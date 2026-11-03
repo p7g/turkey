@@ -2,18 +2,57 @@
 
 A Turkey program is a set of modules, one per source file. A module decides
 which of its names other modules may use, and imports the names it needs from
-other modules. This chapter covers module headers and export lists, imports,
+other modules. This chapter covers export declarations, imports,
 how names are resolved, and the entry point.
 
 ## Modules and files
 
-Each `.gob` file is one module. A module is found by its path: `import
-Shapes.Circle` loads the file `Shapes/Circle.gob`. The compiler looks for it
-first relative to the directory of the program's entry file, then in the
-standard library.
+Each `.gob` file is one module, and a module's name is its path: the file
+`Shapes/Circle.gob` is the module `Shapes.Circle`, and `import Shapes.Circle`
+loads it. The compiler looks for the file first relative to the directory of
+the program's entry file, then in the standard library. Moving a file renames
+the module, and every import of it has to change with it.
+
+The path is spelled exactly as the name is, letter case included, even where
+the filesystem ignores case, as macOS's usually does. A file whose name
+differs only in case is not the module, so a program finds the same modules on
+every system:
+
+<!-- module: Shapes/circle.gob -->
+```kotlin
+export (area)
+
+fun area(r : Int) -> Int = 3 * r * r
+```
+
+<!-- error: cannot find module 'Shapes.Circle': 'Shapes/circle.gob' differs from its name only in case -->
+```kotlin
+import Shapes.Circle (area)
+
+fun main() {
+    print(area(2))
+}
+```
 
 The file the compiler is given is the **entry module**, and
-it must define [`main`](#the-entry-point).
+it must define [`main`](#the-entry-point). The entry module is called `Main`,
+whatever its file is called, and no module may import it: neither as `Main`
+nor by the name its file would have as an ordinary module: beside an entry
+`Tool.gob`, `import Tool` is an error. So each file of a program is exactly
+one module, with one name.
+
+<!-- error: 'Main' is the entry module, and the entry cannot be imported -->
+```kotlin
+import Main
+
+fun main() {
+    print("hello")
+}
+```
+
+> **Coming from Haskell:** a file's path is its module's whole name, so there
+> is no `module Shapes.Circle where` to keep in step with it, and the entry
+> module is `Main` without saying so.
 
 The standard library's `Turkey.*` modules are the implementation itself -- the
 collector, the allocator, the program's startup -- and a program may not import
@@ -37,7 +76,7 @@ another, in either direction:
 
 <!-- module: Even.gob -->
 ```kotlin
-module Even (isEven)
+export (isEven)
 import Odd (isOdd)
 
 fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
@@ -45,7 +84,7 @@ fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
 
 <!-- module: Odd.gob -->
 ```kotlin
-module Odd (isOdd)
+export (isOdd)
 import Even (isEven)
 
 fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
@@ -65,7 +104,7 @@ True
 ```
 
 Each module in a cycle still sees only what it imports: a type imported without
-its constructors is [abstract](#module-headers) there, whichever module
+its constructors is [abstract](#export-declarations) there, whichever module
 declares it.
 
 Top-level bindings are initialized in [dependency
@@ -75,7 +114,7 @@ in a cycle either:
 
 <!-- module: Width.gob -->
 ```kotlin
-module Width (width)
+export (width)
 import Height (height)
 
 let width = height * 2
@@ -83,7 +122,7 @@ let width = height * 2
 
 <!-- module: Height.gob -->
 ```kotlin
-module Height (height)
+export (height)
 import Width (width)
 
 let height = width / 2
@@ -102,28 +141,32 @@ A name a module exports must be declared somewhere. Two modules that each export
 a name as the other's, without either declaring it, export nothing by that
 name.
 
-## Module headers
+## Export declarations
 
 **Syntax**
 
 ```ebnf
-header      ::= "module" modname ("(" export ("," export)* ")")?
+export-decl ::= "export" "(" ".." ")"
+              | "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
               | CONID "(" ".." ")"             -- a type with all its constructors
               | CONID "(" CONID ("," CONID)* ")"
-              | "module" modname               -- a re-export
 ```
 
-A module may start with a header naming the module and listing what it
-**exports**. Only exported names can be used from other modules. A module
-without a header, or with a header but no list, exports everything it
-declares.
+A module that other modules import starts with an export declaration, which
+lists what it **exports**. Only exported names can be used from other modules,
+whether bare or [qualified](#qualified-names). `export (..)` exports everything
+the module itself declares, though not what it imports, and `export ()` exports
+nothing.
+
+The declaration comes first in the file, before any import, and it does not
+name the module: its [path](#modules-and-files) does.
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module Inventory (Item, restock, describe)
+export (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -136,7 +179,7 @@ fun clamp(n) = if n < 0 { 0 } else { n }
 
 <!-- run -->
 ```kotlin
-import Inventory
+import Inventory (restock, describe)
 
 fun main() {
     print(describe(restock("bolts", 12)))
@@ -147,11 +190,12 @@ fun main() {
 bolts x12
 ```
 
-`clamp` is not exported, so `Main` cannot call it:
+`clamp` is not exported, so `Main` cannot call it, neither as `clamp` nor as
+`Inventory.clamp`:
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module Inventory (Item, restock, describe)
+export (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -162,14 +206,61 @@ fun describe(item : Item) = item.name + " x" + show(item.count)
 fun clamp(n) = if n < 0 { 0 } else { n }
 ```
 
-<!-- error: 'clamp' is not defined -->
+<!-- error: 'Inventory.clamp' is not defined -->
 ```kotlin
 import Inventory
 
 fun main() {
-    print(clamp(-1))
+    print(Inventory.clamp(-1))
 }
 ```
+
+Only the [entry module](#modules-and-files) may leave the declaration out,
+since nothing can import it. Importing a module that has none is an error:
+
+<!-- module: Scratch.gob -->
+```kotlin
+fun helper() -> Int = 1
+```
+
+<!-- error: module 'Scratch' is imported but has no export declaration -->
+```kotlin
+import Scratch
+
+fun main() {
+    print(helper())
+}
+```
+
+`export (..)` is the shortest declaration that makes it importable:
+
+<!-- module: Scratch.gob -->
+```kotlin
+export (..)
+
+fun helper() -> Int = 1
+```
+
+<!-- run -->
+```kotlin
+import Scratch
+
+fun main() {
+    print(Scratch.helper())
+}
+```
+
+```text
+1
+```
+
+> **Coming from Haskell:** a module with no export list exports everything
+> in Haskell. Here every module that is imported says what it exports, and
+> `export (..)` is how it says "everything".
+>
+> **Coming from Rust:** a declaration is private unless the export list names
+> it, much as an item is private without `pub`; the list is in one place at
+> the top of the file rather than on each item.
 
 **Types.** Exporting `T` exports the type but not its constructors. Other
 modules can then use `T` in types and receive and pass `T` values, but cannot
@@ -181,7 +272,7 @@ values of it. `T(..)` exports the type and all its constructors.
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module Sealed (Token, make)
+export (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -189,12 +280,12 @@ fun make(n : Int) -> Token = Token { value = n }
 <!-- error: cannot access field 'value' of abstract type 'Token' -->
 ```kotlin
 import Sealed
-fun reveal() = make(3).value
+fun reveal() = Sealed.make(3).value
 ```
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module Sealed (Token, make)
+export (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -208,10 +299,9 @@ import Sealed (Token(..))
 alone exports the class without its methods, so other modules can name it in
 constraints but cannot call its methods.
 
-**Re-exports.** `module M` in an export list passes on everything the module
-has in scope under the qualifier `M`, still qualified. The Prelude uses this
-to make `Vec.push`, `Int.parse` and the like available everywhere
-([The Prelude](builtins.md#the-prelude)).
+An export list names declarations, not modules: a module cannot pass on
+another module's qualifier, and a module that wants `Shapes.Circle.area`
+imports `Shapes.Circle` itself.
 
 ## Imports
 
@@ -219,20 +309,86 @@ to make `Vec.push`, `Int.parse` and the like available everywhere
 
 ```ebnf
 import ::= "import" modname ("as" CONID)? import-list?
-import-list ::= "(" (item ("," item)*)? ")"
-              | "hiding" "(" item ("," item)* ")"
+import-list ::= "(" (entry ("," entry)*)? ")"
+entry  ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item   ::= IDENT | CONID | CONID "(" ".." ")"
          | CONID "(" CONID ("," CONID)* ")"
 ```
 
 | Import | Brings into scope |
 |---|---|
-| `import Geometry` | every export of `Geometry`, both bare (`area`) and qualified (`Geometry.area`) |
-| `import Geometry (area, Point(..))` | only the listed names, both bare and qualified |
-| `import Geometry hiding (area)` | every export except the listed ones |
-| `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
-| `import Geometry as G (area)` | only the listed names, qualified only |
-| `import Geometry ()` | nothing; the module is still loaded, and its instances with it |
+| `import Geometry` | every export, qualified only: `Geometry.area`, not `area` |
+| `import Geometry as G` | every export, qualified as `G.area` |
+| `import Geometry (area, Point(..))` | the listed names bare, and every export qualified |
+| `import Geometry (..)` | every export, both bare and qualified |
+| `import Geometry (area as size)` | `area` under the bare name `size`, and every export qualified |
+| `import Geometry (area as _, ..)` | every export bare except `area`, and every export qualified |
+| `import Geometry as G (area)` | `area` bare, and every export qualified as `G.area` |
+| `import Geometry ()` | the same as `import Geometry`: no bare names, every export qualified |
+
+An import always brings the module's qualified names, `Geometry.area`, or
+`G.area` under an alias, and they are every export the module has. An alias
+replaces the module's name as the qualifier rather than adding to it, so
+after `import Geometry as G` there is no `Geometry.area`. The list chooses only
+which bare names come too. Every import also loads the module, and its
+instances with it.
+
+`..` in a list stands for every export the other entries do not name, and may
+appear once. Beside it an entry only renames (`x as y`) or withholds
+(`x as _`): `import Geometry (area, ..)` is an error, since `..` already
+brings `area`. A rename keeps a name's case, so a value is renamed to a
+lowercase name and a type, class or constructor to a capitalized one.
+`Point(..) as _` withholds the type and its constructors together, and
+`C(..) as _` a class and its methods; `Point as _` withholds the type alone.
+
+Renaming and withholding are for bare names that collide. Here two modules
+both export `parse`, and the second import withholds its `parse`, which is
+then written `Csv.parse`:
+
+<!-- module: Json.gob -->
+```kotlin
+export (Value(..), parse)
+
+type Value = Number(Int) | Text(String)
+
+fun parse(s : String) -> Value = match Int.parse(s) {
+    Some(n) -> Number(n)
+    None -> Text(s)
+}
+```
+
+<!-- module: Csv.gob -->
+```kotlin
+export (parse, width)
+
+fun parse(line : String) -> Vec String = String.split(line, ",")
+
+fun width(row : Vec String) -> Int = len(row)
+```
+
+<!-- run -->
+```kotlin
+import Json (..)
+import Csv (parse as _, ..)
+
+fun describe(v : Value) -> String = match v {
+    Number(n) -> "number " + show(n)
+    Text(s) -> "text " + s
+}
+
+fun main() {
+    print(describe(parse("42")))
+    print(width(Csv.parse("a,b,c")))
+}
+```
+
+```text
+number 42
+3
+```
+
+`import Csv (parse as parseRow, ..)` would bring it bare as `parseRow`
+instead.
 
 In a selective import, `T` brings in the type alone, `T(..)` requests its
 constructors too, and `T(A, B)` requests the named constructors. Each requested
@@ -242,7 +398,7 @@ import that constructor.
 
 <!-- module: Temperature.gob -->
 ```kotlin
-module Temperature (toFahrenheit, toCelsius)
+export (toFahrenheit, toCelsius)
 
 fun toFahrenheit(c) = c * 9.0 / 5.0 + 32.0
 
@@ -279,7 +435,7 @@ alike: `G.Point(1, 2)` builds a point and `G.Point(x, y)` takes one apart.
 
 <!-- module: Geometry.gob -->
 ```kotlin
-module Geometry (Point(..), origin)
+export (Point(..), origin)
 
 type Point = Point(Int, Int)
 
@@ -308,9 +464,11 @@ fun main() {
 
 ### The Prelude
 
-Every module imports the Prelude implicitly. An explicit `import Prelude ...`
-replaces the implicit import, and `import Prelude ()` imports nothing from it
-at all. See [The Prelude](builtins.md#the-prelude) for what it provides.
+Every module imports the Prelude implicitly, with its bare names and the
+library modules it brings qualified, such as `Vec` and `String`. An explicit
+`import Prelude ...` replaces the implicit import of its bare names, and
+`import Prelude ()` imports nothing from it at all, the qualified modules
+included, where `()` after any other module still brings its qualifier. See [The Prelude](builtins.md#the-prelude) for what it provides.
 
 <!-- run -->
 ```kotlin
@@ -442,20 +600,20 @@ Importing the same declaration through more than one route is unambiguous.
 
 <!-- module: First.gob -->
 ```kotlin
-module First (label)
+export (label)
 fun label() -> String = "first"
 ```
 
 <!-- module: Second.gob -->
 ```kotlin
-module Second (label)
+export (label)
 fun label() -> String = "second"
 ```
 
 <!-- error: ambiguous name 'label': 'First.label', 'Second.label' -->
 ```kotlin
-import First
-import Second
+import First (label)
+import Second (label)
 fun main() { print(label()) }
 ```
 

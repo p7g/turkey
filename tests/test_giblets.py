@@ -57,7 +57,7 @@ def verdict(entry: Path, giblets: str, command: str = "core") -> str:
 def test_a_giblet_module_must_come_from_the_library(tmp_path):
     """The same gate `foreign` has: a program cannot opt its own module in,
     and could not stop the compiler holding it to the rule either."""
-    (tmp_path / "Mine.gob").write_text("module Mine (f)\nfun f() -> Int = 0\n",
+    (tmp_path / "Mine.gob").write_text("export (f)\nfun f() -> Int = 0\n",
                                        encoding="utf-8")
     entry = tmp_path / "main.gob"
     entry.write_text("import Mine as M\nfun main() { }\n", encoding="utf-8")
@@ -88,9 +88,9 @@ def lowered(request, tmp_path):
 
     def lower(giblet_body: str, helper_body: str,
               exports: str = "h") -> tuple[int, str, str]:
-        helper.write_text(f"module Probe_helper_{digest} ({exports})\n\n"
+        helper.write_text(f"export ({exports})\n\n"
                           + helper_body, encoding="utf-8")
-        giblet.write_text(f"module Probe_giblet_{digest} (f)\n\n"
+        giblet.write_text(f"export (f)\n\n"
                           f"import Probe_helper_{digest} as H\n"
                           + giblet_body, encoding="utf-8")
         env = dict(os.environ, **{HOOK: f"Probe_giblet_{digest}"})

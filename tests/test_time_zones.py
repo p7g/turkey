@@ -15,7 +15,8 @@ from tests.lang import run
 ZONEINFO = Path(__file__).resolve().parent / "programs" / "time_zones" / "zoneinfo"
 
 LOOKUPS = """\
-import Time
+import Time.DateTime as DateTime
+import Time.Zone as Zone
 
 fun say(r) = match r {
     Right(z) -> show(z)
@@ -34,7 +35,12 @@ fun main() {
 """
 
 SYSTEM = """\
-import Time
+import Time.Date as Date
+import Time.DateTime as DateTime
+import Time.Month (Month(..))
+import Time.PlainDateTime as PlainDateTime
+import Time.TimeOfDay as TimeOfDay
+import Time.Zone as Zone
 
 fun main() {
     match Zone.system() {

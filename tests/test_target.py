@@ -93,7 +93,7 @@ def test_a_target_match_is_decided_before_lowering() -> None:
 # compiler lists, so this one is written into `lib/` for the test's duration
 # and named through `TURKEY_TEST_FOREIGN`.
 ERRNO = """\
-module PROBE (found)
+export (found)
 
 import Target (OS(..))
 import Target as Target

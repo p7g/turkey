@@ -34,7 +34,7 @@ def library(request, monkeypatch):
     monkeypatch.setenv("TURKEY_TEST_FOREIGN", module)
 
     def write(body: str) -> str:
-        path.write_text(f"module {module} (run)\n\n" + body, encoding="utf-8")
+        path.write_text(f"export (run)\n\n" + body, encoding="utf-8")
         return f"import {module} as P\nfun main() {{ P.run() }}\n"
 
     try:

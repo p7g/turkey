@@ -30,7 +30,7 @@ class Probe:
                  command: str = "core") -> str:
         """The compiler's verdict on the module, which is listed as a giblet
         unless the test says otherwise."""
-        self.path.write_text(f"module {self.name} (f)\n\n{body}", encoding="utf-8")
+        self.path.write_text(f"export (f)\n\n{body}", encoding="utf-8")
         return verdict(self.entry, self.name if giblet else "", command)
 
 

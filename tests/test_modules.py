@@ -22,7 +22,7 @@ from tests.lang import check, execute as run, types
 from tests.lang import CompileError
 
 HELPER = """
-module Helper (twice, greet)
+export (twice, greet)
 
 fun twice(n : Int) -> Int = n + n
 
@@ -54,10 +54,12 @@ def output(src: str, search: dict[str, str], capsys) -> list[str]:
 # -- what an import brings ----------------------------------------------------
 
 
-def test_a_plain_import_brings_a_name_both_ways(tmp_path):
+def test_a_plain_import_brings_only_qualified_names(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper\nfun f() -> Int = twice(1) + Helper.twice(2)"
+    src = "import Helper\nfun f() -> Int = Helper.twice(2)"
     assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper\nfun f() = twice(1)", search) == \
+        "'twice' is not defined"
 
 
 def test_a_qualified_import_brings_only_the_qualified_name(tmp_path):
@@ -77,13 +79,81 @@ def test_an_alias_renames_the_module(tmp_path):
 
 
 def test_an_alias_and_a_selective_list_are_independent(tmp_path):
-    """`import M as S (f)`: an alias and a list together, which a parser
-    that treated them as alternatives would refuse."""
+    """`import M as S (f)`: the list chooses the bare names, and the alias
+    qualifies every export, listed or not."""
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper as H (twice)\nfun f() -> Int = H.twice(1)"
+    src = "import Helper as H (twice)\nfun f() -> Int = twice(1) + H.twice(1)\nfun g() = H.greet(\"x\")"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    assert fails("import Helper as H (twice)\nfun f() = H.greet(\"x\")",
-                 search) == "'H.greet' is not defined"
+    assert fails("import Helper as H (twice)\nfun f() = greet(\"x\")",
+                 search) == "'greet' is not defined"
+
+
+def test_a_selective_list_leaves_the_qualifier_whole(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (twice)\nfun g() -> String = Helper.greet(\"x\")"
+    assert sigs(src, search)["g"] == "fun() -> String"
+
+
+def test_an_empty_list_brings_the_qualifier_alone(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper ()\nfun f() -> Int = Helper.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper ()\nfun f() = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_dot_dot_in_a_list_brings_every_bare_name(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper as H (..)\nfun f() -> Int = twice(1) + H.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+
+
+def test_a_rename_brings_the_bare_name_under_another_spelling(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (twice as double)\nfun f() -> Int = double(1) + Helper.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper (twice as double)\nfun f() = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_as_underscore_withholds_one_bare_name_from_dot_dot(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (greet as _, ..)\nfun f() -> Int = twice(1)\nfun g() = Helper.greet(\"x\")"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper (greet as _, ..)\nfun f() = greet(\"x\")", search) == \
+        "'greet' is not defined"
+
+
+def test_a_type_withheld_with_its_constructors(tmp_path):
+    search = write(tmp_path, Shape="export (Shape(..), unit)\n"
+                   "type Shape = Circle(Int) | Square(Int)\nfun unit() = Circle(1)")
+    assert "unknown constructor 'Circle'" in fails(
+        "import Shape (Shape(..) as _, ..)\nfun f() = Circle(1)", search)
+    assert "unknown type 'Shape'" in fails(
+        "import Shape (Shape(..) as _, ..)\nfun f(s : Shape) = s", search)
+    check("import Shape (Shape(..) as _, ..)\nfun f() = Shape.Circle(1)\nfun g() = unit()",
+          search)
+
+
+def test_a_class_withheld_with_its_methods(tmp_path):
+    search = write(tmp_path, Same="export (Same(..))\nclass Same a { fun same(a, a) -> Bool }")
+    assert fails("import Same (Same(..) as _, ..)\nfun f(x) = same(x, x)", search) == \
+        "'same' is not defined"
+    check("import Same (Same(..) as _, ..)\nfun f(x) = Same.same(x, x)", search)
+
+
+@pytest.mark.parametrize("src, message", [
+    ("import Helper (twice, ..)",
+     "'twice' is already brought in by '..'; beside '..' an item can only rename "
+     "a name, as in 'x as y', or withhold it, as in 'x as _'"),
+    ("import Helper (.., ..)", "'..' appears twice in one import list"),
+    ("import Helper (twice as Twice)",
+     "'twice' cannot be renamed to 'Twice': a value's name begins with a lowercase "
+     "letter, and a type's, a class's or a constructor's with a capital"),
+])
+def test_malformed_lists_are_refused(tmp_path, src, message):
+    search = write(tmp_path, Helper=HELPER)
+    assert fails(src, search) == message
 
 
 def test_a_selective_list_withholds_the_rest(tmp_path):
@@ -92,12 +162,19 @@ def test_a_selective_list_withholds_the_rest(tmp_path):
                  search) == "'greet' is not defined"
 
 
-def test_hiding_withholds_only_what_it_names(tmp_path):
+def test_as_underscore_withholds_only_what_it_names(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper hiding (greet)\nfun f() -> Int = twice(1)"
+    src = "import Helper (greet as _, ..)\nfun f() -> Int = twice(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    assert fails("import Helper hiding (greet)\nfun f() = greet(\"x\")",
+    assert fails("import Helper (greet as _, ..)\nfun f() = greet(\"x\")",
                  search) == "'greet' is not defined"
+
+
+def test_hiding_is_not_an_import_form(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    assert fails("import Helper hiding (greet)", search) == (
+        "an import withholds a name with 'as _' beside '..', as in "
+        "'import Helper (x as _, ..)'; there is no 'hiding'")
 
 
 def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
@@ -111,6 +188,15 @@ def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
     ) == "'print' is not defined"
 
 
+def test_the_prelude_qualifiers_go_with_the_prelude(tmp_path):
+    """`Vec.`, `String.` and the rest come with any Prelude import but the
+    empty one."""
+    check("import Prelude (Int)\nfun f() -> Int = String.byteLength(\"ab\")", {})
+    assert fails("import Prelude ()\nimport Data.Int (Int)\n"
+                 "fun f() -> Int = String.byteLength(\"ab\")", {}) == \
+        "'String.byteLength' is not defined"
+
+
 def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
     check("import Prelude (error, Int)\nfun stop() -> Int = error(\"x\")", {})
     assert fails("import Prelude (error)\nfun main() { print(1) }", {}) == \
@@ -120,8 +206,8 @@ def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
 def test_a_prelude_and_a_module_it_imports_may_need_each_other(tmp_path):
     # With the empty marker Base does not import the Prelude; without it, the
     # implicit import closes a cycle, which loads all the same.
-    for base in ("module Base ()\nimport Prelude ()", "module Base ()"):
-        search = write(tmp_path, Prelude="module Prelude ()\nimport Base",
+    for base in ("export ()\nimport Prelude ()", "export ()"):
+        search = write(tmp_path, Prelude="export ()\nimport Base",
                        Base=base)
         check("fun identity(n) = n", search)
 
@@ -131,8 +217,10 @@ def test_a_prelude_and_a_module_it_imports_may_need_each_other(tmp_path):
 
 def test_a_name_the_export_list_omits_is_not_importable(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    assert fails("import Helper\nfun f() = secret()", search) == \
+    assert fails("import Helper (..)\nfun f() = secret()", search) == \
         "'secret' is not defined"
+    assert fails("import Helper\nfun f() = Helper.secret()", search) == \
+        "'Helper.secret' is not defined"
 
 
 def test_importing_a_name_that_is_not_exported_says_so(tmp_path):
@@ -142,15 +230,35 @@ def test_importing_a_name_that_is_not_exported_says_so(tmp_path):
 
 
 def test_a_module_may_not_export_what_it_does_not_have(tmp_path):
-    search = write(tmp_path, Broken="module Broken (nope)\nfun yes() = 1")
+    search = write(tmp_path, Broken="export (nope)\nfun yes() = 1")
     assert fails("import Broken", search) == \
         "module 'Broken' exports 'nope', which is not defined or imported here"
 
 
-def test_a_module_with_no_export_list_exports_everything(tmp_path):
-    search = write(tmp_path, Open="fun one() -> Int = 1\nfun two() -> Int = 2")
-    src = "import Open\nfun f() -> Int = one() + two()"
+def test_export_everything_exports_what_the_module_declares(tmp_path):
+    search = write(tmp_path, Open="export (..)\nfun one() -> Int = 1\nfun two() -> Int = 2")
+    src = "import Open (..)\nfun f() -> Int = one() + Open.two()"
     assert sigs(src, search)["f"] == "fun() -> Int"
+
+
+def test_export_everything_does_not_pass_on_imports(tmp_path):
+    search = write(tmp_path, Helper=HELPER,
+                   Open="export (..)\nimport Helper (..)\nfun one() -> Int = twice(1)")
+    assert fails("import Open (..)\nfun f() -> Int = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_an_imported_module_needs_an_export_declaration(tmp_path):
+    """Even an instance-only import: only the entry, which nothing imports,
+    may leave the declaration out."""
+    search = write(tmp_path, Open="fun one() -> Int = 1")
+    for src in ("import Open", "import Open ()", "import Open as O"):
+        assert fails(src, search).startswith(
+            "module 'Open' is imported but has no export declaration")
+
+
+def test_an_entry_may_have_an_export_declaration(tmp_path):
+    check("export (main)\nfun main() { print(1) }", {})
 
 
 # -- which name wins ----------------------------------------------------------
@@ -160,13 +268,13 @@ def test_a_local_definition_shadows_an_import(tmp_path):
     """A module's own declarations beat its imports. The two are different
     bindings, not a conflict: `twice` here is `Main#twice`."""
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper\nfun twice(s : String) -> String = s + s"
+    src = "import Helper (..)\nfun twice(s : String) -> String = s + s"
     assert sigs(src, search)["twice"] == "fun(String) -> String"
 
 
 def test_an_import_shadows_the_prelude(tmp_path):
-    search = write(tmp_path, Shadow="fun print(x : Int) -> Int = x + 1")
-    src = "import Shadow\nfun f() -> Int = print(1)"
+    search = write(tmp_path, Shadow="export (print)\nfun print(x : Int) -> Int = x + 1")
+    src = "import Shadow (..)\nfun f() -> Int = print(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
 
 
@@ -192,22 +300,22 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module Middle (thrice)\nimport Helper (twice)\n"
+        Middle="export (thrice)\nimport Helper (twice)\n"
                "fun thrice(n : Int) -> Int = twice(n) + n",
     )
-    assert sigs("import Middle\nfun f() -> Int = thrice(1)", search)["f"] == \
+    assert sigs("import Middle (..)\nfun f() -> Int = thrice(1)", search)["f"] == \
         "fun() -> Int"
-    assert fails("import Middle\nfun f() = twice(1)", search) == \
+    assert fails("import Middle (..)\nfun f() = twice(1)", search) == \
         "'twice' is not defined"
 
 
 def test_modules_may_import_each_other(tmp_path):
     search = write(
         tmp_path,
-        A="module A (a)\nimport B (b)\nfun a(n : Int) -> Int = if n == 0 { 0 } else { b(n - 1) }",
-        B="module B (b)\nimport A (a)\nfun b(n : Int) -> Int = a(n)",
+        A="export (a)\nimport B (b)\nfun a(n : Int) -> Int = if n == 0 { 0 } else { b(n - 1) }",
+        B="export (b)\nimport A (a)\nfun b(n : Int) -> Int = a(n)",
     )
-    assert sigs("import A\nfun f() -> Int = a(3)", search)["f"] == "fun() -> Int"
+    assert sigs("import A (..)\nfun f() -> Int = a(3)", search)["f"] == "fun() -> Int"
 
 
 def test_a_missing_module_is_reported(tmp_path):
@@ -219,9 +327,9 @@ def test_a_type_declared_in_another_module_is_usable(tmp_path):
     hand the parser the type names an import already put in scope."""
     search = write(
         tmp_path,
-        Shape="module Shape (Circle(..))\ntype Circle = Circle(Int)",
+        Shape="export (Circle(..))\ntype Circle = Circle(Int)",
     )
-    src = "import Shape\ntype Round = Circle\nfun f(c : Round) -> Round = c"
+    src = "import Shape (..)\ntype Round = Circle\nfun f(c : Round) -> Round = c"
     assert sigs(src, search)["f"] == "fun(Circle) -> Circle"
 
 
@@ -241,7 +349,7 @@ def test_the_prelude_is_imported_without_being_asked_for(tmp_path):
 
 
 def test_a_diagnostic_in_an_imported_module_names_that_module(tmp_path):
-    search = write(tmp_path, Wrong="module Wrong (w)\nfun w() -> Int = \"s\"")
+    search = write(tmp_path, Wrong="export (w)\nfun w() -> Int = \"s\"")
     with pytest.raises(CompileError) as exc:
         check("import Wrong", search)
     assert exc.value.rendered.startswith("Wrong.gob:2:"), exc.value.rendered
@@ -258,18 +366,18 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module Middle (loud)\nimport Helper (greet)\n"
+        Middle="export (loud)\nimport Helper (greet)\n"
                "fun loud(who : String) -> String = greet(who) + \"!\"",
     )
-    src = 'import Middle\nfun main() { print(loud("world")) }'
+    src = 'import Middle (..)\nfun main() { print(loud("world")) }'
     assert output(src, search, capsys) == ["hello, world!"]
 
 
 def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
     search = write(
         tmp_path,
-        One="module One (name)\nfun name() -> String = \"one\"",
-        Two="module Two (name)\nfun name() -> String = \"two\"",
+        One="export (name)\nfun name() -> String = \"one\"",
+        Two="export (name)\nfun name() -> String = \"two\"",
     )
     src = ('import One as One\nimport Two as Two\n'
            'fun main() { print(One.name()); print(Two.name()) }')
@@ -279,7 +387,7 @@ def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
 def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
     (tmp_path / "Helper.gob").write_text(HELPER, encoding="utf-8")
     entry = tmp_path / "Main.gob"
-    entry.write_text('import Helper\nfun main() { print(greet("you")) }',
+    entry.write_text('import Helper (..)\nfun main() { print(greet("you")) }',
                      encoding="utf-8")
     run(entry)
     assert capsys.readouterr().out.splitlines() == ["hello, you"]
@@ -289,8 +397,8 @@ def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
 
 
 def test_the_bare_names_the_library_uses_are_free(tmp_path, capsys):
-    """The other half: `Vec.push` does not claim a bare `push`, because a
-    *module* re-export claims no bare name."""
+    """The other half: `Vec.push` does not claim a bare `push`, because the
+    Prelude's qualifiers bring no bare names."""
     src = """
 fun push(n : Int) -> Int = n + 1
 fun new(n : Int) -> Int = n + 2
@@ -319,7 +427,7 @@ def test_the_library_is_reachable_without_an_import(tmp_path):
 
 
 def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
-    """The Prelude re-exports `Data.Vec` under the short alias. A program
+    """The Prelude's qualifier for `Data.Vec` is the short one. A program
     that wants the long spelling asks for the module itself."""
     src = ("import Data.Vec\n"
            "fun f(xs : Vec Int) -> Unit = Data.Vec.push(xs, 1)")
@@ -339,22 +447,24 @@ fun main() {
     assert output(src, {}, capsys) == ["False", "True", "5"]
 
 
-def test_a_re_export_needs_the_module_to_be_imported(tmp_path):
-    search = write(tmp_path, Nope="module Nope (module Missing)\nfun f() = 1")
-    assert fails("import Nope", search) == \
-        "module 'Nope' re-exports 'Missing', which is not imported here"
+def test_an_export_list_cannot_re_export_a_module(tmp_path):
+    search = write(tmp_path, Nope="export (module Helper)\nimport Helper\nfun f() = 1",
+                   Helper=HELPER)
+    assert fails("import Nope", search) == (
+        "'module' cannot appear in an export list: a module exports only what "
+        "it declares, and a module that wants another's names imports it")
 
 
-def test_module_is_an_export_form_not_an_import_one(tmp_path):
+def test_module_is_not_an_import_form(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    assert "'module' may appear in an export list" in \
-        fails("import Helper (module Helper)", search)
+    assert fails("import Helper (module Helper)", search) == \
+        "expected an export name, found 'module'"
 
 
 # -- a type and an instance know which module made them -----------------------
 
 SHAPE = """
-module Shape (Node(..), leaf)
+export (Node(..), leaf)
 
 type Node = Leaf | Fork(Node, Node)
 
@@ -366,7 +476,7 @@ def test_two_modules_may_each_declare_the_same_type(tmp_path):
     """A type constructor is qualified by its module, so two libraries that
     each have a `Node` can be used together: they are different types."""
     search = write(tmp_path, Shape=SHAPE,
-                   Graph="module Graph (Node(..))\ntype Node = Node(Int)")
+                   Graph="export (Node(..))\ntype Node = Node(Int)")
     src = ("import Shape as S\nimport Graph as G\n"
            "fun a() -> S.Node = S.Leaf\nfun b() -> G.Node = G.Node(1)")
     got = sigs(src, search)
@@ -377,7 +487,7 @@ def test_two_modules_may_each_declare_the_same_type(tmp_path):
 
 def test_a_type_with_one_declaration_prints_short(tmp_path):
     search = write(tmp_path, Shape=SHAPE)
-    assert sigs("import Shape\nfun f() -> Node = leaf()", search)["f"] == \
+    assert sigs("import Shape (..)\nfun f() -> Node = leaf()", search)["f"] == \
         "fun() -> Node"
 
 
@@ -394,14 +504,14 @@ def test_an_export_list_may_withhold_the_constructors(tmp_path):
     difference between an abstract type and a transparent one."""
     search = write(
         tmp_path,
-        Opaque="module Opaque (Token, make)\n"
+        Opaque="export (Token, make)\n"
                "type Token = Token(Int)\n"
                "fun make(n : Int) -> Token = Token(n)",
     )
-    assert sigs("import Opaque\nfun f() -> Token = make(1)", search)["f"] == \
+    assert sigs("import Opaque (..)\nfun f() -> Token = make(1)", search)["f"] == \
         "fun() -> Token"
     assert "unknown constructor 'Token'" in \
-        fails("import Opaque\nfun f() = Token(1)", search)
+        fails("import Opaque (..)\nfun f() = Token(1)", search)
 
 
 def test_a_selective_import_of_a_type_brings_its_constructors_with_dots(tmp_path):
@@ -417,7 +527,7 @@ def test_a_selective_import_of_a_type_brings_its_constructors_with_dots(tmp_path
 
 def test_an_instance_may_live_with_its_type(tmp_path):
     search = write(tmp_path, Shape=SHAPE)
-    src = ("import Shape\n"
+    src = ("import Shape ()\n"
            "type Tree = Tree(Int)\n"
            "instance Show Tree { fun show(t) = \"tree\" }\n"
            "fun f(t : Tree) -> String = show(t)")
@@ -434,7 +544,7 @@ def test_an_instance_may_live_with_its_class(tmp_path):
 def test_an_imported_qualified_class_can_have_a_local_type_instance(tmp_path):
     search = write(
         tmp_path,
-        Rules=("module Rules (Render(..))\n"
+        Rules=("export (Render(..))\n"
                "class Render a { fun render(a) -> String }"),
     )
     src = ("import Rules as R\n"
@@ -450,7 +560,7 @@ def test_an_orphan_instance_is_rejected(tmp_path):
     error in a file neither author wrote."""
     search = write(tmp_path, Shape=SHAPE)
     message = fails(
-        'import Shape\ninstance Show Node { fun show(n) = "node" }', search)
+        'import Shape (Node)\ninstance Show Node { fun show(n) = "node" }', search)
     assert message.startswith("orphan instance: 'Show Node' is declared in 'Main'")
     assert "'Show' belongs to 'Text.Show'" in message
     assert "'Node' to 'Shape'" in message
@@ -468,7 +578,7 @@ def test_two_instances_for_one_head_still_overlap(tmp_path):
     search = write(
         tmp_path,
         Shape=SHAPE,
-        Extra="module Extra ()\nimport Shape (Node(..))\n"
+        Extra="export ()\nimport Shape (Node(..))\n"
               'instance Show Node { fun show(n) = "a" }',
     )
     assert "orphan instance" in fails("import Extra", search)

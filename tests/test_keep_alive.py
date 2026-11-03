@@ -21,7 +21,7 @@ from tests.lang import LIB, output, program
 # The bytes are a library array whose storage `strlen` reads by address,
 # `Prim.elementAddress` of its first element.
 PROBE = """\
-module {name} (lengthOf)
+export (lengthOf)
 
 import Turkey.Libc as Libc
 

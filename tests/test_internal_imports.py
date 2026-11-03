@@ -54,7 +54,7 @@ def test_a_program_s_own_turkey_module_is_its_own(tmp_path):
     """A module beside the entry is the program's, whatever it is called."""
     (tmp_path / "Turkey").mkdir()
     (tmp_path / "Turkey" / "Mine.gob").write_text(
-        "module Turkey.Mine (answer)\nfun answer() -> Int = 42\n",
+        "export (answer)\nfun answer() -> Int = 42\n",
         encoding="utf-8")
     entry = tmp_path / "main.gob"
     entry.write_text("import Turkey.Mine as Mine\n"

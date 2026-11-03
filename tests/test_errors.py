@@ -321,8 +321,8 @@ def test_bifunctor_reaches_the_left_that_functor_cannot():
     one that reaches both, and `Data.Bifunctor.first` is the half of it this
     library had no name for.
 
-    The Prelude does not re-export `Data.Bifunctor`, in either tier, so even
-    the qualifier has to be imported."""
+    The Prelude brings `Data.Bifunctor` in neither tier, so even the qualifier
+    has to be imported."""
     source = """
 import Data.Bifunctor as Bifunctor
 

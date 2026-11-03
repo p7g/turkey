@@ -42,7 +42,7 @@ def module(request, tmp_path):
     digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
     name = f"Probe_atomics_{digest}"
     path = LIB / f"{name}.gob"
-    path.write_text(f"module {name} (run)\n\nimport Turkey.Libc as Libc\n" + PROGRAM,
+    path.write_text(f"export (run)\n\nimport Turkey.Libc as Libc\n" + PROGRAM,
                     encoding="utf-8")
     entry = tmp_path / "main.gob"
     entry.write_text(f"import {name} as P\nfun main() {{ P.run() }}\n", encoding="utf-8")

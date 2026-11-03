@@ -28,27 +28,27 @@ escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex?
 OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"
 ```
 
-Keywords: `as break class continue do else export for foreign fun hiding if
-import in instance let loop match module return type var while`.
+Keywords: `as break class continue do else export for foreign fun if import
+in instance let loop match module return type var while`.
 
 Comments: `--` to the end of the line, and `{- ... -}`, which nests.
 
 ## Modules
 
 ```ebnf
-module      ::= header? top-level*
-header      ::= "module" modname ("(" export ("," export)* ")")?
+module      ::= export-decl? top-level*
+export-decl ::= "export" "(" ".." ")"
+              | "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT
               | CONID
               | CONID "(" ".." ")"
               | CONID "(" CONID ("," CONID)* ")"
-              | "module" modname
 top-level   ::= import | type-decl | class-decl | instance-decl
               | fun-decl | let-decl | var-decl | foreign-decl | infix-decl
 import      ::= "import" modname ("as" CONID)? import-list?
-import-list ::= "(" (item ("," item)*)? ")"
-              | "hiding" "(" item ("," item)* ")"
+import-list ::= "(" (entry ("," entry)*)? ")"
+entry       ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item        ::= IDENT | CONID | CONID "(" ".." ")" | CONID "(" CONID ("," CONID)* ")"
 ```
 

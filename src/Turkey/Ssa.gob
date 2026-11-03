@@ -364,30 +364,45 @@ fun predecessors(f : Func i) -> Array (Vec BlockId) {
 -- Blocks in reverse postorder, which is the order the dominance solver wants:
 -- every block but the entry appears after at least one of its predecessors, so
 -- one pass already computes most of the answer.
-fun reversePostorder(f : Func i) -> Vec BlockId {
+fun reversePostorder(f : Func i) -> Vec BlockId = Vec.reverse(postorder(f))
+
+-- The blocks the entry reaches, each after every block a depth-first search
+-- from the entry visits below it: the order a backward analysis wants, since
+-- every block comes after its successors except across an edge that closes a
+-- cycle.
+fun postorder(f : Func i) -> Vec BlockId {
     let order : Vec BlockId = []
-    let seen = Set.new()
-    -- An explicit stack of (block, next successor to visit): the recursive
-    -- form is depth-first over a graph the size of a whole function, which is
-    -- deep enough to exhaust the real one.
-    let stack = [(f.entry, 0)]
-    Set.add(seen, blockId(f.entry))
-    while len(stack) > 0 {
-        let (b, at) = stack[len(stack) - 1]
-        let succs = successors(f.blocks[blockId(b)].term)
-        if at >= len(succs) {
-            let _ = Vec.pop(stack)
-            Vec.push(order, b)
-        } else {
-            stack[len(stack) - 1] = (b, at + 1)
-            let next = succs[at]
-            if !Set.contains(seen, blockId(next)) {
-                Set.add(seen, blockId(next))
-                Vec.push(stack, (next, 0))
+    let seen = Array.filled(len(f.blocks), False)
+    -- An explicit stack, as three in step: the path from the entry, each
+    -- block's successors, and which of them to visit next. The recursive form
+    -- is depth-first over a graph the size of a whole function, which is deep
+    -- enough to exhaust the real one. Three stacks rather than one of tuples,
+    -- because a tuple per step is an allocation per step, and this runs for
+    -- every analysis of every function.
+    let path = [f.entry]
+    let succs = [successors(f.blocks[blockId(f.entry)].term)]
+    let visit = [0]
+    seen[blockId(f.entry)] = True
+    while len(path) > 0 {
+        let top = len(path) - 1
+        let k = visit[top]
+        if k < len(succs[top]) {
+            visit[top] = k + 1
+            let next = succs[top][k]
+            if !seen[blockId(next)] {
+                seen[blockId(next)] = True
+                Vec.push(path, next)
+                Vec.push(succs, successors(f.blocks[blockId(next)].term))
+                Vec.push(visit, 0)
             }
+        } else {
+            Vec.push(order, path[top])
+            let _ = Vec.pop(path)
+            let _ = Vec.pop(succs)
+            let _ = Vec.pop(visit)
         }
     }
-    Vec.reverse(order)
+    order
 }
 
 -- The immediate dominator of each block, or `None` for one the entry does not
@@ -783,7 +798,7 @@ fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
     let liveIn = Array.init(count, fun(_) = BitSet.new(values))
     let liveOut = Array.init(count, fun(_) = BitSet.new(values))
     let entering = BitSet.new(values)
-    let order = Vec.reverse(reversePostorder(f))
+    let order = postorder(f)
     var changed = True
     while changed {
         changed = False

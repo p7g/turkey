@@ -42,7 +42,8 @@ export (
 -- finds its permit gone takes a free one if there is one. Otherwise its
 -- record is still its own, so it can still take the scheduler's lock: it
 -- gives its task back to the scheduler to queue and parks as a spare
--- (`Turkey.Scheduler.afterCall`).
+-- (`Turkey.Scheduler.afterCall`). Which C calls are made this way, and which
+-- may wait inline, is the contract under "C calls that may block" below.
 --
 -- **Stopping the world.** A collection runs with every other thread stopped at
 -- a safepoint, where the frame tables describe its roots. The collecting
@@ -1342,7 +1343,91 @@ fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
 
 -- -- C calls that may block -------------------------------------------------------------
 --
--- A read from a file or a pipe, a write to one, an open of a FIFO: each can
+-- **The contract.** A C call that can wait on something outside the program --
+-- a file system, a pipe, a terminal, another process's lock, a name server, a
+-- child, the clock -- is made through one of the entries below, and the Turkey
+-- code that calls the entry follows it with `Turkey.Scheduler.afterCall`.
+-- Made inline instead, the call keeps its thread's permit for as long as it
+-- waits, and with one permit the program stops. Two mechanisms sit on top:
+--
+-- * where the system reports readiness, the call is made so that it cannot
+--   wait -- on a non-blocking descriptor, or with `WNOHANG` or `LOCK_NB` --
+--   and a task waits for the readiness on the poller instead (`Turkey.Poll`,
+--   `Turkey.Wait`): pipes, terminals, child exits, and `flock` on Darwin. A
+--   sleep is a timer on the poller, not a C call;
+-- * where the caller needs a deadline, the call runs on a helper task the
+--   caller may leave (`Turkey.Detach`): name lookups, and `flock` on Linux.
+--
+-- A test reads the two lists below from this comment and checks every call to
+-- `Turkey.Libc` outside this module against them. A `Turkey.Libc` function
+-- neither list names can wait, and outside this module only the calls the
+-- second list names make one.
+--
+-- **Calls that never wait** on anything outside the program, which any module
+-- may make:
+--
+-- * `malloc`, `free`, `alignedAlloc`, `realloc`, `mmap`, `munmap`, `mprotect`,
+--   `strlen` and `memchr`: memory, which `mmap` only ever maps anonymously;
+-- * `floor`, `ceil`, `round`, `trunc`, `fmod`, `remainder` and `sqrt`:
+--   arithmetic;
+-- * `getenv`, `sysctlbyname`, `sysconf`, `clockGettime`, `errnoDarwin` and
+--   `errnoLinux`: the process's own state and the system's;
+-- * `fcntl`, `fcntlWith` and `isatty`: a descriptor's own state, with the
+--   commands the library passes, none of which takes a lock;
+-- * `closedir`: a directory has no writes to flush, so closing one waits for
+--   nothing;
+-- * `pipe`, `pipe2`, `kqueue`, `epollCreate1`, `epollCtl` and `eventfd`:
+--   making descriptors and registering them with the poller;
+-- * `pthreadAttrInit`, `pthreadAttrSetStackSize`, `pthreadAttrDestroy`,
+--   `pthreadCreate`, `schedYield`, `osSyncWakeByAddressAny` and
+--   `osSyncWakeByAddressAll`: starting threads, giving up a core, and waking
+--   threads;
+-- * `spawnActionsInit`, `spawnActionsDestroy`, `spawnActionsAddDup2`,
+--   `spawnActionsAddOpen`, `spawnActionsAddChdir`, `spawnAttrInit`,
+--   `spawnAttrDestroy`, `spawnAttrSetFlags`, `spawnAttrSetPGroup` and `kill`:
+--   describing a child before it starts, and signalling one;
+-- * `signal`, `exitNow` and `exit`: installing a handler, and ending the
+--   process;
+-- * `freeaddrinfo`: giving back a lookup's list.
+--
+-- **Calls that can wait, made inline** by the module named, each for the
+-- reason given:
+--
+-- * `Turkey.Entry.write`: the panic's message, written after the program's
+--   entry has returned, and the crash report, written from a signal handler,
+--   which may call only async-signal-safe functions;
+-- * `Turkey.Entry.pthreadJoin`: C's main thread waiting for the thread the
+--   program runs on, and running no Turkey code until it ends;
+-- * `Turkey.Output.write`: `final`, which writes out the standard output after
+--   the program's entry has returned; `drain`, while the program runs, goes
+--   through `blockingWrite`;
+-- * `Turkey.Heap.write`: the collector's diagnostics on the standard error,
+--   which a run asks for (`TURKEY_GC_STATS`, or an aid the program was
+--   compiled without), written by the collecting thread inside a collection,
+--   which cannot give up its thread, or while the globals are made, before any
+--   task runs;
+-- * `Turkey.HeapCheck.write`: the heap verifier's report, just before it ends
+--   the process;
+-- * `Turkey.Lock.osSyncWaitOnAddress`, `Turkey.Lock.osSyncWaitOnAddressWithTimeout`
+--   and `Turkey.Lock.syscall`: the sleeps under the runtime's locks, its idle
+--   threads and `blockingSleepOn`, each waiting for another thread of this
+--   program to change a word (`syscall` is `futex`, which wakes too). A
+--   caller that may sleep long is blocked first (`acquire`, `blockEnter`,
+--   `callEnter`);
+-- * `Turkey.Monitor.usleep`: the monitor's tick, on a thread that holds no
+--   permit;
+-- * `Turkey.Poll.flock` and `Turkey.Poll.waitpid`: only with `LOCK_NB` and
+--   `WNOHANG`, which ask without waiting.
+--
+-- This module's own inline waits are the poller's and the sleeping threads'
+-- (`kevent`, `epollWait`, `Lock.wait`), each made by a thread that is blocked
+-- or stopped first, or by the monitor, and `change`'s `kevent`, whose timeout
+-- is zero. The
+-- `eventfd` it reads and writes is non-blocking, the descriptors it closes are
+-- the poller's own, and the thread-exhaustion message is written just before
+-- the process ends.
+--
+-- **The entries.** A read from a file or a pipe, a write to one, an open of a FIFO: each can
 -- wait for as long as something outside the program takes. A thread in one
 -- is blocked for that time (`callEnter`), so that a collection need not wait
 -- for it and the monitor may give its permit to another; every root its

@@ -311,44 +311,60 @@ fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> Asm.Symbol =
 
 -- -- the frame ---------------------------------------------------------------
 
--- `sp` moves once, on the way in, and nothing moves it again: every slot is
--- addressed from it, and the outgoing arguments sit at the bottom where a call
--- can reach them without touching it.
+-- The frame record is pushed, `x29` pointed at it, and the rest of the frame
+-- claimed below; after that nothing moves `sp`: every slot is addressed from
+-- it, and the outgoing arguments sit at the bottom where a call can reach them
+-- without touching it.
 --
--- The frame record is written with two stores rather than an `stp` because
--- `stp`'s immediate is a signed seven bits scaled -- it reaches 504 bytes, and
--- `boot`'s largest frame is 16,672. A store's unsigned twelve bits reach
--- 32,760, which covers every frame the compiler has produced; past that the
--- offset goes through `scratch` like any other.
+-- The push is a pre-indexed `stp` because the record is at the top of the
+-- frame (`Frame.verifyFrame` checks it), and a pair's signed seven-bit offset
+-- reaches only 504 bytes up from `sp`: frames are often bigger than that.
 fun prologue(b : Code, l : Frame.Layout) -> Unit {
-    adjust(b, l.size, False)
-    store(b, Physical(Gp, 29), l.recordAt, A.W64)
-    store(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
-    address(b, Physical(Gp, 29), l.recordAt)
+    instruction(b, A.StpPre(A.fp, A.lr, A.sp, -16))
+    instruction(b, A.AddImm(A.fp, A.sp, 0, A.W64))
+    adjust(b, l.size - 16, False)
     saves(b, l, True)
 }
 
+-- The prologue undone. `sp` comes back from `x29`, which is one instruction
+-- whatever the frame's size, and is left out when the record is all the frame
+-- there is.
 fun epilogue(b : Code, l : Frame.Layout) -> Unit {
     saves(b, l, False)
-    load(b, Physical(Gp, 29), l.recordAt, A.W64)
-    load(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
-    adjust(b, l.size, True)
+    if l.size > 16 { instruction(b, A.AddImm(A.sp, A.fp, 0, A.W64)) }
+    instruction(b, A.LdpPost(A.fp, A.lr, A.sp, 16))
     instruction(b, A.Ret)
 }
 
 -- The callee-saved registers the colouring actually used, saved on the way in
--- and restored on the way out. One store each rather than pairs: a pair's
--- offset is the narrow immediate again, and the frames here are not small.
+-- and restored on the way out, two to an instruction where two share a file.
+--
+-- They are addressed from `x29`, not `sp`. The area sits directly below the
+-- frame record and holds at most eighteen registers, so it is never more than
+-- 144 bytes below `x29`, which a pair's offset reaches whatever the frame's
+-- size; from `sp` it would be as far up as the frame is big. `Frame.layout`
+-- gives each file an even number of slots, so the pairs are 16-byte aligned
+-- and the last general register, when the count is odd, has a slot of its own.
 fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
-    var at = l.savesAt
-    for n in l.savedGp {
-        if saving { store(b, Physical(Gp, n), at, A.W64) }
-        else { load(b, Physical(Gp, n), at, A.W64) }
-        at = at + 8
+    var at = l.savesAt - l.recordAt
+    for var k = 0; k < len(l.savedGp); k = k + 2 {
+        let r = Physical(Gp, l.savedGp[k])
+        if k + 1 < len(l.savedGp) {
+            let s = Physical(Gp, l.savedGp[k + 1])
+            instruction(b, if saving { A.Stp(r, s, A.fp, at) }
+                           else { A.Ldp(r, s, A.fp, at) })
+        } else {
+            instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
+                           else { A.Ldr(r, Offset(A.fp, at), A.W64) })
+        }
+        at = at + 16
     }
+    -- One at a time: `Stp` and `Ldp` are the general file's, and a function
+    -- saving a `d` register is rare.
     for n in l.savedFp {
-        if saving { store(b, Physical(Fp, n), at, A.W64) }
-        else { load(b, Physical(Fp, n), at, A.W64) }
+        let r = Physical(Fp, n)
+        instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
+                       else { A.Ldr(r, Offset(A.fp, at), A.W64) })
         at = at + 8
     }
 }
@@ -364,30 +380,6 @@ fun adjust(b : Code, size : Int, up : Bool) -> Unit {
         instruction(b, if up { A.AddExt(A.sp, A.sp, scratch) }
                        else { A.SubExt(A.sp, A.sp, scratch) })
     }
-}
-
--- `add d, sp, #offset`, for the frame pointer.
-fun address(b : Code, d : Reg, offset : Int) -> Unit {
-    if offset <= widestImmediate {
-        instruction(b, A.AddImm(d, A.sp, offset, A.W64))
-    } else {
-        instruction(b, A.MovConst(scratch, offset))
-        instruction(b, A.AddExt(d, A.sp, scratch))
-    }
-}
-
-fun store(b : Code, r : Reg, offset : Int, w : A.Width) -> Unit =
-    instruction(b, A.Str(r, at(b, offset), w))
-
-fun load(b : Code, r : Reg, offset : Int, w : A.Width) -> Unit =
-    instruction(b, A.Ldr(r, at(b, offset), w))
-
--- A frame offset as a memory operand, through `scratch` when the immediate
--- does not reach.
-fun at(b : Code, offset : Int) -> Mem {
-    if offset <= widestOffset { return Offset(A.sp, offset) }
-    instruction(b, A.MovConst(scratch, offset))
-    Indexed(A.sp, scratch)
 }
 
 -- -- instructions ------------------------------------------------------------

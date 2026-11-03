@@ -206,8 +206,8 @@ fun main() {
 
 
 def test_a_second_instance_for_a_built_in_type_overlaps():
-    assert fails("instance Add Int { fun add(x, y) = x }") == \
-        "overlapping instances: 'Add Int' and 'Add Int' both apply"
+    assert fails("instance Add Int { fun add(x, y) = x }").startswith(
+        "overlapping instances: 'Add Int' is already declared in 'Data.Int' at ")
 
 
 def test_the_float_operators_are_gone():

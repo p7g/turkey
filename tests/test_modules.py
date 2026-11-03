@@ -571,7 +571,7 @@ def test_an_instance_for_a_built_in_type_over_a_library_class_is_an_orphan(tmp_p
     owns neither end of it."""
     message = fails("instance Neg Char { fun neg(c) = c }", {})
     assert message.startswith("orphan instance: 'Neg Char'")
-    assert "the language itself" in message
+    assert "'Char' to 'Data.Char'" in message
 
 
 def test_two_instances_for_one_head_still_overlap(tmp_path):

@@ -213,6 +213,11 @@ fun instCon(inst : InstInfo) -> String {
     }
 }
 
+-- Returns `cls head` as an instance declaration writes it, with the head
+-- parenthesized where it needs to be: `Iterator (Bag a)`.
+fun showInstance(cls : String, head : Ty.Type) -> String =
+    cls + " " + Ty.showAt(head, Ty.namer(""), 2)
+
 fun instHeadKey(t : Ty.Type) -> String {
     let (h, _) = Ty.spine(t)
     match h {
@@ -471,19 +476,19 @@ fun checkConstructorContexts(t : ClassTable) -> Unit {
 fun declareFamilies(t : ClassTable, d : ClassDecl) -> Unit {
     let info = classNamed(t, d.name)
     for fam in d.families {
+        let written = surfaceMember(fam.name)
         if fam.param != d.param {
-            oops("'" + fam.name + "' must be a family over '" + d.param
-                 + "', the parameter of class '" + d.name + "': a family is "
-                 + "determined by the class variable and there is nothing else "
-                 + "in scope", Some(fam.span))
+            oops("associated type '" + written + "' must take the class "
+                 + "parameter '" + d.param + "', not '" + fam.param + "'; write "
+                 + "'type " + written + " " + d.param + "'", Some(fam.span))
         }
         if let Some(other) = Map.get(t.decls.families, fam.name) {
-            oops("'" + fam.name + "' is already a type family of "
+            oops("'" + written + "' is already an associated type of "
                 + "class '" + other.cls + "'", Some(fam.span))
         }
         if Map.contains(t.decls.tycons, fam.name) {
-            oops("'" + fam.name + "' is already a type; a type family cannot "
-                 + "share its name", Some(fam.span))
+            oops("'" + written + "' is already a type; an associated type "
+                 + "cannot share its name", Some(fam.span))
         }
         Map.put(t.decls.families, fam.name, FamilyInfo {
             name = fam.name
@@ -521,8 +526,9 @@ fun resolveClass(t : ClassTable, d : ClassDecl) -> Unit {
                     _ -> False
                 }
                 if !ok {
-                    oops("the superclasses of '" + d.name + "' must constrain "
-                         + "its own parameter '" + d.param + "'", Some(sup.span))
+                    oops("superclass '" + name + "' must constrain '" + d.param
+                         + "', the parameter of '" + d.name + "'; write '" + name
+                         + " " + d.param + "'", Some(sup.span))
                 }
                 if !Ty.unifyKinds(supInfo.cvar.kind, info.cvar.kind) {
                     oops("'" + d.param + "' cannot be both a '" + name + "' and "
@@ -536,7 +542,7 @@ fun resolveClass(t : ClassTable, d : ClassDecl) -> Unit {
 
     for decl in d.methods {
         if let Some(other) = Map.get(t.owner, decl.name) {
-            oops("'" + decl.name + "' is already a method of class '"
+            oops("'" + surfaceMember(decl.name) + "' is already a method of class '"
                  + other + "'", Some(decl.span))
         }
         let tyvars = Map.new()
@@ -574,13 +580,15 @@ fun methodType(t : ClassTable, decl : FunDecl,
     let fresh = fun() = Ty.freshVar(1)
     let params = Array.map(decl.params, fun(p) = match p.kind {
         PAnnot(_, te) -> Decls.star(t.decls, te, tyvars, fresh)
-        _ -> oops("parameter of method '" + decl.name + "' needs a type: a "
-                  + "class fixes its methods' types, so none is inferred",
-                  Some(p.span))
+        PVar(x) -> oops("parameter '" + x + "' of method '"
+                        + surfaceMember(decl.name) + "' needs a type annotation",
+                        Some(p.span))
+        _ -> oops("parameter of method '" + surfaceMember(decl.name)
+                  + "' needs a type annotation", Some(p.span))
     })
     match decl.ret {
-        None -> oops("method '" + decl.name + "' must state a return type",
-                     Some(decl.span))
+        None -> oops("method '" + surfaceMember(decl.name)
+                     + "' must state a return type", Some(decl.span))
         Some(ret) -> TFun(params, Decls.star(t.decls, ret, tyvars, fresh))
     }
 }
@@ -609,8 +617,8 @@ fun resolveContext(t : ClassTable, context : Vec Ast.Pred, tyvars : Map String T
                 let key = Ty.typeKey(equality.args[0])
                 if let Some(had) = Map.get(answers, key) {
                     oops("'" + Ty.show(equality.args[0])
-                        + "' is already required to be '" + Ty.show(had)
-                        + "' here, and a family has one answer for one argument",
+                        + "' is required to be both '" + Ty.show(had) + "' and '"
+                        + Ty.show(equality.args[1]) + "'; keep one equality",
                         Some(p.span))
                 }
                 Map.put(answers, key, equality.args[1])
@@ -653,9 +661,8 @@ fun resolveEquality(t : ClassTable, p : Ast.Pred, leftTe : Type, rightTe : Type,
     let right = Decls.toType(t.decls, rightTe, tyvars, fresh)
     match left {
         TFam(_, _, _) -> {}
-        _ -> oops("'" + Ty.show(left) + "' is not a type family, and the left "
-                  + "side of a '~' must be one -- an equality says what a family "
-                  + "answers, not that two types happen to agree", Some(p.span))
+        _ -> oops("'" + Ty.show(left) + "' is not an associated type; the left "
+                  + "side of '~' must be one, as in 'Item s ~ Int'", Some(p.span))
     }
     for sub in Ty.subterms(right) {
         if Ty.sameType(sub, left) {
@@ -683,9 +690,8 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> InstInf
         -- downstream that would catch it, because the comparison *is* the
         -- check. A derived instance cannot lie: the compiler reads the name off
         -- the type it is deriving for.
-        oops("'Typed' instances are derived by the compiler, and a program may "
-             + "not declare one: its answer is what 'cast' trusts.",
-             Some(d.span))
+        oops("'Typed' instances cannot be declared; the compiler derives one "
+             + "for every type", Some(d.span))
     }
     let tyvars = Map.new()
     let fresh = fun() = Ty.freshVar(1)
@@ -700,9 +706,8 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> InstInf
     let key = instHeadKey(h)
     for other in instancesOf(t, d.cls) {
         if instHeadKey(other.head) == key {
-            oops("overlapping instances: '" + d.cls + " " + Ty.show(h)
-                 + "' and '" + other.cls + " " + Ty.show(other.head)
-                 + "' both apply", Some(d.span))
+            oops("overlapping instances: '" + showInstance(d.cls, h)
+                 + "' is already declared" + declaredAt(other, owner), Some(d.span))
         }
     }
     let context = resolveContext(t, d.context, tyvars, None)
@@ -732,6 +737,13 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> InstInf
     inst
 }
 
+-- Where `other` is declared, for a message about an instance in `module_`.
+fun declaredAt(other : InstInfo, module_ : String) -> String {
+    if other.module_ == "" { return " by the compiler" }
+    let at = " at " + Source.showSpan(other.decl.span)
+    if other.module_ == module_ { at } else { " in '" + other.module_ + "'" + at }
+}
+
 -- An instance belongs to its class's module or its head's.
 --
 -- Instances are global -- every module sees every one, because a predicate has
@@ -751,17 +763,27 @@ fun checkOrphan(t : ClassTable, inst : InstInfo, d : InstanceDecl) -> Unit {
     if Array.contains(allowed, inst.module_) {
         return {}
     }
-    oops("orphan instance: '" + d.cls + " " + Ty.show(inst.head)
-         + "' is declared in '" + inst.module_ + "', but '" + d.cls
-         + "' belongs to '" + orElse(home, "the library") + "' and '"
-         + Ty.show(inst.head) + "' to '"
-         + orElse(headModule, "the language itself")
-         + "'. An instance must live with its class or with its type, so that "
-         + "no two modules can each claim it.", Some(d.span))
+    let typeHome = if headModule != "" { headModule }
+                   else if builtinHome != "" { builtinHome }
+                   else { tupleHome }
+    let cls = "'" + d.cls + "'"
+    let ty = "'" + Ty.show(inst.head) + "'"
+    let owners = if home == "" && typeHome == "" {
+        cls + " and " + ty + " are built in"
+    } else if home == "" {
+        cls + " is built in and " + ty + " belongs to '" + typeHome + "'"
+    } else if typeHome == "" {
+        cls + " belongs to '" + home + "' and " + ty + " is built in"
+    } else {
+        cls + " belongs to '" + home + "' and " + ty + " to '" + typeHome + "'"
+    }
+    let move = if home == "" && typeHome == "" { "" }
+               else if home == "" || typeHome == "" { "move it there, or " }
+               else { "move it to one of those modules, or " }
+    oops("orphan instance: '" + showInstance(d.cls, inst.head)
+         + "' is declared in '" + inst.module_ + "', but " + owners + "; "
+         + move + "wrap " + ty + " in a type of your own", Some(d.span))
 }
-
-fun orElse(s : String, fallback : String) -> String =
-    if s == "" { fallback } else { s }
 
 fun builtinHomeOf(name : String) -> String = match name {
     "Int" -> "Data.Int"
@@ -784,7 +806,7 @@ fun resolveFamilies(t : ClassTable, d : InstanceDecl, info : ClassInfo,
     for fb in d.families {
         let resolved = match memberNamed(Map.keys(info.families), fb.name) {
             Some(r) -> r
-            None -> oops("'" + fb.name + "' is not a type family of class '"
+            None -> oops("'" + fb.name + "' is not an associated type of class '"
                          + d.cls + "'", Some(fb.span))
         }
         fb.name = resolved
@@ -818,10 +840,10 @@ fun resolveFamilies(t : ClassTable, d : InstanceDecl, info : ClassInfo,
     }
     let missing = Vec.new(2)
     for n in Map.keys(info.families) {
-        if !Map.contains(bound, n) { Vec.push(missing, surfaceMember(n)) }
+        if !Map.contains(bound, n) { Vec.push(missing, "'" + surfaceMember(n) + "'") }
     }
     if len(missing) > 0 {
-        oops("instance '" + d.cls + " " + Ty.show(h) + "' does not define "
+        oops("instance '" + showInstance(d.cls, h) + "' does not define "
              + String.join(Vec.sort(missing), ", "), Some(d.span))
     }
     bound
@@ -838,10 +860,9 @@ fun checkFamDecreasing(fb : FamBind, body : Ty.Type) -> Unit = match Ty.prune(bo
     TFam(_, arg, _) -> {
         match Ty.prune(arg) {
             TVar(_) -> {}
-            _ -> oops("'" + Ty.show(body) + "' cannot appear here: a type family "
-                      + "definition may apply a family only to a type variable "
-                      + "of the instance head, so that reduction terminates",
-                      Some(fb.span))
+            _ -> oops("'" + Ty.show(body) + "' cannot appear here: an associated "
+                      + "type can only be applied to a type variable of the "
+                      + "instance head", Some(fb.span))
         }
         checkFamDecreasing(fb, arg)
     }
@@ -864,6 +885,10 @@ fun checkFamDecreasing(fb : FamBind, body : Ty.Type) -> Unit = match Ty.prune(bo
 -- how much of a type is known yet -- and that is what turns a missing instance
 -- into a silently different one.
 fun checkHeadShape(d : InstanceDecl, h : Ty.Type) -> Unit {
+    -- One namer for the head and its arguments, so a variable is called the
+    -- same in both.
+    let n = Ty.namer("")
+    let shown = Ty.showAt(h, n, 0)
     let (c, spineArgs) = Ty.spine(h)
     let args = match c {
         TTuple(elems) -> elems
@@ -877,15 +902,15 @@ fun checkHeadShape(d : InstanceDecl, h : Ty.Type) -> Unit {
         match Ty.prune(arg) {
             TVar(cell) -> {
                 if Set.contains(seen, cell.id) {
-                    oops("'" + Ty.show(h) + "' cannot be an instance head: '"
-                         + d.cls + "' must be given a type constructor applied "
-                         + "to distinct type variables", Some(d.head.span))
+                    oops("'" + shown + "' cannot be an instance head: '"
+                         + Ty.showAt(arg, n, 0) + "' appears twice in it",
+                         Some(d.head.span))
                 }
                 Set.add(seen, cell.id)
             }
-            _ -> oops("'" + Ty.show(h) + "' cannot be an instance head: '"
-                      + d.cls + "' must be given a type constructor applied to "
-                      + "distinct type variables", Some(d.head.span))
+            _ -> oops("'" + shown + "' cannot be an instance head: '"
+                      + Ty.showAt(arg, n, 0) + "' must be a type variable",
+                      Some(d.head.span))
         }
     }
 }
@@ -920,11 +945,11 @@ fun checkInstance(t : ClassTable, inst : InstInfo) -> Unit {
     let missing = Vec.new(2)
     for (name, m) in Map.entries(info.methods) {
         if !Set.contains(defined, name) && !hasDefault(m) {
-            Vec.push(missing, surfaceMember(name))
+            Vec.push(missing, "'" + surfaceMember(name) + "'")
         }
     }
     if len(missing) > 0 {
-        oops("instance '" + inst.cls + " " + Ty.show(inst.head)
+        oops("instance '" + showInstance(inst.cls, inst.head)
              + "' does not define " + String.join(Vec.sort(missing), ", "),
              Some(inst.decl.span))
     }

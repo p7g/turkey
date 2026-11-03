@@ -300,7 +300,7 @@ instance Iterator (Bag a) {
     fun next(b, cur) = None
 }
 """
-    assert fails(src) == "instance 'Iterator Bag a' does not define Cursor"
+    assert fails(src) == "instance 'Iterator (Bag a)' does not define 'Cursor'"
 
 
 def test_the_methods_are_ordinary_and_callable_by_name():

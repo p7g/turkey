@@ -97,8 +97,8 @@ instance Typed Evil { }
 fun main() { print(1) }
 """
     message = fails(source)
-    assert "derived by the compiler" in message
-    assert "may not declare one" in message
+    assert "'Typed' instances cannot be declared" in message
+    assert "the compiler derives one for every type" in message
 
 
 def test_a_type_with_no_constructor_has_no_rep():

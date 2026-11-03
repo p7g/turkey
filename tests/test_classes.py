@@ -236,7 +236,7 @@ def test_an_instance_must_have_its_superclass_instance():
 
 def test_a_superclass_must_constrain_the_class_parameter():
     src = EQ + "class Rank a : Egal Int { fun under(a, a) -> Bool }"
-    assert "must constrain its own parameter 'a'" in bad(src)
+    assert "superclass 'Egal' must constrain 'a', the parameter of 'Rank'" in bad(src)
 
 
 def test_a_class_may_not_be_its_own_superclass():
@@ -252,17 +252,18 @@ def test_a_class_may_not_be_its_own_superclass():
 
 def test_two_instances_for_one_constructor_overlap():
     assert bad(EQ + "instance Egal Int { fun egal(x, y) = False }") == \
-        "overlapping instances: 'Egal Int' and 'Egal Int' both apply"
+        "overlapping instances: 'Egal Int' is already declared at 6:1"
 
 
 def test_an_instance_head_must_be_a_constructor_over_distinct_variables():
     src = EQ + "instance Egal (Either Int Int) { fun egal(x, y) = True }"
-    assert "distinct type variables" in bad(src)
+    assert bad(src) == \
+        "'Either Int Int' cannot be an instance head: 'Int' must be a type variable"
 
 
 def test_an_instance_must_define_every_method_that_has_no_default():
     assert bad(EQ.replace("fun egal(x, y) = x == y", "")) == \
-        "instance 'Egal Int' does not define egal"
+        "instance 'Egal Int' does not define 'egal'"
 
 
 def test_an_instance_may_not_define_a_method_of_another_class():
@@ -390,4 +391,4 @@ def test_a_class_may_share_a_short_name_with_a_type():
 
 def test_a_method_parameter_needs_a_type():
     src = "class C a { fun f(x) -> a = x }"
-    assert "needs a type" in bad(src)
+    assert bad(src) == "parameter 'x' of method 'f' needs a type annotation"

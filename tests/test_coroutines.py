@@ -162,6 +162,29 @@ fun run() {
     assert out == f"{sum(range(10000)) + 10000}\n"
 
 
+def test_what_a_parked_stack_holds_survives_the_final_collection(coroutines):
+    """The final collection runs after the program's code has returned, with
+    no frame of its own to walk, but other stacks still hold what they hold:
+    with several workers, another thread can be stopped holding an object it
+    uses once the world starts again. A coroutine left suspended is that stack
+    with one worker, and the verifier walks it after the final collection's
+    marking as after any other's."""
+    result = coroutines("""
+fun run() {
+    let c = Co.new(fun() {
+        let held = Array.map([1, 2, 3], fun(x) = Int.toString(x))
+        Co.suspend()
+        print(String.join(held, ","))
+    })
+    Co.resume(c)
+    print("left suspended")
+}
+""", verified=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "left suspended\n"
+    assert result.stderr == ""
+
+
 def test_a_panic_in_a_coroutine_ends_the_program(coroutines):
     result = coroutines("""
 fun run() {

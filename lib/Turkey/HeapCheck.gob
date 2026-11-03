@@ -883,8 +883,14 @@ fun checkRoots() -> Bool {
 }
 
 -- The frame table's shape, then every stack's arm64 frames: the running
--- stack's from `current`, the collection's Turkey frame record or 0 if none is
--- live, and each other stack's from the record it was parked at.
+-- stack's from `current`, the collection's Turkey frame record, and each
+-- other stack's from the record it was parked at.
+--
+-- With `current` 0 the collecting thread has no live Turkey frame, and the
+-- running stack is not walked: its record may describe a stack that is gone,
+-- as it does for the final collection, which runs after the thread that ran
+-- the program's own code has exited. The other stacks are walked all the
+-- same, since other workers' threads still run.
 fun checkFrames(current : Int) -> Bool {
     if entryCount == 0 { return True }
     if entryCount < 0 || Prim.ptrIsNull(entries) {
@@ -897,10 +903,11 @@ fun checkFrames(current : Int) -> Bool {
             return failAt(Prim.cString("invalid native frame table"), entries, fi)
         }
     }
-    if current == 0 { return True }
     let running = stateWord(stateRunning)
-    if running == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
-    if !checkStack(current, word(running, stackHigh)) { return False }
+    if current != 0 {
+        if running == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
+        if !checkStack(current, word(running, stackHigh)) { return False }
+    }
     var stack = stateWord(stateStacks)
     var seen = False
     while stack != 0 {
@@ -912,7 +919,9 @@ fun checkFrames(current : Int) -> Bool {
         }
         stack = word(stack, stackNext)
     }
-    if !seen { return fail(Prim.cString("running stack not on the stack list"), running, -1) }
+    if current != 0 && !seen {
+        return fail(Prim.cString("running stack not on the stack list"), running, -1)
+    }
     True
 }
 

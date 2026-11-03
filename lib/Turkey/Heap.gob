@@ -1081,21 +1081,34 @@ fun frameEntryFor(retaddr : Int) -> Prim.Ptr {
 --
 -- `frame` is the `x29` of the Turkey allocator that called into the heap: a
 -- frame record whose return address is in the allocation site, so the first
--- entry found is the allocating function's. Null means no Turkey frame is
--- live -- the final collection runs after the program has returned, when no
--- stack's frames are -- and nothing is walked.
+-- entry found is the allocating function's. Null means the collecting thread
+-- has no live Turkey frame, and its running stack is not walked.
+--
+-- The other stacks are walked either way. The final collection runs from C
+-- after the program's own code has returned, so it passes null, but the
+-- worker threads are still running: one may be parked at a safepoint or
+-- waiting for a lock, holding an object only its frames reach, and it goes on
+-- using that object once the world starts again. Freeing the object there is
+-- a use after free, and a fault where the C library has returned the region
+-- to the system.
 fun stackTasks(frame : Prim.Ptr) -> Unit {
-    if frameEntryCount == 0 || Prim.ptrIsNull(frame) { return {} }
+    if frameEntryCount == 0 { return {} }
+    -- Skipped below even with a null `frame`: the running stack's record may
+    -- describe a stack that is gone. The thread that ran the program's own
+    -- code exits when that code returns, and the main thread then collects
+    -- with the same worker record.
     let running = Stack.running()
-    if Prim.ptrIsNull(running) {
-        -- Reachable only if something ran the program's code without the
-        -- generated entry. Scanning from an unknown outer bound is how a walk
-        -- runs off the end; not scanning drops live roots silently, which is
-        -- worse. So say so instead of doing either.
-        Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
-        return {}
+    if !Prim.ptrIsNull(frame) {
+        if Prim.ptrIsNull(running) {
+            -- Reachable only if something ran the program's code without the
+            -- generated entry. Scanning from an unknown outer bound is how a
+            -- walk runs off the end; not scanning drops live roots silently,
+            -- which is worse. So say so instead of doing either.
+            Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
+            return {}
+        }
+        addTask(taskStack, frame, Stack.high(running))
     }
-    addTask(taskStack, frame, Stack.high(running))
     var stack = Stack.first()
     while !Prim.ptrIsNull(stack) {
         let parked = Stack.parked(stack)

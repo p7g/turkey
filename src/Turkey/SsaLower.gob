@@ -43,6 +43,7 @@ import Turkey.Prims as Prims
 import Turkey.Runtime as Rt
 import Turkey.LocalEscape as LocalEscape
 import Turkey.Promote as Promote
+import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
@@ -56,7 +57,16 @@ import Turkey.Bulk as Bulk
 -- Carried rather than thrown so a driver can report coverage over a corpus --
 -- and the *reason* rather than only the count, because a histogram of reasons
 -- is what says which form to write next.
-type Unsupported = Unsupported { name : String, what : String }
+--
+-- `overLimit` marks a program past one of the runtime's limits (`refuse`).
+-- That is the program's fault and `what` says what to change, where every
+-- other reason is a form only a compiler bug leaves unlowered.
+type Unsupported = Unsupported {
+    name      : String,
+    what      : String,
+    overLimit : Bool,
+    span      : Option Span,
+}
 
 -- What a *direct* call passes and receives.
 --
@@ -144,8 +154,10 @@ type Lower = Lower {
     lifted  : Vec (Ssa.Func Low),
     -- What belongs to the program rather than to one binding.
     shared  : Lifting,
-    -- The first form that could not be lowered, if any.
+    -- The first form that could not be lowered, if any, and whether it is a
+    -- refusal of a program past a limit rather than an unhandled form.
     var stopped : Option String,
+    var overLimit : Bool,
     var flatRefs : Set.Set String,
     var flatRecords : Set.Set String,
     localRefs : Map Int (Int, Rep),
@@ -249,8 +261,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
             -- language is still unwritten, so a form that *is* handled, by
             -- another phase, does not belong in it.
             None -> match why {
-                Some(w) -> Vec.push(skipped,
-                                      Unsupported { name = bind.name, what = w })
+                Some(u) -> Vec.push(skipped, u)
                 None -> {}
             }
         }
@@ -480,7 +491,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
               globalRefs : Map String Rep,
               tags : Map String Int,
               sigs : Map String Signature, shared : Lifting)
-        -> (Option (Ssa.Func Low), Array (Ssa.Func Low), Option String) {
+        -> (Option (Ssa.Func Low), Array (Ssa.Func Low), Option Unsupported) {
     -- Not a function: a global whose value the module initializer computes,
     -- which is its own phase. Two `let`s rather than one destructuring
     -- binding, because a control transfer cannot cross one.
@@ -522,7 +533,9 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     prepareLocals(l, body)
     lower(l, body, ToReturn)
     match l.stopped {
-        Some(why) -> (None, [], Some(why))
+        Some(why) -> (None, [], Some(Unsupported {
+            name = bind.name, what = why, overLimit = l.overLimit, span = bind.span,
+        }))
         -- Dead blocks dropped here rather than left for each emitter. The
         -- fallthrough panic every `match` gets is unreachable in any program
         -- that compiles, since a non-exhaustive match is rejected. A backend
@@ -544,7 +557,7 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
     sigs = sigs, layouts = layouts, lifted = lifted,
-    shared = shared, stopped = None, flatRefs = Set.new(), flatRecords = Set.new(),
+    shared = shared, stopped = None, overLimit = False, flatRefs = Set.new(), flatRecords = Set.new(),
     localRefs = Map.new(), localObjects = Map.new(),
     nextSlot = 0,
 }
@@ -605,14 +618,26 @@ fun resultType(ty : Ty.Type) -> Ty.Type = match Ty.prune(ty) {
 }
 
 fun stop(l : Lower, what : String) -> Value {
-    match l.stopped {
-        None -> { l.stopped = Some(what) }
-        Some(_) -> {}
-    }
+    halt(l, what, False)
     -- A value of the right shape so the walk can finish without a second
     -- failure mode; nothing reads it, because the caller discards the whole
     -- function.
     Ssa.freshValue(l.func, Ssa.untraced(Unit))
+}
+
+-- Stops the lowering because the program is past one of the runtime's limits.
+-- `message` is shown to the user as is, so it says what to change.
+fun refuse(l : Lower, message : String) -> Unit = halt(l, message, True)
+
+-- Records the first reason the lowering stopped, and keeps it.
+fun halt(l : Lower, what : String, overLimit : Bool) -> Unit {
+    match l.stopped {
+        None -> {
+            l.stopped = Some(what)
+            l.overLimit = overLimit
+        }
+        Some(_) -> {}
+    }
 }
 
 -- Bindings retain their scoped env identity. A marker is never emitted as a
@@ -1593,7 +1618,7 @@ fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
 -- a dictionary of a class with many methods, a packed existential.
 fun wide(l : Lower, count : Int, refusal : fun(Int) -> String) -> Bool {
     if count <= Rt.fieldLimit { return False }
-    stop1(l, refusal(count))
+    refuse(l, refusal(count))
     True
 }
 
@@ -1671,9 +1696,9 @@ fun capturesOf(l : Lower, body : Core,
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
          captures : Vec (String, Rep)) -> Option String {
     if len(captures) > 63 {
-        let _ = stop(l, "a nested function captures " + Int.toString(len(captures))
-                        + " variables, and a function can capture at most 63; pass some "
-                        + "as parameters, or group them in a record")
+        refuse(l, "a nested function captures " + Int.toString(len(captures))
+                  + " variables, and a function can capture at most 63; pass some "
+                  + "as parameters, or group them in a record")
         return None
     }
     -- `%` is the compiler's own character: the lexer will not accept one in an
@@ -1732,7 +1757,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     lower(child, body, ToReturn)
     match child.stopped {
         Some(why) -> {
-            let _ = stop(l, why)
+            halt(l, why, child.overLimit)
             None
         }
         None -> {

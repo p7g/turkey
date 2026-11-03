@@ -457,10 +457,13 @@ fun storeRoot(s : Sel, v : Value) -> Unit = match Roots.slotOf(s.frame, Ssa.valu
 --
 -- All of them pass through but one. `Panic(v)` is a *call* --
 -- `turkey_panic_string` takes the message the program built -- and a call is
--- not something a terminator can be, so it becomes that call and a return of
--- zero, as every panic path returns (`guard`). `Unreachable` stays a
--- terminator: the emitter answers it with the same zero, and there is no call
--- to make.
+-- not something a terminator can be, so it becomes that call and an
+-- `Unreachable`, as every panic path ends (`guard`).
+--
+-- In the machine graph `Unreachable` leaves the function with a zero of its
+-- result, through the exit the emitter shares between every such path. That
+-- is what a block after a diverging call needs and what a panic returns,
+-- whether it was raised here or propagated from a callee.
 fun terminate(s : Sel, t : Term) -> Unit = match t {
     Panic(v) -> {
         s.panicking = True
@@ -468,7 +471,7 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
              Some(calleeOf(s, "turkey_panic_string")), A.xzr,
              [(A.reg(v), A.Gp)], A.Standard)
         s.panicking = False
-        s.out.blocks[s.at].term = Ret(zeroResult(s))
+        s.out.blocks[s.at].term = Unreachable
     }
     Switch(v, cases, default) -> {
         let sorted = Vec.sortBy(cases, fun(x, y) = Array.threeWay(x.0, y.0))
@@ -1402,15 +1405,15 @@ fun propagate(s : Sel) -> Unit {
     let failed = tempValue(s, Ssa.untraced(I1))
     emit(s, A.Ldr(A.reg(failed), A.Offset(A.worker, 0), A.W32))
     -- The empty message: this path propagates a panic that already happened
-    -- and raises nothing new. It returns zero, as every panic path does.
+    -- and raises nothing new. It leaves with zero, as every panic path does.
     guard(s, failed, "")
 }
 
 -- Whether the call being selected is a `Call` instruction that ends a block
 -- whose terminator is `Unreachable`, as the lowering leaves a call that never
 -- returns. Then the test is redundant: both of its exits return zero from
--- here with the flag as the callee left it, and skipping it saves a second
--- epilogue at every bounds check. A call that is only part of a longer
+-- here with the flag as the callee left it, and skipping it saves a load and
+-- a branch at every bounds check. A call that is only part of a longer
 -- instruction is still tested, since the rest of the instruction would run.
 fun endsUnreachable(s : Sel) -> Bool {
     let (b, n) = s.place
@@ -1420,20 +1423,6 @@ fun endsUnreachable(s : Sel) -> Bool {
         (Call(_, _), Unreachable) -> True
         _ -> False
     }
-}
-
--- A zero of the function's result, which is what every path that leaves
--- without a value answers.
---
--- A double's zero is not a `mov`: `mov d0, xzr` is not an instruction, and
--- `fmov d0, xzr` is. Nothing caught this until whole functions were assembled,
--- because a panic path in a `Float` function is not on any corpus program's
--- ordinary route.
-fun zeroResult(s : Sel) -> Value {
-    let zero = tempValue(s, s.out.result)
-    if s.out.result.class_ == F64 { emit(s, A.FMovIn(A.reg(zero), A.xzr)) }
-    else { emit(s, A.Mov(A.reg(zero), A.xzr, A.W64)) }
-    zero
 }
 
 -- Where a global lives: in the root array if the collector must scan it, in
@@ -1669,9 +1658,9 @@ fun guardOn(s : Sel, c : A.Cond, message : String) -> Unit {
 
 -- Split the block: panic if `condition` holds, carry on if it does not.
 --
--- The panic path leaves the function with a zero of its result type --
--- `turkey_panic` sets a flag and returns rather than unwinding, so every
--- caller up the chain checks it and does the same.
+-- The panic path ends in `Unreachable`, which leaves the function with a zero
+-- of its result type -- `turkey_panic` sets a flag and returns rather than
+-- unwinding, so every caller up the chain checks it and does the same.
 fun guard(s : Sel, condition : Value, message : String) -> Unit {
     let failed = block(s)
     let carry = block(s)
@@ -1679,7 +1668,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
                                      BlockId(carry))
     s.at = failed
     -- An empty message means the panic is already raised and is being
-    -- propagated out of a callee: this path adds a return, not a diagnosis.
+    -- propagated out of a callee: this path adds an exit, not a diagnosis.
     if message != "" {
         let text = address(s, messageOf(s, message))
         s.panicking = True
@@ -1688,7 +1677,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
              A.Standard)
         s.panicking = False
     }
-    s.out.blocks[s.at].term = Ret(zeroResult(s))
+    s.out.blocks[s.at].term = Unreachable
     s.at = carry
 }
 

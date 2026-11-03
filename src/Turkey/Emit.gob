@@ -72,8 +72,10 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     function(b, Asm.symbolFor(d, f.name))
     prologue(b, l)
     -- Reverse postorder, so a block's most likely successor is the next block
-    -- and its edge costs no instruction at all.
-    let order = Ssa.reversePostorder(f)
+    -- and its edge costs no instruction at all. A block that is only the exit
+    -- is not placed: its edges go to the exit itself.
+    let exits = exitBlocks(f)
+    let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
     let cold = Cold { text = [], count = 0 }
@@ -85,16 +87,69 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
         match fused(block, reads) {
             Some((c, yes, no)) -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts) - 1)
-                conditional(b, d, tag, c, yes, no, next)
+                conditional(b, d, tag, exits, c, yes, no, next)
             }
             None -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
-                emitTerm(b, d, f, a, l, tag, edges, block.term, next)
+                emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
             }
         }
     }
     for item in cold.text { emit(b, item) }
+    if leaves(f) {
+        emit(b, Label(exitLabel(d, tag)))
+        zero(b, f)
+        epilogue(b, l)
+    }
 }
+
+-- -- the zero exit -----------------------------------------------------------
+
+-- Every path that leaves a function without a value -- an `Unreachable`, which
+-- is how selection ends a panic, and an allocation stub whose call panicked --
+-- returns a zero of the function's result through one exit after the
+-- function's cold code. They are most of a function's ways out, and none is
+-- hot, so each costs a branch instead of an epilogue. `Ret` does not come
+-- here: see `emitTerm`.
+fun exitLabel(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
+    Asm.localLabel(d, "e" + Int.toString(tag))
+
+-- Whether anything in `f` branches to its exit.
+fun leaves(f : Func Inst) -> Bool {
+    for block in f.blocks {
+        if unreachable(block.term) { return True }
+        for i in block.insts {
+            if Option.isSome(A.allocationOf(i.op))
+               || Option.isSome(A.arrayAllocationOf(i.op)) {
+                return True
+            }
+        }
+    }
+    False
+}
+
+-- For each block, whether it is nothing but `Unreachable`, as a panic
+-- propagated from a callee is: then an edge into it can go straight to the
+-- exit. Never the entry, which the prologue falls into.
+fun exitBlocks(f : Func Inst) -> Array Bool {
+    let out = Array.filled(len(f.blocks), False)
+    for var at = 0; at < len(f.blocks); at = at + 1 {
+        let block = f.blocks[at]
+        out[at] = at != Ssa.blockId(f.entry) && len(block.insts) == 0
+                  && unreachable(block.term)
+    }
+    out
+}
+
+fun unreachable(t : Term) -> Bool = match t {
+    Unreachable -> True
+    _ -> False
+}
+
+-- Where an edge to `block` lands.
+fun edgeTo(d : Asm.Dialect, tag : Int, exits : Array Bool, block : BlockId) -> Asm.Symbol =
+    if exits[Ssa.blockId(block)] { exitLabel(d, tag) }
+    else { blockLabel(d, tag, Ssa.blockId(block)) }
 
 -- The first `upTo` instructions of block `at`.
 --
@@ -154,8 +209,8 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
 -- allocations, out of the way of the fast ones.
 type Cold = Cold { text : Code, var count : Int }
 
--- The labels of allocation `n` in function `tag`: its stub (`"s"`), the
--- stub's panic exit (`"p"`) and the return to the fast path (`"r"`).
+-- The labels of allocation `n` in function `tag`: its stub (`"s"`) and the
+-- return to the fast path (`"r"`).
 fun allocationLabel(d : Asm.Dialect, tag : Int, n : Int, which : String) -> Asm.Symbol =
     Asm.localLabel(d, "a" + Int.toString(tag) + which + Int.toString(n))
 
@@ -225,14 +280,14 @@ fun fused(block : Block Inst, reads : Array Int) -> Option (A.Cond, BlockId, Blo
 }
 
 -- `b.cond` to one arm, falling through to the other where it is next.
-fun conditional(b : Code, d : Asm.Dialect, tag : Int, c : A.Cond,
+fun conditional(b : Code, d : Asm.Dialect, tag : Int, exits : Array Bool, c : A.Cond,
                 yes : BlockId, no : BlockId, next : Int) -> Unit {
     if Ssa.blockId(yes) == next {
-        instruction(b, A.BCond(A.invert(c), blockLabel(d, tag, Ssa.blockId(no))))
+        instruction(b, A.BCond(A.invert(c), edgeTo(d, tag, exits, no)))
     } else {
-        instruction(b, A.BCond(c, blockLabel(d, tag, Ssa.blockId(yes))))
+        instruction(b, A.BCond(c, edgeTo(d, tag, exits, yes)))
         if Ssa.blockId(no) != next {
-            instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(no))))
+            instruction(b, A.B(edgeTo(d, tag, exits, no)))
         }
     }
 }
@@ -585,12 +640,15 @@ fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
 -- gets, and the way back with the result in `dest` and `save` restored.
 --
 -- The result goes into `dest` before the restores, because one of them may be
--- into `x0`. The panic exit returns through the epilogue, which needs only the
--- callee-saved registers back, so it pops the save area without reading it.
+-- into `x0`. A panic leaves through the function's zero exit, which needs only
+-- the callee-saved registers back; a stub that pushed a save area pops it
+-- without reading it first, since the exit's epilogue expects `sp` where the
+-- body left it.
 fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
                    tag : Int, n : Int, dest : Reg, slow : Asm.Symbol,
                    save : Frame.CallSave, safepoint : Option Asm.Symbol) -> Unit {
-    let failed = allocationLabel(d, tag, n, "p")
+    let pushed = keptBytes(save) > 0
+    let failed = if pushed { allocationLabel(d, tag, n, "p") } else { exitLabel(d, tag) }
     instruction(b, A.Bl(slow, A.Standard))
     match safepoint {
         Some(label) -> emit(b, Label(label))
@@ -601,10 +659,11 @@ fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
     if !A.sameRegister(dest, A.x0) { instruction(b, A.Mov(dest, A.x0, A.W64)) }
     keep(b, save, False)
     instruction(b, A.B(allocationLabel(d, tag, n, "r")))
-    emit(b, Label(failed))
-    dropKept(b, save)
-    zero(b, f)
-    epilogue(b, l)
+    if pushed {
+        emit(b, Label(failed))
+        dropKept(b, save)
+        instruction(b, A.B(exitLabel(d, tag)))
+    }
 }
 
 -- Where the allocator put a value. A physical register is already itself --
@@ -639,17 +698,21 @@ fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
 
 fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
              a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
-             edges : Array (Option A.Arm), t : Term, next : Int) -> Unit =
+             edges : Array (Option A.Arm), exits : Array Bool, t : Term,
+             next : Int) -> Unit =
     match t {
         -- The result into the register the convention answers in, then the
-        -- frame comes down. Every return does its own epilogue: a shared exit
-        -- block would need the result in place before the jump anyway, and
-        -- would cost a branch to save the stores.
+        -- frame comes down. Every return does its own epilogue, unlike the
+        -- zero exits: a return is the hot way out, and a shared epilogue would
+        -- cost it a branch to save the restores.
         Ret(v) -> {
             result(b, coloured(f, a, A.reg(v)))
             epilogue(b, l)
         }
-        Jump(target, args) -> {
+        -- An edge into an exit block passes nothing, since nothing reads it.
+        Jump(target, args) -> if exits[Ssa.blockId(target)] {
+            instruction(b, A.B(exitLabel(d, tag)))
+        } else {
             let params = Ssa.blockAt(f, target).params
             copies(b, f, a, edges, params, args)
             -- After the copies, which may still read the registers these
@@ -673,27 +736,24 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
         Branch(c, yes, no) -> {
             let bit = coloured(f, a, A.reg(c))
             if Ssa.blockId(yes) == next {
-                instruction(b, A.Cbz(bit, blockLabel(d, tag, Ssa.blockId(no)), A.W32))
+                instruction(b, A.Cbz(bit, edgeTo(d, tag, exits, no), A.W32))
             } else {
-                instruction(b, A.Cbnz(bit, blockLabel(d, tag, Ssa.blockId(yes)), A.W32))
+                instruction(b, A.Cbnz(bit, edgeTo(d, tag, exits, yes), A.W32))
                 if Ssa.blockId(no) != next {
-                    instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(no))))
+                    instruction(b, A.B(edgeTo(d, tag, exits, no)))
                 }
             }
         }
-        -- Selection turns a panic into a call and a return, so one here is a
-        -- selection bug rather than a shape to emit. `brk` says so at run time
-        -- instead of falling into the next function.
+        -- Selection turns a panic into a call and an `Unreachable`, so one
+        -- here is a selection bug rather than a shape to emit. `brk` says so
+        -- at run time instead of falling into the next function.
         Panic(_) -> instruction(b, A.Brk(1))
         -- Selection turns a switch into comparisons, for the same reason.
         Switch(_, _, _) -> instruction(b, A.Brk(1))
-        -- Not a trap: this is reached only where the lowering proved no value
-        -- arrives, and the same zero every panic path returns is the same
+        -- Not a trap: this is reached after a panic, or where the lowering
+        -- proved no value arrives, and the zero a panic returns is the same
         -- claim made unexploitably.
-        Unreachable -> {
-            zero(b, f)
-            epilogue(b, l)
-        }
+        Unreachable -> instruction(b, A.B(exitLabel(d, tag)))
     }
 
 fun result(b : Code, r : Reg) -> Unit = match r {
@@ -702,6 +762,7 @@ fun result(b : Code, r : Reg) -> Unit = match r {
     Virtual(_) -> emit(b, Comment("an unallocated result reached the emitter"))
 }
 
+-- A double's zero is `fmov d0, xzr`: `mov d0, xzr` is not an instruction.
 fun zero(b : Code, f : Func Inst) -> Unit =
     match A.bankOf(f.result) {
         Gp -> instruction(b, A.Mov(A.x0, A.xzr, A.W64))

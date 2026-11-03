@@ -211,7 +211,7 @@ and iterates over `(key, value)` pairs in insertion order.
 
 ## Operator classes
 
-Each arithmetic and comparison operator calls a class method
+Each arithmetic, comparison and bitwise operator calls a class method
 ([Operators](expressions.md#operators-are-class-methods)):
 
 ```text
@@ -233,7 +233,19 @@ class Ord a : Eq a {
     fun gt(x : a, y : a) -> Bool = lt(y, x)
     fun gte(x : a, y : a) -> Bool = !lt(x, y)
 }
+
+class BitAnd a { fun and(a, a) -> a }
+class BitOr a { fun or(a, a) -> a }
+class BitXor a { fun xor(a, a) -> a }
+
+class Shift a {
+    fun shl(a, Int) -> a
+    fun shr(a, Int) -> a
+}
 ```
+
+`Int` and `Byte` have instances of the four bitwise classes
+([Bitwise operators](expressions.md#bitwise-operators)).
 
 The Prelude's `min(x, y)` and `max(x, y)` answer the lesser and the greater
 of two values of any `Ord` type. When neither is less than the other, `min`

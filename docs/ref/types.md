@@ -111,9 +111,16 @@ fun main() {
 
 The library module `Int` has arithmetic that wraps around or returns an
 `Option` instead of panicking, a floored modulus (`Int.mod`), and the bitwise
-operations. There are no bitwise operators. The shifts, `Int.shl` and
-`Int.shr`, panic when the shift amount is outside 0 to 63 rather than masking
-it, and `Int.shr` copies the sign bit.
+operations, which the [bitwise operators](expressions.md#bitwise-operators)
+`&`, `|`, `^`, `<<` and `>>` also spell. The shifts panic when the shift amount
+is outside 0 to 63 rather than masking it, and `>>` copies the sign bit.
+
+<!-- panic: shift amount is not in 0..63 -->
+```kotlin
+fun main() {
+    print(1 << 64)
+}
+```
 
 ### Float
 

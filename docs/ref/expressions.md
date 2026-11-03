@@ -59,10 +59,10 @@ operator here are for [declared operators](#declared-operators).
 | | `-e` `!e` | prefix | every group: negation, logical not |
 | `Multiplication` | `*` `/` `%` | left | `Addition` |
 | `Addition` | `+` `-` | left | `Comparison` |
-| `BitShift` | | left | `BitAnd`, `Comparison` |
-| `BitAnd` | | left | `BitOr`, `BitXor`, `Comparison` |
-| `BitOr` | | left | `Comparison` |
-| `BitXor` | | left | `Comparison` |
+| `BitShift` | `<<` `>>` | left | `BitAnd`, `Comparison` |
+| `BitAnd` | `&` | left | `BitOr`, `BitXor`, `Comparison` |
+| `BitOr` | `\|` | left | `Comparison` |
+| `BitXor` | `^` | left | `Comparison` |
 | `Combine` | | right | `Comparison` |
 | `Comparison` | `<` `<=` `>` `>=` | left | `Equality` |
 | `Equality` | `==` `!=` | left | `Conjunction` |
@@ -157,7 +157,8 @@ The operator always means the class method, even in a module that declares its
 own function called `add` or `eq`. Being Prelude declarations, these operators
 are imported like the Prelude's other names: a module that writes
 `import Prelude ()` has none of them until it imports them from the modules
-that declare them, `Data.Num`, `Data.Eq` and `Data.Ord`
+that declare them, `Data.Num`, `Data.Eq`, `Data.Ord` and, for the
+[bitwise operators](#bitwise-operators), `Bits`
 ([Operators in imports](modules.md#operators-in-imports)):
 
 <!-- run -->
@@ -184,6 +185,51 @@ Which instances the library provides for the built-in types is listed in
 [Built-in types and classes](builtins.md#operator-classes). In particular `+`
 concatenates strings, there is no `%` on `Float`, and `Byte` has no arithmetic.
 
+### Bitwise operators
+
+`&`, `|`, `^`, `<<` and `>>` are declared by the Prelude the same way, each
+calling the method of a class of its own, so a type can have some of them and
+not the others:
+
+| Expression | Means | Class |
+|---|---|---|
+| `a & b` | `and(a, b)` | `BitAnd` |
+| `a \| b` | `or(a, b)` | `BitOr` |
+| `a ^ b` | `xor(a, b)` | `BitXor` |
+| `a << n`, `a >> n` | `shl(a, n)`, `shr(a, n)` | `Shift` |
+
+The shift amount is an `Int` whatever is shifted. `Int` and `Byte` have all
+four classes ([Built-in types and classes](builtins.md#operator-classes)).
+
+The bitwise groups bind tighter than the comparisons, so a mask test needs no
+parentheses, but they are unrelated to the arithmetic groups and to each other
+except where the [table](#operators) relates them:
+
+<!-- run -->
+```kotlin
+fun isSet(flags : Int, bit : Int) -> Bool = flags & (1 << bit) != 0
+
+fun main() {
+    let flags = 0b0101
+    print(isSet(flags, 2))
+    print(isSet(flags, 1))
+    print(flags | 1 << 3)
+}
+```
+
+```text
+True
+False
+13
+```
+
+<!-- error: '+' (Addition) and '<<' (BitShift) have no precedence between them -->
+```kotlin
+fun main() {
+    print(1 + 2 << 3)
+}
+```
+
 ### Logical operators
 
 `&&`, `||` and `!` are built in and work only on `Bool`. `&&` and `||`
@@ -209,11 +255,11 @@ alias for a function: `infix Combine (<>) = combine` puts `<>` in the group
 * The operator is any [operator token](lexical.md#operators-and-punctuation)
   other than the built-in `&&`, `||` and `!`, the punctuation `=`, `->` and
   `~`, and an operator that ends in `=` without beginning with one: `+=` and
-  `>>=` cannot be declared, and `===` can. An arithmetic or comparison
-  operator may be declared only in its own group
-  ([Operators are class methods](#operators-are-class-methods)). `|` may be
-  declared: patterns and type declarations, which use it, are read separately
-  from expressions.
+  `>>=` cannot be declared, and `===` can. An arithmetic, comparison or
+  bitwise operator may be declared only in its own group
+  ([Operators are class methods](#operators-are-class-methods)). `|` is
+  declared in `BitOr` though patterns and type declarations use it too: those
+  are read separately from expressions.
 * The target is a top-level function or a class method that takes two
   parameters, from this module or one it imports. It may be qualified.
 * A use is an ordinary call of the target. Its types are the target's, a class

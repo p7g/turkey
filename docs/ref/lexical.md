@@ -92,15 +92,15 @@ followed by `=`, and `x==-1` is `x`, the operator `==-`, and `1`. A run stops
 before `--`, which begins a comment. Some runs the language spells itself:
 
 ```text
-+   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !   =   ->  |   ~
++   -   *   /   %   ==  !=  <   <=  >   >=  <<  >>  &   |   ^
+&&  ||  !   =   ->  ~
 ```
 
-`&&`, `||` and `!` are built in, and `=`, `->`, `|` and `~` are punctuation;
-`|` separates patterns and constructors, and a module may also
-[declare](expressions.md#declared-operators) it as a binary operator. The
-arithmetic and comparison operators are
+`&&`, `||` and `!` are built in, and `=`, `->` and `~` are punctuation. The
+arithmetic, comparison and bitwise operators are
 [declared by the Prelude](expressions.md#operators-are-class-methods), in
-groups the language fixes. Any other run is an operator only where a module
+groups the language fixes. `|` is also punctuation in patterns and type
+declarations, where it separates alternatives. Any other run is an operator only where a module
 declares it. Using one that nothing
 declares is an error, and when the run splits into operators that do exist,
 the message suggests the split:

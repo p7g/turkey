@@ -171,16 +171,28 @@ type Convention = Standard | PreservesNone
 
 -- The registers of `bank` a call destroys, as a mask with bit `n` for register
 -- `n`, and 0 for an instruction that is not a call. Every register number in
--- either file is below 32. An allocation is a call on its slow path, to the
--- runtime, under the standard convention.
+-- either file is below 32.
+--
+-- An allocation destroys none the allocator hands out. Its fast path writes
+-- only its destination and `x16`/`x17`, which are outside the pool. Its slow
+-- path calls the runtime under the standard convention, and so the stub saves
+-- every caller-saved register holding a value live after the allocation, and
+-- restores it after the call (`Turkey.Emit.stub`, `Turkey.Frame.stubAt`). The
+-- collector does not need those saved registers described: a traced value
+-- live across the allocation is also in its root slot (`Turkey.Roots`), and
+-- the collector does not move objects, so a restored pointer is still valid.
+-- An allocation is still a call to `isCall`, since the collector may run there.
+--
+-- Treating an allocation as a standard call instead would deny every
+-- caller-saved register to every value live across one, though only the slow
+-- path calls, once per refill of a size class's cursor. On the self-compile
+-- that is more of those denials than every real call causes.
 --
 -- Masks rather than lists, and computed once: the allocator asks this of
 -- every instruction it walks.
 fun callClobbers(op : Arm, bank : Bank) -> Int = match op {
     Bl(_, c) -> clobbersUnder(c, bank)
     Blr(_, c) -> clobbersUnder(c, bank)
-    Allocate(_, _) -> clobbersUnder(Standard, bank)
-    AllocateArray(_, _, _, _) -> clobbersUnder(Standard, bank)
     _ -> 0
 }
 
@@ -670,6 +682,9 @@ fun setsFlags(op : Arm) -> Bool = match op {
     _ -> False
 }
 
+-- Whether an instruction calls out of the function, at least on some path:
+-- a safepoint, where the collector may run. An allocation is one, though it
+-- destroys no allocatable register (`callClobbers`).
 fun isCall(i : Inst) -> Bool = match i.op {
     Bl(_, _) -> True
     Blr(_, _) -> True

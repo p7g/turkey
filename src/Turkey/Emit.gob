@@ -82,14 +82,13 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
         emit(b, Label(blockLabel(d, tag, at)))
         let block = f.blocks[at]
-        let insts = withoutEdgeDefinitions(block.insts, edges)
         match fused(block, reads) {
             Some((c, yes, no)) -> {
-                emitInsts(b, cold, d, f, a, l, tag, insts, len(insts) - 1)
+                emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts) - 1)
                 conditional(b, d, tag, c, yes, no, next)
             }
             None -> {
-                emitInsts(b, cold, d, f, a, l, tag, insts, len(insts))
+                emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
                 emitTerm(b, d, f, a, l, tag, edges, block.term, next)
             }
         }
@@ -97,7 +96,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     for item in cold.text { emit(b, item) }
 }
 
--- The first `upTo` instructions of a block.
+-- The first `upTo` instructions of block `at`.
 --
 -- An `Allocate` takes the safepoint map directly after it, if there is one:
 -- that position is its stub's call, so the label goes into the stub. One that
@@ -105,8 +104,13 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
 -- else.
 fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
               a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
-              insts : Vec Inst, upTo : Int) -> Unit {
+              edges : Array (Option A.Arm), at : Int, insts : Vec Inst,
+              upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
+        -- Skip a definition the jump computes, rather than filtering the block
+        -- beforehand, so that `n` stays the instruction's index in its block:
+        -- `Frame.stubAt` names an allocation by that index.
+        if definedAtEdge(insts[n], edges) { continue }
         let op = insts[n].op
         match A.pollOf(op) {
             Some((pb, pn)) -> {
@@ -119,6 +123,7 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
             emitInst(b, d, f, a, l, tag, insts[n])
             continue
         }
+        let save = Frame.stubAt(l, at, n)
         var label = None
         if n + 1 < upTo {
             match A.safepointOf(insts[n + 1].op) {
@@ -131,14 +136,15 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
         }
         match A.allocationOf(op) {
             Some((dest, allocation)) ->
-                allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, label)
+                allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, save,
+                         label)
             None -> {}
         }
         match A.arrayAllocationOf(op) {
             Some((dest, length, fill, allocation)) ->
                 allocateArray(b, cold, d, f, l, tag, coloured(f, a, dest),
                               coloured(f, a, length), coloured(f, a, fill), allocation,
-                              label)
+                              save, label)
             None -> {}
         }
     }
@@ -196,17 +202,9 @@ fun atEdges(f : Func Inst, reads : Array Int) -> Array (Option A.Arm) {
     out
 }
 
--- A block's instructions less the definitions a jump computes instead
--- (`atEdges`). The same vector when there are none, which is almost always.
-fun withoutEdgeDefinitions(insts : Vec Inst, edges : Array (Option A.Arm)) -> Vec Inst {
-    let atEdge = fun(i : Inst) = Ssa.anyDef(i, fun(v) = Option.isSome(edges[Ssa.valueId(v)]))
-    if !Iterator.any(insts, atEdge) { return insts }
-    let out : Vec Inst = []
-    for i in insts {
-        if !atEdge(i) { Vec.push(out, i) }
-    }
-    out
-}
+-- Whether a jump computes what `i` defines instead (`atEdges`).
+fun definedAtEdge(i : Inst, edges : Array (Option A.Arm)) -> Bool =
+    Ssa.anyDef(i, fun(v) = Option.isSome(edges[Ssa.valueId(v)]))
 
 -- A block ending `cset %c, cond; branch %c` where nothing else reads `%c`:
 -- the branch can read the flags itself. Only when the `cset` is the last
@@ -377,10 +375,11 @@ fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
 -- Only the destination and the two scratch registers are written, which is
 -- what lets the allocator see one instruction: the destination holds each
 -- intermediate in turn, so no other value is disturbed. An empty cursor
--- branches to its stub, after the function.
+-- branches to its stub, after the function, which keeps `save` across its
+-- call.
 fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
              l : Frame.Layout, tag : Int, dest : Reg, al : A.Allocation,
-             safepoint : Option Asm.Symbol) -> Unit {
+             save : Frame.CallSave, safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let cursor = scratch
@@ -408,7 +407,7 @@ fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.Str(cursor, Offset(dest, Rt.headerKind), A.W64))
     instruction(b, A.AddImm(dest, dest, Rt.headerBytes, A.W64))
     emit(b, Label(allocationLabel(d, tag, n, "r")))
-    stub(cold.text, d, f, l, tag, n, dest, al, safepoint)
+    stub(cold.text, d, f, l, tag, n, dest, al, save, safepoint)
 }
 
 -- An `AllocateArray`'s fast path: the size class from the runtime's table by
@@ -421,7 +420,8 @@ fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
 -- allocator knows (`A.writesBeforeReading`), so it holds neither.
 fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
                   l : Frame.Layout, tag : Int, dest : Reg, length : Reg, fill : Reg,
-                  al : A.ArrayAllocation, safepoint : Option Asm.Symbol) -> Unit {
+                  al : A.ArrayAllocation, save : Frame.CallSave,
+                  safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let slow = allocationLabel(d, tag, n, "s")
@@ -489,9 +489,11 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.BCond(A.Ne, top))
     emit(b, Label(back))
     -- The stub: the length and the fill into the first two argument
-    -- registers, without either overwriting the other.
+    -- registers, without either overwriting the other. Saving first leaves
+    -- both where the allocator put them.
     let text = cold.text
     emit(text, Label(slow))
+    keep(text, save, True)
     let x1 = A.argRegs[1]
     if A.sameRegister(fill, A.x0) && A.sameRegister(length, x1) {
         instruction(text, A.Mov(scratch, fill, A.W64))
@@ -506,7 +508,7 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     }
     instruction(text, A.MovConst(A.argRegs[2], al.width))
     instruction(text, A.MovConst(A.argRegs[3], al.layout))
-    returnFromStub(text, d, f, l, tag, n, dest, al.slow, safepoint)
+    returnFromStub(text, d, f, l, tag, n, dest, al.slow, save, safepoint)
 }
 
 -- A loop's poll (`Turkey.Polls`): a test of the worker's stop word on the
@@ -530,27 +532,42 @@ fun poll(b : Code, cold : Cold, d : Asm.Dialect, l : Frame.Layout, tag : Int,
     let text = cold.text
     emit(text, Label(slow))
     let save = Frame.pollAt(l, pb, pn)
-    let bytes = (8 * len(save.kept) + 15) / 16 * 16
-    adjust(text, bytes, False)
-    for var k = 0; k < len(save.kept); k = k + 1 {
-        instruction(text, A.Str(save.kept[k], Offset(A.sp, 8 * k), A.W64))
-    }
+    keep(text, save, True)
     instruction(text, A.Bl(Asm.turkeyEntry(d, "turkey_poll"), A.Standard))
     emit(text, Label(safepointLabel(d, tag, pb, pn)))
-    for var k = 0; k < len(save.kept); k = k + 1 {
-        instruction(text, A.Ldr(save.kept[k], Offset(A.sp, 8 * k), A.W64))
-    }
-    adjust(text, bytes, True)
+    keep(text, save, False)
     instruction(text, A.B(back))
 }
+
+-- The registers a slow path keeps across its call, pushed below the frame
+-- when `saving` and popped otherwise.
+fun keep(b : Code, save : Frame.CallSave, saving : Bool) -> Unit {
+    if saving { adjust(b, keptBytes(save), False) }
+    for var k = 0; k < len(save.kept); k = k + 1 {
+        instruction(b, if saving { A.Str(save.kept[k], Offset(A.sp, 8 * k), A.W64) }
+                       else { A.Ldr(save.kept[k], Offset(A.sp, 8 * k), A.W64) })
+    }
+    if !saving { adjust(b, keptBytes(save), True) }
+}
+
+-- The save area alone popped, its registers left as the call left them.
+fun dropKept(b : Code, save : Frame.CallSave) -> Unit = adjust(b, keptBytes(save), True)
+
+-- The save area's size, a multiple of 16 so that `sp` stays aligned.
+fun keptBytes(save : Frame.CallSave) -> Int = (8 * len(save.kept) + 15) / 16 * 16
 
 -- An allocation's slow path, after the function: the runtime's allocator with
 -- its constant arguments, the label the frame table names its return address
 -- by, the panic test every call gets, and back.
+--
+-- The register allocator was told the allocation destroys no allocatable
+-- register but its destination (`A.callClobbers`), so the stub keeps the live
+-- values in registers the call clobbers, as a poll does.
 fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
-         tag : Int, n : Int, dest : Reg, al : A.Allocation,
+         tag : Int, n : Int, dest : Reg, al : A.Allocation, save : Frame.CallSave,
          safepoint : Option Asm.Symbol) -> Unit {
     emit(b, Label(allocationLabel(d, tag, n, "s")))
+    keep(b, save, True)
     var k = 0
     for arg in al.args {
         let r = A.argRegs[k]
@@ -561,14 +578,18 @@ fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
         }
         k = k + 1
     }
-    returnFromStub(b, d, f, l, tag, n, dest, al.slow, safepoint)
+    returnFromStub(b, d, f, l, tag, n, dest, al.slow, save, safepoint)
 }
 
 -- The call that ends a stub, its frame-table label, the panic test every call
--- gets, and the way back with the result in `dest`.
+-- gets, and the way back with the result in `dest` and `save` restored.
+--
+-- The result goes into `dest` before the restores, because one of them may be
+-- into `x0`. The panic exit returns through the epilogue, which needs only the
+-- callee-saved registers back, so it pops the save area without reading it.
 fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
                    tag : Int, n : Int, dest : Reg, slow : Asm.Symbol,
-                   safepoint : Option Asm.Symbol) -> Unit {
+                   save : Frame.CallSave, safepoint : Option Asm.Symbol) -> Unit {
     let failed = allocationLabel(d, tag, n, "p")
     instruction(b, A.Bl(slow, A.Standard))
     match safepoint {
@@ -578,8 +599,10 @@ fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
     instruction(b, A.Ldr(scratch, Offset(A.worker, 0), A.W32))
     instruction(b, A.Cbnz(scratch, failed, A.W32))
     if !A.sameRegister(dest, A.x0) { instruction(b, A.Mov(dest, A.x0, A.W64)) }
+    keep(b, save, False)
     instruction(b, A.B(allocationLabel(d, tag, n, "r")))
     emit(b, Label(failed))
+    dropKept(b, save)
     zero(b, f)
     epilogue(b, l)
 }

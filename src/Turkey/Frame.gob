@@ -1,5 +1,6 @@
 export (
-    Layout(..), SafepointMap(..), PollSave(..), layout, offsetOf, verifyFrame, pollAt,
+    Layout(..), SafepointMap(..), CallSave(..), layout, offsetOf, verifyFrame, pollAt,
+    stubAt,
 )
 
 -- A function's frame, laid out after register allocation.
@@ -47,11 +48,13 @@ import Turkey.Ssa (BlockId(..))
 -- offsets from `x29` of the root slots live across it.
 type SafepointMap = SafepointMap { block : Int, index : Int, offsets : Vec Int }
 
--- What a loop's poll does on its slow path (`Turkey.Emit.poll`): the
--- registers it keeps across its call -- the live values in registers a call
--- clobbers. It stores no roots: every root is in its slot from its definition
--- on (`Turkey.Select.run`).
-type PollSave = PollSave { kept : Vec Reg }
+-- What a slow path the allocator does not see as a call keeps across its
+-- call: a loop's poll's (`Turkey.Emit.poll`) or an allocation's stub's
+-- (`Turkey.Emit.stub`). The registers are the ones a call clobbers that hold
+-- a value live after the instruction, other than a value it defines. It stores
+-- no roots: every root is in its slot from its definition on
+-- (`Turkey.Select.run`).
+type CallSave = CallSave { kept : Vec Reg }
 
 type Layout = Layout {
     size     : Int,
@@ -70,15 +73,24 @@ type Layout = Layout {
     -- Bytes, not slots.
     outgoing : Int,
     maps     : Vec SafepointMap,
-    -- Each poll's, by `pollKey`.
-    polls    : Map.Map Int PollSave,
+    -- Each poll's, by `positionKey` of its low IR position.
+    polls    : Map.Map Int CallSave,
+    -- Each allocation's, by `positionKey` of its block and index in the
+    -- allocated code.
+    stubs    : Map.Map Int CallSave,
 }
 
-fun pollKey(b : Int, n : Int) -> Int = Int.or(Int.shl(b, 32), n)
+fun positionKey(b : Int, n : Int) -> Int = Int.or(Int.shl(b, 32), n)
 
-fun pollAt(l : Layout, b : Int, n : Int) -> PollSave = match Map.get(l.polls, pollKey(b, n)) {
-    Some(p) -> p
-    None -> PollSave { kept = [] }
+-- What the poll at low IR position `(b, n)` keeps across its call.
+fun pollAt(l : Layout, b : Int, n : Int) -> CallSave = savedAt(l.polls, positionKey(b, n))
+
+-- What the allocation at instruction `n` of block `b` keeps across its stub.
+fun stubAt(l : Layout, b : Int, n : Int) -> CallSave = savedAt(l.stubs, positionKey(b, n))
+
+fun savedAt(saves : Map.Map Int CallSave, key : Int) -> CallSave = match Map.get(saves, key) {
+    Some(s) -> s
+    None -> CallSave { kept = [] }
 }
 
 fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
@@ -126,7 +138,7 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
         savedGp = savedGp, savedFp = savedFp, rootsAt = rootsAt, roots = roots,
         spillsAt = spillsAt, spills = spills, objectsAt = objectsAt,
         objectStarts = objectStarts, objectBytes = objectBytes,
-        outgoing = outgoing, maps = [], polls = Map.new(),
+        outgoing = outgoing, maps = [], polls = Map.new(), stubs = Map.new(),
     }
     for block in f.blocks {
         for i in block.insts {
@@ -152,24 +164,35 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
             }
         }
     }
-    placePolls(l, a)
+    placeSaves(l, a)
     l
 }
 
--- What each poll keeps, from the liveness of the allocated code:
--- the values live after the poll are the ones its call must not lose.
-fun placePolls(l : Layout, a : Regalloc.Allocation) -> Unit {
+-- What each poll and each allocation keeps, from the liveness of the
+-- allocated code: the values live after it are the ones its call must not
+-- lose.
+fun placeSaves(l : Layout, a : Regalloc.Allocation) -> Unit {
     let f = a.func
     for var bi = 0; bi < len(f.blocks); bi = bi + 1 {
         let insts = f.blocks[bi].insts
         var after : Array (Array Int) = []
         for var k = 0; k < len(insts); k = k + 1 {
-            match A.pollOf(insts[k].op) {
-                Some((b, n)) -> {
+            let i = insts[k]
+            let key = match A.pollOf(i.op) {
+                Some((b, n)) -> Some((l.polls, positionKey(b, n)))
+                None -> if Option.isSome(A.allocationOf(i.op))
+                           || Option.isSome(A.arrayAllocationOf(i.op)) {
+                    Some((l.stubs, positionKey(bi, k)))
+                } else {
+                    None
+                }
+            }
+            match key {
+                Some((saves, at)) -> {
                     if len(after) == 0 {
                         after = Ssa.liveAfter(f, BlockId(bi), a.liveOut[bi])
                     }
-                    Map.put(l.polls, pollKey(b, n), pollSave(a, after[k]))
+                    Map.put(saves, at, callSave(a, i, after[k]))
                 }
                 None -> {}
             }
@@ -177,9 +200,13 @@ fun placePolls(l : Layout, a : Regalloc.Allocation) -> Unit {
     }
 }
 
-fun pollSave(a : Regalloc.Allocation, live : Array Int) -> PollSave {
+-- The caller-saved registers holding a value in `live` that `i` does not
+-- define. An allocation's stub writes its own result after the call, so that
+-- one needs no keeping, and restoring it would overwrite the result.
+fun callSave(a : Regalloc.Allocation, i : A.Inst, live : Array Int) -> CallSave {
     let kept = []
     for id in live {
+        if Ssa.anyDef(i, fun(d) = Ssa.valueId(d) == id) { continue }
         match inRegister(a, id) {
             Some(Physical(bank, number)) ->
                 if Int.and(A.calleeSavedMask(bank), Int.shl(1, number)) == 0 {
@@ -188,7 +215,7 @@ fun pollSave(a : Regalloc.Allocation, live : Array Int) -> PollSave {
             _ -> {}
         }
     }
-    PollSave { kept = kept }
+    CallSave { kept = kept }
 }
 
 -- The register value `id` was coloured into, if it lives in one.

@@ -121,7 +121,8 @@ fun countOf(f : Func A.Inst, live : Array Int) -> (Int, Int) {
 -- A call clobbers every caller-saved register, so a value live across one can
 -- be held only in a callee-saved register -- of which the general file has ten
 -- and the vector file eight -- or in memory. Total pressure can fit
--- comfortably in 28 registers and this can still not fit in 10.
+-- comfortably in 28 registers and this can still not fit in 10. An allocation
+-- is not counted: it clobbers nothing allocatable (`A.callClobbers`).
 --
 -- Traced and untraced are counted apart because they are not equally
 -- expensive to spill. A traced value live across a safepoint is *already*
@@ -146,7 +147,7 @@ fun acrossCalls(f : Func A.Inst) -> AcrossCalls {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
         for var n = 0; n < len(block.insts); n = n + 1 {
-            if A.isCall(block.insts[n]) {
+            if clobbersOnCall(block.insts[n]) {
                 calls = calls + 1
                 var thisUg = 0
                 var thisTg = 0
@@ -171,6 +172,11 @@ fun acrossCalls(f : Func A.Inst) -> AcrossCalls {
     AcrossCalls { untracedGp = ug, tracedGp = tg, untracedFp = uf,
                   tracedFp = tf, calls = calls }
 }
+
+-- Whether an instruction is a call that destroys some register the
+-- allocator hands out.
+fun clobbersOnCall(i : A.Inst) -> Bool =
+    A.callClobbers(i.op, Gp) != 0 || A.callClobbers(i.op, Fp) != 0
 
 
 -- Pressure once the root array is counted as the spill slot it already is.
@@ -902,10 +908,6 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
             if clobberedGp != 0 || clobberedFp != 0 || holding {
                 let after = BitSet.elements(live)
                 for id in after {
-                    -- A call that defines a register itself (`Allocate`)
-                    -- destroys the caller-saved ones before it writes that
-                    -- register, so its own result may take one.
-                    if A.isCall(i) && defines(i, id) { continue }
                     out[id] = Int.or(out[id], match A.bankOf(f.reps[id]) {
                         Gp -> clobberedGp
                         Fp -> clobberedFp
@@ -929,7 +931,6 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
     out
 }
 
-fun defines(i : A.Inst, id : Int) -> Bool = Ssa.anyDef(i, fun(v) = Ssa.valueId(v) == id)
 fun forbidHeld(out : Array Int, f : Func A.Inst, held : PhysicalLive,
                id : Int) -> Unit {
     let taken = match A.bankOf(f.reps[id]) {
@@ -1153,7 +1154,8 @@ fun untracedPressure(f : Func A.Inst) -> Pressure {
     Pressure { gp = gp, fp = fp }
 }
 
--- The most values live across any single call, traced and untraced together.
+-- The most values live across any single call, traced and untraced together,
+-- counting the calls `acrossCalls` counts.
 --
 -- `acrossCalls` reports the two categories' maxima independently, which can be
 -- at different call sites and so understates the worst one. This is the number
@@ -1165,7 +1167,7 @@ fun worstCall(f : Func A.Inst) -> Int {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
         for var n = 0; n < len(block.insts); n = n + 1 {
-            if A.isCall(block.insts[n]) {
+            if clobbersOnCall(block.insts[n]) {
                 var here = 0
                 for id in after[n] {
                     match A.bankOf(f.reps[id]) {
@@ -1472,8 +1474,8 @@ fun standIn(g : Func A.Inst, out : Vec A.Inst, spills : Spills,
 }
 
 -- Whether an instruction ends every reload's stretch: a call, which destroys
--- the registers a reload could otherwise keep, or a poll, at which the
--- collector may run.
+-- the registers a reload could otherwise keep, or an allocation or a poll, at
+-- which the collector may run.
 fun endsReloads(i : A.Inst) -> Bool =
     A.isCall(i) || Option.isSome(A.pollOf(i.op))
 

@@ -1,8 +1,12 @@
 export (
-    count, index, new, recordOf,
+    count, index, new, recordOf, threadLimit, mainRegister,
     workSeen, sleepForWork, signalWork, collectionSeen, sleepForCollection, signalCollection, stopTheWorld, startTheWorld, stopEnter, stopLeave,
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
+    permits, permitsSet, permitHeld, permitWanted, permitGive, permitAwait,
+    queuedSet, idleEnter, idleLeave,
+    monitorStart, monitoring, monitorState, monitorCalling, monitorWork, monitorHold, monitorTake,
+    monitorHandOut, monitorSleep,
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
     blockingFstat, blockingOpenat, blockingFstatat, blockingUnlinkat, blockingMkdirat,
     blockingRenameat, blockingReadlinkat, blockingFlock, blockingReaddir,
@@ -13,15 +17,35 @@ export (
     pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
 
--- The workers: the threads that run Turkey code, each with a record of its own
--- (`Turkey.Process` lays it out) that `x28` holds while it runs, and how a
--- collection stops all but itself.
+-- The threads that run Turkey code, each with a record of its own
+-- (`Turkey.Process` lays it out) that `x28` holds while it runs; the run
+-- permits that say which of them may take tasks; and how a collection stops
+-- all but itself.
 --
 -- A giblet module, since the collector and the allocator call it.
 --
--- **Stopping the world.** A collection runs with every other worker stopped at
+-- **Records and permits.** A thread's record is what makes it a mutator: its
+-- allocator cursors, its remembered set, its stop word, its stack and its
+-- index. A thread keeps the record it starts with for life, so every table
+-- indexed by a thread's index (`Turkey.Coroutine`'s, the heap's) has one
+-- owner. What `TURKEY_WORKERS` counts is permits: a thread takes tasks from
+-- the queue only while it holds one (`Turkey.Scheduler.workerLoop`). Permits
+-- are interchangeable, so what is kept is how many no thread holds.
+--
+-- **Blocking calls.** A thread about to wait in a C call that may take as long
+-- as something outside the program does -- a file read, `flock` -- says so
+-- with one store (`callEnter`) and keeps its permit. If it is still in the
+-- same call on two ticks of the monitor while tasks wait for a thread, the
+-- monitor takes the permit and hands it to a spare thread (`Turkey.Monitor`).
+-- A call that returns first costs one compare-and-swap (`callExit`). One that
+-- finds its permit gone takes a free one if there is one. Otherwise its
+-- record is still its own, so it can still take the scheduler's lock: it
+-- gives its task back to the scheduler to queue and parks as a spare
+-- (`Turkey.Scheduler.afterCall`).
+--
+-- **Stopping the world.** A collection runs with every other thread stopped at
 -- a safepoint, where the frame tables describe its roots. The collecting
--- worker raises each other worker's stop word -- the word every loop's poll
+-- thread raises each other thread's stop word -- the word every loop's poll
 -- tests (`Turkey.Polls`), which the allocator's slow path tests too -- and
 -- waits until each is either stopped or blocked:
 --
@@ -30,14 +54,14 @@ export (
 --   like any parked one, and waits for the word to come down, marking for
 --   the collection meanwhile if it is asked to (`Turkey.Heap.stopAt`);
 -- * **blocked**: it declared, before waiting on something outside Turkey code
---   -- a lock, or for work -- that its stack is parked at a frame and that it
---   holds nothing else. The collector claims a blocked worker (*held*) so that
---   it cannot run again until the collection ends.
+--   -- a lock, work, a permit or a C call -- that its stack is parked at a
+--   frame and that it holds nothing else. The collector claims a blocked
+--   thread (*held*) so that it cannot run again until the collection ends.
+--   The monitor holds a blocked thread the same way while it takes its permit.
 --
--- A worker's state is one word, changed only atomically. The collector waits
--- at the end until every worker it stopped is running again, so that a second
--- collection never mistakes a worker still leaving the first for one stopped
--- for it.
+-- The collector waits at the end until every thread it stopped is running
+-- again, so that a second collection never mistakes a thread still leaving
+-- the first for one stopped for it.
 
 import Prelude ()
 import Data.Int (Int)
@@ -47,51 +71,107 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Int ()
 import Data.Bool (Bool(..))
-import Bits (BitOr(..), (|))
+import Bits (BitAnd(..), BitOr(..), (&), (|))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Memory as Memory
+import Turkey.Process as Process
 import Turkey.Stack as Stack
 import Turkey.Sys as Sys
 
--- At most this many workers, so that the tables below are allocated once.
-let limit : Int = 64
+-- At most this many threads run Turkey code, the program's own included, and
+-- every table indexed by a thread is this long: about 80 bytes a thread, all
+-- of it allocated at start. One more crashes the program
+-- (`threadsExhausted`), as Go's runtime crashes past 10000.
+--
+-- A thread beyond the permits exists only to carry a permit while another
+-- thread is blocked in a call, so this bounds the calls blocked at once. Past
+-- about a thousand, synchronous calls stop paying: Haas and Leis (VLDB 2023)
+-- needed a little over 1000 `pread`s in flight to keep an NVMe drive busy,
+-- and found more threads than that spending most of their time in the
+-- kernel. A program that blocks more threads than this is more likely stuck,
+-- with tasks waiting on each other's file locks, than busy; and every
+-- collection visits every thread.
+fun threadLimit() -> Int = 1024
 
--- Each worker's record, by index; index 0 is the main worker's, the process
--- state every program defines.
-var records : Prim.Ptr = zeroed(8 * limit)
--- Each worker's state, by index: `running` (0), `stopped` (1), `blocked` (2)
--- or `held` (3).
-var states : Prim.Ptr = zeroed(8 * limit)
--- Word 0: 1 while a collection is stopping the world, claimed by
--- compare-and-swap. Word 8: how many workers there are.
+-- Each thread's record, by index; index 0 is the program's own thread's, the
+-- process state every program defines.
+var records : Prim.Ptr = zeroed(8 * threadLimit())
+
+-- Each thread's state, by index: one word, changed only atomically.
+--
+-- * Bits 0 to 2 are what the thread is doing: running Turkey code (0),
+--   stopped at a safepoint (1), waiting (2) -- for a lock, for work or for a
+--   permit -- or in a blocking call (4). 3 and 5 are those two, held.
+-- * Bit 3 is set while the thread holds no permit.
+-- * The bits from 4 up count the thread's blocking calls, so that the monitor
+--   can tell one long call from two short ones.
+--
+-- The thread writes its own word with plain stores only while it runs, when
+-- nothing else writes it, and leaves a wait or a call by compare-and-swap,
+-- which fails while it is held. A holder holds a waiting or calling thread by
+-- compare-and-swap and lets it go by a store.
+var states : Prim.Ptr = zeroed(8 * threadLimit())
+
+let stoppedState : Int = 1
+let waitingState : Int = 2
+let callingState : Int = 4
+let noPermit : Int = 8
+let callStep : Int = 16
+
+-- Word 0: 1 while a collection is stopping the world, 2 while a thread is
+-- being registered, claimed by compare-and-swap. Word 8: how many threads
+-- there are.
 var control : Prim.Ptr = zeroed(16)
 
--- What workers with nothing to do sleep on, so that they use no processor
+-- The permits' words: how many there are; how many no thread holds; 1 while
+-- the program's own stack waits for one, and 2 once a holder has given it one
+-- (`permitAwait`); the epoch it sleeps on; the epoch spare threads sleep on,
+-- and how many do; how many spares the monitor has woken or started that
+-- have not yet looked for a permit; the scheduler's count of runnable tasks
+-- (`queuedSet`); how many holders are idle, waiting for work; and 1 while the
+-- monitor sleeps because every holder is.
+var permitWords : Prim.Ptr = zeroed(80)
+
+let permitCountAt : Int = 0
+let permitFreeAt : Int = 8
+let wantedAt : Int = 16
+let wantEpochAt : Int = 24
+let spareEpochAt : Int = 32
+let sparesAt : Int = 40
+let handingAt : Int = 48
+let queuedAt : Int = 56
+let idlersAt : Int = 64
+let monitorAsleepAt : Int = 72
+
+-- The monitor's record (`monitorStart`), or null.
+var monitorRecord : Prim.Ptr = Prim.ptrNull()
+
+-- What threads with nothing to do sleep on, so that they use no processor
 -- until there is something for them, and the words that choose which of them
 -- waits for the operating system's readiness events instead (the poller, below).
 --
 -- Word 0 is the work epoch: bumped when a task becomes runnable, and when one
 -- finishes while the program's own code waits for it (`signalWork`). Word 16
 -- is the collection epoch: bumped when a collection asks its stopped and held
--- workers to mark, and when it lets them go (`signalCollection`). Words 8
--- and 24 count the threads asleep on each, so that bumping one costs a system
--- call only when one is.
+-- threads to mark, and when it, or the monitor, lets them go
+-- (`signalCollection`). Words 8 and 24 count the threads asleep on each, so
+-- that bumping one costs a system call only when one is.
 --
 -- A sleeper reads the epoch before it looks for what it waits for, and sleeps
 -- only while the epoch is still what it read: so a bump made after it looked
 -- either shows in the epoch, and it does not sleep, or finds it counted, and
 -- wakes it (`sleepOn`).
 --
--- Word 32 is the poller's claim: 1 while a worker holds the right to poll,
+-- Word 32 is the poller's claim: 1 while a thread holds the right to poll,
 -- taken by compare-and-swap (`claim`), so that at most one polls at a time.
 -- Word 40 is 1 while the claimant is inside, or about to enter, a wait that
 -- only a kernel event ends (`pollWait`). Word 48 is 1 while a break is on its
 -- way to that wait, so that a burst of signals costs one system call
 -- (`wakePoller`). Word 56 counts the registrations and timers the scheduler
--- is waiting on (`interestAdd`); workers read it without a lock to decide
+-- is waiting on (`interestAdd`); threads read it without a lock to decide
 -- whether to poll at all.
 --
 -- A poller sleeps in the kernel and not on the work epoch, so `signalWork`
@@ -125,8 +205,8 @@ fun sleepOn(word : Int, seen : Int) -> Unit {
     let _ = Prim.atomicAdd(signals, plus(word, 8), -1)
 }
 
--- Something for an idle worker to do: wake one, or, `all`, every one. A
--- poller is one more idle worker: it is broken out of its wait when every one
+-- Something for an idle thread to do: wake one, or, `all`, every one. A
+-- poller is one more idle thread: it is broken out of its wait when every one
 -- is to be woken, and when no sleeper on the epoch was there to take a single
 -- wake.
 fun signalWork(all : Bool) -> Unit {
@@ -149,71 +229,119 @@ fun zeroed(bytes : Int) -> Prim.Ptr {
     p
 }
 
--- How many workers there are: 1 until the first is added.
+-- How many threads there are: 1 until the program's own is registered.
 fun count() -> Int {
     let n = Prim.atomicLoad(control, 8)
     if n == 0 { 1 } else { n }
 }
 
--- The running worker's index, a word of its record.
+-- The running thread's index, a word of its record.
 fun index() -> Int = Prim.loadI64(Prim.processState(), 288)
 
--- Whether the running worker is running Turkey code, rather than blocked or
+-- The offset of the running thread's state word in `states`.
+fun mine() -> Int = Prim.intShl(index(), 3)
+
+-- Whether the running thread is running Turkey code, rather than blocked or
 -- stopped -- which it may be in a loop of this module's, inlined into a
 -- caller and so given a poll (`Turkey.Polls`).
-fun running() -> Bool = Prim.atomicLoad(states, 8 * index()) == 0
+fun running() -> Bool = (Prim.atomicLoad(states, mine()) & 7) == 0
 
 fun recordOf(i : Int) -> Prim.Ptr =
     if i == 0 && Prim.atomicLoad(control, 8) == 0 { Prim.processState() }
     else { Prim.loadPtr(records, 8 * i) }
 
--- A record for a new worker, registered and blocked until its thread starts
--- running Turkey code (`blockExit`); null if there is no room or no memory.
--- Called on the main worker, which registers itself first.
+-- Register the program's own thread, as the first, holding a permit: from
+-- here on its waits and calls are counted. Called once, before any other
+-- thread starts.
+fun mainRegister() -> Unit {
+    if Prim.atomicLoad(control, 8) != 0 { return {} }
+    Prim.storePtr(records, 0, Prim.processState())
+    Prim.atomicStore(control, 8, 1)
+}
+
+-- A record for a new thread holding a permit, registered and blocked until
+-- the thread starts running Turkey code (`blockExit`); null if there is no
+-- room or no memory. Called on the program's own thread.
 --
--- Not while a collection is stopping the world, which counted the workers
+-- Not while a collection is stopping the world, which counted the threads
 -- when it began: registration claims the same word a collection does, and
 -- waits blocked for it, so that a collection under way can finish.
 --
--- This and the other functions that record where the worker parked
--- (`acquire`, `Turkey.Heap.pause`) are `foreign` so that they are never inlined: the frame
--- they record must be their own, whose return address is a safepoint in their
--- caller, where the caller's roots are stored and mapped.
+-- This and the other functions that record where the thread parked
+-- (`acquire`, `permitAwait`, `Turkey.Heap.pause`) are `foreign` so that they
+-- are never inlined: the frame they record must be their own, whose return
+-- address is a safepoint in their caller, where the caller's roots are stored
+-- and mapped.
 foreign "turkey_worker_new" fun new() -> Prim.Ptr {
-    -- The first: no other worker exists to be collecting.
-    if Prim.atomicLoad(control, 8) == 0 { return register() }
+    mainRegister()
     blockEnter(Prim.frameAddress())
-    while Prim.atomicCas(control, 0, 0, 1) != 0 { let _ = Libc.schedYield() }
-    let record = register()
+    while Prim.atomicCas(control, 0, 0, 2) != 0 { let _ = Libc.schedYield() }
+    let record = register(True)
     Prim.atomicStore(control, 0, 0)
     blockExit()
     record
 }
 
-fun register() -> Prim.Ptr {
-    var n = Prim.atomicLoad(control, 8)
-    if n == 0 {
-        Prim.storePtr(records, 0, Prim.processState())
-        n = 1
-    }
-    if n == limit { return Prim.ptrNull() }
+-- A record for a spare thread, registered without a permit, for the monitor,
+-- which has no state of its own to block in: null if a collection or another
+-- registration holds the word, or there is no memory, for the monitor to try
+-- again at its next tick. A program that has `threadLimit` threads ends here.
+fun spareNew() -> Prim.Ptr {
+    if Prim.atomicCas(control, 0, 0, 2) != 0 { return Prim.ptrNull() }
+    if Prim.atomicLoad(control, 8) == threadLimit() { threadsExhausted() }
+    let record = register(False)
+    Prim.atomicStore(control, 0, 0)
+    record
+}
+
+-- Under the registration claim.
+fun register(permitted : Bool) -> Prim.Ptr {
+    let n = Prim.atomicLoad(control, 8)
+    if n == threadLimit() { return Prim.ptrNull() }
     -- The record's size, `Turkey.Runtime.processStateBytes`.
     let record = zeroed(2008)
     if Prim.ptrIsNull(record) { return record }
     Prim.storeI64(record, 288, n)
     Prim.storePtr(records, 8 * n, record)
-    Prim.atomicStore(states, 8 * n, 2)
+    Prim.atomicStore(states, 8 * n, if permitted { waitingState } else { plus(waitingState, noPermit) })
     Prim.atomicStore(control, 8, plus(n, 1))
     record
 }
 
--- Stop every other worker, for a collection. False if another worker is
+-- End the program from the monitor's thread, which has no Turkey code to
+-- unwind: the status is 2, as a Go program's is for the same failure.
+fun threadsExhausted() -> Unit {
+    Process.panicInt(Prim.cString("thread exhaustion: the program needs more than "),
+                     threadLimit(), Prim.cString(" threads"))
+    die()
+}
+
+-- Write the running thread's panic message and leave at once: no other
+-- thread's Turkey code can be trusted to finish.
+fun die() -> Unit {
+    say(Prim.cString("turkey: "))
+    say(Process.panicMessage())
+    say(Prim.cString("\n"))
+    Libc.exitNow(2)
+}
+
+fun say(text : Prim.Ptr) -> Unit {
+    let _ = Libc.write(2, text, Libc.strlen(text))
+}
+
+-- Stop every other thread, for a collection. False if another thread is
 -- stopping them already: that one collects, and this one stops at its next
--- safepoint like the rest.
+-- safepoint like the rest. A registration under way is waited for, since it
+-- ends without a safepoint.
 fun stopTheWorld() -> Bool {
+    if Prim.atomicLoad(control, 8) == 0 { return True }
+    while True {
+        let claimed = Prim.atomicCas(control, 0, 0, 1)
+        if claimed == 0 { break }
+        if claimed == 1 { return False }
+        let _ = Libc.schedYield()
+    }
     let n = count()
-    if n < 2 { return True }
-    if Prim.atomicCas(control, 0, 0, 1) != 0 { return False }
     let me = index()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me { let _ = Prim.atomicAdd(recordOf(i), 272, 1) }
@@ -226,82 +354,145 @@ fun stopTheWorld() -> Bool {
     True
 }
 
+-- A thread held by the monitor is not yet held by the collection: the
+-- monitor lets it go in a few hundred instructions, and the collector holds
+-- it then.
 fun stoppedOrHeld(i : Int) -> Bool {
-    let state = Prim.atomicLoad(states, 8 * i)
-    state == 1 || (state == 2 && Prim.atomicCas(states, 8 * i, 2, 3) == 2)
+    let s = Prim.atomicLoad(states, 8 * i)
+    let status = s & 7
+    status == stoppedState
+        || ((status == waitingState || status == callingState)
+            && Prim.atomicCas(states, 8 * i, s, plus(s, 1)) == s)
 }
 
--- Let the other workers go again, and wait until every one that stopped is
+-- Let the other threads go again, and wait until every one that stopped is
 -- running before another collection may stop them.
 fun startTheWorld() -> Unit {
+    if Prim.atomicLoad(control, 8) == 0 { return {} }
     let n = count()
-    if n < 2 { return {} }
     let me = index()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
-            if Prim.atomicLoad(states, 8 * i) == 3 { Prim.atomicStore(states, 8 * i, 2) }
+            -- Every held thread is this collection's: the monitor holds only a
+            -- calling thread, and every one is held here.
+            let s = Prim.atomicLoad(states, 8 * i)
+            let status = s & 7
+            if status == 3 || status == 5 { Prim.atomicStore(states, 8 * i, plus(s, -1)) }
             let _ = Prim.atomicAdd(recordOf(i), 272, -1)
         }
     }
-    -- The stopped and held workers sleep until this says so (`Turkey.Heap.stopAt`).
+    -- The stopped and held threads sleep until this says so (`Turkey.Heap.stopAt`).
     signalCollection()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
-            while Prim.atomicLoad(states, 8 * i) == 1 { let _ = Libc.schedYield() }
+            while (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState {
+                let _ = Libc.schedYield()
+            }
         }
     }
     Prim.atomicStore(control, 0, 0)
 }
 
 -- At a safepoint whose caller's frame record is `frame`, with the running
--- worker's stop word raised: stopped, until `stopLeave`. The collection may
--- ask a stopped worker to help it mark (`Turkey.Heap.stopAt`), which is why
+-- thread's stop word raised: stopped, until `stopLeave`. The collection may
+-- ask a stopped thread to help it mark (`Turkey.Heap.stopAt`), which is why
 -- the wait between the two is the heap's.
 fun stopEnter(frame : Prim.Ptr) -> Unit {
     parkAt(frame)
-    Prim.atomicStore(states, 8 * index(), 1)
+    let at = mine()
+    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), stoppedState))
 }
 
--- Whether the collection that stopped the running worker is still going.
+-- Whether the collection that stopped the running thread is still going.
 fun stopWanted() -> Bool = Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0
 
 fun stopLeave() -> Unit {
     parkAt(Prim.ptrNull())
-    Prim.atomicStore(states, 8 * index(), 0)
+    let at = mine()
+    Prim.atomicStore(states, at, Prim.intSubWrapping(Prim.atomicLoad(states, at), stoppedState))
 }
 
--- Whether worker `i` is stopped at a safepoint, rather than held while
--- blocked; only the collecting worker asks, with the world stopped.
-fun stopped(i : Int) -> Bool = Prim.atomicLoad(states, 8 * i) == 1
+-- Whether thread `i` is stopped at a safepoint, rather than held while
+-- blocked; only the collecting thread asks, with the world stopped.
+fun stopped(i : Int) -> Bool = (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState
 
 -- About to wait outside Turkey code, with every root the caller holds in its
 -- frames and the caller's frame record at `frame`: from here a collection may
--- run without this worker stopping.
+-- run without this thread stopping.
 fun blockEnter(frame : Prim.Ptr) -> Unit {
     if Prim.atomicLoad(control, 8) == 0 { return {} }
     parkAt(frame)
-    Prim.atomicStore(states, 8 * index(), 2)
+    let at = mine()
+    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), waitingState))
 }
 
--- Back from waiting: running again once no collection holds this worker.
+-- Back from waiting: running again once nobody holds this thread.
 fun blockExit() -> Unit {
     while True {
         let epoch = collectionSeen()
         if unblock() { return {} }
-        -- Held by a collection, which bumps the epoch when it lets go.
+        -- Held by a collection or the monitor, which bump the epoch when they
+        -- let go.
         sleepForCollection(epoch)
     }
 }
 
--- Running again, True, unless a collection holds this worker.
+-- Running again, True, unless a collection or the monitor holds this thread.
 fun unblock() -> Bool {
     if Prim.atomicLoad(control, 8) == 0 { return True }
-    if Prim.atomicCas(states, 8 * index(), 2, 0) != 2 { return False }
+    let at = mine()
+    let s = Prim.atomicLoad(states, at)
+    let status = s & 7
+    if status != waitingState && status != callingState { return False }
+    if Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, status)) != s { return False }
     parkAt(Prim.ptrNull())
     True
 }
 
--- Record `frame` as where the running worker's stack is parked, or null. A
+-- About to wait in a C call that may take as long as something outside the
+-- program does: blocked, as `blockEnter` is, and counted, so that the monitor
+-- can tell this call from the next. One store, since this runs at every read
+-- of a file; the constants are literals here and in `callExit` so that
+-- neither loads them from a global (`states` lays them out).
+fun callEnter(frame : Prim.Ptr) -> Unit {
+    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    parkAt(frame)
+    let at = mine()
+    -- `callStep` plus `callingState`.
+    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), 20))
+}
+
+-- Back from the call: running again once nobody holds this thread, and
+-- holding a permit if it can (`permitRegain`). A call back before the monitor
+-- took its permit costs one compare-and-swap.
+fun callExit() -> Unit {
+    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    let at = mine()
+    let s = Prim.atomicLoad(states, at)
+    -- Still calling, with the permit (the low four bits are `callingState`).
+    if (s & 15) == 4 && Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, 4)) == s {
+        parkAt(Prim.ptrNull())
+        return {}
+    }
+    blockExit()
+    if !permitHeld() { permitRegain() }
+}
+
+-- Running again after a call, without a permit: take a free one if there is
+-- one. On the program's own stack, whose code no other thread can run, wait
+-- for one if not. On a task's stack, return without one, for the caller to
+-- give the task back (`Turkey.Scheduler.afterCall`): that switches stacks,
+-- which no giblet may do.
+--
+-- Every coroutine is a task, resumed by the scheduler from a thread's own
+-- stack, so a stack with a resumer is a task's.
+fun permitRegain() -> Unit {
+    let stack = Stack.running()
+    let task = !Prim.ptrIsNull(stack) && !Prim.ptrIsNull(Stack.resumer(stack))
+    if !permitTake(!task) && !task { permitAwait(True) }
+}
+
+-- Record `frame` as where the running thread's stack is parked, or null. A
 -- worker thread has no stack registered until its first Turkey code does it
 -- (`Turkey.Scheduler.workerLoop`), and nothing on it to walk before then.
 fun parkAt(frame : Prim.Ptr) -> Unit {
@@ -309,15 +500,240 @@ fun parkAt(frame : Prim.Ptr) -> Unit {
     if !Prim.ptrIsNull(stack) { Stack.parkedSet(stack, frame) }
 }
 
--- Take `mutex` (`Turkey.Lock`), blocking the worker while it waits if another
+-- Take `mutex` (`Turkey.Lock`), blocking the thread while it waits if another
 -- holds it, so that a holder that allocates -- and so may collect -- never
--- waits on a worker that is waiting on it.
+-- waits on a thread that is waiting on it.
 foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
     if Lock.tryAcquire(mutex) { return {} }
     blockEnter(Prim.frameAddress())
     Lock.acquire(mutex)
     blockExit()
 }
+
+-- -- permits ----------------------------------------------------------------------------
+
+-- How many permits there are: what `TURKEY_WORKERS` asked for, or 1 before
+-- the workers start.
+fun permits() -> Int {
+    let n = Prim.atomicLoad(permitWords, permitCountAt)
+    if n == 0 { 1 } else { n }
+}
+
+fun permitsSet(n : Int) -> Unit = Prim.atomicStore(permitWords, permitCountAt, n)
+
+-- Whether the running thread holds a permit, which every thread does until
+-- the workers start.
+fun permitHeld() -> Bool =
+    Prim.atomicLoad(control, 8) == 0 || (Prim.atomicLoad(states, mine()) & noPermit) == 0
+
+-- Whether the program's own stack is waiting for a permit, which the next
+-- holder to look gives it (`permitGive`).
+fun permitWanted() -> Bool = Prim.atomicLoad(permitWords, wantedAt) == 1
+
+-- Give the running thread's permit to the program's own stack, which waits
+-- for one: True if this thread gave it, False if another holder did first.
+-- The thread holds none after.
+fun permitGive() -> Bool {
+    if Prim.atomicCas(permitWords, wantedAt, 1, 2) != 1 { return False }
+    permitDrop()
+    let _ = Prim.atomicAdd(permitWords, wantEpochAt, 1)
+    let _ = Lock.wake(Prim.ptrAdd(permitWords, wantEpochAt))
+    True
+}
+
+-- Give up the running thread's permit: marked as not held, and then free.
+fun permitDrop() -> Unit {
+    let at = mine()
+    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), noPermit))
+    let _ = Prim.atomicAdd(permitWords, permitFreeAt, 1)
+}
+
+-- Take a free permit for the running thread, which holds none: whether it did.
+-- While the program's own stack waits for one, only it may take one.
+fun permitTake(program : Bool) -> Bool {
+    while permitFree(program) {
+        let free = Prim.atomicLoad(permitWords, permitFreeAt)
+        if Prim.atomicCas(permitWords, permitFreeAt, free, plus(free, -1)) == free {
+            let at = mine()
+            Prim.atomicStore(states, at, Prim.intSubWrapping(Prim.atomicLoad(states, at), noPermit))
+            return True
+        }
+    }
+    False
+}
+
+fun permitFree(program : Bool) -> Bool =
+    Prim.atomicLoad(permitWords, permitFreeAt) > 0
+        && (program || Prim.atomicLoad(permitWords, wantedAt) == 0)
+
+-- Return holding a permit, asleep and blocked meanwhile, so that a collection
+-- need not wait. A spare thread (`program` False) sleeps until the monitor
+-- hands it one (`monitorHandOut`). The program's own stack, whose code no
+-- other thread can run (`program` True), asks the holders for one: it wakes
+-- an idle one, which gives it, and a busy one gives it between tasks
+-- (`Turkey.Scheduler`).
+--
+-- A sleeper reads its epoch, then looks for a free permit; whoever frees one
+-- does so before bumping the epoch, so the sleeper either sees the permit or
+-- sleeps on an epoch that has moved.
+foreign "turkey_permit_await" fun permitAwait(program : Bool) -> Unit {
+    if permitHeld() { return {} }
+    if !program { handingDone() }
+    if permitTake(program) { return {} }
+    let epoch = if program { wantEpochAt } else { spareEpochAt }
+    if program {
+        Prim.atomicStore(permitWords, wantedAt, 1)
+        signalWork(False)
+    }
+    while True {
+        let seen = Prim.atomicLoad(permitWords, epoch)
+        blockEnter(Prim.frameAddress())
+        if !program { let _ = Prim.atomicAdd(permitWords, sparesAt, 1) }
+        if !permitFree(program) && Prim.atomicLoad(permitWords, epoch) == seen {
+            Lock.wait(Prim.ptrAdd(permitWords, epoch), seen)
+        }
+        if !program {
+            let _ = Prim.atomicAdd(permitWords, sparesAt, -1)
+            handingDone()
+        }
+        blockExit()
+        if permitTake(program) { break }
+    }
+    if program {
+        Prim.atomicStore(permitWords, wantedAt, 0)
+        -- One the monitor freed meanwhile, or a second holder's, is a spare's.
+        if Prim.atomicLoad(permitWords, permitFreeAt) > 0 { spareWake() }
+    }
+}
+
+-- One fewer spare on its way to a permit (`monitorHandOut`): a spare says so
+-- each time it looks for one. A spare that looks for another reason counts
+-- too, which at worst wakes or starts one spare too many.
+fun handingDone() -> Unit {
+    let handing = Prim.atomicLoad(permitWords, handingAt)
+    if handing > 0 { let _ = Prim.atomicCas(permitWords, handingAt, handing, plus(handing, -1)) }
+}
+
+fun spareWake() -> Unit {
+    let _ = Prim.atomicAdd(permitWords, spareEpochAt, 1)
+    if Prim.atomicLoad(permitWords, sparesAt) != 0 {
+        let _ = Lock.wake(Prim.ptrAdd(permitWords, spareEpochAt))
+    }
+}
+
+-- The scheduler's count of runnable tasks, which the monitor reads without
+-- its lock. Under the scheduler's lock.
+fun queuedSet(n : Int) -> Unit = Prim.atomicStore(permitWords, queuedAt, n)
+
+-- A holder with nothing to run is about to wait for work, and is back.
+fun idleEnter() -> Unit {
+    let _ = Prim.atomicAdd(permitWords, idlersAt, 1)
+}
+
+fun idleLeave() -> Unit {
+    let _ = Prim.atomicAdd(permitWords, idlersAt, -1)
+    if Prim.atomicLoad(permitWords, monitorAsleepAt) != 0
+            && Prim.atomicCas(permitWords, monitorAsleepAt, 1, 0) == 1 {
+        let _ = Lock.wake(Prim.ptrAdd(permitWords, monitorAsleepAt))
+    }
+}
+
+-- -- the monitor's side -----------------------------------------------------------------
+
+-- Start the monitor's thread (`Turkey.Monitor`), whose record is registered
+-- nowhere, so that no collection waits for it: it never allocates, and it
+-- touches the heap only under the heap's lock while it holds the thread whose
+-- cursors it retires. Its index is -1, which no table has. False if it could
+-- not be started.
+fun monitorStart() -> Bool {
+    let record = zeroed(1752)
+    let thread = Libc.malloc(8)
+    if Prim.ptrIsNull(record) || Prim.ptrIsNull(thread) { return False }
+    Prim.storeI64(record, 288, -1)
+    monitorRecord = record
+    (Libc.pthreadCreate(thread, Prim.ptrNull(), Prim.codeAddress("turkey_worker_start"), record)
+        & 0xFFFF_FFFF) == 0
+}
+
+-- Whether the running thread is the monitor's.
+fun monitoring() -> Bool =
+    !Prim.ptrIsNull(monitorRecord) && Prim.ptrEq(Prim.processState(), monitorRecord)
+
+fun monitorState(i : Int) -> Int = Prim.atomicLoad(states, 8 * i)
+
+-- Whether `state` is a blocking call by a thread that holds its permit.
+fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
+
+-- Whether there is more to run than the threads free to run it: runnable
+-- tasks beyond the idle holders and the free permits, or the program's own
+-- stack waiting for a permit with none free.
+fun monitorWork() -> Bool {
+    let free = Prim.atomicLoad(permitWords, permitFreeAt)
+    let supply = plus(Prim.atomicLoad(permitWords, idlersAt), free)
+    Prim.atomicLoad(permitWords, queuedAt) > supply
+        || (Prim.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
+}
+
+-- Hold thread `i`, whose state was `state`, a call (`monitorCalling`):
+-- whether it still was.
+fun monitorHold(i : Int, state : Int) -> Bool =
+    Prim.atomicCas(states, 8 * i, state, plus(state, 1)) == state
+
+-- Let thread `i`, held from `state`, go without its permit, which is free
+-- first so that the thread may take it back. A thread that returned from its
+-- call meanwhile sleeps on the collection epoch.
+fun monitorTake(i : Int, state : Int) -> Unit {
+    let _ = Prim.atomicAdd(permitWords, permitFreeAt, 1)
+    Prim.atomicStore(states, 8 * i, plus(state, noPermit))
+    signalCollection()
+}
+
+-- Hand a free permit on: to the program's own stack, if it waits for one,
+-- else to a spare thread, waking one or starting one. Whether it did.
+fun monitorHandOut() -> Bool {
+    let free = Prim.atomicLoad(permitWords, permitFreeAt)
+    if free <= 0 { return False }
+    if Prim.atomicLoad(permitWords, wantedAt) != 0 {
+        let _ = Prim.atomicAdd(permitWords, wantEpochAt, 1)
+        return Lock.wake(Prim.ptrAdd(permitWords, wantEpochAt))
+    }
+    if Prim.atomicLoad(permitWords, handingAt) >= free { return False }
+    let _ = Prim.atomicAdd(permitWords, handingAt, 1)
+    if Prim.atomicLoad(permitWords, sparesAt) > 0 {
+        spareWake()
+        return True
+    }
+    let record = spareNew()
+    let thread = Libc.malloc(8)
+    if Prim.ptrIsNull(record) || Prim.ptrIsNull(thread) {
+        Libc.free(thread)
+        let _ = Prim.atomicAdd(permitWords, handingAt, -1)
+        return False
+    }
+    let started = Libc.pthreadCreate(thread, Prim.ptrNull(),
+                                     Prim.codeAddress("turkey_worker_start"), record)
+    if (started & 0xFFFF_FFFF) != 0 {
+        Process.panicInt(Prim.cString("could not start a thread: error "),
+                         started & 0xFFFF_FFFF, Prim.cString(""))
+        die()
+    }
+    True
+}
+
+-- Sleep while every holder is idle, with nothing free to hand out: then no
+-- thread can be in a call holding a permit until a holder stops being idle,
+-- which wakes this (`idleLeave`). Whether it slept.
+fun monitorSleep() -> Bool {
+    if !allIdle() { return False }
+    Prim.atomicStore(permitWords, monitorAsleepAt, 1)
+    if allIdle() { Lock.wait(Prim.ptrAdd(permitWords, monitorAsleepAt), 1) }
+    Prim.atomicStore(permitWords, monitorAsleepAt, 0)
+    True
+}
+
+fun allIdle() -> Bool =
+    Prim.atomicLoad(permitWords, idlersAt) >= permits()
+        && Prim.atomicLoad(permitWords, permitFreeAt) <= 0
 
 -- -- the poller ----------------------------------------------------------------------
 --
@@ -921,65 +1337,68 @@ fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
 
 -- -- C calls that may block -------------------------------------------------------------
 --
--- A read from a pipe or a terminal, a write to one, an open of a FIFO: each
--- can wait for as long as something outside the program takes. A worker in
--- one is blocked for that time (`blockEnter`), so that a collection need not
--- wait for it; every root its caller holds is in a frame, since the call to
--- these is a safepoint. `foreign`, as `acquire` is, so that the frame they
--- record is their own. `Turkey.IO` calls these rather than `Turkey.Libc`'s.
+-- A read from a file or a pipe, a write to one, an open of a FIFO: each can
+-- wait for as long as something outside the program takes. A thread in one
+-- is blocked for that time (`callEnter`), so that a collection need not wait
+-- for it and the monitor may give its permit to another; every root its
+-- caller holds is in a frame, since the call to these is a safepoint.
+-- `foreign`, as `acquire` is, so that the frame they record is their own.
+-- `Turkey.IO` calls these rather than `Turkey.Libc`'s.
 --
 -- Each answers in `Turkey.Sys.result`'s convention, and reads `errno` before
--- `blockExit`: a worker held by a collection sleeps in a C call of its own,
--- which may set `errno` over the one being reported.
+-- `callExit`: a thread held by a collection, or waiting for a permit, sleeps
+-- in a C call of its own, which may set `errno` over the one being reported.
+-- A task's thread may come back from one without a permit, which its caller
+-- then gives back (`Turkey.Scheduler.afterCall`).
 
 foreign "turkey_blocking_read" fun blockingRead(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.read(fd, buf, count))
-    blockExit()
+    callExit()
     n
 }
 
 foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.write(fd, buf, count))
-    blockExit()
+    callExit()
     n
 }
 
 foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Prim.Ptr, count : Int,
                                                   offset : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.pread(fd, buf, count, offset))
-    blockExit()
+    callExit()
     n
 }
 
 foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Prim.Ptr, count : Int,
                                                     offset : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.pwrite(fd, buf, count, offset))
-    blockExit()
+    callExit()
     n
 }
 
 foreign "turkey_blocking_open" fun blockingOpen(path : Prim.Ptr, flags : Int, mode : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let fd = Sys.cResult(Libc.open(path, flags, mode))
-    blockExit()
+    callExit()
     fd
 }
 
 foreign "turkey_blocking_close" fun blockingClose(fd : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.close(fd))
-    blockExit()
+    callExit()
     r
 }
 
 foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Prim.Ptr) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.fstat(fd, buf))
-    blockExit()
+    callExit()
     r
 }
 
@@ -989,67 +1408,67 @@ foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Prim.Ptr) -> I
 
 foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Prim.Ptr, flags : Int,
                                                     mode : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let fd = Sys.cResult(Libc.openat(dir, path, flags, mode))
-    blockExit()
+    callExit()
     fd
 }
 
 foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Prim.Ptr, buf : Prim.Ptr,
                                                       flags : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.fstatat(dir, path, buf, flags))
-    blockExit()
+    callExit()
     r
 }
 
 foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Prim.Ptr,
                                                         flags : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.unlinkat(dir, path, flags))
-    blockExit()
+    callExit()
     r
 }
 
 foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Prim.Ptr,
                                                       mode : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.mkdirat(dir, path, mode))
-    blockExit()
+    callExit()
     r
 }
 
 foreign "turkey_blocking_renameat" fun blockingRenameat(fromDir : Int, from : Prim.Ptr,
                                                         toDir : Int, to : Prim.Ptr) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.renameat(fromDir, from, toDir, to))
-    blockExit()
+    callExit()
     r
 }
 
 foreign "turkey_blocking_readlinkat" fun blockingReadlinkat(dir : Int, path : Prim.Ptr,
                                                             buf : Prim.Ptr, size : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.readlinkat(dir, path, buf, size))
-    blockExit()
+    callExit()
     n
 }
 
 foreign "turkey_blocking_flock" fun blockingFlock(fd : Int, operation : Int) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.flock(fd, operation))
-    blockExit()
+    callExit()
     r
 }
 
 -- The next entry's address as an `Int`, which is positive; 0 at the end of
 -- the stream; or the negated `errno`.
 foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Prim.Ptr) -> Int {
-    blockEnter(Prim.frameAddress())
+    callEnter(Prim.frameAddress())
     Sys.clearErrno()
     let entry = Libc.readdir(stream)
     let r = if Prim.ptrIsNull(entry) { Prim.intNeg(Sys.errno()) } else { Prim.ptrToInt(entry) }
-    blockExit()
+    callExit()
     r
 }
 

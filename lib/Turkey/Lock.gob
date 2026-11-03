@@ -1,4 +1,4 @@
-export (new, acquire, tryAcquire, release, wait, wake, wakeAll)
+export (new, acquire, tryAcquire, release, wait, waitFor, wake, wakeAll)
 
 -- Mutual exclusion for the runtime's own shared state: the heap's region
 -- lists and counters, the list of stacks, the scheduler's queue. Each is held
@@ -128,6 +128,22 @@ fun wait(word : Prim.Ptr, value : Int) -> Unit = match Target.os {
     -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
     -- value waited on here fits in them, and the high ones stay zero.
     Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Prim.ptrNull()) }
+}
+
+-- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
+-- time runs out, too, which the caller tells from a wake by the clock.
+fun waitFor(word : Prim.Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.os {
+    -- `OS_CLOCK_MACH_ABSOLUTE_TIME`, the one clock it takes.
+    Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
+    -- A relative `struct timespec`, in storage of its own: threads wait at once.
+    Linux -> {
+        let timespec = Libc.malloc(16)
+        if Prim.ptrIsNull(timespec) { return wait(word, value) }
+        Prim.storeI64(timespec, 0, nanoseconds / 1000000000)
+        Prim.storeI64(timespec, 8, nanoseconds % 1000000000)
+        let _ = Libc.syscall(futex(), word, 128, value, timespec)
+        Libc.free(timespec)
+    }
 }
 
 -- Wake one thread sleeping on `word`, if one is: whether one was. Darwin

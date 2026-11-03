@@ -17,10 +17,14 @@ type IOError = IOError { kind : ErrorKind, op : String, path : Option String }
 -- and be told when it has not considered one. `NotSeekable` is a positional
 -- read or write on something that has no positions: a FIFO, a pipe, a
 -- terminal. `NotEmpty` is removing a directory that still has entries.
--- `Closed` is an operation on a file after `close`. `Other` keeps the `errno`
--- of anything else.
+-- `Closed` is an operation on a file after `close`. `TimedOut` is an
+-- operation given a deadline that passed first. `HostNotFound` is a name the
+-- system's resolver has no address for (`Net`), and `Resolver` keeps the
+-- resolver's own code for any other failure of a lookup: it is not an
+-- `errno`, and differs by system. `Other` keeps the `errno` of anything else.
 type ErrorKind = NotFound | PermissionDenied | AlreadyExists | IsDirectory | NotDirectory
-               | NotEmpty | BrokenPipe | NoSpace | NotSeekable | Closed | Other(Int)
+               | NotEmpty | BrokenPipe | NoSpace | NotSeekable | Closed | TimedOut
+               | HostNotFound | Resolver(Int) | Other(Int)
 
 -- The error a failed `result` -- a negated `errno`, or `FD.closed` -- means
 -- for `op` on `path`.
@@ -56,6 +60,10 @@ fun code(k : ErrorKind) -> Int = match k {
     NotSeekable -> 7
     Closed -> 8
     NotEmpty -> 9
+    -- Below every case's and `Other`'s, which an `errno` keeps above 10.
+    TimedOut -> -1
+    HostNotFound -> -2
+    Resolver(code) -> -100000 - code
     Other(errno) -> 10 + errno
 }
 
@@ -71,6 +79,9 @@ instance Show ErrorKind {
         NoSpace -> "NoSpace"
         NotSeekable -> "NotSeekable"
         Closed -> "Closed"
+        TimedOut -> "TimedOut"
+        HostNotFound -> "HostNotFound"
+        Resolver(code) -> "Resolver(" + show(code) + ")"
         Other(errno) -> "Other(" + show(errno) + ")"
     }
 }
@@ -87,7 +98,17 @@ fun describe(k : ErrorKind) -> String = match k {
     NoSpace -> "no space left on device"
     NotSeekable -> "illegal seek"
     Closed -> "file already closed"
+    TimedOut -> "timed out"
+    HostNotFound -> "no such host"
+    Resolver(code) -> resolverMessage(code)
     Other(errno) -> otherMessage(errno)
+}
+
+-- As `gai_strerror` words them.
+fun resolverMessage(code : Int) -> String {
+    if code == Sys.eaiAgain() { "temporary failure in name resolution" }
+    else if code == Sys.eaiFail() { "non-recoverable failure in name resolution" }
+    else { "name resolution failed: code " + show(code) }
 }
 
 fun otherMessage(errno : Int) -> String {

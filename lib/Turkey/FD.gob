@@ -76,8 +76,10 @@ export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt
 -- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
 
 import Turkey.Coroutine as Co
+import Turkey.Detach as Detach
 import Turkey.IO as IO
 import Turkey.Scheduler as Scheduler
+import Turkey.Semaphore as Semaphore
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
 import Target (OS(..))
@@ -108,10 +110,21 @@ type FD = FD {
     var polled   : Bool,
     var readers  : Vec Co.Coroutine,
     var writers  : Vec Co.Coroutine,
+    -- Linux's `flock` calls on the descriptor, one at a time (`flockLinux`).
+    -- Made by the first, under the scheduler's lock.
+    var flocking : Option Semaphore.Semaphore,
 }
 
 -- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
-fun fd(number : Int) -> FD = FD { state = Prim.atomicNew(0), number = number, readMode = Unknown, polled = False, readers = [], writers = [] }
+fun fd(number : Int) -> FD = FD {
+    state = Prim.atomicNew(0),
+    number = number,
+    readMode = Unknown,
+    polled = False,
+    readers = [],
+    writers = [],
+    flocking = None,
+}
 
 -- What `readMode` holds: `Unknown`, not yet looked at; `CallAtOnce`; or
 -- `WaitFirst`, wait for readable before each call.
@@ -241,15 +254,17 @@ fun using(f : FD, call : fun(Int) -> Int) -> Int {
 -- is closed during the wait, `timedOut` if `deadline` came first, or the
 -- negated `errno`. Only an answer of 0 leaves the lock taken.
 --
--- On Darwin the wait parks the task (`Turkey.Wait.lockedUnless`) and the
--- deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none. Linux
--- reports no release of a lock, so there the call waits in the kernel and
--- holds its worker, and a deadline other than -1 answers `-EINVAL`.
+-- The deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none. On
+-- Darwin the wait parks the task (`Turkey.Wait.lockedUnless`). Linux reports
+-- no release of a lock, so there the call waits in the kernel, and the
+-- monitor hands its thread's permit on (`Turkey.Workers`); with a deadline,
+-- the call runs on a helper task that the caller leaves at the deadline
+-- (`flockLinux`).
 fun flock(f : FD, operation : Int, deadline : Int) -> Int {
     if !acquire(f) { return closed }
     let r = match Target.os {
         Darwin -> flockParked(f, operation, deadline)
-        Linux -> if deadline < 0 { IO.flock(f.number, operation) } else { -Sys.einval }
+        Linux -> flockLinux(f, operation, deadline)
     }
     let _ = release(f)
     r
@@ -263,6 +278,63 @@ fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
     let stop = fun() = Prim.atomicGet(f.state) & closedBit != 0
     let w = Wait.lockedUnless(f.number, operation, deadline, stop)
     if w == Wait.cancelled { closed } else { w }
+}
+
+-- A call with a deadline waits on a helper task (`Turkey.Detach`), which
+-- goes on after the deadline, and lets go of a lock it takes then by
+-- `LOCK_UN`. A lock belongs to the open file, not to a call, so another
+-- `flock` on the descriptor made between that late lock and its `LOCK_UN`
+-- would find the lock held already, answer 0, and then lose it. So the calls
+-- here take turns per descriptor (`flocking`): each waits, with its own
+-- deadline, until the one before is done, a helper's cleanup included. The
+-- helper holds a reference of its own meanwhile, so that the number is not
+-- closed and reused under it.
+fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
+    let calls = flockCalls(f)
+    if !Semaphore.acquire(calls, deadline) { return timedOut }
+    if deadline < 0 {
+        let r = IO.flock(f.number, operation)
+        Semaphore.release(calls)
+        return r
+    }
+    -- Try first, so that a lock nobody holds costs no helper.
+    let tried = IO.flock(f.number, operation | Sys.lockNonBlocking)
+    if tried != -Sys.eagain() {
+        Semaphore.release(calls)
+        return tried
+    }
+    -- The helper's reference.
+    if !acquire(f) {
+        Semaphore.release(calls)
+        return closed
+    }
+    let n = f.number
+    -- Run by whichever side ends up with the result: the caller, or the
+    -- helper's cleanup.
+    let done = fun() {
+        let _ = release(f)
+        Semaphore.release(calls)
+    }
+    let late = fun(r) {
+        if r == 0 { let _ = IO.flock(n, Sys.lockUnlock) }
+        done()
+    }
+    match Detach.run(fun() = IO.flock(n, operation), late, deadline) {
+        Left(_) -> timedOut
+        Right(r) -> {
+            done()
+            -- Closed meanwhile: the lock goes when the descriptor does.
+            if r == 0 && Prim.atomicGet(f.state) & closedBit != 0 { closed } else { r }
+        }
+    }
+}
+
+fun flockCalls(f : FD) -> Semaphore.Semaphore {
+    Scheduler.lock()
+    let calls = if let Some(calls) = f.flocking { calls } else { Semaphore.new(1) }
+    f.flocking = Some(calls)
+    Scheduler.unlock()
+    calls
 }
 
 -- -- closing --------------------------------------------------------------------------

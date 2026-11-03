@@ -1,0 +1,91 @@
+export (run)
+
+-- Waiting for a C call that cannot be polled, timed or stopped --
+-- `getaddrinfo`, say -- with a deadline: the call runs on a helper task, and
+-- the caller waits for the helper until the deadline. When the deadline comes
+-- first, the caller returns, and the call goes on to its end on the helper,
+-- whose frame keeps every buffer the call was given alive until then.
+--
+-- Nothing stops a call once it has started. A signal would, in some cases,
+-- and is not used: it ends only a call that sleeps interruptibly, which a
+-- local-disk read and `getaddrinfo` do not; one sent just before the call
+-- begins is lost; and a handler without `SA_RESTART` lets every slow system
+-- call in the process fail with `EINTR`, foreign code's included.
+--
+-- **A result nobody takes.** Each call is given the cleanup that undoes its
+-- result -- `freeaddrinfo` for a lookup's list, say, or `close` for a
+-- descriptor. Exactly one of the caller and the helper ends up with the
+-- result (`help` says how), so a result is neither used after its cleanup
+-- nor leaked.
+--
+-- **Who runs the helper.** A task that waits parks, so any thread holding a
+-- permit runs the helper, and at the deadline any one runs the task again.
+-- The program's own stack waits apart from the tasks
+-- (`Turkey.Wait.parkApart`): if it ran the helper itself, it would be inside
+-- the call until the call returned, deadline or not.
+--
+-- A deadline is a time on `Turkey.Wait.now`'s clock, or -1 for none.
+
+import Turkey.Coroutine as Co
+import Turkey.Poll as Poll
+import Turkey.Scheduler as Scheduler
+import Turkey.Wait as Wait
+
+-- A helper's call and what becomes of its result: the waiter the caller
+-- waits on, once the helper is queued, and the result, once the caller may
+-- take it.
+type Pending a = Pending { var waiter : Option Poll.Waiter, var value : Option a }
+
+-- Run `call` on a helper task and wait until `deadline` for its result:
+-- `Right` with it, or `Left(Wait.timedOut)` if the deadline came first, and
+-- then `cleanup` gets the result when the call returns. The call starts even
+-- if the deadline has passed already, so that the result, and with it the
+-- cleanup, always comes.
+--
+-- `call` makes its C call through one of `Turkey.Workers`' blocking
+-- wrappers, followed by `Turkey.Scheduler.afterCall`, as `Turkey.IO` does,
+-- so that the helper's thread may lose its permit while it waits. `cleanup`
+-- runs on the helper, and may make such calls too.
+fun run(call : fun() -> a, cleanup : fun(a) -> Unit, deadline : Int) -> Either Int a {
+    let pending = Pending { waiter = None, value = None }
+    let program = Option.isNone(Co.running())
+    -- Made here rather than under the lock, since a stack is mapped for it.
+    let helper = Co.new(fun() = help(pending, call, cleanup, program))
+    let outcome = Wait.parkApart(fun(timer) {
+        let w = Poll.sleeper(timer)
+        pending.waiter = Some(w)
+        Scheduler.ready(helper)
+        w
+    }, deadline)
+    if outcome != 0 { return Left(outcome) }
+    if let Some(value) = pending.value {
+        Right(value)
+    } else {
+        Prim.error("a detached call ended its wait without a result")
+    }
+}
+
+fun help(pending : Pending a, call : fun() -> a, cleanup : fun(a) -> Unit, program : Bool) -> Unit {
+    let value = call()
+    Scheduler.lock()
+    let w = if let Some(w) = pending.waiter {
+        w
+    } else {
+        Prim.error("a helper ran before it was queued")
+    }
+    -- The race between the call's return and the caller's leaving is
+    -- decided here. The waiter leaves `Waiting` once, under the scheduler's
+    -- lock: by this `complete`, or at the deadline (`Turkey.Poll.expire` for
+    -- a task, `timeOut` in `Turkey.Wait.parkApart`). If this moved it, the
+    -- value is stored before the lock is let go, and the caller, which reads
+    -- it only once it sees `Ready` under the lock, takes it. If the deadline
+    -- moved it, the caller has left or is leaving without reading `value`,
+    -- which nobody else can reach, so the cleanup here is the only one.
+    let taken = Poll.complete(w, 0)
+    if taken {
+        pending.value = Some(value)
+        Wait.wakeEnded(program)
+    }
+    Scheduler.unlock()
+    if !taken { cleanup(value) }
+}

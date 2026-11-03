@@ -1,0 +1,90 @@
+export (Semaphore, new, acquire, release, waiting)
+
+-- A count of permits that tasks take and give back, with deadlines on
+-- `Turkey.Wait.now`'s clock: `System.Sync`'s `Semaphore`, and what bounds
+-- the runtime's own calls in flight (`Turkey.Resolve`, `Turkey.FD`).
+--
+-- A task waiting for a permit parks. The program's own stack sleeps, while
+-- the right to run tasks goes to another thread (`Turkey.Wait.parkApart`),
+-- since a permit is given back by a task, which that stack could otherwise
+-- be inside.
+--
+-- **In order.** A permit given back goes to the waiter that has waited
+-- longest, of those still waiting; one whose deadline passed is skipped. A
+-- permit nobody waits for goes back to the count. So a free permit and a
+-- waiter never exist together, and `acquire` takes a free permit only when
+-- nobody waits for one.
+--
+-- Everything here is read and written under the scheduler's lock.
+
+import Turkey.Coroutine as Co
+import Turkey.Poll as Poll
+import Turkey.Scheduler as Scheduler
+import Turkey.Wait as Wait
+
+-- The free permits, and the waiters in the order they came, from `head` on,
+-- some of them perhaps ended already by their deadlines.
+type Semaphore = Semaphore { var free : Int, queue : Vec Queued, var head : Int }
+
+-- `program` says whether the program's own stack waits, which `release`
+-- wakes differently (`Turkey.Wait.wakeEnded`).
+type Queued = Queued { waiter : Poll.Waiter, program : Bool }
+
+fun new(permits : Int) -> Semaphore = Semaphore { free = permits, queue = [], head = 0 }
+
+-- Take a permit of `s`, waiting until `deadline`, or without limit when it is
+-- -1, for one if none is free: whether it took one. A deadline that has
+-- passed already takes none, even if one is free.
+fun acquire(s : Semaphore, deadline : Int) -> Bool {
+    if deadline >= 0 && Wait.now() >= deadline { return False }
+    Scheduler.lock()
+    let free = s.free > 0
+    if free { s.free = s.free - 1 }
+    Scheduler.unlock()
+    if free { return True }
+    let program = Option.isNone(Co.running())
+    let outcome = Wait.parkApart(fun(timer) {
+        let w = Poll.sleeper(timer)
+        -- A permit given back since the look above.
+        if s.free > 0 {
+            s.free = s.free - 1
+            let _ = Poll.complete(w, 0)
+        } else {
+            Vec.push(s.queue, Queued { waiter = w, program = program })
+        }
+        w
+    }, deadline)
+    outcome == 0
+}
+
+-- Give a permit back to `s`.
+fun release(s : Semaphore) -> Unit {
+    Scheduler.lock()
+    var handed = False
+    while !handed && s.head < len(s.queue) {
+        let q = s.queue[s.head]
+        s.head = s.head + 1
+        -- False for a waiter whose deadline ended it, which is skipped.
+        if Poll.complete(q.waiter, 0) {
+            handed = True
+            Wait.wakeEnded(q.program)
+        }
+    }
+    if s.head == len(s.queue) && s.head > 0 {
+        Vec.clear(s.queue)
+        s.head = 0
+    }
+    if !handed { s.free = s.free + 1 }
+    Scheduler.unlock()
+}
+
+-- How many wait for a permit of `s`.
+fun waiting(s : Semaphore) -> Int {
+    Scheduler.lock()
+    var n = 0
+    for var i = s.head; i < len(s.queue); i = i + 1 {
+        if !Poll.finished(s.queue[i].waiter) { n = n + 1 }
+    }
+    Scheduler.unlock()
+    n
+}

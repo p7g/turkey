@@ -1,6 +1,6 @@
 export (
     now, sleepUntil, readable, writable, readableUnless, writableUnless, childExit, lockedUnless,
-    cancel, forget, timedOut, cancelled,
+    cancel, forget, park, parkApart, wakeEnded, timedOut, cancelled,
 )
 
 -- Waiting for time, a descriptor, a child or a file lock without holding a
@@ -41,6 +41,10 @@ import Control.Iterator (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Bool (Bool(..))
 import Data.Int ()
+import Data.Option (Option(..))
+import Turkey.Coroutine as Co
+import Turkey.Libc as Libc
+import Turkey.Lock as Lock
 import Turkey.Poll as Poll
 import Turkey.Scheduler as Scheduler
 import Turkey.Workers as Workers
@@ -132,4 +136,73 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     Scheduler.unlock()
     Scheduler.waitUntil(fun() = Poll.finished(w), fun(c) = Poll.park(w, c))
     Poll.outcome(w)
+}
+
+-- -- waiting apart from the tasks ---------------------------------------------------
+--
+-- For a wait that a task ends -- a helper's call returning (`Turkey.Detach`),
+-- a semaphore's permit released (`Turkey.Semaphore`). From the program's own
+-- stack, `park` would run tasks meanwhile, and if one were the task the wait
+-- is for, the stack would be inside it until it finished, deadline or not.
+
+-- The word the program's own stack sleeps on in `parkApart`, which
+-- `wakeEnded` moves and wakes. There is one program stack, so one word. A
+-- `let`, since the word moves and the pointer does not: a `var` here would
+-- be a heap cell, allocated as every program starts.
+let programWord : Prim.Ptr = zeroedWord()
+
+fun zeroedWord() -> Prim.Ptr {
+    let word = Libc.malloc(8)
+    Prim.atomicStore(word, 0, 0)
+    word
+}
+
+-- `park`, except that the program's own stack runs no task while it waits.
+-- A task parks as it does in `park`. The program's own stack sleeps as a
+-- thread in a blocking call does (`Turkey.Workers.blockingSleepOn`), and the
+-- monitor hands its permit to a thread that runs the tasks; so it starts the
+-- workers and the monitor if nothing has (`Turkey.Scheduler.start`).
+--
+-- `start` makes the waiter under the scheduler's lock, given the deadline to
+-- put on the poller's heap: `deadline` from a task, and -1 from the program's
+-- own stack, which no worker could wake for it, and which ends the wait
+-- itself (`Turkey.Poll.timeOut`) when its sleep runs out. Whoever ends the
+-- waiter otherwise calls `wakeEnded`, under the lock.
+fun parkApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int = match Co.running() {
+    Some(_) -> park(fun() = start(deadline))
+    None -> sleepApart(start, deadline)
+}
+
+-- A sleep that a wake or the clock cut short only loops. Back from the
+-- sleep, the stack holds a permit again (`Turkey.Workers.callExit`).
+fun sleepApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
+    let _ = Scheduler.start()
+    Scheduler.lock()
+    let w = start(-1)
+    Scheduler.unlock()
+    while True {
+        -- Read before the look, and moved after the waiter ends, so that an
+        -- end after the look stops the sleep from starting.
+        let seen = Prim.atomicLoad(programWord, 0)
+        Scheduler.lock()
+        let left = if deadline < 0 { -1 } else { deadline - Poll.now() }
+        if !Poll.finished(w) && deadline >= 0 && left <= 0 { let _ = Poll.timeOut(w) }
+        let over = Poll.finished(w)
+        Scheduler.unlock()
+        if over { break }
+        Workers.blockingSleepOn(programWord, seen, left)
+    }
+    Poll.outcome(w)
+}
+
+-- A waiter `parkApart` made has just ended, by `Turkey.Poll.complete`: wake
+-- its task, or, when `program` says the program's own stack made it, that
+-- stack. Under the scheduler's lock.
+fun wakeEnded(program : Bool) -> Unit {
+    let tasks = Poll.takeWoken()
+    for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
+    if program {
+        let _ = Prim.atomicAdd(programWord, 0, 1)
+        let _ = Lock.wake(programWord)
+    }
 }

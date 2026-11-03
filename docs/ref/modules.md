@@ -153,6 +153,7 @@ export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
               | CONID "(" ".." ")"             -- a type with all its constructors
               | CONID "(" CONID ("," CONID)* ")"
+              | "(" OPERATOR ")"                -- a declared operator
 ```
 
 A module that other modules import starts with an export declaration, which
@@ -313,6 +314,7 @@ import-list ::= "(" (entry ("," entry)*)? ")"
 entry  ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item   ::= IDENT | CONID | CONID "(" ".." ")"
          | CONID "(" CONID ("," CONID)* ")"
+         | "(" OPERATOR ")"
 ```
 
 | Import | Brings into scope |
@@ -422,6 +424,70 @@ fun main() {
 
 Instances are not imported or exported. Every instance in the program is
 available everywhere ([Coherence](classes.md#coherence)).
+
+### Operators in imports
+
+A [declared operator](expressions.md#declared-operators) is exported by
+writing it in parentheses, `export ((|>))`, and `export (..)` exports every
+operator the module declares. The operator's target does not have to be
+exported too: a use of the operator calls it all the same.
+
+An operator has no qualified spelling, so an import that does not name it
+does not bring it. It comes in only through an import list, as `(|>)` or with
+`..`, and `(|>) as _` beside `..` withholds it. It cannot be renamed; a module
+that wants another spelling declares its own operator with `infix`.
+
+<!-- module: Pipe.gob -->
+```kotlin
+export ((|>))
+
+infix Sequence (|>) = pipe
+
+fun pipe(x, f) = f(x)
+```
+
+<!-- run -->
+```kotlin
+import Pipe ((|>))
+
+fun double(n : Int) -> Int = n * 2
+
+fun main() {
+    print(5 |> double |> show)
+}
+```
+
+```text
+10
+```
+
+Without the list, `|>` is not in scope:
+
+<!-- module: Pipe.gob -->
+```kotlin
+export ((|>))
+
+infix Sequence (|>) = pipe
+
+fun pipe(x, f) = f(x)
+```
+
+<!-- error: the operator '|>' is not declared; 'Pipe' exports it -->
+```kotlin
+import Pipe
+
+fun main() {
+    print(5 |> show)
+}
+```
+
+An operator follows the [name resolution](#name-resolution) rules for bare
+names: the module's own `infix` declaration shadows an imported one, and two
+imports that bring distinct declarations of one operator make every use of it
+an error. The compiler does not pick one by the operands' types, since that
+would also pick a precedence group. An operator a module passes on with its
+export list is the same declaration, and importing it by both routes is not
+ambiguous.
 
 ### Qualified names
 

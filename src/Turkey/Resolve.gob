@@ -1,4 +1,4 @@
-export (program, arities)
+export (program, arities, operators)
 
 -- Name resolution across modules.
 --
@@ -42,7 +42,7 @@ import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Fixity (Group)
-import Turkey.Modules (Module(..), Namespace(..), Scope(..), lookupName)
+import Turkey.Modules (Module(..), Namespace(..), Scope(..), lookupName, conflictsIn)
 import Turkey.Prelude as Prelude
 import Turkey.Source (Span(..))
 import Turkey.Types as Ty
@@ -52,22 +52,14 @@ type R = R {
     scope     : Scope,
     -- Innermost last. A name in any frame is local and is left alone.
     locals    : Vec (Set.Set String),
-    -- Each operator the module declares: its group, and the resolved name of
-    -- the function it means.
+    -- The program's operators, as `operators` makes them.
     operators : Map String (Group, String),
 }
 
--- `arities` is every top-level function and class method of the program, by
--- internal name, with how many parameters it takes.
-fun program(scope : Scope, p : Program, arities : Map String Int) -> Unit {
-    let r = R { scope = scope, locals = Vec.new(4), operators = Map.new() }
-    -- Before any expression, since a use may precede its declaration.
-    for decl in p.decls {
-        match decl {
-            DInfix(d) -> infixDecl(r, d, arities)
-            _ -> {}
-        }
-    }
+-- `operators` is the table `operators` makes.
+fun program(scope : Scope, p : Program,
+            operators : Map String (Group, String)) -> Unit {
+    let r = R { scope = scope, locals = Vec.new(4), operators = operators }
     for decl in p.decls {
         match decl {
             DStmt(s) -> topLevel(r, s)
@@ -106,11 +98,37 @@ fun arities(modules : Vec Module) -> Map String Int {
     out
 }
 
-fun infixDecl(r : R, d : InfixDecl, arities : Map String Int) -> Unit {
-    if Map.contains(r.operators, d.op) {
-        oops("the operator '" + d.op + "' is declared twice", d.span)
+-- Returns every module's `infix` declarations, keyed by the name the operator
+-- namespace maps a symbol to, `M#<>`. Each entry is the operator's group and
+-- the resolved name of the function it means. Resolves each target in place,
+-- in the scope of the module that declares it.
+--
+-- `arities` is the table `arities` makes. Run this before any module is
+-- resolved, because a use in one module may mean a declaration in another,
+-- and in its own module a use may precede its declaration.
+fun operators(modules : Vec Module, arities : Map String Int) -> Map String (Group, String) {
+    let out = Map.new()
+    for m in modules {
+        let seen = Set.new()
+        for decl in m.program.decls {
+            match decl {
+                DInfix(d) -> {
+                    if Set.contains(seen, d.op) {
+                        oops("the operator '" + d.op + "' is declared twice", d.span)
+                    }
+                    Set.add(seen, d.op)
+                    let target = infixTarget(m.scope, d, arities)
+                    Map.put(out, Prelude.internal(m.name, d.op), (d.group, target))
+                }
+                _ -> {}
+            }
+        }
     }
-    let target = match lookupName(r.scope, ValueSpace, d.target, Some(d.targetSpan)) {
+    out
+}
+
+fun infixTarget(scope : Scope, d : InfixDecl, arities : Map String Int) -> String {
+    let target = match lookupName(scope, ValueSpace, d.target, Some(d.targetSpan)) {
         Some(t) -> t
         None -> oops("'" + d.target + "' is not defined", d.targetSpan)
     }
@@ -124,7 +142,7 @@ fun infixDecl(r : R, d : InfixDecl, arities : Map String Int) -> Unit {
                      d.targetSpan)
     }
     d.target = target
-    Map.put(r.operators, d.op, (d.group, target))
+    target
 }
 
 fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
@@ -502,16 +520,58 @@ fun methodRef(r : R, name : String, where : Span) -> Option Expr =
 
 fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.builtinGroup(op) {
     Some(g) -> g
-    None -> match Map.get(r.operators, op) {
+    None -> match declared(r, op, where) {
         Some((g, _)) -> g
         None -> Diag.fail(Diag.at("parse error", "the operator '" + op
-            + "' is not declared" + splitHint(r, op), where), where.file)
+            + "' is not declared" + missingHint(r, op), where), where.file)
     }
+}
+
+-- Which import would bring `op`, if one of the module's imports exports it;
+-- otherwise how `op` might split into operators that are in scope.
+fun missingHint(r : R, op : String) -> String {
+    let from = Vec.new(2)
+    for key in Map.keys(r.scope.operators) {
+        match String.stripSuffix(key, "." + op) {
+            Some(alias) -> Vec.push(from, alias)
+            None -> {}
+        }
+    }
+    if len(from) == 0 { return splitHint(r, op) }
+    let alias = Vec.sort(from)[0]
+    "; '" + alias + "' exports it, and an operator is in scope only where an "
+        + "import list names it, as in 'import " + alias + " ((" + op + "))'"
 }
 
 fun splitHint(r : R, op : String) -> String =
     Fixity.splitAdvice(op, fun(piece) = Fixity.isBuiltin(piece)
-                                        || Map.contains(r.operators, piece))
+                                        || Map.contains(r.scope.operators, piece))
+
+-- The group and target of the declared operator `op` means here, if any.
+--
+-- Two imports that bring distinct declarations of one symbol make every use
+-- of it an error. Choosing between them by operand types would also choose a
+-- group, and so how the chain around the use is grouped.
+fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
+    match Map.get(conflictsIn(r.scope, OperatorSpace), op) {
+        Some(ids) -> oops("the operator '" + op + "' is ambiguous: it is declared in "
+                          + String.join(Vec.map(Vec.sort(ids), declaringModule), " and ")
+                          + "; withhold all but one with '(" + op + ") as _' in "
+                          + "their imports", where)
+        None -> {}
+    }
+    match Map.get(r.scope.operators, op) {
+        Some(id) -> Map.get(r.operators, id)
+        None -> None
+    }
+}
+
+-- The module part of an operator's internal name, quoted. A module name has
+-- no `#`, and an operator may.
+fun declaringModule(id : String) -> String = match String.splitOnce(id, "#") {
+    Some((m, _)) -> "'" + m + "'"
+    None -> "'" + id + "'"
+}
 
 -- One operator of a chain, applied. A built-in operator's node is spanned by
 -- where its left operand begins, and means its class method; a declared one's
@@ -519,7 +579,7 @@ fun splitHint(r : R, op : String) -> String =
 -- should point at.
 fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -> Expr {
     let (name, where) = op
-    match Map.get(r.operators, name) {
+    match declared(r, name, where) {
         Some((_, target)) -> node(where, EBinary(name, left, right,
                                                  Some(node(where, EVar(target, False)))))
         None -> match Fixity.binaryMethod(name) {

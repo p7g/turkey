@@ -68,6 +68,8 @@ type Sel = Sel {
     -- Whether a C function's variadic arguments go on the stack whatever
     -- registers are left, as Darwin passes them, rather than as named ones.
     variadicsOnStack : Bool,
+    -- Whether every allocation records its size for the heap verifier.
+    sizesRecorded : Bool,
     -- Which values the collector must find at each safepoint, from the low IR.
     frame   : Roots.Frame,
     -- The low IR safepoint being selected, until its call is emitted and
@@ -148,7 +150,10 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 -- panic message is interned when the guard that raises it is emitted, so the
 -- table is complete only once every function has been walked, and the module
 -- emitter writes it after the code for exactly this reason.
-fun selectModule(m : Module, target : Target.Target)
+--
+-- `sizesRecorded` is whether the program is built for the heap verifier,
+-- whose size table every allocation then writes (`Turkey.Runtime.regionSizes`).
+fun selectModule(m : Module, target : Target.Target, sizesRecorded : Bool)
         -> (Vec (Func Inst), Vec Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
@@ -162,7 +167,7 @@ fun selectModule(m : Module, target : Target.Target)
     -- table afterwards, in function order -- the order one selection after
     -- another would have met them in.
     let selected = Parallel.map(m.functions, fun(f) {
-        let s = start(f, asm, variadicsOnStack)
+        let s = start(f, asm, variadicsOnStack, sizesRecorded)
         run(s)
         if Option.isNone(s.stopped) {
             -- The same two passes the low IR had, over what selection
@@ -186,7 +191,7 @@ fun selectModule(m : Module, target : Target.Target)
     (done, skipped, asm)
 }
 
-fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool) -> Sel {
+fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool) -> Sel {
     let g = Ssa.newFunc(f.name, f.result)
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
@@ -198,7 +203,7 @@ fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool) -> Sel {
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
-          variadicsOnStack = variadicsOnStack,
+          variadicsOnStack = variadicsOnStack, sizesRecorded = sizesRecorded,
           frame = Roots.analyze(f), pending = None, panicking = False,
           known = constantsOf(f), definedIn = [], definedAt = [],
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
@@ -408,12 +413,9 @@ fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
         -- The frame objects the collector may read before they are built
-        -- (`Turkey.Roots.FrameObject`), cleared before anything can collect;
-        -- and every frame object's generation word, which only the write
-        -- barrier reads (`Turkey.Frame.layout`) and nothing ever sets.
+        -- (`Turkey.Roots.FrameObject`), cleared before anything can collect.
         if b == Ssa.blockId(s.source.entry) {
             for var k = 0; k < len(s.frame.objects); k = k + 1 {
-                emit(s, A.Str(A.xzr, A.ObjectSlot(k, -24), A.W64))
                 if s.frame.objects[k].zeroed {
                     for field in s.frame.objects[k].traced {
                         emit(s, A.Str(A.xzr, A.ObjectSlot(k, field), A.W64))
@@ -791,16 +793,15 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         CellNew(a) -> {
             let value = raw(s, a)
             let traced = Rt.traceBit(Ssa.repOf(s.source, a))
-            allocate(s, d, 16, Rt.heapCell, "turkey_cell_new",
+            allocate(s, d, Rt.cellBytes, "turkey_cell_new",
                      [A.Constant(0), A.Constant(traced)])
-            emit(s, A.Str(value, A.Offset(d, 0), A.W64))
-            let flag = temp(s, Ssa.untraced(I32))
-            constant(s, flag, traced)
-            emit(s, A.Str(flag, A.Offset(d, 8), A.W32))
+            emit(s, A.Str(immediate(s, Rt.headerWord(Rt.cellKind, traced, 0)),
+                          A.Offset(d, 0), A.W64))
+            emit(s, A.Str(value, A.Offset(d, Rt.cellValue), A.W64))
         }
         ObjectNew(kind, tag, layout, fields, _) -> {
             let bytes = Rt.objectBytes(layout)
-            allocate(s, d, bytes, Rt.heapObject, "turkey_object_new",
+            allocate(s, d, bytes, "turkey_object_new",
                      [A.Constant(kind), A.Constant(tag), A.Constant(bytes - Rt.objectFields),
                       A.Constant(layout.pointers)])
             objectHeader(s, d, kind, tag, layout)
@@ -821,7 +822,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.AllocateArray(d, A.reg(length), raw(s, initial), A.ArrayAllocation {
                 width = Rt.elementWidth(element.class_), layout = Rt.layoutCode(element),
                 slow = calleeOf(s, "turkey_array_new"),
-                classes = untracedGlobal(s, Rt.classesGlobal),
+                classes = untracedGlobal(s, Rt.classesGlobal), sizes = s.sizesRecorded,
             }))
             marked(s)
         }
@@ -829,10 +830,10 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- runtime stores and what an indirect call loads back out of the
         -- shell. The environment is null when there is none.
         ClosureNew(code, environment) -> {
-            allocate(s, d, Rt.objectBytes(Rt.closureShell), Rt.heapObject,
+            allocate(s, d, Rt.objectBytes(Rt.closureShell),
                      "turkey_closure_shell", [A.AddressOf(symbolFor(s, code))])
-            -- `Turkey.Alloc.closureShell`'s header: kind 3 and no tag.
-            objectHeader(s, d, 3, -1, Rt.closureShell)
+            -- `Turkey.Alloc.closureShell`'s header: a closure with no tag.
+            objectHeader(s, d, Rt.closureKind, -1, Rt.closureShell)
             emit(s, A.Str(address(s, symbolFor(s, code)), closureCode(d), A.W64))
             let e = match environment {
                 Some(v) -> A.reg(v)
@@ -840,26 +841,28 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
             emit(s, A.Str(e, closureEnvironment(d), A.W64))
         }
-        -- An object in the frame: the word holding its kind and tag, which is
-        -- what `ObjectTag` reads, then its fields, then its address. The count
-        -- and descriptor words are left unwritten, because nothing reads them
-        -- here: the collector finds a frame object's fields from the frame
-        -- table, and never walks one.
+        -- An object in the frame: the header a heap object of its layout
+        -- would have, then its fields, then its address. The header's tag is
+        -- what `ObjectTag` reads, and its generation, young, is what the write
+        -- barrier reads of a store's target (`barrier`). The collector finds a
+        -- frame object's fields from the frame table, and never reads its
+        -- header.
         StackObject(kind, tag, layout, fields) -> {
             let k = frameObject(s, i.result)
-            let t = immediate(s, Int.or(Int.and(kind, 0xFFFF_FFFF),
-                                        Int.shl(Int.and(tag, 0xFFFF_FFFF), 32)))
+            let t = immediate(s, Rt.headerWord(kind, layout.pointers, tag))
             emit(s, A.Str(t, A.ObjectSlot(k, 0), A.W64))
             for var n = 0; n < len(fields); n = n + 1 {
                 storeField(s, A.ObjectSlot(k, Rt.fieldOffset(layout, n)), fields[n])
             }
             emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
         }
-        -- A closure shell, as `turkey_closure_shell` lays one out: kind 3, no
-        -- tag, then the code's address and the environment.
+        -- A closure shell, as `turkey_closure_shell` lays one out: a
+        -- closure's header with no tag, then the environment and the code's
+        -- address.
         StackClosure(code, environment) -> {
             let k = frameObject(s, i.result)
-            emit(s, A.Str(immediate(s, Int.or(3, Int.shl(0xFFFF_FFFF, 32))),
+            emit(s, A.Str(immediate(s, Rt.headerWord(Rt.closureKind,
+                                                     Rt.closureShell.pointers, -1)),
                           A.ObjectSlot(k, 0), A.W64))
             emit(s, A.Str(address(s, symbolFor(s, code)),
                           A.ObjectSlot(k, Rt.fieldOffset(Rt.closureShell, Rt.closureCode)),
@@ -1037,10 +1040,11 @@ fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.v
 
 -- -- allocation ---------------------------------------------------------------------
 
--- A heap allocation of `size` payload bytes into `d`: a slot from the size
--- class's cursor in the heap (`Turkey.Runtime`'s layouts) with its heap
--- header written, or the runtime's `slow` entry called with `args` when the
--- cursor is empty. One `Allocate` instruction, which the emitter expands.
+-- A heap allocation of an object of `size` bytes into `d`: a slot from the
+-- size class's cursor in the heap (`Turkey.Runtime`'s layouts), or the
+-- runtime's `slow` entry called with `args` when the cursor is empty. One
+-- `Allocate` instruction, which the emitter expands. The caller writes the
+-- header.
 --
 -- The take is not a safepoint and calls nothing, so the collector cannot see
 -- the slot before the caller has written every word of the object, which is
@@ -1048,11 +1052,11 @@ fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.v
 -- The collection, the refill and the large object are all the runtime's, and
 -- so are GC stress and allocation statistics, which empty every cursor
 -- (`Turkey.Heap.refill`) so that each allocation reaches it.
-fun allocate(s : Sel, d : Reg, size : Int, kind : Int, slow : String,
+fun allocate(s : Sel, d : Reg, size : Int, slow : String,
              args : Array A.AllocArg) -> Unit {
     let c = Rt.sizeClass(size)
     emit(s, A.Allocate(d, A.Allocation {
-        sizeClass = c, slotBytes = Rt.classSlot(c), size = size, kind = kind,
+        sizeClass = c, slotBytes = Rt.classSlot(c), size = size, sizes = s.sizesRecorded,
         slow = calleeOf(s, slow), args = args,
     }))
     marked(s)
@@ -1075,16 +1079,11 @@ fun untracedGlobal(s : Sel, name : String) -> Asm.Symbol =
         None -> Asm.globalSymbol(s.asm.dialect, name)
     }
 
--- The words before an object's fields, as `Turkey.Alloc` lays them out: the
--- kind and the tag as two 32-bit halves of one word, the bytes of the fields,
--- and the descriptor, the number of traced words the fields start with.
-fun objectHeader(s : Sel, object : Reg, kind : Int, tag : Int, layout : Rt.Layout) -> Unit {
-    let word = Int.or(Int.and(kind, 0xFFFF_FFFF), Int.shl(tag, 32))
-    emit(s, A.Str(immediate(s, word), A.Offset(object, 0), A.W64))
-    emit(s, A.Str(immediate(s, Rt.objectBytes(layout) - Rt.objectFields),
-                  A.Offset(object, 8), A.W64))
-    emit(s, A.Str(immediate(s, layout.pointers), A.Offset(object, 16), A.W64))
-}
+-- The header of a new object, as `Turkey.Alloc` writes it: young, of `kind`
+-- and `tag`, with the count of the traced words its fields start with.
+fun objectHeader(s : Sel, object : Reg, kind : Int, tag : Int, layout : Rt.Layout) -> Unit =
+    emit(s, A.Str(immediate(s, Rt.headerWord(kind, layout.pointers, tag)),
+                  A.Offset(object, 0), A.W64))
 
 -- A field at `at`, as wide as its representation (`Turkey.Runtime.fieldWidth`):
 -- the bytes the layout gave it and no more, since a narrow field's neighbours
@@ -1118,31 +1117,31 @@ fun closureEnvironment(closure : Reg) -> A.Mem =
 --
 -- A minor collection traces from the roots and from the old objects remembered
 -- as holding a young one (`Turkey.Heap`), so a store that makes an old object
--- point at a young one must remember the old one. Header word 0 is the
--- generation word: 0 young, 1 old, 2 old and already remembered. The inline
--- test reads the target's word first, and only a target that is old and not
--- yet remembered goes on to the value: an object, not an immediate, and young.
+-- point at a young one must remember the old one. An object's first byte is
+-- its generation: 0 young, 1 old, 2 old and already remembered. The inline
+-- test reads the target's first, and only a target that is old and not yet
+-- remembered goes on to the value: an object, not an immediate, and young.
 -- Only then the call, which never allocates, collects or panics, and so has
 -- no safepoint map and no test of the panic flag after it.
 --
--- A frame object's generation word is zero (`Turkey.Frame.layout`), so a
--- target need not be known to be in the heap.
+-- A frame object's generation is young (`StackObject`), so a target need not
+-- be known to be in the heap.
 --
 -- The committed bootstrap compiler emits this sequence into what it builds,
--- which runs the collector in lib/: the word's values, the slow path's name
--- and its one argument are an interface between the two, changed only
--- together with a bootstrap bump.
+-- which runs the collector in lib/: the generation's place and values, the
+-- slow path's name and its one argument are an interface between the two,
+-- changed only together with a bootstrap bump.
 fun barrier(s : Sel, target : Reg, value : Reg) -> Unit {
     let done = block(s)
-    let targetAge = temp(s, Ssa.untraced(I64))
-    emit(s, A.Ldr(targetAge, A.Offset(target, -24), A.W64))
-    emit(s, A.CmpImm(targetAge, 1, A.W64))
+    let targetAge = temp(s, Ssa.untraced(I8))
+    emit(s, A.Ldrb(targetAge, A.Offset(target, 0)))
+    emit(s, A.CmpImm(targetAge, 1, A.W32))
     skipIf(s, A.Ne, done)
     emit(s, A.CmpImm(value, 4096, A.W64))
     skipIf(s, A.Lo, done)
-    let valueAge = temp(s, Ssa.untraced(I64))
-    emit(s, A.Ldr(valueAge, A.Offset(value, -24), A.W64))
-    emit(s, A.CmpImm(valueAge, 0, A.W64))
+    let valueAge = temp(s, Ssa.untraced(I8))
+    emit(s, A.Ldrb(valueAge, A.Offset(value, 0)))
+    emit(s, A.CmpImm(valueAge, 0, A.W32))
     skipIf(s, A.Ne, done)
     move(s, A.argRegs[0], A.Gp, target, A.Gp)
     emit(s, A.CallArgs([A.argRegs[0]], []))

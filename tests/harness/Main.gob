@@ -1,4 +1,7 @@
 -- The test harness: finds the cases, runs them against `boot`, and reports.
+-- The cases are the programs in `tests/programs/` (`Programs`), the
+-- archives in `tests/cases/` (`Archive`) and the examples in `docs/ref/`
+-- (`Reference`).
 -- `scripts/test.sh` builds it and runs it with `--root`, `--boot` and
 -- `--cache` filled in; everything after those is the user's:
 --
@@ -7,13 +10,14 @@
 --   -v                 list the passes too, with their times
 --   --shard I/N        run only shard I of N, counting from 1
 --   --timeout-scale F  multiply every time limit by F
---   --selftest         run the harness's own cases instead of the corpus and
---                      the reference
+--   --selftest         run the harness's own cases instead of the programs,
+--                      the archives and the reference
 --   --bless            write each selected case's actual results over its
 --                      goldens, unless they look like a broken compiler
 --                      (`Bless`)
 --   PATH[::CASE]       run only the cases whose name starts with PATH, and
---                      whose part after its last `:` contains CASE
+--                      whose part after its last `:` contains CASE: an
+--                      archive's case is `PATH::CASE`
 --
 -- The exit status is 0 when no case failed the run, 1 when one did, and 2
 -- when the harness could not run at all. Under `--bless` it is 1 when a case
@@ -25,6 +29,7 @@ import System.Env as Env
 import System.Parallel as Parallel
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
+import Archive as Archive
 import Bless (Blessing)
 import Bless as Bless
 import Case (Case(..), Result(..))
@@ -64,8 +69,9 @@ fun main() {
     }
     let found = if o.selftest { Selftest.cases(o.root, o.cache) }
                 else {
-                    Array.append(Programs.discover(o.root + "/tests/programs", "tests/programs"),
-                                 Reference.cases(o.root + "/docs/ref", "docs/ref", o.cache + "/reference"))
+                    Programs.discover(o.root + "/tests/programs", "tests/programs")
+                    + Archive.cases(o.root + "/tests/cases", "tests/cases", o.cache + "/cases")
+                    + Reference.cases(o.root + "/docs/ref", "docs/ref", o.cache + "/reference")
                 }
     let selected = Array.filter(found, \chosen(o, _.name))
     let timingsFile = o.cache + "/timings"
@@ -77,20 +83,27 @@ fun main() {
     let byName = Array.sortByKey(ran, _.0.name)
     let results = Array.map(byName, \(_.0, _.1.0))
     Schedule.writeTimings(timingsFile, timings, results)
+    let decided = Bless.merged(Array.map(byName, \(_.0, _.1.1)))
     let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-    let ok = if o.bless { bless(Array.map(byName, \(_.0, _.1.1)), actual, millis) }
+    let ok = if o.bless { bless(decided, actual, millis) }
              else {
                  let reported = Report.report(results, o.verbose, actual, millis)
-                 if o.selftest { Selftest.check(byName) } else { reported }
+                 if o.selftest { Selftest.check(o.cache, results, decided) } else { reported }
              }
     Env.exit(if ok { 0 } else { 1 })
 }
 
--- Writes every file bless permits, prints what was written and what was
--- refused, and returns whether no case was refused.
+-- Writes every file and makes every archive edit bless permits, prints what
+-- was written and what was refused, and returns whether no case was refused.
 fun bless(decided : Array (Case, Blessing), actual : String, millis : Int) -> Bool {
-    for (path, text) in Bless.permitted(Array.map(decided, _.1)) {
+    let blessings = Array.map(decided, _.1)
+    for (path, text) in Bless.permitted(blessings) {
         if let Left(e) = Files.writeText(path, text) { die("cannot bless: " + Error.describe(e)) }
+    }
+    -- All of an archive's edits are made in one rewrite, since each edit's
+    -- lines are counted in the archive as it was read.
+    for (path, edits) in Bless.archiveEdits(blessings) {
+        if let Left(e) = Archive.rewrite(path, edits) { die("cannot bless: " + Error.describe(e)) }
     }
     Report.blessed(decided, actual, millis)
 }

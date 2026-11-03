@@ -7,11 +7,15 @@ import subprocess
 import pytest
 
 from tests import bootc, toolchain
-from tests.allocator_probe import allocator_object
+from tests.allocator_probe import verify_object
 
 
+# Linked against the exports built with `--gc-verify`, so that every region
+# keeps its size table and the size-class checks have something to read. The
+# probe turns verification off first and on where a case wants a collection
+# checked.
 @pytest.fixture(scope="module")
-def verifier_probe(tmp_path_factory, allocator_object):
+def verifier_probe(tmp_path_factory, verify_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     toolchain.needs_sanitizer()
@@ -28,12 +32,13 @@ def verifier_probe(tmp_path_factory, allocator_object):
 /* The heap's format, as the probe corrupts it: a copy of its own, so that the
    fault injected is the one named here whatever the collector or the verifier
    believes. */
-typedef struct Header { uint64_t generation, size; uint32_t kind, marked; } Header;
+typedef struct Header { uint8_t generation, kind; uint16_t count; int32_t tag; } Header;
 typedef struct Region {
     struct Region *next, *available_next;
     uint64_t slot_size, reserved;
     uint32_t capacity, used, live, search_word, size_class;
-    uint64_t allocated[32], marked_slots[32];
+    uint64_t allocated[64], marked_slots[64];
+    uint64_t *sizes;
     unsigned char data[];
 } Region;
 typedef struct Frame {
@@ -43,23 +48,27 @@ typedef struct Frame {
     void **values;
     int64_t live;
 } Frame;
-typedef struct Object {
-    int32_t kind, tag;
-    int64_t count;
-    uint64_t descriptor;
-    uint64_t slots[];
-} Object;
+/* An object's header and its fields; an array's header, length and
+   elements, which a `String` is. */
+typedef struct Object { Header header; uint64_t slots[]; } Object;
+typedef struct Array { Header header; int64_t length; unsigned char elements[]; } Array;
 typedef struct Entry { uintptr_t retaddr; int64_t count; const int64_t *offsets; } Entry;
-_Static_assert(sizeof(Header) == 24, "header");
-_Static_assert(offsetof(Region, marked_slots) == 312, "marked slots");
-_Static_assert(offsetof(Region, data) == 568, "region data");
+_Static_assert(sizeof(Header) == 8, "header");
+_Static_assert(offsetof(Region, marked_slots) == 568, "marked slots");
+_Static_assert(offsetof(Region, sizes) == 1080, "size table");
+_Static_assert(offsetof(Region, data) == 1088, "region data");
 
 static Region *regions(void) { return turkey_heap_regions(); }
 static Region **available(void) { return turkey_heap_available(); }
 static Region **region_table(void) { return turkey_heap_region_table(); }
 
-static Header *header_of(void *value) { return (Header *)value - 1; }
-static Region *region_of(Header *h) { return (Region *)((uintptr_t)h & ~(uintptr_t)65535); }
+static Header *header_of(void *value) { return value; }
+static Region *region_of(void *p) { return (Region *)((uintptr_t)p & ~(uintptr_t)65535); }
+/* The size an object's allocation recorded: the word of its region's size
+   table at the object's own offset in the region. */
+static uint64_t *size_of(void *value) {
+    return &region_of(value)->sizes[((uintptr_t)value & 65535) / 8];
+}
 
 static int64_t expected_count;
 static void check_stopped(void) {
@@ -71,7 +80,6 @@ static void forget(void *value) {
     Header *h = header_of(value);
     Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
-    h->marked = 0;
     h->generation = 0;
     r->marked_slots[i / 64] &= ~(UINT64_C(1) << (i % 64));
     r->live--;
@@ -83,7 +91,6 @@ static void remember(void *value) {
     Header *h = header_of(value);
     Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
-    h->marked = (uint32_t)turkey_heap_mark_epoch();
     h->generation = 1;
     r->marked_slots[i / 64] |= UINT64_C(1) << (i % 64);
     r->live++;
@@ -105,7 +112,7 @@ int main(int argc, char **argv) {
     void *held[66] = {0};
     turkey_root_enter(&frame, held, 66, "verifier probe");
     frame.live = 1;
-    Object *child = turkey_string_new((const unsigned char *)"ok", 2);
+    Array *child = turkey_string_new((const unsigned char *)"ok", 2);
     /* Two words, the first traced. */
     Object *parent = turkey_object_new(1, 0, 16, 1);
     parent->slots[0] = (uintptr_t)child;
@@ -137,17 +144,21 @@ int main(int argc, char **argv) {
         held[10] = turkey_array_new(0, 0, 8, 7);
         /* Words below 4096 in a traced slot or a root are immediates -- a
            compact sum's nullary constructors -- and are never followed. */
-        ((Object *)held[3])->slots[1] = 4095;
+        uint64_t immediate = 4095;
+        memcpy(((Array *)held[3])->elements + 8, &immediate, 8);
         held[11] = (void *)1;
         held[1] = NULL;
         frame.live = -1;
-        /* Exactly 12 objects reachable (the closure's environment included). */
+        /* Exactly 13 objects reachable (the closure's environment included):
+           one large enough to have a region of its own. */
+        held[12] = turkey_object_new(1, 0, 40000, 0);
         for (int i = 0; i < 100; i++) turkey_cell_new(i, 0);
         turkey_gc_set_verify(1);
-        turkey_heap_set_mark_epoch(UINT32_MAX);
+        turkey_collect();
+        assert(!turkey_has_panicked && turkey_heap_objects() == 13);
+        held[12] = NULL;
         turkey_collect();
         assert(!turkey_has_panicked && turkey_heap_objects() == 12);
-        assert(turkey_heap_mark_epoch() == 1);
         for (int i = 0; i < 20; i++) { turkey_cell_new(i, 0); turkey_collect(); }
         assert(turkey_heap_objects() == 12);
         memset(held, 0, sizeof held);
@@ -158,7 +169,6 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (!strncmp(which, "mark-", 5) || !strcmp(which, "sweep-survivor")) {
-        turkey_heap_set_mark_epoch(turkey_heap_mark_epoch() + 1);
         remember(parent);
         remember(child);
         phase = 1;
@@ -169,29 +179,43 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "mark-high-root")) {
         parent->slots[0] = 0; forget(child);
     }
-    else if (!strcmp(which, "mark-header")) header_of(parent)->marked = 0;
     else if (!strcmp(which, "mark-free")) r->marked_slots[0] |= UINT64_C(1) << 2;
     else if (!strcmp(which, "mark-count")) r->live++;
-    else if (!strcmp(which, "size")) header_of(parent)->size = UINT64_MAX;
-    else if (!strcmp(which, "short-header")) header_of(parent)->size = 8;
-    else if (!strcmp(which, "heap-kind")) header_of(parent)->kind = 99;
-    else if (!strcmp(which, "kind")) parent->kind = 99;
-    else if (!strcmp(which, "negative-kind")) parent->kind = -1;
-    else if (!strcmp(which, "negative-count")) parent->count = -1;
-    else if (!strcmp(which, "huge-count")) parent->count = INT64_MAX;
-    else if (!strcmp(which, "payload")) parent->count = 8;
-    else if (!strcmp(which, "unaligned-count")) parent->count = 15;
-    else if (!strcmp(which, "descriptor")) parent->descriptor = 3;
-    else if (!strcmp(which, "negative-descriptor")) parent->descriptor = -1;
+    else if (!strcmp(which, "size")) *size_of(parent) = UINT64_MAX;
+    /* An object allocated in the wrong size class: what the verifier would
+       see if generated code's copy of the class rule disagreed with the
+       heap's. 72 bytes take an 80-byte slot, and 24 bytes a 24-byte one. */
+    else if (!strcmp(which, "wrong-class")) {
+        held[2] = turkey_object_new(1, 0, 64, 0);
+        *size_of(held[2]) = 24;
+    }
+    /* A small object in a region of its own. */
+    else if (!strcmp(which, "wrong-large-class")) {
+        held[2] = turkey_object_new(1, 0, 40000, 0);
+        *size_of(held[2]) = 24;
+    }
+    /* Too short for its eleven traced words, in the size class it has. */
+    else if (!strcmp(which, "short-size")) {
+        held[2] = turkey_object_new(1, 0, 88, 11);
+        *size_of(held[2]) = 88;
+    }
+    else if (!strcmp(which, "unaligned-size")) *size_of(parent) = 20;
+    else if (!strcmp(which, "kind")) parent->header.kind = 99;
+    else if (!strcmp(which, "negative-length")) child->length = -1;
+    else if (!strcmp(which, "huge-length")) child->length = INT64_MAX;
+    else if (!strcmp(which, "length")) child->length = 3;
+    else if (!strcmp(which, "array-size")) *size_of(child) = 24;
+    else if (!strcmp(which, "descriptor")) parent->header.count = 3;
+    else if (!strcmp(which, "huge-descriptor")) parent->header.count = UINT16_MAX;
     else if (!strcmp(which, "closure")) {
         held[2] = turkey_closure_shell(123);
-        ((Object *)held[2])->descriptor = 2;
+        ((Object *)held[2])->header.count = 2;
     }
-    else if (!strcmp(which, "array-width")) child->descriptor = 3;
-    else if (!strcmp(which, "array-pointer-width")) child->tag = 7;
-    else if (!strcmp(which, "array-tag")) child->tag = 99;
-    else if (!strcmp(which, "negative-array-tag")) child->tag = -1;
-    else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->size = 1; }
+    else if (!strcmp(which, "array-width")) child->header.count = 3;
+    else if (!strcmp(which, "array-pointer-width")) child->header.count = 7;
+    else if (!strcmp(which, "array-code")) child->header.count = 99;
+    else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); *size_of(held[2]) = 8; }
+    else if (!strcmp(which, "cell-flag")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->count = 2; }
     else if (!strcmp(which, "interior")) parent->slots[0]++;
     /* The first word that is not an immediate, and in no region. */
     else if (!strcmp(which, "foreign")) parent->slots[0] = 4096;
@@ -207,12 +231,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "region-reserved")) r->reserved = UINT64_MAX & ~(uint64_t)65535;
     else if (!strcmp(which, "region-capacity")) r->capacity = UINT32_MAX;
     else if (!strcmp(which, "region-count")) r->used++;
-    else if (!strcmp(which, "region-class")) r->size_class = 0;
+    else if (!strcmp(which, "region-class")) r->size_class++;
+    else if (!strcmp(which, "region-sizes")) r->sizes = NULL;
     else if (!strcmp(which, "region-search")) r->search_word = 1;
     else if (!strcmp(which, "heap-count")) turkey_heap_set_objects(turkey_heap_objects() + 1);
     else if (!strcmp(which, "heap-bytes"))
         turkey_heap_set_region_bytes(turkey_heap_region_bytes() + 1);
-    else if (!strcmp(which, "bitmap")) r->allocated[31] |= UINT64_C(1) << 63;
+    else if (!strcmp(which, "bitmap")) r->allocated[63] |= UINT64_C(1) << 63;
     else if (!strcmp(which, "available")) available()[r->size_class] = NULL;
     else if (!strcmp(which, "available-cycle")) r->available_next = r;
     else if (!strcmp(which, "available-foreign")) available()[0] = (void *)1;
@@ -285,7 +310,7 @@ int main(int argc, char **argv) {
         parent->slots[0] = (uintptr_t)dead;
     }
     else if (!strcmp(which, "allocation-stops")) {
-        parent->count = -1;
+        parent->header.kind = 99;
         turkey_gc_set_verify(1);
         turkey_gc_set_stress(1);
         expected_count = turkey_heap_objects();
@@ -308,21 +333,22 @@ int main(int argc, char **argv) {
         uintptr_t parked[3] = {(uintptr_t)&other[15], (uintptr_t)other, 0};
         uintptr_t running[3] = {(uintptr_t)&stack[15], 0, (uintptr_t)parked};
         /* The collector's state with this frame table and these stacks in it:
-           the frame table, its length, the mark epoch, the stack list and the
-           running stack. */
-        int64_t state[17];
+           the frame table, its length, the stack list and the running
+           stack. */
+        int64_t state[16];
         memcpy(state, turkey_heap_state(), sizeof state);
         state[8] = (int64_t)(uintptr_t)&entry;
         state[9] = 1;
         state[10] = (int64_t)(uintptr_t)running;
-        state[16] = (int64_t)(uintptr_t)running;
+        state[15] = (int64_t)(uintptr_t)running;
         int64_t native_phase = 0;
         if (!strcmp(which, "native-invalid")) stack[6] = 4096;
         if (!strcmp(which, "native-parked-invalid")) other[6] = 4096;
         if (!strcmp(which, "native-unlisted")) state[10] = (int64_t)(uintptr_t)parked;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
         if (!strcmp(which, "native-table")) state[8] = 0;
-        if (!strcmp(which, "native-unmarked")) { native_phase = 1; state[7] = 1; }
+        /* No collection has marked anything. */
+        if (!strcmp(which, "native-unmarked")) native_phase = 1;
         int64_t ok = turkey_heap_check_frames(native_phase, (uintptr_t)stack, state);
         if (!strcmp(which, "native-valid")) { assert(ok); puts("valid"); return 0; }
         assert(!ok); puts(turkey_heap_check_message()); return 0;
@@ -335,7 +361,7 @@ int main(int argc, char **argv) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
-                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(allocator_object),
+                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(verify_object),
                     "-lm", "-pthread", "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     return binary
@@ -345,26 +371,26 @@ CASES = {
     "mark-child": "reachable object is unmarked",
     "mark-root": "reachable object is unmarked",
     "mark-high-root": "reachable object is unmarked",
-    "mark-header": "header and region marks disagree",
     "mark-free": "marked/free slot",
     "mark-count": "region counts disagree",
     "size": "object exceeds allocation slot",
-    "short-header": "invalid heap header",
-    "heap-kind": "invalid heap header",
+    "wrong-class": "object in another size class's slot",
+    "wrong-large-class": "object in another size class's slot",
+    "short-size": "invalid object descriptor",
+    "unaligned-size": "payload size disagrees",
     "kind": "invalid object header",
-    "negative-kind": "invalid object header",
-    "negative-count": "invalid object header",
-    "huge-count": "payload size disagrees",
-    "payload": "payload size disagrees",
-    "unaligned-count": "payload size disagrees",
+    "negative-length": "invalid object header",
+    "huge-length": "payload size disagrees",
+    "length": "payload size disagrees",
+    "array-size": "payload size disagrees",
     "descriptor": "invalid object descriptor",
-    "negative-descriptor": "invalid object descriptor",
+    "huge-descriptor": "invalid object descriptor",
     "closure": "invalid object descriptor",
-    "array-width": "invalid array layout",
-    "array-pointer-width": "invalid array layout",
-    "array-tag": "invalid array layout",
-    "negative-array-tag": "invalid array layout",
+    "array-width": "payload size disagrees",
+    "array-pointer-width": "payload size disagrees",
+    "array-code": "invalid array layout",
     "cell-size": "invalid cell size",
+    "cell-flag": "invalid object header",
     "interior": "invalid traced pointer",
     "foreign": "invalid traced pointer",
     "high-address": "invalid traced pointer",
@@ -380,6 +406,7 @@ CASES = {
     "region-capacity": "invalid region geometry",
     "region-count": "region counts disagree",
     "region-class": "invalid region size class",
+    "region-sizes": "region has no size table",
     "region-search": "allocation search skips free slots",
     "heap-count": "heap totals disagree",
     "heap-bytes": "heap totals disagree",
@@ -391,7 +418,7 @@ CASES = {
     "region-table-probe": "region table entry unreachable by probing",
     "sweep-survivor": "unmarked sweep survivor",
     "sticky-marks": "region marks and generation disagree",
-    "generation": "invalid generation word",
+    "generation": "invalid generation",
     "unremembered": "old object holds a young one and is not remembered",
     "remembered": "valid",
     "remembered-count": "remembered objects miscounted",

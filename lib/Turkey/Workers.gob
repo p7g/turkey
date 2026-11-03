@@ -11,7 +11,8 @@ export (
     blockingFstat, blockingOpenat, blockingFstatat, blockingUnlinkat, blockingMkdirat,
     blockingRenameat, blockingReadlinkat, blockingFlock, blockingReaddir,
     claim, release, wakePoller, interestAdd, interest,
-    pollRead, pollWrite, pollReadWrite, pollChild, pollForget, pollForgetChild, pollWait, pollNow,
+    pollRead, pollWrite, pollReadWrite, pollChild, pollUnlock, pollForget, pollForgetChild,
+    pollForgetUnlock, pollWait, pollNow,
     resultToken, resultValue,
     pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
@@ -70,6 +71,7 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Int ()
 import Data.Bool (Bool(..))
+import Bits (BitOr(..), (|))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
@@ -297,7 +299,7 @@ fun register(permitted : Bool) -> Prim.Ptr {
     let n = Prim.atomicLoad(control, 8)
     if n == threadLimit() { return Prim.ptrNull() }
     -- The record's size, `Turkey.Runtime.processStateBytes`.
-    let record = zeroed(1752)
+    let record = zeroed(2008)
     if Prim.ptrIsNull(record) { return record }
     Prim.storeI64(record, 288, n)
     Prim.storePtr(records, 8 * n, record)
@@ -771,6 +773,8 @@ fun allIdle() -> Bool =
 -- `pollReadable`, and the status comes from `waitpid`. Either way the child
 -- is not reaped, and the caller passes the token to `pollForgetChild` once it
 -- has the result, which on Linux closes the descriptor that was watching it.
+-- For an unlock (Darwin only) the value is `pollReadable`, and says only that
+-- some lock on the file was released, not that the caller can take it.
 
 let pollReadable : Int = 1
 let pollWritable : Int = 2
@@ -1017,6 +1021,18 @@ fun pollChild(pid : Int, token : Int) -> Int {
     }
 }
 
+-- Tell the poller to deliver `token` once a `flock` lock on `fd`'s file is
+-- released, by anyone; 0, or the negated `errno`. Darwin only: Linux reports
+-- no release, and answers `-EINVAL`.
+fun pollUnlock(fd : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> change(Sys.filterVnode(), fd, Sys.evAdd | Sys.evOneShot, Sys.noteFunlock, token)
+        Linux -> Prim.intNeg(Sys.einval)
+    }
+}
+
 fun watchPid(pid : Int, token : Int) -> Int {
     let fd = Sys.result(Libc.syscall(Sys.pidfdOpen, Prim.ptrFromInt(pid), 0, 0, Prim.ptrNull()))
     if fd < 0 { return fd }
@@ -1058,6 +1074,16 @@ fun pollForgetChild(pid : Int, token : Int) -> Unit {
             -- other descriptor refers to the pidfd.
             if fd >= 0 { let _ = Libc.close(fd) }
         }
+    }
+}
+
+-- Drop interest in releases of locks on `fd`'s file, ignoring that there may
+-- be none.
+fun pollForgetUnlock(fd : Int) -> Unit {
+    if Prim.atomicLoad(poller, stateAt) != 2 { return }
+    match Target.os {
+        Darwin -> { let _ = change(Sys.filterVnode(), fd, Sys.evDelete, 0, 0) }
+        Linux -> {}
     }
 }
 
@@ -1266,7 +1292,7 @@ fun push(count : Int, token : Int, value : Int) -> Int {
 -- The break is the user filter; an event whose `udata` is the token the
 -- caller chose is anything else. A read or write event carries `EV_EOF` at end
 -- of stream, and `EV_ERROR` for a failure; a process event carries the wait
--- status in `data`.
+-- status in `data`; a vnode event is an unlock, the only one asked for.
 fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
     let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 32))
     let head = Prim.loadI64(event, 8)
@@ -1281,6 +1307,7 @@ fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
     if filter == Sys.filterProc() {
         return push(count, token, Prim.loadI64(event, 16))
     }
+    if filter == Sys.filterVnode() { return push(count, token, pollReadable) }
     var value = if filter == Sys.filterRead() { pollReadable } else { pollWritable }
     if Prim.intAnd(flags, Sys.evEof) != 0 { value = Prim.intOr(value, pollEof) }
     if Prim.intAnd(flags, Sys.evError) != 0 { value = Prim.intOr(value, pollError) }

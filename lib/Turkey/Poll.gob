@@ -1,14 +1,15 @@
 export (
     Waiter, timedOut, cancelled,
-    now, sleeper, readable, writable, childExit,
+    now, sleeper, readable, writable, childExit, locked,
     park, finished, outcome,
     timeout, pending, deliver, expire, cancel, forget, takeWoken, takeHeadMoved,
 )
 
 -- What tasks wait for besides each other: a time to come, a descriptor to be
--- ready, a child to exit. A wait is a `Waiter`; the scheduler's workers
--- deliver what the operating system reports (`Turkey.Workers`' poller) and
--- the time that passes to the waiters, which answer the coroutines to wake.
+-- ready, a child to exit, a file lock to be free. A wait is a `Waiter`; the
+-- scheduler's workers deliver what the operating system reports
+-- (`Turkey.Workers`' poller) and the time that passes to the waiters, which
+-- answer the coroutines to wake.
 --
 -- Every function here is called under the scheduler's lock, which is what
 -- protects every table below, and none of them waits. This module cannot
@@ -46,6 +47,19 @@ export (
 -- A wait for a child that is not this process's answers `-ECHILD`, as does a
 -- second wait for one that is waited for already.
 --
+-- **File locks** (Darwin only). The kernel reports each release of a `flock`
+-- lock on a file, by anyone, to a registration on any descriptor for it, and
+-- does not say who may take the lock now. So the wait takes the lock itself:
+-- it registers, then tries `LOCK_NB`, and on each event registers again and
+-- tries again, until the lock is taken, the deadline comes or the descriptor
+-- is closed. Registering before each try is what keeps a release that comes
+-- between a failed try and the registration from being lost. The tries run
+-- under the scheduler's lock, as `childExit`'s `waitpid` does, and never
+-- wait. A waiter that leaves before its try succeeds has not taken the lock,
+-- so a deadline or a `cancel` leaves no lock behind. All waits for locks
+-- through one descriptor number share a source, since the kernel keeps one
+-- registration per descriptor and filter.
+--
 -- Everything here is reachable from the module's own tables, which are roots:
 -- a waiter is held by its source or by the heap until it leaves them, and a
 -- coroutine by the waiter. The raw memory below holds no heap value.
@@ -60,6 +74,7 @@ import Control.Iterator (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Bool (Bool(..))
 import Data.Int ()
+import Bits (BitOr(..), (|))
 import Data.Option (Option(..))
 import Data.Option as Option
 import Data.Vec (Vec)
@@ -77,15 +92,17 @@ let timedOut : Int = -0x2_0000_0000
 let cancelled : Int = -0x3_0000_0000
 
 -- How a wait stands: still waiting, or ended for good. `Ready` carries the
--- answer: 0 for a descriptor, the wait status for a child, or a negated error
--- number if the wait could not be made or the descriptor failed to register.
+-- answer: 0 for a descriptor or a lock taken, the wait status for a child, or
+-- a negated error number if the wait could not be made or the descriptor
+-- failed to register.
 type Outcome = Waiting | Ready(Int) | TimedOut | Cancelled
 
--- What a waiter waits for.
-type WaitKind = Sleep | Read | Write | Child
+-- What a waiter waits for. A `Lock` carries the `flock` operation to take.
+type WaitKind = Sleep | Read | Write | Child | Lock(Int)
 
--- What a source stands for.
-type SourceKind = Descriptor | ChildProcess
+-- What a source stands for. A `FileLock` is a descriptor whose file's
+-- unlocks are watched.
+type SourceKind = Descriptor | ChildProcess | FileLock
 
 -- One wait. `heapAt` is the waiter's place on the deadline heap, or -1;
 -- `source` is its source's slot, or 0. `coroutine` is the task to wake when it
@@ -102,9 +119,10 @@ type Waiter = Waiter {
 
 -- A descriptor number or a child with waiters, and what the kernel has been
 -- told about it. `armed` is the directions registered: 1 for read, 2 for
--- write, and on Linux what its one registration was made for. `added` is
--- whether Linux's epoll set holds the descriptor at all, which a one-shot that
--- has fired leaves it doing. A source's record is reused when its slot is.
+-- write, and on Linux what its one registration was made for; for a
+-- `FileLock`, 1 while the unlock is registered. `added` is whether Linux's
+-- epoll set holds the descriptor at all, which a one-shot that has fired
+-- leaves it doing. A source's record is reused when its slot is.
 type Source = Source {
     var generation : Int,
     var live       : Bool,
@@ -143,6 +161,8 @@ var freeSlots : Vec Int = []
 var liveSources = 0
 var byFd : Vec Int = []
 var childSlots : Vec Int = []
+-- The slot of the `FileLock` source for each descriptor number, or 0.
+var byLockFd : Vec Int = []
 -- The slots of the children that have exited and are not yet waitable, which
 -- `expire` asks again, and which keep the poller from waiting for long.
 var exiting : Vec Int = []
@@ -306,6 +326,7 @@ fun leave(w : Waiter) -> Unit {
         Sleep -> drop(s.readers, w.id)
         Read -> drop(s.readers, w.id)
         Child -> drop(s.readers, w.id)
+        Lock(_) -> drop(s.readers, w.id)
     }
     if nobodyWaits(s) { freeSource(slot) }
 }
@@ -379,6 +400,10 @@ fun freeSource(slot : Int) -> Unit {
             Workers.pollForgetChild(s.number, tokenOf(slot, s))
             forgetChild(slot)
             if s.exiting { forgetExiting(slot) }
+        }
+        FileLock -> {
+            if s.armed != 0 { Workers.pollForgetUnlock(s.number) }
+            byLockFd[s.number] = 0
         }
     }
     s.live = False
@@ -461,6 +486,7 @@ fun waitFd(fd : Int, kind : WaitKind, deadline : Int) -> Waiter {
         Sleep -> Vec.push(s.readers, w)
         Read -> Vec.push(s.readers, w)
         Child -> Vec.push(s.readers, w)
+        Lock(_) -> Vec.push(s.readers, w)
     }
     let r = arm(slot, s)
     if r < 0 {
@@ -503,6 +529,68 @@ fun childExit(pid : Int, deadline : Int) -> Waiter {
 }
 
 fun status() -> Int = Prim.charToInt(Prim.loadI32(statusBuffer, 0))
+
+-- A wait that takes `operation`'s `flock` lock on `fd`'s file, `operation`
+-- being without `LOCK_NB`: it ends `Ready` with 0 once the lock is taken, or
+-- with the negated error number of a try or a registration that failed.
+-- Darwin only (`Workers.pollUnlock`).
+fun locked(fd : Int, operation : Int, deadline : Int) -> Waiter {
+    let w = newWaiter(Lock(operation), deadline)
+    if fd < 0 { return done(w, -Sys.ebadf) }
+    while len(byLockFd) <= fd { Vec.push(byLockFd, 0) }
+    var slot = byLockFd[fd]
+    if slot == 0 {
+        slot = newSource(FileLock, fd)
+        if slot < 0 { return done(w, slot) }
+        byLockFd[fd] = slot
+    }
+    let s = sources[slot]
+    w.source = slot
+    Vec.push(s.readers, w)
+    let r = armUnlock(slot, s)
+    if r < 0 {
+        leave(w)
+        return done(w, r)
+    }
+    tryLocks(slot, s)
+    if waiting(w) && deadline >= 0 { timerAdd(w) }
+    w
+}
+
+-- Register for the next unlock of the file of `s`, a `FileLock`, if it is not
+-- registered; 0, or the negated error number.
+fun armUnlock(slot : Int, s : Source) -> Int {
+    if s.armed != 0 { return 0 }
+    let r = Workers.pollUnlock(s.number, tokenOf(slot, s))
+    if r >= 0 { s.armed = 1 }
+    r
+}
+
+-- Try each waiter's lock without waiting, and end the waiters that took it
+-- or failed for a reason other than its being held. Frees the source if
+-- nobody waits on it any more.
+fun tryLocks(slot : Int, s : Source) -> Unit {
+    var i = 0
+    while i < len(s.readers) {
+        let w = s.readers[i]
+        let operation = match w.kind {
+            Lock(op) -> op
+            _ -> Prim.error("a lock source with a waiter that is not a lock")
+        }
+        let nonBlocking = operation | Sys.lockNonBlocking
+        var r = Sys.cResult(Libc.flock(s.number, nonBlocking))
+        while r == -Sys.eintr { r = Sys.cResult(Libc.flock(s.number, nonBlocking)) }
+        if r == -Sys.eagain() {
+            i = i + 1
+        } else {
+            Vec.swap(s.readers, i, len(s.readers) - 1)
+            let _ = Vec.pop(s.readers)
+            w.source = 0
+            let _ = finish(w, Ready(r))
+        }
+    }
+    if nobodyWaits(s) { freeSource(slot) }
+}
 
 fun findChild(pid : Int) -> Int {
     let n = len(childSlots)
@@ -589,6 +677,7 @@ fun deliver(token : Int, value : Int) -> Int {
             match s.kind {
                 ChildProcess -> deliverChild(slot, s, value)
                 Descriptor -> deliverFd(slot, s, value)
+                FileLock -> deliverUnlock(slot, s)
             }
         }
     }
@@ -615,6 +704,19 @@ fun deliverFd(slot : Int, s : Source, value : Int) -> Unit {
         endAll(s.writers, Ready(r))
         freeSource(slot)
     }
+}
+
+-- A lock on the file was released, and the one-shot registration is gone:
+-- register again, then try every waiter's lock.
+fun deliverUnlock(slot : Int, s : Source) -> Unit {
+    s.armed = 0
+    let r = armUnlock(slot, s)
+    if r < 0 {
+        endAll(s.readers, Ready(r))
+        freeSource(slot)
+        return
+    }
+    tryLocks(slot, s)
 }
 
 -- The child exited: reap it and answer its status. On Darwin the event has
@@ -693,6 +795,11 @@ fun cancel(fd : Int) -> Int {
         let s = sources[slot]
         endAll(s.readers, Cancelled)
         endAll(s.writers, Cancelled)
+        freeSource(slot)
+    }
+    if fd >= 0 && fd < len(byLockFd) && byLockFd[fd] != 0 {
+        let slot = byLockFd[fd]
+        endAll(sources[slot].readers, Cancelled)
         freeSource(slot)
     }
     ended - before

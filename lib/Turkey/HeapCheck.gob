@@ -65,6 +65,7 @@ import Data.Error (Error(..))
 import Data.Int ()
 import Data.Bool (Bool(..))
 import Turkey.Libc as Libc
+import Turkey.Memory as Memory
 
 -- -- what the collector hands over --------------------------------------------------
 --
@@ -372,6 +373,14 @@ fun hasBit(bits : Int, at : Int) -> Bool = Prim.intAnd(Prim.intShr(bits, at), 1)
 fun bitAt(base : Int, offset : Int, at : Int) -> Bool =
     hasBit(word(base, offset + 8 * (at / 64)), at % 64)
 
+-- The bits of bitmap word `w` that name slots below `capacity`.
+fun slotsIn(w : Int, capacity : Int) -> Int {
+    let beyond = capacity - 64 * w
+    -- A shift by 64 is a shift by 0 on arm64, so a whole word is its own case.
+    if beyond >= 64 { -1 } else if beyond <= 0 { 0 }
+    else { Prim.intSubWrapping(Prim.intShl(1, beyond), 1) }
+}
+
 -- -- the region index -----------------------------------------------------------------
 
 -- The region list, checked for a cycle and copied into `index` in address
@@ -530,13 +539,26 @@ fun checkRegions() -> Bool {
 fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
     var usedSeen = 0
     var liveSeen = 0
-    for var si = 0; si < regionWords * 64; si = si + 1 {
-        let allocated = bitAt(r, regionAllocated, si)
-        let marked = bitAt(r, regionMarked, si)
-        if (si >= capacity && allocated) || (marked && !allocated) {
-            return fail(Prim.cString("marked/free slot or bitmap outside region"), r, si)
-        }
-        if allocated {
+    -- Visit a word of each bitmap at a time, and only the slots whose bits are
+    -- set, in slot order. A verified collection runs this three times over
+    -- every region, and most of a region's slots are free. Testing each of the
+    -- 4096 bit positions instead costs a verified program most of its time.
+    for var wi = 0; wi < regionWords; wi = wi + 1 {
+        let allocatedBits = word(r, regionAllocated + 8 * wi)
+        let markedBits = word(r, regionMarked + 8 * wi)
+        -- The bits that are wrong whatever the slot holds: allocated past the
+        -- capacity, or marked and free.
+        let wrong = Prim.intOr(Prim.intAnd(allocatedBits, Prim.intNot(slotsIn(wi, capacity))),
+                               Prim.intAnd(markedBits, Prim.intNot(allocatedBits)))
+        var left = Prim.intOr(allocatedBits, wrong)
+        while left != 0 {
+            let b = Memory.trailingZeros(left)
+            left = Prim.intAnd(left, Prim.intSubWrapping(left, 1))
+            let si = 64 * wi + b
+            if hasBit(wrong, b) {
+                return fail(Prim.cString("marked/free slot or bitmap outside region"), r, si)
+            }
+            let marked = hasBit(markedBits, b)
             usedSeen = usedSeen + 1
             if marked { liveSeen = liveSeen + 1 }
             let h = r + regionData + si * slotSize
@@ -612,8 +634,12 @@ fun checkObjects() -> Bool {
         let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
         let slotSize = word(r, regionSlotSize)
         let cls = load32(Prim.ptrFromInt(r), regionSizeClass)
-        for var oj = 0; oj < capacity; oj = oj + 1 {
-            if bitAt(r, regionAllocated, oj) {
+        -- Only the allocated slots, a bitmap word at a time, as in `checkSlots`.
+        for var ow = 0; ow < regionWords; ow = ow + 1 {
+            var left = Prim.intAnd(word(r, regionAllocated + 8 * ow), slotsIn(ow, capacity))
+            while left != 0 {
+                let oj = 64 * ow + Memory.trailingZeros(left)
+                left = Prim.intAnd(left, Prim.intSubWrapping(left, 1))
                 let h = r + regionData + oj * slotSize
                 if sizesKept && !checkSize(r, h, slotSize, cls) { return False }
                 if !checkObject(r, oj, h, slotSize) { return False }

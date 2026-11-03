@@ -9,6 +9,8 @@ import fcntl
 import os
 import stat
 import subprocess
+import sys
+import time
 
 import pytest
 
@@ -346,6 +348,137 @@ def test_a_lock_held_by_another_process_keeps_this_one_out(tmp_path):
 fun main() { print(File.tryLock(must(File.openAppend("lock")))) }
 """, tmp_path)
     assert out == ["Right(False)"]
+
+
+# Only Darwin reports the release of a lock, so only there does a task waiting
+# for one leave its worker to the others; on Linux these programs hang.
+darwin_only = pytest.mark.skipif(sys.platform != "darwin",
+                                 reason="Linux reports no release of a lock")
+
+TASKS = """
+import System.Task as Task
+import Time.Duration as Duration
+import Time.Sleep as Sleep
+import Time.Stopwatch as Stopwatch
+"""
+
+
+@darwin_only
+def test_a_second_file_waits_for_the_lock_on_one_worker(tmp_path):
+    out = lines(TASKS + """
+fun main() {
+    let a = must(File.openAppend("lock"))
+    let b = must(File.openAppend("lock"))
+    must(File.lock(a))
+    let _ = Task.runScope(do {
+        let _ = Task.spawn(fun() {
+            let began = Stopwatch.start()
+            must(File.lock(b))
+            print("b locked")
+            print(Duration.toNanos(Stopwatch.elapsed(began)) >= 100 * 1000000)
+        })?
+        let _ = Task.spawn(fun() {
+            Sleep.sleep(Duration.millis(100))
+            print("a unlocks")
+            must(File.unlock(a))
+        })?
+        pure(0)
+    })
+    print(File.tryLock(a))
+}
+""", tmp_path, env={"TURKEY_WORKERS": "1"})
+    assert out == ["a unlocks", "b locked", "True", "Right(False)"]
+
+
+@darwin_only
+def test_a_waiter_that_loses_the_race_for_a_released_lock_waits_again(tmp_path):
+    # The release wakes both waiters' registrations; one takes the lock, and
+    # the other finds it held and waits for the next release.
+    out = lines(TASKS + """
+fun main() {
+    let a = must(File.openAppend("lock"))
+    must(File.lock(a))
+    let _ = Task.runScope(do {
+        for _ in [1, 2] {
+            let _ = Task.spawn(fun() {
+                let f = must(File.openAppend("lock"))
+                must(File.lock(f))
+                print("locked")
+                Sleep.sleep(Duration.millis(50))
+                must(File.close(f))
+            })?
+        }
+        let _ = Task.spawn(fun() {
+            Sleep.sleep(Duration.millis(100))
+            must(File.unlock(a))
+        })?
+        pure(0)
+    })
+    print(File.tryLock(a))
+}
+""", tmp_path, env={"TURKEY_WORKERS": "1"})
+    assert out == ["locked", "locked", "Right(True)"]
+
+
+@darwin_only
+def test_closing_a_file_ends_its_wait_for_the_lock(tmp_path):
+    out = lines(TASKS + """
+fun main() {
+    let a = must(File.openAppend("lock"))
+    let b = must(File.openAppend("lock"))
+    must(File.lock(a))
+    let _ = Task.runScope(do {
+        let _ = Task.spawn(fun() { print(report(File.lock(b))) })?
+        let _ = Task.spawn(fun() {
+            Sleep.sleep(Duration.millis(100))
+            must(File.close(b))
+        })?
+        pure(0)
+    })
+}
+""", tmp_path, env={"TURKEY_WORKERS": "1"})
+    assert out == ["Closed: lock lock: file already closed"]
+
+
+# Takes the lock on the file named by its argument, says so, holds it for
+# 300 ms, and then unlocks it and lingers, or exits holding it.
+HOLDER = """
+import fcntl, sys, time
+f = open(sys.argv[1], "a")
+fcntl.flock(f, fcntl.LOCK_EX)
+print("held", flush=True)
+time.sleep(0.3)
+if sys.argv[2] == "unlock":
+    fcntl.flock(f, fcntl.LOCK_UN)
+    time.sleep(2)
+"""
+
+
+@pytest.mark.parametrize("release", ["unlock", "exit"])
+def test_a_lock_another_process_releases_is_taken_without_spinning(tmp_path, release):
+    program = binary(HEADER + """
+fun main() {
+    must(File.lock(must(File.openAppend("lock"))))
+    print("locked")
+}
+""")
+    holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(tmp_path / "lock"), release],
+                              stdout=subprocess.PIPE)
+    try:
+        assert holder.stdout.readline() == b"held\n"
+        began = time.monotonic()
+        with open(tmp_path / "out", "wb") as out:
+            waiter = subprocess.Popen(toolchain.command(program), cwd=tmp_path, stdout=out,
+                                      env=dict(os.environ, TURKEY_WORKERS="1"))
+            _, status, usage = os.wait4(waiter.pid, 0)
+        wall = time.monotonic() - began
+    finally:
+        holder.kill()
+        holder.wait()
+    assert os.waitstatus_to_exitcode(status) == 0
+    assert (tmp_path / "out").read_bytes() == b"locked\n"
+    assert wall < 2
+    assert usage.ru_utime + usage.ru_stime < wall / 3
 
 
 def test_temporaryDir_is_made_under_TMPDIR(tmp_path):

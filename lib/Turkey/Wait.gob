@@ -1,11 +1,13 @@
 export (
-    now, sleepUntil, readable, writable, readableUnless, writableUnless, childExit, cancel, forget, timedOut, cancelled,
+    now, sleepUntil, readable, writable, readableUnless, writableUnless, childExit, lockedUnless,
+    cancel, forget, timedOut, cancelled,
 )
 
--- Waiting for time, a descriptor or a child without holding a worker: the
--- caller parks as it does for a mutex (`Turkey.Scheduler.waitUntil`), so from
--- a task it suspends and its worker runs others, and from the program's own
--- stack it runs tasks and drives the poller until the wait ends.
+-- Waiting for time, a descriptor, a child or a file lock without holding a
+-- worker: the caller parks as it does for a mutex
+-- (`Turkey.Scheduler.waitUntil`), so from a task it suspends and its worker
+-- runs others, and from the program's own stack it runs tasks and drives the
+-- poller until the wait ends.
 --
 -- A separate module from the scheduler because the scheduler is in every
 -- program and this is only for those that wait for the outside: it needs
@@ -21,7 +23,8 @@ export (
 --
 -- * descriptors: 0 when ready, hung up or failed -- the operation says which;
 -- * children: the wait status `waitpid` stored, which is 0 or more;
--- * for either, `timedOut` if the deadline came first, `cancelled` if the
+-- * file locks: 0 once the lock is taken;
+-- * for any, `timedOut` if the deadline came first, `cancelled` if the
 --   descriptor was closed under the wait (`Turkey.Poll.cancel`), or the
 --   negated error number if the wait could not be made.
 --
@@ -77,6 +80,14 @@ fun writableUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
 -- (`Turkey.Poll`).
 fun childExit(pid : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.childExit(pid, deadline)) }
+
+-- Take `operation`'s `flock` lock on `fd`'s file, `operation` being without
+-- `LOCK_NB`, waiting while another holder has it, unless `stop()` (as for
+-- `readableUnless`). A wait that ends other than with 0 has not taken the
+-- lock. Darwin only: the poller learns of releases there and not on Linux
+-- (`Turkey.Poll`).
+fun lockedUnless(fd : Int, operation : Int, deadline : Int, stop : fun() -> Bool) -> Int =
+    if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.locked(fd, operation, deadline), stop) }
 
 -- `fd` is about to be closed: end every wait on it with `cancelled`.
 fun cancel(fd : Int) -> Unit {

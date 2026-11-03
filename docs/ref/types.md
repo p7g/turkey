@@ -115,7 +115,7 @@ operations, which the [bitwise operators](expressions.md#bitwise-operators)
 `&`, `|`, `^`, `<<` and `>>` also spell. The shifts panic when the shift amount
 is outside 0 to 63 rather than masking it, and `>>` copies the sign bit.
 
-<!-- panic: shift amount is not in 0..63 -->
+<!-- panic: Int.shl: shift amount 64 is outside 0..63 -->
 ```kotlin
 fun main() {
     print(1 << 64)

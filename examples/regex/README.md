@@ -1,8 +1,9 @@
-# Eager monadic Regex library
+# Monadic Regex library
 
-The implementation is now in [`lib/Regex.gob`](../../lib/Regex.gob).
-[`main.gob`](main.gob) is an importing example; it no longer contains a second
-engine. No language changes or explicit `build` / `compile` calls are needed.
+The implementation is in [`lib/Regex.gob`](../../lib/Regex.gob), and
+[`main.gob`](main.gob) is an example that imports it. A pattern is described
+with combinators, compiled once with `compile`, and matched against whole
+strings with `fullMatch`.
 
 ```kotlin
 import Regex as R
@@ -10,14 +11,14 @@ import Regex as R
 type Assignment = Assignment { key : String, value : String }
 
 let word = R.some(R.satisfy(fun(c) = c >= 'a' && c <= 'z'))
-let assignment = do {
+let assignment = R.compile(do {
     let key = R.capture(word)?
     R.literal("=")?
     let value = R.capture(word)?
     pure(R.map2(key, value, fun(k, v) =
         Assignment { key = k, value = v }
     ))
-}
+})
 
 R.fullMatch(assignment, "hello=world")
 -- Some(Assignment { key = "hello", value = "world" })
@@ -29,9 +30,11 @@ nested pairs), triples, capture recipes, and Unit have `Resolve` instances.
 
 ## Typed composition
 
-A `Builder r` contains an assembled NFA and a construction-time result `r`.
-A `Capture a` is a recipe for obtaining an `a` after a successful match.
+A `Builder r` describes a pattern whose result recipe is an `r`. A
+`Capture a` is a recipe for obtaining an `a` after a successful match.
 `Resolve r` supplies the associated `Output r` type and resolves the recipe.
+`compile` turns a `Builder r` into a `Pattern r`, which is what `fullMatch`
+runs.
 
 | Operation | Successful full-match result |
 | --- | --- |
@@ -47,10 +50,10 @@ A `Capture a` is a recipe for obtaining an `a` after a successful match.
 successful matching of an absent optional result is `Some(None)`.
 
 ```kotlin
-R.fullMatch(R.choice(R.literal("yes"), R.satisfy(fun(c) = c == 'n')), "n")
+R.fullMatch(R.compile(R.choice(R.literal("yes"), R.satisfy(fun(c) = c == 'n'))), "n")
 -- Some(Right('n'))
 
-R.fullMatch(R.many(R.literal("a")), "aaa")
+R.fullMatch(R.compile(R.many(R.literal("a"))), "aaa")
 -- Some(["a", "a", "a"])
 ```
 
@@ -60,14 +63,30 @@ Repetition supports structured recipes, including tuple results and the
 produce nested arrays. Each iteration resolves against its own capture subtree;
 optional values and branch choices cannot leak from an earlier iteration.
 
-`map` on a Builder runs at construction time; `map` and `map2` on Capture create
-result recipes. The current standard `Applicative` supplies only `pure`, so
-`Regex.Combining : Applicative` supplies `map2` locally pending TIX-24. No Prelude
-change is included. Arbitrary result callbacks run after recognition and cannot
-change which input matches; unused and losing-branch recipes are not evaluated.
-Callbacks are not memoized: returning a recipe twice may evaluate it twice.
-Character predicates run during recognition and should be stable and side-effect
-free.
+A builder is a description: it runs when it is compiled, once for every place
+it is used in the pattern. So a fragment can appear twice in one pattern, and
+each use resolves to its own match:
+
+```kotlin
+let token = R.capture(word)
+R.fullMatch(R.compile(do {
+    let a = token?
+    R.literal("=")?
+    let b = token?
+    pure((a, b))
+}), "ab=cd")
+-- Some(("ab", "cd"))
+```
+
+`map` on a Builder runs when the pattern is compiled; `map` and `map2` on
+Capture create result recipes. The standard `Applicative` supplies only
+`pure`, so `Regex.Combining : Applicative` supplies `map2`. Result callbacks run
+after recognition and cannot change which input matches; unused and
+losing-branch recipes are not evaluated. Callbacks are not memoized: returning
+a recipe twice may evaluate it twice. Character predicates run during
+recognition and should be stable and side-effect free. Code in a `do` block
+that builds a pattern runs once per use of that block in a compiled pattern,
+and once more for each `compile`.
 
 ## Matching and empty patterns
 
@@ -77,73 +96,67 @@ paths, but a left branch that cannot finish the whole pattern does not commit.
 Optional participation and repetition are greedy, giving way when required by
 the remainder of the pattern.
 
-Epsilon closure visits each instruction at most once per input position, so
-nullable loops terminate. `many(literal(""))` yields `[]`;
-`some(literal(""))` yields `[""]`, retaining its required first iteration.
-Empty loop traversals that revisit a state are discarded. This rule also applies
-to nested nullable patterns; there is no enumeration of infinitely many empty
-iterations.
+Each instruction is visited at most once per input position, so nullable loops
+terminate. `many(literal(""))` yields `[]`; `some(literal(""))` yields `[""]`,
+retaining its required first iteration. Empty loop traversals that revisit a
+state are discarded. This rule also applies to nested nullable patterns; there
+is no enumeration of infinitely many empty iterations.
 
 ## Representation and algorithm
 
-Bind executes its continuation immediately, copies and concatenates the two NFA
-instruction arrays, and relocates jump targets. It never runs again at match
-time. Falling off the instruction array means acceptance. Reusing a completed
-builder across matches does not rebuild or mutate its NFA.
+`compile` runs the builder against an assembly that holds the instructions at
+their final positions and a tag counter belonging to that one pattern:
+Consume, Jump, Split, and the Open and Close boundaries of capture scopes.
+Falling off the end of the instructions means acceptance. Jumps and splits are
+then pointed past any chain of jumps they lead to. A `literal` has no scope,
+since its text is known, and nothing inside a `capture` has one either, since
+the capture discards the inner recipe.
 
-The recognizer follows [Cox's Thompson/Pike VM presentation](https://swtch.com/~rsc/regexp/regexp2.html):
-Consume, Jump, Split, and capture-boundary instructions; ordered epsilon closure;
-parallel active threads; and first-arrival deduplication at each instruction and
-input position. It uses an explicit work stack, not recursive backtracking.
+`fullMatch` runs one of two engines, and they give the same results:
 
-Open and Close instructions append to persistent event histories, so competing
-threads share history prefixes without mutating one another. Only the selected
-successful history is converted into a capture tree. Choice wraps its selected
-branch in a scope; repetition wraps each iteration. Recipes resolve against
-those scopes, giving typed sums and arrays without unboxing or unchecked casts.
+- When `(instructions + 1) * (bytes of text + 1)` is within a budget, 2Mi
+  pairs (a 256 KiB visited set) by default, a depth-first backtracker with a visited bit for each pair
+  of instruction and position. It tries the first branch of every split
+  before the second, so the first path it finds is the one the Pike VM would
+  choose, and since a pair is explored at most once, the work is bounded by
+  the number of pairs. Capture boundaries go to one event log, cut back on
+  backtracking. This follows RE2's BitState, Go's backtracker and Rust's bounded
+  backtracker, whose default budget this is.
+- Otherwise the [Pike VM](https://swtch.com/~rsc/regexp/regexp2.html): ordered
+  epsilon closure, parallel threads, and first-arrival deduplication at each
+  instruction and input position. Threads carry persistent event histories
+  that share prefixes, and only the winner's is turned into a log.
 
-The tests include 24 ambiguous optional `a` prefixes followed by 24 required
-`a`s, and 2,000 repeated captured values. These are correctness/stress checks,
-not a throughput benchmark. NFA state processing is bounded by the program size
-per input position; histories, capture trees, scans of capture children, and user
-result callbacks have additional time and memory costs. Production performance
-claims and engine comparisons remain separate design work.
+`fullMatchWithin(pattern, text, budget)` chooses with another budget; a
+budget of 0 always runs the Pike VM, whose space is linear in the pattern
+alone.
+
+The winning log becomes a capture tree. Choice wraps its selected branch in a
+scope; repetition wraps each iteration. Recipes resolve against those scopes,
+giving typed sums and arrays without unboxing or unchecked casts.
 
 ## Current limits
 
 - Full matching only: no pattern-string frontend, search, or replacement API.
-- Construction uses a process-wide mutable ID supply. Matching allocates history
-  for the current run, not a global-ID-sized capture array. Concurrent construction
-  is not addressed.
-- Capture ownership is not statically enforced. An out-of-scope handle fails
-  with a diagnostic when its recipe is evaluated.
-- Sequential reuse of the same captured fragment reuses its IDs: direct capture
-  lookup chooses the last occurrence in that scope. Repeated-result recipes gather
-  all occurrences of their iteration ID in scope. Use fresh construction for
-  distinct handles; choice and repetition introduce their own nested scopes.
-- Repeated array copying can make construction quadratic. History and result
-  allocation can also be substantial; this is an initial implementation.
+- Character classes are predicates, so the compiler cannot tell whether two
+  alternatives can start with the same character. There is no one-pass
+  engine, and no DFA.
+- Capture ownership is not statically enforced. A handle used outside the
+  scope it was built in fails with a diagnostic when its recipe is evaluated.
 
 ## Verification
 
 From the repository root:
 
 ```sh
-.venv/bin/python -m turkey run --backend python examples/regex/main.gob
-.venv/bin/python -m turkey run --backend llvm examples/regex/main.gob
-.venv/bin/python -m pytest tests/test_regex.py -q
+build/stages/stage2 build -o main.s examples/regex/main.gob && cc -o main main.s && ./main
+python3 -m pytest tests/test_regex.py -q
 sh scripts/test.sh tests/programs/regex_library
 ```
 
-The conformance program in `tests/programs/regex_library.gob` covers construction
-and extraction timing, typed records/tuples/sums/arrays, nesting, optional
-participation, priority and fallback, UTF-8, nullable cycles, program reuse, and
-long capture histories. It joins the existing bootstrap compiler corpus too.
-The Python tests also verify inferred result types and reject capture-as-string,
-incorrect result annotations, and access to private constructors.
-
-The initial library change passed all nine focused pytest cases (six type/API
-checks plus conformance, native execution, and native code-generation checks),
-covering 48 runtime assertions. The bootstrap compiler also produced identical
-inferred types and Core for the conformance program; its generated LLVM compiled
-and passed the same 48 assertions. The example ran on both backends.
+The conformance program in `tests/programs/regex_library.gob` covers when
+builders run and recipes are extracted, typed records, tuples, sums and arrays,
+nesting, optional participation, priority and fallback, UTF-8, nullable
+cycles, reuse of compiled patterns and of fragments, and long capture
+histories. It runs every case twice, once with room to backtrack and once on
+the Pike VM, and the two halves of its output are the same.

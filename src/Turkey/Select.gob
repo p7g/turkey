@@ -391,10 +391,19 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
 -- inserted, so every `BlockId` a terminator already names still means the
 -- block it meant.
 --
--- Before a safepoint, every root live across it is stored into its slot. Which
--- slots are live there is not written at run time: the frame table says it as
--- data, and the call is marked with the low IR position `Roots.liveAt`
--- answers for.
+-- A root is stored into its slot once, directly after its definition, and
+-- never before a safepoint. Which slots are live at a safepoint is not written
+-- at run time: the frame table says it as data, and the call is marked with
+-- the low IR position `Roots.liveAt` answers for.
+--
+-- The invariant the frame table relies on: wherever a safepoint's map says a
+-- slot is live, the slot holds that value. It holds because the definition
+-- dominates every safepoint the value is live across, no other value is ever
+-- given the slot (`Roots.Frame.slots`), and the collector does not move
+-- objects, so nothing rewrites the slot after the store. A loop-invariant
+-- pointer is then stored once before the loop, and not at every call in it.
+-- The price is a store on a path that reaches no safepoint, after a
+-- definition that is live across one only on some other path.
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
@@ -412,20 +421,19 @@ fun run(s : Sel) -> Unit {
                 }
             }
         }
+        if b == Ssa.blockId(s.source.entry) {
+            for p in s.source.params { storeRoot(s, p) }
+        }
+        for p in s.source.blocks[b].params { storeRoot(s, p) }
         let insts = s.source.blocks[b].insts
         for var n = 0; n < len(insts); n = n + 1 {
-            let live = Roots.liveAt(s.frame, b, n)
-            -- A frame object needs no store to be published, only the map:
-            -- its fields are in the frame already.
-            -- A poll stores its roots on its own slow path (`Turkey.Emit.poll`).
+            -- A poll's map is written by its own slow path (`Turkey.Emit.poll`).
             let polls = match insts[n].op {
                 Poll -> True
                 _ -> False
             }
-            if !polls && (len(live) > 0 || len(Roots.objectsAt(s.frame, b, n)) > 0) {
-                for (slot, id) in live {
-                    emit(s, A.Str(A.Virtual(id), A.RootSlot(slot), A.W64))
-                }
+            if !polls && (len(Roots.liveAt(s.frame, b, n)) > 0
+                          || len(Roots.objectsAt(s.frame, b, n)) > 0) {
                 s.pending = Some((b, n))
             }
             s.place = (b, n)
@@ -433,9 +441,16 @@ fun run(s : Sel) -> Unit {
             -- A safepoint selected without a call -- a closure capture is a
             -- store -- has nothing to mark, and nothing can collect inside it.
             s.pending = None
+            -- After the call's map, where the result first exists.
+            storeRoot(s, insts[n].result)
         }
         terminate(s, s.source.blocks[b].term)
     }
+}
+
+fun storeRoot(s : Sel, v : Value) -> Unit = match Roots.slotOf(s.frame, Ssa.valueId(v)) {
+    Some(slot) -> emit(s, A.Str(A.Virtual(Ssa.valueId(v)), A.RootSlot(slot), A.W64))
+    None -> {}
 }
 
 -- A block's terminator, as the machine graph ends a block.
@@ -516,6 +531,28 @@ fun branchIf(s : Sel, c : A.Cond, yes : Int, no : Int) -> Unit {
     let taken = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(taken), c))
     s.out.blocks[s.at].term = Branch(taken, BlockId(yes), BlockId(no))
+}
+
+-- A `not` of a comparison selected just before it is the opposite `cset`
+-- on the same flags, which are still set. The emitter folds a `cset` that
+-- ends a block into its branch, so a branch on `!(a < b)` is `b.ge` and not
+-- `cset; eor; cbnz`; and the first `cset`, if nothing else reads it, is dead.
+--
+-- Not by swapping the branch's arms instead: the emitter lays a block's `no`
+-- arm out next, and the arms are the way round the source wrote them, with
+-- the failure path of a check taken and the code after it falling through.
+fun negate(s : Sel, d : Reg, a : Value) -> Unit {
+    let insts = s.out.blocks[s.at].insts
+    if len(insts) > 0 {
+        match A.csetOf(insts[len(insts) - 1].op) {
+            Some((n, c)) -> if n == Ssa.valueId(a) {
+                emit(s, A.CSet(d, A.invert(c)))
+                return
+            }
+            None -> {}
+        }
+    }
+    emit(s, A.EorImm(d, A.reg(a), 1, A.W32))
 }
 
 -- A new block at the end, and its id.
@@ -614,7 +651,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- distinguish the two.
         Convert(PtrToInt, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
         Convert(IntToPtr, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
-        Not(a) -> emit(s, A.EorImm(d, A.reg(a), 1, A.W32))
+        Not(a) -> negate(s, d, a)
         Intrinsic(k, a) -> intrinsic(s, d, k, A.reg(a))
         -- A field is at a constant offset from the header.
         ObjectGet(target, field) -> loadField(s, d, A.Offset(A.reg(target), field.offset), r)
@@ -1360,12 +1397,28 @@ fun callStacking(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
 -- branch on it. The flag is only ever 0 or 1 (`Turkey.Process.raise` stores
 -- 1), so its low word is the whole answer and can be branched on as a bit.
 fun propagate(s : Sel) -> Unit {
-    if s.panicking { return }
+    if s.panicking || endsUnreachable(s) { return }
     let failed = tempValue(s, Ssa.untraced(I1))
     emit(s, A.Ldr(A.reg(failed), A.Offset(A.worker, 0), A.W32))
     -- The empty message: this path propagates a panic that already happened
     -- and raises nothing new. It returns zero, as every panic path does.
     guard(s, failed, "")
+}
+
+-- Whether the call being selected is a `Call` instruction that ends a block
+-- whose terminator is `Unreachable`, as the lowering leaves a call that never
+-- returns. Then the test is redundant: both of its exits return zero from
+-- here with the flag as the callee left it, and skipping it saves a second
+-- epilogue at every bounds check. A call that is only part of a longer
+-- instruction is still tested, since the rest of the instruction would run.
+fun endsUnreachable(s : Sel) -> Bool {
+    let (b, n) = s.place
+    let block = s.source.blocks[b]
+    if n != len(block.insts) - 1 { return False }
+    match (block.insts[n].op, block.term) {
+        (Call(_, _), Unreachable) -> True
+        _ -> False
+    }
 }
 
 -- A zero of the function's result, which is what every path that leaves
@@ -1440,15 +1493,14 @@ fun runtimeSymbolOf(s : Sel, name : String) -> Asm.Symbol =
     Asm.runtimeFor(s.asm.dialect, name)
 
 -- One element of an array, by address. The header first, then the index scaled
--- by the element's width.
+-- by the element's width, which the access does itself: every width an
+-- element has is one an access of that width can shift its index by.
 fun elementAt(s : Sel, array : Reg, index : Reg, c : RepClass) -> A.Mem {
     let base = temp(s, Ssa.untraced(Ptr))
     emit(s, A.AddImm(base, array, Rt.arrayElements, A.W64))
     let width = Rt.elementWidth(c)
     if width == 1 { return A.Indexed(base, index) }
-    let scaled = temp(s, Ssa.untraced(I64))
-    emit(s, A.Lsl(scaled, index, immediate(s, shiftFor(width)), A.W64))
-    A.Indexed(base, scaled)
+    A.Scaled(base, index, shiftFor(width))
 }
 
 fun shiftFor(width : Int) -> Int = match width {
@@ -1502,7 +1554,7 @@ fun trapping(s : Sel, i : Low, d : Reg, r : Rep, o : BinOp, a : Reg, b : Reg,
             let sign = temp(s, Ssa.untraced(I64))
             emit(s, A.Mul(d, a, b, w))
             emit(s, A.SMulH(high, a, b))
-            emit(s, A.Asr(sign, d, immediate(s, 63), A.W64))
+            emit(s, A.AsrImm(sign, d, 63, A.W64))
             emit(s, A.Cmp(high, sign, A.W64))
             guardOn(s, A.Ne, "integer overflow in *")
         }

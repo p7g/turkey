@@ -1,0 +1,304 @@
+export (run)
+
+-- Jump threading through a join on a `Bool`: a block whose only work is to
+-- branch on its own `i1` parameter is bypassed, and each jump into it becomes
+-- the branch itself, or a jump to the arm the argument it passed selects.
+--
+-- `a || b` and `a && b` in a condition are lowered as a join that receives
+-- the condition's value and then branches on it:
+--
+--     b1: branch %c, b2, b3
+--     b2: jump b4(%c)                 -- %c is true on this edge
+--     b3: %n = not %d; jump b4(%n)
+--     b4(%p): branch %p, yes, no
+--
+-- and this rewrites it to
+--
+--     b1: branch %c, yes, b3
+--     b3: branch %d, no, yes
+--
+-- which is two compares and two conditional branches, with no `i1` made and
+-- none passed. It is also what lets `Turkey.Bounds` see the comparisons: a
+-- block entered from the join learns nothing, and one entered from the
+-- branch on `%d` learns `%d`'s outcome.
+--
+-- **Which joins.** The join holds nothing but its branch and the `not`s
+-- between the branch and the parameter, each used once, by the next; its
+-- other parameters are used nowhere. So threading copies no instruction,
+-- every jump into the join is threaded at once, and the join is left with no
+-- way in. Its arms are entered by a branch, so they take no parameters, and
+-- whatever they read is defined above the join, where it dominates every
+-- block that jumped there too. A join that a jump from a block it dominates
+-- enters is a loop header, and is left alone: bypassing it would give the
+-- loop a second entry.
+--
+-- **What is known on an edge.** The argument, seen through its `not`s, is a
+-- constant; or it is the condition of a branch whose one arm is the only way
+-- into the jumping block, through blocks each with one way in, which says
+-- what it is there. Otherwise the jump becomes a branch on the argument.
+--
+-- It adds no instruction and makes no value live anywhere it was not, so it is
+-- safe before the giblets check.
+
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..))
+
+-- A join this rewrites: the parameter its branch tests, whether an odd number
+-- of `not`s lies between them, and where the branch goes.
+type Join = Join { param : Int, flipped : Bool, yes : BlockId, no : BlockId }
+
+-- The function with every qualifying join threaded and the joins themselves
+-- removed.
+fun run(f : Ssa.Func Low) -> Ssa.Func Low {
+    if !hasJoin(f) { return f }
+    let defs : Array (Option Op) = Array.filled(len(f.reps), None)
+    for block in f.blocks {
+        for i in block.insts { defs[Ssa.valueId(i.result)] = Some(i.op) }
+    }
+    -- A block whose jump became a jump to a known arm, which `forward` then
+    -- tries to remove.
+    let decided = []
+    var threading = True
+    var changed = False
+    -- One join at a time would recompute the predecessors for each. A round
+    -- threads every join it can whose neighbourhood the round has not already
+    -- changed, so what it reads is still true, and the next round takes the
+    -- rest. Nested `&&` and `||` take a round per level.
+    while threading {
+        threading = False
+        let preds = Ssa.predecessors(f)
+        let idom = Ssa.dominators(f)
+        let uses = useCounts(f)
+        let touched = Array.filled(len(f.blocks), False)
+        for b in Ssa.reversePostorder(f) {
+            let j = Ssa.blockId(b)
+            if touched[j] { continue }
+            match joinAt(f, defs, uses, preds, idom, j) {
+                Some(join) -> {
+                    if !clear(preds, touched, j) { continue }
+                    touched[j] = True
+                    for p in preds[j] {
+                        let from = Ssa.blockId(p)
+                        touched[from] = True
+                        match thread(f, defs, preds, join, from) {
+                            Some(_) -> Vec.push(decided, from)
+                            None -> {}
+                        }
+                    }
+                    threading = True
+                    changed = True
+                }
+                None -> {}
+            }
+        }
+    }
+    if !changed { return f }
+    forward(f, decided)
+    Ssa.pruneUnreachable(f)
+}
+
+fun hasJoin(f : Ssa.Func Low) -> Bool {
+    for block in f.blocks {
+        match block.term {
+            Branch(_, _, _) -> if len(block.params) > 0 { return True }
+            _ -> {}
+        }
+    }
+    False
+}
+
+-- How many times each value is read, by an instruction or a terminator.
+fun useCounts(f : Ssa.Func Low) -> Array Int {
+    let uses = Array.filled(len(f.reps), 0)
+    for block in f.blocks {
+        for i in block.insts {
+            for v in L.opUses(i.op) { uses[Ssa.valueId(v)] = uses[Ssa.valueId(v)] + 1 }
+        }
+        for v in Ssa.termUses(block.term) { uses[Ssa.valueId(v)] = uses[Ssa.valueId(v)] + 1 }
+    }
+    uses
+}
+
+-- Whether the join's predecessors, and theirs, are as the round found them.
+fun clear(preds : Array (Vec BlockId), touched : Array Bool, j : Int) -> Bool {
+    for p in preds[j] {
+        let from = Ssa.blockId(p)
+        if touched[from] { return False }
+        for q in preds[from] {
+            if touched[Ssa.blockId(q)] { return False }
+        }
+    }
+    True
+}
+
+fun joinAt(f : Ssa.Func Low, defs : Array (Option Op), uses : Array Int,
+           preds : Array (Vec BlockId), idom : Array (Option Int), j : Int) -> Option Join {
+    let block = f.blocks[j]
+    if len(block.params) == 0 || len(preds[j]) == 0 { return None }
+    match block.term {
+        Branch(c, yes, no) -> joinOf(f, defs, uses, preds, idom, j, c, yes, no)
+        _ -> None
+    }
+}
+
+fun joinOf(f : Ssa.Func Low, defs : Array (Option Op), uses : Array Int,
+           preds : Array (Vec BlockId), idom : Array (Option Int), j : Int,
+           c : Value, yes : BlockId, no : BlockId) -> Option Join {
+    let block = f.blocks[j]
+    if Ssa.blockId(yes) == j || Ssa.blockId(no) == j { return None }
+    -- The branch's condition, back through the `not`s the block holds, which
+    -- must be everything it holds.
+    var tested = c
+    var flipped = False
+    var nots = 0
+    var going = True
+    while going {
+        going = False
+        if uses[Ssa.valueId(tested)] != 1 { return None }
+        match defs[Ssa.valueId(tested)] {
+            Some(Not(inner)) -> if definedIn(block, tested) {
+                tested = inner
+                flipped = !flipped
+                nots = nots + 1
+                going = True
+            }
+            _ -> {}
+        }
+    }
+    if nots != len(block.insts) { return None }
+    var param = -1
+    for var k = 0; k < len(block.params); k = k + 1 {
+        let v = block.params[k]
+        if Ssa.valueId(v) == Ssa.valueId(tested) { param = k }
+        else if uses[Ssa.valueId(v)] > 0 { return None }
+    }
+    if param < 0 { return None }
+    for p in preds[j] {
+        match f.blocks[Ssa.blockId(p)].term {
+            Jump(_, _) -> {}
+            _ -> return None
+        }
+        if Ssa.dominates(idom, BlockId(j), p) { return None }
+    }
+    Some(Join { param = param, flipped = flipped, yes = yes, no = no })
+}
+
+fun definedIn(block : Ssa.Block Low, v : Value) -> Bool {
+    for i in block.insts {
+        if Ssa.valueId(i.result) == Ssa.valueId(v) { return True }
+    }
+    False
+}
+
+-- Replace the jump ending `from` with the join's branch; the arm it goes to,
+-- if the argument it passed is known there.
+fun thread(f : Ssa.Func Low, defs : Array (Option Op), preds : Array (Vec BlockId),
+           join : Join, from : Int) -> Option BlockId {
+    let arg = match f.blocks[from].term {
+        Jump(_, args) -> args[join.param]
+        _ -> return None
+    }
+    let (base, negated) = throughNots(defs, arg)
+    let flipped = negated != join.flipped
+    match knownOn(f, defs, preds, base, from) {
+        Some(holds) -> {
+            let target = if holds != flipped { join.yes } else { join.no }
+            f.blocks[from].term = Jump(target, [])
+            Some(target)
+        }
+        None -> {
+            f.blocks[from].term = if flipped { Branch(base, join.no, join.yes) }
+                                  else { Branch(base, join.yes, join.no) }
+            None
+        }
+    }
+}
+
+fun throughNots(defs : Array (Option Op), v : Value) -> (Value, Bool) {
+    var at = v
+    var negated = False
+    var going = True
+    while going {
+        going = False
+        match defs[Ssa.valueId(at)] {
+            Some(Not(inner)) -> {
+                at = inner
+                negated = !negated
+                going = True
+            }
+            _ -> {}
+        }
+    }
+    (at, negated)
+}
+
+-- What `v` is in `from`: a constant, or the condition of the branch that is
+-- the only way in.
+fun knownOn(f : Ssa.Func Low, defs : Array (Option Op), preds : Array (Vec BlockId),
+            v : Value, from : Int) -> Option Bool {
+    match defs[Ssa.valueId(v)] {
+        Some(ConstInt(n)) -> return Some(n != 0)
+        _ -> {}
+    }
+    var at = from
+    for var steps = 0; steps < reach; steps = steps + 1 {
+        if len(preds[at]) != 1 { return None }
+        let up = Ssa.blockId(preds[at][0])
+        match f.blocks[up].term {
+            Branch(c, yes, no) ->
+                if Ssa.valueId(c) == Ssa.valueId(v) && Ssa.blockId(yes) != Ssa.blockId(no) {
+                    return Some(Ssa.blockId(yes) == at)
+                }
+            _ -> {}
+        }
+        at = up
+    }
+    None
+}
+
+-- How far up a chain of blocks with one way in `knownOn` looks for the
+-- branch. Block merging has not yet joined the chains lowering makes when
+-- this runs, and a block per statement between the test and the join is
+-- typical.
+let reach = 8
+
+-- A block left holding only a jump to a known arm, entered only by a branch
+-- or through empty blocks from one, is skipped: the branch goes to the arm. Selection would otherwise emit it as
+-- a block of one unconditional jump.
+fun forward(f : Ssa.Func Low, decided : Vec Int) -> Unit {
+    let preds = Ssa.predecessors(f)
+    for b in decided {
+        let block = f.blocks[b]
+        if len(block.insts) > 0 || len(preds[b]) != 1 { continue }
+        let target = match block.term {
+            Jump(target, args) -> if len(args) == 0 { target } else { continue }
+            _ -> continue
+        }
+        -- Up through the empty blocks that only lead here.
+        var at = b
+        var q = Ssa.blockId(preds[b][0])
+        var steps = 0
+        while isEmptyJumpTo(f.blocks[q], at) && len(preds[q]) == 1 && steps < reach {
+            at = q
+            q = Ssa.blockId(preds[q][0])
+            steps = steps + 1
+        }
+        match f.blocks[q].term {
+            Branch(c, yes, no) -> {
+                let y = if Ssa.blockId(yes) == at { target } else { yes }
+                let n = if Ssa.blockId(no) == at { target } else { no }
+                f.blocks[q].term = if Ssa.blockId(y) == Ssa.blockId(n) { Jump(y, []) }
+                                   else { Branch(c, y, n) }
+            }
+            _ -> {}
+        }
+    }
+}
+
+fun isEmptyJumpTo(block : Ssa.Block Low, to : Int) -> Bool =
+    len(block.insts) == 0 && match block.term {
+        Jump(target, args) -> Ssa.blockId(target) == to && len(args) == 0
+        _ -> False
+    }

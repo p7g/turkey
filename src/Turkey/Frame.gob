@@ -8,7 +8,7 @@ export (
 -- frame is and how big the whole is; the emitter prints the prologue, the
 -- epilogue and the frame-table entries from it. Everything that needs an
 -- instruction the allocator must see -- the parameter moves, the root stores
--- before a safepoint, the outgoing stack arguments -- was emitted by
+-- after each root's definition, the outgoing stack arguments -- was emitted by
 -- selection, which is why this pass has nothing to insert.
 --
 -- The frame, from the top, with every offset positive from `sp` and `sp` fixed
@@ -49,10 +49,9 @@ type SafepointMap = SafepointMap { block : Int, index : Int, offsets : Vec Int }
 
 -- What a loop's poll does on its slow path (`Turkey.Emit.poll`): the
 -- registers it keeps across its call -- the live values in registers a call
--- clobbers -- and the live roots that are in registers, each with its root
--- slot's offset from `sp`. A root the allocator spilled is in its root slot
--- already, since a spilled value's slot is its root slot when it has one.
-type PollSave = PollSave { kept : Vec Reg, roots : Vec (Reg, Int) }
+-- clobbers. It stores no roots: every root is in its slot from its definition
+-- on (`Turkey.Select.run`).
+type PollSave = PollSave { kept : Vec Reg }
 
 type Layout = Layout {
     size     : Int,
@@ -79,7 +78,7 @@ fun pollKey(b : Int, n : Int) -> Int = Int.or(Int.shl(b, 32), n)
 
 fun pollAt(l : Layout, b : Int, n : Int) -> PollSave = match Map.get(l.polls, pollKey(b, n)) {
     Some(p) -> p
-    None -> PollSave { kept = [], roots = [] }
+    None -> PollSave { kept = [] }
 }
 
 fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
@@ -153,13 +152,13 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
             }
         }
     }
-    placePolls(l, a, frame)
+    placePolls(l, a)
     l
 }
 
--- What each poll keeps and stores, from the liveness of the allocated code:
+-- What each poll keeps, from the liveness of the allocated code:
 -- the values live after the poll are the ones its call must not lose.
-fun placePolls(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame) -> Unit {
+fun placePolls(l : Layout, a : Regalloc.Allocation) -> Unit {
     let f = a.func
     for var bi = 0; bi < len(f.blocks); bi = bi + 1 {
         let insts = f.blocks[bi].insts
@@ -170,7 +169,7 @@ fun placePolls(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame) -> Unit
                     if len(after) == 0 {
                         after = Ssa.liveAfter(f, BlockId(bi), a.liveOut[bi])
                     }
-                    Map.put(l.polls, pollKey(b, n), pollSave(l, a, frame, b, n, after[k]))
+                    Map.put(l.polls, pollKey(b, n), pollSave(a, after[k]))
                 }
                 None -> {}
             }
@@ -178,8 +177,7 @@ fun placePolls(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame) -> Unit
     }
 }
 
-fun pollSave(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame, b : Int, n : Int,
-             live : Array Int) -> PollSave {
+fun pollSave(a : Regalloc.Allocation, live : Array Int) -> PollSave {
     let kept = []
     for id in live {
         match inRegister(a, id) {
@@ -190,27 +188,7 @@ fun pollSave(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame, b : Int, 
             _ -> {}
         }
     }
-    let roots = []
-    for (slot, id) in Roots.liveAt(frame, b, n) {
-        if sortedContains(live, id) {
-            match inRegister(a, id) {
-                Some(r) -> Vec.push(roots, (r, l.rootsAt + 8 * slot))
-                None -> {}
-            }
-        }
-    }
-    PollSave { kept = kept, roots = roots }
-}
-
--- Whether `id` is in `ids`, which ascend (`Ssa.liveAfter`).
-fun sortedContains(ids : Array Int, id : Int) -> Bool {
-    var low = 0
-    var high = len(ids)
-    while low < high {
-        let middle = (low + high) / 2
-        if ids[middle] < id { low = middle + 1 } else { high = middle }
-    }
-    low < len(ids) && ids[low] == id
+    PollSave { kept = kept }
 }
 
 -- The register value `id` was coloured into, if it lives in one.
@@ -283,6 +261,7 @@ fun offsetOf(l : Layout, m : Mem) -> Option Int = match m {
     IncomingArg(k) -> Some(l.size + 8 * k)
     Offset(_, _) -> None
     Indexed(_, _) -> None
+    Scaled(_, _, _) -> None
     PageOffset(_, _) -> None
 }
 
@@ -322,6 +301,7 @@ fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
             Fp -> {}
         }
     }
+    let idom = Ssa.dominators(f)
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let insts = f.blocks[b].insts
         for var n = 0; n < len(insts); n = n + 1 {
@@ -330,7 +310,7 @@ fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
                 None -> {}
             }
             match A.safepointOf(insts[n].op) {
-                Some((lb, ln)) -> checkMap(out, a, frame, insts, b, n, lb, ln)
+                Some((lb, ln)) -> checkMap(out, a, frame, idom, b, n, lb, ln)
                 None -> {}
             }
         }
@@ -356,6 +336,7 @@ fun checkSlot(out : Vec String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
         -- the answer that keeps this verifier quiet about it.
         Offset(_, _) -> True
         Indexed(_, _) -> True
+        Scaled(_, _, _) -> True
         PageOffset(_, _) -> True
     }
     if !within {
@@ -365,30 +346,50 @@ fun checkSlot(out : Vec String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
 }
 
 -- A frame-table entry is true if the call before it is a call, and every root
--- it lists holds its value by then: stored in this block before the call, or
--- spilled into that slot at its definition, which dominates every use.
+-- it lists holds its value by then: stored into that slot earlier in this
+-- block or in a block that dominates it, or spilled into that slot at its
+-- definition. Each slot belongs to one value, so a store into it is a store of
+-- that value.
 fun checkMap(out : Vec String, a : Regalloc.Allocation, frame : Roots.Frame,
-             insts : Vec A.Inst, b : Int, n : Int, lb : Int, ln : Int) -> Unit {
+             idom : Array (Option Int), b : Int, n : Int, lb : Int, ln : Int) -> Unit {
     let at = "b" + Int.toString(b) + " instruction " + Int.toString(n)
-    if n == 0 || !A.isCall(insts[n - 1]) {
+    let blocks = a.func.blocks
+    if n == 0 || !A.isCall(blocks[b].insts[n - 1]) {
         Vec.push(out, "the safepoint map at " + at + " does not follow a call")
     }
     for (slot, id) in Roots.liveAt(frame, lb, ln) {
         let want = show(RootSlot(slot))
-        var stored = match Map.get(a.spills.slots, id) {
+        let spilled = match Map.get(a.spills.slots, id) {
             Some(m) -> show(m) == want
             None -> False
         }
-        for var k = 0; k < n; k = k + 1 {
-            match A.slotStore(insts[k].op) {
-                Some((_, m)) -> if show(m) == want { stored = True }
-                None -> {}
+        var stored = spilled || storesInto(blocks[b].insts, want, n)
+        var here = b
+        while !stored {
+            match idom[here] {
+                Some(up) -> if up == here { break } else {
+                    here = up
+                    stored = storesInto(blocks[up].insts, want, len(blocks[up].insts))
+                }
+                None -> break
             }
         }
         if !stored {
             Vec.push(out, "root slot " + Int.toString(slot) + " (%"
                             + Int.toString(id) + ") is in the map at " + at
-                            + " but nothing stores it first")
+                            + " but no store into it dominates the call")
         }
     }
+}
+
+-- Whether one of the first `before` instructions stores into the slot `want`
+-- names.
+fun storesInto(insts : Vec A.Inst, want : String, before : Int) -> Bool {
+    for var k = 0; k < before; k = k + 1 {
+        match A.slotStore(insts[k].op) {
+            Some((_, m)) -> if show(m) == want { return True }
+            None -> {}
+        }
+    }
+    False
 }

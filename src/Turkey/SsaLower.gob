@@ -70,6 +70,10 @@ type Unsupported = Unsupported { name : String, what : String }
 type Signature = Signature {
     params : Array Rep,
     result : Rep,
+    -- Whether a saturated call never comes back: the body always reaches
+    -- `Prim.error` or another such call. Set by `signatures` once every
+    -- binding has an entry, since it is a fact about the call graph.
+    var diverges : Bool,
 }
 
 -- The state one binding's lowering shares across every function it makes.
@@ -356,7 +360,72 @@ fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
             None -> {}
         }
     }
+    markDiverging(program, out)
     out
+}
+
+-- Set `diverges` on every function whose body never returns, to the least
+-- fixed point over direct calls: each round may find a caller of what the
+-- last round found. Starting from false marks a function only once every path
+-- through it is shown to reach a panic, so a cycle with no panic on it stays
+-- unmarked. That is conservative rather than necessary -- such a cycle does
+-- not come back either -- and it keeps the claim the simple one.
+--
+-- The point of knowing is the caller's liveness. A bounds check's failure
+-- path calls a function that panics; if the lowering let that call fall
+-- through into the code after the check, every value live there would be
+-- live across a call, and could only be held in a callee-saved register.
+fun markDiverging(program : CProgram, sigs : Map String Signature) -> Unit {
+    var changed = True
+    while changed {
+        changed = False
+        for bind in program.binds {
+            match (Map.get(sigs, bind.name), spine(bind.value)) {
+                (Some(sig), Some((_, body))) -> if !sig.diverges && neverReturns(sigs, body) {
+                    sig.diverges = True
+                    changed = True
+                }
+                _ -> {}
+            }
+        }
+    }
+}
+
+-- Whether evaluating `e` always ends in a panic. Conservative in the
+-- direction of answering false, which costs a block left reachable rather
+-- than a caller cut short.
+fun neverReturns(sigs : Map String Signature, e : Core) -> Bool = match e.kind {
+    CApp(fn, args) -> divergingCall(sigs, e, fn, args)
+    CLet(_, _, value, body, _) -> neverReturns(sigs, value) || neverReturns(sigs, body)
+    CJoin(_, _, _, rest, _) -> neverReturns(sigs, rest)
+    CMatch(_, alts) -> {
+        if len(alts) == 0 { return False }
+        for a in alts { if !neverReturns(sigs, a.body) { return False } }
+        True
+    }
+    CIf(_, then, otherwise) -> match otherwise {
+        Some(o) -> neverReturns(sigs, then) && neverReturns(sigs, o)
+        None -> False
+    }
+    _ -> False
+}
+
+-- Whether the call `e`, of `fn` to `args`, never comes back: its type is
+-- bottom, or it is `Prim.error`, or a saturated direct call to a function
+-- `sigs` says diverges.
+fun divergingCall(sigs : Map String Signature, e : Core, fn : Core, args : Array Core) -> Bool {
+    match Ty.prune(e.ty) {
+        TBottom -> return True
+        _ -> {}
+    }
+    match erased(fn).kind {
+        CPrim(Prims.Error) -> True
+        CVar(name) -> match Map.get(sigs, name) {
+            Some(sig) -> sig.diverges && len(args) == len(sig.params)
+            None -> False
+        }
+        _ -> False
+    }
 }
 
 -- One binding's signature, keyed on *that binding's* layouts.
@@ -381,7 +450,7 @@ fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
         TBottom -> repIn(decls, bind.layouts, body.ty)
         other -> repIn(decls, bind.layouts, other)
     }
-    Some(Signature { params = reps, result = result })
+    Some(Signature { params = reps, result = result, diverges = False })
 }
 
 -- Every constructor's runtime tag: the whole program's constructor names in
@@ -435,7 +504,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     -- of the two moved.
     let sig = match Map.get(sigs, bind.name) {
         Some(found) -> found
-        None -> Signature { params = [], result = Ssa.traced(Ptr) }
+        None -> Signature { params = [], result = Ssa.traced(Ptr), diverges = False }
     }
     let f = Ssa.newFunc(bind.name, sig.result)
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
@@ -1386,21 +1455,20 @@ fun valueHere(l : Lower, e : Core) -> Value {
             TFun(_, _) -> stop(l, "the constructor '" + name + "' must be saturated")
             _ -> constructor(l, e, name, [], rep)
         }
-        -- A call whose result type is bottom does not come back, so what
-        -- follows it is unreachable rather than merely dead. Saying so keeps
-        -- a `ret` or a jump from being built out of a value that never
-        -- arrives -- which is what the verifier was reporting as a
-        -- representation disagreement.
+        -- A call that does not come back -- its result type is bottom, or
+        -- its callee always panics -- makes what follows it unreachable
+        -- rather than merely dead. Saying so keeps a `ret` or a jump from
+        -- being built out of a value that never arrives, which the verifier
+        -- reports as a representation disagreement, and keeps the code after
+        -- the call out of the graph: a fall-through edge would make every
+        -- value live there live across the call too.
         CApp(fn, args) -> {
             let called = call(l, e, fn, args, rep)
-            match Ty.prune(e.ty) {
-                TBottom -> {
-                    L.terminate(l.b, Unreachable)
-                    L.into(l.b, L.block(l.b))
-                    zero(l, rep)
-                }
-                _ -> called
-            }
+            if divergingCall(l.sigs, e, fn, args) {
+                L.terminate(l.b, Unreachable)
+                L.into(l.b, L.block(l.b))
+                zero(l, rep)
+            } else { called }
         }
         -- A form that is not a value in itself: it is control flow that
         -- *arrives* at one. Giving it a block whose parameter is where its

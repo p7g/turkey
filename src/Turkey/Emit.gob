@@ -46,8 +46,9 @@ type Code = Vec (Item Inst)
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
 -- big for an immediate, and the cycle in a parallel copy each need a register
--- no value holds.
+-- no value holds. `d31` is the vector file's, for a cycle of doubles.
 let scratch = Physical(Gp, 16)
+let fpScratch = Physical(Fp, 31)
 
 -- The largest byte offset a scaled unsigned immediate reaches on a 64-bit
 -- load or store. Past it the offset goes into `scratch` and the access uses
@@ -471,9 +472,9 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
 -- The register allocator was told nothing happens here, so the slow path
 -- keeps everything it disturbs: the live values in registers the call
 -- clobbers (`Frame.pollAt`) are pushed below the frame and popped after. `sp`
--- moves, which the frame's own slots never see, since the roots are stored
--- before it does and the collector finds them from `x29`. The label after the
--- call is the poll's frame-table entry.
+-- moves, which the frame's own slots never see: the roots are in their slots
+-- from their definitions on, and the collector finds them from `x29`. The
+-- label after the call is the poll's frame-table entry.
 fun poll(b : Code, cold : Cold, d : Asm.Dialect, l : Frame.Layout, tag : Int,
          pb : Int, pn : Int) -> Unit {
     let n = cold.count
@@ -486,7 +487,6 @@ fun poll(b : Code, cold : Cold, d : Asm.Dialect, l : Frame.Layout, tag : Int,
     let text = cold.text
     emit(text, Label(slow))
     let save = Frame.pollAt(l, pb, pn)
-    for (r, offset) in save.roots { store(text, r, offset, A.W64) }
     let bytes = (8 * len(save.kept) + 15) / 16 * 16
     adjust(text, bytes, False)
     for var k = 0; k < len(save.kept); k = k + 1 {
@@ -675,10 +675,14 @@ fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation,
                 if !done[i] && !parked {
                     parked = True
                     let from = srcs[i]
-                    move(b, scratch, from)
+                    let park = match from {
+                        Physical(Fp, _) -> fpScratch
+                        _ -> scratch
+                    }
+                    move(b, park, from)
                     for var k = 0; k < len(srcs); k = k + 1 {
                         if !done[k] && sameReg(srcs[k], from) {
-                            srcs[k] = scratch
+                            srcs[k] = park
                         }
                     }
                 }
@@ -696,9 +700,8 @@ fun isSource(r : Reg, srcs : Vec Reg, done : Array Bool) -> Bool {
 
 fun sameReg(a : Reg, b : Reg) -> Bool = A.sameRegister(a, b)
 
--- A move between two registers of the same file, or through the general file
--- when a double has to travel in the scratch register -- there is no reserved
--- `d` scratch, and `fmov` crosses the files without converting.
+-- A move between two registers of the same file, or across the files, which
+-- `fmov` does without converting.
 fun move(b : Code, d : Reg, s : Reg) -> Unit = match (d, s) {
     (Physical(Gp, _), Physical(Gp, _)) -> instruction(b, A.Mov(d, s, A.W64))
     (Physical(Fp, _), Physical(Fp, _)) -> instruction(b, A.FMov(d, s))

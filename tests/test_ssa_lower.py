@@ -492,3 +492,49 @@ def test_a_constrained_function_builds_no_closure_per_call():
         calls = {c[1:] for c in re.findall(r"call (@\S+)", body)}
         assert not calls & wrapped, body
         assert "closure.new" not in body and not re.search(r"call %\d", body), body
+
+
+DIVERGING_CALLS = """
+fun fail(what : String, n : Int) -> a =
+    error("bad " + what + ": " + Int.toString(n) + " (" + Int.toString(n * 2) + ")")
+
+fun refuse(n : Int) -> a = fail("refused", n + 1)
+
+fun clamp(n : Int) -> Int = if n > 1000 { fail("clamped", n) } else { n - 1 }
+
+fun total(xs : Array Int, n : Int) -> Int {
+    var t = 0
+    for var i = 0; i < n; i = i + 1 {
+        if i > 900 { refuse(i) }
+        t = t + clamp(xs[i])
+    }
+    t
+}
+
+fun main() {
+    print(total([1, 2, 3], 3))
+    print(total([1, 2000], 2))
+}
+"""
+
+
+def test_a_call_that_always_panics_ends_its_block():
+    # `fail` is typed `-> a` and used at `Unit` and at `Int`, so the call's
+    # type says nothing; what says it never returns is its body, and the
+    # bounds check's `outOfBounds` is the same. A fall-through edge from any
+    # of these calls would make every loop value live across a call.
+    result = lang.dump("ssa", DIVERGING_CALLS)
+    assert result.code == 0, result.stderr
+    body = re.search(r"^fun @Main#total\(.*?^}$", result.stdout,
+                     re.M | re.S).group(0)
+    lines = [line.strip() for line in body.splitlines()]
+    calls = [i for i, line in enumerate(lines)
+             if re.search(r"= call @(Main#fail|Main#refuse|Data\.Array\.Storage#outOfBounds)",
+                          line)]
+    assert len(calls) >= 3, body
+    for i in calls:
+        assert lines[i + 1] == "unreachable", body
+    # And the panic still leaves through every caller.
+    result = lang.panics(DIVERGING_CALLS)
+    assert result.stdout == "3\n", result.stdout
+    assert lang.panic_message(result) == "bad clamped: 2000 (4000)"

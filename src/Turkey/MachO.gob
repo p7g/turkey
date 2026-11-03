@@ -11,12 +11,18 @@ export (objectFile)
 --
 -- **Symbols.** Every named symbol defined here is in the table -- exported
 -- ones as external, the rest as local -- so that `nm`, a profiler and a crash
--- report name every function. A temporary label is in it only if a
--- relocation refers to it: a Mach-O relocation names a symbol or a section,
--- and an arm64 page relocation must name a symbol, so a label in another
--- section is reached through a local symbol of its own, spelled as the
--- assembly spells it. The table is ordered locals, then exported, then
--- undefined, as `LC_DYSYMTAB` describes it, and the last two by name.
+-- report name every function. A temporary label is in it only if a page
+-- relocation refers to it, since an arm64 page relocation must name a symbol;
+-- such a label gets a local symbol spelled as the assembly spells it. Page
+-- relocations reach only data labels. An eight-byte word that holds a
+-- temporary label's address relocates against the label's section instead,
+-- with the label's address in the object stored in the word. That keeps the
+-- frame table's return addresses, which are labels in `__text`, out of the
+-- table: the linker records every symbol in `__text` as a function start, and
+-- a profiler ends a function at the next start, so a symbol on each return
+-- address would cut every function after its first call. The table is
+-- ordered locals, then exported, then undefined, as `LC_DYSYMTAB` describes
+-- it, and the last two by name.
 
 import Data.Set as Set
 import Turkey.Asm as Asm
@@ -57,7 +63,7 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
     let addresses = Array.filled(count, 0)
     var size = 0
     for var k = 0; k < count; k = k + 1 {
-        size = alignUp(size, Int.shl(1, sections[k].align))
+        size = alignUp(size, 1 << sections[k].align)
         addresses[k] = size
         size = size + len(sections[k].bytes)
     }
@@ -154,13 +160,25 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
         pad(out, contents + addresses[k])
         extend(out, sections[k].bytes)
     }
+    let definitions = Map.new()
+    for d in obj.defined { Map.put(definitions, Asm.spell(d.symbol), d) }
     pad(out, relocationsAt[0])
-    for s in sections {
-        for r in s.relocations {
+    for var k = 0; k < count; k = k + 1 {
+        for r in sections[k].relocations {
             let (kind, pcrel, length) = relocationKind(r.use)
+            -- The symbol's index with the extern bit, or the section's
+            -- ordinal without it.
+            let target = match (sectionRelative(r), Map.get(definitions, Asm.spell(r.target))) {
+                (True, Some(d)) -> {
+                    -- Store the label's address as the implicit addend.
+                    Byte.putLE(out, contents + addresses[k] + r.offset, 8,
+                               addresses[d.section] + d.offset)
+                    d.section + 1
+                }
+                _ -> Map.getOr(indices, symbolName(r.target), 0) | 1 << 27
+            }
             le(out, 4, r.offset)
-            le(out, 4, Map.getOr(indices, symbolName(r.target), 0) + Int.shl(pcrel, 24)
-                       + Int.shl(length, 25) + Int.shl(1, 27) + Int.shl(kind, 28))
+            le(out, 4, target | pcrel << 24 | length << 25 | kind << 28)
         }
     }
     pad(out, symbolsAt)
@@ -181,7 +199,9 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
 fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) {
     let referenced = Set.new()
     for s in obj.sections {
-        for r in s.relocations { Set.add(referenced, Asm.spell(r.target)) }
+        for r in s.relocations {
+            if !sectionRelative(r) { Set.add(referenced, Asm.spell(r.target)) }
+        }
     }
     let locals = []
     let exported = []
@@ -208,6 +228,13 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
     for e in Vec.sortBy(exported, byName) { Vec.push(entries, e) }
     for e in Vec.sortBy(undefined, byName) { Vec.push(entries, e) }
     (entries, len(locals), len(exported))
+}
+
+-- Whether the relocation names its target's section rather than a symbol:
+-- an eight-byte word that holds a temporary label's address.
+fun sectionRelative(r : Relocation Fixup) -> Bool = match (r.use, r.target.kind) {
+    (Address64, Temporary) -> True
+    _ -> False
 }
 
 -- A symbol's name in the table: a named symbol's own, and a temporary

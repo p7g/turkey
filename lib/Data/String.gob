@@ -21,6 +21,7 @@ module Data.String (
     find,
     toBytes,
     fromBytes,
+    fromBytesLossy,
     builder,
     push,
     build,
@@ -40,6 +41,7 @@ module Data.String (
     trimStart,
     trimEnd,
     lines,
+    unlines,
     words,
 )
 
@@ -244,6 +246,42 @@ fun fromBytes[Index c, Length c, Key c ~ Int, Value c ~ Byte](bs : c) -> Option 
     if wellFormed(raw) { Some(String(raw)) } else { None }
 }
 
+-- The total partner of `fromBytes`: well-formed characters are kept, and each
+-- maximal subpart of an ill-formed sequence -- the longest run that some
+-- well-formed sequence begins with, or one byte -- becomes one U+FFFD. So
+-- `E1 80 41` is U+FFFD and `A`, and `E0 80 41` is two U+FFFD and `A`, since no
+-- well-formed sequence begins `E0 80`.
+--
+-- A U+FFFD is three bytes and stands for at least one, so the result is at most
+-- three times the input: it is written into scratch storage that long and
+-- copied once to its length. Input that is well-formed is the string as it is.
+fun fromBytesLossy[Index c, Length c, Key c ~ Int, Value c ~ Byte](bs : c) -> String {
+    let n = len(bs)
+    let raw = Prim.arrayNewUninit(n)
+    for var i = 0; i < n; i = i + 1 { Prim.arraySet(raw, i, bs[i]) }
+    if wellFormed(raw) { return String(raw) }
+    let out = Prim.arrayNewUninit(3 * n)
+    var i = 0
+    var at = 0
+    while i < n {
+        let width = Scan.sequenceAt(raw, i, n)
+        if width > 0 {
+            Prim.arrayCopy(out, at, raw, i, width)
+            at = at + width
+            i = i + width
+        } else {
+            Prim.arraySet(out, at, Prim.byteFromInt(0xEF))
+            Prim.arraySet(out, at + 1, Prim.byteFromInt(0xBF))
+            Prim.arraySet(out, at + 2, Prim.byteFromInt(0xBD))
+            at = at + 3
+            i = i - width
+        }
+    }
+    let exact = Prim.arrayNewUninit(at)
+    Prim.arrayCopy(exact, 0, out, 0, at)
+    String(exact)
+}
+
 -- Whether `bytes` is well-formed UTF-8: the shortest encoding of a scalar
 -- value, each time, to the end. Overlong forms, surrogates, code points past
 -- 10FFFF and truncated sequences all fail. The one validator every door into
@@ -424,6 +462,18 @@ fun lines(s : String) -> Vec String {
         start = stop + 1
     }
     out
+}
+
+-- Each line followed by a newline, so `unlines(lines(s)) == s` for text that
+-- ends in one. A newline ends a line rather than separating two, which is the
+-- difference from joining with "\n".
+fun unlines[Iterator c, Item c ~ String](lines : c) -> String {
+    let b = builder()
+    for line in lines {
+        push(b, line)
+        push(b, "\n")
+    }
+    build(b)
 }
 
 fun carriageReturn() -> Byte = Prim.byteFromInt(13)

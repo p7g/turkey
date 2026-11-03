@@ -18,11 +18,11 @@ The Prelude provides these names unqualified:
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
-| Functions | `print`, `write`, `error`, `fail`, `const` |
+| Functions | `print`, `write`, `error`, `fail`, `const`, `min`, `max` |
 
 It also provides the library modules `Array`, `Bool`, `Byte`, `Char`,
-`Either`, `Error`, `Float`, `Int`, `Map`, `Option`, `Ordering`, `String` and
-`Vec` under those names, qualified only. That is why `Vec.push` and
+`Either`, `Error`, `Float`, `Int`, `Iterator`, `Map`, `Option`, `Ordering`,
+`String` and `Vec` under those names, qualified only. That is why `Vec.push` and
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
 for a program to use.
 
@@ -232,6 +232,30 @@ class Ord a : Eq a {
 }
 ```
 
+The Prelude's `min(x, y)` and `max(x, y)` answer the lesser and the greater
+of two values of any `Ord` type. When neither is less than the other, `min`
+answers `x` and `max` answers `y`:
+
+<!-- run -->
+```kotlin
+type Entry = Entry { score : Int, name : String }
+
+instance Eq Entry { fun eq(a, b) = a.score == b.score }
+instance Ord Entry { fun lt(a, b) = a.score < b.score }
+
+fun main() {
+    print(max(3, 7))
+    let ada = Entry { score = 9, name = "Ada" }
+    let bo = Entry { score = 9, name = "Bo" }
+    print(min(ada, bo).name + " " + max(ada, bo).name)
+}
+```
+
+```text
+7
+Ada Bo
+```
+
 The instances the library provides for built-in types:
 
 | Type | `Eq` | `Ord` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
@@ -371,6 +395,29 @@ fun main() {
 3
 2
 1
+```
+
+`Iterator.any`, `Iterator.all`, `Iterator.count` and `Iterator.find` ask a
+predicate of each element of any iterator in turn: whether it holds for some
+element, for every element, for how many, and the first it holds for. `any`,
+`all` and `find` stop at the element that decides, and take nothing after it.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let words = ["fig", "pear", "plum"]
+    print(Iterator.any(words, String.startsWith(_, "p")))
+    print(Iterator.all(words, String.startsWith(_, "p")))
+    print(Iterator.count(words, String.startsWith(_, "p")))
+    print(Iterator.find(words, String.startsWith(_, "p")))
+}
+```
+
+```text
+True
+False
+2
+Some(pear)
 ```
 
 ## `Index`

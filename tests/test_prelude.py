@@ -204,6 +204,45 @@ fun main() {
     ]
 
 
+# Counts aloud: `next` prints each element it hands out, so what a consumer
+# pulled is in the output.
+NOISY = """
+type Noisy = Noisy { stop : Int }
+type NoisyCur = NoisyCur { var at : Int }
+
+instance Iterator Noisy {
+    type Item = Int
+    type Cursor = NoisyCur
+
+    fun iter(n) = NoisyCur { at = 0 }
+
+    fun next(n, cur) {
+        if cur.at >= n.stop { return None }
+        let k = cur.at
+        print("next " + show(k))
+        cur.at = k + 1
+        Some(k)
+    }
+}
+"""
+
+
+def test_any_and_find_pull_nothing_past_the_deciding_element(capsys):
+    src = NOISY + """
+fun main() {
+    let xs = Noisy { stop = 10 }
+    print(Iterator.any(xs, _ == 2))
+    print(Iterator.find(xs, _ == 1))
+    print(Iterator.all(xs, _ < 1))
+}
+"""
+    assert output(src, capsys) == [
+        "next 0", "next 1", "next 2", "True",
+        "next 0", "next 1", "Some(1)",
+        "next 0", "next 1", "False",
+    ]
+
+
 def test_nothing_asks_the_container_for_a_length(capsys):
     """An iterator with no end at all is fine, because the loop never counts.
 
@@ -268,3 +307,79 @@ def test_the_methods_are_ordinary_and_callable_by_name():
     src = "fun head(xs) { let cur = iter(xs)\n next(xs, cur) }"
     assert scheme(src, "head") == \
         "[Iterator a] fun(a) -> Option (Iterator.Item a)"
+
+
+# -- min, max, Option.or, Either.left and Either.right --------------------------
+
+
+def test_min_and_max(capsys):
+    src = """
+fun main() {
+    print(min(3, 5))
+    print(max(3, 5))
+    print(min("pear", "fig"))
+    print(max(2.5, -1.0))
+}
+"""
+    assert output(src, capsys) == ["3", "5", "fig", "2.5"]
+
+
+def test_on_a_tie_min_answers_the_first_and_max_the_second(capsys):
+    """Two records equal by `Ord` but told apart by a field it ignores."""
+    src = """
+type Tagged = Tagged { rank : Int, tag : String }
+
+instance Eq Tagged { fun eq(a, b) = a.rank == b.rank }
+instance Ord Tagged { fun lt(a, b) = a.rank < b.rank }
+
+fun main() {
+    let x = Tagged { rank = 1, tag = "x" }
+    let y = Tagged { rank = 1, tag = "y" }
+    print(min(x, y).tag)
+    print(max(x, y).tag)
+    print(min(y, x).tag)
+    print(max(y, x).tag)
+}
+"""
+    assert output(src, capsys) == ["x", "y", "y", "x"]
+
+
+def test_option_or_answers_the_first_some(capsys):
+    src = """
+fun main() {
+    let none : Option Int = None
+    print(Option.or(Some(1), Some(2)))
+    print(Option.or(none, Some(2)))
+    print(Option.or(Some(1), none))
+    print(Option.or(none, none))
+}
+"""
+    assert output(src, capsys) == ["Some(1)", "Some(2)", "Some(1)", "None"]
+
+
+def test_option_or_is_eager(capsys):
+    src = """
+fun noisy(x : Int) -> Option Int {
+    print("evaluated")
+    Some(x)
+}
+
+fun main() {
+    print(Option.or(Some(1), noisy(2)))
+}
+"""
+    assert output(src, capsys) == ["evaluated", "Some(1)"]
+
+
+def test_either_left_and_right(capsys):
+    src = """
+fun main() {
+    let l : Either String Int = Left("no")
+    let r : Either String Int = Right(7)
+    print(Either.left(l))
+    print(Either.right(l))
+    print(Either.left(r))
+    print(Either.right(r))
+}
+"""
+    assert output(src, capsys) == ["Some(no)", "None", "None", "Some(7)"]

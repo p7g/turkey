@@ -8,11 +8,15 @@
 --   --shard I/N        run only shard I of N, counting from 1
 --   --timeout-scale F  multiply every time limit by F
 --   --selftest         run the harness's own cases instead of the corpus
+--   --bless            write each selected case's actual results over its
+--                      goldens, unless they look like a broken compiler
+--                      (`Bless`)
 --   PATH[::CASE]       run only the cases whose path starts with PATH, and
 --                      whose case name contains CASE
 --
 -- The exit status is 0 when no case failed the run, 1 when one did, and 2
--- when the harness could not run at all.
+-- when the harness could not run at all. Under `--bless` it is 1 when a case
+-- was refused, whether or not the others were written.
 
 import System.Args as Args
 import System.Args (Arg(..))
@@ -20,9 +24,12 @@ import System.Env as Env
 import System.Parallel as Parallel
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
+import Bless (Blessing)
+import Bless as Bless
 import Case (Case(..), Result(..))
 import Cache as Cache
 import Execute as Execute
+import Files as Files
 import Programs as Programs
 import Report as Report
 import Schedule as Schedule
@@ -38,6 +45,7 @@ type Options = Options {
     var shard : Option (Int, Int),
     var scale : Float,
     var selftest : Bool,
+    var bless : Bool,
     selections : Vec String,
 }
 
@@ -65,9 +73,21 @@ fun main() {
     let results = Array.map(byName, \(_.0, _.1.0))
     Schedule.writeTimings(timingsFile, timings, results)
     let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-    let reported = Report.report(results, o.verbose, actual, millis)
-    let ok = if o.selftest { Selftest.check(byName) } else { reported }
+    let ok = if o.bless { bless(Array.map(byName, \(_.0, _.1.1)), actual, millis) }
+             else {
+                 let reported = Report.report(results, o.verbose, actual, millis)
+                 if o.selftest { Selftest.check(byName) } else { reported }
+             }
     Env.exit(if ok { 0 } else { 1 })
+}
+
+-- Writes every file bless permits, prints what was written and what was
+-- refused, and returns whether no case was refused.
+fun bless(decided : Array (Case, Blessing), actual : String, millis : Int) -> Bool {
+    for (path, text) in Bless.permitted(Array.map(decided, _.1)) {
+        if let Left(e) = Files.writeText(path, text) { die("cannot bless: " + Error.describe(e)) }
+    }
+    Report.blessed(decided, actual, millis)
 }
 
 -- Whether the case `name` is in the shard and the selection.
@@ -91,7 +111,7 @@ fun selector(s : String) -> (String, String) = Option.unwrapOr(String.splitOnce(
 fun options(args : Array String) -> Options {
     let o = Options {
         root = ".", boot = "boot", cache = "", jobs = Parallel.workers(), verbose = False,
-        shard = None, scale = 1.0, selftest = False, selections = [],
+        shard = None, scale = 1.0, selftest = False, bless = False, selections = [],
     }
     let p = Args.parser(args)
     loop {
@@ -113,12 +133,16 @@ fun options(args : Array String) -> Options {
                     }
                 }
                 Long("selftest") -> { o.selftest = True }
+                Long("bless") -> { o.bless = True }
                 Value(path) -> Vec.push(o.selections, path)
                 _ -> die(Args.unexpected(arg))
             }
         }
     }
     if String.isEmpty(o.cache) { die("--cache is required; run the harness by scripts/test.sh") }
+    -- The selftest checks what bless decides without writing; blessing its
+    -- cases would overwrite the goldens that make them what they are.
+    if o.selftest && o.bless { die("--bless and --selftest cannot be given together") }
     o
 }
 

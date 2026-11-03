@@ -73,7 +73,7 @@ def test_named_zones_come_from_tzdir(tmp_path):
         "America/New_York",
         "America/New_York",
         "no time zone named 'Nowhere/Zone'",
-        f"{zones}/Bad/Zone is not a valid time zone",
+        f"{zones}/Bad/Zone is not a valid time zone file",
         "Some(2026-07-04T12:00:00-04:00[America/New_York])",
         "None",
         "None",

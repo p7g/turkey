@@ -117,7 +117,8 @@ fun run() -> Unit {{
 """)
     result = lang.run(entry)
     assert result.code != 0
-    assert "a run of elements outside the array's storage" in result.stderr
+    assert ("array range out of bounds: another task resized the array while it was "
+            "copied or filled") in result.stderr
 
 
 def test_raw_memory_holds_no_traced_element(library):

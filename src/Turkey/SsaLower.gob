@@ -1448,7 +1448,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             store(l, target, x)
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
-        CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple")
+        CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple", fieldsOf("this tuple"))
         CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
         CCon(name) -> match Ty.prune(e.ty) {
@@ -1532,8 +1532,8 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
 -- runtime's own object header distinguishes. `mutable` has a bit set for each
 -- field that may be assigned later.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             mutable : Int, what : String) -> Value {
-    if wide(l, what, len(items), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
+             mutable : Int, what : String, refusal : fun(Int) -> String) -> Value {
+    if wide(l, len(items), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(items, fun(x) = value(l, x))
     built(l, kind, tag, values, mutable, what)
 }
@@ -1553,7 +1553,11 @@ fun built(l : Lower, kind : Int, tag : Int, values : Array Value, mutable : Int,
 -- must be: the masks of all dictionaries of a class agree.
 fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
     let what = "builds a dictionary, " + cls
-    if wide(l, what, len(slots), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
+    let refusal = fun(n) = "an instance of class '" + Ty.shortName(cls) + "' needs "
+        + Int.toString(n) + " slots, one for each method and superclass, and an instance "
+        + "can have at most " + Int.toString(Rt.fieldLimit) + "; split the class into "
+        + "smaller ones"
+    if wide(l, len(slots), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(slots, fun(x) = value(l, x))
     for v in values {
         if Ssa.repOf(l.func, v) != Ssa.traced(Ptr) {
@@ -1583,14 +1587,13 @@ fun mutableMask(l : Lower, con : String, count : Int) -> Int =
 -- The mutable mask with every one of `count` fields set.
 fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
 
--- Whether an object of `count` fields is past `limit`, stopping the lowering
--- if it is. The parser holds a declared constructor and a tuple to
--- `Rt.fieldLimit`; this stops anything else that wide -- a dictionary of a
--- class with many methods, a packed existential.
-fun wide(l : Lower, kind : String, count : Int, limit : Int) -> Bool {
-    if count <= limit { return False }
-    stop1(l, kind + " of " + Int.toString(count) + " slots, more than the "
-             + Int.toString(limit) + " an object may have")
+-- Whether an object of `count` fields is past `Rt.fieldLimit`, stopping the
+-- lowering with `refusal(count)` if it is. The parser holds a declared
+-- constructor and a tuple to the limit; this stops anything else that wide --
+-- a dictionary of a class with many methods, a packed existential.
+fun wide(l : Lower, count : Int, refusal : fun(Int) -> String) -> Bool {
+    if count <= Rt.fieldLimit { return False }
+    stop1(l, refusal(count))
     True
 }
 
@@ -1668,7 +1671,9 @@ fun capturesOf(l : Lower, body : Core,
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
          captures : Vec (String, Rep)) -> Option String {
     if len(captures) > 63 {
-        let _ = stop(l, "a lambda with more than 63 captures")
+        let _ = stop(l, "a nested function captures " + Int.toString(len(captures))
+                        + " variables, and a function can capture at most 63; pass some "
+                        + "as parameters, or group them in a record")
         return None
     }
     -- `%` is the compiler's own character: the lexer will not accept one in an
@@ -2088,14 +2093,22 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 packed(l, info, name, args, tag)
             } else {
                 aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
-                          "builds a value with " + Ty.shortName(name))
+                          "builds a value with " + Ty.shortName(name),
+                          fieldsOf("constructor '" + Ty.shortName(name) + "'"))
             }
             None -> aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
-                              "builds a value with " + Ty.shortName(name))
+                              "builds a value with " + Ty.shortName(name),
+                              fieldsOf("constructor '" + Ty.shortName(name) + "'"))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
 }
+
+-- The refusal of a tuple or constructed value too wide to build, in the
+-- parser's words: it refuses the ones a program declares.
+fun fieldsOf(subject : String) -> fun(Int) -> String =
+    fun(n) = subject + " has " + Int.toString(n) + " fields, and a value can have at most "
+             + Int.toString(Rt.fieldLimit)
 
 -- A packed existential: one layout code per hidden variable, then the carried
 -- dictionaries, then the fields. The codes are what an opening
@@ -2107,7 +2120,10 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
         None -> return stop(l, "packing '" + name
                             + "' at a layout that is not knowable here")
     }
-    if wide(l, "a packed existential", len(parts) + len(args), Rt.fieldLimit) {
+    let refusal = fun(n) = "constructor '" + Ty.shortName(name) + "' needs " + Int.toString(n)
+        + " fields, counting one for each hidden type and each constraint, and a value can "
+        + "have at most " + Int.toString(Rt.fieldLimit) + "; move some fields into a record"
+    if wide(l, len(parts) + len(args), refusal) {
         return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
     let values = Array.init(len(parts) + len(args), fun(i) =

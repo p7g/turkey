@@ -166,7 +166,7 @@ fun main() {
 }
 """)
     assert result.code != 0
-    assert "the steps' dependencies have a cycle" in result.stderr
+    assert "step 0 can never run: its dependencies lead into a cycle" in result.stderr
     assert "unreachable" not in result.stdout
 
 

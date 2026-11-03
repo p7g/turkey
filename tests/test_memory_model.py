@@ -196,4 +196,5 @@ fun run() -> Unit {{
 }}
 """)
     assert result.returncode == 1
-    assert result.stderr == "panic: array access outside the array's storage\n"
+    assert result.stderr == ("panic: array index out of bounds: another task resized the "
+                             "array during this access\n")

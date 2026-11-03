@@ -1,6 +1,6 @@
 export (
     argsSet, argCount, argBytes, argLength, environment,
-    panic, panicString, pending, panicked, panicMessage, panicClear,
+    panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
 )
 
@@ -134,6 +134,83 @@ fun record(bytes : Prim.Ptr, length : Int) -> Unit {
     }
     Prim.storeI8(buffer, kept, Prim.byteFromInt(0))
     raise()
+}
+
+-- Raise a panic whose message is `before`, `n` in decimal, then `after`,
+-- unless one is already raised. `before` and `after` are NUL-terminated, and
+-- the message is truncated to the buffer. For the allocator, which cannot
+-- allocate a message to hand to `panic`.
+fun panicInt(before : Prim.Ptr, n : Int, after : Prim.Ptr) -> Unit {
+    if pending() { return {} }
+    -- The magnitude of `minValue` is 2^63, which the unsigned reading of its
+    -- wrapped negation is.
+    compose(before, n < 0, if n < 0 { Prim.intSubWrapping(0, n) } else { n }, after)
+}
+
+-- `panicInt` with `n`'s bits read as an unsigned number, for a byte count.
+fun panicUnsigned(before : Prim.Ptr, n : Int, after : Prim.Ptr) -> Unit {
+    if pending() { return {} }
+    compose(before, False, n, after)
+}
+
+fun compose(before : Prim.Ptr, negative : Bool, magnitude : Int, after : Prim.Ptr) -> Unit {
+    let buffer = Prim.ptrAdd(Prim.processState(), messageAt())
+    let limit = messageBytes() - 1
+    var at = putText(buffer, 0, limit, before)
+    if negative && at < limit {
+        Prim.storeI8(buffer, at, Prim.byteFromInt(45))
+        at = at + 1
+    }
+    at = putDigits(buffer, at, limit, magnitude)
+    at = putText(buffer, at, limit, after)
+    Prim.storeI8(buffer, at, Prim.byteFromInt(0))
+    raise()
+}
+
+-- Copy the NUL-terminated `text` to `buffer` at `at`, stopping at `limit`, and
+-- return where it ends.
+fun putText(buffer : Prim.Ptr, at : Int, limit : Int, text : Prim.Ptr) -> Int {
+    let n = Libc.strlen(text)
+    var i = 0
+    while i < n && at + i < limit {
+        Prim.storeI8(buffer, at + i, Prim.loadI8(text, i))
+        i = i + 1
+    }
+    at + i
+}
+
+-- Write the unsigned `u` in decimal to `buffer` at `at`, stopping at `limit`,
+-- and return where it ends.
+fun putDigits(buffer : Prim.Ptr, at : Int, limit : Int, u : Int) -> Int {
+    -- Peel the digits off the low end, then reverse them in place.
+    var rest = u
+    var end = at
+    loop {
+        -- A negative `rest` is at least 2^63 unsigned, and `/` is signed:
+        -- halve it with a logical shift first.
+        let next = if rest < 0 {
+            Prim.intAnd(Prim.intShr(rest, 1), 0x7FFF_FFFF_FFFF_FFFF) / 5
+        } else {
+            rest / 10
+        }
+        let digit = Prim.intSubWrapping(rest, Prim.intMulWrapping(next, 10))
+        if end < limit {
+            Prim.storeI8(buffer, end, Prim.byteFromInt(48 + digit))
+            end = end + 1
+        }
+        rest = next
+        if rest == 0 { break }
+    }
+    var i = at
+    var j = end - 1
+    while i < j {
+        let x = Prim.loadI8(buffer, i)
+        Prim.storeI8(buffer, i, Prim.loadI8(buffer, j))
+        Prim.storeI8(buffer, j, x)
+        i = i + 1
+        j = j - 1
+    }
+    end
 }
 
 fun raise() -> Unit = Prim.storeI64(Prim.processState(), flagAt(), 1)

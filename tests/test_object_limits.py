@@ -65,4 +65,5 @@ fun main() {{
 """
     with pytest.raises(lang.CompileError) as error:
         lang.run(src)
-    assert "a lambda with more than 63 captures" in str(error.value)
+    assert ("a nested function captures 65 variables, and a function can capture at "
+            "most 63") in str(error.value)

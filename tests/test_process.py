@@ -18,7 +18,8 @@ from tests.lang import run
 
 HEADER = """\
 import Process
-import Time
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch (Stopwatch)
 
 fun text(b : Array Byte) -> String = match String.fromBytes(Vec.fromArray(b)) {
     Some(s) -> s
@@ -27,7 +28,7 @@ fun text(b : Array Byte) -> String = match String.fromBytes(Vec.fromArray(b)) {
 
 fun sh(script : String) -> Process.Command = Process.command(["/bin/sh", "-c", script])
 
-fun millisSince(sw : Time.Stopwatch) -> Int = Time.Duration.toNanos(Time.Stopwatch.elapsed(sw)) / 1000000
+fun millisSince(sw : Stopwatch) -> Int = Duration.toNanos(Stopwatch.elapsed(sw)) / 1000000
 """
 
 WORKERS = pytest.mark.parametrize("workers", ["1", "4"])
@@ -176,8 +177,8 @@ fun main() {
 def test_a_timeout_kills_the_program_and_keeps_what_it_wrote(workers):
     out = lines("""
 fun main() {
-    let sw = Time.Stopwatch.start()
-    match Process.run(sh("echo before; echo oops >&2; sleep 30; echo after"), Some(Time.millis(400))) {
+    let sw = Stopwatch.start()
+    match Process.run(sh("echo before; echo oops >&2; sleep 30; echo after"), Some(Duration.millis(400))) {
         Right(o) -> {
             print(o.status)
             print(text(o.stdout))
@@ -199,8 +200,8 @@ def test_a_timeout_with_a_grandchild_holding_the_pipe(workers):
     grandchild is gone."""
     result = run(HEADER + """
 fun main() {
-    let sw = Time.Stopwatch.start()
-    match Process.run(sh("sleep 60 & echo $!"), Some(Time.millis(500))) {
+    let sw = Stopwatch.start()
+    match Process.run(sh("sleep 60 & echo $!"), Some(Duration.millis(500))) {
         Right(o) -> {
             print(o.status)
             print(text(o.stdout))
@@ -221,7 +222,7 @@ fun main() {
 def test_a_timeout_kills_everything_in_the_programs_group(workers):
     result = run(HEADER + """
 fun main() {
-    match Process.run(sh("sleep 60 & sleep 60 & echo $!; wait"), Some(Time.millis(500))) {
+    match Process.run(sh("sleep 60 & sleep 60 & echo $!; wait"), Some(Duration.millis(500))) {
         Right(o) -> {
             print(o.status)
             print(text(o.stdout))
@@ -254,7 +255,7 @@ def test_several_run_at_once_and_are_waited_for_as_each_ends(workers):
 import System.Task as Task
 
 fun main() {
-    let sw = Time.Stopwatch.start()
+    let sw = Stopwatch.start()
     let codes = Task.runScope(do {
         let ts = []
         for ms in [900, 100, 500, 300] {

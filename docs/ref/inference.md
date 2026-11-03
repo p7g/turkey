@@ -129,7 +129,7 @@ let seed = same(3)
 
 <!-- error: expected Int, found Float in the operands of '/' -->
 ```kotlin
-import Seed
+import Seed (seed)
 
 fun main() {
     print(seed / 2.0)

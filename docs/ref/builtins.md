@@ -20,11 +20,14 @@ The Prelude provides these names unqualified:
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
 | Functions | `print`, `write`, `error`, `fail`, `const`, `min`, `max` |
 
-It also provides the library modules `Array`, `Bool`, `Byte`, `Char`,
-`Either`, `Error`, `Float`, `Int`, `Iterator`, `Map`, `Option`, `Ordering`,
-`String` and `Vec` under those names, qualified only. That is why `Vec.push` and
+With the Prelude, a module also imports the library modules `Data.Array`,
+`Data.Bool`, `Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`,
+`Data.Float`, `Data.Int`, `Control.Iterator`, `Data.Map`, `Data.Option`,
+`Data.Ordering`, `Data.String` and `Data.Vec` under the last part of their
+names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
-for a program to use.
+for a program to use. An explicit Prelude import keeps these, and only
+`import Prelude ()` leaves them out.
 
 A type is in scope only through an import, the implicit Prelude import
 included. A module that replaces the Prelude import imports the types it

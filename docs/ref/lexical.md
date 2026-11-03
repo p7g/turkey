@@ -68,9 +68,9 @@ These words are reserved and cannot be used as identifiers:
 
 ```text
 as        break     class     continue  do        else      export
-for       foreign   fun       hiding    if        import    in
-instance  let       loop      match     module    return    type
-var       while
+for       foreign   fun       if        import    in        instance
+let       loop      match     module    return    type      var
+while
 ```
 
 `True`, `False`, `None` and `Some` are not keywords. They are constructors of

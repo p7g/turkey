@@ -14,8 +14,9 @@ imports it, and it already provides:
 - every class -- `Eq`, `Ord`, `Show`, `Iterator`, `Index`, `Length`, `Monad`, …
 - `Bool(..)`, `Option(..)`, `Either(..)`, `Ordering(..)`, `Array`, `Map`
 - `print`, `write`, `show`, `len`, `error`, `hash`
-- every `Data.*` module under its own qualification: `Vec.push`,
-  `String.slice`, `Int.toString`, `Char.isDigit`, `Map.get`, `Option.map`
+- thirteen `Data.*` modules and `Control.Iterator` under their own
+  qualification: `Vec.push`, `String.slice`, `Int.toString`, `Char.isDigit`,
+  `Map.get`, `Option.map`, `Iterator.any`
 
 So a module that lexes text needs **no imports at all**. Write `String.push`
 and `Vec.new` and be done.
@@ -27,8 +28,12 @@ hand for no reason. Don't.
 
 What still needs importing:
 
-- `System.IO`, `System.Env`, `Data.Set` -- not re-exported by the Prelude.
+- `System.IO`, `System.Env`, `Data.Set` -- not among the Prelude's qualifiers.
 - other `Turkey.*` modules.
+
+`import Turkey.Ast` gives `Turkey.Ast.Expr` and no bare names; a module that
+works on the tree writes `import Turkey.Ast (..)`, and one whose own `Pred`
+would collide writes `import Turkey.Ast (Pred as _, ..)`.
 
 **Qualified names work, including for types.** `String.Index` is a type and
 `String.slice` is a function, and neither needs an import beyond the Prelude's.
@@ -103,8 +108,8 @@ Modules are `Turkey.*` and live in `src/Turkey/`.
 
 Reserved words cannot be field or variable names, and the list is longer than
 it looks: `type class instance fun let var match if else while for in loop
-return break continue module import export as hiding do`. `hiding` and `export`
-are the two that bite -- `ImportDecl` has a `hidden` field for that reason.
+return break continue module import export as do`. `export` is the one that
+bites.
 
 ## Taking a record apart
 

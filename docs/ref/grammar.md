@@ -28,8 +28,8 @@ escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex?
 OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"
 ```
 
-Keywords: `as break class continue do else export for foreign fun hiding if
-import in instance let loop match module return type var while`.
+Keywords: `as break class continue do else export for foreign fun if import
+in instance let loop match module return type var while`.
 
 Comments: `--` to the end of the line, and `{- ... -}`, which nests.
 
@@ -44,12 +44,10 @@ export      ::= IDENT
               | CONID
               | CONID "(" ".." ")"
               | CONID "(" CONID ("," CONID)* ")"
-              | "module" modname
 top-level   ::= import | type-decl | class-decl | instance-decl
               | fun-decl | let-decl | var-decl | foreign-decl | infix-decl
 import      ::= "import" modname ("as" CONID)? import-list?
 import-list ::= "(" (entry ("," entry)*)? ")"
-              | "hiding" "(" item ("," item)* ")"
 entry       ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item        ::= IDENT | CONID | CONID "(" ".." ")" | CONID "(" CONID ("," CONID)* ")"
 ```

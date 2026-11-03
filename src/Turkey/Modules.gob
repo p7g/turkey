@@ -31,11 +31,11 @@ export (
 -- So modules may import each other in a cycle, and `Turkey.Infer` checks a
 -- component's modules together, as one program.
 
-import Turkey.Ast
+import Turkey.Ast (..)
 import System.Env as Env
 import System.File as File
 import System.IO as IO
--- `Data.Set` is not one of the modules the Prelude re-exports.
+-- `Data.Set` is not one of the Prelude's qualifiers.
 import Data.Set as Set
 import Turkey.Deps as Deps
 import Turkey.Diag as Diag
@@ -667,19 +667,16 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
 }
 
 -- Which bare names an import brings. Its qualified names are every export,
--- under its alias, whatever this says -- except that `hiding` withholds both.
+-- under its alias, whatever this says.
 type Bare
     = AllBare
     | NoBare
     -- An import's list, and whether it has a `..`.
     | Listed(Vec ImportItem, Bool)
-    -- `hiding (...)`, and whether the bare names come too.
-    | Hiding(Vec ExportItem, Bool)
 
-fun bareOf(imp : ImportDecl) -> Bare = match (imp.items, imp.hidden) {
-    (Some(items), _) -> Listed(items, imp.rest)
-    (None, Some(hidden)) -> Hiding(hidden, !imp.qualified)
-    (None, None) -> if imp.qualified { NoBare } else { AllBare }
+fun bareOf(imp : ImportDecl) -> Bare = match imp.items {
+    Some(items) -> Listed(items, imp.rest)
+    None -> NoBare
 }
 
 fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
@@ -693,37 +690,20 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                + "exports, or 'export (..)' for everything it declares", where)
     }
     let available = spaces(dep.exports)
-    let qualified = match bare {
-        Hiding(hidden, _) -> withheld(l, dep, available, hidden)
-        _ -> available
-    }
     let chosen = match bare {
         AllBare -> available
         NoBare -> spaces(newScope())
         Listed(items, rest) -> listed(l, dep, items, rest, where, strict)
-        Hiding(_, also) -> if also { qualified } else { spaces(newScope()) }
     }
     for space in namespaces {
         let i = namespaceIndex(space)
-        for (short, target) in Map.entries(qualified[i]) {
+        for (short, target) in Map.entries(available[i]) {
             mergeName(scope, space, alias + "." + short, target)
         }
         for (short, target) in Map.entries(chosen[i]) {
             mergeName(scope, space, short, target)
         }
     }
-}
-
-fun withheld(l : Loader, dep : Module, available : Array (Map String String),
-             hidden : Vec ExportItem) -> Array (Map String String) {
-    let out = Set.new()
-    for item in hidden {
-        Set.add(out, item.name)
-        if Option.isSome(Map.get(dep.exports.classes, item.name)) {
-            for sub in subsOf(l, dep, item) { Set.add(out, sub) }
-        }
-    }
-    Array.map(available, fun(space) = keepIf(space, !Set.contains(out, _)))
 }
 
 -- The bare names an import's list brings. With a `..`, every export comes
@@ -836,14 +816,6 @@ fun copyMap(m : Map String String) -> Map String String {
     out
 }
 
-fun keepIf(m : Map String String, keep : fun(String) -> Bool) -> Map String String {
-    let out = Map.new()
-    for (k, v) in Map.entries(m) {
-        if keep(k) { Map.put(out, k, v) }
-    }
-    out
-}
-
 fun namedAnywhere(s : Scope, name : String) -> Bool {
     for space in spaces(s) {
         if Map.contains(space, name) { return True }
@@ -897,9 +869,6 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
 
 fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
               out : Scope, strict : Bool) -> Unit {
-    if item.kind == "module" {
-        return reexport(m, item, out, strict)
-    }
     if isLower(item.name) {
         return match exported(m, mine.values, ValueSpace, item, strict) {
             Some(target) -> Map.put(out.values, item.name, target)
@@ -974,30 +943,6 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
 fun notConstructor(con : String, item : ExportItem) -> Unit =
     oopsAt("'" + con + "' is not a constructor of '" + item.name + "'",
            Some(item.span))
-
--- `module M`: everything in scope here under that qualification, passed on
--- *still qualified*. That is what lets the Prelude hand every program
--- `Vec.push` without claiming the bare `push`.
-fun reexport(m : Module, item : ExportItem, out : Scope, strict : Bool) -> Unit {
-    let prefix = item.name + "."
-    var found = False
-    let into = spaces(out)
-    let from = spaces(m.scope)
-    for space in namespaces {
-        let i = namespaceIndex(space)
-        for (surface, target) in Map.entries(from[i]) {
-            if String.startsWith(surface, prefix) {
-                discard(findName(m.scope, space, surface, item, strict))
-                Map.put(into[i], surface, target)
-                found = True
-            }
-        }
-    }
-    if strict && !found {
-        oopsAt("module '" + m.name + "' re-exports '" + item.name
-               + "', which is not imported here", Some(item.span))
-    }
-}
 
 -- What an export item names in `space`: the module's own declaration, or what
 -- its scope means by the name. `None` only in a round that reports nothing.

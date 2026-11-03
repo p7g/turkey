@@ -153,7 +153,6 @@ export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
               | CONID "(" ".." ")"             -- a type with all its constructors
               | CONID "(" CONID ("," CONID)* ")"
-              | "module" modname               -- a re-export
 ```
 
 A module that other modules import starts with an export declaration, which
@@ -180,7 +179,7 @@ fun clamp(n) = if n < 0 { 0 } else { n }
 
 <!-- run -->
 ```kotlin
-import Inventory
+import Inventory (restock, describe)
 
 fun main() {
     print(describe(restock("bolts", 12)))
@@ -207,12 +206,12 @@ fun describe(item : Item) = item.name + " x" + show(item.count)
 fun clamp(n) = if n < 0 { 0 } else { n }
 ```
 
-<!-- error: 'clamp' is not defined -->
+<!-- error: 'Inventory.clamp' is not defined -->
 ```kotlin
 import Inventory
 
 fun main() {
-    print(clamp(-1))
+    print(Inventory.clamp(-1))
 }
 ```
 
@@ -247,7 +246,7 @@ fun helper() -> Int = 1
 import Scratch
 
 fun main() {
-    print(helper())
+    print(Scratch.helper())
 }
 ```
 
@@ -281,7 +280,7 @@ fun make(n : Int) -> Token = Token { value = n }
 <!-- error: cannot access field 'value' of abstract type 'Token' -->
 ```kotlin
 import Sealed
-fun reveal() = make(3).value
+fun reveal() = Sealed.make(3).value
 ```
 
 <!-- module: Sealed.gob -->
@@ -300,10 +299,9 @@ import Sealed (Token(..))
 alone exports the class without its methods, so other modules can name it in
 constraints but cannot call its methods.
 
-**Re-exports.** `module M` in an export list passes on everything the module
-has in scope under the qualifier `M`, still qualified. The Prelude uses this
-to make `Vec.push`, `Int.parse` and the like available everywhere
-([The Prelude](builtins.md#the-prelude)).
+An export list names declarations, not modules: a module cannot pass on
+another module's qualifier, and a module that wants `Shapes.Circle.area`
+imports `Shapes.Circle` itself.
 
 ## Imports
 
@@ -312,7 +310,6 @@ to make `Vec.push`, `Int.parse` and the like available everywhere
 ```ebnf
 import ::= "import" modname ("as" CONID)? import-list?
 import-list ::= "(" (entry ("," entry)*)? ")"
-              | "hiding" "(" item ("," item)* ")"
 entry  ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item   ::= IDENT | CONID | CONID "(" ".." ")"
          | CONID "(" CONID ("," CONID)* ")"
@@ -320,18 +317,21 @@ item   ::= IDENT | CONID | CONID "(" ".." ")"
 
 | Import | Brings into scope |
 |---|---|
-| `import Geometry` | every export of `Geometry`, both bare (`area`) and qualified (`Geometry.area`) |
+| `import Geometry` | every export, qualified only: `Geometry.area`, not `area` |
+| `import Geometry as G` | every export, qualified as `G.area` |
 | `import Geometry (area, Point(..))` | the listed names bare, and every export qualified |
 | `import Geometry (..)` | every export, both bare and qualified |
 | `import Geometry (area as size)` | `area` under the bare name `size`, and every export qualified |
 | `import Geometry (area as _, ..)` | every export bare except `area`, and every export qualified |
-| `import Geometry hiding (area)` | every export except the listed ones |
-| `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
 | `import Geometry as G (area)` | `area` bare, and every export qualified as `G.area` |
-| `import Geometry ()` | no bare names; every export qualified, and the module's instances |
+| `import Geometry ()` | the same as `import Geometry`: no bare names, every export qualified |
 
-An import's list chooses bare names only. The qualified names, `Geometry.area`
-or `G.area`, are every export the module has, whatever the list says.
+An import always brings the module's qualified names, `Geometry.area`, or
+`G.area` under an alias, and they are every export the module has. An alias
+replaces the module's name as the qualifier rather than adding to it, so
+after `import Geometry as G` there is no `Geometry.area`. The list chooses only
+which bare names come too. Every import also loads the module, and its
+instances with it.
 
 `..` in a list stands for every export the other entries do not name, and may
 appear once. Beside it an entry only renames (`x as y`) or withholds
@@ -464,9 +464,11 @@ fun main() {
 
 ### The Prelude
 
-Every module imports the Prelude implicitly. An explicit `import Prelude ...`
-replaces the implicit import, and `import Prelude ()` imports nothing from it
-at all. See [The Prelude](builtins.md#the-prelude) for what it provides.
+Every module imports the Prelude implicitly, with its bare names and the
+library modules it brings qualified, such as `Vec` and `String`. An explicit
+`import Prelude ...` replaces the implicit import of its bare names, and
+`import Prelude ()` imports nothing from it at all, the qualified modules
+included, where `()` after any other module still brings its qualifier. See [The Prelude](builtins.md#the-prelude) for what it provides.
 
 <!-- run -->
 ```kotlin
@@ -610,8 +612,8 @@ fun label() -> String = "second"
 
 <!-- error: ambiguous name 'label': 'First.label', 'Second.label' -->
 ```kotlin
-import First
-import Second
+import First (label)
+import Second (label)
 fun main() { print(label()) }
 ```
 

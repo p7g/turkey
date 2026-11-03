@@ -18,7 +18,7 @@ export (parse, collectTycons)
 -- ambiguities to that shape: a scan decides by looking, where a speculative
 -- parse would have to decide by failing.
 
-import Turkey.Ast
+import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Lexer as Lexer
@@ -287,6 +287,11 @@ fun parseExportDecl(p : P) -> ExportDecl {
     }
     let items = Vec.new(8)
     while !at(p, ")") {
+        if at(p, "module") {
+            oops(p, "'module' cannot appear in an export list: a module exports "
+                    + "only what it declares, and a module that wants another's "
+                    + "names imports it", cur(p).span)
+        }
         Vec.push(items, parseExportItem(p))
         if !eat(p, ",") { break }
     }
@@ -295,12 +300,6 @@ fun parseExportDecl(p : P) -> ExportDecl {
 }
 
 fun parseExportItem(p : P) -> ExportItem {
-    -- `module M` re-exports everything in scope under that qualification. It is
-    -- the one export form that names no entity.
-    if at(p, "module") {
-        let s = advance(p).span
-        return ExportItem { span = s, name = parseModname(p), kind = "module", subs = None }
-    }
     let tok = advance(p)
     if !isNameToken(tok) {
         oops(p, "expected an export name, found " + describe(tok), tok.span)
@@ -316,7 +315,7 @@ fun parseExportItem(p : P) -> ExportItem {
         skipToken(p, ")")
         subs = Some(names)
     }
-    ExportItem { span = tok.span, name = text(tok), kind = "name", subs = subs }
+    ExportItem { span = tok.span, name = text(tok), subs = subs }
 }
 
 fun isNameToken(tok : Token) -> Bool = match Token.kindName(tok.kind) {
@@ -335,22 +334,19 @@ fun parseImport(p : P) -> ImportDecl {
     var alias : Option String = None
     var items : Option (Vec ImportItem) = None
     var rest = False
-    var hidden : Option (Vec ExportItem) = None
     if eat(p, "as") { alias = Some(text(expectWhat(p, "CONID", "a module alias"))) }
     -- An alias and a list are independent: `import M as S (f)` names the
     -- qualifier and chooses the bare names.
-    if at(p, "hiding") {
-        step(p)
-        hidden = Some(parseParenNameList(p))
-    } else if at(p, "(") {
+    if at(p, "(") {
         let (list, dots) = parseImportList(p)
         items = Some(list)
         rest = dots
+    } else if at(p, "IDENT") && text(cur(p)) == "hiding" {
+        oops(p, "an import withholds a name with 'as _' beside '..', as in "
+                + "'import " + name + " (x as _, ..)'; there is no 'hiding'",
+             cur(p).span)
     }
-    ImportDecl {
-        span = s, name = name, alias = alias, items = items, rest = rest,
-        hidden = hidden, qualified = Option.isSome(alias),
-    }
+    ImportDecl { span = s, name = name, alias = alias, items = items, rest = rest }
 }
 
 -- `(a, T(..), x as y, C as _, ..)`. Beside a `..`, which already brings every
@@ -387,10 +383,6 @@ fun parseImportList(p : P) -> (Vec ImportItem, Bool) {
 
 fun parseImportItem(p : P) -> ImportItem {
     let item = parseExportItem(p)
-    if item.kind == "module" {
-        oops(p, "'module' may appear in an export list, not in an import's "
-                + "name list: a module re-exports, it does not import", item.span)
-    }
     if !eat(p, "as") { return ImportItem { item = item, rename = None } }
     let tok = advance(p)
     if !isNameToken(tok) {
@@ -409,22 +401,6 @@ fun parseImportItem(p : P) -> ImportItem {
 fun startsUpper(name : String) -> Bool = match String.decode(name, String.start(name)) {
     Some(c) -> Char.isAsciiUpper(c)
     None -> False
-}
-
-fun parseParenNameList(p : P) -> Vec ExportItem {
-    skipToken(p, "(")
-    let names = Vec.new(4)
-    while !at(p, ")") {
-        let item = parseExportItem(p)
-        if item.kind == "module" {
-            oops(p, "'module' may appear in an export list, not in an import's "
-                    + "name list: a module re-exports, it does not import", item.span)
-        }
-        Vec.push(names, item)
-        if !eat(p, ",") { break }
-    }
-    skipToken(p, ")")
-    names
 }
 
 -- -- operator declarations -----------------------------------------------------------

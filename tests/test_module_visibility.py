@@ -18,11 +18,11 @@ fun read(t : Token) -> Int = t.value
 ])
 def test_abstract_fields_require_visible_constructor(body):
     assert "field 'value' of abstract type 'Token'" in lang.fails(
-        "import Tok\n" + body, OPAQUE)
+        "import Tok (..)\n" + body, OPAQUE)
 
 
 def test_abstract_record_can_be_used_through_its_interface():
-    assert lang.output("import Tok\nfun main() { print(read(make(7))) }", OPAQUE) == "7\n"
+    assert lang.output("import Tok (..)\nfun main() { print(read(make(7))) }", OPAQUE) == "7\n"
 
 
 @pytest.mark.parametrize("selection", ["Token(..)", "Token(Token)"])
@@ -44,20 +44,20 @@ def test_unrelated_constructor_cannot_be_exported_under_another_type():
 
 def test_hidden_constructor_cannot_be_reexported():
     assert "'Token' is not a constructor of 'Token'" in lang.fails("import Relay", {
-        **OPAQUE, "Relay.gob": "export (Token(..))\nimport Tok"})
+        **OPAQUE, "Relay.gob": "export (Token(..))\nimport Tok (..)"})
 
 
 PEERS = {name + ".gob": f'export (f)\nfun f() -> String = "{name}"' for name in ("A", "B")}
 
 
-@pytest.mark.parametrize("imports", ["import A\nimport B", "import B\nimport A"])
+@pytest.mark.parametrize("imports", ["import A (..)\nimport B (..)", "import B (..)\nimport A (..)"])
 def test_ambiguous_import_is_reported_at_use(imports):
     assert lang.fails(imports + "\nfun main() { print(f()) }", PEERS) == (
         "ambiguous name 'f': 'A.f', 'B.f'")
 
 
 def test_unused_ambiguity_and_qualified_access_are_legal():
-    assert lang.output("import A\nimport B\nfun main() { print(A.f()); print(B.f()) }", PEERS) == "A\nB\n"
+    assert lang.output("import A (..)\nimport B (..)\nfun main() { print(A.f()); print(B.f()) }", PEERS) == "A\nB\n"
 
 
 @pytest.mark.parametrize("body", [
@@ -65,23 +65,23 @@ def test_unused_ambiguity_and_qualified_access_are_legal():
     'fun main() { let f = fun() = "local"; print(f()) }',
 ])
 def test_local_bindings_shadow_ambiguous_imports(body):
-    assert lang.output("import A\nimport B\n" + body, PEERS) == "local\n"
+    assert lang.output("import A (..)\nimport B (..)\n" + body, PEERS) == "local\n"
 
 
 def test_repeated_import_of_same_declaration_is_unambiguous():
-    assert lang.output("import A\nimport Relay\nfun main() { print(f()) }", {
-        **PEERS, "Relay.gob": "export (f)\nimport A"}) == "A\n"
+    assert lang.output("import A (..)\nimport Relay (..)\nfun main() { print(f()) }", {
+        **PEERS, "Relay.gob": "export (f)\nimport A (..)"}) == "A\n"
 
 
 def test_ambiguous_name_cannot_be_reexported():
     assert "ambiguous name 'f'" in lang.fails("import Relay", {
-        **PEERS, "Relay.gob": "export (f)\nimport A\nimport B"})
+        **PEERS, "Relay.gob": "export (f)\nimport A (..)\nimport B (..)"})
 
 
 @pytest.mark.parametrize("body", ["fun f(x : T) = x", "fun f() = C", "fun f(x) = match x { C -> 1 }"])
 def test_type_and_constructor_names_have_ambiguity_checks(body):
     modules = {n + ".gob": f"export (T(..))\ntype T = C" for n in ("A", "B")}
-    assert "ambiguous name" in lang.fails("import A\nimport B\n" + body, modules)
+    assert "ambiguous name" in lang.fails("import A (..)\nimport B (..)\n" + body, modules)
 
 
 def test_qualified_record_constructor_allows_field_access():
@@ -91,19 +91,19 @@ def test_qualified_record_constructor_allows_field_access():
 
 def test_field_evidence_cannot_cross_module_boundary_to_reveal_abstract_record():
     assert "field 'value' of abstract type 'Token'" in lang.fails(
-        "import Tok\nimport Access\nfun f() = get(make(1))",
+        "import Tok (..)\nimport Access (..)\nfun f() = get(make(1))",
         {**OPAQUE, "Access.gob": "export (get)\nfun get(x) = x.value"})
 
 
 def test_class_names_are_ambiguous_independently_of_types():
     modules = {n + ".gob": f"export (C(..))\nclass C a {{ fun get(a) -> Int }}" for n in ("A", "B")}
     assert "ambiguous name 'C'" in lang.fails(
-        "import A\nimport B\nfun f[C a](x : a) = get(x)", modules)
+        "import A (..)\nimport B (..)\nfun f[C a](x : a) = get(x)", modules)
 
 
 def test_ambiguous_import_reports_the_use_location():
     with pytest.raises(lang.CompileError) as error:
-        lang.check("import A\nimport B\nfun f2() = f()", PEERS)
+        lang.check("import A (..)\nimport B (..)\nfun f2() = f()", PEERS)
     assert error.value.rendered.startswith("Main.gob:3:")
 
 

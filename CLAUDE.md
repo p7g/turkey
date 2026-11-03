@@ -7,7 +7,7 @@ noticing, and a stale document is worse than none, because the next reader
 takes it for fact.
 
 * **What the language is:** `docs/ref/`. Every example is compiled and run by
-  `tests/test_reference.py`, which is why it stays.
+  the test harness (`sh scripts/test.sh docs/ref`), which is why it stays.
 * **Why this code is the way it is:** a comment in the module it is about,
   edited in the same commit as the code. See "Comments" below.
 * **Why a change was made:** the commit message. It is dated, so it cannot go
@@ -75,8 +75,8 @@ and a change is checked by what it *does*:
   every behavioral test goes through it. Regenerate a golden with
   `sh scripts/test.sh --bless [PATH]` and **read the diff**: nothing else
   says whether a change is a fix or a regression.
-* **The reference.** `tests/test_reference.py` compiles and runs every example
-  in `docs/ref/`, so the chapters are executable.
+* **The reference.** The harness compiles and runs every example in
+  `docs/ref/` (`sh scripts/test.sh docs/ref`), so the chapters are executable.
 * **The fixed point.** `boot` compiles itself, and `pytest -m bootstrap` checks
   that the compiler it builds emits the same bytes it was built from. A
   miscompile has to reproduce itself exactly to survive.
@@ -95,9 +95,9 @@ both scripts say when and why at the top.
 `docs/ref/` is the language as its users see it. After any change a program
 could notice -- syntax, a type rule, a diagnostic the reference quotes, a
 panic, what the Prelude provides -- update the chapters it touches in the same
-commit, and fix any sentence a bug fix has made wrong. `tests/test_reference.py`
-compiles and runs every example, so a stale example goes red; stale prose does
-not, so grep the chapters for the feature you changed.
+commit, and fix any sentence a bug fix has made wrong. The harness compiles and
+runs every example, so a stale example goes red; stale prose does not, so grep
+the chapters for the feature you changed.
 
 How the reference is written:
 
@@ -157,5 +157,5 @@ needs, and what "done" means.
 
 * `README.md` -- what Turkey is, and how to build and run it.
 * `docs/ref/` -- the language reference: syntax and semantics for people
-  writing Turkey, every example compiled and run by `tests/test_reference.py`.
+  writing Turkey, every example compiled and run by `sh scripts/test.sh`.
 * `src/CLAUDE.md` -- house style for the compiler's own source.

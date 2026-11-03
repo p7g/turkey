@@ -191,11 +191,12 @@ For more depth:
 - [Language reference](docs/ref/README.md): the syntax and meaning of every construct
 - [Compiler written in Turkey](src/)
 
-The recorded programs in `tests/programs/` are run by a harness written in
-Turkey, `tests/harness/`:
+The recorded programs in `tests/programs/` and the examples in `docs/ref/` are
+run by a harness written in Turkey, `tests/harness/`:
 
-    sh scripts/test.sh                    # every program, one per core at once
+    sh scripts/test.sh                    # every case, one per core at once
     sh scripts/test.sh tests/programs/bf  # the programs whose path starts so
+    sh scripts/test.sh docs/ref/types.md  # one chapter's examples
     sh scripts/test.sh -v --shard 2/4     # a quarter of them, passes listed
     sh scripts/test.sh --selftest         # the harness checked on its own cases
     sh scripts/test.sh --bless PATH       # PATH's goldens rewritten from its output
@@ -205,7 +206,9 @@ bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are compiled
 programs. A program's expected outcome is a directive in it: `--@ error` (it
 must not compile), `--@ panic`, `--@ exit: N`, and otherwise exit 0. A case
 that fails is shown with a diff, and every actual output is kept under
-`$TMPDIR/turkey-test/actual/`.
+`$TMPDIR/turkey-test/actual/`. A reference example is named by its chapter and
+the line of its fence, `docs/ref/types.md:40`, and checked against what the
+chapter says of it (`docs/ref/README.md`); `--bless` never writes one.
 
 `--bless` writes the selected programs' actual output over their `.expected`
 files, and their dumps over the `.types`, `.core`, `.opt` and `.mono` files

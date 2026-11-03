@@ -14,7 +14,7 @@
 #             emitter over the compiler's source and the corpus, which
 #             test_emit, test_bootstrap and test_arm64_native share
 #   backend   instruction selection, SSA, the machine checks and the runtime
-#   corpus    the reference's examples, the inference corpus, and diagnostics
+#   corpus    the inference corpus, and diagnostics
 #   language  every other file, so a new test file lands somewhere without
 #             anyone listing it
 #
@@ -28,7 +28,7 @@ SELF="test_bootstrap test_emit test_arm64_native"
 BACKEND="test_select test_machine_check test_ssa_lower test_ssa test_sccp
          test_mono test_heap_verifier test_runtime_gc test_allocators
          test_alloc_sites"
-CORPUS="test_reference test_infer_corpus test_errors test_entry
+CORPUS="test_infer_corpus test_errors test_entry
         test_system test_target"
 
 files() {

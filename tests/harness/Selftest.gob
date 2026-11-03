@@ -1,12 +1,19 @@
 export (cases, check)
 
--- The harness checked against cases whose outcome is known: one per outcome,
--- in `selftest/`, each named for the outcome it must be given (`fail_*.gob`
--- must be reported as a fail). A harness that called a crash a wrong answer,
--- or let an unknown directive pass, would otherwise go unnoticed, since its
--- reports on the real corpus are all anyone reads.
+-- The harness checked against cases whose outcome is known: at least one per
+-- outcome, in `selftest/`, each named for the outcome it must be given
+-- (`fail_*.gob` must be reported as a fail), and each listed with what
+-- `--bless` must do with it. A harness that called a crash a wrong answer,
+-- let an unknown directive pass, or blessed a crash would otherwise go
+-- unnoticed, since its reports on the real corpus are all anyone reads.
+--
+-- Bless is checked by its decisions alone, which are pure: nothing here
+-- writes a golden.
 
-import Case (Case(..), Outcome(..), Result(..))
+import Bless (Blessing(..), Guard(..))
+import Bless as Bless
+import Case (Case(..), Expected(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..),
+             Recorded(..))
 import Case as Case
 import Files as Files
 import Programs as Programs
@@ -16,6 +23,33 @@ let prefixes = [
     ("compiler_crash", CompilerCrash), ("program_crash", ProgramCrash),
     ("harness_error", HarnessError), ("timeout", Timeout), ("xfail", XFail),
     ("xpass", XPass), ("skip", Skip), ("fail", Fail), ("pass", Pass),
+]
+
+-- What bless must do with a case: leave it, write exactly these files (by
+-- base name, in order), keep it deliberately, or refuse it by this guard.
+type Wanted = Same | Writes(Array String) | Kept | Refused(Guard)
+
+-- What bless must do with each case, by the case's base name. Every case is
+-- listed, and every guard is reached by at least one, except those that no
+-- real compile reaches, which `checkOwnError` and `checkDumpGuards` cover.
+let blessings = [
+    ("compiler_crash.gob", Refused(Crash)),
+    ("fail_diagnostic.gob", Refused(Diagnostic)),
+    ("fail_dump_differs.gob", Writes(["fail_dump_differs.types"])),
+    ("fail_dump_exits.gob", Refused(WrongEnd)),
+    ("fail_error_compiles.gob", Refused(WrongEnd)),
+    ("fail_exit_nonzero.gob", Refused(WrongEnd)),
+    ("fail_exit_zero.gob", Refused(WrongEnd)),
+    ("fail_newly_empty.gob", Refused(NewlyEmpty)),
+    ("fail_wrong_answer.gob", Writes(["fail_wrong_answer.expected"])),
+    ("harness_error_no_golden.gob", Writes(["harness_error_no_golden.expected"])),
+    ("harness_error_unknown_directive.gob", Refused(Unrunnable)),
+    ("pass.gob", Same),
+    ("program_crash.gob", Refused(Crash)),
+    ("skip.gob", Kept),
+    ("timeout.gob", Refused(Overrun)),
+    ("xfail.gob", Kept),
+    ("xpass.gob", Kept),
 ]
 
 -- The cases in `ROOT/tests/harness/selftest`, and the one that crashes
@@ -34,33 +68,44 @@ fun cases(root : String, cache : String) -> Array Case {
     Array.append(found, Programs.discover(directory, "(generated)"))
 }
 
--- Whether every case was given the outcome its name says, and every outcome
--- was given to some case, printing what was not.
-fun check(ran : Array (Case, Result)) -> Bool {
+-- Returns whether every case was given the outcome its name says and the
+-- blessing listed for it, every outcome was given to some case, and the
+-- refusal limit and the guards on made-up results hold, printing what did
+-- not.
+fun check(ran : Array (Case, (Result, Blessing))) -> Bool {
+    let outcomes = checkOutcomes(ran)
+    let blessed = checkBlessings(ran)
+    let limited = checkLimit(Array.map(ran, _.1.1))
+    let own = checkOwnError()
+    let dumped = checkDumpGuards()
+    let ok = outcomes && blessed && limited && own && dumped
+    print(if ok { "selftest: every outcome classified and every blessing decided correctly" }
+          else { "selftest: FAILED" })
+    ok
+}
+
+fun checkOutcomes(ran : Array (Case, (Result, Blessing))) -> Bool {
     var ok = True
-    for (c, r) in ran {
-        let name = c.name
-        let base = Option.fold(String.rsplitOnce(name, "/"), name, _.1)
+    for (c, (r, _)) in ran {
         let got = r.outcome
-        match wanted(base) {
+        match wanted(baseName(c.name)) {
             None -> {
-                print("selftest: " + name + " is not named for an outcome")
+                print("selftest: " + c.name + " is not named for an outcome")
                 ok = False
             }
             Some(o) -> if o != got {
-                print("selftest: " + name + " should be " + Case.outcomeName(o) + ", was "
+                print("selftest: " + c.name + " should be " + Case.outcomeName(o) + ", was "
                       + Case.outcomeName(got) + " (" + r.why + ")")
                 ok = False
             }
         }
     }
     for (_, o) in prefixes {
-        if !Iterator.any(ran, _.1.outcome == o) {
+        if !Iterator.any(ran, _.1.0.outcome == o) {
             print("selftest: no case was given " + Case.outcomeName(o))
             ok = False
         }
     }
-    print(if ok { "selftest: every outcome classified correctly" } else { "selftest: FAILED" })
     ok
 }
 
@@ -70,3 +115,126 @@ fun wanted(base : String) -> Option Outcome {
     }
     None
 }
+
+fun checkBlessings(ran : Array (Case, (Result, Blessing))) -> Bool {
+    var ok = True
+    for (c, (_, b)) in ran {
+        let base = baseName(c.name)
+        match Iterator.find(blessings, _.0 == base) {
+            None -> {
+                print("selftest: " + c.name + " has no blessing listed")
+                ok = False
+            }
+            Some((_, w)) -> if wantedShape(w) != shape(b) {
+                print("selftest: bless should " + wantedShape(w) + " " + c.name + ", but would "
+                      + shape(b) + why(b))
+                ok = False
+            }
+        }
+    }
+    ok
+}
+
+-- The corpus refuses more cases than the limit, so blessing all of it writes
+-- nothing; with only the limit's worth of those refusals it writes every
+-- clean case's files, and with one more, nothing.
+fun checkLimit(decided : Array Blessing) -> Bool {
+    let refusals = Array.filter(decided, Bless.refused)
+    let clean = Array.filter(decided, \!Bless.refused(_))
+    let limit = Bless.refusalLimit
+    if len(refusals) <= limit {
+        print("selftest: the corpus refuses " + Int.toString(len(refusals)) + " cases, which is not over the limit of "
+              + Int.toString(limit))
+        return False
+    }
+    let all = len(Bless.permitted(clean))
+    let atLimit = len(Bless.permitted(Array.append(clean, Array.slice(refusals, 0, limit))))
+    let overLimit = len(Bless.permitted(Array.append(clean, Array.slice(refusals, 0, limit + 1))))
+    let whole = len(Bless.permitted(decided))
+    if all == 0 || atLimit != all || overLimit != 0 || whole != 0 {
+        print("selftest: the refusal limit does not hold: " + Int.toString(all) + " files clean, "
+              + Int.toString(atLimit) + " at the limit, " + Int.toString(overLimit) + " over it, "
+              + Int.toString(whole) + " for the whole corpus")
+        return False
+    }
+    True
+}
+
+-- A case that is never run, for checking bless on results made up for it.
+fun madeUp(expected : Expected, dumps : Array (String, String)) -> Case = Case {
+    name = "(made up)/case.gob", directory = "/nonexistent", entry = "case.gob",
+    sources = ["case.gob"], golden = "/nonexistent/case.expected", dumps = dumps,
+    expected = expected, timeout = None, requires = [], xfail = None, problem = None,
+}
+
+-- The guard on an error that `boot` reports about itself, which no committed
+-- case reaches: on a case marked `--@ error`, such an error must be refused
+-- rather than recorded as the diagnostic.
+fun checkOwnError() -> Bool {
+    let c = madeUp(Rejected, [])
+    let recorded = Recorded { expected = Some("case.gob:1:1: parse error: expected a declaration\n"), dumps = [] }
+    let observed = Observed { ending = Diagnosed(2), output = "boot: cannot read case.gob\n", dumps = [] }
+    let b = Bless.decide(c, recorded, observed)
+    let w = Refused(Diagnostic)
+    if wantedShape(w) == shape(b) { return True }
+    print("selftest: for an error boot reports about itself, bless should " + wantedShape(w)
+          + ", but would " + shape(b) + why(b))
+    False
+}
+
+-- The guards on a dump that no real compile reaches, checked on results made
+-- up for a case with one dump golden: `boot check` panicking, dying by a
+-- signal, running out of time, or printing nothing where its golden has a
+-- line.
+fun checkDumpGuards() -> Bool {
+    let c = madeUp(Exits(0), [("types", "/nonexistent/case.types")])
+    let recorded = Recorded { expected = Some("hello\n"), dumps = ["main : fun() -> Unit\n"] }
+    let tried = [
+        ((Panicked(101), "panic: no\n"), Refused(Crash)),
+        ((Killed(11), ""), Refused(Crash)),
+        ((Expired, ""), Refused(Overrun)),
+        ((Returned(0), ""), Refused(NewlyEmpty)),
+        ((Returned(0), "main : fun() -> Unit\n"), Same),
+    ]
+    var ok = True
+    for (dump, w) in tried {
+        let observed = Observed { ending = Ran(Returned(0)), output = "hello\n", dumps = [dump] }
+        let b = Bless.decide(c, recorded, observed)
+        if wantedShape(w) != shape(b) {
+            print("selftest: for a types dump that ended " + finishName(dump.0) + ", bless should "
+                  + wantedShape(w) + ", but would " + shape(b) + why(b))
+            ok = False
+        }
+    }
+    ok
+}
+
+fun finishName(f : Finish) -> String = match f {
+    Returned(code) -> "exiting " + Int.toString(code)
+    Panicked(_) -> "in a panic"
+    Killed(n) -> "by signal " + Int.toString(n)
+    Expired -> "out of time"
+}
+
+-- A blessing and a wanted one, in words that are equal when they agree.
+fun shape(b : Blessing) -> String = match b {
+    Unchanged -> "leave"
+    Write(files) -> "write " + String.join(Array.map(files, \baseName(_.0)), ", ")
+    Keep(_) -> "keep"
+    Refuse(g, _) -> "refuse (" + Bless.guardName(g) + ")"
+}
+
+fun wantedShape(w : Wanted) -> String = match w {
+    Same -> "leave"
+    Writes(files) -> "write " + String.join(files, ", ")
+    Kept -> "keep"
+    Refused(g) -> "refuse (" + Bless.guardName(g) + ")"
+}
+
+fun why(b : Blessing) -> String = match b {
+    Keep(reason) -> ": " + reason
+    Refuse(_, reason) -> ": " + reason
+    Unchanged | Write(_) -> ""
+}
+
+fun baseName(path : String) -> String = Option.fold(String.rsplitOnce(path, "/"), path, _.1)

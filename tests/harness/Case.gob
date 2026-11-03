@@ -1,15 +1,16 @@
 export (
     Case(..), Expected(..), Requirement(..), Outcome(..), Result(..),
-    directives, requirementName, outcomeName, failsRun, passed,
+    Finish(..), Ending(..), Observed(..), Recorded(..),
+    directives, requirementName, outcomeName, failsRun, passed, disagreement,
 )
 
 -- What a test is, whatever source it came from, and what can become of it.
 --
 -- Every source of cases is a function from a path to an `Array Case`, and the
 -- runner sees nothing else. A case that cannot be run as written -- an
--- unknown directive, a missing golden -- is still a case, carrying its
--- `problem`, so that it is reported as a harness error in its place rather
--- than dropped.
+-- unknown directive, an entry that cannot be read -- is still a case,
+-- carrying its `problem`, so that it is reported as a harness error in its
+-- place rather than dropped.
 
 -- How a case must end. Without a directive saying otherwise, a program
 -- compiles, runs and exits 0.
@@ -112,6 +113,49 @@ fun passed(o : Outcome) -> Bool = match o {
     Pass -> True
     _ -> False
 }
+
+-- -- what a run produced ------------------------------------------------------------
+
+-- How one process ended: it exited with a status, printed a panic and exited
+-- with a status, died by a signal, or was killed at its time limit.
+type Finish = Returned(Int) | Panicked(Int) | Killed(Int) | Expired
+
+-- How a case's compile and run ended. `CompileCrash` is `boot` dying by a
+-- signal or panicking, or the link failing, with why; `CompileExpired` is
+-- either of them running out of time; `Diagnosed` is `boot` refusing the
+-- program, with its exit status; `Ran` is how the compiled program ended.
+type Ending = CompileCrash(String) | CompileExpired | Diagnosed(Int) | Ran(Finish)
+
+-- What a run of a case produced. `output` is what the `.expected` golden is
+-- compared with: stdout, then the compile's warnings and the program's
+-- stderr; or a failed compile's diagnostic. `dumps` holds how each dump
+-- stage ended and what it printed, stdout then stderr, in the order of
+-- `Case.dumps`. It is empty when the compile crashed or ran out of time,
+-- since no dump is run then.
+type Observed = Observed { ending : Ending, output : String, dumps : Array (Finish, String) }
+
+-- A case's goldens as they are on disk: the `.expected` file, if there is
+-- one, and each dump golden, in the order of `Case.dumps`.
+type Recorded = Recorded { expected : Option String, dumps : Array String }
+
+-- Returns why `ending` is not the end that the directive `expected` names,
+-- or `None` if it is. Only a diagnostic, an exit and a panic are compared;
+-- for a crash or a timeout this returns `None`, and the caller classifies
+-- those first.
+fun disagreement(expected : Expected, ending : Ending) -> Option String = match (expected, ending) {
+    (_, CompileCrash(_)) | (_, CompileExpired) | (_, Ran(Killed(_))) | (_, Ran(Expired)) -> None
+    (Rejected, Diagnosed(_)) -> None
+    (Rejected, _) -> Some("compiled, but --@ error expects a compile error")
+    (_, Diagnosed(_)) -> Some("did not compile")
+    (Exits(n), Ran(Returned(code))) ->
+        if code == n { None } else { Some("exited " + Int.toString(code) + ", not " + Int.toString(n)) }
+    (Exits(_), Ran(Panicked(_))) -> Some("panicked")
+    (Panics, Ran(Panicked(code))) -> if code != 0 { None } else { withoutPanic(code) }
+    (Panics, Ran(Returned(code))) -> withoutPanic(code)
+}
+
+fun withoutPanic(code : Int) -> Option String =
+    Some("exited " + Int.toString(code) + " without the panic --@ panic expects")
 
 -- -- directives -----------------------------------------------------------------------
 

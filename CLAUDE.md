@@ -73,7 +73,7 @@ and a change is checked by what it *does*:
 * **Recorded behavior.** `tests/programs/` holds a program, its exact output
   and its exit status. `tests/lang.py` compiles and runs through `boot`, and
   every behavioral test goes through it. Regenerate a golden with
-  `python3 -m tests.regenerate_expected` and **read the diff**: nothing else
+  `sh scripts/test.sh --bless [PATH]` and **read the diff**: nothing else
   says whether a change is a fix or a regression.
 * **The reference.** `tests/test_reference.py` compiles and runs every example
   in `docs/ref/`, so the chapters are executable.

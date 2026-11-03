@@ -279,8 +279,8 @@ fun close(f : FD) -> Int {
     let p = f.state
     while True {
         let state = Prim.atomicGet(p)
-        if Prim.intAnd(state, closedBit) != 0 { return 0 }
-        let marked = Prim.intOr(state, closedBit) + reference
+        if state & closedBit != 0 { return 0 }
+        let marked = (state | closedBit) + reference
         if Prim.atomicSwapIf(p, state, marked) == state { break }
     }
     -- A waiter registers under the scheduler's lock after seeing the bit
@@ -307,7 +307,7 @@ fun acquire(f : FD) -> Bool {
     let p = f.state
     while True {
         let state = Prim.atomicGet(p)
-        if Prim.intAnd(state, closedBit) != 0 { return False }
+        if state & closedBit != 0 { return False }
         if Prim.atomicSwapIf(p, state, state + reference) == state { return True }
     }
     False
@@ -327,7 +327,7 @@ fun release(f : FD) -> Int {
 fun lock(f : FD, bit : Int, waited : Int) -> Bool {
     let p = f.state
     let state = Prim.atomicGet(p)
-    if Prim.intAnd(state, closedBit + bit) == 0 {
+    if state & (closedBit + bit) == 0 {
         if Prim.atomicSwapIf(p, state, state + bit + reference) == state { return True }
     }
     let claim = Claim { got = False }
@@ -347,13 +347,13 @@ fun tryLock(f : FD, bit : Int, waited : Int, claim : Claim) -> Bool {
     let p = f.state
     while True {
         let state = Prim.atomicGet(p)
-        if Prim.intAnd(state, closedBit) != 0 { return True }
-        if Prim.intAnd(state, bit) == 0 {
+        if state & closedBit != 0 { return True }
+        if state & bit == 0 {
             if Prim.atomicSwapIf(p, state, state + bit + reference) == state {
                 claim.got = True
                 return True
             }
-        } else if Prim.intAnd(state, waited) != 0 {
+        } else if state & waited != 0 {
             return False
         } else if Prim.atomicSwapIf(p, state, state + waited) == state {
             return False
@@ -370,10 +370,10 @@ fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
     var before = 0
     while True {
         before = Prim.atomicGet(p)
-        let after = Prim.intAnd(before, Prim.intNot(bit + waited)) - reference
+        let after = (before & Prim.intNot(bit + waited)) - reference
         if Prim.atomicSwapIf(p, before, after) == before { break }
     }
-    if Prim.intAnd(before, waited) != 0 {
+    if before & waited != 0 {
         Scheduler.lock()
         if bit == readLock {
             for c in f.readers { Scheduler.wake(c) }
@@ -385,7 +385,7 @@ fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
         Scheduler.changed()
         Scheduler.unlock()
     }
-    if Prim.intAnd(before, Prim.intNot(bit + waited)) - reference == closedBit {
+    if (before & Prim.intNot(bit + waited)) - reference == closedBit {
         let _ = closeNumber(f)
     }
 }
@@ -430,7 +430,7 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
 -- wait the poller could not make.
 fun park(f : FD, writing : Bool, deadline : Int) -> Int {
     f.polled = True
-    let stop = fun() = Prim.intAnd(Prim.atomicGet(f.state), closedBit) != 0
+    let stop = fun() = Prim.atomicGet(f.state) & closedBit != 0
     let w = if writing { Wait.writableUnless(f.number, deadline, stop) }
             else { Wait.readableUnless(f.number, deadline, stop) }
     if w == Wait.cancelled { closed } else { w }
@@ -441,7 +441,7 @@ fun park(f : FD, writing : Bool, deadline : Int) -> Int {
 -- otherwise, including when it cannot tell.
 fun inherited(number : Int) -> ReadMode {
     let flags = IO.fcntl(number, Sys.getStatusFlags)
-    if flags < 0 || Prim.intAnd(flags, Sys.nonBlocking()) != 0 { return CallAtOnce }
+    if flags < 0 || flags & Sys.nonBlocking() != 0 { return CallAtOnce }
     let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
     if IO.fstat(number, stat) < 0 { return CallAtOnce }
     let kind = Sys.fileType(IO.statMode(stat))

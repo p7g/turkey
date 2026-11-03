@@ -47,7 +47,8 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Int ()
 import Data.Bool (Bool(..))
-import Bits (BitOr(..), (|))
+-- Shifts use the primitives, for the reason `Turkey.Heap` gives at its imports.
+import Bits (BitAnd(..), BitOr(..), (&), (|))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
@@ -263,7 +264,7 @@ fun stopEnter(frame : Prim.Ptr) -> Unit {
 }
 
 -- Whether the collection that stopped the running worker is still going.
-fun stopWanted() -> Bool = Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0
+fun stopWanted() -> Bool = Prim.atomicLoad(Prim.processState(), 272) & 1 != 0
 
 fun stopLeave() -> Unit {
     parkAt(Prim.ptrNull())
@@ -451,7 +452,7 @@ fun makeKqueue() -> Int {
     if kq < 0 { return Prim.intNeg(Sys.errno()) }
     let _ = Libc.fcntlWith(kq, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
     Prim.atomicStore(poller, descriptorAt, kq)
-    let r = change(Sys.filterUser(), 0, Prim.intOr(Sys.evAdd, Sys.evClear), 0, 0)
+    let r = change(Sys.filterUser(), 0, Sys.evAdd | Sys.evClear, 0, 0)
     if r < 0 { let _ = Libc.close(kq) }
     r
 }
@@ -461,7 +462,7 @@ fun makeKqueue() -> Int {
 fun makeEpoll() -> Int {
     let ep = Sys.cInt(Libc.epollCreate1(Sys.closeOnExec()))
     if ep < 0 { return Prim.intNeg(Sys.errno()) }
-    let wake = Sys.cInt(Libc.eventfd(0, Prim.intOr(Sys.nonBlocking(), Sys.closeOnExec())))
+    let wake = Sys.cInt(Libc.eventfd(0, Sys.nonBlocking() | Sys.closeOnExec()))
     if wake < 0 {
         let failure = Prim.intNeg(Sys.errno())
         let _ = Libc.close(ep)
@@ -485,8 +486,7 @@ fun makeEpoll() -> Int {
 fun setEvent(buf : Prim.Ptr, at : Int, ident : Int, filter : Int, flags : Int, fflags : Int,
              data : Int, udata : Int) -> Unit {
     Prim.storeI64(buf, at, ident)
-    let packed = Prim.intOr(Prim.intAnd(filter, 0xFFFF),
-                            Prim.intOr(Prim.intShl(flags, 16), Prim.intShl(fflags, 32)))
+    let packed = filter & 0xFFFF | Prim.intShl(flags, 16) | Prim.intShl(fflags, 32)
     Prim.storeI64(buf, plus(at, 8), packed)
     Prim.storeI64(buf, plus(at, 16), data)
     Prim.storeI64(buf, plus(at, 24), udata)
@@ -501,7 +501,7 @@ fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) ->
     -- The change, its receipt, and a zero timeout.
     let buf = zeroed(80)
     if Prim.ptrIsNull(buf) { return Prim.intNeg(Sys.enomem) }
-    setEvent(buf, 0, ident, filter, Prim.intOr(flags, Sys.evReceipt), fflags, 0, udata)
+    setEvent(buf, 0, ident, filter, flags | Sys.evReceipt, fflags, 0, udata)
     let kq = Prim.atomicLoad(poller, descriptorAt)
     var answer = 0
     while True {
@@ -511,7 +511,7 @@ fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) ->
             if answer != Prim.intNeg(Sys.eintr) { break }
         } else {
             let head = Prim.loadI64(buf, 40)
-            if Prim.intAnd(Prim.intShr(head, 16), Sys.evError) != 0 {
+            if Prim.intShr(head, 16) & Sys.evError != 0 {
                 answer = Prim.intNeg(Prim.loadI64(buf, 48))
             }
             break
@@ -539,7 +539,7 @@ fun epollControl(ep : Int, operation : Int, fd : Int, events : Int, token : Int)
 -- descriptor's registration, or a new one if it has none.
 fun epollArm(fd : Int, events : Int, token : Int) -> Int {
     let ep = Prim.atomicLoad(poller, descriptorAt)
-    let armed = Prim.intOr(events, Sys.epollOneShot)
+    let armed = events | Sys.epollOneShot
     let r = epollControl(ep, Sys.epollCtlMod, fd, armed, token)
     if r == Prim.intNeg(Sys.enoent) { epollControl(ep, Sys.epollCtlAdd, fd, armed, token) } else { r }
 }
@@ -552,7 +552,7 @@ fun pollRead(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
     match Target.os {
-        Darwin -> change(Sys.filterRead(), fd, Prim.intOr(Sys.evAdd, Sys.evOneShot), 0, token)
+        Darwin -> change(Sys.filterRead(), fd, Sys.evAdd | Sys.evOneShot, 0, token)
         Linux -> epollArm(fd, Sys.epollIn, token)
     }
 }
@@ -562,7 +562,7 @@ fun pollWrite(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
     match Target.os {
-        Darwin -> change(Sys.filterWrite(), fd, Prim.intOr(Sys.evAdd, Sys.evOneShot), 0, token)
+        Darwin -> change(Sys.filterWrite(), fd, Sys.evAdd | Sys.evOneShot, 0, token)
         Linux -> epollArm(fd, Sys.epollOut, token)
     }
 }
@@ -576,11 +576,11 @@ fun pollReadWrite(fd : Int, token : Int) -> Int {
     if ready < 0 { return ready }
     match Target.os {
         Darwin -> {
-            let flags = Prim.intOr(Sys.evAdd, Sys.evOneShot)
+            let flags = Sys.evAdd | Sys.evOneShot
             let r = change(Sys.filterRead(), fd, flags, 0, token)
             if r < 0 { r } else { change(Sys.filterWrite(), fd, flags, 0, token) }
         }
-        Linux -> epollArm(fd, Prim.intOr(Sys.epollIn, Sys.epollOut), token)
+        Linux -> epollArm(fd, Sys.epollIn | Sys.epollOut, token)
     }
 }
 
@@ -597,8 +597,8 @@ fun pollChild(pid : Int, token : Int) -> Int {
     if ready < 0 { return ready }
     match Target.os {
         Darwin -> {
-            let flags = Prim.intOr(Sys.evAdd, Sys.evOneShot)
-            let r = change(Sys.filterProc(), pid, flags, Prim.intOr(Sys.noteExit, Sys.noteExitStatus), token)
+            let flags = Sys.evAdd | Sys.evOneShot
+            let r = change(Sys.filterProc(), pid, flags, Sys.noteExit | Sys.noteExitStatus, token)
             if r == Prim.intNeg(Sys.esrch) { 1 } else { r }
         }
         Linux -> watchPid(pid, token)
@@ -880,9 +880,9 @@ fun push(count : Int, token : Int, value : Int) -> Int {
 fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
     let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 32))
     let head = Prim.loadI64(event, 8)
-    let raw = Prim.intAnd(head, 0xFFFF)
+    let raw = head & 0xFFFF
     let filter = if raw >= 0x8000 { Prim.intSubWrapping(raw, 0x10000) } else { raw }
-    let flags = Prim.intAnd(Prim.intShr(head, 16), 0xFFFF)
+    let flags = Prim.intShr(head, 16) & 0xFFFF
     if filter == Sys.filterUser() {
         Prim.atomicStore(signals, wakePendingAt, 0)
         return count
@@ -893,8 +893,8 @@ fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
     }
     if filter == Sys.filterVnode() { return push(count, token, pollReadable) }
     var value = if filter == Sys.filterRead() { pollReadable } else { pollWritable }
-    if Prim.intAnd(flags, Sys.evEof) != 0 { value = Prim.intOr(value, pollEof) }
-    if Prim.intAnd(flags, Sys.evError) != 0 { value = Prim.intOr(value, pollError) }
+    if flags & Sys.evEof != 0 { value = value | pollEof }
+    if flags & Sys.evError != 0 { value = value | pollError }
     push(count, token, value)
 }
 
@@ -902,7 +902,7 @@ fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
 -- break, whose `eventfd` is read to empty it, which makes it stop reporting.
 fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
     let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 16))
-    let events = Prim.intAnd(Prim.loadI64(event, 0), 0xFFFF_FFFF)
+    let events = Prim.loadI64(event, 0) & 0xFFFF_FFFF
     let token = Prim.loadI64(event, 8)
     if token == 0 {
         let _ = Libc.read(Prim.atomicLoad(poller, wakeDescriptorAt), Prim.ptrAdd(scratch, drainAt), 8)
@@ -910,12 +910,12 @@ fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
         return count
     }
     var value = 0
-    if Prim.intAnd(events, Sys.epollIn) != 0 { value = Prim.intOr(value, pollReadable) }
-    if Prim.intAnd(events, Sys.epollOut) != 0 { value = Prim.intOr(value, pollWritable) }
-    if Prim.intAnd(events, Prim.intOr(Sys.epollHup, Sys.epollRdHup)) != 0 {
-        value = Prim.intOr(value, pollEof)
+    if events & Sys.epollIn != 0 { value = value | pollReadable }
+    if events & Sys.epollOut != 0 { value = value | pollWritable }
+    if events & (Sys.epollHup | Sys.epollRdHup) != 0 {
+        value = value | pollEof
     }
-    if Prim.intAnd(events, Sys.epollErr) != 0 { value = Prim.intOr(value, pollError) }
+    if events & Sys.epollErr != 0 { value = value | pollError }
     push(count, token, value)
 }
 

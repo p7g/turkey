@@ -1,8 +1,9 @@
-export (readBytes, readText, writeText, listed, filesUnder, isDirectory, exists, age, parentOf)
+export (readBytes, readText, writeText, writeOut, listed, filesUnder, isDirectory, exists, age, parentOf)
 
 -- The file operations the harness needs. Every failure here ends up as a
 -- harness error, so each carries the path it was about.
 
+import Hash.SHA256 as SHA256
 import System.File as File
 import System.File (FileKind(..), Stat(..))
 import System.IO as IO
@@ -74,4 +75,35 @@ fun collect(directory : String, prefix : String, out : Vec String) -> Either Som
         }
     }
     Right(())
+}
+
+-- Returns the directory under `work` that holds `files`, each (name, text),
+-- writing it first if it is not there yet, and marks it used.
+--
+-- The directory is named by a hash of the files. It is filled in a fresh one
+-- and renamed into place, so concurrent runs that share the cache share it
+-- too, and none of them sees it half-written. A run rewrites the `used` file
+-- of every directory it finds, and `Cache.evict` removes those unused for a
+-- week.
+fun writeOut(work : String, files : Array (String, String)) -> Either SomeError String {
+    -- Each length comes before its text, so that no two sets of files hash
+    -- the same by moving text from one file to the next.
+    let parts = Array.map(files, \_.0 + "\u{0}" + Int.toString(String.byteLength(_.1)) + "\u{0}" + _.1)
+    let directory = work + "/" + SHA256.ofText(String.join(parts, ""))
+    if exists(directory) {
+        writeText(directory + "/used", "")?
+        return Right(directory)
+    }
+    Error.promote(File.createDirAll(work))?
+    let staging = Error.promote(File.temporaryDir("turkey-case-"))?
+    for (name, text) in files { writeText(staging + "/" + name, text)? }
+    writeText(staging + "/used", "")?
+    -- A rename that finds the directory there lost a race to a run writing
+    -- the same files, and the directory that won is as good.
+    let renamed = File.rename(staging, directory)
+    let _ = File.removeTree(staging)
+    if let Left(e) = renamed {
+        if !exists(directory) { return Left(fail(e)) }
+    }
+    Right(directory)
 }

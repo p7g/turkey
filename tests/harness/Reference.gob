@@ -1,4 +1,4 @@
-export (cases, message)
+export (cases, message, diagnostic, panicMessage)
 
 -- Cases from the language reference, `docs/ref/`: every Turkey example in
 -- every chapter, checked against what the chapter says of it.
@@ -32,14 +32,8 @@ export (cases, message)
 -- a harness error.
 --
 -- Each example is written out as `Main.gob` beside its modules, in a
--- directory of its own under `WORK` named by a hash of those files. The
--- directory is filled in a fresh one and renamed into place, so concurrent
--- runs that share the cache share it too, and none of them sees it
--- half-written. A run rewrites the `used` file of every directory it finds,
--- and `Cache.evict` removes those unused for a week.
+-- directory of its own under `WORK` (`Files.writeOut`).
 
-import Hash.SHA256 as SHA256
-import System.File as File
 import Case (Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Ending(..), Observed(..))
 import Files as Files
 
@@ -113,11 +107,12 @@ fun broken(name : String, directory : String, entry : String, why : String) -> C
     xfail = None,
     problem = Some(why),
     checkOnly = False,
+    environment = [],
 }
 
 fun example(work : String, name : String, e : Example) -> Case {
     let files = [("Main.gob", e.source)] + e.modules
-    let written = writeOut(work, files)
+    let written = Files.writeOut(work, files)
     let quoted = match e.mode {
         Fails(text) | Panic(text) -> Some(text)
         Run | Check -> None
@@ -142,32 +137,8 @@ fun example(work : String, name : String, e : Example) -> Case {
             Check | Fails(_) -> True
             Run | Panic(_) -> False
         },
+        environment = [],
     }
-}
-
--- Returns the directory under `work` that holds `files`, each (name, text),
--- writing it first if it is not there yet, and marks it used.
-fun writeOut(work : String, files : Array (String, String)) -> Either SomeError String {
-    -- Each length comes before its text, so that no two sets of files hash
-    -- the same by moving text from one file to the next.
-    let parts = Array.map(files, \_.0 + "\u{0}" + Int.toString(String.byteLength(_.1)) + "\u{0}" + _.1)
-    let directory = work + "/" + SHA256.ofText(String.join(parts, ""))
-    if Files.exists(directory) {
-        Files.writeText(directory + "/used", "")?
-        return Right(directory)
-    }
-    Error.promote(File.createDirAll(work))?
-    let staging = Error.promote(File.temporaryDir("turkey-reference-"))?
-    for (name, text) in files { Files.writeText(staging + "/" + name, text)? }
-    Files.writeText(staging + "/used", "")?
-    -- A rename that finds the directory there lost a race to a run writing
-    -- the same files, and the directory that won is as good.
-    let renamed = File.rename(staging, directory)
-    let _ = File.removeTree(staging)
-    if let Left(e) = renamed {
-        if !Files.exists(directory) { return Left(fail(e)) }
-    }
-    Right(directory)
 }
 
 -- -- reading a chapter -----------------------------------------------------------------

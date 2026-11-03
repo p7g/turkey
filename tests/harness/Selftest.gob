@@ -6,18 +6,25 @@ export (cases, check)
 -- `--bless` must do with it. The chapters in `selftest/reference/` are
 -- reference examples, named like any other (`pass.md:13`), and each way a
 -- chapter can be malformed has one there, listed with the reason it must be
--- given. A harness that called a crash a wrong answer,
--- let an unknown directive pass, or blessed a crash would otherwise go
--- unnoticed, since its reports on the real corpus are all anyone reads.
+-- given. The archives in `selftest/cases/` hold archive cases, each named
+-- for its outcome by its archive (`pass.cases::stdout`), and each way an
+-- archive can be malformed has one there, listed likewise. A harness that
+-- called a crash a wrong answer, let an unknown directive pass, or blessed a
+-- crash would otherwise go unnoticed, since its reports on the real corpus
+-- are all anyone reads.
 --
--- Bless is checked by its decisions alone, which are pure: nothing here
--- writes a golden.
+-- Bless is checked by its decisions, which are pure, and by the edits it
+-- makes to copies of two archives under the cache. Nothing here writes a
+-- golden in the repository.
 
+import Archive (Edit(..))
+import Archive as Archive
 import Bless (Blessing(..), Guard(..))
 import Bless as Bless
 import Case (Case(..), Expected(..), Golden(..), Outcome(..), Result(..), Finish(..), Ending(..),
              Observed(..), Recorded(..))
 import Case as Case
+import Diff as Diff
 import Files as Files
 import Programs as Programs
 import Reference as Reference
@@ -30,8 +37,9 @@ let prefixes = [
 ]
 
 -- What bless must do with a case: leave it, write exactly these files (by
--- base name, in order), keep it deliberately, or refuse it by this guard.
-type Wanted = Same | Writes(Array String) | Kept | Refused(Guard)
+-- base name, in order), edit exactly these sections of its archive (in
+-- order), keep it deliberately, or refuse it by this guard.
+type Wanted = Same | Writes(Array String) | Edited(Array String) | Kept | Refused(Guard)
 
 -- What bless must do with each case, by the case's base name. Every case is
 -- listed, and every guard is reached by at least one, except those that no
@@ -69,6 +77,57 @@ let blessings = [
     ("pass.md:42", Kept),
     ("pass.md:55", Kept),
     ("pass.md:71", Kept),
+    ("fail.cases::diagnostic", Refused(Diagnostic)),
+    ("fail.cases::header_line", Refused(Unholdable)),
+    ("fail.cases::matrix_agrees[X=1]", Edited(["stdout"])),
+    ("fail.cases::matrix_agrees[X=2]", Edited(["stdout"])),
+    ("fail.cases::matrix_disagrees[X=1]", Refused(Divergent)),
+    ("fail.cases::matrix_disagrees[X=2]", Refused(Divergent)),
+    ("fail.cases::missing_streams", Edited(["stdout", "stderr"])),
+    ("fail.cases::newly_empty", Refused(NewlyEmpty)),
+    ("fail.cases::no_newline", Refused(Unholdable)),
+    ("fail.cases::wrong_dump", Edited(["types"])),
+    ("fail.cases::wrong_error", Edited(["error"])),
+    ("fail.cases::wrong_panic", Edited(["panic"])),
+    ("fail.cases::wrong_stdout", Edited(["stdout"])),
+    ("fail_unterminated.cases::missing_stdout", Edited(["stdout"])),
+    ("harness_error_case_name.cases:3", Refused(Unrunnable)),
+    ("harness_error_directive_before_case.cases:2", Refused(Unrunnable)),
+    ("harness_error_directives.cases::check_panic", Refused(Unrunnable)),
+    ("harness_error_directives.cases::check_stdout", Refused(Unrunnable)),
+    ("harness_error_directives.cases::check_value", Refused(Unrunnable)),
+    ("harness_error_directives.cases::error_section", Refused(Unrunnable)),
+    ("harness_error_directives.cases::error_stderr", Refused(Unrunnable)),
+    ("harness_error_directives.cases::matrix_repeat", Refused(Unrunnable)),
+    ("harness_error_directives.cases::matrix_twice[X=1,X=2]", Refused(Unrunnable)),
+    ("harness_error_directives.cases::matrix_usage", Refused(Unrunnable)),
+    ("harness_error_directives.cases::panic_section", Refused(Unrunnable)),
+    ("harness_error_directives.cases::panic_stderr", Refused(Unrunnable)),
+    ("harness_error_directives.cases::two_outcomes", Refused(Unrunnable)),
+    ("harness_error_directives.cases::unknown", Refused(Unrunnable)),
+    ("harness_error_duplicate_case.cases:6", Refused(Unrunnable)),
+    ("harness_error_duplicate_section.cases:7", Refused(Unrunnable)),
+    ("harness_error_header_in_source.cases:6", Refused(Unrunnable)),
+    ("harness_error_no_cases.cases", Refused(Unrunnable)),
+    ("harness_error_no_main.cases:3", Refused(Unrunnable)),
+    ("harness_error_section_before_case.cases:3", Refused(Unrunnable)),
+    ("harness_error_shared_after_case.cases:6", Refused(Unrunnable)),
+    ("harness_error_text_before_case.cases:3", Refused(Unrunnable)),
+    ("harness_error_text_in_preamble.cases:4", Refused(Unrunnable)),
+    ("harness_error_unknown_header.cases:6", Refused(Unrunnable)),
+    ("pass.cases::check", Same),
+    ("pass.cases::dumps", Same),
+    ("pass.cases::error", Same),
+    ("pass.cases::exit", Same),
+    ("pass.cases::matrix[X=1,Y=a]", Same),
+    ("pass.cases::matrix[X=1,Y=b]", Same),
+    ("pass.cases::matrix[X=2,Y=a]", Same),
+    ("pass.cases::matrix[X=2,Y=b]", Same),
+    ("pass.cases::modules", Same),
+    ("pass.cases::panic", Same),
+    ("pass.cases::silent", Same),
+    ("pass.cases::stderr", Same),
+    ("pass.cases::stdout", Same),
 ]
 
 -- The reason each malformed reference chapter must be given, by its case's
@@ -79,7 +138,36 @@ let malformed = [
     ("harness_error_trailing_module.md:4", "'module' blocks with no example after them"),
     ("harness_error_unknown_directive.md:3", "unknown directive 'runs'"),
     ("harness_error_unmarked.md:3", "a kotlin fence with no directive"),
+    ("harness_error_case_name.cases:3", "'a[b]' is not a case name"),
+    ("harness_error_directive_before_case.cases:2", "a directive before the first case"),
+    ("harness_error_directives.cases::check_panic", "'check' never runs the program, so it cannot panic"),
+    ("harness_error_directives.cases::check_stdout", "so it prints nothing to stdout"),
+    ("harness_error_directives.cases::check_value", "'check' takes no value"),
+    ("harness_error_directives.cases::error_section", "an 'error' section needs '--@ error'"),
+    ("harness_error_directives.cases::error_stderr", "compares its 'error' section, not 'stderr'"),
+    ("harness_error_directives.cases::matrix_repeat", "'matrix' lists '1' twice"),
+    ("harness_error_directives.cases::matrix_twice[X=1,X=2]", "two 'matrix' lines set 'X'"),
+    ("harness_error_directives.cases::matrix_usage", "'matrix' takes NAME=V1,V2"),
+    ("harness_error_directives.cases::panic_section", "a 'panic' section needs '--@ panic'"),
+    ("harness_error_directives.cases::panic_stderr", "stderr is not compared for a case marked '--@ panic'"),
+    ("harness_error_directives.cases::two_outcomes", "more than one of 'exit', 'panic' and 'error'"),
+    ("harness_error_directives.cases::unknown", "unknown directive 'args'"),
+    ("harness_error_duplicate_case.cases:6", "two cases named 'x'"),
+    ("harness_error_duplicate_section.cases:7", "two 'stdout' sections"),
+    ("harness_error_header_in_source.cases:6", "unknown section 'note'"),
+    ("harness_error_no_cases.cases", "no cases in"),
+    ("harness_error_no_main.cases:3", "case 'x' has no Main.gob"),
+    ("harness_error_section_before_case.cases:3", "a section before the first case"),
+    ("harness_error_shared_after_case.cases:6", "'shared' after the first case"),
+    ("harness_error_text_before_case.cases:3", "text before the first case"),
+    ("harness_error_text_in_preamble.cases:4", "text before the case's first section"),
+    ("harness_error_unknown_header.cases:6", "unknown section 'output'"),
 ]
+
+-- The archives in `selftest/cases/`, by name, whose edits bless makes to a
+-- copy under the cache: the copy must then be byte for byte the committed
+-- `NAME.blessed` beside the archive.
+let blessedArchives = ["fail", "fail_unterminated"]
 
 -- The cases in `ROOT/tests/harness/selftest`, its reference chapters, a
 -- directory of chapters with no examples, and the one that crashes
@@ -92,6 +180,7 @@ fun cases(root : String, cache : String) -> Array Case {
     let prefix = "tests/harness/selftest"
     let examples = cache + "/reference"
     let found = Programs.discover(selftest, prefix)
+                + Archive.cases(selftest + "/cases", prefix + "/cases", cache + "/cases")
                 + Reference.cases(selftest + "/reference", prefix + "/reference", examples)
                 + Reference.cases(selftest + "/harness_error_no_examples", prefix + "/harness_error_no_examples",
                                   examples)
@@ -106,24 +195,29 @@ fun cases(root : String, cache : String) -> Array Case {
 
 -- Returns whether every case was given the outcome its name says and the
 -- blessing listed for it, every outcome was given to some case, every
--- malformed chapter was given its reason, and the refusal limit and the
--- guards on made-up results hold, printing what did not.
-fun check(ran : Array (Case, (Result, Blessing))) -> Bool {
-    let outcomes = checkOutcomes(ran)
-    let chapters = checkMalformed(ran)
-    let blessed = checkBlessings(ran)
-    let limited = checkLimit(Array.map(ran, _.1.1))
+-- malformed chapter and archive was given its reason, bless's archive edits
+-- make the bytes committed for them, and the refusal limit and the guards on
+-- made-up results hold, printing what did not. `decided` is each case's
+-- blessing once a matrix case's expansions are merged (`Bless.merged`).
+--
+-- Writes copies of archives under `cache`.
+fun check(cache : String, results : Array (Case, Result), decided : Array (Case, Blessing)) -> Bool {
+    let outcomes = checkOutcomes(results)
+    let reasons = checkMalformed(results)
+    let blessed = checkBlessings(decided)
+    let edited = checkArchiveEdits(cache, decided)
+    let limited = checkLimit(Array.map(decided, _.1))
     let own = checkOwnError()
     let dumped = checkDumpGuards()
-    let ok = outcomes && chapters && blessed && limited && own && dumped
+    let ok = outcomes && reasons && blessed && edited && limited && own && dumped
     print(if ok { "selftest: every outcome classified and every blessing decided correctly" }
           else { "selftest: FAILED" })
     ok
 }
 
-fun checkOutcomes(ran : Array (Case, (Result, Blessing))) -> Bool {
+fun checkOutcomes(ran : Array (Case, Result)) -> Bool {
     var ok = True
-    for (c, (r, _)) in ran {
+    for (c, r) in ran {
         let got = r.outcome
         match wanted(baseName(c.name)) {
             None -> {
@@ -138,7 +232,7 @@ fun checkOutcomes(ran : Array (Case, (Result, Blessing))) -> Bool {
         }
     }
     for (_, o) in prefixes {
-        if !Iterator.any(ran, _.1.0.outcome == o) {
+        if !Iterator.any(ran, _.1.outcome == o) {
             print("selftest: no case was given " + Case.outcomeName(o))
             ok = False
         }
@@ -146,7 +240,7 @@ fun checkOutcomes(ran : Array (Case, (Result, Blessing))) -> Bool {
     ok
 }
 
-fun checkMalformed(ran : Array (Case, (Result, Blessing))) -> Bool {
+fun checkMalformed(ran : Array (Case, Result)) -> Bool {
     var ok = True
     for (base, reason) in malformed {
         match Iterator.find(ran, \baseName(_.0.name) == base) {
@@ -154,7 +248,7 @@ fun checkMalformed(ran : Array (Case, (Result, Blessing))) -> Bool {
                 print("selftest: there is no case " + base)
                 ok = False
             }
-            Some((c, (r, _))) -> if !String.contains(r.why, reason) {
+            Some((c, r)) -> if !String.contains(r.why, reason) {
                 print("selftest: " + c.name + " should be a harness error for '" + reason + "', was "
                       + Case.outcomeName(r.outcome) + " (" + r.why + ")")
                 ok = False
@@ -171,9 +265,9 @@ fun wanted(base : String) -> Option Outcome {
     None
 }
 
-fun checkBlessings(ran : Array (Case, (Result, Blessing))) -> Bool {
+fun checkBlessings(decided : Array (Case, Blessing)) -> Bool {
     var ok = True
-    for (c, (_, b)) in ran {
+    for (c, b) in decided {
         let base = baseName(c.name)
         match Iterator.find(blessings, _.0 == base) {
             None -> {
@@ -188,6 +282,47 @@ fun checkBlessings(ran : Array (Case, (Result, Blessing))) -> Bool {
         }
     }
     ok
+}
+
+-- Bless's edits to each of `blessedArchives`, made to a copy of it under
+-- `cache`, must leave the copy exactly as the committed `NAME.blessed` is.
+fun checkArchiveEdits(cache : String, decided : Array (Case, Blessing)) -> Bool {
+    let edits = Bless.collected(Array.map(decided, _.1))
+    var ok = True
+    for name in blessedArchives {
+        let file = "/" + name + ".cases"
+        let made = Option.fold(Iterator.find(edits, \String.endsWith(_.0, file)), [], _.1)
+        if len(made) == 0 {
+            print("selftest: bless would make no edits to " + name + ".cases")
+            ok = False
+            continue
+        }
+        let original = made[0].path
+        let copy = cache + "/selftest/blessed/" + name + ".cases"
+        match blessCopy(original, copy, made) {
+            Left(e) -> {
+                print("selftest: cannot bless a copy of " + name + ".cases: " + Error.describe(e))
+                ok = False
+            }
+            Right((got, wanted)) -> if got != wanted {
+                print("selftest: bless edits " + name + ".cases into something other than " + name + ".blessed:")
+                write(Diff.unified(wanted, got, 200))
+                ok = False
+            }
+        }
+    }
+    ok
+}
+
+-- Copies `original` to `copy`, makes `edits` to the copy, and returns what
+-- the copy then holds and what `NAME.blessed` beside `original` holds.
+fun blessCopy(original : String, copy : String, edits : Array Edit) -> Either SomeError (String, String) {
+    Files.writeText(copy, Files.readText(original)?)?
+    let retargeted = Array.map(edits, fun(e) = Edit { path = copy, section = e.section, from = e.from, to = e.to,
+                                                      text = e.text })
+    Archive.rewrite(copy, retargeted)?
+    let wanted = Option.unwrapOr(String.stripSuffix(original, ".cases"), original) + ".blessed"
+    Right((Files.readText(copy)?, Files.readText(wanted)?))
 }
 
 -- The corpus refuses more cases than the limit, so blessing all of it writes
@@ -220,7 +355,7 @@ fun madeUp(expected : Expected, dumps : Array (String, String)) -> Case = Case {
     name = "(made up)/case.gob", directory = "/nonexistent", entry = "case.gob",
     sources = ["case.gob"], golden = OnDisk("/nonexistent/case.expected"), dumps = dumps,
     expected = expected, timeout = None, requires = [], xfail = None, problem = None,
-    checkOnly = False,
+    checkOnly = False, environment = [],
 }
 
 -- The guard on an error that `boot` reports about itself, which no committed
@@ -248,11 +383,11 @@ fun checkDumpGuards() -> Bool {
     let c = madeUp(Exits(0), [("types", "/nonexistent/case.types")])
     let recorded = Recorded { expected = Some("hello\n"), dumps = ["main : fun() -> Unit\n"] }
     let tried = [
-        ((Panicked(101), "panic: no\n"), Refused(Crash)),
-        ((Killed(11), ""), Refused(Crash)),
-        ((Expired, ""), Refused(Overrun)),
-        ((Returned(0), ""), Refused(NewlyEmpty)),
-        ((Returned(0), "main : fun() -> Unit\n"), Same),
+        ((Panicked(101), "", "panic: no\n"), Refused(Crash)),
+        ((Killed(11), "", ""), Refused(Crash)),
+        ((Expired, "", ""), Refused(Overrun)),
+        ((Returned(0), "", ""), Refused(NewlyEmpty)),
+        ((Returned(0), "main : fun() -> Unit\n", ""), Same),
     ]
     var ok = True
     for (dump, w) in tried {
@@ -278,6 +413,7 @@ fun finishName(f : Finish) -> String = match f {
 fun shape(b : Blessing) -> String = match b {
     Unchanged -> "leave"
     Write(files) -> "write " + String.join(Array.map(files, \baseName(_.0)), ", ")
+    Edits(edits) -> "edit " + String.join(Array.map(edits, _.section), ", ")
     Keep(_) -> "keep"
     Refuse(g, _) -> "refuse (" + Bless.guardName(g) + ")"
 }
@@ -285,6 +421,7 @@ fun shape(b : Blessing) -> String = match b {
 fun wantedShape(w : Wanted) -> String = match w {
     Same -> "leave"
     Writes(files) -> "write " + String.join(files, ", ")
+    Edited(sections) -> "edit " + String.join(sections, ", ")
     Kept -> "keep"
     Refused(g) -> "refuse (" + Bless.guardName(g) + ")"
 }
@@ -292,7 +429,7 @@ fun wantedShape(w : Wanted) -> String = match w {
 fun why(b : Blessing) -> String = match b {
     Keep(reason) -> ": " + reason
     Refuse(_, reason) -> ": " + reason
-    Unchanged | Write(_) -> ""
+    Unchanged | Write(_) | Edits(_) -> ""
 }
 
 fun baseName(path : String) -> String = Option.fold(String.rsplitOnce(path, "/"), path, _.1)

@@ -7,8 +7,9 @@ export (Cache(..), Compiled(..), open, compile, evict, panicked)
 -- bytes; the library, by name and contents, since a library module the
 -- compiler itself never uses is in no byte of `boot`, but a program that
 -- imports it compiles differently when it changes; the toolchain's identity
--- (`Toolchain.identity`); the arguments `boot` is given; and each of the
--- case's sources by name and contents. Running is not cached: it is what is
+-- (`Toolchain.identity`); the arguments `boot` is given; the case's own
+-- environment, which `boot` runs under; and each of the case's sources by
+-- name and contents. Running is not cached: it is what is
 -- being tested.
 --
 -- **An entry is published whole.** It is filled in a fresh directory of its
@@ -21,9 +22,9 @@ export (Cache(..), Compiled(..), open, compile, evict, panicked)
 --
 -- **Eviction runs when the harness starts.** A hit rewrites the entry's
 -- `used` file, and an entry whose `used` is 7 days old is removed, as is a
--- reference example's directory under `ROOT/reference/` (`Reference`). Of the
--- builds `scripts/test.sh` keeps (`boot/`, `stage1/`, `harness/`), all but the
--- 8 most recently used are removed. Nothing used in the last hour is ever
+-- directory of a case's files under `ROOT/reference/` or `ROOT/cases/`
+-- (`Files.writeOut`). Of the builds `scripts/test.sh` keeps (`boot/`,
+-- `stage1/`, `harness/`), all but the 8 most recently used are removed. Nothing used in the last hour is ever
 -- removed, so a concurrent session never loses what it is using.
 
 import Hash.SHA256 as SHA256
@@ -73,6 +74,7 @@ fun feed(h : SHA256.SHA256, directory : String, names : Array String) -> Either 
 fun keyOf(cache : Cache, c : Case, argv : Array String) -> Either SomeError String {
     let h = SHA256.new()
     SHA256.updateText(h, cache.base + "\u{0}" + String.join(argv, " ") + "\u{0}")
+    for (name, value) in c.environment { SHA256.updateText(h, name + "=" + value + "\u{0}") }
     feed(h, c.directory, c.sources)?
     Right(SHA256.hex(SHA256.finish(h)))
 }
@@ -151,7 +153,7 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
     let output = if c.checkOnly { [] } else { ["-o", object] }
     let argv = t.run + [t.boot] + flags + output + [c.entry]
     let limit = Toolchain.limit(t, 300)
-    let compiled = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
+    let compiled = match Process.run(Toolchain.caseCommand(t, c, argv), Some(limit)) {
         Left(e) -> return Crashed("boot did not start: " + Error.message(e), "")
         Right(out) -> out
     }
@@ -210,10 +212,12 @@ fun evict(root : String) -> Unit {
             let _ = File.removeTree(path)
         }
     }
-    let examples = root + "/reference"
-    for name in Files.listed(examples) {
-        let path = examples + "/" + name
-        if olderThan(path + "/used", week) { let _ = File.removeTree(path) }
+    for kind in ["reference", "cases"] {
+        let written = root + "/" + kind
+        for name in Files.listed(written) {
+            let path = written + "/" + name
+            if olderThan(path + "/used", week) { let _ = File.removeTree(path) }
+        }
     }
     for kind in ["boot", "stage1", "harness"] {
         let directory = root + "/" + kind

@@ -91,8 +91,10 @@ let cellKind : Int = 5
 let regionBytes : Int = 0x10000
 -- Clears the offset within a region, leaving its base.
 let regionMask : Int = -0x10000
-let regionWords : Int = 32
-let regionClasses : Int = 22
+-- The words of each slot bitmap: 4096 bits, which the 4028 slots of the
+-- 16-byte class need.
+let regionWords : Int = 64
+let regionClasses : Int = 26
 let regionNext : Int = 0
 let regionAvailableNext : Int = 8
 let regionSlotSize : Int = 16
@@ -103,11 +105,13 @@ let regionLive : Int = 40
 let regionSearchWord : Int = 44
 let regionSizeClass : Int = 48
 let regionAllocated : Int = 56
-let regionMarked : Int = 312
+let regionMarked : Int = 568
 -- The region's size table, or null: see `sizesKept`.
-let regionSizes : Int = 568
--- Where the slots begin. Eight-byte alignment is all an object needs.
-let regionData : Int = 576
+let regionSizes : Int = 1080
+-- Where the slots begin. Eight-byte alignment is all an object needs, so
+-- every slot size is a multiple of 8 and the smallest is 16: the header and
+-- one word.
+let regionData : Int = 1088
 
 -- `RootFrame`, the shadow stack -- the globals' frame, and any a C caller
 -- registers -- is a chain of these: the previous frame, a NUL-terminated
@@ -178,26 +182,26 @@ var bytesSince : Int = 0
 
 -- What a worker's cursors have taken since it was last folded into the three
 -- counts above, by `retire` or when the worker took a region: objects, objects since the collection, and their bytes,
--- in the last three words of its record (`Prim.processState`, from 1728).
+-- in the last three words of its record (`Prim.processState`, from 1984).
 -- Kept per worker so that a refill from a region the cursor owns touches
 -- nothing shared and takes no lock.
 fun localAdd(objects : Int, bytes : Int) -> Unit {
     let w = Prim.processState()
-    Prim.storeI64(w, 1728, plus(Prim.loadI64(w, 1728), objects))
-    Prim.storeI64(w, 1736, plus(Prim.loadI64(w, 1736), objects))
-    Prim.storeI64(w, 1744, plus(Prim.loadI64(w, 1744), bytes))
+    Prim.storeI64(w, 1984, plus(Prim.loadI64(w, 1984), objects))
+    Prim.storeI64(w, 1992, plus(Prim.loadI64(w, 1992), objects))
+    Prim.storeI64(w, 2000, plus(Prim.loadI64(w, 2000), bytes))
 }
 
-fun localBytes() -> Int = Prim.loadI64(Prim.processState(), 1744)
+fun localBytes() -> Int = Prim.loadI64(Prim.processState(), 2000)
 
 -- Fold worker `w`'s counts into the heap's and zero them.
 fun localFold(w : Prim.Ptr) -> Unit {
-    heapCount = plus(heapCount, Prim.loadI64(w, 1728))
-    allocationsSince = plus(allocationsSince, Prim.loadI64(w, 1736))
-    bytesSince = plus(bytesSince, Prim.loadI64(w, 1744))
-    Prim.storeI64(w, 1728, 0)
-    Prim.storeI64(w, 1736, 0)
-    Prim.storeI64(w, 1744, 0)
+    heapCount = plus(heapCount, Prim.loadI64(w, 1984))
+    allocationsSince = plus(allocationsSince, Prim.loadI64(w, 1992))
+    bytesSince = plus(bytesSince, Prim.loadI64(w, 2000))
+    Prim.storeI64(w, 1984, 0)
+    Prim.storeI64(w, 1992, 0)
+    Prim.storeI64(w, 2000, 0)
 }
 -- The bytes of the slots the last sweep kept: a large object's whole region.
 var liveBytes : Int = 0
@@ -484,8 +488,9 @@ fun tableRemove(region : Prim.Ptr) -> Unit {
 
 -- -- size classes and cursors -----------------------------------------------------------
 --
--- Size classes are 32 to 256 bytes in steps of 16, then powers of two up to
--- half a region. A request above that is large and gets a region of its own.
+-- Size classes are 16 to 64 bytes in steps of 8, 80 to 256 in steps of 16,
+-- then powers of two up to half a region. A request above that is large and
+-- gets a region of its own.
 --
 -- Allocation takes slots a bitmap word at a time. A class's cursor owns one
 -- region, taken off the class's available list, and holds the free slots of
@@ -524,24 +529,25 @@ let cursorBytes : Int = 64
 -- The largest object a size class holds: half a region.
 let smallBytes : Int = 32768
 
--- Each small object's class, indexed by its size rounded up to 16 and divided
--- by 16. Every class boundary is a multiple of 16, so every size in one step
+-- Each small object's class, indexed by its size rounded up to 8 and divided
+-- by 8. Every class boundary is a multiple of 8, so every size in one step
 -- has the same class.
 var classes : Prim.Ptr = classTable()
 
 fun classTable() -> Prim.Ptr {
-    let table = zeroed(2049)
-    for var step = 1; step <= 2048; step = step + 1 {
-        Prim.storeI8(table, step, Prim.byteFromInt(classFor(16 * step)))
+    let table = zeroed(4097)
+    for var step = 1; step <= 4096; step = step + 1 {
+        Prim.storeI8(table, step, Prim.byteFromInt(classFor(8 * step)))
     }
     table
 }
 
 fun classFor(bytes : Int) -> Int {
-    if bytes <= 32 { return 0 }
-    if bytes <= 256 { return Prim.intShr(bytes + 15, 4) - 2 }
+    if bytes <= 16 { return 0 }
+    if bytes <= 64 { return Prim.intShr(bytes + 7, 3) - 2 }
+    if bytes <= 256 { return Prim.intShr(bytes + 15, 4) + 2 }
     var classSize = 256
-    var sizeClass = 14
+    var sizeClass = 18
     while classSize < bytes {
         classSize = classSize * 2
         sizeClass = sizeClass + 1
@@ -550,16 +556,18 @@ fun classFor(bytes : Int) -> Int {
 }
 
 fun classSlot(sizeClass : Int) -> Int =
-    if sizeClass < 15 { 32 + 16 * sizeClass } else { Prim.intShl(256, sizeClass - 14) }
+    if sizeClass < 7 { 16 + 8 * sizeClass }
+    else if sizeClass < 19 { 64 + 16 * (sizeClass - 6) }
+    else { Prim.intShl(256, sizeClass - 18) }
 
 -- The class of an object of at most `smallBytes` bytes.
 fun classOf(size : Int) -> Int =
-    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 15), 4)))
+    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 7), 3)))
 
 -- Whether `size`, unsigned, is small enough for the fast path: a class-table
--- step below 2048. The few sizes just under `smallBytes` it turns away are
+-- step below 4096. The few sizes just under `smallBytes` it turns away are
 -- still small, and `allocateSlow` gives them their class.
-fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 15), 15) == 0
+fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 7), 15) == 0
 
 fun cursorOf(sizeClass : Int) -> Prim.Ptr = cursorIn(Prim.processState(), sizeClass)
 
@@ -761,8 +769,8 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
 
 -- The largest object a region can be made for: an `Int` that the region's
 -- own fields and the rounding up to a whole region all fit beside.
--- 2^63 - 1 - 576 - 65535.
-let largest : Int = 9223372036854709696
+-- 2^63 - 1 - 1088 - 65535.
+let largest : Int = 9223372036854709184
 
 -- `value` if it is a live object, or null if it is not: not into a region,
 -- not at a slot, or at a free slot.
@@ -1189,7 +1197,7 @@ fun claim(region : Prim.Ptr, at : Int, mask : Int, object : Prim.Ptr, shared : B
         }
         if Prim.atomicCas(region, at, marks, Prim.intOr(marks, mask)) == marks {
             -- The count is the low half of the word at `regionLive`, and
-            -- never carries into the high half: a region has at most 2048
+            -- never carries into the high half: a region has at most 4096
             -- slots.
             let _ = Prim.atomicAdd(region, regionLive, 1)
             break

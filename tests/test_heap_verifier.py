@@ -37,7 +37,7 @@ typedef struct Region {
     struct Region *next, *available_next;
     uint64_t slot_size, reserved;
     uint32_t capacity, used, live, search_word, size_class;
-    uint64_t allocated[32], marked_slots[32];
+    uint64_t allocated[64], marked_slots[64];
     uint64_t *sizes;
     unsigned char data[];
 } Region;
@@ -54,9 +54,9 @@ typedef struct Object { Header header; uint64_t slots[]; } Object;
 typedef struct Array { Header header; int64_t length; unsigned char elements[]; } Array;
 typedef struct Entry { uintptr_t retaddr; int64_t count; const int64_t *offsets; } Entry;
 _Static_assert(sizeof(Header) == 8, "header");
-_Static_assert(offsetof(Region, marked_slots) == 312, "marked slots");
-_Static_assert(offsetof(Region, sizes) == 568, "size table");
-_Static_assert(offsetof(Region, data) == 576, "region data");
+_Static_assert(offsetof(Region, marked_slots) == 568, "marked slots");
+_Static_assert(offsetof(Region, sizes) == 1080, "size table");
+_Static_assert(offsetof(Region, data) == 1088, "region data");
 
 static Region *regions(void) { return turkey_heap_regions(); }
 static Region **available(void) { return turkey_heap_available(); }
@@ -184,8 +184,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "size")) *size_of(parent) = UINT64_MAX;
     /* An object allocated in the wrong size class: what the verifier would
        see if generated code's copy of the class rule disagreed with the
-       heap's. 72 bytes take an 80-byte slot, and 24 would take a 32-byte
-       one. */
+       heap's. 72 bytes take an 80-byte slot, and 24 bytes a 24-byte one. */
     else if (!strcmp(which, "wrong-class")) {
         held[2] = turkey_object_new(1, 0, 64, 0);
         *size_of(held[2]) = 24;
@@ -195,13 +194,17 @@ int main(int argc, char **argv) {
         held[2] = turkey_object_new(1, 0, 40000, 0);
         *size_of(held[2]) = 24;
     }
-    else if (!strcmp(which, "short-size")) *size_of(parent) = 8;
+    /* Too short for its eleven traced words, in the size class it has. */
+    else if (!strcmp(which, "short-size")) {
+        held[2] = turkey_object_new(1, 0, 88, 11);
+        *size_of(held[2]) = 88;
+    }
     else if (!strcmp(which, "unaligned-size")) *size_of(parent) = 20;
     else if (!strcmp(which, "kind")) parent->header.kind = 99;
     else if (!strcmp(which, "negative-length")) child->length = -1;
     else if (!strcmp(which, "huge-length")) child->length = INT64_MAX;
     else if (!strcmp(which, "length")) child->length = 3;
-    else if (!strcmp(which, "array-size")) *size_of(child) = 32;
+    else if (!strcmp(which, "array-size")) *size_of(child) = 24;
     else if (!strcmp(which, "descriptor")) parent->header.count = 3;
     else if (!strcmp(which, "huge-descriptor")) parent->header.count = UINT16_MAX;
     else if (!strcmp(which, "closure")) {
@@ -228,13 +231,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "region-reserved")) r->reserved = UINT64_MAX & ~(uint64_t)65535;
     else if (!strcmp(which, "region-capacity")) r->capacity = UINT32_MAX;
     else if (!strcmp(which, "region-count")) r->used++;
-    else if (!strcmp(which, "region-class")) r->size_class = 1;
+    else if (!strcmp(which, "region-class")) r->size_class++;
     else if (!strcmp(which, "region-sizes")) r->sizes = NULL;
     else if (!strcmp(which, "region-search")) r->search_word = 1;
     else if (!strcmp(which, "heap-count")) turkey_heap_set_objects(turkey_heap_objects() + 1);
     else if (!strcmp(which, "heap-bytes"))
         turkey_heap_set_region_bytes(turkey_heap_region_bytes() + 1);
-    else if (!strcmp(which, "bitmap")) r->allocated[31] |= UINT64_C(1) << 63;
+    else if (!strcmp(which, "bitmap")) r->allocated[63] |= UINT64_C(1) << 63;
     else if (!strcmp(which, "available")) available()[r->size_class] = NULL;
     else if (!strcmp(which, "available-cycle")) r->available_next = r;
     else if (!strcmp(which, "available-foreign")) available()[0] = (void *)1;

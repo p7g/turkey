@@ -191,7 +191,8 @@ alias for a function: `infix Combine (<>) = combine` puts `<>` in the group
   left to right, before the call: unlike `&&` and `||`, a declared operator
   never skips its right operand.
 * The operator may be used anywhere in the module that declares it, before the
-  declaration too. It is not visible in other modules.
+  declaration too. Other modules use it only by naming it in an import list
+  ([Operators in imports](modules.md#operators-in-imports)).
 * An operator is declared once per module, in one group.
 
 `infix` is a keyword only at the start of a top-level declaration, so it is

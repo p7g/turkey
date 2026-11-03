@@ -1,5 +1,6 @@
 export (
     Namespace(..), Scope(..), newScope, spaces, lookupName, conflictsIn,
+    isOperatorName,
     Module(..),
     Loader(..), newLoader, loadEntry,
     ownDeclared, ownScope,
@@ -48,7 +49,7 @@ import Turkey.Giblets as Giblets
 
 -- -- scopes -------------------------------------------------------------------------
 
--- One module's view of the world, in five namespaces.
+-- One module's view of the world, in six namespaces.
 --
 -- They have to be at least three. A value is lowercase while a type and a
 -- constructor are both uppercase, so `type Point = Point(Int, Int)` puts the
@@ -58,11 +59,24 @@ import Turkey.Giblets as Giblets
 -- Class identity is scoped even though the resulting instance table is global:
 -- two modules may define different classes with the same short name. The fifth
 -- is protocol-method identity, for the operator and iteration nodes the parser
--- writes itself; a method also appears in `values` for ordinary calls.
-type Namespace = ValueSpace | TypeSpace | ConstructorSpace | ClassSpace | MethodSpace
+-- writes itself; a method also appears in `values` for ordinary calls. The
+-- sixth is declared operators, from a symbol to the `infix` declaration it
+-- means, named `M#<>` after the module that declares it. An operator has no
+-- qualified spelling, and a use reads only the bare entries. The qualified
+-- ones, `Pipe.|>`, are there so that a diagnostic about an operator out of
+-- scope can name the import that would bring it.
+type Namespace
+    = ValueSpace
+    | TypeSpace
+    | ConstructorSpace
+    | ClassSpace
+    | MethodSpace
+    | OperatorSpace
 
-let namespaces =
-    [ValueSpace, TypeSpace, ConstructorSpace, ClassSpace, MethodSpace]
+let namespaces = [
+    ValueSpace, TypeSpace, ConstructorSpace, ClassSpace, MethodSpace,
+    OperatorSpace,
+]
 
 -- Array storage follows the same order as `spaces` and `namespaces`.
 fun namespaceIndex(space : Namespace) -> Int = match space {
@@ -71,6 +85,7 @@ fun namespaceIndex(space : Namespace) -> Int = match space {
     ConstructorSpace -> 2
     ClassSpace -> 3
     MethodSpace -> 4
+    OperatorSpace -> 5
 }
 
 fun conflictsIn(s : Scope, space : Namespace) -> Map String (Vec String) =
@@ -82,20 +97,21 @@ type Scope = Scope {
     cons    : Map String String,
     classes : Map String String,
     methods : Map String String,
+    operators : Map String String,
     var conflicts : Array (Map String (Vec String)),
 }
 
 fun newScope() -> Scope = Scope {
     values = Map.new(), types = Map.new(), cons = Map.new(),
-    classes = Map.new(), methods = Map.new(),
-    conflicts = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
+    classes = Map.new(), methods = Map.new(), operators = Map.new(),
+    conflicts = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
 }
 
--- The five, in a fixed order, so that a rule which applies to all of them is
+-- The six, in a fixed order, so that a rule which applies to all of them is
 -- written once. A `Map` is a reference, so these are the scope's own tables and
 -- not copies of them.
 fun spaces(s : Scope) -> Array (Map String String) =
-    [s.values, s.types, s.cons, s.classes, s.methods]
+    [s.values, s.types, s.cons, s.classes, s.methods, s.operators]
 
 fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
     ValueSpace -> s.values
@@ -103,6 +119,7 @@ fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
     ConstructorSpace -> s.cons
     ClassSpace -> s.classes
     MethodSpace -> s.methods
+    OperatorSpace -> s.operators
 }
 
 -- Conflicts retain declaration identities, not import spellings: two routes
@@ -869,6 +886,12 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
 
 fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
               out : Scope, strict : Bool) -> Unit {
+    if isOperatorName(item.name) {
+        return match exported(m, mine.operators, OperatorSpace, item, strict) {
+            Some(target) -> Map.put(out.operators, item.name, target)
+            None -> {}
+        }
+    }
     if isLower(item.name) {
         return match exported(m, mine.values, ValueSpace, item, strict) {
             Some(target) -> Map.put(out.values, item.name, target)
@@ -967,6 +990,13 @@ fun findName(s : Scope, space : Namespace, name : String, item : ExportItem,
 fun firstOf(a : Option v, b : Option v) -> Option v = match a {
     Some(_) -> a
     None -> b
+}
+
+-- Whether an export or import item names an operator. The parser writes
+-- `(<>)` as the item `<>`, and every other item begins with a letter.
+fun isOperatorName(name : String) -> Bool = match String.decode(name, String.start(name)) {
+    Some(c) -> !Char.isAsciiAlpha(c) && c != '_'
+    None -> False
 }
 
 fun isLower(name : String) -> Bool = match String.decode(name, String.start(name)) {
@@ -1070,7 +1100,7 @@ fun checkForeignPlacement(name : String, program : Program,
 
 -- -- what a module declares ---------------------------------------------------------
 
--- What a module declares, in each of `Scope`'s five namespaces, before class
+-- What a module declares, in each of `Scope`'s six namespaces, before class
 -- membership is taken into account.
 fun ownDeclared(program : Program) -> Array (Vec String) {
     let values = Vec.new(8)
@@ -1078,6 +1108,7 @@ fun ownDeclared(program : Program) -> Array (Vec String) {
     let cons = Vec.new(4)
     let classes = Vec.new(2)
     let methods = Vec.new(4)
+    let operators = Vec.new(2)
     for decl in program.decls {
         match decl {
             DStmt(s) -> match s.kind {
@@ -1107,10 +1138,10 @@ fun ownDeclared(program : Program) -> Array (Vec String) {
             }
             DInstance(_) -> {}
             DForeign(f) -> Vec.push(values, f.name)
-            DInfix(_) -> {}
+            DInfix(d) -> Vec.push(operators, d.op)
         }
     }
-    [values, types, cons, classes, methods]
+    [values, types, cons, classes, methods, operators]
 }
 
 -- The module's declarations with class members owned by their class.

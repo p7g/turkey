@@ -248,7 +248,7 @@ patterns: `let`, `var`, function and lambda parameters, and the pattern of a
 `for ... in` loop. Anything else there is an error that names a value the
 pattern would not match:
 
-<!-- error: this pattern is refutable; 'None' is not matched. Use 'if let' or 'match' -->
+<!-- error: this pattern does not match 'None'; use 'if let' or 'match' -->
 ```kotlin
 fun main() {
     let Some(x) = Vec.pop([1, 2, 3])

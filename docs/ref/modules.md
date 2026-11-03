@@ -128,7 +128,7 @@ import Width (width)
 let height = width / 2
 ```
 
-<!-- error: only functions may be mutually recursive -->
+<!-- error: only functions can be mutually recursive -->
 ```kotlin
 import Width (width)
 

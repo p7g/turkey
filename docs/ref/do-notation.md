@@ -379,7 +379,7 @@ automatically: write `Some(x)`, `Right(x)` or `pure(x)`, not `x`. This keeps
 the meaning of an ordinary expression the same whether or not a `?` appears
 earlier in the block. A plain value in that position is a type error:
 
-<!-- error: found String -->
+<!-- error: found 'String' -->
 ```kotlin
 fun label(maybe) {
     let x = maybe?

@@ -359,7 +359,7 @@ def test_a_diagnostic_never_shows_an_internal_name(tmp_path):
     """A top-level binding is `Main#f` after resolution; no message says so."""
     assert "#" not in fails("let a = b\nlet b = a", {})
     assert fails("let a = b\nlet b = a", {}).startswith(
-        "cyclic definition: a, b")
+        "cyclic definition: 'a', 'b'")
 
 
 def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):

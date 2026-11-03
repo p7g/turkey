@@ -69,8 +69,8 @@ fun main() {
 
 @pytest.mark.parametrize("src, message", [
     ("fun f(x : (Int, String)) = x.2", "projection index 2 is out of bounds"),
-    ("type R = R { x : Int }\nfun f(x : R) = x.0", "cannot project position 0"),
-    ("type S = A(Int) | B(Int)\nfun f(x : S) = x.0", "cannot project position 0"),
+    ("type R = R { x : Int }\nfun f(x : R) = x.0", "cannot take '.0' of"),
+    ("type S = A(Int) | B(Int)\nfun f(x : S) = x.0", "cannot take '.0' of"),
 ])
 def test_invalid_projection_receivers_are_rejected(src, message):
     assert message in failure(src)

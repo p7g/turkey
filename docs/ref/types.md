@@ -598,7 +598,7 @@ constructor, and that constructor is a record. A type with several
 constructors is taken apart with `match`, even if all of its constructors are
 records:
 
-<!-- error: cannot read field 'radius': 'Shape' is not a single-variant record type -->
+<!-- error: cannot read field 'radius': 'Shape' is not a record type with one constructor; take it apart with 'match' -->
 ```kotlin
 type Shape = Circle { radius : Float } | Square { side : Float }
 
@@ -849,7 +849,7 @@ knows only what the bracket said: in the example above, only that `value` has
 a `Show` instance. The hidden type cannot leave the place where it was opened,
 so a function cannot return the unwrapped value:
 
-<!-- error: cannot escape the pattern 'Shown' that opened it -->
+<!-- error: the type 'a' hidden by 'Shown' cannot leave the 'match' arm or function that opened it -->
 ```kotlin
 type Shown = Shown[Show a](a)
 

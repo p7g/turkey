@@ -254,7 +254,7 @@ Because a function argument is a boundary, a `_` inside a call inside an
 argument makes a function for the inner call, not for the outer one.
 `show(_ * 2)` means `show(fun($x) = $x * 2)`, so this is an error:
 
-<!-- error: where '_' means fun($x) = $x * 2 -->
+<!-- error: where '_' means 'fun($x) = $x * 2' -->
 ```kotlin
 fun main() {
     print(Array.map([1, 2, 3], show(_ * 2)))
@@ -435,7 +435,7 @@ calls refer to. So a top-level `let` can call a function declared further
 down. Only functions can depend on each other in a cycle; a cycle that
 includes a `let` or `var` is an error:
 
-<!-- error: only functions may be mutually recursive -->
+<!-- error: only functions can be mutually recursive -->
 ```kotlin
 let a = b + 1
 let b = a + 1
@@ -553,7 +553,7 @@ fun count(label : a, n) -> Int = if n > 3 { n } else { count("more", n + 1) }
 fun pick(x : a, y : b) = if True { x } else { y }
 ```
 
-<!-- error: the body of 'describe' needs 'Show a', which the context its annotation writes does not state -->
+<!-- error: the body of 'describe' needs 'Show a', which its annotation's context does not list -->
 ```kotlin
 fun describe(x : a, label) = label + show(x)
 ```

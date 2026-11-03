@@ -131,14 +131,14 @@ fun main() { print(Error.messageOf(fail(Plain(1)))) }
 
 def test_a_packed_payload_is_read_by_opening_it_not_by_field():
     """Restriction 3. The field's type is the hidden one, so there is no type
-    at which to read it -- and the message has to say that rather than claim
-    `SomeError` is a multi-variant type, which it is not."""
+    at which to read it -- and the message has to blame the existential rather
+    than claim `SomeError` lacks a single record constructor, which it has."""
     source = PAYLOADS + """
 fun main() { print(fail(IoError(1)).payload) }
 """
     message = fails(source)
-    assert "is existential" in message
-    assert "only opening the value in a 'match' arm can name" in message
+    assert "of the existential type" in message
+    assert "take it apart in a 'match' arm" in message
 
 
 def test_the_channel_comes_from_the_prelude():

@@ -193,8 +193,8 @@ def test_a_declared_context_is_asked_for_rather_than_asserted():
 def test_a_declared_context_over_a_variable_the_type_omits_is_ambiguous():
     src = EQ + "fun f[Egal b](x : Int) -> Int = x"
     assert bad(src) == (
-        "'Egal b' constrains a type that the declared type of 'f' does not "
-        "mention, so no use of 'f' could decide it"
+        "'Egal b' constrains a type variable that the declared type of 'f' "
+        "does not mention; remove it from the context"
     )
 
 
@@ -338,7 +338,7 @@ def test_a_default_body_is_checked_against_the_class_signature():
     # The class variable is rigid inside the default, so `1` is not free to
     # become whatever `a` turns out to be.
     assert bad(src) == \
-        "a numeric literal cannot have type 'a'; it must be one of Int, Float"
+        "a numeric literal cannot have type 'a'; it must be one of 'Int', 'Float'"
 
 
 def test_a_default_may_use_the_class_it_is_declared_in():

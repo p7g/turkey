@@ -70,9 +70,11 @@ let oneOf = "OneOf"
 type Constraint
     -- `left ~ right`. The equality fragment of the domain.
     = CEq(Ty.Type, Ty.Type, Option Span, String)
-    -- A predicate that must hold. The `String` is the verb to use if it turns
-    -- out to be unsatisfiable -- "read" or "mutate" for a `HasField`, which is
-    -- the one thing about a field access the predicate itself does not record.
+    -- A predicate that must hold. The `String` names where the demand came
+    -- from, for a diagnostic if it turns out unsatisfiable. A field access's
+    -- predicate carries the verb instead -- "read" or "assign to" -- which is
+    -- the one thing about a field access the predicate itself does not record;
+    -- any other phrase is spliced into "expected ..., found ... in <phrase>".
     -- Mutable, because `improve` rewrites a predicate's arguments in place.
     | CPred(PredCell)
     | CAnd(Vec Constraint)
@@ -293,8 +295,8 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
                 -- one it will be is the caller's business. Such an equation is
                 -- merely stuck, and is reported as stuck.
                 Some(missing) -> if !granted(s, missing) {
-                    oops("no instance for '" + Ty.showPred(missing) + "', so '"
-                         + Ty.show(t) + "' has no definition", where)
+                    oops("no instance for '" + Ty.showPred(missing) + "', which '"
+                         + Ty.show(t) + "' needs", where)
                 }
                 None -> {}
             }
@@ -416,8 +418,9 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 -- `name <= t`: instantiate, and re-emit the scheme's obligations.
 --
 -- A scheme's predicates are demands on whoever instantiates it, so they come
--- back as constraints over this site's fresh variables. The verb is "read": a
--- scheme records which field it needs, not whether the access that produced the
+-- back as constraints over this site's fresh variables, attributed to the
+-- context of `name`. A field predicate among them reports as a read: a scheme
+-- records which field it needs, not whether the access that produced the
 -- demand was a read or an assignment.
 fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
                   use : Option Use, given : Option Scheme) -> Unit {
@@ -451,7 +454,8 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
         }
         None -> {}
     }
-    for p in preds { solve(s, cpredOf(p, where, "read")) }
+    let context = "the context of '" + Ty.shortName(name) + "'"
+    for p in preds { solve(s, cpredOf(p, where, context)) }
 }
 
 -- Solve the definition one rank in, generalize, then solve the body.
@@ -614,10 +618,22 @@ fun checkRigid(s : Solver, c : LetCell, retainedPreds : Vec PredCell) -> Unit {
                 if Map.contains(seen.names, v.id) { touches = True }
             }
             if touches && !Set.contains(allowed, predKey(cp.pred)) {
+                -- A literal's demand cannot be written in a context, so it is
+                -- reported as what it does to the variable.
+                if cp.pred.name == oneOf {
+                    let varName = Ty.showAt(cp.pred.args[0], seen, 0)
+                    let members = match cp.pred.args[1] {
+                        TSet(names) -> Ty.quoteLiteralSet(names)
+                        other -> Ty.show(other)
+                    }
+                    oops("the annotation on '" + name + "' says '" + varName
+                         + "' is any type, but its body makes it one of "
+                         + members, Some(where))
+                }
                 oops("the body of '" + name + "' needs '"
-                     + Ty.showPredWith(cp.pred, seen) + "', which the context its "
-                     + "annotation writes does not state; add it, or complete the "
-                     + "signature", Some(where))
+                     + Ty.showPredWith(cp.pred, seen) + "', which its "
+                     + "annotation's context does not list; add it to the "
+                     + "context", Some(where))
             }
         }
     }
@@ -754,7 +770,7 @@ fun improveFamilies(s : Solver) -> Unit {
                     -- message again for a unification that cannot fail.
                     Some((first, at)) -> if !Ty.sameType(first, c.pred.args[1]) {
                         Ty.unify(first, c.pred.args[1], firstSpan(c.span, at),
-                                 "the answers given for '" + Ty.show(left) + "'",
+                                 "the uses of '" + Ty.show(left) + "'",
                                  families(s))
                     }
                     None -> Map.put(seen, key, (c.pred.args[1], c.span))
@@ -894,12 +910,14 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
 -- Why a generated field or projection class has no instance.
 --
 -- Ordinary instance resolution would say "no instance for `%HasField.cap Int`",
--- which names a class the programmer cannot see and did not write. These are
--- the messages the structural discharge used to produce, kept word for word:
--- the class is an implementation of field access, so its failures have to read
--- as field errors.
+-- which names a class the programmer cannot see and did not write. The class is
+-- an implementation of field access, so its failures have to read as field
+-- errors.
 fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
     let (h, _) = Ty.spine(receiver)
+    -- Only an assignment's predicates carry "assign to"; any other context,
+    -- such as a scheme's, is a read.
+    let verb = if c.context == "assign to" { c.context } else { "read" }
     match fieldLabel(p.name) {
         Some(label) -> {
             match h {
@@ -909,29 +927,41 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
                     }
                     match Decls.recordFields(s.decls, con.name) {
                         Some(names) -> if !Array.contains(names, label) {
-                            oops("type '" + con.name + "' has no field '" + label
-                                 + "' (it has: " + String.join(names, ", ") + ")",
-                                 c.span)
+                            oops("type '" + Ty.show(receiver) + "' has no field '"
+                                 + label + "'; its fields are "
+                                 + String.join(Array.map(names, fun(n) = "'" + n + "'"),
+                                               ", "), c.span)
                         }
                         None -> {}
                     }
                     match Decls.existentialFields(s.decls, con.name) {
                         Some(hidden) -> if Array.contains(hidden, label) {
-                            oops("cannot " + c.context + " field '" + label
-                                 + "': '" + Ty.show(receiver) + "' is "
-                                 + "existential, so the field's type is one "
-                                 + "that only opening the value in a 'match' "
-                                 + "arm can name.", c.span)
+                            oops("cannot " + verb + " field '" + label
+                                 + "' of the existential type '"
+                                 + Ty.show(receiver) + "'; take it apart in a "
+                                 + "'match' arm instead", c.span)
                         }
                         None -> {}
                     }
                 }
                 _ -> {}
             }
-            oops("cannot " + c.context + " field '" + label + "': '"
-                 + Ty.show(receiver) + "' is not a single-variant record type. "
-                 + "Multi-variant types are immutable and are taken apart with "
-                 + "'match'.", c.span)
+            -- Every type that reaches here lacks the one record constructor
+            -- that '.' needs. A read from a type with constructors of its own
+            -- can take the value apart instead; an assignment has no
+            -- alternative, since such a type is immutable.
+            let fix = match h {
+                TCon(con) -> match Map.get(s.decls.tycons, con.name) {
+                    Some(info) -> if verb == "read" && len(info.variants) > 0 {
+                        "; take it apart with 'match'"
+                    } else { "" }
+                    None -> ""
+                }
+                _ -> ""
+            }
+            oops("cannot " + verb + " field '" + label + "': '"
+                 + Ty.show(receiver) + "' is not a record type with one "
+                 + "constructor" + fix, c.span)
         }
         None -> {}
     }
@@ -944,10 +974,10 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
         _ -> Decls.projectionTypes(s.decls, receiver)
     }
     match choices {
-        None -> oops("cannot project position " + Int.toString(index) + " from '"
-                     + Ty.show(receiver) + "': numeric projection requires a "
-                     + "tuple or an immutable type with exactly one positional "
-                     + "constructor", c.span)
+        None -> oops("cannot take '." + Int.toString(index) + "' of '"
+                     + Ty.show(receiver) + "': '." + Int.toString(index)
+                     + "' can only be taken of a tuple or of a type with one "
+                     + "positional constructor", c.span)
         Some(elems) -> oops("projection index " + Int.toString(index)
                             + " is out of bounds for '" + Ty.show(receiver)
                             + "', which has " + Int.toString(len(elems))
@@ -973,8 +1003,8 @@ fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Unit {
     match Decls.fieldSpan(s.decls, tycon, label) {
         Some(at) -> oops("cannot assign to field '" + label + "': it is not 'var' in '"
             + Ty.shortName(tycon) + "' (declared at " + at.file + ":"
-            + showSpan(at) + "). Declare it 'var " + label
-            + "' to make it assignable.", c.span)
+            + showSpan(at) + "); declare it 'var " + label
+            + "' to make it assignable", c.span)
         None -> {}
     }
 }
@@ -1037,7 +1067,7 @@ fun oneOfRule(s : Solver, c : PredCell) -> Bool {
         "a numeric literal"
     }
     oops(what + " cannot have type '" + Ty.show(t) + "'; it must be "
-         + "one of " + Ty.showLiteralSet(names), c.span)
+         + "one of " + Ty.quoteLiteralSet(names), c.span)
 }
 
 -- The type a `OneOf` demand's member `name` stands for: the member itself for
@@ -1078,9 +1108,11 @@ fun improveNumeric(s : Solver) -> Unit {
                 let names = intersect(setNames(first.pred.args[1], first.span),
                                       setNames(c.pred.args[1], c.span))
                 if len(names) == 0 {
-                    oops("no numeric type is both "
-                         + Ty.show(first.pred.args[1]) + " and "
-                         + Ty.show(c.pred.args[1]), c.span)
+                    oops("no numeric type is both one of "
+                         + Ty.quoteLiteralSet(setNames(first.pred.args[1], first.span))
+                         + " and one of "
+                         + Ty.quoteLiteralSet(setNames(c.pred.args[1], c.span)),
+                         c.span)
                 }
                 first.pred = Ty.pred(first.pred.name,
                                      [first.pred.args[0], TSet(names)])
@@ -1203,54 +1235,53 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
         let other = if leftIsFam { right } else { left }
         -- A generated field family is machinery, not something a context can
         -- state: a reader wrote `r.n` and cannot write `Field.n r ~ Int`. So it
-        -- keeps the message the stranded `HasField` predicate used to give,
-        -- which names what was written.
+        -- is reported as the stranded `HasField` predicate below is, naming
+        -- what was written.
         let owner = match fam {
             TFam(name, _, _) -> Classes.fieldFamilyOwner(name)
             _ -> "?"
         }
         match fieldLabel(owner) {
-            Some(label) -> oops("cannot determine the type of the value whose "
-                + "field '" + label + "' is being accessed. Add a type "
-                + "annotation.", c.span)
+            Some(label) -> unknownReceiver("field '" + label + "' is used",
+                                           c.span)
             None -> {}
         }
         match Classes.generatedIndex(owner) {
-            Some(index) -> oops("cannot determine the type of the value being "
-                + "projected at position " + Int.toString(index)
-                + ". Add a type annotation.", c.span)
+            Some(index) -> unknownReceiver("'." + Int.toString(index)
+                                           + "' is taken", c.span)
             None -> {}
-        }
-        let cls = match fam {
-            TFam(name, _, _) -> match Map.get(s.decls.families, name) {
-                Some(fi) -> Ty.shortName(fi.cls)
-                None -> name
-            }
-            _ -> "?"
         }
         let where = if c.context == "" { "" } else { " in " + c.context }
         -- Name the remedy. It is not "add a type annotation": an equality is
         -- something a context can state, and stating it is what fixes this.
         let equality = Ty.show(fam) + " ~ " + Ty.show(other)
-        oops("cannot reduce '" + Ty.show(fam) + "' to '" + Ty.show(other) + "'"
-             + where + ": nothing says which '" + cls + "' instance defines it. "
-             + "Add '" + equality + "' to the context.", c.span)
+        oops("cannot tell whether '" + Ty.show(fam) + "' is '" + Ty.show(other)
+             + "'" + where + "; add '" + equality + "' to the context", c.span)
     }
     match fieldLabel(c.pred.name) {
-        Some(label) -> oops("cannot determine the type of the value whose field '"
-             + label + "' is being accessed. Add a type annotation.", c.span)
+        Some(label) -> unknownReceiver("field '" + label + "' is used", c.span)
         None -> {}
     }
     match Classes.generatedIndex(c.pred.name) {
-        Some(index) -> oops("cannot determine the type of the value being "
-             + "projected at position " + Int.toString(index)
-             + ". Add a type annotation.", c.span)
+        Some(index) -> unknownReceiver("'." + Int.toString(index) + "' is taken",
+                                       c.span)
         None -> {}
     }
-    oops("cannot determine a type satisfying '"
-         + Ty.showPredWith(c.pred, Ty.namer("")) + "'. Add a type annotation.",
-         c.span)
+    let names = Ty.namer("")
+    let shown = Ty.showPredWith(c.pred, names)
+    let vars = Ty.varsOf(c.pred.args)
+    let unknown = if len(vars) == 0 { None } else { Map.get(names.names, vars[0].id) }
+    match unknown {
+        Some(v) -> oops("cannot determine what type '" + v + "' is in '" + shown
+                        + "'; add a type annotation", c.span)
+        None -> oops("cannot determine a type satisfying '" + shown
+                     + "'; add a type annotation", c.span)
+    }
 }
+
+fun unknownReceiver(what : String, where : Option Span) -> a =
+    oops("cannot determine the type of the value whose " + what
+         + " here; add a type annotation", where)
 
 -- -- context splitting -------------------------------------------------------------
 

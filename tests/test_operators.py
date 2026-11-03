@@ -64,7 +64,7 @@ def test_the_operators_are_homogeneous():
     This is the visible cost of declining MPTCs, and it is stated here rather
     than left to be discovered.
     """
-    assert "expected Int, found Float" in fails("fun f(a : Int, b : Float) = a + b")
+    assert "expected 'Int', found 'Float'" in fails("fun f(a : Int, b : Float) = a + b")
 
 
 def test_an_operator_needs_only_an_instance(capsys):

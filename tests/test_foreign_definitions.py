@@ -83,7 +83,7 @@ def test_the_body_is_held_to_the_giblet_rule(probe):
 def test_only_the_seven_representable_types_cross(probe):
     message = probe('foreign "probe_f" fun f(x : Int) -> Int = x\n'
                     'foreign "probe_g" fun g(s : String) -> Int = 0\n')
-    assert "'String' cannot cross a foreign boundary in" in message
+    assert "'String' cannot appear in the foreign signature of" in message
 
 
 def test_every_parameter_is_named(probe):
@@ -98,14 +98,14 @@ def test_seven_general_arguments_fit_and_an_eighth_does_not(probe):
     assert probe(f'foreign "probe_f" fun f({seven}) -> Int = a6\n') == ""
     eight = ", ".join(f"a{i} : Int" for i in range(8))
     message = probe(f'foreign "probe_f" fun f({eight}) -> Int = a7\n')
-    assert "takes 8 general arguments, and a foreign definition takes at " \
-           "most 7" in message
+    assert "has 8 non-'Float' parameters, but a foreign definition can " \
+           "have at most 7" in message
 
 
 def test_a_symbol_is_defined_once(probe):
     message = probe('foreign "probe_f" fun f(x : Int) -> Int = x\n'
                     'foreign "probe_f" fun g(x : Int) -> Int = x\n')
-    assert "the C symbol 'probe_f' is already claimed by" in message
+    assert "the C symbol 'probe_f' is already declared or defined by" in message
 
 
 # -- kept alive ----------------------------------------------------------------

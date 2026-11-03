@@ -240,7 +240,7 @@ A method whose class parameter appears only in its result, such as a
 `default() -> a`, can be called only where the result's type is fixed by the
 context around the call. Otherwise the call is ambiguous:
 
-<!-- error: cannot determine a type satisfying 'Show a'. Add a type annotation. -->
+<!-- error: cannot determine what type 'a' is in 'Show a'; add a type annotation -->
 ```kotlin
 class Default a {
     fun default() -> a

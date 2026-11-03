@@ -127,7 +127,7 @@ fun same(x) = x
 let seed = same(3)
 ```
 
-<!-- error: expected Int, found Float in the operands of '/' -->
+<!-- error: expected 'Int', found 'Float' in the operands of '/' -->
 ```kotlin
 import Seed (seed)
 
@@ -250,7 +250,7 @@ Unlike a numeric literal, an array literal is never generic in its container.
 A binding that is generalized, such as a function, still decides which of the
 two it builds, and defaults to `Array` when its own body does not say:
 
-<!-- error: expected Vec, found Array in a function call -->
+<!-- error: expected 'Vec', found 'Array' in a function call -->
 ```kotlin
 fun empty() = []
 
@@ -264,7 +264,7 @@ fun main() {
 `empty` is `fun() -> Array a`: generic in the element, but not in the
 container. Declaring `fun empty() -> Vec a` makes it build a `Vec`. A signature
 cannot ask for both: `fun empty() -> c a = []` is rejected with `an array
-literal cannot have type 'c a'; it must be one of Array, Vec`.
+literal cannot have type 'c a'; it must be one of 'Array', 'Vec'`.
 
 A literal in a top-level `let` is decided by that `let`'s own definition. The
 binding is not generalized ([the value restriction](#generalization)), and uses
@@ -272,7 +272,7 @@ of it in functions, in the same module or in a module that imports it, come too
 late: a table that only a function pushes to is an `Array`, and the push is a
 type error:
 
-<!-- error: expected Vec, found Array in a function call -->
+<!-- error: expected 'Vec', found 'Array' in a function call -->
 ```kotlin
 let pending = []
 
@@ -285,7 +285,7 @@ The constraint a literal contributes is `OneOf t {Array, Vec} e`: `t` must be
 one of the listed containers applied to the element type `e`. Like the numeric
 one, it cannot be written in a program, and a mismatch names the set:
 
-<!-- error: an array literal cannot have type 'Int'; it must be one of Array, Vec -->
+<!-- error: an array literal cannot have type 'Int'; it must be one of 'Array', 'Vec' -->
 ```kotlin
 let count : Int = [1, 2]
 ```
@@ -339,7 +339,7 @@ can ever decide: one that appears in no parameter, no result, and no other
 use. The classic case is a method whose class parameter appears only in its
 result, such as `default() -> a`, passed to a function that accepts any type:
 
-<!-- error: cannot determine a type satisfying 'Show a'. Add a type annotation. -->
+<!-- error: cannot determine what type 'a' is in 'Show a'; add a type annotation -->
 ```kotlin
 class Default a {
     fun default() -> a
@@ -359,7 +359,7 @@ The fix is an annotation that picks the type: `print(default() : Int)`.
 The same happens with an empty array whose element type nothing fixes, when
 it is printed or compared:
 
-<!-- error: Add a type annotation -->
+<!-- error: add a type annotation -->
 ```kotlin
 fun main() {
     print([])

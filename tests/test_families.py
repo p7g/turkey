@@ -222,17 +222,16 @@ def test_a_carried_equation_is_checked_at_the_use_site(capsys):
     """
     # `Elem (Array String)` reduces, and the equality is then an ordinary
     # mismatch at the call rather than a mystery inside `f`.
-    assert "expected String, found Int" in fails(bad)
+    assert "expected 'String', found 'Int'" in fails(bad)
 
 
 def test_an_equation_that_can_never_be_decided_is_rejected():
     message = fails(CONTAINER + "fun f[Container c](xs : c) -> Int = first(xs)")
     # `c` is the name the signature wrote, kept by the skolem.
-    assert "cannot reduce 'Container.Elem c' to 'Int'" in message
-    assert "which 'Container' instance defines it" in message
+    assert "cannot tell whether 'Container.Elem c' is 'Int'" in message
     # And the remedy, which is the equality itself: `f` is rejected for saying
     # too little, not for being wrong, and adding it to the context fixes it.
-    assert "Add 'Container.Elem c ~ Int' to the context." in message
+    assert "add 'Container.Elem c ~ Int' to the context" in message
     assert scheme(
         CONTAINER + "fun f[Elem c ~ Int, Container c](xs : c) -> Int = first(xs)",
         "f",
@@ -241,7 +240,7 @@ def test_an_equation_that_can_never_be_decided_is_rejected():
 
 def test_a_family_over_a_type_with_no_instance_is_rejected_where_written():
     assert fails(CONTAINER + "fun f(x : Elem Bool) -> Int = 1\nfun g() = f(True)") == (
-        "no instance for 'Container Bool', so 'Container.Elem Bool' has no definition"
+        "no instance for 'Container Bool', which 'Container.Elem Bool' needs"
     )
 
 

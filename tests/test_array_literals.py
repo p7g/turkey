@@ -63,7 +63,7 @@ def test_a_top_level_binding_is_decided_by_its_own_definition() -> None:
     defaulted once its own definition is solved."""
     message = lang.fails("let pending = []\n"
                          "fun remember(x : String) = Vec.push(pending, x)\n")
-    assert message == "expected Vec, found Array in a function call"
+    assert message == "expected 'Vec', found 'Array' in a function call"
 
 
 def test_a_top_level_binding_is_decided_the_same_for_an_importer() -> None:
@@ -71,7 +71,7 @@ def test_a_top_level_binding_is_decided_the_same_for_an_importer() -> None:
                          "fun main() = Vec.push(pending, 1)\n",
                          {"Queue.gob": "export (pending)\n"
                                        "let pending = []\n"})
-    assert message == "expected Vec, found Array in a function call"
+    assert message == "expected 'Vec', found 'Array' in a function call"
 
 
 def test_an_annotated_top_level_binding_is_a_vec() -> None:
@@ -136,13 +136,13 @@ def test_a_use_wanting_another_container_is_a_mismatch_with_array() -> None:
     message = lang.fails("fun empty() = []\n"
                          "fun takes(v : Vec Int) -> Unit = {}\n"
                          "let u = takes(empty())\n")
-    assert message == "expected Vec, found Array in a function call"
+    assert message == "expected 'Vec', found 'Array' in a function call"
 
 
 def test_an_annotation_cannot_make_the_container_generic() -> None:
     message = lang.fails("fun empty() -> c a = []\n")
     assert message == ("an array literal cannot have type 'c a'; it must be "
-                       "one of Array, Vec")
+                       "one of 'Array', 'Vec'")
 
 
 # ------------------------------------------------------ what a mismatch says
@@ -153,16 +153,16 @@ def test_an_annotation_cannot_make_the_container_generic() -> None:
 def test_a_literal_where_no_container_fits(annotation) -> None:
     message = lang.fails(f'let x : {annotation} = ["a"]\n')
     assert message == (f"an array literal cannot have type '{annotation}'; "
-                       "it must be one of Array, Vec")
+                       "it must be one of 'Array', 'Vec'")
 
 
 def test_a_wrong_element_is_reported_against_the_element() -> None:
     assert lang.fails('let v : Vec Int = ["a"]\n') == \
-        "expected Int, found String in an array literal"
+        "expected 'Int', found 'String' in an array literal"
 
 
 @pytest.mark.parametrize("src", ["let x : String = 1\n",
                                  "let x : Option Int = 1\n"])
 def test_a_numeric_literal_names_only_the_numbers(src) -> None:
     assert re.fullmatch(r"a numeric literal cannot have type '[^']+'; it must "
-                        r"be one of Int, Float", lang.fails(src))
+                        r"be one of 'Int', 'Float'", lang.fails(src))

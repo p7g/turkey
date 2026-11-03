@@ -95,4 +95,4 @@ def test_a_non_final_placeholder_statement_is_a_discarded_function():
     ("print(Array.map(xs, show((_ + 1) * 2)))", "fun($x) = ($x + 1) * 2"),
 ])
 def test_a_mismatch_at_the_call_says_what_the_placeholder_meant(body, meaning):
-    assert f"where '_' means {meaning}" in fails(body)
+    assert f"where '_' means '{meaning}'" in fails(body)

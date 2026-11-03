@@ -451,7 +451,7 @@ fun main() {
 True
 ```
 
-<!-- error: 'Order' is missing field(s): rush -->
+<!-- error: 'Order' is missing field 'rush' -->
 ```kotlin
 type Order = Order { item : String, quantity : Int, rush : Bool }
 

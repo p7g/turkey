@@ -30,7 +30,7 @@ def test_an_integer_past_two_to_the_53_is_not_a_float() -> None:
     """Every integer below 2^53 is exactly a `Float`; past it, one is not, and
     a literal that would round is refused rather than rounded."""
     check("let x : Float = 9007199254740991\n")
-    with pytest.raises(CompileError, match="expected Int, found Float"):
+    with pytest.raises(CompileError, match="expected 'Int', found 'Float'"):
         check("let x : Float = 9007199254740993\n")
 
 
@@ -41,7 +41,7 @@ def test_an_integer_literal_works_where_a_float_is_wanted() -> None:
 
 
 def test_a_decimal_literal_does_not_work_where_an_int_is_wanted() -> None:
-    with pytest.raises(CompileError, match="expected Int, found Float"):
+    with pytest.raises(CompileError, match="expected 'Int', found 'Float'"):
         check("fun f(n : Int) -> Int = n\nlet y = f(1.5)\n")
 
 
@@ -77,7 +77,7 @@ def test_a_stranded_field_demand_still_does_not_default() -> None:
     """Only `OneOf` defaults. There is no preferred record type to guess."""
     src = ("type Cell = Cell { n : Int }\n"
            "fun main() {\n  var box = []\n  print(Int.toString(box[0].n))\n}\n")
-    with pytest.raises(CompileError, match="Add a type annotation"):
+    with pytest.raises(CompileError, match="add a type annotation"):
         check(src)
 
 

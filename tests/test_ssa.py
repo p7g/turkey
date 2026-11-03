@@ -159,3 +159,33 @@ def test_a_raw_load_is_not_a_safepoint():
     be rooted around it -- which is the whole reason raw access is an opcode
     rather than a runtime call."""
     assert "a raw load is a safepoint: 0" in _dump()
+
+
+def test_liveness_reaches_every_block_of_a_loop_nest():
+    """A value read in a loop is live all the way round it.
+
+    `x` (%0) and `y` (%1) are defined before two nested loops and read inside
+    both, and `i` (%2) is the outer loop's parameter. The latch of the outer
+    loop reads only `i` and `x` itself; `y` is live out of it only because the
+    header reads it again, which is what propagating the header's live-in
+    through the loop has to find.
+    """
+    dump = _dump()
+    assert "loops b0 in [] out [%0 %1]" in dump
+    assert "loops b1 in [%0 %1] out [%0 %1 %2]" in dump
+    assert "loops b2 in [%0 %1 %2] out [%0 %1 %2]" in dump
+    assert "loops b3 in [%0 %1 %2] out [%0 %1]" in dump
+    assert "loops b4 in [%2] out []" in dump
+
+
+def test_liveness_is_exact_on_an_irreducible_cycle():
+    """A cycle with two entries has no header, so no loop to propagate through.
+
+    `x` (%0) and `c` (%1) are read on both blocks of the cycle; the edge from
+    b2 back to b1 is the one a single backward pass misses.
+    """
+    dump = _dump()
+    assert "irreducible b0 in [] out [%0 %1]" in dump
+    assert "irreducible b1 in [%0 %1] out [%0 %1]" in dump
+    assert "irreducible b2 in [%0 %1] out [%0 %1]" in dump
+    assert "irreducible b3 in [%0] out []" in dump

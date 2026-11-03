@@ -20,6 +20,8 @@ import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..), Callee(..), IndexCheck(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.Runtime as Rt
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
 
 fun main() {
     let i64 = Ssa.untraced(I64)
@@ -117,7 +119,86 @@ fun main() {
     print("orphan idom: " + showIdom(Ssa.dominators(f)[Ssa.blockId(orphan)]))
     print("b0 dom orphan: "
           + showBool(Ssa.dominates(Ssa.dominators(f), b0, orphan)))
+
+    liveLoops()
+    liveIrreducible()
 }
+
+-- Two loops, one inside the other, reading values defined before both. The
+-- outer loop's latch, b3, does not read `y`, so `y` is live out of it only
+-- because the header reads it again round the back edge.
+fun liveLoops() -> Unit {
+    let i64 = Ssa.untraced(I64)
+    let i1 = Ssa.untraced(I1)
+    let f = Ssa.newFunc("loops", i64)
+    let b = L.builder(f, BlockId(0))
+    let b0 = L.block(b)
+    let b1 = L.block(b)
+    let b2 = L.block(b)
+    let b3 = L.block(b)
+    let b4 = L.block(b)
+    L.into(b, b0)
+    let x = L.emit(b, ConstInt(1), i64)
+    let y = L.emit(b, ConstInt(2), i64)
+    L.terminate(b, Jump(b1, [x]))
+
+    let i = L.param(b, b1, i64)
+    L.into(b, b1)
+    let more = L.emit(b, Cmp(Lt, i, y), i1)
+    L.terminate(b, Branch(more, b2, b4))
+
+    L.into(b, b2)
+    let s = L.emit(b, Bin(Add, i, x), i64)
+    let again = L.emit(b, Cmp(Lt, s, y), i1)
+    L.terminate(b, Branch(again, b2, b3))
+
+    L.into(b, b3)
+    let next = L.emit(b, Bin(Add, i, x), i64)
+    L.terminate(b, Jump(b1, [next]))
+
+    L.into(b, b4)
+    L.terminate(b, Ret(i))
+    showLiveness(f)
+}
+
+-- A cycle with two entries, so neither block of it dominates the other and
+-- it has no header.
+fun liveIrreducible() -> Unit {
+    let i64 = Ssa.untraced(I64)
+    let i1 = Ssa.untraced(I1)
+    let f = Ssa.newFunc("irreducible", i64)
+    let b = L.builder(f, BlockId(0))
+    let b0 = L.block(b)
+    let b1 = L.block(b)
+    let b2 = L.block(b)
+    let b3 = L.block(b)
+    L.into(b, b0)
+    let x = L.emit(b, ConstInt(1), i64)
+    let c = L.emit(b, Cmp(Eq, x, x), i1)
+    L.terminate(b, Branch(c, b1, b2))
+
+    L.into(b, b1)
+    L.terminate(b, Branch(c, b2, b3))
+
+    L.into(b, b2)
+    let _ = L.emit(b, Bin(Add, x, x), i64)
+    L.terminate(b, Jump(b1, []))
+
+    L.into(b, b3)
+    L.terminate(b, Ret(x))
+    showLiveness(f)
+}
+
+fun showLiveness(f : Ssa.Func Low) -> Unit {
+    let (liveIn, liveOut) = Ssa.livenessInOut(f)
+    for var n = 0; n < len(f.blocks); n = n + 1 {
+        print(f.name + " b" + Int.toString(n) + " in " + showIds(liveIn[n])
+              + " out " + showIds(liveOut[n]))
+    }
+}
+
+fun showIds(s : BitSet) -> String =
+    "[" + String.join(Array.map(BitSet.elements(s), fun(n) = "%" + Int.toString(n)), " ") + "]"
 
 -- The two verifiers are separate on purpose: `Ssa.verify` owns the shape of
 -- the graph and dominance, and knows nothing about opcodes; `L.checkReps`

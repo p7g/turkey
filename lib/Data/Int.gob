@@ -41,6 +41,7 @@ import Data.Bool (Bool(..))
 import Data.Option (Option(..))
 import Data.Ordering (Ordering(..))
 import Data.String (String(..), bytesOf)
+import Turkey.Process as Process
 
 -- The 64-bit signed integer, which the compiler provides.
 type Int = Prim.Int
@@ -190,23 +191,38 @@ fun not(a : Int) -> Int = Prim.intNot(a)
 -- compiles to a single instruction: arm64 masks the shift amount to six bits,
 -- so shifting by 64 would quietly be a shift by zero.
 fun shl(a : Int, by : Int) -> Int {
-    shiftAmount("Int.shl", by)
+    shiftAmount(Shl, by)
     Prim.intShl(a, by)
 }
 
 fun shr(a : Int, by : Int) -> Int {
-    shiftAmount("Int.shr", by)
+    shiftAmount(Shr, by)
     Prim.intShr(a, by)
 }
 
-fun shiftAmount(operation : String, by : Int) -> Unit {
+-- Which operator's amount `badShift` reports. A constructor rather than the C
+-- string itself, so that the passing path, which every shift takes, never
+-- computes the string's address.
+type ShiftOp = Shl | Shr
+
+fun shiftAmount(operation : ShiftOp, by : Int) -> Unit {
     if Prim.intLt(by, 0) || Prim.intLt(63, by) { badShift(operation, by) }
 }
 
--- The message is built apart from the test, so that the strings it allocates
--- cost nothing on the path that passes.
-fun badShift(operation : String, by : Int) -> a =
-    Prim.error(operation + ": shift amount " + toString(by) + " is outside 0..63")
+-- The panic allocates nothing, so a giblet can shift by a variable amount.
+--
+-- `panicInt` raises the panic and returns. The `Prim.error` after it never
+-- reports its message, because the first panic raised is the one reported. It
+-- is there for its type: it makes `badShift` a call that always panics, which
+-- the optimizer keeps out of line instead of copying into every shift.
+fun badShift(operation : ShiftOp, by : Int) -> a {
+    let before = match operation {
+        Shl -> Prim.cString("Int.shl: shift amount ")
+        Shr -> Prim.cString("Int.shr: shift amount ")
+    }
+    Process.panicInt(before, by, Prim.cString(" is outside 0..63"))
+    Prim.error("")
+}
 
 -- -- ranges -------------------------------------------------------------------
 

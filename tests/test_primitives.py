@@ -14,7 +14,7 @@ import math
 
 import pytest
 
-from tests.lang import CompileError, check
+from tests.lang import CompileError, check, panic_message, panics
 from tests.lang import execute as run
 
 
@@ -166,6 +166,12 @@ def test_shifts_are_arithmetic_and_panic_out_of_range():
     for by in (64, -1):
         with pytest.raises(Exception, match="shift amount"):
             out(f"fun main() {{ print(Int.shl(1, {by})) }}")
+
+
+@pytest.mark.parametrize("shift, by", [("shl", 64), ("shr", 64), ("shl", -1)])
+def test_an_out_of_range_shift_names_the_operation_and_amount(shift, by):
+    result = panics(f"fun main() {{ print(Int.{shift}(1, {by})) }}")
+    assert panic_message(result) == f"Int.{shift}: shift amount {by} is outside 0..63"
 
 
 # --------------------------------------------------------------------- Byte

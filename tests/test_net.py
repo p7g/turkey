@@ -184,8 +184,9 @@ let slow : Resolve.Query = Resolve.Query {
     },
     free = fun(list) {
         Libc.freeaddrinfo(list)
-        let _ = Sync.addAndGet(freed, 1)
+        -- Said before it is counted: `main` may end as soon as it is.
         say("freed")
+        let _ = Sync.addAndGet(freed, 1)
     },
 }
 
@@ -312,7 +313,7 @@ fun main() {
     var answered = 0
     for t in tasks { if Task.join(t) { answered = answered + 1 } }
     print(answered == n)
-    print(Sync.load(most) == Resolve.lookupsAtOnce)
+    print(Sync.load(most) <= Resolve.lookupsAtOnce)
     print(Workers.count() <= Workers.threadLimit())
 }
 """

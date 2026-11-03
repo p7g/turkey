@@ -18,7 +18,7 @@ The Prelude provides these names unqualified:
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
-| Functions | `print`, `write`, `error`, `fail`, `const` |
+| Functions | `print`, `write`, `error`, `fail`, `const`, `min`, `max` |
 
 It also provides the library modules `Array`, `Bool`, `Byte`, `Char`,
 `Either`, `Error`, `Float`, `Int`, `Iterator`, `Map`, `Option`, `Ordering`,
@@ -230,6 +230,30 @@ class Ord a : Eq a {
     fun gt(x : a, y : a) -> Bool = lt(y, x)
     fun gte(x : a, y : a) -> Bool = !lt(x, y)
 }
+```
+
+The Prelude's `min(x, y)` and `max(x, y)` answer the lesser and the greater
+of two values of any `Ord` type. When neither is less than the other, `min`
+answers `x` and `max` answers `y`:
+
+<!-- run -->
+```kotlin
+type Entry = Entry { score : Int, name : String }
+
+instance Eq Entry { fun eq(a, b) = a.score == b.score }
+instance Ord Entry { fun lt(a, b) = a.score < b.score }
+
+fun main() {
+    print(max(3, 7))
+    let ada = Entry { score = 9, name = "Ada" }
+    let bo = Entry { score = 9, name = "Bo" }
+    print(min(ada, bo).name + " " + max(ada, bo).name)
+}
+```
+
+```text
+7
+Ada Bo
 ```
 
 The instances the library provides for built-in types:

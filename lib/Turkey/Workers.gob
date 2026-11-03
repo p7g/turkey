@@ -71,7 +71,7 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Int ()
 import Data.Bool (Bool(..))
-import Bits (BitOr(..), (|))
+import Bits (BitAnd(..), BitOr(..), (&), (|))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
@@ -244,7 +244,7 @@ fun mine() -> Int = Prim.intShl(index(), 3)
 -- Whether the running thread is running Turkey code, rather than blocked or
 -- stopped -- which it may be in a loop of this module's, inlined into a
 -- caller and so given a poll (`Turkey.Polls`).
-fun running() -> Bool = Prim.intAnd(Prim.atomicLoad(states, mine()), 7) == 0
+fun running() -> Bool = (Prim.atomicLoad(states, mine()) & 7) == 0
 
 fun recordOf(i : Int) -> Prim.Ptr =
     if i == 0 && Prim.atomicLoad(control, 8) == 0 { Prim.processState() }
@@ -359,7 +359,7 @@ fun stopTheWorld() -> Bool {
 -- it then.
 fun stoppedOrHeld(i : Int) -> Bool {
     let s = Prim.atomicLoad(states, 8 * i)
-    let status = Prim.intAnd(s, 7)
+    let status = s & 7
     status == stoppedState
         || ((status == waitingState || status == callingState)
             && Prim.atomicCas(states, 8 * i, s, plus(s, 1)) == s)
@@ -376,7 +376,7 @@ fun startTheWorld() -> Unit {
             -- Every held thread is this collection's: the monitor holds only a
             -- calling thread, and every one is held here.
             let s = Prim.atomicLoad(states, 8 * i)
-            let status = Prim.intAnd(s, 7)
+            let status = s & 7
             if status == 3 || status == 5 { Prim.atomicStore(states, 8 * i, plus(s, -1)) }
             let _ = Prim.atomicAdd(recordOf(i), 272, -1)
         }
@@ -385,7 +385,7 @@ fun startTheWorld() -> Unit {
     signalCollection()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
-            while Prim.intAnd(Prim.atomicLoad(states, 8 * i), 7) == stoppedState {
+            while (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState {
                 let _ = Libc.schedYield()
             }
         }
@@ -414,7 +414,7 @@ fun stopLeave() -> Unit {
 
 -- Whether thread `i` is stopped at a safepoint, rather than held while
 -- blocked; only the collecting thread asks, with the world stopped.
-fun stopped(i : Int) -> Bool = Prim.intAnd(Prim.atomicLoad(states, 8 * i), 7) == stoppedState
+fun stopped(i : Int) -> Bool = (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState
 
 -- About to wait outside Turkey code, with every root the caller holds in its
 -- frames and the caller's frame record at `frame`: from here a collection may
@@ -442,7 +442,7 @@ fun unblock() -> Bool {
     if Prim.atomicLoad(control, 8) == 0 { return True }
     let at = mine()
     let s = Prim.atomicLoad(states, at)
-    let status = Prim.intAnd(s, 7)
+    let status = s & 7
     if status != waitingState && status != callingState { return False }
     if Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, status)) != s { return False }
     parkAt(Prim.ptrNull())
@@ -470,7 +470,7 @@ fun callExit() -> Unit {
     let at = mine()
     let s = Prim.atomicLoad(states, at)
     -- Still calling, with the permit (the low four bits are `callingState`).
-    if Prim.intAnd(s, 15) == 4 && Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, 4)) == s {
+    if (s & 15) == 4 && Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, 4)) == s {
         parkAt(Prim.ptrNull())
         return {}
     }
@@ -524,7 +524,7 @@ fun permitsSet(n : Int) -> Unit = Prim.atomicStore(permitWords, permitCountAt, n
 -- Whether the running thread holds a permit, which every thread does until
 -- the workers start.
 fun permitHeld() -> Bool =
-    Prim.atomicLoad(control, 8) == 0 || Prim.intAnd(Prim.atomicLoad(states, mine()), noPermit) == 0
+    Prim.atomicLoad(control, 8) == 0 || (Prim.atomicLoad(states, mine()) & noPermit) == 0
 
 -- Whether the program's own stack is waiting for a permit, which the next
 -- holder to look gives it (`permitGive`).
@@ -651,8 +651,8 @@ fun monitorStart() -> Bool {
     if Prim.ptrIsNull(record) || Prim.ptrIsNull(thread) { return False }
     Prim.storeI64(record, 288, -1)
     monitorRecord = record
-    Prim.intAnd(Libc.pthreadCreate(thread, Prim.ptrNull(), Prim.codeAddress("turkey_worker_start"),
-                                   record), 0xFFFF_FFFF) == 0
+    (Libc.pthreadCreate(thread, Prim.ptrNull(), Prim.codeAddress("turkey_worker_start"), record)
+        & 0xFFFF_FFFF) == 0
 }
 
 -- Whether the running thread is the monitor's.
@@ -662,7 +662,7 @@ fun monitoring() -> Bool =
 fun monitorState(i : Int) -> Int = Prim.atomicLoad(states, 8 * i)
 
 -- Whether `state` is a blocking call by a thread that holds its permit.
-fun monitorCalling(state : Int) -> Bool = Prim.intAnd(state, 15) == callingState
+fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
 
 -- Whether there is more to run than the threads free to run it: runnable
 -- tasks beyond the idle holders and the free permits, or the program's own
@@ -712,9 +712,9 @@ fun monitorHandOut() -> Bool {
     }
     let started = Libc.pthreadCreate(thread, Prim.ptrNull(),
                                      Prim.codeAddress("turkey_worker_start"), record)
-    if Prim.intAnd(started, 0xFFFF_FFFF) != 0 {
+    if (started & 0xFFFF_FFFF) != 0 {
         Process.panicInt(Prim.cString("could not start a thread: error "),
-                         Prim.intAnd(started, 0xFFFF_FFFF), Prim.cString(""))
+                         started & 0xFFFF_FFFF, Prim.cString(""))
         die()
     }
     True

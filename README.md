@@ -85,7 +85,7 @@ On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
 the maths functions the library calls out of libc.
 
 Run the compiler from the repository root, where it finds `lib/`. It has two
-commands. `build` writes the program to `-o`, in the format the file's
+commands that compile. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or
 `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
 object needs no assembler, only a linker. `check` compiles as far as the last stage that
@@ -95,6 +95,16 @@ rectangles.gob` shows the inferred types, and running the compiler with no
 arguments lists the stages. `build --timings` reports on standard error how
 long each phase took, how the backend's time is spread over functions, and how
 much of the optimizer's work could run in parallel.
+
+`build/stages/stage2 interpret rectangles.gob` runs a program without
+compiling it, passing any further arguments to the program. It interprets the
+compiler's intermediate form, Core, as lowering produces it, or as a later
+stage leaves it with `--after mono`, `reduce`, `joins` or `opt`; a program
+whose output differs between two stages points at the pass between them. It
+exits 98 for a program that calls C itself and 99 when it runs out of stack.
+The C functions and runtime it reaches run compiled, through
+`lib/Interpreter/Boundary.gob`, which `scripts/build.sh` checks against what
+`stage2 boundary src/Main.gob` generates from the library.
 
 A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
 per performance core -- every core, on a Mac without performance levels or on

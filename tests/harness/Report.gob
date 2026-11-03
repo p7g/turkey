@@ -1,10 +1,15 @@
-export (report)
+export (report, blessed)
 
 -- What a run prints: a line per case that did not pass, `OUTCOME: NAME (why)`,
 -- with its diff below it; with `verbose`, a line per pass and its time; then
 -- a count of each outcome. The run fails if any case's outcome does
 -- (`Case.failsRun`).
+--
+-- What a `--bless` run prints instead: a line per case that was written,
+-- refused or kept, `ACTION: NAME (what)`; then a count of each.
 
+import Bless (Blessing(..))
+import Bless as Bless
 import Case (Case(..), Outcome(..), Result(..))
 import Case as Case
 
@@ -33,6 +38,52 @@ fun report(ran : Array (Case, Result), verbose : Bool, actual : String, millis :
     print(summary + " in " + seconds(millis))
     ok
 }
+
+-- Prints what bless did with each case, given that it wrote what
+-- `Bless.permitted` returns, and returns whether no case was refused.
+fun blessed(decided : Array (Case, Blessing), actual : String, millis : Int) -> Bool {
+    let blessings = Array.map(decided, _.1)
+    let held = Bless.overLimit(blessings)
+    var written = 0
+    var unwritten = 0
+    var refused = 0
+    var kept = 0
+    for (c, b) in decided {
+        match b {
+            Unchanged -> {}
+            Write(files) -> {
+                let names = String.join(Array.map(files, \baseName(_.0)), ", ")
+                if held { unwritten = unwritten + 1 } else { written = written + 1 }
+                print((if held { "not written: " } else { "wrote: " }) + c.name + " (" + names + ")")
+            }
+            Refuse(guard, why) -> {
+                refused = refused + 1
+                print("refused: " + c.name + " (" + Bless.guardName(guard) + ": " + why + ")")
+            }
+            Keep(why) -> {
+                kept = kept + 1
+                print("kept: " + c.name + " (" + why + ")")
+            }
+        }
+    }
+    if held {
+        print("bless: " + Int.toString(refused) + " cases were refused, more than "
+              + Int.toString(Bless.refusalLimit) + ", so nothing was written; is boot broken?")
+    }
+    if refused > 0 { print("actual results are in " + actual) }
+    let unchanged = len(decided) - written - unwritten - refused - kept
+    let counts = [(written, "written"), (unwritten, "not written"), (refused, "refused"),
+                  (kept, "kept"), (unchanged, "unchanged")]
+    let parts = []
+    for (n, what) in counts {
+        if n > 0 { Vec.push(parts, Int.toString(n) + " " + what) }
+    }
+    let summary = if len(parts) == 0 { "no cases" } else { String.join(parts, ", ") }
+    print(summary + " in " + seconds(millis))
+    refused == 0
+}
+
+fun baseName(path : String) -> String = Option.fold(String.rsplitOnce(path, "/"), path, _.1)
 
 fun seconds(millis : Int) -> String {
     let tenths = millis / 100

@@ -224,12 +224,17 @@ Operators, field access, `.0` projection, `?`, `:` annotations and the
 function being called are not boundaries, and neither are grouping
 parentheses. So `_ * 2 + 1` is one function, and so is `(_ + 1) * 2`.
 
-A boundary that is *nothing but* `_` does not count, and the function reaches
-one boundary further out. That is what makes `pow(_, 2)` a function, rather
-than passing a function to `pow`:
+**A bare `_`.** When a function argument, index, tuple component, array
+element or record field is *nothing but* `_`, the function is the call, index,
+tuple, array or record it belongs to, and nothing around that. That is what
+makes `pow(_, 2)` a function, rather than passing a function to `pow`:
 
 <!-- run -->
 ```kotlin
+infix Sequence (|>) = pipe
+
+fun pipe(x, f) = f(x)
+
 fun pow(x, n) {
     var result = 1
     for var i = 0; i < n; i = i + 1 { result = result * x }
@@ -239,16 +244,34 @@ fun pow(x, n) {
 fun main() {
     print(Array.map([1, 2, 3], pow(_, 2)))
     print(Array.map(["a", "b"], (_, 0)))
+    print([1, 2, 3] |> Array.map(_, pow(_, 2)) |> Array.filter(_, _ > 1))
 }
 ```
 
 ```text
 [1, 4, 9]
 [(a, 0), (b, 0)]
+[4, 9]
 ```
 
 In the second line the tuple's first component is a bare `_`, so the function
-is the whole tuple: `fun($x) = ($x, 0)`.
+is the whole tuple: `fun($x) = ($x, 0)`. In the third, each stage is its own
+function, because each `_` stops at its call: the pipeline is roughly
+`pipe(pipe([1, 2, 3], fun($a) = Array.map($a, fun($x) = pow($x, 2))),
+fun($b) = Array.filter($b, fun($y) = $y > 1))`.
+
+So a call with a bare `_` is a function even where an operator or a field
+access follows it. `label(_) + "!"` adds a function to a string, which is an
+error; write `\label(_) + "!"`, explained below.
+
+<!-- error: where '_' means 'fun($x) = label($x)' -->
+```kotlin
+fun label(name) = "<" + name + ">"
+
+fun main() {
+    print(Array.map(["Mars", "Venus"], label(_) + "!"))
+}
+```
 
 Because a function argument is a boundary, a `_` inside a call inside an
 argument makes a function for the inner call, not for the outer one.
@@ -261,8 +284,8 @@ fun main() {
 }
 ```
 
-When a type error is reported at a call whose argument is a placeholder
-function, the message says what the `_` was taken to mean.
+When a type error is reported at a call or an operator whose argument is a
+placeholder function, the message says what the `_` was taken to mean.
 
 A function made by `_` has one parameter and uses it once: a second `_` in the
 same function is an error. `_` on its own as a whole statement, `let` or
@@ -345,10 +368,12 @@ in it is an error.
 The rest of the expression is evaluated each time the function is called,
 exactly as it would be in the lambda it stands for.
 
-**Coming from Scala:** this is Scala's placeholder syntax, with two
+**Coming from Scala:** this is Scala's placeholder syntax, with three
 differences. Grouping parentheses are not a boundary, so `(_ + 1) * 2` is one
-function, where in Scala the parentheses would end it. And `_ + _` is an error
-rather than a function of two parameters; use `fun(a, b) = a + b`.
+function, where in Scala the parentheses would end it. A bare `_` argument
+makes a function of its call alone, so `f(_) + 1` adds a function to `1`,
+where in Scala it would be `x => f(x) + 1`. And `_ + _` is an error rather
+than a function of two parameters; use `fun(a, b) = a + b`.
 
 **Coming from Haskell:** `\` starts a function, as it does in Haskell, but it
 takes no parameter list. The parameter is `_`.

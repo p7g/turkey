@@ -1,0 +1,128 @@
+export (Guard(..), Blessing(..), decide, permitted, overLimit, refused, refusalLimit, guardName)
+
+-- Whether `--bless` may write a case's actual results over its goldens.
+--
+-- A broken compiler fails every case at once, and a bless that wrote what it
+-- printed would record the breakage as the answer, with nothing left to say
+-- it is wrong. So a result that looks like a failure of the compiler rather
+-- than of the program is refused, and a run that refuses many cases writes
+-- nothing at all: a real change moves a few goldens, and a broken compiler
+-- moves all of them.
+--
+-- Both decisions are pure functions of the case, its goldens and what its
+-- run produced, so the selftest checks them without writing a file.
+
+import Case (Case(..), Expected(..), Finish(..), Ending(..), Observed(..), Recorded(..))
+import Case as Case
+
+-- The most refused cases a run may have and still write the rest.
+let refusalLimit : Int = 5
+
+-- Why a result was refused: a compiler or program crash; a timeout; a `boot`
+-- diagnostic on a case not marked `--@ error`, or an error `boot` reports
+-- about itself rather than the program on any case; an end other than the
+-- one its directive names; output that is empty where its golden is not; or
+-- a case that could not be run at all.
+type Guard = Crash | Overrun | Diagnostic | WrongEnd | NewlyEmpty | Unrunnable
+
+fun guardName(g : Guard) -> String = match g {
+    Crash -> "crash"
+    Overrun -> "timeout"
+    Diagnostic -> "diagnostic"
+    WrongEnd -> "wrong end"
+    NewlyEmpty -> "newly empty"
+    Unrunnable -> "unrunnable"
+}
+
+-- What bless does with a case: nothing, because every golden already holds
+-- what the run produced; write each (path, text); nothing, deliberately, for
+-- the reason given; or nothing, refused, by the guard and for the reason
+-- given. Only a refusal fails the run.
+type Blessing = Unchanged | Write(Array (String, String)) | Keep(String) | Refuse(Guard, String)
+
+-- Returns what bless does with case `c`, whose goldens are `recorded` and
+-- whose run produced `observed`. Never writes a file.
+--
+-- A case is refused whole: if any of its results is suspect, none of its
+-- goldens is written. A missing `.expected` is written, and a dump golden is
+-- written only if it is in `c.dumps`, which holds the ones that exist.
+fun decide(c : Case, recorded : Recorded, observed : Observed) -> Blessing {
+    -- An `xfail` golden records what the case is expected not to print yet;
+    -- writing what it does print would delete that.
+    if let Some(reason) = c.xfail { return Keep("xfail: " + reason) }
+    if let Some((guard, why)) = suspect(c.expected, observed) { return Refuse(guard, why) }
+    -- A new program needs an `.expected`, so a missing one is created. Adding
+    -- a dump golden is a deliberate act, so only existing ones are compared.
+    let writes = []
+    match recorded.expected {
+        Some(old) -> {
+            if newlyEmpty(old, observed.output) { return Refuse(NewlyEmpty, "the output is newly empty") }
+            if old != observed.output { Vec.push(writes, (c.golden, observed.output)) }
+        }
+        None -> Vec.push(writes, (c.golden, observed.output))
+    }
+    for i in Int.range(0, len(c.dumps)) {
+        let stage = c.dumps[i].0
+        let (finish, printed) = observed.dumps[i]
+        let dump = "the " + stage + " dump"
+        match finish {
+            Returned(0) -> {}
+            Returned(code) -> return Refuse(WrongEnd, dump + " exited " + Int.toString(code))
+            Panicked(_) -> return Refuse(Crash, dump + " panicked")
+            Killed(n) -> return Refuse(Crash, dump + " died by signal " + Int.toString(n))
+            Expired -> return Refuse(Overrun, dump + " took too long")
+        }
+        let old = recorded.dumps[i]
+        if newlyEmpty(old, printed) { return Refuse(NewlyEmpty, dump + " is newly empty") }
+        if old != printed { Vec.push(writes, (c.dumps[i].1, printed)) }
+    }
+    if len(writes) == 0 { Unchanged } else { Write(Vec.toArray(writes)) }
+}
+
+-- The guard that how the case ended trips, and why, if it trips one.
+fun suspect(expected : Expected, observed : Observed) -> Option (Guard, String) {
+    let ending = observed.ending
+    match ending {
+        CompileCrash(why) -> Some((Crash, "compiler crash: " + why))
+        CompileExpired -> Some((Overrun, "boot or the link took too long"))
+        Ran(Killed(n)) -> Some((Crash, "the program died by signal " + Int.toString(n)))
+        Ran(Expired) -> Some((Overrun, "the program ran out of time"))
+        Diagnosed(_) -> {
+            -- `boot` prefixes `boot: ` to an error of its own, such as a
+            -- usage error or a file it cannot read, and never to a
+            -- diagnostic about the program. Such an error on a case marked
+            -- `--@ error` would otherwise pass every other guard.
+            for line in String.lines(observed.output) {
+                if let Some(error) = String.stripPrefix(line, "boot: ") {
+                    return Some((Diagnostic, "an error from boot itself: " + error))
+                }
+            }
+            Option.map(Case.disagreement(expected, ending), \(Diagnostic, _))
+        }
+        Ran(Returned(_)) | Ran(Panicked(_)) -> Option.map(Case.disagreement(expected, ending), \(WrongEnd, _))
+    }
+}
+
+fun newlyEmpty(old : String, actual : String) -> Bool = !String.isEmpty(old) && String.isEmpty(actual)
+
+fun refused(b : Blessing) -> Bool = match b {
+    Refuse(_, _) -> True
+    _ -> False
+}
+
+-- Returns whether more than `refusalLimit` of `blessings` are refusals.
+fun overLimit(blessings : Array Blessing) -> Bool = Iterator.count(blessings, refused) > refusalLimit
+
+-- Returns every (path, text) the run may write, given each case's blessing:
+-- all the writes, unless more than `refusalLimit` cases were refused, and
+-- then none.
+fun permitted(blessings : Array Blessing) -> Array (String, String) {
+    if overLimit(blessings) { return [] }
+    let writes = []
+    for b in blessings {
+        if let Write(files) = b {
+            for f in files { Vec.push(writes, f) }
+        }
+    }
+    Vec.toArray(writes)
+}

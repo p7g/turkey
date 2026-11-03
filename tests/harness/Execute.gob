@@ -1,6 +1,7 @@
 export (execute, diffLimit)
 
--- One case, compiled, run and compared, as an outcome.
+-- One case, compiled, run and compared: its outcome, and what `--bless`
+-- would do with it.
 --
 -- A case is compiled by `boot` from its own directory, so a diagnostic names
 -- the file by its bare name, then linked by the C compiler, then run in that
@@ -10,6 +11,12 @@ export (execute, diffLimit)
 -- directive says. Then each dump golden is checked against `boot check
 -- --dump STAGE`, which is not cached, since the dump is what is tested.
 --
+-- Running a case and judging it are separate: `observe` runs the processes
+-- and gathers what they produced, and `verdict` and `Bless.decide` are pure
+-- functions of that, the case and its goldens. Every dump is run whenever the
+-- compile answered, even when the output already failed, since bless needs
+-- them all.
+--
 -- Every actual result is written under `ACTUAL/NAME/` for inspection, whether
 -- the case passed or not: `output`, and one file per dump.
 
@@ -18,7 +25,9 @@ import Process as Process
 import System.IO (IOError)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
-import Case (Case(..), Expected(..), Outcome(..), Result(..))
+import Bless (Blessing(..), Guard(..))
+import Bless as Bless
+import Case (Case(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..), Recorded(..))
 import Case as Case
 import Cache (Cache, Compiled(..))
 import Cache as Cache
@@ -38,10 +47,14 @@ let defaultTimeout : Int = 300
 -- What became of a case, before its time is added.
 type Verdict = Verdict { outcome : Outcome, why : String, diff : String }
 
-fun execute(t : Toolchain, cache : Cache, actual : String, c : Case) -> Result {
+-- Returns the outcome of case `c` and what bless would do with it. Writes the
+-- actual results under `ACTUAL/NAME/`, and never writes a golden.
+fun execute(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Result, Blessing) {
     let watch = Stopwatch.start()
-    let Verdict { outcome, why, diff } = expected(c, judge(t, cache, actual + "/" + c.name, c))
-    Result { outcome, why, diff, millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000 }
+    let (judged, blessing) = assess(t, cache, actual + "/" + c.name, c)
+    let Verdict { outcome, why, diff } = expected(c, judged)
+    let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
+    (Result { outcome, why, diff, millis }, blessing)
 }
 
 -- An `xfail` case turns a wrong answer into the failure it expects and a
@@ -53,111 +66,159 @@ fun expected(c : Case, judged : Verdict) -> Verdict = match (c.xfail, judged.out
     _ -> judged
 }
 
-fun harnessError(e : SomeError) -> Verdict = Verdict(HarnessError, Error.describe(e), "")
-
-fun judge(t : Toolchain, cache : Cache, actual : String, c : Case) -> Verdict {
-    if let Some(problem) = c.problem { return Verdict(HarnessError, problem, "") }
+fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict, Blessing) {
+    if let Some(problem) = c.problem { return unrunnable(problem) }
     for r in c.requires {
-        if !Toolchain.satisfies(t, r) { return Verdict(Skip, "requires " + Case.requirementName(r), "") }
+        if !Toolchain.satisfies(t, r) {
+            let why = "requires " + Case.requirementName(r)
+            return (Verdict(Skip, why, ""), Keep(why))
+        }
     }
-    let golden = match Files.readText(c.golden) {
-        Right(text) -> text
-        Left(e) -> return harnessError(e)
+    let recorded = match goldens(c) {
+        Right(recorded) -> recorded
+        Left(e) -> return unrunnable(Error.describe(e))
     }
+    let observed = match observe(t, cache, actual, c) {
+        Right(observed) -> observed
+        Left(why) -> return unrunnable(why)
+    }
+    (verdict(c, recorded, observed), Bless.decide(c, recorded, observed))
+}
+
+fun unrunnable(why : String) -> (Verdict, Blessing) = (Verdict(HarnessError, why, ""), Refuse(Unrunnable, why))
+
+-- The case's goldens as they are on disk. A missing `.expected` is not an
+-- error here: the verdict reports it, and bless creates it.
+fun goldens(c : Case) -> Either SomeError Recorded {
+    let expected = if Files.exists(c.golden) { Some(Files.readText(c.golden)?) } else { None }
+    let dumps = []
+    for (_, path) in c.dumps { Vec.push(dumps, Files.readText(path)?) }
+    Right(Recorded { expected, dumps = Vec.toArray(dumps) })
+}
+
+-- -- running ---------------------------------------------------------------------------
+
+-- The case compiled, run, and dumped. `Left` is why it could not be: a
+-- harness error, not a result.
+fun observe(t : Toolchain, cache : Cache, actual : String, c : Case) -> Either String Observed {
     let compiled = match Cache.compile(cache, t, c) {
         Right(compiled) -> compiled
-        Left(e) -> return harnessError(e)
+        Left(e) -> return Left(Error.describe(e))
     }
     let ran = match compiled {
-        Crashed(why, stderr) -> {
-            record(actual, "output", stderr)
-            return Verdict(CompilerCrash, why, tail(stderr))
-        }
-        Overran(stderr) -> {
-            record(actual, "output", stderr)
-            return Verdict(Timeout, "boot or the link took too long", tail(stderr))
-        }
-        Refused(_, stderr) -> {
-            record(actual, "output", stderr)
-            let diff = Diff.unified(golden, stderr, diffLimit)
-            return match c.expected {
-                Rejected -> if diff == "" { dumps(t, actual, c) }
-                            else { Verdict(Fail, "the diagnostic differs", diff) }
-                _ -> Verdict(Fail, "did not compile", diff)
-            }
-        }
+        Crashed(why, stderr) -> (CompileCrash(why), stderr)
+        Overran(stderr) -> (CompileExpired, stderr)
+        Refused(code, stderr) -> (Diagnosed(code), stderr)
         Built(binary, warnings) -> match runProgram(t, c, binary, warnings) {
             Right(r) -> r
             Left(e) -> {
                 record(actual, "output", "")
-                return Verdict(HarnessError, "the program did not start: " + Error.message(e), "")
+                return Left("the program did not start: " + Error.message(e))
             }
         }
     }
-    let (status, output, programStderr) = ran
+    let (ending, output) = ran
     record(actual, "output", output)
-    let diff = Diff.unified(golden, output, diffLimit)
-    match status {
-        TimedOut -> Verdict(Timeout, "the program ran out of time", diff)
-        Signaled(n) -> Verdict(ProgramCrash, "the program died by signal " + Int.toString(n), diff)
-        Exited(code) -> {
-            let panicked = Cache.panicked(programStderr)
-            let wrongEnd = match c.expected {
-                Exits(n) -> if panicked { Some("panicked") }
-                            else if code != n { Some("exited " + Int.toString(code) + ", not " + Int.toString(n)) }
-                            else { None }
-                Panics -> if panicked && code != 0 { None }
-                          else { Some("exited " + Int.toString(code) + " without the panic --@ panic expects") }
-                Rejected -> Some("compiled, but --@ error expects a compile error")
-            }
-            match wrongEnd {
-                Some(why) -> Verdict(Fail, why, diff)
-                None -> if diff != "" { Verdict(Fail, "the output differs", diff) } else { dumps(t, actual, c) }
-            }
-        }
+    let dumps = match ending {
+        CompileCrash(_) | CompileExpired -> []
+        Diagnosed(_) | Ran(_) -> runDumps(t, actual, c)?
     }
+    Right(Observed { ending, output, dumps })
 }
 
--- The compiled program run in the case's directory: how it ended, what the
--- golden is compared with, and its own stderr, where a panic is looked for.
+-- The compiled program run in the case's directory: how it ended, and what
+-- the golden is compared with.
 fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
-    -> Either IOError (Status, String, String) {
+    -> Either IOError (Ending, String) {
     let argv = t.run + [binary]
     let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
     let Output { stdout, stderr, status } = Process.run(Toolchain.command(t, argv, c.directory), Some(limit))?
     let err = Toolchain.text(stderr)
-    Right((status, Toolchain.text(stdout) + warnings + err, err))
+    Right((Ran(finish(status, err)), Toolchain.text(stdout) + warnings + err))
 }
 
--- Each dump golden against what `boot check --dump STAGE` prints, stdout then
--- stderr; the first that differs decides.
-fun dumps(t : Toolchain, actual : String, c : Case) -> Verdict {
-    for (stage, golden) in c.dumps {
-        let expected = match Files.readText(golden) {
-            Right(text) -> text
-            Left(e) -> return harnessError(e)
-        }
+-- Each of the case's dump stages, as `boot check --dump STAGE` ended and what
+-- it printed, stdout then stderr.
+fun runDumps(t : Toolchain, actual : String, c : Case) -> Either String (Array (Finish, String)) {
+    let out = []
+    for (stage, _) in c.dumps {
         let argv = t.run + [t.boot, "check", "--dump", stage, c.entry]
         let limit = Toolchain.limit(t, defaultTimeout)
-        let out = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
-            Right(out) -> out
-            Left(e) -> return Verdict(HarnessError, "boot did not start: " + Error.message(e), "")
+        let ran = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
+            Right(ran) -> ran
+            Left(e) -> return Left("boot did not start: " + Error.message(e))
         }
-        let stderr = Toolchain.text(out.stderr)
-        let printed = Toolchain.text(out.stdout) + stderr
+        let stderr = Toolchain.text(ran.stderr)
+        let printed = Toolchain.text(ran.stdout) + stderr
         record(actual, stage, printed)
-        let diff = Diff.unified(expected, printed, diffLimit)
-        match out.status {
-            TimedOut -> return Verdict(Timeout, "the " + stage + " dump took too long", diff)
-            Signaled(n) -> return Verdict(CompilerCrash, "the " + stage + " dump died by signal " + Int.toString(n), tail(stderr))
-            Exited(code) -> {
-                if Cache.panicked(stderr) { return Verdict(CompilerCrash, "the " + stage + " dump panicked", tail(stderr)) }
-                if diff != "" { return Verdict(Fail, "the " + stage + " dump differs", diff) }
-                if code != 0 { return Verdict(Fail, "the " + stage + " dump exited " + Int.toString(code), "") }
-            }
+        Vec.push(out, (finish(ran.status, stderr), printed))
+    }
+    Right(Vec.toArray(out))
+}
+
+-- How a process ended, given its stderr, where a panic is looked for.
+fun finish(status : Status, stderr : String) -> Finish = match status {
+    TimedOut -> Expired
+    Signaled(n) -> Killed(n)
+    Exited(code) -> if Cache.panicked(stderr) { Panicked(code) } else { Returned(code) }
+}
+
+-- Keep `text` as the actual result `name` of a case. Failing to is not a
+-- reason to fail the case, which has been judged on what was compared.
+fun record(directory : String, name : String, text : String) -> Unit {
+    let _ = Files.writeText(directory + "/" + name, text)
+}
+
+-- -- judging ---------------------------------------------------------------------------
+
+-- The outcome of a case whose goldens are `recorded` and whose run produced
+-- `observed`. The output is judged first, then each dump in turn; the first
+-- that is wrong decides.
+fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict {
+    let golden = match recorded.expected {
+        Some(text) -> text
+        None -> {
+            let file = Option.fold(String.rsplitOnce(c.golden, "/"), c.golden, _.1)
+            return Verdict(HarnessError, "no " + file + " beside " + c.entry, "")
         }
     }
+    let output = observed.output
+    let diff = Diff.unified(golden, output, diffLimit)
+    match observed.ending {
+        CompileCrash(why) -> return Verdict(CompilerCrash, why, tail(output))
+        CompileExpired -> return Verdict(Timeout, "boot or the link took too long", tail(output))
+        Ran(Expired) -> return Verdict(Timeout, "the program ran out of time", diff)
+        Ran(Killed(n)) -> return Verdict(ProgramCrash, "the program died by signal " + Int.toString(n), diff)
+        Diagnosed(_) | Ran(Returned(_)) | Ran(Panicked(_)) -> {}
+    }
+    if let Some(why) = Case.disagreement(c.expected, observed.ending) { return Verdict(Fail, why, diff) }
+    if diff != "" {
+        let why = match observed.ending {
+            Diagnosed(_) -> "the diagnostic differs"
+            _ -> "the output differs"
+        }
+        return Verdict(Fail, why, diff)
+    }
+    for i in Int.range(0, len(c.dumps)) {
+        if let Some(v) = dumpVerdict(c.dumps[i].0, recorded.dumps[i], observed.dumps[i]) { return v }
+    }
     Verdict(Pass, "", "")
+}
+
+-- What is wrong with the dump of `stage`, whose golden is `golden`, if
+-- anything is.
+fun dumpVerdict(stage : String, golden : String, ran : (Finish, String)) -> Option Verdict {
+    let (finished, printed) = ran
+    let dump = "the " + stage + " dump"
+    let diff = Diff.unified(golden, printed, diffLimit)
+    match finished {
+        Expired -> Some(Verdict(Timeout, dump + " took too long", diff))
+        Killed(n) -> Some(Verdict(CompilerCrash, dump + " died by signal " + Int.toString(n), tail(printed)))
+        Panicked(_) -> Some(Verdict(CompilerCrash, dump + " panicked", tail(printed)))
+        Returned(code) -> if diff != "" { Some(Verdict(Fail, dump + " differs", diff)) }
+                          else if code != 0 { Some(Verdict(Fail, dump + " exited " + Int.toString(code), "")) }
+                          else { None }
+    }
 }
 
 -- A crash's last lines, which is where what went wrong usually is.
@@ -165,10 +226,4 @@ fun tail(text : String) -> String {
     let lines = String.lines(text)
     let from = max(len(lines) - diffLimit, 0)
     String.unlines(Vec.slice(lines, from, len(lines)))
-}
-
--- Keep `text` as the actual result `name` of a case. Failing to is not a
--- reason to fail the case, which has been judged on what was compared.
-fun record(directory : String, name : String, text : String) -> Unit {
-    let _ = Files.writeText(directory + "/" + name, text)
 }

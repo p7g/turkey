@@ -3,6 +3,11 @@
 #
 #   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [PATH[::CASE]...]
 #   scripts/test.sh --selftest
+#   scripts/test.sh --bless [PATH[::CASE]...]
+#
+# --bless writes the actual results of the cases selected over their goldens,
+# refusing any that look like a broken compiler; tests/harness/Bless.gob says
+# which. Read the diff before committing what it wrote.
 #
 # Builds two programs first, each cached by a fingerprint of its inputs under
 # $TMPDIR/turkey-test/ and reused while that fingerprint holds:

@@ -52,6 +52,8 @@ def test_an_implicit_function_uses_its_parameter_once(body):
     ("match _ { _ -> print(1) }", "the value 'match' inspects"),
     ("match _.moons { _ -> print(1) }", "the value 'match' inspects"),
     ("if let Some(x) = _ { print(x) }", "the value a 'let' condition matches"),
+    ("if Array.contains(_, 2) { print(1) }", "the condition of 'if'"),
+    ("for x in Array.map(xs, _) { print(x) }", "the sequence of 'for'"),
     ("while let Some(x) = _ { print(x) }", "the value a 'let' condition matches"),
 ])
 def test_a_condition_refuses_a_placeholder(body, where):
@@ -95,4 +97,14 @@ def test_a_non_final_placeholder_statement_is_a_discarded_function():
     ("print(Array.map(xs, show((_ + 1) * 2)))", "fun($x) = ($x + 1) * 2"),
 ])
 def test_a_mismatch_at_the_call_says_what_the_placeholder_meant(body, meaning):
+    assert f"where '_' means '{meaning}'" in fails(body)
+
+
+@pytest.mark.parametrize("body, meaning", [
+    ("print(Array.map(xs, pow(_, 2) + \"!\"))", "fun($x) = pow($x, 2)"),
+    ("print(Array.map(xs, \"!\" + pow(n, _)))", "fun($x) = pow(n, $x)"),
+])
+def test_a_mismatch_at_an_operator_says_what_the_placeholder_meant(body, meaning):
+    """A bare `_` stops at its call, so the operator around the call is
+    where a function meets the value it was meant to make."""
     assert f"where '_' means '{meaning}'" in fails(body)

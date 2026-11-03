@@ -1,5 +1,5 @@
 export (
-    allocate, collect, report, rootsHead, pause,
+    allocate, collect, report, rootsHead, pause, retireHeld,
 )
 
 -- The heap and its collector: regions of fixed-size slots, allocation into
@@ -218,7 +218,7 @@ var markEpoch : Int = 0
 -- `markerBytes` apart by worker index; kept across collections, so its
 -- growth is paid for once.
 let markerBytes : Int = 24
-var markers : Prim.Ptr = zeroed(markerBytes * 64)
+var markers : Prim.Ptr = zeroed(markerBytes * Workers.threadLimit())
 
 -- The old objects the write barrier has seen given a young one since the last
 -- collection, each once: its generation word says it is here.
@@ -691,6 +691,15 @@ fun retireWorker(w : Prim.Ptr) -> Unit {
         }
     }
     localFold(w)
+}
+
+-- Give a blocked worker's cursors back, as `retire` does, for the monitor
+-- (`Turkey.Monitor`), which holds the worker so that it cannot allocate:
+-- under the lock, since every other worker may be allocating.
+fun retireHeld(w : Prim.Ptr) -> Unit {
+    Lock.acquire(heapLock)
+    retireWorker(w)
+    Lock.release(heapLock)
 }
 
 -- Append worker `w`'s remembered objects to the running worker's set, which
@@ -1459,8 +1468,8 @@ var failure : Prim.Ptr = Prim.ptrNull()
 -- Each worker's word saying the collection wants it to mark, by index,
 -- cleared by the worker once it has finished; and each's saying it is
 -- waiting in `pause`, where it would see that.
-var helping : Prim.Ptr = zeroed(8 * 64)
-var pausing : Prim.Ptr = zeroed(8 * 64)
+var helping : Prim.Ptr = zeroed(8 * Workers.threadLimit())
+var pausing : Prim.Ptr = zeroed(8 * Workers.threadLimit())
 
 -- The pool: full packets, and empty ones kept for reuse, each a list through
 -- its packet's first word. A packet is that word, a count, and its entries.
@@ -1987,7 +1996,12 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 -- The run's totals, when TURKEY_GC_STATS asked for them.
 foreign "turkey_gc_report" fun report() -> Unit {
     if !statsWanted { return {} }
+    -- With the world stopped, as a collection retires: other workers may
+    -- still be allocating, and the monitor retiring a blocked one's cursors.
+    -- A collection under way stops this worker at the loop's poll.
+    while !Workers.stopTheWorld() {}
     retire()
+    Workers.startTheWorld()
     textLength = 0
     put(Prim.cString("[gc] region bytes "))
     putInt(regionBytesInUse)
@@ -2039,6 +2053,15 @@ foreign "turkey_gc_report" fun report() -> Unit {
     putInt(collections - statsMinor)
     put(Prim.cString(", remembered "))
     putInt(Prim.atomicLoad(statsCounts, statsRememberedAt))
+    put(Prim.cString("\n"))
+    writeLine()
+    -- Every collection's stop visits every thread.
+    put(Prim.cString("[gc] threads "))
+    putInt(Workers.count())
+    put(Prim.cString(" of at most "))
+    putInt(Workers.threadLimit())
+    put(Prim.cString(", permits "))
+    putInt(Workers.permits())
     put(Prim.cString("\n"))
     writeLine()
 }

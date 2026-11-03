@@ -28,7 +28,10 @@ export (
 --
 -- The calls that can wait on something outside the program go through
 -- `Turkey.Workers`' blocking entries, so that a collection need not wait for
--- the worker; those read `errno` before the worker runs Turkey code again.
+-- the thread and the monitor may hand its permit to another; those read
+-- `errno` before the thread runs Turkey code again. Each is followed by
+-- `Turkey.Scheduler.afterCall`, which gives the task back if its thread came
+-- back without a permit.
 -- `fcntl` and `isatty` are called directly: with the commands used here, each
 -- answers from the descriptor's own state without waiting.
 
@@ -54,6 +57,7 @@ import Data.String (String)
 import Data.String as Str
 import Turkey.Libc as Libc
 import Turkey.Memory as Memory
+import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 import Turkey.Workers as Workers
 
@@ -64,6 +68,7 @@ import Turkey.Workers as Workers
 fun read(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingRead(fd, addressOf(bytes, from), to - from)
+    Scheduler.afterCall()
     Prim.keepAlive(bytes)
     n
 }
@@ -73,6 +78,7 @@ fun read(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
 fun write(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingWrite(fd, addressOf(bytes, from), to - from)
+    Scheduler.afterCall()
     Prim.keepAlive(bytes)
     n
 }
@@ -84,6 +90,7 @@ fun writeText(fd : Int, text : String, from : Int, to : Int) -> Int {
     let storage = Str.bytesOf(text)
     within(len(storage), from, to)
     let n = Workers.blockingWrite(fd, Prim.elementAddress(storage, from), to - from)
+    Scheduler.afterCall()
     Prim.keepAlive(storage)
     n
 }
@@ -94,6 +101,7 @@ fun writeText(fd : Int, text : String, from : Int, to : Int) -> Int {
 fun readAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingPread(fd, addressOf(bytes, from), to - from, offset)
+    Scheduler.afterCall()
     Prim.keepAlive(bytes)
     n
 }
@@ -103,6 +111,7 @@ fun readAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> 
 fun writeAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingPwrite(fd, addressOf(bytes, from), to - from, offset)
+    Scheduler.afterCall()
     Prim.keepAlive(bytes)
     n
 }
@@ -117,6 +126,7 @@ fun writeAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) ->
 fun open(path : String, flags : Int, mode : Int) -> Int {
     let name = cPath(path)
     let fd = Workers.blockingOpen(addressOf(name, 0), flags, mode)
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     fd
 }
@@ -125,7 +135,11 @@ fun open(path : String, flags : Int, mode : Int) -> Int {
 -- that fails, which for a file just written can be where a deferred write
 -- error is first reported, is not retried, since the number may already be
 -- someone else's.
-fun close(fd : Int) -> Int = Workers.blockingClose(fd)
+fun close(fd : Int) -> Int {
+    let r = Workers.blockingClose(fd)
+    Scheduler.afterCall()
+    r
+}
 
 -- `fcntl` with no argument, such as `Sys.getStatusFlags`: what the command
 -- answers, or the negated `errno`.
@@ -142,6 +156,7 @@ fun fstat(fd : Int, stat : Array Byte) -> Int {
         Prim.error("an array too short for a struct stat")
     }
     let r = Workers.blockingFstat(fd, addressOf(stat, 0))
+    Scheduler.afterCall()
     Prim.keepAlive(stat)
     r
 }
@@ -155,6 +170,7 @@ fun statAt(dir : Int, name : Array Byte, stat : Array Byte, flags : Int) -> Int 
     }
     terminated(name)
     let r = Workers.blockingFstatat(dir, addressOf(name, 0), addressOf(stat, 0), flags)
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     Prim.keepAlive(stat)
     r
@@ -192,6 +208,7 @@ fun isatty(fd : Int) -> Int {
 fun openAt(dir : Int, name : Array Byte, flags : Int, mode : Int) -> Int {
     terminated(name)
     let fd = Workers.blockingOpenat(dir, addressOf(name, 0), flags, mode)
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     fd
 }
@@ -201,6 +218,7 @@ fun openAt(dir : Int, name : Array Byte, flags : Int, mode : Int) -> Int {
 fun removeAt(dir : Int, name : Array Byte, flags : Int) -> Int {
     terminated(name)
     let r = Workers.blockingUnlinkat(dir, addressOf(name, 0), flags)
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     r
 }
@@ -210,6 +228,7 @@ fun removeAt(dir : Int, name : Array Byte, flags : Int) -> Int {
 fun makeDirectoryAt(dir : Int, name : Array Byte, mode : Int) -> Int {
     terminated(name)
     let r = Workers.blockingMkdirat(dir, addressOf(name, 0), mode)
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     r
 }
@@ -220,6 +239,7 @@ fun renameAt(fromDir : Int, from : Array Byte, toDir : Int, to : Array Byte) -> 
     terminated(from)
     terminated(to)
     let r = Workers.blockingRenameat(fromDir, addressOf(from, 0), toDir, addressOf(to, 0))
+    Scheduler.afterCall()
     Prim.keepAlive(from)
     Prim.keepAlive(to)
     r
@@ -231,6 +251,7 @@ fun renameAt(fromDir : Int, from : Array Byte, toDir : Int, to : Array Byte) -> 
 fun readLinkAt(dir : Int, name : Array Byte, into : Array Byte) -> Int {
     terminated(name)
     let r = Workers.blockingReadlinkat(dir, addressOf(name, 0), addressOf(into, 0), len(into))
+    Scheduler.afterCall()
     Prim.keepAlive(name)
     Prim.keepAlive(into)
     r
@@ -238,7 +259,11 @@ fun readLinkAt(dir : Int, name : Array Byte, into : Array Byte) -> Int {
 
 -- `flock`: 0, or the negated `errno`, `-EWOULDBLOCK` for a lock held
 -- elsewhere when `operation` has `Sys.lockNonBlocking`.
-fun flock(fd : Int, operation : Int) -> Int = Workers.blockingFlock(fd, operation)
+fun flock(fd : Int, operation : Int) -> Int {
+    let r = Workers.blockingFlock(fd, operation)
+    Scheduler.afterCall()
+    r
+}
 
 -- Make a directory named by `template`, a NUL-terminated path ending in six
 -- `X`s, which are replaced in place by the name chosen: 0, or the negated
@@ -260,7 +285,11 @@ fun openStream(fd : Int) -> Int {
 
 -- The next entry of `stream`: its address, good until the next call, or 0 at
 -- the end, or the negated `errno`. "." and ".." are entries.
-fun readEntry(stream : Int) -> Int = Workers.blockingReaddir(Prim.ptrFromInt(stream))
+fun readEntry(stream : Int) -> Int {
+    let entry = Workers.blockingReaddir(Prim.ptrFromInt(stream))
+    Scheduler.afterCall()
+    entry
+}
 
 -- An entry's `d_type`: one of `Sys.entryUnknown` and the others beside it.
 fun entryType(entry : Int) -> Int =

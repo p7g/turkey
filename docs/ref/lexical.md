@@ -159,7 +159,7 @@ True
 A decimal literal other than `0` does not start with a zero, so `010` is an
 error rather than ten or eight:
 
-<!-- error: leading zeros are not allowed in '010' -->
+<!-- error: '010' has a leading zero -->
 ```kotlin
 fun main() {
     print(010)
@@ -176,7 +176,7 @@ inference, as described in [Numeric literals](inference.md#numeric-literals).
 A literal larger than the largest `Int` is an error, even where a `Float` is
 wanted. `9223372036854775808` is one past the largest `Int`:
 
-<!-- error: integer literal out of range: 9223372036854775808 -->
+<!-- error: integer literal '9223372036854775808' is too large for 'Int' -->
 ```kotlin
 fun main() {
     print(9223372036854775808)
@@ -190,7 +190,7 @@ fun main() {
 > and a 64-bit pattern read as `-1` could be one. The largest hexadecimal
 > literal is `0x7FFF_FFFF_FFFF_FFFF`.
 
-<!-- error: integer literal out of range: 0xFFFF_FFFF_FFFF_FFFF -->
+<!-- error: integer literal '0xFFFF_FFFF_FFFF_FFFF' is too large for 'Int' -->
 ```kotlin
 fun main() {
     print(0xFFFF_FFFF_FFFF_FFFF)
@@ -275,7 +275,7 @@ fun main() {
 tab:	| quote:" | smile:😀
 ```
 
-<!-- error: is not a Unicode scalar value -->
+<!-- error: is a surrogate, and a character or string cannot contain one -->
 ```kotlin
 fun main() {
     print("\u{D800}")

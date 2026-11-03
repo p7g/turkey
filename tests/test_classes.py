@@ -52,7 +52,7 @@ instance Egal Int {
 def test_a_signature_must_state_a_return_type():
     with pytest.raises(CompileError) as exc:
         check("class C a { fun f(a) }")
-    assert "must state a return type" in exc.value.message
+    assert "has neither a body nor a return type" in exc.value.message
 
 
 def test_a_top_level_fun_may_not_omit_its_body():

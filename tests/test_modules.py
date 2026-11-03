@@ -144,12 +144,12 @@ def test_a_class_withheld_with_its_methods(tmp_path):
 
 @pytest.mark.parametrize("src, message", [
     ("import Helper (twice, ..)",
-     "'twice' is already brought in by '..'; beside '..' an item can only rename "
-     "a name, as in 'x as y', or withhold it, as in 'x as _'"),
-    ("import Helper (.., ..)", "'..' appears twice in one import list"),
+     "'twice' is already imported by '..'; remove it, or write 'twice as _' to "
+     "withhold it"),
+    ("import Helper (.., ..)", "'..' appears twice in this import list"),
     ("import Helper (twice as Twice)",
-     "'twice' cannot be renamed to 'Twice': a value's name begins with a lowercase "
-     "letter, and a type's, a class's or a constructor's with a capital"),
+     "'twice' cannot be renamed to 'Twice'; a value's name must start with a "
+     "lowercase letter"),
 ])
 def test_malformed_lists_are_refused(tmp_path, src, message):
     search = write(tmp_path, Helper=HELPER)
@@ -173,8 +173,8 @@ def test_as_underscore_withholds_only_what_it_names(tmp_path):
 def test_hiding_is_not_an_import_form(tmp_path):
     search = write(tmp_path, Helper=HELPER)
     assert fails("import Helper hiding (greet)", search) == (
-        "an import withholds a name with 'as _' beside '..', as in "
-        "'import Helper (x as _, ..)'; there is no 'hiding'")
+        "'hiding' cannot appear in an import; write "
+        "'import Helper (greet as _, ..)' instead")
 
 
 def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
@@ -451,14 +451,14 @@ def test_an_export_list_cannot_re_export_a_module(tmp_path):
     search = write(tmp_path, Nope="export (module Helper)\nimport Helper\nfun f() = 1",
                    Helper=HELPER)
     assert fails("import Nope", search) == (
-        "'module' cannot appear in an export list: a module exports only what "
-        "it declares, and a module that wants another's names imports it")
+        "'module' cannot appear in an export list; an export list can name only "
+        "declarations")
 
 
 def test_module_is_not_an_import_form(tmp_path):
     search = write(tmp_path, Helper=HELPER)
     assert fails("import Helper (module Helper)", search) == \
-        "expected an export name, found 'module'"
+        "expected a name, found keyword 'module'"
 
 
 # -- a type and an instance know which module made them -----------------------

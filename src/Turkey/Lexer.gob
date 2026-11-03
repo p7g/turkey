@@ -205,7 +205,7 @@ fun skipBlockComment(lx : Lexer) -> Unit {
     let start = here(lx)
     var depth = 0
     loop {
-        if atEnd(lx) { oops(lx, "unterminated block comment", start) }
+        if atEnd(lx) { oops(lx, "this block comment has no closing '-}'", start) }
         if charIs(peek(lx), '{') && charIs(peekAt(lx, 1), '-') {
             bumpBy(lx, 2)
             depth = depth + 1
@@ -245,15 +245,16 @@ fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
     }
     digitRun(lx, 10)
     let text = String.slice(lx.src, from, lx.at)
-    if String.startsWith(text, "0") && text != "0" {
-        oops(lx, "leading zeros are not allowed in '" + text
-                 + "' (octal is written 0o)", start)
-    }
     -- A `.` only continues the number when a digit follows, so `1.foo` stays
     -- an INT and a field access, and `0..n` a range.
-    if (charIs(peek(lx), '.') && isDigitIn(peekAt(lx, 1), 10)) || isExponentMark(peek(lx)) {
-        return lexFloat(lx, start, from)
+    let isFloat = (charIs(peek(lx), '.') && isDigitIn(peekAt(lx, 1), 10))
+        || isExponentMark(peek(lx))
+    if String.startsWith(text, "0") && text != "0" {
+        if isFloat { oops(lx, "'" + text + "' has a leading zero; remove it", start) }
+        oops(lx, "'" + text + "' has a leading zero; remove it, or write '0o"
+                 + withoutLeadingZeros(text) + "' for an octal number", start)
     }
+    if isFloat { return lexFloat(lx, start, from) }
     endOfNumeral(lx, start, 10)
     intToken(lx, start, from, text, 10)
 }
@@ -277,10 +278,34 @@ fun lexSelector(lx : Lexer, start : Span) -> Token {
     let from = lx.at
     while isDigitIn(peek(lx), 10) { bump(lx) }
     let text = String.slice(lx.src, from, lx.at)
-    if (String.startsWith(text, "0") && text != "0") || gluedOn(peek(lx)) {
-        oops(lx, "a tuple selector is a plain decimal index such as .0 or .1", start)
+    if String.startsWith(text, "0") && text != "0" {
+        oops(lx, "tuple index '." + text + "' has a leading zero; write '."
+                 + withoutLeadingZeros(text) + "'", start)
+    }
+    if let Some(c) = peek(lx) {
+        if gluedOn(Some(c)) {
+            oops(lx, "tuple index '." + text + "' cannot be followed directly by '"
+                     + Char.toString(c) + "'", start)
+        }
     }
     intToken(lx, start, from, text, 10)
+}
+
+-- `text`, a run of decimal digits and `_`s, without its leading zeros and the
+-- `_`s among them; "0" if nothing is left.
+fun withoutLeadingZeros(text : String) -> String {
+    var at = String.start(text)
+    loop {
+        match String.step(text, at) {
+            None -> { break }
+            Some(p) -> {
+                if p.0 != '0' && p.0 != '_' { break }
+                at = p.1
+            }
+        }
+    }
+    let rest = String.slice(text, at, String.end(text))
+    if rest == "" { "0" } else { rest }
 }
 
 -- `digits` is the numeral without its prefix, `from` where the whole of it
@@ -290,8 +315,8 @@ fun intToken(lx : Lexer, start : Span, from : String.Index, digits : String,
     Some(n) -> plain(KInt, VInt(n), start)
     -- `Int` is 64-bit, so a literal past its range is a compile error
     -- rather than something that wraps or widens.
-    None -> oops(lx, "integer literal out of range: "
-                     + String.slice(lx.src, from, lx.at), start)
+    None -> oops(lx, "integer literal '" + String.slice(lx.src, from, lx.at)
+                     + "' is too large for 'Int'", start)
 }
 
 -- Entered at the `.` of a fraction or at the `e` of an exponent. An exponent
@@ -305,8 +330,8 @@ fun lexFloat(lx : Lexer, start : Span, from : String.Index) -> Token {
         bump(lx)
         if charIsSign(peek(lx)) { bump(lx) }
         if !isDigitIn(peek(lx), 10) {
-            oops(lx, "exponent needs digits in '"
-                     + String.slice(lx.src, from, lx.at) + "'", start)
+            oops(lx, "the exponent in '" + String.slice(lx.src, from, lx.at)
+                     + "' has no digits", start)
         }
         digitRun(lx, 10)
     }
@@ -336,7 +361,7 @@ fun endOfNumeral(lx : Lexer, start : Span, radix : Int) -> Unit = match peek(lx)
     None -> {}
     Some(c) -> {
         if c == '_' {
-            oops(lx, "a '_' in a number must sit between two digits", start)
+            oops(lx, "'_' in this number is not between two digits; remove it", start)
         } else if Char.isDigit(c) {
             oops(lx, "invalid digit '" + Char.toString(c) + "' in "
                      + radixName(radix) + " literal", start)
@@ -413,9 +438,12 @@ fun lexString(lx : Lexer, start : Span) -> Token {
     let b = String.builder()
     loop {
         match peek(lx) {
-            None -> { oops(lx, "unterminated string literal", start) }
+            None -> { oops(lx, "the file ends inside this string literal", start) }
             Some(c) -> {
-                if c == '\n' { oops(lx, "newline in string literal", start) }
+                if c == '\n' {
+                    oops(lx, "this string literal has no closing '\"' on its line; "
+                             + "write '\\n' for a line break", start)
+                }
                 if c == '"' {
                     bump(lx)
                     break
@@ -435,19 +463,26 @@ fun lexString(lx : Lexer, start : Span) -> Token {
 fun lexChar(lx : Lexer, start : Span) -> Token {
     bump(lx)
     var value = '?'
+    var empty = False
     match peek(lx) {
-        None -> { oops(lx, "unterminated character literal", start) }
+        None -> { oops(lx, "the file ends inside this character literal", start) }
         Some(c) -> {
             if c == '\\' {
                 value = lexEscape(lx)
             } else {
+                empty = c == '\''
                 value = c
                 bump(lx)
             }
         }
     }
     if !charIs(peek(lx), '\'') {
-        oops(lx, "character literal must contain exactly one character", start)
+        if empty { oops(lx, "this character literal is empty", start) }
+        if atEnd(lx) || charIs(peek(lx), '\n') {
+            oops(lx, "this character literal has no closing quote", start)
+        }
+        oops(lx, "this character literal holds more than one character; "
+                 + "write text in double quotes", start)
     }
     bump(lx)
     plain(KChar, VChar(value), start)
@@ -464,7 +499,7 @@ fun lexEscape(lx : Lexer) -> Char {
     bump(lx)
     var c = '?'
     match peek(lx) {
-        None -> { oops(lx, "unterminated escape sequence", start) }
+        None -> { oops(lx, "the file ends inside this escape sequence", start) }
         Some(found) -> { c = found }
     }
     bump(lx)
@@ -482,7 +517,7 @@ fun lexEscape(lx : Lexer) -> Char {
 }
 
 let malformedUnicodeEscape =
-    "\\u escape must be written \\u{...}, with one to six hex digits in the braces"
+    "malformed '\\u' escape; write one to six hex digits in braces, as in '\\u{1F600}'"
 
 fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
     if !charIs(peek(lx), '{') { oops(lx, malformedUnicodeEscape, start) }
@@ -501,16 +536,16 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
     let code = Option.expect(valueIn(digits, 16), "six hex digits fit an Int")
     match Char.fromInt(code) {
         Some(c) -> c
-        None -> oops(lx, "\\u{" + digits + "} is not a Unicode scalar value: "
-                         + notScalarBecause(code), start)
+        None -> oops(lx, notScalar("'\\u{" + digits + "}'", code), start)
     }
 }
 
-fun notScalarBecause(code : Int) -> String =
+-- `Char.fromInt` refuses exactly the surrogates and what lies above 10FFFF.
+fun notScalar(escape : String, code : Int) -> String =
     if code <= 0xDFFF {
-        "the surrogates D800..DFFF are not characters, and a string may not contain one"
+        escape + " is a surrogate, and a character or string cannot contain one"
     } else {
-        "values above 10FFFF are not characters, and a string may not contain one"
+        escape + " is above '\\u{10FFFF}', the largest Unicode scalar value"
     }
 
 -- -- words and operators --------------------------------------------------------------

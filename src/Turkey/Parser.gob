@@ -153,15 +153,30 @@ fun isOperatorRun(tok : Token) -> Bool = match tok.kind {
 fun oops(p : P, message : String, where : Span) -> a =
     Diag.fail(Diag.at("parse error", message, where), p.file)
 
--- How a token is named in a message. A literal or a name is quoted with its
--- kind, since "found IDENT 'x'" says more than "found 'IDENT'"; everything
--- else *is* its kind, so it is quoted alone.
+-- Returns how a message names a token: as the user wrote it, in quotes. A
+-- string or character literal carries its own quotes, a keyword says it is
+-- one, and a line break or the end of the file is named in words.
 fun describe(tok : Token) -> String = match tok.kind {
-    KEof -> "end of input"
-    KNewline -> "end of line"
-    KInt | KFloat | KString | KChar | KIdent | KConid ->
-        Token.kindName(tok.kind) + " '" + text(tok) + "'"
-    _ -> "'" + Token.kindName(tok.kind) + "'"
+    KEof -> "end of file"
+    KNewline -> if tok.forced { "';'" } else { "end of line" }
+    KString -> Token.quote(text(tok))
+    KChar -> match tok.value {
+        VChar(c) -> charLiteral(c)
+        _ -> "'" + text(tok) + "'"
+    }
+    KWord(word) -> "keyword '" + word + "'"
+    KOp(op) -> "'" + op + "'"
+    KInt | KFloat | KIdent | KConid -> "'" + text(tok) + "'"
+}
+
+-- `c` spelled as a character literal. The value is all a token keeps, so a
+-- number comes back in decimal and an escape in `Token.quote`'s spelling.
+fun charLiteral(c : Char) -> String = match c {
+    '\'' -> "'\\''"
+    '"' -> "'\"'"
+    -- `quote` escapes for a string; with its double quotes gone, the escapes
+    -- that remain are the same in a character literal.
+    _ -> "'" + String.replace(Token.quote(Char.toString(c)), "\"", "") + "'"
 }
 
 -- A token's value as text, which is what an error message quotes and what a
@@ -254,11 +269,15 @@ fun parseProgram(p : P) -> Program {
         } else if atInfix(p) {
             Vec.push(decls, DInfix(parseInfixDecl(p)))
         } else if at(p, "export") {
-            oops(p, "an export declaration comes first in its file, before "
-                    + "any import or declaration", cur(p).span)
+            if Option.isSome(exportDecl) {
+                oops(p, "this file already has an export declaration; "
+                        + "merge the two", cur(p).span)
+            }
+            oops(p, "this 'export' comes after an import or declaration; "
+                    + "move it to the top of the file", cur(p).span)
         } else if at(p, "module") {
-            oops(p, "a module's exports are declared with 'export (...)', "
-                    + "not 'module (...)'", cur(p).span)
+            oops(p, "'module' cannot begin a declaration; write 'export (...)' "
+                    + "to list the module's exports", cur(p).span)
         } else {
             oops(p, "expected a top-level declaration, found "
                     + describe(cur(p)), cur(p).span)
@@ -288,9 +307,8 @@ fun parseExportDecl(p : P) -> ExportDecl {
     let items = Vec.new(8)
     while !at(p, ")") {
         if at(p, "module") {
-            oops(p, "'module' cannot appear in an export list: a module exports "
-                    + "only what it declares, and a module that wants another's "
-                    + "names imports it", cur(p).span)
+            oops(p, "'module' cannot appear in an export list; an export list "
+                    + "can name only declarations", cur(p).span)
         }
         Vec.push(items, parseExportItem(p))
         if !eat(p, ",") { break }
@@ -310,7 +328,7 @@ fun parseExportItem(p : P) -> ExportItem {
     }
     let tok = advance(p)
     if !isNameToken(tok) {
-        oops(p, "expected an export name, found " + describe(tok), tok.span)
+        oops(p, "expected a name, found " + describe(tok), tok.span)
     }
     var subs : Option (Vec String) = None
     if isConid(tok) && at(p, "(") {
@@ -350,11 +368,26 @@ fun parseImport(p : P) -> ImportDecl {
         items = Some(list)
         rest = dots
     } else if at(p, "IDENT") && text(cur(p)) == "hiding" {
-        oops(p, "an import withholds a name with 'as _' beside '..', as in "
-                + "'import " + name + " (x as _, ..)'; there is no 'hiding'",
-             cur(p).span)
+        oops(p, "'hiding' cannot appear in an import; write 'import " + name
+                + " (" + withheld(p) + "..)' instead", cur(p).span)
     }
     ImportDecl { span = s, name = name, alias = alias, items = items, rest = rest }
+}
+
+-- The names in the list after a `hiding` at the cursor, each as `x as _, `,
+-- for a message to suggest; `x as _, ` when there is no such list.
+fun withheld(p : P) -> String {
+    let b = String.builder()
+    if Token.kindName(peek(p, 1).kind) == "(" {
+        var ahead = 2
+        while isNameToken(peek(p, ahead)) {
+            String.push(b, text(peek(p, ahead)) + " as _, ")
+            if Token.kindName(peek(p, ahead + 1).kind) != "," { break }
+            ahead = ahead + 2
+        }
+    }
+    let names = String.build(b)
+    if names == "" { "x as _, " } else { names }
 }
 
 -- `(a, T(..), x as y, C as _, ..)`. Beside a `..`, which already brings every
@@ -367,7 +400,7 @@ fun parseImportList(p : P) -> (Vec ImportItem, Bool) {
         if at(p, "..") {
             let tok = advance(p)
             if Option.isSome(dots) {
-                oops(p, "'..' appears twice in one import list", tok.span)
+                oops(p, "'..' appears twice in this import list", tok.span)
             }
             dots = Some(tok.span)
         } else {
@@ -379,9 +412,9 @@ fun parseImportList(p : P) -> (Vec ImportItem, Bool) {
     if Option.isSome(dots) {
         for entry in items {
             if Option.isNone(entry.rename) {
-                oops(p, "'" + entry.item.name + "' is already brought in by '..'; "
-                        + "beside '..' an item can only rename a name, as in "
-                        + "'x as y', or withhold it, as in 'x as _'",
+                let name = entry.item.name
+                oops(p, "'" + name + "' is already imported by '..'; remove it, "
+                        + "or write '" + name + " as _' to withhold it",
                      entry.item.span)
             }
         }
@@ -399,8 +432,9 @@ fun parseImportItem(p : P) -> ImportItem {
     -- as `infix G (<+>) = M.f`, and the group is then written where it is
     -- used.
     if operator && text(tok) != "_" {
-        oops(p, "an operator cannot be renamed; import it as '_' to withhold it, "
-                + "or declare the spelling you want with 'infix'", tok.span)
+        oops(p, "operator '" + item.name + "' cannot be renamed; write '("
+                + item.name + ") as _' to withhold it, or declare the spelling "
+                + "you want with 'infix'", tok.span)
     }
     if !isNameToken(tok) {
         oops(p, "expected a name, or '_' for none, after 'as', found "
@@ -408,9 +442,13 @@ fun parseImportItem(p : P) -> ImportItem {
     }
     let to = text(tok)
     if to != "_" && isConid(tok) != startsUpper(item.name) {
-        oops(p, "'" + item.name + "' cannot be renamed to '" + to + "': a value's "
-                + "name begins with a lowercase letter, and a type's, a class's or "
-                + "a constructor's with a capital", tok.span)
+        let rule = if startsUpper(item.name) {
+            "the name of a type, class or constructor must start with a capital"
+        } else {
+            "a value's name must start with a lowercase letter"
+        }
+        oops(p, "'" + item.name + "' cannot be renamed to '" + to + "'; " + rule,
+             tok.span)
     }
     ImportItem { item = item, rename = Some(to) }
 }
@@ -456,7 +494,7 @@ fun parseInfixDecl(p : P) -> InfixDecl {
         skipWhat(p, ".", "a function name")
         target = qualifier + "." + text(expectWhat(p, "IDENT", "a function name"))
     } else {
-        oops(p, "expected the function the operator means, found "
+        oops(p, "expected the name of a function after '=', found "
                 + describe(targetTok), targetTok.span)
     }
     InfixDecl {
@@ -572,7 +610,8 @@ fun parseConContext(p : P) -> (Vec String, Vec Pred) {
         let s = cur(p).span
         let written = parseTypeExpr(p)
         if at(p, "~") {
-            oops(p, "a constructor's bracket may not state an equality", s)
+            oops(p, "'~' cannot appear in an existential bracket; write type "
+                    + "variables such as 's' and constraints such as 'Error e'", s)
         }
         match written.kind {
             TEVar(name) -> Vec.push(binders, name)
@@ -590,8 +629,8 @@ fun parseConContext(p : P) -> (Vec String, Vec Pred) {
 }
 
 let conContextShape =
-    "a constructor's bracket holds type variables, as in 's', and classes "
-    + "applied to one type, as in 'Error e'"
+    "this entry is neither a type variable nor a constraint; an existential "
+    + "bracket can hold only entries such as 's' or 'Error e'"
 
 fun parseConDecl(p : P) -> ConDecl {
     let tok = expectWhat(p, "CONID", "a constructor name")
@@ -617,8 +656,8 @@ fun parseConDecl(p : P) -> ConDecl {
         skipToken(p, ")")
         fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(args))
     } else if at(p, "IDENT") || at(p, "CONID") || at(p, "fun") {
-        oops(p, "constructor '" + text(tok) + "' must parenthesize its payload: write '"
-                + text(tok) + "(...)'", cur(p).span)
+        oops(p, "the payload of constructor '" + text(tok) + "' is not in "
+                + "parentheses; write '" + text(tok) + "(...)'", cur(p).span)
     }
     ConDecl {
         span = tok.span, name = text(tok), args = args, fields = None,
@@ -638,8 +677,8 @@ fun fieldSeparator(p : P) -> Bool {
     if !at(p, "NEWLINE") { return False }
     skipNewlines(p)
     if !at(p, "IDENT") && !at(p, "var") && !at(p, "..") && !at(p, "}") {
-        oops(p, "a line break separates fields here, so this line must begin "
-                + "a field; found " + describe(cur(p)), cur(p).span)
+        oops(p, "expected a field or '}' at the start of this line, found "
+                + describe(cur(p)), cur(p).span)
     }
     True
 }
@@ -668,7 +707,7 @@ fun parseRecordPayload(p : P) -> (Vec (String, Type), Vec String, Vec Span) {
         if assignable { Vec.push(vars, text(tok)) }
         Vec.push(spans, tok.span)
         if Vec.contains(seen, text(tok)) {
-            oops(p, "duplicate field '" + text(tok) + "'", tok.span)
+            oops(p, "field '" + text(tok) + "' is declared twice", tok.span)
         }
         Vec.push(seen, text(tok))
         skipToken(p, ":")
@@ -693,14 +732,15 @@ fun parseTypeExpr(p : P) -> Type {
             if len(existing) == 0 {
                 return mkType(p, head.span, TECon(name, args))
             }
-            oops(p, "only a type constructor or a type variable can be applied "
-                    + "to arguments", head.span)
+            oops(p, "'" + name + "' is applied to arguments both inside and "
+                    + "outside parentheses; write them all after '" + name + "'",
+                 head.span)
         }
         -- A variable in head position: `f a`, which is what a higher-kinded
         -- parameter looks like at the surface.
         TEVar(_) -> mkType(p, head.span, TEApp(head, args))
-        _ -> oops(p, "only a type constructor or a type variable can be applied "
-                     + "to arguments", head.span)
+        _ -> oops(p, "this type cannot be applied to arguments; only a type "
+                     + "name or a type variable can be", head.span)
     }
 }
 
@@ -754,7 +794,8 @@ fun parseParenType(p : P, tok : Token) -> Type {
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
-                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
+                oops(p, "a tuple cannot have just one component; remove the "
+                        + "trailing ','", cur(p).span)
             }
             break
         }
@@ -825,8 +866,8 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
     }
     skipToken(p, ")")
     if !eat(p, "->") {
-        oops(p, "method '" + name + "' has no body, so it is a signature and must "
-                + "state a return type", cur(p).span)
+        oops(p, "method '" + name + "' has neither a body nor a return type; "
+                + "add '-> T' after the parameters", cur(p).span)
     }
     let ret = parseTypeExpr(p)
     -- A parameter of a stated type with no name is an anonymous binder.
@@ -862,22 +903,22 @@ fun parseForeignDecl(p : P) -> Decl {
     step(p)
     let symbol = text(tok)
     if symbol == "" {
-        oops(p, "a foreign declaration needs a C symbol", tok.span)
+        oops(p, "the C symbol is empty; write its name between the quotes",
+             tok.span)
     }
     skipToken(p, "fun")
     let name = text(expectWhat(p, "IDENT", "a function name"))
     let (params, variadic) = parseForeignParams(p)
     if !eat(p, "->") {
-        oops(p, "foreign '" + name + "' has no body, so it must state a return "
-                + "type; a C function that returns nothing writes '-> Unit'",
+        oops(p, "foreign '" + name + "' has no return type; add '-> T' after "
+                + "the parameters, or '-> Unit' if it returns nothing",
              cur(p).span)
     }
     let ret = parseTypeExpr(p)
     if at(p, "{") || at(p, "=") {
         if let Some((_, marker)) = variadic {
             oops(p, "foreign '" + name + "' has a body, so it cannot be "
-                    + "variadic: a Turkey body has no way to read C's variadic "
-                    + "arguments", marker)
+                    + "variadic; remove the '...'", marker)
         }
         -- Every parameter of a definition is a binder, and a name is what
         -- binds one; an unnamed parameter could never be read.
@@ -891,7 +932,7 @@ fun parseForeignDecl(p : P) -> Decl {
             }
             if !named {
                 oops(p, "foreign '" + name + "' has a body, so each parameter "
-                        + "needs a name: write 'x : T'", param.span)
+                        + "needs a name; write 'x : T'", param.span)
             }
         }
         let body = parseFunBody(p)
@@ -934,12 +975,13 @@ fun parseForeignParams(p : P) -> (Vec Pat, Option (Int, Span)) {
         if at(p, "...") {
             let marker = cur(p).span
             if Option.isSome(variadic) {
-                oops(p, "a foreign parameter list has one '...'", marker)
+                oops(p, "'...' appears twice in this parameter list; remove "
+                        + "one", marker)
             }
             step(p)
             if at(p, ")") {
-                oops(p, "'...' must be followed by the variadic arguments "
-                        + "this declaration passes, each with its type", marker)
+                oops(p, "'...' has no parameters after it; declare the variadic "
+                        + "arguments after it, as in '... mode : Int'", marker)
             }
             variadic = Some((len(params), marker))
         }
@@ -999,8 +1041,8 @@ fun parsePredEntry(p : P) -> Pred {
 }
 
 let contextShape =
-    "a context entry is a class applied to one type, as in 'Ord a', or an "
-    + "equality, as in 'Item c ~ Op'"
+    "this entry is neither a constraint nor an equality; a context can hold "
+    + "only entries such as 'Ord a' or 'Item c ~ Op'"
 
 -- -- classes and instances -------------------------------------------------------------
 
@@ -1065,13 +1107,13 @@ fun parseClassBody(p : P, isClass : Bool, param : String)
     while !at(p, "}") {
         if at(p, "type") {
             let s = expect(p, "type").span
-            let name = text(expectWhat(p, "CONID", "a type family name"))
+            let name = text(expectWhat(p, "CONID", "an associated type name"))
             let written = text(expectWhat(p, "IDENT", "'" + param + "', the class parameter"))
             Vec.push(families, FamDecl { span = s, name = name, param = written })
         } else if at(p, "fun") {
             Vec.push(methods, parseFunDecl(p, isClass))
         } else {
-            oops(p, "expected a method or a 'type', found " + describe(cur(p)),
+            oops(p, "expected 'fun' or 'type', found " + describe(cur(p)),
                  cur(p).span)
         }
         endOfStatement(p)
@@ -1091,13 +1133,13 @@ fun parseInstanceBody(p : P) -> (Vec FunDecl, Vec FamBind) {
     while !at(p, "}") {
         if at(p, "type") {
             let s = expect(p, "type").span
-            let name = text(expectWhat(p, "CONID", "a type family name"))
+            let name = text(expectWhat(p, "CONID", "an associated type name"))
             skipToken(p, "=")
             Vec.push(families, FamBind { span = s, name = name, body = parseTypeExpr(p) })
         } else if at(p, "fun") {
             Vec.push(methods, parseFunDecl(p, False))
         } else {
-            oops(p, "expected a method or a 'type', found " + describe(cur(p)),
+            oops(p, "expected 'fun' or 'type', found " + describe(cur(p)),
                  cur(p).span)
         }
         endOfStatement(p)
@@ -1171,12 +1213,14 @@ fun parseStmt(p : P) -> Stmt {
 }
 
 fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match e.kind {
-    EProject(_, _) -> oops(p, "numeric projections are read-only", s)
+    EProject(_, index) ->
+        oops(p, "cannot assign to the tuple component '." + Int.toString(index)
+                + "'; build a new tuple instead", s)
     EVar(_, _) -> {}
     EField(_, _) -> {}
     EIndex(_, _, _, _) -> {}
-    _ -> oops(p, "left side of an assignment must be a variable, a record field, "
-                 + "or an array element", s)
+    _ -> oops(p, "this expression cannot be assigned to; the left side of '=' "
+                 + "must be a variable, a record field or an array element", s)
 }
 
 fun parseBlock(p : P) -> Expr {
@@ -1185,7 +1229,7 @@ fun parseBlock(p : P) -> Expr {
     let stmts = Vec.new(8)
     skipNewlines(p)
     while !at(p, "}") {
-        if at(p, "EOF") { oops(p, "unterminated block", s) }
+        if at(p, "EOF") { oops(p, "this block has no closing '}'", s) }
         Vec.push(stmts, parseStmt(p))
         endOfStatement(p)
     }
@@ -1233,7 +1277,8 @@ fun parseParenPattern(p : P, tok : Token) -> Pat {
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
-                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
+                oops(p, "a tuple cannot have just one component; remove the "
+                        + "trailing ','", cur(p).span)
             }
             break
         }
@@ -1269,8 +1314,8 @@ fun parseConPattern(p : P) -> Pat {
                 rest = True
                 let _ = fieldSeparator(p)
                 if !at(p, "}") {
-                    oops(p, "'..' must be the last thing in a record pattern",
-                         cur(p).span)
+                    oops(p, "'..' is not last in this record pattern; move it "
+                            + "to the end", cur(p).span)
                 }
                 break
             }
@@ -1293,8 +1338,8 @@ fun parseConPattern(p : P) -> Pat {
         }
         skipToken(p, ")")
     } else if atAny(p, patternStart) {
-        oops(p, "constructor pattern '" + con + "' must parenthesize its "
-                + "arguments: write '" + con + "(...)'", cur(p).span)
+        oops(p, "the arguments of '" + con + "' are not in parentheses; write '"
+                + con + "(...)'", cur(p).span)
     }
     mkPat(p, tok.span, PCon(con, args))
 }
@@ -1443,7 +1488,8 @@ fun parseAtom(p : P) -> Expr {
                 -- `while let p = e { B }` is `loop { match e { p -> B,
                 -- _ -> break } }`: the pattern failing is what ends the loop.
                 let s = tok.span
-                let (pat, value, body) = parseBindingCondition(p)
+                let (pat, value, body) =
+                    parseBindingCondition(p, "a 'while'", "test the rest inside the loop")
                 let m = mkExpr(p, s, EMatch(value, [
                     Arm { span = s, patterns = [pat], body = body },
                     Arm { span = s, patterns = [mkPat(p, s, PWild)],
@@ -1452,7 +1498,7 @@ fun parseAtom(p : P) -> Expr {
                 return mkExpr(p, s, ELoop(mkExpr(p, s, EBlock([mkStmt(p, s, SExpr(m))]))))
             }
             let cond = parseScrutinee(p, "the condition of 'while'")
-            refuseChainedCondition(p)
+            refuseChainedCondition(p, "a 'while'", "join them with '&&'")
             mkExpr(p, tok.span, EWhile(cond, parseBlock(p)))
         }
         "for" -> parseFor(p)
@@ -1490,7 +1536,8 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
-                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
+                oops(p, "a tuple cannot have just one component; remove the "
+                        + "trailing ','", cur(p).span)
             }
             break
         }
@@ -1568,7 +1615,8 @@ fun parseIf(p : P) -> Expr {
     let s = expect(p, "if").span
     if at(p, "let") || at(p, "var") { return parseIfLet(p, s) }
     let cond = parseScrutinee(p, "the condition of 'if'")
-    refuseChainedCondition(p)
+    refuseChainedCondition(p, "an 'if'",
+                           "join them with '&&', or nest a second 'if' inside this one")
     let then = parseBlock(p)
     var otherwise : Option Expr = None
     if eat(p, "else") {
@@ -1583,7 +1631,8 @@ fun parseIf(p : P) -> Expr {
 -- existed, and a `match` is what every stage already handles. Without an `else`
 -- the other arm is `()`.
 fun parseIfLet(p : P, s : Span) -> Expr {
-    let (pat, value, then) = parseBindingCondition(p)
+    let (pat, value, then) =
+        parseBindingCondition(p, "an 'if'", "nest a second 'if' inside this one")
     var otherwise = mkExpr(p, s, EUnit)
     if eat(p, "else") {
         if at(p, "if") { otherwise = parseIf(p) }
@@ -1597,7 +1646,7 @@ fun parseIfLet(p : P, s : Span) -> Expr {
 
 -- `let p = e { body }` or `var p = e { body }`, after `if` or `while`. `var`
 -- prefixes the block with `var x = x` for each binder, in pattern order.
-fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
+fun parseBindingCondition(p : P, construct : String, fix : String) -> (Pat, Expr, Expr) {
     let s = cur(p).span
     let mutable = at(p, "var")
     step(p)
@@ -1606,7 +1655,7 @@ fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
     skipToken(p, "=")
     p.noRecord = saved
     let value = parseScrutinee(p, "the value a 'let' condition matches")
-    refuseChainedCondition(p)
+    refuseChainedCondition(p, construct, fix)
     var body = parseBlock(p)
     if mutable {
         let stmts = Vec.new(4)
@@ -1624,10 +1673,11 @@ fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
 }
 
 -- The condition is a list in the grammar so that chaining can be added without
--- a retrofit; only the one-element list is implemented.
-fun refuseChainedCondition(p : P) -> Unit {
+-- a retrofit; only the one-element list is implemented. `construct` names the
+-- `if` or `while` the condition belongs to, and `fix` is what to write instead.
+fun refuseChainedCondition(p : P, construct : String, fix : String) -> Unit {
     if at(p, ",") {
-        oops(p, "a condition cannot be chained with ',' yet; nest the 'if' instead",
+        oops(p, "',' cannot separate the conditions of " + construct + "; " + fix,
              cur(p).span)
     }
 }
@@ -1695,7 +1745,7 @@ fun parseMatch(p : P) -> Expr {
     let arms = Vec.new(4)
     skipNewlines(p)
     while !at(p, "}") {
-        if at(p, "EOF") { oops(p, "unterminated match expression", s) }
+        if at(p, "EOF") { oops(p, "this 'match' has no closing '}'", s) }
         Vec.push(arms, parseMatchArm(p))
         if at(p, "NEWLINE") {
             skipNewlines(p)
@@ -1706,7 +1756,9 @@ fun parseMatch(p : P) -> Expr {
     }
     skipToken(p, "}")
     p.noRecord = saved
-    if len(arms) == 0 { oops(p, "a match expression needs at least one arm", s) }
+    if len(arms) == 0 {
+        oops(p, "this 'match' has no arms; add at least one 'pattern -> value' arm", s)
+    }
     mkExpr(p, s, EMatch(scrutinee, arms))
 }
 
@@ -1716,8 +1768,8 @@ fun parseMatchArm(p : P) -> Arm {
     -- join the previous arm's body, and arms are separated by a line break or
     -- `;` already.
     if at(p, "|") {
-        oops(p, "a match arm does not begin with '|'; separate arms with a line break or ';'",
-             cur(p).span)
+        oops(p, "a match arm cannot begin with '|'; remove it, and separate arms "
+                + "with a line break or ';'", cur(p).span)
     }
     let s = cur(p).span
     let patterns = Vec.new(2)
@@ -1802,8 +1854,8 @@ fun closeImplicit(p : P, e : Expr) -> Expr {
     let found = placeholders(e)
     if len(found) == 0 { return e }
     if len(found) > 1 {
-        oops(p, "a function made by '_' uses its parameter once; write '\\' before "
-                + "it to use the parameter again, or 'fun' for more than one",
+        oops(p, "'_' appears more than once in this function; start it with '\\' "
+                + "to make every '_' the same parameter, or write 'fun(a, b) = ...'",
              found[1].span)
     }
     shorthandLambda(p, e, found, e.span)
@@ -1813,9 +1865,7 @@ fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
     if p.pending == 0 || p.explicit > 0 { return {} }
     let found = placeholders(e)
     if len(found) > 0 {
-        oops(p, "'_' cannot be used in " + what
-                + ": the function it makes could never be used there",
-             found[0].span)
+        oops(p, "'_' cannot be used in " + what, found[0].span)
     }
 }
 
@@ -1831,8 +1881,8 @@ fun parseExplicit(p : P, tok : Token) -> Expr {
     p.noRecord = saved
     let found = placeholders(body)
     if len(found) == 0 {
-        oops(p, "'\\' makes a function of the '_' after it, and there is none",
-             tok.span)
+        oops(p, "'\\' has no '_' after it; remove the '\\', or use '_' for "
+                + "the parameter", tok.span)
     }
     shorthandLambda(p, body, found, tok.span)
 }

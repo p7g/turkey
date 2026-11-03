@@ -146,7 +146,7 @@ def test_an_unknown_head_applied_to_arguments_says_how_to_write_a_constructor() 
 
 
 def test_a_newtype_head_applied_without_parentheses_is_refused() -> None:
-    assert "must parenthesize its payload" in bad("type Meters = Meters Float")
+    assert "is not in parentheses; write 'Meters(...)'" in bad("type Meters = Meters Float")
 
 
 def test_the_prelude_and_built_in_kinds() -> None:

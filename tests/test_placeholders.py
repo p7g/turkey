@@ -41,7 +41,7 @@ def test_a_bare_placeholder_with_nothing_around_it(body):
     "print(Array.map(xs, _ * n + _))",
 ])
 def test_an_implicit_function_uses_its_parameter_once(body):
-    assert "a function made by '_' uses its parameter once" in fails(body)
+    assert "'_' appears more than once in this function" in fails(body)
 
 
 @pytest.mark.parametrize("body, where", [
@@ -71,12 +71,12 @@ def test_a_nested_boundary_inside_a_condition_is_its_own():
 
 
 def test_explicit_needs_a_placeholder():
-    assert "'\\' makes a function of the '_' after it, and there is none" \
-        in fails("let g = \\n + 1")
+    assert "'\\' has no '_' after it; remove the '\\', or use '_' for the " \
+        "parameter" in fails("let g = \\n + 1")
 
 
 def test_a_nested_explicit_claims_every_placeholder_inside_it():
-    assert "'\\' makes a function of the '_' after it" \
+    assert "'\\' has no '_' after it" \
         in fails("print(Array.map(xs, \\Array.map(xs, \\_ * 10)))")
 
 

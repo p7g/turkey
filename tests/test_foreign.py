@@ -230,7 +230,7 @@ def test_a_return_type_is_required(probe):
         "export (f)\n"
         'foreign "probe" fun f(x : Int)\n'))
     message = fails(entry)
-    assert "must state a return type" in message
+    assert "has no return type" in message
     assert "-> Unit" in message
 
 
@@ -338,14 +338,14 @@ def test_a_variadic_marker_needs_an_argument_after_it(probe):
     entry = probe((
         "export (f)\n"
         'foreign "open" fun f(path : Prim.Ptr, flags : Int, ...) -> Int\n'))
-    assert "must be followed by the variadic arguments" in fails(entry)
+    assert "'...' has no parameters after it" in fails(entry)
 
 
 def test_a_parameter_list_has_one_variadic_marker(probe):
     entry = probe((
         "export (f)\n"
         'foreign "probe" fun f(a : Int, ... b : Int, ... c : Int) -> Int\n'))
-    assert "one '...'" in fails(entry)
+    assert "'...' appears twice in this parameter list" in fails(entry)
 
 
 def test_a_foreign_definition_cannot_be_variadic():

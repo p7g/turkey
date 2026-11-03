@@ -268,7 +268,7 @@ A function made by `_` has one parameter and uses it once: a second `_` in the
 same function is an error. `_` on its own as a whole statement, `let` or
 function body is an error too; write `fun(x) = x`.
 
-<!-- error: a function made by '_' uses its parameter once -->
+<!-- error: '_' appears more than once in this function -->
 ```kotlin
 fun main() {
     print(Array.map([1, 2, 3], _ * _))

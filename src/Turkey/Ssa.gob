@@ -766,12 +766,11 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
 
 -- Which values are live on the way out of each block.
 --
--- Backward dataflow to a fixpoint, in reverse postorder reversed, which is the
--- order that propagates a backward analysis furthest per sweep. Written here
--- rather than in a pass because it is a fact about the *graph* -- the same
--- analysis serves the collector's root sets now and the register allocator's
--- interference later, and the parameter over instructions is what lets one
--- copy do both.
+-- Backward dataflow over the graph, solved as `livenessInOut` says. Written
+-- here rather than in a pass because it is a fact about the *graph* -- the
+-- same analysis serves the collector's root sets now and the register
+-- allocator's interference later, and the parameter over instructions is what
+-- lets one copy do both.
 --
 -- Block parameters are the reason this is simpler than it looks. A value
 -- crossing an edge is an *argument on that edge*, used by the predecessor's
@@ -783,55 +782,184 @@ fun liveness[Inst i](f : Func i) -> Array BitSet {
     out
 }
 
--- Both halves of the same fixpoint. `liveness` answers only live-*out* because
+-- Both halves of the same analysis. `liveness` answers only live-*out* because
 -- that is all the root analysis needed; the colourer needs live-*in* too, to
--- know what a block's parameters interfere with, and computing the fixpoint
+-- know what a block's parameters interfere with, and computing the analysis
 -- twice to get a set it already had would be silly.
 --
 -- Every set is a bitset over the function's value ids, which are dense, and
--- each block's pair is updated in place. Unioning a successor's live-in into
--- live-out rather than rebuilding live-out is exact because both only grow:
--- the iteration starts from empty sets and every step is monotone.
+-- each block's pair is built in place by unions. Two passes and no fixpoint,
+-- after Brandner, Boissinot, Darte, Dupont de Dinechin and Rastello,
+-- "Computing Liveness Sets for SSA-Form Programs" (INRIA RR-7503, 2011):
+--
+-- * A backward pass in postorder, over every edge except those that close a
+--   cycle. Along the rest every successor comes first, so each block is
+--   walked once, and without a cycle this is already the answer.
+-- * A forward pass over the loop-nesting forest. A value live into a loop's
+--   header and not one of its parameters is defined outside the loop, since
+--   its definition dominates its uses; so it is live into and out of every
+--   block of the loop, and that is all the first pass missed.
+--
+-- The second pass is exact only where every cycle has a header that dominates
+-- it. A function with an irreducible cycle iterates to the fixpoint instead,
+-- from where the first pass left it: every set is already below the answer,
+-- which is all the iteration needs of its start.
 fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
     let count = len(f.blocks)
     let values = len(f.reps)
     let liveIn = Array.init(count, fun(_) = BitSet.new(values))
     let liveOut = Array.init(count, fun(_) = BitSet.new(values))
-    let entering = BitSet.new(values)
     let order = postorder(f)
-    var changed = True
-    while changed {
-        changed = False
-        for at in order {
-            let b = blockId(at)
-            let out = liveOut[b]
-            for s in successors(f.blocks[b].term) {
-                let _ = BitSet.unionInto(out, liveIn[blockId(s)])
+    -- Position in postorder, or -1 for a block the entry does not reach.
+    let rank = Array.filled(count, -1)
+    for var k = 0; k < len(order); k = k + 1 { rank[blockId(order[k])] = k }
+    let succs : Array (Array BlockId) = Array.filled(count, [])
+    -- Whether some edge goes to a block no earlier in postorder, which only
+    -- an edge closing a cycle does.
+    var cyclic = False
+    for at in order {
+        let b = blockId(at)
+        succs[b] = successors(f.blocks[b].term)
+        for s in succs[b] {
+            if rank[blockId(s)] < rank[b] {
+                let _ = BitSet.unionInto(liveOut[b], liveIn[blockId(s)])
+            } else {
+                cyclic = True
             }
-            BitSet.copyFrom(entering, out)
-            -- Backward through the terminator, then the instructions.
-            for v in termUses(f.blocks[b].term) {
-                BitSet.add(entering, valueId(v))
+        }
+        transfer(f, b, liveOut[b], liveIn[b])
+    }
+    if !cyclic { return (liveIn, liveOut) }
+    match loopForest(order, rank, succs) {
+        Some((innermost, parent)) -> {
+            -- In reverse postorder, which visits a header before the blocks
+            -- of its loop and an outer header before an inner one, so each
+            -- header's set is complete by the time it is read.
+            for var k = len(order) - 1; k >= 0; k = k - 1 {
+                let b = blockId(order[k])
+                let h = innermost[b]
+                if h == b {
+                    if parent[b] >= 0 {
+                        let _ = BitSet.unionInto(liveIn[b], liveIn[parent[b]])
+                    }
+                    let _ = BitSet.unionInto(liveOut[b], liveIn[b])
+                } else if h >= 0 {
+                    let _ = BitSet.unionInto(liveIn[b], liveIn[h])
+                    let _ = BitSet.unionInto(liveOut[b], liveIn[h])
+                }
             }
-            for var n = len(f.blocks[b].insts) - 1; n >= 0; n = n - 1 {
-                eachDef(f.blocks[b].insts[n], fun(v) {
-                    let _ = BitSet.remove(entering, valueId(v))
-                })
-                eachUse(f.blocks[b].insts[n], fun(v) =
-                    BitSet.add(entering, valueId(v)))
-            }
-            for p in f.blocks[b].params {
-                let _ = BitSet.remove(entering, valueId(p))
-            }
-            -- Live-out is a function of the live-ins alone, so a pass that
-            -- changes no live-in has reached the fixpoint.
-            if !BitSet.equal(entering, liveIn[b]) {
-                BitSet.copyFrom(liveIn[b], entering)
-                changed = True
+        }
+        None -> {
+            let entering = BitSet.new(values)
+            var changed = True
+            while changed {
+                changed = False
+                for at in order {
+                    let b = blockId(at)
+                    for s in succs[b] {
+                        let _ = BitSet.unionInto(liveOut[b], liveIn[blockId(s)])
+                    }
+                    transfer(f, b, liveOut[b], entering)
+                    -- Live-out is a function of the live-ins alone, so a pass
+                    -- that changes no live-in has reached the fixpoint.
+                    if !BitSet.equal(entering, liveIn[b]) {
+                        BitSet.copyFrom(liveIn[b], entering)
+                        changed = True
+                    }
+                }
             }
         }
     }
     (liveIn, liveOut)
+}
+
+-- Makes `into` hold what is live into block `b`, given what is live out of it:
+-- backward through the terminator, then the instructions, then the
+-- parameters.
+fun transfer[Inst i](f : Func i, b : Int, out : BitSet, into : BitSet) -> Unit {
+    let block = f.blocks[b]
+    BitSet.copyFrom(into, out)
+    for v in termUses(block.term) { BitSet.add(into, valueId(v)) }
+    for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
+        eachDef(block.insts[n], fun(v) {
+            let _ = BitSet.remove(into, valueId(v))
+        })
+        eachUse(block.insts[n], fun(v) = BitSet.add(into, valueId(v)))
+    }
+    for p in block.params {
+        let _ = BitSet.remove(into, valueId(p))
+    }
+}
+
+-- The loop-nesting forest of the blocks in `order`, a postorder from the
+-- entry, given each block's position in it and its successors; or `None` if
+-- some cycle is irreducible.
+--
+-- Answers two arrays indexed by block. The first holds the header of the
+-- innermost loop containing the block, which for a header is itself, or -1
+-- for a block in no loop. The second holds, for a header, the header of the
+-- innermost loop strictly containing its own, or -1.
+--
+-- A loop is a header and every block that reaches one of its back edges
+-- without passing the header. An edge closes a cycle when it goes to a block
+-- no earlier in postorder; such an edge is a back edge when its target
+-- dominates its source, and the graph is reducible when every one is. Walking
+-- back from a source without passing the target reaches the entry exactly
+-- when the target does not dominate it, so the walk that collects a loop also
+-- checks it.
+fun loopForest(order : Vec BlockId, rank : Array Int,
+               succs : Array (Array BlockId)) -> Option (Array Int, Array Int) {
+    let count = len(rank)
+    -- Every block's predecessors in one array: those of `b` are at
+    -- `start[b]` up to `start[b + 1]`. Two allocations rather than one per
+    -- block.
+    let start = Array.filled(count + 1, 0)
+    for at in order {
+        for s in succs[blockId(at)] {
+            start[blockId(s) + 1] = start[blockId(s) + 1] + 1
+        }
+    }
+    for var b = 0; b < count; b = b + 1 { start[b + 1] = start[b + 1] + start[b] }
+    let fill = Array.init(count, fun(b) = start[b])
+    let preds = Array.filled(start[count], 0)
+    for at in order {
+        for s in succs[blockId(at)] {
+            preds[fill[blockId(s)]] = blockId(at)
+            fill[blockId(s)] = fill[blockId(s)] + 1
+        }
+    }
+
+    let entry = len(order) - 1
+    let innermost = Array.filled(count, -1)
+    let parent = Array.filled(count, -1)
+    -- The header whose walk last visited each block.
+    let seen = Array.filled(count, -1)
+    let work : Vec Int = []
+    -- Headers in reverse postorder, which puts each after every header that
+    -- dominates it, so a loop is collected after the loops containing it and
+    -- an inner header overwrites an outer one.
+    for var k = len(order) - 1; k >= 0; k = k - 1 {
+        let h = blockId(order[k])
+        for var e = start[h]; e < start[h + 1]; e = e + 1 {
+            if rank[preds[e]] <= rank[h] { Vec.push(work, preds[e]) }
+        }
+        if len(work) > 0 {
+            parent[h] = innermost[h]
+            innermost[h] = h
+            seen[h] = h
+            while let Some(b) = Vec.pop(work) {
+                if seen[b] != h {
+                    if rank[b] == entry { return None }
+                    seen[b] = h
+                    innermost[b] = h
+                    for var e = start[b]; e < start[b + 1]; e = e + 1 {
+                        Vec.push(work, preds[e])
+                    }
+                }
+            }
+        }
+    }
+    Some((innermost, parent))
 }
 
 -- What a terminator reads. Not part of the `Inst` class, because a terminator

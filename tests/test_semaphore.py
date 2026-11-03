@@ -1,9 +1,9 @@
-"""`System.Sync`'s semaphore: units handed out in order, deadlines, and the
+"""`System.Sync`'s semaphore: permits handed out in order, deadlines, and the
 skip of a waiter whose deadline passed.
 
 Each program runs its body on a task, or on the program's own stack, which
-waits for a unit apart from the tasks (`Turkey.Wait.parkApart`) since a task
-gives the unit back. A body waits for the others to queue by asking
+waits for a permit apart from the tasks (`Turkey.Wait.parkApart`) since a task
+gives the permit back. A body waits for the others to queue by asking
 `Turkey.Semaphore.waiting`, a bounded number of times.
 """
 
@@ -21,7 +21,7 @@ import System.Sync as Sync
 import System.Task as Task
 import Time.Deadline as Deadline
 import Time.Duration as Duration
-import Turkey.Semaphore as Units
+import Turkey.Semaphore as Semaphores
 import Turkey.Wait as Wait
 
 -- Until `ready()`, looking every millisecond for at most ten seconds.
@@ -34,9 +34,9 @@ fun waitFor(ready : fun() -> Bool) -> Unit {
     if !ready() { error("gave up waiting") }
 }
 
-fun queued(s : Sync.Semaphore, n : Int) -> Unit = waitFor(fun() = Units.waiting(s) == n)
+fun queued(s : Sync.Semaphore, n : Int) -> Unit = waitFor(fun() = Semaphores.waiting(s) == n)
 
--- Three tasks queue, one at a time, behind the unit this stack holds, and
+-- Three tasks queue, one at a time, behind the permit this stack holds, and
 -- take it in the order they came.
 fun inOrder() -> Unit {
     let s = Sync.semaphore(1)
@@ -46,7 +46,7 @@ fun inOrder() -> Unit {
         let names = ["a", "b", "c"]
         for var i = 0; i < len(names); i = i + 1 {
             let name = names[i]
-            let _ = Task.spawn(fun() = Sync.withUnit(s, fun() = Sync.update(order, fun(o) = o + name)))?
+            let _ = Task.spawn(fun() = Sync.withPermit(s, fun() = Sync.update(order, fun(o) = o + name)))?
             queued(s, i + 1)
         }
         Sync.release(s)
@@ -55,8 +55,8 @@ fun inOrder() -> Unit {
     print(Sync.withLock(order, fun(o) = o))
 }
 
--- This stack waits with a deadline behind a unit a task holds: it gives up
--- at the deadline, and takes the unit once the task gives it back.
+-- This stack waits with a deadline behind a permit a task holds: it gives up
+-- at the deadline, and takes the permit once the task gives it back.
 fun expires() -> Unit {
     let s = Sync.semaphore(1)
     let held = Sync.atomicInt(0)
@@ -82,7 +82,7 @@ fun expires() -> Unit {
 }
 
 -- A task with a deadline queues first, and this stack, without one, second.
--- The task's deadline passes; the unit given back then skips it, and comes
+-- The task's deadline passes; the permit given back then skips it, and comes
 -- here.
 fun skips() -> Unit {
     let s = Sync.semaphore(1)
@@ -102,7 +102,7 @@ fun skips() -> Unit {
                 Sync.store(gaveUp, 1)
                 Sync.store(letGo, 1)
             } else {
-                print("the first waiter took a unit")
+                print("the first waiter took a permit")
             }
         })?
         queued(s, 1)
@@ -111,7 +111,7 @@ fun skips() -> Unit {
         Sync.release(s)
         -- Free again, and nobody waits.
         print(Sync.acquire(s, Some(Deadline.after(Duration.seconds(10)))))
-        print(Units.waiting(s))
+        print(Semaphores.waiting(s))
         pure({})
     })
 }
@@ -163,7 +163,7 @@ WORKERS = ["1", "4"]
 
 @pytest.mark.parametrize("workers", WORKERS)
 @pytest.mark.parametrize("origin", ORIGINS)
-def test_units_go_to_waiters_in_the_order_they_came(binary, origin, workers):
+def test_permits_go_to_waiters_in_the_order_they_came(binary, origin, workers):
     assert _run(binary, "inOrder", origin, workers) == ["abc"]
 
 

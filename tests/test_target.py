@@ -1,7 +1,7 @@
 """`Target.os` and `Target.arch`, and the `--target` option that sets them.
 
 What a program can observe is in `docs/ref/modules.md`, whose examples
-`test_reference` runs. Here: the command line, the claim the reference makes
+the harness runs (`sh scripts/test.sh docs/ref/modules.md`). Here: the command line, the claim the reference makes
 about compiling -- that only the chosen target's arm of a `match Target.os`
 survives to be compiled -- and that each target's output is what its
 assembler accepts.

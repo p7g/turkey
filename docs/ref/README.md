@@ -75,7 +75,7 @@ reader of that language would expect.
 ## Examples
 
 Every example is a whole program or a set of declarations. Each one is
-compiled by the test suite (`tests/test_reference.py`), so none of them is
+compiled by the test suite (`sh scripts/test.sh docs/ref`), so none of them is
 hypothetical. When an example prints something, its output follows it:
 
 <!-- run -->

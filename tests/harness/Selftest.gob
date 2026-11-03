@@ -3,7 +3,10 @@ export (cases, check)
 -- The harness checked against cases whose outcome is known: at least one per
 -- outcome, in `selftest/`, each named for the outcome it must be given
 -- (`fail_*.gob` must be reported as a fail), and each listed with what
--- `--bless` must do with it. A harness that called a crash a wrong answer,
+-- `--bless` must do with it. The chapters in `selftest/reference/` are
+-- reference examples, named like any other (`pass.md:13`), and each way a
+-- chapter can be malformed has one there, listed with the reason it must be
+-- given. A harness that called a crash a wrong answer,
 -- let an unknown directive pass, or blessed a crash would otherwise go
 -- unnoticed, since its reports on the real corpus are all anyone reads.
 --
@@ -12,11 +15,12 @@ export (cases, check)
 
 import Bless (Blessing(..), Guard(..))
 import Bless as Bless
-import Case (Case(..), Expected(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..),
-             Recorded(..))
+import Case (Case(..), Expected(..), Golden(..), Outcome(..), Result(..), Finish(..), Ending(..),
+             Observed(..), Recorded(..))
 import Case as Case
 import Files as Files
 import Programs as Programs
+import Reference as Reference
 
 -- The file-name prefix each outcome's case has.
 let prefixes = [
@@ -50,15 +54,47 @@ let blessings = [
     ("timeout.gob", Refused(Overrun)),
     ("xfail.gob", Kept),
     ("xpass.gob", Kept),
+    ("fail_compiles.md:4", Kept),
+    ("fail_message.md:4", Kept),
+    ("fail_output.md:4", Kept),
+    ("fail_panic_output.md:4", Kept),
+    ("harness_error_no_examples", Refused(Unrunnable)),
+    ("harness_error_no_text.md:4", Refused(Unrunnable)),
+    ("harness_error_trailing_module.md:4", Refused(Unrunnable)),
+    ("harness_error_unknown_directive.md:3", Refused(Unrunnable)),
+    ("harness_error_unmarked.md:3", Refused(Unrunnable)),
+    ("pass.md:13", Kept),
+    ("pass.md:26", Kept),
+    ("pass.md:33", Kept),
+    ("pass.md:42", Kept),
+    ("pass.md:55", Kept),
+    ("pass.md:71", Kept),
 ]
 
--- The cases in `ROOT/tests/harness/selftest`, and the one that crashes
+-- The reason each malformed reference chapter must be given, by its case's
+-- base name, which holds the line the reason is about.
+let malformed = [
+    ("harness_error_no_examples", "no examples in"),
+    ("harness_error_no_text.md:4", "'run' needs a text fence"),
+    ("harness_error_trailing_module.md:4", "'module' blocks with no example after them"),
+    ("harness_error_unknown_directive.md:3", "unknown directive 'runs'"),
+    ("harness_error_unmarked.md:3", "a kotlin fence with no directive"),
+]
+
+-- The cases in `ROOT/tests/harness/selftest`, its reference chapters, a
+-- directory of chapters with no examples, and the one that crashes
 -- `boot`, which is written under the cache each run rather than committed:
 -- it is a program nested deeper than the compiler's stack, 400 KB of
 -- parentheses. If `boot` stops crashing on it, the selftest says so and a new
 -- way to crash it is wanted.
 fun cases(root : String, cache : String) -> Array Case {
-    let found = Programs.discover(root + "/tests/harness/selftest", "tests/harness/selftest")
+    let selftest = root + "/tests/harness/selftest"
+    let prefix = "tests/harness/selftest"
+    let examples = cache + "/reference"
+    let found = Programs.discover(selftest, prefix)
+                + Reference.cases(selftest + "/reference", prefix + "/reference", examples)
+                + Reference.cases(selftest + "/harness_error_no_examples", prefix + "/harness_error_no_examples",
+                                  examples)
     let depth = 200000
     let source = "fun main() { print(Int.toString(" + String.repeat("(", depth) + "1"
                  + String.repeat(")", depth) + ")) }\n"
@@ -69,16 +105,17 @@ fun cases(root : String, cache : String) -> Array Case {
 }
 
 -- Returns whether every case was given the outcome its name says and the
--- blessing listed for it, every outcome was given to some case, and the
--- refusal limit and the guards on made-up results hold, printing what did
--- not.
+-- blessing listed for it, every outcome was given to some case, every
+-- malformed chapter was given its reason, and the refusal limit and the
+-- guards on made-up results hold, printing what did not.
 fun check(ran : Array (Case, (Result, Blessing))) -> Bool {
     let outcomes = checkOutcomes(ran)
+    let chapters = checkMalformed(ran)
     let blessed = checkBlessings(ran)
     let limited = checkLimit(Array.map(ran, _.1.1))
     let own = checkOwnError()
     let dumped = checkDumpGuards()
-    let ok = outcomes && blessed && limited && own && dumped
+    let ok = outcomes && chapters && blessed && limited && own && dumped
     print(if ok { "selftest: every outcome classified and every blessing decided correctly" }
           else { "selftest: FAILED" })
     ok
@@ -104,6 +141,24 @@ fun checkOutcomes(ran : Array (Case, (Result, Blessing))) -> Bool {
         if !Iterator.any(ran, _.1.0.outcome == o) {
             print("selftest: no case was given " + Case.outcomeName(o))
             ok = False
+        }
+    }
+    ok
+}
+
+fun checkMalformed(ran : Array (Case, (Result, Blessing))) -> Bool {
+    var ok = True
+    for (base, reason) in malformed {
+        match Iterator.find(ran, \baseName(_.0.name) == base) {
+            None -> {
+                print("selftest: there is no case " + base)
+                ok = False
+            }
+            Some((c, (r, _))) -> if !String.contains(r.why, reason) {
+                print("selftest: " + c.name + " should be a harness error for '" + reason + "', was "
+                      + Case.outcomeName(r.outcome) + " (" + r.why + ")")
+                ok = False
+            }
         }
     }
     ok
@@ -163,8 +218,9 @@ fun checkLimit(decided : Array Blessing) -> Bool {
 -- A case that is never run, for checking bless on results made up for it.
 fun madeUp(expected : Expected, dumps : Array (String, String)) -> Case = Case {
     name = "(made up)/case.gob", directory = "/nonexistent", entry = "case.gob",
-    sources = ["case.gob"], golden = "/nonexistent/case.expected", dumps = dumps,
+    sources = ["case.gob"], golden = OnDisk("/nonexistent/case.expected"), dumps = dumps,
     expected = expected, timeout = None, requires = [], xfail = None, problem = None,
+    checkOnly = False,
 }
 
 -- The guard on an error that `boot` reports about itself, which no committed
@@ -173,7 +229,9 @@ fun madeUp(expected : Expected, dumps : Array (String, String)) -> Case = Case {
 fun checkOwnError() -> Bool {
     let c = madeUp(Rejected, [])
     let recorded = Recorded { expected = Some("case.gob:1:1: parse error: expected a declaration\n"), dumps = [] }
-    let observed = Observed { ending = Diagnosed(2), output = "boot: cannot read case.gob\n", dumps = [] }
+    let observed = Observed {
+        ending = Diagnosed(2), stdout = "", stderr = "boot: cannot read case.gob\n", dumps = [],
+    }
     let b = Bless.decide(c, recorded, observed)
     let w = Refused(Diagnostic)
     if wantedShape(w) == shape(b) { return True }
@@ -198,7 +256,7 @@ fun checkDumpGuards() -> Bool {
     ]
     var ok = True
     for (dump, w) in tried {
-        let observed = Observed { ending = Ran(Returned(0)), output = "hello\n", dumps = [dump] }
+        let observed = Observed { ending = Ran(Returned(0)), stdout = "hello\n", stderr = "", dumps = [dump] }
         let b = Bless.decide(c, recorded, observed)
         if wantedShape(w) != shape(b) {
             print("selftest: for a types dump that ended " + finishName(dump.0) + ", bless should "

@@ -7,12 +7,13 @@
 --   -v                 list the passes too, with their times
 --   --shard I/N        run only shard I of N, counting from 1
 --   --timeout-scale F  multiply every time limit by F
---   --selftest         run the harness's own cases instead of the corpus
+--   --selftest         run the harness's own cases instead of the corpus and
+--                      the reference
 --   --bless            write each selected case's actual results over its
 --                      goldens, unless they look like a broken compiler
 --                      (`Bless`)
---   PATH[::CASE]       run only the cases whose path starts with PATH, and
---                      whose case name contains CASE
+--   PATH[::CASE]       run only the cases whose name starts with PATH, and
+--                      whose part after its last `:` contains CASE
 --
 -- The exit status is 0 when no case failed the run, 1 when one did, and 2
 -- when the harness could not run at all. Under `--bless` it is 1 when a case
@@ -31,6 +32,7 @@ import Cache as Cache
 import Execute as Execute
 import Files as Files
 import Programs as Programs
+import Reference as Reference
 import Report as Report
 import Schedule as Schedule
 import Selftest as Selftest
@@ -61,7 +63,10 @@ fun main() {
         Left(e) -> die("cannot read what the cache key is made of: " + Error.describe(e))
     }
     let found = if o.selftest { Selftest.cases(o.root, o.cache) }
-                else { Programs.discover(o.root + "/tests/programs", "tests/programs") }
+                else {
+                    Array.append(Programs.discover(o.root + "/tests/programs", "tests/programs"),
+                                 Reference.cases(o.root + "/docs/ref", "docs/ref", o.cache + "/reference"))
+                }
     let selected = Array.filter(found, \chosen(o, _.name))
     let timingsFile = o.cache + "/timings"
     let timings = Schedule.readTimings(timingsFile)
@@ -90,17 +95,19 @@ fun bless(decided : Array (Case, Blessing), actual : String, millis : Int) -> Bo
     Report.blessed(decided, actual, millis)
 }
 
--- Whether the case `name` is in the shard and the selection.
+-- Whether the case `name` is in the shard and the selection. A case's part is
+-- what follows the last `:` of its name, such as the line of a reference
+-- example (`docs/ref/types.md:40`); a program has none.
 fun chosen(o : Options, name : String) -> Bool {
     if let Some((index, count)) = o.shard {
         if !Schedule.inShard(name, index, count) { return False }
     }
     if len(o.selections) == 0 { return True }
-    let (path, part) = selector(name)
+    let part = Option.fold(String.rsplitOnce(name, ":"), "", _.1)
     for s in o.selections {
         let (wantPath, wantPart) = selector(s)
         let wantPath = Option.unwrapOr(String.stripPrefix(wantPath, "./"), wantPath)
-        if String.startsWith(path, wantPath) && String.contains(part, wantPart) { return True }
+        if String.startsWith(name, wantPath) && String.contains(part, wantPart) { return True }
     }
     False
 }

@@ -1,0 +1,266 @@
+export (
+    Socket, Listener, connect, listen, accept, shutdownWrite, close, closeListener,
+    setDeadline, clearDeadline, localAddress, peerAddress, listenerAddress,
+)
+
+-- TCP connections: a `Socket` to read and write, and a `Listener` that
+-- accepts them.
+--
+--     let d = Net.resolve("example.com", 80, Net.publicInternet, Duration.seconds(10))?
+--     let s = TCP.connect(d, Duration.seconds(10))?
+--     writeFrom(s, request)?
+--
+-- **Waiting parks the task.** A read, a write, an `accept` or a `connect`
+-- that has to wait suspends the task on the poller, and its worker runs other
+-- tasks meanwhile; nothing here holds a worker while the network is slow.
+--
+-- **Connecting.** `connect` takes a `Net.Destination`, so it reaches only
+-- addresses a policy allowed (`Net.resolve`). It tries them in order under
+-- one deadline. An address that refuses the connection, or that no route
+-- reaches, moves it on to the next; the last one's failure is the answer if
+-- none connects. A deadline that passes first is `TimedOut`, whichever
+-- address it was trying.
+--
+-- **A `Socket`** is a `Read` and a `Write`, and its errors are `IOError`s
+-- (`Net.NetError`). A read answers 0 at the end of input, which is where the
+-- peer's `shutdownWrite` or `close` lands. A write sends all of its buffer or
+-- fails; the bytes go out as soon as they are written, since Nagle's
+-- algorithm is off (`TCP_NODELAY`), so a caller that wants a header and a
+-- body in one segment writes them in one buffer. A write to a connection the
+-- peer has closed fails with `BrokenPipe` or `ConnectionReset`, and never
+-- ends the process with `SIGPIPE`.
+--
+-- **Sharing.** Any number of tasks may hold one `Socket`. Reads take turns
+-- with reads, and writes with writes, so one write's bytes are never split
+-- by another's; a read and a write run at once.
+--
+-- **A deadline** set with `setDeadline` bounds every read and write on the
+-- socket from then on, and one that passes is `TimedOut`. A write that timed
+-- out may have sent part of its buffer, so a protocol that frames its
+-- messages has to close the connection after one.
+--
+-- **Closing** is idempotent, and ends every read, write and `accept` parked
+-- on the socket or listener with `Closed`, from whichever task closes it.
+-- That is how a server stops accepting: another task closes its listener.
+-- The descriptor number is released only when the last operation using it
+-- has returned, so a closed socket is never read through a number reused
+-- for another file.
+--
+-- Every socket is close-on-exec, so a program started later does not inherit
+-- it.
+
+import Time (Timeout(..))
+import Turkey.Buffer (Buffer(..))
+import Turkey.ConnectPolicy (Destination(..))
+import Turkey.ConnectPolicy as ConnectPolicy
+import Turkey.Errors (IOError(..), ErrorKind)
+import Turkey.Errors as Errors
+import Turkey.FD as FD
+import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
+import Turkey.Resolve (IP(..))
+import Turkey.Socket as Calls
+import Turkey.Sys as Sys
+
+-- A connection: its descriptor, the point every read and write on it gives up
+-- at (on `Turkey.Wait.now`'s clock, or -1), and what its errors name: the
+-- host and port it was connected to, or the peer it was accepted from.
+type Socket = Socket { fd : FD.FD, var deadline : Int, name : Option String }
+
+-- A listening socket, and the address and port it is bound to.
+type Listener = Listener { fd : FD.FD, address : (IP, Int) }
+
+-- How many connections the kernel holds for a listener before `accept` takes
+-- them. Each system caps it at its own limit (`somaxconn`).
+let backlog : Int = 1024
+
+instance Read Socket {
+    type ReadError = IOError
+    fun readInto(s, into) {
+        needsRoom(into)
+        let n = FD.readBy(s.fd, into.storage, into.end, into.limit, s.deadline)
+        if n < 0 { return Left(failure("read", s.name, n)) }
+        into.end = into.end + n
+        Right(n)
+    }
+}
+
+instance Write Socket {
+    type WriteError = IOError
+    fun writeFrom(s, from) {
+        let storage = from.storage
+        let to = from.end
+        let n = FD.writeWith(s.fd, fun(number, at) = Calls.send(number, storage, at, to),
+                             from.start, to, s.deadline)
+        if n < 0 { Left(failure("write", s.name, n)) } else { Right(()) }
+    }
+    -- Nothing is held back: each write is sent.
+    fun flush(s) = Right(())
+}
+
+-- -- connecting -----------------------------------------------------------------------
+
+-- A connection to one of `d`'s addresses, tried in order, all within
+-- `timeout`.
+fun connect[Timeout t](d : Destination, timeout : t) -> Either IOError Socket {
+    let deadline = ConnectPolicy.limit(timeout)
+    let name = Some(endpoint(d.host, d.port))
+    var last = -Sys.econnrefused()
+    for ip in d.addresses {
+        let r = attempt(ip, d.port, deadline)
+        match r {
+            Right(fd) -> return Right(Socket { fd, deadline = -1, name })
+            Left(n) -> {
+                if !movesOn(n) { return Left(failure("connect", name, n)) }
+                last = n
+            }
+        }
+    }
+    Left(failure("connect", name, last))
+}
+
+-- Whether a failure to connect to one address is a reason to try the next:
+-- the address refused, could not be reached, or cannot be used from here at
+-- all (IPv6 on a host without it).
+fun movesOn(n : Int) -> Bool =
+    n == -Sys.econnrefused() || n == -Sys.econnreset() || n == -Sys.enetunreach()
+    || n == -Sys.ehostunreach() || n == -Sys.etimedout() || n == -Sys.eafnosupport()
+    || n == -Sys.eaddrnotavail()
+
+-- A connected socket to `ip`, or the negated `errno` of the failure,
+-- `FD.timedOut` if `deadline` came first.
+fun attempt(ip : IP, port : Int, deadline : Int) -> Either Int FD.FD {
+    let number = Calls.open(ip)
+    if number < 0 { return Left(number) }
+    let made = Calls.setNoDelay(number)
+    let f = FD.fd(number)
+    if made < 0 {
+        let _ = FD.close(f)
+        return Left(made)
+    }
+    -- The first call starts the connection, and once the socket is writable
+    -- each later one asks how it ended. A signal that interrupts `connect`
+    -- leaves it going on in the background, as `EINPROGRESS` does.
+    var started = False
+    let r = FD.writingWith(f, fun(n) {
+        if started { return Calls.connected(n) }
+        started = True
+        let c = Calls.connect(n, ip, port)
+        if c == -Sys.einprogress() || c == -Sys.eintr { -Sys.eagain() } else { c }
+    }, deadline)
+    if r < 0 {
+        let _ = FD.close(f)
+        return Left(r)
+    }
+    Right(f)
+}
+
+-- -- listening ------------------------------------------------------------------------
+
+-- A listener on `address` and `port`, which takes connections as soon as this
+-- returns; port 0 asks the system for a free one, which `listenerAddress`
+-- tells. `SO_REUSEADDR` is set, so a server restarted at once can bind a port
+-- its old connections still hold.
+fun listen(address : IP, port : Int) -> Either IOError Listener {
+    let name = Some(endpoint(show(address), port))
+    let number = Calls.listen(address, port, backlog)
+    if number < 0 { return Left(failure("listen", name, number)) }
+    let f = FD.fd(number)
+    match Calls.localAddress(number) {
+        Right(bound) -> Right(Listener { fd = f, address = bound })
+        Left(n) -> {
+            let _ = FD.close(f)
+            Left(failure("listen", name, n))
+        }
+    }
+}
+
+-- The next connection to `l`, waiting for one to arrive: `Closed` if `l` is
+-- closed, before or during the wait. Tasks that call it at once take turns,
+-- and each connection goes to one of them.
+fun accept(l : Listener) -> Either IOError Socket {
+    let n = FD.readingWith(l.fd, fun(number) {
+        let r = Calls.accept(number)
+        -- A connection the peer gave up before it was taken: try at once
+        -- for the next, as after a signal.
+        if r == -Sys.econnaborted() { -Sys.eintr } else { r }
+    }, -1)
+    if n < 0 { return Left(failure("accept", Some(endpoint(show(l.address.0), l.address.1)), n)) }
+    let name = match Calls.peerAddress(n) {
+        Right((ip, port)) -> Some(endpoint(show(ip), port))
+        Left(_) -> None
+    }
+    Right(Socket { fd = FD.fd(n), deadline = -1, name })
+}
+
+-- The address and port `l` is bound to.
+fun listenerAddress(l : Listener) -> (IP, Int) = l.address
+
+-- Stop `l` accepting: an `accept` waiting on it ends with `Closed`, as does
+-- every later one. Connections it accepted stay open.
+fun closeListener(l : Listener) -> Either IOError Unit = closed(l.fd, None)
+
+-- -- connections ----------------------------------------------------------------------
+
+-- Send the end of input: the peer reads it after everything written before,
+-- and can go on writing. A write after it fails. It waits for a write in
+-- progress to finish, so it never lands inside one.
+fun shutdownWrite(s : Socket) -> Either IOError Unit {
+    let r = FD.writingWith(s.fd, fun(n) = Calls.shutdownWrite(n), -1)
+    if r < 0 { Left(failure("shutdown", s.name, r)) } else { Right(()) }
+}
+
+-- Close `s`. A read or a write parked on it, in any task, ends with
+-- `Closed`, as does every later one. Closing it again does nothing.
+fun close(s : Socket) -> Either IOError Unit = closed(s.fd, s.name)
+
+-- Bound every read and write on `s` from now on by `timeout`: a `Duration`
+-- from now, or a `Deadline`.
+fun setDeadline[Timeout t](s : Socket, timeout : t) -> Unit {
+    s.deadline = ConnectPolicy.limit(timeout)
+}
+
+-- Let reads and writes on `s` wait without limit again.
+fun clearDeadline(s : Socket) -> Unit {
+    s.deadline = -1
+}
+
+-- The address and port `s` is bound to on this machine.
+fun localAddress(s : Socket) -> Either IOError (IP, Int) =
+    named(s, "getsockname", fun(n) = Calls.localAddress(n))
+
+-- The address and port of `s`'s peer.
+fun peerAddress(s : Socket) -> Either IOError (IP, Int) =
+    named(s, "getpeername", fun(n) = Calls.peerAddress(n))
+
+-- -- underneath -----------------------------------------------------------------------
+
+fun named(s : Socket, op : String, call : fun(Int) -> Either Int (IP, Int)) -> Either IOError (IP, Int) {
+    var answer : Either Int (IP, Int) = Left(FD.closed)
+    let _ = FD.using(s.fd, fun(n) {
+        answer = call(n)
+        0
+    })
+    match answer {
+        Right(a) -> Right(a)
+        Left(n) -> Left(failure(op, s.name, n))
+    }
+}
+
+fun closed(f : FD.FD, name : Option String) -> Either IOError Unit {
+    let r = FD.close(f)
+    if r < 0 { Left(failure("close", name, r)) } else { Right(()) }
+}
+
+-- `host:port`, with an IPv6 address in brackets.
+fun endpoint(host : String, port : Int) -> String =
+    if String.contains(host, ":") && !String.startsWith(host, "[") {
+        "[" + host + "]:" + show(port)
+    } else {
+        host + ":" + show(port)
+    }
+
+-- The error a failed result means: a negated `errno`, `FD.closed`, or
+-- `FD.timedOut`.
+fun failure(op : String, name : Option String, n : Int) -> IOError =
+    if n == FD.timedOut { IOError { kind = Errors.TimedOut, op, path = name } }
+    else { Errors.failure(op, name, n) }

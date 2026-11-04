@@ -218,11 +218,13 @@ def test_an_instance_declared_in_a_giblet_and_called_directly_is_accepted(
 
 
 # Each helper is recursive, so it is a loop breaker and is never inlined: what
-# the giblet makes to pass to it survives to the Low IR.
+# the giblet makes to pass to it survives to the Low IR. The tuple and the
+# record have five fields, so each is an object: one of four or fewer is passed
+# in registers and makes nothing.
 MADE = (
-    "type P = P { x : Int, y : Int }\n"                                   # 3
-    "fun tuple(t : (Int, Int), k : Int) -> Int =\n"                        # 4
-    "    if k == 0 { match t { (a, _) -> a } } else { tuple(t, k - 1) }\n"                     # 5
+    "type P = P { x : Int, y : Int, z : Int, u : Int, v : Int }\n"        # 3
+    "fun tuple(t : (Int, Int, Int, Int, Int), k : Int) -> Int =\n"         # 4
+    "    if k == 0 { match t { (a, _, _, _, _) -> a } } else { tuple(t, k - 1) }\n"  # 5
     "fun array(t : Array Int, k : Int) -> Int =\n"                         # 6
     "    if k == 0 { len(t) } else { array(t, k - 1) }\n"                  # 7
     "fun record(t : P, k : Int) -> Int =\n"                                # 8
@@ -236,11 +238,11 @@ MADE = (
 
 
 @pytest.mark.parametrize("body, function, reason", [
-    ("fun f(n : Int) -> Int = H.tuple((n, n), n)\n",
+    ("fun f(n : Int) -> Int = H.tuple((n, n, n, n, n), n)\n",
      "f", "builds a tuple"),
     ("fun f(n : Int) -> Int = H.array([n, n], n)\n",
      "f", "builds an array"),
-    ("fun f(n : Int) -> Int = H.record(H.P { x = n, y = n }, n)\n",
+    ("fun f(n : Int) -> Int = H.record(H.P { x = n, y = n, z = n, u = n, v = n }, n)\n",
      "f", "builds a value with P"),
     # The closure's captured environment is the object it makes.
     ("fun f(n : Int) -> Int = H.closure(fun(x : Int) = x + n, n)\n",

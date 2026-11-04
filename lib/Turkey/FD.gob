@@ -1,5 +1,5 @@
 export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt, writeAt, using, flock,
-        close)
+        readingWith, writingWith, writeWith, close)
 
 -- A descriptor that tasks share: the one place the I/O layer decides when a
 -- descriptor number stops being this file's, and which of two tasks using it
@@ -70,7 +70,10 @@ export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt
 --
 -- **A deadline.** `readBy` takes one, a point on `Turkey.Wait.now`'s clock or
 -- -1 for none, and gives up at it from either wait: the one before the call
--- and the one after `EAGAIN`.
+-- and the one after `EAGAIN`. So do `readingWith`, `writingWith` and
+-- `writeWith`, which make a call of the caller's in place of `read` or
+-- `write` -- `accept`, `connect`, `send` -- under the same lock and the same
+-- retry loop, for a descriptor the library made non-blocking itself.
 --
 -- Every result is a count, never negative, or the negated `errno`, as
 -- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
@@ -186,7 +189,7 @@ fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> 
 -- write at a time per `FD`, so the bytes go out contiguously.
 fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True)
+    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1)
     unlock(f, writeLock, writeWaited)
     n
 }
@@ -194,9 +197,53 @@ fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
 -- `write`, from a string's own bytes, counted in bytes.
 fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True)
+    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1)
     unlock(f, writeLock, writeWaited)
     n
+}
+
+-- -- calls in place of a read or a write --------------------------------------------
+
+-- What `call(number)` answers, made under the read lock as a `read` is, for a
+-- call that takes what a read would, such as `accept`. Made again at once
+-- after `EINTR`, and after `EAGAIN` once the descriptor is readable; or
+-- `closed`, or `timedOut` if `deadline` came first. For a non-blocking
+-- descriptor only: nothing here looks at an inherited one's mode.
+fun readingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
+    if !lock(f, readLock, readWaited) { return closed }
+    let n = retried(f, call, False, deadline)
+    unlock(f, readLock, readWaited)
+    n
+}
+
+-- `readingWith` under the write lock, waiting for writable: for a call that a
+-- write would wait with, such as a `connect` in progress.
+fun writingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
+    if !lock(f, writeLock, writeWaited) { return closed }
+    let n = retried(f, call, True, deadline)
+    unlock(f, writeLock, writeWaited)
+    n
+}
+
+-- `write`, through `step(number, at)`, which writes from `at` up to `to` as
+-- `write` would and answers what it did: `send` with flags, say. Gives up at
+-- `deadline` with `timedOut`, after however much went out before it.
+fun writeWith(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int) -> Int {
+    if !lock(f, writeLock, writeWaited) { return closed }
+    let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline)
+    unlock(f, writeLock, writeWaited)
+    n
+}
+
+fun retried(f : FD, call : fun(Int) -> Int, writing : Bool, deadline : Int) -> Int {
+    while True {
+        let n = call(f.number)
+        if n == -Sys.eintr { continue }
+        if n != -Sys.eagain() { return n }
+        let w = park(f, writing, deadline)
+        if w != 0 { return w }
+    }
+    0
 }
 
 -- -- positional -----------------------------------------------------------------------
@@ -232,7 +279,7 @@ fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> In
 fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
-                     from, to, False)
+                     from, to, False, -1)
     let _ = release(f)
     n
 }
@@ -472,10 +519,11 @@ fun closeNumber(f : FD) -> Int {
 
 -- `write` until all of `from..to` is taken: `step(at)` writes from `at` and
 -- answers what the call did. Retried at once after a signal; after `EAGAIN`
--- the task parks until the descriptor is writable if `sequential`, and
--- yields otherwise; 0 from a non-empty write, which would otherwise loop, is
+-- the task parks until the descriptor is writable, or until `deadline`, if
+-- `sequential`, and yields otherwise; 0 from a non-empty write, which would otherwise loop, is
 -- reported as `EIO`.
-fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : Bool) -> Int {
+fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : Bool,
+             deadline : Int) -> Int {
     var at = from
     while at < to {
         let n = step(at)
@@ -485,7 +533,7 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
                 Scheduler.yield()
                 continue
             }
-            let w = park(f, True, -1)
+            let w = park(f, True, deadline)
             if w == 0 { continue }
             return w
         }

@@ -38,7 +38,9 @@ def _stressed(src: str) -> str:
 # closure the callee builds over the record and passes on. The closures capture
 # strings built at run time, so a capture the collector lost would print wrong.
 READERS = """
-type Mapper = Mapper { expr : fun(Int) -> String, ty : fun(String) -> String }
+-- A `var` field, so that it is an object: an immutable record this small is
+-- held as its fields.
+type Mapper = Mapper { expr : fun(Int) -> String, var ty : fun(String) -> String }
 type Hasher = Hasher { var h : Int }
 
 fun each(xs : Array Int, f : fun(Int) -> String) -> String {
@@ -178,9 +180,9 @@ def test_objects_that_outlive_their_call_stay_on_the_heap():
 # carries it round the loop is dead once it is reassigned, and only the final
 # object is read after the loop. `chain` above is the case where it is not.
 LOOPS = """
--- Two fields, so that it is an object: a record of one immutable field is
--- that field at run time.
-type Box = Box { x : Int, y : Int }
+-- A `var` field, so that it is an object: an immutable record this small is
+-- held as its fields.
+type Box = Box { x : Int, var y : Int }
 
 -- Recursive, so that it is called rather than inlined and the box is built.
 fun read(b : Box, k : Int) -> Int = if k == 0 { b.x } else { read(b, k - 1) }

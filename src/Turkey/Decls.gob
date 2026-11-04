@@ -10,7 +10,7 @@ export (
     fieldType, projectionTypes, payloadType, payloadTypes, hasIdentity, isRecordCon,
     substitute, newtypes, erasedPayload, conFieldTypes, conFieldTypesOpened,
     variantCount, Compact(..), compactShape, compactOf, enumSize, enumIndex,
-    showDeclarations,
+    FlatDecl(..), flatCandidates, flatDecl, showDeclarations,
 )
 
 -- Type and constructor declarations, resolved into semantic types
@@ -27,6 +27,7 @@ import Turkey.Ast (..)
 import Turkey.Deps as Deps
 import Turkey.Diag as Diag
 import Turkey.Source (Span(..))
+import Turkey.Ssa as Ssa
 import Turkey.Types as Ty
 -- The *constructors* of the semantic type, without the name itself: in this
 -- file `Type` is the syntax the author wrote (`Turkey.Ast`) and `Ty.Type` is
@@ -171,6 +172,16 @@ type DeclTable = DeclTable {
     definitions  : Map String ForeignInfo,
     -- `newtypes`, computed once the declarations are all in.
     var newtypeNames : Option (Set.Set String),
+    -- `flatCandidates`, likewise.
+    var flatNames : Option (Map String FlatDecl),
+    -- The layout of each candidate without parameters, which is the same
+    -- wherever it is asked for. Filled by `Turkey.Layout.share` before anything
+    -- reads it in parallel, and only read after.
+    groundLayouts : Map String Ssa.Layout,
+    -- Existential constructor -> key name -> index: the keys each is packed at
+    -- anywhere in the program, numbered. Filled by `Turkey.Layout.share`, which
+    -- says why every packed key is in it, and only read after.
+    packings : Map String (Map String Int),
     -- Existential constructors whose contexts name classes, until the class
     -- table has the classes to check them against.
     var uncheckedContexts : Vec (ConInfo, ConDecl),
@@ -183,7 +194,8 @@ fun newDeclTable() -> DeclTable {
         tycons = Map.new(), constructors = Map.new(), heads = Map.new(),
         families = Map.new(), shorts = Map.new(), order = Vec.new(16),
         foreigns = Map.new(), definitions = Map.new(),
-        newtypeNames = None, uncheckedContexts = [],
+        newtypeNames = None, flatNames = None, groundLayouts = Map.new(),
+        packings = Map.new(), uncheckedContexts = [],
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
@@ -787,9 +799,10 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
 -- wrapper is erased into its payload, so `type Loop = Loop(Loop)` has no
 -- representation at all -- and the cycle need not be direct, since `A(B)`,
 -- `B(C)`, `C(A)` is the same thing spread over three declarations. An edge is
--- drawn only where the payload's *head* is another candidate: a payload of
--- `Option B` is a pointer to a variant type whatever `B` is, and that pointer
--- is where the recursion stops. One member of each cycle keeps its box -- the
+-- drawn only where the payload's *head* is another candidate. A payload of
+-- `Option B` is a variant type, whose layout may depend on `B`'s; where that
+-- leads back to the newtype, `Turkey.Layout`'s unfolding finds the cycle and
+-- holds the types on it boxed. One member of each cycle keeps its box -- the
 -- first by name, as `Turkey.Opt`'s loop breaker picks one -- which is enough to
 -- make the rest terminate.
 fun newtypes(t : DeclTable) -> Set.Set String {
@@ -831,6 +844,118 @@ fun newtypes(t : DeclTable) -> Set.Set String {
     }
     t.newtypeNames = Some(candidates)
     candidates
+}
+
+-- What `Turkey.Layout` needs of a declared type that may be flat, read once.
+type FlatDecl = FlatDecl {
+    -- The type's parameters, in order, by variable: what an application's
+    -- arguments are substituted for.
+    params : Array Int,
+    -- Its constructors, in declaration order, and each one's field types.
+    names  : Array String,
+    fields : Array (Array Ty.Type),
+    -- The payload constructor's index, if the type is a compact sum.
+    compact : Option Int,
+}
+
+-- Returns the facts about `tycon` if it is a candidate (`flatCandidates`).
+fun flatDecl(t : DeclTable, tycon : String) -> Option FlatDecl =
+    Map.get(flatCandidates(t), tycon)
+
+-- Returns the declared types whose values may be held as their fields'
+-- slots rather than as a pointer to an object: `Turkey.Layout.flatOf` decides
+-- per instantiation, and considers only these. Computed once and cached; the
+-- first call must not race another, so `Turkey.Layout.share` makes it before
+-- anything runs in parallel.
+--
+-- A candidate has a constructor with a field, is neither an enumeration nor a
+-- newtype, which have their own representations, and is immutable and not
+-- existential: a copy of its value cannot be told from the original, which is
+-- what lets its slots be copied freely. And it is not recursive: no type its
+-- fields mention, at any depth of declarations, mentions it back. A recursive
+-- type has values of every size, which slots cannot hold.
+fun flatCandidates(t : DeclTable) -> Map String FlatDecl {
+    match t.flatNames {
+        Some(found) -> return found
+        None -> {}
+    }
+    let erased = newtypes(t)
+    let graph = Map.new()
+    for (name, info) in Map.entries(t.tycons) {
+        let deps = Set.new()
+        for v in info.variants {
+            match Ty.prune(v.scheme.body) {
+                TFun(params, _) -> for p in params { mentionedInto(p, deps) }
+                _ -> {}
+            }
+        }
+        Map.put(graph, name, deps)
+    }
+    let recursive = Set.new()
+    for component in Deps.sccs(graph) {
+        let first = component[0]
+        if len(component) > 1 || Set.contains(Map.getOr(graph, first, Set.new()), first) {
+            for name in component { Set.add(recursive, name) }
+        }
+    }
+    let out = Map.new()
+    for (name, info) in Map.entries(t.tycons) {
+        var carries = False
+        var hidden = False
+        for v in info.variants {
+            if v.arity > 0 { carries = True }
+            if len(v.exists) > 0 { hidden = True }
+        }
+        if carries && !hidden && !isMutable(info) && !Set.contains(erased, name)
+                && !Set.contains(recursive, name) {
+            Map.put(out, name, flatDeclOf(t, info))
+        }
+    }
+    t.flatNames = Some(out)
+    out
+}
+
+fun flatDeclOf(t : DeclTable, info : TyconInfo) -> FlatDecl {
+    let params = match Ty.prune(info.variants[0].scheme.body) {
+        TFun(_, ret) -> {
+            let (_, args) = Ty.spine(ret)
+            let ids = []
+            for a in args {
+                match Ty.prune(a) {
+                    TVar(cell) -> Vec.push(ids, cell.id)
+                    _ -> Vec.push(ids, -1)
+                }
+            }
+            Vec.toArray(ids)
+        }
+        _ -> []
+    }
+    let fields = Array.map(Vec.toArray(info.variants), fun(v) = match Ty.prune(v.scheme.body) {
+        TFun(ps, _) -> ps
+        _ -> []
+    })
+    let names = Array.map(Vec.toArray(info.variants), _.name)
+    let compact = match compactShape(t, info.name) {
+        Some(c) -> Array.indexOf(names, c.payload)
+        None -> None
+    }
+    FlatDecl { params = params, names = names, fields = fields, compact = compact }
+}
+
+-- Add every declared type constructor `ty` mentions to `out`.
+fun mentionedInto(ty : Ty.Type, out : Set.Set String) -> Unit = match Ty.prune(ty) {
+    TCon(c) -> Set.add(out, c.name)
+    TApp(fn, arg, _) -> {
+        mentionedInto(fn, out)
+        mentionedInto(arg, out)
+    }
+    TFam(_, arg, _) -> mentionedInto(arg, out)
+    TFun(params, ret) -> {
+        for p in params { mentionedInto(p, out) }
+        mentionedInto(ret, out)
+    }
+    TTuple(elems) -> for e in elems { mentionedInto(e, out) }
+    _ -> {}
 }
 
 -- What a value of `receiver` really is, if its wrapper is erased.
@@ -888,12 +1013,12 @@ fun conFieldTypes(t : DeclTable, receiver : Ty.Type,
 }
 
 -- A sum whose constructors are nullary but for one, and that one positional
--- with a single field: `Option a`, `Data.Map`'s `Entry`. Where that field is
--- held at a traced pointer, a value of the sum is one word -- see
--- `Turkey.SsaLower`'s compact sums -- and elsewhere it is an ordinary object.
--- Which of the two a value is depends on the instantiation, so code that builds
--- or tests one at a type variable needs that variable's layout
--- (`Turkey.Layout.constructs`).
+-- with a single field: `Option a`, `Data.Map`'s `Entry`. Where memory holds that
+-- field at a traced pointer, a value of the sum is one word -- see
+-- `Turkey.SsaLower`'s compact sums -- and elsewhere it is flat or an ordinary
+-- object (`Turkey.Layout.flatOf`). Which a value is depends on the
+-- instantiation, so code that builds or tests one at a type variable needs
+-- that variable's layout.
 --
 -- Existential and record constructors disqualify a sum: a packed value carries
 -- its layout codes, and a record has identity if a field is a `var`.

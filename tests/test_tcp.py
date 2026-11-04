@@ -383,12 +383,12 @@ fun main() {
         print(host + " " + check(Net.publicInternet, host))
     }
     print(check(Net.anywhere, "127.0.0.1"))
-    let internal = Net.only([Net.AddressRange(Net.V4(0x0a00_0000), 8)])
+    let internal = Net.allowlist([Net.AddressRange(Net.V4(0x0a00_0000), 8)])
     print(check(internal, "10.1.2.3"))
     print(check(internal, "::ffff:10.1.2.3"))
     print(check(internal, "11.0.0.1"))
-    print(check(Net.only([Net.HostName("[::1]")]), "::1"))
-    print(check(Net.only([]), "8.8.8.8"))
+    print(check(Net.allowlist([Net.HostName("[::1]")]), "::1"))
+    print(check(Net.allowlist([]), "8.8.8.8"))
     match Net.resolve("127.0.0.1", 0, Net.anywhere, Duration.seconds(5)) {
         Right(_) -> print("port 0 allowed")
         Left(e) -> print(e)
@@ -466,12 +466,12 @@ fun check(policy : Net.ConnectPolicy, host : String) -> String =
     }
 
 fun main() {
-    let rule = Net.only([Net.HostName("example.com")])
+    let rule = Net.allowlist([Net.HostName("example.com")])
     print(check(rule, "Example.COM."))
     print(check(rule, "EXAMPLE.com"))
     print(check(rule, "example.com.."))
     print(check(rule, "example.org"))
-    print(check(Net.only([Net.HostName("API.Example.com.")]), "api.example.com"))
+    print(check(Net.allowlist([Net.HostName("API.Example.com.")]), "api.example.com"))
     print(check(Net.publicInternet, "Example.COM."))
     print(String.join(Vec.toArray(asked), ","))
 }

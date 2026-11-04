@@ -9,6 +9,7 @@ import Net.HTTP.H1.Body as Body
 import Net.HTTP.H1.Body (Drained(..))
 import Net.HTTP.H1.Head (Framing(..))
 import Net.HTTP.H1.Input as Input
+import Net.HTTP.Headers as Headers
 import Net.HTTP.Incoming as Incoming
 import Net.HTTP.Limits as Limits
 import Run (..)
@@ -51,7 +52,7 @@ fun decode(src : Source, framing : Framing, limits : Limits, room : Int) -> Stri
 
 -- Reads `text` framed by `framing` every adversarial way, and prints the one
 -- outcome they agree on, or each that disagrees.
-fun body(label : String, text : String, framing : Framing) = bodyWith(label, text, framing, Limits.defaults)
+fun body(label : String, text : String, framing : Framing) = bodyWith(label, text, framing, Limits.empty)
 
 fun bodyWith(label : String, text : String, framing : Framing, limits : Limits) {
     let s = String.toBytes(text)
@@ -104,15 +105,15 @@ fun bodies() {
     body("an extension without a value", "5;a=\r\nhello\r\n0\r\n\r\n", Chunked)
     body("an unterminated quoted value", "5;a=\"x\r\nhello\r\n0\r\n\r\n", Chunked)
     body("a NUL in an extension", "5;a\u{0}\r\nhello\r\n0\r\n\r\n", Chunked)
-    let limits = Limits.defaults
-    let padding = Limits.chunkLineBytes(limits) - String.byteLength("5;a=\r\n")
+    let limits = Limits.empty
+    let padding = Limits.values(limits).chunkLineBytes - String.byteLength("5;a=\r\n")
     body("an extension at the line limit", "5;a=" + repeated("x", padding) + "\r\nhello\r\n0\r\n\r\n", Chunked)
     body("an extension one past it", "5;a=" + repeated("x", padding + 1) + "\r\nhello\r\n0\r\n\r\n", Chunked)
     body("a trailer line with a bare LF", "0\r\nX: a\n\r\n", Chunked)
     body("an obs-folded trailer", "0\r\nX: a\r\n b\r\n\r\n", Chunked)
     body("a reserved trailer", "0\r\nContent-Length: 5\r\n\r\n", Chunked)
     body("Host as a trailer", "0\r\nHost: a\r\n\r\n", Chunked)
-    let trailerPadding = Limits.trailerBytes(limits) - String.byteLength("X: \r\n")
+    let trailerPadding = Limits.values(limits).trailerBytes - String.byteLength("X: \r\n")
     body("trailers at the limit", "0\r\nX: " + repeated("t", trailerPadding) + "\r\n\r\n", Chunked)
     body("trailers one past it", "0\r\nX: " + repeated("t", trailerPadding + 1) + "\r\n\r\n", Chunked)
     body("many short trailers past it", "0\r\n" + repeated("X: y\r\n", 1000) + "\r\n", Chunked)
@@ -136,7 +137,7 @@ fun bodies() {
 -- prints that it ran.
 fun arrived(text : String, framing : Framing) -> (Incoming, Source) {
     let src = sized(String.toBytes(text), [3])
-    let b = Body.body(Input.input(src, Limits.defaults), framing, Limits.defaults)
+    let b = Body.body(Input.input(src, Limits.empty), framing, Limits.empty)
     Body.beforeFirstRead(b, fun() {
         print("  (the hook ran, with " + show(src.at) + " bytes read)")
         Right(())
@@ -192,9 +193,19 @@ fun incoming() {
     let (k, _) = arrived("hel", ContentLength(5))
     print("receive a truncated body: " + received(k, 5))
 
+    -- Trailers come once the body has ended.
+    let (m, _) = arrived("5\r\nhello\r\n0\r\nX-Checksum: abc\r\nX-Count: 1\r\n\r\n", Chunked)
+    let before = show(trailers(m))
+    let whole = received(m, 100)
+    print("trailers: " + before + " before, then " + whole + " and "
+          + visible(show(Option.map(trailers(m), Headers.fields))))
+    let (n, _) = arrived("hello", ContentLength(5))
+    let _ = received(n, 5)
+    print("trailers of a body with a length: " + show(Option.map(trailers(n), Headers.size)))
+
     -- A hook that fails fails the read, and the body after it.
     let src = sized(String.toBytes("hello"), [5])
-    let failing = Body.body(Input.input(src, Limits.defaults), ContentLength(5), Limits.defaults)
+    let failing = Body.body(Input.input(src, Limits.empty), ContentLength(5), Limits.empty)
     Body.beforeFirstRead(failing, fun() = Left(Truncated))
     let l = Body.incoming(failing, fun(e) = fail(e))
     print("a failing hook: " + received(l, 5) + ", " + show(src.at) + " bytes read")
@@ -221,18 +232,18 @@ fun drained(text : String, framing : Framing, first : Int, limits : Limits) -> S
 
 fun draining() {
     print("-- draining an unread body")
-    let d = Limits.defaults
+    let d = Limits.empty
     let next = "GET / HTTP/1.1\r\n\r\n"
     print("read to its end: " + drained("hello" + next, ContentLength(5), 5, d))
     print("a short remainder: " + drained("hello" + next, ContentLength(5), 2, d))
     print("unread, within the cap: " + drained(repeated("x", 1000) + next, ContentLength(1000), 0, d))
-    let cap = Limits.drainBytes(d)
+    let cap = Limits.values(d).drainBytes
     print("at the cap: " + drained(repeated("x", cap) + next, ContentLength(cap), 0, d))
     print("over the cap, closed without reading: "
           + drained(repeated("x", 1000), ContentLength(cap + 1), 0, d))
     let chunked = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
     print("chunked, within the cap: " + drained(chunked + next, Chunked, 0, d))
-    let small = Limits.withDrainBytes(d, 4)
+    let small = combine(d, Limits.drainBytes(4))
     print("chunked, past a 4-byte cap: " + drained(chunked + next, Chunked, 0, small))
     print("chunked and malformed: " + drained("3\r\nabc\n" + next, Chunked, 0, d))
     print("until the stream closes: " + drained("all", UntilClose, 0, d))

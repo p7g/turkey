@@ -1,4 +1,7 @@
-export (Request(..), ClientRequest(..), RequestTarget(..), Target(..), request, segments)
+export (
+    Request(..), ClientRequest(..), RequestTarget(..), Target(..), Control(..),
+    request, segments, contentLength, host, upgradeRequested, acceptsTrailers,
+)
 
 -- Requests, as a server receives them and as a client sends them: a method,
 -- which carries the body, a target, and header fields.
@@ -18,6 +21,7 @@ export (Request(..), ClientRequest(..), RequestTarget(..), Target(..), request, 
 import Net.HTTP.Headers as Headers (Headers, HasHeaders(..))
 import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
 import Net.HTTP.Method (Method)
+import Net.HTTP.Token (Token)
 import URL as URL (URLError)
 
 -- A request a server received, routed by matching on it:
@@ -27,12 +31,45 @@ import URL as URL (URLError)
 --         (POST(body), "/orders") -> ...
 --         _ -> ...
 --     }
-type Request b = Request { method : Method b, target : RequestTarget, headers : Headers }
+--
+-- `control` is what the fields the library reads itself said; the functions
+-- below read it.
+type Request b = Request {
+    method : Method b,
+    target : RequestTarget,
+    headers : Headers,
+    control : Control,
+}
 
 instance HasHeaders (Request b) {
     fun headers(r) = r.headers
-    fun withHeaders(r, hs) = Request { method = r.method, target = r.target, headers = hs }
+    fun setHeaders(r, hs) =
+        Request { method = r.method, target = r.target, headers = hs, control = r.control }
 }
+
+-- What a request's reserved fields said, which `headers` cannot hold:
+--
+-- * `contentLength`: the body's declared length, `None` for a chunked body
+--   or none.
+-- * `upgrade`: the protocols `Upgrade` offered, in order. An offer with a
+--   version (`HTTP/2.0`) is not a token, and is left out.
+-- * `trailers`: whether `TE` lists `trailers`, so the client reads trailers
+--   after a chunked response.
+type Control = Control { contentLength : Option Int, upgrade : Array Token, trailers : Bool }
+
+-- Returns the length the request's body declared, if it declared one.
+fun contentLength(r : Request b) -> Option Int = r.control.contentLength
+
+-- Returns the host and port the request was sent to, from `Host` or from an
+-- absolute-form target.
+fun host(r : Request b) -> Option String = r.target.authority
+
+-- Returns the protocols the client offered to switch to, in its order of
+-- preference, or none.
+fun upgradeRequested(r : Request b) -> Array Token = r.control.upgrade
+
+-- Returns whether the client reads trailers after a chunked response.
+fun acceptsTrailers(r : Request b) -> Bool = r.control.trailers
 
 -- A request a client is to send, built with `request` and `header`:
 --
@@ -46,7 +83,7 @@ type ClientRequest b = ClientRequest { method : Method b, url : Either URLError 
 
 instance HasHeaders (ClientRequest b) {
     fun headers(r) = r.headers
-    fun withHeaders(r, hs) = ClientRequest { method = r.method, url = r.url, headers = hs }
+    fun setHeaders(r, hs) = ClientRequest { method = r.method, url = r.url, headers = hs }
 }
 
 -- What a client can send a request to: an `HTTPURL`, or a `String` that

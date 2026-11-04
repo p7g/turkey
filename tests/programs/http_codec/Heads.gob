@@ -48,7 +48,7 @@ fun strictOutcome(s : Array Byte) -> (Bool, String) = match Strict.parse(s, 0) {
     })
 }
 
-fun case(name : String, text : String) = caseWith(name, text, Limits.defaults)
+fun case(name : String, text : String) = caseWith(name, text, Limits.empty)
 
 fun caseWith(name : String, text : String, limits : Limits) {
     let s = String.toBytes(text)
@@ -73,8 +73,8 @@ fun caseWith(name : String, text : String, limits : Limits) {
 fun request(fields : String) -> String = "GET / HTTP/1.1\r\nHost: example.com\r\n" + fields + "\r\n"
 
 fun requests() {
-    let lineLimit = Limits.lineBytes(Limits.defaults)
-    let fieldLimit = Limits.fields(Limits.defaults)
+    let lineLimit = Limits.values(Limits.empty).lineBytes
+    let fieldLimit = Limits.values(Limits.empty).fields
 
     print("-- accepted")
     case("minimal", request(""))
@@ -207,6 +207,17 @@ fun requests() {
     case("Expect twice", request("Expect: 100-continue\r\nExpect: 100-continue\r\n"))
     case("Expect from HTTP/1.0", "PUT / HTTP/1.0\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n")
     case("the rest are dropped", request("Keep-Alive: 5\r\nTE: trailers\r\nTrailer: X\r\nProxy-Connection: x\r\nX: y\r\n"))
+    case("Upgrade offers, one with a version", request("Connection: upgrade\r\nUpgrade: websocket, HTTP/2.0, h2c\r\n"))
+    case("TE lists trailers", request("TE: gzip;q=0.5, Trailers\r\n"))
+    case("TE lists something else", request("TE: trailersx, gzip\r\n"))
+
+    print("-- the fields Connection names are this hop's")
+    let hop = request("Connection: x-hop, close\r\nX-Hop: 1\r\nX-Keep: 2\r\nx-hop: 3\r\n")
+    case("Connection names a field", hop)
+    let (_, kept, _) = readWays(String.toBytes(hop), Limits.empty)[0]
+    print("  " + kept)
+    case("Connection names one in another case", request("X-Hop: 1\r\nConnection: X-HOP\r\n"))
+    case("Connection names a reserved field", request("Connection: content-length\r\nContent-Length: 3\r\n"))
 
     print("-- limits")
     let longest = "GET /" + repeated("a", lineLimit - 16) + " HTTP/1.1\r\nHost: a\r\n\r\n"
@@ -217,7 +228,7 @@ fun requests() {
     case("past it, then malformed", request(repeated("X: y\r\n", fieldLimit) + "\n"))
     case("malformed before the limit", request(repeated("X: y\r\n", 5) + "X y\r\n"
                                                + repeated("X: y\r\n", fieldLimit)))
-    let small = Limits.withHeadBytes(Limits.defaults, 64)
+    let small = combine(Limits.empty, Limits.headBytes(64))
     let padding = 64 - String.byteLength(request("X: \r\n"))
     caseWith("head at a 64-byte limit", request("X: " + repeated("a", padding) + "\r\n"), small)
     caseWith("head one past it", request("X: " + repeated("a", padding + 1) + "\r\n"), small)
@@ -242,7 +253,7 @@ fun requests() {
 
 fun show1(text : String) {
     let s = String.toBytes(text)
-    let (_, full, _) = readWays(s, Limits.defaults)[0]
+    let (_, full, _) = readWays(s, Limits.empty)[0]
     print(firstLine(text) + " => " + visible(full))
 }
 
@@ -255,8 +266,8 @@ fun firstLine(text : String) -> String = match String.splitOnce(text, "\r\n") {
 fun values() {
     let s = String.toBytes("GET / HTTP/1.1\r\nHost: a\r\nX: caf") + [Byte.truncate(0xE9)]
             + String.toBytes("\r\nY:  b c \r\n\r\n")
-    let input = Input.input(sized(s, [len(s)]), Limits.defaults)
-    match readRequest(input, Limits.defaults) {
+    let input = Input.input(sized(s, [len(s)]), Limits.empty)
+    match readRequest(input, Limits.empty) {
         Right(Some(h)) -> {
             let x = Option.expect(Headers.get(h.headers, HeaderName.literal("x")), "x")
             let y = Option.expect(Headers.get(h.headers, HeaderName.literal("y")), "y")
@@ -274,8 +285,8 @@ fun response(text : String, m : Method Unit) {
     let s = String.toBytes(text)
     let outcomes = []
     for src in [sized(s, [len(s) + 1]), oneByte(s), splitAt(s, len(s) / 2)] {
-        let input = Input.input(src, Limits.defaults)
-        Vec.push(outcomes, responseOutcome(readResponse(input, Limits.defaults, m)))
+        let input = Input.input(src, Limits.empty)
+        Vec.push(outcomes, responseOutcome(readResponse(input, Limits.empty, m)))
     }
     var line = Method.name(m) + " " + visible(text) + ": " + outcomes[0]
     for o in outcomes {
@@ -301,6 +312,7 @@ fun responses() {
     response("HTTP/1.1 200 Connection established\r\n\r\n", CONNECT)
     response("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", GET)
     response("HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nConnection: x-hop\r\nX-Hop: 1\r\nX-Keep: 2\r\nContent-Length: 0\r\n\r\n", GET)
 
     print("-- responses: the head rules that apply to them")
     response("HTTP/1.1 200 OK\nContent-Length: 1\r\n\r\n", GET)
@@ -338,10 +350,10 @@ fun stageOne() {
     let two = String.toBytes("GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n")
     for (label, src) in [("whole", sized(two, [len(two)])), ("by byte", oneByte(two)),
                          ("in sevens", sized(two, [7]))] {
-        let input = Input.input(src, Limits.defaults)
+        let input = Input.input(src, Limits.empty)
         let paths = []
         loop {
-            match readRequest(input, Limits.defaults) {
+            match readRequest(input, Limits.empty) {
                 Right(Some(h)) -> Vec.push(paths, h.target.path)
                 other -> {
                     Vec.push(paths, requestOutcome(other))
@@ -356,23 +368,23 @@ fun stageOne() {
     -- however many more are on their way.
     let endless = String.toBytes("GET / HTTP/1.1\r\nX: " + repeated("a", 100000))
     let src = sized(endless, [100])
-    let input = Input.input(src, Limits.defaults)
-    print("an endless head: " + requestOutcome(readRequest(input, Limits.defaults)) + " after "
+    let input = Input.input(src, Limits.empty)
+    print("an endless head: " + requestOutcome(readRequest(input, Limits.empty)) + " after "
           + show(src.at) + " bytes")
     let longLine = String.toBytes("GET /" + repeated("a", 100000))
     let src2 = sized(longLine, [100])
-    let input2 = Input.input(src2, Limits.defaults)
-    print("an endless request line: " + requestOutcome(readRequest(input2, Limits.defaults)) + " after "
+    let input2 = Input.input(src2, Limits.empty)
+    print("an endless request line: " + requestOutcome(readRequest(input2, Limits.empty)) + " after "
           + show(src2.at) + " bytes")
 
     -- A head that spans the end of one array is moved to a new one whole.
     let filler = repeated("X: " + repeated("b", 90) + "\r\n", 90)
     let many = String.toBytes(repeated("GET / HTTP/1.1\r\nHost: a\r\n" + filler + "\r\n", 4))
-    let input3 = Input.input(sized(many, [1000, 3, 777]), Limits.defaults)
+    let input3 = Input.input(sized(many, [1000, 3, 777]), Limits.empty)
     let heads = []
     let shown = []
     loop {
-        match readRequest(input3, Limits.defaults) {
+        match readRequest(input3, Limits.empty) {
             Right(Some(h)) -> {
                 Vec.push(heads, h)
                 Vec.push(shown, show(h.headers))

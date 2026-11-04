@@ -7,6 +7,8 @@ import Data.Error (cast, messageOf)
 import Net.HTTP.H1.Head (Framing(..), Persistence(..))
 import Net.HTTP.H1.Output as Output
 import Net.HTTP.H1.Output (OutgoingResponse(..))
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
 import Net.HTTP.Headers as Headers
 import Net.HTTP.Stream as Stream
 import System.IO as IO
@@ -64,8 +66,12 @@ instance Error Gone { fun message(g) = "the feed went away" }
 
 -- Sends `s` as a 200 response over `out`, framed as an HTTP/1.1 response
 -- frames it, and prints what went out and how it ended.
-fun respond(label : String, s : Stream, out : Wire) -> Sink {
-    let framing = Stream.framing(Stream.length(s), Chunked)
+fun respond(label : String, s : Stream, out : Wire) -> Sink = respondAs(label, s, out, Chunked)
+
+-- Sends `s` as `respond` does, with `unknown` as the framing for a body of
+-- unknown length.
+fun respondAs(label : String, s : Stream, out : Wire, unknown : Framing) -> Sink {
+    let framing = Stream.framing(Stream.length(s), unknown)
     let head = Output.responseHead(OutgoingResponse {
         status = OK, headers = Headers.empty, framing, persistence = KeepAlive, upgrade = None,
     })
@@ -79,9 +85,9 @@ fun respond(label : String, s : Stream, out : Wire) -> Sink {
     into
 }
 
-fun pieces(parts : Array String) -> fun(Sink) -> Either SomeError Unit = fun(sink) {
+fun pieces(parts : Array String) -> fun(Sink) -> Either SomeError Headers = fun(sink) {
     for part in parts { IO.writeText(sink, part)? }
-    Right(())
+    Right(Headers.empty)
 }
 
 fun main() {
@@ -98,7 +104,7 @@ fun main() {
     -- A function that swallows its overrun still cannot finish the message.
     let _ = respond("overrun ignored", Stream(LengthKnown(3), fun(sink) {
         let _ = IO.writeText(sink, "hello")
-        Right(())
+        Right(Headers.empty)
     }), wire())
 
     print("-- unknown length")
@@ -108,9 +114,19 @@ fun main() {
         flush(sink)?
         IO.writeText(sink, "data: 2\n\n")?
         flush(sink)?
-        Right(())
+        Right(Headers.empty)
     }), wire())
     let _ = respond("nothing written", Stream(LengthUnknown, pieces([])), wire())
+
+    print("-- trailers")
+    let checksum = Headers.field(HeaderName.literal("x-checksum"), HeaderValue.literal("abc"))
+    let withChecksum = fun(sink) {
+        IO.writeText(sink, "hello")?
+        Right(checksum)
+    }
+    let _ = respond("chunked", Stream(LengthUnknown, withChecksum), wire())
+    let _ = respond("known length", Stream(LengthKnown(5), withChecksum), wire())
+    let _ = respondAs("until close", Stream(LengthUnknown, withChecksum), wire(), UntilClose)
 
     print("-- the function fails")
     let _ = respond("chunked, not ended", Stream(LengthUnknown, fun(sink) {
@@ -130,7 +146,8 @@ fun main() {
     let kept = []
     let ended = respond("kept the sink", Stream(LengthUnknown, fun(sink) {
         Vec.push(kept, sink)
-        IO.writeText(sink, "x")
+        IO.writeText(sink, "x")?
+        Right(Headers.empty)
     }), wire())
     for s in kept {
         match IO.writeText(s, "late") {

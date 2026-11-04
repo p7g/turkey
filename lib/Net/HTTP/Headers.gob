@@ -1,13 +1,13 @@
 export (
     Header(..), Multiplicity(..), HasHeaders(..), Headers,
-    empty, fromFields, fields, size, has, add, set, remove, get, getAll, one, header,
+    empty, field, fromFields, fields, size, has, add, set, remove, get, getAll, one, header, withHeaders,
     Accept(..), ContentType(..), Authorization(..), IdempotencyKey(..), Location(..),
     RetryAfter(..), Retry(..), SetCookie(..),
 )
 
 -- Header fields, typed.
 --
---     let hs = Headers.add(Headers.empty, ContentType, MediaType.json)
+--     let hs = combine(field(ContentType, MediaType.json), field(Accept, MediaType.json))
 --     Headers.get(hs, ContentType)            -- Some(application/json)
 --     Headers.get(hs, HeaderName.literal("content-type"))
 --                                             -- Some(application/json), as text
@@ -37,6 +37,13 @@ export (
 -- program added are the same thing, and `get` with a `HeaderName` sees typed
 -- fields as the text they are sent as. A typed value is written when it is
 -- added, so the text it would be sent as is checked then.
+--
+-- **`Headers` is a monoid.** `field(h, v)` is headers of one field, and
+-- `combine` appends the right side's fields after the left's, keeping both
+-- where both have a field: that is HTTP's own multiplicity, and it makes
+-- `combine` associative, with `empty` as its identity. So a set of fields is
+-- a value that can be named, shared and joined to a message's with
+-- `withHeaders`. Replacing a field is `set`, which is not a `combine`.
 --
 -- `Headers` is immutable: `add`, `set` and `remove` return new headers. A
 -- message's headers are a few dozen fields, so each copy is small, and a
@@ -80,11 +87,15 @@ class Header h {
 --   library does not know.
 type Multiplicity = Single | CommaSeparated | OnePerLine
 
--- A message with headers, which `header` adds to.
+-- A message with headers. `setHeaders(m, hs)` returns `m` with `hs` in place
+-- of its headers.
 class HasHeaders m {
     fun headers(m) -> Headers
-    fun withHeaders(m, Headers) -> m
+    fun setHeaders(m, Headers) -> m
 }
+
+-- Returns `m` with `hs`'s fields after its own, as `combine` joins them.
+fun withHeaders[HasHeaders m](m : m, hs : Headers) -> m = setHeaders(m, combine(headers(m), hs))
 
 -- Returns a function that adds the field `h: v` to a message, for building
 -- one in a pipeline:
@@ -93,7 +104,7 @@ class HasHeaders m {
 --
 -- It adds, never replaces, as `add` does.
 fun header[HasHeaders m, Header h](h : h, v : Value h) -> fun(m) -> m =
-    fun(message) = withHeaders(message, add(headers(message), h, v))
+    fun(message) = withHeaders(message, field(h, v))
 
 type Field = Field(HeaderName, HeaderValue)
 
@@ -105,6 +116,15 @@ instance Show Headers {
 }
 
 let empty = Headers([])
+
+instance Semigroup Headers {
+    fun combine(Headers(a), Headers(b)) = Headers(a + b)
+}
+
+instance Monoid Headers { fun empty() = empty }
+
+-- Returns headers of the one field `h: v`.
+fun field[Header h](h : h, v : Value h) -> Headers = Headers([Field(headerName(h), writeValue(h, v))])
 
 -- Returns headers holding `fields` in order. A codec that has read a
 -- message's fields builds its headers with this.

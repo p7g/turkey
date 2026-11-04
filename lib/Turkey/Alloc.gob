@@ -22,14 +22,17 @@ import Data.Bool (Bool(..))
 import Turkey.Memory as Memory
 import Turkey.Heap as Heap
 import Turkey.Process as Process
+import Data.Int as Int
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- A cell: its header, whose count is 1 if the value is a pointer the
 -- collector follows, and the value.
-foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.Ptr {
+foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Ptr {
     let cell = Heap.allocate(16, 5, Prim.frameAddress())
-    if !Prim.ptrIsNull(cell) {
+    if !Ptr.isNull(cell) {
         header(cell, 5, if pointerValue != 0 { 1 } else { 0 }, 0)
-        Prim.storeI64(cell, 8, value)
+        Ptr.store(cell, 8, value)
     }
     cell
 }
@@ -39,23 +42,23 @@ foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.P
 -- (`Turkey.Runtime.layout`); all the runtime keeps is the count, which is the
 -- collector's whole description of the object.
 foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
-                                         pointers : Int) -> Prim.Ptr {
+                                         pointers : Int) -> Ptr {
     -- The bound on `bytes` is far past any object a program builds, and keeps
     -- the size from overflowing. The header counts the pointers in 16 bits.
     if kind < 0 || kind == 2 || kind > 4 || bytes < 0 || bytes > 0x1_0000_0000
             || bytes & 7 != 0 || pointers < 0 || pointers > bytes >> 3
             || pointers > 0xFFFF {
         Process.panic(Prim.cString("invalid object size"))
-        return Prim.ptrNull()
+        return Ptr.null()
     }
-    let size = Prim.intAddWrapping(8, bytes)
+    let size = Int.addWrapping(8, bytes)
     let object = Heap.allocate(size, kind, Prim.frameAddress())
-    if Prim.ptrIsNull(object) { return object }
+    if Ptr.isNull(object) { return object }
     header(object, kind, pointers, tag)
     -- In line, a word at a time: most objects have a few fields, and are
     -- zeroed in fewer instructions than a call takes.
-    for var at = 8; at < size; at = Prim.intAddWrapping(at, 8) {
-        Prim.storeI64(object, at, 0)
+    for var at = 8; at < size; at = Int.addWrapping(at, 8) {
+        Ptr.store(object, at, 0)
     }
     object
 }
@@ -64,8 +67,8 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
 -- (`Turkey.Runtime.objectFields`): the generation in the first byte, then the
 -- kind, the count in the next two and the tag in the last four. One store,
 -- so that no field of it is ever seen half written.
-fun header(object : Prim.Ptr, kind : Int, count : Int, tag : Int) -> Unit =
-    Prim.storeI64(object, 0, kind << 8 | count << 16 | (tag & 0xFFFF_FFFF) << 32)
+fun header(object : Ptr, kind : Int, count : Int, tag : Int) -> Unit =
+    Ptr.store(object, 0, kind << 8 | count << 16 | (tag & 0xFFFF_FFFF) << 32)
 
 -- An array of `length` elements, each `initial`. The element's layout code
 -- (`Turkey.Runtime.layoutCode`) is all the header keeps of it, so the width
@@ -73,10 +76,10 @@ fun header(object : Prim.Ptr, kind : Int, count : Int, tag : Int) -> Unit =
 -- and a word for any other.
 foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
                                         elementWidth : Int, elementLayout : Int)
-        -> Prim.Ptr {
+        -> Ptr {
     if length < 0 {
         Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is negative"))
-        return Prim.ptrNull()
+        return Ptr.null()
     }
     -- floor((SIZE_MAX - 16) / width). Every nonnegative Int fits at width 1;
     -- widths 4 and 8 have signed-representable bounds. After this check the
@@ -84,28 +87,28 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
     let width = if elementLayout == 2 { 1 } else if elementLayout == 3 { 4 } else { 8 }
     if elementLayout < 0 || elementLayout > 7 || elementWidth != width {
         Process.panic(Prim.cString("invalid array element width"))
-        return Prim.ptrNull()
+        return Ptr.null()
     }
     if (elementWidth == 4 && length > 4611686018427387899)
             || (elementWidth == 8 && length > 2305843009213693949) {
         Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is too large"))
-        return Prim.ptrNull()
+        return Ptr.null()
     }
-    let size = Prim.intAddWrapping(16, Prim.intMulWrapping(length, elementWidth))
+    let size = Int.addWrapping(16, Int.mulWrapping(length, elementWidth))
     let array = Heap.allocate(size, 2, Prim.frameAddress())
-    if Prim.ptrIsNull(array) { return array }
+    if Ptr.isNull(array) { return array }
     header(array, 2, elementLayout, 0)
-    Prim.storeI64(array, 8, length)
-    let bytes = Prim.ptrAdd(array, 16)
+    Ptr.store(array, 8, length)
+    let bytes = Ptr.add(array, 16)
     if elementWidth == 1 {
         Memory.fill(bytes, length, initial)
     } else {
         for var i = 0; i < length; i = i + 1 {
-            let offset = Prim.intMulWrapping(i, elementWidth)
+            let offset = Int.mulWrapping(i, elementWidth)
             if elementWidth == 4 {
-                Prim.storeI32(bytes, offset, Prim.charFromInt(initial))
+                Ptr.store32(bytes, offset, initial)
             } else {
-                Prim.storeI64(bytes, offset, initial)
+                Ptr.store(bytes, offset, initial)
             }
         }
     }
@@ -116,16 +119,16 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
 -- initialization makes the shell safe to trace until that pointer is installed.
 -- Laid out as `Turkey.Runtime.closureShell` says: the environment, traced,
 -- then the code's address.
-foreign "turkey_closure_shell" fun closureShell(code : Int) -> Prim.Ptr {
+foreign "turkey_closure_shell" fun closureShell(code : Int) -> Ptr {
     let closure = objectNew(3, -1, 16, 1)
-    if !Prim.ptrIsNull(closure) { Prim.storeI64(closure, 16, code) }
+    if !Ptr.isNull(closure) { Ptr.store(closure, 16, code) }
     closure
 }
 
-foreign "turkey_string_new" fun stringNew(bytes : Prim.Ptr, length : Int) -> Prim.Ptr {
+foreign "turkey_string_new" fun stringNew(bytes : Ptr, length : Int) -> Ptr {
     let array = arrayNew(length, 0, 1, 2)
-    if !Prim.ptrIsNull(array) && length > 0 {
-        Memory.copy(Prim.ptrAdd(array, 16), bytes, length)
+    if !Ptr.isNull(array) && length > 0 {
+        Memory.copy(Ptr.add(array, 16), bytes, length)
     }
     array
 }

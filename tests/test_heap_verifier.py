@@ -479,9 +479,9 @@ fun main() {
     if defect == "native-roots":
         before, after = ("    stackTasks(frame)\n", "")
     else:
-        before = ("        let object = Prim.ptrFromInt(if chunk == 0 { entry } "
+        before = ("        let object = Ptr.fromInt(if chunk == 0 { entry } "
                   "else { entry & addressBits })\n")
-        after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
+        after = before + "        if !Ptr.isNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
     binary = tmp_path / "broken"

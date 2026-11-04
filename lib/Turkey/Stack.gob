@@ -26,6 +26,9 @@ import Target as Target
 import Turkey.Process as Process
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
+import Data.Int as Int
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- A machine stack Turkey frames run on: the outermost frame record any walk of
 -- it may reach, the frame record it was parked at (null while it runs), the
@@ -52,28 +55,28 @@ let stackBytes : Int = 40
 -- parked at, so a stack must be on this list before Turkey code that can
 -- allocate runs on it, and must have its parked frame recorded before it stops
 -- running.
-var stacks : Prim.Ptr = Prim.ptrNull()
-var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
+var stacks : Ptr = Ptr.null()
+var entryStack : Ptr = Libc.malloc(stackBytes)
 
 -- Held while a worker edits the list. A collection reads it with every other
 -- worker stopped, and takes no lock.
-var stacksLock : Prim.Ptr = Lock.new()
+var stacksLock : Ptr = Lock.new()
 
 -- Recorded by the generated entry, from its own frame, after early
 -- initialization and before anything can allocate: the program's own stack,
 -- running, and the only one there is.
-foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
-    if Prim.ptrIsNull(entryStack) {
+foreign "turkey_entry_stack_set" fun entryStackSet(frame : Ptr) -> Unit {
+    if Ptr.isNull(entryStack) {
         Process.panic(Prim.cString("no memory for the stack record"))
         return {}
     }
-    Prim.storePtr(entryStack, stackHigh, frame)
-    Prim.storePtr(entryStack, stackParked, Prim.ptrNull())
-    Prim.storePtr(entryStack, stackNext, Prim.ptrNull())
-    Prim.storePtr(entryStack, stackLow, Prim.ptrNull())
-    Prim.storePtr(entryStack, stackResumedBy, Prim.ptrNull())
+    Ptr.store(entryStack, stackHigh, frame)
+    Ptr.store(entryStack, stackParked, Ptr.null())
+    Ptr.store(entryStack, stackNext, Ptr.null())
+    Ptr.store(entryStack, stackLow, Ptr.null())
+    Ptr.store(entryStack, stackResumedBy, Ptr.null())
     stacks = entryStack
-    Prim.storePtr(Prim.processState(), runningAt(), entryStack)
+    Ptr.store(Prim.processState(), runningAt(), entryStack)
 }
 
 -- The stack the running worker is on: the one `Prim.swapStack` would switch
@@ -81,49 +84,49 @@ foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
 -- worker runs a stack of its own; `Turkey.Runtime.workerRunningStack` is the
 -- compiler's copy of the offset, for the switch. A function rather than a
 -- `let` because a `let` is a load from its global.
-fun running() -> Prim.Ptr = Prim.loadPtr(Prim.processState(), runningAt())
+fun running() -> Ptr = Ptr.load(Prim.processState(), runningAt())
 
 fun runningAt() -> Int = 280
 
 -- The list, for walking it: the first stack, and the one after `stack`.
-fun first() -> Prim.Ptr = stacks
-fun next(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackNext)
+fun first() -> Ptr = stacks
+fun next(stack : Ptr) -> Ptr = Ptr.load(stack, stackNext)
 
 -- The outermost frame record any walk of `stack` may reach, and the record it
 -- was parked at, null while it runs.
-fun high(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackHigh)
-fun parked(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackParked)
+fun high(stack : Ptr) -> Ptr = Ptr.load(stack, stackHigh)
+fun parked(stack : Ptr) -> Ptr = Ptr.load(stack, stackParked)
 
 -- Record the frame a stack's worker stopped at, for a collection to walk it
 -- from (`Turkey.Workers`), or null when it runs again. A worker stopped for a
 -- collection looks to it like any parked stack.
-fun parkedSet(stack : Prim.Ptr, frame : Prim.Ptr) -> Unit =
-    Prim.storePtr(stack, stackParked, frame)
+fun parkedSet(stack : Ptr, frame : Ptr) -> Unit =
+    Ptr.store(stack, stackParked, frame)
 
 -- A worker thread's own stack, registered and running, as `entryStackSet` does
 -- for the program's: `frame` is its outermost Turkey frame record. False if
 -- there was no memory for the record.
-fun threadStackSet(frame : Prim.Ptr) -> Bool {
+fun threadStackSet(frame : Ptr) -> Bool {
     let record = Libc.malloc(stackBytes)
-    if Prim.ptrIsNull(record) { return False }
-    Prim.storePtr(record, stackHigh, frame)
-    Prim.storePtr(record, stackParked, Prim.ptrNull())
-    Prim.storePtr(record, stackLow, Prim.ptrNull())
-    Prim.storePtr(record, stackResumedBy, Prim.ptrNull())
+    if Ptr.isNull(record) { return False }
+    Ptr.store(record, stackHigh, frame)
+    Ptr.store(record, stackParked, Ptr.null())
+    Ptr.store(record, stackLow, Ptr.null())
+    Ptr.store(record, stackResumedBy, Ptr.null())
     Lock.acquire(stacksLock)
-    Prim.storePtr(record, stackNext, stacks)
+    Ptr.store(record, stackNext, stacks)
     stacks = record
     Lock.release(stacksLock)
-    Prim.storePtr(Prim.processState(), runningAt(), record)
+    Ptr.store(Prim.processState(), runningAt(), record)
     True
 }
 
 -- The stack whose code last resumed `stack`, which `Turkey.Coroutine` switches
 -- back to.
-fun resumer(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackResumedBy)
+fun resumer(stack : Ptr) -> Ptr = Ptr.load(stack, stackResumedBy)
 
-fun resumerSet(stack : Prim.Ptr, by : Prim.Ptr) -> Unit =
-    Prim.storePtr(stack, stackResumedBy, by)
+fun resumerSet(stack : Ptr, by : Ptr) -> Unit =
+    Ptr.store(stack, stackResumedBy, by)
 
 -- Below every coroutine stack, a region mapped with no access, so that running
 -- off the end faults instead of writing over whatever is mapped next. A
@@ -148,36 +151,36 @@ let stackGuardBytes = 65536
 -- record. That code calls the coroutine's start, whose frame record then
 -- links to the outermost one -- a record whose saved `x29` is zero, where
 -- every walk of the stack stops.
-fun new(bytes : Int) -> Prim.Ptr {
-    let total = Prim.intAddWrapping(stackGuardBytes, bytes)
-    let base = Libc.mmap(Prim.ptrNull(), total, protReadWrite, mapPrivateAnonymous(),
+fun new(bytes : Int) -> Ptr {
+    let total = Int.addWrapping(stackGuardBytes, bytes)
+    let base = Libc.mmap(Ptr.null(), total, protReadWrite, mapPrivateAnonymous(),
                          -1, 0)
-    if Prim.ptrToInt(base) == -1 { return Prim.ptrNull() }
+    if Ptr.toInt(base) == -1 { return Ptr.null() }
     if Libc.mprotect(base, stackGuardBytes, protNone) & 0xFFFF_FFFF != 0 {
         let _ = Libc.munmap(base, total)
-        return Prim.ptrNull()
+        return Ptr.null()
     }
     let record = Libc.malloc(stackBytes)
-    if Prim.ptrIsNull(record) {
+    if Ptr.isNull(record) {
         let _ = Libc.munmap(base, total)
-        return Prim.ptrNull()
+        return Ptr.null()
     }
-    let high = Prim.ptrAdd(base, total)
-    let outermost = Prim.ptrAdd(high, -16)
-    let entry = Prim.ptrAdd(high, -32)
-    let parked = Prim.ptrAdd(high, -48)
-    Prim.storePtr(outermost, 0, Prim.ptrNull())
-    Prim.storePtr(outermost, 8, Prim.ptrNull())
-    Prim.storePtr(entry, 0, record)
-    Prim.storePtr(entry, 8, Prim.ptrNull())
-    Prim.storePtr(parked, 0, outermost)
-    Prim.storePtr(parked, 8, Prim.codeAddress("turkey_stack_start"))
-    Prim.storePtr(record, stackHigh, high)
-    Prim.storePtr(record, stackParked, parked)
-    Prim.storePtr(record, stackLow, base)
-    Prim.storePtr(record, stackResumedBy, Prim.ptrNull())
+    let high = Ptr.add(base, total)
+    let outermost = Ptr.add(high, -16)
+    let entry = Ptr.add(high, -32)
+    let parked = Ptr.add(high, -48)
+    Ptr.store(outermost, 0, Ptr.null())
+    Ptr.store(outermost, 8, Ptr.null())
+    Ptr.store(entry, 0, record)
+    Ptr.store(entry, 8, Ptr.null())
+    Ptr.store(parked, 0, outermost)
+    Ptr.store(parked, 8, Prim.codeAddress("turkey_stack_start"))
+    Ptr.store(record, stackHigh, high)
+    Ptr.store(record, stackParked, parked)
+    Ptr.store(record, stackLow, base)
+    Ptr.store(record, stackResumedBy, Ptr.null())
     Lock.acquire(stacksLock)
-    Prim.storePtr(record, stackNext, stacks)
+    Ptr.store(record, stackNext, stacks)
     stacks = record
     Lock.release(stacksLock)
     record
@@ -185,8 +188,8 @@ fun new(bytes : Int) -> Prim.Ptr {
 
 -- Unregister and unmap a stack whose last frame is gone: one that is parked
 -- for good, never to be resumed. Never the running one.
-fun free(stack : Prim.Ptr) -> Unit {
-    if Prim.ptrEq(stack, running()) || Prim.ptrIsNull(Prim.loadPtr(stack, stackLow)) {
+fun free(stack : Ptr) -> Unit {
+    if stack == running() || Ptr.isNull(Ptr.load(stack, stackLow)) {
         Process.panic(Prim.cString("freed a stack that is running or not a coroutine's"))
         return {}
     }
@@ -197,24 +200,24 @@ fun free(stack : Prim.Ptr) -> Unit {
         Process.panic(Prim.cString("freed a stack that is not registered"))
         return {}
     }
-    let low = Prim.loadPtr(stack, stackLow)
-    let _ = Libc.munmap(low, Prim.ptrDiff(Prim.loadPtr(stack, stackHigh), low))
+    let low : Ptr = Ptr.load(stack, stackLow)
+    let _ = Libc.munmap(low, Ptr.diff(Ptr.load(stack, stackHigh), low))
     Libc.free(stack)
 }
 
 -- Take `stack` off the list; False if it is not on it. Under `stacksLock`, so
 -- it reports rather than panics: a panic would return past the release.
-fun unlink(stack : Prim.Ptr) -> Bool {
-    if Prim.ptrEq(stacks, stack) {
-        stacks = Prim.loadPtr(stack, stackNext)
+fun unlink(stack : Ptr) -> Bool {
+    if stacks == stack {
+        stacks = Ptr.load(stack, stackNext)
         return True
     }
     var before = stacks
-    while !Prim.ptrIsNull(before) && !Prim.ptrEq(Prim.loadPtr(before, stackNext), stack) {
-        before = Prim.loadPtr(before, stackNext)
+    while !Ptr.isNull(before) && Ptr.load(before, stackNext) != stack {
+        before = Ptr.load(before, stackNext)
     }
-    if Prim.ptrIsNull(before) { return False }
-    Prim.storePtr(before, stackNext, Prim.loadPtr(stack, stackNext))
+    if Ptr.isNull(before) { return False }
+    Ptr.store(before, stackNext, Ptr.load(stack, stackNext) : Ptr)
     True
 }
 

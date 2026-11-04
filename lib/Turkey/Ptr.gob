@@ -1,16 +1,16 @@
 export (
     Ptr, alloc, free,
     add, diff, null, isNull, toInt, fromInt,
-    Load, load, Store, store,
+    Load, load, Store, store, load32, store32,
+    atomicLoad, atomicStore, atomicAdd, atomicCas,
     toCString, fromCString,
-    raw, wrap,
 )
 
 -- Raw memory, for the library's own code that crosses into C: memory the
 -- collector does not know about.
 --
--- `Ptr` is a newtype over `Prim.Ptr` and erases to it, so the wrapper costs
--- nothing at run time.
+-- `Ptr` is `Prim.Ptr` under its own name, as `Int` is `Prim.Int`, so a
+-- `foreign` declaration takes and returns one directly.
 --
 -- `alloc` and `free` are `malloc` and `free`, declared in `Turkey.Libc`.
 
@@ -19,6 +19,7 @@ import Data.Byte (Byte)
 import Data.Int (Int)
 import Data.Float (Float)
 import Data.Char (Char)
+import Data.Char as Char
 import Data.Tuple (Unit)
 import Data.String (String)
 import Data.Eq (Eq(..), (==), (!=))
@@ -32,46 +33,40 @@ import Data.Option (Option(..))
 import Data.String as String
 import Turkey.Libc as Libc
 
-type Ptr = Ptr(Prim.Ptr)
+type Ptr = Prim.Ptr
 
 -- `size` bytes of uninitialized memory, or a null pointer if the allocation
 -- failed. The contents are undefined -- not zero -- and reading before writing
 -- is undefined behaviour rather than a panic.
-fun alloc(size : Int) -> Ptr = Ptr(Libc.malloc(size))
+fun alloc(size : Int) -> Ptr = Libc.malloc(size)
 
 -- Freeing a pointer this module did not answer, or one already freed, is
 -- undefined behaviour. Freeing a null pointer does nothing.
-fun free(p : Ptr) = match p { Ptr(address) -> Libc.free(address) }
+fun free(p : Ptr) = Libc.free(p)
 
 -- -- arithmetic ------------------------------------------------------------------------
 
 -- `p` advanced by `offset` *bytes*. Wrapping and unchecked: it is defined for
 -- any offset, and dereferencing the result is what is undefined if the offset
 -- left the block.
-fun add(p : Ptr, offset : Int) -> Ptr = match p { Ptr(raw) -> Ptr(Prim.ptrAdd(raw, offset)) }
+fun add(p : Ptr, offset : Int) -> Ptr = Prim.ptrAdd(p, offset)
 
 -- The number of bytes from `b` to `a`. Meaningful only when both point into
 -- the same block; across blocks the answer is a number and nothing more.
-fun diff(a : Ptr, b : Ptr) -> Int = match (a, b) {
-    (Ptr(x), Ptr(y)) -> Prim.ptrDiff(x, y)
-}
+fun diff(a : Ptr, b : Ptr) -> Int = Prim.ptrDiff(a, b)
 
-fun null() -> Ptr = Ptr(Prim.ptrNull())
+fun null() -> Ptr = Prim.ptrNull()
 
-fun isNull(p : Ptr) -> Bool = match p { Ptr(raw) -> Prim.ptrIsNull(raw) }
+fun isNull(p : Ptr) -> Bool = Prim.ptrIsNull(p)
 
 -- The address as an integer. The value is *unspecified* beyond round-tripping
 -- through `fromInt`, so a program that prints one prints something neither
 -- host promises. It is here for alignment tests and for hashing.
-fun toInt(p : Ptr) -> Int = match p { Ptr(raw) -> Prim.ptrToInt(raw) }
+fun toInt(p : Ptr) -> Int = Prim.ptrToInt(p)
 
 -- No provenance is carried and none is checked. Dereferencing an address that
 -- did not come from `alloc` is undefined behaviour.
-fun fromInt(n : Int) -> Ptr = Ptr(Prim.ptrFromInt(n))
-
-instance Eq Ptr {
-    fun eq(Ptr(x), Ptr(y)) = Prim.ptrEq(x, y)
-}
+fun fromInt(n : Int) -> Ptr = Prim.ptrFromInt(n)
 
 -- -- reading and writing ---------------------------------------------------------------
 
@@ -85,14 +80,13 @@ instance Eq Ptr {
 --
 -- So `load` is one name and `mono` erases the dictionary: a selection off a
 -- ground dictionary becomes a top-level binding, and `opt` inlines the body,
--- which is one `Prim.` call. Nothing is built and nothing allocates, and that
--- is the ordinary case -- runtime code should use these rather than the floor.
+-- which is one `Prim.` call. Nothing is built and nothing allocates, which is
+-- what lets giblet code use these.
 --
--- The two exceptions, and they are the reason the `Prim.` names stay
--- reachable from `lib/`: a call site past `mono`'s specialization cap, and a
--- caller that is itself polymorphic. Both keep a dictionary, and a call
--- through one is a call to an unknown function, which a giblet module may not
--- make. Giblet code drops to the floor; everything else should not.
+-- A call site past `mono`'s specialization cap, or in a caller that is itself
+-- polymorphic, keeps a dictionary, and a call through one is a call to an
+-- unknown function. The giblet check refuses that in a giblet module, so a
+-- giblet that compiles has had every dictionary erased.
 --
 -- Dispatch is on the *result*, as `Monoid.empty` is, so a call site annotates:
 -- `let n : Int = Ptr.load(p, 0)`.
@@ -102,49 +96,40 @@ instance Eq Ptr {
 class Load a { fun load(Ptr, Int) -> a }
 class Store a { fun store(Ptr, Int, a) -> Unit }
 
-instance Load Int { fun load(p, off) = match p { Ptr(r) -> Prim.loadI64(r, off) } }
-instance Load Byte { fun load(p, off) = match p { Ptr(r) -> Prim.loadI8(r, off) } }
-instance Load Char { fun load(p, off) = match p { Ptr(r) -> Prim.loadI32(r, off) } }
-instance Load Float { fun load(p, off) = match p { Ptr(r) -> Prim.loadF64(r, off) } }
-instance Load Bool { fun load(p, off) = match p { Ptr(r) -> Prim.loadI1(r, off) } }
-instance Load Ptr { fun load(p, off) = match p { Ptr(r) -> Ptr(Prim.loadPtr(r, off)) } }
+instance Load Int { fun load(p, off) = Prim.loadI64(p, off) }
+instance Load Byte { fun load(p, off) = Prim.loadI8(p, off) }
+instance Load Char { fun load(p, off) = Prim.loadI32(p, off) }
+instance Load Float { fun load(p, off) = Prim.loadF64(p, off) }
+instance Load Bool { fun load(p, off) = Prim.loadI1(p, off) }
+instance Load Ptr { fun load(p, off) = Prim.loadPtr(p, off) }
 
-instance Store Int {
-    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI64(r, off, v) }
-}
-instance Store Byte {
-    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI8(r, off, v) }
-}
-instance Store Char {
-    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI32(r, off, v) }
-}
-instance Store Float {
-    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeF64(r, off, v) }
-}
-instance Store Bool {
-    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI1(r, off, v) }
-}
-instance Store Ptr {
-    fun store(p, off, v) = match (p, v) {
-        (Ptr(r), Ptr(x)) -> Prim.storePtr(r, off, x)
-    }
-}
+instance Store Int { fun store(p, off, v) = Prim.storeI64(p, off, v) }
+instance Store Byte { fun store(p, off, v) = Prim.storeI8(p, off, v) }
+instance Store Char { fun store(p, off, v) = Prim.storeI32(p, off, v) }
+instance Store Float { fun store(p, off, v) = Prim.storeF64(p, off, v) }
+instance Store Bool { fun store(p, off, v) = Prim.storeI1(p, off, v) }
+instance Store Ptr { fun store(p, off, v) = Prim.storePtr(p, off, v) }
 
--- -- crossing to a declaration --------------------------------------------------------
+-- A 32-bit integer, for a C `int` or `uint32_t`: `load32` zero-extends it, and
+-- `store32` writes `value`'s low 32 bits. `Char` is the 32-bit type the
+-- loads and stores have, so these go through it.
+fun load32(p : Ptr, offset : Int) -> Int = Char.toInt(load(p, offset))
+fun store32(p : Ptr, offset : Int, value : Int) -> Unit = Prim.storeI32(p, offset, Prim.charFromInt(value))
 
--- The address inside, and the wrapper around one.
---
--- A `foreign` declaration is written over `Prim.Ptr`, because the type mapping
--- is the seven types that each erase to one representation and a newtype is
--- not one of them by name. These two are the seam, and they are free: `Ptr` is
--- a newtype and erases to exactly what it wraps.
---
--- They are exported because the library's wrappers over `Turkey.Libc` need
--- that seam, and nothing outside the library can import this module to reach
--- it.
-fun raw(p : Ptr) -> Prim.Ptr = match p { Ptr(address) -> address }
+-- -- atomics --------------------------------------------------------------------------
 
-fun wrap(address : Prim.Ptr) -> Ptr = Ptr(address)
+-- The word at `offset`, read, written or changed atomically. Each orders every
+-- memory access around it, so these are also the program's fences.
+fun atomicLoad(p : Ptr, offset : Int) -> Int = Prim.atomicLoad(p, offset)
+fun atomicStore(p : Ptr, offset : Int, value : Int) -> Unit = Prim.atomicStore(p, offset, value)
+
+-- Add `n` to the word, and return the value before.
+fun atomicAdd(p : Ptr, offset : Int, n : Int) -> Int = Prim.atomicAdd(p, offset, n)
+
+-- Store `new` if the word holds `expected`, and return the value before:
+-- `expected` exactly when the store happened.
+fun atomicCas(p : Ptr, offset : Int, expected : Int, new : Int) -> Int =
+    Prim.atomicCas(p, offset, expected, new)
 
 -- -- C strings ------------------------------------------------------------------------
 

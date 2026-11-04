@@ -33,6 +33,10 @@ import Data.Array ()
 import Data.Bool (Bool(..))
 import Data.Int ()
 import Turkey.Libc as Libc
+import Data.Int as Int
+import Data.Byte as Byte
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- 0x8080_8080_8080_8080, which as a signed literal is out of range.
 let highs : Int = -0x7F7F_7F7F_7F7F_7F80
@@ -44,8 +48,8 @@ let highs : Int = -0x7F7F_7F7F_7F7F_7F80
 fun newline(bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let base = Prim.elementAddress(Array.storage(bytes), 0)
-    let p = Libc.memchr(Prim.ptrAdd(base, from), 10, to - from)
-    let found = if Prim.ptrIsNull(p) { -1 } else { Prim.ptrDiff(p, base) }
+    let p = Libc.memchr(Ptr.add(base, from), 10, to - from)
+    let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
     Prim.keepAlive(bytes)
     found
 }
@@ -53,20 +57,20 @@ fun newline(bytes : Array Byte, from : Int, to : Int) -> Int {
 -- Where the first byte of `base[from..to)` that is not ASCII is, or `to` if
 -- they all are: 32 bytes per step, with their high bits tested together, then
 -- a word at a time, then a byte.
-fun asciiFrom(base : Prim.Ptr, from : Int, to : Int) -> Int {
+fun asciiFrom(base : Ptr, from : Int, to : Int) -> Int {
     var i = from
     while i + 32 <= to {
-        let any = Prim.loadI64(base, i) | Prim.loadI64(base, i + 8) | Prim.loadI64(base, i + 16) | Prim.loadI64(base, i + 24)
+        let any : Int = Ptr.load(base, i) | Ptr.load(base, i + 8) | Ptr.load(base, i + 16) | Ptr.load(base, i + 24)
         if any & highs != 0 { break }
         i = i + 32
     }
     while i + 8 <= to {
-        let high = Prim.loadI64(base, i) & highs
+        let high : Int = Ptr.load(base, i) & highs
         if high != 0 { return i + firstFlagged(high) }
         i = i + 8
     }
     while i < to {
-        if Prim.byteToInt(Prim.loadI8(base, i)) >= 0x80 { return i }
+        if Byte.toInt(Ptr.load(base, i)) >= 0x80 { return i }
         i = i + 1
     }
     to
@@ -84,7 +88,7 @@ fun wellFormed(bytes : Prim.Array Byte, from : Int, to : Int) -> Bool {
     var i = from
     var good = True
     while i < to {
-        let lead = Prim.byteToInt(Prim.loadI8(base, i))
+        let lead = Byte.toInt(Ptr.load(base, i))
         if lead < 0x80 {
             i = asciiFrom(base, i, to)
             continue
@@ -107,7 +111,7 @@ fun sequenceAt(bytes : Prim.Array Byte, i : Int, to : Int) -> Int {
     within(len(bytes), i, to)
     if i >= to { Prim.error("Turkey.Scan: no sequence at the end of a window") }
     let base = Prim.elementAddress(bytes, 0)
-    let lead = Prim.byteToInt(Prim.loadI8(base, i))
+    let lead = Byte.toInt(Ptr.load(base, i))
     let width = if lead < 0x80 { 1 } else { sequence(base, i, to, lead) }
     Prim.keepAlive(bytes)
     width
@@ -137,7 +141,7 @@ fun sequenceAt(bytes : Prim.Array Byte, i : Int, to : Int) -> Int {
 -- `E0` and the lone `80`, since no well-formed sequence begins `E0 80`; and
 -- `F1 80 80 41` is one, `F1 80 80`, followed by `41`. Each maximal subpart is
 -- one U+FFFD to a lossy decoder.
-fun sequence(base : Prim.Ptr, i : Int, to : Int, lead : Int) -> Int {
+fun sequence(base : Ptr, i : Int, to : Int, lead : Int) -> Int {
     var width = 0
     var low = 0x80
     var high = 0xBF
@@ -153,11 +157,11 @@ fun sequence(base : Prim.Ptr, i : Int, to : Int, lead : Int) -> Int {
         return -1
     }
     if i + 1 >= to { return -1 }
-    let second = Prim.byteToInt(Prim.loadI8(base, i + 1))
+    let second = Byte.toInt(Ptr.load(base, i + 1))
     if second < low || second > high { return -1 }
     for var k = 2; k < width; k = k + 1 {
         if i + k >= to { return -k }
-        let b = Prim.byteToInt(Prim.loadI8(base, i + k))
+        let b = Byte.toInt(Ptr.load(base, i + k))
         if b & 0xC0 != 0x80 { return -k }
     }
     width
@@ -170,9 +174,9 @@ fun sequence(base : Prim.Ptr, i : Int, to : Int, lead : Int) -> Int {
 -- k. The shift is arithmetic, so for k = 7 the mask clears the copies of the
 -- sign bit it brings in.
 fun firstFlagged(flags : Int) -> Int {
-    let lowest = flags & Prim.intNegWrapping(flags)
+    let lowest = flags & Int.negWrapping(flags)
     let down = lowest >> 7 & 0x01FF_FFFF_FFFF_FFFF
-    let spread = Prim.intMulWrapping(down, 0x0001_0203_0405_0607)
+    let spread = Int.mulWrapping(down, 0x0001_0203_0405_0607)
     spread >> 56 & 0xff
 }
 

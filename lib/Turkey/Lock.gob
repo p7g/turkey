@@ -52,49 +52,52 @@ import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
 import Turkey.Process as Process
+import Data.Int as Int
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- A fresh, unlocked lock; a panic if there is no memory for one.
-fun new() -> Prim.Ptr {
+fun new() -> Ptr {
     let lock = Libc.malloc(24)
-    if Prim.ptrIsNull(lock) {
+    if Ptr.isNull(lock) {
         Process.panic(Prim.cString("could not make a lock"))
         return lock
     }
-    Prim.atomicStore(lock, 16, 0)
-    Prim.atomicStore(lock, 8, 0)
-    Prim.atomicStore(lock, 0, 0)
+    Ptr.atomicStore(lock, 16, 0)
+    Ptr.atomicStore(lock, 8, 0)
+    Ptr.atomicStore(lock, 0, 0)
     lock
 }
 
 -- Take `lock` if no thread holds it: True if this one now does.
-fun tryAcquire(lock : Prim.Ptr) -> Bool = Prim.atomicCas(lock, 0, 0, 1) == 0
+fun tryAcquire(lock : Ptr) -> Bool = Ptr.atomicCas(lock, 0, 0, 1) == 0
 
 -- Wait until no other thread holds `lock`, and hold it. Not recursive: a
 -- thread that takes a lock it holds waits forever.
-fun acquire(lock : Prim.Ptr) -> Unit {
+fun acquire(lock : Ptr) -> Unit {
     if !tryAcquire(lock) { contended(lock) }
 }
 
-fun contended(lock : Prim.Ptr) -> Unit {
+fun contended(lock : Ptr) -> Unit {
     -- Reading rather than swapping, so that waiting threads do not take the
     -- cache line from the one that holds it.
-    for var i = 0; i < 100; i = Prim.intAddWrapping(i, 1) {
-        if Prim.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
+    for var i = 0; i < 100; i = Int.addWrapping(i, 1) {
+        if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
     }
-    for var i = 0; i < 4; i = Prim.intAddWrapping(i, 1) {
+    for var i = 0; i < 4; i = Int.addWrapping(i, 1) {
         let _ = Libc.schedYield()
-        if Prim.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
+        if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
     }
     while True {
-        let _ = Prim.atomicAdd(lock, 8, 1)
+        let _ = Ptr.atomicAdd(lock, 8, 1)
         if tryAcquire(lock) {
-            let _ = Prim.atomicAdd(lock, 8, -1)
+            let _ = Ptr.atomicAdd(lock, 8, -1)
             return {}
         }
         wait(lock, 1)
         -- Awake, so a release may wake another.
-        Prim.atomicStore(lock, 16, 0)
-        let _ = Prim.atomicAdd(lock, 8, -1)
+        Ptr.atomicStore(lock, 16, 0)
+        let _ = Ptr.atomicAdd(lock, 8, -1)
         if tryAcquire(lock) { return {} }
     }
 }
@@ -106,12 +109,12 @@ fun contended(lock : Prim.Ptr) -> Unit {
 -- since, behind a holder who has released too. So while the lock is free and
 -- someone is counted, a release keeps trying until a wake finds a sleeper or
 -- another release takes the job over.
-fun release(lock : Prim.Ptr) -> Unit {
-    Prim.atomicStore(lock, 0, 0)
-    while Prim.atomicLoad(lock, 8) != 0 && Prim.atomicLoad(lock, 0) == 0
-            && Prim.atomicCas(lock, 16, 0, 1) == 0 {
+fun release(lock : Ptr) -> Unit {
+    Ptr.atomicStore(lock, 0, 0)
+    while Ptr.atomicLoad(lock, 8) != 0 && Ptr.atomicLoad(lock, 0) == 0
+            && Ptr.atomicCas(lock, 16, 0, 1) == 0 {
         if wake(lock) { return {} }
-        Prim.atomicStore(lock, 16, 0)
+        Ptr.atomicStore(lock, 16, 0)
     }
 }
 
@@ -123,24 +126,24 @@ fun release(lock : Prim.Ptr) -> Unit {
 
 -- Sleep while the word at `word` holds `value`. May return early -- a
 -- signal, or a wake meant for another -- so the caller tests again.
-fun wait(word : Prim.Ptr, value : Int) -> Unit = match Target.os {
+fun wait(word : Ptr, value : Int) -> Unit = match Target.os {
     Darwin -> { let _ = Libc.osSyncWaitOnAddress(word, value, 8, 0) }
     -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
     -- value waited on here fits in them, and the high ones stay zero.
-    Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Prim.ptrNull()) }
+    Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Ptr.null()) }
 }
 
 -- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
 -- time runs out, too, which the caller tells from a wake by the clock.
-fun waitFor(word : Prim.Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.os {
+fun waitFor(word : Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.os {
     -- `OS_CLOCK_MACH_ABSOLUTE_TIME`, the one clock it takes.
     Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
     -- A relative `struct timespec`, in storage of its own: threads wait at once.
     Linux -> {
         let timespec = Libc.malloc(16)
-        if Prim.ptrIsNull(timespec) { return wait(word, value) }
-        Prim.storeI64(timespec, 0, nanoseconds / 1000000000)
-        Prim.storeI64(timespec, 8, nanoseconds % 1000000000)
+        if Ptr.isNull(timespec) { return wait(word, value) }
+        Ptr.store(timespec, 0, nanoseconds / 1000000000)
+        Ptr.store(timespec, 8, nanoseconds % 1000000000)
         let _ = Libc.syscall(futex(), word, 128, value, timespec)
         Libc.free(timespec)
     }
@@ -149,18 +152,18 @@ fun waitFor(word : Prim.Ptr, value : Int, nanoseconds : Int) -> Unit = match Tar
 -- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
 -- answers 0 having woken one and -1 (`ENOENT`) having found none; Linux, how
 -- many it woke.
-fun wake(word : Prim.Ptr) -> Bool = match Target.os {
+fun wake(word : Ptr) -> Bool = match Target.os {
     Darwin -> Libc.osSyncWakeByAddressAny(word, 8, 0) & 0xFFFF_FFFF == 0
     Linux -> {
-        let woken = Libc.syscall(futex(), word, 129, 1, Prim.ptrNull()) & 0xFFFF_FFFF
+        let woken = Libc.syscall(futex(), word, 129, 1, Ptr.null()) & 0xFFFF_FFFF
         woken > 0 && woken < 0x8000_0000
     }
 }
 
 -- Wake every thread sleeping on `word`.
-fun wakeAll(word : Prim.Ptr) -> Unit = match Target.os {
+fun wakeAll(word : Ptr) -> Unit = match Target.os {
     Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
-    Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Prim.ptrNull()) }
+    Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Ptr.null()) }
 }
 
 -- `SYS_futex` on arm64 Linux.

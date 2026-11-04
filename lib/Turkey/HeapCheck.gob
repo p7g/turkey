@@ -48,7 +48,7 @@ export (
 -- arbitrary corruption of the address space.
 --
 -- A giblet module: it runs inside a collection, when nothing may allocate.
--- Every value is an `Int`, a `Bool` or a `Prim.Ptr`, the scratch it needs is
+-- Every value is an `Int`, a `Bool` or a `Ptr`, the scratch it needs is
 -- malloc'ed, and a failure is formatted by hand and written to fd 2.
 --
 -- The trap `Turkey.Heap` describes applies here too: a caller's `var` that
@@ -67,6 +67,10 @@ import Data.Int ()
 import Data.Bool (Bool(..))
 import Turkey.Libc as Libc
 import Turkey.Memory as Memory
+import Data.Int as Int
+import Data.Byte as Byte
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- -- what the collector hands over --------------------------------------------------
 --
@@ -176,28 +180,28 @@ let sizeBound : Int = 0x4000_0000_0000_0000
 -- -- state ----------------------------------------------------------------------------
 
 -- The regions, sorted by address, for membership: rebuilt at each check.
-var index : Prim.Ptr = Prim.ptrNull()
+var index : Ptr = Ptr.null()
 var indexCount : Int = 0
 
 -- One check's settings, and the collector's state it was handed.
-var state : Prim.Ptr = Prim.ptrNull()
+var state : Ptr = Ptr.null()
 var phase : Phase = BeforeMarking
 var sizesKept : Bool = False
 var barriers : Bool = False
 -- The objects whose generation says they are remembered, as counted.
 var rememberedSeen : Int = 0
-var entries : Prim.Ptr = Prim.ptrNull()
+var entries : Ptr = Ptr.null()
 var entryCount : Int = 0
 
 -- Per size class, how many regions have room, and how many the available
 -- lists hold: set to zero by each check before it counts.
-var expected : Prim.Ptr = Libc.malloc(8 * regionClasses)
-var actual : Prim.Ptr = Libc.malloc(8 * regionClasses)
+var expected : Ptr = Libc.malloc(8 * regionClasses)
+var actual : Ptr = Libc.malloc(8 * regionClasses)
 
 -- The diagnostic, NUL-terminated. If there was no memory for it, a failure is
 -- still a failure, and ends the process unexplained.
 let textBytes : Int = 256
-var text : Prim.Ptr = Libc.malloc(textBytes)
+var text : Ptr = Libc.malloc(textBytes)
 var textLength : Int = 0
 
 -- -- the entry points -----------------------------------------------------------------
@@ -235,9 +239,9 @@ fun phaseOf(when : Int) -> Phase =
 -- With a panic pending this checks nothing, because Turkey code unwinds at
 -- every call while the flag is up. Nor does the collector mark or sweep then,
 -- for the same reason, so there is nothing for a check to catch.
-fun verify(when : Phase, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
+fun verify(when : Phase, frame : Ptr, handed : Ptr) -> Unit {
     if check(when, frame, handed) { return {} }
-    if !Prim.ptrIsNull(text) {
+    if !Ptr.isNull(text) {
         putByte(10)
         let _ = Libc.write(2, text, textLength)
     }
@@ -247,53 +251,53 @@ fun verify(when : Phase, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
 -- The same check, answering 1 if it passes and 0 with `message` set if not:
 -- for the tests that corrupt the heap on purpose, which take the state from
 -- `turkey_heap_state`.
-foreign "turkey_heap_check" fun checkForTests(when : Int, frame : Prim.Ptr,
-                                              handed : Prim.Ptr) -> Int =
+foreign "turkey_heap_check" fun checkForTests(when : Int, frame : Ptr,
+                                              handed : Ptr) -> Int =
     if check(phaseOf(when), frame, handed) { 1 } else { 0 }
 
-foreign "turkey_heap_check_message" fun message() -> Prim.Ptr = text
+foreign "turkey_heap_check_message" fun message() -> Ptr = text
 
 -- The native frame walk alone, from `current`: for a test that builds stacks
 -- and a frame table and puts them in the state it hands over.
 foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current : Int,
-                                                          handed : Prim.Ptr) -> Int {
+                                                          handed : Ptr) -> Int {
     if !begin(phaseOf(when), handed) { return 0 }
     let passed = checkFrames(current)
     releaseIndex()
     if passed { 1 } else { 0 }
 }
 
-fun check(when : Phase, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
+fun check(when : Phase, frame : Ptr, handed : Ptr) -> Bool {
     if !begin(when, handed) { return False }
     let passed = checkRegions() && checkTable() && checkObjects() && checkRemembered()
                  && checkAvailable() && checkRoots()
-                 && checkFrames(Prim.ptrToInt(frame))
+                 && checkFrames(Ptr.toInt(frame))
     releaseIndex()
     passed
 }
 
 -- Take the state, and index its regions.
-fun begin(when : Phase, handed : Prim.Ptr) -> Bool {
+fun begin(when : Phase, handed : Ptr) -> Bool {
     textLength = 0
-    if Prim.ptrIsNull(handed) || Prim.ptrIsNull(expected) || Prim.ptrIsNull(actual) {
+    if Ptr.isNull(handed) || Ptr.isNull(expected) || Ptr.isNull(actual) {
         return fail(Prim.cString("out of memory"), 0, -1)
     }
     state = handed
     phase = when
     sizesKept = stateWord(stateSizesKept) != 0
     barriers = stateWord(stateGenerational) != 0
-    entries = Prim.loadPtr(state, stateFrameEntries)
+    entries = Ptr.load(state, stateFrameEntries)
     entryCount = stateWord(stateFrameEntryCount)
     buildIndex()
 }
 
-fun stateWord(offset : Int) -> Int = Prim.loadI64(state, offset)
+fun stateWord(offset : Int) -> Int = Ptr.load(state, offset)
 
 -- -- the diagnostic -------------------------------------------------------------------
 
 -- "heap verifier: <reason> (at 0x<owner>, slot <at>)", and False.
-fun fail(reason : Prim.Ptr, owner : Int, at : Int) -> Bool {
-    if Prim.ptrIsNull(text) { return False }
+fun fail(reason : Ptr, owner : Int, at : Int) -> Bool {
+    if Ptr.isNull(text) { return False }
     textLength = 0
     put(Prim.cString("heap verifier: "))
     put(reason)
@@ -302,26 +306,26 @@ fun fail(reason : Prim.Ptr, owner : Int, at : Int) -> Bool {
     put(Prim.cString(", slot "))
     putInt(at)
     putByte(41)
-    Prim.storeI8(text, textLength, Prim.byteFromInt(0))
+    Ptr.store(text, textLength, Byte.truncate(0))
     False
 }
 
-fun failAt(reason : Prim.Ptr, owner : Prim.Ptr, at : Int) -> Bool =
-    fail(reason, Prim.ptrToInt(owner), at)
+fun failAt(reason : Ptr, owner : Ptr, at : Int) -> Bool =
+    fail(reason, Ptr.toInt(owner), at)
 
 -- Two bytes are kept free: one for the NUL, and one for the newline `verify`
 -- writes in its place.
 fun putByte(byte : Int) -> Unit {
     if textLength < textBytes - 2 {
-        Prim.storeI8(text, textLength, Prim.byteFromInt(byte))
+        Ptr.store(text, textLength, Byte.truncate(byte))
         textLength = textLength + 1
     }
 }
 
-fun put(s : Prim.Ptr) -> Unit {
+fun put(s : Ptr) -> Unit {
     var k = 0
-    while Prim.byteToInt(Prim.loadI8(s, k)) != 0 {
-        putByte(Prim.byteToInt(Prim.loadI8(s, k)))
+    while Byte.toInt(Ptr.load(s, k)) != 0 {
+        putByte(Byte.toInt(Ptr.load(s, k)))
         k = k + 1
     }
 }
@@ -331,7 +335,7 @@ fun putInt(n : Int) -> Unit {
         putByte(45)
         putDigits(n)
     } else {
-        putDigits(Prim.intNeg(n))
+        putDigits(-n)
     }
 }
 
@@ -355,15 +359,13 @@ fun nibble(n : Int, shift : Int) -> Int = n >> shift & 15
 
 -- -- words ----------------------------------------------------------------------------
 
-fun load32(p : Prim.Ptr, offset : Int) -> Int = Prim.charToInt(Prim.loadI32(p, offset))
-
 -- The header's fields, from the object at `h`.
-fun generationOf(h : Int) -> Int = load32(Prim.ptrFromInt(h), 0) & 255
-fun kindOf(h : Int) -> Int = load32(Prim.ptrFromInt(h), 0) >> 8 & 255
-fun countOf(h : Int) -> Int = load32(Prim.ptrFromInt(h), 0) >> 16
+fun generationOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) & 255
+fun kindOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) >> 8 & 255
+fun countOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) >> 16
 
 fun word(address : Int, offset : Int) -> Int =
-    Prim.loadI64(Prim.ptrFromInt(address), offset)
+    Ptr.load(Ptr.fromInt(address), offset)
 
 -- Unsigned `a < b`: a word claimed to be a pointer need not fit in 63 bits.
 fun below(a : Int, b : Int) -> Bool =
@@ -379,7 +381,7 @@ fun slotsIn(w : Int, capacity : Int) -> Int {
     let beyond = capacity - 64 * w
     -- A shift by 64 panics, so a whole word is its own case.
     if beyond >= 64 { -1 } else if beyond <= 0 { 0 }
-    else { Prim.intSubWrapping(1 << beyond, 1) }
+    else { Int.subWrapping(1 << beyond, 1) }
 }
 
 -- -- the region index -----------------------------------------------------------------
@@ -387,7 +389,7 @@ fun slotsIn(w : Int, capacity : Int) -> Int {
 -- The region list, checked for a cycle and copied into `index` in address
 -- order. False, with the failure recorded, if it cannot be.
 fun buildIndex() -> Bool {
-    index = Prim.ptrNull()
+    index = Ptr.null()
     indexCount = 0
     let first = stateWord(stateRegions)
     var tortoise = first
@@ -405,11 +407,11 @@ fun buildIndex() -> Bool {
     }
     if found == 0 { return True }
     let table = Libc.malloc(8 * found)
-    if Prim.ptrIsNull(table) { return fail(Prim.cString("out of memory"), 0, -1) }
+    if Ptr.isNull(table) { return fail(Prim.cString("out of memory"), 0, -1) }
     var filled = 0
     var copied = first
     while copied != 0 {
-        Prim.storeI64(table, 8 * filled, copied)
+        Ptr.store(table, 8 * filled, copied)
         filled = filled + 1
         copied = word(copied, regionNext)
     }
@@ -420,15 +422,15 @@ fun buildIndex() -> Bool {
 }
 
 fun releaseIndex() -> Unit {
-    if !Prim.ptrIsNull(index) { Libc.free(index) }
-    index = Prim.ptrNull()
+    if !Ptr.isNull(index) { Libc.free(index) }
+    index = Ptr.null()
     indexCount = 0
 }
 
-fun indexAt(at : Int) -> Int = Prim.loadI64(index, 8 * at)
+fun indexAt(at : Int) -> Int = Ptr.load(index, 8 * at)
 
 -- Heapsort, in place and without recursion.
-fun sortRegions(table : Prim.Ptr, n : Int) -> Unit {
+fun sortRegions(table : Ptr, n : Int) -> Unit {
     var top = n / 2
     while top > 0 {
         top = top - 1
@@ -442,15 +444,15 @@ fun sortRegions(table : Prim.Ptr, n : Int) -> Unit {
     }
 }
 
-fun sink(table : Prim.Ptr, from : Int, n : Int) -> Unit {
+fun sink(table : Ptr, from : Int, n : Int) -> Unit {
     var parent = from
     while 2 * parent + 1 < n {
         var larger = 2 * parent + 1
-        if larger + 1 < n && below(Prim.loadI64(table, 8 * larger),
-                                   Prim.loadI64(table, 8 * (larger + 1))) {
+        if larger + 1 < n && below(Ptr.load(table, 8 * larger),
+                                   Ptr.load(table, 8 * (larger + 1))) {
             larger = larger + 1
         }
-        if !below(Prim.loadI64(table, 8 * parent), Prim.loadI64(table, 8 * larger)) {
+        if !below(Ptr.load(table, 8 * parent), Ptr.load(table, 8 * larger)) {
             return {}
         }
         exchange(table, parent, larger)
@@ -458,10 +460,10 @@ fun sink(table : Prim.Ptr, from : Int, n : Int) -> Unit {
     }
 }
 
-fun exchange(table : Prim.Ptr, a : Int, b : Int) -> Unit {
-    let saved = Prim.loadI64(table, 8 * a)
-    Prim.storeI64(table, 8 * a, Prim.loadI64(table, 8 * b))
-    Prim.storeI64(table, 8 * b, saved)
+fun exchange(table : Ptr, a : Int, b : Int) -> Unit {
+    let saved : Int = Ptr.load(table, 8 * a)
+    Ptr.store(table, 8 * a, Ptr.load(table, 8 * b) : Int)
+    Ptr.store(table, 8 * b, saved)
 }
 
 -- The last region at or below `address`, or 0 if there is none: the only one
@@ -491,10 +493,10 @@ fun checkRegions() -> Bool {
         let r = indexAt(ri)
         let reserved = word(r, regionReserved)
         let slotSize = word(r, regionSlotSize)
-        let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
-        let used = load32(Prim.ptrFromInt(r), regionUsed)
-        let cls = load32(Prim.ptrFromInt(r), regionSizeClass)
-        let search = load32(Prim.ptrFromInt(r), regionSearchWord)
+        let capacity = Ptr.load32(Ptr.fromInt(r), regionCapacity)
+        let used = Ptr.load32(Ptr.fromInt(r), regionUsed)
+        let cls = Ptr.load32(Ptr.fromInt(r), regionSizeClass)
+        let search = Ptr.load32(Ptr.fromInt(r), regionSearchWord)
         if r & (regionBytes - 1) != 0
                 || below(reserved, regionBytes) || !below(reserved, sizeBound)
                 || reserved & (regionBytes - 1) != 0
@@ -549,11 +551,11 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
         let markedBits = word(r, regionMarked + 8 * wi)
         -- The bits that are wrong whatever the slot holds: allocated past the
         -- capacity, or marked and free.
-        let wrong = allocatedBits & Prim.intNot(slotsIn(wi, capacity)) | markedBits & Prim.intNot(allocatedBits)
+        let wrong = allocatedBits & Int.not(slotsIn(wi, capacity)) | markedBits & Int.not(allocatedBits)
         var left = allocatedBits | wrong
         while left != 0 {
             let b = Memory.trailingZeros(left)
-            left = left & Prim.intSubWrapping(left, 1)
+            left = left & Int.subWrapping(left, 1)
             let si = 64 * wi + b
             if hasBit(wrong, b) {
                 return fail(Prim.cString("marked/free slot or bitmap outside region"), r, si)
@@ -577,8 +579,8 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
             }
         }
     }
-    let p = Prim.ptrFromInt(r)
-    if usedSeen != load32(p, regionUsed) || liveSeen != load32(p, regionLive) {
+    let p = Ptr.fromInt(r)
+    if usedSeen != Ptr.load32(p, regionUsed) || liveSeen != Ptr.load32(p, regionLive) {
         return fail(Prim.cString("region counts disagree"), r, -1)
     }
     True
@@ -588,7 +590,7 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
 -- each reachable by linear probing from its home slot: no empty slot between
 -- the home and the entry.
 fun checkTable() -> Bool {
-    let table = Prim.loadPtr(state, stateRegionTable)
+    let table : Ptr = Ptr.load(state, stateRegionTable)
     let capacity = stateWord(stateRegionTableCapacity)
     let count = stateWord(stateRegionTableCount)
     if count != indexCount || capacity < 0 || capacity & (capacity - 1) != 0
@@ -597,7 +599,7 @@ fun checkTable() -> Bool {
     }
     var entriesSeen = 0
     for var ti = 0; ti < capacity; ti = ti + 1 {
-        let r = Prim.loadI64(table, 8 * ti)
+        let r : Int = Ptr.load(table, 8 * ti)
         if r != 0 {
             entriesSeen = entriesSeen + 1
             if !listed(r) {
@@ -605,7 +607,7 @@ fun checkTable() -> Bool {
             }
             var probe = home(r, capacity)
             while probe != ti {
-                if Prim.loadI64(table, 8 * probe) == 0 {
+                if Ptr.load(table, 8 * probe) == 0 {
                     return fail(Prim.cString("region table entry unreachable by probing"), r, ti)
                 }
                 probe = (probe + 1) & (capacity - 1)
@@ -621,7 +623,7 @@ fun checkTable() -> Bool {
 -- Fibonacci hashing of the region's number, masked to the table: the same
 -- function the collector inserts with, restated.
 fun home(region : Int, capacity : Int) -> Int {
-    let h = Prim.intMulWrapping(region >> 16, -7046029254386353131)
+    let h = Int.mulWrapping(region >> 16, -7046029254386353131)
     let folded = h ^ h >> 32 & 0xFFFF_FFFF
     folded & (capacity - 1)
 }
@@ -631,15 +633,15 @@ fun checkObjects() -> Bool {
     rememberedSeen = 0
     for var oi = 0; oi < indexCount; oi = oi + 1 {
         let r = indexAt(oi)
-        let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
+        let capacity = Ptr.load32(Ptr.fromInt(r), regionCapacity)
         let slotSize = word(r, regionSlotSize)
-        let cls = load32(Prim.ptrFromInt(r), regionSizeClass)
+        let cls = Ptr.load32(Ptr.fromInt(r), regionSizeClass)
         -- Only the allocated slots, a bitmap word at a time, as in `checkSlots`.
         for var ow = 0; ow < regionWords; ow = ow + 1 {
             var left = word(r, regionAllocated + 8 * ow) & slotsIn(ow, capacity)
             while left != 0 {
                 let oj = 64 * ow + Memory.trailingZeros(left)
-                left = left & Prim.intSubWrapping(left, 1)
+                left = left & Int.subWrapping(left, 1)
                 let h = r + regionData + oj * slotSize
                 if sizesKept && !checkSize(r, h, slotSize, cls) { return False }
                 if !checkObject(r, oj, h, slotSize) { return False }
@@ -683,34 +685,34 @@ fun ofClass(size : Int, cls : Int) -> Bool {
 -- class with a free slot. A full region's `availableNext` is stale and not
 -- looked at.
 fun checkAvailable() -> Bool {
-    let lists = Prim.loadPtr(state, stateAvailable)
+    let lists : Ptr = Ptr.load(state, stateAvailable)
     for var ac = 0; ac < regionClasses; ac = ac + 1 {
-        Prim.storeI64(expected, 8 * ac, 0)
-        Prim.storeI64(actual, 8 * ac, 0)
+        Ptr.store(expected, 8 * ac, 0)
+        Ptr.store(actual, 8 * ac, 0)
     }
     for var an = 0; an < indexCount; an = an + 1 {
-        let p = Prim.ptrFromInt(indexAt(an))
-        let cls = load32(p, regionSizeClass)
-        if cls < regionClasses && load32(p, regionUsed) < load32(p, regionCapacity) {
-            Prim.storeI64(expected, 8 * cls, Prim.loadI64(expected, 8 * cls) + 1)
+        let p = Ptr.fromInt(indexAt(an))
+        let cls = Ptr.load32(p, regionSizeClass)
+        if cls < regionClasses && Ptr.load32(p, regionUsed) < Ptr.load32(p, regionCapacity) {
+            Ptr.store(expected, 8 * cls, Ptr.load(expected, 8 * cls) + 1)
         }
     }
     for var ac = 0; ac < regionClasses; ac = ac + 1 {
-        var ar = Prim.loadI64(lists, 8 * ac)
+        var ar : Int = Ptr.load(lists, 8 * ac)
         while ar != 0 {
-            let seen = Prim.loadI64(actual, 8 * ac) + 1
-            Prim.storeI64(actual, 8 * ac, seen)
+            let seen : Int = Ptr.load(actual, 8 * ac) + 1
+            Ptr.store(actual, 8 * ac, seen)
             -- Membership before anything is read from it: the list may hold a
             -- word that is not a region at all.
             if seen > indexCount || !listed(ar)
-                    || load32(Prim.ptrFromInt(ar), regionSizeClass) != ac
-                    || load32(Prim.ptrFromInt(ar), regionUsed)
-                       >= load32(Prim.ptrFromInt(ar), regionCapacity) {
+                    || Ptr.load32(Ptr.fromInt(ar), regionSizeClass) != ac
+                    || Ptr.load32(Ptr.fromInt(ar), regionUsed)
+                       >= Ptr.load32(Ptr.fromInt(ar), regionCapacity) {
                 return fail(Prim.cString("invalid available-region list"), ar, ac)
             }
             ar = word(ar, regionAvailableNext)
         }
-        if Prim.loadI64(actual, 8 * ac) != Prim.loadI64(expected, 8 * ac) {
+        if (Ptr.load(actual, 8 * ac) : Int) != Ptr.load(expected, 8 * ac) {
             return fail(Prim.cString("missing available region"), 0, ac)
         }
     }
@@ -796,7 +798,7 @@ fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
     if r == 0 || below(value, r + regionData) {
         return fail(Prim.cString("invalid traced pointer"), owner, at)
     }
-    let offset = Prim.intSubWrapping(value, r + regionData)
+    let offset = Int.subWrapping(value, r + regionData)
     let slotSize = word(r, regionSlotSize)
     -- Past the region's reservation is past its last slot, and keeps the
     -- division below on a small positive `offset`.
@@ -804,7 +806,7 @@ fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
         return fail(Prim.cString("invalid traced pointer"), owner, at)
     }
     let slot = offset / slotSize
-    if slot >= load32(Prim.ptrFromInt(r), regionCapacity) || !bitAt(r, regionAllocated, slot) {
+    if slot >= Ptr.load32(Ptr.fromInt(r), regionCapacity) || !bitAt(r, regionAllocated, slot) {
         return fail(Prim.cString("invalid traced pointer"), owner, at)
     }
     if marked && !bitAt(r, regionMarked, slot) {
@@ -834,18 +836,18 @@ fun notYoung(value : Int, owner : Int, at : Int) -> Bool {
 fun checkRemembered() -> Bool {
     if afterMarking() { return True }
     let count = stateWord(stateRememberedCount)
-    let entries = Prim.loadPtr(state, stateRemembered)
+    let entries : Ptr = Ptr.load(state, stateRemembered)
     if count != rememberedSeen {
         return fail(Prim.cString("remembered objects miscounted"), count, rememberedSeen)
     }
     for var ei = 0; ei < count; ei = ei + 1 {
-        let value = Prim.loadI64(entries, 8 * ei)
-        if below(value, immediates) || !checkPointer(value, False, Prim.ptrToInt(entries), ei) {
-            return fail(Prim.cString("invalid remembered object"), Prim.ptrToInt(entries), ei)
+        let value : Int = Ptr.load(entries, 8 * ei)
+        if below(value, immediates) || !checkPointer(value, False, Ptr.toInt(entries), ei) {
+            return fail(Prim.cString("invalid remembered object"), Ptr.toInt(entries), ei)
         }
         if generationOf(value) != rememberedOld {
             return fail(Prim.cString("remembered object is not marked remembered"),
-                        Prim.ptrToInt(entries), ei)
+                        Ptr.toInt(entries), ei)
         }
     }
     True
@@ -892,7 +894,7 @@ fun checkRoots() -> Bool {
 -- same, since other workers' threads still run.
 fun checkFrames(current : Int) -> Bool {
     if entryCount == 0 { return True }
-    if entryCount < 0 || Prim.ptrIsNull(entries) {
+    if entryCount < 0 || Ptr.isNull(entries) {
         return failAt(Prim.cString("invalid native frame table"), entries, -1)
     }
     for var fi = 0; fi < entryCount; fi = fi + 1 {
@@ -944,10 +946,10 @@ fun checkStack(current : Int, high : Int) -> Bool {
         if e >= 0 {
             let offsets = entryWord(e, 16)
             for var fi = 0; fi < entryWord(e, 8); fi = fi + 1 {
-                let slot = Prim.intAddWrapping(caller, word(offsets, 8 * fi))
+                let slot = Int.addWrapping(caller, word(offsets, 8 * fi))
                 if slot & 7 != 0 || below(slot, walked + 16) || below(high - 8, slot) {
                     return fail(Prim.cString("invalid native root offset"),
-                                Prim.ptrToInt(entries) + entryBytes * e, fi)
+                                Ptr.toInt(entries) + entryBytes * e, fi)
                 }
                 -- A frame slot may hold the address of an object in a frame
                 -- of the same stack, which the collector skips by the same
@@ -963,7 +965,7 @@ fun checkStack(current : Int, high : Int) -> Bool {
     True
 }
 
-fun entryWord(i : Int, offset : Int) -> Int = Prim.loadI64(entries, entryBytes * i + offset)
+fun entryWord(i : Int, offset : Int) -> Int = Ptr.load(entries, entryBytes * i + offset)
 
 -- The entry for return address `address`, or -1.
 fun entryFor(address : Int) -> Int {

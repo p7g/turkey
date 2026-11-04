@@ -82,6 +82,9 @@ import Turkey.Memory as Memory
 import Turkey.Process as Process
 import Turkey.Stack as Stack
 import Turkey.Sys as Sys
+import Data.Int as Int
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- At most this many threads run Turkey code, the program's own included, and
 -- every table indexed by a thread is this long: about 80 bytes a thread, all
@@ -100,7 +103,7 @@ fun threadLimit() -> Int = 1024
 
 -- Each thread's record, by index; index 0 is the program's own thread's, the
 -- process state every program defines.
-var records : Prim.Ptr = zeroed(8 * threadLimit())
+var records : Ptr = zeroed(8 * threadLimit())
 
 -- Each thread's state, by index: one word, changed only atomically.
 --
@@ -115,7 +118,7 @@ var records : Prim.Ptr = zeroed(8 * threadLimit())
 -- nothing else writes it, and leaves a wait or a call by compare-and-swap,
 -- which fails while it is held. A holder holds a waiting or calling thread by
 -- compare-and-swap and lets it go by a store.
-var states : Prim.Ptr = zeroed(8 * threadLimit())
+var states : Ptr = zeroed(8 * threadLimit())
 
 let stoppedState : Int = 1
 let waitingState : Int = 2
@@ -126,7 +129,7 @@ let callStep : Int = 16
 -- Word 0: 1 while a collection is stopping the world, 2 while a thread is
 -- being registered, claimed by compare-and-swap. Word 8: how many threads
 -- there are.
-var control : Prim.Ptr = zeroed(16)
+var control : Ptr = zeroed(16)
 
 -- The permits' words: how many there are; how many no thread holds; 1 while
 -- the program's own stack waits for one, and 2 once a holder has given it one
@@ -135,7 +138,7 @@ var control : Prim.Ptr = zeroed(16)
 -- have not yet looked for a permit; the scheduler's count of runnable tasks
 -- (`queuedSet`); how many holders are idle, waiting for work; and 1 while the
 -- monitor sleeps because every holder is.
-var permitWords : Prim.Ptr = zeroed(80)
+var permitWords : Ptr = zeroed(80)
 
 let permitCountAt : Int = 0
 let permitFreeAt : Int = 8
@@ -149,7 +152,7 @@ let idlersAt : Int = 64
 let monitorAsleepAt : Int = 72
 
 -- The monitor's record (`monitorStart`), or null.
-var monitorRecord : Prim.Ptr = Prim.ptrNull()
+var monitorRecord : Ptr = Ptr.null()
 
 -- What threads with nothing to do sleep on, so that they use no processor
 -- until there is something for them, and the words that choose which of them
@@ -185,15 +188,15 @@ var monitorRecord : Prim.Ptr = Prim.ptrNull()
 -- poller clears word 40 and then word 48: a signaller that finds word 48 set
 -- relies on a break already on its way, which the kernel holds for the next
 -- wait if this one has ended, so at worst the next wait ends early.
-var signals : Prim.Ptr = zeroed(64)
+var signals : Ptr = zeroed(64)
 
 let claimedAt : Int = 32
 let blockedAt : Int = 40
 let wakePendingAt : Int = 48
 let interestAt : Int = 56
 
-fun workSeen() -> Int = Prim.atomicLoad(signals, 0)
-fun collectionSeen() -> Int = Prim.atomicLoad(signals, 16)
+fun workSeen() -> Int = Ptr.atomicLoad(signals, 0)
+fun collectionSeen() -> Int = Ptr.atomicLoad(signals, 16)
 
 fun sleepForWork(seen : Int) -> Unit = sleepOn(0, seen)
 fun sleepForCollection(seen : Int) -> Unit = sleepOn(16, seen)
@@ -202,9 +205,9 @@ fun sleepForCollection(seen : Int) -> Unit = sleepOn(16, seen)
 -- epoch is read again, and the bump goes before the count is read, so one of
 -- the two sees the other.
 fun sleepOn(word : Int, seen : Int) -> Unit {
-    let _ = Prim.atomicAdd(signals, plus(word, 8), 1)
-    if Prim.atomicLoad(signals, word) == seen { Lock.wait(Prim.ptrAdd(signals, word), seen) }
-    let _ = Prim.atomicAdd(signals, plus(word, 8), -1)
+    let _ = Ptr.atomicAdd(signals, plus(word, 8), 1)
+    if Ptr.atomicLoad(signals, word) == seen { Lock.wait(Ptr.add(signals, word), seen) }
+    let _ = Ptr.atomicAdd(signals, plus(word, 8), -1)
 }
 
 -- Something for an idle thread to do: wake one, or, `all`, every one. A
@@ -212,33 +215,33 @@ fun sleepOn(word : Int, seen : Int) -> Unit {
 -- is to be woken, and when no sleeper on the epoch was there to take a single
 -- wake.
 fun signalWork(all : Bool) -> Unit {
-    let _ = Prim.atomicAdd(signals, 0, 1)
+    let _ = Ptr.atomicAdd(signals, 0, 1)
     var woken = False
-    if Prim.atomicLoad(signals, 8) != 0 {
+    if Ptr.atomicLoad(signals, 8) != 0 {
         if all { Lock.wakeAll(signals) } else { woken = Lock.wake(signals) }
     }
-    if (all || !woken) && Prim.atomicLoad(signals, blockedAt) != 0 { wakePoller() }
+    if (all || !woken) && Ptr.atomicLoad(signals, blockedAt) != 0 { wakePoller() }
 }
 
 fun signalCollection() -> Unit {
-    let _ = Prim.atomicAdd(signals, 16, 1)
-    if Prim.atomicLoad(signals, 24) != 0 { Lock.wakeAll(Prim.ptrAdd(signals, 16)) }
+    let _ = Ptr.atomicAdd(signals, 16, 1)
+    if Ptr.atomicLoad(signals, 24) != 0 { Lock.wakeAll(Ptr.add(signals, 16)) }
 }
 
-fun zeroed(bytes : Int) -> Prim.Ptr {
+fun zeroed(bytes : Int) -> Ptr {
     let p = Libc.malloc(bytes)
-    if !Prim.ptrIsNull(p) { Memory.fill(p, bytes, 0) }
+    if !Ptr.isNull(p) { Memory.fill(p, bytes, 0) }
     p
 }
 
 -- How many threads there are: 1 until the program's own is registered.
 fun count() -> Int {
-    let n = Prim.atomicLoad(control, 8)
+    let n = Ptr.atomicLoad(control, 8)
     if n == 0 { 1 } else { n }
 }
 
 -- The running thread's index, a word of its record.
-fun index() -> Int = Prim.loadI64(Prim.processState(), 288)
+fun index() -> Int = Ptr.load(Prim.processState(), 288)
 
 -- The offset of the running thread's state word in `states`.
 fun mine() -> Int = index() << 3
@@ -246,23 +249,23 @@ fun mine() -> Int = index() << 3
 -- Whether the running thread is running Turkey code, rather than blocked or
 -- stopped -- which it may be in a loop of this module's, inlined into a
 -- caller and so given a poll (`Turkey.Polls`).
-fun running() -> Bool = (Prim.atomicLoad(states, mine()) & 7) == 0
+fun running() -> Bool = (Ptr.atomicLoad(states, mine()) & 7) == 0
 
-fun recordOf(i : Int) -> Prim.Ptr =
-    if i == 0 && Prim.atomicLoad(control, 8) == 0 { Prim.processState() }
-    else { Prim.loadPtr(records, 8 * i) }
+fun recordOf(i : Int) -> Ptr =
+    if i == 0 && Ptr.atomicLoad(control, 8) == 0 { Prim.processState() }
+    else { Ptr.load(records, 8 * i) }
 
 -- Whether the program's own thread is registered (`mainRegister`), which it is
 -- once the workers have started.
-fun started() -> Bool = Prim.atomicLoad(control, 8) != 0
+fun started() -> Bool = Ptr.atomicLoad(control, 8) != 0
 
 -- Register the program's own thread, as the first, holding a permit: from
 -- here on its waits and calls are counted. Called once, before any other
 -- thread starts.
 fun mainRegister() -> Unit {
-    if Prim.atomicLoad(control, 8) != 0 { return {} }
-    Prim.storePtr(records, 0, Prim.processState())
-    Prim.atomicStore(control, 8, 1)
+    if Ptr.atomicLoad(control, 8) != 0 { return {} }
+    Ptr.store(records, 0, Prim.processState())
+    Ptr.atomicStore(control, 8, 1)
 }
 
 -- A record for a new thread holding a permit, registered and blocked until
@@ -278,12 +281,12 @@ fun mainRegister() -> Unit {
 -- are never inlined: the frame they record must be their own, whose return
 -- address is a safepoint in their caller, where the caller's roots are stored
 -- and mapped.
-foreign "turkey_worker_new" fun new() -> Prim.Ptr {
+foreign "turkey_worker_new" fun new() -> Ptr {
     mainRegister()
     blockEnter(Prim.frameAddress())
-    while Prim.atomicCas(control, 0, 0, 2) != 0 { let _ = Libc.schedYield() }
+    while Ptr.atomicCas(control, 0, 0, 2) != 0 { let _ = Libc.schedYield() }
     let record = register(True)
-    Prim.atomicStore(control, 0, 0)
+    Ptr.atomicStore(control, 0, 0)
     blockExit()
     record
 }
@@ -292,25 +295,25 @@ foreign "turkey_worker_new" fun new() -> Prim.Ptr {
 -- which has no state of its own to block in: null if a collection or another
 -- registration holds the word, or there is no memory, for the monitor to try
 -- again at its next tick. A program that has `threadLimit` threads ends here.
-fun spareNew() -> Prim.Ptr {
-    if Prim.atomicCas(control, 0, 0, 2) != 0 { return Prim.ptrNull() }
-    if Prim.atomicLoad(control, 8) == threadLimit() { threadsExhausted() }
+fun spareNew() -> Ptr {
+    if Ptr.atomicCas(control, 0, 0, 2) != 0 { return Ptr.null() }
+    if Ptr.atomicLoad(control, 8) == threadLimit() { threadsExhausted() }
     let record = register(False)
-    Prim.atomicStore(control, 0, 0)
+    Ptr.atomicStore(control, 0, 0)
     record
 }
 
 -- Under the registration claim.
-fun register(permitted : Bool) -> Prim.Ptr {
-    let n = Prim.atomicLoad(control, 8)
-    if n == threadLimit() { return Prim.ptrNull() }
+fun register(permitted : Bool) -> Ptr {
+    let n = Ptr.atomicLoad(control, 8)
+    if n == threadLimit() { return Ptr.null() }
     -- The record's size, `Turkey.Runtime.processStateBytes`.
     let record = zeroed(2008)
-    if Prim.ptrIsNull(record) { return record }
-    Prim.storeI64(record, 288, n)
-    Prim.storePtr(records, 8 * n, record)
-    Prim.atomicStore(states, 8 * n, if permitted { waitingState } else { plus(waitingState, noPermit) })
-    Prim.atomicStore(control, 8, plus(n, 1))
+    if Ptr.isNull(record) { return record }
+    Ptr.store(record, 288, n)
+    Ptr.store(records, 8 * n, record)
+    Ptr.atomicStore(states, 8 * n, if permitted { waitingState } else { plus(waitingState, noPermit) })
+    Ptr.atomicStore(control, 8, plus(n, 1))
     record
 }
 
@@ -331,7 +334,7 @@ fun die() -> Unit {
     Libc.exitNow(2)
 }
 
-fun say(text : Prim.Ptr) -> Unit {
+fun say(text : Ptr) -> Unit {
     let _ = Libc.write(2, text, Libc.strlen(text))
 }
 
@@ -340,9 +343,9 @@ fun say(text : Prim.Ptr) -> Unit {
 -- safepoint like the rest. A registration under way is waited for, since it
 -- ends without a safepoint.
 fun stopTheWorld() -> Bool {
-    if Prim.atomicLoad(control, 8) == 0 { return True }
+    if Ptr.atomicLoad(control, 8) == 0 { return True }
     while True {
-        let claimed = Prim.atomicCas(control, 0, 0, 1)
+        let claimed = Ptr.atomicCas(control, 0, 0, 1)
         if claimed == 0 { break }
         if claimed == 1 { return False }
         let _ = Libc.schedYield()
@@ -350,7 +353,7 @@ fun stopTheWorld() -> Bool {
     let n = count()
     let me = index()
     for var i = 0; i < n; i = plus(i, 1) {
-        if i != me { let _ = Prim.atomicAdd(recordOf(i), 272, 1) }
+        if i != me { let _ = Ptr.atomicAdd(recordOf(i), 272, 1) }
     }
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
@@ -364,72 +367,72 @@ fun stopTheWorld() -> Bool {
 -- monitor lets it go in a few hundred instructions, and the collector holds
 -- it then.
 fun stoppedOrHeld(i : Int) -> Bool {
-    let s = Prim.atomicLoad(states, 8 * i)
+    let s = Ptr.atomicLoad(states, 8 * i)
     let status = s & 7
     status == stoppedState
         || ((status == waitingState || status == callingState)
-            && Prim.atomicCas(states, 8 * i, s, plus(s, 1)) == s)
+            && Ptr.atomicCas(states, 8 * i, s, plus(s, 1)) == s)
 }
 
 -- Let the other threads go again, and wait until every one that stopped is
 -- running before another collection may stop them.
 fun startTheWorld() -> Unit {
-    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return {} }
     let n = count()
     let me = index()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
             -- Every held thread is this collection's: the monitor holds only a
             -- calling thread, and every one is held here.
-            let s = Prim.atomicLoad(states, 8 * i)
+            let s = Ptr.atomicLoad(states, 8 * i)
             let status = s & 7
-            if status == 3 || status == 5 { Prim.atomicStore(states, 8 * i, plus(s, -1)) }
-            let _ = Prim.atomicAdd(recordOf(i), 272, -1)
+            if status == 3 || status == 5 { Ptr.atomicStore(states, 8 * i, plus(s, -1)) }
+            let _ = Ptr.atomicAdd(recordOf(i), 272, -1)
         }
     }
     -- The stopped and held threads sleep until this says so (`Turkey.Heap.stopAt`).
     signalCollection()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
-            while (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState {
+            while (Ptr.atomicLoad(states, 8 * i) & 7) == stoppedState {
                 let _ = Libc.schedYield()
             }
         }
     }
-    Prim.atomicStore(control, 0, 0)
+    Ptr.atomicStore(control, 0, 0)
 }
 
 -- At a safepoint whose caller's frame record is `frame`, with the running
 -- thread's stop word raised: stopped, until `stopLeave`. The collection may
 -- ask a stopped thread to help it mark (`Turkey.Heap.stopAt`), which is why
 -- the wait between the two is the heap's.
-fun stopEnter(frame : Prim.Ptr) -> Unit {
+fun stopEnter(frame : Ptr) -> Unit {
     parkAt(frame)
     let at = mine()
-    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), stoppedState))
+    Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), stoppedState))
 }
 
 -- Whether the collection that stopped the running thread is still going.
-fun stopWanted() -> Bool = Prim.atomicLoad(Prim.processState(), 272) & 1 != 0
+fun stopWanted() -> Bool = Ptr.atomicLoad(Prim.processState(), 272) & 1 != 0
 
 fun stopLeave() -> Unit {
-    parkAt(Prim.ptrNull())
+    parkAt(Ptr.null())
     let at = mine()
-    Prim.atomicStore(states, at, Prim.intSubWrapping(Prim.atomicLoad(states, at), stoppedState))
+    Ptr.atomicStore(states, at, Int.subWrapping(Ptr.atomicLoad(states, at), stoppedState))
 }
 
 -- Whether thread `i` is stopped at a safepoint, rather than held while
 -- blocked; only the collecting thread asks, with the world stopped.
-fun stopped(i : Int) -> Bool = (Prim.atomicLoad(states, 8 * i) & 7) == stoppedState
+fun stopped(i : Int) -> Bool = (Ptr.atomicLoad(states, 8 * i) & 7) == stoppedState
 
 -- About to wait outside Turkey code, with every root the caller holds in its
 -- frames and the caller's frame record at `frame`: from here a collection may
 -- run without this thread stopping.
-fun blockEnter(frame : Prim.Ptr) -> Unit {
-    if Prim.atomicLoad(control, 8) == 0 { return {} }
+fun blockEnter(frame : Ptr) -> Unit {
+    if Ptr.atomicLoad(control, 8) == 0 { return {} }
     parkAt(frame)
     let at = mine()
-    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), waitingState))
+    Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), waitingState))
 }
 
 -- Back from waiting: running again once nobody holds this thread.
@@ -445,13 +448,13 @@ fun blockExit() -> Unit {
 
 -- Running again, True, unless a collection or the monitor holds this thread.
 fun unblock() -> Bool {
-    if Prim.atomicLoad(control, 8) == 0 { return True }
+    if Ptr.atomicLoad(control, 8) == 0 { return True }
     let at = mine()
-    let s = Prim.atomicLoad(states, at)
+    let s = Ptr.atomicLoad(states, at)
     let status = s & 7
     if status != waitingState && status != callingState { return False }
-    if Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, status)) != s { return False }
-    parkAt(Prim.ptrNull())
+    if Ptr.atomicCas(states, at, s, Int.subWrapping(s, status)) != s { return False }
+    parkAt(Ptr.null())
     True
 }
 
@@ -460,24 +463,24 @@ fun unblock() -> Bool {
 -- can tell this call from the next. One store, since this runs at every read
 -- of a file; the constants are literals here and in `callExit` so that
 -- neither loads them from a global (`states` lays them out).
-fun callEnter(frame : Prim.Ptr) -> Unit {
-    if Prim.atomicLoad(control, 8) == 0 { return {} }
+fun callEnter(frame : Ptr) -> Unit {
+    if Ptr.atomicLoad(control, 8) == 0 { return {} }
     parkAt(frame)
     let at = mine()
     -- `callStep` plus `callingState`.
-    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), 20))
+    Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), 20))
 }
 
 -- Back from the call: running again once nobody holds this thread, and
 -- holding a permit if it can (`permitRegain`). A call back before the monitor
 -- took its permit costs one compare-and-swap.
 fun callExit() -> Unit {
-    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return {} }
     let at = mine()
-    let s = Prim.atomicLoad(states, at)
+    let s = Ptr.atomicLoad(states, at)
     -- Still calling, with the permit (the low four bits are `callingState`).
-    if (s & 15) == 4 && Prim.atomicCas(states, at, s, Prim.intSubWrapping(s, 4)) == s {
-        parkAt(Prim.ptrNull())
+    if (s & 15) == 4 && Ptr.atomicCas(states, at, s, Int.subWrapping(s, 4)) == s {
+        parkAt(Ptr.null())
         return {}
     }
     blockExit()
@@ -494,22 +497,22 @@ fun callExit() -> Unit {
 -- stack, so a stack with a resumer is a task's.
 fun permitRegain() -> Unit {
     let stack = Stack.running()
-    let task = !Prim.ptrIsNull(stack) && !Prim.ptrIsNull(Stack.resumer(stack))
+    let task = !Ptr.isNull(stack) && !Ptr.isNull(Stack.resumer(stack))
     if !permitTake(!task) && !task { permitAwait(True) }
 }
 
 -- Record `frame` as where the running thread's stack is parked, or null. A
 -- worker thread has no stack registered until its first Turkey code does it
 -- (`Turkey.Scheduler.workerLoop`), and nothing on it to walk before then.
-fun parkAt(frame : Prim.Ptr) -> Unit {
+fun parkAt(frame : Ptr) -> Unit {
     let stack = Stack.running()
-    if !Prim.ptrIsNull(stack) { Stack.parkedSet(stack, frame) }
+    if !Ptr.isNull(stack) { Stack.parkedSet(stack, frame) }
 }
 
 -- Take `mutex` (`Turkey.Lock`), blocking the thread while it waits if another
 -- holds it, so that a holder that allocates -- and so may collect -- never
 -- waits on a thread that is waiting on it.
-foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
+foreign "turkey_lock_acquire" fun acquire(mutex : Ptr) -> Unit {
     if Lock.tryAcquire(mutex) { return {} }
     blockEnter(Prim.frameAddress())
     Lock.acquire(mutex)
@@ -521,47 +524,47 @@ foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
 -- How many permits there are: what `TURKEY_WORKERS` asked for, or 1 before
 -- the workers start.
 fun permits() -> Int {
-    let n = Prim.atomicLoad(permitWords, permitCountAt)
+    let n = Ptr.atomicLoad(permitWords, permitCountAt)
     if n == 0 { 1 } else { n }
 }
 
-fun permitsSet(n : Int) -> Unit = Prim.atomicStore(permitWords, permitCountAt, n)
+fun permitsSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, permitCountAt, n)
 
 -- Whether the running thread holds a permit, which every thread does until
 -- the workers start.
 fun permitHeld() -> Bool =
-    Prim.atomicLoad(control, 8) == 0 || (Prim.atomicLoad(states, mine()) & noPermit) == 0
+    Ptr.atomicLoad(control, 8) == 0 || (Ptr.atomicLoad(states, mine()) & noPermit) == 0
 
 -- Whether the program's own stack is waiting for a permit, which the next
 -- holder to look gives it (`permitGive`).
-fun permitWanted() -> Bool = Prim.atomicLoad(permitWords, wantedAt) == 1
+fun permitWanted() -> Bool = Ptr.atomicLoad(permitWords, wantedAt) == 1
 
 -- Give the running thread's permit to the program's own stack, which waits
 -- for one: True if this thread gave it, False if another holder did first.
 -- The thread holds none after.
 fun permitGive() -> Bool {
-    if Prim.atomicCas(permitWords, wantedAt, 1, 2) != 1 { return False }
+    if Ptr.atomicCas(permitWords, wantedAt, 1, 2) != 1 { return False }
     permitDrop()
-    let _ = Prim.atomicAdd(permitWords, wantEpochAt, 1)
-    let _ = Lock.wake(Prim.ptrAdd(permitWords, wantEpochAt))
+    let _ = Ptr.atomicAdd(permitWords, wantEpochAt, 1)
+    let _ = Lock.wake(Ptr.add(permitWords, wantEpochAt))
     True
 }
 
 -- Give up the running thread's permit: marked as not held, and then free.
 fun permitDrop() -> Unit {
     let at = mine()
-    Prim.atomicStore(states, at, plus(Prim.atomicLoad(states, at), noPermit))
-    let _ = Prim.atomicAdd(permitWords, permitFreeAt, 1)
+    Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), noPermit))
+    let _ = Ptr.atomicAdd(permitWords, permitFreeAt, 1)
 }
 
 -- Take a free permit for the running thread, which holds none: whether it did.
 -- While the program's own stack waits for one, only it may take one.
 fun permitTake(program : Bool) -> Bool {
     while permitFree(program) {
-        let free = Prim.atomicLoad(permitWords, permitFreeAt)
-        if Prim.atomicCas(permitWords, permitFreeAt, free, plus(free, -1)) == free {
+        let free = Ptr.atomicLoad(permitWords, permitFreeAt)
+        if Ptr.atomicCas(permitWords, permitFreeAt, free, plus(free, -1)) == free {
             let at = mine()
-            Prim.atomicStore(states, at, Prim.intSubWrapping(Prim.atomicLoad(states, at), noPermit))
+            Ptr.atomicStore(states, at, Int.subWrapping(Ptr.atomicLoad(states, at), noPermit))
             return True
         }
     }
@@ -569,8 +572,8 @@ fun permitTake(program : Bool) -> Bool {
 }
 
 fun permitFree(program : Bool) -> Bool =
-    Prim.atomicLoad(permitWords, permitFreeAt) > 0
-        && (program || Prim.atomicLoad(permitWords, wantedAt) == 0)
+    Ptr.atomicLoad(permitWords, permitFreeAt) > 0
+        && (program || Ptr.atomicLoad(permitWords, wantedAt) == 0)
 
 -- Return holding a permit, asleep and blocked meanwhile, so that a collection
 -- need not wait. A spare thread (`program` False) sleeps until the monitor
@@ -588,27 +591,27 @@ foreign "turkey_permit_await" fun permitAwait(program : Bool) -> Unit {
     if permitTake(program) { return {} }
     let epoch = if program { wantEpochAt } else { spareEpochAt }
     if program {
-        Prim.atomicStore(permitWords, wantedAt, 1)
+        Ptr.atomicStore(permitWords, wantedAt, 1)
         signalWork(False)
     }
     while True {
-        let seen = Prim.atomicLoad(permitWords, epoch)
+        let seen = Ptr.atomicLoad(permitWords, epoch)
         blockEnter(Prim.frameAddress())
-        if !program { let _ = Prim.atomicAdd(permitWords, sparesAt, 1) }
-        if !permitFree(program) && Prim.atomicLoad(permitWords, epoch) == seen {
-            Lock.wait(Prim.ptrAdd(permitWords, epoch), seen)
+        if !program { let _ = Ptr.atomicAdd(permitWords, sparesAt, 1) }
+        if !permitFree(program) && Ptr.atomicLoad(permitWords, epoch) == seen {
+            Lock.wait(Ptr.add(permitWords, epoch), seen)
         }
         if !program {
-            let _ = Prim.atomicAdd(permitWords, sparesAt, -1)
+            let _ = Ptr.atomicAdd(permitWords, sparesAt, -1)
             handingDone()
         }
         blockExit()
         if permitTake(program) { break }
     }
     if program {
-        Prim.atomicStore(permitWords, wantedAt, 0)
+        Ptr.atomicStore(permitWords, wantedAt, 0)
         -- One the monitor freed meanwhile, or a second holder's, is a spare's.
-        if Prim.atomicLoad(permitWords, permitFreeAt) > 0 { spareWake() }
+        if Ptr.atomicLoad(permitWords, permitFreeAt) > 0 { spareWake() }
     }
 }
 
@@ -616,31 +619,31 @@ foreign "turkey_permit_await" fun permitAwait(program : Bool) -> Unit {
 -- each time it looks for one. A spare that looks for another reason counts
 -- too, which at worst wakes or starts one spare too many.
 fun handingDone() -> Unit {
-    let handing = Prim.atomicLoad(permitWords, handingAt)
-    if handing > 0 { let _ = Prim.atomicCas(permitWords, handingAt, handing, plus(handing, -1)) }
+    let handing = Ptr.atomicLoad(permitWords, handingAt)
+    if handing > 0 { let _ = Ptr.atomicCas(permitWords, handingAt, handing, plus(handing, -1)) }
 }
 
 fun spareWake() -> Unit {
-    let _ = Prim.atomicAdd(permitWords, spareEpochAt, 1)
-    if Prim.atomicLoad(permitWords, sparesAt) != 0 {
-        let _ = Lock.wake(Prim.ptrAdd(permitWords, spareEpochAt))
+    let _ = Ptr.atomicAdd(permitWords, spareEpochAt, 1)
+    if Ptr.atomicLoad(permitWords, sparesAt) != 0 {
+        let _ = Lock.wake(Ptr.add(permitWords, spareEpochAt))
     }
 }
 
 -- The scheduler's count of runnable tasks, which the monitor reads without
 -- its lock. Under the scheduler's lock.
-fun queuedSet(n : Int) -> Unit = Prim.atomicStore(permitWords, queuedAt, n)
+fun queuedSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, queuedAt, n)
 
 -- A holder with nothing to run is about to wait for work, and is back.
 fun idleEnter() -> Unit {
-    let _ = Prim.atomicAdd(permitWords, idlersAt, 1)
+    let _ = Ptr.atomicAdd(permitWords, idlersAt, 1)
 }
 
 fun idleLeave() -> Unit {
-    let _ = Prim.atomicAdd(permitWords, idlersAt, -1)
-    if Prim.atomicLoad(permitWords, monitorAsleepAt) != 0
-            && Prim.atomicCas(permitWords, monitorAsleepAt, 1, 0) == 1 {
-        let _ = Lock.wake(Prim.ptrAdd(permitWords, monitorAsleepAt))
+    let _ = Ptr.atomicAdd(permitWords, idlersAt, -1)
+    if Ptr.atomicLoad(permitWords, monitorAsleepAt) != 0
+            && Ptr.atomicCas(permitWords, monitorAsleepAt, 1, 0) == 1 {
+        let _ = Lock.wake(Ptr.add(permitWords, monitorAsleepAt))
     }
 }
 
@@ -654,18 +657,18 @@ fun idleLeave() -> Unit {
 fun monitorStart() -> Bool {
     let record = zeroed(1752)
     let thread = Libc.malloc(8)
-    if Prim.ptrIsNull(record) || Prim.ptrIsNull(thread) { return False }
-    Prim.storeI64(record, 288, -1)
+    if Ptr.isNull(record) || Ptr.isNull(thread) { return False }
+    Ptr.store(record, 288, -1)
     monitorRecord = record
-    (Libc.pthreadCreate(thread, Prim.ptrNull(), Prim.codeAddress("turkey_worker_start"), record)
+    (Libc.pthreadCreate(thread, Ptr.null(), Prim.codeAddress("turkey_worker_start"), record)
         & 0xFFFF_FFFF) == 0
 }
 
 -- Whether the running thread is the monitor's.
 fun monitoring() -> Bool =
-    !Prim.ptrIsNull(monitorRecord) && Prim.ptrEq(Prim.processState(), monitorRecord)
+    !Ptr.isNull(monitorRecord) && Prim.processState() == monitorRecord
 
-fun monitorState(i : Int) -> Int = Prim.atomicLoad(states, 8 * i)
+fun monitorState(i : Int) -> Int = Ptr.atomicLoad(states, 8 * i)
 
 -- Whether `state` is a blocking call by a thread that holds its permit.
 fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
@@ -674,49 +677,49 @@ fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
 -- tasks beyond the idle holders and the free permits, or the program's own
 -- stack waiting for a permit with none free.
 fun monitorWork() -> Bool {
-    let free = Prim.atomicLoad(permitWords, permitFreeAt)
-    let supply = plus(Prim.atomicLoad(permitWords, idlersAt), free)
-    Prim.atomicLoad(permitWords, queuedAt) > supply
-        || (Prim.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
+    let free = Ptr.atomicLoad(permitWords, permitFreeAt)
+    let supply = plus(Ptr.atomicLoad(permitWords, idlersAt), free)
+    Ptr.atomicLoad(permitWords, queuedAt) > supply
+        || (Ptr.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
 }
 
 -- Hold thread `i`, whose state was `state`, a call (`monitorCalling`):
 -- whether it still was.
 fun monitorHold(i : Int, state : Int) -> Bool =
-    Prim.atomicCas(states, 8 * i, state, plus(state, 1)) == state
+    Ptr.atomicCas(states, 8 * i, state, plus(state, 1)) == state
 
 -- Let thread `i`, held from `state`, go without its permit, which is free
 -- first so that the thread may take it back. A thread that returned from its
 -- call meanwhile sleeps on the collection epoch.
 fun monitorTake(i : Int, state : Int) -> Unit {
-    let _ = Prim.atomicAdd(permitWords, permitFreeAt, 1)
-    Prim.atomicStore(states, 8 * i, plus(state, noPermit))
+    let _ = Ptr.atomicAdd(permitWords, permitFreeAt, 1)
+    Ptr.atomicStore(states, 8 * i, plus(state, noPermit))
     signalCollection()
 }
 
 -- Hand a free permit on: to the program's own stack, if it waits for one,
 -- else to a spare thread, waking one or starting one. Whether it did.
 fun monitorHandOut() -> Bool {
-    let free = Prim.atomicLoad(permitWords, permitFreeAt)
+    let free = Ptr.atomicLoad(permitWords, permitFreeAt)
     if free <= 0 { return False }
-    if Prim.atomicLoad(permitWords, wantedAt) != 0 {
-        let _ = Prim.atomicAdd(permitWords, wantEpochAt, 1)
-        return Lock.wake(Prim.ptrAdd(permitWords, wantEpochAt))
+    if Ptr.atomicLoad(permitWords, wantedAt) != 0 {
+        let _ = Ptr.atomicAdd(permitWords, wantEpochAt, 1)
+        return Lock.wake(Ptr.add(permitWords, wantEpochAt))
     }
-    if Prim.atomicLoad(permitWords, handingAt) >= free { return False }
-    let _ = Prim.atomicAdd(permitWords, handingAt, 1)
-    if Prim.atomicLoad(permitWords, sparesAt) > 0 {
+    if Ptr.atomicLoad(permitWords, handingAt) >= free { return False }
+    let _ = Ptr.atomicAdd(permitWords, handingAt, 1)
+    if Ptr.atomicLoad(permitWords, sparesAt) > 0 {
         spareWake()
         return True
     }
     let record = spareNew()
     let thread = Libc.malloc(8)
-    if Prim.ptrIsNull(record) || Prim.ptrIsNull(thread) {
+    if Ptr.isNull(record) || Ptr.isNull(thread) {
         Libc.free(thread)
-        let _ = Prim.atomicAdd(permitWords, handingAt, -1)
+        let _ = Ptr.atomicAdd(permitWords, handingAt, -1)
         return False
     }
-    let started = Libc.pthreadCreate(thread, Prim.ptrNull(),
+    let started = Libc.pthreadCreate(thread, Ptr.null(),
                                      Prim.codeAddress("turkey_worker_start"), record)
     if (started & 0xFFFF_FFFF) != 0 {
         Process.panicInt(Prim.cString("could not start a thread: error "),
@@ -731,15 +734,15 @@ fun monitorHandOut() -> Bool {
 -- which wakes this (`idleLeave`). Whether it slept.
 fun monitorSleep() -> Bool {
     if !allIdle() { return False }
-    Prim.atomicStore(permitWords, monitorAsleepAt, 1)
-    if allIdle() { Lock.wait(Prim.ptrAdd(permitWords, monitorAsleepAt), 1) }
-    Prim.atomicStore(permitWords, monitorAsleepAt, 0)
+    Ptr.atomicStore(permitWords, monitorAsleepAt, 1)
+    if allIdle() { Lock.wait(Ptr.add(permitWords, monitorAsleepAt), 1) }
+    Ptr.atomicStore(permitWords, monitorAsleepAt, 0)
     True
 }
 
 fun allIdle() -> Bool =
-    Prim.atomicLoad(permitWords, idlersAt) >= permits()
-        && Prim.atomicLoad(permitWords, permitFreeAt) <= 0
+    Ptr.atomicLoad(permitWords, idlersAt) >= permits()
+        && Ptr.atomicLoad(permitWords, permitFreeAt) <= 0
 
 -- -- the poller ----------------------------------------------------------------------
 --
@@ -798,7 +801,7 @@ let batch : Int = 64
 -- Linux's `eventfd`, registered with token 0. The negated `errno` a failed
 -- making left. The scratch block (`scratchAt`). The results block, `batch`
 -- `(token, value)` pairs of Ints. How many pairs the last wait left there.
-var poller : Prim.Ptr = zeroed(64)
+var poller : Ptr = zeroed(64)
 
 let stateAt : Int = 0
 let descriptorAt : Int = 8
@@ -824,16 +827,16 @@ let scratchBytes : Int = 2080
 -- few system calls, with no safepoint in it.
 fun pollerReady() -> Int {
     while True {
-        let state = Prim.atomicLoad(poller, stateAt)
+        let state = Ptr.atomicLoad(poller, stateAt)
         if state == 2 { return 0 }
-        if state == 3 { return Prim.atomicLoad(poller, failureAt) }
-        if state == 0 && Prim.atomicCas(poller, stateAt, 0, 1) == 0 {
+        if state == 3 { return Ptr.atomicLoad(poller, failureAt) }
+        if state == 0 && Ptr.atomicCas(poller, stateAt, 0, 1) == 0 {
             let r = make()
             if r == 0 {
-                Prim.atomicStore(poller, stateAt, 2)
+                Ptr.atomicStore(poller, stateAt, 2)
             } else {
-                Prim.atomicStore(poller, failureAt, r)
-                Prim.atomicStore(poller, stateAt, 3)
+                Ptr.atomicStore(poller, failureAt, r)
+                Ptr.atomicStore(poller, stateAt, 3)
             }
         } else {
             let _ = Libc.schedYield()
@@ -844,22 +847,22 @@ fun pollerReady() -> Int {
 
 fun make() -> Int {
     let scratch = zeroed(scratchBytes)
-    let results = Libc.malloc(Prim.intMulWrapping(batch, 16))
-    if Prim.ptrIsNull(scratch) || Prim.ptrIsNull(results) {
+    let results = Libc.malloc(Int.mulWrapping(batch, 16))
+    if Ptr.isNull(scratch) || Ptr.isNull(results) {
         Libc.free(scratch)
         Libc.free(results)
-        return Prim.intNeg(Sys.enomem)
+        return -Sys.enomem
     }
-    Prim.storeI64(scratch, oneAt, 1)
-    Prim.storePtr(poller, scratchAt, scratch)
-    Prim.storePtr(poller, resultsAt, results)
+    Ptr.store(scratch, oneAt, 1)
+    Ptr.store(poller, scratchAt, scratch)
+    Ptr.store(poller, resultsAt, results)
     let r = match Target.os {
         Darwin -> makeKqueue()
         Linux -> makeEpoll()
     }
     if r != 0 {
-        Prim.storePtr(poller, scratchAt, Prim.ptrNull())
-        Prim.storePtr(poller, resultsAt, Prim.ptrNull())
+        Ptr.store(poller, scratchAt, Ptr.null())
+        Ptr.store(poller, resultsAt, Ptr.null())
         Libc.free(scratch)
         Libc.free(results)
     }
@@ -870,9 +873,9 @@ fun make() -> Int {
 -- `EV_CLEAR` makes each trigger one event that a wait takes.
 fun makeKqueue() -> Int {
     let kq = Sys.cInt(Libc.kqueue())
-    if kq < 0 { return Prim.intNeg(Sys.errno()) }
+    if kq < 0 { return -Sys.errno() }
     let _ = Libc.fcntlWith(kq, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
-    Prim.atomicStore(poller, descriptorAt, kq)
+    Ptr.atomicStore(poller, descriptorAt, kq)
     let r = change(Sys.filterUser(), 0, Sys.evAdd | Sys.evClear, 0, 0)
     if r < 0 { let _ = Libc.close(kq) }
     r
@@ -882,10 +885,10 @@ fun makeKqueue() -> Int {
 -- token 0, level-triggered: it stays readable until a wait reads it.
 fun makeEpoll() -> Int {
     let ep = Sys.cInt(Libc.epollCreate1(Sys.closeOnExec()))
-    if ep < 0 { return Prim.intNeg(Sys.errno()) }
+    if ep < 0 { return -Sys.errno() }
     let wake = Sys.cInt(Libc.eventfd(0, Sys.nonBlocking() | Sys.closeOnExec()))
     if wake < 0 {
-        let failure = Prim.intNeg(Sys.errno())
+        let failure = -Sys.errno()
         let _ = Libc.close(ep)
         return failure
     }
@@ -895,8 +898,8 @@ fun makeEpoll() -> Int {
         let _ = Libc.close(wake)
         return r
     }
-    Prim.atomicStore(poller, descriptorAt, ep)
-    Prim.atomicStore(poller, wakeDescriptorAt, wake)
+    Ptr.atomicStore(poller, descriptorAt, ep)
+    Ptr.atomicStore(poller, wakeDescriptorAt, wake)
     0
 }
 
@@ -904,13 +907,13 @@ fun makeEpoll() -> Int {
 
 -- Fill the `struct kevent` at `at` in `buf` (`Turkey.Sys.keventBytes`). The
 -- `filter`, `flags` and `fflags` fields share one word, little-endian.
-fun setEvent(buf : Prim.Ptr, at : Int, ident : Int, filter : Int, flags : Int, fflags : Int,
+fun setEvent(buf : Ptr, at : Int, ident : Int, filter : Int, flags : Int, fflags : Int,
              data : Int, udata : Int) -> Unit {
-    Prim.storeI64(buf, at, ident)
+    Ptr.store(buf, at, ident)
     let packed = filter & 0xFFFF | flags << 16 | fflags << 32
-    Prim.storeI64(buf, plus(at, 8), packed)
-    Prim.storeI64(buf, plus(at, 16), data)
-    Prim.storeI64(buf, plus(at, 24), udata)
+    Ptr.store(buf, plus(at, 8), packed)
+    Ptr.store(buf, plus(at, 16), data)
+    Ptr.store(buf, plus(at, 24), udata)
 }
 
 -- Make one change to the queue, with `EV_RECEIPT`, so that the call answers
@@ -921,19 +924,19 @@ fun setEvent(buf : Prim.Ptr, at : Int, ident : Int, filter : Int, flags : Int, f
 fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) -> Int {
     -- The change, its receipt, and a zero timeout.
     let buf = zeroed(80)
-    if Prim.ptrIsNull(buf) { return Prim.intNeg(Sys.enomem) }
+    if Ptr.isNull(buf) { return -Sys.enomem }
     setEvent(buf, 0, ident, filter, flags | Sys.evReceipt, fflags, 0, udata)
-    let kq = Prim.atomicLoad(poller, descriptorAt)
+    let kq = Ptr.atomicLoad(poller, descriptorAt)
     var answer = 0
     while True {
-        let n = Sys.cInt(Libc.kevent(kq, buf, 1, Prim.ptrAdd(buf, 32), 1, Prim.ptrAdd(buf, 64)))
+        let n = Sys.cInt(Libc.kevent(kq, buf, 1, Ptr.add(buf, 32), 1, Ptr.add(buf, 64)))
         if n < 0 {
-            answer = Prim.intNeg(Sys.errno())
-            if answer != Prim.intNeg(Sys.eintr) { break }
+            answer = -Sys.errno()
+            if answer != -Sys.eintr { break }
         } else {
-            let head = Prim.loadI64(buf, 40)
+            let head : Int = Ptr.load(buf, 40)
             if head >> 16 & Sys.evError != 0 {
-                answer = Prim.intNeg(Prim.loadI64(buf, 48))
+                answer = -Ptr.load(buf, 48)
             }
             break
         }
@@ -948,9 +951,9 @@ fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) ->
 -- the negated `errno`.
 fun epollControl(ep : Int, operation : Int, fd : Int, events : Int, token : Int) -> Int {
     let event = Libc.malloc(16)
-    if Prim.ptrIsNull(event) { return Prim.intNeg(Sys.enomem) }
-    Prim.storeI64(event, 0, events)
-    Prim.storeI64(event, 8, token)
+    if Ptr.isNull(event) { return -Sys.enomem }
+    Ptr.store(event, 0, events)
+    Ptr.store(event, 8, token)
     let r = Sys.cResult(Libc.epollCtl(ep, operation, fd, event))
     Libc.free(event)
     r
@@ -959,10 +962,10 @@ fun epollControl(ep : Int, operation : Int, fd : Int, events : Int, token : Int)
 -- Interest in `fd`'s `events`, once, delivering `token`: a change of the
 -- descriptor's registration, or a new one if it has none.
 fun epollArm(fd : Int, events : Int, token : Int) -> Int {
-    let ep = Prim.atomicLoad(poller, descriptorAt)
+    let ep = Ptr.atomicLoad(poller, descriptorAt)
     let armed = events | Sys.epollOneShot
     let r = epollControl(ep, Sys.epollCtlMod, fd, armed, token)
-    if r == Prim.intNeg(Sys.enoent) { epollControl(ep, Sys.epollCtlAdd, fd, armed, token) } else { r }
+    if r == -Sys.enoent { epollControl(ep, Sys.epollCtlAdd, fd, armed, token) } else { r }
 }
 
 -- -- registering
@@ -1020,7 +1023,7 @@ fun pollChild(pid : Int, token : Int) -> Int {
         Darwin -> {
             let flags = Sys.evAdd | Sys.evOneShot
             let r = change(Sys.filterProc(), pid, flags, Sys.noteExit | Sys.noteExitStatus, token)
-            if r == Prim.intNeg(Sys.esrch) { 1 } else { r }
+            if r == -Sys.esrch { 1 } else { r }
         }
         Linux -> watchPid(pid, token)
     }
@@ -1034,12 +1037,12 @@ fun pollUnlock(fd : Int, token : Int) -> Int {
     if ready < 0 { return ready }
     match Target.os {
         Darwin -> change(Sys.filterVnode(), fd, Sys.evAdd | Sys.evOneShot, Sys.noteFunlock, token)
-        Linux -> Prim.intNeg(Sys.einval)
+        Linux -> -Sys.einval
     }
 }
 
 fun watchPid(pid : Int, token : Int) -> Int {
-    let fd = Sys.result(Libc.syscall(Sys.pidfdOpen, Prim.ptrFromInt(pid), 0, 0, Prim.ptrNull()))
+    let fd = Sys.result(Libc.syscall(Sys.pidfdOpen, Ptr.fromInt(pid), 0, 0, Ptr.null()))
     if fd < 0 { return fd }
     let r = epollArm(fd, Sys.epollIn, token)
     if r < 0 {
@@ -1048,7 +1051,7 @@ fun watchPid(pid : Int, token : Int) -> Int {
     }
     if !childAdd(token, fd) {
         let _ = Libc.close(fd)
-        return Prim.intNeg(Sys.enomem)
+        return -Sys.enomem
     }
     0
 }
@@ -1056,13 +1059,13 @@ fun watchPid(pid : Int, token : Int) -> Int {
 -- Drop interest in `fd`, both directions, ignoring that there may be none.
 -- Before it is closed, on Linux (see above).
 fun pollForget(fd : Int) -> Unit {
-    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
     match Target.os {
         Darwin -> {
             let _ = change(Sys.filterRead(), fd, Sys.evDelete, 0, 0)
             let _ = change(Sys.filterWrite(), fd, Sys.evDelete, 0, 0)
         }
-        Linux -> { let _ = epollControl(Prim.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, 0, 0) }
+        Linux -> { let _ = epollControl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, 0, 0) }
     }
 }
 
@@ -1070,7 +1073,7 @@ fun pollForget(fd : Int) -> Unit {
 -- watched it, ignoring that it may have fired or never been registered:
 -- the caller does this once the child's result has been delivered, too.
 fun pollForgetChild(pid : Int, token : Int) -> Unit {
-    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
     match Target.os {
         Darwin -> { let _ = change(Sys.filterProc(), pid, Sys.evDelete, 0, 0) }
         Linux -> {
@@ -1085,7 +1088,7 @@ fun pollForgetChild(pid : Int, token : Int) -> Unit {
 -- Drop interest in releases of locks on `fd`'s file, ignoring that there may
 -- be none.
 fun pollForgetUnlock(fd : Int) -> Unit {
-    if Prim.atomicLoad(poller, stateAt) != 2 { return }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return }
     match Target.os {
         Darwin -> { let _ = change(Sys.filterVnode(), fd, Sys.evDelete, 0, 0) }
         Linux -> {}
@@ -1098,29 +1101,29 @@ fun pollForgetUnlock(fd : Int) -> Unit {
 -- 8 how many, 16 how many fit. Under `childLock`, taken with `acquire` so
 -- that a waiter does not hold up a collection. Only registration and
 -- `pollForgetChild` use it; the wait does not.
-var children : Prim.Ptr = zeroed(24)
-var childLock : Prim.Ptr = Lock.new()
+var children : Ptr = zeroed(24)
+var childLock : Ptr = Lock.new()
 
 fun childAdd(token : Int, fd : Int) -> Bool {
     acquire(childLock)
-    var n = Prim.loadI64(children, 8)
-    var table = Prim.loadPtr(children, 0)
+    var n : Int = Ptr.load(children, 8)
+    var table : Ptr = Ptr.load(children, 0)
     var ok = True
-    if n == Prim.loadI64(children, 16) {
-        let room = if n == 0 { 8 } else { Prim.intMulWrapping(n, 2) }
-        let grown = Libc.realloc(table, Prim.intMulWrapping(room, 16))
-        if Prim.ptrIsNull(grown) {
+    if n == Ptr.load(children, 16) {
+        let room = if n == 0 { 8 } else { Int.mulWrapping(n, 2) }
+        let grown = Libc.realloc(table, Int.mulWrapping(room, 16))
+        if Ptr.isNull(grown) {
             ok = False
         } else {
             table = grown
-            Prim.storePtr(children, 0, grown)
-            Prim.storeI64(children, 16, room)
+            Ptr.store(children, 0, grown)
+            Ptr.store(children, 16, room)
         }
     }
     if ok {
-        Prim.storeI64(table, Prim.intMulWrapping(n, 16), token)
-        Prim.storeI64(table, plus(Prim.intMulWrapping(n, 16), 8), fd)
-        Prim.storeI64(children, 8, plus(n, 1))
+        Ptr.store(table, Int.mulWrapping(n, 16), token)
+        Ptr.store(table, plus(Int.mulWrapping(n, 16), 8), fd)
+        Ptr.store(children, 8, plus(n, 1))
     }
     Lock.release(childLock)
     ok
@@ -1129,17 +1132,17 @@ fun childAdd(token : Int, fd : Int) -> Bool {
 -- Remove the pair for `token` and answer its descriptor, or -1.
 fun childTake(token : Int) -> Int {
     acquire(childLock)
-    let n = Prim.loadI64(children, 8)
-    let table = Prim.loadPtr(children, 0)
+    let n : Int = Ptr.load(children, 8)
+    let table : Ptr = Ptr.load(children, 0)
     var found = -1
     for var i = 0; i < n; i = plus(i, 1) {
-        let at = Prim.intMulWrapping(i, 16)
-        if found < 0 && Prim.loadI64(table, at) == token {
-            found = Prim.loadI64(table, plus(at, 8))
-            let last = Prim.intMulWrapping(plus(n, -1), 16)
-            Prim.storeI64(table, at, Prim.loadI64(table, last))
-            Prim.storeI64(table, plus(at, 8), Prim.loadI64(table, plus(last, 8)))
-            Prim.storeI64(children, 8, plus(n, -1))
+        let at = Int.mulWrapping(i, 16)
+        if found < 0 && Ptr.load(table, at) == token {
+            found = Ptr.load(table, plus(at, 8))
+            let last = Int.mulWrapping(plus(n, -1), 16)
+            Ptr.store(table, at, Ptr.load(table, last) : Int)
+            Ptr.store(table, plus(at, 8), Ptr.load(table, plus(last, 8)) : Int)
+            Ptr.store(children, 8, plus(n, -1))
         }
     }
     Lock.release(childLock)
@@ -1150,17 +1153,17 @@ fun childTake(token : Int) -> Int {
 
 -- Whether the caller is now the one worker that may poll: it stays so until
 -- `release`.
-fun claim() -> Bool = Prim.atomicCas(signals, claimedAt, 0, 1) == 0
+fun claim() -> Bool = Ptr.atomicCas(signals, claimedAt, 0, 1) == 0
 
-fun release() -> Unit = Prim.atomicStore(signals, claimedAt, 0)
+fun release() -> Unit = Ptr.atomicStore(signals, claimedAt, 0)
 
 -- Registrations and timers the scheduler is waiting on, `n` more (or fewer,
 -- negative).
 fun interestAdd(n : Int) -> Unit {
-    let _ = Prim.atomicAdd(signals, interestAt, n)
+    let _ = Ptr.atomicAdd(signals, interestAt, n)
 }
 
-fun interest() -> Int = Prim.atomicLoad(signals, interestAt)
+fun interest() -> Int = Ptr.atomicLoad(signals, interestAt)
 
 -- End the poller's wait, if it is in one, or keep its next from starting: a
 -- Darwin user event is triggered, a Linux `eventfd` written. A break is one
@@ -1169,20 +1172,20 @@ fun interest() -> Int = Prim.atomicLoad(signals, interestAt)
 -- that sets word 48 sends it, and a send that fails clears the word again so
 -- that the next signaller tries.
 fun wakePoller() -> Unit {
-    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
-    if Prim.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return {} }
     let failed = match Target.os {
         Darwin -> change(Sys.filterUser(), 0, 0, Sys.noteTrigger, 0) < 0
         -- `EAGAIN` is a counter that cannot take another 1: a break is
         -- pending already.
         Linux -> {
-            let wake = Prim.atomicLoad(poller, wakeDescriptorAt)
-            let one = Prim.ptrAdd(Prim.loadPtr(poller, scratchAt), oneAt)
+            let wake = Ptr.atomicLoad(poller, wakeDescriptorAt)
+            let one = Ptr.add(Ptr.load(poller, scratchAt), oneAt)
             let r = Sys.result(Libc.write(wake, one, 8))
-            r < 0 && r != Prim.intNeg(Sys.eagain())
+            r < 0 && r != -Sys.eagain()
         }
     }
-    if failed { Prim.atomicStore(signals, wakePendingAt, 0) }
+    if failed { Ptr.atomicStore(signals, wakePendingAt, 0) }
 }
 
 -- -- waiting
@@ -1200,12 +1203,12 @@ fun wakePoller() -> Unit {
 fun pollWait(seen : Int, timeout : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
-    Prim.atomicStore(poller, countAt, 0)
-    Prim.atomicStore(signals, blockedAt, 1)
+    Ptr.atomicStore(poller, countAt, 0)
+    Ptr.atomicStore(signals, blockedAt, 1)
     var n = 0
-    if Prim.atomicLoad(signals, 0) == seen { n = waitFor(timeout) }
-    Prim.atomicStore(signals, blockedAt, 0)
-    Prim.atomicStore(signals, wakePendingAt, 0)
+    if Ptr.atomicLoad(signals, 0) == seen { n = waitFor(timeout) }
+    Ptr.atomicStore(signals, blockedAt, 0)
+    Ptr.atomicStore(signals, wakePendingAt, 0)
     n
 }
 
@@ -1215,15 +1218,15 @@ fun pollWait(seen : Int, timeout : Int) -> Int {
 fun pollNow() -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
-    Prim.atomicStore(poller, countAt, 0)
+    Ptr.atomicStore(poller, countAt, 0)
     waitFor(0)
 }
 
 fun resultToken(i : Int) -> Int =
-    Prim.loadI64(Prim.loadPtr(poller, resultsAt), Prim.intMulWrapping(i, 16))
+    Ptr.load(Ptr.load(poller, resultsAt), Int.mulWrapping(i, 16))
 
 fun resultValue(i : Int) -> Int =
-    Prim.loadI64(Prim.loadPtr(poller, resultsAt), plus(Prim.intMulWrapping(i, 16), 8))
+    Ptr.load(Ptr.load(poller, resultsAt), plus(Int.mulWrapping(i, 16), 8))
 
 -- The kernel's wait and the decoding of what it left. An interrupted wait
 -- answers 0, as a timeout does; the caller looks again. `errno` is read
@@ -1232,7 +1235,7 @@ fun resultValue(i : Int) -> Int =
 -- Taking a break clears the break word: the event is gone from the kernel, so
 -- the next signaller must send another.
 fun waitFor(timeout : Int) -> Int {
-    let scratch = Prim.loadPtr(poller, scratchAt)
+    let scratch : Ptr = Ptr.load(poller, scratchAt)
     let n = match Target.os {
         Darwin -> kqueueWait(scratch, timeout)
         Linux -> epollWaitFor(scratch, timeout)
@@ -1245,28 +1248,28 @@ fun waitFor(timeout : Int) -> Int {
             Linux -> decodeEpoll(scratch, i, count)
         }
     }
-    Prim.atomicStore(poller, countAt, count)
+    Ptr.atomicStore(poller, countAt, count)
     count
 }
 
 -- The number of events the kernel stored at `scratch`, or the negated `errno`
 -- of a wait that failed, with an interruption counted as no events.
-fun kqueueWait(scratch : Prim.Ptr, timeout : Int) -> Int {
+fun kqueueWait(scratch : Ptr, timeout : Int) -> Int {
     -- Capped at about 31 years, which Darwin accepts and which is as good as
     -- never.
-    var limit = Prim.ptrNull()
+    var limit = Ptr.null()
     if timeout >= 0 {
-        limit = Prim.ptrAdd(scratch, timespecAt)
+        limit = Ptr.add(scratch, timespecAt)
         let capped = if timeout > 1_000_000_000_000_000 { 1_000_000_000_000_000 } else { timeout }
-        Prim.storeI64(limit, 0, capped / 1_000_000_000)
-        Prim.storeI64(limit, 8, capped % 1_000_000_000)
+        Ptr.store(limit, 0, capped / 1_000_000_000)
+        Ptr.store(limit, 8, capped % 1_000_000_000)
     }
-    let n = Sys.cInt(Libc.kevent(Prim.atomicLoad(poller, descriptorAt), Prim.ptrNull(), 0,
+    let n = Sys.cInt(Libc.kevent(Ptr.atomicLoad(poller, descriptorAt), Ptr.null(), 0,
                                  scratch, batch, limit))
     afterWait(n)
 }
 
-fun epollWaitFor(scratch : Prim.Ptr, timeout : Int) -> Int {
+fun epollWaitFor(scratch : Ptr, timeout : Int) -> Int {
     -- Milliseconds, rounded up; a C `int`, so capped.
     let ms = if timeout < 0 {
         -1
@@ -1275,21 +1278,21 @@ fun epollWaitFor(scratch : Prim.Ptr, timeout : Int) -> Int {
     } else {
         plus(timeout, 999_999) / 1_000_000
     }
-    let n = Sys.cInt(Libc.epollWait(Prim.atomicLoad(poller, descriptorAt), scratch, batch, ms))
+    let n = Sys.cInt(Libc.epollWait(Ptr.atomicLoad(poller, descriptorAt), scratch, batch, ms))
     afterWait(n)
 }
 
 fun afterWait(n : Int) -> Int {
     if n >= 0 { return n }
-    let failure = Prim.intNeg(Sys.errno())
-    if failure == Prim.intNeg(Sys.eintr) { 0 } else { failure }
+    let failure = -Sys.errno()
+    if failure == -Sys.eintr { 0 } else { failure }
 }
 
 -- Add the pair `(token, value)` to the results, answering the new count.
 fun push(count : Int, token : Int, value : Int) -> Int {
-    let results = Prim.loadPtr(poller, resultsAt)
-    Prim.storeI64(results, Prim.intMulWrapping(count, 16), token)
-    Prim.storeI64(results, plus(Prim.intMulWrapping(count, 16), 8), value)
+    let results : Ptr = Ptr.load(poller, resultsAt)
+    Ptr.store(results, Int.mulWrapping(count, 16), token)
+    Ptr.store(results, plus(Int.mulWrapping(count, 16), 8), value)
     plus(count, 1)
 }
 
@@ -1298,19 +1301,19 @@ fun push(count : Int, token : Int, value : Int) -> Int {
 -- caller chose is anything else. A read or write event carries `EV_EOF` at end
 -- of stream, and `EV_ERROR` for a failure; a process event carries the wait
 -- status in `data`; a vnode event is an unlock, the only one asked for.
-fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
-    let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 32))
-    let head = Prim.loadI64(event, 8)
+fun decodeKevent(scratch : Ptr, i : Int, count : Int) -> Int {
+    let event = Ptr.add(scratch, Int.mulWrapping(i, 32))
+    let head : Int = Ptr.load(event, 8)
     let raw = head & 0xFFFF
-    let filter = if raw >= 0x8000 { Prim.intSubWrapping(raw, 0x10000) } else { raw }
+    let filter = if raw >= 0x8000 { Int.subWrapping(raw, 0x10000) } else { raw }
     let flags = head >> 16 & 0xFFFF
     if filter == Sys.filterUser() {
-        Prim.atomicStore(signals, wakePendingAt, 0)
+        Ptr.atomicStore(signals, wakePendingAt, 0)
         return count
     }
-    let token = Prim.loadI64(event, 24)
+    let token : Int = Ptr.load(event, 24)
     if filter == Sys.filterProc() {
-        return push(count, token, Prim.loadI64(event, 16))
+        return push(count, token, Ptr.load(event, 16))
     }
     if filter == Sys.filterVnode() { return push(count, token, pollReadable) }
     var value = if filter == Sys.filterRead() { pollReadable } else { pollWritable }
@@ -1321,13 +1324,13 @@ fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
 
 -- The `i`th `struct epoll_event` at `scratch` as a result, if it is not the
 -- break, whose `eventfd` is read to empty it, which makes it stop reporting.
-fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
-    let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 16))
-    let events = Prim.loadI64(event, 0) & 0xFFFF_FFFF
-    let token = Prim.loadI64(event, 8)
+fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
+    let event = Ptr.add(scratch, Int.mulWrapping(i, 16))
+    let events : Int = Ptr.load(event, 0) & 0xFFFF_FFFF
+    let token : Int = Ptr.load(event, 8)
     if token == 0 {
-        let _ = Libc.read(Prim.atomicLoad(poller, wakeDescriptorAt), Prim.ptrAdd(scratch, drainAt), 8)
-        Prim.atomicStore(signals, wakePendingAt, 0)
+        let _ = Libc.read(Ptr.atomicLoad(poller, wakeDescriptorAt), Ptr.add(scratch, drainAt), 8)
+        Ptr.atomicStore(signals, wakePendingAt, 0)
         return count
     }
     var value = 0
@@ -1444,21 +1447,21 @@ fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
 -- A task's thread may come back from one without a permit, which its caller
 -- then gives back (`Turkey.Scheduler.afterCall`).
 
-foreign "turkey_blocking_read" fun blockingRead(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
+foreign "turkey_blocking_read" fun blockingRead(fd : Int, buf : Ptr, count : Int) -> Int {
     callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.read(fd, buf, count))
     callExit()
     n
 }
 
-foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
+foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Ptr, count : Int) -> Int {
     callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.write(fd, buf, count))
     callExit()
     n
 }
 
-foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Prim.Ptr, count : Int,
+foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Ptr, count : Int,
                                                   offset : Int) -> Int {
     callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.pread(fd, buf, count, offset))
@@ -1466,7 +1469,7 @@ foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Prim.Ptr, coun
     n
 }
 
-foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Prim.Ptr, count : Int,
+foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Ptr, count : Int,
                                                     offset : Int) -> Int {
     callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.pwrite(fd, buf, count, offset))
@@ -1474,7 +1477,7 @@ foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Prim.Ptr, co
     n
 }
 
-foreign "turkey_blocking_open" fun blockingOpen(path : Prim.Ptr, flags : Int, mode : Int) -> Int {
+foreign "turkey_blocking_open" fun blockingOpen(path : Ptr, flags : Int, mode : Int) -> Int {
     callEnter(Prim.frameAddress())
     let fd = Sys.cResult(Libc.open(path, flags, mode))
     callExit()
@@ -1488,7 +1491,7 @@ foreign "turkey_blocking_close" fun blockingClose(fd : Int) -> Int {
     r
 }
 
-foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Prim.Ptr) -> Int {
+foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.fstat(fd, buf))
     callExit()
@@ -1499,7 +1502,7 @@ foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Prim.Ptr) -> I
 -- network file system is unbounded, and `flock` without `LOCK_NB` for as long
 -- as another process holds the lock.
 
-foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Prim.Ptr, flags : Int,
+foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Ptr, flags : Int,
                                                     mode : Int) -> Int {
     callEnter(Prim.frameAddress())
     let fd = Sys.cResult(Libc.openat(dir, path, flags, mode))
@@ -1507,7 +1510,7 @@ foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Prim.Ptr, 
     fd
 }
 
-foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Prim.Ptr, buf : Prim.Ptr,
+foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Ptr, buf : Ptr,
                                                       flags : Int) -> Int {
     callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.fstatat(dir, path, buf, flags))
@@ -1515,7 +1518,7 @@ foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Prim.Ptr
     r
 }
 
-foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Prim.Ptr,
+foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Ptr,
                                                         flags : Int) -> Int {
     callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.unlinkat(dir, path, flags))
@@ -1523,7 +1526,7 @@ foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Prim.P
     r
 }
 
-foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Prim.Ptr,
+foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Ptr,
                                                       mode : Int) -> Int {
     callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.mkdirat(dir, path, mode))
@@ -1531,16 +1534,16 @@ foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Prim.Ptr
     r
 }
 
-foreign "turkey_blocking_renameat" fun blockingRenameat(fromDir : Int, from : Prim.Ptr,
-                                                        toDir : Int, to : Prim.Ptr) -> Int {
+foreign "turkey_blocking_renameat" fun blockingRenameat(fromDir : Int, from : Ptr,
+                                                        toDir : Int, to : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     let r = Sys.cResult(Libc.renameat(fromDir, from, toDir, to))
     callExit()
     r
 }
 
-foreign "turkey_blocking_readlinkat" fun blockingReadlinkat(dir : Int, path : Prim.Ptr,
-                                                            buf : Prim.Ptr, size : Int) -> Int {
+foreign "turkey_blocking_readlinkat" fun blockingReadlinkat(dir : Int, path : Ptr,
+                                                            buf : Ptr, size : Int) -> Int {
     callEnter(Prim.frameAddress())
     let n = Sys.result(Libc.readlinkat(dir, path, buf, size))
     callExit()
@@ -1556,10 +1559,10 @@ foreign "turkey_blocking_flock" fun blockingFlock(fd : Int, operation : Int) -> 
 
 -- `mkdtemp`, which makes a directory as `mkdirat` does: 0, or the negated
 -- `errno`.
-foreign "turkey_blocking_mkdtemp" fun blockingMkdtemp(template : Prim.Ptr) -> Int {
+foreign "turkey_blocking_mkdtemp" fun blockingMkdtemp(template : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     let made = Libc.mkdtemp(template)
-    let r = if Prim.ptrIsNull(made) { Prim.intNeg(Sys.errno()) } else { 0 }
+    let r = if Ptr.isNull(made) { -Sys.errno() } else { 0 }
     callExit()
     r
 }
@@ -1570,18 +1573,18 @@ foreign "turkey_blocking_mkdtemp" fun blockingMkdtemp(template : Prim.Ptr) -> In
 foreign "turkey_blocking_fdopendir" fun blockingFdopendir(fd : Int) -> Int {
     callEnter(Prim.frameAddress())
     let stream = Libc.fdopendir(fd)
-    let r = if Prim.ptrIsNull(stream) { Prim.intNeg(Sys.errno()) } else { Prim.ptrToInt(stream) }
+    let r = if Ptr.isNull(stream) { -Sys.errno() } else { Ptr.toInt(stream) }
     callExit()
     r
 }
 
 -- The next entry's address as an `Int`, which is positive; 0 at the end of
 -- the stream; or the negated `errno`.
-foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Prim.Ptr) -> Int {
+foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     Sys.clearErrno()
     let entry = Libc.readdir(stream)
-    let r = if Prim.ptrIsNull(entry) { Prim.intNeg(Sys.errno()) } else { Prim.ptrToInt(entry) }
+    let r = if Ptr.isNull(entry) { -Sys.errno() } else { Ptr.toInt(entry) }
     callExit()
     r
 }
@@ -1590,11 +1593,11 @@ foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Prim.Ptr) -> Int 
 -- slowest name server it asks: the list is stored at word 0 of `out`, and,
 -- when the answer is `EAI_SYSTEM`, `errno` at word 8. The answer is the C
 -- `int` code, sign-extended: 0, or an `EAI_*` code (`Turkey.Sys`).
-foreign "turkey_blocking_getaddrinfo" fun blockingGetaddrinfo(node : Prim.Ptr, hints : Prim.Ptr,
-                                                              out : Prim.Ptr) -> Int {
+foreign "turkey_blocking_getaddrinfo" fun blockingGetaddrinfo(node : Ptr, hints : Ptr,
+                                                              out : Ptr) -> Int {
     callEnter(Prim.frameAddress())
-    let code = Sys.cInt(Libc.getaddrinfo(node, Prim.ptrNull(), hints, out))
-    if code == Sys.eaiSystem() { Prim.storeI64(out, 8, Sys.errno()) }
+    let code = Sys.cInt(Libc.getaddrinfo(node, Ptr.null(), hints, out))
+    if code == Sys.eaiSystem() { Ptr.store(out, 8, Sys.errno()) }
     callExit()
     code
 }
@@ -1603,9 +1606,9 @@ foreign "turkey_blocking_getaddrinfo" fun blockingGetaddrinfo(node : Prim.Ptr, h
 -- loaded from its file system: on Linux, once the child has called `exec`.
 -- The answer is its C `int` error number, sign-extended: 0, or an `errno`
 -- value.
-foreign "turkey_blocking_spawnp" fun blockingSpawnp(pid : Prim.Ptr, file : Prim.Ptr,
-                                                    actions : Prim.Ptr, attributes : Prim.Ptr,
-                                                    argv : Prim.Ptr, envp : Prim.Ptr) -> Int {
+foreign "turkey_blocking_spawnp" fun blockingSpawnp(pid : Ptr, file : Ptr,
+                                                    actions : Ptr, attributes : Ptr,
+                                                    argv : Ptr, envp : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     let failure = Sys.cInt(Libc.posixSpawnp(pid, file, actions, attributes, argv, envp))
     callExit()
@@ -1617,7 +1620,7 @@ foreign "turkey_blocking_spawnp" fun blockingSpawnp(pid : Prim.Ptr, file : Prim.
 -- own stack can wait for a task without running it, while the monitor hands
 -- its permit to a thread that does (`Turkey.Detach`). Returns early as
 -- `Turkey.Lock.wait` does.
-foreign "turkey_blocking_sleep_on" fun blockingSleepOn(word : Prim.Ptr, value : Int,
+foreign "turkey_blocking_sleep_on" fun blockingSleepOn(word : Ptr, value : Int,
                                                        nanoseconds : Int) -> Unit {
     callEnter(Prim.frameAddress())
     if nanoseconds < 0 { Lock.wait(word, value) } else { Lock.waitFor(word, value, nanoseconds) }
@@ -1630,20 +1633,20 @@ foreign "turkey_blocking_sleep_on" fun blockingSleepOn(word : Prim.Ptr, value : 
 -- flag is word 0 of a record, and the message bytes 24 to 272.
 foreign "turkey_worker_ended" fun ended() -> Unit {
     let mine = Prim.processState()
-    if Prim.loadI64(mine, 0) == 0 { return {} }
+    if Ptr.load(mine, 0) == 0 { return {} }
     -- Down first: every call below returns to a test of it.
-    Prim.storeI64(mine, 0, 0)
+    Ptr.store(mine, 0, 0)
     let first = recordOf(0)
     -- The message before the flag, which the main worker may act on at once.
     -- One that is unwinding already keeps its own.
-    if Prim.atomicLoad(first, 0) != 0 { return {} }
+    if Ptr.atomicLoad(first, 0) != 0 { return {} }
     for var at = 24; at < 272; at = plus(at, 8) {
-        Prim.storeI64(first, at, Prim.loadI64(mine, at))
+        Ptr.store(first, at, Ptr.load(mine, at) : Int)
     }
-    let _ = Prim.atomicCas(first, 0, 0, 1)
+    let _ = Ptr.atomicCas(first, 0, 0, 1)
     -- The main worker may be asleep waiting for work, and sees the flag only
     -- once it runs again.
     signalWork(True)
 }
 
-fun plus(a : Int, b : Int) -> Int = Prim.intAddWrapping(a, b)
+fun plus(a : Int, b : Int) -> Int = Int.addWrapping(a, b)

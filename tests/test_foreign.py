@@ -281,7 +281,7 @@ fun createFlags() -> Int = match Target.os {
 
 fun create(path : String, mode : Int) -> Int {
     let name = Ptr.toCString(path)
-    let fd = openCreate(Ptr.raw(name), createFlags(), mode)
+    let fd = openCreate(name, createFlags(), mode)
     Ptr.free(name)
     fd
 }

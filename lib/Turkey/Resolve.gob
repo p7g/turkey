@@ -30,6 +30,8 @@ import Turkey.Semaphore as Semaphore
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
 import Turkey.Workers as Workers
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 -- -- addresses -----------------------------------------------------------------------
 
@@ -258,8 +260,8 @@ fun pack(g : Array Int, at : Int) -> Int {
 -- lookup is given `system`; a test gives one whose `getaddrinfo` blocks for
 -- as long as it likes, or whose `freeaddrinfo` counts what it frees.
 type Resolver = Resolver {
-    getaddrinfo : fun(Prim.Ptr, Prim.Ptr, Prim.Ptr) -> Int,
-    freeaddrinfo : fun(Prim.Ptr) -> Unit,
+    getaddrinfo : fun(Ptr, Ptr, Ptr) -> Int,
+    freeaddrinfo : fun(Ptr) -> Unit,
 }
 
 let system : Resolver = Resolver {
@@ -280,7 +282,7 @@ let lookups : Semaphore.Semaphore = Semaphore.new(lookupsAtOnce)
 
 -- What `getaddrinfo` returned: the list it allocated, or its error code,
 -- an `EAI_*` value, with the `errno` that goes with `EAI_SYSTEM`.
-type Addrinfo = Listed(Prim.Ptr) | Failed(Int, Int)
+type Addrinfo = Listed(Ptr) | Failed(Int, Int)
 
 -- The addresses `host` names, in the order the resolver gives them, each
 -- once; waiting at most until `deadline`, on `Turkey.Wait.now`'s clock, or
@@ -316,7 +318,7 @@ fun lookup(resolver : Resolver, host : String, deadline : Int) -> Either IOError
 fun call(resolver : Resolver, name : Array Byte) -> Addrinfo {
     let hints = Libc.malloc(Sys.addrinfoBytes)
     let out = Libc.malloc(16)
-    if Prim.ptrIsNull(hints) || Prim.ptrIsNull(out) {
+    if Ptr.isNull(hints) || Ptr.isNull(out) {
         Libc.free(hints)
         Libc.free(out)
         return Failed(Sys.eaiMemory(), 0)
@@ -326,11 +328,11 @@ fun call(resolver : Resolver, name : Array Byte) -> Addrinfo {
     -- address comes once per type otherwise.
     Memory.fill(hints, Sys.addrinfoBytes, 0)
     Memory.fill(out, 16, 0)
-    Prim.storeI32(hints, Sys.addrinfoSocktypeAt, Prim.charFromInt(Sys.sockStream))
+    Ptr.store32(hints, Sys.addrinfoSocktypeAt, Sys.sockStream)
     let code = resolver.getaddrinfo(IO.addressOf(name, 0), hints, out)
     Scheduler.afterCall()
     Prim.keepAlive(name)
-    let returned = if code == 0 { Listed(Prim.loadPtr(out, 0)) } else { Failed(code, Prim.loadI64(out, 8)) }
+    let returned = if code == 0 { Listed(Ptr.load(out, 0)) } else { Failed(code, Ptr.load(out, 8)) }
     Libc.free(hints)
     Libc.free(out)
     returned
@@ -342,31 +344,31 @@ fun discard(resolver : Resolver, returned : Addrinfo) -> Unit = match returned {
 }
 
 -- The addresses on `list`, each once, in its order.
-fun addresses(list : Prim.Ptr) -> Array IP {
+fun addresses(list : Ptr) -> Array IP {
     let found : Vec IP = []
     var at = list
-    while !Prim.ptrIsNull(at) {
-        let family = Prim.charToInt(Prim.loadI32(at, Sys.addrinfoFamilyAt))
-        let sockaddr = Prim.loadPtr(at, Sys.addrinfoAddressAt())
-        let ip = if Prim.ptrIsNull(sockaddr) { None }
+    while !Ptr.isNull(at) {
+        let family = Ptr.load32(at, Sys.addrinfoFamilyAt)
+        let sockaddr : Ptr = Ptr.load(at, Sys.addrinfoAddressAt())
+        let ip = if Ptr.isNull(sockaddr) { None }
                  else if family == Sys.afInet { Some(V4(bigEndian(sockaddr, 4, 4))) }
                  else if family == Sys.afInet6() {
-                     let scope = Prim.charToInt(Prim.loadI32(sockaddr, 24)) & 0xFFFF_FFFF
+                     let scope = Ptr.load32(sockaddr, 24) & 0xFFFF_FFFF
                      Some(V6(bigEndian(sockaddr, 8, 8), bigEndian(sockaddr, 16, 8), scope))
                  } else { None }
         match ip {
             Some(ip) -> if !Vec.contains(found, ip) { Vec.push(found, ip) }
             None -> {}
         }
-        at = Prim.loadPtr(at, Sys.addrinfoNextAt)
+        at = Ptr.load(at, Sys.addrinfoNextAt)
     }
     Vec.toArray(found)
 }
 
-fun bigEndian(p : Prim.Ptr, at : Int, bytes : Int) -> Int {
+fun bigEndian(p : Ptr, at : Int, bytes : Int) -> Int {
     var n = 0
     for var k = 0; k < bytes; k = k + 1 {
-        n = (n << 8) | Prim.byteToInt(Prim.loadI8(p, at + k))
+        n = (n << 8) | Byte.toInt(Ptr.load(p, at + k))
     }
     n
 }

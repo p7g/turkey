@@ -1,0 +1,146 @@
+-- Streamed bodies: a `Stream`'s function writing through a `Sink` over the
+-- HTTP/1 body writer, with no sockets. What reaches the wire, and what each
+-- way of getting the length wrong fails with.
+
+import Net.HTTP (..)
+import Data.Error (cast, messageOf)
+import Net.HTTP.H1.Head (Framing(..), Persistence(..))
+import Net.HTTP.H1.Output as Output
+import Net.HTTP.H1.Output (OutgoingResponse(..))
+import Net.HTTP.Headers as Headers
+import Net.HTTP.Stream as Stream
+import System.IO as IO
+import System.IO (Write(..), IOError(..), ErrorKind(..))
+
+-- A connection that records what is written to it, and fails every write
+-- once `failAfter` writes have gone out.
+type Wire = Wire { pieces : Vec (Array Byte), failAfter : Int }
+
+fun wire() -> Wire = Wire { pieces = [], failAfter = Int.maxValue() }
+
+instance Write Wire {
+    type WriteError = IOError
+    fun writeFrom(w, from) {
+        if len(w.pieces) >= w.failAfter {
+            return Left(IOError { kind = BrokenPipe, op = "write", path = None })
+        }
+        Vec.push(w.pieces, IO.bytes(from))
+        Right(())
+    }
+    fun flush(w) = Right(())
+}
+
+fun written(w : Wire) -> String {
+    let all = []
+    for piece in w.pieces {
+        for b in piece { Vec.push(all, b) }
+    }
+    visible(String.fromBytesLossy(Vec.toArray(all)))
+}
+
+fun visible(s : String) -> String = String.replace(String.replace(s, "\r", "\\r"), "\n", "\\n")
+
+-- Returns what a sink failed with, named by the kind of error inside it.
+fun describe(e : SomeError) -> String {
+    if let Some(h) = cast(e) {
+        let http : HTTPError = h
+        return match http {
+            Transport(inner) -> "Transport(" + messageOf(inner) + ")"
+            other -> show(other)
+        }
+    }
+    if let Some(io) = cast(e) {
+        let IOError { kind, .. } = io
+        return "IOError " + show(kind)
+    }
+    messageOf(e)
+}
+
+-- An error of the program's own, as a stream's function returns one.
+type Gone = Gone
+
+instance Show Gone { fun show(g) = "Gone" }
+instance Error Gone { fun message(g) = "the feed went away" }
+
+-- Sends `s` as a 200 response over `out`, framed as an HTTP/1.1 response
+-- frames it, and prints what went out and how it ended.
+fun respond(label : String, s : Stream, out : Wire) -> Sink {
+    let framing = Stream.framing(Stream.length(s), Chunked)
+    let head = Output.responseHead(OutgoingResponse {
+        status = OK, headers = Headers.empty, framing, persistence = KeepAlive, upgrade = None,
+    })
+    let into = Stream.sink(Output.bodyWriter(out, head, framing), fail)
+    let outcome = match Stream.send(s, into) {
+        Right(_) -> "ok"
+        Left(e) -> describe(e)
+    }
+    print(label + ": " + outcome + ", " + show(len(out.pieces)) + " writes")
+    print("  " + written(out))
+    into
+}
+
+fun pieces(parts : Array String) -> fun(Sink) -> Either SomeError Unit = fun(sink) {
+    for part in parts { IO.writeText(sink, part)? }
+    Right(())
+}
+
+fun main() {
+    print("-- lengths")
+    print(show(LengthKnown(5)) + " " + show(LengthUnknown) + " " + show(LengthKnown(5) == LengthKnown(5)))
+    print(show(Stream.framing(LengthKnown(3), Chunked)) + " " + show(Stream.framing(LengthUnknown, Chunked))
+          + " " + show(Stream.framing(LengthUnknown, UntilClose)))
+
+    print("-- known length")
+    let _ = respond("exact", Stream(LengthKnown(11), pieces(["hello", " ", "world"])), wire())
+    let _ = respond("empty", Stream(LengthKnown(0), pieces([])), wire())
+    let _ = respond("past the length", Stream(LengthKnown(3), pieces(["hello"])), wire())
+    let _ = respond("short of the length", Stream(LengthKnown(10), pieces(["hello"])), wire())
+    -- A function that swallows its overrun still cannot finish the message.
+    let _ = respond("overrun ignored", Stream(LengthKnown(3), fun(sink) {
+        let _ = IO.writeText(sink, "hello")
+        Right(())
+    }), wire())
+
+    print("-- unknown length")
+    let _ = respond("chunked", Stream(LengthUnknown, pieces(["hello", " ", "world"])), wire())
+    let _ = respond("flushed", Stream(LengthUnknown, fun(sink) {
+        IO.writeText(sink, "data: 1\n\n")?
+        flush(sink)?
+        IO.writeText(sink, "data: 2\n\n")?
+        flush(sink)?
+        Right(())
+    }), wire())
+    let _ = respond("nothing written", Stream(LengthUnknown, pieces([])), wire())
+
+    print("-- the function fails")
+    let _ = respond("chunked, not ended", Stream(LengthUnknown, fun(sink) {
+        IO.writeText(sink, "partial")?
+        Left(fail(Gone))
+    }), wire())
+    let _ = respond("known, not ended", Stream(LengthKnown(10), fun(sink) {
+        IO.writeText(sink, "part")?
+        Left(fail(Gone))
+    }), wire())
+
+    print("-- the connection fails")
+    let broken = Wire { pieces = [], failAfter = 1 }
+    let _ = respond("after the first write", Stream(LengthUnknown, pieces(["one", "two"])), broken)
+
+    print("-- after the message ended")
+    let kept = []
+    let ended = respond("kept the sink", Stream(LengthUnknown, fun(sink) {
+        Vec.push(kept, sink)
+        IO.writeText(sink, "x")
+    }), wire())
+    for s in kept {
+        match IO.writeText(s, "late") {
+            Left(e) -> print("late write: " + describe(e))
+            Right(_) -> print("FAIL: a late write succeeded")
+        }
+        match flush(s) {
+            Left(e) -> print("late flush: " + describe(e))
+            Right(_) -> print("FAIL: a late flush succeeded")
+        }
+    }
+    let _ = ended
+}

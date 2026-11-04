@@ -2,7 +2,7 @@
 
 Every connection here is to a listener in the same program, on loopback, so
 nothing reaches the network. A name that must resolve to something chosen is
-given to `Turkey.Destination.resolve` with a resolver of the test's own, as
+given to `Turkey.ConnectPolicy.resolve` with a resolver of the test's own, as
 `tests/test_net.py` does for lookups.
 """
 
@@ -21,7 +21,7 @@ def internal(monkeypatch):
     own, and a resolver that answers what they say."""
     monkeypatch.setenv(bootc.INTERNAL_IMPORTS,
                        os.environ[bootc.INTERNAL_IMPORTS]
-                       + ",Turkey.Destination,Turkey.Resolve,Turkey.Socket,Turkey.Sys,"
+                       + ",Turkey.ConnectPolicy,Turkey.Resolve,Turkey.Socket,Turkey.Sys,"
                        + "Turkey.Workers,Turkey.IO,Turkey.Scheduler")
 
 
@@ -367,7 +367,7 @@ import Net
 import System.IO as IO
 import Time.Duration as Duration
 
-fun check(policy : Net.Policy, host : String) -> String =
+fun check(policy : Net.ConnectPolicy, host : String) -> String =
     match Net.resolve(host, 443, policy, Duration.seconds(5)) {
         Right(d) -> "allowed " + show(Net.addresses(d))
         Left(e) -> show(e.kind)
@@ -383,11 +383,11 @@ fun main() {
         print(host + " " + check(Net.publicInternet, host))
     }
     print(check(Net.anywhere, "127.0.0.1"))
-    let internal = Net.only([Net.Range(Net.V4(0x0a00_0000), 8)])
+    let internal = Net.only([Net.AddressRange(Net.V4(0x0a00_0000), 8)])
     print(check(internal, "10.1.2.3"))
     print(check(internal, "::ffff:10.1.2.3"))
     print(check(internal, "11.0.0.1"))
-    print(check(Net.only([Net.Name("[::1]")]), "::1"))
+    print(check(Net.only([Net.HostName("[::1]")]), "::1"))
     print(check(Net.only([]), "8.8.8.8"))
     match Net.resolve("127.0.0.1", 0, Net.anywhere, Duration.seconds(5)) {
         Right(_) -> print("port 0 allowed")
@@ -435,7 +435,7 @@ def test_public_internet_refuses_what_is_not_on_it(tmp_path):
 NAMES = """
 import Net
 import System.IO as IO
-import Turkey.Destination as Dest
+import Turkey.ConnectPolicy as ConnectPolicy
 import Turkey.IO as Calls
 import Turkey.Libc as Libc
 import Turkey.Ptr as Ptr
@@ -459,19 +459,19 @@ let fixed : Resolve.Resolver = Resolve.Resolver {
     freeaddrinfo = fun(list) = Libc.freeaddrinfo(list),
 }
 
-fun check(policy : Dest.Policy, host : String) -> String =
-    match Dest.resolve(fixed, host, 80, policy, -1) {
+fun check(policy : Net.ConnectPolicy, host : String) -> String =
+    match ConnectPolicy.resolve(fixed, host, 80, policy, -1) {
         Right(d) -> "allowed " + d.host + " " + show(d.addresses)
         Left(e) -> show(e)
     }
 
 fun main() {
-    let rule = Net.only([Net.Name("example.com")])
+    let rule = Net.only([Net.HostName("example.com")])
     print(check(rule, "Example.COM."))
     print(check(rule, "EXAMPLE.com"))
     print(check(rule, "example.com.."))
     print(check(rule, "example.org"))
-    print(check(Net.only([Net.Name("API.Example.com.")]), "api.example.com"))
+    print(check(Net.only([Net.HostName("API.Example.com.")]), "api.example.com"))
     print(check(Net.publicInternet, "Example.COM."))
     print(String.join(Vec.toArray(asked), ","))
 }
@@ -483,10 +483,10 @@ def test_a_name_rule_compares_names_normalised(tmp_path):
     assert _run(binary).splitlines() == [
         "allowed Example.COM. [127.0.0.1]",
         "allowed EXAMPLE.com [127.0.0.1]",
-        "resolve example.com..: every address refused by the destination policy",
-        "resolve example.org: every address refused by the destination policy",
+        "resolve example.com..: every address refused by the connect policy",
+        "resolve example.org: every address refused by the connect policy",
         "allowed api.example.com [127.0.0.1]",
-        "resolve Example.COM.: every address refused by the destination policy",
+        "resolve Example.COM.: every address refused by the connect policy",
         # Each lookup asks for the name as written.
         "Example.COM.,EXAMPLE.com,example.com..,example.org,api.example.com,Example.COM.",
     ]

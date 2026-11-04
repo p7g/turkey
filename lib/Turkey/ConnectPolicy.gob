@@ -1,11 +1,12 @@
 export (
-    Policy(..), Rule(..), publicInternet, only, anywhere, allows, normalise, unwrapped,
+    ConnectPolicy(..), ConnectRule(..), publicInternet, only, anywhere, allows, normalise,
+    unwrapped,
     Destination(..), resolve, limit,
 )
 
 -- Where a program may connect, and the checked addresses it connects to:
--- the machinery under `Net`'s `Policy`, `Destination` and `resolve`, whose
--- comment states the rules. `Net` exports the types without their
+-- the machinery under `Net`'s `ConnectPolicy`, `Destination` and `resolve`,
+-- whose comment states the rules. `Net` exports the types without their
 -- constructors, so a `Destination` is made only by `resolve`, and `Net.TCP`,
 -- which imports this module, reads its fields.
 --
@@ -24,53 +25,53 @@ import Turkey.Sys as Sys
 -- -- policies -------------------------------------------------------------------------
 
 -- `Only`'s names are kept normalised.
-type Policy = PublicInternet | Only(Array Rule) | Anywhere
+type ConnectPolicy = PublicInternet | Only(Array ConnectRule) | Anywhere
 
 -- What `only` allows: a host name, compared after normalising both sides; or
 -- the addresses whose first `bits` bits are those of `ip`.
-type Rule = Name(String) | Range(IP, Int)
+type ConnectRule = HostName(String) | AddressRange(IP, Int)
 
-let publicInternet : Policy = PublicInternet
+let publicInternet : ConnectPolicy = PublicInternet
 
-let anywhere : Policy = Anywhere
+let anywhere : ConnectPolicy = Anywhere
 
 -- A policy that allows exactly what `rules` name. A range whose prefix is
 -- longer than its address is a mistake in the program, and panics.
-fun only(rules : Array Rule) -> Policy {
+fun only(rules : Array ConnectRule) -> ConnectPolicy {
     for r in rules {
-        if let Range(ip, bits) = r {
+        if let AddressRange(ip, bits) = r {
             if bits < 0 || bits > width(ip) {
                 error("Net.only: a /" + show(bits) + " range of " + show(ip))
             }
         }
     }
     Only(Array.map(rules, fun(r) = match r {
-        Name(n) -> Name(normalise(n))
-        Range(ip, bits) -> Range(ip, bits)
+        HostName(n) -> HostName(normalise(n))
+        AddressRange(ip, bits) -> AddressRange(ip, bits)
     }))
 }
 
 -- Whether `policy` lets a program connect to `ip`, as an address that the
 -- host name `name` resolved to.
-fun allows(policy : Policy, name : String, ip : IP) -> Bool = match policy {
+fun allows(policy : ConnectPolicy, name : String, ip : IP) -> Bool = match policy {
     Anywhere -> True
     PublicInternet -> !refusedPublicly(unwrapped(ip))
     Only(rules) -> allowsName(rules, normalise(name)) || inRanges(rules, ip)
 }
 
-fun allowsName(rules : Array Rule, name : String) -> Bool {
+fun allowsName(rules : Array ConnectRule, name : String) -> Bool {
     for r in rules {
-        if let Name(n) = r { if n == name { return True } }
+        if let HostName(n) = r { if n == name { return True } }
     }
     False
 }
 
 -- A range matches the address as it is or unwrapped, so a range of IPv4
 -- addresses covers them written as IPv6 too.
-fun inRanges(rules : Array Rule, ip : IP) -> Bool {
+fun inRanges(rules : Array ConnectRule, ip : IP) -> Bool {
     let inner = unwrapped(ip)
     for r in rules {
-        if let Range(base, bits) = r {
+        if let AddressRange(base, bits) = r {
             if within(base, bits, ip) || within(base, bits, inner) { return True }
         }
     }
@@ -201,7 +202,7 @@ instance Show Destination {
 -- without limit when it is -1. The lookup is made without the brackets an
 -- IPv6 literal is written in, and otherwise as written, a trailing dot
 -- included.
-fun resolve(resolver : Resolver, host : String, port : Int, policy : Policy,
+fun resolve(resolver : Resolver, host : String, port : Int, policy : ConnectPolicy,
             deadline : Int) -> Either IOError Destination {
     if port < 1 || port > 65535 {
         return Left(IOError { kind = Errors.Other(Sys.einval), op = "resolve", path = Some(host) })

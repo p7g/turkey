@@ -1,0 +1,79 @@
+export (Source(..), source, oneByte, splitAt, sized, Sink, sink, written, writes, Rng, rng, next)
+
+-- In-memory streams for driving the codec without sockets: a source that
+-- hands its bytes out in whatever pieces a test chooses, and a sink that
+-- records each write.
+
+import System.IO as IO
+import System.IO (Read(..), Write(..), IOError)
+
+-- A source over `bytes`, handing out at most `sizes(k)` bytes on its `k`th
+-- read.
+type Source = Source { bytes : Array Byte, sizes : fun(Int) -> Int, var at : Int, var reads : Int }
+
+fun source(bytes : Array Byte, sizes : fun(Int) -> Int) -> Source =
+    Source { bytes, sizes, at = 0, reads = 0 }
+
+-- One byte per read: every CRLF, every chunk-size line and every field line
+-- arrives split.
+fun oneByte(bytes : Array Byte) -> Source = source(bytes, fun(_) = 1)
+
+-- The bytes before `cut` in the first read, the rest in the second.
+fun splitAt(bytes : Array Byte, cut : Int) -> Source =
+    source(bytes, fun(k) = if k == 0 { if cut > 0 { cut } else { 1 } } else { len(bytes) })
+
+-- Pieces of the sizes `pattern` gives, repeated.
+fun sized(bytes : Array Byte, pattern : Array Int) -> Source =
+    source(bytes, fun(k) = pattern[k % len(pattern)])
+
+instance Read Source {
+    type ReadError = IOError
+    fun readInto(s, into) {
+        let left = len(s.bytes) - s.at
+        var n = s.sizes(s.reads)
+        if n > left { n = left }
+        if n > IO.room(into) { n = IO.room(into) }
+        if n < 1 && left > 0 { n = 1 }
+        s.reads = s.reads + 1
+        IO.append(into, s.bytes, s.at, s.at + n)
+        s.at = s.at + n
+        Right(n)
+    }
+}
+
+-- A sink that keeps every write apart.
+type Sink = Sink { pieces : Vec (Array Byte) }
+
+fun sink() -> Sink = Sink { pieces = [] }
+
+instance Write Sink {
+    type WriteError = IOError
+    fun writeFrom(s, from) {
+        Vec.push(s.pieces, IO.bytes(from))
+        Right(())
+    }
+    fun flush(s) = Right(())
+}
+
+-- Returns everything written, as one string.
+fun written(s : Sink) -> String {
+    let all = []
+    for piece in s.pieces {
+        for b in piece { Vec.push(all, b) }
+    }
+    String.fromBytesLossy(Vec.toArray(all))
+}
+
+fun writes(s : Sink) -> Int = len(s.pieces)
+
+-- A 63-bit linear congruential generator, for the fuzz.
+type Rng = Rng { var state : Int }
+
+fun rng(seed : Int) -> Rng = Rng { state = seed }
+
+-- Returns a number from 0 to `bound` - 1.
+fun next(r : Rng, bound : Int) -> Int {
+    r.state = Int.and(Int.addWrapping(Int.mulWrapping(r.state, 6364136223846793005), 1442695040888963407),
+                      Int.maxValue())
+    Int.shr(r.state, 17) % bound
+}

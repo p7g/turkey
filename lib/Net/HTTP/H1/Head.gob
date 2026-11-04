@@ -1,0 +1,627 @@
+export (
+    RequestHead(..), ResponseHead(..), Framing(..), Persistence(..), Version(..),
+    parseRequest, parseResponse, fieldLine, isReservedName,
+)
+
+-- Stage 2 of the HTTP/1 head parser: one pass over a complete head, by hand,
+-- with the byte classes of `Net.HTTP.H1.Classes`. `Net.HTTP.H1.Input` is
+-- stage 1, which finds where the head ends.
+--
+-- **Strict, with no leniency to turn on.** Each rule below is one an HTTP
+-- implementation's CVE showed was needed:
+--
+-- * CRLF only, everywhere: a bare LF, or a CR without its LF, is refused.
+-- * No whitespace between a field name and its colon, and none before the
+--   first field (obs-fold).
+-- * Content-Length is `1*DIGIT`, fits an `Int`, and appears at most once.
+-- * Transfer-Encoding is a list of tokens ending in exactly `chunked`;
+--   nothing may follow `chunked`.
+-- * Content-Length beside Transfer-Encoding is refused, not resolved.
+-- * No control byte in a value: no NUL, no DEL, no CR or LF.
+-- * A body is never ignored: a request's framing is what its fields say,
+--   whatever its method.
+--
+-- **Checks run in a fixed order,** so a head that breaks two rules is always
+-- refused for the same one:
+--
+-- 1. The grammar, left to right. Any byte it cannot take is `Malformed`,
+--    except that a head with more than `fields` field lines is
+--    `HeadTooLarge` at the first line past the limit.
+-- 2. Then, on a head the grammar accepts: a first line over `lineBytes`
+--    (`LineTooLong`); a version other than 1.0 and 1.1
+--    (`UnsupportedVersion`); a target whose form the method does not allow
+--    (`Malformed`); the fields, one at a time, where a malformed or repeated
+--    Content-Length, a malformed Transfer-Encoding or one that continues
+--    after `chunked`, or a malformed Connection is `Malformed`; then a Host
+--    missing from 1.1, repeated or malformed (`Malformed`), a
+--    Transfer-Encoding that does not end in `chunked` (`Malformed`), a coding
+--    other than `chunked` (`UnknownCoding`), Content-Length beside
+--    Transfer-Encoding (`Malformed`), a Host that disagrees with the target
+--    (`Malformed`), and last an `Expect` other than `100-continue`
+--    (`UnmetExpectation`).
+--
+-- **Nothing is copied but names and the target.** Header values are views
+-- into the head's bytes, which stage 1 never writes again. A name is copied
+-- because it is stored lowercase.
+--
+-- **The reserved fields are taken out.** Content-Length, Transfer-Encoding,
+-- Host, Connection, Expect and Upgrade become the head's framing, target,
+-- persistence, expectation and upgrade; Keep-Alive, TE, Trailer and
+-- Proxy-Connection are dropped. None of them reaches `headers`, which holds
+-- only what a program could have written itself.
+
+import Net.HTTP.Error (Refusal(..))
+import Net.HTTP.H1.Classes (..)
+import Net.HTTP.HeaderValue (HeaderValue)
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.HTTPURL as HTTPURL
+import Net.HTTP.Limits as Limits (Limits)
+import Net.HTTP.Method as Method (Method(..))
+import Net.HTTP.Request (RequestTarget(..))
+import Net.HTTP.Status as Status (Status)
+import Turkey.HTTPField (HeaderName(..))
+import Turkey.HTTPField as Field
+
+-- How a message's body is delimited on the wire.
+--
+-- * `ContentLength(n)`: exactly `n` bytes follow the head.
+-- * `Chunked`: chunks follow, the last one empty, then trailers.
+-- * `UntilClose`: the body is everything until the connection closes. Only a
+--   response can be framed this way.
+-- * `NoBody`: nothing follows the head.
+type Framing = ContentLength(Int) | Chunked | UntilClose | NoBody
+
+instance Eq Framing {
+    fun eq(a, b) = match (a, b) {
+        (ContentLength(x), ContentLength(y)) -> x == y
+        (Chunked, Chunked) | (UntilClose, UntilClose) | (NoBody, NoBody) -> True
+        _ -> False
+    }
+}
+
+instance Show Framing {
+    fun show(f) = match f {
+        ContentLength(n) -> "ContentLength(" + show(n) + ")"
+        Chunked -> "Chunked"
+        UntilClose -> "UntilClose"
+        NoBody -> "NoBody"
+    }
+}
+
+-- Whether the connection may carry another message after this one.
+type Persistence = KeepAlive | Close
+
+instance Eq Persistence {
+    fun eq(a, b) = match (a, b) {
+        (KeepAlive, KeepAlive) | (Close, Close) -> True
+        _ -> False
+    }
+}
+
+instance Show Persistence {
+    fun show(p) = match p {
+        KeepAlive -> "KeepAlive"
+        Close -> "Close"
+    }
+}
+
+type Version = HTTP10 | HTTP11
+
+instance Show Version {
+    fun show(v) = match v {
+        HTTP10 -> "HTTP/1.0"
+        HTTP11 -> "HTTP/1.1"
+    }
+}
+
+-- A request head, read and checked.
+--
+-- `method` carries `()` where the method has a body, for the server to
+-- replace with the body itself (`map`). An extension method carries
+-- `Some(())` when the framing says a body follows. A method without a body
+-- slot, such as GET, may still have a body by its framing; it is never
+-- ignored, but drained or refused as an unread body is.
+--
+-- `target.authority` is the request's `Host`, or the authority of an
+-- absolute-form or CONNECT target, which `Host` must agree with. For CONNECT,
+-- `target.path` is empty.
+--
+-- `persistence` is `Close` for HTTP/1.0, and for `Connection: close`.
+-- `expectContinue` is whether an HTTP/1.1 client waits for `100 Continue`
+-- before it sends the body. `upgrade` is each `Upgrade` line's value, for
+-- the server to decide on.
+type RequestHead = RequestHead {
+    method : Method Unit,
+    target : RequestTarget,
+    headers : Headers,
+    version : Version,
+    framing : Framing,
+    persistence : Persistence,
+    expectContinue : Bool,
+    upgrade : Array HeaderValue,
+}
+
+-- A response head, read and checked, with the framing its request implies:
+-- no body for a response to HEAD, for 1xx, 204 and 304, and for a 2xx to
+-- CONNECT, whose connection becomes a tunnel; otherwise chunked, a length, or
+-- until the connection closes.
+type ResponseHead = ResponseHead {
+    status : Status,
+    headers : Headers,
+    version : Version,
+    framing : Framing,
+    persistence : Persistence,
+    upgrade : Array HeaderValue,
+}
+
+-- -- requests --------------------------------------------------------------------------
+
+-- Returns the request head `s[at..to)`, which ends in its empty line, or why
+-- it is refused, checking in the order the module comment gives.
+fun parseRequest(s : Array Byte, at : Int, to : Int, limits : Limits) -> Either Refusal RequestHead {
+    -- request-line = method SP request-target SP HTTP-version CRLF
+    let methodEnd = scan(tchar, s, at, to)
+    if methodEnd == at || !isByte(s, methodEnd, to, sp) { return Left(Malformed) }
+    let targetStart = methodEnd + 1
+    let targetEnd = scan(targetChar, s, targetStart, to)
+    if targetEnd == targetStart || !isByte(s, targetEnd, to, sp) { return Left(Malformed) }
+    let v = targetEnd + 1
+    if !isVersion(s, v, to) { return Left(Malformed) }
+    let major = Byte.toInt(s[v + 5]) - 48
+    let minor = Byte.toInt(s[v + 7]) - 48
+    let lineEnd = v + 10
+
+    let fields = Vec.new(64)
+    let end = fieldLines(s, lineEnd, to, Limits.fields(limits), fields)?
+    if end != to { return Left(Malformed) }
+
+    if lineEnd - at > Limits.lineBytes(limits) { return Left(LineTooLong) }
+    if major != 1 || minor > 1 { return Left(UnsupportedVersion) }
+    let form = match targetForm(s, at, methodEnd, targetStart, targetEnd) {
+        Refused -> return Left(Malformed)
+        allowed -> allowed
+    }
+
+    let f = classify(s, fields)?
+    if f.hosts > 1 || (minor == 1 && f.hosts == 0) { return Left(Malformed) }
+    if f.hosts == 1 && !isHost(s, f.hostFrom, f.hostTo) { return Left(Malformed) }
+    if f.coded && !f.chunked { return Left(Malformed) }
+    if f.other { return Left(UnknownCoding) }
+    if f.coded && Option.isSome(f.length) { return Left(Malformed) }
+    let framing = if f.coded {
+        Chunked
+    } else {
+        match f.length {
+            Some(n) -> ContentLength(n)
+            None -> NoBody
+        }
+    }
+    let target = requestTarget(s, form, targetStart, targetEnd, f)?
+    let expectContinue = match f.expect {
+        NoExpectation -> False
+        ContinueExpected -> minor == 1
+        OtherExpected -> return Left(UnmetExpectation)
+    }
+
+    Right(RequestHead {
+        method = method(s, at, methodEnd, framing),
+        target,
+        headers = f.headers,
+        version = if minor == 0 { HTTP10 } else { HTTP11 },
+        framing,
+        persistence = if minor == 0 || f.close { Close } else { KeepAlive },
+        expectContinue,
+        upgrade = f.upgrade,
+    })
+}
+
+-- The four forms of RFC 9112 §3.2, as the method allows them.
+type Form = OriginForm | AbsoluteForm | AuthorityForm | AsteriskForm | Refused
+
+-- Returns the target's form, or `Refused` where the method does not allow
+-- it: asterisk-form only with OPTIONS, authority-form exactly with CONNECT,
+-- otherwise origin-form or absolute-form.
+fun targetForm(s : Array Byte, at : Int, methodEnd : Int, from : Int, to : Int) -> Form {
+    if Byte.toInt(s[from]) == star {
+        return if to - from == 1 && isMethod(s, at, methodEnd, optionsName) { AsteriskForm } else { Refused }
+    }
+    if isMethod(s, at, methodEnd, connectName) {
+        return if isAuthority(s, from, to) { AuthorityForm } else { Refused }
+    }
+    if Byte.toInt(s[from]) == slash { return OriginForm }
+    -- absolute-form: scheme ":" and the rest, scheme = ALPHA *schemeChar
+    if !alpha[Byte.toInt(s[from])] { return Refused }
+    let q = scan(schemeChar, s, from + 1, to)
+    if q < to && Byte.toInt(s[q]) == colon { AbsoluteForm } else { Refused }
+}
+
+-- authority-form = host ":" port, host = "[" IP literal "]" / reg-name,
+-- port = 1*DIGIT.
+fun isAuthority(s : Array Byte, from : Int, to : Int) -> Bool {
+    let q = hostEnd(s, from, to)
+    if q == from || q >= to || Byte.toInt(s[q]) != colon { return False }
+    let port = scan(digit, s, q + 1, to)
+    port > q + 1 && port == to
+}
+
+-- Host = uri-host [ ":" port ] (RFC 9110 §7.2), or empty, which a request
+-- whose target has no authority sends.
+fun isHost(s : Array Byte, from : Int, to : Int) -> Bool {
+    if from == to { return True }
+    let q = hostEnd(s, from, to)
+    if q == from { return False }
+    if q == to { return True }
+    if Byte.toInt(s[q]) != colon { return False }
+    let port = scan(digit, s, q + 1, to)
+    port > q + 1 && port == to
+}
+
+-- Returns where the host at `from` ends: after an IP literal's closing
+-- bracket, or after a reg-name. `from` if there is none.
+fun hostEnd(s : Array Byte, from : Int, to : Int) -> Int {
+    if from < to && Byte.toInt(s[from]) == openBracket {
+        let q = scan(ipv6Char, s, from + 1, to)
+        if q == from + 1 || !isByte(s, q, to, closeBracket) { return from }
+        return q + 1
+    }
+    scan(regNameChar, s, from, to)
+}
+
+-- Returns the target, with its authority from `Host` or from the target
+-- itself, which `Host` must then agree with.
+fun requestTarget(s : Array Byte, form : Form, from : Int, to : Int, f : Fields) -> Either Refusal RequestTarget {
+    let host = if f.hosts == 1 && f.hostFrom < f.hostTo { Some(lowerText(s, f.hostFrom, f.hostTo)) } else { None }
+    match form {
+        OriginForm -> {
+            let q = scan(notQuestion, s, from, to)
+            let query = if q < to { Some(ascii(s, q + 1, to)) } else { None }
+            Right(RequestTarget { authority = host, path = ascii(s, from, q), query })
+        }
+        AsteriskForm -> Right(RequestTarget { authority = host, path = "*", query = None })
+        AuthorityForm -> {
+            let authority = lowerText(s, from, to)
+            if f.hosts == 1 && !sameAuthority(host, authority, 80) { return Left(Malformed) }
+            Right(RequestTarget { authority = Some(authority), path = "", query = None })
+        }
+        AbsoluteForm -> {
+            let url = match HTTPURL.parse(ascii(s, from, to)) {
+                Right(u) -> u
+                Left(_) -> return Left(Malformed)
+            }
+            let authority = HTTPURL.authority(url)
+            let defaultPort = if HTTPURL.isHTTPS(url) { 443 } else { 80 }
+            if f.hosts == 1 && !sameAuthority(host, authority, defaultPort) { return Left(Malformed) }
+            Right(RequestTarget { authority = Some(authority), path = HTTPURL.path(url),
+                                  query = HTTPURL.query(url) })
+        }
+        Refused -> Left(Malformed)
+    }
+}
+
+let notQuestion = Array.init(256, fun(b) = b != question)
+
+-- Whether the `Host` field `host`, lowercase, names `authority`: the same host
+-- and the same port, where a missing port is `defaultPort`.
+fun sameAuthority(host : Option String, authority : String, defaultPort : Int) -> Bool = match host {
+    None -> False
+    Some(h) -> {
+        let (hName, hPort) = splitPort(h, defaultPort)
+        let (aName, aPort) = splitPort(authority, defaultPort)
+        hName == aName && hPort == aPort
+    }
+}
+
+-- Returns `authority`'s host and port, the port `defaultPort` if it has none.
+-- `authority` is a host and an optional port that `isHost` accepted.
+fun splitPort(authority : String, defaultPort : Int) -> (String, Int) {
+    let bytes = String.toBytes(authority)
+    let q = hostEnd(bytes, 0, len(bytes))
+    if q == len(bytes) { return (authority, defaultPort) }
+    let port = Option.unwrapOr(Int.parse(ascii(bytes, q + 1, len(bytes))), -1)
+    (ascii(bytes, 0, q), port)
+}
+
+-- Returns the method `s[at..to)` names, carrying `()` where it has a body.
+fun method(s : Array Byte, at : Int, to : Int, framing : Framing) -> Method Unit {
+    for (bytes, m) in methods {
+        if isMethod(s, at, to, bytes) { return m }
+    }
+    let name = Option.expect(Method.extension(ascii(s, at, to)), "a token that is no standard method")
+    Extension(name, if framing == NoBody { None } else { Some(()) })
+}
+
+let methods : Array (Array Byte, Method Unit) = [
+    (String.toBytes("GET"), GET), (String.toBytes("POST"), POST(())), (String.toBytes("HEAD"), HEAD),
+    (String.toBytes("PUT"), PUT(())), (String.toBytes("DELETE"), DELETE),
+    (String.toBytes("OPTIONS"), OPTIONS), (String.toBytes("PATCH"), PATCH(())),
+    (String.toBytes("CONNECT"), CONNECT), (String.toBytes("TRACE"), TRACE),
+]
+
+-- Returns whether `s[from..to)` is exactly `m`. Methods are case-sensitive,
+-- RFC 9110 §9.1.
+fun isMethod(s : Array Byte, from : Int, to : Int, m : Array Byte) -> Bool {
+    if to - from != len(m) { return False }
+    for var i = 0; i < len(m); i = i + 1 {
+        if s[from + i] != m[i] { return False }
+    }
+    True
+}
+
+let optionsName = String.toBytes("OPTIONS")
+let connectName = String.toBytes("CONNECT")
+
+-- HTTP-version = "HTTP/" DIGIT "." DIGIT, then CRLF.
+fun isVersion(s : Array Byte, v : Int, to : Int) -> Bool {
+    if v + 10 > to { return False }
+    for var i = 0; i < 5; i = i + 1 {
+        if s[v + i] != httpName[i] { return False }
+    }
+    digit[Byte.toInt(s[v + 5])] && isByte(s, v + 6, to, dot) && digit[Byte.toInt(s[v + 7])]
+        && isCrlf(s, v + 8, to)
+}
+
+let httpName = String.toBytes("HTTP/")
+
+-- -- responses -------------------------------------------------------------------------
+
+-- Returns the response head `s[at..to)` to a request with method `request`,
+-- or why it is refused: the request head's checks, in the same order, where
+-- they apply to a response.
+fun parseResponse(s : Array Byte, at : Int, to : Int, limits : Limits, request : Method b)
+        -> Either Refusal ResponseHead {
+    -- status-line = HTTP-version SP status-code SP [ reason-phrase ] CRLF.
+    -- A status line with no reason and no SP before the CRLF is accepted
+    -- too: some servers send one, and the reason is never read.
+    if at + 12 > to { return Left(Malformed) }
+    for var i = 0; i < 5; i = i + 1 {
+        if s[at + i] != httpName[i] { return Left(Malformed) }
+    }
+    if !digit[Byte.toInt(s[at + 5])] || !isByte(s, at + 6, to, dot) || !digit[Byte.toInt(s[at + 7])]
+        || !isByte(s, at + 8, to, sp) {
+        return Left(Malformed)
+    }
+    let major = Byte.toInt(s[at + 5]) - 48
+    let minor = Byte.toInt(s[at + 7]) - 48
+    let c = at + 9
+    if !digit[Byte.toInt(s[c])] || !digit[Byte.toInt(s[c + 1])] || !digit[Byte.toInt(s[c + 2])] {
+        return Left(Malformed)
+    }
+    let code = 100 * (Byte.toInt(s[c]) - 48) + 10 * (Byte.toInt(s[c + 1]) - 48) + (Byte.toInt(s[c + 2]) - 48)
+    var lineEnd = c + 3
+    if isByte(s, lineEnd, to, sp) {
+        lineEnd = scan(reasonChar, s, lineEnd + 1, to)
+    }
+    if !isCrlf(s, lineEnd, to) { return Left(Malformed) }
+    lineEnd = lineEnd + 2
+
+    let fields = Vec.new(64)
+    let end = fieldLines(s, lineEnd, to, Limits.fields(limits), fields)?
+    if end != to { return Left(Malformed) }
+
+    if lineEnd - at > Limits.lineBytes(limits) { return Left(LineTooLong) }
+    if major != 1 || minor > 1 { return Left(UnsupportedVersion) }
+    if code < 100 || code > 599 { return Left(Malformed) }
+    let status = Option.expect(Status.fromCode(code), "a code from 100 to 599")
+
+    let f = classify(s, fields)?
+    if f.coded && !f.chunked { return Left(Malformed) }
+    if f.other { return Left(UnknownCoding) }
+    if f.coded && Option.isSome(f.length) { return Left(Malformed) }
+    let toRequest = match request {
+        HEAD -> True
+        CONNECT -> code / 100 == 2
+        _ -> False
+    }
+    let bodiless = toRequest || code / 100 == 1 || code == 204 || code == 304
+    let framing = if bodiless {
+        NoBody
+    } else if f.coded {
+        Chunked
+    } else {
+        match f.length {
+            Some(n) -> ContentLength(n)
+            None -> UntilClose
+        }
+    }
+    let persistent = !f.close && (minor == 1 || f.keepAlive) && framing != UntilClose
+    Right(ResponseHead {
+        status,
+        headers = f.headers,
+        version = if minor == 0 { HTTP10 } else { HTTP11 },
+        framing,
+        persistence = if persistent { KeepAlive } else { Close },
+        upgrade = f.upgrade,
+    })
+}
+
+-- -- fields ----------------------------------------------------------------------------
+
+-- Reads `*( field-line CRLF ) CRLF` from `p`, pushing four offsets per line
+-- into `fields`: name start, name end, value start, value end. Returns where
+-- the empty line ends. More than `limit` lines is `HeadTooLarge`.
+fun fieldLines(s : Array Byte, at : Int, to : Int, limit : Int, fields : Vec Int) -> Either Refusal Int {
+    var p = at
+    loop {
+        if isCrlf(s, p, to) { return Right(p + 2) }
+        if len(fields) == 4 * limit { return Left(HeadTooLarge) }
+        p = fieldLine(s, p, to, fields)
+        if p < 0 { return Left(Malformed) }
+    }
+}
+
+-- Reads one `field-line CRLF` at `p`, pushing its four offsets into `fields`,
+-- and returns where it ends, or -1 if it is malformed.
+--
+-- field-line = field-name ":" OWS field-value OWS
+fun fieldLine(s : Array Byte, p : Int, to : Int, fields : Vec Int) -> Int {
+    let nameEnd = scan(tchar, s, p, to)
+    if nameEnd == p || !isByte(s, nameEnd, to, colon) { return -1 }
+    let valueStart = scan(ows, s, nameEnd + 1, to)
+    -- Take every byte a value or its trailing OWS may hold, then give the
+    -- trailing OWS back: field-value never ends in whitespace.
+    let runEnd = scan(fieldChar, s, valueStart, to)
+    var valueEnd = runEnd
+    while valueEnd > valueStart && ows[Byte.toInt(s[valueEnd - 1])] {
+        valueEnd = valueEnd - 1
+    }
+    if !isCrlf(s, runEnd, to) { return -1 }
+    Vec.push(fields, p)
+    Vec.push(fields, nameEnd)
+    Vec.push(fields, valueStart)
+    Vec.push(fields, valueEnd)
+    runEnd + 2
+}
+
+-- What the fields of a head say, once read.
+type Fields = Fields {
+    headers : Headers,
+    hosts : Int,
+    hostFrom : Int,
+    hostTo : Int,
+    length : Option Int,
+    coded : Bool,       -- Transfer-Encoding is present
+    chunked : Bool,     -- and ends in `chunked`
+    other : Bool,       -- and holds another coding
+    close : Bool,       -- Connection holds `close`
+    keepAlive : Bool,   -- Connection holds `keep-alive`
+    expect : Expectation,
+    upgrade : Array HeaderValue,
+}
+
+type Expectation = NoExpectation | ContinueExpected | OtherExpected
+
+-- The fields the codec reads, or drops, rather than handing on.
+type Kind =
+    HostField | LengthField | CodingField | ConnectionField | ExpectField | UpgradeField
+    | DroppedField | OtherField
+
+-- Reads the fields at the offsets in `fields`, one at a time, refusing the
+-- first malformed or repeated framing field.
+fun classify(s : Array Byte, fields : Vec Int) -> Either Refusal Fields {
+    let kept = []
+    let upgrade = []
+    var hosts = 0
+    var hostFrom = 0
+    var hostTo = 0
+    var length = None
+    var coded = False
+    var chunked = False
+    var other = False
+    var close = False
+    var keepAlive = False
+    var expect = NoExpectation
+    for var i = 0; i < len(fields); i = i + 4 {
+        let from = fields[i + 2]
+        let to = fields[i + 3]
+        match kindOf(s, fields[i], fields[i + 1]) {
+            HostField -> {
+                hosts = hosts + 1
+                hostFrom = from
+                hostTo = to
+            }
+            LengthField -> {
+                if Option.isSome(length) { return Left(Malformed) }
+                match contentLength(s, from, to) {
+                    Some(n) -> { length = Some(n) }
+                    None -> return Left(Malformed)
+                }
+            }
+            -- Transfer-Encoding = token *( OWS "," OWS token ), over every
+            -- such line in order; nothing may follow `chunked`.
+            CodingField -> {
+                coded = True
+                var q = from
+                loop {
+                    let e = scan(tchar, s, q, to)
+                    if e == q || chunked { return Left(Malformed) }
+                    if sameText(s, q, e, chunkedName) { chunked = True } else { other = True }
+                    if e == to { break }
+                    q = scan(ows, s, e, to)
+                    if !isByte(s, q, to, comma) { return Left(Malformed) }
+                    q = scan(ows, s, q + 1, to)
+                }
+            }
+            -- Connection = 1#connection-option, each a token.
+            ConnectionField -> {
+                var q = from
+                loop {
+                    let e = scan(tchar, s, q, to)
+                    if e == q { return Left(Malformed) }
+                    if sameText(s, q, e, closeName) { close = True }
+                    if sameText(s, q, e, keepAliveName) { keepAlive = True }
+                    if e == to { break }
+                    q = scan(ows, s, e, to)
+                    if !isByte(s, q, to, comma) { return Left(Malformed) }
+                    q = scan(ows, s, q + 1, to)
+                }
+            }
+            ExpectField -> {
+                let continued = match expect {
+                    NoExpectation -> sameText(s, from, to, continueName)
+                    _ -> False
+                }
+                expect = if continued { ContinueExpected } else { OtherExpected }
+            }
+            UpgradeField -> Vec.push(upgrade, Field.view(s, from, to))
+            DroppedField -> {}
+            OtherField -> Vec.push(kept, (HeaderName(lowerText(s, fields[i], fields[i + 1])), Field.view(s, from, to)))
+        }
+    }
+    Right(Fields {
+        headers = Headers.fromFields(Vec.toArray(kept)),
+        hosts, hostFrom, hostTo, length, coded, chunked, other, close, keepAlive, expect,
+        upgrade = Vec.toArray(upgrade),
+    })
+}
+
+-- Returns the kind of the field named by `s[from..to)`, ignoring ASCII case.
+fun kindOf(s : Array Byte, from : Int, to : Int) -> Kind = match to - from {
+    2 -> if sameText(s, from, to, teName) { DroppedField } else { OtherField }
+    4 -> if sameText(s, from, to, hostName) { HostField } else { OtherField }
+    6 -> if sameText(s, from, to, expectName) { ExpectField } else { OtherField }
+    7 -> if sameText(s, from, to, upgradeName) { UpgradeField }
+         else if sameText(s, from, to, trailerName) { DroppedField }
+         else { OtherField }
+    10 -> if sameText(s, from, to, connectionName) { ConnectionField }
+          else if sameText(s, from, to, keepAliveName) { DroppedField }
+          else { OtherField }
+    14 -> if sameText(s, from, to, contentLengthName) { LengthField } else { OtherField }
+    16 -> if sameText(s, from, to, proxyConnectionName) { DroppedField } else { OtherField }
+    17 -> if sameText(s, from, to, transferEncodingName) { CodingField } else { OtherField }
+    _ -> OtherField
+}
+
+-- Whether `s[from..to)` is a reserved field name, in any case: one a trailer
+-- may not hold either.
+fun isReservedName(s : Array Byte, from : Int, to : Int) -> Bool = match kindOf(s, from, to) {
+    OtherField -> False
+    _ -> True
+}
+
+let hostName = String.toBytes("host")
+let contentLengthName = String.toBytes("content-length")
+let transferEncodingName = String.toBytes("transfer-encoding")
+let connectionName = String.toBytes("connection")
+let keepAliveName = String.toBytes("keep-alive")
+let expectName = String.toBytes("expect")
+let upgradeName = String.toBytes("upgrade")
+let teName = String.toBytes("te")
+let trailerName = String.toBytes("trailer")
+let proxyConnectionName = String.toBytes("proxy-connection")
+let chunkedName = String.toBytes("chunked")
+let closeName = String.toBytes("close")
+let continueName = String.toBytes("100-continue")
+
+-- Content-Length = 1*DIGIT, and the number must fit in an `Int`.
+fun contentLength(s : Array Byte, from : Int, to : Int) -> Option Int {
+    if from == to { return None }
+    var n = 0
+    for var i = from; i < to; i = i + 1 {
+        let b = Byte.toInt(s[i])
+        if !digit[b] { return None }
+        let d = b - 48
+        if n > (Int.maxValue() - d) / 10 { return None }
+        n = n * 10 + d
+    }
+    Some(n)
+}

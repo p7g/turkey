@@ -1,0 +1,321 @@
+export (Head(..), Framing(..), parse)
+
+-- The strict reading the codec is fuzzed against: the request-head parser of
+-- the prototype that settled stage 2's design, with its byte classes and the
+-- order of its checks. The codec enforces more than this -- the reserved
+-- fields beyond framing, the Host field's syntax and its agreement with the
+-- target -- so where this refuses a head the codec must refuse it too, and
+-- where both accept one they must agree on its framing.
+
+-- `parse` takes `(bytes, at)` and returns `Left(status)` or `Right(head)`,
+-- checking in this order:
+--
+-- 1. The grammar, left to right. Any byte it cannot take is 400, except that
+--    a head with more than `fieldLimit` field lines is 431 at the first line
+--    past the limit.
+-- 2. Then, on a head the grammar accepts, in this order: a request line
+--    longer than `lineLimit` (414); a version other than 1.0 and 1.1 (505); a
+--    target whose form the method does not allow (400); the fields, one at a
+--    time, where a malformed or repeated Content-Length or a malformed
+--    Transfer-Encoding or one that continues after `chunked` is 400; then
+--    Host missing from 1.1 or repeated (400), a Transfer-Encoding that does
+--    not end in `chunked` (400), a coding other than `chunked` (501), and
+--    Content-Length beside Transfer-Encoding (400).
+
+-- A parsed head, as offsets into the bytes it was parsed from.
+type Head = Head {
+    start : Int,          -- where the method starts
+    methodEnd : Int,
+    targetStart : Int,
+    targetEnd : Int,
+    minor : Int,          -- the version is HTTP/1.minor
+    -- Four offsets per field line: name start, name end, value start, value
+    -- end. The value excludes the whitespace around it.
+    fields : Vec Int,
+    var framing : Framing,
+    end : Int,            -- one past the empty line's LF
+}
+
+type Framing = NoBody | Length(Int) | Chunked
+
+let badRequest = 400
+let uriTooLong = 414
+let fieldsTooLarge = 431
+let notImplemented = 501
+let versionNotSupported = 505
+
+-- The longest request line accepted, CRLF included.
+let lineLimit = 8192
+
+-- The most field lines accepted.
+let fieldLimit = 100
+
+let sp = 32
+let htab = 9
+let cr = 13
+let lf = 10
+let colon = 58
+let comma = 44
+let slash = 47
+let star = 42
+let dot = 46
+let openBracket = 91
+let closeBracket = 93
+
+fun table(member : fun(Int) -> Bool) -> Array Bool = Array.init(256, member)
+
+fun among(chars : String, b : Int) -> Bool =
+    Array.contains(String.toBytes(chars), Byte.truncate(b))
+
+fun isDigit(b : Int) -> Bool = b >= 48 && b <= 57
+fun isAlpha(b : Int) -> Bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+fun isHex(b : Int) -> Bool = isDigit(b) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+
+-- tchar, RFC 9110 §5.6.2.
+let tchar = table(fun(b) = isDigit(b) || isAlpha(b) || among("!#$%&'*+-.^_`|~", b))
+
+-- The bytes a request target may hold: visible ASCII, except "#", since a
+-- fragment is never sent. RFC 3986 allows fewer, but clients send "{", "}",
+-- "|" and the like unencoded, and the form checks after the grammar are what
+-- framing depends on.
+let targetChar = table(fun(b) = b >= 0x21 && b <= 0x7E && b != 35)
+
+-- field-vchar, RFC 9110 §5.5: VCHAR or obs-text. Never a control byte, so
+-- never CR, LF or NUL.
+let fieldVchar = table(fun(b) = (b >= 0x21 && b <= 0x7E) || b >= 0x80)
+
+-- A byte of field-value or of the whitespace beside it.
+let fieldChar = table(fun(b) = (b >= 0x21 && b <= 0x7E) || b >= 0x80 || b == sp || b == htab)
+
+-- OWS, RFC 9110 §5.6.3: SP and HTAB, nothing else.
+let ows = table(fun(b) = b == sp || b == htab)
+
+let digit = table(isDigit)
+let alpha = table(isAlpha)
+
+-- RFC 3986 §3.1: the bytes after a scheme's first letter.
+let schemeChar = table(fun(b) = isDigit(b) || isAlpha(b) || among("+-.", b))
+
+-- RFC 3986 §3.2.2: reg-name, unreserved / pct-encoded / sub-delims.
+let regNameChar = table(fun(b) = isDigit(b) || isAlpha(b) || among("-._~!$&'()*+,;=%", b))
+
+-- The bytes inside an IP literal's brackets.
+let ipv6Char = table(fun(b) = isHex(b) || b == colon || b == dot)
+
+-- The fields the checks after the grammar look at.
+type Kind = Host | ContentLength | TransferEncoding | Other
+
+-- Returns the kind of the field named by `s[from..to)`, ignoring ASCII case.
+fun kindOf(s : Array Byte, from : Int, to : Int) -> Kind = match to - from {
+    4 -> if sameText(s, from, hostName) { Host } else { Other }
+    14 -> if sameText(s, from, contentLengthName) { ContentLength } else { Other }
+    17 -> if sameText(s, from, transferEncodingName) { TransferEncoding } else { Other }
+    _ -> Other
+}
+
+-- Returns whether `s[from..to)` is the coding `chunked`, ignoring ASCII case.
+fun isChunked(s : Array Byte, from : Int, to : Int) -> Bool =
+    to - from == len(chunkedName) && sameText(s, from, chunkedName)
+
+-- Returns whether `s[from..to)` is exactly `method`. Methods are
+-- case-sensitive, RFC 9110 §9.1.
+fun isMethod(s : Array Byte, from : Int, to : Int, m : Array Byte) -> Bool {
+    if to - from != len(m) { return False }
+    for var i = 0; i < len(m); i = i + 1 {
+        if s[from + i] != m[i] { return False }
+    }
+    True
+}
+
+let hostName = String.toBytes("host")
+let contentLengthName = String.toBytes("content-length")
+let transferEncodingName = String.toBytes("transfer-encoding")
+let chunkedName = String.toBytes("chunked")
+let optionsMethod = String.toBytes("OPTIONS")
+let connectMethod = String.toBytes("CONNECT")
+
+-- Returns whether the bytes at `from` are `want`, where `want` is lowercase
+-- ASCII and the bytes may be in either case. The caller has checked that
+-- there are enough of them.
+fun sameText(s : Array Byte, from : Int, want : Array Byte) -> Bool {
+    for var i = 0; i < len(want); i = i + 1 {
+        let b = Byte.toInt(s[from + i])
+        let folded = if b >= 65 && b <= 90 { b + 32 } else { b }
+        if folded != Byte.toInt(want[i]) { return False }
+    }
+    True
+}
+
+
+-- -- the parser ----------------------------------------------------------------------
+
+-- Returns the request head at `at` in `s`, or the status to refuse it with,
+-- checking in the order above.
+fun parse(s : Array Byte, at : Int) -> Either Int Head {
+    -- request-line = method SP request-target SP HTTP-version CRLF
+    let methodEnd = scan(tchar, s, at)
+    if methodEnd == at || !isByte(s, methodEnd, sp) { return Left(badRequest) }
+    let targetStart = methodEnd + 1
+    let targetEnd = scan(targetChar, s, targetStart)
+    if targetEnd == targetStart || !isByte(s, targetEnd, sp) { return Left(badRequest) }
+    let v = targetEnd + 1
+    if !isVersion(s, v) { return Left(badRequest) }
+    let major = Byte.toInt(s[v + 5]) - 48
+    let minor = Byte.toInt(s[v + 7]) - 48
+    let lineEnd = v + 10
+
+    -- *( field-line CRLF ) CRLF, where
+    -- field-line = field-name ":" OWS field-value OWS
+    let fields = Vec.new(64)
+    var p = lineEnd
+    loop {
+        if isCrlf(s, p) {
+            p = p + 2
+            break
+        }
+        if len(fields) == 4 * fieldLimit { return Left(fieldsTooLarge) }
+        let nameEnd = scan(tchar, s, p)
+        if nameEnd == p || !isByte(s, nameEnd, colon) { return Left(badRequest) }
+        let valueStart = scan(ows, s, nameEnd + 1)
+        -- Take every byte a value or its trailing OWS may hold, then give the
+        -- trailing OWS back: field-value never ends in whitespace.
+        let runEnd = scan(fieldChar, s, valueStart)
+        var valueEnd = runEnd
+        while valueEnd > valueStart && ows[Byte.toInt(s[valueEnd - 1])] {
+            valueEnd = valueEnd - 1
+        }
+        if !isCrlf(s, runEnd) { return Left(badRequest) }
+        Vec.push(fields, p)
+        Vec.push(fields, nameEnd)
+        Vec.push(fields, valueStart)
+        Vec.push(fields, valueEnd)
+        p = runEnd + 2
+    }
+
+    if lineEnd - at > lineLimit { return Left(uriTooLong) }
+    if major != 1 || minor > 1 { return Left(versionNotSupported) }
+    if !targetAllowed(s, at, methodEnd, targetStart, targetEnd) { return Left(badRequest) }
+
+    var hosts = 0
+    var length = None
+    var coded = False
+    var chunked = False
+    var other = False
+    for var i = 0; i < len(fields); i = i + 4 {
+        let from = fields[i + 2]
+        let to = fields[i + 3]
+        match kindOf(s, fields[i], fields[i + 1]) {
+            Host -> { hosts = hosts + 1 }
+            ContentLength -> {
+                if Option.isSome(length) { return Left(badRequest) }
+                match contentLength(s, from, to) {
+                    Some(n) -> { length = Some(n) }
+                    None -> return Left(badRequest)
+                }
+            }
+            -- Transfer-Encoding = token *( OWS "," OWS token ), over every
+            -- such line in order; nothing may follow `chunked`.
+            TransferEncoding -> {
+                coded = True
+                var q = from
+                loop {
+                    let e = scan(tchar, s, q)
+                    if e == q || chunked { return Left(badRequest) }
+                    if isChunked(s, q, e) { chunked = True } else { other = True }
+                    if e == to { break }
+                    q = scan(ows, s, e)
+                    if !isByte(s, q, comma) { return Left(badRequest) }
+                    q = scan(ows, s, q + 1)
+                }
+            }
+            Other -> {}
+        }
+    }
+    if hosts > 1 || (minor == 1 && hosts == 0) { return Left(badRequest) }
+    if coded && !chunked { return Left(badRequest) }
+    if other { return Left(notImplemented) }
+    if coded && Option.isSome(length) { return Left(badRequest) }
+
+    let framing = if coded {
+        Chunked
+    } else {
+        match length {
+            Some(n) -> Length(n)
+            None -> NoBody
+        }
+    }
+    Right(Head {
+        start = at, methodEnd = methodEnd, targetStart = targetStart, targetEnd = targetEnd,
+        minor = minor, fields = fields, framing = framing, end = p,
+    })
+}
+
+-- Returns the first index from `p` whose byte is not in `table`, or the
+-- length of `s`.
+fun scan(table : Array Bool, s : Array Byte, p : Int) -> Int {
+    var q = p
+    while q < len(s) && table[Byte.toInt(s[q])] { q = q + 1 }
+    q
+}
+
+fun isByte(s : Array Byte, i : Int, b : Int) -> Bool = i < len(s) && Byte.toInt(s[i]) == b
+
+fun isCrlf(s : Array Byte, i : Int) -> Bool = isByte(s, i, cr) && isByte(s, i + 1, lf)
+
+-- HTTP-version = "HTTP/" DIGIT "." DIGIT, then CRLF.
+fun isVersion(s : Array Byte, v : Int) -> Bool {
+    if v + 10 > len(s) { return False }
+    for var i = 0; i < 5; i = i + 1 {
+        if s[v + i] != httpName[i] { return False }
+    }
+    digit[Byte.toInt(s[v + 5])] && isByte(s, v + 6, dot) && digit[Byte.toInt(s[v + 7])]
+        && isCrlf(s, v + 8)
+}
+
+let httpName = String.toBytes("HTTP/")
+
+-- Content-Length = 1*DIGIT, and the number must fit in an `Int`.
+fun contentLength(s : Array Byte, from : Int, to : Int) -> Option Int {
+    if from == to { return None }
+    var n = 0
+    for var i = from; i < to; i = i + 1 {
+        let b = Byte.toInt(s[i])
+        if !digit[b] { return None }
+        let d = b - 48
+        if n > (Int.maxValue() - d) / 10 { return None }
+        n = n * 10 + d
+    }
+    Some(n)
+}
+
+-- Returns whether the method allows the target's form, RFC 9112 §3.2:
+-- asterisk-form only with OPTIONS, authority-form exactly with CONNECT,
+-- otherwise origin-form or absolute-form.
+fun targetAllowed(s : Array Byte, at : Int, methodEnd : Int, from : Int, to : Int) -> Bool {
+    if Byte.toInt(s[from]) == star {
+        return to - from == 1 && isMethod(s, at, methodEnd, optionsMethod)
+    }
+    if isMethod(s, at, methodEnd, connectMethod) { return isAuthority(s, from, to) }
+    if Byte.toInt(s[from]) == slash { return True }
+    -- absolute-form: scheme ":" and the rest, scheme = ALPHA *schemeChar
+    if !alpha[Byte.toInt(s[from])] { return False }
+    let q = scan(schemeChar, s, from + 1)
+    q < to && Byte.toInt(s[q]) == colon
+}
+
+-- authority-form = host ":" port, host = "[" IP literal "]" / reg-name,
+-- port = 1*DIGIT.
+fun isAuthority(s : Array Byte, from : Int, to : Int) -> Bool {
+    var q = from
+    if Byte.toInt(s[from]) == openBracket {
+        q = scan(ipv6Char, s, from + 1)
+        if q == from + 1 || !isByte(s, q, closeBracket) { return False }
+        q = q + 1
+    } else {
+        q = scan(regNameChar, s, from)
+        if q == from { return False }
+    }
+    if q >= to || Byte.toInt(s[q]) != colon { return False }
+    let port = scan(digit, s, q + 1)
+    port > q + 1 && port == to
+}

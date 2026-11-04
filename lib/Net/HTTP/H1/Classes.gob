@@ -1,0 +1,124 @@
+export (
+    tchar, targetChar, fieldVchar, fieldChar, ows, digit, hexDigit, alpha, schemeChar,
+    regNameChar, ipv6Char, reasonChar, quotedChar,
+    sp, htab, cr, lf, colon, semicolon, comma, slash, star, dot, question, equals, quote,
+    backslash, openBracket, closeBracket,
+    scan, isByte, isCrlf, sameText, hexValue, ascii, lowerText,
+)
+
+-- The byte classes of RFC 9110 and RFC 9112 as 256-entry tables, and the scan
+-- loop every part of the HTTP/1 codec reads them with. A table is an array
+-- indexed by the byte, so a class test is one load.
+--
+-- Each table is exactly its rule's class and nothing looser: `ows` is SP and
+-- HTAB only, and no class but `ows` and `fieldChar` holds any control byte.
+
+import Data.String (String(..))
+import Turkey.Buffer as Buf
+
+let sp = 32
+let htab = 9
+let cr = 13
+let lf = 10
+let colon = 58
+let semicolon = 59
+let comma = 44
+let slash = 47
+let star = 42
+let dot = 46
+let question = 63
+let equals = 61
+let quote = 34
+let backslash = 92
+let openBracket = 91
+let closeBracket = 93
+
+fun table(member : fun(Int) -> Bool) -> Array Bool = Array.init(256, member)
+
+fun among(chars : String, b : Int) -> Bool =
+    Array.contains(String.toBytes(chars), Byte.truncate(b))
+
+fun isDigit(b : Int) -> Bool = b >= 48 && b <= 57
+fun isAlpha(b : Int) -> Bool = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+fun isHex(b : Int) -> Bool = isDigit(b) || (b >= 65 && b <= 70) || (b >= 97 && b <= 102)
+
+-- tchar, RFC 9110 §5.6.2.
+let tchar = table(fun(b) = isDigit(b) || isAlpha(b) || among("!#$%&'*+-.^_`|~", b))
+
+-- The bytes a request target may hold: visible ASCII, except "#", since a
+-- fragment is never sent. RFC 3986 allows fewer, but clients send "{", "}",
+-- "|" and the like unencoded, and the form checks after the grammar are what
+-- framing and routing depend on.
+let targetChar = table(fun(b) = b >= 0x21 && b <= 0x7E && b != 35)
+
+-- field-vchar, RFC 9110 §5.5: VCHAR or obs-text. Never a control byte, so
+-- never CR, LF or NUL.
+let fieldVchar = table(fun(b) = (b >= 0x21 && b <= 0x7E) || b >= 0x80)
+
+-- A byte of field-value or of the whitespace beside it.
+let fieldChar = table(fun(b) = (b >= 0x21 && b <= 0x7E) || b >= 0x80 || b == sp || b == htab)
+
+-- reason-phrase, RFC 9112 §4: HTAB, SP, VCHAR and obs-text.
+let reasonChar = fieldChar
+
+-- qdtext, RFC 9110 §5.6.4, which a chunk extension's quoted value holds.
+let quotedChar = table(fun(b) = b == htab || b == sp || b == 0x21 || (b >= 0x23 && b <= 0x5B)
+                                || (b >= 0x5D && b <= 0x7E) || b >= 0x80)
+
+-- OWS, RFC 9110 §5.6.3: SP and HTAB, nothing else.
+let ows = table(fun(b) = b == sp || b == htab)
+
+let digit = table(isDigit)
+let hexDigit = table(isHex)
+let alpha = table(isAlpha)
+
+-- RFC 3986 §3.1: the bytes after a scheme's first letter.
+let schemeChar = table(fun(b) = isDigit(b) || isAlpha(b) || among("+-.", b))
+
+-- RFC 3986 §3.2.2: reg-name, unreserved / pct-encoded / sub-delims.
+let regNameChar = table(fun(b) = isDigit(b) || isAlpha(b) || among("-._~!$&'()*+,;=%", b))
+
+-- The bytes inside an IP literal's brackets.
+let ipv6Char = table(fun(b) = isHex(b) || b == colon || b == dot)
+
+-- Returns the first index from `p` before `to` whose byte is not in `table`,
+-- or `to`.
+fun scan(table : Array Bool, s : Array Byte, p : Int, to : Int) -> Int {
+    var q = p
+    while q < to && table[Byte.toInt(s[q])] { q = q + 1 }
+    q
+}
+
+fun isByte(s : Array Byte, i : Int, to : Int, b : Int) -> Bool = i < to && Byte.toInt(s[i]) == b
+
+fun isCrlf(s : Array Byte, i : Int, to : Int) -> Bool = isByte(s, i, to, cr) && isByte(s, i + 1, to, lf)
+
+-- Returns whether `s[from..to)` is `want`, where `want` is lowercase ASCII
+-- and the bytes may be in either case.
+fun sameText(s : Array Byte, from : Int, to : Int, want : Array Byte) -> Bool {
+    if to - from != len(want) { return False }
+    for var i = 0; i < len(want); i = i + 1 {
+        let b = Byte.toInt(s[from + i])
+        let folded = if b >= 65 && b <= 90 { b + 32 } else { b }
+        if folded != Byte.toInt(want[i]) { return False }
+    }
+    True
+}
+
+-- Returns the value of the hex digit `b`, which `hexDigit` holds.
+fun hexValue(b : Int) -> Int =
+    if b <= 57 { b - 48 } else if b <= 70 { b - 55 } else { b - 87 }
+
+-- Returns `s[from..to)`, which is ASCII, as a string.
+fun ascii(s : Array Byte, from : Int, to : Int) -> String =
+    Option.expect(Buf.textOf(s, from, to), "ASCII bytes")
+
+-- Returns `s[from..to)`, which is ASCII, as a lowercase string.
+fun lowerText(s : Array Byte, from : Int, to : Int) -> String {
+    let raw : Prim.Array Byte = Prim.arrayNewUninit(to - from)
+    for var i = from; i < to; i = i + 1 {
+        let b = Byte.toInt(s[i])
+        raw[i - from] = Byte.truncate(if b >= 65 && b <= 90 { b + 32 } else { b })
+    }
+    String(raw)
+}

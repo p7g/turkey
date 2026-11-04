@@ -91,9 +91,10 @@ export (
 -- made from it keeps what it needs, so releasing one while its connections
 -- run is safe.
 
-import Net (Connection(..), accept, closeListener)
+import Net (Connection(..), Described(..), ConnectionInfo(..), TLSInfo(..), accept, closeListener)
 import Net as Net
 import Net.TCP (Listener)
+import Net.TCP as TCP
 import System.Sync as Sync
 import Time (Timeout(..))
 import Time.Deadline (Deadline)
@@ -108,6 +109,7 @@ import Turkey.OpenSSL as SSL
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
+import Turkey.Resolve (IP)
 import Turkey.Resolve as Resolve
 import Turkey.Sys (cInt)
 import Turkey.TLSCallbacks as Callbacks
@@ -378,6 +380,10 @@ type TLS = TLS {
     engine  : Sync.Mutex Engine,
     -- The certificates to choose among, for a server.
     config  : Option ServerConfig,
+    -- The addresses of the connection underneath, for a connection an
+    -- `Acceptor` accepted, which knows them; `None` otherwise.
+    var local : Option (IP, Int),
+    var peer : Option (IP, Int),
 }
 
 -- A connection's OpenSSL state, and what its operations share.
@@ -484,6 +490,8 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
             failed = None, limit = None,
         }),
         config,
+        local = None,
+        peer = None,
     }
 
 -- -- making one -----------------------------------------------------------------------
@@ -972,6 +980,16 @@ fun serverName(t : TLS) -> Option String = Either.unwrapOr(using(t, "serverName"
     Ptr.fromCString(SSL.sslGetServername(engine.ssl, SSL.nameTypeHostName))
 }))), None)
 
+-- The addresses underneath, for a connection an `Acceptor` accepted, and
+-- the SNI name and ALPN protocol once the handshake is done.
+instance Described TLS {
+    fun connectionInfo(t) = ConnectionInfo {
+        local = t.local,
+        peer = t.peer,
+        tls = Some(TLSInfo { serverName = serverName(t), protocol = protocol(t) }),
+    }
+}
+
 -- -- accepting ------------------------------------------------------------------------
 
 -- A TCP listener whose connections are TLS servers presenting `config`.
@@ -989,7 +1007,11 @@ instance Net.Listener Acceptor {
     fun accept(Acceptor { listener, config }) {
         let s = accept(listener)?
         match server(s, config) {
-            Right(t) -> Right(t)
+            Right(t) -> {
+                t.local = Either.right(TCP.localAddress(s))
+                t.peer = Either.right(TCP.peerAddress(s))
+                Right(t)
+            }
             Left(_) -> {
                 let _ = close(s)
                 Left(IOError { kind = Closed, op = "accept", path = None })

@@ -1,0 +1,1003 @@
+export (
+    TLS, TLSError(..),
+    ClientConfig, Roots(..), clientConfig, releaseClient,
+    ServerConfig, Certificate(..), serverConfig, releaseServer,
+    client, server, handshake, protocol, serverName,
+    setDeadline, clearDeadline, shutdownWrite, close,
+    Acceptor, acceptor, accept,
+)
+
+-- TLS over any connection: a client that verifies the server it reaches, a
+-- server that presents a certificate chosen by the name the client asks for,
+-- and a `TLS` connection that is read and written like the one under it.
+--
+--     let roots = TLS.clientConfig(TLS.SystemRoots, ["http/1.1"])?
+--     let d = Net.resolve("example.com", 443, Net.publicInternet, Duration.seconds(10))?
+--     let s = TCP.connect(d, Duration.seconds(10))?
+--     let t = TLS.client(s, d, roots, Duration.seconds(10))?
+--     IO.writeText(t, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")?
+--
+-- **Linking.** The protocol is OpenSSL 3's, and a program that imports this
+-- module links with `-lssl -lcrypto`. On macOS that is Homebrew's
+-- `openssl@3`, with `-L$(brew --prefix openssl@3)/lib`: the system's
+-- `/usr/lib/libcrypto.dylib` ends a process that loads it.
+--
+-- **OpenSSL never sees a descriptor.** It reads the peer's bytes from a
+-- buffer this module fills from the connection underneath, and writes the
+-- bytes to send into another, which this module writes to the connection.
+-- So a wait for the network parks the task, as on a plain socket, and TLS
+-- is a layer over any `Net.Connection` whose errors are `IOError`s. A `TLS`
+-- is itself a `Net.Connection`.
+--
+-- **The client always verifies.** The server's chain must lead to a trusted
+-- root, its certificate must be valid now, and it must name the host the
+-- `Destination` was resolved from. There is no setting that turns any of it
+-- off. A test against a certificate of its own makes its own CA a root
+-- (`RootsFile`). The name is sent as SNI, and checked against the
+-- certificate, without its trailing dot (RFC 6066 forbids the dot in SNI,
+-- and certificates are written without it). An IP address is checked
+-- against the certificate's IP addresses, and sent as no SNI at all.
+--
+-- **The trusted roots (`SystemRoots`)** are OpenSSL's defaults: the files
+-- `$SSL_CERT_FILE` and `$SSL_CERT_DIR` name if they are set, and otherwise
+-- the `cert.pem` and `certs/` of the directory OpenSSL was built for. On
+-- Linux that is the distribution's bundle (`/etc/ssl/certs` on Debian). On
+-- macOS it is Homebrew's `etc/openssl@3/cert.pem`, which Homebrew's
+-- `ca-certificates` builds from the system keychains: the roots in
+-- `SystemRootCertificates.keychain` and `System.keychain` that pass
+-- `security verify-cert`, as of when it was installed. That is used rather
+-- than reading the keychain at run time, which would need the Security
+-- framework, a second library beyond libSystem, for each process, to get the
+-- same roots. What it costs: a root added to the keychain later (by device
+-- management, say) is trusted only after `brew postinstall ca-certificates`.
+--
+-- **Versions.** TLS 1.2 and 1.3, as OpenSSL negotiates them. Renegotiation is
+-- refused.
+--
+-- **ALPN.** Each side lists the protocols it speaks (`"http/1.1"`), and
+-- `protocol` says which one the handshake chose. A server picks the first of
+-- its own list that the client offers too, and with none in common the
+-- handshake fails, as RFC 7301 asks. Either side may list none.
+--
+-- **The server** holds one or more certificates, each a chain and its key.
+-- The client's SNI picks the first whose certificate names the host, by
+-- RFC 6125's rules, wildcards included; a client that sends no name, or one
+-- no certificate names, gets the first. `server` and `accept` make the
+-- connection without waiting: its handshake runs inside its first read or
+-- write, bounded by its deadline, so a slow client holds up only its own
+-- task. `handshake` runs it first, under a limit of its own.
+--
+-- **Errors.** A failure of the connection underneath is `Stream` with its
+-- `IOError`, `TimedOut` and `Closed` among them. A certificate the client
+-- refuses is `Untrusted`, `Expired`, `NotYetValid`, `WrongHost` or
+-- `BadCertificate`; anything else the protocol fails with, an alert from the
+-- peer included, is `Refused` with OpenSSL's reason. A handshake that fails
+-- fails for good: every later read and write answers the same error.
+--
+-- **A connection that ends without the peer's close_notify is `Truncated`,**
+-- not an end of input. The peer said nothing about whether it meant to stop
+-- there, and an attacker who can cut a connection can choose where. A read
+-- answers 0 only after a close_notify, which `shutdownWrite` sends.
+--
+-- **Sharing.** As with a TCP socket, any number of tasks may hold a `TLS`:
+-- reads take turns with reads, writes with writes, and a read and a write run
+-- at once. Ciphertext reaches the connection in the order OpenSSL made it,
+-- whichever task made it.
+--
+-- **Closing** closes the connection underneath, so a read or write parked on
+-- it ends with `Stream` of `Closed`, as does every later one. The OpenSSL
+-- connection is freed once the last operation using it has returned. A
+-- configuration is freed by `releaseClient` or `releaseServer`; a connection
+-- made from it keeps what it needs, so releasing one while its connections
+-- run is safe.
+
+import Net (Connection(..), Accept(..))
+import Net.TCP (Listener)
+import System.Sync as Sync
+import Time (Timeout(..))
+import Time.Deadline (Deadline)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.ConnectPolicy (Destination(..))
+import Turkey.ConnectPolicy as ConnectPolicy
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.Errors as Errors
+import Turkey.IO as IO
+import Turkey.OpenSSL as SSL
+import Turkey.Ptr as Ptr
+import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
+import Turkey.Resolve as Resolve
+import Turkey.Sys (cInt)
+import Turkey.TLSCallbacks as Callbacks
+
+-- -- errors ---------------------------------------------------------------------------
+
+-- What a TLS operation fails with. See the module comment.
+type TLSError
+    -- The connection underneath failed, timed out, or was closed.
+    = Stream(IOError)
+    -- The peer's chain does not lead to a trusted root.
+    | Untrusted
+    -- A certificate in the peer's chain has expired.
+    | Expired
+    -- A certificate in the peer's chain is not valid yet.
+    | NotYetValid
+    -- The peer's certificate does not name the host connected to.
+    | WrongHost
+    -- Verification refused the peer's certificate for another reason, which
+    -- this is OpenSSL's text for.
+    | BadCertificate(String)
+    -- The connection ended without the peer's close_notify.
+    | Truncated
+    -- The protocol failed: an alert from the peer, or a message out of place.
+    -- OpenSSL's reason.
+    | Refused(String)
+    -- A configuration could not be made: a file that would not load, a key
+    -- that is not the certificate's, a protocol name out of range.
+    | Configuration(String)
+
+instance Show TLSError {
+    fun show(e) = match e {
+        Stream(io) -> "Stream(" + show(io) + ")"
+        Untrusted -> "Untrusted"
+        Expired -> "Expired"
+        NotYetValid -> "NotYetValid"
+        WrongHost -> "WrongHost"
+        BadCertificate(why) -> "BadCertificate(" + why + ")"
+        Truncated -> "Truncated"
+        Refused(why) -> "Refused(" + why + ")"
+        Configuration(why) -> "Configuration(" + why + ")"
+    }
+}
+
+instance Error TLSError {
+    fun message(e) = match e {
+        Stream(io) -> message(io)
+        Untrusted -> "the peer's certificate is not signed by a trusted root"
+        Expired -> "the peer's certificate has expired"
+        NotYetValid -> "the peer's certificate is not valid yet"
+        WrongHost -> "the peer's certificate is not for this host"
+        BadCertificate(why) -> "the peer's certificate was refused: " + why
+        Truncated -> "the connection ended without a TLS close_notify"
+        Refused(why) -> "TLS: " + why
+        Configuration(why) -> "TLS configuration: " + why
+    }
+}
+
+-- -- configuration --------------------------------------------------------------------
+
+-- The roots a client trusts: the system's, or only those in a PEM file.
+type Roots = SystemRoots | RootsFile(String)
+
+-- A certificate chain and its private key: the paths of two PEM files, the
+-- chain leaf first.
+type Certificate = Certificate { chain : String, key : String }
+
+-- A client's roots and protocols, in an OpenSSL context.
+type ClientConfig = ClientConfig {
+    -- Held while `ctx` is used or released.
+    guard : Sync.Mutex Unit,
+    -- One reference, dropped by `releaseClient`, which leaves it null. Each
+    -- connection takes a reference of its own (`SSL_new`).
+    var ctx : Prim.Ptr,
+    -- The protocols to offer, in ALPN's wire form.
+    protocols : Array Byte,
+}
+
+-- A server's certificates and protocols, in one OpenSSL context each.
+type ServerConfig = ServerConfig {
+    -- Held while `contexts` is used or released.
+    guard : Sync.Mutex Unit,
+    -- One context per certificate, as addresses, each holding one reference
+    -- that `releaseServer` drops, leaving this empty. The first is the
+    -- default.
+    var contexts : Array Int,
+    protocols : Array Byte,
+}
+
+-- A client configuration trusting `roots` and offering `protocols` by ALPN.
+fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError ClientConfig {
+    let wire = alpnWire(protocols)?
+    SSL.errClearError()
+    let ctx = SSL.ctxNew(SSL.tlsClientMethod())
+    if Prim.ptrIsNull(ctx) { return Left(Configuration(reason())) }
+    -- `ctx` is this function's until it is returned: freed on any failure.
+    match configureClient(ctx, roots) {
+        Right(_) -> Right(ClientConfig { guard = Sync.mutex(()), ctx, protocols = wire })
+        Left(e) -> {
+            SSL.ctxFree(ctx)
+            Left(e)
+        }
+    }
+}
+
+fun configureClient(ctx : Prim.Ptr, roots : Roots) -> Either TLSError Unit {
+    configureCommon(ctx)?
+    SSL.ctxSetVerify(ctx, SSL.verifyPeer, Prim.ptrNull())
+    match roots {
+        SystemRoots -> if cInt(SSL.ctxSetDefaultVerifyPaths(ctx)) != 1 {
+            return Left(Configuration("the system's roots: " + reason()))
+        }
+        RootsFile(path) -> {
+            let loaded = withPath(path, fun(p) = SSL.ctxLoadVerifyFile(ctx, p))?
+            if loaded != 1 { return Left(Configuration(path + ": " + reason())) }
+        }
+    }
+    Right(())
+}
+
+-- A server configuration presenting `certificates`, chosen among by SNI, and
+-- accepting `protocols` by ALPN.
+fun serverConfig(certificates : Array Certificate, protocols : Array String)
+        -> Either TLSError ServerConfig {
+    if len(certificates) == 0 {
+        return Left(Configuration("a server needs at least one certificate"))
+    }
+    let wire = alpnWire(protocols)?
+    let contexts = []
+    for c in certificates {
+        match serverContext(c) {
+            Right(ctx) -> Vec.push(contexts, Prim.ptrToInt(ctx))
+            Left(e) -> {
+                for made in contexts { SSL.ctxFree(Prim.ptrFromInt(made)) }
+                return Left(e)
+            }
+        }
+    }
+    Right(ServerConfig { guard = Sync.mutex(()), contexts = Vec.toArray(contexts), protocols = wire })
+}
+
+-- A context presenting `c`, owned by the caller.
+fun serverContext(c : Certificate) -> Either TLSError Prim.Ptr {
+    SSL.errClearError()
+    let ctx = SSL.ctxNew(SSL.tlsServerMethod())
+    if Prim.ptrIsNull(ctx) { return Left(Configuration(reason())) }
+    match configureServer(ctx, c) {
+        Right(_) -> Right(ctx)
+        Left(e) -> {
+            SSL.ctxFree(ctx)
+            Left(e)
+        }
+    }
+}
+
+fun configureServer(ctx : Prim.Ptr, c : Certificate) -> Either TLSError Unit {
+    configureCommon(ctx)?
+    let chain = withPath(c.chain, fun(p) = SSL.ctxUseCertificateChainFile(ctx, p))?
+    if chain != 1 { return Left(Configuration(c.chain + ": " + reason())) }
+    let key = withPath(c.key, fun(p) = SSL.ctxUsePrivateKeyFile(ctx, p, SSL.filetypePEM))?
+    if key != 1 { return Left(Configuration(c.key + ": " + reason())) }
+    if cInt(SSL.ctxCheckPrivateKey(ctx)) != 1 {
+        return Left(Configuration(c.key + " is not the key of " + c.chain + ": " + reason()))
+    }
+    -- Both read the connection's block (`Turkey.TLSCallbacks`), not an
+    -- argument, so nothing here outlives the context.
+    SSL.ctxSetAlpnSelectCb(ctx, Prim.codeAddress("turkey_tls_alpn_select"), Prim.ptrNull())
+    SSL.ctxSetClientHelloCb(ctx, Prim.codeAddress("turkey_tls_client_hello"), Prim.ptrNull())
+    Right(())
+}
+
+-- TLS 1.2 at least, and no renegotiation: a renegotiation would make a write
+-- wait for a read, which a layer whose reads and writes run apart cannot do.
+fun configureCommon(ctx : Prim.Ptr) -> Either TLSError Unit {
+    if SSL.ctxCtrl(ctx, SSL.ctrlSetMinProtoVersion, SSL.tls12Version, Prim.ptrNull()) != 1 {
+        return Left(Configuration(reason()))
+    }
+    let _ = SSL.ctxSetOptions(ctx, SSL.opNoRenegotiation)
+    Right(())
+}
+
+-- Free `c`'s context. Connections made from it keep working; a `client` after
+-- it fails with `Configuration`. Releasing it again does nothing.
+fun releaseClient(c : ClientConfig) -> Unit = Sync.withLock(c.guard, fun(_) {
+    if !Prim.ptrIsNull(c.ctx) {
+        SSL.ctxFree(c.ctx)
+        c.ctx = Prim.ptrNull()
+    }
+})
+
+-- Free `c`'s contexts. Connections made from it keep working; a `server` or
+-- `accept` after it fails. Releasing it again does nothing.
+fun releaseServer(c : ServerConfig) -> Unit = Sync.withLock(c.guard, fun(_) {
+    for ctx in c.contexts { SSL.ctxFree(Prim.ptrFromInt(ctx)) }
+    c.contexts = []
+})
+
+-- `protocols` in ALPN's wire form: each name after a byte of its length.
+fun alpnWire(protocols : Array String) -> Either TLSError (Array Byte) {
+    let out = []
+    for p in protocols {
+        let bytes = String.toBytes(p)
+        if len(bytes) == 0 || len(bytes) > 255 {
+            return Left(Configuration("the ALPN protocol '" + p + "' is " + show(len(bytes))
+                                      + " bytes long, and must be 1 to 255"))
+        }
+        Vec.push(out, Byte.truncate(len(bytes)))
+        for b in bytes { Vec.push(out, b) }
+    }
+    Right(Vec.toArray(out))
+}
+
+-- `f` of `path` as a C string, which is freed after. A path with a NUL in it
+-- is refused: C would read only the part before it.
+fun withPath(path : String, f : fun(Prim.Ptr) -> Int) -> Either TLSError Int {
+    if String.contains(path, "\0") {
+        return Left(Configuration("a path cannot contain a NUL byte"))
+    }
+    let c = cString(path)
+    let r = f(Ptr.raw(c))
+    Ptr.free(c)
+    Right(cInt(r))
+}
+
+-- `s` as a NUL-terminated C string the caller frees. Panics if out of memory.
+fun cString(s : String) -> Ptr.Ptr {
+    let c = Ptr.toCString(s)
+    if Ptr.isNull(c) { error("Net.TLS: out of memory") }
+    c
+}
+
+-- -- connections ----------------------------------------------------------------------
+
+-- The connection under a `TLS`, as functions over it, so that `TLS` need not
+-- name its type: an instance's context cannot say that a stream's read and
+-- write errors are both `IOError`, and a function's can.
+type Under = Under {
+    reading     : fun(Buffer) -> Either IOError Int,
+    writing     : fun(Buffer) -> Either IOError Unit,
+    bounding    : fun(Option Deadline) -> Unit,
+    halfClosing : fun() -> Either IOError Unit,
+    closing     : fun() -> Either IOError Unit,
+}
+
+fun streamOf[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](c : c) -> Under =
+    Under {
+        reading = fun(b) = readInto(c, b),
+        writing = fun(b) = writeFrom(c, b),
+        bounding = fun(limit) = match limit {
+            Some(at) -> setDeadline(c, at)
+            None -> clearDeadline(c)
+        },
+        halfClosing = fun() = shutdownWrite(c),
+        closing = fun() = close(c),
+    }
+
+-- A TLS connection over a `Net.Connection`.
+--
+-- Three locks, always taken in this order, and the last never held while
+-- the task waits:
+--
+-- * `reading`, by the task reading from the connection underneath: a read,
+--   or the handshake. So the peer's bytes go into OpenSSL in order.
+-- * `sending`, by the task taking ciphertext out of `wbio` and writing it to
+--   the connection, held until it is written. So it goes out in order,
+--   whichever task's call made it.
+-- * `engine`, around every call into OpenSSL with this connection, since one
+--   `SSL` is not to be used from two threads at once. It also guards the
+--   fields marked below.
+type TLS = TLS {
+    stream    : Under,
+    reading   : Sync.Mutex Unit,
+    sending   : Sync.Mutex Unit,
+    engine    : Sync.Mutex Unit,
+    -- Owned. `retire` frees it, with `SSL_free`, once the connection is
+    -- closed and no operation is using it; it is null after. `SSL_free` also
+    -- frees `rbio` and `wbio`, and drops the reference to the context.
+    var ssl   : Prim.Ptr,
+    -- The memory BIOs `ssl` reads the peer's bytes from and writes the bytes
+    -- to send into. Owned by `ssl`.
+    rbio      : Prim.Ptr,
+    wbio      : Prim.Ptr,
+    -- A server's block for the callbacks (`Turkey.TLSCallbacks`), from
+    -- `malloc`. Owned, and freed by `retire` straight after `ssl`, which is
+    -- the last thing that reads it. Null for a client.
+    var block : Prim.Ptr,
+    -- The certificates to choose among, for a server.
+    config    : Option ServerConfig,
+    -- Under `engine`: how many operations are using `ssl`; whether `close`
+    -- has been called; whether the handshake is done; and the error it, or
+    -- any later call, failed with for good.
+    var users  : Int,
+    var closed : Bool,
+    var shaken : Bool,
+    var failed : Option TLSError,
+    -- The limit `setDeadline` set, which `handshake` puts back after its own.
+    var limit  : Option Deadline,
+    -- The peer's bytes, under `reading`, and the bytes to send, under
+    -- `sending`, on their way between the connection and OpenSSL.
+    incoming  : Buffer,
+    outgoing  : Buffer,
+}
+
+-- What one call into OpenSSL left to do.
+type Step = Shaken | NeedBytes | ChooseCertificate | Moved(Int) | Ended | Failed(TLSError)
+
+let cipherCapacity : Int = 32768
+
+-- The most plaintext given to one `SSL_write`: one record's worth, so that
+-- the ciphertext waiting in `wbio` stays one record long.
+let recordBytes : Int = 16384
+
+instance Read TLS {
+    type ReadError = TLSError
+    fun readInto(t, into) {
+        needsRoom(into)
+        using(t, "read", fun() {
+            settled(t)?
+            Sync.withLock(t.reading, fun(_) = receive(t, into))
+        })
+    }
+}
+
+instance Write TLS {
+    type WriteError = TLSError
+    fun writeFrom(t, from) = using(t, "write", fun() {
+        settled(t)?
+        Sync.withLock(t.sending, fun(_) = transmit(t, from))
+    })
+    -- Nothing is held back: each write is sent.
+    fun flush(t) = Right(())
+}
+
+-- `shutdownWrite` sends a close_notify, then ends the connection's output
+-- underneath. `close` closes the connection underneath.
+instance Connection TLS {
+    fun setDeadline(t, timeout) {
+        let at = deadline(timeout)
+        Sync.withLock(t.engine, fun(_) { t.limit = Some(at) })
+        t.stream.bounding(Some(at))
+    }
+    fun clearDeadline(t) {
+        Sync.withLock(t.engine, fun(_) { t.limit = None })
+        t.stream.bounding(None)
+    }
+    fun shutdownWrite(t) = using(t, "shutdown", fun() {
+        settled(t)?
+        Sync.withLock(t.sending, fun(_) {
+            let _ = engine(t, fun() {
+                SSL.errClearError()
+                SSL.sslShutdown(t.ssl)
+            })
+            drain(t)?
+            Either.mapLeft(t.stream.halfClosing(), Stream)
+        })
+    })
+    fun close(t) {
+        let first = Sync.withLock(t.engine, fun(_) {
+            if t.closed { return False }
+            t.closed = True
+            retire(t)
+            True
+        })
+        if first { Either.mapLeft(t.stream.closing(), Stream) } else { Right(()) }
+    }
+}
+
+fun newTLS(stream : Under, ssl : Prim.Ptr, rbio : Prim.Ptr, wbio : Prim.Ptr, block : Prim.Ptr,
+           config : Option ServerConfig) -> TLS =
+    TLS {
+        stream, reading = Sync.mutex(()), sending = Sync.mutex(()), engine = Sync.mutex(()),
+        ssl, rbio, wbio, block, config, users = 0, closed = False, shaken = False,
+        failed = None, limit = None,
+        incoming = Buf.buffer(cipherCapacity), outgoing = Buf.buffer(cipherCapacity),
+    }
+
+-- -- making one -----------------------------------------------------------------------
+
+-- A TLS client over `conn`, which is connected to `to`, with the handshake
+-- done within `timeout`. The server must present a certificate for `to`'s
+-- host that `config`'s roots vouch for.
+--
+-- If the handshake fails, `conn` is left open, and closing it is the
+-- caller's. Once this answers a `TLS`, the `TLS` owns `conn`: `close` it
+-- rather than `conn`, and bound it with the `TLS`'s `setDeadline`. The
+-- handshake replaces any deadline `conn` had, and leaves it with none.
+fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
+        conn : c, to : Destination, config : ClientConfig, timeout : t) -> Either TLSError TLS {
+    let name = checkedName(to.host)?
+    SSL.errClearError()
+    let ssl = Sync.withLock(config.guard, fun(_) =
+        if Prim.ptrIsNull(config.ctx) { Prim.ptrNull() } else { SSL.sslNew(config.ctx) })
+    if Prim.ptrIsNull(ssl) {
+        return Left(Configuration("cannot make a connection from a released configuration"))
+    }
+    -- `ssl` is this function's until the `TLS` holds it.
+    let bios = match attachBIOs(ssl) {
+        Right(b) -> b
+        Left(e) -> {
+            SSL.sslFree(ssl)
+            return Left(e)
+        }
+    }
+    SSL.sslSetConnectState(ssl)
+    let t = newTLS(streamOf(conn), ssl, bios.0, bios.1, Prim.ptrNull(), None)
+    -- From here `t` owns `ssl`, and `abandon` frees it.
+    match nameServer(ssl, name, config.protocols) {
+        Right(_) -> {}
+        Left(e) -> {
+            abandon(t)
+            return Left(e)
+        }
+    }
+    match handshake(t, timeout) {
+        Right(_) -> Right(t)
+        Left(e) -> {
+            abandon(t)
+            Left(e)
+        }
+    }
+}
+
+-- A TLS server over `conn`, presenting `config`'s certificates. Nothing is
+-- waited for: the handshake runs inside the first read or write, or in
+-- `handshake`. The `TLS` owns `conn`: `close` it rather than `conn`. A
+-- configuration released already is `Configuration`, and leaves `conn` open.
+fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
+        conn : c, config : ServerConfig) -> Either TLSError TLS {
+    SSL.errClearError()
+    let ssl = Sync.withLock(config.guard, fun(_) =
+        if len(config.contexts) == 0 { Prim.ptrNull() }
+        else { SSL.sslNew(Prim.ptrFromInt(config.contexts[0])) })
+    if Prim.ptrIsNull(ssl) {
+        return Left(Configuration("cannot make a connection from a released configuration"))
+    }
+    let bios = match attachBIOs(ssl) {
+        Right(b) -> b
+        Left(e) -> {
+            SSL.sslFree(ssl)
+            return Left(e)
+        }
+    }
+    SSL.sslSetAcceptState(ssl)
+    let block = callbackBlock(config.protocols)
+    if Prim.ptrIsNull(block) {
+        SSL.sslFree(ssl)
+        error("Net.TLS: out of memory")
+    }
+    let _ = SSL.sslSetExData(ssl, 0, block)
+    Right(newTLS(streamOf(conn), ssl, bios.0, bios.1, block, Some(config)))
+}
+
+-- Two memory BIOs, given to `ssl`, which owns them from then on: `(rbio,
+-- wbio)`.
+fun attachBIOs(ssl : Prim.Ptr) -> Either TLSError (Prim.Ptr, Prim.Ptr) {
+    let rbio = SSL.bioNew(SSL.bioSMem())
+    if Prim.ptrIsNull(rbio) { return Left(Configuration(reason())) }
+    let wbio = SSL.bioNew(SSL.bioSMem())
+    if Prim.ptrIsNull(wbio) {
+        let _ = SSL.bioFree(rbio)
+        return Left(Configuration(reason()))
+    }
+    SSL.sslSetBio(ssl, rbio, wbio)
+    Right((rbio, wbio))
+}
+
+-- The block a server's callbacks read: no certificate chosen yet, and the
+-- protocols. Null if out of memory.
+fun callbackBlock(protocols : Array Byte) -> Prim.Ptr {
+    let n = len(protocols)
+    let block = Ptr.alloc(Callbacks.protocolsAt + n)
+    if Ptr.isNull(block) { return Ptr.raw(block) }
+    Ptr.store(block, Callbacks.chosenAt, 0)
+    Ptr.store(block, Callbacks.protocolsLengthAt, n)
+    for var i = 0; i < n; i = i + 1 {
+        Ptr.store(block, Callbacks.protocolsAt + i, protocols[i])
+    }
+    Ptr.raw(block)
+}
+
+-- Tell OpenSSL the name to send and to check, and the protocols to offer.
+-- Each call copies what it is given.
+fun nameServer(ssl : Prim.Ptr, name : String, protocols : Array Byte) -> Either TLSError Unit {
+    let c = cString(name)
+    let sent = match Resolve.parse(name) {
+        -- An address: no SNI, which carries only host names.
+        Some(_) -> 1
+        None -> SSL.sslCtrl(ssl, SSL.ctrlSetTLSExtHostName, SSL.nameTypeHostName, Ptr.raw(c))
+    }
+    -- An address as text is checked against the certificate's addresses.
+    let checked = cInt(SSL.sslSet1Host(ssl, Ptr.raw(c)))
+    Ptr.free(c)
+    if sent != 1 || checked != 1 {
+        return Left(Configuration("the host name '" + name + "': " + reason()))
+    }
+    if len(protocols) > 0 {
+        let r = cInt(SSL.sslSetAlpnProtos(ssl, IO.addressOf(protocols, 0), len(protocols)))
+        Prim.keepAlive(protocols)
+        if r != 0 { return Left(Configuration(reason())) }
+    }
+    Right(())
+}
+
+-- The name a certificate is checked against: the host without the brackets
+-- of an IPv6 literal or a trailing dot.
+fun checkedName(host : String) -> Either TLSError String {
+    let name = ConnectPolicy.trailingDotless(ConnectPolicy.bracketless(host))
+    if name == "" || String.contains(name, "\0") {
+        return Left(Configuration("cannot verify a certificate for the host '" + host + "'"))
+    }
+    Right(name)
+}
+
+-- Mark a `TLS` that is never handed out as closed, which frees its OpenSSL
+-- connection; its stream is left open.
+fun abandon(t : TLS) -> Unit = Sync.withLock(t.engine, fun(_) {
+    t.closed = True
+    retire(t)
+})
+
+-- -- an operation's life --------------------------------------------------------------
+
+-- `f`, counted as an operation using `t.ssl`, which is not freed until it
+-- returns. On a closed `t`, `Closed`.
+fun using(t : TLS, op : String, f : fun() -> Either TLSError a) -> Either TLSError a {
+    let entered = Sync.withLock(t.engine, fun(_) {
+        if t.closed { return False }
+        t.users = t.users + 1
+        True
+    })
+    if !entered { return Left(Stream(IOError { kind = Closed, op, path = None })) }
+    let r = f()
+    Sync.withLock(t.engine, fun(_) {
+        t.users = t.users - 1
+        retire(t)
+    })
+    r
+}
+
+-- With `engine` held: free the OpenSSL connection once `t` is closed and
+-- nothing is using it, then the block its callbacks read.
+fun retire(t : TLS) -> Unit {
+    if !t.closed || t.users > 0 || Prim.ptrIsNull(t.ssl) { return {} }
+    SSL.sslFree(t.ssl)
+    t.ssl = Prim.ptrNull()
+    if !Prim.ptrIsNull(t.block) {
+        Ptr.free(Ptr.wrap(t.block))
+        t.block = Prim.ptrNull()
+    }
+}
+
+-- `f` with `engine` held. Every call into OpenSSL with `t` is made here.
+fun engine(t : TLS, f : fun() -> a) -> a = Sync.withLock(t.engine, fun(_) = f())
+
+-- -- the handshake --------------------------------------------------------------------
+
+-- Run `t`'s handshake if it has not run, within `timeout` and the deadline
+-- `t` has, whichever comes first.
+fun handshake[Timeout d](t : TLS, timeout : d) -> Either TLSError Unit = using(t, "handshake", fun() {
+    let own = Sync.withLock(t.engine, fun(_) = t.limit)
+    let at = deadline(timeout)
+    let bound = match own {
+        Some(o) -> if o < at { o } else { at }
+        None -> at
+    }
+    t.stream.bounding(Some(bound))
+    let r = settled(t)
+    t.stream.bounding(own)
+    r
+})
+
+-- Whether the handshake is done, running it if not.
+fun settled(t : TLS) -> Either TLSError Unit {
+    let (shaken, failed) = Sync.withLock(t.engine, fun(_) = (t.shaken, t.failed))
+    match failed {
+        Some(e) -> return Left(e)
+        None -> {}
+    }
+    if shaken { return Right(()) }
+    Sync.withLock(t.reading, fun(_) = shake(t))
+}
+
+-- With `reading` held: the handshake, to its end. Another task may have
+-- finished it while this one waited for `reading`, which the first step finds.
+fun shake(t : TLS) -> Either TLSError Unit {
+    loop {
+        let step = engine(t, fun() {
+            match t.failed {
+                Some(e) -> return Failed(e)
+                None -> {}
+            }
+            if t.shaken { return Shaken }
+            SSL.errClearError()
+            let r = cInt(SSL.sslDoHandshake(t.ssl))
+            if r == 1 {
+                t.shaken = True
+                return Shaken
+            }
+            let code = cInt(SSL.sslGetError(t.ssl, r))
+            if code == SSL.errorWantRead { NeedBytes }
+            else if code == SSL.errorWantClientHelloCb { ChooseCertificate }
+            else {
+                let e = failure(t.ssl, code)
+                t.failed = Some(e)
+                Failed(e)
+            }
+        })
+        -- What the step made goes out even when it failed: an alert says why.
+        match step {
+            Failed(e) -> {
+                let _ = send(t)
+                return Left(e)
+            }
+            _ -> {}
+        }
+        match send(t) {
+            Left(e) -> return Left(fail(t, e))
+            Right(_) -> {}
+        }
+        match step {
+            Shaken -> return Right(())
+            NeedBytes -> match fill(t) {
+                Left(e) -> return Left(fail(t, e))
+                Right(_) -> {}
+            }
+            ChooseCertificate -> choose(t)
+            _ -> {}
+        }
+    }
+}
+
+-- Record `e` as what every later operation on `t` fails with, and answer it.
+fun fail(t : TLS, e : TLSError) -> TLSError {
+    Sync.withLock(t.engine, fun(_) { t.failed = Some(e) })
+    e
+}
+
+-- With `reading` held, on a server, while the handshake waits for it: move the
+-- connection to the first certificate that names the host the client sent,
+-- or leave it on the first, and let the handshake go on.
+fun choose(t : TLS) -> Unit {
+    let name = engine(t, fun() = requestedName(t.ssl))
+    match t.config {
+        Some(config) -> Sync.withLock(config.guard, fun(_) {
+            -- A configuration released since leaves the connection where it is.
+            var chosen = Prim.ptrNull()
+            if let Some(n) = name {
+                for at in config.contexts {
+                    let ctx = Prim.ptrFromInt(at)
+                    if names(ctx, n) {
+                        chosen = ctx
+                        break
+                    }
+                }
+            }
+            engine(t, fun() {
+                if !Prim.ptrIsNull(chosen) { let _ = SSL.sslSetSSLCtx(t.ssl, chosen) }
+                Prim.storeI64(t.block, Callbacks.chosenAt, 1)
+            })
+        })
+        None -> engine(t, fun() { Prim.storeI64(t.block, Callbacks.chosenAt, 1) })
+    }
+}
+
+-- Whether `ctx`'s certificate names the host `name`.
+fun names(ctx : Prim.Ptr, name : String) -> Bool {
+    let certificate = SSL.ctxGet0Certificate(ctx)
+    if Prim.ptrIsNull(certificate) { return False }
+    let bytes = String.toBytes(name)
+    let r = cInt(SSL.x509CheckHost(certificate, IO.addressOf(bytes, 0), len(bytes), 0,
+                                   Prim.ptrNull()))
+    Prim.keepAlive(bytes)
+    r == 1
+}
+
+-- With `engine` held, during the client-hello callback's retry: the host name
+-- in the client's SNI, if it sent one. The extension's body is a list (two
+-- bytes of length) of entries, each a type byte, 0 for a host name, then two
+-- bytes of length and the name.
+fun requestedName(ssl : Prim.Ptr) -> Option String {
+    let out = Ptr.alloc(16)
+    if Ptr.isNull(out) { error("Net.TLS: out of memory") }
+    let found = cInt(SSL.sslClientHelloGet0Ext(ssl, SSL.extServerName, Ptr.raw(out),
+                                               Ptr.raw(Ptr.add(out, 8))))
+    let data : Ptr.Ptr = Ptr.load(out, 0)
+    let length : Int = Ptr.load(out, 8)
+    Ptr.free(out)
+    if found != 1 { return None }
+    if length < 5 { return None }
+    let bytes = Array.init(length, fun(i) = (Ptr.load(data, i) : Byte))
+    let listed = Byte.toInt(bytes[0]) * 256 + Byte.toInt(bytes[1])
+    let size = Byte.toInt(bytes[3]) * 256 + Byte.toInt(bytes[4])
+    if listed + 2 > length || Byte.toInt(bytes[2]) != 0 || 5 + size > length { return None }
+    String.fromBytes(Array.slice(bytes, 5, 5 + size))
+}
+
+-- -- reading and writing --------------------------------------------------------------
+
+-- With `reading` held: decrypted bytes into `into`, reading the peer's
+-- bytes until OpenSSL has some.
+fun receive(t : TLS, into : Buffer) -> Either TLSError Int {
+    loop {
+        var pending = False
+        let step = engine(t, fun() {
+            match t.failed {
+                Some(e) -> return Failed(e)
+                None -> {}
+            }
+            SSL.errClearError()
+            let r = cInt(SSL.sslRead(t.ssl, IO.addressOf(into.storage, into.end),
+                                     into.limit - into.end))
+            let code = if r > 0 { 0 } else { cInt(SSL.sslGetError(t.ssl, r)) }
+            Prim.keepAlive(into.storage)
+            -- Reading can make bytes to send: a key update's answer, or an
+            -- alert.
+            pending = SSL.bioCtrlPending(t.wbio) > 0
+            if r > 0 { Moved(r) }
+            else if code == SSL.errorWantRead { NeedBytes }
+            else if code == SSL.errorZeroReturn { Ended }
+            else {
+                let e = failure(t.ssl, code)
+                t.failed = Some(e)
+                Failed(e)
+            }
+        })
+        if pending { send(t)? }
+        match step {
+            Moved(n) -> {
+                into.end = into.end + n
+                return Right(n)
+            }
+            Ended -> return Right(0)
+            NeedBytes -> fill(t)?
+            Failed(e) -> return Left(e)
+            _ -> {}
+        }
+    }
+}
+
+-- With `sending` held: encrypt `from`'s window a record at a time, and send
+-- each.
+fun transmit(t : TLS, from : Buffer) -> Either TLSError Unit {
+    var at = from.start
+    while at < from.end {
+        let chunk = if from.end - at < recordBytes { from.end - at } else { recordBytes }
+        let start = at
+        let step = engine(t, fun() {
+            match t.failed {
+                Some(e) -> return Failed(e)
+                None -> {}
+            }
+            SSL.errClearError()
+            let r = cInt(SSL.sslWrite(t.ssl, IO.addressOf(from.storage, start), chunk))
+            let code = if r > 0 { 0 } else { cInt(SSL.sslGetError(t.ssl, r)) }
+            Prim.keepAlive(from.storage)
+            if r > 0 { return Moved(r) }
+            let e = failure(t.ssl, code)
+            t.failed = Some(e)
+            Failed(e)
+        })
+        drain(t)?
+        match step {
+            Moved(n) -> { at = at + n }
+            Failed(e) -> return Left(e)
+            _ -> {}
+        }
+    }
+    Right(())
+}
+
+-- With `reading` held: the peer's next bytes, given to OpenSSL. A connection
+-- that ends here ends before the TLS stream did.
+fun fill(t : TLS) -> Either TLSError Unit {
+    Buf.clear(t.incoming)
+    let n = Either.mapLeft(t.stream.reading(t.incoming), Stream)?
+    if n == 0 { return Left(Truncated) }
+    let taken = engine(t, fun() {
+        let r = cInt(SSL.bioWrite(t.rbio, IO.addressOf(t.incoming.storage, t.incoming.start), n))
+        Prim.keepAlive(t.incoming.storage)
+        r
+    })
+    -- A memory BIO takes everything, unless it cannot grow.
+    if taken != n { error("Net.TLS: out of memory") }
+    Right(())
+}
+
+-- Send what OpenSSL has made, taking `sending`.
+fun send(t : TLS) -> Either TLSError Unit = Sync.withLock(t.sending, fun(_) = drain(t))
+
+-- With `sending` held: write everything in `wbio` to the connection.
+fun drain(t : TLS) -> Either TLSError Unit {
+    loop {
+        Buf.clear(t.outgoing)
+        let n = engine(t, fun() {
+            let r = cInt(SSL.bioRead(t.wbio, IO.addressOf(t.outgoing.storage, 0),
+                                     Buf.capacity(t.outgoing)))
+            Prim.keepAlive(t.outgoing.storage)
+            r
+        })
+        -- An empty memory BIO answers -1, to be retried.
+        if n <= 0 { return Right(()) }
+        t.outgoing.end = n
+        Either.mapLeft(t.stream.writing(t.outgoing), Stream)?
+    }
+}
+
+-- With `engine` held, straight after the call that failed with `code`: why,
+-- from the verification's result and this thread's error queue.
+fun failure(ssl : Prim.Ptr, code : Int) -> TLSError {
+    let verified = SSL.sslGetVerifyResult(ssl)
+    if code == SSL.errorSSL && verified != SSL.verifyOK {
+        SSL.errClearError()
+        return verifyFailure(verified)
+    }
+    if code == SSL.errorSSL || code == SSL.errorSyscall { return Refused(reason()) }
+    Refused("unexpected SSL_get_error " + show(code))
+}
+
+fun verifyFailure(code : Int) -> TLSError {
+    if code == SSL.verifyCertHasExpired { Expired }
+    else if code == SSL.verifyCertNotYetValid { NotYetValid }
+    else if code == SSL.verifyHostnameMismatch || code == SSL.verifyIPAddressMismatch { WrongHost }
+    else if code == SSL.verifyUnableToGetIssuerCert || code == SSL.verifyDepthZeroSelfSigned
+            || code == SSL.verifySelfSignedInChain || code == SSL.verifyUnableToGetIssuerCertLocally
+            || code == SSL.verifyUnableToVerifyLeafSignature { Untrusted }
+    else { BadCertificate(staticText(SSL.x509VerifyCertErrorString(code), "error " + show(code))) }
+}
+
+-- The reason for the oldest error on this thread's queue, which is emptied.
+-- An error from the system, such as a file that is not there, is
+-- `ERR_SYSTEM_FLAG` and its `errno`, which OpenSSL has no text for.
+fun reason() -> String {
+    let code = SSL.errGetError()
+    SSL.errClearError()
+    if code == 0 { return "unknown error" }
+    if (code & SSL.errSystemFlag) != 0 {
+        return Errors.describe(Errors.kindOf(-(code & (SSL.errSystemFlag - 1))))
+    }
+    staticText(SSL.errReasonErrorString(code), "error " + show(code))
+}
+
+-- A string OpenSSL owns, copied, or `otherwise` if there is none.
+fun staticText(p : Prim.Ptr, otherwise : String) -> String =
+    Option.unwrapOr(Ptr.fromCString(Ptr.wrap(p)), otherwise)
+
+-- -- what the handshake chose ---------------------------------------------------------
+
+-- The protocol ALPN chose, once the handshake is done; `None` before, without
+-- ALPN, or once `t` is closed.
+fun protocol(t : TLS) -> Option String = Either.unwrapOr(using(t, "protocol", fun() = Right(engine(t, fun() {
+    if !t.shaken { return None }
+    let out = Ptr.alloc(16)
+    if Ptr.isNull(out) { error("Net.TLS: out of memory") }
+    Ptr.store(out, 8, 0)
+    SSL.sslGet0AlpnSelected(t.ssl, Ptr.raw(out), Ptr.raw(Ptr.add(out, 8)))
+    let data : Ptr.Ptr = Ptr.load(out, 0)
+    -- A C `unsigned int`.
+    let length : Int = Ptr.load(out, 8)
+    Ptr.free(out)
+    let n = length & 0xFFFF_FFFF
+    if Ptr.isNull(data) || n == 0 { return None }
+    String.fromBytes(Array.init(n, fun(i) = (Ptr.load(data, i) : Byte)))
+}))), None)
+
+-- The host name the client sent by SNI, once the handshake is done: on a
+-- client, the one it sent. `None` without one, or once `t` is closed.
+fun serverName(t : TLS) -> Option String = Either.unwrapOr(using(t, "serverName", fun() = Right(engine(t, fun() {
+    if !t.shaken { return None }
+    Ptr.fromCString(Ptr.wrap(SSL.sslGetServername(t.ssl, SSL.nameTypeHostName)))
+}))), None)
+
+-- -- accepting ------------------------------------------------------------------------
+
+-- A TCP listener whose connections are TLS servers presenting `config`.
+type Acceptor = Acceptor { listener : Listener, config : ServerConfig }
+
+fun acceptor(l : Listener, config : ServerConfig) -> Acceptor = Acceptor { listener = l, config }
+
+-- The next connection, as `server` makes it: its handshake runs in its first
+-- read or write, so a slow client does not hold up the next `accept`. Once
+-- `config` is released, a connection is closed as it arrives, and the
+-- answer is `Closed`.
+instance Accept Acceptor {
+    type Accepted = TLS
+    fun accept(Acceptor { listener, config }) {
+        let s = accept(listener)?
+        match server(s, config) {
+            Right(t) -> Right(t)
+            Left(_) -> {
+                let _ = close(s)
+                Left(IOError { kind = Closed, op = "accept", path = None })
+            }
+        }
+    }
+}

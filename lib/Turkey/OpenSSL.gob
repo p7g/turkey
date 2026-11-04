@@ -1,0 +1,262 @@
+export (
+    tlsClientMethod, tlsServerMethod, ctxNew, ctxFree, ctxCtrl, ctxSetOptions, ctxSetVerify,
+    ctxSetDefaultVerifyPaths, ctxLoadVerifyFile, ctxUseCertificateChainFile,
+    ctxUsePrivateKeyFile, ctxCheckPrivateKey, ctxGet0Certificate, ctxSetAlpnSelectCb,
+    ctxSetClientHelloCb, x509CheckHost,
+    sslNew, sslFree, sslSetConnectState, sslSetAcceptState, sslSetBio, sslCtrl, sslSet1Host,
+    sslSetAlpnProtos, sslDoHandshake, sslRead, sslWrite, sslShutdown, sslGetError,
+    sslGetVerifyResult, sslGet0AlpnSelected, sslGetServername, sslClientHelloGet0Ext,
+    sslSetSSLCtx, sslGetExData, sslSetExData, sslSelectNextProto,
+    bioSMem, bioNew, bioFree, bioRead, bioWrite, bioCtrlPending,
+    errClearError, errGetError, errReasonErrorString, x509VerifyCertErrorString, errSystemFlag,
+    errorSSL, errorWantRead, errorWantWrite, errorSyscall, errorZeroReturn,
+    errorWantClientHelloCb,
+    ctrlSetMinProtoVersion, tls12Version, opNoRenegotiation, verifyPeer, filetypePEM,
+    ctrlSetTLSExtHostName, nameTypeHostName, extServerName,
+    clientHelloRetry, clientHelloSuccess, tlsextErrOK, tlsextErrAlertFatal, npnNegotiated,
+    verifyOK, verifyUnableToGetIssuerCert, verifyCertNotYetValid, verifyCertHasExpired,
+    verifyDepthZeroSelfSigned, verifySelfSignedInChain, verifyUnableToGetIssuerCertLocally,
+    verifyUnableToVerifyLeafSignature, verifyHostnameMismatch, verifyIPAddressMismatch,
+)
+
+-- The OpenSSL 3 functions `Net.TLS` calls, and the constants it passes them.
+--
+-- One of the modules the compiler lets declare a C symbol. Nothing here is
+-- linked into a program unless it reaches `Net.TLS`, and one that does links
+-- with `-lssl -lcrypto` (on macOS, Homebrew's `openssl@3`).
+--
+-- **The surface is what a TLS library over memory has to offer, and no
+-- more:** a configuration (roots, a certificate and key, the protocol
+-- versions, ALPN), a connection over two memory buffers, ciphertext in and
+-- out, plaintext in and out, and the verification result. OpenSSL never sees
+-- a descriptor: `rbio` is a memory BIO the caller writes the peer's bytes
+-- into, and `wbio` one it reads the bytes to send out of. rustls-ffi offers
+-- the same shape, so `Net.TLS` could sit on it instead.
+--
+-- **Ownership** follows OpenSSL's rules, which `Net.TLS` states at each use.
+-- An `SSL_CTX` is reference-counted: `SSL_new` takes a reference, so a
+-- connection keeps its context alive after the context's owner frees it.
+-- `SSL_set_bio` hands both BIOs to the connection, and `SSL_free` frees them.
+-- Every `const char *` answered here belongs to OpenSSL and is copied before
+-- the next call.
+--
+-- A C `int` comes back in the low half of a register, with the high half
+-- undefined, so every one is read through `Turkey.Sys.cInt`. The constants
+-- are those of OpenSSL 3's headers, which `tests/test_tls.py` compiles and
+-- compares.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Tuple (Unit)
+import Data.Num (Neg(..))
+
+-- -- contexts ---------------------------------------------------------------------------
+
+foreign "TLS_client_method" fun tlsClientMethod() -> Prim.Ptr
+
+foreign "TLS_server_method" fun tlsServerMethod() -> Prim.Ptr
+
+-- A new context with one reference, or null.
+foreign "SSL_CTX_new" fun ctxNew(method : Prim.Ptr) -> Prim.Ptr
+
+-- Drop one reference; the last frees the context.
+foreign "SSL_CTX_free" fun ctxFree(ctx : Prim.Ptr) -> Unit
+
+-- What `SSL_CTX_set_min_proto_version` is a macro for.
+foreign "SSL_CTX_ctrl" fun ctxCtrl(ctx : Prim.Ptr, command : Int, larg : Int,
+                                   parg : Prim.Ptr) -> Int
+
+-- The options after adding `options` (a `uint64_t`).
+foreign "SSL_CTX_set_options" fun ctxSetOptions(ctx : Prim.Ptr, options : Int) -> Int
+
+-- `callback` null: OpenSSL's own verification, and nothing else.
+foreign "SSL_CTX_set_verify" fun ctxSetVerify(ctx : Prim.Ptr, mode : Int,
+                                              callback : Prim.Ptr) -> Unit
+
+-- The roots in OpenSSL's default places: `$SSL_CERT_FILE` and
+-- `$SSL_CERT_DIR` if set, and otherwise the `cert.pem` and `certs/` of the
+-- directory OpenSSL was built with. 1 on success.
+foreign "SSL_CTX_set_default_verify_paths" fun ctxSetDefaultVerifyPaths(ctx : Prim.Ptr) -> Int
+
+-- The roots in the PEM file at the NUL-terminated `path`. 1 on success.
+foreign "SSL_CTX_load_verify_file" fun ctxLoadVerifyFile(ctx : Prim.Ptr, path : Prim.Ptr) -> Int
+
+-- The certificate and the chain after it, from a PEM file. 1 on success.
+foreign "SSL_CTX_use_certificate_chain_file" fun ctxUseCertificateChainFile(ctx : Prim.Ptr,
+                                                                            path : Prim.Ptr) -> Int
+
+foreign "SSL_CTX_use_PrivateKey_file" fun ctxUsePrivateKeyFile(ctx : Prim.Ptr, path : Prim.Ptr,
+                                                               filetype : Int) -> Int
+
+-- Whether the key is the certificate's: 1 if it is.
+foreign "SSL_CTX_check_private_key" fun ctxCheckPrivateKey(ctx : Prim.Ptr) -> Int
+
+-- The context's certificate, which the context owns.
+foreign "SSL_CTX_get0_certificate" fun ctxGet0Certificate(ctx : Prim.Ptr) -> Prim.Ptr
+
+-- `callback` is a C function pointer: a `foreign` definition's address.
+foreign "SSL_CTX_set_alpn_select_cb" fun ctxSetAlpnSelectCb(ctx : Prim.Ptr, callback : Prim.Ptr,
+                                                            argument : Prim.Ptr) -> Unit
+
+foreign "SSL_CTX_set_client_hello_cb" fun ctxSetClientHelloCb(ctx : Prim.Ptr, callback : Prim.Ptr,
+                                                              argument : Prim.Ptr) -> Unit
+
+-- 1 if the certificate names the host `name[0..length)`, by RFC 6125's rules,
+-- wildcards included. `peername` null.
+foreign "X509_check_host" fun x509CheckHost(certificate : Prim.Ptr, name : Prim.Ptr, length : Int,
+                                            flags : Int, peername : Prim.Ptr) -> Int
+
+-- -- connections ------------------------------------------------------------------------
+
+-- A connection holding a reference to `ctx`, or null.
+foreign "SSL_new" fun sslNew(ctx : Prim.Ptr) -> Prim.Ptr
+
+-- Frees the connection, both its BIOs, and its reference to its context.
+foreign "SSL_free" fun sslFree(ssl : Prim.Ptr) -> Unit
+
+foreign "SSL_set_connect_state" fun sslSetConnectState(ssl : Prim.Ptr) -> Unit
+
+foreign "SSL_set_accept_state" fun sslSetAcceptState(ssl : Prim.Ptr) -> Unit
+
+-- The connection takes ownership of both BIOs.
+foreign "SSL_set_bio" fun sslSetBio(ssl : Prim.Ptr, rbio : Prim.Ptr, wbio : Prim.Ptr) -> Unit
+
+-- What `SSL_set_tlsext_host_name` is a macro for.
+foreign "SSL_ctrl" fun sslCtrl(ssl : Prim.Ptr, command : Int, larg : Int, parg : Prim.Ptr) -> Int
+
+-- The name the peer's certificate must have: a DNS name, or an IP address
+-- written as text. 1 on success.
+foreign "SSL_set1_host" fun sslSet1Host(ssl : Prim.Ptr, name : Prim.Ptr) -> Int
+
+-- The protocols to offer, in ALPN's wire form. **0** on success.
+foreign "SSL_set_alpn_protos" fun sslSetAlpnProtos(ssl : Prim.Ptr, protocols : Prim.Ptr,
+                                                   length : Int) -> Int
+
+-- 1 when the handshake is done, and otherwise what `SSL_get_error` explains.
+foreign "SSL_do_handshake" fun sslDoHandshake(ssl : Prim.Ptr) -> Int
+
+-- How many bytes were read or written, or `<= 0` and what `SSL_get_error`
+-- explains.
+foreign "SSL_read" fun sslRead(ssl : Prim.Ptr, buffer : Prim.Ptr, length : Int) -> Int
+
+foreign "SSL_write" fun sslWrite(ssl : Prim.Ptr, buffer : Prim.Ptr, length : Int) -> Int
+
+-- Queue a close_notify. 0 or 1 once it is queued.
+foreign "SSL_shutdown" fun sslShutdown(ssl : Prim.Ptr) -> Int
+
+-- Why the call that answered `result` stopped. It reads this thread's error
+-- queue, so it is asked straight after the call, with nothing between.
+foreign "SSL_get_error" fun sslGetError(ssl : Prim.Ptr, result : Int) -> Int
+
+-- The verification's `X509_V_` code: `X509_V_OK`, or why the peer's
+-- certificate was refused.
+foreign "SSL_get_verify_result" fun sslGetVerifyResult(ssl : Prim.Ptr) -> Int
+
+-- The protocol ALPN chose: a pointer to its bytes into `data`, and their
+-- count, a C `unsigned int`, into `length`; a null pointer and 0 if none.
+foreign "SSL_get0_alpn_selected" fun sslGet0AlpnSelected(ssl : Prim.Ptr, data : Prim.Ptr,
+                                                         length : Prim.Ptr) -> Unit
+
+-- The server name the client sent, NUL-terminated, or null.
+foreign "SSL_get_servername" fun sslGetServername(ssl : Prim.Ptr, nameType : Int) -> Prim.Ptr
+
+-- During the client-hello callback, or after it asked for a retry: the body
+-- of the client's extension `extension`, a pointer into `out` and a `size_t`
+-- into `length`. 1 if the client sent it.
+foreign "SSL_client_hello_get0_ext" fun sslClientHelloGet0Ext(ssl : Prim.Ptr, extension : Int,
+                                                              out : Prim.Ptr,
+                                                              length : Prim.Ptr) -> Int
+
+-- Move the connection to `ctx`'s certificate, taking a reference to `ctx`
+-- and dropping the one to its old context.
+foreign "SSL_set_SSL_CTX" fun sslSetSSLCtx(ssl : Prim.Ptr, ctx : Prim.Ptr) -> Prim.Ptr
+
+-- Slot 0 is the application's, what `SSL_get_app_data` reads.
+foreign "SSL_get_ex_data" fun sslGetExData(ssl : Prim.Ptr, index : Int) -> Prim.Ptr
+
+foreign "SSL_set_ex_data" fun sslSetExData(ssl : Prim.Ptr, index : Int, data : Prim.Ptr) -> Int
+
+-- The first of the server's protocols that the client offers too, as a
+-- pointer into the server's list in `out` and a length byte in `outLength`.
+-- `OPENSSL_NPN_NEGOTIATED` if there was one.
+foreign "SSL_select_next_proto" fun sslSelectNextProto(out : Prim.Ptr, outLength : Prim.Ptr,
+                                                       server : Prim.Ptr, serverLength : Int,
+                                                       client : Prim.Ptr, clientLength : Int) -> Int
+
+-- -- memory BIOs ------------------------------------------------------------------------
+
+foreign "BIO_s_mem" fun bioSMem() -> Prim.Ptr
+
+-- An empty memory BIO, which grows as it is written and, read while empty,
+-- asks to be retried rather than reporting an end. Null if out of memory.
+foreign "BIO_new" fun bioNew(method : Prim.Ptr) -> Prim.Ptr
+
+foreign "BIO_free" fun bioFree(bio : Prim.Ptr) -> Int
+
+foreign "BIO_read" fun bioRead(bio : Prim.Ptr, buffer : Prim.Ptr, length : Int) -> Int
+
+foreign "BIO_write" fun bioWrite(bio : Prim.Ptr, buffer : Prim.Ptr, length : Int) -> Int
+
+-- How many bytes the BIO holds, a `size_t`.
+foreign "BIO_ctrl_pending" fun bioCtrlPending(bio : Prim.Ptr) -> Int
+
+-- -- errors -----------------------------------------------------------------------------
+
+-- The error queue is the thread's: cleared before each call whose failure is
+-- read, and read before anything else runs on the thread.
+foreign "ERR_clear_error" fun errClearError() -> Unit
+
+-- The oldest error on the queue, removed from it, or 0. An `unsigned long`.
+foreign "ERR_get_error" fun errGetError() -> Int
+
+-- A static description of the error's reason, or null.
+foreign "ERR_reason_error_string" fun errReasonErrorString(code : Int) -> Prim.Ptr
+
+-- A static description of an `X509_V_` code.
+foreign "X509_verify_cert_error_string" fun x509VerifyCertErrorString(code : Int) -> Prim.Ptr
+
+-- -- constants --------------------------------------------------------------------------
+
+-- The bit of an `ERR_get_error` code that marks an error from the system,
+-- whose bits below it are the `errno`.
+let errSystemFlag : Int = 0x8000_0000
+
+-- `SSL_get_error`'s answers.
+let errorSSL : Int = 1
+let errorWantRead : Int = 2
+let errorWantWrite : Int = 3
+let errorSyscall : Int = 5
+let errorZeroReturn : Int = 6
+let errorWantClientHelloCb : Int = 11
+
+let ctrlSetMinProtoVersion : Int = 123
+let tls12Version : Int = 0x0303
+-- `SSL_OP_NO_RENEGOTIATION`, a bit of a `uint64_t`.
+let opNoRenegotiation : Int = 0x4000_0000
+let verifyPeer : Int = 1
+let filetypePEM : Int = 1
+let ctrlSetTLSExtHostName : Int = 55
+let nameTypeHostName : Int = 0
+-- `TLSEXT_TYPE_server_name`, the extension that carries SNI.
+let extServerName : Int = 0
+
+-- What the client-hello callback answers.
+let clientHelloRetry : Int = -1
+let clientHelloSuccess : Int = 1
+
+-- What the ALPN callback answers.
+let tlsextErrOK : Int = 0
+let tlsextErrAlertFatal : Int = 2
+let npnNegotiated : Int = 1
+
+-- `X509_V_` codes.
+let verifyOK : Int = 0
+let verifyUnableToGetIssuerCert : Int = 2
+let verifyCertNotYetValid : Int = 9
+let verifyCertHasExpired : Int = 10
+let verifyDepthZeroSelfSigned : Int = 18
+let verifySelfSignedInChain : Int = 19
+let verifyUnableToGetIssuerCertLocally : Int = 20
+let verifyUnableToVerifyLeafSignature : Int = 21
+let verifyHostnameMismatch : Int = 62
+let verifyIPAddressMismatch : Int = 64

@@ -2913,22 +2913,34 @@ fun flatValue(l : Lower, f : Layout.Flat, held : Ssa.Layout, k : Int,
     let values = Array.map(args, value(l, _))
     let slots = Array.map(f.slots, storageZero(l, _))
     if len(f.names) > 0 { slots[0] = enumValue(l, k, f.slots[0]) }
+    -- One box for a value held boxed in more than one field, as `(x, x)` is.
+    let boxes = Map.new()
     for var i = 0; i < len(fields); i = i + 1 {
         let at = fields[i]
-        let parts = fieldSlots(l, values[i], Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) })
+        let parts = fieldSlots(l, values[i], Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) },
+                               boxes)
         for var j = 0; j < len(at); j = j + 1 { slots[at[j]] = parts[j] }
     }
     fromSlots(l, held, slots)
 }
 
 -- The slots a flat value holds its field `v` in, at `layout`: the field's own,
--- or the box of a field of several slots held as a pointer (`Layout.Flat`).
-fun fieldSlots(l : Lower, v : Value, layout : Ssa.Layout) -> Array Value =
-    match multiOf(l, v) {
-        Some(m) -> if len(multiLayout(m).slots) != len(layout.slots) { [stored(l, v)] }
-                   else { slotsOf(l, v, layout) }
-        None -> slotsOf(l, v, layout)
-    }
+-- or the box of a field of several slots held as a pointer (`Layout.Flat`),
+-- which is the one in `boxes` if `v` has been boxed already.
+fun fieldSlots(l : Lower, v : Value, layout : Ssa.Layout,
+               boxes : Map Int Value) -> Array Value = match multiOf(l, v) {
+    Some(m) -> if len(multiLayout(m).slots) != len(layout.slots) {
+        match Map.get(boxes, Ssa.valueId(v)) {
+            Some(box) -> [box]
+            None -> {
+                let box = stored(l, v)
+                Map.put(boxes, Ssa.valueId(v), box)
+                [box]
+            }
+        }
+    } else { slotsOf(l, v, layout) }
+    None -> slotsOf(l, v, layout)
+}
 
 -- The value of a field of `layout` that a flat value holds in `values`: the
 -- slots themselves, or the box of a field of several slots held as one

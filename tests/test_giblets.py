@@ -375,8 +375,10 @@ HIDDEN = (
 
 @pytest.mark.parametrize("helper, reason, line", [
     # Polymorphic recursion is compiled per layout, so passing `n` boxes
-    # nothing; what allocates is the tuple the recursion builds.
-    ("nests", "builds a tuple", 5),
+    # nothing. The tuple the recursion builds is flat until its components
+    # are four slots each, and then it holds each as a pointer to its box:
+    # what allocates is that box, of the copy's `a`.
+    ("nests", "builds a value of a", 5),
     # An existential packing is an object with the layout codes in front. It
     # goes into an array so that it outlives the function that opens it: a
     # packing opened where it is built is read from its operands and deleted.

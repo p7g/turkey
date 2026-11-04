@@ -12,8 +12,8 @@ export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt
 -- holds a reference for as long as it uses the number, `close` only marks the
 -- descriptor closed, and `close(2)` runs when the last reference is dropped.
 --
--- **The state word**, a `Prim.Atomic` of its own, so that every access to it
--- is atomic, as `System.Sync` keeps its own:
+-- **The state word**, a `Sync.AtomicInt` of its own, so that every access to it
+-- is atomic:
 --
 -- * bit 0, `closedBit`: `close` has been called. Nothing clears it, and an
 --   operation that finds it set takes no reference and answers `closed`;
@@ -82,6 +82,7 @@ import Turkey.Scheduler as Scheduler
 import Turkey.Semaphore as Semaphore
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
+import System.Sync as Sync
 import Target (OS(..))
 import Target as Target
 
@@ -104,7 +105,7 @@ let timedOut : Int = Wait.timedOut
 -- `readMode` is changed only by whoever holds the read lock, and `polled`
 -- only from False to True, so neither needs an atomic instruction.
 type FD = FD {
-    state        : Prim.Atomic,
+    state        : Sync.AtomicInt,
     number       : Int,
     var readMode : ReadMode,
     var polled   : Bool,
@@ -117,7 +118,7 @@ type FD = FD {
 
 -- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
 fun fd(number : Int) -> FD = FD {
-    state = Prim.atomicNew(0),
+    state = Sync.atomicInt(0),
     number = number,
     readMode = Unknown,
     polled = False,
@@ -275,7 +276,7 @@ fun flock(f : FD, operation : Int, deadline : Int) -> Int {
 fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
     let r = IO.flock(f.number, operation | Sys.lockNonBlocking)
     if r != -Sys.eagain() { return r }
-    let stop = fun() = Prim.atomicGet(f.state) & closedBit != 0
+    let stop = fun() = Sync.load(f.state) & closedBit != 0
     let w = Wait.lockedUnless(f.number, operation, deadline, stop)
     if w == Wait.cancelled { closed } else { w }
 }
@@ -324,7 +325,7 @@ fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
         Right(r) -> {
             done()
             -- Closed meanwhile: the lock goes when the descriptor does.
-            if r == 0 && Prim.atomicGet(f.state) & closedBit != 0 { closed } else { r }
+            if r == 0 && Sync.load(f.state) & closedBit != 0 { closed } else { r }
         }
     }
 }
@@ -350,10 +351,10 @@ fun flockCalls(f : FD) -> Semaphore.Semaphore {
 fun close(f : FD) -> Int {
     let p = f.state
     while True {
-        let state = Prim.atomicGet(p)
+        let state = Sync.load(p)
         if state & closedBit != 0 { return 0 }
         let marked = (state | closedBit) + reference
-        if Prim.atomicSwapIf(p, state, marked) == state { break }
+        if Sync.compareAndSet(p, state, marked) { break }
     }
     -- A waiter registers under the scheduler's lock after seeing the bit
     -- clear, so one that registered before this takes the lock is in a list,
@@ -378,9 +379,9 @@ fun close(f : FD) -> Int {
 fun acquire(f : FD) -> Bool {
     let p = f.state
     while True {
-        let state = Prim.atomicGet(p)
+        let state = Sync.load(p)
         if state & closedBit != 0 { return False }
-        if Prim.atomicSwapIf(p, state, state + reference) == state { return True }
+        if Sync.compareAndSet(p, state, state + reference) { return True }
     }
     False
 }
@@ -390,17 +391,16 @@ fun acquire(f : FD) -> Bool {
 -- sees the count reach 0 with the bit set, since no reference is taken once
 -- it is set and `close` holds one of its own while it sets it.
 fun release(f : FD) -> Int {
-    let before = Prim.atomicAddTo(f.state, -reference)
-    if before - reference == closedBit { closeNumber(f) } else { 0 }
+    if Sync.addAndGet(f.state, -reference) == closedBit { closeNumber(f) } else { 0 }
 }
 
 -- Take `bit`'s lock and a reference with it, waiting for the lock if it is
 -- held, unless `f` is or becomes closed. Whether it was taken.
 fun lock(f : FD, bit : Int, waited : Int) -> Bool {
     let p = f.state
-    let state = Prim.atomicGet(p)
+    let state = Sync.load(p)
     if state & (closedBit + bit) == 0 {
-        if Prim.atomicSwapIf(p, state, state + bit + reference) == state { return True }
+        if Sync.compareAndSet(p, state, state + bit + reference) { return True }
     }
     let claim = Claim { got = False }
     Scheduler.waitUntil(fun() = tryLock(f, bit, waited, claim),
@@ -418,16 +418,16 @@ type Claim = Claim { var got : Bool }
 fun tryLock(f : FD, bit : Int, waited : Int, claim : Claim) -> Bool {
     let p = f.state
     while True {
-        let state = Prim.atomicGet(p)
+        let state = Sync.load(p)
         if state & closedBit != 0 { return True }
         if state & bit == 0 {
-            if Prim.atomicSwapIf(p, state, state + bit + reference) == state {
+            if Sync.compareAndSet(p, state, state + bit + reference) {
                 claim.got = True
                 return True
             }
         } else if state & waited != 0 {
             return False
-        } else if Prim.atomicSwapIf(p, state, state + waited) == state {
+        } else if Sync.compareAndSet(p, state, state + waited) {
             return False
         }
     }
@@ -441,9 +441,9 @@ fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
     let p = f.state
     var before = 0
     while True {
-        before = Prim.atomicGet(p)
+        before = Sync.load(p)
         let after = (before & Int.not(bit + waited)) - reference
-        if Prim.atomicSwapIf(p, before, after) == before { break }
+        if Sync.compareAndSet(p, before, after) { break }
     }
     if before & waited != 0 {
         Scheduler.lock()
@@ -502,7 +502,7 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
 -- wait the poller could not make.
 fun park(f : FD, writing : Bool, deadline : Int) -> Int {
     f.polled = True
-    let stop = fun() = Prim.atomicGet(f.state) & closedBit != 0
+    let stop = fun() = Sync.load(f.state) & closedBit != 0
     let w = if writing { Wait.writableUnless(f.number, deadline, stop) }
             else { Wait.readableUnless(f.number, deadline, stop) }
     if w == Wait.cancelled { closed } else { w }

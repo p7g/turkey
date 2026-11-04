@@ -26,9 +26,9 @@ export (
 --   nonzero constant nor a move from an integer;
 -- * **the call**: each argument register holds a value at the callee's
 --   parameter representation and in the callee's order, and the value read out
---   of the result register is at the callee's result representation -- which
---   for a C function returning `void` means it is not read as anything but
---   unit, because nothing was written there.
+--   of each result register is at the callee's representation for that
+--   result -- which for a C function returning `void` means it is not read as
+--   anything but unit, because nothing was written there.
 --
 -- Virtual registers are judged by `Func.reps`, which selection and the spiller
 -- share with the low IR; physical registers carry their bank. The terminators
@@ -50,12 +50,13 @@ import Turkey.Ssa (Rep(..), RepClass(..), Func(..), Block(..))
 -- What a call to a symbol must pass and may read back.
 --
 -- `Returns` is a Turkey function, whose every parameter and result has a
--- representation. `Void` is a C entry point that writes no result register.
+-- representation, with one result per register it answers in. `Void` is a C
+-- entry point that writes no result register.
 -- A symbol in neither -- the runtime's untyped heap operations, a foreign
 -- declaration -- is checked for banks only, since a machine word is all its
 -- C signature says.
 type Signature
-    = Returns(Array Rep, Rep)
+    = Returns(Array Rep, Array Rep)
     | Void
 
 -- Every symbol a call may name whose signature is known, spelled as a `bl`
@@ -65,7 +66,7 @@ fun signatures(functions : Array (Func Low), dialect : Asm.Dialect)
     let out = Map.new()
     for f in functions {
         let params = Array.map(f.params, fun(p) = Ssa.repOf(f, p))
-        Map.put(out, Asm.spell(Asm.symbolFor(dialect, f.name)), Returns(params, f.result))
+        Map.put(out, Asm.spell(Asm.symbolFor(dialect, f.name)), Returns(params, f.results))
     }
     for name in Rt.voidSymbols() {
         Map.put(out, Asm.spell(Asm.runtimeFor(dialect, name)), Void)
@@ -108,8 +109,9 @@ type Checker = Checker {
     var called : Option Called,
 }
 
--- A call, as the instructions after it need to know it.
-type Called = Called { sym : String, sig : Option Signature, into : Reg }
+-- A call, as the instructions after it need to know it: the register its
+-- first result is read from, and the result registers already read.
+type Called = Called { sym : String, sig : Option Signature, into : Reg, read : Vec Int }
 
 fun complain(c : Checker, what : String) -> Unit {
     let i = c.f.blocks[c.block].insts[c.index]
@@ -533,10 +535,10 @@ fun call(c : Checker, sym : String, sig : Option Signature) -> Unit {
         }
     }
     match (sig, named) {
-        (Some(Returns(params, result)), Some(into)) -> {
+        (Some(Returns(params, results)), Some(into)) -> {
             arguments(c, sym, params)
-            if !sameBank(A.bankOf(result), bankOfReg(c, into)) {
-                complain(c, sym + " answers " + show(result) + ", not in "
+            if !sameBank(A.bankOf(results[0]), bankOfReg(c, into)) {
+                complain(c, sym + " answers " + show(results[0]) + ", not in "
                             + A.showReg(into, W64))
             }
         }
@@ -555,7 +557,7 @@ fun call(c : Checker, sym : String, sig : Option Signature) -> Unit {
         Some(r) -> r
         None -> A.x0
     }
-    c.called = Some(Called { sym = sym, sig = sig, into = into })
+    c.called = Some(Called { sym = sym, sig = sig, into = into, read = [] })
     c.listed = None
     c.moved = Map.new()
     c.stacked = Map.new()
@@ -604,15 +606,27 @@ fun arguments(c : Checker, sym : String, params : Array Rep) -> Unit {
     }
 }
 
--- The first read of the result register after a call is the call's result,
--- and is held at what the callee answers.
+-- The first read of each result register after a call is that result of the
+-- call, and is held at what the callee answers in it.
 fun readsResult(c : Checker, op : Arm) -> Unit {
     if let Some(k) = c.called {
         if let Some((d, from)) = transfer(op) {
-            if regKey(from) == regKey(k.into) {
-                c.called = None
-                if let Some(got) = repOf(c, d) { result(c, k, got) }
+            let key = regKey(from)
+            if Vec.contains(k.read, key) { return }
+            let at = match k.sig {
+                Some(Returns(_, answers)) -> {
+                    let regs = A.resultRegs(answers)
+                    var found = -1
+                    for var j = 0; j < len(regs); j = j + 1 {
+                        if regKey(regs[j]) == key { found = j }
+                    }
+                    found
+                }
+                _ -> if key == regKey(k.into) { 0 } else { -1 }
             }
+            if at < 0 { return }
+            Vec.push(k.read, key)
+            if let Some(got) = repOf(c, d) { result(c, k, at, got) }
         }
     }
 }
@@ -626,10 +640,10 @@ fun transfer(op : Arm) -> Option (Reg, Reg) = match op {
     _ -> None
 }
 
-fun result(c : Checker, k : Called, got : Rep) -> Unit = match k.sig {
-    Some(Returns(_, answers)) -> if got != answers {
+fun result(c : Checker, k : Called, at : Int, got : Rep) -> Unit = match k.sig {
+    Some(Returns(_, answers)) -> if got != answers[at] {
         complain(c, "reads " + show(got) + " from " + k.sym
-                    + ", which answers " + show(answers))
+                    + ", which answers " + show(answers[at]))
     }
     Some(Void) -> if got.class_ != Unit {
         complain(c, "reads " + show(got) + " from " + k.sym

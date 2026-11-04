@@ -182,3 +182,146 @@ def test_flat_values_kept_everywhere_survive_a_collection_at_every_allocation():
         result = lang.run(KEPT, env=env, flags=VERIFY)
         assert result.code == 0, result.stderr
         assert result.stdout == plain
+
+
+# Each function recurses, so none is inlined, and each returns a flat value:
+# a sum with a traced slot, a pair across both register files, three doubles,
+# and three slots two of which are traced. `twice` passes `parse`'s `Left` on
+# through `?`. The closures go through the adapter that boxes a result.
+RETURNED = """
+type Err = Err { message : String, code : Int }
+
+fun parse(s : String, n : Int) -> Either Err Int {
+    if n == 0 { return Left(Err { message = "bad " + s, code = 7 }) }
+    if n < 0 { return parse(s, n + 1) }
+    Right(n * 2)
+}
+
+fun twice(s : String, n : Int) -> Either Err Int {
+    let a = parse(s, n)?
+    let b = parse(s, a - 1)?
+    Right(a + b)
+}
+
+fun pair(n : Int) -> (Int, Float) = if n == 0 { (0, 0.5) } else {
+    let (a, b) = pair(n - 1)
+    (a + n, b * 2.0)
+}
+
+fun floats(x : Float, n : Int) -> (Float, Float, Float) =
+    if n == 0 { (x, x + 1.0, x + 2.0) } else { floats(x * 2.0, n - 1) }
+
+fun names(n : Int) -> (String, Int, String) =
+    if n == 0 { ("a", 0, "z") } else {
+        let (x, k, y) = names(n - 1)
+        (x + "b", k + 1, y + Int.toString(n))
+    }
+
+fun describe(e : Either Err Int) -> String = match e {
+    Left(err) -> "Left(" + err.message + ", " + Int.toString(err.code) + ")"
+    Right(n) -> "Right(" + Int.toString(n) + ")"
+}
+
+fun main() {
+    print(describe(twice("x", 3)))
+    print(describe(twice("y", 0)))
+    print(describe(twice("z", -2)))
+    print(pair(4))
+    print(floats(1.5, 3))
+    print(names(3))
+    let kept = [parse("p", 1), parse("q", 0), twice("r", 2)]
+    for e in kept { print(describe(e)) }
+    let fs = [parse, twice]
+    print(describe(fs[0]("c", 5)))
+    let gs = [fun(n : Int) -> (String, Int, String) = names(n)]
+    print(gs[0](2))
+    var total = 0
+    for var i = 0; i < 300; i = i + 1 {
+        match parse(Int.toString(i), i % 5) {
+            Right(v) -> { total = total + v }
+            Left(err) -> { total = total + err.code + String.byteLength(err.message) }
+        }
+        let (s, k, t) = names(i % 4)
+        total = total + k + String.byteLength(s) + String.byteLength(t)
+    }
+    print(total)
+}
+"""
+
+
+def test_a_flat_result_comes_back_in_registers():
+    plain = lang.output(RETURNED)
+    assert plain == (
+        "Right(16)\nLeft(bad y, 7)\nLeft(bad z, 7)\n(10, 8.0)\n(12.0, 13.0, 14.0)\n"
+        "(abbb, 3, z123)\nRight(2)\nLeft(bad q, 7)\nRight(10)\nRight(10)\n"
+        "(abb, 2, z12)\n3968\n")
+    result = lang.dump("ssa", RETURNED)
+    assert result.code == 0, result.stderr
+    # One register per slot, the integer ones numbered apart from the float
+    # ones, and nothing built to return or to read a result.
+    for name, results in [("parse", "(i1, ptr*, i64)"), ("pair", "(i64, f64)"),
+                          ("floats", "(f64, f64, f64)"), ("names", "(ptr*, i64, ptr*)")]:
+        body = _function(result.stdout, name)
+        assert body.split("{", 1)[0].endswith(f"-> {results} "), body
+        assert "object.new" not in body and "stack.object" not in body, body
+    assert re.search(r"= result %\d+, 2\n", _function(result.stdout, "parse"))
+    # Only the closure's adapter boxes the result.
+    adapter = _function(result.stdout, "parse%boxed")
+    assert adapter.split("{", 1)[0].endswith("-> ptr* "), adapter
+    assert "object.new" in adapter, adapter
+    for env in (STRESS, GENERATIONAL):
+        stressed = lang.run(RETURNED, env=env, flags=VERIFY)
+        assert stressed.code == 0, stressed.stderr
+        assert stressed.stdout == plain
+
+
+# Each function recurses, so none is inlined. In `pick` and `sum` both arms of
+# the `if` read an element, which memory holds boxed; in `mixed` one arm
+# builds the value from its slots.
+MERGED = """
+type R = R { a : Int, b : Bool }
+
+fun pick(xs : Array R, ys : Vec R, c : Bool, n : Int) -> Unit {
+    if n > 0 { return pick(xs, ys, !c, n - 1) }
+    let x = if c { xs[0] } else { xs[1] }
+    Vec.push(ys, x)
+}
+
+fun sum(xs : Array R, c : Bool, n : Int) -> Int {
+    if n > 0 { return sum(xs, !c, n - 1) }
+    let x = if c { xs[0] } else { xs[1] }
+    x.a
+}
+
+fun mixed(xs : Array R, c : Bool, n : Int) -> Vec R {
+    if n > 0 { return mixed(xs, !c, n - 1) }
+    let x = if c { xs[0] } else { R { a = n + 5, b = c } }
+    [x]
+}
+
+fun main() {
+    let xs = [R { a = 1, b = True }, R { a = 2, b = False }]
+    let ys : Vec R = []
+    pick(xs, ys, True, 3)
+    pick(xs, ys, True, 2)
+    print(ys[0].a + ys[1].a)
+    print(sum(xs, False, 1))
+    print(mixed(xs, True, 1)[0].a)
+    print(mixed(xs, True, 2)[0].a)
+}
+"""
+
+
+def test_boxes_arriving_at_a_merge_pass_through_it_boxed():
+    assert lang.output(MERGED) == "3\n1\n5\n1\n"
+    result = lang.dump("ssa", MERGED)
+    assert result.code == 0, result.stderr
+    # Every value arriving is a box, so the merge takes the box: the push
+    # stores the element's own pointer, and the field is read once, after it.
+    pick = _function(result.stdout, "pick")
+    assert "object.new" not in pick and "object.get %" not in pick.split("call @Data.Vec")[0], pick
+    sum_ = _function(result.stdout, "sum")
+    assert sum_.count("object.get") == 1, sum_
+    # A value built from its slots arrives in them, and the merge takes slots.
+    mixed = _function(result.stdout, "mixed")
+    assert re.search(r"b\d+\(%\d+:i64, %\d+:i1\):", mixed), mixed

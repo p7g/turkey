@@ -107,10 +107,10 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
 
 -- Every path that leaves a function without a value -- an `Unreachable`, which
 -- is how selection ends a panic, and an allocation stub whose call panicked --
--- returns a zero of the function's result through one exit after the
--- function's cold code. They are most of a function's ways out, and none is
--- hot, so each costs a branch instead of an epilogue. `Ret` does not come
--- here: see `emitTerm`.
+-- returns a zero in each of the function's result registers through one exit
+-- after the function's cold code. They are most of a function's ways out, and
+-- none is hot, so each costs a branch instead of an epilogue. `Ret` does not
+-- come here: see `emitTerm`.
 fun exitLabel(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
     Asm.localLabel(d, "e" + Int.toString(tag))
 
@@ -711,8 +711,12 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
         -- frame comes down. Every return does its own epilogue, unlike the
         -- zero exits: a return is the hot way out, and a shared epilogue would
         -- cost it a branch to save the restores.
-        Ret(v) -> {
-            result(b, coloured(f, a, A.reg(v)))
+        -- Several results go in at once, as a jump's arguments do: one
+        -- may be in the register another answers in.
+        Ret(vs) -> {
+            let dsts = Vec.fromArray(A.resultRegs(f.results))
+            let srcs = Vec.map(vs, fun(v) = coloured(f, a, A.reg(v)))
+            parallelMove(b, dsts, srcs)
             epilogue(b, l)
         }
         -- An edge into an exit block passes nothing, since nothing reads it.
@@ -762,18 +766,17 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
         Unreachable -> instruction(b, A.B(exitLabel(d, tag)))
     }
 
-fun result(b : Code, r : Reg) -> Unit = match r {
-    Physical(Gp, n) -> if n != 0 { instruction(b, A.Mov(A.x0, r, A.W64)) }
-    Physical(Fp, n) -> if n != 0 { instruction(b, A.FMov(A.d0, r)) }
-    Virtual(_) -> emit(b, Comment("an unallocated result reached the emitter"))
-}
-
--- A double's zero is `fmov d0, xzr`: `mov d0, xzr` is not an instruction.
-fun zero(b : Code, f : Func Inst) -> Unit =
-    match A.bankOf(f.result) {
-        Gp -> instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-        Fp -> instruction(b, A.FMovIn(A.d0, A.xzr))
+-- Every result register zero, for a way out that answers nothing: null in a
+-- traced one, which the collector skips. A double's zero is `fmov d0, xzr`:
+-- `mov d0, xzr` is not an instruction.
+fun zero(b : Code, f : Func Inst) -> Unit {
+    for r in A.resultRegs(f.results) {
+        match r {
+            Physical(Fp, _) -> instruction(b, A.FMovIn(r, A.xzr))
+            _ -> instruction(b, A.Mov(r, A.xzr, A.W64))
+        }
     }
+}
 
 -- -- parallel copies ---------------------------------------------------------
 
@@ -798,9 +801,21 @@ fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation, edges : Array (Opti
         if Option.isSome(edges[Ssa.valueId(args[i])]) { continue }
         let d = coloured(f, a, A.reg(params[i]))
         let s = coloured(f, a, A.reg(args[i]))
-        if A.showReg(d, A.W64) != A.showReg(s, A.W64) {
-            Vec.push(dsts, d)
-            Vec.push(srcs, s)
+        Vec.push(dsts, d)
+        Vec.push(srcs, s)
+    }
+    parallelMove(b, dsts, srcs)
+}
+
+-- Each of `srcs` into the register at the same index of `dsts`, all at once.
+-- A pair already in one register needs no move.
+fun parallelMove(b : Code, allDsts : Vec Reg, allSrcs : Vec Reg) -> Unit {
+    let dsts : Vec Reg = []
+    let srcs : Vec Reg = []
+    for var i = 0; i < len(allDsts) && i < len(allSrcs); i = i + 1 {
+        if !sameReg(allDsts[i], allSrcs[i]) {
+            Vec.push(dsts, allDsts[i])
+            Vec.push(srcs, allSrcs[i])
         }
     }
     let done = Array.filled(len(dsts), False)

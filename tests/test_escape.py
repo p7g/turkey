@@ -109,27 +109,27 @@ def test_frame_objects_survive_collection():
 
 
 ESCAPES = """
--- Two fields, so that it is an object: a record of one immutable field is
--- that field at run time.
-type Box = Box { x : Int, y : Int }
+-- Five fields, more than a value held in registers can have, so that it is an
+-- object wherever it is.
+type Box = Box { x : Int, y : Int, z : Int, u : Int, w : Int }
 type Holder = Holder { var item : Box }
 type Chain = Link(Int, Chain) | End
 
 var kept : Vec Box = []
 
-fun toGlobal(n : Int) -> Unit { Vec.push(kept, Box { x = n, y = 0 }) }
+fun toGlobal(n : Int) -> Unit { Vec.push(kept, Box { x = n, y = 0, z = 0, u = 0, w = 0 }) }
 
-fun returned(n : Int) -> Box = Box { x = n, y = 0 }
+fun returned(n : Int) -> Box = Box { x = n, y = 0, z = 0, u = 0, w = 0 }
 
 fun captured(n : Int) -> fun() -> Int {
-    let b = Box { x = n, y = 0 }
+    let b = Box { x = n, y = 0, z = 0, u = 0, w = 0 }
     fun() = b.x
 }
 
-fun through(f : fun(Box) -> Int, n : Int) -> Int = f(Box { x = n, y = 0 })
+fun through(f : fun(Box) -> Int, n : Int) -> Int = f(Box { x = n, y = 0, z = 0, u = 0, w = 0 })
 
 fun stored(h : Holder, n : Int) -> Int {
-    h.item = Box { x = n, y = 0 }
+    h.item = Box { x = n, y = 0, z = 0, u = 0, w = 0 }
     h.item.x
 }
 
@@ -152,7 +152,7 @@ fun recursive(n : Int) -> Int {
 fun main() {
     toGlobal(1)
     print(kept[0].x + returned(2).x + captured(3)() + through(fun(b) = b.x, 4))
-    let h = Holder { item = Box { x = 0, y = 0 } }
+    let h = Holder { item = Box { x = 0, y = 0, z = 0, u = 0, w = 0 } }
     print(stored(h, 5) + h.item.x)
     print(chain(100))
     print(recursive(6))

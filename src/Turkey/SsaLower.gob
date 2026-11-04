@@ -81,8 +81,12 @@ type Signature = Signature {
     -- Per parameter, the registers it is passed in: its slots (`passedIn`),
     -- or one pointer where the body needs its box (`boxParameters`).
     params : Array (Array Rep),
-    -- A result of several slots is returned as its box.
-    result : Rep,
+    -- The registers the result is answered in: a value of several slots in
+    -- its slots, one register each (`Ssa.Func.results`), and any other value
+    -- in the one register it is held in. A closure answers a value of several
+    -- slots as its box, so a closure over a function that answers in several
+    -- registers goes through an adapter that boxes them (`adaptClosures`).
+    results : Array Rep,
     -- Whether a saturated call never comes back: the body always reaches
     -- `Prim.error` or another such call. Set by `signatures` once every
     -- binding has an entry, since it is a fact about the call graph.
@@ -222,6 +226,10 @@ type Dest
     -- A block taking the value as its one parameter. This is where a phi would
     -- be, and having it be a jump argument is why there is no phi.
     | ToBlock(BlockId)
+    -- A block taking a value of several slots, whose parameters are decided
+    -- once every value arriving at it is known (`control`). Each arrival is
+    -- the block it comes from, left unterminated, and the value.
+    | ToMerge(BlockId, Vec (BlockId, Value))
 
 -- -- representations ----------------------------------------------------------------
 
@@ -278,7 +286,7 @@ fun setLayouts(l : Lower, layouts : Map String Ssa.Layout) -> Unit {
 }
 
 -- The one register a value of this type is held in when it is held in one: in
--- memory, in a closure's parameters and result, and in a function's result.
+-- memory, and in a closure's parameters and result.
 -- A type of several slots is held there as a pointer to its box.
 fun repIn(decls : DeclTable, layouts : Map String Ssa.Layout, ty : Ty.Type) -> Rep =
     Layout.storedRep(layoutIn(decls, layouts, ty))
@@ -412,9 +420,11 @@ fun paramsFor(l : Lower, block : BlockId, layout : Ssa.Layout) -> Value {
 -- memory and passed through the join is then not taken apart and boxed again.
 fun joinParams(l : Lower, target : BlockId, params : Array CParam, body : Core,
                dest : Dest) -> Vec Value {
+    -- A function that answers a value of several slots answers its slots,
+    -- and a closure answers its box.
     let returned = match dest {
-        ToReturn -> True
-        ToBlock(_) -> False
+        ToReturn -> len(l.func.results) == 1
+        _ -> False
     }
     let boxed = Array.map(params, fun(p) {
         if !isMulti(heldOf(l, p.ty)) { return False }
@@ -533,11 +543,12 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
     (module_, skipped)
 }
 
--- Point every closure over a top-level function that takes a parameter in
--- several registers at an adapter of the closure convention, which takes that
--- parameter boxed, as every caller of a closure passes it (`closureCall`), and
--- calls the function with its slots. One adapter per such function, made only
--- where a closure over it is.
+-- Point every closure over a top-level function that takes a parameter or
+-- answers its result in several registers at an adapter of the closure
+-- convention, which takes that parameter boxed, as every caller of a closure
+-- passes it (`closureCall`), calls the function with its slots, and answers
+-- the box of its results. One adapter per such function, made only where a
+-- closure over it is.
 fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
     let made = Map.new()
     for f in m.functions {
@@ -545,7 +556,8 @@ fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
             for inst in block.insts {
                 match inst.op {
                     ClosureNew(name, None) -> match Map.get(sigs, name) {
-                        Some(sig) -> if Iterator.any(sig.params, fun(reps) = len(reps) > 1) {
+                        Some(sig) -> if Iterator.any(sig.params, fun(reps) = len(reps) > 1)
+                                         || len(sig.results) > 1 {
                             let symbol = name + "%boxed"
                             if !Map.contains(made, name) {
                                 Map.put(made, name, adapter(name, symbol, sig))
@@ -566,7 +578,8 @@ fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
 
 -- The adapter `symbol` for the function `name` of signature `sig`.
 fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
-    let f = Ssa.newFunc(symbol, sig.result)
+    let boxes = len(sig.results) > 1
+    let f = Ssa.newFunc(symbol, if boxes { [Ssa.traced(Ptr)] } else { sig.results })
     let b = L.builder(f, BlockId(0))
     L.into(b, L.block(b))
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
@@ -585,8 +598,15 @@ fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
             }
         }
     }
-    let result = L.emit(b, Call(Direct(name), Vec.toArray(args)), sig.result)
-    L.terminate(b, Ret(result))
+    let first = L.emit(b, Call(Direct(name), Vec.toArray(args)), sig.results[0])
+    if !boxes {
+        L.terminate(b, Ret([first]))
+        return f
+    }
+    let results = Array.init(len(sig.results), fun(k) =
+        if k == 0 { first } else { L.emit(b, Result(first, k), sig.results[k]) })
+    let box = L.emit(b, ObjectNew(0, -1, Rt.layout(sig.results), results, 0), Ssa.traced(Ptr))
+    L.terminate(b, Ret([box]))
     f
 }
 
@@ -735,8 +755,9 @@ fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
 }
 
 -- Pass a parameter of several slots boxed, as one pointer, to a function
--- whose body needs its box: one that stores it, returns it, or passes it on
--- where a box is wanted. Its callers hold such a value boxed often, having read
+-- whose body needs its box: one that stores it, or passes it on where a box
+-- is wanted. Returning it is not such a use, since a function answers a value
+-- of several slots in its slots. Its callers hold such a value boxed often, having read
 -- it from memory, and then pass the pointer they have, where in slots the
 -- callee would box it again. A parameter the body only takes apart keeps its
 -- slots, so nothing is boxed or loaded for it at all.
@@ -771,7 +792,7 @@ fun boxParameters(program : CProgram, decls : DeclTable,
                     a.names = Set.new()
                     a.boxed = False
                     Set.add(a.names, params[i].name)
-                    usesIn(a, body, True)
+                    usesIn(a, body, len(sig.results) == 1)
                     if a.boxed {
                         sig.params[i] = [Ssa.traced(Ptr)]
                         changed = True
@@ -797,7 +818,7 @@ type Uses = Uses {
 -- Look for a use in `e`, which is somewhere a box of its value is wanted if
 -- `boxed`. A position of several slots that takes them apart, binds them or
 -- passes them on in slots wants no box; memory, a closure's argument and a
--- function's result do.
+-- closure's result do.
 fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
     if a.boxed { return }
     match e.kind {
@@ -991,10 +1012,10 @@ fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
     -- From the binding's own type rather than from the body: a body that
     -- always diverges is typed bottom, and a caller reads the signature.
     let result = match Ty.prune(resultType(bind.ty)) {
-        TBottom -> repIn(decls, bind.layouts, body.ty)
-        other -> repIn(decls, bind.layouts, other)
+        TBottom -> layoutIn(decls, bind.layouts, body.ty)
+        other -> layoutIn(decls, bind.layouts, other)
     }
-    Some(Signature { params = reps, result = result, diverges = False })
+    Some(Signature { params = reps, results = passedIn(result), diverges = False })
 }
 
 -- Every constructor's runtime tag: the whole program's constructor names in
@@ -1048,9 +1069,9 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     -- of the two moved.
     let sig = match Map.get(sigs, bind.name) {
         Some(found) -> found
-        None -> Signature { params = [], result = Ssa.traced(Ptr), diverges = False }
+        None -> Signature { params = [], results = [Ssa.traced(Ptr)], diverges = False }
     }
-    let f = Ssa.newFunc(bind.name, sig.result)
+    let f = Ssa.newFunc(bind.name, sig.results)
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, bind.layouts, [],
                      shared)
@@ -1940,8 +1961,34 @@ fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
 }
 
 fun finish(l : Lower, v : Value, dest : Dest) -> Unit = match dest {
-    ToReturn -> L.terminate(l.b, Ret(coerce(l, v, l.func.result)))
+    ToReturn -> L.terminate(l.b, Ret(returned(l, v)))
     ToBlock(target) -> L.terminate(l.b, Jump(target, argsFor(l, target, [v])))
+    ToMerge(_, arrivals) -> Vec.push(arrivals, (l.b.at, v))
+}
+
+-- What a function answers for `v`, one value per register it answers in. A
+-- value of several slots is answered in its slots, loaded here if it is boxed,
+-- so a call's results passed straight back are moved and nothing is built.
+fun returned(l : Lower, v : Value) -> Vec Value {
+    let results = l.func.results
+    if len(results) == 1 { return [coerce(l, v, results[0])] }
+    match multiOf(l, v) {
+        Some(m) -> {
+            let slots = slotsOf(l, v, multiLayout(m))
+            if len(slots) != len(results) {
+                return [stop(l, "a value of " + Ssa.layoutName(multiLayout(m))
+                                + " answered in " + Int.toString(len(results)) + " registers")]
+            }
+            Vec.fromArray(Array.init(len(results), fun(k) = coerce(l, slots[k], results[k])))
+        }
+        -- A diverging expression's value, which nothing reads.
+        None -> if Ssa.repOf(l.func, v).class_ == Unit {
+            Vec.fromArray(Array.map(results, zero(l, _)))
+        } else {
+            [stop(l, "a value of " + show(Ssa.repOf(l.func, v)) + " answered in "
+                     + Int.toString(len(results)) + " registers")]
+        }
+    }
 }
 
 -- -- representation boundaries -------------------------------------------------------
@@ -2144,10 +2191,36 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
 -- `lower` already sends a value to a destination; this makes a destination out
 -- of a fresh block and reads the value back out of its parameter. Nothing else
 -- is needed, and in particular no slot: the parameter is the value.
+--
+-- A value of several slots arrives boxed when every value sent to it is a box,
+-- as values read from memory are, and in its slots otherwise. A merge whose
+-- value is stored again then passes the pointer on, where taking every box
+-- apart would build a new one for the store. When the merge's value is taken
+-- apart instead, the loads move from the arms to the merge, which costs the
+-- same. The jumps into it are made once the arms are lowered, since only then
+-- is it known which form the values arrive in.
 fun control(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     let merge = L.block(l.b)
-    let arrived = paramsFor(l, merge, held)
-    lower(l, e, ToBlock(merge))
+    if !isMulti(held) {
+        let arrived = paramsFor(l, merge, held)
+        lower(l, e, ToBlock(merge))
+        L.into(l.b, merge)
+        return arrived
+    }
+    let arrivals = []
+    lower(l, e, ToMerge(merge, arrivals))
+    let boxed = len(arrivals) > 0 && Iterator.all(arrivals, fun((_, v)) = match multiOf(l, v) {
+        Some(Boxed(_, _)) -> True
+        _ -> False
+    })
+    let arrived = if boxed {
+        Map.put(l.held.boxedJoins, blockIndex(merge), [True])
+        fromStored(l, held, L.param(l.b, merge, Ssa.traced(Ptr)))
+    } else { paramsFor(l, merge, held) }
+    for (from, v) in arrivals {
+        L.into(l.b, from)
+        L.terminate(l.b, Jump(merge, argsFor(l, merge, [v])))
+    }
     L.into(l.b, merge)
     arrived
 }
@@ -2358,7 +2431,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     let symbol = l.func.name + "%lambda" + Int.toString(l.shared.next)
     l.shared.next = l.shared.next + 1
     -- The body and every call site derive the signature from its types.
-    let g = Ssa.newFunc(symbol, repOf(l, result))
+    let g = Ssa.newFunc(symbol, [repOf(l, result)])
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
     -- forgot them would read its captures at the boxed width.
@@ -2994,7 +3067,14 @@ fun directCall(l : Lower, name : String, sig : Signature, args : Array Core,
             }
         }
     }
-    coerce(l, L.emit(l.b, Call(Direct(name), Vec.toArray(supplied)), sig.result), rep)
+    let first = L.emit(l.b, Call(Direct(name), Vec.toArray(supplied)), sig.results[0])
+    if len(sig.results) == 1 { return coerce(l, first, rep) }
+    -- Every result is read right after the call, in the order the callee
+    -- answers them (`Result`), whether or not anything uses it: an unused one
+    -- is deleted later, and a use that wants the value boxed builds the box.
+    let results = Array.init(len(sig.results), fun(k) =
+        if k == 0 { first } else { L.emit(l.b, Result(first, k), sig.results[k]) })
+    newMulti(l, Slots(Ssa.Layout { slots = sig.results }, results))
 }
 
 -- The closure operand's function type defines the ABI at every call site.
@@ -3498,7 +3578,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                  sigs : Map String Signature, shared : Lifting,
                  layouts : Map String (Map String Ssa.Layout), held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
-    let f = Ssa.newFunc(name, Ssa.untraced(Unit))
+    let f = Ssa.newFunc(name, [Ssa.untraced(Unit)])
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, Map.new(), [], shared)
     L.into(l.b, L.block(l.b))
     for a in actions {
@@ -3527,7 +3607,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                               + why)
         }
     }
-    L.terminate(l.b, Ret(L.emit(l.b, ConstUnit, Ssa.untraced(Unit))))
+    L.terminate(l.b, Ret([L.emit(l.b, ConstUnit, Ssa.untraced(Unit))]))
     (Promote.run(f), pruneAll(l.lifted))
 }
 

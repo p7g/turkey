@@ -226,6 +226,10 @@ type Dest
     -- A block taking the value as its one parameter. This is where a phi would
     -- be, and having it be a jump argument is why there is no phi.
     | ToBlock(BlockId)
+    -- A block taking a value of several slots, whose parameters are decided
+    -- once every value arriving at it is known (`control`). Each arrival is
+    -- the block it comes from, left unterminated, and the value.
+    | ToMerge(BlockId, Vec (BlockId, Value))
 
 -- -- representations ----------------------------------------------------------------
 
@@ -420,7 +424,7 @@ fun joinParams(l : Lower, target : BlockId, params : Array CParam, body : Core,
     -- and a closure answers its box.
     let returned = match dest {
         ToReturn -> len(l.func.results) == 1
-        ToBlock(_) -> False
+        _ -> False
     }
     let boxed = Array.map(params, fun(p) {
         if !isMulti(heldOf(l, p.ty)) { return False }
@@ -1958,6 +1962,7 @@ fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
 fun finish(l : Lower, v : Value, dest : Dest) -> Unit = match dest {
     ToReturn -> L.terminate(l.b, Ret(returned(l, v)))
     ToBlock(target) -> L.terminate(l.b, Jump(target, argsFor(l, target, [v])))
+    ToMerge(_, arrivals) -> Vec.push(arrivals, (l.b.at, v))
 }
 
 -- What a function answers for `v`, one value per register it answers in. A
@@ -2185,10 +2190,36 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
 -- `lower` already sends a value to a destination; this makes a destination out
 -- of a fresh block and reads the value back out of its parameter. Nothing else
 -- is needed, and in particular no slot: the parameter is the value.
+--
+-- A value of several slots arrives boxed when every value sent to it is a box,
+-- as values read from memory are, and in its slots otherwise. A merge whose
+-- value is stored again then passes the pointer on, where taking every box
+-- apart would build a new one for the store. When the merge's value is taken
+-- apart instead, the loads move from the arms to the merge, which costs the
+-- same. The jumps into it are made once the arms are lowered, since only then
+-- is it known which form the values arrive in.
 fun control(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     let merge = L.block(l.b)
-    let arrived = paramsFor(l, merge, held)
-    lower(l, e, ToBlock(merge))
+    if !isMulti(held) {
+        let arrived = paramsFor(l, merge, held)
+        lower(l, e, ToBlock(merge))
+        L.into(l.b, merge)
+        return arrived
+    }
+    let arrivals = []
+    lower(l, e, ToMerge(merge, arrivals))
+    let boxed = len(arrivals) > 0 && Iterator.all(arrivals, fun((_, v)) = match multiOf(l, v) {
+        Some(Boxed(_, _)) -> True
+        _ -> False
+    })
+    let arrived = if boxed {
+        Map.put(l.held.boxedJoins, blockIndex(merge), [True])
+        fromStored(l, held, L.param(l.b, merge, Ssa.traced(Ptr)))
+    } else { paramsFor(l, merge, held) }
+    for (from, v) in arrivals {
+        L.into(l.b, from)
+        L.terminate(l.b, Jump(merge, argsFor(l, merge, [v])))
+    }
     L.into(l.b, merge)
     arrived
 }

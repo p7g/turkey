@@ -336,3 +336,55 @@ def test_a_field_too_wide_to_fit_is_held_as_its_box():
         stressed = lang.run(WIDE, env=env, flags=VERIFY)
         assert stressed.code == 0, stressed.stderr
         assert stressed.stdout == plain
+
+
+# Each function recurses, so none is inlined. In `pick` and `sum` both arms of
+# the `if` read an element, which memory holds boxed; in `mixed` one arm
+# builds the value from its slots.
+MERGED = """
+type R = R { a : Int, b : Bool }
+
+fun pick(xs : Array R, ys : Vec R, c : Bool, n : Int) -> Unit {
+    if n > 0 { return pick(xs, ys, !c, n - 1) }
+    let x = if c { xs[0] } else { xs[1] }
+    Vec.push(ys, x)
+}
+
+fun sum(xs : Array R, c : Bool, n : Int) -> Int {
+    if n > 0 { return sum(xs, !c, n - 1) }
+    let x = if c { xs[0] } else { xs[1] }
+    x.a
+}
+
+fun mixed(xs : Array R, c : Bool, n : Int) -> Vec R {
+    if n > 0 { return mixed(xs, !c, n - 1) }
+    let x = if c { xs[0] } else { R { a = n + 5, b = c } }
+    [x]
+}
+
+fun main() {
+    let xs = [R { a = 1, b = True }, R { a = 2, b = False }]
+    let ys : Vec R = []
+    pick(xs, ys, True, 3)
+    pick(xs, ys, True, 2)
+    print(ys[0].a + ys[1].a)
+    print(sum(xs, False, 1))
+    print(mixed(xs, True, 1)[0].a)
+    print(mixed(xs, True, 2)[0].a)
+}
+"""
+
+
+def test_boxes_arriving_at_a_merge_pass_through_it_boxed():
+    assert lang.output(MERGED) == "3\n1\n5\n1\n"
+    result = lang.dump("ssa", MERGED)
+    assert result.code == 0, result.stderr
+    # Every value arriving is a box, so the merge takes the box: the push
+    # stores the element's own pointer, and the field is read once, after it.
+    pick = _function(result.stdout, "pick")
+    assert "object.new" not in pick and "object.get %" not in pick.split("call @Data.Vec")[0], pick
+    sum_ = _function(result.stdout, "sum")
+    assert sum_.count("object.get") == 1, sum_
+    # A value built from its slots arrives in them, and the merge takes slots.
+    mixed = _function(result.stdout, "mixed")
+    assert re.search(r"b\d+\(%\d+:i64, %\d+:i1\):", mixed), mixed

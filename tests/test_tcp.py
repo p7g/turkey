@@ -447,7 +447,7 @@ let loopbackName : Array Byte = Calls.cPath("127.0.0.1")
 
 let asked : Vec String = []
 
-fun cString(p : Prim.Ptr) -> String = Option.unwrapOr(Ptr.fromCString(Ptr.wrap(p)), "?")
+fun cString(p : Ptr.Ptr) -> String = Option.unwrapOr(Ptr.fromCString(p), "?")
 
 let fixed : Resolve.Resolver = Resolve.Resolver {
     getaddrinfo = fun(node, hints, out) {

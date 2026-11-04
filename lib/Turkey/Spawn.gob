@@ -40,6 +40,7 @@ import Turkey.Sys as Sys
 import Turkey.Workers as Workers
 import Target (OS(..))
 import Target as Target
+import Turkey.Ptr (Ptr)
 
 -- A started child: its pid, and our ends of the pipes its standard output and
 -- standard error write to, as descriptor numbers the caller now owns.
@@ -48,7 +49,7 @@ type Started = Started { pid : Int, stdout : Int, stderr : Int }
 -- The environment the program started with, taken while the program's
 -- globals are initialized, on the thread that has the process's arguments:
 -- a task may run on a worker whose record has none.
-let inherited : Prim.Ptr = Process.environment()
+let inherited : Ptr = Process.environment()
 
 -- Room for a `posix_spawn_file_actions_t` or a `posix_spawnattr_t`, which are
 -- opaque; the largest either is on a supported target is 336 bytes.
@@ -92,13 +93,13 @@ fun start(argv : Array String, directory : Option String, environment : Array (S
     let envBlock = pointers(environmentWith(environment, blocks), blocks)
     let dir = match directory {
         Some(d) -> cString(d, blocks)
-        None -> Prim.ptrNull()
+        None -> Ptr.null()
     }
     let devNull = cString("/dev/null", blocks)
     var failure = 0
-    if Prim.ptrIsNull(pid) || Prim.ptrIsNull(actions) || Prim.ptrIsNull(attributes)
-            || Prim.ptrIsNull(program) || Prim.ptrIsNull(argvBlock) || Prim.ptrIsNull(envBlock)
-            || Prim.ptrIsNull(devNull) || (Option.isSome(directory) && Prim.ptrIsNull(dir)) {
+    if Ptr.isNull(pid) || Ptr.isNull(actions) || Ptr.isNull(attributes)
+            || Ptr.isNull(program) || Ptr.isNull(argvBlock) || Ptr.isNull(envBlock)
+            || Ptr.isNull(devNull) || (Option.isSome(directory) && Ptr.isNull(dir)) {
         failure = Sys.enomem
     }
     var actionsMade = False
@@ -134,7 +135,7 @@ fun start(argv : Array String, directory : Option String, environment : Array (S
         failure = Workers.blockingSpawnp(pid, program, actions, attributes, argvBlock, envBlock)
         Scheduler.afterCall()
     }
-    let child = if failure == 0 { Prim.charToInt(Prim.loadI32(pid, 0)) } else { 0 }
+    let child = if failure == 0 { Ptr.load32(pid, 0) } else { 0 }
     if actionsMade { let _ = Libc.spawnActionsDestroy(actions) }
     if attributesMade { let _ = Libc.spawnAttrDestroy(attributes) }
     for block in blocks { Libc.free(block) }
@@ -165,13 +166,13 @@ fun killGroup(pid : Int) -> Int = Sys.cResult(Libc.kill(-pid, Sys.sigKill))
 -- `errno` if it could not be made. Both ends are close-on-exec.
 fun pipePair() -> Either Int (Int, Int) {
     let fds = Libc.malloc(8)
-    if Prim.ptrIsNull(fds) { return Left(-Sys.enomem) }
+    if Ptr.isNull(fds) { return Left(-Sys.enomem) }
     let made = match Target.os {
         Darwin -> Sys.cResult(Libc.pipe(fds))
         Linux -> Sys.cResult(Libc.pipe2(fds, Sys.closeOnExec()))
     }
-    let read = Prim.charToInt(Prim.loadI32(fds, 0))
-    let write = Prim.charToInt(Prim.loadI32(fds, 4))
+    let read = Ptr.load32(fds, 0)
+    let write = Ptr.load32(fds, 4)
     Libc.free(fds)
     if made < 0 { return Left(made) }
     var failure = IO.fcntl(read, Sys.getStatusFlags)
@@ -200,34 +201,34 @@ fun darwin() -> Bool = match Target.os {
 -- `s` and a NUL in a block of its own, added to `blocks` to be freed after
 -- the call; null if the allocation failed. A NUL inside `s` ends the string
 -- early, for the system.
-fun cString(s : String, blocks : Vec Prim.Ptr) -> Prim.Ptr {
-    let p = Ptr.raw(Ptr.toCString(s))
+fun cString(s : String, blocks : Vec Ptr) -> Ptr {
+    let p = Ptr.toCString(s)
     Vec.push(blocks, p)
     p
 }
 
 -- A NULL-terminated array of the pointers in `items`, in a block added to
 -- `blocks`; null if the allocation failed or an item is null.
-fun pointers(items : Array Prim.Ptr, blocks : Vec Prim.Ptr) -> Prim.Ptr {
+fun pointers(items : Array Ptr, blocks : Vec Ptr) -> Ptr {
     let p = Libc.malloc(8 * (len(items) + 1))
     Vec.push(blocks, p)
-    if Prim.ptrIsNull(p) { return p }
+    if Ptr.isNull(p) { return p }
     for var i = 0; i < len(items); i = i + 1 {
-        if Prim.ptrIsNull(items[i]) { return Prim.ptrNull() }
-        Prim.storePtr(p, 8 * i, items[i])
+        if Ptr.isNull(items[i]) { return Ptr.null() }
+        Ptr.store(p, 8 * i, items[i])
     }
-    Prim.storePtr(p, 8 * len(items), Prim.ptrNull())
+    Ptr.store(p, 8 * len(items), Ptr.null())
     p
 }
 
 -- The inherited environment's strings, less any whose name is one of
 -- `overrides`, then a `NAME=value` for each override.
-fun environmentWith(overrides : Array (String, String), blocks : Vec Prim.Ptr) -> Array Prim.Ptr {
+fun environmentWith(overrides : Array (String, String), blocks : Vec Ptr) -> Array Ptr {
     let entries = []
     let names = Array.map(overrides, fun((name, _)) = String.toBytes(name))
     var at = 0
-    while !Prim.ptrIsNull(inherited) && !Prim.ptrIsNull(Prim.loadPtr(inherited, 8 * at)) {
-        let entry = Prim.loadPtr(inherited, 8 * at)
+    while !Ptr.isNull(inherited) && !Ptr.isNull(Ptr.load(inherited, 8 * at)) {
+        let entry : Ptr = Ptr.load(inherited, 8 * at)
         at = at + 1
         if !named(entry, names) { Vec.push(entries, entry) }
     }
@@ -238,13 +239,13 @@ fun environmentWith(overrides : Array (String, String), blocks : Vec Prim.Ptr) -
 }
 
 -- Whether the `NAME=value` string at `entry` has one of `names` as its name.
-fun named(entry : Prim.Ptr, names : Array (Array Byte)) -> Bool {
+fun named(entry : Ptr, names : Array (Array Byte)) -> Bool {
     for name in names {
         var same = True
         for var i = 0; i < len(name) && same; i = i + 1 {
-            same = Prim.byteToInt(Prim.loadI8(entry, i)) == Byte.toInt(name[i])
+            same = Byte.toInt(Ptr.load(entry, i)) == Byte.toInt(name[i])
         }
-        if same && Prim.byteToInt(Prim.loadI8(entry, len(name))) == 61 { return True }
+        if same && Byte.toInt(Ptr.load(entry, len(name))) == 61 { return True }
     }
     False
 }

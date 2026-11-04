@@ -156,7 +156,7 @@ fun main() {
             for up in [True, False] {
                 reset(p)
                 let (to, from) = if up { (shift, 0) } else { (0, shift) }
-                Memory.copy(Ptr.raw(Ptr.add(p, to)), Ptr.raw(Ptr.add(p, from)), n)
+                Memory.copy(Ptr.add(p, to), Ptr.add(p, from), n)
                 var ok = True
                 for var i = 0; i < 160; i = i + 1 {
                     let want = if i >= to && i < to + n { byte(i - to + from) }
@@ -169,7 +169,7 @@ fun main() {
             }
         }
         reset(p)
-        Memory.fill(Ptr.raw(Ptr.add(p, 3)), n, 0x1A5)
+        Memory.fill(Ptr.add(p, 3), n, 0x1A5)
         var ok = True
         for var i = 0; i < 160; i = i + 1 {
             let want = if i >= 3 && i < 3 + n { byte(0xA5) } else { byte(i) }

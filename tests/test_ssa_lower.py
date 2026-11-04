@@ -529,7 +529,7 @@ def test_a_call_that_always_panics_ends_its_block():
                      re.M | re.S).group(0)
     lines = [line.strip() for line in body.splitlines()]
     calls = [i for i, line in enumerate(lines)
-             if re.search(r"= call @(Main#fail|Main#refuse|Data\.Array\.Storage#outOfBounds)",
+             if re.search(r"= call @(Main#fail|Main#refuse|Turkey\.Array#outOfBounds)",
                           line)]
     assert len(calls) >= 3, body
     for i in calls:

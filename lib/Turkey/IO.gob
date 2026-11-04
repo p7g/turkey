@@ -13,14 +13,14 @@ export (
 -- **Storage is passed in place.** A call that reads into or writes from bytes
 -- is given an `Array Byte` and a window of it, `from` up to but not including
 -- `to`, and hands the kernel the address of the window's first element
--- (`Prim.elementAddress`). No scratch memory is allocated and nothing is
+-- (`Ptr.elementAddress`). No scratch memory is allocated and nothing is
 -- copied a byte at a time. The address is good for the call because the
 -- collector does not move objects.
 --
 -- What the address does not do is keep the array alive: past its last use in
 -- Turkey code the array may be dead to the compiler, and a worker blocked in
 -- the call lets a collection run. So every function here ends with a
--- `Prim.keepAlive` of the array it lent, which roots it across the call.
+-- `Ptr.keepAlive` of the array it lent, which roots it across the call.
 --
 -- Each window is checked against its array once, before the call, and a bad
 -- one is a panic: the callers are the library's own, and a window outside the
@@ -60,6 +60,9 @@ import Turkey.Memory as Memory
 import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 import Turkey.Workers as Workers
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
+import Turkey.Array as Storage
 
 -- -- descriptors ------------------------------------------------------------------
 
@@ -69,7 +72,7 @@ fun read(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingRead(fd, addressOf(bytes, from), to - from)
     Scheduler.afterCall()
-    Prim.keepAlive(bytes)
+    Ptr.keepAlive(bytes)
     n
 }
 
@@ -79,7 +82,7 @@ fun write(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     within(len(bytes), from, to)
     let n = Workers.blockingWrite(fd, addressOf(bytes, from), to - from)
     Scheduler.afterCall()
-    Prim.keepAlive(bytes)
+    Ptr.keepAlive(bytes)
     n
 }
 
@@ -89,9 +92,9 @@ fun write(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
 fun writeText(fd : Int, text : String, from : Int, to : Int) -> Int {
     let storage = Str.bytesOf(text)
     within(len(storage), from, to)
-    let n = Workers.blockingWrite(fd, Prim.elementAddress(storage, from), to - from)
+    let n = Workers.blockingWrite(fd, Ptr.elementAddress(storage, from), to - from)
     Scheduler.afterCall()
-    Prim.keepAlive(storage)
+    Ptr.keepAlive(storage)
     n
 }
 
@@ -102,7 +105,7 @@ fun readAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> 
     within(len(bytes), from, to)
     let n = Workers.blockingPread(fd, addressOf(bytes, from), to - from, offset)
     Scheduler.afterCall()
-    Prim.keepAlive(bytes)
+    Ptr.keepAlive(bytes)
     n
 }
 
@@ -112,7 +115,7 @@ fun writeAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) ->
     within(len(bytes), from, to)
     let n = Workers.blockingPwrite(fd, addressOf(bytes, from), to - from, offset)
     Scheduler.afterCall()
-    Prim.keepAlive(bytes)
+    Ptr.keepAlive(bytes)
     n
 }
 
@@ -127,7 +130,7 @@ fun open(path : String, flags : Int, mode : Int) -> Int {
     let name = cPath(path)
     let fd = Workers.blockingOpen(addressOf(name, 0), flags, mode)
     Scheduler.afterCall()
-    Prim.keepAlive(name)
+    Ptr.keepAlive(name)
     fd
 }
 
@@ -153,11 +156,11 @@ fun fcntlWith(fd : Int, command : Int, argument : Int) -> Int =
 -- or the negated `errno`. `statMode` and `statSize` read it.
 fun fstat(fd : Int, stat : Array Byte) -> Int {
     if len(stat) < Sys.statBytes() {
-        Prim.error("an array too short for a struct stat")
+        error("an array too short for a struct stat")
     }
     let r = Workers.blockingFstat(fd, addressOf(stat, 0))
     Scheduler.afterCall()
-    Prim.keepAlive(stat)
+    Ptr.keepAlive(stat)
     r
 }
 
@@ -166,13 +169,13 @@ fun fstat(fd : Int, stat : Array Byte) -> Int {
 -- `Sys.atSymlinkNoFollow()`.
 fun statAt(dir : Int, name : Array Byte, stat : Array Byte, flags : Int) -> Int {
     if len(stat) < Sys.statBytes() {
-        Prim.error("an array too short for a struct stat")
+        error("an array too short for a struct stat")
     }
     terminated(name)
     let r = Workers.blockingFstatat(dir, addressOf(name, 0), addressOf(stat, 0), flags)
     Scheduler.afterCall()
-    Prim.keepAlive(name)
-    Prim.keepAlive(stat)
+    Ptr.keepAlive(name)
+    Ptr.keepAlive(stat)
     r
 }
 
@@ -209,7 +212,7 @@ fun openAt(dir : Int, name : Array Byte, flags : Int, mode : Int) -> Int {
     terminated(name)
     let fd = Workers.blockingOpenat(dir, addressOf(name, 0), flags, mode)
     Scheduler.afterCall()
-    Prim.keepAlive(name)
+    Ptr.keepAlive(name)
     fd
 }
 
@@ -219,7 +222,7 @@ fun removeAt(dir : Int, name : Array Byte, flags : Int) -> Int {
     terminated(name)
     let r = Workers.blockingUnlinkat(dir, addressOf(name, 0), flags)
     Scheduler.afterCall()
-    Prim.keepAlive(name)
+    Ptr.keepAlive(name)
     r
 }
 
@@ -229,7 +232,7 @@ fun makeDirectoryAt(dir : Int, name : Array Byte, mode : Int) -> Int {
     terminated(name)
     let r = Workers.blockingMkdirat(dir, addressOf(name, 0), mode)
     Scheduler.afterCall()
-    Prim.keepAlive(name)
+    Ptr.keepAlive(name)
     r
 }
 
@@ -240,8 +243,8 @@ fun renameAt(fromDir : Int, from : Array Byte, toDir : Int, to : Array Byte) -> 
     terminated(to)
     let r = Workers.blockingRenameat(fromDir, addressOf(from, 0), toDir, addressOf(to, 0))
     Scheduler.afterCall()
-    Prim.keepAlive(from)
-    Prim.keepAlive(to)
+    Ptr.keepAlive(from)
+    Ptr.keepAlive(to)
     r
 }
 
@@ -252,8 +255,8 @@ fun readLinkAt(dir : Int, name : Array Byte, into : Array Byte) -> Int {
     terminated(name)
     let r = Workers.blockingReadlinkat(dir, addressOf(name, 0), addressOf(into, 0), len(into))
     Scheduler.afterCall()
-    Prim.keepAlive(name)
-    Prim.keepAlive(into)
+    Ptr.keepAlive(name)
+    Ptr.keepAlive(into)
     r
 }
 
@@ -272,7 +275,7 @@ fun makeTemporaryDirectory(template : Array Byte) -> Int {
     terminated(template)
     let r = Workers.blockingMkdtemp(addressOf(template, 0))
     Scheduler.afterCall()
-    Prim.keepAlive(template)
+    Ptr.keepAlive(template)
     r
 }
 
@@ -287,18 +290,18 @@ fun openStream(fd : Int) -> Int {
 -- The next entry of `stream`: its address, good until the next call, or 0 at
 -- the end, or the negated `errno`. "." and ".." are entries.
 fun readEntry(stream : Int) -> Int {
-    let entry = Workers.blockingReaddir(Prim.ptrFromInt(stream))
+    let entry = Workers.blockingReaddir(Ptr.fromInt(stream))
     Scheduler.afterCall()
     entry
 }
 
 -- An entry's `d_type`: one of `Sys.entryUnknown` and the others beside it.
 fun entryType(entry : Int) -> Int =
-    Prim.byteToInt(Prim.loadI8(Prim.ptrFromInt(entry), Sys.direntTypeAt()))
+    Byte.toInt(Ptr.load(Ptr.fromInt(entry), Sys.direntTypeAt()))
 
 -- An entry's name, NUL-terminated, in an array of its own.
 fun entryName(entry : Int) -> Array Byte {
-    let at = Prim.ptrAdd(Prim.ptrFromInt(entry), Sys.direntNameAt())
+    let at = Ptr.add(Ptr.fromInt(entry), Sys.direntNameAt())
     let n = Libc.strlen(at)
     let name = Array.filled(n + 1, Byte.truncate(0))
     Memory.copy(addressOf(name, 0), at, n)
@@ -307,7 +310,7 @@ fun entryName(entry : Int) -> Array Byte {
 
 -- Close `stream` and its descriptor: 0, or the negated `errno`. Called
 -- directly, as `close` on a directory waits for nothing.
-fun closeStream(stream : Int) -> Int = Sys.cResult(Libc.closedir(Prim.ptrFromInt(stream)))
+fun closeStream(stream : Int) -> Int = Sys.cResult(Libc.closedir(Ptr.fromInt(stream)))
 
 -- -- copying ----------------------------------------------------------------------
 
@@ -316,7 +319,7 @@ fun closeStream(stream : Int) -> Int = Sys.cResult(Libc.closedir(Prim.ptrFromInt
 -- through here.
 --
 -- Both windows are checked here, in one test, and a bad one panics naming
--- it. Then `Prim.arrayCopy` moves the bytes 32 at a time, as `memmove`
+-- it. Then `Storage.move` moves the bytes 32 at a time, as `memmove`
 -- would: the two windows may overlap. The primitive checks both runs again
 -- against the storage, which is what keeps it safe whoever calls it, but its
 -- message cannot say which window was wrong; it is never the one a caller
@@ -331,7 +334,7 @@ fun copy(target : Array Byte, at : Int, source : Array Byte, from : Int, to : In
     if from < 0 || count < 0 || to > len(source) || at < 0 || at > len(target) - count {
         copyOutside(len(target), at, len(source), from, to)
     }
-    Prim.arrayCopy(Array.storage(target), at, Array.storage(source), from, count)
+    Storage.move(Array.storage(target), at, Array.storage(source), from, count)
 }
 
 -- Which of `copy`'s windows is wrong, said as `outside` says it: the source's
@@ -344,8 +347,8 @@ fun copyOutside(targetLength : Int, at : Int, sourceLength : Int, from : Int, to
 -- -- underneath -------------------------------------------------------------------
 
 -- The address of element `at` of a byte array.
-fun addressOf(bytes : Array Byte, at : Int) -> Prim.Ptr =
-    Prim.elementAddress(Array.storage(bytes), at)
+fun addressOf(bytes : Array Byte, at : Int) -> Ptr =
+    Ptr.elementAddress(Array.storage(bytes), at)
 
 -- Panic unless `from..to` is a window of something `length` long.
 fun within(length : Int, from : Int, to : Int) -> Unit {
@@ -361,14 +364,14 @@ fun outside(from : Int, to : Int, length : Int) -> Unit {
                  " are outside an array of length ", Int.toString(length)]
     var message = ""
     for word in words { message = Str.concat(message, word) }
-    Prim.error(message)
+    error(message)
 }
 
 -- Panic unless `name` ends in a NUL.
 fun terminated(name : Array Byte) -> Unit {
     let n = len(name)
     if n == 0 || Byte.toInt(name[n - 1]) != 0 {
-        Prim.error("a name passed to the system must end in a NUL byte")
+        error("a name passed to the system must end in a NUL byte")
     }
 }
 
@@ -378,13 +381,13 @@ fun cPath(path : String) -> Array Byte {
     let n = len(storage)
     for var i = 0; i < n; i = i + 1 {
         if Byte.toInt(storage[i]) == 0 {
-            Prim.error(Str.concat(
+            error(Str.concat(
                 Str.concat("path has a NUL byte at byte offset ", Int.toString(i)),
                 ", and a path cannot contain one"))
         }
     }
     let name = Array.filled(n + 1, Byte.truncate(0))
-    Memory.copy(addressOf(name, 0), Prim.elementAddress(storage, 0), n)
-    Prim.keepAlive(storage)
+    Memory.copy(addressOf(name, 0), Ptr.elementAddress(storage, 0), n)
+    Ptr.keepAlive(storage)
     name
 }

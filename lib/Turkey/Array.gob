@@ -1,9 +1,16 @@
-export (outOfBounds, checkRun, sliceOutOfBounds, endedEarly, sorted, copy, threeWay)
+export (
+    outOfBounds, checkRun, sliceOutOfBounds, endedEarly, sorted, copy, threeWay,
+    uninitialized, filled, move, moveIn, fill,
+)
 
 -- What `Data.Array` and `Data.Vec` share. Both keep their elements in the
 -- first `length` slots of a `Prim.Array` -- all of them, for an `Array` -- so
 -- what is written here takes that storage and its length rather than either
 -- container.
+--
+-- It is under `Turkey` so that a program cannot import it: `uninitialized`
+-- answers slots that are zero, which for most element types is no value at
+-- all, and `Data.Array` wraps any storage it is handed.
 
 import Prelude ()
 import Data.Int (Int)
@@ -19,6 +26,7 @@ import Data.Int ()
 import Data.Int as Int
 import Data.Ordering (Ordering(..))
 import Data.String as Str
+import Turkey.Ptr (Ptr)
 
 -- The message is built in its own function, and that is the whole point of
 -- it being one. Every string in it is allocated, so building it inline made
@@ -29,7 +37,7 @@ import Data.String as Str
 -- Rust outlines the same path into a cold `panic_bounds_check` for the same
 -- reason.
 fun outOfBounds(operation : String, i : Int, length : Int) -> a {
-    Prim.error(Str.concat(
+    error(Str.concat(
         Str.concat(
             Str.concat(
                 Str.concat("array index out of bounds: ", operation),
@@ -54,13 +62,13 @@ fun checkRun(operation : String, role : String, at : Int, count : Int, length : 
 fun runOutOfBounds(operation : String, role : String, at : Int, count : Int,
                    length : Int) -> a {
     if count < 0 {
-        Prim.error(Str.concat(Str.concat(operation, ": count "),
+        error(Str.concat(Str.concat(operation, ": count "),
                               Str.concat(Int.toString(count), " is negative")))
     }
     let run = Str.concat(Str.concat(": index ", Int.toString(at)),
                          Str.concat(" and count ", Int.toString(count)))
     let whose = Str.concat(Str.concat(" are outside the ", role), ", length ")
-    Prim.error(Str.concat(Str.concat(operation, run),
+    error(Str.concat(Str.concat(operation, run),
                           Str.concat(whose, Int.toString(length))))
 }
 
@@ -68,11 +76,11 @@ fun runOutOfBounds(operation : String, role : String, at : Int, count : Int,
 -- is out of bounds, length 3".
 fun sliceOutOfBounds(operation : String, from : Int, to : Int, length : Int) -> a {
     if from > to {
-        Prim.error(Str.concat(
+        error(Str.concat(
             Str.concat(Str.concat(operation, ": from "), Int.toString(from)),
             Str.concat(" is greater than to ", Int.toString(to))))
     }
-    Prim.error(Str.concat(
+    error(Str.concat(
         Str.concat(
             Str.concat(Str.concat(operation, ": from "), Int.toString(from)),
             Str.concat(" to ", Int.toString(to))),
@@ -82,7 +90,7 @@ fun sliceOutOfBounds(operation : String, from : Int, to : Int, length : Int) -> 
 -- For a map that counts to the length: the iteration stopped at `i` of the
 -- `length` elements it was asked for.
 fun endedEarly(operation : String, i : Int, length : Int) -> a {
-    Prim.error(Str.concat(
+    error(Str.concat(
         Str.concat(
             Str.concat(Str.concat(operation, ": the collection ended after "),
                        Int.toString(i)),
@@ -114,10 +122,35 @@ fun sorted(storage : Prim.Array a, length : Int,
     out
 }
 
+-- -- raw storage -----------------------------------------------------------------------
+
+-- Storage for `length` elements. Each slot holds its representation's zero,
+-- which for most element types is no value at all, so write a slot before
+-- reading it.
+fun uninitialized(length : Int) -> Prim.Array a = Prim.arrayNewUninit(length)
+
+-- Storage for `length` elements, each `value`.
+fun filled(length : Int, value : a) -> Prim.Array a = Prim.arrayNew(length, value)
+
+-- Copy `count` elements from `source[from]` to `target[at]`. The two runs may
+-- overlap in one array. Panics if either run leaves its array.
+fun move(target : Prim.Array a, at : Int, source : Prim.Array a, from : Int, count : Int) -> Unit =
+    Prim.arrayCopy(target, at, source, from, count)
+
+-- Copy `count` elements to `target[at]` from raw memory at `source`, laid out
+-- as the array lays them out. Panics if the run leaves `target`.
+fun moveIn(target : Prim.Array a, at : Int, source : Ptr, count : Int) -> Unit =
+    Prim.arrayCopyIn(target, at, source, count)
+
+-- Set the `count` elements from `target[at]` to `value`. Panics if the run
+-- leaves `target`.
+fun fill(target : Prim.Array a, at : Int, count : Int, value : a) -> Unit =
+    Prim.arrayFill(target, at, count, value)
+
 -- The first `length` elements of `storage`, in storage of their own.
 fun copy(storage : Prim.Array a, length : Int) -> Prim.Array a {
-    let out = Prim.arrayNewUninit(length)
-    Prim.arrayCopy(out, 0, storage, 0, length)
+    let out = uninitialized(length)
+    move(out, 0, storage, 0, length)
     out
 }
 
@@ -154,7 +187,7 @@ fun mergeRange(xs : Prim.Array a, scratch : Prim.Array a, lo : Int, hi : Int,
         }
         out = out + 1
     }
-    Prim.arrayCopy(xs, lo, scratch, lo, hi - lo)
+    move(xs, lo, scratch, lo, hi - lo)
 }
 
 -- `Ord` answers in `Bool`, so a three-way comparison costs two questions.

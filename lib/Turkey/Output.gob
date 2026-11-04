@@ -34,9 +34,13 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Int ()
 import Data.Bool (Bool(..))
+import Turkey.Memory as Memory
 import Turkey.Libc as Libc
 import Turkey.Sys as Sys
 import Turkey.Workers as Workers
+import Data.Byte as Byte
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 fun heldAt() -> Int = 0
 fun capacityAt() -> Int = 8
@@ -46,40 +50,40 @@ fun failureAt() -> Int = 32
 fun bytesAt() -> Int = 40
 
 -- The block, or null before `start`, and in a program that never prints.
-var block : Prim.Ptr = Prim.ptrNull()
+var block : Ptr = Ptr.null()
 
 -- Make the block, holding `capacity` bytes: whether there was memory for it.
 fun start(capacity : Int, isTerminal : Bool) -> Bool {
     let p = Libc.malloc(bytesAt() + capacity)
-    if Prim.ptrIsNull(p) { return False }
-    Prim.storeI64(p, heldAt(), 0)
-    Prim.storeI64(p, capacityAt(), capacity)
-    Prim.storeI64(p, lockAt(), 0)
-    Prim.storeI64(p, terminalAt(), if isTerminal { 1 } else { 0 })
-    Prim.storeI64(p, failureAt(), 0)
+    if Ptr.isNull(p) { return False }
+    Ptr.store(p, heldAt(), 0)
+    Ptr.store(p, capacityAt(), capacity)
+    Ptr.store(p, lockAt(), 0)
+    Ptr.store(p, terminalAt(), if isTerminal { 1 } else { 0 })
+    Ptr.store(p, failureAt(), 0)
     block = p
     True
 }
 
-fun started() -> Bool = !Prim.ptrIsNull(block)
+fun started() -> Bool = !Ptr.isNull(block)
 
-fun held() -> Int = Prim.loadI64(block, heldAt())
+fun held() -> Int = Ptr.load(block, heldAt())
 
-fun room() -> Int = Prim.loadI64(block, capacityAt()) - held()
+fun room() -> Int = Ptr.load(block, capacityAt()) - held()
 
-fun terminal() -> Bool = Prim.loadI64(block, terminalAt()) != 0
+fun terminal() -> Bool = Ptr.load(block, terminalAt()) != 0
 
 -- Append `count` bytes from `source`. The caller has checked the room.
-fun append(source : Prim.Ptr, count : Int) -> Unit {
+fun append(source : Ptr, count : Int) -> Unit {
     let n = held()
-    Prim.copyBytes(Prim.ptrAdd(block, bytesAt() + n), source, count)
-    Prim.storeI64(block, heldAt(), n + count)
+    Memory.copy(Ptr.add(block, bytesAt() + n), source, count)
+    Ptr.store(block, heldAt(), n + count)
 }
 
 fun appendByte(value : Int) -> Unit {
     let n = held()
-    Prim.storeI8(block, bytesAt() + n, Prim.byteFromInt(value))
-    Prim.storeI64(block, heldAt(), n + 1)
+    Ptr.store(block, bytesAt() + n, Byte.truncate(value))
+    Ptr.store(block, heldAt(), n + 1)
 }
 
 -- The count of bytes up to and including the last newline held, or 0 if
@@ -87,7 +91,7 @@ fun appendByte(value : Int) -> Unit {
 -- line.
 fun lastLineEnd() -> Int {
     var at = held()
-    while at > 0 && Prim.byteToInt(Prim.loadI8(block, bytesAt() + at - 1)) != 10 {
+    while at > 0 && Byte.toInt(Ptr.load(block, bytesAt() + at - 1)) != 10 {
         at = at - 1
     }
     at
@@ -113,7 +117,7 @@ fun drainBy(n : Int, carried : Bool) -> Int {
     var done = 0
     var left = 0
     while done < n {
-        let at = Prim.ptrAdd(block, bytesAt() + done)
+        let at = Ptr.add(block, bytesAt() + done)
         let r = if carried {
             Workers.blockingWrite(1, at, n - done)
         } else {
@@ -126,47 +130,47 @@ fun drainBy(n : Int, carried : Bool) -> Int {
         if r != -Sys.eintr {
             if r <= 0 {
                 noteFailure(if r == 0 { -Sys.eio } else { r })
-                Prim.storeI64(block, heldAt(), 0)
+                Ptr.store(block, heldAt(), 0)
                 return 0
             }
             done = done + r
         }
     }
     let total = held()
-    Prim.copyBytes(Prim.ptrAdd(block, bytesAt()), Prim.ptrAdd(block, bytesAt() + done),
+    Memory.copy(Ptr.add(block, bytesAt()), Ptr.add(block, bytesAt() + done),
                    total - done)
-    Prim.storeI64(block, heldAt(), total - done)
+    Ptr.store(block, heldAt(), total - done)
     left
 }
 
 -- Keep `failure`, a negated `errno`, unless an earlier one is kept.
 fun noteFailure(failure : Int) -> Unit {
-    if Prim.loadI64(block, failureAt()) == 0 { Prim.storeI64(block, failureAt(), failure) }
+    if Ptr.load(block, failureAt()) == 0 { Ptr.store(block, failureAt(), failure) }
 }
 
 -- The first failure since the last call, as a negated `errno`, or 0; then
 -- none.
 fun takeFailure() -> Int {
-    let failure = Prim.loadI64(block, failureAt())
-    Prim.storeI64(block, failureAt(), 0)
+    let failure : Int = Ptr.load(block, failureAt())
+    Ptr.store(block, failureAt(), 0)
     failure
 }
 
 -- -- the lock -------------------------------------------------------------------------
 
 -- Take the lock if it is free.
-fun tryLock() -> Bool = Prim.atomicCas(block, lockAt(), 0, 1) == 0
+fun tryLock() -> Bool = Ptr.atomicCas(block, lockAt(), 0, 1) == 0
 
 -- Take the lock if it is free, or mark it waited for: whether it was taken.
 -- A task that is not given it waits, and is woken by the `unlock` that sees
 -- the mark.
 fun claim() -> Bool {
     while True {
-        let state = Prim.atomicLoad(block, lockAt())
+        let state = Ptr.atomicLoad(block, lockAt())
         if state == 0 {
-            if Prim.atomicCas(block, lockAt(), 0, 2) == 0 { return True }
+            if Ptr.atomicCas(block, lockAt(), 0, 2) == 0 { return True }
         } else if state == 1 {
-            if Prim.atomicCas(block, lockAt(), 1, 2) == 1 { return False }
+            if Ptr.atomicCas(block, lockAt(), 1, 2) == 1 { return False }
         } else {
             return False
         }
@@ -177,8 +181,8 @@ fun claim() -> Bool {
 -- Release the lock: whether a task may be waiting for it.
 fun unlock() -> Bool {
     while True {
-        let old = Prim.atomicLoad(block, lockAt())
-        if Prim.atomicCas(block, lockAt(), old, 0) == old { return old == 2 }
+        let old = Ptr.atomicLoad(block, lockAt())
+        if Ptr.atomicCas(block, lockAt(), old, 0) == old { return old == 2 }
     }
     False
 }

@@ -99,6 +99,10 @@ type Sel = Sel {
     -- The panic messages this function names, in the order it first names
     -- them, for the module's table (`selectModule`). `asm` is only read.
     messages : Vec String,
+    -- What each function of the module answers in, by name, for a call to one
+    -- that answers in several registers. Shared by every function, and only
+    -- read.
+    results : Map String (Array Rep),
 }
 
 -- `text`'s symbol, recorded as one this function names.
@@ -159,6 +163,8 @@ fun selectModule(m : Module, target : Target.Target, sizesRecorded : Bool)
     -- the same literal in the next and the root array is one array.
     let asm = Asm.newAsm(m, Asm.dialectFor(target))
     let variadicsOnStack = target.os == "Darwin"
+    let results = Map.new()
+    for f in m.functions { Map.put(results, f.name, f.results) }
     -- One selection per function, answering both the function and, if it
     -- stopped, why. Both come out of one run: selection and the root
     -- analysis inside it are the expensive part, and asking twice doubles
@@ -167,7 +173,7 @@ fun selectModule(m : Module, target : Target.Target, sizesRecorded : Bool)
     -- table afterwards, in function order -- the order one selection after
     -- another would have met them in.
     let selected = Parallel.map(m.functions, fun(f) {
-        let s = start(f, asm, variadicsOnStack, sizesRecorded)
+        let s = start(f, asm, variadicsOnStack, sizesRecorded, results)
         run(s)
         if Option.isNone(s.stopped) {
             -- The same two passes the low IR had, over what selection
@@ -191,8 +197,9 @@ fun selectModule(m : Module, target : Target.Target, sizesRecorded : Bool)
     (done, skipped, asm)
 }
 
-fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool) -> Sel {
-    let g = Ssa.newFunc(f.name, f.result)
+fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool,
+          results : Map String (Array Rep)) -> Sel {
+    let g = Ssa.newFunc(f.name, f.results)
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
     for r in f.reps { Vec.push(g.reps, r) }
@@ -207,7 +214,8 @@ fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool
           frame = Roots.analyze(f), pending = None, panicking = False,
           known = constantsOf(f), definedIn = [], definedAt = [],
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
-          publishers = Map.new(), publishedIn = Map.new(), messages = [] }
+          publishers = Map.new(), publishedIn = Map.new(), messages = [],
+          results = results }
 }
 
 fun placeDefinitions(s : Sel) -> Unit {
@@ -898,8 +906,8 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             let want = A.bankOf(r)
             match callee {
                 Direct(name) ->
-                    call(s, d, want, Some(want), Some(symbolFor(s, name)), A.xzr, passed,
-                         A.Standard)
+                    callInto(s, d, want, Some(want), resultsOf(s, name), Some(symbolFor(s, name)),
+                             A.xzr, passed, A.Standard, len(passed))
                 Runtime(routine) -> {
                     let entry = Rt.entryPoint(routine)
                     -- The stack arguments below are this compiler's own
@@ -954,8 +962,43 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 }
             }
         }
+        -- Moved out of its register with the call (`resultsOf`).
+        Result(_, _) -> {}
         _ -> stop(s, L.showOpName(i.op))
     }
+}
+
+-- The results after the first of a direct call to `name`, being selected at
+-- `s.place`, as `callInto` moves them out: per result, the register it is
+-- wanted in, the one the callee answers it in, and that one's file. A result
+-- nothing reads has no `Result` instruction, and is moved nowhere.
+--
+-- The `Result`s are the instructions right after the call (`L.checkResults`),
+-- so they are found by looking ahead, and selecting each emits nothing.
+fun resultsOf(s : Sel, name : String) -> Array (Option Reg, Reg, A.Bank) {
+    let reps = Map.getOr(s.results, name, [])
+    if len(reps) < 2 { return [] }
+    let registers = A.resultRegs(reps)
+    let (b, n) = s.place
+    let insts = s.source.blocks[b].insts
+    let call = insts[n].result
+    let out = []
+    for var at = n + 1; at < len(insts); at = at + 1 {
+        match insts[at].op {
+            Result(of, k) -> if of == call {
+                Vec.push(out, (Some(A.reg(insts[at].result)), registers[k], A.bankOf(reps[k])))
+            }
+            _ -> break
+        }
+    }
+    -- Every result register is written by the call, whether or not it is
+    -- read, and the call records them all.
+    for var k = 1; k < len(reps); k = k + 1 {
+        if !Iterator.any(out, fun((_, from, _)) = A.sameRegister(from, registers[k])) {
+            Vec.push(out, (None, registers[k], A.bankOf(reps[k])))
+        }
+    }
+    Vec.toArray(out)
 }
 
 -- A constant in a fresh register, for an operand the IR gives as an integer
@@ -1312,7 +1355,15 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
 fun callStacking(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
                  sym : Option Asm.Symbol, indirect : Reg,
                  args : Array (Reg, A.Bank), convention : A.Convention,
-                 stacked : Int) -> Unit {
+                 stacked : Int) -> Unit =
+    callInto(s, d, dBank, answers, [], sym, indirect, args, convention, stacked)
+
+-- `callStacking`, for a callee that answers in several registers: `more` is
+-- the rest of its results, after the first, as `resultsOf` gives them.
+fun callInto(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
+             more : Array (Option Reg, Reg, A.Bank), sym : Option Asm.Symbol, indirect : Reg,
+             args : Array (Reg, A.Bank), convention : A.Convention,
+             stacked : Int) -> Unit {
     let ins = []
     var general = 0
     var vector = 0
@@ -1350,11 +1401,12 @@ fun callStacking(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
     -- nothing to liveness today. That is correct rather than pointless: the fact is
     -- recorded where the allocator will read it, and the allocator is what
     -- teaches `uses`/`defs` about physical registers.
-    let outs = match answers {
+    let first = match answers {
         Some(Gp) -> [A.x0]
         Some(Fp) -> [A.d0]
         None -> []
     }
+    let outs = Array.append(first, Array.map(more, fun((_, from, _)) = from))
     emit(s, A.CallArgs(ins, outs))
     match sym {
         Some(name) -> emit(s, A.Bl(name, convention))
@@ -1383,6 +1435,16 @@ fun callStacking(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
         None -> match dBank {
             Gp -> emit(s, A.Mov(d, A.xzr, A.W64))
             Fp -> emit(s, A.FMovIn(d, A.xzr))
+        }
+    }
+    -- Before the panic test, so every result is out of its register in the
+    -- block the call is in: the allocator keeps a physical register live only
+    -- within one block, and a callee that panicked answers zeros, which
+    -- nothing reads.
+    for (into, from, bank) in more {
+        match into {
+            Some(d) -> move(s, d, bank, from, bank)
+            None -> {}
         }
     }
     propagate(s)

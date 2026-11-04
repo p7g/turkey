@@ -265,7 +265,9 @@ fun deletable(e : Effects) -> Bool = !e.writes && !e.traps && !e.diverges
 -- control-flow graph is made of: both a virtual and a machine instruction
 -- sequence branches and jumps, and every analysis below reads only this.
 type Term
-    = Ret(Value)
+    -- The function's results, one per register it answers in, in the order
+    -- `Func.results` gives their representations.
+    = Ret(Vec Value)
     -- The arguments are the target block's parameters, positionally.
     | Jump(BlockId, Vec Value)
     | Branch(Value, BlockId, BlockId)
@@ -306,7 +308,12 @@ fun newBlock() -> Block i =
 type Func i = Func {
     name       : String,
     params     : Vec Value,
-    result     : Rep,
+    -- What the function answers in, one `Rep` per register: one for most
+    -- functions, and a flat value's slots for a function that returns one in
+    -- several registers. Each register's `Rep` is fixed, whatever value is
+    -- returned, so the collector never has to ask which constructor came
+    -- back to know whether a result register holds a pointer.
+    results    : Array Rep,
     var blocks : Vec (Block i),
     var entry  : BlockId,
     -- Indexed by `valueId`. The side table a dense index buys.
@@ -321,8 +328,8 @@ type Func i = Func {
     var reasons : Map Int String,
 }
 
-fun newFunc(name : String, result : Rep) -> Func i = Func {
-    name = name, params = [], result = result,
+fun newFunc(name : String, results : Array Rep) -> Func i = Func {
+    name = name, params = [], results = results,
     blocks = [], entry = BlockId(0), reps = [], origins = Map.new(),
     reasons = Map.new(),
 }
@@ -678,11 +685,19 @@ fun checkTerm(out : Vec String, f : Func i, idom : Array (Option Int),
               t : Term) -> Unit {
     let last = len(f.blocks[b].insts)
     match t {
-        Ret(v) -> {
-            checkUse(out, f, idom, defBlock, defAt, v, b, last)
-            if repOf(f, v) != f.result {
-                Vec.push(out, f.name + ": returns " + show(repOf(f, v))
-                                + " where " + show(f.result) + " was declared")
+        Ret(vs) -> {
+            if len(vs) != len(f.results) {
+                Vec.push(out, f.name + ": returns " + Int.toString(len(vs))
+                                + " values where " + Int.toString(len(f.results))
+                                + " were declared")
+                return
+            }
+            for var k = 0; k < len(vs); k = k + 1 {
+                checkUse(out, f, idom, defBlock, defAt, vs[k], b, last)
+                if repOf(f, vs[k]) != f.results[k] {
+                    Vec.push(out, f.name + ": returns " + show(repOf(f, vs[k]))
+                                    + " where " + show(f.results[k]) + " was declared")
+                }
             }
         }
         Jump(target, args) -> checkEdge(out, f, idom, defBlock, defAt, b, target, args)
@@ -754,7 +769,7 @@ fun showFunc[Inst i](f : Func i) -> String {
         if i > 0 { String.push(b, ", ") }
         String.push(b, showValue(f, f.params[i]))
     }
-    String.push(b, ") -> " + show(f.result) + " {\n")
+    String.push(b, ") -> " + showResults(f.results) + " {\n")
     for var n = 0; n < len(f.blocks); n = n + 1 {
         let block = f.blocks[n]
         String.push(b, "  b" + Int.toString(n))
@@ -775,11 +790,16 @@ fun showFunc[Inst i](f : Func i) -> String {
     String.build(b)
 }
 
+-- Returns one result's representation as itself, and several in parentheses.
+fun showResults(rs : Array Rep) -> String =
+    if len(rs) == 1 { show(rs[0]) }
+    else { "(" + String.join(Array.map(rs, show), ", ") + ")" }
+
 fun showValue(f : Func i, v : Value) -> String =
     "%" + Int.toString(valueId(v)) + ":" + show(repOf(f, v))
 
 fun showTerm(f : Func i, t : Term) -> String = match t {
-    Ret(v) -> "ret " + showValue(f, v)
+    Ret(vs) -> "ret " + String.join(Vec.map(vs, showValue(f, _)), ", ")
     Jump(target, args) -> {
         let b = String.builder()
         String.push(b, "jump b" + Int.toString(blockId(target)) + "(")
@@ -1012,7 +1032,7 @@ fun loopForest(order : Vec BlockId, rank : Array Int,
 -- is not an instruction here -- it is a field of the block, which is what
 -- keeps a block from ever being without one.
 fun termUses(t : Term) -> Vec Value = match t {
-    Ret(v) -> [v]
+    Ret(vs) -> vs
     Jump(_, args) -> args
     Branch(c, _, _) -> [c]
     Switch(v, _, _) -> [v]
@@ -1077,7 +1097,7 @@ fun pruneUnreachable[Inst i](f : Func i) -> Func i {
     for var k = 0; k < len(order); k = k + 1 {
         remap[blockId(order[k])] = k
     }
-    let out = newFunc(f.name, f.result)
+    let out = newFunc(f.name, f.results)
     for r in f.reps { Vec.push(out.reps, r) }
     for p in f.params { Vec.push(out.params, p) }
     -- The numbering is kept, so the origins are too.
@@ -1096,7 +1116,7 @@ fun pruneUnreachable[Inst i](f : Func i) -> Func i {
 }
 
 fun remapTerm(remap : Array Int, t : Term) -> Term = match t {
-    Ret(v) -> Ret(v)
+    Ret(vs) -> Ret(vs)
     Jump(target, args) -> Jump(BlockId(remap[blockId(target)]), args)
     Branch(c, yes, no) ->
         Branch(c, BlockId(remap[blockId(yes)]), BlockId(remap[blockId(no)]))

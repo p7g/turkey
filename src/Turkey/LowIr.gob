@@ -1,7 +1,8 @@
 export (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
     FieldRef(..), fieldRef,
-    low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
+    low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
+    checkResults, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
@@ -292,6 +293,20 @@ type Op
     -- A closure shell in the frame, as `ClosureNew` builds one on the heap.
     | StackClosure(String, Option Value)
     | Call(Callee, Array Value)
+    -- The `k`th result of a direct call to a function that answers in several
+    -- registers (`Ssa.Func.results`), for `k` from 1: the call itself defines
+    -- result 0. Every instruction still defines exactly one value.
+    --
+    -- Two invariants keep the collector's frame tables unchanged. Each result
+    -- register has one `Rep`, whichever value the callee returned, so a
+    -- register is never traced on one return and raw on another. And the
+    -- results of a call immediately follow it, in the same block, with no
+    -- instruction between (`checkResults`): instruction selection moves every
+    -- one out of its register directly after the call, so none is live across
+    -- the call's own safepoint, as the call's own result is not, and nothing
+    -- can collect before each is in a register the allocator chose.
+    -- Not every `k` need appear: an unused one is deleted like any value.
+    | Result(Value, Int)
     | GlobalLoad(String)
     | GlobalStore(String, Value)
     -- A mutable local. With function-wide SSA these are only what is genuinely
@@ -469,6 +484,8 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- better per callee takes the whole program, which one instruction does
     -- not have; `summarize` below is that, for allocation, over the module.
     Call(_, _) -> everything()
+    -- Reads a register the call wrote, and nothing else.
+    Result(_, _) -> empty()
     GlobalLoad(_) -> Ssa.reads_()
     GlobalStore(_, _) -> Ssa.writes()
     SlotLoad(_) -> Ssa.reads_()
@@ -529,6 +546,7 @@ fun opUses(op : Op) -> Array Value = match op {
         Indirect(f) -> Array.init(len(args) + 1, fun(i) = if i == 0 { f } else { args[i - 1] })
         _ -> Array.init(len(args), args[_])
     }
+    Result(a, _) -> [a]
     GlobalLoad(_) -> []
     GlobalStore(_, a) -> [a]
     SlotLoad(_) -> []
@@ -572,6 +590,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     StackObject(a, b, c, d) -> StackObject(a, b, c, Array.map(d, f))
     StackClosure(a, b) -> StackClosure(a, Option.map(b, f))
     Call(a, b) -> Call(mapCallee(a, f), Array.map(b, f))
+    Result(a, k) -> Result(f(a), k)
     GlobalLoad(a) -> GlobalLoad(a)
     GlobalStore(a, b) -> GlobalStore(a, f(b))
     SlotLoad(a) -> SlotLoad(a)
@@ -799,11 +818,11 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Vec String {
                                     }
                                 }
                             }
-                            if Ssa.repOf(f, i.result) != callee.result {
+                            if Ssa.repOf(f, i.result) != callee.results[0] {
                                 Vec.push(out, f.name + ": reads "
                                     + show(Ssa.repOf(f, i.result))
                                     + " from @" + name + ", which answers "
-                                    + show(callee.result))
+                                    + show(callee.results[0]))
                             }
                         }
                         None -> Vec.push(out, f.name + ": calls @" + name
@@ -813,6 +832,70 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Vec String {
                     StackClosure(code, _) -> closes(out, known, f.name, code)
                     _ -> {}
                 }
+            }
+            -- Each result read against the callee's, which `checkResults` has
+            -- already held to follow a direct call.
+            for var n = 0; n < len(block.insts); n = n + 1 {
+                match block.insts[n].op {
+                    Result(_, k) -> match callOf(block.insts, n) {
+                        Some(Call(Direct(name), _)) -> match Map.get(known, name) {
+                            Some(callee) -> if k >= len(callee.results) {
+                                Vec.push(out, f.name + ": reads result "
+                                    + Int.toString(k) + " of @" + name
+                                    + ", which answers " + Int.toString(len(callee.results)))
+                            } else if Ssa.repOf(f, block.insts[n].result) != callee.results[k] {
+                                Vec.push(out, f.name + ": reads "
+                                    + show(Ssa.repOf(f, block.insts[n].result))
+                                    + " as result " + Int.toString(k) + " of @" + name
+                                    + ", which answers " + show(callee.results[k]))
+                            }
+                            None -> {}
+                        }
+                        _ -> {}
+                    }
+                    _ -> {}
+                }
+            }
+        }
+    }
+    out
+}
+
+-- The operation of the call that the `Result` at `insts[n]` reads, if it is the
+-- instruction just before the run of results `n` is in.
+fun callOf(insts : Vec Low, n : Int) -> Option Op {
+    var at = n - 1
+    while at >= 0 && isResult(insts[at].op) { at = at - 1 }
+    if at < 0 { return None }
+    match insts[n].op {
+        Result(call, _) -> if insts[at].result == call { Some(insts[at].op) } else { None }
+        _ -> None
+    }
+}
+
+fun isResult(op : Op) -> Bool = match op {
+    Result(_, _) -> True
+    _ -> False
+}
+
+-- Where each `Result` is: directly after the direct call it reads, or after
+-- another result of that call, as instruction selection requires (`Result`).
+-- Answers complaints, as `checkReps` does.
+fun checkResults(f : Ssa.Func Low) -> Vec String {
+    let out = []
+    for block in f.blocks {
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            match block.insts[n].op {
+                Result(_, k) -> match callOf(block.insts, n) {
+                    Some(Call(Direct(_), _)) -> if k < 1 {
+                        Vec.push(out, f.name + ": reads result " + Int.toString(k)
+                                        + " of a call, which is the call's own value")
+                    }
+                    _ -> Vec.push(out, f.name + ": %" + Int.toString(Ssa.valueId(block.insts[n].result))
+                                         + " reads a result of something other than the "
+                                         + "direct call just before it")
+                }
+                _ -> {}
             }
         }
     }
@@ -1020,6 +1103,7 @@ fun showOpName(op : Op) -> String = match op {
         Foreign(_, _) -> "call.foreign"
         Indirect(_) -> "call.indirect"
     }
+    Result(_, _) -> "result"
     GlobalLoad(_) -> "global.load"
     GlobalStore(_, _) -> "global.store"
     SlotLoad(_) -> "slot.load"
@@ -1111,6 +1195,7 @@ instance Show Op {
         }
         String.build(b)
     }
+    Result(a, k) -> "result " + v(a) + ", " + Int.toString(k)
     GlobalLoad(name) -> "global.load $" + name
     GlobalStore(name, a) -> "global.store $" + name + ", " + v(a)
     SlotLoad(i) -> "slot.load " + Int.toString(i)

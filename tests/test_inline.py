@@ -121,3 +121,23 @@ def test_arguments_that_mention_each_others_parameters_are_inlined():
     assert dump.code == 0, dump.stderr
     assert "Main#pair(" not in _body(dump.stdout, "Main#swapper")
     assert lang.output(SWAP) == "63\n"
+
+
+FILL_RUN = """
+fun main() {
+    let xs = [1, 2, 3, 4]
+    Array.fill(xs, 1, 2, 9)
+    print(xs)
+}
+"""
+
+
+def test_a_library_name_for_a_bulk_primitive_is_inlined():
+    """`Data.Array.Storage#fill` is `Prim.arrayFill` and nothing else. The
+    primitive is costed as the loops it lowers to, which is over the inline
+    limit, but its name must cost no more than the primitive does in place:
+    no call to it survives, and no specialization of it is made."""
+    dump = lang.dump("opt", FILL_RUN)
+    assert dump.code == 0, dump.stderr
+    assert "Data.Array.Storage#fill" not in dump.stdout, dump.stdout
+    assert lang.output(FILL_RUN) == "[1, 9, 9, 4]\n"

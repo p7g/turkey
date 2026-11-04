@@ -1,0 +1,220 @@
+export (
+    ConnectPolicy(..), ConnectRule(..), publicInternet, allowlist, anywhere, allows,
+    normalise, unwrapped,
+    Destination(..), resolve, limit,
+)
+
+-- Where a program may connect, and the checked addresses it connects to:
+-- the machinery under `Net`'s `ConnectPolicy`, `Destination` and `resolve`,
+-- whose comment states the rules. `Net` exports the types without their
+-- constructors, so a `Destination` is made only by `resolve`, and `Net.TCP`,
+-- which imports this module, reads its fields.
+--
+-- A lookup takes its `Turkey.Resolve.Resolver`, so that a test can give
+-- names the addresses it wants without a name server.
+
+import Time (Timeout(..))
+import Time.Clock as Clock
+import Time.Deadline as Deadline
+import Turkey.Errors (IOError(..), ErrorKind)
+import Turkey.Errors as Errors
+import Turkey.Resolve (IP(..), Resolver)
+import Turkey.Resolve as Resolve
+import Turkey.Sys as Sys
+
+-- -- policies -------------------------------------------------------------------------
+
+-- `Allowlist`'s names are kept normalised.
+type ConnectPolicy = PublicInternet | Allowlist(Array ConnectRule) | Anywhere
+
+-- What `allowlist` allows: a host name, compared after normalising both
+-- sides; or the addresses whose first `bits` bits are those of `ip`.
+type ConnectRule = HostName(String) | AddressRange(IP, Int)
+
+let publicInternet : ConnectPolicy = PublicInternet
+
+let anywhere : ConnectPolicy = Anywhere
+
+-- A policy that allows exactly what `rules` name. A range whose prefix is
+-- longer than its address is a mistake in the program, and panics.
+fun allowlist(rules : Array ConnectRule) -> ConnectPolicy {
+    for r in rules {
+        if let AddressRange(ip, bits) = r {
+            if bits < 0 || bits > width(ip) {
+                error("Net.allowlist: a /" + show(bits) + " range of " + show(ip))
+            }
+        }
+    }
+    Allowlist(Array.map(rules, fun(r) = match r {
+        HostName(n) -> HostName(normalise(n))
+        AddressRange(ip, bits) -> AddressRange(ip, bits)
+    }))
+}
+
+-- Whether `policy` lets a program connect to `ip`, as an address that the
+-- host name `name` resolved to.
+fun allows(policy : ConnectPolicy, name : String, ip : IP) -> Bool = match policy {
+    Anywhere -> True
+    PublicInternet -> !refusedPublicly(unwrapped(ip))
+    Allowlist(rules) -> allowsName(rules, normalise(name)) || inRanges(rules, ip)
+}
+
+fun allowsName(rules : Array ConnectRule, name : String) -> Bool {
+    for r in rules {
+        if let HostName(n) = r { if n == name { return True } }
+    }
+    False
+}
+
+-- A range matches the address as it is or unwrapped, so a range of IPv4
+-- addresses covers them written as IPv6 too.
+fun inRanges(rules : Array ConnectRule, ip : IP) -> Bool {
+    let inner = unwrapped(ip)
+    for r in rules {
+        if let AddressRange(base, bits) = r {
+            if within(base, bits, ip) || within(base, bits, inner) { return True }
+        }
+    }
+    False
+}
+
+-- `name` as a policy compares it: without the brackets an IPv6 literal is
+-- written in, without one trailing dot, and in ASCII lowercase. A name that
+-- differs from a rule only in these is the same name to the resolver, so
+-- comparing it as written would let `Example.COM.` past a rule against
+-- `example.com`.
+fun normalise(name : String) -> String = asciiLower(trailingDotless(bracketless(name)))
+
+-- `s` with `A` to `Z` made `a` to `z`, and every other byte as it is, so that
+-- the result is UTF-8 whenever `s` is.
+fun asciiLower(s : String) -> String {
+    let b = String.bytesOf(s)
+    let lowered = Array.init(len(b), fun(i) {
+        let c = Byte.toInt(b[i])
+        if c >= 65 && c <= 90 { Byte.truncate(c + 32) } else { b[i] }
+    })
+    String.fromBytesLossy(lowered)
+}
+
+fun bracketless(name : String) -> String {
+    if let Some(open) = String.stripPrefix(name, "[") {
+        if let Some(inner) = String.stripSuffix(open, "]") { return inner }
+    }
+    name
+}
+
+fun trailingDotless(name : String) -> String = Option.unwrapOr(String.stripSuffix(name, "."), name)
+
+-- The IPv4 address inside an IPv4-mapped address (`::ffff:a.b.c.d`) or one
+-- under the well-known NAT64 prefix (`64:ff9b::a.b.c.d`), which is where a
+-- connection to it goes; any other address as it is.
+fun unwrapped(ip : IP) -> IP = match ip {
+    V6(high, low, _) ->
+        if (high == 0 && (low >> 32) == 0xffff) || (high == 0x64_ff9b_0000_0000 && (low >> 32) == 0) {
+            V4(low & 0xFFFF_FFFF)
+        } else {
+            ip
+        }
+    V4(_) -> ip
+}
+
+-- Whether `ip` is outside the public internet: in one of `publicV4`'s or
+-- `publicV6`'s ranges.
+fun refusedPublicly(ip : IP) -> Bool {
+    let ranges = match ip {
+        V4(_) -> notPublicV4
+        V6(_, _, _) -> notPublicV6
+    }
+    for (base, bits) in ranges {
+        if within(base, bits, ip) { return True }
+    }
+    False
+}
+
+let notPublicV4 : Array (IP, Int) = [
+    (V4(0x0000_0000), 8),    -- "this network", 0.0.0.0 among it
+    (V4(0x0a00_0000), 8),    -- private
+    (V4(0x6440_0000), 10),   -- shared address space (CGNAT)
+    (V4(0x7f00_0000), 8),    -- loopback
+    (V4(0xa9fe_0000), 16),   -- link-local
+    (V4(0xac10_0000), 12),   -- private
+    (V4(0xc000_0000), 24),   -- IETF protocol assignments
+    (V4(0xc000_0200), 24),   -- documentation
+    (V4(0xc0a8_0000), 16),   -- private
+    (V4(0xc612_0000), 15),   -- benchmarking
+    (V4(0xc633_6400), 24),   -- documentation
+    (V4(0xcb00_7100), 24),   -- documentation
+    (V4(0xe000_0000), 4),    -- multicast
+    (V4(0xf000_0000), 4),    -- reserved, the broadcast address among it
+]
+
+let notPublicV6 : Array (IP, Int) = [
+    (prefixOf(0, 0, 0), 96),               -- unspecified, loopback, IPv4-compatible
+    (prefixOf(0x64, 0xff9b, 1), 48),       -- NAT64 for local use
+    (prefixOf(0x2001, 0xdb8, 0), 32),      -- documentation
+    (prefixOf(0x3fff, 0, 0), 20),          -- documentation
+    (prefixOf(0xfc00, 0, 0), 7),           -- private (unique local)
+    (prefixOf(0xfe80, 0, 0), 10),          -- link-local
+    (prefixOf(0xff00, 0, 0), 8),           -- multicast
+]
+
+-- The IPv6 address whose first three groups are `a`, `b` and `c`, and the
+-- rest zero.
+fun prefixOf(a : Int, b : Int, c : Int) -> IP = V6((a << 48) | (b << 32) | (c << 16), 0, 0)
+
+fun width(ip : IP) -> Int = match ip {
+    V4(_) -> 32
+    V6(_, _, _) -> 128
+}
+
+-- Whether `ip` has `base`'s first `bits` bits. Addresses of two families
+-- never match; a scope is not part of the comparison.
+fun within(base : IP, bits : Int, ip : IP) -> Bool = match (base, ip) {
+    (V4(b), V4(a)) -> prefix(b, a, bits, 32)
+    (V6(bh, bl, _), V6(ah, al, _)) ->
+        if bits <= 64 { prefix(bh, ah, bits, 64) }
+        else { bh == ah && prefix(bl, al, bits - 64, 64) }
+    _ -> False
+}
+
+-- Whether the first `bits` of the `size`-bit numbers `a` and `b` agree.
+fun prefix(a : Int, b : Int, bits : Int, size : Int) -> Bool {
+    if bits == 0 { return True }
+    let shift = size - bits
+    -- Shift the difference rather than each side, so that a 64-bit half
+    -- whose top bit is set compares the same as any other.
+    ((a ^ b) >> shift) == 0
+}
+
+-- -- destinations -----------------------------------------------------------------------
+
+-- A host, a port, and the addresses the host resolved to that the policy
+-- allowed, in the resolver's order: never empty. `host` is as the caller
+-- wrote it.
+type Destination = Destination { host : String, port : Int, addresses : Array IP }
+
+instance Show Destination {
+    fun show(d) = d.host + ":" + show(d.port) + " " + show(d.addresses)
+}
+
+-- `host`'s addresses that `policy` allows, as a `Destination` for `port`;
+-- waiting for the resolver until `deadline`, on `Turkey.Wait.now`'s clock, or
+-- without limit when it is -1. The lookup is made without the brackets an
+-- IPv6 literal is written in, and otherwise as written, a trailing dot
+-- included.
+fun resolve(resolver : Resolver, host : String, port : Int, policy : ConnectPolicy,
+            deadline : Int) -> Either IOError Destination {
+    if port < 1 || port > 65535 {
+        return Left(IOError { kind = Errors.Other(Sys.einval), op = "resolve", path = Some(host) })
+    }
+    let found = Resolve.lookup(resolver, bracketless(host), deadline)?
+    let allowed = Array.filter(found, fun(ip) = allows(policy, host, ip))
+    if len(allowed) == 0 {
+        return Left(IOError { kind = Errors.Forbidden, op = "resolve", path = Some(host) })
+    }
+    Right(Destination { host, port, addresses = allowed })
+}
+
+-- The point `t` sets, in nanoseconds on `Turkey.Wait.now`'s clock. A
+-- `Duration` starts now.
+fun limit[Timeout t](t : t) -> Int = Clock.nanos(Deadline.reading(deadline(t)))

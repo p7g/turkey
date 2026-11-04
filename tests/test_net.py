@@ -14,7 +14,7 @@ import subprocess
 
 import pytest
 
-from tests import bootc, toolchain
+from tests import bootc, lang, toolchain
 
 
 @pytest.fixture(autouse=True)
@@ -129,13 +129,13 @@ fun main() {
     -- `localhost` comes from the hosts file, which has the IPv4 loopback
     -- address on every system the suite runs on; whether it lists `::1` too
     -- differs.
-    for timeout in [None, Some(Duration.seconds(30))] {
-        match Net.lookup("localhost", timeout) {
+    for found in [Net.lookupUnbounded("localhost"), Net.lookup("localhost", Duration.seconds(30))] {
+        match found {
             Right(found) -> print(Array.contains(found, Resolve.V4(0x7f000001)))
             Left(e) -> print(e)
         }
     }
-    print(Net.lookup("bad\\u{0}name", None))
+    print(Net.lookup("bad\\u{0}name", Duration.seconds(30)))
 }
 """
 
@@ -373,3 +373,21 @@ def test_timers_and_pipes_go_on_while_lookups_wait(tmp_path, workers):
         process.kill()
     assert process.returncode == 0, err
     assert out == "found\nfound\n10\n"
+
+
+# -- no limit is said, not defaulted ------------------------------------------------
+
+def test_an_option_is_not_a_timeout():
+    """A `None` from configuration must not make a lookup unbounded without
+    the code saying so: `lookupUnbounded` is how a program says it."""
+    with pytest.raises(lang.CompileError) as error:
+        lang.check("""
+import Net
+import Time.Duration as Duration
+
+fun main() {
+    let configured : Option Duration.Duration = None
+    print(Net.lookup("localhost", configured))
+}
+""")
+    assert error.value.message == "no instance for 'Timeout (Option Duration)'"

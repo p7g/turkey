@@ -1,0 +1,144 @@
+export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLength)
+
+-- A message body that has arrived and not been read: a request's, for a
+-- server's handler, or a response's, for a client's callback.
+--
+--     (POST(body), "/orders") -> {
+--         let bytes = receive(body, 65536)?
+--         ...
+--     }
+--
+-- **The limit is part of reaching the bytes.** An `Incoming` gives its bytes
+-- only through `receive(b, atMost)`, which reads the whole body into a buffer,
+-- `limited(b, atMost)`, a `Read` over it, or `unbounded(b)`, a `Read` with no
+-- limit, conspicuously named, for a proxy that streams a body on. No default
+-- limit exists to forget, and a handler that never reads a body never thinks
+-- about one.
+--
+-- * A body whose declared length is over `atMost` is `TooLarge` at once,
+--   before a byte is read, so a server can answer 413 and a client waiting
+--   for `100 Continue` is refused before it sends anything.
+-- * A body without a declared length (chunked) is counted as it arrives, and
+--   is `TooLarge` at the first byte past `atMost`.
+-- * A body is taken once. A second `receive`, `limited` or `unbounded` fails
+--   with `Consumed`: otherwise a second limit would start counting again
+--   where the first stopped.
+--
+-- An `Incoming` hides the connection under it, TCP or TLS, behind one
+-- indirect call per read, so a handler takes no transport parameter. Its
+-- errors are `HTTPError`s; `receive` lifts them into the caller's error type
+-- through `FromHTTP`.
+
+import Net.HTTP.Error (HTTPError(..), FromHTTP(..))
+import System.IO (AnyRead)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.ReadWrite (Read(..), needsRoom)
+
+type Incoming = Incoming { source : AnyRead HTTPError, declared : Option Int, var taken : Bool }
+
+-- Returns the body `source` reads, whose framing declared `declared` bytes,
+-- or `None` if it declared no length. A codec makes one from what it read; a
+-- test makes one to give a handler a body.
+fun incoming(source : AnyRead HTTPError, declared : Option Int) -> Incoming =
+    Incoming { source, declared, taken = False }
+
+-- Returns the body's declared length, if its framing gave one.
+fun declaredLength(b : Incoming) -> Option Int = b.declared
+
+-- A `Read` over a body, under a limit.
+type BodyRead = BodyRead {
+    source : AnyRead HTTPError,
+    atMost : Int,
+    var read : Int,
+    var failure : Option HTTPError,
+}
+
+instance Read BodyRead {
+    type ReadError = HTTPError
+    fun readInto(r, into) {
+        needsRoom(into)
+        if let Some(e) = r.failure { return Left(e) }
+        let left = r.atMost - r.read
+        if left == 0 {
+            -- At the limit, a body that has not ended is over it. One byte
+            -- read into a buffer of our own says which, without handing the
+            -- caller a byte past the limit.
+            let probe = Buf.buffer(1)
+            let n = readOrFail(r, probe)?
+            if n > 0 { return fail(r, TooLarge) }
+            return Right(0)
+        }
+        let n = Buf.limited(into, left, fun() = readOrFail(r, into))?
+        r.read = r.read + n
+        Right(n)
+    }
+}
+
+fun readOrFail(r : BodyRead, into : Buffer) -> Either HTTPError Int = match readInto(r.source, into) {
+    Left(e) -> fail(r, e)
+    Right(n) -> Right(n)
+}
+
+fun fail(r : BodyRead, e : HTTPError) -> Either HTTPError Int {
+    r.failure = Some(e)
+    Left(e)
+}
+
+-- Returns a `Read` over the body that fails with `TooLarge` past `atMost`
+-- bytes: at its first read if the declared length is over it, or else at
+-- the first byte past it. Panics if `atMost` is negative.
+fun limited(b : Incoming, atMost : Int) -> BodyRead {
+    if atMost < 0 { error("Incoming.limited: limit " + Int.toString(atMost) + " is negative") }
+    let failure = if b.taken {
+        Some(Consumed)
+    } else {
+        match b.declared {
+            Some(n) -> if n > atMost { Some(TooLarge) } else { None }
+            None -> None
+        }
+    }
+    b.taken = True
+    BodyRead { source = b.source, atMost, read = 0, failure }
+}
+
+-- Returns a `Read` over the body with no limit at all. For a program that
+-- passes a body on as it arrives, and bounds it some other way.
+fun unbounded(b : Incoming) -> BodyRead {
+    let failure = if b.taken { Some(Consumed) } else { None }
+    b.taken = True
+    BodyRead { source = b.source, atMost = Int.maxValue(), read = 0, failure }
+}
+
+-- Returns the whole body, at most `atMost` bytes, in a buffer of its own:
+-- one allocation of the declared length where there is one. A longer body
+-- is `TooLarge`.
+fun receive[FromHTTP e](b : Incoming, atMost : Int) -> Either e Buffer {
+    let r = limited(b, atMost)
+    var out = Buf.buffer(match b.declared {
+        Some(n) -> if n <= atMost && n > 0 { n } else { 1 }
+        None -> if atMost < 16384 && atMost > 0 { atMost } else { 16384 }
+    })
+    loop {
+        if Buf.room(out) == 0 {
+            if Buf.capacity(out) >= atMost || b.declared == Some(Buf.capacity(out)) {
+                -- Full at the limit: one more read says whether the body
+                -- ended there.
+                let n = lift(readInto(r, Buf.buffer(1)))?
+                if n == 0 { break }
+            }
+            let grown = Buf.buffer(if 2 * Buf.capacity(out) > atMost { atMost } else { 2 * Buf.capacity(out) })
+            Buf.append(grown, out.storage, out.start, out.end)
+            out = grown
+        }
+        let into = out
+        let n = lift(readInto(r, into))?
+        if n == 0 { break }
+    }
+    Right(out)
+}
+
+fun lift[FromHTTP e](x : Either HTTPError a) -> Either e a = match x {
+    Left(e) -> Left(fromHTTP(e))
+    Right(a) -> Right(a)
+}

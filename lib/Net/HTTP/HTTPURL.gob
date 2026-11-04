@@ -1,0 +1,98 @@
+export (
+    HTTPURL, parse, literal, fromURL, toURL, toString,
+    isHTTPS, host, port, authority, path, query, target, segments,
+)
+
+-- A URL an HTTP request can be sent to: `http` or `https`, with a host.
+--
+-- A `URL` that is one is refined by `fromURL`, which also refuses:
+--
+-- * user information (`https://user:pw@host/`), which RFC 9110 §4.2.4
+--   forbids a sender to write: it leaks into logs, and it makes
+--   `https://bank.example@evil.example/` read as the bank's;
+-- * a `%` in the host, so that two spellings of one host cannot pass two
+--   different checks;
+--
+-- and drops the fragment, which is the client's alone and never sent. An
+-- empty path is `/`, as RFC 9110 §4.2.3 makes it.
+
+import URL as URL (URL, URLError(..))
+import Net.HTTP.Syntax as Syntax
+
+type HTTPURL = HTTPURL {
+    isHTTPS : Bool
+    host : String
+    port : Option Int
+    path : String
+    query : Option String
+}
+
+instance Eq HTTPURL { fun eq(a, b) = toString(a) == toString(b) }
+instance Show HTTPURL { fun show(u) = toString(u) }
+
+fun parse(text : String) -> Either URLError HTTPURL = fromURL(URL.parse(text)?)
+
+-- Returns the URL `text` writes, and panics if it writes no HTTP URL.
+fun literal(text : String) -> HTTPURL = match parse(text) {
+    Right(u) -> u
+    Left(e) -> error("invalid HTTP URL literal '" + Syntax.escaped(text) + "': " + show(e))
+}
+
+fun fromURL(u : URL) -> Either URLError HTTPURL {
+    let isHTTPS = match URL.scheme(u) {
+        "http" -> False
+        "https" -> True
+        other -> return Left(UnsupportedScheme(other))
+    }
+    let a = match URL.authority(u) {
+        Some(a) -> a
+        None -> return Left(MissingHost)
+    }
+    if Option.isSome(URL.userinfo(a)) { return Left(UserinfoNotAllowed) }
+    if URL.host(a) == "" { return Left(MissingHost) }
+    if String.contains(URL.host(a), "%") { return Left(BadHost) }
+    let path = if URL.path(u) == "" { "/" } else { URL.path(u) }
+    Right(HTTPURL { isHTTPS, host = URL.host(a), port = URL.port(a), path, query = URL.query(u) })
+}
+
+fun toURL(u : HTTPURL) -> URL = URL.literal(toString(u))
+
+fun toString(u : HTTPURL) -> String {
+    let q = match u.query {
+        Some(q) -> "?" + q
+        None -> ""
+    }
+    (if u.isHTTPS { "https://" } else { "http://" }) + authority(u) + u.path + q
+}
+
+fun isHTTPS(u : HTTPURL) -> Bool = u.isHTTPS
+
+-- Returns the host as written, lowercase: a name, an IPv4 address, or an
+-- IPv6 address in brackets.
+fun host(u : HTTPURL) -> String = u.host
+
+-- Returns the port, the scheme's own (80 or 443) where the URL gives none.
+fun port(u : HTTPURL) -> Int = match u.port {
+    Some(n) -> n
+    None -> if u.isHTTPS { 443 } else { 80 }
+}
+
+-- Returns the host and, if the URL gave one, the port: `example.com:8080`.
+fun authority(u : HTTPURL) -> String = match u.port {
+    Some(n) -> u.host + ":" + Int.toString(n)
+    None -> u.host
+}
+
+-- Returns the path, encoded, never empty.
+fun path(u : HTTPURL) -> String = u.path
+
+fun query(u : HTTPURL) -> Option String = u.query
+
+-- Returns the path and query, as a request line sends them: `/search?q=a`.
+fun target(u : HTTPURL) -> String = match u.query {
+    Some(q) -> u.path + "?" + q
+    None -> u.path
+}
+
+-- Returns the path's segments, decoded, as `URL.segments` does.
+fun segments(u : HTTPURL) -> Option (Array String) = URL.segments(toURL(u))

@@ -1,0 +1,96 @@
+export (NewCookie, new, withAttribute, parse, toString, name, value, attributes)
+
+-- A cookie as a `Set-Cookie` header sets it (RFC 6265 §4.1): a name, a value,
+-- and attributes such as `Path=/`, `Secure` and `HttpOnly`.
+--
+--     let session = Cookie.new("session", id)?
+--     let session = Cookie.withAttribute(session, "HttpOnly")?
+--
+-- Each `Set-Cookie` header sets one cookie, and the headers are never joined
+-- into one: an `Expires` date holds a comma, so a joined list could not be
+-- split again.
+--
+-- The syntax is the strict one RFC 6265 gives servers. The name is a token;
+-- the value is the bytes the RFC allows, perhaps in double quotes, which are
+-- kept; an attribute is any text without a control byte or `;`.
+
+import Net.HTTP.Syntax as Syntax
+
+type NewCookie = NewCookie { name : String, value : String, attributes : Array String }
+
+instance Eq NewCookie { fun eq(a, b) = toString(a) == toString(b) }
+instance Show NewCookie { fun show(c) = toString(c) }
+
+fun new(name : String, value : String) -> Option NewCookie =
+    if Syntax.isToken(name) && isCookieValue(value) {
+        Some(NewCookie { name, value, attributes = [] })
+    } else {
+        None
+    }
+
+-- Returns `c` with the attribute `text` after those it has.
+fun withAttribute(c : NewCookie, text : String) -> Option NewCookie =
+    if isAttribute(text) {
+        Some(NewCookie { name = c.name, value = c.value, attributes = c.attributes + [text] })
+    } else {
+        None
+    }
+
+-- set-cookie-string = cookie-pair *( ";" SP cookie-av )
+fun parse(text : String) -> Option NewCookie {
+    let parts = String.split(text, "; ")
+    let (name, value) = String.splitOnce(parts[0], "=")?
+    var cookie = new(name, value)?
+    for var i = 1; i < len(parts); i = i + 1 {
+        cookie = withAttribute(cookie, parts[i])?
+    }
+    Some(cookie)
+}
+
+fun toString(c : NewCookie) -> String {
+    let out = String.builder()
+    String.push(out, c.name)
+    String.push(out, "=")
+    String.push(out, c.value)
+    for a in c.attributes {
+        String.push(out, "; ")
+        String.push(out, a)
+    }
+    String.build(out)
+}
+
+fun name(c : NewCookie) -> String = c.name
+fun value(c : NewCookie) -> String = c.value
+fun attributes(c : NewCookie) -> Array String = c.attributes
+
+-- cookie-value = *cookie-octet / ( DQUOTE *cookie-octet DQUOTE )
+fun isCookieValue(s : String) -> Bool {
+    let inner = match String.stripPrefix(s, "\"") {
+        Some(rest) -> match String.stripSuffix(rest, "\"") {
+            Some(inside) -> inside
+            None -> return False
+        }
+        None -> s
+    }
+    for b in String.toBytes(inner) {
+        if !isCookieOctet(Byte.toInt(b)) { return False }
+    }
+    True
+}
+
+-- cookie-octet = %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E: visible ASCII
+-- without `"`, `,`, `;` and `\`.
+fun isCookieOctet(b : Int) -> Bool =
+    b >= 0x21 && b <= 0x7E && b != 0x22 && b != 0x2C && b != 0x3B && b != 0x5C
+
+-- cookie-av: any CHAR except CTLs or ";". Not empty, and not starting or
+-- ending with a space, which would not survive being read again.
+fun isAttribute(s : String) -> Bool {
+    let n = String.byteLength(s)
+    if n == 0 || Syntax.byteAt(s, 0) == 0x20 || Syntax.byteAt(s, n - 1) == 0x20 { return False }
+    for b in String.toBytes(s) {
+        let x = Byte.toInt(b)
+        if x < 0x20 || x >= 0x7F || x == 0x3B { return False }
+    }
+    True
+}

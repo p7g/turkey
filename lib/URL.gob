@@ -1,0 +1,431 @@
+export (
+    URL, Reference, Authority, URLError(..),
+    parse, literal, parseReference, referenceLiteral, reference, resolve,
+    scheme, authority, path, query, fragment, segments, toString,
+    userinfo, host, port, decode,
+)
+
+-- URLs as RFC 3986 defines them, for any scheme: `https://example.com/a?b`,
+-- `mailto:someone@example.com`, `urn:isbn:0451450523`.
+--
+--     match URL.parse("https://example.com/search?q=turkey") {
+--         Right(u) -> print(URL.path(u))
+--         Left(e) -> print(e)
+--     }
+--
+-- **Two types.** A `URL` is absolute: it has a scheme, so it names something
+-- on its own. A `Reference` may be relative, `../style.css` or `/orders/42`
+-- or `?page=2`, and means something only against a base, which `resolve`
+-- supplies. Every `URL` is also a reference, through `reference`.
+--
+-- **Strict.** Every byte must be one RFC 3986 allows where it stands, and a
+-- `%` must start two hexadecimal digits. Spaces, controls, `\`, and bytes
+-- outside ASCII are refused rather than encoded or dropped, so the text a URL
+-- shows is exactly the text it was parsed from, apart from the scheme and
+-- host, which are case-insensitive and stored lowercase. Nothing else is
+-- normalized: dot segments stay as written until `resolve`, and
+-- percent-encoding is never added or removed.
+--
+-- **Components are encoded.** `path`, `query` and `fragment` are as they
+-- appear in the URL, `%2F` and all. `segments` decodes the path into its
+-- segments, where `a%2Fb` is one segment holding a slash, which no reading of
+-- the encoded path can tell apart from two.
+
+import Data.String (String(..))
+import Net as Net
+import Net.HTTP.Syntax as Syntax
+
+type Parts = Parts {
+    scheme : Option String
+    authority : Option Authority
+    path : String
+    query : Option String
+    fragment : Option String
+}
+
+-- An absolute URL: `parts.scheme` is always `Some`.
+type URL = URL(Parts)
+
+-- A URL or a relative reference.
+type Reference = Reference(Parts)
+
+-- The part after `//`: `user@host:port`.
+type Authority = Authority { userinfo : Option String, host : String, port : Option Int }
+
+-- Why text is not a URL. Each names the component that was refused.
+type URLError =
+    NotAbsolute
+    | BadScheme
+    | BadUserinfo
+    | BadHost
+    | BadPort
+    | BadPath
+    | BadQuery
+    | BadFragment
+    | UnsupportedScheme(String)
+    | MissingHost
+    | UserinfoNotAllowed
+
+instance Show URLError {
+    fun show(e) = match e {
+        NotAbsolute -> "not an absolute URL: it has no scheme"
+        BadScheme -> "invalid URL scheme"
+        BadUserinfo -> "invalid user information in URL"
+        BadHost -> "invalid host in URL"
+        BadPort -> "invalid port in URL"
+        BadPath -> "invalid URL path"
+        BadQuery -> "invalid URL query"
+        BadFragment -> "invalid URL fragment"
+        UnsupportedScheme(s) -> "unsupported URL scheme '" + Syntax.escaped(s) + "'"
+        MissingHost -> "URL has no host"
+        UserinfoNotAllowed -> "URL has user information, which is not allowed here"
+    }
+}
+
+instance Error URLError { fun message(e) = show(e) }
+
+instance Eq URL { fun eq(a, b) = toString(a) == toString(b) }
+instance Show URL { fun show(u) = toString(u) }
+instance Eq Reference { fun eq(a, b) = render(partsOf(a)) == render(partsOf(b)) }
+instance Show Reference { fun show(r) = render(partsOf(r)) }
+
+fun partsOf(Reference(p)) = p
+fun urlParts(URL(p)) = p
+
+-- Returns the absolute URL `text` writes.
+fun parse(text : String) -> Either URLError URL {
+    let parts = parseParts(text)?
+    if Option.isNone(parts.scheme) { return Left(NotAbsolute) }
+    Right(URL(parts))
+}
+
+-- Returns the URL `text` writes, and panics if it writes none: a URL written
+-- in the program's source that does not parse is a mistake in the program.
+fun literal(text : String) -> URL = match parse(text) {
+    Right(u) -> u
+    Left(e) -> error("invalid URL literal '" + Syntax.escaped(text) + "': " + show(e))
+}
+
+-- Returns the URL or relative reference `text` writes.
+fun parseReference(text : String) -> Either URLError Reference =
+    Either.map(parseParts(text), Reference)
+
+-- Returns the reference `text` writes, and panics if it writes none.
+fun referenceLiteral(text : String) -> Reference = match parseReference(text) {
+    Right(r) -> r
+    Left(e) -> error("invalid URL reference literal '" + Syntax.escaped(text) + "': " + show(e))
+}
+
+fun reference(URL(p)) -> Reference = Reference(p)
+
+fun scheme(URL(p)) -> String = Option.unwrapOr(p.scheme, "")
+fun authority(URL(p)) -> Option Authority = p.authority
+fun path(URL(p)) -> String = p.path
+fun query(URL(p)) -> Option String = p.query
+fun fragment(URL(p)) -> Option String = p.fragment
+
+fun userinfo(a : Authority) -> Option String = a.userinfo
+fun host(a : Authority) -> String = a.host
+fun port(a : Authority) -> Option Int = a.port
+
+-- Returns the path's segments, decoded: `/a%20b/c` is `["a b", "c"]`. The
+-- empty path has no segments, and `/` one empty segment. Returns `None` if
+-- a segment decodes to bytes that are not UTF-8.
+fun segments(u : URL) -> Option (Array String) {
+    let p = path(u)
+    if p == "" { return Some([]) }
+    let body = Option.unwrapOr(String.stripPrefix(p, "/"), p)
+    if body == "" { return Some([""]) }
+    let out = []
+    for part in String.split(body, "/") {
+        Vec.push(out, decode(part)?)
+    }
+    Some(Vec.toArray(out))
+}
+
+-- Returns `text` with each `%XX` replaced by the byte it encodes, or `None`
+-- if the result is not UTF-8. `text` comes from a parsed URL, so every `%`
+-- starts two hexadecimal digits.
+fun decode(text : String) -> Option String {
+    let bytes = String.bytesOf(text)
+    let out = []
+    var i = 0
+    while i < len(bytes) {
+        let b = Byte.toInt(bytes[i])
+        if b == 0x25 && i + 2 < len(bytes) {
+            Vec.push(out, Byte.truncate(hexValue(Byte.toInt(bytes[i + 1])) * 16
+                                        + hexValue(Byte.toInt(bytes[i + 2]))))
+            i = i + 3
+        } else {
+            Vec.push(out, bytes[i])
+            i = i + 1
+        }
+    }
+    String.fromBytes(out)
+}
+
+fun toString(URL(p)) -> String = render(p)
+
+-- RFC 3986 §5.3: the components joined with the delimiters that mark them.
+fun render(p : Parts) -> String {
+    let out = String.builder()
+    if let Some(s) = p.scheme {
+        String.push(out, s)
+        String.push(out, ":")
+    }
+    if let Some(a) = p.authority {
+        String.push(out, "//")
+        if let Some(u) = a.userinfo {
+            String.push(out, u)
+            String.push(out, "@")
+        }
+        String.push(out, a.host)
+        if let Some(n) = a.port {
+            String.push(out, ":")
+            String.push(out, Int.toString(n))
+        }
+    }
+    String.push(out, p.path)
+    if let Some(q) = p.query {
+        String.push(out, "?")
+        String.push(out, q)
+    }
+    if let Some(f) = p.fragment {
+        String.push(out, "#")
+        String.push(out, f)
+    }
+    String.build(out)
+}
+
+-- Returns the URL `reference` names when read against `base`, by the
+-- algorithm of RFC 3986 §5.2, dot segments removed.
+fun resolve(base : URL, reference : Reference) -> URL {
+    let b = urlParts(base)
+    let r = partsOf(reference)
+    if Option.isSome(r.scheme) {
+        return URL(Parts { scheme = r.scheme, authority = r.authority, path = removeDots(r.path),
+                           query = r.query, fragment = r.fragment })
+    }
+    if Option.isSome(r.authority) {
+        return URL(Parts { scheme = b.scheme, authority = r.authority, path = removeDots(r.path),
+                           query = r.query, fragment = r.fragment })
+    }
+    if r.path == "" {
+        let q = if Option.isSome(r.query) { r.query } else { b.query }
+        return URL(Parts { scheme = b.scheme, authority = b.authority, path = b.path, query = q,
+                           fragment = r.fragment })
+    }
+    let merged = if String.startsWith(r.path, "/") { r.path } else { merge(b, r.path) }
+    URL(Parts { scheme = b.scheme, authority = b.authority, path = removeDots(merged),
+                query = r.query, fragment = r.fragment })
+}
+
+-- RFC 3986 §5.2.3: a relative path is appended to the base path's directory.
+fun merge(base : Parts, relative : String) -> String {
+    if Option.isSome(base.authority) && base.path == "" { return "/" + relative }
+    match String.rsplitOnce(base.path, "/") {
+        Some((directory, _)) -> directory + "/" + relative
+        None -> relative
+    }
+}
+
+-- RFC 3986 §5.2.4, step by step: each turn of the loop applies the first
+-- rule that matches the front of `input`.
+fun removeDots(path : String) -> String {
+    var input = path
+    var output = ""
+    while input != "" {
+        if let Some(rest) = String.stripPrefix(input, "../") {
+            input = rest
+        } else if let Some(rest) = String.stripPrefix(input, "./") {
+            input = rest
+        } else if let Some(rest) = String.stripPrefix(input, "/./") {
+            input = "/" + rest
+        } else if input == "/." {
+            input = "/"
+        } else if let Some(rest) = String.stripPrefix(input, "/../") {
+            input = "/" + rest
+            output = dropLastSegment(output)
+        } else if input == "/.." {
+            input = "/"
+            output = dropLastSegment(output)
+        } else if input == "." || input == ".." {
+            input = ""
+        } else {
+            let start = if String.startsWith(input, "/") { 1 } else { 0 }
+            let stop = Syntax.byteFind(input, "/", start)
+            output = output + Syntax.sliceBytes(input, 0, stop)
+            input = Syntax.sliceBytes(input, stop, String.byteLength(input))
+        }
+    }
+    output
+}
+
+fun dropLastSegment(s : String) -> String = match String.rsplitOnce(s, "/") {
+    Some((front, _)) -> front
+    None -> ""
+}
+
+-- Splits `text` at the delimiters of RFC 3986 §3, then checks each component
+-- against its own grammar.
+fun parseParts(text : String) -> Either URLError Parts {
+    let n = String.byteLength(text)
+    var at = 0
+    let scheme = schemeEnd(text)
+    var schemeText = None
+    if scheme > 0 {
+        schemeText = Some(Syntax.asciiLower(Syntax.sliceBytes(text, 0, scheme)))
+        at = scheme + 1
+    }
+    var authority = None
+    if String.startsWith(Syntax.sliceBytes(text, at, n), "//") {
+        let stop = firstOf(text, at + 2, "/?#")
+        authority = Some(parseAuthority(Syntax.sliceBytes(text, at + 2, stop))?)
+        at = stop
+    }
+    let pathEnd = firstOf(text, at, "?#")
+    let path = Syntax.sliceBytes(text, at, pathEnd)
+    if !allBytes(path, isPathByte) { return Left(BadPath) }
+    if Option.isNone(schemeText) && Option.isNone(authority) {
+        -- A relative path's first segment cannot hold a colon, or it would
+        -- read as a scheme.
+        let first = Syntax.sliceBytes(path, 0, Syntax.byteFind(path, "/", 0))
+        if String.contains(first, ":") { return Left(BadScheme) }
+    }
+    at = pathEnd
+    var query = None
+    if at < n && Syntax.byteAt(text, at) == 0x3F {
+        let stop = firstOf(text, at + 1, "#")
+        let q = Syntax.sliceBytes(text, at + 1, stop)
+        if !allBytes(q, isQueryByte) { return Left(BadQuery) }
+        query = Some(q)
+        at = stop
+    }
+    var fragment = None
+    if at < n {
+        let f = Syntax.sliceBytes(text, at + 1, n)
+        if !allBytes(f, isQueryByte) { return Left(BadFragment) }
+        fragment = Some(f)
+    }
+    Right(Parts { scheme = schemeText, authority, path, query, fragment })
+}
+
+-- Returns the offset of the colon that ends a scheme at the start of `text`,
+-- or 0 if `text` does not start with one.
+-- scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." )
+fun schemeEnd(text : String) -> Int {
+    let n = String.byteLength(text)
+    if n == 0 || !isAlpha(Syntax.byteAt(text, 0)) { return 0 }
+    for var i = 1; i < n; i = i + 1 {
+        let b = Syntax.byteAt(text, i)
+        if b == 0x3A { return i }
+        if !(isAlpha(b) || isDigit(b) || b == 0x2B || b == 0x2D || b == 0x2E) { return 0 }
+    }
+    0
+}
+
+-- authority = [ userinfo "@" ] host [ ":" port ]
+fun parseAuthority(text : String) -> Either URLError Authority {
+    var rest = text
+    var userinfo = None
+    if let Some((u, h)) = String.rsplitOnce(text, "@") {
+        if !allBytes(u, isUserinfoByte) { return Left(BadUserinfo) }
+        userinfo = Some(u)
+        rest = h
+    }
+    var host = rest
+    var port = None
+    -- The port follows the last colon outside an IPv6 literal's brackets.
+    let close = if String.startsWith(rest, "[") { Syntax.byteFind(rest, "]", 0) } else { 0 }
+    let colon = Syntax.byteFind(rest, ":", close)
+    if colon < String.byteLength(rest) {
+        host = Syntax.sliceBytes(rest, 0, colon)
+        port = Some(parsePort(Syntax.sliceBytes(rest, colon + 1, String.byteLength(rest)))?)
+    }
+    Right(Authority { userinfo, host = parseHost(host)?, port })
+}
+
+-- port = *DIGIT, here at least one and at most 65535: an empty port after a
+-- colon is allowed by the grammar but means nothing, and refusing it leaves
+-- one spelling of each authority.
+fun parsePort(text : String) -> Either URLError Int {
+    if text == "" || String.byteLength(text) > 5 || !allBytes(text, isDigit) { return Left(BadPort) }
+    let n = Option.unwrapOr(Int.parse(text), 65536)
+    if n > 65535 { Left(BadPort) } else { Right(n) }
+}
+
+-- host = IP-literal / IPv4address / reg-name. An IPv6 literal must be an
+-- address `Net.parse` reads; a registered name is lowercased. IPvFuture is
+-- not accepted.
+fun parseHost(text : String) -> Either URLError String {
+    if let Some(inner) = String.stripPrefix(text, "[") {
+        let address = String.stripSuffix(inner, "]")
+        match address {
+            Some(a) -> if Option.isSome(Net.parse(a)) && String.contains(a, ":") && !String.contains(a, "%") {
+                return Right(Syntax.asciiLower(text))
+            }
+            None -> ()
+        }
+        return Left(BadHost)
+    }
+    if !allBytes(text, isRegNameByte) { return Left(BadHost) }
+    Right(Syntax.asciiLower(text))
+}
+
+-- Returns the offset of the first byte at or after `from` that is one of
+-- `stops`, or the length of `text`.
+fun firstOf(text : String, from : Int, stops : String) -> Int {
+    let n = String.byteLength(text)
+    for var i = from; i < n; i = i + 1 {
+        let b = Syntax.byteAt(text, i)
+        for var k = 0; k < String.byteLength(stops); k = k + 1 {
+            if Syntax.byteAt(stops, k) == b { return i }
+        }
+    }
+    n
+}
+
+-- Whether every byte of `text` is one `ok` allows, with `%` allowed only as
+-- the start of two hexadecimal digits.
+fun allBytes(text : String, ok : fun(Int) -> Bool) -> Bool {
+    let n = String.byteLength(text)
+    var i = 0
+    while i < n {
+        let b = Syntax.byteAt(text, i)
+        if b == 0x25 {
+            if i + 2 >= n { return False }
+            if !isHex(Syntax.byteAt(text, i + 1)) || !isHex(Syntax.byteAt(text, i + 2)) { return False }
+            i = i + 3
+        } else if ok(b) {
+            i = i + 1
+        } else {
+            return False
+        }
+    }
+    True
+}
+
+fun isAlpha(b : Int) -> Bool = (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+fun isDigit(b : Int) -> Bool = b >= 0x30 && b <= 0x39
+fun isHex(b : Int) -> Bool = isDigit(b) || (b >= 0x41 && b <= 0x46) || (b >= 0x61 && b <= 0x66)
+
+fun hexValue(b : Int) -> Int =
+    if isDigit(b) { b - 0x30 } else if b >= 0x61 { b - 0x61 + 10 } else { b - 0x41 + 10 }
+
+-- unreserved = ALPHA / DIGIT / "-" / "." / "_" / "~"
+fun isUnreserved(b : Int) -> Bool =
+    isAlpha(b) || isDigit(b) || b == 0x2D || b == 0x2E || b == 0x5F || b == 0x7E
+
+-- sub-delims = "!" / "$" / "&" / "'" / "(" / ")" / "*" / "+" / "," / ";" / "="
+fun isSubDelim(b : Int) -> Bool = match b {
+    0x21 | 0x24 | 0x26 | 0x27 | 0x28 | 0x29 | 0x2A | 0x2B | 0x2C | 0x3B | 0x3D -> True
+    _ -> False
+}
+
+fun isRegNameByte(b : Int) -> Bool = isUnreserved(b) || isSubDelim(b)
+fun isUserinfoByte(b : Int) -> Bool = isRegNameByte(b) || b == 0x3A
+
+-- pchar = unreserved / pct-encoded / sub-delims / ":" / "@"
+fun isPChar(b : Int) -> Bool = isRegNameByte(b) || b == 0x3A || b == 0x40
+fun isPathByte(b : Int) -> Bool = isPChar(b) || b == 0x2F
+fun isQueryByte(b : Int) -> Bool = isPathByte(b) || b == 0x3F

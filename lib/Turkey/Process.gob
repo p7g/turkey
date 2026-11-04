@@ -2,6 +2,7 @@ export (
     argsSet, argCount, argBytes, argLength, environment,
     panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
+    workerRecord,
 )
 
 -- What the program was started with, and how it is ending: its arguments, and
@@ -50,6 +51,14 @@ import Data.Error (Error(..))
 import Data.Int ()
 import Data.Bool (Bool(..))
 import Turkey.Libc as Libc
+import Data.Int as Int
+import Data.Byte as Byte
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
+import Data.Byte (Byte)
+
+-- The running worker's record, the block laid out above.
+fun workerRecord() -> Ptr = Prim.processState()
 
 fun flagAt() -> Int = 0
 fun argCountAt() -> Int = 8
@@ -65,24 +74,24 @@ fun messageBytes() -> Int = 248
 -- Not copied: `argv` belongs to the process and lives as long as it does, so
 -- what is kept is the pointer, and each argument's length is counted when it
 -- is asked for.
-fun argsSet(argc : Int, argv : Prim.Ptr) -> Unit {
-    let state = Prim.processState()
+fun argsSet(argc : Int, argv : Ptr) -> Unit {
+    let state = workerRecord()
     if argc >= 1 {
-        Prim.storeI64(state, argCountAt(), argc - 1)
-        Prim.storePtr(state, argVectorAt(), Prim.ptrAdd(argv, 8))
+        Ptr.store(state, argCountAt(), argc - 1)
+        Ptr.store(state, argVectorAt(), Ptr.add(argv, 8))
     } else {
-        Prim.storeI64(state, argCountAt(), 0)
-        Prim.storePtr(state, argVectorAt(), Prim.ptrNull())
+        Ptr.store(state, argCountAt(), 0)
+        Ptr.store(state, argVectorAt(), Ptr.null())
     }
 }
 
 -- How many arguments the program was given, its own name not among them.
-fun argCount() -> Int = Prim.loadI64(Prim.processState(), argCountAt())
+fun argCount() -> Int = Ptr.load(workerRecord(), argCountAt())
 
 -- Argument `index`'s bytes, NUL-terminated. An index outside `0..argCount()`
 -- is undefined, as any raw read is.
-fun argBytes(index : Int) -> Prim.Ptr =
-    Prim.loadPtr(Prim.loadPtr(Prim.processState(), argVectorAt()), 8 * index)
+fun argBytes(index : Int) -> Ptr =
+    Ptr.load(Ptr.load(workerRecord(), argVectorAt()), 8 * index)
 
 fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
 
@@ -92,10 +101,10 @@ fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
 -- null, so it is found from the argument vector kept above, which points at
 -- `argv[1]`. Nothing in the program changes the environment, so the strings
 -- stay as they were.
-fun environment() -> Prim.Ptr {
-    let vector = Prim.loadPtr(Prim.processState(), argVectorAt())
-    if Prim.ptrIsNull(vector) { return vector }
-    Prim.ptrAdd(vector, 8 * (argCount() + 1))
+fun environment() -> Ptr {
+    let vector : Ptr = Ptr.load(workerRecord(), argVectorAt())
+    if Ptr.isNull(vector) { return vector }
+    Ptr.add(vector, 8 * (argCount() + 1))
 }
 
 -- -- panicking --------------------------------------------------------------------------
@@ -105,7 +114,7 @@ fun environment() -> Prim.Ptr {
 --
 -- The C symbol is what generated code calls for a panic whose message is a
 -- constant.
-foreign "turkey_panic" fun panic(message : Prim.Ptr) -> Unit {
+foreign "turkey_panic" fun panic(message : Ptr) -> Unit {
     if pending() { return {} }
     record(message, Libc.strlen(message))
 }
@@ -113,27 +122,27 @@ foreign "turkey_panic" fun panic(message : Prim.Ptr) -> Unit {
 -- The same with the message as a Turkey `String`, which is what `error` hands
 -- over: a byte array, its length in the header's count and its bytes after
 -- the header. A null one is a panic with no message of its own.
-foreign "turkey_panic_string" fun panicString(message : Prim.Ptr) -> Unit {
+foreign "turkey_panic_string" fun panicString(message : Ptr) -> Unit {
     if pending() { return {} }
-    if Prim.ptrIsNull(message) {
+    if Ptr.isNull(message) {
         record(Prim.cString("error"), 5)
     } else {
-        record(Prim.ptrAdd(message, 16), Prim.loadI64(message, 8))
+        record(Ptr.add(message, 16), Ptr.load(message, 8))
     }
 }
 
 -- Copy the message in, then raise the flag. In that order: every call returns
 -- to a test of the flag, and the copy is calls.
-fun record(bytes : Prim.Ptr, length : Int) -> Unit {
+fun record(bytes : Ptr, length : Int) -> Unit {
     let limit = messageBytes() - 1
     let kept = if length < limit { length } else { limit }
-    let buffer = Prim.ptrAdd(Prim.processState(), messageAt())
+    let buffer = Ptr.add(workerRecord(), messageAt())
     var i = 0
     while i < kept {
-        Prim.storeI8(buffer, i, Prim.loadI8(bytes, i))
+        Ptr.store(buffer, i, Ptr.load(bytes, i) : Byte)
         i = i + 1
     }
-    Prim.storeI8(buffer, kept, Prim.byteFromInt(0))
+    Ptr.store(buffer, kept, Byte.truncate(0))
     raise()
 }
 
@@ -141,40 +150,40 @@ fun record(bytes : Prim.Ptr, length : Int) -> Unit {
 -- unless one is already raised. `before` and `after` are NUL-terminated, and
 -- the message is truncated to the buffer. For the allocator, which cannot
 -- allocate a message to hand to `panic`.
-fun panicInt(before : Prim.Ptr, n : Int, after : Prim.Ptr) -> Unit {
+fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
     -- The magnitude of `minValue` is 2^63, which the unsigned reading of its
     -- wrapped negation is.
-    compose(before, n < 0, if n < 0 { Prim.intSubWrapping(0, n) } else { n }, after)
+    compose(before, n < 0, if n < 0 { Int.subWrapping(0, n) } else { n }, after)
 }
 
 -- `panicInt` with `n`'s bits read as an unsigned number, for a byte count.
-fun panicUnsigned(before : Prim.Ptr, n : Int, after : Prim.Ptr) -> Unit {
+fun panicUnsigned(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
     compose(before, False, n, after)
 }
 
-fun compose(before : Prim.Ptr, negative : Bool, magnitude : Int, after : Prim.Ptr) -> Unit {
-    let buffer = Prim.ptrAdd(Prim.processState(), messageAt())
+fun compose(before : Ptr, negative : Bool, magnitude : Int, after : Ptr) -> Unit {
+    let buffer = Ptr.add(workerRecord(), messageAt())
     let limit = messageBytes() - 1
     var at = putText(buffer, 0, limit, before)
     if negative && at < limit {
-        Prim.storeI8(buffer, at, Prim.byteFromInt(45))
+        Ptr.store(buffer, at, Byte.truncate(45))
         at = at + 1
     }
     at = putDigits(buffer, at, limit, magnitude)
     at = putText(buffer, at, limit, after)
-    Prim.storeI8(buffer, at, Prim.byteFromInt(0))
+    Ptr.store(buffer, at, Byte.truncate(0))
     raise()
 }
 
 -- Copy the NUL-terminated `text` to `buffer` at `at`, stopping at `limit`, and
 -- return where it ends.
-fun putText(buffer : Prim.Ptr, at : Int, limit : Int, text : Prim.Ptr) -> Int {
+fun putText(buffer : Ptr, at : Int, limit : Int, text : Ptr) -> Int {
     let n = Libc.strlen(text)
     var i = 0
     while i < n && at + i < limit {
-        Prim.storeI8(buffer, at + i, Prim.loadI8(text, i))
+        Ptr.store(buffer, at + i, Ptr.load(text, i) : Byte)
         i = i + 1
     }
     at + i
@@ -182,25 +191,25 @@ fun putText(buffer : Prim.Ptr, at : Int, limit : Int, text : Prim.Ptr) -> Int {
 
 -- Write the unsigned `u` in decimal to `buffer` at `at`, stopping at `limit`,
 -- and return where it ends.
-fun putDigits(buffer : Prim.Ptr, at : Int, limit : Int, u : Int) -> Int {
+fun putDigits(buffer : Ptr, at : Int, limit : Int, u : Int) -> Int {
     -- Peel the digits off the low end, then reverse them in place.
     var rest = u
     var end = at
     loop {
-        -- A negative `rest` is at least 2^63 unsigned, and `/` is signed:
-        -- halve it with a logical shift first.
+        -- A negative `rest` is at least 2^63 unsigned, and `/` is signed: halve
+        -- it without its top bit, then add back the 2^62 that bit was worth.
         --
-        -- `Prim.intShr`, not `>>`: `>>` panics through `panicInt`, which
-        -- calls this, and the cycle that makes would be broken at `>>`,
-        -- leaving every shift in the program a call.
+        -- Not `>>`, which panics through `panicInt`, which calls this: the
+        -- cycle that makes would be broken at `>>`, leaving every shift in
+        -- the program a call.
         let next = if rest < 0 {
-            (Prim.intShr(rest, 1) & 0x7FFF_FFFF_FFFF_FFFF) / 5
+            ((rest & 0x7FFF_FFFF_FFFF_FFFF) / 2 + 0x4000_0000_0000_0000) / 5
         } else {
             rest / 10
         }
-        let digit = Prim.intSubWrapping(rest, Prim.intMulWrapping(next, 10))
+        let digit = Int.subWrapping(rest, Int.mulWrapping(next, 10))
         if end < limit {
-            Prim.storeI8(buffer, end, Prim.byteFromInt(48 + digit))
+            Ptr.store(buffer, end, Byte.truncate(48 + digit))
             end = end + 1
         }
         rest = next
@@ -209,19 +218,19 @@ fun putDigits(buffer : Prim.Ptr, at : Int, limit : Int, u : Int) -> Int {
     var i = at
     var j = end - 1
     while i < j {
-        let x = Prim.loadI8(buffer, i)
-        Prim.storeI8(buffer, i, Prim.loadI8(buffer, j))
-        Prim.storeI8(buffer, j, x)
+        let x : Byte = Ptr.load(buffer, i)
+        Ptr.store(buffer, i, Ptr.load(buffer, j) : Byte)
+        Ptr.store(buffer, j, x)
         i = i + 1
         j = j - 1
     }
     end
 }
 
-fun raise() -> Unit = Prim.storeI64(Prim.processState(), flagAt(), 1)
+fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 
 -- Whether a panic or an exit is unwinding right now.
-fun pending() -> Bool = Prim.loadI64(Prim.processState(), flagAt()) != 0
+fun pending() -> Bool = Ptr.load(workerRecord(), flagAt()) != 0
 
 -- The program's ending, once `entryReturned` has taken the flag down.
 var ended : Bool = False
@@ -230,15 +239,15 @@ var ended : Bool = False
 fun panicked() -> Bool = pending() || ended
 
 -- The panic's message, NUL-terminated; empty if there has been none.
-foreign "turkey_panic_message" fun panicMessage() -> Prim.Ptr =
-    Prim.ptrAdd(Prim.processState(), messageAt())
+foreign "turkey_panic_message" fun panicMessage() -> Ptr =
+    Ptr.add(workerRecord(), messageAt())
 
 -- Forget the panic and the exit, for C that raises them on purpose: the
 -- tests that call the allocator with bad arguments.
 foreign "turkey_panic_clear" fun panicClear() -> Unit {
-    let state = Prim.processState()
-    Prim.storeI64(state, flagAt(), 0)
-    Prim.storeI8(state, messageAt(), Prim.byteFromInt(0))
+    let state = workerRecord()
+    Ptr.store(state, flagAt(), 0)
+    Ptr.store(state, messageAt(), Byte.truncate(0))
     ended = False
     exitRequested = False
     status = 0
@@ -252,7 +261,7 @@ foreign "turkey_panic_clear" fun panicClear() -> Unit {
 -- is parked in `ended`, where `panicked` still sees it and no call site does.
 foreign "turkey_entry_returned" fun entryReturned() -> Unit {
     ended = pending()
-    Prim.storeI64(Prim.processState(), flagAt(), 0)
+    Ptr.store(workerRecord(), flagAt(), 0)
 }
 
 -- -- exiting ----------------------------------------------------------------------------

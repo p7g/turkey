@@ -41,12 +41,12 @@ import Turkey.Semaphore as Semaphores
 -- waiters are woken, not handed the mutex, so one that is never quick enough
 -- can wait for as long as others keep taking it.
 type Mutex a = Mutex {
-    state       : Prim.Atomic,
+    state       : AtomicInt,
     var waiters : Vec Co.Coroutine,
     var value   : a,
 }
 
-fun mutex(value : a) -> Mutex a = Mutex { state = Prim.atomicNew(0), waiters = [], value = value }
+fun mutex(value : a) -> Mutex a = Mutex { state = atomicInt(0), waiters = [], value = value }
 
 -- `f` of the value, with the mutex held.
 fun withLock(m : Mutex a, f : fun(a) -> b) -> b {
@@ -64,7 +64,7 @@ fun update(m : Mutex a, f : fun(a) -> a) -> Unit {
 }
 
 fun lock(m : Mutex a) -> Unit {
-    if Prim.atomicSwapIf(m.state, 0, 1) == 0 { return {} }
+    if compareAndSet(m.state, 0, 1) { return {} }
     Scheduler.waitUntil(fun() = claim(m), fun(c) = Vec.push(m.waiters, c))
 }
 
@@ -72,11 +72,11 @@ fun lock(m : Mutex a) -> Unit {
 fun claim(m : Mutex a) -> Bool {
     let p = m.state
     while True {
-        let state = Prim.atomicGet(p)
+        let state = load(p)
         if state == 0 {
-            if Prim.atomicSwapIf(p, 0, 2) == 0 { return True }
+            if compareAndSet(p, 0, 2) { return True }
         } else if state == 1 {
-            if Prim.atomicSwapIf(p, 1, 2) == 1 { return False }
+            if compareAndSet(p, 1, 2) { return False }
         } else {
             return False
         }
@@ -93,10 +93,10 @@ fun unlock(m : Mutex a) -> Unit {
     Scheduler.unlock()
 }
 
-fun swap(p : Prim.Atomic, value : Int) -> Int {
+fun swap(p : AtomicInt, value : Int) -> Int {
     while True {
-        let old = Prim.atomicGet(p)
-        if Prim.atomicSwapIf(p, old, value) == old { return old }
+        let old = load(p)
+        if compareAndSet(p, old, value) { return old }
     }
     0
 }
@@ -116,7 +116,7 @@ fun store(AtomicInt(cell), value : Int) -> Unit = Prim.atomicSet(cell, value)
 
 -- Add `n`, answering the sum. It wraps on overflow, as the instruction does.
 fun addAndGet(AtomicInt(cell), n : Int) -> Int =
-    Prim.intAddWrapping(Prim.atomicAddTo(cell, n), n)
+    Int.addWrapping(Prim.atomicAddTo(cell, n), n)
 
 -- Store `new` if the value is `expected`, answering whether it was.
 fun compareAndSet(AtomicInt(cell), expected : Int, new : Int) -> Bool =
@@ -131,36 +131,36 @@ fun compareAndSet(AtomicInt(cell), expected : Int, new : Int) -> Bool =
 -- A computation that asks for its own value waits for itself, which is a
 -- deadlock.
 type Once a = Once {
-    state       : Prim.Atomic,
+    state       : AtomicInt,
     compute     : fun() -> a,
     var made    : Option a,
     var waiters : Vec Co.Coroutine,
 }
 
 fun once(compute : fun() -> a) -> Once a =
-    Once { state = Prim.atomicNew(0), compute = compute, made = None, waiters = [] }
+    Once { state = atomicInt(0), compute = compute, made = None, waiters = [] }
 
 fun force(o : Once a) -> a {
     let p = o.state
-    if Prim.atomicGet(p) != 2 {
-        if Prim.atomicSwapIf(p, 0, 1) == 0 {
+    if load(p) != 2 {
+        if compareAndSet(p, 0, 1) {
             let value = o.compute()
             Scheduler.lock()
             o.made = Some(value)
-            Prim.atomicSet(p, 2)
+            store(p, 2)
             for c in o.waiters { Scheduler.wake(c) }
             o.waiters = []
             Scheduler.changed()
             Scheduler.unlock()
         } else {
-            Scheduler.waitUntil(fun() = Prim.atomicGet(p) == 2,
+            Scheduler.waitUntil(fun() = load(p) == 2,
                                 fun(c) = Vec.push(o.waiters, c))
         }
     }
     -- Written before the state became 2, which this read after.
     match o.made {
         Some(value) -> value
-        None -> Prim.error("System.Sync.force: a value marked made is missing")
+        None -> error("System.Sync.force: a value marked made is missing")
     }
 }
 

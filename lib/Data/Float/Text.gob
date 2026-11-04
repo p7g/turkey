@@ -12,13 +12,11 @@ export (toString, parse)
 -- Eisel-Lemire) all need; the price is time, not correctness.
 --
 -- Parsing has one shortcut in front, and it is exact too: see `fastPath`.
---
--- Written against `Prim.` for floats because `Data.Float` imports this module,
--- so the `Float` instances are not available here.
 
 import Prelude ()
 import Data.Int (Int)
 import Data.Float (Float)
+import Data.Float as Float
 import Data.Byte (Byte)
 import Data.Tuple (Unit)
 import Data.Array (Array)
@@ -33,6 +31,8 @@ import Data.Int ()
 import Data.Int as Int
 import Data.Option (Option(..))
 import Data.String (String(..), bytesOf)
+import Data.Byte as Byte
+import Turkey.Array as Storage
 
 -- -- the decimal ------------------------------------------------------------
 --
@@ -67,15 +67,15 @@ let slack = 18
 fun newDecimal() -> Decimal = Decimal {
     -- `slack` more than `capacity`: `leftShift` writes its result up to that
     -- far right of where it will finally sit.
-    digits = Prim.arrayNew(capacity + slack, Prim.byteFromInt(0)),
+    digits = Storage.filled(capacity + slack, Byte.truncate(0)),
     nd = 0,
     dp = 0,
     trunc = False,
 }
 
-fun digitAt(d : Decimal, i : Int) -> Int = Prim.byteToInt(d.digits[i])
+fun digitAt(d : Decimal, i : Int) -> Int = Byte.toInt(d.digits[i])
 
-fun setDigit(d : Decimal, i : Int, v : Int) -> Unit { d.digits[i] = Prim.byteFromInt(v) }
+fun setDigit(d : Decimal, i : Int, v : Int) -> Unit { d.digits[i] = Byte.truncate(v) }
 
 fun trim(d : Decimal) -> Unit {
     while d.nd > 0 && digitAt(d, d.nd - 1) == 0 { d.nd = d.nd - 1 }
@@ -271,7 +271,7 @@ let signBit = -0x7FFF_FFFF_FFFF_FFFF - 1
 -- there is a fractional part, `.0` if nothing else, so finite output lexes as
 -- a `Float` literal and not an `Int` one.
 fun toString(x : Float) -> String {
-    let bits = Prim.floatBits(x)
+    let bits = Float.bits(x)
     let negative = bits < 0
     let biased = bits >> mantBits & maxBiased
     let frac = bits & (hidden - 1)
@@ -380,7 +380,7 @@ fun roundShortest(d : Decimal, mant : Int, exp : Int) -> Unit {
 -- Lay out the digits of a nonzero `d`. At most 17 digits and a three-digit
 -- exponent, so 32 bytes is room enough before trimming to size.
 fun render(d : Decimal, negative : Bool) -> String {
-    let out = Prim.arrayNewUninit(32)
+    let out = Storage.uninitialized(32)
     var at = 0
     if negative { at = put(out, at, 45) }
     let e = d.dp - 1
@@ -414,13 +414,13 @@ fun render(d : Decimal, negative : Bool) -> String {
         if magnitude < 10 { at = put(out, at, 48) }
         at = putInt(out, at, magnitude)
     }
-    let exact = Prim.arrayNewUninit(at)
+    let exact = Storage.uninitialized(at)
     for var i = 0; i < at; i = i + 1 { exact[i] = out[i] }
     String(exact)
 }
 
 fun put(out : Prim.Array Byte, at : Int, byte : Int) -> Int {
-    out[at] = Prim.byteFromInt(byte)
+    out[at] = Byte.truncate(byte)
     at + 1
 }
 
@@ -449,9 +449,9 @@ fun putInt(out : Prim.Array Byte, at : Int, n : Int) -> Int {
 fun parse(s : String) -> Option Float {
     let b = bytesOf(s)
     let n = len(b)
-    if bytesAre(b, "NaN") { return Some(Prim.floatDiv(0.0, 0.0)) }
-    if bytesAre(b, "Infinity") { return Some(Prim.floatDiv(1.0, 0.0)) }
-    if bytesAre(b, "-Infinity") { return Some(Prim.floatDiv(Prim.floatNeg(1.0), 0.0)) }
+    if bytesAre(b, "NaN") { return Some(Float.nan()) }
+    if bytesAre(b, "Infinity") { return Some(Float.infinity()) }
+    if bytesAre(b, "-Infinity") { return Some(-Float.infinity()) }
 
     let scan = Scan { digits = newDecimal(), mantissa = 0, significant = 0 }
     let d = scan.digits
@@ -506,11 +506,11 @@ fun parse(s : String) -> Option Float {
     let exp10 = exponent - fractionDigits
     if scan.significant <= 15 && exp10 >= -22 && exp10 <= 22 {
         let x = fastPath(scan.mantissa, exp10)
-        return Some(if negative { Prim.floatNeg(x) } else { x })
+        return Some(if negative { -x } else { x })
     }
     d.dp = d.dp + exponent
     trim(d)
-    Some(Prim.floatFromBits(toBits(d, negative)))
+    Some(Float.fromBits(toBits(d, negative)))
 }
 
 -- The digits read so far: all of them in `digits`, and the first 15
@@ -544,11 +544,11 @@ fun isDigit(c : Int) -> Bool = c >= 48 && c <= 57
 -- operands is correctly rounded by definition -- which is the whole of what
 -- parsing has to achieve. Most literals in real programs take it.
 fun fastPath(mantissa : Int, exp10 : Int) -> Float {
-    let m = Prim.intToFloat(mantissa)
+    let m = Float.fromInt(mantissa)
     if exp10 >= 0 {
-        Prim.floatMul(m, powerOfTen(exp10))
+        m * powerOfTen(exp10)
     } else {
-        Prim.floatDiv(m, powerOfTen(-exp10))
+        m / powerOfTen(-exp10)
     }
 }
 
@@ -556,7 +556,7 @@ fun fastPath(mantissa : Int, exp10 : Int) -> Float {
 -- `5^22` is below `2^53`.
 fun powerOfTen(k : Int) -> Float {
     var p = 1.0
-    for var i = 0; i < k; i = i + 1 { p = Prim.floatMul(p, 10.0) }
+    for var i = 0; i < k; i = i + 1 { p = p * 10.0 }
     p
 }
 
@@ -621,7 +621,7 @@ fun stepFor(n : Int) -> Int = match n {
     _ -> 27
 }
 
-fun byteAt(b : Prim.Array Byte, i : Int) -> Int = Prim.byteToInt(b[i])
+fun byteAt(b : Prim.Array Byte, i : Int) -> Int = Byte.toInt(b[i])
 
 fun bytesAre(b : Prim.Array Byte, s : String) -> Bool {
     let t = bytesOf(s)

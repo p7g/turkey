@@ -86,6 +86,7 @@ import Turkey.Prelude as P
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
+import System.Env as Env
 import System.IO as IO
 import System.Parallel as Parallel
 import Algorithm.Hash (fnv1a)
@@ -93,6 +94,13 @@ import Data.Hashable (Hasher(..))
 import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
+
+-- A miscompile planted on purpose, for testing that `boot interpret
+-- --stages` names the pass a wrong answer comes from: under
+-- `TURKEY_SEED_MISCOMPILE=opt-add-wraps`, every reduction rewrites a trapping
+-- `Prim.intAdd` into the wrapping one, so an overflow that should panic
+-- prints a wrapped sum instead.
+let seededAddWraps = Env.get("TURKEY_SEED_MISCOMPILE") == Some("opt-add-wraps")
 
 -- How large a body may be and still be inlined, counted as `sizeOf_` counts.
 -- Small enough that a call site does not become unreadable, large enough for
@@ -554,11 +562,20 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
 -- components, and so the same whoever asked first; and the names it invents
 -- are scoped to it (`fresh`). One component is reduced by one worker, in
 -- order, because within a cycle what is known depends on that order.
-fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
+--
+-- `opaque` names bindings never to inline, beside the loop breakers. The
+-- compile passes none. The interpreter passes the bindings that run compiled
+-- under it (`Turkey.Hosted`) when it runs a stage after this one: inlined, a
+-- runtime body would be interpreted inside its caller, reading and writing a
+-- copy of the runtime's state rather than the state itself. So the stages it
+-- interprets differ from the compiled program in exactly that inlining.
+fun reduceProgram(program : CProgram, decls : DeclTable,
+                  opaque : Set.Set String) -> CProgram {
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
     let base = newReducer(program, decls, graph, walked)
+    for name in Set.elements(opaque) { Set.add(base.breakers, name) }
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
@@ -721,7 +738,13 @@ fun step(r : Reducer, e : Core) -> Option Core {
             CSlot(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
             _ -> constant(r, e)
         }
-        CApp(fn, _) -> return match fn.kind {
+        CApp(fn, args) -> return match fn.kind {
+            CPrim(Prims.IntAdd) ->
+                if seededAddWraps {
+                    Some(mkCore(e.ty, e.span, CApp(mkCore(fn.ty, fn.span, CPrim(Prims.IntAddWrapping)), args)))
+                } else {
+                    inline(r, e, inlineLimit)
+                }
             CLam(_, _, _) -> beta(r, e)
             CSlot(_, _) -> knownLambda(r.decls, e)
             CProject(_, _) -> match knownLambda(r.decls, e) {

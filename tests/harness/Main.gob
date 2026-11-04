@@ -14,7 +14,8 @@
 --                      the archives and the reference
 --   --bless            write each selected case's actual results over its
 --                      goldens, unless they look like a broken compiler
---                      (`Bless`)
+--                      (`Bless`), and its line in the interpreter's skip
+--                      list (`Interpreted`)
 --   PATH[::CASE]       run only the cases whose name starts with PATH, and
 --                      whose part after its last `:` contains CASE: an
 --                      archive's case is `PATH::CASE`
@@ -36,6 +37,8 @@ import Case (Case(..), Result(..))
 import Cache as Cache
 import Execute as Execute
 import Files as Files
+import Interpreted (Skips(..))
+import Interpreted as Interpreted
 import Programs as Programs
 import Reference as Reference
 import Report as Report
@@ -73,19 +76,25 @@ fun main() {
                     + Archive.cases(o.root + "/tests/cases", "tests/cases", o.cache + "/cases")
                     + Reference.cases(o.root + "/docs/ref", "docs/ref", o.cache + "/reference")
                 }
+    -- The selftest's cases are not in the skip list, and none needs to be.
+    let skips = if o.selftest { Skips { header = "", listed = Map.new() } } else { readSkips(o.root) }
     let selected = Array.filter(found, \chosen(o, _.name))
     let timingsFile = o.cache + "/timings"
     let timings = Schedule.readTimings(timingsFile)
     let cases = Schedule.ordered(selected, timings)
     let actual = o.cache + "/actual"
-    let ran = Schedule.runAll(cases, o.jobs, Execute.execute(t, cache, actual, _))
+    let ran = Schedule.runAll(cases, o.jobs, Execute.execute(t, cache, actual, skips, _))
     -- Reported in name order, whatever order they ran in.
     let byName = Array.sortByKey(ran, _.0.name)
     let results = Array.map(byName, \(_.0, _.1.0))
     Schedule.writeTimings(timingsFile, timings, results)
     let decided = Bless.merged(Array.map(byName, \(_.0, _.1.1)))
     let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-    let ok = if o.bless { bless(decided, actual, millis) }
+    let listings = []
+    for (c, (_, _, listing)) in byName {
+        if let Some(l) = listing { Vec.push(listings, (c.name, l)) }
+    }
+    let ok = if o.bless { bless(decided, o.root, skips, Vec.toArray(listings), actual, millis) }
              else {
                  let reported = Report.report(results, o.verbose, actual, millis)
                  if o.selftest { Selftest.check(o.cache, results, decided) } else { reported }
@@ -93,10 +102,20 @@ fun main() {
     Env.exit(if ok { 0 } else { 1 })
 }
 
--- Writes every file and makes every archive edit bless permits, prints what
--- was written and what was refused, and returns whether no case was refused.
-fun bless(decided : Array (Case, Blessing), actual : String, millis : Int) -> Bool {
+-- Writes every file and makes every archive edit bless permits, and the skip
+-- list as `listings` makes it, prints what was written and what was refused,
+-- and returns whether no case was refused.
+fun bless(decided : Array (Case, Blessing), root : String, skips : Skips,
+          listings : Array (String, Either String (Option String)), actual : String, millis : Int) -> Bool {
     let blessings = Array.map(decided, _.1)
+    if !Bless.overLimit(blessings) {
+        if let Some(text) = Interpreted.rewritten(skips, listings) {
+            if let Left(e) = Files.writeText(root + "/" + Interpreted.file, text) {
+                die("cannot bless: " + Error.describe(e))
+            }
+            print("wrote: " + Interpreted.file)
+        }
+    }
     for (path, text) in Bless.permitted(blessings) {
         if let Left(e) = Files.writeText(path, text) { die("cannot bless: " + Error.describe(e)) }
     }
@@ -164,6 +183,20 @@ fun options(args : Array String) -> Options {
     -- cases would overwrite the goldens that make them what they are.
     if o.selftest && o.bless { die("--bless and --selftest cannot be given together") }
     o
+}
+
+-- The skip list under `root`, which may be missing, and is then empty.
+fun readSkips(root : String) -> Skips {
+    let path = root + "/" + Interpreted.file
+    if !Files.exists(path) { return Skips { header = "", listed = Map.new() } }
+    let text = match Files.readText(path) {
+        Right(text) -> text
+        Left(e) -> die("cannot read the skip list: " + Error.describe(e))
+    }
+    match Interpreted.readSkips(text) {
+        Right(skips) -> skips
+        Left(why) -> die(why)
+    }
 }
 
 fun valueOf(p : Args.Parser) -> String = match Args.value(p) {

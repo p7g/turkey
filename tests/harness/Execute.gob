@@ -21,8 +21,11 @@ export (execute, diffLimit)
 -- compile answered, even when the output already failed, since bless needs
 -- them all.
 --
+-- A program that ran is also run by `boot interpret`, and a case passes only
+-- if the two runs agree or the skip list says why they cannot (`Interpreted`).
+--
 -- Every actual result is written under `ACTUAL/NAME/` for inspection, whether
--- the case passed or not: `output`, and one file per dump.
+-- the case passed or not: `output`, `interpreted`, and one file per dump.
 
 import Process (Output(..), Status(..))
 import Process as Process
@@ -34,12 +37,14 @@ import Bless as Bless
 import Archive (Comparison(..))
 import Archive as Archive
 import Case (Case(..), Golden(..), Quote(..), Archived(..), Section(..), Outcome(..), Result(..), Finish(..),
-             Ending(..), Observed(..), Recorded(..))
+             Ending(..), Observed(..), Interpretation(..), Recorded(..))
 import Case as Case
 import Cache (Cache, Compiled(..))
 import Cache as Cache
 import Diff as Diff
 import Files as Files
+import Interpreted (Skips(..))
+import Interpreted as Interpreted
 import Reference as Reference
 import Toolchain (Toolchain(..))
 import Toolchain as Toolchain
@@ -55,14 +60,20 @@ let defaultTimeout : Int = 300
 -- What became of a case, before its time is added.
 type Verdict = Verdict { outcome : Outcome, why : String, diff : String }
 
--- Returns the outcome of case `c` and what bless would do with it. Writes the
--- actual results under `ACTUAL/NAME/`, and never writes a golden.
-fun execute(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Result, Blessing) {
+-- What bless makes a case's line in the skip list (`Interpreted.entry`), or
+-- `None` if the case's program did not run.
+type Listing = Option (Either String (Option String))
+
+-- Returns the outcome of case `c`, what bless would do with it, and what
+-- bless would make its line in `skips`. Writes the actual results under
+-- `ACTUAL/NAME/`, and never writes a golden.
+fun execute(t : Toolchain, cache : Cache, actual : String, skips : Skips, c : Case)
+    -> (Result, Blessing, Listing) {
     let watch = Stopwatch.start()
-    let (judged, blessing) = assess(t, cache, actual + "/" + c.name, c)
+    let (judged, blessing, listing) = assess(t, cache, actual + "/" + c.name, Map.get(skips.listed, c.name), c)
     let Verdict { outcome, why, diff } = expected(c, judged)
     let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-    (Result { outcome, why, diff, millis }, blessing)
+    (Result { outcome, why, diff, millis }, blessing, listing)
 }
 
 -- An `xfail` case turns a wrong answer into the failure it expects and a
@@ -74,12 +85,13 @@ fun expected(c : Case, judged : Verdict) -> Verdict = match (c.xfail, judged.out
     _ -> judged
 }
 
-fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict, Blessing) {
+fun assess(t : Toolchain, cache : Cache, actual : String, listed : Option String, c : Case)
+    -> (Verdict, Blessing, Listing) {
     if let Some(problem) = c.problem { return unrunnable(problem) }
     for r in c.requires {
         if !Toolchain.satisfies(t, r) {
             let why = "requires " + Case.requirementName(r)
-            return (Verdict(Skip, why, ""), Keep(why))
+            return (Verdict(Skip, why, ""), Keep(why), None)
         }
     }
     let recorded = match goldens(c) {
@@ -90,10 +102,19 @@ fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict,
         Right(observed) -> observed
         Left(why) -> return unrunnable(why)
     }
-    (verdict(c, recorded, observed), Bless.decide(c, recorded, observed))
+    let listing = Option.map(observed.interpreted, Interpreted.entry(listed, observed, _))
+    -- A golden is not written for a case whose interpreted run bless cannot
+    -- account for, since the native output it would record is as suspect.
+    let blessing = match (Bless.decide(c, recorded, observed), listing) {
+        (Unchanged, Some(Left(why))) | (Write(_), Some(Left(why))) | (Edits(_), Some(Left(why))) ->
+            Refuse(Disagrees, why)
+        (b, _) -> b
+    }
+    (verdict(c, recorded, observed, listed), blessing, listing)
 }
 
-fun unrunnable(why : String) -> (Verdict, Blessing) = (Verdict(HarnessError, why, ""), Refuse(Unrunnable, why))
+fun unrunnable(why : String) -> (Verdict, Blessing, Listing) =
+    (Verdict(HarnessError, why, ""), Refuse(Unrunnable, why), None)
 
 -- The case's goldens as they are on disk. A missing `.expected` is not an
 -- error here: the verdict reports it, and bless creates it. A quoted golden
@@ -133,11 +154,23 @@ fun observe(t : Toolchain, cache : Cache, actual : String, c : Case) -> Either S
     }
     let (ending, stdout, stderr) = ran
     record(actual, "output", stdout + stderr)
+    -- A program that crashed or ran out of time has failed already, and
+    -- interpreting it would take at least as long.
+    let interpreted = match ending {
+        Ran(Returned(_)) | Ran(Panicked(_)) -> match interpret(t, c) {
+            Right(i) -> {
+                record(actual, "interpreted", i.printed)
+                Some(i)
+            }
+            Left(e) -> return Left("boot interpret did not start: " + Error.message(e))
+        }
+        Ran(Killed(_)) | Ran(Expired) | CompileCrash(_) | CompileExpired | Diagnosed(_) | Checked -> None
+    }
     let dumps = match ending {
         CompileCrash(_) | CompileExpired -> []
         Diagnosed(_) | Checked | Ran(_) -> runDumps(t, actual, c)?
     }
-    Right(Observed { ending, stdout, stderr, dumps })
+    Right(Observed { ending, stdout, stderr, dumps, interpreted })
 }
 
 -- The compiled program run in the case's directory: how it ended, its
@@ -149,6 +182,17 @@ fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
     let Output { stdout, stderr, status } = Process.run(Toolchain.caseCommand(t, c, argv), Some(limit))?
     let err = Toolchain.text(stderr)
     Right((Ran(finish(status, err)), Toolchain.text(stdout), warnings + err))
+}
+
+-- The case's program run by `boot interpret`, in the case's directory. It is
+-- given at least the default time limit, since the interpreter is slower
+-- than the program's own limit allows for.
+fun interpret(t : Toolchain, c : Case) -> Either IOError Interpretation {
+    let argv = t.run + [t.boot, "interpret", c.entry]
+    let limit = Toolchain.limit(t, max(Option.unwrapOr(c.timeout, defaultTimeout), defaultTimeout))
+    let Output { stdout, stderr, status } = Process.run(Toolchain.caseCommand(t, c, argv), Some(limit))?
+    let err = Toolchain.text(stderr)
+    Right(Interpretation { finish = finish(status, err), printed = Toolchain.text(stdout) + err })
 }
 
 -- Each of the case's dump stages, as `boot check --dump STAGE` ended, its
@@ -186,12 +230,24 @@ fun record(directory : String, name : String, text : String) -> Unit {
 -- -- judging ---------------------------------------------------------------------------
 
 -- The outcome of a case whose goldens are `recorded` and whose run produced
--- `observed`. The output is judged first, then each dump in turn; the first
+-- `observed`, and whose reason in the skip list is `listed`. The output is
+-- judged first, then each dump in turn, then the interpreted run; the first
 -- that is wrong decides.
-fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict = match c.golden {
-    OnDisk(path) -> goldenVerdict(c, path, recorded, observed)
-    Quoted(q) -> quotedVerdict(c, q, observed)
-    InArchive(a) -> archiveVerdict(c, a, observed)
+fun verdict(c : Case, recorded : Recorded, observed : Observed, listed : Option String) -> Verdict {
+    let native = match c.golden {
+        OnDisk(path) -> goldenVerdict(c, path, recorded, observed)
+        Quoted(q) -> quotedVerdict(c, q, observed)
+        InArchive(a) -> archiveVerdict(c, a, observed)
+    }
+    if !Case.passed(native.outcome) { return native }
+    let judged = match observed.interpreted {
+        Some(i) -> Interpreted.judge(listed, observed, i, diffLimit)
+        None -> None
+    }
+    match judged {
+        Some((outcome, why, diff)) -> Verdict(outcome, why, diff)
+        None -> native
+    }
 }
 
 fun goldenVerdict(c : Case, path : String, recorded : Recorded, observed : Observed) -> Verdict {

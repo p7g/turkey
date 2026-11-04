@@ -15,17 +15,20 @@ export (cases, check)
 --
 -- Bless is checked by its decisions, which are pure, and by the edits it
 -- makes to copies of two archives under the cache. Nothing here writes a
--- golden in the repository.
+-- golden in the repository. The comparison with interpreted runs, and what
+-- bless makes of the skip list, are checked on made-up runs, since every
+-- case here that runs agrees with its interpreted run.
 
 import Archive (Edit(..))
 import Archive as Archive
 import Bless (Blessing(..), Guard(..))
 import Bless as Bless
 import Case (Case(..), Expected(..), Golden(..), Outcome(..), Result(..), Finish(..), Ending(..),
-             Observed(..), Recorded(..))
+             Observed(..), Interpretation(..), Recorded(..))
 import Case as Case
 import Diff as Diff
 import Files as Files
+import Interpreted as Interpreted
 import Programs as Programs
 import Reference as Reference
 
@@ -209,7 +212,8 @@ fun check(cache : String, results : Array (Case, Result), decided : Array (Case,
     let limited = checkLimit(Array.map(decided, _.1))
     let own = checkOwnError()
     let dumped = checkDumpGuards()
-    let ok = outcomes && reasons && blessed && edited && limited && own && dumped
+    let interpreted = checkInterpreted()
+    let ok = outcomes && reasons && blessed && edited && limited && own && dumped && interpreted
     print(if ok { "selftest: every outcome classified and every blessing decided correctly" }
           else { "selftest: FAILED" })
     ok
@@ -366,6 +370,7 @@ fun checkOwnError() -> Bool {
     let recorded = Recorded { expected = Some("case.gob:1:1: parse error: expected a declaration\n"), dumps = [] }
     let observed = Observed {
         ending = Diagnosed(2), stdout = "", stderr = "boot: cannot read case.gob\n", dumps = [],
+        interpreted = None,
     }
     let b = Bless.decide(c, recorded, observed)
     let w = Refused(Diagnostic)
@@ -391,11 +396,71 @@ fun checkDumpGuards() -> Bool {
     ]
     var ok = True
     for (dump, w) in tried {
-        let observed = Observed { ending = Ran(Returned(0)), stdout = "hello\n", stderr = "", dumps = [dump] }
+        let observed = Observed { ending = Ran(Returned(0)), stdout = "hello\n", stderr = "", dumps = [dump],
+                                  interpreted = None }
         let b = Bless.decide(c, recorded, observed)
         if wantedShape(w) != shape(b) {
             print("selftest: for a types dump that ended " + finishName(dump.0) + ", bless should "
                   + wantedShape(w) + ", but would " + shape(b) + why(b))
+            ok = False
+        }
+    }
+    ok
+}
+
+-- How an interpreted run is judged against a native one that printed
+-- `hello` and exited 0, and what bless makes of the skip list after it.
+fun checkInterpreted() -> Bool {
+    let observed = Observed { ending = Ran(Returned(0)), stdout = "hello\n", stderr = "", dumps = [],
+                              interpreted = None }
+    let agreeing = Interpretation { finish = Returned(0), printed = "hello\n" }
+    let calling = Interpretation { finish = Returned(98), printed = "the interpreter cannot call 'f'\n" }
+    let wrong = Interpretation { finish = Returned(0), printed = "goodbye\n" }
+    let tried = [
+        ("an agreeing run", None, agreeing, None, Right(None)),
+        ("an agreeing run listed as 'ffi'", Some("ffi"), agreeing, Some(Fail), Right(None)),
+        ("an unlisted 'ffi' run", None, calling, Some(Fail), Right(Some("ffi"))),
+        ("a listed 'ffi' run", Some("ffi"), calling, None, Right(Some("ffi"))),
+        ("an 'ffi' run listed as 'stack'", Some("stack"), calling, Some(Fail), Right(Some("ffi"))),
+        ("an unlisted wrong answer", None, wrong, Some(Fail), Left("")),
+        ("a wrong answer listed as 'timing'", Some("timing"), wrong, None, Right(Some("timing"))),
+        ("a wrong answer listed as 'ffi'", Some("ffi"), wrong, Some(Fail), Left("")),
+    ]
+    var ok = True
+    for (what, listed, i, outcome, entry) in tried {
+        let judged = Option.map(Interpreted.judge(listed, observed, i, 10), _.0)
+        if judged != outcome {
+            print("selftest: " + what + " should " + Option.fold(outcome, "pass", \"be a " + Case.outcomeName(_))
+                  + ", but would " + Option.fold(judged, "pass", \"be a " + Case.outcomeName(_)))
+            ok = False
+        }
+        let blessed = Interpreted.entry(listed, observed, i)
+        let same = match (blessed, entry) {
+            (Left(_), Left(_)) -> True
+            (Right(a), Right(b)) -> a == b
+            _ -> False
+        }
+        if !same {
+            print("selftest: bless decides the skip list's line wrongly for " + what)
+            ok = False
+        }
+    }
+    -- A line bless did not run the case of is kept, a pytest node id with a
+    -- space in it included, and the header stays where it is.
+    let text = "# header\n\na.gob ffi\nb.gob stack\ntests/test_x.py::test_y[a b] timing\n"
+    let wanted = "# header\n\nb.gob stack\nc.gob ffi\ntests/test_x.py::test_y[a b] timing\n"
+    match Interpreted.readSkips(text) {
+        Right(skips) -> {
+            let entries = [("a.gob", Right(None)), ("c.gob", Right(Some("ffi"))), ("b.gob", Left("refused"))]
+            let got = Interpreted.rewritten(skips, entries)
+            if got != Some(wanted) {
+                print("selftest: bless rewrites the skip list as\n" + Option.unwrapOr(got, "(nothing)\n")
+                      + "rather than\n" + wanted)
+                ok = False
+            }
+        }
+        Left(why) -> {
+            print("selftest: the skip list cannot be read: " + why)
             ok = False
         }
     }

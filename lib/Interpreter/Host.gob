@@ -1,0 +1,135 @@
+export (
+    Entry, overrides, executable,
+    byte, char, float, bool, ptr, bytes, handle,
+    vUnit, vBool, vHandle, vCoroutines,
+    thunk, predicate, sink, saved, unavailable,
+)
+
+-- How a value crosses between interpreted code and the compiled host: what
+-- `Interpreter.Boundary`, the generated table, is written in, and the few
+-- bindings the interpreter supplies in place of interpreting them.
+--
+-- A library module, for `Prim.*` and the runtime's modules; see
+-- `Interpreter.Value`.
+
+import Interpreter.Value (Value(..), Reenter(..), Handle(..), Cell(..))
+import Interpreter.Value as V
+import Turkey.Coroutine as Co
+import Turkey.Process as Process
+import Turkey.Ptr as Ptr
+
+-- One entry: the interpreter's way back in, and the arguments.
+type Entry = fun(Reenter, Array Value) -> Value
+
+-- Bindings of interpreted modules that the interpreter answers itself.
+--
+-- * `errno` is read straight after the call that set it, which the
+--   interpreter cannot promise: boxing the call's result may allocate, and
+--   allocating may reach C. Every boundary call into `Libc` or `Workers`
+--   saves it instead (`Interpreter.Value.saveErrno`), and these read and
+--   clear what was saved.
+-- * The program's arguments are the interpreter's own after `boot`,
+--   `interpret` and any options: the host's `Turkey.Process` knows only the
+--   whole command line, so the interpreted program asks through these, which
+--   skip what the interpreter consumed. `skipped` is how many that is.
+fun overrides(skipped : Int) -> Array (String, Entry) = [
+    ("Turkey.Sys#errno", fun(_, _) = VInt(V.savedErrno())),
+    ("Turkey.Sys#clearErrno", fun(_, _) {
+        V.clearErrno()
+        VUnit
+    }),
+    ("Turkey.Process#argCount", fun(_, _) = VInt(Process.argCount() - skipped)),
+    ("Turkey.Process#argBytes", fun(_, a) =
+        VPtr(Process.argBytes(V.int(a[0]) + skipped))),
+    ("Turkey.Process#argLength", fun(_, a) =
+        VInt(Process.argLength(V.int(a[0]) + skipped))),
+]
+
+-- The name this process was started by, `argv[0]`, which the interpreter
+-- runs to start itself again; empty if there is none, or if it is not UTF-8.
+fun executable() -> String =
+    Option.unwrapOr(Ptr.fromCString(Ptr.wrap(Process.programBytes())), "")
+
+-- -- from interpreted values ------------------------------------------------------------
+
+fun byte(v : Value) -> Byte = match v {
+    VByte(b) -> b
+    _ -> wrong("Byte")
+}
+
+fun char(v : Value) -> Char = match v {
+    VChar(c) -> c
+    _ -> wrong("Char")
+}
+
+fun float(v : Value) -> Float = match v {
+    VFloat(x) -> x
+    _ -> wrong("Float")
+}
+
+fun bool(v : Value) -> Bool = V.isTrue(v)
+
+fun ptr(v : Value) -> Prim.Ptr = match v {
+    VPtr(p) -> p
+    _ -> wrong("Prim.Ptr")
+}
+
+-- An interpreted byte array is a host one.
+fun bytes(v : Value) -> Array Byte = match v {
+    VBytes(xs) -> Prim.castAs(xs)
+    _ -> wrong("Array Byte")
+}
+
+-- A host object handed back. The generated table names the type it
+-- expects, and only a value of that type was ever wrapped as one of them.
+fun handle(v : Value) -> a = match v {
+    VHandle(Handle(x)) -> Prim.castAs(x)
+    _ -> wrong("a host object")
+}
+
+fun wrong(what : String) -> a =
+    Prim.error("internal error: a boundary call expected " + what)
+
+-- -- to interpreted values --------------------------------------------------------------
+
+fun vUnit(u : Unit) -> Value = VUnit
+
+fun vBool(b : Bool) -> Value = V.bool(b)
+
+fun vHandle(x : a) -> Value = VHandle(Handle(x))
+
+-- A `Vec Coroutine` the host hands over, as the interpreted `Vec` it is:
+-- `Data.Vec`'s storage record, its array and its length, behind the erased
+-- wrapper.
+fun vCoroutines(cs : Vec Co.Coroutine) -> Value {
+    let storage = Prim.arrayNew(len(cs), VUnit)
+    for var i = 0; i < len(cs); i = i + 1 { Prim.arraySet(storage, i, vHandle(cs[i])) }
+    VCon(0, [VValues(storage), VInt(len(cs))])
+}
+
+-- -- interpreted functions the host calls -------------------------------------------------
+
+fun thunk(r : Reenter, f : Value, budget : Int) -> fun() -> Unit =
+    fun() {
+        let _ = r.call(f, [], budget)
+    }
+
+fun predicate(r : Reenter, f : Value, budget : Int) -> fun() -> Bool =
+    fun() = V.isTrue(r.call(f, [], budget))
+
+fun sink(r : Reenter, f : Value, budget : Int) -> fun(a) -> Unit =
+    fun(x) {
+        let _ = r.call(f, [vHandle(x)], budget)
+    }
+
+-- `x`, once the calling thread's `errno` is saved: what a call into `Libc` or
+-- `Workers` is wrapped in, with nothing between the call and the save.
+fun saved(x : a) -> a {
+    V.saveErrno()
+    x
+}
+
+-- A compiled function this target does not have, which the library calls
+-- only on another.
+fun unavailable(name : String) -> a =
+    Prim.error("internal error: '" + name + "' does not exist on this target")

@@ -31,6 +31,8 @@ import Data.Eq (Eq(..), (==), (!=))
 import Data.Num (Neg(..))
 import Bits (BitAnd(..), (&))
 import Turkey.OpenSSL as OpenSSL
+import Turkey.Ptr (Ptr)
+import Turkey.Ptr as Ptr
 
 let chosenAt : Int = 0
 let protocolsLengthAt : Int = 8
@@ -39,13 +41,14 @@ let protocolsAt : Int = 16
 -- `int (*)(SSL *, int *alert, void *argument)`: retry until a certificate is
 -- chosen, then go on. A connection without a block has nothing to choose.
 -- The constants are written out: a giblet reads no global it need not.
-foreign "turkey_tls_client_hello" fun clientHello(ssl : Prim.Ptr, alert : Prim.Ptr,
-                                                  argument : Prim.Ptr) -> Int {
+foreign "turkey_tls_client_hello" fun clientHello(ssl : Ptr, alert : Ptr,
+                                                  argument : Ptr) -> Int {
     let block = OpenSSL.sslGetExData(ssl, 0)
     -- SSL_CLIENT_HELLO_SUCCESS
-    if Prim.ptrIsNull(block) { return 1 }
+    if Ptr.isNull(block) { return 1 }
     -- SSL_CLIENT_HELLO_SUCCESS, or SSL_CLIENT_HELLO_RETRY
-    if Prim.loadI64(block, 0) != 0 { 1 } else { -1 }
+    let chosen : Int = Ptr.load(block, 0)
+    if chosen != 0 { 1 } else { -1 }
 }
 
 -- `int (*)(SSL *, const unsigned char **out, unsigned char *outLength, const
@@ -53,16 +56,16 @@ foreign "turkey_tls_client_hello" fun clientHello(ssl : Prim.Ptr, alert : Prim.P
 -- first of the server's protocols that the client also offers. With none in
 -- common the handshake fails with a `no_application_protocol` alert, as RFC
 -- 7301 asks. A server that offers none answers without ALPN.
-foreign "turkey_tls_alpn_select" fun alpnSelect(ssl : Prim.Ptr, out : Prim.Ptr,
-                                                outLength : Prim.Ptr, client : Prim.Ptr,
-                                                clientLength : Int, argument : Prim.Ptr) -> Int {
+foreign "turkey_tls_alpn_select" fun alpnSelect(ssl : Ptr, out : Ptr,
+                                                outLength : Ptr, client : Ptr,
+                                                clientLength : Int, argument : Ptr) -> Int {
     let block = OpenSSL.sslGetExData(ssl, 0)
     -- SSL_TLSEXT_ERR_NOACK: no protocol, and no alert.
-    if Prim.ptrIsNull(block) { return 3 }
-    let length = Prim.loadI64(block, 8)
+    if Ptr.isNull(block) { return 3 }
+    let length : Int = Ptr.load(block, 8)
     if length == 0 { return 3 }
     -- `clientLength` is a C `unsigned int`, with the high half undefined.
-    let r = OpenSSL.sslSelectNextProto(out, outLength, Prim.ptrAdd(block, 16), length,
+    let r = OpenSSL.sslSelectNextProto(out, outLength, Ptr.add(block, 16), length,
                                        client, clientLength & 0xFFFF_FFFF)
     -- OPENSSL_NPN_NEGOTIATED: SSL_TLSEXT_ERR_OK; else SSL_TLSEXT_ERR_ALERT_FATAL.
     if (r & 0xFFFF_FFFF) == 1 { 0 } else { 2 }

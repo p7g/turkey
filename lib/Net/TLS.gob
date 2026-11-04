@@ -104,6 +104,7 @@ import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.Errors as Errors
 import Turkey.IO as IO
 import Turkey.OpenSSL as SSL
+import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
 import Turkey.Resolve as Resolve
@@ -179,7 +180,7 @@ type ClientConfig = ClientConfig {
     guard : Sync.Mutex Unit,
     -- One reference, dropped by `releaseClient`, which leaves it null. Each
     -- connection takes a reference of its own (`SSL_new`).
-    var ctx : Prim.Ptr,
+    var ctx : Ptr,
     -- The protocols to offer, in ALPN's wire form.
     protocols : Array Byte,
 }
@@ -200,7 +201,7 @@ fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError Cli
     let wire = alpnWire(protocols)?
     SSL.errClearError()
     let ctx = SSL.ctxNew(SSL.tlsClientMethod())
-    if Prim.ptrIsNull(ctx) { return Left(Configuration(reason())) }
+    if Ptr.isNull(ctx) { return Left(Configuration(reason())) }
     -- `ctx` is this function's until it is returned: freed on any failure.
     match configureClient(ctx, roots) {
         Right(_) -> Right(ClientConfig { guard = Sync.mutex(()), ctx, protocols = wire })
@@ -211,9 +212,9 @@ fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError Cli
     }
 }
 
-fun configureClient(ctx : Prim.Ptr, roots : Roots) -> Either TLSError Unit {
+fun configureClient(ctx : Ptr, roots : Roots) -> Either TLSError Unit {
     configureCommon(ctx)?
-    SSL.ctxSetVerify(ctx, SSL.verifyPeer, Prim.ptrNull())
+    SSL.ctxSetVerify(ctx, SSL.verifyPeer, Ptr.null())
     match roots {
         SystemRoots -> if cInt(SSL.ctxSetDefaultVerifyPaths(ctx)) != 1 {
             return Left(Configuration("the system's roots: " + reason()))
@@ -237,9 +238,9 @@ fun serverConfig(certificates : Array Certificate, protocols : Array String)
     let contexts = []
     for c in certificates {
         match serverContext(c) {
-            Right(ctx) -> Vec.push(contexts, Prim.ptrToInt(ctx))
+            Right(ctx) -> Vec.push(contexts, Ptr.toInt(ctx))
             Left(e) -> {
-                for made in contexts { SSL.ctxFree(Prim.ptrFromInt(made)) }
+                for made in contexts { SSL.ctxFree(Ptr.fromInt(made)) }
                 return Left(e)
             }
         }
@@ -248,10 +249,10 @@ fun serverConfig(certificates : Array Certificate, protocols : Array String)
 }
 
 -- A context presenting `c`, owned by the caller.
-fun serverContext(c : Certificate) -> Either TLSError Prim.Ptr {
+fun serverContext(c : Certificate) -> Either TLSError Ptr {
     SSL.errClearError()
     let ctx = SSL.ctxNew(SSL.tlsServerMethod())
-    if Prim.ptrIsNull(ctx) { return Left(Configuration(reason())) }
+    if Ptr.isNull(ctx) { return Left(Configuration(reason())) }
     match configureServer(ctx, c) {
         Right(_) -> Right(ctx)
         Left(e) -> {
@@ -261,7 +262,7 @@ fun serverContext(c : Certificate) -> Either TLSError Prim.Ptr {
     }
 }
 
-fun configureServer(ctx : Prim.Ptr, c : Certificate) -> Either TLSError Unit {
+fun configureServer(ctx : Ptr, c : Certificate) -> Either TLSError Unit {
     configureCommon(ctx)?
     let chain = withPath(c.chain, fun(p) = SSL.ctxUseCertificateChainFile(ctx, p))?
     if chain != 1 { return Left(Configuration(c.chain + ": " + reason())) }
@@ -272,15 +273,15 @@ fun configureServer(ctx : Prim.Ptr, c : Certificate) -> Either TLSError Unit {
     }
     -- Both read the connection's block (`Turkey.TLSCallbacks`), not an
     -- argument, so nothing here outlives the context.
-    SSL.ctxSetAlpnSelectCb(ctx, Prim.codeAddress("turkey_tls_alpn_select"), Prim.ptrNull())
-    SSL.ctxSetClientHelloCb(ctx, Prim.codeAddress("turkey_tls_client_hello"), Prim.ptrNull())
+    SSL.ctxSetAlpnSelectCb(ctx, Prim.codeAddress("turkey_tls_alpn_select"), Ptr.null())
+    SSL.ctxSetClientHelloCb(ctx, Prim.codeAddress("turkey_tls_client_hello"), Ptr.null())
     Right(())
 }
 
 -- TLS 1.2 at least, and no renegotiation: a renegotiation would make a write
 -- wait for a read, which a layer whose reads and writes run apart cannot do.
-fun configureCommon(ctx : Prim.Ptr) -> Either TLSError Unit {
-    if SSL.ctxCtrl(ctx, SSL.ctrlSetMinProtoVersion, SSL.tls12Version, Prim.ptrNull()) != 1 {
+fun configureCommon(ctx : Ptr) -> Either TLSError Unit {
+    if SSL.ctxCtrl(ctx, SSL.ctrlSetMinProtoVersion, SSL.tls12Version, Ptr.null()) != 1 {
         return Left(Configuration(reason()))
     }
     let _ = SSL.ctxSetOptions(ctx, SSL.opNoRenegotiation)
@@ -290,16 +291,16 @@ fun configureCommon(ctx : Prim.Ptr) -> Either TLSError Unit {
 -- Free `c`'s context. Connections made from it keep working; a `client` after
 -- it fails with `Configuration`. Releasing it again does nothing.
 fun releaseClient(c : ClientConfig) -> Unit = Sync.withLock(c.guard, fun(_) {
-    if !Prim.ptrIsNull(c.ctx) {
+    if !Ptr.isNull(c.ctx) {
         SSL.ctxFree(c.ctx)
-        c.ctx = Prim.ptrNull()
+        c.ctx = Ptr.null()
     }
 })
 
 -- Free `c`'s contexts. Connections made from it keep working; a `server` or
 -- `accept` after it fails. Releasing it again does nothing.
 fun releaseServer(c : ServerConfig) -> Unit = Sync.withLock(c.guard, fun(_) {
-    for ctx in c.contexts { SSL.ctxFree(Prim.ptrFromInt(ctx)) }
+    for ctx in c.contexts { SSL.ctxFree(Ptr.fromInt(ctx)) }
     c.contexts = []
 })
 
@@ -320,18 +321,18 @@ fun alpnWire(protocols : Array String) -> Either TLSError (Array Byte) {
 
 -- `f` of `path` as a C string, which is freed after. A path with a NUL in it
 -- is refused: C would read only the part before it.
-fun withPath(path : String, f : fun(Prim.Ptr) -> Int) -> Either TLSError Int {
+fun withPath(path : String, f : fun(Ptr) -> Int) -> Either TLSError Int {
     if String.contains(path, "\0") {
         return Left(Configuration("a path cannot contain a NUL byte"))
     }
     let c = cString(path)
-    let r = f(Ptr.raw(c))
+    let r = f(c)
     Ptr.free(c)
     Right(cInt(r))
 }
 
 -- `s` as a NUL-terminated C string the caller frees. Panics if out of memory.
-fun cString(s : String) -> Ptr.Ptr {
+fun cString(s : String) -> Ptr {
     let c = Ptr.toCString(s)
     if Ptr.isNull(c) { error("Net.TLS: out of memory") }
     c
@@ -383,15 +384,15 @@ type TLS = TLS {
     -- Owned. `retire` frees it, with `SSL_free`, once the connection is
     -- closed and no operation is using it; it is null after. `SSL_free` also
     -- frees `rbio` and `wbio`, and drops the reference to the context.
-    var ssl   : Prim.Ptr,
+    var ssl   : Ptr,
     -- The memory BIOs `ssl` reads the peer's bytes from and writes the bytes
     -- to send into. Owned by `ssl`.
-    rbio      : Prim.Ptr,
-    wbio      : Prim.Ptr,
+    rbio      : Ptr,
+    wbio      : Ptr,
     -- A server's block for the callbacks (`Turkey.TLSCallbacks`), from
     -- `malloc`. Owned, and freed by `retire` straight after `ssl`, which is
     -- the last thing that reads it. Null for a client.
-    var block : Prim.Ptr,
+    var block : Ptr,
     -- The certificates to choose among, for a server.
     config    : Option ServerConfig,
     -- Under `engine`: how many operations are using `ssl`; whether `close`
@@ -473,7 +474,7 @@ instance Connection TLS {
     }
 }
 
-fun newTLS(stream : Under, ssl : Prim.Ptr, rbio : Prim.Ptr, wbio : Prim.Ptr, block : Prim.Ptr,
+fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
            config : Option ServerConfig) -> TLS =
     TLS {
         stream, reading = Sync.mutex(()), sending = Sync.mutex(()), engine = Sync.mutex(()),
@@ -497,8 +498,8 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
     let name = checkedName(to.host)?
     SSL.errClearError()
     let ssl = Sync.withLock(config.guard, fun(_) =
-        if Prim.ptrIsNull(config.ctx) { Prim.ptrNull() } else { SSL.sslNew(config.ctx) })
-    if Prim.ptrIsNull(ssl) {
+        if Ptr.isNull(config.ctx) { Ptr.null() } else { SSL.sslNew(config.ctx) })
+    if Ptr.isNull(ssl) {
         return Left(Configuration("cannot make a connection from a released configuration"))
     }
     -- `ssl` is this function's until the `TLS` holds it.
@@ -510,7 +511,7 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
         }
     }
     SSL.sslSetConnectState(ssl)
-    let t = newTLS(streamOf(conn), ssl, bios.0, bios.1, Prim.ptrNull(), None)
+    let t = newTLS(streamOf(conn), ssl, bios.0, bios.1, Ptr.null(), None)
     -- From here `t` owns `ssl`, and `abandon` frees it.
     match nameServer(ssl, name, config.protocols) {
         Right(_) -> {}
@@ -536,9 +537,9 @@ fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
         conn : c, config : ServerConfig) -> Either TLSError TLS {
     SSL.errClearError()
     let ssl = Sync.withLock(config.guard, fun(_) =
-        if len(config.contexts) == 0 { Prim.ptrNull() }
-        else { SSL.sslNew(Prim.ptrFromInt(config.contexts[0])) })
-    if Prim.ptrIsNull(ssl) {
+        if len(config.contexts) == 0 { Ptr.null() }
+        else { SSL.sslNew(Ptr.fromInt(config.contexts[0])) })
+    if Ptr.isNull(ssl) {
         return Left(Configuration("cannot make a connection from a released configuration"))
     }
     let bios = match attachBIOs(ssl) {
@@ -550,7 +551,7 @@ fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
     }
     SSL.sslSetAcceptState(ssl)
     let block = callbackBlock(config.protocols)
-    if Prim.ptrIsNull(block) {
+    if Ptr.isNull(block) {
         SSL.sslFree(ssl)
         error("Net.TLS: out of memory")
     }
@@ -560,11 +561,11 @@ fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
 
 -- Two memory BIOs, given to `ssl`, which owns them from then on: `(rbio,
 -- wbio)`.
-fun attachBIOs(ssl : Prim.Ptr) -> Either TLSError (Prim.Ptr, Prim.Ptr) {
+fun attachBIOs(ssl : Ptr) -> Either TLSError (Ptr, Ptr) {
     let rbio = SSL.bioNew(SSL.bioSMem())
-    if Prim.ptrIsNull(rbio) { return Left(Configuration(reason())) }
+    if Ptr.isNull(rbio) { return Left(Configuration(reason())) }
     let wbio = SSL.bioNew(SSL.bioSMem())
-    if Prim.ptrIsNull(wbio) {
+    if Ptr.isNull(wbio) {
         let _ = SSL.bioFree(rbio)
         return Left(Configuration(reason()))
     }
@@ -574,36 +575,36 @@ fun attachBIOs(ssl : Prim.Ptr) -> Either TLSError (Prim.Ptr, Prim.Ptr) {
 
 -- The block a server's callbacks read: no certificate chosen yet, and the
 -- protocols. Null if out of memory.
-fun callbackBlock(protocols : Array Byte) -> Prim.Ptr {
+fun callbackBlock(protocols : Array Byte) -> Ptr {
     let n = len(protocols)
     let block = Ptr.alloc(Callbacks.protocolsAt + n)
-    if Ptr.isNull(block) { return Ptr.raw(block) }
+    if Ptr.isNull(block) { return block }
     Ptr.store(block, Callbacks.chosenAt, 0)
     Ptr.store(block, Callbacks.protocolsLengthAt, n)
     for var i = 0; i < n; i = i + 1 {
         Ptr.store(block, Callbacks.protocolsAt + i, protocols[i])
     }
-    Ptr.raw(block)
+    block
 }
 
 -- Tell OpenSSL the name to send and to check, and the protocols to offer.
 -- Each call copies what it is given.
-fun nameServer(ssl : Prim.Ptr, name : String, protocols : Array Byte) -> Either TLSError Unit {
+fun nameServer(ssl : Ptr, name : String, protocols : Array Byte) -> Either TLSError Unit {
     let c = cString(name)
     let sent = match Resolve.parse(name) {
         -- An address: no SNI, which carries only host names.
         Some(_) -> 1
-        None -> SSL.sslCtrl(ssl, SSL.ctrlSetTLSExtHostName, SSL.nameTypeHostName, Ptr.raw(c))
+        None -> SSL.sslCtrl(ssl, SSL.ctrlSetTLSExtHostName, SSL.nameTypeHostName, c)
     }
     -- An address as text is checked against the certificate's addresses.
-    let checked = cInt(SSL.sslSet1Host(ssl, Ptr.raw(c)))
+    let checked = cInt(SSL.sslSet1Host(ssl, c))
     Ptr.free(c)
     if sent != 1 || checked != 1 {
         return Left(Configuration("the host name '" + name + "': " + reason()))
     }
     if len(protocols) > 0 {
         let r = cInt(SSL.sslSetAlpnProtos(ssl, IO.addressOf(protocols, 0), len(protocols)))
-        Prim.keepAlive(protocols)
+        Ptr.keepAlive(protocols)
         if r != 0 { return Left(Configuration(reason())) }
     }
     Right(())
@@ -648,12 +649,12 @@ fun using(t : TLS, op : String, f : fun() -> Either TLSError a) -> Either TLSErr
 -- With `engine` held: free the OpenSSL connection once `t` is closed and
 -- nothing is using it, then the block its callbacks read.
 fun retire(t : TLS) -> Unit {
-    if !t.closed || t.users > 0 || Prim.ptrIsNull(t.ssl) { return {} }
+    if !t.closed || t.users > 0 || Ptr.isNull(t.ssl) { return {} }
     SSL.sslFree(t.ssl)
-    t.ssl = Prim.ptrNull()
-    if !Prim.ptrIsNull(t.block) {
-        Ptr.free(Ptr.wrap(t.block))
-        t.block = Prim.ptrNull()
+    t.ssl = Ptr.null()
+    if !Ptr.isNull(t.block) {
+        Ptr.free(t.block)
+        t.block = Ptr.null()
     }
 }
 
@@ -751,10 +752,10 @@ fun choose(t : TLS) -> Unit {
     match t.config {
         Some(config) -> Sync.withLock(config.guard, fun(_) {
             -- A configuration released since leaves the connection where it is.
-            var chosen = Prim.ptrNull()
+            var chosen = Ptr.null()
             if let Some(n) = name {
                 for at in config.contexts {
-                    let ctx = Prim.ptrFromInt(at)
+                    let ctx = Ptr.fromInt(at)
                     if names(ctx, n) {
                         chosen = ctx
                         break
@@ -762,22 +763,22 @@ fun choose(t : TLS) -> Unit {
                 }
             }
             engine(t, fun() {
-                if !Prim.ptrIsNull(chosen) { let _ = SSL.sslSetSSLCtx(t.ssl, chosen) }
-                Prim.storeI64(t.block, Callbacks.chosenAt, 1)
+                if !Ptr.isNull(chosen) { let _ = SSL.sslSetSSLCtx(t.ssl, chosen) }
+                Ptr.store(t.block, Callbacks.chosenAt, 1)
             })
         })
-        None -> engine(t, fun() { Prim.storeI64(t.block, Callbacks.chosenAt, 1) })
+        None -> engine(t, fun() { Ptr.store(t.block, Callbacks.chosenAt, 1) })
     }
 }
 
 -- Whether `ctx`'s certificate names the host `name`.
-fun names(ctx : Prim.Ptr, name : String) -> Bool {
+fun names(ctx : Ptr, name : String) -> Bool {
     let certificate = SSL.ctxGet0Certificate(ctx)
-    if Prim.ptrIsNull(certificate) { return False }
+    if Ptr.isNull(certificate) { return False }
     let bytes = String.toBytes(name)
     let r = cInt(SSL.x509CheckHost(certificate, IO.addressOf(bytes, 0), len(bytes), 0,
-                                   Prim.ptrNull()))
-    Prim.keepAlive(bytes)
+                                   Ptr.null()))
+    Ptr.keepAlive(bytes)
     r == 1
 }
 
@@ -785,12 +786,12 @@ fun names(ctx : Prim.Ptr, name : String) -> Bool {
 -- in the client's SNI, if it sent one. The extension's body is a list (two
 -- bytes of length) of entries, each a type byte, 0 for a host name, then two
 -- bytes of length and the name.
-fun requestedName(ssl : Prim.Ptr) -> Option String {
+fun requestedName(ssl : Ptr) -> Option String {
     let out = Ptr.alloc(16)
     if Ptr.isNull(out) { error("Net.TLS: out of memory") }
-    let found = cInt(SSL.sslClientHelloGet0Ext(ssl, SSL.extServerName, Ptr.raw(out),
-                                               Ptr.raw(Ptr.add(out, 8))))
-    let data : Ptr.Ptr = Ptr.load(out, 0)
+    let found = cInt(SSL.sslClientHelloGet0Ext(ssl, SSL.extServerName, out,
+                                               Ptr.add(out, 8)))
+    let data : Ptr = Ptr.load(out, 0)
     let length : Int = Ptr.load(out, 8)
     Ptr.free(out)
     if found != 1 { return None }
@@ -818,7 +819,7 @@ fun receive(t : TLS, into : Buffer) -> Either TLSError Int {
             let r = cInt(SSL.sslRead(t.ssl, IO.addressOf(into.storage, into.end),
                                      into.limit - into.end))
             let code = if r > 0 { 0 } else { cInt(SSL.sslGetError(t.ssl, r)) }
-            Prim.keepAlive(into.storage)
+            Ptr.keepAlive(into.storage)
             -- Reading can make bytes to send: a key update's answer, or an
             -- alert.
             pending = SSL.bioCtrlPending(t.wbio) > 0
@@ -860,7 +861,7 @@ fun transmit(t : TLS, from : Buffer) -> Either TLSError Unit {
             SSL.errClearError()
             let r = cInt(SSL.sslWrite(t.ssl, IO.addressOf(from.storage, start), chunk))
             let code = if r > 0 { 0 } else { cInt(SSL.sslGetError(t.ssl, r)) }
-            Prim.keepAlive(from.storage)
+            Ptr.keepAlive(from.storage)
             if r > 0 { return Moved(r) }
             let e = failure(t.ssl, code)
             t.failed = Some(e)
@@ -884,7 +885,7 @@ fun fill(t : TLS) -> Either TLSError Unit {
     if n == 0 { return Left(Truncated) }
     let taken = engine(t, fun() {
         let r = cInt(SSL.bioWrite(t.rbio, IO.addressOf(t.incoming.storage, t.incoming.start), n))
-        Prim.keepAlive(t.incoming.storage)
+        Ptr.keepAlive(t.incoming.storage)
         r
     })
     -- A memory BIO takes everything, unless it cannot grow.
@@ -902,7 +903,7 @@ fun drain(t : TLS) -> Either TLSError Unit {
         let n = engine(t, fun() {
             let r = cInt(SSL.bioRead(t.wbio, IO.addressOf(t.outgoing.storage, 0),
                                      Buf.capacity(t.outgoing)))
-            Prim.keepAlive(t.outgoing.storage)
+            Ptr.keepAlive(t.outgoing.storage)
             r
         })
         -- An empty memory BIO answers -1, to be retried.
@@ -914,7 +915,7 @@ fun drain(t : TLS) -> Either TLSError Unit {
 
 -- With `engine` held, straight after the call that failed with `code`: why,
 -- from the verification's result and this thread's error queue.
-fun failure(ssl : Prim.Ptr, code : Int) -> TLSError {
+fun failure(ssl : Ptr, code : Int) -> TLSError {
     let verified = SSL.sslGetVerifyResult(ssl)
     if code == SSL.errorSSL && verified != SSL.verifyOK {
         SSL.errClearError()
@@ -948,8 +949,8 @@ fun reason() -> String {
 }
 
 -- A string OpenSSL owns, copied, or `otherwise` if there is none.
-fun staticText(p : Prim.Ptr, otherwise : String) -> String =
-    Option.unwrapOr(Ptr.fromCString(Ptr.wrap(p)), otherwise)
+fun staticText(p : Ptr, otherwise : String) -> String =
+    Option.unwrapOr(Ptr.fromCString(p), otherwise)
 
 -- -- what the handshake chose ---------------------------------------------------------
 
@@ -960,8 +961,8 @@ fun protocol(t : TLS) -> Option String = Either.unwrapOr(using(t, "protocol", fu
     let out = Ptr.alloc(16)
     if Ptr.isNull(out) { error("Net.TLS: out of memory") }
     Ptr.store(out, 8, 0)
-    SSL.sslGet0AlpnSelected(t.ssl, Ptr.raw(out), Ptr.raw(Ptr.add(out, 8)))
-    let data : Ptr.Ptr = Ptr.load(out, 0)
+    SSL.sslGet0AlpnSelected(t.ssl, out, Ptr.add(out, 8))
+    let data : Ptr = Ptr.load(out, 0)
     -- A C `unsigned int`.
     let length : Int = Ptr.load(out, 8)
     Ptr.free(out)
@@ -974,7 +975,7 @@ fun protocol(t : TLS) -> Option String = Either.unwrapOr(using(t, "protocol", fu
 -- client, the one it sent. `None` without one, or once `t` is closed.
 fun serverName(t : TLS) -> Option String = Either.unwrapOr(using(t, "serverName", fun() = Right(engine(t, fun() {
     if !t.shaken { return None }
-    Ptr.fromCString(Ptr.wrap(SSL.sslGetServername(t.ssl, SSL.nameTypeHostName)))
+    Ptr.fromCString(SSL.sslGetServername(t.ssl, SSL.nameTypeHostName))
 }))), None)
 
 -- -- accepting ------------------------------------------------------------------------

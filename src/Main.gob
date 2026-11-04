@@ -28,6 +28,7 @@ import Turkey.Source as Source
 import Turkey.Source (Source(..))
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
+import Turkey.Binders as Binders
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TCon, TVar)
@@ -376,7 +377,7 @@ fun position(stage : String) -> Int = match Array.indexOf(stages, stage) {
 -- Every module of the program, loaded, resolved and desugared, in dependency
 -- order. What every stage from here on starts from.
 fun loadResolved(path : String) -> Vec Modules.Module {
-    let (groups, _) = loadProgram(path)
+    let (groups, _, _) = loadProgram(path)
     let modules = Vec.new(8)
     for group in groups {
         for m in group { Vec.push(modules, m) }
@@ -385,18 +386,24 @@ fun loadResolved(path : String) -> Vec Modules.Module {
 }
 
 -- Every module of the program, a component of modules that import each other
--- at a time, and the entry among them. The entry is in the last component to
--- finish loading, since a component finishes after everything it imports, but
--- saying so here beats relying on it at every call site.
-fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module) {
+-- at a time, the entry among them, and the binder table resolution filled.
+-- The entry is in the last component to finish loading, since a component
+-- finishes after everything it imports, but saying so here beats relying on it
+-- at every call site.
+fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module,
+                                    Binders.Table) {
     let loader = Modules.newLoader([directoryOf(path), libRoot()])
     let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
     let operators = Resolve.operators(loader.order, Resolve.arities(loader.order))
+    let binders = Binders.newTable()
+    Resolve.declare(loader.order, binders)
     for m in loader.order {
-        Resolve.program(m.scope, m.program, operators)
+        Resolve.program(m.name, m.scope, m.program, operators, binders)
+        -- Before desugaring, whose generated references have no binder yet.
+        Binders.checkReferences(binders, m.program, m.file)
         Desugar.program(m.program, m.scope.methods)
     }
-    (loader.groups, entry)
+    (loader.groups, entry, binders)
 }
 
 -- The program's declaration table, and nothing after it: every type constructor
@@ -420,7 +427,7 @@ fun registerTables(path : String,
                    withClasses : Bool) -> (Decls.DeclTable, Classes.ClassTable) {
     let table = Decls.newDeclTable()
     let classes = Classes.newClassTable(table)
-    let (groups, _) = loadProgram(path)
+    let (groups, _, _) = loadProgram(path)
     for group in groups {
         let types = Vec.new(8)
         let classDecls = Vec.new(4)
@@ -1253,7 +1260,7 @@ type Checked = Checked {
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
     Solved.resetDictNames()
-    let (groups, entry) = loadProgram(path)
+    let (groups, entry, binders) = loadProgram(path)
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
@@ -1296,6 +1303,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         }
         for w in g.warnings { Vec.push(checked.warnings, w) }
     }
+    Binders.checkInferred(binders, path)
     checkMain(entry, checked.env, checked.classes)
     (checked, entry)
 }

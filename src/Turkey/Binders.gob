@@ -1,0 +1,205 @@
+export (
+    Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
+    newTable, owner, fresh, ownerOf, localOf, binderAt,
+    declare, named, record, leaveUnresolved, checkReferences, checkInferred,
+)
+
+-- Every term binder of the program, and which binder each occurrence means.
+--
+-- A binder id is an (owner, local index) pair packed into one `Int`. An owner
+-- is a unit of the program that one worker mints into, in program order --
+-- here, a top-level binding -- and each owner keeps its own counter. So an id
+-- depends only on the program and never on how workers are scheduled, which
+-- the bootstrap fixed point relies on: an id that varied between runs would
+-- vary every `Map Int` iteration order keyed by it.
+--
+-- Owners themselves are numbered from one counter, which is safe only because
+-- every owner is registered by one thread, in program order.
+--
+-- Ids are process-local. They are never printed, and nothing persisted may be
+-- keyed by one; a binder's stable name is its `moduleName` and `name`.
+--
+-- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, an `EVar` -- to
+-- the binder it binds or means. It is keyed by the ids `Turkey.Ast.freshNodeId`
+-- hands out, which are unique across the program.
+
+import Turkey.Ast (..)
+import Turkey.Diag as Diag
+import Turkey.Source (Span)
+
+-- What a binder is to the program.
+type Kind
+    -- A parameter, a pattern variable, a `let`, `var` or local `fun`.
+    = Local
+    -- A top-level `fun`, `let`, `var` or `foreign` definition.
+    | TopLevel
+    -- A class method.
+    | Method
+    -- A machine operation, which no source declares.
+    | Primitive
+
+-- Where a binder comes from, as `fresh` is told it.
+type Origin
+    -- Bound by the program text at the span. The flag is whether it is a
+    -- `var`, which is what gives it a cell.
+    = Written(Span, Bool)
+    -- A primitive.
+    | Builtin
+    -- A copy of the binder with this id, whose span and mutability it takes.
+    | CopyOf(Int)
+
+type Binder = Binder {
+    -- The source spelling, unqualified, or a hint for one the compiler made.
+    name       : String,
+    kind       : Kind,
+    moduleName : String,
+    mutable    : Bool,
+    -- `None` for a primitive.
+    span       : Option Span,
+    -- For a copy, the id it was copied from.
+    origin     : Option Int,
+}
+
+type Owner = Owner {
+    -- A hint for whoever is debugging; two owners may share one.
+    name       : String,
+    moduleName : String,
+    binders    : Vec Binder,
+}
+
+type Table = Table {
+    owners     : Vec Owner,
+    refs       : Map Int Int,
+    -- A top-level binder by its internal name, `Module#name`, `Module#C.m` or
+    -- a primitive's spelling, so that a reference resolved to that name can
+    -- find its id.
+    byName     : Map String Int,
+    -- The `EVar` nodes resolution could not find a binder for, which leaves
+    -- them for inference to report, with their spellings.
+    unresolved : Map Int String,
+}
+
+fun newTable() -> Table = Table {
+    owners = [], refs = Map.new(), byName = Map.new(), unresolved = Map.new(),
+}
+
+-- A local index takes the low 32 bits of an id and the owner the rest.
+let localBits = 32
+let localLimit = Int.shl(1, localBits)
+
+-- Returns a new owner in the module `moduleName`, with no binders.
+fun owner(t : Table, moduleName : String, hint : String) -> Int {
+    Vec.push(t.owners, Owner { name = hint, moduleName = moduleName, binders = [] })
+    len(t.owners) - 1
+}
+
+-- Returns the id of a new binder in `ownerId`, the next local index after
+-- the ones it already has. Writes only that owner's table.
+fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
+          origin : Origin) -> Int {
+    let o = t.owners[ownerId]
+    let (span, mutable, from) = match origin {
+        Written(where, isVar) -> (Some(where), isVar, None)
+        Builtin -> (None, False, None)
+        CopyOf(id) -> {
+            let b = binderAt(t, id)
+            (b.span, b.mutable, Some(id))
+        }
+    }
+    let local = len(o.binders)
+    if local >= localLimit {
+        error("Binders.fresh: owner '" + o.name + "' has " + Int.toString(local)
+              + " binders, and an owner can hold only 2^32")
+    }
+    Vec.push(o.binders, Binder {
+        name = hint, kind = kind, moduleName = o.moduleName, mutable = mutable,
+        span = span, origin = from,
+    })
+    Int.shl(ownerId, localBits) + local
+}
+
+fun ownerOf(id : Int) -> Int = Int.shr(id, localBits)
+
+fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
+
+fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
+
+-- Adds a binder to `ownerId` that references resolved to `internal` mean.
+-- Does nothing when `internal` is declared already: the first declaration of
+-- a name keeps it, and the duplicate is left for the stage that reports one.
+fun declare(t : Table, ownerId : Int, internal : String, short : String,
+            kind : Kind, origin : Origin) -> Unit {
+    if !Map.contains(t.byName, internal) {
+        Map.put(t.byName, internal, fresh(t, ownerId, short, kind, origin))
+    }
+}
+
+-- Returns the id of the top-level binder named `internal`, if one was declared.
+fun named(t : Table, internal : String) -> Option Int = Map.get(t.byName, internal)
+
+-- Records that the node `nodeId` binds or means the binder `id`.
+fun record(t : Table, nodeId : Int, id : Int) -> Unit = Map.put(t.refs, nodeId, id)
+
+-- Records that the `EVar` node `nodeId`, spelled `name`, means no binder
+-- resolution could find.
+fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
+    Map.put(t.unresolved, nodeId, name)
+
+-- Raises an internal error unless every `EVar` in `p` has an entry in `refs`
+-- or was left for inference. Covers the method references resolution writes
+-- into `EIndex`, `EUnary`, `EBinary`, `EForIn` and `EQuestion`, which are not
+-- among `Turkey.Ast.children`.
+fun checkReferences(t : Table, p : Program, file : String) -> Unit {
+    let missing = []
+    for decl in p.decls {
+        match decl {
+            DStmt(s) -> scan(t, ChStmt(s), missing)
+            DClass(c) -> for meth in c.methods { scan(t, ChFun(meth), missing) }
+            DInstance(i) -> for meth in i.methods { scan(t, ChFun(meth), missing) }
+            DType(_) | DForeign(_) | DInfix(_) -> {}
+        }
+    }
+    if len(missing) > 0 {
+        Diag.fail(Diag.whole("internal error",
+            "resolution left these references without a binder: "
+            + String.join(missing, ", ")), file)
+    }
+}
+
+-- Raises an internal error if resolution left any reference for inference to
+-- report. Call it once inference has accepted the program: such a reference
+-- is then one inference found a binder for and resolution did not.
+fun checkInferred(t : Table, file : String) -> Unit {
+    let names = Array.map(Array.sort(Map.values(t.unresolved)), fun(n) = "'" + n + "'")
+    if len(names) > 0 {
+        Diag.fail(Diag.whole("internal error",
+            "inference found binders that resolution did not, for "
+            + String.join(names, ", ")), file)
+    }
+}
+
+fun scan(t : Table, c : Child, missing : Vec String) -> Unit {
+    if let ChExpr(e) = c {
+        for ref in methodRefs(e) { scan(t, ChExpr(ref), missing) }
+        if let EVar(name, _) = e.kind {
+            if !Map.contains(t.refs, e.id) && !Map.contains(t.unresolved, e.id) {
+                Vec.push(missing, "'" + name + "'")
+            }
+        }
+    }
+    for child in children(c) { scan(t, child, missing) }
+}
+
+fun methodRefs(e : Expr) -> Vec Expr = match e.kind {
+    EIndex(_, _, get, set) -> Vec.append(optional(get), optional(set))
+    EUnary(_, _, fn) -> optional(fn)
+    EBinary(_, _, _, fn) -> optional(fn)
+    EForIn(_, _, _, iterFn, nextFn) -> Vec.append(optional(iterFn), optional(nextFn))
+    EQuestion(_, bindFn) -> optional(bindFn)
+    _ -> []
+}
+
+fun optional(e : Option Expr) -> Vec Expr = match e {
+    Some(x) -> [x]
+    None -> []
+}

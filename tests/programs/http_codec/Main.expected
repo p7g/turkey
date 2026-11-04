@@ -270,3 +270,54 @@ chunked and malformed: error 400
 until the stream closes: MustClose, 3 bytes after it
 no body: Reusable, 18 bytes after it
 waiting for 100 Continue: Right(MustClose)
+-- writing requests
+GET: ok, 1 writes
+  GET /a/b?q=1 HTTP/1.1\r\nhost: example.com\r\ncontent-type: application/json\r\nx-trace: a b\r\n\r\n
+  read back: GET Some(example.com) /a/b Some(q=1) [content-type: application/json\nx-trace: a b] HTTP/1.1 NoBody KeepAlive False [] body ""
+POST, the head and body in one write: ok, 1 writes
+  POST /orders HTTP/1.1\r\nhost: api.example.com:8443\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 5\r\n\r\nhello
+  read back: POST(body) Some(api.example.com:8443) /orders None [content-type: application/json\nx-trace: a b] HTTP/1.1 ContentLength(5) KeepAlive False [] body "hello"
+chunked, one write per chunk: ok, 4 writes
+  PUT /up HTTP/1.1\r\nhost: example.com\r\ncontent-type: application/json\r\nx-trace: a b\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n1\r\n \r\n5\r\nworld\r\n0\r\n\r\n
+  read back: PUT(body) Some(example.com) /up None [content-type: application/json\nx-trace: a b] HTTP/1.1 Chunked KeepAlive False [] body "hello world"
+Connection and Expect: ok, 1 writes
+  OPTIONS / HTTP/1.1\r\nhost: example.com\r\nconnection: close\r\nexpect: 100-continue\r\n\r\n
+-- the reserved fields cannot come from Headers
+Content-Length: Left(the header 'content-length' is written by the HTTP library and cannot be set)
+transfer-encoding: Left(the header 'transfer-encoding' is written by the HTTP library and cannot be set)
+Host: Left(the header 'host' is written by the HTTP library and cannot be set)
+Connection: Left(the header 'connection' is written by the HTTP library and cannot be set)
+Expect: Left(the header 'expect' is written by the HTTP library and cannot be set)
+Upgrade: Left(the header 'upgrade' is written by the HTTP library and cannot be set)
+TE: Left(the header 'te' is written by the HTTP library and cannot be set)
+Trailer: Left(the header 'trailer' is written by the HTTP library and cannot be set)
+Keep-Alive: Left(the header 'keep-alive' is written by the HTTP library and cannot be set)
+Proxy-Connection: Left(the header 'proxy-connection' is written by the HTTP library and cannot be set)
+-- writing responses
+200, length: ok, 1 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 2\r\n\r\nok
+204: ok, 1 writes
+  HTTP/1.1 204 No Content\r\ncontent-type: application/json\r\nx-trace: a b\r\n\r\n
+200, until the connection closes: ok, 2 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\nconnection: close\r\n\r\nab
+200, closing after: ok, 1 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 1\r\nconnection: close\r\n\r\nx
+to HEAD: the length GET would have, and no body: ok, 1 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 5\r\n\r\n
+101: ok, 1 writes
+  HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: websocket\r\n\r\n
+chunked with trailers: 2 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ntransfer-encoding: chunked\r\n\r\n4\r\ndata\r\n0\r\nx-checksum: 7\r\n\r\n
+  decoded: "data", trailers x-checksum: 7
+-- a body is written exactly as declared
+over the declared length: write: more body was written than the length declared, 0 writes
+  
+over it, after a write within it: write: more body was written than the length declared, 1 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 3\r\n\r\nab
+short of it: finish: the message ended before its framing said it would, 1 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 5\r\n\r\nabc
+a byte of a bodiless response: write: more body was written than the length declared, 0 writes
+  
+a first write larger than the head's spare room: ok, 2 writes
+  HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-trace: a b\r\ncontent-length: 10000\r\n\r\nzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz... (10088 bytes)
+a write after an overrun: more body was written than the length declared, 0 writes

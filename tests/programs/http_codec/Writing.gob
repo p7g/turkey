@@ -1,0 +1,163 @@
+export (writing)
+
+-- The serializer: heads written from the HTTP values, the body writer's
+-- framing, and what goes out in how many writes.
+
+import Net.HTTP (..)
+import Net.HTTP.H1.Body as Body
+import Net.HTTP.H1.Head (RequestHead(..), ResponseHead(..), Framing(..), Persistence(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.H1.Output as Output
+import Net.HTTP.H1.Output (OutgoingRequest(..), OutgoingResponse(..))
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Headers as Headers
+import Net.HTTP.HTTPURL as HTTPURL
+import Net.HTTP.Limits as Limits
+import Net.HTTP.MediaType as MediaType
+import Bodies (decode)
+import Run (..)
+import System.IO as IO
+import System.IO (Write(..), IOError)
+import Wire (Sink, sink, written, writes, sized, oneByte)
+
+fun headers() -> Headers =
+    Headers.add(Headers.add(Headers.empty, ContentType, MediaType.json),
+                HeaderName.literal("x-trace"), HeaderValue.literal("a b"))
+
+fun send(label : String, head : IO.Buffer, framing : Framing, pieces : Array String) {
+    let _ = deliver(label, head, framing, pieces)
+}
+
+-- Writes `pieces` as a body after `head`, prints what went out, and returns
+-- the sink it went to.
+fun deliver(label : String, head : IO.Buffer, framing : Framing, pieces : Array String) -> Sink {
+    let out = sink()
+    let w = Output.bodyWriter(out, head, framing)
+    var status = "ok"
+    for piece in pieces {
+        if let Left(e) = writeFrom(w, IO.bytesOf(piece)) {
+            status = "write: " + errorText(e)
+        }
+    }
+    if let Left(e) = Output.finish(w) {
+        if status == "ok" { status = "finish: " + errorText(e) }
+    }
+    print(label + ": " + status + ", " + show(writes(out)) + " writes")
+    print("  " + shortened(written(out)))
+    out
+}
+
+-- Returns `text` visible, and cut short with its length if it is long.
+fun shortened(text : String) -> String {
+    if String.byteLength(text) <= 300 { return visible(text) }
+    visible(String.fromBytesLossy(Array.slice(String.toBytes(text), 0, 120))) + "... ("
+        + show(String.byteLength(text)) + " bytes)"
+}
+
+-- Returns the body of the message `text`, after its head.
+fun afterHead(text : String) -> Array Byte = match String.splitOnce(text, "\r\n\r\n") {
+    Some((_, body)) -> String.toBytes(body)
+    None -> []
+}
+
+fun errorText(e : Either HTTPError IOError) -> String = match e {
+    Left(h) -> show(h)
+    Right(io) -> show(io)
+}
+
+fun request(m : Method Unit, url : String, framing : Framing) -> IO.Buffer =
+    Option.expect(Either.right(Output.requestHead(OutgoingRequest {
+        method = m, url = HTTPURL.literal(url), headers = headers(), framing,
+        persistence = KeepAlive, expectContinue = False,
+    })), "a request head")
+
+fun response(status : Status, framing : Framing, persistence : Persistence) -> IO.Buffer =
+    Output.responseHead(OutgoingResponse { status, headers = headers(), framing, persistence, upgrade = None })
+
+-- Reads `bytes` back as a request, and its body, as the codec reads one.
+fun readBack(bytes : Array Byte) -> String {
+    let limits = Limits.defaults
+    let input = Input.input(oneByte(bytes), limits)
+    match readRequest(input, limits) {
+        Right(Some(h)) -> {
+            let b = Body.body(input, h.framing, limits)
+            let got = []
+            let buf = IO.buffer(3)
+            loop {
+                IO.clear(buf)
+                match IO.readInto(b, buf) {
+                    Left(e) -> return describeRequest(h) + " body error " + statusOf(e)
+                    Right(0) -> break
+                    Right(_) -> for x in IO.bytes(buf) { Vec.push(got, x) }
+                }
+            }
+            describeRequest(h) + " body \"" + String.fromBytesLossy(Vec.toArray(got)) + "\""
+        }
+        other -> requestOutcome(other)
+    }
+}
+
+fun writing() {
+    print("-- writing requests")
+    let get = deliver("GET", request(GET, "http://example.com/a/b?q=1", NoBody), NoBody, [])
+    print("  read back: " + visible(readBack(String.toBytes(written(get)))))
+    let post = deliver("POST, the head and body in one write",
+                    request(POST(()), "https://api.example.com:8443/orders", ContentLength(5)),
+                    ContentLength(5), ["hello"])
+    print("  read back: " + visible(readBack(String.toBytes(written(post)))))
+    let chunked = deliver("chunked, one write per chunk",
+                       request(PUT(()), "http://example.com/up", Chunked), Chunked, ["hello", " ", "world"])
+    print("  read back: " + visible(readBack(String.toBytes(written(chunked)))))
+    let options = Output.requestHead(OutgoingRequest {
+        method = OPTIONS, url = HTTPURL.literal("http://example.com/"), headers = Headers.empty,
+        framing = NoBody, persistence = Close, expectContinue = True,
+    })
+    match options {
+        Right(head) -> send("Connection and Expect", head, NoBody, [])
+        Left(e) -> print("FAIL: " + show(e))
+    }
+
+    print("-- the reserved fields cannot come from Headers")
+    for n in ["Content-Length", "transfer-encoding", "Host", "Connection", "Expect", "Upgrade", "TE",
+              "Trailer", "Keep-Alive", "Proxy-Connection"] {
+        print(n + ": " + show(HeaderName.parse(n)))
+    }
+
+    print("-- writing responses")
+    send("200, length", response(OK, ContentLength(2), KeepAlive), ContentLength(2), ["ok"])
+    send("204", response(NoContent, NoBody, KeepAlive), NoBody, [])
+    send("200, until the connection closes", response(OK, UntilClose, KeepAlive), UntilClose, ["a", "b"])
+    send("200, closing after", response(OK, ContentLength(1), Close), ContentLength(1), ["x"])
+    send("to HEAD: the length GET would have, and no body", response(OK, ContentLength(5), KeepAlive),
+         NoBody, [])
+    let upgrade = Output.responseHead(OutgoingResponse {
+        status = SwitchingProtocols, headers = Headers.empty, framing = NoBody, persistence = KeepAlive,
+        upgrade = Some(HeaderValue.literal("websocket")),
+    })
+    send("101", upgrade, NoBody, [])
+    let out = sink()
+    let w = Output.bodyWriter(out, response(OK, Chunked, KeepAlive), Chunked)
+    let _ = writeFrom(w, IO.bytesOf("data"))
+    let _ = Output.finishWith(w, Headers.add(Headers.empty, HeaderName.literal("x-checksum"), HeaderValue.literal("7")))
+    print("chunked with trailers: " + show(writes(out)) + " writes")
+    print("  " + visible(written(out)))
+    print("  decoded: " + decode(sized(afterHead(written(out)), [5]), Chunked, Limits.defaults, 3))
+
+    print("-- a body is written exactly as declared")
+    send("over the declared length", response(OK, ContentLength(3), KeepAlive), ContentLength(3),
+         ["abcde", "x"])
+    send("over it, after a write within it", response(OK, ContentLength(3), KeepAlive), ContentLength(3),
+         ["ab", "cd"])
+    send("short of it", response(OK, ContentLength(5), KeepAlive), ContentLength(5), ["abc"])
+    send("a byte of a bodiless response", response(NoContent, NoBody, KeepAlive), NoBody, ["x"])
+    let big = repeated("z", 10000)
+    send("a first write larger than the head's spare room", response(OK, ContentLength(10000), KeepAlive),
+                     ContentLength(10000), [big])
+    let after = sink()
+    let w2 = Output.bodyWriter(after, response(OK, ContentLength(4), KeepAlive), ContentLength(4))
+    let _ = writeFrom(w2, IO.bytesOf("abcdef"))
+    let again = writeFrom(w2, IO.bytesOf("ab"))
+    print("a write after an overrun: " + (match again { Left(e) -> errorText(e); Right(_) -> "ok" })
+          + ", " + show(writes(after)) + " writes")
+}

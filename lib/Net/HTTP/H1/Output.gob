@@ -1,0 +1,344 @@
+export (
+    OutgoingRequest(..), OutgoingResponse(..), BodyWriter,
+    requestHead, responseHead, bodyWriter, finish, finishWith,
+)
+
+-- The writing side of HTTP/1: heads written from the HTTP values, and a body
+-- writer that frames what a program writes.
+--
+-- **The reserved fields come from the framing and the request alone.**
+-- `Host` is the URL's authority; Content-Length and Transfer-Encoding are the
+-- framing's; Connection, Expect and Upgrade are the head's own fields. None
+-- can come from `Headers`, which cannot hold them, so one message cannot be
+-- framed two ways.
+--
+-- **Outgoing values are as valid as incoming ones.** Every byte written is
+-- from a value whose type checked it when it was made: a `HeaderName` is a
+-- token, a `HeaderValue` has no CR, LF, NUL or other control byte, a method's
+-- name is a token, a status's reason is a constant. The request target and
+-- `Host` come from an `HTTPURL`, and are checked again here, byte by byte,
+-- against the bytes a request line can hold.
+--
+-- **The head goes out with the first body bytes,** in one write. A head is
+-- written into a buffer with room to spare, and the body writer sends it with
+-- as much of the first write as fits. A connection without Nagle's algorithm
+-- sends each write at once, so a head written alone would be a packet of its
+-- own.
+--
+-- **A body is written exactly as its framing declared.**
+--
+-- * `ContentLength(n)`: writing past `n` bytes is `Overrun`, and finishing
+--   short of them is `Truncated`. Nothing past `n` is sent.
+-- * `Chunked`: each write is a chunk; `finish` writes the last chunk and any
+--   trailers. A chunk's closing CRLF is held back and goes out with the next
+--   chunk's size line, so a chunk is one write.
+-- * `UntilClose`: written as it comes; the connection's close ends it.
+-- * `NoBody`: any byte written is `Overrun`.
+--
+-- Either refusal leaves the message unfinishable, so every later write fails
+-- too, and the connection must be closed: the peer has seen a head that
+-- promised more than it will get.
+
+import Net.HTTP.Error (HTTPError(..))
+import Net.HTTP.H1.Classes (targetChar)
+import Net.HTTP.H1.Head (Framing(..), Persistence(..))
+import Net.HTTP.H1.Input (CodecError)
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
+import Net.HTTP.Method as Method (Method)
+import Net.HTTP.Status as Status (Status)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.HTTPField (HeaderName(..), HeaderValue(..))
+import Turkey.ReadWrite (Write(..))
+import URL (URLError(..))
+
+-- A request head to write. `framing` must not be `UntilClose`, which only a
+-- response can be framed by. A request whose method has a body, and whose
+-- body is empty, is `ContentLength(0)`, not `NoBody` (RFC 9110 §8.6).
+type OutgoingRequest b = OutgoingRequest {
+    method : Method b,
+    url : HTTPURL,
+    headers : Headers,
+    framing : Framing,
+    persistence : Persistence,
+    expectContinue : Bool,
+}
+
+-- A response head to write. A 1xx or 204 response must be `NoBody`, and a
+-- 304 must not be `Chunked`. A response to HEAD gives the framing a GET
+-- would have had, and its body writer is made with `NoBody`.
+--
+-- `upgrade`, for a 101, is written as `Upgrade` with `Connection: upgrade`.
+type OutgoingResponse = OutgoingResponse {
+    status : Status,
+    headers : Headers,
+    framing : Framing,
+    persistence : Persistence,
+    upgrade : Option HeaderValue,
+}
+
+-- How much room a head's buffer has after the head, for the first body
+-- bytes.
+let spare = 4096
+
+-- Returns the request head, in a buffer with room after it for the body
+-- writer, or `BadURL` if the URL's target or authority holds a byte a
+-- request line cannot.
+fun requestHead(r : OutgoingRequest b) -> Either HTTPError Buffer {
+    let target = HTTPURL.target(r.url)
+    let authority = HTTPURL.authority(r.url)
+    if !allIn(targetChar, target) { return Left(BadURL(BadPath)) }
+    if !allIn(targetChar, authority) { return Left(BadURL(BadHost)) }
+    let out = Writer { buffer = Buf.buffer(512 + spare) }
+    text(out, Method.name(r.method))
+    text(out, " ")
+    text(out, target)
+    text(out, " HTTP/1.1\r\nhost: ")
+    text(out, authority)
+    text(out, "\r\n")
+    fields(out, r.headers)
+    match r.framing {
+        UntilClose -> error("requestHead: a request cannot be framed until the connection closes")
+        framing -> framingFields(out, framing)
+    }
+    if let Close = r.persistence { text(out, "connection: close\r\n") }
+    if r.expectContinue { text(out, "expect: 100-continue\r\n") }
+    text(out, "\r\n")
+    Right(finished(out))
+}
+
+-- Returns the response head, in a buffer with room after it for the body
+-- writer. Panics if the framing is one the status cannot have.
+fun responseHead(r : OutgoingResponse) -> Buffer {
+    let code = Status.code(r.status)
+    let bodiless = code / 100 == 1 || code == 204
+    match r.framing {
+        NoBody -> {}
+        Chunked -> if bodiless || code == 304 { badFraming(code, r.framing) }
+        _ -> if bodiless { badFraming(code, r.framing) }
+    }
+    let out = Writer { buffer = Buf.buffer(512 + spare) }
+    text(out, "HTTP/1.1 ")
+    text(out, Int.toString(code))
+    text(out, " ")
+    text(out, Status.reason(r.status))
+    text(out, "\r\n")
+    fields(out, r.headers)
+    framingFields(out, r.framing)
+    if let Some(v) = r.upgrade {
+        text(out, "connection: upgrade\r\nupgrade: ")
+        value(out, v)
+        text(out, "\r\n")
+    } else {
+        match (r.persistence, r.framing) {
+            (Close, _) | (_, UntilClose) -> text(out, "connection: close\r\n")
+            _ -> {}
+        }
+    }
+    text(out, "\r\n")
+    finished(out)
+}
+
+fun badFraming(code : Int, f : Framing) -> Unit =
+    error("responseHead: a " + Int.toString(code) + " response cannot be framed as " + show(f))
+
+-- The fields a framing declares: Content-Length or Transfer-Encoding, or
+-- none.
+fun framingFields(out : Writer, f : Framing) -> Unit = match f {
+    ContentLength(n) -> {
+        text(out, "content-length: ")
+        text(out, Int.toString(n))
+        text(out, "\r\n")
+    }
+    Chunked -> text(out, "transfer-encoding: chunked\r\n")
+    UntilClose | NoBody -> {}
+}
+
+fun fields(out : Writer, hs : Headers) -> Unit {
+    for (HeaderName(n), v) in Headers.fields(hs) {
+        text(out, n)
+        text(out, ": ")
+        value(out, v)
+        text(out, "\r\n")
+    }
+}
+
+fun allIn(table : Array Bool, s : String) -> Bool {
+    let bytes : Prim.Array Byte = String.bytesOf(s)
+    for var i = 0; i < len(bytes); i = i + 1 {
+        if !table[Byte.toInt(bytes[i])] { return False }
+    }
+    len(bytes) > 0
+}
+
+-- A buffer that grows as a head is written into it.
+type Writer = Writer { var buffer : Buffer }
+
+fun room(out : Writer, n : Int) -> Buffer {
+    let b = out.buffer
+    if b.limit - b.end >= n { return b }
+    let grown = Buf.buffer(2 * (b.end + n))
+    Buf.append(grown, b.storage, b.start, b.end)
+    out.buffer = grown
+    grown
+}
+
+fun text(out : Writer, s : String) -> Unit {
+    let n = String.byteLength(s)
+    Buf.appendText(room(out, n), s, 0, n)
+}
+
+fun value(out : Writer, v : HeaderValue) -> Unit =
+    Buf.append(room(out, v.to - v.from), v.bytes, v.from, v.to)
+
+-- Returns the head, with at least `spare` bytes of room after it.
+fun finished(out : Writer) -> Buffer = room(out, spare)
+
+-- -- bodies ----------------------------------------------------------------------------
+
+type BodyWriter w = BodyWriter {
+    sink : w,
+    -- Bytes not yet written: the head, until the first write, and then a
+    -- chunk's closing CRLF.
+    pending : Buffer,
+    var state : State,
+}
+
+type State =
+    Sending(Int)     -- bytes of a declared length still to come
+    | Chunking
+    | Streaming      -- until the connection closes
+    | Bodiless
+    | Done
+    | Broken(HTTPError)
+
+-- Returns a writer of a body framed by `framing`, which sends `head` before
+-- it. `head` is a buffer from `requestHead` or `responseHead`, which the
+-- writer takes over.
+fun bodyWriter(sink : w, head : Buffer, framing : Framing) -> BodyWriter w {
+    let state = match framing {
+        ContentLength(n) -> Sending(n)
+        Chunked -> Chunking
+        UntilClose -> Streaming
+        NoBody -> Bodiless
+    }
+    BodyWriter { sink, pending = head, state }
+}
+
+instance Write (BodyWriter w) : Write w {
+    type WriteError = CodecError (WriteError w)
+    fun writeFrom(bw, from) {
+        let n = from.end - from.start
+        if n == 0 { return Right(()) }
+        match bw.state {
+            Sending(left) -> {
+                if n > left { return broken(bw, Overrun) }
+                bw.state = Sending(left - n)
+                emit(bw, from)
+            }
+            Chunking -> {
+                hex(bw.pending, n)
+                Buf.appendText(bw.pending, "\r\n", 0, 2)
+                emit(bw, from)?
+                -- The CRLF that closes the chunk waits for the next write.
+                Buf.appendText(bw.pending, "\r\n", 0, 2)
+                Right(())
+            }
+            Streaming -> emit(bw, from)
+            Bodiless | Done -> broken(bw, Overrun)
+            Broken(e) -> Left(Left(e))
+        }
+    }
+    fun flush(bw) {
+        sendPending(bw)?
+        match flush(bw.sink) {
+            Left(e) -> Left(Right(e))
+            Right(_) -> Right(())
+        }
+    }
+}
+
+-- Sends what is pending with as much of `from` as fits beside it, in one
+-- write, and then the rest of `from`.
+fun emit[Write w](bw : BodyWriter w, from : Buffer) -> Either (CodecError (WriteError w)) Unit {
+    let p = bw.pending
+    let fits = p.limit - p.end
+    let n = from.end - from.start
+    let first = if n < fits { n } else { fits }
+    Buf.append(p, from.storage, from.start, from.start + first)
+    sendPending(bw)?
+    if first < n { send(bw, Buf.view(from, from.start + first, from.end))? }
+    Right(())
+}
+
+fun sendPending[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit {
+    let p = bw.pending
+    if p.end == p.start { return Right(()) }
+    send(bw, p)?
+    Buf.clear(p)
+    Right(())
+}
+
+fun send[Write w](bw : BodyWriter w, b : Buffer) -> Either (CodecError (WriteError w)) Unit =
+    match writeFrom(bw.sink, b) {
+        Left(e) -> {
+            -- Part of the message may be on the wire: it cannot be finished.
+            bw.state = Broken(Truncated)
+            Left(Right(e))
+        }
+        Right(_) -> Right(())
+    }
+
+fun broken(bw : BodyWriter w, e : HTTPError) -> Either (CodecError x) Unit {
+    bw.state = Broken(e)
+    Left(Left(e))
+}
+
+-- Appends `n` in lowercase hex.
+fun hex(b : Buffer, n : Int) -> Unit {
+    var shift = 60
+    while shift > 0 && Int.shr(n, shift) == 0 { shift = shift - 4 }
+    while shift >= 0 {
+        Buf.push(b, hexDigits[Int.and(Int.shr(n, shift), 15)])
+        shift = shift - 4
+    }
+}
+
+let hexDigits = String.toBytes("0123456789abcdef")
+
+-- Ends the body: the last chunk of a chunked one, the head of a bodiless
+-- one, and whatever else is pending, then flushes the sink. `Truncated` if a
+-- declared length was not reached. Finishing twice does nothing more.
+fun finish[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit =
+    finishWith(bw, Headers.empty)
+
+-- Ends a chunked body with `trailers` after its last chunk, as `finish`
+-- does. Panics if the body is not chunked and `trailers` holds any field:
+-- only a chunked body has anywhere to put them.
+fun finishWith[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecError (WriteError w)) Unit {
+    match bw.state {
+        Sending(left) -> if left > 0 { return broken(bw, Truncated) }
+        Chunking -> {
+            let out = Writer { buffer = bw.pending }
+            text(out, "0\r\n")
+            fields(out, trailers)
+            text(out, "\r\n")
+            send(bw, out.buffer)?
+            Buf.clear(bw.pending)
+        }
+        Done -> return Right(())
+        Broken(e) -> return Left(Left(e))
+        Streaming | Bodiless -> {}
+    }
+    match bw.state {
+        Chunking -> {}
+        _ -> if Headers.size(trailers) > 0 { error("finishWith: only a chunked body has trailers") }
+    }
+    sendPending(bw)?
+    bw.state = Done
+    match flush(bw.sink) {
+        Left(e) -> Left(Right(e))
+        Right(_) -> Right(())
+    }
+}

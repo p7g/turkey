@@ -1,0 +1,491 @@
+export (hostModules, compiledShared, compiledIn, generate)
+
+-- Where the interpreter stops and the compiled host takes over, and the
+-- generator of `lib/Interpreter/Boundary.gob`, the table of every crossing.
+--
+-- **The unit is the binding.** A binding runs compiled when its module is a
+-- host module, or when it is one of a shared module's bindings that touch
+-- the module's state. Every other binding is interpreted, and the
+-- interpreter never runs a host or shared module's initializer.
+--
+-- * The host modules: the giblets, which the collector and the entry are
+--   made of; `Coroutine`, which switches stacks; `Scheduler`, which takes
+--   code addresses and frame addresses; `Libc`, the C functions; and `Poll`,
+--   whose module-level `var`s are the scheduler's wait state, which an
+--   interpreted copy would duplicate with no worker delivering to it.
+-- * `Turkey.Stdout` is shared. The interpreter is a Turkey program, so the
+--   host has its own standard output already, buffer, lock and waiters. Its
+--   monomorphic bindings run compiled and are the only ones that reach that
+--   state; its generic `print` and `write` are interpreted and reach it
+--   through them.
+-- * `System.Task`'s one global starts the workers, and the host started
+--   them already: the compiler's own front end imports `System.Parallel`.
+--   So that global is never computed here, and the rest of the module, which
+--   reaches the scheduler only through host entry points, is interpreted.
+-- * `System.File` is imported by the host too, and its `standardInput` owns a
+--   buffer over descriptor 0. Two buffers are harmless while one of them
+--   reads, so the host never reads standard input, which `generate` checks.
+--
+-- **Why the table is generated.** It is derived from the library, so a
+-- library change that would split state fails here, at build time, rather
+-- than as a wrong answer at run time. `generate` refuses a library where:
+--
+-- * an interpreted binding uses a compiled one that is generic, which has no
+--   compiled body to call, or that is not exported, which the table cannot
+--   name;
+-- * a value of a type the table cannot carry crosses;
+-- * a module a host module imports has a module-level `var` or an
+--   initializer that calls something, state an interpreted copy would split;
+-- * the host's own program reaches `System.File.stdin`.
+
+import Data.Set as Set
+import Interpreter.Boundary as Boundary
+import Turkey.Core (..)
+import Turkey.Decls (DeclTable)
+import Turkey.Decls as Decls
+import Turkey.Giblets as Giblets
+import Turkey.Modules as Modules
+import Turkey.Ast (Program(..), ImportDecl(..))
+import Turkey.Prelude as Prelude
+import Turkey.Prims as Prims
+import Turkey.Types as Ty
+import Turkey.Types (Type, TVar, TCon, TApp, TFam, TFun, TTuple)
+
+-- The modules whose bindings always run compiled.
+fun hostModules() -> Set.Set String {
+    let out = Giblets.gibletModules()
+    for name in ["Turkey.Coroutine", "Turkey.Scheduler", "Turkey.Libc", "Turkey.Poll"] {
+        Set.add(out, name)
+    }
+    out
+}
+
+let sharedModule = "Turkey.Stdout"
+
+-- The global that starts the workers, which the interpreter never computes.
+let startsWorkers = "System.Task#workers"
+
+-- The modules whose calls set `errno`, which a crossing saves.
+let settingErrno = ["Turkey.Libc", "Turkey.Workers"]
+
+-- The bindings of interpreted modules that run compiled: the shared module's
+-- monomorphic ones, and the global that starts the workers.
+fun compiledShared(program : CProgram) -> Vec String {
+    let out = [startsWorkers]
+    for group in [program.dicts, program.binds] {
+        for b in group {
+            if b.module_ == sharedModule && len(b.binders) == 0 { Vec.push(out, b.name) }
+        }
+    }
+    Vec.sort(out)
+}
+
+-- The bindings of `program` that run compiled under the interpreter: every
+-- one of a host module, and the shared ones the table lists.
+fun compiledIn(program : CProgram) -> Set.Set String {
+    let host = hostModules()
+    let out = Set.new()
+    for name in Boundary.compiledShared { Set.add(out, name) }
+    for group in [program.dicts, program.binds] {
+        for b in group { if Set.contains(host, b.module_) { Set.add(out, b.name) } }
+    }
+    out
+}
+
+-- -- generating -----------------------------------------------------------------------
+
+type Gen = Gen {
+    decls    : DeclTable,
+    owners   : Map String CBind,
+    host     : Set.Set String,
+    compiled : Set.Set String,
+    -- Each module's exported names, qualified.
+    exported : Map String (Set.Set String),
+    problems : Vec String,
+}
+
+-- The text of `lib/Interpreter/Boundary.gob` for the library `program` was
+-- lowered from, or every reason there cannot be one. `modules` are the
+-- library's modules, and `hostReaches` the names the host's own program
+-- reaches from its `main`.
+fun generate(program : CProgram, decls : DeclTable, modules : Vec Modules.Module,
+             hostReaches : Set.Set String) -> Either (Vec String) String {
+    let g = Gen {
+        decls = decls, owners = Map.new(), host = hostModules(), compiled = Set.new(),
+        exported = Map.new(), problems = [],
+    }
+    for group in [program.dicts, program.binds] {
+        for b in group { Map.put(g.owners, b.name, b) }
+    }
+    let shared = compiledShared(program)
+    for name in shared { Set.add(g.compiled, name) }
+    for m in modules {
+        let names = Set.new()
+        for (_, target) in Map.entries(m.exports.values) { Set.add(names, target) }
+        Map.put(g.exported, m.name, names)
+    }
+
+    -- Every compiled binding an interpreted one mentions, and on which
+    -- targets: a C function one target's libc lacks is called only from that
+    -- target's arm of a `match Target.os`, and its entry must be too, or the
+    -- table would not link on the other.
+    let targets = targetConstructors(decls)
+    let used = Map.new()
+    for os in targets {
+        let reached = Set.new()
+        for group in [program.dicts, program.binds] {
+            for b in group {
+                if !runsCompiled(g, b.name) { namesUnder(b.value, os, reached) }
+            }
+        }
+        for n in Set.elements(reached) {
+            if runsCompiled(g, n) {
+                let on = Map.getOr(used, n, [])
+                Vec.push(on, os)
+                Map.put(used, n, on)
+            }
+        }
+    }
+    let functions = []
+    let values = []
+    let imported = Set.new()
+    for n in Array.sort(Map.keys(used)) {
+        let (owner, generic, ty) = match Map.get(g.owners, n) {
+            Some(b) -> (b.module_, len(b.binders) > 0, b.ty)
+            None -> {
+                let f = g.decls.foreigns[n]
+                (moduleOf(n), False, TFun(f.params, f.ret))
+            }
+        }
+        let only = if len(used[n]) == len(targets) { None } else { Some(used[n]) }
+        match entry(g, n, owner, generic, ty, only) {
+            Some((isFunction, text)) -> {
+                Set.add(imported, owner)
+                if isFunction { Vec.push(functions, text) } else { Vec.push(values, text) }
+            }
+            None -> {}
+        }
+    }
+    checkImportedState(g, program, modules)
+    if Set.contains(hostReaches, "System.File#stdin") {
+        Vec.push(g.problems, "the host reaches 'System.File.stdin', and only the "
+                 + "interpreted program may read standard input")
+    }
+    if len(g.problems) > 0 { return Left(g.problems) }
+    Right(render(Array.sort(Set.elements(imported)), functions, values, shared))
+}
+
+-- Whether the binding or `foreign` declaration `name` runs compiled.
+fun runsCompiled(g : Gen, name : String) -> Bool = match Map.get(g.owners, name) {
+    Some(b) -> Set.contains(g.host, b.module_) || Set.contains(g.compiled, name)
+    None -> Map.contains(g.decls.foreigns, name) && Set.contains(g.host, moduleOf(name))
+}
+
+fun moduleOf(name : String) -> String = match String.splitOnce(name, "#") {
+    Some((owner, _)) -> owner
+    None -> ""
+}
+
+fun render(modules : Array String, functions : Vec String, values : Vec String,
+           shared : Vec String) -> String {
+    let b = String.builder()
+    String.push(b, "export (functions, values, compiledShared)\n\n")
+    String.push(b, "-- Generated by `boot boundary` from the library; do not edit. See\n")
+    String.push(b, "-- `Turkey.Hosted`, which says what crosses and why.\n\n")
+    String.push(b, "import Interpreter.Host as H\n")
+    String.push(b, "import Interpreter.Value (Value(..))\n")
+    String.push(b, "import Interpreter.Value as V\n")
+    String.push(b, "import Target (OS(..))\n")
+    String.push(b, "import Target as Target\n")
+    for m in modules { String.push(b, "import " + m + " as " + aliasOf(m) + "\n") }
+    String.push(b, "\n-- The compiled functions interpreted code calls.\n")
+    String.push(b, "let functions : Array (String, H.Entry) = [\n")
+    for f in functions { String.push(b, f) }
+    String.push(b, "]\n\n-- The compiled values interpreted code reads.\n")
+    String.push(b, "let values : Array (String, fun() -> Value) = [\n")
+    for v in values { String.push(b, v) }
+    String.push(b, "]\n\n-- The bindings of interpreted modules that run compiled.\n")
+    String.push(b, "let compiledShared : Array String = [\n")
+    for s in shared { String.push(b, "    \"" + s + "\",\n") }
+    String.push(b, "]\n")
+    String.build(b)
+}
+
+fun aliasOf(m : String) -> String = String.join(String.split(m, "."), "_")
+
+-- One table row for the compiled binding `name`, of the module `owner`:
+-- whether it is a function, and the text. `None` after recording why there
+-- is none.
+--
+-- `only` names the targets it may be called on, when it is not all of them.
+fun entry(g : Gen, name : String, owner : String, generic : Bool,
+          ty : Type, only : Option (Vec String)) -> Option (Bool, String) {
+    let short = match String.splitOnce(name, "#") {
+        Some((_, after)) -> after
+        None -> name
+    }
+    let shown = owner + "." + short
+    if generic || hasVariables(ty) {
+        return refuse(g, "'" + shown + "' is generic, and interpreted code can call only "
+                         + "a monomorphic compiled binding; give it a monomorphic type")
+    }
+    let exported = match Map.get(g.exported, owner) {
+        Some(names) -> Set.contains(names, name)
+        None -> False
+    }
+    if !exported {
+        return refuse(g, "'" + shown + "' is called by interpreted code but not "
+                         + "exported by '" + owner + "'; export it")
+    }
+    let callee = aliasOf(owner) + "." + short
+    let key = "    (\"" + name + "\", "
+    match Ty.prune(ty) {
+        TFun(params, ret) -> {
+            let budget = if name == "Turkey.Coroutine#new" { "V.coroutineBudget" }
+                         else { "V.callbackBudget" }
+            let args = []
+            for var i = 0; i < len(params); i = i + 1 {
+                match argument(g, params[i], "a[" + Int.toString(i) + "]", budget) {
+                    Some(text) -> Vec.push(args, text)
+                    None -> return refuse(g, "'" + shown + "' takes a '" + Ty.show(params[i])
+                                             + "', which cannot cross from interpreted code")
+                }
+            }
+            var called = callee + "(" + String.join(args, ", ") + ")"
+            if Array.contains(settingErrno, owner) { called = "H.saved(" + called + ")" }
+            match result(g, ret, called) {
+                Some(text) -> Some((True, key + "fun(r, a) = " + onTargets(only, shown, text)
+                                          + "),\n"))
+                None -> refuse(g, "'" + shown + "' answers a '" + Ty.show(ret)
+                                  + "', which cannot cross to interpreted code")
+            }
+        }
+        t -> match result(g, t, callee) {
+            Some(text) -> Some((False, key + "fun() = " + text + "),\n"))
+            None -> refuse(g, "'" + shown + "' is a '" + Ty.show(t)
+                              + "', which cannot cross to interpreted code")
+        }
+    }
+}
+
+-- `text`, or a `match Target.os` that is `text` on the targets in `only`.
+fun onTargets(only : Option (Vec String), shown : String, text : String) -> String =
+    match only {
+        None -> text
+        Some(targets) -> {
+            let b = String.builder()
+            String.push(b, "match Target.os {\n")
+            for os in targets {
+                let constructor = match String.splitOnce(os, "#") {
+                    Some((_, c)) -> c
+                    None -> os
+                }
+                String.push(b, "        " + constructor + " -> " + text + "\n")
+            }
+            String.push(b, "        _ -> H.unavailable(\"" + shown + "\")\n    }")
+            String.build(b)
+        }
+    }
+
+-- The constructors of the target's operating system, which `Target.os` is
+-- one of, or one empty name if the library has none.
+fun targetConstructors(decls : DeclTable) -> Vec String = match Map.get(decls.tycons, "Target#OS") {
+    Some(info) -> Vec.map(info.variants, _.name)
+    None -> [""]
+}
+
+-- Every name `e` mentions on the target whose constructor is `os`: an arm of
+-- a `match Target.os` for another target mentions nothing.
+fun namesUnder(e : Core, os : String, out : Set.Set String) -> Unit = match e.kind {
+    CVar(name) -> Set.add(out, name)
+    CMatch(scrutinee, alts) -> {
+        namesUnder(scrutinee, os, out)
+        let onTarget = match untypedHead(scrutinee).kind {
+            CVar(name) -> name == "Target#os"
+            _ -> False
+        }
+        for a in alts {
+            let taken = match a.alt {
+                ACon(name, _, _) -> !onTarget || name == os
+                _ -> True
+            }
+            if taken { namesUnder(a.body, os, out) }
+        }
+    }
+    kind -> {
+        let _ = mapKind(kind, Mapper {
+            expr = fun(x) {
+                namesUnder(x, os, out)
+                x
+            },
+            type_ = fun(t) = t,
+            bind = fun(b) {
+                namesUnder(b.value, os, out)
+                b
+            },
+        })
+    }
+}
+
+fun refuse(g : Gen, problem : String) -> Option a {
+    Vec.push(g.problems, problem)
+    None
+}
+
+fun hasVariables(t : Type) -> Bool = match Ty.prune(t) {
+    TVar(_) -> True
+    TCon(_) -> False
+    TApp(f, a, _) -> hasVariables(f) || hasVariables(a)
+    TFam(_, _, _) -> True
+    TFun(ps, r) -> Iterator.any(ps, hasVariables) || hasVariables(r)
+    TTuple(es) -> Iterator.any(es, hasVariables)
+    _ -> False
+}
+
+-- What a type is, for crossing: a scalar by name, bytes, a host object, or
+-- nothing that can cross.
+type Crossing = Scalar(String) | Bytes | Object | Coroutines | Cannot
+
+fun crossing(g : Gen, t : Type) -> Crossing {
+    let (h, args) = Ty.spine(Ty.prune(t))
+    let name = match h {
+        TCon(c) -> c.name
+        _ -> return Cannot
+    }
+    if name == "Int" || name == "Byte" || name == "Char" || name == "Float"
+            || name == "Unit" || name == "Prim.Ptr" || name == Prelude.boolType {
+        return Scalar(name)
+    }
+    if name == "Data.Vec#Vec" && len(args) == 1 {
+        if let Object = crossing(g, args[0]) { return Coroutines }
+        return Cannot
+    }
+    match Decls.erasedPayload(g.decls, Ty.prune(t)) {
+        Some(payload) -> {
+            let (ph, pargs) = Ty.spine(Ty.prune(payload))
+            if let TCon(c) = ph {
+                if c.name == "Prim.Array" && len(pargs) == 1 {
+                    if let Scalar("Byte") = crossing(g, pargs[0]) { return Bytes }
+                }
+            }
+            return Cannot
+        }
+        None -> {}
+    }
+    if Map.contains(g.decls.tycons, name) && Option.isNone(Decls.enumSize(g.decls, name)) {
+        return Object
+    }
+    Cannot
+}
+
+-- The host value an interpreted argument `v` is, as text.
+fun argument(g : Gen, t : Type, v : String, budget : String) -> Option String =
+    match Ty.prune(t) {
+        TFun(params, ret) -> {
+            let returns = crossing(g, ret)
+            if len(params) == 0 {
+                match returns {
+                    Scalar("Unit") -> Some("H.thunk(r, " + v + ", " + budget + ")")
+                    Scalar(b) -> if b == Prelude.boolType {
+                        Some("H.predicate(r, " + v + ", " + budget + ")")
+                    } else { None }
+                    _ -> None
+                }
+            } else if len(params) == 1 {
+                match (crossing(g, params[0]), returns) {
+                    (Object, Scalar("Unit")) -> Some("H.sink(r, " + v + ", " + budget + ")")
+                    _ -> None
+                }
+            } else { None }
+        }
+        _ -> match crossing(g, t) {
+            Scalar("Int") -> Some("V.int(" + v + ")")
+            Scalar("Byte") -> Some("H.byte(" + v + ")")
+            Scalar("Char") -> Some("H.char(" + v + ")")
+            Scalar("Float") -> Some("H.float(" + v + ")")
+            Scalar("Prim.Ptr") -> Some("H.ptr(" + v + ")")
+            Scalar("Unit") -> Some("()")
+            Scalar(_) -> Some("H.bool(" + v + ")")
+            Bytes -> Some("H.bytes(" + v + ")")
+            Object -> Some("H.handle(" + v + ")")
+            Coroutines | Cannot -> None
+        }
+    }
+
+-- The interpreted value of the host expression `x`, as text.
+fun result(g : Gen, t : Type, x : String) -> Option String = match crossing(g, t) {
+    Scalar("Int") -> Some("VInt(" + x + ")")
+    Scalar("Byte") -> Some("VByte(" + x + ")")
+    Scalar("Char") -> Some("VChar(" + x + ")")
+    Scalar("Float") -> Some("VFloat(" + x + ")")
+    Scalar("Prim.Ptr") -> Some("VPtr(" + x + ")")
+    Scalar("Unit") -> Some("H.vUnit(" + x + ")")
+    Scalar(_) -> Some("H.vBool(" + x + ")")
+    Object -> Some("H.vHandle(" + x + ")")
+    Coroutines -> Some("H.vCoroutines(" + x + ")")
+    Bytes | Cannot -> None
+}
+
+-- -- state a host module would share -----------------------------------------------------
+
+-- Refuse a module a host module imports, and the interpreter interprets,
+-- that holds state: a copy of it would be the interpreted program's, apart
+-- from the host's.
+fun checkImportedState(g : Gen, program : CProgram, modules : Vec Modules.Module) -> Unit {
+    let watched = Set.new()
+    for m in modules {
+        if !Set.contains(g.host, m.name) { continue }
+        for imp in m.program.imports {
+            if !Set.contains(g.host, imp.name) && imp.name != sharedModule {
+                Set.add(watched, imp.name)
+            }
+        }
+    }
+    for b in program.binds {
+        if !Set.contains(watched, b.module_) || runsCompiled(g, b.name) { continue }
+        let shown = String.replace(b.name, "#", ".")
+        if b.mutable {
+            Vec.push(g.problems, "'" + shown + "' is a module-level 'var' in a module a "
+                     + "host module imports, so the interpreter's copy would split it")
+        } else if len(b.binders) == 0 && !inert(b.value) {
+            Vec.push(g.problems, "'" + shown + "' is initialized by a call in a module a "
+                     + "host module imports, so the interpreter would run it twice")
+        }
+    }
+}
+
+-- Whether computing `e` can do anything but build a value: it calls no
+-- function but a constructor or a primitive, and allocates nothing a
+-- program could tell apart from a copy.
+fun inert(e : Core) -> Bool = match e.kind {
+    CLit(_) | CUnit | CVar(_) | CCon(_) | CPrim(_) -> True
+    CLam(_, _, _) | CTyLam(_, _) -> True
+    CTuple(es) | CArray(es) | CDict(_, es) -> Iterator.all(es, inert)
+    CTyApp(f, _) -> inert(f)
+    CSlot(t, _) | CProject(t, _) -> inert(t)
+    CApp(f, args) -> match untypedHead(f).kind {
+        CCon(_) -> Iterator.all(args, inert)
+        CPrim(p) -> isPure(p) && Iterator.all(args, inert)
+        _ -> False
+    }
+    CIf(c, t, o) -> inert(c) && inert(t) && match o {
+        Some(x) -> inert(x)
+        None -> True
+    }
+    CMatch(s, alts) -> inert(s) && Iterator.all(alts, fun(a) = inert(a.body))
+    CLet(_, _, v, body, _) -> inert(v) && inert(body)
+    _ -> False
+}
+
+fun untypedHead(e : Core) -> Core = match e.kind {
+    CTyApp(inner, _) -> untypedHead(inner)
+    _ -> e
+}
+
+-- A primitive that only computes on its operands.
+fun isPure(p : Prims.Prim) -> Bool = match p {
+    Prims.IntAdd | Prims.IntSub | Prims.IntMul | Prims.IntNeg | Prims.IntAnd | Prims.IntOr
+        | Prims.IntXor | Prims.IntShl | Prims.IntShr | Prims.IntNot | Prims.CharFromInt
+        | Prims.ByteFromInt | Prims.IntToFloat | Prims.FloatNeg | Prims.FloatFromBits -> True
+    _ -> False
+}

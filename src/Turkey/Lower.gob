@@ -2289,10 +2289,24 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
         }
         -- A destructuring binding is a one-armed match, which is what it is.
         _ -> {
-            let body = rest()
+            let body = if mutable { varCells(l, pat, rest, scope, at) } else { rest() }
             matched(l, value, [(bare, body)], body.ty, at)
         }
     }
+}
+
+-- Lower `rest` with every name `pat` binds as a cell, for a `var` that
+-- destructures: any of them can be assigned in the statements that follow,
+-- which `rest` lowers under `scope`.
+fun varCells(l : Lowerer, pat : Pat, rest : fun() -> Core, scope : Scope,
+             where : Option Span) -> Core {
+    let types = Typed.ofPattern(l.types, pat)
+    let names = Vec.new(4)
+    for name in Map.keys(types) {
+        Vec.push(names, name)
+        Set.add(scope.cells, name)
+    }
+    cellsAround(l, types, names, rest(), where)
 }
 
 -- Lower a pattern's body, making a cell of any binder it assigns.
@@ -2311,8 +2325,15 @@ fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
     if len(here) == 0 { return lower(scope) }
     let inner = childScope(scope)
     for name in here { Set.add(inner.cells, name) }
-    var out = lower(inner)
-    for name in Vec.reverse(Vec.sort(here)) {
+    cellsAround(l, types, here, lower(inner), where)
+}
+
+-- Wrap `body` in a cell for each of `names`, each holding the value the
+-- pattern bound to that name. `types` is what the pattern binds.
+fun cellsAround(l : Lowerer, types : Map String Ty.Type, names : Vec String,
+                body : Core, where : Option Span) -> Core {
+    var out = body
+    for name in Vec.reverse(Vec.sort(names)) {
         let ty = rigidly(l, Map.getOr(types, name, TBottom))
         out = node(out.ty, where, CLet(name, refOf(ty),
             node(refOf(ty), where, CRef(node(ty, where, CVar(name)))),

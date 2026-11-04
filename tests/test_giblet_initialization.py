@@ -164,8 +164,13 @@ int main(void) {
      'let base : Int = 0', 'builds a tuple'),
     ('var value : String = "traced"\nfun read() -> Int = 0',
      'let base : Int = 0', 'uses the string literal "traced"'),
-    ('var value : Option Int = None\nfun read() -> Int = 0',
+    # Too wide to be held as its slots, so `Narrow` is a shared empty object.
+    ('type Wide = Narrow | Wide(Int, Int, Int, Int)\n'
+     'var value : Wide = Narrow\nfun read() -> Int = 0',
      'let base : Int = 0', "uses a constructor with no fields, such as 'None'"),
+    # Held as its slots, and a global holds it boxed.
+    ('var value : Option Int = None\nfun read() -> Int = 0',
+     'let base : Int = 0', 'builds a value with Option'),
 ])
 def test_unsafe_initializers_are_refused(modules, body, dependency, message):
     entry, env = modules(body, dependency)

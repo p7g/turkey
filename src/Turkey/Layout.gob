@@ -1,5 +1,6 @@
 export (
-    layoutOf, share, packedKeyParts, openedLayouts, skolemKey, unknownLayouts,
+    Flat(..), layoutOf, flatOf, unfolds, storedRep, flatLimit, share, packedKeyParts,
+    openedLayouts, skolemKey, unknownLayouts,
 )
 
 -- One compiled body per distinct *layout* of the type arguments: the pass that
@@ -14,11 +15,17 @@ export (
 --
 -- This pass is the same specialization keyed on the *layout* of each type
 -- argument rather than on the type, and it needs no cap for the reason the cap
--- existed. There are seven layouts and infinitely many types; `layout(Pair a)`
--- is `ptr` whatever `a` is, so the chain that diverged under a type key --
--- `Pair Int`, `Pair (Pair Int)`, ... -- collapses to a single key. The thing
--- that could not be bounded was the type index. The layout index is bounded by
--- construction, so the worklist below terminates on any program.
+-- existed. **The keys a binding can be copied at are finite, whatever the
+-- program.** A key is one layout per atom, and a layout is a sequence of at
+-- most `flatLimit` slots drawn from seven representations, so there are
+-- finitely many: a type whose slots would be more is boxed, and a boxed type's
+-- layout is one `ptr` whatever is inside it. The chain that diverged under a
+-- type key collapses: `f[a]` calling `f[(a, a)]` at `a = Int` asks for layouts
+-- of 1, 2 and 4 `i64` slots, then for `(a, a)` boxed, one `ptr`, and from
+-- there for 2 and 4 `ptr` slots and `ptr` again, which is a key it has. A
+-- component that takes no slot cannot nest without end either, because a
+-- layout is its slots and nothing else: `((), ())` is `unit`, as `()` is. So
+-- the worklist below terminates on any program.
 --
 -- **Every generic body is copied, and no generic body is compiled.** The
 -- invariant the backend relies on is that the layout of every type a body
@@ -132,6 +139,48 @@ fun isStar(k : Kind) -> Bool = match Ty.kprune(k) {
     _ -> True
 }
 
+-- The most slots a flat value may have. Past it, a value is held as a pointer
+-- to an object, as every value of a type that is not flat is.
+let flatLimit = 4
+
+-- How a value of a flat type is held: its slots, and which of them hold each
+-- field of each constructor.
+--
+-- A product (a tuple, or a type with one constructor) is its fields' slots in
+-- field order, a flat field's own slots spliced in. A sum has a tag slot
+-- first, holding the index of the value's constructor among its type's, and
+-- then the slots its constructors' fields need, merged by representation: the
+-- n-th slot of one representation in one constructor's fields is the n-th slot
+-- of that representation in the sum, whatever the constructor. So no slot is
+-- traced under one tag and untraced under another, and a slot a constructor
+-- does not use holds zero, which for a traced slot is a null the collector
+-- skips.
+type Flat = Flat {
+    slots  : Array Rep,
+    -- A sum's constructors, in declaration order; empty for a product.
+    names  : Array String,
+    -- Per constructor (one, for a product), per field, the slots holding it.
+    fields : Array (Array (Array Int)),
+}
+
+-- The order a sum's merged slots come in, after its tag.
+let slotOrder = [
+    Ssa.traced(Ptr), Ssa.untraced(Ptr), Ssa.untraced(I64), Ssa.untraced(F64),
+    Ssa.untraced(I32), Ssa.untraced(I8), Ssa.untraced(I1),
+]
+
+-- Returns the representation a memory position holds a value of this layout
+-- at: a field, an array element, a cell, a global. A layout of one slot is
+-- held as that slot, and one of none as `unit`. A layout of several slots is
+-- held as a traced pointer to an object of those slots, built when the value
+-- is stored. This is a function of the layout alone, so a position's writer
+-- and its reader agree on it whichever copy of a body each is in.
+fun storedRep(l : Layout) -> Rep = match len(l.slots) {
+    0 -> Ssa.untraced(Unit)
+    1 -> l.slots[0]
+    _ -> Ssa.traced(Ptr)
+}
+
 -- The layout a value of `ty` is held at, or `None` if that is not known.
 --
 -- `layouts` is the binding's `layouts`, with the constants of any existential
@@ -142,39 +191,148 @@ fun isStar(k : Kind) -> Bool = match Ty.kprune(k) {
 -- no uniform representation to fall back on: a guess would be a value that one
 -- side holds boxed and the other reads raw.
 fun layoutOf(decls : DeclTable, ty : Ty.Type,
-             layouts : Map String Layout) -> Option Layout {
+             layouts : Map String Layout) -> Option Layout =
+    if !unfolds(decls, ty) { unfold(decls, ty, layouts, lookup) }
+    else { unfolded(fun(u) = unfold(decls, ty, layouts, u)) }
+
+-- Returns where the fields of a value of `ty` are among its slots, if the type
+-- is a tuple or declared type held flat at these layouts, and `None` if it is
+-- not or its layout is not known. The slots are `layoutOf`'s.
+fun flatOf(decls : DeclTable, ty : Ty.Type,
+           layouts : Map String Layout) -> Option Flat =
+    unfolded(fun(u) = flatIn(decls, ty, layouts, u))
+
+-- Returns whether finding the layout of `ty` unfolds a declaration: whether
+-- `ty` is a tuple, or a newtype or a possibly flat type applied. The layout of
+-- any other type is a lookup, cheaper than remembering it.
+fun unfolds(decls : DeclTable, ty : Ty.Type) -> Bool = match Ty.prune(ty) {
+    TTuple(_) -> True
+    TCon(c) -> unfoldsName(decls, c.name)
+    TApp(fn, _, _) -> match headOf(fn) {
+        TCon(c) -> unfoldsName(decls, c.name)
+        _ -> False
+    }
+    _ -> False
+}
+
+-- The head of an application's spine, found without building the spine.
+fun headOf(ty : Ty.Type) -> Ty.Type = match Ty.prune(ty) {
+    TApp(fn, _, _) -> headOf(fn)
+    other -> other
+}
+
+fun unfoldsName(decls : DeclTable, name : String) -> Bool =
+    Set.contains(Decls.newtypes(decls), name) || Option.isSome(Decls.flatDecl(decls, name))
+
+-- `f` of a quick unfolding, or of a careful one if the quick one gave up.
+--
+-- The quick one does not name the types it unfolds, which costs a string per
+-- type: a type is on a cycle only if its unfolding never ends, so one that ends
+-- within `quickDepth` is on none. Past it, the unfolding is redone keeping the
+-- names, which finds any cycle.
+fun unfolded(f : fun(Unfolding) -> a) -> a {
+    let quick = Unfolding { keys = None, depth = 0, cut = noCut, deep = False }
+    let found = f(quick)
+    if !quick.deep { return found }
+    f(Unfolding { keys = Some([]), depth = 0, cut = noCut, deep = False })
+}
+
+-- The types being unfolded, outermost first, and the depth of the outermost
+-- one a type inside it was found to mention again.
+--
+-- A declaration that mentions itself is never flat (`Decls.flatCandidates`),
+-- but a type can still reach itself through its arguments: with
+-- `type B = B(A)` and `type A = A(Option B)`, both newtypes, unfolding
+-- `Option B` asks for `B`, which is `Option B` again. Every type on such a cycle
+-- is held boxed. That is a property of the type and not of where the question
+-- started, so every frame from the revisited one inward answers boxed, however
+-- the cycle was entered.
+--
+-- `keys` is `None` for the quick unfolding, which only counts its depth and
+-- gives up past `quickDepth`, setting `deep`.
+type Unfolding = Unfolding {
+    keys     : Option (Vec String),
+    var depth : Int,
+    var cut  : Int,
+    var deep : Bool,
+}
+
+-- No depth is this deep: the cut when no cycle is open.
+let noCut = 1000000000
+
+-- What `unfold` is given for a type that does not unfold (`unfolds`): it is
+-- never entered, so never changed, and every thread can share it.
+let lookup = Unfolding { keys = None, depth = 0, cut = noCut, deep = False }
+
+-- Deeper than the nesting of newtypes and flat types in any type a program
+-- writes.
+let quickDepth = 32
+
+-- Enters `t`, returning its depth, or -1 if it is already being unfolded or
+-- the quick unfolding has given up.
+fun enter(u : Unfolding, t : Ty.Type) -> Int = match u.keys {
+    None -> {
+        if u.depth >= quickDepth {
+            u.deep = True
+            return -1
+        }
+        u.depth = u.depth + 1
+        u.depth - 1
+    }
+    Some(keys) -> {
+        let key = Ty.typeKey(t)
+        for var i = 0; i < len(keys); i = i + 1 {
+            if keys[i] == key {
+                if i < u.cut { u.cut = i }
+                return -1
+            }
+        }
+        Vec.push(keys, key)
+        len(keys) - 1
+    }
+}
+
+-- Leaves the type entered at `depth`, returning whether it is on a cycle.
+fun leave(u : Unfolding, depth : Int) -> Bool = match u.keys {
+    None -> {
+        u.depth = depth
+        False
+    }
+    Some(keys) -> {
+        discard(Vec.pop(keys))
+        let cyclic = u.cut <= depth
+        if u.cut >= depth { u.cut = noCut }
+        cyclic
+    }
+}
+
+fun unfold(decls : DeclTable, ty : Ty.Type, layouts : Map String Layout,
+           u : Unfolding) -> Option Layout {
+    if u.deep { return Some(ptr) }
     let t = Ty.prune(ty)
     match t {
         TBottom -> return Some(unit_)
         _ -> {}
     }
     if isAtom(t) { return Map.get(layouts, Ty.typeKey(t)) }
-    -- A newtype is its payload, so its representation is its payload's. See
-    -- `Decls.newtypes`, which is also where the recursion that would make this
-    -- loop is excluded.
-    match Decls.erasedPayload(decls, t) {
-        Some(payload) -> return layoutOf(decls, payload, layouts)
-        None -> {}
-    }
     match t {
-        TCon(c) -> {
-            if c.name == "Int" { return Some(i64) }
-            if c.name == "Byte" { return Some(i8) }
-            if c.name == "Char" { return Some(i32) }
-            if c.name == "Float" { return Some(f64) }
-            if c.name == "Unit" { return Some(unit_) }
-            if c.name == "Prim.Ptr" { return Some(addr) }
-            -- Every other declared type is an enumeration or a heap object,
-            -- and a heap object is reached by pointer. Said here rather than
-            -- left to a catch-all at the end, so that the end can be a refusal.
-            Some(declaredLayout(decls, c.name))
-        }
         TFun(_, _) -> Some(ptr)
-        TApp(_, _, _) -> match Ty.spine(t) {
-            (TCon(c), _) -> Some(declaredLayout(decls, c.name))
-            _ -> Some(ptr)
+        TTuple(elems) -> {
+            let found = Vec.new(len(elems))
+            for x in elems {
+                let l = unfold(decls, x, layouts, u)?
+                Vec.push(found, l.slots)
+            }
+            Some(Layout { slots = productSlots(Vec.toArray(found)) })
         }
-        TTuple(_) -> Some(ptr)
+        TCon(c) -> named(decls, t, c.name, [], layouts, u)
+        TApp(_, _, _) -> {
+            let (h, args) = Ty.spine(t)
+            match h {
+                TCon(c) -> named(decls, t, c.name, args, layouts, u)
+                _ -> Some(ptr)
+            }
+        }
         -- A `TSet` is the one that can arrive: a numeric literal whose type was
         -- still a *decision*. Defaulting settles it at generalization and the
         -- type table's own check is that it did, so one here is a hole in that
@@ -183,15 +341,239 @@ fun layoutOf(decls : DeclTable, ty : Ty.Type,
     }
 }
 
--- A declared type's layout: an enumeration's index at the narrowest width that
--- holds its largest (`Decls.enumSize`), and anything else a pointer to its
--- object. One constructor has nothing to hold.
-fun declaredLayout(decls : DeclTable, tycon : String) -> Layout =
-    match Decls.enumSize(decls, tycon) {
-        Some(n) -> if n == 1 { unit_ } else if n == 2 { i1 }
-                   else if n <= 256 { i8 } else { i32 }
-        None -> ptr
+-- The layout of `t`, a declared type applied to `args`: a primitive's, an
+-- enumeration's index at the narrowest width that holds its largest
+-- (`Decls.enumSize`), a newtype's payload's, the slots of a flat type, and
+-- anything else a pointer to its object. One constructor has nothing to hold.
+fun named(decls : DeclTable, t : Ty.Type, name : String, args : Array Ty.Type,
+          layouts : Map String Layout, u : Unfolding) -> Option Layout {
+    if len(args) == 0 {
+        match name {
+            "Int" -> return Some(i64)
+            "Byte" -> return Some(i8)
+            "Char" -> return Some(i32)
+            "Float" -> return Some(f64)
+            "Unit" -> return Some(unit_)
+            "Prim.Ptr" -> return Some(addr)
+            _ -> {}
+        }
     }
+    -- A newtype is its payload, so its representation is its payload's. See
+    -- `Decls.newtypes`, which is also where the recursion that would make this
+    -- loop is excluded.
+    if Set.contains(Decls.newtypes(decls), name) {
+        match Decls.payloadType(decls, t, 0) {
+            Some(payload) -> {
+                let depth = enter(u, t)
+                if depth < 0 { return Some(ptr) }
+                let found = unfold(decls, payload, layouts, u)
+                discard(leave(u, depth))
+                return found
+            }
+            None -> {}
+        }
+    }
+    match Decls.enumSize(decls, name) {
+        Some(n) -> return Some(indexLayout(n))
+        None -> {}
+    }
+    let fd = match Decls.flatDecl(decls, name) {
+        Some(found) -> found
+        None -> return Some(ptr)
+    }
+    if len(fd.params) == 0 {
+        match Map.get(decls.groundLayouts, name) {
+            Some(found) -> return Some(found)
+            None -> {}
+        }
+    }
+    match fieldsOf(decls, t, fd, args, layouts, u)? {
+        Some(fields) -> Some(Layout { slots = declaredSlots(fd, fields) })
+        None -> Some(ptr)
+    }
+}
+
+-- The slots of each field of each constructor of `t`, an application of the
+-- candidate `fd` to `args`: `None` if one is not known, and `Some(None)` if
+-- `t` is on a cycle, and so boxed.
+fun fieldsOf(decls : DeclTable, t : Ty.Type, fd : Decls.FlatDecl,
+             args : Array Ty.Type, layouts : Map String Layout,
+             u : Unfolding) -> Option (Option (Array (Array (Array Rep)))) {
+    let depth = enter(u, t)
+    if depth < 0 { return Some(None) }
+    let mapping = Map.new()
+    for var i = 0; i < len(fd.params) && i < len(args); i = i + 1 {
+        if fd.params[i] >= 0 { Map.put(mapping, fd.params[i], args[i]) }
+    }
+    var known = True
+    let found = Array.map(fd.fields, fun(types) = Array.map(types, fun(x) =
+        match unfold(decls, Decls.substitute(x, mapping), layouts, u) {
+            Some(l) -> l.slots
+            None -> {
+                known = False
+                []
+            }
+        }))
+    let cyclic = leave(u, depth)
+    if !known { return None }
+    if cyclic { return Some(None) }
+    Some(Some(found))
+}
+
+-- The slots of a value of the candidate `fd` whose fields have these slots, or
+-- one pointer if it is held boxed.
+fun declaredSlots(fd : Decls.FlatDecl, fields : Array (Array (Array Rep))) -> Array Rep {
+    if len(fields) == 1 { return productSlots(fields[0]) }
+    if boxedCompact(fd, fields) { return ptr.slots }
+    sumSlots(fields)
+}
+
+-- Whether a sum of nullaries and one constructor with one field is one word
+-- (`Turkey.SsaLower`'s compact sums): when memory holds that field at a
+-- pointer. A payload of several slots is such a field, held in memory as a
+-- pointer to its slots, so `Some(x)` of an `x` read from memory is that
+-- pointer, where a flat sum would take `x` apart and box it again to return
+-- it.
+fun boxedCompact(fd : Decls.FlatDecl, fields : Array (Array (Array Rep))) -> Bool =
+    match fd.compact {
+        Some(k) -> len(fields[k]) == 1
+                   && storedRep(Layout { slots = fields[k][0] }) == Ssa.traced(Ptr)
+        None -> False
+    }
+
+-- The slots of a product of fields of these slots, or one pointer if there are
+-- more than `flatLimit`.
+fun productSlots(fields : Array (Array Rep)) -> Array Rep {
+    let slots = []
+    for f in fields { for r in f { Vec.push(slots, r) } }
+    if len(slots) > flatLimit { ptr.slots } else { Vec.toArray(slots) }
+}
+
+-- The slots of a sum whose constructors have fields of these slots, or one
+-- pointer if there are more than `flatLimit`.
+fun sumSlots(fields : Array (Array (Array Rep))) -> Array Rep =
+    Option.unwrapOr(sumFits(fields), ptr.slots)
+
+-- The slots of a sum whose constructors have fields of these slots, if there
+-- are at most `flatLimit`: the tag, then for each representation in
+-- `slotOrder`, as many slots as any one constructor needs.
+fun sumFits(fields : Array (Array (Array Rep))) -> Option (Array Rep) {
+    let most = Array.filled(len(slotOrder), 0)
+    let count = Array.filled(len(slotOrder), 0)
+    for con in fields {
+        for var k = 0; k < len(count); k = k + 1 { count[k] = 0 }
+        for f in con {
+            for r in f {
+                let k = orderOf(r)
+                count[k] = count[k] + 1
+            }
+        }
+        for var k = 0; k < len(most); k = k + 1 {
+            if count[k] > most[k] { most[k] = count[k] }
+        }
+    }
+    var total = len(indexLayout(len(fields)).slots)
+    for m in most { total = total + m }
+    if total > flatLimit { return None }
+    let slots = []
+    for r in indexLayout(len(fields)).slots { Vec.push(slots, r) }
+    for var k = 0; k < len(slotOrder); k = k + 1 {
+        for var n = 0; n < most[k]; n = n + 1 { Vec.push(slots, slotOrder[k]) }
+    }
+    Some(Vec.toArray(slots))
+}
+
+fun flatIn(decls : DeclTable, ty : Ty.Type, layouts : Map String Layout,
+           u : Unfolding) -> Option Flat {
+    let t = Ty.prune(ty)
+    if isAtom(t) { return None }
+    match t {
+        TTuple(elems) -> {
+            let found = Vec.new(len(elems))
+            for x in elems {
+                let l = unfold(decls, x, layouts, u)?
+                Vec.push(found, l.slots)
+            }
+            let fields = Vec.toArray(found)
+            if totalSlots(fields) > flatLimit { None } else { Some(productFlat(fields)) }
+        }
+        TCon(_) -> declaredFlat(decls, t, [], layouts, u)
+        TApp(_, _, _) -> {
+            let (h, args) = Ty.spine(t)
+            match h {
+                TCon(_) -> declaredFlat(decls, t, args, layouts, u)
+                _ -> None
+            }
+        }
+        _ -> None
+    }
+}
+
+fun declaredFlat(decls : DeclTable, t : Ty.Type, args : Array Ty.Type,
+                 layouts : Map String Layout, u : Unfolding) -> Option Flat {
+    let name = match Ty.spine(t) {
+        (TCon(c), _) -> c.name
+        _ -> return None
+    }
+    let fd = Decls.flatDecl(decls, name)?
+    let fields = match fieldsOf(decls, t, fd, args, layouts, u)? {
+        Some(found) -> found
+        None -> return None
+    }
+    if len(fields) == 1 {
+        if totalSlots(fields[0]) > flatLimit { return None }
+        return Some(productFlat(fields[0]))
+    }
+    if boxedCompact(fd, fields) { return None }
+    let slots = sumFits(fields)?
+    Some(sumFlat(fd.names, slots, fields))
+}
+
+fun totalSlots(fields : Array (Array Rep)) -> Int {
+    var n = 0
+    for f in fields { n = n + len(f) }
+    n
+}
+
+-- The `Flat` of a product of fields of these slots.
+fun productFlat(fields : Array (Array Rep)) -> Flat {
+    let slots = []
+    let where_ = Array.map(fields, fun(f) = Array.map(f, fun(r) {
+        Vec.push(slots, r)
+        len(slots) - 1
+    }))
+    Flat { slots = Vec.toArray(slots), names = [], fields = [where_] }
+}
+
+-- The `Flat` of a sum of constructors `names` with fields of these slots, its
+-- slots being `slots`, as `sumSlots` lays them out.
+fun sumFlat(names : Array String, slots : Array Rep,
+            fields : Array (Array (Array Rep))) -> Flat {
+    let tag = len(indexLayout(len(names)).slots)
+    -- The first of `slots` of each representation in `slotOrder`.
+    let first = Array.filled(len(slotOrder), len(slots))
+    for var i = len(slots) - 1; i >= tag; i = i - 1 { first[orderOf(slots[i])] = i }
+    let where_ = Array.map(fields, fun(con) {
+        let used = Array.filled(len(slotOrder), 0)
+        Array.map(con, fun(f) = Array.map(f, fun(r) {
+            let k = orderOf(r)
+            let at = first[k] + used[k]
+            used[k] = used[k] + 1
+            at
+        }))
+    })
+    Flat { slots = slots, names = names, fields = where_ }
+}
+
+fun orderOf(r : Rep) -> Int = match Array.indexOf(slotOrder, r) {
+    Some(k) -> k
+    None -> oops("a slot held at " + show(r))
+}
+
+-- The layout of an index below `n`: none for one value, a bit for two, and
+-- otherwise the narrowest width that holds the largest.
+fun indexLayout(n : Int) -> Layout =
+    if n == 1 { unit_ } else if n == 2 { i1 } else if n <= 256 { i8 } else { i32 }
 
 -- -- atoms --------------------------------------------------------------------------
 
@@ -563,6 +945,16 @@ fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
 -- of its own. The keys only grow, and there are finitely many.
 fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
           main : String) -> CProgram {
+    -- Computed here, before `unknownLayouts` and the backend ask for layouts in
+    -- parallel, since these are cached in `decls`.
+    for (name, fd) in Map.entries(Decls.flatCandidates(decls)) {
+        if len(fd.params) == 0 {
+            match layoutOf(decls, Decls.head(decls, name), Map.new()) {
+                Some(found) -> Map.put(decls.groundLayouts, name, found)
+                None -> {}
+            }
+        }
+    }
     let keys = Map.new()
     loop {
         publish(classes, keys)
@@ -1396,8 +1788,9 @@ fun unknownLayouts(program : CProgram, decls : DeclTable) -> Vec String {
 fun unknownOf(decls : DeclTable, b : CBind) -> Vec String {
     let out = []
     let seen = Set.new()
-    let report = fun(t : Ty.Type, layouts : Map String Layout) = {
-        match unknownIn(decls, t, layouts) {
+    let report = fun(t : Ty.Type, layouts : Map String Layout,
+                     known : Map String (Option Ty.Type)) = {
+        match unknownIn(decls, t, layouts, known) {
             Some(bad) -> {
                 let k = Ty.show(bad)
                 if !Set.contains(seen, k) {
@@ -1408,15 +1801,32 @@ fun unknownOf(decls : DeclTable, b : CBind) -> Vec String {
             None -> {}
         }
     }
-    report(b.ty, b.layouts)
-    unknownInto(b.value, b.layouts, report)
+    let known = Map.new()
+    report(b.ty, b.layouts, known)
+    unknownInto(b.value, b.layouts, known, report)
     out
 }
 
-fun unknownIn(decls : DeclTable, ty : Ty.Type,
-              layouts : Map String Layout) -> Option Ty.Type {
+-- `known` holds the answer for each type already asked about under these
+-- layouts, by its `Ty.typeKey`: a body mentions the same types at most of its
+-- nodes, and a flat type's layout takes its fields' to find.
+fun unknownIn(decls : DeclTable, ty : Ty.Type, layouts : Map String Layout,
+              known : Map String (Option Ty.Type)) -> Option Ty.Type {
     let t = Ty.prune(ty)
     if !isStar(Ty.kindOf(t)) { return None }
+    if !unfolds(decls, t) { return unknownUncached(decls, t, layouts, known) }
+    let key = Ty.typeKey(t)
+    match Map.get(known, key) {
+        Some(found) -> return found
+        None -> {}
+    }
+    let found = unknownUncached(decls, t, layouts, known)
+    Map.put(known, key, found)
+    found
+}
+
+fun unknownUncached(decls : DeclTable, t : Ty.Type, layouts : Map String Layout,
+                    known : Map String (Option Ty.Type)) -> Option Ty.Type {
     match layoutOf(decls, t, layouts) {
         None -> return Some(t)
         Some(_) -> {}
@@ -1429,7 +1839,7 @@ fun unknownIn(decls : DeclTable, ty : Ty.Type,
         _ -> []
     }
     for p in parts {
-        match unknownIn(decls, p, layouts) {
+        match unknownIn(decls, p, layouts, known) {
             Some(bad) -> return Some(bad)
             None -> {}
         }
@@ -1438,11 +1848,13 @@ fun unknownIn(decls : DeclTable, ty : Ty.Type,
 }
 
 fun unknownInto(e : Core, layouts : Map String Layout,
-                report : fun(Ty.Type, Map String Layout) -> Unit) -> Unit {
-    report(e.ty, layouts)
+                known : Map String (Option Ty.Type),
+                report : fun(Ty.Type, Map String Layout,
+                             Map String (Option Ty.Type)) -> Unit) -> Unit {
+    report(e.ty, layouts, known)
     match e.kind {
         CMatch(scrutinee, alts) -> {
-            unknownInto(scrutinee, layouts, report)
+            unknownInto(scrutinee, layouts, known, report)
             for alt in alts {
                 let inner = Map.new()
                 for (k, l) in Map.entries(layouts) { Map.put(inner, k, l) }
@@ -1456,7 +1868,7 @@ fun unknownInto(e : Core, layouts : Map String Layout,
                     }
                     None -> {}
                 }
-                unknownInto(alt.body, inner, report)
+                unknownInto(alt.body, inner, Map.new(), report)
             }
             return {}
         }
@@ -1464,16 +1876,16 @@ fun unknownInto(e : Core, layouts : Map String Layout,
     }
     discard(mapKind(e.kind, Mapper {
         expr = fun(x) = {
-            unknownInto(x, layouts, report)
+            unknownInto(x, layouts, known, report)
             x
         },
         type_ = fun(t) = {
-            report(t, layouts)
+            report(t, layouts, known)
             t
         },
         bind = fun(b) = {
-            report(b.ty, layouts)
-            unknownInto(b.value, layouts, report)
+            report(b.ty, layouts, known)
+            unknownInto(b.value, layouts, known, report)
             b
         },
     }))

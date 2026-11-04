@@ -78,7 +78,10 @@ type Unsupported = Unsupported {
 -- parameters at the layouts its key names, so a caller that read them off its
 -- own scheme would pass a value at a layout the copy does not hold it at.
 type Signature = Signature {
-    params : Array Rep,
+    -- Per parameter, the registers it is passed in: its slots (`passedIn`),
+    -- or one pointer where the body needs its box (`boxParameters`).
+    params : Array (Array Rep),
+    -- A result of several slots is returned as its box.
     result : Rep,
     -- Whether a saturated call never comes back: the body always reaches
     -- `Prim.error` or another such call. Set by `signatures` once every
@@ -164,6 +167,52 @@ type Lower = Lower {
     -- A local record's or dictionary's slots, by position.
     localObjects : Map Int (Array (Int, Rep)),
     var nextSlot : Int,
+    held : Held,
+}
+
+-- What one function's lowering knows about how its values are held.
+type Held = Held {
+    -- Every value of several slots this function holds, by its marker, and
+    -- the type of each that an expression gave, which a box's reason names.
+    multis : Map Int Multi,
+    types  : Map Int Ty.Type,
+    -- `Layout.layoutOf` and `Layout.flatOf` of each type asked about under
+    -- `layouts`, by its `Ty.typeKey`: the lowering asks about most types many
+    -- times, and the answer takes allocation to find. Emptied whenever
+    -- `layouts` changes.
+    var layouts : Map String Ssa.Layout,
+    var flats   : Map String (Option Layout.Flat),
+    -- Per join block, which of its values of several slots it takes boxed,
+    -- in one parameter (`joinParams`).
+    boxedJoins : Map Int (Array Bool),
+}
+
+-- A value of a type held in several slots (`Layout.flatOf`), as the lowering
+-- carries it. Its `Value` is a marker that no instruction defines, standing
+-- for one of two forms: the slots themselves, one SSA value each, or a pointer
+-- to the object a memory position holds them in (`Layout.storedRep`).
+--
+-- **One SSA value is one register, by construction.** No instruction takes or
+-- defines a marker: a use that needs the slots takes them out (`slotsOf`), and
+-- one that needs a pointer gets the box (`stored`). So `Ssa`, `LowIr`, the
+-- register allocator, instruction selection and the frame tables never see a
+-- value wider than a word. A marker that escaped into an instruction would be
+-- a use of a value nothing defines, which the verifier reports.
+--
+-- The boxed form is what a value read from memory starts as, and it is taken
+-- apart only where its slots are wanted. So a value moved from one memory
+-- position to another keeps its box, and is not taken apart and boxed again;
+-- a function's or a join's parameter that its body would box is passed boxed
+-- for the same reason (`boxParameters`, `joinParams`). The slots are not kept
+-- beside the box: a block that wants them loads them, which is cheaper than
+-- holding both forms live.
+type Multi
+    = Slots(Ssa.Layout, Array Value)
+    | Boxed(Ssa.Layout, Value)
+
+fun multiLayout(m : Multi) -> Ssa.Layout = match m {
+    Slots(layout, _) -> layout
+    Boxed(layout, _) -> layout
 }
 
 -- Where an expression's value goes.
@@ -176,18 +225,7 @@ type Dest
 
 -- -- representations ----------------------------------------------------------------
 
--- Returns the one register a value of this layout is held in: its slot, or
--- `Unit` for a layout with none. Fails on a layout of several slots, which
--- one `Rep` cannot hold.
-fun repOfLayout(layout : Ssa.Layout) -> Rep = match len(layout.slots) {
-    0 -> Ssa.untraced(Unit)
-    1 -> layout.slots[0]
-    _ -> oops("the layout '" + Ssa.layoutName(layout) + "' has "
-              + Int.toString(len(layout.slots)) + " slots, and a value is held "
-              + "in one register")
-}
-
--- What a body *holds* a value of this type at, under these layouts.
+-- What a body holds a value of this type at, under these layouts.
 --
 -- There is no answer to fall back on. `Turkey.Layout` copies every generic body
 -- per layout so that every type a body mentions has one, and
@@ -195,16 +233,236 @@ fun repOfLayout(layout : Ssa.Layout) -> Rep = match len(layout.slots) {
 -- compiler bug, and holding it at a traced pointer would be a guess that the
 -- value's producer or consumer need not share.
 --
--- Split out of `repOf` because the signature pre-pass asks this before any
+-- Split out of `heldOf` because the signature pre-pass asks this before any
 -- `Lower` exists, and asks it under a *different* binding's layouts than the
 -- one being lowered. That is the whole point of `Signature`.
-fun repIn(decls : DeclTable, layouts : Map String Ssa.Layout, ty : Ty.Type) -> Rep =
+fun layoutIn(decls : DeclTable, layouts : Map String Ssa.Layout,
+             ty : Ty.Type) -> Ssa.Layout =
     match Layout.layoutOf(decls, ty, layouts) {
-        Some(layout) -> repOfLayout(layout)
+        Some(layout) -> layout
         None -> oops("no layout for the type '" + Ty.show(ty) + "'")
     }
 
-fun repOf(l : Lower, ty : Ty.Type) -> Rep = repIn(l.decls, l.layouts, ty)
+fun heldOf(l : Lower, ty : Ty.Type) -> Ssa.Layout {
+    if !Layout.unfolds(l.decls, ty) { return layoutIn(l.decls, l.layouts, ty) }
+    let key = Ty.typeKey(ty)
+    match Map.get(l.held.layouts, key) {
+        Some(found) -> found
+        None -> {
+            let found = layoutIn(l.decls, l.layouts, ty)
+            Map.put(l.held.layouts, key, found)
+            found
+        }
+    }
+}
+
+-- Where the fields of a value of `ty` are among its slots, if it is flat.
+fun flatHere(l : Lower, ty : Ty.Type) -> Option Layout.Flat {
+    if !Layout.unfolds(l.decls, ty) { return Layout.flatOf(l.decls, ty, l.layouts) }
+    let key = Ty.typeKey(ty)
+    match Map.get(l.held.flats, key) {
+        Some(found) -> found
+        None -> {
+            let found = Layout.flatOf(l.decls, ty, l.layouts)
+            Map.put(l.held.flats, key, found)
+            found
+        }
+    }
+}
+
+-- Make `layouts` the ones this body is lowered under.
+fun setLayouts(l : Lower, layouts : Map String Ssa.Layout) -> Unit {
+    l.layouts = layouts
+    l.held.layouts = Map.new()
+    l.held.flats = Map.new()
+}
+
+-- The one register a value of this type is held in when it is held in one: in
+-- memory, in a closure's parameters and result, and in a function's result.
+-- A type of several slots is held there as a pointer to its box.
+fun repIn(decls : DeclTable, layouts : Map String Ssa.Layout, ty : Ty.Type) -> Rep =
+    Layout.storedRep(layoutIn(decls, layouts, ty))
+
+fun repOf(l : Lower, ty : Ty.Type) -> Rep = Layout.storedRep(heldOf(l, ty))
+
+fun isMulti(layout : Ssa.Layout) -> Bool = len(layout.slots) > 1
+
+-- The registers a direct call passes a parameter of this layout in: its slots,
+-- if it has several, and otherwise the one register it is held in.
+fun passedIn(layout : Ssa.Layout) -> Array Rep =
+    if isMulti(layout) { layout.slots } else { [Layout.storedRep(layout)] }
+
+-- -- values of several slots ------------------------------------------------------
+
+fun multiOf(l : Lower, v : Value) -> Option Multi = Map.get(l.held.multis, Ssa.valueId(v))
+
+fun newMulti(l : Lower, m : Multi) -> Value {
+    let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
+    Map.put(l.held.multis, Ssa.valueId(marker), m)
+    marker
+}
+
+-- The value of `layout` made of these slots: nothing, the one slot, or a
+-- marker for several.
+fun fromSlots(l : Lower, layout : Ssa.Layout, values : Array Value) -> Value =
+    match len(layout.slots) {
+        0 -> L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+        1 -> coerce(l, values[0], layout.slots[0])
+        _ -> newMulti(l, Slots(layout, values))
+    }
+
+-- The value of `layout` that a memory position held as `v` (`Layout.storedRep`).
+fun fromStored(l : Lower, layout : Ssa.Layout, v : Value) -> Value =
+    if isMulti(layout) { newMulti(l, Boxed(layout, v)) } else { v }
+
+-- The slots of `v`, a value of `layout`. A boxed value is loaded here, in the
+-- block the slots are wanted in.
+fun slotsOf(l : Lower, v : Value, layout : Ssa.Layout) -> Array Value =
+    slotsAt(l, v, layout, Array.init(len(layout.slots), fun(i) = i))
+
+-- The slots of `v` at `indices`.
+fun slotsAt(l : Lower, v : Value, layout : Ssa.Layout,
+            indices : Array Int) -> Array Value {
+    if !isMulti(layout) { return Array.map(indices, fun(_) = v) }
+    match multiOf(l, v) {
+        Some(Slots(_, values)) -> Array.map(indices, fun(i) = values[i])
+        Some(Boxed(had, box)) -> {
+            let object = Rt.layout(had.slots)
+            Array.map(indices, fun(i) =
+                L.emit(l.b, ObjectGet(box, L.fieldRef(object, i)), had.slots[i]))
+        }
+        None -> {
+            let _ = stop(l, "a value of " + Ssa.layoutName(layout)
+                            + " held in one register")
+            Array.map(indices, fun(i) = zero(l, layout.slots[i]))
+        }
+    }
+}
+
+-- What a memory position holds of `v`: `v` itself, unless it is a value of
+-- several slots, which is held as a pointer to an object of its slots. A
+-- boxed value is its box, and a value in slots is boxed here.
+fun stored(l : Lower, v : Value) -> Value = match multiOf(l, v) {
+    None -> v
+    Some(Boxed(_, box)) -> box
+    Some(Slots(layout, values)) -> {
+        let made = L.emit(l.b, ObjectNew(0, -1, Rt.layout(layout.slots), values, 0),
+                          Ssa.traced(Ptr))
+        -- Named as building the value it holds, which is what memory holds of
+        -- it.
+        let what = match Map.get(l.held.types, Ssa.valueId(v)) {
+            Some(ty) -> match Ty.prune(ty) {
+                TTuple(_) -> "a tuple"
+                t -> match Ty.spine(t) {
+                    (TCon(c), _) -> "a value with " + Ty.shortName(c.name)
+                    _ -> "a value of " + Ty.show(t)
+                }
+            }
+            None -> "a value of " + Ssa.layoutName(layout)
+        }
+        Map.put(l.func.reasons, Ssa.valueId(made), "builds " + what)
+        made
+    }
+}
+
+-- What memory positions written together hold of `values`: `stored` of each,
+-- with one box for a value that appears more than once, as `(x, x)` does.
+fun storedAll(l : Lower, values : Array Value) -> Array Value {
+    let out = Array.map(values, fun(v) = v)
+    for var i = 0; i < len(values); i = i + 1 {
+        if Option.isSome(multiOf(l, values[i])) {
+            -- An earlier field of the same value, already boxed, or a box now.
+            var j = 0
+            while j < i && values[j] != values[i] { j = j + 1 }
+            out[i] = if j < i { out[j] } else { stored(l, values[i]) }
+        }
+    }
+    out
+}
+
+-- `v`, the value of an expression whose type is held at `layout`, as every
+-- value of that layout is carried: a marker if it has several slots. A value
+-- of such a type in one register is its box, as a load from memory, a call's
+-- result or a closure's parameter gives it.
+fun adopted(l : Lower, ty : Ty.Type, layout : Ssa.Layout, v : Value) -> Value {
+    if !isMulti(layout) || Option.isSome(l.stopped) { return v }
+    let marker = if Option.isSome(multiOf(l, v)) { v }
+        else if Ssa.repOf(l.func, v) != Ssa.traced(Ptr) {
+            return stop(l, "a value of " + Ssa.layoutName(layout) + " held at "
+                           + show(Ssa.repOf(l.func, v)))
+        } else { newMulti(l, Boxed(layout, v)) }
+    if !Map.contains(l.held.types, Ssa.valueId(marker)) {
+        Map.put(l.held.types, Ssa.valueId(marker), ty)
+    }
+    marker
+}
+
+-- The parameters a block takes a value of `layout` in, as one value: one
+-- parameter per slot if it has several.
+fun paramsFor(l : Lower, block : BlockId, layout : Ssa.Layout) -> Value {
+    if !isMulti(layout) { return L.param(l.b, block, Layout.storedRep(layout)) }
+    let ps = Array.map(layout.slots, L.param(l.b, block, _))
+    newMulti(l, Slots(layout, ps))
+}
+
+-- The parameters of the join `target` for `params`, as one value each. A
+-- parameter of several slots whose uses in `body`, which is lowered towards
+-- `dest`, need its box takes the box,
+-- by the rule a function's parameter does (`boxParameters`): a value read from
+-- memory and passed through the join is then not taken apart and boxed again.
+fun joinParams(l : Lower, target : BlockId, params : Array CParam, body : Core,
+               dest : Dest) -> Vec Value {
+    let returned = match dest {
+        ToReturn -> True
+        ToBlock(_) -> False
+    }
+    let boxed = Array.map(params, fun(p) {
+        if !isMulti(heldOf(l, p.ty)) { return False }
+        let a = Uses { decls = l.decls, layouts = l.layouts, sigs = l.sigs,
+                       names = Set.new(), boxed = False, spread = Map.new() }
+        Set.add(a.names, p.name)
+        usesIn(a, body, returned)
+        a.boxed
+    })
+    Map.put(l.held.boxedJoins, blockIndex(target), boxed)
+    let entered = []
+    for var i = 0; i < len(params); i = i + 1 {
+        let layout = heldOf(l, params[i].ty)
+        Vec.push(entered, if boxed[i] {
+            fromStored(l, layout, L.param(l.b, target, Ssa.traced(Ptr)))
+        } else { paramsFor(l, target, layout) })
+    }
+    entered
+}
+
+fun blockIndex(b : BlockId) -> Int = match b { BlockId(n) -> n }
+
+-- The arguments a jump passes `values` to `target` in: a value of several
+-- slots as its slots, or as its box where `target` takes it boxed, each
+-- coerced to its parameter.
+fun argsFor(l : Lower, target : BlockId, values : Array Value) -> Vec Value {
+    let params = Ssa.blockAt(l.func, target).params
+    let boxed = Map.getOr(l.held.boxedJoins, blockIndex(target), [])
+    let out = []
+    for var i = 0; i < len(values); i = i + 1 {
+        let v = values[i]
+        match multiOf(l, v) {
+            Some(m) -> if i < len(boxed) && boxed[i] { Vec.push(out, stored(l, v)) }
+                       else { for x in slotsOf(l, v, multiLayout(m)) { Vec.push(out, x) } }
+            None -> Vec.push(out, v)
+        }
+    }
+    if len(out) != len(params) {
+        let _ = stop(l, "a jump with " + Int.toString(len(out)) + " values to a "
+                        + "block of " + Int.toString(len(params)) + " parameters")
+        return []
+    }
+    let passed = []
+    for var i = 0; i < len(out); i = i + 1 {
+        Vec.push(passed, coerce(l, out[i], Ssa.repOf(l.func, params[i])))
+    }
+    passed
+}
 
 -- -- lowering -----------------------------------------------------------------------
 
@@ -271,24 +529,112 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
                            initial = initializerName, early = Giblets.initializerName,
                            definitions = Vec.sort(definitions) }
     internNullaries(module_, init)
+    adaptClosures(module_, sigs)
     (module_, skipped)
 }
 
--- Empty objects have no fields to mutate and the language has no physical
--- equality, so one per (kind, tag) can be shared. Done in the IR, so that the
--- emitter sees ordinary rooted global loads rather than inventing its own
--- interning.
-fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
-    let objects : Map String (Int, Int) = Map.new()
+-- Point every closure over a top-level function that takes a parameter in
+-- several registers at an adapter of the closure convention, which takes that
+-- parameter boxed, as every caller of a closure passes it (`closureCall`), and
+-- calls the function with its slots. One adapter per such function, made only
+-- where a closure over it is.
+fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
+    let made = Map.new()
     for f in m.functions {
         for block in f.blocks {
             for inst in block.insts {
                 match inst.op {
-                    ObjectNew(kind, tag, _, fields, _) -> if len(fields) == 0 {
+                    ClosureNew(name, None) -> match Map.get(sigs, name) {
+                        Some(sig) -> if Iterator.any(sig.params, fun(reps) = len(reps) > 1) {
+                            let symbol = name + "%boxed"
+                            if !Map.contains(made, name) {
+                                Map.put(made, name, adapter(name, symbol, sig))
+                            }
+                            inst.op = ClosureNew(symbol, None)
+                        }
+                        None -> {}
+                    }
+                    _ -> {}
+                }
+            }
+        }
+    }
+    if len(made) == 0 { return }
+    let adapters = Array.map(Array.sort(Map.keys(made)), fun(name) = made[name])
+    m.functions = Array.append(m.functions, adapters)
+}
+
+-- The adapter `symbol` for the function `name` of signature `sig`.
+fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
+    let f = Ssa.newFunc(symbol, sig.result)
+    let b = L.builder(f, BlockId(0))
+    L.into(b, L.block(b))
+    Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
+    let args = [L.emit(b, ConstInt(0), Ssa.traced(Ptr))]
+    for reps in sig.params {
+        if len(reps) == 1 {
+            let v = Ssa.freshValue(f, reps[0])
+            Vec.push(f.params, v)
+            Vec.push(args, v)
+        } else {
+            let box = Ssa.freshValue(f, Ssa.traced(Ptr))
+            Vec.push(f.params, box)
+            let object = Rt.layout(reps)
+            for var k = 0; k < len(reps); k = k + 1 {
+                Vec.push(args, L.emit(b, ObjectGet(box, L.fieldRef(object, k)), reps[k]))
+            }
+        }
+    }
+    let result = L.emit(b, Call(Direct(name), Vec.toArray(args)), sig.result)
+    L.terminate(b, Ret(result))
+    f
+}
+
+-- Empty objects have no fields to mutate and the language has no physical
+-- equality, so one per (kind, tag) can be shared. So can a tuple whose fields
+-- are all constants, a box of a value of several slots among them, such as
+-- `None` of an `Option Int` returned boxed: neither is written after it is
+-- built. Done in the IR, so that the emitter sees ordinary rooted global loads
+-- rather than inventing its own interning.
+--
+-- Not the tuples of a giblet module, which run before the globals here exist,
+-- and which are refused if they allocate at all.
+fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
+    let objects : Map String (Int, Int, Rt.Layout, Array Op) = Map.new()
+    let giblets = Giblets.gibletModules()
+    for f in m.functions {
+        let shared = !Set.contains(giblets, moduleOf(f.name))
+            && f.name != Giblets.initializerName
+        -- The constant each value is, where one is.
+        let constants = Map.new()
+        for block in f.blocks {
+            for inst in block.insts {
+                match inst.op {
+                    ConstInt(_) -> Map.put(constants, Ssa.valueId(inst.result), inst.op)
+                    ConstFloat(_) -> Map.put(constants, Ssa.valueId(inst.result), inst.op)
+                    _ -> {}
+                }
+            }
+        }
+        for block in f.blocks {
+            for inst in block.insts {
+                match inst.op {
+                    ObjectNew(kind, tag, layout, fields, mutable) -> if len(fields) == 0 {
                         let name = "%nullary." + Int.toString(kind) + "."
                                    + Int.toString(tag)
-                        Map.put(objects, name, (kind, tag))
+                        Map.put(objects, name, (kind, tag, layout, []))
                         inst.op = GlobalLoad(name)
+                    } else if shared && kind == 0 && tag == -1 && mutable == 0 {
+                        match constantsOf(constants, fields) {
+                            Some(ops) -> {
+                                let name = "%box." + String.join(Array.map(layout.reps, fun(r) =
+                                               Int.toString(Rt.layoutCode(r))), "")
+                                           + "." + String.join(Array.map(ops, constantName), ".")
+                                Map.put(objects, name, (kind, tag, layout, ops))
+                                inst.op = GlobalLoad(name)
+                            }
+                            None -> {}
+                        }
                     }
                     _ -> {}
                 }
@@ -302,8 +648,10 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let start = L.block(b)
     L.into(b, start)
     for (name, shape) in objects {
+        let (kind, tag, layout, ops) = shape
         Vec.push(m.globals, (name, Ssa.traced(Ptr)))
-        let made = L.emit(b, ObjectNew(shape.0, shape.1, Rt.layout([]), [], 0), Ssa.traced(Ptr))
+        let values = Array.init(len(ops), fun(i) = L.emit(b, ops[i], layout.reps[i]))
+        let made = L.emit(b, ObjectNew(kind, tag, layout, values, 0), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
     L.terminate(b, Jump(init.entry, []))
@@ -314,6 +662,29 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     init.blocks = ordered.blocks
     init.entry = ordered.entry
 }
+
+-- The module a function's symbol belongs to: what precedes its `#`.
+fun moduleOf(symbol : String) -> String = match String.splitOnce(symbol, "#") {
+    Some((module_, _)) -> module_
+    None -> symbol
+}
+
+-- The constants `fields` are, if every one is one.
+fun constantsOf(constants : Map Int Op, fields : Array Value) -> Option (Array Op) {
+    let out = []
+    for v in fields { Vec.push(out, Map.get(constants, Ssa.valueId(v))?) }
+    Some(Vec.toArray(out))
+}
+
+-- A constant as a global's name spells it: digits, and letters for the rest.
+fun constantName(op : Op) -> String = match op {
+    ConstInt(n) -> signed(n)
+    ConstFloat(x) -> "f" + signed(Float.bits(x))
+    _ -> "x"
+}
+
+-- A negative `n` is `m` and its complement, which is not negative.
+fun signed(n : Int) -> String = if n < 0 { "m" + Int.toString(Int.not(n)) } else { Int.toString(n) }
 
 -- Where each global's value is kept, and at what representation.
 --
@@ -358,8 +729,183 @@ fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
             None -> {}
         }
     }
+    boxParameters(program, decls, out)
     markDiverging(program, out)
     out
+}
+
+-- Pass a parameter of several slots boxed, as one pointer, to a function
+-- whose body needs its box: one that stores it, returns it, or passes it on
+-- where a box is wanted. Its callers hold such a value boxed often, having read
+-- it from memory, and then pass the pointer they have, where in slots the
+-- callee would box it again. A parameter the body only takes apart keeps its
+-- slots, so nothing is boxed or loaded for it at all.
+--
+-- Each signature starts with every parameter in slots, and a round moves to a
+-- box each one some use now needs boxed. Passing a parameter on to one that
+-- became boxed is such a use, so this runs until a round moves none. It only
+-- ever moves parameters one way, so it stops.
+fun boxParameters(program : CProgram, decls : DeclTable,
+                  sigs : Map String Signature) -> Unit {
+    -- Per binding, the `spread` its rounds share.
+    let spread = Map.new()
+    var changed = True
+    while changed {
+        changed = False
+        for bind in program.binds {
+            let sig = match Map.get(sigs, bind.name) {
+                Some(found) -> found
+                None -> continue
+            }
+            let shape = match spine(bind.value) {
+                Some(found) -> found
+                None -> continue
+            }
+            let (params, body) = shape
+            let a = Uses { decls = decls, layouts = bind.layouts, sigs = sigs,
+                           names = Set.new(), boxed = False,
+                           spread = Map.getOr(spread, bind.name, Map.new()) }
+            Map.put(spread, bind.name, a.spread)
+            for var i = 0; i < len(params) && i < len(sig.params); i = i + 1 {
+                if len(sig.params[i]) > 1 {
+                    a.names = Set.new()
+                    a.boxed = False
+                    Set.add(a.names, params[i].name)
+                    usesIn(a, body, True)
+                    if a.boxed {
+                        sig.params[i] = [Ssa.traced(Ptr)]
+                        changed = True
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- What `usesIn` is looking for: a use of any of `names`, the parameter and
+-- what a `let` renames it to, where a box of it is wanted.
+type Uses = Uses {
+    decls   : DeclTable,
+    layouts : Map String Ssa.Layout,
+    sigs    : Map String Signature,
+    var names : Set.Set String,
+    var boxed : Bool,
+    -- `spreads` of each type asked about, by its `Ty.typeKey`.
+    spread  : Map String Bool,
+}
+
+-- Look for a use in `e`, which is somewhere a box of its value is wanted if
+-- `boxed`. A position of several slots that takes them apart, binds them or
+-- passes them on in slots wants no box; memory, a closure's argument and a
+-- function's result do.
+fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
+    if a.boxed { return }
+    match e.kind {
+        CVar(n) -> if boxed && Set.contains(a.names, n) { a.boxed = True }
+        CTyApp(inner, _) -> usesIn(a, inner, boxed)
+        CTyLam(_, inner) -> usesIn(a, inner, boxed)
+        CLet(n, _, bound, body, _) -> {
+            usesIn(a, bound, False)
+            let renames = match bound.kind {
+                CVar(m) -> Set.contains(a.names, m)
+                _ -> False
+            }
+            -- Names are not unique, so a `let` of another value hides the
+            -- parameter's name in its body.
+            let had = Set.contains(a.names, n)
+            if renames { Set.add(a.names, n) } else { discard(Set.remove(a.names, n)) }
+            usesIn(a, body, boxed)
+            if had { Set.add(a.names, n) } else { discard(Set.remove(a.names, n)) }
+        }
+        CIf(c, then_, otherwise) -> {
+            usesIn(a, c, False)
+            usesIn(a, then_, boxed)
+            match otherwise {
+                Some(o) -> usesIn(a, o, boxed)
+                None -> {}
+            }
+        }
+        CMatch(scrutinee, alts) -> {
+            usesIn(a, scrutinee, False)
+            for alt in alts { hiding(a, Core.altVars(alt.alt), fun() = usesIn(a, alt.body, boxed)) }
+        }
+        CJoin(_, params, body, rest, _) -> {
+            hiding(a, Array.map(params, _.name), fun() = usesIn(a, body, boxed))
+            usesIn(a, rest, boxed)
+        }
+        CJump(_, args) -> for x in args { usesIn(a, x, False) }
+        CProject(target, _) -> usesIn(a, target, False)
+        CTuple(elems) -> {
+            let spread = spreads(a, e.ty)
+            for x in elems { usesIn(a, x, !spread) }
+        }
+        CApp(fn, args) -> match erased(fn).kind {
+            -- A newtype's value is its payload, wanted wherever it is.
+            CCon(_) -> {
+                let wanted = if Option.isSome(Decls.erasedPayload(a.decls, e.ty)) { boxed }
+                             else { !spreads(a, e.ty) }
+                for x in args { usesIn(a, x, wanted) }
+            }
+            CVar(name) -> match Map.get(a.sigs, name) {
+                Some(sig) -> if len(sig.params) == len(args) {
+                    for var i = 0; i < len(args); i = i + 1 {
+                        usesIn(a, args[i], len(sig.params[i]) == 1)
+                    }
+                } else {
+                    for x in args { usesIn(a, x, True) }
+                }
+                None -> for x in args { usesIn(a, x, True) }
+            }
+            _ -> {
+                usesIn(a, fn, False)
+                for x in args { usesIn(a, x, True) }
+            }
+        }
+        -- A lambda's result is boxed, and what it captures is held in slots.
+        CLam(params, body, _) -> hiding(a, Array.map(params, _.name), fun() = usesIn(a, body, True))
+        _ -> discard(Core.mapKind(e.kind, Mapper {
+            expr = fun(x) = {
+                usesIn(a, x, True)
+                x
+            },
+            type_ = fun(t) = t,
+            bind = fun(b) = {
+                usesIn(a, b.value, True)
+                b
+            },
+        }))
+    }
+}
+
+-- `walk()`, with `names` not standing for the parameter while it runs.
+fun hiding[Iterator c, Item c ~ String](a : Uses, names : c, walk : fun() -> Unit) -> Unit {
+    let hidden = []
+    for n in names {
+        if Set.contains(a.names, n) {
+            discard(Set.remove(a.names, n))
+            Vec.push(hidden, n)
+        }
+    }
+    walk()
+    for n in hidden { Set.add(a.names, n) }
+}
+
+-- Whether a value of `ty` is held in several slots, so a component of it is
+-- spliced into them rather than boxed.
+fun spreads(a : Uses, ty : Ty.Type) -> Bool {
+    if !Layout.unfolds(a.decls, ty) { return False }
+    let key = Ty.typeKey(ty)
+    match Map.get(a.spread, key) {
+        Some(found) -> found
+        None -> {
+            let found = match Layout.layoutOf(a.decls, ty, a.layouts) {
+                Some(layout) -> isMulti(layout)
+                None -> False
+            }
+            Map.put(a.spread, key, found)
+            found
+        }
+    }
 }
 
 -- Set `diverges` on every function whose body never returns, to the least
@@ -441,7 +987,7 @@ fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
         Some((_, inner)) -> inner
         None -> bind.value
     }
-    let reps = Array.map(params, \repIn(decls, bind.layouts, _.ty))
+    let reps = Array.map(params, fun(p) = passedIn(layoutIn(decls, bind.layouts, p.ty)))
     -- From the binding's own type rather than from the body: a body that
     -- always diverges is typed bottom, and a caller reads the signature.
     let result = match Ty.prune(resultType(bind.ty)) {
@@ -511,11 +1057,17 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     let entry = L.block(l.b)
     L.into(l.b, entry)
     for var i = 0; i < len(params); i = i + 1 {
-        let held = if i < len(sig.params) { sig.params[i] }
-                   else { repOf(l, params[i].ty) }
-        let v = Ssa.freshValue(f, held)
-        Vec.push(f.params, v)
-        Map.put(l.env, params[i].name, v)
+        let layout = heldOf(l, params[i].ty)
+        let reps = if i < len(sig.params) { sig.params[i] } else { passedIn(layout) }
+        let vs = Array.map(reps, fun(r) {
+            let v = Ssa.freshValue(f, r)
+            Vec.push(f.params, v)
+            v
+        })
+        let bound = if !isMulti(layout) { vs[0] }
+            else if len(vs) == 1 { fromStored(l, layout, vs[0]) }
+            else { fromSlots(l, layout, vs) }
+        Map.put(l.env, params[i].name, bound)
     }
     prepareLocals(l, body)
     lower(l, body, ToReturn)
@@ -547,6 +1099,8 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
     shared = shared, stopped = None, overLimit = False, flatRefs = Set.new(), flatRecords = Set.new(),
     localRefs = Map.new(), localObjects = Map.new(),
     nextSlot = 0,
+    held = Held { multis = Map.new(), types = Map.new(), layouts = Map.new(),
+                  flats = Map.new(), boxedJoins = Map.new() },
 }
 
 -- A binding's value as parameters and a body, with type abstraction erased.
@@ -650,7 +1204,8 @@ fun localBinding(l : Lower, name : String, bound : Core) -> Value {
             Map.put(l.localObjects, Ssa.valueId(marker), slots)
             return marker
         }
-        CApp(fn, args) -> if Set.contains(l.flatRecords, name) && builds(l, fn) {
+        CApp(fn, args) -> if Set.contains(l.flatRecords, name) && builds(l, fn)
+                && Option.isNone(flatHere(l, bound.ty)) {
             let slots = Array.map(args, fun(inner) = localSlot(l, value(l, inner)))
             let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
             Map.put(l.localObjects, Ssa.valueId(marker), slots)
@@ -673,7 +1228,8 @@ fun isMarker(l : Lower, v : Value) -> Bool =
     Map.contains(l.localRefs, Ssa.valueId(v))
         || Map.contains(l.localObjects, Ssa.valueId(v))
 
-fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
+fun localSlot(l : Lower, held : Value) -> (Int, Rep) {
+    let v = stored(l, held)
     let slot = l.nextSlot
     l.nextSlot = slot + 1
     L.effect(l.b, SlotStore(slot, v))
@@ -741,10 +1297,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
         -- whole IR is shaped for.
         CJoin(name, params, body, rest, recursive) -> {
             let target = L.block(l.b)
-            let entered : Vec Value = []
-            for p in params {
-                Vec.push(entered, L.param(l.b, target, repOf(l, p.ty)))
-            }
+            let entered = joinParams(l, target, params, body, dest)
             -- Join names are no more unique than term names are, and for the
             -- same reason: inlining copies bodies, so a function inlined into
             -- itself has two joins called `loop`. An unscoped map sends the
@@ -773,14 +1326,8 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
         CJump(name, args) -> {
             let supplied = Array.map(args, fun(a) = value(l, a))
             match Map.get(l.joins, name) {
-                Some(target) -> {
-                    let passed : Vec Value = []
-                    for var i = 0; i < len(supplied); i = i + 1 {
-                        Vec.push(passed,
-                                   coerce(l, supplied[i], wanted(l, target, i)))
-                    }
-                    L.terminate(l.b, Jump(target, passed))
-                }
+                Some(target) ->
+                    L.terminate(l.b, Jump(target, argsFor(l, target, supplied)))
                 None -> {
                     let _ = stop(l, "a jump to an unknown join")
                 }
@@ -817,11 +1364,11 @@ fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Dest) 
         -- An existential arm's copy is lowered under the layouts it names for
         -- the constants it opens.
         let outer = l.layouts
-        l.layouts = openedLayoutsFor(alts[i].alt, outer)
+        setLayouts(l, openedLayoutsFor(alts[i].alt, outer))
         testArm(l, alts[i].alt, whole, ty, success, failure)
         L.into(l.b, success)
         lower(l, alts[i].body, dest)
-        l.layouts = outer
+        setLayouts(l, outer)
         restore(l, was)
         test = failure
     }
@@ -896,6 +1443,16 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
                 default = None
             }
         }
+        Spread(f) -> {
+            for var i = 0; i < len(tested); i = i + 1 {
+                let key = Option.unwrapOr(Array.indexOf(f.names, conOf(tested[i].alt)), -1)
+                if !Set.contains(keyed, key) {
+                    Set.add(keyed, key)
+                    Vec.push(cases, (key, blocks[i]))
+                }
+            }
+            if len(keyed) == len(f.names) { default = None }
+        }
         Indices(all) -> {
             for var i = 0; i < len(tested); i = i + 1 {
                 let key = Option.unwrapOr(Array.indexOf(all, conOf(tested[i].alt)), -1)
@@ -934,6 +1491,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
     }
     let discriminant = match shape {
         Tags(_) -> L.emit(l.b, ObjectTag(whole), Ssa.untraced(I32))
+        Spread(f) -> flatTag(l, whole, f)
         _ -> whole
     }
     L.terminate(l.b, decide(l, discriminant, cases, default))
@@ -970,7 +1528,13 @@ fun caseFor(cases : Vec (Int, BlockId), default : Option BlockId,
 -- What a switch reads: an ordinary sum's tag, every one of which its type
 -- names; an enumeration's value, which is its index among those names; a
 -- one-word compact sum's word; or the value of an integer or character.
-type SwitchShape = Tags(Array String) | Indices(Array String) | Words(Compact) | Literals
+type SwitchShape
+    = Tags(Array String)
+    | Indices(Array String)
+    | Words(Compact)
+    | Literals
+    -- A flat sum's tag slot, which holds the constructor's index.
+    | Spread(Layout.Flat)
 
 fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
                 tested : Vec CAlt) -> Option SwitchShape {
@@ -1008,7 +1572,11 @@ fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
                 return Some(Indices(variants))
             }
             match compactAt(l, first, ty) {
-                Some(c) -> Some(Words(c))
+                Some(c) -> return Some(Words(c))
+                None -> {}
+            }
+            match flatHere(l, ty) {
+                Some(f) -> Some(Spread(f))
                 None -> Some(Tags(variants))
             }
         }
@@ -1038,6 +1606,8 @@ fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Typ
             Words(c) -> if Option.isNone(Vec.indexOf(c.nullaries, name)) {
                 compactPayload(l, c, binders, whole, ty)
             }
+            Spread(f) -> bindFlat(l, whole, f,
+                                  Option.unwrapOr(Array.indexOf(f.names, name), -1), binders)
             _ -> match Decls.conFieldTypes(l.decls, ty, name) {
                 Some(types) -> destructure(l, whole, layoutOf(l, types), positions(binders, types, 0))
                 None -> stop1(l, "the fields of '" + name + "' at " + Ty.show(ty))
@@ -1082,7 +1652,10 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
                 TTuple(ts) -> ts
                 _ -> return stop1(l, "a tuple pattern at " + Ty.show(ty))
             }
-            destructure(l, v, layoutOf(l, types), positions(binders, types, 0))
+            match flatHere(l, ty) {
+                Some(f) -> bindFlat(l, v, f, 0, binders)
+                None -> destructure(l, v, layoutOf(l, types), positions(binders, types, 0))
+            }
             L.terminate(l.b, Jump(success, []))
         }
         ACon(name, binders, Some(o)) -> opened(l, name, binders, o, v, ty, success, failure)
@@ -1115,6 +1688,24 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
                 }
                 None -> {}
             }
+            match flatHere(l, ty) {
+                Some(f) -> {
+                    let k = if len(f.names) == 0 { 0 } else {
+                        let k = Option.unwrapOr(Array.indexOf(f.names, name), -1)
+                        let tag = flatTag(l, v, f)
+                        let want = enumValue(l, k, f.slots[0])
+                        let test = L.emit(l.b, Cmp(Eq, tag, want), Ssa.untraced(I1))
+                        let contents = L.block(l.b)
+                        L.terminate(l.b, Branch(test, contents, failure))
+                        L.into(l.b, contents)
+                        k
+                    }
+                    bindFlat(l, v, f, k, binders)
+                    L.terminate(l.b, Jump(success, []))
+                    return
+                }
+                None -> {}
+            }
             let types = match Decls.conFieldTypes(l.decls, ty, name) {
                 Some(ts) -> ts
                 None -> return stop1(l, "the fields of '" + name + "' at " + Ty.show(ty))
@@ -1130,6 +1721,32 @@ fun bindTo(l : Lower, binder : Option String, v : Value) -> Unit = match binder 
     Some(name) -> Map.put(l.env, name, v)
     None -> {}
 }
+
+-- Bind the fields an arm binds of `v`, a value of a flat type built with its
+-- `k`th constructor, from the slots `f` puts them in. A field nobody binds is
+-- not read.
+fun bindFlat(l : Lower, v : Value, f : Layout.Flat, k : Int,
+             binders : Array (Option String)) -> Unit {
+    if k < 0 || k >= len(f.fields) {
+        return stop1(l, "a constructor not among the flat type's")
+    }
+    let whole = Ssa.Layout { slots = f.slots }
+    let fields = f.fields[k]
+    for var i = 0; i < len(binders) && i < len(fields); i = i + 1 {
+        match binders[i] {
+            Some(name) -> {
+                let at = fields[i]
+                let layout = Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) }
+                Map.put(l.env, name, fromSlots(l, layout, slotsAt(l, v, whole, at)))
+            }
+            None -> {}
+        }
+    }
+}
+
+-- The tag slot of `v`, a value of the flat sum `f`.
+fun flatTag(l : Lower, v : Value, f : Layout.Flat) -> Value =
+    slotsAt(l, v, Ssa.Layout { slots = f.slots }, [0])[0]
 
 -- The fields an arm binds: each one's slot in the object, counting from
 -- `first`, its name, and its type.
@@ -1247,8 +1864,9 @@ fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
 fun destructure(l : Lower, object : Value, layout : Rt.Layout,
                 fields : Vec (Int, String, Ty.Type)) -> Unit {
     for (index, name, fieldTy) in fields {
-        Map.put(l.env, name, L.emit(l.b, ObjectGet(object, L.fieldRef(layout, index)),
-                                    repOf(l, fieldTy)))
+        let held = heldOf(l, fieldTy)
+        Map.put(l.env, name, fromStored(l, held,
+            L.emit(l.b, ObjectGet(object, L.fieldRef(layout, index)), Layout.storedRep(held))))
     }
 }
 
@@ -1322,17 +1940,7 @@ fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
 
 fun finish(l : Lower, v : Value, dest : Dest) -> Unit = match dest {
     ToReturn -> L.terminate(l.b, Ret(coerce(l, v, l.func.result)))
-    ToBlock(target) -> {
-        let want = wanted(l, target, 0)
-        L.terminate(l.b, Jump(target, [coerce(l, v, want)]))
-    }
-}
-
--- The representation a block's nth parameter is held at.
-fun wanted(l : Lower, target : BlockId, index : Int) -> Rep {
-    let params = Ssa.blockAt(l.func, target).params
-    if index < len(params) { Ssa.repOf(l.func, params[index]) }
-    else { Ssa.traced(Ptr) }
+    ToBlock(target) -> L.terminate(l.b, Jump(target, argsFor(l, target, [v])))
 }
 
 -- -- representation boundaries -------------------------------------------------------
@@ -1352,6 +1960,11 @@ fun wanted(l : Lower, target : BlockId, index : Int) -> Rep {
 -- to convert, and a unit where a word is wanted is a diverging expression's,
 -- which nothing reads.
 fun coerce(l : Lower, v : Value, want : Rep) -> Value {
+    -- A value of several slots is wanted in one register only as its box.
+    if Option.isSome(multiOf(l, v)) {
+        if want == Ssa.traced(Ptr) { return stored(l, v) }
+        return stop(l, "a value of several slots wanted at " + show(want))
+    }
     let have = Ssa.repOf(l.func, v)
     if have == want { return v }
     if want.class_ == Unit { return L.emit(l.b, ConstUnit, want) }
@@ -1376,17 +1989,18 @@ fun value(l : Lower, e : Core) -> Value {
         Some(_) -> { l.b.span = e.span }
         None -> {}
     }
-    let v = valueHere(l, e)
+    let held = if Option.isSome(l.stopped) { Ssa.Layout { slots = [] } } else { heldOf(l, e.ty) }
+    let v = adopted(l, e.ty, held, valueHere(l, e, held))
     l.b.span = outer
     v
 }
 
-fun valueHere(l : Lower, e : Core) -> Value {
+fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     match l.stopped {
         Some(_) -> return Ssa.freshValue(l.func, Ssa.untraced(Unit))
         None -> {}
     }
-    let rep = repOf(l, e.ty)
+    let rep = Layout.storedRep(held)
     match e.kind {
         CUnit -> L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         CLit(lit) -> literal(l, lit, rep)
@@ -1419,7 +2033,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
         -- global may carry a bare variable there.
         CTyApp(_, _) -> value(l, Core.mkCore(e.ty, e.span, erased(e).kind))
         CTyLam(_, _) -> value(l, Core.mkCore(e.ty, e.span, erased(e).kind))
-        CRef(inner) -> L.emit(l.b, CellNew(value(l, inner)), Ssa.traced(Ptr))
+        CRef(inner) -> L.emit(l.b, CellNew(stored(l, value(l, inner))), Ssa.traced(Ptr))
         CDeref(inner) -> match globalRef(l, inner) {
             Some((name, held)) -> coerce(l, L.emit(l.b, GlobalLoad(name), held), rep)
             None -> match localRef(l, inner) {
@@ -1433,9 +2047,20 @@ fun valueHere(l : Lower, e : Core) -> Value {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
             None -> match Decls.erasedPayload(l.decls, target.ty) {
             Some(_) -> value(l, target)
+            None -> match flatHere(l, target.ty) {
+            Some(f) -> {
+                let whole = value(l, target)
+                if index >= len(f.fields[0]) {
+                    return stop(l, "a projection of field " + Int.toString(index)
+                                   + " from " + Ty.show(target.ty))
+                }
+                let at = f.fields[0][index]
+                fromSlots(l, held, slotsAt(l, whole, Ssa.Layout { slots = f.slots }, at))
+            }
             None -> match projected(l, target.ty, index) {
                 Some(field) -> L.emit(l.b, ObjectGet(value(l, target), field), rep)
                 None -> Ssa.freshValue(l.func, rep)
+            }
             }
             }
         }
@@ -1460,7 +2085,10 @@ fun valueHere(l : Lower, e : Core) -> Value {
             store(l, target, x)
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
-        CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple", fieldsOf("this tuple"))
+        CTuple(elems) -> match flatHere(l, e.ty) {
+            Some(f) -> flatValue(l, f, held, 0, elems)
+            None -> aggregate(l, elems, 0, -1, 0, "builds a tuple", fieldsOf("this tuple"))
+        }
         CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
         CCon(name) -> match Ty.prune(e.ty) {
@@ -1492,11 +2120,20 @@ fun valueHere(l : Lower, e : Core) -> Value {
         -- and the fix is a per-primitive adapter that `primitive` would
         -- generate.
         CPrim(p) -> stop(l, "the primitive '" + Prims.name(p) + "' used as a value")
-        CIf(_, _, _) -> control(l, e, rep)
-        CMatch(_, _) -> control(l, e, rep)
-        CLet(_, _, _, _, _) -> control(l, e, rep)
-        CJoin(_, _, _, _, _) -> control(l, e, rep)
-        CLetRec(_, _) -> control(l, e, rep)
+        CIf(_, _, _) -> control(l, e, held)
+        CMatch(_, _) -> control(l, e, held)
+        -- One path in and one out, so no block is needed for its value, and
+        -- a value of several slots keeps the form its body gave it.
+        CLet(name, _, bound, body, _) -> {
+            let v = localBinding(l, name, bound)
+            let was = saving(l, [name])
+            Map.put(l.env, name, v)
+            let result = value(l, body)
+            restore(l, was)
+            result
+        }
+        CJoin(_, _, _, _, _) -> control(l, e, held)
+        CLetRec(_, _) -> control(l, e, held)
         _ -> stop(l, formOf(e))
     }
 }
@@ -1506,16 +2143,21 @@ fun valueHere(l : Lower, e : Core) -> Value {
 -- `lower` already sends a value to a destination; this makes a destination out
 -- of a fresh block and reads the value back out of its parameter. Nothing else
 -- is needed, and in particular no slot: the parameter is the value.
-fun control(l : Lower, e : Core, rep : Rep) -> Value {
+fun control(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     let merge = L.block(l.b)
-    let arrived = L.param(l.b, merge, rep)
+    let arrived = paramsFor(l, merge, held)
     lower(l, e, ToBlock(merge))
     L.into(l.b, merge)
     arrived
 }
 
 -- The shapes of assignment target.
-fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
+fun store(l : Lower, target : Core, assigned : Value) -> Unit {
+    let x = stored(l, assigned)
+    storeStored(l, target, x)
+}
+
+fun storeStored(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     CIndex(array, index) -> {
         let a = value(l, array)
         L.effect(l.b, ArraySet(a, value(l, index), x, Checked))
@@ -1551,8 +2193,9 @@ fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
 }
 
 -- An object of these fields, laid out from their representations.
-fun built(l : Lower, kind : Int, tag : Int, values : Array Value, mutable : Int,
+fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Int,
           what : String) -> Value {
+    let values = storedAll(l, fields)
     let layout = Rt.layout(Array.map(values, Ssa.repOf(l.func, _)))
     if !countable(l, layout) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let made = L.emit(l.b, ObjectNew(kind, tag, layout, values, mutable), Ssa.traced(Ptr))
@@ -1653,14 +2296,14 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 -- `extra` is `CLetRec`'s siblings: names that will hold closures but do not
 -- yet, so their representation is known before their value is.
 fun capturesOf(l : Lower, body : Core,
-               extra : Set.Set String) -> Vec (String, Rep) {
+               extra : Set.Set String) -> Vec (String, Ssa.Layout) {
     let mentioned = Core.namesOf(body)
     let out = []
     -- Sorted, so that what a lowering produces does not depend on a map's
     -- iteration order.
     for name in Array.sort(Set.elements(mentioned)) {
         if Set.contains(extra, name) {
-            Vec.push(out, (name, Ssa.traced(Ptr)))
+            Vec.push(out, (name, Ssa.Layout { slots = [Ssa.traced(Ptr)] }))
         } else {
             match Map.get(l.env, name) {
                 -- A flattened `var` or record is a marker, never emitted, and
@@ -1674,9 +2317,11 @@ fun capturesOf(l : Lower, body : Core,
                 -- A `unit` holds nothing and `lift` makes the child its own;
                 -- the 63-slot cap makes that worth doing rather than merely
                 -- tidy.
-                Some(v) -> if !isMarker(l, v)
-                        && Ssa.repOf(l.func, v).class_ != Unit {
-                    Vec.push(out, (name, Ssa.repOf(l.func, v)))
+                Some(v) -> match multiOf(l, v) {
+                    Some(m) -> Vec.push(out, (name, multiLayout(m)))
+                    None -> if !isMarker(l, v) && Ssa.repOf(l.func, v).class_ != Unit {
+                        Vec.push(out, (name, Ssa.Layout { slots = [Ssa.repOf(l.func, v)] }))
+                    }
                 }
                 None -> {}
             }
@@ -1693,11 +2338,16 @@ fun capturesOf(l : Lower, body : Core,
 -- array and the counter, which is what makes the symbols unique and the
 -- results collectable.
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
-         captures : Vec (String, Rep)) -> Option String {
-    if len(captures) > 63 {
-        refuse(l, "a nested function captures " + Int.toString(len(captures))
-                  + " variables, and a function can capture at most 63; pass some "
-                  + "as parameters, or group them in a record")
+         captures : Vec (String, Ssa.Layout)) -> Option String {
+    -- A capture of several slots takes a word for each (`environmentLayout`).
+    let words = len(environmentReps(captures))
+    if words > 63 {
+        let counted = if words == len(captures) { Int.toString(words) + " variables" }
+            else { Int.toString(len(captures)) + " variables in " + Int.toString(words)
+                   + " words" }
+        refuse(l, "a nested function captures " + counted + ", and a function can "
+                  + "capture at most 63; pass some as parameters, or group them in a "
+                  + "record")
         return None
     }
     -- `%` is the compiler's own character: the lexer will not accept one in an
@@ -1707,7 +2357,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     let symbol = l.func.name + "%lambda" + Int.toString(l.shared.next)
     l.shared.next = l.shared.next + 1
     -- The body and every call site derive the signature from its types.
-    let g = Ssa.newFunc(symbol, repIn(l.decls, l.layouts, result))
+    let g = Ssa.newFunc(symbol, repOf(l, result))
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
     -- forgot them would read its captures at the boxed width.
@@ -1718,6 +2368,11 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- `Turkey.Core`'s note on tail positions says exactly this.
     let child = newLower(l.decls, g, l.globals, l.globalRefs, l.tags, l.sigs,
                          l.layouts, l.lifted, l.shared)
+    -- Under the parent's layouts as they are now, so the child can share what
+    -- the parent has found out about them. Either one that changes its
+    -- layouts starts afresh (`setLayouts`) rather than emptying these.
+    child.held.layouts = l.held.layouts
+    child.held.flats = l.held.flats
     let entry = L.block(child.b)
     L.into(child.b, entry)
     -- The environment comes first and is not the closure: the callee is handed
@@ -1739,18 +2394,23 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     }
     let taken : Vec Value = []
     for p in params {
-        let v = Ssa.freshValue(g, repIn(l.decls, l.layouts, p.ty))
+        let v = Ssa.freshValue(g, repOf(l, p.ty))
         Vec.push(g.params, v)
         Vec.push(taken, v)
     }
     let held = environmentLayout(captures)
+    let firsts = environmentFirsts(captures)
     for var i = 0; i < len(captures); i = i + 1 {
-        let (name, r) = captures[i]
-        Map.put(child.env, name, L.emit(child.b, ObjectGet(environment, L.fieldRef(held, i)), r))
+        let (name, layout) = captures[i]
+        let values = Array.init(len(layout.slots), fun(k) =
+            L.emit(child.b, ObjectGet(environment, L.fieldRef(held, firsts[i] + k)),
+                   layout.slots[k]))
+        Map.put(child.env, name, fromSlots(child, layout, values))
     }
     for var i = 0; i < len(params) && i < len(taken); i = i + 1 {
-        let held = repIn(l.decls, l.layouts, params[i].ty)
-        Map.put(child.env, params[i].name, coerce(child, taken[i], held))
+        let layout = heldOf(l, params[i].ty)
+        Map.put(child.env, params[i].name,
+                fromStored(child, layout, coerce(child, taken[i], Layout.storedRep(layout))))
     }
     prepareLocals(child, body)
     lower(child, body, ToReturn)
@@ -1773,38 +2433,55 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
 -- `later` is a sibling in a recursive group that does not exist yet: its slot
 -- starts null, which the collector skips, and is marked mutable, and `letrec`
 -- writes it with `ClosureCapture` once every shell exists.
-fun closureShell(l : Lower, symbol : String, captures : Vec (String, Rep),
+fun closureShell(l : Lower, symbol : String, captures : Vec (String, Ssa.Layout),
                  later : Set.Set String) -> Value {
     if len(captures) == 0 {
         return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
     var mutable = 0
-    let values = Array.init(len(captures), fun(i) {
-        let (name, r) = captures[i]
+    let values = []
+    for (name, layout) in captures {
         if Set.contains(later, name) {
-            mutable = mutable | 1 << i
-            storageZero(l, r)
+            mutable = mutable | 1 << len(values)
+            for r in layout.slots { Vec.push(values, storageZero(l, r)) }
         } else {
             match Map.get(l.env, name) {
-                Some(v) -> v
+                Some(v) -> for x in slotsOf(l, v, layout) { Vec.push(values, x) }
                 None -> {
-                    let zero = storageZero(l, r)
+                    for r in layout.slots { Vec.push(values, storageZero(l, r)) }
                     let _ = stop(l, "a capture of the unbound name '" + name + "'")
-                    zero
                 }
             }
         }
-    })
-    let environment = L.emit(l.b, ObjectNew(4, -1, environmentLayout(captures), values,
-                                            mutable),
+    }
+    let environment = L.emit(l.b, ObjectNew(4, -1, environmentLayout(captures),
+                                            Vec.toArray(values), mutable),
                              Ssa.traced(Ptr))
     L.emit(l.b, ClosureNew(symbol, Some(environment)), Ssa.traced(Ptr))
 }
 
 -- The layout of an environment holding these captures, which the parent
--- builds and writes and the child reads.
-fun environmentLayout(captures : Vec (String, Rep)) -> Rt.Layout =
-    Rt.layout(Array.map(captures, _.1))
+-- builds and writes and the child reads. A capture of several slots takes one
+-- field per slot: the environment is private to the two of them, so it need
+-- not hold the capture boxed, as a memory position every copy reads must.
+fun environmentLayout(captures : Vec (String, Ssa.Layout)) -> Rt.Layout =
+    Rt.layout(environmentReps(captures))
+
+fun environmentReps(captures : Vec (String, Ssa.Layout)) -> Array Rep {
+    let out = []
+    for (_, layout) in captures { for r in layout.slots { Vec.push(out, r) } }
+    Vec.toArray(out)
+}
+
+-- The environment field each capture's first slot is in.
+fun environmentFirsts(captures : Vec (String, Ssa.Layout)) -> Array Int {
+    var at = 0
+    Array.map(Vec.toArray(captures), fun(c) {
+        let first = at
+        at = at + len(c.1.slots)
+        first
+    })
+}
 
 -- A lambda in value position: lift it, then build the closure.
 fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> Value {
@@ -1867,11 +2544,12 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
     }
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
         let (_, _, captures) = plans[i]
+        let firsts = environmentFirsts(captures)
         for var j = 0; j < len(captures); j = j + 1 {
             if Set.contains(siblings, captures[j].0) {
                 match Map.get(l.env, captures[j].0) {
                     Some(v) -> L.effect(l.b, ClosureCapture(shells[i],
-                                                            L.fieldRef(environmentLayout(captures), j), v))
+                        L.fieldRef(environmentLayout(captures), firsts[j]), v))
                     None -> {}
                 }
             }
@@ -1884,7 +2562,7 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
 fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     let (_, args) = Ty.spine(Ty.prune(e.ty))
     let element = if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
-    let values = Array.map(elems, fun(x) = value(l, x))
+    let values = storedAll(l, Array.map(elems, value(l, _)))
     let length = L.emit(l.b, ConstInt(len(values)), Ssa.untraced(I64))
     -- `ArrayNew` wants something to fill with. An array with elements is
     -- filled over anyway, and an empty one has no slot to read, so a zero of
@@ -1928,11 +2606,13 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
 --   a wrap around 0, and a word at or above `Heap.immediates` that is not a
 --   wrap is always the bare payload.
 --
--- At any other payload representation -- `Option Int` -- the sum is an ordinary
--- object, nullaries interned, as a sum that is not compact is. So which of the
--- two a value is depends on the instantiation, and building or testing one needs
--- the payload's layout: `Turkey.Layout` gives every body that does so at a type
--- variable a layout-keyed copy, and `compactAt` refuses where there is none.
+-- A payload of several slots counts as a traced pointer, since memory holds it
+-- as its box. At any other payload representation -- `Option Int` -- the sum is
+-- flat, or an ordinary object if it is too wide, as a sum that is not compact
+-- is. So which a value is depends on the instantiation, and building or
+-- testing one needs the payload's layout: `Turkey.Layout` gives every body
+-- that does so at a type variable a layout-keyed copy, and `compactAt` refuses
+-- where there is none.
 --
 -- The word is a function of the *value*, not of the code building it, so ground
 -- code, a type-specialized copy and a layout-shared copy agree without knowing
@@ -1980,6 +2660,12 @@ fun plain(l : Lower, ty : Ty.Type) -> Bool {
     let t = Ty.prune(ty)
     match Decls.erasedPayload(l.decls, t) {
         Some(payload) -> return plain(l, payload)
+        None -> {}
+    }
+    -- A flat value of several slots is held as its box, an ordinary object. One
+    -- of one slot is that slot, which may be anything.
+    match flatHere(l, t) {
+        Some(f) -> return len(f.slots) > 1
         None -> {}
     }
     match t {
@@ -2085,7 +2771,7 @@ fun compactPayload(l : Lower, c : Compact, binders : Array (Option String), v : 
         L.into(l.b, after)
         got
     }
-    Map.put(l.env, bound, inner)
+    Map.put(l.env, bound, fromStored(l, heldOf(l, field), inner))
 }
 
 -- An enumeration's constructor: its index, at the width its type is held at
@@ -2111,6 +2797,19 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
         Some(c) -> return compactValue(l, c, name, e.ty, args)
         None -> {}
     }
+    match flatHere(l, e.ty) {
+        Some(f) -> {
+            let k = if len(f.names) == 0 { 0 } else {
+                match Array.indexOf(f.names, name) {
+                    Some(i) -> i
+                    None -> return stop(l, "the constructor '" + name + "' is not one of "
+                                           + Ty.show(e.ty) + "'s")
+                }
+            }
+            return flatValue(l, f, heldOf(l, e.ty), k, args)
+        }
+        None -> {}
+    }
     match Map.get(l.tags, name) {
         Some(tag) -> match Decls.con(l.decls, name) {
             Some(info) -> if len(info.exists) > 0 {
@@ -2126,6 +2825,27 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
+}
+
+-- A value of a flat type built with its `k`th constructor (the only one, for a
+-- product) from `args`: each field's slots where `Layout.Flat` puts them, a
+-- sum's tag, and zero in every slot this constructor does not use.
+fun flatValue(l : Lower, f : Layout.Flat, held : Ssa.Layout, k : Int,
+              args : Array Core) -> Value {
+    let fields = f.fields[k]
+    if len(args) != len(fields) {
+        return stop(l, "a flat value of " + Int.toString(len(fields)) + " fields built from "
+                       + Int.toString(len(args)))
+    }
+    let values = Array.map(args, value(l, _))
+    let slots = Array.map(f.slots, storageZero(l, _))
+    if len(f.names) > 0 { slots[0] = enumValue(l, k, f.slots[0]) }
+    for var i = 0; i < len(fields); i = i + 1 {
+        let at = fields[i]
+        let parts = slotsOf(l, values[i], Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) })
+        for var j = 0; j < len(at); j = j + 1 { slots[at[j]] = parts[j] }
+    }
+    fromSlots(l, held, slots)
 }
 
 -- The refusal of a tuple or constructed value too wide to build, in the
@@ -2273,13 +2993,20 @@ fun definesSymbol(decls : DeclTable, symbol : String) -> Bool {
 -- own scheme would pass a value at a layout the copy does not hold it at.
 fun directCall(l : Lower, name : String, sig : Signature, args : Array Core,
                rep : Rep) -> Value {
-    let supplied = Array.init(len(args) + 1, fun(i) =
-        if i == 0 {
-            L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))
+    let supplied = [L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))]
+    for var i = 0; i < len(args); i = i + 1 {
+        let v = value(l, args[i])
+        let reps = sig.params[i]
+        if len(reps) == 1 {
+            Vec.push(supplied, coerce(l, v, reps[0]))
         } else {
-            coerce(l, value(l, args[i - 1]), sig.params[i - 1])
-        })
-    coerce(l, L.emit(l.b, Call(Direct(name), supplied), sig.result), rep)
+            let slots = slotsOf(l, v, Ssa.Layout { slots = reps })
+            for var k = 0; k < len(slots); k = k + 1 {
+                Vec.push(supplied, coerce(l, slots[k], reps[k]))
+            }
+        }
+    }
+    coerce(l, L.emit(l.b, Call(Direct(name), Vec.toArray(supplied)), sig.result), rep)
 }
 
 -- The closure operand's function type defines the ABI at every call site.
@@ -2292,9 +3019,9 @@ fun closureCall(l : Lower, fn : Core, args : Array Core, rep : Rep) -> Value {
     match Ty.prune(fn.ty) {
         TFun(params, result) -> {
             let supplied = Array.init(len(args), fun(i) =
-                coerce(l, value(l, args[i]), repIn(l.decls, l.layouts, params[i])))
+                coerce(l, value(l, args[i]), repOf(l, params[i])))
             coerce(l, L.emit(l.b, Call(Indirect(closure), supplied),
-                repIn(l.decls, l.layouts, result)), rep)
+                repOf(l, result)), rep)
         }
         _ -> stop(l, "a closure without a function type")
     }
@@ -2614,7 +3341,8 @@ fun operands(l : Lower, p : Prims.Prim, args : Array Core, arity : Int) -> Array
         oops(Prims.name(p) + " applied to " + Int.toString(len(args))
              + " arguments, not " + Int.toString(arity))
     }
-    Array.map(args, value(l, _))
+    -- A primitive takes a value of several slots only where it stores it.
+    Array.map(args, fun(a) = stored(l, value(l, a)))
 }
 
 fun noOperands(l : Lower, p : Prims.Prim, args : Array Core) -> Unit {
@@ -2788,7 +3516,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
     for a in actions {
         let owner = ownerOf(a)
         -- The owning binding's layouts, restored per action.
-        l.layouts = Map.getOr(layouts, owner, Map.new())
+        setLayouts(l, Map.getOr(layouts, owner, Map.new()))
         l.env = Map.new()
         l.joins = Map.new()
         l.stopped = None
@@ -2824,12 +3552,12 @@ fun ownerOf(a : Action) -> String = match a {
 -- One action, appended to wherever the cursor is.
 --
 -- A `Store` and a `Field` both have to *compute* a value, and computing one
--- may branch -- a global initialized by a `match` is ordinary. So the value
--- goes to a block whose parameter receives it, and the store happens there,
--- which leaves the cursor in the right place for the action after it. This is
--- the same destination passing the rest of the module uses, and it is why the
--- initializer needs no reverse chaining: the successor is simply where the
--- cursor ends up.
+-- may branch -- a global initialized by a `match` is ordinary. `value` sends
+-- such a value to a block whose parameters receive it (`control`), and the
+-- store happens there, which leaves the cursor in the right place for the
+-- action after it. This is the same destination passing the rest of the module
+-- uses, and it is why the initializer needs no reverse chaining: the successor
+-- is simply where the cursor ends up.
 --
 -- Each value is analysed for escaping locals on its own, as a function's body
 -- is, so a `var` in an initializer -- or in whatever was inlined into one --
@@ -2853,22 +3581,15 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         L.effect(l.b, GlobalStore(name, made))
     }
     Field(name, index, v) -> {
-        let after = L.block(l.b)
-        let arrived = L.param(l.b, after, repOf(l, v.ty))
         prepareLocals(l, v)
-        lower(l, v, ToBlock(after))
-        L.into(l.b, after)
+        let arrived = stored(l, value(l, v))
         let record = L.emit(l.b, GlobalLoad(name), Ssa.traced(Ptr))
         L.effect(l.b, ObjectSet(record, dictionarySlot(index), arrived))
     }
     Store(name, v) -> {
         let want = Map.getOr(held, name, Ssa.traced(Ptr))
-        let after = L.block(l.b)
-        let arrived = L.param(l.b, after, want)
         prepareLocals(l, v)
-        lower(l, v, ToBlock(after))
-        L.into(l.b, after)
-        L.effect(l.b, GlobalStore(name, arrived))
+        L.effect(l.b, GlobalStore(name, coerce(l, value(l, v), want)))
     }
 }
 
@@ -2876,3 +3597,5 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
 -- The lifted functions get the same treatment: a lambda's body has the same
 -- `match` fallthroughs its parent's does.
 fun pruneAll(fs : Vec (Ssa.Func Low)) -> Array (Ssa.Func Low) = Array.map(fs, Promote.run)
+
+fun discard(x : a) -> Unit = {}

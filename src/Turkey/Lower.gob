@@ -143,6 +143,9 @@ type Lowerer = Lowerer {
     -- rebuild one node around its operands.
     placeholders : Map Int Core,
     var counter  : Int,
+    -- How many top-level bindings each module has that the program never
+    -- named (`topName`).
+    tops         : Map String Int,
     -- Which constructors `Prim.targetOs` and `Prim.targetArch` stand for.
     target       : Target.Target,
     -- And the build primitives (`Turkey.Build`).
@@ -154,7 +157,7 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
                build : Build.Build) -> Lowerer = Lowerer {
     decls = decls, classes = classes, env = env, types = types, target = target,
     build = build,
-    rigid = Map.new(), placeholders = Map.new(), counter = 0,
+    rigid = Map.new(), placeholders = Map.new(), counter = 0, tops = Map.new(),
 }
 
 -- A binder this pass invents. `%` cannot start a source identifier.
@@ -162,6 +165,16 @@ fun freshName(l : Lowerer, hint : String) -> String {
     let n = l.counter
     l.counter = l.counter + 1
     "%" + hint + Int.toString(n)
+}
+
+-- A top-level binding of `owner` that the program never named. Numbered
+-- within `owner` rather than across the program, so that the name depends
+-- on nothing but the module: the REPL keeps an earlier input's values by
+-- name, from one program to the next, while the other modules change.
+fun topName(l : Lowerer, owner : String, hint : String) -> String {
+    let n = Map.getOr(l.tops, owner, 0)
+    Map.put(l.tops, owner, n + 1)
+    owner + "#%" + hint + Int.toString(n)
 }
 
 fun node(ty : Ty.Type, where : Option Span, k : CoreKind) -> Core =
@@ -218,7 +231,7 @@ fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
     -- binding nothing reads, which is what a `let` already means.
     SExpr(e) -> {
         let value = expr(l, e, scope)
-        [newBind(owner + "#" + freshName(l, "top"), value.ty, [], value,
+        [newBind(topName(l, owner, "top"), value.ty, [], value,
                  Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
@@ -284,7 +297,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         }
         _ -> {}
     }
-    let holder = owner + "#" + freshName(l, "bound")
+    let holder = topName(l, owner, "bound")
     let out = [newBind(holder, lowered.ty, [], lowered, Some(stmt.span))]
     for name in Vec.sort(patternVars(pat)) {
         let nty = nameType(l, name)

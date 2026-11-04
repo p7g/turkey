@@ -98,7 +98,7 @@ The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
 Run the compiler from the repository root, where it finds `lib/`. It has two
-commands. `build` writes the program to `-o`, in the format the file's
+commands that compile. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or
 `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
 object needs no assembler, only a linker. `check` compiles as far as the last stage that
@@ -108,6 +108,27 @@ rectangles.gob` shows the inferred types, and running the compiler with no
 arguments lists the stages. `build --timings` reports on standard error how
 long each phase took, how the backend's time is spread over functions, and how
 much of the optimizer's work could run in parallel.
+
+`build/stages/stage2 interpret rectangles.gob` runs a program without
+compiling it, passing any further arguments to the program. It interprets the
+compiler's intermediate form, Core, as lowering produces it, or as a later
+stage leaves it with `--after mono`, `reduce`, `joins` or `opt`; a program
+whose output differs between two stages points at the pass between them. It
+exits 98 for a program that calls C itself and 99 when it runs out of stack.
+The C functions and runtime it reaches run compiled, through
+`lib/Interpreter/Boundary.gob`, which `scripts/build.sh` checks against what
+`stage2 boundary src/Main.gob` generates from the library.
+
+`build/stages/stage2 repl` is an interactive top level on the same
+interpreter. It reads declarations, `import`s and expressions from standard
+input, one per line, or more while a bracket is open or a line ends in `=`.
+An expression is bound to `it` and printed with `show`, or its type is printed
+where it has no `Show`. A later declaration of a name shadows the earlier one,
+and what was written against the earlier one keeps it. A type error is
+reported and the session goes on; a panic ends it. Each input takes about
+0.6 s, since it checks the library and every earlier input again, twice: once
+in a child `check`, so that a rejected input does not end the session, and
+once to run it.
 
 A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
 per performance core -- every core on a Mac without performance levels; on

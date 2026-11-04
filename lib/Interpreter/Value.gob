@@ -1,0 +1,190 @@
+export (
+    Value(..), Closure(..), Abstraction(..), Cell(..), Handle(..), Env(..), TyEnv(..),
+    Reenter(..),
+    unit, false_, true_, bool, isTrue, string, text, int, fields,
+    stackLimit, beyond, coroutineBudget, callbackBudget, entryBudget,
+    saveErrno, savedErrno, clearErrno,
+)
+
+-- The values `Turkey.Interpret` computes with, and what reaches the host.
+--
+-- This module and `Interpreter.Prims` are library modules so that they can
+-- spell `Prim.*` and import the runtime's `Turkey.*` modules, which only the
+-- library may do. They import the compiler's own modules too (`Turkey.Core`,
+-- `Turkey.Types`), which resolve only when the entry is the compiler's: a
+-- program's entry directory is searched first, and the compiler's is `src/`.
+-- So nothing but the compiler can import them.
+--
+-- **Representation.** A scalar is held unboxed in its own variant. A type
+-- whose wrapper the backend erases (`Decls.newtypes`) is its payload here too,
+-- so a `String` is the byte array it wraps, and `Prim.castAs` between a
+-- wrapper and its payload is the identity it is in compiled code. Every other
+-- constructor is `VCon` with its index in declaration order, an enumeration's
+-- included: `Bool` is `VCon(0, [])` or `VCon(1, [])`.
+--
+-- **Arrays.** An array whose element type is `Int`, `Byte`, `Char`, `Float`,
+-- `Bool` or `Prim.Ptr` is a host array of that element, laid out as compiled
+-- code lays it out, so `Prim.elementAddress` of one is a real address that C
+-- may read and write. Every other array is a host array of `Value`.
+
+import Turkey.Core (Core, CParam)
+import Turkey.Prims as Prims
+import Turkey.Types as Ty
+import Turkey.Types (VarCell)
+import Turkey.Sys as Sys
+import Turkey.Workers as Workers
+
+type Value
+    = VUnit
+    | VInt(Int)
+    | VByte(Byte)
+    | VChar(Char)
+    | VFloat(Float)
+    | VPtr(Prim.Ptr)
+    -- A constructor's index and its fields, which a `var` field's assignment
+    -- writes in place.
+    | VCon(Int, Array Value)
+    -- An existential constructor: its index, its dictionaries then its
+    -- fields, and the ground types it packs, in the order it declares them.
+    | VPacked(Int, Array Value, Array Ty.Type)
+    | VTuple(Array Value)
+    | VFun(Closure)
+    | VAbstraction(Abstraction)
+    | VCell(Cell)
+    | VAtomic(Prim.Atomic)
+    | VInts(Prim.Array Int)
+    | VBytes(Prim.Array Byte)
+    | VChars(Prim.Array Char)
+    | VFloats(Prim.Array Float)
+    | VBools(Prim.Array Bool)
+    | VPtrs(Prim.Array Prim.Ptr)
+    | VValues(Prim.Array Value)
+    -- A host object interpreted code only hands back, such as a coroutine.
+    | VHandle(Handle)
+    -- A compiled function: a boundary entry, or one of the bindings the
+    -- interpreter supplies itself.
+    | VNative(String, fun(Array Value) -> Value)
+    -- A primitive or a constructor used as a function value rather than
+    -- applied where it is written.
+    | VPrimitive(Prims.Prim)
+    | VConstructor(String)
+    -- A jump on its way out to the join it names. It is never stored: only a
+    -- tail position yields one, and a join catches it.
+    | VJump(String, Array Value)
+
+-- A lambda, with the variables and types it closes over.
+type Closure = Closure {
+    params : Array CParam,
+    body   : Core,
+    env    : Option Env,
+    tys    : Option TyEnv,
+}
+
+-- A type abstraction: its body runs once per type application, under the
+-- types the application supplies.
+type Abstraction = Abstraction {
+    binders : Vec VarCell,
+    body    : Core,
+    env     : Option Env,
+    tys     : Option TyEnv,
+}
+
+-- A reference cell: what a `var` is.
+type Cell = Cell { var value : Value }
+
+type Handle = Handle[a](a)
+
+-- The local variables in scope, innermost first. `value` is assigned only
+-- while a recursive group is being bound, to close the knot.
+type Env = Env {
+    name      : String,
+    var value : Value,
+    next      : Option Env,
+}
+
+-- The types in scope, innermost first. A binding holds a type as it was
+-- written at the application that supplied it, with the environment it was
+-- written in: substituting is put off to the few places that need a ground
+-- type. `key` is a variable's id, or a rigid constant's uid negated.
+type TyEnv = TyEnv {
+    key   : Int,
+    ty    : Ty.Type,
+    scope : Option TyEnv,
+    next  : Option TyEnv,
+}
+
+-- How compiled code calls back into the interpreter: a function value, its
+-- arguments, and the stack budget the call may use below its own frame.
+type Reenter = Reenter { call : fun(Value, Array Value, Int) -> Value }
+
+let unit = VUnit
+let false_ = VCon(0, [])
+let true_ = VCon(1, [])
+
+fun bool(b : Bool) -> Value = if b { true_ } else { false_ }
+
+fun isTrue(v : Value) -> Bool = match v {
+    VCon(tag, _) -> tag == 1
+    _ -> Prim.error("internal error: a condition is not a Bool")
+}
+
+-- A host `String` as a value, sharing its bytes: a string is immutable.
+fun string(s : String) -> Value = VBytes(Prim.castAs(s))
+
+-- The host `String` a value holds.
+fun text(v : Value) -> String = match v {
+    VBytes(bytes) -> Prim.castAs(bytes)
+    _ -> Prim.error("internal error: not a string")
+}
+
+fun int(v : Value) -> Int = match v {
+    VInt(n) -> n
+    _ -> Prim.error("internal error: not an Int")
+}
+
+-- The fields of a constructed value or the elements of a tuple.
+fun fields(v : Value) -> Array Value = match v {
+    VCon(_, fs) -> fs
+    VPacked(_, fs, _) -> fs
+    VTuple(es) -> es
+    _ -> Prim.error("internal error: not a constructed value")
+}
+
+-- -- the stack ----------------------------------------------------------------------
+
+-- What an interpretation may use below the frame it starts at. The entry
+-- thread's stack is 512 MB (`Turkey.Entry`) and a coroutine's 1 MB
+-- (`Turkey.Coroutine`); each budget leaves room for the compiled frames a
+-- primitive or a boundary call adds below the last check. A callback the
+-- scheduler makes may run on a worker's own thread, whose stack is the
+-- system's default, so it gets the least.
+let entryBudget = 500 * 1048576
+let coroutineBudget = 768 * 1024
+let callbackBudget = 128 * 1024
+
+-- The lowest frame address an interpretation that starts here may reach.
+fun stackLimit(budget : Int) -> Int = Prim.ptrToInt(Prim.frameAddress()) - budget
+
+-- Whether the caller's frame is below `limit`. The stack grows down.
+fun beyond(limit : Int) -> Bool = Prim.ptrToInt(Prim.frameAddress()) < limit
+
+-- -- errno --------------------------------------------------------------------------
+
+-- Each worker's `errno` as the last boundary call into C left it. Saved
+-- straight after the call, because the interpreter allocates before the
+-- program can ask, and an allocation may reach C. Indexed by the worker
+-- running the call: a task that suspends between the call and the question
+-- may resume on another worker, which is no different from compiled code
+-- reading the thread's own `errno`.
+let errnoSlots : Prim.Array Int = Prim.arrayNew(64, 0)
+
+fun saveErrno() -> Unit = Prim.arraySet(errnoSlots, Workers.index(), Sys.errno())
+
+fun savedErrno() -> Int = Prim.arrayGet(errnoSlots, Workers.index())
+
+-- Clear both: the thread's, which the next call into C may leave alone, and
+-- the slot.
+fun clearErrno() -> Unit {
+    Sys.clearErrno()
+    Prim.arraySet(errnoSlots, Workers.index(), 0)
+}

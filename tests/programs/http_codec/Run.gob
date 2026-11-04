@@ -1,0 +1,103 @@
+export (
+    readRequest, readResponse, requestOutcome, responseOutcome, describeRequest, framingText,
+    statusOf, repeated, visible,
+)
+
+-- Reading heads through both stages, and printing what came out.
+
+import Net.HTTP (..)
+import Net.HTTP.Error (refusalStatus)
+import Net.HTTP.H1.Head as Head
+import Net.HTTP.H1.Head (RequestHead(..), ResponseHead(..), Framing(..), Persistence(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.H1.Input (Input, HeadBytes(..))
+import Net.HTTP.Headers as Headers
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Method as Method
+import Net.HTTP.Status as Status
+import System.IO (Read(..), IOError)
+
+-- Returns the next request head from `input`, through stage 1 then stage 2.
+fun readRequest[Read r](input : Input r, limits : Limits) -> Either (Either HTTPError (ReadError r)) (Option RequestHead) {
+    match Input.readHead(input, limits)? {
+        None -> Right(None)
+        Some(HeadBytes { bytes, from, to }) -> match Head.parseRequest(bytes, from, to, limits) {
+            Right(h) -> Right(Some(h))
+            Left(r) -> Left(Left(BadMessage(r)))
+        }
+    }
+}
+
+fun readResponse[Read r](input : Input r, limits : Limits, m : Method Unit)
+        -> Either (Either HTTPError (ReadError r)) (Option ResponseHead) {
+    match Input.readHead(input, limits)? {
+        None -> Right(None)
+        Some(HeadBytes { bytes, from, to }) -> match Head.parseResponse(bytes, from, to, limits, m) {
+            Right(h) -> Right(Some(h))
+            Left(r) -> Left(Left(BadMessage(r)))
+        }
+    }
+}
+
+-- Returns the status a refusal is answered with, or what else went wrong.
+fun statusOf(e : Either HTTPError IOError) -> String = match e {
+    Left(BadMessage(r)) -> show(Status.code(refusalStatus(r)))
+    Left(Truncated) -> "truncated"
+    Left(other) -> show(other)
+    Right(io) -> show(io)
+}
+
+fun framingText(f : Framing) -> String = match f {
+    NoBody -> "no body"
+    ContentLength(n) -> "length " + show(n)
+    Chunked -> "chunked"
+    UntilClose -> "until close"
+}
+
+-- A request head's outcome in a few words.
+fun requestOutcome(result : Either (Either HTTPError IOError) (Option RequestHead)) -> String = match result {
+    Left(e) -> statusOf(e)
+    Right(None) -> "end"
+    Right(Some(h)) -> {
+        var text = "ok " + framingText(h.framing) + ", " + show(Headers.size(h.headers)) + " fields"
+        if let Close = h.persistence { text = text + ", close" }
+        if h.expectContinue { text = text + ", expects 100" }
+        if len(h.upgrade) > 0 { text = text + ", upgrade " + show(h.upgrade) }
+        text
+    }
+}
+
+fun responseOutcome(result : Either (Either HTTPError IOError) (Option ResponseHead)) -> String = match result {
+    Left(e) -> statusOf(e)
+    Right(None) -> "end"
+    Right(Some(h)) -> {
+        var text = "ok " + show(Status.code(h.status)) + " " + framingText(h.framing) + ", "
+            + show(Headers.size(h.headers)) + " fields"
+        if let Close = h.persistence { text = text + ", close" }
+        if len(h.upgrade) > 0 { text = text + ", upgrade " + show(h.upgrade) }
+        text
+    }
+}
+
+-- Everything a request head holds, to compare two readings of one.
+fun describeRequest(h : RequestHead) -> String =
+    Method.name(h.method) + (if Option.isSome(Method.body(h.method)) { "(body)" } else { "" }) + " " + show(h.target.authority) + " "
+    + h.target.path + " " + show(h.target.query) + " [" + show(h.headers) + "] " + show(h.version) + " "
+    + show(h.framing) + " " + show(h.persistence) + " " + show(h.expectContinue) + " " + show(h.upgrade)
+
+fun repeated(text : String, n : Int) -> String {
+    var out = ""
+    for _ in Int.range(0, n) { out = out + text }
+    out
+}
+
+-- Returns `s` with its control bytes spelled out, so a printed message stays
+-- on one line.
+fun visible(s : String) -> String {
+    var out = s
+    for (raw, spelled) in [("\r", "\\r"), ("\n", "\\n"), ("\t", "\\t"), ("\u{0}", "\\0"), ("\u{7F}", "\\x7F"),
+                           ("\u{1}", "\\x01")] {
+        out = String.replace(out, raw, spelled)
+    }
+    out
+}

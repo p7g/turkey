@@ -1,0 +1,248 @@
+export (bodies, incoming, draining, decode)
+
+-- The body layers, each driven from an in-memory source that hands its
+-- bytes out in adversarial pieces: one at a time, split at every position,
+-- and in repeating patterns that cut CRLFs and chunk-size lines in two.
+
+import Net.HTTP (..)
+import Net.HTTP.H1.Body as Body
+import Net.HTTP.H1.Body (Drained(..))
+import Net.HTTP.H1.Head (Framing(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.Incoming as Incoming
+import Net.HTTP.Limits as Limits
+import Run (..)
+import System.IO as IO
+import System.IO (Read(..), IOError)
+import Wire (Source(..), source, oneByte, splitAt, sized)
+
+-- Returns what reading the body framed by `framing` from `src` gives: its
+-- bytes, its trailers and what was left after it, or the error, reading
+-- into a buffer of `room` bytes at a time.
+fun decode(src : Source, framing : Framing, limits : Limits, room : Int) -> String {
+    let input = Input.input(src, limits)
+    let b = Body.body(input, framing, limits)
+    let got = []
+    let buf = IO.buffer(room)
+    loop {
+        IO.clear(buf)
+        match readInto(b, buf) {
+            Left(e) -> return "error " + statusOf(e)
+            Right(0) -> break
+            Right(_) -> for x in IO.bytes(buf) { Vec.push(got, x) }
+        }
+    }
+    let rest = []
+    loop {
+        IO.clear(buf)
+        match Input.take(input, buf, room) {
+            Right(0) -> break
+            Right(_) -> for x in IO.bytes(buf) { Vec.push(rest, x) }
+            Left(_) -> break
+        }
+    }
+    let trailers = show(Body.trailers(b))
+    "\"" + visible(String.fromBytesLossy(Vec.toArray(got))) + "\""
+        + (if trailers == "" { "" }
+           else if String.byteLength(trailers) > 60 { ", " + show(String.byteLength(trailers)) + " bytes of trailers" }
+           else { ", trailers " + visible(trailers) })
+        + (if len(rest) == 0 { "" } else { ", then \"" + visible(String.fromBytesLossy(Vec.toArray(rest))) + "\"" })
+}
+
+-- Reads `text` framed by `framing` every adversarial way, and prints the one
+-- outcome they agree on, or each that disagrees.
+fun body(label : String, text : String, framing : Framing) = bodyWith(label, text, framing, Limits.defaults)
+
+fun bodyWith(label : String, text : String, framing : Framing, limits : Limits) {
+    let s = String.toBytes(text)
+    let expected = decode(sized(s, [len(s) + 1]), framing, limits, 4096)
+    var line = label + ": " + expected
+    let ways = [("by byte", oneByte(s)), ("in twos", sized(s, [2])), ("in threes", sized(s, [3, 1])),
+                ("1, 2, 5, 7", sized(s, [1, 2, 5, 7]))]
+    for (name, src) in ways {
+        let got = decode(src, framing, limits, 4096)
+        if got != expected { line = line + " DISAGREE " + name + ": " + got }
+    }
+    -- Split at every position, and read into a buffer of one byte and one of
+    -- seven, so each chunk is handed out in pieces too.
+    for var cut = 0; cut <= len(s); cut = cut + 1 {
+        for room in [1, 7] {
+            let got = decode(splitAt(s, cut), framing, limits, room)
+            if got != expected { line = line + " DISAGREE split at " + show(cut) + ": " + got }
+        }
+    }
+    print(line)
+}
+
+fun bodies() {
+    print("-- chunked bodies, read every way")
+    body("two chunks and trailers", "5\r\nhello\r\n6;ext=1\r\n world\r\n0\r\nX-T: v\r\nY:  w \r\n\r\nNEXT", Chunked)
+    body("no trailers", "3\r\nabc\r\n0\r\n\r\n", Chunked)
+    body("only the last chunk", "0\r\n\r\n", Chunked)
+    body("hex in either case", "A\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n", Chunked)
+    body("leading zeros", "0005\r\nhello\r\n000\r\n\r\n", Chunked)
+    body("extensions", "5;a;b=c;d=\"x y\" ; e = f\r\nhello\r\n0;last\r\n\r\n", Chunked)
+    body("a quoted pair", "5;a=\"q\\\"q\"\r\nhello\r\n0\r\n\r\n", Chunked)
+
+    print("-- chunked bodies: refused")
+    body("a plus sign", "+5\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("a minus sign", "-5\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("0x", "0x5\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("whitespace before the size", " 5\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("whitespace after the size", "5 \r\nhello\r\n0\r\n\r\n", Chunked)
+    body("no size", "\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("sixteen digits", "0000000000000005\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("seventeen digits", "00000000000000005\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("past the largest Int", "8000000000000000\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("the largest Int", "7fffffffffffffff\r\nhello\r\n", Chunked)
+    body("a bare LF after the size", "5\nhello\r\n0\r\n\r\n", Chunked)
+    body("a bare LF after the data", "5\r\nhello\n0\r\n\r\n", Chunked)
+    body("a bare CR after the data", "5\r\nhello\r0\r\n\r\n", Chunked)
+    body("no CRLF after the data", "5\r\nhelloX0\r\n\r\n", Chunked)
+    body("more data than the size", "5\r\nhello!\r\n0\r\n\r\n", Chunked)
+    body("an extension without a name", "5;=x\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("an extension without a value", "5;a=\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("an unterminated quoted value", "5;a=\"x\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("a NUL in an extension", "5;a\u{0}\r\nhello\r\n0\r\n\r\n", Chunked)
+    let limits = Limits.defaults
+    let padding = Limits.chunkLineBytes(limits) - String.byteLength("5;a=\r\n")
+    body("an extension at the line limit", "5;a=" + repeated("x", padding) + "\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("an extension one past it", "5;a=" + repeated("x", padding + 1) + "\r\nhello\r\n0\r\n\r\n", Chunked)
+    body("a trailer line with a bare LF", "0\r\nX: a\n\r\n", Chunked)
+    body("an obs-folded trailer", "0\r\nX: a\r\n b\r\n\r\n", Chunked)
+    body("a reserved trailer", "0\r\nContent-Length: 5\r\n\r\n", Chunked)
+    body("Host as a trailer", "0\r\nHost: a\r\n\r\n", Chunked)
+    let trailerPadding = Limits.trailerBytes(limits) - String.byteLength("X: \r\n")
+    body("trailers at the limit", "0\r\nX: " + repeated("t", trailerPadding) + "\r\n\r\n", Chunked)
+    body("trailers one past it", "0\r\nX: " + repeated("t", trailerPadding + 1) + "\r\n\r\n", Chunked)
+    body("many short trailers past it", "0\r\n" + repeated("X: y\r\n", 1000) + "\r\n", Chunked)
+    body("ended in the size line", "5", Chunked)
+    body("ended in the data", "5\r\nhel", Chunked)
+    body("ended before the CRLF", "5\r\nhello", Chunked)
+    body("ended in the trailers", "0\r\nX: a\r\n", Chunked)
+
+    print("-- Content-Length and the rest")
+    body("exact", "hello", ContentLength(5))
+    body("the next message after it", "helloGET / HTTP/1.1", ContentLength(5))
+    body("truncated", "hello", ContentLength(10))
+    body("empty", "", ContentLength(0))
+    body("nothing, with bytes after", "GET", NoBody)
+    body("until the stream ends", "all of it, \r\n0\r\n and more", UntilClose)
+}
+
+-- -- Incoming --------------------------------------------------------------------------
+
+-- Returns an `Incoming` over `text` framed by `framing`, whose first-read hook
+-- prints that it ran.
+fun arrived(text : String, framing : Framing) -> (Incoming, Source) {
+    let src = sized(String.toBytes(text), [3])
+    let b = Body.body(Input.input(src, Limits.defaults), framing, Limits.defaults)
+    Body.beforeFirstRead(b, fun() {
+        print("  (the hook ran, with " + show(src.at) + " bytes read)")
+        Right(())
+    })
+    (Body.incoming(b, fun(e) = fail(e)), src)
+}
+
+fun received(b : Incoming, atMost : Int) -> String = match (receive(b, atMost) : Either HTTPError IO.Buffer) {
+    Left(e) -> "error " + show(e)
+    Right(buf) -> "\"" + visible(String.fromBytesLossy(IO.bytes(buf))) + "\""
+}
+
+-- Reads all of `r`, a buffer of `room` bytes at a time.
+fun readAll(r : BodyRead, room : Int) -> String {
+    let got = []
+    let buf = IO.buffer(room)
+    loop {
+        IO.clear(buf)
+        match readInto(r, buf) {
+            Left(e) -> return "\"" + visible(String.fromBytesLossy(Vec.toArray(got))) + "\" then error "
+                              + show(e)
+            Right(0) -> break
+            Right(_) -> for x in IO.bytes(buf) { Vec.push(got, x) }
+        }
+    }
+    "\"" + visible(String.fromBytesLossy(Vec.toArray(got))) + "\""
+}
+
+fun incoming() {
+    print("-- Incoming")
+    let (a, _) = arrived("hello", ContentLength(5))
+    print("receive 5 of 5: " + received(a, 5))
+    let (b, src) = arrived("hello", ContentLength(5))
+    print("receive 4 of a declared 5: " + received(b, 4) + ", " + show(src.at) + " bytes read")
+    let (c, _) = arrived("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", Chunked)
+    print("receive 11 of chunked 11: " + received(c, 11))
+    let (d, _) = arrived("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", Chunked)
+    print("receive 10 of chunked 11: " + received(d, 10))
+    let (e, _) = arrived("hello", ContentLength(5))
+    print("receive twice: " + received(e, 5) + ", then " + received(e, 5))
+    let (f, _) = arrived("hello", ContentLength(5))
+    print("limited 5, two bytes at a time: " + readAll(limited(f, 5), 2))
+    let (g, _) = arrived("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", Chunked)
+    print("limited 7 of chunked 11, three bytes at a time: " + readAll(limited(g, 7), 3))
+    let (h, _) = arrived("5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n", Chunked)
+    print("unbounded: " + readAll(unbounded(h), 4096))
+    let (i, _) = arrived("hello", ContentLength(5))
+    let first = limited(i, 2)
+    print("limited after limited: " + readAll(limited(i, 100), 10) + ", the first still "
+          + readAll(first, 10))
+    let (j, _) = arrived("", ContentLength(0))
+    print("receive an empty body: " + received(j, 0))
+    let (k, _) = arrived("hel", ContentLength(5))
+    print("receive a truncated body: " + received(k, 5))
+
+    -- A hook that fails fails the read, and the body after it.
+    let src = sized(String.toBytes("hello"), [5])
+    let failing = Body.body(Input.input(src, Limits.defaults), ContentLength(5), Limits.defaults)
+    Body.beforeFirstRead(failing, fun() = Left(Truncated))
+    let l = Body.incoming(failing, fun(e) = fail(e))
+    print("a failing hook: " + received(l, 5) + ", " + show(src.at) + " bytes read")
+}
+
+-- -- draining --------------------------------------------------------------------------
+
+-- Returns what `drain` decides for the body framed by `framing` over `text`,
+-- after reading `first` bytes of it, and what is left for the next message.
+fun drained(text : String, framing : Framing, first : Int, limits : Limits) -> String {
+    let s = String.toBytes(text)
+    let src = sized(s, [64])
+    let input = Input.input(src, limits)
+    let b = Body.body(input, framing, limits)
+    if first > 0 {
+        let buf = IO.buffer(first)
+        if let Left(e) = readInto(b, buf) { return "error " + statusOf(e) }
+    }
+    match Body.drain(b) {
+        Left(e) -> "error " + statusOf(e)
+        Right(d) -> show(d) + ", " + show(Input.held(input) + len(s) - src.at) + " bytes after it"
+    }
+}
+
+fun draining() {
+    print("-- draining an unread body")
+    let d = Limits.defaults
+    let next = "GET / HTTP/1.1\r\n\r\n"
+    print("read to its end: " + drained("hello" + next, ContentLength(5), 5, d))
+    print("a short remainder: " + drained("hello" + next, ContentLength(5), 2, d))
+    print("unread, within the cap: " + drained(repeated("x", 1000) + next, ContentLength(1000), 0, d))
+    let cap = Limits.drainBytes(d)
+    print("at the cap: " + drained(repeated("x", cap) + next, ContentLength(cap), 0, d))
+    print("over the cap, closed without reading: "
+          + drained(repeated("x", 1000), ContentLength(cap + 1), 0, d))
+    let chunked = "3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n"
+    print("chunked, within the cap: " + drained(chunked + next, Chunked, 0, d))
+    let small = Limits.withDrainBytes(d, 4)
+    print("chunked, past a 4-byte cap: " + drained(chunked + next, Chunked, 0, small))
+    print("chunked and malformed: " + drained("3\r\nabc\n" + next, Chunked, 0, d))
+    print("until the stream closes: " + drained("all", UntilClose, 0, d))
+    print("no body: " + drained(next, NoBody, 0, d))
+
+    -- A client that sent `Expect: 100-continue` waits for it before sending
+    -- the body, so a body whose hook never ran is not waited for.
+    let s = String.toBytes("hello" + next)
+    let input = Input.input(sized(s, [64]), d)
+    let b = Body.body(input, ContentLength(5), d)
+    Body.beforeFirstRead(b, fun() = Right(()))
+    print("waiting for 100 Continue: " + show(Body.drain(b)))
+}

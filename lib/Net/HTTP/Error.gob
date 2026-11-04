@@ -1,4 +1,4 @@
-export (HTTPError(..), HeaderError(..), FromHTTP(..))
+export (HTTPError(..), HeaderError(..), Refusal(..), FromHTTP(..), refusalStatus)
 
 -- What goes wrong in HTTP, and how a caller's own error type takes it in.
 --
@@ -13,10 +13,88 @@ export (HTTPError(..), HeaderError(..), FromHTTP(..))
 --     instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
 
 import URL (URLError)
+import Net.HTTP.Status (Status(BadRequest, URITooLong, RequestHeaderFieldsTooLarge, NotImplemented, HTTPVersionNotSupported, ExpectationFailed))
 import Net.HTTP.Syntax as Syntax
 
 -- Every failure the HTTP library reports.
-type HTTPError = BadURL(URLError) | BadHeader(HeaderError)
+--
+-- * `BadURL`, `BadHeader`: a value a program made, or asked for, is not one.
+-- * `BadMessage`: the peer sent a message that breaks HTTP/1's rules. Its
+--   framing can no longer be trusted, so the connection is closed after it.
+-- * `TooLarge`: a body is longer than the limit its reader asked for.
+-- * `Truncated`: a body ended before its framing said it would.
+-- * `Overrun`: a program wrote more body than the length it declared.
+-- * `Consumed`: a body was asked for a second time, after an earlier
+--   `receive`, `limited` or `unbounded` took it.
+-- * `Transport`: the connection underneath failed: its own error, held as a
+--   `SomeError` so that any stream's errors fit and `cast` recovers them.
+--
+-- Every one of these but `BadURL`, `BadHeader` and `TooLarge` leaves a
+-- message half sent or half read, and the connection is never reused after
+-- one.
+type HTTPError =
+    BadURL(URLError)
+    | BadHeader(HeaderError)
+    | BadMessage(Refusal)
+    | TooLarge
+    | Truncated
+    | Overrun
+    | Consumed
+    | Transport(SomeError)
+
+-- Why the HTTP/1 codec refused a message, by the status a server answers it
+-- with (`refusalStatus`). A client that refuses a response closes the
+-- connection and answers nothing.
+--
+-- * `Malformed` (400): a byte the grammar does not allow, ambiguous framing,
+--   or a `Host` that is missing, repeated or disagrees with the target.
+-- * `LineTooLong` (414): a request line or status line over its limit.
+-- * `HeadTooLarge` (431): a head, or trailers, over the byte limit, or more
+--   fields than the limit.
+-- * `UnknownCoding` (501): a transfer coding other than `chunked`.
+-- * `UnsupportedVersion` (505): a version other than HTTP/1.0 and HTTP/1.1.
+-- * `UnmetExpectation` (417): an `Expect` other than `100-continue`.
+type Refusal =
+    Malformed
+    | LineTooLong
+    | HeadTooLarge
+    | UnknownCoding
+    | UnsupportedVersion
+    | UnmetExpectation
+
+instance Eq Refusal {
+    fun eq(a, b) = refusalStatus(a) == refusalStatus(b)
+}
+
+instance Show Refusal {
+    fun show(r) = match r {
+        Malformed -> "Malformed"
+        LineTooLong -> "LineTooLong"
+        HeadTooLarge -> "HeadTooLarge"
+        UnknownCoding -> "UnknownCoding"
+        UnsupportedVersion -> "UnsupportedVersion"
+        UnmetExpectation -> "UnmetExpectation"
+    }
+}
+
+-- Returns the status a server answers a refused request with.
+fun refusalStatus(r : Refusal) -> Status = match r {
+    Malformed -> BadRequest
+    LineTooLong -> URITooLong
+    HeadTooLarge -> RequestHeaderFieldsTooLarge
+    UnknownCoding -> NotImplemented
+    UnsupportedVersion -> HTTPVersionNotSupported
+    UnmetExpectation -> ExpectationFailed
+}
+
+fun describe(r : Refusal) -> String = match r {
+    Malformed -> "the message is malformed"
+    LineTooLong -> "the first line is too long"
+    HeadTooLarge -> "the header fields are too large"
+    UnknownCoding -> "the transfer coding is not supported"
+    UnsupportedVersion -> "the HTTP version is not supported"
+    UnmetExpectation -> "the expectation cannot be met"
+}
 
 -- Why a header field was refused. A field's name is quoted as text, escaped
 -- by `show`, since a refused name may be the bytes that made it dangerous. A
@@ -42,6 +120,12 @@ instance Show HTTPError {
     fun show(e) = match e {
         BadURL(u) -> show(u)
         BadHeader(h) -> show(h)
+        BadMessage(r) -> describe(r)
+        TooLarge -> "the body is larger than its limit"
+        Truncated -> "the message ended before its framing said it would"
+        Overrun -> "more body was written than the length declared"
+        Consumed -> "the body was already taken"
+        Transport(e) -> show(e)
     }
 }
 

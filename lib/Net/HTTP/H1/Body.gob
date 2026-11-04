@@ -1,0 +1,331 @@
+export (
+    Body, Drained(..),
+    body, beforeFirstRead, declaredLength, isEnded, trailers, drain, incoming,
+)
+
+-- An HTTP/1 message body as a `Read`: the bytes after a head, decoded from
+-- their framing, ending exactly where the message ends, so that what follows
+-- is the next message.
+--
+-- * `ContentLength(n)`: `n` bytes. A stream that ends first is `Truncated`.
+-- * `Chunked`: chunks, each `chunk-size [ chunk-ext ] CRLF data CRLF`, then
+--   the last chunk and the trailers.
+-- * `UntilClose`: everything until the stream ends.
+-- * `NoBody`: nothing.
+--
+-- **A chunk is read as strictly as a head.** The size is hex digits only (no
+-- `+`, `-`, `0x` or whitespace), at most 16 of them, and overflow-checked.
+-- The whole chunk-size line, extensions included, is at most
+-- `chunkLineBytes`, which bounds the bytes a peer can send that no reader
+-- looks at. Extensions must be well-formed, though their meaning is ignored.
+-- The data must be followed by exactly CRLF. The trailers are field lines as
+-- a head's are, at most `trailerBytes` of them, and may not hold a reserved
+-- field. Any of these refused is a `BadMessage`, and the body fails from
+-- then on: its framing is lost, so the connection cannot be reused.
+--
+-- **The limit a program reads under** is `Net.HTTP.Incoming`'s, applied to
+-- what this reader returns; `incoming` wraps a body as one.
+
+import Net.HTTP.Error (HTTPError(..), Refusal(..))
+import Net.HTTP.H1.Classes (..)
+import Net.HTTP.H1.Head (Framing(..), fieldLine, isReservedName)
+import Net.HTTP.H1.Input (Input, CodecError, Line(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.Incoming as Incoming (Incoming)
+import Net.HTTP.Limits as Limits (Limits)
+import System.IO as IO
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.HTTPField (HeaderName(..))
+import Turkey.HTTPField as Field
+import Turkey.ReadWrite (Read(..), needsRoom)
+
+type Body r = Body {
+    input : Input r,
+    limits : Limits,
+    declared : Option Int,
+    var state : State,
+    var hook : Option (fun() -> Either HTTPError Unit),
+    var trailerFields : Headers,
+}
+
+-- Where a body's reader is. A chunked body moves through `ChunkSize`,
+-- `ChunkData` and `ChunkEnd` once per chunk, and its last chunk's trailers
+-- are read before it is `Ended`.
+type State =
+    Remaining(Int)
+    | ChunkSize
+    | ChunkData(Int)
+    | ChunkEnd
+    | ToEnd
+    | Ended
+    | Failed(HTTPError)
+
+-- Returns the body framed by `framing` that starts at what `input` holds.
+fun body(input : Input r, framing : Framing, limits : Limits) -> Body r {
+    let (state, declared) = match framing {
+        ContentLength(0) -> (Ended, Some(0))
+        ContentLength(n) -> (Remaining(n), Some(n))
+        Chunked -> (ChunkSize, None)
+        UntilClose -> (ToEnd, None)
+        NoBody -> (Ended, Some(0))
+    }
+    Body { input, limits, declared, state, hook = None, trailerFields = Headers.empty }
+}
+
+-- Makes `hook` run once, just before the body's first read from the stream,
+-- and fail that read if it fails.
+--
+-- This is the seam for `100 Continue`. A client that sent
+-- `Expect: 100-continue` waits for it before sending the body, so the server
+-- sets a hook that writes it. `Net.HTTP.Incoming` checks a declared length
+-- against the program's limit before it reads at all, so a body refused as
+-- too large never runs the hook, and the client is refused before it sends
+-- a byte.
+fun beforeFirstRead(b : Body r, hook : fun() -> Either HTTPError Unit) -> Unit {
+    if !isEnded(b) { b.hook = Some(hook) }
+}
+
+-- Returns the body's length if its framing declared one.
+fun declaredLength(b : Body r) -> Option Int = b.declared
+
+-- Whether the body has been read to its end.
+fun isEnded(b : Body r) -> Bool = match b.state {
+    Ended -> True
+    _ -> False
+}
+
+-- Returns the trailers of a chunked body that has been read to its end, and
+-- no fields for any other.
+fun trailers(b : Body r) -> Headers = b.trailerFields
+
+instance Read (Body r) : Read r {
+    type ReadError = CodecError (ReadError r)
+    fun readInto(b, into) {
+        needsRoom(into)
+        if let Some(hook) = b.hook {
+            b.hook = None
+            if let Left(e) = hook() { return failed(b, e) }
+        }
+        let input = b.input
+        loop {
+            match b.state {
+                Ended -> return Right(0)
+                Failed(e) -> return Left(Left(e))
+                Remaining(n) -> {
+                    let got = Input.take(input, into, n)?
+                    if got == 0 { return failed(b, Truncated) }
+                    b.state = if got == n { Ended } else { Remaining(n - got) }
+                    return Right(got)
+                }
+                ToEnd -> {
+                    let got = Input.take(input, into, Int.maxValue())?
+                    if got == 0 { b.state = Ended }
+                    return Right(got)
+                }
+                ChunkData(n) -> {
+                    let got = Input.take(input, into, n)?
+                    if got == 0 { return failed(b, Truncated) }
+                    b.state = if got == n { ChunkEnd } else { ChunkData(n - got) }
+                    return Right(got)
+                }
+                -- chunk-data is followed by CRLF, and nothing else.
+                ChunkEnd -> match Input.line(input, 2)? {
+                    Whole(s, from, lineEnd) -> {
+                        if lineEnd != from + 1 || Byte.toInt(s[from]) != cr {
+                            return failed(b, BadMessage(Malformed))
+                        }
+                        Input.skip(input, 2)
+                        b.state = ChunkSize
+                    }
+                    TooLong -> return failed(b, BadMessage(Malformed))
+                    EndOfStream -> return failed(b, Truncated)
+                }
+                ChunkSize -> match Input.line(input, Limits.chunkLineBytes(b.limits))? {
+                    Whole(s, from, lineEnd) -> {
+                        let size = chunkSize(s, from, lineEnd)
+                        if size < 0 { return failed(b, BadMessage(Malformed)) }
+                        Input.skip(input, lineEnd + 1 - from)
+                        if size > 0 {
+                            b.state = ChunkData(size)
+                        } else {
+                            if let Left(e) = readTrailers(b)? { return failed(b, e) }
+                            b.state = Ended
+                        }
+                    }
+                    TooLong -> return failed(b, BadMessage(Malformed))
+                    EndOfStream -> return failed(b, Truncated)
+                }
+            }
+        }
+    }
+}
+
+fun failed(b : Body r, e : HTTPError) -> Either (CodecError x) Int {
+    b.state = Failed(e)
+    Left(Left(e))
+}
+
+-- Returns the size the chunk line `s[from..lineEnd]` gives, or -1 if the
+-- line is malformed.
+--
+-- chunk = chunk-size [ chunk-ext ] CRLF
+-- chunk-size = 1*HEXDIG
+-- chunk-ext = *( BWS ";" BWS chunk-ext-name [ BWS "=" BWS chunk-ext-val ] )
+-- chunk-ext-name = token
+-- chunk-ext-val = token / quoted-string
+fun chunkSize(s : Array Byte, from : Int, lineEnd : Int) -> Int {
+    if lineEnd == from || Byte.toInt(s[lineEnd - 1]) != cr { return -1 }
+    let to = lineEnd - 1
+    let digits = scan(hexDigit, s, from, to)
+    if digits == from || digits - from > maxSizeDigits { return -1 }
+    var n = 0
+    for var i = from; i < digits; i = i + 1 {
+        let d = hexValue(Byte.toInt(s[i]))
+        if n > (Int.maxValue() - d) / 16 { return -1 }
+        n = n * 16 + d
+    }
+    var p = digits
+    while p < to {
+        p = scan(ows, s, p, to)
+        if !isByte(s, p, to, semicolon) { return -1 }
+        p = tokenEnd(s, scan(ows, s, p + 1, to), to)
+        if p < 0 { return -1 }
+        let q = scan(ows, s, p, to)
+        if isByte(s, q, to, equals) {
+            let v = scan(ows, s, q + 1, to)
+            p = if isByte(s, v, to, quote) { quotedEnd(s, v, to) } else { tokenEnd(s, v, to) }
+            if p < 0 { return -1 }
+        }
+    }
+    n
+}
+
+-- A chunk size longer than this cannot be a length, and more digits are only
+-- a way to hide the size from a reader that stops early.
+let maxSizeDigits = 16
+
+fun tokenEnd(s : Array Byte, p : Int, to : Int) -> Int {
+    let e = scan(tchar, s, p, to)
+    if e == p { -1 } else { e }
+}
+
+-- quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE, where
+-- quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text ). Returns where it ends,
+-- or -1.
+fun quotedEnd(s : Array Byte, p : Int, to : Int) -> Int {
+    var q = p + 1
+    loop {
+        q = scan(quotedChar, s, q, to)
+        if q >= to { return -1 }
+        let b = Byte.toInt(s[q])
+        if b == quote { return q + 1 }
+        if b != backslash || q + 1 >= to || !fieldChar[Byte.toInt(s[q + 1])] { return -1 }
+        q = q + 2
+    }
+}
+
+-- Reads the trailer section after the last chunk: field lines, at most
+-- `trailerBytes` of them with their CRLFs, then the empty line. Returns the
+-- refusal on the left of the right, so that a stream error stays apart.
+fun readTrailers[Read r](b : Body r) -> Either (CodecError (ReadError r)) (Either HTTPError Unit) {
+    let input = b.input
+    var budget = Limits.trailerBytes(b.limits)
+    let kept = []
+    let offsets = Vec.new(4)
+    loop {
+        match Input.line(input, budget + 2)? {
+            Whole(s, from, lineEnd) -> {
+                if lineEnd == from + 1 && Byte.toInt(s[from]) == cr {
+                    Input.skip(input, 2)
+                    break
+                }
+                let size = lineEnd + 1 - from
+                if size > budget { return Right(Left(BadMessage(HeadTooLarge))) }
+                Vec.clear(offsets)
+                if fieldLine(s, from, lineEnd + 1, offsets) != lineEnd + 1 {
+                    return Right(Left(BadMessage(Malformed)))
+                }
+                if isReservedName(s, offsets[0], offsets[1]) { return Right(Left(BadMessage(Malformed))) }
+                Vec.push(kept, (HeaderName(lowerText(s, offsets[0], offsets[1])),
+                                Field.view(s, offsets[2], offsets[3])))
+                Input.pin(input)
+                Input.skip(input, size)
+                budget = budget - size
+            }
+            TooLong -> return Right(Left(BadMessage(HeadTooLarge)))
+            EndOfStream -> return Right(Left(Truncated))
+        }
+    }
+    b.trailerFields = Headers.fromFields(Vec.toArray(kept))
+    Right(Right(()))
+}
+
+-- -- unread bodies ---------------------------------------------------------------------
+
+-- Whether a connection can carry another message once this body is behind
+-- it: `Reusable` when the body has been read to its end, `MustClose` when it
+-- cannot be, or not cheaply enough.
+type Drained = Reusable | MustClose
+
+instance Eq Drained {
+    fun eq(a, b) = match (a, b) {
+        (Reusable, Reusable) | (MustClose, MustClose) -> True
+        _ -> False
+    }
+}
+
+instance Show Drained {
+    fun show(d) = match d {
+        Reusable -> "Reusable"
+        MustClose -> "MustClose"
+    }
+}
+
+-- Reads and discards what is left of `b`, if that is cheap, and returns
+-- whether the connection can be reused. RFC 9112 §9.3: a server must read a
+-- whole body or close the connection, or the rest is read as the next
+-- message; a client reusing a pooled connection is in the same place.
+--
+-- * Read to its end already: `Reusable`.
+-- * A declared remainder: discarded if it is at most `drainBytes`, else
+--   `MustClose` at once, without reading. Skipping gigabytes to save one
+--   handshake is a bad trade.
+-- * Chunked: discarded until it ends, or until `drainBytes` have been, and
+--   then `MustClose`.
+-- * Until the stream closes: `MustClose`.
+-- * A body whose first-read hook has not run: `MustClose`. That is a client
+--   still waiting for `100 Continue`, which may never send the body, or may
+--   send it later, after the next message has been looked for.
+-- * A body that already failed: `MustClose`.
+--
+-- The server and the client both end a message with this, and close the
+-- connection, staged as they see fit, on `MustClose` or on an error.
+fun drain[Read r](b : Body r) -> Either (CodecError (ReadError r)) Drained {
+    if isEnded(b) { return Right(Reusable) }
+    if Option.isSome(b.hook) { return Right(MustClose) }
+    let cap = Limits.drainBytes(b.limits)
+    match b.state {
+        Remaining(n) -> if n > cap { return Right(MustClose) }
+        ToEnd | Failed(_) -> return Right(MustClose)
+        _ -> {}
+    }
+    let scratch = Buf.buffer(16384)
+    var discarded = 0
+    while discarded <= cap {
+        Buf.clear(scratch)
+        let n = readInto(b, scratch)?
+        if n == 0 { return Right(Reusable) }
+        discarded = discarded + n
+    }
+    Right(MustClose)
+}
+
+-- Returns `b` as the `Incoming` a program reads, with the stream's errors
+-- made `HTTPError`s by `lift`.
+fun incoming[Read r](b : Body r, lift : fun(ReadError r) -> SomeError) -> Incoming =
+    Incoming.incoming(IO.anyRead(b, fun(e) = match e {
+        Left(h) -> h
+        Right(s) -> Transport(lift(s))
+    }), b.declared)

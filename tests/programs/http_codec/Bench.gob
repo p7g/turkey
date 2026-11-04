@@ -1,0 +1,133 @@
+-- Times the head parser, and runs the fuzz in `Fuzz.gob` longer than the
+-- golden program does. `scripts/bench-http-codec.sh` runs it.
+--
+--   Bench time FILE ROUNDS     read every head in FILE through stage 1 and
+--                              stage 2, ROUNDS times
+--   Bench parse FILE ROUNDS    stage 2 alone, over heads stage 1 found once
+--   Bench check FILE           every head in FILE is accepted, with the
+--                              framing the prototype's reading gives it
+--   Bench fuzz COUNT SEED      COUNT mutations of heads and of bodies
+--
+-- FILE is heads one after another, as a connection carries them. `time` and
+-- `parse` print the nanoseconds per head and a checksum of what was read, so
+-- that no reading's work is dead.
+
+import Net.HTTP (..)
+import Net.HTTP.H1.Head as Head
+import Net.HTTP.H1.Head (RequestHead(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.H1.Input (HeadBytes(..))
+import Net.HTTP.Headers as Headers
+import Net.HTTP.Limits as Limits
+import Fuzz (fuzzHeads, fuzzBodies)
+import Run (..)
+import Strict as Strict
+import System.Env as Env
+import System.File as File
+import System.IO as IO
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
+import Wire (sized)
+
+fun main() {
+    let args = Env.args()
+    match args[0] {
+        "time" -> time(load(args[1]), count(args[2]))
+        "parse" -> parse(load(args[1]), count(args[2]))
+        "check" -> check(load(args[1]))
+        "fuzz" -> {
+            fuzzHeads(count(args[1]), count(args[2]))
+            fuzzBodies(count(args[1]), count(args[2]) + 1)
+        }
+        other -> error("Bench: unknown command '" + other + "'")
+    }
+}
+
+fun count(s : String) -> Int = Option.expect(Int.parse(s), "a count")
+
+fun load(path : String) -> Array Byte = match File.readAll(path) {
+    Right(b) -> IO.bytes(b)
+    Left(e) -> error("Bench: cannot read " + path + ": " + show(e))
+}
+
+-- The reads a socket would hand over: 64 KiB at a time.
+let readSize = 65536
+
+fun time(s : Array Byte, rounds : Int) {
+    var heads = 0
+    var sum = 0
+    let clock = Stopwatch.start()
+    for _ in Int.range(0, rounds) {
+        let input = Input.input(sized(s, [readSize]), Limits.defaults)
+        loop {
+            match readRequest(input, Limits.defaults) {
+                Right(Some(h)) -> {
+                    heads = heads + 1
+                    sum = sum + Headers.size(h.headers) + String.byteLength(h.target.path)
+                }
+                Right(None) -> break
+                Left(e) -> error("Bench: refused after " + show(heads) + " heads: " + statusOf(e))
+            }
+        }
+    }
+    let ns = Duration.toNanos(Stopwatch.elapsed(clock))
+    print("stage 1 and 2: " + show(heads) + " heads, " + show(ns / max(heads, 1)) + " ns per head, checksum "
+          + show(sum))
+}
+
+fun parse(s : Array Byte, rounds : Int) {
+    let spans = []
+    let input = Input.input(sized(s, [len(s)]), Limits.defaults)
+    loop {
+        match Input.readHead(input, Limits.defaults) {
+            Right(Some(HeadBytes { bytes, from, to })) -> Vec.push(spans, (bytes, from, to))
+            Right(None) -> break
+            Left(_) -> error("Bench: stage 1 refused a head")
+        }
+    }
+    var heads = 0
+    var sum = 0
+    let clock = Stopwatch.start()
+    for _ in Int.range(0, rounds) {
+        for (bytes, from, to) in spans {
+            match Head.parseRequest(bytes, from, to, Limits.defaults) {
+                Right(h) -> {
+                    heads = heads + 1
+                    sum = sum + Headers.size(h.headers) + String.byteLength(h.target.path)
+                }
+                Left(r) -> error("Bench: refused: " + show(r))
+            }
+        }
+    }
+    let ns = Duration.toNanos(Stopwatch.elapsed(clock))
+    print("stage 2: " + show(heads) + " heads, " + show(ns / max(heads, 1)) + " ns per head, checksum "
+          + show(sum))
+}
+
+fun check(s : Array Byte) {
+    let input = Input.input(sized(s, [readSize]), Limits.defaults)
+    var heads = 0
+    loop {
+        match Input.readHead(input, Limits.defaults) {
+            Right(Some(HeadBytes { bytes, from, to })) -> {
+                let strict = Strict.parse(Array.slice(bytes, from, to), 0)
+                match (Head.parseRequest(bytes, from, to, Limits.defaults), strict) {
+                    (Right(_), Right(_)) -> { heads = heads + 1 }
+                    (codec, _) -> {
+                        print("check: head " + show(heads) + " is refused: "
+                              + visible(String.fromBytesLossy(Array.slice(bytes, from, to))))
+                        return ()
+                    }
+                }
+            }
+            Right(None) -> break
+            Left(e) -> {
+                print("check: stage 1 refused after " + show(heads) + " heads: " + statusOf(e))
+                return ()
+            }
+        }
+    }
+    print("check: " + show(heads) + " heads, all accepted")
+}
+
+fun max(a : Int, b : Int) -> Int = if a > b { a } else { b }

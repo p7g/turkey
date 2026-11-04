@@ -1,0 +1,226 @@
+export (
+    Input, CodecError, HeadBytes(..),
+    Line(..), input, readHead, take, line, skip, pin, held, source,
+)
+
+-- The reading side of an HTTP/1 connection: the bytes read from a stream and
+-- not yet consumed, and stage 1 of the head parser, which finds where a head
+-- ends.
+--
+-- **Stage 1** (`readHead`) scans each newly read window for the end of the
+-- head, remembering how far it has scanned, so a head that arrives a byte at
+-- a time costs one pass, not one per read. It refuses a head over the byte
+-- limit, and a first line over the line limit, as soon as the bytes show it,
+-- without waiting for the rest. A head ends at the first LF that follows an
+-- LF, alone or with a CR between; stage 2 then refuses the bare LF, so a
+-- malformed head is refused at once rather than waited on until it reaches
+-- the limit.
+--
+-- **The bytes are never overwritten while a value views them.** A head is
+-- handed on as a span of the array it arrived in, and stage 2's header
+-- values view that array. So once a head has been handed out, the array is
+-- pinned: nothing rewinds or compacts it, and when it is full the window
+-- moves to a new array. An array nobody views is reused in place. This is
+-- what lets values be views without copies, and it costs one array per
+-- buffer of heads, not one per head.
+--
+-- **Body bytes** go through the same window, so that what one message read
+-- ahead of its end is where the next message starts. A body read with
+-- nothing held goes from the stream straight into the reader's buffer.
+
+import Net.HTTP.Error (HTTPError(..), Refusal(..))
+import Net.HTTP.H1.Classes (cr, lf)
+import Net.HTTP.Limits as Limits (Limits)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.ReadWrite (Read(..))
+
+-- What reading through the codec fails with: the codec's own error on the
+-- left, or the stream's on the right.
+type CodecError e = Either HTTPError e
+
+type Input r = Input {
+    source : r,
+    -- The window `held.start..held.end` is what was read and not consumed.
+    -- `held.limit` is the array's length.
+    var held : Buffer,
+    -- Whether a value may view bytes of `held.storage`, so that none of it
+    -- may be written again.
+    var pinned : Bool,
+    -- Stage 1's state for the head it is looking for: where its scan
+    -- resumes, and where the head's first LF is, or -1.
+    var scanned : Int,
+    var firstLF : Int,
+    -- The smallest array a new window gets: room for a whole head.
+    capacity : Int,
+}
+
+-- A head stage 1 found: `bytes[from..to)`, ending in its empty line. The
+-- array is never written again.
+type HeadBytes = HeadBytes { bytes : Array Byte, from : Int, to : Int }
+
+-- Returns an input over `source`, with room for a head of the limit's size.
+fun input(source : r, limits : Limits) -> Input r {
+    let capacity = if Limits.headBytes(limits) > 16384 { Limits.headBytes(limits) } else { 16384 }
+    Input { source, held = Buf.buffer(capacity), pinned = False, scanned = 0, firstLF = -1, capacity }
+}
+
+fun source(input : Input r) -> r = input.source
+
+-- Returns how many bytes are held, read and not yet consumed.
+fun held(input : Input r) -> Int = input.held.end - input.held.start
+
+-- Returns the next head, `None` if the stream ended cleanly before its first
+-- byte, or why there is none: `HeadTooLarge` over `headBytes`, `LineTooLong`
+-- for a first line over `lineBytes`, `Truncated` if the stream ended inside
+-- it, or the stream's own error.
+fun readHead[Read r](input : Input r, limits : Limits) -> Either (CodecError (ReadError r)) (Option HeadBytes) {
+    let headLimit = Limits.headBytes(limits)
+    let lineLimit = Limits.lineBytes(limits)
+    loop {
+        let b = input.held
+        let s = b.storage
+        let start = b.start
+        var i = if input.scanned > start { input.scanned } else { start }
+        while i < b.end {
+            if Byte.toInt(s[i]) == lf {
+                if input.firstLF < 0 { input.firstLF = i }
+                if endsHead(s, start, i) {
+                    let to = i + 1
+                    let firstLine = input.firstLF + 1 - start
+                    input.scanned = to
+                    input.firstLF = -1
+                    if firstLine > lineLimit { return Left(Left(BadMessage(LineTooLong))) }
+                    if to - start > headLimit { return Left(Left(BadMessage(HeadTooLarge))) }
+                    b.start = to
+                    input.pinned = True
+                    return Right(Some(HeadBytes { bytes = s, from = start, to }))
+                }
+            }
+            i = i + 1
+        }
+        input.scanned = b.end
+        let filled = b.end - start
+        if input.firstLF < 0 && filled >= lineLimit { return Left(Left(BadMessage(LineTooLong))) }
+        if input.firstLF >= 0 && input.firstLF + 1 - start > lineLimit {
+            return Left(Left(BadMessage(LineTooLong)))
+        }
+        if filled >= headLimit { return Left(Left(BadMessage(HeadTooLarge))) }
+        let n = fill(input)?
+        if n == 0 {
+            if filled == 0 { return Right(None) }
+            return Left(Left(Truncated))
+        }
+    }
+}
+
+-- Whether the LF at `i` ends a head that starts at `start`: it follows an LF,
+-- alone or with a CR between.
+fun endsHead(s : Array Byte, start : Int, i : Int) -> Bool {
+    if i - 1 < start { return False }
+    let before = Byte.toInt(s[i - 1])
+    if before == lf { return True }
+    before == cr && i - 2 >= start && Byte.toInt(s[i - 2]) == lf
+}
+
+-- Reads more of the stream into the window, after making room: how many
+-- bytes arrived, 0 at the end of the stream.
+fun fill[Read r](input : Input r) -> Either (CodecError (ReadError r)) Int {
+    makeRoom(input)
+    match readInto(input.source, input.held) {
+        Left(e) -> Left(Right(e))
+        Right(n) -> Right(n)
+    }
+}
+
+-- Makes the window's array have room after the window. An array no value
+-- views is reused: the window moves to its front. A pinned one is left to
+-- the values that view it, and the window moves to a new array, twice as
+-- large if the window already fills one.
+fun makeRoom(input : Input r) -> Unit {
+    let b = input.held
+    if b.end < b.limit { return () }
+    let old = b.start
+    let filled = b.end - old
+    if !input.pinned && old > 0 {
+        Buf.compact(b)
+    } else {
+        let size = if 2 * filled > input.capacity { 2 * filled } else { input.capacity }
+        let fresh = Buf.buffer(size)
+        Buf.append(fresh, b.storage, b.start, b.end)
+        input.held = fresh
+        input.pinned = False
+    }
+    input.scanned = if input.scanned > old { input.scanned - old } else { 0 }
+    if input.firstLF >= 0 { input.firstLF = input.firstLF - old }
+}
+
+-- Marks the window's array as viewed by a value, so that it is never written
+-- again.
+fun pin(input : Input r) -> Unit { input.pinned = True }
+
+-- Moves up to `max` body bytes into `into`, at least 1 unless the stream has
+-- ended: from what is held if anything is, or else from the stream straight
+-- into `into`. Returns how many moved, 0 at the end of the stream.
+fun take[Read r](input : Input r, into : Buffer, max : Int) -> Either (CodecError (ReadError r)) Int {
+    let b = input.held
+    let filled = b.end - b.start
+    if filled > 0 {
+        let n = smallest(filled, max, into.limit - into.end)
+        Buf.append(into, b.storage, b.start, b.start + n)
+        consumed(input, n)
+        return Right(n)
+    }
+    match Buf.limited(into, max, fun() = readInto(input.source, into)) {
+        Left(e) -> Left(Right(e))
+        Right(n) -> Right(n)
+    }
+}
+
+-- Drops `n` held bytes, which the caller has read.
+fun skip(input : Input r, n : Int) -> Unit = consumed(input, n)
+
+fun consumed(input : Input r, n : Int) -> Unit {
+    let b = input.held
+    b.start = b.start + n
+    -- An empty window starts again at the front of an array no value views.
+    if b.start == b.end && !input.pinned {
+        b.start = 0
+        b.end = 0
+    }
+    input.scanned = b.start
+    input.firstLF = -1
+}
+
+-- Returns the window's array and the offsets of the next line, `from` to the
+-- LF that ends it, reading more of the stream until a whole line of at most
+-- `max` bytes, CRLF included, is held. `TooLong` if the line is longer, or
+-- `EndOfStream` if the stream ends first. The line stays held; the
+-- caller drops it with `skip`.
+fun line[Read r](input : Input r, max : Int) -> Either (CodecError (ReadError r)) Line {
+    var searched = input.held.start
+    loop {
+        let b = input.held
+        let s = b.storage
+        var i = searched
+        let stop = if b.end - b.start > max { b.start + max } else { b.end }
+        while i < stop {
+            if Byte.toInt(s[i]) == lf { return Right(Whole(s, b.start, i)) }
+            i = i + 1
+        }
+        if b.end - b.start >= max { return Right(TooLong) }
+        let before = b.start
+        let n = fill(input)?
+        if n == 0 { return Right(EndOfStream) }
+        searched = input.held.start + (i - before)
+    }
+}
+
+-- What `line` found: a line `bytes[from..lf]`, a line over the limit, or the
+-- end of the stream before a whole line.
+type Line = Whole(Array Byte, Int, Int) | TooLong | EndOfStream
+
+fun smallest(a : Int, b : Int, c : Int) -> Int {
+    let ab = if a < b { a } else { b }
+    if ab < c { ab } else { c }
+}

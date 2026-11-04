@@ -1,0 +1,390 @@
+export (requests, responses, stageOne, readWays)
+
+-- The head parser on the inputs HTTP's CVEs taught servers to refuse, a few
+-- accepted ones beside each, and the limits. One group per rule.
+--
+-- Each case is read three ways: whole, a byte at a time, and split in two
+-- in the middle. A line prints the outcome when all three agree, and
+-- DISAGREE otherwise. It also prints what the prototype's strict reading
+-- (`Strict.gob`) said where that differs, and LOOSER where the codec accepts
+-- a head that reading refuses, which must never happen.
+
+import Net.HTTP (..)
+import Net.HTTP.H1.Head (RequestHead(..), ResponseHead(..), Framing(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.Headers as Headers
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Limits as Limits
+import Net.HTTP.Status as Status
+import Net.HTTP.Method as Method
+import Run (..)
+import Strict as Strict
+import Wire (Source, oneByte, splitAt, sized)
+
+-- Returns the three readings of `s`: the outcome, a description to compare
+-- them by, and how many bytes of `s` were left after the head, held or not
+-- yet read.
+fun readWays(s : Array Byte, limits : Limits) -> Array (String, String, Int) {
+    let out = []
+    for src in [sized(s, [len(s) + 1]), oneByte(s), splitAt(s, len(s) / 2)] {
+        let input = Input.input(src, limits)
+        let result = readRequest(input, limits)
+        let full = match result {
+            Right(Some(h)) -> describeRequest(h)
+            _ -> requestOutcome(result)
+        }
+        Vec.push(out, (requestOutcome(result), full, Input.held(input) + len(s) - src.at))
+    }
+    Vec.toArray(out)
+}
+
+fun strictOutcome(s : Array Byte) -> (Bool, String) = match Strict.parse(s, 0) {
+    Left(status) -> (False, show(status))
+    Right(h) -> (True, match h.framing {
+        Strict.NoBody -> "no body"
+        Strict.Length(n) -> "length " + show(n)
+        Strict.Chunked -> "chunked"
+    })
+}
+
+fun case(name : String, text : String) = caseWith(name, text, Limits.defaults)
+
+fun caseWith(name : String, text : String, limits : Limits) {
+    let s = String.toBytes(text)
+    let ways = readWays(s, limits)
+    let (outcome, full, left) = ways[0]
+    var line = name + ": " + outcome
+    if left > 0 { line = line + ", " + show(left) + " bytes left" }
+    for (o, f, l) in ways {
+        if f != full || l != left { line = line + " DISAGREE: " + o + " / " + f }
+    }
+    let (accepted, strict) = strictOutcome(s)
+    let ok = String.startsWith(outcome, "ok ")
+    if ok && !accepted { line = line + " LOOSER than the prototype's " + strict }
+    if ok && accepted && !String.startsWith(outcome, "ok " + strict) {
+        line = line + " (prototype: " + strict + ")"
+    }
+    if !ok && outcome != strict { line = line + " (prototype: " + strict + ")" }
+    print(line)
+}
+
+-- A request with `fields` inserted after a Host line.
+fun request(fields : String) -> String = "GET / HTTP/1.1\r\nHost: example.com\r\n" + fields + "\r\n"
+
+fun requests() {
+    let lineLimit = Limits.lineBytes(Limits.defaults)
+    let fieldLimit = Limits.fields(Limits.defaults)
+
+    print("-- accepted")
+    case("minimal", request(""))
+    case("value spans", "GET /a?b=c HTTP/1.1\r\nHost:x\r\nAccept:  a b\t \r\nEmpty:\r\nBlank: \t \r\n\r\n")
+    case("HTTP/1.0 without Host", "GET / HTTP/1.0\r\n\r\n")
+    case("method is any token", "M-SEARCH / HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("obs-text in a value", request("X: caf\u{E9}\r\n"))
+    case("HTAB inside a value", request("X: a\tb\r\n"))
+    case("bytes after the head", request("") + "GET")
+
+    print("-- rule 1: CRLF only, everywhere")
+    case("bare LF after the request line", "GET / HTTP/1.1\nHost: a\r\n\r\n")
+    case("bare LF after a field line", "GET / HTTP/1.1\r\nHost: a\n\r\n")
+    case("bare LF as the empty line", "GET / HTTP/1.1\r\nHost: a\r\n\n")
+    case("bare CR inside a value", request("X: a\rb\r\n"))
+    case("CR CR LF", request("X: a\r\r\n"))
+
+    print("-- rule 2: no whitespace between a field name and its colon")
+    case("SP before the colon", request("Transfer-Encoding : chunked\r\n"))
+    case("HTAB before the colon", request("Content-Length\t: 5\r\n"))
+    case("empty field name", request(": x\r\n"))
+    case("non-token byte in a name", request("X@Y: z\r\n"))
+
+    print("-- rule 3: Content-Length is 1*DIGIT, overflow-checked")
+    case("plain", request("Content-Length: 42\r\n"))
+    case("leading zeros", request("Content-Length: 007\r\n"))
+    case("largest Int", request("Content-Length: 9223372036854775807\r\n"))
+    case("one past the largest Int", request("Content-Length: 9223372036854775808\r\n"))
+    case("twenty digits", request("Content-Length: 99999999999999999999\r\n"))
+    case("plus sign", request("Content-Length: +5\r\n"))
+    case("minus sign", request("Content-Length: -1\r\n"))
+    case("hex", request("Content-Length: 0x10\r\n"))
+    case("empty", request("Content-Length:\r\n"))
+    case("two numbers", request("Content-Length: 5 5\r\n"))
+    case("a list", request("Content-Length: 5, 5\r\n"))
+    case("two lines, same value", request("Content-Length: 5\r\nContent-Length: 5\r\n"))
+    case("name in another case", request("content-LENGTH: 3\r\n"))
+
+    print("-- rule 4: Transfer-Encoding ends in exactly chunked")
+    case("chunked", request("Transfer-Encoding: chunked\r\n"))
+    case("in another case", request("Transfer-Encoding: ChUnKeD\r\n"))
+    case("trailing whitespace", request("Transfer-Encoding: chunked \t\r\n"))
+    case("gzip then chunked", request("Transfer-Encoding: gzip, chunked\r\n"))
+    case("gzip then chunked, two lines", request("Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n"))
+    case("chunked then gzip", request("Transfer-Encoding: chunked, gzip\r\n"))
+    case("chunked then gzip, two lines", request("Transfer-Encoding: chunked\r\nTransfer-Encoding: gzip\r\n"))
+    case("chunked twice", request("Transfer-Encoding: chunked, chunked\r\n"))
+    case("identity", request("Transfer-Encoding: identity\r\n"))
+    case("chunked with a suffix", request("Transfer-Encoding: chunkedx\r\n"))
+    case("a parameter", request("Transfer-Encoding: chunked;q=1\r\n"))
+    case("an empty element", request("Transfer-Encoding: , chunked\r\n"))
+    case("a trailing comma", request("Transfer-Encoding: chunked,\r\n"))
+    case("quoted", request("Transfer-Encoding: \"chunked\"\r\n"))
+    case("empty", request("Transfer-Encoding:\r\n"))
+
+    print("-- rule 5: Content-Length with Transfer-Encoding is refused")
+    case("both", request("Content-Length: 5\r\nTransfer-Encoding: chunked\r\n"))
+    case("both, other order", request("Transfer-Encoding: chunked\r\nContent-Length: 5\r\n"))
+
+    print("-- rule 8: obs-fold is refused")
+    case("folded value", request("X: a\r\n b\r\n"))
+    case("folded with HTAB", request("Transfer-Encoding: gzip,\r\n\tchunked\r\n"))
+    case("whitespace before the first field", "GET / HTTP/1.1\r\n Host: a\r\n\r\n")
+
+    print("-- rule 9: a body is never ignored, whatever the method")
+    case("GET with Content-Length", request("Content-Length: 3\r\n"))
+    case("GET with chunked", request("Transfer-Encoding: chunked\r\n"))
+    case("OPTIONS with Content-Length", "OPTIONS * HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n")
+
+    print("-- rule 12: no CR, LF, NUL or other control byte in a value")
+    case("NUL", request("X: a\u{0}b\r\n"))
+    case("DEL", request("X: a\u{7F}b\r\n"))
+    case("SOH", request("X: \u{1}\r\n"))
+    case("LF alone ends nothing", request("X: a\nY: b\r\n"))
+
+    print("-- request line")
+    case("lowercase HTTP", "GET / http/1.1\r\nHost: a\r\n\r\n")
+    case("two spaces", "GET  / HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("HTAB for SP", "GET\t/ HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("no target", "GET HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("fragment in the target", "GET /a#b HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("space in the target", "GET /a b HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("HTTP/1.2", "GET / HTTP/1.2\r\nHost: a\r\n\r\n")
+    case("HTTP/2.0", "GET / HTTP/2.0\r\nHost: a\r\n\r\n")
+    case("HTTP/0.9", "GET / HTTP/0.9\r\n\r\n")
+    case("HTTP/1.10", "GET / HTTP/1.10\r\nHost: a\r\n\r\n")
+    case("absolute-form", "GET http://example.com/a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    case("absolute-form without a scheme", "GET 1http://x HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("asterisk with GET", "GET * HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("asterisk and more", "OPTIONS *a HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("CONNECT host:port", "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+    case("CONNECT IP literal", "CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n")
+    case("CONNECT without a port", "CONNECT example.com HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("CONNECT with a path", "CONNECT /x HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("CONNECT with an empty port", "CONNECT a: HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("the HTTP/2 preface", "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+
+    print("-- Host")
+    case("HTTP/1.1 without Host", "GET / HTTP/1.1\r\n\r\n")
+    case("two Host lines", request("Host: other\r\n"))
+    case("HTTP/1.0 with two Host lines", "GET / HTTP/1.0\r\nHost: a\r\nhost: b\r\n\r\n")
+    case("empty Host", "GET / HTTP/1.1\r\nHost:\r\n\r\n")
+    case("Host with a port", "GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n")
+    case("Host with an IP literal", "GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n")
+    case("Host with an empty port", "GET / HTTP/1.1\r\nHost: example.com:\r\n\r\n")
+    case("Host with userinfo", "GET / HTTP/1.1\r\nHost: user@example.com\r\n\r\n")
+    case("Host with a path", "GET / HTTP/1.1\r\nHost: example.com/a\r\n\r\n")
+    case("Host with a space", "GET / HTTP/1.1\r\nHost: exa mple.com\r\n\r\n")
+    case("absolute-form, Host disagrees", "GET http://example.com/a HTTP/1.1\r\nHost: other.com\r\n\r\n")
+    case("absolute-form, Host in another case", "GET http://example.com/a HTTP/1.1\r\nHost: EXAMPLE.com\r\n\r\n")
+    case("absolute-form, default port spelled", "GET http://example.com:80/a HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    case("absolute-form, https port", "GET https://example.com/ HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+    case("absolute-form, other port", "GET http://example.com:8080/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    case("absolute-form, empty Host", "GET http://example.com/ HTTP/1.1\r\nHost:\r\n\r\n")
+    case("absolute-form, not http", "GET ftp://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    case("absolute-form, userinfo", "GET http://u@example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+    case("CONNECT, Host disagrees", "CONNECT example.com:443 HTTP/1.1\r\nHost: other.com:443\r\n\r\n")
+
+    print("-- the fields the codec reads itself")
+    case("Connection: close", request("Connection: close\r\n"))
+    case("Connection: keep-alive", request("Connection: keep-alive\r\n"))
+    case("Connection, two options", request("Connection: Keep-Alive, Close\r\n"))
+    case("Connection, malformed", request("Connection: close;\r\n"))
+    case("Connection, empty", request("Connection:\r\n"))
+    case("HTTP/1.0 keeps nothing open", "GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")
+    case("Upgrade", request("Connection: upgrade\r\nUpgrade: websocket\r\n"))
+    case("Expect: 100-continue", request("Content-Length: 3\r\nExpect: 100-continue\r\n"))
+    case("Expect in another case", request("Expect: 100-Continue\r\n"))
+    case("Expect, anything else", request("Expect: 200-ok\r\n"))
+    case("Expect twice", request("Expect: 100-continue\r\nExpect: 100-continue\r\n"))
+    case("Expect from HTTP/1.0", "PUT / HTTP/1.0\r\nContent-Length: 3\r\nExpect: 100-continue\r\n\r\n")
+    case("the rest are dropped", request("Keep-Alive: 5\r\nTE: trailers\r\nTrailer: X\r\nProxy-Connection: x\r\nX: y\r\n"))
+
+    print("-- limits")
+    let longest = "GET /" + repeated("a", lineLimit - 16) + " HTTP/1.1\r\nHost: a\r\n\r\n"
+    case("request line at the limit", longest)
+    case("request line one past it", "GET /" + repeated("a", lineLimit - 15) + " HTTP/1.1\r\nHost: a\r\n\r\n")
+    case("fields at the limit", request(repeated("X: y\r\n", fieldLimit - 1)))
+    case("one field past it", request(repeated("X: y\r\n", fieldLimit)))
+    case("past it, then malformed", request(repeated("X: y\r\n", fieldLimit) + "\n"))
+    case("malformed before the limit", request(repeated("X: y\r\n", 5) + "X y\r\n"
+                                               + repeated("X: y\r\n", fieldLimit)))
+    let small = Limits.withHeadBytes(Limits.defaults, 64)
+    let padding = 64 - String.byteLength(request("X: \r\n"))
+    caseWith("head at a 64-byte limit", request("X: " + repeated("a", padding) + "\r\n"), small)
+    caseWith("head one past it", request("X: " + repeated("a", padding + 1) + "\r\n"), small)
+    case("unterminated", "GET / HTTP/1.1\r\nHost: a\r\n")
+    case("empty input", "")
+
+    print("-- order of refusals")
+    case("bad version and bad field", "GET / HTTP/2.0\r\nX y\r\n\r\n")
+    case("long line and bad version", "GET /" + repeated("a", lineLimit) + " HTTP/2.0\r\n\r\n")
+    case("bad Content-Length and two Hosts", request("Content-Length: x\r\nHost: b\r\n"))
+    case("gzip and Content-Length", request("Transfer-Encoding: gzip, chunked\r\nContent-Length: 1\r\n"))
+
+    print("-- what a head holds")
+    show1("POST /orders?id=7 HTTP/1.1\r\nHost: Shop.Example\r\nContent-Type: text/plain\r\nX-A: 1\r\nx-a: 2\r\nContent-Length: 3\r\n\r\n")
+    show1("M-SEARCH / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n")
+    show1("M-SEARCH / HTTP/1.1\r\nHost: a\r\n\r\n")
+    show1("OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n")
+    show1("CONNECT Example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+    show1("GET http://example.com:8080/a/b?c HTTP/1.1\r\nHost: example.com:8080\r\n\r\n")
+    values()
+}
+
+fun show1(text : String) {
+    let s = String.toBytes(text)
+    let (_, full, _) = readWays(s, Limits.defaults)[0]
+    print(firstLine(text) + " => " + visible(full))
+}
+
+fun firstLine(text : String) -> String = match String.splitOnce(text, "\r\n") {
+    Some((first, _)) -> visible(first)
+    None -> visible(text)
+}
+
+-- Header values are views of the head's bytes, which may not be UTF-8.
+fun values() {
+    let s = String.toBytes("GET / HTTP/1.1\r\nHost: a\r\nX: caf") + [Byte.truncate(0xE9)]
+            + String.toBytes("\r\nY:  b c \r\n\r\n")
+    let input = Input.input(sized(s, [len(s)]), Limits.defaults)
+    match readRequest(input, Limits.defaults) {
+        Right(Some(h)) -> {
+            let x = Option.expect(Headers.get(h.headers, HeaderName.literal("x")), "x")
+            let y = Option.expect(Headers.get(h.headers, HeaderName.literal("y")), "y")
+            print("a value that is not UTF-8 reads as " + show(HeaderValue.toString(x)) + ", and equals "
+                  + "itself: " + show(x == x) + "; whitespace around a value is not part of it: "
+                  + show(HeaderValue.toString(y)))
+        }
+        other -> print("FAIL: " + requestOutcome(other))
+    }
+}
+
+-- -- responses -------------------------------------------------------------------------
+
+fun response(text : String, m : Method Unit) {
+    let s = String.toBytes(text)
+    let outcomes = []
+    for src in [sized(s, [len(s) + 1]), oneByte(s), splitAt(s, len(s) / 2)] {
+        let input = Input.input(src, Limits.defaults)
+        Vec.push(outcomes, responseOutcome(readResponse(input, Limits.defaults, m)))
+    }
+    var line = Method.name(m) + " " + visible(text) + ": " + outcomes[0]
+    for o in outcomes {
+        if o != outcomes[0] { line = line + " DISAGREE: " + o }
+    }
+    print(line)
+}
+
+fun responses() {
+    print("-- responses")
+    response("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Type: text/plain\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\n\r\n", GET)
+    response("HTTP/1.1 200 \r\n\r\n", GET)
+    response("HTTP/1.1 204\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.0 200 OK\r\nConnection: keep-alive\r\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n", HEAD)
+    response("HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n", GET)
+    response("HTTP/1.1 100 Continue\r\n\r\n", PUT(()))
+    response("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n", GET)
+    response("HTTP/1.1 200 Connection established\r\n\r\n", CONNECT)
+    response("HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: websocket\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\nContent-Length: 0\r\n\r\n", GET)
+
+    print("-- responses: the head rules that apply to them")
+    response("HTTP/1.1 200 OK\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length: 1\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length : 1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length: +1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nContent-Length: 99999999999999999999\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 1\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nX: a\r\n b\r\n\r\n", GET)
+    response("HTTP/1.1 200 OK\r\nX: a\u{0}b\r\n\r\n", GET)
+    response("HTTP/1.1 200 O\u{0}K\r\n\r\n", GET)
+
+    print("-- responses: the status line")
+    response("HTTP/1.1 2000 OK\r\n\r\n", GET)
+    response("HTTP/1.1 20 OK\r\n\r\n", GET)
+    response("HTTP/1.1 099 Low\r\n\r\n", GET)
+    response("HTTP/1.1 600 High\r\n\r\n", GET)
+    response("HTTP/1.1 299 Unknown\r\n\r\n", GET)
+    response("HTTP/2.0 200 OK\r\n\r\n", GET)
+    response("http/1.1 200 OK\r\n\r\n", GET)
+    response("HTTP/1.1  200 OK\r\n\r\n", GET)
+    response("HTTP/1.1 200OK\r\n\r\n", GET)
+}
+
+-- -- stage 1 ---------------------------------------------------------------------------
+
+fun stageOne() {
+    print("-- stage 1")
+    -- Pipelined heads come out one at a time, in order, and the bytes after
+    -- the last are the stream's end.
+    let two = String.toBytes("GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: a\r\n\r\n")
+    for (label, src) in [("whole", sized(two, [len(two)])), ("by byte", oneByte(two)),
+                         ("in sevens", sized(two, [7]))] {
+        let input = Input.input(src, Limits.defaults)
+        let paths = []
+        loop {
+            match readRequest(input, Limits.defaults) {
+                Right(Some(h)) -> Vec.push(paths, h.target.path)
+                other -> {
+                    Vec.push(paths, requestOutcome(other))
+                    break
+                }
+            }
+        }
+        print("pipelined, " + label + ": " + show(paths))
+    }
+
+    -- A head over the limit is refused once the limit's bytes have arrived,
+    -- however many more are on their way.
+    let endless = String.toBytes("GET / HTTP/1.1\r\nX: " + repeated("a", 100000))
+    let src = sized(endless, [100])
+    let input = Input.input(src, Limits.defaults)
+    print("an endless head: " + requestOutcome(readRequest(input, Limits.defaults)) + " after "
+          + show(src.at) + " bytes")
+    let longLine = String.toBytes("GET /" + repeated("a", 100000))
+    let src2 = sized(longLine, [100])
+    let input2 = Input.input(src2, Limits.defaults)
+    print("an endless request line: " + requestOutcome(readRequest(input2, Limits.defaults)) + " after "
+          + show(src2.at) + " bytes")
+
+    -- A head that spans the end of one array is moved to a new one whole.
+    let filler = repeated("X: " + repeated("b", 90) + "\r\n", 90)
+    let many = String.toBytes(repeated("GET / HTTP/1.1\r\nHost: a\r\n" + filler + "\r\n", 4))
+    let input3 = Input.input(sized(many, [1000, 3, 777]), Limits.defaults)
+    let heads = []
+    let shown = []
+    loop {
+        match readRequest(input3, Limits.defaults) {
+            Right(Some(h)) -> {
+                Vec.push(heads, h)
+                Vec.push(shown, show(h.headers))
+            }
+            _ -> break
+        }
+    }
+    -- Every head's values still read as they did when it was parsed, after
+    -- the heads that followed it were read.
+    var intact = True
+    for var i = 0; i < len(heads); i = i + 1 {
+        if show(heads[i].headers) != shown[i] { intact = False }
+    }
+    print("four 8 KiB heads across arrays: " + show(len(heads)) + " heads, values intact: " + show(intact))
+}

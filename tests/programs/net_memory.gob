@@ -1,0 +1,100 @@
+-- In-memory connections: bytes each way, a writer held up by a full
+-- direction until the peer reads, half-close, close from another task,
+-- deadlines, and a listener.
+
+import Net (Connection(..), Listener(..))
+import Net.Memory as Memory
+import System.IO as IO
+import System.IO (Read(..), Write(..), IOError(..), ErrorKind(..))
+import System.Task as Task
+import Time.Clock as Clock
+import Time.Duration as Duration
+import Time.Sleep as Sleep
+
+fun kindOf(e : IOError) -> String = show(e.kind)
+
+-- Reads once into a buffer of `size`: what came, or how it failed.
+fun readOnce(p : Memory.Pipe, size : Int) -> String {
+    let buf = IO.buffer(size)
+    match readInto(p, buf) {
+        Right(0) -> "end"
+        Right(_) -> "\"" + String.fromBytesLossy(IO.bytes(buf)) + "\""
+        Left(e) -> kindOf(e)
+    }
+}
+
+fun written(r : Either IOError Unit) -> String = match r {
+    Right(_) -> "ok"
+    Left(e) -> kindOf(e)
+}
+
+fun main() {
+    print("-- both ways")
+    let (a, b) = Memory.pair(16)
+    print(written(IO.writeText(a, "ping")) + " " + readOnce(b, 64))
+    print(written(IO.writeText(b, "pong")) + " " + readOnce(a, 2) + " " + readOnce(a, 64))
+
+    print("-- a full direction holds the writer until the peer reads")
+    let (w, r) = Memory.pair(4)
+    let got = Task.runScope(do {
+        let writer = Task.spawn(fun() = written(IO.writeText(w, "0123456789")))?
+        Sleep.sleep(Duration.millis(50))
+        let first = readOnce(r, 64)
+        let rest = readOnce(r, 64) + readOnce(r, 64)
+        pure((writer, first, rest))
+    })
+    let (writer, first, rest) = got
+    print("first read " + first + ", then " + rest + ", writer " + Task.join(writer))
+
+    print("-- half-close")
+    let (h, k) = Memory.pair(16)
+    let _ = IO.writeText(h, "last")
+    print(written(shutdownWrite(h)))
+    print(readOnce(k, 64) + " " + readOnce(k, 64))
+    print("write after shutdown: " + written(IO.writeText(h, "more")))
+    print("the other way still works: " + written(IO.writeText(k, "back")) + " " + readOnce(h, 64))
+
+    print("-- close")
+    let (c, d) = Memory.pair(16)
+    let parked = Task.runScope(do {
+        let reader = Task.spawn(fun() = readOnce(c, 64))?
+        Sleep.sleep(Duration.millis(50))
+        let _ = close(c)
+        pure(reader)
+    })
+    print("a parked read: " + Task.join(parked))
+    print("later, here: " + readOnce(c, 64) + " " + written(IO.writeText(c, "x")))
+    print("the peer: " + readOnce(d, 64) + " " + written(IO.writeText(d, "x")))
+    print("closing again: " + written(close(c)))
+
+    print("-- deadlines")
+    let (e, f) = Memory.pair(16)
+    setDeadline(e, Duration.millis(100))
+    let from = Clock.monotonic()
+    let outcome = readOnce(e, 64)
+    let took = Clock.between(from, Clock.monotonic())
+    print(outcome + " " + show(took >= Duration.millis(90) && took < Duration.seconds(3)))
+    clearDeadline(e)
+    let _ = IO.writeText(f, "late")
+    print(readOnce(e, 64))
+
+    print("-- listening")
+    let l = Memory.listener(64)
+    let near = Either.unwrapOr(Either.mapLeft(Memory.connect(l), fun(x) = error(show(x))), Memory.pair(1).0)
+    let far = Either.unwrapOr(Either.mapLeft(accept(l), fun(x) = error(show(x))), Memory.pair(1).0)
+    print(written(IO.writeText(near, "hi")) + " " + readOnce(far, 64))
+    let waiting = Task.runScope(do {
+        let acceptor = Task.spawn(fun() = match accept(l) {
+            Right(_) -> "accepted"
+            Left(x) -> kindOf(x)
+        })?
+        Sleep.sleep(Duration.millis(50))
+        let _ = closeListener(l)
+        pure(acceptor)
+    })
+    print("a parked accept: " + Task.join(waiting))
+    print("connect after close: " + match Memory.connect(l) {
+        Right(_) -> "connected"
+        Left(x) -> kindOf(x)
+    })
+}

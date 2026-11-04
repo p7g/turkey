@@ -1,0 +1,290 @@
+export (Pipe, Listener, pair, listener, connect, accept, closeListener)
+
+-- Connections that never leave the program: two ends of a `Pipe`, each a
+-- `Net.Connection` as a TCP socket is, and a `Listener` that hands out the
+-- far end of each `connect`. For testing a server or a protocol without a
+-- socket, a port, or a network.
+--
+--     let l = Memory.listener(65536)
+--     let client = Memory.connect(l)?
+--     let server = accept(l)?
+--
+-- **As a TCP connection behaves,** within one program:
+--
+-- * Each direction holds at most the capacity it was made with. A write
+--   that does not fit waits for the peer to read, so a peer that stops
+--   reading stalls a writer, as a full socket buffer does.
+-- * A read waits for bytes, and answers 0 once the peer has shut down its
+--   writing or closed its end and every byte before that has been read.
+-- * A write after the peer closed its end, or after this end shut down its
+--   writing, fails with `BrokenPipe`.
+-- * `close` ends every read and write parked on this end, in any task, with
+--   `Closed`, as it does every later one.
+-- * A deadline bounds every read and write from when it is set; one that
+--   passes is `TimedOut`.
+--
+-- Waiting suspends the task, as waiting on a socket does, so the far end
+-- may be served by another task of the same program.
+
+import Net as Net
+import Net (Connection(..), accept, closeListener)
+import System.Sync as Sync
+import System.Sync (Mutex, Semaphore)
+import Time (Timeout(..))
+import Time.Deadline (Deadline)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
+
+-- One direction of a pipe: the bytes written and not yet read, and how its
+-- two sides have ended.
+type Flow = Flow {
+    held : Buffer,
+    -- The writing side shut down or closed: once `held` is empty, a read
+    -- answers 0.
+    var ended : Bool,
+    -- The reading side closed: a write fails.
+    var abandoned : Bool,
+}
+
+-- What both directions share: one lock over both flows, and one semaphore
+-- for each side to wait on. A change that could let a waiter go on gives
+-- its semaphore a permit for each task waiting on it, so none sleeps
+-- through the change; a waiter that wakes to find nothing changed for it
+-- waits again.
+type Shared = Shared {
+    flows : Mutex (Array Flow),
+    -- Indexed by end: the tasks waiting on end 0, and on end 1.
+    wakeups : Array Semaphore,
+    waiting : Array Sync.AtomicInt,
+}
+
+-- One end of an in-memory connection. End 0 reads flow 0 and writes flow 1;
+-- end 1 the other way round.
+type Pipe = Pipe {
+    shared : Shared,
+    side : Int,
+    var deadline : Option Deadline,
+    var closed : Bool,
+}
+
+-- Returns the two ends of a new connection, each direction holding at most
+-- `capacity` bytes. Panics if `capacity` is below 1.
+fun pair(capacity : Int) -> (Pipe, Pipe) {
+    if capacity < 1 { error("Memory.pair: capacity " + Int.toString(capacity) + " is below 1") }
+    let flow = fun() = Flow { held = Buf.buffer(capacity), ended = False, abandoned = False }
+    let shared = Shared {
+        flows = Sync.mutex([flow(), flow()]),
+        wakeups = [Sync.semaphore(0), Sync.semaphore(0)],
+        waiting = [Sync.atomicInt(0), Sync.atomicInt(0)],
+    }
+    (Pipe { shared, side = 0, deadline = None, closed = False },
+     Pipe { shared, side = 1, deadline = None, closed = False })
+}
+
+fun failure(kind : ErrorKind, op : String) -> IOError = IOError { kind, op, path = None }
+
+fun peer(p : Pipe) -> Int = 1 - p.side
+
+-- Wakes every task waiting on end `side`.
+fun wake(shared : Shared, side : Int) -> Unit {
+    var n = Sync.load(shared.waiting[side])
+    while n > 0 {
+        Sync.release(shared.wakeups[side])
+        n = n - 1
+    }
+}
+
+-- Waits on end `p.side` until a change wakes it: whether one did before the
+-- deadline. The caller counted itself among the waiters while it held the
+-- lock, so a change made after its look cannot miss it.
+fun park(p : Pipe) -> Bool {
+    let woken = Sync.acquire(p.shared.wakeups[p.side], p.deadline)
+    let _ = Sync.addAndGet(p.shared.waiting[p.side], -1)
+    woken
+}
+
+-- What one look at a flow found: an answer, or nothing yet.
+type Step a = Done(a) | Wait
+
+-- Runs `look` on the flows under the lock until it answers, waiting between
+-- looks. A wait that ends at the deadline is `TimedOut`, and a close of this
+-- end, `Closed`.
+fun until(p : Pipe, op : String, look : fun(Array Flow) -> Step (Either IOError a)) -> Either IOError a {
+    loop {
+        if p.closed { return Left(failure(Closed, op)) }
+        let step = Sync.withLock(p.shared.flows, fun(flows) {
+            let step = look(flows)
+            if let Wait = step { let _ = Sync.addAndGet(p.shared.waiting[p.side], 1) }
+            step
+        })
+        if let Done(answer) = step { return answer }
+        if !park(p) {
+            if p.closed { return Left(failure(Closed, op)) }
+            return Left(failure(TimedOut, op))
+        }
+    }
+}
+
+instance Read Pipe {
+    type ReadError = IOError
+    fun readInto(p, into) {
+        needsRoom(into)
+        let side = p.side
+        let got = until(p, "read", fun(flows) {
+            let f = flows[side]
+            let held = f.held
+            let n = held.end - held.start
+            if n == 0 {
+                return if f.ended { Done(Right(0)) } else { Wait }
+            }
+            let moved = if n < Buf.room(into) { n } else { Buf.room(into) }
+            Buf.append(into, held.storage, held.start, held.start + moved)
+            Buf.consume(held, moved)
+            Done(Right(moved))
+        })?
+        if got > 0 { wake(p.shared, peer(p)) }
+        Right(got)
+    }
+}
+
+instance Write Pipe {
+    type WriteError = IOError
+    fun writeFrom(p, from) = writeAll(p, from)
+    fun flush(p) = if p.closed { Left(failure(Closed, "flush")) } else { Right(()) }
+}
+
+-- Moves `from`'s window into the peer's flow, waiting for room as the peer
+-- reads.
+fun writeAll(p : Pipe, from : Buffer) -> Either IOError Unit {
+    let side = peer(p)
+    var at = from.start
+    while at < from.end {
+        let start = at
+        let moved = until(p, "write", fun(flows) {
+            let f = flows[side]
+            if f.abandoned || f.ended { return Done(Left(failure(BrokenPipe, "write"))) }
+            let held = f.held
+            if held.end == held.limit { Buf.compact(held) }
+            let room = held.limit - held.end
+            if room == 0 { return Wait }
+            let n = if from.end - start < room { from.end - start } else { room }
+            Buf.append(held, from.storage, start, start + n)
+            Done(Right(n))
+        })?
+        at = at + moved
+        wake(p.shared, side)
+    }
+    Right(())
+}
+
+-- A deadline set on one end bounds that end's waits only.
+instance Connection Pipe {
+    fun setDeadline(p, timeout) {
+        p.deadline = Some(deadline(timeout))
+    }
+    fun clearDeadline(p) {
+        p.deadline = None
+    }
+    fun shutdownWrite(p) {
+        if p.closed { return Left(failure(Closed, "shutdown")) }
+        let side = peer(p)
+        Sync.withLock(p.shared.flows, fun(flows) {
+            let f = flows[side]
+            f.ended = True
+        })
+        wake(p.shared, side)
+        Right(())
+    }
+    fun close(p) {
+        if p.closed { return Right(()) }
+        p.closed = True
+        let mine = p.side
+        let theirs = peer(p)
+        Sync.withLock(p.shared.flows, fun(flows) {
+            let reading = flows[mine]
+            let writing = flows[theirs]
+            reading.abandoned = True
+            writing.ended = True
+        })
+        wake(p.shared, mine)
+        wake(p.shared, theirs)
+        Right(())
+    }
+}
+
+-- -- listening ------------------------------------------------------------------------
+
+-- Where `connect` leaves the far end of each connection for `accept`.
+type Listener = Listener {
+    capacity : Int,
+    queue : Mutex Arrivals,
+    arrived : Semaphore,
+    waiting : Sync.AtomicInt,
+}
+
+-- The far ends not yet accepted are `pending[next..]`.
+type Arrivals = Arrivals { pending : Vec Pipe, var next : Int, var closed : Bool }
+
+-- Returns a listener whose connections hold at most `capacity` bytes in
+-- each direction. Panics if `capacity` is below 1.
+fun listener(capacity : Int) -> Listener {
+    if capacity < 1 { error("Memory.listener: capacity " + Int.toString(capacity) + " is below 1") }
+    Listener {
+        capacity,
+        queue = Sync.mutex(Arrivals { pending = [], next = 0, closed = False }),
+        arrived = Sync.semaphore(0),
+        waiting = Sync.atomicInt(0),
+    }
+}
+
+-- Returns the near end of a new connection to `l`, whose far end the next
+-- `accept` answers. Fails with `Closed` once `l` is closed. Never waits.
+fun connect(l : Listener) -> Either IOError Pipe {
+    let (near, far) = pair(l.capacity)
+    let open = Sync.withLock(l.queue, fun(a) {
+        if a.closed { return False }
+        Vec.push(a.pending, far)
+        True
+    })
+    if !open { return Left(failure(Closed, "connect")) }
+    Sync.release(l.arrived)
+    Right(near)
+}
+
+-- The far end of the oldest `connect` not yet accepted, waiting for one if
+-- there is none. Closing `l` ends the wait with `Closed`.
+instance Net.Listener Listener {
+    type Accepted = Pipe
+    fun accept(l) {
+        loop {
+            let next = Sync.withLock(l.queue, fun(a) {
+                if a.closed { return Done(Left(failure(Closed, "accept"))) }
+                if a.next == len(a.pending) {
+                    let _ = Sync.addAndGet(l.waiting, 1)
+                    return Wait
+                }
+                let p = a.pending[a.next]
+                a.next = a.next + 1
+                if a.next == len(a.pending) {
+                    Vec.clear(a.pending)
+                    a.next = 0
+                }
+                Done(Right(p))
+            })
+            if let Done(answer) = next { return answer }
+            let _ = Sync.acquire(l.arrived, None)
+            let _ = Sync.addAndGet(l.waiting, -1)
+        }
+    }
+    fun closeListener(l) {
+        Sync.withLock(l.queue, fun(a) { a.closed = True })
+        var n = Sync.load(l.waiting)
+        while n > 0 {
+            Sync.release(l.arrived)
+            n = n - 1
+        }
+        Right(())
+    }
+}

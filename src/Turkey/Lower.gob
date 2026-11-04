@@ -2104,15 +2104,6 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
                  mutable : Bool, rest : fun() -> Core, ty : Ty.Type,
                  at : Option Span, scope : Scope) -> Core {
     let bare = unannot(pat)
-    let name = match bare.kind {
-        PVar(n) -> n
-        _ -> {
-            let keyword = if mutable { "var" } else { "let" }
-            unsupported("this '" + keyword + "' destructures a value that can 'return', "
-                        + "'break' or 'continue', which is not supported yet; bind the "
-                        + "value to one name first, then destructure that name", at)
-        }
-    }
     if len(letBinders(l, stmt, pat)) > 0 {
         oops("a control transfer under a polymorphic 'let'", at)
     }
@@ -2123,13 +2114,23 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
     -- under whatever this binding did to the scope -- a `var` becomes a cell,
     -- and every mention of it after this point has to be a read of that cell.
     let value = conv(l, src, scope, Some(joined))
-    Map.put(scope.binders, name, [])
-    let body = if mutable {
-        Set.add(scope.cells, name)
-        let cell = node(refOf(held), at, CRef(heldVar))
-        node(ty, at, CLet(name, cell.ty, cell, rest(), []))
-    } else {
-        node(ty, at, CLet(name, held, heldVar, rest(), []))
+    let body = match bare.kind {
+        PVar(name) -> {
+            Map.put(scope.binders, name, [])
+            if mutable {
+                Set.add(scope.cells, name)
+                let cell = node(refOf(held), at, CRef(heldVar))
+                node(ty, at, CLet(name, cell.ty, cell, rest(), []))
+            } else {
+                node(ty, at, CLet(name, held, heldVar, rest(), []))
+            }
+        }
+        PWild -> rest()
+        -- A destructuring binding is a one-armed match, as in `bindPattern`.
+        _ -> {
+            let inner = if mutable { varCells(l, pat, rest, scope, at) } else { rest() }
+            matched(l, heldVar, [(bare, inner)], ty, at)
+        }
     }
     node(ty, at, CJoin(joined, [CParam { name = valueName, ty = held }],
                        body, value, False))
@@ -2584,9 +2585,4 @@ fun operands(e : Expr) -> Option (Vec Expr) = match e.kind {
     EBinary(op, left, right, _) ->
         if op == "&&" || op == "||" { None } else { Some([left, right]) }
     _ -> None
-}
-
-fun unsupported(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("unsupported", message), "")
-    Some(s) -> Diag.fail(Diag.at("unsupported", message, s), s.file)
 }

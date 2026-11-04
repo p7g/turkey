@@ -1,0 +1,227 @@
+export (
+    open, connect, connected, listen, accept, shutdownWrite, send, setNoDelay,
+    localAddress, peerAddress,
+)
+
+-- TCP sockets at the level of the system calls, for `Net.TCP`: making one,
+-- laying out its addresses, and the calls that connect, listen, accept and
+-- send. Every function answers in `Turkey.Sys.result`'s convention, a
+-- descriptor or a count, or the negated `errno`.
+--
+-- **Every descriptor is non-blocking and close-on-exec from the start.** On
+-- Linux, `socket` and `accept4` take both flags and set them in the call.
+-- Darwin has neither the flags nor `accept4`, so `fcntl` sets them straight
+-- after. No `exec` can inherit the descriptor in that window: the one place
+-- the library starts a program, `Turkey.Spawn`, closes on Darwin every
+-- descriptor the child is not given.
+--
+-- **No `SIGPIPE`.** The runtime leaves the signal at its default, which ends
+-- the process, and a write to a connection the peer has closed raises it. So
+-- a Darwin socket gets `SO_NOSIGPIPE`, and a Linux write goes through `send`
+-- with `MSG_NOSIGNAL`; either way the write fails with `EPIPE` instead.
+--
+-- **None of these calls waits.** On a non-blocking socket `connect` answers
+-- `EINPROGRESS` and `accept` and `send` answer `EAGAIN` rather than wait, and
+-- the caller parks the task on the poller (`Turkey.FD`). So each is made
+-- inline, not through `Turkey.Workers`' blocking entries.
+--
+-- **Addresses** are laid out in byte arrays lent to the call in place, as
+-- `Turkey.IO` lends its buffers, with the port and the address in network
+-- order. Darwin starts a `sockaddr` with its length and family in a byte
+-- each, where Linux has a two-byte family.
+
+import Turkey.IO as IO
+import Turkey.Libc as Libc
+import Turkey.Resolve (IP(..))
+import Turkey.Sys as Sys
+import Target (OS(..))
+import Target as Target
+
+-- A TCP socket for `ip`'s family.
+fun open(ip : IP) -> Int = match Target.os {
+    Linux -> Sys.cResult(Libc.socket(family(ip),
+                                     Sys.sockStream | Sys.sockNonBlocking | Sys.sockCloseOnExec, 0))
+    Darwin -> prepared(Sys.cResult(Libc.socket(family(ip), Sys.sockStream, 0)))
+}
+
+-- Darwin: `fd`, made close-on-exec and non-blocking and without `SIGPIPE`,
+-- or closed and the negated `errno` of the call that failed. A negative `fd`
+-- is passed through.
+fun prepared(fd : Int) -> Int {
+    if fd < 0 { return fd }
+    var r = IO.fcntlWith(fd, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+    if r >= 0 {
+        let flags = IO.fcntl(fd, Sys.getStatusFlags)
+        r = if flags < 0 { flags } else { IO.fcntlWith(fd, Sys.setStatusFlags, flags | Sys.nonBlocking()) }
+    }
+    if r >= 0 { r = setOption(fd, Sys.solSocket(), Sys.soNoSigPipe, 1) }
+    if r < 0 {
+        let _ = IO.close(fd)
+        return r
+    }
+    fd
+}
+
+-- Start connecting `fd` to `ip` and `port`: 0 if it connected at once,
+-- `-EINPROGRESS` if it goes on in the background, when `connected` says how
+-- it ended.
+fun connect(fd : Int, ip : IP, port : Int) -> Int {
+    let address = sockaddr(ip, port)
+    let r = Sys.cResult(Libc.connect(fd, IO.addressOf(address, 0), len(address)))
+    Prim.keepAlive(address)
+    r
+}
+
+-- How a connection `connect` left in progress ended, once the socket is
+-- writable: 0 if it is made, `-EAGAIN` if it is still in progress, or the
+-- negated `errno` it failed with. `SO_ERROR` gives the failure and clears it;
+-- a socket with none that has no peer has not finished.
+fun connected(fd : Int) -> Int {
+    let value = Array.filled(4, Byte.truncate(0))
+    let length = socklen(4)
+    let r = Sys.cResult(Libc.getsockopt(fd, Sys.solSocket(), Sys.soError(),
+                                        IO.addressOf(value, 0), IO.addressOf(length, 0)))
+    Prim.keepAlive(value)
+    Prim.keepAlive(length)
+    if r < 0 { return r }
+    let failed = Byte.getLE(value, 0, 4)
+    if failed != 0 { return -failed }
+    match peerAddress(fd) {
+        Right(_) -> 0
+        Left(e) -> if e == -Sys.enotconn() { -Sys.eagain() } else { e }
+    }
+}
+
+-- A socket bound to `ip` and `port` and listening, with `SO_REUSEADDR`, so
+-- that a server restarted at once can bind a port that its old connections
+-- still hold in `TIME_WAIT`. `backlog` bounds the connections the kernel
+-- holds that `accept` has not taken; it caps it at its own limit.
+fun listen(ip : IP, port : Int, backlog : Int) -> Int {
+    let fd = open(ip)
+    if fd < 0 { return fd }
+    var r = setOption(fd, Sys.solSocket(), Sys.soReuseAddress(), 1)
+    if r >= 0 {
+        let address = sockaddr(ip, port)
+        r = Sys.cResult(Libc.bind(fd, IO.addressOf(address, 0), len(address)))
+        Prim.keepAlive(address)
+    }
+    if r >= 0 { r = Sys.cResult(Libc.listen(fd, backlog)) }
+    if r < 0 {
+        let _ = IO.close(fd)
+        return r
+    }
+    fd
+}
+
+-- A connection the listening `fd` has waiting, as a new socket made as
+-- `open` makes one, with `TCP_NODELAY`; `-EAGAIN` if none is waiting.
+fun accept(fd : Int) -> Int {
+    let made = match Target.os {
+        Linux -> Sys.cResult(Libc.accept4(fd, Prim.ptrNull(), Prim.ptrNull(),
+                                          Sys.sockNonBlocking | Sys.sockCloseOnExec))
+        Darwin -> prepared(Sys.cResult(Libc.accept(fd, Prim.ptrNull(), Prim.ptrNull())))
+    }
+    if made < 0 { return made }
+    let r = setNoDelay(made)
+    if r < 0 {
+        let _ = IO.close(made)
+        return r
+    }
+    made
+}
+
+-- Turn off Nagle's algorithm, so that a small write goes out at once rather
+-- than waiting for the last one to be acknowledged. Whoever writes is then
+-- the one to coalesce what belongs together into one write.
+fun setNoDelay(fd : Int) -> Int = setOption(fd, Sys.ipprotoTCP, Sys.tcpNoDelay, 1)
+
+-- Send a FIN: the peer reads the end of input, and can still write.
+fun shutdownWrite(fd : Int) -> Int = Sys.cResult(Libc.shutdown(fd, Sys.shutWrite))
+
+-- Up to `to - from` bytes of `bytes[from..to)`: how many went, or the negated
+-- `errno`, `-EPIPE` where `write` would raise `SIGPIPE`.
+fun send(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    if from < 0 || to < from || to > len(bytes) { error("send: a window outside the array") }
+    let n = Sys.result(Libc.send(fd, IO.addressOf(bytes, from), to - from, Sys.msgNoSignal()))
+    Prim.keepAlive(bytes)
+    n
+}
+
+-- The address and port `fd` is bound to, or the negated `errno`.
+fun localAddress(fd : Int) -> Either Int (IP, Int) =
+    named(fun(at, length) = Libc.getsockname(fd, at, length))
+
+-- The address and port of `fd`'s peer, or the negated `errno`: `-ENOTCONN`
+-- if it has none.
+fun peerAddress(fd : Int) -> Either Int (IP, Int) =
+    named(fun(at, length) = Libc.getpeername(fd, at, length))
+
+-- -- underneath -----------------------------------------------------------------------
+
+fun family(ip : IP) -> Int = match ip {
+    V4(_) -> Sys.afInet
+    V6(_, _, _) -> Sys.afInet6()
+}
+
+-- `ip` and `port` as a `struct sockaddr_in` or `sockaddr_in6`.
+fun sockaddr(ip : IP, port : Int) -> Array Byte {
+    let size = match ip {
+        V4(_) -> Sys.sockaddrInBytes
+        V6(_, _, _) -> Sys.sockaddrIn6Bytes
+    }
+    let a = Array.filled(size, Byte.truncate(0))
+    match Target.os {
+        Darwin -> {
+            a[0] = Byte.truncate(size)
+            a[1] = Byte.truncate(family(ip))
+        }
+        Linux -> Byte.putLE(a, 0, 2, family(ip))
+    }
+    Byte.putBE(a, 2, 2, port)
+    match ip {
+        V4(n) -> Byte.putBE(a, 4, 4, n)
+        V6(high, low, scope) -> {
+            Byte.putBE(a, 8, 8, high)
+            Byte.putBE(a, 16, 8, low)
+            Byte.putLE(a, 24, 4, scope)
+        }
+    }
+    a
+}
+
+-- What `call(address, length)` stores, read as an address and a port.
+fun named(call : fun(Prim.Ptr, Prim.Ptr) -> Int) -> Either Int (IP, Int) {
+    let a = Array.filled(Sys.sockaddrIn6Bytes, Byte.truncate(0))
+    let length = socklen(Sys.sockaddrIn6Bytes)
+    let r = Sys.cResult(call(IO.addressOf(a, 0), IO.addressOf(length, 0)))
+    Prim.keepAlive(a)
+    Prim.keepAlive(length)
+    if r < 0 { return Left(r) }
+    let kind = match Target.os {
+        Darwin -> Byte.toInt(a[1])
+        Linux -> Byte.getLE(a, 0, 2)
+    }
+    let port = Byte.getBE(a, 2, 2)
+    if kind == Sys.afInet { Right((V4(Byte.getBE(a, 4, 4)), port)) }
+    else if kind == Sys.afInet6() {
+        Right((V6(Byte.getBE(a, 8, 8), Byte.getBE(a, 16, 8), Byte.getLE(a, 24, 4)), port))
+    } else {
+        Left(-Sys.eafnosupport())
+    }
+}
+
+-- A `socklen_t` holding `n`, to lend to a call that reads and stores it.
+fun socklen(n : Int) -> Array Byte {
+    let a = Array.filled(4, Byte.truncate(0))
+    Byte.putLE(a, 0, 4, n)
+    a
+}
+
+-- Set an `int` socket option.
+fun setOption(fd : Int, level : Int, name : Int, value : Int) -> Int {
+    let v = Array.filled(4, Byte.truncate(0))
+    Byte.putLE(v, 0, 4, value)
+    let r = Sys.cResult(Libc.setsockopt(fd, level, name, IO.addressOf(v, 0), 4))
+    Prim.keepAlive(v)
+    r
+}

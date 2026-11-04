@@ -77,6 +77,25 @@ def test_a_value_is_computed_once_however_many_ask(workers):
     assert result.stdout == "200\nmade\n1\n"
 
 
+# A task that holds a mutex finds it held; once it is released, it is free.
+TRY = """
+import System.Sync as Sync
+
+fun main() {
+    let m = Sync.mutex(5)
+    print(Sync.withLock(m, fun(_) = Sync.tryWithLock(m, fun(v) = v + 1)))
+    print(Sync.tryWithLock(m, fun(v) = v + 1))
+    print(Sync.withLock(m, fun(v) = v))
+}
+"""
+
+
+def test_trying_a_held_mutex_does_not_wait():
+    result = lang.run(TRY)
+    assert result.code == 0, result.stderr
+    assert result.stdout == "None\nSome(6)\n5\n"
+
+
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_taking_a_mutex_twice_is_a_deadlock(workers):
     result = lang.run("""

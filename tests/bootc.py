@@ -228,18 +228,21 @@ def digest(*parts: bytes) -> str:
 
 
 def link(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
-         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+         env: dict[str, str] | None = None,
+         libraries: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
     """`boot build` of `entry` to an object beside `output`, linked into
     `output` with the C compiler and the runtime's libraries. Answers `boot`'s
     run, whose stderr a caller may read. `flags` go to `boot` before the
-    entry."""
+    entry; `libraries` go to the linker after the runtime's, such as
+    `toolchain.openssl_libraries()` for a program that imports `Net.TLS`."""
     obj = output.with_name(output.name + ".o")
     compiled = subprocess.run(
         toolchain.command(binary(), "build", "-o", str(obj), *flags, str(entry)),
         cwd=cwd, env=env, capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
     linked = subprocess.run([*toolchain.cc(), "-o", str(output), str(obj),
-                             *toolchain.libraries()], capture_output=True, text=True)
+                             *toolchain.libraries(), *libraries],
+                            capture_output=True, text=True)
     assert linked.returncode == 0, linked.stderr[-4000:]
     return compiled
 

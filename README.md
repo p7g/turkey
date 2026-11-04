@@ -84,6 +84,19 @@ cc -o rectangles rectangles.o
 On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
 the maths functions the library calls out of libc.
 
+A program that imports `Net.TLS` also links OpenSSL 3: add `-lssl -lcrypto`.
+On Linux that is the system's (`apt-get install libssl-dev` on Debian and
+Ubuntu). On a Mac it is Homebrew's, since the system's own
+`/usr/lib/libcrypto.dylib` ends any process that loads it:
+
+```sh
+brew install openssl@3
+cc -o client client.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
+```
+
+The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
+make their certificates with that installation's `openssl`.
+
 Run the compiler from the repository root, where it finds `lib/`. It has two
 commands. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or

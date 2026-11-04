@@ -49,6 +49,7 @@ export (
 -- Every socket is close-on-exec, so a program started later does not inherit
 -- it.
 
+import Net (Connection(..), Accept(..))
 import Time (Timeout(..))
 import Turkey.Buffer (Buffer(..))
 import Turkey.ConnectPolicy (Destination(..))
@@ -177,7 +178,12 @@ fun listen(address : IP, port : Int) -> Either IOError Listener {
 -- The next connection to `l`, waiting for one to arrive: `Closed` if `l` is
 -- closed, before or during the wait. Tasks that call it at once take turns,
 -- and each connection goes to one of them.
-fun accept(l : Listener) -> Either IOError Socket {
+instance Accept Listener {
+    type Accepted = Socket
+    fun accept(l) = acceptNext(l)
+}
+
+fun acceptNext(l : Listener) -> Either IOError Socket {
     let n = FD.readingWith(l.fd, fun(number) {
         let r = Calls.accept(number)
         -- A connection the peer gave up before it was taken: try at once
@@ -201,27 +207,20 @@ fun closeListener(l : Listener) -> Either IOError Unit = closed(l.fd, None)
 
 -- -- connections ----------------------------------------------------------------------
 
--- Send the end of input: the peer reads it after everything written before,
--- and can go on writing. A write after it fails. It waits for a write in
--- progress to finish, so it never lands inside one.
-fun shutdownWrite(s : Socket) -> Either IOError Unit {
-    let r = FD.writingWith(s.fd, fun(n) = Calls.shutdownWrite(n), -1)
-    if r < 0 { Left(failure("shutdown", s.name, r)) } else { Right(()) }
-}
-
--- Close `s`. A read or a write parked on it, in any task, ends with
--- `Closed`, as does every later one. Closing it again does nothing.
-fun close(s : Socket) -> Either IOError Unit = closed(s.fd, s.name)
-
--- Bound every read and write on `s` from now on by `timeout`: a `Duration`
--- from now, or a `Deadline`.
-fun setDeadline[Timeout t](s : Socket, timeout : t) -> Unit {
-    s.deadline = ConnectPolicy.limit(timeout)
-}
-
--- Let reads and writes on `s` wait without limit again.
-fun clearDeadline(s : Socket) -> Unit {
-    s.deadline = -1
+-- `shutdownWrite` waits for a write in progress to finish, so it never lands
+-- inside one. A deadline bounds every read and write from when it is set.
+instance Connection Socket {
+    fun setDeadline(s, timeout) {
+        s.deadline = ConnectPolicy.limit(timeout)
+    }
+    fun clearDeadline(s) {
+        s.deadline = -1
+    }
+    fun shutdownWrite(s) {
+        let r = FD.writingWith(s.fd, fun(n) = Calls.shutdownWrite(n), -1)
+        if r < 0 { Left(failure("shutdown", s.name, r)) } else { Right(()) }
+    }
+    fun close(s) = closed(s.fd, s.name)
 }
 
 -- The address and port `s` is bound to on this machine.

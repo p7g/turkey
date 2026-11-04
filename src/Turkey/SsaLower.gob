@@ -1762,9 +1762,9 @@ fun positions(binders : Array (Option String), types : Array Ty.Type,
     out
 }
 
--- Opening a packed existential: the tag, then the stored layout codes against
--- the ones this copy of the arm was lowered for, then the carried dictionaries,
--- then the fields.
+-- Opening a packed existential: the tag, then the stored index against the one
+-- this copy of the arm was lowered for, then the carried dictionaries, then
+-- the fields.
 fun opened(l : Lower, name : String, binders : Array (Option String), o : Opening,
            v : Value, ty : Ty.Type, success : BlockId, failure : BlockId) -> Unit {
     let layouts = match o.layouts {
@@ -1772,28 +1772,29 @@ fun opened(l : Lower, name : String, binders : Array (Option String), o : Openin
         None -> return stop1(l, "an arm opening '" + name
                              + "' reached the backend without its layouts")
     }
-    let info = match Decls.con(l.decls, name) {
+    let index = match Layout.packingIndex(l.decls, name, layouts) {
         Some(i) -> i
-        None -> return stop1(l, "unknown constructor '" + name + "'")
+        None -> return stop1(l, "an arm opening '" + name + "' at "
+                             + Ssa.keyName(layouts) + ", which nothing packs")
     }
     let skolemTypes = Array.map(o.skolems, TCon)
     let types = match Decls.conFieldTypesOpened(l.decls, ty, name, skolemTypes) {
         Some(ts) -> ts
         None -> return stop1(l, "the fields of '" + name + "' opened at " + Ty.show(ty))
     }
-    -- What `packed` built: a code per hidden variable, the dictionaries, the
-    -- fields.
-    let exists = len(info.exists)
+    -- What `packed` built: the index, the dictionaries, the fields.
     let carried = len(o.evidence)
-    let reps = Array.init(exists + carried + len(types), fun(i) =
-        if i < exists { Ssa.untraced(I64) }
-        else if i < exists + carried { Ssa.traced(Ptr) }
-        else { repOf(l, types[i - exists - carried]) })
+    let reps = Array.init(1 + carried + len(types), fun(i) =
+        if i == 0 { Ssa.untraced(I64) }
+        else if i <= carried { Ssa.traced(Ptr) }
+        else { repOf(l, types[i - 1 - carried]) })
     let layout = Rt.layout(reps)
     if !tested(l, v, name, failure) { return }
-    for var i = 0; i < len(layouts); i = i + 1 {
-        let code = L.emit(l.b, ObjectGet(v, L.fieldRef(layout, i)), Ssa.untraced(I64))
-        let want = L.emit(l.b, ConstInt(keyCode(layouts[i])), Ssa.untraced(I64))
+    -- A constructor packed at one key has one copy of each arm opening it, and
+    -- nothing to tell apart, as `tested` reasons for a tag.
+    if Layout.packingCount(l.decls, name) > 1 {
+        let code = L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 0)), Ssa.untraced(I64))
+        let want = L.emit(l.b, ConstInt(index), Ssa.untraced(I64))
         let test = L.emit(l.b, Cmp(Eq, code, want), Ssa.untraced(I1))
         let next = L.block(l.b)
         L.terminate(l.b, Branch(test, next, failure))
@@ -1801,9 +1802,9 @@ fun opened(l : Lower, name : String, binders : Array (Option String), o : Openin
     }
     for var i = 0; i < len(o.evidence); i = i + 1 {
         Map.put(l.env, o.evidence[i],
-                L.emit(l.b, ObjectGet(v, L.fieldRef(layout, exists + i)), Ssa.traced(Ptr)))
+                L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 1 + i)), Ssa.traced(Ptr)))
     }
-    destructure(l, v, layout, positions(binders, types, exists + carried))
+    destructure(l, v, layout, positions(binders, types, 1 + carried))
     L.terminate(l.b, Jump(success, []))
 }
 
@@ -2854,9 +2855,10 @@ fun fieldsOf(subject : String) -> fun(Int) -> String =
     fun(n) = subject + " has " + Int.toString(n) + " fields, and a value can have at most "
              + Int.toString(Rt.fieldLimit)
 
--- A packed existential: one layout code per hidden variable, then the carried
--- dictionaries, then the fields. The codes are what an opening
--- compares against the layouts its arm's copy was lowered for.
+-- A packed existential: the index of its hidden variables' layouts in the
+-- table of keys the constructor is packed at, then the carried dictionaries,
+-- then the fields. The index is what an opening compares against the one its
+-- arm's copy was lowered for.
 fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
            tag : Int) -> Value {
     let parts = match Layout.packedKeyParts(l.decls, info, args, l.layouts) {
@@ -2864,42 +2866,28 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
         None -> return stop(l, "packing '" + name
                             + "' at a layout that is not knowable here")
     }
+    -- Nothing reads the index of a constructor nothing opens.
+    let index = if !Layout.isOpened(l.decls, name) { 0 } else {
+        match Layout.packingIndex(l.decls, name, parts) {
+            Some(i) -> i
+            None -> return stop(l, "packing '" + name + "' at " + Ssa.keyName(parts)
+                                + ", which is not in its table")
+        }
+    }
     let refusal = fun(n) = "constructor '" + Ty.shortName(name) + "' needs " + Int.toString(n)
-        + " fields, counting one for each hidden type and each constraint, and a value can "
-        + "have at most " + Int.toString(Rt.fieldLimit) + "; move some fields into a record"
-    if wide(l, len(parts) + len(args), refusal) {
+        + " fields, counting one for its hidden types and one for each constraint, and a "
+        + "value can have at most " + Int.toString(Rt.fieldLimit)
+        + "; move some fields into a record"
+    if wide(l, 1 + len(args), refusal) {
         return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
-    let values = Array.init(len(parts) + len(args), fun(i) =
-        if i < len(parts) {
-            L.emit(l.b, ConstInt(keyCode(parts[i])), Ssa.untraced(I64))
+    let values = Array.init(1 + len(args), fun(i) =
+        if i == 0 {
+            L.emit(l.b, ConstInt(index), Ssa.untraced(I64))
         } else {
-            value(l, args[i - len(parts)])
+            value(l, args[i - 1])
         })
     built(l, 1, tag, values, 0, "packs an existential, " + Ty.shortName(name))
-}
-
--- A layout's code as a packed value stores it, which names one layout and
--- nothing else: its position in `Layout.openedLayouts`, or for a layout of
--- several slots one base-8 digit per slot, the first lowest, each the slot's
--- `Rt.layoutCode`. No such digit is 0, so a code of several slots is at least
--- 9 and its digits say how many slots it has.
-fun keyCode(layout : Ssa.Layout) -> Int {
-    var i = 0
-    for opened in Layout.openedLayouts {
-        if opened == layout { return i }
-        i = i + 1
-    }
-    if len(layout.slots) < 2 {
-        oops("a packed type held at " + Ssa.layoutName(layout))
-    }
-    var code = 0
-    var scale = 1
-    for r in layout.slots {
-        code = code + scale * Rt.layoutCode(r)
-        scale = scale * 8
-    }
-    code
 }
 
 fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {

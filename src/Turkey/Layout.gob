@@ -1,6 +1,6 @@
 export (
     Flat(..), layoutOf, flatOf, unfolds, storedRep, flatLimit, share, packedKeyParts,
-    openedLayouts, skolemKey, unknownLayouts,
+    packingIndex, packingCount, isOpened, skolemKey, unknownLayouts,
 )
 
 -- One compiled body per distinct *layout* of the type arguments: the pass that
@@ -101,17 +101,6 @@ let ptr = one(Ssa.traced(Ptr))
 let addr = one(Ssa.untraced(Ptr))
 
 fun one(slot : Rep) -> Layout = Layout { slots = [slot] }
-
--- Every layout of one slot or none a packed variable can be stored at, in the
--- order an opened arm is copied for them before the program's packings are
--- known. A layout of several slots is copied for only once some packing is
--- found to store it (`share`): there are thousands of them.
---
--- `addr` is deliberately absent: the number of copies is
--- `len(openedLayouts)^arity`, so an entry here is paid for by every existential
--- in the program, and nothing packs a raw pointer into one. Listed rather than
--- derived so that the cost of adding one is visible.
-let openedLayouts = [unit_, i1, i8, i32, i64, f64, ptr]
 
 -- How many atoms one binding's key may have. Only polymorphic recursion
 -- through a family can grow the set without bound -- `f[t]` calling
@@ -869,10 +858,9 @@ type Sharer = Sharer {
     atoms   : Map String (Vec Ty.Type),
     -- Each binding's families, with the equations it was checked under.
     fams    : Map String (Option Ty.Families),
-    -- Which layout keys each existential constructor is packed at, when known;
-    -- an opened arm is copied for those alone. `None` copies every key of
-    -- `openedLayouts`, which is the first of `share`'s runs.
-    packed  : Option Packed,
+    -- Which keys each existential constructor is packed at, as far as the
+    -- runs before this one found; an opened arm is copied for those alone.
+    packed  : Packed,
     -- "original|key" -> the name built for it.
     done    : Map String String,
     -- original -> the copies, in request order.
@@ -930,14 +918,15 @@ fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
 -- The program with every generic binding replaced by one copy per layout its
 -- callers need.
 --
--- At least twice when the program opens an existential: once copying every
--- opened arm for every layout in `openedLayouts`, which is what makes every
--- packing's layouts knowable, and again copying each arm only for the keys
--- some reachable packing stores. A key of several slots is in no
--- `openedLayouts` combination, so an arm copied for one in the second run is
--- new, and may pack keys of its own; the run is repeated with those until a
--- run packs no key it did not copy for. The keys only grow, and there are
--- finitely many.
+-- Repeated while a constructor that some arm opens is found packed at a key
+-- its arms were not copied for. An opened arm is copied for the keys in its
+-- constructor's table and no others (`openingKeys`), and every table starts
+-- empty, so the first run copies no opened arm. Each later run copies the arms
+-- for what the runs before it found packed, and an arm copied for a new key can
+-- pack a key of its own: an arm that opens `C(x)` and packs `C((x, x))` packs
+-- `C` at twice the slots it opened it at. The tables only grow, and they
+-- are finite: a key is one layout per hidden variable, and a layout is at most
+-- `flatLimit` slots, since a type with more is boxed and held at one `ptr`.
 --
 -- And again while calls through unknown dictionaries ask for method keys the
 -- dictionaries were not built with: a dictionary's fields are decided before
@@ -955,35 +944,36 @@ fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
             }
         }
     }
+    let opened = openedConstructors(program)
+    let packed = Map.new()
+    for con in Set.elements(opened) { Map.put(packed, con, Map.new()) }
     let keys = Map.new()
     loop {
         publish(classes, keys)
-        let (first, asked1) = shareOnce(program, decls, classes, main, None, keys)
-        var out = first
-        var asked = asked1
-        if opensAnywhere(program) {
-            let packed = packedLayouts(first, decls)
-            loop {
-                let (next, nextAsked) = shareOnce(program, decls, classes, main,
-                                                  Some(packed), keys)
-                out = next
-                asked = nextAsked
-                if !mergePacked(packed, packedLayouts(next, decls)) { break }
+        loop {
+            let (out, asked) = shareOnce(program, decls, classes, main, packed, keys)
+            -- A program that opens nothing has no table to fill: skip the walk.
+            if len(Map.keys(packed)) > 0 && mergePacked(packed, packedLayouts(out, decls, packed)) {
+                continue
             }
+            if mergeKeys(keys, asked) { break }
+            numberPackings(decls, packed)
+            return out
         }
-        if !mergeKeys(keys, asked) { return out }
     }
 }
 
--- Constructor -> key name -> the key's layouts: what `packedLayouts` finds.
+-- Constructor -> key name -> the key's layouts, in the order they were found.
+-- One entry for each constructor some arm opens, and none for any other: a
+-- value of a constructor nothing opens is never asked which key it was packed
+-- at, so it has no table.
 type Packed = Map String (Map String (Vec Layout))
 
 -- Add `more` to `into`, answering whether anything was new.
 fun mergePacked(into : Packed, more : Packed) -> Bool {
     var grew = False
     for (con, found) in Map.entries(more) {
-        let have = Map.getOr(into, con, Map.new())
-        Map.put(into, con, have)
+        let have = into[con]
         for (k, parts) in Map.entries(found) {
             if !Map.contains(have, k) {
                 Map.put(have, k, parts)
@@ -993,6 +983,46 @@ fun mergePacked(into : Packed, more : Packed) -> Bool {
     }
     grew
 }
+
+-- Record each constructor's table in `decls.packings`, numbering its keys in
+-- the order they were found.
+--
+-- **The tables are whole-program: every key an opened constructor is packed at
+-- anywhere is in its table.** `share` numbers them after its last run, whose
+-- packings were all merged in, and that run's program is the one the backend
+-- lowers. Every arm in it was copied for a key some run found packed. So a
+-- pack site and an opener look a key up in the same table: the index a packed
+-- value stores is the index the opened arm's copy compares it against.
+fun numberPackings(decls : DeclTable, packed : Packed) -> Unit {
+    for (con, found) in Map.entries(packed) {
+        let numbered = Map.new()
+        var i = 0
+        for k in Map.keys(found) {
+            Map.put(numbered, k, i)
+            i = i + 1
+        }
+        Map.put(decls.packings, con, numbered)
+    }
+}
+
+-- The index of `parts` in the table of keys `name` is packed at: what a packed
+-- value stores for its hidden variables. `None` if nothing packs `name` there.
+fun packingIndex(decls : DeclTable, name : String, parts : Vec Layout) -> Option Int =
+    match Map.get(decls.packings, name) {
+        Some(numbered) -> Map.get(numbered, Ssa.keyName(parts))
+        None -> None
+    }
+
+-- Whether some arm opens `name`. A value of a constructor nothing opens is
+-- never asked which key it was packed at, and has no table.
+fun isOpened(decls : DeclTable, name : String) -> Bool = Map.contains(decls.packings, name)
+
+-- How many keys `name` is packed at in the whole program.
+fun packingCount(decls : DeclTable, name : String) -> Int =
+    match Map.get(decls.packings, name) {
+        Some(numbered) -> len(Map.keys(numbered))
+        None -> 0
+    }
 
 -- Add `more` to `into`, answering whether anything was new.
 fun mergeKeys(into : Keys, more : Keys) -> Bool {
@@ -1037,19 +1067,22 @@ fun publish(classes : ClassTable, keys : Keys) -> Unit {
     }
 }
 
-fun opensAnywhere(program : CProgram) -> Bool {
-    let found = Vec.new(1)
+-- Every constructor some arm in `program` opens.
+fun openedConstructors(program : CProgram) -> Set.Set String {
+    let found = Set.new()
     for b in Vec.append(program.dicts, program.binds) {
         opensInto(b.value, found)
     }
-    len(found) > 0
+    found
 }
 
-fun opensInto(e : Core, found : Vec Bool) -> Unit {
-    if len(found) > 0 { return {} }
+fun opensInto(e : Core, found : Set.Set String) -> Unit {
     match e.kind {
         CMatch(_, alts) -> for alt in alts {
-            if Option.isSome(openingOf(alt.alt)) { Vec.push(found, True) }
+            match alt.alt {
+                ACon(name, _, Some(_)) -> Set.add(found, name)
+                _ -> {}
+            }
         }
         _ -> {}
     }
@@ -1067,7 +1100,7 @@ fun opensInto(e : Core, found : Vec Bool) -> Unit {
 }
 
 fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
-              main : String, packed : Option Packed,
+              main : String, packed : Packed,
               keys : Keys) -> (CProgram, Keys) {
     let binds = Map.new()
     let generic = Set.new()
@@ -1900,7 +1933,7 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Vec CAlt,
     for alt in alts {
         match alt.alt {
             ACon(name, fields, Some(o)) -> if Option.isNone(o.layouts) {
-                for parts in openingKeys(s, scrutinee, name, o, abstracted) {
+                for parts in openingKeys(s, scrutinee, name, abstracted) {
                     let copy = ACon(name, fields, Some(Opening {
                         evidence = o.evidence, skolems = o.skolems,
                         layouts = Some(parts),
@@ -1917,33 +1950,20 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Vec CAlt,
     mkCore(e.ty, e.span, CMatch(rewrite(s, scrutinee, sc), out))
 }
 
--- The keys an arm opening `name` is copied for: one per combination of
--- layouts for its constants -- unless the value being opened is a packing
--- right here, in which case it is the one key that packing stores.
-fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
+-- The keys an arm opening `name` is copied for: the ones `name` is packed at,
+-- as far as the runs so far found -- unless the value being opened is a
+-- packing right here, in which case it is the one key that packing stores.
+-- None, for a constructor nothing packs: no value reaches the arm.
+fun openingKeys(s : Sharer, scrutinee : Core, name : String,
                 abstracted : Map String Layout) -> Vec (Vec Layout) {
     match knownKey(s, scrutinee, name, abstracted) {
         Some(parts) -> return [parts]
         None -> {}
     }
-    let allowed = match s.packed {
-        None -> return keyChoices(len(o.skolems))
-        Some(table) -> Map.getOr(table, name, Map.new())
+    match Map.get(s.packed, name) {
+        Some(found) -> Vec.fromArray(Map.values(found))
+        None -> []
     }
-    -- In `keyChoices`' order, then the keys of several slots by name.
-    let keys = Vec.new(8)
-    let taken = Set.new()
-    for parts in keyChoices(len(o.skolems)) {
-        let k = Ssa.keyName(parts)
-        if Map.contains(allowed, k) {
-            Vec.push(keys, parts)
-            Set.add(taken, k)
-        }
-    }
-    for k in Array.sort(Map.keys(allowed)) {
-        if !Set.contains(taken, k) { Vec.push(keys, allowed[k]) }
-    }
-    keys
 }
 
 -- The scope inside an arm: the layouts around it, and the constants it opens
@@ -1963,22 +1983,6 @@ fun inArm(sc : Scope, alt : Alt) -> Scope {
     }
     Scope { owner = sc.owner, chain = Array.append(sc.chain, [inner]),
             locals = sc.locals }
-}
-
--- Every key of `n` layouts drawn from `openedLayouts`, the last layout
--- varying fastest.
-fun keyChoices(n : Int) -> Vec (Vec Layout) {
-    var out = [Vec.new(0)]
-    for var i = 0; i < n; i = i + 1 {
-        let next = Vec.new(len(out) * len(openedLayouts))
-        for prefix in out {
-            for layout in openedLayouts {
-                Vec.push(next, Vec.append(prefix, [layout]))
-            }
-        }
-        out = next
-    }
-    out
 }
 
 -- The layouts an opening must be for, when what it opens is a packing written
@@ -2009,8 +2013,9 @@ fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {
     _ -> []
 }
 
--- The layouts one packing stores for its hidden variables, or `None` if they
--- are not knowable here. Matched one way, so no type is changed.
+-- The key one packing is at -- one layout per hidden variable, which the
+-- packed value records as its index in the constructor's table -- or `None` if
+-- the layouts are not knowable here. Matched one way, so no type is changed.
 fun packedKeyParts(decls : DeclTable, info : ConInfo, args : Array Core,
                    abstracted : Map String Layout) -> Option (Vec Layout) {
     let found = Map.new()
@@ -2077,96 +2082,56 @@ fun matchTypes(pattern : Ty.Type, target : Ty.Type,
     _ -> False
 }
 
--- For each existential constructor, the layout keys some reachable packing
--- stores. A packing inside a copy of an opened arm happens only if that copy is
--- ever taken, so it counts once the key its arm was copied for is itself packed
--- somewhere.
-fun packedLayouts(program : CProgram, decls : DeclTable) -> Packed {
-    let records = Vec.new(8)
+-- For each constructor in `tables`, the keys `program` packs it at.
+--
+-- Every packing is in a body compiled at known layouts -- a copy, or an arm
+-- copied for one key -- so each stores a key this finds. One it cannot know is
+-- a bug in the copying.
+fun packedLayouts(program : CProgram, decls : DeclTable, tables : Packed) -> Packed {
+    let out = Map.new()
+    for con in Map.keys(tables) { Map.put(out, con, Map.new()) }
     for b in Vec.append(program.dicts, program.binds) {
-        packingsInto(decls, b.value, b.layouts, [], records)
+        packingsInto(decls, b.value, b.layouts, out)
     }
-    let live = Map.new()
-    var grew = True
-    while grew {
-        grew = False
-        for (name, key, conditions) in records {
-            var ready = True
-            for cond in conditions {
-                let (con, want) = cond
-                if !Map.contains(Map.getOr(live, con, Map.new()), want) {
-                    ready = False
-                }
-            }
-            if !ready { continue }
-            let have = match Map.get(live, name) {
-                Some(found) -> found
-                None -> {
-                    let made = Map.new()
-                    Map.put(live, name, made)
-                    made
-                }
-            }
-            let keys = match key {
-                Some(one) -> [one]
-                None -> keyChoices(len(existsOf(decls, name)))
-            }
-            for one in keys {
-                let k = Ssa.keyName(one)
-                if !Map.contains(have, k) {
-                    Map.put(have, k, one)
-                    grew = True
-                }
-            }
-        }
-    }
-    live
+    out
 }
 
-fun existsOf(decls : DeclTable, name : String) -> Vec VarCell =
-    match Decls.con(decls, name) {
-        Some(info) -> info.exists
-        None -> []
-    }
-
+-- Add each packing in `e` of a constructor `out` has a table for.
 fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String Layout,
-                 conditions : Vec (String, String),
-                 out : Vec (String, Option (Vec Layout),
-                              Vec (String, String))) -> Unit {
+                 out : Packed) -> Unit {
     match e.kind {
         CMatch(scrutinee, alts) -> {
-            packingsInto(decls, scrutinee, abstracted, conditions, out)
+            packingsInto(decls, scrutinee, abstracted, out)
             for alt in alts {
                 let inner = Map.new()
                 for (id_, layout) in Map.entries(abstracted) {
                     Map.put(inner, id_, layout)
                 }
-                let held = Vec.new(len(conditions))
-                for c in conditions { Vec.push(held, c) }
-                match alt.alt {
-                    ACon(name, _, Some(o)) -> match o.layouts {
-                        Some(ls) -> {
-                            for var j = 0; j < len(o.skolems) && j < len(ls);
-                                j = j + 1 {
-                                Map.put(inner, skolemKey(o.skolems[j]), ls[j])
-                            }
-                            Vec.push(held, (name, Ssa.keyName(ls)))
+                match openingOf(alt.alt) {
+                    Some(o) -> match o.layouts {
+                        Some(ls) -> for var j = 0; j < len(o.skolems) && j < len(ls);
+                                        j = j + 1 {
+                            Map.put(inner, skolemKey(o.skolems[j]), ls[j])
                         }
                         None -> {}
                     }
-                    _ -> {}
+                    None -> {}
                 }
-                packingsInto(decls, alt.body, inner, held, out)
+                packingsInto(decls, alt.body, inner, out)
             }
             return {}
         }
         CApp(fn, args) -> match fn.kind {
-            CCon(name) -> match Decls.con(decls, name) {
-                Some(info) -> if len(info.exists) > 0 {
-                    Vec.push(out, (name, packedKeyParts(decls, info, args,
-                                                          abstracted), conditions))
+            CCon(name) -> match (Map.get(out, name), Decls.con(decls, name)) {
+                (Some(have), Some(info)) -> match packedKeyParts(decls, info, args, abstracted) {
+                    Some(parts) -> {
+                        let k = Ssa.keyName(parts)
+                        if !Map.contains(have, k) { Map.put(have, k, parts) }
+                    }
+                    None -> oopsAt("packing '" + name
+                                   + "' at layouts that are not knowable here", e)
                 }
-                None -> {}
+                _ -> {}
             }
             _ -> {}
         }
@@ -2174,12 +2139,12 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String Layout,
     }
     discard(mapKind(e.kind, Mapper {
         expr = fun(x) = {
-            packingsInto(decls, x, abstracted, conditions, out)
+            packingsInto(decls, x, abstracted, out)
             x
         },
         type_ = fun(t) = t,
         bind = fun(b) = {
-            packingsInto(decls, b.value, b.layouts, conditions, out)
+            packingsInto(decls, b.value, b.layouts, out)
             b
         },
     }))

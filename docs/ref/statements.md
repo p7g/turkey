@@ -252,7 +252,7 @@ fun main() {
 8
 ```
 
-`B` must not reach its end, because the variables would then have no value.
+`B` must not fall through, because the variables would then have no value.
 It has to finish with `return`, `break` or `continue`, or with a call to a
 function that never returns. A function never returns when its result type is
 a type variable that none of its parameters mention, as in `error : fun(String)
@@ -275,7 +275,7 @@ fun main() {
 8080
 ```
 
-<!-- error: this 'else' block can reach its end; it must end in 'return', 'break', 'continue' or a call that never returns -->
+<!-- error: this 'else' block can fall through; it must end in 'return', 'break', 'continue' or a call that never returns -->
 ```kotlin
 fun port(text : String) -> Int {
     let Some(n) = Int.parse(text) else { print("not a port") }

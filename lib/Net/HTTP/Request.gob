@@ -1,0 +1,62 @@
+export (Request(..), RequestTarget(..), Target(..), request, segments)
+
+-- A request: a method, which carries the body, a target, and header fields.
+--
+--     request(GET, "https://api.example.com/users/1")
+--         |> header(Accept, MediaType.json)
+--
+-- The record's constructor is exported, and its fields are read and built
+-- directly, because each field's type holds its own invariant: a `Method`
+-- cannot put a body on a GET, a target is a `Target`, and `Headers` cannot
+-- hold a field the library writes itself. No combination of valid fields is
+-- an invalid request.
+--
+-- **The target is a type parameter.** A client's request is sent to a
+-- `Target`: an `HTTPURL`, or a `String`, which is parsed when the request is
+-- sent, so that a URL written as a literal needs no `?` and a bad one is
+-- reported by `send`. A server's request has a `RequestTarget`, the path and
+-- query it arrived with.
+
+import Net.HTTP.Headers as Headers (Headers, HasHeaders(..))
+import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
+import Net.HTTP.Method (Method)
+import URL as URL (URLError)
+
+type Request t b = Request { method : Method b, target : t, headers : Headers }
+
+instance HasHeaders (Request t b) {
+    fun headers(r) = r.headers
+    fun withHeaders(r, hs) = Request { method = r.method, target = r.target, headers = hs }
+}
+
+-- What a client can send a request to.
+class Target t { fun httpURL(t) -> Either URLError HTTPURL }
+
+instance Target HTTPURL { fun httpURL(u) = Right(u) }
+instance Target String { fun httpURL(s) = HTTPURL.parse(s) }
+
+-- Returns a request with no headers.
+fun request[Target t](m : Method b, t : t) -> Request t b =
+    Request { method = m, target = t, headers = Headers.empty }
+
+-- The target of a request a server received, as the codec read it from the
+-- request line and the `Host` field.
+--
+-- `path` is encoded, exactly as it arrived (`*` for `OPTIONS *`); `segments`
+-- decodes it. `authority` is the host and port the request was sent to, from
+-- `Host` or from an absolute-form target, which must agree. The strings are
+-- the codec's checked input: nothing sends a `RequestTarget`, so a program
+-- that builds one, to test a handler, cannot put it on the wire.
+type RequestTarget = RequestTarget { authority : Option String, path : String, query : Option String }
+
+-- Returns the path's segments, decoded: `/a%20b/c` is `["a b", "c"]`.
+-- Returns `None` if a segment is not UTF-8 once decoded.
+fun segments(t : RequestTarget) -> Option (Array String) {
+    let body = Option.unwrapOr(String.stripPrefix(t.path, "/"), t.path)
+    if body == "" { return Some([""]) }
+    let out = []
+    for part in String.split(body, "/") {
+        Vec.push(out, URL.decode(part)?)
+    }
+    Some(Vec.toArray(out))
+}

@@ -1,0 +1,80 @@
+export (encode, decode)
+
+-- Base64 as RFC 4648 §4 defines it: the standard alphabet, `A-Z a-z 0-9 + /`,
+-- with `=` padding.
+--
+--     Base64.encode(String.toBytes("Man"))      -- "TWFu"
+--     Base64.decode("TWE=")                      -- Some([77, 97])
+--
+-- Bytes go in and come out, since base64 exists to carry bytes that are not
+-- text; a caller that has text converts it with `String.toBytes` and
+-- `String.fromBytes`.
+--
+-- **Decoding is strict.** It takes exactly what `encode` writes and refuses
+-- everything else: no line breaks or spaces, no missing padding, no `=`
+-- except at the end, and no bits set after the last byte (RFC 4648 §3.5). So
+-- each byte string has one encoding, and two decoders that compare encoded
+-- text cannot disagree about what it holds.
+
+import Data.String (String(..))
+
+-- The sextet each alphabet byte stands for, or -1.
+let values = {
+    let table = Array.filled(256, -1)
+    for var i = 0; i < 64; i = i + 1 { table[Byte.toInt(String.bytesOf(alphabet)[i])] = i }
+    table
+}
+
+let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+-- Returns `bytes` encoded, padded to a multiple of four characters.
+fun encode[Index c, Length c, Key c ~ Int, Value c ~ Byte](bytes : c) -> String {
+    let n = len(bytes)
+    -- Every byte written is ASCII, so the buffer is UTF-8 as it stands and
+    -- becomes the string without a check.
+    let out = Prim.arrayNewUninit((n + 2) / 3 * 4)
+    for var i = 0; i < n; i = i + 3 {
+        let b1 = if i + 1 < n { Byte.toInt(bytes[i + 1]) } else { 0 }
+        let b2 = if i + 2 < n { Byte.toInt(bytes[i + 2]) } else { 0 }
+        let group = (Byte.toInt(bytes[i]) << 16) | (b1 << 8) | b2
+        let at = i / 3 * 4
+        out[at] = sextet(group >> 18)
+        out[at + 1] = sextet(group >> 12)
+        out[at + 2] = if i + 1 < n { sextet(group >> 6) } else { pad }
+        out[at + 3] = if i + 2 < n { sextet(group) } else { pad }
+    }
+    String(out)
+}
+
+fun sextet(n : Int) -> Byte = String.bytesOf(alphabet)[n & 63]
+
+-- Returns the bytes `text` encodes, or `None` if it is not exactly what
+-- `encode` would write for them.
+fun decode(text : String) -> Option (Array Byte) {
+    let chars = String.bytesOf(text)
+    let n = len(chars)
+    if n % 4 != 0 { return None }
+    let padding = if n == 0 { 0 } else if chars[n - 1] != pad { 0 } else if chars[n - 2] != pad { 1 } else { 2 }
+    let out = Array.filled(n / 4 * 3 - padding, Byte.truncate(0))
+    for var i = 0; i < n; i = i + 4 {
+        let last = i + 4 == n
+        var group = 0
+        for var k = 0; k < 4; k = k + 1 {
+            let isPad = last && k >= 4 - padding
+            let v = if isPad { 0 } else { values[Byte.toInt(chars[i + k])] }
+            if v < 0 { return None }
+            group = (group << 6) | v
+        }
+        let at = i / 4 * 3
+        out[at] = Byte.truncate(group >> 16)
+        if !last || padding < 2 { out[at + 1] = Byte.truncate(group >> 8) }
+        if !last || padding < 1 { out[at + 2] = Byte.truncate(group) }
+        -- Bits after the last byte must be zero, or two texts would decode to
+        -- the same bytes.
+        if last && padding == 1 && group & 0xFF != 0 { return None }
+        if last && padding == 2 && group & 0xFFFF != 0 { return None }
+    }
+    Some(out)
+}
+
+let pad = Byte.truncate(0x3D)

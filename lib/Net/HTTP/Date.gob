@@ -1,0 +1,77 @@
+export (parse, toString)
+
+-- HTTP dates in the preferred format of RFC 9110 §5.6.7, IMF-fixdate:
+-- `Sun, 06 Nov 1994 08:49:37 GMT`, always in UTC, always 29 bytes.
+--
+-- Only this format is read. The RFC also asks a recipient to accept the
+-- obsolete RFC 850 and asctime formats, which no sender has been allowed to
+-- generate since 1999; a date in either does not read.
+
+import Time.Calendar as Calendar
+import Time.Instant as Instant (Instant)
+import Time.Month as Month (Month(..))
+import Time.Weekday as Weekday
+import Net.HTTP.Syntax as Syntax
+
+let dayNames = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+let monthNames = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+let nanosPerSecond = 1000000000
+let secondsPerDay = 86400
+
+-- Returns the instant `text` writes, which must be an IMF-fixdate whose day
+-- name agrees with its date.
+fun parse(text : String) -> Option Instant {
+    if String.byteLength(text) != 29 { return None }
+    let part = fun(from, to) = Syntax.sliceBytes(text, from, to)
+    if part(3, 5) != ", " || part(7, 8) != " " || part(11, 12) != " " || part(16, 17) != " "
+        || part(19, 20) != ":" || part(22, 23) != ":" || part(25, 29) != " GMT" {
+        return None
+    }
+    let weekday = Array.indexOf(dayNames, part(0, 3))?
+    let day = digits(part(5, 7))?
+    let month = Month.fromNumber(Array.indexOf(monthNames, part(8, 11))? + 1)?
+    let year = digits(part(12, 16))?
+    let hour = digits(part(17, 19))?
+    let minute = digits(part(20, 22))?
+    -- 60 is a leap second, which the timeline does not count; it reads as
+    -- the second before it, as the system clock would.
+    let second = digits(part(23, 25))?
+    if day < 1 || day > Calendar.daysInMonth(year, month) || hour > 23 || minute > 59 || second > 60 {
+        return None
+    }
+    let date = Calendar.daysFromCivil(year, month, day)
+    if Weekday.number(Calendar.weekday(date)) != weekday + 1 { return None }
+    let seconds = Calendar.epochDays(date) * secondsPerDay + hour * 3600 + minute * 60
+        + (if second == 60 { 59 } else { second })
+    Some(Instant.fromUnixNanos(seconds * nanosPerSecond))
+}
+
+-- Returns `t` as an IMF-fixdate, to the whole second, rounded down.
+fun toString(t : Instant) -> String {
+    let seconds = Calendar.floorDiv(Instant.unixNanos(t), nanosPerSecond)
+    let days = Calendar.floorDiv(seconds, secondsPerDay)
+    let inDay = seconds - days * secondsPerDay
+    let date = Calendar.fromEpochDays(days)
+    let (year, month, day) = Calendar.civilFromDays(date)
+    dayNames[Weekday.number(Calendar.weekday(date)) - 1] + ", " + pad(day, 2) + " "
+        + monthNames[Month.number(month) - 1] + " " + pad(year, 4) + " " + pad(inDay / 3600, 2)
+        + ":" + pad(inDay / 60 % 60, 2) + ":" + pad(inDay % 60, 2) + " GMT"
+}
+
+fun pad(n : Int, width : Int) -> String {
+    var s = Int.toString(n)
+    while String.byteLength(s) < width { s = "0" + s }
+    s
+}
+
+-- Returns the number `text` writes in decimal digits alone, with no sign.
+fun digits(text : String) -> Option Int {
+    var n = 0
+    for b in String.toBytes(text) {
+        let d = Byte.toInt(b) - 0x30
+        if d < 0 || d > 9 { return None }
+        n = n * 10 + d
+    }
+    Some(n)
+}

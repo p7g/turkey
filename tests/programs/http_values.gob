@@ -1,0 +1,284 @@
+import Net.HTTP (..)
+import Data.Error (messageOf, cast)
+import Net.HTTP.Cookie as Cookie
+import Net.HTTP.Credentials as Credentials
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Headers as Headers
+import Net.HTTP.MediaType as MediaType
+import Net.HTTP.HTTPURL as HTTPURL
+import Net.HTTP.Method as Method
+import Net.HTTP.Request as Request
+import Net.HTTP.Status as Status
+import Net.HTTP.Token as Token
+import Time.Duration as Duration
+import Time.Instant as Instant
+import URL as URL
+
+-- `|>` is not in the Prelude yet; `header` is built to be used with it.
+infix Sequence (|>) = pipe
+fun pipe(x, f) = f(x)
+
+fun check(condition : Bool, label : String) {
+    if !condition { error("FAIL: " + label) }
+    print("PASS: " + label)
+}
+
+-- Returns `s` quoted, with its control bytes spelled as escapes, so a label
+-- never prints the CR or LF it is about.
+fun visible(s : String) -> String {
+    var out = s
+    for (raw, spelled) in [("\r", "\\r"), ("\n", "\\n"), ("\t", "\\t"), ("\u{0}", "\\0"),
+                           ("\u{7}", "\\a"), ("\u{7F}", "\\x7F")] {
+        out = String.replace(out, raw, spelled)
+    }
+    "\"" + out + "\""
+}
+
+fun main() {
+    methods()
+    statuses()
+    names()
+    values()
+    typedRoundTrips()
+    multiplicity()
+    errors()
+    building()
+}
+
+fun methods() {
+    print("-- methods")
+    let all : Array (Method String) = [
+        GET, HEAD, DELETE, OPTIONS, TRACE, CONNECT, POST("p"), PUT("p"), PATCH("p"),
+        Extension(Option.expect(Method.extension("PROPFIND"), "token"), None),
+    ]
+    for m in all {
+        print(Method.name(m) + " safe=" + show(Method.isSafe(m)) + " idempotent="
+              + show(Method.isIdempotent(m)) + " body=" + show(Method.body(m)))
+    }
+    for name in ["GET", "POST", "get", "M-SEARCH", "BAD NAME", ""] {
+        print("extension " + show(name) + " -> " + show(Method.extension(name)))
+    }
+    -- `map` reaches the body and keeps the method.
+    for m in [POST(3), GET, Extension(Option.expect(Method.extension("QUERY"), "token"), Some(5))] {
+        let bumped = map(m, fun(n) = n + 1)
+        print(Method.name(bumped) + " " + show(Method.body(bumped)))
+    }
+}
+
+fun statuses() {
+    print("-- statuses")
+    var named = 0
+    var roundTrips = True
+    for var n = 100; n <= 999; n = n + 1 {
+        match Status.fromCode(n) {
+            Some(s) -> {
+                if Status.code(s) != n { roundTrips = False }
+                if Status.reason(s) != "" {
+                    named = named + 1
+                    print(show(s))
+                }
+            }
+            None -> { roundTrips = False }
+        }
+    }
+    check(roundTrips, "every code from 100 to 999 round-trips through code")
+    print("named: " + show(named))
+    for n in [-1, 0, 99, 1000] {
+        check(Option.isNone(Status.fromCode(n)), "no status for " + show(n))
+    }
+    -- A registered code is its constructor, so a match on the name sees it.
+    let described = match Status.fromCode(404) {
+        Some(NotFound) -> "NotFound"
+        _ -> "something else"
+    }
+    check(described == "NotFound", "fromCode(404) matches NotFound")
+    check(Status.fromCode(299) == Status.fromCode(299), "an unnamed code equals itself")
+    check(show(Status.fromCode(299)) == "Some(299)", "an unnamed code shows its number")
+    check(Status.isClientError(NotFound) && Status.isSuccess(NoContent), "classes of status")
+}
+
+fun names() {
+    print("-- header names")
+    let reserved = [
+        "Content-Length", "Transfer-Encoding", "Connection", "Keep-Alive", "Upgrade", "TE",
+        "Trailer", "Proxy-Connection", "Host", "Expect",
+    ]
+    for n in reserved {
+        let refusedAsReserved = match HeaderName.parse(n) {
+            Left(ReservedName(_)) -> True
+            _ -> False
+        }
+        check(refusedAsReserved && HeaderName.isReserved(n), n + " is refused as reserved")
+    }
+    -- In any case.
+    for n in ["content-length", "HOST", "tE", "transfer-ENCODING"] {
+        check(Either.isRight(HeaderName.parse(n)) == False, n + " is refused")
+    }
+    for n in ["X-Request-ID", "Content-Type", "x", "a!#$%&'*+-.^_`|~9"] {
+        print(n + " -> " + show(HeaderName.parse(n)))
+    }
+    for n in ["", "bad name", "colon:", "new\nline", "x\r\n", "nul\u{0}", "é"] {
+        print(visible(n) + " -> " + show(HeaderName.parse(n)))
+    }
+}
+
+fun values() {
+    print("-- header values")
+    let refused = [
+        "a\rb", "a\nb", "a\r\nInjected: yes", "nul\u{0}here", "del\u{7F}", "bell\u{7}",
+        " leading", "trailing ", "\ttab", "\r\n",
+    ]
+    for v in refused {
+        let refusedAsInvalid = match HeaderValue.parse(v) {
+            Left(InvalidValue) -> True
+            _ -> False
+        }
+        check(refusedAsInvalid, "refused " + visible(v))
+    }
+    for v in ["", "plain", "a  b\tc", "quoted \"x\"", "naïve", "!~"] {
+        check(Option.isSome(Either.right(HeaderValue.parse(v))), "accepted " + visible(v))
+    }
+    let secret = HeaderValue.sensitive(HeaderValue.literal("hunter2"))
+    check(show(secret) == "<sensitive>", "a sensitive value does not show")
+    check(HeaderValue.toString(secret) == "hunter2", "a sensitive value is still sent")
+    check(secret == HeaderValue.literal("hunter2"), "the mark does not change equality")
+}
+
+-- Adds `v` under `h`, then reads it back, both typed and as the text sent.
+fun roundTrip[Header h, Eq (Value h), Show (Value h)](h : h, v : Value h) {
+    let hs = Headers.add(Headers.empty, h, v)
+    let back = Headers.get(hs, h)
+    let label = HeaderName.toString(headerName(h)) + ": " + show(v)
+    check(back == Some(v), "round trip " + label)
+    match Headers.get(hs, headerName(h)) {
+        Some(text) -> print("  sent as " + show(text))
+        None -> error("FAIL: no text for " + label)
+    }
+}
+
+fun typedRoundTrips() {
+    print("-- typed round trips")
+    roundTrip(Accept, MediaType.json)
+    roundTrip(Accept, MediaType.literal("text/*; q=0.5"))
+    roundTrip(ContentType, MediaType.html)
+    roundTrip(ContentType, Option.expect(MediaType.withParameter(MediaType.json, "note", "a \"b\"; c"), "p"))
+    roundTrip(Authorization, Option.expect(Credentials.bearer("abc.DEF-123=="), "bearer"))
+    roundTrip(Authorization, Option.expect(Credentials.basic("Aladdin", "open sesame"), "basic"))
+    roundTrip(IdempotencyKey, Token.literal("8e03978e-40d5-43e8-bc93-6894a57f9324"))
+    roundTrip(Location, URL.referenceLiteral("/orders/42?x=1"))
+    roundTrip(Location, URL.referenceLiteral("https://example.com/a"))
+    roundTrip(RetryAfter, RetryIn(Duration.seconds(120)))
+    roundTrip(RetryAfter, RetryAt(Instant.fromUnixNanos(784111777000000000)))
+    roundTrip(SetCookie, Option.expect(Cookie.parse("id=a3fWa; Path=/; Secure; HttpOnly"), "cookie"))
+    roundTrip(HeaderName.literal("X-Trace"), HeaderValue.literal("abc def"))
+
+    -- What arrives as text reads as the typed value.
+    let wire = Headers.fromFields([
+        (HeaderName.literal("Content-Type"), HeaderValue.literal("Text/HTML;Charset=\"utf-8\"")),
+        (HeaderName.literal("Accept"), HeaderValue.literal("text/html, application/json;q=0.9 ,, */*;q=0.1")),
+        (HeaderName.literal("Authorization"), HeaderValue.literal("Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==")),
+        (HeaderName.literal("Retry-After"), HeaderValue.literal("Sun, 06 Nov 1994 08:49:37 GMT")),
+        (HeaderName.literal("Idempotency-Key"), HeaderValue.literal("not-quoted")),
+    ])
+    print(Headers.get(wire, ContentType))
+    print(Headers.getAll(wire, Accept))
+    print(Option.map(Headers.get(wire, Authorization), Credentials.basicPair))
+    print(Headers.get(wire, RetryAfter))
+    check(Option.isNone(Headers.get(wire, IdempotencyKey)), "an unquoted Idempotency-Key does not read")
+    -- A negative wait is written as no wait.
+    let soon = Headers.add(Headers.empty, RetryAfter, RetryIn(Duration.seconds(-5)))
+    check(Headers.get(soon, RetryAfter) == Some(RetryIn(Duration.seconds(0))), "a negative Retry-After is 0")
+    -- Credentials never show, in any form.
+    let authorized = Headers.add(Headers.empty, Authorization, Option.expect(Credentials.bearer("s3cret"), "t"))
+    check(!String.contains(show(authorized), "s3cret"), "headers do not show credentials")
+    check(!String.contains(show(Headers.get(authorized, Authorization)), "s3cret"), "credentials do not show")
+}
+
+fun multiplicity() {
+    print("-- multiplicity")
+    let a = Option.expect(Cookie.parse("a=1; Expires=Wed, 21 Oct 2015 07:28:00 GMT"), "a")
+    let b = Option.expect(Cookie.parse("b=2"), "b")
+    let hs = Headers.add(Headers.add(Headers.empty, SetCookie, a), SetCookie, b)
+    check(Headers.size(hs) == 2, "two Set-Cookie fields stay two lines")
+    check(show(Headers.getAll(hs, SetCookie)) == show([a, b]), "both cookies read back, in order")
+    check(len(Headers.getAll(hs, HeaderName.literal("set-cookie"))) == 2, "the text is not split at the date's comma")
+    print(hs)
+    -- `set` replaces every line with one, where the first was.
+    let c = Option.expect(Cookie.parse("c=3"), "c")
+    let replaced = Headers.set(Headers.add(hs, ContentType, MediaType.json), SetCookie, c)
+    print(replaced)
+    print(Headers.remove(replaced, SetCookie))
+    -- A comma-separated field is one list over any number of lines.
+    let accepts = Headers.fromFields([
+        (HeaderName.literal("accept"), HeaderValue.literal("text/html, \"quoted,comma\"/x")),
+        (HeaderName.literal("accept"), HeaderValue.literal("application/json")),
+    ])
+    print(Headers.getAll(accepts, Accept))
+    check(Headers.has(accepts, Accept) && !Headers.has(accepts, ContentType), "has")
+}
+
+type AppError = AppError(HTTPError)
+instance FromHTTP AppError { fun fromHTTP(e) = AppError(e) }
+
+fun singleType(hs : Headers) -> Either AppError (Option MediaType) = Right(Headers.one(hs, ContentType)?)
+fun singleSome(hs : Headers) -> Either SomeError (Option MediaType) = Right(Headers.one(hs, ContentType)?)
+fun singleBare(hs : Headers) -> Either HTTPError (Option MediaType) = Right(Headers.one(hs, ContentType)?)
+fun singleNested(hs : Headers) -> Either (Either HTTPError String) (Option MediaType) =
+    Right(Headers.one(hs, ContentType)?)
+
+fun errors() {
+    print("-- errors")
+    let none = Headers.empty
+    let once = Headers.add(none, ContentType, MediaType.json)
+    let twice = Headers.add(once, ContentType, MediaType.html)
+    let bad = Headers.fromFields([(HeaderName.literal("content-type"), HeaderValue.literal("not a type"))])
+    for hs in [none, once, twice, bad] {
+        match singleType(hs) {
+            Right(m) -> print("AppError side: " + show(m))
+            Left(AppError(e)) -> print("AppError side: " + show(e))
+        }
+    }
+    match singleSome(twice) {
+        Left(e) -> {
+            print("SomeError: " + messageOf(e))
+            check(Option.isSome(cast(e) : Option HTTPError), "the SomeError holds the HTTPError")
+        }
+        Right(_) -> error("FAIL: duplicate accepted")
+    }
+    print(singleBare(bad))
+    print(singleNested(twice))
+    -- `get` takes the first value, where `one` refuses two.
+    print(Headers.get(twice, ContentType))
+}
+
+fun building() {
+    print("-- building")
+    let r = request(GET, "https://api.example.com/users/" + show(7))
+        |> header(Accept, MediaType.json)
+        |> header(IdempotencyKey, Token.literal("k1"))
+    print(Method.name(r.method) + " " + show(r.url))
+    print(r.headers)
+    -- A bad target is kept, to be reported when the request is sent.
+    let bad = request(DELETE, "https://exa mple.com/")
+    print(bad.url)
+    let put = request(PUT("bytes"), HTTPURL.literal("http://example.com:8080")) |> header(ContentType, MediaType.octetStream)
+    print(show(put.url) + " " + show(Method.body(put.method)))
+    -- A request a server received, routed by matching.
+    let at = fun(path) = RequestTarget { authority = Some("example.com"), path, query = None }
+    let received = [
+        Request { method = GET, target = at("/health"), headers = Headers.empty },
+        Request { method = POST("{}"), target = at("/orders"), headers = Headers.empty },
+        Request { method = PATCH("{}"), target = at("/orders"), headers = Headers.empty },
+        Request { method = GET, target = at("/files/a%20b/c%2Fd"), headers = Headers.empty },
+    ]
+    for req in received {
+        let answer = match (req.method, req.target.path) {
+            (GET, "/health") -> "ok"
+            (POST(body), "/orders") -> "created from " + body
+            (_, "/orders") -> "method not allowed"
+            _ -> "not found: " + show(Request.segments(req.target))
+        }
+        print(answer)
+    }
+}

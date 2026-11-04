@@ -1,0 +1,61 @@
+export (HTTPError(..), HeaderError(..), FromHTTP(..))
+
+-- What goes wrong in HTTP, and how a caller's own error type takes it in.
+--
+-- `?` never converts one error type into another, so the library's fallible
+-- functions do not return `HTTPError`. They return `[FromHTTP e] Either e a`,
+-- and the caller's function decides `e` by its own return type: an
+-- application's error, `SomeError`, or `HTTPError` itself. So `?` on an HTTP
+-- result lifts it without `promote`, which is left for other libraries'
+-- errors.
+--
+--     type APIError = BadBody(HTTPError) | NotFound
+--     instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
+
+import URL (URLError)
+import Net.HTTP.Syntax as Syntax
+
+-- Every failure the HTTP library reports.
+type HTTPError = BadURL(URLError) | BadHeader(HeaderError)
+
+-- Why a header field was refused. A field's name is quoted as text, escaped
+-- by `show`, since a refused name may be the bytes that made it dangerous. A
+-- refused value is never quoted: it may be a credential.
+type HeaderError =
+    InvalidName(String)
+    | ReservedName(String)
+    | InvalidValue
+    | DuplicateField(String)
+    | UnreadableValue(String)
+
+instance Show HeaderError {
+    fun show(e) = match e {
+        InvalidName(n) -> "invalid header name '" + Syntax.escaped(n) + "'"
+        ReservedName(n) -> "the header '" + n + "' is written by the HTTP library and cannot be set"
+        InvalidValue -> "invalid header value"
+        DuplicateField(n) -> "more than one value for the '" + n + "' header"
+        UnreadableValue(n) -> "the '" + n + "' header's value does not read as one"
+    }
+}
+
+instance Show HTTPError {
+    fun show(e) = match e {
+        BadURL(u) -> show(u)
+        BadHeader(h) -> show(h)
+    }
+}
+
+instance Error HeaderError { fun message(e) = show(e) }
+instance Error HTTPError { fun message(e) = show(e) }
+
+-- An error type that can hold an `HTTPError`.
+class FromHTTP e { fun fromHTTP(HTTPError) -> e }
+
+instance FromHTTP HTTPError { fun fromHTTP(e) = e }
+
+-- An `HTTPError` enters the shared error channel as itself, so `cast` finds it.
+instance FromHTTP SomeError { fun fromHTTP(e) = fail(e) }
+
+-- An HTTP error is the left side's: `Either HTTPError e` holds it as a
+-- `Left`, and so does any `Either l e` whose `l` can hold one.
+instance FromHTTP (Either l r) : FromHTTP l { fun fromHTTP(e) = Left(fromHTTP(e)) }

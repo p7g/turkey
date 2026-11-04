@@ -6,6 +6,10 @@ Two settings, both split with shell-word rules:
   machine checking arm64 output it is a cross compiler, and it links
   statically: a dynamically linked arm64 binary under qemu-user needs an arm64
   libc to load, and a static one needs nothing.
+* `$TURKEY_OPENSSL` is where OpenSSL 3 is installed, for a program that
+  imports `Net.TLS`: its `lib/`, `include/` and `bin/openssl`. Unset on macOS
+  it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by
+  the compiler and on `$PATH`.
 * `$TURKEY_RUN` is a prefix for executing anything the compiler linked -- a
   test program or a built `boot`. Empty means run it directly, which is right
   natively and also under qemu-user once binfmt_misc knows the format; the
@@ -43,6 +47,76 @@ def missing() -> bool:
 def command(binary: Path, *args: str) -> list[str]:
     """The argv that runs `binary` with `args`."""
     return [*shlex.split(os.environ.get("TURKEY_RUN", "")), str(binary), *args]
+
+
+def _openssl_prefix() -> Path | None:
+    """Where OpenSSL 3 is installed, or None for the system's default places.
+
+    On macOS the system's own `/usr/lib/libcrypto.dylib` ends any process
+    that loads it, so a Mac needs Homebrew's `openssl@3`, which is keg-only:
+    not on the default search paths, so named with -L and -I.
+    """
+    if (prefix := os.environ.get("TURKEY_OPENSSL")):
+        return Path(prefix)
+    if target() != "arm64-darwin":
+        return None
+    for brew in ("/opt/homebrew/bin/brew", "brew"):
+        if shutil.which(brew):
+            result = subprocess.run([brew, "--prefix", "openssl@3"],
+                                    capture_output=True, text=True)
+            if result.returncode == 0 and result.stdout.strip():
+                return Path(result.stdout.strip())
+    return Path("/opt/homebrew/opt/openssl@3")
+
+
+def openssl_libraries() -> list[str]:
+    """What a program that imports `Net.TLS` adds to its link, after the
+    runtime's `libraries()`. Only such a program gets these: one that does
+    not links exactly as it would without them."""
+    prefix = _openssl_prefix()
+    found = [f"-L{prefix / 'lib'}"] if prefix else []
+    return [*found, "-lssl", "-lcrypto"]
+
+
+def openssl_includes() -> list[str]:
+    """The flags a C file that includes OpenSSL's headers compiles with."""
+    prefix = _openssl_prefix()
+    return [f"-I{prefix / 'include'}"] if prefix else []
+
+
+def openssl_command() -> str:
+    """The `openssl` program of the same installation, which the tests make
+    their certificates with. macOS's `/usr/bin/openssl` is LibreSSL's."""
+    prefix = _openssl_prefix()
+    return str(prefix / "bin" / "openssl") if prefix else "openssl"
+
+
+@functools.lru_cache(maxsize=None)
+def links_openssl() -> bool:
+    """Whether a C program that calls OpenSSL 3 compiles and links here."""
+    if missing():
+        return False
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "probe.c"
+        source.write_text("#include <openssl/ssl.h>\n"
+                          "int main(void) { return SSL_CTX_new(TLS_method()) == 0; }\n")
+        result = subprocess.run(
+            [*cc(), *openssl_includes(), str(source), "-o", str(Path(directory) / "probe"),
+             *openssl_libraries()], capture_output=True)
+    return result.returncode == 0
+
+
+def needs_openssl() -> None:
+    """Skips the calling test unless OpenSSL 3 links, or fails it where
+    `$TURKEY_REQUIRE_OPENSSL` is set, as CI sets it, so that a runner without
+    OpenSSL cannot pass by skipping."""
+    if links_openssl():
+        return
+    message = "OpenSSL 3 does not link with $TURKEY_CC" + (
+        f" from {_openssl_prefix()}" if _openssl_prefix() else "")
+    if os.environ.get("TURKEY_REQUIRE_OPENSSL"):
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 def identity() -> bytes:

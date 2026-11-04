@@ -189,17 +189,17 @@ var bytesSince : Int = 0
 
 -- What a worker's cursors have taken since it was last folded into the three
 -- counts above, by `retire` or when the worker took a region: objects, objects since the collection, and their bytes,
--- in the last three words of its record (`Prim.processState`, from 1984).
+-- in the last three words of its record (`Process.workerRecord`, from 1984).
 -- Kept per worker so that a refill from a region the cursor owns touches
 -- nothing shared and takes no lock.
 fun localAdd(objects : Int, bytes : Int) -> Unit {
-    let w = Prim.processState()
+    let w = Process.workerRecord()
     Ptr.store(w, 1984, plus(Ptr.load(w, 1984), objects))
     Ptr.store(w, 1992, plus(Ptr.load(w, 1992), objects))
     Ptr.store(w, 2000, plus(Ptr.load(w, 2000), bytes))
 }
 
-fun localBytes() -> Int = Ptr.load(Prim.processState(), 2000)
+fun localBytes() -> Int = Ptr.load(Process.workerRecord(), 2000)
 
 -- Fold worker `w`'s counts into the heap's and zero them.
 fun localFold(w : Ptr) -> Unit {
@@ -229,14 +229,14 @@ var markers : Ptr = zeroed(markerBytes * Workers.threadLimit())
 -- The write barrier's remembered set is per worker, so that no two barriers
 -- write one buffer: a `malloc`ed array of objects, its count and its
 -- capacity, in words 296, 304 and 312 of the running worker's record
--- (`Prim.processState`). Offsets are literals in the accessors, since a `let`
+-- (`Process.workerRecord`). Offsets are literals in the accessors, since a `let`
 -- is a load from its global. A collection consumes the running worker's.
-fun remembered() -> Ptr = Ptr.load(Prim.processState(), 296)
-fun rememberedSet(buffer : Ptr) -> Unit = Ptr.store(Prim.processState(), 296, buffer)
-fun rememberedCount() -> Int = Ptr.load(Prim.processState(), 304)
-fun rememberedCountSet(n : Int) -> Unit = Ptr.store(Prim.processState(), 304, n)
-fun rememberedCapacity() -> Int = Ptr.load(Prim.processState(), 312)
-fun rememberedCapacitySet(n : Int) -> Unit = Ptr.store(Prim.processState(), 312, n)
+fun remembered() -> Ptr = Ptr.load(Process.workerRecord(), 296)
+fun rememberedSet(buffer : Ptr) -> Unit = Ptr.store(Process.workerRecord(), 296, buffer)
+fun rememberedCount() -> Int = Ptr.load(Process.workerRecord(), 304)
+fun rememberedCountSet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 304, n)
+fun rememberedCapacity() -> Int = Ptr.load(Process.workerRecord(), 312)
+fun rememberedCapacitySet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 312, n)
 
 -- The arm64 backend's frame table, sorted by return address.
 var frameEntries : Ptr = Ptr.null()
@@ -523,7 +523,7 @@ let cursorWord : Int = 32
 let cursorBytes : Int = 64
 
 -- The cursors are the running worker's, one per class from 320 bytes into its
--- record (`Prim.processState`), where `Turkey.Runtime` puts them and generated
+-- record (`Process.workerRecord`), where `Turkey.Runtime` puts them and generated
 -- code finds them. The offset is a literal in `cursorOf` rather than a `let`
 -- because a `let` is a load from its global, on every slow-path allocation.
 
@@ -570,7 +570,7 @@ fun classOf(size : Int) -> Int =
 -- still small, and `allocateSlow` gives them their class.
 fun fastSize(size : Int) -> Bool = plus(size, 7) >> 15 == 0
 
-fun cursorOf(sizeClass : Int) -> Ptr = cursorIn(Prim.processState(), sizeClass)
+fun cursorOf(sizeClass : Int) -> Ptr = cursorIn(Process.workerRecord(), sizeClass)
 
 fun cursorIn(w : Ptr, sizeClass : Int) -> Ptr =
     Ptr.add(w, plus(320, sizeClass << 6))
@@ -612,7 +612,7 @@ fun refill(cursor : Ptr, sizeClass : Int) -> Bool {
         -- While the lock is held anyway: so that what triggers a collection
         -- counts every worker's allocation to within a region's worth each,
         -- and not only the worker that asks.
-        localFold(Prim.processState())
+        localFold(Process.workerRecord())
         Lock.release(heapLock)
         if Ptr.isNull(region) { return False }
         Ptr.store(cursor, cursorRegion, region)
@@ -669,7 +669,7 @@ fun takeRegion(sizeClass : Int) -> Ptr {
 -- shared lists without the lock: it runs only where no other worker can be
 -- allocating, in a collection or with one worker.
 fun retire() -> Unit {
-    let me = Prim.processState()
+    let me = Process.workerRecord()
     for var i = 0; i < Workers.count(); i = plus(i, 1) {
         let w = Workers.recordOf(i)
         retireWorker(w)
@@ -871,13 +871,13 @@ fun outOfMemory() -> Ptr {
 -- that stress collects at polls as at allocations, and is the running
 -- worker's own.
 fun pollWordSet(up : Bool) -> Unit {
-    let w = Prim.processState()
+    let w = Process.workerRecord()
     let raised = Ptr.atomicLoad(w, 272) & 2 != 0
     if up && !raised { let _ = Ptr.atomicAdd(w, 272, 2) }
     if !up && raised { let _ = Ptr.atomicAdd(w, 272, -2) }
 }
 
-fun stopAsked() -> Bool = Ptr.atomicLoad(Prim.processState(), 272) & 1 != 0
+fun stopAsked() -> Bool = Ptr.atomicLoad(Process.workerRecord(), 272) & 1 != 0
 
 -- A loop's poll, called when the worker's poll word is up, as at any call.
 -- Not while the worker is blocked or stopped: the loop is then one of

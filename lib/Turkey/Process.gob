@@ -2,6 +2,7 @@ export (
     argsSet, argCount, argBytes, argLength, environment,
     panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
+    workerRecord,
 )
 
 -- What the program was started with, and how it is ending: its arguments, and
@@ -56,6 +57,9 @@ import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Data.Byte (Byte)
 
+-- The running worker's record, the block laid out above.
+fun workerRecord() -> Ptr = Prim.processState()
+
 fun flagAt() -> Int = 0
 fun argCountAt() -> Int = 8
 fun argVectorAt() -> Int = 16
@@ -71,7 +75,7 @@ fun messageBytes() -> Int = 248
 -- what is kept is the pointer, and each argument's length is counted when it
 -- is asked for.
 fun argsSet(argc : Int, argv : Ptr) -> Unit {
-    let state = Prim.processState()
+    let state = workerRecord()
     if argc >= 1 {
         Ptr.store(state, argCountAt(), argc - 1)
         Ptr.store(state, argVectorAt(), Ptr.add(argv, 8))
@@ -82,12 +86,12 @@ fun argsSet(argc : Int, argv : Ptr) -> Unit {
 }
 
 -- How many arguments the program was given, its own name not among them.
-fun argCount() -> Int = Ptr.load(Prim.processState(), argCountAt())
+fun argCount() -> Int = Ptr.load(workerRecord(), argCountAt())
 
 -- Argument `index`'s bytes, NUL-terminated. An index outside `0..argCount()`
 -- is undefined, as any raw read is.
 fun argBytes(index : Int) -> Ptr =
-    Ptr.load(Ptr.load(Prim.processState(), argVectorAt()), 8 * index)
+    Ptr.load(Ptr.load(workerRecord(), argVectorAt()), 8 * index)
 
 fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
 
@@ -98,7 +102,7 @@ fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
 -- `argv[1]`. Nothing in the program changes the environment, so the strings
 -- stay as they were.
 fun environment() -> Ptr {
-    let vector : Ptr = Ptr.load(Prim.processState(), argVectorAt())
+    let vector : Ptr = Ptr.load(workerRecord(), argVectorAt())
     if Ptr.isNull(vector) { return vector }
     Ptr.add(vector, 8 * (argCount() + 1))
 }
@@ -132,7 +136,7 @@ foreign "turkey_panic_string" fun panicString(message : Ptr) -> Unit {
 fun record(bytes : Ptr, length : Int) -> Unit {
     let limit = messageBytes() - 1
     let kept = if length < limit { length } else { limit }
-    let buffer = Ptr.add(Prim.processState(), messageAt())
+    let buffer = Ptr.add(workerRecord(), messageAt())
     var i = 0
     while i < kept {
         Ptr.store(buffer, i, Ptr.load(bytes, i) : Byte)
@@ -160,7 +164,7 @@ fun panicUnsigned(before : Ptr, n : Int, after : Ptr) -> Unit {
 }
 
 fun compose(before : Ptr, negative : Bool, magnitude : Int, after : Ptr) -> Unit {
-    let buffer = Ptr.add(Prim.processState(), messageAt())
+    let buffer = Ptr.add(workerRecord(), messageAt())
     let limit = messageBytes() - 1
     var at = putText(buffer, 0, limit, before)
     if negative && at < limit {
@@ -223,10 +227,10 @@ fun putDigits(buffer : Ptr, at : Int, limit : Int, u : Int) -> Int {
     end
 }
 
-fun raise() -> Unit = Ptr.store(Prim.processState(), flagAt(), 1)
+fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 
 -- Whether a panic or an exit is unwinding right now.
-fun pending() -> Bool = Ptr.load(Prim.processState(), flagAt()) != 0
+fun pending() -> Bool = Ptr.load(workerRecord(), flagAt()) != 0
 
 -- The program's ending, once `entryReturned` has taken the flag down.
 var ended : Bool = False
@@ -236,12 +240,12 @@ fun panicked() -> Bool = pending() || ended
 
 -- The panic's message, NUL-terminated; empty if there has been none.
 foreign "turkey_panic_message" fun panicMessage() -> Ptr =
-    Ptr.add(Prim.processState(), messageAt())
+    Ptr.add(workerRecord(), messageAt())
 
 -- Forget the panic and the exit, for C that raises them on purpose: the
 -- tests that call the allocator with bad arguments.
 foreign "turkey_panic_clear" fun panicClear() -> Unit {
-    let state = Prim.processState()
+    let state = workerRecord()
     Ptr.store(state, flagAt(), 0)
     Ptr.store(state, messageAt(), Byte.truncate(0))
     ended = False
@@ -257,7 +261,7 @@ foreign "turkey_panic_clear" fun panicClear() -> Unit {
 -- is parked in `ended`, where `panicked` still sees it and no call site does.
 foreign "turkey_entry_returned" fun entryReturned() -> Unit {
     ended = pending()
-    Ptr.store(Prim.processState(), flagAt(), 0)
+    Ptr.store(workerRecord(), flagAt(), 0)
 }
 
 -- -- exiting ----------------------------------------------------------------------------

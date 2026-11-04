@@ -1,0 +1,257 @@
+export (
+    Cursor(..), cursor, atEnd, peek, advance, skipSpace, expect, token, quotedString,
+    tokenOrQuoted, rest,
+    isTokenByte, isFieldVChar, isQuotable, byteAt, byteFind,
+    isToken, isFieldValue, canQuote, quote, asciiLower, sliceBytes, listItems, escaped,
+)
+
+-- The small grammars of RFC 9110 that header values are written in: tokens,
+-- quoted strings, parameters and comma-separated lists.
+--
+-- Every function works on bytes, not characters. The grammar is defined over
+-- octets, and each byte it gives a meaning to is ASCII, so a cut made next to
+-- one of those bytes is never inside a UTF-8 sequence.
+--
+-- A value is read once, whole, and is a few hundred bytes at most, so the
+-- grammars are written as a cursor over the bytes with `?` on `Option` rather
+-- than as tables or combinators: each rule is a few lines that read as the
+-- RFC's ABNF does.
+
+import Data.String (String(..))
+
+-- tchar = "!" / "#" / "$" / "%" / "&" / "'" / "*" / "+" / "-" / "." /
+--         "^" / "_" / "`" / "|" / "~" / DIGIT / ALPHA
+let tokenBytes = Array.init(256, fun(b) = isAlphanumeric(b) || match b {
+    0x21 | 0x23 | 0x24 | 0x25 | 0x26 | 0x27 | 0x2A | 0x2B | 0x2D | 0x2E
+        | 0x5E | 0x5F | 0x60 | 0x7C | 0x7E -> True
+    _ -> False
+})
+
+fun isAlphanumeric(b : Int) -> Bool =
+    (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A)
+
+fun isTokenByte(b : Int) -> Bool = b >= 0 && b < 256 && tokenBytes[b]
+
+-- field-vchar = VCHAR / obs-text. Bytes from 0x80 are obs-text, which the RFC
+-- tells a recipient to treat as opaque; they arrive here only as parts of
+-- UTF-8 sequences, since a `String` holds nothing else.
+fun isFieldVChar(b : Int) -> Bool = (b >= 0x21 && b <= 0x7E) || b >= 0x80
+
+-- What a quoted string can carry, unescaped or after a backslash: HTAB, SP,
+-- VCHAR and obs-text. Every other control byte, CR, LF and NUL among them,
+-- has no spelling inside quotes.
+fun isQuotable(b : Int) -> Bool = b == 0x09 || b == 0x20 || isFieldVChar(b)
+
+fun isSpace(b : Int) -> Bool = b == 0x20 || b == 0x09
+
+fun byteAt(s : String, i : Int) -> Int = Byte.toInt(String.bytesOf(s)[i])
+
+-- Returns the offset of the first `needle` at or after `from`, or the length
+-- of `s` if there is none, so that the result is always a place to cut.
+fun byteFind(s : String, needle : String, from : Int) -> Int {
+    let n = String.byteLength(s)
+    let m = String.byteLength(needle)
+    for var at = from; at + m <= n; at = at + 1 {
+        var k = 0
+        while k < m && byteAt(s, at + k) == byteAt(needle, k) { k = k + 1 }
+        if k == m { return at }
+    }
+    n
+}
+
+fun isToken(s : String) -> Bool {
+    let n = String.byteLength(s)
+    if n == 0 { return False }
+    for var i = 0; i < n; i = i + 1 {
+        if !isTokenByte(byteAt(s, i)) { return False }
+    }
+    True
+}
+
+-- field-value = *field-content, which neither starts nor ends with
+-- whitespace: SP and HTAB are allowed only between visible bytes.
+fun isFieldValue(s : String) -> Bool {
+    let n = String.byteLength(s)
+    if n == 0 { return True }
+    if isSpace(byteAt(s, 0)) || isSpace(byteAt(s, n - 1)) { return False }
+    for var i = 0; i < n; i = i + 1 {
+        let b = byteAt(s, i)
+        if !isFieldVChar(b) && !isSpace(b) { return False }
+    }
+    True
+}
+
+fun canQuote(s : String) -> Bool {
+    let n = String.byteLength(s)
+    for var i = 0; i < n; i = i + 1 {
+        if !isQuotable(byteAt(s, i)) { return False }
+    }
+    True
+}
+
+-- Returns `s` as a quoted-string, with `"` and `\` escaped. `s` must pass
+-- `canQuote`; the callers check it before they build the value that is
+-- written.
+fun quote(s : String) -> String {
+    let out = String.builder()
+    String.push(out, "\"")
+    let n = String.byteLength(s)
+    var from = 0
+    for var i = 0; i < n; i = i + 1 {
+        let b = byteAt(s, i)
+        if b == 0x22 || b == 0x5C {
+            String.push(out, sliceBytes(s, from, i))
+            String.push(out, "\\")
+            from = i
+        }
+    }
+    String.push(out, sliceBytes(s, from, n))
+    String.push(out, "\"")
+    String.build(out)
+}
+
+-- Returns `s` with ASCII letters lowercased and every other byte unchanged.
+fun asciiLower(s : String) -> String {
+    let from = String.bytesOf(s)
+    let n = len(from)
+    let out = Prim.arrayNewUninit(n)
+    for var i = 0; i < n; i = i + 1 {
+        let b = Byte.toInt(from[i])
+        out[i] = Byte.truncate(if b >= 0x41 && b <= 0x5A { b + 0x20 } else { b })
+    }
+    String(out)
+}
+
+-- Returns bytes `start` up to `stop` of `s`. Both must be next to an ASCII
+-- byte or at an end, which every cut the grammars make is.
+fun sliceBytes(s : String, start : Int, stop : Int) -> String {
+    let out = Prim.arrayNewUninit(stop - start)
+    Prim.arrayCopy(out, 0, String.bytesOf(s), start, stop - start)
+    String(out)
+}
+
+-- A position in a value being read.
+type Cursor = Cursor { text : String, var at : Int }
+
+fun cursor(text : String) -> Cursor = Cursor { text, at = 0 }
+
+fun atEnd(c : Cursor) -> Bool = c.at >= String.byteLength(c.text)
+
+-- Returns the byte at the cursor, or -1 at the end.
+fun peek(c : Cursor) -> Int = if atEnd(c) { -1 } else { byteAt(c.text, c.at) }
+
+fun advance(c : Cursor) -> Unit { c.at = c.at + 1 }
+
+-- OWS = *( SP / HTAB )
+fun skipSpace(c : Cursor) -> Unit {
+    while isSpace(peek(c)) { advance(c) }
+}
+
+-- Consumes `b` if it is next.
+fun expect(c : Cursor, b : Int) -> Option Unit {
+    if peek(c) != b { return None }
+    advance(c)
+    Some(())
+}
+
+-- token = 1*tchar
+fun token(c : Cursor) -> Option String {
+    let from = c.at
+    while !atEnd(c) && isTokenByte(peek(c)) { advance(c) }
+    if c.at == from { None } else { Some(sliceBytes(c.text, from, c.at)) }
+}
+
+-- quoted-string = DQUOTE *( qdtext / quoted-pair ) DQUOTE, returned with its
+-- quotes removed and its escapes undone.
+fun quotedString(c : Cursor) -> Option String {
+    expect(c, 0x22)?
+    let out = String.builder()
+    var from = c.at
+    loop {
+        let b = peek(c)
+        if b == 0x22 {
+            String.push(out, sliceBytes(c.text, from, c.at))
+            advance(c)
+            return Some(String.build(out))
+        }
+        if b == 0x5C {
+            String.push(out, sliceBytes(c.text, from, c.at))
+            advance(c)
+            if !isQuotable(peek(c)) { return None }
+            from = c.at
+            advance(c)
+        } else if isQuotable(b) {
+            advance(c)
+        } else {
+            return None
+        }
+    }
+}
+
+fun tokenOrQuoted(c : Cursor) -> Option String =
+    if peek(c) == 0x22 { quotedString(c) } else { token(c) }
+
+-- Returns the bytes from the cursor to the end, and moves it there.
+fun rest(c : Cursor) -> String {
+    let from = c.at
+    c.at = String.byteLength(c.text)
+    sliceBytes(c.text, from, c.at)
+}
+
+-- Returns the elements of a comma-separated list (RFC 9110 §5.6.1), with the
+-- whitespace around each removed. Commas inside a quoted string do not
+-- separate. Empty elements are dropped, as a recipient must accept
+-- `a, , b` as `a, b`. Returns `None` if a quoted string is not closed.
+fun listItems(s : String) -> Option (Vec String) {
+    let items = []
+    let c = cursor(s)
+    var from = 0
+    while !atEnd(c) {
+        match peek(c) {
+            0x22 -> {
+                quotedString(c)?
+                ()
+            }
+            0x2C -> {
+                push(items, s, from, c.at)
+                advance(c)
+                from = c.at
+            }
+            _ -> advance(c)
+        }
+    }
+    push(items, s, from, c.at)
+    Some(items)
+}
+
+fun push(items : Vec String, s : String, from : Int, to : Int) -> Unit {
+    var start = from
+    var stop = to
+    while start < stop && isSpace(byteAt(s, start)) { start = start + 1 }
+    while stop > start && isSpace(byteAt(s, stop - 1)) { stop = stop - 1 }
+    if stop > start { Vec.push(items, sliceBytes(s, start, stop)) }
+}
+
+-- Returns `s` with every byte outside printable ASCII written as `\xNN`, for
+-- a diagnostic that quotes text it refused: a refused value may hold the very
+-- CR and LF that make it dangerous, and a message must not carry them on.
+fun escaped(s : String) -> String {
+    let out = String.builder()
+    let n = String.byteLength(s)
+    var from = 0
+    for var i = 0; i < n; i = i + 1 {
+        let b = byteAt(s, i)
+        if b < 0x20 || b >= 0x7F {
+            String.push(out, sliceBytes(s, from, i))
+            String.push(out, "\\x" + hexByte(b))
+            from = i + 1
+        }
+    }
+    String.push(out, sliceBytes(s, from, n))
+    String.build(out)
+}
+
+let hexDigits = "0123456789ABCDEF"
+
+fun hexByte(b : Int) -> String =
+    sliceBytes(hexDigits, b >> 4, (b >> 4) + 1) + sliceBytes(hexDigits, b & 15, (b & 15) + 1)

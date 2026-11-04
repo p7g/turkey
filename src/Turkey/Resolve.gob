@@ -61,7 +61,6 @@ import Turkey.Types as Ty
 
 -- One module's scope, plus the stack of local frames the walk maintains.
 type R = R {
-    moduleName : String,
     scope      : Scope,
     -- Innermost last, each mapping a name to the binder it means there. A
     -- name in any frame is local and is left alone.
@@ -75,11 +74,11 @@ type R = R {
 
 -- `operators` is the table `operators` makes, and `binders` the one `declare`
 -- filled.
-fun program(moduleName : String, scope : Scope, p : Program,
+fun program(scope : Scope, p : Program,
             operators : Map String (Group, String),
             binders : Binders.Table) -> Unit {
     let r = R {
-        moduleName = moduleName, scope = scope, locals = Vec.new(4),
+        scope = scope, locals = Vec.new(4),
         operators = operators, binders = binders, owner = 0,
     }
     for decl in p.decls {
@@ -121,60 +120,82 @@ fun arities(modules : Vec Module) -> Map String Int {
 }
 
 -- Declares in `binders` every primitive, and every module's top-level
--- binders and class methods, under the internal names resolution gives them.
--- Run this before any module is resolved, for the reason `operators` gives.
+-- binders and class methods, under the internal names resolution gives them,
+-- and records each binding occurrence. Run this before any module is
+-- resolved, for the reason `operators` gives.
 --
--- Each declaration gets an owner of its own, and a `let` or `var` that binds
--- several names puts them all in one.
+-- Also registers the owner of every top-level declaration whose body has
+-- locals: each statement, class method, instance method and foreign
+-- definition gets one, and a `let` or `var` puts every name it binds in its
+-- own. The walk reads them back through `enter`, so this is the one place
+-- that decides what an owner is.
 fun declare(modules : Vec Module, binders : Binders.Table) -> Unit {
     for b in Prims.all {
         let name = Prims.spelling(b)
-        Binders.declare(binders, Binders.owner(binders, "Prim", name), name, name,
-                        Primitive, Builtin)
+        discard(Binders.declare(binders, Binders.owner(binders, "Prim", name), name,
+                                name, Primitive, Builtin))
     }
     for m in modules {
         for decl in m.program.decls {
             match decl {
                 DStmt(s) -> match s.kind {
-                    SFun(d) -> declareOne(binders, m.name, d.name, d.span)
-                    SLet(pat, _) -> declarePattern(binders, m.name, pat, False)
-                    SVar(pat, _) -> declarePattern(binders, m.name, pat, True)
-                    SAssign(_, _) | SExpr(_) -> {}
-                }
-                DClass(c) -> {
-                    let cls = Prelude.internal(m.name, c.name)
-                    for meth in c.methods {
-                        let internal = cls + "." + meth.name
-                        Binders.declare(binders, Binders.owner(binders, m.name, internal),
-                                        internal, meth.name, Method,
-                                        Written(meth.span, False))
+                    SFun(d) -> {
+                        let o = ownerFor(binders, m.name, s.id, d.name)
+                        declareAt(binders, o, d.id, Prelude.internal(m.name, d.name),
+                                  d.name, TopLevel, Written(d.span, False))
                     }
+                    SLet(pat, _) -> declarePattern(binders, m.name, s.id, pat, False)
+                    SVar(pat, _) -> declarePattern(binders, m.name, s.id, pat, True)
+                    SAssign(_, _) | SExpr(_) ->
+                        discard(ownerFor(binders, m.name, s.id, "%top"))
                 }
-                DForeign(f) -> declareOne(binders, m.name, f.name, f.span)
-                DType(_) | DInstance(_) | DInfix(_) -> {}
+                DClass(c) -> for meth in c.methods {
+                    let member = c.name + "." + meth.name
+                    let o = ownerFor(binders, m.name, meth.id, member)
+                    declareAt(binders, o, meth.id, Prelude.internal(m.name, member),
+                              meth.name, Method, Written(meth.span, False))
+                }
+                DInstance(i) -> for meth in i.methods {
+                    discard(ownerFor(binders, m.name, meth.id,
+                                     "instance " + i.cls + "." + meth.name))
+                }
+                DForeign(f) -> {
+                    let o = ownerFor(binders, m.name, f.id, f.name)
+                    declareAt(binders, o, f.id, Prelude.internal(m.name, f.name), f.name,
+                              TopLevel, Written(f.span, False))
+                }
+                DType(_) | DInfix(_) -> {}
             }
         }
     }
 }
 
-fun declareOne(binders : Binders.Table, moduleName : String, short : String,
-               where : Span) -> Unit {
-    let internal = Prelude.internal(moduleName, short)
-    Binders.declare(binders, Binders.owner(binders, moduleName, internal), internal,
-                    short, TopLevel, Written(where, False))
+-- Returns a new owner for the declaration `nodeId` of `moduleName`, after
+-- recording it there.
+fun ownerFor(binders : Binders.Table, moduleName : String, nodeId : Int,
+             hint : String) -> Int {
+    let o = Binders.owner(binders, moduleName, Prelude.internal(moduleName, hint))
+    Binders.ownDeclaration(binders, nodeId, o)
+    o
 }
 
-fun declarePattern(binders : Binders.Table, moduleName : String, pat : Pat,
-                   mutable : Bool) -> Unit {
-    let vars = varNodes(pat)
-    if len(vars) > 0 {
-        let o = Binders.owner(binders, moduleName,
-                              Prelude.internal(moduleName, varName(vars[0])))
-        for v in vars {
-            let short = varName(v)
-            Binders.declare(binders, o, Prelude.internal(moduleName, short), short,
-                            TopLevel, Written(v.span, mutable))
-        }
+-- Declares a top-level binder in `o` and records `nodeId` as its binding
+-- occurrence.
+fun declareAt(binders : Binders.Table, o : Int, nodeId : Int, internal : String,
+              short : String, kind : Kind, origin : Origin) -> Unit {
+    let id = Binders.declare(binders, o, internal, short, kind, origin)
+    Binders.record(binders, nodeId, id)
+}
+
+fun declarePattern(binders : Binders.Table, moduleName : String, stmtId : Int,
+                   pat : Pat, mutable : Bool) -> Unit {
+    let vars = varPatterns(pat)
+    let hint = if len(vars) > 0 { varName(vars[0]) } else { "%top" }
+    let o = ownerFor(binders, moduleName, stmtId, hint)
+    for v in vars {
+        let short = varName(v)
+        declareAt(binders, o, v.id, Prelude.internal(moduleName, short), short,
+                  TopLevel, Written(v.span, mutable))
     }
 }
 
@@ -228,9 +249,7 @@ fun infixTarget(scope : Scope, d : InfixDecl, arities : Map String Int) -> Strin
 
 fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
     f.name = lookupOr(r.scope.values, f.name)
-    -- A foreign declaration has no node id, so its binder has no occurrence to
-    -- record; only its parameters do.
-    r.owner = Binders.ownerOf(declaredBinder(r, f.name, f.span))
+    enter(r, f.id, f.span)
     for param in f.params { pattern(r, param) }
     push(r)
     for param in f.params { bindPattern(r, param, False) }
@@ -265,7 +284,7 @@ fun classDecl(r : R, d : ClassDecl) -> Unit {
     context(r, d.supers)
     for meth in d.methods {
         meth.name = d.name + "." + meth.name
-        enterNamed(r, meth.id, meth.name, meth.span)
+        enter(r, meth.id, meth.span)
         funDecl(r, meth)
     }
     for fam in d.families { fam.name = d.name + "." + fam.name }
@@ -280,11 +299,13 @@ fun instanceDecl(r : R, d : InstanceDecl) -> Unit {
         typeExpr(r, bind.body)
     }
     -- An instance method's name is a reference to the class method it
-    -- defines, and its body is an owner of its own.
+    -- defines. It has no binder when the class is unknown or declares no such
+    -- method, and `Classes` rejects both programs, so there is nothing to
+    -- record; failing here instead would replace that diagnostic with an
+    -- internal error.
     for meth in d.methods {
-        let internal = d.cls + "." + meth.name
-        r.owner = Binders.owner(r.binders, r.moduleName, internal)
-        if let Some(id) = Binders.named(r.binders, internal) {
+        enter(r, meth.id, meth.span)
+        if let Some(id) = Binders.named(r.binders, d.cls + "." + meth.name) {
             Binders.record(r.binders, meth.id, id)
         }
         funDecl(r, meth)
@@ -295,59 +316,40 @@ fun instanceDecl(r : R, d : InstanceDecl) -> Unit {
 fun topLevel(r : R, s : Stmt) -> Unit = match s.kind {
     SFun(d) -> {
         d.name = lookupOr(r.scope.values, d.name)
-        enterNamed(r, d.id, d.name, d.span)
+        enter(r, s.id, s.span)
         funDecl(r, d)
     }
-    SLet(pat, value) -> topLevelBinding(r, pat, value)
-    SVar(pat, value) -> topLevelBinding(r, pat, value)
+    SLet(pat, value) -> topLevelBinding(r, s, pat, value)
+    SVar(pat, value) -> topLevelBinding(r, s, pat, value)
     _ -> {
         -- An assignment or a bare expression at the top level binds nothing, so
         -- there is nothing to rename -- only to resolve.
-        r.owner = Binders.owner(r.binders, r.moduleName,
-                                Prelude.internal(r.moduleName, "%top"))
+        enter(r, s.id, s.span)
         push(r)
         stmt(r, s)
         pop(r)
     }
 }
 
-fun topLevelBinding(r : R, pat : Pat, value : Expr) -> Unit {
-    let vars = varNodes(pat)
-    r.owner = if len(vars) > 0 {
-        let first = vars[0]
-        let internal = lookupOr(r.scope.values, varName(first))
-        Binders.ownerOf(declaredBinder(r, internal, first.span))
-    } else {
-        Binders.owner(r.binders, r.moduleName, Prelude.internal(r.moduleName, "%top"))
-    }
+-- `declare` has recorded each variable's binder; this renames it.
+fun topLevelBinding(r : R, s : Stmt, pat : Pat, value : Expr) -> Unit {
+    enter(r, s.id, s.span)
     expr(r, value)
     pattern(r, pat)
-    for v in vars {
-        let internal = lookupOr(r.scope.values, varName(v))
-        v.kind = PVar(internal)
-        Binders.record(r.binders, v.id, declaredBinder(r, internal, v.span))
-    }
+    for v in varPatterns(pat) { v.kind = PVar(lookupOr(r.scope.values, varName(v))) }
 }
 
--- Records `nodeId` as the occurrence that binds the top-level binder
--- `internal`, and makes that binder's owner the one the locals of its body
--- are minted into.
-fun enterNamed(r : R, nodeId : Int, internal : String, where : Span) -> Unit {
-    let id = declaredBinder(r, internal, where)
-    Binders.record(r.binders, nodeId, id)
-    r.owner = Binders.ownerOf(id)
-}
-
--- Returns the id `declare` gave the top-level binder `internal`. Only a
--- compiler bug can leave one undeclared, because `declare` reads the same
--- declarations this walk does.
-fun declaredBinder(r : R, internal : String, where : Span) -> Int =
-    match Binders.named(r.binders, internal) {
-        Some(id) -> id
+-- Makes the owner `declare` registered for the declaration `nodeId` the one
+-- the locals of its body are minted into. Only a compiler bug can leave one
+-- unregistered, because `declare` reads the same declarations this walk does.
+fun enter(r : R, nodeId : Int, where : Span) -> Unit {
+    r.owner = match Binders.declarationOwner(r.binders, nodeId) {
+        Some(o) -> o
         None -> Diag.fail(Diag.at("internal error",
-                                  "'" + internal + "' was never declared", where),
+                                  "this declaration was never given an owner", where),
                           where.file)
     }
+}
 
 fun funDecl(r : R, d : FunDecl) -> Unit {
     context(r, d.context)
@@ -423,24 +425,27 @@ fun pattern(r : R, p : Pat) -> Unit = match p.kind {
 -- Binds each variable of a local pattern in the innermost frame, as a fresh
 -- binder in the current owner, and records the pattern node against it.
 fun bindPattern(r : R, p : Pat, mutable : Bool) -> Unit {
-    for v in varNodes(p) { bindLocal(r, v.id, varName(v), v.span, mutable) }
+    for v in varPatterns(p) { bindLocal(r, v.id, varName(v), v.span, mutable) }
 }
 
--- The `PVar` nodes of a pattern, in the order `patternVars` lists their names.
-fun varNodes(p : Pat) -> Vec Pat {
-    let out = Vec.new(4)
-    collectVarNodes(p, out)
-    out
-}
-
-fun collectVarNodes(p : Pat, out : Vec Pat) -> Unit = match p.kind {
-    PVar(_) -> Vec.push(out, p)
-    PWild -> {}
-    PLit(_) -> {}
-    PCon(_, args) -> for a in args { collectVarNodes(a, out) }
-    PRecord(_, fields, _) -> for (_, sub) in fields { collectVarNodes(sub, out) }
-    PTuple(elems) -> for e in elems { collectVarNodes(e, out) }
-    PAnnot(inner, _) -> collectVarNodes(inner, out)
+-- Binds an arm's alternatives, `A(x) | B(x)`, in the innermost frame. They
+-- bind one set of names between them, so the first mints each binder and the
+-- rest record their occurrences against it. A name the first does not bind
+-- gets a binder of its own, which keeps the side table complete for a
+-- program that inference then rejects.
+fun bindAlternatives(r : R, alts : Vec Pat) -> Unit {
+    if len(alts) == 0 { return {} }
+    bindPattern(r, alts[0], False)
+    let frame = r.locals[len(r.locals) - 1]
+    for var i = 1; i < len(alts); i = i + 1 {
+        for v in varPatterns(alts[i]) {
+            let name = varName(v)
+            match Map.get(frame, name) {
+                Some(id) -> Binders.record(r.binders, v.id, id)
+                None -> bindLocal(r, v.id, name, v.span, False)
+            }
+        }
+    }
 }
 
 fun varName(p : Pat) -> String = match p.kind {
@@ -563,7 +568,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         for arm in arms {
             for p in arm.patterns { pattern(r, p) }
             push(r)
-            for p in arm.patterns { bindPattern(r, p, False) }
+            bindAlternatives(r, arm.patterns)
             expr(r, arm.body)
             pop(r)
         }

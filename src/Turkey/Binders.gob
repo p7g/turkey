@@ -1,7 +1,8 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
     newTable, owner, fresh, ownerOf, localOf, binderAt,
-    declare, named, record, leaveUnresolved, checkReferences, checkInferred,
+    declare, named, record, leaveUnresolved, ownDeclaration, declarationOwner,
+    checkReferences, checkInferred,
 )
 
 -- Every term binder of the program, and which binder each occurrence means.
@@ -19,9 +20,10 @@ export (
 -- Ids are process-local. They are never printed, and nothing persisted may be
 -- keyed by one; a binder's stable name is its `moduleName` and `name`.
 --
--- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, an `EVar` -- to
--- the binder it binds or means. It is keyed by the ids `Turkey.Ast.freshNodeId`
--- hands out, which are unique across the program.
+-- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
+-- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
+-- the ids `Turkey.Ast.freshNodeId` hands out, which are unique across the
+-- program.
 
 import Turkey.Ast (..)
 import Turkey.Diag as Diag
@@ -68,19 +70,24 @@ type Owner = Owner {
 }
 
 type Table = Table {
-    owners     : Vec Owner,
-    refs       : Map Int Int,
+    owners            : Vec Owner,
+    refs              : Map Int Int,
     -- A top-level binder by its internal name, `Module#name`, `Module#C.m` or
     -- a primitive's spelling, so that a reference resolved to that name can
     -- find its id.
-    byName     : Map String Int,
+    byName            : Map String Int,
+    -- The owner of each top-level declaration, by the declaration's node id:
+    -- a top-level statement's, a class or instance method's, or a foreign
+    -- definition's.
+    declarationOwners : Map Int Int,
     -- The `EVar` nodes resolution could not find a binder for, which leaves
     -- them for inference to report, with their spellings.
-    unresolved : Map Int String,
+    unresolved        : Map Int String,
 }
 
 fun newTable() -> Table = Table {
-    owners = [], refs = Map.new(), byName = Map.new(), unresolved = Map.new(),
+    owners = [], refs = Map.new(), byName = Map.new(),
+    declarationOwners = Map.new(), unresolved = Map.new(),
 }
 
 -- A local index takes the low 32 bits of an id and the owner the rest.
@@ -124,14 +131,15 @@ fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
 
 fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
 
--- Adds a binder to `ownerId` that references resolved to `internal` mean.
--- Does nothing when `internal` is declared already: the first declaration of
--- a name keeps it, and the duplicate is left for the stage that reports one.
+-- Returns the id of a new binder in `ownerId`, which references resolved to
+-- `internal` mean. A second declaration of `internal` still gets a binder of
+-- its own, but references keep meaning the first; the duplicate is left for
+-- the stage that reports one.
 fun declare(t : Table, ownerId : Int, internal : String, short : String,
-            kind : Kind, origin : Origin) -> Unit {
-    if !Map.contains(t.byName, internal) {
-        Map.put(t.byName, internal, fresh(t, ownerId, short, kind, origin))
-    }
+            kind : Kind, origin : Origin) -> Int {
+    let id = fresh(t, ownerId, short, kind, origin)
+    if !Map.contains(t.byName, internal) { Map.put(t.byName, internal, id) }
+    id
 }
 
 -- Returns the id of the top-level binder named `internal`, if one was declared.
@@ -140,29 +148,47 @@ fun named(t : Table, internal : String) -> Option Int = Map.get(t.byName, intern
 -- Records that the node `nodeId` binds or means the binder `id`.
 fun record(t : Table, nodeId : Int, id : Int) -> Unit = Map.put(t.refs, nodeId, id)
 
+-- Records `ownerId` as the owner of the top-level declaration `nodeId`.
+fun ownDeclaration(t : Table, nodeId : Int, ownerId : Int) -> Unit =
+    Map.put(t.declarationOwners, nodeId, ownerId)
+
+-- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`.
+fun declarationOwner(t : Table, nodeId : Int) -> Option Int =
+    Map.get(t.declarationOwners, nodeId)
+
 -- Records that the `EVar` node `nodeId`, spelled `name`, means no binder
 -- resolution could find.
 fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
     Map.put(t.unresolved, nodeId, name)
 
--- Raises an internal error unless every `EVar` in `p` has an entry in `refs`
--- or was left for inference. Covers the method references resolution writes
--- into `EIndex`, `EUnary`, `EBinary`, `EForIn` and `EQuestion`, which are not
--- among `Turkey.Ast.children`.
+-- Raises an internal error unless every binding occurrence and every `EVar`
+-- in `p` has an entry in `refs`, or the `EVar` was left for inference, and
+-- unless the alternatives of each match arm bind each name to one binder.
+-- Covers the method references resolution writes into `EIndex`, `EUnary`,
+-- `EBinary`, `EForIn` and `EQuestion`, which are not among
+-- `Turkey.Ast.children`. Costs a walk of the whole program.
 fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     let missing = []
     for decl in p.decls {
         match decl {
             DStmt(s) -> scan(t, ChStmt(s), missing)
-            DClass(c) -> for meth in c.methods { scan(t, ChFun(meth), missing) }
+            DClass(c) -> for meth in c.methods {
+                expect(t, meth.id, meth.name, missing)
+                scan(t, ChFun(meth), missing)
+            }
+            -- An instance method's own id names the class method it defines,
+            -- and has no entry when it defines none.
             DInstance(i) -> for meth in i.methods { scan(t, ChFun(meth), missing) }
-            DType(_) | DForeign(_) | DInfix(_) -> {}
+            DForeign(f) -> {
+                expect(t, f.id, f.name, missing)
+                for param in f.params { expectPattern(t, param, missing) }
+            }
+            DType(_) | DInfix(_) -> {}
         }
     }
     if len(missing) > 0 {
         Diag.fail(Diag.whole("internal error",
-            "resolution left these references without a binder: "
-            + String.join(missing, ", ")), file)
+            "resolution recorded " + String.join(missing, ", ")), file)
     }
 }
 
@@ -179,15 +205,57 @@ fun checkInferred(t : Table, file : String) -> Unit {
 }
 
 fun scan(t : Table, c : Child, missing : Vec String) -> Unit {
-    if let ChExpr(e) = c {
-        for ref in methodRefs(e) { scan(t, ChExpr(ref), missing) }
-        if let EVar(name, _) = e.kind {
-            if !Map.contains(t.refs, e.id) && !Map.contains(t.unresolved, e.id) {
-                Vec.push(missing, "'" + name + "'")
+    match c {
+        ChExpr(e) -> {
+            for ref in methodRefs(e) { scan(t, ChExpr(ref), missing) }
+            match e.kind {
+                EVar(name, _) -> if !Map.contains(t.unresolved, e.id) {
+                    expect(t, e.id, name, missing)
+                }
+                ELambda(params, _, _) -> for p in params { expectPattern(t, p, missing) }
+                EForIn(pat, _, _, _, _) -> expectPattern(t, pat, missing)
+                _ -> {}
+            }
+        }
+        ChStmt(s) -> match s.kind {
+            SLet(pat, _) | SVar(pat, _) -> expectPattern(t, pat, missing)
+            SFun(d) -> expect(t, d.id, d.name, missing)
+            SAssign(_, _) | SExpr(_) -> {}
+        }
+        ChArm(a) -> expectAlternatives(t, a, missing)
+        ChFun(d) -> for p in d.params { expectPattern(t, p, missing) }
+    }
+    for child in children(c) { scan(t, child, missing) }
+}
+
+fun expect(t : Table, nodeId : Int, name : String, missing : Vec String) -> Unit {
+    if !Map.contains(t.refs, nodeId) { Vec.push(missing, "no binder for '" + name + "'") }
+}
+
+fun expectPattern(t : Table, p : Pat, missing : Vec String) -> Unit {
+    for v in varPatterns(p) {
+        if let PVar(name) = v.kind { expect(t, v.id, name, missing) }
+    }
+}
+
+-- Every alternative of an arm binds the same names, so each name must mean
+-- one binder in all of them.
+fun expectAlternatives(t : Table, a : Arm, missing : Vec String) -> Unit {
+    let first = Map.new()
+    for alt in a.patterns {
+        expectPattern(t, alt, missing)
+        for v in varPatterns(alt) {
+            if let (PVar(name), Some(id)) = (v.kind, Map.get(t.refs, v.id)) {
+                match Map.get(first, name) {
+                    Some(earlier) -> if earlier != id {
+                        Vec.push(missing, "two binders for '" + name
+                                          + "' in the alternatives of one arm")
+                    }
+                    None -> Map.put(first, name, id)
+                }
             }
         }
     }
-    for child in children(c) { scan(t, child, missing) }
 }
 
 fun methodRefs(e : Expr) -> Vec Expr = match e.kind {

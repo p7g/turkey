@@ -120,6 +120,10 @@ long enough in a call that cannot be polled, such as a file read or `flock`:
 then another thread runs the rest meanwhile, as one does beside each worker
 blocked in such a call. The test suite sets it to 1 for everything it runs
 unless a test asks for more, since it runs a process per core already.
+The suite also sets `TURKEY_CHECK_BINDERS`, which has the compiler check that
+name resolution recorded a binder for every variable a program binds or reads;
+a gap is an internal error. It costs a walk of the program, so it is off
+otherwise.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
 assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler

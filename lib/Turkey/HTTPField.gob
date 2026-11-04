@@ -1,0 +1,57 @@
+export (HeaderName(..), HeaderValue(..), name, view, text, sameBytes)
+
+-- `HeaderName` and `HeaderValue` with their representations open, for the
+-- HTTP/1 codec. `Net.HTTP.HeaderName` and `Net.HTTP.HeaderValue` re-export
+-- the types abstractly with the checked constructors, so a program can make
+-- neither without the check. The codec has already checked every byte when
+-- it reads a field off the wire, so it builds them here without checking
+-- twice.
+
+import Turkey.Buffer as Buf
+
+-- A field name: a token, lowercase, never one of the reserved names.
+type HeaderName = HeaderName(String)
+
+instance Eq HeaderName { fun eq(HeaderName(a), HeaderName(b)) = a == b }
+instance Show HeaderName { fun show(HeaderName(s)) = s }
+
+-- A field value: `bytes[from..to)`, which no one writes to while the value is
+-- alive. A value read off the wire is a view into the array its head arrived
+-- in, which the codec hands over and never reuses; a value a program makes
+-- views its string's own bytes.
+--
+-- The bytes may hold obs-text (0x80 and above) that is not UTF-8, since that
+-- is a valid field value on the wire. `text` reads them as a string.
+type HeaderValue = HeaderValue { bytes : Array Byte, from : Int, to : Int, isSensitive : Bool }
+
+-- Values compare by their bytes; whether either is marked does not matter.
+instance Eq HeaderValue { fun eq(a, b) = sameBytes(a, b) }
+
+instance Show HeaderValue {
+    fun show(v) = if v.isSensitive { "<sensitive>" } else { text(v) }
+}
+
+-- Returns `s` as a name. `s` must be a lowercase token that is not reserved.
+fun name(s : String) -> HeaderName = HeaderName(s)
+
+-- Returns `bytes[from..to)` as a value. The bytes must be a valid field value
+-- and must not change while the value is alive.
+fun view(bytes : Array Byte, from : Int, to : Int) -> HeaderValue =
+    HeaderValue { bytes, from, to, isSensitive = False }
+
+-- Returns the value as a string. Bytes that are not UTF-8 are replaced by
+-- U+FFFD, which no typed header's grammar accepts, so such a value reads as
+-- no typed value at all.
+fun text(v : HeaderValue) -> String = match Buf.textOf(v.bytes, v.from, v.to) {
+    Some(s) -> s
+    None -> String.fromBytesLossy(Array.slice(v.bytes, v.from, v.to))
+}
+
+fun sameBytes(a : HeaderValue, b : HeaderValue) -> Bool {
+    let n = a.to - a.from
+    if n != b.to - b.from { return False }
+    for var i = 0; i < n; i = i + 1 {
+        if a.bytes[a.from + i] != b.bytes[b.from + i] { return False }
+    }
+    True
+}

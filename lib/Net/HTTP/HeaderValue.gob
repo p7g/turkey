@@ -11,26 +11,27 @@ export (HeaderValue, parse, literal, toString, sensitive, isSensitive)
 -- those that arrive: an outgoing value is checked as strictly as an incoming
 -- one.
 --
+-- **A value is bytes.** One that arrived is a view into the bytes its head
+-- arrived in, not a copy, and may hold bytes above 0x7F that are not UTF-8,
+-- which the wire allows. `toString` reads it as text.
+--
 -- **Sensitive values.** A value marked `sensitive`, as credentials are, shows
 -- as `<sensitive>`, so printing a request or its headers does not print a
 -- password. The mark is also what tells an HTTP/2 encoder never to index the
 -- value.
 
+import Data.String (String(..))
 import Net.HTTP.Error (HeaderError(..))
 import Net.HTTP.Syntax as Syntax
+import Turkey.HTTPField (HeaderValue(..))
+import Turkey.HTTPField as Field
 
-type HeaderValue = HeaderValue { text : String, isSensitive : Bool }
-
--- Values compare by their text; whether either is marked does not matter.
-instance Eq HeaderValue { fun eq(a, b) = a.text == b.text }
-
-instance Show HeaderValue {
-    fun show(v) = if v.isSensitive { "<sensitive>" } else { v.text }
+fun parse(s : String) -> Either HeaderError HeaderValue {
+    if !Syntax.isFieldValue(s) { return Left(InvalidValue) }
+    -- A `String`'s bytes never change, so the value may view them in place.
+    let bytes : Array Byte = Prim.castAs(String.bytesOf(s))
+    Right(Field.view(bytes, 0, len(bytes)))
 }
-
-fun parse(s : String) -> Either HeaderError HeaderValue =
-    if Syntax.isFieldValue(s) { Right(HeaderValue { text = s, isSensitive = False }) }
-    else { Left(InvalidValue) }
 
 -- Returns `s` as a header value, and panics if it is not one: a value written
 -- in the program's source that is invalid is a mistake in the program.
@@ -39,11 +40,13 @@ fun literal(s : String) -> HeaderValue = match parse(s) {
     Left(_) -> error("invalid header value literal '" + Syntax.escaped(s) + "'")
 }
 
--- Returns the value's text, as it is sent. A sensitive value's text too: this
--- is how it is written to the wire.
-fun toString(v : HeaderValue) -> String = v.text
+-- Returns the value's text. A sensitive value's text too. Bytes that are not
+-- UTF-8 come back as U+FFFD; the bytes sent are the value's own, not this
+-- text's.
+fun toString(v : HeaderValue) -> String = Field.text(v)
 
 -- Returns `v` marked sensitive.
-fun sensitive(v : HeaderValue) -> HeaderValue = HeaderValue { text = v.text, isSensitive = True }
+fun sensitive(v : HeaderValue) -> HeaderValue =
+    HeaderValue { bytes = v.bytes, from = v.from, to = v.to, isSensitive = True }
 
 fun isSensitive(v : HeaderValue) -> Bool = v.isSensitive

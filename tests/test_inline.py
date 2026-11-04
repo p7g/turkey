@@ -133,11 +133,11 @@ fun main() {
 
 
 def test_a_library_name_for_a_bulk_primitive_is_inlined():
-    """`Data.Array.Storage#fill` is `Prim.arrayFill` and nothing else. The
+    """`Turkey.Array#fill` is `Prim.arrayFill` and nothing else. The
     primitive is costed as the loops it lowers to, which is over the inline
     limit, but its name must cost no more than the primitive does in place:
     no call to it survives, and no specialization of it is made."""
     dump = lang.dump("opt", FILL_RUN)
     assert dump.code == 0, dump.stderr
-    assert "Data.Array.Storage#fill" not in dump.stdout, dump.stdout
+    assert "Turkey.Array#fill" not in dump.stdout, dump.stdout
     assert lang.output(FILL_RUN) == "[1, 9, 9, 4]\n"

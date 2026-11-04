@@ -1,5 +1,5 @@
 export (
-    IP(..), NetError, lookup, lookupUntil, parse,
+    IP(..), NetError, lookup, lookupUnbounded, parse,
     ConnectPolicy, ConnectRule(..), publicInternet, allowlist, anywhere,
     Destination, resolve, host, port, addresses,
 )
@@ -9,7 +9,7 @@ export (
 -- policy lets a connection reach. `Net.TCP` connects to what `resolve`
 -- answers.
 --
---     match Net.lookup("example.com", Some(Duration.seconds(5))) {
+--     match Net.lookup("example.com", Duration.seconds(5)) {
 --         Right(addresses) -> for a in addresses { print(a) }
 --         Left(e) -> print(e)
 --     }
@@ -31,8 +31,8 @@ export (
 -- **The timeout** bounds the whole lookup, waiting for a turn included. When
 -- it passes first the answer is `TimedOut`, at once. The resolver cannot be
 -- stopped, so it goes on to its end, and what it finds is thrown away.
--- Without a timeout, a lookup waits as long as the slowest name server the
--- resolver asks.
+-- `lookupUnbounded` has no timeout: it waits as long as the slowest name
+-- server the resolver asks, and holds a thread for all of that time.
 --
 -- **Many at once.** A lookup waits without holding a worker, so other tasks
 -- run meanwhile, and lookups from several tasks run at once, up to 128 in
@@ -90,10 +90,6 @@ export (
 -- that has some addresses it refuses keeps only the others.
 
 import Time (Timeout(..))
-import Time.Clock as Clock
-import Time.Deadline (Deadline)
-import Time.Deadline as Deadline
-import Time.Duration (Duration)
 import Turkey.ConnectPolicy (ConnectPolicy, ConnectRule(..), Destination(..))
 import Turkey.ConnectPolicy as ConnectPolicy
 import Turkey.Errors (IOError)
@@ -105,16 +101,16 @@ import Turkey.Resolve as Resolve
 -- of them without a conversion.
 type NetError = IOError
 
--- The addresses `host` names, waiting at most `timeout` for them.
-fun lookup(host : String, timeout : Option Duration) -> Either IOError (Array IP) =
-    lookupUntil(host, Option.map(timeout, Deadline.after))
-
--- `lookup` with a deadline made earlier, so that one limit can cover this and
+-- The addresses `host` names, waiting at most `timeout` for them: a
+-- `Duration`, or a `Deadline` made earlier so that one limit covers this and
 -- other steps.
-fun lookupUntil(host : String, deadline : Option Deadline) -> Either IOError (Array IP) {
-    let limit = if let Some(d) = deadline { Clock.nanos(Deadline.reading(d)) } else { -1 }
-    Resolve.lookup(Resolve.system, host, limit)
-}
+fun lookup[Timeout t](host : String, timeout : t) -> Either IOError (Array IP) =
+    Resolve.lookup(Resolve.system, host, ConnectPolicy.limit(timeout))
+
+-- `lookup` with no limit on the wait. The task makes the call itself, and the
+-- thread it runs on stays in `getaddrinfo` until the resolver answers.
+fun lookupUnbounded(host : String) -> Either IOError (Array IP) =
+    Resolve.lookup(Resolve.system, host, -1)
 
 -- The address `text` writes, if it writes one: four decimal parts from 0 to
 -- 255 without leading zeros; or eight hexadecimal groups, one run of zero

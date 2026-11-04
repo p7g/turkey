@@ -111,8 +111,8 @@ constraint    ::= qualified-CONID atype
 fun-decl  ::= "fun" IDENT context? "(" (pattern ("," pattern)*)? ")" ("->" type)? fun-body
 fun-body  ::= "=" expression
             | block
-let-decl  ::= "let" pattern "=" expression
-var-decl  ::= "var" pattern "=" expression
+let-decl  ::= "let" pattern "=" expression ("else" block)?
+var-decl  ::= "var" pattern "=" expression ("else" block)?
 ```
 
 ## Statements

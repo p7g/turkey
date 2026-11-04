@@ -383,8 +383,8 @@ takes no parameter list. The parameter is `_`.
 **Syntax**
 
 ```ebnf
-let-decl ::= "let" pattern "=" expression
-var-decl ::= "var" pattern "=" expression
+let-decl ::= "let" pattern "=" expression ("else" block)?
+var-decl ::= "var" pattern "=" expression ("else" block)?
 ```
 
 `let` binds the names in a pattern to the parts of a value. The binding cannot
@@ -399,10 +399,12 @@ fun main() {
 }
 ```
 
-The pattern must be [irrefutable](patterns.md#irrefutable-patterns), so
-`let (x, y) = point` is fine and `let Some(x) = maybe` is an error. Use
-[`if let`](statements.md#if-let-and-if-var) or [`match`](statements.md#match)
-for a pattern that might not match.
+Without an `else`, the pattern must be
+[irrefutable](patterns.md#irrefutable-patterns), so `let (x, y) = point` is
+fine and `let Some(x) = maybe` is an error. For a pattern that might not match,
+add an `else` block that leaves
+([`let ... else`](statements.md#let--else-and-var--else)), or use
+[`if let`](statements.md#if-let-and-if-var) or [`match`](statements.md#match).
 
 `let` and `var` decide whether the *name* can be pointed at something else.
 They do not decide whether the value is mutable. A `let` binding of a

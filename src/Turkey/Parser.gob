@@ -39,6 +39,8 @@ type P = P {
     -- How many `_` placeholders have been read and not yet made into a
     -- parameter. Zero is the common case, and it lets a boundary skip the walk.
     var pending  : Int,
+    -- See `Program.elseEnds`.
+    elseEnds     : Vec Expr,
 }
 
 fun parse(source : Source, known : Vec String) -> Program {
@@ -51,6 +53,7 @@ fun parse(source : Source, known : Vec String) -> Program {
         file = source.name,
         explicit = 0,
         pending = 0,
+        elseEnds = [],
     }
     parseProgram(p)
 }
@@ -284,7 +287,10 @@ fun parseProgram(p : P) -> Program {
         }
         endOfStatement(p)
     }
-    Program { span = s, exportDecl = exportDecl, imports = imports, decls = decls }
+    Program {
+        span = s, exportDecl = exportDecl, imports = imports, decls = decls,
+        elseEnds = p.elseEnds,
+    }
 }
 
 fun endOfStatement(p : P) -> Unit {
@@ -1177,16 +1183,93 @@ fun parseFunBody(p : P) -> Expr {
 
 fun parseBindingStmt(p : P) -> Stmt {
     let tok = advance(p)
+    let mutable = Token.isWord(tok.kind, "var")
     let saved = setNoRecord(p, False)
     let pattern = parsePattern(p)
     skipToken(p, "=")
     let value = closeWhole(p, parseExpr(p))
     p.noRecord = saved
-    if Token.isWord(tok.kind, "let") {
-        mkStmt(p, tok.span, SLet(pattern, value))
-    } else {
-        mkStmt(p, tok.span, SVar(pattern, value))
+    if at(p, "else") { return parseLetElse(p, tok.span, mutable, pattern, value) }
+    mkStmt(p, tok.span, if mutable { SVar(pattern, value) } else { SLet(pattern, value) })
+}
+
+-- `let p = e else { B }` is
+--
+--     let (x, y) = match e { p -> (x, y), _ -> B }
+--
+-- for the names `p` binds, with a lone name in place of the tuple, or `_` for
+-- none, and `var` in place of `let` for `var p = e else { B }`.
+--
+-- The names are bound by a `let` of the block rather than by putting the rest
+-- of the block in the first arm. Desugaring `?` treats a statement of the block
+-- differently from one inside a branch, so nesting would change how every `?`
+-- after this statement is lowered.
+fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> Stmt {
+    -- `let x = if c { a } else { b } else { ... }` would read either way, so a
+    -- value ending in a block cannot take an `else`.
+    if Token.kindName(p.toks[p.i - 1].kind) == "}" {
+        oops(p, "a 'let' value that ends in '}' cannot be followed by 'else'; "
+                + "put the value in parentheses", cur(p).span)
     }
+    skipToken(p, "else")
+    let otherwise = parseBlock(p)
+    collectElseEnds(p, otherwise)
+    let names = patternVars(pat)
+    let vars = Vec.map(names, fun(n) = mkPat(p, pat.span, PVar(n)))
+    let refs = Vec.map(names, fun(n) = mkExpr(p, pat.span, EVar(n, False)))
+    let (bound, out) = match len(names) {
+        0 -> (mkPat(p, pat.span, PWild), mkExpr(p, pat.span, EUnit))
+        1 -> (vars[0], refs[0])
+        _ -> (mkPat(p, pat.span, PTuple(vars)), mkExpr(p, pat.span, ETuple(refs)))
+    }
+    let m = mkExpr(p, s, EMatch(value, [
+        Arm { span = pat.span, patterns = [pat], body = out },
+        Arm { span = otherwise.span, patterns = [mkPat(p, otherwise.span, PWild)],
+              body = otherwise },
+    ]))
+    mkStmt(p, s, if mutable { SVar(bound, m) } else { SLet(bound, m) })
+}
+
+-- Record in `p.elseEnds` every way `e`, an `else` block, can end that is not a
+-- control transfer: each expression in tail position other than a `return`,
+-- `break`, `continue` or a `loop` with no `break` of its own.
+fun collectElseEnds(p : P, e : Expr) -> Unit = match e.kind {
+    EReturn(_) | EBreak(_) | EContinue -> {}
+    EBlock(stmts) -> {
+        if len(stmts) > 0 {
+            if let SExpr(last) = stmts[len(stmts) - 1].kind {
+                return collectElseEnds(p, last)
+            }
+        }
+        Vec.push(p.elseEnds, e)
+    }
+    EIf(_, then, Some(otherwise)) -> {
+        collectElseEnds(p, then)
+        collectElseEnds(p, otherwise)
+    }
+    EMatch(_, arms) -> for arm in arms { collectElseEnds(p, arm.body) }
+    ELoop(body) -> if breaksOut(ChExpr(body)) { Vec.push(p.elseEnds, e) }
+    _ -> Vec.push(p.elseEnds, e)
+}
+
+-- Whether `c`, a loop's body, holds a `break` that leaves that loop: one not
+-- inside a nested loop, a lambda or a local `fun`.
+fun breaksOut(c : Child) -> Bool {
+    match c {
+        ChExpr(e) -> match e.kind {
+            EBreak(_) -> return True
+            EWhile(_, _) | EForIn(_, _, _, _, _) | EForC(_, _, _, _) | ELoop(_) ->
+                return False
+            ELambda(_, _, _) -> return False
+            _ -> {}
+        }
+        ChStmt(s) -> if let SFun(_) = s.kind { return False }
+        _ -> {}
+    }
+    for ch in children(c) {
+        if breaksOut(ch) { return True }
+    }
+    False
 }
 
 fun parseStmt(p : P) -> Stmt {

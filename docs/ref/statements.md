@@ -208,6 +208,116 @@ took 8
 42
 ```
 
+## `let ... else` and `var ... else`
+
+**Syntax**
+
+```ebnf
+let-decl ::= "let" pattern "=" expression ("else" block)?
+var-decl ::= "var" pattern "=" expression ("else" block)?
+```
+
+`let p = e else { B }` evaluates `e`. If `p` matches, the pattern's variables
+are bound for the rest of the block, as with a plain `let`. If it does not, `B`
+runs instead. It is approximately
+
+```text
+let ($x, $y) = match e {
+    p -> ($x, $y)
+    _ -> B
+}
+```
+
+where `$x` and `$y` are the variables `p` binds, so the pattern may be
+refutable. `var p = e else { B }` is the same, except that the variables can be
+assigned afterwards.
+
+<!-- run -->
+```kotlin
+fun total(lines : Array String) -> Int {
+    var sum = 0
+    for line in lines {
+        let Some(n) = Int.parse(line) else { continue }
+        sum = sum + n
+    }
+    sum
+}
+
+fun main() {
+    print(total(["3", "four", "5"]))
+}
+```
+
+```text
+8
+```
+
+`B` must not reach its end, because the variables would then have no value.
+It has to finish with `return`, `break` or `continue`, or with a call to a
+function that never returns. A function never returns when its result type is
+a type variable that none of its parameters mention, as in `error : fun(String)
+-> a`: it has no way to make a value of that type. An `if` or `match` at the end
+of `B` passes when every branch does.
+
+<!-- run -->
+```kotlin
+fun port(text : String) -> Int {
+    let Some(n) = Int.parse(text) else { error("not a port: " + text) }
+    n
+}
+
+fun main() {
+    print(port("8080"))
+}
+```
+
+```text
+8080
+```
+
+<!-- error: this 'else' block can reach its end; it must end in 'return', 'break', 'continue' or a call that never returns -->
+```kotlin
+fun port(text : String) -> Int {
+    let Some(n) = Int.parse(text) else { print("not a port") }
+    n
+}
+
+fun main() {
+    print(port("8080"))
+}
+```
+
+The variables `p` binds are not visible in `B`, and neither is the value that
+failed to match. When `B` needs that value, as in reporting the error inside a
+`Left`, use `match`.
+
+The value cannot end in `}` when an `else` follows, because the `else` could
+belong to an `if` inside it. Put such a value in parentheses:
+
+<!-- error: a 'let' value that ends in '}' cannot be followed by 'else'; put the value in parentheses -->
+```kotlin
+fun pick(fast : Bool, x : Option Int) -> Int {
+    let Some(v) = if fast { x } else { None } else { return 0 }
+    v
+}
+```
+
+<!-- run -->
+```kotlin
+fun pick(fast : Bool, x : Option Int) -> Int {
+    let Some(v) = (if fast { x } else { None }) else { return 0 }
+    v
+}
+
+fun main() {
+    print(pick(True, Some(3)))
+}
+```
+
+```text
+3
+```
+
 ## `match`
 
 **Syntax**

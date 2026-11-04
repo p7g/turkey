@@ -119,6 +119,9 @@ type Generator = Generator {
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
     discardSites : Vec Expr,
+    -- See `Program.elseEnds`, as a list and by id.
+    elseEnds   : Vec Expr,
+    elseEndIds : Set.Set Int,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
     -- variables and its context.
     partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred),
@@ -137,7 +140,8 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
         warnings = Vec.new(4), matchSites = Vec.new(8),
-        binderSites = Vec.new(8), discardSites = Vec.new(8),
+        binderSites = Vec.new(8), discardSites = Vec.new(8), elseEnds = [],
+        elseEndIds = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
     }
 }
@@ -262,6 +266,10 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     let foreigns = Vec.new(4)
     let items = Vec.new(16)
     for (owner, program) in modules {
+        for e in program.elseEnds {
+            Vec.push(g.elseEnds, e)
+            Set.add(g.elseEndIds, e.id)
+        }
         for d in program.decls {
             match d {
                 DType(t) -> Vec.push(typeDecls, t)
@@ -891,6 +899,22 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
+    -- The parser has passed over every way an `else` block can end by a
+    -- transfer. What is left must be a call that never returns. A callee with
+    -- no recorded type was rebuilt by desugaring because it held a `?`, and
+    -- nothing shows that one never returns.
+    for end in g.elseEnds {
+        let leaves = match end.kind {
+            ECall(fn, _) -> Map.contains(g.types.exprs, fn.id)
+                            && neverReturns(Typed.of_(g.types, fn))
+            _ -> False
+        }
+        if !leaves {
+            oops("this 'else' block can reach its end; it must end in 'return', "
+                 + "'break', 'continue' or a call that never returns",
+                 Some(end.span))
+        }
+    }
     -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
         let ty = Typed.of_(g.types, x)
@@ -928,16 +952,7 @@ fun diverges(g : Generator, e : Expr) -> Bool {
         _ -> {}
     }
     match e.kind {
-        ECall(fn, _) -> match Typed.of_(g.types, fn) {
-            TFun(params, ret) -> match Ty.prune(ret) {
-                TVar(cell) -> {
-                    for v in Ty.varsOf(params) { if v.id == cell.id { return False } }
-                    True
-                }
-                _ -> False
-            }
-            _ -> False
-        }
+        ECall(fn, _) -> neverReturns(Typed.of_(g.types, fn))
         EIf(_, then, otherwise) -> match otherwise {
             Some(o) -> diverges(g, then) && diverges(g, o)
             None -> False
@@ -954,6 +969,19 @@ fun diverges(g : Generator, e : Expr) -> Bool {
         }
         _ -> False
     }
+}
+
+-- Whether a function of type `t` never returns, by parametricity: its result is
+-- a variable its parameters do not mention.
+fun neverReturns(t : Ty.Type) -> Bool = match t {
+    TFun(params, ret) -> match Ty.prune(ret) {
+        TVar(cell) -> {
+            for v in Ty.varsOf(params) { if v.id == cell.id { return False } }
+            True
+        }
+        _ -> False
+    }
+    _ -> False
 }
 
 -- -- binders -----------------------------------------------------------------------
@@ -1112,7 +1140,7 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
     Vec.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
-    Vec.push(g.binderSites, (pat, t, "use 'if let' or 'match'"))
+    Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'"))
     let binds = Vec.new(4)
     for (n, ty) in Map.entries(bound) { Vec.push(binds, (n, ty)) }
     let defn = pop(g)
@@ -1468,7 +1496,14 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
 -- -- expressions -------------------------------------------------------------------
 
 fun genExpr(g : Generator, e : Expr) -> Ty.Type {
-    let ty = genExprKind(g, e)
+    var ty = genExprKind(g, e)
+    -- Where an `else` block can end is bottom, like a `return`, and checked
+    -- once types are solved: only a call to a function whose result its
+    -- parameters do not mention passes. Answering the real type would unify a
+    -- call's result with the type of the names the `let` binds, and the check
+    -- could no longer tell; and an end that is plainly not bottom would be
+    -- reported as a mismatch between the arms instead.
+    if Set.contains(g.elseEndIds, e.id) { ty = TBottom }
     -- One place, so no case can forget. What is recorded is the variable itself,
     -- not a snapshot of it: solving fills it in later.
     Typed.record(g.types, e, ty)

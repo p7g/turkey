@@ -366,7 +366,8 @@ fun streamOf[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](c : c)
 --   them on their way.
 -- * `sending`, by the task taking ciphertext out of `wbio` and writing it to
 --   the connection, held until it is written. So it goes out in order,
---   whichever task's call made it. It holds the bytes on their way.
+--   whichever task's call made it. It holds the bytes on their way. Only a
+--   write or `shutdownWrite` waits for it; see `send`.
 -- * `engine`, around every call into OpenSSL with this connection, since one
 --   `SSL` is not to be used from two threads at once.
 type TLS = TLS {
@@ -427,7 +428,9 @@ instance Write TLS {
     type WriteError = TLSError
     fun writeFrom(t, from) = using(t, "write", fun() {
         settled(t)?
-        Sync.withLock(t.sending, fun(outgoing) = transmit(t, outgoing, from))
+        Sync.withLock(t.sending, fun(outgoing) = transmit(t, outgoing, from))?
+        -- What a read left in `wbio` while this held `sending`.
+        send(t)
     })
     -- Nothing is held back: each write is sent.
     fun flush(t) = Right(())
@@ -453,6 +456,8 @@ instance Connection TLS {
                 SSL.sslShutdown(engine.ssl)
             })
             drain(t, outgoing)?
+            -- What a read leaves in `wbio` from here on is never sent: the
+            -- connection's output is ended.
             Either.mapLeft(t.stream.halfClosing(), Stream)
         })
     })
@@ -865,8 +870,24 @@ fun fill(t : TLS, incoming : Buffer) -> Either TLSError Unit {
     Right(())
 }
 
--- Send what OpenSSL has made, taking `sending`.
-fun send(t : TLS) -> Either TLSError Unit = Sync.withLock(t.sending, fun(outgoing) = drain(t, outgoing))
+-- Send what OpenSSL has made, unless another task holds `sending`. That task
+-- sends it instead, since every write looks at `wbio` again after releasing
+-- `sending`; so the bytes go out either way.
+fun send(t : TLS) -> Either TLSError Unit {
+    -- Never wait for `sending` here. A read calls this, and the holder may be
+    -- a write waiting for the peer to read, while the peer waits for this
+    -- task to read.
+    loop {
+        if let Some(r) = Sync.tryWithLock(t.sending, fun(outgoing) = drain(t, outgoing)) {
+            r?
+        } else {
+            return Right(())
+        }
+        -- Bytes a read left while this held `sending`.
+        let left = withEngine(t, fun(engine) = SSL.bioCtrlPending(engine.wbio) > 0)
+        if !left { return Right(()) }
+    }
+}
 
 -- With `sending` held: write everything in `wbio` to the connection.
 fun drain(t : TLS, outgoing : Buffer) -> Either TLSError Unit {

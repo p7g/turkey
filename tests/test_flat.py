@@ -275,69 +275,6 @@ def test_a_flat_result_comes_back_in_registers():
         assert stressed.stdout == plain
 
 
-# `Failure` is four slots, so `Either Failure Int` would be six inline: a tag,
-# the failure's own four and the `Int`. Each field of several slots is then
-# held as a pointer to its box, as an object of the type would hold it, so the
-# sum is three slots and comes back in registers. `pairs` does the same for a
-# product: two flat pairs of three slots are two pointers.
-WIDE = """
-type Failure = Failure { what : String, where_ : String, code : Int, fatal : Bool }
-
-fun attempt(n : Int) -> Either Failure Int {
-    if n < 0 { return attempt(n + 1) }
-    if n % 3 == 0 {
-        return Left(Failure { what = "bad", where_ = Int.toString(n), code = n, fatal = n > 5 })
-    }
-    Right(n * 10)
-}
-
-fun pairs(n : Int) -> ((String, Int, Bool), (String, Int, Bool)) =
-    if n == 0 { (("a", 0, True), ("b", 1, False)) } else {
-        let (x, y) = pairs(n - 1)
-        (y, (x.0 + "!", x.1 + n, !x.2))
-    }
-
-fun main() {
-    var total = 0
-    for var i = -2; i < 300; i = i + 1 {
-        match attempt(i) {
-            Right(v) -> { total = total + v }
-            Left(f) -> {
-                total = total + f.code + String.byteLength(f.where_)
-                if f.fatal { total = total + 1 }
-            }
-        }
-    }
-    print(total)
-    print(pairs(5))
-    let kept = [attempt(3), attempt(4)]
-    for k in kept {
-        match k {
-            Left(f) -> print(f.what + " at " + f.where_)
-            Right(v) -> print(v)
-        }
-    }
-}
-"""
-
-
-def test_a_field_too_wide_to_fit_is_held_as_its_box():
-    plain = lang.output(WIDE)
-    assert plain == "315212\n((b!!, 7, False), (a!!!, 9, False))\nbad at 3\n40\n"
-    result = lang.dump("ssa", WIDE)
-    assert result.code == 0, result.stderr
-    attempt = _function(result.stdout, "attempt")
-    assert attempt.split("{", 1)[0].endswith("-> (i1, ptr*, i64) "), attempt
-    # The `Right` path builds nothing; the `Left` boxes the failure alone.
-    assert attempt.count("object.new") == 1, attempt
-    pairs = _function(result.stdout, "pairs")
-    assert pairs.split("{", 1)[0].endswith("-> (ptr*, ptr*) "), pairs
-    for env in (STRESS, GENERATIONAL):
-        stressed = lang.run(WIDE, env=env, flags=VERIFY)
-        assert stressed.code == 0, stressed.stderr
-        assert stressed.stdout == plain
-
-
 # Each function recurses, so none is inlined. In `pick` and `sum` both arms of
 # the `if` read an element, which memory holds boxed; in `mixed` one arm
 # builds the value from its slots.

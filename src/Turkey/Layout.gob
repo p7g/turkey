@@ -147,12 +147,7 @@ let flatLimit = 4
 -- field of each constructor.
 --
 -- A product (a tuple, or a type with one constructor) is its fields' slots in
--- field order, a flat field's own slots spliced in. When they come to more
--- than `flatLimit`, each field of several slots is held as the pointer to its
--- box that memory would hold it at, and the value is flat if that fits. An
--- object of the type would hold those fields as the same pointers, so this
--- saves the object and costs nothing: `Either IOError Int`, whose `IOError` is
--- four slots, is a tag, a pointer to the error and the `Int`. A sum has a tag slot
+-- field order, a flat field's own slots spliced in. A sum has a tag slot
 -- first, holding the index of the value's constructor among its type's, and
 -- then the slots its constructors' fields need, merged by representation: the
 -- n-th slot of one representation in one constructor's fields is the n-th slot
@@ -164,9 +159,7 @@ type Flat = Flat {
     slots  : Array Rep,
     -- A sum's constructors, in declaration order; empty for a product.
     names  : Array String,
-    -- Per constructor (one, for a product), per field, the slots holding it:
-    -- the field's own slots, or one holding a pointer to its box where the
-    -- field has several and they did not fit.
+    -- Per constructor (one, for a product), per field, the slots holding it.
     fields : Array (Array (Array Int)),
 }
 
@@ -428,8 +421,7 @@ fun fieldsOf(decls : DeclTable, t : Ty.Type, fd : Decls.FlatDecl,
 }
 
 -- The slots of a value of the candidate `fd` whose fields have these slots, or
--- one pointer if it is held boxed. `fields` are each field's own slots, before
--- any is held as a pointer to fit (`productFields`, `sumFields`).
+-- one pointer if it is held boxed.
 fun declaredSlots(fd : Decls.FlatDecl, fields : Array (Array (Array Rep))) -> Array Rep {
     if len(fields) == 1 { return productSlots(fields[0]) }
     if boxedCompact(fd, fields) { return ptr.slots }
@@ -449,52 +441,18 @@ fun boxedCompact(fd : Decls.FlatDecl, fields : Array (Array (Array Rep))) -> Boo
         None -> False
     }
 
--- The slots of a product of fields of these slots, or one pointer if they do
--- not fit (`productFields`).
-fun productSlots(fields : Array (Array Rep)) -> Array Rep = match productFields(fields) {
-    Some(held) -> {
-        let slots = []
-        for f in held { for r in f { Vec.push(slots, r) } }
-        Vec.toArray(slots)
-    }
-    None -> ptr.slots
+-- The slots of a product of fields of these slots, or one pointer if there are
+-- more than `flatLimit`.
+fun productSlots(fields : Array (Array Rep)) -> Array Rep {
+    let slots = []
+    for f in fields { for r in f { Vec.push(slots, r) } }
+    if len(slots) > flatLimit { ptr.slots } else { Vec.toArray(slots) }
 }
 
 -- The slots of a sum whose constructors have fields of these slots, or one
--- pointer if they do not fit (`sumFields`).
-fun sumSlots(fields : Array (Array (Array Rep))) -> Array Rep = match sumFields(fields) {
-    Some((_, slots)) -> slots
-    None -> ptr.slots
-}
-
--- The slots a flat product holds each of these fields in, if it is flat: each
--- field's own if they come to at most `flatLimit`, or else with every field of
--- several slots held as a pointer to its box, if that does.
-fun productFields(fields : Array (Array Rep)) -> Option (Array (Array Rep)) {
-    if totalSlots(fields) <= flatLimit { return Some(fields) }
-    let held = Array.map(fields, narrowed)
-    if totalSlots(held) <= flatLimit { Some(held) } else { None }
-}
-
--- The same for a sum: the slots each field of each constructor is held in, and
--- the sum's slots (`sumFits`).
-fun sumFields(fields : Array (Array (Array Rep)))
-        -> Option (Array (Array (Array Rep)), Array Rep) {
-    match sumFits(fields) {
-        Some(slots) -> return Some((fields, slots))
-        None -> {}
-    }
-    let held = Array.map(fields, fun(con) = Array.map(con, narrowed))
-    match sumFits(held) {
-        Some(slots) -> Some((held, slots))
-        None -> None
-    }
-}
-
--- A field's slots as memory holds the field: one slot as itself, and several
--- as a pointer to their box (`storedRep`).
-fun narrowed(slots : Array Rep) -> Array Rep =
-    if len(slots) > 1 { ptr.slots } else { slots }
+-- pointer if there are more than `flatLimit`.
+fun sumSlots(fields : Array (Array (Array Rep))) -> Array Rep =
+    Option.unwrapOr(sumFits(fields), ptr.slots)
 
 -- The slots of a sum whose constructors have fields of these slots, if there
 -- are at most `flatLimit`: the tag, then for each representation in
@@ -536,7 +494,8 @@ fun flatIn(decls : DeclTable, ty : Ty.Type, layouts : Map String Layout,
                 let l = unfold(decls, x, layouts, u)?
                 Vec.push(found, l.slots)
             }
-            Some(productFlat(productFields(Vec.toArray(found))?))
+            let fields = Vec.toArray(found)
+            if totalSlots(fields) > flatLimit { None } else { Some(productFlat(fields)) }
         }
         TCon(_) -> declaredFlat(decls, t, [], layouts, u)
         TApp(_, _, _) -> {
@@ -561,10 +520,13 @@ fun declaredFlat(decls : DeclTable, t : Ty.Type, args : Array Ty.Type,
         Some(found) -> found
         None -> return None
     }
-    if len(fields) == 1 { return Some(productFlat(productFields(fields[0])?)) }
+    if len(fields) == 1 {
+        if totalSlots(fields[0]) > flatLimit { return None }
+        return Some(productFlat(fields[0]))
+    }
     if boxedCompact(fd, fields) { return None }
-    let (held, slots) = sumFields(fields)?
-    Some(sumFlat(fd.names, slots, held))
+    let slots = sumFits(fields)?
+    Some(sumFlat(fd.names, slots, fields))
 }
 
 fun totalSlots(fields : Array (Array Rep)) -> Int {

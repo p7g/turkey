@@ -7,6 +7,7 @@ import Net.HTTP.HeaderValue as HeaderValue
 import Net.HTTP.Headers as Headers
 import Net.HTTP.MediaType as MediaType
 import Net.HTTP.HTTPURL as HTTPURL
+import Net.HTTP.Limits as Limits
 import Net.HTTP.Method as Method
 import Net.HTTP.Request as Request
 import Net.HTTP.Status as Status
@@ -42,6 +43,7 @@ fun main() {
     values()
     typedRoundTrips()
     multiplicity()
+    combining()
     errors()
     building()
 }
@@ -218,6 +220,51 @@ fun multiplicity() {
     check(Headers.has(accepts, Accept) && !Headers.has(accepts, ContentType), "has")
 }
 
+-- Headers and limits are monoids: values that can be named and joined.
+fun combining() {
+    print("-- combining")
+    let json = field(ContentType, MediaType.json)
+    let cached = field(HeaderName.literal("cache-control"), HeaderValue.literal("no-store"))
+    let shared = combine(json, cached)
+    print(shared)
+    let r = withHeaders(request(GET, "https://example.com/") |> header(Accept, MediaType.json), shared)
+    print(r.headers)
+    -- A `Single` field on the right replaces the left's; a list, a
+    -- `Set-Cookie` and a field by its raw name are appended.
+    let cookie = fun(text) = Option.expect(Cookie.parse(text), text)
+    let raw = fun(v) = field(HeaderName.literal("x-raw"), HeaderValue.literal(v))
+    let a = combine(combine(json, field(SetCookie, cookie("a=1"))), raw("1"))
+    let b = combine(combine(field(Accept, MediaType.json), field(ContentType, MediaType.plainText)), raw("2"))
+    let c = combine(combine(field(SetCookie, cookie("b=2")), field(ContentType, MediaType.html)),
+                    field(Accept, MediaType.plainText))
+    let left = combine(combine(a, b), c)
+    let right = combine(a, combine(b, c))
+    print(left)
+    check(show(left) == show(right), "combine is associative, field order included")
+    check(show(combine(Headers.empty, left)) == show(left), "empty is a left identity")
+    check(show(combine(left, Headers.empty)) == show(left), "empty is a right identity")
+    check(Headers.size(combine(json, json)) == 1, "a Single field on the right wins")
+    -- Fields off the wire are appended, and two of a Single field stay two,
+    -- for `one` to refuse.
+    let wire = Headers.fromFields([
+        (HeaderName.literal("content-type"), HeaderValue.literal("text/plain")),
+        (HeaderName.literal("content-type"), HeaderValue.literal("text/html")),
+    ])
+    check(Headers.size(combine(Headers.empty, wire)) == 2, "fields off the wire are appended")
+    check(!Either.isRight(singleBare(wire)), "two Content-Types off the wire are refused")
+    print(combine(wire, json))
+
+    let strict = combine(Limits.headBytes(8192), Limits.fields(50))
+    let v = Limits.values(combine(strict, Limits.headBytes(4096)))
+    print("limits: head " + show(v.headBytes) + ", fields " + show(v.fields) + ", lines " + show(v.lineBytes)
+          + ", stall " + show(v.stall))
+    let d = Limits.values(Limits.empty)
+    print("defaults: head " + show(d.headBytes) + ", drain " + show(d.drainBytes) + ", idle "
+          + show(d.idleTimeout) + ", connections " + show(d.connections))
+    let l = Limits.values(combine(Limits.stall(Duration.seconds(10)), combine(Limits.empty, Limits.connections(8))))
+    print("joined: stall " + show(l.stall) + ", connections " + show(l.connections))
+}
+
 type AppError = AppError(HTTPError)
 instance FromHTTP AppError { fun fromHTTP(e) = AppError(e) }
 
@@ -266,11 +313,12 @@ fun building() {
     print(show(put.url) + " " + show(Method.body(put.method)))
     -- A request a server received, routed by matching.
     let at = fun(path) = RequestTarget { authority = Some("example.com"), path, query = None }
+    let none = Control { contentLength = None, upgrade = [], trailers = False }
     let received = [
-        Request { method = GET, target = at("/health"), headers = Headers.empty },
-        Request { method = POST("{}"), target = at("/orders"), headers = Headers.empty },
-        Request { method = PATCH("{}"), target = at("/orders"), headers = Headers.empty },
-        Request { method = GET, target = at("/files/a%20b/c%2Fd"), headers = Headers.empty },
+        Request { method = GET, target = at("/health"), headers = Headers.empty, control = none },
+        Request { method = POST("{}"), target = at("/orders"), headers = Headers.empty, control = none },
+        Request { method = PATCH("{}"), target = at("/orders"), headers = Headers.empty, control = none },
+        Request { method = GET, target = at("/files/a%20b/c%2Fd"), headers = Headers.empty, control = none },
     ]
     for req in received {
         let answer = match (req.method, req.target.path) {

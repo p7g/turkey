@@ -1,17 +1,26 @@
 export (
-    Limits, defaults,
+    Limits, Values(..), empty, values,
     headBytes, fields, lineBytes, chunkLineBytes, trailerBytes, drainBytes,
-    withHeadBytes, withFields, withLineBytes, withChunkLineBytes, withTrailerBytes, withDrainBytes,
+    headTimeout, stall, idleTimeout, lingerIdle, lingerTotal, connections,
 )
 
--- How much of a peer's message HTTP reads before it refuses or gives up.
+-- How much of a peer's message HTTP reads before it refuses or gives up, and
+-- how long it waits.
 --
---     let l = Limits.withHeadBytes(Limits.defaults, 32768)
+--     let strict = combine(Limits.headBytes(8192), Limits.fields(50))
+--     let l = combine(strict, Limits.stall(Duration.seconds(10)))
 --
--- `Limits` is abstract and built from `defaults` with the `with...`
--- functions, so that a limit can be added without breaking a program that
--- sets the others. Each setter panics on a limit below 1: a limit of none
--- would make every message refused, which is a mistake in the program.
+-- **`Limits` is a set of overrides of the defaults.** Each function below
+-- returns a value that overrides one limit; `empty` overrides none, and
+-- `combine` joins two, the right side winning wherever both override
+-- the same limit. That join is associative, so settings can be named, reused
+-- and built up in any grouping. `values(l)` returns every limit with the
+-- overrides applied. A limit can be added without breaking a program that
+-- sets the others.
+--
+-- Each function panics on a limit below 1, or a duration that is not
+-- positive: a limit of none would refuse every message, which is a mistake
+-- in the program.
 --
 -- | limit            | default | what is over it                          |
 -- |------------------|---------|------------------------------------------|
@@ -22,74 +31,193 @@ export (
 -- | `trailerBytes`   | 4 KiB   | the trailer fields after a chunked body  |
 -- | `drainBytes`     | 256 KiB | an unread body, discarded to keep the    |
 -- |                  |         | connection open; a longer one closes it  |
+-- | `headTimeout`    | 30 s    | a whole request head, from its first     |
+-- |                  |         | byte, or a TLS handshake and the first   |
+-- |                  |         | head from the connection's start         |
+-- | `stall`          | 30 s    | a read or write blocked without progress |
+-- | `idleTimeout`    | 60 s    | a kept-alive connection with no request  |
+-- | `lingerIdle`     | 5 s     | a read while a connection closes after a |
+-- |                  |         | request it did not read to its end       |
+-- | `lingerTotal`    | 30 s    | all of that closing                      |
+-- | `connections`    | 1024    | connections a server holds at once; the  |
+-- |                  |         | next waits in the listener's backlog     |
 --
 -- Each byte count includes the CRLFs. The chunk-line limit is what keeps a
 -- peer from sending a gigabyte of chunk extensions, which no reader looks at.
 -- A chunk size also has at most 16 hex digits whatever the limits, since a
 -- longer one cannot be a length.
+--
+-- **The head timeout is a deadline, not a timer between reads,** so a head
+-- dripped a byte at a time cannot hold a connection past it. The stall limit
+-- is the other kind: a limit on progress. It bounds how long one read or
+-- write waits without moving a byte, so a slow but steady body goes on, and a
+-- peer that stops sending, or stops reading what it is sent, is cut off. It
+-- never counts time in which nothing was being read or written, so a quiet
+-- stream whose program has nothing to send is not cut.
 
+import Time.Duration (Duration)
+import Time.Duration as Duration
+
+-- Each field is `None` where the default holds. The fields are `var` only so
+-- that the functions below can fill one in on a value they have just made; no
+-- `Limits` changes once it is returned.
 type Limits = Limits {
+    var headBytes : Option Int,
+    var fields : Option Int,
+    var lineBytes : Option Int,
+    var chunkLineBytes : Option Int,
+    var trailerBytes : Option Int,
+    var drainBytes : Option Int,
+    var headTimeout : Option Duration,
+    var stall : Option Duration,
+    var idleTimeout : Option Duration,
+    var lingerIdle : Option Duration,
+    var lingerTotal : Option Duration,
+    var connections : Option Int,
+}
+
+-- Every limit, with a set of overrides applied.
+type Values = Values {
     headBytes : Int,
     fields : Int,
     lineBytes : Int,
     chunkLineBytes : Int,
     trailerBytes : Int,
     drainBytes : Int,
+    headTimeout : Duration,
+    stall : Duration,
+    idleTimeout : Duration,
+    lingerIdle : Duration,
+    lingerTotal : Duration,
+    connections : Int,
 }
 
-let defaults = Limits {
-    headBytes = 16384,
-    fields = 100,
-    lineBytes = 8192,
-    chunkLineBytes = 1024,
-    trailerBytes = 4096,
-    drainBytes = 262144,
+let empty = none()
+
+fun none() -> Limits = Limits {
+    headBytes = None, fields = None, lineBytes = None, chunkLineBytes = None, trailerBytes = None,
+    drainBytes = None, headTimeout = None, stall = None, idleTimeout = None, lingerIdle = None,
+    lingerTotal = None, connections = None,
 }
 
-fun headBytes(l : Limits) -> Int = l.headBytes
-fun fields(l : Limits) -> Int = l.fields
-fun lineBytes(l : Limits) -> Int = l.lineBytes
-fun chunkLineBytes(l : Limits) -> Int = l.chunkLineBytes
-fun trailerBytes(l : Limits) -> Int = l.trailerBytes
-fun drainBytes(l : Limits) -> Int = l.drainBytes
-
-fun withHeadBytes(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes = _, fields, lineBytes, chunkLineBytes, trailerBytes, drainBytes } = l
-    Limits { headBytes = positive("withHeadBytes", n), fields, lineBytes, chunkLineBytes, trailerBytes,
-             drainBytes }
+instance Semigroup Limits {
+    fun combine(a, b) = Limits {
+        headBytes = over(a.headBytes, b.headBytes),
+        fields = over(a.fields, b.fields),
+        lineBytes = over(a.lineBytes, b.lineBytes),
+        chunkLineBytes = over(a.chunkLineBytes, b.chunkLineBytes),
+        trailerBytes = over(a.trailerBytes, b.trailerBytes),
+        drainBytes = over(a.drainBytes, b.drainBytes),
+        headTimeout = over(a.headTimeout, b.headTimeout),
+        stall = over(a.stall, b.stall),
+        idleTimeout = over(a.idleTimeout, b.idleTimeout),
+        lingerIdle = over(a.lingerIdle, b.lingerIdle),
+        lingerTotal = over(a.lingerTotal, b.lingerTotal),
+        connections = over(a.connections, b.connections),
+    }
 }
 
-fun withFields(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes, fields = _, lineBytes, chunkLineBytes, trailerBytes, drainBytes } = l
-    Limits { headBytes, fields = positive("withFields", n), lineBytes, chunkLineBytes, trailerBytes,
-             drainBytes }
+instance Monoid Limits { fun empty() = empty }
+
+fun over(a : Option x, b : Option x) -> Option x = match b {
+    Some(_) -> b
+    None -> a
 }
 
-fun withLineBytes(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes, fields, lineBytes = _, chunkLineBytes, trailerBytes, drainBytes } = l
-    Limits { headBytes, fields, lineBytes = positive("withLineBytes", n), chunkLineBytes, trailerBytes,
-             drainBytes }
+-- Returns every limit, each `l`'s override or else its default.
+fun values(l : Limits) -> Values = Values {
+    headBytes = Option.unwrapOr(l.headBytes, 16384),
+    fields = Option.unwrapOr(l.fields, 100),
+    lineBytes = Option.unwrapOr(l.lineBytes, 8192),
+    chunkLineBytes = Option.unwrapOr(l.chunkLineBytes, 1024),
+    trailerBytes = Option.unwrapOr(l.trailerBytes, 4096),
+    drainBytes = Option.unwrapOr(l.drainBytes, 262144),
+    headTimeout = Option.unwrapOr(l.headTimeout, Duration.seconds(30)),
+    stall = Option.unwrapOr(l.stall, Duration.seconds(30)),
+    idleTimeout = Option.unwrapOr(l.idleTimeout, Duration.seconds(60)),
+    lingerIdle = Option.unwrapOr(l.lingerIdle, Duration.seconds(5)),
+    lingerTotal = Option.unwrapOr(l.lingerTotal, Duration.seconds(30)),
+    connections = Option.unwrapOr(l.connections, 1024),
 }
 
-fun withChunkLineBytes(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes, fields, lineBytes, chunkLineBytes = _, trailerBytes, drainBytes } = l
-    Limits { headBytes, fields, lineBytes, chunkLineBytes = positive("withChunkLineBytes", n),
-             trailerBytes, drainBytes }
+fun headBytes(n : Int) -> Limits {
+    let l = none()
+    l.headBytes = Some(count("headBytes", n))
+    l
 }
 
-fun withTrailerBytes(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes, fields, lineBytes, chunkLineBytes, trailerBytes = _, drainBytes } = l
-    Limits { headBytes, fields, lineBytes, chunkLineBytes, trailerBytes = positive("withTrailerBytes", n),
-             drainBytes }
+fun fields(n : Int) -> Limits {
+    let l = none()
+    l.fields = Some(count("fields", n))
+    l
 }
 
-fun withDrainBytes(l : Limits, n : Int) -> Limits {
-    let Limits { headBytes, fields, lineBytes, chunkLineBytes, trailerBytes, drainBytes = _ } = l
-    Limits { headBytes, fields, lineBytes, chunkLineBytes, trailerBytes,
-             drainBytes = positive("withDrainBytes", n) }
+fun lineBytes(n : Int) -> Limits {
+    let l = none()
+    l.lineBytes = Some(count("lineBytes", n))
+    l
 }
 
-fun positive(setter : String, n : Int) -> Int {
-    if n < 1 { error("Limits." + setter + ": limit " + Int.toString(n) + " is below 1") }
+fun chunkLineBytes(n : Int) -> Limits {
+    let l = none()
+    l.chunkLineBytes = Some(count("chunkLineBytes", n))
+    l
+}
+
+fun trailerBytes(n : Int) -> Limits {
+    let l = none()
+    l.trailerBytes = Some(count("trailerBytes", n))
+    l
+}
+
+fun drainBytes(n : Int) -> Limits {
+    let l = none()
+    l.drainBytes = Some(count("drainBytes", n))
+    l
+}
+
+fun headTimeout(d : Duration) -> Limits {
+    let l = none()
+    l.headTimeout = Some(duration("headTimeout", d))
+    l
+}
+
+fun stall(d : Duration) -> Limits {
+    let l = none()
+    l.stall = Some(duration("stall", d))
+    l
+}
+
+fun idleTimeout(d : Duration) -> Limits {
+    let l = none()
+    l.idleTimeout = Some(duration("idleTimeout", d))
+    l
+}
+
+fun lingerIdle(d : Duration) -> Limits {
+    let l = none()
+    l.lingerIdle = Some(duration("lingerIdle", d))
+    l
+}
+
+fun lingerTotal(d : Duration) -> Limits {
+    let l = none()
+    l.lingerTotal = Some(duration("lingerTotal", d))
+    l
+}
+
+fun connections(n : Int) -> Limits {
+    let l = none()
+    l.connections = Some(count("connections", n))
+    l
+}
+
+fun count(name : String, n : Int) -> Int {
+    if n < 1 { error("Limits." + name + ": limit " + Int.toString(n) + " is below 1") }
     n
+}
+
+fun duration(name : String, d : Duration) -> Duration {
+    if Duration.toNanos(d) <= 0 { error("Limits." + name + ": duration " + show(d) + " is not positive") }
+    d
 }

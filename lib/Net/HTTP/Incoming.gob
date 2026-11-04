@@ -1,4 +1,4 @@
-export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLength)
+export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLength, trailers)
 
 -- A message body that has arrived and not been read: a request's, for a
 -- server's handler, or a response's, for a client's callback.
@@ -24,27 +24,44 @@ export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLengt
 --   with `Consumed`: otherwise a second limit would start counting again
 --   where the first stopped.
 --
+-- **Trailers** are fields sent after a chunked body, such as a checksum or
+-- gRPC's status. `trailers(b)` returns them once the body has been read to
+-- its end, and `None` before then.
+--
 -- An `Incoming` hides the connection under it, TCP or TLS, behind one
 -- indirect call per read, so a handler takes no transport parameter. Its
 -- errors are `HTTPError`s; `receive` lifts them into the caller's error type
 -- through `FromHTTP`.
 
 import Net.HTTP.Error (HTTPError(..), FromHTTP(..))
+import Net.HTTP.Headers (Headers)
 import System.IO (AnyRead)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 import Turkey.ReadWrite (Read(..), needsRoom)
 
-type Incoming = Incoming { source : AnyRead HTTPError, declared : Option Int, var taken : Bool }
+type Incoming = Incoming {
+    source : AnyRead HTTPError,
+    declared : Option Int,
+    trailing : fun() -> Option Headers,
+    var taken : Bool,
+}
 
 -- Returns the body `source` reads, whose framing declared `declared` bytes,
--- or `None` if it declared no length. A codec makes one from what it read; a
--- test makes one to give a handler a body.
-fun incoming(source : AnyRead HTTPError, declared : Option Int) -> Incoming =
-    Incoming { source, declared, taken = False }
+-- or `None` if it declared no length. `trailing` returns the trailers once
+-- `source` has ended, and `None` until then. A codec makes one from what it
+-- read; a test makes one to give a handler a body.
+fun incoming(source : AnyRead HTTPError, declared : Option Int, trailing : fun() -> Option Headers)
+        -> Incoming =
+    Incoming { source, declared, trailing, taken = False }
 
 -- Returns the body's declared length, if its framing gave one.
 fun declaredLength(b : Incoming) -> Option Int = b.declared
+
+-- Returns the fields that followed the body, once it has been read to its
+-- end: no fields for a body that was not chunked, or whose sender added none.
+-- Returns `None` while the body has not ended.
+fun trailers(b : Incoming) -> Option Headers = b.trailing()
 
 -- A `Read` over a body, under a limit.
 type BodyRead = BodyRead {

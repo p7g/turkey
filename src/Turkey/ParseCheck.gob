@@ -1,0 +1,431 @@
+export (check)
+
+-- Checks a parse against the text it was parsed from, for the test suite.
+--
+-- Two invariants, each raised as an internal error when it fails:
+--
+-- * Every node's span covers its own text. A child lies within its parent, and
+--   the children of one node do not overlap. A node with an empty span is one
+--   the parser wrote itself and covers no text, so it is checked against
+--   nothing; its children are checked as children of its nearest ancestor that
+--   the source writes.
+-- * The tokens and comments of the file account for all of its text, apart
+--   from spaces, tabs and carriage returns. Each comment's text is the text at
+--   its span, and the blank lines are exactly the lines that hold nothing else
+--   and end in a line break.
+--
+-- The checks do not ask the order of children, only that they are disjoint:
+-- the `match` a `let ... else` means holds its value before its pattern.
+
+import Turkey.Ast (..)
+import Turkey.Diag as Diag
+import Turkey.Lexer as Lexer
+import Turkey.Source as Source
+import Turkey.Source (Source(..), Span(..))
+import Turkey.Token (Comment(..), Kind(..), Token(..))
+
+-- Raises an internal error unless `program`, parsed from `source`, keeps both
+-- invariants above. Lexes `source` a second time, and walks the whole tree.
+fun check(program : Program, source : Source) -> Unit {
+    checkTree(program)
+    checkText(program, source)
+}
+
+fun internal(message : String, where : Span) -> a =
+    Diag.fail(Diag.at("internal error", message, where), where.file)
+
+-- -- the tree ------------------------------------------------------------------------
+
+-- Checks the node spanned by `s` and records it among `siblings`. `inside`
+-- visits the node's children, each into the collector it is given.
+fun node(s : Span, siblings : Vec Span, inside : fun(Vec Span) -> Unit) -> Unit {
+    if Source.isEmpty(s) {
+        inside(siblings)
+        return
+    }
+    if Source.before(s.endLine, s.endCol, s.line, s.col) {
+        internal("this node ends at " + Int.toString(s.endLine) + ":"
+                 + Int.toString(s.endCol) + ", before it starts", s)
+    }
+    Vec.push(siblings, s)
+    let parts = []
+    inside(parts)
+    for part in parts {
+        if !Source.contains(s, part) {
+            internal("a part of this node, at " + Source.showSpan(part)
+                     + ", reaches outside it", s)
+        }
+    }
+    let ordered = Vec.sortByKey(parts, fun(x) = (x.line, x.col))
+    for var i = 1; i < len(ordered); i = i + 1 {
+        let a = ordered[i - 1]
+        let b = ordered[i]
+        if Source.before(b.line, b.col, a.endLine, a.endCol) {
+            internal("two parts of this node overlap, at " + Source.showSpan(a)
+                     + " and " + Source.showSpan(b), s)
+        }
+    }
+}
+
+fun leaf(s : Span, siblings : Vec Span) -> Unit = node(s, siblings, fun(_) = ())
+
+fun checkTree(program : Program) -> Unit {
+    let Program { span, exportDecl, imports, decls, letElses = _, comments = _,
+                  blankLines = _ } = program
+    node(span, [], fun(out) {
+        if let Some(e) = exportDecl { exportList(e, out) }
+        for i in imports { importDecl(i, out) }
+        for d in decls { decl(d, out) }
+    })
+}
+
+fun exportList(e : ExportDecl, out : Vec Span) -> Unit {
+    let ExportDecl { span, items } = e
+    node(span, out, fun(parts) {
+        if let Some(xs) = items { for x in xs { leaf(x.span, parts) } }
+    })
+}
+
+fun importDecl(i : ImportDecl, out : Vec Span) -> Unit {
+    let ImportDecl { span, name = _, alias = _, items, rest = _ } = i
+    node(span, out, fun(parts) {
+        if let Some(xs) = items { for x in xs { leaf(x.item.span, parts) } }
+    })
+}
+
+fun decl(d : Decl, out : Vec Span) -> Unit = match d {
+    DStmt(s) -> stmt(s, out)
+    DType(t) -> typeDecl(t, out)
+    DClass(c) -> classDecl(c, out)
+    DInstance(i) -> instanceDecl(i, out)
+    DForeign(f) -> foreignDecl(f, out)
+    DInfix(i) -> {
+        let InfixDecl { span, group = _, op = _, target = _, targetSpan } = i
+        node(span, out, leaf(targetSpan, _))
+    }
+}
+
+fun typeDecl(t : TypeDecl, out : Vec Span) -> Unit {
+    let TypeDecl { span, name = _, params = _, variants, alias } = t
+    node(span, out, fun(parts) {
+        if let Some(vs) = variants { for v in vs { conDecl(v, parts) } }
+        if let Some(a) = alias { typeExpr(a, parts) }
+    })
+}
+
+fun conDecl(c : ConDecl, out : Vec Span) -> Unit {
+    let ConDecl { span, name = _, args, fields, vars = _, fieldSpans, binders = _,
+                  context } = c
+    node(span, out, fun(parts) {
+        for t in args { typeExpr(t, parts) }
+        if let Some(fs) = fields { for (_, t) in fs { typeExpr(t, parts) } }
+        for s in fieldSpans { leaf(s, parts) }
+        for p in context { pred(p, parts) }
+    })
+}
+
+fun classDecl(c : ClassDecl, out : Vec Span) -> Unit {
+    let ClassDecl { span, name = _, param = _, supers, methods, families } = c
+    node(span, out, fun(parts) {
+        for p in supers { pred(p, parts) }
+        for m in methods { funDecl(m, parts) }
+        for f in families { leaf(f.span, parts) }
+    })
+}
+
+fun instanceDecl(i : InstanceDecl, out : Vec Span) -> Unit {
+    let InstanceDecl { span, cls = _, head, context, methods, families } = i
+    node(span, out, fun(parts) {
+        typeExpr(head, parts)
+        for p in context { pred(p, parts) }
+        for m in methods { funDecl(m, parts) }
+        for f in families {
+            let FamBind { span = at, name = _, body } = f
+            node(at, parts, typeExpr(body, _))
+        }
+    })
+}
+
+fun foreignDecl(f : ForeignDecl, out : Vec Span) -> Unit {
+    let ForeignDecl { id = _, span, name = _, symbol = _, params, fixed = _, ret } = f
+    node(span, out, fun(parts) {
+        for p in params { pattern(p, parts) }
+        typeExpr(ret, parts)
+    })
+}
+
+fun funDecl(d : FunDecl, out : Vec Span) -> Unit {
+    let FunDecl { id = _, span, name = _, params, ret, body, context,
+                  monomorphic = _, symbol = _ } = d
+    node(span, out, fun(parts) {
+        for p in context { pred(p, parts) }
+        for p in params { pattern(p, parts) }
+        if let Some(t) = ret { typeExpr(t, parts) }
+        if let Some(b) = body { expr(b, parts) }
+    })
+}
+
+fun pred(p : Pred, out : Vec Span) -> Unit {
+    let Pred { span, kind } = p
+    node(span, out, fun(parts) = match kind {
+        PClass(_, t) -> typeExpr(t, parts)
+        PEq(a, b) -> {
+            typeExpr(a, parts)
+            typeExpr(b, parts)
+        }
+    })
+}
+
+fun typeExpr(t : Type, out : Vec Span) -> Unit {
+    let Type { id = _, span, kind } = t
+    node(span, out, fun(parts) = match kind {
+        TEVar(_) -> ()
+        TECon(_, args) -> for a in args { typeExpr(a, parts) }
+        TEApp(head, args) -> {
+            typeExpr(head, parts)
+            for a in args { typeExpr(a, parts) }
+        }
+        TETuple(xs) -> for x in xs { typeExpr(x, parts) }
+        TEFun(params, ret) -> {
+            for x in params { typeExpr(x, parts) }
+            typeExpr(ret, parts)
+        }
+    })
+}
+
+fun pattern(p : Pat, out : Vec Span) -> Unit {
+    let Pat { id = _, span, kind, opening = _ } = p
+    node(span, out, fun(parts) = match kind {
+        PVar(_) | PWild | PLit(_) -> ()
+        PCon(_, args) -> for a in args { pattern(a, parts) }
+        PRecord(_, fields, _) -> for (_, sub) in fields { pattern(sub, parts) }
+        PTuple(xs) -> for x in xs { pattern(x, parts) }
+        PAnnot(inner, t) -> {
+            pattern(inner, parts)
+            typeExpr(t, parts)
+        }
+    })
+}
+
+fun stmt(s : Stmt, out : Vec Span) -> Unit {
+    let Stmt { id = _, span, kind } = s
+    node(span, out, fun(parts) = match kind {
+        SLet(p, value) | SVar(p, value) -> {
+            pattern(p, parts)
+            expr(value, parts)
+        }
+        SFun(d) -> funDecl(d, parts)
+        SAssign(target, value) -> {
+            expr(target, parts)
+            expr(value, parts)
+        }
+        SExpr(e) -> expr(e, parts)
+    })
+}
+
+fun optExpr(e : Option Expr, out : Vec Span) -> Unit {
+    if let Some(x) = e { expr(x, out) }
+}
+
+fun expr(e : Expr, out : Vec Span) -> Unit {
+    let Expr { id = _, span, kind } = e
+    node(span, out, fun(parts) = match kind {
+        ELit(_) | EUnit | EVar(_, _) | ECon(_) | EContinue -> ()
+        ETuple(xs) | EArray(xs) -> for x in xs { expr(x, parts) }
+        ERecord(_, fields) -> for (_, value) in fields { expr(value, parts) }
+        ELambda(params, ret, body) -> {
+            for p in params { pattern(p, parts) }
+            if let Some(t) = ret { typeExpr(t, parts) }
+            expr(body, parts)
+        }
+        ECall(callee, args) -> {
+            expr(callee, parts)
+            for a in args { expr(a, parts) }
+        }
+        EIndex(obj, index, get, set) -> {
+            expr(obj, parts)
+            expr(index, parts)
+            optExpr(get, parts)
+            optExpr(set, parts)
+        }
+        EField(obj, _) | EProject(obj, _) -> expr(obj, parts)
+        EUnary(_, operand, fn) -> {
+            expr(operand, parts)
+            optExpr(fn, parts)
+        }
+        EBinary(_, left, right, fn) -> {
+            expr(left, parts)
+            expr(right, parts)
+            optExpr(fn, parts)
+        }
+        EChain(operands, ops) -> {
+            for x in operands { expr(x, parts) }
+            for (_, at) in ops { leaf(at, parts) }
+        }
+        EAnnot(inner, t) -> {
+            expr(inner, parts)
+            typeExpr(t, parts)
+        }
+        EIf(cond, then, otherwise) -> {
+            expr(cond, parts)
+            expr(then, parts)
+            optExpr(otherwise, parts)
+        }
+        EWhile(cond, body) -> {
+            expr(cond, parts)
+            expr(body, parts)
+        }
+        EForIn(pat, iterable, body, iter, next) -> {
+            pattern(pat, parts)
+            expr(iterable, parts)
+            expr(body, parts)
+            optExpr(iter, parts)
+            optExpr(next, parts)
+        }
+        EForC(init, cond, step, body) -> {
+            if let Some(s) = init { stmt(s, parts) }
+            expr(cond, parts)
+            if let Some(s) = step { stmt(s, parts) }
+            expr(body, parts)
+        }
+        ELoop(body) | EDo(body) -> expr(body, parts)
+        EMatch(scrutinee, arms) -> {
+            expr(scrutinee, parts)
+            for a in arms { arm(a, parts) }
+        }
+        EReturn(value) | EBreak(value) -> optExpr(value, parts)
+        EBlock(stmts) -> for s in stmts { stmt(s, parts) }
+        EQuestion(inner, bind) -> {
+            expr(inner, parts)
+            optExpr(bind, parts)
+        }
+    })
+}
+
+fun arm(a : Arm, out : Vec Span) -> Unit {
+    let Arm { span, patterns, guards, body } = a
+    node(span, out, fun(parts) {
+        for p in patterns { pattern(p, parts) }
+        for g in guards {
+            match g {
+                GTest(test) -> expr(test, parts)
+                GLet(alts, value) -> {
+                    for p in alts { pattern(p, parts) }
+                    expr(value, parts)
+                }
+            }
+        }
+        expr(body, parts)
+    })
+}
+
+-- -- the text ------------------------------------------------------------------------
+
+-- What covers a stretch of the text: a token, or the comment at an index into
+-- the program's comments.
+type Cover = ByToken(Span) | ByComment(Int)
+
+fun coverSpan(program : Program, c : Cover) -> Span = match c {
+    ByToken(s) -> s
+    ByComment(i) -> program.comments[i].span
+}
+
+-- Walks the text once, code point by code point, beside the tokens and
+-- comments in source order.
+fun checkText(program : Program, source : Source) -> Unit {
+    let covers : Vec Cover = []
+    for tok in Lexer.tokenizeRaw(source).tokens {
+        match tok.kind {
+            KEof -> ()
+            _ -> Vec.push(covers, ByToken(tok.span))
+        }
+    }
+    for var i = 0; i < len(program.comments); i = i + 1 { Vec.push(covers, ByComment(i)) }
+    let ordered = Vec.sortByKey(covers, fun(c) {
+        let s = coverSpan(program, c)
+        (s.line, s.col)
+    })
+    let file = source.name
+    let blank : Vec Int = []
+    var next = 0
+    var line = 1
+    var col = 1
+    var lineBlank = True
+    var at = String.start(source.text)
+    -- The comment the walk is in, its first offset, and its span.
+    var open : Option (Int, String.Index, Span) = None
+    while !String.atEnd(source.text, at) {
+        let (c, after) = Option.expect(String.step(source.text, at), "not at the end")
+        let here = Source.span(file, line, col)
+        -- Leave a cover that ends here, and enter the one that starts here.
+        if let Some((i, from, s)) = open {
+            if !Source.before(line, col, s.endLine, s.endCol) {
+                commentText(program.comments[i], source, from, at)
+                open = None
+            }
+        }
+        while next < len(ordered) {
+            let s = coverSpan(program, ordered[next])
+            if Source.before(line, col, s.endLine, s.endCol) { break }
+            next = next + 1
+        }
+        var inComment = False
+        var covered = False
+        if next < len(ordered) {
+            let s = coverSpan(program, ordered[next])
+            if !Source.before(line, col, s.line, s.col) {
+                covered = True
+                if let ByComment(i) = ordered[next] {
+                    inComment = True
+                    if Option.isNone(open) && s.line == line && s.col == col {
+                        open = Some((i, at, s))
+                    }
+                }
+            }
+            if next + 1 < len(ordered) {
+                let t = coverSpan(program, ordered[next + 1])
+                if Source.before(t.line, t.col, s.endLine, s.endCol) {
+                    internal("the text at " + Source.showSpan(s) + " and at "
+                             + Source.showSpan(t) + " is covered twice", t)
+                }
+            }
+        }
+        let space = c == ' ' || c == '\t' || c == '\r'
+        if !covered && !space && c != '\n' {
+            internal("the character '" + Char.toString(c)
+                     + "' is in no token and no comment", here)
+        }
+        if c == '\n' {
+            if lineBlank && !inComment { Vec.push(blank, line) }
+            line = line + 1
+            col = 1
+            lineBlank = True
+        } else {
+            if inComment || !space { lineBlank = False }
+            col = col + 1
+        }
+        at = after
+    }
+    if let Some((i, from, _)) = open { commentText(program.comments[i], source, from, at) }
+    if !sameLines(blank, program.blankLines) {
+        internal("the blank lines are " + show(blank) + ", and the lexer found "
+                 + show(program.blankLines), Source.span(file, 1, 1))
+    }
+}
+
+fun sameLines(a : Vec Int, b : Vec Int) -> Bool {
+    if len(a) != len(b) { return False }
+    for var i = 0; i < len(a); i = i + 1 {
+        if a[i] != b[i] { return False }
+    }
+    True
+}
+
+fun commentText(c : Comment, source : Source, from : String.Index,
+                to : String.Index) -> Unit {
+    let written = String.slice(source.text, from, to)
+    if written != c.text {
+        internal("this comment reads " + show(written) + ", and the lexer kept "
+                 + show(c.text), c.span)
+    }
+}

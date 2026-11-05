@@ -23,9 +23,10 @@ import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Lexer as Lexer
 import Turkey.Runtime as Rt
+import Turkey.Source as Source
 import Turkey.Source (Source(..), Span)
 import Turkey.Token as Token
-import Turkey.Token (Kind(..), Token(..), Value(..))
+import Turkey.Token (Comment, Kind(..), Token(..), Value(..))
 
 type P = P {
     toks         : Vec Token,
@@ -41,10 +42,13 @@ type P = P {
     var pending  : Int,
     -- See `Program.letElses`.
     letElses     : Vec LetElse,
+    comments     : Vec Comment,
+    blankLines   : Vec Int,
 }
 
 fun parse(source : Source, known : Vec String) -> Program {
-    let toks = Lexer.tokenize(source)
+    let lexed = Lexer.tokenize(source)
+    let toks = lexed.tokens
     let p = P {
         toks = toks,
         i = 0,
@@ -54,6 +58,8 @@ fun parse(source : Source, known : Vec String) -> Program {
         explicit = 0,
         pending = 0,
         letElses = [],
+        comments = lexed.comments,
+        blankLines = lexed.blankLines,
     }
     parseProgram(p)
 }
@@ -205,25 +211,62 @@ fun setNoRecord(p : P, flag : Bool) -> Bool {
 -- -- node construction --------------------------------------------------------------
 --
 -- Every node gets a fresh id here, which is the only place nodes are made.
+--
+-- A node the source writes spans from the start it is given to the end of the
+-- last token read. So `mkExpr` and the others below build a node only once its
+-- last token has been read, and a node built any earlier would be cut short.
+-- A node the parser writes itself, such as the wildcard arm of an `if let`
+-- or the method a `-` means, covers no text: the `made` forms give it an
+-- empty span at the start it is given, which is where its diagnostics point.
 
 fun freshId(p : P) -> Int = freshNodeId()
 
-fun mkType(p : P, s : Span, k : TypeKind) -> Type =
-    Type { id = freshId(p), span = s, kind = k }
+-- Returns `s` ending where the last token read ends. A line break never ends
+-- a node, so it is skipped.
+fun close(p : P, s : Span) -> Span {
+    var j = p.i - 1
+    while j >= 0 && isNewline(p.toks[j]) { j = j - 1 }
+    if j < 0 { return s }
+    Source.through(s, p.toks[j].span)
+}
 
-fun mkPat(p : P, s : Span, k : PatKind) -> Pat =
+fun isNewline(tok : Token) -> Bool = match tok.kind {
+    KNewline -> True
+    _ -> False
+}
+
+fun mkType(p : P, s : Span, k : TypeKind) -> Type =
+    Type { id = freshId(p), span = close(p, s), kind = k }
+
+fun mkPat(p : P, s : Span, k : PatKind) -> Pat = patNode(p, close(p, s), k)
+
+fun madePat(p : P, s : Span, k : PatKind) -> Pat = patNode(p, Source.emptyAt(s), k)
+
+fun patNode(p : P, s : Span, k : PatKind) -> Pat =
     Pat { id = freshId(p), span = s, kind = k, opening = None }
 
-fun mkExpr(p : P, s : Span, k : ExprKind) -> Expr =
+fun mkExpr(p : P, s : Span, k : ExprKind) -> Expr = exprNode(p, close(p, s), k)
+
+fun madeExpr(p : P, s : Span, k : ExprKind) -> Expr = exprNode(p, Source.emptyAt(s), k)
+
+fun exprNode(p : P, s : Span, k : ExprKind) -> Expr =
     Expr { id = freshId(p), span = s, kind = k }
 
-fun mkStmt(p : P, s : Span, k : StmtKind) -> Stmt =
+fun mkStmt(p : P, s : Span, k : StmtKind) -> Stmt = stmtNode(p, close(p, s), k)
+
+fun madeStmt(p : P, s : Span, k : StmtKind) -> Stmt = stmtNode(p, Source.emptyAt(s), k)
+
+fun stmtNode(p : P, s : Span, k : StmtKind) -> Stmt =
     Stmt { id = freshId(p), span = s, kind = k }
+
+-- An arm the parser writes itself, as the `match` an `if let` means has.
+fun madeArm(s : Span, patterns : Vec Pat, guards : Vec Guard, body : Expr) -> Arm =
+    Arm { span = Source.emptyAt(s), patterns = patterns, guards = guards, body = body }
 
 -- A marked method reference: the `neg` a `-` means. Marked, so that a module
 -- defining its own `neg` does not quietly capture every `-` in the file.
 fun method(p : P, s : Span, name : String) -> Expr =
-    mkExpr(p, s, EVar(name, True))
+    madeExpr(p, s, EVar(name, True))
 
 -- -- tables -------------------------------------------------------------------------
 
@@ -288,8 +331,8 @@ fun parseProgram(p : P) -> Program {
         endOfStatement(p)
     }
     Program {
-        span = s, exportDecl = exportDecl, imports = imports, decls = decls,
-        letElses = p.letElses,
+        span = close(p, s), exportDecl = exportDecl, imports = imports, decls = decls,
+        letElses = p.letElses, comments = p.comments, blankLines = p.blankLines,
     }
 }
 
@@ -308,7 +351,7 @@ fun parseExportDecl(p : P) -> ExportDecl {
     skipWhat(p, "(", "'(' and the module's exports")
     if eat(p, "..") {
         skipToken(p, ")")
-        return ExportDecl { span = s, items = None }
+        return ExportDecl { span = close(p, s), items = None }
     }
     let items = Vec.new(8)
     while !at(p, ")") {
@@ -320,7 +363,7 @@ fun parseExportDecl(p : P) -> ExportDecl {
         if !eat(p, ",") { break }
     }
     skipToken(p, ")")
-    ExportDecl { span = s, items = Some(items) }
+    ExportDecl { span = close(p, s), items = Some(items) }
 }
 
 -- `f`, `T`, `T(..)`, `T(A, B)`, or an operator in parentheses, `(<>)`, which
@@ -347,7 +390,7 @@ fun parseExportItem(p : P) -> ExportItem {
         skipToken(p, ")")
         subs = Some(names)
     }
-    ExportItem { span = tok.span, name = text(tok), subs = subs }
+    ExportItem { span = close(p, tok.span), name = text(tok), subs = subs }
 }
 
 fun isNameToken(tok : Token) -> Bool = match Token.kindName(tok.kind) {
@@ -377,7 +420,7 @@ fun parseImport(p : P) -> ImportDecl {
         oops(p, "'hiding' cannot appear in an import; write 'import " + name
                 + " (" + withheld(p) + "..)' instead", cur(p).span)
     }
-    ImportDecl { span = s, name = name, alias = alias, items = items, rest = rest }
+    ImportDecl { span = close(p, s), name = name, alias = alias, items = items, rest = rest }
 }
 
 -- The names in the list after a `hiding` at the cursor, each as `x as _, `,
@@ -504,7 +547,7 @@ fun parseInfixDecl(p : P) -> InfixDecl {
                 + describe(targetTok), targetTok.span)
     }
     InfixDecl {
-        span = opTok.span, group = group, op = text(opTok), target = target,
+        span = close(p, opTok.span), group = group, op = text(opTok), target = target,
         targetSpan = targetTok.span,
     }
 }
@@ -542,9 +585,10 @@ fun parseTypeDecl(p : P) -> TypeDecl {
             return parseDataRhs(p, s, name, params)
         }
     }
+    let alias = parseTypeExpr(p)
     TypeDecl {
-        span = s, name = name, params = params, variants = None,
-        alias = Some(parseTypeExpr(p)),
+        span = close(p, s), name = name, params = params, variants = None,
+        alias = Some(alias),
     }
 }
 
@@ -601,7 +645,10 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDec
         skipNewlines(p)
         Vec.push(variants, parseConDecl(p))
     }
-    TypeDecl { span = s, name = name, params = params, variants = Some(variants), alias = None }
+    TypeDecl {
+        span = close(p, s), name = name, params = params, variants = Some(variants),
+        alias = None,
+    }
 }
 
 -- `[s, Error e]` -- the variables an existential constructor hides. Read like a
@@ -623,7 +670,7 @@ fun parseConContext(p : P) -> (Vec String, Vec Pred) {
             TEVar(name) -> Vec.push(binders, name)
             TECon(name, args) -> {
                 if len(args) != 1 { oops(p, conContextShape, s) }
-                Vec.push(preds, Pred { span = s, kind = PClass(name, args[0]) })
+                Vec.push(preds, Pred { span = close(p, s), kind = PClass(name, args[0]) })
             }
             _ -> oops(p, conContextShape, s)
         }
@@ -645,7 +692,7 @@ fun parseConDecl(p : P) -> ConDecl {
         let (fields, vars, spans) = parseRecordPayload(p)
         fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(fields))
         return ConDecl {
-            span = tok.span, name = text(tok), args = [],
+            span = close(p, tok.span), name = text(tok), args = [],
             fields = Some(fields), vars = vars, fieldSpans = spans,
             binders = binders, context = context,
         }
@@ -666,7 +713,7 @@ fun parseConDecl(p : P) -> ConDecl {
                 + "parentheses; write '" + text(tok) + "(...)'", cur(p).span)
     }
     ConDecl {
-        span = tok.span, name = text(tok), args = args, fields = None,
+        span = close(p, tok.span), name = text(tok), args = args, fields = None,
         vars = [], fieldSpans = [], binders = binders, context = context,
     }
 }
@@ -825,10 +872,10 @@ fun parseFunDecl(p : P, allowSignature : Bool) -> FunDecl {
     let params = parseParamList(p)
     var ret : Option Type = None
     if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
+    let body = parseFunBody(p)
     FunDecl {
-        id = freshId(p), span = s, name = name, params = params, ret = ret,
-        body = Some(parseFunBody(p)), context = context,
-        monomorphic = False, symbol = None,
+        id = freshId(p), span = close(p, s), name = name, params = params, ret = ret,
+        body = Some(body), context = context, monomorphic = False, symbol = None,
     }
 }
 
@@ -879,10 +926,10 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
     -- A parameter of a stated type with no name is an anonymous binder.
     let params = Vec.new(len(types))
     for t in types {
-        Vec.push(params, mkPat(p, t.span, PAnnot(mkPat(p, t.span, PWild), t)))
+        Vec.push(params, madePat(p, t.span, PAnnot(madePat(p, t.span, PWild), t)))
     }
     FunDecl {
-        id = freshId(p), span = s, name = name, params = params,
+        id = freshId(p), span = close(p, s), name = name, params = params,
         ret = Some(ret), body = None, context = context, monomorphic = False,
         symbol = None,
     }
@@ -943,7 +990,7 @@ fun parseForeignDecl(p : P) -> Decl {
         }
         let body = parseFunBody(p)
         return DStmt(mkStmt(p, s, SFun(FunDecl {
-            id = freshId(p), span = s, name = name, params = params,
+            id = freshId(p), span = close(p, s), name = name, params = params,
             ret = Some(ret), body = Some(body), context = [],
             monomorphic = True, symbol = Some(symbol),
         })))
@@ -953,7 +1000,7 @@ fun parseForeignDecl(p : P) -> Decl {
         None -> len(params)
     }
     DForeign(ForeignDecl {
-        id = freshId(p), span = s, name = name, symbol = symbol, params = params, fixed = fixed,
+        id = freshId(p), span = close(p, s), name = name, symbol = symbol, params = params, fixed = fixed,
         ret = ret,
     })
 }
@@ -995,15 +1042,13 @@ fun parseForeignParams(p : P) -> (Vec Pat, Option (Int, Span)) {
         if Token.kindName(tok.kind) == "IDENT"
                 && Token.kindName(peek(p, 1).kind) == ":" {
             step(p)
+            let binder = mkPat(p, tok.span, if text(tok) == "_" { PWild } else { PVar(text(tok)) })
             step(p)
             let ty = parseTypeExpr(p)
-            let binder = if text(tok) == "_" { PWild } else { PVar(text(tok)) }
-            Vec.push(params, mkPat(p, tok.span,
-                                     PAnnot(mkPat(p, tok.span, binder), ty)))
+            Vec.push(params, mkPat(p, tok.span, PAnnot(binder, ty)))
         } else {
             let ty = parseTypeExpr(p)
-            Vec.push(params, mkPat(p, ty.span,
-                                     PAnnot(mkPat(p, ty.span, PWild), ty)))
+            Vec.push(params, madePat(p, ty.span, PAnnot(madePat(p, ty.span, PWild), ty)))
         }
         if !eat(p, ",") { break }
     }
@@ -1033,12 +1078,13 @@ fun parsePredEntry(p : P) -> Pred {
     let s = cur(p).span
     let written = parseTypeExpr(p)
     if eat(p, "~") {
-        return Pred { span = s, kind = PEq(written, parseTypeExpr(p)) }
+        let other = parseTypeExpr(p)
+        return Pred { span = close(p, s), kind = PEq(written, other) }
     }
     match written.kind {
         TECon(name, args) -> {
             if len(args) == 1 {
-                return Pred { span = s, kind = PClass(name, args[0]) }
+                return Pred { span = close(p, s), kind = PClass(name, args[0]) }
             }
             oops(p, contextShape, s)
         }
@@ -1061,9 +1107,8 @@ fun parseClassDecl(p : P) -> ClassDecl {
         loop {
             let tok = cur(p)
             let className = parseModname(p)
-            Vec.push(supers, Pred {
-                span = tok.span, kind = PClass(className, parseAtype(p)),
-            })
+            let arg = parseAtype(p)
+            Vec.push(supers, Pred { span = close(p, tok.span), kind = PClass(className, arg) })
             if !eat(p, ",") { break }
             skipNewlines(p)
             if at(p, "{") { break }
@@ -1072,7 +1117,7 @@ fun parseClassDecl(p : P) -> ClassDecl {
     skipNewlines(p)
     let body = parseClassBody(p, True, param)
     ClassDecl {
-        span = s, name = name, param = param, supers = supers,
+        span = close(p, s), name = name, param = param, supers = supers,
         methods = body.0, families = body.1,
     }
 }
@@ -1086,7 +1131,7 @@ fun parseInstanceDecl(p : P) -> InstanceDecl {
     skipNewlines(p)
     let body = parseInstanceBody(p)
     InstanceDecl {
-        span = s, cls = name, head = head, context = context,
+        span = close(p, s), cls = name, head = head, context = context,
         methods = body.0, families = body.1,
     }
 }
@@ -1115,7 +1160,7 @@ fun parseClassBody(p : P, isClass : Bool, param : String)
             let s = expect(p, "type").span
             let name = text(expectWhat(p, "CONID", "an associated type name"))
             let written = text(expectWhat(p, "IDENT", "'" + param + "', the class parameter"))
-            Vec.push(families, FamDecl { span = s, name = name, param = written })
+            Vec.push(families, FamDecl { span = close(p, s), name = name, param = written })
         } else if at(p, "fun") {
             Vec.push(methods, parseFunDecl(p, isClass))
         } else {
@@ -1141,7 +1186,8 @@ fun parseInstanceBody(p : P) -> (Vec FunDecl, Vec FamBind) {
             let s = expect(p, "type").span
             let name = text(expectWhat(p, "CONID", "an associated type name"))
             skipToken(p, "=")
-            Vec.push(families, FamBind { span = s, name = name, body = parseTypeExpr(p) })
+            let body = parseTypeExpr(p)
+            Vec.push(families, FamBind { span = close(p, s), name = name, body = body })
         } else if at(p, "fun") {
             Vec.push(methods, parseFunDecl(p, False))
         } else {
@@ -1219,17 +1265,16 @@ fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> St
         block = otherwise, completion = completion(otherwise), tailCalls = tails,
     })
     let names = patternVars(pat)
-    let vars = Vec.map(names, fun(n) = mkPat(p, pat.span, PVar(n)))
-    let refs = Vec.map(names, fun(n) = mkExpr(p, pat.span, EVar(n, False)))
+    let vars = Vec.map(names, fun(n) = madePat(p, pat.span, PVar(n)))
+    let refs = Vec.map(names, fun(n) = madeExpr(p, pat.span, EVar(n, False)))
     let (bound, out) = match len(names) {
-        0 -> (mkPat(p, pat.span, PWild), mkExpr(p, pat.span, EUnit))
+        0 -> (madePat(p, pat.span, PWild), madeExpr(p, pat.span, EUnit))
         1 -> (vars[0], refs[0])
-        _ -> (mkPat(p, pat.span, PTuple(vars)), mkExpr(p, pat.span, ETuple(refs)))
+        _ -> (madePat(p, pat.span, PTuple(vars)), madeExpr(p, pat.span, ETuple(refs)))
     }
-    let m = mkExpr(p, s, EMatch(value, [
-        Arm { span = pat.span, patterns = [pat], guards = [], body = out },
-        Arm { span = otherwise.span, patterns = [mkPat(p, otherwise.span, PWild)],
-              guards = [], body = otherwise },
+    let m = madeExpr(p, s, EMatch(value, [
+        madeArm(pat.span, [pat], [], out),
+        madeArm(otherwise.span, [madePat(p, otherwise.span, PWild)], [], otherwise),
     ]))
     mkStmt(p, s, if mutable { SVar(bound, m) } else { SLet(bound, m) })
 }
@@ -1556,12 +1601,11 @@ fun parseAtom(p : P) -> Expr {
             -- A condition failing is what ends the loop.
             let s = tok.span
             let (value, patterns, guards, body) = parseConditions(p, "'while'", lead)
-            let m = mkExpr(p, s, EMatch(value, [
-                Arm { span = s, patterns = patterns, guards = guards, body = body },
-                Arm { span = s, patterns = [mkPat(p, s, PWild)], guards = [],
-                      body = mkExpr(p, s, EBreak(None)) },
+            let m = madeExpr(p, s, EMatch(value, [
+                madeArm(s, patterns, guards, body),
+                madeArm(s, [madePat(p, s, PWild)], [], madeExpr(p, s, EBreak(None))),
             ]))
-            return mkExpr(p, s, ELoop(mkExpr(p, s, EBlock([mkStmt(p, s, SExpr(m))]))))
+            return mkExpr(p, s, ELoop(madeExpr(p, s, EBlock([madeStmt(p, s, SExpr(m))]))))
         }
         "for" -> parseFor(p)
         "loop" -> {
@@ -1700,14 +1744,14 @@ fun parseIf(p : P) -> Expr {
 -- the form existed, and a guarded `match` is what every stage already handles.
 fun parseIfLet(p : P, s : Span, lead : Vec Expr) -> Expr {
     let (value, patterns, guards, then) = parseConditions(p, "'if'", lead)
-    var otherwise = mkExpr(p, s, EUnit)
+    var otherwise = madeExpr(p, s, EUnit)
     if eat(p, "else") {
         if at(p, "if") { otherwise = parseIf(p) }
         else { otherwise = parseBlock(p) }
     }
     mkExpr(p, s, EMatch(value, [
-        Arm { span = s, patterns = patterns, guards = guards, body = then },
-        Arm { span = s, patterns = [mkPat(p, s, PWild)], guards = [], body = otherwise },
+        madeArm(s, patterns, guards, then),
+        madeArm(s, [madePat(p, s, PWild)], [], otherwise),
     ]))
 }
 
@@ -1761,8 +1805,8 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr)
             for name in patternVars(pat) {
                 if !Vec.contains(seen, name) {
                     Vec.push(seen, name)
-                    Vec.push(stmts, mkStmt(p, s, SVar(mkPat(p, s, PVar(name)),
-                                                      mkExpr(p, s, EVar(name, False)))))
+                    Vec.push(stmts, madeStmt(p, s, SVar(madePat(p, s, PVar(name)),
+                                                        madeExpr(p, s, EVar(name, False)))))
                 }
             }
         }
@@ -1770,12 +1814,12 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr)
             EBlock(inner) -> for st in inner { Vec.push(stmts, st) }
             _ -> {}
         }
-        body = mkExpr(p, body.span, EBlock(stmts))
+        body = madeExpr(p, body.span, EBlock(stmts))
     }
     match guards[0] {
         GLet(patterns, value) ->
             (value, patterns, Vec.slice(guards, 1, len(guards)), body)
-        GTest(_) -> (mkExpr(p, s, EUnit), [mkPat(p, s, PWild)], guards, body)
+        GTest(_) -> (madeExpr(p, s, EUnit), [madePat(p, s, PWild)], guards, body)
     }
 }
 
@@ -1882,7 +1926,8 @@ fun parseMatchArm(p : P) -> Arm {
     let s = cur(p).span
     let patterns = parseAlternatives(p)
     skipWhat(p, "->", "'->' after the arm's patterns")
-    Arm { span = s, patterns = patterns, guards = [], body = closeWhole(p, parseExpr(p)) }
+    let body = closeWhole(p, parseExpr(p))
+    Arm { span = close(p, s), patterns = patterns, guards = [], body = body }
 }
 
 -- -- lambda shorthand -----------------------------------------------------------------
@@ -2002,12 +2047,14 @@ fun parseExplicit(p : P, tok : Token) -> Expr {
         oops(p, "'\\' has no '_' after it; remove the '\\', or use '_' for "
                 + "the parameter", tok.span)
     }
-    shorthandLambda(p, body, found, tok.span)
+    shorthandLambda(p, body, found, close(p, tok.span))
 }
 
+-- `s` is the whole span of the function: of the `\` and its body, or of the
+-- expression a `_` made into a function.
 fun shorthandLambda(p : P, body : Expr, found : Vec Expr, s : Span) -> Expr {
     let name = shorthandPrefix + Int.toString(freshId(p))
     for placeholder in found { placeholder.kind = EVar(name, False) }
     p.pending = p.pending - len(found)
-    mkExpr(p, s, ELambda([mkPat(p, found[0].span, PVar(name))], None, body))
+    exprNode(p, s, ELambda([madePat(p, found[0].span, PVar(name))], None, body))
 }

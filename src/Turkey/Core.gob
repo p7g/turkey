@@ -4,7 +4,7 @@ export (
     altVars, openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
-    namesOf, namesInto, codeAddressName,
+    namesOf, namesInto, codeAddressName, mentions,
     dictName, classOfDict, dictClass, isDictionary,
     abstractionBinders,
     Aliases(..), newAliases, alias,
@@ -440,6 +440,48 @@ fun abstractionBinders(b : CBind) -> Vec VarCell {
 
 fun discard(x : a) -> Unit = {}
 
+-- Returns whether a variable in `e` refers to the binder `id`, stopping at the
+-- first that does. A binder id is bound at most once in a program, so every
+-- such variable is one the binder scopes over, and none is shadowed.
+fun mentions(e : Core, id : Int) -> Bool = match e.kind {
+    CVar(_, i) -> i == id
+    CLit(_) | CUnit | CCon(_) | CPrim(_) -> False
+    CTuple(elems) -> anyMentions(elems, id)
+    CArray(elems) -> anyMentions(elems, id)
+    CDict(_, slots) -> anyMentions(slots, id)
+    CSlot(target, _) -> mentions(target, id)
+    CProject(target, _) -> mentions(target, id)
+    CIndex(target, index) -> mentions(target, id) || mentions(index, id)
+    CLam(_, body, _) -> mentions(body, id)
+    CApp(fn, args) -> mentions(fn, id) || anyMentions(args, id)
+    CTyLam(_, body) -> mentions(body, id)
+    CTyApp(fn, _) -> mentions(fn, id)
+    CLet(_, _, _, value, body, _) -> mentions(value, id) || mentions(body, id)
+    CLetRec(binds, body) -> {
+        for b in binds { if mentions(bindValue(b), id) { return True } }
+        mentions(body, id)
+    }
+    CJoin(_, _, _, body, rest, _) -> mentions(body, id) || mentions(rest, id)
+    CJump(_, _, args) -> anyMentions(args, id)
+    CRef(value) -> mentions(value, id)
+    CDeref(target) -> mentions(target, id)
+    CAssign(target, value) -> mentions(target, id) || mentions(value, id)
+    CIf(cond, then, otherwise) -> mentions(cond, id) || mentions(then, id) || match otherwise {
+        Some(o) -> mentions(o, id)
+        None -> False
+    }
+    CMatch(scrutinee, alts) -> {
+        if mentions(scrutinee, id) { return True }
+        for a in alts { if mentions(altBody(a), id) { return True } }
+        False
+    }
+}
+
+fun anyMentions[Iterator c, Item c ~ Core](xs : c, id : Int) -> Bool {
+    for x in xs { if mentions(x, id) { return True } }
+    False
+}
+
 -- What `namesInto` reports a `Prim.codeAddress("symbol")` as. It uses the
 -- `foreign` definition with that C symbol as surely as a call would, but
 -- names the definition by its symbol rather than its binding, so it is
@@ -593,9 +635,23 @@ fun settle(a : Aliases) -> Unit {
 -- The id goes first: it holds no `:`, so the key splits back unambiguously.
 fun identity(name : String, id : Int) -> String = Int.toString(id) + ":" + name
 
-fun baseName(name : String) -> String = match generatedParts(name) {
-    Some((hint, suffix)) -> "%" + hint + suffix
-    None -> name
+fun baseName(spelled : String) -> String {
+    let name = withoutRespelling(spelled)
+    match generatedParts(name) {
+        Some((hint, suffix)) -> "%" + hint + suffix
+        None -> name
+    }
+}
+
+-- `name` without the `~` and number `Turkey.Opt.respell` adds to tell two
+-- binders of one spelling apart.
+fun withoutRespelling(name : String) -> String {
+    let chars = Vec.new(String.byteLength(name))
+    for c in String.codePoints(name) { Vec.push(chars, c) }
+    var i = len(chars)
+    while i > 0 && Char.isDigit(chars[i - 1]) { i = i - 1 }
+    if i == len(chars) || i < 2 || chars[i - 1] != '~' { return name }
+    String.fromCodePoints(Vec.slice(chars, 0, i - 1))
 }
 
 -- A generated name is `%hint123` or `%hint123.suffix`, taken apart by scanning.

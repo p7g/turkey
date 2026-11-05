@@ -1,6 +1,6 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
-    newTable, owner, fresh, ownerOf, localOf, binderAt,
+    newTable, owner, fresh, ownerOf, localOf, binderAt, unrecorded, recorded,
     declare, named, record, refer, leaveUnresolved,
     ownDeclaration, declarationOwner,
     checkReferences, checkInferred, methodRefs, boundIn, boundByPattern,
@@ -23,6 +23,11 @@ export (
 --
 -- Ids are process-local. They are never printed, and nothing persisted may be
 -- keyed by one; a binder's stable name is its `moduleName` and `name`.
+--
+-- An owner may also number binders it keeps no record of (`unrecorded`).
+-- `Turkey.Opt` does this for a callee body it reduces once and copies into
+-- every caller: the body is cached on a worker, so its binders cannot be
+-- minted into the table there, and no id in it reaches the output.
 --
 -- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
 -- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
@@ -62,6 +67,9 @@ type Origin
     -- span is the binding's. A copy keyed by something other than its type
     -- arguments is a `CopyOf`.
     | Specialized(Option Int, Array Ty.Type, Option Span)
+    -- Made by a pass after `Turkey.Lower` for the term at the span, if it has
+    -- one, and not a copy of a recorded binder. Never a `var`.
+    | Synthesized(Option Span)
 
 type Binder = Binder {
     -- The source spelling, unqualified, or a hint for one the compiler made.
@@ -130,6 +138,7 @@ fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
             (b.span, b.mutable, Some(id), [])
         }
         Specialized(id, types, where) -> (where, False, id, types)
+        Synthesized(where) -> (where, False, None, [])
     }
     let local = len(o.binders)
     if local >= localLimit {
@@ -148,6 +157,15 @@ fun ownerOf(id : Int) -> Int = Int.shr(id, localBits)
 fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
 
 fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
+
+-- Returns the id with the owner `ownerId` and the local index `local`, for a
+-- binder the table keeps no record of. Its owner must hold no recorded
+-- binders, or the two would share ids.
+fun unrecorded(ownerId : Int, local : Int) -> Int = Int.shl(ownerId, localBits) + local
+
+-- Returns whether the table has a record of the binder `id`.
+fun recorded(t : Table, id : Int) -> Bool =
+    id >= 0 && localOf(id) < len(t.owners[ownerOf(id)].binders)
 
 -- Returns the id of a new binder in `ownerId`, which references resolved to
 -- `internal` mean. A second declaration of `internal` still gets a binder of

@@ -56,5 +56,6 @@ def test_literals_reached_from_heap_stack_and_globals(env, flags):
 def test_a_literal_is_its_address_and_not_a_startup_allocation():
     result = lang.dump("listing", 'fun main() { print("static") }')
     assert result.code == 0, result.stderr
-    assert re.search(r"add x\d+, x\d+, .*static\.str\d+.*PAGEOFF", result.stdout)
+    # The low half of the address: `@PAGEOFF` in Mach-O, `:lo12:` in ELF.
+    assert re.search(r"add x\d+, x\d+, .*static\.str\d+", result.stdout)
     assert "turkey_string_new" not in result.stdout

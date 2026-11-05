@@ -428,56 +428,56 @@ available everywhere ([Coherence](classes.md#coherence)).
 ### Operators in imports
 
 A [declared operator](expressions.md#declared-operators) is exported by
-writing it in parentheses, `export ((|>))`, and `export (..)` exports every
+writing it in parentheses, `export ((</>))`, and `export (..)` exports every
 operator the module declares. The operator's target does not have to be
 exported too: a use of the operator calls it all the same.
 
 An operator has no qualified spelling, so an import that does not name it
-does not bring it. It comes in only through an import list, as `(|>)` or with
-`..`, and `(|>) as _` beside `..` withholds it. It cannot be renamed; a module
-that wants another spelling declares its own operator with `infix`.
+does not bring it. It comes in only through an import list, as `(</>)` or
+with `..`, and `(</>) as _` beside `..` withholds it. It cannot be renamed; a
+module that wants another spelling declares its own operator with `infix`.
+The Prelude's operators, such as `<>` and `|>`, come in with the implicit
+Prelude import like its other names.
 
-<!-- module: Pipe.gob -->
+<!-- module: Path.gob -->
 ```kotlin
-export ((|>))
+export ((</>))
 
-infix Sequence (|>) = pipe
+infix Combine (</>) = joinPath
 
-fun pipe(x, f) = f(x)
+fun joinPath(dir : String, name : String) -> String = dir + "/" + name
 ```
 
 <!-- run -->
 ```kotlin
-import Pipe ((|>))
-
-fun double(n : Int) -> Int = n * 2
+import Path ((</>))
 
 fun main() {
-    print(5 |> double |> show)
+    print("usr" </> "local" </> "bin")
 }
 ```
 
 ```text
-10
+usr/local/bin
 ```
 
-Without the list, `|>` is not in scope:
+Without the list, `</>` is not in scope:
 
-<!-- module: Pipe.gob -->
+<!-- module: Path.gob -->
 ```kotlin
-export ((|>))
+export ((</>))
 
-infix Sequence (|>) = pipe
+infix Combine (</>) = joinPath
 
-fun pipe(x, f) = f(x)
+fun joinPath(dir : String, name : String) -> String = dir + "/" + name
 ```
 
-<!-- error: the operator '|>' is not imported; 'Pipe' exports it -->
+<!-- error: the operator '</>' is not imported; 'Path' exports it -->
 ```kotlin
-import Pipe
+import Path
 
 fun main() {
-    print(5 |> show)
+    print("usr" </> "bin")
 }
 ```
 

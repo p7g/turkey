@@ -12,7 +12,8 @@ patterns each of those places accepts.
 **Syntax**
 
 ```ebnf
-pattern      ::= pattern-atom (":" type)?
+pattern      ::= alternative ("|" alternative)*          -- alternatives
+alternative  ::= pattern-atom (":" type)?
 pattern-atom ::= IDENT                                   -- variable
                | "_"                                     -- wildcard
                | INT | FLOAT | STRING | CHAR             -- literal
@@ -36,6 +37,7 @@ field-pattern ::= IDENT "=" pattern
 | `Some(p)` | a `Some` whose payload matches `p` | what `p` binds |
 | `C { f = p, g }` | a `C` whose field `f` matches `p` | what `p` binds, and `g` |
 | `p : T` | what `p` matches, checking it has type `T` | what `p` binds |
+| `p1 \| p2` | what `p1` or `p2` matches | what the alternative that matched binds |
 
 Patterns nest: `Some((x, _))` matches a `Some` holding a pair, and binds the
 pair's first element.
@@ -151,20 +153,27 @@ pattern. Annotated patterns can appear inside other patterns, as in
 A constructor pattern whose constructor is
 [existential](types.md#existential-types) opens the value: each hidden type
 becomes a new type, known only inside the `match` arm or the function whose
-pattern it is. Existential patterns are allowed in `match` arms without `|`
-alternatives and in function and lambda parameters, and nowhere else.
+pattern it is. Existential patterns are allowed in `match` arms and in
+function and lambda parameters, and nowhere else, and not inside
+[alternatives](#alternatives).
 
 ## Alternatives
 
 **Syntax**
 
 ```ebnf
-match-arm ::= pattern ("|" pattern)* "->" expression
+pattern ::= alternative ("|" alternative)*
 ```
 
-A `match` arm may list several patterns separated by `|`. The arm is taken if
-any of them matches. Every alternative must bind the same variables, at the
-same types:
+`p1 | p2` matches a value that `p1` or `p2` matches. Alternatives can be
+written anywhere a pattern can: at the top of a `match` arm, and nested inside
+a tuple, a constructor's arguments or a record's fields. `|` binds more
+loosely than anything else in a pattern, so `Some(x) : T | None` is
+`(Some(x) : T) | None`; write parentheses to group alternatives where a single
+pattern is expected, as in `Some((1 | 2, name))`.
+
+Every alternative must bind the same variables, at the same types, so that the
+code after the pattern can use them whichever alternative matched:
 
 <!-- run -->
 ```kotlin
@@ -206,8 +215,57 @@ fun main() {
 3
 ```
 
-The `|` belongs to the pattern list of one arm, so an arm cannot begin with
-one ([`match`](statements.md#match)).
+An arm cannot begin with `|` ([`match`](statements.md#match)).
+
+Nested alternatives save repeating the rest of a pattern. A router that
+answers `HEAD` like `GET` writes the method's alternatives inside the tuple,
+rather than `(GET, "/health") | (HEAD, "/health")`:
+
+<!-- run -->
+```kotlin
+type Method = GET | HEAD | POST
+
+fun route(method : Method, path : String) -> String = match (method, path) {
+    (GET | HEAD, "/health") -> "200 ok"
+    (POST, "/orders") -> "201 created"
+    (_, "/health" | "/orders") -> "405 method not allowed"
+    _ -> "404 not found"
+}
+
+fun main() {
+    print(route(HEAD, "/health"))
+    print(route(GET, "/orders"))
+}
+```
+
+```text
+200 ok
+405 method not allowed
+```
+
+Alternatives are tried from left to right. When alternatives nested inside a
+pattern overlap, the first one that matches is the one taken, and its
+variables are the ones bound; if the rest of the pattern does not match, or a
+later condition of an [`if let`](statements.md#if-let-and-if-var) fails, the
+other alternatives are not tried. The alternatives at the top of an arm, or of
+the pattern of a `let` condition, are each tried in turn instead:
+
+<!-- run -->
+```kotlin
+fun larger(pair : (Int, Int)) -> String {
+    let nested = if let ((x, _) | (_, x)) = pair, x > 5 { show(x) } else { "none" }
+    let listed = if let (x, _) | (_, x) = pair, x > 5 { show(x) } else { "none" }
+    nested + " " + listed
+}
+
+fun main() {
+    print(larger((1, 9)))
+}
+```
+
+```text
+none 9
+```
 
 ## Exhaustiveness
 
@@ -243,6 +301,24 @@ compiler does not report such arms.
 A pattern is **irrefutable** if it matches every value of its type. Variables,
 wildcards, tuples of irrefutable patterns, and constructors of types that have
 only one constructor, with irrefutable payload patterns, are irrefutable.
+
+Alternatives are irrefutable when together they match every value:
+
+<!-- run -->
+```kotlin
+fun magnitude(signed : Either Int Int) -> Int {
+    let Left(n) | Right(n) = signed
+    n
+}
+
+fun main() {
+    print(magnitude(Right(4)))
+}
+```
+
+```text
+4
+```
 
 Places that bind without a second arm to fall back on accept only irrefutable
 patterns: `let` and `var` without `else`, function and lambda parameters, and

@@ -175,8 +175,8 @@ field-init ::= IDENT "=" expression
 if-expr    ::= "if" conditions block ("else" (block | if-expr))?
 conditions ::= condition ("," condition)*                        -- no two expressions in a row
 condition  ::= expression                                        -- no bare record expression
-             | ("let" | "var") pattern ("|" pattern)* "=" expression  -- only after "if" and "while"
-match-arm  ::= pattern ("|" pattern)* "->" expression
+             | ("let" | "var") pattern "=" expression                -- only after "if" and "while"
+match-arm  ::= pattern "->" expression
 ```
 
 In a `condition`, and in the collection of `for ... in`, a record expression
@@ -200,7 +200,8 @@ operators](expressions.md#declared-operators)).
 ## Patterns
 
 ```ebnf
-pattern       ::= pattern-atom (":" type)?
+pattern       ::= alternative ("|" alternative)*
+alternative   ::= pattern-atom (":" type)?
 pattern-atom  ::= IDENT
                 | "_"
                 | INT | FLOAT | STRING | CHAR

@@ -1,4 +1,7 @@
-export (main, entryThread, crashReport, installCrashHandler)
+export (
+    main, entryThread, crashReport, installCrashHandler,
+    signalNote, signalHandler, signalPipeSet, signalTake,
+)
 
 -- Start a compiled program and report its result or a fault.
 -- C calls these exported functions: the generated main, pthread_create, and
@@ -185,6 +188,76 @@ foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
         shown = shown + 1
     }
     Libc.exitNow(139)
+}
+
+-- -- a signal the program waits for -----------------------------------------------
+--
+-- `Signal` delivers a signal by the self-pipe trick, and this is its half that
+-- runs in signal context: `signalNote` adds 1 to the signal's count, then
+-- writes a byte to the pipe whose read end `Signal` waits on through the
+-- poller. `Signal` reads the pipe empty first and takes the counts after
+-- (`signalTake`), so a signal that comes between the two leaves a byte that
+-- wakes the next wait, and none is lost.
+--
+-- The pipe's write end is non-blocking, so a full pipe drops the byte rather
+-- than stopping the thread; the count keeps the delivery, and a full pipe
+-- already wakes the reader.
+
+-- Raw words: the pipe's write end at 0, or -1 until `signalPipeSet`; a count
+-- for each signal number from 1 to `signalLimit - 1` at `8 * number`; and the
+-- byte the handler writes, at `signalByteAt`.
+let signalLimit : Int = 32
+let signalByteAt : Int = 256
+let signalWords : Ptr = signalState()
+
+fun signalState() -> Ptr {
+    let words = Libc.malloc(264)
+    for var at = 0; at < 264; at = at + 8 { Ptr.store(words, at, 0) }
+    Ptr.store(words, 0, -1)
+    words
+}
+
+-- The handler, `void (*)(int)`, for `signal`.
+--
+-- It runs on whichever thread the kernel picks, on whatever stack that thread
+-- is on, and may have interrupted anything. Being a giblet is what lets it run
+-- at all, and it is written to return into the code it interrupted unharmed:
+-- it calls only `write`, which is async-signal-safe; it touches only the raw
+-- words above, with atomics; and it puts back the `errno` the write may have
+-- changed, which the interrupted code may be about to read.
+foreign "turkey_signal_note" fun signalNote(signal : Int) -> Unit {
+    let number = cInt(signal)
+    if number <= 0 || number >= signalLimit { return {} }
+    let _ = Ptr.atomicAdd(signalWords, number * 8, 1)
+    let fd : Int = Ptr.atomicLoad(signalWords, 0)
+    if fd < 0 { return {} }
+    let errno = errnoLocation()
+    let saved = Ptr.load32(errno, 0)
+    let _ = Libc.write(fd, Ptr.add(signalWords, signalByteAt), 1)
+    Ptr.store32(errno, 0, saved)
+}
+
+-- `signalNote`'s address, to hand to `signal`.
+fun signalHandler() -> Ptr = Prim.codeAddress("turkey_signal_note")
+
+-- Have the handler write to `fd`, a non-blocking pipe's write end.
+fun signalPipeSet(fd : Int) -> Unit = Ptr.atomicStore(signalWords, 0, fd)
+
+-- How many times signal `number` has arrived since the last call, which
+-- starts its count again from 0.
+fun signalTake(number : Int) -> Int {
+    let at = number * 8
+    while True {
+        let count = Ptr.atomicLoad(signalWords, at)
+        if Ptr.atomicCas(signalWords, at, count, 0) == count { return count }
+    }
+    0
+}
+
+-- Where this thread's `errno` lives, as `Turkey.Sys.location` finds it.
+fun errnoLocation() -> Ptr = match Target.os {
+    Darwin -> Libc.errnoDarwin()
+    Linux -> Libc.errnoLinux()
 }
 
 -- -- writing without a `String` ------------------------------------------------------

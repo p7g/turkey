@@ -1,7 +1,7 @@
 export (
     Asm(..), Dialect(..), Section(..), Symbol(..), SymbolKind(..), dialectFor, newAsm,
-    symbolFor, runtimeFor, messageSymbol, internMessage, literalSlot, globalSlot, globalSymbol,
-    rootsSymbol, literalName, messageName, entrySymbol, globalsFrame,
+    symbolFor, runtimeFor, messageSymbol, internMessage, literalSymbol, globalSlot, globalSymbol,
+    rootsSymbol, literalName, isStaticObject, staticStart, staticEnd, messageName, entrySymbol, globalsFrame,
     frameTableSymbol, localLabel, spell, page, pageOffset, section, functionType,
     architecture, calleeFor, turkeyEntry,
 )
@@ -31,15 +31,14 @@ import Turkey.SsaLower (Module(..))
 import Turkey.Target as Target
 
 type Asm = Asm {
-    -- String literal -> its index. Interned per module, so `ConstString` is a
-    -- load of an already-decided cache and not an allocation.
+    -- String literal -> its index, which names its static object. Interned
+    -- per module, so one text is one object.
     literals : Map String Int,
     -- Panic message -> its index.
     messages : Map String Int,
     -- Traced global -> its slot in the permanent root array.
     globals  : Map String Int,
-    -- How many slots that array has: the traced globals, then one cache per
-    -- literal.
+    -- How many slots that array has: one per traced global.
     roots    : Int,
     dialect  : Dialect,
     -- The C symbols the runtime defines in Turkey (`foreign` definitions), to
@@ -68,9 +67,10 @@ type Section =
     Text
     -- NUL-terminated C strings: the panic messages.
     | CStrings
-    -- Read-only bytes: the string literals.
+    -- Read-only bytes.
     | Constants
-    -- Writable words: the globals and the root array.
+    -- Writable words: the string literals' static objects, the globals and
+    -- the root array.
     | Data
     -- Words the linker relocates and nothing writes afterwards: the frame
     -- table, which holds return addresses.
@@ -107,7 +107,7 @@ type Symbol = Symbol { name : String, kind : SymbolKind, format : Dialect }
 
 type SymbolKind
     -- An assembler-local label, which never reaches the symbol table: a block,
-    -- a stub, a literal's bytes. `name` is without the format's prefix.
+    -- a stub, a literal's object. `name` is without the format's prefix.
     = Temporary
     -- A name in the symbol table, as the table holds it.
     | Named
@@ -183,7 +183,24 @@ fun runtimeFor(d : Dialect, name : String) -> Symbol = symbolFor(d, name)
 -- Compiler-private data, named as local labels so these never reach the symbol
 -- table.
 fun literalName(d : Dialect, index : Int) -> Symbol =
-    localLabel(d, "str" + Int.toString(index))
+    localLabel(d, staticPrefix + "str" + Int.toString(index))
+
+-- Whether `sym` names a static object (`Turkey.Emit.emitLiterals`), whose
+-- address is a traced value: the collector recognizes it by its range and
+-- skips it. Every static object's label, and nothing else's, starts with the
+-- prefix.
+fun isStaticObject(sym : Symbol) -> Bool = match sym.kind {
+    Temporary -> String.startsWith(sym.name, staticPrefix)
+    Named -> False
+}
+
+let staticPrefix = "static."
+
+-- The bounds of the module's static objects, which the entry sequence
+-- registers with the collector: the first object's address, and the address
+-- just past the last.
+fun staticStart(d : Dialect) -> Symbol = localLabel(d, "static_start")
+fun staticEnd(d : Dialect) -> Symbol = localLabel(d, "static_end")
 --
 -- A message is named by its text, not by when it was first mentioned, so that
 -- functions selected at once agree on its name without asking each other
@@ -233,21 +250,20 @@ fun internMessage(a : Asm, text : String) -> Unit {
     }
 }
 
--- The root slot holding this literal's `TurkeyString`.
+-- The static object holding this literal.
 --
 -- Every literal is interned before anything is selected, so this is a lookup
--- and not an assignment: a slot decided while emitting would depend on the
+-- and not an assignment: an index decided while emitting would depend on the
 -- order functions were walked in, and two runs would disagree.
-fun literalSlot(a : Asm, text : String) -> Int =
-    Map.getOr(a.literals, text, 0) + len(a.globals)
+fun literalSymbol(a : Asm, text : String) -> Symbol =
+    literalName(a.dialect, Map.getOr(a.literals, text, 0))
 
 -- The module's naming, decided up front.
 --
--- The traced globals take the low slots and the literal caches the rest. Both
--- are roots for the same reason and for the whole run: a dictionary is a
--- global nothing holds in a stack frame, and a literal's `TurkeyString` is
--- allocated once by the entry sequence and never again -- a collector that
--- cannot see either frees them the first time it runs.
+-- Each traced global takes a slot of the root array, a root for the whole run:
+-- a dictionary is a global nothing holds in a stack frame, and a collector
+-- that cannot see it frees it the first time it runs. A literal needs no slot:
+-- it is a static object, which the collector never frees.
 --
 -- A scalar global holds nothing to trace and stays ordinary storage, which
 -- also keeps the array dense: its length is the number of things the collector
@@ -276,7 +292,7 @@ fun newAsm(m : Module, dialect : Dialect) -> Asm {
     let defined = Map.new()
     for (sym, name) in m.definitions { Map.put(defined, sym, name) }
     Asm { literals = literals, messages = Map.new(), globals = globals,
-          roots = roots + len(literals), dialect = dialect, defined = defined }
+          roots = roots, dialect = dialect, defined = defined }
 }
 
 -- What generated code calls for the C symbol `sym`: the Turkey-side entry if

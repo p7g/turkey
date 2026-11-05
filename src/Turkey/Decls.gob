@@ -190,6 +190,9 @@ type DeclTable = DeclTable {
     -- Existential constructors whose contexts name classes, until the class
     -- table has the classes to check them against.
     var uncheckedContexts : Vec (ConInfo, ConDecl),
+    -- The aliases reported as recursive. One has no expansion, so every use
+    -- of it translates to bottom.
+    recursiveAliases : Set.Set String,
 }
 
 fun newDeclTable() -> DeclTable {
@@ -200,7 +203,7 @@ fun newDeclTable() -> DeclTable {
         families = Map.new(), shorts = Map.new(), order = Vec.new(16),
         foreigns = Map.new(), definitions = Map.new(), functions = Set.new(),
         newtypeNames = None, flatNames = None, groundLayouts = Map.new(),
-        packings = Map.new(), uncheckedContexts = [],
+        packings = Map.new(), uncheckedContexts = [], recursiveAliases = Set.new(),
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
@@ -353,14 +356,22 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
             None -> Map.put(t.shorts, short, d.name)
         }
     }
+    -- Cycles first: a constructor field or an alias body that mentions a
+    -- recursive alias would otherwise expand it for ever.
+    for d in kept {
+        if Option.isSome(d.alias) && !Set.contains(t.recursiveAliases, d.name) {
+            let _ = checkAliasAcyclic(t, d.name, d.name, Set.new())
+        }
+    }
     for d in kept {
         if Option.isNone(d.alias) && !Set.contains(invalid, d.name) { resolveVariants(t, d) }
     }
     for d in kept {
         if Option.isSome(d.alias) {
             checkAliasHead(t, d)
-            checkAliasAcyclic(t, d.name, d.name, Set.new())
-            kindCheckAlias(t, tyconOf(t, d.name))
+            if !Set.contains(t.recursiveAliases, d.name) {
+                kindCheckAlias(t, tyconOf(t, d.name))
+            }
         }
     }
     settleKinds(t)
@@ -534,21 +545,28 @@ fun firstOfPair(p : (String, Type)) -> String {
 
 -- A type alias may not be recursive: it is expanded, not unfolded, so a
 -- recursive one has no normal form to expand to.
+--
+-- Returns whether `root` is recursive. If so, reports it, and adds every alias
+-- on the cycle to `t.recursiveAliases`, so a cycle through several is
+-- reported once.
 fun checkAliasAcyclic(t : DeclTable, root : String, name : String,
-                      seen : Set.Set String) -> Unit {
+                      seen : Set.Set String) -> Bool {
     match Map.get(t.tycons, name) {
-        None -> return {}
+        None -> return False
         Some(info) -> {
-            if !info.isAlias || Set.contains(seen, name) { return {} }
+            if !info.isAlias || Set.contains(seen, name) { return False }
             let inner = Set.new()
             for s in Set.elements(seen) { Set.add(inner, s) }
             Set.add(inner, name)
             for referenced in referencedTycons(info.aliasBody) {
                 if referenced == root {
-                    return report("type alias '" + root + "' is recursive", info.span)
+                    report("type alias '" + root + "' is recursive", tyconOf(t, root).span)
+                    for s in Set.elements(inner) { Set.add(t.recursiveAliases, s) }
+                    return True
                 }
-                checkAliasAcyclic(t, root, referenced, inner)
+                if checkAliasAcyclic(t, root, referenced, inner) { return True }
             }
+            False
         }
     }
 }
@@ -603,7 +621,9 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
         if Map.contains(t.families, name) {
             return family(t, te, name, args, tyvars, fresh)
         }
-        -- A type reported here is bottom, which absorbs whatever it meets.
+        -- A type reported here, or a recursive alias, is bottom. Bottom unifies
+        -- with anything, and the kind and shape checks skip it.
+        if Set.contains(t.recursiveAliases, name) { return TBottom }
         let info = match Map.get(t.tycons, name) {
             Some(i) -> i
             None -> {
@@ -659,7 +679,7 @@ fun family(t : DeclTable, te : Type, name : String, args : Vec Type,
         return TBottom
     }
     let resolved = Array.map(args, toType(t, _, tyvars, fresh))
-    if !Ty.unifyKinds(Ty.kindOf(resolved[0]), fam.argKind) {
+    if !Ty.isBottom(resolved[0]) && !Ty.unifyKinds(Ty.kindOf(resolved[0]), fam.argKind) {
         report("'" + Ty.show(resolved[0]) + "' has kind "
                + Ty.showKind(Ty.kindOf(resolved[0])) + ", but '" + name
                + "' expects an argument of kind " + Ty.showKind(fam.argKind),

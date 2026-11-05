@@ -425,7 +425,7 @@ fun registerAll(t : ClassTable, classes : Vec (ClassDecl, String),
     -- One report per cycle, not one per class in it.
     let cyclic = Set.new()
     for (d, _) in kept {
-        if !Set.contains(cyclic, d.name) { checkSuperAcyclic(t, d.name, [], cyclic) }
+        if !Set.contains(cyclic, d.name) { let _ = checkSuperAcyclic(t, d.name, [], cyclic) }
     }
     for (_, fam) in Map.entries(t.decls.families) {
         let _ = Ty.defaultKind(fam.resKind)
@@ -470,7 +470,7 @@ fun checkConstructorContexts(t : ClassTable) -> Unit {
                 }
             }
             let arg = p.args[0]
-            if !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
+            if !Ty.isBottom(arg) && !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
                 report("'" + Ty.show(arg) + "' has kind "
                        + Ty.showKind(Ty.kindOf(arg)) + ", but '" + p.name
                        + "' constrains a type of kind "
@@ -519,20 +519,33 @@ fun declareFamilies(t : ClassTable, d : ClassDecl) -> Unit {
     }
 }
 
--- Reports a superclass cycle reachable from `name`, and adds every class the
--- walk passed through to `cyclic`, so that the walk from another of them does
--- not report the same cycle again.
+-- Reports a superclass cycle reachable from `name`, and removes the edge that
+-- closes it, so that nothing later follows the superclasses round for ever.
+-- When it reports, it adds the classes on the walk's path to `cyclic`, so
+-- that a walk from another of them does not report the same cycle again.
+--
+-- Returns whether `name` is already on the path `seen`, that is, whether the
+-- edge to it closes a cycle.
 fun checkSuperAcyclic(t : ClassTable, name : String, seen : Array String,
-                      cyclic : Set.Set String) -> Unit {
+                      cyclic : Set.Set String) -> Bool {
     if Array.contains(seen, name) {
-        if Set.contains(cyclic, name) { return }
-        for s in seen { Set.add(cyclic, s) }
-        return report("class '" + name + "' is its own superclass", classNamed(t, name).span)
+        if !Set.contains(cyclic, name) {
+            for s in seen { Set.add(cyclic, s) }
+            report("class '" + name + "' is its own superclass", classNamed(t, name).span)
+        }
+        return True
     }
     let inner = Array.append(seen, [name])
-    for sup in classNamed(t, name).supers {
-        checkSuperAcyclic(t, sup.name, inner, cyclic)
+    let info = classNamed(t, name)
+    let kept = []
+    for sup in info.supers {
+        if !checkSuperAcyclic(t, sup.name, inner, cyclic) { Vec.push(kept, sup) }
     }
+    if len(kept) < len(info.supers) {
+        Vec.clear(info.supers)
+        for sup in kept { Vec.push(info.supers, sup) }
+    }
+    False
 }
 
 fun resolveClass(t : ClassTable, d : ClassDecl) -> Unit {
@@ -671,7 +684,7 @@ fun resolveContext(t : ClassTable, context : Vec Ast.Pred, tyvars : Map String T
                     }
                 }
                 let arg = Decls.toType(t.decls, argTe, tyvars, fresh)
-                if !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
+                if !Ty.isBottom(arg) && !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
                     report("'" + Ty.show(arg) + "' has kind "
                            + Ty.showKind(Ty.kindOf(arg)) + ", but '" + name
                            + "' constrains a type of kind "
@@ -700,6 +713,8 @@ fun resolveEquality(t : ClassTable, p : Ast.Pred, leftTe : Type, rightTe : Type,
                     tyvars : Map String Ty.Type, fresh : Ty.Fresh) -> Pred {
     let left = Decls.toType(t.decls, leftTe, tyvars, fresh)
     let right = Decls.toType(t.decls, rightTe, tyvars, fresh)
+    -- A side already reported as a wrong type has nothing left to check.
+    if Ty.isBottom(left) || Ty.isBottom(right) { return Ty.pred(Ty.equals, [left, right]) }
     match left {
         TFam(_, _, _) -> {}
         _ -> report("'" + Ty.show(left) + "' is not an associated type; the left "
@@ -744,6 +759,8 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
     let tyvars = Map.new()
     let fresh = fun() = Ty.freshVar(1)
     let h = Decls.toType(t.decls, d.head, tyvars, fresh)
+    -- A head already reported as a wrong type is not registered.
+    if Ty.isBottom(h) { return None }
     if !Ty.unifyKinds(Ty.kindOf(h), info.cvar.kind) {
         report("'" + Ty.show(h) + "' has kind " + Ty.showKind(Ty.kindOf(h))
                + ", but '" + d.cls + "' constrains a type of kind "
@@ -883,7 +900,7 @@ fun resolveFamilies(t : ClassTable, d : InstanceDecl, info : ClassInfo,
             Some(f) -> f
             None -> bug("unknown type family '" + resolved + "'", Some(fb.span))
         }
-        if !Ty.unifyKinds(Ty.kindOf(body), fam.resKind) {
+        if !Ty.isBottom(body) && !Ty.unifyKinds(Ty.kindOf(body), fam.resKind) {
             report("'" + Ty.show(body) + "' has kind "
                    + Ty.showKind(Ty.kindOf(body)) + ", but '" + fb.name
                    + "' produces a type of kind " + Ty.showKind(fam.resKind),

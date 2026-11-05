@@ -861,30 +861,33 @@ fun knownCondition(d : DeclTable, e : Core) -> Option Core = match e.kind {
 
 -- A primitive applied to constants: the constant it computes, or `None` where
 -- an operand is not a constant or the primitive would trap.
-fun knownPrim(e : Core) -> Option Core = match e.kind {
-    CApp(fn, args) -> match stripTyApp(fn).kind {
-        CPrim(p) -> Option.map(folded(p, args), fun(kind) = mkCore(e.ty, e.span, kind))
-        _ -> None
+fun knownPrim(e : Core) -> Option Core {
+    -- Two `if let`s rather than one with both conditions: the committed
+    -- bootstrap, which compiles this file, does not parse the chained form.
+    if let CApp(fn, args) = e.kind {
+        if let CPrim(p) = stripTyApp(fn).kind {
+            return map(folded(p, args), mkCore(e.ty, e.span, _))
+        }
     }
-    _ -> None
+    None
 }
 
 -- A primitive left out is never folded, which is always correct: the floats,
 -- which `Turkey.Sccp` does not fold either, and the bytes, which have no
 -- literal to fold to or from.
 fun folded(p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
-    Prims.CharToInt -> unary(charAt(args, 0), fun(c) = Some(intLit(c)))
-    Prims.CharFromInt -> unary(intAt(args, 0), fun(n) =
-        if Fold.isScalar(n) { Option.map(Char.fromInt(n), fun(c) = CLit(LChar(c))) }
+    Prims.CharToInt -> map(charAt(args, 0), intLit)
+    Prims.CharFromInt -> bind(intAt(args, 0), fun(n) =
+        if Fold.isScalar(n) { map(Char.fromInt(n), fun(c) = CLit(LChar(c))) }
         else { None })
-    Prims.CharIsScalar -> unary(intAt(args, 0), fun(n) = Some(boolCon(Fold.isScalar(n))))
+    Prims.CharIsScalar -> map(intAt(args, 0), fun(n) = boolCon(Fold.isScalar(n)))
     Prims.CharEq -> relation(L.Eq, charAt(args, 0), charAt(args, 1))
     Prims.CharLt -> relation(L.Lt, charAt(args, 0), charAt(args, 1))
     Prims.IntEq -> relation(L.Eq, intAt(args, 0), intAt(args, 1))
     Prims.IntLt -> relation(L.Lt, intAt(args, 0), intAt(args, 1))
     Prims.BoolEq -> relation(L.Eq, boolAt(args, 0), boolAt(args, 1))
     Prims.BoolLt -> relation(L.Lt, boolAt(args, 0), boolAt(args, 1))
-    Prims.Not -> unary(boolAt(args, 0), fun(b) = Some(boolCon(b == 0)))
+    Prims.Not -> map(boolAt(args, 0), fun(b) = boolCon(b == 0))
     Prims.IntAdd -> arithmetic(L.Add, intAt(args, 0), intAt(args, 1))
     Prims.IntSub -> arithmetic(L.Sub, intAt(args, 0), intAt(args, 1))
     Prims.IntMul -> arithmetic(L.Mul, intAt(args, 0), intAt(args, 1))
@@ -906,41 +909,29 @@ fun folded(p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
     _ -> None
 }
 
-fun unary(x : Option Int, f : fun(Int) -> Option CoreKind) -> Option CoreKind = match x {
-    Some(v) -> f(v)
-    None -> None
-}
+fun relation(o : L.CmpOp, x : Option Int, y : Option Int) -> Option CoreKind =
+    Some(boolCon(Fold.compare(o, x?, y?)))
 
-fun relation(o : L.CmpOp, x : Option Int, y : Option Int) -> Option CoreKind = match (x, y) {
-    (Some(a), Some(b)) -> Some(boolCon(Fold.compare(o, a, b)))
-    _ -> None
-}
-
-fun arithmetic(o : L.BinOp, x : Option Int, y : Option Int) -> Option CoreKind = match (x, y) {
-    (Some(a), Some(b)) -> Option.map(Fold.binary(o, a, b), intLit)
-    _ -> None
-}
+fun arithmetic(o : L.BinOp, x : Option Int, y : Option Int) -> Option CoreKind =
+    map(Fold.binary(o, x?, y?), intLit)
 
 fun intLit(n : Int) -> CoreKind = CLit(LInt(n))
 
 fun boolCon(b : Bool) -> CoreKind = CCon(if b { P.boolTrue } else { P.boolFalse })
 
-fun intAt(args : Array Core, i : Int) -> Option Int = match args[i].kind {
-    CLit(LInt(n)) -> Some(n)
-    _ -> None
-}
+fun intAt(args : Array Core, i : Int) -> Option Int =
+    if let CLit(LInt(n)) = args[i].kind { Some(n) } else { None }
 
-fun charAt(args : Array Core, i : Int) -> Option Int = match args[i].kind {
-    CLit(LChar(c)) -> Some(Char.toInt(c))
-    _ -> None
-}
+fun charAt(args : Array Core, i : Int) -> Option Int =
+    if let CLit(LChar(c)) = args[i].kind { Some(Char.toInt(c)) } else { None }
 
 -- `True` as 1 and `False` as 0, which is how `Fold.compare` orders them.
-fun boolAt(args : Array Core, i : Int) -> Option Int = match args[i].kind {
-    CCon(name) -> if name == P.boolTrue { Some(1) } else if name == P.boolFalse { Some(0) }
-                  else { None }
-    _ -> None
-}
+fun boolAt(args : Array Core, i : Int) -> Option Int =
+    if let CCon(name) = args[i].kind {
+        if name == P.boolTrue { Some(1) } else if name == P.boolFalse { Some(0) } else { None }
+    } else {
+        None
+    }
 
 fun fresh(r : Reducer, hint : String) -> String {
     var name = ""

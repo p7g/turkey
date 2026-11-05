@@ -140,13 +140,11 @@ fun forget(fd : Int) -> Unit {
 }
 
 -- Wake `tasks`, of the `ended` waits the poller just ended, and the program's
--- own code if it waits. Without either lock.
+-- own code if it waits. Without the poller's lock.
 fun wakeAll(ended : Int, tasks : Vec Co.Coroutine) -> Unit {
     if ended > 0 {
-        Scheduler.lock()
-        for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
+        Scheduler.wakeAll(tasks)
         Scheduler.changed()
-        Scheduler.unlock()
     }
 }
 
@@ -191,7 +189,17 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     }
     Poll.unlock()
     wakeAll(ends, others)
-    if parked { Co.suspend() }
+    if parked {
+        Co.suspend()
+        -- Nothing queues a task parked on `w` but the wake that follows `w`'s
+        -- end. That wake queues it under the queue's lock, or, if the task
+        -- has not suspended yet, marks it woken by a compare-and-swap, and
+        -- `run` queues it once it suspends. The worker that resumed it
+        -- acquired one or the other after the end, so the end is seen here
+        -- without the poller's lock. `await` looks again under it all the
+        -- same.
+        if Poll.finished(w) { return Poll.outcome(w) }
+    }
     await(w)
 }
 

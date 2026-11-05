@@ -12,7 +12,8 @@ export (run, reach)
 --   function or through a closure, or converting it to an untraced word;
 -- * passing it to a parameter whose summary says it escapes, or to a call in
 --   tail position (`L.inTailPosition`) whose callee can call this function
---   again by direct calls (`directCycles`);
+--   again by direct calls (`directCycles`). The second is about this frame
+--   only, and is left out of the summaries: see `Graph.tailArgs`;
 -- * being held -- as a field, or through a phi -- by something that escapes.
 --
 -- A store after construction is an escape even into an object that does not
@@ -80,6 +81,15 @@ type Graph = Graph {
     held : Array (Array Int),
     -- Values that escape whatever the summaries say.
     sinks : Vec Int,
+    -- What tail calls on a cycle pass, which may not be built in this frame:
+    -- the frame is gone while the callee runs. Not sinks. A parameter passed
+    -- on lives in a frame that is still there -- the caller's, or one further
+    -- out, since a frame object passed to a tail call makes that an ordinary
+    -- call -- so the value itself escapes only when this function's own sites
+    -- are decided, and not in the summaries callers read. Its contents
+    -- escape in both: a value built here is then on the heap, and what a heap
+    -- object holds may not be in any frame.
+    tailArgs : Vec Int,
     -- Direct calls, and closures built over known code.
     calls : Vec (String, Array Int),
     closures : Vec (String, Int),
@@ -138,7 +148,8 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     for var w = 0; w < len(work); w = w + 1 {
         let k = work[w]
         queued[k] = False
-        let flow = decide(functions[k], graphs[k], summaries, byName, frameable[k], lives, k)
+        let flow = decide(functions[k], graphs[k], summaries, byName, frameable[k], False,
+                          lives, k)
         if grow(summaries[k], functions[k], flow.escapes, flow.contents) {
             for reader in Set.elements(readers[k]) {
                 if !queued[reader] {
@@ -150,7 +161,7 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     }
     for var k = 0; k < len(functions); k = k + 1 {
         if frameable[k] && len(graphs[k].sites) > 0 {
-            let flow = decide(functions[k], graphs[k], summaries, byName, True, lives, k)
+            let flow = decide(functions[k], graphs[k], summaries, byName, True, True, lives, k)
             rewrite(functions[k], graphs[k], flow.escapes)
         }
     }
@@ -221,7 +232,7 @@ fun graphOf(f : Ssa.Func Low, repeats : fun(String, String) -> Bool) -> Graph {
         sources = Array.init(n, fun(_) = []),
         loadedFrom = Array.filled(n, -1),
         held = Array.init(n, fun(_) = []),
-        sinks = [], calls = [], closures = [], sites = [], cyclic = [],
+        sinks = [], tailArgs = [], calls = [], closures = [], sites = [], cyclic = [],
     }
     let traced = fun(v : Value) -> Bool { Ssa.repOf(f, v).traced }
     let sink = fun(v : Value) -> Unit {
@@ -293,12 +304,14 @@ fun graphOf(f : Ssa.Func Low, repeats : fun(String, String) -> Bool) -> Graph {
                 -- unless the callee can call this function again: then the
                 -- calls can go round without bound, and only tail calls keep
                 -- the stack from growing with them, so what such a call
-                -- passes escapes whatever the callee's summary says
-                -- (`directCycles` says which cycles count).
-                Call(Direct(name), args) -> if L.inTailPosition(f, b, at)
-                                               && repeats(f.name, name) {
-                    for a in args { sink(a) }
-                } else {
+                -- passes is built on the heap (`tailArgs`; `directCycles`
+                -- says which cycles count).
+                Call(Direct(name), args) -> {
+                    if L.inTailPosition(f, b, at) && repeats(f.name, name) {
+                        for a in args {
+                            if traced(a) { Vec.push(g.tailArgs, Ssa.valueId(a)) }
+                        }
+                    }
                     Vec.push(g.calls, (name, Array.map(args, Ssa.valueId)))
                 }
                 -- The closure called is not among the arguments: see the
@@ -361,12 +374,14 @@ fun reachesItself(f : Ssa.Func Low, b : Int) -> Bool {
 
 -- -- one function -----------------------------------------------------------------
 
--- Escape under the current summaries, then every allocation that could live in
--- the frame and cannot -- a site reached again while its object is reachable,
+-- Escape under the current summaries -- and, with `tails`, of what tail calls
+-- on a cycle pass (`Graph.tailArgs`), whose contents alone the summaries
+-- count -- then
+-- every allocation that could live in the frame and cannot -- a site reached again while its object is reachable,
 -- or past the budget -- made to escape as well, since it stays on the heap
 -- and so does anything it holds.
 fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
-           byName : Map String Int, frameable : Bool,
+           byName : Map String Int, frameable : Bool, tails : Bool,
            lives : Array (Option Live), k : Int) -> Flow {
     let flow = Flow {
         escapes = Array.filled(len(f.reps), False),
@@ -374,6 +389,9 @@ fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
         work = [],
     }
     for id in g.sinks { escape(flow, id) }
+    for id in g.tailArgs {
+        if tails { escape(flow, id) } else { leak(flow, id) }
+    }
     for (name, args) in g.calls {
         match Map.get(byName, name) {
             Some(callee) -> {

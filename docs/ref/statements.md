@@ -207,7 +207,10 @@ The condition cannot be a bare record expression; see
 **Syntax**
 
 ```ebnf
-if-let ::= "if" ("let" | "var") pattern "=" expression block ("else" (block | if-expr))?
+if-let     ::= "if" conditions block ("else" (block | if-expr))?
+conditions ::= condition ("," condition)*
+condition  ::= expression
+             | ("let" | "var") pattern ("|" pattern)* "=" expression
 ```
 
 `if let p = e { A } else { B }` evaluates `e`, and runs `A` with the pattern's
@@ -222,7 +225,8 @@ match e {
 
 and without an `else`, `B` is `()`. The variables `p` binds are visible in `A`
 only. `if var` is the same, except that the bound variables can be assigned
-inside `A`.
+inside `A`. Like a `match` arm, a `let` can list alternatives, `p | q`, and
+every alternative must bind the same variables.
 
 <!-- run -->
 ```kotlin
@@ -245,115 +249,69 @@ took 8
 42
 ```
 
-## `let ... else` and `var ... else`
+### Condition lists
 
-**Syntax**
+A head can hold several conditions separated by commas, as long as one of
+them is a `let` or `var`. Each condition is either a `let` or a test, a
+`Bool` expression. They are evaluated left to right, and the first one that
+fails (a pattern that does not match, or a test that is `False`) runs `B`
+without evaluating the rest. `A` runs only when every condition holds. Each
+`let` binds its variables for the conditions after it and for `A`, and none
+of them is visible in `B`.
 
-```ebnf
-let-decl ::= "let" pattern "=" expression ("else" block)?
-var-decl ::= "var" pattern "=" expression ("else" block)?
-```
-
-`let p = e else { B }` evaluates `e`. If `p` matches, the pattern's variables
-are bound for the rest of the block, as with a plain `let`. If it does not, `B`
-runs instead. It is approximately
+`if let p1 = e1, c2, let p3 = e3 { A } else { B }` is approximately
 
 ```text
-let ($x, $y) = match e {
-    p -> ($x, $y)
+match e1 {
+    p1 -> if c2 {
+        match e3 {
+            p3 -> A
+            _ -> B
+        }
+    } else {
+        B
+    }
     _ -> B
 }
 ```
 
-where `$x` and `$y` are the variables `p` binds, so the pattern may be
-refutable. `var p = e else { B }` is the same, except that the variables can be
-assigned afterwards.
+except that `B` is written once, and every failing condition goes to it.
+
+Two tests in a row are an error, because `a && b` already says that: write
+`if let Some(n) = o, n > 0 && n < 10`, not `n > 0, n < 10`. A `?` can be in
+the first condition but not a later one, and only the first condition can
+match an [existential](types.md#existential-types) constructor.
 
 <!-- run -->
 ```kotlin
-fun total(lines : Array String) -> Int {
-    var sum = 0
-    for line in lines {
-        let Some(n) = Int.parse(line) else { continue }
-        sum = sum + n
+fun port(setting : String) -> Option Int {
+    if let Some((key, value)) = String.splitOnce(setting, "="), key == "port",
+       let Some(n) = Int.parse(value) {
+        Some(n)
+    } else {
+        None
     }
-    sum
 }
 
 fun main() {
-    print(total(["3", "four", "5"]))
+    print(port("port=8080"))
+    print(port("host=example.com"))
+    print(port("port=eighty"))
 }
 ```
 
 ```text
-8
+Some(8080)
+None
+None
 ```
 
-`B` must not fall through, because the variables would then have no value:
-it must [not be able to complete](#blocks), counting a call to a function that
-never returns as a statement that cannot complete. A function never returns
-when its result type is a type variable that none of its parameters mention,
-as in `error : fun(String) -> a`: it has no way to make a value of that type.
-So every way through `B` has to reach a `return`, `break`, `continue` or such
-a call.
-
-<!-- run -->
+<!-- error: two tests in a row cannot be separated by ','; join them with '&&' -->
 ```kotlin
-fun port(text : String) -> Int {
-    let Some(n) = Int.parse(text) else { error("not a port: " + text) }
-    n
-}
-
 fun main() {
-    print(port("8080"))
+    let o = Some(4)
+    if let Some(n) = o, n > 0, n < 10 { print(n) }
 }
-```
-
-```text
-8080
-```
-
-<!-- error: this 'else' block can fall through; it must end in 'return', 'break', 'continue' or a call that never returns -->
-```kotlin
-fun port(text : String) -> Int {
-    let Some(n) = Int.parse(text) else { print("not a port") }
-    n
-}
-
-fun main() {
-    print(port("8080"))
-}
-```
-
-The variables `p` binds are not visible in `B`, and neither is the value that
-failed to match. When `B` needs that value, as in reporting the error inside a
-`Left`, use `match`.
-
-The value cannot end in `}` when an `else` follows, because the `else` could
-belong to an `if` inside it. Put such a value in parentheses:
-
-<!-- error: a 'let' value that ends in '}' cannot be followed by 'else'; put the value in parentheses -->
-```kotlin
-fun pick(fast : Bool, x : Option Int) -> Int {
-    let Some(v) = if fast { x } else { None } else { return 0 }
-    v
-}
-```
-
-<!-- run -->
-```kotlin
-fun pick(fast : Bool, x : Option Int) -> Int {
-    let Some(v) = (if fast { x } else { None }) else { return 0 }
-    v
-}
-
-fun main() {
-    print(pick(True, Some(3)))
-}
-```
-
-```text
-3
 ```
 
 ## `match`
@@ -437,7 +395,7 @@ fun main() {
 **Syntax**
 
 ```ebnf
-while-let ::= "while" ("let" | "var") pattern "=" expression block
+while-let ::= "while" conditions block
 ```
 
 `while let p = e { B }` evaluates `e` and runs `B` while `p` matches. It is
@@ -453,7 +411,9 @@ loop {
 ```
 
 so `e` is evaluated again before every iteration, including after a
-`continue`. `while var` makes the bound variables assignable inside `B`.
+`continue`. `while var` makes the bound variables assignable inside `B`. A
+`while` head takes a [condition list](#condition-lists) as an `if` head does,
+and the loop ends at the first condition that fails.
 
 <!-- run -->
 ```kotlin
@@ -462,6 +422,10 @@ fun main() {
     while let Some(task) = Vec.pop(pending) {
         print("doing " + task)
     }
+    let readings = [7, 120, 3, 5]
+    while let Some(r) = Vec.pop(readings), r < 100 {
+        print(r)
+    }
 }
 ```
 
@@ -469,6 +433,8 @@ fun main() {
 doing a
 doing b
 doing c
+5
+3
 ```
 
 ## `for` over a collection

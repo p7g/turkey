@@ -171,6 +171,11 @@ fun node(ty : Ty.Type, where : Option Span, k : CoreKind) -> Core =
 -- `Turkey.Match`.
 fun matched(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
             where : Option Span) -> Core =
+    matchedArms(l, scrutinee, Vec.map(arms, fun((pat, body)) = (pat, Match.Taken(body))),
+                ty, where)
+
+fun matchedArms(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Match.Body),
+                ty : Ty.Type, where : Option Span) -> Core =
     Match.compile(Match.Matcher {
         decls = l.decls,
         reduce = fun(t) = resolved(l, t),
@@ -1353,17 +1358,9 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 Some(o) -> Some(expr(l, o, scope))
                 None -> None
             }))
-        EMatch(scrutinee, arms) -> {
-            let alts = Vec.new(4)
-            for arm in arms {
-                for pat in arm.patterns {
-                    Vec.push(alts, (pat, celled(l, pat,
-                        arm.body, expr(l, arm.body, _),
-                        childScope(scope), Some(arm.span))))
-                }
-            }
-            matched(l, expr(l, scrutinee, scope), alts, ty, where)
-        }
+        EMatch(scrutinee, arms) -> matchedArms(l, expr(l, scrutinee, scope),
+            armBodies(l, arms, ty, scope, fun(body, inner) = expr(l, body, inner)),
+            ty, where)
         EBlock(stmts) -> block(l, stmts, ty, where, childScope(scope))
         _ -> oops("cannot lower this expression", where)
     }
@@ -1660,17 +1657,60 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Vec Arm,
               scope : Scope, k : Option String) -> Core {
     let ty = typeOfExpr(l, e)
     let where = Some(e.span)
-    scrutinized(l, scrutinee, ty, where, scope, fun(s) = {
-        let alts = Vec.new(4)
-        for arm in arms {
-            for pat in arm.patterns {
-                Vec.push(alts, (pat, celled(l, pat,
-                    arm.body, conv(l, arm.body, _, k),
-                    childScope(scope), Some(arm.span))))
+    scrutinized(l, scrutinee, ty, where, scope, fun(s) = matchedArms(l, s,
+        armBodies(l, arms, ty, scope, fun(body, inner) = conv(l, body, inner, k)),
+        ty, where))
+}
+
+-- Returns each arm's code for each of its patterns, with `lower` lowering a
+-- body in a scope. `ty` is the type of the `match`.
+fun armBodies(l : Lowerer, arms : Vec Arm, ty : Ty.Type, scope : Scope,
+              lower : fun(Expr, Scope) -> Core) -> Vec (Pat, Match.Body) {
+    let alts = Vec.new(4)
+    for arm in arms {
+        let where = Some(arm.span)
+        for pat in arm.patterns {
+            let body = if len(arm.guards) == 0 {
+                Match.Taken(celled(l, pat, ChArm(arm), lower(arm.body, _),
+                                   childScope(scope), where))
+            } else {
+                Match.Guarded(fun(fail) = celled(l, pat, ChArm(arm),
+                    guarded(l, arm, 0, ty, _, lower, fail), childScope(scope), where))
             }
+            Vec.push(alts, (pat, body))
         }
-        matched(l, s, alts, ty, where)
-    })
+    }
+    alts
+}
+
+-- Returns code that runs guards `i` onwards of `arm` and then its body, and
+-- jumps to `fail` when a guard does not hold.
+--
+-- A `let` guard is a `match` of its own, whose last arm is that jump. The
+-- guards after it, and the body, are lowered once per pattern of that guard,
+-- as an arm's body is lowered once per pattern of the arm.
+fun guarded(l : Lowerer, arm : Arm, i : Int, ty : Ty.Type, scope : Scope,
+            lower : fun(Expr, Scope) -> Core, fail : String) -> Core {
+    if i == len(arm.guards) { return lower(arm.body, scope) }
+    let g = arm.guards[i]
+    let where = Some(guardExpr(g).span)
+    let failing = node(TBottom, where, CJump(fail, []))
+    match g {
+        GTest(test) -> scrutinized(l, test, ty, where, scope, fun(c) =
+            node(ty, where, CIf(c, guarded(l, arm, i + 1, ty, scope, lower, fail),
+                                Some(failing))))
+        GLet(patterns, value) -> scrutinized(l, value, ty, where, scope, fun(v) = {
+            let alts = Vec.new(len(patterns) + 1)
+            for pat in patterns {
+                Vec.push(alts, (pat, Match.Taken(celled(l, pat, ChArm(arm),
+                    guarded(l, arm, i + 1, ty, _, lower, fail), childScope(scope), where))))
+            }
+            let other = Pat { id = patterns[0].id, span = patterns[0].span,
+                              kind = PWild, opening = None }
+            Vec.push(alts, (other, Match.Taken(failing)))
+            matchedArms(l, v, alts, ty, where)
+        })
+    }
 }
 
 -- A branch whose *scrutinee* may itself hold a transfer, which has to run before
@@ -2322,15 +2362,16 @@ fun varCells(l : Lowerer, pat : Pat, rest : fun() -> Core, scope : Scope,
     cellsAround(l, types, names, rest(), where)
 }
 
--- Lower a pattern's body, making a cell of any binder it assigns.
+-- Lowers the code a pattern's binders scope over, making a cell of any binder
+-- that `within` assigns.
 --
 -- A pattern binder is reassignable like any other: reassigning a destructured
 -- parameter rebinds the local name and nothing else, because patterns bind, they
 -- do not alias. A cell is exactly that, and nothing more.
-fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
+fun celled(l : Lowerer, pat : Pat, within : Child, lower : fun(Scope) -> Core,
            scope : Scope, where : Option Span) -> Core {
     let types = Typed.ofPattern(l.types, pat)
-    let written = assignedIn(ChExpr(body))
+    let written = assignedIn(within)
     let here = Vec.new(2)
     for name in Map.keys(types) {
         if Set.contains(written, name) { Vec.push(here, name) }

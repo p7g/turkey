@@ -1,4 +1,4 @@
-export (Matcher(..), compile)
+export (Matcher(..), Body(..), compile)
 
 -- Match compilation: a `match` over source patterns, which nest, becomes nested
 -- `match`es over `Turkey.Core.Alt`s, which do not.
@@ -36,6 +36,10 @@ export (Matcher(..), compile)
 -- The order of tests is the order of the source: columns left to right, a
 -- constructor's fields before the columns after it. A run is never reordered
 -- with another, so an arm that might match is tried before every arm after it.
+--
+-- An arm with guards is a row like any other until its patterns have all
+-- matched. Its guards then run under its bindings, and a failing one jumps to
+-- the rows after it, which is a join point of its own.
 
 import Turkey.Ast (..)
 import Turkey.Core (..)
@@ -55,16 +59,26 @@ type Matcher = Matcher {
     fresh  : fun(String) -> String,
 }
 
--- One compilation's state: how many jumps there are to each fallthrough.
+-- What an arm does once its patterns have matched.
+type Body
+    -- Returns its value.
+    = Taken(Core)
+    -- Runs its guards and then returns its value. Given the name of a join that
+    -- takes no arguments, returns code that jumps there when a guard fails.
+    | Guarded(fun(String) -> Core)
+
+-- One compilation's state: how many jumps there are to each fallthrough, and
+-- which fallthroughs a guard jumps to.
 type State = State {
-    m     : Matcher,
-    jumps : Map String Int,
+    m       : Matcher,
+    jumps   : Map String Int,
+    guarded : Map String Bool,
 }
 
 -- `match scrutinee { arms }`, of type `ty`, compiled.
-fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
+fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Body), ty : Ty.Type,
             span : Option Span) -> Core {
-    let st = State { m = m, jumps = Map.new() }
+    let st = State { m = m, jumps = Map.new(), guarded = Map.new() }
     let site = Site { ty = ty, span = span }
     -- The scrutinee is evaluated once, and a later run may test it again, so it
     -- is held in a variable unless it is one or nothing reads it twice.
@@ -138,7 +152,7 @@ type Column = Column { name : String, ty : Ty.Type }
 type Row = Row {
     pats  : Array Pat,
     binds : Array (String, Ty.Type, String),
-    body  : Core,
+    body  : Body,
 }
 
 -- What every `match` this emits shares: the type and span of the source one.
@@ -148,18 +162,49 @@ type Site = Site { ty : Ty.Type, span : Option Span }
 -- or reaching a `match` with no arm for the value when there is no `fail`.
 fun matrix(st : State, columns : Vec Column, rows : Array Row,
            fail : Option String, site : Site) -> Core {
-    if len(columns) == 0 { return leafOf(rows[0]) }
+    if len(columns) == 0 { return leaves(st, rows, 0, fail, site) }
     runs(st, columns, runsOf(rows), 0, fail, site)
 }
 
--- The first row, every test passed: its body under the variables it bound.
+-- Returns the code for rows `i` onwards once every test has passed: the first
+-- row's body, then the rows after it if that body is guarded and a guard fails.
+--
+-- A guard fails under its row's bindings, so the rows after it are a join
+-- defined outside them, and `fail` is marked as reached from under bindings.
+-- A guarded row with no row after it falls to `fail`. There is always one:
+-- `Turkey.Exhaustive` counts a guarded arm as covering nothing, so some later
+-- arm handles every value a guard can decline.
+fun leaves(st : State, rows : Array Row, i : Int, fail : Option String,
+           site : Site) -> Core {
+    let row = rows[i]
+    match row.body {
+        Taken(body) -> leafOf(row, body)
+        Guarded(build) -> {
+            if i + 1 == len(rows) {
+                let target = match fail {
+                    Some(f) -> f
+                    None -> oops("a guarded arm with nothing to fall through to")
+                }
+                Map.put(st.jumps, target, Map.getOr(st.jumps, target, 0) + 1)
+                Map.put(st.guarded, target, True)
+                return leafOf(row, build(target))
+            }
+            let next = st.m.fresh("next")
+            let rest = leaves(st, rows, i + 1, fail, site)
+            mkCore(site.ty, site.span, CJoin(next, [], rest, leafOf(row, build(next)), False))
+        }
+    }
+}
+
+-- A row with every test passed: `body` under the variables the row bound.
 --
 -- The bindings are made here and not where each variable was met, so that no
--- jump to a fallthrough is ever under a binding a later arm's body could
--- mention. That is what lets `runs` put a fallthrough with one jump in the
--- jump's place.
-fun leafOf(row : Row) -> Core {
-    var out = row.body
+-- jump to a fallthrough from a pattern test is ever under a binding a later
+-- arm's body could mention. That is what lets `runs` put a fallthrough with
+-- one jump in the jump's place. A guard's jump is under them, which is why
+-- `runs` keeps a fallthrough a guard reaches as a join.
+fun leafOf(row : Row, body : Core) -> Core {
+    var out = body
     for var i = len(row.binds) - 1; i >= 0; i = i - 1 {
         let (name, ty, column) = row.binds[i]
         out = mkCore(out.ty, out.span,
@@ -181,7 +226,11 @@ fun runs(st : State, columns : Vec Column, all : Vec (Vec Row), i : Int,
     let first = run(st, columns, all[i], Some(next), site)
     match Map.getOr(st.jumps, next, 0) {
         0 -> first
-        1 -> replaceJump(first, next, rest)
+        1 -> if Map.contains(st.guarded, next) {
+            mkCore(site.ty, site.span, CJoin(next, [], rest, first, False))
+        } else {
+            replaceJump(first, next, rest)
+        }
         _ -> mkCore(site.ty, site.span, CJoin(next, [], rest, first, False))
     }
 }

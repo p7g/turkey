@@ -11,13 +11,17 @@
 #     connections, and report the functions by their own samples and by
 #     their callees' too. perf samples on the `cpu-clock` timer rather than
 #     a hardware counter, which a virtual machine may not expose;
-#   * count its system calls with `strace -c -f` over 8 s of the same load,
-#     and divide by the requests wrk completed in that time.
+#   * count its system calls with `perf stat` on every `syscalls:sys_enter_*`
+#     tracepoint over 8 s of the same load, and divide by the requests wrk
+#     completed in that time.
 #
-# strace slows the server several times over, so only its counts per
-# request mean anything, not its times. Everything goes to
-# build/bench/http/profile/. Needs perf (`linux-tools`), strace, and sudo to
-# let perf and strace attach.
+# The counts come from tracepoints rather than strace because strace slows
+# the server several times over, and a slow server changes what it calls: a
+# read that would have waited finds its data already there, so the waits,
+# and the polling calls that make them, drop out of the count. The
+# tracepoints cost the server a few percent. Everything goes to
+# build/bench/http/profile/. Needs perf (`linux-tools`) and sudo to let perf
+# attach.
 
 set -eu
 
@@ -64,17 +68,22 @@ for impl in ${*:-turkey go}; do
     perf report -i "$P/$impl.perf.data" --stdio --children --sort symbol --percent-limit 2 -g none \
         > "$P/$impl.perf-children.txt" 2> /dev/null
 
-    wrk -t"$LOAD_THREADS" -c64 -d10s "$url" > "$P/$impl.wrk-strace.txt" &
+    wrk -t"$LOAD_THREADS" -c64 -d10s "$url" > "$P/$impl.wrk-syscalls.txt" &
     load=$!
     sleep 1
-    sudo timeout -s INT 8 strace -c -f -p $SERVER -o "$P/$impl.strace.txt" || true
-    sudo chown "$(id -u)" "$P/$impl.strace.txt"
+    sudo perf stat -x, -e 'syscalls:sys_enter_*' -p $SERVER -o "$P/$impl.syscalls.csv" -- sleep 8
+    sudo chown "$(id -u)" "$P/$impl.syscalls.csv"
     wait $load
-    # wrk ran 10 s, strace watched 8 of them: count the requests in those 8.
-    requests=$(awk '/requests in/ { print int($1 * 0.8) }' "$P/$impl.wrk-strace.txt")
-    echo "requests while traced: about $requests" >> "$P/$impl.strace.txt"
-    awk -v n="$requests" '$NF ~ /^[a-z_0-9]+$/ && $4 ~ /^[0-9]+$/ { printf "%-16s %6.2f per request\n", $NF, $4 / n }' \
-        "$P/$impl.strace.txt" > "$P/$impl.syscalls-per-request.txt"
+    # wrk ran 10 s and perf watched 8 s of the steady middle: take those 8 s
+    # at wrk's average rate.
+    requests=$(awk '/Requests\/sec/ { print int($2 * 8) }' "$P/$impl.wrk-syscalls.txt")
+    awk -F, -v n="$requests" '$1 ~ /^[0-9]+$/ && $1 > 0 {
+            sub(/^syscalls:sys_enter_/, "", $3)
+            total += $1
+            printf "%-16s %6.2f per request\n", $3, $1 / n
+        }
+        END { printf "%-16s %6.2f per request, of about %d requests\n", "total", total / n, n }' \
+        "$P/$impl.syscalls.csv" | sort -k2 -rn > "$P/$impl.syscalls-per-request.txt"
 
     kill $SERVER 2> /dev/null || true
     wait $SERVER 2> /dev/null || true

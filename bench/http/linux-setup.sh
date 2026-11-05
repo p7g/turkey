@@ -5,8 +5,8 @@
 #
 #   sh bench/http/linux-setup.sh
 #
-# It installs, with sudo, Ubuntu's wrk, nginx, OpenSSL, GNU time, strace,
-# perf and Ruby; and as this user Go, Node and a Temurin JDK under
+# It installs, with sudo, Ubuntu's wrk, nginx, OpenSSL, GNU time, perf and
+# Ruby; and as this user Go, Node and a Temurin JDK under
 # ~/toolchains, Rust through rustup, oha through cargo, a Python venv with
 # uvicorn, uvloop, httptools and gunicorn, and Puma. The versions match the
 # ones the CI workflow uses. Then it clones this checkout's current commit
@@ -26,7 +26,7 @@ mkdir -p "$T"
 
 sudo apt-get update -q
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
-    build-essential git curl ca-certificates wrk nginx libssl-dev openssl time strace \
+    build-essential git curl ca-certificates wrk nginx libssl-dev openssl time \
     ruby ruby-dev python3-venv linux-tools-common "linux-tools-$(uname -r)"
 sudo systemctl disable --now nginx || true
 

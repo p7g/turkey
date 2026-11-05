@@ -1,7 +1,7 @@
 -- A small HTTP API: routing by `match` on the method and the path, the
 -- request body taken out of `POST`'s payload, an error type whose
 -- `ToResponse` instance maps each error to a response, and every path
--- ending in `respond`.
+-- ending in `respond`; and a shutdown on SIGTERM.
 --
 --     curl -i localhost:8080/health
 --     curl -i -X POST --data 'two eggs' localhost:8080/orders
@@ -15,9 +15,12 @@ import Net.HTTP.MediaType as MediaType
 import Net.HTTP.Server as Server
 import Net.HTTP.Server (Respond, Done, respond)
 import Net.TCP as TCP
+import Signal
 import System.IO as IO
 import System.Sync as Sync
 import System.Sync (Mutex)
+import System.Task as Task
+import Time.Duration as Duration
 
 -- What can go wrong with a request. Each becomes a response of its own
 -- status. `WrongMethod` holds the methods the path allows.
@@ -74,13 +77,28 @@ fun route(orders : Orders, req : Request Incoming) -> Either APIError ServerResp
 -- Returns the order number in a path `/orders/N`.
 fun orderNumber(path : String) -> Option Int = Int.parse(String.stripPrefix(path, "/orders/")?)
 
+-- Serves until SIGTERM or Ctrl+C, then stops: no new connections, ten
+-- seconds for the requests in flight, then whatever is left is closed.
 fun main() {
     let address = Option.expect(Net.parse("127.0.0.1"), "an address")
+    let signals = match Signal.listen([Signal.Terminate, Signal.Interrupt]) {
+        Right(s) -> s
+        Left(e) -> return print("signals: " + show(e))
+    }
     match TCP.listen(address, 8080) {
         Right(l) -> {
             let orders = Orders { items = Sync.mutex([]) }
             print("listening on 127.0.0.1:8080")
-            Server.serve(l, Server.defaultConfig, fun(req, r) = handle(orders, req, r))
+            Task.runScope(do {
+                let server = Server.start(l, Server.defaultConfig, fun(req, r) = handle(orders, req, r))?
+                let _ = Task.spawn(fun() {
+                    let got = Signal.waitUnbounded(signals)
+                    print("stopping on " + show(got))
+                    Server.stop(server, Duration.seconds(10))
+                })?
+                pure({})
+            })
+            print("stopped")
         }
         Left(e) -> print("listen: " + show(e))
     }

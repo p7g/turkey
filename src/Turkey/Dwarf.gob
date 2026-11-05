@@ -1,0 +1,243 @@
+export (CompileUnit(..), Subprogram(..), sourceFiles, emitUnit)
+
+-- DWARF 5 debug information as stream items (`Turkey.Stream`): the sections
+-- `-g` adds besides the line table, which the assembler builds from the
+-- `.loc` rows.
+--
+-- Items rather than text, so the assembly printer and an object writer read
+-- the same entries, and the bytes one writes can be checked against what the
+-- system assembler makes of the other's.
+--
+-- What is written is one compile unit for the program, which is one object,
+-- and a subprogram for each function in it: its name and its range of
+-- addresses, which is what a debugger needs to name a frame and a profiler to
+-- attribute a sample. On macOS the compile unit is what makes the line table
+-- reachable at all: the linker records an object in the executable's debug
+-- map only if it has one, and a debugger finds an object's DWARF only through
+-- that map.
+--
+-- Every string is a `DW_FORM_strp` offset into `debug_str` and every address
+-- a `DW_FORM_addr`, which needs no `debug_str_offsets` or `debug_addr` table.
+-- The indexed forms would save a relocation per string and address, and cost
+-- two more sections to write and to get right.
+
+import Data.Map as Map
+import Turkey.Asm as Asm
+import Turkey.Asm (Symbol)
+import Turkey.Position as Position
+import Turkey.Stream (Item(..))
+
+-- The program as one compile unit: what made it, its main file and the
+-- directory its relative paths start from, the labels around all of its code,
+-- and its functions.
+type CompileUnit = CompileUnit {
+    producer  : String,
+    name      : String,
+    directory : String,
+    low       : Symbol,
+    high      : Symbol,
+    functions : Vec Subprogram,
+}
+
+-- A function, by the name its frames are shown with and the labels at its
+-- first instruction and after its last.
+type Subprogram = Subprogram { name : String, low : Symbol, high : Symbol }
+
+-- -- encodings ------------------------------------------------------------------
+
+let version = 5
+let compileUnitType = 0x01
+let addressSize = 8
+
+let tagCompileUnit = 0x11
+let tagSubprogram = 0x2e
+
+let childrenNo = 0
+let childrenYes = 1
+
+let atName = 0x03
+let atStmtList = 0x10
+let atLowPc = 0x11
+let atHighPc = 0x12
+let atLanguage = 0x13
+let atCompDir = 0x1b
+let atProducer = 0x25
+let atFrameBase = 0x40
+
+let formAddr = 0x01
+let formData2 = 0x05
+let formData4 = 0x06
+let formStrp = 0x0e
+let formSecOffset = 0x17
+let formExprloc = 0x18
+
+-- C11, because Turkey has no language code of its own. A debugger reads the
+-- code to choose how it parses expressions and shows values; a line table and
+-- a function's name and range do not depend on it, and a code in the vendor
+-- range would leave each debugger to guess. Revisit once there are variables
+-- to show.
+let languageC11 = 0x1d
+
+-- `x29`, the frame record, which a function's frame is addressed from.
+let opReg29 = 0x50 + 29
+
+-- The abbreviation codes, numbered from 1 in the order `abbreviations` writes
+-- them.
+let abbrevCompileUnit = 1
+let abbrevSubprogram = 2
+
+-- -- the line table's files ---------------------------------------------------------
+
+-- The line table's file entries, before any `Loc`: each of `files` by its
+-- number, which is what a position names (`Turkey.Position`), then file 0, the
+-- main file in `directory`. A relative path is relative to `directory`.
+--
+-- File 0 goes last on purpose. The main file also has a number of its own, and LLVM's
+-- assembler gives a file it already holds as file 0 no other number: a
+-- `.file 0` first would leave that number unassigned, and every row in the
+-- main file refused.
+fun sourceFiles(directory : String, main : String, files : Position.Files,
+                out : Vec (Item i)) -> Unit {
+    var n = 1
+    loop {
+        match Position.fileName(files, n) {
+            Some(path) -> Vec.push(out, SourceFile(n, None, path))
+            None -> break
+        }
+        n = n + 1
+    }
+    Vec.push(out, SourceFile(0, Some(directory), main))
+}
+
+-- -- the compile unit ----------------------------------------------------------
+
+-- The labels the sections are addressed by.
+type Labels = Labels {
+    abbrev    : Symbol,
+    strings   : Symbol,
+    line      : Symbol,
+    infoStart : Symbol,
+    infoEnd   : Symbol,
+}
+
+-- The strings the entries name, each once, in the order first named.
+type Strings = Strings { d : Asm.Dialect, index : Map.Map String Int, texts : Vec String }
+
+-- `debug_abbrev`, `debug_info` and `debug_str` for `u`, and the start of
+-- `debug_line`, whose contents the assembler writes after it.
+--
+-- Leaves the current section `debug_line`: whatever follows has to name its
+-- own.
+fun emitUnit(d : Asm.Dialect, u : CompileUnit, out : Vec (Item i)) -> Unit {
+    let labels = Labels {
+        abbrev = Asm.localLabel(d, "debug_abbrev"),
+        strings = Asm.localLabel(d, "debug_str"),
+        line = Asm.localLabel(d, "debug_line"),
+        infoStart = Asm.localLabel(d, "debug_info_start"),
+        infoEnd = Asm.localLabel(d, "debug_info_end"),
+    }
+    let strings = Strings { d = d, index = Map.new(), texts = [] }
+    abbreviations(labels, out)
+    info(labels, strings, u, out)
+    Vec.push(out, Section(Asm.DebugStr))
+    Vec.push(out, Label(labels.strings))
+    for var k = 0; k < len(strings.texts); k = k + 1 {
+        Vec.push(out, Label(stringLabel(d, k)))
+        Vec.push(out, CString(strings.texts[k]))
+    }
+    Vec.push(out, Section(Asm.DebugLine))
+    Vec.push(out, Label(labels.line))
+}
+
+-- One abbreviation for the compile unit and one for every subprogram: the
+-- tag, whether children follow, then each attribute with its form.
+fun abbreviations(labels : Labels, out : Vec (Item i)) -> Unit {
+    Vec.push(out, Section(Asm.DebugAbbrev))
+    Vec.push(out, Label(labels.abbrev))
+    abbreviation(abbrevCompileUnit, tagCompileUnit, childrenYes,
+                 [(atProducer, formStrp), (atLanguage, formData2), (atName, formStrp),
+                  (atCompDir, formStrp), (atStmtList, formSecOffset), (atLowPc, formAddr),
+                  (atHighPc, formAddr)], out)
+    abbreviation(abbrevSubprogram, tagSubprogram, childrenNo,
+                 [(atName, formStrp), (atLowPc, formAddr), (atHighPc, formData4),
+                  (atFrameBase, formExprloc)], out)
+    Vec.push(out, Byte(0))
+}
+
+fun abbreviation(code : Int, tag : Int, children : Int, attributes : Array (Int, Int),
+                 out : Vec (Item i)) -> Unit {
+    Vec.push(out, Uleb(code))
+    Vec.push(out, Uleb(tag))
+    Vec.push(out, Byte(children))
+    for (attribute, form) in attributes {
+        Vec.push(out, Uleb(attribute))
+        Vec.push(out, Uleb(form))
+    }
+    Vec.push(out, Byte(0))
+    Vec.push(out, Byte(0))
+}
+
+-- The unit's header, its compile unit entry, a subprogram entry per function
+-- and the end of the compile unit's children, each entry's attributes in its
+-- abbreviation's order.
+--
+-- A function's high pc is in `DW_FORM_data4`, the length from its low pc,
+-- which the assembler fixes, so only the low pc is relocated. The compile
+-- unit's is an address like its low pc: its range has every function's symbol
+-- inside it, and a Mach-O assembler leaves a distance across a symbol as a
+-- pair of relocations, which debuggers do not apply to an object's DWARF.
+fun info(labels : Labels, strings : Strings, u : CompileUnit, out : Vec (Item i)) -> Unit {
+    Vec.push(out, Section(Asm.DebugInfo))
+    -- The unit's length counts from after the length itself.
+    Vec.push(out, Difference(labels.infoEnd, labels.infoStart))
+    Vec.push(out, Label(labels.infoStart))
+    half(version, out)
+    Vec.push(out, Byte(compileUnitType))
+    Vec.push(out, Byte(addressSize))
+    Vec.push(out, SectionOffset(labels.abbrev, labels.abbrev))
+
+    Vec.push(out, Uleb(abbrevCompileUnit))
+    string(strings, labels, u.producer, out)
+    half(languageC11, out)
+    string(strings, labels, u.name, out)
+    string(strings, labels, u.directory, out)
+    Vec.push(out, SectionOffset(labels.line, labels.line))
+    Vec.push(out, WordOf(u.low))
+    Vec.push(out, WordOf(u.high))
+
+    for f in u.functions {
+        Vec.push(out, Uleb(abbrevSubprogram))
+        string(strings, labels, f.name, out)
+        Vec.push(out, WordOf(f.low))
+        Vec.push(out, Difference(f.high, f.low))
+        -- An expression one operation long.
+        Vec.push(out, Uleb(1))
+        Vec.push(out, Byte(opReg29))
+    }
+    Vec.push(out, Byte(0))
+    Vec.push(out, Label(labels.infoEnd))
+}
+
+-- A `DW_FORM_strp` naming `text`, which `emitUnit` writes into `debug_str`.
+fun string(strings : Strings, labels : Labels, text : String, out : Vec (Item i)) -> Unit {
+    let k = match Map.get(strings.index, text) {
+        Some(k) -> k
+        None -> {
+            let k = len(strings.texts)
+            Map.put(strings.index, text, k)
+            Vec.push(strings.texts, text)
+            k
+        }
+    }
+    Vec.push(out, SectionOffset(stringLabel(strings.d, k), labels.strings))
+}
+
+fun stringLabel(d : Asm.Dialect, k : Int) -> Symbol =
+    Asm.localLabel(d, "debug_str" + Int.toString(k))
+
+-- `n` in two bytes, least significant first, as every DWARF target this
+-- writes for is little-endian.
+fun half(n : Int, out : Vec (Item i)) -> Unit {
+    Vec.push(out, Byte(n & 0xFF))
+    Vec.push(out, Byte((n >> 8) & 0xFF))
+}

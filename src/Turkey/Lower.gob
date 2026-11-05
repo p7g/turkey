@@ -100,7 +100,14 @@ fun moduleOf(name : String) -> String = match String.rsplitOnce(name, "#") {
 -- binder it shadows left behind. Every binder form -- a parameter, a pattern,
 -- a match arm, a `for`, a `let` or a local `fun` -- gets this without a rule of
 -- its own.
+--
+-- A scope holds only what was bound in it, and defers every other binder to
+-- `parent`, so making one costs nothing however much is in scope. A child sees
+-- what its ancestors record after it was made, which cannot change an answer:
+-- a binder is recorded where it is bound, and a mention of it is lowered after
+-- that.
 type Scope = Scope {
+    parent   : Option Scope,
     -- The binders that are held in reference cells, each with the binder of
     -- its cell: a mention of one reads the cell.
     --
@@ -127,17 +134,38 @@ type Scope = Scope {
 }
 
 fun newScope() -> Scope = Scope {
-    cells = Map.new(), binders = Map.new(), ret = None, brk = None, cont = None,
+    parent = None, cells = Map.new(), binders = Map.new(),
+    ret = None, brk = None, cont = None,
 }
 
-fun childScope(s : Scope) -> Scope {
-    let cells = Map.new()
-    for (k, v) in Map.entries(s.cells) { Map.put(cells, k, v) }
-    let binders = Map.new()
-    for (k, v) in Map.entries(s.binders) { Map.put(binders, k, v) }
-    Scope { cells = cells, binders = binders, ret = s.ret, brk = s.brk,
-            cont = s.cont }
+-- Returns a scope nested in `s`, with the same transfer targets. Takes
+-- constant time.
+fun childScope(s : Scope) -> Scope = Scope {
+    parent = Some(s), cells = Map.new(), binders = Map.new(),
+    ret = s.ret, brk = s.brk, cont = s.cont,
 }
+
+-- Returns the cell holding the binder `id`, if one does. Takes time
+-- proportional to the depth of `s`.
+fun cellOf(s : Scope, id : Int) -> Option (String, Int) =
+    match Map.get(s.cells, id) {
+        Some(cell) -> Some(cell)
+        None -> match s.parent {
+            Some(outer) -> cellOf(outer, id)
+            None -> None
+        }
+    }
+
+-- Returns what the local binder `id` abstracts over, or `None` if it is not
+-- a local in scope. Takes time proportional to the depth of `s`.
+fun localBinders(s : Scope, id : Int) -> Option (Vec VarCell) =
+    match Map.get(s.binders, id) {
+        Some(binders) -> Some(binders)
+        None -> match s.parent {
+            Some(outer) -> localBinders(outer, id)
+            None -> None
+        }
+    }
 
 -- -- the lowerer --------------------------------------------------------------------
 
@@ -178,7 +206,8 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
     decls = decls, classes = classes, env = env, types = types, target = target,
     build = build, binders = binders,
     rigid = Map.new(), placeholders = Map.new(), counter = 0,
-    owner = 0, site = Span { file = "", line = 0, col = 0 }, copies = Map.new(),
+    owner = 0, site = Span { file = "", line = 0, col = 0, endLine = 0, endCol = 0 },
+    copies = Map.new(),
 }
 
 -- A binder this pass invents: its spelling, and its id.
@@ -1626,7 +1655,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         Some(x) -> len(x.evidence) == 0 && len(x.typeArgs) == 0
     }
     if plain {
-        match Map.get(scope.cells, id) {
+        match cellOf(scope, id) {
             Some((cell, cellId)) -> return node(result, where,
                 CDeref(node(refOf(result), where, CVar(cell, cellId))))
             None -> {}
@@ -2662,7 +2691,7 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
     match target.kind {
         EVar(name, _) -> {
             let id = binderOf(l, target.id, name, Some(target.span))
-            let (cell, cellId) = Map.getOr(scope.cells, id, (name, id))
+            let (cell, cellId) = Option.unwrapOr(cellOf(scope, id), (name, id))
             node(unit, at, CAssign(
                 node(refOf(value.ty), Some(target.span), CVar(cell, cellId)), value))
         }
@@ -2710,7 +2739,7 @@ fun equationsOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
 -- What the binder `id`, spelled `name`, abstracts over, local bindings
 -- before top-level ones.
 fun bindersOf(l : Lowerer, id : Int, name : String, scope : Scope) -> Vec VarCell =
-    match Map.get(scope.binders, id) {
+    match localBinders(scope, id) {
         Some(local) -> local
         None -> match schemeOf(l, name) {
             Some(s) -> s.quantified

@@ -1,0 +1,125 @@
+export (Payload, text, bytes, file, incoming, stream, replayable, awaitsContinue, open)
+
+-- A request body as the client sends it: whether it can be sent again, and
+-- a function that makes the `Stream` to send each time. The client sends a
+-- `ClientRequest Payload`; the `Body` instances (`Net.HTTP.Body`) make one
+-- with `text`, `bytes`, `file`, `incoming` and `stream`.
+--
+-- **Sent again.** A `String` and a `Buffer` are held, and a `File` is read
+-- from offset 0 by `readAt` each time it is sent, so it never depends on the
+-- file's position: each of these can be sent again. An `Incoming` and a
+-- `Stream` are read as they are written, once, and cannot. The client's
+-- retry and redirect rules send a request again only when its body is
+-- replayable.
+--
+-- **The length** is sent as `Content-Length`: a `String`'s and a `Buffer`'s
+-- size, the size `stat` returns for a `File` when the request is sent, an
+-- `Incoming`'s declared length, and a `Stream`'s own. A body with none goes
+-- chunked. A file that then grows or shrinks while it is written fails the
+-- request (`Overrun` or `Truncated`) rather than sending other bytes than
+-- the length declared.
+
+import Data.Error (promote)
+import Data.Ord (min)
+import Net.HTTP.Error (HTTPError(..), transport)
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.Incoming as Incoming (Incoming)
+import Net.HTTP.Stream as Stream (Stream(..), BodyLength(..), Sink)
+import System.File as File (File, CanRead)
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.ReadWrite (Write(..))
+
+-- `open` is called once per send, before the head is written, and the
+-- stream it returns is sent once.
+type Payload = Payload {
+    replayable     : Bool
+    open           : fun() -> Either HTTPError Stream
+    awaitsContinue : fun() -> Bool
+}
+
+-- Returns whether the body can be sent again.
+fun replayable(p : Payload) -> Bool = p.replayable
+
+-- Returns whether the body is a received one whose sender waits for a
+-- `100 Continue` that reading it will send, so that the request carrying it
+-- should ask its own server for one first.
+fun awaitsContinue(p : Payload) -> Bool = p.awaitsContinue()
+
+-- Returns the stream that sends the body this time, or why there is none: a
+-- file that cannot be measured.
+fun open(p : Payload) -> Either HTTPError Stream = p.open()
+
+fun held(s : Stream) -> Payload = Payload {
+    replayable = True
+    open = fun() = Right(s)
+    awaitsContinue = fun() = False
+}
+
+-- Returns `s`'s UTF-8 bytes as a body.
+fun text(s : String) -> Payload = held(Stream(LengthKnown(String.byteLength(s)), fun(sink) {
+    writeFrom(sink, Buf.bytesOf(s))?
+    Right(Headers.empty)
+}))
+
+-- Returns `b`'s window, as it is now, as a body. The buffer is never
+-- consumed, so a send again sends the same bytes.
+fun bytes(b : Buffer) -> Payload {
+    let from = b.start
+    let to = b.end
+    held(Stream(LengthKnown(to - from), fun(sink) {
+        writeFrom(sink, Buf.view(b, from, to))?
+        Right(Headers.empty)
+    }))
+}
+
+-- Returns `f`'s contents as a body, read from offset 0 each time it is sent.
+fun file[CanRead m](f : File m) -> Payload = Payload {
+    replayable = True
+    open = fun() {
+        let size = transport(File.stat(f))?.size
+        Right(Stream(LengthKnown(size), fun(sink) {
+            copyFile(f, size, sink)?
+            Right(Headers.empty)
+        }))
+    }
+    awaitsContinue = fun() = False
+}
+
+-- Returns a body that arrived, passed on as it is read: the length its
+-- framing declared, if any, the bytes as they come, with no limit of their
+-- own, and its trailers. It can be sent once.
+fun incoming(b : Incoming) -> Payload = Payload {
+    replayable = False
+    open = fun() = Right(Stream.relayed(b))
+    awaitsContinue = fun() = Incoming.awaitsContinue(b)
+}
+
+-- Returns `s` as a body. It can be sent once.
+fun stream(s : Stream) -> Payload =
+    Payload {
+        replayable = False
+        open = fun() = Right(s)
+        awaitsContinue = fun() = False
+    }
+
+-- How much of a file each read takes.
+let chunk = 65536
+
+-- Writes the first `size` bytes of `f`, from offset 0, or as many as it
+-- has; the sink refuses fewer than the `size` its framing declared.
+fun copyFile[CanRead m](f : File m, size : Int, sink : Sink) -> Either SomeError Unit {
+    let into = Buf.buffer(if size > 0 { min(size, chunk) } else { chunk })
+    var offset = 0
+    while offset < size {
+        Buf.clear(into)
+        let want = min(size - offset, Buf.capacity(into))
+        let n = Buf.limited(into, want, fun() = promote(File.readAt(f, offset, into)))?
+        if n == 0 {
+            break
+        }
+        writeFrom(sink, into)?
+        offset = offset + n
+    }
+    Right(())
+}

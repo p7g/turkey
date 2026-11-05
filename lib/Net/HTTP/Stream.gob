@@ -1,4 +1,4 @@
-export (Stream(..), BodyLength(..), Sink, sink, send, length, framing)
+export (Stream(..), BodyLength(..), Sink, sink, send, length, framing, relayed)
 
 -- A body that a program writes as it goes, for a server's response or a
 -- client's request: its length, if it knows it, and a function that writes
@@ -44,8 +44,11 @@ import Net.HTTP.Error (HTTPError(..))
 import Net.HTTP.H1.Head (Framing(..))
 import Net.HTTP.H1.Output (BodyWriter)
 import Net.HTTP.H1.Output as Output
-import Net.HTTP.Headers (Headers)
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.Incoming as Incoming (Incoming)
+import System.IO as IO (CopyError(..))
 import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
 import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.ReadWrite (Write(..))
 
@@ -133,6 +136,25 @@ fun codecError(e : Either HTTPError t, lift : fun(t) -> SomeError) -> SomeError 
     Left(h) -> fail(h)
     Right(t) -> fail(Transport(lift(t)))
 }
+
+-- Returns a stream that passes `b` on as it is read: the length its framing
+-- declared, if any, the bytes as they come, with no limit of their own, and
+-- then the trailers it arrived with. Its function reads `b`, so it can run
+-- once.
+fun relayed(b : Incoming) -> Stream {
+    let length = match Incoming.declaredLength(b) {
+        Some(n) -> LengthKnown(n)
+        None -> LengthUnknown
+    }
+    Stream(length, fun(into) = match IO.copy(Incoming.unbounded(b), into, Buf.buffer(relayChunk)) {
+        Right(_) -> Right(Option.unwrapOr(Incoming.trailers(b), Headers.empty))
+        Left(Reading(e)) -> Left(fail(e))
+        Left(Writing(e)) -> Left(e)
+    })
+}
+
+-- How much of a relayed body each read takes.
+let relayChunk = 65536
 
 -- Runs `s`'s function on `into`, then ends the body with the trailers it
 -- returned, and closes the sink either way. Returns the function's error if

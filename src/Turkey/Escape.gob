@@ -10,7 +10,9 @@ export (run, reach)
 -- * returning it, storing it in a global, a cell, raw memory, or a
 --   field or element *after* construction, passing it to a runtime or foreign
 --   function or through a closure, or converting it to an untraced word;
--- * passing it to a parameter whose summary says it escapes;
+-- * passing it to a parameter whose summary says it escapes, or to a call in
+--   tail position (`L.inTailPosition`) whose callee can call this function
+--   again by direct calls (`directCycles`);
 -- * being held -- as a field, or through a phi -- by something that escapes.
 --
 -- A store after construction is an escape even into an object that does not
@@ -54,6 +56,7 @@ export (run, reach)
 
 import Data.Map as Map
 import Data.Set as Set
+import Turkey.Deps as Deps
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), Callee(..))
 import Turkey.Runtime as Rt
@@ -99,7 +102,13 @@ type Flow = Flow {
 fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     let byName = Map.new()
     for var k = 0; k < len(functions); k = k + 1 { Map.put(byName, functions[k].name, k) }
-    let graphs = Array.map(functions, graphOf)
+    let cycles = directCycles(functions)
+    let repeats = fun(caller : String, callee : String) -> Bool =
+        match (Map.get(cycles, caller), Map.get(cycles, callee)) {
+            (Some(a), Some(b)) -> a == b
+            _ -> False
+        }
+    let graphs = Array.map(functions, graphOf(_, repeats))
     let summaries = Array.map(functions, fun(f) = Summary {
         self = Array.filled(len(f.params), False),
         contents = Array.filled(len(f.params), False),
@@ -167,7 +176,46 @@ fun grow(s : Summary, f : Ssa.Func Low, escapes : Array Bool,
 
 -- -- the graph --------------------------------------------------------------------
 
-fun graphOf(f : Ssa.Func Low) -> Graph {
+-- Each function in a cycle of direct calls, with a number for its cycle: two
+-- functions with the same number can each call the other again.
+--
+-- A call through a closure is no edge. What a closure call passes escapes
+-- anyway, so only a direct call is ever passed a frame object; but a cycle can
+-- still close through one, as a visitor's does -- `anyKid(e, someJump(_, ..))`
+-- passes a closure it built for the callee to call back. Such a cycle keeps a
+-- frame per round where what it passes lives in the frame, and is as deep as
+-- the data it walks. Counting it would move those closures to the heap, which
+-- cost the self-compile a third more allocations.
+fun directCycles(functions : Array (Ssa.Func Low)) -> Map String Int {
+    let graph = Map.new()
+    for f in functions {
+        let callees = Set.new()
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Direct(name), _) -> Set.add(callees, name)
+                    _ -> {}
+                }
+            }
+        }
+        Map.put(graph, f.name, callees)
+    }
+    let out = Map.new()
+    var number = 0
+    for component in Deps.sccs(graph) {
+        let looped = len(component) > 1 || match Map.get(graph, component[0]) {
+            Some(callees) -> Set.contains(callees, component[0])
+            None -> False
+        }
+        if looped {
+            for name in component { Map.put(out, name, number) }
+            number = number + 1
+        }
+    }
+    out
+}
+
+fun graphOf(f : Ssa.Func Low, repeats : fun(String, String) -> Bool) -> Graph {
     let n = len(f.reps)
     let g = Graph {
         sources = Array.init(n, fun(_) = []),
@@ -239,8 +287,20 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
                     None -> {}
                 }
                 ClosureCapture(_, _, v) -> sink(v)
-                Call(Direct(name), args) ->
+                -- A tail call's frame is gone while its callee runs, so a
+                -- frame object passed to it makes it an ordinary call
+                -- (`Turkey.Select.isTailCall`). That costs one frame once,
+                -- unless the callee can call this function again: then the
+                -- calls can go round without bound, and only tail calls keep
+                -- the stack from growing with them, so what such a call
+                -- passes escapes whatever the callee's summary says
+                -- (`directCycles` says which cycles count).
+                Call(Direct(name), args) -> if L.inTailPosition(f, b, at)
+                                               && repeats(f.name, name) {
+                    for a in args { sink(a) }
+                } else {
                     Vec.push(g.calls, (name, Array.map(args, Ssa.valueId)))
+                }
                 -- The closure called is not among the arguments: see the
                 -- header.
                 Call(_, args) -> for a in args { sink(a) }

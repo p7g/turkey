@@ -334,6 +334,11 @@ fun instruction(c : Checker, op : Arm) -> Unit {
             wantInt(c, target, W64, "an indirect call's target")
             call(c, "an indirect callee", None)
         }
+        TailB(sym) -> tailCall(c, Asm.spell(sym), Map.get(c.sigs, Asm.spell(sym)))
+        TailBr(target) -> {
+            wantInt(c, target, W64, "an indirect tail call's target")
+            tailCall(c, "an indirect callee", None)
+        }
         SafepointMap(_, _) -> {}
         Poll(_, _) -> {}
         -- A call whose arguments are constants the emitter writes itself, so
@@ -357,6 +362,7 @@ fun instruction(c : Checker, op : Arm) -> Unit {
         }
         Ret -> {}
         B(_) -> {}
+        Br(target) -> wantInt(c, target, W64, "a branch's target")
         BCond(_, _) -> {}
         Cbz(a, _, w) -> wantInt(c, a, w, "a tested register")
         Cbnz(a, _, w) -> wantInt(c, a, w, "a tested register")
@@ -562,6 +568,46 @@ fun call(c : Checker, sym : String, sig : Option Signature) -> Unit {
     c.moved = Map.new()
     c.stacked = Map.new()
 }
+
+-- A tail call passes its arguments as a call does, and none on the stack,
+-- whose outgoing area goes with this frame. Its callee answers this
+-- function's caller, so it must answer what this function does, in the same
+-- registers.
+fun tailCall(c : Checker, sym : String, sig : Option Signature) -> Unit {
+    if Option.isNone(c.listed) {
+        complain(c, "a tail call with no argument list before it")
+    }
+    if len(Map.keys(c.stacked)) > 0 {
+        complain(c, "a tail call to " + sym + " passes arguments on the stack")
+    }
+    match sig {
+        Some(Returns(params, results)) -> {
+            arguments(c, sym, params)
+            if !sameReps(results, c.f.results) {
+                complain(c, "tail-calls " + sym + ", which answers "
+                            + showReps(results) + ", from a function that answers "
+                            + showReps(c.f.results))
+            }
+        }
+        Some(Void) -> complain(c, "tail-calls " + sym + ", which returns void")
+        None -> {}
+    }
+    c.called = None
+    c.listed = None
+    c.moved = Map.new()
+    c.stacked = Map.new()
+}
+
+fun sameReps(xs : Array Rep, ys : Array Rep) -> Bool {
+    if len(xs) != len(ys) { return False }
+    for var k = 0; k < len(xs); k = k + 1 {
+        if xs[k] != ys[k] { return False }
+    }
+    True
+}
+
+fun showReps(reps : Array Rep) -> String =
+    "(" + String.join(Array.map(reps, show), ", ") + ")"
 
 -- Each parameter against the register or stack slot the convention puts it
 -- in. The files are numbered separately, and past eight in a file a parameter

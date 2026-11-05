@@ -993,13 +993,13 @@ fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 
 -- -- the module's data -------------------------------------------------------
 
--- What a function is not: the bytes behind each string literal, the storage
--- behind each global, and the permanent root array that holds both the traced
--- globals and the literals' cached `TurkeyString`s.
+-- What a function is not: the static object behind each string literal, the
+-- storage behind each global, and the permanent root array that holds the
+-- traced globals.
 --
 -- Every name and every slot here was decided by `Turkey.Asm` before selection
--- ran, which is what lets `ConstString` be a load of slot *n* emitted long
--- before anything defined slot *n*.
+-- ran, which is what lets `ConstString` name literal *n* long before anything
+-- defined it.
 fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> Unit {
     let b = code(out)
     emitLiterals(asm, b)
@@ -1048,9 +1048,14 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> U
     emit(b, Space(Rt.processStateBytes))
 }
 
--- Each literal's bytes, and nothing else. The `TurkeyString` is built once by
--- the entry sequence and cached in the root array, so what the data section
--- holds is the *input* to `turkey_string_new`.
+-- Each literal as a static object: a byte array laid out as
+-- `turkey_string_new` lays one out -- header, length, bytes -- so that a
+-- `String` a literal reads as is the same as one built at run time. They are
+-- contiguous, between `Asm.staticStart` and `Asm.staticEnd`, which is the
+-- range the entry sequence registers with the collector.
+--
+-- In writable data rather than read-only: an `Array Byte` can be cast from a
+-- `String`, and a write through it would fault in read-only memory.
 --
 -- Not the section the panic messages go in, where a format has one of its own
 -- for NUL-terminated C strings: and a Turkey string is bytes and a length: it may
@@ -1058,12 +1063,19 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> U
 fun emitLiterals(asm : Asm.Asm, b : Code) -> Unit {
     let ordered = byIndex(asm.literals)
     if len(ordered) == 0 { return }
-    emit(b, Section(Asm.Constants))
+    emit(b, Section(Asm.Data))
+    emit(b, Align(3))
+    emit(b, Label(Asm.staticStart(asm.dialect)))
+    let header = Rt.staticHeaderWord(Rt.arrayKind, Rt.layoutCode(Ssa.untraced(I8)), 0)
     for var i = 0; i < len(ordered); i = i + 1 {
         emit(b, Align(3))
         emit(b, Label(Asm.literalName(asm.dialect, i)))
+        emit(b, Word(header))
+        emit(b, Word(byteLength(ordered[i])))
         emit(b, Bytes(ordered[i]))
     }
+    emit(b, Align(3))
+    emit(b, Label(Asm.staticEnd(asm.dialect)))
 }
 
 -- A `text -> index` interning table as an array in index order.
@@ -1202,9 +1214,8 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     call(b, d, "turkey_entry_stack_set")
 
     -- The permanent frame, before anything allocates. It is never left: every
-    -- global and every literal is live for the whole run, so the mask is all
-    -- ones and this frame sits at the bottom of the chain until the process
-    -- exits.
+    -- traced global is live for the whole run, so the mask is all ones and
+    -- this frame sits at the bottom of the chain until the process exits.
     symbolInto(b, A.x0, Asm.globalsFrame(d))
     symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
     instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
@@ -1216,22 +1227,18 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     instruction(b, A.MovN(Physical(Gp, 1), 0))
     instruction(b, A.Str(Physical(Gp, 1), Offset(A.x0, 32), A.W64))
 
-    -- The frame table, before anything allocates: the first collection may
-    -- happen inside the first `turkey_string_new` below, and a collection that
-    -- cannot read the table sees no frame's roots at all.
+    -- The frame table, before anything allocates: a collection that cannot
+    -- read the table sees no frame's roots at all.
     symbolInto(b, A.x0, Asm.frameTableSymbol(d))
     call(b, d, "turkey_frame_table_register")
 
-    -- Each literal's `TurkeyString`, built once and cached in its slot. This
-    -- is what makes `ConstString` a load rather than an allocation, and what
-    -- makes it not a safepoint.
-    let ordered = byIndex(asm.literals)
-    for var i = 0; i < len(ordered); i = i + 1 {
-        symbolInto(b, A.x0, Asm.literalName(d, i))
-        instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
-        call(b, d, "turkey_string_new")
-        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
-        storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
+    -- The literals' static objects, before any code that can read one runs.
+    -- After early initialization, which sets the collector's range to empty;
+    -- giblet code uses no literal.
+    if len(asm.literals) > 0 {
+        symbolInto(b, A.x0, Asm.staticStart(d))
+        symbolInto(b, Physical(Gp, 1), Asm.staticEnd(d))
+        call(b, d, "turkey_static_register")
     }
 
     instruction(b, A.Bl(Asm.symbolFor(d, m.initial), A.Standard))

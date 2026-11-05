@@ -268,6 +268,11 @@ fun rememberedCapacitySet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 3
 var frameEntries : Ptr = Ptr.null()
 var frameEntryCount : Int = 0
 
+-- The program's static objects: the address of the first, and the bytes from
+-- it to the end of the last. Empty until the entry sequence registers them.
+var staticStart : Int = 0
+var staticBytes : Int = 0
+
 -- GC stress: a collection at every allocation, or with TURKEY_GC_STRESS=N
 -- for N above 1, at random intervals averaging N allocations -- each gap
 -- uniform in 1..2N-1, so that no allocation site is always skipped. The
@@ -1026,6 +1031,30 @@ foreign "turkey_roots_head" fun rootsHead() -> Ptr = roots
 -- A frame whose return address is in no table has no roots, and is skipped. A
 -- binary that registers no table walks no frames.
 
+-- -- static objects -----------------------------------------------------------------
+--
+-- A static object is laid out as the allocator lays out a heap object, but the
+-- linker places it, in the program's data, between `start` and `end`. The
+-- collector never marks, frees or traces one: it holds only immediates and
+-- other static objects, so nothing reachable only through it needs keeping.
+-- Its generation is `old`, so the write barrier never remembers an object for
+-- holding one.
+--
+-- The range is registered at run time rather than named as a linker symbol
+-- here, because this module is compiled by every compiler, the committed
+-- bootstrap among them, and a binary whose emitter predates static objects
+-- must still link. Such a binary never registers, and its range stays empty.
+-- The entry sequence registers before any code that can hold a static object
+-- runs.
+foreign "turkey_static_register" fun staticRegister(start : Ptr, end : Ptr) -> Unit {
+    staticStart = Ptr.toInt(start)
+    staticBytes = Int.subWrapping(Ptr.toInt(end), staticStart)
+}
+
+-- Whether `value` is a static object. One unsigned comparison, which touches
+-- no memory but this module's two words.
+fun isStatic(value : Ptr) -> Bool = below(Int.subWrapping(Ptr.toInt(value), staticStart), staticBytes)
+
 -- The emitter writes a flat array -- count, then {return address, n, n
 -- offsets} -- because it cannot sort by an address the linker has not
 -- assigned yet. Sorting it once here is what makes the lookup a binary search.
@@ -1224,7 +1253,7 @@ fun immediate(value : Ptr) -> Bool = below(Ptr.toInt(value), immediates)
 -- yet marked, and push it on the running worker's stack. `what` null means a
 -- root the caller cannot name.
 fun markGrey(value : Ptr, what : Ptr, index : Int) -> Unit {
-    if immediate(value) { return {} }
+    if immediate(value) || isStatic(value) { return {} }
     -- Exact roots and object descriptors make the header O(1) to find in normal
     -- execution. GC stress checks membership, and it earns the cost: a pointer
     -- that is not in the heap means a root was missed or a descriptor is
@@ -1373,6 +1402,9 @@ fun drain() -> Unit {
     var capacity : Int = Ptr.load(m, 16)
     var top : Int = Ptr.load(m, 8)
     let shared = sharing
+    -- `isStatic`'s range, read once rather than once per field.
+    let staticFrom = staticStart
+    let staticSize = staticBytes
     var countdown = shareEvery
     while top > 0 {
         if shared {
@@ -1424,6 +1456,7 @@ fun drain() -> Unit {
         while field < end {
             let child : Ptr = Ptr.load(object, plus(first, times8(field)))
             if immediate(child) {
+            } else if below(Int.subWrapping(Ptr.toInt(child), staticFrom), staticSize) {
             } else if stress && Ptr.isNull(findObject(child)) {
                 notHeapPointer(child, fieldName(kind), field)
             } else {
@@ -2383,6 +2416,8 @@ fun snapshot() -> Ptr {
     Ptr.store(state, Check.stateGenerational, if generational { 1 } else { 0 })
     Ptr.store(state, Check.stateRemembered, remembered())
     Ptr.store(state, Check.stateRememberedCount, rememberedCount())
+    Ptr.store(state, Check.stateStaticStart, staticStart)
+    Ptr.store(state, Check.stateStaticBytes, staticBytes)
     state
 }
 

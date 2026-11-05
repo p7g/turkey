@@ -3,7 +3,7 @@ export (
     stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
     stateSizesKept, stateFrameEntries, stateFrameEntryCount, stateStacks,
     stateRoots, stateGenerational, stateRemembered, stateRememberedCount,
-    stateRunning, stateSpare, stateSpareCount,
+    stateRunning, stateSpare, stateSpareCount, stateStaticStart, stateStaticBytes,
 )
 
 -- The heap verifier: in a program compiled with `--gc-verify`, the collector
@@ -80,10 +80,11 @@ import Turkey.Ptr as Ptr
 -- and its length, the list of stacks, the innermost shadow-stack frame,
 -- whether the program runs the write barrier (and so whether an old object
 -- holding a young one must be remembered), the remembered objects and their
--- count, the stack the mutator is running on, and the spare regions and
--- their count.
+-- count, the stack the mutator is running on, the spare regions and their
+-- count, and the static objects' range: its first address and its length in
+-- bytes.
 
-let stateBytes : Int = 144
+let stateBytes : Int = 160
 let stateRegions : Int = 0
 let stateAvailable : Int = 8
 let stateRegionTable : Int = 16
@@ -102,6 +103,8 @@ let stateRememberedCount : Int = 112
 let stateRunning : Int = 120
 let stateSpare : Int = 128
 let stateSpareCount : Int = 136
+let stateStaticStart : Int = 144
+let stateStaticBytes : Int = 152
 
 -- -- the heap's format ----------------------------------------------------------------
 
@@ -295,6 +298,12 @@ fun begin(when : Phase, handed : Ptr) -> Bool {
 }
 
 fun stateWord(offset : Int) -> Int = Ptr.load(state, offset)
+
+-- Whether `value` is in the static objects' range. A static object is laid
+-- out by the linker, outside every region, and holds only immediates and other
+-- static objects, so a pointer to one is valid and leads nowhere to check.
+fun inStatic(value : Int) -> Bool =
+    below(Int.subWrapping(value, stateWord(stateStaticStart)), stateWord(stateStaticBytes))
 
 -- -- the diagnostic -------------------------------------------------------------------
 
@@ -813,14 +822,14 @@ fun checkObject(r : Int, slot : Int, h : Int, slotSize : Int) -> Bool {
 -- 32-bit word, or a word for every other code.
 fun elementWidth(code : Int) -> Int = if code == 2 { 1 } else if code == 3 { 4 } else { 8 }
 
--- `value`, found at slot `at` of `owner`, is an immediate or an allocated
+-- `value`, found at slot `at` of `owner`, is an immediate, a static object or an allocated
 -- object; if `marked`, that object is marked too.
 --
 -- An immediate is a word below the first page's end: null, or a compact sum's
 -- nullary constructor, which generated code stores in traced slots as a small
 -- integer. The collector skips the same range.
 fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
-    if below(value, immediates) { return True }
+    if below(value, immediates) || inStatic(value) { return True }
     let r = regionAt(value)
     if r == 0 || below(value, r + regionData) {
         return fail(Prim.cString("invalid traced pointer"), owner, at)
@@ -845,7 +854,7 @@ fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
 -- `value`, a pointer `checkPointer` has accepted, found at slot `at` of an old
 -- object that is not remembered, is not a young object.
 fun notYoung(value : Int, owner : Int, at : Int) -> Bool {
-    if below(value, immediates) { return True }
+    if below(value, immediates) || inStatic(value) { return True }
     if generationOf(value) != young { return True }
     fail(Prim.cString("old object holds a young one and is not remembered"), owner, at)
 }

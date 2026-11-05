@@ -29,6 +29,7 @@ export (
 import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Source (Span)
+import Turkey.Types as Ty
 
 -- What a binder is to the program.
 type Kind
@@ -53,6 +54,10 @@ type Origin
     | Builtin
     -- A copy of the binder with this id, whose span and mutability it takes.
     | CopyOf(Int)
+    -- A copy of a polymorphic binding at these type arguments, made by a pass
+    -- that specializes. The binding is the one with the id, if it has one;
+    -- the span is the binding's.
+    | Specialized(Option Int, Array Ty.Type, Option Span)
 
 type Binder = Binder {
     -- The source spelling, unqualified, or a hint for one the compiler made.
@@ -64,6 +69,9 @@ type Binder = Binder {
     span       : Option Span,
     -- For a copy, the id it was copied from.
     origin     : Option Int,
+    -- For a specialization, the type arguments it was made at; empty for any
+    -- other binder.
+    typeArguments : Array Ty.Type,
 }
 
 type Owner = Owner {
@@ -109,14 +117,15 @@ fun owner(t : Table, moduleName : String, hint : String) -> Int {
 fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
           origin : Origin) -> Int {
     let o = t.owners[ownerId]
-    let (span, mutable, from) = match origin {
-        Written(where, isVar) -> (Some(where), isVar, None)
-        Generated(where) -> (Some(where), False, None)
-        Builtin -> (None, False, None)
+    let (span, mutable, from, args) = match origin {
+        Written(where, isVar) -> (Some(where), isVar, None, [])
+        Generated(where) -> (Some(where), False, None, [])
+        Builtin -> (None, False, None, [])
         CopyOf(id) -> {
             let b = binderAt(t, id)
-            (b.span, b.mutable, Some(id))
+            (b.span, b.mutable, Some(id), [])
         }
+        Specialized(id, types, where) -> (where, False, id, types)
     }
     let local = len(o.binders)
     if local >= localLimit {
@@ -125,7 +134,7 @@ fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
     }
     Vec.push(o.binders, Binder {
         name = hint, kind = kind, moduleName = o.moduleName, mutable = mutable,
-        span = span, origin = from,
+        span = span, origin = from, typeArguments = args,
     })
     Int.shl(ownerId, localBits) + local
 }

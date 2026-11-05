@@ -70,6 +70,8 @@ import Turkey.Ast (Opening(..), Lit(..))
 import Turkey.Core (Core(..), CoreKind(..), CAlt(..), CBind(..), CProgram(..),
                     CParam(..), Alt(..), Mapper(..), mapKind, namesOf, openingOf,
                     abstractionBinders, isDictionary, dictClass)
+import Turkey.Binders as Binders
+import Turkey.Binders (Origin(..))
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Coretc as Coretc
@@ -850,6 +852,8 @@ fun freeAtomsInto(ty : Ty.Type, bound : Set.Set Int,
 -- -- the pass -----------------------------------------------------------------------
 
 type Sharer = Sharer {
+    -- Where each local copy is minted: see `requestLocal`.
+    table   : Binders.Table,
     decls   : DeclTable,
     classes : ClassTable,
     binds   : Map String CBind,
@@ -887,7 +891,10 @@ type Keys = Map String (Map String (Map String (Vec Layout)))
 -- the arms' patterns. A local copy's atoms go into every map on the chain: into
 -- the first so the backend sees them, and into the rest so the rewrite does.
 --
--- `locals` are the generalized bindings in scope, innermost last.
+-- `locals` are the generalized bindings in scope, innermost last, each under
+-- its `localKey`. Scoped, unlike `Turkey.Mono`'s, because `Turkey.Opt` has run:
+-- an inlined copy keeps the ids of what it copied, so one id may be bound
+-- inside another binding of itself.
 type Scope = Scope {
     owner  : String,
     chain  : Array (Map String Layout),
@@ -897,18 +904,25 @@ type Scope = Scope {
 -- A generalized binding inside a body, and its copies.
 type Local = Local {
     name      : String,
+    id        : Int,
     ty        : Ty.Type,
     value     : Core,
     binders   : Vec VarCell,
     atoms     : Vec Ty.Type,
     -- A copy's original, for the fields `CLetRec` keeps on a binding.
     bind      : Option CBind,
-    -- key -> the copy's name.
-    done      : Map String String,
-    -- The copies requested and not yet built: name, renaming, fresh binders.
-    var queue : Vec (String, Map Int Ty.Type, Vec VarCell),
-    built     : Vec (String, Ty.Type, Core, Vec VarCell, Map Int Ty.Type),
+    -- key -> the copy's spelling and id.
+    done      : Map String (String, Int),
+    -- The copies requested and not yet built: spelling, id, renaming, fresh
+    -- binders.
+    var queue : Vec (String, Int, Map Int Ty.Type, Vec VarCell),
+    built     : Vec (String, Int, Ty.Type, Core, Vec VarCell, Map Int Ty.Type),
 }
+
+-- What a local is found under in a scope: its id and its spelling together.
+-- After `Turkey.Opt` that pair is a binder's identity, and a binder with no id
+-- has only its spelling.
+fun localKey(name : String, id : Int) -> String = Int.toString(id) + ":" + name
 
 fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
 
@@ -932,8 +946,8 @@ fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
 -- dictionaries were not built with: a dictionary's fields are decided before
 -- the calls that read them are found, and a keyed field's body can make calls
 -- of its own. The keys only grow, and there are finitely many.
-fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
-          main : String) -> CProgram {
+fun share(program : CProgram, table : Binders.Table, decls : DeclTable,
+          classes : ClassTable, main : String) -> CProgram {
     -- Computed here, before `unknownLayouts` and the backend ask for layouts in
     -- parallel, since these are cached in `decls`.
     for (name, fd) in Map.entries(Decls.flatCandidates(decls)) {
@@ -951,7 +965,8 @@ fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
     loop {
         publish(classes, keys)
         loop {
-            let (out, asked) = shareOnce(program, decls, classes, main, packed, keys)
+            let (out, asked) = shareOnce(program, table, decls, classes, main, packed,
+                                         keys)
             -- A program that opens nothing has no table to fill: skip the walk.
             if len(Map.keys(packed)) > 0 && mergePacked(packed, packedLayouts(out, decls, packed)) {
                 continue
@@ -1099,8 +1114,8 @@ fun opensInto(e : Core, found : Set.Set String) -> Unit {
     }))
 }
 
-fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
-              main : String, packed : Packed,
+fun shareOnce(program : CProgram, table : Binders.Table, decls : DeclTable,
+              classes : ClassTable, main : String, packed : Packed,
               keys : Keys) -> (CProgram, Keys) {
     let binds = Map.new()
     let generic = Set.new()
@@ -1118,7 +1133,7 @@ fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
     let used = Set.new()
     for (name, _) in Map.entries(binds) { Set.add(used, name) }
     let s = Sharer {
-        decls = decls, classes = classes, binds = binds, generic = generic,
+        table = table, decls = decls, classes = classes, binds = binds, generic = generic,
         atoms = closeAtoms(binds, generic, fams), fams = fams, packed = packed,
         done = Map.new(), made = Map.new(), queue = Vec.new(8), used = used,
         keys = keys, asked = Map.new(),
@@ -1275,10 +1290,12 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
             CSlot(target, index) -> if len(args) > 0 && isDictionary(target.ty) {
                 return dynamicCall(s, e, fn, target, index, args, sc)
             }
-            CVar(n, id) -> match localNamed(sc, n) {
-                Some(local) -> return mkCore(e.ty, e.span, CTyApp(
-                    mkCore(fn.ty, fn.span, CVar(requestLocal(s, sc, local, args, e), id)),
-                    args))
+            CVar(n, id) -> match localNamed(sc, n, id) {
+                Some(local) -> {
+                    let (made, madeId) = requestLocal(s, sc, local, args, e)
+                    return mkCore(e.ty, e.span, CTyApp(
+                        mkCore(fn.ty, fn.span, CVar(made, madeId)), args))
+                }
                 None -> if Set.contains(s.generic, n) {
                     return mkCore(e.ty, e.span, CTyApp(
                         mkCore(fn.ty, fn.span, CVar(requestAt(s, sc, n, args, e), id)),
@@ -1610,9 +1627,10 @@ fun spineBinders(value : Core) -> Vec VarCell {
     out
 }
 
-fun localNamed(sc : Scope, name : String) -> Option Local {
+fun localNamed(sc : Scope, name : String, id : Int) -> Option Local {
+    let key = localKey(name, id)
     for var i = len(sc.locals) - 1; i >= 0; i = i - 1 {
-        match Map.get(sc.locals[i], name) {
+        match Map.get(sc.locals[i], key) {
             Some(found) -> return Some(found)
             None -> {}
         }
@@ -1636,20 +1654,26 @@ fun visibleIn(s : Sharer, sc : Scope) -> Set.Set Int {
     out
 }
 
-fun newLocal(s : Sharer, sc : Scope, name : String, ty : Ty.Type, value : Core,
-             binders : Vec VarCell, bind : Option CBind) -> Local = Local {
-    name = name, ty = ty, value = value, binders = binders,
+fun newLocal(s : Sharer, sc : Scope, name : String, id : Int, ty : Ty.Type,
+             value : Core, binders : Vec VarCell, bind : Option CBind) -> Local = Local {
+    name = name, id = id, ty = ty, value = value, binders = binders,
     atoms = atomsOf(ty, value, binders, visibleIn(s, sc), []),
     bind = bind, done = Map.new(), queue = Vec.new(2), built = Vec.new(2),
 }
 
--- The copy of a local binding a use at `args` means.
+-- The copy of a local binding a use at `args` means, as its spelling and id.
 --
 -- A local copy is the local binding with fresh binders, so that its atoms can go
 -- into the owner's one layouts map beside every other copy's: two copies of one
 -- local at two layouts are two sets of variables, not one set at two layouts.
+--
+-- The copy is a binder of its own, minted into the local's owner; this pass
+-- runs on one thread, so the order it mints in is the program's. A local with
+-- no id has copies with none. The spelling is the local's and the layout key,
+-- which tells one local's copies apart; two locals sharing a spelling have
+-- copies sharing one, scoped as the locals are.
 fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
-                 at : Core) -> String {
+                 at : Core) -> (String, Int) {
     if len(args) != len(local.binders) {
         oopsAt("a type application of the local '" + local.name + "' to "
                + Int.toString(len(args)) + " types, where it binds "
@@ -1667,6 +1691,10 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
         None -> {}
     }
     let made = local.name + "@[" + k + "]"
+    let madeId = if local.id == noId { noId } else {
+        Binders.fresh(s.table, Binders.ownerOf(local.id), made, Binders.Local,
+                      Specialized(Some(local.id), args, at.span))
+    }
     let renaming = Map.new()
     let fresh = Vec.new(len(local.binders))
     for v in local.binders {
@@ -1678,9 +1706,9 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
         let key = Ty.typeKey(Decls.substitute(local.atoms[i], renaming))
         for layouts in sc.chain { Map.put(layouts, key, parts[i]) }
     }
-    Map.put(local.done, k, made)
-    Vec.push(local.queue, (made, renaming, fresh))
-    made
+    Map.put(local.done, k, (made, madeId))
+    Vec.push(local.queue, (made, madeId, renaming, fresh))
+    (made, madeId)
 }
 
 -- Build every copy requested of these locals, including the ones requested
@@ -1694,10 +1722,10 @@ fun drainLocals(s : Sharer, locals : Vec Local, sc : Scope) -> Unit {
                 going = True
                 let batch = local.queue
                 local.queue = Vec.new(2)
-                for (made, renaming, fresh) in batch {
+                for (made, madeId, renaming, fresh) in batch {
                     let value = rewrite(s, renamedSpine(
                         Opt.instantiateTypes(local.value, renaming), renaming), sc)
-                    Vec.push(local.built, (made, Decls.substitute(local.ty, renaming),
+                    Vec.push(local.built, (made, madeId, Decls.substitute(local.ty, renaming),
                                              value, fresh, renaming))
                 }
             }
@@ -1715,8 +1743,8 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
     for b in binds {
         let binders = abstractionBinders(b)
         if len(binders) > 0 {
-            let local = newLocal(s, sc, b.name, b.ty, b.value, binders, Some(b))
-            Map.put(scope, b.name, local)
+            let local = newLocal(s, sc, b.name, b.id, b.ty, b.value, binders, Some(b))
+            Map.put(scope, localKey(b.name, b.id), local)
             Vec.push(locals, local)
         }
     }
@@ -1734,7 +1762,7 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
             Some(b) -> b
             None -> continue
         }
-        for (made, ty, value, fresh, renaming) in local.built {
+        for (made, madeId, ty, value, fresh, renaming) in local.built {
             -- The original states its binders in `binders`, on the spine, or
             -- both; the copy states them where it did, renamed.
             let own = Vec.new(len(original.binders))
@@ -1745,7 +1773,7 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
                 }
             }
             let copy = CBind {
-                name = made, id = original.id, ty = ty, binders = own, value = value,
+                name = made, id = madeId, ty = ty, binders = own, value = value,
                 span = original.span, mutable = original.mutable,
                 module_ = original.module_,
                 equations = Vec.map(original.equations, fun(pair) = {
@@ -1766,9 +1794,9 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
 fun localLet(s : Sharer, e : Core, name : String, id : Int, bound : Ty.Type, value : Core,
              body : Core, stated : Vec VarCell, binders : Vec VarCell,
              sc : Scope) -> Core {
-    let local = newLocal(s, sc, name, bound, value, binders, None)
+    let local = newLocal(s, sc, name, id, bound, value, binders, None)
     let scope = Map.new()
-    Map.put(scope, name, local)
+    Map.put(scope, localKey(name, id), local)
     Vec.push(sc.locals, scope)
     let rest = rewrite(s, body, sc)
     discard(Vec.pop(sc.locals))
@@ -1777,7 +1805,7 @@ fun localLet(s : Sharer, e : Core, name : String, id : Int, bound : Ty.Type, val
     drainLocals(s, [local], sc)
     var out = rest
     for var i = len(local.built) - 1; i >= 0; i = i - 1 {
-        let (made, ty, v, _, renaming) = local.built[i]
+        let (made, madeId, ty, v, _, renaming) = local.built[i]
         let own = Vec.new(len(stated))
         for b in stated {
             match Map.get(renaming, b.id) {
@@ -1785,7 +1813,7 @@ fun localLet(s : Sharer, e : Core, name : String, id : Int, bound : Ty.Type, val
                 _ -> Vec.push(own, b)
             }
         }
-        out = mkCore(e.ty, e.span, CLet(made, id, ty, v, out, own))
+        out = mkCore(e.ty, e.span, CLet(made, madeId, ty, v, out, own))
     }
     out
 }

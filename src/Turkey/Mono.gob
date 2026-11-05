@@ -44,6 +44,8 @@ export (
 import System.Parallel as Parallel
 import Data.Set as Set
 import Turkey.Ast (..)
+import Turkey.Binders as Binders
+import Turkey.Binders (Origin(..))
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Core (..)
@@ -60,7 +62,7 @@ import Turkey.Source (Span(..))
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), TVar, TCon, TApp, TFam, TFun,
-                     TTuple)
+                     TTuple, TSet, TBottom)
 
 -- How large a type argument may be. A cheap early refusal: a request this
 -- large is almost certainly an unrolling that the tests below would refuse
@@ -118,23 +120,32 @@ fun typeSize(t : Ty.Type) -> Int = match Ty.prune(t) {
     _ -> 1
 }
 
--- A type, as a fragment of a name.
+-- A ground type, as a fragment of a name.
 --
--- Readability is the whole requirement -- `Main#squash@Int` should be findable
--- in a dump by someone who knows what they are looking for -- and *not*
--- uniqueness, which `fresh` provides separately by keying on the type and
--- disambiguating a collision with a counter.
+-- Two requirements. It is readable -- `Main#squash@Int` should be findable in
+-- a dump by someone who knows what they are looking for -- and it is
+-- injective on ground types, because a specialization is spelled by its
+-- origin and its type arguments alone (`spelling`), and two specializations
+-- of one binding at two types must not be spelled alike. A constructor is
+-- written by its short name unless another module declared the same one
+-- (`Ty.display`), which is a property of the program, not of the order
+-- anything was asked for in.
 fun mangle(t : Ty.Type) -> String = match Ty.prune(t) {
-    TCon(c) -> Ty.shortName(c.name)
+    TCon(c) -> Ty.display(c.name)
     TApp(_, _, _) -> {
         let (h, args) = Ty.spine(Ty.prune(t))
-        mangle(h) + "(" + String.join(Array.map(args, mangle), ",") + ")"
+        mangle(h) + "(" + mangleAll(args) + ")"
     }
     TFam(name, arg, _) -> name + "(" + mangle(arg) + ")"
-    TFun(_, _) -> "fun"
-    TTuple(_) -> "tuple"
-    _ -> "_"
+    TFun(params, ret) -> "fun(" + mangleAll(params) + ")->" + mangle(ret)
+    TTuple(elems) -> "(" + mangleAll(elems) + ")"
+    TSet(names) -> "{" + String.join(names, ",") + "}"
+    TBottom -> "!"
+    -- Not ground, so never asked for.
+    TVar(_) -> "_"
 }
+
+fun mangleAll(ts : Array Ty.Type) -> String = String.join(Array.map(ts, mangle), ",")
 
 -- Whether this binding is a lambda over nothing but dictionaries.
 --
@@ -169,10 +180,13 @@ fun takesDictionaries(b : CBind) -> Bool = match b.value.kind {
 --
 -- **The memo.** A second round that re-asked for a binding at the same types
 -- would not find round one's answer, and would build a byte-identical second
--- copy under a disambiguated name -- specialization as a source of duplication,
--- which is the opposite of the point.
+-- copy -- specialization as a source of duplication, which is the opposite of
+-- the point.
 type State = State {
-    done          : Map String String,
+    -- Request key -> the specialization's spelling and binder id.
+    done          : Map String (String, Int),
+    -- Spelling -> the request key it was made for; see `spelling`.
+    spellings     : Map String String,
     origin        : Map String String,
     -- Bindings on an expanding cycle (`expandingBindings`), never copied.
     var expanding : Set.Set String,
@@ -182,7 +196,8 @@ type State = State {
 }
 
 fun newState() -> State = State {
-    done = Map.new(), origin = Map.new(), expanding = Set.new(),
+    done = Map.new(), spellings = Map.new(), origin = Map.new(),
+    expanding = Set.new(),
     spent = 0, ceiling = 0,
 }
 
@@ -212,19 +227,28 @@ fun derive(st : State, made : String, parent : String) -> Unit =
 --
 -- It cannot be lifted to the top level and specialized there, because its body
 -- may close over the enclosing binding's parameters. So it is specialized in
--- place: one extra binding beside the original, per type it was used at.
+-- place: one extra binding beside the original, per type it was used at, each
+-- a binder of its own.
 type Local = Local {
+    name    : String,
+    -- The binder's id in the output, which a copy names as its origin.
+    id      : Int,
+    span    : Option Span,
     binders : Vec VarCell,
-    insts   : Map String (String, Array Ty.Type),
+    -- Arguments key -> the copy's spelling, its id, and the arguments.
+    insts   : Map String (String, Int, Array Ty.Type),
 }
 
-fun newLocal(binders : Vec VarCell) -> Local =
-    Local { binders = binders, insts = Map.new() }
+fun newLocal(name : String, id : Int, span : Option Span,
+             binders : Vec VarCell) -> Local =
+    Local { name = name, id = id, span = span, binders = binders, insts = Map.new() }
 
 -- -- the whole program, and the specializations asked of it -------------------------
 
 type Mono = Mono {
     program    : CProgram,
+    -- Every specialization is minted here: see `request`.
+    table      : Binders.Table,
     decls      : DeclTable,
     classes    : ClassTable,
     state      : State,
@@ -239,16 +263,15 @@ type Mono = Mono {
     topDicts   : Set.Set String,
     dictGroup  : Set.Set String,
     made       : Map String (Vec CBind),
-    queue      : Vec (String, CBind, Array Ty.Type, Option (Vec String)),
-    used       : Set.Set String,
+    queue      : Vec (String, Int, CBind, Array Ty.Type, Option (Vec String)),
 }
 
-fun newMono(program : CProgram, decls : DeclTable, classes : ClassTable,
-            state : State) -> Mono = Mono {
-    program = program, decls = decls, classes = classes, state = state,
-    byname = Map.new(), generic = Map.new(), takesDicts = Set.new(),
-    topDicts = Set.new(), dictGroup = Set.new(), made = Map.new(),
-    queue = Vec.new(8), used = Set.new(),
+fun newMono(program : CProgram, table : Binders.Table, decls : DeclTable,
+            classes : ClassTable, state : State) -> Mono = Mono {
+    program = program, table = table, decls = decls, classes = classes,
+    state = state, byname = Map.new(), generic = Map.new(),
+    takesDicts = Set.new(), topDicts = Set.new(), dictGroup = Set.new(),
+    made = Map.new(), queue = Vec.new(8),
 }
 
 -- One binding's body, rewritten under one substitution.
@@ -256,6 +279,13 @@ fun newMono(program : CProgram, decls : DeclTable, classes : ClassTable,
 -- Created per specialization (with the binders mapped to that specialization's
 -- type arguments) and per ground binding (with an empty substitution, where it
 -- only rewrites call sites and touches no types).
+--
+-- **A copy binds nothing its original binds.** A specialization's body, and a
+-- local's, is a second copy of a term the program keeps, so each binder with
+-- an id it meets gets a fresh one (`bindId`), in the owner the copy is minted
+-- into, and each reference to it is renamed with it (`refId`). The original is
+-- rewritten in place and keeps its ids. A binder with no id -- a dictionary --
+-- is told apart by its spelling and is copied as it is.
 type Rewriter = Rewriter {
     owner      : Mono,
     subst      : Map Int Ty.Type,
@@ -268,12 +298,20 @@ type Rewriter = Rewriter {
     -- instance is what the collapse has to see through, since the binding it
     -- hoists the application into cannot see a local name.
     aliases    : Map String String,
-    scopes     : Vec (Map String Local),
+    -- Every generalized local met so far, by its id in the input. Not scoped:
+    -- before `Turkey.Opt` no id is bound twice, so an id names one binder
+    -- wherever it is read.
+    locals     : Map Int Local,
+    -- The owner a copy's binders are minted into, or `None` when this rewrites
+    -- an original in place.
+    copyInto   : Option Int,
+    -- Input id -> output id, for each binder this copy renamed.
+    ids        : Map Int Int,
 }
 
 fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
-                equations : Vec (Ty.Type, Ty.Type),
-                scopes : Option (Vec (Map String Local))) -> Rewriter {
+                equations : Vec (Ty.Type, Ty.Type), copyInto : Option Int,
+                locals : Map Int Local, ids : Map Int Int) -> Rewriter {
     -- Substituted before the family reducer is built from them: a given
     -- `Item s ~ Op` becomes `Item (Array Int) ~ Op` under the specialization,
     -- and it is the substituted form that is a rewrite rule for the types in the
@@ -286,22 +324,58 @@ fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
     Rewriter {
         owner = owner, subst = subst, equations = eqs,
         fams = Coretc.famsOf(owner.classes, eqs),
-        rename = Map.new(), aliases = Map.new(),
-        scopes = match scopes {
-            Some(s) -> s
-            None -> Vec.new(4)
-        },
+        rename = Map.new(), aliases = Map.new(), locals = locals,
+        copyInto = copyInto, ids = ids,
     }
 }
 
--- A rewriter for a nested binding, sharing the local scopes so a specialized
--- local body can still reach the locals around it.
-fun childRewriter(r : Rewriter, subst : Map Int Ty.Type,
-                  equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
-    let made = newRewriter(r.owner, subst, equations, Some(r.scopes))
+-- A rewriter for a member of a group with equations of its own: the same
+-- term, so it renames as `r` does.
+fun childRewriter(r : Rewriter, equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
+    let made = newRewriter(r.owner, r.subst, equations, r.copyInto, r.locals, r.ids)
     for (k, v) in Map.entries(r.aliases) { Map.put(made.aliases, k, v) }
+    made.rename = r.rename
     made
 }
+
+-- A rewriter for a copy of a generalized local's value, at the substitution
+-- that specializes it. It shares the locals, so the copy can still reach the
+-- ones around it, and starts from `r`'s renaming, so it reads them under the
+-- ids they have here. Its own binders are minted into the owner `r` copies
+-- into, or the local's own when `r` rewrites an original.
+fun copyRewriter(r : Rewriter, local : Local, subst : Map Int Ty.Type,
+                 equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
+    let ids = Map.new()
+    for (k, v) in Map.entries(r.ids) { Map.put(ids, k, v) }
+    let made = newRewriter(r.owner, subst, equations, Some(homeOf(r, local.id)),
+                           r.locals, ids)
+    for (k, v) in Map.entries(r.aliases) { Map.put(made.aliases, k, v) }
+    made.rename = r.rename
+    made
+}
+
+-- Where a binder made beside the local `near` is minted.
+fun homeOf(r : Rewriter, near : Int) -> Int = match r.copyInto {
+    Some(o) -> o
+    None -> Binders.ownerOf(near)
+}
+
+-- The output id of a binder bound at `id`: fresh in a copy, the same in an
+-- original.
+fun bindId(r : Rewriter, name : String, id : Int) -> Int {
+    if id == noId { return id }
+    match r.copyInto {
+        None -> id
+        Some(o) -> {
+            let made = Binders.fresh(r.owner.table, o, name, Binders.Local, CopyOf(id))
+            Map.put(r.ids, id, made)
+            made
+        }
+    }
+}
+
+-- The output id of a reference to the binder `id`.
+fun refId(r : Rewriter, id : Int) -> Int = Map.getOr(r.ids, id, id)
 
 -- A type under the substitution, with families reduced.
 --
@@ -319,8 +393,12 @@ fun rTy(r : Rewriter, t : Ty.Type) -> Ty.Type {
 }
 
 fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
-    CVar(name, id) -> mkCore(rTy(r, e.ty), e.span,
-                         CVar(Map.getOr(r.rename, name, name), id))
+    CVar(name, id) -> match Map.get(r.rename, name) {
+        -- A dictionary parameter a collapse consumed: the dictionary it was
+        -- handed, which is top-level.
+        Some(dict) -> mkCore(rTy(r, e.ty), e.span, CVar(dict, id))
+        None -> mkCore(rTy(r, e.ty), e.span, CVar(name, refId(r, id)))
+    }
     CTyApp(fn, args) -> rewriteTyApp(r, e, fn, args)
     CApp(_, _) -> match collapse(r, e) {
         Some(made) -> made
@@ -329,8 +407,45 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
     CLet(name, id, bound, value, body, binders) ->
         rewriteLet(r, e, name, id, bound, value, body, binders)
     CLetRec(binds, body) -> rewriteLetRec(r, e, binds, body)
+    -- The other binding forms: each binder renamed before the term it scopes
+    -- over is rewritten.
+    CLam(params, body, name) -> {
+        let ps = Array.map(params, rewriteParam(r, _))
+        mkCore(rTy(r, e.ty), e.span, CLam(ps, rewrite(r, body), name))
+    }
+    CJoin(name, id, params, body, rest, recursive) -> {
+        let made = bindId(r, name, id)
+        let ps = Array.map(params, rewriteParam(r, _))
+        mkCore(rTy(r, e.ty), e.span,
+               CJoin(name, made, ps, rewrite(r, body), rewrite(r, rest), recursive))
+    }
+    CJump(name, id, args) -> mkCore(rTy(r, e.ty), e.span,
+        CJump(name, refId(r, id), Vec.map(args, rewrite(r, _))))
+    CMatch(scrutinee, alts) -> mkCore(rTy(r, e.ty), e.span,
+        CMatch(rewrite(r, scrutinee), Vec.map(alts, fun(a) = {
+            let alt = rewriteAlt(r, a.alt)
+            CAlt { alt = alt, body = rewrite(r, a.body) }
+        })))
     _ -> generic(r, e)
 }
+
+fun rewriteParam(r : Rewriter, p : CParam) -> CParam {
+    let CParam { name, id, ty } = p
+    CParam { name = name, id = bindId(r, name, id), ty = rTy(r, ty) }
+}
+
+fun rewriteAlt(r : Rewriter, a : Alt) -> Alt = match a {
+    ACon(con, fields, opening) -> ACon(con, Array.map(fields, rewriteBinder(r, _)), opening)
+    ATuple(elems) -> ATuple(Array.map(elems, rewriteBinder(r, _)))
+    ALit(_) -> a
+    AAny(binder) -> AAny(rewriteBinder(r, binder))
+}
+
+fun rewriteBinder(r : Rewriter, binder : Option (String, Int)) -> Option (String, Int) =
+    match binder {
+        Some((name, id)) -> Some((name, bindId(r, name, id)))
+        None -> None
+    }
 
 -- Every node not named above: rebuild it, rewriting the children and
 -- substituting the types. `Turkey.Core.mapKind` is that rule, written once.
@@ -338,7 +453,7 @@ fun generic(r : Rewriter, e : Core) -> Core = mkCore(rTy(r, e.ty), e.span,
     mapKind(e.kind, Mapper {
         expr = fun(x) = rewrite(r, x),
         type_ = fun(t) = rTy(r, t),
-        bind = fun(b) = rewriteBind(r, b),
+        bind = fun(b) = rewriteMember(r, (b, b.id)),
     }))
 
 -- A type application: the one place a specialization is asked for.
@@ -359,18 +474,18 @@ fun rewriteTyApp(r : Rewriter, e : Core, fn : Core,
     mkCore(rTy(r, e.ty), e.span, CTyApp(rewrite(r, fn), resolved))
 }
 
--- The specialized name for a use, or `None` to leave it generic.
--- A specialization keeps the id of the binding it specializes, as every
--- respelling in this pass does: it is the spelling that tells copies apart.
+-- The specialization a use means, or `None` to leave it generic.
 fun instantiate(r : Rewriter, given : String, id : Int, args : Array Ty.Type,
                 e : Core) -> Option Core {
     let name = Map.getOr(r.rename, given, given)
     for a in args {
         if !ground(a) { return None }
     }
-    match localNamed(r, name) {
-        Some(local) -> return Some(mkCore(rTy(r, e.ty), e.span,
-            CVar(localInst(r, name, local, args), id)))
+    match Map.get(r.locals, id) {
+        Some(local) -> {
+            let (made, madeId) = localInst(r, local, args)
+            return Some(mkCore(rTy(r, e.ty), e.span, CVar(made, madeId)))
+        }
         None -> {}
     }
     let b = match Map.get(r.owner.generic, name) {
@@ -379,7 +494,7 @@ fun instantiate(r : Rewriter, given : String, id : Int, args : Array Ty.Type,
     }
     if len(b.binders) != len(args) { return None }
     match request(r.owner, b, args, None) {
-        Some(made) -> Some(mkCore(rTy(r, e.ty), e.span, CVar(made, id)))
+        Some((made, madeId)) -> Some(mkCore(rTy(r, e.ty), e.span, CVar(made, madeId)))
         None -> None
     }
 }
@@ -413,11 +528,10 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
         }
         _ -> {}
     }
-    let named = match head.kind {
-        CVar(n, i) -> (n, i)
+    let given = match head.kind {
+        CVar(n, _) -> n
         _ -> return None
     }
-    let (given, id) = named
     let name = Map.getOr(r.rename, given, given)
     let b = match Map.get(r.owner.byname, name) {
         Some(x) -> x
@@ -441,18 +555,19 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
             Some(n) -> Vec.push(supplied, n)
         }
     }
-    let made = match request(r.owner, b, targs, Some(supplied)) {
+    let granted = match request(r.owner, b, targs, Some(supplied)) {
         Some(n) -> n
         None -> return None
     }
+    let (made, madeId) = granted
     let ty = rTy(r, e.ty)
     let promoted = promotedBinders(b, Some(supplied))
-    if len(promoted) == 0 { return Some(mkCore(ty, e.span, CVar(made, id))) }
+    if len(promoted) == 0 { return Some(mkCore(ty, e.span, CVar(made, madeId))) }
     -- The copy states the abstraction; this site is where the *value* of it was
     -- expected, so it is restated here as the eta-expansion it is.
     let types = Array.map(promoted, TVar)
     Some(mkCore(ty, e.span, CTyLam(promoted,
-        mkCore(ty, e.span, CTyApp(mkCore(ty, e.span, CVar(made, id)), types)))))
+        mkCore(ty, e.span, CTyApp(mkCore(ty, e.span, CVar(made, madeId)), types)))))
 }
 
 -- The top-level dictionary this expression names, or `None`.
@@ -466,34 +581,37 @@ fun globalDict(r : Rewriter, e : Core) -> Option String = match e.kind {
 
 -- -- generalized bindings inside a body ---------------------------------------------
 
-fun localNamed(r : Rewriter, name : String) -> Option Local {
-    for var i = len(r.scopes) - 1; i >= 0; i = i - 1 {
-        match Map.get(r.scopes[i], name) {
-            Some(found) -> return Some(found)
-            None -> {}
-        }
-    }
-    None
-}
-
-fun localInst(r : Rewriter, name : String, local : Local,
-              args : Array Ty.Type) -> String {
+-- The copy of a local at these arguments, as its spelling and its id, made
+-- the first time it is asked for. Two locals may share a spelling, and so may
+-- their copies; their ids tell them apart, and the passes that still read
+-- spellings scope them as the originals are scoped.
+fun localInst(r : Rewriter, local : Local, args : Array Ty.Type) -> (String, Int) {
     let key = argsKey(args)
     match Map.get(local.insts, key) {
-        Some((made, _)) -> made
+        Some((made, id, _)) -> (made, id)
         None -> {
-            let made = fresh(r.owner, name, args)
-            Map.put(local.insts, key, (made, args))
-            made
+            let made = spelling(local.name, args)
+            let id = Binders.fresh(r.owner.table, homeOf(r, local.id), made,
+                                   Binders.Local,
+                                   Specialized(Some(local.id), args, local.span))
+            Map.put(local.insts, key, (made, id, args))
+            (made, id)
         }
     }
 }
+
+-- A specialization's spelling: its origin's and its type arguments', which
+-- `mangle` writes injectively. So a binding's specializations are spelled
+-- apart, and no counter or order of requests enters the spelling.
+fun spelling(origin : String, args : Array Ty.Type) -> String =
+    origin + "@" + mangleAll(args)
 
 fun argsKey(args : Array Ty.Type) -> String =
     String.join(Array.map(args, Ty.typeKey), "|")
 
 fun rewriteLet(r : Rewriter, e : Core, name : String, id : Int, bound : Ty.Type,
                value : Core, body : Core, binders : Vec VarCell) -> Core {
+    let out = bindId(r, name, id)
     if len(binders) == 0 {
         -- Written out rather than left to `generic`, because the alias has to be
         -- recorded between the value and the body: the value is what decides
@@ -509,19 +627,17 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, id : Int, bound : Ty.Type,
         if had { Map.put(r.aliases, name, saved) }
         else { discard(Map.delete(r.aliases, name)) }
         return mkCore(rTy(r, e.ty), e.span,
-                      CLet(name, id, rTy(r, bound), v, b, []))
+                      CLet(name, out, rTy(r, bound), v, b, []))
     }
-    let local = newLocal(binders)
-    let scope = Map.new()
-    Map.put(scope, name, local)
-    Vec.push(r.scopes, scope)
+    if id == noId { oops("a generalized local '" + name + "' has no binder id", e.span) }
+    let local = newLocal(name, out, e.span, binders)
+    Map.put(r.locals, id, local)
     let b = rewrite(r, body)
     let made = drain(r, local, binders, value)
-    discard(Vec.pop(r.scopes))
-    var out = b
+    var rest = b
     for var i = len(made) - 1; i >= 0; i = i - 1 {
-        let (n, v) = made[i]
-        out = mkCore(rTy(r, e.ty), e.span, CLet(n, id, v.ty, v, out, []))
+        let (n, nid, v) = made[i]
+        rest = mkCore(rTy(r, e.ty), e.span, CLet(n, nid, v.ty, v, rest, []))
     }
     -- The generic binding stays, outermost, so that a use this pass could not
     -- specialize -- a capped one, or one under a variable that is not this
@@ -529,13 +645,13 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, id : Int, bound : Ty.Type,
     -- costs an allocation and nothing else, and reachability removes it when
     -- nothing reads it.
     mkCore(rTy(r, e.ty), e.span,
-           CLet(name, id, rTy(r, bound), rewrite(r, value), out, binders))
+           CLet(name, out, rTy(r, bound), rewrite(r, value), rest, binders))
 }
 
 -- Build every instantiation of one local binding, including the ones discovered
 -- while building the others.
 fun drain(r : Rewriter, local : Local, binders : Vec VarCell,
-          value : Core) -> Vec (String, Core) {
+          value : Core) -> Vec (String, Int, Core) {
     let out = Vec.new(4)
     let seen = Set.new()
     var going = True
@@ -547,11 +663,10 @@ fun drain(r : Rewriter, local : Local, binders : Vec VarCell,
         if len(todo) == 0 { return out }
         for (key, made) in todo {
             Set.add(seen, key)
-            let (name, args) = made
-            let sub = childRewriter(r, extended(r.subst, binders, args),
-                                    r.equations)
-            sub.rename = r.rename
-            Vec.push(out, (name, rewrite(sub, value)))
+            let (name, id, args) = made
+            let sub = copyRewriter(r, local, extended(r.subst, binders, args),
+                                   r.equations)
+            Vec.push(out, (name, id, rewrite(sub, value)))
         }
     }
     out
@@ -569,46 +684,60 @@ fun extended(subst : Map Int Ty.Type, binders : Vec VarCell,
 
 fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
                   body : Core) -> Core {
+    -- Every member renamed before any is rewritten, since each may name the
+    -- others.
+    let renamed = Vec.map(binds, fun(b) = (b, bindId(r, b.name, b.id)))
     let poly = Map.new()
-    for b in binds {
-        if len(b.binders) > 0 { Map.put(poly, b.name, newLocal(b.binders)) }
+    for (b, out) in renamed {
+        if len(b.binders) > 0 {
+            if b.id == noId {
+                oops("a generalized local '" + b.name + "' has no binder id", b.span)
+            }
+            let local = newLocal(b.name, out, b.span, b.binders)
+            Map.put(poly, b.id, local)
+            Map.put(r.locals, b.id, local)
+        }
     }
-    if len(Map.keys(poly)) == 0 { return generic(r, e) }
-    Vec.push(r.scopes, poly)
+    if len(Map.keys(poly)) == 0 {
+        return mkCore(rTy(r, e.ty), e.span,
+                      CLetRec(Vec.map(renamed, rewriteMember(r, _)), rewrite(r, body)))
+    }
     let rest = rewrite(r, body)
     -- The generic copies first, and for the reason a `let` keeps its original: a
     -- sibling or a capped call may still name them. Their own recursive calls are
     -- at their own binders, which are not ground, so nothing inside them
     -- specializes.
-    let out = Vec.map(binds, rewriteBind(r, _))
+    let out = Vec.map(renamed, rewriteMember(r, _))
     let pending = Map.new()
     for b in binds {
-        if len(b.binders) > 0 { Map.put(pending, b.name, b) }
+        if len(b.binders) > 0 { Map.put(pending, b.id, b) }
     }
     let seen = Set.new()
     var going = True
     while going {
         let todo = Vec.new(4)
-        for (ownerName, local) in Map.entries(poly) {
+        for (origin, local) in Map.entries(poly) {
             for (k, v) in Map.entries(local.insts) {
-                if !Set.contains(seen, ownerName + "|" + k) {
-                    Vec.push(todo, (ownerName, k, v))
-                }
+                let at = Int.toString(origin) + "|" + k
+                if !Set.contains(seen, at) { Vec.push(todo, (origin, at, v)) }
             }
         }
         if len(todo) == 0 { going = False }
-        for (ownerName, key, made) in todo {
-            Set.add(seen, ownerName + "|" + key)
-            let (name, args) = made
-            let orig = match Map.get(pending, ownerName) {
+        for (origin, at, made) in todo {
+            Set.add(seen, at)
+            let (name, id, args) = made
+            let orig = match Map.get(pending, origin) {
                 Some(x) -> x
                 None -> oops("a local instantiation lost its original", e.span)
             }
-            let sub = childRewriter(r, extended(r.subst, orig.binders, args),
-                                    orig.equations)
-            sub.rename = r.rename
+            let local = match Map.get(poly, origin) {
+                Some(x) -> x
+                None -> oops("a local instantiation lost its original", e.span)
+            }
+            let sub = copyRewriter(r, local, extended(r.subst, orig.binders, args),
+                                   orig.equations)
             let b = CBind {
-                name = name, id = orig.id, ty = rTy(sub, orig.ty), binders = [],
+                name = name, id = id, ty = rTy(sub, orig.ty), binders = [],
                 value = rewrite(sub, orig.value), span = orig.span,
                 mutable = False, module_ = orig.module_,
                 equations = sub.equations, layouts = orig.layouts,
@@ -616,25 +745,17 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
             Vec.push(out, b)
         }
     }
-    discard(Vec.pop(r.scopes))
     mkCore(rTy(r, e.ty), e.span, CLetRec(out, rest))
 }
 
--- One member of a group, generic or not, under this rewriter -- with its own
--- equations added, since a member may carry some.
-fun rewriteBind(r : Rewriter, b : CBind) -> CBind {
-    if len(b.equations) == 0 {
-        return CBind {
-            name = b.name, id = b.id, ty = rTy(r, b.ty), binders = b.binders,
-            value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
-            module_ = b.module_, equations = b.equations,
-            layouts = b.layouts,
-        }
-    }
-    let sub = childRewriter(r, r.subst, b.equations)
-    sub.rename = r.rename
+-- One member of a group, generic or not, under this rewriter, with the id
+-- `rewriteLetRec` renamed it to -- and with its own equations added, since a
+-- member may carry some.
+fun rewriteMember(r : Rewriter, renamed : (CBind, Int)) -> CBind {
+    let (b, id) = renamed
+    let sub = if len(b.equations) == 0 { r } else { childRewriter(r, b.equations) }
     CBind {
-        name = b.name, id = b.id, ty = rTy(sub, b.ty), binders = b.binders,
+        name = b.name, id = id, ty = rTy(sub, b.ty), binders = b.binders,
         value = rewrite(sub, b.value), span = b.span, mutable = b.mutable,
         module_ = b.module_, equations = sub.equations, layouts = b.layouts,
     }
@@ -646,7 +767,6 @@ fun runMono(m : Mono) -> CProgram {
     for (group, isDict) in [(m.program.dicts, True), (m.program.binds, False)] {
         for b in group {
             Map.put(m.byname, b.name, b)
-            Set.add(m.used, b.name)
             if len(b.binders) > 0 { Map.put(m.generic, b.name, b) }
             if isDict { Set.add(m.dictGroup, b.name) }
             if isDict && len(b.binders) == 0 { Set.add(m.topDicts, b.name) }
@@ -675,7 +795,7 @@ fun runMono(m : Mono) -> CProgram {
     }
     var at = 0
     while at < len(m.queue) {
-        let (name, b, targs, dicts) = m.queue[at]
+        let (name, id, b, targs, dicts) = m.queue[at]
         at = at + 1
         let group = match Map.get(m.made, b.name) {
             Some(g) -> g
@@ -685,7 +805,7 @@ fun runMono(m : Mono) -> CProgram {
                 g
             }
         }
-        Vec.push(group, build(m, name, b, targs, dicts))
+        Vec.push(group, build(m, name, id, b, targs, dicts))
     }
 
     let out = CProgram { dicts = Vec.new(16), binds = Vec.new(32) }
@@ -706,7 +826,7 @@ fun runMono(m : Mono) -> CProgram {
 }
 
 fun rewriteTop(m : Mono, b : CBind) -> CBind {
-    let r = newRewriter(m, Map.new(), b.equations, None)
+    let r = newRewriter(m, Map.new(), b.equations, None, Map.new(), Map.new())
     CBind {
         name = b.name, id = b.id, ty = b.ty, binders = b.binders,
         value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
@@ -715,9 +835,17 @@ fun rewriteTop(m : Mono, b : CBind) -> CBind {
     }
 }
 
--- Ask for a binding at these arguments. `None` means the cap said no.
+-- Ask for a binding at these arguments, and get its spelling and binder id.
+-- `None` means the cap said no.
+--
+-- **Each specialization is a top-level binder in an owner of its own.** The
+-- owner is registered here, and owners are numbered from one counter, so the
+-- id depends on the order of requests. That order is the program's: the
+-- whole of `runMono` runs on one thread, rewriting the bindings in program
+-- order and then building the queue in the order it was filled. The owner is
+-- named, and the binder spelled, by the origin and the type arguments.
 fun request(m : Mono, b : CBind, targs : Array Ty.Type,
-            dicts : Option (Vec String)) -> Option String {
+            dicts : Option (Vec String)) -> Option (String, Int) {
     for t in targs {
         if !ground(t) { return None }
     }
@@ -735,7 +863,15 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type,
         if typeSize(t) > maxTypeNodes { return None }
     }
     if !admit(m.state, b) { return None }
-    let name = fresh(m, b.name, targs)
+    let name = topSpelling(b, targs, dicts)
+    match Map.get(m.state.spellings, name) {
+        Some(other) -> oops("two specializations are both spelled '" + name
+                            + "': " + other + " and " + key, b.span)
+        None -> Map.put(m.state.spellings, name, key)
+    }
+    let origin = if b.id == noId { None } else { Some(b.id) }
+    let id = Binders.fresh(m.table, Binders.owner(m.table, b.module_, name), name,
+                           Binders.TopLevel, Specialized(origin, targs, b.span))
     derive(m.state, name, b.name)
     match dicts {
         Some(_) -> if Set.contains(m.dictGroup, b.name) { Set.add(m.topDicts, name) }
@@ -744,32 +880,36 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type,
     -- Recorded *before* the body is built, which is what makes a recursive
     -- binding terminate: the copy's own call to itself, at its own arguments,
     -- finds this entry rather than asking for another copy.
-    Map.put(m.state.done, key, name)
-    Vec.push(m.queue, (name, b, targs, dicts))
-    Some(name)
+    Map.put(m.state.done, key, (name, id))
+    Vec.push(m.queue, (name, id, b, targs, dicts))
+    Some((name, id))
 }
 
-fun fresh(m : Mono, name : String, targs : Array Ty.Type) -> String {
-    let base = if len(targs) == 0 { name + "@" } else {
-        name + "@" + String.join(Array.map(targs, mangle), ",")
+-- A top-level specialization's spelling, which is also its symbol in the
+-- object file.
+--
+-- A binding that takes dictionaries is specialized two ways: collapsed, with
+-- the dictionaries supplied, and, where a call's dictionary is not a
+-- top-level one, at its types alone and still taking them. The second is
+-- spelled `~dicts`. Two collapses of one binding at one type are handed the
+-- same dictionaries, since instances are coherent; `request` checks it, and
+-- an earlier spelling that a second request would reuse is an internal
+-- error rather than a binding defined twice.
+fun topSpelling(b : CBind, targs : Array Ty.Type, dicts : Option (Vec String)) -> String =
+    match dicts {
+        None -> if takesDictionaries(b) { spelling(b.name, targs) + "~dicts" }
+                else { spelling(b.name, targs) }
+        Some(_) -> spelling(b.name, targs)
     }
-    var candidate = base
-    var n = 1
-    while Set.contains(m.used, candidate) {
-        n = n + 1
-        candidate = base + "~" + Int.toString(n)
-    }
-    Set.add(m.used, candidate)
-    candidate
-}
 
-fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
+fun build(m : Mono, name : String, id : Int, b : CBind, targs : Array Ty.Type,
           dicts : Option (Vec String)) -> CBind {
     let subst = Map.new()
     for var i = 0; i < len(b.binders) && i < len(targs); i = i + 1 {
         Map.put(subst, b.binders[i].id, targs[i])
     }
-    let r = newRewriter(m, subst, b.equations, None)
+    let r = newRewriter(m, subst, b.equations, Some(Binders.ownerOf(id)),
+                        Map.new(), Map.new())
     var ty = rTy(r, b.ty)
     var value = b.value
     match dicts {
@@ -812,7 +952,7 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
         }
     }
     CBind {
-        name = name, id = b.id, ty = ty, binders = binders, value = rewrite(r, value),
+        name = name, id = id, ty = ty, binders = binders, value = rewrite(r, value),
         span = b.span, mutable = b.mutable, module_ = b.module_,
         equations = r.equations, layouts = b.layouts,
     }
@@ -1301,8 +1441,8 @@ fun reachable(program : CProgram, main : String, roots : Vec String,
 --
 -- The rounds share one state, which is what makes the ceiling one ceiling. Reachability
 -- runs once, at the end, over the finished program.
-fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
-                 main : String, roots : Vec String) -> CProgram {
+fun monomorphize(program : CProgram, table : Binders.Table, decls : DeclTable,
+                 classes : ClassTable, main : String, roots : Vec String) -> CProgram {
     let state = newState()
     state.expanding = expandingBindings(program)
     var size = 0
@@ -1312,7 +1452,7 @@ fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
     state.ceiling = size * ceilingFactor
     var out = program
     for var i = 0; i < rounds; i = i + 1 {
-        let specialized = runMono(newMono(out, decls, classes, state))
+        let specialized = runMono(newMono(out, table, decls, classes, state))
         out = runDevirt(newDevirt(specialized, classes, state))
     }
     reachable(out, main, roots, decls.definitions, fun(_) = True)

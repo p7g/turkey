@@ -295,6 +295,20 @@ fun successorsOf(graph : Map String (Set.Set String), name : String)
     None -> Set.new()
 }
 
+-- Returns `roots` and every name they reach in `graph`.
+fun reachable(graph : Map String (Set.Set String), roots : Vec String)
+        -> Set.Set String {
+    let seen = Set.new()
+    let work = []
+    for name in roots { Vec.push(work, name) }
+    for var k = 0; k < len(work); k = k + 1 {
+        if Set.contains(seen, work[k]) { continue }
+        Set.add(seen, work[k])
+        for next in Set.elements(successorsOf(graph, work[k])) { Vec.push(work, next) }
+    }
+    seen
+}
+
 -- -- the traversal --------------------------------------------------------------------
 
 -- What is being inlined around the term being reduced: the calls `inline`
@@ -312,10 +326,14 @@ type Inlining = Inlining {
     -- whatever is being inlined around it, and `expr` marks it so; one reduced
     -- while it moved may reduce further once those are lifted.
     var declined : Int,
+    -- The binding whose code the term is: the one being reduced, or the callee
+    -- `bodyOf` is reducing. Inlined code becomes part of it.
+    var within : String,
 }
 
 -- Returns the context of a term with nothing inlined around it.
-fun outermost() -> Inlining = Inlining { active = [], speculating = False, declined = 0 }
+fun outermost() -> Inlining =
+    Inlining { active = [], speculating = False, declined = 0, within = "" }
 
 type Reducer = Reducer {
     breakers : Set.Set String,
@@ -342,6 +360,9 @@ type Reducer = Reducer {
     -- Which call of `reduceProgram` this is. The second can inline what the
     -- first could not, so it must not trust the first's marks.
     run : Int,
+    -- The bindings whose inlined code takes the span of the call it replaces
+    -- (`placed`).
+    callSites : Set.Set String,
     -- A binding's body, reduced, computed once. Without it a chain `f` calls
     -- `g` calls `h` re-reduces `h` once per path that reaches it, which is
     -- exponential in the depth of the call graph.
@@ -417,7 +438,8 @@ type Done = Done {
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
-               walked : Array Walked, run : Int, table : Binders.Table) -> Reducer {
+               walked : Array Walked, run : Int, table : Binders.Table,
+               callSites : Set.Set String) -> Reducer {
     let all = Vec.append(program.dicts, program.binds)
     let bindings = Map.new()
     for b in all {
@@ -442,7 +464,8 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         dicts = Methods.dictionaries(program.dicts),
         inlining = outermost(), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
-        run = run, reduced = Map.new(), constants = Map.new(),
+        run = run, callSites = callSites,
+        reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written,
         minting = Minting {
             owner = -1, count = 0,
@@ -462,7 +485,8 @@ fun forComponent(base : Reducer, c : Int, owner : Int, finished : fun(Int) -> Do
                  cache : Cache) -> Reducer = Reducer {
     breakers = base.breakers, decls = base.decls, bindings = base.bindings,
     dicts = base.dicts, inlining = outermost(), sizes = Map.new(), moves = Map.new(),
-    ends = Map.new(), cache = cache, run = base.run, reduced = Map.new(),
+    ends = Map.new(), cache = cache, run = base.run,
+    callSites = base.callSites, reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     minting = Minting {
         owner = owner, count = 0, scratch = base.minting.scratch, template = False,
@@ -593,13 +617,19 @@ var runs = 0
 --
 -- Every local binder of the result has an id, and within one binding no two
 -- binders share a spelling (`respell`).
-fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table) -> CProgram {
+fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table,
+                  keepsCallSites : fun(String) -> Bool) -> CProgram {
     let program = adoptProgram(table, input)
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
     runs = runs + 1
-    let base = newReducer(program, decls, graph, walked, runs, table)
+    -- The giblet check follows a call out of a giblet and names the line in
+    -- each function along the way, so a binding reachable from one where
+    -- positions are read needs its call sites as much as that one does.
+    let wanted = Vec.filter(binds, \keepsCallSites(_.module_))
+    let callSites = reachable(graph, Vec.map(wanted, _.name))
+    let base = newReducer(program, decls, graph, walked, runs, table, callSites)
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
@@ -657,6 +687,7 @@ fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table) ->
         for name in components[c] {
             match Map.get(first, name) {
                 Some(index) -> {
+                    r.inlining.within = name
                     let value = expr(r, binds[index].value)
                     Vec.push(values, (index, value))
                     memoize(r, name, value)
@@ -690,7 +721,10 @@ fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table) ->
     -- in no component, and are reduced last, with every component finished.
     let rest = forComponent(base, len(components), restOwner, fun(c) = made[c], newCache())
     for var i = 0; i < len(binds); i = i + 1 {
-        if !Map.contains(done, i) { Map.put(done, i, expr(rest, binds[i].value)) }
+        if !Map.contains(done, i) {
+            rest.inlining.within = binds[i].name
+            Map.put(done, i, expr(rest, binds[i].value))
+        }
     }
     let split = len(program.dicts)
     let dicts = Vec.new(split)
@@ -1068,7 +1102,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- the primitive costs. Held to the size limit, a bulk primitive's name
     -- would stay a call at every site and be specialized for every element type.
     if forwardsPrim(body) {
-        return Some(applyParams(r, params, args, body, e.ty, Inlined(e.span)))
+        return Some(applyParams(r, params, args, body, e.ty, placing(r, e.span)))
     }
     let size = sizeOf(r, name, key, body)
     if size > speculativeInlineLimit { return None }
@@ -1092,10 +1126,8 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- nothing -- and *not* inlining it would put a frame in every panic trace
     -- pointing at the standard library rather than at the code that failed.
     if endsOf(r, name, key, body) && size > bottomInlineLimit { return None }
-    -- A copied callee body becomes part of this call site, and every node
-    -- copied from the callee blames the invocation if a later Core check
-    -- rejects the residual (`Inlined`).
-    let made = applyParams(r, params, args, body, e.ty, Inlined(e.span))
+    -- A copied callee body becomes part of this call site (`placing`).
+    let made = applyParams(r, params, args, body, e.ty, placing(r, e.span))
     if size <= limit { return Some(made) }
     -- Restored to what it was, not to `False`. Speculation is meant not to
     -- nest -- the flag is the whole mechanism for that -- and clearing it on
@@ -1195,16 +1227,18 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
             }
             let m = r.minting
             let (template, next) = (m.template, m.next)
-            let speculating = r.inlining.speculating
+            let (speculating, within) = (r.inlining.speculating, r.inlining.within)
             m.template = True
             m.next = 0
             r.inlining.speculating = False
+            r.inlining.within = name
             Vec.push(r.inlining.active, name)
             let made = expr(r, inner)
             discard(Vec.pop(r.inlining.active))
             m.template = template
             m.next = next
             r.inlining.speculating = speculating
+            r.inlining.within = within
             Map.put(if owned(r, name) { r.reduced } else { r.cache.reduced }, key, made)
             made
         }
@@ -2014,6 +2048,15 @@ type Placing
     -- As `Copying`, for a callee's body inlined at a call with this span, which
     -- every node copied from the body takes.
     | Inlined(Option Span)
+
+-- How a callee's body is placed at a call with `span`. Positions of inlined
+-- code are read in two places: the giblet check, which names the line that
+-- allocates in each function from a giblet on, and allocation counting by
+-- site. So code inlined into a binding either one reads takes the call's span;
+-- elsewhere the copy keeps the callee's own spans, which only an internal
+-- error from a later Core check would show.
+fun placing(r : Reducer, span : Option Span) -> Placing =
+    if Set.contains(r.callSites, r.inlining.within) { Inlined(span) } else { Copying }
 
 fun applyParams[Iterator p, Length p, Item p ~ CParam,
                 Index c, Key c ~ Int, Value c ~ Core, Iterator c, Item c ~ Core](

@@ -1,8 +1,8 @@
 export (
     Waiter, timedOut, cancelled,
-    now, sleeper, readable, writable, readableBlocking, childExit, locked,
+    mutex, lock, unlock, now, sleeper, readable, writable, readableBlocking, childExit, locked,
     park, finished, outcome, complete, timeOut,
-    timeout, pending, deliver, expire, cancel, forget, takeWoken, takeHeadMoved,
+    timeout, deliver, expire, cancel, forget, takeWoken, takeHeadMoved,
 )
 
 -- What tasks wait for besides each other: a time to come, a descriptor to be
@@ -11,10 +11,17 @@ export (
 -- (`Turkey.Workers`' poller) and the time that passes to the waiters, which
 -- answer the coroutines to wake.
 --
--- Every function here is called under the scheduler's lock, which is what
--- protects every table below, and none of them waits. This module cannot
--- import `Turkey.Scheduler`, which imports it: what it has to wake it
--- answers, and the scheduler wakes it (`takeWoken`).
+-- **The poller's lock** (`lock`) protects every table below, and every
+-- function here but `now`, `lock` and `unlock` is called under it; none of
+-- them waits. It is not the scheduler's: a task parks on a descriptor, and
+-- the poller delivers its events, without touching the run queue. This module
+-- cannot import `Turkey.Scheduler`, which imports it: what it has to wake it
+-- answers (`takeWoken`), and whoever ended the wait wakes those tasks after
+-- letting this lock go. So a thread may take this lock while it holds the
+-- scheduler's, and never the scheduler's while it holds this one.
+--
+-- Whoever ends waits calls `takeWoken` before it lets the lock go, so that it
+-- wakes exactly the tasks of the waits it ended.
 --
 -- **One way out of waiting.** A waiter is `Waiting` until the first of an
 -- event, its deadline and a cancellation reaches it, and then it is `Ready`,
@@ -85,7 +92,7 @@ export (
 -- tries again, until the lock is taken, the deadline comes or the descriptor
 -- is closed. Registering before each try is what keeps a release that comes
 -- between a failed try and the registration from being lost. The tries run
--- under the scheduler's lock, as `childExit`'s `waitpid` does, and never
+-- under the poller's lock, as `childExit`'s `waitpid` does, and never
 -- wait. A waiter that leaves before its try succeeds has not taken the lock,
 -- so a deadline or a `cancel` leaves no lock behind. All waits for locks
 -- through one descriptor number share a source, since the kernel keeps one
@@ -113,6 +120,7 @@ import Data.Vec (Vec)
 import Data.Vec as Vec
 import Turkey.Coroutine as Co
 import Turkey.Libc as Libc
+import Turkey.Lock as Lock
 import Turkey.Sys as Sys
 import Turkey.Workers as Workers
 import Target (OS(..))
@@ -226,6 +234,14 @@ var nextId = 0
 
 -- Where `waitpid` stores a status; only used under the lock.
 var statusBuffer : Ptr = Libc.malloc(8)
+
+-- The poller's lock. A thread waiting for it is blocked
+-- (`Turkey.Workers.acquire`), so its holder may allocate and collect. A
+-- `let`, since nothing replaces it: a `var` would be a heap cell.
+let mutex : Ptr = Lock.new()
+
+fun lock() -> Unit = Workers.acquire(mutex)
+fun unlock() -> Unit = Lock.release(mutex)
 
 -- -- time ---------------------------------------------------------------------------------
 
@@ -759,9 +775,6 @@ fun complete(w : Waiter, value : Int) -> Bool = finish(w, Ready(value))
 fun timeOut(w : Waiter) -> Bool = finish(w, TimedOut)
 
 -- -- what the scheduler asks ----------------------------------------------------------------
-
--- Whether any wait can still end: a source with waiters, or a deadline.
-fun pending() -> Bool = countedSources > 0 || len(timers) > 0
 
 -- What the poller should wait for, at time `now`: -1 if nothing can end a
 -- wait; -2 (`Turkey.Workers.pollTimeoutForever`) if only an event can; else

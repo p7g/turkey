@@ -1,4 +1,4 @@
-export (lock, unlock, ready, wake, changed, waitUntil, yield, afterCall, start)
+export (lock, unlock, ready, wake, changed, waitUntil, waitOn, yield, afterCall, start)
 
 -- Which task runs next, and on which worker.
 --
@@ -21,7 +21,10 @@ export (lock, unlock, ready, wake, changed, waitUntil, yield, afterCall, start)
 -- **The lock.** The queue, every coroutine's `waiting` state, and what tasks
 -- wait on (`System.Task`) are read and written only under one lock. A worker
 -- waiting for it is blocked (`Turkey.Workers.acquire`), so its holder may
--- allocate, and collect, without waiting for the worker waiting on it.
+-- allocate, and collect, without waiting for the worker waiting on it. What
+-- tasks wait for outside the program is under the poller's lock instead
+-- (`Turkey.Poll.lock`), which may be taken while this one is held, and not
+-- the other way round.
 --
 -- **Waking before parking.** A coroutine that is about to wait registers
 -- itself under the lock and then suspends; whatever it waits for may wake it
@@ -38,8 +41,9 @@ export (lock, unlock, ready, wake, changed, waitUntil, yield, afterCall, start)
 -- deadline, and `signalWork` breaks that wait when there is something to run.
 -- A worker that is busy looks between tasks (`poll`), without waiting, for one
 -- atomic load when nothing is registered. Whoever learns of an event or a
--- passed deadline applies it under the lock, waking the tasks it ends. A task
--- that is waiting for one is not stuck: the deadlock check counts it.
+-- passed deadline applies it under the poller's lock, then wakes the tasks it
+-- ended under this one. A task that is waiting for one is not stuck: the
+-- deadlock check counts it.
 --
 -- The Prelude's `print` waits through here for the standard output's lock
 -- (`Turkey.Stdout`), so this module names what it uses rather than importing
@@ -179,70 +183,126 @@ fun run(c : Co.Coroutine) -> Unit {
 -- makes `done` hold can wake it, and suspends until then; code on a worker's
 -- own stack runs other tasks meanwhile. `done` and `register` run under the
 -- lock.
-fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
+fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit =
+    waitOn(queueLock, done, register)
+
+-- `waitUntil`, with `done` and `register` run under `mutex` rather than the
+-- scheduler's lock. Whatever makes `done` hold does it under `mutex`, wakes
+-- the coroutines registered with it (`wake`), and calls `changed`.
+fun waitOn(mutex : Ptr, done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
     match Co.running() {
         Some(c) -> while True {
-            lock()
+            Workers.acquire(mutex)
             if done() {
-                unlock()
+                Lock.release(mutex)
                 return {}
             }
             register(c)
-            unlock()
+            Lock.release(mutex)
             Co.suspend()
         }
         None -> while True {
             -- The task this stack ran last may have lost its permit (`afterCall`).
             if !Workers.permitHeld() { Workers.permitAwait(True) }
+            if holds(mutex, done) { return {} }
             lock()
-            if done() {
-                unlock()
-                return {}
-            }
             let seen = Workers.workSeen()
             let c = next()
-            -- Nothing to run here or anywhere, and nothing done: only a task
-            -- could make it so, and every task is waiting, for nothing the
-            -- poller could deliver either.
-            let stuck = Option.isNone(c) && running == 0 && !Poll.pending()
-            if Option.isNone(c) && !stuck { programWaits = True }
+            let quiet = Option.isNone(c) && running == 0
+            if Option.isNone(c) { programWaits = True }
             unlock()
             match c {
                 Some(c) -> {
                     run(c)
                     poll()
                 }
-                None -> if stuck {
-                    return error("deadlock: every task is waiting")
-                } else {
-                    idle(seen)
+                None -> {
+                    -- Look again, now that `changed` will signal: whatever made
+                    -- `done` hold since the look above called it before
+                    -- `programWaits` was set.
+                    var over = holds(mutex, done)
+                    -- Nothing to run here or anywhere, and nothing done: only a
+                    -- task could make it so, and every task is waiting, for
+                    -- nothing the poller could deliver either. A task that
+                    -- ended after the look at `done` and before `stuck`'s may
+                    -- have made it hold, so look once more; with nothing
+                    -- running, nothing can change it after.
+                    if !over && quiet && stuck() {
+                        over = holds(mutex, done)
+                        if !over { return error("deadlock: every task is waiting") }
+                    }
+                    if !over { idle(seen) }
                     lock()
                     programWaits = False
                     unlock()
+                    if over { return {} }
                 }
             }
         }
     }
 }
 
+fun holds(mutex : Ptr, done : fun() -> Bool) -> Bool {
+    Workers.acquire(mutex)
+    let over = done()
+    Lock.release(mutex)
+    over
+}
+
+-- Whether nothing is queued or running and nothing is registered with the
+-- poller, so that no task can ever run again. A `settle` delivers events under
+-- the poller's lock and then queues their tasks under this one, and between
+-- the two neither shows them; it moves `settling` to odd before and back to
+-- even after, so an answer is taken only from a look that no `settle`
+-- overlapped. Waits end otherwise only by what a running task does.
+fun stuck() -> Bool {
+    while True {
+        let before = Ptr.atomicLoad(settling, 0)
+        if before % 2 == 0 {
+            lock()
+            let empty = head == len(runnable) && running == 0
+            unlock()
+            if !empty || Workers.interest() > 0 { return False }
+            if Ptr.atomicLoad(settling, 0) == before { return True }
+        } else {
+            let _ = Libc.schedYield()
+        }
+    }
+    False
+}
+
 -- -- the poller ------------------------------------------------------------------------
+
+-- Odd while a `settle` is under way (`stuck`).
+let settling : Ptr = zeroedWord()
+
+fun zeroedWord() -> Ptr {
+    let word = Libc.malloc(8)
+    Ptr.atomicStore(word, 0, 0)
+    word
+}
 
 -- Apply what the poller found, as the worker that holds its claim: its first
 -- `n` results, and then the deadlines that have passed. Each wait that ends
 -- wakes its task, and the program's own code if it waits.
 fun settle(n : Int) -> Unit {
-    lock()
+    let _ = Ptr.atomicAdd(settling, 0, 1)
+    let now = Poll.now()
+    Poll.lock()
     var ended = 0
     for var i = 0; i < n; i = i + 1 {
         ended = ended + Poll.deliver(Workers.resultToken(i), Workers.resultValue(i))
     }
-    ended = ended + Poll.expire(Poll.now())
+    ended = ended + Poll.expire(now)
+    let tasks = Poll.takeWoken()
+    Poll.unlock()
     if ended > 0 {
-        let tasks = Poll.takeWoken()
+        lock()
         for var i = 0; i < len(tasks); i = i + 1 { wake(tasks[i]) }
         changed()
+        unlock()
     }
-    unlock()
+    let _ = Ptr.atomicAdd(settling, 0, 1)
 }
 
 -- Look for events and deadlines without waiting, between tasks: the worker
@@ -277,9 +337,10 @@ fun idle(seen : Int) -> Unit {
 }
 
 fun wait(seen : Int) -> Unit {
-    lock()
-    let timeout = Poll.timeout(Poll.now())
-    unlock()
+    let now = Poll.now()
+    Poll.lock()
+    let timeout = Poll.timeout(now)
+    Poll.unlock()
     if timeout == -1 || !Workers.claim() {
         let _ = Heap.pause(seen, -1)
         return {}

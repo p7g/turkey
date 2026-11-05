@@ -1,7 +1,7 @@
 export (
     now, sleepUntil, readable, writable, readableUnless, writableUnless, readableUnlessAsOf,
     writableUnlessAsOf, readableBlockingUnless, childExit, lockedUnless,
-    cancel, forget, park, parkApart, wakeEnded, timedOut, cancelled,
+    cancel, forget, park, parkApart, sleeper, complete, finished, timedOut, cancelled,
 )
 
 -- Waiting for time, a descriptor, a child or a file lock without holding a
@@ -12,8 +12,15 @@ export (
 --
 -- A separate module from the scheduler because the scheduler is in every
 -- program and this is only for those that wait for the outside: it needs
--- `Turkey.Poll`, which the scheduler already has, and the scheduler's lock
--- and `waitUntil`.
+-- `Turkey.Poll`, which the scheduler already has, and the scheduler's
+-- `waitOn`.
+--
+-- A wait is made, checked and parked on under the poller's lock
+-- (`Turkey.Poll.lock`), not the scheduler's, and the tasks of the waits that
+-- end are woken after it is let go. Waits that another task ends
+-- (`parkApart`) are made under the scheduler's lock too, which guards what
+-- their owners keep beside them, a semaphore's queue, say; the poller's is
+-- taken inside it, never the other way round.
 --
 -- The Prelude imports `Turkey.Stdout`, which parks on a full pipe through this
 -- module, so this module names each library module it uses and does not import
@@ -43,6 +50,7 @@ import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Bool (Bool(..))
 import Data.Int ()
 import Data.Option (Option(..))
+import Data.Vec (Vec)
 import Turkey.Coroutine as Co
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
@@ -72,7 +80,7 @@ fun writable(fd : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.writable(fd, deadline)) }
 
 -- `readable` and `writable` that answer `cancelled` without waiting if `stop()`
--- is true once the wait may be registered, which is under the scheduler's lock,
+-- is true once the wait may be registered, which is under the poller's lock,
 -- so that `stop` must only read. A closer that makes `stop` true and then calls
 -- `cancel` ends this wait either way: `cancel` finds it registered, or `stop`
 -- sees what the closer made true.
@@ -113,26 +121,32 @@ fun lockedUnless(fd : Int, operation : Int, deadline : Int, stop : fun() -> Bool
 
 -- `fd` is about to be closed: end every wait on it with `cancelled`.
 fun cancel(fd : Int) -> Unit {
-    Scheduler.lock()
-    wakeAll(Poll.cancel(fd))
-    Scheduler.unlock()
+    Poll.lock()
+    let ended = Poll.cancel(fd)
+    let tasks = Poll.takeWoken()
+    Poll.unlock()
+    wakeAll(ended, tasks)
 }
 
 -- Drop the poller's interest in `fd`, before its number is closed, ending any
 -- wait still on it as `cancel` does. Every number that was waited on is
 -- forgotten before it is closed (`Turkey.Poll`).
 fun forget(fd : Int) -> Unit {
-    Scheduler.lock()
-    wakeAll(Poll.forget(fd))
-    Scheduler.unlock()
+    Poll.lock()
+    let ended = Poll.forget(fd)
+    let tasks = Poll.takeWoken()
+    Poll.unlock()
+    wakeAll(ended, tasks)
 }
 
--- Wake the tasks of the `ended` waits the poller just ended, under the lock.
-fun wakeAll(ended : Int) -> Unit {
+-- Wake `tasks`, of the `ended` waits the poller just ended, and the program's
+-- own code if it waits. Without either lock.
+fun wakeAll(ended : Int, tasks : Vec Co.Coroutine) -> Unit {
     if ended > 0 {
-        let tasks = Poll.takeWoken()
+        Scheduler.lock()
         for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
         Scheduler.changed()
+        Scheduler.unlock()
     }
 }
 
@@ -150,18 +164,39 @@ fun passedAsOf(deadline : Int, now : Int) -> Bool = deadline >= 0 && now >= dead
 fun park(start : fun() -> Poll.Waiter) -> Int = parkUnless(start, fun() = False)
 
 fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
-    Scheduler.lock()
+    Poll.lock()
     if stop() {
-        Scheduler.unlock()
+        Poll.unlock()
         return cancelled
     }
     let before = Workers.interest()
     let w = start()
+    tell(before)
+    -- A task parks on `w` before the lock is let go, as `waitOn`'s first
+    -- look would, rather than taking the lock again for it.
+    let parked = match Co.running() {
+        Some(c) -> if Poll.finished(w) { False } else {
+            Poll.park(w, c)
+            True
+        }
+        None -> False
+    }
+    Poll.unlock()
+    if parked { Co.suspend() }
+    await(w)
+}
+
+-- Tell the workers about the waits just made, `before` being the interest
+-- before them. Under the poller's lock.
+fun tell(before : Int) -> Unit {
     let earlier = Poll.takeHeadMoved()
     if earlier || (before == 0 && Workers.interest() > 0) { Workers.signalWork(False) }
     if earlier { Workers.wakePoller() }
-    Scheduler.unlock()
-    Scheduler.waitUntil(fun() = Poll.finished(w), fun(c) = Poll.park(w, c))
+}
+
+-- Park until `w` ends, and answer how. Without either lock.
+fun await(w : Poll.Waiter) -> Int {
+    Scheduler.waitOn(Poll.mutex, fun() = Poll.finished(w), fun(c) = Poll.park(w, c))
     Poll.outcome(w)
 }
 
@@ -173,7 +208,7 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
 -- is for, the stack would be inside it until it finished, deadline or not.
 
 -- The word the program's own stack sleeps on in `parkApart`, which
--- `wakeEnded` moves and wakes. There is one program stack, so one word. A
+-- `complete` moves and wakes. There is one program stack, so one word. A
 -- `let`, since the word moves and the pointer does not: a `var` here would
 -- be a heap cell, allocated as every program starts.
 let programWord : Ptr = zeroedWord()
@@ -190,13 +225,19 @@ fun zeroedWord() -> Ptr {
 -- monitor hands its permit to a thread that runs the tasks; so it starts the
 -- workers and the monitor if nothing has (`Turkey.Scheduler.start`).
 --
--- `start` makes the waiter under the scheduler's lock, given the deadline to
--- put on the poller's heap: `deadline` from a task, and -1 from the program's
--- own stack, which no worker could wake for it, and which ends the wait
--- itself (`Turkey.Poll.timeOut`) when its sleep runs out. Whoever ends the
--- waiter otherwise calls `wakeEnded`, under the lock.
+-- `start` makes the waiter with `sleeper` under the scheduler's lock, given
+-- the deadline to put on the poller's heap: `deadline` from a task, and -1
+-- from the program's own stack, which no worker could wake for it, and which
+-- ends the wait itself (`Turkey.Poll.timeOut`) when its sleep runs out.
+-- Whoever ends the waiter otherwise calls `complete`, under the scheduler's
+-- lock.
 fun parkApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int = match Co.running() {
-    Some(_) -> park(fun() = start(deadline))
+    Some(_) -> {
+        Scheduler.lock()
+        let w = start(deadline)
+        Scheduler.unlock()
+        await(w)
+    }
     None -> sleepApart(start, deadline)
 }
 
@@ -211,25 +252,49 @@ fun sleepApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
         -- Read before the look, and moved after the waiter ends, so that an
         -- end after the look stops the sleep from starting.
         let seen = Ptr.atomicLoad(programWord, 0)
-        Scheduler.lock()
+        Poll.lock()
         let left = if deadline < 0 { -1 } else { deadline - Poll.now() }
+        -- No task parked on `w`, so there is none to wake.
         if !Poll.finished(w) && deadline >= 0 && left <= 0 { let _ = Poll.timeOut(w) }
         let over = Poll.finished(w)
-        Scheduler.unlock()
+        Poll.unlock()
         if over { break }
         Workers.blockingSleepOn(programWord, seen, left)
     }
     Poll.outcome(w)
 }
 
--- A waiter `parkApart` made has just ended, by `Turkey.Poll.complete`: wake
--- its task, or, when `program` says the program's own stack made it, that
--- stack. Under the scheduler's lock.
-fun wakeEnded(program : Bool) -> Unit {
+-- A waiter for `parkApart`'s `start` to make: one that only `complete` or
+-- `deadline` ends. Takes the poller's lock, so the caller must not hold it.
+fun sleeper(deadline : Int) -> Poll.Waiter {
+    Poll.lock()
+    let before = Workers.interest()
+    let w = Poll.sleeper(deadline)
+    tell(before)
+    Poll.unlock()
+    w
+}
+
+-- End `w`, a waiter `parkApart` made, `Ready` with 0, if it still waits:
+-- whether it did. Wakes its task, or, when `program` says the program's own
+-- stack made it, that stack. Under the scheduler's lock.
+fun complete(w : Poll.Waiter, program : Bool) -> Bool {
+    Poll.lock()
+    let taken = Poll.complete(w, 0)
     let tasks = Poll.takeWoken()
+    Poll.unlock()
     for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
-    if program {
+    if taken && program {
         let _ = Ptr.atomicAdd(programWord, 0, 1)
         let _ = Lock.wake(programWord)
     }
+    taken
+}
+
+-- Whether `w` has ended. Takes the poller's lock.
+fun finished(w : Poll.Waiter) -> Bool {
+    Poll.lock()
+    let over = Poll.finished(w)
+    Poll.unlock()
+    over
 }

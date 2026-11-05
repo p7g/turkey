@@ -15,7 +15,8 @@ export (Semaphore, new, acquire, release, waiting)
 -- waiter never exist together, and `acquire` takes a free permit only when
 -- nobody waits for one.
 --
--- Everything here is read and written under the scheduler's lock.
+-- Everything here is read and written under the scheduler's lock, and each
+-- waiter's state under the poller's too (`Turkey.Wait`).
 
 import Turkey.Coroutine as Co
 import Turkey.Poll as Poll
@@ -27,7 +28,7 @@ import Turkey.Wait as Wait
 type Semaphore = Semaphore { var free : Int, queue : Vec Queued, var head : Int }
 
 -- `program` says whether the program's own stack waits, which `release`
--- wakes differently (`Turkey.Wait.wakeEnded`).
+-- wakes differently (`Turkey.Wait.complete`).
 type Queued = Queued { waiter : Poll.Waiter, program : Bool }
 
 fun new(permits : Int) -> Semaphore = Semaphore { free = permits, queue = [], head = 0 }
@@ -44,11 +45,11 @@ fun acquire(s : Semaphore, deadline : Int) -> Bool {
     if free { return True }
     let program = Option.isNone(Co.running())
     let outcome = Wait.parkApart(fun(timer) {
-        let w = Poll.sleeper(timer)
+        let w = Wait.sleeper(timer)
         -- A permit given back since the look above.
         if s.free > 0 {
             s.free = s.free - 1
-            let _ = Poll.complete(w, 0)
+            let _ = Wait.complete(w, False)
         } else {
             Vec.push(s.queue, Queued { waiter = w, program = program })
         }
@@ -65,10 +66,7 @@ fun release(s : Semaphore) -> Unit {
         let q = s.queue[s.head]
         s.head = s.head + 1
         -- False for a waiter whose deadline ended it, which is skipped.
-        if Poll.complete(q.waiter, 0) {
-            handed = True
-            Wait.wakeEnded(q.program)
-        }
+        if Wait.complete(q.waiter, q.program) { handed = True }
     }
     if s.head == len(s.queue) && s.head > 0 {
         Vec.clear(s.queue)
@@ -83,7 +81,7 @@ fun waiting(s : Semaphore) -> Int {
     Scheduler.lock()
     var n = 0
     for var i = s.head; i < len(s.queue); i = i + 1 {
-        if !Poll.finished(s.queue[i].waiter) { n = n + 1 }
+        if !Wait.finished(s.queue[i].waiter) { n = n + 1 }
     }
     Scheduler.unlock()
     n

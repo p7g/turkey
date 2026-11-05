@@ -15,6 +15,7 @@ export (Item(..), print)
 
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol)
+import Turkey.Position as Position
 
 type Item i
     -- The instruction set the code needs, first in a module.
@@ -40,6 +41,34 @@ type Item i
     | CString(String)
     -- Text for the reader of the assembly, with no bytes behind it.
     | Comment(String)
+    -- A byte, and an unsigned integer in LEB128, the variable-length encoding
+    -- DWARF writes most of its numbers in.
+    | Byte(Int)
+    | Uleb(Int)
+    -- Four bytes holding the distance from the second label to the first,
+    -- both in the same section: a length, or a function's size. Fixed by the
+    -- assembler, so the linker never changes it -- provided, on Mach-O, that
+    -- no global symbol lies between the two. Across one, the assembler writes
+    -- a pair of relocations instead, which nothing applies to debug
+    -- information.
+    | Difference(Symbol, Symbol)
+    -- Four bytes holding the first label's offset from the start of its
+    -- section, which the second label marks. Where the linker joins sections
+    -- of one name from several objects, as an ELF linker joins
+    -- `.debug_str`, the offset is relocated to the joined section's;
+    -- Mach-O's debug sections are never joined, so there it is the plain
+    -- distance.
+    | SectionOffset(Symbol, Symbol)
+    -- Source file `n` of the line table, by its path, with the directory it
+    -- is relative to when that is not the compile directory. File 0 is the
+    -- program's main file and names the compile directory.
+    | SourceFile(Int, Option String, String)
+    -- A row of the line table at the next instruction: the position the row
+    -- starts (`Turkey.Position`), and whether it is where the function's
+    -- body begins, after its prologue. Takes no bytes. Position 0 is a row
+    -- with no source line, which ends the previous row where a function
+    -- with no position begins.
+    | Loc(Int, Bool)
 
 -- The items as assembly text, appended to `b`, and the array emptied.
 --
@@ -71,11 +100,57 @@ fun printItem[Show i](d : Asm.Dialect, item : Item i, b : String.Builder) -> Uni
         Bytes(text) -> byteList(b, text, False)
         CString(text) -> byteList(b, text, True)
         Comment(text) -> line(b, "    // " + text)
+        Byte(n) -> line(b, "    .byte " + Int.toString(n))
+        Uleb(n) -> line(b, "    .uleb128 " + Int.toString(n))
+        Difference(to, from) -> line(b, "    .long " + Asm.spell(to) + " - " + Asm.spell(from))
+        SectionOffset(label, start) -> match d {
+            Asm.MachO -> line(b, "    .long " + Asm.spell(label) + " - " + Asm.spell(start))
+            -- A label in another section is a relocation, against the
+            -- section, which the linker moves with the joined section.
+            Asm.Elf -> line(b, "    .long " + Asm.spell(label))
+        }
+        SourceFile(n, directory, path) -> {
+            let dir = match directory {
+                Some(text) -> quoted(text) + " "
+                None -> ""
+            }
+            line(b, "    .file " + Int.toString(n) + " " + dir + quoted(path))
+        }
+        Loc(at, prologueEnd) -> {
+            String.push(b, "    .loc " + Int.toString(Position.file(at)) + " "
+                           + Int.toString(Position.line(at)) + " "
+                           + Int.toString(Position.column(at)))
+            if prologueEnd { String.push(b, " prologue_end") }
+            -- Every row says whether it is a statement: the assembler carries
+            -- `is_stmt` from one `.loc` to the next.
+            String.push(b, if Position.isStmt(at) { " is_stmt 1" } else { " is_stmt 0" })
+            String.push(b, "\n")
+        }
     }
 
 fun line(b : String.Builder, text : String) -> Unit {
     String.push(b, text)
     String.push(b, "\n")
+}
+
+-- `text` as a string the assembler reads back unchanged: a quote and a
+-- backslash escaped, and every control character in octal.
+fun quoted(text : String) -> String {
+    let b = String.builder()
+    String.push(b, "\"")
+    for c in String.codePoints(text) {
+        let n = Char.toInt(c)
+        if c == '"' || c == '\\' {
+            String.push(b, "\\" + Char.toString(c))
+        } else if n < 32 {
+            String.push(b, "\\" + Int.toString((n >> 6) & 7) + Int.toString((n >> 3) & 7)
+                           + Int.toString(n & 7))
+        } else {
+            String.push(b, Char.toString(c))
+        }
+    }
+    String.push(b, "\"")
+    String.build(b)
 }
 
 -- Bytes as a `.byte` directive, never as a quoted string: the text is whatever

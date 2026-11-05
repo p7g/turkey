@@ -942,8 +942,10 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- looked up then, and an array too large for a size class is the
         -- runtime's (`allocateArray`).
         ArrayNew(length, initial, element) -> {
-            emit(s, A.AllocateArray(d, A.reg(length), raw(s, initial), A.ArrayAllocation {
-                width = Rt.elementWidth(element.class_), layout = Rt.layoutCode(element),
+            let width = Rt.elementWidth(element.class_)
+            emit(s, A.AllocateArray(d, A.reg(length), fillPattern(s, initial, width),
+                                    A.ArrayAllocation {
+                width = width, layout = Rt.layoutCode(element),
                 slow = calleeOf(s, "turkey_array_new"),
                 classes = untracedGlobal(s, Rt.classesGlobal), sizes = s.sizesRecorded,
             }))
@@ -1419,6 +1421,35 @@ fun raw(s : Sel, v : Value) -> Reg {
     let bits = temp(s, Ssa.untraced(I64))
     emit(s, A.FMovOut(bits, A.reg(v)))
     bits
+}
+
+-- A general register holding `v`'s bits once per element of `width` bytes,
+-- which is what `AllocateArray` takes as its fill: the emitter stores it a
+-- word or a pair of words at a time, and the runtime's slow path reads only
+-- the element's low bytes of it. A constant fill is widened here, at
+-- compile time.
+fun fillPattern(s : Sel, v : Value, width : Int) -> Reg {
+    let copies = match width {
+        1 -> 0x0101_0101_0101_0101
+        4 -> 0x0000_0001_0000_0001
+        _ -> 1
+    }
+    if let Some(n) = known(s, v) {
+        let low = match width {
+            1 -> n & 0xFF
+            4 -> n & 0xFFFF_FFFF
+            _ -> n
+        }
+        return immediate(s, Int.mulWrapping(low, copies))
+    }
+    if copies == 1 { return raw(s, v) }
+    -- Clear the bits above the element first: nothing says a narrow value's
+    -- register holds zeroes there, and the multiply would spread them.
+    let low = temp(s, Ssa.untraced(I64))
+    emit(s, A.Ubfx(low, A.reg(v), 0, 8 * width))
+    let word = temp(s, Ssa.untraced(I64))
+    emit(s, A.Mul(word, low, immediate(s, copies), A.W64))
+    word
 }
 
 -- A move between any two banks. The pair of banks is what picks the

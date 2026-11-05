@@ -573,19 +573,35 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.Str(cursor, Offset(dest, 0), A.W64))
     instruction(b, A.Str(length, Offset(dest, 8), A.W64))
     -- Every element, including an array of pointers to nothing, which the
-    -- collector may walk before anything else is stored.
+    -- collector may walk before anything else is stored. `fill` is the
+    -- element's pattern repeated across a word (`Select.fillPattern`), so
+    -- the elements are stored in whole words: the first on its own, then
+    -- pairs from the last down. When the words are even in number, the
+    -- last pair stores the first word again, which costs one store and
+    -- saves a test.
+    --
+    -- The last word may run past the last element, and stays inside the
+    -- slot: every size class is a multiple of 8 bytes and the class is
+    -- chosen by the array's size rounded up to 8, so the slot holds the
+    -- header and the elements rounded up to a word.
+    --
+    -- `cursor` starts 8 below the last pair, at the elements' bytes rounded
+    -- up to a word less one word, so that the pair is stored at `cursor + 8`
+    -- and the loop runs while `cursor` is above `dest`: it stops at `dest`
+    -- for an odd count of words and at `dest - 8` for an even one.
     instruction(b, A.Cbz(length, back, A.W64))
-    instruction(b, A.AddImm(cursor, dest, Rt.arrayElements, A.W64))
-    instruction(b, A.Mov(word, length, A.W64))
+    instruction(b, A.Str(fill, Offset(dest, Rt.arrayElements), A.W64))
+    instruction(b, A.SubImm(cursor, length, 1, A.W64))
+    if shift < 3 { instruction(b, A.LsrImm(cursor, cursor, 3 - shift, A.W64)) }
+    instruction(b, A.LslImm(cursor, cursor, 3, A.W64))
+    instruction(b, A.Add(cursor, dest, cursor, A.W64))
+    instruction(b, A.Cmp(cursor, dest, A.W64))
+    instruction(b, A.BCond(A.Ls, back))
     emit(b, Label(top))
-    match al.width {
-        1 -> instruction(b, A.Strb(fill, Offset(cursor, 0)))
-        4 -> instruction(b, A.Str(fill, Offset(cursor, 0), A.W32))
-        _ -> instruction(b, A.Str(fill, Offset(cursor, 0), A.W64))
-    }
-    instruction(b, A.AddImm(cursor, cursor, al.width, A.W64))
-    instruction(b, A.SubSImm(word, word, 1, A.W64))
-    instruction(b, A.BCond(A.Ne, top))
+    instruction(b, A.Stp(fill, fill, cursor, 8))
+    instruction(b, A.SubImm(cursor, cursor, 16, A.W64))
+    instruction(b, A.Cmp(cursor, dest, A.W64))
+    instruction(b, A.BCond(A.Hi, top))
     emit(b, Label(back))
     -- The stub: the length and the fill into the first two argument
     -- registers, without either overwriting the other, and without a move

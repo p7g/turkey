@@ -919,9 +919,11 @@ type Local = Local {
     built     : Vec (String, Int, Ty.Type, Core, Vec VarCell, Map Int Ty.Type),
 }
 
--- What a local is found under in a scope: its id and its spelling together.
--- After `Turkey.Opt` that pair is a binder's identity, and a binder with no id
--- has only its spelling.
+-- What a local is found under in a scope: its id and its spelling together,
+-- or its spelling alone for a binder with no id. After `Turkey.Opt` the pair
+-- is not unique, since an inlined copy keeps the ids it copied, so a key
+-- identifies a binder only together with the scope: `localNamed` searches the
+-- innermost scope first, as the binding structure does.
 fun localKey(name : String, id : Int) -> String = Int.toString(id) + ":" + name
 
 fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
@@ -1667,11 +1669,13 @@ fun newLocal(s : Sharer, sc : Scope, name : String, id : Int, ty : Ty.Type,
 -- into the owner's one layouts map beside every other copy's: two copies of one
 -- local at two layouts are two sets of variables, not one set at two layouts.
 --
--- The copy is a binder of its own, minted into the local's owner; this pass
--- runs on one thread, so the order it mints in is the program's. A local with
--- no id has copies with none. The spelling is the local's and the layout key,
--- which tells one local's copies apart; two locals sharing a spelling have
--- copies sharing one, scoped as the locals are.
+-- The copy is a binder of its own, minted into the local's owner as a
+-- `CopyOf` it, so it takes the binding's span. It records no type arguments:
+-- it is keyed by layout, and every argument tuple with that layout shares it.
+-- This pass runs on one thread, so the order it mints in is the program's. A
+-- local with no id has copies with none. The spelling is the local's and the
+-- layout key, which tells one local's copies apart; two locals sharing a
+-- spelling have copies sharing one, scoped as the locals are.
 fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
                  at : Core) -> (String, Int) {
     if len(args) != len(local.binders) {
@@ -1693,7 +1697,7 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
     let made = local.name + "@[" + k + "]"
     let madeId = if local.id == noId { noId } else {
         Binders.fresh(s.table, Binders.ownerOf(local.id), made, Binders.Local,
-                      Specialized(Some(local.id), args, at.span))
+                      CopyOf(local.id))
     }
     let renaming = Map.new()
     let fresh = Vec.new(len(local.binders))

@@ -68,12 +68,13 @@ import Net.HTTP.Method as Method (Method)
 import Net.HTTP.Status as Status (Status)
 import Net.HTTP.Token as Token (Token)
 import System.Sync as Sync
-import System.Sync (AtomicInt, Mutex)
+import System.Sync (AtomicInt)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 import Turkey.HTTPField (HeaderName(..), HeaderValue(..))
 import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.ReadWrite (Write(..))
+import Turkey.Workers as Workers
 import URL (URLError(..))
 
 -- A request head to write. `framing` must not be `UntilClose`, which only a
@@ -107,12 +108,30 @@ type OutgoingResponse = OutgoingResponse {
 
 -- -- buffers -------------------------------------------------------------------------
 
--- Output buffers no connection is using: at most `keep` of them, so that a
--- burst of busy connections leaves at most `keep` buffers behind.
-type Buffers = Buffers { free : Mutex (Vec Buffer), keep : Int }
+-- Output buffers no connection is using, so that a burst of busy
+-- connections leaves at most about `keep` buffers behind.
+--
+-- The pool keeps a list for each thread (`Turkey.Workers.index`), which only
+-- the task running on that thread touches, so taking and giving back takes no
+-- lock: a task does not suspend between reading the thread's index and
+-- touching its list, so no other task runs on that thread meanwhile. A buffer
+-- taken on one thread may go back on another. Each list keeps at most `keep`
+-- divided among the threads that run tasks (`Turkey.Workers.permits`), and at
+-- least one.
+type Buffers = Buffers { free : Array (Option (Vec Buffer)), keep : Int }
 
--- Returns an empty pool that keeps at most `keep` buffers.
-fun buffers(keep : Int) -> Buffers = Buffers { free = Sync.mutex([]), keep }
+-- Returns an empty pool that keeps at most about `keep` buffers.
+fun buffers(keep : Int) -> Buffers =
+    Buffers { free = Array.filled(Workers.threadLimit(), None), keep }
+
+-- The running thread's list of `p`'s free buffers.
+fun mine(p : Buffers) -> Vec Buffer {
+    let i = Workers.index()
+    if let Some(free) = p.free[i] { return free }
+    let free = []
+    p.free[i] = Some(free)
+    free
+}
 
 -- How large a pooled buffer is: room for a head of a few dozen fields and
 -- the first few KiB of its body.
@@ -155,8 +174,11 @@ fun release(o : Outbox) -> Unit {
     }
 }
 
-fun giveBack(p : Buffers, b : Buffer) -> Unit =
-    Sync.withLock(p.free, fun(free) { if len(free) < p.keep { Vec.push(free, b) } })
+fun giveBack(p : Buffers, b : Buffer) -> Unit {
+    let free = mine(p)
+    let most = p.keep / Workers.permits()
+    if len(free) < (if most < 1 { 1 } else { most }) { Vec.push(free, b) }
+}
 
 -- Returns the outbox's buffer, emptied, taking one from the pool first if
 -- it holds none.
@@ -164,7 +186,7 @@ fun lent(o : Outbox) -> Buffer {
     let b = match o.lent {
         Some(b) -> b
         None -> {
-            let b = match Sync.withLock(o.pool.free, Vec.pop) {
+            let b = match Vec.pop(mine(o.pool)) {
                 Some(b) -> b
                 None -> Buf.buffer(size)
             }

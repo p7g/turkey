@@ -192,6 +192,12 @@ type Lowerer = Lowerer {
     -- each binder bound in it gets, by the binder `binders` records. Empty
     -- elsewhere. See `copiesOf`.
     var copies   : Map Int Int,
+    -- The dictionaries in scope, by the spelling inference gave each, and the
+    -- id of each one's binder. See `withDicts`.
+    dicts        : Map String Int,
+    -- What each pattern that opens an existential binds, by the pattern's
+    -- node, as its latest lowering minted it. See `openPattern`.
+    opened       : Map Int Opened,
 }
 
 fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
@@ -201,7 +207,7 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
     build = build, binders = binders,
     rigid = Map.new(), placeholders = Map.new(), counter = 0,
     owner = 0, site = Span { file = "", line = 0, col = 0, endLine = 0, endCol = 0 },
-    copies = Map.new(),
+    copies = Map.new(), dicts = Map.new(), opened = Map.new(),
 }
 
 -- A binder this pass invents: its spelling, and its id.
@@ -221,7 +227,7 @@ fun freshName(l : Lowerer, hint : String) -> (String, Int) {
 
 -- Returns the id of a new binder spelled `name`, in the current owner.
 fun mint(l : Lowerer, name : String) -> Int =
-    Binders.fresh(l.binders, l.owner, name, Local, Generated(l.site))
+    Binders.fresh(l.binders, l.owner, name, Local, Generated(Some(l.site)))
 
 -- Returns the id of a new binder spelled `name` that copies the binder `id`,
 -- in the current owner: the cell that holds a reassigned binder, or the local
@@ -300,6 +306,91 @@ fun under(l : Lowerer, copies : Map Int Int, lower : fun() -> a) -> a {
     out
 }
 
+-- -- dictionaries in scope ----------------------------------------------------------
+
+-- Inference names each dictionary a term takes or opens -- a function's
+-- context, an instance's, a method's own, the instance's own dictionary
+-- inside one of its methods, an existential's evidence -- and the evidence it
+-- records for a use refers to a dictionary by that name. No two places in the
+-- source share a name, but one name may still have several binders: this
+-- pass lowers some source more than once (see `copiesOf`), and every member
+-- of a group of functions binds the group's one context. So each place that
+-- binds dictionaries mints a binder for each, in the current owner, before it
+-- lowers the scope they are bound over, and a reference in that scope means
+-- the innermost binder of its name.
+
+-- Returns a new binder, in the current owner, for each dictionary in `names`:
+-- its spelling and its id.
+fun mintDicts(l : Lowerer, names : Array String) -> Array (String, Int) =
+    Array.map(names, fun(name) = (name, mint(l, name)))
+
+-- Returns `lower()`, run with the dictionaries `bound` in scope.
+fun withDicts(l : Lowerer, bound : Array (String, Int), lower : fun() -> a) -> a {
+    let saved = Array.map(bound, fun((name, _)) = (name, Map.get(l.dicts, name)))
+    for (name, id) in bound { Map.put(l.dicts, name, id) }
+    let out = lower()
+    for var i = len(saved) - 1; i >= 0; i = i - 1 {
+        match saved[i] {
+            (name, Some(id)) -> Map.put(l.dicts, name, id)
+            (name, None) -> discard(Map.delete(l.dicts, name))
+        }
+    }
+    out
+}
+
+-- Returns the reference to the dictionary in scope that inference named
+-- `name`. Raises an internal error when none is.
+fun dictRef(l : Lowerer, name : String, where : Option Span) -> Ref =
+    match Map.get(l.dicts, name) {
+        Some(id) -> ById(id)
+        None -> oops("the dictionary '" + name + "' is not in scope", where)
+    }
+
+-- Mints the evidence binders of every existential `pat` opens, records what
+-- each opening pattern binds for `Turkey.Match` to read (`openedBy`), and
+-- returns the binders, to be brought into scope over the code the pattern
+-- guards.
+fun openPattern(l : Lowerer, pat : Pat) -> Array (String, Int) {
+    let out = []
+    for p in openingPatterns(pat) {
+        if let Some(o) = p.opening {
+            let bound = mintDicts(l, o.evidence)
+            Map.put(l.opened, p.id, Opened { evidence = bound, skolems = o.skolems,
+                                             layouts = None })
+            for b in bound { Vec.push(out, b) }
+        }
+    }
+    Vec.toArray(out)
+}
+
+-- What the pattern `p`, which opens an existential, binds at its latest
+-- lowering.
+fun openedBy(l : Lowerer, p : Pat) -> Opened = match Map.get(l.opened, p.id) {
+    Some(o) -> o
+    None -> oops("an existential pattern was compiled before it was opened", Some(p.span))
+}
+
+-- Every node of `p` that opens an existential, outermost first. An
+-- alternative cannot open one, so only the first of each `POr` is searched,
+-- as `varPatterns` searches it.
+fun openingPatterns(p : Pat) -> Vec Pat {
+    let out = []
+    openingPatternsInto(p, out)
+    out
+}
+
+fun openingPatternsInto(p : Pat, out : Vec Pat) -> Unit {
+    if Option.isSome(p.opening) { Vec.push(out, p) }
+    match p.kind {
+        PVar(_) | PWild | PLit(_) -> {}
+        PCon(_, args) -> for a in args { openingPatternsInto(a, out) }
+        PRecord(_, fields, _) -> for (_, sub) in fields { openingPatternsInto(sub, out) }
+        PTuple(elems) -> for e in elems { openingPatternsInto(e, out) }
+        PAnnot(inner, _) -> openingPatternsInto(inner, out)
+        POr(alts) -> openingPatternsInto(alts[0], out)
+    }
+}
+
 fun patternBinder(l : Lowerer, p : Pat) -> Int =
     binderOf(l, p.id, varName(p), Some(p.span))
 
@@ -371,6 +462,7 @@ fun compiled(l : Lowerer, binderOf : fun(Pat) -> Int, scrutinee : Core,
         reduce = fun(t) = resolved(l, t),
         fresh = freshName(l, _),
         binderOf = binderOf,
+        opened = openedBy(l, _),
     }, scrutinee, arms, ty, where)
 
 -- A placeholder for a type this pass fills in a moment later.
@@ -464,8 +556,6 @@ fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction) -> Ty.Type
 -- statements, so there is nowhere for a multi-name binder to live.
 fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
              scope : Scope, owner : String) -> Vec CBind {
-    let lowered = expr(l, value, scope)
-    let dicts = abstractionOf(l, stmt.id)
     let bare = unannot(pat)
     match bare.kind {
         PVar(name) -> {
@@ -475,7 +565,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
                 Some(sc) -> sc.quantified
                 None -> []
             }
-            var body = abstract(l, lowered, dicts)
+            var body = abstract(l, abstractionOf(l, stmt.id), fun() = expr(l, value, scope))
             if mutable {
                 Map.put(scope.cells, id, (name, id))
                 body = node(refOf(body.ty), Some(stmt.span), CRef(body))
@@ -486,6 +576,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         }
         _ -> {}
     }
+    let lowered = expr(l, value, scope)
     let (holderName, holderId) = freshName(l, "bound")
     let holder = owner + "#" + holderName
     let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, Some(stmt.span))]
@@ -538,9 +629,11 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
     }
     let result = dictType(l, inst.cls, inst.head)
     if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
-    if inst.cls == P.typedClass { return typeRepDict(l, inst, result) }
+    let bound = contextParams(l, inst, plan)
+    if inst.cls == P.typedClass { return typeRepDict(l, inst, result, bound) }
     let givens = instanceGivens(l, inst, plan)
-    let record = dictionary(l, inst.cls, result, Some(inst.decl.span), fun(slot) =
+    let record = withDicts(l, bound, fun() = dictionary(l, inst.cls, result,
+                                                      Some(inst.decl.span), fun(slot) =
         match slot {
             SuperSlot(sup) -> match Map.get(plan.supers, sup) {
                 Some(ev) -> evidence(l, ev, dictType(l, sup, inst.head), givens)
@@ -554,20 +647,8 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
             }
             KeyedSlot(_, _) -> oops("a keyed slot before layouts are shared",
                                     Some(inst.decl.span))
-        })
-    var value = record
-    if len(plan.params) > 0 {
-        let count = fewer(len(plan.params), len(inst.context))
-        let params = Array.init(count, fun(i) {
-            let p = inst.context[i]
-            CParam {
-                name = plan.params[i], id = noId, ty = dictType(l, p.name, p.args[0]),
-            }
-        })
-        value = node(TFun(Array.map(params, _.ty), result),
-                     Some(inst.decl.span),
-                     CLam(params, record, instName(inst)))
-    }
+        }))
+    let value = overContext(l, inst, bound, record, result)
     let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
                     value, Some(inst.decl.span))
     -- A method's own equalities, at this head. A binding is where Core keeps the
@@ -616,12 +697,8 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
 -- The `Proxy` argument carries nothing and is ignored. It exists so a call can
 -- say which instance it means, since the answer depends on the type and not on
 -- any value of it.
-fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
-    let plan = match inst.plan {
-        Some(pl) -> pl
-        None -> oops("a derived 'Typed' instance has no plan",
-                     Some(inst.decl.span))
-    }
+fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
+               bound : Array (String, Int)) -> CBind {
     let span = Some(inst.decl.span)
     let repTy = Decls.head(l.decls, P.typeRepCon)
     let (head, _) = Ty.spine(inst.head)
@@ -630,15 +707,14 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
         TTuple(elems) -> "Tuple" + Int.toString(len(elems))
         _ -> oops("a derived 'Typed' instance has no constructor", span)
     }
-    let count = fewer(len(plan.params), len(inst.context))
-    let elems = Array.init(count, fun(i) {
+    let elems = Array.init(len(bound), fun(i) {
         let pred = inst.context[i]
         let argument = pred.args[0]
         let proxyTy = Ty.applyTo(Decls.head(l.decls, P.proxyCon),
                                  [argument], span)
         let dictTy = dictType(l, pred.name, argument)
         let method = node(TFun([proxyTy], repTy), span,
-                          CSlot(node(dictTy, span, CVar(BySpelling(plan.params[i]))),
+                          CSlot(node(dictTy, span, CVar(ById(bound[i].1))),
                                 slotFor(l, P.typedClass, typeRepMethod(l), span)))
         node(repTy, span, CApp(method, [node(proxyTy, span, CCon(P.proxyCon))]))
     })
@@ -652,21 +728,31 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
                     CLam([CParam { name = "%p", id = mint(l, "%p"), ty = ownProxy }], made,
                          instName(inst) + "#typeRep"))
     let record = dictionary(l, inst.cls, result, span, fun(_) = body)
-    var value = record
-    if len(plan.params) > 0 {
-        let count = fewer(len(plan.params), len(inst.context))
-        let params = Array.init(count, fun(i) {
-            let pr = inst.context[i]
-            CParam {
-                name = plan.params[i], id = noId, ty = dictType(l, pr.name, pr.args[0]),
-            }
-        })
-        value = node(TFun(Array.map(params, _.ty), result), span,
-                     CLam(params, record, instName(inst)))
-    }
+    let value = overContext(l, inst, bound, record, result)
     let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
                     value, span)
     b
+}
+
+-- The binders of an instance's context, one for each dictionary it takes,
+-- under the names the plan gave them.
+fun contextParams(l : Lowerer, inst : InstInfo, plan : InstancePlan)
+        -> Array (String, Int) =
+    mintDicts(l, Array.init(fewer(len(plan.params), len(inst.context)),
+                            fun(i) = plan.params[i]))
+
+-- An instance's dictionary `record`, of type `result`, as a function of its
+-- context `bound`, or `record` itself for an instance with none.
+fun overContext(l : Lowerer, inst : InstInfo, bound : Array (String, Int), record : Core,
+                result : Ty.Type) -> Core {
+    if len(bound) == 0 { return record }
+    let params = Array.init(len(bound), fun(i) {
+        let p = inst.context[i]
+        let (name, id) = bound[i]
+        CParam { name = name, id = id, ty = dictType(l, p.name, p.args[0]) }
+    })
+    node(TFun(Array.map(params, _.ty), result), Some(inst.decl.span),
+         CLam(params, record, instName(inst)))
 }
 
 fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
@@ -756,7 +842,8 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
     }
     let count = fewer(len(params), len(inst.context))
     let args = Array.init(count, fun(i) {
-        node(predType(l, inst.context[i]), Some(inst.decl.span), CVar(BySpelling(params[i])))
+        node(predType(l, inst.context[i]), Some(inst.decl.span),
+             CVar(dictRef(l, params[i], Some(inst.decl.span))))
     })
     fn.ty = TFun(Array.map(args, _.ty), result)
     node(result, Some(inst.decl.span), CApp(fn, args))
@@ -799,14 +886,15 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
     let owned = enter(l, impl.decl.id, info.module_, defaultName(cls, name),
                       impl.decl.span)
     let saved = setSkolems(l, impl, mi, [cvar])
-    var body = function(l, impl.decl, mi.scheme.body, newScope(),
-                        Some(impl.dictParams),
-                        Some(Classes.methodDicts(mi)))
+    let self = mint(l, impl.selfName)
+    var body = withDicts(l, [(impl.selfName, self)], fun() =
+        function(l, impl.decl, mi.scheme.body, newScope(), Some(impl.dictParams),
+                 Some(Classes.methodDicts(mi))))
     l.rigid = saved
     leave(l, owned)
     body = methodAbstraction(mi, body, Some(impl.decl.span))
     let lam = node(TFun([selfTy], body.ty), Some(impl.decl.span),
-        CLam([CParam { name = impl.selfName, id = noId, ty = selfTy }], body,
+        CLam([CParam { name = impl.selfName, id = self, ty = selfTy }], body,
              defaultName(cls, name)))
     let b = newBind(info.module_, defaultName(cls, name), noId, lam.ty, [cvar], lam,
                     Some(impl.decl.span))
@@ -849,13 +937,14 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let owned = enter(l, impl.decl.id, inst.module_,
                       instName(inst) + "." + name, impl.decl.span)
     let saved = setSkolems(l, impl, mi, Ty.varsOf([inst.head]))
-    var body = function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
-                        Some(Classes.methodDicts(mi)))
+    let self = if impl.selfName != "" { [(impl.selfName, mint(l, impl.selfName))] } else { [] }
+    var body = withDicts(l, self, fun() =
+        function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
+                 Some(Classes.methodDicts(mi))))
     l.rigid = saved
     leave(l, owned)
-    if impl.selfName != "" {
-        body = bindSelf(l, inst, params, impl.selfName, body,
-                        Some(impl.decl.span))
+    for (selfName, selfId) in self {
+        body = bindSelf(l, inst, params, selfName, selfId, body, Some(impl.decl.span))
     }
     methodAbstraction(mi, body, Some(impl.decl.span))
 }
@@ -1068,15 +1157,15 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- itself, so a binding evaluated while the dictionary is being built would build
 -- the dictionary again, for ever. Under the lambda it is evaluated when the
 -- method is *called*, by which time the dictionary exists.
-fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String,
+fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
              body : Core, where : Option Span) -> Core {
     let own = selfDict(l, inst, params)
     match body.kind {
         CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,
-            node(inner.ty, where, CLet(name, noId, own.ty, own, inner, [])),
+            node(inner.ty, where, CLet(name, id, own.ty, own, inner, [])),
             lamName))
         _ -> node(body.ty, where,
-                  CLet(name, noId, own.ty, own, body, []))
+                  CLet(name, id, own.ty, own, body, []))
     }
 }
 
@@ -1131,7 +1220,7 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
                 None -> want
             }
         }
-        var out = node(start, None, CVar(BySpelling(name)))
+        var out = node(start, None, CVar(dictRef(l, name, None)))
         var cls = match dictClass(start) {
             Some(c) -> c
             None -> oops("'" + name + "' is not a dictionary", None)
@@ -1265,11 +1354,14 @@ fun function(l : Lowerer, decl : FunDecl, ty : Ty.Type, scope : Scope,
         }
         None -> {}
     }
-    let saved = signatureSkolems(l, dicts, ty)
-    let inner = lambdaOf(l, decl.params, body, ty, Some(decl.span), scope,
-                         decl.name)
-    l.rigid = saved
-    wrapDicts(l, inner, params, ps, Some(decl.span))
+    let bound = dictBinders(l, Option.unwrapOr(params, []), Option.unwrapOr(ps, []))
+    let inner = withDicts(l, bound, fun() {
+        let saved = signatureSkolems(l, dicts, ty)
+        let made = lambdaOf(l, decl.params, body, ty, Some(decl.span), scope, decl.name)
+        l.rigid = saved
+        made
+    })
+    wrapDicts(l, inner, bound, Option.unwrapOr(ps, []), Some(decl.span))
 }
 
 -- The constant-to-variable map for a signature-checked body.
@@ -1302,30 +1394,33 @@ fun signatureSkolems(l : Lowerer, dicts : Option Abstraction,
     }
 }
 
-fun wrapDicts(l : Lowerer, inner : Core, params : Option (Vec String),
-              preds : Option (Vec Pred), where : Option Span) -> Core {
-    let ns = match params {
-        Some(p) -> p
-        None -> return inner
-    }
-    if len(ns) == 0 { return inner }
-    let ps = match preds {
-        Some(p) -> p
-        None -> []
-    }
-    let count = fewer(len(ns), len(ps))
-    let cparams = Array.init(count, fun(i) = CParam {
-        name = ns[i], id = noId, ty = dictType(l, ps[i].name, ps[i].args[0]),
+-- Returns the binders of a lambda over the dictionaries `names`, one for
+-- each of `preds`.
+fun dictBinders(l : Lowerer, names : Vec String, preds : Vec Pred) -> Array (String, Int) =
+    mintDicts(l, Array.init(fewer(len(names), len(preds)), fun(i) = names[i]))
+
+-- `inner` under a lambda over the dictionaries `bound`, at `preds`, or `inner`
+-- itself when there are none.
+fun wrapDicts(l : Lowerer, inner : Core, bound : Array (String, Int), preds : Vec Pred,
+              where : Option Span) -> Core {
+    if len(bound) == 0 { return inner }
+    let cparams = Array.init(len(bound), fun(i) {
+        let (name, id) = bound[i]
+        CParam { name = name, id = id, ty = dictType(l, preds[i].name, preds[i].args[0]) }
     })
     node(TFun(Array.map(cparams, _.ty), inner.ty), where,
          CLam(cparams, inner, "<anonymous>"))
 }
 
-fun abstract(l : Lowerer, value : Core, dicts : Option Abstraction) -> Core =
+-- Returns `lower()` under a lambda over the dictionaries `dicts` takes, which
+-- are in scope while it runs.
+fun abstract(l : Lowerer, dicts : Option Abstraction, lower : fun() -> Core) -> Core =
     match dicts {
-        None -> value
-        Some(a) -> if len(a.params) == 0 { value } else {
-            wrapDicts(l, value, Some(a.params), Some(a.preds), value.span)
+        None -> lower()
+        Some(a) -> {
+            let bound = dictBinders(l, a.params, a.preds)
+            let value = withDicts(l, bound, lower)
+            wrapDicts(l, value, bound, a.preds, value.span)
         }
     }
 
@@ -1386,15 +1481,21 @@ fun lambdaOf(l : Lowerer, params : Vec Pat, body : Expr, ty : Ty.Type,
     inner.ret = None
     inner.brk = None
     inner.cont = None
+    -- The evidence a destructured parameter opens is in scope over the body,
+    -- as its variables are.
+    let evidence = []
+    for (_, pat) in matches {
+        for b in openPattern(l, pat) { Vec.push(evidence, b) }
+    }
     var joined : Option ((String, Int), CParam) = None
     var out = node(TBottom, where, CUnit)
     if holdsReturn(ChExpr(body)) {
         let ret = freshName(l, "ret")
         joined = Some((ret, freshParam(l, "rv", fnRet)))
         inner.ret = Some(ret)
-        out = conv(l, body, inner, Some(ret))
+        out = withDicts(l, Vec.toArray(evidence), fun() = conv(l, body, inner, Some(ret)))
     } else {
-        out = expr(l, body, inner)
+        out = withDicts(l, Vec.toArray(evidence), fun() = expr(l, body, inner))
     }
     -- Each cell holds its binder's value, and is bound inside the binder: a
     -- destructured parameter's cells inside the match that binds it, a named
@@ -1875,15 +1976,18 @@ fun armBodies(l : Lowerer, arms : Vec Arm, ty : Ty.Type, scope : Scope,
                 Binders.boundIn(l.binders, ChArm(arm), bound)
                 copiesOf(l, bound)
             }
+            let evidence = openPattern(l, pat)
             -- A guarded body is lowered when the `match` is compiled, after
-            -- this loop, so it puts its copies back in place itself.
+            -- this loop, so it puts its copies and evidence back in place
+            -- itself.
             let body = if len(arm.guards) == 0 {
-                Match.Taken(under(l, copies, fun() = celled(l, pat, ChArm(arm),
-                    lower(arm.body, _), childScope(scope), where)))
+                Match.Taken(under(l, copies, fun() = withDicts(l, evidence, fun() =
+                    celled(l, pat, ChArm(arm), lower(arm.body, _), childScope(scope),
+                           where))))
             } else {
-                Match.Guarded(fun(fail) = under(l, copies, fun() = celled(l, pat,
-                    ChArm(arm), guarded(l, arm, 0, ty, _, lower, fail),
-                    childScope(scope), where)))
+                Match.Guarded(fun(fail) = under(l, copies, fun() = withDicts(l, evidence,
+                    fun() = celled(l, pat, ChArm(arm), guarded(l, arm, 0, ty, _, lower, fail),
+                                   childScope(scope), where))))
             }
             under(l, copies, fun() = addArm(l, out, pat, body))
         }
@@ -2544,7 +2648,7 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
 fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
                 mutable : Bool, rest : fun() -> Core, scope : Scope) -> Core {
     let at = Some(stmt.span)
-    let value = abstract(l, expr(l, source, scope), abstractionOf(l, stmt.id))
+    let value = abstract(l, abstractionOf(l, stmt.id), fun() = expr(l, source, scope))
     let bare = unannot(pat)
     let binders = letBinders(l, stmt, pat)
     match bare.kind {

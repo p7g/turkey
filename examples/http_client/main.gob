@@ -1,0 +1,46 @@
+-- Fetches a URL and prints the URL it ended at after redirects, its
+-- status, its fields and up to 1 MiB of its body: `fetch https://example.com/`.
+--
+--     build/stages/stage2 build -o fetch.o examples/http_client/main.gob
+--     cc -o fetch fetch.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
+--     ./fetch https://example.com/
+--
+-- The client reaches only the public internet, its default, follows up to
+-- five redirects, and gives the whole exchange ten seconds.
+
+import Net.HTTP (..)
+import Net.HTTP.Client as Client
+import Net.HTTP.Client (send)
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Headers as Headers
+import Net.HTTP.HTTPURL as HTTPURL
+import System.Env as Env
+import System.IO as IO
+import Time.Duration as Duration
+
+fun fetch(c : Client.Client, url : String) -> Either SomeError String =
+    send(c, request(GET, url), Duration.seconds(10), fun(resp) {
+        var out = HTTPURL.toString(resp.url) + "\n" + show(resp.status) + "\n"
+        for (name, value) in Headers.fields(resp.headers) {
+            out = out + HeaderName.toString(name) + ": " + HeaderValue.toString(value) + "\n"
+        }
+        let b = receive(resp.body, 1048576)?
+        Right(out + "\n" + String.fromBytesLossy(IO.bytes(b)))
+    })
+
+fun main() {
+    let args = Env.args()
+    if len(args) != 1 {
+        error("usage: fetch URL")
+    }
+    let c = match Client.client(Client.follow(5)) {
+        Right(c) -> c
+        Left(e) -> error(show(e))
+    }
+    match fetch(c, args[0]) {
+        Right(text) -> print(text)
+        Left(e) -> print("error: " + Error.describe(e))
+    }
+    Client.close(c)
+}

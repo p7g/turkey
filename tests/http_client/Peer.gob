@@ -1,0 +1,246 @@
+export (
+    Peer, Seen(..), Reply(..), After(..), Expectation(..),
+    plain, secure, expecting, serve, port, accepted, closedConnections, discarded, closeListener, hold, release,
+    response, ok, redirectTo, reply,
+)
+
+-- A scripted HTTP/1 server on loopback, for the client's tests: it reads
+-- each request with the codec, and answers it with whatever bytes the test's
+-- script says, then keeps the connection, closes it, or misbehaves as told.
+-- Each connection is served by a task of its own.
+
+import Net
+import Net.HTTP (..)
+import Net.HTTP.H1.Body as Framed
+import Net.HTTP.H1.Head as Head
+import Net.HTTP.H1.Head (RequestHead(..), Framing(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.H1.Input (HeadBytes(..))
+import Net.HTTP.Limits as Limits
+import Net.HTTP.Method as Method
+import Net.HTTP.Token as Token
+import Net.TCP as TCP
+import Net.TLS as TLS
+import System.IO as IO
+import System.IO (Write(..))
+import System.Sync as Sync
+import System.Task as Task
+import Time.Duration as Duration
+import Time.Duration (Duration)
+import Time.Sleep (sleep)
+
+let loopback : Net.IP = Net.V4(0x7f000001)
+
+-- A request as the peer saw it: which connection it came on (from 1), its
+-- method, target, fields, body and trailers. `chunked` is whether the body
+-- came chunked, `expected` whether the request came with
+-- `Expect: 100-continue`, and `upgrade` the protocols it offered.
+type Seen = Seen { connection : Int, method : String, path : String, headers : Headers, body : String,
+                   trailers : Headers, chunked : Bool, expected : Bool, upgrade : Array String }
+
+-- What to send, and what to do after.
+type Reply = Reply { bytes : String, after : After }
+
+-- * `Keep`: read the next request on the connection.
+-- * `Close`: close the connection.
+-- * `Linger`: end the output, then read and discard until the client closes
+--   its end, so the client reads the reply before it sees the close.
+-- * `Stall(d)`: send nothing more for `d`, then close.
+-- * `Drip(pieces, d)`: send each piece `d` apart, then close.
+-- * `Echo`: send back every byte that arrives until the client ends its
+--   output, then close: the protocol a 101 switches to.
+type After = Keep | Close | Linger | Stall(Duration) | Drip(Array String, Duration) | Echo
+
+-- What the peer does with a request that has `Expect: 100-continue`:
+-- * `Grant`: send a 100, then read the body;
+-- * `Refuse(bytes)`: send `bytes` instead, then read and count what the
+--   client sends until it closes (`discarded`);
+-- * `Ignore`: read the body as though nothing was asked;
+-- * `Early(bytes)`: as `Refuse`, for every request, whether it asked or not.
+type Expectation = Grant | Refuse(String) | Ignore | Early(String)
+
+type Peer = Peer {
+    listener : TCP.Listener,
+    tls : Option TLS.ServerConfig,
+    port : Int,
+    accepted : Sync.AtomicInt,
+    -- How many connections the peer has closed.
+    closed : Sync.AtomicInt,
+    -- How many bytes the peer read after refusing an expectation.
+    discarded : Sync.AtomicInt,
+    expectation : Expectation,
+    answer : fun(Seen) -> Reply,
+}
+
+fun listening() -> (TCP.Listener, Int) = match TCP.listen(loopback, 0) {
+    Right(l) -> (l, TCP.listenerAddress(l).1)
+    Left(e) -> error(show(e))
+}
+
+fun peer(tls : Option TLS.ServerConfig, expectation : Expectation, answer : fun(Seen) -> Reply) -> Peer {
+    let (l, port) = listening()
+    Peer { listener = l, tls, port, accepted = Sync.atomicInt(0), closed = Sync.atomicInt(0),
+           discarded = Sync.atomicInt(0), expectation, answer }
+}
+
+fun plain(answer : fun(Seen) -> Reply) -> Peer = peer(None, Grant, answer)
+
+fun secure(config : TLS.ServerConfig, answer : fun(Seen) -> Reply) -> Peer = peer(Some(config), Grant, answer)
+
+fun expecting(e : Expectation, answer : fun(Seen) -> Reply) -> Peer = peer(None, e, answer)
+
+fun port(p : Peer) -> Int = p.port
+fun accepted(p : Peer) -> Int = Sync.load(p.accepted)
+fun discarded(p : Peer) -> Int = Sync.load(p.discarded)
+
+-- Returns how many connections have ended, by either side's close.
+fun closedConnections(p : Peer) -> Int = Sync.load(p.closed)
+
+-- Stops accepting, which ends `serve` once its connection closes.
+fun closeListener(p : Peer) -> Unit {
+    let _ = TCP.closeListener(p.listener)
+}
+
+-- Waits until the peer has closed `n` connections.
+fun hold(p : Peer, n : Int) -> Unit {
+    while Sync.load(p.closed) < n { sleep(Duration.millis(5)) }
+}
+
+fun release(p : Peer) -> Unit = closeListener(p)
+
+-- Accepts connections until the listener is closed, serving each in a task
+-- of its own, and returns once every one has closed.
+fun serve(p : Peer) -> Unit = Task.runScope(acceptAll(p))
+
+fun acceptAll(p : Peer) -> Task.Spawn Unit = match next(p) {
+    Some(serving) -> do {
+        let _ = Task.spawn(serving)?
+        acceptAll(p)
+    }
+    None -> pure(())
+}
+
+-- Returns a function that serves the next connection, once it arrives.
+fun next(p : Peer) -> Option (fun() -> Unit) {
+    let s = match TCP.accept(p.listener) {
+        Right(s) -> s
+        Left(_) -> return None
+    }
+    let number = Sync.addAndGet(p.accepted, 1)
+    match p.tls {
+        None -> Some(fun() = connection(p, number, s))
+        Some(config) -> match TLS.server(s, config) {
+            Right(t) -> Some(fun() = connection(p, number, t))
+            Left(_) -> {
+                let _ = TCP.close(s)
+                Some(fun() {})
+            }
+        }
+    }
+}
+
+fun connection[Net.Connection c](p : Peer, number : Int, conn : c) -> Unit {
+    Net.setDeadline(conn, Duration.seconds(20))
+    let limits = Limits.empty
+    let input = Input.input(conn, limits)
+    loop {
+        let head = match Input.readHead(input, limits) {
+            Right(Some(HeadBytes { bytes, from, to })) -> match Head.parseRequest(bytes, from, to, limits) {
+                Right(h) -> h
+                Left(_) -> break
+            }
+            _ -> break
+        }
+        let refusal = match p.expectation {
+            Early(bytes) -> Some(bytes)
+            Refuse(bytes) -> if head.expectContinue { Some(bytes) } else { None }
+            Grant | Ignore -> None
+        }
+        if let Some(bytes) = refusal {
+            let _ = IO.writeText(conn, bytes)
+            let _ = Net.shutdownWrite(conn)
+            let rest = Input.held(input) + match IO.readAll(conn) {
+                Right(b) -> IO.filled(b)
+                Left(_) -> 0
+            }
+            let _ = Sync.addAndGet(p.discarded, rest)
+            break
+        }
+        if let Grant = p.expectation {
+            if head.expectContinue {
+                if let Left(_) = IO.writeText(conn, "HTTP/1.1 100 Continue\r\n\r\n") { break }
+            }
+        }
+        let framed = Framed.body(input, head.framing, limits)
+        let text = match IO.readAll(framed) {
+            Right(b) -> String.fromBytesLossy(IO.bytes(b))
+            Left(_) -> break
+        }
+        let chunked = match head.framing {
+            Chunked -> True
+            _ -> False
+        }
+        let seen = Seen { connection = number, method = Method.name(head.method), path = head.target.path,
+                          headers = head.headers, body = text, trailers = Framed.trailers(framed), chunked,
+                          expected = head.expectContinue,
+                          upgrade = Array.map(Head.protocols(head.upgrade), Token.toString) }
+        let r = p.answer(seen)
+        -- A response to HEAD has the head a GET's would, and no body.
+        let bytes = match head.method {
+            HEAD -> match String.splitOnce(r.bytes, "\r\n\r\n") {
+                Some((h, _)) -> h + "\r\n\r\n"
+                None -> r.bytes
+            }
+            _ -> r.bytes
+        }
+        if let Left(_) = IO.writeText(conn, bytes) { break }
+        match r.after {
+            Keep -> {}
+            Close -> break
+            Linger -> {
+                let _ = Net.shutdownWrite(conn)
+                let _ = IO.readAll(conn)
+                break
+            }
+            Stall(d) -> {
+                sleep(d)
+                break
+            }
+            Drip(pieces, d) -> {
+                for piece in pieces {
+                    sleep(d)
+                    let _ = IO.writeText(conn, piece)
+                }
+                break
+            }
+            Echo -> {
+                let into = IO.buffer(4096)
+                loop {
+                    IO.clear(into)
+                    match Input.take(input, into, 4096) {
+                        Right(n) -> if n == 0 { break } else if let Left(_) = writeFrom(conn, into) { break }
+                        Left(_) -> break
+                    }
+                }
+                break
+            }
+        }
+    }
+    let _ = Net.close(conn)
+    let _ = Sync.addAndGet(p.closed, 1)
+}
+
+-- -- replies ---------------------------------------------------------------------------
+
+fun response(status : String, fields : Array String, body : String) -> String {
+    var head = "HTTP/1.1 " + status + "\r\ncontent-length: " + show(String.byteLength(body)) + "\r\n"
+    for f in fields { head = head + f + "\r\n" }
+    head + "\r\n" + body
+}
+
+fun ok(body : String) -> Reply = Reply { bytes = response("200 OK", [], body), after = Keep }
+
+fun redirectTo(status : String, location : String) -> Reply =
+    Reply { bytes = response(status, ["location: " + location], ""), after = Keep }
+
+fun reply(bytes : String, after : After) -> Reply = Reply { bytes, after }

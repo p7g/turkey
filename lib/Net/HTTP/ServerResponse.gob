@@ -1,6 +1,6 @@
 export (
     ServerResponse, ToResponse(..), Content(..), Outgoing(..),
-    body, stream, statusOnly, noContent, notModified, switch, status, outgoing,
+    body, stream, statusOnly, noContent, notModified, switch, relay, status, outgoing,
 )
 
 -- What a server sends in response to a request: a status, header fields,
@@ -24,6 +24,8 @@ export (
 -- * `statusOnly(s)` is `s` with no body. `noContent()` is a 204, and
 --   `notModified()` a 304.
 -- * `switch` is a 101 that hands the connection to another protocol.
+-- * `relay(resp)` is a response a client received, passed on as it is
+--   read: a proxy's.
 -- * A 1xx other than 101 is not a response here. The server's `inform`
 --   sends one, before the final response.
 --
@@ -38,9 +40,11 @@ export (
 
 import Net.HTTP.Headers as Headers (Headers, HasHeaders(..), ContentType(..))
 import Net.HTTP.Duplex (Duplex)
+import Net.HTTP.Incoming (Incoming)
+import Net.HTTP.Response (Response(..))
 import Net.HTTP.MediaType as MediaType (MediaType)
 import Net.HTTP.Status as Status (Status(NoContent, NotModified, SwitchingProtocols))
-import Net.HTTP.Stream (Stream(..), BodyLength, Sink)
+import Net.HTTP.Stream as Stream (Stream(..), BodyLength, Sink)
 import Net.HTTP.Token as Token (Token)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
@@ -148,6 +152,26 @@ fun notModified() -> ServerResponse = make(NotModified, Headers.empty, Empty)
 -- handler.
 fun switch(protocol : Token, headers : Headers, run : fun(Duplex) -> Either SomeError Unit) -> ServerResponse =
     make(SwitchingProtocols, headers, Switched(protocol, run))
+
+-- Returns `resp`, a response a client received, to be sent on as it is
+-- read: its status, its fields, its body, read as it is written and with no
+-- limit of its own, and the trailers that followed it. A 204 or 304 is
+-- sent without a body. A failure to read the body once the head is sent
+-- closes the connection, as a stream's does.
+--
+-- The client took out the fields that frame the message and those
+-- `Connection` names, so `resp.headers` holds only what a proxy passes on.
+-- Panics on a 1xx: an interim response is relayed with the server's
+-- `inform`, and a 101 is a `switch`.
+fun relay(resp : Response Incoming) -> ServerResponse {
+    let code = Status.code(resp.status)
+    if code / 100 == 1 {
+        error("ServerResponse.relay: status " + Int.toString(code)
+              + " cannot be relayed as a final response; send it with 'inform', or a 101 with 'switch'")
+    }
+    let content = if code == 204 || code == 304 { Empty } else { Streamed(Stream.relayed(resp.body)) }
+    make(resp.status, resp.headers, content)
+}
 
 -- -- conversions ------------------------------------------------------------------------
 

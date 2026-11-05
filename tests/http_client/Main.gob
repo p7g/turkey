@@ -1,0 +1,774 @@
+-- The HTTP client against scripted servers on loopback (`Peer`), one
+-- scenario per run: `main SCENARIO CERTS`, where CERTS is the directory of
+-- the test CA and the certificates it signed. The arguments are read in
+-- `main`, since a task on another worker sees none.
+
+import Net
+import Net (ConnectRule(..))
+import Net.HTTP (..)
+import Net.HTTP.Client as Client
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Respond, Done, respond, failed)
+import Net.TCP as TCP
+import Net.HTTP.Client (Client, Received(..), exchange, next, send, sendUnbounded, sendUpgrade, redirect, expectStatus, retryAllowed)
+import Net.HTTP.Credentials as Credentials
+import Net.HTTP.Headers as Headers
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.HTTPURL as HTTPURL
+import Net.HTTP.Limits as Limits
+import Net.HTTP.Method as Method
+import Net.HTTP.Status as Status
+import Net.HTTP.Token as Token
+import Net.TLS as TLS
+import Peer (..)
+import System.Env as Env
+import System.File as File
+import System.IO as IO
+import System.Task as Task
+import Time.Duration as Duration
+import Time.Sleep as Sleep
+import Time.Stopwatch as Stopwatch
+import System.IO (IOError(..), ErrorKind(PermissionDenied), Read(..), Write(..))
+import Net.HTTP.Incoming as Incoming
+import Net.HTTP.Payload as Payload
+
+-- Runs `body` with `peers` serving, then stops them.
+fun scenario(peers : Array Peer, body : fun() -> Unit) -> Unit = Task.runScope(do {
+    for p in peers {
+        let _ = Task.spawn(fun() = serve(p))?
+    }
+    let _ = Task.spawn(fun() {
+        body()
+        for p in peers { closeListener(p) }
+    })?
+    pure(())
+})
+
+fun clientOf(c : Client.Config) -> Client = match Client.client(c) {
+    Right(c) -> c
+    Left(e) -> error(show(e))
+}
+
+fun local() -> Client.Config = Client.policy(Net.anywhere)
+
+fun url(p : Peer, path : String) -> String = "http://127.0.0.1:" + show(port(p)) + path
+
+fun text(b : IO.Buffer) -> String = String.fromBytesLossy(IO.bytes(b))
+
+-- A response's status and body, as a line.
+fun fetch(c : Client, req : ClientRequest Payload) -> String =
+    outcome(send(c, req, Duration.seconds(10), fun(resp) {
+        let b = receive(resp.body, 1048576)?
+        Right(show(Status.code(resp.status)) + " " + text(b))
+    }))
+
+fun outcome(r : Either HTTPError String) -> String = match r {
+    Right(s) -> s
+    Left(e) -> "error " + explain(e)
+}
+
+-- An error, with a transport error reduced to its kind, so that a line does
+-- not depend on the port or the system's wording.
+fun explain(e : HTTPError) -> String = match e {
+    SendFailed(NotSent(x)) -> "NotSent(" + explain(x) + ")"
+    SendFailed(MaybeSent(x)) -> "MaybeSent(" + explain(x) + ")"
+    SendFailed(BadResponse(x)) -> "BadResponse(" + explain(x) + ")"
+    Transport(s) -> match Error.cast(s) : Option IOError {
+        Some(io) -> "Transport(" + show(io.kind) + ")"
+        None -> match Error.cast(s) : Option TLS.TLSError {
+            Some(t) -> "Transport(" + show(t) + ")"
+            None -> "Transport(" + Error.describe(s) + ")"
+        }
+    }
+    BadURL(u) -> "BadURL(" + show(u) + ")"
+    BadRedirect(r) -> "BadRedirect(" + refusal(r) + ")"
+    BadMessage(r) -> "BadMessage(" + show(r) + ")"
+    Truncated -> "Truncated"
+    TooLarge -> "TooLarge"
+    other -> show(other)
+}
+
+fun refusal(r : RedirectRefused) -> String = match r {
+    NotRedirect -> "NotRedirect"
+    NoLocation -> "NoLocation"
+    BadLocation(e) -> "BadLocation(" + explain(e) + ")"
+    BadTarget(u) -> "BadTarget(" + show(u) + ")"
+    Downgrade -> "Downgrade"
+    NotReplayable -> "NotReplayable"
+    TooManyRedirects -> "TooManyRedirects"
+}
+
+fun echo(s : Seen) -> Reply =
+    ok(s.method + " " + s.path + " [" + s.body + "] on " + show(s.connection))
+
+-- -- scenarios ---------------------------------------------------------------------------
+
+fun basics(dir : String) {
+    let p = plain(echo)
+    scenario([p], fun() {
+        let c = clientOf(local())
+        print(fetch(c, request(GET, url(p, "/hello"))))
+        print(fetch(c, request(newPOST("a=1&b=2"), url(p, "/form"))))
+        print(fetch(c, request(newPUT(IO.bytesOf("from a buffer")), url(p, "/buffer"))))
+        let path = dir + "/body.txt"
+        let _ = File.writeText(path, "from a file")
+        let sent = File.use(File.openRead(path), fun(f) = Right(fetch(c, request(newPUT(f), url(p, "/file")))))
+        print(Either.unwrapOr(sent, "could not open the file"))
+        print(fetch(c, request(newPOST(""), url(p, "/empty"))))
+        print(fetch(c, request(newPATCH("patch"), url(p, "/patch"))))
+        let query = Option.expect(Method.extension("QUERY"), "a method name")
+        print(fetch(c, request(newExtension(query, "q=1"), url(p, "/query"))))
+        -- A response's body, passed on as a request's as it arrives.
+        print(outcome(send(c, request(GET, url(p, "/source")), Duration.seconds(10), fun(resp) =
+            Right(fetch(c, request(newPOST(resp.body), url(p, "/relayed")))))))
+        print(outcome(send(c, request(HEAD, url(p, "/head")), Duration.seconds(10), fun(resp) {
+            let b = receive(resp.body, 100)?
+            Right(show(Status.code(resp.status)) + " head, " + show(IO.filled(b)) + " body bytes")
+        })))
+        print(outcome(send(c, request(GET, url(p, "/status")), Duration.seconds(10), fun(resp) {
+            expectStatus(resp, NotFound)?
+            Right("expected")
+        })))
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+    })
+}
+
+fun pool() {
+    let p = plain(fun(s) = match s.path {
+        "/extra" -> reply(response("200 OK", [], "five") + "XX", Keep)
+        "/close" -> reply(response("200 OK", ["connection: close"], "closing"), Close)
+        "/big" -> ok(String.repeat("x", 300000))
+        "/chunked" -> reply("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n", Keep)
+        "/old" -> reply("HTTP/1.0 200 OK\r\ncontent-length: 2\r\n\r\nok", Close)
+        _ -> ok("on " + show(s.connection))
+    })
+    scenario([p], fun() {
+        let c = clientOf(local())
+        -- Read to the end: the connection is reused.
+        print(fetch(c, request(GET, url(p, "/a"))))
+        print(fetch(c, request(GET, url(p, "/b"))))
+        -- Not read, but short: drained, and reused.
+        print(outcome(send(c, request(GET, url(p, "/unread")), Duration.seconds(10), fun(_) = Right("unread"))))
+        print(fetch(c, request(GET, url(p, "/c"))))
+        -- A chunked body read to its end.
+        print(fetch(c, request(GET, url(p, "/chunked"))))
+        print(fetch(c, request(GET, url(p, "/d"))))
+        -- Bytes after the message: never reused.
+        print(fetch(c, request(GET, url(p, "/extra"))))
+        print(fetch(c, request(GET, url(p, "/e"))))
+        -- `Connection: close`, and HTTP/1.0 without keep-alive.
+        print(fetch(c, request(GET, url(p, "/close"))))
+        print(fetch(c, request(GET, url(p, "/f"))))
+        print(fetch(c, request(GET, url(p, "/old"))))
+        print(fetch(c, request(GET, url(p, "/g"))))
+        -- Unread and over the drain cap: closed rather than drained.
+        print(outcome(send(c, request(GET, url(p, "/big")), Duration.seconds(10), fun(_) = Right("unread big"))))
+        print(fetch(c, request(GET, url(p, "/h"))))
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+    })
+}
+
+-- Idle connections expire wherever they are in the pool: below a fresher
+-- one of an origin still in use, and at an origin never asked for again.
+-- Past the cap across origins, the oldest is closed.
+fun expiry() {
+    let a = plain(fun(s) = ok("a on " + show(s.connection)))
+    let b = plain(fun(s) = ok("b on " + show(s.connection)))
+    scenario([a, b], fun() {
+        let c = clientOf(combine(local(), Client.limits(Limits.idleTimeout(Duration.millis(500)))))
+        -- Two connections to `a`: the inner request's is pooled 800 ms
+        -- before the outer one's, and has expired by then.
+        print(outcome(send(c, request(GET, url(a, "/outer")), Duration.seconds(10), fun(_) {
+            let inner = fetch(c, request(GET, url(a, "/inner")))
+            Sleep.sleep(Duration.millis(800))
+            Right(inner)
+        })))
+        print(fetch(c, request(GET, url(a, "/next"))))
+        Sleep.sleep(Duration.millis(100))
+        print("a closed " + show(closedConnections(a)))
+        -- `a`'s last connection expires while only `b` is asked for.
+        Sleep.sleep(Duration.millis(700))
+        print(fetch(c, request(GET, url(b, "/"))))
+        Sleep.sleep(Duration.millis(100))
+        print("a closed " + show(closedConnections(a)))
+        Client.close(c)
+        let capped = clientOf(combine(local(), Client.idleTotal(1)))
+        print(fetch(capped, request(GET, url(a, "/"))))
+        print(fetch(capped, request(GET, url(b, "/"))))
+        Sleep.sleep(Duration.millis(100))
+        print("a closed " + show(closedConnections(a)))
+        print(fetch(capped, request(GET, url(b, "/"))))
+        Client.close(capped)
+    })
+}
+
+-- A server that closes each connection after its first response, without
+-- saying so: the client pools the connection, and finds it closed when it
+-- sends the next request on it.
+fun retry() {
+    let p = plain(fun(s) = reply(response("200 OK", [], s.method + " on " + show(s.connection)), Close))
+    scenario([p], fun() {
+        let c = clientOf(local())
+        let key = Option.expect(Token.parse("k-1"), "a token")
+        let tries = [
+            ("GET", request(GET, url(p, "/"))),
+            ("PUT", request(newPUT("x"), url(p, "/"))),
+            ("POST with a key", withHeaders(request(newPOST("x"), url(p, "/")), field(IdempotencyKey, key))),
+            ("POST", request(newPOST("x"), url(p, "/"))),
+        ]
+        var closed = 0
+        for (name, req) in tries {
+            -- Leave a pooled connection the server has closed.
+            print(fetch(c, request(GET, url(p, "/prime"))))
+            closed = closed + 1
+            hold(p, closed)
+            let r = fetch(c, req)
+            print(name + ": " + r)
+            if !String.startsWith(r, "error") { closed = closed + 1 }
+        }
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+    })
+}
+
+-- The retry rule as a table: what failed, the method, and the request:
+-- plain, with an `Idempotency-Key`, and with a body that cannot be sent
+-- again.
+fun rule() {
+    let failures = [("NotSent", NotSent(Truncated)), ("MaybeSent", MaybeSent(Truncated)),
+                    ("BadResponse", BadResponse(Truncated))]
+    let once = fun() = Payload.stream(Stream(LengthKnown(0), fun(_) = Right(Headers.empty)))
+    let methods : Array (String, Method Payload, Method Payload) = [
+        ("GET", GET, GET), ("PUT", newPUT("x"), PUT(once())), ("POST", newPOST("x"), POST(once())),
+    ]
+    let key = Option.expect(Token.parse("k-1"), "a token")
+    for (failed, e) in failures {
+        for (name, m, unreplayable) in methods {
+            let plain = request(m, "http://example.com/")
+            let cases = [plain, withHeaders(plain, field(IdempotencyKey, key)), request(unreplayable, "http://example.com/")]
+            var line = failed + " " + name + ":"
+            for req in cases {
+                line = line + " " + (if retryAllowed(e, req) { "retry" } else { "no" })
+            }
+            print(line)
+        }
+    }
+}
+
+fun redirects() {
+    let other = plain(fun(s) = ok("other got " + s.method + " " + s.path + ", authorization "
+                                  + show(Headers.has(s.headers, Authorization))
+                                  + ", cookie " + show(Headers.has(s.headers, HeaderName.literal("cookie")))))
+    let p = plain(fun(s) = match s.path {
+        "/loop" -> redirectTo("302 Found", "/loop")
+        "/a" -> redirectTo("302 Found", "/b")
+        "/b" -> redirectTo("301 Moved Permanently", "/c")
+        "/c" -> redirectTo("303 See Other", "/end")
+        "/post" -> redirectTo("302 Found", "/end")
+        "/keep" -> redirectTo("307 Temporary Redirect", "/end")
+        "/keep308" -> redirectTo("308 Permanent Redirect", "/end")
+        "/away" -> redirectTo("302 Found", url(other, "/landed"))
+        "/same" -> redirectTo("302 Found", "/landed")
+        "/file" -> redirectTo("302 Found", "file:///etc/passwd")
+        "/nowhere" -> reply(response("302 Found", [], ""), Keep)
+        "/landed" -> ok("landed, authorization " + show(Headers.has(s.headers, Authorization)))
+        _ -> ok(s.method + " " + s.path + " [" + s.body + "]")
+    })
+    scenario([p, other], fun() {
+        let off = clientOf(local())
+        print("off: " + fetch(off, request(GET, url(p, "/a"))))
+        Client.close(off)
+        -- Combined settings: the right side wins where both set one.
+        let overridden = clientOf(combine(combine(local(), Client.follow(3)), Client.follow(0)))
+        print("overridden: " + fetch(overridden, request(GET, url(p, "/a"))))
+        Client.close(overridden)
+        let c = clientOf(combine(local(), Client.follow(3)))
+        print(fetch(c, request(GET, url(p, "/a"))))
+        print(fetch(c, request(GET, url(p, "/loop"))))
+        print(fetch(c, request(newPOST("form"), url(p, "/post"))))
+        print(fetch(c, request(newPOST("form"), url(p, "/keep"))))
+        print(fetch(c, request(newPUT("put"), url(p, "/keep308"))))
+        print(fetch(c, request(HEAD, url(p, "/c"))))
+        let creds = Option.expect(Credentials.bearer("secret"), "a token")
+        let cookie = HeaderValue.literal("session=1")
+        let withCreds = fun(path) =
+            withHeaders(request(GET, url(p, path)), combine(field(Authorization, creds), field(HeaderName.literal("cookie"), cookie)))
+        -- Same host, another port: credentials are dropped.
+        print(fetch(c, withCreds("/away")))
+        print(fetch(c, withCreds("/same")))
+        print(fetch(c, request(GET, url(p, "/file"))))
+        print(fetch(c, request(GET, url(p, "/nowhere"))))
+        Client.close(c)
+        -- Every hop goes through the policy: localhost is allowed by name,
+        -- and 127.0.0.1 is not.
+        let named = clientOf(combine(Client.policy(Net.allowlist([HostName("localhost")])), Client.follow(3)))
+        let byName = fun(path) = "http://localhost:" + show(port(p)) + path
+        print(fetch(named, request(GET, byName("/same"))))
+        print(fetch(named, request(GET, byName("/away"))))
+        Client.close(named)
+    })
+}
+
+fun policy() {
+    let p = plain(echo)
+    scenario([p], fun() {
+        let c = clientOf(Client.defaultConfig)
+        print(fetch(c, request(GET, url(p, "/"))))
+        print(fetch(c, request(GET, "http://localhost:" + show(port(p)) + "/")))
+        print(fetch(c, request(GET, "ftp://example.com/")))
+        print(fetch(c, request(GET, "http://user:pw@example.com/")))
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+    })
+}
+
+fun deadlines() {
+    let p = plain(fun(s) = match s.path {
+        "/silent" -> reply("", Stall(Duration.seconds(3)))
+        "/stall" -> reply("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nhalf", Stall(Duration.seconds(3)))
+        "/drip" -> reply("HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n",
+                         Drip(["01", "23", "45", "67", "89"], Duration.millis(100)))
+        _ -> ok("fine")
+    })
+    scenario([p], fun() {
+        let c = clientOf(combine(local(), Client.limits(Limits.stall(Duration.millis(500)))))
+        let watch = Stopwatch.start()
+        let r = send(c, request(GET, url(p, "/silent")), Duration.millis(200), fun(resp) = Right("answered"))
+        print("send within 200 ms: " + outcome(r) + ", in time " + show(Stopwatch.elapsed(watch) < Duration.seconds(2)))
+        -- The total limit covers the body's reads inside the callback.
+        let watch2 = Stopwatch.start()
+        let r2 = send(c, request(GET, url(p, "/drip")), Duration.millis(300), fun(resp) {
+            let b = receive(resp.body, 100)?
+            Right(text(b))
+        })
+        print("drip within 300 ms: " + outcome(r2) + ", in time " + show(Stopwatch.elapsed(watch2) < Duration.seconds(2)))
+        -- No total limit: a slow body that keeps moving arrives whole, and
+        -- one that stops is cut off by the stall limit.
+        print("unbounded drip: " + outcome(sendUnbounded(c, request(GET, url(p, "/drip")), fun(resp) {
+            let b = receive(resp.body, 100)?
+            Right(text(b))
+        })))
+        let watch3 = Stopwatch.start()
+        print("unbounded stall: " + outcome(sendUnbounded(c, request(GET, url(p, "/stall")), fun(resp) {
+            let b = receive(resp.body, 100)?
+            Right(text(b))
+        })) + ", in time " + show(Stopwatch.elapsed(watch3) < Duration.seconds(2)))
+        -- The callback's own wait between reads is not a stall.
+        print("quiet caller: " + outcome(sendUnbounded(c, request(GET, url(p, "/drip")), fun(resp) {
+            Sleep.sleep(Duration.millis(800))
+            let b = receive(resp.body, 100)?
+            Right(text(b))
+        })))
+        Client.close(c)
+    })
+}
+
+fun early() {
+    let tooLarge = response("413 Content Too Large", ["connection: close"], "too large")
+    let p = plain(fun(_) = reply(tooLarge, Linger))
+    let impatient = expecting(Early(tooLarge), echo)
+    scenario([p, impatient], fun() {
+        let c = clientOf(local())
+        print(fetch(c, request(newPOST(String.repeat("y", 4194304)), url(p, "/upload"))))
+        -- A body that would take 5 s to send. The server answers after its
+        -- head, and the answer ends it.
+        var sent = 0
+        let slow = Stream(LengthUnknown, fun(sink) {
+            while sent < 500 {
+                IO.writeText(sink, "chunk")?
+                flush(sink)?
+                sent = sent + 1
+                Sleep.sleep(Duration.millis(10))
+            }
+            Right(Headers.empty)
+        })
+        let watch = Stopwatch.start()
+        print(fetch(c, request(newPOST(slow), url(impatient, "/upload"))))
+        print("before the body ended " + show(sent < 500 && Stopwatch.elapsed(watch) < Duration.seconds(4)))
+        Client.close(c)
+    })
+}
+
+-- Trailers: read after a chunked response, sent after a streamed request,
+-- and relayed with a response's body; and the streams the codec refuses.
+-- A proxy: a server that sends each request on to `upstream` and relays
+-- its response, fields, body and trailers, as they arrive.
+fun proxy() {
+    let upstream = plain(fun(s) = match s.path {
+        "/chunked" -> reply("HTTP/1.1 201 Created\r\ntransfer-encoding: chunked\r\nx-up: yes\r\n\r\n"
+                            + "5\r\nhello\r\n0\r\nx-checksum: abc\r\n\r\n", Keep)
+        "/empty" -> reply("HTTP/1.1 204 No Content\r\nx-up: yes\r\n\r\n", Keep)
+        _ -> ok(s.method + " " + s.path + " [" + s.body + "]")
+    })
+    scenario([upstream], fun() {
+        let c = clientOf(local())
+        let l = match TCP.listen(Net.V4(0x7f000001), 0) {
+            Right(l) -> l
+            Left(e) -> error(show(e))
+        }
+        let at = "http://127.0.0.1:" + show(TCP.listenerAddress(l).1)
+        let forward = fun(req : Request Incoming, r : Respond) -> Done {
+            let onward = ClientRequest {
+                method = map(req.method, payload)
+                url = HTTPURL.parse(url(upstream, req.target.path))
+                headers = req.headers
+            }
+            match send(c, onward, Duration.seconds(10), fun(resp) = Right(respond(r, relay(resp)))) {
+                Right(done) -> done
+                Left(e) -> failed(r, e)
+            }
+        }
+        Task.runScope(do {
+            let server = Server.start(l, Server.defaultConfig, forward)?
+            print(throughProxy(c, request(GET, at + "/chunked")))
+            print(throughProxy(c, request(GET, at + "/empty")))
+            print(throughProxy(c, request(newPOST("a=1"), at + "/form")))
+            Server.stop(server, Duration.seconds(1))
+            Server.wait(server)
+            pure(())
+        })
+        Client.close(c)
+    })
+}
+
+-- A response through the proxy: its status, body, whether it has the
+-- upstream's `x-up`, and its trailers.
+fun throughProxy(c : Client, req : ClientRequest Payload) -> String =
+    outcome(send(c, req, Duration.seconds(10), fun(resp) {
+        let b = receive(resp.body, 1024)?
+        let up = Headers.has(resp.headers, HeaderName.literal("x-up"))
+        let after = Option.unwrapOr(trailers(resp.body), Headers.empty)
+        Right(show(Status.code(resp.status)) + " [" + text(b) + "] x-up " + show(up) + ", trailers " + show(after))
+    }))
+
+fun trailing() {
+    let p = plain(fun(s) = match s.path {
+        "/trailers" -> reply("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc\r\n\r\n", Keep)
+        -- Answers nothing, so that the client's own failure is what it reports.
+        "/silent" -> reply("", Linger)
+        _ -> ok(s.method + " [" + s.body + "] chunked " + show(s.chunked) + ", trailers [" + show(s.trailers) + "]")
+    })
+    scenario([p], fun() {
+        let c = clientOf(local())
+        print(outcome(send(c, request(GET, url(p, "/trailers")), Duration.seconds(10), fun(resp) {
+            let before = Option.isSome(trailers(resp.body))
+            let b = receive(resp.body, 100)?
+            let after = match trailers(resp.body) {
+                Some(hs) -> show(hs)
+                None -> "none"
+            }
+            Right("trailers before the end " + show(before) + "; " + text(b) + "; then " + after)
+        })))
+        let checksum = Headers.fromFields([(HeaderName.literal("x-checksum"), HeaderValue.literal("abc"))])
+        let streamed = Stream(LengthUnknown, fun(sink) {
+            IO.writeText(sink, "one,")?
+            flush(sink)?
+            IO.writeText(sink, "two")?
+            Right(checksum)
+        })
+        print(fetch(c, request(newPOST(streamed), url(p, "/streamed"))))
+        let known = fun(n, s, hs) = Stream(LengthKnown(n), fun(sink) {
+            IO.writeText(sink, s)?
+            Right(hs)
+        })
+        print(fetch(c, request(newPUT(known(3, "abc", Headers.empty)), url(p, "/known"))))
+        print(fetch(c, request(newPUT(known(3, "abc", checksum)), url(p, "/silent"))))
+        print(fetch(c, request(newPUT(known(5, "abc", Headers.empty)), url(p, "/silent"))))
+        print(fetch(c, request(newPUT(known(2, "abc", Headers.empty)), url(p, "/silent"))))
+        let failing = Stream(LengthUnknown, fun(sink) {
+            IO.writeText(sink, "partial")?
+            Left(fail(IOError { kind = PermissionDenied, op = "read", path = None }))
+        })
+        print(fetch(c, request(newPOST(failing), url(p, "/silent"))))
+        -- A response's body, trailers and all, relayed as a request's.
+        print(outcome(send(c, request(GET, url(p, "/trailers")), Duration.seconds(10), fun(resp) =
+            Right(fetch(c, request(newPOST(resp.body), url(p, "/relayed")))))))
+        Client.close(c)
+    })
+}
+
+-- A body a downstream client sends only once it has its `100 Continue`,
+-- which its first read stands for.
+type Waiting = Waiting { body : Array Byte, var at : Int, var read : Bool }
+
+instance Read Waiting {
+    type ReadError = HTTPError
+    fun readInto(w, into) {
+        w.read = True
+        let left = len(w.body) - w.at
+        let n = if IO.room(into) < left { IO.room(into) } else { left }
+        IO.append(into, w.body, w.at, w.at + n)
+        w.at = w.at + n
+        Right(n)
+    }
+}
+
+-- Returns a downstream body of `text`, declaring `declared`, whose sender
+-- waits for a 100 if `waits`.
+fun downstream(text : String, declared : Option Int, waits : Bool) -> (Waiting, Incoming) {
+    let w = Waiting { body = IO.bytes(IO.bytesOf(text)), at = 0, read = False }
+    let b = Incoming.incoming(IO.anyRead(w, fun(e) = e), declared, fun() = Some(Headers.empty),
+                              fun() = waits && !w.read)
+    (w, b)
+}
+
+-- `Expect: 100-continue` end to end: a relayed body whose sender waits for
+-- a 100 goes with `Expect`, and is read only after the upstream's 100.
+fun relayed() {
+    let answer = fun(s : Seen) = ok(s.method + " expected " + show(s.expected) + " [" + s.body + "]")
+    let granting = plain(answer)
+    let refusing = expecting(Refuse(response("413 Content Too Large", ["connection: close"], "too large")), answer)
+    scenario([granting, refusing], fun() {
+        let c = clientOf(local())
+        let relay = fun(p, declared, waits) {
+            let (w, b) = downstream("small", declared, waits)
+            print(fetch(c, request(newPUT(b), url(p, "/"))) + "; downstream read " + show(w.read))
+        }
+        relay(granting, None, True)
+        relay(granting, Some(5), True)
+        relay(granting, Some(5), False)
+        relay(refusing, Some(5), True)
+        print("discarded " + show(discarded(refusing)))
+        Client.close(c)
+    })
+}
+
+fun escape() {
+    let p = plain(echo)
+    scenario([p], fun() {
+        let c = clientOf(local())
+        let r : Either HTTPError Incoming = send(c, request(GET, url(p, "/")), Duration.seconds(10), fun(resp) = Right(resp.body))
+        match r {
+            Right(b) -> {
+                let got : Either HTTPError IO.Buffer = receive(b, 100)
+                print("escaped: " + outcome(Either.map(got, text)))
+            }
+            Left(e) -> print("error " + explain(e))
+        }
+        Client.close(c)
+    })
+}
+
+fun secured(dir : String) {
+    let config = match TLS.serverConfig([TLS.Certificate { chain = dir + "/localhost.pem",
+                                                          key = dir + "/localhost.key" }], ["http/1.1"]) {
+        Right(c) -> c
+        Left(e) -> error(show(e))
+    }
+    let plainPeer = plain(echo)
+    let p = secure(config, fun(s) = match s.path {
+        "/down" -> redirectTo("302 Found", url(plainPeer, "/"))
+        _ -> echo(s)
+    })
+    scenario([p, plainPeer], fun() {
+        let roots = combine(local(), Client.roots(TLS.RootsFile(dir + "/ca.pem")))
+        let c = clientOf(combine(roots, Client.follow(3)))
+        let at = fun(path) = "https://localhost:" + show(port(p)) + path
+        print(fetch(c, request(GET, at("/one"))))
+        print(fetch(c, request(newPOST("over tls"), at("/two"))))
+        print(fetch(c, request(GET, at("/down"))))
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+        -- The system's roots do not vouch for the test CA.
+        let untrusting = clientOf(local())
+        print(fetch(untrusting, request(GET, at("/three"))))
+        Client.close(untrusting)
+    })
+    TLS.releaseServer(config)
+}
+
+-- Interim responses pulled by `exchange` and skipped by `send`; the URL and
+-- timings a response carries; and redirects followed by hand.
+fun heads() {
+    let early = "HTTP/1.1 103 Early Hints\r\nlink: </style.css>\r\n\r\n"
+    let p = plain(fun(s) = match s.path {
+        "/hints" -> reply(early + early + response("200 OK", [], "after hints"), Keep)
+        "/a" -> redirectTo("302 Found", "/b")
+        "/b" -> redirectTo("307 Temporary Redirect", "/end")
+        _ -> ok(s.method + " " + s.path + " [" + s.body + "]")
+    })
+    scenario([p], fun() {
+        let c = clientOf(local())
+        print(outcome(exchange(c, request(GET, url(p, "/hints")), Duration.seconds(10), fun(ex) {
+            var seen = ""
+            loop {
+                match next(ex)? {
+                    Informational(status, headers) -> {
+                        seen = seen + show(Status.code(status)) + " (" + show(Headers.size(headers)) + " field), "
+                    }
+                    Final(resp) -> {
+                        let b = receive(resp.body, 100)?
+                        seen = seen + show(Status.code(resp.status)) + " " + text(b)
+                        break
+                    }
+                }
+            }
+            -- Past the final response, there is nothing more.
+            let more = match next(ex) {
+                Right(_) -> "a head"
+                Left(e) -> explain(e)
+            }
+            Right(seen + "; then " + more)
+        })))
+        print(fetch(c, request(GET, url(p, "/hints"))))
+        -- A fresh connection's timings, then a pooled one's.
+        Client.close(c)
+        let d = clientOf(local())
+        let timed = fun() = outcome(send(d, request(GET, url(p, "/t")), Duration.seconds(10), fun(resp) {
+            let t = resp.timings
+            Right("dns " + show(Option.isSome(t.dns)) + ", connect " + show(Option.isSome(t.connect))
+                  + ", tls " + show(Option.isSome(t.tls)))
+        }))
+        print("fresh: " + timed())
+        print("pooled: " + timed())
+        -- The low-level client returns a redirect as it is; `redirect`
+        -- builds the next request, and `url` says where each came from.
+        var req = request(newPOST("form"), url(p, "/a"))
+        var hops = 0
+        loop {
+            let r = send(d, req, Duration.seconds(10), fun(resp) -> Either HTTPError (Option (ClientRequest Payload)) {
+                print(show(Status.code(resp.status)) + " from " + HTTPURL.path(resp.url))
+                match redirect(resp, req) {
+                    Right(n) -> Right(Some(n))
+                    Left(why) -> {
+                        print("stop: " + refusal(why))
+                        let b = receive(resp.body, 100)?
+                        print("body " + text(b))
+                        Right(None)
+                    }
+                }
+            })
+            match r {
+                Right(Some(n)) -> {
+                    req = n
+                    hops = hops + 1
+                }
+                Right(None) -> break
+                Left(e) -> {
+                    print("error " + explain(e))
+                    break
+                }
+            }
+        }
+        print("hops " + show(hops))
+        -- `send` with `follow` gives the last hop's URL.
+        let f = clientOf(combine(local(), Client.follow(3)))
+        print(outcome(send(f, request(GET, url(p, "/a")), Duration.seconds(10), fun(resp) =
+            Right(show(Status.code(resp.status)) + " from " + HTTPURL.path(resp.url)))))
+        Client.close(f)
+        Client.close(d)
+    })
+}
+
+-- `Expect: 100-continue` for a body of 1 MiB or more: sent after the
+-- server's 100, withheld after a refusal, and sent anyway once a second
+-- passes without either.
+fun expected() {
+    let answer = fun(s : Seen) = ok(s.method + " expected " + show(s.expected) + ", "
+                                    + show(String.byteLength(s.body)) + " bytes")
+    let granting = plain(answer)
+    let refusing = expecting(Refuse(response("413 Content Too Large", ["connection: close"], "too large")), answer)
+    let ignoring = expecting(Ignore, answer)
+    let big = String.repeat("b", 2097152)
+    scenario([granting, refusing, ignoring], fun() {
+        let c = clientOf(local())
+        print(fetch(c, request(newPUT("small"), url(granting, "/"))))
+        print(fetch(c, request(newPUT(big), url(granting, "/"))))
+        -- The 100 is the client's own, and `next` does not return it.
+        print(outcome(exchange(c, request(newPUT(big), url(granting, "/")), Duration.seconds(10), fun(ex) {
+            match next(ex)? {
+                Informational(st, _) -> Right("informational " + show(Status.code(st)))
+                Final(resp) -> Right("final " + show(Status.code(resp.status)))
+            }
+        })))
+        print(fetch(c, request(newPUT(big), url(refusing, "/"))))
+        print("discarded " + show(discarded(refusing)))
+        let watch = Stopwatch.start()
+        let r = fetch(c, request(newPUT(big), url(ignoring, "/")))
+        let waited = Stopwatch.elapsed(watch)
+        print(r + ", waited " + show(waited >= Duration.millis(900) && waited < Duration.seconds(5)))
+        Client.close(c)
+    })
+}
+
+-- Upgrades: a 101 hands over the connection, bytes the server sent after its
+-- head first; a response that does not switch reaches the callback with a
+-- closed duplex; a switch to a protocol not offered is refused; and the
+-- switched connection keeps the deadlines its protocol sets, not the stall
+-- limit.
+fun upgrades() {
+    let switching = fun(protocol) =
+        "HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: " + protocol + "\r\n\r\n"
+    let p = plain(fun(s) = match s.path {
+        "/echo" -> reply(switching("Echo") + "hello ", Echo)
+        "/wrong" -> reply(switching("other"), Close)
+        "/quiet" -> reply(switching("echo"), Stall(Duration.seconds(2)))
+        "/late" -> reply(switching("echo"), Drip(["late"], Duration.millis(600)))
+        _ -> ok("offered [" + String.join(s.upgrade, ", ") + "]")
+    })
+    scenario([p], fun() {
+        let c = clientOf(combine(local(), Client.limits(Limits.stall(Duration.millis(300)))))
+        let protocols = [Token.literal("echo"), Token.literal("chat")]
+        let upgrade = fun(path, use) = outcome(sendUpgrade(c, request(GET, url(p, path)), protocols,
+                                                           Duration.seconds(10), use))
+        print(upgrade("/echo", fun(resp, d) {
+            lifted(IO.writeText(d, "world"))?
+            lifted(Net.shutdownWrite(d))?
+            let all = lifted(IO.readAll(d))?
+            Right(show(Status.code(resp.status)) + " " + text(all))
+        }))
+        print(upgrade("/offer", fun(resp, d) {
+            let b = receive(resp.body, 100)?
+            let written = match lifted(IO.writeText(d, "x")) {
+                Right(_) -> "written"
+                Left(e) -> explain(e)
+            }
+            Right(show(Status.code(resp.status)) + " " + text(b) + "; duplex " + written)
+        }))
+        print(upgrade("/wrong", fun(resp, _) = Right(show(Status.code(resp.status)))))
+        print(upgrade("/quiet", fun(_, d) {
+            Net.setDeadline(d, Duration.millis(200))
+            let all = lifted(IO.readAll(d))?
+            Right("quiet " + text(all))
+        }))
+        print(upgrade("/late", fun(_, d) {
+            let all = lifted(IO.readAll(d))?
+            Right("after the stall limit: " + text(all))
+        }))
+        -- A switched connection is never pooled.
+        print(fetch(c, request(GET, url(p, "/after"))))
+        print("connections " + show(accepted(p)))
+        Client.close(c)
+    })
+}
+
+fun lifted(r : Either SomeError a) -> Either HTTPError a = Either.mapLeft(r, fun(e) = Transport(e))
+
+fun main() {
+    let args = Env.args()
+    run(args[0], args[1])
+}
+
+fun run(name : String, dir : String) = match name {
+    "basics" -> basics(dir)
+    "pool" -> pool()
+    "expiry" -> expiry()
+    "retry" -> retry()
+    "rule" -> rule()
+    "redirects" -> redirects()
+    "policy" -> policy()
+    "deadlines" -> deadlines()
+    "early" -> early()
+    "trailers" -> trailing()
+    "proxy" -> proxy()
+    "relayed" -> relayed()
+    "upgrades" -> upgrades()
+    "expect" -> expected()
+    "heads" -> heads()
+    "escape" -> escape()
+    "tls" -> secured(dir)
+    other -> error("no scenario " + other)
+}

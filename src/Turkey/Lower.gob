@@ -100,7 +100,14 @@ fun moduleOf(name : String) -> String = match String.rsplitOnce(name, "#") {
 -- binder it shadows left behind. Every binder form -- a parameter, a pattern,
 -- a match arm, a `for`, a `let` or a local `fun` -- gets this without a rule of
 -- its own.
+--
+-- A scope holds only what was bound in it, and defers every other binder to
+-- `parent`, so making one costs nothing however much is in scope. A child sees
+-- what its ancestors record after it was made, which cannot change an answer:
+-- a binder is recorded where it is bound, and a mention of it is lowered after
+-- that.
 type Scope = Scope {
+    parent   : Option Scope,
     -- The binders that are held in reference cells, each with the binder of
     -- its cell: a mention of one reads the cell.
     --
@@ -127,17 +134,38 @@ type Scope = Scope {
 }
 
 fun newScope() -> Scope = Scope {
-    cells = Map.new(), binders = Map.new(), ret = None, brk = None, cont = None,
+    parent = None, cells = Map.new(), binders = Map.new(),
+    ret = None, brk = None, cont = None,
 }
 
-fun childScope(s : Scope) -> Scope {
-    let cells = Map.new()
-    for (k, v) in Map.entries(s.cells) { Map.put(cells, k, v) }
-    let binders = Map.new()
-    for (k, v) in Map.entries(s.binders) { Map.put(binders, k, v) }
-    Scope { cells = cells, binders = binders, ret = s.ret, brk = s.brk,
-            cont = s.cont }
+-- Returns a scope nested in `s`, with the same transfer targets. Takes
+-- constant time.
+fun childScope(s : Scope) -> Scope = Scope {
+    parent = Some(s), cells = Map.new(), binders = Map.new(),
+    ret = s.ret, brk = s.brk, cont = s.cont,
 }
+
+-- Returns the cell holding the binder `id`, if one does. Takes time
+-- proportional to the depth of `s`.
+fun cellOf(s : Scope, id : Int) -> Option (String, Int) =
+    match Map.get(s.cells, id) {
+        Some(cell) -> Some(cell)
+        None -> match s.parent {
+            Some(outer) -> cellOf(outer, id)
+            None -> None
+        }
+    }
+
+-- Returns what the local binder `id` abstracts over, or `None` if it is not
+-- a local in scope. Takes time proportional to the depth of `s`.
+fun localBinders(s : Scope, id : Int) -> Option (Vec VarCell) =
+    match Map.get(s.binders, id) {
+        Some(binders) -> Some(binders)
+        None -> match s.parent {
+            Some(outer) -> localBinders(outer, id)
+            None -> None
+        }
+    }
 
 -- -- the lowerer --------------------------------------------------------------------
 
@@ -166,6 +194,10 @@ type Lowerer = Lowerer {
     -- recorded at: the top-level declaration being lowered.
     var owner    : Int,
     var site     : Span,
+    -- While source this pass has already lowered is lowered again: the copy
+    -- each binder bound in it gets, by the binder `binders` records. Empty
+    -- elsewhere. See `copiesOf`.
+    var copies   : Map Int Int,
 }
 
 fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
@@ -174,7 +206,8 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
     decls = decls, classes = classes, env = env, types = types, target = target,
     build = build, binders = binders,
     rigid = Map.new(), placeholders = Map.new(), counter = 0,
-    owner = 0, site = Span { file = "", line = 0, col = 0 },
+    owner = 0, site = Span { file = "", line = 0, col = 0, endLine = 0, endCol = 0 },
+    copies = Map.new(),
 }
 
 -- A binder this pass invents: its spelling, and its id.
@@ -233,14 +266,45 @@ fun leave(l : Lowerer, saved : (Int, Span)) -> Unit {
     l.site = where
 }
 
--- Returns the binder the node `nodeId`, spelled `name`, binds or means.
--- Resolution and desugaring record one for every binding occurrence and every
--- reference inference accepted, so a missing one is a compiler bug.
+-- Returns the binder the node `nodeId`, spelled `name`, binds or means: the
+-- one `binders` records, or its copy while `copies` has one. Resolution and
+-- desugaring record one for every binding occurrence and every reference
+-- inference accepted, so a missing one is a compiler bug.
 fun binderOf(l : Lowerer, nodeId : Int, name : String, where : Option Span) -> Int =
     match Map.get(l.binders.refs, nodeId) {
-        Some(id) -> id
+        Some(id) -> Map.getOr(l.copies, id, id)
         None -> oops("no binder was recorded for '" + name + "'", where)
     }
+
+-- Returns `l.copies` with a new copy of each binder in `bound`, for lowering
+-- the source that binds them once more.
+--
+-- Some source is lowered more than once: an arm's body once per alternative
+-- of its pattern, and the rest of an arm once per alternative of a `let`
+-- guard. No binder may be bound twice in a program, so every lowering after
+-- the first binds copies, and the references in it mean the copies. A binder
+-- that an enclosing lowering already copied is copied afresh.
+fun copiesOf(l : Lowerer, bound : Vec Int) -> Map Int Int {
+    let out = Map.new()
+    for (id, copy) in Map.entries(l.copies) { Map.put(out, id, copy) }
+    let made = Set.new()
+    for id in bound {
+        if !Set.contains(made, id) {
+            Set.add(made, id)
+            Map.put(out, id, copyOf(l, Binders.binderAt(l.binders, id).name, id))
+        }
+    }
+    out
+}
+
+-- Returns `lower()`, run with `copies` in place of `l.copies`.
+fun under(l : Lowerer, copies : Map Int Int, lower : fun() -> a) -> a {
+    let saved = l.copies
+    l.copies = copies
+    let out = lower()
+    l.copies = saved
+    out
+}
 
 fun patternBinder(l : Lowerer, p : Pat) -> Int =
     binderOf(l, p.id, varName(p), Some(p.span))
@@ -274,10 +338,31 @@ fun matchedAs(l : Lowerer, binderOf : fun(Pat) -> Int, scrutinee : Core,
     compiled(l, binderOf, scrutinee,
              Vec.map(arms, fun((pat, body)) = (pat, Match.Taken(body))), ty, where)
 
+-- The arms of one `match`, each pattern with the code it runs, and the id
+-- each pattern variable binds, by the variable's node.
+--
+-- The ids are taken when an arm is added rather than when the `match` is
+-- compiled, because `l.copies` is what decides them, and it differs from one
+-- alternative of an arm to the next.
+type Arms = Arms {
+    alts    : Vec (Pat, Match.Body),
+    binders : Map Int Int,
+}
+
+fun newArms() -> Arms = Arms { alts = Vec.new(4), binders = Map.new() }
+
+fun addArm(l : Lowerer, arms : Arms, pat : Pat, body : Match.Body) -> Unit {
+    Vec.push(arms.alts, (pat, body))
+    for v in varPatterns(pat) { Map.put(arms.binders, v.id, patternBinder(l, v)) }
+}
+
 -- The same, with arms that may run guards.
-fun matchedArms(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Match.Body),
-                ty : Ty.Type, where : Option Span) -> Core =
-    compiled(l, patternBinder(l, _), scrutinee, arms, ty, where)
+fun matchedArms(l : Lowerer, scrutinee : Core, arms : Arms, ty : Ty.Type,
+                where : Option Span) -> Core =
+    compiled(l, fun(p) = match Map.get(arms.binders, p.id) {
+        Some(id) -> id
+        None -> patternBinder(l, p)
+    }, scrutinee, arms.alts, ty, where)
 
 fun compiled(l : Lowerer, binderOf : fun(Pat) -> Int, scrutinee : Core,
              arms : Vec (Pat, Match.Body), ty : Ty.Type, where : Option Span) -> Core =
@@ -1570,7 +1655,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         Some(x) -> len(x.evidence) == 0 && len(x.typeArgs) == 0
     }
     if plain {
-        match Map.get(scope.cells, id) {
+        match cellOf(scope, id) {
             Some((cell, cellId)) -> return node(result, where,
                 CDeref(node(refOf(result), where, CVar(cell, cellId))))
             None -> {}
@@ -1780,22 +1865,31 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Vec Arm,
 -- Returns each arm's code for each of its patterns, with `lower` lowering a
 -- body in a scope. `ty` is the type of the `match`.
 fun armBodies(l : Lowerer, arms : Vec Arm, ty : Ty.Type, scope : Scope,
-              lower : fun(Expr, Scope) -> Core) -> Vec (Pat, Match.Body) {
-    let alts = Vec.new(4)
+              lower : fun(Expr, Scope) -> Core) -> Arms {
+    let out = newArms()
     for arm in arms {
         let where = Some(arm.span)
-        for pat in arm.patterns {
-            let body = if len(arm.guards) == 0 {
-                Match.Taken(celled(l, pat, ChArm(arm), lower(arm.body, _),
-                                   childScope(scope), where))
-            } else {
-                Match.Guarded(fun(fail) = celled(l, pat, ChArm(arm),
-                    guarded(l, arm, 0, ty, _, lower, fail), childScope(scope), where))
+        for var k = 0; k < len(arm.patterns); k = k + 1 {
+            let pat = arm.patterns[k]
+            let copies = if k == 0 { l.copies } else {
+                let bound = []
+                Binders.boundIn(l.binders, ChArm(arm), bound)
+                copiesOf(l, bound)
             }
-            Vec.push(alts, (pat, body))
+            -- A guarded body is lowered when the `match` is compiled, after
+            -- this loop, so it puts its copies back in place itself.
+            let body = if len(arm.guards) == 0 {
+                Match.Taken(under(l, copies, fun() = celled(l, pat, ChArm(arm),
+                    lower(arm.body, _), childScope(scope), where)))
+            } else {
+                Match.Guarded(fun(fail) = under(l, copies, fun() = celled(l, pat,
+                    ChArm(arm), guarded(l, arm, 0, ty, _, lower, fail),
+                    childScope(scope), where)))
+            }
+            under(l, copies, fun() = addArm(l, out, pat, body))
         }
     }
-    alts
+    out
 }
 
 -- Returns code that runs guards `i` onwards of `arm` and then its body, and
@@ -1815,17 +1909,41 @@ fun guarded(l : Lowerer, arm : Arm, i : Int, ty : Ty.Type, scope : Scope,
             node(ty, where, CIf(c, guarded(l, arm, i + 1, ty, scope, lower, fail),
                                 Some(failing))))
         GLet(patterns, value) -> scrutinized(l, value, ty, where, scope, fun(v) = {
-            let alts = Vec.new(len(patterns) + 1)
-            for pat in patterns {
-                Vec.push(alts, (pat, Match.Taken(celled(l, pat, ChArm(arm),
-                    guarded(l, arm, i + 1, ty, _, lower, fail), childScope(scope), where))))
+            let alts = newArms()
+            for var k = 0; k < len(patterns); k = k + 1 {
+                let pat = patterns[k]
+                let copies = if k == 0 { l.copies } else { copiesOf(l, boundFrom(l, arm, i)) }
+                under(l, copies, fun() = addArm(l, alts, pat, Match.Taken(celled(l, pat,
+                    ChArm(arm), guarded(l, arm, i + 1, ty, _, lower, fail),
+                    childScope(scope), where))))
             }
             let other = Pat { id = patterns[0].id, span = patterns[0].span,
                               kind = PWild, opening = None }
-            Vec.push(alts, (other, Match.Taken(failing)))
+            addArm(l, alts, other, Match.Taken(failing))
             matchedArms(l, v, alts, ty, where)
         })
     }
+}
+
+-- Returns the binders that the patterns of guard `i` of `arm` bind, and the
+-- guards after it, and the arm's body: what an alternative of that guard
+-- lowers again.
+fun boundFrom(l : Lowerer, arm : Arm, i : Int) -> Vec Int {
+    let out = []
+    if let GLet(patterns, _) = arm.guards[i] {
+        for p in patterns { Binders.boundByPattern(l.binders, p, out) }
+    }
+    for var j = i + 1; j < len(arm.guards); j = j + 1 {
+        match arm.guards[j] {
+            GTest(test) -> Binders.boundIn(l.binders, ChExpr(test), out)
+            GLet(patterns, value) -> {
+                for p in patterns { Binders.boundByPattern(l.binders, p, out) }
+                Binders.boundIn(l.binders, ChExpr(value), out)
+            }
+        }
+    }
+    Binders.boundIn(l.binders, ChExpr(arm.body), out)
+    out
 }
 
 -- A branch whose *scrutinee* may itself hold a transfer, which has to run before
@@ -2573,7 +2691,7 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
     match target.kind {
         EVar(name, _) -> {
             let id = binderOf(l, target.id, name, Some(target.span))
-            let (cell, cellId) = Map.getOr(scope.cells, id, (name, id))
+            let (cell, cellId) = Option.unwrapOr(cellOf(scope, id), (name, id))
             node(unit, at, CAssign(
                 node(refOf(value.ty), Some(target.span), CVar(cell, cellId)), value))
         }
@@ -2621,7 +2739,7 @@ fun equationsOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
 -- What the binder `id`, spelled `name`, abstracts over, local bindings
 -- before top-level ones.
 fun bindersOf(l : Lowerer, id : Int, name : String, scope : Scope) -> Vec VarCell =
-    match Map.get(scope.binders, id) {
+    match localBinders(scope, id) {
         Some(local) -> local
         None -> match schemeOf(l, name) {
             Some(s) -> s.quantified

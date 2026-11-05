@@ -1,0 +1,374 @@
+export (
+    Conn(..), close, halfClose, isTimeout, isStale,
+    Paced, paced, conn, firstRead, progressed, carry,
+    Pool, Pooled(..), pool, take, give, closeIdle,
+)
+
+-- A client's connections: plain or TLS, read and written under its limits,
+-- and kept between requests in a pool per origin.
+--
+-- **Pacing.** A `Paced` connection bounds each read and write by two limits:
+-- the request's total deadline, if it has one, and the stall limit, measured
+-- from when the operation began or the last time a byte moved in either
+-- direction, whichever is later. So the limit fires only on a peer that
+-- stopped reading or sending, never on a caller that waited between reads.
+-- A request body is written in one task while the response is read in
+-- another, so a long upload must not stall out the read that waits for the
+-- response's head: a read that times out while the other direction moved is
+-- tried again, with the stall measured from that movement. A read that times out has taken no
+-- byte, so trying it again loses nothing. A write is never tried again,
+-- since one that timed out may have sent part of its buffer.
+--
+-- **Carrying.** Once a connection switches protocols, `carry` bounds each
+-- read and write by the deadline the new protocol sets, or by nothing, and
+-- by neither of the two limits: the protocol keeps its own time, and a
+-- connection waiting for its peer's next message has not stalled.
+--
+-- **The pool** keeps idle connections by origin -- scheme, host and port --
+-- at most `perOrigin` of each and `total` in all, for at most `idle` each.
+-- A connection is given back only by a caller that read its last message to
+-- the exact end; this module trusts that. One taken out is the caller's
+-- alone until it is given back or closed.
+--
+-- **Every `take` and `give` sweeps the whole pool**, closing each connection
+-- idle too long and dropping origins left with none. Sweeping only the
+-- origin asked for would leak: an origin never asked for again would keep
+-- its connections, and a busy one would keep those below its freshest,
+-- since `take` stops at the first fresh one. Each origin's connections are
+-- kept oldest first, so the sweep reads only up to the first fresh one of
+-- each. Past `total`, the oldest connection of any origin is closed.
+
+import Data.Error (promote)
+import Data.Ord (max)
+import Net (Connection(..))
+import Net.TCP as TCP
+import Net.TCP (Socket)
+import Net.TLS as TLS
+import Net.TLS (TLS, TLSError(..))
+import System.Sync as Sync
+import Time.Clock as Clock
+import Time.Deadline as Deadline
+import Time.Deadline (Deadline)
+import Time.Duration as Duration
+import Time.Duration (Duration)
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.Buffer (Buffer(..))
+import Turkey.ReadWrite (Read(..), Write(..))
+
+-- -- connections ------------------------------------------------------------------------
+
+-- A connection to a server, over TCP or TLS. Its errors are packed into
+-- `SomeError`, so that an `IOError` and a `TLSError` travel the same way
+-- and `cast` recovers either.
+type Conn = Plain(Socket) | Secure(TLS)
+
+instance Read Conn {
+    type ReadError = SomeError
+    fun readInto(c, into) = match c {
+        Plain(s) -> promote(readInto(s, into))
+        Secure(t) -> promote(readInto(t, into))
+    }
+}
+
+instance Write Conn {
+    type WriteError = SomeError
+    fun writeFrom(c, from) = match c {
+        Plain(s) -> promote(writeFrom(s, from))
+        Secure(t) -> promote(writeFrom(t, from))
+    }
+    fun flush(c) = Right(())
+}
+
+-- Closes `c`, ending every read and write parked on it. A failure to close
+-- is dropped: the connection is not used again either way.
+fun close(c : Conn) -> Unit {
+    let _ = match c {
+        Plain(s) -> promote(TCP.close(s))
+        Secure(t) -> promote(TLS.close(t))
+    }
+}
+
+-- Ends `c`'s output; the server can go on sending.
+fun halfClose(c : Conn) -> Either SomeError Unit = match c {
+    Plain(s) -> promote(shutdownWrite(s))
+    Secure(t) -> promote(shutdownWrite(t))
+}
+
+fun bound(c : Conn, at : Option Deadline) -> Unit = match (c, at) {
+    (Plain(s), Some(d)) -> TCP.setDeadline(s, d)
+    (Plain(s), None) -> TCP.clearDeadline(s)
+    (Secure(t), Some(d)) -> TLS.setDeadline(t, d)
+    (Secure(t), None) -> TLS.clearDeadline(t)
+}
+
+-- Returns the `IOError` a connection's error is or holds, for either kind of
+-- connection.
+fun ioError(e : SomeError) -> Option IOError {
+    if let Some(io) = Error.cast(e) : Option IOError {
+        return Some(io)
+    }
+    match Error.cast(e) : Option TLSError {
+        Some(Stream(io)) -> Some(io)
+        _ -> None
+    }
+}
+
+-- Whether `e` is a read or write that timed out.
+fun isTimeout(e : SomeError) -> Bool = match ioError(e) {
+    Some(io) -> io.kind == TimedOut
+    None -> False
+}
+
+-- Whether `e` is what a stale connection, one the server had already
+-- closed, fails with: a reset, a broken pipe, or TLS ending without its
+-- close_notify. A timeout is not: the server may be slow rather than gone.
+fun isStale(e : SomeError) -> Bool {
+    if let Some(Truncated) = Error.cast(e) : Option TLSError {
+        return True
+    }
+    match ioError(e) {
+        Some(io) -> io.kind == ConnectionReset || io.kind == BrokenPipe
+        None -> False
+    }
+}
+
+-- -- pacing -----------------------------------------------------------------------------
+
+type Paced = Paced {
+    conn          : Conn
+    total         : Option Deadline
+    stall         : Duration
+    -- When a byte last moved either way, in `Clock.monotonic` nanoseconds.
+    -- Written by the task reading and the one writing.
+    moved         : Sync.AtomicInt
+    -- When the first byte was read, if one has been.
+    var firstRead : Option Clock.Reading
+    var pacing    : Pacing
+}
+
+-- Under the two limits, or carrying another protocol until a deadline.
+type Pacing = Limited | Carrying(Option Deadline)
+
+fun paced(c : Conn, total : Option Deadline, stall : Duration) -> Paced =
+    Paced {
+        conn = c
+        total
+        stall
+        moved = Sync.atomicInt(now())
+        firstRead = None
+        pacing = Limited
+    }
+
+-- Bounds every later read and write on `p` by `d` alone, or by nothing.
+fun carry(p : Paced, d : Option Deadline) -> Unit { p.pacing = Carrying(d) }
+
+fun conn(p : Paced) -> Conn = p.conn
+
+-- Returns when the first byte was read from `p`, if one has been.
+fun firstRead(p : Paced) -> Option Clock.Reading = p.firstRead
+
+fun now() -> Int = Clock.nanos(Clock.monotonic())
+
+-- Records that a byte moved, as the other direction's limit reads it.
+fun progressed(p : Paced) -> Unit = Sync.store(p.moved, now())
+
+-- Returns the later of `a` and the last movement, from which an operation
+-- that began at `a` is allowed `stall`.
+fun since(p : Paced, a : Int) -> Int = max(Sync.load(p.moved), a)
+
+-- Bounds the next operation on `p`, begun at `started`, by whichever comes
+-- first: the total deadline, or the stall limit after `started` or the last
+-- movement, whichever is later. Returns whether the stall limit is the
+-- nearer.
+fun limit(p : Paced, started : Int) -> Bool {
+    if let Carrying(d) = p.pacing {
+        bound(p.conn, d)
+        return False
+    }
+    let stalled = since(p, started) + Duration.toNanos(p.stall) - now()
+    let stallAt = Deadline.after(Duration.nanos(max(stalled, 0)))
+    if let Some(t) = p.total, t < stallAt {
+        bound(p.conn, Some(t))
+        return False
+    }
+    bound(p.conn, Some(stallAt))
+    True
+}
+
+-- Whether an operation begun at `started` has stalled out: nothing moved
+-- either way for `stall` since it began.
+fun stalledOut(p : Paced, started : Int) -> Bool = now() - since(p, started) >= Duration.toNanos(p.stall)
+
+instance Read Paced {
+    type ReadError = SomeError
+    fun readInto(p, into) {
+        let started = now()
+        loop {
+            let byStall = limit(p, started)
+            match readInto(p.conn, into) {
+                Right(n) -> {
+                    if n > 0 {
+                        progressed(p)
+                        if Option.isNone(p.firstRead) {
+                            p.firstRead = Some(Clock.monotonic())
+                        }
+                    }
+                    return Right(n)
+                }
+                Left(e) -> {
+                    -- Timed out by the stall limit, while the other direction
+                    -- moved: wait again.
+                    if !(byStall && isTimeout(e) && !stalledOut(p, started)) {
+                        return Left(e)
+                    }
+                }
+            }
+        }
+    }
+}
+
+instance Write Paced {
+    type WriteError = SomeError
+    fun writeFrom(p, from) {
+        let _ = limit(p, now())
+        writeFrom(p.conn, from)?
+        if from.end > from.start {
+            progressed(p)
+        }
+        Right(())
+    }
+    fun flush(p) = Right(())
+}
+
+-- -- the pool ---------------------------------------------------------------------------
+
+type Pool = Pool {
+    perOrigin   : Int
+    total       : Int
+    idle        : Duration
+    connections : Sync.Mutex Idle
+}
+
+-- The idle connections of each origin that has any, oldest first, and how
+-- many there are in all.
+type Idle = Idle {
+    var origins : Map String (Vec Pooled)
+    var count   : Int
+}
+
+-- An idle connection, and when it was given back.
+type Pooled = Pooled {
+    conn  : Conn
+    since : Clock.Reading
+}
+
+fun pool(perOrigin : Int, total : Int, idle : Duration) -> Pool =
+    Pool {
+        perOrigin
+        total
+        idle
+        connections = Sync.mutex(Idle { origins = Map.new(), count = 0 })
+    }
+
+-- Removes from `idle` every connection kept for `p.idle` or longer, and
+-- every origin left with none, and adds those connections to `closing`.
+fun sweep(p : Pool, idle : Idle, closing : Vec Conn) -> Unit {
+    let now = Clock.monotonic()
+    for (origin, kept) in Map.entries(idle.origins) {
+        var expired = 0
+        while expired < len(kept) && Clock.between(kept[expired].since, now) >= p.idle {
+            Vec.push(closing, kept[expired].conn)
+            expired = expired + 1
+        }
+        if expired > 0 {
+            dropOldest(idle, origin, kept, expired)
+        }
+    }
+}
+
+-- Removes the `n` oldest of `kept`, `origin`'s connections, from `idle`,
+-- and the origin itself if that leaves it none.
+fun dropOldest(idle : Idle, origin : String, kept : Vec Pooled, n : Int) -> Unit {
+    idle.count = idle.count - n
+    if n == len(kept) {
+        let _ = Map.delete(idle.origins, origin)
+    } else {
+        Map.put(idle.origins, origin, Vec.slice(kept, n, len(kept)))
+    }
+}
+
+-- Returns an idle connection to `origin`, the most recently given back,
+-- after closing every connection idle too long.
+fun take(p : Pool, origin : String) -> Option Conn {
+    let closing = []
+    let found = Sync.withLock(p.connections, fun(idle) {
+        sweep(p, idle, closing)
+        let kept = Map.get(idle.origins, origin)?
+        let Pooled { conn = c, since = _ } = Vec.pop(kept)?
+        idle.count = idle.count - 1
+        if len(kept) == 0 {
+            let _ = Map.delete(idle.origins, origin)
+        }
+        Some(c)
+    })
+    for c in closing { close(c) }
+    found
+}
+
+-- Keeps `c` for the next request to `origin`, after closing every
+-- connection idle too long. Closes `c` instead if the origin has as many
+-- idle connections as it may, and the pool's oldest if the pool then has
+-- more than `total`.
+fun give(p : Pool, origin : String, c : Conn) -> Unit {
+    let closing = []
+    Sync.withLock(p.connections, fun(idle) {
+        sweep(p, idle, closing)
+        let kept = Option.unwrapOr(Map.get(idle.origins, origin), [])
+        if len(kept) >= p.perOrigin || p.total == 0 {
+            Vec.push(closing, c)
+        } else {
+            Vec.push(kept, Pooled { conn = c, since = Clock.monotonic() })
+            if len(kept) == 1 {
+                Map.put(idle.origins, origin, kept)
+            }
+            idle.count = idle.count + 1
+            if idle.count > p.total {
+                evictOldest(idle, closing)
+            }
+        }
+    })
+    for c in closing { close(c) }
+}
+
+-- Removes the pool's oldest connection, of whichever origin, and adds it to
+-- `closing`. Each origin's oldest is its first, so only those are compared.
+fun evictOldest(idle : Idle, closing : Vec Conn) -> Unit {
+    var oldest = None
+    for (origin, kept) in Map.entries(idle.origins) {
+        let older = match oldest {
+            Some((_, o)) -> kept[0].since < o[0].since
+            None -> True
+        }
+        if older {
+            oldest = Some((origin, kept))
+        }
+    }
+    if let Some((origin, kept)) = oldest {
+        Vec.push(closing, kept[0].conn)
+        dropOldest(idle, origin, kept, 1)
+    }
+}
+
+-- Closes every idle connection.
+fun closeIdle(p : Pool) -> Unit {
+    let all = Sync.withLock(p.connections, fun(idle) {
+        let all = []
+        for kept in Map.values(idle.origins) {
+            for Pooled { conn = c, since = _ } in kept { Vec.push(all, c) }
+        }
+        idle.origins = Map.new()
+        idle.count = 0
+        all
+    })
+    for c in all { close(c) }
+}

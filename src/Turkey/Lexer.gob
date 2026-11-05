@@ -1,4 +1,4 @@
-export (tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
+export (Lexed(..), tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
 
 -- The tokenizer, in two passes.
 --
@@ -6,20 +6,39 @@ export (tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
 -- decides which of them terminate a production. Keeping the two apart is what
 -- makes the subtlest part of the lexical structure testable on its own.
 --
+-- Comments and blank lines are not tokens. The first pass collects them into
+-- tables beside the tokens, so that the parser never has to skip them and a
+-- tool that reprints the source can still put them back.
+--
 -- Identifiers and numerals are ASCII: `[a-z_]` starts a name and `[0-9]` a
 -- numeral, so a Greek letter or a Devanagari digit starts neither. The rules
 -- for numerals are under "numbers" below.
 
 import Turkey.Diag as Diag
-import Turkey.Source (Source(..), Span, span)
-import Turkey.Token (Kind(..), Token(..), Value(..), isOp)
+import Turkey.Source (Source(..), Span, span, endingAt)
+import Turkey.Token (Comment(..), Kind(..), Token(..), Value(..), isOp)
 
 type Lexer = Lexer {
-    src      : String,
-    file     : String,
-    var at   : String.Index,
-    var line : Int,
-    var col  : Int,
+    src        : String,
+    file       : String,
+    var at     : String.Index,
+    var line   : Int,
+    var col    : Int,
+    comments   : Vec Comment,
+    blankLines : Vec Int,
+    -- The last line on which a token or a comment ended, or 0 before the
+    -- first. A line break on any later line ends a blank line.
+    var lastContent : Int,
+}
+
+-- A file's tokens, and what the tokens leave out: its comments in source
+-- order, and the number of each line that holds only spaces, tabs and
+-- carriage returns and ends in a line break. A line inside a block comment is
+-- part of the comment, so it is never blank.
+type Lexed = Lexed {
+    tokens     : Vec Token,
+    comments   : Vec Comment,
+    blankLines : Vec Int,
 }
 
 -- -- tables -------------------------------------------------------------------------
@@ -129,13 +148,16 @@ fun charIsSign(c : Option Char) -> Bool = match c {
 
 -- -- pass one ----------------------------------------------------------------------
 
-fun tokenizeRaw(source : Source) -> Vec Token {
+fun tokenizeRaw(source : Source) -> Lexed {
     let lx = Lexer {
         src = source.text,
         file = source.name,
         at = String.start(source.text),
         line = 1,
         col = 1,
+        comments = [],
+        blankLines = [],
+        lastContent = 0,
     }
     let tokens = Vec.new(64)
     loop {
@@ -144,11 +166,25 @@ fun tokenizeRaw(source : Source) -> Vec Token {
         let start = here(lx)
         match peek(lx) {
             None -> { break }
-            Some(c) -> { Vec.push(tokens, lexOne(lx, start, c, tokens)) }
+            Some(c) -> {
+                if c == '\n' && lx.lastContent < lx.line { Vec.push(lx.blankLines, lx.line) }
+                let tok = lexOne(lx, start, c, tokens)
+                -- A `;` is a NEWLINE, and it is also text on its line.
+                match tok.kind {
+                    KNewline -> if tok.forced { lx.lastContent = lx.line }
+                    _ -> { lx.lastContent = lx.line }
+                }
+                Vec.push(tokens, Token {
+                    kind = tok.kind,
+                    value = tok.value,
+                    span = endingAt(tok.span, lx.line, lx.col),
+                    forced = tok.forced,
+                })
+            }
         }
     }
     Vec.push(tokens, plain(KEof, VText(""), here(lx)))
-    tokens
+    Lexed { tokens = tokens, comments = lx.comments, blankLines = lx.blankLines }
 }
 
 fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Vec Token) -> Token {
@@ -190,10 +226,13 @@ fun skipInlineTrivia(lx : Lexer) -> Unit {
                 if c == ' ' || c == '\t' || c == '\r' {
                     bump(lx)
                 } else if c == '-' && charIs(peekAt(lx, 1), '-') {
+                    let start = here(lx)
+                    let from = lx.at
                     while !atEnd(lx) {
                         if charIs(peek(lx), '\n') { break }
                         bump(lx)
                     }
+                    keepComment(lx, start, from, False)
                 } else if c == '{' && charIs(peekAt(lx, 1), '-') {
                     skipBlockComment(lx)
                 } else {
@@ -204,9 +243,20 @@ fun skipInlineTrivia(lx : Lexer) -> Unit {
     }
 }
 
+-- Records the comment that began at `start`, offset `from`, and ends here.
+fun keepComment(lx : Lexer, start : Span, from : String.Index, block : Bool) -> Unit {
+    Vec.push(lx.comments, Comment {
+        span = endingAt(start, lx.line, lx.col),
+        text = String.slice(lx.src, from, lx.at),
+        block = block,
+    })
+    lx.lastContent = lx.line
+}
+
 -- Nested, so `{- {- -} -}` is one comment.
 fun skipBlockComment(lx : Lexer) -> Unit {
     let start = here(lx)
+    let from = lx.at
     var depth = 0
     loop {
         if atEnd(lx) { oops(lx, "this block comment has no closing '-}'", start) }
@@ -221,6 +271,7 @@ fun skipBlockComment(lx : Lexer) -> Unit {
             bump(lx)
         }
     }
+    keepComment(lx, start, from, True)
 }
 
 -- -- numbers -----------------------------------------------------------------------
@@ -769,4 +820,11 @@ fun canStart(k : Kind) -> Bool {
     }
 }
 
-fun tokenize(source : Source) -> Vec Token = applyNewlineRule(tokenizeRaw(source))
+fun tokenize(source : Source) -> Lexed {
+    let raw = tokenizeRaw(source)
+    Lexed {
+        tokens = applyNewlineRule(raw.tokens),
+        comments = raw.comments,
+        blankLines = raw.blankLines,
+    }
+}

@@ -9,8 +9,8 @@ assembler accepts.
 
 from __future__ import annotations
 
+import hashlib
 import os
-import re
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -116,7 +116,8 @@ def errno(request: pytest.FixtureRequest,
           monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A program that asks for errno's address through `ERRNO`, whose module
     is named for the test so that parallel tests do not share it."""
-    stem = "Probe_" + re.sub(r"[^A-Za-z0-9_]", "_", request.node.name)[:60]
+    digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
+    stem = f"Probe_target_{digest}"
     path = lang.LIB / f"{stem}.gob"
     path.write_text(ERRNO.replace("PROBE", stem), encoding="utf-8")
     monkeypatch.setenv("TURKEY_TEST_FOREIGN", stem)

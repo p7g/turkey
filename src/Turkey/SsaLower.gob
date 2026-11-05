@@ -3600,12 +3600,8 @@ fun initializer(program : CProgram, decls : DeclTable,
     let storage = storageOf(program, decls)
     let held = Map.new()
     for (name, r) in storage { Map.put(held, name, r) }
-    let layouts = Map.new()
-    let spans = Map.new()
-    for bind in Vec.append(program.dicts, program.binds) {
-        Map.put(layouts, bind.name, bind.layouts)
-        Map.put(spans, bind.name, bind.span)
-    }
+    let owners = Map.new()
+    for bind in Vec.append(program.dicts, program.binds) { Map.put(owners, bind.name, bind) }
 
     let actions : Vec Action = []
     let deferred = []
@@ -3640,9 +3636,9 @@ fun initializer(program : CProgram, decls : DeclTable,
         }
     }
     let (early, earlyLifted) = lowerActions(Giblets.initializerName, earlyActions,
-        decls, globals, globalRefs, tags, sigs, shared, layouts, spans, held)
+        decls, globals, globalRefs, tags, sigs, shared, owners, held)
     let (init, lifted) = lowerActions(initializerName, actions,
-        decls, globals, globalRefs, tags, sigs, shared, layouts, spans, held)
+        decls, globals, globalRefs, tags, sigs, shared, owners, held)
     (init, early, Array.append(earlyLifted, lifted), storage)
 }
 
@@ -3653,20 +3649,27 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
                  tags : Map String Int,
                  sigs : Map String Signature, shared : Lifting,
-                 layouts : Map String (Map String Ssa.Layout),
-                 spans : Map String (Option Span), held : Map String Rep)
+                 owners : Map String CBind, held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
     let f = Ssa.newFunc(name, [Ssa.untraced(Unit)])
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, Map.new(), [], shared)
     L.into(l.b, L.block(l.b))
     for a in actions {
         let owner = ownerOf(a)
+        let bind = match Map.get(owners, owner) {
+            Some(found) -> found
+            None -> oops("the global '" + owner + "' has no binding")
+        }
         -- The owning binding's layouts, restored per action.
-        setLayouts(l, Map.getOr(layouts, owner, Map.new()))
+        setLayouts(l, bind.layouts)
         -- The owning binding's position, which what the action lowers to
         -- takes where its own nodes have none: a dictionary is built from
         -- nodes the compiler made.
-        l.b.span = Map.getOr(spans, owner, None)
+        l.b.span = bind.span
+        -- The global's module, for the lambdas the action lifts to take.
+        -- `Lower` has no room for a field of its own for it; the
+        -- initializer's own is put back to empty below.
+        f.module_ = bind.module_
         l.env = Map.new()
         l.evidence = Map.new()
         l.joins = Map.new()
@@ -3690,6 +3693,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                               + why)
         }
     }
+    f.module_ = ""
     L.terminate(l.b, Ret([L.emit(l.b, ConstUnit, Ssa.untraced(Unit))]))
     (Promote.run(f), pruneAll(l.lifted))
 }

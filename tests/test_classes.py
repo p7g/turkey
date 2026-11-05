@@ -269,7 +269,10 @@ def test_an_instance_must_define_every_method_that_has_no_default():
 def test_an_instance_may_not_define_a_method_of_another_class():
     src = EQ + """
     class Display a { fun display(a) -> String }
-    instance Display Int { fun egal(x, y) = True }
+    instance Display Int {
+        fun display(x) = "int"
+        fun egal(x, y) = True
+    }
     """
     assert bad(src) == "'egal' is not a method of class 'Display'"
 

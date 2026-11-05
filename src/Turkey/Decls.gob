@@ -190,6 +190,9 @@ type DeclTable = DeclTable {
     -- Existential constructors whose contexts name classes, until the class
     -- table has the classes to check them against.
     var uncheckedContexts : Vec (ConInfo, ConDecl),
+    -- The aliases reported as recursive. One has no expansion, so every use
+    -- of it translates to bottom.
+    recursiveAliases : Set.Set String,
 }
 
 fun newDeclTable() -> DeclTable {
@@ -200,7 +203,7 @@ fun newDeclTable() -> DeclTable {
         families = Map.new(), shorts = Map.new(), order = Vec.new(16),
         foreigns = Map.new(), definitions = Map.new(), functions = Set.new(),
         newtypeNames = None, flatNames = None, groundLayouts = Map.new(),
-        packings = Map.new(), uncheckedContexts = [],
+        packings = Map.new(), uncheckedContexts = [], recursiveAliases = Set.new(),
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
@@ -261,6 +264,10 @@ fun namesPrimitive(d : TypeDecl) -> Bool {
 -- Declare every type before resolving any, so they may refer to each other in
 -- any order.
 fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
+    -- A declaration whose variables were reported below is still registered,
+    -- so its uses elsewhere find it, but its constructors are not translated:
+    -- translating them assumes every variable is declared.
+    let invalid = Set.new()
     for d in decls {
         let params = Set.new()
         for p in d.params { Set.add(params, p) }
@@ -276,16 +283,18 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
                 let hidden = hiddenVariables(c)
                 for name in hidden {
                     if Set.contains(params, name) {
-                        oops("'" + name + "' is a parameter of type '" + d.name
-                             + "', so the bracket of '" + c.name
-                             + "' cannot hide it", Some(c.span))
+                        Set.add(invalid, d.name)
+                        report("'" + name + "' is a parameter of type '" + d.name
+                               + "', so the bracket of '" + c.name
+                               + "' cannot hide it", Some(c.span))
                     }
                 }
                 let distinct = Set.new()
                 for b in c.binders {
                     if Set.contains(distinct, b) {
-                        oops("'" + b + "' appears twice in the bracket of '"
-                             + c.name + "'", Some(c.span))
+                        Set.add(invalid, d.name)
+                        report("'" + b + "' appears twice in the bracket of '"
+                               + c.name + "'", Some(c.span))
                     }
                     Set.add(distinct, b)
                 }
@@ -301,8 +310,9 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
                     match v.kind {
                         TEVar(name) -> if !Set.contains(params, name)
                                 && !Set.contains(hiddenSet, name) {
-                            oops("type variable '" + name + "' is not declared by "
-                                 + "type '" + d.name + "'", Some(v.span))
+                            Set.add(invalid, d.name)
+                            report("type variable '" + name + "' is not declared by "
+                                   + "type '" + d.name + "'", Some(v.span))
                         }
                         _ -> {}
                     }
@@ -310,14 +320,19 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
             }
         }
     }
+    -- A declaration reported as a duplicate is left out of the passes below,
+    -- so its constructors are not reported again as duplicates of the first's.
+    let kept : Vec TypeDecl = []
     for d in decls {
         let short = Ty.shortName(d.name)
         if Ty.isPrimitive(short) && !namesPrimitive(d) {
-            oops("cannot redefine the built-in type '" + short + "'", Some(d.span))
+            report("cannot redefine the built-in type '" + short + "'", Some(d.span))
         }
         if Map.contains(t.tycons, d.name) {
-            oops("type '" + d.name + "' is declared more than once", Some(d.span))
+            report("type '" + d.name + "' is declared more than once", Some(d.span))
+            continue
         }
+        Vec.push(kept, d)
         -- Every declaration is given its kind *skeleton* up front -- one arrow
         -- per parameter, over kind variables. Arity is syntactic, so the
         -- skeleton is exact and only the parameters' own kinds are left to
@@ -341,14 +356,22 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
             None -> Map.put(t.shorts, short, d.name)
         }
     }
-    for d in decls {
-        if Option.isNone(d.alias) { resolveVariants(t, d) }
+    -- Cycles first: a constructor field or an alias body that mentions a
+    -- recursive alias would otherwise expand it for ever.
+    for d in kept {
+        if Option.isSome(d.alias) && !Set.contains(t.recursiveAliases, d.name) {
+            let _ = checkAliasAcyclic(t, d.name, d.name, Set.new())
+        }
     }
-    for d in decls {
+    for d in kept {
+        if Option.isNone(d.alias) && !Set.contains(invalid, d.name) { resolveVariants(t, d) }
+    }
+    for d in kept {
         if Option.isSome(d.alias) {
             checkAliasHead(t, d)
-            checkAliasAcyclic(t, d.name, d.name, Set.new())
-            kindCheckAlias(t, tyconOf(t, d.name))
+            if !Set.contains(t.recursiveAliases, d.name) {
+                kindCheckAlias(t, tyconOf(t, d.name))
+            }
         }
     }
     settleKinds(t)
@@ -362,8 +385,8 @@ fun checkAliasHead(t : DeclTable, d : TypeDecl) -> Unit = match d.alias {
         TECon(name, args) -> {
             if len(args) != 0 && !Map.contains(t.tycons, name)
                     && !Map.contains(t.families, name) {
-                oops("unknown type '" + name + "'; to declare a constructor, "
-                     + "write '" + name + "(...)'", Some(te.span))
+                report("unknown type '" + name + "'; to declare a constructor, "
+                       + "write '" + name + "(...)'", Some(te.span))
             }
         }
         _ -> {}
@@ -432,7 +455,7 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
         None -> {}
         Some(variants) -> for c in variants {
             match Map.get(t.constructors, c.name) {
-                Some(other) -> oops("constructor '" + c.name + "' is already "
+                Some(other) -> report("constructor '" + c.name + "' is already "
                     + "declared by type '" + other.tycon + "'", Some(c.span))
                 None -> {}
             }
@@ -497,12 +520,12 @@ fun checkVars(decl : TypeDecl, c : ConDecl, variants : Vec ConDecl) -> Unit {
     if len(c.vars) == 0 { return {} }
     let at = Some(firstVarSpan(c))
     if len(variants) > 1 {
-        oops("field '" + c.vars[0] + "' cannot be 'var': '" + decl.name
-             + "' has more than one constructor", at)
+        return report("field '" + c.vars[0] + "' cannot be 'var': '" + decl.name
+                      + "' has more than one constructor", at)
     }
     if len(hiddenVariables(c)) > 0 {
-        oops("field '" + c.vars[0] + "' cannot be 'var': '" + c.name
-             + "' is existential", at)
+        report("field '" + c.vars[0] + "' cannot be 'var': '" + c.name
+               + "' is existential", at)
     }
 }
 
@@ -522,21 +545,28 @@ fun firstOfPair(p : (String, Type)) -> String {
 
 -- A type alias may not be recursive: it is expanded, not unfolded, so a
 -- recursive one has no normal form to expand to.
+--
+-- Returns whether `root` is recursive. If so, reports it, and adds every alias
+-- on the cycle to `t.recursiveAliases`, so a cycle through several is
+-- reported once.
 fun checkAliasAcyclic(t : DeclTable, root : String, name : String,
-                      seen : Set.Set String) -> Unit {
+                      seen : Set.Set String) -> Bool {
     match Map.get(t.tycons, name) {
-        None -> return {}
+        None -> return False
         Some(info) -> {
-            if !info.isAlias || Set.contains(seen, name) { return {} }
+            if !info.isAlias || Set.contains(seen, name) { return False }
             let inner = Set.new()
             for s in Set.elements(seen) { Set.add(inner, s) }
             Set.add(inner, name)
             for referenced in referencedTycons(info.aliasBody) {
                 if referenced == root {
-                    oops("type alias '" + root + "' is recursive", info.span)
+                    report("type alias '" + root + "' is recursive", tyconOf(t, root).span)
+                    for s in Set.elements(inner) { Set.add(t.recursiveAliases, s) }
+                    return True
                 }
-                checkAliasAcyclic(t, root, referenced, inner)
+                if checkAliasAcyclic(t, root, referenced, inner) { return True }
             }
+            False
         }
     }
 }
@@ -554,8 +584,8 @@ fun star(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
          fresh : Ty.Fresh) -> Ty.Type {
     let out = toType(t, te, tyvars, fresh)
     if !Ty.unifyKinds(Ty.kindOf(out), KStar) {
-        oops("'" + Ty.show(out) + "' has kind " + Ty.showKind(Ty.kindOf(out))
-             + ", but a type of kind * is needed here", Some(te.span))
+        report("'" + Ty.show(out) + "' has kind " + Ty.showKind(Ty.kindOf(out))
+               + ", but a type of kind * is needed here", Some(te.span))
     }
     out
 }
@@ -591,9 +621,15 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
         if Map.contains(t.families, name) {
             return family(t, te, name, args, tyvars, fresh)
         }
+        -- A type reported here, or a recursive alias, is bottom. Bottom unifies
+        -- with anything, and the kind and shape checks skip it.
+        if Set.contains(t.recursiveAliases, name) { return TBottom }
         let info = match Map.get(t.tycons, name) {
             Some(i) -> i
-            None -> oops("unknown type '" + name + "'", Some(te.span))
+            None -> {
+                report("unknown type '" + name + "'", Some(te.span))
+                return TBottom
+            }
         }
         let resolved = Array.map(args, toType(t, _, tyvars, fresh))
         if info.isAlias {
@@ -605,10 +641,11 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
             -- family's do; an expansion has kind `*`, so that is a kind error
             -- naming what the alias stands for, `Int Bool` saying `Int`.
             if len(resolved) < len(info.params) {
-                oops("type alias '" + name + "' needs "
-                     + arguments(len(info.params)) + " but has "
-                     + Int.toString(len(resolved)) + "; an alias "
-                     + "cannot be partially applied", Some(te.span))
+                report("type alias '" + name + "' needs "
+                       + arguments(len(info.params)) + " but has "
+                       + Int.toString(len(resolved)) + "; an alias "
+                       + "cannot be partially applied", Some(te.span))
+                return TBottom
             }
             let substitution = Map.new()
             for var i = 0; i < len(info.params); i = i + 1 {
@@ -637,15 +674,16 @@ fun family(t : DeclTable, te : Type, name : String, args : Vec Type,
         None -> bug("unknown type family '" + name + "'", Some(te.span))
     }
     if len(args) == 0 {
-        oops("'" + name + "' is an associated type of class '" + fam.cls
-             + "' and must be applied to a type", Some(te.span))
+        report("'" + name + "' is an associated type of class '" + fam.cls
+               + "' and must be applied to a type", Some(te.span))
+        return TBottom
     }
     let resolved = Array.map(args, toType(t, _, tyvars, fresh))
-    if !Ty.unifyKinds(Ty.kindOf(resolved[0]), fam.argKind) {
-        oops("'" + Ty.show(resolved[0]) + "' has kind "
-             + Ty.showKind(Ty.kindOf(resolved[0])) + ", but '" + name
-             + "' expects an argument of kind " + Ty.showKind(fam.argKind),
-             Some(te.span))
+    if !Ty.isBottom(resolved[0]) && !Ty.unifyKinds(Ty.kindOf(resolved[0]), fam.argKind) {
+        report("'" + Ty.show(resolved[0]) + "' has kind "
+               + Ty.showKind(Ty.kindOf(resolved[0])) + ", but '" + name
+               + "' expects an argument of kind " + Ty.showKind(fam.argKind),
+               Some(te.span))
     }
     Ty.applyTo(TFam(name, resolved[0], fam.resKind),
                Array.slice(resolved, 1, len(resolved)), Some(te.span))
@@ -679,7 +717,10 @@ fun instantiateCon(t : DeclTable, name : String, fresh : Ty.Fresh,
                    where : Option Span) -> Ty.Type =
     match Map.get(t.constructors, name) {
         Some(info) -> Ty.instantiate(info.scheme, fresh)
-        None -> oops("unknown constructor '" + name + "'", where)
+        None -> {
+            report("unknown constructor '" + name + "'", where)
+            TBottom
+        }
     }
 
 fun con(t : DeclTable, name : String) -> Option ConInfo = Map.get(t.constructors, name)
@@ -1281,9 +1322,12 @@ fun typeVariablesInto(te : Type, out : Vec Type) -> Unit = match te.kind {
 fun undeclared() -> VarCell =
     bug("type declaration validation missed an undeclared variable", None)
 
-fun oops(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("type error", message), "")
-    Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
+-- Reports a type error and returns, for a check that can skip what it was
+-- checking and carry on. Registration goes on past an error so that every
+-- declaration reports, and the generator stops once it is done.
+fun report(message : String, where : Option Span) -> Unit = match where {
+    None -> Diag.report(Diag.whole("type error", message))
+    Some(s) -> Diag.report(Diag.at("type error", message, s))
 }
 
 -- A check only a compiler bug can fail, so it is not reported as the

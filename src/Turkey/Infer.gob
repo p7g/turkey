@@ -268,6 +268,11 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     let items = Vec.new(16)
     for (owner, program) in modules {
         for le in program.letElses {
+            -- One that falls through even if every call in it never returns
+            -- is reported now, before solving. Desugaring may have rewritten
+            -- the block into a value that is no longer bottom, and solving
+            -- would report that as a mismatch between the arms instead.
+            if completes(le.completion, fun(_) = False) { fallsThrough(le) }
             Vec.push(g.letElses, le)
             Set.add(g.bottoms, le.block.id)
             for call in le.tailCalls { Set.add(g.bottoms, call.id) }
@@ -901,17 +906,8 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
-    -- When an `else` block falls through, it does so past its last statement.
     for le in g.letElses {
-        if completes(le.completion, Typed.canReturn(g.types, _)) {
-            let at = match le.block.kind {
-                EBlock(stmts) -> if len(stmts) > 0 { stmts[len(stmts) - 1].span }
-                                 else { le.block.span }
-                _ -> le.block.span
-            }
-            oops("this 'else' block can fall through; it must end in 'return', "
-                 + "'break', 'continue' or a call that never returns", Some(at))
-        }
+        if completes(le.completion, Typed.canReturn(g.types, _)) { fallsThrough(le) }
     }
     -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
@@ -926,6 +922,18 @@ fun checkExhaustiveness(g : Generator) -> Unit {
                  Some(x.span))
         }
     }
+}
+
+-- Reports that a `let ... else` block can fall through. It does so past its
+-- last statement, so that is where the report points.
+fun fallsThrough(le : LetElse) -> a {
+    let at = match le.block.kind {
+        EBlock(stmts) -> if len(stmts) > 0 { stmts[len(stmts) - 1].span }
+                         else { le.block.span }
+        _ -> le.block.span
+    }
+    oops("this 'else' block can fall through; it must end in 'return', "
+         + "'break', 'continue' or a call that never returns", Some(at))
 }
 
 -- A block whose value nobody reads -- a loop body, a one-armed `if` -- discards

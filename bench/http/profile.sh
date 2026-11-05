@@ -7,8 +7,10 @@
 # threads (default 2), warm it up, then
 #
 #   * record 10 s of call stacks with `perf record --call-graph fp` while
-#     wrk drives 64 keep-alive connections, and report the functions by
-#     their own samples and by their callees' too;
+#     wrk, with $LOAD_THREADS threads (default 2), drives 64 keep-alive
+#     connections, and report the functions by their own samples and by
+#     their callees' too. perf samples on the `cpu-clock` timer rather than
+#     a hardware counter, which a virtual machine may not expose;
 #   * count its system calls with `strace -c -f` over 8 s of the same load,
 #     and divide by the requests wrk completed in that time.
 #
@@ -24,6 +26,7 @@ cd "$ROOT"
 OUT=$ROOT/build/bench/http
 P=$OUT/profile
 CORES=${CORES:-2}
+LOAD_THREADS=${LOAD_THREADS:-2}
 PORT=18090
 mkdir -p "$P"
 
@@ -48,12 +51,12 @@ url=http://127.0.0.1:$PORT/hello
 for impl in ${*:-turkey go}; do
     echo "== $impl"
     start "$impl"
-    wrk -t2 -c64 -d3s "$url" > /dev/null
+    wrk -t"$LOAD_THREADS" -c64 -d3s "$url" > /dev/null
 
-    wrk -t2 -c64 -d13s "$url" > "$P/$impl.wrk-perf.txt" &
+    wrk -t"$LOAD_THREADS" -c64 -d13s "$url" > "$P/$impl.wrk-perf.txt" &
     load=$!
     sleep 1
-    sudo perf record -q -F 999 --call-graph fp -o "$P/$impl.perf.data" -p $SERVER -- sleep 10
+    sudo perf record -q -e cpu-clock -F 999 --call-graph fp -o "$P/$impl.perf.data" -p $SERVER -- sleep 10
     wait $load
     sudo chown "$(id -u)" "$P/$impl.perf.data"
     perf report -i "$P/$impl.perf.data" --stdio --no-children --sort symbol --percent-limit 0.5 \
@@ -61,7 +64,7 @@ for impl in ${*:-turkey go}; do
     perf report -i "$P/$impl.perf.data" --stdio --children --sort symbol --percent-limit 2 -g none \
         > "$P/$impl.perf-children.txt" 2> /dev/null
 
-    wrk -t2 -c64 -d10s "$url" > "$P/$impl.wrk-strace.txt" &
+    wrk -t"$LOAD_THREADS" -c64 -d10s "$url" > "$P/$impl.wrk-strace.txt" &
     load=$!
     sleep 1
     sudo timeout -s INT 8 strace -c -f -p $SERVER -o "$P/$impl.strace.txt" || true

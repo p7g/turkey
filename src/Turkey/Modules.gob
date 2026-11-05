@@ -125,13 +125,20 @@ fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
 
 -- Conflicts retain declaration identities, not import spellings: two routes
 -- to the same re-export are still one declaration.
+--
+-- An ambiguous name is reported, and the first of its declarations in order of
+-- internal name is returned, so that the caller does not report the name again
+-- as undefined.
 fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
     match Map.get(conflictsIn(s, space), name) {
-        Some(targets) -> oopsAt("'" + name + "' is ambiguous: it is imported as "
-            + String.join(Vec.map(Vec.sort(targets), fun(t) =
-                quoted(String.replace(t, "#", "."))), " and ")
-            + "; write the qualified name of the one you mean", where)
+        Some(targets) -> {
+            report("'" + name + "' is ambiguous: it is imported as "
+                + String.join(Vec.map(Vec.sort(targets), fun(t) =
+                    quoted(String.replace(t, "#", "."))), " and ")
+                + "; write the qualified name of the one you mean", where)
+            Some(Vec.sort(targets)[0])
+        }
         None -> Map.get(spaceAt(s, space), name)
     }
 }
@@ -428,8 +435,9 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
     }
     for imp in program.imports {
         if imp.name == Prelude.entryName {
-            oopsAt("'" + Prelude.entryName + "' is the entry module, and the "
+            report("'" + Prelude.entryName + "' is the entry module, and the "
                    + "entry cannot be imported", Some(imp.span))
+            continue
         }
         if importsModule(imp) { Vec.push(edges, imp.name) }
     }
@@ -520,9 +528,19 @@ fun finish(l : Loader, names : Vec String) -> Unit {
     if together { settleTables(l, modules) }
     -- The last round reports what is wrong, and is the only round of a
     -- component of one module.
+    --
+    -- The scope and export checks report only while nothing has been reported
+    -- yet. A module checked after an error, or beside it in a cycle, imports
+    -- from what failed or from what imports it, and would report the same
+    -- missing names again; an error reported earlier in the same module, such
+    -- as a misplaced foreign declaration, turns them off as well. A module's
+    -- exports are not checked once its imports report, since an export of a
+    -- name an import failed to bring would be reported again as undefined.
     for m in modules {
-        m.scope = scopeOf(l, m, True)
-        m.exports = exportsOf(l, m, True)
+        let strict = !Diag.hasErrors()
+        let before = Diag.errorCount()
+        m.scope = scopeOf(l, m, strict)
+        m.exports = exportsOf(l, m, strict && Diag.errorCount() == before)
     }
     for m in modules { Vec.push(l.order, m) }
     Vec.push(l.groups, modules)
@@ -651,7 +669,9 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
     }
     let imports = newScope()
     for imp in m.program.imports {
-        if !optsOut(imp) {
+        -- An import of the entry was reported when the module was read, and
+        -- the entry is not loaded yet.
+        if !optsOut(imp) && imp.name != Prelude.entryName {
             let dep = moduleNamed(l, imp.name)
             let alias = match imp.alias {
                 Some(a) -> a
@@ -705,9 +725,11 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
     -- at an import. Only the entry may omit the declaration, and the entry
     -- cannot be imported.
     if strict && Option.isNone(dep.program.exportDecl) {
-        oopsAt("module '" + dep.name + "' is imported but has no export "
-               + "declaration; begin it with 'export (...)' listing its "
-               + "exports, or 'export (..)' for everything it declares", where)
+        -- And nothing is brought: every item of the list would be reported
+        -- as missing from the exports the module does not declare.
+        return report("module '" + dep.name + "' is imported but has no export "
+                      + "declaration; begin it with 'export (...)' listing its "
+                      + "exports, or 'export (..)' for everything it declares", where)
     }
     let available = spaces(dep.exports)
     let chosen = match bare {
@@ -759,8 +781,9 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
 fun itemNames(l : Loader, dep : Module, item : ExportItem, where : Option Span,
               strict : Bool) -> Vec (Int, String, String, Bool) {
     if strict && !namedAnywhere(dep.exports, item.name) {
-        oopsAt("module '" + dep.name + "' does not export "
+        report("module '" + dep.name + "' does not export "
                + quoted(item.name), where)
+        return []
     }
     let available = spaces(dep.exports)
     let out = Vec.new(4)
@@ -802,14 +825,14 @@ fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,
             if !Vec.contains(membersOf(l, cls), sub)
                 || !(Map.contains(dep.exports.methods, sub)
                      || Map.contains(dep.exports.types, sub)) {
-                oopsAt("module '" + dep.name + "' does not export member '"
+                report("module '" + dep.name + "' does not export member '"
                        + sub + "' of class '" + item.name + "'", where)
             }
         }
         None -> {
             if !constructorMember(l, Map.get(dep.exports.types, item.name),
                                   sub, Map.get(dep.exports.cons, sub)) {
-                oopsAt("module '" + dep.name + "' does not export constructor '"
+                report("module '" + dep.name + "' does not export constructor '"
                        + sub + "' of type '" + item.name + "'", where)
             }
         }
@@ -936,7 +959,7 @@ fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
             None -> match family {
                 Some(f) -> Map.put(out.types, member, f)
                 None -> if strict {
-                    oopsAt("'" + member + "' is not a member of class '"
+                    report("'" + member + "' is not a member of class '"
                            + item.name + "'", Some(item.span))
                 }
             }
@@ -953,7 +976,10 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
     Map.put(out.types, item.name, target)
     let variants = variantsOf(l, Some(target))
     for con in subsFrom(item, variants) {
-        if strict && !Vec.contains(variants, con) { notConstructor(con, item) }
+        if strict && !Vec.contains(variants, con) {
+            notConstructor(con, item)
+            continue
+        }
         match firstOf(Map.get(mine.cons, con),
                       findName(m.scope, ConstructorSpace, con, item, strict)) {
             Some(t) -> if constructorMember(l, Some(target), con, Some(t)) {
@@ -967,7 +993,7 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
 }
 
 fun notConstructor(con : String, item : ExportItem) -> Unit =
-    oopsAt("'" + con + "' is not a constructor of '" + item.name + "'",
+    report("'" + con + "' is not a constructor of '" + item.name + "'",
            Some(item.span))
 
 -- What an export item names in `space`: the module's own declaration, or what
@@ -977,13 +1003,13 @@ fun exported(m : Module, own : Map String String, space : Namespace,
     let found = firstOf(Map.get(own, item.name),
                         findName(m.scope, space, item.name, item, strict))
     if strict && Option.isNone(found) {
-        oopsAt("module '" + m.name + "' exports '" + item.name
+        report("module '" + m.name + "' exports '" + item.name
                + "', which is not defined or imported here", Some(item.span))
     }
     found
 }
 
--- `lookupName`, which refuses an ambiguous name; or, in a round that reports
+-- `lookupName`, which reports an ambiguous name; or, in a round that reports
 -- nothing, the scope's own entry, ambiguous or not.
 fun findName(s : Scope, space : Namespace, name : String, item : ExportItem,
              strict : Bool) -> Option String =
@@ -1052,7 +1078,7 @@ fun checkInternalImport(l : Loader, imp : ImportDecl) -> Unit {
         }
         None -> {}
     }
-    oopsAt("'" + imp.name + "' is part of the implementation, and only the "
+    report("'" + imp.name + "' is part of the implementation, and only the "
            + "standard library may import it", Some(imp.span))
 }
 
@@ -1092,7 +1118,7 @@ fun checkForeignPlacement(name : String, program : Program,
         if let DStmt(s) = d {
             if let SFun(f) = s.kind {
                 if Option.isSome(f.symbol) && !giblet {
-                    oopsAt("a 'foreign' function with a body can appear only "
+                    report("a 'foreign' function with a body can appear only "
                         + "in a giblet module of the standard library, and '"
                         + name + "' is not one", Some(s.span))
                 }
@@ -1102,7 +1128,7 @@ fun checkForeignPlacement(name : String, program : Program,
     if library && declaresForeign(name) { return }
     for d in program.decls {
         match d {
-            DForeign(f) -> oopsAt("a 'foreign' function without a body can "
+            DForeign(f) -> report("a 'foreign' function without a body can "
                 + "appear only in "
                 + String.join(Array.map(foreignModules, quoted), " or ")
                 + " of the standard library, and '" + name + "' is not one of "
@@ -1213,11 +1239,19 @@ fun ownScope(name : String, program : Program) -> Scope {
 
 -- -- diagnostics --------------------------------------------------------------------
 
-fun oops(message : String) -> a = oopsAt(message, None)
+-- Ends the compile, for a module that cannot be loaded: one that cannot be
+-- found or read, or the entry's file reached through another module's name.
+-- The import graph is built
+-- by following what each module imports, so without the module's source
+-- there is nothing further to follow, and every module that imports it would
+-- only report the same gap.
+fun oops(message : String) -> a = Diag.fail(Diag.whole("type error", message), "")
 
-fun oopsAt(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("type error", message), "")
-    Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
+-- Reports a type error and returns, for a check that can skip what it was
+-- checking and carry on. The driver stops once loading is done.
+fun report(message : String, where : Option Span) -> Unit = match where {
+    None -> Diag.report(Diag.whole("type error", message))
+    Some(s) -> Diag.report(Diag.at("type error", message, s))
 }
 
 -- Raises a check that only a compiler bug, or a standard library that does

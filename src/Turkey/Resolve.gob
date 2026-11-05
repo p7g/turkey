@@ -82,7 +82,11 @@ fun program(scope : Scope, p : Program,
         scope = scope, locals = Vec.new(4),
         operators = operators, binders = binders, owner = 0,
     }
+    -- Each top-level declaration is a unit of diagnostics (`Diag.beginUnit`):
+    -- one undeclared operator in a chain is reported once, not again as a
+    -- precedence error against the placeholder group it was given.
     for decl in p.decls {
+        Diag.beginUnit()
         match decl {
             DStmt(s) -> topLevel(r, s)
             DType(t) -> typeDecl(r, t)
@@ -91,6 +95,7 @@ fun program(scope : Scope, p : Program,
             DForeign(f) -> foreignDecl(r, f)
             DInfix(_) -> {}
         }
+        let _ = Diag.endUnit()
     }
 }
 
@@ -230,7 +235,7 @@ fun operators(modules : Vec Module, arities : Map String Int) -> Map String (Gro
             match decl {
                 DInfix(d) -> {
                     if Set.contains(seen, d.op) {
-                        oops("the operator '" + d.op + "' is declared twice", d.span)
+                        report("the operator '" + d.op + "' is declared twice", d.span)
                     }
                     Set.add(seen, d.op)
                     let target = infixTarget(m.scope, d, arities)
@@ -244,19 +249,25 @@ fun operators(modules : Vec Module, arities : Map String Int) -> Map String (Gro
 }
 
 fun infixTarget(scope : Scope, d : InfixDecl, arities : Map String Int) -> String {
+    -- An undefined target is reported and left as written, and one of the
+    -- wrong arity is reported and resolved anyway. Either way `loadProgram`
+    -- stops before anything calls it.
     let target = match lookupName(scope, ValueSpace, d.target, Some(d.targetSpan)) {
         Some(t) -> t
-        None -> oops("'" + d.target + "' is not defined", d.targetSpan)
+        None -> {
+            report("'" + d.target + "' is not defined", d.targetSpan)
+            return d.target
+        }
     }
     match Map.get(arities, target) {
         Some(2) -> {}
-        Some(n) -> oops("'" + d.target + "' takes " + Int.toString(n)
-                        + (if n == 1 { " parameter" } else { " parameters" })
-                        + ", and the operator '" + d.op
-                        + "' must name a function of two", d.targetSpan)
-        None -> oops("'" + d.target + "' is neither a top-level function nor a "
-                     + "class method, and the operator '" + d.op + "' must "
-                     + "name one", d.targetSpan)
+        Some(n) -> report("'" + d.target + "' takes " + Int.toString(n)
+                          + (if n == 1 { " parameter" } else { " parameters" })
+                          + ", and the operator '" + d.op
+                          + "' must name a function of two", d.targetSpan)
+        None -> report("'" + d.target + "' is neither a top-level function nor a "
+                       + "class method, and the operator '" + d.op + "' must "
+                       + "name one", d.targetSpan)
     }
     d.target = target
     target
@@ -502,7 +513,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
                             -- is in the shared environment so the Prelude can
                             -- be checked -- so this is the stage that has to
                             -- say no.
-                            oops("'" + name + "' is not defined", e.span)
+                            report("'" + name + "' is not defined", e.span)
                         }
                         Binders.leaveUnresolved(r.binders, e.id, name)
                     }
@@ -681,8 +692,10 @@ fun localBinding(r : R, pat : Pat, value : Expr, mutable : Bool) -> Unit {
 fun tycon(r : R, name : String, where : Span) -> String =
     match lookupName(r.scope, TypeSpace, name, Some(where)) {
         Some(target) -> target
-        None -> if Ty.isPrimitive(name) { oops("unknown type '" + name + "'", where) }
-                else { name }
+        None -> {
+            if Ty.isPrimitive(name) { report("unknown type '" + name + "'", where) }
+            name
+        }
     }
 fun con(r : R, name : String, where : Span) -> String =
     Option.unwrapOr(lookupName(r.scope, ConstructorSpace, name, Some(where)), name)
@@ -748,12 +761,17 @@ fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.fixedGroup
     Some(g) -> g
     None -> match declared(r, op, where) {
         Some((g, _)) -> g
-        None -> notDeclared(r, op, where)
+        None -> {
+            -- Any group will do: the declaration is now a failed unit, and
+            -- `loadProgram` stops before anything reads how it was grouped.
+            notDeclared(r, op, where)
+            Fixity.Addition
+        }
     }
 }
 
-fun notDeclared(r : R, op : String, where : Span) -> a =
-    Diag.fail(Diag.at("parse error", missing(r, op), where), where.file)
+fun notDeclared(r : R, op : String, where : Span) -> Unit =
+    Diag.report(Diag.at("parse error", missing(r, op), where))
 
 -- Returns the message for `op`, which is not in scope: which import would
 -- bring it, if one of the module's imports exports it, and otherwise how it
@@ -786,10 +804,10 @@ fun splitHint(r : R, op : String) -> String =
 -- group, and so how the chain around the use is grouped.
 fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
     match Map.get(conflictsIn(r.scope, OperatorSpace), op) {
-        Some(ids) -> oops("the operator '" + op + "' is ambiguous: it is declared in "
-                          + String.join(Vec.map(Vec.sort(ids), declaringModule), " and ")
-                          + "; withhold all but one with '(" + op + ") as _' in "
-                          + "their imports", where)
+        Some(ids) -> report("the operator '" + op + "' is ambiguous: it is declared in "
+                            + String.join(Vec.map(Vec.sort(ids), declaringModule), " and ")
+                            + "; withhold all but one with '(" + op + ") as _' in "
+                            + "their imports", where)
         None -> {}
     }
     match Map.get(r.scope.operators, op) {
@@ -818,7 +836,10 @@ fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -
         }
         None -> match Fixity.builtinGroup(name) {
             Some(_) -> node(Source.through(from, right.span), EBinary(name, left, right, None))
-            None -> notDeclared(r, name, where)
+            None -> {
+                notDeclared(r, name, where)
+                node(where, EBinary(name, left, right, None))
+            }
         }
     }
 }
@@ -854,7 +875,7 @@ fun bindLocal(r : R, nodeId : Int, name : String, where : Span, mutable : Bool) 
     }
 }
 
-fun oops(message : String, where : Span) -> a =
-    Diag.fail(Diag.at("type error", message, where), where.file)
+fun report(message : String, where : Span) -> Unit =
+    Diag.report(Diag.at("type error", message, where))
 
 fun discard(x : a) -> Unit = {}

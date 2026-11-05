@@ -1,11 +1,12 @@
-export (newline, wellFormed, sequenceAt)
+export (newline, wellFormed, sequenceAt, equalAt, compare, search)
 
 -- The read-only scans of the I/O layer and of `String`: where the next
 -- newline is, how far a run of ASCII goes, whether bytes are well-formed
--- UTF-8, and how long the sequence at an offset is. Each works on the array's
--- storage, the first three several bytes at a time, over a window checked
+-- UTF-8, how long the sequence at an offset is, whether two runs of bytes are
+-- equal, how two arrays of bytes order, and where one occurs in another. Each
+-- works on the array's storage, several bytes at a time, over a window checked
 -- against the array once, because these run over every byte a program reads
--- and a byte loop is several times slower.
+-- or compares and a byte loop is several times slower.
 --
 -- The loads are 64-bit `Ptr.load`s at the address of an element
 -- (`Ptr.elementAddress`), unaligned: arm64 loads from any address, and both
@@ -51,6 +52,46 @@ fun newline(bytes : Array Byte, from : Int, to : Int) -> Int {
     let p = Libc.memchr(Ptr.add(base, from), 10, to - from)
     let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
     Ptr.keepAlive(bytes)
+    found
+}
+
+-- Whether `a[from..from + count)` holds the bytes of `b[0..count)`. C's
+-- `memcmp`, for the same reason as `newline`.
+fun equalAt(a : Prim.Array Byte, from : Int, b : Prim.Array Byte, count : Int) -> Bool {
+    within(len(a), from, from + count)
+    within(len(b), 0, count)
+    let r = Libc.memcmp(Ptr.add(Ptr.elementAddress(a, 0), from), Ptr.elementAddress(b, 0), count)
+    Ptr.keepAlive(a)
+    Ptr.keepAlive(b)
+    r & 0xFFFF_FFFF == 0
+}
+
+-- Negative, zero or positive as `a` orders below, the same as or above `b`:
+-- by the first byte that differs, as unsigned, and otherwise by length, so
+-- that a proper prefix orders below.
+fun compare(a : Prim.Array Byte, b : Prim.Array Byte) -> Int {
+    let n = len(a)
+    let m = len(b)
+    let r = Libc.memcmp(Ptr.elementAddress(a, 0), Ptr.elementAddress(b, 0), if n < m { n } else { m })
+    Ptr.keepAlive(a)
+    Ptr.keepAlive(b)
+    -- `memcmp` answers a C `int`, whose sign is bit 31: the high half of the
+    -- register is undefined.
+    let low = r & 0xFFFF_FFFF
+    if low == 0 { n - m } else if low >= 0x8000_0000 { -1 } else { 1 }
+}
+
+-- Where `needle` first occurs in `haystack[from..)`, as an offset into
+-- `haystack`, or -1. An empty needle occurs at `from`. C's `memmem`.
+fun search(haystack : Prim.Array Byte, needle : Prim.Array Byte, from : Int) -> Int {
+    let n = len(haystack)
+    within(n, from, n)
+    if len(needle) == 0 { return from }
+    let base = Ptr.elementAddress(haystack, 0)
+    let p = Libc.memmem(Ptr.add(base, from), n - from, Ptr.elementAddress(needle, 0), len(needle))
+    let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
+    Ptr.keepAlive(haystack)
+    Ptr.keepAlive(needle)
     found
 }
 

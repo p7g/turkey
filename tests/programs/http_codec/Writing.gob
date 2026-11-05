@@ -25,13 +25,13 @@ fun headers() -> Headers =
     Headers.add(Headers.add(Headers.empty, ContentType, MediaType.json),
                 HeaderName.literal("x-trace"), HeaderValue.literal("a b"))
 
-fun send(label : String, head : IO.Buffer, framing : Framing, pieces : Array String) {
+fun send(label : String, head : Output.Outbox, framing : Framing, pieces : Array String) {
     let _ = deliver(label, head, framing, pieces)
 }
 
 -- Writes `pieces` as a body after `head`, prints what went out, and returns
 -- the sink it went to.
-fun deliver(label : String, head : IO.Buffer, framing : Framing, pieces : Array String) -> Tape {
+fun deliver(label : String, head : Output.Outbox, framing : Framing, pieces : Array String) -> Tape {
     let out = tape()
     let w = Output.bodyWriter(out, head, framing)
     var status = "ok"
@@ -66,14 +66,23 @@ fun errorText(e : Either HTTPError IOError) -> String = match e {
     Right(io) -> show(io)
 }
 
-fun request(m : Method Unit, url : String, framing : Framing) -> IO.Buffer =
-    Option.expect(Either.right(Output.requestHead(OutgoingRequest {
+-- Returns an outbox of its own pool, holding no head yet.
+fun fresh() -> Output.Outbox = Output.outbox(Output.buffers(1))
+
+fun request(m : Method Unit, url : String, framing : Framing) -> Output.Outbox {
+    let o = fresh()
+    Option.expect(Either.right(Output.requestHead(o, OutgoingRequest {
         method = m, url = HTTPURL.literal(url), headers = headers(), framing,
         persistence = KeepAlive, expectContinue = False, upgrade = [],
     })), "a request head")
+    o
+}
 
-fun response(status : Status, framing : Framing, persistence : Persistence) -> IO.Buffer =
-    Output.responseHead(OutgoingResponse { status, headers = headers(), framing, persistence, upgrade = None })
+fun response(status : Status, framing : Framing, persistence : Persistence) -> Output.Outbox {
+    let o = fresh()
+    Output.responseHead(o, OutgoingResponse { status, headers = headers(), framing, persistence, upgrade = None })
+    o
+}
 
 -- Reads `bytes` back as a request, and its body, as the codec reads one.
 fun readBack(bytes : Array Byte) -> String {
@@ -109,12 +118,12 @@ fun writing() {
     let chunked = deliver("chunked, one write per chunk",
                        request(PUT(()), "http://example.com/up", Chunked), Chunked, ["hello", " ", "world"])
     print("  read back: " + visible(readBack(String.toBytes(written(chunked)))))
-    let options = Output.requestHead(OutgoingRequest {
+    let options = fresh()
+    match Output.requestHead(options, OutgoingRequest {
         method = OPTIONS, url = HTTPURL.literal("http://example.com/"), headers = Headers.empty,
         framing = NoBody, persistence = Close, expectContinue = True, upgrade = [],
-    })
-    match options {
-        Right(head) -> send("Connection and Expect", head, NoBody, [])
+    }) {
+        Right(_) -> send("Connection and Expect", options, NoBody, [])
         Left(e) -> print("FAIL: " + show(e))
     }
 
@@ -131,7 +140,8 @@ fun writing() {
     send("200, closing after", response(OK, ContentLength(1), Close), ContentLength(1), ["x"])
     send("to HEAD: the length GET would have, and no body", response(OK, ContentLength(5), KeepAlive),
          NoBody, [])
-    let upgrade = Output.responseHead(OutgoingResponse {
+    let upgrade = fresh()
+    Output.responseHead(upgrade, OutgoingResponse {
         status = SwitchingProtocols, headers = Headers.empty, framing = NoBody, persistence = KeepAlive,
         upgrade = Some(HeaderValue.literal("websocket")),
     })
@@ -152,12 +162,40 @@ fun writing() {
     send("short of it", response(OK, ContentLength(5), KeepAlive), ContentLength(5), ["abc"])
     send("a byte of a bodiless response", response(NoContent, NoBody, KeepAlive), NoBody, ["x"])
     let big = repeated("z", 10000)
-    send("a first write larger than the head's spare room", response(OK, ContentLength(10000), KeepAlive),
+    send("a first write larger than the head's room", response(OK, ContentLength(10000), KeepAlive),
                      ContentLength(10000), [big])
+    send("a write larger than the room, after the head went out", response(OK, ContentLength(10001), KeepAlive),
+         ContentLength(10001), ["a", big])
+    send("a streamed first write, sent with the head", response(OK, UntilClose, Close), UntilClose,
+         [repeated("y", 1000), "z"])
+    send("a first chunk larger than the head's room", response(OK, Chunked, KeepAlive), Chunked,
+         [repeated("c", 5000), "d"])
+    -- A head that does not fit the pooled buffer moves to one of its own.
+    let long = Headers.add(headers(), HeaderName.literal("x-long"), HeaderValue.literal(repeated("v", 6000)))
+    let large = fresh()
+    Output.responseHead(large, OutgoingResponse { status = OK, headers = long, framing = Chunked,
+                                                  persistence = KeepAlive, upgrade = None })
+    send("a head larger than the buffer", large, Chunked, ["abc"])
+    -- Two exchanges on one outbox: the second head overwrites nothing the
+    -- first sent.
+    let shared = fresh()
+    let one = tape()
+    Output.responseHead(shared, OutgoingResponse { status = OK, headers = Headers.empty, framing = ContentLength(3),
+                                                   persistence = KeepAlive, upgrade = None })
+    let w1 = Output.bodyWriter(one, shared, ContentLength(3))
+    let _ = writeFrom(w1, IO.bytesOf("one"))
+    let _ = Output.finish(w1)
+    Output.release(shared)
+    Output.responseHead(shared, OutgoingResponse { status = NoContent, headers = Headers.empty, framing = NoBody,
+                                                   persistence = KeepAlive, upgrade = None })
+    let w2 = Output.bodyWriter(one, shared, NoBody)
+    let _ = Output.finish(w2)
+    print("two exchanges on one outbox: " + show(writes(one)) + " writes")
+    print("  " + visible(written(one)))
     let after = tape()
-    let w2 = Output.bodyWriter(after, response(OK, ContentLength(4), KeepAlive), ContentLength(4))
-    let _ = writeFrom(w2, IO.bytesOf("abcdef"))
-    let again = writeFrom(w2, IO.bytesOf("ab"))
+    let w3 = Output.bodyWriter(after, response(OK, ContentLength(4), KeepAlive), ContentLength(4))
+    let _ = writeFrom(w3, IO.bytesOf("abcdef"))
+    let again = writeFrom(w3, IO.bytesOf("ab"))
     print("a write after an overrun: " + (match again { Left(e) -> errorText(e); Right(_) -> "ok" })
           + ", " + show(writes(after)) + " writes")
 }

@@ -7,6 +7,7 @@
 import Client (..)
 import Net (ConnectionInfo(..), TLSInfo, shutdownWrite, close)
 import Net.HTTP (..)
+import Data.Error (cast, messageOf)
 import Net.HTTP.HeaderName as HeaderName
 import Net.HTTP.HeaderValue as HeaderValue
 import Net.HTTP.Headers as Headers
@@ -89,6 +90,12 @@ type Gone = Gone
 
 instance Show Gone { fun show(g) = "Gone" }
 instance Error Gone { fun message(g) = "the source went away" }
+
+-- Returns the kind of `IOError` a sink's write failed with, or its message.
+fun describe(e : SomeError) -> String = match cast(e) : Option IOError {
+    Some(io) -> "IOError " + show(io.kind)
+    None -> messageOf(e)
+}
 
 fun filled(n : Int) -> IO.Buffer {
     let b = IO.buffer(n)
@@ -330,6 +337,37 @@ fun connections() {
     shown("HTTP/1.0", withServer(config, route, fun(l) = send(l, "GET /chunks HTTP/1.0\r\n\r\nGET /health HTTP/1.0\r\n\r\n")))
     shown("Connection: close", withServer(config, route, fun(l) = send(l,
         "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" + get("/json"))))
+
+    -- A task given a stream's sink writes to it after its exchange has
+    -- ended, while the next request on the connection is served. The write
+    -- fails, and nothing of it reaches either response.
+    let stash = Sync.mutex([])
+    let late = Sync.mutex("")
+    let keeping = fun(req : Request Incoming, r : Respond) -> Done = match req.target.path {
+        "/keep" -> respond(r, stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+            Sync.withLock(stash, fun(v : Vec Sink) = Vec.push(v, sink))
+            IO.writeText(sink, "kept")?
+            Right(Headers.empty)
+        }))
+        _ -> {
+            let written = Sync.event()
+            background(r, fun() {
+                let outcome = match Sync.withLock(stash, fun(v : Vec Sink) = Vec.pop(v)) {
+                    Some(sink) -> match IO.writeText(sink, "LATE") {
+                        Left(e) -> "failed, " + describe(e)
+                        Right(_) -> "succeeded"
+                    }
+                    None -> "no sink"
+                }
+                Sync.update(late, fun(_) = outcome)
+                Sync.setEvent(written)
+            })
+            Sync.waitEventUnbounded(written)
+            respond(r, text("after the late write"))
+        }
+    }
+    shown("a sink kept past its exchange", withServer(config, keeping, fun(l) = send(l, get("/keep") + get("/next"))))
+    print("late write: " + Sync.withLock(late, fun(s) = s))
 
     print("-- draining")
     -- An unread body within the drain cap is discarded, and the next request

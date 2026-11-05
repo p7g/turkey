@@ -10,7 +10,7 @@ export (
     intMin, intMax, byteMin, byteMax, charMax, isScalarValue,
     tArray, tRawArray, tRawPtr, tAtomic, arrayOf, rawArrayOf,
     isForeignType, foreignTypes, foreignArgLimit,
-    kindOf, applyTo, spine, headCon,
+    kindOf, applyTo, isBottom, spine, headCon,
     numericOrder, intLiteralSet, floatLiteralSet, numericType,
     arrayLiteralSet, isArrayLiteralSet, literalOrder, literalSetType,
     showLiteralSet, quoteLiteralSet,
@@ -19,7 +19,7 @@ export (
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
     skolemsOf, markOpened, clearOpened,
-    unify, join, generalize, instantiate, instantiateQual,
+    unify, join, generalize, instantiate, instantiateQual, typeError,
     typeKey, sameType, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
     showPredWith,
@@ -466,24 +466,35 @@ fun kindOf(t : Type) -> Kind = match prune(t) {
 fun applyTo(head : Type, args : Array Type, where : Option Span) -> Type {
     var t = head
     for arg in args {
+        -- Bottom stands for a type already reported as wrong, and its kind
+        -- says nothing about what was meant, so applying it is bottom too.
+        if isBottom(t) || isBottom(arg) { return TBottom }
         let k = kprune(kindOf(t))
         let result = kvar()
         if !unifyKinds(k, KFun(kindOf(arg), result)) {
             -- A kind still undecided can only have failed the occurs check,
             -- since a variable unifies with anything else: `f f` would need
             -- `f`'s kind to contain itself.
+            -- Reported, and bottom in its place, as for any type already
+            -- reported as wrong.
             match kprune(k) {
-                KVar(_) -> oops("'" + show(t) + "' cannot be applied to '"
-                                + show(arg) + "': that would need a kind that "
-                                + "contains itself", where)
-                _ -> oops("'" + show(t) + "' has kind " + showKind(k)
-                          + ", so it cannot be applied to '" + show(arg) + "'",
-                          where)
+                KVar(_) -> typeError("'" + show(t) + "' cannot be applied to '"
+                                     + show(arg) + "': that would need a kind that "
+                                     + "contains itself", where)
+                _ -> typeError("'" + show(t) + "' has kind " + showKind(k)
+                               + ", so it cannot be applied to '" + show(arg) + "'",
+                               where)
             }
+            return TBottom
         }
         t = TApp(t, arg, result)
     }
     t
+}
+
+fun isBottom(t : Type) -> Bool = match prune(t) {
+    TBottom -> True
+    _ -> False
 }
 
 -- Decompose `f a1 ... an` into its head and its arguments.
@@ -1411,11 +1422,6 @@ fun showPredWith(p : Pred, n : Namer) -> String {
 }
 
 -- -- diagnostics --------------------------------------------------------------------
-
-fun oops(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("type error", message), "")
-    Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
-}
 
 -- Reports a type error and returns, for a site that can leave its types as
 -- they are and carry on.

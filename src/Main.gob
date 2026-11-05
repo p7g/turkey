@@ -392,15 +392,24 @@ fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module,
                                     Binders.Table) {
     let loader = Modules.newLoader([directoryOf(path), libRoot()])
     let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
+    -- An import that failed leaves its names out of scope, and resolving
+    -- against that scope would report every use of them again.
+    Diag.stopOnErrors()
     let operators = Resolve.operators(loader.order, Resolve.arities(loader.order))
     let binders = Binders.newTable()
     Resolve.declare(loader.order, binders)
     let checking = checkingBinders()
     for m in loader.order {
         Resolve.program(m.scope, m.program, operators, binders)
-        Desugar.program(m.program, m.scope, binders)
-        if checking { Binders.checkReferences(binders, m.program, m.file) }
+        -- Resolution goes on to every module past an error, so that all of
+        -- them report. Desugaring does not: it reads what resolution
+        -- recorded, and a reported error left a gap there.
+        if !Diag.hasErrors() {
+            Desugar.program(m.program, m.scope, binders)
+            if checking { Binders.checkReferences(binders, m.program, m.file) }
+        }
     }
+    Diag.stopOnErrors()
     (loader.groups, entry, binders)
 }
 
@@ -452,6 +461,7 @@ fun registerTables(path : String,
         }
         Decls.registerAll(table, types)
         if withClasses { Classes.registerAll(classes, classDecls, instDecls) }
+        Diag.stopOnErrors()
     }
     (table, classes)
 }
@@ -721,7 +731,8 @@ fun complaintsOf(f : Ssa.Func LowIr.Low) -> Vec String {
 --
 -- A program past one of the runtime's limits is reported first, as the
 -- program's error: its refusal says what to change. Any other skip is a form
--- only a compiler bug leaves unlowered.
+-- only a compiler bug leaves unlowered. Either ends the compile, since this
+-- runs after the front end, where nothing collects diagnostics.
 fun refuseSkipped(skipped : Vec SsaLower.Unsupported, path : String) -> Unit {
     for u in skipped {
         if u.overLimit {
@@ -1312,6 +1323,9 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
                                    checked.types, binders)
         let (items, constraint) = Infer.generate(g, programs)
+        -- The generator goes on past an error with a placeholder in its place,
+        -- which a constraint built around it would only report against again.
+        Diag.stopOnErrors()
         -- A constraint with no span has no module to go by, and is held to the
         -- group's first; a group of one module has no other.
         let fallback = visibleConstructors(group[0])
@@ -1325,6 +1339,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         -- has left with a harmless answer in place of the real one.
         Diag.stopOnErrors()
         Infer.checkExhaustiveness(g)
+        Diag.stopOnErrors()
         Evidence.run(checked.classes, solver.uses)
         for item in items {
             Vec.push(checked.ordered, item)
@@ -1334,6 +1349,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
     if checkingBinders() { Binders.checkInferred(binders, path) }
     checkMain(entry, checked.env, checked.classes)
     Diag.stopOnErrors()
+    Diag.stopCollecting()
     (checked, entry)
 }
 
@@ -1362,10 +1378,10 @@ fun checkMain(entry : Modules.Module, env : Constraints.Env,
                     if let Some(binding) = Constraints.lookup_(env, name) {
                         let scheme = reduced(classes, binding.scheme)
                         if !isEntryType(scheme) {
-                            Diag.fail(Diag.at("type error",
+                            Diag.report(Diag.at("type error",
                                 "'main' has type '" + Ty.showScheme(scheme)
                                 + "', and the entry point must have type "
-                                + "'fun() -> Unit'", s.span), s.span.file)
+                                + "'fun() -> Unit'", s.span))
                         }
                     }
                 }

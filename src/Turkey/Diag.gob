@@ -1,6 +1,6 @@
 export (
     Diag(..), Severity(..), at, whole, warningAt, render, fail, short, compiling,
-    report, beginUnit, endUnit, hasErrors, stopOnErrors,
+    report, beginUnit, endUnit, hasErrors, errorCount, stopOnErrors, stopCollecting,
 )
 
 -- A diagnostic is a value.
@@ -62,31 +62,41 @@ fun compiling(path : String) -> Unit {
 
 -- -- the collector --------------------------------------------------------------------
 --
--- One for the process, as `entryFile` is. That is safe because only the front
--- end reports, and the front end runs on one thread; the stages after it run
--- on workers, and every error they can find is a compiler bug, which `fail`s.
+-- One for the process, as `entryFile` is. That is safe because it collects
+-- only while the front end runs, and the front end runs on one thread. The
+-- driver calls `stopCollecting` once the program is checked: the stages after
+-- it run on workers, and a site they share with the front end that reports an
+-- error then ends the compile, as `fail` does, instead of leaving it in a
+-- collector nothing would print.
 
 -- What has been reported and not yet printed, in the order it was reported.
 var collected : Vec Diag = []
 
--- Whether an error has been reported.
+-- Whether an error has been reported, and how many have been kept.
 var errorSeen = False
+var errorsKept = 0
+
+-- Whether `report` collects, or ends the compile on an error.
+var collecting = True
 
 -- How deep the current unit is, and whether it has reported an error. Only the
 -- outermost unit counts.
 var unitDepth = 0
 var unitFailed = False
 
--- Records `d`, to be printed by the next `stopOnErrors` or `fail`.
+-- Records `d`, to be printed by the next `stopOnErrors` or `fail`. After
+-- `stopCollecting`, an error ends the compile at once instead.
 --
 -- Inside a unit that has already reported an error, a further error is
 -- dropped: the unit is abandoned in all but name, and what it reports after
 -- its first error is most often that error seen again from another use.
 fun report(d : Diag) -> Unit {
     if let Error = d.severity {
+        if !collecting { fail(d, "") }
         if unitFailed { return }
         if unitDepth > 0 { unitFailed = True }
         errorSeen = True
+        errorsKept = errorsKept + 1
     }
     Vec.push(collected, d)
 }
@@ -107,6 +117,14 @@ fun endUnit() -> Bool {
 
 -- Returns whether an error has been reported.
 fun hasErrors() -> Bool = errorSeen
+
+-- Returns how many errors `report` has kept.
+fun errorCount() -> Int = errorsKept
+
+-- Makes `report` end the compile on an error from now on, as `fail` does.
+fun stopCollecting() -> Unit {
+    collecting = False
+}
 
 -- Prints what has been reported, in source order, to stderr. Exits with status
 -- 1 if any of it was an error, and returns otherwise.

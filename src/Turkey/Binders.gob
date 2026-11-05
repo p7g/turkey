@@ -3,7 +3,7 @@ export (
     newTable, owner, fresh, ownerOf, localOf, binderAt,
     declare, named, record, refer, leaveUnresolved,
     ownDeclaration, declarationOwner,
-    checkReferences, checkInferred, methodRefs,
+    checkReferences, checkInferred, methodRefs, boundIn, boundByPattern,
 )
 
 -- Every term binder of the program, and which binder each occurrence means.
@@ -287,6 +287,43 @@ fun expectShared(t : Table, alts : Vec Pat, missing : Vec String) -> Unit {
             }
         }
     }
+}
+
+-- Adds to `out` the binder of every binding occurrence in `c` and below it:
+-- every pattern variable, `fun` statement and parameter. The method
+-- references `methodRefs` returns bind nothing, so they are not walked.
+fun boundIn(t : Table, c : Child, out : Vec Int) -> Unit {
+    match c {
+        ChExpr(e) -> match e.kind {
+            ELambda(params, _, _) -> for p in params { boundByPattern(t, p, out) }
+            EForIn(pat, _, _, _, _) -> boundByPattern(t, pat, out)
+            _ -> {}
+        }
+        ChStmt(s) -> match s.kind {
+            SLet(pat, _) | SVar(pat, _) -> boundByPattern(t, pat, out)
+            SFun(d) -> boundAt(t, d.id, out)
+            SAssign(_, _) | SExpr(_) -> {}
+        }
+        ChArm(a) -> {
+            for p in a.patterns { boundByPattern(t, p, out) }
+            for g in a.guards {
+                if let GLet(alts, _) = g {
+                    for p in alts { boundByPattern(t, p, out) }
+                }
+            }
+        }
+        ChFun(d) -> for p in d.params { boundByPattern(t, p, out) }
+    }
+    for child in children(c) { boundIn(t, child, out) }
+}
+
+-- Adds to `out` the binder of every variable in `p`.
+fun boundByPattern(t : Table, p : Pat, out : Vec Int) -> Unit {
+    for v in varPatterns(p) { boundAt(t, v.id, out) }
+}
+
+fun boundAt(t : Table, nodeId : Int, out : Vec Int) -> Unit {
+    if let Some(id) = Map.get(t.refs, nodeId) { Vec.push(out, id) }
 }
 
 -- Returns the method references resolution wrote into `e`, which are not

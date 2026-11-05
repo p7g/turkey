@@ -65,6 +65,7 @@ for impl in ${*:-turkey go}; do
     load=$!
     sleep 1
     sudo timeout -s INT 8 strace -c -f -p $SERVER -o "$P/$impl.strace.txt" || true
+    sudo chown "$(id -u)" "$P/$impl.strace.txt"
     wait $load
     # wrk ran 10 s, strace watched 8 of them: count the requests in those 8.
     requests=$(awk '/requests in/ { print int($1 * 0.8) }' "$P/$impl.wrk-strace.txt")

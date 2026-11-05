@@ -199,8 +199,9 @@ fun join(g : Generator, a : Ty.Type, b : Ty.Type, where : Option Span,
 
 -- -- binders -----------------------------------------------------------------------
 
--- Returns the binder the `EVar` node `e`, spelled `name`, means. Reports the
--- name as undefined at `where` when resolution found no binder for it.
+-- Returns the binder the `EVar` node `e`, spelled `name`, means. When
+-- resolution found no binder for it, reports the name as undefined at `where`
+-- and returns `C.noBinder`.
 fun referent(g : Generator, e : Expr, name : String, where : Span) -> Int =
     match Map.get(g.binders.refs, e.id) {
         Some(id) -> id
@@ -244,7 +245,7 @@ fun bindersIn(g : Generator, pats : Vec Pat, where : Span,
 fun assignable(g : Generator, id : Int) -> Bool =
     Binders.binderAt(g.binders, id).mutable || Set.contains(g.parameters, id)
 
--- Raises the type error for an assignment at `where` to the binder `id`,
+-- Reports the type error for an assignment at `where` to the binder `id`,
 -- which cannot be assigned.
 fun notAssignable(g : Generator, id : Int, where : Span) -> Unit {
     let b = Binders.binderAt(g.binders, id)
@@ -390,12 +391,21 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
                 Vec.push(boundNames, n)
             }
         }
-        checkGroupRecursion(group, Vec.sort(boundNames), component, graph)
-        Vec.push(groups, group)
+        -- A group reported as cyclic is not generated: the rest of the
+        -- generator takes a recursive group to be all functions.
+        if !checkGroupRecursion(group, Vec.sort(boundNames), component, graph) {
+            Vec.push(groups, group)
+        }
         for item in group { Vec.push(ordered, item) }
     }
 
-    for group in groups { bindTopGroup(g, group) }
+    -- Each group is a unit of diagnostics, as it is when solved: one wrong
+    -- record field is reported once, not again as a missing one.
+    for group in groups {
+        Diag.beginUnit()
+        bindTopGroup(g, group)
+        let _ = Diag.endUnit()
+    }
     -- Method bodies come after every group, so that they may call any
     -- top-level binding. Nothing calls *them* by name, so their position is
     -- otherwise free.
@@ -425,21 +435,25 @@ fun itemBinders(g : Generator, item : Stmt) -> Vec Int = match item.kind {
 
 fun checkGroupRecursion(group : Vec Stmt, boundNames : Vec String,
                         component : Vec String,
-                        graph : Map String (Set.Set String)) -> Unit {
+                        graph : Map String (Set.Set String)) -> Bool {
     var recursive = len(component) > 1
     for k in component {
         if Set.contains(Map.getOr(graph, k, Set.new()), k) { recursive = True }
     }
-    if !recursive { return {} }
+    if !recursive { return False }
     for item in group {
         match item.kind {
             SFun(_) -> {}
-            _ -> return Ty.typeError("cyclic definition: "
-                      + String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
-                      + " depend on each other, but only functions can be "
-                      + "mutually recursive", Some(group[0].span))
+            _ -> {
+                Ty.typeError("cyclic definition: "
+                    + String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
+                    + " depend on each other, but only functions can be "
+                    + "mutually recursive", Some(group[0].span))
+                return True
+            }
         }
     }
+    False
 }
 
 -- Put every class method in scope, under the scheme its class gives it, and
@@ -630,9 +644,11 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
                     -- One elaboration of a default serves every instance: its own
                     -- class dictionary arrives under a name each instance rebinds
                     -- as its dictionary is built.
+                    Diag.beginUnit()
                     Map.put(info.defaults, m.name, checkMethod(g, m, sk,
                         [], [],
                         "the default definition of '" + m.name + "'", None, None))
+                    let _ = Diag.endUnit()
                 }
             }
         }
@@ -663,9 +679,11 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
             Map.put(sk.mapping, m.classVar.id, Classes.skolemApply(sk, inst.head))
             let context = Array.map(inst.context, fun(q) =
                 Ty.pred(q.name, [Classes.skolemApply(sk, q.args[0])]))
+            Diag.beginUnit()
             Map.put(plan.methods, methodDecl.name, checkMethod(g, m, sk, context,
                 plan.params, "instance '" + decl.cls + " " + Ty.show(inst.head)
                 + "'", Some(methodDecl), Some(selfName)))
+            let _ = Diag.endUnit()
         }
     }
 }
@@ -744,11 +762,12 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     -- rigid, so nothing generalizes. What the rank buys is that a predicate the
     -- body raised is settled here, against the assumptions, instead of escaping
     -- to the end of the program.
-    emit(g, CAssume(givens, CLet(LetCell {
+    -- A unit of diagnostics, as a top-level group is.
+    emit(g, CUnit(CAssume(givens, CLet(LetCell {
         binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
         dicts = None, skolems = sk.made, rigid = [],
-    })))
+    }))))
     -- Only the constants this scope actually *made*. The mapping also holds the
     -- class variable, whose entry is the instance head rather than a skolem, and
     -- inverting that one would turn every real `Option` in the body back into a
@@ -935,8 +954,7 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
-    -- After every match, as in `turkey/infer.py`, so a program with both faults
-    -- reports the same one first on either side.
+    -- Refutable binding patterns, after every match.
     for (pat, bound, fix) in g.binderSites {
         match Exhaustive.checkPattern(g.decls, pat, Typed.resolve(g.types, bound)) {
             None -> {}
@@ -2106,7 +2124,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
 }
 
 -- Returns what the patterns of one arm or one `let` guard bind, each matched
--- against `ty`. Raises a type error unless every pattern binds the names the
+-- against `ty`. Reports a type error unless every pattern binds the names the
 -- first one does, at the same types.
 fun alternatives(g : Generator, patterns : Vec Pat, ty : Ty.Type) -> Map String Ty.Type {
     let bindings = matchPattern(g, patterns[0], ty)

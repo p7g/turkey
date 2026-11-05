@@ -117,7 +117,7 @@ import Net.HTTP.Stream as Stream (BodyLength(..))
 import Net.HTTP.Syntax as Syntax
 import Net.HTTP.Token as Token (Token)
 import System.Sync as Sync
-import System.Sync (Mutex, Semaphore)
+import System.Sync (Event, Mutex, Semaphore)
 import System.Task as Task
 import System.Task (Spawn)
 import Time.Clock as Clock
@@ -304,10 +304,9 @@ type Server = Server {
     -- One permit per connection the limit allows: taken before an accept,
     -- and given back when the connection ends.
     permits : Semaphore,
-    -- A permit once the accept loop, every connection and every background
-    -- task have ended. Whoever takes it gives it back, so every `wait` and
-    -- `stop` sees it.
-    done : Semaphore,
+    -- Set once the accept loop, every connection and every background task
+    -- have ended.
+    done : Event,
     closeListening : fun() -> Unit,
     background : Work,
 }
@@ -338,7 +337,7 @@ fun start[Listener l, Connection (Accepted l), Described (Accepted l), Error (Re
         values,
         registry = Sync.mutex(Registry { stopping = False, entries = Map.new(), next = 0 }),
         permits = Sync.semaphore(values.connections),
-        done = Sync.semaphore(0),
+        done = Sync.event(),
         closeListening = fun() { let _ = closeListener(l) },
         background = work(),
     }
@@ -360,20 +359,14 @@ fun stop(server : Server, drain : Duration) -> Unit {
     -- An accept loop waiting for a permit sees `stopping` once it has one.
     Sync.release(server.permits)
     for close in idle { close() }
-    if Sync.acquire(server.done, Some(until)) {
-        Sync.release(server.done)
-        return ()
-    }
+    if Sync.wait(server.done, until) { return () }
     let rest = Sync.withLock(server.registry, fun(r : Registry) = closers(r, False))
     for close in rest { close() }
 }
 
 -- Returns once `server` has stopped, and every connection it served and
 -- every background task has ended.
-fun wait(server : Server) -> Unit {
-    let _ = Sync.acquire(server.done, None)
-    Sync.release(server.done)
-}
+fun wait(server : Server) -> Unit = Sync.waitUnbounded(server.done)
 
 fun closers(r : Registry, onlyIdle : Bool) -> Array (fun() -> Unit) {
     let out = []
@@ -407,30 +400,33 @@ fun run[Listener l, Connection (Accepted l), Described (Accepted l), Error (Read
         })?
         pure(())
     })
-    Sync.release(server.done)
+    Sync.set(server.done)
 }
 
 fun acceptAll[Listener l, Connection (Accepted l), Described (Accepted l), Error (ReadError (Accepted l)),
               Error (WriteError (Accepted l))](
-        server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Unit = do {
+        server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Unit {
     var pause = firstPause
-    loop {
-        let _ = Sync.acquire(server.permits, None)
-        if isStopping(server) { break }
-        let accepted = accept(l)
-        if let Right(c) = accepted {
-            pause = firstPause
-            let _ = Task.spawn(fun() = connection(server, c, handler))?
+    Task.spawnEach(fun() {
+        while True {
+            let _ = Sync.acquire(server.permits, None)
+            if isStopping(server) { return None }
+            match accept(l) {
+                Right(c) -> {
+                    pause = firstPause
+                    return Some(fun() = connection(server, c, handler))
+                }
+                Left(e) -> {
+                    Sync.release(server.permits)
+                    if e.kind == Closed || isStopping(server) { return None }
+                    report(server, AcceptFailed(e))
+                    Sleep.sleep(pause)
+                    pause = if pause < lastPause { Duration.times(pause, 2) } else { lastPause }
+                }
+            }
         }
-        if let Left(e) = accepted {
-            Sync.release(server.permits)
-            if e.kind == Closed || isStopping(server) { break }
-            report(server, AcceptFailed(e))
-            Sleep.sleep(pause)
-            pause = if pause < lastPause { Duration.times(pause, 2) } else { lastPause }
-        }
-    }
-    pure(())
+        None
+    })
 }
 
 -- How long the accept loop waits after a failed accept: doubling from the
@@ -442,12 +438,12 @@ let lastPause = Duration.seconds(1)
 -- -- background work ---------------------------------------------------------------------
 
 -- Functions waiting to be spawned in the background scope, and whether
--- that scope still takes them.
-type Work = Work { queue : Mutex Queue, ready : Semaphore }
+-- that scope still takes them. `ready` is set whenever either changes.
+type Work = Work { queue : Mutex Queue, ready : Event }
 
-type Queue = Queue { pending : Vec (fun() -> Unit), var next : Int, var finished : Bool }
+type Queue = Queue { var pending : Vec (fun() -> Unit), var finished : Bool }
 
-fun work() -> Work = Work { queue = Sync.mutex(Queue { pending = [], next = 0, finished = False }), ready = Sync.semaphore(0) }
+fun work() -> Work = Work { queue = Sync.mutex(Queue { pending = [], finished = False }), ready = Sync.event() }
 
 -- Hands `f` to the dispatcher, or runs it here once the dispatcher has
 -- ended.
@@ -457,31 +453,44 @@ fun submit(w : Work, f : fun() -> Unit) -> Unit {
         Vec.push(q.pending, f)
         True
     })
-    if queued { Sync.release(w.ready) } else { f() }
+    if queued { Sync.set(w.ready) } else { f() }
 }
 
 -- Ends the dispatcher once it has spawned everything submitted before.
 fun finish(w : Work) -> Unit {
     Sync.withLock(w.queue, fun(q : Queue) { q.finished = True })
-    Sync.release(w.ready)
+    Sync.set(w.ready)
 }
 
 -- Spawns each submitted function, until `finish`.
-fun dispatch(w : Work) -> Spawn Unit = do {
-    loop {
-        let _ = Sync.acquire(w.ready, None)
-        let next = Sync.withLock(w.queue, fun(q : Queue) {
-            if q.next == len(q.pending) { return None }
-            let f = q.pending[q.next]
-            q.next = q.next + 1
-            Some(f)
-        })
-        match next {
-            Some(f) -> { let _ = Task.spawn(f)? }
-            None -> break
+--
+-- Each turn takes every pending function at once, leaving the queue empty,
+-- so that the queue holds a function only until it is spawned.
+fun dispatch(w : Work) -> Spawn Unit {
+    var batch : Vec (fun() -> Unit) = []
+    var at = 0
+    Task.spawnEach(fun() {
+        while at == len(batch) {
+            -- Clear before taking, never after: a `submit` that sets `ready`
+            -- after the clear has queued what the take below finds or the
+            -- next wait returns for, so its set is never lost.
+            Sync.clear(w.ready)
+            let (taken, finished) = Sync.withLock(w.queue, fun(q : Queue) {
+                let taken = q.pending
+                q.pending = []
+                (taken, q.finished)
+            })
+            batch = taken
+            at = 0
+            if len(batch) == 0 {
+                if finished { return None }
+                Sync.waitUnbounded(w.ready)
+            }
         }
-    }
-    pure(())
+        let f = batch[at]
+        at = at + 1
+        Some(f)
+    })
 }
 
 -- -- deadlines ---------------------------------------------------------------------------

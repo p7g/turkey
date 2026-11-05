@@ -75,6 +75,8 @@ export (program)
 -- also says what each one is where a closure would not.
 
 import Turkey.Ast (..)
+import Turkey.Binders as Binders
+import Turkey.Binders (Kind(..), Origin(..))
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
 import Turkey.Source (Span(..))
@@ -82,11 +84,14 @@ import Turkey.Source (Span(..))
 -- -- state --------------------------------------------------------------------------
 
 type D = D {
-    -- The generated-name counter. `%` is not a character an identifier may
-    -- contain, so a name made from it cannot collide with one the author wrote.
+    -- The generated-name counter.
     var n     : Int,
     -- The module's protocol-method scope, for `bind` and `pure`.
     methods   : Map String String,
+    binders   : Binders.Table,
+    -- The owner the binders this pass writes are minted into: that of the
+    -- top-level declaration being walked, as `Turkey.Resolve` registered it.
+    var owner : Int,
     -- How many lifted loops enclose the code being translated. A `break` only
     -- becomes a `Brk` inside one; outside, it is left alone so that the checker
     -- still reports it as a `break` with no loop, which is what it is.
@@ -104,12 +109,50 @@ fun mkStmt(d : D, s : Span, k : StmtKind) -> Stmt =
 fun mkPat(d : D, s : Span, k : PatKind) -> Pat =
     Pat { id = freshId(d), span = s, kind = k, opening = None }
 
--- A fresh `%`-name. The counter is bumped before anything else the caller does,
--- because a continuation may make names of its own and the numbering is part of
--- what the two implementations agree about.
-fun fresh(d : D, prefix : String) -> String {
+-- A binder this pass writes: its spelling, and its id in `Turkey.Binders`.
+type Temp = Temp { name : String, id : Int }
+
+-- Returns a binder spelled `prefix` and a fresh number. The counter is bumped
+-- before anything else the caller does, because a continuation may make names
+-- of its own, and the spellings are what the goldens record.
+fun fresh(d : D, prefix : String, span : Span) -> Temp =
+    temp(d, prefix + number(d), span)
+
+-- Returns the next number for a `%`-name. `%` is not a character an identifier
+-- may contain, so a name made from it cannot collide with one the author wrote.
+fun number(d : D) -> String {
     d.n = d.n + 1
-    prefix + Int.toString(d.n)
+    Int.toString(d.n)
+}
+
+-- Returns a binder spelled `name`, minted in the current owner. Two binders may
+-- share a spelling: each `Flow` arm binds its own `%b`, and the id is what
+-- tells them apart.
+fun temp(d : D, name : String, span : Span) -> Temp =
+    Temp { name = name, id = Binders.fresh(d.binders, d.owner, name, Local,
+                                           Generated(span)) }
+
+-- A pattern binding `t`.
+fun bindTemp(d : D, t : Temp, span : Span) -> Pat {
+    let p = mkPat(d, span, PVar(t.name))
+    Binders.record(d.binders, p.id, t.id)
+    p
+}
+
+-- A reference to `t`.
+fun varOf(d : D, t : Temp, span : Span) -> Expr {
+    let e = mkExpr(d, span, EVar(t.name, False))
+    Binders.record(d.binders, e.id, t.id)
+    e
+}
+
+-- Makes the owner `Turkey.Resolve` registered for the top-level declaration
+-- `nodeId` the one this pass mints into.
+fun enter(d : D, nodeId : Int, where : Span) -> Unit {
+    d.owner = match Binders.declarationOwner(d.binders, nodeId) {
+        Some(o) -> o
+        None -> bug("this declaration was never given an owner", where)
+    }
 }
 
 -- -- continuations ------------------------------------------------------------------
@@ -286,13 +329,25 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 
 -- -- the pass -----------------------------------------------------------------------
 
-fun program(p : Program, methods : Map String String) -> Unit {
-    let d = D { n = 0, methods = methods, depth = 0 }
+-- Rewrites `p` in place. Every binder it writes is minted in `binders`, and
+-- every binding occurrence and reference it writes is recorded there.
+fun program(p : Program, methods : Map String String,
+            binders : Binders.Table) -> Unit {
+    let d = D { n = 0, methods = methods, binders = binders, owner = 0, depth = 0 }
     for decl in p.decls {
         match decl {
-            DClass(c) -> for m in c.methods { funBody(d, m) }
-            DInstance(i) -> for m in i.methods { funBody(d, m) }
-            DStmt(s) -> discard(walkStmt(d, s))
+            DClass(c) -> for m in c.methods {
+                enter(d, m.id, m.span)
+                funBody(d, m)
+            }
+            DInstance(i) -> for m in i.methods {
+                enter(d, m.id, m.span)
+                funBody(d, m)
+            }
+            DStmt(s) -> {
+                enter(d, s.id, s.span)
+                discard(walkStmt(d, s))
+            }
             -- Nothing to desugar: a foreign declaration has no body, and its
             -- types were resolved before this pass ran.
             DType(_) -> {}
@@ -643,9 +698,9 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
 -- -- the two calls the lowering makes ------------------------------------------------
 
 fun bindWith(d : D, m : Expr, k : Cont, span : Span, fn : Option Expr) -> Expr {
-    let name = fresh(d, "%k")
-    let param = mkPat(d, span, PVar(name))
-    let read = mkExpr(d, span, EVar(name, False))
+    let k1 = fresh(d, "%k", span)
+    let param = bindTemp(d, k1, span)
+    let read = varOf(d, k1, span)
     let lam = mkExpr(d, span, ELambda([param], None, apply(d, k, read)))
     let f = match fn {
         Some(x) -> x
@@ -662,17 +717,41 @@ fun pureOf(d : D, value : Expr) -> Expr =
 fun fallOf(d : D, value : Expr) -> Expr =
     pureOf(d, conOf(d, P.flowFall, [value], value.span))
 
+-- A reference to the class method `name`, found in the protocol-method scope
+-- and recorded against its binder as `Turkey.Resolve` records `-x`. A method
+-- the module cannot see keeps its short name and is left for inference to
+-- report.
 fun methodRef(d : D, span : Span, name : String) -> Expr =
-    mkExpr(d, span, EVar(Map.getOr(d.methods, name, name), True))
+    match Map.get(d.methods, name) {
+        Some(target) -> {
+            let e = mkExpr(d, span, EVar(target, True))
+            if let Some(id) = Binders.named(d.binders, target) {
+                Binders.record(d.binders, e.id, id)
+            }
+            e
+        }
+        None -> {
+            let e = mkExpr(d, span, EVar(name, True))
+            Binders.leaveUnresolved(d.binders, e.id, name)
+            e
+        }
+    }
+
+-- A reference to the top-level binder resolution named `internal`. One that
+-- was never declared has no entry, for `Binders.checkReferences` to report.
+fun globalOf(d : D, internal : String, span : Span) -> Expr {
+    let e = mkExpr(d, span, EVar(internal, False))
+    if let Some(id) = Binders.named(d.binders, internal) {
+        Binders.record(d.binders, e.id, id)
+    }
+    e
+}
 
 -- A `Flow` or `Option` constructor. Nullary ones are values, not calls.
 fun conOf(d : D, name : String, args : Vec Expr, span : Span) -> Expr {
     let made = mkExpr(d, span, ECon(name))
     if len(args) == 0 { made } else { mkExpr(d, span, ECall(made, args)) }
 }
-
-fun varOf(d : D, name : String, span : Span) -> Expr =
-    mkExpr(d, span, EVar(name, False))
 
 -- -- flow mode: control transfers as values ---------------------------------------
 
@@ -707,25 +786,35 @@ fun transferWith(d : D, con : String, value : Option Expr, span : Span) -> Expr 
 -- differ in their first parameter -- `head`'s own value type is not the rest of
 -- the block's.
 fun sequence(d : D, head : Expr, after : Cont, span : Span) -> Expr {
-    let fell = fresh(d, "%fell")
+    let fell = fresh(d, "%fell", span)
     bindWith(d, head, KFn(fun(f) = mkExpr(d, span, EMatch(f, [
-        armOf(d, P.flowFall, Some(fell), span,
+        armOf(d, P.flowFall, Bound(fell), span,
               apply(d, after, varOf(d, fell, span))),
-        armOf(d, P.flowBrk, Some("%b"), span,
-              pureOf(d, conOf(d, P.flowBrk, [varOf(d, "%b", span)], span))),
-        armOf(d, P.flowCont, None, span,
+        passOn(d, P.flowBrk, span),
+        armOf(d, P.flowCont, Nothing, span,
               pureOf(d, conOf(d, P.flowCont, [], span))),
-        armOf(d, P.flowRet, Some("%r"), span,
-              pureOf(d, conOf(d, P.flowRet, [varOf(d, "%r", span)], span))),
+        passOn(d, P.flowRet, span),
     ]))), span, None)
 }
 
-fun armOf(d : D, con : String, bind : Option String, span : Span,
+-- The arm `Con(%x) -> pure(Con(%x))`, for `Brk` or `Ret`, which keeps
+-- travelling outward.
+fun passOn(d : D, con : String, span : Span) -> Arm {
+    let x = temp(d, if con == P.flowBrk { "%b" } else { "%r" }, span)
+    armOf(d, con, Bound(x), span,
+          pureOf(d, conOf(d, con, [varOf(d, x, span)], span)))
+}
+
+-- What an arm `armOf` builds binds of its constructor's one field, if the
+-- constructor has one.
+type Payload = Nothing | Ignored | Bound(Temp)
+
+fun armOf(d : D, con : String, bind : Payload, span : Span,
           body : Expr) -> Arm {
     let args = match bind {
-        None -> []
-        Some(b) -> if b == "%_" { [mkPat(d, span, PWild)] }
-                   else { [mkPat(d, span, PVar(b))] }
+        Nothing -> []
+        Ignored -> [mkPat(d, span, PWild)]
+        Bound(t) -> [bindTemp(d, t, span)]
     }
     Arm {
         span = span,
@@ -754,15 +843,19 @@ fun armOf(d : D, con : String, bind : Option String, span : Span,
 -- name. That is the one thing here a `Never` would say better.
 fun unflow(d : D, body : Expr, span : Span) -> Expr {
     let unreachable = mkExpr(d, span, ECall(
-        mkExpr(d, span, EVar(P.error, False)),
+        globalOf(d, P.error, span),
         [mkExpr(d, span, ELit(LString(
             "internal error: a loop transfer escaped its loop")))]))
-    bindWith(d, body, KFn(fun(f) = mkExpr(d, span, EMatch(f, [
-        armOf(d, P.flowFall, Some("%v"), span, varOf(d, "%v", span)),
-        armOf(d, P.flowRet, Some("%r"), span, varOf(d, "%r", span)),
-        brokeArm(d, span, unreachable),
-        armOf(d, P.flowCont, None, span, unreachable),
-    ]))), span, None)
+    bindWith(d, body, KFn(fun(f) = {
+        let v = temp(d, "%v", span)
+        let r = temp(d, "%r", span)
+        mkExpr(d, span, EMatch(f, [
+            armOf(d, P.flowFall, Bound(v), span, varOf(d, v, span)),
+            armOf(d, P.flowRet, Bound(r), span, varOf(d, r, span)),
+            brokeArm(d, span, unreachable),
+            armOf(d, P.flowCont, Nothing, span, unreachable),
+        ]))
+    }), span, None)
 }
 
 -- The `Brk` arm, with its payload pinned to `Unit`.
@@ -795,7 +888,7 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
              + "in another expression; bind its value with 'let' first", e.span)
     }
     let span = e.span
-    let name = fresh(d, "%loop")
+    let name = fresh(d, "%loop", span)
     let call = mkExpr(d, span, ECall(varOf(d, name, span), []))
 
     d.depth = d.depth + 1
@@ -809,14 +902,15 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
     let again = if len(step) > 0 { wrap(d, step, call, span) } else { call }
     -- `Brk(v)` is the loop's own value, so it becomes this expression's `Fall`;
     -- `Ret` keeps travelling.
-    let roundAgain = bindWith(d, bodyFlow, KFn(fun(f) =
+    let roundAgain = bindWith(d, bodyFlow, KFn(fun(f) = {
+        let b = temp(d, "%b", span)
         mkExpr(d, span, EMatch(f, [
-            armOf(d, P.flowFall, Some("%_"), span, again),
-            armOf(d, P.flowCont, None, span, again),
-            armOf(d, P.flowBrk, Some("%b"), span, fallOf(d, varOf(d, "%b", span))),
-            armOf(d, P.flowRet, Some("%r"), span,
-                  pureOf(d, conOf(d, P.flowRet, [varOf(d, "%r", span)], span))),
-        ]))), span, None)
+            armOf(d, P.flowFall, Ignored, span, again),
+            armOf(d, P.flowCont, Nothing, span, again),
+            armOf(d, P.flowBrk, Bound(b), span, fallOf(d, varOf(d, b, span))),
+            passOn(d, P.flowRet, span),
+        ]))
+    }), span, None)
 
     let done = fallOf(d, mkExpr(d, span, EUnit))
 
@@ -871,21 +965,24 @@ fun optStmtArray(s : Option Stmt) -> Vec Stmt = match s {
 -- the slot that matters and open in the one that cannot be, and `mono`
 -- specializes only at ground instantiations. One dead parameter kept the whole
 -- loop generic and out of reach of the inliner behind it.
-fun loopFun(d : D, name : String, body : Expr, span : Span) -> Stmt =
-    mkStmt(d, span, SFun(FunDecl {
-        id = freshId(d), span = span, name = name, params = [],
+fun loopFun(d : D, name : Temp, body : Expr, span : Span) -> Stmt {
+    let decl = FunDecl {
+        id = freshId(d), span = span, name = name.name, params = [],
         ret = None, body = Some(body), context = [],
         monomorphic = True, symbol = None,
-    }))
+    }
+    Binders.record(d.binders, decl.id, name.id)
+    mkStmt(d, span, SFun(decl))
+}
 
 -- `for x in xs` in its cursor form, then lifted like any other loop.
 fun forIn(d : D, pat : Pat, iterable : Expr, iterFn : Option Expr,
-          nextFn : Option Expr, name : String, call : Expr, roundAgain : Expr,
+          nextFn : Option Expr, name : Temp, call : Expr, roundAgain : Expr,
           span : Span) -> Expr {
-    let n = fresh(d, "")
-    let seqName = "%seq" + n
-    let curName = "%cur" + n
-    let item = "%item" + n
+    let n = number(d)
+    let seqName = temp(d, "%seq" + n, span)
+    let curName = temp(d, "%cur" + n, span)
+    let item = temp(d, "%item" + n, span)
     let iter = iteration(d, iterFn, span)
     let next = iteration(d, nextFn, span)
 
@@ -893,12 +990,12 @@ fun forIn(d : D, pat : Pat, iterable : Expr, iterFn : Option Expr,
         let advance = mkExpr(d, span, ECall(next,
             [varOf(d, seqName, span), varOf(d, curName, span)]))
         let body = mkExpr(d, span, EMatch(advance, [
-            armOf(d, P.optionNone, None, span,
+            armOf(d, P.optionNone, Nothing, span,
                   fallOf(d, mkExpr(d, span, EUnit))),
             Arm {
                 span = span,
                 patterns = [mkPat(d, span, PCon(P.optionSome,
-                    [mkPat(d, span, PVar(item))]))],
+                    [bindTemp(d, item, span)]))],
                 body = mkExpr(d, span, EBlock([
                     mkStmt(d, span, SLet(pat, varOf(d, item, span))),
                     mkStmt(d, span, SExpr(roundAgain)),
@@ -906,8 +1003,8 @@ fun forIn(d : D, pat : Pat, iterable : Expr, iterFn : Option Expr,
             },
         ]))
         wrap(d, [
-            mkStmt(d, span, SLet(mkPat(d, span, PVar(seqName)), xs)),
-            mkStmt(d, span, SLet(mkPat(d, span, PVar(curName)),
+            mkStmt(d, span, SLet(bindTemp(d, seqName, span), xs)),
+            mkStmt(d, span, SLet(bindTemp(d, curName, span),
                 mkExpr(d, span, ECall(iter, [varOf(d, seqName, span)])))),
             loopFun(d, name, body, span),
         ], call, span)

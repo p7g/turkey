@@ -668,12 +668,13 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
               k : Cont, tail : Bool, flow : Bool) -> Expr {
     var lifted = False
     for a in arms {
+        for g in a.guards { refuseInGuard(guardExpr(g), flow) }
         if branching(a.body, flow) { lifted = True }
     }
 
     if !lifted {
         return expr(d, scrutinee, KFn(fun(s) = {
-            for a in arms { a.body = walkExpr(d, a.body) }
+            for a in arms { walkArm(d, a) }
             apply(d, k, mkExpr(d, span, EMatch(s, arms)))
         }), False, False)
     }
@@ -685,12 +686,47 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
             if !flow { refuseEscapesIn(d, a.body, "match") }
             Vec.push(built, Arm {
                 span = a.span, patterns = a.patterns,
+                guards = Vec.map(a.guards, walkGuard(d, _)),
                 body = block(d, a.body, inner, flow),
             })
         }
         let made = mkExpr(d, span, EMatch(s, built))
         if tail { made } else { bindWith(d, made, k, span, None) }
     }), False, False)
+}
+
+-- Raises an error for a `?` in a guard, or a transfer that would travel as a
+-- `Flow`.
+--
+-- A guard runs part way through matching, after its arm's patterns and before
+-- the next arm is tried, so neither can take the rest of the match as its
+-- continuation. Guards come only from the later conditions of an `if` or
+-- `while` head, and the first condition is the `match`'s subject, which can
+-- hold either.
+fun refuseInGuard(g : Expr, flow : Bool) -> Unit {
+    if owns(ChExpr(g)) {
+        oops("a '?' can be in the first condition of an 'if' or 'while' but not a "
+             + "later one; bind its value with 'let' before the 'if'", g.span)
+    }
+    if flow {
+        match escapes(ChExpr(g), False) {
+            Some(found) -> oops(
+                "this '" + keyword(found) + "' cannot be in a later condition of "
+                + "an 'if' or 'while' in a block that holds a '?'; bind the "
+                + "condition's value with 'let' before the 'if'", found.span)
+            None -> {}
+        }
+    }
+}
+
+fun walkGuard(d : D, g : Guard) -> Guard = match g {
+    GTest(e) -> GTest(walkExpr(d, e))
+    GLet(alts, e) -> GLet(alts, walkExpr(d, e))
+}
+
+fun walkArm(d : D, a : Arm) -> Unit {
+    a.guards = Vec.map(a.guards, walkGuard(d, _))
+    a.body = walkExpr(d, armBody(a))
 }
 
 -- -- the two calls the lowering makes ------------------------------------------------
@@ -805,6 +841,7 @@ fun armOf(d : D, con : String, bind : Payload, span : Span,
     Arm {
         span = span,
         patterns = [mkPat(d, span, PCon(con, args))],
+        guards = [],
         body = body,
     }
 }
@@ -852,6 +889,7 @@ fun brokeArm(d : D, span : Span, body : Expr) -> Arm {
     Arm {
         span = span,
         patterns = [mkPat(d, span, PCon(P.flowBrk, [inner]))],
+        guards = [],
         body = body,
     }
 }
@@ -982,6 +1020,7 @@ fun forIn(d : D, pat : Pat, iterable : Expr, iterFn : Option Expr,
                 span = span,
                 patterns = [mkPat(d, span, PCon(P.optionSome,
                     [bindTemp(d, item, span)]))],
+                guards = [],
                 body = mkExpr(d, span, EBlock([
                     mkStmt(d, span, SLet(pat, varOf(d, item, span))),
                     mkStmt(d, span, SExpr(roundAgain)),
@@ -1069,7 +1108,7 @@ fun walkExpr(d : D, e : Expr) -> Expr {
         }
         ELoop(body) -> { e.kind = ELoop(walkExpr(d, body)) }
         EMatch(scrutinee, arms) -> {
-            for a in arms { a.body = walkExpr(d, armBody(a)) }
+            for a in arms { walkArm(d, a) }
             e.kind = EMatch(walkExpr(d, scrutinee), arms)
         }
         EReturn(value) -> { e.kind = EReturn(walkOpt(d, value)) }
@@ -1219,7 +1258,10 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
     ELoop(body) -> indexExpr(d, body)
     EMatch(scrutinee, arms) -> {
         indexExpr(d, scrutinee)
-        for a in arms { indexExpr(d, a.body) }
+        for a in arms {
+            for g in a.guards { indexExpr(d, guardExpr(g)) }
+            indexExpr(d, a.body)
+        }
     }
     EReturn(value) -> indexOpt(d, value)
     EBreak(value) -> indexOpt(d, value)

@@ -1,7 +1,7 @@
 export (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
     Mem(..), Arm(..), Inst(..), Convention(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, foldDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
-    sameRegister, moveHint, safepointOf, pollOf, allocationOf, arrayAllocationOf,
+    sameRegister, moveHint, safepointOf, pollOf, allocationOf, arrayAllocationOf, tailCallOf,
     writesBeforeReading, memOf, rematerializable,
     xzr, sp, fp, lr, x0, d0, worker, argRegs, fpArgRegs, resultRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall, callClobbers,
@@ -214,6 +214,8 @@ type Convention = Standard | PreservesNone
 fun callClobbers(op : Arm, bank : Bank) -> Int = match op {
     Bl(_, c) -> clobbersUnder(c, bank)
     Blr(_, c) -> clobbersUnder(c, bank)
+    TailB(_) -> clobbersUnder(Standard, bank)
+    TailBr(_) -> clobbersUnder(Standard, bank)
     _ -> 0
 }
 
@@ -392,6 +394,13 @@ type Arm
     -- what the callee may destroy.
     | Bl(Symbol, Convention)
     | Blr(Reg, Convention)
+    -- Tail calls, direct and through a register: the callee answers this
+    -- function's caller, and nothing in this function runs after one. Each is
+    -- a pseudo-instruction the emitter expands into the epilogue and a branch
+    -- (`Turkey.Emit.tailCall`), because the epilogue restores what the frame
+    -- layout saved, and the layout is decided after allocation.
+    | TailB(Symbol)
+    | TailBr(Reg)
     -- A pseudo-instruction: the arguments a call passes and the register it
     -- answers in are not operands of `Bl`, so without this the allocator would
     -- see a call that uses and defines nothing. It carries no encoding.
@@ -428,6 +437,9 @@ type Arm
     -- function's symbol for a tail call. The emitter places them; selection
     -- ends a block with a terminator instead.
     | B(Symbol)
+    -- Branches to the address in the register: an indirect tail call's
+    -- branch, after the epilogue.
+    | Br(Reg)
     | BCond(Cond, Symbol)
     -- Branch if the register, at this width, is zero or is not.
     | Cbz(Reg, Symbol, Width)
@@ -710,12 +722,22 @@ fun setsFlags(op : Arm) -> Bool = match op {
     _ -> False
 }
 
+-- A tail call's target: the callee's symbol, or the register holding its
+-- address.
+fun tailCallOf(op : Arm) -> Option (Either Symbol Reg) = match op {
+    TailB(sym) -> Some(Left(sym))
+    TailBr(r) -> Some(Right(r))
+    _ -> None
+}
+
 -- Whether an instruction calls out of the function, at least on some path:
 -- a safepoint, where the collector may run. An allocation is one, though it
 -- destroys no allocatable register (`callClobbers`).
 fun isCall(i : Inst) -> Bool = match i.op {
     Bl(_, _) -> True
     Blr(_, _) -> True
+    TailB(_) -> True
+    TailBr(_) -> True
     Allocate(_, _) -> True
     AllocateArray(_, _, _, _) -> True
     _ -> False
@@ -816,11 +838,14 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Fcvtzs(_, a)        -> p(a)
     Bl(_, _)            -> False
     Blr(a, _)           -> p(a)
+    TailB(_)            -> False
+    TailBr(a)           -> p(a)
     CallArgs(ins, _)    -> anyIn(ins, p)
     SafepointMap(_, _)  -> False
     Poll(_, _)          -> False
     Ret                 -> False
     B(_)                -> False
+    Br(a)               -> p(a)
     BCond(_, _)         -> False
     Cbz(a, _, _)        -> p(a)
     Cbnz(a, _, _)       -> p(a)
@@ -909,11 +934,14 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Fcvtzs(k0, a)         -> Fcvtzs(k0, g(a))
     Bl(k0, k1)            -> Bl(k0, k1)
     Blr(a, k1)            -> Blr(g(a), k1)
+    TailB(k0)             -> TailB(k0)
+    TailBr(a)             -> TailBr(g(a))
     CallArgs(ins, k1)     -> CallArgs(Vec.map(ins, g), k1)
     SafepointMap(k0, k1)  -> SafepointMap(k0, k1)
     Poll(k0, k1)          -> Poll(k0, k1)
     Ret                   -> Ret
     B(k0)                 -> B(k0)
+    Br(a)                 -> Br(g(a))
     BCond(k0, k1)         -> BCond(k0, k1)
     Cbz(a, k1, k2)        -> Cbz(g(a), k1, k2)
     Cbnz(a, k1, k2)       -> Cbnz(g(a), k1, k2)
@@ -1014,11 +1042,14 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     MovConst(f0, f1)         -> MovConst(g(f0), f1)
     Bl(f0, f1)               -> Bl(f0, f1)
     Blr(f0, f1)              -> Blr(g(f0), f1)
+    TailB(f0)                -> TailB(f0)
+    TailBr(f0)               -> TailBr(g(f0))
     CallArgs(f0, f1)         -> CallArgs(Vec.map(f0, g), Array.map(f1, g))
     SafepointMap(f0, f1)     -> SafepointMap(f0, f1)
     Poll(f0, f1)             -> Poll(f0, f1)
     Ret                      -> Ret
     B(f0)                    -> B(f0)
+    Br(f0)                   -> Br(g(f0))
     BCond(f0, f1)            -> BCond(f0, f1)
     Cbz(f0, f1, f2)          -> Cbz(g(f0), f1, f2)
     Cbnz(f0, f1, f2)         -> Cbnz(g(f0), f1, f2)
@@ -1111,11 +1142,14 @@ fun foldDest(op : Arm, acc : a, f : fun(a, Reg) -> a) -> a = match op {
     Fcvtzs(d, _)        -> f(acc, d)
     Bl(_, _)            -> acc
     Blr(_, _)           -> acc
+    TailB(_)            -> acc
+    TailBr(_)           -> acc
     CallArgs(_, outs)   -> foldIn(outs, acc, f)
     SafepointMap(_, _)  -> acc
     Poll(_, _)          -> acc
     Ret                 -> acc
     B(_)                -> acc
+    Br(_)               -> acc
     BCond(_, _)         -> acc
     Cbz(_, _, _)        -> acc
     Cbnz(_, _, _)       -> acc
@@ -1350,6 +1384,9 @@ fun showArm(op : Arm) -> String = match op {
     }
     Bl(sym, _)             -> "bl " + Asm.spell(sym)
     Blr(a, _)              -> "blr " + showReg(a, W64)
+    -- Printed as comments before the emitter expands them.
+    TailB(sym)             -> "// tail call " + Asm.spell(sym)
+    TailBr(a)              -> "// tail call " + showReg(a, W64)
     -- Printed as a comment: it has no encoding and exists to tell the register
     -- allocator what a call reads and writes.
     CallArgs(ins, outs)    -> "// call uses " + Int.toString(len(ins))
@@ -1358,6 +1395,7 @@ fun showArm(op : Arm) -> String = match op {
     Poll(b, n)             -> "// poll " + Int.toString(b) + ":" + Int.toString(n)
     Ret                    -> "ret"
     B(target)              -> "b " + Asm.spell(target)
+    Br(a)                  -> "br " + showReg(a, W64)
     BCond(c, target)       -> "b." + condName(c) + " " + Asm.spell(target)
     Cbz(a, target, w)      -> "cbz " + showReg(a, w) + ", " + Asm.spell(target)
     Cbnz(a, target, w)     -> "cbnz " + showReg(a, w) + ", " + Asm.spell(target)

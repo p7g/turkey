@@ -10,7 +10,10 @@ export (run, reach)
 -- * returning it, storing it in a global, a cell, raw memory, or a
 --   field or element *after* construction, passing it to a runtime or foreign
 --   function or through a closure, or converting it to an untraced word;
--- * passing it to a parameter whose summary says it escapes;
+-- * passing it to a parameter whose summary says it escapes, or to a call in
+--   tail position (`L.inTailPosition`) whose callee can call this function
+--   again by direct calls (`directCycles`). The second is about this frame
+--   only, and is left out of the summaries: see `Graph.tailArgs`;
 -- * being held -- as a field, or through a phi -- by something that escapes.
 --
 -- A store after construction is an escape even into an object that does not
@@ -54,6 +57,7 @@ export (run, reach)
 
 import Data.Map as Map
 import Data.Set as Set
+import Turkey.Deps as Deps
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), Callee(..))
 import Turkey.Runtime as Rt
@@ -77,6 +81,15 @@ type Graph = Graph {
     held : Array (Array Int),
     -- Values that escape whatever the summaries say.
     sinks : Vec Int,
+    -- What tail calls on a cycle pass, which may not be built in this frame:
+    -- the frame is gone while the callee runs. Not sinks. A parameter passed
+    -- on lives in a frame that is still there -- the caller's, or one further
+    -- out, since a frame object passed to a tail call makes that an ordinary
+    -- call -- so the value itself escapes only when this function's own sites
+    -- are decided, and not in the summaries callers read. Its contents
+    -- escape in both: a value built here is then on the heap, and what a heap
+    -- object holds may not be in any frame.
+    tailArgs : Vec Int,
     -- Direct calls, and closures built over known code.
     calls : Vec (String, Array Int),
     closures : Vec (String, Int),
@@ -99,7 +112,13 @@ type Flow = Flow {
 fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     let byName = Map.new()
     for var k = 0; k < len(functions); k = k + 1 { Map.put(byName, functions[k].name, k) }
-    let graphs = Array.map(functions, graphOf)
+    let cycles = directCycles(functions)
+    let repeats = fun(caller : String, callee : String) -> Bool =
+        match (Map.get(cycles, caller), Map.get(cycles, callee)) {
+            (Some(a), Some(b)) -> a == b
+            _ -> False
+        }
+    let graphs = Array.map(functions, graphOf(_, repeats))
     let summaries = Array.map(functions, fun(f) = Summary {
         self = Array.filled(len(f.params), False),
         contents = Array.filled(len(f.params), False),
@@ -129,7 +148,8 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     for var w = 0; w < len(work); w = w + 1 {
         let k = work[w]
         queued[k] = False
-        let flow = decide(functions[k], graphs[k], summaries, byName, frameable[k], lives, k)
+        let flow = decide(functions[k], graphs[k], summaries, byName, frameable[k], False,
+                          lives, k)
         if grow(summaries[k], functions[k], flow.escapes, flow.contents) {
             for reader in Set.elements(readers[k]) {
                 if !queued[reader] {
@@ -141,7 +161,7 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     }
     for var k = 0; k < len(functions); k = k + 1 {
         if frameable[k] && len(graphs[k].sites) > 0 {
-            let flow = decide(functions[k], graphs[k], summaries, byName, True, lives, k)
+            let flow = decide(functions[k], graphs[k], summaries, byName, True, True, lives, k)
             rewrite(functions[k], graphs[k], flow.escapes)
         }
     }
@@ -167,13 +187,52 @@ fun grow(s : Summary, f : Ssa.Func Low, escapes : Array Bool,
 
 -- -- the graph --------------------------------------------------------------------
 
-fun graphOf(f : Ssa.Func Low) -> Graph {
+-- Each function in a cycle of direct calls, with a number for its cycle: two
+-- functions with the same number can each call the other again.
+--
+-- A call through a closure is no edge. What a closure call passes escapes
+-- anyway, so only a direct call is ever passed a frame object; but a cycle can
+-- still close through one, as a visitor's does -- `anyKid(e, someJump(_, ..))`
+-- passes a closure it built for the callee to call back. Such a cycle keeps a
+-- frame per round where what it passes lives in the frame, and is as deep as
+-- the data it walks. Counting it would move those closures to the heap, which
+-- cost the self-compile a third more allocations.
+fun directCycles(functions : Array (Ssa.Func Low)) -> Map String Int {
+    let graph = Map.new()
+    for f in functions {
+        let callees = Set.new()
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Direct(name), _) -> Set.add(callees, name)
+                    _ -> {}
+                }
+            }
+        }
+        Map.put(graph, f.name, callees)
+    }
+    let out = Map.new()
+    var number = 0
+    for component in Deps.sccs(graph) {
+        let looped = len(component) > 1 || match Map.get(graph, component[0]) {
+            Some(callees) -> Set.contains(callees, component[0])
+            None -> False
+        }
+        if looped {
+            for name in component { Map.put(out, name, number) }
+            number = number + 1
+        }
+    }
+    out
+}
+
+fun graphOf(f : Ssa.Func Low, repeats : fun(String, String) -> Bool) -> Graph {
     let n = len(f.reps)
     let g = Graph {
         sources = Array.init(n, fun(_) = []),
         loadedFrom = Array.filled(n, -1),
         held = Array.init(n, fun(_) = []),
-        sinks = [], calls = [], closures = [], sites = [], cyclic = [],
+        sinks = [], tailArgs = [], calls = [], closures = [], sites = [], cyclic = [],
     }
     let traced = fun(v : Value) -> Bool { Ssa.repOf(f, v).traced }
     let sink = fun(v : Value) -> Unit {
@@ -239,8 +298,22 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
                     None -> {}
                 }
                 ClosureCapture(_, _, v) -> sink(v)
-                Call(Direct(name), args) ->
+                -- A tail call's frame is gone while its callee runs, so a
+                -- frame object passed to it makes it an ordinary call
+                -- (`Turkey.Select.isTailCall`). That costs one frame once,
+                -- unless the callee can call this function again: then the
+                -- calls can go round without bound, and only tail calls keep
+                -- the stack from growing with them, so what such a call
+                -- passes is built on the heap (`tailArgs`; `directCycles`
+                -- says which cycles count).
+                Call(Direct(name), args) -> {
+                    if L.inTailPosition(f, b, at) && repeats(f.name, name) {
+                        for a in args {
+                            if traced(a) { Vec.push(g.tailArgs, Ssa.valueId(a)) }
+                        }
+                    }
                     Vec.push(g.calls, (name, Array.map(args, Ssa.valueId)))
+                }
                 -- The closure called is not among the arguments: see the
                 -- header.
                 Call(_, args) -> for a in args { sink(a) }
@@ -301,12 +374,14 @@ fun reachesItself(f : Ssa.Func Low, b : Int) -> Bool {
 
 -- -- one function -----------------------------------------------------------------
 
--- Escape under the current summaries, then every allocation that could live in
--- the frame and cannot -- a site reached again while its object is reachable,
+-- Escape under the current summaries -- and, with `tails`, of what tail calls
+-- on a cycle pass (`Graph.tailArgs`), whose contents alone the summaries
+-- count -- then
+-- every allocation that could live in the frame and cannot -- a site reached again while its object is reachable,
 -- or past the budget -- made to escape as well, since it stays on the heap
 -- and so does anything it holds.
 fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
-           byName : Map String Int, frameable : Bool,
+           byName : Map String Int, frameable : Bool, tails : Bool,
            lives : Array (Option Live), k : Int) -> Flow {
     let flow = Flow {
         escapes = Array.filled(len(f.reps), False),
@@ -314,6 +389,9 @@ fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
         work = [],
     }
     for id in g.sinks { escape(flow, id) }
+    for id in g.tailArgs {
+        if tails { escape(flow, id) } else { leak(flow, id) }
+    }
     for (name, args) in g.calls {
         match Map.get(byName, name) {
             Some(callee) -> {

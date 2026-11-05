@@ -4,7 +4,7 @@ export (
     Expr(..), ExprKind(..),
     Stmt(..), StmtKind(..),
     Lit(..), litKind, literalText,
-    Arm(..),
+    Arm(..), Guard(..), guardExpr,
     Pred(..), PredKind(..),
     FunDecl(..),
     ForeignDecl(..),
@@ -216,10 +216,29 @@ type ExprKind
     | EQuestion(Expr, Option Expr)
     | EDo(Expr)
 
+-- An arm is taken when one of its patterns matches and then every guard holds,
+-- in order. A failing guard goes on to the next arm, with the bindings its arm
+-- made undone; the subject is not evaluated again.
 type Arm = Arm {
-    span     : Span,
-    patterns : Vec Pat,
-    var body : Expr,
+    span       : Span,
+    patterns   : Vec Pat,
+    var guards : Vec Guard,
+    var body   : Expr,
+}
+
+-- One guard of an arm. It sees the arm's bindings and those of the guards
+-- before it, and the arm's body sees all of them.
+type Guard
+    -- Holds when the expression, a `Bool`, is `True`.
+    = GTest(Expr)
+    -- Holds when one of the patterns matches the expression's value, and binds
+    -- what that pattern binds.
+    | GLet(Vec Pat, Expr)
+
+-- Returns the expression a guard evaluates.
+fun guardExpr(g : Guard) -> Expr = match g {
+    GTest(e) -> e
+    GLet(_, e) -> e
 }
 
 -- -- statements -------------------------------------------------------------------
@@ -490,7 +509,8 @@ type Child
 fun children(c : Child) -> Vec Child = match c {
     ChExpr(e) -> exprChildren(e)
     ChStmt(s) -> stmtChildren(s)
-    ChArm(a) -> [ChExpr(armBody(a))]
+    ChArm(a) -> Vec.append(Vec.map(a.guards, fun(g) = ChExpr(guardExpr(g))),
+                           [ChExpr(armBody(a))])
     ChFun(f) -> match declBody(f) {
         Some(b) -> [ChExpr(b)]
         None -> []
@@ -712,7 +732,12 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
         var ends = Stops
         var breaks = Stops
         for arm in arms {
-            let (armEnds, armBreaks) = reach(armBody(arm))
+            -- A guard that is false goes on to a later arm, which this loop
+            -- counts on its own, so an arm reaches its end through its guards
+            -- and then its body.
+            let steps = Vec.map(arm.guards, fun(g) = reach(guardExpr(g)))
+            Vec.push(steps, reach(armBody(arm)))
+            let (armEnds, armBreaks) = inOrder(steps)
             ends = orElse(ends, armEnds)
             breaks = orElse(breaks, armBreaks)
         }

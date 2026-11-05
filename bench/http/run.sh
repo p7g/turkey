@@ -9,7 +9,8 @@
 # `build` builds every program into build/bench/http and stops. With no
 # scenario, every scenario runs:
 #
-#   keepalive   GET /hello over keep-alive, at 1, 64 and 256 connections
+#   keepalive   GET /hello over keep-alive, at each of $KEEPALIVE_CONNS
+#               connections (default 1, 64 and 256)
 #   close       GET /hello, a new connection per request, 64 at once, driven
 #               by go/connload (its comment says why wrk cannot)
 #   download    GET /1m, a 1 MiB response, 64 connections
@@ -71,6 +72,7 @@ REPS=${REPS:-3}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-10}
 IDLE_PCT=${IDLE_PCT:-85}
 RATES=${RATES:-"5000 40000"}
+KEEPALIVE_CONNS=${KEEPALIVE_CONNS:-"1 64 256"}
 PORT=18080
 CC=${TURKEY_CC:-cc}
 RESULTS=$OUT/results.tsv
@@ -334,7 +336,7 @@ u=http://127.0.0.1:$PORT
 s=https://127.0.0.1:$PORT
 
 scenario_keepalive() {
-    for conns in 1 64 256; do
+    for conns in $KEEPALIVE_CONNS; do
         for impl in $servers; do measure keepalive $impl $conns plain $u/hello; done
     done
 }

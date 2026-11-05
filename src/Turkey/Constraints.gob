@@ -1,7 +1,8 @@
 export (
     oneOf,
-    Constraint(..), PredCell(..), LetCell(..), cpredOf,
-    Binding(..), Env(..), newEnv, childEnv, define, lookup_,
+    Constraint(..), Instantiates(..), PredCell(..), LetCell(..), cpredOf,
+    noBinder,
+    Binding(..), Env(..), newEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
     fresh, adopt, rank,
     reach,
@@ -13,6 +14,11 @@ export (
 -- *builds* a constraint, deciding nothing and never looking a name up. This
 -- module solves that constraint, and owns the two things solving needs: the type
 -- environment, and the stack of pools that decides what generalizes.
+--
+-- A constraint names a binder by its id from `Turkey.Binders`, and the
+-- environment is keyed by id. Resolution has already decided which binder each
+-- occurrence means, so the environment needs no scopes: an id names one binder
+-- wherever it appears, and shadowing cannot reach it.
 --
 --     t1 ~ t2            CEq         equality
 --     P t                CPred       a predicate of the domain X
@@ -82,17 +88,20 @@ type Constraint
     -- This is how the generator hands the solver a set of variables without
     -- knowing what rank they belong to. The solver stamps them on the way in.
     | CExists(Vec VarCell, Constraint)
-    -- Bind names to *types* -- monomorphically -- while solving the body.
+    -- Bind binders to *types* -- monomorphically -- while solving the body.
     -- Function parameters, `match` arm binders, and the placeholders of a
-    -- recursive group. Nothing is generalized, so nothing changes rank.
-    | CDef(Vec (String, Ty.Type), Constraint, Bool)
-    -- Bind names to *schemes* already built. The one binder whose schemes
+    -- recursive group. Nothing is generalized, so nothing changes rank. Each
+    -- binder comes with its id and its name as the tree spells it. The flag
+    -- says the binders are top-level.
+    | CDef(Vec (Int, String, Ty.Type), Constraint, Bool)
+    -- Bind binders to *schemes* already built, each with its id and spelling
+    -- as in `CDef`. The one binder whose schemes
     -- solving does not discover: a `fun` with a complete annotation states its
     -- own type, so the scheme is in scope from the group's first line, which is
     -- what lets a recursive occurrence *instantiate* it. That is polymorphic
     -- recursion, admissible here because the type was stated rather than
     -- guessed.
-    | CBind(Vec (String, Scheme), Constraint, Bool)
+    | CBind(Vec (Int, String, Scheme), Constraint, Bool)
     -- Solve the definition one rank deeper, generalize, bind the schemes, solve
     -- the body. The single place generalization happens.
     | CLet(LetCell)
@@ -103,12 +112,11 @@ type Constraint
     -- whole of it: an assumption introduced by a *pattern* is what makes GADTs
     -- destroy principal types, and none is introduced here.
     | CAssume(Vec (String, Pred), Constraint)
-    -- `name <= t`: instantiate the scheme bound to `name` at `t`. The generator
-    -- emits this instead of looking the name up, which is what lets it run
-    -- without a type environment at all.
-    -- The scheme, when the name is not in the environment: an existential
-    -- constructor with a context is used like a constrained function.
-    | CInstance(String, Ty.Type, Option Span, Option Use, Option Scheme)
+    -- `name <= t`: instantiate a scheme at `t`. The generator emits this
+    -- instead of looking the name up, which is what lets it run without a type
+    -- environment at all. The name is the occurrence's spelling, for
+    -- diagnostics.
+    | CInstance(String, Ty.Type, Option Span, Option Use, Instantiates)
     -- A site whose predicates were emitted on their own, as `CPred`s, but whose
     -- lowering needs the dictionaries that prove them. Solving it demands
     -- nothing; it records which scopes are open here, which is what elaboration
@@ -128,8 +136,22 @@ type PredCell = PredCell {
 fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
     CPred(PredCell { pred = p, span = where, context = context })
 
+-- What a `CInstance` instantiates.
+type Instantiates
+    -- The scheme bound to the binder with this id.
+    = OfBinder(Int)
+    -- This scheme, which no binder holds: an existential constructor with a
+    -- context is used like a constrained function.
+    | OfScheme(Scheme)
+
+-- The id of a binder a `CLet` or `CDef` binds only for its rank, or of a
+-- generated class's method: no occurrence names one, and the environment
+-- never holds one by id.
+let noBinder = -1
+
 type LetCell = LetCell {
-    binds    : Vec (String, Ty.Type),
+    -- Each binder's id, its name as the tree spells it, and its type.
+    binds    : Vec (Int, String, Ty.Type),
     defn     : Constraint,
     body     : Constraint,
     span     : Option Span,
@@ -154,39 +176,44 @@ type Binding = Binding {
     mutable : Bool,
 }
 
--- A chain of scopes. Lookup walks outward; definition always writes here.
 type Env = Env {
-    parent : Option Env,
-    names  : Map String Binding,
+    -- The binding of every binder in scope at the constraint being solved,
+    -- by id. A local leaves once the constraint that binds it is solved, so a
+    -- reference that outlives its binder is reported rather than read.
+    binders : Map Int Binding,
+    -- Every top-level binding, class method and primitive by its internal
+    -- name, which the stages after inference look one up by.
+    names   : Map String Binding,
 }
 
-fun newEnv() -> Env = Env { parent = None, names = Map.new() }
+fun newEnv() -> Env = Env { binders = Map.new(), names = Map.new() }
 
-fun childEnv(e : Env) -> Env = Env { parent = Some(e), names = Map.new() }
-
-fun define(e : Env, name : String, b : Binding) -> Unit = Map.put(e.names, name, b)
-
-fun lookup_(e : Env, name : String) -> Option Binding {
-    var here = e
-    var going = True
-    while going {
-        match Map.get(here.names, name) {
-            Some(b) -> return Some(b)
-            None -> match here.parent {
-                Some(up) -> { here = up }
-                None -> { going = False }
-            }
-        }
-    }
-    None
+-- Binds the top-level binder `id`, internally named `name`, for good. With
+-- `noBinder` for `id` -- a generated class's method, which no source
+-- declares -- binds it by name only.
+fun define(e : Env, id : Int, name : String, b : Binding) -> Unit {
+    if id != noBinder { Map.put(e.binders, id, b) }
+    Map.put(e.names, name, b)
 }
+
+-- Binds the binder `id` until `unbind` removes it.
+fun bind(e : Env, id : Int, b : Binding) -> Unit = Map.put(e.binders, id, b)
+
+fun unbind(e : Env, id : Int) -> Unit { let _ = Map.delete(e.binders, id) }
+
+-- Returns what the binder `id` is bound to.
+fun binding(e : Env, id : Int) -> Option Binding = Map.get(e.binders, id)
+
+-- Returns the top-level binding, class method or primitive internally named
+-- `name`.
+fun lookup_(e : Env, name : String) -> Option Binding = Map.get(e.names, name)
 
 -- -- the solver --------------------------------------------------------------------
 
 type Solver = Solver {
     decls           : DeclTable,
     classes         : ClassTable,
-    var env         : Env,
+    env             : Env,
     -- The value constructors in scope where a span is, by the module it is
     -- in: a component of modules is solved in one run, and each of its
     -- modules sees its own.
@@ -203,8 +230,6 @@ type Solver = Solver {
     pools           : Vec (Vec VarCell),
     -- Predicates that could not be settled yet.
     var deferred    : Vec PredCell,
-    -- Schemes of every name a top-level `CLet` bound, for the `types` command.
-    topLevel        : Env,
 }
 
 fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
@@ -212,7 +237,7 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
         assumptions = Vec.new(4), scopes = Vec.new(4), uses = Vec.new(16),
-        pools = [Vec.new(8)], deferred = Vec.new(8), topLevel = env,
+        pools = [Vec.new(8)], deferred = Vec.new(8),
     }
 
 -- The two operations unification needs from the solver, as the record
@@ -385,34 +410,34 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     }
     CDef(binds, body, top) -> {
         if top { decideTopLevelLiterals(s) }
-        let saved = s.env
-        s.env = childEnv(saved)
-        for (name, ty) in binds {
-            let b = Binding { scheme = Ty.mono(ty), mutable = top }
-            define(s.env, name, b)
-            if top { define(s.topLevel, name, b) }
+        for (id, name, ty) in binds {
+            bindFor(s, id, name, Binding { scheme = Ty.mono(ty), mutable = top }, top)
         }
         solve(s, body)
-        s.env = saved
+        if !top { for (id, _, _) in binds { unbind(s.env, id) } }
     }
     CBind(binds, body, top) -> {
-        let saved = s.env
-        s.env = childEnv(saved)
-        for (name, sch) in binds {
-            let b = Binding { scheme = sch, mutable = top }
-            define(s.env, name, b)
-            if top { define(s.topLevel, name, b) }
+        for (id, name, sch) in binds {
+            bindFor(s, id, name, Binding { scheme = sch, mutable = top }, top)
         }
         solve(s, body)
-        s.env = saved
+        if !top { for (id, _, _) in binds { unbind(s.env, id) } }
     }
     CLet(cell) -> solveLet(s, cell)
-    CInstance(name, ty, where, use, given) ->
-        solveInstance(s, name, ty, where, use, given)
+    CInstance(name, ty, where, use, of) ->
+        solveInstance(s, name, ty, where, use, of)
     CUse(u) -> {
         u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
         Vec.push(s.uses, u)
     }
+}
+
+-- Binds `id` to `b`: for good and under its internal name `name` when the
+-- binder is top-level, and otherwise until the constraint that binds it is
+-- solved. A binder bound only for its rank is not bound at all.
+fun bindFor(s : Solver, id : Int, name : String, b : Binding, top : Bool) -> Unit {
+    if id == noBinder { return {} }
+    if top { define(s.env, id, name, b) } else { bind(s.env, id, b) }
 }
 
 -- `name <= t`: instantiate, and re-emit the scheme's obligations.
@@ -423,10 +448,10 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 -- records which field it needs, not whether the access that produced the
 -- demand was a read or an assignment.
 fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
-                  use : Option Use, given : Option Scheme) -> Unit {
-    let scheme = match given {
-        Some(sc) -> sc
-        None -> match lookup_(s.env, name) {
+                  use : Option Use, of : Instantiates) -> Unit {
+    let scheme = match of {
+        OfScheme(sc) -> sc
+        OfBinder(id) -> match binding(s.env, id) {
             Some(b) -> b.scheme
             None -> bug("generation let '" + name + "' through unbound", where)
         }
@@ -485,7 +510,7 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     solve(s, c.defn)
     discard(Vec.pop(s.scopes))
     settle(s)
-    let types = Array.map(c.binds, _.1)
+    let types = Array.map(c.binds, _.2)
     let retainedPreds = split(s, types)
     -- An equation tied to a variable this binder quantifies can never be decided
     -- by an enclosing one -- nothing outside mentions the variable -- so this is
@@ -514,12 +539,15 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     -- nothing and would be handed the undischarged binding at run time. It needs
     -- the group's own dictionaries, which is exactly what the scope now holds.
     let group = Set.new()
-    for (name, _) in c.binds { Set.add(group, name) }
+    for (id, _, _) in c.binds { Set.add(group, id) }
     if len(shared) > 0 {
         for var i = firstUse; i < len(s.uses); i = i + 1 {
             let u = s.uses[i]
-            if len(u.preds) == 0 && Set.contains(group, u.name)
-               && holdsScope(u.scopes, scope) {
+            let inGroup = match u.binder {
+                Some(id) -> Set.contains(group, id)
+                None -> False
+            }
+            if len(u.preds) == 0 && inGroup && holdsScope(u.scopes, scope) {
                 u.preds = shared
             }
         }
@@ -534,9 +562,7 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
         None -> {}
     }
 
-    let saved = s.env
-    s.env = childEnv(saved)
-    for (name, ty) in c.binds {
+    for (id, name, ty) in c.binds {
         let own = Vec.new(4)
         for p in constrain(retainedPreds, ty) {
             if !Classes.isClass(s.classes, p.name) { Vec.push(own, p) }
@@ -567,11 +593,10 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
             Some(a) -> Map.put(a.schemes, name, b.scheme)
             None -> {}
         }
-        define(s.env, name, b)
-        if c.topLevel { define(s.topLevel, name, b) }
+        bindFor(s, id, name, b, c.topLevel)
     }
     solve(s, c.body)
-    s.env = saved
+    if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
 }
 
 -- A partial annotation is an assertion too: each variable its header wrote must

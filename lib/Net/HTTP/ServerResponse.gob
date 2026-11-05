@@ -14,7 +14,7 @@ export (
 -- constructor: a `Method` cannot put a body on a GET, and `Headers` cannot
 -- hold a field the library writes. A response's rule spans two fields:
 -- whether it may have a body depends on its status, since a 1xx, 204 or 304
--- response has none. No field's type can say that, so a response is made
+-- response has none. No field's type can enforce that, so a response is made
 -- only by the functions here, which check it, and a record would let a
 -- program build one they refuse.
 --
@@ -29,7 +29,7 @@ export (
 --
 -- The library never picks a media type: a response has the `Content-Type`
 -- its constructor was given, or none. Header fields are added with
--- `|> header(h, v)` or `withHeaders`.
+-- `withHeaders(response, field(h, v))`.
 --
 -- **A stream's function runs while `respond` writes,** after the head is on
 -- the wire, so a failure in it can no longer change the status: the
@@ -45,7 +45,11 @@ import Net.HTTP.Token as Token (Token)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 
-type ServerResponse = ServerResponse { code : Status, fields : Headers, content : Outgoing }
+type ServerResponse = ServerResponse {
+    status   : Status
+    headers  : Headers
+    outgoing : Outgoing
+}
 
 -- A response's body, as the server writes it.
 --
@@ -62,15 +66,15 @@ type Outgoing =
     | Switched(Token, fun(Duplex) -> Either SomeError Unit)
 
 instance HasHeaders ServerResponse {
-    fun headers(r) = r.fields
-    fun setHeaders(r, hs) = ServerResponse { code = r.code, fields = hs, content = r.content }
+    fun headers(r) = r.headers
+    fun setHeaders(r, hs) = ServerResponse { status = r.status, headers = hs, outgoing = r.outgoing }
 }
 
 -- Returns the response's status.
-fun status(r : ServerResponse) -> Status = r.code
+fun status(r : ServerResponse) -> Status = r.status
 
 -- Returns the response's body, for the server that writes it.
-fun outgoing(r : ServerResponse) -> Outgoing = r.content
+fun outgoing(r : ServerResponse) -> Outgoing = r.outgoing
 
 -- What `body` sends: text as its UTF-8 bytes, or the bytes of a
 -- `Buffer`'s window.
@@ -82,8 +86,9 @@ instance Content String { fun contentBytes(s) = Buf.bytesOf(s) }
 -- sent.
 instance Content Buffer { fun contentBytes(b) = b }
 
--- Panics unless a response with `s` may have a body.
-fun bodied(s : Status, constructor : String) -> Status {
+-- Returns `s`. Panics unless a response with `s` may have a body, naming
+-- `constructor`, the function the program called.
+fun checkBodyAllowed(s : Status, constructor : String) -> Status {
     let code = Status.code(s)
     let fix = if code == 204 { "use 'noContent'" }
               else if code == 304 { "use 'notModified'" }
@@ -95,19 +100,19 @@ fun bodied(s : Status, constructor : String) -> Status {
     s
 }
 
-fun make(s : Status, fields : Headers, content : Outgoing) -> ServerResponse =
-    ServerResponse { code = s, fields, content }
+fun make(s : Status, headers : Headers, outgoing : Outgoing) -> ServerResponse =
+    ServerResponse { status = s, headers, outgoing }
 
 -- Returns a response of `s` with `content` as its body, of type `t`.
 fun body[Content c](s : Status, t : MediaType, content : c) -> ServerResponse =
-    make(bodied(s, "body"), Headers.field(ContentType, t), Whole(contentBytes(content)))
+    make(checkBodyAllowed(s, "body"), Headers.field(ContentType, t), Whole(contentBytes(content)))
 
 -- Returns a response of `s`, of type `t`, whose body `write` writes,
 -- `length` bytes of it, once the head is sent, and whose trailers it
 -- returns. For a response to HEAD, `write` is never called.
 fun stream(s : Status, t : MediaType, length : BodyLength, write : fun(Sink) -> Either SomeError Headers)
         -> ServerResponse =
-    make(bodied(s, "stream"), Headers.field(ContentType, t), Streamed(Stream(length, write)))
+    make(checkBodyAllowed(s, "stream"), Headers.field(ContentType, t), Streamed(Stream(length, write)))
 
 -- Returns a response of `s` with no body: framed as having none for a 204
 -- or 304, and with a length of 0 otherwise. Panics on a 1xx, which `inform`
@@ -128,7 +133,7 @@ fun statusOnly(s : Status) -> ServerResponse {
 fun noContent() -> ServerResponse = make(NoContent, Headers.empty, Empty)
 
 -- Returns a 304 response, which has no body. Add the fields a 200 would have
--- had, `ETag` among them, with `header`.
+-- had, `ETag` among them, with `withHeaders`.
 fun notModified() -> ServerResponse = make(NotModified, Headers.empty, Empty)
 
 -- Returns a response that switches the connection to `protocol`: a 101 with
@@ -152,8 +157,8 @@ fun switch(protocol : Token, headers : Headers, run : fun(Duplex) -> Either Some
 -- * `Status`: `statusOnly` of it.
 -- * `Either l r`, when both sides are a `ToResponse`: the side it holds. So a
 --   handler computes an `Either APIError ServerResponse`, uses `?` on its
---   way, and its error type says, in its own `ToResponse` instance, what
---   response each error becomes.
+--   way, and its error type's own `ToResponse` instance chooses the response
+--   each error becomes.
 class ToResponse r { fun toResponse(r) -> ServerResponse }
 
 instance ToResponse ServerResponse { fun toResponse(r) = r }

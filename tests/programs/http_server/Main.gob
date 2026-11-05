@@ -27,11 +27,8 @@ import System.Task as Task
 import Time.Duration as Duration
 import Time.Sleep as Sleep
 
--- `|>` is not in the Prelude yet; `header` is built to be used with it.
-infix Sequence (|>) = pipe
-fun pipe(x, f) = f(x)
-
--- An application's own error, which says which response each error becomes.
+-- An application's own error, whose `ToResponse` instance chooses the response
+-- each error becomes.
 type APIError = Missing | WrongMethod | BadBody(HTTPError)
 
 instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
@@ -52,7 +49,7 @@ fun text(s : String) -> ServerResponse = body(OK, MediaType.plainText, s)
 fun api(req : Request Incoming) -> Either APIError ServerResponse = match (req.method, req.target.path) {
     (GET, "/health") | (HEAD, "/health") -> Right(body(OK, MediaType.plainText, "ok"))
     (GET, "/json") -> Right(body(OK, MediaType.json, "{\"a\":1}"))
-    (GET, "/html") -> Right(body(OK, MediaType.plainText, "<p>hi</p>") |> header(ContentType, MediaType.html))
+    (GET, "/html") -> Right(withHeaders(body(OK, MediaType.plainText, "<p>hi</p>"), field(ContentType, MediaType.html)))
     (GET, "/empty") -> Right(noContent())
     (GET, "/cached") -> Right(notModified())
     (GET, "/chunks") | (HEAD, "/chunks") -> Right(stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
@@ -246,10 +243,11 @@ fun trailing() {
     let trailed = fun(req : Request Incoming, r : Respond) -> Done {
         let length = if req.target.path == "/known" { LengthKnown(5) } else { LengthUnknown }
         let note = "TE trailers: " + show(acceptsTrailers(req))
-        respond(r, stream(OK, MediaType.plainText, length, fun(sink) {
+        let response = stream(OK, MediaType.plainText, length, fun(sink) {
             IO.writeText(sink, "hello")?
             Right(checksum)
-        }) |> header(HeaderName.literal("x-note"), HeaderValue.literal(note)))
+        })
+        respond(r, withHeaders(response, field(HeaderName.literal("x-note"), HeaderValue.literal(note))))
     }
     shown("chunked", withServer(reporting(es), trailed, fun(l) = send(l,
         "GET / HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nConnection: TE\r\n\r\n")))

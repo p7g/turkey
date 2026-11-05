@@ -47,7 +47,7 @@ import Turkey.Types (TBottom)
 fun parts(k : CoreKind, tail : Bool) -> Vec (Core, Bool) = match k {
     CLit(_) -> []
     CUnit -> []
-    CVar(_) -> []
+    CVar(_, _) -> []
     CCon(_) -> []
     CPrim(_) -> []
     CTuple(elems) -> Vec.map(elems, (_, False))
@@ -66,14 +66,14 @@ fun parts(k : CoreKind, tail : Bool) -> Vec (Core, Bool) = match k {
     }
     CTyLam(_, body) -> [(body, False)]
     CTyApp(fn, _) -> [(fn, False)]
-    CLet(_, _, value, body, _) -> [(value, False), (body, tail)]
+    CLet(_, _, _, value, body, _) -> [(value, False), (body, tail)]
     CLetRec(binds, body) -> {
         let out = Vec.map(binds, \(bindValue(_), False))
         Vec.push(out, (body, tail))
         out
     }
-    CJoin(_, _, body, rest, _) -> [(body, tail), (rest, tail)]
-    CJump(_, args) -> Vec.map(args, (_, False))
+    CJoin(_, _, _, body, rest, _) -> [(body, tail), (rest, tail)]
+    CJump(_, _, args) -> Vec.map(args, (_, False))
     CRef(value) -> [(value, False)]
     CDeref(target) -> [(target, False)]
     CAssign(target, value) -> [(target, False), (value, False)]
@@ -96,15 +96,15 @@ fun parts(k : CoreKind, tail : Bool) -> Vec (Core, Bool) = match k {
 -- out; everything else has none, so the ordinary mapper covers it.
 fun mapTails(k : CoreKind, tail : Bool,
              f : fun(Core, Bool) -> Core) -> CoreKind = match k {
-    CLet(name, bound, value, body, binders) ->
-        CLet(name, bound, f(value, False), f(body, tail), binders)
+    CLet(name, id, bound, value, body, binders) ->
+        CLet(name, id, bound, f(value, False), f(body, tail), binders)
     CLetRec(binds, body) -> CLetRec(Vec.map(binds, fun(b) = CBind {
-        name = b.name, ty = b.ty, binders = b.binders,
+        name = b.name, id = b.id, ty = b.ty, binders = b.binders,
         value = f(b.value, False), span = b.span, mutable = b.mutable,
         module_ = b.module_, equations = b.equations, layouts = b.layouts,
     }), f(body, tail))
-    CJoin(name, params, body, rest, recursive) ->
-        CJoin(name, params, f(body, tail), f(rest, tail), recursive)
+    CJoin(name, id, params, body, rest, recursive) ->
+        CJoin(name, id, params, f(body, tail), f(rest, tail), recursive)
     CIf(cond, then, otherwise) -> CIf(f(cond, False), f(then, tail),
         match otherwise {
             Some(o) -> Some(f(o, tail))
@@ -116,7 +116,7 @@ fun mapTails(k : CoreKind, tail : Bool,
         expr = fun(x) = f(x, False),
         type_ = fun(t) = t,
         bind = fun(b) = CBind {
-            name = b.name, ty = b.ty, binders = b.binders,
+            name = b.name, id = b.id, ty = b.ty, binders = b.binders,
             value = f(b.value, False), span = b.span, mutable = b.mutable,
             module_ = b.module_, equations = b.equations,
             layouts = b.layouts,
@@ -133,7 +133,7 @@ fun discover(program : CProgram) -> CProgram = CProgram {
 }
 
 fun joinBind(b : CBind) -> CBind = CBind {
-    name = b.name, ty = b.ty, binders = b.binders, value = expr(b.value),
+    name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = expr(b.value),
     span = b.span, mutable = b.mutable, module_ = b.module_,
     equations = b.equations, layouts = b.layouts,
 }
@@ -147,10 +147,10 @@ fun joinBind(b : CBind) -> CBind = CBind {
 -- inside an argument fails for its own reasons.
 fun expr(e : Core) -> Core {
     match e.kind {
-        CLet(name, _, value, body, binders) -> if len(binders) == 0 {
+        CLet(name, id, _, value, body, binders) -> if len(binders) == 0 {
             match asJoin(name, value, body, e.ty, False) {
                 Some(params) ->
-                    return finish(e, name, params, value, body, False)
+                    return finish(e, name, id, params, value, body, False)
                 None -> {}
             }
         }
@@ -158,7 +158,7 @@ fun expr(e : Core) -> Core {
             let b = binds[0]
             match asJoin(b.name, b.value, body, e.ty, True) {
                 Some(params) ->
-                    return finish(e, b.name, params, b.value, body, True)
+                    return finish(e, b.name, b.id, params, b.value, body, True)
                 None -> {}
             }
         }
@@ -178,7 +178,7 @@ fun expr(e : Core) -> Core {
 -- `CJoin`, and the checker reads the same entry. A non-recursive join has no
 -- self-calls for the `rest` pass to find, so passing `True` there is a statement
 -- rather than a filter.
-fun finish(e : Core, name : String, params : Array CParam, lam : Core,
+fun finish(e : Core, name : String, id : Int, params : Array CParam, lam : Core,
            rest : Core, recursive : Bool) -> Core {
     let body = match lam.kind {
         CLam(_, inner, _) -> inner
@@ -186,9 +186,9 @@ fun finish(e : Core, name : String, params : Array CParam, lam : Core,
     }
     let arity = len(params)
     mkCore(e.ty, lam.span, CJoin(
-        name, params,
-        jumps(expr(body), name, arity, recursive),
-        jumps(expr(rest), name, arity, True),
+        name, id, params,
+        jumps(expr(body), name, id, arity, recursive),
+        jumps(expr(rest), name, id, arity, True),
         recursive))
 }
 
@@ -240,9 +240,9 @@ fun walkCalls(e : Core, name : String, arity : Int, tail : Bool) -> Bool {
     match e.kind {
         -- A bare mention: it escapes -- into an argument, a data structure, a
         -- returned value -- and a label cannot be passed anywhere.
-        CVar(n) -> return n != name
+        CVar(n, _) -> return n != name
         CApp(fn, args) -> match fn.kind {
-            CVar(n) -> if n == name {
+            CVar(n, _) -> if n == name {
                 if !tail || len(args) != arity { return False }
                 for a in args {
                     if !walkCalls(a, name, arity, False) { return False }
@@ -260,29 +260,29 @@ fun walkCalls(e : Core, name : String, arity : Int, tail : Bool) -> Bool {
 }
 
 -- Turn the calls the analysis just licensed into jumps.
-fun jumps(e : Core, name : String, arity : Int, tail : Bool) -> Core {
+fun jumps(e : Core, name : String, id : Int, arity : Int, tail : Bool) -> Core {
     match e.kind {
         CApp(fn, args) -> match fn.kind {
-            CVar(n) -> if n == name && tail {
+            CVar(n, _) -> if n == name && tail {
                 if len(args) != arity {
                     oops("an unlicensed call reached jumps")
                 }
-                return mkCore(TBottom, e.span, CJump(name,
-                    Vec.map(args, jumps(_, name, arity, False))))
+                return mkCore(TBottom, e.span, CJump(name, id,
+                    Vec.map(args, jumps(_, name, id, arity, False))))
             }
             _ -> {}
         }
         _ -> {}
     }
     mkCore(e.ty, e.span, mapTails(e.kind, tail,
-                                  fun(x, t) = jumps(x, name, arity, t)))
+                                  fun(x, t) = jumps(x, name, id, arity, t)))
 }
 
 -- -- two small questions about names --------------------------------------------------
 
 fun mentions(e : Core, name : String) -> Bool {
     match e.kind {
-        CVar(n) -> if n == name { return True }
+        CVar(n, _) -> if n == name { return True }
         _ -> {}
     }
     for (child, _) in parts(e.kind, False) {
@@ -303,11 +303,11 @@ fun rebinds(e : Core, name : String) -> Bool {
         CLam(params, _, _) -> for p in params {
             if p.name == name { return True }
         }
-        CJoin(bound, params, _, _, _) -> {
+        CJoin(bound, _, params, _, _, _) -> {
             if bound == name { return True }
             for p in params { if p.name == name { return True } }
         }
-        CLet(bound, _, _, _, _) -> if bound == name { return True }
+        CLet(bound, _, _, _, _, _) -> if bound == name { return True }
         CLetRec(binds, _) -> for b in binds {
             if b.name == name { return True }
         }

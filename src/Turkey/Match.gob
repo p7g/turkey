@@ -47,18 +47,21 @@ import Turkey.Types as Ty
 import Turkey.Types (TTuple, TBottom, TCon)
 
 -- What compiling needs from the pass that calls it: the declarations, how to
--- reduce a field's type to the one its constructors are read off, and how to
--- name a binder it invents.
+-- reduce a field's type to the one its constructors are read off, how to name
+-- a binder it invents, and the id of the binder a pattern variable binds. A
+-- binder is a spelling and an id; see `Turkey.Core.CParam`.
 type Matcher = Matcher {
-    decls  : DeclTable,
-    reduce : fun(Ty.Type) -> Ty.Type,
-    fresh  : fun(String) -> String,
+    decls    : DeclTable,
+    reduce   : fun(Ty.Type) -> Ty.Type,
+    fresh    : fun(String) -> (String, Int),
+    binderOf : fun(Pat) -> Int,
 }
 
--- One compilation's state: how many jumps there are to each fallthrough.
+-- One compilation's state: how many jumps there are to each fallthrough, by
+-- the fallthrough's id.
 type State = State {
     m     : Matcher,
-    jumps : Map String Int,
+    jumps : Map Int Int,
 }
 
 -- `match scrutinee { arms }`, of type `ty`, compiled.
@@ -69,8 +72,11 @@ fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
     -- The scrutinee is evaluated once, and a later run may test it again, so it
     -- is held in a variable unless it is one or nothing reads it twice.
     let root = match scrutinee.kind {
-        CVar(name) -> Column { name = name, ty = scrutinee.ty }
-        _ -> Column { name = m.fresh("scrut"), ty = scrutinee.ty }
+        CVar(name, id) -> Column { name = name, id = id, ty = scrutinee.ty }
+        _ -> {
+            let (name, id) = m.fresh("scrut")
+            Column { name = name, id = id, ty = scrutinee.ty }
+        }
     }
     let rows = Array.map(arms, fun((pat, body)) = Row { pats = [pat], binds = [], body = body })
     let out = if len(rows) == 0 {
@@ -79,38 +85,40 @@ fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
         matrix(st, [root], rows, None, site)
     }
     match scrutinee.kind {
-        CVar(_) -> out
-        _ -> once(out, root.name, scrutinee)
+        CVar(_, _) -> out
+        _ -> once(out, root, scrutinee)
     }
 }
 
 -- `out` with the scrutinee in the one place that reads `name`, when that place
 -- is where `out` starts, and bound around it otherwise.
-fun once(out : Core, name : String, scrutinee : Core) -> Core {
+fun once(out : Core, root : Column, scrutinee : Core) -> Core {
     let counted = Map.new()
     countNames(out, counted)
-    if Map.getOr(counted, name, 0) == 1 {
+    if Map.getOr(counted, root.id, 0) == 1 {
         match out.kind {
-            CMatch(s, alts) -> if isVar(s, name) {
+            CMatch(s, alts) -> if isVar(s, root.id) {
                 return mkCore(out.ty, out.span, CMatch(scrutinee, alts))
             }
-            CLet(bound, ty, value, body, binders) -> if isVar(value, name) {
-                return mkCore(out.ty, out.span, CLet(bound, ty, scrutinee, body, binders))
+            CLet(bound, boundId, ty, value, body, binders) -> if isVar(value, root.id) {
+                return mkCore(out.ty, out.span,
+                              CLet(bound, boundId, ty, scrutinee, body, binders))
             }
             _ -> {}
         }
     }
-    mkCore(out.ty, out.span, CLet(name, scrutinee.ty, scrutinee, out, []))
+    mkCore(out.ty, out.span, CLet(root.name, root.id, scrutinee.ty, scrutinee, out, []))
 }
 
-fun isVar(e : Core, name : String) -> Bool = match e.kind {
-    CVar(n) -> n == name
+fun isVar(e : Core, id : Int) -> Bool = match e.kind {
+    CVar(_, n) -> n == id
     _ -> False
 }
 
-fun countNames(e : Core, out : Map String Int) -> Unit {
+-- Counts the references to each binder in `e`, by id.
+fun countNames(e : Core, out : Map Int Int) -> Unit {
     match e.kind {
-        CVar(n) -> Map.put(out, n, Map.getOr(out, n, 0) + 1)
+        CVar(_, n) -> Map.put(out, n, Map.getOr(out, n, 0) + 1)
         _ -> {}
     }
     discard(mapKind(e.kind, Mapper {
@@ -131,13 +139,13 @@ fun discard(x : a) -> Unit = {}
 -- -- the matrix ------------------------------------------------------------------------
 
 -- A value under test: the variable that holds it, and its type.
-type Column = Column { name : String, ty : Ty.Type }
+type Column = Column { name : String, id : Int, ty : Ty.Type }
 
 -- One arm, part way through: the patterns still to test, one per column, and
 -- the variables the patterns already passed bound, each to the column it named.
 type Row = Row {
     pats  : Array Pat,
-    binds : Array (String, Ty.Type, String),
+    binds : Array (String, Int, Ty.Type, Column),
     body  : Core,
 }
 
@@ -147,7 +155,7 @@ type Site = Site { ty : Ty.Type, span : Option Span }
 -- The code for `rows` against `columns`, jumping to `fail` when none matches,
 -- or reaching a `match` with no arm for the value when there is no `fail`.
 fun matrix(st : State, columns : Vec Column, rows : Array Row,
-           fail : Option String, site : Site) -> Core {
+           fail : Option (String, Int), site : Site) -> Core {
     if len(columns) == 0 { return leafOf(rows[0]) }
     runs(st, columns, runsOf(rows), 0, fail, site)
 }
@@ -161,9 +169,10 @@ fun matrix(st : State, columns : Vec Column, rows : Array Row,
 fun leafOf(row : Row) -> Core {
     var out = row.body
     for var i = len(row.binds) - 1; i >= 0; i = i - 1 {
-        let (name, ty, column) = row.binds[i]
+        let (name, id, ty, column) = row.binds[i]
         out = mkCore(out.ty, out.span,
-                     CLet(name, ty, mkCore(ty, out.span, CVar(column)), out, []))
+                     CLet(name, id, ty, mkCore(ty, out.span, CVar(column.name, column.id)),
+                          out, []))
     }
     out
 }
@@ -173,16 +182,16 @@ fun leafOf(row : Row) -> Core {
 -- The rest is a join point when more than one place falls through to it, and
 -- stands in for the one jump when one does.
 fun runs(st : State, columns : Vec Column, all : Vec (Vec Row), i : Int,
-         fail : Option String, site : Site) -> Core {
+         fail : Option (String, Int), site : Site) -> Core {
     if i + 1 == len(all) { return run(st, columns, all[i], fail, site) }
     let rest = runs(st, columns, all, i + 1, fail, site)
-    let next = st.m.fresh("next")
-    Map.put(st.jumps, next, 0)
-    let first = run(st, columns, all[i], Some(next), site)
-    match Map.getOr(st.jumps, next, 0) {
+    let (next, nextId) = st.m.fresh("next")
+    Map.put(st.jumps, nextId, 0)
+    let first = run(st, columns, all[i], Some((next, nextId)), site)
+    match Map.getOr(st.jumps, nextId, 0) {
         0 -> first
-        1 -> replaceJump(first, next, rest)
-        _ -> mkCore(site.ty, site.span, CJoin(next, [], rest, first, False))
+        1 -> replaceJump(first, nextId, rest)
+        _ -> mkCore(site.ty, site.span, CJoin(next, nextId, [], rest, first, False))
     }
 }
 
@@ -230,13 +239,15 @@ fun runsOf(rows : Array Row) -> Vec (Vec Row) {
 }
 
 fun run(st : State, columns : Vec Column, rows : Vec Row,
-        fail : Option String, site : Site) -> Core {
+        fail : Option (String, Int), site : Site) -> Core {
     let column = columns[0]
     let after = Vec.slice(columns, 1, len(columns))
     match headOf(rows[0]) {
         Variable -> matrix(st, after, Array.map(rows, fun(row) = {
-            let binds = match unannot(row.pats[0]).kind {
-                PVar(name) -> Array.append(row.binds, [(name, column.ty, column.name)])
+            let bare = unannot(row.pats[0])
+            let binds = match bare.kind {
+                PVar(name) -> Array.append(row.binds,
+                    [(name, st.m.binderOf(bare), column.ty, column)])
                 _ -> row.binds
             }
             Row { pats = rest(row), binds = binds, body = row.body }
@@ -266,7 +277,7 @@ fun rest(row : Row) -> Array Pat = Array.slice(row.pats, 1, len(row.pats))
 -- One arm per constructor the run names, in the order it first names them, and
 -- an arm that falls through when the run does not name them all.
 fun constructors(st : State, column : Column, after : Vec Column,
-                 rows : Vec Row, fail : Option String, site : Site) -> Core {
+                 rows : Vec Row, fail : Option (String, Int), site : Site) -> Core {
     let names = []
     for row in rows {
         let name = conName(unannot(row.pats[0]))
@@ -333,7 +344,7 @@ fun positional(info : Decls.ConInfo, p : Pat) -> Vec Pat = match p.kind {
 -- Two rows share an arm when their literals are spelled alike. Not floats,
 -- whose equality is not their spelling's.
 fun literals(st : State, column : Column, after : Vec Column,
-             rows : Vec Row, fail : Option String, site : Site) -> Core {
+             rows : Vec Row, fail : Option (String, Int), site : Site) -> Core {
     let seen : Vec Lit = []
     let groups : Vec (Vec Row) = []
     for row in rows {
@@ -374,9 +385,9 @@ fun sameLiteral(a : Lit, b : Lit) -> Bool = match (a, b) {
 }
 
 -- The arm that falls through, when there is somewhere to fall.
-fun orElse(st : State, alts : Vec CAlt, fail : Option String, site : Site) -> Unit =
+fun orElse(st : State, alts : Vec CAlt, fail : Option (String, Int), site : Site) -> Unit =
     match fail {
-        Some(name) -> Vec.push(alts, CAlt { alt = AAny(None), body = jump(st, name, site) })
+        Some(target) -> Vec.push(alts, CAlt { alt = AAny(None), body = jump(st, target, site) })
         None -> {}
     }
 
@@ -390,12 +401,16 @@ fun orElse(st : State, alts : Vec CAlt, fail : Option String, site : Site) -> Un
 -- to test.
 fun expand(st : State, after : Vec Column, rows : Vec Row,
            subs : Array (Vec Pat), types : Array Ty.Type,
-           fail : Option String, site : Site) -> (Array (Option String), Core) {
+           fail : Option (String, Int), site : Site)
+        -> (Array (Option (String, Int)), Core) {
     if len(rows) == 1 && every(subs[0], leaf) && every(rest(rows[0]), leaf) {
         let row = rows[0]
-        let binders = Array.map(subs[0], fun(p) = match unannot(p).kind {
-            PVar(name) -> Some(name)
-            _ -> None
+        let binders = Array.map(subs[0], fun(p) {
+            let bare = unannot(p)
+            match bare.kind {
+                PVar(name) -> Some((name, st.m.binderOf(bare)))
+                _ -> None
+            }
         })
         let inner = Row { pats = rest(row), binds = row.binds, body = row.body }
         return (binders, matrix(st, after, [inner], fail, site))
@@ -408,10 +423,10 @@ fun expand(st : State, after : Vec Column, rows : Vec Row,
             if i < len(s) && !ignored(s[i]) { used = True }
         }
         if used {
-            let name = st.m.fresh(hintFor(subs, i))
-            Vec.push(columns, Column { name = name, ty = types[i] })
+            let (name, id) = st.m.fresh(hintFor(subs, i))
+            Vec.push(columns, Column { name = name, id = id, ty = types[i] })
             Vec.push(kept, i)
-            Some(name)
+            Some((name, id))
         } else {
             None
         }
@@ -427,7 +442,7 @@ fun expand(st : State, after : Vec Column, rows : Vec Row,
 -- What a field's column is called after: the variable the rows bind it to,
 -- when they agree on one, so a dump still says `k` where the source did. The
 -- column is a fresh name all the same, since a body under it may read another
--- `k`; only the letters are kept, which is what the printer renumbers.
+-- `k`; only the letters are kept, and the printer drops the counter.
 fun hintFor(subs : Array (Vec Pat), i : Int) -> String {
     var named = ""
     for s in subs {
@@ -477,36 +492,38 @@ fun unannot(p : Pat) -> Pat = match p.kind {
 }
 
 fun switch(column : Column, alts : Vec CAlt, site : Site) -> Core =
-    mkCore(site.ty, site.span, CMatch(mkCore(column.ty, site.span, CVar(column.name)), alts))
+    mkCore(site.ty, site.span, CMatch(mkCore(column.ty, site.span,
+                                             CVar(column.name, column.id)), alts))
 
 -- -- fallthrough -----------------------------------------------------------------------
 
-fun jump(st : State, name : String, site : Site) -> Core {
-    Map.put(st.jumps, name, Map.getOr(st.jumps, name, 0) + 1)
-    mkCore(TBottom, site.span, CJump(name, []))
+fun jump(st : State, target : (String, Int), site : Site) -> Core {
+    let (name, id) = target
+    Map.put(st.jumps, id, Map.getOr(st.jumps, id, 0) + 1)
+    mkCore(TBottom, site.span, CJump(name, id, []))
 }
 
--- `e` with its one jump to `name` replaced by `with`. Every variable `with`
+-- `e` with its one jump to the join `label` replaced by `with`. Every variable `with`
 -- reads is bound outside `e` or is a column bound around the jump under a name
 -- of this pass's, so nothing on the way down can capture it; see `leafOf`.
 --
 -- An arm that only falls through, to code that binds the value its `match`
 -- tests, becomes an arm binding that value: `_ -> let y = v in b`, in a
 -- `match v`, is `y -> b`, which is the arm as it was written.
-fun replaceJump(e : Core, name : String, with : Core) -> Core = match e.kind {
-    CJump(target, _) -> if target == name { with } else { e }
+fun replaceJump(e : Core, label : Int, with : Core) -> Core = match e.kind {
+    CJump(_, target, _) -> if target == label { with } else { e }
     CMatch(scrutinee, alts) -> mkCore(e.ty, e.span, CMatch(scrutinee, Vec.map(alts,
         fun(a) = match (a.alt, a.body.kind) {
-            (AAny(None), CJump(target, _)) ->
-                if target == name { bindingArm(scrutinee, with) } else { a }
-            _ -> CAlt { alt = a.alt, body = replaceJump(a.body, name, with) }
+            (AAny(None), CJump(_, target, _)) ->
+                if target == label { bindingArm(scrutinee, with) } else { a }
+            _ -> CAlt { alt = a.alt, body = replaceJump(a.body, label, with) }
         })))
     _ -> mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
-        expr = replaceJump(_, name, with),
+        expr = replaceJump(_, label, with),
         type_ = fun(t) = t,
         bind = fun(b) = CBind {
-            name = b.name, ty = b.ty, binders = b.binders,
-            value = replaceJump(b.value, name, with), span = b.span,
+            name = b.name, id = b.id, ty = b.ty, binders = b.binders,
+            value = replaceJump(b.value, label, with), span = b.span,
             mutable = b.mutable, module_ = b.module_, equations = b.equations,
             layouts = b.layouts,
         },
@@ -514,9 +531,9 @@ fun replaceJump(e : Core, name : String, with : Core) -> Core = match e.kind {
 }
 
 fun bindingArm(scrutinee : Core, with : Core) -> CAlt = match (scrutinee.kind, with.kind) {
-    (CVar(tested), CLet(bound, _, value, body, binders)) ->
+    (CVar(_, tested), CLet(bound, boundId, _, value, body, binders)) ->
         if isVar(value, tested) && len(binders) == 0 {
-            CAlt { alt = AAny(Some(bound)), body = body }
+            CAlt { alt = AAny(Some((bound, boundId))), body = body }
         } else {
             CAlt { alt = AAny(None), body = with }
         }

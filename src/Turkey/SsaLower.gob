@@ -822,13 +822,13 @@ type Uses = Uses {
 fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
     if a.boxed { return }
     match e.kind {
-        CVar(n) -> if boxed && Set.contains(a.names, n) { a.boxed = True }
+        CVar(n, _) -> if boxed && Set.contains(a.names, n) { a.boxed = True }
         CTyApp(inner, _) -> usesIn(a, inner, boxed)
         CTyLam(_, inner) -> usesIn(a, inner, boxed)
-        CLet(n, _, bound, body, _) -> {
+        CLet(n, _, _, bound, body, _) -> {
             usesIn(a, bound, False)
             let renames = match bound.kind {
-                CVar(m) -> Set.contains(a.names, m)
+                CVar(m, _) -> Set.contains(a.names, m)
                 _ -> False
             }
             -- Names are not unique, so a `let` of another value hides the
@@ -850,11 +850,11 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
             usesIn(a, scrutinee, False)
             for alt in alts { hiding(a, Core.altVars(alt.alt), fun() = usesIn(a, alt.body, boxed)) }
         }
-        CJoin(_, params, body, rest, _) -> {
+        CJoin(_, _, params, body, rest, _) -> {
             hiding(a, Array.map(params, _.name), fun() = usesIn(a, body, boxed))
             usesIn(a, rest, boxed)
         }
-        CJump(_, args) -> for x in args { usesIn(a, x, False) }
+        CJump(_, _, args) -> for x in args { usesIn(a, x, False) }
         CProject(target, _) -> usesIn(a, target, False)
         CTuple(elems) -> {
             let spread = spreads(a, e.ty)
@@ -867,7 +867,7 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
                              else { !spreads(a, e.ty) }
                 for x in args { usesIn(a, x, wanted) }
             }
-            CVar(name) -> match Map.get(a.sigs, name) {
+            CVar(name, _) -> match Map.get(a.sigs, name) {
                 Some(sig) -> if len(sig.params) == len(args) {
                     for var i = 0; i < len(args); i = i + 1 {
                         usesIn(a, args[i], len(sig.params[i]) == 1)
@@ -961,8 +961,8 @@ fun markDiverging(program : CProgram, sigs : Map String Signature) -> Unit {
 -- than a caller cut short.
 fun neverReturns(sigs : Map String Signature, e : Core) -> Bool = match e.kind {
     CApp(fn, args) -> divergingCall(sigs, e, fn, args)
-    CLet(_, _, value, body, _) -> neverReturns(sigs, value) || neverReturns(sigs, body)
-    CJoin(_, _, _, rest, _) -> neverReturns(sigs, rest)
+    CLet(_, _, _, value, body, _) -> neverReturns(sigs, value) || neverReturns(sigs, body)
+    CJoin(_, _, _, _, rest, _) -> neverReturns(sigs, rest)
     CMatch(_, alts) -> {
         if len(alts) == 0 { return False }
         for a in alts { if !neverReturns(sigs, a.body) { return False } }
@@ -985,7 +985,7 @@ fun divergingCall(sigs : Map String Signature, e : Core, fn : Core, args : Array
     }
     match erased(fn).kind {
         CPrim(Prims.Error) -> True
-        CVar(name) -> match Map.get(sigs, name) {
+        CVar(name, _) -> match Map.get(sigs, name) {
             Some(sig) -> sig.diverges && len(args) == len(sig.params)
             None -> False
         }
@@ -1258,7 +1258,7 @@ fun localSlot(l : Lower, held : Value) -> (Int, Rep) {
 }
 
 fun globalRef(l : Lower, e : Core) -> Option (String, Rep) = match e.kind {
-    CVar(name) -> match Map.get(l.globalRefs, name) {
+    CVar(name, _) -> match Map.get(l.globalRefs, name) {
         Some(held) -> Some((name, held))
         None -> None
     }
@@ -1266,7 +1266,7 @@ fun globalRef(l : Lower, e : Core) -> Option (String, Rep) = match e.kind {
 }
 
 fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
-    CVar(name) -> match Map.get(l.env, name) {
+    CVar(name, _) -> match Map.get(l.env, name) {
         Some(v) -> Map.get(l.localRefs, Ssa.valueId(v))
         None -> None
     }
@@ -1275,7 +1275,7 @@ fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
 
 fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
     match e.kind {
-        CVar(name) -> match Map.get(l.env, name) {
+        CVar(name, _) -> match Map.get(l.env, name) {
             Some(v) -> match Map.get(l.localObjects, Ssa.valueId(v)) {
                 Some(slots) -> if index < len(slots) { Some(slots[index]) } else { None }
                 None -> None
@@ -1307,7 +1307,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 None -> finish(l, L.emit(l.b, ConstUnit, Ssa.untraced(Unit)), dest)
             }
         }
-        CLet(name, ty, bound, body, _) -> {
+        CLet(name, _, ty, bound, body, _) -> {
             let v = localBinding(l, name, bound)
             let was = saving(l, [name])
             Map.put(l.env, name, v)
@@ -1316,7 +1316,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
         }
         -- A join is a block, and a jump to it is a jump. This is the case the
         -- whole IR is shaped for.
-        CJoin(name, params, body, rest, recursive) -> {
+        CJoin(name, _, params, body, rest, recursive) -> {
             let target = L.block(l.b)
             let entered = joinParams(l, target, params, body, dest)
             -- Join names are no more unique than term names are, and for the
@@ -1344,7 +1344,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             restore(l, was)
             if recursive { restore1Join(l, name, hidden) }
         }
-        CJump(name, args) -> {
+        CJump(name, _, args) -> {
             let supplied = Array.map(args, fun(a) = value(l, a))
             match Map.get(l.joins, name) {
                 Some(target) ->
@@ -1738,8 +1738,8 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
     }
 }
 
-fun bindTo(l : Lower, binder : Option String, v : Value) -> Unit = match binder {
-    Some(name) -> Map.put(l.env, name, v)
+fun bindTo(l : Lower, binder : Option (String, Int), v : Value) -> Unit = match binder {
+    Some((name, _)) -> Map.put(l.env, name, v)
     None -> {}
 }
 
@@ -1747,7 +1747,7 @@ fun bindTo(l : Lower, binder : Option String, v : Value) -> Unit = match binder 
 -- `k`th constructor, from the slots `f` puts them in. A field nobody binds is
 -- not read.
 fun bindFlat(l : Lower, v : Value, f : Layout.Flat, k : Int,
-             binders : Array (Option String)) -> Unit {
+             binders : Array (Option (String, Int))) -> Unit {
     if k < 0 || k >= len(f.fields) {
         return stop1(l, "a constructor not among the flat type's")
     }
@@ -1755,7 +1755,7 @@ fun bindFlat(l : Lower, v : Value, f : Layout.Flat, k : Int,
     let fields = f.fields[k]
     for var i = 0; i < len(binders) && i < len(fields); i = i + 1 {
         match binders[i] {
-            Some(name) -> {
+            Some((name, _)) -> {
                 let at = fields[i]
                 let layout = Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) }
                 Map.put(l.env, name, fromSlots(l, layout, slotsAt(l, v, whole, at)))
@@ -1771,12 +1771,12 @@ fun flatTag(l : Lower, v : Value, f : Layout.Flat) -> Value =
 
 -- The fields an arm binds: each one's slot in the object, counting from
 -- `first`, its name, and its type.
-fun positions(binders : Array (Option String), types : Array Ty.Type,
+fun positions(binders : Array (Option (String, Int)), types : Array Ty.Type,
               first : Int) -> Vec (Int, String, Ty.Type) {
     let out = []
     for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
         match binders[i] {
-            Some(name) -> Vec.push(out, (first + i, name, types[i]))
+            Some((name, _)) -> Vec.push(out, (first + i, name, types[i]))
             None -> {}
         }
     }
@@ -1786,7 +1786,7 @@ fun positions(binders : Array (Option String), types : Array Ty.Type,
 -- Opening a packed existential: the tag, then the stored index against the one
 -- this copy of the arm was lowered for, then the carried dictionaries, then
 -- the fields.
-fun opened(l : Lower, name : String, binders : Array (Option String), o : Opening,
+fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o : Opening,
            v : Value, ty : Ty.Type, success : BlockId, failure : BlockId) -> Unit {
     let layouts = match o.layouts {
         Some(ls) -> ls
@@ -2052,7 +2052,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     match e.kind {
         CUnit -> L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         CLit(lit) -> literal(l, lit, rep)
-        CVar(name) -> match Map.get(l.env, name) {
+        CVar(name, _) -> match Map.get(l.env, name) {
             Some(v) -> v
             -- A top-level *function* mentioned rather than called.
             -- `GlobalLoad` would load the symbol, which is a code address and
@@ -2172,7 +2172,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         CMatch(_, _) -> control(l, e, held)
         -- One path in and one out, so no block is needed for its value, and
         -- a value of several slots keeps the form its body gave it.
-        CLet(name, _, bound, body, _) -> {
+        CLet(name, _, _, bound, body, _) -> {
             let v = localBinding(l, name, bound)
             let was = saving(l, [name])
             Map.put(l.env, name, v)
@@ -2180,7 +2180,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
             restore(l, was)
             result
         }
-        CJoin(_, _, _, _, _) -> control(l, e, held)
+        CJoin(_, _, _, _, _, _) -> control(l, e, held)
         CLetRec(_, _) -> control(l, e, held)
         _ -> stop(l, formOf(e))
     }
@@ -2797,7 +2797,7 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
 
 -- A constructor on a one-word compact sum: the word test, then the payload,
 -- read only if the arm binds it.
-fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option String),
+fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option (String, Int)),
                 v : Value, ty : Ty.Type,
                 success : BlockId, failure : BlockId) -> Unit {
     match Vec.indexOf(c.nullaries, name) {
@@ -2820,11 +2820,11 @@ fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option S
 
 -- A compact sum's payload, known to be there, bound if the arm binds it: the
 -- word itself, or the field of the wrap it is.
-fun compactPayload(l : Lower, c : Compact, binders : Array (Option String), v : Value,
+fun compactPayload(l : Lower, c : Compact, binders : Array (Option (String, Int)), v : Value,
                    ty : Ty.Type) -> Unit {
     let binder = if len(binders) == 1 { binders[0] } else { None }
     let bound = match binder {
-        Some(b) -> b
+        Some((b, _)) -> b
         None -> return
     }
     let field = compactField(l, c, ty)
@@ -2996,7 +2996,7 @@ fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
 fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value {
     match fn.kind {
         CPrim(p) -> primitive(l, e, p, args, rep)
-        CVar(name) -> if Map.contains(l.decls.foreigns, name) {
+        CVar(name, _) -> if Map.contains(l.decls.foreigns, name) {
             -- A declared C symbol. Everything a runtime call needs
             -- and nothing more: no marshalling, because the type mapping is
             -- the seven types that each erase to one representation, and no
@@ -3466,7 +3466,7 @@ fun elementRep(l : Lower, ty : Ty.Type) -> Rep {
 fun formOf(e : Core) -> String = match e.kind {
     CLit(_) -> "a literal"
     CUnit -> "unit"
-    CVar(_) -> "a variable"
+    CVar(_, _) -> "a variable"
     CCon(name) -> "the constructor '" + name + "'"
     CPrim(p) -> "the primitive '" + Prims.name(p) + "'"
     CTuple(_) -> "a tuple"
@@ -3479,10 +3479,10 @@ fun formOf(e : Core) -> String = match e.kind {
     CApp(_, _) -> "an application"
     CTyLam(_, _) -> "a type abstraction"
     CTyApp(_, _) -> "a type application"
-    CLet(_, _, _, _, _) -> "a let"
+    CLet(_, _, _, _, _, _) -> "a let"
     CLetRec(_, _) -> "a letrec"
-    CJoin(_, _, _, _, _) -> "a join"
-    CJump(_, _) -> "a jump"
+    CJoin(_, _, _, _, _, _) -> "a join"
+    CJump(_, _, _) -> "a jump"
     CRef(_) -> "a ref"
     CDeref(_) -> "a deref"
     CAssign(_, _) -> "an assignment"

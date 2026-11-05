@@ -319,15 +319,15 @@ fun rTy(r : Rewriter, t : Ty.Type) -> Ty.Type {
 }
 
 fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
-    CVar(name) -> mkCore(rTy(r, e.ty), e.span,
-                         CVar(Map.getOr(r.rename, name, name)))
+    CVar(name, id) -> mkCore(rTy(r, e.ty), e.span,
+                         CVar(Map.getOr(r.rename, name, name), id))
     CTyApp(fn, args) -> rewriteTyApp(r, e, fn, args)
     CApp(_, _) -> match collapse(r, e) {
         Some(made) -> made
         None -> generic(r, e)
     }
-    CLet(name, bound, value, body, binders) ->
-        rewriteLet(r, e, name, bound, value, body, binders)
+    CLet(name, id, bound, value, body, binders) ->
+        rewriteLet(r, e, name, id, bound, value, body, binders)
     CLetRec(binds, body) -> rewriteLetRec(r, e, binds, body)
     _ -> generic(r, e)
 }
@@ -350,7 +350,7 @@ fun rewriteTyApp(r : Rewriter, e : Core, fn : Core,
                  args : Array Ty.Type) -> Core {
     let resolved = Array.map(args, rTy(r, _))
     match fn.kind {
-        CVar(name) -> match instantiate(r, name, resolved, e) {
+        CVar(name, id) -> match instantiate(r, name, id, resolved, e) {
             Some(made) -> return made
             None -> {}
         }
@@ -360,7 +360,9 @@ fun rewriteTyApp(r : Rewriter, e : Core, fn : Core,
 }
 
 -- The specialized name for a use, or `None` to leave it generic.
-fun instantiate(r : Rewriter, given : String, args : Array Ty.Type,
+-- A specialization keeps the id of the binding it specializes, as every
+-- respelling in this pass does: it is the spelling that tells copies apart.
+fun instantiate(r : Rewriter, given : String, id : Int, args : Array Ty.Type,
                 e : Core) -> Option Core {
     let name = Map.getOr(r.rename, given, given)
     for a in args {
@@ -368,7 +370,7 @@ fun instantiate(r : Rewriter, given : String, args : Array Ty.Type,
     }
     match localNamed(r, name) {
         Some(local) -> return Some(mkCore(rTy(r, e.ty), e.span,
-            CVar(localInst(r, name, local, args))))
+            CVar(localInst(r, name, local, args), id)))
         None -> {}
     }
     let b = match Map.get(r.owner.generic, name) {
@@ -377,7 +379,7 @@ fun instantiate(r : Rewriter, given : String, args : Array Ty.Type,
     }
     if len(b.binders) != len(args) { return None }
     match request(r.owner, b, args, None) {
-        Some(made) -> Some(mkCore(rTy(r, e.ty), e.span, CVar(made)))
+        Some(made) -> Some(mkCore(rTy(r, e.ty), e.span, CVar(made, id)))
         None -> None
     }
 }
@@ -411,10 +413,11 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
         }
         _ -> {}
     }
-    let given = match head.kind {
-        CVar(n) -> n
+    let named = match head.kind {
+        CVar(n, i) -> (n, i)
         _ -> return None
     }
+    let (given, id) = named
     let name = Map.getOr(r.rename, given, given)
     let b = match Map.get(r.owner.byname, name) {
         Some(x) -> x
@@ -444,17 +447,17 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
     }
     let ty = rTy(r, e.ty)
     let promoted = promotedBinders(b, Some(supplied))
-    if len(promoted) == 0 { return Some(mkCore(ty, e.span, CVar(made))) }
+    if len(promoted) == 0 { return Some(mkCore(ty, e.span, CVar(made, id))) }
     -- The copy states the abstraction; this site is where the *value* of it was
     -- expected, so it is restated here as the eta-expansion it is.
     let types = Array.map(promoted, TVar)
     Some(mkCore(ty, e.span, CTyLam(promoted,
-        mkCore(ty, e.span, CTyApp(mkCore(ty, e.span, CVar(made)), types)))))
+        mkCore(ty, e.span, CTyApp(mkCore(ty, e.span, CVar(made, id)), types)))))
 }
 
 -- The top-level dictionary this expression names, or `None`.
 fun globalDict(r : Rewriter, e : Core) -> Option String = match e.kind {
-    CVar(given) -> {
+    CVar(given, _) -> {
         let name = Map.getOr(r.aliases, given, given)
         if Set.contains(r.owner.topDicts, name) { Some(name) } else { None }
     }
@@ -489,7 +492,7 @@ fun localInst(r : Rewriter, name : String, local : Local,
 fun argsKey(args : Array Ty.Type) -> String =
     String.join(Array.map(args, Ty.typeKey), "|")
 
-fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
+fun rewriteLet(r : Rewriter, e : Core, name : String, id : Int, bound : Ty.Type,
                value : Core, body : Core, binders : Vec VarCell) -> Core {
     if len(binders) == 0 {
         -- Written out rather than left to `generic`, because the alias has to be
@@ -506,7 +509,7 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
         if had { Map.put(r.aliases, name, saved) }
         else { discard(Map.delete(r.aliases, name)) }
         return mkCore(rTy(r, e.ty), e.span,
-                      CLet(name, rTy(r, bound), v, b, []))
+                      CLet(name, id, rTy(r, bound), v, b, []))
     }
     let local = newLocal(binders)
     let scope = Map.new()
@@ -518,7 +521,7 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
     var out = b
     for var i = len(made) - 1; i >= 0; i = i - 1 {
         let (n, v) = made[i]
-        out = mkCore(rTy(r, e.ty), e.span, CLet(n, v.ty, v, out, []))
+        out = mkCore(rTy(r, e.ty), e.span, CLet(n, id, v.ty, v, out, []))
     }
     -- The generic binding stays, outermost, so that a use this pass could not
     -- specialize -- a capped one, or one under a variable that is not this
@@ -526,7 +529,7 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
     -- costs an allocation and nothing else, and reachability removes it when
     -- nothing reads it.
     mkCore(rTy(r, e.ty), e.span,
-           CLet(name, rTy(r, bound), rewrite(r, value), out, binders))
+           CLet(name, id, rTy(r, bound), rewrite(r, value), out, binders))
 }
 
 -- Build every instantiation of one local binding, including the ones discovered
@@ -605,7 +608,7 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
                                     orig.equations)
             sub.rename = r.rename
             let b = CBind {
-                name = name, ty = rTy(sub, orig.ty), binders = [],
+                name = name, id = orig.id, ty = rTy(sub, orig.ty), binders = [],
                 value = rewrite(sub, orig.value), span = orig.span,
                 mutable = False, module_ = orig.module_,
                 equations = sub.equations, layouts = orig.layouts,
@@ -622,7 +625,7 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
 fun rewriteBind(r : Rewriter, b : CBind) -> CBind {
     if len(b.equations) == 0 {
         return CBind {
-            name = b.name, ty = rTy(r, b.ty), binders = b.binders,
+            name = b.name, id = b.id, ty = rTy(r, b.ty), binders = b.binders,
             value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
             module_ = b.module_, equations = b.equations,
             layouts = b.layouts,
@@ -631,7 +634,7 @@ fun rewriteBind(r : Rewriter, b : CBind) -> CBind {
     let sub = childRewriter(r, r.subst, b.equations)
     sub.rename = r.rename
     CBind {
-        name = b.name, ty = rTy(sub, b.ty), binders = b.binders,
+        name = b.name, id = b.id, ty = rTy(sub, b.ty), binders = b.binders,
         value = rewrite(sub, b.value), span = b.span, mutable = b.mutable,
         module_ = b.module_, equations = sub.equations, layouts = b.layouts,
     }
@@ -705,7 +708,7 @@ fun runMono(m : Mono) -> CProgram {
 fun rewriteTop(m : Mono, b : CBind) -> CBind {
     let r = newRewriter(m, Map.new(), b.equations, None)
     CBind {
-        name = b.name, ty = b.ty, binders = b.binders,
+        name = b.name, id = b.id, ty = b.ty, binders = b.binders,
         value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
         module_ = b.module_, equations = b.equations,
         layouts = b.layouts,
@@ -809,7 +812,7 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
         }
     }
     CBind {
-        name = name, ty = ty, binders = binders, value = rewrite(r, value),
+        name = name, id = b.id, ty = ty, binders = binders, value = rewrite(r, value),
         span = b.span, mutable = b.mutable, module_ = b.module_,
         equations = r.equations, layouts = b.layouts,
     }
@@ -876,7 +879,7 @@ fun reduceBind(b : CBind, fams : Option Ty.Families) -> CBind {
 }
 
 fun rewriteValue(b : CBind, value : Core) -> CBind = CBind {
-    name = b.name, ty = b.ty, binders = b.binders, value = value,
+    name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
     equations = b.equations, layouts = b.layouts,
 }
@@ -1030,7 +1033,7 @@ fun runDevirt(d : Devirt) -> CProgram {
 }
 
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
-    name = b.name, ty = b.ty, binders = b.binders, value = value,
+    name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
     equations = b.equations, layouts = b.layouts,
 }
@@ -1108,18 +1111,18 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
                CLam(params, inner, made))
     }
     Vec.push(d.hoisted, CBind {
-        name = made, ty = body.ty, binders = binders, value = body,
+        name = made, id = noId, ty = body.ty, binders = binders, value = body,
         span = owner.span, mutable = False, module_ = owner.module_,
         equations = Vec.slice(owner.equations, 0, len(owner.equations)),
         layouts = Map.new(),
     })
-    let head = mkCore(body.ty, value.span, CVar(made))
+    let head = mkCore(body.ty, value.span, CVar(made, noId))
     let applied = if len(binders) == 0 { head } else {
         mkCore(body.ty, value.span, CTyApp(head, Array.map(binders, TVar)))
     }
     let reference = if len(params) == 0 { applied } else {
         mkCore(inner.ty, value.span, CApp(applied,
-            Array.map(params, fun(p) = mkCore(p.ty, value.span, CVar(p.name)))))
+            Array.map(params, fun(p) = mkCore(p.ty, value.span, CVar(p.name, p.id)))))
     }
     -- A method that states its own quantification keeps stating it.
     match value.kind {
@@ -1442,7 +1445,7 @@ fun typeApplications(e : Core) -> Vec (String, Array Ty.Type) {
 fun collectTypeApplications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
     match e.kind {
         CTyApp(fn, types) -> match fn.kind {
-            CVar(name) -> Vec.push(out, (name, types))
+            CVar(name, _) -> Vec.push(out, (name, types))
             _ -> {}
         }
         _ -> {}

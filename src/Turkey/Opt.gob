@@ -367,12 +367,12 @@ type Reducer = Reducer {
     finished : fun(Int) -> Done,
 }
 
--- Where the binders a reduction makes are minted (`mint`): into `owner`, the
--- component's own owner in `table`, or while `bodyOf` reduces a callee, as
--- unrecorded ids in `scratch`, numbered from `next`.
+-- Where the binders a reduction makes are numbered (`mint`): in `owner`, the
+-- component's own, from `count`, or while `bodyOf` reduces a callee, in
+-- `scratch`, from `next`.
 type Minting = Minting {
-    table        : Binders.Table,
     owner        : Int,
+    var count    : Int,
     scratch      : Int,
     var template : Bool,
     var next     : Int,
@@ -445,7 +445,7 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         run = run, reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written,
         minting = Minting {
-            table = table, owner = -1,
+            owner = -1, count = 0,
             scratch = Binders.owner(table, "", "the bodies Turkey.Opt copies"),
             template = False, next = 0,
         },
@@ -465,8 +465,8 @@ fun forComponent(base : Reducer, c : Int, owner : Int, finished : fun(Int) -> Do
     ends = Map.new(), cache = cache, run = base.run, reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     minting = Minting {
-        table = base.minting.table, owner = owner, scratch = base.minting.scratch,
-        template = False, next = 0,
+        owner = owner, count = 0, scratch = base.minting.scratch, template = False,
+        next = 0,
     },
     homes = base.homes, component = c, finished = finished,
 }
@@ -887,37 +887,32 @@ fun knownCondition(d : DeclTable, e : Core) -> Option Core = match e.kind {
 -- Returns a new binder, as its spelling and its id. The spelling is the same
 -- for every binder made with `hint`; the id tells them apart.
 fun fresh(r : Reducer, hint : String) -> (String, Int) {
-    let name = "%" + hint
-    (name, mint(r, name, Synthesized(None)))
+    ("%" + hint, mint(r))
 }
 
--- Returns the id of a new binder spelled `name`, made as `origin` says.
+-- Returns the id of a new binder.
 --
--- A component's reducer mints into an owner of its own, which `reduceProgram`
--- registered before any component started, and one worker reduces the whole
--- component in order. So the ids it mints are a function of the component
--- alone, whichever worker runs it and whatever else that worker reduced
--- first. A body `bodyOf` reduces is numbered from 0 in `scratch` instead:
--- such a body is cached on a worker, so the component that asks for it first
--- varies from run to run, and minting it into that component's owner would
--- make the component's later ids vary too.
-fun mint(r : Reducer, name : String, origin : Origin) -> Int {
+-- A component's reducer numbers its binders in an owner of its own, which
+-- `reduceProgram` registered before any component started, and one worker
+-- reduces the whole component in order. So the ids it mints are a function of
+-- the component alone, whichever worker runs it and whatever else that worker
+-- reduced first. A body `bodyOf` reduces is numbered from 0 in `scratch`
+-- instead: such a body is cached on a worker, so the component that asks for
+-- it first varies from run to run, and numbering it in that component's owner
+-- would make the component's later ids vary too.
+--
+-- No id minted here is recorded in the table (`Binders.unrecorded`). Most are
+-- copies, the self-compile makes millions, and nothing after this pass reads
+-- their records: recording them doubled the compiler's peak heap.
+fun mint(r : Reducer) -> Int {
     let m = r.minting
     if m.template {
-        let id = Binders.unrecorded(m.scratch, m.next)
         m.next = m.next + 1
-        return id
+        return Binders.unrecorded(m.scratch, m.next - 1)
     }
-    Binders.fresh(m.table, m.owner, name, Binders.Local, origin)
+    m.count = m.count + 1
+    Binders.unrecorded(m.owner, m.count - 1)
 }
-
--- Returns a fresh id for a copy of the binder spelled `name` with the id `id`.
-fun mintCopy(r : Reducer, name : String, id : Int) -> Int =
-    mint(r, name, if !r.minting.template && Binders.recorded(r.minting.table, id) {
-        CopyOf(id)
-    } else {
-        Synthesized(None)
-    })
 
 -- -- the reductions --------------------------------------------------------------------
 
@@ -2054,7 +2049,7 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
             let bound = match how {
                 Moving -> (names[i], ids[i])
                 _ -> {
-                    let made = (names[i], mintCopy(r, names[i], ids[i]))
+                    let made = (names[i], mint(r))
                     Map.put(renamed, ids[i], made)
                     made
                 }
@@ -2064,8 +2059,8 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     }
     var out = match how {
         Moving -> if len(subst) == 0 { body } else { moved(r, body, subst) }
-        Copying -> copyWith(fun(n, i) = mintCopy(r, n, i), body, subst, renamed, True, None)
-        Inlined(span) -> copyWith(fun(n, i) = mintCopy(r, n, i), body, subst, renamed, True, Some(span))
+        Copying -> copyWith(fun() = mint(r), body, subst, renamed, True, None)
+        Inlined(span) -> copyWith(fun() = mint(r), body, subst, renamed, True, Some(span))
     }
     for var i = len(lets) - 1; i >= 0; i = i - 1 {
         let ((name, id), arg) = lets[i]
@@ -2138,7 +2133,7 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
 -- Returns a copy of `alts` in which every binder has a fresh id, for a rule
 -- that puts them in more than one place.
 fun copyAlts(r : Reducer, alts : Vec CAlt) -> Vec CAlt {
-    let c = copier(fun(n, i) = mintCopy(r, n, i), Map.new(), Map.new(), True, None)
+    let c = copier(fun() = mint(r), Map.new(), Map.new(), True, None)
     Vec.map(alts, fun(a) = CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) })
 }
 
@@ -2146,12 +2141,11 @@ fun copyAlts(r : Reducer, alts : Vec CAlt) -> Vec CAlt {
 -- term, for a body that moves: its binders are bound nowhere else, so they
 -- keep their ids.
 fun moved(r : Reducer, body : Core, subst : Map Int Core) -> Core =
-    copyWith(fun(n, i) = mintCopy(r, n, i), body, subst, Map.new(), False, None)
+    copyWith(fun() = mint(r), body, subst, Map.new(), False, None)
 
 type Copier = Copier {
-    -- Returns the id of a fresh binder for a copy of the binder spelled so,
-    -- with the id.
-    mint : fun(String, Int) -> Int,
+    -- Returns the id of a fresh binder.
+    mint : fun() -> Int,
     -- What each binder becomes, as its spelling and id, by its id: met by the
     -- copy, or given beforehand.
     renamed : Map Int (String, Int),
@@ -2167,7 +2161,7 @@ type Copier = Copier {
     var changed : Int,
 }
 
-fun copier(mint : fun(String, Int) -> Int, subst : Map Int Core,
+fun copier(mint : fun() -> Int, subst : Map Int Core,
            renamed : Map Int (String, Int), freshen : Bool,
            rebase : Option (Option Span)) -> Copier = Copier {
     mint = mint, renamed = renamed, subst = subst, freshen = freshen,
@@ -2181,7 +2175,7 @@ fun copier(mint : fun(String, Int) -> Int, subst : Map Int Core,
 --
 -- Every rule that puts a second copy of a term into the program makes it
 -- here, which is what keeps each binder id bound once.
-fun copyWith(mint : fun(String, Int) -> Int, body : Core, subst : Map Int Core,
+fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
              renamed : Map Int (String, Int), freshen : Bool,
              rebase : Option (Option Span)) -> Core =
     copyTerm(copier(mint, subst, renamed, freshen, rebase), body)
@@ -2279,7 +2273,7 @@ fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {
     -- Under `noId`, every reference to a top-level binding without an id
     -- would be renamed to this binder.
     if id == noId { oops("the binder '" + name + "' has no id") }
-    let made = (name, c.mint(name, id))
+    let made = (name, c.mint())
     Map.put(c.renamed, id, made)
     c.changed = c.changed + 1
     made
@@ -2514,7 +2508,7 @@ fun respell(b : CBind) -> CBind {
         }
     }
     if len(renamed) == 0 { return b }
-    withValue(b, copyWith(fun(_, _) = oops("respell mints nothing"), b.value, Map.new(),
+    withValue(b, copyWith(fun() = oops("respell mints nothing"), b.value, Map.new(),
                           renamed, False, None))
 }
 

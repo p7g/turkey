@@ -1,0 +1,132 @@
+export (
+    Events, events, recorder, recorded, withServer, send, sendAll, readAll, readUntil, visible, shown, elapsedWithin,
+)
+
+-- A client's side of the server's tests: raw bytes written to a `Net.Memory`
+-- connection and what comes back, printed with the parts that change from
+-- run to run (the `Date` field) taken out.
+
+import Net (shutdownWrite, close)
+import Net.HTTP (..)
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Config, ServerEvent, Respond, Done)
+import Net.Memory as Memory
+import System.IO as IO
+import System.IO (Read(..), Write(..), IOError(..))
+import System.Sync as Sync
+import System.Sync (Mutex)
+import System.Task as Task
+import Time.Clock as Clock
+import Time.Duration as Duration (Duration)
+
+-- What a server reported to `onError`, in the order it did.
+type Events = Events { seen : Mutex (Vec String) }
+
+fun events() -> Events = Events { seen = Sync.mutex([]) }
+
+fun recorder(e : Events) -> fun(ServerEvent) -> Unit = fun(event) {
+    let text = show(event)
+    Sync.withLock(e.seen, fun(v : Vec String) = Vec.push(v, text))
+}
+
+fun recorded(e : Events) -> Array String = Sync.withLock(e.seen, fun(v : Vec String) = Vec.toArray(v))
+
+-- Runs a server of `handler` on an in-memory listener, calls `client` with
+-- the listener, then stops the server and waits for it. Returns what
+-- `client` returned.
+fun withServer(config : Config, handler : fun(Request Incoming, Respond) -> Done,
+               client : fun(Memory.Listener) -> String) -> String {
+    let l = Memory.listener(65536)
+    Task.runScope(do {
+        let server = Server.start(l, config, handler)?
+        let out = client(l)
+        Server.stop(server, Duration.seconds(5))
+        Server.wait(server)
+        pure(out)
+    })
+}
+
+-- Connects to `l`, writes `request`, shuts down writing, and returns all
+-- that comes back until the server closes.
+fun send(l : Memory.Listener, request : String) -> String = sendAll(l, [request])
+
+fun sendAll(l : Memory.Listener, pieces : Array String) -> String {
+    let c = match Memory.connect(l) {
+        Right(c) -> c
+        Left(e) -> return "connect: " + show(e)
+    }
+    for piece in pieces {
+        if let Left(e) = IO.writeText(c, piece) { return "write: " + show(e) }
+    }
+    let _ = shutdownWrite(c)
+    let out = readAll(c)
+    let _ = close(c)
+    out
+}
+
+-- Returns what `c` reads until its end, and how it ended if not cleanly.
+fun readAll[Read r, Show (ReadError r)](c : r) -> String {
+    let got = []
+    let buf = IO.buffer(4096)
+    loop {
+        IO.clear(buf)
+        match readInto(c, buf) {
+            Right(0) -> break
+            Right(_) -> for b in IO.bytes(buf) { Vec.push(got, b) }
+            Left(e) -> {
+                for b in String.toBytes(" <" + show(e) + ">") { Vec.push(got, b) }
+                break
+            }
+        }
+    }
+    String.fromBytesLossy(Vec.toArray(got))
+}
+
+-- Returns what `c` reads until it has read `marker`, or its end.
+fun readUntil[Read r](c : r, marker : String) -> String {
+    let got = []
+    let one = IO.buffer(1)
+    loop {
+        IO.clear(one)
+        match readInto(c, one) {
+            Right(0) | Left(_) -> break
+            Right(_) -> for b in IO.bytes(one) { Vec.push(got, b) }
+        }
+        if String.endsWith(String.fromBytesLossy(Vec.toArray(got)), marker) { break }
+    }
+    String.fromBytesLossy(Vec.toArray(got))
+}
+
+-- Returns `s` with CR and LF spelled out, and every `Date` field's value
+-- replaced by `<date>`.
+fun visible(s : String) -> String {
+    var out = ""
+    var rest = s
+    loop {
+        match String.splitOnce(rest, "date: ") {
+            Some((before, after)) -> {
+                out = out + before + "date: <date>"
+                rest = match String.splitOnce(after, "\r\n") {
+                    Some((_, tail)) -> "\r\n" + tail
+                    None -> ""
+                }
+            }
+            None -> {
+                out = out + rest
+                break
+            }
+        }
+    }
+    String.replace(String.replace(out, "\r", "\\r"), "\n", "\\n")
+}
+
+-- Prints `label` and the exchange's bytes, visible.
+fun shown(label : String, text : String) -> Unit = print(label + ": " + visible(text))
+
+-- Returns whether `f` ran for at least `least` and at most `most`.
+fun elapsedWithin(f : fun() -> Unit, least : Duration, most : Duration) -> Bool {
+    let from = Clock.monotonic()
+    f()
+    let took = Clock.between(from, Clock.monotonic())
+    took >= least && took <= most
+}

@@ -1,0 +1,637 @@
+-- The HTTP/1 server, over in-memory connections and once over loopback TCP:
+-- routing, HEAD, request bodies and `100 Continue`, informational
+-- responses, trailers, a body read while the response is written, draining
+-- and the lingering close, the time limits, failures before and after the
+-- commit point, background work, and a graceful stop.
+
+import Client (..)
+import Net (ConnectionInfo(..), TLSInfo, shutdownWrite, close)
+import Net.HTTP (..)
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.Headers as Headers
+import Net.HTTP.Limits as Limits
+import Net.HTTP.MediaType as MediaType
+import Net.HTTP.Method as Method
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Config, Respond, Done, respond, inform, failed, background, setStall)
+import Net.HTTP.Status as Status
+import Net.HTTP.Token as Token
+import Net.Memory as Memory
+import Net.TCP as TCP
+import Net as Net
+import System.IO as IO
+import System.IO (Read(..), Write(..), IOError(..))
+import System.Sync as Sync
+import System.Task as Task
+import Time.Duration as Duration
+import Time.Sleep as Sleep
+
+-- An application's own error, whose `ToResponse` instance chooses the response
+-- each error becomes.
+type APIError = Missing | WrongMethod | BadBody(HTTPError)
+
+instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
+
+instance ToResponse APIError {
+    fun toResponse(e) = match e {
+        Missing -> statusOnly(NotFound)
+        WrongMethod -> body(MethodNotAllowed, MediaType.plainText, "use GET\n")
+        BadBody(TooLarge) -> body(ContentTooLarge, MediaType.plainText, "too large\n")
+        BadBody(other) -> body(BadRequest, MediaType.plainText, show(other) + "\n")
+    }
+}
+
+fun route(req : Request Incoming, r : Respond) -> Done = respond(r, api(req))
+
+fun text(s : String) -> ServerResponse = body(OK, MediaType.plainText, s)
+
+fun api(req : Request Incoming) -> Either APIError ServerResponse = match (req.method, req.target.path) {
+    (GET, "/health") | (HEAD, "/health") -> Right(body(OK, MediaType.plainText, "ok"))
+    (GET, "/json") -> Right(body(OK, MediaType.json, "{\"a\":1}"))
+    (GET, "/html") -> Right(withHeaders(body(OK, MediaType.plainText, "<p>hi</p>"), field(ContentType, MediaType.html)))
+    (GET, "/empty") -> Right(noContent())
+    (GET, "/cached") -> Right(notModified())
+    (GET, "/chunks") | (HEAD, "/chunks") -> Right(stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+        IO.writeText(sink, "one,")?
+        IO.writeText(sink, "two")?
+        Right(Headers.empty)
+    }))
+    (GET, "/sized") -> Right(stream(OK, MediaType.plainText, LengthKnown(5), fun(sink) {
+        IO.writeText(sink, "12345")?
+        Right(Headers.empty)
+    }))
+    (POST(content), "/echo") -> {
+        let got = receive(content, 16)?
+        Right(body(OK, MediaType.octetStream, got))
+    }
+    (POST(_), "/ignore") -> Right(body(OK, MediaType.plainText, "ignored"))
+    (GET, "/slow") -> {
+        Sleep.sleep(Duration.millis(300))
+        Right(body(OK, MediaType.plainText, "slow"))
+    }
+    (GET, "/abort") -> Right(stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+        IO.writeText(sink, "partial")?
+        flush(sink)?
+        Left(fail(Gone))
+    }))
+    (GET, "/big") -> Right(stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+        let chunk = filled(16384)
+        for _ in Int.range(0, 256) { writeFrom(sink, chunk)? }
+        Right(Headers.empty)
+    }))
+    (_, "/health") -> Left(WrongMethod)
+    _ -> Left(Missing)
+}
+
+-- What a stream's function fails with when its source goes away.
+type Gone = Gone
+
+instance Show Gone { fun show(g) = "Gone" }
+instance Error Gone { fun message(g) = "the source went away" }
+
+fun filled(n : Int) -> IO.Buffer {
+    let b = IO.buffer(n)
+    for _ in Int.range(0, n) { IO.push(b, String.toBytes("x")[0]) }
+    b
+}
+
+fun plain() -> Config = Server.defaultConfig
+
+fun reporting(es : Events) -> Config = Server.onError(recorder(es))
+
+fun limited(l : Limits, es : Events) -> Config = combine(Server.limits(l), reporting(es))
+
+fun connected(l : Memory.Listener) -> Memory.Pipe = match Memory.connect(l) {
+    Right(c) -> c
+    Left(e) -> error("connect: " + show(e))
+}
+
+fun get(path : String) -> String = "GET " + path + " HTTP/1.1\r\nHost: x\r\n\r\n"
+
+fun main() {
+    basics()
+    heads()
+    bodies()
+    informing()
+    trailing()
+    duplex()
+    connections()
+    refusals()
+    switching()
+    conversions()
+    respondingOnce()
+    limits()
+    aborts()
+    describing()
+    stopping()
+    loopback()
+}
+
+fun basics() {
+    print("-- routing and error responses")
+    let config = plain()
+    shown("GET", withServer(config, route, fun(l) = send(l, get("/health"))))
+    shown("json", withServer(config, route, fun(l) = send(l, get("/json"))))
+    shown("own content type", withServer(config, route, fun(l) = send(l, get("/html"))))
+    shown("204", withServer(config, route, fun(l) = send(l, get("/empty"))))
+    shown("304", withServer(config, route, fun(l) = send(l, get("/cached"))))
+    shown("not found", withServer(config, route, fun(l) = send(l, get("/nope"))))
+    shown("method", withServer(config, route, fun(l) = send(l, "DELETE /health HTTP/1.1\r\nHost: x\r\n\r\n")))
+    shown("chunked", withServer(config, route, fun(l) = send(l, get("/chunks"))))
+    shown("sized stream", withServer(config, route, fun(l) = send(l, get("/sized"))))
+}
+
+fun heads() {
+    print("-- HEAD")
+    let config = plain()
+    shown("HEAD", withServer(config, route, fun(l) = send(l, "HEAD /health HTTP/1.1\r\nHost: x\r\n\r\n")))
+    shown("HEAD of a stream", withServer(config, route, fun(l) = send(l, "HEAD /chunks HTTP/1.1\r\nHost: x\r\n\r\n")))
+    -- The handler sees HEAD as itself, and the stream's function is never
+    -- called.
+    var called = False
+    var seen = ""
+    let streaming = fun(req : Request Incoming, r : Respond) -> Done {
+        seen = Method.name(req.method)
+        respond(r, stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+            called = True
+            IO.writeText(sink, "body")?
+            Right(Headers.empty)
+        }))
+    }
+    shown("HEAD, own handler", withServer(config, streaming, fun(l) = send(l, "HEAD / HTTP/1.1\r\nHost: x\r\n\r\n")))
+    print("the handler saw " + seen + ", stream function called: " + show(called))
+}
+
+fun bodies() {
+    print("-- request bodies")
+    let config = plain()
+    shown("echo", withServer(config, route, fun(l) = send(l,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello")))
+    shown("chunked echo", withServer(config, route, fun(l) = send(l,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n")))
+    shown("declared too large", withServer(config, route, fun(l) = send(l,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 17\r\n\r\n12345678901234567")))
+    shown("chunked too large", withServer(config, route, fun(l) = send(l,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n11\r\n12345678901234567\r\n0\r\n\r\n")))
+
+    print("-- 100 Continue")
+    -- Within the limit: the server sends 100 from inside `receive`, and the
+    -- client sends the body only once it has read it.
+    shown("within the limit", withServer(config, route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+        let interim = readUntil(c, "\r\n\r\n")
+        let _ = IO.writeText(c, "hello")
+        let _ = shutdownWrite(c)
+        interim + readAll(c)
+    }))
+    -- Over it: 413 at once, with no 100, and the client never sends.
+    shown("over the limit", withServer(config, route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 50\r\nExpect: 100-continue\r\n\r\n")
+        let answer = readUntil(c, "too large\n")
+        let _ = shutdownWrite(c)
+        answer + " | then " + readAll(c)
+    }))
+    -- A handler that sends 100 itself, as a proxy relaying its upstream's
+    -- does, and then reads: one 100 reaches the client, not two.
+    let relaying = fun(req : Request Incoming, r : Respond) -> Done = match req.method {
+        POST(content) -> {
+            if let Left(e) = inform(r, Continue, Headers.empty) { return failed(r, e) }
+            respond(r, match (receive(content, 16) : Either HTTPError IO.Buffer) {
+                Right(got) -> body(OK, MediaType.octetStream, got)
+                Left(e) -> body(BadRequest, MediaType.plainText, show(e))
+            })
+        }
+        _ -> respond(r, MethodNotAllowed)
+    }
+    shown("100 sent by the handler", withServer(config, relaying, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nExpect: 100-continue\r\n\r\n")
+        let interim = readUntil(c, "\r\n\r\n")
+        let _ = IO.writeText(c, "ok")
+        let _ = shutdownWrite(c)
+        interim + readAll(c)
+    }))
+}
+
+fun informing() {
+    print("-- informational responses")
+    let es = events()
+    let hints = fun(req : Request Incoming, r : Respond) -> Done {
+        let link = Headers.field(HeaderName.literal("link"), HeaderValue.literal("</style.css>; rel=preload"))
+        if let Left(e) = inform(r, EarlyHints, link) { return failed(r, e) }
+        if let Left(e) = inform(r, Option.expect(Status.fromCode(104), "104"), Headers.empty) { return failed(r, e) }
+        let done = respond(r, text("page"))
+        let late = match inform(r, EarlyHints, Headers.empty) {
+            Left(e) -> "refused, " + show(e)
+            Right(_) -> "sent"
+        }
+        print("inform after respond: " + late)
+        done
+    }
+    shown("103 and 104", withServer(reporting(es), hints, fun(l) = send(l, get("/"))))
+    shown("to HTTP/1.0", withServer(reporting(es), hints, fun(l) = send(l, "GET / HTTP/1.0\r\n\r\n")))
+    for e in recorded(es) { print("event: " + e) }
+}
+
+fun trailing() {
+    print("-- trailers")
+    let es = events()
+    let checksum = Headers.field(HeaderName.literal("x-checksum"), HeaderValue.literal("abc"))
+    let trailed = fun(req : Request Incoming, r : Respond) -> Done {
+        let length = if req.target.path == "/known" { LengthKnown(5) } else { LengthUnknown }
+        let note = "TE trailers: " + show(acceptsTrailers(req))
+        let response = stream(OK, MediaType.plainText, length, fun(sink) {
+            IO.writeText(sink, "hello")?
+            Right(checksum)
+        })
+        respond(r, withHeaders(response, field(HeaderName.literal("x-note"), HeaderValue.literal(note))))
+    }
+    shown("chunked", withServer(reporting(es), trailed, fun(l) = send(l,
+        "GET / HTTP/1.1\r\nHost: x\r\nTE: trailers\r\nConnection: TE\r\n\r\n")))
+    shown("known length", withServer(reporting(es), trailed, fun(l) = send(l, get("/known"))))
+    for e in recorded(es) { print("event: " + e) }
+
+    -- A request's trailers, once its body has been read.
+    let reading = fun(req : Request Incoming, r : Respond) -> Done = match req.method {
+        POST(content) -> {
+            let before = show(Option.map(trailers(content), Headers.size))
+            let _ : Either HTTPError IO.Buffer = receive(content, 100)
+            respond(r, text("before " + before + ", after " + show(Option.map(trailers(content), Headers.fields))))
+        }
+        _ -> respond(r, MethodNotAllowed)
+    }
+    shown("request trailers", withServer(plain(), reading, fun(l) = send(l,
+        "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Sum: 7\r\n\r\n")))
+}
+
+fun duplex() {
+    print("-- the body read while the response is written")
+    -- The stream's function echoes the request body as it reads it, so the
+    -- client must send and read at once: more than both directions hold.
+    let echo = fun(req : Request Incoming, r : Respond) -> Done = match req.method {
+        POST(content) -> respond(r, stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+            let from = unbounded(content)
+            let buf = IO.buffer(4096)
+            loop {
+                IO.clear(buf)
+                let n = Either.mapLeft(readInto(from, buf), fun(e) = fail(e))?
+                if n == 0 { break }
+                writeFrom(sink, buf)?
+            }
+            Right(Headers.empty)
+        }))
+        _ -> respond(r, MethodNotAllowed)
+    }
+    let size = 1048576
+    print(withServer(plain(), echo, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: " + show(size) + "\r\n\r\n")
+        let (wrote, answer) = Task.runScope(do {
+            let writer = Task.spawn(fun() = writeMany(c, size))?
+            let answer = readAll(c)
+            pure((writer, answer))
+        })
+        "echoed: " + Task.join(wrote) + ", read " + show(String.byteLength(answer) > size) + " bytes past the body"
+    }))
+    -- A large body to a handler that responds before reading it: the server
+    -- responds, then lingers, discarding, so the client's writes go through
+    -- and it reads the whole response.
+    print(withServer(plain(), route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: " + show(size) + "\r\n\r\n")
+        let (wrote, answer) = Task.runScope(do {
+            let writer = Task.spawn(fun() = writeMany(c, size))?
+            let answer = readAll(c)
+            pure((writer, answer))
+        })
+        "responded first: " + Task.join(wrote) + ", read " + visible(answer)
+    }))
+}
+
+-- Writes `size` bytes to `c` and shuts down its writing.
+fun writeMany(c : Memory.Pipe, size : Int) -> String {
+    let chunk = filled(16384)
+    var sent = 0
+    while sent < size {
+        if let Left(e) = writeFrom(c, chunk) { return "write failed: " + show(e) }
+        sent = sent + 16384
+    }
+    let _ = shutdownWrite(c)
+    "wrote it all"
+}
+
+fun connections() {
+    print("-- keeping connections")
+    let config = plain()
+    shown("pipelined", withServer(config, route, fun(l) = send(l, get("/health") + get("/json"))))
+    shown("HTTP/1.0", withServer(config, route, fun(l) = send(l, "GET /chunks HTTP/1.0\r\n\r\nGET /health HTTP/1.0\r\n\r\n")))
+    shown("Connection: close", withServer(config, route, fun(l) = send(l,
+        "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n" + get("/json"))))
+
+    print("-- draining")
+    -- An unread body within the drain cap is discarded, and the next request
+    -- is served on the same connection.
+    shown("within the cap", withServer(config, route, fun(l) = send(l,
+        "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789" + get("/health"))))
+    shown("chunked within the cap", withServer(config, route, fun(l) = send(l,
+        "POST /ignore HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n" + get("/health"))))
+    -- Over it: the response says close, and nothing after it is served.
+    let small = Server.limits(Limits.drainBytes(4))
+    shown("over the cap", withServer(small, route, fun(l) = send(l,
+        "POST /ignore HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n0123456789" + get("/health"))))
+}
+
+fun refusals() {
+    print("-- refused requests")
+    let es = events()
+    let config = reporting(es)
+    shown("malformed", withServer(config, route, fun(l) = send(l, "GET /health HTTP/1.1\r\nHost : x\r\n\r\n")))
+    shown("no Host", withServer(config, route, fun(l) = send(l, "GET /health HTTP/1.1\r\n\r\n")))
+    shown("HTTP/2", withServer(config, route, fun(l) = send(l, "GET /health HTTP/2.0\r\nHost: x\r\n\r\n")))
+    shown("unknown coding", withServer(config, route, fun(l) = send(l,
+        "POST /echo HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: gzip, chunked\r\n\r\n")))
+    shown("head too large", withServer(config, route, fun(l) = send(l,
+        "GET /health HTTP/1.1\r\nHost: x\r\nX: " + String.repeat("a", 20000) + "\r\n\r\n")))
+    for e in recorded(es) { print("event: " + e) }
+}
+
+fun switching() {
+    print("-- switching protocols")
+    let es = events()
+    let echo = fun(req : Request Incoming, r : Respond) -> Done {
+        print("offered: " + show(upgradeRequested(req)))
+        respond(r, switch(Token.literal("echo"), Headers.empty, fun(d) {
+            let line = readUntil(d, "\n")
+            IO.writeText(d, "echo: " + line)?
+            flush(d)?
+            shutdownWrite(d)
+        }))
+    }
+    shown("offered", withServer(reporting(es), echo, fun(l) = send(l,
+        "GET /chat HTTP/1.1\r\nHost: x\r\nConnection: upgrade\r\nUpgrade: other, Echo\r\n\r\nhi\n")))
+    shown("not offered", withServer(reporting(es), echo, fun(l) = send(l, get("/chat"))))
+    for e in recorded(es) { print("event: " + e) }
+}
+
+fun conversions() {
+    print("-- conversions to a response")
+    let config = plain()
+    let greeting = fun(req : Request Incoming, r : Respond) -> Done = respond(r, text("hello"))
+    shown("ServerResponse", withServer(config, greeting, fun(l) = send(l, get("/"))))
+    let accepted = fun(req : Request Incoming, r : Respond) -> Done = respond(r, Accepted)
+    shown("Status", withServer(config, accepted, fun(l) = send(l, get("/"))))
+    let either = fun(req : Request Incoming, r : Respond) -> Done =
+        respond(r, if req.target.path == "/yes" { Right(text("yes")) } else { Left(Forbidden) })
+    shown("Either", withServer(config, either, fun(l) = send(l, get("/yes") + get("/no"))))
+}
+
+fun respondingOnce() {
+    print("-- responding once")
+    let es = events()
+    -- A second `respond` sends nothing.
+    let twice = fun(req : Request Incoming, r : Respond) -> Done {
+        let _ = respond(r, text("first"))
+        respond(r, body(Created, MediaType.plainText, "second"))
+    }
+    shown("twice", withServer(reporting(es), twice, fun(l) = send(l, get("/"))))
+    -- `failed` before anything is sent sends a 502.
+    let upstreamDown = fun(req : Request Incoming, r : Respond) -> Done = failed(r, Truncated)
+    shown("failed first", withServer(reporting(es), upstreamDown, fun(l) = send(l, get("/") + get("/"))))
+    -- Once the head is sent, it closes the connection: the chunked body
+    -- has no last chunk, so the client can tell it was cut short, and the
+    -- next request is not read.
+    let midway = fun(req : Request Incoming, r : Respond) -> Done = respond(r, stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+        IO.writeText(sink, "partial")?
+        flush(sink)?
+        let _ = failed(r, Truncated)
+        Right(Headers.empty)
+    }))
+    shown("failed after", withServer(reporting(es), midway, fun(l) = send(l, get("/") + get("/"))))
+    for e in recorded(es) { print("event: " + e) }
+}
+
+fun limits() {
+    print("-- time limits")
+    let es = events()
+    -- Slowloris: a head dripped a byte at a time is cut off at the head
+    -- deadline, however steadily the bytes come.
+    print(withServer(limited(Limits.headTimeout(Duration.millis(300)), es), route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, "GET /health HTTP/1.1\r\nHost: x\r\n")
+        let (dripped, closedInTime) = Task.runScope(do {
+            let dripper = Task.spawn(fun() {
+                for _ in Int.range(0, 100) {
+                    if let Left(_) = IO.writeText(c, "X") { return "the server closed the connection" }
+                    Sleep.sleep(Duration.millis(50))
+                }
+                "never closed"
+            })?
+            let inTime = elapsedWithin(fun() { let _ = readAll(c) }, Duration.millis(250), Duration.seconds(3))
+            pure((dripper, inTime))
+        })
+        "slowloris: " + Task.join(dripped) + ", in time: " + show(closedInTime)
+    }))
+    for e in recorded(es) { print("event: " + e) }
+
+    -- Stall: a client that stops reading the response is cut off once a
+    -- write has made no progress for the stall limit.
+    let stalled = events()
+    let stall = limited(Limits.stall(Duration.millis(300)), stalled)
+    print(withServer(stall, route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, get("/big"))
+        Sleep.sleep(Duration.millis(1500))
+        let got = readAll(c)
+        "stall: read " + show(String.byteLength(got) < 4194304) + " short of the body"
+    }))
+    for e in recorded(stalled) { print("event: " + e) }
+
+    -- A handler that is quiet for longer than the stall limit is not cut:
+    -- nothing was waiting on the client.
+    let quietStream = fun(req : Request Incoming, r : Respond) -> Done = respond(r, stream(OK, MediaType.plainText, LengthUnknown, fun(sink) {
+        IO.writeText(sink, "tick,")?
+        flush(sink)?
+        Sleep.sleep(Duration.millis(700))
+        IO.writeText(sink, "tock")?
+        Right(Headers.empty)
+    }))
+    let calm = events()
+    shown("quiet stream", withServer(limited(Limits.stall(Duration.millis(300)), calm), quietStream,
+                                     fun(l) = send(l, get("/"))))
+    print("events: " + show(len(recorded(calm))))
+
+    -- A request may set its own stall limit, for a client known to be slow.
+    let patient = fun(req : Request Incoming, r : Respond) -> Done {
+        setStall(r, Duration.seconds(5))
+        route(req, r)
+    }
+    print(withServer(stall, patient, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, get("/big"))
+        Sleep.sleep(Duration.millis(1000))
+        let got = readAll(c)
+        "own stall limit: read " + show(String.byteLength(got) > 4194304) + " past the body"
+    }))
+
+    -- Idle: a kept-alive connection with no next request is closed, quietly.
+    let quiet = events()
+    print(withServer(limited(Limits.idleTimeout(Duration.millis(200)), quiet), route, fun(l) {
+        let c = connected(l)
+        let _ = IO.writeText(c, get("/health"))
+        let first = readUntil(c, "ok")
+        let inTime = elapsedWithin(fun() { let _ = readAll(c) }, Duration.millis(150), Duration.seconds(3))
+        "idle: responded " + show(String.endsWith(first, "ok")) + ", then closed in time: " + show(inTime)
+    }))
+    print("events: " + show(len(recorded(quiet))))
+
+    -- The connection cap: a second connection waits until the first ends.
+    print(withServer(Server.limits(Limits.connections(1)), route, fun(l) {
+        let (first, second) = Task.runScope(do {
+            let a = Task.spawn(fun() = send(l, get("/slow")))?
+            Sleep.sleep(Duration.millis(50))
+            let b = Task.spawn(fun() {
+                var answer = ""
+                let waited = elapsedWithin(fun() { answer = send(l, get("/health")) },
+                                           Duration.millis(200), Duration.seconds(3))
+                (waited, String.endsWith(answer, "ok"))
+            })?
+            pure((a, b))
+        })
+        let (waited, responded) = Task.join(second)
+        "cap: first " + show(String.endsWith(Task.join(first), "slow")) + ", second waited " + show(waited)
+            + " and got a response " + show(responded)
+    }))
+}
+
+fun aborts() {
+    print("-- failures after the commit point")
+    let es = events()
+    let config = reporting(es)
+    -- The chunked body is left without its last chunk, so the client can
+    -- tell it was cut short.
+    shown("aborted stream", withServer(config, route, fun(l) = send(l, get("/abort"))))
+    let overrun = fun(req : Request Incoming, r : Respond) -> Done = respond(r, stream(OK, MediaType.plainText, LengthKnown(3), fun(sink) {
+        IO.writeText(sink, "12345")?
+        Right(Headers.empty)
+    }))
+    shown("overrun", withServer(config, overrun, fun(l) = send(l, get("/"))))
+    let short = fun(req : Request Incoming, r : Respond) -> Done = respond(r, stream(OK, MediaType.plainText, LengthKnown(10), fun(sink) {
+        IO.writeText(sink, "12345")?
+        Right(Headers.empty)
+    }))
+    shown("short", withServer(config, short, fun(l) = send(l, get("/"))))
+    for e in recorded(es) { print("event: " + e) }
+}
+
+fun describing() {
+    print("-- the connection")
+    let where = fun(req : Request Incoming, r : Respond) -> Done {
+        let ConnectionInfo { local, peer, tls } = req.connection
+        respond(r, text("local " + show(Option.isSome(local)) + ", peer " + show(Option.isSome(peer)) + ", TLS "
+                        + show(Option.isSome(tls)) + ", host " + show(host(req))))
+    }
+    shown("in memory", withServer(plain(), where, fun(l) = send(l, get("/"))))
+}
+
+fun stopping() {
+    print("-- stopping")
+    let l = Memory.listener(65536)
+    let (busy, idle, stopped) = Task.runScope(do {
+        let server = Server.start(l, plain(), route)?
+        -- An idle kept-alive connection, and one with a request in flight.
+        let quiet = connected(l)
+        let _ = IO.writeText(quiet, get("/health"))
+        let _ = readUntil(quiet, "ok")
+        let working = connected(l)
+        let _ = IO.writeText(working, get("/slow"))
+        Sleep.sleep(Duration.millis(100))
+        let busy = Task.spawn(fun() = readAll(working))?
+        let idle = Task.spawn(fun() = readAll(quiet))?
+        Server.stop(server, Duration.seconds(5))
+        Server.wait(server)
+        pure((busy, idle, Memory.connect(l)))
+    })
+    shown("in flight", Task.join(busy))
+    shown("idle", Task.join(idle))
+    print("connect after stop: " + show(Either.isRight(stopped)))
+
+    -- A request still running when the drain time is up has its connection
+    -- closed under it.
+    let m = Memory.listener(65536)
+    let cut = Task.runScope(do {
+        let server = Server.start(m, plain(), route)?
+        let c = connected(m)
+        let _ = IO.writeText(c, get("/slow"))
+        Sleep.sleep(Duration.millis(50))
+        let reader = Task.spawn(fun() = readAll(c))?
+        Server.stop(server, Duration.millis(50))
+        Server.wait(server)
+        pure(reader)
+    })
+    shown("drain time up", Task.join(cut))
+
+    -- Work handed to `background` outlives its request, and `wait` waits
+    -- for it.
+    let finished = Sync.mutex(False)
+    let later = fun(req : Request Incoming, r : Respond) -> Done {
+        background(r, fun() {
+            Sleep.sleep(Duration.millis(300))
+            Sync.update(finished, fun(_) = True)
+        })
+        respond(r, Accepted)
+    }
+    let n = Memory.listener(65536)
+    let responded = Task.runScope(do {
+        let server = Server.start(n, plain(), later)?
+        let answer = send(n, get("/"))
+        let before = Sync.withLock(finished, fun(f) = f)
+        Server.stop(server, Duration.seconds(5))
+        Server.wait(server)
+        pure("responded " + show(String.startsWith(answer, "HTTP/1.1 202")) + ", work done by then "
+             + show(before) + ", after wait " + show(Sync.withLock(finished, fun(f) = f)))
+    })
+    print("background: " + responded)
+}
+
+fun loopback() {
+    print("-- over loopback TCP")
+    let address = Option.expect(Net.parse("127.0.0.1"), "an address")
+    let l = match TCP.listen(address, 0) {
+        Right(l) -> l
+        Left(e) -> return print("listen: " + show(e))
+    }
+    let port = TCP.listenerAddress(l).1
+    let peers = fun(req : Request Incoming, r : Respond) -> Done = match req.method {
+        POST(content) -> {
+            let ConnectionInfo { local, peer, .. } = req.connection
+            let at = show(Option.map(local, fun((_, p)) = p == port)) + " " + show(Option.isSome(peer))
+            respond(r, match (receive(content, 16) : Either HTTPError IO.Buffer) {
+                Right(got) -> body(OK, MediaType.plainText, at + " " + String.fromBytesLossy(IO.bytes(got)))
+                Left(e) -> body(BadRequest, MediaType.plainText, show(e))
+            })
+        }
+        _ -> respond(r, MethodNotAllowed)
+    }
+    let answer = Task.runScope(do {
+        let server = Server.start(l, plain(), peers)?
+        let answer = match Net.resolve("127.0.0.1", port, Net.anywhere, Duration.seconds(5)) {
+            Left(e) -> "resolve: " + show(e)
+            Right(d) -> match TCP.connect(d, Duration.seconds(5)) {
+                Left(e) -> "connect: " + show(e)
+                Right(s) -> {
+                    let _ = IO.writeText(s, "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\npong")
+                    let _ = shutdownWrite(s)
+                    let got = readAll(s)
+                    let _ = close(s)
+                    got
+                }
+            }
+        }
+        Server.stop(server, Duration.seconds(5))
+        pure(answer)
+    })
+    shown("TCP", answer)
+}

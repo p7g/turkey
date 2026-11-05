@@ -4,7 +4,7 @@ export (
     ServerConfig, Certificate(..), serverConfig, releaseServer,
     client, server, handshake, protocol, serverName,
     setDeadline, clearDeadline, shutdownWrite, close,
-    Acceptor, acceptor, accept,
+    Acceptor, acceptor, accept, closeListener,
 )
 
 -- TLS over any connection: a client that verifies the server it reaches, a
@@ -55,7 +55,7 @@ export (
 -- refused.
 --
 -- **ALPN.** Each side lists the protocols it speaks (`"http/1.1"`), and
--- `protocol` says which one the handshake chose. A server picks the first of
+-- `protocol` returns the one the handshake chose. A server picks the first of
 -- its own list that the client offers too, and with none in common the
 -- handshake fails, as RFC 7301 asks. Either side may list none.
 --
@@ -72,12 +72,12 @@ export (
 -- refuses is `Untrusted`, `Expired`, `NotYetValid`, `WrongHost` or
 -- `BadCertificate`; anything else the protocol fails with, an alert from the
 -- peer included, is `Refused` with OpenSSL's reason. A handshake that fails
--- fails for good: every later read and write answers the same error.
+-- fails for good: every later read and write fails with the same error.
 --
 -- **A connection that ends without the peer's close_notify is `Truncated`,**
 -- not an end of input. The peer said nothing about whether it meant to stop
 -- there, and an attacker who can cut a connection can choose where. A read
--- answers 0 only after a close_notify, which `shutdownWrite` sends.
+-- returns 0 only after a close_notify, which `shutdownWrite` sends.
 --
 -- **Sharing.** As with a TCP socket, any number of tasks may hold a `TLS`:
 -- reads take turns with reads, writes with writes, and a read and a write run
@@ -91,8 +91,10 @@ export (
 -- made from it keeps what it needs, so releasing one while its connections
 -- run is safe.
 
-import Net (Connection(..), Accept(..))
+import Net (Connection(..), HasConnectionInfo(..), ConnectionInfo(..), TLSInfo(..), accept, closeListener)
+import Net as Net
 import Net.TCP (Listener)
+import Net.TCP as TCP
 import System.Sync as Sync
 import Time (Timeout(..))
 import Time.Deadline (Deadline)
@@ -107,8 +109,10 @@ import Turkey.OpenSSL as SSL
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
+import Turkey.Resolve (IP)
 import Turkey.Resolve as Resolve
 import Turkey.Sys (cInt)
+import Turkey.Sys as Sys
 import Turkey.TLSCallbacks as Callbacks
 
 -- -- errors ---------------------------------------------------------------------------
@@ -377,6 +381,10 @@ type TLS = TLS {
     engine  : Sync.Mutex Engine,
     -- The certificates to choose among, for a server.
     config  : Option ServerConfig,
+    -- The addresses of the connection underneath, for a connection an
+    -- `Acceptor` accepted, which knows them; `None` otherwise.
+    local   : Option (IP, Int),
+    peer    : Option (IP, Int),
 }
 
 -- A connection's OpenSSL state, and what its operations share.
@@ -473,7 +481,7 @@ instance Connection TLS {
 }
 
 fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
-           config : Option ServerConfig) -> TLS =
+           config : Option ServerConfig, local : Option (IP, Int), peer : Option (IP, Int)) -> TLS =
     TLS {
         stream,
         reading = Sync.mutex(Buf.buffer(cipherCapacity)),
@@ -483,6 +491,8 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
             failed = None, limit = None,
         }),
         config,
+        local,
+        peer,
     }
 
 -- -- making one -----------------------------------------------------------------------
@@ -492,7 +502,7 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
 -- host that `config`'s roots vouch for.
 --
 -- If the handshake fails, `conn` is left open, and closing it is the
--- caller's. Once this answers a `TLS`, the `TLS` owns `conn`: `close` it
+-- caller's. Once this returns a `TLS`, the `TLS` owns `conn`: `close` it
 -- rather than `conn`, and bound it with the `TLS`'s `setDeadline`. The
 -- handshake replaces any deadline `conn` had, and leaves it with none.
 fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
@@ -513,7 +523,7 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
         }
     }
     SSL.sslSetConnectState(ssl)
-    let t = newTLS(streamOf(conn), ssl, bios.0, bios.1, Ptr.null(), None)
+    let t = newTLS(streamOf(conn), ssl, bios.0, bios.1, Ptr.null(), None, None, None)
     -- From here `t` owns `ssl`, and `abandon` frees it.
     if let Left(e) = nameServer(ssl, name, config.protocols) {
         abandon(t)
@@ -533,12 +543,20 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
 -- `handshake`. The `TLS` owns `conn`: `close` it rather than `conn`. A
 -- configuration released already is `Configuration`, and leaves `conn` open.
 fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
-        conn : c, config : ServerConfig) -> Either TLSError TLS {
+        conn : c, config : ServerConfig) -> Either TLSError TLS = serverAt(conn, config, None, None)
+
+-- `server`, whose `connectionInfo` reports `local` and `peer`.
+fun serverAt[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
+        conn : c, config : ServerConfig, local : Option (IP, Int), peer : Option (IP, Int)) -> Either TLSError TLS {
     SSL.errClearError()
-    let ssl = Sync.withLock(config.contexts, fun(contexts) =
-        if len(contexts) == 0 { Ptr.null() } else { SSL.sslNew(contexts[0]) })
-    if Ptr.isNull(ssl) {
+    let made = Sync.withLock(config.contexts, fun(contexts) =
+        if len(contexts) == 0 { None } else { Some(SSL.sslNew(contexts[0])) })
+    let Some(ssl) = made else {
         return Left(Configuration("cannot make a connection from a released configuration"))
+    }
+    -- Null from a live context is out of memory.
+    if Ptr.isNull(ssl) {
+        return Left(Configuration(reason()))
     }
     let bios = match attachBIOs(ssl) {
         Right(b) -> b
@@ -554,7 +572,7 @@ fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
         error("Net.TLS: out of memory")
     }
     let _ = SSL.sslSetExData(ssl, 0, block)
-    Right(newTLS(streamOf(conn), ssl, bios.0, bios.1, block, Some(config)))
+    Right(newTLS(streamOf(conn), ssl, bios.0, bios.1, block, Some(config), local, peer))
 }
 
 -- Two memory BIOs, given to `ssl`, which owns them from then on: `(rbio,
@@ -707,7 +725,7 @@ fun shake(t : TLS, incoming : Buffer) -> Either TLSError Unit {
                 Failed(e)
             }
         })
-        -- What the step made goes out even when it failed: an alert says why.
+        -- What the step made goes out even when it failed: an alert carries the reason.
         if let Failed(e) = step {
             let _ = send(t)
             return Left(e)
@@ -722,7 +740,7 @@ fun shake(t : TLS, incoming : Buffer) -> Either TLSError Unit {
     }
 }
 
--- Record `e` as what every later operation on `t` fails with, and answer it.
+-- Record `e` as what every later operation on `t` fails with, and return it.
 fun fail(t : TLS, e : TLSError) -> TLSError {
     withEngine(t, fun(engine) { engine.failed = Some(e) })
     e
@@ -800,7 +818,7 @@ fun receive(t : TLS, incoming : Buffer, into : Buffer) -> Either TLSError Int {
                                      into.limit - into.end))
             let code = if r > 0 { 0 } else { cInt(SSL.sslGetError(engine.ssl, r)) }
             Ptr.keepAlive(into.storage)
-            -- Reading can make bytes to send: a key update's answer, or an
+            -- Reading can make bytes to send: a key update's reply, or an
             -- alert.
             pending = SSL.bioCtrlPending(engine.wbio) > 0
             if r > 0 { Moved(r) }
@@ -899,7 +917,7 @@ fun drain(t : TLS, outgoing : Buffer) -> Either TLSError Unit {
             Ptr.keepAlive(outgoing.storage)
             r
         })
-        -- An empty memory BIO answers -1, to be retried.
+        -- An empty memory BIO returns -1, to be retried.
         if n <= 0 { return Right(()) }
         outgoing.end = n
         Either.mapLeft(t.stream.writing(outgoing), Stream)?
@@ -971,6 +989,16 @@ fun serverName(t : TLS) -> Option String = Either.unwrapOr(using(t, "serverName"
     Ptr.fromCString(SSL.sslGetServername(engine.ssl, SSL.nameTypeHostName))
 }))), None)
 
+-- The addresses underneath, for a connection an `Acceptor` accepted, and
+-- the SNI name and ALPN protocol once the handshake is done.
+instance HasConnectionInfo TLS {
+    fun connectionInfo(t) = ConnectionInfo {
+        local = t.local,
+        peer = t.peer,
+        tls = Some(TLSInfo { serverName = serverName(t), alpn = protocol(t) }),
+    }
+}
+
 -- -- accepting ------------------------------------------------------------------------
 
 -- A TCP listener whose connections are TLS servers presenting `config`.
@@ -980,18 +1008,28 @@ fun acceptor(l : Listener, config : ServerConfig) -> Acceptor = Acceptor { liste
 
 -- The next connection, as `server` makes it: its handshake runs in its first
 -- read or write, so a slow client does not hold up the next `accept`. Once
--- `config` is released, a connection is closed as it arrives, and the
--- answer is `Closed`.
-instance Accept Acceptor {
+-- `config` is released, a connection is closed as it arrives, and `accept`
+-- returns `Closed`. A connection whose TLS state cannot be made, for want of
+-- memory, is closed too, and `accept` returns an `Other` of `ENOMEM`, which
+-- a server reports and retries. Closing the acceptor closes the TCP listener
+-- under it.
+instance Net.Listener Acceptor {
     type Accepted = TLS
+    fun closeListener(a) = closeListener(a.listener)
     fun accept(Acceptor { listener, config }) {
         let s = accept(listener)?
-        match server(s, config) {
-            Right(t) -> Right(t)
-            Left(_) -> {
-                let _ = close(s)
-                Left(IOError { kind = Closed, op = "accept", path = None })
-            }
+        let local = Either.right(TCP.localAddress(s))
+        let peer = Either.right(TCP.peerAddress(s))
+        if let Right(t) = serverAt(s, config, local, peer) {
+            return Right(t)
         }
+        let _ = close(s)
+        -- `serverAt` fails only for a released configuration, or for a null
+        -- from `SSL_new` or `BIO_new`, which is out of memory. Only the first
+        -- is the end of accepting: `Closed` stops a server's accept loop.
+        let kind = if isReleased(config) { Closed } else { Other(Sys.enomem) }
+        Left(IOError { kind, op = "accept", path = None })
     }
 }
+
+fun isReleased(config : ServerConfig) -> Bool = Sync.withLock(config.contexts, fun(contexts) = len(contexts) == 0)

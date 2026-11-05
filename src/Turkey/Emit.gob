@@ -31,6 +31,7 @@ import Turkey.Arm64 as A
 import Turkey.Arm64 (Reg(..), Bank(..), Mem(..), Inst(..), AllocArg(..))
 import Turkey.Asm as Asm
 import Turkey.Frame as Frame
+import Turkey.Position as Position
 import Turkey.Regalloc as Regalloc
 import Turkey.Runtime as Rt
 import Turkey.Sites as Sites
@@ -41,7 +42,17 @@ import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
 import Turkey.Stream (Item(..))
 
-type Code = Vec (Item Inst)
+-- The items emitted so far, and the source position the next instruction
+-- takes (`Turkey.Position`).
+--
+-- Positions: the prologue takes the declaration's; each instruction what it
+-- was selected with, whatever it expands into here, its slow path after the
+-- function included; a terminator its block's `termAt`, with the edge's
+-- copies and a return's moves as no stepping target; the zero exit and every
+-- runtime stub, 0.
+type Code = Code { items : Vec (Item Inst), var at : Int }
+
+fun code(items : Vec (Item Inst)) -> Code = Code { items = items, at = 0 }
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -62,14 +73,16 @@ let widestAddend = 4095
 -- The largest immediate `add` and `sub` take without a shift.
 let widestImmediate = 4095
 
-fun emit(b : Code, item : Item Inst) -> Unit = Vec.push(b, item)
+fun emit(b : Code, item : Item Inst) -> Unit = Vec.push(b.items, item)
 
-fun instruction(b : Code, op : A.Arm) -> Unit = emit(b, Instruction(Inst { op = op }))
+fun instruction(b : Code, op : A.Arm) -> Unit = emit(b, Instruction(Inst { op = op, at = b.at }))
 
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, b : Code) -> Unit {
+             l : Frame.Layout, tag : Int, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
+    b.at = f.at
     prologue(b, l)
     -- Reverse postorder, so a block's most likely successor is the next block
     -- and its edge costs no instruction at all. A block that is only the exit
@@ -78,7 +91,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
-    let cold = Cold { text = [], count = 0 }
+    let cold = Cold { text = code([]), count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
@@ -87,18 +100,21 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
         match fused(block, reads) {
             Some((c, yes, no)) -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts) - 1)
+                b.at = block.termAt
                 conditional(b, d, tag, exits, c, yes, no, next)
             }
             None -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
                 if !endsInTailCall(block) {
+                    b.at = block.termAt
                     emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
                 }
             }
         }
     }
-    for item in cold.text { emit(b, item) }
+    for item in cold.text.items { emit(b, item) }
     if leaves(f) {
+        b.at = 0
         emit(b, Label(exitLabel(d, tag)))
         zero(b, f)
         epilogue(b, l)
@@ -168,6 +184,8 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
         -- beforehand, so that `n` stays the instruction's index in its block:
         -- `Frame.stubAt` names an allocation by that index.
         if definedAtEdge(insts[n], edges) { continue }
+        b.at = insts[n].at
+        cold.text.at = insts[n].at
         let op = insts[n].op
         match A.pollOf(op) {
             Some((pb, pn)) -> {
@@ -777,7 +795,10 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
         Ret(vs) -> {
             let dsts = Vec.fromArray(A.resultRegs(f.results))
             let srcs = Vec.map(vs, fun(v) = coloured(f, a, A.reg(v)))
+            let at = b.at
+            b.at = Position.notStmt(at)
             parallelMove(b, dsts, srcs)
+            b.at = at
             epilogue(b, l)
         }
         -- An edge into an exit block passes nothing, since nothing reads it.
@@ -785,6 +806,8 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
             instruction(b, A.B(exitLabel(d, tag)))
         } else {
             let params = Ssa.blockAt(f, target).params
+            let at = b.at
+            b.at = Position.notStmt(at)
             copies(b, f, a, edges, params, args)
             -- After the copies, which may still read the registers these
             -- write, and which have finished with the scratch register a
@@ -793,11 +816,13 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
                 match edges[Ssa.valueId(args[i])] {
                     Some(op) -> emitInst(b, d, f, a, l, tag, Inst {
                         op = A.rewrite(op, fun(r) = renamed(r, args[i], params[i]),
-                                       fun(m) = m)
+                                       fun(m) = m),
+                        at = b.at,
                     })
                     None -> {}
                 }
             }
+            b.at = at
             if Ssa.blockId(target) != next {
                 instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(target))))
             }
@@ -955,7 +980,8 @@ fun move(b : Code, d : Reg, s : Reg) -> Unit = match (d, s) {
 --
 -- `turkey_panic` takes a C string (`lib/Turkey/Process.gob`), so each one
 -- ends in a zero.
-fun emitMessages(asm : Asm.Asm, b : Code) -> Unit {
+fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let ordered = byIndex(asm.messages)
     if len(ordered) == 0 { return }
     emit(b, Section(Asm.CStrings))
@@ -974,7 +1000,8 @@ fun emitMessages(asm : Asm.Asm, b : Code) -> Unit {
 -- Every name and every slot here was decided by `Turkey.Asm` before selection
 -- ran, which is what lets `ConstString` be a load of slot *n* emitted long
 -- before anything defined slot *n*.
-fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : Code) -> Unit {
+fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     emitLiterals(asm, b)
     emit(b, Section(Asm.Data))
     -- A build that counts allocations (`Turkey.Sites`): the number of sites,
@@ -1066,7 +1093,8 @@ fun byIndex(table : Map.Map String Int) -> Vec String {
 -- nowhere else, between the two stacks, so nothing that can collect ever sees
 -- it name the wrong one. `x16` and `x17` are the scratch registers, which the allocator
 -- never hands out.
-fun emitSwapStack(asm : Asm.Asm, b : Code) -> Unit {
+fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     let x16 = Physical(Gp, 16)
@@ -1098,7 +1126,8 @@ fun emitSwapStack(asm : Asm.Asm, b : Code) -> Unit {
 -- this one, for the last time: nothing resumes a stack whose body has
 -- returned, and the `brk` says so if something does. `sp` is where it was on
 -- the way in, since the callee restores it, so the word is still there.
-fun emitStackStart(asm : Asm.Asm, b : Code) -> Unit {
+fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     emit(b, Section(Asm.Text))
@@ -1118,7 +1147,8 @@ fun emitStackStart(asm : Asm.Asm, b : Code) -> Unit {
 -- `turkey_worker_ended` hands to the main worker, through its Turkey entry so
 -- that `x28` is still this worker's. A full frame record, so that the worker's
 -- stack has an outermost one, and `x28` saved, since C keeps it.
-fun emitWorkerStart(asm : Asm.Asm, b : Code) -> Unit {
+fun emitWorkerStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.workerStartSymbol))
@@ -1147,7 +1177,8 @@ fun emitWorkerStart(asm : Asm.Asm, b : Code) -> Unit {
 -- end, parks the program's ending where the entry's own code will not unwind
 -- on it.
 fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
-              b : Code) -> Unit {
+              out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.entrySymbol(d))
@@ -1282,7 +1313,8 @@ fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
 -- moves the arguments the same way and branches to the body, leaving `x28`
 -- and making no frame: the body's frame record then holds its Turkey
 -- caller's return address, as at any call.
-fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
+fun emitDefinitions(m : Module, asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     for (sym, name) in m.definitions {
         for f in m.functions {
             if f.name == name {
@@ -1380,7 +1412,8 @@ fun byteLength(text : String) -> Int {
 -- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
 -- computing them since phase 4.
 fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
-                   b : Code) -> Unit {
+                   out : Vec (Item Inst)) -> Unit {
+    let b = code(out)
     let d = asm.dialect
     emit(b, Section(Asm.Relocated))
     emit(b, Align(3))

@@ -4,7 +4,7 @@ export (
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
     checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
-    Builder(..), builder, into, emit, effect, terminate, block, param,
+    Builder(..), builder, here, into, emit, effect, terminate, block, param,
 )
 
 -- The virtual instruction set: what `Turkey.Ssa`'s graph is instantiated with
@@ -42,6 +42,7 @@ export (
 -- these; that is its job.
 
 import Data.Map as Map
+import Turkey.Position as Position
 import Turkey.Runtime as Rt
 import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
@@ -314,17 +315,27 @@ type Op
     | SlotLoad(Int)
     | SlotStore(Int, Value)
 
--- An instruction is an operation and the value it defines.
+-- An instruction is an operation, the value it defines, and the source
+-- position it came from.
 --
 -- Every instruction defines exactly one value, and an effectful one defines a
 -- `unit`. Uniform is cheaper than an `Option` here in both senses: no
 -- allocation to ask what an instruction defines, and no case to forget.
+--
+-- `at` is packed by `Turkey.Position`, and 0 where there is none. **A position
+-- never influences code generation.** No `Show`, `Eq` or `Hash` of `Low`
+-- reads it, and no pass compares or keys on it, so a program compiles to the
+-- same bytes whatever its positions are. `Show` matters most: the register
+-- allocator's reload check compares instructions by their `show()` text, and
+-- a position in that text would change what it accepts. A dump prints
+-- positions through `Turkey.Position.describe` instead.
 type Low = Low {
     result : Value,
     var op : Op,
+    var at : Int,
 }
 
-fun low(result : Value, op : Op) -> Low = Low { result = result, op = op }
+fun low(result : Value, op : Op, at : Int) -> Low = Low { result = result, op = op, at = at }
 
 -- -- building ------------------------------------------------------------------------
 
@@ -351,14 +362,23 @@ fun low(result : Value, op : Op) -> Low = Low { result = result, op = op }
 type Builder = Builder {
     func     : Ssa.Func Low,
     var at   : Ssa.BlockId,
-    -- The source construct being lowered, which the lowering keeps current;
-    -- recorded against every instruction that may allocate, and every string
-    -- literal, since those are what the giblets check names (`Func.origins`).
+    -- The source construct being lowered, which the lowering keeps current.
+    -- Every instruction and terminator takes its start as its position, and
+    -- it is recorded against every instruction that may allocate, and every
+    -- string literal, since those are what the giblets check names
+    -- (`Func.origins`).
     var span : Option Span,
+    files    : Position.Cache,
 }
 
-fun builder(f : Ssa.Func Low, at : Ssa.BlockId) -> Builder =
-    Builder { func = f, at = at, span = None }
+fun builder(f : Ssa.Func Low, at : Ssa.BlockId, files : Position.Files) -> Builder =
+    Builder { func = f, at = at, span = None, files = Position.cache(files) }
+
+-- Returns the packed position of the construct being lowered, or 0.
+fun here(b : Builder) -> Int = match b.span {
+    Some(s) -> Position.fromSpan(b.files, s)
+    None -> 0
+}
 
 fun isConstString(op : Op) -> Bool = match op {
     ConstString(_) -> True
@@ -379,7 +399,7 @@ fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
 -- what an opcode means.
 fun emit(b : Builder, op : Op, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
-    Vec.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
+    Vec.push(Ssa.blockAt(b.func, b.at).insts, low(v, op, here(b)))
     if effectsOf(op).allocates || isConstString(op) {
         match b.span {
             Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), s)
@@ -396,7 +416,9 @@ fun effect(b : Builder, op : Op) -> Unit {
 }
 
 fun terminate(b : Builder, t : Ssa.Term) -> Unit {
-    Ssa.blockAt(b.func, b.at).term = t
+    let block = Ssa.blockAt(b.func, b.at)
+    block.term = t
+    block.termAt = here(b)
 }
 
 -- A new empty block, and its id.
@@ -613,7 +635,7 @@ instance Inst Low {
     }
     fun anyDef(i, p) = p(i.result)
     fun effects(i) = effectsOf(i.op)
-    fun renameUses(i, f) = low(i.result, mapUses(i.op, f))
+    fun renameUses(i, f) = low(i.result, mapUses(i.op, f), i.at)
     fun copyOf(_) = None
 }
 

@@ -45,6 +45,7 @@ import Data.Set as Set
 import Turkey.Deps as Deps
 import Turkey.LowIr as L
 import Turkey.LowIr (Callee(..), Op(..), Low(..))
+import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (BlockId(..), RepClass(..), Term(..))
 
@@ -53,7 +54,10 @@ import Turkey.Ssa (BlockId(..), RepClass(..), Term(..))
 fun insert(f : Ssa.Func Low, recursive : Bool) -> Unit {
     if recursive {
         let entry = Ssa.blockAt(f, f.entry)
-        let insts = [L.low(Ssa.freshValue(f, Ssa.untraced(Unit)), Poll)]
+        -- Part of entering the function, like the prologue: the declaration,
+        -- and no stepping target of its own.
+        let insts = [L.low(Ssa.freshValue(f, Ssa.untraced(Unit)), Poll,
+                           Position.notStmt(f.at))]
         for i in entry.insts { Vec.push(insts, i) }
         entry.insts = insts
     }
@@ -117,13 +121,18 @@ fun always(f : Ssa.Func Low, allocating : Array Bool, header : Int) -> Bool {
 -- Put a poll on the edge from `from` to `header`: at the end of `from` when it
 -- jumps there, and in a block of its own on a branch's or a switch's arms,
 -- whose target takes no arguments.
+--
+-- The poll takes the position of the terminator the edge leaves by, and a
+-- block made for it jumps on with that position too, as no stepping target.
 fun poll(f : Ssa.Func Low, from : Int, header : Int) -> Unit {
+    let at = f.blocks[from].termAt
     let edge = match f.blocks[from].term {
         Jump(_, _) -> from
         Branch(c, yes, no) -> {
             Vec.push(f.blocks, Ssa.newBlock())
             let made = len(f.blocks) - 1
             f.blocks[made].term = Jump(BlockId(header), [])
+            f.blocks[made].termAt = Position.notStmt(at)
             f.blocks[from].term = if Ssa.blockId(yes) == header {
                 Branch(c, BlockId(made), no)
             } else {
@@ -135,6 +144,7 @@ fun poll(f : Ssa.Func Low, from : Int, header : Int) -> Unit {
             Vec.push(f.blocks, Ssa.newBlock())
             let made = len(f.blocks) - 1
             f.blocks[made].term = Jump(BlockId(header), [])
+            f.blocks[made].termAt = Position.notStmt(at)
             let redirect = fun(t : BlockId) -> BlockId =
                 if Ssa.blockId(t) == header { BlockId(made) } else { t }
             f.blocks[from].term = Switch(v,
@@ -148,7 +158,7 @@ fun poll(f : Ssa.Func Low, from : Int, header : Int) -> Unit {
         _ -> return
     }
     let done = Ssa.freshValue(f, Ssa.untraced(Unit))
-    Vec.push(f.blocks[edge].insts, L.low(done, Poll))
+    Vec.push(f.blocks[edge].insts, L.low(done, Poll, at))
 }
 
 -- The functions of `functions` in a cycle of the call graph, leaving out

@@ -435,12 +435,18 @@ fun seq(d : D, stmts : Vec Stmt, from : Int, k : Cont, span : Span,
 fun split(d : D, stmts : Vec Stmt, i : Int, k : Cont, span : Span,
           flow : Bool, last : Bool) -> Expr {
     let s = stmts[i]
-    -- What runs once this statement has been bound. It ignores the value: a
-    -- `let` has already put it where it belongs, and a bare statement's value is
-    -- discarded by the sequence.
+    -- What runs once this statement has been bound. It ignores its argument,
+    -- so each statement kind first puts its value tree where it belongs.
     let after = KFn(fun(value) =
         if last { apply(d, k, mkExpr(d, s.span, EUnit)) }
         else { seq(d, stmts, i + 1, k, span, flow) })
+    -- A bare statement's value tree is the statement itself with each `?`
+    -- replaced, as in `print(%k1)`, so it has to stay a statement. Passing it
+    -- straight to `after` would drop the call along with its result.
+    let discarded = KFn(fun(v) = mkExpr(d, s.span, EBlock([
+        mkStmt(d, s.span, SExpr(v)),
+        mkStmt(d, s.span, SExpr(apply(d, after, mkExpr(d, s.span, EUnit)))),
+    ])))
     match s.kind {
         SLet(pat, value) -> binding(d, s, pat, value, False, after, flow)
         SVar(pat, value) -> binding(d, s, pat, value, True, after, flow)
@@ -459,7 +465,7 @@ fun split(d : D, stmts : Vec Stmt, i : Int, k : Cont, span : Span,
             -- `Fall` and the other three travel outward.
             sequence(d, expr(d, e, KFall, True, True), after, s.span)
         } else {
-            expr(d, e, after, False, flow)
+            expr(d, e, discarded, False, flow)
         }
         SFun(_) -> bug("'?' is not supported in this kind of statement yet",
                        s.span)

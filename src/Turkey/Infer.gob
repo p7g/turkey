@@ -120,6 +120,9 @@ type Generator = Generator {
     discardSites : Vec Expr,
     -- See `Program.letElses`.
     letElses : Vec LetElse,
+    -- Every block's statements, for the unreachable-code warning, which needs
+    -- solved types to tell which calls return.
+    blocks   : Vec (Vec Stmt),
     -- The ids of the nodes generation types bottom whatever they are: every
     -- `else` block of a `let ... else`, and the calls in its tail positions.
     bottoms  : Set.Set Int,
@@ -142,7 +145,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
         warnings = Vec.new(4), matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
-        bottoms = Set.new(),
+        blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
     }
 }
@@ -909,6 +912,23 @@ fun checkExhaustiveness(g : Generator) -> Unit {
     for le in g.letElses {
         if completes(le.completion, Typed.canReturn(g.types, _)) { fallsThrough(le) }
     }
+    -- One warning for each run of unreachable statements, at its first, in
+    -- the order they appear in the source. Blocks are recorded outermost
+    -- first, so a block nested in another is visited after it.
+    let unreachable = Vec.new(4)
+    for stmts in g.blocks {
+        for var i = 0; i + 1 < len(stmts); i = i + 1 {
+            if !completes(stmtCompletion(stmts[i]), Typed.canReturn(g.types, _)) {
+                Vec.push(unreachable, stmts[i + 1].span)
+                break
+            }
+        }
+    }
+    for at in Vec.sortByKey(unreachable, fun(sp) = (sp.file, (sp.line, sp.col))) {
+        Vec.push(g.warnings, Diag.render(Diag.at("warning",
+            "this statement is unreachable, since the one before it cannot "
+            + "complete; remove it", at), ""))
+    }
     -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
         let ty = Typed.of_(g.types, x)
@@ -1625,7 +1645,10 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let annotated = typeOf(g, te)
         join(g, genExpr(g, inner), annotated, Some(e.span), "a type annotation")
     }
-    EBlock(stmts) -> genSequence(g, stmts, 0)
+    EBlock(stmts) -> {
+        Vec.push(g.blocks, stmts)
+        genSequence(g, stmts, 0)
+    }
     EIf(cond, then, otherwise) -> {
         eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "an 'if' condition")
         let thenType = genExpr(g, then)

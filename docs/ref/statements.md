@@ -43,8 +43,9 @@ A statement **cannot complete** when no way of running it reaches its end: a
 `return`, `break` or `continue`; a `loop` that cannot reach one of its own
 `break`s; an `if` with an `else`, or a `match`, none of whose branches can
 complete; or any statement that evaluates one of these on every way through
-it. The statements after it are unreachable and never run, and the block never
-produces a value, so it has any type, as `return` does:
+it. The statements after it are unreachable and never run, and the compiler
+warns about them. The block never produces a value, so it has any type, as
+`return` does:
 
 <!-- run -->
 ```kotlin
@@ -72,8 +73,8 @@ not a number: x
 ```
 
 A call to a function that never returns, such as `error`, also ends the run of
-a block, but it does not change the block's type, which is still that of its
-last statement.
+a block, and the compiler warns about what follows it too, but the call does
+not change the block's type, which is still that of its last statement.
 
 A declaration in a block is visible from the next statement to the end of the
 block. A block is a scope: its declarations are not visible after it.

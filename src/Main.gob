@@ -64,6 +64,7 @@ import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
+import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Polls as Polls
@@ -322,7 +323,9 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name), slotNames(checked))) }
     write(String.drain(b))
     if through("opt") { return }
-    let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, path)
+    let files = Position.files(checked.files)
+    let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, files,
+                                         path)
     at = lap("ssa", at)
     if wants("ssa") { dumpSsa(b, module_, skipped) }
     write(String.drain(b))
@@ -655,9 +658,10 @@ fun roots(checked : Checked) -> Vec String =
 -- remove what the check objects to -- a literal on a branch proven dead, an
 -- allocation nothing reads -- and cannot make acceptable code unacceptable.
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
-                classes : Classes.ClassTable, path : String)
+                classes : Classes.ClassTable, files : Position.Files, path : String)
         -> (SsaLower.Module, Vec SsaLower.Unsupported) {
-    let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes))
+    let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes),
+                                                   files)
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
@@ -1290,6 +1294,9 @@ type Checked = Checked {
     library     : Set.Set String,
     -- Which binder each binding occurrence and reference means.
     binders     : Binders.Table,
+    -- Every module's file, in the order the modules were loaded: what a
+    -- source position's file number counts.
+    files       : Vec String,
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
@@ -1301,7 +1308,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
             Decls.newDeclTable()),
         env = initialEnv(binders), types = Typed.newTypeTable(),
         ordered = Vec.new(32), owners = Map.new(),
-        library = Set.new(), binders = binders,
+        library = Set.new(), binders = binders, files = [],
     }
     checked.classes = Classes.newClassTable(checked.decls)
     -- A component of modules is checked in one run: their bindings may use
@@ -1311,6 +1318,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         let owners = Map.new()
         let visibleByFile = Map.new()
         for m in group {
+            Vec.push(checked.files, m.file)
             if m.library { Set.add(checked.library, m.name) }
             Vec.push(programs, (m.name, m.program))
             for d in m.program.decls {

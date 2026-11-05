@@ -36,6 +36,7 @@ import Turkey.Arm64 as A
 -- The bank constructors unqualified because patterns cannot be qualified,
 -- which is the same reason `Turkey.Select` imports them this way.
 import Turkey.Arm64 (Bank(..), Reg(..))
+import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Func, BlockId, Value, Term(..))
 
@@ -1344,9 +1345,11 @@ fun copyFunc(f : Func A.Inst) -> Func A.Inst {
         for p in block.params { Vec.push(made.params, p) }
         for i in block.insts { Vec.push(made.insts, i) }
         made.term = block.term
+        made.termAt = block.termAt
         Vec.push(g.blocks, made)
     }
     g.entry = f.entry
+    g.at = f.at
     g
 }
 
@@ -1375,6 +1378,11 @@ fun copyFunc(f : Func A.Inst) -> Func A.Inst {
 -- is deleted, since every read of it is renamed, and its reload is a copy of
 -- that definition into the reload's value: a constant is one instruction to
 -- recompute, where a slot costs a store, a load, and room in the frame.
+--
+-- Positions: a store takes its definition's, a reload or a recomputation the
+-- position of the read it serves, and neither is a stepping target. A block
+-- parameter is defined at the block's start, so its store takes the position
+-- of what the block does first.
 fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
           roots : Map Int Int, spills : Spills) -> Unit {
     let splitting = Set.new()
@@ -1409,7 +1417,9 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
         -- Spilled value -> the reload standing in for it here.
         let ready = inherited(preds, leaving, b)
         let out : Vec A.Inst = []
-        for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p)) }
+        let entered = Position.notStmt(if len(block.insts) > 0 { block.insts[0].at }
+                                       else { block.termAt })
+        for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p), entered) }
         for var n = 0; n < len(block.insts); n = n + 1 {
             let i = block.insts[n]
             -- Selection stores every root into its slot after its definition.
@@ -1422,10 +1432,10 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
             }
             var op = i.op
             for id in Array.sort(Set.elements(usedSpilled(Ssa.uses(i), ids))) {
-                let t = standIn(g, out, spills, ready, crowded, id)
+                let t = standIn(g, out, spills, ready, crowded, id, Position.notStmt(i.at))
                 op = A.mapUses(op, renamed(_, id, t))
             }
-            Vec.push(out, A.Inst { op = op })
+            Vec.push(out, A.Inst { op = op, at = i.at })
             -- A call that defines its own result (`Allocate`) keeps its
             -- safepoint map directly after it, where the frame expects it, and
             -- the result's spill store goes after the map.
@@ -1435,12 +1445,13 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
                 n = n + 1
             }
             Ssa.eachDef(i, fun(d) =
-                storeIfSpilled(out, spills, ids, Ssa.valueId(d)))
+                storeIfSpilled(out, spills, ids, Ssa.valueId(d), Position.notStmt(i.at)))
             if endsReloads(i) { clear(ready) }
         }
         var term = block.term
         for id in Array.sort(Set.elements(usedSpilled(Ssa.termUses(term), ids))) {
-            let t = standIn(g, out, spills, ready, crowded, id)
+            let t = standIn(g, out, spills, ready, crowded, id,
+                            Position.notStmt(block.termAt))
             term = renamedTerm(term, id, t)
         }
         block.insts = out
@@ -1454,11 +1465,11 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
 }
 
 -- The value to read in place of the spilled or split `id`, loading it at the
--- end of `out` if nothing loaded already stands in for it.
+-- end of `out` with position `at` if nothing loaded already stands in for it.
 fun standIn(g : Func A.Inst, out : Vec A.Inst, spills : Spills,
-            ready : Map Int Int, crowded : Set.Set Int, id : Int) -> Int {
+            ready : Map Int Int, crowded : Set.Set Int, id : Int, at : Int) -> Int {
     match Map.get(spills.reloadOf, id) {
-        Some(from) -> return reload(g, out, spills, from)
+        Some(from) -> return reload(g, out, spills, from, at)
         None -> {}
     }
     match Map.get(ready, id) {
@@ -1467,7 +1478,7 @@ fun standIn(g : Func A.Inst, out : Vec A.Inst, spills : Spills,
             t
         }
         None -> {
-            let t = reload(g, out, spills, id)
+            let t = reload(g, out, spills, id, at)
             if !Set.contains(crowded, id) { Map.put(ready, id, t) }
             t
         }
@@ -1540,11 +1551,11 @@ fun usedSpilled[Iterator c, Item c ~ Value](vs : c, ids : Set.Set Int) -> Set.Se
 }
 
 fun storeIfSpilled(out : Vec A.Inst, spills : Spills, ids : Set.Set Int,
-                   id : Int) -> Unit {
+                   id : Int, at : Int) -> Unit {
     if Set.contains(ids, id) {
         match Map.get(spills.slots, id) {
             Some(slot) -> {
-                Vec.push(out, A.Inst { op = A.Str(A.Virtual(id), slot, A.W64) })
+                Vec.push(out, A.Inst { op = A.Str(A.Virtual(id), slot, A.W64), at = at })
                 spills.stores = spills.stores + 1
             }
             None -> {}
@@ -1552,15 +1563,15 @@ fun storeIfSpilled(out : Vec A.Inst, spills : Spills, ids : Set.Set Int,
     }
 }
 
--- A fresh value holding `id`, at the end of `out`: loaded from its slot, or
--- computed again by a copy of its definition.
-fun reload(g : Func A.Inst, out : Vec A.Inst, spills : Spills, id : Int) -> Int {
+-- A fresh value holding `id`, at the end of `out` with position `at`: loaded
+-- from its slot, or computed again by a copy of its definition.
+fun reload(g : Func A.Inst, out : Vec A.Inst, spills : Spills, id : Int, at : Int) -> Int {
     let t = Ssa.valueId(Ssa.freshValue(g, g.reps[id]))
     Map.put(spills.reloadOf, t, id)
     match Map.get(spills.slots, id) {
-        Some(slot) -> Vec.push(out, A.Inst { op = A.Ldr(A.Virtual(t), slot, A.W64) })
+        Some(slot) -> Vec.push(out, A.Inst { op = A.Ldr(A.Virtual(t), slot, A.W64), at = at })
         None -> match Map.get(spills.remat, id) {
-            Some(op) -> Vec.push(out, A.Inst { op = remade(op, id, t) })
+            Some(op) -> Vec.push(out, A.Inst { op = remade(op, id, t), at = at })
             None -> {}
         }
     }
@@ -1757,7 +1768,8 @@ fun checkRemade(out : Vec String, spills : Spills, ready : Map Int Unit,
         match Map.get(spills.reloadOf, t) {
             Some(from) -> {
                 match Map.get(spills.remat, from) {
-                    Some(op) -> if show(A.Inst { op = remade(op, from, t) }) != show(i) {
+                    Some(op) -> if show(A.Inst { op = remade(op, from, t), at = i.at })
+                                       != show(i) {
                         Vec.push(out, "reload %" + Int.toString(t) + " at " + at
                                         + " is not the definition of %"
                                         + Int.toString(from))

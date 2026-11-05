@@ -1,4 +1,5 @@
-"""Tasks (`System.Task`): scopes, `spawn`, `join` and `yield` on one worker.
+"""Tasks (`System.Task`): scopes, `spawn`, `spawnEach`, `join` and `yield` on
+one worker.
 
 Every program that should succeed is run twice, plainly and with a
 collection at every allocation and the heap verified around each, and the two
@@ -6,9 +7,12 @@ must print the same: a task's values live in frames of a parked stack, which
 the collector must find.
 """
 
+import os
+import subprocess
+
 import pytest
 
-from tests import lang
+from tests import lang, toolchain
 
 STRESS = {"TURKEY_GC_STRESS": "1"}
 
@@ -319,3 +323,54 @@ fun main() {
     assert result.stdout == ""
     assert result.stderr == \
         "panic: array index out of bounds: read at index 3, length 1\n"
+
+
+# A loop that starts a task per iteration, for as many iterations as `N`
+# says, from inside a task as a server's accept loop does.
+SPAWN_EACH = """
+import System.Env as Env
+import System.Sync as Sync
+import System.Task as Task
+
+fun count(n : Int) -> Int {
+    let ran = Sync.atomicInt(0)
+    var i = 0
+    Task.runScope(Task.spawnEach(fun() {
+        if i == n { return None }
+        i = i + 1
+        Task.yield()
+        Some(fun() { let _ = Sync.addAndGet(ran, 1) })
+    }))
+    Sync.load(ran)
+}
+
+fun main() {
+    let n = Option.unwrapOr(Int.parse(Option.unwrapOr(Env.get("N"), "0")), 0)
+    print(Task.join(Task.runScope(Task.spawn(fun() = count(n)))))
+}
+"""
+
+
+def _peak(binary, n: int) -> int:
+    """Runs `binary` with `N=n` and returns its peak resident size, in the
+    platform's unit for `ru_maxrss`."""
+    # Four workers, because with one every finished task still leaks memory
+    # of its own, which would hide what this test measures.
+    child = subprocess.Popen(toolchain.command(binary), stdout=subprocess.PIPE, text=True,
+                             env=dict(os.environ, N=str(n), TURKEY_WORKERS="4"))
+    out = child.stdout.read()
+    _, status, usage = os.wait4(child.pid, 0)
+    child.returncode = os.waitstatus_to_exitcode(status)
+    assert child.returncode == 0
+    assert out == f"{n}\n"
+    return usage.ru_maxrss
+
+
+def test_spawn_each_runs_in_constant_memory():
+    """Millions of iterations of `spawnEach` take no more memory than a
+    hundred thousand, where a `loop` with `spawn(f)?` in a `do` block grows
+    the stack by a frame each."""
+    binary = lang.binary(SPAWN_EACH)
+    small = _peak(binary, 100_000)
+    large = _peak(binary, 3_000_000)
+    assert large < 4 * small, (small, large)

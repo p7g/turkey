@@ -1,4 +1,4 @@
-export (Task, Spawn, runScope, spawn, join, yield)
+export (Task, Spawn, runScope, spawn, spawnEach, join, yield)
 
 -- Tasks: functions that run concurrently with the code that started them,
 -- each suspending where it waits -- in `join`, in `yield`, at any depth of
@@ -79,7 +79,27 @@ fun runScope(body : Spawn a) -> a {
 
 -- Start `f` as a task in the enclosing scope. It runs when the code that
 -- started it next waits or yields.
-fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
+fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) = start(scope, f))
+
+-- Calls `next` until it returns `None`, and starts each function it returns
+-- as a task in the enclosing scope, in order. `next` may wait, for a
+-- connection or for work, say. Runs in constant stack however many tasks it
+-- starts.
+--
+-- Use this for a loop that starts tasks without bound. In a `do` block, each
+-- `spawn(f)?` inside a `loop` nests a call that returns only when the loop
+-- ends, so the stack grows with every iteration, and a long enough loop
+-- overflows it.
+fun spawnEach(next : fun() -> Option (fun() -> Unit)) -> Spawn Unit = Spawn(fun(scope) {
+    while True {
+        match next() {
+            Some(f) -> { let _ = start(scope, f) }
+            None -> return ()
+        }
+    }
+})
+
+fun start(scope : Scope, f : fun() -> a) -> Task a {
     let task = Task { result = None, waiters = [] }
     let c = Co.new(fun() {
         let value = f()
@@ -100,7 +120,7 @@ fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
     Scheduler.ready(c)
     Scheduler.unlock()
     task
-})
+}
 
 -- `task`'s result, waiting for it to finish if it has not.
 fun join(task : Task a) -> a {

@@ -19,10 +19,11 @@ export (
 -- **A handler sends its response through its `Respond`.** It takes the
 -- request and a `Respond`, and ends in `respond(r, x)`, where `x` is a
 -- `ToResponse`: a `ServerResponse`, or a value that becomes one, its own
--- error type among them. `respond` writes the whole response, a stream's body and trailers
--- included, before it returns, so whatever the handler holds open -- a file,
--- an upstream connection whose body it relays -- is open for as long as the
--- response needs it. The `respond` call is the commit point.
+-- error type among them. `respond` writes the whole response, a stream's
+-- body and trailers included, before it returns, so whatever the handler
+-- holds open -- a file, an upstream connection whose body it relays -- is
+-- open for as long as the response needs it. The `respond` call is the
+-- commit point.
 --
 -- **Every path responds, once.** `respond` returns a `Done`, whose
 -- constructor is hidden, and a handler must return one, so a handler that
@@ -55,11 +56,10 @@ export (
 -- read, after the limit is checked, so a body declared too large is refused
 -- before the client sends it. The body stays readable while `respond`
 -- writes, so a stream's function can write its response as it reads the
--- request. A body
--- still unread when `respond` returns is read and discarded if at most
--- `drainBytes` of it remain, so the connection can carry the next request;
--- a longer one, or one the client has not started sending, closes the
--- connection instead.
+-- request. A body still unread when `respond` returns is read and discarded
+-- if at most `drainBytes` of it remain, so the connection can carry the next
+-- request; a longer one, or one the client has not started sending, closes
+-- the connection instead.
 --
 -- **Closing while the client sends.** Closing a connection whose client is
 -- still sending makes the system send a reset, which can destroy the
@@ -191,14 +191,15 @@ type ServerEvent
 
 instance Show ServerEvent {
     fun show(e) = match e {
-        AcceptFailed(io) -> "AcceptFailed(" + show(io) + ")"
-        Refused(r) -> "Refused(" + show(r) + ")"
-        ConnectionFailed(s) -> "ConnectionFailed(" + show(s) + ")"
-        ResponseAborted(s) -> "ResponseAborted(" + show(s) + ")"
-        BadSwitch(t) -> "BadSwitch(" + show(t) + ")"
-        HandlerFailed(h) -> "HandlerFailed(" + show(h) + ")"
-        RespondedTwice(s) -> "RespondedTwice(" + show(Status.code(s)) + ")"
-        NoResponse -> "NoResponse"
+        AcceptFailed(io) -> "accepting a connection failed: " + show(io)
+        Refused(r) -> "a request was refused: " + show(BadMessage(r))
+        ConnectionFailed(s) -> "a connection failed: " + show(s)
+        ResponseAborted(s) -> "a response was cut short: " + show(s)
+        BadSwitch(t) -> "a handler switched to " + show(t) + " on a request that cannot switch to it"
+        HandlerFailed(h) -> "a handler failed: " + show(h)
+        RespondedTwice(s) -> "a handler responded twice; its second response, a "
+                             + show(Status.code(s)) + ", was not sent"
+        NoResponse -> "a handler returned without responding"
     }
 }
 
@@ -225,6 +226,11 @@ type Respond = Respond {
 -- How far a request's response has got: nothing sent yet, a final response
 -- being written, or written.
 type RespondState = Unsent | Sending | Sent
+
+fun isSent(s : RespondState) -> Bool = match s {
+    Sent -> True
+    Unsent | Sending -> False
+}
 
 -- Proof that a request got its response: only `respond` and `failed` make
 -- one.
@@ -307,7 +313,7 @@ type Server = Server {
     -- Set once the accept loop, every connection and every background task
     -- have ended.
     done           : Event
-    closeListening : fun() -> Unit
+    closeListener  : fun() -> Unit
     background     : Work
 }
 
@@ -346,7 +352,7 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
         registry = Sync.mutex(Registry { stopping = False, entries = Map.new(), next = 0 }),
         permits = Sync.semaphore(values.connections),
         done = Sync.event(),
-        closeListening = fun() { let _ = closeListener(l) },
+        closeListener = fun() { let _ = closeListener(l) },
         background = work(),
     }
     Task.spawn(fun() = run(server, l, handler))?
@@ -359,17 +365,19 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
 -- closed, which is before their tasks have necessarily ended; `wait` waits
 -- for those.
 fun stop(server : Server, drain : Duration) -> Unit {
-    let until = Deadline.after(drain)
+    let deadline = Deadline.after(drain)
     let idle = Sync.withLock(server.registry, fun(r) {
         r.stopping = True
-        closers(r, True)
+        idleClosers(r)
     })
-    server.closeListening()
+    server.closeListener()
     -- An accept loop waiting for a permit sees `stopping` once it has one.
     Sync.release(server.permits)
     for close in idle { close() }
-    if Sync.waitEvent(server.done, until) { return }
-    let rest = Sync.withLock(server.registry, closers(_, False))
+    if Sync.waitEvent(server.done, deadline) {
+        return
+    }
+    let rest = Sync.withLock(server.registry, allClosers)
     for close in rest { close() }
 }
 
@@ -377,12 +385,22 @@ fun stop(server : Server, drain : Duration) -> Unit {
 -- every background task has ended.
 fun wait(server : Server) -> Unit = Sync.waitEventUnbounded(server.done)
 
-fun closers(r : Registry, onlyIdle : Bool) -> Array (fun() -> Unit) {
+-- Returns the functions that close the connections waiting for a request.
+fun idleClosers(r : Registry) -> Array (fun() -> Unit) {
     let out = []
     for e in Map.values(r.entries) {
-        if e.idle || !onlyIdle {
+        if e.idle {
             Vec.push(out, e.close)
         }
+    }
+    Vec.toArray(out)
+}
+
+-- Returns the functions that close every connection.
+fun allClosers(r : Registry) -> Array (fun() -> Unit) {
+    let out = []
+    for e in Map.values(r.entries) {
+        Vec.push(out, e.close)
     }
     Vec.toArray(out)
 }
@@ -531,25 +549,25 @@ fun dispatch(w : Work) -> Spawn Unit {
 -- a clock reading each, and is what lets one deadline cover a whole head
 -- while another bounds each wait for a body's bytes.
 type Guarded c = Guarded {
-    conn        : c,
-    values      : Values,
-    var phase   : Phase,
+    conn        : c
+    values      : Values
+    var phase   : Phase
     -- This request's stall limit: `Limits`' unless the handler set its own.
-    var stall   : Duration,
+    var stall   : Duration
     -- The deadline a switched connection's `Duplex` set.
-    var carried : Option Deadline,
+    var carried : Option Deadline
 }
 
 -- * `Idle(d)`: waiting for a request's first byte until `d`. The first byte
---   starts `Heading`.
--- * `Heading(d)`: reading a head that must be whole by `d`.
+--   starts `ReadingHead`.
+-- * `ReadingHead(d)`: reading a head that must be whole by `d`.
 -- * `Exchanging`: reading a body or writing a response, each wait bounded by
 --   the stall limit.
 -- * `Carrying`: carrying another protocol after a 101, bounded only by the
 --   deadline its `Duplex` sets: the protocol keeps its own time.
 -- * `Lingering(d)`: discarding input before a close, each read bounded by
 --   `lingerIdle`, and all of them by `d`.
-type Phase = Idle(Deadline) | Heading(Deadline) | Exchanging | Carrying | Lingering(Deadline)
+type Phase = Idle(Deadline) | ReadingHead(Deadline) | Exchanging | Carrying | Lingering(Deadline)
 
 -- Sets `g`'s connection's deadline for its next operation.
 --
@@ -560,7 +578,7 @@ type Phase = Idle(Deadline) | Heading(Deadline) | Exchanging | Carrying | Linger
 -- stopped both sending and reading.
 fun bound[Connection c](g : Guarded c) -> Unit = match g.phase {
     Idle(d) -> Net.setDeadline(g.conn, d)
-    Heading(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.stall)))
+    ReadingHead(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.stall)))
     Exchanging -> Net.setDeadline(g.conn, Deadline.after(g.stall))
     Carrying -> match g.carried {
         Some(d) -> Net.setDeadline(g.conn, d)
@@ -575,7 +593,7 @@ instance Read (Guarded c) : Connection c {
         bound(g)
         let n = readInto(g.conn, into)?
         if let Idle(_) = g.phase, n > 0 {
-            g.phase = Heading(Deadline.after(g.values.headTimeout))
+            g.phase = ReadingHead(Deadline.after(g.values.headTimeout))
         }
         Right(n)
     }
@@ -589,11 +607,7 @@ instance Write (Guarded c) : Connection c {
     fun writeFrom(g, from) {
         var at = from.start
         while at < from.end {
-            let to = if from.end - at > piece {
-                at + piece
-            } else {
-                from.end
-            }
+            let to = min(at + piece, from.end)
             bound(g)
             writeFrom(g.conn, Buf.view(from, at, to))?
             at = to
@@ -616,7 +630,7 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
     let g = Guarded {
         conn
         values
-        phase = Heading(Deadline.after(values.headTimeout))
+        phase = ReadingHead(Deadline.after(values.headTimeout))
         stall = values.stall
         carried = None
     }
@@ -635,18 +649,24 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
     Sync.release(server.permits)
 }
 
--- Marks the connection `id` idle or busy. Returns `False` if the server is
--- stopping, and then an idle connection is to close.
-fun mark(server : Server, id : Int, idle : Bool) -> Bool =
+-- Marks the connection `id` as waiting for a request. Returns `False`, and
+-- leaves it busy, if the server is stopping: the connection is to close.
+fun markIdle(server : Server, id : Int) -> Bool =
     Sync.withLock(server.registry, fun(r) {
-        if r.stopping && idle {
+        if r.stopping {
             return False
         }
-        if let Some(e) = Map.get(r.entries, id) {
-            e.idle = idle
-        }
+        setIdle(r, id, True)
         True
     })
+
+-- Marks the connection `id` as serving a request.
+fun markBusy(server : Server, id : Int) -> Unit = Sync.withLock(server.registry, setIdle(_, id, False))
+
+fun setIdle(r : Registry, id : Int, idle : Bool) -> Unit =
+    if let Some(e) = Map.get(r.entries, id) {
+        e.idle = idle
+    }
 
 -- What a connection does once a request's response is written and its
 -- handler has returned: read the next request, close, or shut down its side
@@ -658,56 +678,54 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
         server : Server, g : Guarded c, id : Int, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let limits = server.config.limits
     let input = Input.input(g, limits)
-    var info = None
-    var first = True
+    var known = None
     loop {
-        if first {
-            first = False
-        } else {
-            if !mark(server, id, True) { return }
-            -- Bytes held already are a pipelined request's head, begun.
-            g.phase = if Input.held(input) > 0 {
-                Heading(Deadline.after(g.values.headTimeout))
-            } else {
-                Idle(Deadline.after(g.values.idleTimeout))
-            }
-        }
         let found = Input.readHead(input, limits)
         let wasIdle = match g.phase {
             Idle(_) -> True
             _ -> False
         }
-        let bytes = match found {
+        let raw = match found {
             Right(Some(h)) -> h
             Right(None) -> return
             Left(Left(BadMessage(r))) -> return refuse(server, g, r)
-            Left(Left(e)) -> return failure(server, fail(e))
+            Left(Left(e)) -> return reportConnectionFailed(server, fail(e))
             Left(Right(e)) -> {
                 -- A kept-alive connection that times out, or that `stop`
                 -- closes, before a byte of the next request has ended
                 -- normally.
                 if !wasIdle && !isStopping(server) {
-                    failure(server, fail(e))
+                    reportConnectionFailed(server, fail(e))
                 }
                 return
             }
         }
-        let _ = mark(server, id, False)
+        markBusy(server, id)
         g.phase = Exchanging
         g.stall = g.values.stall
         -- Read once the first head is in, so a TLS handshake is done.
-        let described = match info {
+        let info = match known {
             Some(i) -> i
             None -> {
                 let i = connectionInfo(g.conn)
-                info = Some(i)
+                known = Some(i)
                 i
             }
         }
-        let HeadBytes { bytes = s, from, to } = bytes
-        match Head.parseRequest(s, from, to, limits) {
-            Right(head) -> match exchange(server, g, input, head, described, handler) {
-                KeepOpen -> {}
+        let HeadBytes { bytes, from, to } = raw
+        match Head.parseRequest(bytes, from, to, limits) {
+            Right(head) -> match exchange(server, g, input, head, info, handler) {
+                KeepOpen -> {
+                    if !markIdle(server, id) {
+                        return
+                    }
+                    -- Bytes held already are a pipelined request's head, begun.
+                    g.phase = if Input.held(input) > 0 {
+                        ReadingHead(Deadline.after(g.values.headTimeout))
+                    } else {
+                        Idle(Deadline.after(g.values.idleTimeout))
+                    }
+                }
                 CloseAfter -> return
                 LingerAfter -> return linger(g)
             }
@@ -716,7 +734,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
     }
 }
 
-fun failure(server : Server, e : SomeError) -> Unit = report(server, ConnectionFailed(e))
+fun reportConnectionFailed(server : Server, e : SomeError) -> Unit = report(server, ConnectionFailed(e))
 
 -- Sends the refusal's status in response to a request the codec refused,
 -- and closes the connection, lingering: the client may still be sending.
@@ -725,8 +743,8 @@ fun refuse[Connection c, Error (WriteError c)](server : Server, g : Guarded c, r
     g.phase = Exchanging
     let s = refusalStatus(r)
     let response = plain(s)
-    if let Left(e) = write(g, response, Close, False, Chunked) {
-        return failure(server, e)
+    if let Left(e) = write(g, response, Close, WithBody, Chunked) {
+        return reportConnectionFailed(server, e)
     }
     linger(g)
 }
@@ -743,7 +761,7 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
     let ex = Exchange { after = CloseAfter, continued = False }
     let body = Body.body(input, head.framing, server.config.limits)
     if head.expectContinue {
-        Body.beforeFirstRead(body, fun() = sendContinue(g, ex))
+        Body.beforeFirstRead(body, fun() = sendInformational(g, head, ex, Continue, Headers.empty))
     }
     let incoming = Body.incoming(body, fail)
     let req = Request {
@@ -756,7 +774,7 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
     let r = Respond {
         state = Unsent
         send = fun(response) { ex.after = writeResponse(server, g, input, body, head, response) }
-        sendInformational = fun(status, headers) = sendInformation(g, head, ex, status, headers)
+        sendInformational = fun(status, headers) = sendInformational(g, head, ex, status, headers)
         abort = fun() {
             let _ = close(g.conn)
             ex.after = CloseAfter
@@ -766,13 +784,10 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
         report = report(server, _)
     }
     let _ = handler(req, r)
-    match r.state {
-        Sent -> {}
-        _ -> {
-            report(server, NoResponse)
-            r.state = Sending
-            ex.after = writeResponse(server, g, input, body, head, plain(InternalServerError))
-        }
+    if !isSent(r.state) {
+        report(server, NoResponse)
+        r.state = Sending
+        ex.after = writeResponse(server, g, input, body, head, plain(InternalServerError))
     }
     -- A late `respond` or `inform`, from a task that outlived the handler,
     -- must not write into the next exchange.
@@ -785,29 +800,28 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
 fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), body : Body (Guarded c), head : RequestHead,
         response : ServerResponse) -> After {
-    let isHead = match head.method {
-        HEAD -> True
-        _ -> False
+    let extent = match head.method {
+        HEAD -> HeadOnly
+        _ -> WithBody
     }
-    let mayKeep = head.persistence == KeepAlive && !isStopping(server)
+    let wanted = if head.persistence == KeepAlive && !isStopping(server) { KeepAlive } else { Close }
     let unknown = if isHTTP10(head.version) { UntilClose } else { Chunked }
     match ServerResponse.outgoing(response) {
         Switched(protocol, run) -> switchTo(server, g, input, body, head, response, protocol, run)
         Streamed(stream) -> {
-            if isHead {
-                fixed(server, g, body, response, mayKeep, True, unknown)
+            if let HeadOnly = extent {
+                fixed(server, g, body, response, wanted, HeadOnly, unknown)
             } else {
                 -- The body stays readable while the function writes, so what is
                 -- left of it is known only once it returns.
-                let persistence = if mayKeep { KeepAlive } else { Close }
                 let framing = Stream.framing(Stream.length(stream), unknown)
-                let into = Stream.sink(Output.bodyWriter(g, headOf(response, framing, persistence), framing), fail)
+                let into = Stream.sink(Output.bodyWriter(g, headOf(response, framing, wanted), framing), fail)
                 if let Left(e) = Stream.send(stream, into) {
                     report(server, ResponseAborted(e))
                     return CloseAfter
                 }
                 if let Right(Reusable) = Body.drain(body) {
-                    if persistence == KeepAlive && framing != UntilClose {
+                    if wanted == KeepAlive && framing != UntilClose {
                         KeepOpen
                     } else {
                         CloseAfter
@@ -817,23 +831,21 @@ fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
                 }
             }
         }
-        _ -> fixed(server, g, body, response, mayKeep, isHead, unknown)
+        _ -> fixed(server, g, body, response, wanted, extent, unknown)
     }
 }
 
 -- Sends a response whose body is fixed already, or the response to a HEAD
--- request, after draining what is left of the request's body, so the
--- response says whether the connection stays open.
+-- request, after draining what is left of the request's body, so that the
+-- response's head can state whether the connection stays open: as `wanted`,
+-- if the request's body left it reusable.
 fun fixed[Connection c, Error (ReadError c), Error (WriteError c)](
-        server : Server, g : Guarded c, body : Body (Guarded c), response : ServerResponse, mayKeep : Bool,
-        isHead : Bool, unknown : Framing) -> After {
-    let drained = match Body.drain(body) {
-        Right(d) -> d
-        Left(_) -> MustClose
-    }
-    let keep = mayKeep && drained == Reusable
-    if let Left(e) = write(g, response, if keep { KeepAlive } else { Close }, isHead, unknown) {
-        failure(server, e)
+        server : Server, g : Guarded c, body : Body (Guarded c), response : ServerResponse, wanted : Persistence,
+        extent : Extent, unknown : Framing) -> After {
+    let drained = Either.unwrapOr(Body.drain(body), MustClose)
+    let keep = wanted == KeepAlive && drained == Reusable
+    if let Left(e) = write(g, response, if keep { KeepAlive } else { Close }, extent, unknown) {
+        reportConnectionFailed(server, e)
         return CloseAfter
     }
     if keep {
@@ -845,12 +857,16 @@ fun fixed[Connection c, Error (ReadError c), Error (WriteError c)](
     }
 }
 
--- Writes `response` with `persistence`, and no body for a response to
--- HEAD. A stream's body is not written: its response is written here only
--- for a HEAD request, framed as a GET's would be, with `unknown` for a
+-- Whether a response is written whole, or only its head, as to a HEAD
+-- request.
+type Extent = WithBody | HeadOnly
+
+-- Writes `response` with `persistence`, and with no body if `extent` is
+-- `HeadOnly`. A stream's body is not written: its response is written here
+-- only for a HEAD request, framed as a GET's would be, with `unknown` for a
 -- length the stream does not know.
 fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerResponse, persistence : Persistence,
-                                              isHead : Bool, unknown : Framing) -> Either SomeError Unit {
+                                              extent : Extent, unknown : Framing) -> Either SomeError Unit {
     let code = Status.code(ServerResponse.status(response))
     let content = ServerResponse.outgoing(response)
     let framing = match content {
@@ -858,8 +874,12 @@ fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerRe
         Streamed(stream) -> Stream.framing(Stream.length(stream), unknown)
         _ -> if code == 204 || code == 304 { NoBody } else { ContentLength(0) }
     }
-    let w = Output.bodyWriter(g, headOf(response, framing, persistence), if isHead { NoBody } else { framing })
-    if let Whole(b) = content, !isHead {
+    let written = match extent {
+        WithBody -> framing
+        HeadOnly -> NoBody
+    }
+    let w = Output.bodyWriter(g, headOf(response, framing, persistence), written)
+    if let (Whole(b), WithBody) = (content, extent) {
         Either.mapLeft(writeFrom(w, b), toSomeError)?
     }
     Either.mapLeft(Output.finish(w), toSomeError)
@@ -897,43 +917,37 @@ fun plain(s : Status) -> ServerResponse =
 
 -- -- informational responses -------------------------------------------------------------
 
--- Writes `100 Continue`, for a client waiting for it before it sends a
--- body, unless the handler has sent it already with `inform`.
-fun sendContinue[Connection c, Error (WriteError c)](g : Guarded c, ex : Exchange) -> Either HTTPError Unit {
-    if ex.continued {
+-- Writes the 1xx `status` with `headers`: nothing to an HTTP/1.0 client,
+-- and nothing for a `100 Continue` already sent, by the handler's `inform`
+-- or for a client waiting for it before it sends a body.
+fun sendInformational[Connection c, Error (WriteError c)](
+        g : Guarded c, head : RequestHead, ex : Exchange, status : Status, headers : Headers) -> Either HTTPError Unit {
+    if isHTTP10(head.version) {
         return Right(())
     }
-    ex.continued = True
-    sendHead(g, Output.responseHead(OutgoingResponse {
-        status = Continue
-        headers = Headers.empty
-        framing = NoBody
-        persistence = KeepAlive
-        upgrade = None
-    }))
-}
-
--- Writes the 1xx `status` with `headers`: nothing to an HTTP/1.0 client,
--- and nothing for a `100 Continue` already sent.
-fun sendInformation[Connection c, Error (WriteError c)](
-        g : Guarded c, head : RequestHead, ex : Exchange, status : Status, headers : Headers) -> Either HTTPError Unit {
-    if isHTTP10(head.version) { return Right(()) }
     if Status.code(status) == 100 {
-        if ex.continued { return Right(()) }
+        if ex.continued {
+            return Right(())
+        }
         ex.continued = True
     }
-    let sent = sendHead(g, Output.responseHead(OutgoingResponse {
-        status
-        headers
-        framing = NoBody
-        persistence = KeepAlive
-        upgrade = None
-    }))
+    let sent = sendHead(g, interimHead(status, headers, None))
     if let Left(_) = sent {
         ex.after = CloseAfter
     }
     sent
 }
+
+-- Returns the head of a 1xx response: no body, and the connection kept,
+-- switched to `upgrade` if there is one.
+fun interimHead(status : Status, headers : Headers, upgrade : Option HeaderValue) -> Buffer =
+    Output.responseHead(OutgoingResponse {
+        status
+        headers
+        framing = NoBody
+        persistence = if Option.isSome(upgrade) { Close } else { KeepAlive }
+        upgrade
+    })
 
 fun sendHead[Connection c, Error (WriteError c)](g : Guarded c, head : Buffer) -> Either HTTPError Unit {
     let sent = do {
@@ -970,19 +984,13 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
     let drained = Either.unwrapOr(Body.drain(body), MustClose)
     if isHTTP10(head.version) || !offers(Head.control(head).upgrade, protocol) || drained == MustClose {
         report(server, BadSwitch(protocol))
-        let _ = write(g, plain(InternalServerError), Close, False, Chunked)
+        let _ = write(g, plain(InternalServerError), Close, WithBody, Chunked)
         return if drained == MustClose { LingerAfter } else { CloseAfter }
     }
     let name = HeaderValue.literal(Token.toString(protocol))
-    let switched = Output.responseHead(OutgoingResponse {
-        status = ServerResponse.status(response)
-        headers = headers(response)
-        framing = NoBody
-        persistence = Close
-        upgrade = Some(name)
-    })
+    let switched = interimHead(ServerResponse.status(response), headers(response), Some(name))
     if let Left(e) = Output.finish(Output.bodyWriter(g, switched, NoBody)) {
-        failure(server, toSomeError(e))
+        reportConnectionFailed(server, toSomeError(e))
         return CloseAfter
     }
     g.phase = Carrying

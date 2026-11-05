@@ -13,7 +13,7 @@ type Assignment = Assignment { key : String, value : String }
 let word = R.some(R.satisfy(fun(c) = c >= 'a' && c <= 'z'))
 let assignment = R.compile(do {
     let key = R.capture(word)?
-    R.literal("=")?
+    let _ = R.literal("=")?
     let value = R.capture(word)?
     pure(R.map2(key, value, fun(k, v) =
         Assignment { key = k, value = v }
@@ -71,7 +71,7 @@ each use resolves to its own match:
 let token = R.capture(word)
 R.fullMatch(R.compile(do {
     let a = token?
-    R.literal("=")?
+    let _ = R.literal("=")?
     let b = token?
     pure((a, b))
 }), "ab=cd")

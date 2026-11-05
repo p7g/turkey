@@ -1,0 +1,1052 @@
+export (
+    Client, Config, defaultConfig,
+    policy, limits, roots, follow, connectLimit, idlePerOrigin, idleTotal,
+    client, close,
+    Exchange, Received(..), exchange, exchangeUnbounded, next, send, sendUnbounded, sendUpgrade, sendUpgradeUnbounded,
+    redirect, expectStatus, hostField, contentLength, retryAllowed,
+)
+
+-- An HTTP/1.1 client: requests sent over a pool of connections, each one
+-- reaching only what a `ConnectPolicy` allows.
+--
+--     let c = Client.client(Client.defaultConfig)?
+--     send(c, request(GET, "https://api.example.com/users/1"), Duration.seconds(10), fun(resp) {
+--         expectStatus(resp, OK)?
+--         receive(resp.body, 1048576)
+--     })
+--
+-- **The response is the callback's.** `send` calls `use` with the response
+-- once its head has arrived, and the body can be read only inside `use`.
+-- When `use` returns, what it left unread is read and thrown away if that is
+-- cheap (the limits' `drainBytes`), so the connection can carry the next request;
+-- otherwise the connection is closed. A body read after `use` returned fails
+-- with `Transport` of an `IOError` whose kind is `Closed`. `use`'s result,
+-- and its error, are `send`'s.
+--
+-- **Every head, pulled.** `exchange` calls `use` with the exchange instead,
+-- and `next` returns each head the server responds with: every interim (1xx)
+-- response as `Informational`, then the final one as `Final`, whose body is
+-- read as `send`'s is. A proxy relays a 103 that way. `send` is `exchange`
+-- with the interim responses skipped. A 100 Continue is never returned: the
+-- server sends it in response to the client's own `Expect`. A server may
+-- send at most 16 interim responses before the final one; more, or a 101 to
+-- a request that asked for no upgrade, is `BadResponse`.
+--
+-- **Errors** come back through `FromHTTP`, so `?` lifts them into the
+-- caller's own error type. A request that got no response is `SendFailed`
+-- of a `ClientError`, which records whether the server may have seen it:
+-- `NotSent`, `MaybeSent` or `BadResponse`.
+--
+-- **Deadlines.** The timeout covers everything: resolving, connecting, the
+-- TLS handshake, sending, the response's heads, every redirect `send`
+-- follows, the one retry, and each read of the body inside `use`. The
+-- `...Unbounded` calls have no total limit, for a transfer whose length
+-- cannot be known ahead. Two limits hold for both: resolving, connecting and
+-- the handshake together within the connect limit (30 s), and the limits'
+-- `stall` (30 s), which closes a connection on which a read or write has waited
+-- that long while no byte moved either way. A deadline that passes part-way
+-- through a message closes the connection.
+--
+-- **Connections** are pooled per origin -- scheme, host and port -- and a
+-- connection is reused only once both directions ended exactly: the request
+-- was written whole, and its response was read to its exact end with
+-- nothing after it. A byte past the end would be read as the next response,
+-- so a connection that has one is closed. Up to 64 idle connections are kept
+-- per origin and 100 in all, the oldest closed first past that, each for up
+-- to the limits' `idleTimeout` (60 s). A `Client` is safe to share between
+-- tasks.
+--
+-- **One retry.** A pooled connection may be stale: closed by the server
+-- while it was idle, which the client learns only by using it, when it
+-- ends before any byte of a response. Then the request is sent once more
+-- on a new connection, if it is safe to: it was `NotSent`, or it was
+-- `MaybeSent` and its method is idempotent or it has an `Idempotency-Key`;
+-- and its body can be sent again. Nothing else is retried.
+--
+-- **Redirects** are responses like any other: a 3xx reaches `use` as it is.
+-- `redirect(resp, req)` builds the request that follows one, under the rules
+-- its comment gives, so a program that must see each hop loops itself.
+-- A client built with `follow(n)` has `send` run that loop for up to `n` hops; the hop
+-- past `n` is `NotSent(BadRedirect(TooManyRedirects))`, and one `redirect`
+-- refuses for a reason other than `NotRedirect`, `NoLocation` or
+-- `NotReplayable` is `NotSent(BadRedirect(...))`. Each hop goes through
+-- `Net.resolve` and the policy again, as any request does. A response's
+-- `url` is the URL it came from, and its `timings` how long each step of its
+-- hop took.
+--
+-- **Upgrades.** `sendUpgrade` offers to switch the connection to another
+-- protocol (WebSocket, for one), and on a 101 hands `use` the connection as a
+-- `Duplex`: bytes the server sent after its 101 are read first, and
+-- `shutdownWrite` ends this side's output while the server goes on. A 101
+-- must name only protocols the request offered, or it is `BadResponse`. The
+-- timeout ends with the 101; after it, the new protocol keeps its own time,
+-- with the deadlines `use` sets, and the stall limit no longer applies. The
+-- connection is closed when `use` returns, never pooled. A proxy calls the
+-- server's `switch` inside `use`, so both connections close together.
+--
+-- **Bodies.** A request's method carries its body as a `Payload`, made by
+-- `newPOST`, `newPUT`, `newPATCH` or `newExtension` from any `Body`
+-- (`Net.HTTP.Body`), which holds its length and whether it can be sent
+-- again. A `Stream` body sends the trailers its function returns, and a
+-- relayed `Incoming` the trailers it came with. A body that fails, or does
+-- not match the length it declared, fails the request, and the connection
+-- is closed. A response's trailers are `trailers(resp.body)` once its body
+-- has been read to the end.
+--
+-- **On the wire.** HTTP/1.1, one request at a time per connection, never
+-- pipelined. The client writes `Host` (`hostField`), the framing
+-- (`Content-Length` from the body's length, `contentLength`, or chunked when
+-- it has none), `Expect: 100-continue`, and nothing else of its own. A
+-- request body is written by a task of its own while the response is read,
+-- so a response the server sends before reading the whole body (a 413) is
+-- read.
+-- TLS offers ALPN `http/1.1`.
+--
+-- **`Expect: 100-continue`** goes with a body of 1 MiB or more, and with a
+-- relayed `Incoming` whose sender waits for a 100 itself. The body is sent
+-- once the server's 100 arrives, or after 1 s without one; a final response
+-- first means it is not sent, and the connection is closed. A relayed body
+-- is read only when it is sent, and that first read is what sends its
+-- sender's 100, so a server's refusal reaches the sender before it has sent
+-- a byte.
+
+import Data.Error as Error
+import Data.Error (promote)
+import Data.Ord (min)
+import Net
+import Net (ConnectPolicy)
+import Net.TCP as TCP
+import Net.TLS as TLS
+import Net.TLS (TLSError, Roots(..))
+import Net.HTTP.Payload as Payload (Payload)
+import Net.HTTP.Error (HTTPError(..), ClientError(..), RedirectRefused(..), Refusal(..), FromHTTP(..))
+import Net.HTTP.H1.Body as Framed
+import Net.HTTP.H1.Body (Drained(..))
+import Net.HTTP.H1.Head as Head
+import Net.HTTP.H1.Head (ResponseHead(..), Framing(..), Persistence(..))
+import Net.HTTP.H1.Input as Input
+import Net.HTTP.H1.Input (Input, HeadBytes(..))
+import Net.HTTP.H1.Output as Output
+import Net.HTTP.H1.Output (OutgoingRequest(..))
+import Net.HTTP.H1.Pool as Pool
+import Net.HTTP.H1.Pool (Conn(..), Paced, Pool)
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.Headers as Headers (Headers, Authorization(..), ContentType(..), IdempotencyKey(..), Location(..))
+import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
+import Net.HTTP.Incoming as Incoming (Incoming)
+import Net.HTTP.Limits as Limits (Limits)
+import Net.HTTP.Method as Method (Method(..))
+import Net.HTTP.Request (ClientRequest(..))
+import Net.HTTP.Response (Response(..), Timings(..))
+import Net.HTTP.Status as Status (Status)
+import Net.HTTP.Stream as Stream (Stream, BodyLength(..))
+import Control.Iterator as Iterator
+import Net.HTTP.Syntax as Syntax
+import Net.HTTP.Token as Token (Token)
+import Net.HTTP.Duplex as Duplex (Duplex)
+import Time.Clock as Clock
+import Time.Stopwatch as Stopwatch
+import System.IO as IO
+import System.Sync as Sync
+import System.Task as Task
+import Time (Timeout(..))
+import Time.Deadline as Deadline
+import Time.Deadline (Deadline)
+import Time.Duration as Duration
+import Time.Duration (Duration)
+import Turkey.Buffer (Buffer)
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.ReadWrite (Read(..), Write(..))
+import URL as URL
+
+-- -- configuration ----------------------------------------------------------------------
+
+-- Overrides of a client's settings, each one `None` to keep the default. A
+-- monoid: `defaultConfig` changes nothing, and `combine(a, b)` takes each
+-- setting from `b` where `b` sets it and from `a` where it does not, so
+-- settings can be named, kept and combined in any grouping. Each function
+-- below returns a `Config` that sets one thing, and has the name of the
+-- field it sets. `limits` is itself a set of overrides, which combine the
+-- same way.
+type Config = Config {
+    policy : Option ConnectPolicy,
+    limits : Limits,
+    roots : Option Roots,
+    follow : Option Int,
+    connectLimit : Option Duration,
+    idlePerOrigin : Option Int,
+    idleTotal : Option Int,
+}
+
+-- The `Config` that sets nothing, so that every setting has its default.
+let defaultConfig = Config {
+    policy = None, limits = Limits.empty, roots = None, follow = None, connectLimit = None, idlePerOrigin = None,
+    idleTotal = None,
+}
+
+instance Semigroup Config {
+    fun combine(a, b) = Config {
+        policy = Option.or(b.policy, a.policy),
+        limits = combine(a.limits, b.limits),
+        roots = Option.or(b.roots, a.roots),
+        follow = Option.or(b.follow, a.follow),
+        connectLimit = Option.or(b.connectLimit, a.connectLimit),
+        idlePerOrigin = Option.or(b.idlePerOrigin, a.idlePerOrigin),
+        idleTotal = Option.or(b.idleTotal, a.idleTotal),
+    }
+}
+
+instance Monoid Config { fun empty() = defaultConfig }
+
+-- Returns a `Config` that connects only where `p` allows. The default is
+-- `Net.publicInternet`, so that a client reaches a loopback or private
+-- address only where a program allows it.
+fun policy(p : ConnectPolicy) -> Config = Config {
+    policy = Some(p), limits = Limits.empty, roots = None, follow = None, connectLimit = None, idlePerOrigin = None,
+    idleTotal = None,
+}
+
+-- Returns a `Config` that reads responses under `l`'s overrides of the
+-- limits. Of the limits, the client uses the head, line, chunk-line, trailer
+-- and drain sizes; `stall`, for each read and write; and `idleTimeout`, for
+-- how long a pooled connection is kept. Combining two such `Config`s
+-- combines their limits.
+fun limits(l : Limits) -> Config = Config {
+    policy = None, limits = l, roots = None, follow = None, connectLimit = None, idlePerOrigin = None,
+    idleTotal = None,
+}
+
+-- Returns a `Config` that trusts `r` rather than the system's roots: a
+-- test's own CA, or a service's.
+fun roots(r : Roots) -> Config = Config {
+    policy = None, limits = Limits.empty, roots = Some(r), follow = None, connectLimit = None, idlePerOrigin = None,
+    idleTotal = None,
+}
+
+-- Returns a `Config` under which `send` follows up to `n` redirects per
+-- request. The default is 0. Panics if `n` is negative.
+fun follow(n : Int) -> Config {
+    if n < 0 { error("Client.follow: redirect count " + Int.toString(n) + " cannot be negative") }
+    Config {
+        policy = None, limits = Limits.empty, roots = None, follow = Some(n), connectLimit = None, idlePerOrigin = None,
+        idleTotal = None,
+    }
+}
+
+-- Returns a `Config` that allows `d` for resolving, connecting and the TLS
+-- handshake together. The default is 30 s. Panics if `d` is not positive.
+fun connectLimit(d : Duration) -> Config {
+    if Duration.toNanos(d) <= 0 { error("Client.connectLimit: connect limit " + show(d) + " must be positive") }
+    Config {
+        policy = None, limits = Limits.empty, roots = None, follow = None, connectLimit = Some(d), idlePerOrigin = None,
+        idleTotal = None,
+    }
+}
+
+-- Returns a `Config` that keeps up to `n` idle connections per origin; 0
+-- keeps none. The default is 64. Panics if `n` is negative.
+fun idlePerOrigin(n : Int) -> Config {
+    if n < 0 { error("Client.idlePerOrigin: idle connection count " + Int.toString(n) + " cannot be negative") }
+    Config {
+        policy = None, limits = Limits.empty, roots = None, follow = None, connectLimit = None, idlePerOrigin = Some(n),
+        idleTotal = None,
+    }
+}
+
+-- Returns a `Config` that keeps up to `n` idle connections in all, across
+-- every origin, closing the oldest past it; 0 keeps none. The default is
+-- 100. Panics if `n` is negative.
+fun idleTotal(n : Int) -> Config {
+    if n < 0 { error("Client.idleTotal: idle connection count " + Int.toString(n) + " cannot be negative") }
+    Config {
+        policy = None, limits = Limits.empty, roots = None, follow = None, connectLimit = None, idlePerOrigin = None,
+        idleTotal = Some(n),
+    }
+}
+
+-- A `Config` with every default filled in. `limits` stays a set of
+-- overrides, which the codec resolves where it reads one; `stall` and
+-- `idle` are resolved from it once here.
+type Settings = Settings {
+    policy : ConnectPolicy,
+    limits : Limits,
+    roots : Roots,
+    follow : Int,
+    stall : Duration,
+    connectLimit : Duration,
+    idle : Duration,
+    idlePerOrigin : Int,
+    idleTotal : Int,
+}
+
+fun settings(c : Config) -> Settings {
+    let v = Limits.values(c.limits)
+    Settings {
+        policy = Option.unwrapOr(c.policy, Net.publicInternet),
+        limits = c.limits,
+        roots = Option.unwrapOr(c.roots, SystemRoots),
+        follow = Option.unwrapOr(c.follow, 0),
+        stall = v.stall,
+        connectLimit = Option.unwrapOr(c.connectLimit, Duration.seconds(30)),
+        idle = v.idleTimeout,
+        idlePerOrigin = Option.unwrapOr(c.idlePerOrigin, 64),
+        idleTotal = Option.unwrapOr(c.idleTotal, 100),
+    }
+}
+
+-- -- the client -------------------------------------------------------------------------
+
+type Client = Client { settings : Settings, tls : TLS.ClientConfig, pool : Pool }
+
+-- Returns a client with `c`'s settings, and the defaults for those it does
+-- not set, or why its TLS configuration cannot be made: a roots file that
+-- does not load.
+fun client(c : Config) -> Either TLSError Client {
+    let s = settings(c)
+    let tls = TLS.clientConfig(s.roots, ["http/1.1"])?
+    Right(Client { settings = s, tls, pool = Pool.pool(s.idlePerOrigin, s.idleTotal, s.idle) })
+}
+
+-- Closes the client's idle connections and frees its TLS configuration. A
+-- request in flight finishes; one sent later fails.
+fun close(c : Client) -> Unit {
+    Pool.closeIdle(c.pool)
+    TLS.releaseClient(c.tls)
+}
+
+-- Returns `Right(())` if the response's status is `status`, and otherwise
+-- `UnexpectedStatus` with the status it has.
+fun expectStatus[FromHTTP e](r : Response b, status : Status) -> Either e Unit =
+    if r.status == status { Right(()) } else { Left(fromHTTP(UnexpectedStatus(r.status))) }
+
+-- Returns the `Host` value the client writes for a request to `u`, for a
+-- program that signs the request's fields.
+fun hostField(u : HTTPURL) -> String = Output.hostField(u)
+
+-- Returns the `Content-Length` the client writes for `req`'s body, for a
+-- program that signs the request's fields: `None` if its method has no body
+-- or the body's length is not known before it is sent, and so it goes
+-- chunked.
+fun contentLength(req : ClientRequest Payload) -> Either HTTPError (Option Int) = match Method.body(req.method) {
+    Some(p) -> match Stream.length(Payload.open(p)?) {
+        LengthKnown(n) -> Right(Some(n))
+        LengthUnknown -> Right(None)
+    }
+    None -> Right(None)
+}
+
+-- -- sending ----------------------------------------------------------------------------
+
+-- A head the server sent in response to a request: an interim (1xx) one, of
+-- which there may be several, or the final response.
+type Received = Informational(Status, Headers) | Final(Response Incoming)
+
+-- Sends `req` and calls `use` with the exchange, from which `next` reads
+-- each head the server responds with, everything within `timeout`. See the
+-- module comment.
+fun exchange[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, timeout : d,
+                                     use : fun(Exchange) -> Either e a) -> Either e a =
+    exchangeWithin(c, req, Some(deadline(timeout)), use)
+
+-- `exchange` with no total limit: only the connect limit and the stall
+-- limit.
+fun exchangeUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload,
+                                  use : fun(Exchange) -> Either e a) -> Either e a =
+    exchangeWithin(c, req, None, use)
+
+-- Sends `req` and calls `use` with its final response, everything within
+-- `timeout`. Interim (1xx) responses are skipped, and redirects followed as
+-- far as the client's `follow` allows. See the module comment.
+fun send[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, timeout : d,
+                                 use : fun(Response Incoming) -> Either e a) -> Either e a =
+    sendWithin(c, req, Some(deadline(timeout)), use)
+
+-- `send` with no total limit: only the connect limit and the stall limit.
+fun sendUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload,
+                              use : fun(Response Incoming) -> Either e a) -> Either e a =
+    sendWithin(c, req, None, use)
+
+-- Sends `req` offering to switch its connection to one of `protocols`, in
+-- order of preference, and calls `use` with the final response and the
+-- switched connection. A 101 is the switch: `use` reads and writes the new
+-- protocol through the `Duplex`, and the connection is closed when `use`
+-- returns. Any other final response reaches `use` as `send`'s would, with
+-- a duplex whose every read and write fails with an `IOError` of kind
+-- `Closed`.
+-- `timeout` covers everything up to the final response's head; the duplex is
+-- bounded only by the deadlines `use` sets on it. Panics if `protocols` is
+-- empty.
+fun sendUpgrade[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, protocols : Array Token, timeout : d,
+                                        use : fun(Response Incoming, Duplex) -> Either e a) -> Either e a =
+    upgradeWithin(c, req, offer(protocols, "sendUpgrade"), Some(deadline(timeout)), use)
+
+-- `sendUpgrade` with no limit on reaching the final response but the
+-- connect limit and the stall limit. Panics if `protocols` is empty.
+fun sendUpgradeUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload, protocols : Array Token,
+                                     use : fun(Response Incoming, Duplex) -> Either e a) -> Either e a =
+    upgradeWithin(c, req, offer(protocols, "sendUpgradeUnbounded"), None, use)
+
+-- Returns `protocols`, or panics, naming `caller`, if it is empty.
+fun offer(protocols : Array Token, caller : String) -> Array Token {
+    if len(protocols) == 0 {
+        error("Client." + caller + ": 'protocols' cannot be empty; offer at least one protocol")
+    }
+    protocols
+}
+
+-- One request as it is sent to one URL: the first, or a redirect's, and the
+-- protocols it offers to switch to.
+type Hop = Hop { method : Method Payload, url : HTTPURL, headers : Headers, upgrade : Array Token }
+
+fun firstHop(req : ClientRequest Payload, upgrade : Array Token) -> Either HTTPError Hop = match req.url {
+    Right(url) -> Right(Hop { method = req.method, url, headers = req.headers, upgrade })
+    Left(e) -> Left(SendFailed(NotSent(BadURL(e))))
+}
+
+fun upgradeWithin[FromHTTP e](c : Client, req : ClientRequest Payload, protocols : Array Token,
+                              total : Option Deadline, use : fun(Response Incoming, Duplex) -> Either e a)
+        -> Either e a {
+    let h = Either.mapLeft(firstHop(req, protocols), fromHTTP)?
+    match sendHop(c, h, total, fun(ex) = switched(ex, use)) {
+        Right(r) -> r
+        Left(e) -> Left(fromHTTP(e))
+    }
+}
+
+-- Reads `ex`'s final response, and on a 101 to a protocol the request
+-- offered, hands `use` the connection.
+fun switched[FromHTTP e](ex : Exchange, use : fun(Response Incoming, Duplex) -> Either e a) -> Either e a {
+    let resp = loop {
+        if let Final(resp) = next(ex)? { break resp }
+    }
+    let rh = match ex.state {
+        Delivering(_, rh) -> rh
+        _ -> return Left(fromHTTP(closed()))
+    }
+    if Status.code(rh.status) != 101 { return use(resp, closedDuplex()) }
+    let chosen = Head.protocols(rh.upgrade)
+    if len(chosen) == 0 || !Iterator.all(chosen, fun(t) = offered(ex.hop.upgrade, t)) {
+        return Left(fromHTTP(failWith(ex, BadResponse(BadMessage(Malformed)))))
+    }
+    -- The server switches once it has read the whole request, so the
+    -- connection is the new protocol's only once the request was written.
+    awaitWriter(ex.written)
+    if Sync.load(ex.written) != 1 { return Left(fromHTTP(failWith(ex, MaybeSent(Truncated)))) }
+    ex.state = Over
+    let p = ex.paced
+    let conn = Pool.conn(p)
+    Pool.carry(p, None)
+    let d = Duplex.duplex(
+        fun(into : Buffer) = Either.mapLeft(Input.take(ex.input, into, Int.maxValue()), fun(e) = match e {
+            Left(h) -> fail(h)
+            Right(s) -> s
+        }),
+        fun(from : Buffer) = writeFrom(p, from),
+        fun() = Right(()),
+        fun(limit : Option Deadline) = Pool.carry(p, limit),
+        fun() = Pool.halfClose(conn),
+        fun() {
+            Pool.close(conn)
+            Right(())
+        },
+    )
+    let r = use(resp, d)
+    Pool.close(conn)
+    r
+}
+
+-- Whether `protocols` holds `t`, compared without case.
+fun offered(protocols : Array Token, t : Token) -> Bool =
+    Iterator.any(protocols, fun(o) = Syntax.asciiLower(Token.toString(o)) == Syntax.asciiLower(Token.toString(t)))
+
+-- A duplex over no connection, for a response that did not switch: every
+-- read and write fails with an `IOError` of kind `Closed`.
+fun closedDuplex() -> Duplex = Duplex.duplex(
+    fun(_) = Left(closedError("read")),
+    fun(_) = Left(closedError("write")),
+    fun() = Left(closedError("flush")),
+    fun(_) {},
+    fun() = Left(closedError("shutdown")),
+    fun() = Right(()),
+)
+
+-- Returns the error of an operation `op` on a closed connection.
+fun closedError(op : String) -> SomeError = fail(IOError { kind = Closed, op, path = None })
+
+fun exchangeWithin[FromHTTP e](c : Client, req : ClientRequest Payload, total : Option Deadline,
+                               use : fun(Exchange) -> Either e a) -> Either e a {
+    let h = Either.mapLeft(firstHop(req, []), fromHTTP)?
+    match sendHop(c, h, total, use) {
+        Right(r) -> r
+        Left(e) -> Left(fromHTTP(e))
+    }
+}
+
+-- What one hop of `send` came to.
+type Step a = Delivered(a) | Redirected(Hop)
+
+fun sendWithin[FromHTTP e](c : Client, req : ClientRequest Payload, total : Option Deadline,
+                           use : fun(Response Incoming) -> Either e a) -> Either e a {
+    var h = Either.mapLeft(firstHop(req, []), fromHTTP)?
+    var left = c.settings.follow
+    loop {
+        let from = h
+        let step = sendHop(c, h, total, fun(ex) -> Either HTTPError (Step (Either e a)) {
+            let resp = final(ex)?
+            if c.settings.follow > 0 {
+                match redirectHop(resp, from) {
+                    Right(next) -> return if left == 0 {
+                        Left(SendFailed(NotSent(BadRedirect(TooManyRedirects))))
+                    } else {
+                        Right(Redirected(next))
+                    }
+                    -- Not one to follow: the caller gets it.
+                    Left(NotRedirect) | Left(NoLocation) | Left(NotReplayable) -> {}
+                    Left(r) -> return Left(SendFailed(NotSent(BadRedirect(r))))
+                }
+            }
+            Right(Delivered(use(resp)))
+        })
+        match step {
+            Left(e) | Right(Left(e)) -> return Left(fromHTTP(e))
+            Right(Right(Delivered(r))) -> return r
+            Right(Right(Redirected(next))) -> {
+                h = next
+                left = left - 1
+            }
+        }
+    }
+}
+
+-- Returns the exchange's final response, skipping interim ones.
+fun final[FromHTTP e](ex : Exchange) -> Either e (Response Incoming) = loop {
+    match next(ex)? {
+        Informational(_, _) -> {}
+        Final(resp) -> break Right(resp)
+    }
+}
+
+-- What went wrong with one attempt at a hop: its connection was stale
+-- (`Stale`), so the request may be sent again; or otherwise.
+type Failure = Stale(ClientError) | Failed(HTTPError)
+
+-- Whether an attempt may take a pooled connection, or must make a new one.
+type Reuse = MayReuse | NeverReuse
+
+-- Sends `h`, and once more on a new connection if the first was stale and
+-- the retry rule allows it.
+fun sendHop[FromHTTP e](c : Client, h : Hop, total : Option Deadline,
+                        use : fun(Exchange) -> Either e a) -> Either HTTPError (Either e a) =
+    match attempt(c, h, total, MayReuse, use) {
+        Right(r) -> Right(r)
+        Left(Failed(e)) -> Left(e)
+        Left(Stale(e)) -> if mayRetry(e, h.method, h.headers) {
+            match attempt(c, h, total, NeverReuse, use) {
+                Right(r) -> Right(r)
+                Left(Failed(again)) -> Left(again)
+                Left(Stale(again)) -> Left(SendFailed(again))
+            }
+        } else {
+            Left(SendFailed(e))
+        }
+    }
+
+-- Returns whether the client sends `req` again after it failed with `e` on a
+-- stale connection: when sending it again cannot repeat an effect, because
+-- none of it was sent, or its method is idempotent, or it has an
+-- `Idempotency-Key`; and its body, if it has one, can be sent again.
+fun retryAllowed(e : ClientError, req : ClientRequest Payload) -> Bool = mayRetry(e, req.method, req.headers)
+
+fun mayRetry(e : ClientError, m : Method Payload, headers : Headers) -> Bool {
+    let safe = match e {
+        NotSent(_) -> True
+        MaybeSent(_) -> Method.isIdempotent(m) || Headers.has(headers, IdempotencyKey)
+        BadResponse(_) -> False
+    }
+    safe && replayable(m)
+}
+
+-- Whether the method's body, if it has one, can be sent again.
+fun replayable(m : Method Payload) -> Bool = match Method.body(m) {
+    Some(o) -> Payload.replayable(o)
+    None -> True
+}
+
+-- -- one exchange -----------------------------------------------------------------------
+
+-- Returns the key of the pool `u`'s connections are kept under.
+fun origin(u : HTTPURL) -> String =
+    (if HTTPURL.isHTTPS(u) { "https://" } else { "http://" }) + HTTPURL.host(u) + ":"
+        + Int.toString(HTTPURL.port(u))
+
+-- One request on one connection, and the heads read in response to it.
+type Exchange = Exchange {
+    client : Client,
+    hop : Hop,
+    paced : Paced,
+    input : Input Paced,
+    -- 0 while the request is being written, 1 once it all was, 2 if writing
+    -- it failed or its body was not sent.
+    written : Sync.AtomicInt,
+    -- Whether the body is to be sent after `Expect: 100-continue`.
+    verdict : Verdict,
+    key : String,
+    dialed : Dialed,
+    -- When writing the request began.
+    began : Clock.Reading,
+    -- A head read before `use` was called, not yet returned by `next`.
+    var pending : Option ResponseHead,
+    var interim : Int,
+    var state : State,
+    -- Why the body could not be written, if its own source failed rather
+    -- than the connection. Set by the writer before it stores `written`.
+    var sourceFailure : Option HTTPError,
+}
+
+-- Where an exchange is: reading heads; with its final response delivered;
+-- or over, after a failure or once `use` returned.
+type State = Reading | Delivering(Scoped, ResponseHead) | Over
+
+-- Sends `h` on a pooled connection, if `reuse` allows one and there is one,
+-- or on a new one, and reads the response's first head; then calls `use`
+-- with the exchange. A pooled connection that turns out stale before that
+-- head is `Stale`, and `use` is not called.
+fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Reuse,
+                        use : fun(Exchange) -> Either e a) -> Either Failure (Either e a) {
+    let body = match Method.body(h.method) {
+        None -> None
+        Some(o) -> match Payload.open(o) {
+            Right(s) -> Some((s, Payload.awaitsContinue(o)))
+            Left(e) -> return Left(Failed(SendFailed(NotSent(e))))
+        }
+    }
+    let framing = match body {
+        None -> NoBody
+        Some((s, _)) -> Stream.framing(Stream.length(s), Chunked)
+    }
+    -- A relayed body whose sender waits for a 100 is read only once this
+    -- server's 100 arrives, and that read sends the sender's: so a refusal
+    -- from here reaches the sender before it sends a byte.
+    let expecting = match body {
+        Some((s, relayed)) -> relayed || match Stream.length(s) {
+            LengthKnown(n) -> n >= continueThreshold
+            LengthUnknown -> False
+        }
+        None -> False
+    }
+    let head = match Output.requestHead(OutgoingRequest {
+        method = h.method, url = h.url, headers = h.headers, framing, persistence = KeepAlive,
+        expectContinue = expecting, upgrade = h.upgrade,
+    }) {
+        Right(b) -> b
+        Left(e) -> return Left(Failed(SendFailed(NotSent(e))))
+    }
+    let key = origin(h.url)
+    let pooled = match reuse {
+        MayReuse -> Pool.take(c.pool, key)
+        NeverReuse -> None
+    }
+    let reused = Option.isSome(pooled)
+    let made = match pooled {
+        Some(conn) -> (conn, reusedConnection)
+        None -> match dial(c, h.url, total) {
+            Right(made) -> made
+            Left(e) -> return Left(Failed(SendFailed(NotSent(e))))
+        }
+    }
+    let (conn, dialed) = made
+    let p = Pool.paced(conn, total, c.settings.stall)
+    let written = Sync.atomicInt(0)
+    let verdict = Verdict { decided = Sync.atomicInt(0), ready = Sync.semaphore(0) }
+    let ex = Exchange {
+        client = c, hop = h, paced = p, input = Input.input(p, c.settings.limits), written, verdict,
+        key, dialed, began = Clock.monotonic(), pending = None, interim = 0, state = Reading, sourceFailure = None,
+    }
+    let proceed = if expecting { Some(fun() = awaitContinue(verdict, total)) } else { None }
+    let write = fun() = match writeRequest(p, head, framing, Option.map(body, fun((s, _)) = s), proceed) {
+        Wrote -> Sync.store(written, 1)
+        SourceFailed(e) -> {
+            ex.sourceFailure = Some(e)
+            Sync.store(written, 2)
+        }
+        ConnectionFailed | Withheld -> Sync.store(written, 2)
+    }
+    let run = fun() -> Either Failure (Either e a) = match readHead(ex) {
+        Right(rh) -> {
+            ex.pending = Some(rh)
+            let r = use(ex)
+            finish(ex)
+            Right(r)
+        }
+        Left(MaybeStale(e)) -> if reused {
+            Pool.close(conn)
+            decide(verdict, Withhold)
+            awaitWriter(written)
+            Left(Stale(MaybeSent(e)))
+        } else {
+            Left(Failed(failWith(ex, MaybeSent(e))))
+        }
+        Left(Broken(e)) -> Left(Failed(failWith(ex, e)))
+    }
+    match body {
+        None -> {
+            write()
+            run()
+        }
+        Some(_) -> Task.runScope(do {
+            let _ = Task.spawn(write)?
+            pure(run())
+        })
+    }
+}
+
+-- How writing a request ended. A connection that failed carries no reason:
+-- the response's reader meets the same failure itself. `Withheld`: the
+-- server responded to `Expect: 100-continue` with a final response, so the
+-- body was not sent.
+type Written = Wrote | SourceFailed(HTTPError) | ConnectionFailed | Withheld
+
+-- Writes the request's head and body. With `proceed`, sends the head alone
+-- first, and the body only if `proceed` returns `True`. If the body's own
+-- source fails, closes the connection, so that the response is not waited
+-- for: the server is waiting for the rest of the body. If the connection
+-- fails, leaves it, so that a response the server sent before it stopped
+-- reading is still read.
+fun writeRequest(p : Paced, head : Buffer, framing : Framing, body : Option Stream,
+                 proceed : Option (fun() -> Bool)) -> Written {
+    let w = Output.bodyWriter(p, head, framing)
+    if let Some(go) = proceed {
+        if let Left(_) = flush(w) { return ConnectionFailed }
+        if !go() { return Withheld }
+    }
+    var connectionFailed = False
+    let finished = match body {
+        Some(s) -> Stream.send(s, Stream.sink(w, fun(e) {
+            connectionFailed = True
+            e
+        }))
+        None -> match Output.finish(w) {
+            Right(_) -> Right(())
+            Left(Left(h)) -> Left(fail(h))
+            Left(Right(e)) -> {
+                connectionFailed = True
+                Left(e)
+            }
+        }
+    }
+    match finished {
+        Right(_) -> Wrote
+        Left(e) -> if connectionFailed {
+            ConnectionFailed
+        } else {
+            Pool.close(Pool.conn(p))
+            -- The codec's own refusals (`Overrun`, `Truncated`,
+            -- `UnframedTrailers`) are `HTTPError`s; anything else failed in
+            -- the body's source.
+            SourceFailed(match Error.cast(e) : Option HTTPError {
+                Some(h) -> h
+                None -> Transport(e)
+            })
+        }
+    }
+}
+
+-- A body this long or longer goes after `Expect: 100-continue`, so that a
+-- server can refuse it (a 413, a 401) before it is sent. 1 MiB is curl's
+-- threshold: below it, the round trip the server's 100 costs is worth more
+-- than the bytes a refusal saves.
+let continueThreshold = 1048576
+
+-- How long to wait for a server's 100 before sending the body anyway, as
+-- RFC 9110 §10.1.1 allows: a server that does not understand `Expect` never
+-- sends one. 1 s is curl's wait.
+let continueWait = Duration.seconds(1)
+
+-- Whether the body waiting on `Expect: 100-continue` is to be sent: decided
+-- once, by the reader on the server's 100 or final response, by the writer
+-- when the wait runs out, or by a failure.
+type Verdict = Verdict { decided : Sync.AtomicInt, ready : Sync.Semaphore }
+
+type Decision = Send | Withhold
+
+fun code(d : Decision) -> Int = match d {
+    Send -> 1
+    Withhold -> 2
+}
+
+-- Decides `v` as `d`, unless it has been decided, and wakes the writer.
+fun decide(v : Verdict, d : Decision) -> Unit {
+    if Sync.compareAndSet(v.decided, 0, code(d)) { Sync.release(v.ready) }
+}
+
+-- Waits for the server's verdict, up to `continueWait` and `total`, and
+-- returns whether to send the body: yes on a 100 or a wait run out, and no
+-- on a final response or a failure.
+fun awaitContinue(v : Verdict, total : Option Deadline) -> Bool {
+    let wait = Deadline.after(continueWait)
+    let until = match total {
+        Some(t) -> min(t, wait)
+        None -> wait
+    }
+    let _ = Sync.acquire(v.ready, Some(until))
+    let _ = Sync.compareAndSet(v.decided, 0, code(Send))
+    Sync.load(v.decided) == code(Send)
+}
+
+-- How long making a connection took, step by step; all `None` for one taken
+-- from the pool.
+type Dialed = Dialed { dns : Option Duration, connect : Option Duration, tls : Option Duration }
+
+let reusedConnection = Dialed { dns = None, connect = None, tls = None }
+
+-- A new connection to `u`'s origin: resolved under the client's policy,
+-- connected, and for https, with TLS. All within the connect limit and
+-- `total`, whichever is first.
+fun dial(c : Client, u : HTTPURL, total : Option Deadline) -> Either HTTPError (Conn, Dialed) {
+    let limit = Deadline.after(c.settings.connectLimit)
+    let within = match total {
+        Some(t) -> min(t, limit)
+        None -> limit
+    }
+    let dnsTimer = Stopwatch.start()
+    let d = transport(Net.resolve(HTTPURL.host(u), HTTPURL.port(u), c.settings.policy, within))?
+    let dns = Some(Stopwatch.elapsed(dnsTimer))
+    let connectTimer = Stopwatch.start()
+    let s = transport(TCP.connect(d, within))?
+    let connect = Some(Stopwatch.elapsed(connectTimer))
+    if !HTTPURL.isHTTPS(u) { return Right((Plain(s), Dialed { dns, connect, tls = None })) }
+    let tlsTimer = Stopwatch.start()
+    match TLS.client(s, d, c.tls, within) {
+        Right(t) -> Right((Secure(t), Dialed { dns, connect, tls = Some(Stopwatch.elapsed(tlsTimer)) }))
+        Left(e) -> {
+            let _ = TCP.close(s)
+            Left(Transport(fail(e)))
+        }
+    }
+}
+
+fun transport[Error x](r : Either x a) -> Either HTTPError a = Either.mapLeft(r, fun(e) = Transport(fail(e)))
+
+-- How many interim responses a request may get before its final one. A
+-- server that sends them without end would otherwise hold `send`, which
+-- skips them, for as long as it liked.
+let interimLimit = 16
+
+-- How reading a head failed: the connection ended before any byte of it
+-- (`MaybeStale`), which on a pooled connection means it was stale; or
+-- otherwise.
+type HeadFailure = MaybeStale(HTTPError) | Broken(ClientError)
+
+fun readHead(ex : Exchange) -> Either HeadFailure ResponseHead {
+    let limits = ex.client.settings.limits
+    match Input.readHead(ex.input, limits) {
+        Right(Some(HeadBytes { bytes, from, to })) -> match Head.parseResponse(bytes, from, to, limits, ex.hop.method) {
+            Right(rh) -> {
+                let code = Status.code(rh.status)
+                if code == 100 {
+                    decide(ex.verdict, Send)
+                } else if code >= 200 {
+                    decide(ex.verdict, Withhold)
+                }
+                Right(rh)
+            }
+            Left(r) -> Left(Broken(BadResponse(BadMessage(r))))
+        }
+        Right(None) -> Left(MaybeStale(Truncated))
+        Left(Left(BadMessage(r))) -> Left(Broken(BadResponse(BadMessage(r))))
+        Left(Left(other)) -> Left(Broken(MaybeSent(other)))
+        Left(Right(s)) -> if Input.held(ex.input) == 0 && Pool.isStale(s) {
+            Left(MaybeStale(Transport(s)))
+        } else {
+            Left(Broken(MaybeSent(Transport(s))))
+        }
+    }
+}
+
+-- Ends `ex` without a response: closes the connection and, once the
+-- request's writing has stopped, returns `e`, or a failure of the body's
+-- own source in its place, since that is what caused `e`.
+fun failWith(ex : Exchange, e : ClientError) -> HTTPError {
+    ex.state = Over
+    Pool.close(Pool.conn(ex.paced))
+    decide(ex.verdict, Withhold)
+    awaitWriter(ex.written)
+    match ex.sourceFailure {
+        Some(w) -> SendFailed(MaybeSent(w))
+        None -> SendFailed(e)
+    }
+}
+
+-- Returns the next head the server sent in response to the exchange's
+-- request: each interim (1xx) one, then the final response. After the final
+-- one, and once the exchange's callback has returned, fails with `Transport`
+-- of an `IOError` whose kind is `Closed`.
+fun next[FromHTTP e](ex : Exchange) -> Either e Received {
+    if let Reading = ex.state {} else { return Left(fromHTTP(closed())) }
+    let rh = loop {
+        let rh = match ex.pending {
+            Some(rh) -> {
+                ex.pending = None
+                rh
+            }
+            None -> match readHead(ex) {
+                Right(rh) -> rh
+                Left(MaybeStale(e)) -> return Left(fromHTTP(failWith(ex, MaybeSent(e))))
+                Left(Broken(e)) -> return Left(fromHTTP(failWith(ex, e)))
+            }
+        }
+        let code = Status.code(rh.status)
+        if code / 100 != 1 { break rh }
+        ex.interim = ex.interim + 1
+        -- A 101 to a request that offered an upgrade is its final response;
+        -- to any other, it accepts an upgrade that was not offered.
+        if code == 101 && len(ex.hop.upgrade) > 0 { break rh }
+        if code == 101 || ex.interim > interimLimit {
+            return Left(fromHTTP(failWith(ex, BadResponse(BadMessage(Malformed)))))
+        }
+        -- A 100 is the client's own: it permits sending the body. A proxy
+        -- that relayed it would ask its client for a body that a 100 of its
+        -- own, sent when the body is read, already requests.
+        if code != 100 { return Right(Informational(rh.status, rh.headers)) }
+    }
+    let framed = Framed.body(ex.input, rh.framing, ex.client.settings.limits)
+    let scoped = Scoped { body = framed, open = True }
+    ex.state = Delivering(scoped, rh)
+    let incoming = Incoming.incoming(IO.anyRead(scoped, fun(e) = e), Framed.declaredLength(framed),
+                                     fun() = if Framed.isEnded(framed) { Some(Framed.trailers(framed)) } else { None },
+                                     fun() = False)
+    Right(Final(Response { status = rh.status, headers = rh.headers, body = incoming, url = ex.hop.url,
+                           timings = timings(ex) }))
+}
+
+fun timings(ex : Exchange) -> Timings {
+    let first = Option.unwrapOr(Pool.firstRead(ex.paced), Clock.monotonic())
+    Timings { dns = ex.dialed.dns, connect = ex.dialed.connect, tls = ex.dialed.tls,
+              firstByte = Clock.between(ex.began, first) }
+}
+
+fun closed() -> HTTPError = Transport(closedError("read"))
+
+-- Ends `ex` once its callback has returned: what the final response left
+-- unread is drained, and the connection goes back to the pool if both
+-- directions ended exactly. A callback that returned before the final
+-- response leaves a connection that cannot be reused.
+fun finish(ex : Exchange) -> Unit {
+    let state = ex.state
+    ex.state = Over
+    match state {
+        Delivering(scoped, rh) -> {
+            scoped.open = False
+            settle(ex, scoped.body, rh)
+        }
+        Reading -> {
+            Pool.close(Pool.conn(ex.paced))
+            decide(ex.verdict, Withhold)
+            awaitWriter(ex.written)
+        }
+        Over -> {}
+    }
+}
+
+-- Waits until the request's writer has stopped. Its task is in the same
+-- scope, so it is about to finish: either it wrote everything, or the
+-- connection, closed or failed, has ended its write.
+fun awaitWriter(written : Sync.AtomicInt) -> Unit {
+    while Sync.load(written) == 0 { Task.yield() }
+}
+
+-- Gives the exchange's connection back to the pool if the response ended
+-- exactly and the request was written whole, and closes it otherwise.
+fun settle(ex : Exchange, framed : Framed.Body Paced, rh : ResponseHead) -> Unit {
+    let conn = Pool.conn(ex.paced)
+    let drained = match Framed.drain(framed) {
+        Right(Reusable) -> True
+        _ -> False
+    }
+    let reusable = drained && rh.persistence == KeepAlive && Input.held(ex.input) == 0
+        -- A request still being written when its response ended got an
+        -- early response, and the server will not read the rest.
+        && Sync.load(ex.written) == 1
+    if reusable {
+        Pool.give(ex.client.pool, ex.key, conn)
+    } else {
+        Pool.close(conn)
+        awaitWriter(ex.written)
+    }
+}
+
+-- A response body that reads only while `open`: inside the callback.
+type Scoped = Scoped { body : Framed.Body Paced, var open : Bool }
+
+instance Read Scoped {
+    type ReadError = HTTPError
+    fun readInto(s, into) {
+        if !s.open { return Left(closed()) }
+        match readInto(s.body, into) {
+            Right(n) -> Right(n)
+            Left(Left(e)) -> Left(e)
+            Left(Right(e)) -> Left(Transport(e))
+        }
+    }
+}
+
+-- -- redirects --------------------------------------------------------------------------
+
+-- Returns the request that follows the redirect `resp` to `from`, or why
+-- there is none:
+--
+-- * a 301, 302 or 303 becomes a GET without a body, unless `from` is a GET
+--   or a HEAD, which stays as it is; a 307 or 308 keeps the method and the
+--   body, and is `NotReplayable` if the body cannot be sent again;
+-- * the target is `Location` resolved against `resp.url`, and must be
+--   `http` or `https`, and not `http` after `https`;
+-- * `Authorization`, `Cookie` and `Proxy-Authorization` are dropped when the
+--   scheme, host or port changes, and `Content-Type` with the body.
+--
+-- The request it returns is sent through the client's `ConnectPolicy` like
+-- any other.
+fun redirect(resp : Response b, from : ClientRequest Payload) -> Either RedirectRefused (ClientRequest Payload) {
+    let h = redirectHop(resp, Hop { method = from.method, url = resp.url, headers = from.headers, upgrade = [] })?
+    Right(ClientRequest { method = h.method, url = Right(h.url), headers = h.headers })
+}
+
+-- `redirect`'s rules, for the hop `from` that `resp` responded to.
+fun redirectHop(resp : Response b, from : Hop) -> Either RedirectRefused Hop {
+    let keepsMethod = match Status.code(resp.status) {
+        301 | 302 | 303 -> False
+        307 | 308 -> True
+        _ -> return Left(NotRedirect)
+    }
+    let location : Either HTTPError (Option URL.Reference) = Headers.one(resp.headers, Location)
+    let reference = match location {
+        Right(Some(r)) -> r
+        Right(None) -> return Left(NoLocation)
+        Left(e) -> return Left(BadLocation(e))
+    }
+    if keepsMethod && !replayable(from.method) { return Left(NotReplayable) }
+    let next = match HTTPURL.fromURL(URL.resolve(HTTPURL.toURL(resp.url), reference)) {
+        Right(u) -> u
+        Left(e) -> return Left(BadTarget(e))
+    }
+    if HTTPURL.isHTTPS(resp.url) && !HTTPURL.isHTTPS(next) { return Left(Downgrade) }
+    let (method, dropped) = if keepsMethod {
+        (from.method, False)
+    } else {
+        match from.method {
+            GET -> (GET, False)
+            HEAD -> (HEAD, False)
+            _ -> (GET, True)
+        }
+    }
+    var headers = from.headers
+    if dropped { headers = Headers.remove(headers, ContentType) }
+    if origin(next) != origin(resp.url) {
+        headers = Headers.remove(headers, Authorization)
+        headers = Headers.remove(headers, cookie)
+        headers = Headers.remove(headers, proxyAuthorization)
+    }
+    Right(Hop { method, url = next, headers, upgrade = from.upgrade })
+}
+
+let cookie = HeaderName.literal("cookie")
+let proxyAuthorization = HeaderName.literal("proxy-authorization")

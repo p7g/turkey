@@ -1,4 +1,4 @@
-export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLength, trailers)
+export (Incoming, BodyRead, incoming, receive, limited, unbounded, declaredLength, trailers, awaitsContinue)
 
 -- A message body that has arrived and not been read: a request's, for a
 -- server's handler, or a response's, for a client's callback.
@@ -43,17 +43,26 @@ import Turkey.ReadWrite (Read(..), needsRoom)
 type Incoming = Incoming {
     source : AnyRead HTTPError,
     declared : Option Int,
-    trailing : fun() -> Option Headers,
+    trailers : fun() -> Option Headers,
+    awaitsContinue : fun() -> Bool,
     var taken : Bool,
 }
 
 -- Returns the body `source` reads, whose framing declared `declared` bytes,
--- or `None` if it declared no length. `trailing` returns the trailers once
--- `source` has ended, and `None` until then. A codec makes one from what it
--- read; a test makes one to give a handler a body.
-fun incoming(source : AnyRead HTTPError, declared : Option Int, trailing : fun() -> Option Headers)
-        -> Incoming =
-    Incoming { source, declared, trailing, taken = False }
+-- or `None` if it declared no length. `trailers` returns the trailers once
+-- `source` has ended, and `None` until then. `awaitsContinue` returns `True`
+-- while the body's sender waits for a `100 Continue` that the body's first
+-- read sends. A codec makes one from what it read; a test makes one to give
+-- a handler a body.
+fun incoming(source : AnyRead HTTPError, declared : Option Int, trailers : fun() -> Option Headers,
+             awaitsContinue : fun() -> Bool) -> Incoming =
+    Incoming { source, declared, trailers, awaitsContinue, taken = False }
+
+-- Returns whether the body's sender is waiting for a `100 Continue`, which
+-- reading the body sends. A proxy that relays the body asks its upstream
+-- for a 100 first, and reads the body only once it arrives, so that an
+-- upstream refusal reaches the sender before it sends a byte.
+fun awaitsContinue(b : Incoming) -> Bool = b.awaitsContinue()
 
 -- Returns the body's declared length, if its framing gave one.
 fun declaredLength(b : Incoming) -> Option Int = b.declared
@@ -61,7 +70,7 @@ fun declaredLength(b : Incoming) -> Option Int = b.declared
 -- Returns the fields that followed the body, once it has been read to its
 -- end: no fields for a body that was not chunked, or whose sender added none.
 -- Returns `None` while the body has not ended.
-fun trailers(b : Incoming) -> Option Headers = b.trailing()
+fun trailers(b : Incoming) -> Option Headers = b.trailers()
 
 -- A `Read` over a body, under a limit.
 type BodyRead = BodyRead {

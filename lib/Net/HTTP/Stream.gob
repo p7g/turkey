@@ -1,0 +1,171 @@
+export (Stream(..), BodyLength(..), Sink, sink, send, length, framing, relayed)
+
+-- A body that a program writes as it goes, for a server's response or a
+-- client's request: its length, if it knows it, and a function that writes
+-- the bytes into a `Sink`.
+--
+--     Stream(LengthUnknown, fun(sink) {
+--         for event in feed() {
+--             IO.writeText(sink, "data: " + event + "\n\n")?
+--             flush(sink)?
+--         }
+--         Right(Headers.empty)
+--     })
+--
+-- **The function runs after the head is sent.** By the time it writes a
+-- byte, the peer has the status and the fields, so nothing it does can
+-- replace them. If it fails, or writes other than the length it declared,
+-- the message cannot be finished, and the connection under it is closed: the
+-- peer sees a message cut short, never a complete one with the wrong bytes.
+--
+-- * `LengthKnown(n)`: exactly `n` bytes. Writing past them is `Overrun`, and
+--   nothing past `n` is sent. Returning short of them is `Truncated`.
+-- * `LengthUnknown`: as many bytes as the function writes. Each write is
+--   sent as it comes; the end is marked when the function returns `Right`.
+--   A function that returns `Left` leaves it unmarked, so the peer can tell
+--   the body was cut short.
+--
+-- **Trailers.** The function returns the fields to send after the body, such
+-- as a checksum or gRPC's status, or `Headers.empty` for none. HTTP/1 sends
+-- trailers only after a chunked body, so trailers from a `LengthKnown`
+-- stream, or from any stream sent to an HTTP/1.0 peer, are
+-- `UnframedTrailers`, and the message is left unfinished as after any other
+-- error.
+--
+-- **Errors.** A sink's writes fail with `SomeError`, and the function returns
+-- one, so that `?` carries a failed write out of it, and another library's
+-- error enters with `promote`. The sink's own failures are `HTTPError`s
+-- inside it, which `cast` recovers: `Overrun`, `Truncated`,
+-- `UnframedTrailers`, and `Transport` for the connection's own. A write after the message has ended, as a sink
+-- kept past its function's return would make, is an `IOError` of kind
+-- `Closed`.
+
+import Net.HTTP.Error (HTTPError(..))
+import Net.HTTP.H1.Head (Framing(..))
+import Net.HTTP.H1.Output (BodyWriter)
+import Net.HTTP.H1.Output as Output
+import Net.HTTP.Headers as Headers (Headers)
+import Net.HTTP.Incoming as Incoming (Incoming)
+import System.IO as IO (CopyError(..))
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.ReadWrite (Write(..))
+
+-- How long a streamed body is: `LengthKnown(n)` bytes, or as long as it
+-- turns out to be.
+type BodyLength = LengthKnown(Int) | LengthUnknown
+
+instance Eq BodyLength {
+    fun eq(a, b) = match (a, b) {
+        (LengthKnown(x), LengthKnown(y)) -> x == y
+        (LengthUnknown, LengthUnknown) -> True
+        _ -> False
+    }
+}
+
+instance Show BodyLength {
+    fun show(l) = match l {
+        LengthKnown(n) -> "LengthKnown(" + show(n) + ")"
+        LengthUnknown -> "LengthUnknown"
+    }
+}
+
+-- A body of the length given, written by the function, which is called at
+-- most once: never for a response to HEAD, and once the head is sent for
+-- any other message.
+type Stream = Stream(BodyLength, fun(Sink) -> Either SomeError Headers)
+
+-- Returns the length `s` declares.
+fun length(s : Stream) -> BodyLength = match s {
+    Stream(l, _) -> l
+}
+
+-- Where a `Stream`'s function writes its body. It is a `Write`, and valid
+-- only while that function runs.
+--
+-- The message under it is reached through closures, so that a sink has one
+-- type whatever the connection is, and a function written once writes over
+-- TCP and TLS alike.
+type Sink = Sink {
+    writing : fun(Buffer) -> Either SomeError Unit,
+    flushing : fun() -> Either SomeError Unit,
+    finishing : fun(Headers) -> Either SomeError Unit,
+    var open : Bool,
+}
+
+instance Write Sink {
+    type WriteError = SomeError
+    fun writeFrom(s, from) {
+        if !s.open { return Left(closed()) }
+        s.writing(from)
+    }
+    fun flush(s) {
+        if !s.open { return Left(closed()) }
+        s.flushing()
+    }
+}
+
+fun closed() -> SomeError = fail(IOError { kind = Closed, op = "Sink.write", path = None })
+
+-- Returns the framing an HTTP/1 message gives a body of length `l`, with
+-- `unknown` for a body whose length is not known: `Chunked`, or for a
+-- response to an HTTP/1.0 request, which cannot read chunks, `UntilClose`.
+-- Panics on a negative length.
+fun framing(l : BodyLength, unknown : Framing) -> Framing = match l {
+    LengthKnown(n) -> {
+        if n < 0 { error("Stream: length " + Int.toString(n) + " is negative") }
+        ContentLength(n)
+    }
+    LengthUnknown -> unknown
+}
+
+-- Returns a sink that writes through `w`, an HTTP/1 body writer, with the
+-- connection's errors made `SomeError`s by `lift`.
+fun sink[Write w](w : BodyWriter w, lift : fun(WriteError w) -> SomeError) -> Sink = Sink {
+    writing = fun(from) = Either.mapLeft(writeFrom(w, from), fun(e) = codecError(e, lift)),
+    flushing = fun() = Either.mapLeft(flush(w), fun(e) = codecError(e, lift)),
+    finishing = fun(trailers) =
+        Either.mapLeft(Output.finishWith(w, trailers), fun(e) = codecError(e, lift)),
+    open = True,
+}
+
+-- Returns the codec's refusal as itself, and the connection's failure as
+-- `Transport`, so that `cast` finds an `HTTPError` in either.
+fun codecError(e : Either HTTPError t, lift : fun(t) -> SomeError) -> SomeError = match e {
+    Left(h) -> fail(h)
+    Right(t) -> fail(Transport(lift(t)))
+}
+
+-- Returns a stream that passes `b` on as it is read: the length its framing
+-- declared, if any, the bytes as they come, with no limit of their own, and
+-- then the trailers it arrived with. Its function reads `b`, so it can run
+-- once.
+fun relayed(b : Incoming) -> Stream {
+    let length = match Incoming.declaredLength(b) {
+        Some(n) -> LengthKnown(n)
+        None -> LengthUnknown
+    }
+    Stream(length, fun(into) = match IO.copy(Incoming.unbounded(b), into, Buf.buffer(relayChunk)) {
+        Right(_) -> Right(Option.unwrapOr(Incoming.trailers(b), Headers.empty))
+        Left(Reading(e)) -> Left(fail(e))
+        Left(Writing(e)) -> Left(e)
+    })
+}
+
+-- How much of a relayed body each read takes.
+let relayChunk = 65536
+
+-- Runs `s`'s function on `into`, then ends the body with the trailers it
+-- returned, and closes the sink either way. Returns the function's error if
+-- it failed, and then the body is left unended; or the end's: `Truncated` if
+-- a declared length was not reached, `UnframedTrailers` for trailers the
+-- framing has no place for. After any of these, the message cannot be
+-- finished, and the connection must be closed.
+fun send(s : Stream, into : Sink) -> Either SomeError Unit {
+    let Stream(_, write) = s
+    let written = write(into)
+    into.open = False
+    let trailers = written?
+    into.finishing(trailers)
+}

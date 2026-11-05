@@ -1,0 +1,87 @@
+-- A small HTTP API: routing by `match` on the method and the path, the
+-- request body taken out of `POST`'s payload, an error type whose
+-- `ToResponse` instance maps each error to a response, and every path
+-- ending in `respond`.
+--
+--     curl -i localhost:8080/health
+--     curl -i -X POST --data 'two eggs' localhost:8080/orders
+--     curl -i localhost:8080/orders/1
+
+import Net as Net
+import Net.HTTP (..)
+import Net.HTTP.HeaderName as HeaderName
+import Net.HTTP.HeaderValue as HeaderValue
+import Net.HTTP.MediaType as MediaType
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Respond, Done, respond)
+import Net.TCP as TCP
+import System.IO as IO
+import System.Sync as Sync
+import System.Sync (Mutex)
+
+-- What can go wrong with a request. Each becomes a response of its own
+-- status. `WrongMethod` holds the methods the path allows.
+type APIError = Missing | WrongMethod(String) | BadBody(HTTPError) | NotText
+
+-- `receive` converts the body's errors into this type, so `?` needs no
+-- conversion.
+instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
+
+instance ToResponse APIError {
+    fun toResponse(e) = match e {
+        Missing -> statusOnly(NotFound)
+        -- A 405 lists the methods the resource allows (RFC 9110 §15.5.6).
+        WrongMethod(allowed) ->
+            withHeaders(statusOnly(MethodNotAllowed), field(allowField, HeaderValue.literal(allowed)))
+        BadBody(TooLarge) -> body(ContentTooLarge, MediaType.plainText, "an order is at most 1 KiB\n")
+        BadBody(other) -> body(BadRequest, MediaType.plainText, show(other) + "\n")
+        NotText -> body(BadRequest, MediaType.plainText, "an order is UTF-8 text\n")
+    }
+}
+
+let allowField = HeaderName.literal("allow")
+
+type Orders = Orders { items : Mutex (Vec String) }
+
+fun handle(orders : Orders, req : Request Incoming, r : Respond) -> Done = respond(r, route(orders, req))
+
+fun route(orders : Orders, req : Request Incoming) -> Either APIError ServerResponse =
+    match (req.method, req.target.path) {
+        (GET, "/health") | (HEAD, "/health") -> Right(body(OK, MediaType.plainText, "ok\n"))
+        (POST(content), "/orders") -> {
+            let order = match String.fromBytes(IO.bytes(receive(content, 1024)?)) {
+                Some(t) -> t
+                None -> return Left(NotText)
+            }
+            let id = Sync.withLock(orders.items, fun(v) {
+                Vec.push(v, order)
+                len(v)
+            })
+            Right(body(Created, MediaType.plainText, show(id) + "\n"))
+        }
+        (_, "/health") -> Left(WrongMethod("GET, HEAD"))
+        (_, "/orders") -> Left(WrongMethod("POST"))
+        (GET, path) -> match orderNumber(path) {
+            Some(n) -> match Sync.withLock(orders.items, Vec.at(_, n - 1)) {
+                Some(order) -> Right(body(OK, MediaType.plainText, order + "\n"))
+                None -> Left(Missing)
+            }
+            None -> Left(Missing)
+        }
+        _ -> Left(Missing)
+    }
+
+-- Returns the order number in a path `/orders/N`.
+fun orderNumber(path : String) -> Option Int = Int.parse(String.stripPrefix(path, "/orders/")?)
+
+fun main() {
+    let address = Option.expect(Net.parse("127.0.0.1"), "an address")
+    match TCP.listen(address, 8080) {
+        Right(l) -> {
+            let orders = Orders { items = Sync.mutex([]) }
+            print("listening on 127.0.0.1:8080")
+            Server.serve(l, Server.defaultConfig, fun(req, r) = handle(orders, req, r))
+        }
+        Left(e) -> print("listen: " + show(e))
+    }
+}

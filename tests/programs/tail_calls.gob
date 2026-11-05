@@ -1,0 +1,142 @@
+-- Calls in tail position run in constant stack: direct, mutual, through a
+-- closure, and through a monad's `bind`, which is how a loop holding a `?`
+-- reaches its next iteration.
+--
+-- Each runs in a task, whose stack is a megabyte. A frame per call takes at
+-- least 16 bytes, for the frame pointer and the link register, so a hundred
+-- thousand calls would need 1.6 MB. Keep the count near that: the GC stress
+-- test collects at every allocation, and at a million calls this program takes
+-- over twelve minutes there.
+
+import System.Task as Task
+
+let deep = 100000
+
+fun countDown(n : Int, acc : Int) -> Int =
+    if n == 0 { acc } else { countDown(n - 1, acc + 1) }
+
+fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
+fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
+
+-- The callee is a closure, so the tail call is through a register.
+fun bounce(n : Int, k : fun(Int, Int) -> Int) -> Int =
+    if n == 0 { 0 } else { k(n - 1, n) }
+
+fun step(n : Int, last : Int) -> Int = if n == 0 { last } else { bounce(n, step) }
+
+-- The loop's next iteration is the closure `bind` calls last.
+fun count(n : Int) -> Task.Spawn Int = do {
+    var i = 0
+    loop {
+        if i == n { break }
+        let _ = pure(i)?
+        i = i + 1
+    }
+    pure(i)
+}
+
+-- A reader, a state and a continuation monad, as a program would write them.
+type Reader a = Reader(fun(Int) -> a)
+
+instance Functor Reader { fun map(Reader(run), f) = Reader(fun(e) = f(run(e))) }
+instance Applicative Reader { fun pure(v) = Reader(fun(_) = v) }
+instance Monad Reader {
+    fun bind(Reader(run), f) = Reader(fun(e) {
+        let Reader(rest) = f(run(e))
+        rest(e)
+    })
+}
+
+fun ask() -> Reader Int = Reader(fun(e) = e)
+
+fun runReader(Reader(run), e : Int) = run(e)
+
+fun sumAsks(n : Int) -> Reader Int = do {
+    var total = 0
+    for var i = 0; i < n; i = i + 1 {
+        let e = ask()?
+        total = total + e
+    }
+    pure(total)
+}
+
+-- Recursion written by hand rather than with a loop.
+fun asks(n : Int, acc : Int) -> Reader Int = do {
+    let e = ask()?
+    if n == 0 { pure(acc) } else { asks(n - 1, acc + e) }
+}
+
+type State a = State(fun(Int) -> (a, Int))
+
+instance Functor State {
+    fun map(State(run), f) = State(fun(s) { let (a, t) = run(s); (f(a), t) })
+}
+instance Applicative State { fun pure(v) = State(fun(s) = (v, s)) }
+instance Monad State {
+    fun bind(State(run), f) = State(fun(s) {
+        let (a, t) = run(s)
+        let State(rest) = f(a)
+        rest(t)
+    })
+}
+
+fun tick() -> State Unit = State(fun(s) = ((), s + 1))
+
+fun runState(State(run), s : Int) = run(s)
+
+fun ticks(n : Int) -> State Int = do {
+    var i = 0
+    while i < n {
+        tick()?
+        i = i + 1
+    }
+    pure(i)
+}
+
+type Cont a = Cont(fun(fun(a) -> Int) -> Int)
+
+instance Functor Cont { fun map(Cont(c), f) = Cont(fun(k) = c(fun(a) = k(f(a)))) }
+instance Applicative Cont { fun pure(v) = Cont(fun(k) = k(v)) }
+instance Monad Cont {
+    fun bind(Cont(c), f) = Cont(fun(k) = c(fun(a) {
+        let Cont(r) = f(a)
+        r(k)
+    }))
+}
+
+fun runCont(Cont(c)) = c(fun(x) = x)
+
+fun counted(n : Int) -> Cont Int = do {
+    var i = 0
+    loop {
+        if i == n { break }
+        let _ = pure(i)?
+        i = i + 1
+    }
+    pure(i)
+}
+
+-- A fresh record passed in tail position on every round. Passed anywhere
+-- else, a record that never leaves its callee could be built in the caller's
+-- frame; here that frame is gone while the callee runs.
+type Counter = Counter { var count : Int }
+
+fun drain(c : Counter, n : Int) -> Int {
+    if n == 0 { return c.count }
+    drain(Counter { count = c.count + 1 }, n - 1)
+}
+
+fun inTask(f : fun() -> a) -> a =
+    Task.join(Task.runScope(Task.spawn(f)))
+
+fun main() {
+    print(inTask(fun() = countDown(deep, 0)))
+    print(inTask(fun() = isEven(deep)))
+    print(inTask(fun() = step(deep, 0)))
+    print(inTask(fun() = Task.runScope(count(deep))))
+    print(inTask(fun() = runReader(sumAsks(deep), 2)))
+    print(inTask(fun() = runReader(asks(deep, 0), 3)))
+    print(inTask(fun() = runState(ticks(deep), 0)))
+    print(inTask(fun() = runCont(counted(deep))))
+    print(inTask(fun() = drain(Counter { count = 0 }, deep)))
+}

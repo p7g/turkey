@@ -672,7 +672,7 @@ fun atomsOf(ty : Ty.Type, value : Core, binders : Vec VarCell,
 fun applications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
     match e.kind {
         CTyApp(fn, args) -> match fn.kind {
-            CVar(n) -> Vec.push(out, (n, args))
+            CVar(n, _) -> Vec.push(out, (n, args))
             _ -> {}
         }
         _ -> {}
@@ -800,7 +800,7 @@ fun defaultsInto(b : CBind, layouts : Map String Layout,
 fun bindersInto(e : Core, out : Set.Set Int) -> Unit {
     match e.kind {
         CTyLam(vs, _) -> for v in vs { Set.add(out, v.id) }
-        CLet(_, _, _, _, vs) -> for v in vs { Set.add(out, v.id) }
+        CLet(_, _, _, _, _, vs) -> for v in vs { Set.add(out, v.id) }
         _ -> {}
     }
     discard(mapKind(e.kind, Mapper {
@@ -1251,7 +1251,7 @@ fun build(s : Sharer, made : String, original : String,
 }
 
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
-    name = b.name, ty = b.ty, binders = b.binders, value = value,
+    name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
     equations = b.equations, layouts = b.layouts,
 }
@@ -1275,13 +1275,13 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
             CSlot(target, index) -> if len(args) > 0 && isDictionary(target.ty) {
                 return dynamicCall(s, e, fn, target, index, args, sc)
             }
-            CVar(n) -> match localNamed(sc, n) {
+            CVar(n, id) -> match localNamed(sc, n) {
                 Some(local) -> return mkCore(e.ty, e.span, CTyApp(
-                    mkCore(fn.ty, fn.span, CVar(requestLocal(s, sc, local, args, e))),
+                    mkCore(fn.ty, fn.span, CVar(requestLocal(s, sc, local, args, e), id)),
                     args))
                 None -> if Set.contains(s.generic, n) {
                     return mkCore(e.ty, e.span, CTyApp(
-                        mkCore(fn.ty, fn.span, CVar(requestAt(s, sc, n, args, e))),
+                        mkCore(fn.ty, fn.span, CVar(requestAt(s, sc, n, args, e), id)),
                         args))
                 }
             }
@@ -1303,10 +1303,10 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
             }
             if any { return localRec(s, e, binds, body, sc) }
         }
-        CLet(name, bound, value, body, binders) -> {
+        CLet(name, id, bound, value, body, binders) -> {
             let all = Vec.append(binders, spineBinders(value))
             if len(all) > 0 {
-                return localLet(s, e, name, bound, value, body, binders, all, sc)
+                return localLet(s, e, name, id, bound, value, body, binders, all, sc)
             }
         }
         _ -> {}
@@ -1579,8 +1579,7 @@ fun methodStub(e : Core, stated : Option (Vec VarCell), vs : Vec VarCell,
                     + "method and whose layouts are not known", e)
     }
     let names = Array.init(len(params), fun(i) {
-        CParam { name = "%unused" + Int.toString(i),
-                                   ty = params[i] }
+        CParam { name = "%unused" + Int.toString(i), id = noId, ty = params[i] }
     })
     let message = mkCore(Ty.tString(), e.span, CLit(LString(
         "internal error: a dictionary method was called at layouts it was not "
@@ -1746,7 +1745,7 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
                 }
             }
             let copy = CBind {
-                name = made, ty = ty, binders = own, value = value,
+                name = made, id = original.id, ty = ty, binders = own, value = value,
                 span = original.span, mutable = original.mutable,
                 module_ = original.module_,
                 equations = Vec.map(original.equations, fun(pair) = {
@@ -1764,7 +1763,7 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
 
 -- A `let` that generalized: its copies, each bound around the body, and not the
 -- original.
-fun localLet(s : Sharer, e : Core, name : String, bound : Ty.Type, value : Core,
+fun localLet(s : Sharer, e : Core, name : String, id : Int, bound : Ty.Type, value : Core,
              body : Core, stated : Vec VarCell, binders : Vec VarCell,
              sc : Scope) -> Core {
     let local = newLocal(s, sc, name, bound, value, binders, None)
@@ -1786,7 +1785,7 @@ fun localLet(s : Sharer, e : Core, name : String, bound : Ty.Type, value : Core,
                 _ -> Vec.push(own, b)
             }
         }
-        out = mkCore(e.ty, e.span, CLet(made, ty, v, out, own))
+        out = mkCore(e.ty, e.span, CLet(made, id, ty, v, out, own))
     }
     out
 }

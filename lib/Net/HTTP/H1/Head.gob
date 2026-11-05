@@ -1,6 +1,6 @@
 export (
     RequestHead(..), ResponseHead(..), Framing(..), Persistence(..), Version(..),
-    parseRequest, parseResponse, fieldLine, isReservedName,
+    parseRequest, parseResponse, fieldLine, isReservedName, control, protocols,
 )
 
 -- Stage 2 of the HTTP/1 head parser: one pass over a complete head, by hand,
@@ -45,20 +45,32 @@ export (
 -- because it is stored lowercase.
 --
 -- **The reserved fields are taken out.** Content-Length, Transfer-Encoding,
--- Host, Connection, Expect and Upgrade become the head's framing, target,
--- persistence, expectation and upgrade; Keep-Alive, TE, Trailer and
--- Proxy-Connection are dropped. None of them reaches `headers`, which holds
--- only what a program could have written itself.
+-- Host, Connection, Expect, Upgrade and TE become the head's framing, target,
+-- persistence, expectation, upgrade and trailer acceptance; Keep-Alive,
+-- Trailer and Proxy-Connection are dropped. None of them reaches `headers`,
+-- which holds only what a program could have written itself.
+--
+-- **So are the fields `Connection` names.** `Connection: X-Foo` says that
+-- `X-Foo` is for this hop only (RFC 9110 §7.6.1), so no `X-Foo` field
+-- reaches `headers` either. They are removed here, on receipt, before any
+-- program sees the message, rather than when a proxy sends it on: removed on
+-- sending, a peer's `Connection` could name a field the program added
+-- itself, and strip it. The cost is that a program that is not a proxy
+-- cannot read such a field either. A name in `Connection` that is a reserved
+-- field changes nothing, since the framing was read before anything was
+-- removed.
 
 import Net.HTTP.Error (Refusal(..))
 import Net.HTTP.H1.Classes (..)
-import Net.HTTP.HeaderValue (HeaderValue)
+import Net.HTTP.HeaderValue as HeaderValue (HeaderValue)
 import Net.HTTP.Headers as Headers (Headers)
 import Net.HTTP.HTTPURL as HTTPURL
 import Net.HTTP.Limits as Limits (Limits)
 import Net.HTTP.Method as Method (Method(..))
-import Net.HTTP.Request (RequestTarget(..))
+import Net.HTTP.Request (RequestTarget(..), Control(..))
 import Net.HTTP.Status as Status (Status)
+import Net.HTTP.Syntax as Syntax
+import Net.HTTP.Token as Token (Token)
 import Turkey.HTTPField (HeaderName(..))
 import Turkey.HTTPField as Field
 
@@ -129,7 +141,8 @@ instance Show Version {
 -- `persistence` is `Close` for HTTP/1.0, and for `Connection: close`.
 -- `expectContinue` is whether an HTTP/1.1 client waits for `100 Continue`
 -- before it sends the body. `upgrade` is each `Upgrade` line's value, for
--- the server to decide on.
+-- the server to decide on. `trailers` is whether `TE` lists `trailers`: the
+-- client reads trailers after a chunked response.
 type RequestHead = RequestHead {
     method : Method Unit,
     target : RequestTarget,
@@ -139,6 +152,7 @@ type RequestHead = RequestHead {
     persistence : Persistence,
     expectContinue : Bool,
     upgrade : Array HeaderValue,
+    trailers : Bool,
 }
 
 -- A response head, read and checked, with the framing its request implies:
@@ -172,10 +186,10 @@ fun parseRequest(s : Array Byte, at : Int, to : Int, limits : Limits) -> Either 
     let lineEnd = v + 10
 
     let fields = Vec.new(64)
-    let end = fieldLines(s, lineEnd, to, Limits.fields(limits), fields)?
+    let end = fieldLines(s, lineEnd, to, Limits.values(limits).fields, fields)?
     if end != to { return Left(Malformed) }
 
-    if lineEnd - at > Limits.lineBytes(limits) { return Left(LineTooLong) }
+    if lineEnd - at > Limits.values(limits).lineBytes { return Left(LineTooLong) }
     if major != 1 || minor > 1 { return Left(UnsupportedVersion) }
     let form = match targetForm(s, at, methodEnd, targetStart, targetEnd) {
         Refused -> return Left(Malformed)
@@ -212,7 +226,35 @@ fun parseRequest(s : Array Byte, at : Int, to : Int, limits : Limits) -> Either 
         persistence = if minor == 0 || f.close { Close } else { KeepAlive },
         expectContinue,
         upgrade = f.upgrade,
+        trailers = f.trailers,
     })
+}
+
+-- Returns the protocols `Upgrade` lines name, in order. An element that is
+-- not a token, such as one with a version (`HTTP/2.0`), is left out.
+fun protocols(upgrade : Array HeaderValue) -> Array Token {
+    let offers = []
+    for line in upgrade {
+        if let Some(items) = Syntax.listItems(HeaderValue.toString(line)) {
+            for item in items {
+                if let Some(t) = Token.parse(item) { Vec.push(offers, t) }
+            }
+        }
+    }
+    Vec.toArray(offers)
+}
+
+-- Returns what `h`'s reserved fields said, for the request a server hands
+-- on.
+fun control(h : RequestHead) -> Control {
+    Control {
+        contentLength = match h.framing {
+            ContentLength(n) -> Some(n)
+            _ -> None
+        },
+        upgrade = protocols(h.upgrade),
+        trailers = h.trailers,
+    }
 }
 
 -- The four forms of RFC 9112 §3.2, as the method allows them.
@@ -395,10 +437,10 @@ fun parseResponse(s : Array Byte, at : Int, to : Int, limits : Limits, request :
     lineEnd = lineEnd + 2
 
     let fields = Vec.new(64)
-    let end = fieldLines(s, lineEnd, to, Limits.fields(limits), fields)?
+    let end = fieldLines(s, lineEnd, to, Limits.values(limits).fields, fields)?
     if end != to { return Left(Malformed) }
 
-    if lineEnd - at > Limits.lineBytes(limits) { return Left(LineTooLong) }
+    if lineEnd - at > Limits.values(limits).lineBytes { return Left(LineTooLong) }
     if major != 1 || minor > 1 { return Left(UnsupportedVersion) }
     if code < 100 || code > 599 { return Left(Malformed) }
     let status = Option.expect(Status.fromCode(code), "a code from 100 to 599")
@@ -486,6 +528,7 @@ type Fields = Fields {
     keepAlive : Bool,   -- Connection holds `keep-alive`
     expect : Expectation,
     upgrade : Array HeaderValue,
+    trailers : Bool,    -- TE lists `trailers`
 }
 
 type Expectation = NoExpectation | ContinueExpected | OtherExpected
@@ -493,13 +536,16 @@ type Expectation = NoExpectation | ContinueExpected | OtherExpected
 -- The fields the codec reads, or drops, rather than handing on.
 type Kind =
     HostField | LengthField | CodingField | ConnectionField | ExpectField | UpgradeField
-    | DroppedField | OtherField
+    | TEField | DroppedField | OtherField
 
 -- Reads the fields at the offsets in `fields`, one at a time, refusing the
--- first malformed or repeated framing field.
+-- first malformed or repeated framing field. The fields `Connection` names
+-- are left out of `headers`.
 fun classify(s : Array Byte, fields : Vec Int) -> Either Refusal Fields {
     let kept = []
     let upgrade = []
+    let hopByHop = []
+    var trailers = False
     var hosts = 0
     var hostFrom = 0
     var hostTo = 0
@@ -547,8 +593,13 @@ fun classify(s : Array Byte, fields : Vec Int) -> Either Refusal Fields {
                 loop {
                     let e = scan(tchar, s, q, to)
                     if e == q { return Left(Malformed) }
-                    if sameText(s, q, e, closeName) { close = True }
-                    if sameText(s, q, e, keepAliveName) { keepAlive = True }
+                    if sameText(s, q, e, closeName) {
+                        close = True
+                    } else if sameText(s, q, e, keepAliveName) {
+                        keepAlive = True
+                    } else {
+                        Vec.push(hopByHop, HeaderName(lowerText(s, q, e)))
+                    }
                     if e == to { break }
                     q = scan(ows, s, e, to)
                     if !isByte(s, q, to, comma) { return Left(Malformed) }
@@ -563,20 +614,47 @@ fun classify(s : Array Byte, fields : Vec Int) -> Either Refusal Fields {
                 expect = if continued { ContinueExpected } else { OtherExpected }
             }
             UpgradeField -> Vec.push(upgrade, Field.view(s, from, to))
+            TEField -> if listsTrailers(s, from, to) { trailers = True }
             DroppedField -> {}
             OtherField -> Vec.push(kept, (HeaderName(lowerText(s, fields[i], fields[i + 1])), Field.view(s, from, to)))
         }
     }
+    let endToEnd = if len(hopByHop) == 0 {
+        Vec.toArray(kept)
+    } else {
+        Array.filter(Vec.toArray(kept), fun((n, _)) = !Vec.contains(hopByHop, n))
+    }
     Right(Fields {
-        headers = Headers.fromFields(Vec.toArray(kept)),
+        headers = Headers.fromFields(endToEnd),
         hosts, hostFrom, hostTo, length, coded, chunked, other, close, keepAlive, expect,
         upgrade = Vec.toArray(upgrade),
+        trailers,
     })
 }
 
+-- Whether the `TE` value `s[from..to)` lists `trailers`. TE = #t-codings,
+-- t-codings = "trailers" / transfer-coding [ weight ]. Elements are compared
+-- by their leading token; one that does not read is passed over, since the
+-- field is dropped either way.
+fun listsTrailers(s : Array Byte, from : Int, to : Int) -> Bool {
+    var q = scan(ows, s, from, to)
+    while q < to {
+        let e = scan(tchar, s, q, to)
+        if sameText(s, q, e, trailersName) {
+            let after = scan(ows, s, e, to)
+            if after == to || Byte.toInt(s[after]) == comma { return True }
+        }
+        q = scan(notComma, s, e, to)
+        q = scan(ows, s, q + 1, to)
+    }
+    False
+}
+
+let notComma = Array.init(256, fun(b) = b != comma)
+
 -- Returns the kind of the field named by `s[from..to)`, ignoring ASCII case.
 fun kindOf(s : Array Byte, from : Int, to : Int) -> Kind = match to - from {
-    2 -> if sameText(s, from, to, teName) { DroppedField } else { OtherField }
+    2 -> if sameText(s, from, to, teName) { TEField } else { OtherField }
     4 -> if sameText(s, from, to, hostName) { HostField } else { OtherField }
     6 -> if sameText(s, from, to, expectName) { ExpectField } else { OtherField }
     7 -> if sameText(s, from, to, upgradeName) { UpgradeField }
@@ -611,6 +689,7 @@ let proxyConnectionName = String.toBytes("proxy-connection")
 let chunkedName = String.toBytes("chunked")
 let closeName = String.toBytes("close")
 let continueName = String.toBytes("100-continue")
+let trailersName = String.toBytes("trailers")
 
 -- Content-Length = 1*DIGIT, and the number must fit in an `Int`.
 fun contentLength(s : Array Byte, from : Int, to : Int) -> Option Int {

@@ -17,21 +17,24 @@ export (
     RetryAfter(..), Retry(..), SetCookie(..),
     MediaType, Credentials, NewCookie, Token,
     URL, URLError(..), HTTPURL,
-    Request(..), ClientRequest(..), RequestTarget(..), Target(..),
-    HTTPError(..), HeaderError(..), Refusal(..), FromHTTP(..),
-    Incoming, BodyRead, Limits,
-    request, header, receive, limited, unbounded,
+    Request(..), ClientRequest(..), RequestTarget(..), Target(..), Control(..), Response(..), Timings(..),
+    HTTPError(..), HeaderError(..), Refusal(..), ClientError(..), RedirectRefused(..), FromHTTP(..),
+    Incoming, BodyRead, Limits, Stream(..), BodyLength(..), Sink, Duplex, Body(..), Replay, Payload,
+    ServerResponse, ToResponse(..), Content(..), body, stream, statusOnly, noContent, notModified, switch, relay,
+    request, field, withHeaders, receive, limited, unbounded, trailers,
+    newPOST, newPUT, newPATCH, newExtension,
+    contentLength, host, upgradeRequested, acceptsTrailers,
 )
 
--- HTTP's protocol values: methods, statuses, header fields, URLs and
--- requests, shared by the HTTP/1 codec, the client and the server. Nothing
--- here does I/O.
+-- HTTP's protocol values: methods, statuses, header fields, URLs, requests,
+-- and the bodies and responses that go with them, shared by the HTTP/1
+-- codec, the client and the server. Nothing here opens a connection.
 --
 --     import Net.HTTP (..)
 --     import Net.HTTP.MediaType as MediaType
 --
---     let r = request(GET, "https://api.example.com/users/1")
---         |> header(Accept, MediaType.json)
+--     let r = withHeaders(request(GET, "https://api.example.com/users/1"),
+--                         field(Accept, MediaType.json))
 --
 -- This module gathers the types, their constructors and the classes, so that
 -- one import brings what a program names and matches on. The functions of
@@ -41,9 +44,17 @@ export (
 -- `HeaderValue`, `MediaType`, `Method`, `Credentials`, `Cookie`, `Token`,
 -- `HTTPURL`, `Limits` and `URL`. Their names (`parse`, `get`, `add`) would
 -- collide with each other's here, and with the Prelude's. The exceptions are
--- `request` and `header`, which build a request, and `receive`, `limited` and
--- `unbounded`, which read an `Incoming` body: a program names them as often
--- as it names a method.
+-- `request`, `field` and `withHeaders`, which build a request; `newPOST`,
+-- `newPUT`, `newPATCH` and `newExtension`, which make a method that carries
+-- a body; `receive`, `limited`, `unbounded` and `trailers`, which read an
+-- `Incoming` body; `contentLength`, `host`, `upgradeRequested` and
+-- `acceptsTrailers`, which read the reserved fields of a received request;
+-- and `body`, `stream`, `statusOnly`, `noContent`, `notModified`, `switch`
+-- and `relay`, which build a server's response: a program names them as often
+-- as it names a method. The server itself is `Net.HTTP.Server`.
+--
+-- The client is `Net.HTTP.Client`, imported on its own: it links OpenSSL,
+-- which a program that only handles HTTP values has no need of.
 --
 -- **The rules come from HTTP's CVEs.** Values are validated strictly when
 -- they are made, whether a program writes them or they arrive: no CR, LF or
@@ -51,22 +62,32 @@ export (
 -- a message -- Content-Length, Transfer-Encoding, Host and the rest -- have
 -- no name a program can write, because the library writes them.
 
+import Net.HTTP.Body (Body(..), Replay, newPOST, newPUT, newPATCH, newExtension)
 import Net.HTTP.Cookie (NewCookie)
 import Net.HTTP.Credentials (Credentials)
-import Net.HTTP.Error (HTTPError(..), HeaderError(..), Refusal(..), FromHTTP(..))
-import Net.HTTP.Incoming (Incoming, BodyRead, receive, limited, unbounded)
+import Net.HTTP.Duplex (Duplex)
+import Net.HTTP.Error (HTTPError(..), HeaderError(..), Refusal(..), ClientError(..), RedirectRefused(..), FromHTTP(..))
+import Net.HTTP.Incoming (Incoming, BodyRead, receive, limited, unbounded, trailers)
 import Net.HTTP.Limits (Limits)
 import Net.HTTP.HeaderName (HeaderName)
 import Net.HTTP.HeaderValue (HeaderValue)
+import Net.HTTP.Payload (Payload)
 import Net.HTTP.Headers (
     Headers, Header(..), Multiplicity(..), HasHeaders(..),
     Accept(..), ContentType(..), Authorization(..), IdempotencyKey(..), Location(..),
-    RetryAfter(..), Retry(..), SetCookie(..), header,
+    RetryAfter(..), Retry(..), SetCookie(..), field, withHeaders,
 )
 import Net.HTTP.HTTPURL (HTTPURL)
 import Net.HTTP.MediaType (MediaType)
 import Net.HTTP.Method (Method(..), MethodName)
-import Net.HTTP.Request (Request(..), ClientRequest(..), RequestTarget(..), Target(..), request)
+import Net.HTTP.Request (
+    Request(..), ClientRequest(..), RequestTarget(..), Target(..), Control(..), request,
+    contentLength, host, upgradeRequested, acceptsTrailers,
+)
+import Net.HTTP.Response (Response(..), Timings(..))
+import Net.HTTP.ServerResponse (
+    ServerResponse, ToResponse(..), Content(..), body, stream, statusOnly, noContent, notModified, switch, relay,
+)
 import Net.HTTP.Status (
     Status(
         Continue, SwitchingProtocols, Processing, EarlyHints, OK, Created,
@@ -81,5 +102,6 @@ import Net.HTTP.Status (
         GatewayTimeout, HTTPVersionNotSupported, VariantAlsoNegotiates, InsufficientStorage, LoopDetected, NetworkAuthenticationRequired
     )
 )
+import Net.HTTP.Stream (Stream(..), BodyLength(..), Sink)
 import Net.HTTP.Token (Token)
 import URL (URL, URLError(..))

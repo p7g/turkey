@@ -1,6 +1,6 @@
 export (
     refName, refOf, isRef, refElem,
-    Core(..), CoreKind(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..),
+    Core(..), CoreKind(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..), noId,
     altVars, openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
@@ -93,15 +93,28 @@ type Core = Core {
     var ty : Ty.Type,
     span   : Option Span,
     kind   : CoreKind,
+    -- The run of `Turkey.Opt` that left this node, and everything under it,
+    -- at a fixed point, so that the run does not reduce it again; 0 if none
+    -- has. Every node starts at 0, so a copy or a rebuilt node is reduced
+    -- again. No other pass reads it.
+    var settledIn : Int,
 }
 
 fun mkCore(ty : Ty.Type, span : Option Span, kind : CoreKind) -> Core =
-    Core { ty = ty, span = span, kind = kind }
+    Core { ty = ty, span = span, kind = kind, settledIn = 0 }
 
+-- A binder's spelling and its id are carried side by side. The passes after
+-- `Turkey.Lower` key on the spelling; the id is what tells two binders that
+-- share a spelling apart, in a dump and in the passes that come to read it.
 type CParam = CParam {
     name : String,
+    id   : Int,
     ty   : Ty.Type,
 }
+
+-- The id a binder carries when `Turkey.Binders` has no record of it: a
+-- dictionary, or a binder a pass after `Turkey.Lower` made.
+let noId = -1
 
 -- One arm. What its test *binds*, and at what types, is deliberately not
 -- recorded: the checker derives it from the scrutinee's type and the
@@ -120,11 +133,11 @@ type CAlt = CAlt {
 type Alt
     -- A constructor and a binder per field, in declaration order -- a record's
     -- too -- and, for an existential, what it opens.
-    = ACon(String, Array (Option String), Option Opening)
-    | ATuple(Array (Option String))
+    = ACon(String, Array (Option (String, Int)), Option Opening)
+    | ATuple(Array (Option (String, Int)))
     | ALit(Ast.Lit)
     -- Anything at all, binding the whole scrutinee when named.
-    | AAny(Option String)
+    | AAny(Option (String, Int))
 
 type CoreKind
     = CLit(Ast.Lit)
@@ -132,7 +145,7 @@ type CoreKind
     -- A term variable: a local, a top-level binding, or a dictionary. A
     -- dictionary is not a separate form -- that is the milestone's whole claim:
     -- evidence became a value, so it is fetched the way any other value is.
-    | CVar(String)
+    | CVar(String, Int)
     -- A data constructor, referred to but not yet applied.
     | CCon(String)
     -- A machine operation. The resolver's `Prim.` spelling becomes this once,
@@ -163,7 +176,7 @@ type CoreKind
     -- name may be one nothing reads, which is how a statement whose value is
     -- discarded is expressed. A `let` generalizes, so a local binding may be
     -- polymorphic and its uses may be type applications.
-    | CLet(String, Ty.Type, Core, Core, Vec VarCell)
+    | CLet(String, Int, Ty.Type, Core, Core, Vec VarCell)
     -- A binding group that may refer to itself and to its siblings. One form for
     -- the whole group rather than one per name, because that is what a
     -- strongly-connected component is and what the dictionary abstraction is
@@ -182,11 +195,11 @@ type CoreKind
     -- The `Bool` says whether the body may jump to the join itself -- a loop
     -- compiled as a label. A non-recursive join is the case-of-case
     -- duplication: one continuation, several branches reaching it.
-    | CJoin(String, Array CParam, Core, Core, Bool)
+    | CJoin(String, Int, Array CParam, Core, Core, Bool)
     -- `jump j(args)`. Typed `!`: it never yields to its context, which is why it
     -- needs no type of its own beyond bottom, and why a branch that jumps stays
     -- compatible with a branch that does not.
-    | CJump(String, Vec Core)
+    | CJump(String, Int, Vec Core)
     -- Make a reference cell. What a `var` binding is.
     | CRef(Core)
     -- Read a reference cell. What a mention of a `var` is.
@@ -208,6 +221,10 @@ type CoreKind
 -- retained.
 type CBind = CBind {
     var name      : String,
+    -- `noId` for a binding `Turkey.Binders` has no record of: an instance's
+    -- dictionary, a default method, or a binding a pass after `Turkey.Lower`
+    -- made.
+    var id        : Int,
     var ty        : Ty.Type,
     binders       : Vec VarCell,
     value         : Core,
@@ -253,9 +270,9 @@ type CProgram = CProgram {
 -- rid of.
 fun tailFieldNames(k : CoreKind) -> Array String = match k {
     CIf(_, _, _) -> ["then", "otherwise"]
-    CLet(_, _, _, _, _) -> ["body"]
+    CLet(_, _, _, _, _, _) -> ["body"]
     CLetRec(_, _) -> ["body"]
-    CJoin(_, _, _, _, _) -> ["body", "rest"]
+    CJoin(_, _, _, _, _, _) -> ["body", "rest"]
     CMatch(_, _) -> ["alts"]
     _ -> []
 }
@@ -265,9 +282,9 @@ fun tailParts(k : CoreKind) -> Array Core = match k {
         Some(o) -> [then, o]
         None -> [then]
     }
-    CLet(_, _, _, body, _) -> [body]
+    CLet(_, _, _, _, body, _) -> [body]
     CLetRec(_, body) -> [body]
-    CJoin(_, _, body, rest, _) -> [body, rest]
+    CJoin(_, _, _, body, rest, _) -> [body, rest]
     CMatch(_, alts) -> Array.map(alts, _.body)
     _ -> []
 }
@@ -298,7 +315,7 @@ type Mapper = Mapper {
 fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CLit(_) -> k
     CUnit -> k
-    CVar(_) -> k
+    CVar(_, _) -> k
     CCon(_) -> k
     CPrim(_) -> k
     CTuple(elems) -> CTuple(Array.map(elems, m.expr))
@@ -307,19 +324,17 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CSlot(target, index) -> CSlot(m.expr(target), index)
     CProject(target, index) -> CProject(m.expr(target), index)
     CIndex(target, index) -> CIndex(m.expr(target), m.expr(index))
-    CLam(params, body, name) -> CLam(Array.map(params, fun(p) =
-        CParam { name = p.name, ty = m.type_(p.ty) }), m.expr(body), name)
+    CLam(params, body, name) -> CLam(Array.map(params, mapParam(_, m)), m.expr(body), name)
     CApp(fn, args) -> CApp(m.expr(fn), Array.map(args, m.expr))
     CTyLam(binders, body) -> CTyLam(binders, m.expr(body))
     CTyApp(fn, args) -> CTyApp(m.expr(fn), Array.map(args, m.type_))
-    CLet(name, bound, value, body, binders) ->
-        CLet(name, m.type_(bound), m.expr(value), m.expr(body), binders)
+    CLet(name, id, bound, value, body, binders) ->
+        CLet(name, id, m.type_(bound), m.expr(value), m.expr(body), binders)
     CLetRec(binds, body) -> CLetRec(Vec.map(binds, m.bind), m.expr(body))
-    CJoin(name, params, body, rest, recursive) ->
-        CJoin(name, Array.map(params, fun(p) =
-            CParam { name = p.name, ty = m.type_(p.ty) }),
+    CJoin(name, id, params, body, rest, recursive) ->
+        CJoin(name, id, Array.map(params, mapParam(_, m)),
             m.expr(body), m.expr(rest), recursive)
-    CJump(name, args) -> CJump(name, Vec.map(args, m.expr))
+    CJump(name, id, args) -> CJump(name, id, Vec.map(args, m.expr))
     CRef(value) -> CRef(m.expr(value))
     CDeref(target) -> CDeref(m.expr(target))
     CAssign(target, value) -> CAssign(m.expr(target), m.expr(value))
@@ -332,13 +347,18 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
         Vec.map(alts, fun(a) = CAlt { alt = a.alt, body = m.expr(a.body) }))
 }
 
+fun mapParam(p : CParam, m : Mapper) -> CParam {
+    let CParam { name, id, ty } = p
+    CParam { name = name, id = id, ty = m.type_(ty) }
+}
+
 -- The term a binding holds, and the term an arm holds, each taken apart with a
 -- full pattern: a Core-valued field added to `CBind` or `CAlt` is then a compile
 -- error in the one place every child enumerator asks.
 fun bindValue(b : CBind) -> Core {
     let CBind {
-        name = _, ty = _, binders = _, value, span = _, mutable = _, module_ = _,
-        equations = _, layouts = _,
+        name = _, id = _, ty = _, binders = _, value, span = _, mutable = _,
+        module_ = _, equations = _, layouts = _,
     } = b
     value
 }
@@ -451,7 +471,7 @@ fun namesOf(e : Core) -> Set.Set String {
 }
 
 fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
-    CVar(name) -> Set.add(out, name)
+    CVar(name, _) -> Set.add(out, name)
     CLit(_) -> {}
     CUnit -> {}
     CCon(_) -> {}
@@ -476,7 +496,7 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
     }
     CTyLam(_, body) -> namesInto(body, out)
     CTyApp(fn, _) -> namesInto(fn, out)
-    CLet(_, _, value, body, _) -> {
+    CLet(_, _, _, value, body, _) -> {
         namesInto(value, out)
         namesInto(body, out)
     }
@@ -484,11 +504,11 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
         for b in binds { namesInto(bindValue(b), out) }
         namesInto(body, out)
     }
-    CJoin(_, _, body, rest, _) -> {
+    CJoin(_, _, _, body, rest, _) -> {
         namesInto(body, out)
         namesInto(rest, out)
     }
-    CJump(_, args) -> for a in args { namesInto(a, out) }
+    CJump(_, _, args) -> for a in args { namesInto(a, out) }
     CRef(value) -> namesInto(value, out)
     CDeref(target) -> namesInto(target, out)
     CAssign(target, value) -> {
@@ -511,48 +531,76 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
 
 -- -- printing -----------------------------------------------------------------------
 
--- Renumbers the binders a pass invented, per binding, in encounter order.
+-- How a dump names binders.
 --
--- `%seq24` and `%d52.Show` carry a counter that is global to a whole
--- compilation, so adding a generated name anywhere renumbers every name after
--- it. That makes a golden churn on changes it has nothing to do with, and the
--- numbers mean nothing to a reader anyway -- they exist to be unique, and they
--- still are after this. The same decision the printer already makes for type
--- variables, which are named `a, b, c` in encounter order.
+-- A binder prints as its base name: its spelling, less the counter in a
+-- spelling a pass generated (`%seq24` is `%seq`, `%d52.Show` is `%d.Show`).
+-- Where two binders in one dump share a base name, each prints as `base%k`,
+-- with `k` numbered per base name in order of first print. A binder is its
+-- spelling and its id together, so two binders spelled alike are told apart
+-- by their ids, and a binder a pass renamed is a new one.
+--
+-- The counters and the ids are global to a compilation, so printing either
+-- would move every name after a binder added anywhere. Neither is printed.
+--
+-- Whether a base name is shared is known only once the whole dump has been
+-- walked, so a dump is printed twice: once to collect the binders in order of
+-- first print, and once, after `settle`, to print them.
 type Aliases = Aliases {
-    seen   : Map String String,
-    counts : Map String Int,
+    -- What each binder prints as, by `identity`. Its base name until `settle`.
+    printed     : Map String String,
+    -- The binders under each base name, by `identity`, in order of first print.
+    byBase      : Map String (Vec String),
+    var settled : Bool,
     -- What slot `i` of a class's dictionary holds, for a dump to print it by.
-    slotName : fun(String, Int) -> String,
+    slotName    : fun(String, Int) -> String,
 }
 
 fun newAliases(slotName : fun(String, Int) -> String) -> Aliases =
-    Aliases { seen = Map.new(), counts = Map.new(), slotName = slotName }
+    Aliases { printed = Map.new(), byBase = Map.new(), settled = False,
+              slotName = slotName }
 
-fun alias(a : Aliases, name : String) -> String {
-    match Map.get(a.seen, name) {
+-- Returns what the binder spelled `name` with the id `id` prints as. Before
+-- `settle`, records it and returns its base name.
+fun alias(a : Aliases, name : String, id : Int) -> String {
+    let key = identity(name, id)
+    match Map.get(a.printed, key) {
         Some(found) -> return found
         None -> {}
     }
-    match generatedParts(name) {
-        None -> {
-            Map.put(a.seen, name, name)
-            name
-        }
-        Some((hint, suffix)) -> {
-            let key = hint + "|" + suffix
-            let n = Map.getOr(a.counts, key, 0) + 1
-            Map.put(a.counts, key, n)
-            let out = "%" + hint + Int.toString(n) + suffix
-            Map.put(a.seen, name, out)
-            out
+    let base = baseName(name)
+    if a.settled { return base }
+    Map.put(a.printed, key, base)
+    match Map.get(a.byBase, base) {
+        Some(keys) -> Vec.push(keys, key)
+        None -> Map.put(a.byBase, base, [key])
+    }
+    base
+}
+
+-- Numbers every binder whose base name another binder shares.
+fun settle(a : Aliases) -> Unit {
+    for (base, keys) in Map.entries(a.byBase) {
+        if len(keys) > 1 {
+            for var i = 0; i < len(keys); i = i + 1 {
+                Map.put(a.printed, keys[i], base + "%" + Int.toString(i + 1))
+            }
         }
     }
+    a.settled = True
+}
+
+-- The id goes first: it holds no `:`, so the key splits back unambiguously.
+fun identity(name : String, id : Int) -> String = Int.toString(id) + ":" + name
+
+fun baseName(name : String) -> String = match generatedParts(name) {
+    Some((hint, suffix)) -> "%" + hint + suffix
+    None -> name
 }
 
 -- A generated name is `%hint123` or `%hint123.suffix`, taken apart by scanning.
--- The hint is the letters after the `%`, the digits are dropped and renumbered,
--- and anything from the first `.` onwards is the suffix and is kept.
+-- The hint is the letters after the `%`, the digits are the counter, and
+-- anything from the first `.` onwards is the suffix.
 fun generatedParts(name : String) -> Option (String, String) {
     let cs = String.codePoints(name)
     let chars = Vec.new(String.byteLength(name))
@@ -586,8 +634,8 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
     match e.kind {
         CLit(l) -> p + showLit(l)
         CUnit -> p + "()"
-        CVar(name) -> p + alias(a, name)
-        CCon(name) -> p + alias(a, name)
+        CVar(name, id) -> p + alias(a, name, id)
+        CCon(name) -> p + name
         CPrim(prim) -> p + Prims.name(prim)
         CTuple(elems) -> p + "(" + String.join(flatEach(elems, n, a), ", ") + ")"
         CArray(elems) -> p + "[" + String.join(flatEach(elems, n, a), ", ") + "]"
@@ -607,14 +655,13 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
                 Some(cls) -> a.slotName(cls, index)
                 None -> "%" + Int.toString(index)
             }
-            p + flat(target, n, a) + "." + alias(a, name)
+            p + flat(target, n, a) + "." + name
         }
         CProject(target, index) -> p + flat(target, n, a) + "." + Int.toString(index)
         CIndex(target, index) ->
             p + flat(target, n, a) + "[" + flat(index, n, a) + "]"
         CLam(params, body, _) -> {
-            let ps = Array.map(params, fun(q) =
-                alias(a, q.name) + " : " + Ty.showAt(q.ty, n, 0))
+            let ps = Array.map(params, showParam(_, n, a))
             p + "fun(" + String.join(ps, ", ") + ") {\n"
               + showExpr(body, indent + 1, n, a) + "\n" + p + "}"
         }
@@ -628,12 +675,12 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
             let as_ = Array.map(args, Ty.showAt(_, n, 0))
             p + flat(fn, n, a) + "[" + String.join(as_, ", ") + "]"
         }
-        CLet(name, bound, value, body, binders) -> {
+        CLet(name, id, bound, value, body, binders) -> {
             let forall = if len(binders) == 0 { "" } else {
                 " forall " + String.join(Array.map(binders,
                     \Ty.showAt(TVar(_), n, 0)), " ") + "."
             }
-            p + "let " + alias(a, name) + " :" + forall + " "
+            p + "let " + alias(a, name, id) + " :" + forall + " "
               + Ty.showAt(bound, n, 0) + " =\n"
               + showExpr(value, indent + 1, n, a) + "\n"
               + showExpr(body, indent, n, a)
@@ -646,23 +693,22 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
                     " forall " + String.join(Array.map(b.binders,
                         \Ty.showAt(TVar(_), n, 0)), " ") + "."
                 }
-                Vec.push(out, p + "  " + alias(a, b.name) + " :" + forall + " "
+                Vec.push(out, p + "  " + alias(a, b.name, b.id) + " :" + forall + " "
                                 + Ty.showAt(b.ty, n, 0) + " =")
                 Vec.push(out, showExpr(b.value, indent + 2, n, a))
             }
             Vec.push(out, showExpr(body, indent, n, a))
             String.join(out, "\n")
         }
-        CJoin(name, params, body, rest, recursive) -> {
-            let ps = Array.map(params, fun(q) =
-                alias(a, q.name) + " : " + Ty.showAt(q.ty, n, 0))
+        CJoin(name, id, params, body, rest, recursive) -> {
+            let ps = Array.map(params, showParam(_, n, a))
             let kind = if recursive { "join rec" } else { "join" }
-            p + kind + " " + alias(a, name) + "(" + String.join(ps, ", ")
+            p + kind + " " + alias(a, name, id) + "(" + String.join(ps, ", ")
               + ") : " + Ty.showAt(e.ty, n, 0) + " = {\n"
               + showExpr(body, indent + 1, n, a) + "\n" + p + "}\n"
               + showExpr(rest, indent, n, a)
         }
-        CJump(name, args) -> call(None, "jump " + alias(a, name), args, indent, n, a)
+        CJump(name, id, args) -> call(None, "jump " + alias(a, name, id), args, indent, n, a)
         CRef(value) -> call(None, "ref", [value], indent, n, a)
         CDeref(target) -> p + "!" + flat(target, n, a)
         CAssign(target, value) -> {
@@ -718,6 +764,9 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
 
 fun showLit(l : Ast.Lit) -> String = literalText(l)
 
+fun showParam(q : CParam, n : Namer, a : Aliases) -> String =
+    alias(a, q.name, q.id) + " : " + Ty.showAt(q.ty, n, 0)
+
 fun flat(e : Core, n : Namer, a : Aliases) -> String =
     String.trim(showExpr(e, 0, n, a))
 
@@ -764,7 +813,7 @@ fun call[Iterator c, Length c, Item c ~ Core](fn : Option Core, name : String, a
 
 fun showAlt(alt : Alt, a : Aliases) -> String = match alt {
     ACon(name, fields, opening) -> {
-        let head = alias(a, name) + showOpening(opening, a)
+        let head = name + showOpening(opening, a)
         if len(fields) == 0 { head } else {
             head + "(" + String.join(Array.map(fields, showBinder(_, a)), ", ") + ")"
         }
@@ -774,8 +823,8 @@ fun showAlt(alt : Alt, a : Aliases) -> String = match alt {
     AAny(binder) -> showBinder(binder, a)
 }
 
-fun showBinder(binder : Option String, a : Aliases) -> String = match binder {
-    Some(name) -> alias(a, name)
+fun showBinder(binder : Option (String, Int), a : Aliases) -> String = match binder {
+    Some((name, id)) -> alias(a, name, id)
     None -> "_"
 }
 
@@ -789,11 +838,11 @@ fun altVars(alt : Alt) -> Vec String {
                 Some(o) -> for d in o.evidence { Vec.push(out, d) }
                 None -> {}
             }
-            for f in fields { if let Some(n) = f { Vec.push(out, n) } }
+            for f in fields { if let Some((n, _)) = f { Vec.push(out, n) } }
         }
-        ATuple(elems) -> for f in elems { if let Some(n) = f { Vec.push(out, n) } }
+        ATuple(elems) -> for f in elems { if let Some((n, _)) = f { Vec.push(out, n) } }
         ALit(_) -> {}
-        AAny(binder) -> if let Some(n) = binder { Vec.push(out, n) }
+        AAny(binder) -> if let Some((n, _)) = binder { Vec.push(out, n) }
     }
     out
 }
@@ -809,7 +858,7 @@ fun showOpening(opening : Option Opening, a : Aliases) -> String = match opening
             Some(ls) -> "@" + Ssa.keyName(ls)
         }
         "[" + String.join(Array.map(o.skolems, _.name), ", ") + layouts
-            + "](" + String.join(Array.map(o.evidence, alias(a, _)), ", ")
+            + "](" + String.join(Array.map(o.evidence, alias(a, _, noId)), ", ")
             + ")"
     }
 }
@@ -825,8 +874,14 @@ fun openingOf(alt : Alt) -> Option Opening = match alt {
 -- the whole reason a reader can follow a type variable from a `forall` to the
 -- parameter that uses it.
 fun showBind(b : CBind, slotName : fun(String, Int) -> String) -> String {
-    let n = Ty.namer("")
     let a = newAliases(slotName)
+    discard(renderBind(b, a))
+    settle(a)
+    renderBind(b, a)
+}
+
+fun renderBind(b : CBind, a : Aliases) -> String {
+    let n = Ty.namer("")
     let forall = if len(b.binders) == 0 { "" } else {
         "forall " + String.join(Array.map(b.binders,
             \Ty.showAt(TVar(_), n, 0)), " ") + ". "

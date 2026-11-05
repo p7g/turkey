@@ -138,9 +138,9 @@ from, and the one that chose differently.
   chapter.
 * The **Haskell 2010 Report** gives the meaning of each piece of syntactic
   sugar by translating it into a smaller core language. This reference
-  explains `for`, `if let`, `while let`, array literals and `?` the same way,
-  except that it translates into ordinary Turkey rather than a separate core
-  language.
+  explains `for`, `if let`, `while let`, `let ... else`, array literals and
+  `?` the same way, except that it translates into ordinary Turkey rather than
+  a separate core language.
 * The **Rust Reference** puts a small syntax block in each section, and it
   tests its examples, including examples that are meant to be rejected. This
   reference does both: the syntax sits next to the construct it describes, and

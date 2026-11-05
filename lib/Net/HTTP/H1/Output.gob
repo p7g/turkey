@@ -1,6 +1,6 @@
 export (
     OutgoingRequest(..), OutgoingResponse(..), BodyWriter,
-    requestHead, responseHead, bodyWriter, finish, finishWith,
+    requestHead, responseHead, hostField, bodyWriter, finish, finishWith,
 )
 
 -- The writing side of HTTP/1: heads written from the HTTP values, and a body
@@ -47,6 +47,7 @@ import Net.HTTP.Headers as Headers (Headers)
 import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
 import Net.HTTP.Method as Method (Method)
 import Net.HTTP.Status as Status (Status)
+import Net.HTTP.Token as Token (Token)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 import Turkey.HTTPField (HeaderName(..), HeaderValue(..))
@@ -56,6 +57,9 @@ import URL (URLError(..))
 -- A request head to write. `framing` must not be `UntilClose`, which only a
 -- response can be framed by. A request whose method has a body, and whose
 -- body is empty, is `ContentLength(0)`, not `NoBody` (RFC 9110 §8.6).
+--
+-- `upgrade`, when it is not empty, is written as `Upgrade`, in order, with
+-- `Connection: upgrade`.
 type OutgoingRequest b = OutgoingRequest {
     method : Method b,
     url : HTTPURL,
@@ -63,6 +67,7 @@ type OutgoingRequest b = OutgoingRequest {
     framing : Framing,
     persistence : Persistence,
     expectContinue : Bool,
+    upgrade : Array Token,
 }
 
 -- A response head to write. A 1xx or 204 response must be `NoBody`, and a
@@ -82,12 +87,16 @@ type OutgoingResponse = OutgoingResponse {
 -- bytes.
 let spare = 4096
 
+-- Returns the value a request head's `Host` has for `u`: its host as
+-- written, lowercase, and the port if the URL gave one.
+fun hostField(u : HTTPURL) -> String = HTTPURL.authority(u)
+
 -- Returns the request head, in a buffer with room after it for the body
 -- writer, or `BadURL` if the URL's target or authority holds a byte a
 -- request line cannot.
 fun requestHead(r : OutgoingRequest b) -> Either HTTPError Buffer {
     let target = HTTPURL.target(r.url)
-    let authority = HTTPURL.authority(r.url)
+    let authority = hostField(r.url)
     if !allIn(targetChar, target) { return Left(BadURL(BadPath)) }
     if !allIn(targetChar, authority) { return Left(BadURL(BadHost)) }
     let out = Writer { buffer = Buf.buffer(512 + spare) }
@@ -103,6 +112,11 @@ fun requestHead(r : OutgoingRequest b) -> Either HTTPError Buffer {
         framing -> framingFields(out, framing)
     }
     if let Close = r.persistence { text(out, "connection: close\r\n") }
+    if len(r.upgrade) > 0 {
+        text(out, "connection: upgrade\r\nupgrade: ")
+        text(out, String.join(Array.map(r.upgrade, Token.toString), ", "))
+        text(out, "\r\n")
+    }
     if r.expectContinue { text(out, "expect: 100-continue\r\n") }
     text(out, "\r\n")
     Right(finished(out))
@@ -314,9 +328,16 @@ fun finish[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Uni
     finishWith(bw, Headers.empty)
 
 -- Ends a chunked body with `trailers` after its last chunk, as `finish`
--- does. Panics if the body is not chunked and `trailers` holds any field:
--- only a chunked body has anywhere to put them.
+-- does. `UnframedTrailers` if the body is not chunked and `trailers` holds
+-- any field: only a chunked body has anywhere to put them. The message is
+-- then left unfinished, as after any other refusal.
 fun finishWith[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecError (WriteError w)) Unit {
+    match bw.state {
+        Sending(_) | Streaming | Bodiless -> if Headers.size(trailers) > 0 {
+            return broken(bw, UnframedTrailers)
+        }
+        _ -> {}
+    }
     match bw.state {
         Sending(left) -> if left > 0 { return broken(bw, Truncated) }
         Chunking -> {
@@ -330,10 +351,6 @@ fun finishWith[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecE
         Done -> return Right(())
         Broken(e) -> return Left(Left(e))
         Streaming | Bodiless -> {}
-    }
-    match bw.state {
-        Chunking -> {}
-        _ -> if Headers.size(trailers) > 0 { error("finishWith: only a chunked body has trailers") }
     }
     sendPending(bw)?
     bw.state = Done

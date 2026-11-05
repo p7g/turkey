@@ -436,7 +436,14 @@ fun run(s : Sel) -> Unit {
         }
         for p in s.source.blocks[b].params { storeRoot(s, p) }
         let insts = s.source.blocks[b].insts
+        var tail = False
         for var n = 0; n < len(insts); n = n + 1 {
+            if isTailCall(s, b, n) {
+                s.place = (b, n)
+                tailCall(s, insts[n])
+                tail = True
+                break
+            }
             -- A poll's map is written by its own slow path (`Turkey.Emit.poll`).
             let polls = match insts[n].op {
                 Poll -> True
@@ -454,7 +461,115 @@ fun run(s : Sel) -> Unit {
             -- After the call's map, where the result first exists.
             storeRoot(s, insts[n].result)
         }
-        terminate(s, s.source.blocks[b].term)
+        if tail {
+            s.out.blocks[s.at].term = Unreachable
+        } else {
+            terminate(s, s.source.blocks[b].term)
+        }
+    }
+}
+
+-- -- tail calls ---------------------------------------------------------------------
+
+-- Whether the instruction at `(b, n)` is a call whose results are the
+-- function's: a call in tail position (`L.inTailPosition`) of a Turkey
+-- function, directly or through a closure, whose every result is returned,
+-- in order. Then nothing in this frame is needed after the call, and the
+-- callee can answer this function's caller.
+--
+-- Declined, so the call stays a call, when an argument goes on the stack:
+-- the outgoing area is part of this frame, which is gone when the callee
+-- reads it.
+--
+-- A runtime or foreign callee is never one: its convention is C's, and C's
+-- callee does not answer in this function's result registers.
+fun isTailCall(s : Sel, b : Int, n : Int) -> Bool {
+    if !L.inTailPosition(s.source, b, n) { return False }
+    let block = s.source.blocks[b]
+    let i = block.insts[n]
+    let answers = match i.op {
+        Call(Direct(name), args) -> {
+            if overflows(passedOf(s, args)) { return False }
+            let reps = Map.getOr(s.results, name, [])
+            if len(reps) == 0 { 1 } else { len(reps) }
+        }
+        Call(Indirect(_), args) -> {
+            -- The environment is passed first, in the general file.
+            if overflows(Array.append([(A.xzr, Gp)], passedOf(s, args))) { return False }
+            1
+        }
+        _ -> return False
+    }
+    let vs = match L.returned(s.source, b) {
+        Some(vs) -> vs
+        None -> return False
+    }
+    if len(vs) != answers || vs[0] != i.result { return False }
+    -- One `Result` per further register, each the value returned in it. Each
+    -- defines a value of its own, so no two can stand for the same `vs[k]`,
+    -- and as many of them as there are further registers covers every one.
+    if len(block.insts) - n - 1 != len(vs) - 1 { return False }
+    for var at = n + 1; at < len(block.insts); at = at + 1 {
+        match block.insts[at].op {
+            Result(of, k) -> if of != i.result || k < 1 || k >= len(vs)
+                                || vs[k] != block.insts[at].result {
+                return False
+            }
+            _ -> return False
+        }
+    }
+    -- A frame object the call could reach would be an address in a frame
+    -- that no longer exists, so a call that can reach one stays a call.
+    -- `Roots.objectsAt` lists the objects the call's operands may reach.
+    -- There are none when the callee can call this function again by direct
+    -- calls: `Turkey.Escape` builds on the heap what such a call passes, so
+    -- such a cycle of tail calls never grows the stack.
+    --
+    -- `Roots.liveAt` is not asked. At a call it lists the call's own
+    -- operands, rooted for the callee's sake, and nothing else here, since
+    -- nothing is live after this call. A Turkey callee roots its own
+    -- parameters at its entry, before anything in it can collect.
+    len(Roots.objectsAt(s.frame, b, n)) == 0
+}
+
+-- The arguments of a call, each in the file its representation puts it in.
+fun passedOf(s : Sel, args : Array Value) -> Array (Reg, A.Bank) =
+    Array.map(args, fun(a) = (A.reg(a), A.bankOf(Ssa.repOf(s.source, a))))
+
+-- A call `isTailCall` accepted: the arguments into their registers, as
+-- `callInto` passes them, and the tail call. No result is moved out and no
+-- panic is tested: a callee that panics answers zeros, which is what the test
+-- would have answered, and it answers them to this function's caller.
+fun tailCall(s : Sel, i : Low) -> Unit = match i.op {
+    Call(Direct(name), args) ->
+        tailInto(s, Some(symbolFor(s, name)), A.xzr, passedOf(s, args))
+    Call(Indirect(closure), args) -> {
+        let code = temp(s, Ssa.traced(Ptr))
+        let env = temp(s, Ssa.traced(Ptr))
+        emit(s, A.Ldr(code, closureCode(A.reg(closure)), A.W64))
+        emit(s, A.Ldr(env, closureEnvironment(A.reg(closure)), A.W64))
+        tailInto(s, None, code, Array.append([(env, Gp)], passedOf(s, args)))
+    }
+    _ -> stop(s, "a tail call that is not a call of a Turkey function")
+}
+
+fun tailInto(s : Sel, sym : Option Asm.Symbol, indirect : Reg,
+             args : Array (Reg, A.Bank)) -> Unit {
+    let ins = []
+    var general = 0
+    var vector = 0
+    for (a, bank) in args {
+        let into = match bank {
+            Gp -> { let at = general; general = general + 1; A.argRegs[at] }
+            Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
+        }
+        move(s, into, bank, a, bank)
+        Vec.push(ins, into)
+    }
+    emit(s, A.CallArgs(ins, []))
+    match sym {
+        Some(name) -> emit(s, A.TailB(name))
+        None -> emit(s, A.TailBr(indirect))
     }
 }
 

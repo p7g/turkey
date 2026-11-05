@@ -57,9 +57,9 @@ fun digit(c : Char) -> Bool = c >= '0' && c <= '9'
 
 fun pattern() = do {
     let left = R.capture(R.some(R.satisfy(digit)))?
-    R.literal("-")?
+    let _ = R.literal("-")?
     let middle = R.optional(R.capture(R.some(R.satisfy(Char.isAsciiAlpha))))?
-    R.literal("-")?
+    let _ = R.literal("-")?
     let right = R.capture(R.some(R.satisfy(digit)))?
     pure((left, middle, right))
 }

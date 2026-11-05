@@ -1,0 +1,79 @@
+export (Body(..), Replay, newPOST, newPUT, newPATCH, newExtension)
+
+-- What a client can send as a request body, and the methods that carry one.
+--
+--     let form = withHeaders(request(newPOST("a=1&b=2"), url), field(ContentType, MediaType.formURLEncoded))
+--     send(c, form, Duration.seconds(10), use)
+--
+--     File.use(File.openRead(path), fun(f) {
+--         let upload = withHeaders(request(newPUT(f), url), field(ContentType, MediaType.octetStream))
+--         send(c, upload, timeout, use)
+--     })
+--
+-- The client never picks a media type: a request has the `Content-Type`
+-- its headers give it, or none.
+--
+-- A request a client sends is a `ClientRequest Payload`: its body, if its
+-- method has one, is the client's one body type, so `request(GET, url)`
+-- needs no annotation. `newPOST`, `newPUT`, `newPATCH` and `newExtension`
+-- take any `Body` and make the `Payload` from it. A proxy passes on a
+-- request it received with `map(req.method, payload)`.
+--
+-- **Sending again.** `Replay` marks a body that can be sent again whole:
+-- `String`, `Buffer` and `File`, the last read from offset 0 each time. The
+-- client sends a request again (its one retry, a 307 or 308 redirect) only
+-- if its body is one. An `Incoming` is passed on as it arrives, and a
+-- `Stream` written as it goes; each is sent once. A program that must read a
+-- body before sending it, to sign it, asks for `Replay`.
+--
+-- **Trailers.** A `Stream`'s function returns the fields to send after the
+-- body, and a relayed `Incoming` sends the trailers it arrived with. Only a
+-- chunked body has trailers, so a `Stream` of `LengthKnown` length that
+-- returns any fails the request with `UnframedTrailers`.
+
+import Net.HTTP.Payload as Payload (Payload)
+import Net.HTTP.Incoming (Incoming)
+import Net.HTTP.Method (Method(..), MethodName)
+import Net.HTTP.Stream (Stream)
+import System.File (File, CanRead)
+import Turkey.Buffer (Buffer)
+
+-- A value a client can send as a request body.
+class Body b { fun payload(b) -> Payload }
+
+-- A body that can be sent again whole.
+class Replay b : Body b {}
+
+instance Body Payload { fun payload(p) = p }
+
+-- A string's UTF-8 bytes.
+instance Body String { fun payload(s) = Payload.text(s) }
+instance Replay String {}
+
+-- A buffer's window, as it is when the request is made.
+instance Body Buffer { fun payload(b) = Payload.bytes(b) }
+instance Replay Buffer {}
+
+-- A file's contents, from offset 0, with the length `stat` gives when the
+-- request is sent.
+instance Body (File m) : CanRead m { fun payload(f) = Payload.file(f) }
+instance Replay (File m) : CanRead m {}
+
+-- A body that arrived, passed on as it is read, with no limit of its own,
+-- and its trailers after it.
+instance Body Incoming { fun payload(b) = Payload.incoming(b) }
+
+-- A body written as it is sent, with the trailers its function returns.
+instance Body Stream { fun payload(s) = Payload.stream(s) }
+
+-- Returns a POST carrying `b`.
+fun newPOST[Body b](b : b) -> Method Payload = POST(payload(b))
+
+-- Returns a PUT carrying `b`.
+fun newPUT[Body b](b : b) -> Method Payload = PUT(payload(b))
+
+-- Returns a PATCH carrying `b`.
+fun newPATCH[Body b](b : b) -> Method Payload = PATCH(payload(b))
+
+-- Returns the extension method `name` carrying `b`.
+fun newExtension[Body b](name : MethodName, b : b) -> Method Payload = Extension(name, Some(payload(b)))

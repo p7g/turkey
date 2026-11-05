@@ -1,19 +1,19 @@
 export (
     Header(..), Multiplicity(..), HasHeaders(..), Headers,
-    empty, fromFields, fields, size, has, add, set, remove, get, getAll, one, header,
+    empty, field, fromFields, fields, size, has, add, set, remove, get, getAll, one, withHeaders,
     Accept(..), ContentType(..), Authorization(..), IdempotencyKey(..), Location(..),
     RetryAfter(..), Retry(..), SetCookie(..),
 )
 
 -- Header fields, typed.
 --
---     let hs = Headers.add(Headers.empty, ContentType, MediaType.json)
+--     let hs = combine(field(ContentType, MediaType.json), field(Accept, MediaType.json))
 --     Headers.get(hs, ContentType)            -- Some(application/json)
 --     Headers.get(hs, HeaderName.literal("content-type"))
 --                                             -- Some(application/json), as text
 --
 -- **A header is a type.** Each field the library knows is a type with an
--- instance of `Header`, which says the field's name, the type of its value,
+-- instance of `Header`, which gives the field's name, the type of its value,
 -- and how that value is read from and written as text: `ContentType` holds a
 -- `MediaType` and `Authorization` holds `Credentials`. A `HeaderName` is a
 -- header too, whose value is the `HeaderValue` text, for any field the
@@ -29,7 +29,7 @@ export (
 -- they were added or arrived, each once per line, and nothing is ever joined:
 -- two `Set-Cookie` fields stay two, as RFC 6265 requires, since an `Expires`
 -- date has a comma in it. A field written as a comma-separated list is split
--- into its elements when it is read, where its header says it is one.
+-- into its elements when it is read, where its header declares it one.
 --
 -- **Values are stored as text.** Each field is held as its name and the
 -- `HeaderValue` its value is written as, and a typed value is read from that
@@ -37,6 +37,14 @@ export (
 -- program added are the same thing, and `get` with a `HeaderName` sees typed
 -- fields as the text they are sent as. A typed value is written when it is
 -- added, so the text it would be sent as is checked then.
+--
+-- **`Headers` is a monoid.** `field(h, v)` is headers of one field, and
+-- `combine` joins two sets of fields by each field's multiplicity: a
+-- `Single` field on the right replaces the left's, and any other is added
+-- after them. So a set of fields is a value that can be named, shared and
+-- joined to a message's with `withHeaders`, and joining a default content
+-- type and a program's own leaves one. Replacing any field explicitly is
+-- `set`.
 --
 -- `Headers` is immutable: `add`, `set` and `remove` return new headers. A
 -- message's headers are a few dozen fields, so each copy is small, and a
@@ -80,39 +88,77 @@ class Header h {
 --   library does not know.
 type Multiplicity = Single | CommaSeparated | OnePerLine
 
--- A message with headers, which `header` adds to.
+-- A message with headers. `setHeaders(m, hs)` returns `m` with `hs` in place
+-- of its headers.
 class HasHeaders m {
     fun headers(m) -> Headers
-    fun withHeaders(m, Headers) -> m
+    fun setHeaders(m, Headers) -> m
 }
 
--- Returns a function that adds the field `h: v` to a message, for building
--- one in a pipeline:
+-- Returns `m` with `hs`'s fields after its own, as `combine` joins them: a
+-- `Single` field replaces the message's, and any other is added after its
+-- fields.
 --
---     request(GET, url) |> header(Accept, MediaType.json) |> header(h, v)
---
--- It adds, never replaces, as `add` does.
-fun header[HasHeaders m, Header h](h : h, v : Value h) -> fun(m) -> m =
-    fun(message) = withHeaders(message, add(headers(message), h, v))
+--     withHeaders(request(GET, url), field(Accept, MediaType.json))
+--     withHeaders(request(GET, url), combine(field(Accept, MediaType.json), field(h, v)))
+fun withHeaders[HasHeaders m](m : m, hs : Headers) -> m = setHeaders(m, combine(headers(m), hs))
 
-type Field = Field(HeaderName, HeaderValue)
+-- A field, and how `combine` joins it: `Replaces` for a field whose header
+-- is `Single`, written by a program through a `Header` instance, and
+-- `Appends` for every other, those read off the wire among them.
+type Field = Field(HeaderName, HeaderValue, Join)
+
+type Join = Replaces | Appends
+
+fun joinOf[Header h](h : h) -> Join = match multiplicity(h) {
+    Single -> Replaces
+    CommaSeparated | OnePerLine -> Appends
+}
+
+fun made[Header h](h : h, v : Value h) -> Field = Field(headerName(h), writeValue(h, v), joinOf(h))
 
 type Headers = Headers(Array Field)
 
 -- One field per line, `name: value`, a sensitive value hidden.
 instance Show Headers {
-    fun show(Headers(fs)) = String.join(Array.map(fs, fun(Field(n, v)) = show(n) + ": " + show(v)), "\n")
+    fun show(Headers(fs)) = String.join(Array.map(fs, fun(Field(n, v, _)) = show(n) + ": " + show(v)), "\n")
 }
 
 let empty = Headers([])
 
--- Returns headers holding `fields` in order. A codec that has read a
--- message's fields builds its headers with this.
+-- Returns `a`'s fields, then `b`'s, leaving out `a`'s fields of each name
+-- for which `b` holds a `Replaces` field. So a `Single` field on the right
+-- wins, and every other field is appended, `Set-Cookie` among them, never
+-- joined into one line. Whether `a`'s fields of a name stay depends only on
+-- what `b` holds of that name, so the join is associative, field order
+-- included, and `empty` is its identity on either side.
+--
+-- Headers read off the wire are never built with `combine`. Two
+-- `Content-Type` fields from a peer are an ambiguity, which `one` refuses,
+-- not a value to settle by keeping the last.
+instance Semigroup Headers {
+    fun combine(Headers(a), Headers(b)) {
+        let replaced = []
+        for Field(n, _, j) in b {
+            if let Replaces = j { Vec.push(replaced, n) }
+        }
+        if len(replaced) == 0 { return Headers(a + b) }
+        Headers(Array.filter(a, fun(Field(n, _, _)) = !Vec.contains(replaced, n)) + b)
+    }
+}
+
+instance Monoid Headers { fun empty() = empty }
+
+-- Returns headers of the one field `h: v`.
+fun field[Header h](h : h, v : Value h) -> Headers = Headers([made(h, v)])
+
+-- Returns headers holding `fields` in order, each appended by `combine`. A
+-- codec that has read a message's fields builds its headers with this.
 fun fromFields(fields : Array (HeaderName, HeaderValue)) -> Headers =
-    Headers(Array.map(fields, fun((n, v)) = Field(n, v)))
+    Headers(Array.map(fields, fun((n, v)) = Field(n, v, Appends)))
 
 -- Returns every field, in order, as it is sent.
-fun fields(Headers(fs)) -> Array (HeaderName, HeaderValue) = Array.map(fs, fun(Field(n, v)) = (n, v))
+fun fields(Headers(fs)) -> Array (HeaderName, HeaderValue) = Array.map(fs, fun(Field(n, v, _)) = (n, v))
 
 -- Returns the number of lines.
 fun size(Headers(fs)) -> Int = len(fs)
@@ -121,7 +167,7 @@ fun has[Header h](hs : Headers, h : h) -> Bool = len(lines(hs, headerName(h))) >
 
 -- Returns `hs` with the field `h: v` after its other fields.
 fun add[Header h](Headers(fs) : Headers, h : h, v : Value h) -> Headers =
-    Headers(fs + [Field(headerName(h), writeValue(h, v))])
+    Headers(fs + [made(h, v)])
 
 -- Returns `hs` with every `h` field replaced by the one field `h: v`, where
 -- the first of them was, or after the other fields if there was none.
@@ -129,26 +175,26 @@ fun set[Header h](Headers(fs) : Headers, h : h, v : Value h) -> Headers {
     let name = headerName(h)
     let out = []
     var placed = False
-    for Field(n, old) in fs {
+    for Field(n, old, j) in fs {
         if n != name {
-            Vec.push(out, Field(n, old))
+            Vec.push(out, Field(n, old, j))
         } else if !placed {
-            Vec.push(out, Field(name, writeValue(h, v)))
+            Vec.push(out, made(h, v))
             placed = True
         }
     }
-    if !placed { Vec.push(out, Field(name, writeValue(h, v))) }
+    if !placed { Vec.push(out, made(h, v)) }
     Headers(Vec.toArray(out))
 }
 
 -- Returns `hs` without its `h` fields.
 fun remove[Header h](Headers(fs) : Headers, h : h) -> Headers {
     let name = headerName(h)
-    Headers(Array.filter(fs, fun(Field(n, _)) = n != name))
+    Headers(Array.filter(fs, fun(Field(n, _, _)) = n != name))
 }
 
 -- Returns the first value of `h`, or `None` if there is none or it does not
--- read. Where a second value would be an error, `one` says so.
+-- read. Where a second value would be an error, `one` reports it.
 fun get[Header h](hs : Headers, h : h) -> Option (Value h) {
     let found = elements(hs, h)
     if len(found) == 0 { None } else { readValue(h, found[0]) }
@@ -183,7 +229,7 @@ fun one[Header h, FromHTTP e](hs : Headers, h : h) -> Either e (Option (Value h)
 -- Returns the text of each line named `name`, in order.
 fun lines(Headers(fs) : Headers, name : HeaderName) -> Array HeaderValue {
     let out = []
-    for Field(n, v) in fs {
+    for Field(n, v, _) in fs {
         if n == name { Vec.push(out, v) }
     }
     Vec.toArray(out)

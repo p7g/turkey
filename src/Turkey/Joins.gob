@@ -148,7 +148,7 @@ fun joinBind(b : CBind) -> CBind = CBind {
 fun expr(e : Core) -> Core {
     match e.kind {
         CLet(name, id, _, value, body, binders) -> if len(binders) == 0 {
-            match asJoin(name, value, body, e.ty, False) {
+            match asJoin(id, value, body, e.ty, False) {
                 Some(params) ->
                     return finish(e, name, id, params, value, body, False)
                 None -> {}
@@ -156,7 +156,7 @@ fun expr(e : Core) -> Core {
         }
         CLetRec(binds, body) -> if len(binds) == 1 && len(binds[0].binders) == 0 {
             let b = binds[0]
-            match asJoin(b.name, b.value, body, e.ty, True) {
+            match asJoin(b.id, b.value, body, e.ty, True) {
                 Some(params) ->
                     return finish(e, b.name, b.id, params, b.value, body, True)
                 None -> {}
@@ -196,56 +196,53 @@ fun finish(e : Core, name : String, id : Int, params : Array CParam, lam : Core,
 
 -- The join's parameters if this binding qualifies, or `None`.
 --
--- Five conditions, and each is the same one seen from a different side: the
--- binding is a lambda; nothing rebinds its name underneath, so every mention
--- below really is a mention of it; every mention is a saturated tail call; the
--- self-calls are there only if the join says it is recursive; and the lambda
--- answers what the surrounding term answers, since a jump replaces the value of
--- the whole join expression.
+-- Four conditions, and each is the same one seen from a different side: the
+-- binding is a lambda; every mention is a saturated tail call; the self-calls
+-- are there only if the join says it is recursive; and the lambda answers what
+-- the surrounding term answers, since a jump replaces the value of the whole
+-- join expression. A mention is a variable with the binding's id, and no id is
+-- bound twice, so nothing underneath can rebind it.
 --
 -- Split in two because the `match` that takes the lambda apart cannot also
 -- answer `None` for the binding that is not one: a control transfer may not
 -- cross a destructuring binding.
-fun asJoin(name : String, value : Core, body : Core, ty : Ty.Type,
+fun asJoin(id : Int, value : Core, body : Core, ty : Ty.Type,
            recursive : Bool) -> Option (Array CParam) = match value.kind {
-    CLam(params, inner, _) -> asJoinLam(name, params, inner, body, ty,
-                                        recursive)
+    CLam(params, inner, _) -> asJoinLam(id, params, inner, body, ty, recursive)
     _ -> None
 }
 
-fun asJoinLam(name : String, params : Array CParam, inner : Core, body : Core,
+fun asJoinLam(id : Int, params : Array CParam, inner : Core, body : Core,
               ty : Ty.Type, recursive : Bool) -> Option (Array CParam) {
     let arity = len(params)
-    if rebinds(body, name) || rebinds(inner, name) { return None }
-    if !onlyTailCalls(body, name, arity, True) { return None }
-    if !onlyTailCalls(inner, name, arity, recursive) { return None }
+    if !onlyTailCalls(body, id, arity, True) { return None }
+    if !onlyTailCalls(inner, id, arity, recursive) { return None }
     -- A `letrec` whose one binding never calls itself. Legal, and not this
     -- pass's business to tidy: leaving it alone keeps the recursive case about
     -- recursion.
-    if recursive && !mentions(inner, name) { return None }
+    if recursive && !mentions(inner, id) { return None }
     if !compatible(ty, inner.ty) { return None }
     Some(params)
 }
 
--- Whether every mention of `name` in `e` is a saturated call in tail position
--- -- and, when `allowed` is false, whether there are none at all.
-fun onlyTailCalls(e : Core, name : String, arity : Int,
-                  allowed : Bool) -> Bool {
-    if !mentions(e, name) { return True }
+-- Whether every mention of the binder `id` in `e` is a saturated call in tail
+-- position -- and, when `allowed` is false, whether there are none at all.
+fun onlyTailCalls(e : Core, id : Int, arity : Int, allowed : Bool) -> Bool {
+    if !mentions(e, id) { return True }
     if !allowed { return False }
-    walkCalls(e, name, arity, True)
+    walkCalls(e, id, arity, True)
 }
 
-fun walkCalls(e : Core, name : String, arity : Int, tail : Bool) -> Bool {
+fun walkCalls(e : Core, id : Int, arity : Int, tail : Bool) -> Bool {
     match e.kind {
         -- A bare mention: it escapes -- into an argument, a data structure, a
         -- returned value -- and a label cannot be passed anywhere.
-        CVar(n, _) -> return n != name
+        CVar(_, n) -> return n != id
         CApp(fn, args) -> match fn.kind {
-            CVar(n, _) -> if n == name {
+            CVar(_, n) -> if n == id {
                 if !tail || len(args) != arity { return False }
                 for a in args {
-                    if !walkCalls(a, name, arity, False) { return False }
+                    if !walkCalls(a, id, arity, False) { return False }
                 }
                 return True
             }
@@ -254,7 +251,7 @@ fun walkCalls(e : Core, name : String, arity : Int, tail : Bool) -> Bool {
         _ -> {}
     }
     for (child, inTail) in parts(e.kind, tail) {
-        if !walkCalls(child, name, arity, inTail) { return False }
+        if !walkCalls(child, id, arity, inTail) { return False }
     }
     True
 }
@@ -263,7 +260,7 @@ fun walkCalls(e : Core, name : String, arity : Int, tail : Bool) -> Bool {
 fun jumps(e : Core, name : String, id : Int, arity : Int, tail : Bool) -> Core {
     match e.kind {
         CApp(fn, args) -> match fn.kind {
-            CVar(n, _) -> if n == name && tail {
+            CVar(_, n) -> if n == id && tail {
                 if len(args) != arity {
                     oops("an unlicensed call reached jumps")
                 }
@@ -276,50 +273,6 @@ fun jumps(e : Core, name : String, id : Int, arity : Int, tail : Bool) -> Core {
     }
     mkCore(e.ty, e.span, mapTails(e.kind, tail,
                                   fun(x, t) = jumps(x, name, id, arity, t)))
-}
-
--- -- two small questions about names --------------------------------------------------
-
-fun mentions(e : Core, name : String) -> Bool {
-    match e.kind {
-        CVar(n, _) -> if n == name { return True }
-        _ -> {}
-    }
-    for (child, _) in parts(e.kind, False) {
-        if mentions(child, name) { return True }
-    }
-    False
-}
-
--- Whether anything under `e` binds `name` again.
---
--- Names are unique after resolution and the generated ones carry a counter, so
--- this should never fire -- which is exactly why it is worth asking. If it ever
--- did, an inner mention would not be a mention of the join point, and rewriting
--- it to a jump would be a miscompilation the checker could well accept, since
--- the two would agree on types and differ only on which binding they meant.
-fun rebinds(e : Core, name : String) -> Bool {
-    match e.kind {
-        CLam(params, _, _) -> for p in params {
-            if p.name == name { return True }
-        }
-        CJoin(bound, _, params, _, _, _) -> {
-            if bound == name { return True }
-            for p in params { if p.name == name { return True } }
-        }
-        CLet(bound, _, _, _, _, _) -> if bound == name { return True }
-        CLetRec(binds, _) -> for b in binds {
-            if b.name == name { return True }
-        }
-        CMatch(_, alts) -> for a in alts {
-            if Vec.contains(altVars(a.alt), name) { return True }
-        }
-        _ -> {}
-    }
-    for (child, _) in parts(e.kind, False) {
-        if rebinds(child, name) { return True }
-    }
-    False
 }
 
 fun oops(message : String) -> a =

@@ -15,6 +15,9 @@ wrongly is a miscompile that still inlines.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 from tests import lang
@@ -141,3 +144,22 @@ def test_a_library_name_for_a_bulk_primitive_is_inlined():
     assert dump.code == 0, dump.stderr
     assert "Turkey.Array#fill" not in dump.stdout, dump.stdout
     assert lang.output(FILL_RUN) == "[1, 9, 9, 4]\n"
+
+
+def _unspelled(body: str) -> str:
+    """`body` without what a spelling decides: the numbers a dump gives two
+    binders of one spelling, and the `Renamed` that tells the hand-renamed
+    callees apart."""
+    body = re.sub(r"%\d+", "", body)
+    body = body.replace("Renamed", "")
+    return re.sub(r"\bm\b", "n", body)
+
+
+def test_a_callee_optimizes_alike_whatever_its_parameter_is_spelled():
+    # `inlinedRenamed` is `inlined` with the callee's parameter spelled `m`
+    # rather than like the caller's `n`; see the program's header.
+    golden = (Path(__file__).parent / "programs" / "loop_result_shadowed.opt").read_text()
+    inlined = _body(golden, "Main#inlined")
+    renamed = _body(golden, "Main#inlinedRenamed")
+    assert inlined and renamed
+    assert _unspelled(inlined) == _unspelled(renamed), (inlined, renamed)

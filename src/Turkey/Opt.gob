@@ -98,7 +98,7 @@ import Turkey.Methods as Methods
 import Turkey.Prelude as P
 import Turkey.Source (Span)
 import Turkey.Types as Ty
-import Turkey.Types (VarCell(..), TBottom)
+import Turkey.Types (VarCell(..), ConCell(..), TBottom, TCon, TApp, TFam, TFun, TTuple)
 import System.IO as IO
 import System.Parallel as Parallel
 import Algorithm.Hash (fnv1a)
@@ -392,6 +392,7 @@ type Reducer = Reducer {
 -- component's own, from `count`, or while `bodyOf` reduces a callee, in
 -- `scratch`, from `next`.
 type Minting = Minting {
+    table        : Binders.Table,
     owner        : Int,
     var count    : Int,
     scratch      : Int,
@@ -468,8 +469,8 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written,
         minting = Minting {
-            owner = -1, count = 0,
-            scratch = Binders.owner(table, "", "the bodies Turkey.Opt copies"),
+            table = table, owner = -1, count = 0,
+            scratch = Binders.unrecordedOwner(table, "", "the bodies Turkey.Opt copies"),
             template = False, next = 0,
         },
         homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
@@ -489,8 +490,8 @@ fun forComponent(base : Reducer, c : Int, owner : Int, finished : fun(Int) -> Do
     callSites = base.callSites, reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     minting = Minting {
-        owner = owner, count = 0, scratch = base.minting.scratch, template = False,
-        next = 0,
+        table = base.minting.table, owner = owner, count = 0,
+        scratch = base.minting.scratch, template = False, next = 0,
     },
     homes = base.homes, component = c, finished = finished,
 }
@@ -677,9 +678,9 @@ fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table,
             Some(index) -> binds[index].module_
             None -> ""
         }
-        Binders.owner(table, module_, names[0])
+        Binders.unrecordedOwner(table, module_, names[0])
     })
-    let restOwner = Binders.owner(table, "", "bindings of a name bound twice")
+    let restOwner = Binders.unrecordedOwner(table, "", "bindings of a name bound twice")
     let reduceComponent = fun(cache, c, finished) {
         let started = if measuring { Some(Stopwatch.start()) } else { None }
         let r = forComponent(base, c, owners[c], finished, cache)
@@ -942,10 +943,10 @@ fun mint(r : Reducer) -> Int {
     let m = r.minting
     if m.template {
         m.next = m.next + 1
-        return Binders.unrecorded(m.scratch, m.next - 1)
+        return Binders.unrecorded(m.table, m.scratch, m.next - 1)
     }
     m.count = m.count + 1
-    Binders.unrecorded(m.owner, m.count - 1)
+    Binders.unrecorded(m.table, m.owner, m.count - 1)
 }
 
 -- -- the reductions --------------------------------------------------------------------
@@ -1228,6 +1229,7 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
             let m = r.minting
             let (template, next) = (m.template, m.next)
             let (speculating, within) = (r.inlining.speculating, r.inlining.within)
+            let declined = r.inlining.declined
             m.template = True
             m.next = 0
             r.inlining.speculating = False
@@ -1239,6 +1241,12 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
             m.next = next
             r.inlining.speculating = speculating
             r.inlining.within = within
+            -- What the body declined is about the body's own fixed point, and
+            -- left counted it would keep the caller's terms unsettled, to be
+            -- reduced again -- but only on a worker that had not cached the
+            -- body, which would make how much the caller mints depend on
+            -- what that worker reduced before.
+            r.inlining.declined = declined
             Map.put(if owned(r, name) { r.reduced } else { r.cache.reduced }, key, made)
             made
         }
@@ -2192,6 +2200,13 @@ type Copier = Copier {
     -- What each binder becomes, as its spelling and id, by its id: met by the
     -- copy, or given beforehand.
     renamed : Map Int (String, Int),
+    -- What each existential's evidence the copy has met is respelled to. A
+    -- spelling is enough to key it by: `adoptProgram` gave every evidence
+    -- binder a spelling of its own.
+    evidence : Map String String,
+    -- What each skolem an opening in the copy rigidified is replaced by, by
+    -- its uid: the copy's own skolem. Empty until the copy meets an opening.
+    skolems : Map Int Ty.Type,
     subst : Map Int Core,
     -- Whether a binder not in `renamed` gets a fresh id.
     freshen : Bool,
@@ -2207,7 +2222,8 @@ type Copier = Copier {
 fun copier(mint : fun() -> Int, subst : Map Int Core,
            renamed : Map Int (String, Int), freshen : Bool,
            rebase : Option (Option Span)) -> Copier = Copier {
-    mint = mint, renamed = renamed, subst = subst, freshen = freshen,
+    mint = mint, renamed = renamed, evidence = Map.new(), skolems = Map.new(), subst = subst,
+    freshen = freshen,
     rebase = rebase, substituted = 0, changed = 0,
 }
 
@@ -2225,11 +2241,12 @@ fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
 
 fun copyTerm(c : Copier, e : Core) -> Core {
     -- A leaf that binds nothing and reads nothing renamed or replaced is
-    -- shared as it is, unless its span is to change.
-    if Option.isNone(c.rebase) {
+    -- shared as it is, unless its span or a skolem in its type is to change.
+    if Option.isNone(c.rebase) && len(c.skolems) == 0 {
         match e.kind {
             CLit(_) | CUnit | CCon(_) | CPrim(_) -> return e
-            CVar(_, id) -> if !Map.contains(c.subst, id) && !Map.contains(c.renamed, id) {
+            CVar(name, id) -> if !Map.contains(c.subst, id) && !Map.contains(c.renamed, id)
+                                    && (id != noId || !Map.contains(c.evidence, name)) {
                 return e
             }
             _ -> {}
@@ -2246,7 +2263,15 @@ fun copyTerm(c : Copier, e : Core) -> Core {
                 c.changed = c.changed + 1
                 return copyWith(c.mint, value, Map.new(), Map.new(), True, None)
             }
-            None -> {
+            None -> if id == noId {
+                match Map.get(c.evidence, name) {
+                    Some(made) -> {
+                        c.changed = c.changed + 1
+                        CVar(made, noId)
+                    }
+                    None -> e.kind
+                }
+            } else {
                 let (n, i) = referenceTo(c, name, id)
                 CVar(n, i)
             }
@@ -2262,7 +2287,7 @@ fun copyTerm(c : Copier, e : Core) -> Core {
         CLet(name, id, ty, value, body, binders) -> {
             let v = copyTerm(c, value)
             let (n, i) = bindName(c, name, id)
-            CLet(n, i, ty, v, copyTerm(c, body), binders)
+            CLet(n, i, typeIn(c, ty), v, copyTerm(c, body), binders)
         }
         CLetRec(binds, body) -> {
             let named = Vec.map(binds, fun(b) = bindName(c, b.name, b.id))
@@ -2274,9 +2299,11 @@ fun copyTerm(c : Copier, e : Core) -> Core {
                 } = binds[k]
                 let (n, i) = named[k]
                 Vec.push(made, CBind {
-                    name = n, id = i, ty = ty, binders = binders,
+                    name = n, id = i, ty = typeIn(c, ty), binders = binders,
                     value = copyTerm(c, value), span = span, mutable = mutable,
-                    module_ = module_, equations = equations, layouts = layouts,
+                    module_ = module_,
+                    equations = Vec.map(equations, fun((l, r)) = (typeIn(c, l), typeIn(c, r))),
+                    layouts = layouts,
                 })
             }
             CLetRec(made, copyTerm(c, body))
@@ -2294,7 +2321,7 @@ fun copyTerm(c : Copier, e : Core) -> Core {
         }
         _ -> mapKind(e.kind, Mapper {
             expr = copyTerm(c, _),
-            type_ = fun(t) = t,
+            type_ = typeIn(c, _),
             bind = fun(_) = oops("a binding outside a letrec reached copyTerm"),
         })
     }
@@ -2302,12 +2329,14 @@ fun copyTerm(c : Copier, e : Core) -> Core {
     -- reads nothing renamed or replaced -- is shared as it was, not rebuilt
     -- and still marked as settled. Sharing it is sound because only binders
     -- have to be unique, and it has none.
-    if Option.isNone(c.rebase) && c.changed == changedBefore { return e }
+    if Option.isNone(c.rebase) && len(c.skolems) == 0 && c.changed == changedBefore {
+        return e
+    }
     let span = match c.rebase {
         Some(s) -> s
         None -> e.span
     }
-    let out = mkCore(e.ty, span, kind)
+    let out = mkCore(typeIn(c, e.ty), span, kind)
     -- No reduction reads a span or depends on which ids a term's binders
     -- have, so a copy of a settled term is settled too, and an inlined body is
     -- not reduced again at every call site. A substituted value can expose a
@@ -2338,7 +2367,24 @@ fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {
 fun bindParam(c : Copier, p : CParam) -> CParam {
     let CParam { name, id, ty } = p
     let (n, i) = bindName(c, name, id)
-    CParam { name = n, id = i, ty = ty }
+    CParam { name = n, id = i, ty = typeIn(c, ty) }
+}
+
+-- `t` with the skolems the copy has replaced so far replaced.
+fun typeIn(c : Copier, t : Ty.Type) -> Ty.Type =
+    if len(c.skolems) == 0 { t } else { replaceSkolems(t, c.skolems) }
+
+-- `t` with each skolem `skolems` has, by uid, replaced.
+fun replaceSkolems(t : Ty.Type, skolems : Map Int Ty.Type) -> Ty.Type = match Ty.prune(t) {
+    TCon(cell) -> if cell.uid == 0 { TCon(cell) } else {
+        Map.getOr(skolems, cell.uid, TCon(cell))
+    }
+    TApp(fn, arg, k) -> TApp(replaceSkolems(fn, skolems), replaceSkolems(arg, skolems), k)
+    TFam(name, arg, k) -> TFam(name, replaceSkolems(arg, skolems), k)
+    TFun(params, ret) -> TFun(Array.map(params, replaceSkolems(_, skolems)),
+                              replaceSkolems(ret, skolems))
+    TTuple(elems) -> TTuple(Array.map(elems, replaceSkolems(_, skolems)))
+    other -> other
 }
 
 fun referenceTo(c : Copier, name : String, id : Int) -> (String, Int) =
@@ -2350,10 +2396,44 @@ fun referenceTo(c : Copier, name : String, id : Int) -> (String, Int) =
         None -> (name, id)
     }
 
--- An existential's evidence keeps its spelling: it has no id, and is scoped
--- by spelling.
+-- An existential's evidence has no id and is found by its spelling, so a copy
+-- gives it a new spelling instead, unique as an id is: its own spelling's
+-- base and a fresh id.
+--
+-- The rigid constants an opening makes are binders at the type level, and a
+-- copy gives them fresh ones too. A copy nested inside its original would
+-- otherwise open one constant twice, and `Turkey.Layout` gives a constant the
+-- layout of the innermost arm that opened it, so a value of the outer arm's
+-- would be read at the inner's layout. A constant is told apart by its uid,
+-- which takes a fresh id negated: unique as the id is, deterministic, and
+-- clear of the positive uids inference hands out.
 fun bindAlt(c : Copier, alt : Alt) -> Alt = match alt {
-    ACon(con, fields, opening) -> ACon(con, Array.map(fields, bindPart(c, _)), opening)
+    ACon(con, fields, opening) -> {
+        let made = Array.map(fields, bindPart(c, _))
+        ACon(con, made, match opening {
+            Some(o) -> if !c.freshen { opening } else {
+                Some(Opening {
+                    evidence = Array.map(o.evidence, fun(d) {
+                        let respelled = withoutRespelling(d) + "~" + Int.toString(c.mint())
+                        Map.put(c.evidence, d, respelled)
+                        c.changed = c.changed + 1
+                        respelled
+                    }),
+                    skolems = Vec.map(o.skolems, fun(old) {
+                        let ConCell { name, kind, level, uid } = old
+                        let made = ConCell {
+                            name = name, kind = kind, level = level, uid = -1 - c.mint(),
+                        }
+                        Map.put(c.skolems, uid, TCon(made))
+                        c.changed = c.changed + 1
+                        made
+                    }),
+                    layouts = o.layouts,
+                })
+            }
+            None -> None
+        })
+    }
     ATuple(fields) -> ATuple(Array.map(fields, bindPart(c, _)))
     ALit(_) -> alt
     AAny(binder) -> AAny(bindPart(c, binder))
@@ -2376,8 +2456,14 @@ fun bindPart(c : Copier, binder : Option (String, Int)) -> Option (String, Int) 
 -- into the owner of the binding they are in, or, for a binding with no id,
 -- into an owner registered for it. A reference with no id means the innermost
 -- binder of its spelling, as `Turkey.Coretc` resolves one, or a top-level
--- binding if none is in scope. An existential's evidence keeps no id, since
--- `Alt` has nowhere to put one.
+-- binding if none is in scope.
+--
+-- An existential's evidence has no id, since `Opening` has nowhere to put one,
+-- and is found by its spelling, which is the same for every opening of one
+-- class. So it gets a spelling of its own instead: its base and a fresh id,
+-- unique as the id is. With that, and with `copyWith` respelling evidence in
+-- each copy, no rule can move a reference to one opening's evidence under
+-- another's.
 fun adoptProgram(table : Binders.Table, program : CProgram) -> CProgram = CProgram {
     dicts = Vec.map(program.dicts, adopt(table, _)),
     binds = Vec.map(program.binds, adopt(table, _)),
@@ -2388,8 +2474,9 @@ type Adopter = Adopter {
     bind   : CBind,
     -- Where this binding's new binders go; -1 until one needs it.
     var owner : Int,
-    -- The binder each spelling means here, by id; `noId` for evidence.
-    terms  : Map String Int,
+    -- What each spelling means here, as the spelling and id a reference to it
+    -- takes: a binder's id, or for evidence, its new spelling and `noId`.
+    terms  : Map String (String, Int),
     labels : Map String Int,
     -- How many binders and references the walk has given an id so far.
     var changed : Int,
@@ -2409,7 +2496,13 @@ fun adoptTerm(a : Adopter, e : Core) -> Core {
 
 fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CVar(name, id) -> if id != noId { e.kind } else {
-        CVar(name, adoptReference(a, a.terms, name))
+        match Map.get(a.terms, name) {
+            Some((n, i)) -> {
+                if n != name || i != noId { a.changed = a.changed + 1 }
+                CVar(n, i)
+            }
+            None -> e.kind
+        }
     }
     CJump(name, id, args) -> CJump(name,
         if id != noId { id } else { adoptReference(a, a.labels, name) },
@@ -2417,7 +2510,7 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CLam(params, body, label) -> {
         let ps = Array.map(params, fun(p) =
             CParam { name = p.name, id = adoptId(a, p.name, p.id), ty = p.ty })
-        let saved = within(a.terms, Array.map(ps, fun(p) = (p.name, p.id)))
+        let saved = within(a.terms, Array.map(ps, fun(p) = (p.name, (p.name, p.id))))
         let made = adoptTerm(a, body)
         restore(a.terms, saved)
         CLam(ps, made, label)
@@ -2425,7 +2518,7 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CLet(name, id, ty, value, body, binders) -> {
         let v = adoptTerm(a, value)
         let i = adoptId(a, name, id)
-        let saved = within(a.terms, [(name, i)])
+        let saved = within(a.terms, [(name, (name, i))])
         let made = adoptTerm(a, body)
         restore(a.terms, saved)
         CLet(name, i, ty, v, made, binders)
@@ -2433,7 +2526,9 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CLetRec(binds, body) -> {
         let ids = Vec.map(binds, fun(b) = adoptId(a, b.name, b.id))
         let pairs = []
-        for var k = 0; k < len(binds); k = k + 1 { Vec.push(pairs, (binds[k].name, ids[k])) }
+        for var k = 0; k < len(binds); k = k + 1 {
+            Vec.push(pairs, (binds[k].name, (binds[k].name, ids[k])))
+        }
         let saved = within(a.terms, pairs)
         let made = []
         for var k = 0; k < len(binds); k = k + 1 {
@@ -2451,7 +2546,7 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
         let i = adoptId(a, name, id)
         let ps = Array.map(params, fun(p) =
             CParam { name = p.name, id = adoptId(a, p.name, p.id), ty = p.ty })
-        let savedParams = within(a.terms, Array.map(ps, fun(p) = (p.name, p.id)))
+        let savedParams = within(a.terms, Array.map(ps, fun(p) = (p.name, (p.name, p.id))))
         let savedLabel = within(a.labels, if recursive { [(name, i)] } else { [] })
         let madeBody = adoptTerm(a, body)
         restore(a.labels, savedLabel)
@@ -2464,8 +2559,9 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CMatch(scrutinee, alts) -> {
         let s = adoptTerm(a, scrutinee)
         CMatch(s, Vec.map(alts, fun(alt) {
-            let made = adoptAlt(a, alt.alt)
-            let saved = within(a.terms, scopedBy(made))
+            let scope = []
+            let made = adoptAlt(a, alt.alt, scope)
+            let saved = within(a.terms, scope)
             let body = adoptTerm(a, alt.body)
             restore(a.terms, saved)
             CAlt { alt = made, body = body }
@@ -2478,8 +2574,7 @@ fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     })
 }
 
--- The id of the binder `name` means in `scope`, or `noId` for a top-level
--- binding.
+-- The id of the join `name` means in `scope`, or `noId` if none is in scope.
 fun adoptReference(a : Adopter, scope : Map String Int, name : String) -> Int {
     let id = Map.getOr(scope, name, noId)
     if id != noId { a.changed = a.changed + 1 }
@@ -2497,13 +2592,33 @@ fun adoptId(a : Adopter, name : String, id : Int) -> Int {
     Binders.fresh(a.table, a.owner, name, Binders.Local, Synthesized(None))
 }
 
-fun adoptAlt(a : Adopter, alt : Alt) -> Alt {
+-- `alt` with ids on its binders and new spellings on its evidence. Adds to
+-- `scope` what each spelling the arm binds means over its body.
+fun adoptAlt(a : Adopter, alt : Alt, scope : Vec (String, (String, Int))) -> Alt {
     let part = fun(binder) = match binder {
-        Some((name, id)) -> Some((name, adoptId(a, name, id)))
+        Some((name, id)) -> {
+            let made = adoptId(a, name, id)
+            Vec.push(scope, (name, (name, made)))
+            Some((name, made))
+        }
         None -> None
     }
     match alt {
-        ACon(con, fields, opening) -> ACon(con, Array.map(fields, part), opening)
+        ACon(con, fields, opening) -> {
+            let respelled = match opening {
+                Some(o) -> Some(Opening {
+                    evidence = Array.map(o.evidence, fun(d) {
+                        let made = withoutRespelling(d) + "~"
+                                   + Int.toString(adoptId(a, d, noId))
+                        Vec.push(scope, (d, (made, noId)))
+                        made
+                    }),
+                    skolems = o.skolems, layouts = o.layouts,
+                })
+                None -> None
+            }
+            ACon(con, Array.map(fields, part), respelled)
+        }
         ATuple(fields) -> ATuple(Array.map(fields, part))
         ALit(_) -> alt
         AAny(binder) -> AAny(part(binder))
@@ -2532,8 +2647,8 @@ fun scopedBy(alt : Alt) -> Vec (String, Int) {
 }
 
 -- Puts each pair in `scope`, and returns what `restore` needs to undo it.
-fun within[Iterator c, Item c ~ (String, Int)](scope : Map String Int, pairs : c)
-        -> Vec (String, Option Int) {
+fun within[Iterator c, Item c ~ (String, v)](scope : Map String v, pairs : c)
+        -> Vec (String, Option v) {
     let saved = []
     for (name, id) in pairs {
         Vec.push(saved, (name, Map.get(scope, name)))
@@ -2542,7 +2657,7 @@ fun within[Iterator c, Item c ~ (String, Int)](scope : Map String Int, pairs : c
     saved
 }
 
-fun restore(scope : Map String Int, saved : Vec (String, Option Int)) -> Unit {
+fun restore(scope : Map String v, saved : Vec (String, Option v)) -> Unit {
     for var i = len(saved) - 1; i >= 0; i = i - 1 {
         let (name, was) = saved[i]
         match was {
@@ -2571,12 +2686,15 @@ fun respell(b : CBind) -> CBind {
     let renamed = Map.new()
     for name in order {
         let ids = Map.getOr(bound, name, [])
+        -- From the base, so that a binder respelled by an earlier run, and
+        -- copied since, is not given a second suffix.
+        let base = withoutRespelling(name)
         var k = 1
         for var i = 1; i < len(ids); i = i + 1 {
             var made = name
             while Set.contains(spellings, made) {
                 k = k + 1
-                made = name + "~" + Int.toString(k)
+                made = base + "~" + Int.toString(k)
             }
             Set.add(spellings, made)
             Map.put(renamed, ids[i], (made, ids[i]))

@@ -51,11 +51,21 @@ def test_a_string_step_join_takes_the_fields():
     for name in ("Main#firstTwo", "Main#countA"):
         body = _body(dump.stdout, name)
         assert ": (Char, Index)" not in body, body
-    # The loop binds the two fields one by one: as the parameters of the
-    # step's join, or, where that join has one jump, as `let`s at the jump.
+    # The loop binds the two fields one by one, and the index travels
+    # unwrapped. Where the step's join survives, its parameters are the `Char`
+    # and the `Int` inside the `Index`. Where the join has one jump it is
+    # beta-reduced, and the fields are `let`s at the jump. Either way no join
+    # passes an `Index`, and one is built only for the initial `at` and once
+    # per step, where `at` is assigned.
     count = _body(dump.stdout, "Main#countA")
     assert re.search(r"%jf\S* : Char\b", count), count
-    assert re.search(r"%jf\S* : (Index|Int)\b", count), count
+    step = re.search(r"join %js[^(]*\(([^)]*)\)", count)
+    if step and step.group(1):
+        assert re.search(r": Char, [^,]*: Int$", step.group(1)), count
+    assert not re.search(r"join [^(]*\([^)]*: Index\b", count), count
+    builds = [line for line in count.splitlines()
+              if "Data.String#Index(" in line and not line.rstrip().endswith("->")]
+    assert len(builds) == 2, count
     assert lang.output(FIRST_TWO) == "1\n2\n0\n4\n"
 
 

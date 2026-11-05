@@ -78,7 +78,9 @@ import Turkey.Ast (..)
 import Turkey.Binders as Binders
 import Turkey.Binders (Kind(..), Origin(..))
 import Turkey.Diag as Diag
+import Turkey.Modules (Scope)
 import Turkey.Prelude as P
+import Turkey.Resolve as Resolve
 import Turkey.Source (Span(..))
 
 -- -- state --------------------------------------------------------------------------
@@ -86,8 +88,8 @@ import Turkey.Source (Span(..))
 type D = D {
     -- The generated-name counter.
     var n     : Int,
-    -- The module's protocol-method scope, for `bind` and `pure`.
-    methods   : Map String String,
+    -- The module's scope, whose protocol-method scope gives `bind` and `pure`.
+    scope     : Scope,
     binders   : Binders.Table,
     -- The owner the binders this pass writes are minted into: that of the
     -- top-level declaration being walked, as `Turkey.Resolve` registered it.
@@ -149,10 +151,7 @@ fun varOf(d : D, t : Temp, span : Span) -> Expr {
 -- Makes the owner `Turkey.Resolve` registered for the top-level declaration
 -- `nodeId` the one this pass mints into.
 fun enter(d : D, nodeId : Int, where : Span) -> Unit {
-    d.owner = match Binders.declarationOwner(d.binders, nodeId) {
-        Some(o) -> o
-        None -> bug("this declaration was never given an owner", where)
-    }
+    d.owner = Binders.declarationOwner(d.binders, nodeId, where)
 }
 
 -- -- continuations ------------------------------------------------------------------
@@ -331,9 +330,8 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 
 -- Rewrites `p` in place. Every binder it writes is minted in `binders`, and
 -- every binding occurrence and reference it writes is recorded there.
-fun program(p : Program, methods : Map String String,
-            binders : Binders.Table) -> Unit {
-    let d = D { n = 0, methods = methods, binders = binders, owner = 0, depth = 0 }
+fun program(p : Program, scope : Scope, binders : Binders.Table) -> Unit {
+    let d = D { n = 0, scope = scope, binders = binders, owner = 0, depth = 0 }
     for decl in p.decls {
         match decl {
             DClass(c) -> for m in c.methods {
@@ -717,33 +715,21 @@ fun pureOf(d : D, value : Expr) -> Expr =
 fun fallOf(d : D, value : Expr) -> Expr =
     pureOf(d, conOf(d, P.flowFall, [value], value.span))
 
--- A reference to the class method `name`, found in the protocol-method scope
--- and recorded against its binder as `Turkey.Resolve` records `-x`. A method
--- the module cannot see keeps its short name and is left for inference to
--- report.
-fun methodRef(d : D, span : Span, name : String) -> Expr =
-    match Map.get(d.methods, name) {
-        Some(target) -> {
-            let e = mkExpr(d, span, EVar(target, True))
-            if let Some(id) = Binders.named(d.binders, target) {
-                Binders.record(d.binders, e.id, id)
-            }
-            e
-        }
-        None -> {
-            let e = mkExpr(d, span, EVar(name, True))
-            Binders.leaveUnresolved(d.binders, e.id, name)
-            e
-        }
-    }
+-- A reference to the class method `name`, resolved and recorded as
+-- `Turkey.Resolve` resolves `-x`. A method the module cannot see keeps its
+-- short name and is left for inference to report.
+fun methodRef(d : D, span : Span, name : String) -> Expr {
+    let e = mkExpr(d, span, EVar(name, True))
+    let found = Resolve.protocolMethod(d.scope, d.binders, e.id, name, span)
+    if let Some(target) = found { e.kind = EVar(target, True) }
+    e
+}
 
 -- A reference to the top-level binder resolution named `internal`. One that
 -- was never declared has no entry, for `Binders.checkReferences` to report.
 fun globalOf(d : D, internal : String, span : Span) -> Expr {
     let e = mkExpr(d, span, EVar(internal, False))
-    if let Some(id) = Binders.named(d.binders, internal) {
-        Binders.record(d.binders, e.id, id)
-    }
+    Binders.refer(d.binders, e.id, internal)
     e
 }
 
@@ -790,17 +776,17 @@ fun sequence(d : D, head : Expr, after : Cont, span : Span) -> Expr {
     bindWith(d, head, KFn(fun(f) = mkExpr(d, span, EMatch(f, [
         armOf(d, P.flowFall, Bound(fell), span,
               apply(d, after, varOf(d, fell, span))),
-        passOn(d, P.flowBrk, span),
+        passOn(d, P.flowBrk, "%b", span),
         armOf(d, P.flowCont, Nothing, span,
               pureOf(d, conOf(d, P.flowCont, [], span))),
-        passOn(d, P.flowRet, span),
+        passOn(d, P.flowRet, "%r", span),
     ]))), span, None)
 }
 
--- The arm `Con(%x) -> pure(Con(%x))`, for `Brk` or `Ret`, which keeps
--- travelling outward.
-fun passOn(d : D, con : String, span : Span) -> Arm {
-    let x = temp(d, if con == P.flowBrk { "%b" } else { "%r" }, span)
+-- The arm `Con(x) -> pure(Con(x))`, with `x` spelled `spelling`, for a `Brk`
+-- or `Ret` that keeps travelling outward.
+fun passOn(d : D, con : String, spelling : String, span : Span) -> Arm {
+    let x = temp(d, spelling, span)
     armOf(d, con, Bound(x), span,
           pureOf(d, conOf(d, con, [varOf(d, x, span)], span)))
 }
@@ -908,7 +894,7 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
             armOf(d, P.flowFall, Ignored, span, again),
             armOf(d, P.flowCont, Nothing, span, again),
             armOf(d, P.flowBrk, Bound(b), span, fallOf(d, varOf(d, b, span))),
-            passOn(d, P.flowRet, span),
+            passOn(d, P.flowRet, "%r", span),
         ]))
     }), span, None)
 

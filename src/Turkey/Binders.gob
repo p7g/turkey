@@ -1,7 +1,8 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
     newTable, owner, fresh, ownerOf, localOf, binderAt,
-    declare, named, record, leaveUnresolved, ownDeclaration, declarationOwner,
+    declare, named, record, refer, leaveUnresolved,
+    ownDeclaration, declarationOwner,
     checkReferences, checkInferred,
 )
 
@@ -83,8 +84,8 @@ type Table = Table {
     -- a top-level statement's, a class or instance method's, or a foreign
     -- definition's.
     declarationOwners : Map Int Int,
-    -- The `EVar` nodes resolution could not find a binder for, which leaves
-    -- them for inference to report, with their spellings.
+    -- The `EVar` nodes no binder was found for when they were resolved or
+    -- written, with their spellings. Inference reports them.
     unresolved        : Map Int String,
 }
 
@@ -152,16 +153,34 @@ fun named(t : Table, internal : String) -> Option Int = Map.get(t.byName, intern
 -- Records that the node `nodeId` binds or means the binder `id`.
 fun record(t : Table, nodeId : Int, id : Int) -> Unit = Map.put(t.refs, nodeId, id)
 
+-- Records that the node `nodeId` means the top-level binder named `internal`.
+-- Records nothing when no binder was declared under that name, which leaves
+-- the node for `checkReferences` to report.
+fun refer(t : Table, nodeId : Int, internal : String) -> Unit =
+    match named(t, internal) {
+        Some(id) -> record(t, nodeId, id)
+        None -> {}
+    }
+
 -- Records `ownerId` as the owner of the top-level declaration `nodeId`.
 fun ownDeclaration(t : Table, nodeId : Int, ownerId : Int) -> Unit =
     Map.put(t.declarationOwners, nodeId, ownerId)
 
--- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`.
-fun declarationOwner(t : Table, nodeId : Int) -> Option Int =
-    Map.get(t.declarationOwners, nodeId)
+-- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`,
+-- which is spanned by `where`. Raises an internal error if none was recorded,
+-- which only a compiler bug can cause: every stage that mints walks the
+-- declarations `Turkey.Resolve.declare` registered.
+fun declarationOwner(t : Table, nodeId : Int, where : Span) -> Int =
+    match Map.get(t.declarationOwners, nodeId) {
+        Some(o) -> o
+        None -> Diag.fail(Diag.at("internal error",
+                                  "this declaration was never given an owner", where),
+                          where.file)
+    }
 
--- Records that the `EVar` node `nodeId`, spelled `name`, means no binder
--- resolution could find.
+-- Records that the `EVar` node `nodeId`, spelled `name`, means no binder the
+-- stage that resolved or wrote it could find, which leaves it for inference to
+-- report.
 fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
     Map.put(t.unresolved, nodeId, name)
 
@@ -197,15 +216,15 @@ fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     }
 }
 
--- Raises an internal error if resolution left any reference for inference to
+-- Raises an internal error if any reference was left for inference to
 -- report. Call it once inference has accepted the program: such a reference
--- is then one inference found a binder for and resolution did not.
+-- is then one inference found a binder for and the table has none for.
 fun checkInferred(t : Table, file : String) -> Unit {
     let names = Array.map(Array.sort(Map.values(t.unresolved)), fun(n) = "'" + n + "'")
     if len(names) > 0 {
         Diag.fail(Diag.whole("internal error",
-            "inference found binders that resolution did not, for "
-            + String.join(names, ", ")), file)
+            "no stage recorded a binder for " + String.join(names, ", ")
+            + ", but inference found one"), file)
     }
 }
 

@@ -3,7 +3,7 @@ export (
     stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
     stateSizesKept, stateFrameEntries, stateFrameEntryCount, stateStacks,
     stateRoots, stateGenerational, stateRemembered, stateRememberedCount,
-    stateRunning,
+    stateRunning, stateSpare, stateSpareCount,
 )
 
 -- The heap verifier: in a program compiled with `--gc-verify`, the collector
@@ -80,9 +80,10 @@ import Turkey.Ptr as Ptr
 -- and its length, the list of stacks, the innermost shadow-stack frame,
 -- whether the program runs the write barrier (and so whether an old object
 -- holding a young one must be remembered), the remembered objects and their
--- count, and the stack the mutator is running on.
+-- count, the stack the mutator is running on, and the spare regions and
+-- their count.
 
-let stateBytes : Int = 128
+let stateBytes : Int = 144
 let stateRegions : Int = 0
 let stateAvailable : Int = 8
 let stateRegionTable : Int = 16
@@ -99,6 +100,8 @@ let stateGenerational : Int = 96
 let stateRemembered : Int = 104
 let stateRememberedCount : Int = 112
 let stateRunning : Int = 120
+let stateSpare : Int = 128
+let stateSpareCount : Int = 136
 
 -- -- the heap's format ----------------------------------------------------------------
 
@@ -269,8 +272,8 @@ foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current :
 
 fun check(when : Phase, frame : Ptr, handed : Ptr) -> Bool {
     if !begin(when, handed) { return False }
-    let passed = checkRegions() && checkTable() && checkObjects() && checkRemembered()
-                 && checkAvailable() && checkRoots()
+    let passed = checkRegions() && checkTable() && checkSpares() && checkObjects()
+                 && checkRemembered() && checkAvailable() && checkRoots()
                  && checkFrames(Ptr.toInt(frame))
     releaseIndex()
     passed
@@ -716,6 +719,30 @@ fun checkAvailable() -> Bool {
             return fail(Prim.cString("missing available region"), 0, ac)
         }
     }
+    True
+}
+
+-- The spare regions, empty and kept for reuse: as many as counted, each a
+-- 64KB-aligned block that no listed region overlaps. The table holds exactly
+-- the listed regions, so no spare is in it either.
+fun checkSpares() -> Bool {
+    let count = stateWord(stateSpareCount)
+    var seen = 0
+    var s : Int = stateWord(stateSpare)
+    while s != 0 {
+        seen = seen + 1
+        -- Alignment before anything is read from it: the list may hold a word
+        -- that is not a block at all.
+        if seen > count || s & (regionBytes - 1) != 0 {
+            return fail(Prim.cString("invalid spare-region list"), s, -1)
+        }
+        let r = regionAt(s)
+        if r != 0 && below(s - r, word(r, regionReserved)) {
+            return fail(Prim.cString("spare region in use"), s, -1)
+        }
+        s = word(s, regionNext)
+    }
+    if seen != count { return fail(Prim.cString("spare count disagrees"), 0, -1) }
     True
 }
 

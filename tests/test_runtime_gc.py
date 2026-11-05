@@ -145,8 +145,18 @@ int main(void) {
         assert(((TurkeyArray *)held[0])->elements[30] == 'q');
     }
     turkey_root_leave(&frame);
+    /* Empty regions are kept up to the heap's peak since the last full
+       collection or between the two before it, so the third full collection
+       that allocates nothing gives every one back. A stressed run collects
+       at every allocation, so its peaks are smaller. */
+    for (int i = 0; i < 2000; i++) turkey_string_new(bytes, 31);
     turkey_collect();
     assert(turkey_heap_region_bytes() == 0);
+    if (!getenv("TURKEY_GC_STRESS")) assert(turkey_heap_spare_bytes() >= 65536);
+    turkey_collect();
+    if (!getenv("TURKEY_GC_STRESS")) assert(turkey_heap_spare_bytes() >= 65536);
+    turkey_collect();
+    assert(turkey_heap_spare_bytes() == 0);
     free(bytes);
     return turkey_has_panicked != 0;
 }

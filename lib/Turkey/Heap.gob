@@ -180,6 +180,32 @@ var regionTable : Ptr = Ptr.null()
 var regionTableCapacity : Int = 0
 var regionTableCount : Int = 0
 
+-- Empty 64KB regions, linked by `next`, that `newRegion` takes before it asks
+-- libc for memory. A spare is on no region list and not in the region table,
+-- so nothing in it is an object, and `regionBytesInUse` does not count it.
+-- Its size table, if it has one, stays with it.
+--
+-- Kept because libc does not keep them cheaply: glibc serves a 64KB-aligned
+-- 64KB block from a fresh `mmap`, so a region freed at a sweep and allocated
+-- again before the next one costs a `munmap`, an `mmap` and a page fault per
+-- page the allocator touches, which a program with short-lived garbage pays
+-- every cycle.
+var spare : Ptr = Ptr.null()
+var spareCount : Int = 0
+-- The most bytes the regions in use have reserved since the last full
+-- collection, and between the two before it: what the sweep lets the heap
+-- hold, spares included.
+--
+-- A peak rather than the regions each cycle takes, and over full collections
+-- rather than cycles, because of how a generational heap grows. Between full
+-- collections, old objects that die stay in their regions, so the heap takes
+-- regions at every minor collection and gives none back; the full collection
+-- then empties them all at once. Keeping only what recent cycles took frees
+-- those at every full collection and maps them again before the next, which
+-- on the HTTP benchmark was an `mmap` and a `munmap` every 200 requests.
+var peakSinceFull : Int = 0
+var peakBeforeFull : Int = 0
+
 var roots : Ptr = Ptr.null()
 var heapCount : Int = 0
 -- Objects, and the bytes of their slots, allocated since the last
@@ -749,16 +775,26 @@ fun largeAllocate(bytes : Int) -> Ptr {
     Ptr.add(made, regionData)
 }
 
--- A fresh, empty region with slots of `slotSize`, on the region list and, if
--- it is small, its class's available list; null if there is no memory for it.
--- Under `heapLock`.
+-- An empty region with slots of `slotSize`, on the region list and, if it is
+-- small, its class's available list; null if there is no memory for it. A
+-- 64KB one is a spare if there is one. Under `heapLock`.
 fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr {
     let reserved = if large {
         (regionData + bytes + regionBytes - 1) & regionMask
     } else { regionBytes }
-    let made = Libc.alignedAlloc(regionBytes, reserved)
+    let reused = reserved == regionBytes && !Ptr.isNull(spare)
+    let made = if reused { spare } else { Libc.alignedAlloc(regionBytes, reserved) }
     if Ptr.isNull(made) { return made }
-    let sizes = if sizesKept { Libc.malloc(regionBytes) } else { Ptr.null() }
+    -- A freed slot in a live region is reused as it was left, so no allocation
+    -- reads a slot before writing it, and a spare's old slots need no
+    -- clearing either. Only the header is cleared, below.
+    if reused {
+        spare = Ptr.load(made, regionNext)
+        spareCount = spareCount - 1
+    }
+    let sizes = if !sizesKept { Ptr.null() }
+                else if reused { Ptr.load(made, regionSizes) }
+                else { Libc.malloc(regionBytes) }
     if (sizesKept && Ptr.isNull(sizes)) || !tableInsert(made) {
         Libc.free(sizes)
         Libc.free(made)
@@ -778,6 +814,7 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
     }
     regionBytesInUse = regionBytesInUse + reserved
     if regionBytesInUse > regionBytesPeak { regionBytesPeak = regionBytesInUse }
+    if regionBytesInUse > peakSinceFull { peakSinceFull = regionBytesInUse }
     made
 }
 
@@ -1916,7 +1953,8 @@ fun clearMarks() -> Unit {
     }
 }
 
--- Empty regions cost one free, however many objects they held. A survivor's
+-- An empty region is set aside whole, as a spare or freed, however many
+-- objects it held. A survivor's
 -- marks become its allocation bitmap, so no individual header is visited.
 --
 -- The marks are kept: every survivor is old now, and an old object stays
@@ -1936,10 +1974,14 @@ fun sweep() -> Unit {
         if live == 0 {
             if Ptr.isNull(previous) { regions = next }
             else { Ptr.store(previous, regionNext, next) }
-            regionBytesInUse = regionBytesInUse - Ptr.load(region, regionReserved)
+            let reserved : Int = Ptr.load(region, regionReserved)
+            regionBytesInUse = regionBytesInUse - reserved
             tableRemove(region)
-            Libc.free(Ptr.load(region, regionSizes))
-            Libc.free(region)
+            if reserved == regionBytes {
+                Ptr.store(region, regionNext, spare)
+                spare = region
+                spareCount = spareCount + 1
+            } else { release(region) }
         } else {
             Memory.copy(Ptr.add(region, regionAllocated),
                         Ptr.add(region, regionMarked), 8 * regionWords)
@@ -1957,6 +1999,37 @@ fun sweep() -> Unit {
         }
         region = next
     }
+    trimSpares()
+}
+
+-- Free the spares beyond what the heap's recent peak leaves room for: the
+-- regions in use and the spares together reserve no more than the regions in
+-- use did at their most, since the last full collection or between the two
+-- before it. A program at a steady size keeps what it will take again; one
+-- that shrinks gives the excess back to libc at its second full collection
+-- after. Spares change which memory a region takes, not how many regions are
+-- in use, so what the heap holds from libc never exceeds what its regions in
+-- use reserved at their most in that window.
+fun trimSpares() -> Unit {
+    let peak = if peakSinceFull > peakBeforeFull { peakSinceFull } else { peakBeforeFull }
+    let room = (peak - regionBytesInUse) / regionBytes
+    let kept = if room > 0 { room } else { 0 }
+    while spareCount > kept {
+        let freed = spare
+        spare = Ptr.load(freed, regionNext)
+        spareCount = spareCount - 1
+        release(freed)
+    }
+    if !minor {
+        peakBeforeFull = peakSinceFull
+        peakSinceFull = regionBytesInUse
+    }
+}
+
+-- Give a region and its size table back to libc.
+fun release(region : Ptr) -> Unit {
+    Libc.free(Ptr.load(region, regionSizes))
+    Libc.free(region)
 }
 
 -- -- statistics -------------------------------------------------------------------------
@@ -2016,6 +2089,8 @@ foreign "turkey_gc_report" fun report() -> Unit {
     putInt(regionBytesInUse)
     put(Prim.cString(", peak "))
     putInt(regionBytesPeak)
+    put(Prim.cString(", spare "))
+    putInt(spareCount * regionBytes)
     put(Prim.cString("\n"))
     writeLine()
     put(Prim.cString("[gc] collections "))
@@ -2296,6 +2371,8 @@ fun snapshot() -> Ptr {
     Ptr.store(state, Check.stateRegionTableCapacity, regionTableCapacity)
     Ptr.store(state, Check.stateRegionTableCount, regionTableCount)
     Ptr.store(state, Check.stateRegionBytes, regionBytesInUse)
+    Ptr.store(state, Check.stateSpare, spare)
+    Ptr.store(state, Check.stateSpareCount, spareCount)
     Ptr.store(state, Check.stateObjects, heapCount)
     Ptr.store(state, Check.stateSizesKept, if sizesKept { 1 } else { 0 })
     Ptr.store(state, Check.stateFrameEntries, frameEntries)
@@ -2354,6 +2431,8 @@ foreign "turkey_heap_regions" fun heapRegions() -> Ptr = regions
 foreign "turkey_heap_available" fun heapAvailable() -> Ptr = available
 
 foreign "turkey_heap_region_bytes" fun heapRegionBytes() -> Int = regionBytesInUse
+
+foreign "turkey_heap_spare_bytes" fun heapSpareBytes() -> Int = spareCount * regionBytes
 
 foreign "turkey_heap_region_table" fun heapRegionTable() -> Ptr = regionTable
 

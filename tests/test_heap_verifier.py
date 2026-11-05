@@ -335,7 +335,7 @@ int main(int argc, char **argv) {
         /* The collector's state with this frame table and these stacks in it:
            the frame table, its length, the stack list and the running
            stack. */
-        int64_t state[16];
+        int64_t state[18];
         memcpy(state, turkey_heap_state(), sizeof state);
         state[8] = (int64_t)(uintptr_t)&entry;
         state[9] = 1;

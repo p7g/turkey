@@ -360,6 +360,55 @@ def test_a_parked_accept_holds_no_worker(tmp_path):
     assert _run(binary, "1").splitlines() == ["ping read TimedOut", "accept Closed"]
 
 
+# `setLimits`' `each` bounds each read on its own, from when it begins, and
+# its deadline bounds all of them.
+LIMITS = COMMON + """
+import Time.Deadline as Deadline
+
+fun main() {
+    let (l, port) = listening(loopback)
+    let c = match dial(loopback, port) { Right(c) -> c; Left(e) -> error(show(e)) }
+    let s = match TCP.accept(l) { Right(s) -> s; Left(e) -> error(show(e)) }
+    let reader = Task.runScope(do {
+        let reader = Task.spawn(fun() {
+            -- Six bytes 50 ms apart take longer than the 200 ms each read may
+            -- wait, and every read is in time.
+            TCP.setLimits(s, None, Duration.millis(200))
+            var got = 0
+            while got < 6 {
+                match IO.readInto(s, IO.buffer(16)) {
+                    Right(n) -> { got = got + n }
+                    Left(e) -> return show(e.kind) + " after " + Int.toString(got)
+                }
+            }
+            -- Nothing more comes, so the next read waits its 200 ms.
+            let idle = brief(IO.readInto(s, IO.buffer(16)))
+            -- A deadline sooner than `each` ends the read at the deadline.
+            TCP.setLimits(s, Some(Deadline.after(Duration.millis(50))), Duration.seconds(30))
+            let clock = Stopwatch.start()
+            let early = brief(IO.readInto(s, IO.buffer(16)))
+            let quick = Stopwatch.elapsed(clock) < Duration.seconds(10)
+            Int.toString(got) + " " + idle + " " + early + " " + show(quick)
+        })?
+        for var i = 0; i < 6; i = i + 1 {
+            Sleep.sleep(Duration.millis(50))
+            let _ = IO.writeText(c, "x")
+        }
+        pure(reader)
+    })
+    print(Task.join(reader))
+    let _ = TCP.close(c)
+    let _ = TCP.close(s)
+}
+"""
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_set_limits_bounds_each_read_and_all_of_them(tmp_path, workers):
+    binary = _build(tmp_path, LIMITS)
+    assert _run(binary, workers).splitlines() == ["6 read TimedOut read TimedOut True"]
+
+
 # -- policies -----------------------------------------------------------------------
 
 LITERALS = """

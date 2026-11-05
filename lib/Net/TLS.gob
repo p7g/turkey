@@ -3,7 +3,7 @@ export (
     ClientConfig, Roots(..), clientConfig, releaseClient,
     ServerConfig, Certificate(..), serverConfig, releaseServer,
     client, server, handshake, protocol, serverName,
-    setDeadline, clearDeadline, shutdownWrite, close,
+    setDeadline, clearDeadline, setLimits, shutdownWrite, close,
     Acceptor, acceptor, accept, closeListener,
 )
 
@@ -98,6 +98,7 @@ import Net.TCP as TCP
 import System.Sync as Sync
 import Time (Timeout(..))
 import Time.Deadline (Deadline)
+import Time.Duration (Duration)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 import Turkey.ConnectPolicy (Destination(..))
@@ -408,8 +409,10 @@ type Engine = Engine {
     var closed : Bool,
     var shaken : Bool,
     var failed : Option TLSError,
-    -- The limit `setDeadline` set, which `handshake` puts back after its own.
+    -- The limit `setDeadline` set, which `handshake` puts back after its own,
+    -- and the one `setLimits` set on each read and write.
     var limit  : Option Deadline,
+    var each   : Option Duration,
 }
 
 -- What one call into OpenSSL left to do.
@@ -426,6 +429,7 @@ instance Read TLS {
     fun readInto(t, into) {
         needsRoom(into)
         using(t, "read", fun() {
+            begin(t)
             settled(t)?
             Sync.withLock(t.reading, fun(incoming) = receive(t, incoming, into))
         })
@@ -435,6 +439,7 @@ instance Read TLS {
 instance Write TLS {
     type WriteError = TLSError
     fun writeFrom(t, from) = using(t, "write", fun() {
+        begin(t)
         settled(t)?
         Sync.withLock(t.sending, fun(outgoing) = transmit(t, outgoing, from))?
         -- What a read left in `wbio` while this held `sending`.
@@ -449,14 +454,28 @@ instance Write TLS {
 instance Connection TLS {
     fun setDeadline(t, timeout) {
         let at = deadline(timeout)
-        withEngine(t, fun(engine) { engine.limit = Some(at) })
+        withEngine(t, fun(engine) {
+            engine.limit = Some(at)
+            engine.each = None
+        })
         t.stream.bounding(Some(at))
     }
     fun clearDeadline(t) {
-        withEngine(t, fun(engine) { engine.limit = None })
+        withEngine(t, fun(engine) {
+            engine.limit = None
+            engine.each = None
+        })
         t.stream.bounding(None)
     }
+    fun setLimits(t, deadline, each) {
+        withEngine(t, fun(engine) {
+            engine.limit = deadline
+            engine.each = Some(each)
+        })
+        t.stream.bounding(deadline)
+    }
     fun shutdownWrite(t) = using(t, "shutdown", fun() {
+        begin(t)
         settled(t)?
         Sync.withLock(t.sending, fun(outgoing) {
             let _ = withEngine(t, fun(engine) {
@@ -488,7 +507,7 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
         sending = Sync.mutex(Buf.buffer(cipherCapacity)),
         engine = Sync.mutex(Engine {
             ssl, rbio, wbio, block, users = 0, closed = False, shaken = False,
-            failed = None, limit = None,
+            failed = None, limit = None, each = None,
         }),
         config,
         local,
@@ -671,6 +690,17 @@ fun retire(engine : Engine) -> Unit {
     if !Ptr.isNull(engine.block) {
         Ptr.free(engine.block)
         engine.block = Ptr.null()
+    }
+}
+
+-- Bounds the connection underneath for a read, write or shutdown of `t`
+-- that begins now, if `setLimits` gave each one a limit. The connection
+-- underneath has one deadline for both directions, so an operation that
+-- begins extends one under way in the other direction.
+fun begin(t : TLS) -> Unit {
+    let (limit, each) = withEngine(t, fun(engine) = (engine.limit, engine.each))
+    if let Some(e) = each {
+        t.stream.bounding(Some(Net.operationDeadline(limit, e)))
     }
 }
 

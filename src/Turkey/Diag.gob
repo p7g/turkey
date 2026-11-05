@@ -1,11 +1,16 @@
-export (Diag(..), at, whole, render, fail, short, compiling)
+export (
+    Diag(..), Severity(..), at, whole, warningAt, render, fail, short, compiling,
+    report, beginUnit, endUnit, hasErrors, stopOnErrors,
+)
 
 -- A diagnostic is a value.
 --
--- Turkey has no exceptions, so a stage that cannot continue answers with a
--- record rather than raising. `fail` is the one exception, deliberately: it
--- renders and exits, which keeps the lexer from threading a result type through
--- every character for an error that ends the compile anyway.
+-- Turkey has no exceptions, so a stage cannot stop part way through a unit of
+-- work and unwind to the next one. Instead a site that finds an error
+-- `report`s it and carries on with a harmless answer, and the driver decides,
+-- at the end of each stage, whether to go on (`stopOnErrors`). `fail` is the
+-- older way, and stays for the sites that cannot carry on: it prints what has
+-- been reported, renders its own diagnostic and exits.
 --
 -- One rendering, `file:line:col: stage: message`, and every diagnostic uses it.
 
@@ -13,10 +18,15 @@ import System.Env as Env
 import System.IO as IO
 import Turkey.Source (Span(..), showSpan)
 
+-- An `Error` stops the compile at the end of the stage that reports it. A
+-- `Warning` is printed and stops nothing.
+type Severity = Error | Warning
+
 type Diag = Diag {
-    stage   : String,
-    message : String,
-    span    : Option Span,
+    stage    : String,
+    message  : String,
+    span     : Option Span,
+    severity : Severity,
 }
 
 -- Both constructors shorten the message here rather than leaving it to the
@@ -24,12 +34,15 @@ type Diag = Diag {
 -- whose author remembered to. A site that forgets says `Main#Named` to someone
 -- who wrote `Named`.
 fun at(stage : String, message : String, where : Span) -> Diag =
-    Diag { stage = stage, message = short(message), span = Some(where) }
+    Diag { stage = stage, message = short(message), span = Some(where), severity = Error }
 
 -- A diagnostic about a whole file rather than a place in it: a file that cannot
 -- be read has no line to point at.
 fun whole(stage : String, message : String) -> Diag =
-    Diag { stage = stage, message = short(message), span = None }
+    Diag { stage = stage, message = short(message), span = None, severity = Error }
+
+fun warningAt(message : String, where : Span) -> Diag =
+    Diag { stage = "warning", message = short(message), span = Some(where), severity = Warning }
 
 fun render(d : Diag, filename : String) -> String = match d.span {
     None -> filename + ": " + d.stage + ": " + d.message
@@ -47,10 +60,87 @@ fun compiling(path : String) -> Unit {
     entryFile = path
 }
 
+-- -- the collector --------------------------------------------------------------------
+--
+-- One for the process, as `entryFile` is. That is safe because only the front
+-- end reports, and the front end runs on one thread; the stages after it run
+-- on workers, and every error they can find is a compiler bug, which `fail`s.
+
+-- What has been reported and not yet printed, in the order it was reported.
+var collected : Vec Diag = []
+
+-- Whether an error has been reported.
+var errorSeen = False
+
+-- How deep the current unit is, and whether it has reported an error. Only the
+-- outermost unit counts.
+var unitDepth = 0
+var unitFailed = False
+
+-- Records `d`, to be printed by the next `stopOnErrors` or `fail`.
+--
+-- Inside a unit that has already reported an error, a further error is
+-- dropped: the unit is abandoned in all but name, and what it reports after
+-- its first error is most often that error seen again from another use.
+fun report(d : Diag) -> Unit {
+    if let Error = d.severity {
+        if unitFailed { return }
+        if unitDepth > 0 { unitFailed = True }
+        errorSeen = True
+    }
+    Vec.push(collected, d)
+}
+
+-- Starts a unit: the stretch of work whose errors after the first are dropped.
+fun beginUnit() -> Unit {
+    if unitDepth == 0 { unitFailed = False }
+    unitDepth = unitDepth + 1
+}
+
+-- Ends the unit `beginUnit` started, and returns whether it reported an error.
+fun endUnit() -> Bool {
+    unitDepth = unitDepth - 1
+    let failed = unitFailed
+    if unitDepth == 0 { unitFailed = False }
+    failed
+}
+
+-- Returns whether an error has been reported.
+fun hasErrors() -> Bool = errorSeen
+
+-- Prints what has been reported, in source order, to stderr. Exits with status
+-- 1 if any of it was an error, and returns otherwise.
+fun stopOnErrors() -> Unit {
+    printCollected()
+    if errorSeen { Env.exit(1) }
+}
+
+fun printCollected() -> Unit {
+    -- Sorted by place, and stably, so two reports at one place keep their order.
+    let ordered = Vec.sortByKey(collected, fun(d) = match d.span {
+        Some(s) -> (s.file, (s.line, s.col))
+        None -> ("", (0, 0))
+    })
+    for d in ordered { let _ = IO.writeText(IO.stderr(), render(d, entryFile) + "\n") }
+    Vec.clear(collected)
+}
+
+-- Prints what has been reported, then `d`, and exits.
+--
+-- `d` is left out when an error has already been reported in the current
+-- unit, as `report` would leave it out. So is an internal error once any
+-- error has been reported: the stage went on past that error with a harmless
+-- answer in its place, and we assume a check that fails afterwards is failing
+-- on that answer, not on a bug of its own.
+--
 -- Diverges, so it may be used where a value is expected.
 fun fail(d : Diag, filename : String) -> a {
-    let name = if filename == "" { entryFile } else { filename }
-    let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
+    printCollected()
+    let cascade = unitFailed || (errorSeen && d.stage == "internal error")
+    if !cascade {
+        let name = if filename == "" { entryFile } else { filename }
+        let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
+    }
     Env.exit(1)
 }
 

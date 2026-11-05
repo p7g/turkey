@@ -53,7 +53,7 @@ def test_a_string_step_join_takes_the_fields():
         assert ": (Char, Index)" not in body, body
     # The loop's join has both fields as parameters, the index unwrapped too.
     count = _body(dump.stdout, "Main#countA")
-    assert re.search(r"join %js\d+[^(]*\([^)]*: Char, [^)]*: Int\)", count), count
+    assert re.search(r"join %js[^(]*\([^)]*: Char, [^)]*: Int\)", count), count
     assert lang.output(FIRST_TWO) == "1\n2\n0\n4\n"
 
 

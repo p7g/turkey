@@ -23,6 +23,8 @@ export (
     Program(..),
     patternVars, varPatterns, freshNodeId, armBody, declBody,
     Child(..), children, exprChildren, stmtChildren,
+    Completion(..), completion, stmtCompletion, completes, stmtStops, breaksOut,
+    LetElse(..),
     shorthandPrefix, isShorthand, sketch,
 )
 
@@ -433,6 +435,12 @@ type Program = Program {
     exportDecl : Option ExportDecl,
     imports    : Vec ImportDecl,
     decls      : Vec Decl,
+    -- Every `let ... else` in the file. Its `else` block must not fall
+    -- through, which depends on whether its calls return, and only types can
+    -- show that. The parser records each block's completion because
+    -- desugaring may rewrite the block's transfers into values before
+    -- anything checks types.
+    letElses   : Vec LetElse,
 }
 
 -- Every variable a pattern binds.
@@ -533,8 +541,8 @@ fun stmtChildren(s : Stmt) -> Vec Child = match s.kind {
 }
 
 -- The expression an arm holds, and the body a declaration holds. Named because
--- three modules ask -- `children` below, `Infer.diverges`, `Desugar`'s rewrite
--- -- not because either is more than the field access it reads as.
+-- several places ask -- `children` and `reach` below, `Desugar`'s rewrite --
+-- not because either is more than the field access it reads as.
 fun armBody(a : Arm) -> Expr {
     a.body
 }
@@ -555,6 +563,233 @@ fun optExpr(e : Option Expr) -> Vec Child = match e {
 fun optStmt(s : Option Stmt) -> Vec Child = match s {
     Some(x) -> [ChStmt(x)]
     None -> []
+}
+
+-- -- completion ---------------------------------------------------------------------
+
+-- Whether control that reaches the start of an expression can reach its end:
+-- whether the expression "can complete normally", in the term of the Java
+-- Language Specification (§14.22). It is a structural question except at a
+-- call, which returns or not according to the callee's type, and some stages
+-- ask before types are solved. So the answer is a formula with an atom for
+-- each call, which `completes` evaluates once something can say which calls
+-- return.
+--
+-- The formula overestimates wherever it is unsure. A stage asks whether
+-- something can complete in order to reject it, so overestimating rejects a
+-- program that is fine, and underestimating would accept one that is not.
+type Completion
+    = Completes
+    | Stops
+    -- Completes exactly when this call returns.
+    | IfReturns(Expr)
+    | AndThen(Completion, Completion)
+    | OrElse(Completion, Completion)
+
+-- Returns a formula that holds exactly when `e` can complete normally.
+fun completion(e : Expr) -> Completion {
+    let (ends, _) = reach(e)
+    ends
+}
+
+-- Returns a formula that holds exactly when `s` can complete normally.
+fun stmtCompletion(s : Stmt) -> Completion {
+    let (ends, _) = reachStmt(s)
+    ends
+}
+
+-- Evaluates a formula, with `returns` deciding each call.
+fun completes(c : Completion, returns : fun(Expr) -> Bool) -> Bool = match c {
+    Completes -> True
+    Stops -> False
+    IfReturns(call) -> returns(call)
+    AndThen(a, b) -> completes(a, returns) && completes(b, returns)
+    OrElse(a, b) -> completes(a, returns) || completes(b, returns)
+}
+
+-- Whether `s` cannot complete normally, whatever its calls do. It needs no
+-- types, so generation can ask it.
+fun stmtStops(s : Stmt) -> Bool = !completes(stmtCompletion(s), fun(_) = True)
+
+-- Whether the loop whose body is `body` can reach one of its own breaks,
+-- whatever the body's calls do.
+fun breaksOut(body : Expr) -> Bool {
+    let (_, breaks) = reach(body)
+    completes(breaks, fun(_) = True)
+}
+
+fun andThen(a : Completion, b : Completion) -> Completion = match a {
+    Stops -> Stops
+    Completes -> b
+    _ -> match b {
+        Stops -> Stops
+        Completes -> a
+        _ -> AndThen(a, b)
+    }
+}
+
+fun orElse(a : Completion, b : Completion) -> Completion = match a {
+    Completes -> Completes
+    Stops -> b
+    _ -> match b {
+        Completes -> Completes
+        Stops -> a
+        _ -> OrElse(a, b)
+    }
+}
+
+-- Two formulas for `e`, each assuming control reaches its start: that it
+-- reaches the end of `e`, and that it reaches a `break` leaving the innermost
+-- loop around `e`. A loop completes exactly when one of its own breaks is
+-- reached, so the second is what a loop asks of its body.
+--
+-- Each node's formulas are built from its children's, not by threading a
+-- formula for "reached so far" through the walk: threading copies that formula
+-- into both branches of every `if`, and a run of `if`s would double it each
+-- time.
+fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
+    ELit(_) -> (Completes, Stops)
+    EUnit -> (Completes, Stops)
+    EVar(_, _) -> (Completes, Stops)
+    ECon(_) -> (Completes, Stops)
+    ETuple(xs) -> inOrder(Vec.map(xs, reach))
+    EArray(xs) -> inOrder(Vec.map(xs, reach))
+    ERecord(_, fields) -> inOrder(Vec.map(fields, fun((_, value)) = reach(value)))
+    -- Making a function runs none of it, and its `return`s and `break`s are
+    -- its own.
+    ELambda(_, _, _) -> (Completes, Stops)
+    ECall(fn, args) -> {
+        let (ends, breaks) = inOrder(Vec.append([reach(fn)], Vec.map(args, reach)))
+        (andThen(ends, IfReturns(e)), breaks)
+    }
+    EIndex(arr, index, _, _) -> inOrder([reach(arr), reach(index)])
+    EField(obj, _) -> reach(obj)
+    EProject(obj, _) -> reach(obj)
+    EUnary(_, operand, _) -> reach(operand)
+    EBinary(op, left, right, _) ->
+        if op == "&&" || op == "||" { orSkip(reach(left), reach(right)) }
+        else { inOrder([reach(left), reach(right)]) }
+    -- Grouping is not known yet, so with a short-circuiting operator anywhere
+    -- in the chain only the first operand is sure to run, and any operand's
+    -- `break` may be reached.
+    EChain(operands, ops) -> {
+        let parts = Vec.map(operands, reach)
+        if Iterator.any(ops, fun((op, _)) = op == "&&" || op == "||") {
+            let (ends, _) = parts[0]
+            var breaks = Stops
+            for (_, b) in parts { breaks = orElse(breaks, b) }
+            (ends, breaks)
+        } else {
+            inOrder(parts)
+        }
+    }
+    EAnnot(inner, _) -> reach(inner)
+    EIf(cond, then, otherwise) -> {
+        let (thenEnds, thenBreaks) = reach(then)
+        let (elseEnds, elseBreaks) = match otherwise {
+            Some(o) -> reach(o)
+            None -> (Completes, Stops)
+        }
+        branch(reach(cond), orElse(thenEnds, elseEnds), orElse(thenBreaks, elseBreaks))
+    }
+    -- The body runs only once the condition does, and leaves the loop when the
+    -- condition is false, so the loop completes when the condition does.
+    -- Breaks in the body leave this loop and no other.
+    EWhile(cond, _) -> reach(cond)
+    EForIn(_, iterable, _, _, _) -> reach(iterable)
+    EForC(init, cond, _, _) -> {
+        let first = match init {
+            Some(s) -> reachStmt(s)
+            None -> (Completes, Stops)
+        }
+        inOrder([first, reach(cond)])
+    }
+    ELoop(body) -> {
+        let (_, breaks) = reach(body)
+        (breaks, Stops)
+    }
+    EMatch(scrutinee, arms) -> {
+        var ends = Stops
+        var breaks = Stops
+        for arm in arms {
+            let (armEnds, armBreaks) = reach(armBody(arm))
+            ends = orElse(ends, armEnds)
+            breaks = orElse(breaks, armBreaks)
+        }
+        branch(reach(scrutinee), ends, breaks)
+    }
+    EReturn(value) -> {
+        let (_, breaks) = optReach(value)
+        (Stops, breaks)
+    }
+    EBreak(value) -> {
+        let (ends, breaks) = optReach(value)
+        (Stops, orElse(breaks, ends))
+    }
+    EContinue -> (Stops, Stops)
+    EBlock(stmts) -> inOrder(Vec.map(stmts, reachStmt))
+    -- A `?` that does not unwrap leaves the function, and one that does
+    -- completes.
+    EQuestion(inner, _) -> reach(inner)
+    -- A `do` block is evaluated as a value of its monad, and a `break` cannot
+    -- cross into one.
+    EDo(_) -> (Completes, Stops)
+}
+
+fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
+    SLet(_, value) -> reach(value)
+    SVar(_, value) -> reach(value)
+    SFun(_) -> (Completes, Stops)
+    SAssign(target, value) -> inOrder([reach(value), reach(target)])
+    SExpr(e) -> reach(e)
+}
+
+fun optReach(e : Option Expr) -> (Completion, Completion) = match e {
+    Some(x) -> reach(x)
+    None -> (Completes, Stops)
+}
+
+-- Parts that run one after another: the whole completes when every part does,
+-- and a `break` is reached in a part once every part before it has completed.
+fun inOrder(parts : Vec (Completion, Completion)) -> (Completion, Completion) {
+    var ends = Completes
+    var breaks = Stops
+    -- From the last part back, so each `break` formula is built once rather
+    -- than repeating the prefix before it.
+    for var i = len(parts) - 1; i >= 0; i = i - 1 {
+        let (partEnds, partBreaks) = parts[i]
+        breaks = orElse(partBreaks, andThen(partEnds, breaks))
+        ends = andThen(partEnds, ends)
+    }
+    (ends, breaks)
+}
+
+-- A test, then one of several branches whose formulas are already combined.
+fun branch(test : (Completion, Completion), ends : Completion,
+           breaks : Completion) -> (Completion, Completion) {
+    let (testEnds, testBreaks) = test
+    (andThen(testEnds, ends), orElse(testBreaks, andThen(testEnds, breaks)))
+}
+
+-- `left`, and then `right` only sometimes, as `&&` and `||` run it.
+fun orSkip(left : (Completion, Completion),
+           right : (Completion, Completion)) -> (Completion, Completion) {
+    let (leftEnds, leftBreaks) = left
+    let (_, rightBreaks) = right
+    (leftEnds, orElse(leftBreaks, andThen(leftEnds, rightBreaks)))
+}
+
+-- What a `let ... else` leaves for the stages after the parser. See
+-- `Program.letElses`.
+type LetElse = LetElse {
+    -- The `else` block.
+    block      : Expr,
+    -- Whether `block` can complete, read before desugaring may rewrite its
+    -- transfers into values.
+    completion : Completion,
+    -- The calls in `block`'s tail positions: its last statement, through both
+    -- branches of an `if` and every arm of a `match`.
+    tailCalls  : Vec Expr,
 }
 
 -- -- lambda shorthand ---------------------------------------------------------------

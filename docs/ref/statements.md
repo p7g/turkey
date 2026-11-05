@@ -39,6 +39,43 @@ fun main() {
 12
 ```
 
+A statement **cannot complete** when no way of running it reaches its end: a
+`return`, `break` or `continue`; a `loop` that cannot reach one of its own
+`break`s; an `if` with an `else`, or a `match`, none of whose branches can
+complete; or any statement that evaluates one of these on every way through
+it. The statements after it are unreachable and never run, and the compiler
+warns about them. The block never produces a value, so it has any type, as
+`return` does:
+
+<!-- run -->
+```kotlin
+fun orZero(text : String) -> Int {
+    let n = match Int.parse(text) {
+        Some(n) -> n
+        None -> {
+            print("not a number: " + text)
+            return 0
+        }
+    }
+    n * 2
+}
+
+fun main() {
+    print(orZero("21"))
+    print(orZero("x"))
+}
+```
+
+```text
+42
+not a number: x
+0
+```
+
+A call to a function that never returns, such as `error`, also ends the run of
+a block, and the compiler warns about what follows it too, but the call does
+not change the block's type, which is still that of its last statement.
+
 A declaration in a block is visible from the next statement to the end of the
 block. A block is a scope: its declarations are not visible after it.
 
@@ -206,6 +243,117 @@ fun main() {
 ```text
 took 8
 42
+```
+
+## `let ... else` and `var ... else`
+
+**Syntax**
+
+```ebnf
+let-decl ::= "let" pattern "=" expression ("else" block)?
+var-decl ::= "var" pattern "=" expression ("else" block)?
+```
+
+`let p = e else { B }` evaluates `e`. If `p` matches, the pattern's variables
+are bound for the rest of the block, as with a plain `let`. If it does not, `B`
+runs instead. It is approximately
+
+```text
+let ($x, $y) = match e {
+    p -> ($x, $y)
+    _ -> B
+}
+```
+
+where `$x` and `$y` are the variables `p` binds, so the pattern may be
+refutable. `var p = e else { B }` is the same, except that the variables can be
+assigned afterwards.
+
+<!-- run -->
+```kotlin
+fun total(lines : Array String) -> Int {
+    var sum = 0
+    for line in lines {
+        let Some(n) = Int.parse(line) else { continue }
+        sum = sum + n
+    }
+    sum
+}
+
+fun main() {
+    print(total(["3", "four", "5"]))
+}
+```
+
+```text
+8
+```
+
+`B` must not fall through, because the variables would then have no value:
+it must [not be able to complete](#blocks), counting a call to a function that
+never returns as a statement that cannot complete. A function never returns
+when its result type is a type variable that none of its parameters mention,
+as in `error : fun(String) -> a`: it has no way to make a value of that type.
+So every way through `B` has to reach a `return`, `break`, `continue` or such
+a call.
+
+<!-- run -->
+```kotlin
+fun port(text : String) -> Int {
+    let Some(n) = Int.parse(text) else { error("not a port: " + text) }
+    n
+}
+
+fun main() {
+    print(port("8080"))
+}
+```
+
+```text
+8080
+```
+
+<!-- error: this 'else' block can fall through; it must end in 'return', 'break', 'continue' or a call that never returns -->
+```kotlin
+fun port(text : String) -> Int {
+    let Some(n) = Int.parse(text) else { print("not a port") }
+    n
+}
+
+fun main() {
+    print(port("8080"))
+}
+```
+
+The variables `p` binds are not visible in `B`, and neither is the value that
+failed to match. When `B` needs that value, as in reporting the error inside a
+`Left`, use `match`.
+
+The value cannot end in `}` when an `else` follows, because the `else` could
+belong to an `if` inside it. Put such a value in parentheses:
+
+<!-- error: a 'let' value that ends in '}' cannot be followed by 'else'; put the value in parentheses -->
+```kotlin
+fun pick(fast : Bool, x : Option Int) -> Int {
+    let Some(v) = if fast { x } else { None } else { return 0 }
+    v
+}
+```
+
+<!-- run -->
+```kotlin
+fun pick(fast : Bool, x : Option Int) -> Int {
+    let Some(v) = (if fast { x } else { None }) else { return 0 }
+    v
+}
+
+fun main() {
+    print(pick(True, Some(3)))
+}
+```
+
+```text
+3
 ```
 
 ## `match`
@@ -557,7 +705,7 @@ fun main() {
 
 | Construct | Type |
 |---|---|
-| `{ ...; e }` | the type of `e`, or `Unit` if the last statement is a declaration |
+| `{ ...; e }` | the type of `e`, `Unit` if the last statement is a declaration, or any type if a statement cannot complete |
 | `if c { A } else { B }` | the type of `A` and `B`, which must agree |
 | `if c { A }` | `Unit` |
 | `if let p = e { A } else { B }` | the type of `A` and `B` |

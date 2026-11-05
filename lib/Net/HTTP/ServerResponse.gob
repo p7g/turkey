@@ -1,13 +1,13 @@
 export (
-    ServerResponse, Reply(..), Outgoing(..),
-    text, json, bytes, stream, noContent, notModified, switch, status, outgoing, contentType,
+    ServerResponse, ToResponse(..), Content(..), Outgoing(..),
+    body, stream, statusOnly, noContent, notModified, switch, status, outgoing,
 )
 
--- What a server sends in answer to a request: a status, header fields, and a
--- body, which `Net.HTTP.Server`'s `respond` writes.
+-- What a server sends in response to a request: a status, header fields,
+-- and a body, which `Net.HTTP.Server`'s `respond` writes.
 --
---     (GET, "/health") -> respond(r, text(OK, "ok"))
---     (GET, "/events") -> respond(r, stream(OK, LengthUnknown, feed) |> header(ContentType, MediaType.eventStream))
+--     (GET, "/health") -> respond(r, body(OK, MediaType.plainText, "ok\n"))
+--     (GET, "/events") -> respond(r, stream(OK, MediaType.eventStream, LengthUnknown, feed))
 --
 -- **Abstract, where `ClientRequest` is a record.** A rule that fits inside
 -- one field's type is kept by that type, so `ClientRequest b` exports its
@@ -18,19 +18,18 @@ export (
 -- only by the functions here, which check it, and a record would let a
 -- program build one they refuse.
 --
--- * `text`, `json`, `bytes` and `stream` have a body, and panic on a status
---   that cannot: a status written in a program that cannot carry its body is
---   a mistake in the program, as a bad literal is.
--- * `noContent()` is a 204, and `notModified()` a 304, with no body.
+-- * `body` and `stream` have a body, of the media type the caller names,
+--   and panic on a status that cannot: a status written in a program that
+--   cannot carry its body is a mistake in the program, as a bad literal is.
+-- * `statusOnly(s)` is `s` with no body. `noContent()` is a 204, and
+--   `notModified()` a 304.
 -- * `switch` is a 101 that hands the connection to another protocol.
--- * `reply(s)` of a `Status` is that status with an empty body.
 -- * A 1xx other than 101 is not a response here. The server's `inform`
 --   sends one, before the final response.
 --
--- Header fields are added with `|> header(h, v)` or `withHeaders`. The
--- content type each constructor gives is used only if the program adds none
--- of its own, so `text(OK, page) |> header(ContentType, MediaType.html)`
--- sends one.
+-- The library never picks a media type: a response has the `Content-Type`
+-- its constructor was given, or none. Header fields are added with
+-- `|> header(h, v)` or `withHeaders`.
 --
 -- **A stream's function runs while `respond` writes,** after the head is on
 -- the wire, so a failure in it can no longer change the status: the
@@ -40,19 +39,13 @@ export (
 import Net.HTTP.Headers as Headers (Headers, HasHeaders(..), ContentType(..))
 import Net.HTTP.Duplex (Duplex)
 import Net.HTTP.MediaType as MediaType (MediaType)
-import Net.HTTP.Status as Status (Status(NoContent, NotModified, OK, SwitchingProtocols))
+import Net.HTTP.Status as Status (Status(NoContent, NotModified, SwitchingProtocols))
 import Net.HTTP.Stream (Stream(..), BodyLength, Sink)
 import Net.HTTP.Token as Token (Token)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 
-type ServerResponse = ServerResponse {
-    code : Status,
-    fields : Headers,
-    -- The content type to send if `fields` has none.
-    defaultType : Option MediaType,
-    body : Outgoing,
-}
+type ServerResponse = ServerResponse { code : Status, fields : Headers, content : Outgoing }
 
 -- A response's body, as the server writes it.
 --
@@ -70,63 +63,73 @@ type Outgoing =
 
 instance HasHeaders ServerResponse {
     fun headers(r) = r.fields
-    fun setHeaders(r, hs) = ServerResponse { code = r.code, fields = hs, defaultType = r.defaultType, body = r.body }
+    fun setHeaders(r, hs) = ServerResponse { code = r.code, fields = hs, content = r.content }
 }
 
 -- Returns the response's status.
 fun status(r : ServerResponse) -> Status = r.code
 
 -- Returns the response's body, for the server that writes it.
-fun outgoing(r : ServerResponse) -> Outgoing = r.body
+fun outgoing(r : ServerResponse) -> Outgoing = r.content
 
--- Returns the content type the response is sent with: its own field if it
--- has one, or else the one its constructor gave.
-fun contentType(r : ServerResponse) -> Option MediaType = match Headers.get(r.fields, ContentType) {
-    Some(t) -> Some(t)
-    None -> r.defaultType
-}
+-- What `body` sends: text as its UTF-8 bytes, or the bytes of a
+-- `Buffer`'s window.
+class Content c { fun contentBytes(c) -> Buffer }
+
+instance Content String { fun contentBytes(s) = Buf.bytesOf(s) }
+
+-- The response keeps the buffer, which must not be changed until it is
+-- sent.
+instance Content Buffer { fun contentBytes(b) = b }
 
 -- Panics unless a response with `s` may have a body.
 fun bodied(s : Status, constructor : String) -> Status {
     let code = Status.code(s)
+    let fix = if code == 204 { "use 'noContent'" }
+              else if code == 304 { "use 'notModified'" }
+              else if code == 101 { "use 'switch'" }
+              else { "send it with 'inform'" }
     if code / 100 == 1 || code == 204 || code == 304 {
-        error("ServerResponse." + constructor + ": a " + Int.toString(code) + " response cannot have a body")
+        error("ServerResponse." + constructor + ": status " + Int.toString(code) + " cannot have a body; " + fix)
     }
     s
 }
 
-fun make(s : Status, t : Option MediaType, body : Outgoing) -> ServerResponse =
-    ServerResponse { code = s, fields = Headers.empty, defaultType = t, body }
+fun make(s : Status, fields : Headers, content : Outgoing) -> ServerResponse =
+    ServerResponse { code = s, fields, content }
 
--- Returns a response of `s` with `body` as UTF-8 text, of type
--- `text/plain; charset=utf-8`.
-fun text(s : Status, body : String) -> ServerResponse =
-    make(bodied(s, "text"), Some(MediaType.plainText), Whole(Buf.bytesOf(body)))
+-- Returns a response of `s` with `content` as its body, of type `t`.
+fun body[Content c](s : Status, t : MediaType, content : c) -> ServerResponse =
+    make(bodied(s, "body"), Headers.field(ContentType, t), Whole(contentBytes(content)))
 
--- Returns a response of `s` with `encoded`, a JSON document, as its body, of
--- type `application/json`.
-fun json(s : Status, encoded : String) -> ServerResponse =
-    make(bodied(s, "json"), Some(MediaType.json), Whole(Buf.bytesOf(encoded)))
+-- Returns a response of `s`, of type `t`, whose body `write` writes,
+-- `length` bytes of it, once the head is sent, and whose trailers it
+-- returns. For a response to HEAD, `write` is never called.
+fun stream(s : Status, t : MediaType, length : BodyLength, write : fun(Sink) -> Either SomeError Headers)
+        -> ServerResponse =
+    make(bodied(s, "stream"), Headers.field(ContentType, t), Streamed(Stream(length, write)))
 
--- Returns a response of `s` with the bytes of `body`'s window, of type
--- `application/octet-stream`. The response keeps `body`, which must not be
--- changed until it is sent.
-fun bytes(s : Status, body : Buffer) -> ServerResponse =
-    make(bodied(s, "bytes"), Some(MediaType.octetStream), Whole(body))
-
--- Returns a response of `s` whose body `write` writes, `length` bytes of
--- it, once the head is sent, and whose trailers it returns. For a response
--- to HEAD, `write` is never called. The response has no default content
--- type.
-fun stream(s : Status, length : BodyLength, write : fun(Sink) -> Either SomeError Headers) -> ServerResponse =
-    make(bodied(s, "stream"), None, Streamed(Stream(length, write)))
+-- Returns a response of `s` with no body: framed as having none for a 204
+-- or 304, and with a length of 0 otherwise. Panics on a 1xx, which `inform`
+-- or `switch` sends.
+fun statusOnly(s : Status) -> ServerResponse {
+    let code = Status.code(s)
+    if code == 101 {
+        error("ServerResponse.statusOnly: status 101 cannot be sent without a protocol; use 'switch'")
+    }
+    if code / 100 == 1 {
+        error("ServerResponse.statusOnly: status " + Int.toString(code)
+              + " cannot be a final response; send it with 'inform'")
+    }
+    make(s, Headers.empty, Empty)
+}
 
 -- Returns a 204 response, which has no body.
-fun noContent() -> ServerResponse = make(NoContent, None, Empty)
+fun noContent() -> ServerResponse = make(NoContent, Headers.empty, Empty)
 
 -- Returns a 304 response, which has no body. Add the fields a 200 would have
 -- had, `ETag` among them, with `header`.
-fun notModified() -> ServerResponse = make(NotModified, None, Empty)
+fun notModified() -> ServerResponse = make(NotModified, Headers.empty, Empty)
 
 -- Returns a response that switches the connection to `protocol`: a 101 with
 -- `headers`, and `Upgrade` and `Connection` written by the server. Once it is
@@ -139,41 +142,27 @@ fun notModified() -> ServerResponse = make(NotModified, None, Empty)
 -- it to `onError`: a 101 that the client did not ask for is a mistake in the
 -- handler.
 fun switch(protocol : Token, headers : Headers, run : fun(Duplex) -> Either SomeError Unit) -> ServerResponse =
-    ServerResponse {
-        code = SwitchingProtocols, fields = headers, defaultType = None, body = Switched(protocol, run),
-    }
+    make(SwitchingProtocols, headers, Switched(protocol, run))
 
--- -- replies ----------------------------------------------------------------------------
+-- -- conversions ------------------------------------------------------------------------
 
 -- What `respond` takes: anything that becomes a response.
 --
 -- * `ServerResponse`: itself.
--- * `String`: a 200 with the string as text.
--- * `Status`: that status with an empty body. Panics on a 1xx, which
---   `inform` sends.
--- * `Either l r`, when both sides are a `Reply`: the side it holds. So a
+-- * `Status`: `statusOnly` of it.
+-- * `Either l r`, when both sides are a `ToResponse`: the side it holds. So a
 --   handler computes an `Either APIError ServerResponse`, uses `?` on its
---   way, and its error type says, in its own `Reply` instance, what each
---   error answers.
-class Reply r { fun reply(r) -> ServerResponse }
+--   way, and its error type says, in its own `ToResponse` instance, what
+--   response each error becomes.
+class ToResponse r { fun toResponse(r) -> ServerResponse }
 
-instance Reply ServerResponse { fun reply(r) = r }
+instance ToResponse ServerResponse { fun toResponse(r) = r }
 
-instance Reply String { fun reply(s) = text(OK, s) }
+instance ToResponse Status { fun toResponse(s) = statusOnly(s) }
 
-instance Reply Status {
-    fun reply(s) {
-        let code = Status.code(s)
-        if code / 100 == 1 {
-            error("ServerResponse.reply: a " + Int.toString(code) + " response is sent with inform")
-        }
-        make(s, None, Empty)
-    }
-}
-
-instance Reply (Either l r) : Reply l, Reply r {
-    fun reply(x) = match x {
-        Left(l) -> reply(l)
-        Right(r) -> reply(r)
+instance ToResponse (Either l r) : ToResponse l, ToResponse r {
+    fun toResponse(x) = match x {
+        Left(l) -> toResponse(l)
+        Right(r) -> toResponse(r)
     }
 }

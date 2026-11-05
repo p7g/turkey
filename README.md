@@ -301,10 +301,10 @@ taken. `.github/workflows/http-bench.yml` runs it on an arm64 Linux runner
 for a pull request that changes it, or on demand, and puts the tables in the
 job summary.
 
-On macOS, the scenarios that open a connection per request, and the one that
-holds 10,000 connections, measure the kernel more than the server: loopback
-connections stall once many are open or recently closed. Take those numbers
-from Linux.
+On a Mac that has been up for weeks, new loopback connections can stall for a
+second at a time once a few thousand are open, and the scenarios that open
+many connections then measure the kernel rather than the server; a reboot
+clears it. Check `uptime` before trusting those numbers.
 
 ## Project status
 

@@ -55,6 +55,10 @@ def main():
         parts = line.rstrip("\n").split("\t")
         scenario, impl, conns = parts[:3]
         r = fields(" ".join(parts[4:]))
+        # An idle run whose client could not open every connection
+        # measured fewer than it says.
+        if scenario == "idle" and r.get("ready") == 0:
+            continue
         # An upload's bytes go to the server, and wrk counts only what it
         # reads, so its throughput is one MiB per request.
         if scenario == "upload" and "rps" in r:

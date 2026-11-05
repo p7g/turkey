@@ -3,10 +3,13 @@
 // over TLS for an https URL, send one GET with `Connection: close`, read the
 // response, and close. Prints a line in the format of bench/http/wrk.lua.
 //
-// wrk cannot measure this on macOS. A connection closed normally leaves its
-// address pair in TIME_WAIT for 2 x MSL (30 s on macOS), and on loopback
-// that pair holds the client's ephemeral port, so at most 16,384 ports per
-// 30 s, about 550 connections per second, get through. Closing with
+// wrk cannot measure this on macOS. With `Connection: close` the server
+// closes first, and its end of the address pair waits in TIME_WAIT for
+// 2 x MSL (30 s on macOS). The client picks its next ephemeral port without
+// looking at the server's sockets, so once a few thousand pairs are waiting
+// it soon reuses one of them, and macOS drops that SYN: the connect waits a
+// second for its retransmission. Measured with wrk, 64 connections, after
+// some 20,000 connections every new one fails or stalls. Closing with
 // SO_LINGER 0 sends a reset instead, which leaves no TIME_WAIT on either
 // side. The reset goes out once the whole response has been read, so the
 // server has done all its work, its own close included.

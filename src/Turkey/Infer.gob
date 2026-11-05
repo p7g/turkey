@@ -2034,24 +2034,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
     var result = TBottom
     for arm in arms {
         Vec.push(g.openings, Some(Vec.new(2)))
-        let bindings = matchPattern(g, arm.patterns[0], scrutineeType)
-        for var i = 1; i < len(arm.patterns); i = i + 1 {
-            let alt = arm.patterns[i]
-            let other = matchPattern(g, alt, scrutineeType)
-            match unshared(other, bindings) {
-                Some((name, True)) -> oops("this alternative binds '" + name
-                    + "' and the first does not; every alternative must bind "
-                    + "the same variables", Some(alt.span))
-                Some((name, False)) -> oops("this alternative does not bind '"
-                    + name + "' and the first does; every alternative must "
-                    + "bind the same variables", Some(alt.span))
-                None -> {}
-            }
-            for (name, ty) in Map.entries(other) {
-                eq(g, Map.getOr(bindings, name, ty), ty, Some(alt.span),
-                   "the binding '" + name + "'")
-            }
-        }
+        let bindings = alternatives(g, arm.patterns, scrutineeType)
         let openings = popOpenings(g)
         if len(openings) > 0 && len(arm.patterns) > 1 {
             oops("an arm with alternatives cannot match an existential "
@@ -2063,7 +2046,9 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         -- rigid constants.
         let answer = if len(openings) > 0 { Some(fresh(g)) } else { None }
         push(g)
+        let guardBindings = guards(g, arm.guards)
         var body = genExpr(g, arm.body)
+        closeGuards(g, guardBindings)
         match answer {
             Some(ans) -> match body {
                 TBottom -> {}
@@ -2087,6 +2072,67 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         result = join(g, result, body, Some(arm.span), "the arms of a 'match'")
     }
     result
+}
+
+-- Returns what the patterns of one arm or one `let` guard bind, each matched
+-- against `ty`. Raises a type error unless every pattern binds the names the
+-- first one does, at the same types.
+fun alternatives(g : Generator, patterns : Vec Pat, ty : Ty.Type) -> Map String Ty.Type {
+    let bindings = matchPattern(g, patterns[0], ty)
+    for var i = 1; i < len(patterns); i = i + 1 {
+        let alt = patterns[i]
+        let other = matchPattern(g, alt, ty)
+        match unshared(other, bindings) {
+            Some((name, True)) -> oops("this alternative binds '" + name
+                + "' and the first does not; every alternative must bind "
+                + "the same variables", Some(alt.span))
+            Some((name, False)) -> oops("this alternative does not bind '"
+                + name + "' and the first does; every alternative must "
+                + "bind the same variables", Some(alt.span))
+            None -> {}
+        }
+        for (name, t) in Map.entries(other) {
+            eq(g, Map.getOr(bindings, name, t), t, Some(alt.span),
+               "the binding '" + name + "'")
+        }
+    }
+    bindings
+}
+
+-- Generates an arm's guards, in order, and returns the binders each `let`
+-- guard binds, with their types. A test is a `Bool`. A `let` guard's binders
+-- are in scope for the guards after it and the arm's body; `closeGuards`
+-- binds them around those, given what this returns.
+--
+-- Refuse an existential in a `let` guard: its rigid constants would have to
+-- scope over the guards after it and the body, inside the arm's own rank.
+fun guards(g : Generator, gs : Vec Guard) -> Vec (Vec (Int, String, Ty.Type)) {
+    let opened = []
+    for guard in gs {
+        match guard {
+            GTest(test) ->
+                eq(g, genExpr(g, test), Ty.tBool(), Some(test.span), "a condition")
+            GLet(patterns, value) -> {
+                let ty = genExpr(g, value)
+                Vec.push(g.openings, None)
+                let bindings = alternatives(g, patterns, ty)
+                discard(Vec.pop(g.openings))
+                push(g)
+                -- The alternatives bind one set of binders between them, so
+                -- the first's are all of them.
+                Vec.push(opened, bindersIn(g, [patterns[0]], value.span, bindings))
+            }
+        }
+    }
+    opened
+}
+
+-- Closes the frames `guards` opened, innermost first, binding what each bound.
+fun closeGuards(g : Generator, opened : Vec (Vec (Int, String, Ty.Type))) -> Unit {
+    for var i = len(opened) - 1; i >= 0; i = i - 1 {
+        let inner = pop(g)
+        emit(g, CDef(opened[i], inner, False))
+    }
 }
 
 -- Returns a name that exactly one of `alt` and `first` binds, paired with

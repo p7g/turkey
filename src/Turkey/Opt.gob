@@ -53,24 +53,28 @@ export (
 -- beside their own recursion, which is where they differ from each other
 -- anyway.
 --
--- ## Not here: constant folding and common subexpressions
+-- ## Constant folding: proven results only
 --
--- Neither would fire. In the Core this pass leaves, over the test corpus and
--- the compiler itself, no primitive application has even one literal operand
--- -- a programmer writes a constant already folded, and inlining substitutes
--- variables -- and a repeated pure expression occurs 32 times in 384,095
--- nodes. The constants appear during lowering (tag tests, offsets, bounds),
--- which is why the low IR has sparse conditional constant propagation and this
--- has none. Core already propagates what it can: `let`-bound values are
--- substituted, a known constructor selects its branch, and a join is
--- specialized per constructor its jumps supply.
+-- A primitive applied to constants is replaced by the constant it computes
+-- (`knownPrim`). The constants come from source a programmer wrote to read
+-- well -- `Char.toInt(':')`, `-1`, a shift by a literal amount behind a range
+-- check -- and from inlining, which substitutes them. A top-level binding
+-- whose value folds becomes an atom, so `constant` puts it at every mention
+-- and it is never a global the program loads.
 --
--- A folder added here anyway has two traps. `Int` arithmetic panics on
--- overflow, so it must fold only a result it has proved in range -- neither
--- to a wrapped literal nor to an eager panic in a branch that may not run --
--- and must check before it computes, since the compiler's own `+` panics too.
--- And CSE needs an effects analysis Core does not have: `isValue` is about
--- cost, not about whether two occurrences read the same mutable state.
+-- **A trap never moves.** `Int` arithmetic panics on overflow, division at a
+-- zero divisor, and `CharFromInt` is folded only for a scalar value. Such an
+-- application is folded only when its constants are proven not to trap, by
+-- `Turkey.Fold`, which `Turkey.Sccp` shares. Otherwise it stays as it is: not
+-- a wrapped literal, and not an eager panic, because the application may sit
+-- in a branch that never runs.
+--
+-- ## Not here: common subexpressions
+--
+-- A repeated pure expression occurs 32 times in 384,095 nodes of the Core
+-- this pass leaves, over the test corpus and the compiler itself. And CSE
+-- needs an effects analysis Core does not have: `isValue` is about cost, not
+-- about whether two occurrences read the same mutable state.
 
 import Data.Set as Set
 import Turkey.Ast (..)
@@ -79,6 +83,8 @@ import Turkey.Core (..)
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), substitute)
 import Turkey.Deps as Deps
+import Turkey.Fold as Fold
+import Turkey.LowIr as L
 import Turkey.Prims as Prims
 import Turkey.Diag as Diag
 import Turkey.Methods as Methods
@@ -785,6 +791,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
             CSlot(_, _) -> knownLambda(r.decls, e)
+            CPrim(_) -> knownPrim(e)
             CProject(_, _) -> match knownLambda(r.decls, e) {
                 Some(made) -> Some(made)
                 None -> inline(r, e, inlineLimit)
@@ -885,6 +892,80 @@ fun knownCondition(d : DeclTable, e : Core) -> Option Core = match e.kind {
     }
     _ -> None
 }
+
+-- A primitive applied to constants: the constant it computes, or `None` where
+-- an operand is not a constant or the primitive would trap.
+fun knownPrim(e : Core) -> Option Core {
+    -- Two `if let`s rather than one with both conditions: the committed
+    -- bootstrap, which compiles this file, does not parse the chained form.
+    if let CApp(fn, args) = e.kind {
+        if let CPrim(p) = stripTyApp(fn).kind {
+            return map(folded(p, args), mkCore(e.ty, e.span, _))
+        }
+    }
+    None
+}
+
+-- A primitive left out is never folded, which is always correct: the floats,
+-- which `Turkey.Sccp` does not fold either, and the bytes, which have no
+-- literal to fold to or from.
+fun folded(p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
+    Prims.CharToInt -> map(charAt(args, 0), intLit)
+    Prims.CharFromInt -> bind(intAt(args, 0), fun(n) =
+        if Fold.isScalar(n) { map(Char.fromInt(n), fun(c) = CLit(LChar(c))) }
+        else { None })
+    Prims.CharIsScalar -> map(intAt(args, 0), fun(n) = boolCon(Fold.isScalar(n)))
+    Prims.CharEq -> relation(L.Eq, charAt(args, 0), charAt(args, 1))
+    Prims.CharLt -> relation(L.Lt, charAt(args, 0), charAt(args, 1))
+    Prims.IntEq -> relation(L.Eq, intAt(args, 0), intAt(args, 1))
+    Prims.IntLt -> relation(L.Lt, intAt(args, 0), intAt(args, 1))
+    Prims.BoolEq -> relation(L.Eq, boolAt(args, 0), boolAt(args, 1))
+    Prims.BoolLt -> relation(L.Lt, boolAt(args, 0), boolAt(args, 1))
+    Prims.Not -> map(boolAt(args, 0), fun(b) = boolCon(b == 0))
+    Prims.IntAdd -> arithmetic(L.Add, intAt(args, 0), intAt(args, 1))
+    Prims.IntSub -> arithmetic(L.Sub, intAt(args, 0), intAt(args, 1))
+    Prims.IntMul -> arithmetic(L.Mul, intAt(args, 0), intAt(args, 1))
+    Prims.IntDiv -> arithmetic(L.Div, intAt(args, 0), intAt(args, 1))
+    Prims.IntRem -> arithmetic(L.Rem, intAt(args, 0), intAt(args, 1))
+    Prims.IntAddWrapping -> arithmetic(L.AddWrap, intAt(args, 0), intAt(args, 1))
+    Prims.IntSubWrapping -> arithmetic(L.SubWrap, intAt(args, 0), intAt(args, 1))
+    Prims.IntMulWrapping -> arithmetic(L.MulWrap, intAt(args, 0), intAt(args, 1))
+    Prims.IntAnd -> arithmetic(L.And, intAt(args, 0), intAt(args, 1))
+    Prims.IntOr -> arithmetic(L.Or, intAt(args, 0), intAt(args, 1))
+    Prims.IntXor -> arithmetic(L.Xor, intAt(args, 0), intAt(args, 1))
+    Prims.IntShl -> arithmetic(L.Shl, intAt(args, 0), intAt(args, 1))
+    Prims.IntShr -> arithmetic(L.Shr, intAt(args, 0), intAt(args, 1))
+    -- Negation is subtraction from zero, which overflows for exactly the
+    -- operand `IntNeg` traps on.
+    Prims.IntNeg -> arithmetic(L.Sub, Some(0), intAt(args, 0))
+    Prims.IntNegWrapping -> arithmetic(L.SubWrap, Some(0), intAt(args, 0))
+    Prims.IntNot -> arithmetic(L.Xor, intAt(args, 0), Some(-1))
+    _ -> None
+}
+
+fun relation(o : L.CmpOp, x : Option Int, y : Option Int) -> Option CoreKind =
+    Some(boolCon(Fold.compare(o, x?, y?)))
+
+fun arithmetic(o : L.BinOp, x : Option Int, y : Option Int) -> Option CoreKind =
+    map(Fold.binary(o, x?, y?), intLit)
+
+fun intLit(n : Int) -> CoreKind = CLit(LInt(n))
+
+fun boolCon(b : Bool) -> CoreKind = CCon(if b { P.boolTrue } else { P.boolFalse })
+
+fun intAt(args : Array Core, i : Int) -> Option Int =
+    if let CLit(LInt(n)) = args[i].kind { Some(n) } else { None }
+
+fun charAt(args : Array Core, i : Int) -> Option Int =
+    if let CLit(LChar(c)) = args[i].kind { Some(Char.toInt(c)) } else { None }
+
+-- `True` as 1 and `False` as 0, which is how `Fold.compare` orders them.
+fun boolAt(args : Array Core, i : Int) -> Option Int =
+    if let CCon(name) = args[i].kind {
+        if name == P.boolTrue { Some(1) } else if name == P.boolFalse { Some(0) } else { None }
+    } else {
+        None
+    }
 
 fun fresh(r : Reducer, hint : String) -> String {
     var name = ""

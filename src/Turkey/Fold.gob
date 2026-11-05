@@ -1,0 +1,54 @@
+export (binary, compare, isScalar)
+
+-- `Int` operations evaluated at compile time, exactly as the generated code
+-- evaluates them at run time.
+--
+-- Both constant folders call these -- `Turkey.Opt` on Core and `Turkey.Sccp`
+-- on the low IR -- so the two cannot disagree about what a constant operation
+-- produces or about which ones trap.
+--
+-- **A trap is never folded.** `Add`, `Sub` and `Mul` panic on overflow, and
+-- `Div` and `Rem` at a zero divisor and `Div` at the one quotient that does
+-- not fit. For those operands `binary` returns `None`, and the caller keeps
+-- the operation, so the program panics where and when it always did. Each
+-- check is made before computing, because the compiler's own arithmetic traps
+-- the same way.
+
+import Turkey.LowIr (BinOp(..), CmpOp(..))
+
+-- Returns `o` applied to `x` and `y` as 64-bit two's complement, or `None`
+-- where the machine would panic or where its result depends on the target.
+fun binary(o : BinOp, x : Int, y : Int) -> Option Int = match o {
+    Add -> Int.addChecked(x, y)
+    Sub -> Int.subChecked(x, y)
+    Mul -> Int.mulChecked(x, y)
+    Div -> if y == 0 || (x == Int.minValue() && y == -1) { None } else { Some(x / y) }
+    -- `x % -1` is zero for every `x`, and it is what selection answers for
+    -- `minValue() % -1` rather than computing the quotient that does not fit.
+    Rem -> if y == 0 { None } else if y == -1 { Some(0) } else { Some(x % y) }
+    AddWrap -> Some(Int.addWrapping(x, y))
+    SubWrap -> Some(Int.subWrapping(x, y))
+    MulWrap -> Some(Int.mulWrapping(x, y))
+    And -> Some(x & y)
+    Or -> Some(x | y)
+    Xor -> Some(x ^ y)
+    -- arm64 masks a shift amount to six bits, so only an amount the mask
+    -- leaves alone folds to what the machine computes.
+    Shl -> if y >= 0 && y <= 63 { Some(x << y) } else { None }
+    Shr -> if y >= 0 && y <= 63 { Some(x >> y) } else { None }
+    ShrU -> None
+}
+
+-- Returns the signed comparison `o` of `x` and `y`.
+fun compare(o : CmpOp, x : Int, y : Int) -> Bool = match o {
+    Eq -> x == y
+    Ne -> x != y
+    Lt -> x < y
+    Le -> x <= y
+    Gt -> x > y
+    Ge -> x >= y
+}
+
+-- Returns whether `x` is a Unicode scalar value: a code point that is not a
+-- surrogate, as `Turkey.Select` tests it.
+fun isScalar(x : Int) -> Bool = x >= 0 && x <= 0x10FFFF && !(x >= 0xD800 && x <= 0xDFFF)

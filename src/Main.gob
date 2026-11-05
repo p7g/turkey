@@ -489,7 +489,7 @@ fun slotNames(checked : Checked) -> fun(String, Int) -> String =
 
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
-                                   checked.types, target, build)
+                                   checked.types, target, build, checked.binders)
     let program = Lower.program(lowerer, checked.ordered, checked.owners)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env))
@@ -1266,6 +1266,8 @@ type Checked = Checked {
     warnings    : Vec String,
     -- The modules that came from the shipped library.
     library     : Set.Set String,
+    -- Which binder each binding occurrence and reference means.
+    binders     : Binders.Table,
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
@@ -1274,9 +1276,9 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
-        env = Constraints.childEnv(initialEnv()), types = Typed.newTypeTable(),
+        env = initialEnv(binders), types = Typed.newTypeTable(),
         ordered = Vec.new(32), owners = Map.new(), warnings = Vec.new(4),
-        library = Set.new(),
+        library = Set.new(), binders = binders,
     }
     checked.classes = Classes.newClassTable(checked.decls)
     -- A component of modules is checked in one run: their bindings may use
@@ -1294,7 +1296,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
             Map.put(visibleByFile, m.file, visibleConstructors(m))
         }
         let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
-                                   checked.types)
+                                   checked.types, binders)
         let (items, constraint) = Infer.generate(g, programs)
         -- A constraint with no span has no module to go by, and is held to the
         -- group's first; a group of one module has no other.
@@ -1373,10 +1375,15 @@ fun isEntryType(scheme : Ty.Scheme) -> Bool {
 -- The environment every module is checked in. What a module may *write* is
 -- settled by its scope one stage earlier, so this holds every primitive for
 -- everybody.
-fun initialEnv() -> Constraints.Env {
+fun initialEnv(binders : Binders.Table) -> Constraints.Env {
     let env = Constraints.newEnv()
     for b in Prims.all {
-        Constraints.define(env, Prims.spelling(b),
+        let name = Prims.spelling(b)
+        let id = match Binders.named(binders, name) {
+            Some(id) -> id
+            None -> die("internal error: the primitive '" + name + "' has no binder")
+        }
+        Constraints.define(env, id, name,
             Constraints.Binding { scheme = PrimTypes.spellingScheme(b),
                                   mutable = False })
     }

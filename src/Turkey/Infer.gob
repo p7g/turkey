@@ -10,8 +10,9 @@ export (
 -- substitution for a traversal decision to depend on, because there is no
 -- substitution here at all.
 --
--- What it does keep is everything genuinely syntactic: scopes, but only of names
--- and their mutability, since `cannot assign to 'x'` is a property of the
+-- What it does keep is everything genuinely syntactic: which binder each
+-- occurrence means, which resolution recorded in the binder table, and which
+-- binders may be assigned, since `cannot assign to 'x'` is a property of the
 -- binding form; bottom, which is produced syntactically by `return`, `break` and
 -- `continue` and never discovered by solving; annotation type variables, scoped
 -- to the enclosing function so the `a` in a signature and the `a` in a body
@@ -32,13 +33,14 @@ import Turkey.Ast (Pred as _, ..)
 -- `Pred` below is the semantic predicate; the syntactic one a context is
 -- written as is `Ast.Pred`.
 import Turkey.Ast as Ast
+import Turkey.Binders as Binders
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        MethodInfo(..), MethodImpl(..), InstancePlan(..),
                        Skolems(..))
 import Turkey.Constraints as C
-import Turkey.Constraints (Constraint(..), Binding(..), Env(..), PredCell(..),
-                           LetCell(..))
+import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..),
+                           PredCell(..), LetCell(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
@@ -100,9 +102,11 @@ type Generator = Generator {
     classes     : ClassTable,
     env         : Env,
     frames      : Vec Frame,
-    -- Name -> mutable. Types are the solver's business; this is only what
-    -- generation needs to reject an undefined name or a write to a `let`.
-    scopes        : Vec (Map String Bool),
+    -- Which binder each occurrence means, and what each binder is.
+    binders     : Binders.Table,
+    -- The binders that are function parameters. A parameter may be assigned
+    -- although it is not a `var`.
+    parameters  : Set.Set Int,
     fnStack       : Vec Ty.Type,
     var loopStack : Vec LoopCtx,
     tyvarScopes   : Vec (Map String Ty.Type),
@@ -136,37 +140,18 @@ type Generator = Generator {
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
-                 types : TypeTable) -> Generator {
+                 types : TypeTable, binders : Binders.Table) -> Generator {
     Typed.observe(types, classes)
     Generator {
         decls = decls, types = types, classes = classes,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
-        scopes = [namesOf(builtins)], fnStack = Vec.new(4),
+        binders = binders, parameters = Set.new(), fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
         warnings = Vec.new(4), matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
     }
-}
-
--- Every name an environment holds, with its mutability.
-fun namesOf(env : Env) -> Map String Bool {
-    let out = Map.new()
-    var here = Some(env)
-    var going = True
-    while going {
-        match here {
-            None -> { going = False }
-            Some(e) -> {
-                for (name, b) in Map.entries(e.names) {
-                    if !Map.contains(out, name) { Map.put(out, name, b.mutable) }
-                }
-                here = e.parent
-            }
-        }
-    }
-    out
 }
 
 -- -- building ----------------------------------------------------------------------
@@ -213,23 +198,65 @@ fun join(g : Generator, a : Ty.Type, b : Ty.Type, where : Option Span,
     a
 }
 
--- -- scopes ------------------------------------------------------------------------
+-- -- binders -----------------------------------------------------------------------
 
-fun bound(g : Generator, name : String) -> Bool {
-    for var i = len(g.scopes) - 1; i >= 0; i = i - 1 {
-        if Map.contains(g.scopes[i], name) { return True }
-    }
-    False
-}
-
-fun isMutable(g : Generator, name : String) -> Bool {
-    for var i = len(g.scopes) - 1; i >= 0; i = i - 1 {
-        match Map.get(g.scopes[i], name) {
-            Some(m) -> return m
-            None -> {}
+-- Returns the binder the `EVar` node `e`, spelled `name`, means. Reports the
+-- name as undefined at `where` when resolution found no binder for it.
+fun referent(g : Generator, e : Expr, name : String, where : Span) -> Int =
+    match Map.get(g.binders.refs, e.id) {
+        Some(id) -> id
+        None -> if Map.contains(g.binders.unresolved, e.id) {
+            oops("'" + name + "' is not defined", Some(where))
+        } else {
+            bug("no binder was recorded for '" + name + "'", Some(where))
         }
     }
-    False
+
+-- Returns the binder the binding occurrence `nodeId` binds.
+fun boundAt(g : Generator, nodeId : Int, name : String, where : Span) -> Int =
+    match Map.get(g.binders.refs, nodeId) {
+        Some(id) -> id
+        None -> bug("no binder was recorded for '" + name + "'", Some(where))
+    }
+
+-- Returns each name `bound` maps, with the binder `pats` bind it to and its
+-- type, in `bound`'s order. Each name must be bound once among `pats`.
+fun bindersIn(g : Generator, pats : Vec Pat, where : Span,
+              bound : Map String Ty.Type) -> Vec (Int, String, Ty.Type) {
+    let ids = Map.new()
+    for pat in pats {
+        for v in varPatterns(pat) {
+            if let PVar(name) = v.kind {
+                Map.put(ids, name, boundAt(g, v.id, name, v.span))
+            }
+        }
+    }
+    let out = Vec.new(len(ids))
+    for (name, ty) in Map.entries(bound) {
+        match Map.get(ids, name) {
+            Some(id) -> Vec.push(out, (id, name, ty))
+            None -> bug("'" + name + "' is bound by no pattern here", Some(where))
+        }
+    }
+    out
+}
+
+fun assignable(g : Generator, id : Int) -> Bool =
+    Binders.binderAt(g.binders, id).mutable || Set.contains(g.parameters, id)
+
+-- Raises the type error for an assignment at `where` to the binder `id`,
+-- which cannot be assigned.
+fun notAssignable(g : Generator, id : Int, where : Span) -> Unit {
+    let b = Binders.binderAt(g.binders, id)
+    let prefix = "cannot assign to '" + b.name + "': "
+    if let Binders.Method = b.kind {
+        oops(prefix + "it is a class method", Some(where))
+    } else if Set.contains(g.decls.functions, id) {
+        oops(prefix + "it is a function", Some(where))
+    } else {
+        oops(prefix + "it was bound with 'let'; declare it with 'var' to make "
+             + "it reassignable", Some(where))
+    }
 }
 
 -- Translate an annotation, resolving its type variables in the innermost
@@ -314,8 +341,10 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
         Map.put(byKey, key, items[i])
     }
     let owner = Map.new()
+    let ownerOf = Map.new()
     for var i = 0; i < len(items); i = i + 1 {
         let key = "item" + Int.toString(i)
+        for id in itemBinders(g, items[i]) { Map.put(ownerOf, id, key) }
         for name in Map.getOr(namesFor, key, []) {
             if Map.contains(owner, name) {
                 oops("'" + name + "' is declared more than once",
@@ -338,8 +367,8 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     let graph = Map.new()
     for var i = 0; i < len(items); i = i + 1 {
         let edges = Set.new()
-        for n in Set.elements(itemDeps(items[i])) {
-            match Map.get(owner, n) {
+        for id in Set.elements(Deps.references(g.binders, items[i])) {
+            match Map.get(ownerOf, id) {
                 Some(key) -> Set.add(edges, key)
                 None -> {}
             }
@@ -381,11 +410,17 @@ fun itemNames(item : Stmt) -> Vec String = match item.kind {
     _ -> []
 }
 
-fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
-    SFun(d) -> Deps.freeNamesOfFun(d, Set.new())
-    SLet(_, value) -> Deps.freeNames(value, Set.new())
-    SVar(_, value) -> Deps.freeNames(value, Set.new())
-    _ -> Set.new()
+-- Returns the binders a top-level item binds.
+fun itemBinders(g : Generator, item : Stmt) -> Vec Int = match item.kind {
+    SFun(d) -> [boundAt(g, d.id, d.name, d.span)]
+    SLet(pat, _) | SVar(pat, _) -> {
+        let out = Vec.new(2)
+        for v in varPatterns(pat) {
+            if let PVar(name) = v.kind { Vec.push(out, boundAt(g, v.id, name, v.span)) }
+        }
+        out
+    }
+    _ -> []
 }
 
 fun checkGroupRecursion(group : Vec Stmt, boundNames : Vec String,
@@ -438,15 +473,11 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
             name = d.name, symbol = d.symbol, params = params, fixed = d.fixed,
             ret = ret, span = Some(d.span),
         })
-        C.define(g.env, d.name, Binding {
+        let id = boundAt(g, d.id, d.name, d.span)
+        Set.add(g.decls.functions, id)
+        C.define(g.env, id, d.name, Binding {
             scheme = Ty.mono(TFun(params, ret)), mutable = False,
         })
-        -- And into scope, not only into the environment. `bound` is what
-        -- decides whether a mention resolves and it reads the scopes;
-        -- `bindMethods` does the same pair of writes for the same reason.
-        -- Without this a module that calls its *own* declaration is told the
-        -- name is not defined, while every other module sees it.
-        Map.put(g.scopes[0], d.name, False)
     }
 }
 
@@ -554,7 +585,7 @@ fun bindMethods(g : Generator) -> Unit {
     for (_, info) in Map.entries(g.classes.classes) {
         for (_, m) in Map.entries(info.methods) {
             let alreadyOwned = Map.contains(g.classes.owner, m.name)
-            if bound(g, m.name) {
+            if Option.isSome(C.lookup_(g.env, m.name)) {
                 -- Already bound by an earlier module: a class method is global
                 -- and unqualified, so every module sees the same one. Binding it
                 -- again is a no-op, not a collision.
@@ -564,8 +595,15 @@ fun bindMethods(g : Generator) -> Unit {
                          Some(m.decl.span))
                 }
             } else {
-                C.define(g.env, m.name, Binding { scheme = m.scheme, mutable = False })
-                Map.put(g.scopes[0], m.name, False)
+                let id = match (Binders.named(g.binders, m.name), info.span) {
+                    (Some(id), _) -> id
+                    -- A generated class has no declaration, so its methods
+                    -- have no binders.
+                    (None, None) -> C.noBinder
+                    (None, Some(_)) -> bug("the class method '" + m.name
+                                           + "' has no binder", Some(m.decl.span))
+                }
+                C.define(g.env, id, m.name, Binding { scheme = m.scheme, mutable = False })
             }
         }
     }
@@ -706,7 +744,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     -- body raised is settled here, against the assumptions, instead of escaping
     -- to the end of the program.
     emit(g, CAssume(givens, CLet(LetCell {
-        binds = [("%" + what + "." + m.name, expected)], defn = defn,
+        binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
         dicts = None, skolems = sk.made, rigid = [],
     })))
@@ -864,7 +902,7 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
        "the declared type of '" + decl.name + "'")
     let defn = pop(g)
     CAssume(givens, CLet(LetCell {
-        binds = [("%sig." + decl.name, expected)], defn = defn,
+        binds = [(C.noBinder, "%sig." + decl.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
         dicts = None, skolems = sk.made, rigid = [],
     }))
@@ -976,40 +1014,36 @@ fun discardsLast(g : Generator, body : Expr) -> Unit = match body.kind {
 -- `let` is not always "the remaining statements" -- a C-style `for`'s
 -- initializer scopes over the condition and step too.
 fun bindGroup(g : Generator, group : Vec Stmt, rest : fun() -> a) -> a {
-    let (scope, binder) = groupBinder(g, group)
-    Vec.push(g.scopes, scope)
+    let binder = groupBinder(g, group)
     push(g)
     let out = rest()
     let body = pop(g)
-    discard(Vec.pop(g.scopes))
     emit(g, binder(body, False))
     out
 }
 
--- Generate a top-level binding group. Its names join the module's own scope,
--- where every group generated after it sees them, and its binder scopes over
--- nothing: the solver keeps a top-level binder's names past its end.
+-- Generate a top-level binding group. Its binder scopes over nothing: the
+-- solver keeps a top-level binder's binding past its end, where every group
+-- generated after it sees it.
 fun bindTopGroup(g : Generator, group : Vec Stmt) -> Unit {
-    let (scope, binder) = groupBinder(g, group)
-    for (name, mutable) in Map.entries(scope) { Map.put(g.scopes[0], name, mutable) }
+    let binder = groupBinder(g, group)
     emit(g, binder(CAnd([]), True))
 }
 
--- Generate a group's definition. Answers the names it binds, each with whether
--- it may be assigned, and the binder that scopes them over a body -- the only
--- place a binder is built, so the only place that has to get its shape right.
-fun groupBinder(g : Generator, group : Vec Stmt)
-        -> (Map String Bool, fun(Constraint, Bool) -> Constraint) {
-    let (binds, defn, generalizes, mutable, sigs) = buildDefinition(g, group)
+-- Generate a group's definition. Answers the binder that scopes what it binds
+-- over a body -- the only place a binder is built, so the only place that has
+-- to get its shape right.
+fun groupBinder(g : Generator, group : Vec Stmt) -> fun(Constraint, Bool) -> Constraint {
+    let (binds, defn, generalizes, sigs) = buildDefinition(g, group)
     -- What each `fun` in the group was bound at. A generalizing group's schemes
     -- are recorded by the solver, which is the only place they exist; this covers
     -- the group that does not generalize, whose names are monomorphic.
     let boundTypes = Map.new()
-    for (n, t) in binds { Map.put(boundTypes, n, t) }
-    for (n, s) in sigs { Map.put(boundTypes, n, s.body) }
+    for (id, _, t) in binds { Map.put(boundTypes, id, t) }
+    for (id, _, s) in sigs { Map.put(boundTypes, id, s.body) }
     for item in group {
         match item.kind {
-            SFun(d) -> match Map.get(boundTypes, d.name) {
+            SFun(d) -> match Map.get(boundTypes, boundAt(g, d.id, d.name, d.span)) {
                 Some(t) -> Typed.recordDecl(g.types, d.id, t)
                 None -> {}
             }
@@ -1017,15 +1051,11 @@ fun groupBinder(g : Generator, group : Vec Stmt)
         }
     }
 
-    let scope = Map.new()
-    for (n, _) in binds { Map.put(scope, n, mutable) }
-    for (n, _) in sigs { Map.put(scope, n, False) }
-    (scope, fun(body, top) = binderOf(g, group, binds, defn, generalizes, sigs,
-                                      body, top))
+    fun(body, top) = binderOf(g, group, binds, defn, generalizes, sigs, body, top)
 }
 
-fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (String, Ty.Type),
-             defn : Constraint, generalizes : Bool, sigs : Vec (String, Scheme),
+fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type),
+             defn : Constraint, generalizes : Bool, sigs : Vec (Int, String, Scheme),
              body : Constraint, top : Bool) -> Constraint {
     var node = CAnd([])
     if len(binds) == 0 {
@@ -1038,11 +1068,11 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (String, Ty.Type),
         -- it in when it decides what the schemes retain. A member with a
         -- signature is not in the group's binds and got its own abstraction.
         let dicts = newAbstraction()
-        let names = Set.new()
-        for (n, _) in binds { Set.add(names, n) }
+        let ids = Set.new()
+        for (id, _, _) in binds { Set.add(ids, id) }
         for item in group {
             match item.kind {
-                SFun(d) -> if Set.contains(names, d.name) {
+                SFun(d) -> if Set.contains(ids, boundAt(g, d.id, d.name, d.span)) {
                     Map.put(g.types.abstractions, d.id, dicts)
                 }
                 _ -> Map.put(g.types.abstractions, item.id, dicts)
@@ -1078,10 +1108,10 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (String, Ty.Type),
     node
 }
 
--- The bound names, the definition's constraint, and how it binds.
+-- The binders a group binds, the definition's constraint, whether it
+-- generalizes, and the binders whose signatures state their schemes.
 fun buildDefinition(g : Generator, group : Vec Stmt)
-        -> (Vec (String, Ty.Type), Constraint, Bool, Bool,
-            Vec (String, Scheme)) {
+        -> (Vec (Int, String, Ty.Type), Constraint, Bool, Vec (Int, String, Scheme)) {
     var allFuns = True
     for item in group {
         match item.kind {
@@ -1106,31 +1136,29 @@ fun buildDefinition(g : Generator, group : Vec Stmt)
         for d in decls {
             if d.monomorphic { mono = True }
         }
-        return (binds, defn, !mono, False, sigs)
+        return (binds, defn, !mono, sigs)
     }
     let stmt = group[0]
     match stmt.kind {
-        SLet(pat, value) -> letDefinition(g, stmt, pat, value, False)
-        SVar(pat, value) -> letDefinition(g, stmt, pat, value, True)
+        SLet(pat, value) -> letDefinition(g, pat, value, False)
+        SVar(pat, value) -> letDefinition(g, pat, value, True)
         _ -> bug("only functions may share a binding group", Some(stmt.span))
     }
 }
 
-fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
-                  isVar : Bool) -> (Vec (String, Ty.Type), Constraint, Bool,
-                                    Bool, Vec (String, Scheme)) {
+fun letDefinition(g : Generator, pat : Pat, value : Expr, isVar : Bool)
+        -> (Vec (Int, String, Ty.Type), Constraint, Bool, Vec (Int, String, Scheme)) {
     push(g)
     let t = genExpr(g, value)
     Vec.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
     Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'"))
-    let binds = Vec.new(4)
-    for (n, ty) in Map.entries(bound) { Vec.push(binds, (n, ty)) }
+    let binds = bindersIn(g, [pat], pat.span, bound)
     let defn = pop(g)
     -- Only a `let` bound to a syntactic value generalizes.
     let generalizes = !isVar && isNonexpansive(g, value)
-    (binds, defn, generalizes, isVar, [])
+    (binds, defn, generalizes, [])
 }
 
 -- One strongly-connected group at a time.
@@ -1142,15 +1170,16 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
 -- with a signature is bound to that signature by the `CBind` wrapped around the
 -- whole group, so a recursive use of it instantiates instead.
 fun buildFunGroup(g : Generator, decls : Vec FunDecl)
-        -> (Vec (String, Ty.Type), Constraint, Vec (String, Scheme)) {
+        -> (Vec (Int, String, Ty.Type), Constraint, Vec (Int, String, Scheme)) {
     let sigs = Vec.new(4)
     let checks = Vec.new(4)
     let inferred = Vec.new(4)
     for decl in decls {
+        Set.add(g.decls.functions, boundAt(g, decl.id, decl.name, decl.span))
         match declaredScheme(g, decl) {
             None -> Vec.push(inferred, decl)
             Some((s, tyvars)) -> {
-                Vec.push(sigs, (decl.name, s))
+                Vec.push(sigs, (boundAt(g, decl.id, decl.name, decl.span), decl.name, s))
                 Vec.push(checks, (decl, s, tyvars))
             }
         }
@@ -1158,25 +1187,22 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
 
     push(g)
     let binds = Vec.new(len(inferred))
-    for decl in inferred { Vec.push(binds, (decl.name, fresh(g))) }
-    let scope = Map.new()
-    for (n, _) in binds { Map.put(scope, n, False) }
-    for (n, _) in sigs { Map.put(scope, n, False) }
-    Vec.push(g.scopes, scope)
+    for decl in inferred {
+        Vec.push(binds, (boundAt(g, decl.id, decl.name, decl.span), decl.name, fresh(g)))
+    }
     push(g)
     for (decl, s, tyvars) in checks {
         emit(g, checkSignature(g, decl, s, tyvars))
     }
     for var i = 0; i < len(inferred); i = i + 1 {
         let decl = inferred[i]
-        let (_, placeholder) = binds[i]
+        let (_, _, placeholder) = binds[i]
         eq(g, placeholder,
            genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                        decl.context, None, decl.id),
            Some(decl.span), "the definition of '" + Ty.shortName(decl.name) + "'")
     }
     let inner = pop(g)
-    discard(Vec.pop(g.scopes))
     emit(g, CDef(binds, inner, False))
     (binds, pop(g), sigs)
 }
@@ -1255,9 +1281,8 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     -- restriction that makes a `var` binding special has nothing to say about
     -- them; reassigning one rebinds this local slot and does not write through
     -- to the caller.
-    let paramScope = Map.new()
-    for (n, _) in Map.entries(binds) { Map.put(paramScope, n, True) }
-    Vec.push(g.scopes, paramScope)
+    let bindList = bindersIn(g, params, where, binds)
+    for (id, _, _) in bindList { Set.add(g.parameters, id) }
     push(g)
     Vec.push(g.fnStack, ret)
     -- `break` cannot cross a function.
@@ -1272,10 +1297,7 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     -- A body of type bottom leaves `ret` to be fixed by the `return`s.
     eq(g, ret, bodyType, Some(where), "the function body")
     let inner = pop(g)
-    discard(Vec.pop(g.scopes))
 
-    let bindList = Vec.new(4)
-    for (n, t) in Map.entries(binds) { Vec.push(bindList, (n, t)) }
     -- A parameter that opened an existential scopes its rigid constants over
     -- the body and its `return`s; `ret` was made outside, so neither can hand
     -- one back.
@@ -1457,14 +1479,9 @@ fun genStmt(g : Generator, stmt : Stmt) -> Ty.Type = match stmt.kind {
 fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit =
     match target.kind {
         EVar(name, _) -> {
-            if !bound(g, name) {
-                oops("'" + name + "' is not defined", Some(where))
-            }
-            if !isMutable(g, name) {
-                oops("cannot assign to '" + name + "': it was bound with 'let'; "
-                     + "declare it with 'var' to make it reassignable", Some(where))
-            }
-            eq(g, use(g, name, Some(where), None), genExpr(g, value), Some(where),
+            let id = referent(g, target, name, where)
+            if !assignable(g, id) { notAssignable(g, id, where) }
+            eq(g, use(g, name, id, Some(where), None), genExpr(g, value), Some(where),
                "the assignment to '" + name + "'")
         }
         EField(_, _) -> {
@@ -1510,18 +1527,18 @@ fun genExpr(g : Generator, e : Expr) -> Ty.Type {
 -- What that is cannot be known here -- it depends on what the solver decides the
 -- name's predicates are about -- which is why the site is marked rather than
 -- resolved.
-fun use(g : Generator, name : String, where : Option Span,
+fun use(g : Generator, name : String, id : Int, where : Option Span,
         node : Option Expr) -> Ty.Type {
     let t = fresh(g)
     let marker = match node {
         Some(n) -> {
-            let u = newUse(name, where, None)
+            let u = newUse(name, Some(id), where, None)
             Map.put(g.types.uses, n.id, u)
             Some(u)
         }
         None -> None
     }
-    emit(g, CInstance(name, t, where, marker, None))
+    emit(g, CInstance(name, t, where, marker, OfBinder(id)))
     t
 }
 
@@ -1571,12 +1588,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         else { literalType(kind) }
     }
     EUnit -> Ty.tUnit()
-    EVar(name, _) -> {
-        if !bound(g, name) {
-            oops("'" + name + "' is not defined", Some(e.span))
-        }
-        use(g, name, Some(e.span), Some(e))
-    }
+    EVar(name, _) -> use(g, name, referent(g, e, name, e.span), Some(e.span), Some(e))
     ECon(name) -> match conType(g, e, name) {
         -- A nullary constructor is a value; anything else is a function.
         TFun(params, ret) -> if len(params) == 0 { ret } else { TFun(params, ret) }
@@ -1769,9 +1781,9 @@ fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
     }
     let params = Array.init(info.arity, fun(_) = fresh(g))
     let con = TFun(params, fresh(g))
-    let u = newUse(name, Some(e.span), None)
+    let u = newUse(name, None, Some(e.span), None)
     Map.put(g.types.uses, e.id, u)
-    emit(g, CInstance(name, con, Some(e.span), Some(u), Some(info.scheme)))
+    emit(g, CInstance(name, con, Some(e.span), Some(u), OfScheme(info.scheme)))
     con
 }
 
@@ -1840,7 +1852,7 @@ fun openedConstraint(openings : Vec (Array (String, Pred), Vec ConCell),
         for s in made { Vec.push(skolems, s) }
     }
     CAssume(givens, CLet(LetCell {
-        binds = [("%opened", Ty.tUnit())], defn = inner,
+        binds = [(C.noBinder, "%opened", Ty.tUnit())], defn = inner,
         body = CAnd([]), span = where, topLevel = False,
         dicts = None, skolems = skolems, rigid = [],
     }))
@@ -1940,7 +1952,7 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             let receiver = genExpr(g, obj)
             let cls = Classes.fieldClass(name)
             discard(Classes.ensureGenerated(g.classes, cls))
-            let u = newUse(cls, Some(e.span), None)
+            let u = newUse(cls, None, Some(e.span), None)
             let reads = Ty.pred(cls, [receiver])
             Vec.push(u.preds, reads)
             emit(g, C.cpredOf(reads, Some(e.span),
@@ -2017,9 +2029,6 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     discard(Vec.pop(g.openings))
     Vec.push(g.binderSites, (pat, element,
         "name the element and 'match' on it in the loop body"))
-    let scope = Map.new()
-    for (n, _) in Map.entries(binds) { Map.put(scope, n, False) }
-    Vec.push(g.scopes, scope)
     push(g)
     Vec.push(g.loopStack, LoopCtx {
         kind = "for", result = Ty.tUnit(),
@@ -2028,10 +2037,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     discardsLast(g, body)
     discard(Vec.pop(g.loopStack))
     let inner = pop(g)
-    discard(Vec.pop(g.scopes))
-    let bindList = Vec.new(4)
-    for (n, t) in Map.entries(binds) { Vec.push(bindList, (n, t)) }
-    emit(g, CDef(bindList, inner, False))
+    emit(g, CDef(bindersIn(g, [pat], pat.span, binds), inner, False))
     Ty.tUnit()
 }
 
@@ -2048,9 +2054,6 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
             oops("an arm with alternatives cannot match an existential "
                  + "constructor; give it an arm of its own", Some(arm.span))
         }
-        let scope = Map.new()
-        for (n, _) in Map.entries(bindings) { Map.put(scope, n, False) }
-        Vec.push(g.scopes, scope)
         -- The arm's value is joined with the others *inside* the rank its
         -- patterns opened, so a type it hides cannot leave through it: the
         -- variable standing for the result is made out here, older than the
@@ -2071,10 +2074,10 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
             None -> {}
         }
         let armC = pop(g)
-        discard(Vec.pop(g.scopes))
-        let bindList = Vec.new(4)
-        for (n, t) in Map.entries(bindings) { Vec.push(bindList, (n, t)) }
-        let defined = CDef(bindList, armC, False)
+        -- The alternatives bind one set of binders between them, so the
+        -- first's are all of them.
+        let defined = CDef(bindersIn(g, [arm.patterns[0]], arm.span, bindings), armC,
+                           False)
         if len(openings) > 0 {
             emit(g, openedConstraint(openings, defined, Some(arm.span)))
         } else {
@@ -2110,14 +2113,14 @@ fun alternatives(g : Generator, patterns : Vec Pat, ty : Ty.Type) -> Map String 
     bindings
 }
 
--- Generates an arm's guards, in order, and returns what each `let` guard
--- binds. A test is a `Bool`. A `let` guard opens a scope for what its patterns
--- bind, which stays open for the guards after it and the arm's body;
--- `closeGuards` closes them, given what this returns.
+-- Generates an arm's guards, in order, and returns the binders each `let`
+-- guard binds, with their types. A test is a `Bool`. A `let` guard's binders
+-- are in scope for the guards after it and the arm's body; `closeGuards`
+-- binds them around those, given what this returns.
 --
 -- Refuse an existential in a `let` guard: its rigid constants would have to
 -- scope over the guards after it and the body, inside the arm's own rank.
-fun guards(g : Generator, gs : Vec Guard) -> Vec (Map String Ty.Type) {
+fun guards(g : Generator, gs : Vec Guard) -> Vec (Vec (Int, String, Ty.Type)) {
     let opened = []
     for guard in gs {
         match guard {
@@ -2128,25 +2131,21 @@ fun guards(g : Generator, gs : Vec Guard) -> Vec (Map String Ty.Type) {
                 Vec.push(g.openings, None)
                 let bindings = alternatives(g, patterns, ty)
                 discard(Vec.pop(g.openings))
-                let scope = Map.new()
-                for (n, _) in Map.entries(bindings) { Map.put(scope, n, False) }
-                Vec.push(g.scopes, scope)
                 push(g)
-                Vec.push(opened, bindings)
+                -- The alternatives bind one set of binders between them, so
+                -- the first's are all of them.
+                Vec.push(opened, bindersIn(g, [patterns[0]], value.span, bindings))
             }
         }
     }
     opened
 }
 
--- Closes the scopes `guards` opened, innermost first, binding what each bound.
-fun closeGuards(g : Generator, opened : Vec (Map String Ty.Type)) -> Unit {
+-- Closes the frames `guards` opened, innermost first, binding what each bound.
+fun closeGuards(g : Generator, opened : Vec (Vec (Int, String, Ty.Type))) -> Unit {
     for var i = len(opened) - 1; i >= 0; i = i - 1 {
         let inner = pop(g)
-        discard(Vec.pop(g.scopes))
-        let bindList = Vec.new(4)
-        for (n, t) in Map.entries(opened[i]) { Vec.push(bindList, (n, t)) }
-        emit(g, CDef(bindList, inner, False))
+        emit(g, CDef(opened[i], inner, False))
     }
 }
 

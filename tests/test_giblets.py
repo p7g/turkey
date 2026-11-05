@@ -360,6 +360,27 @@ def test_an_instance_method_is_giblet_code(lowered):
                      r"\([^)]*Probe_giblet_\w+\.gob:13:\d+\)", stderr), stderr
 
 
+CLOSURE = "let h : fun(Int) -> Int = fun(x : Int) -> Int = len([x, x])\n"
+
+
+def test_a_top_level_closure_is_giblet_code(lowered, tmp_path):
+    """A function a top-level `let` holds belongs to the module that declares
+    the `let`, so an allocating one in a giblet module is refused, and the
+    same one in an ordinary module compiles."""
+    code, _, stderr = lowered(
+        CLOSURE + "fun f(n : Int) -> Int = n\n",
+        "fun h(n : Int) -> Int = n\n",
+        giblet_exports="f, h",
+        main="print(Int.toString(P.f(3) + P.h(1) + P.h(2)))")
+    assert code != 0
+    assert re.search(r"giblets: 'h' in a giblet module builds an array "
+                     r"\([^)]*Probe_giblet_\w+\.gob:4:\d+\)", stderr), stderr
+    entry = tmp_path / "main.gob"
+    entry.write_text(CLOSURE + "fun main() { print(Int.toString(h(1) + h(2))) }\n",
+                     encoding="utf-8")
+    assert verdict(entry, "", "ssa") == ""
+
+
 def test_a_stack_switch_is_refused(lowered):
     """A giblet may run while the heap is half marked, and another stack's
     code may allocate: a switch in one would let it."""

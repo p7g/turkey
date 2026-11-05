@@ -110,7 +110,6 @@ type Generator = Generator {
     fnStack       : Vec Ty.Type,
     var loopStack : Vec LoopCtx,
     tyvarScopes   : Vec (Map String Ty.Type),
-    warnings      : Vec String,
     -- Exhaustiveness runs after solving, when scrutinee types are known.
     matchSites  : Vec (Expr, Ty.Type),
     -- And irrefutability: every pattern that binds with no second arm to fall
@@ -147,7 +146,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
         binders = binders, parameters = Set.new(), fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
-        warnings = Vec.new(4), matchSites = Vec.new(8),
+        matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
@@ -962,10 +961,9 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
-    for at in Vec.sortByKey(unreachable, fun(sp) = (sp.file, (sp.line, sp.col))) {
-        Vec.push(g.warnings, Diag.render(Diag.at("warning",
-            "this statement is unreachable, since the one before it cannot "
-            + "complete; remove it", at), ""))
+    for at in unreachable {
+        Diag.report(Diag.warningAt("this statement is unreachable, since the one "
+                                   + "before it cannot complete; remove it", at))
     }
     -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
@@ -1055,8 +1053,11 @@ fun groupBinder(g : Generator, group : Vec Stmt) -> fun(Constraint, Bool) -> Con
 }
 
 fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type),
-             defn : Constraint, generalizes : Bool, sigs : Vec (Int, String, Scheme),
+             written : Constraint, generalizes : Bool, sigs : Vec (Int, String, Scheme),
              body : Constraint, top : Bool) -> Constraint {
+    -- A top-level group is a unit of diagnostics: one wrong expression in it
+    -- is reported once, not once for each use that disagrees with it.
+    let defn = if top { CUnit(written) } else { written }
     var node = CAnd([])
     if len(binds) == 0 {
         -- Every member states its own type, so there is nothing left to

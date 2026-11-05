@@ -124,6 +124,10 @@ type Constraint
     -- predicates carry the verb a diagnostic needs, and a use emitted through
     -- `CInstance` would re-emit them as reads.
     | CUse(Use)
+    -- Solve the body as one unit of diagnostics (`Diag.beginUnit`): after its
+    -- first error, the rest of what it reports is dropped. The generator puts
+    -- one around each top-level binding group's definition.
+    | CUnit(Constraint)
 
 -- A deferred predicate keeps its identity across rounds, and `improve` rewrites
 -- its arguments where it stands, so it is a record rather than a variant field.
@@ -368,6 +372,9 @@ fun isFam(t : Ty.Type) -> Bool = match t {
 fun run(s : Solver, c : Constraint) -> Unit {
     solve(s, c)
     settle(s)
+    -- What is left open after an error is most often open because of it, so
+    -- defaulting it would only guess, and `rejectStranded` reports nothing.
+    if Diag.hasErrors() { return }
     -- The outermost boundary: nothing further can narrow what is left, so
     -- anything still open that has a default takes it, and the rest is an error.
     --
@@ -429,6 +436,11 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     CUse(u) -> {
         u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
         Vec.push(s.uses, u)
+    }
+    CUnit(body) -> {
+        Diag.beginUnit()
+        solve(s, body)
+        discard(Diag.endUnit())
     }
 }
 
@@ -503,7 +515,14 @@ fun solveLet(s : Solver, c : LetCell) -> Unit {
     for con in c.skolems { con.level = Ty.noScope }
 }
 
+-- A top-level binding group is a unit (`Diag.beginUnit`), its generalization
+-- included. Its definition is a `CUnit` of its own, which nests inside this
+-- one. When the unit reports an error, its binders are bound to bottom rather
+-- than to the scheme its half-solved types would generalize to, so that a
+-- later group using one absorbs the use instead of reporting the same error
+-- again against it. Bottom unifies with anything and binds nothing.
 fun letBody(s : Solver, c : LetCell) -> Unit {
+    if c.topLevel { Diag.beginUnit() }
     let scope = newScope()
     Vec.push(s.scopes, scope)
     let firstUse = len(s.uses)
@@ -594,6 +613,11 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
             None -> {}
         }
         bindFor(s, id, name, b, c.topLevel)
+    }
+    if c.topLevel && Diag.endUnit() {
+        for (id, name, _) in c.binds {
+            bindFor(s, id, name, Binding { scheme = Ty.mono(TBottom), mutable = False }, True)
+        }
     }
     solve(s, c.body)
     if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
@@ -1246,6 +1270,9 @@ fun retained(s : Solver, level : Int) -> Vec PredCell {
 -- Report a predicate that can be neither discharged nor quantified.
 fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
     if len(stranded) == 0 { return {} }
+    -- A predicate left open after an error is most often open because of it:
+    -- the error left a variable unbound that would have decided it.
+    if Diag.hasErrors() { return {} }
     let c = stranded[0]
     if c.pred.name == Ty.equals {
         -- An equality that reaches here is not wrong, it is undecidable, and the

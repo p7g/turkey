@@ -1,199 +1,39 @@
-export (freeNames, freeNamesOfFun, sccs, components)
+export (references, sccs, components)
 
--- Free-variable and dependency analysis over trees (`turkey/deps.py`).
+-- Dependency analysis over trees.
 --
--- Two entry points: the names a subtree references but does not bind, and
--- Tarjan's strongly-connected components emitted dependencies-first. Between
--- them they decide what a binding group is, which is what generalization is
--- quantified over.
---
--- `patternVars` lives in `Turkey.Ast`, being a structural question about the
--- tree that three stages ask.
+-- Two entry points: the binders a statement references, and Tarjan's
+-- strongly-connected components emitted dependencies-first. Between them they
+-- decide what a binding group is, which is what generalization is quantified
+-- over.
 
 import Data.Set as Set
 import Turkey.Ast (..)
-import Turkey.Diag as Diag
+import Turkey.Binders as Binders
 
--- -- free names ---------------------------------------------------------------------
+-- -- references ---------------------------------------------------------------------
 
--- The unbound names an expression references. A constructor counts: a binding
--- that mentions one depends on nothing at the value level, but the walk cannot
--- tell the two apart and the caller filters by what it actually bound.
-fun freeNames(e : Expr, bound : Set.Set String) -> Set.Set String {
+-- Returns the ids of the binders `s` references, as the side table `t`
+-- records them: every `EVar` and every method reference resolution wrote.
+-- A binder `s` binds and also references is included, which is how a caller
+-- tells a recursive definition. A binder bound inside `s` may be included
+-- too: its id names no binder outside `s`, so a caller that looks ids up
+-- among the binders it cares about needs no scoping to discard it. An `EVar`
+-- left for inference to report has no id and is skipped.
+fun references(t : Binders.Table, s : Stmt) -> Set.Set Int {
     let out = Set.new()
-    exprFree(e, bound, out)
+    for child in children(ChStmt(s)) { collect(t, child, out) }
     out
 }
 
--- A function's body, with its parameters bound. The function's own name is
--- deliberately *not* bound here; the caller decides whether it is recursive.
-fun freeNamesOfFun(d : FunDecl, bound : Set.Set String) -> Set.Set String {
-    let inner = extend(bound, paramVars(d.params))
-    let out = Set.new()
-    match declBody(d) {
-        Some(b) -> exprFree(b, inner, out)
-        None -> {}
-    }
-    out
-}
-
-fun exprFree(e : Expr, bound : Set.Set String, out : Set.Set String) -> Unit =
-    match e.kind {
-        ELit(_) -> {}
-        EUnit -> {}
-        EContinue -> {}
-        EVar(name, _) -> if !Set.contains(bound, name) { Set.add(out, name) }
-        ECon(name) -> if !Set.contains(bound, name) { Set.add(out, name) }
-        ETuple(elems) -> for x in elems { exprFree(x, bound, out) }
-        EArray(elems) -> for x in elems { exprFree(x, bound, out) }
-        EField(obj, _) -> exprFree(obj, bound, out)
-        EProject(obj, _) -> exprFree(obj, bound, out)
-        ERecord(con, fields) -> {
-            if !Set.contains(bound, con) { Set.add(out, con) }
-            for (_, value) in fields { exprFree(value, bound, out) }
+fun collect(t : Binders.Table, c : Child, out : Set.Set Int) -> Unit {
+    if let ChExpr(e) = c {
+        if let EVar(_, _) = e.kind {
+            if let Some(id) = Map.get(t.refs, e.id) { Set.add(out, id) }
         }
-        ECall(fn, args) -> {
-            exprFree(fn, bound, out)
-            for a in args { exprFree(a, bound, out) }
-        }
-        EIndex(arr, index, _, _) -> {
-            exprFree(arr, bound, out)
-            exprFree(index, bound, out)
-        }
-        EUnary(_, operand, _) -> exprFree(operand, bound, out)
-        -- The method counts, since a declared operator's is the function it
-        -- calls. A built-in operator's is a class method, which no binding
-        -- depends on, so counting it changes nothing.
-        EBinary(_, left, right, fn) -> {
-            optFree(fn, bound, out)
-            exprFree(left, bound, out)
-            exprFree(right, bound, out)
-        }
-        EAnnot(inner, _) -> exprFree(inner, bound, out)
-        EIf(cond, then, otherwise) -> {
-            exprFree(cond, bound, out)
-            exprFree(then, bound, out)
-            match otherwise {
-                Some(o) -> exprFree(o, bound, out)
-                None -> {}
-            }
-        }
-        EWhile(cond, body) -> {
-            exprFree(cond, bound, out)
-            exprFree(body, bound, out)
-        }
-        ELoop(body) -> exprFree(body, bound, out)
-        EReturn(value) -> optFree(value, bound, out)
-        EBreak(value) -> optFree(value, bound, out)
-        ELambda(params, _, body) ->
-            exprFree(body, extend(bound, paramVars(params)), out)
-        EMatch(scrutinee, arms) -> {
-            exprFree(scrutinee, bound, out)
-            for Arm { span = _, patterns, guards, body } in arms {
-                let inner = Set.new()
-                for n in Set.elements(bound) { Set.add(inner, n) }
-                for p in patterns {
-                    for v in patternVars(p) { Set.add(inner, v) }
-                }
-                for g in guards {
-                    exprFree(guardExpr(g), inner, out)
-                    if let GLet(alts, _) = g {
-                        for p in alts {
-                            for v in patternVars(p) { Set.add(inner, v) }
-                        }
-                    }
-                }
-                exprFree(body, inner, out)
-            }
-        }
-        EForIn(pat, iterable, body, _, _) -> {
-            exprFree(iterable, bound, out)
-            exprFree(body, extend(bound, patternVars(pat)), out)
-        }
-        -- init, cond, step and body share one scope; only init introduces
-        -- bindings the rest can see.
-        EForC(init, cond, step, body) -> {
-            let current = Set.new()
-            for n in Set.elements(bound) { Set.add(current, n) }
-            match init {
-                Some(s) -> for n in stmtFree(s, current, out) { Set.add(current, n) }
-                None -> {}
-            }
-            exprFree(cond, current, out)
-            match step {
-                Some(s) -> discard(stmtFree(s, current, out))
-                None -> {}
-            }
-            exprFree(body, current, out)
-        }
-        EBlock(stmts) -> blockFree(stmts, bound, out)
-        -- Neither survives desugaring, and nothing calls this before it runs.
-        EQuestion(inner, _) -> exprFree(inner, bound, out)
-        EDo(body) -> exprFree(body, bound, out)
-        -- Resolution groups every chain, and nothing calls this before it runs.
-        EChain(operands, _) -> for x in operands { exprFree(x, bound, out) }
+        for ref in Binders.methodRefs(e) { collect(t, ChExpr(ref), out) }
     }
-
-fun optFree(e : Option Expr, bound : Set.Set String, out : Set.Set String) -> Unit =
-    match e {
-        Some(x) -> exprFree(x, bound, out)
-        None -> {}
-    }
-
--- Walk a statement list left to right; each binding is in scope for every
--- statement after it.
-fun blockFree(stmts : Vec Stmt, bound : Set.Set String,
-              out : Set.Set String) -> Unit {
-    let current = Set.new()
-    for n in Set.elements(bound) { Set.add(current, n) }
-    for s in stmts {
-        for n in stmtFree(s, current, out) { Set.add(current, n) }
-    }
-}
-
--- Adds one statement's free names to `out`, and answers what it newly binds.
-fun stmtFree(s : Stmt, bound : Set.Set String,
-             out : Set.Set String) -> Vec String = match s.kind {
-    SLet(pat, value) -> {
-        exprFree(value, bound, out)
-        patternVars(pat)
-    }
-    SVar(pat, value) -> {
-        exprFree(value, bound, out)
-        patternVars(pat)
-    }
-    SFun(d) -> {
-        -- A local function's own name is in scope for its body, so it may
-        -- recurse, and for later statements.
-        let inner = extend(bound, [d.name])
-        for n in Set.elements(freeNamesOfFun(d, inner)) { Set.add(out, n) }
-        [d.name]
-    }
-    -- `x = e` still references `x`, so the target is walked too.
-    SAssign(target, value) -> {
-        exprFree(target, bound, out)
-        exprFree(value, bound, out)
-        []
-    }
-    SExpr(e) -> {
-        exprFree(e, bound, out)
-        []
-    }
-}
-
-fun paramVars(params : Vec Pat) -> Vec String {
-    let out = Vec.new(4)
-    for p in params {
-        for v in patternVars(p) { Vec.push(out, v) }
-    }
-    out
-}
-
-fun extend(bound : Set.Set String, names : Vec String) -> Set.Set String {
-    let out = Set.new()
-    for n in Set.elements(bound) { Set.add(out, n) }
-    for n in names { Set.add(out, n) }
-    out
+    for child in children(c) { collect(t, child, out) }
 }
 
 -- -- strongly-connected components --------------------------------------------------

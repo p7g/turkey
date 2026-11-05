@@ -1,6 +1,7 @@
 export (
     refName, refOf, isRef, refElem,
-    Core(..), CoreKind(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..), noId,
+    Core(..), CoreKind(..), Ref(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..),
+    noId, refTo, spellingOf, binderId,
     openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
@@ -103,12 +104,15 @@ type Core = Core {
 fun mkCore(ty : Ty.Type, span : Option Span, kind : CoreKind) -> Core =
     Core { ty = ty, span = span, kind = kind, settledIn = 0 }
 
--- A binder's spelling and its id are carried side by side. The passes after
--- `Turkey.Lower` find a local binder by its id, and a spelling is only
--- printed: two binders of one binding may share one. A binder with no id is
+-- A binder carries a spelling and an id. A binder with an id is found by the
+-- id, and its spelling is only what a dump prints it as: two binders of one
+-- binding may share one. The id may be one `Turkey.Binders` keeps no record
+-- of, which is why the spelling stays on the binder. A binder with no id is
 -- found by its spelling: a top-level binding by its `Module#name`, which is
--- unique, and an existential's evidence, which `Alt` has nowhere to keep an
--- id for, by the spelling of its own that `Turkey.Opt` gives it.
+-- unique and is its symbol; a dictionary or instance parameter, which
+-- `Turkey.Lower` and `Turkey.Mono` bind with no id and `Turkey.Opt` gives
+-- one; and an existential's evidence, which `Alt` has nowhere to keep an id
+-- for, by the spelling of its own that `Turkey.Opt` gives it.
 type CParam = CParam {
     name : String,
     id   : Int,
@@ -118,6 +122,43 @@ type CParam = CParam {
 -- The id a binder carries when `Turkey.Binders` has no record of it: a
 -- dictionary, or a binder a pass after `Turkey.Lower` made.
 let noId = -1
+
+-- What a reference refers to: a local binder by its id, or a binder with no
+-- id by its spelling (see `CParam`). A reference to a top-level binding is
+-- by its spelling, even where the binding has an id, because the passes
+-- after the lowering find top-level bindings by name. A reference carries no
+-- spelling of its own beside an id: a dump prints it as its binder.
+type Ref = ById(Int) | BySpelling(String)
+
+instance Eq Ref {
+    fun eq(a, b) = match (a, b) {
+        (ById(x), ById(y)) -> x == y
+        (BySpelling(x), BySpelling(y)) -> x == y
+        _ -> False
+    }
+}
+
+instance Hash Ref {
+    fun hashInto(r, h) = match r {
+        ById(id) -> hashInto(id, h)
+        BySpelling(name) -> hashInto(name, h)
+    }
+}
+
+-- Returns the reference that finds the binder spelled `name` with the id `id`.
+fun refTo(name : String, id : Int) -> Ref = if id == noId { BySpelling(name) } else { ById(id) }
+
+-- Returns the id `r` finds its binder by, or `noId` for one by spelling.
+fun binderId(r : Ref) -> Int = match r {
+    ById(id) -> id
+    BySpelling(_) -> noId
+}
+
+-- Returns the spelling `r` finds its binder by, or `None` for one by id.
+fun spellingOf(r : Ref) -> Option String = match r {
+    BySpelling(name) -> Some(name)
+    ById(_) -> None
+}
 
 -- One arm. What its test *binds*, and at what types, is deliberately not
 -- recorded: the checker derives it from the scrutinee's type and the
@@ -148,7 +189,7 @@ type CoreKind
     -- A term variable: a local, a top-level binding, or a dictionary. A
     -- dictionary is not a separate form -- that is the milestone's whole claim:
     -- evidence became a value, so it is fetched the way any other value is.
-    | CVar(String, Int)
+    | CVar(Ref)
     -- A data constructor, referred to but not yet applied.
     | CCon(String)
     -- A machine operation. The resolver's `Prim.` spelling becomes this once,
@@ -202,7 +243,7 @@ type CoreKind
     -- `jump j(args)`. Typed `!`: it never yields to its context, which is why it
     -- needs no type of its own beyond bottom, and why a branch that jumps stays
     -- compatible with a branch that does not.
-    | CJump(String, Int, Vec Core)
+    | CJump(Ref, Vec Core)
     -- Make a reference cell. What a `var` binding is.
     | CRef(Core)
     -- Read a reference cell. What a mention of a `var` is.
@@ -318,7 +359,7 @@ type Mapper = Mapper {
 fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CLit(_) -> k
     CUnit -> k
-    CVar(_, _) -> k
+    CVar(_) -> k
     CCon(_) -> k
     CPrim(_) -> k
     CTuple(elems) -> CTuple(Array.map(elems, m.expr))
@@ -337,7 +378,7 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CJoin(name, id, params, body, rest, recursive) ->
         CJoin(name, id, Array.map(params, mapParam(_, m)),
             m.expr(body), m.expr(rest), recursive)
-    CJump(name, id, args) -> CJump(name, id, Vec.map(args, m.expr))
+    CJump(target, args) -> CJump(target, Vec.map(args, m.expr))
     CRef(value) -> CRef(m.expr(value))
     CDeref(target) -> CDeref(m.expr(target))
     CAssign(target, value) -> CAssign(m.expr(target), m.expr(value))
@@ -373,12 +414,6 @@ fun altBody(a : CAlt) -> Core {
 
 -- -- names --------------------------------------------------------------------------
 
--- Every term name mentioned anywhere inside a term.
---
--- Deliberately an over-approximation: a local that happens to share a top-level
--- binding's name counts as a mention of it. Being wrong in this direction costs
--- a binding kept alive or a call left un-inlined; being wrong in the other costs
--- a program that does not run.
 -- -- queries about the IR -------------------------------------------------------------
 
 -- `%Dict.` is a bijection, and both halves live here.
@@ -447,7 +482,7 @@ fun discard(x : a) -> Unit = {}
 -- first that does. A binder id is bound at most once in a program, so every
 -- such variable is one the binder scopes over, and none is shadowed.
 fun mentions(e : Core, id : Int) -> Bool = match e.kind {
-    CVar(_, i) -> i == id
+    CVar(r) -> r == ById(id)
     CLit(_) | CUnit | CCon(_) | CPrim(_) -> False
     CTuple(elems) -> anyMentions(elems, id)
     CArray(elems) -> anyMentions(elems, id)
@@ -465,7 +500,7 @@ fun mentions(e : Core, id : Int) -> Bool = match e.kind {
         mentions(body, id)
     }
     CJoin(_, _, _, body, rest, _) -> mentions(body, id) || mentions(rest, id)
-    CJump(_, _, args) -> anyMentions(args, id)
+    CJump(_, args) -> anyMentions(args, id)
     CRef(value) -> mentions(value, id)
     CDeref(target) -> mentions(target, id)
     CAssign(target, value) -> mentions(target, id) || mentions(value, id)
@@ -485,32 +520,23 @@ fun anyMentions[Iterator c, Item c ~ Core](xs : c, id : Int) -> Bool {
     False
 }
 
--- Returns each binder a `CVar` in `e` refers to, once, as its spelling and
--- id, in the order of first mention. A reference with an id is told apart by
--- its id, and one with `noId` (a top-level binding a pass made, or an
--- existential's evidence) by its spelling. Includes binders `e` binds itself
--- and top-level bindings.
-fun references(e : Core) -> Vec (String, Int) {
-    let r = Refs { out = [], ids = Set.new(), spellings = Set.new() }
+-- Returns each binder a `CVar` in `e` refers to, once, in the order of
+-- first mention. Includes binders `e` binds itself and top-level bindings.
+fun references(e : Core) -> Vec Ref {
+    let r = Refs { out = [], seen = Set.new() }
     referencesInto(e, r)
     r.out
 }
 
 type Refs = Refs {
-    out       : Vec (String, Int),
-    ids       : Set.Set Int,
-    spellings : Set.Set String,
+    out  : Vec Ref,
+    seen : Set.Set Ref,
 }
 
 fun referencesInto(e : Core, r : Refs) -> Unit = match e.kind {
-    CVar(name, id) -> if id == noId {
-        if !Set.contains(r.spellings, name) {
-            Set.add(r.spellings, name)
-            Vec.push(r.out, (name, id))
-        }
-    } else if !Set.contains(r.ids, id) {
-        Set.add(r.ids, id)
-        Vec.push(r.out, (name, id))
+    CVar(ref) -> if !Set.contains(r.seen, ref) {
+        Set.add(r.seen, ref)
+        Vec.push(r.out, ref)
     }
     CLit(_) | CUnit | CCon(_) | CPrim(_) -> {}
     CTuple(elems) -> for x in elems { referencesInto(x, r) }
@@ -541,7 +567,7 @@ fun referencesInto(e : Core, r : Refs) -> Unit = match e.kind {
         referencesInto(body, r)
         referencesInto(rest, r)
     }
-    CJump(_, _, args) -> for a in args { referencesInto(a, r) }
+    CJump(_, args) -> for a in args { referencesInto(a, r) }
     CRef(value) -> referencesInto(value, r)
     CDeref(target) -> referencesInto(target, r)
     CAssign(target, value) -> {
@@ -583,6 +609,9 @@ fun untyped(e : Core) -> Core = match e.kind {
     _ -> e
 }
 
+-- Returns the spelling of every binder a reference by spelling in `e` finds
+-- -- a top-level binding, a dictionary, an existential's evidence -- and the
+-- `codeAddressName` of each C symbol a `Prim.codeAddress` names.
 fun namesOf(e : Core) -> Set.Set String {
     let out = Set.new()
     namesInto(e, out)
@@ -590,7 +619,8 @@ fun namesOf(e : Core) -> Set.Set String {
 }
 
 fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
-    CVar(name, _) -> Set.add(out, name)
+    CVar(BySpelling(name)) -> Set.add(out, name)
+    CVar(ById(_)) -> {}
     CLit(_) -> {}
     CUnit -> {}
     CCon(_) -> {}
@@ -627,7 +657,7 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
         namesInto(body, out)
         namesInto(rest, out)
     }
-    CJump(_, _, args) -> for a in args { namesInto(a, out) }
+    CJump(_, args) -> for a in args { namesInto(a, out) }
     CRef(value) -> namesInto(value, out)
     CDeref(target) -> namesInto(target, out)
     CAssign(target, value) -> {
@@ -657,7 +687,8 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
 -- Where two binders in one dump share a base name, each prints as `base%k`,
 -- with `k` numbered per base name in order of first print. A binder is its
 -- spelling and its id together, so two binders spelled alike are told apart
--- by their ids, and a binder a pass renamed is a new one.
+-- by their ids, and a binder a pass renamed is a new one. A reference prints
+-- as the binder it finds.
 --
 -- The counters and the ids are global to a compilation, so printing either
 -- would move every name after a binder added anywhere. Neither is printed.
@@ -671,17 +702,21 @@ type Aliases = Aliases {
     -- The binders under each base name, by `identity`, in order of first print.
     byBase      : Map String (Vec String),
     var settled : Bool,
+    -- The spelling of each binder with an id, for a reference to it to print
+    -- as it does. A binder is printed before any reference to it.
+    spellings   : Map Int String,
     -- What slot `i` of a class's dictionary holds, for a dump to print it by.
     slotName    : fun(String, Int) -> String,
 }
 
 fun newAliases(slotName : fun(String, Int) -> String) -> Aliases =
     Aliases { printed = Map.new(), byBase = Map.new(), settled = False,
-              slotName = slotName }
+              spellings = Map.new(), slotName = slotName }
 
 -- Returns what the binder spelled `name` with the id `id` prints as. Before
 -- `settle`, records it and returns its base name.
 fun alias(a : Aliases, name : String, id : Int) -> String {
+    if id != noId { Map.put(a.spellings, id, name) }
     let key = identity(name, id)
     match Map.get(a.printed, key) {
         Some(found) -> return found
@@ -695,6 +730,17 @@ fun alias(a : Aliases, name : String, id : Int) -> String {
         None -> Map.put(a.byBase, base, [key])
     }
     base
+}
+
+-- Returns what the binder `r` refers to prints as. A reference by an id no
+-- binder in the dump has prints as `%unbound`, which only a term the checker
+-- would refuse can hold.
+fun aliasOf(a : Aliases, r : Ref) -> String = match r {
+    BySpelling(name) -> alias(a, name, noId)
+    ById(id) -> match Map.get(a.spellings, id) {
+        Some(name) -> alias(a, name, id)
+        None -> "%unbound"
+    }
 }
 
 -- Numbers every binder whose base name another binder shares.
@@ -775,7 +821,7 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
     match e.kind {
         CLit(l) -> p + showLit(l)
         CUnit -> p + "()"
-        CVar(name, id) -> p + alias(a, name, id)
+        CVar(r) -> p + aliasOf(a, r)
         CCon(name) -> p + name
         CPrim(prim) -> p + Prims.name(prim)
         CTuple(elems) -> p + "(" + String.join(flatEach(elems, n, a), ", ") + ")"
@@ -849,7 +895,7 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
               + showExpr(body, indent + 1, n, a) + "\n" + p + "}\n"
               + showExpr(rest, indent, n, a)
         }
-        CJump(name, id, args) -> call(None, "jump " + alias(a, name, id), args, indent, n, a)
+        CJump(target, args) -> call(None, "jump " + aliasOf(a, target), args, indent, n, a)
         CRef(value) -> call(None, "ref", [value], indent, n, a)
         CDeref(target) -> p + "!" + flat(target, n, a)
         CAssign(target, value) -> {

@@ -353,13 +353,11 @@ fun main() {
 }
 """
 
-def _peak(binary, n: int) -> int:
-    """Runs `binary` with `N=n` and returns its peak resident size, in the
-    platform's unit for `ru_maxrss`."""
-    # Four workers, because with one every finished task still leaks memory
-    # of its own, which would hide what this test measures.
+def _peak(binary, n: int, **env: str) -> int:
+    """Runs `binary` with `N=n` and `env` and returns its peak resident size,
+    in the platform's unit for `ru_maxrss`."""
     child = subprocess.Popen(toolchain.command(binary), stdout=subprocess.PIPE, text=True,
-                             env=dict(os.environ, N=str(n), TURKEY_WORKERS="4"))
+                             env=dict(os.environ, N=str(n), **env))
     out = child.stdout.read()
     _, status, usage = os.wait4(child.pid, 0)
     child.returncode = os.waitstatus_to_exitcode(status)
@@ -376,3 +374,34 @@ def test_a_loop_that_spawns_runs_in_constant_memory():
     small = _peak(binary, 100_000)
     large = _peak(binary, 3_000_000)
     assert large < 4 * small, (small, large)
+
+
+# A task per iteration, each finished before the next starts, waited for on the
+# program's own stack.
+FINISHING_TASKS = """
+import System.Env as Env
+import System.Sync as Sync
+import System.Task as Task
+
+fun main() {
+    let n = Option.unwrapOr(Int.parse(Option.unwrapOr(Env.get("N"), "0")), 0)
+    let ran = Sync.atomicInt(0)
+    for var i = 0; i < n; i = i + 1 {
+        Task.runScope(do {
+            let _ = Task.spawn(fun() { let _ = Sync.addAndGet(ran, 1) })?
+            pure(())
+        })
+    }
+    print(Sync.load(ran))
+}
+"""
+
+@pytest.mark.parametrize("src", [FINISHING_TASKS, SPAWNING_LOOP], ids=["finishing", "spawning"])
+def test_finished_tasks_take_no_memory_on_one_worker(src):
+    """A finished task leaves nothing behind when one worker runs every task,
+    whether they are waited for on the program's own stack or in a task: a
+    million tasks take no more memory than a hundred thousand."""
+    binary = lang.binary(src)
+    small = _peak(binary, 100_000, TURKEY_WORKERS="1")
+    large = _peak(binary, 1_000_000, TURKEY_WORKERS="1")
+    assert large < 2 * small, (small, large)

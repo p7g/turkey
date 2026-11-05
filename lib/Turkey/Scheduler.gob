@@ -85,7 +85,10 @@ let woken = 2
 
 var queueLock : Ptr = Lock.new()
 
--- The tasks that can run, oldest first, from `head` on.
+-- The tasks that can run, oldest first, from `head` on. The slots before
+-- `head` still hold the tasks taken from them, which keeps those tasks and
+-- everything they reach alive, so `next` drops the slots once they are at
+-- least as many as the tasks still queued.
 var runnable : Vec Co.Coroutine = []
 var head = 0
 -- How many tasks some worker has taken to run and not yet suspended.
@@ -127,17 +130,22 @@ fun wake(c : Co.Coroutine) -> Unit {
 -- The next runnable coroutine, counted as running until `run` has seen it
 -- suspend. Under the lock.
 fun next() -> Option Co.Coroutine {
-    if head == len(runnable) {
-        if head > 0 {
-            runnable = []
-            head = 0
-        }
-        return None
-    }
+    if head == len(runnable) { return None }
     let c = runnable[head]
     head = head + 1
     running = running + 1
-    Workers.queuedSet(len(runnable) - head)
+    -- Drop the taken slots as tasks are taken, not when a look finds the
+    -- queue empty: nothing may ever look while it is. The program's own stack
+    -- stops looking once what it waits for is done, a busy worker finds a task
+    -- every time, and with one worker there is no idle one. Copying only when
+    -- the taken slots are at least as many as the queued tasks copies no more
+    -- tasks, over a run, than are taken: a constant per task.
+    let queued = len(runnable) - head
+    if head >= queued {
+        runnable = Vec.slice(runnable, head, len(runnable))
+        head = 0
+    }
+    Workers.queuedSet(queued)
     Some(c)
 }
 

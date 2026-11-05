@@ -25,16 +25,19 @@
 #   client      each client against nginx: GET /hello, 1 and 64 at once
 #   idle        server RSS holding 10,000 idle keep-alive connections
 #
-# Every server gets the same number of cores, $CORES (default 4):
-# TURKEY_WORKERS, GOMAXPROCS, TOKIO_WORKER_THREADS, Java's
-# -XX:ActiveProcessorCount, and as many processes for the servers whose
-# language runs one thread at a time -- Node's cluster workers, uvicorn's
-# and gunicorn's workers, Puma's -- and nginx's. gunicorn's and Puma's
-# workers have 16 threads each, for requests waiting on I/O. wrk drives the
+# Every configuration runs once for each core count in $CORES (default
+# "2 8"), and every server gets that many: TURKEY_WORKERS, GOMAXPROCS,
+# TOKIO_WORKER_THREADS, Java's -XX:ActiveProcessorCount, and as many
+# processes for the servers whose language runs one thread at a time --
+# Node's cluster workers, uvicorn's and gunicorn's workers, Puma's -- and
+# nginx's. gunicorn's and Puma's workers have 16 threads each, for requests
+# waiting on I/O. Two counts far apart show how each server scales, which
+# one count cannot: a server can lead at 2 cores and fall behind at 8. wrk drives the
 # servers with $LOAD_THREADS threads (default 4), connload with
 # GOMAXPROCS=$CONNLOAD_PROCS (default 8), since a connection costs it more.
 # macOS cannot pin a thread to a core, so the split is by count only, on a
-# machine with more cores than the two together.
+# machine with more cores than the two together; the script warns when the
+# largest count in $CORES and $LOAD_THREADS add up to more than it has.
 #
 # Each configuration runs $REPS times (default 3) for $SECONDS_PER_RUN
 # seconds (default 10), each after a fresh start of the server and a
@@ -65,7 +68,7 @@ cd "$ROOT"
 HERE=$ROOT/bench/http
 OUT=$ROOT/build/bench/http
 BOOT=${TURKEY_BOOT:-build/stages/stage3}
-CORES=${CORES:-4}
+CORES=${CORES:-"2 8"}
 LOAD_THREADS=${LOAD_THREADS:-4}
 CONNLOAD_PROCS=${CONNLOAD_PROCS:-8}
 REPS=${REPS:-3}
@@ -154,7 +157,8 @@ timed() {
     fi
 }
 
-# Starts server IMPL on $PORT, plain or `tls`, setting $SERVER to its pid.
+# Starts server IMPL on $PORT, plain or `tls`, with $cores cores, setting
+# $SERVER to its pid.
 # Refuses if anything already listens there: the readiness check below
 # would take that process for the new server, and every run would measure
 # it.
@@ -168,19 +172,19 @@ start() {
     tlsargs=""
     if [ "$mode" = tls ]; then tlsargs="$OUT/cert.pem $OUT/key.pem"; fi
     case $impl in
-        turkey) TURKEY_WORKERS=$CORES "$OUT/turkey-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
-        go) GOMAXPROCS=$CORES "$OUT/go-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
-        rust) TOKIO_WORKER_THREADS=$CORES "$OUT/rust-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
-        node) BENCH_WORKERS=$CORES node "$HERE/node/server.js" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
+        turkey) TURKEY_WORKERS=$cores "$OUT/turkey-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
+        go) GOMAXPROCS=$cores "$OUT/go-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
+        rust) TOKIO_WORKER_THREADS=$cores "$OUT/rust-server" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
+        node) BENCH_WORKERS=$cores node "$HERE/node/server.js" $PORT $tlsargs > "$OUT/server.log" 2>&1 & ;;
         asgi)
             set -- python3 -m uvicorn --app-dir "$HERE/python" asgi:app --host 127.0.0.1 --port $PORT \
-                --workers $CORES --loop uvloop --http httptools --no-access-log --log-level warning \
+                --workers $cores --loop uvloop --http httptools --no-access-log --log-level warning \
                 --timeout-keep-alive 60
             if [ "$mode" = tls ]; then set -- "$@" --ssl-certfile "$OUT/cert.pem" --ssl-keyfile "$OUT/key.pem"; fi
             "$@" > "$OUT/server.log" 2>&1 &
             ;;
         wsgi)
-            set -- python3 -m gunicorn --chdir "$HERE/python" wsgi:app -b 127.0.0.1:$PORT --workers $CORES \
+            set -- python3 -m gunicorn --chdir "$HERE/python" wsgi:app -b 127.0.0.1:$PORT --workers $cores \
                 --worker-class gthread --threads 16 --keep-alive 60 --worker-connections 5000 --log-level warning
             if [ "$mode" = tls ]; then set -- "$@" --certfile "$OUT/cert.pem" --keyfile "$OUT/key.pem"; fi
             "$@" > "$OUT/server.log" 2>&1 &
@@ -188,12 +192,12 @@ start() {
         ruby)
             bind=tcp://127.0.0.1:$PORT
             if [ "$mode" = tls ]; then bind="ssl://127.0.0.1:$PORT?cert=$OUT/cert.pem&key=$OUT/key.pem&verify_mode=none"; fi
-            puma -w $CORES -t 16:16 -b "$bind" --silent "$HERE/ruby/config.ru" > "$OUT/server.log" 2>&1 &
+            puma -w $cores -t 16:16 -b "$bind" --silent "$HERE/ruby/config.ru" > "$OUT/server.log" 2>&1 &
             ;;
         java)
             ks=""
             if [ "$mode" = tls ]; then ks=$OUT/keystore.p12; fi
-            java -XX:ActiveProcessorCount=$CORES -Dsun.net.httpserver.maxIdleConnections=20000 \
+            java -XX:ActiveProcessorCount=$cores -Dsun.net.httpserver.maxIdleConnections=20000 \
                 -cp "$OUT/java" Server $PORT $ks > "$OUT/server.log" 2>&1 &
             ;;
         nginx)
@@ -206,7 +210,7 @@ start() {
                 t=""
                 c=""
             fi
-            sed -e "s|WORKERS|$CORES|" -e "s|PORT|$PORT|" -e "s|ROOT|$OUT/nginx|g" \
+            sed -e "s|WORKERS|$cores|" -e "s|PORT|$PORT|" -e "s|ROOT|$OUT/nginx|g" \
                 -e "s| TLS;| $t;|" -e "s|TLSCONFIG|$c|" "$HERE/nginx/nginx.conf" > "$OUT/nginx/nginx.conf"
             nginx -e stderr -p "$OUT/nginx" -c "$OUT/nginx/nginx.conf" > "$OUT/server.log" 2>&1 &
             ;;
@@ -289,46 +293,48 @@ sample() {
 # Runs wrk against the server: SCENARIO IMPL CONNS MODE URL [wrk options],
 # with $SCRIPT_ARGS passed to wrk.lua; or connload in its place when the
 # options are `connload`, or oha at a fixed rate when they are `oha RATE`.
-# Records one line per repetition.
+# Records one line per core count in $CORES and repetition.
 measure() {
     scenario=$1 impl=$2 conns=$3 mode=$4 url=$5
     shift 5
     threads=$LOAD_THREADS
     if [ "$conns" -lt "$threads" ]; then threads=$conns; fi
-    for rep in $(seq "$REPS"); do
-        state=$(quiet)
-        start "$impl" "$mode"
-        rm -f "$OUT/sampled"
-        if [ "${1:-}" = connload ]; then
-            GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" 2 > /dev/null 2>&1 || true
-            sample &
-            sampler=$!
-            cpu0=$(cputime)
-            GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" "$SECONDS_PER_RUN" > "$OUT/wrk.out" 2>&1 || true
-        elif [ "${1:-}" = oha ]; then
-            oha --no-tui --output-format quiet -c "$conns" -z 2s -q "$2" "$url" > /dev/null 2>&1 || true
-            sample &
-            sampler=$!
-            cpu0=$(cputime)
-            oha --no-tui --output-format json -c "$conns" -z "${SECONDS_PER_RUN}s" -q "$2" --latency-correction "$url" \
-                > "$OUT/oha.json" 2> /dev/null || true
-            python3 "$HERE/oha.py" "$OUT/oha.json" > "$OUT/wrk.out" 2>&1 || true
-        else
-            wrk -t"$threads" -c"$conns" -d2s -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > /dev/null 2>&1 || true
-            sample &
-            sampler=$!
-            cpu0=$(cputime)
-            wrk -t"$threads" -c"$conns" -d"${SECONDS_PER_RUN}s" -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > "$OUT/wrk.out" 2>&1 || true
-        fi
-        cpu=$(awk -v a="$cpu0" -v b="$(cputime)" 'BEGIN { printf "%.2f", b - a }')
-        touch "$OUT/sampled"
-        wait $sampler || true
-        top=$(cat "$OUT/sampled")
-        stop
-        line=$(grep '^rps=' "$OUT/wrk.out" || { cat "$OUT/wrk.out" >&2; echo "rps=0"; })
-        line="$line cpu_s=$cpu secs=$SECONDS_PER_RUN"
-        echo "  $scenario $impl c=$conns #$rep: $line rss_kb=$top $state"
-        printf '%s\t%s\t%s\t%s\t%s\trss_kb=%s\t%s\n' "$scenario" "$impl" "$conns" "$rep" "$line" "$top" "$state" >> "$RESULTS"
+    for cores in $CORES; do
+        for rep in $(seq "$REPS"); do
+            state=$(quiet)
+            start "$impl" "$mode"
+            rm -f "$OUT/sampled"
+            if [ "${1:-}" = connload ]; then
+                GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" 2 > /dev/null 2>&1 || true
+                sample &
+                sampler=$!
+                cpu0=$(cputime)
+                GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" "$SECONDS_PER_RUN" > "$OUT/wrk.out" 2>&1 || true
+            elif [ "${1:-}" = oha ]; then
+                oha --no-tui --output-format quiet -c "$conns" -z 2s -q "$2" "$url" > /dev/null 2>&1 || true
+                sample &
+                sampler=$!
+                cpu0=$(cputime)
+                oha --no-tui --output-format json -c "$conns" -z "${SECONDS_PER_RUN}s" -q "$2" --latency-correction "$url" \
+                    > "$OUT/oha.json" 2> /dev/null || true
+                python3 "$HERE/oha.py" "$OUT/oha.json" > "$OUT/wrk.out" 2>&1 || true
+            else
+                wrk -t"$threads" -c"$conns" -d2s -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > /dev/null 2>&1 || true
+                sample &
+                sampler=$!
+                cpu0=$(cputime)
+                wrk -t"$threads" -c"$conns" -d"${SECONDS_PER_RUN}s" -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > "$OUT/wrk.out" 2>&1 || true
+            fi
+            cpu=$(awk -v a="$cpu0" -v b="$(cputime)" 'BEGIN { printf "%.2f", b - a }')
+            touch "$OUT/sampled"
+            wait $sampler || true
+            top=$(cat "$OUT/sampled")
+            stop
+            line=$(grep '^rps=' "$OUT/wrk.out" || { cat "$OUT/wrk.out" >&2; echo "rps=0"; })
+            line="$line cpu_s=$cpu secs=$SECONDS_PER_RUN cores=$cores"
+            echo "  $scenario $impl c=$conns cores=$cores #$rep: $line rss_kb=$top $state"
+            printf '%s\t%s\t%s\t%s\t%s\trss_kb=%s\t%s\n' "$scenario" "$impl" "$conns" "$rep" "$line" "$top" "$state" >> "$RESULTS"
+        done
     done
 }
 
@@ -383,61 +389,67 @@ scenario_tls_handshake() {
 }
 
 # Each client sends REQUESTS GETs of /hello to nginx, from 1 and from 64
-# tasks, with $CORES threads of its own; nginx has $CORES workers too.
+# tasks, with $cores threads of its own for each count in $CORES; nginx has
+# $cores workers too.
 scenario_client() {
-    start nginx plain
-    url=$u/hello
-    for conc in 1 64; do
-        n=20000
-        if [ "$conc" -gt 1 ]; then n=200000; fi
-        for impl in turkey go rust curl; do
-            for rep in $(seq "$REPS"); do
-                state=$(quiet)
-                case $impl in
-                    turkey) cmd="env TURKEY_WORKERS=$CORES $OUT/turkey-client $url $n $conc" ;;
-                    go) cmd="env GOMAXPROCS=$CORES $OUT/go-client $url $n $conc" ;;
-                    rust) cmd="env TOKIO_WORKER_THREADS=$CORES $OUT/rust-client $url $n $conc" ;;
-                    curl)
-                        awk -v n=$n -v url=$url 'BEGIN { for (i = 0; i < n; i++) print "url = " url "\noutput = /dev/null" }' > "$OUT/curl.cfg"
-                        if [ "$conc" -gt 1 ]; then
-                            cmd="curl -s --parallel --parallel-max $conc -K $OUT/curl.cfg"
-                        else
-                            cmd="curl -s -K $OUT/curl.cfg"
-                        fi
-                        ;;
-                esac
-                timed $cmd
-                rss=$RSS
-                line=$(grep '^rps=' "$OUT/client.out" || awk -v n=$n -v r="$REAL" 'BEGIN { printf "rps=%.0f\n", n / r }')
-                echo "  client $impl conc=$conc #$rep: $line rss_kb=$rss $state"
-                printf '%s\t%s\t%s\t%s\t%s\trss_kb=%s\t%s\n' client $impl "$conc" "$rep" "$line" "$rss" "$state" >> "$RESULTS"
+    for cores in $CORES; do
+        start nginx plain
+        url=$u/hello
+        for conc in 1 64; do
+            n=20000
+            if [ "$conc" -gt 1 ]; then n=200000; fi
+            for impl in turkey go rust curl; do
+                for rep in $(seq "$REPS"); do
+                    state=$(quiet)
+                    case $impl in
+                        turkey) cmd="env TURKEY_WORKERS=$cores $OUT/turkey-client $url $n $conc" ;;
+                        go) cmd="env GOMAXPROCS=$cores $OUT/go-client $url $n $conc" ;;
+                        rust) cmd="env TOKIO_WORKER_THREADS=$cores $OUT/rust-client $url $n $conc" ;;
+                        curl)
+                            awk -v n=$n -v url=$url 'BEGIN { for (i = 0; i < n; i++) print "url = " url "\noutput = /dev/null" }' > "$OUT/curl.cfg"
+                            if [ "$conc" -gt 1 ]; then
+                                cmd="curl -s --parallel --parallel-max $conc -K $OUT/curl.cfg"
+                            else
+                                cmd="curl -s -K $OUT/curl.cfg"
+                            fi
+                            ;;
+                    esac
+                    timed $cmd
+                    rss=$RSS
+                    line=$(grep '^rps=' "$OUT/client.out" || awk -v n=$n -v r="$REAL" 'BEGIN { printf "rps=%.0f\n", n / r }')
+                    line="$line cores=$cores"
+                    echo "  client $impl conc=$conc cores=$cores #$rep: $line rss_kb=$rss $state"
+                    printf '%s\t%s\t%s\t%s\t%s\trss_kb=%s\t%s\n' client $impl "$conc" "$rep" "$line" "$rss" "$state" >> "$RESULTS"
+                done
             done
         done
+        stop
     done
-    stop
 }
 
 # The server's RSS after one request, and with 10,000 idle keep-alive
 # connections open, each of which has had one response.
 scenario_idle() {
-    for impl in $servers; do
-        for rep in $(seq "$REPS"); do
-            state=$(quiet)
-            start "$impl" plain
-            before=$(rss)
-            "$OUT/go-holdconns" 127.0.0.1:$PORT 10000 10 > "$OUT/hold.out" 2>&1 &
-            hold=$!
-            for _ in $(seq 600); do
-                if grep -q ready "$OUT/hold.out"; then break; fi
-                sleep 0.1
+    for cores in $CORES; do
+        for impl in $servers; do
+            for rep in $(seq "$REPS"); do
+                state=$(quiet)
+                start "$impl" plain
+                before=$(rss)
+                "$OUT/go-holdconns" 127.0.0.1:$PORT 10000 10 > "$OUT/hold.out" 2>&1 &
+                hold=$!
+                for _ in $(seq 600); do
+                    if grep -q ready "$OUT/hold.out"; then break; fi
+                    sleep 0.1
+                done
+                sleep 2
+                held=$(rss)
+                wait $hold || true
+                stop
+                ok=$(grep -c ready "$OUT/hold.out" || true)
+                echo "  idle $impl cores=$cores #$rep: before_kb=$before held_kb=$held ready=$ok $state"
+                printf '%s\t%s\t%s\t%s\tbefore_kb=%s held_kb=%s ready=%s cores=%s\t\t%s\n' idle $impl 10000 "$rep" "$before" "$held" "$ok" "$cores" "$state" >> "$RESULTS"
             done
-            sleep 2
-            held=$(rss)
-            wait $hold || true
-            stop
-            ok=$(grep -c ready "$OUT/hold.out" || true)
-            echo "  idle $impl #$rep: before_kb=$before held_kb=$held ready=$ok $state"
-            printf '%s\t%s\t%s\t%s\tbefore_kb=%s held_kb=%s ready=%s\t\t%s\n' idle $impl 10000 "$rep" "$before" "$held" "$ok" "$state" >> "$RESULTS"
         done
     done
 }
@@ -476,6 +488,11 @@ if [ "${1:-}" = build ]; then
 fi
 build
 versions
+if [ "$OS" = Darwin ]; then ncpu=$(sysctl -n hw.ncpu); else ncpu=$(nproc); fi
+most=$(echo $CORES | tr ' ' '\n' | sort -n | tail -1)
+if [ $((most + LOAD_THREADS)) -gt "$ncpu" ]; then
+    echo "warning: $most server cores and $LOAD_THREADS load threads share $ncpu CPUs; the load generator will slow the server" >&2
+fi
 all="keepalive close download upload stream tls rate client idle"
 for sc in ${*:-$all}; do
     echo "== $sc"

@@ -1,6 +1,6 @@
 """Prints a Markdown table per scenario from run.sh's results: for each
-implementation and connection count, the median of the repetitions and, in
-brackets, their range.
+implementation, connection count and core count, the median of the
+repetitions and, in brackets, their range.
 
     python3 bench/http/summarize.py [build/bench/http/results.tsv]
 """
@@ -67,29 +67,33 @@ def main():
         # The server's CPU time over the run, per request it served.
         if r.get("cpu_s") and r.get("rps") and r.get("secs"):
             r["cpu_us"] = r["cpu_s"] * 1e6 / (r["rps"] * r["secs"])
-        runs[(scenario, impl, int(conns))].append(r)
+        # Results recorded before run.sh took a list of core counts have
+        # none; they show with an empty cores column.
+        key = (scenario, impl, int(conns), int(r.get("cores", 0)))
+        runs[key].append(r)
         if parts[-1] == "noisy":
-            noisy[(scenario, impl, int(conns))] += 1
+            noisy[key] += 1
     scenarios = []
-    for scenario, _, _ in runs:
+    for scenario, _, _, _ in runs:
         if scenario not in scenarios:
             scenarios.append(scenario)
     for scenario in scenarios:
-        keys = [(s, i, c) for (s, i, c) in runs if s == scenario]
-        keys.sort(key=lambda k: (k[2], ORDER.index(k[1]) if k[1] in ORDER else 99))
+        keys = [k for k in runs if k[0] == scenario]
+        keys.sort(key=lambda k: (k[2], k[3], ORDER.index(k[1]) if k[1] in ORDER else 99))
         present = [c for c in COLUMNS if any(c in r for k in keys for r in runs[k])]
         if scenario not in ("download", "upload", "stream"):
             present = [c for c in present if c != "mibps"]
         if all(r.get("errors", 0) == 0 for k in keys for r in runs[k]):
             present = [c for c in present if c != "errors"]
         print(f"### {scenario}\n")
-        print("| impl | conns | " + " | ".join(COLUMNS[c] for c in present) + " |")
-        print("|---|---:|" + "---:|" * len(present))
+        print("| impl | conns | cores | " + " | ".join(COLUMNS[c] for c in present) + " |")
+        print("|---|---:|---:|" + "---:|" * len(present))
         for k in keys:
             rs = runs[k]
             cells = [cell(c, [r[c] for r in rs if c in r]) if any(c in r for r in rs) else "" for c in present]
             mark = f" ({noisy[k]} noisy)" if noisy[k] else ""
-            print(f"| {k[1]}{mark} | {k[2]} | " + " | ".join(cells) + " |")
+            cores = k[3] or ""
+            print(f"| {k[1]}{mark} | {k[2]} | {cores} | " + " | ".join(cells) + " |")
         print()
 
 

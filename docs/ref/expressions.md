@@ -48,10 +48,13 @@ chain ::= unary (OPERATOR unary)*
 
 A sequence of binary operators is grouped by **precedence groups**. Every
 binary operator belongs to one group, and a group's associativity applies to
-all of its operators. The groups are fixed, and so is the group of each
-operator in the table below: `&&` and `||` are built in, and the others are
-[declared by the Prelude](#operators-are-class-methods). The groups with no
-operator here are for [declared operators](#declared-operators).
+all of its operators. The groups are fixed. `&&` and `||` are built in, and
+the other operators in the table below are
+[declared by the Prelude](#operators-are-class-methods). The group of each
+arithmetic, comparison and bitwise operator is fixed too; `<>`, `|>`, `|>>`,
+`<&>` and `<$>` are [the Prelude's other operators](#the-preludes-other-operators),
+which a module may replace with its own in any group. The `Choice` group has
+no Prelude operator, and is for [declared operators](#declared-operators).
 
 | Group | Operators | Associativity | Binds tighter than |
 |---|---|---|---|
@@ -63,13 +66,13 @@ operator here are for [declared operators](#declared-operators).
 | `BitAnd` | `&` | left | `BitOr`, `BitXor`, `Comparison` |
 | `BitOr` | `\|` | left | `Comparison` |
 | `BitXor` | `^` | left | `Comparison` |
-| `Combine` | | right | `Comparison` |
+| `Combine` | `<>` | right | `Comparison` |
 | `Comparison` | `<` `<=` `>` `>=` | left | `Equality` |
 | `Equality` | `==` `!=` | left | `Conjunction` |
 | `Conjunction` | `&&` | left | `Disjunction` |
 | `Disjunction` | `\|\|` | left | `Choice` |
 | `Choice` | | left | `Sequence` |
-| `Sequence` | | left | |
+| `Sequence` | `\|>` `\|>>` `<&>` `<$>` | left | |
 | | `e : T` | | binds loosest of all: [type annotation](#type-annotations) |
 
 "Binds tighter than" is transitive: `Multiplication` binds tighter than
@@ -230,6 +233,89 @@ fun main() {
 }
 ```
 
+### The Prelude's other operators
+
+The Prelude declares five more operators, for combining values and for
+pipelines:
+
+| Expression | Means | Class |
+|---|---|---|
+| `a <> b` | `combine(a, b)` | `Semigroup` |
+| `x \|> f` | `pipe(x, f)`, which is `f(x)` | |
+| `m \|>> f` | `bind(m, f)` | `Monad` |
+| `xs <&> f` | `map(xs, f)` | `Functor` |
+| `f <$> xs` | `fmap(f, xs)`, which is `map(xs, f)` | `Functor` |
+
+`<>` is in `Combine`, which is right-associative and binds tighter than the
+comparisons. The other four are in `Sequence`, the loosest group, so each
+applies to everything on its left, and a chain of them runs left to right.
+`|>>` is `|>` for a [monadic](builtins.md#functor-applicative-and-monad) value:
+the function returns another such value, and a `None` or a `Left` stops the
+chain.
+
+<!-- run -->
+```kotlin
+fun half(n : Int) -> Option Int = if n % 2 == 0 { Some(n / 2) } else { None }
+
+fun double(n : Int) -> Int = n * 2
+
+fun main() {
+    print("Hello" <> ", " <> "world" |> String.codePointCount)
+    print("ab" <> "c" == "abc")
+    print(Some(12) |>> half |>> half)
+    print(Some(12) |>> half |>> half |>> half)
+    print([1, 2, 3] <&> double <&> double)
+    print(double <$> Some(21))
+}
+```
+
+```text
+12
+True
+Some(3)
+None
+[4, 8, 12]
+Some(42)
+```
+
+As a desugaring, the first and third `print`s are roughly:
+
+```text
+print(pipe(combine("Hello", combine(", ", "world")), String.codePointCount))
+print(bind(bind(Some(12), half), half))
+```
+
+`Combine` is right-associative so that a chain of appends is cheap:
+`a <> b <> c` is `a <> (b <> c)`, which on strings and vectors copies each
+part once, where `(a <> b) <> c` would copy `a` again at every step.
+
+`<&>` and `<$>` are the same `map` with the operands in either order. Use
+`<&>` for a chain: `xs <&> f <&> g` applies `f` and then `g`. Since `Sequence`
+is left-associative, `g <$> f <$> xs` is `(g <$> f) <$> xs`, which maps over
+the function `f` and is a type error:
+
+<!-- error: in the operands of '<$>' -->
+```kotlin
+fun double(n : Int) -> Int = n * 2
+
+fun main() {
+    print(show <$> double <$> [1, 2])
+}
+```
+
+An operator is not a boundary of a [placeholder function](declarations.md#placeholder-functions),
+so `xs <&> _ + 1` is one function of the whole expression rather than a map.
+Give the function a name, or write it with `fun`, or call `map(xs, _ + 1)`,
+where the argument is a boundary.
+
+Like any [declared operator](#declared-operators), each of these is shadowed
+by a module's own `infix` declaration of the same operator, which may put it
+in another group. `import Prelude ()` leaves all five out; they are declared
+in `Data.Semigroup`, `Data.Function`, `Control.Monad` and `Data.Functor`.
+
+The `Choice` group, between `Disjunction` and `Sequence`, has no Prelude
+operator. The library module `Regex` declares `<|>` there, as its `orElse`.
+
 ### Logical operators
 
 `&&`, `||` and `!` are built in and work only on `Bool`. `&&` and `||`
@@ -276,44 +362,33 @@ still an ordinary name everywhere else.
 
 <!-- run -->
 ```kotlin
-infix Combine (<>) = combine
-infix Sequence (|>) = pipe
+infix Combine (</>) = joinPath
 
-fun pipe(x, f) = f(x)
-
-fun shout(s : String) -> String = s <> "!"
+fun joinPath(dir : String, name : String) -> String = dir + "/" + name
 
 fun main() {
-    print("Hello" <> ", " <> "world" |> shout)
-    print("ab" <> "c" == "abc")
+    print("usr" </> "local" </> "bin")
+    print("usr" </> "lib" == "usr/lib")
 }
 ```
 
 ```text
-Hello, world!
+usr/local/bin
 True
 ```
 
-`combine` is the method of the Prelude's `Semigroup` class, so `<>` works on
-every type with a `Semigroup` instance. `Combine` binds tighter than
-`Equality`, so the comparison is `("ab" <> "c") == "abc"`, and `Sequence` is
-the loosest group, so `|>` applies to the whole concatenation. As a
-desugaring, the first `print` is roughly:
+`Combine` is right-associative and binds tighter than `Equality`, so as a
+desugaring the two `print`s are roughly:
 
 ```text
-print(pipe(combine("Hello", combine(", ", "world")), shout))
+print(joinPath("usr", joinPath("local", "bin")))
+print(eq(joinPath("usr", "lib"), "usr/lib"))
 ```
-
-`Combine` is right-associative, which the nesting shows: `a <> b <> c` is
-`a <> (b <> c)`. On strings and vectors that copies each part once, where the
-other grouping would copy the left part again at every step.
 
 Mixing unrelated groups is an error that names both operators:
 
 <!-- error: '+' (Addition) and '<>' (Combine) have no precedence between them -->
 ```kotlin
-infix Combine (<>) = combine
-
 fun main() {
     print("a" + "b" <> "c")
 }
@@ -324,10 +399,6 @@ continues the line before it ([Line breaks](lexical.md#line-breaks-and-semicolon
 
 <!-- run -->
 ```kotlin
-infix Sequence (|>) = pipe
-
-fun pipe(x, f) = f(x)
-
 fun main() {
     let shown = [3, 1, 2]
         |> Vec.fromArray

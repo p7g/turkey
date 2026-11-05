@@ -49,9 +49,10 @@ export (
 -- program makes it with `copyWith`, which gives each binder in the copy a
 -- fresh id. So no rule has to ask whether moving a term under a binder
 -- captures a variable: the binder and the variable have different ids. Each
--- rule keys a binder on its id, never on its spelling, and a copy keeps its
--- original's spelling, so the spellings of two binders may clash until
--- `respell` tells them apart.
+-- rule keys a binder on its id, never on its spelling. A copy keeps its
+-- original's spelling, so two binders of one binding may share a spelling,
+-- and one may sit under the other: no pass after this one finds a binder by
+-- its spelling, and a dump tells them apart by id.
 --
 -- The ids a reduction mints are deterministic however components are
 -- scheduled; see `mint`.
@@ -627,8 +628,8 @@ var runs = 0
 -- reduced by one worker, in order, because within a cycle what is known
 -- depends on that order.
 --
--- Every local binder of the result has an id, and within one binding no two
--- binders share a spelling (`respell`).
+-- Every local binder of the result has an id, except an existential's
+-- evidence, which has a spelling no other binder in the program has.
 fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table,
                   keepsCallSites : fun(String) -> Bool) -> CProgram {
     let program = adoptProgram(table, input)
@@ -750,8 +751,8 @@ fun reduceProgram(input : CProgram, decls : DeclTable, table : Binders.Table,
             program.binds[i].value)))
     }
     CProgram {
-        dicts = Vec.fromArray(Parallel.map(dicts, respell)),
-        binds = Vec.fromArray(Parallel.map(others, respell)),
+        dicts = dicts,
+        binds = others,
     }
 }
 
@@ -2764,27 +2765,6 @@ fun adoptAlt(a : Adopter, alt : Alt, scope : Vec (String, (String, Int))) -> Alt
     }
 }
 
--- What an arm binds over its body, as spellings and ids.
-fun scopedBy(alt : Alt) -> Vec (String, Int) {
-    let out = []
-    let part = fun(binder) = match binder {
-        Some(pair) -> Vec.push(out, pair)
-        None -> {}
-    }
-    match alt {
-        ACon(_, fields, opening) -> {
-            if let Some(o) = opening {
-                for d in o.evidence { Vec.push(out, (d, noId)) }
-            }
-            for f in fields { part(f) }
-        }
-        ATuple(fields) -> for f in fields { part(f) }
-        ALit(_) -> {}
-        AAny(binder) -> part(binder)
-    }
-    out
-}
-
 -- Puts each pair in `scope`, and returns what `restore` needs to undo it.
 fun within[Iterator c, Item c ~ (String, v)](scope : Map String v, pairs : c)
         -> Vec (String, Option v) {
@@ -2804,79 +2784,6 @@ fun restore(scope : Map String v, saved : Vec (String, Option v)) -> Unit {
             None -> discard(Map.delete(scope, name))
         }
     }
-}
-
--- `b` with its local binders respelled so that no two share a spelling.
---
--- The reductions key binders on ids and give a copy its original's spelling,
--- so two binders of one binding may share a spelling, and one may come to sit
--- under the other. `Turkey.SsaLower` and `Turkey.Layout` find a binder by its
--- spelling, and so does `Turkey.Coretc`'s check that a reference's spelling
--- and id agree: to them the inner binder would capture a reference to the
--- outer. So the first binder of each spelling keeps it, and each later one
--- gets the spelling with `~` and a number, which nothing else in the binding
--- is spelled. A dump prints a spelling without that suffix
--- (`Turkey.Core.baseName`), and tells the binders apart by id.
-fun respell(b : CBind) -> CBind {
-    let spellings = Set.new()
-    let bound = Map.new()
-    let order = []
-    spellingsIn(b.value, spellings, bound, order)
-    let renamed = Map.new()
-    for name in order {
-        let ids = Map.getOr(bound, name, [])
-        -- From the base, so that a binder respelled by an earlier run, and
-        -- copied since, is not given a second suffix.
-        let base = withoutRespelling(name)
-        var k = 1
-        for var i = 1; i < len(ids); i = i + 1 {
-            var made = name
-            while Set.contains(spellings, made) {
-                k = k + 1
-                made = base + "~" + Int.toString(k)
-            }
-            Set.add(spellings, made)
-            Map.put(renamed, ids[i], (made, ids[i]))
-        }
-    }
-    if len(renamed) == 0 { return b }
-    withValue(b, copyWith(fun() = oops("respell mints nothing"), b.value, Map.new(),
-                          renamed, False, None))
-}
-
--- Adds to `spellings` every spelling `e` binds or reads, and to `bound` the
--- ids bound under each spelling, in the order the walk meets them. `order`
--- gets each bound spelling once, in the order it is first bound.
-fun spellingsIn(e : Core, spellings : Set.Set String, bound : Map String (Vec Int),
-                order : Vec String) -> Unit {
-    let binder = fun(name, id) {
-        Set.add(spellings, name)
-        if id != noId {
-            match Map.get(bound, name) {
-                Some(ids) -> Vec.push(ids, id)
-                None -> {
-                    Map.put(bound, name, [id])
-                    Vec.push(order, name)
-                }
-            }
-        }
-    }
-    match e.kind {
-        CVar(name, _) -> Set.add(spellings, name)
-        CJump(name, _, _) -> Set.add(spellings, name)
-        CLam(params, _, _) -> for p in params { binder(p.name, p.id) }
-        CLet(name, id, _, _, _, _) -> binder(name, id)
-        CLetRec(binds, _) -> for b in binds { binder(b.name, b.id) }
-        CJoin(name, id, params, _, _, _) -> {
-            binder(name, id)
-            for p in params { binder(p.name, p.id) }
-        }
-        CMatch(_, alts) -> for a in alts {
-            for (name, id) in scopedBy(a.alt) { binder(name, id) }
-        }
-        _ -> {}
-    }
-    eachKid(e.kind, spellingsIn(_, spellings, bound, order))
 }
 
 -- -- small questions about terms ------------------------------------------------------

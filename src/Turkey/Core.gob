@@ -1,10 +1,10 @@
 export (
     refName, refOf, isRef, refElem,
     Core(..), CoreKind(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..), noId,
-    altVars, openingOf, showAlt,
+    openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
-    namesOf, namesInto, codeAddressName, mentions, withoutRespelling,
+    namesOf, namesInto, codeAddressName, mentions, references, withoutRespelling,
     dictName, classOfDict, dictClass, isDictionary,
     abstractionBinders,
     Aliases(..), newAliases, alias,
@@ -104,8 +104,11 @@ fun mkCore(ty : Ty.Type, span : Option Span, kind : CoreKind) -> Core =
     Core { ty = ty, span = span, kind = kind, settledIn = 0 }
 
 -- A binder's spelling and its id are carried side by side. The passes after
--- `Turkey.Lower` key on the spelling; the id is what tells two binders that
--- share a spelling apart, in a dump and in the passes that come to read it.
+-- `Turkey.Lower` find a local binder by its id, and a spelling is only
+-- printed: two binders of one binding may share one. A binder with no id is
+-- found by its spelling: a top-level binding by its `Module#name`, which is
+-- unique, and an existential's evidence, which `Alt` has nowhere to keep an
+-- id for, by the spelling of its own that `Turkey.Opt` gives it.
 type CParam = CParam {
     name : String,
     id   : Int,
@@ -482,6 +485,80 @@ fun anyMentions[Iterator c, Item c ~ Core](xs : c, id : Int) -> Bool {
     False
 }
 
+-- Returns each binder a `CVar` in `e` refers to, once, as its spelling and
+-- id, in the order of first mention. A reference with an id is told apart by
+-- its id, and one with `noId` (a top-level binding a pass made, or an
+-- existential's evidence) by its spelling. Includes binders `e` binds itself
+-- and top-level bindings.
+fun references(e : Core) -> Vec (String, Int) {
+    let r = Refs { out = [], ids = Set.new(), spellings = Set.new() }
+    referencesInto(e, r)
+    r.out
+}
+
+type Refs = Refs {
+    out       : Vec (String, Int),
+    ids       : Set.Set Int,
+    spellings : Set.Set String,
+}
+
+fun referencesInto(e : Core, r : Refs) -> Unit = match e.kind {
+    CVar(name, id) -> if id == noId {
+        if !Set.contains(r.spellings, name) {
+            Set.add(r.spellings, name)
+            Vec.push(r.out, (name, id))
+        }
+    } else if !Set.contains(r.ids, id) {
+        Set.add(r.ids, id)
+        Vec.push(r.out, (name, id))
+    }
+    CLit(_) | CUnit | CCon(_) | CPrim(_) -> {}
+    CTuple(elems) -> for x in elems { referencesInto(x, r) }
+    CArray(elems) -> for x in elems { referencesInto(x, r) }
+    CDict(_, slots) -> for x in slots { referencesInto(x, r) }
+    CSlot(target, _) -> referencesInto(target, r)
+    CProject(target, _) -> referencesInto(target, r)
+    CIndex(target, index) -> {
+        referencesInto(target, r)
+        referencesInto(index, r)
+    }
+    CLam(_, body, _) -> referencesInto(body, r)
+    CApp(fn, args) -> {
+        referencesInto(fn, r)
+        for a in args { referencesInto(a, r) }
+    }
+    CTyLam(_, body) -> referencesInto(body, r)
+    CTyApp(fn, _) -> referencesInto(fn, r)
+    CLet(_, _, _, value, body, _) -> {
+        referencesInto(value, r)
+        referencesInto(body, r)
+    }
+    CLetRec(binds, body) -> {
+        for b in binds { referencesInto(bindValue(b), r) }
+        referencesInto(body, r)
+    }
+    CJoin(_, _, _, body, rest, _) -> {
+        referencesInto(body, r)
+        referencesInto(rest, r)
+    }
+    CJump(_, _, args) -> for a in args { referencesInto(a, r) }
+    CRef(value) -> referencesInto(value, r)
+    CDeref(target) -> referencesInto(target, r)
+    CAssign(target, value) -> {
+        referencesInto(target, r)
+        referencesInto(value, r)
+    }
+    CIf(cond, then, otherwise) -> {
+        referencesInto(cond, r)
+        referencesInto(then, r)
+        if let Some(o) = otherwise { referencesInto(o, r) }
+    }
+    CMatch(scrutinee, alts) -> {
+        referencesInto(scrutinee, r)
+        for a in alts { referencesInto(altBody(a), r) }
+    }
+}
+
 -- What `namesInto` reports a `Prim.codeAddress("symbol")` as. It uses the
 -- `foreign` definition with that C symbol as surely as a call would, but
 -- names the definition by its symbol rather than its binding, so it is
@@ -644,7 +721,7 @@ fun baseName(spelled : String) -> String {
 }
 
 -- `name` without the `~` and number `Turkey.Opt` adds, as many times as it
--- added one, to tell two binders of one spelling apart.
+-- added one, to give an existential's evidence a spelling of its own.
 fun withoutRespelling(name : String) -> String {
     let chars = Vec.new(String.byteLength(name))
     for c in String.codePoints(name) { Vec.push(chars, c) }
@@ -890,25 +967,6 @@ fun showAlt(alt : Alt, a : Aliases) -> String = match alt {
 fun showBinder(binder : Option (String, Int), a : Aliases) -> String = match binder {
     Some((name, id)) -> alias(a, name, id)
     None -> "_"
-}
-
--- The names an arm binds: its binders, and the dictionaries an opening
--- brings into scope.
-fun altVars(alt : Alt) -> Vec String {
-    let out = []
-    match alt {
-        ACon(_, fields, opening) -> {
-            match opening {
-                Some(o) -> for d in o.evidence { Vec.push(out, d) }
-                None -> {}
-            }
-            for f in fields { if let Some((n, _)) = f { Vec.push(out, n) } }
-        }
-        ATuple(elems) -> for f in elems { if let Some((n, _)) = f { Vec.push(out, n) } }
-        ALit(_) -> {}
-        AAny(binder) -> if let Some((n, _)) = binder { Vec.push(out, n) }
-    }
-    out
 }
 
 -- What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid

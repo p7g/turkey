@@ -893,13 +893,12 @@ type Keys = Map String (Map String (Map String (Vec Layout)))
 -- the first so the backend sees them, and into the rest so the rewrite does.
 --
 -- `locals` are the generalized bindings in scope, innermost last, each under
--- its `localKey`. Scoped, unlike `Turkey.Mono`'s, because `Turkey.Opt` has run:
--- an inlined copy keeps the ids of what it copied, so one id may be bound
--- inside another binding of itself.
+-- its id. Scoped because a local's copies keep the ids of the binders inside
+-- it, so a local inside one is bound once in each copy.
 type Scope = Scope {
     owner  : String,
     chain  : Array (Map String Layout),
-    locals : Vec (Map String Local),
+    locals : Vec (Map Int Local),
 }
 
 -- A generalized binding inside a body, and its copies.
@@ -925,8 +924,6 @@ type Local = Local {
 -- is not unique, since an inlined copy keeps the ids it copied, so a key
 -- identifies a binder only together with the scope: `localNamed` searches the
 -- innermost scope first, as the binding structure does.
-fun localKey(name : String, id : Int) -> String = Int.toString(id) + ":" + name
-
 fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
 
 fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
@@ -1264,7 +1261,11 @@ fun build(s : Sharer, made : String, original : String,
     let copy = withValue(b, rewrite(s, b.value, Scope {
         owner = original, chain = [layouts], locals = Vec.new(2),
     }))
+    -- A binding of its own, which `Turkey.Binders` has no record of: the
+    -- copies of one original would otherwise share its id, and a reference
+    -- to one would find another.
     copy.name = made
+    copy.id = noId
     copy.layouts = layouts
     copy
 }
@@ -1294,7 +1295,7 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
             CSlot(target, index) -> if len(args) > 0 && isDictionary(target.ty) {
                 return dynamicCall(s, e, fn, target, index, args, sc)
             }
-            CVar(n, id) -> match localNamed(sc, n, id) {
+            CVar(n, id) -> match localNamed(sc, id) {
                 Some(local) -> {
                     let (made, madeId) = requestLocal(s, sc, local, args, e)
                     return mkCore(e.ty, e.span, CTyApp(
@@ -1302,7 +1303,7 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
                 }
                 None -> if Set.contains(s.generic, n) {
                     return mkCore(e.ty, e.span, CTyApp(
-                        mkCore(fn.ty, fn.span, CVar(requestAt(s, sc, n, args, e), id)),
+                        mkCore(fn.ty, fn.span, CVar(requestAt(s, sc, n, args, e), noId)),
                         args))
                 }
             }
@@ -1485,7 +1486,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
             Map.put(shared, name, made)
             continue
         }
-        Vec.push(out, methodStub(value, stated, vs, inner, sc))
+        Vec.push(out, methodStub(s, value, stated, vs, inner, sc))
         let own = ownVars(m)
         let atoms = methodAtoms(m)
         let made = Map.new()
@@ -1591,7 +1592,7 @@ fun defaultAtoms(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Unit {
 -- one reads the keyed slot for its key (`dynamicCall`), so nothing calls
 -- this. Its atoms are given `unit`, which is as good as any layout for
 -- parameters nothing reads.
-fun methodStub(e : Core, stated : Option (Vec VarCell), vs : Vec VarCell,
+fun methodStub(s : Sharer, e : Core, stated : Option (Vec VarCell), vs : Vec VarCell,
                body : Core, sc : Scope) -> Core {
     defaultAtoms(vs, body.ty, sc)
     let (params, result) = match Ty.prune(body.ty) {
@@ -1600,7 +1601,9 @@ fun methodStub(e : Core, stated : Option (Vec VarCell), vs : Vec VarCell,
                     + "method and whose layouts are not known", e)
     }
     let names = Array.init(len(params), fun(i) {
-        CParam { name = "%unused" + Int.toString(i), id = noId, ty = params[i] }
+        let name = "%unused" + Int.toString(i)
+        CParam { name = name, ty = params[i],
+                 id = Binders.fresh(s.table, s.owner, name, Binders.Local, Synthesized(e.span)) }
     })
     let message = mkCore(Ty.tString(), e.span, CLit(LString(
         "internal error: a dictionary method was called at layouts it was not "
@@ -1631,15 +1634,25 @@ fun spineBinders(value : Core) -> Vec VarCell {
     out
 }
 
-fun localNamed(sc : Scope, name : String, id : Int) -> Option Local {
-    let key = localKey(name, id)
+-- The generalized local a reference with this id means, if it is one.
+fun localNamed(sc : Scope, id : Int) -> Option Local {
+    if id == noId { return None }
     for var i = len(sc.locals) - 1; i >= 0; i = i - 1 {
-        match Map.get(sc.locals[i], key) {
+        match Map.get(sc.locals[i], id) {
             Some(found) -> return Some(found)
             None -> {}
         }
     }
     None
+}
+
+-- The id of a generalized local, which every one has once `Turkey.Opt` has
+-- adopted the program's binders.
+fun idOf(name : String, id : Int, at : Core) -> Int {
+    if id == noId {
+        oopsAt("the generalized local '" + name + "' has no binder id", at)
+    }
+    id
 }
 
 -- The variables bound around a term, by the owner and every local scope: what
@@ -1676,10 +1689,8 @@ fun newLocal(s : Sharer, sc : Scope, name : String, id : Int, ty : Ty.Type,
 -- arguments: it is keyed by layout, and every argument tuple with that layout
 -- shares it. It is minted into an owner of this pass's own, not the local's:
 -- a local `Turkey.Opt` made has an owner whose binders are unrecorded. This
--- pass runs on one thread, so the order it mints in is the program's. A
--- local with no id has copies with none. The spelling is the local's and the
--- layout key, which tells one local's copies apart; two locals sharing a
--- spelling have copies sharing one, scoped as the locals are.
+-- pass runs on one thread, so the order it mints in is the program's. The
+-- spelling, which a dump prints, is the local's and the layout key.
 fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
                  at : Core) -> (String, Int) {
     if len(args) != len(local.binders) {
@@ -1699,9 +1710,7 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
         None -> {}
     }
     let made = local.name + "@[" + k + "]"
-    let madeId = if local.id == noId { noId } else {
-        Binders.fresh(s.table, s.owner, made, Binders.Local, CopyOf(local.id))
-    }
+    let madeId = Binders.fresh(s.table, s.owner, made, Binders.Local, CopyOf(local.id))
     let renaming = Map.new()
     let fresh = Vec.new(len(local.binders))
     for v in local.binders {
@@ -1751,7 +1760,7 @@ fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
         let binders = abstractionBinders(b)
         if len(binders) > 0 {
             let local = newLocal(s, sc, b.name, b.id, b.ty, b.value, binders, Some(b))
-            Map.put(scope, localKey(b.name, b.id), local)
+            Map.put(scope, idOf(b.name, b.id, e), local)
             Vec.push(locals, local)
         }
     }
@@ -1803,7 +1812,7 @@ fun localLet(s : Sharer, e : Core, name : String, id : Int, bound : Ty.Type, val
              sc : Scope) -> Core {
     let local = newLocal(s, sc, name, id, bound, value, binders, None)
     let scope = Map.new()
-    Map.put(scope, localKey(name, id), local)
+    Map.put(scope, idOf(name, id, e), local)
     Vec.push(sc.locals, scope)
     let rest = rewrite(s, body, sc)
     discard(Vec.pop(sc.locals))

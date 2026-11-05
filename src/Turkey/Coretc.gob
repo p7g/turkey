@@ -72,16 +72,19 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
 
 -- -- the environment ---------------------------------------------------------------
 
--- Whether a program's binder ids tell its binders apart.
+-- How often a program may bind one id. In either case no binder is bound
+-- inside the scope of another binder with its id, so a reference with an id
+-- means the one binder with that id in scope.
 type Ids
     -- Each id is bound at most once in the program, which `checkProgram`
-    -- checks, so a binder with an id is found by it. See `defineC`.
+    -- checks.
     = UniqueIds
-    -- Some pass copied binders together with their ids, so one id may stand
-    -- for several binders, or respelled a reference to point at a binder it
-    -- made, keeping the reference's id. A binder is filed under its spelling,
-    -- and ids are not checked.
-    | CopiedIds
+    -- An id may be bound more than once: `Turkey.Layout` copies a binding, or
+    -- a local's value, once per layout, and the copies keep the binders'
+    -- ids. Each copy is a separate binding or a separate scope, so the rule
+    -- above still holds, and the backend, which keeps a scope per binding,
+    -- relies on it.
+    | ScopedIds
 
 -- What a binder in scope stands for.
 type Bound = Bound {
@@ -146,27 +149,21 @@ fun layered(e : CEnv) -> CEnv =
     CEnv { ids = e.ids, inScope = Map.new(), outer = e.inScope, undo = [] }
 
 -- The key a reference is looked up by. A binder with no id -- a dictionary,
--- an instance's or a default method's binding, or a binder a pass after the
--- lowering made -- is found by its spelling even when ids are unique.
+-- an instance's or a default method's binding, an existential's evidence, or
+-- a binder a pass after the lowering made -- is found by its spelling.
 -- Spellings of those binders are not unique: every instance method's
 -- dictionary parameter is spelled alike, for one.
-fun keyOf(e : CEnv, name : String, id : Int) -> BinderKey = match e.ids {
-    UniqueIds -> if id == noId { BySpelling(name) } else { ById(id) }
-    CopiedIds -> BySpelling(name)
-}
+fun keyOf(name : String, id : Int) -> BinderKey =
+    if id == noId { BySpelling(name) } else { ById(id) }
 
--- Brings a binder into scope. Every binder is filed under its spelling, and
--- with `UniqueIds` one with an id under its id too: the passes after this one
--- still find a binder by its spelling, and `resolve` checks that the
--- spelling and the id find the same one.
+-- Brings a binder into scope, under its spelling, and under its id if it has
+-- one. A reference with no id may mean a binder with one: the lowering and
+-- the specializer write some references to top-level bindings with no id.
 fun defineC(e : CEnv, name : String, id : Int, binders : Vec VarCell,
             ty : Ty.Type) -> Unit {
     let b = Some(Bound { name = name, id = id, binders = binders, ty = ty })
     file(e, BySpelling(name), b)
-    match e.ids {
-        UniqueIds -> if id != noId { file(e, ById(id), b) }
-        CopiedIds -> {}
-    }
+    if id != noId { file(e, ById(id), b) }
 }
 
 fun file(e : CEnv, key : BinderKey, b : Option Bound) -> Unit {
@@ -175,7 +172,7 @@ fun file(e : CEnv, key : BinderKey, b : Option Bound) -> Unit {
 }
 
 fun lookupC(e : CEnv, name : String, id : Int) -> Option Bound =
-    lookupKey(e, keyOf(e, name, id))
+    lookupKey(e, keyOf(name, id))
 
 fun lookupKey(e : CEnv, key : BinderKey) -> Option Bound =
     match Map.get(e.inScope, key) {
@@ -280,7 +277,7 @@ fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
         UniqueIds -> for b in all {
             if b.id != noId { claim(first, b.id, b.name, b) }
         }
-        CopiedIds -> {}
+        ScopedIds -> {}
     }
     let top = newCEnv(ids)
     for g in globals { defineC(top, g.name, g.id, g.binders, g.ty) }
@@ -294,7 +291,7 @@ fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
                                  fun(ck, b) = checkTop(ck, b, layered(top)))
     match ids {
         UniqueIds -> checkUnique(first, all, bound)
-        CopiedIds -> {}
+        ScopedIds -> {}
     }
 }
 
@@ -328,23 +325,32 @@ fun claim(first : Map Int (String, String), id : Int, name : String,
 }
 
 -- Brings a binder the term binds into scope, and notes it for `checkUnique`.
+-- Raises an internal error if a binder with its id is in scope already.
 fun bind(ck : Checker, env : CEnv, name : String, id : Int, binders : Vec VarCell,
-         ty : Ty.Type) -> Unit {
+         ty : Ty.Type, where : Option Span) -> Unit {
+    if id != noId {
+        if let Some(outer) = lookupKey(env, ById(id)) {
+            fail("'" + name + "' is bound inside the scope of '" + outer.name
+                 + "', which has the same id", where)
+        }
+    }
     noteBound(ck, env, name, id)
     defineC(env, name, id, binders, ty)
 }
 
 fun noteBound(ck : Checker, env : CEnv, name : String, id : Int) -> Unit = match env.ids {
     UniqueIds -> if id != noId { Vec.push(ck.bound, (id, name)) }
-    CopiedIds -> {}
+    ScopedIds -> {}
 }
 
 -- The binder a reference names, which must be in scope.
 --
--- With `UniqueIds`, the binder its spelling finds must also be the one its id
--- finds. The passes after this one still go by the spelling, so a reference
--- whose id and spelling find two binders would mean one here and the other
--- there.
+-- A reference with an id is found by the id alone. Its spelling must be its
+-- binder's, because a dump prints the two by their spellings and ids and
+-- would otherwise print them as two binders. Whether the spelling would find
+-- some other binder is not checked: no pass after the lowering finds a
+-- binder with an id by its spelling, so a copy may sit under a binder it
+-- shares a spelling with.
 fun resolve(env : CEnv, name : String, id : Int, where : Option Span) -> Bound {
     let found = match lookupC(env, name, id) {
         Some(found) -> found
@@ -352,15 +358,6 @@ fun resolve(env : CEnv, name : String, id : Int, where : Option Span) -> Bound {
     }
     if found.name != name {
         fail("'" + name + "' has the id of the binder '" + found.name + "'", where)
-    }
-    match env.ids {
-        UniqueIds -> if let Some(spelled) = lookupKey(env, BySpelling(name)) {
-            if spelled.id != id {
-                fail("'" + name + "' refers to a binder that another '" + name
-                     + "' shadows", where)
-            }
-        }
-        CopiedIds -> {}
     }
     found
 }
@@ -447,7 +444,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
     CDict(cls, slots) -> checkDict(ck, e, cls, slots, env)
     CLam(params, body, _) -> {
         let mark = enter(env)
-        for p in params { bind(ck, env, p.name, p.id, [], p.ty) }
+        for p in params { bind(ck, env, p.name, p.id, [], p.ty, e.span) }
         let got = TFun(Array.map(params, _.ty), check(ck, body, env, None))
         leave(env, mark)
         got
@@ -460,14 +457,14 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
             mismatch(ck, bound, v, e.span, "the binding '" + name + "'")
         }
         let mark = enter(env)
-        bind(ck, env, name, id, binders, bound)
+        bind(ck, env, name, id, binders, bound, e.span)
         let got = check(ck, body, env, tail(ck, e, "body"))
         leave(env, mark)
         got
     }
     CLetRec(binds, body) -> {
         let mark = enter(env)
-        for b in binds { bind(ck, env, b.name, b.id, b.binders, b.ty) }
+        for b in binds { bind(ck, env, b.name, b.id, b.binders, b.ty, e.span) }
         for b in binds { checkBind(ck, b, env) }
         let got = check(ck, body, env, tail(ck, e, "body"))
         leave(env, mark)
@@ -513,7 +510,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         for alt in alts {
             let mark = enter(env)
             for (name, id, ty) in pattern(ck, alt.alt, s, e.span) {
-                bind(ck, env, name, id, [], ty)
+                bind(ck, env, name, id, [], ty, e.span)
             }
             let opened = openArm(ck, env, alt.alt, e.span)
             let got = check(ck, alt.body, env, joins)
@@ -855,14 +852,17 @@ fun checkJoin(ck : Checker, e : Core, name : String, id : Int, params : Array CP
     let innerJoins = Map.new()
     for (k, v) in Map.entries(joins) { Map.put(innerJoins, k, v) }
     let j = JoinPoint { name = name, id = id, params = params, ty = e.ty }
-    Map.put(innerJoins, BySpelling(name), j)
-    match env.ids {
-        UniqueIds -> if id != noId { Map.put(innerJoins, ById(id), j) }
-        CopiedIds -> {}
+    if id != noId {
+        if let Some(outer) = Map.get(joins, ById(id)) {
+            fail("the join point '" + name + "' is bound inside the scope of '"
+                 + outer.name + "', which has the same id", e.span)
+        }
     }
+    Map.put(innerJoins, BySpelling(name), j)
+    if id != noId { Map.put(innerJoins, ById(id), j) }
     noteBound(ck, env, name, id)
     let mark = enter(env)
-    for p in params { bind(ck, env, p.name, p.id, [], p.ty) }
+    for p in params { bind(ck, env, p.name, p.id, [], p.ty, e.span) }
     let bodyTy = check(ck, body, env,
                        if recursive { Some(innerJoins) } else { Some(joins) })
     leave(env, mark)
@@ -880,23 +880,13 @@ fun checkJoin(ck : Checker, e : Core, name : String, id : Int, params : Array CP
 -- in tail position -- are worth telling apart.
 fun checkJump(ck : Checker, e : Core, name : String, id : Int, args : Vec Core,
               env : CEnv) -> Ty.Type {
-    let found = Map.get(ck.joins, keyOf(env, name, id))
+    let found = Map.get(ck.joins, keyOf(name, id))
     let argTys = Array.map(args, check(ck, _, env, None))
     let params = match found {
         Some(j) -> {
             if j.name != name {
                 fail("a jump to '" + name + "' has the id of the join point '"
                      + j.name + "'", e.span)
-            }
-            -- As `resolve` checks a reference, and for the same reason.
-            match env.ids {
-                UniqueIds -> if let Some(spelled) = Map.get(ck.joins, BySpelling(name)) {
-                    if spelled.id != id {
-                        fail("a jump to '" + name + "' is to a join point that "
-                             + "another '" + name + "' shadows", e.span)
-                    }
-                }
-                CopiedIds -> {}
             }
             j.params
         }

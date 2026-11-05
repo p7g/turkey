@@ -119,7 +119,7 @@ import Net.TCP as TCP
 import Net.TLS as TLS
 import Net.TLS (TLSError, Roots(..))
 import Net.HTTP.Payload as Payload (Payload)
-import Net.HTTP.Error (HTTPError(..), ClientError(..), RedirectRefused(..), Refusal(..), FromHTTP(..))
+import Net.HTTP.Error (HTTPError(..), ClientError(..), RedirectRefused(..), Refusal(..), FromHTTP(..), transport, flattenError)
 import Net.HTTP.H1.Body as Framed
 import Net.HTTP.H1.Body (Drained(..))
 import Net.HTTP.H1.Head as Head
@@ -148,7 +148,9 @@ import Time.Clock as Clock
 import Time.Stopwatch as Stopwatch
 import System.IO as IO
 import System.Sync as Sync
+import System.Sync (Event, Mutex)
 import System.Task as Task
+import System.Task (Task)
 import Time (Timeout(..))
 import Time.Deadline as Deadline
 import Time.Deadline (Deadline)
@@ -430,17 +432,15 @@ fun switched[FromHTTP e](ex : Exchange, use : fun(Response Incoming, Duplex) -> 
     }
     -- The server switches once it has read the whole request, so the
     -- connection is the new protocol's only once the request was written.
-    awaitWriter(ex.written)
-    if Sync.load(ex.written) != 1 { return Left(fromHTTP(failWith(ex, MaybeSent(Truncated)))) }
+    let Wrote = awaitWriter(ex) else {
+        return Left(fromHTTP(failWith(ex, MaybeSent(Truncated))))
+    }
     ex.state = Over
     let p = ex.paced
     let conn = Pool.conn(p)
     Pool.carry(p, None)
     let d = Duplex.duplex(
-        fun(into : Buffer) = Either.mapLeft(Input.take(ex.input, into, Int.maxValue()), fun(e) = match e {
-            Left(h) -> fail(h)
-            Right(s) -> s
-        }),
+        fun(into : Buffer) = Either.mapLeft(Input.take(ex.input, into, Int.maxValue()), flattenError),
         fun(from : Buffer) = writeFrom(p, from),
         fun() = Right(()),
         fun(limit : Option Deadline) = Pool.carry(p, limit),
@@ -585,9 +585,7 @@ type Exchange = Exchange {
     hop : Hop,
     paced : Paced,
     input : Input Paced,
-    -- 0 while the request is being written, 1 once it all was, 2 if writing
-    -- it failed or its body was not sent.
-    written : Sync.AtomicInt,
+    writer : Writer,
     -- Whether the body is to be sent after `Expect: 100-continue`.
     verdict : Verdict,
     key : String,
@@ -598,10 +596,12 @@ type Exchange = Exchange {
     var pending : Option ResponseHead,
     var interim : Int,
     var state : State,
-    -- Why the body could not be written, if its own source failed rather
-    -- than the connection. Set by the writer before it stores `written`.
-    var sourceFailure : Option HTTPError,
 }
+
+-- The request's writer: one that finished before the response was read,
+-- for a request without a body, or a task of its own, and an event it sets
+-- as it finishes.
+type Writer = Finished(Written) | Running(Task Written, Event)
 
 -- Where an exchange is: reading heads; with its final response delivered;
 -- or over, after a failure or once `use` returned.
@@ -656,22 +656,14 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
     }
     let (conn, dialed) = made
     let p = Pool.paced(conn, total, c.settings.stall)
-    let written = Sync.atomicInt(0)
-    let verdict = Verdict { decided = Sync.atomicInt(0), ready = Sync.semaphore(0) }
-    let ex = Exchange {
-        client = c, hop = h, paced = p, input = Input.input(p, c.settings.limits), written, verdict,
-        key, dialed, began = Clock.monotonic(), pending = None, interim = 0, state = Reading, sourceFailure = None,
+    let v = verdict()
+    let proceed = if expecting { Some(fun() = awaitContinue(v, total)) } else { None }
+    let write = fun() = writeRequest(p, head, framing, Option.map(body, fun((s, _)) = s), proceed)
+    let exchangeOn = fun(writer) = Exchange {
+        client = c, hop = h, paced = p, input = Input.input(p, c.settings.limits), writer, verdict = v,
+        key, dialed, began = Clock.monotonic(), pending = None, interim = 0, state = Reading,
     }
-    let proceed = if expecting { Some(fun() = awaitContinue(verdict, total)) } else { None }
-    let write = fun() = match writeRequest(p, head, framing, Option.map(body, fun((s, _)) = s), proceed) {
-        Wrote -> Sync.store(written, 1)
-        SourceFailed(e) -> {
-            ex.sourceFailure = Some(e)
-            Sync.store(written, 2)
-        }
-        ConnectionFailed | Withheld -> Sync.store(written, 2)
-    }
-    let run = fun() -> Either Failure (Either e a) = match readHead(ex) {
+    let run = fun(ex : Exchange) -> Either Failure (Either e a) = match readHead(ex) {
         Right(rh) -> {
             ex.pending = Some(rh)
             let r = use(ex)
@@ -680,8 +672,8 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
         }
         Left(MaybeStale(e)) -> if reused {
             Pool.close(conn)
-            decide(verdict, Withhold)
-            awaitWriter(written)
+            decide(v, Withhold)
+            let _ = awaitWriter(ex)
             Left(Stale(MaybeSent(e)))
         } else {
             Left(Failed(failWith(ex, MaybeSent(e))))
@@ -689,13 +681,15 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
         Left(Broken(e)) -> Left(Failed(failWith(ex, e)))
     }
     match body {
-        None -> {
-            write()
-            run()
-        }
+        None -> run(exchangeOn(Finished(write())))
         Some(_) -> Task.runScope(do {
-            let _ = Task.spawn(write)?
-            pure(run())
+            let finished = Sync.event()
+            let task = Task.spawn(fun() {
+                let w = write()
+                Sync.setEvent(finished)
+                w
+            })?
+            pure(run(exchangeOn(Running(task, finished))))
         })
     }
 }
@@ -725,14 +719,10 @@ fun writeRequest(p : Paced, head : Buffer, framing : Framing, body : Option Stre
             connectionFailed = True
             e
         }))
-        None -> match Output.finish(w) {
-            Right(_) -> Right(())
-            Left(Left(h)) -> Left(fail(h))
-            Left(Right(e)) -> {
-                connectionFailed = True
-                Left(e)
-            }
-        }
+        None -> Either.mapLeft(Output.finish(w), fun(e) {
+            connectionFailed = Either.isRight(e)
+            flattenError(e)
+        })
     }
     match finished {
         Right(_) -> Wrote
@@ -764,19 +754,18 @@ let continueWait = Duration.seconds(1)
 
 -- Whether the body waiting on `Expect: 100-continue` is to be sent: decided
 -- once, by the reader on the server's 100 or final response, by the writer
--- when the wait runs out, or by a failure.
-type Verdict = Verdict { decided : Sync.AtomicInt, ready : Sync.Semaphore }
+-- when the wait runs out, or by a failure. `decided` is set once `decision`
+-- holds one.
+type Verdict = Verdict { decision : Mutex (Option Decision), decided : Event }
 
 type Decision = Send | Withhold
 
-fun code(d : Decision) -> Int = match d {
-    Send -> 1
-    Withhold -> 2
-}
+fun verdict() -> Verdict = Verdict { decision = Sync.mutex(None), decided = Sync.event() }
 
 -- Decides `v` as `d`, unless it has been decided, and wakes the writer.
 fun decide(v : Verdict, d : Decision) -> Unit {
-    if Sync.compareAndSet(v.decided, 0, code(d)) { Sync.release(v.ready) }
+    Sync.update(v.decision, Option.or(_, Some(d)))
+    Sync.setEvent(v.decided)
 }
 
 -- Waits for the server's verdict, up to `continueWait` and `total`, and
@@ -788,9 +777,12 @@ fun awaitContinue(v : Verdict, total : Option Deadline) -> Bool {
         Some(t) -> min(t, wait)
         None -> wait
     }
-    let _ = Sync.acquire(v.ready, Some(until))
-    let _ = Sync.compareAndSet(v.decided, 0, code(Send))
-    Sync.load(v.decided) == code(Send)
+    let _ = Sync.waitEvent(v.decided, until)
+    decide(v, Send)
+    match Sync.withLock(v.decision, fun(held) = held) {
+        Some(Send) -> True
+        _ -> False
+    }
 }
 
 -- How long making a connection took, step by step; all `None` for one taken
@@ -824,8 +816,6 @@ fun dial(c : Client, u : HTTPURL, total : Option Deadline) -> Either HTTPError (
         }
     }
 }
-
-fun transport[Error x](r : Either x a) -> Either HTTPError a = Either.mapLeft(r, fun(e) = Transport(fail(e)))
 
 -- How many interim responses a request may get before its final one. A
 -- server that sends them without end would otherwise hold `send`, which
@@ -870,10 +860,9 @@ fun failWith(ex : Exchange, e : ClientError) -> HTTPError {
     ex.state = Over
     Pool.close(Pool.conn(ex.paced))
     decide(ex.verdict, Withhold)
-    awaitWriter(ex.written)
-    match ex.sourceFailure {
-        Some(w) -> SendFailed(MaybeSent(w))
-        None -> SendFailed(e)
+    match awaitWriter(ex) {
+        SourceFailed(w) -> SendFailed(MaybeSent(w))
+        _ -> SendFailed(e)
     }
 }
 
@@ -882,7 +871,9 @@ fun failWith(ex : Exchange, e : ClientError) -> HTTPError {
 -- one, and once the exchange's callback has returned, fails with `Transport`
 -- of an `IOError` whose kind is `Closed`.
 fun next[FromHTTP e](ex : Exchange) -> Either e Received {
-    if let Reading = ex.state {} else { return Left(fromHTTP(closed())) }
+    let Reading = ex.state else {
+        return Left(fromHTTP(closed()))
+    }
     let rh = loop {
         let rh = match ex.pending {
             Some(rh) -> {
@@ -942,17 +933,31 @@ fun finish(ex : Exchange) -> Unit {
         Reading -> {
             Pool.close(Pool.conn(ex.paced))
             decide(ex.verdict, Withhold)
-            awaitWriter(ex.written)
+            let _ = awaitWriter(ex)
         }
         Over -> {}
     }
 }
 
--- Waits until the request's writer has stopped. Its task is in the same
--- scope, so it is about to finish: either it wrote everything, or the
--- connection, closed or failed, has ended its write.
-fun awaitWriter(written : Sync.AtomicInt) -> Unit {
-    while Sync.load(written) == 0 { Task.yield() }
+-- Returns how writing the request ended, waiting for its writer to stop.
+-- Its task is in the same scope, and stops once it wrote everything or the
+-- connection, closed or failed, ended its write.
+fun awaitWriter(ex : Exchange) -> Written = match ex.writer {
+    Finished(w) -> w
+    Running(task, _) -> Task.join(task)
+}
+
+-- Returns whether the request's writer has stopped having written it all,
+-- without waiting for a writer that is still running.
+fun wroteWhole(ex : Exchange) -> Bool {
+    let stopped = match ex.writer {
+        Finished(_) -> True
+        Running(_, finished) -> Sync.isEventSet(finished)
+    }
+    stopped && match awaitWriter(ex) {
+        Wrote -> True
+        _ -> False
+    }
 }
 
 -- Gives the exchange's connection back to the pool if the response ended
@@ -966,12 +971,12 @@ fun settle(ex : Exchange, framed : Framed.Body Paced, rh : ResponseHead) -> Unit
     let reusable = drained && rh.persistence == KeepAlive && Input.held(ex.input) == 0
         -- A request still being written when its response ended got an
         -- early response, and the server will not read the rest.
-        && Sync.load(ex.written) == 1
+        && wroteWhole(ex)
     if reusable {
         Pool.give(ex.client.pool, ex.key, conn)
     } else {
         Pool.close(conn)
-        awaitWriter(ex.written)
+        let _ = awaitWriter(ex)
     }
 }
 

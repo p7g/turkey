@@ -1067,17 +1067,26 @@ fun awaitWriter(ex : Exchange) -> Written = match ex.writer {
 }
 
 -- Returns whether the request's writer has stopped having written it all,
--- without waiting for a writer that is still running.
+-- waiting up to `writeGrace` for a writer that is still running.
 fun wroteWhole(ex : Exchange) -> Bool {
     let stopped = match ex.writer {
         Finished(_) -> True
-        Running(_, finished) -> Sync.isEventSet(finished)
+        Running(_, finished) -> Sync.waitEvent(finished, Deadline.after(writeGrace))
     }
     stopped && match awaitWriter(ex) {
         Wrote -> True
         _ -> False
     }
 }
+
+-- How long a response that ended exactly waits for its request's writer.
+-- The server responds only once the last byte has arrived, but the
+-- writer's task may not have run since that byte's write returned, so the
+-- reader can find the response complete before the writer has stopped.
+-- Without the wait, that race would close a reusable connection. A writer
+-- still running after the wait got an early response, from a server that
+-- will not read the rest, so its connection is closed.
+let writeGrace = Duration.millis(50)
 
 -- Gives the exchange's connection back to the pool if the response ended
 -- exactly and the request was written whole, and closes it otherwise.

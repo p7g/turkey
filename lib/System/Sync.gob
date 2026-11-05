@@ -3,29 +3,34 @@ export (
     AtomicInt, atomicInt, load, store, addAndGet, compareAndSet,
     Once, once, force,
     Semaphore, semaphore, acquire, release, withPermit,
+    Event, event, set, clear, isSet, wait, waitUnbounded,
 )
 
 -- What tasks that share data need when they run at once (`System.Task`): a
 -- mutex around a value, an integer changed atomically, a value computed once
--- however many tasks ask for it, and a count of permits that bounds how many
--- tasks do something at once.
+-- however many tasks ask for it, a count of permits that bounds how many
+-- tasks do something at once, and a flag that tasks wait to see raised.
 --
 -- A task waiting for any of them waits as it does in `Task.join`: it is
 -- suspended, and its worker runs other tasks meanwhile. The program's own
--- code waiting for a semaphore's permit runs no task meanwhile, since the one
--- that gives the permit back may be among them: it sleeps, and the right to
+-- code waiting for a semaphore's permit or an event runs no task meanwhile,
+-- since the one that gives the permit back or sets the event may be among
+-- them: it sleeps, and the right to
 -- run tasks goes to another thread. So nothing here holds up a worker.
 --
 -- Each keeps its state word in a `Prim.Atomic`, a cell of its own whose every
 -- access is atomic.
 
+import Time (Timeout(..))
 import Time.Clock as Clock
 import Time.Deadline (Deadline)
 import Time.Deadline as Deadline
 import Turkey.Coroutine as Co
+import Turkey.Poll as Poll
 import Turkey.Scheduler as Scheduler
 import Turkey.Semaphore (Semaphore)
 import Turkey.Semaphore as Semaphores
+import Turkey.Wait as Wait
 
 -- -- mutex -----------------------------------------------------------------------------
 
@@ -212,4 +217,98 @@ fun withPermit(s : Semaphore, f : fun() -> b) -> b {
     let made = f()
     release(s)
     made
+}
+
+-- -- events --------------------------------------------------------------------------
+
+-- A flag that tasks wait to see raised. `set` raises it and wakes every task
+-- waiting, and it stays raised, so every later `wait` returns at once, until
+-- `clear` lowers it.
+--
+--     let ready = Sync.event()
+--     ...
+--     Sync.set(ready)                     -- in one task
+--     Sync.waitUnbounded(ready)           -- in another
+--
+-- The flag and the waiters are read and written under the scheduler's lock.
+-- `waiters` holds a waiter whose deadline ended it until the next `set`, or
+-- until a wait finds the list twice as long as after its last pruning.
+type Event = Event { var raised : Bool, var waiters : Vec EventWaiter, var pruned : Int }
+
+-- `program` says whether the program's own stack waits, which `set` wakes
+-- differently (`Turkey.Wait.wakeEnded`).
+type EventWaiter = EventWaiter { waiter : Poll.Waiter, program : Bool }
+
+-- Returns an event, lowered.
+fun event() -> Event = Event { raised = False, waiters = [], pruned = 0 }
+
+-- Raises `e`, and wakes every task waiting for it.
+fun set(e : Event) -> Unit {
+    Scheduler.lock()
+    e.raised = True
+    for q in e.waiters {
+        -- False for a waiter whose deadline ended it.
+        if Poll.complete(q.waiter, 0) { Wait.wakeEnded(q.program) }
+    }
+    e.waiters = []
+    e.pruned = 0
+    Scheduler.unlock()
+}
+
+-- Lowers `e`. A task that waits for it from then on waits for the next `set`.
+fun clear(e : Event) -> Unit {
+    Scheduler.lock()
+    e.raised = False
+    Scheduler.unlock()
+}
+
+-- Returns whether `e` is raised.
+fun isSet(e : Event) -> Bool {
+    Scheduler.lock()
+    let raised = e.raised
+    Scheduler.unlock()
+    raised
+}
+
+-- Waits until `e` is raised, or until `t` runs out. Returns whether it is
+-- raised: at once, even with a deadline that has passed, if it is raised
+-- already.
+fun wait[Timeout t](e : Event, t : t) -> Bool = waitFor(e, Clock.nanos(Deadline.reading(deadline(t))))
+
+-- Waits until `e` is raised, however long that takes.
+fun waitUnbounded(e : Event) -> Unit {
+    let _ = waitFor(e, -1)
+}
+
+-- `wait` until `deadline` on `Turkey.Wait.now`'s clock, or without limit
+-- when it is -1.
+fun waitFor(e : Event, deadline : Int) -> Bool {
+    if isSet(e) { return True }
+    if deadline >= 0 && Wait.now() >= deadline { return False }
+    let program = Option.isNone(Co.running())
+    let outcome = Wait.parkApart(fun(timer) {
+        let w = Poll.sleeper(timer)
+        -- Raised since the look above.
+        if e.raised {
+            let _ = Poll.complete(w, 0)
+        } else {
+            prune(e)
+            Vec.push(e.waiters, EventWaiter { waiter = w, program })
+        }
+        w
+    }, deadline)
+    outcome == 0
+}
+
+-- Drops the waiters that deadlines ended, once the list has doubled since it
+-- was last pruned, so that timed waits on an event never set keep it to
+-- twice the waiters still waiting, at a constant cost per wait on average.
+fun prune(e : Event) -> Unit {
+    if len(e.waiters) < 8 || len(e.waiters) < 2 * e.pruned { return () }
+    let kept = []
+    for q in e.waiters {
+        if !Poll.finished(q.waiter) { Vec.push(kept, q) }
+    }
+    e.waiters = kept
+    e.pruned = len(kept)
 }

@@ -1,6 +1,6 @@
-"""`System.Sync`: a mutex, atomic integers, and a value computed once, used by
-tasks that run at once. Each program's result must be the same at any number
-of workers; at one, tasks interleave only where they wait.
+"""`System.Sync`: a mutex, atomic integers, a value computed once and an
+event, used by tasks that run at once. Each program's result must be the same
+at any number of workers; at one, tasks interleave only where they wait.
 """
 
 import pytest
@@ -116,3 +116,58 @@ def test_the_counters_survive_collections(workers):
                       flags=("--gc-verify",))
     assert result.code == 0, result.stderr
     assert result.stdout == "79800\n400\n400\nTrue\nFalse\n7\n"
+
+
+# Tasks wait for an event that a later task sets; it stays set, and lets a
+# wait with a deadline already passed through, until it is cleared. Waits
+# with deadlines on an event nobody sets give up at them, and the program's
+# own stack then waits, unbounded, for a task that sets it.
+EVENT = """
+import System.Sync as Sync
+import System.Task as Task
+import Time.Duration as Duration
+
+fun main() {
+    let e = Sync.event()
+    print(Sync.isSet(e))
+    print(Sync.wait(e, Duration.millis(20)))
+    let woken = Sync.atomicInt(0)
+    Task.runScope(do {
+        for _ in [1, 2, 3] {
+            let _ = Task.spawn(fun() {
+                Sync.waitUnbounded(e)
+                let _ = Sync.addAndGet(woken, 1)
+            })?
+        }
+        let _ = Task.spawn(fun() = Sync.set(e))?
+        pure(())
+    })
+    print(Sync.load(woken))
+    print(Sync.wait(e, Duration.nanos(0)))
+    Sync.clear(e)
+    print(Sync.isSet(e))
+    let gaveUp = Sync.atomicInt(0)
+    Task.runScope(do {
+        for _ in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] {
+            let _ = Task.spawn(fun() {
+                if !Sync.wait(e, Duration.millis(1)) { let _ = Sync.addAndGet(gaveUp, 1) }
+            })?
+        }
+        pure(())
+    })
+    print(Sync.load(gaveUp))
+    Task.runScope(do {
+        let _ = Task.spawn(fun() = Sync.set(e))?
+        Sync.waitUnbounded(e)
+        pure(())
+    })
+    print(Sync.isSet(e))
+}
+"""
+
+
+@pytest.mark.parametrize("workers", COUNTS)
+def test_an_event_wakes_every_waiter_and_stays_set(workers):
+    result = lang.run(EVENT, env={"TURKEY_WORKERS": workers})
+    assert result.code == 0, result.stderr
+    assert result.stdout == "False\nFalse\n3\nTrue\nFalse\n20\nTrue\n"

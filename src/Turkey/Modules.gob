@@ -125,6 +125,10 @@ fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
 
 -- Conflicts retain declaration identities, not import spellings: two routes
 -- to the same re-export are still one declaration.
+--
+-- An ambiguous name is reported, and the first of its declarations in order of
+-- internal name is returned, so that the caller does not report the name again
+-- as undefined.
 fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
     match Map.get(conflictsIn(s, space), name) {
@@ -133,7 +137,7 @@ fun lookupName(s : Scope, space : Namespace, name : String,
                 + String.join(Vec.map(Vec.sort(targets), fun(t) =
                     quoted(String.replace(t, "#", "."))), " and ")
                 + "; write the qualified name of the one you mean", where)
-            None
+            Some(Vec.sort(targets)[0])
         }
         None -> Map.get(spaceAt(s, space), name)
     }
@@ -525,11 +529,13 @@ fun finish(l : Loader, names : Vec String) -> Unit {
     -- The last round reports what is wrong, and is the only round of a
     -- component of one module.
     --
-    -- Only the first module with something wrong reports it. A module loaded
-    -- after it, or beside it in a cycle, imports from it or from what imports
-    -- it, and would report the same missing names again. Within that module,
-    -- an export of a name an import failed to bring would be reported again
-    -- as undefined, so its exports are not checked once its imports report.
+    -- The scope and export checks report only while nothing has been reported
+    -- yet. A module checked after an error, or beside it in a cycle, imports
+    -- from what failed or from what imports it, and would report the same
+    -- missing names again; an error reported earlier in the same module, such
+    -- as a misplaced foreign declaration, turns them off as well. A module's
+    -- exports are not checked once its imports report, since an export of a
+    -- name an import failed to bring would be reported again as undefined.
     for m in modules {
         let strict = !Diag.hasErrors()
         let before = Diag.errorCount()
@@ -663,7 +669,9 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
     }
     let imports = newScope()
     for imp in m.program.imports {
-        if !optsOut(imp) {
+        -- An import of the entry was reported when the module was read, and
+        -- the entry is not loaded yet.
+        if !optsOut(imp) && imp.name != Prelude.entryName {
             let dep = moduleNamed(l, imp.name)
             let alias = match imp.alias {
                 Some(a) -> a
@@ -968,7 +976,10 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
     Map.put(out.types, item.name, target)
     let variants = variantsOf(l, Some(target))
     for con in subsFrom(item, variants) {
-        if strict && !Vec.contains(variants, con) { notConstructor(con, item) }
+        if strict && !Vec.contains(variants, con) {
+            notConstructor(con, item)
+            continue
+        }
         match firstOf(Map.get(mine.cons, con),
                       findName(m.scope, ConstructorSpace, con, item, strict)) {
             Some(t) -> if constructorMember(l, Some(target), con, Some(t)) {
@@ -998,7 +1009,7 @@ fun exported(m : Module, own : Map String String, space : Namespace,
     found
 }
 
--- `lookupName`, which refuses an ambiguous name; or, in a round that reports
+-- `lookupName`, which reports an ambiguous name; or, in a round that reports
 -- nothing, the scope's own entry, ambiguous or not.
 fun findName(s : Scope, space : Namespace, name : String, item : ExportItem,
              strict : Bool) -> Option String =
@@ -1229,7 +1240,8 @@ fun ownScope(name : String, program : Program) -> Scope {
 -- -- diagnostics --------------------------------------------------------------------
 
 -- Ends the compile, for a module that cannot be loaded: one that cannot be
--- found or read, or the entry named as an import. The import graph is built
+-- found or read, or the entry's file reached through another module's name.
+-- The import graph is built
 -- by following what each module imports, so without the module's source
 -- there is nothing further to follow, and every module that imports it would
 -- only report the same gap.

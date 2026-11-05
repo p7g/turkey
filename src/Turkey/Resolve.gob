@@ -1,4 +1,4 @@
-export (program, arities, operators, declare)
+export (program, arities, operators, declare, protocolMethod)
 
 -- Name resolution across modules.
 --
@@ -305,9 +305,7 @@ fun instanceDecl(r : R, d : InstanceDecl) -> Unit {
     -- internal error.
     for meth in d.methods {
         enter(r, meth.id, meth.span)
-        if let Some(id) = Binders.named(r.binders, d.cls + "." + meth.name) {
-            Binders.record(r.binders, meth.id, id)
-        }
+        Binders.refer(r.binders, meth.id, d.cls + "." + meth.name)
         funDecl(r, meth)
     }
 }
@@ -340,15 +338,9 @@ fun topLevelBinding(r : R, s : Stmt, pat : Pat, value : Expr) -> Unit {
 }
 
 -- Makes the owner `declare` registered for the declaration `nodeId` the one
--- the locals of its body are minted into. Only a compiler bug can leave one
--- unregistered, because `declare` reads the same declarations this walk does.
+-- the locals of its body are minted into.
 fun enter(r : R, nodeId : Int, where : Span) -> Unit {
-    r.owner = match Binders.declarationOwner(r.binders, nodeId) {
-        Some(o) -> o
-        None -> Diag.fail(Diag.at("internal error",
-                                  "this declaration was never given an owner", where),
-                          where.file)
-    }
+    r.owner = Binders.declarationOwner(r.binders, nodeId, where)
 }
 
 fun funDecl(r : R, d : FunDecl) -> Unit {
@@ -467,7 +459,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
                 None -> match lookupName(r.scope, ValueSpace, name, Some(e.span)) {
                     Some(target) -> {
                         e.kind = EVar(target, False)
-                        refer(r, e.id, target)
+                        Binders.refer(r.binders, e.id, target)
                     }
                     None -> {
                         if String.contains(name, ".") {
@@ -663,23 +655,25 @@ fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
 
 -- Resolves the marked reference `e`, spelled `name`, in the protocol-method
 -- scope.
-fun method(r : R, e : Expr, name : String) -> Unit =
-    match lookupName(r.scope, MethodSpace, name, Some(e.span)) {
-        Some(target) -> {
-            e.kind = EVar(target, True)
-            refer(r, e.id, target)
-        }
-        None -> Binders.leaveUnresolved(r.binders, e.id, name)
-    }
+fun method(r : R, e : Expr, name : String) -> Unit {
+    let found = protocolMethod(r.scope, r.binders, e.id, name, e.span)
+    if let Some(target) = found { e.kind = EVar(target, True) }
+}
 
--- Records the reference `nodeId` against the top-level binder resolved to
--- `target`. A target `declare` did not declare is left without an entry, for
--- `Binders.checkReferences` to report.
-fun refer(r : R, nodeId : Int, target : String) -> Unit =
-    match Binders.named(r.binders, target) {
-        Some(id) -> Binders.record(r.binders, nodeId, id)
-        None -> {}
+-- Returns the internal name of the class method `name` in the protocol-method
+-- scope of `scope`, after recording the reference `nodeId`, spanned by
+-- `where`, against its binder. Returns `None` when the scope has no such
+-- method, after leaving `nodeId` for inference to report. Raises a diagnostic
+-- at `where` when the scope imports two different methods named `name`.
+fun protocolMethod(scope : Scope, binders : Binders.Table, nodeId : Int,
+                   name : String, where : Span) -> Option String {
+    let found = lookupName(scope, MethodSpace, name, Some(where))
+    match found {
+        Some(target) -> Binders.refer(binders, nodeId, target)
+        None -> Binders.leaveUnresolved(binders, nodeId, name)
     }
+    found
+}
 
 -- A method reference *this* stage writes, for a node the parser left bare.
 -- `None` when the module cannot see the method at all, which leaves the
@@ -692,7 +686,7 @@ fun methodRef(r : R, name : String, where : Span) -> Option Expr =
         -- hold a whole program: the second `get` would read the first's type.
         Some(target) -> {
             let made = Expr { id = freshNodeId(), span = where, kind = EVar(target, True) }
-            refer(r, made.id, target)
+            Binders.refer(r.binders, made.id, target)
             Some(made)
         }
     }
@@ -770,7 +764,7 @@ fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -
     match declared(r, name, where) {
         Some((_, target)) -> {
             let fn = node(where, EVar(target, False))
-            refer(r, fn.id, target)
+            Binders.refer(r.binders, fn.id, target)
             node(where, EBinary(name, left, right, Some(fn)))
         }
         None -> match Fixity.builtinGroup(name) {

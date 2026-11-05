@@ -1,7 +1,8 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
     newTable, owner, fresh, ownerOf, localOf, binderAt,
-    declare, named, record, leaveUnresolved, ownDeclaration, declarationOwner,
+    declare, named, record, refer, leaveUnresolved,
+    ownDeclaration, declarationOwner,
     checkReferences, checkInferred,
 )
 
@@ -31,7 +32,8 @@ import Turkey.Source (Span)
 
 -- What a binder is to the program.
 type Kind
-    -- A parameter, a pattern variable, a `let`, `var` or local `fun`.
+    -- A parameter, a pattern variable, a `let`, `var` or local `fun`, or a
+    -- temporary the compiler writes.
     = Local
     -- A top-level `fun`, `let`, `var` or `foreign` definition.
     | TopLevel
@@ -45,6 +47,8 @@ type Origin
     -- Bound by the program text at the span. The flag is whether it is a
     -- `var`, which is what gives it a cell.
     = Written(Span, Bool)
+    -- Made by the compiler for the construct at the span. Never a `var`.
+    | Generated(Span)
     -- A primitive.
     | Builtin
     -- A copy of the binder with this id, whose span and mutability it takes.
@@ -80,8 +84,8 @@ type Table = Table {
     -- a top-level statement's, a class or instance method's, or a foreign
     -- definition's.
     declarationOwners : Map Int Int,
-    -- The `EVar` nodes resolution could not find a binder for, which leaves
-    -- them for inference to report, with their spellings.
+    -- The `EVar` nodes no binder was found for when they were resolved or
+    -- written, with their spellings. Inference reports them.
     unresolved        : Map Int String,
 }
 
@@ -107,6 +111,7 @@ fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
     let o = t.owners[ownerId]
     let (span, mutable, from) = match origin {
         Written(where, isVar) -> (Some(where), isVar, None)
+        Generated(where) -> (Some(where), False, None)
         Builtin -> (None, False, None)
         CopyOf(id) -> {
             let b = binderAt(t, id)
@@ -148,16 +153,34 @@ fun named(t : Table, internal : String) -> Option Int = Map.get(t.byName, intern
 -- Records that the node `nodeId` binds or means the binder `id`.
 fun record(t : Table, nodeId : Int, id : Int) -> Unit = Map.put(t.refs, nodeId, id)
 
+-- Records that the node `nodeId` means the top-level binder named `internal`.
+-- Records nothing when no binder was declared under that name, which leaves
+-- the node for `checkReferences` to report.
+fun refer(t : Table, nodeId : Int, internal : String) -> Unit =
+    match named(t, internal) {
+        Some(id) -> record(t, nodeId, id)
+        None -> {}
+    }
+
 -- Records `ownerId` as the owner of the top-level declaration `nodeId`.
 fun ownDeclaration(t : Table, nodeId : Int, ownerId : Int) -> Unit =
     Map.put(t.declarationOwners, nodeId, ownerId)
 
--- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`.
-fun declarationOwner(t : Table, nodeId : Int) -> Option Int =
-    Map.get(t.declarationOwners, nodeId)
+-- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`,
+-- which is spanned by `where`. Raises an internal error if none was recorded,
+-- which only a compiler bug can cause: every stage that mints walks the
+-- declarations `Turkey.Resolve.declare` registered.
+fun declarationOwner(t : Table, nodeId : Int, where : Span) -> Int =
+    match Map.get(t.declarationOwners, nodeId) {
+        Some(o) -> o
+        None -> Diag.fail(Diag.at("internal error",
+                                  "this declaration was never given an owner", where),
+                          where.file)
+    }
 
--- Records that the `EVar` node `nodeId`, spelled `name`, means no binder
--- resolution could find.
+-- Records that the `EVar` node `nodeId`, spelled `name`, means no binder the
+-- stage that resolved or wrote it could find, which leaves it for inference to
+-- report.
 fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
     Map.put(t.unresolved, nodeId, name)
 
@@ -166,7 +189,8 @@ fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
 -- unless the alternatives of each match arm bind each name to one binder.
 -- Covers the method references resolution writes into `EIndex`, `EUnary`,
 -- `EBinary`, `EForIn` and `EQuestion`, which are not among
--- `Turkey.Ast.children`. Costs a walk of the whole program.
+-- `Turkey.Ast.children`, so it can run before `Turkey.Desugar` or after it.
+-- Costs a walk of the whole program.
 fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     let missing = []
     for decl in p.decls {
@@ -188,19 +212,19 @@ fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     }
     if len(missing) > 0 {
         Diag.fail(Diag.whole("internal error",
-            "resolution recorded " + String.join(missing, ", ")), file)
+            "the binder table has " + String.join(missing, ", ")), file)
     }
 }
 
--- Raises an internal error if resolution left any reference for inference to
+-- Raises an internal error if any reference was left for inference to
 -- report. Call it once inference has accepted the program: such a reference
--- is then one inference found a binder for and resolution did not.
+-- is then one inference found a binder for and the table has none for.
 fun checkInferred(t : Table, file : String) -> Unit {
     let names = Array.map(Array.sort(Map.values(t.unresolved)), fun(n) = "'" + n + "'")
     if len(names) > 0 {
         Diag.fail(Diag.whole("internal error",
-            "inference found binders that resolution did not, for "
-            + String.join(names, ", ")), file)
+            "no stage recorded a binder for " + String.join(names, ", ")
+            + ", but inference found one"), file)
     }
 }
 

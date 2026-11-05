@@ -157,7 +157,8 @@ because each class has a single type parameter. `Money * Int` cannot be given
 a meaning with `*`; write a function instead.
 
 The operator always means the class method, even in a module that declares its
-own function called `add` or `eq`. Being Prelude declarations, these operators
+own function called `add` or `eq`, or a class of its own with a method called
+`neg`. Being Prelude declarations, these operators
 are imported like the Prelude's other names: a module that writes
 `import Prelude ()` has none of them until it imports them from the modules
 that declare them, `Data.Num`, `Data.Eq`, `Data.Ord` and, for the
@@ -534,7 +535,8 @@ mean `get(c, k)` and `set(c, k, v)`, the methods of the classes
 [`Index` and `SetIndex`](builtins.md#index), so indexing works on any type with
 an instance. The library has instances for `Array` and `Vec`, whose keys are
 `Int` positions counting from zero, and for `Map`, whose keys are the map's key
-type.
+type. They mean those two methods even in a module with a class of its own
+whose method is called `get` or `set`.
 
 <!-- run -->
 ```kotlin

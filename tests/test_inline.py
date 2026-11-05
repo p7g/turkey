@@ -146,20 +146,24 @@ def test_a_library_name_for_a_bulk_primitive_is_inlined():
     assert lang.output(FILL_RUN) == "[1, 9, 9, 4]\n"
 
 
-def _unspelled(body: str) -> str:
-    """`body` without what a spelling decides: the numbers a dump gives two
-    binders of one spelling, and the `Renamed` that tells the hand-renamed
-    callees apart."""
-    body = re.sub(r"%\d+", "", body)
-    body = body.replace("Renamed", "")
-    return re.sub(r"\bm\b", "n", body)
-
-
 def test_a_callee_optimizes_alike_whatever_its_parameter_is_spelled():
     # `inlinedRenamed` is `inlined` with the callee's parameter spelled `m`
-    # rather than like the caller's `n`; see the program's header.
+    # rather than like the caller's `n`; see the program's header. The two
+    # bodies must match token for token, `%k` numbers included, except that
+    # one name in `inlined` -- whatever the callee's binder prints as there --
+    # is `m` in `inlinedRenamed`, everywhere and nowhere else. Two binders that
+    # a capture had merged, or one that had split, would break that bijection.
     golden = (Path(__file__).parent / "programs" / "loop_result_shadowed.opt").read_text()
-    inlined = _body(golden, "Main#inlined")
-    renamed = _body(golden, "Main#inlinedRenamed")
-    assert inlined and renamed
-    assert _unspelled(inlined) == _unspelled(renamed), (inlined, renamed)
+    inlined = _tokens(_body(golden, "Main#inlined"))
+    renamed = _tokens(_body(golden, "Main#inlinedRenamed"))
+    assert inlined and len(inlined) == len(renamed), (inlined, renamed)
+    pairs = {(a, b) for a, b in zip(inlined, renamed) if a != b}
+    assert len(pairs) == 1, pairs
+    alias, other = pairs.pop()
+    assert other == "m", (alias, other)
+    assert alias not in renamed and "m" not in inlined, (alias, inlined, renamed)
+
+
+def _tokens(body: str) -> list[str]:
+    """`body` as names, numbers and single punctuation marks."""
+    return re.findall(r"[A-Za-z_%][\w%#.@~]*|\d+|\S", body)

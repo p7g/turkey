@@ -390,14 +390,13 @@ type Reducer = Reducer {
 
 -- Where the binders a reduction makes are numbered (`mint`): in `owner`, the
 -- component's own, from `count`, or while `bodyOf` reduces a callee, in
--- `scratch`, from `next`.
+-- `scratch`, from the worker's `Cache.scratch`.
 type Minting = Minting {
     table        : Binders.Table,
     owner        : Int,
     var count    : Int,
     scratch      : Int,
     var template : Bool,
-    var next     : Int,
 }
 
 -- Answers about bindings of finished components, kept by a worker across the
@@ -412,11 +411,15 @@ type Cache = Cache {
     moves   : Map String Bool,
     ends    : Map String Bool,
     wrote   : Map String Int,
+    -- How many binders this worker has numbered in the scratch owner, for the
+    -- bodies `bodyOf` reduces (`mint`). Never reset, unlike the answers above
+    -- it is not a function of any binding, and no output depends on it.
+    var scratch : Int,
 }
 
 fun newCache() -> Cache = Cache {
     reduced = Map.new(), sizes = Map.new(), moves = Map.new(), ends = Map.new(),
-    wrote = Map.new(),
+    wrote = Map.new(), scratch = 0,
 }
 
 -- The component of each binding, and of just the bindings that can be a
@@ -471,7 +474,7 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         minting = Minting {
             table = table, owner = -1, count = 0,
             scratch = Binders.unrecordedOwner(table, "", "the bodies Turkey.Opt copies"),
-            template = False, next = 0,
+            template = False,
         },
         homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
         component = -1,
@@ -491,7 +494,7 @@ fun forComponent(base : Reducer, c : Int, owner : Int, finished : fun(Int) -> Do
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     minting = Minting {
         table = base.minting.table, owner = owner, count = 0,
-        scratch = base.minting.scratch, template = False, next = 0,
+        scratch = base.minting.scratch, template = False,
     },
     homes = base.homes, component = c, finished = finished,
 }
@@ -931,10 +934,19 @@ fun fresh(r : Reducer, hint : String) -> (String, Int) {
 -- `reduceProgram` registered before any component started, and one worker
 -- reduces the whole component in order. So the ids it mints are a function of
 -- the component alone, whichever worker runs it and whatever else that worker
--- reduced first. A body `bodyOf` reduces is numbered from 0 in `scratch`
--- instead: such a body is cached on a worker, so the component that asks for
--- it first varies from run to run, and numbering it in that component's owner
--- would make the component's later ids vary too.
+-- reduced first.
+--
+-- A body `bodyOf` reduces is numbered in `scratch` instead, from a count the
+-- worker keeps and never resets. Such a body is cached on a worker, so the
+-- component that asks for it first varies from run to run, and numbering it
+-- in that component's owner would make the component's later ids vary too.
+-- Its own ids vary with what the worker reduced before, which no output
+-- shows: the body reaches the output only through a copy, and a copy mints
+-- afresh in walk order. They are unique on the worker, though, and that
+-- matters. A body reduced inside another is keyed by type arguments that may
+-- name the outer one's rigid constants, whose uids come from these ids. A
+-- count restarted per body would let the inner body open a constant with an
+-- outer one's uid, and its copy would then replace both.
 --
 -- No id minted here is recorded in the table (`Binders.unrecorded`). Most are
 -- copies, the self-compile makes millions, and nothing after this pass reads
@@ -942,8 +954,8 @@ fun fresh(r : Reducer, hint : String) -> (String, Int) {
 fun mint(r : Reducer) -> Int {
     let m = r.minting
     if m.template {
-        m.next = m.next + 1
-        return Binders.unrecorded(m.table, m.scratch, m.next - 1)
+        r.cache.scratch = r.cache.scratch + 1
+        return Binders.unrecorded(m.table, m.scratch, r.cache.scratch - 1)
     }
     m.count = m.count + 1
     Binders.unrecorded(m.table, m.owner, m.count - 1)
@@ -1213,11 +1225,10 @@ fun endsOf(r : Reducer, name : String, key : String, body : Core) -> Bool {
 -- that termination is a property of this function rather than of that argument.
 --
 -- It is reduced as if no speculation were under way, and the binders it makes
--- are numbered from 0 in `scratch`, so that the body is the same whichever
--- component asks for it first, on whichever worker: each worker reduces it
--- once. Those ids are not recorded and are shared by every such body, which
--- is sound because no such body reaches the output: `inlineApp` copies it into
--- each caller, and the copy gives every binder in it a fresh id.
+-- are numbered in `scratch` (`mint`), so that the body is the same whichever
+-- component asks for it first, on whichever worker, but for its ids: each
+-- worker reduces it once. No such body reaches the output: `inlineApp` copies
+-- it into each caller, and the copy gives every binder in it a fresh id.
 fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
     match reducedOf(r, name, key) {
         Some(found) -> found
@@ -1227,18 +1238,16 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
                 _ -> oops("a callee whose value is not a lambda")
             }
             let m = r.minting
-            let (template, next) = (m.template, m.next)
+            let template = m.template
             let (speculating, within) = (r.inlining.speculating, r.inlining.within)
             let declined = r.inlining.declined
             m.template = True
-            m.next = 0
             r.inlining.speculating = False
             r.inlining.within = name
             Vec.push(r.inlining.active, name)
             let made = expr(r, inner)
             discard(Vec.pop(r.inlining.active))
             m.template = template
-            m.next = next
             r.inlining.speculating = speculating
             r.inlining.within = within
             -- What the body declined is about the body's own fixed point, and
@@ -1608,8 +1617,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
 
     -- One jump: the body moves there, and nothing is copied.
     if len(jumps) == 1 {
-        let args = jumpArgs(jumps[0])
-        let made = expr(r, applyParams(r, params, args, body, e.ty, Moving))
+        let made = expr(r, atTheJump(r, params, jumpArgs(jumps[0]), body, e.ty))
         return Some(replaceJumps(rest, id, fun(_) = Some(made)))
     }
 
@@ -1668,6 +1676,53 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
         out = mkCore(e.ty, e.span, CJoin(label, labelId, ps, made, out, False))
     }
     Some(out)
+}
+
+-- `body`, moved to the one jump that passes it `args`, with each parameter
+-- bound to its argument.
+--
+-- A constructor the jump builds is passed as its fields, as `flattenJoin`
+-- passes them to a join that stays: each field is bound to a name, and the
+-- parameter to the constructor rebuilt from those names, which `knownLet` can
+-- take apart where the body matches on it. Every other argument that is not
+-- a value is bound to a name too, so that the arguments are still evaluated
+-- left to right, before the body.
+fun atTheJump(r : Reducer, params : Array CParam, args : Vec Core, body : Core,
+              ty : Ty.Type) -> Core {
+    let lets = []
+    let rebuilt = []
+    let names = []
+    let values = []
+    for var i = 0; i < len(args); i = i + 1 {
+        let arg = args[i]
+        let p = params[i]
+        if unfoldable(r, arg) && !Iterator.all(knownParts(arg), isAtom) {
+            let vars = Array.map(knownParts(arg), fun(part) =
+                if isAtom(part) { part } else { named(r, lets, "jf", part) })
+            Vec.push(rebuilt, (p, rebuildKnown(arg, vars)))
+        } else {
+            Vec.push(names, (p.name, p.id))
+            Vec.push(values, if isValue(r.decls, arg) { arg } else { named(r, lets, "jv", arg) })
+        }
+    }
+    var inner = body
+    for var i = len(rebuilt) - 1; i >= 0; i = i - 1 {
+        let (p, value) = rebuilt[i]
+        inner = mkCore(ty, value.span, CLet(p.name, p.id, p.ty, value, inner, []))
+    }
+    var out = applyNames(r, names, values, inner, ty, Moving)
+    for var i = len(lets) - 1; i >= 0; i = i - 1 {
+        let (name, id, value) = lets[i]
+        out = mkCore(ty, value.span, CLet(name, id, value.ty, value, out, []))
+    }
+    out
+}
+
+-- A reference to a new binder of `value`, which is added to `lets`.
+fun named(r : Reducer, lets : Vec (String, Int, Core), hint : String, value : Core) -> Core {
+    let (name, id) = fresh(r, hint)
+    Vec.push(lets, (name, id, value))
+    mkCore(value.ty, value.span, CVar(name, id))
 }
 
 -- The jump a specialized copy wants in place of this one, if its signature

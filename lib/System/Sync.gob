@@ -3,20 +3,22 @@ export (
     AtomicInt, atomicInt, load, store, addAndGet, compareAndSet,
     Once, once, force,
     Semaphore, semaphore, acquire, release, withPermit,
-    Event, event, set, clear, isSet, wait, waitUnbounded,
+    Event, event, setEvent, clearEvent, isEventSet, waitEvent, waitEventUnbounded,
+    Condition, condition, waitFor, waitForUnbounded, notifyAll,
 )
 
 -- What tasks that share data need when they run at once (`System.Task`): a
 -- mutex around a value, an integer changed atomically, a value computed once
 -- however many tasks ask for it, a count of permits that bounds how many
--- tasks do something at once, and a flag that tasks wait to see raised.
+-- tasks do something at once, a flag that tasks wait to see raised, and a
+-- condition on a mutex's value that tasks wait to see hold.
 --
 -- A task waiting for any of them waits as it does in `Task.join`: it is
 -- suspended, and its worker runs other tasks meanwhile. The program's own
--- code waiting for a semaphore's permit or an event runs no task meanwhile,
--- since the one that gives the permit back or sets the event may be among
--- them: it sleeps, and the right to
--- run tasks goes to another thread. So nothing here holds up a worker.
+-- code waiting for a permit, an event or a condition runs no task
+-- meanwhile, since the task that ends its wait may be among them: it sleeps,
+-- and the right to run tasks goes to another thread. So nothing here holds
+-- up a worker.
 --
 -- Each keeps its state word in a `Prim.Atomic`, a cell of its own whose every
 -- access is atomic.
@@ -131,11 +133,11 @@ fun load(AtomicInt(cell)) -> Int = Prim.atomicGet(cell)
 
 fun store(AtomicInt(cell), value : Int) -> Unit = Prim.atomicSet(cell, value)
 
--- Add `n`, answering the sum. It wraps on overflow, as the instruction does.
+-- Adds `n`, and returns the sum. It wraps on overflow, as the instruction does.
 fun addAndGet(AtomicInt(cell), n : Int) -> Int =
     Int.addWrapping(Prim.atomicAddTo(cell, n), n)
 
--- Store `new` if the value is `expected`, answering whether it was.
+-- Stores `new` if the value is `expected`, and returns whether it was.
 fun compareAndSet(AtomicInt(cell), expected : Int, new : Int) -> Bool =
     Prim.atomicSwapIf(cell, expected, new) == expected
 
@@ -219,51 +221,120 @@ fun withPermit(s : Semaphore, f : fun() -> b) -> b {
     made
 }
 
+-- -- waiters -------------------------------------------------------------------------
+
+-- The tasks waiting for an `Event` or a `Condition`, every one of them
+-- woken by the next `wakeAll`. Read and written under the scheduler's lock.
+-- `list` holds a waiter whose deadline ended it until the next `wakeAll`, or
+-- until a wait finds the list twice as long as after its last pruning.
+type Waiters = Waiters {
+    var list   : Vec Waiter
+    var pruned : Int
+}
+
+-- `program` is whether the program's own stack waits, which `wakeAll` wakes
+-- differently (`Turkey.Wait.wakeEnded`).
+type Waiter = Waiter {
+    waiter  : Poll.Waiter
+    program : Bool
+}
+
+fun waiters() -> Waiters = Waiters { list = [], pruned = 0 }
+
+-- Ends every wait on `ws`. Under the scheduler's lock.
+fun wakeAll(ws : Waiters) -> Unit {
+    for q in ws.list {
+        -- False for a waiter whose deadline ended it.
+        if Poll.complete(q.waiter, 0) {
+            Wait.wakeEnded(q.program)
+        }
+    }
+    ws.list = []
+    ws.pruned = 0
+}
+
+-- Waits on `ws` until a `wakeAll`, or until `deadline` on `Turkey.Wait.now`'s
+-- clock, or without limit when it is -1. Returns whether a `wakeAll` ended
+-- the wait. Returns `True` without waiting if `woken()` holds when the wait
+-- is registered, which is under the scheduler's lock: so the caller states
+-- in `woken` what a `wakeAll` since its own look has changed, and that
+-- `wakeAll` is never missed.
+fun parkOn(ws : Waiters, deadline : Int, woken : fun() -> Bool) -> Bool {
+    if deadline >= 0 && Wait.now() >= deadline {
+        return False
+    }
+    let program = Option.isNone(Co.running())
+    let outcome = Wait.parkApart(fun(timer) {
+        let w = Poll.sleeper(timer)
+        if woken() {
+            let _ = Poll.complete(w, 0)
+        } else {
+            prune(ws)
+            Vec.push(ws.list, Waiter { waiter = w, program })
+        }
+        w
+    }, deadline)
+    outcome == 0
+}
+
+-- Drops the waiters that deadlines ended, once the list has doubled since it
+-- was last pruned, so that timed waits that nothing wakes keep it to twice
+-- the waiters still waiting, at a constant cost per wait on average.
+fun prune(ws : Waiters) -> Unit {
+    if len(ws.list) < 8 || len(ws.list) < 2 * ws.pruned {
+        return
+    }
+    let kept = []
+    for q in ws.list {
+        if !Poll.finished(q.waiter) {
+            Vec.push(kept, q)
+        }
+    }
+    ws.list = kept
+    ws.pruned = len(kept)
+}
+
+-- Returns `t`'s deadline on `Turkey.Wait.now`'s clock.
+fun nanosOf[Timeout t](t : t) -> Int = Clock.nanos(Deadline.reading(deadline(t)))
+
 -- -- events --------------------------------------------------------------------------
 
--- A flag that tasks wait to see raised. `set` raises it and wakes every task
--- waiting, and it stays raised, so every later `wait` returns at once, until
--- `clear` lowers it.
+-- A flag that tasks wait to see raised. `setEvent` raises it and wakes every
+-- task waiting, and it stays raised, so every later `waitEvent` returns at
+-- once, until `clearEvent` lowers it.
 --
 --     let ready = Sync.event()
 --     ...
---     Sync.set(ready)                     -- in one task
---     Sync.waitUnbounded(ready)           -- in another
+--     Sync.setEvent(ready)                -- in one task
+--     Sync.waitEventUnbounded(ready)      -- in another
 --
--- The flag and the waiters are read and written under the scheduler's lock.
--- `waiters` holds a waiter whose deadline ended it until the next `set`, or
--- until a wait finds the list twice as long as after its last pruning.
-type Event = Event { var raised : Bool, var waiters : Vec EventWaiter, var pruned : Int }
-
--- `program` says whether the program's own stack waits, which `set` wakes
--- differently (`Turkey.Wait.wakeEnded`).
-type EventWaiter = EventWaiter { waiter : Poll.Waiter, program : Bool }
+-- The flag is read and written under the scheduler's lock.
+type Event = Event {
+    var raised : Bool
+    waiters    : Waiters
+}
 
 -- Returns an event, lowered.
-fun event() -> Event = Event { raised = False, waiters = [], pruned = 0 }
+fun event() -> Event = Event { raised = False, waiters = waiters() }
 
 -- Raises `e`, and wakes every task waiting for it.
-fun set(e : Event) -> Unit {
+fun setEvent(e : Event) -> Unit {
     Scheduler.lock()
     e.raised = True
-    for q in e.waiters {
-        -- False for a waiter whose deadline ended it.
-        if Poll.complete(q.waiter, 0) { Wait.wakeEnded(q.program) }
-    }
-    e.waiters = []
-    e.pruned = 0
+    wakeAll(e.waiters)
     Scheduler.unlock()
 }
 
--- Lowers `e`. A task that waits for it from then on waits for the next `set`.
-fun clear(e : Event) -> Unit {
+-- Lowers `e`. A task that waits for it from then on waits for the next
+-- `setEvent`.
+fun clearEvent(e : Event) -> Unit {
     Scheduler.lock()
     e.raised = False
     Scheduler.unlock()
 }
 
 -- Returns whether `e` is raised.
-fun isSet(e : Event) -> Bool {
+fun isEventSet(e : Event) -> Bool {
     Scheduler.lock()
     let raised = e.raised
     Scheduler.unlock()
@@ -273,42 +344,100 @@ fun isSet(e : Event) -> Bool {
 -- Waits until `e` is raised, or until `t` runs out. Returns whether it is
 -- raised: at once, even with a deadline that has passed, if it is raised
 -- already.
-fun wait[Timeout t](e : Event, t : t) -> Bool = waitFor(e, Clock.nanos(Deadline.reading(deadline(t))))
+fun waitEvent[Timeout t](e : Event, t : t) -> Bool = waitRaised(e, nanosOf(t))
 
 -- Waits until `e` is raised, however long that takes.
-fun waitUnbounded(e : Event) -> Unit {
-    let _ = waitFor(e, -1)
+fun waitEventUnbounded(e : Event) -> Unit {
+    let _ = waitRaised(e, -1)
 }
 
--- `wait` until `deadline` on `Turkey.Wait.now`'s clock, or without limit
--- when it is -1.
-fun waitFor(e : Event, deadline : Int) -> Bool {
-    if isSet(e) { return True }
-    if deadline >= 0 && Wait.now() >= deadline { return False }
-    let program = Option.isNone(Co.running())
-    let outcome = Wait.parkApart(fun(timer) {
-        let w = Poll.sleeper(timer)
-        -- Raised since the look above.
-        if e.raised {
-            let _ = Poll.complete(w, 0)
-        } else {
-            prune(e)
-            Vec.push(e.waiters, EventWaiter { waiter = w, program })
-        }
-        w
-    }, deadline)
-    outcome == 0
-}
-
--- Drops the waiters that deadlines ended, once the list has doubled since it
--- was last pruned, so that timed waits on an event never set keep it to
--- twice the waiters still waiting, at a constant cost per wait on average.
-fun prune(e : Event) -> Unit {
-    if len(e.waiters) < 8 || len(e.waiters) < 2 * e.pruned { return () }
-    let kept = []
-    for q in e.waiters {
-        if !Poll.finished(q.waiter) { Vec.push(kept, q) }
+-- `waitEvent` until `deadline` on `Turkey.Wait.now`'s clock, or without
+-- limit when it is -1.
+fun waitRaised(e : Event, deadline : Int) -> Bool {
+    if isEventSet(e) {
+        return True
     }
-    e.waiters = kept
-    e.pruned = len(kept)
+    parkOn(e.waiters, deadline, fun() = e.raised)
+}
+
+-- -- conditions ----------------------------------------------------------------------
+
+-- A mutex's value that tasks wait on until it is ready for them. A waiter
+-- states what it waits for as a function of the value, run with the mutex
+-- held; a task that changes the value calls `notifyAll`, and every waiter
+-- runs its function again.
+--
+--     let jobs = Sync.mutex([])
+--     let added = Sync.condition(jobs)
+--     ...
+--     Sync.withLock(jobs, Vec.push(_, job))          -- in one task
+--     Sync.notifyAll(added)
+--     ...
+--     let job = Sync.waitForUnbounded(added, Vec.pop) -- in another
+--
+-- Several conditions may share one mutex, one for each kind of change that
+-- tasks wait for, so that a change wakes only the tasks it may concern.
+--
+-- **No notification is lost.** A `notifyAll` made after a waiter's function
+-- returned `None`, the mutex still held or not, has that waiter run it
+-- again. One made before the function ran finds no waiter, and the function
+-- sees the change.
+type Condition a = Condition {
+    mutex        : Mutex a
+    -- Moved by every `notifyAll`, under the scheduler's lock. A waiter that
+    -- finds it moved since its function ran has missed a notification.
+    var notified : Int
+    waiters      : Waiters
+}
+
+-- Returns a condition on `m`'s value.
+fun condition(m : Mutex a) -> Condition a = Condition { mutex = m, notified = 0, waiters = waiters() }
+
+-- Wakes every task waiting on `c`, to run its function again.
+fun notifyAll(c : Condition a) -> Unit {
+    Scheduler.lock()
+    c.notified = c.notified + 1
+    wakeAll(c.waiters)
+    Scheduler.unlock()
+}
+
+-- Runs `ready` on `c`'s value with the mutex held, and returns the first
+-- `Some` it returns: at once, or after a `notifyAll` on `c`. Waits for each
+-- `notifyAll` without the mutex. Returns `None` if `ready` still returns
+-- `None` once `t` has run out; `ready` runs once more then, so a change
+-- made just before the deadline is not missed.
+fun waitFor[Timeout t](c : Condition a, t : t, ready : fun(a) -> Option b) -> Option b =
+    waitReady(c, nanosOf(t), ready)
+
+-- Runs `ready` as `waitFor` does, however long it takes to return `Some`,
+-- and returns what that holds.
+fun waitForUnbounded(c : Condition a, ready : fun(a) -> Option b) -> b {
+    -- `match` rather than `let`-`else`, which the compiler that builds this
+    -- module from `bootstrap/` does not parse.
+    match waitReady(c, -1, ready) {
+        Some(made) -> made
+        None -> error("System.Sync.waitForUnbounded: a wait without a deadline ended unready")
+    }
+}
+
+-- `waitFor` until `deadline` on `Turkey.Wait.now`'s clock, or without
+-- limit when it is -1.
+fun waitReady(c : Condition a, deadline : Int, ready : fun(a) -> Option b) -> Option b {
+    var timedOut = False
+    loop {
+        -- Read `notified` with the mutex held, so that a change made after
+        -- this look, and the `notifyAll` that follows it, moves it.
+        let (made, seen) = withLock(c.mutex, fun(value) = (ready(value), notifications(c)))
+        if timedOut || Option.isSome(made) {
+            return made
+        }
+        timedOut = !parkOn(c.waiters, deadline, fun() = c.notified != seen)
+    }
+}
+
+fun notifications(c : Condition a) -> Int {
+    Scheduler.lock()
+    let n = c.notified
+    Scheduler.unlock()
+    n
 }

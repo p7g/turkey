@@ -129,45 +129,136 @@ import Time.Duration as Duration
 
 fun main() {
     let e = Sync.event()
-    print(Sync.isSet(e))
-    print(Sync.wait(e, Duration.millis(20)))
+    print(Sync.isEventSet(e))
+    print(Sync.waitEvent(e, Duration.millis(20)))
     let woken = Sync.atomicInt(0)
     Task.runScope(do {
         for _ in [1, 2, 3] {
             let _ = Task.spawn(fun() {
-                Sync.waitUnbounded(e)
+                Sync.waitEventUnbounded(e)
                 let _ = Sync.addAndGet(woken, 1)
             })?
         }
-        let _ = Task.spawn(fun() = Sync.set(e))?
+        let _ = Task.spawn(fun() = Sync.setEvent(e))?
         pure(())
     })
     print(Sync.load(woken))
-    print(Sync.wait(e, Duration.nanos(0)))
-    Sync.clear(e)
-    print(Sync.isSet(e))
+    print(Sync.waitEvent(e, Duration.nanos(0)))
+    Sync.clearEvent(e)
+    print(Sync.isEventSet(e))
     let gaveUp = Sync.atomicInt(0)
     Task.runScope(do {
         for _ in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] {
             let _ = Task.spawn(fun() {
-                if !Sync.wait(e, Duration.millis(1)) { let _ = Sync.addAndGet(gaveUp, 1) }
+                if !Sync.waitEvent(e, Duration.millis(1)) { let _ = Sync.addAndGet(gaveUp, 1) }
             })?
         }
         pure(())
     })
     print(Sync.load(gaveUp))
     Task.runScope(do {
-        let _ = Task.spawn(fun() = Sync.set(e))?
-        Sync.waitUnbounded(e)
+        let _ = Task.spawn(fun() = Sync.setEvent(e))?
+        Sync.waitEventUnbounded(e)
         pure(())
     })
-    print(Sync.isSet(e))
+    print(Sync.isEventSet(e))
 }
 """
+
+
+EVENT_OUTPUT = "False\nFalse\n3\nTrue\nFalse\n20\nTrue\n"
 
 
 @pytest.mark.parametrize("workers", COUNTS)
 def test_an_event_wakes_every_waiter_and_stays_set(workers):
     result = lang.run(EVENT, env={"TURKEY_WORKERS": workers})
     assert result.code == 0, result.stderr
-    assert result.stdout == "False\nFalse\n3\nTrue\nFalse\n20\nTrue\n"
+    assert result.stdout == EVENT_OUTPUT
+
+
+# Tasks wait on a condition for jobs that another task pushes one at a time,
+# each push followed by a notification, until each takes a 0. A wait with a
+# deadline gives up on a condition that never holds, and a deadline already
+# passed still runs the function once. Timed waits on a condition nobody
+# notifies give up at their deadlines, and the program's own stack then
+# waits, unbounded, for a task that pushes a job.
+CONDITION = """
+import System.Sync as Sync
+import System.Task as Task
+import Time.Duration as Duration
+
+fun push(jobs : Sync.Mutex (Vec Int), added : Sync.Condition (Vec Int), job : Int) -> Unit {
+    Sync.withLock(jobs, Vec.push(_, job))
+    Sync.notifyAll(added)
+}
+
+fun main() {
+    let jobs = Sync.mutex([])
+    let added = Sync.condition(jobs)
+    print(Sync.waitFor(added, Duration.millis(20), Vec.pop))
+    let total = Sync.atomicInt(0)
+    Task.runScope(do {
+        for _ in [1, 2, 3, 4] {
+            let _ = Task.spawn(fun() {
+                loop {
+                    let job = Sync.waitForUnbounded(added, Vec.pop)
+                    if job == 0 {
+                        break
+                    }
+                    let _ = Sync.addAndGet(total, job)
+                }
+            })?
+        }
+        let _ = Task.spawn(fun() {
+            var job = 1
+            while job <= 100 {
+                push(jobs, added, job)
+                job = job + 1
+                Task.yield()
+            }
+            for _ in [1, 2, 3, 4] {
+                push(jobs, added, 0)
+            }
+        })?
+        pure(())
+    })
+    print(Sync.load(total))
+    print(Sync.waitFor(added, Duration.nanos(0), fun(v) = Some(len(v))))
+    let gaveUp = Sync.atomicInt(0)
+    Task.runScope(do {
+        for _ in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20] {
+            let _ = Task.spawn(fun() {
+                if let None = Sync.waitFor(added, Duration.millis(1), fun(_) = None) {
+                    let _ = Sync.addAndGet(gaveUp, 1)
+                }
+            })?
+        }
+        pure(())
+    })
+    print(Sync.load(gaveUp))
+    Task.runScope(do {
+        let _ = Task.spawn(fun() = push(jobs, added, 7))?
+        print(Sync.waitForUnbounded(added, Vec.pop))
+        pure(())
+    })
+}
+"""
+
+CONDITION_OUTPUT = "None\n5050\nSome(0)\n20\n7\n"
+
+
+@pytest.mark.parametrize("workers", COUNTS)
+def test_a_condition_wakes_its_waiters_to_look_again(workers):
+    result = lang.run(CONDITION, env={"TURKEY_WORKERS": workers})
+    assert result.code == 0, result.stderr
+    assert result.stdout == CONDITION_OUTPUT
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+@pytest.mark.parametrize("program, output", [(EVENT, EVENT_OUTPUT), (CONDITION, CONDITION_OUTPUT)],
+                         ids=["event", "condition"])
+def test_waits_survive_collections(workers, program, output):
+    result = lang.run(program, env={"TURKEY_WORKERS": workers, "TURKEY_GC_STRESS": "97"},
+                      flags=("--gc-verify",))
+    assert result.code == 0, result.stderr
+    assert result.stdout == output

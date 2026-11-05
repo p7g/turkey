@@ -368,14 +368,14 @@ fun stop(server : Server, drain : Duration) -> Unit {
     -- An accept loop waiting for a permit sees `stopping` once it has one.
     Sync.release(server.permits)
     for close in idle { close() }
-    if Sync.wait(server.done, until) { return }
+    if Sync.waitEvent(server.done, until) { return }
     let rest = Sync.withLock(server.registry, closers(_, False))
     for close in rest { close() }
 }
 
 -- Returns once `server` has stopped, and every connection it served and
 -- every background task has ended.
-fun wait(server : Server) -> Unit = Sync.waitUnbounded(server.done)
+fun wait(server : Server) -> Unit = Sync.waitEventUnbounded(server.done)
 
 fun closers(r : Registry, onlyIdle : Bool) -> Array (fun() -> Unit) {
     let out = []
@@ -412,7 +412,7 @@ fun run[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Err
         })?
         pure(())
     })
-    Sync.set(server.done)
+    Sync.setEvent(server.done)
 }
 
 fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
@@ -482,7 +482,7 @@ fun submit(w : Work, f : fun() -> Unit) -> Unit {
         True
     })
     if queued {
-        Sync.set(w.ready)
+        Sync.setEvent(w.ready)
     } else {
         f()
     }
@@ -491,7 +491,7 @@ fun submit(w : Work, f : fun() -> Unit) -> Unit {
 -- Ends the dispatcher once it has spawned everything submitted before.
 fun finish(w : Work) -> Unit {
     Sync.withLock(w.queue, fun(q) { q.finished = True })
-    Sync.set(w.ready)
+    Sync.setEvent(w.ready)
 }
 
 -- Spawns each submitted function, until `finish`.
@@ -504,7 +504,7 @@ fun dispatch(w : Work) -> Spawn Unit {
             -- Clear before taking, never after: a `submit` that sets `ready`
             -- after the clear has queued what the take below finds or the
             -- next wait returns for, so its set is never lost.
-            Sync.clear(w.ready)
+            Sync.clearEvent(w.ready)
             let (taken, finished) = Sync.withLock(w.queue, fun(q) {
                 let taken = q.pending
                 q.pending = []
@@ -517,7 +517,7 @@ fun dispatch(w : Work) -> Spawn Unit {
                 if finished {
                     break
                 }
-                Sync.waitUnbounded(w.ready)
+                Sync.waitEventUnbounded(w.ready)
             }
         }
         pure(())

@@ -153,9 +153,16 @@ timed() {
 }
 
 # Starts server IMPL on $PORT, plain or `tls`, setting $SERVER to its pid.
+# Refuses if anything already listens there: the readiness check below
+# would take that process for the new server, and every run would measure
+# it.
 start() {
     impl=$1
     mode=${2:-plain}
+    if curl -sk -o /dev/null "http://127.0.0.1:$PORT/hello" || curl -sk -o /dev/null "https://127.0.0.1:$PORT/hello"; then
+        echo "port $PORT is already in use; stop whatever listens there" >&2
+        exit 1
+    fi
     tlsargs=""
     if [ "$mode" = tls ]; then tlsargs="$OUT/cert.pem $OUT/key.pem"; fi
     case $impl in

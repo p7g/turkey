@@ -55,6 +55,7 @@ import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
+import Turkey.Dwarf as Dwarf
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
@@ -103,6 +104,12 @@ var build = Build.plain
 -- compilation needs to know first: which phases are worth splitting, and
 -- whether the work in them is even enough to split.
 var timings = False
+
+-- `-g`: write a line table and the debug information a debugger and a
+-- profiler need to find it, as assembly only. The code is the same either
+-- way; only the items `Turkey.Emit` and `Turkey.Dwarf` add, none of which
+-- has a byte in the code, tell the two builds apart.
+var debugInfo = False
 
 -- A stopwatch started now, after reporting `phase` as having run since
 -- `since` was started.
@@ -160,6 +167,7 @@ fun main() {
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
                 Short('f') -> { format = Some(formatNamed(valueOf(p))) }
+                Short('g') -> { debugInfo = True }
                 Long("target") -> {
                     let name = valueOf(p)
                     target = match Target.named(name) {
@@ -279,6 +287,10 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
         }
     }
     if let Object = chosen {
+        if debugInfo {
+            die("boot cannot write debug information into an object yet; write "
+                + "assembly with -f asm and assemble it with -gdwarf-5")
+        }
         if len(paths) > 1 {
             die(Int.toString(len(paths)) + " input files cannot be written as "
                 + "one object; build each file separately")
@@ -353,7 +365,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             let assembler = Assembler.new(Encode.isa())
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
-            let refused = emitModule(path, entry, module_, outs)
+            let refused = emitModule(path, entry, module_, files, outs)
             -- A function that is not there is a link error at best, and no
             -- error at all if its callers were refused too.
             if len(refused) > 0 {
@@ -371,9 +383,9 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
         Some(Sink { to, .. }) -> {
             Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
                                    render = Stream.print })
-            let _ = emitModule(path, entry, module_, outs)
+            let _ = emitModule(path, entry, module_, files, outs)
         }
-        None -> { let _ = emitModule(path, entry, module_, outs) }
+        None -> { let _ = emitModule(path, entry, module_, files, outs) }
     }
     if wants("positions") {
         showCoverage(coverage, b)
@@ -878,7 +890,7 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
             let code = []
-            Emit.emitFunc(asm, a.func, a, l, i, code)
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, code)
             let texts = Array.map(outs, fun(o) = if o.apart {
                 let text = String.builder()
                 o.render(asm.dialect, Vec.slice(code, 0, len(code)), text)
@@ -924,7 +936,7 @@ type Out = Out {
 --
 -- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
-              outs : Vec Out) -> Vec String {
+              files : Position.Files, outs : Vec Out) -> Vec String {
     let refused = []
     let note = fun(text) { for o in outs { String.push(o.text, text) } }
     -- Each consumer empties the array it is handed, so all but the last are
@@ -964,6 +976,14 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let code = []
     Vec.push(code, Stream.Architecture)
     Vec.push(code, Stream.Section(Asm.Text))
+    -- With `-g`, the line table's files before any row names one, and a
+    -- label at the start of the code, where the compile unit's range begins.
+    let directory = Option.unwrapOr(Env.currentDirectory(), ".")
+    let textStart = Asm.localLabel(asm.dialect, "text_start")
+    if debugInfo {
+        Dwarf.sourceFiles(directory, path, files, code)
+        Vec.push(code, Stream.Label(textStart))
+    }
     consume(asm.dialect, code)
     for u in unsupported {
         Vec.push(refused, u.name + ": " + u.what)
@@ -1017,6 +1037,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- the table is only complete once every function has been emitted.
     -- The entry first: it interns the `<globals>` message, so the message
     -- table is not complete until it has run either.
+    -- The entry and the stubs after it have no source position, so with `-g`
+    -- one row with no line covers them all, rather than the last function's
+    -- last row.
+    if debugInfo { Vec.push(code, Stream.Loc(0, False)) }
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
     -- Each only in a program that needs it: the switch names the runtime's
@@ -1032,6 +1056,20 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
+    if debugInfo {
+        -- The end of the code, after everything the text section holds.
+        let textEnd = Asm.localLabel(asm.dialect, "text_end")
+        Vec.push(code, Stream.Section(Asm.Text))
+        Vec.push(code, Stream.Label(textEnd))
+        let functions = Vec.map(layouts, fun((i, _)) =
+            Dwarf.Subprogram { name = selected[i].name,
+                               low = Asm.symbolFor(asm.dialect, selected[i].name),
+                               high = Emit.functionEnd(asm.dialect, i) })
+        Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {
+            producer = "boot", name = path, directory = directory, low = textStart,
+            high = textEnd, functions = functions,
+        }, code)
+    }
     consume(asm.dialect, code)
     flush()
     let _ = lap("tables", at)
@@ -1606,7 +1644,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
-        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] FILE...\n"
+        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))

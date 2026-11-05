@@ -1,6 +1,6 @@
 export (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
-    emitSwapStack, emitStackStart, emitWorkerStart,
+    emitSwapStack, emitStackStart, emitWorkerStart, functionEnd,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -50,9 +50,23 @@ import Turkey.Stream (Item(..))
 -- function included; a terminator its block's `termAt`, with the edge's
 -- copies and a return's moves as no stepping target; the zero exit and every
 -- runtime stub, 0.
-type Code = Code { items : Vec (Item Inst), var at : Int }
+--
+-- With `rows`, an instruction whose position is not 0 and differs from the
+-- last row's starts a row of the line table (`Loc`), and so does the first
+-- one after the prologue, which marks where the body begins. `row` is the
+-- last row's position, -1 before the first. The rows are items of no size,
+-- placed only here and read by no pass, so the instructions are the same
+-- with them and without.
+type Code = Code {
+    items            : Vec (Item Inst),
+    var at           : Int,
+    rows             : Bool,
+    var row          : Int,
+    var prologueDone : Bool,
+}
 
-fun code(items : Vec (Item Inst)) -> Code = Code { items = items, at = 0 }
+fun code(items : Vec (Item Inst), rows : Bool) -> Code =
+    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False }
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -75,15 +89,32 @@ let widestImmediate = 4095
 
 fun emit(b : Code, item : Item Inst) -> Unit = Vec.push(b.items, item)
 
-fun instruction(b : Code, op : A.Arm) -> Unit = emit(b, Instruction(Inst { op = op, at = b.at }))
+fun instruction(b : Code, op : A.Arm) -> Unit {
+    -- Position 0 continues the last row.
+    if b.rows && b.at != 0 && (b.at != b.row || b.prologueDone) {
+        emit(b, Loc(b.at, b.prologueDone))
+        b.row = b.at
+        b.prologueDone = False
+    }
+    emit(b, Instruction(Inst { op = op, at = b.at }))
+}
 
+-- The label after function `tag`'s last instruction, with `rows`.
+fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
+    Asm.localLabel(d, "f" + Int.toString(tag) + "end")
+
+-- Function `tag`, with a line table row at each change of position if `rows`.
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+             l : Frame.Layout, tag : Int, rows : Bool, out : Vec (Item Inst)) -> Unit {
+    let b = code(out, rows)
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
+    -- A function the compiler made has no position. A row with no line
+    -- starts it, or the last row of whatever came before would cover it.
+    if rows && f.at == 0 { emit(b, Loc(0, False)) }
     b.at = f.at
     prologue(b, l)
+    b.prologueDone = rows
     -- Reverse postorder, so a block's most likely successor is the next block
     -- and its edge costs no instruction at all. A block that is only the exit
     -- is not placed: its edges go to the exit itself.
@@ -91,7 +122,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
-    let cold = Cold { text = code([]), count = 0 }
+    let cold = Cold { text = code([], rows), count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
@@ -119,6 +150,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
         zero(b, f)
         epilogue(b, l)
     }
+    if rows { emit(b, Label(functionEnd(d, tag))) }
 }
 
 -- -- the zero exit -----------------------------------------------------------
@@ -981,7 +1013,7 @@ fun move(b : Code, d : Reg, s : Reg) -> Unit = match (d, s) {
 -- `turkey_panic` takes a C string (`lib/Turkey/Process.gob`), so each one
 -- ends in a zero.
 fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let ordered = byIndex(asm.messages)
     if len(ordered) == 0 { return }
     emit(b, Section(Asm.CStrings))
@@ -1001,7 +1033,7 @@ fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- ran, which is what lets `ConstString` be a load of slot *n* emitted long
 -- before anything defined slot *n*.
 fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     emitLiterals(asm, b)
     emit(b, Section(Asm.Data))
     -- A build that counts allocations (`Turkey.Sites`): the number of sites,
@@ -1094,7 +1126,7 @@ fun byIndex(table : Map.Map String Int) -> Vec String {
 -- it name the wrong one. `x16` and `x17` are the scratch registers, which the allocator
 -- never hands out.
 fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     let x16 = Physical(Gp, 16)
@@ -1127,7 +1159,7 @@ fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- returned, and the `brk` says so if something does. `sp` is where it was on
 -- the way in, since the callee restores it, so the word is still there.
 fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     emit(b, Section(Asm.Text))
@@ -1148,7 +1180,7 @@ fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- that `x28` is still this worker's. A full frame record, so that the worker's
 -- stack has an outermost one, and `x28` saved, since C keeps it.
 fun emitWorkerStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.workerStartSymbol))
@@ -1178,7 +1210,7 @@ fun emitWorkerStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- on it.
 fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
               out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.entrySymbol(d))
@@ -1314,7 +1346,7 @@ fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
 -- and making no frame: the body's frame record then holds its Turkey
 -- caller's return address, as at any call.
 fun emitDefinitions(m : Module, asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     for (sym, name) in m.definitions {
         for f in m.functions {
             if f.name == name {
@@ -1413,7 +1445,7 @@ fun byteLength(text : String) -> Int {
 -- computing them since phase 4.
 fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
                    out : Vec (Item Inst)) -> Unit {
-    let b = code(out)
+    let b = code(out, False)
     let d = asm.dialect
     emit(b, Section(Asm.Relocated))
     emit(b, Align(3))

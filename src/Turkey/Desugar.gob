@@ -522,7 +522,7 @@ fun keyword(transfer : Expr) -> String = match transfer.kind {
 -- normally costs: its branches already are the tail, so `k` goes straight into
 -- them. That is not an optimization the monad laws are being trusted for -- it
 -- is the no-auto-`pure` rule, which says the tail of a do block is already the
--- monadic value.
+-- monadic value. `branchesEnd` says when `k` can go into the branches.
 fun expr(d : D, e : Expr, k : Cont, tail : Bool, flow : Bool) -> Expr {
     -- In flow mode a construct with no `?` in it still needs lowering if it
     -- transfers control: the transfer has to become a value even though nothing
@@ -641,9 +641,11 @@ fun ifExpr(d : D, span : Span, cond : Expr, then : Expr,
         }), False, False)
     }
 
-    -- In tail position `k` goes into the branches and there is no `bind` at all;
-    -- otherwise each branch ends at `pure` and the `if` is bound.
-    let inner = if tail { k } else { KPure }
+    -- In tail position `k` may go into the branches, and then there is no
+    -- `bind` at all; otherwise each branch ends at `pure` and the `if` is
+    -- bound.
+    let direct = branchesEnd(k, tail)
+    let inner = if direct { k } else { KPure }
     expr(d, cond, KFn(fun(c) = {
         if !flow {
             -- Outside flow mode a branch becomes a lambda body, so a transfer
@@ -660,7 +662,7 @@ fun ifExpr(d : D, span : Span, cond : Expr, then : Expr,
             None -> apply(d, inner, mkExpr(d, span, EUnit))
         }
         let built = mkExpr(d, span, EIf(c, t, Some(o)))
-        if tail { built } else { bindWith(d, built, k, span, None) }
+        if direct { built } else { bindWith(d, built, k, span, None) }
     }), False, False)
 }
 
@@ -679,7 +681,8 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
         }), False, False)
     }
 
-    let inner = if tail { k } else { KPure }
+    let direct = branchesEnd(k, tail)
+    let inner = if direct { k } else { KPure }
     expr(d, scrutinee, KFn(fun(s) = {
         let built = Vec.new(len(arms))
         for a in arms {
@@ -691,8 +694,23 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
             })
         }
         let made = mkExpr(d, span, EMatch(s, built))
-        if tail { made } else { bindWith(d, made, k, span, None) }
+        if direct { made } else { bindWith(d, made, k, span, None) }
     }), False, False)
+}
+
+-- Returns whether each branch of a lifted `if` or `match` may end at `k`
+-- itself, rather than at `pure` with the construct bound to `k`.
+--
+-- Only in tail position, and only for the pass's own named continuations. A
+-- `KFn` is the code that follows -- in a bare block that is a `let`'s value,
+-- the `let` and everything after it -- and putting it into every branch would
+-- give each branch its own copy. The copies would multiply with each lifted
+-- construct they pass through, and every copy would bind the binders that code
+-- binds again, where a binder must be bound once. So a `KFn` stays after the
+-- `bind`, written once.
+fun branchesEnd(k : Cont, tail : Bool) -> Bool = match k {
+    KFn(_) -> False
+    _ -> tail
 }
 
 -- Raises an error for a `?` in a guard, or a transfer that would travel as a
@@ -829,13 +847,12 @@ fun passOn(d : D, con : String, spelling : String, span : Span) -> Arm {
 
 -- What an arm `armOf` builds binds of its constructor's one field, if the
 -- constructor has one.
-type Payload = Nothing | Ignored | Bound(Temp)
+type Payload = Nothing | Bound(Temp)
 
 fun armOf(d : D, con : String, bind : Payload, span : Span,
           body : Expr) -> Arm {
     let args = match bind {
         Nothing -> []
-        Ignored -> [mkPat(d, span, PWild)]
         Bound(t) -> [bindTemp(d, t, span)]
     }
     Arm {
@@ -925,14 +942,15 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
     }
     let again = if len(step) > 0 { wrap(d, step, call, span) } else { call }
     -- `Brk(v)` is the loop's own value, so it becomes this expression's `Fall`;
-    -- `Ret` keeps travelling.
+    -- `Ret` keeps travelling. `Fall` and `Cont` both go round again, so they
+    -- share the last arm, and the step, which may bind, is written once.
     let roundAgain = bindWith(d, bodyFlow, KFn(fun(f) = {
         let b = temp(d, "%b", span)
         mkExpr(d, span, EMatch(f, [
-            armOf(d, P.flowFall, Ignored, span, again),
-            armOf(d, P.flowCont, Nothing, span, again),
             armOf(d, P.flowBrk, Bound(b), span, fallOf(d, varOf(d, b, span))),
             passOn(d, P.flowRet, "%r", span),
+            Arm { span = span, patterns = [mkPat(d, span, PWild)], guards = [],
+                  body = again },
         ]))
     }), span, None)
 

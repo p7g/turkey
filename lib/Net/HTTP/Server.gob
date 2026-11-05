@@ -97,6 +97,7 @@ export (
 --
 -- **Errors** go to the configuration's `onError`, and nowhere by default.
 
+import Data.Error (promote)
 import Net as Net
 import Net (Connection, Listener(..), HasConnectionInfo(..), ConnectionInfo, shutdownWrite, close)
 import Net.HTTP.Duplex as Duplex (Duplex)
@@ -145,10 +146,7 @@ let defaultConfig = Config { limits = Limits.empty, onError = None }
 instance Semigroup Config {
     fun combine(a, b) = Config {
         limits = combine(a.limits, b.limits),
-        onError = match b.onError {
-            Some(_) -> b.onError
-            None -> a.onError
-        },
+        onError = Option.or(b.onError, a.onError),
     }
 }
 
@@ -181,8 +179,8 @@ fun onError(f : fun(ServerEvent) -> Unit) -> Config = Config { limits = Limits.e
 --   this status, which was not sent.
 -- * `NoResponse`: a handler returned a `Done` it did not get from its own
 --   `Respond`. The request got a 500.
-type ServerEvent =
-    AcceptFailed(IOError)
+type ServerEvent
+    = AcceptFailed(IOError)
     | Refused(Refusal)
     | ConnectionFailed(SomeError)
     | ResponseAborted(SomeError)
@@ -215,13 +213,13 @@ instance Show ServerEvent {
 -- handler starts may call `inform` or `respond` only while the handler
 -- waits for it.
 type Respond = Respond {
-    var state : RespondState,
-    send : fun(ServerResponse) -> Unit,
-    sendInformational : fun(Status, Headers) -> Either HTTPError Unit,
-    abort : fun() -> Unit,
-    spawn : fun(fun() -> Unit) -> Unit,
-    setStall : fun(Duration) -> Unit,
-    report : fun(ServerEvent) -> Unit,
+    var state         : RespondState
+    send              : fun(ServerResponse) -> Unit
+    sendInformational : fun(Status, Headers) -> Either HTTPError Unit
+    abort             : fun() -> Unit
+    spawn             : fun(fun() -> Unit) -> Unit
+    setStall          : fun(Duration) -> Unit
+    report            : fun(ServerEvent) -> Unit
 }
 
 -- How far a request's response has got: nothing sent yet, a final response
@@ -238,12 +236,9 @@ type Done = Done
 -- second call sends nothing, and is reported as `RespondedTwice`.
 fun respond[ToResponse x](r : Respond, x : x) -> Done {
     let response = toResponse(x)
-    match r.state {
-        Unsent -> {}
-        _ -> {
-            r.report(RespondedTwice(ServerResponse.status(response)))
-            return Done
-        }
+    let Unsent = r.state else {
+        r.report(RespondedTwice(ServerResponse.status(response)))
+        return Done
     }
     r.state = Sending
     r.send(response)
@@ -262,9 +257,10 @@ fun inform(r : Respond, status : Status, headers : Headers) -> Either HTTPError 
     if code / 100 != 1 || code == 101 {
         error("Server.inform: status " + Int.toString(code) + " must be 1xx other than 101; send 101 with 'switch'")
     }
-    match r.state {
-        Unsent -> r.sendInformational(status, headers)
-        _ -> Left(Transport(fail(IOError { kind = Closed, op = "inform", path = None })))
+    if let Unsent = r.state {
+        r.sendInformational(status, headers)
+    } else {
+        Left(Transport(fail(IOError { kind = Closed, op = "inform", path = None })))
     }
 }
 
@@ -273,16 +269,13 @@ fun inform(r : Respond, status : Status, headers : Headers) -> Either HTTPError 
 -- for a whole one. Reports `e` to `onError` as `HandlerFailed`.
 fun failed(r : Respond, e : HTTPError) -> Done {
     r.report(HandlerFailed(e))
-    match r.state {
-        Unsent -> {
-            r.state = Sending
-            r.send(plain(BadGateway))
-            r.state = Sent
-        }
-        _ -> {
-            r.abort()
-            r.state = Sent
-        }
+    if let Unsent = r.state {
+        r.state = Sending
+        r.send(plain(BadGateway))
+        r.state = Sent
+    } else {
+        r.abort()
+        r.state = Sent
     }
     Done
 }
@@ -296,39 +289,49 @@ fun background(r : Respond, f : fun() -> Unit) -> Unit = r.spawn(f)
 -- Sets the stall limit for the rest of this request's reads and writes to
 -- `d`, in place of `Limits`' `stall`. Panics if `d` is not positive.
 fun setStall(r : Respond, d : Duration) -> Unit {
-    if Duration.toNanos(d) <= 0 { error("Server.setStall: stall limit " + show(d) + " must be positive") }
+    if Duration.toNanos(d) <= 0 {
+        error("Server.setStall: stall limit " + show(d) + " must be positive")
+    }
     r.setStall(d)
 }
 
 -- -- the server --------------------------------------------------------------------------
 
 type Server = Server {
-    config : Config,
-    values : Values,
-    registry : Mutex Registry,
+    config         : Config
+    values         : Values
+    registry       : Mutex Registry
     -- One permit per connection the limit allows: taken before an accept,
     -- and given back when the connection ends.
-    permits : Semaphore,
+    permits        : Semaphore
     -- Set once the accept loop, every connection and every background task
     -- have ended.
-    done : Event,
-    closeListening : fun() -> Unit,
-    background : Work,
+    done           : Event
+    closeListening : fun() -> Unit
+    background     : Work
 }
 
 -- The connections being served, and whether the server is stopping.
-type Registry = Registry { var stopping : Bool, entries : Map Int Entry, var next : Int }
+type Registry = Registry {
+    var stopping : Bool
+    entries      : Map Int Entry
+    var next     : Int
+}
 
 -- A connection `stop` may have to close: at once if it waits for a request,
 -- or at the end of the drain time.
-type Entry = Entry { close : fun() -> Unit, var idle : Bool }
+type Entry = Entry {
+    close    : fun() -> Unit
+    var idle : Bool
+}
 
 -- Serves the connections `l` accepts, each request with `handler`, until
 -- `l` is closed and every connection has ended.
 fun serve[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
           Error (WriteError (Accepted l))](
-        l : l, config : Config, handler : fun(Request Incoming, Respond) -> Done) -> Unit =
-    Task.runScope(map(start(l, config, handler), fun(_) = ()))
+        l : l, config : Config, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
+    let _ = Task.runScope(start(l, config, handler))
+}
 
 -- Returns a server of the connections `l` accepts, each request with
 -- `handler`, running as a task of the enclosing `Task.runScope`, which
@@ -346,7 +349,8 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
         closeListening = fun() { let _ = closeListener(l) },
         background = work(),
     }
-    map(Task.spawn(fun() = run(server, l, handler)), fun(_) = server)
+    Task.spawn(fun() = run(server, l, handler))?
+    pure(server)
 }
 
 -- Stops `server`: closes its listener and its idle connections, lets the
@@ -356,7 +360,7 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
 -- for those.
 fun stop(server : Server, drain : Duration) -> Unit {
     let until = Deadline.after(drain)
-    let idle = Sync.withLock(server.registry, fun(r : Registry) {
+    let idle = Sync.withLock(server.registry, fun(r) {
         r.stopping = True
         closers(r, True)
     })
@@ -364,8 +368,8 @@ fun stop(server : Server, drain : Duration) -> Unit {
     -- An accept loop waiting for a permit sees `stopping` once it has one.
     Sync.release(server.permits)
     for close in idle { close() }
-    if Sync.wait(server.done, until) { return () }
-    let rest = Sync.withLock(server.registry, fun(r : Registry) = closers(r, False))
+    if Sync.wait(server.done, until) { return }
+    let rest = Sync.withLock(server.registry, closers(_, False))
     for close in rest { close() }
 }
 
@@ -375,17 +379,20 @@ fun wait(server : Server) -> Unit = Sync.waitUnbounded(server.done)
 
 fun closers(r : Registry, onlyIdle : Bool) -> Array (fun() -> Unit) {
     let out = []
-    for (_, e) in Map.entries(r.entries) {
-        if e.idle || !onlyIdle { Vec.push(out, e.close) }
+    for e in Map.values(r.entries) {
+        if e.idle || !onlyIdle {
+            Vec.push(out, e.close)
+        }
     }
     Vec.toArray(out)
 }
 
-fun isStopping(server : Server) -> Bool = Sync.withLock(server.registry, fun(r : Registry) = r.stopping)
+fun isStopping(server : Server) -> Bool = Sync.withLock(server.registry, _.stopping)
 
-fun report(server : Server, e : ServerEvent) -> Unit {
-    if let Some(f) = server.config.onError { f(e) }
-}
+fun report(server : Server, e : ServerEvent) -> Unit =
+    if let Some(f) = server.config.onError {
+        f(e)
+    }
 
 -- Runs the accept loop and every connection it starts, and the background
 -- tasks, to their end.
@@ -413,9 +420,11 @@ fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l
         server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Unit {
     var pause = firstPause
     Task.spawnEach(fun() {
-        while True {
+        loop {
             let _ = Sync.acquire(server.permits, None)
-            if isStopping(server) { return None }
+            if isStopping(server) {
+                return None
+            }
             match accept(l) {
                 Right(c) -> {
                     pause = firstPause
@@ -423,14 +432,15 @@ fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l
                 }
                 Left(e) -> {
                     Sync.release(server.permits)
-                    if e.kind == Closed || isStopping(server) { return None }
+                    if e.kind == Closed || isStopping(server) {
+                        return None
+                    }
                     report(server, AcceptFailed(e))
                     Sleep.sleep(pause)
                     pause = if pause < lastPause { Duration.times(pause, 2) } else { lastPause }
                 }
             }
         }
-        None
     })
 }
 
@@ -444,26 +454,42 @@ let lastPause = Duration.seconds(1)
 
 -- Functions waiting to be spawned in the background scope, and whether
 -- that scope still takes them. `ready` is set whenever either changes.
-type Work = Work { queue : Mutex Queue, ready : Event }
+type Work = Work {
+    queue : Mutex Queue
+    ready : Event
+}
 
-type Queue = Queue { var pending : Vec (fun() -> Unit), var finished : Bool }
+type Queue = Queue {
+    var pending  : Vec (fun() -> Unit)
+    var finished : Bool
+}
 
-fun work() -> Work = Work { queue = Sync.mutex(Queue { pending = [], finished = False }), ready = Sync.event() }
+fun work() -> Work =
+    Work {
+        queue = Sync.mutex(Queue { pending = [], finished = False })
+        ready = Sync.event()
+    }
 
 -- Hands `f` to the dispatcher, or runs it here once the dispatcher has
 -- ended.
 fun submit(w : Work, f : fun() -> Unit) -> Unit {
-    let queued = Sync.withLock(w.queue, fun(q : Queue) {
-        if q.finished { return False }
+    let queued = Sync.withLock(w.queue, fun(q) {
+        if q.finished {
+            return False
+        }
         Vec.push(q.pending, f)
         True
     })
-    if queued { Sync.set(w.ready) } else { f() }
+    if queued {
+        Sync.set(w.ready)
+    } else {
+        f()
+    }
 }
 
 -- Ends the dispatcher once it has spawned everything submitted before.
 fun finish(w : Work) -> Unit {
-    Sync.withLock(w.queue, fun(q : Queue) { q.finished = True })
+    Sync.withLock(w.queue, fun(q) { q.finished = True })
     Sync.set(w.ready)
 }
 
@@ -480,7 +506,7 @@ fun dispatch(w : Work) -> Spawn Unit {
             -- after the clear has queued what the take below finds or the
             -- next wait returns for, so its set is never lost.
             Sync.clear(w.ready)
-            let (taken, finished) = Sync.withLock(w.queue, fun(q : Queue) {
+            let (taken, finished) = Sync.withLock(w.queue, fun(q) {
                 let taken = q.pending
                 q.pending = []
                 (taken, q.finished)
@@ -488,7 +514,9 @@ fun dispatch(w : Work) -> Spawn Unit {
             batch = taken
             at = 0
             if len(batch) == 0 {
-                if finished { return None }
+                if finished {
+                    return None
+                }
                 Sync.waitUnbounded(w.ready)
             }
         }
@@ -505,11 +533,11 @@ fun dispatch(w : Work) -> Spawn Unit {
 -- a clock reading each, and is what lets one deadline cover a whole head
 -- while another bounds each wait for a body's bytes.
 type Guarded c = Guarded {
-    conn : c,
-    values : Values,
-    var phase : Phase,
+    conn        : c,
+    values      : Values,
+    var phase   : Phase,
     -- This request's stall limit: `Limits`' unless the handler set its own.
-    var stall : Duration,
+    var stall   : Duration,
     -- The deadline a switched connection's `Duplex` set.
     var carried : Option Deadline,
 }
@@ -548,8 +576,8 @@ instance Read (Guarded c) : Connection c {
     fun readInto(g, into) {
         bound(g)
         let n = readInto(g.conn, into)?
-        if let Idle(_) = g.phase {
-            if n > 0 { g.phase = Heading(Deadline.after(g.values.headTimeout)) }
+        if let Idle(_) = g.phase, n > 0 {
+            g.phase = Heading(Deadline.after(g.values.headTimeout))
         }
         Right(n)
     }
@@ -563,7 +591,11 @@ instance Write (Guarded c) : Connection c {
     fun writeFrom(g, from) {
         var at = from.start
         while at < from.end {
-            let to = if from.end - at > piece { at + piece } else { from.end }
+            let to = if from.end - at > piece {
+                at + piece
+            } else {
+                from.end
+            }
             bound(g)
             writeFrom(g.conn, Buf.view(from, at, to))?
             at = to
@@ -584,18 +616,22 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
         server : Server, conn : c, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let values = server.values
     let g = Guarded {
-        conn, values, phase = Heading(Deadline.after(values.headTimeout)), stall = values.stall, carried = None,
+        conn
+        values
+        phase = Heading(Deadline.after(values.headTimeout))
+        stall = values.stall
+        carried = None
     }
-    let id = Sync.withLock(server.registry, fun(r : Registry) {
-        if r.stopping { return -1 }
+    let id = Sync.withLock(server.registry, fun(r) {
+        if r.stopping { return None }
         let id = r.next
         r.next = id + 1
         Map.put(r.entries, id, Entry { close = fun() { let _ = close(conn) }, idle = False })
-        id
+        Some(id)
     })
-    if id >= 0 {
+    if let Some(id) = id {
         exchanges(server, g, id, handler)
-        Sync.withLock(server.registry, fun(r : Registry) { let _ = Map.delete(r.entries, id) })
+        let _ = Sync.withLock(server.registry, \Map.delete(_.entries, id))
     }
     let _ = close(conn)
     Sync.release(server.permits)
@@ -603,11 +639,16 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
 
 -- Marks the connection `id` idle or busy. Returns `False` if the server is
 -- stopping, and then an idle connection is to close.
-fun mark(server : Server, id : Int, idle : Bool) -> Bool = Sync.withLock(server.registry, fun(r : Registry) {
-    if r.stopping && idle { return False }
-    if let Some(e) = Map.get(r.entries, id) { e.idle = idle }
-    True
-})
+fun mark(server : Server, id : Int, idle : Bool) -> Bool =
+    Sync.withLock(server.registry, fun(r) {
+        if r.stopping && idle {
+            return False
+        }
+        if let Some(e) = Map.get(r.entries, id) {
+            e.idle = idle
+        }
+        True
+    })
 
 -- What a connection does once a request's response is written and its
 -- handler has returned: read the next request, close, or shut down its side
@@ -619,11 +660,13 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
         server : Server, g : Guarded c, id : Int, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let limits = server.config.limits
     let input = Input.input(g, limits)
-    var info : Option ConnectionInfo = None
+    var info = None
     var first = True
     loop {
-        if !first {
-            if !mark(server, id, True) { return () }
+        if first {
+            first = False
+        } else {
+            if !mark(server, id, True) { return }
             -- Bytes held already are a pipelined request's head, begun.
             g.phase = if Input.held(input) > 0 {
                 Heading(Deadline.after(g.values.headTimeout))
@@ -631,7 +674,6 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
                 Idle(Deadline.after(g.values.idleTimeout))
             }
         }
-        first = False
         let found = Input.readHead(input, limits)
         let wasIdle = match g.phase {
             Idle(_) -> True
@@ -639,15 +681,17 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
         }
         let bytes = match found {
             Right(Some(h)) -> h
-            Right(None) -> return ()
+            Right(None) -> return
             Left(Left(BadMessage(r))) -> return refuse(server, g, r)
             Left(Left(e)) -> return failure(server, fail(e))
             Left(Right(e)) -> {
                 -- A kept-alive connection that times out, or that `stop`
                 -- closes, before a byte of the next request has ended
                 -- normally.
-                if !wasIdle && !isStopping(server) { failure(server, fail(e)) }
-                return ()
+                if !wasIdle && !isStopping(server) {
+                    failure(server, fail(e))
+                }
+                return
             }
         }
         let _ = mark(server, id, False)
@@ -666,7 +710,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
         match Head.parseRequest(s, from, to, limits) {
             Right(head) -> match exchange(server, g, input, head, described, handler) {
                 KeepOpen -> {}
-                CloseAfter -> return ()
+                CloseAfter -> return
                 LingerAfter -> return linger(g)
             }
             Left(r) -> return refuse(server, g, r)
@@ -683,7 +727,9 @@ fun refuse[Connection c, Error (WriteError c)](server : Server, g : Guarded c, r
     g.phase = Exchanging
     let s = refusalStatus(r)
     let response = plain(s)
-    if let Left(e) = write(g, response, Close, False, Chunked) { return failure(server, e) }
+    if let Left(e) = write(g, response, Close, False, Chunked) {
+        return failure(server, e)
+    }
     linger(g)
 }
 
@@ -698,23 +744,28 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
         handler : fun(Request Incoming, Respond) -> Done) -> After {
     let ex = Exchange { after = CloseAfter, continued = False }
     let body = Body.body(input, head.framing, server.config.limits)
-    if head.expectContinue { Body.beforeFirstRead(body, fun() = sendContinue(g, ex)) }
-    let incoming = Body.incoming(body, fun(e) = fail(e))
+    if head.expectContinue {
+        Body.beforeFirstRead(body, fun() = sendContinue(g, ex))
+    }
+    let incoming = Body.incoming(body, fail)
     let req = Request {
-        method = map(head.method, fun(_ : Unit) = incoming), target = head.target, headers = head.headers,
-        control = Head.control(head), connection = info,
+        method = map(head.method, fun(_) = incoming)
+        target = head.target
+        headers = head.headers
+        control = Head.control(head)
+        connection = info
     }
     let r = Respond {
-        state = Unsent,
-        send = fun(response) { ex.after = writeResponse(server, g, input, body, head, response) },
-        sendInformational = fun(status, headers) = sendInformation(g, head, ex, status, headers),
+        state = Unsent
+        send = fun(response) { ex.after = writeResponse(server, g, input, body, head, response) }
+        sendInformational = fun(status, headers) = sendInformation(g, head, ex, status, headers)
         abort = fun() {
             let _ = close(g.conn)
             ex.after = CloseAfter
-        },
-        spawn = fun(f) = submit(server.background, f),
-        setStall = fun(d) { g.stall = d },
-        report = fun(e) = report(server, e),
+        }
+        spawn = submit(server.background, _)
+        setStall = fun(d) { g.stall = d }
+        report = report(server, _)
     }
     let _ = handler(req, r)
     match r.state {
@@ -744,20 +795,28 @@ fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
     let unknown = if isHTTP10(head.version) { UntilClose } else { Chunked }
     match ServerResponse.outgoing(response) {
         Switched(protocol, run) -> switchTo(server, g, input, body, head, response, protocol, run)
-        Streamed(stream) -> if isHead { fixed(server, g, body, response, mayKeep, True, unknown) } else {
-            -- The body stays readable while the function writes, so what is
-            -- left of it is known only once it returns.
-            let persistence = if mayKeep { KeepAlive } else { Close }
-            let framing = Stream.framing(Stream.length(stream), unknown)
-            let into = Stream.sink(Output.bodyWriter(g, headOf(response, framing, persistence), framing),
-                                   fun(e) = fail(e))
-            if let Left(e) = Stream.send(stream, into) {
-                report(server, ResponseAborted(e))
-                return CloseAfter
-            }
-            match Body.drain(body) {
-                Right(Reusable) -> if persistence == KeepAlive && framing != UntilClose { KeepOpen } else { CloseAfter }
-                _ -> LingerAfter
+        Streamed(stream) -> {
+            if isHead {
+                fixed(server, g, body, response, mayKeep, True, unknown)
+            } else {
+                -- The body stays readable while the function writes, so what is
+                -- left of it is known only once it returns.
+                let persistence = if mayKeep { KeepAlive } else { Close }
+                let framing = Stream.framing(Stream.length(stream), unknown)
+                let into = Stream.sink(Output.bodyWriter(g, headOf(response, framing, persistence), framing), fail)
+                if let Left(e) = Stream.send(stream, into) {
+                    report(server, ResponseAborted(e))
+                    return CloseAfter
+                }
+                if let Right(Reusable) = Body.drain(body) {
+                    if persistence == KeepAlive && framing != UntilClose {
+                        KeepOpen
+                    } else {
+                        CloseAfter
+                    }
+                } else {
+                    LingerAfter
+                }
             }
         }
         _ -> fixed(server, g, body, response, mayKeep, isHead, unknown)
@@ -779,7 +838,13 @@ fun fixed[Connection c, Error (ReadError c), Error (WriteError c)](
         failure(server, e)
         return CloseAfter
     }
-    if keep { KeepOpen } else if drained == MustClose { LingerAfter } else { CloseAfter }
+    if keep {
+        KeepOpen
+    } else if drained == MustClose {
+        LingerAfter
+    } else {
+        CloseAfter
+    }
 }
 
 -- Writes `response` with `persistence`, and no body for a response to
@@ -796,8 +861,8 @@ fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerRe
         _ -> if code == 204 || code == 304 { NoBody } else { ContentLength(0) }
     }
     let w = Output.bodyWriter(g, headOf(response, framing, persistence), if isHead { NoBody } else { framing })
-    if let Whole(b) = content {
-        if !isHead { Either.mapLeft(writeFrom(w, b), toSomeError)? }
+    if let Whole(b) = content, !isHead {
+        Either.mapLeft(writeFrom(w, b), toSomeError)?
     }
     Either.mapLeft(Output.finish(w), toSomeError)
 }
@@ -817,7 +882,11 @@ fun headOf(response : ServerResponse, framing : Framing, persistence : Persisten
         fields = Headers.add(fields, dateField, HeaderValue.literal(Date.toString(Clock.realtime())))
     }
     Output.responseHead(OutgoingResponse {
-        status = ServerResponse.status(response), headers = fields, framing, persistence, upgrade = None,
+        status = ServerResponse.status(response)
+        headers = fields
+        framing
+        persistence
+        upgrade = None
     })
 }
 
@@ -825,42 +894,55 @@ let dateField = HeaderName.literal("date")
 
 -- Returns the response the server sends on its own behalf: `s` with its
 -- reason phrase as text.
-fun plain(s : Status) -> ServerResponse = ServerResponse.body(s, MediaType.plainText, Status.reason(s) + "\n")
+fun plain(s : Status) -> ServerResponse =
+    ServerResponse.body(s, MediaType.plainText, Status.reason(s) + "\n")
 
 -- -- informational responses -------------------------------------------------------------
 
 -- Writes `100 Continue`, for a client waiting for it before it sends a
 -- body, unless the handler has sent it already with `inform`.
 fun sendContinue[Connection c, Error (WriteError c)](g : Guarded c, ex : Exchange) -> Either HTTPError Unit {
-    if ex.continued { return Right(()) }
+    if ex.continued {
+        return Right(())
+    }
     ex.continued = True
     sendHead(g, Output.responseHead(OutgoingResponse {
-        status = Continue, headers = Headers.empty, framing = NoBody, persistence = KeepAlive, upgrade = None,
+        status = Continue
+        headers = Headers.empty
+        framing = NoBody
+        persistence = KeepAlive
+        upgrade = None
     }))
 }
 
 -- Writes the 1xx `status` with `headers`: nothing to an HTTP/1.0 client,
 -- and nothing for a `100 Continue` already sent.
-fun sendInformation[Connection c, Error (WriteError c)](g : Guarded c, head : RequestHead, ex : Exchange,
-                                                        status : Status, headers : Headers) -> Either HTTPError Unit {
+fun sendInformation[Connection c, Error (WriteError c)](
+        g : Guarded c, head : RequestHead, ex : Exchange, status : Status, headers : Headers) -> Either HTTPError Unit {
     if isHTTP10(head.version) { return Right(()) }
     if Status.code(status) == 100 {
         if ex.continued { return Right(()) }
         ex.continued = True
     }
     let sent = sendHead(g, Output.responseHead(OutgoingResponse {
-        status, headers, framing = NoBody, persistence = KeepAlive, upgrade = None,
+        status
+        headers
+        framing = NoBody
+        persistence = KeepAlive
+        upgrade = None
     }))
-    if let Left(_) = sent { ex.after = CloseAfter }
+    if let Left(_) = sent {
+        ex.after = CloseAfter
+    }
     sent
 }
 
 fun sendHead[Connection c, Error (WriteError c)](g : Guarded c, head : Buffer) -> Either HTTPError Unit {
-    let sent = match writeFrom(g, head) {
-        Right(_) -> flush(g)
-        Left(e) -> Left(e)
+    let sent = do {
+        writeFrom(g, head)?
+        flush(g)
     }
-    Either.mapLeft(sent, fun(e) = Transport(fail(e)))
+    Either.mapLeft(sent, \Transport(fail(_)))
 }
 
 -- Shuts down the writing side and discards what the client still sends,
@@ -873,9 +955,8 @@ fun linger[Connection c](g : Guarded c) -> Unit {
     let scratch = Buf.buffer(16384)
     loop {
         Buf.clear(scratch)
-        match readInto(g, scratch) {
-            Right(0) | Left(_) -> break
-            Right(_) -> {}
+        if let Right(0) | Left(_) = readInto(g, scratch) {
+            break
         }
     }
 }
@@ -888,10 +969,7 @@ fun linger[Connection c](g : Guarded c) -> Unit {
 fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), body : Body (Guarded c), head : RequestHead,
         response : ServerResponse, protocol : Token, run : fun(Duplex) -> Either SomeError Unit) -> After {
-    let drained = match Body.drain(body) {
-        Right(d) -> d
-        Left(_) -> MustClose
-    }
+    let drained = Either.unwrapOr(Body.drain(body), MustClose)
     if isHTTP10(head.version) || !offers(Head.control(head).upgrade, protocol) || drained == MustClose {
         report(server, BadSwitch(protocol))
         let _ = write(g, plain(InternalServerError), Close, False, Chunked)
@@ -899,23 +977,28 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
     }
     let name = HeaderValue.literal(Token.toString(protocol))
     let switched = Output.responseHead(OutgoingResponse {
-        status = ServerResponse.status(response), headers = headers(response), framing = NoBody,
-        persistence = Close, upgrade = Some(name),
+        status = ServerResponse.status(response)
+        headers = headers(response)
+        framing = NoBody
+        persistence = Close
+        upgrade = Some(name)
     })
-    if let Left(e) = Either.mapLeft(Output.finish(Output.bodyWriter(g, switched, NoBody)), toSomeError) {
-        failure(server, e)
+    if let Left(e) = Output.finish(Output.bodyWriter(g, switched, NoBody)) {
+        failure(server, toSomeError(e))
         return CloseAfter
     }
     g.phase = Carrying
     let d = Duplex.duplex(
-        fun(into : Buffer) = Either.mapLeft(Input.take(input, into, Int.maxValue()), toSomeError),
-        fun(from : Buffer) = Either.mapLeft(writeFrom(g, from), fun(e) = fail(e)),
-        fun() = Either.mapLeft(flush(g), fun(e) = fail(e)),
-        fun(limit : Option Deadline) { g.carried = limit },
-        fun() = Either.mapLeft(shutdownWrite(g.conn), fun(e) = fail(e)),
-        fun() = Either.mapLeft(close(g.conn), fun(e) = fail(e)),
+        fun(into) = Either.mapLeft(Input.take(input, into, Int.maxValue()), toSomeError),
+        fun(from) = promote(writeFrom(g, from)),
+        fun() = promote(flush(g)),
+        fun(limit) { g.carried = limit },
+        fun() = promote(shutdownWrite(g.conn)),
+        fun() = promote(close(g.conn)),
     )
-    if let Left(e) = run(d) { report(server, ResponseAborted(e)) }
+    if let Left(e) = run(d) {
+        report(server, ResponseAborted(e))
+    }
     CloseAfter
 }
 
@@ -928,7 +1011,9 @@ fun isHTTP10(v : Version) -> Bool = match v {
 fun offers(upgrade : Array Token, protocol : Token) -> Bool {
     let wanted = Syntax.asciiLower(Token.toString(protocol))
     for t in upgrade {
-        if Syntax.asciiLower(Token.toString(t)) == wanted { return True }
+        if Syntax.asciiLower(Token.toString(t)) == wanted {
+            return True
+        }
     }
     False
 }

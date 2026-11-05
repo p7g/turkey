@@ -563,6 +563,8 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
 -- closure over it is.
 fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
     let made = Map.new()
+    let modules = Map.new()
+    for f in m.functions { Map.put(modules, f.name, f.module_) }
     for f in m.functions {
         for block in f.blocks {
             for inst in block.insts {
@@ -572,7 +574,9 @@ fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
                                          || len(sig.results) > 1 {
                             let symbol = name + "%boxed"
                             if !Map.contains(made, name) {
-                                Map.put(made, name, adapter(name, symbol, sig))
+                                let a = adapter(name, symbol, sig)
+                                a.module_ = Map.getOr(modules, name, "")
+                                Map.put(made, name, a)
                             }
                             inst.op = ClosureNew(symbol, None)
                         }
@@ -635,7 +639,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let objects : Map String (Int, Int, Rt.Layout, Array Op) = Map.new()
     let giblets = Giblets.gibletModules()
     for f in m.functions {
-        let shared = !Set.contains(giblets, moduleOf(f.name))
+        let shared = !Set.contains(giblets, f.module_)
             && f.name != Giblets.initializerName
         -- The constant each value is, where one is.
         let constants = Map.new()
@@ -693,12 +697,6 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let ordered = Ssa.pruneUnreachable(init)
     init.blocks = ordered.blocks
     init.entry = ordered.entry
-}
-
--- The module a function's symbol belongs to: what precedes its `#`.
-fun moduleOf(symbol : String) -> String = match String.splitOnce(symbol, "#") {
-    Some((module_, _)) -> module_
-    None -> symbol
 }
 
 -- The constants `fields` are, if every one is one.
@@ -1070,6 +1068,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         None -> Signature { params = [], results = [Ssa.traced(Ptr)], diverges = False }
     }
     let f = Ssa.newFunc(bind.name, sig.results)
+    f.module_ = bind.module_
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, bind.layouts, [],
                      shared)
@@ -2493,6 +2492,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- The body and every call site derive the signature from its types.
     let g = Ssa.newFunc(symbol, [repOf(l, result)])
     g.at = L.here(l.b)
+    g.module_ = l.func.module_
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
     -- forgot them would read its captures at the boxed width.

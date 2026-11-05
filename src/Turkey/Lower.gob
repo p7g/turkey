@@ -85,12 +85,6 @@ fun instName(inst : InstInfo) -> String =
 fun defaultName(cls : String, method : String) -> String =
     "%default." + cls + "." + method
 
--- Which module a resolved top-level name belongs to (`Main#f` -> `Main`).
-fun moduleOf(name : String) -> String = match String.rsplitOnce(name, "#") {
-    Some((before, _)) -> before
-    None -> ""
-}
-
 -- -- scope --------------------------------------------------------------------------
 
 -- What this pass knows about the binders in scope, keyed by binder id.
@@ -400,10 +394,10 @@ fun program(l : Lowerer, ordered : Vec Stmt, owners : Map Int String) -> CProgra
     out
 }
 
-fun newBind(name : String, id : Int, ty : Ty.Type, binders : Vec VarCell,
-            value : Core, where : Option Span) -> CBind = CBind {
+fun newBind(module_ : String, name : String, id : Int, ty : Ty.Type,
+            binders : Vec VarCell, value : Core, where : Option Span) -> CBind = CBind {
     name = name, id = id, ty = ty, binders = binders, value = value, span = where,
-    mutable = False, module_ = moduleOf(name), equations = [],
+    mutable = False, module_ = module_, equations = [],
     layouts = Map.new(),
 }
 
@@ -418,7 +412,7 @@ fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
     SExpr(e) -> {
         let value = expr(l, e, scope)
         let (name, id) = freshName(l, "top")
-        [newBind(owner + "#" + name, id, value.ty, [], value, Some(stmt.span))]
+        [newBind(owner, owner + "#" + name, id, value.ty, [], value, Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
 }
@@ -434,11 +428,11 @@ fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
         None -> funType(l, decl)
     }
     let dicts = abstractionOf(l, decl.id)
-    let b = newBind(decl.name, binderOf(l, decl.id, decl.name, Some(decl.span)),
+    let id = binderOf(l, decl.id, decl.name, Some(decl.span))
+    let b = newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
                     abstracted(l, ty, dicts), binders,
                     function(l, decl, ty, scope, None, None), Some(decl.span))
     b.equations = equationsOf(s)
-    b.module_ = moduleOf(decl.name)
     b
 }
 
@@ -479,7 +473,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
                 Map.put(scope.cells, id, (name, id))
                 body = node(refOf(body.ty), Some(stmt.span), CRef(body))
             }
-            let b = newBind(name, id, body.ty, binders, body, Some(stmt.span))
+            let b = newBind(owner, name, id, body.ty, binders, body, Some(stmt.span))
             b.mutable = mutable
             return [b]
         }
@@ -487,7 +481,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
     }
     let (holderName, holderId) = freshName(l, "bound")
     let holder = owner + "#" + holderName
-    let out = [newBind(holder, holderId, lowered.ty, [], lowered, Some(stmt.span))]
+    let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, Some(stmt.span))]
     -- Each name is its own top-level binding, which projects it out of the
     -- whole value with a one-armed match. The match binds a local copy of
     -- every name, which shadows the top-level binder it is a copy of.
@@ -504,7 +498,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
             node(lowered.ty, Some(stmt.span), CVar(holder, holderId)),
             [(pat, node(nty, Some(stmt.span), CVar(name, Map.getOr(copies, v.id, noId))))],
             nty, Some(stmt.span))
-        Vec.push(out, newBind(name, id, picked.ty, [], picked, Some(stmt.span)))
+        Vec.push(out, newBind(owner, name, id, picked.ty, [], picked, Some(stmt.span)))
     }
     out
 }
@@ -567,9 +561,8 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                      Some(inst.decl.span),
                      CLam(params, record, instName(inst)))
     }
-    let b = newBind(instName(inst), noId, value.ty, instanceBinders(inst), value,
-                    Some(inst.decl.span))
-    b.module_ = inst.module_
+    let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
+                    value, Some(inst.decl.span))
     -- A method's own equalities, at this head. A binding is where Core keeps the
     -- equalities a body was checked under, and a method body is a field of this
     -- one; `Elem s ~ Part (Option a)` names the method's own `s`, so it cannot
@@ -664,8 +657,8 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
         value = node(TFun(Array.map(params, _.ty), result), span,
                      CLam(params, record, instName(inst)))
     }
-    let b = newBind(instName(inst), noId, value.ty, instanceBinders(inst), value, span)
-    b.module_ = inst.module_
+    let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
+                    value, span)
     b
 }
 
@@ -700,8 +693,8 @@ fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
         }
     }
     let record = dictionary(l, inst.cls, result, span, fun(_) = method)
-    let b = newBind(instName(inst), noId, result, instanceBinders(inst), record, span)
-    b.module_ = inst.module_
+    let b = newBind(inst.module_, instName(inst), noId, result, instanceBinders(inst),
+                    record, span)
     b
 }
 
@@ -808,9 +801,8 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
     let lam = node(TFun([selfTy], body.ty), Some(impl.decl.span),
         CLam([CParam { name = impl.selfName, id = noId, ty = selfTy }], body,
              defaultName(cls, name)))
-    let b = newBind(defaultName(cls, name), noId, lam.ty, [cvar], lam,
+    let b = newBind(info.module_, defaultName(cls, name), noId, lam.ty, [cvar], lam,
                     Some(impl.decl.span))
-    b.module_ = info.module_
     b.equations = equationsOf(Some(mi.scheme))
     b
 }
@@ -2490,7 +2482,8 @@ fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
         None -> (rigidly(l, declType(l, decl)), [])
     }
     let dicts = abstractionOf(l, decl.id)
-    let b = newBind(decl.name, binderOf(l, decl.id, decl.name, Some(decl.span)),
+    let id = binderOf(l, decl.id, decl.name, Some(decl.span))
+    let b = newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
                     abstracted(l, fnTy, dicts), binders,
                     function(l, decl, fnTy, scope, None, None), Some(decl.span))
     b.equations = equationsOf(s)

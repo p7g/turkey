@@ -9,14 +9,17 @@ export (
 -- Every term binder of the program, and which binder each occurrence means.
 --
 -- A binder id is an (owner, local index) pair packed into one `Int`. An owner
--- is a unit of the program that one worker mints into, in program order --
--- here, a top-level binding -- and each owner keeps its own counter. So an id
--- depends only on the program and never on how workers are scheduled, which
--- the bootstrap fixed point relies on: an id that varied between runs would
--- vary every `Map Int` iteration order keyed by it.
+-- is a unit of the program -- a top-level declaration, an instance
+-- dictionary, a specialization -- and each keeps its own counter. A pass that
+-- copies a binder may mint the copy into the owner the original came from,
+-- which need not be the binding it is rewriting.
 --
--- Owners themselves are numbered from one counter, which is safe only because
--- every owner is registered by one thread, in program order.
+-- An id depends only on the program and never on how workers are scheduled,
+-- which the bootstrap fixed point relies on: an id that varied between runs
+-- would vary every `Map Int` iteration order keyed by it. What makes that
+-- true is that every owner is registered, and every binder minted, on one
+-- thread, in an order the program decides. Owners are numbered from one
+-- counter, so a pass that minted on workers would break it.
 --
 -- Ids are process-local. They are never printed, and nothing persisted may be
 -- keyed by one; a binder's stable name is its `moduleName` and `name`.
@@ -29,6 +32,7 @@ export (
 import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Source (Span)
+import Turkey.Types as Ty
 
 -- What a binder is to the program.
 type Kind
@@ -53,6 +57,11 @@ type Origin
     | Builtin
     -- A copy of the binder with this id, whose span and mutability it takes.
     | CopyOf(Int)
+    -- A copy of a polymorphic binding at these ground type arguments, made by
+    -- `Turkey.Mono`. The binding is the one with the id, if it has one; the
+    -- span is the binding's. A copy keyed by something other than its type
+    -- arguments is a `CopyOf`.
+    | Specialized(Option Int, Array Ty.Type, Option Span)
 
 type Binder = Binder {
     -- The source spelling, unqualified, or a hint for one the compiler made.
@@ -64,6 +73,9 @@ type Binder = Binder {
     span       : Option Span,
     -- For a copy, the id it was copied from.
     origin     : Option Int,
+    -- For a specialization, the type arguments it was made at; empty for any
+    -- other binder.
+    typeArguments : Array Ty.Type,
 }
 
 type Owner = Owner {
@@ -109,14 +121,15 @@ fun owner(t : Table, moduleName : String, hint : String) -> Int {
 fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
           origin : Origin) -> Int {
     let o = t.owners[ownerId]
-    let (span, mutable, from) = match origin {
-        Written(where, isVar) -> (Some(where), isVar, None)
-        Generated(where) -> (Some(where), False, None)
-        Builtin -> (None, False, None)
+    let (span, mutable, from, args) = match origin {
+        Written(where, isVar) -> (Some(where), isVar, None, [])
+        Generated(where) -> (Some(where), False, None, [])
+        Builtin -> (None, False, None, [])
         CopyOf(id) -> {
             let b = binderAt(t, id)
-            (b.span, b.mutable, Some(id))
+            (b.span, b.mutable, Some(id), [])
         }
+        Specialized(id, types, where) -> (where, False, id, types)
     }
     let local = len(o.binders)
     if local >= localLimit {
@@ -125,7 +138,7 @@ fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
     }
     Vec.push(o.binders, Binder {
         name = hint, kind = kind, moduleName = o.moduleName, mutable = mutable,
-        span = span, origin = from,
+        span = span, origin = from, typeArguments = args,
     })
     Int.shl(ownerId, localBits) + local
 }

@@ -1,6 +1,7 @@
 export (
     Conn(..), close, halfClose, isTimeout, isStale,
     Paced, paced, conn, firstRead, progressed, carry,
+    Link, link, pace, input,
     Pool, Pooled(..), pool, take, give, closeIdle,
 )
 
@@ -24,6 +25,12 @@ export (
 -- by neither of the two limits: the protocol keeps its own time, and a
 -- connection waiting for its peer's next message has not stalled.
 --
+-- **A link** is a connection with what it keeps from one exchange to the
+-- next: its `Paced`, reset for each exchange, and the `Input` its responses
+-- are read from. The input's array is reused until heads fill it, rather
+-- than one made, and zero-filled, for every exchange; header values that
+-- view it stay valid, since `Input` never writes over a head it handed out.
+--
 -- **The pool** keeps idle connections by origin -- scheme, host and port --
 -- at most `perOrigin` of each and `total` in all, for at most `idle` each.
 -- A connection is given back only by a caller that read its last message to
@@ -45,6 +52,8 @@ import Net.TCP as TCP
 import Net.TCP (Socket)
 import Net.TLS as TLS
 import Net.TLS (TLS, TLSError(..))
+import Net.HTTP.H1.Input as Input (Input)
+import Net.HTTP.Limits (Limits)
 import System.Sync as Sync
 import Time.Clock as Clock
 import Time.Deadline as Deadline
@@ -136,7 +145,7 @@ fun isStale(e : SomeError) -> Bool {
 
 type Paced = Paced {
     conn          : Conn
-    total         : Option Deadline
+    var total     : Option Deadline
     stall         : Duration
     -- When a byte last moved either way, in `Clock.monotonic` nanoseconds.
     -- Written by the task reading and the one writing.
@@ -158,6 +167,33 @@ fun paced(c : Conn, total : Option Deadline, stall : Duration) -> Paced =
         firstRead = None
         pacing = Limited
     }
+
+-- -- links ------------------------------------------------------------------------------
+
+type Link = Link {
+    paced : Paced
+    input : Input Paced
+}
+
+-- Returns a link over `c`, whose reads and writes stall out after `stall`,
+-- reading heads within `limits`.
+fun link(c : Conn, stall : Duration, limits : Limits) -> Link {
+    let p = paced(c, None, stall)
+    Link { paced = p, input = Input.input(p, limits) }
+}
+
+-- Returns `l`'s pacing, reset for a new exchange bounded by `total`: no
+-- byte read yet, and the stall measured from now.
+fun pace(l : Link, total : Option Deadline) -> Paced {
+    let p = l.paced
+    p.total = total
+    Sync.store(p.moved, now())
+    p.firstRead = None
+    p.pacing = Limited
+    p
+}
+
+fun input(l : Link) -> Input Paced = l.input
 
 -- Bounds every later read and write on `p` by `d` alone, or by nothing.
 fun carry(p : Paced, d : Option Deadline) -> Unit { p.pacing = Carrying(d) }
@@ -258,7 +294,7 @@ type Idle = Idle {
 
 -- An idle connection, and when it was given back.
 type Pooled = Pooled {
-    conn  : Conn
+    link  : Link
     since : Clock.Reading
 }
 
@@ -272,12 +308,12 @@ fun pool(perOrigin : Int, total : Int, idle : Duration) -> Pool =
 
 -- Removes from `idle` every connection kept for `p.idle` or longer, and
 -- every origin left with none, and adds those connections to `closing`.
-fun sweep(p : Pool, idle : Idle, closing : Vec Conn) -> Unit {
+fun sweep(p : Pool, idle : Idle, closing : Vec Link) -> Unit {
     let now = Clock.monotonic()
     for (origin, kept) in Map.entries(idle.origins) {
         var expired = 0
         while expired < len(kept) && Clock.between(kept[expired].since, now) >= p.idle {
-            Vec.push(closing, kept[expired].conn)
+            Vec.push(closing, kept[expired].link)
             expired = expired + 1
         }
         if expired > 0 {
@@ -299,35 +335,39 @@ fun dropOldest(idle : Idle, origin : String, kept : Vec Pooled, n : Int) -> Unit
 
 -- Returns an idle connection to `origin`, the most recently given back,
 -- after closing every connection idle too long.
-fun take(p : Pool, origin : String) -> Option Conn {
+fun take(p : Pool, origin : String) -> Option Link {
     let closing = []
     let found = Sync.withLock(p.connections, fun(idle) {
         sweep(p, idle, closing)
         let kept = Map.get(idle.origins, origin)?
-        let Pooled { conn = c, since = _ } = Vec.pop(kept)?
+        let Pooled { link = l, since = _ } = Vec.pop(kept)?
         idle.count = idle.count - 1
         if len(kept) == 0 {
             let _ = Map.delete(idle.origins, origin)
         }
-        Some(c)
+        Some(l)
     })
-    for c in closing { close(c) }
+    closeAll(closing)
     found
 }
 
--- Keeps `c` for the next request to `origin`, after closing every
--- connection idle too long. Closes `c` instead if the origin has as many
+fun closeAll(links : Vec Link) -> Unit {
+    for l in links { close(l.paced.conn) }
+}
+
+-- Keeps `l` for the next request to `origin`, after closing every
+-- connection idle too long. Closes `l` instead if the origin has as many
 -- idle connections as it may, and the pool's oldest if the pool then has
--- more than `total`.
-fun give(p : Pool, origin : String, c : Conn) -> Unit {
+-- more than `total`. `l`'s input must hold no byte.
+fun give(p : Pool, origin : String, l : Link) -> Unit {
     let closing = []
     Sync.withLock(p.connections, fun(idle) {
         sweep(p, idle, closing)
         let kept = Option.unwrapOr(Map.get(idle.origins, origin), [])
         if len(kept) >= p.perOrigin || p.total == 0 {
-            Vec.push(closing, c)
+            Vec.push(closing, l)
         } else {
-            Vec.push(kept, Pooled { conn = c, since = Clock.monotonic() })
+            Vec.push(kept, Pooled { link = l, since = Clock.monotonic() })
             if len(kept) == 1 {
                 Map.put(idle.origins, origin, kept)
             }
@@ -337,12 +377,12 @@ fun give(p : Pool, origin : String, c : Conn) -> Unit {
             }
         }
     })
-    for c in closing { close(c) }
+    closeAll(closing)
 }
 
 -- Removes the pool's oldest connection, of whichever origin, and adds it to
 -- `closing`. Each origin's oldest is its first, so only those are compared.
-fun evictOldest(idle : Idle, closing : Vec Conn) -> Unit {
+fun evictOldest(idle : Idle, closing : Vec Link) -> Unit {
     var oldest = None
     for (origin, kept) in Map.entries(idle.origins) {
         let older = match oldest {
@@ -354,7 +394,7 @@ fun evictOldest(idle : Idle, closing : Vec Conn) -> Unit {
         }
     }
     if let Some((origin, kept)) = oldest {
-        Vec.push(closing, kept[0].conn)
+        Vec.push(closing, kept[0].link)
         dropOldest(idle, origin, kept, 1)
     }
 }
@@ -364,11 +404,11 @@ fun closeIdle(p : Pool) -> Unit {
     let all = Sync.withLock(p.connections, fun(idle) {
         let all = []
         for kept in Map.values(idle.origins) {
-            for Pooled { conn = c, since = _ } in kept { Vec.push(all, c) }
+            for Pooled { link = l, since = _ } in kept { Vec.push(all, l) }
         }
         idle.origins = Map.new()
         idle.count = 0
         all
     })
-    for c in all { close(c) }
+    closeAll(all)
 }

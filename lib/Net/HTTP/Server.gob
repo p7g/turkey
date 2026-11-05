@@ -101,11 +101,11 @@ import Data.Error (promote)
 import Net as Net
 import Net (Connection, Listener(..), HasConnectionInfo(..), ConnectionInfo, shutdownWrite, close)
 import Net.HTTP.Duplex as Duplex (Duplex)
-import Net.HTTP.Error (HTTPError(..), Refusal(..), refusalStatus, toSomeError, transport)
+import Net.HTTP.Error (HTTPError(..), Refusal(..), refusalStatus, toSomeError)
 import Net.HTTP.H1.Body as Body (Body, Drained(..))
 import Net.HTTP.H1.Head as Head (RequestHead(..), Framing(..), Persistence(..), Version(..))
 import Net.HTTP.H1.Input as Input (Input, HeadBytes(..))
-import Net.HTTP.H1.Output as Output (OutgoingResponse(..))
+import Net.HTTP.H1.Output as Output (OutgoingResponse(..), Buffers, Outbox)
 import Net.HTTP.HeaderName as HeaderName (HeaderName)
 import Net.HTTP.HeaderValue as HeaderValue (HeaderValue)
 import Net.HTTP.Headers as Headers (Headers, HasHeaders(..))
@@ -315,6 +315,8 @@ type Server = Server {
     done           : Event
     closeListener  : fun() -> Unit
     background     : Work
+    -- The output buffers of the connections between requests.
+    buffers        : Buffers
 }
 
 -- The connections being served, and whether the server is stopping.
@@ -354,10 +356,16 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
         done = Sync.event(),
         closeListener = fun() { let _ = closeListener(l) },
         background = work(),
+        buffers = Output.buffers(keptBuffers),
     }
     let _ = Task.spawn(fun() = run(server, l, handler))?
     pure(server)
 }
+
+-- How many output buffers a server keeps for its connections' next
+-- requests: at 4 KiB each, at most 512 KiB, however many connections were
+-- busy at once.
+let keptBuffers = 128
 
 -- Stops `server`: closes its listener and its idle connections, lets the
 -- requests in flight and the background tasks finish for up to `drain`,
@@ -556,6 +564,8 @@ type Guarded c = Guarded {
     var stall   : Duration
     -- The deadline a switched connection's `Duplex` set.
     var carried : Option Deadline
+    -- Where the response heads are written, lent a buffer for each exchange.
+    outbox      : Outbox
 }
 
 -- * `Idle(d)`: waiting for a request's first byte until `d`. The first byte
@@ -633,6 +643,7 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
         phase = ReadingHead(Deadline.after(values.headTimeout))
         stall = values.stall
         carried = None
+        outbox = Output.outbox(server.buffers)
     }
     let id = Sync.withLock(server.registry, fun(r) {
         if r.stopping { return None }
@@ -645,6 +656,7 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
         exchanges(server, g, id, handler)
         let _ = Sync.withLock(server.registry, \Map.delete(_.entries, id))
     }
+    Output.release(g.outbox)
     let _ = close(conn)
     Sync.release(server.permits)
 }
@@ -716,6 +728,9 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
         match Head.parseRequest(bytes, from, to, limits) {
             Right(head) -> match exchange(server, g, input, head, info, handler) {
                 KeepOpen -> {
+                    -- A connection waiting for its next request holds no
+                    -- output buffer.
+                    Output.release(g.outbox)
                     if !markIdle(server, id) {
                         return
                     }
@@ -749,16 +764,17 @@ fun refuse[Connection c, Error (WriteError c)](server : Server, g : Guarded c, r
     linger(g)
 }
 
--- One request's response as it goes: what follows it, and whether
--- `100 Continue` has been sent.
-type Exchange = Exchange { var after : After, var continued : Bool }
+-- One request's response as it goes: what follows it, whether
+-- `100 Continue` has been sent, and whether the final response's head has
+-- been written.
+type Exchange = Exchange { var after : After, var continued : Bool, var final : Bool }
 
 -- Serves one request whose head is `head`, and returns what the connection
 -- does next.
 fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), head : RequestHead, info : ConnectionInfo,
         handler : fun(Request Incoming, Respond) -> Done) -> After {
-    let ex = Exchange { after = CloseAfter, continued = False }
+    let ex = Exchange { after = CloseAfter, continued = False, final = False }
     let body = Body.body(input, head.framing, server.config.limits)
     if head.expectContinue {
         Body.beforeFirstRead(body, fun() = sendInformational(g, head, ex, Continue, Headers.empty))
@@ -773,7 +789,7 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
     }
     let r = Respond {
         state = Unsent
-        send = fun(response) { ex.after = writeResponse(server, g, input, body, head, response) }
+        send = fun(response) { ex.after = writeResponse(server, g, input, body, head, ex, response) }
         sendInformational = fun(status, headers) = sendInformational(g, head, ex, status, headers)
         abort = fun() {
             let _ = close(g.conn)
@@ -787,7 +803,7 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
     if !isSent(r.state) {
         report(server, NoResponse)
         r.state = Sending
-        ex.after = writeResponse(server, g, input, body, head, plain(InternalServerError))
+        ex.after = writeResponse(server, g, input, body, head, ex, plain(InternalServerError))
     }
     -- A late `respond` or `inform`, from a task that outlived the handler,
     -- must not write into the next exchange.
@@ -799,7 +815,10 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
 -- does next.
 fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), body : Body (Guarded c), head : RequestHead,
-        response : ServerResponse) -> After {
+        ex : Exchange, response : ServerResponse) -> After {
+    -- From here the outbox's buffer holds the final response: no 1xx may
+    -- be written into it, nor sent after it.
+    ex.final = True
     let extent = match head.method {
         HEAD -> HeadOnly
         _ -> WithBody
@@ -815,7 +834,8 @@ fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
                 -- The body stays readable while the function writes, so what is
                 -- left of it is known only once it returns.
                 let framing = Stream.framing(Stream.length(stream), unknown)
-                let into = Stream.sink(Output.bodyWriter(g, headOf(response, framing, wanted), framing), fail)
+                headOf(g, response, framing, wanted)
+                let into = Stream.sink(Output.bodyWriter(g, g.outbox, framing), fail)
                 if let Left(e) = Stream.send(stream, into) {
                     report(server, ResponseAborted(e))
                     return CloseAfter
@@ -878,21 +898,23 @@ fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerRe
         WithBody -> framing
         HeadOnly -> NoBody
     }
-    let w = Output.bodyWriter(g, headOf(response, framing, persistence), written)
+    headOf(g, response, framing, persistence)
+    let w = Output.bodyWriter(g, g.outbox, written)
     if let (Whole(b), WithBody) = (content, extent) {
         Either.mapLeft(writeFrom(w, b), toSomeError)?
     }
     Either.mapLeft(Output.finish(w), toSomeError)
 }
 
--- Returns the head of `response`, with the one field the server adds:
--- `Date`, which an origin server with a clock sends (RFC 9110 §6.6.1).
-fun headOf(response : ServerResponse, framing : Framing, persistence : Persistence) -> Buffer {
+-- Writes the head of `response` into `g`'s outbox, with the one field the
+-- server adds: `Date`, which an origin server with a clock sends (RFC 9110
+-- §6.6.1).
+fun headOf(g : Guarded c, response : ServerResponse, framing : Framing, persistence : Persistence) -> Unit {
     var fields = headers(response)
     if !Headers.has(fields, dateField) {
         fields = Headers.add(fields, dateField, HeaderValue.literal(Date.toString(Clock.realtime())))
     }
-    Output.responseHead(OutgoingResponse {
+    Output.responseHead(g.outbox, OutgoingResponse {
         status = ServerResponse.status(response)
         headers = fields
         framing
@@ -911,11 +933,13 @@ fun plain(s : Status) -> ServerResponse =
 -- -- informational responses -------------------------------------------------------------
 
 -- Writes the 1xx `status` with `headers`: nothing to an HTTP/1.0 client,
--- and nothing for a `100 Continue` already sent, by the handler's `inform`
--- or for a client waiting for it before it sends a body.
+-- nothing for a `100 Continue` already sent, by the handler's `inform` or
+-- for a client waiting for it before it sends a body, and nothing once the
+-- final response has begun, as when a stream's function first reads the
+-- request's body.
 fun sendInformational[Connection c, Error (WriteError c)](
         g : Guarded c, head : RequestHead, ex : Exchange, status : Status, headers : Headers) -> Either HTTPError Unit {
-    if isHTTP10(head.version) {
+    if isHTTP10(head.version) || ex.final {
         return Right(())
     }
     if Status.code(status) == 100 {
@@ -924,17 +948,18 @@ fun sendInformational[Connection c, Error (WriteError c)](
         }
         ex.continued = True
     }
-    let sent = sendHead(g, interimHead(status, headers, None))
+    interimHead(g, status, headers, None)
+    let sent = sendHead(g)
     if let Left(_) = sent {
         ex.after = CloseAfter
     }
     sent
 }
 
--- Returns the head of a 1xx response: no body, and the connection kept,
--- switched to `upgrade` if there is one.
-fun interimHead(status : Status, headers : Headers, upgrade : Option HeaderValue) -> Buffer =
-    Output.responseHead(OutgoingResponse {
+-- Writes the head of a 1xx response into `g`'s outbox: no body, and the
+-- connection kept, switched to `upgrade` if there is one.
+fun interimHead(g : Guarded c, status : Status, headers : Headers, upgrade : Option HeaderValue) -> Unit =
+    Output.responseHead(g.outbox, OutgoingResponse {
         status
         headers
         framing = NoBody
@@ -942,13 +967,13 @@ fun interimHead(status : Status, headers : Headers, upgrade : Option HeaderValue
         upgrade
     })
 
-fun sendHead[Connection c, Error (WriteError c)](g : Guarded c, head : Buffer) -> Either HTTPError Unit {
-    let sent = do {
-        writeFrom(g, head)?
-        flush(g)
+-- Sends the bodiless head written into `g`'s outbox.
+fun sendHead[Connection c, Error (WriteError c)](g : Guarded c) -> Either HTTPError Unit =
+    match Output.finish(Output.bodyWriter(g, g.outbox, NoBody)) {
+        Right(_) -> Right(())
+        Left(Left(h)) -> Left(h)
+        Left(Right(e)) -> Left(Transport(fail(e)))
     }
-    transport(sent)
-}
 
 -- Shuts down the writing side and discards what the client still sends,
 -- within the linger limits, so the close that follows does not reset the
@@ -981,8 +1006,8 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
         return if drained == MustClose { LingerAfter } else { CloseAfter }
     }
     let name = HeaderValue.literal(Token.toString(protocol))
-    let switched = interimHead(ServerResponse.status(response), headers(response), Some(name))
-    if let Left(e) = Output.finish(Output.bodyWriter(g, switched, NoBody)) {
+    interimHead(g, ServerResponse.status(response), headers(response), Some(name))
+    if let Left(e) = Output.finish(Output.bodyWriter(g, g.outbox, NoBody)) {
         reportConnectionFailed(server, toSomeError(e))
         return CloseAfter
     }

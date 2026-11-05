@@ -72,10 +72,9 @@ fun respond(label : String, s : Stream, out : Wire) -> Sink = respondAs(label, s
 -- unknown length.
 fun respondAs(label : String, s : Stream, out : Wire, unknown : Framing) -> Sink {
     let framing = Stream.framing(Stream.length(s), unknown)
-    let head = Output.responseHead(OutgoingResponse {
-        status = OK, headers = Headers.empty, framing, persistence = KeepAlive, upgrade = None,
-    })
-    let into = Stream.sink(Output.bodyWriter(out, head, framing), fail)
+    let o = Output.outbox(Output.buffers(1))
+    okHead(o, framing)
+    let into = Stream.sink(Output.bodyWriter(out, o, framing), fail)
     let outcome = match Stream.send(s, into) {
         Right(_) -> "ok"
         Left(e) -> describe(e)
@@ -84,6 +83,12 @@ fun respondAs(label : String, s : Stream, out : Wire, unknown : Framing) -> Sink
     print("  " + written(out))
     into
 }
+
+-- Writes a 200 response head framed by `framing` into `o`.
+fun okHead(o : Output.Outbox, framing : Framing) -> Unit =
+    Output.responseHead(o, OutgoingResponse {
+        status = OK, headers = Headers.empty, framing, persistence = KeepAlive, upgrade = None,
+    })
 
 fun pieces(parts : Array String) -> fun(Sink) -> Either SomeError Headers = fun(sink) {
     for part in parts { IO.writeText(sink, part)? }
@@ -160,4 +165,36 @@ fun main() {
         }
     }
     let _ = ended
+
+    -- A sink whose function never ran to its end, so it is still open, but
+    -- whose exchange has: the outbox's buffer, with the head still in it,
+    -- went back to the pool and is lent to the next exchange. Nothing the
+    -- old writer does reaches the wire or the buffer.
+    let pool = Output.buffers(1)
+    let o = Output.outbox(pool)
+    let out = wire()
+    okHead(o, Chunked)
+    let staleWriter = Output.bodyWriter(out, o, Chunked)
+    let stale = Stream.sink(staleWriter, fail)
+    Output.release(o)
+    let next = Output.outbox(pool)
+    okHead(next, ContentLength(2))
+    match IO.writeText(stale, "late") {
+        Left(e) -> print("write after its exchange: " + describe(e))
+        Right(_) -> print("FAIL: a write after its exchange succeeded")
+    }
+    match flush(stale) {
+        Left(e) -> print("flush after its exchange: " + describe(e))
+        Right(_) -> print("FAIL: a flush after its exchange succeeded")
+    }
+    match Output.finish(staleWriter) {
+        Left(Left(h)) -> print("finish after its exchange: " + describe(fail(h)))
+        Left(Right(io)) -> print("finish after its exchange: " + show(io))
+        Right(_) -> print("FAIL: a finish after its exchange succeeded")
+    }
+    print("  " + show(len(out.pieces)) + " writes from the old writer")
+    let w = Output.bodyWriter(out, next, ContentLength(2))
+    let _ = IO.writeText(w, "ok")
+    let _ = Output.finish(w)
+    print("  the next exchange: " + written(out))
 }

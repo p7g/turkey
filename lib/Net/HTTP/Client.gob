@@ -127,9 +127,9 @@ import Net.HTTP.H1.Head (ResponseHead(..), Framing(..), Persistence(..))
 import Net.HTTP.H1.Input as Input
 import Net.HTTP.H1.Input (Input, HeadBytes(..))
 import Net.HTTP.H1.Output as Output
-import Net.HTTP.H1.Output (OutgoingRequest(..))
+import Net.HTTP.H1.Output (OutgoingRequest(..), Buffers, Outbox)
 import Net.HTTP.H1.Pool as Pool
-import Net.HTTP.H1.Pool (Conn(..), Paced, Pool)
+import Net.HTTP.H1.Pool (Conn(..), Link, Paced, Pool)
 import Net.HTTP.HeaderName as HeaderName
 import Net.HTTP.Headers as Headers (Headers, Authorization(..), ContentType(..), IdempotencyKey(..), Location(..))
 import Net.HTTP.HTTPURL as HTTPURL (HTTPURL)
@@ -350,7 +350,14 @@ type Client = Client {
     settings : Settings
     tls      : TLS.ClientConfig
     pool     : Pool
+    -- The buffers request heads are written into, one lent to each
+    -- exchange while it writes its request.
+    buffers  : Buffers
 }
+
+-- How many request buffers a client keeps for its next requests: at 4 KiB
+-- each, at most 256 KiB, however many requests were in flight at once.
+let keptBuffers = 64
 
 -- Returns a client with `c`'s settings, and the defaults for those it does
 -- not set, or why its TLS configuration cannot be made: a roots file that
@@ -362,6 +369,7 @@ fun client(c : Config) -> Either TLSError Client {
         settings = s
         tls
         pool = Pool.pool(s.idlePerOrigin, s.idleTotal, s.idle)
+        buffers = Output.buffers(keptBuffers)
     })
 }
 
@@ -650,6 +658,7 @@ fun origin(u : HTTPURL) -> String =
 type Exchange = Exchange {
     client      : Client
     hop         : Hop
+    link        : Link
     paced       : Paced
     input       : Input Paced
     writer      : Writer
@@ -701,7 +710,10 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
         }
         None -> False
     }
-    let head = match Output.requestHead(OutgoingRequest {
+    -- The outbox lends the request's head a buffer until the exchange,
+    -- and with it the writer, has ended.
+    let out = Output.outbox(c.buffers)
+    if let Left(e) = Output.requestHead(out, OutgoingRequest {
         method = h.method
         url = h.url
         headers = h.headers
@@ -710,8 +722,7 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
         expectContinue = expecting
         upgrade = h.upgrade
     }) {
-        Right(b) -> b
-        Left(e) -> return Left(Failed(SendFailed(NotSent(e))))
+        return Left(Failed(SendFailed(NotSent(e))))
     }
     let key = origin(h.url)
     let pooled = match reuse {
@@ -720,22 +731,27 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
     }
     let reused = Option.isSome(pooled)
     let made = match pooled {
-        Some(conn) -> (conn, reusedConnection)
+        Some(l) -> (l, reusedConnection)
         None -> match dial(c, h.url, total) {
-            Right(made) -> made
-            Left(e) -> return Left(Failed(SendFailed(NotSent(e))))
+            Right((conn, dialed)) -> (Pool.link(conn, c.settings.stall, c.settings.limits), dialed)
+            Left(e) -> {
+                Output.release(out)
+                return Left(Failed(SendFailed(NotSent(e))))
+            }
         }
     }
-    let (conn, dialed) = made
-    let p = Pool.paced(conn, total, c.settings.stall)
+    let (link, dialed) = made
+    let p = Pool.pace(link, total)
+    let conn = Pool.conn(p)
     let v = verdict()
     let proceed = if expecting { Some(fun() = awaitContinue(v, total)) } else { None }
-    let write = fun() = writeRequest(p, head, framing, Option.map(body, fun((s, _)) = s), proceed)
+    let write = fun() = writeRequest(p, out, framing, Option.map(body, fun((s, _)) = s), proceed)
     let exchangeOn = fun(writer) = Exchange {
         client = c
         hop = h
+        link
         paced = p
-        input = Input.input(p, c.settings.limits)
+        input = Pool.input(link)
         writer
         verdict = v
         key
@@ -762,7 +778,7 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
         }
         Left(Broken(e)) -> Left(Failed(failWith(ex, e)))
     }
-    match body {
+    let result = match body {
         None -> run(exchangeOn(Finished(write())))
         Some(_) -> Task.runScope(do {
             let finished = Sync.event()
@@ -774,6 +790,8 @@ fun attempt[FromHTTP e](c : Client, h : Hop, total : Option Deadline, reuse : Re
             pure(run(exchangeOn(Running(task, finished))))
         })
     }
+    Output.release(out)
+    result
 }
 
 -- How writing a request ended. A connection that failed carries no reason:
@@ -788,9 +806,9 @@ type Written = Wrote | SourceFailed(HTTPError) | ConnectionFailed | Withheld
 -- for: the server is waiting for the rest of the body. If the connection
 -- fails, leaves it, so that a response the server sent before it stopped
 -- reading is still read.
-fun writeRequest(p : Paced, head : Buffer, framing : Framing, body : Option Stream,
+fun writeRequest(p : Paced, out : Outbox, framing : Framing, body : Option Stream,
                  proceed : Option (fun() -> Bool)) -> Written {
-    let w = Output.bodyWriter(p, head, framing)
+    let w = Output.bodyWriter(p, out, framing)
     if let Some(go) = proceed {
         if let Left(_) = flush(w) {
             return ConnectionFailed
@@ -1101,7 +1119,7 @@ fun settle(ex : Exchange, framed : Framed.Body Paced, rh : ResponseHead) -> Unit
         -- early response, and the server will not read the rest.
         && wroteWhole(ex)
     if reusable {
-        Pool.give(ex.client.pool, ex.key, conn)
+        Pool.give(ex.client.pool, ex.key, ex.link)
     } else {
         Pool.close(conn)
         let _ = awaitWriter(ex)

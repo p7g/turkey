@@ -51,9 +51,11 @@ def test_a_string_step_join_takes_the_fields():
     for name in ("Main#firstTwo", "Main#countA"):
         body = _body(dump.stdout, name)
         assert ": (Char, Index)" not in body, body
-    # The loop's join has both fields as parameters, the index unwrapped too.
+    # The loop binds the two fields one by one: as the parameters of the
+    # step's join, or, where that join has one jump, as `let`s at the jump.
     count = _body(dump.stdout, "Main#countA")
-    assert re.search(r"join %js[^(]*\([^)]*: Char, [^)]*: Int\)", count), count
+    assert re.search(r"%jf\S* : Char\b", count), count
+    assert re.search(r"%jf\S* : (Index|Int)\b", count), count
     assert lang.output(FIRST_TWO) == "1\n2\n0\n4\n"
 
 

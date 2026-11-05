@@ -47,11 +47,11 @@ export (
 -- the program, in the input or in the output: `Turkey.Coretc` checks it before
 -- this pass and after it. Every rule that puts a second copy of a term in the
 -- program makes it with `copyWith`, which gives each binder in the copy a
--- fresh id. So no rule has to ask whether moving a term
--- under a binder captures a variable: the binder and the variable have
--- different ids. Each rule keys a binder on its id, never on its spelling, and
--- a copy keeps its original's spelling, so the spellings of two binders may
--- clash until `respell` tells them apart.
+-- fresh id. So no rule has to ask whether moving a term under a binder
+-- captures a variable: the binder and the variable have different ids. Each
+-- rule keys a binder on its id, never on its spelling, and a copy keeps its
+-- original's spelling, so the spellings of two binders may clash until
+-- `respell` tells them apart.
 --
 -- The ids a reduction mints are deterministic however components are
 -- scheduled; see `mint`.
@@ -2162,13 +2162,16 @@ type Copier = Copier {
     rebase : Option (Option Span),
     -- How many variables `subst` has replaced so far.
     var substituted : Int,
+    -- How many binders and references `renamed` has respelled or renumbered
+    -- so far, with the variables replaced.
+    var changed : Int,
 }
 
 fun copier(mint : fun(String, Int) -> Int, subst : Map Int Core,
            renamed : Map Int (String, Int), freshen : Bool,
            rebase : Option (Option Span)) -> Copier = Copier {
     mint = mint, renamed = renamed, subst = subst, freshen = freshen,
-    rebase = rebase, substituted = 0,
+    rebase = rebase, substituted = 0, changed = 0,
 }
 
 -- Returns `body` with each variable `subst` maps replaced by a copy of its own
@@ -2185,12 +2188,14 @@ fun copyWith(mint : fun(String, Int) -> Int, body : Core, subst : Map Int Core,
 
 fun copyTerm(c : Copier, e : Core) -> Core {
     let before = c.substituted
+    let changedBefore = c.changed
     let kind = match e.kind {
         CVar(name, id) -> match Map.get(c.subst, id) {
             -- With the value's own spans, and binders of its own: a value is
             -- substituted at every mention.
             Some(value) -> {
                 c.substituted = c.substituted + 1
+                c.changed = c.changed + 1
                 return copyWith(c.mint, value, Map.new(), Map.new(), True, None)
             }
             None -> {
@@ -2245,6 +2250,9 @@ fun copyTerm(c : Copier, e : Core) -> Core {
             bind = fun(_) = oops("a binding outside a letrec reached copyTerm"),
         })
     }
+    -- A term that moves keeps every subterm the walk changed nothing in, as
+    -- it was: not rebuilt, and still marked as settled.
+    if !c.freshen && Option.isNone(c.rebase) && c.changed == changedBefore { return e }
     let span = match c.rebase {
         Some(s) -> s
         None -> e.span
@@ -2261,7 +2269,10 @@ fun copyTerm(c : Copier, e : Core) -> Core {
 -- What the binder spelled `name` with the id `id` becomes in the copy.
 fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {
     match Map.get(c.renamed, id) {
-        Some(made) -> return made
+        Some(made) -> {
+            c.changed = c.changed + 1
+            return made
+        }
         None -> {}
     }
     if !c.freshen { return (name, id) }
@@ -2270,6 +2281,7 @@ fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {
     if id == noId { oops("the binder '" + name + "' has no id") }
     let made = (name, c.mint(name, id))
     Map.put(c.renamed, id, made)
+    c.changed = c.changed + 1
     made
 }
 
@@ -2281,7 +2293,10 @@ fun bindParam(c : Copier, p : CParam) -> CParam {
 
 fun referenceTo(c : Copier, name : String, id : Int) -> (String, Int) =
     match Map.get(c.renamed, id) {
-        Some(made) -> made
+        Some(made) -> {
+            c.changed = c.changed + 1
+            made
+        }
         None -> (name, id)
     }
 

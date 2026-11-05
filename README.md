@@ -133,6 +133,45 @@ emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
 replaces the committed compiler, which is rare and deliberate; both scripts
 explain themselves at the top.
 
+### Debugging and profiling
+
+`build -g` adds a line table and the DWARF a debugger needs to find it: a
+compile unit for the program and an entry for each function. It changes no
+code: a program built with `-g` runs the same instructions as one built
+without. For now `-g` writes assembly only, so assemble it with DWARF 5,
+which is what the compile unit is:
+
+```sh
+build/stages/stage2 build -g -o rectangles.s rectangles.gob
+cc -gdwarf-5 -c rectangles.s -o rectangles.o
+cc -o rectangles rectangles.o
+```
+
+On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
+object and writes only a map to it into the executable, which is how lldb and
+Instruments find it. To make a copy that does not need the object, run
+`dsymutil rectangles`, which writes `rectangles.dSYM` beside it. On Linux the
+DWARF is linked into the executable.
+
+Then a debugger stops at a line and names the frames by function, file and
+line:
+
+```sh
+lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o bt
+gdb ./rectangles -ex 'break rectangles.gob:4' -ex run -ex bt
+```
+
+A function's name is its symbol, such as `Main#area@Rectangle`, with its
+module in it. A function the optimizer inlined has no frame of its own: its
+code is part of its caller's, so a breakpoint on one of its lines stops in the
+caller, here `Main#main`. There is no information about variables or types
+yet, so a debugger shows registers and memory rather than values.
+
+Profilers need no `-g` to name functions: every function keeps a frame pointer,
+so `sample PID` and Instruments on a Mac, and `perf record --call-graph=fp` on
+Linux, walk the stack and show the functions by name. With `-g`, Instruments
+and `perf report --sort srcline` also show the lines samples fall on.
+
 ### The C compiler, and running on another machine
 
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
@@ -190,6 +229,10 @@ programs run directly. CI does this on GitHub's arm64 runners
 (`.github/workflows/linux.yml`), building from the bootstrap under gcc and
 running the suite and the fixed point split across jobs by
 `scripts/ci-shard.sh`.
+
+`tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump` and runs
+lldb on macOS and gdb on Linux, and skips a check, saying which tool is
+missing, where one is not installed.
 
 One group of tests depends on the C compiler, and skips, saying why, where it
 cannot do what it needs: under

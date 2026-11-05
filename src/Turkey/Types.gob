@@ -888,6 +888,12 @@ fun firstOf(a : Option v, b : Option v) -> Option v = match a {
 -- be. That is the third outcome, and `defer` is where it goes -- back on the
 -- solver's queue, to be retried when something has been learnt. Without a
 -- reducer there is no queue, so it is a mismatch.
+--
+-- A mismatch is reported (`Diag.report`) and the pair is left as it was, with
+-- no variable bound, so the solver can go on to the rest of the program.
+-- Every error below returns at once for that reason: binding a variable after
+-- an occurs check or a kind error has failed would build a cyclic or ill-kinded
+-- type for the rest of the solve to trip over.
 fun unify(a : Type, b : Type, where : Option Span, context : String,
           fams : Option Families) -> Unit {
     let x = normalize(a, fams)
@@ -912,7 +918,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
         TVar(cell) -> {
             match escaping(cell, y) {
                 Some(out) -> match openedEscape(y, out, cell.level) {
-                    Some(opener) -> oops("the type '" + out + "' hidden by '"
+                    Some(opener) -> return typeError("the type '" + out + "' hidden by '"
                         + shortName(opener) + "' cannot leave the 'match' arm or "
                         + "function that opened it", where)
                     None -> {}
@@ -920,7 +926,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 None -> {}
             }
             match escaping(cell, y) {
-                Some(out) -> oops("the type variable '" + out + "' from a "
+                Some(out) -> return typeError("the type variable '" + out + "' from a "
                     + "signature cannot be equal to a type from outside its "
                     + "function", where)
                 None -> {}
@@ -928,10 +934,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             if occursAndAdjust(cell, y) {
                 -- One namer for both sides, so the variable keeps its name.
                 let n = namer("")
-                oops("cannot construct the infinite type '" + showAt(x, n, 0)
-                     + " = " + showAt(y, n, 0) + "'", where)
+                return typeError("cannot construct the infinite type '" + showAt(x, n, 0)
+                                 + " = " + showAt(y, n, 0) + "'", where)
             }
-            if !unifyKinds(cell.kind, kindOf(y)) { kindMismatch(x, y, where) }
+            if !unifyKinds(cell.kind, kindOf(y)) { return kindMismatch(x, y, where) }
             cell.ref = Some(y)
             return {}
         }
@@ -958,14 +964,14 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             unify(a1, a2, where, context, fams)
         }
         (TFun(p1, r1), TFun(p2, r2)) -> {
-            if len(p1) != len(p2) { arityMismatch(len(p1), len(p2), where) }
+            if len(p1) != len(p2) { return arityMismatch(len(p1), len(p2), where) }
             for var i = 0; i < len(p1); i = i + 1 {
                 unify(p1[i], p2[i], where, context, fams)
             }
             unify(r1, r2, where, context, fams)
         }
         (TTuple(e1), TTuple(e2)) -> {
-            if len(e1) != len(e2) { mismatch(x, y, where, context) }
+            if len(e1) != len(e2) { return mismatch(x, y, where, context) }
             for var i = 0; i < len(e1); i = i + 1 {
                 unify(e1[i], e2[i], where, context, fams)
             }
@@ -982,7 +988,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
 -- waits for the argument to be decided.
 fun unifyRest(x : Type, y : Type, where : Option Span, context : String,
               fams : Option Families) -> Unit {
-    if !isFam(x) && !isFam(y) { mismatch(x, y, where, context) }
+    if !isFam(x) && !isFam(y) { return mismatch(x, y, where, context) }
     match (x, y) {
         (TFam(n1, a1, _), TFam(n2, a2, _)) ->
             if n1 == n2 && sameType(a1, a2) { return {} }
@@ -999,18 +1005,18 @@ fun isFam(t : Type) -> Bool = match t {
     _ -> False
 }
 
-fun kindMismatch(a : Type, b : Type, where : Option Span) -> a =
-    oops("'" + show(b) + "' has kind " + showKind(kindOf(b))
+fun kindMismatch(a : Type, b : Type, where : Option Span) -> Unit =
+    typeError("'" + show(b) + "' has kind " + showKind(kindOf(b))
          + ", but a type of kind " + showKind(kindOf(a))
          + " is needed here", where)
 
-fun mismatch(a : Type, b : Type, where : Option Span, context : String) -> a {
+fun mismatch(a : Type, b : Type, where : Option Span, context : String) -> Unit {
     let suffix = if context == "" { "" } else { " in " + context }
-    oops("expected '" + show(a) + "', found '" + show(b) + "'" + suffix, where)
+    typeError("expected '" + show(a) + "', found '" + show(b) + "'" + suffix, where)
 }
 
-fun arityMismatch(want : Int, got : Int, where : Option Span) -> a =
-    oops("this function takes " + Int.toString(want) + " argument"
+fun arityMismatch(want : Int, got : Int, where : Option Span) -> Unit =
+    typeError("this function takes " + Int.toString(want) + " argument"
          + (if want == 1 { "" } else { "s" }) + " but " + Int.toString(got)
          + " " + (if got == 1 { "was" } else { "were" }) + " supplied", where)
 
@@ -1409,6 +1415,13 @@ fun showPredWith(p : Pred, n : Namer) -> String {
 fun oops(message : String, where : Option Span) -> a = match where {
     None -> Diag.fail(Diag.whole("type error", message), "")
     Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
+}
+
+-- Reports a type error and returns, for a site that can leave its types as
+-- they are and carry on.
+fun typeError(message : String, where : Option Span) -> Unit = match where {
+    None -> Diag.report(Diag.whole("type error", message))
+    Some(s) -> Diag.report(Diag.at("type error", message, s))
 }
 
 fun discard(x : a) -> Unit = {}

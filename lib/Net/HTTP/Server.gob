@@ -418,22 +418,22 @@ fun run[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Err
 fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
               Error (WriteError (Accepted l))](
         server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Unit {
-    var pause = firstPause
-    Task.spawnEach(fun() {
+    do {
+        var pause = firstPause
         loop {
             let _ = Sync.acquire(server.permits, None)
             if isStopping(server) {
-                return None
+                break
             }
             match accept(l) {
                 Right(c) -> {
                     pause = firstPause
-                    return Some(fun() = connection(server, c, handler))
+                    let _ = Task.spawn(fun() = connection(server, c, handler))?
                 }
                 Left(e) -> {
                     Sync.release(server.permits)
                     if e.kind == Closed || isStopping(server) {
-                        return None
+                        break
                     }
                     report(server, AcceptFailed(e))
                     Sleep.sleep(pause)
@@ -441,7 +441,8 @@ fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l
                 }
             }
         }
-    })
+        pure(())
+    }
 }
 
 -- How long the accept loop waits after a failed accept: doubling from the
@@ -498,10 +499,8 @@ fun finish(w : Work) -> Unit {
 -- Each turn takes every pending function at once, leaving the queue empty,
 -- so that the queue holds a function only until it is spawned.
 fun dispatch(w : Work) -> Spawn Unit {
-    var batch : Vec (fun() -> Unit) = []
-    var at = 0
-    Task.spawnEach(fun() {
-        while at == len(batch) {
+    do {
+        loop {
             -- Clear before taking, never after: a `submit` that sets `ready`
             -- after the clear has queued what the take below finds or the
             -- next wait returns for, so its set is never lost.
@@ -511,19 +510,18 @@ fun dispatch(w : Work) -> Spawn Unit {
                 q.pending = []
                 (taken, q.finished)
             })
-            batch = taken
-            at = 0
-            if len(batch) == 0 {
+            for f in taken {
+                let _ = Task.spawn(f)?
+            }
+            if len(taken) == 0 {
                 if finished {
-                    return None
+                    break
                 }
                 Sync.waitUnbounded(w.ready)
             }
         }
-        let f = batch[at]
-        at = at + 1
-        Some(f)
-    })
+        pure(())
+    }
 }
 
 -- -- deadlines ---------------------------------------------------------------------------

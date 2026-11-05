@@ -1,4 +1,4 @@
-"""Tasks (`System.Task`): scopes, `spawn`, `spawnEach`, `join` and `yield` on
+"""Tasks (`System.Task`): scopes, `spawn`, `join` and `yield` on
 one worker.
 
 Every program that should succeed is run twice, plainly and with a
@@ -325,22 +325,25 @@ fun main() {
         "panic: array index out of bounds: read at index 3, length 1\n"
 
 
-# A loop that starts a task per iteration, for as many iterations as `N`
-# says, from inside a task as a server's accept loop does.
-SPAWN_EACH = """
+# A `loop` in a `do` block that starts a task per iteration, for as many
+# iterations as `N` says, from inside a task as a server's accept loop does.
+SPAWNING_LOOP = """
 import System.Env as Env
 import System.Sync as Sync
 import System.Task as Task
 
 fun count(n : Int) -> Int {
     let ran = Sync.atomicInt(0)
-    var i = 0
-    Task.runScope(Task.spawnEach(fun() {
-        if i == n { return None }
-        i = i + 1
-        Task.yield()
-        Some(fun() { let _ = Sync.addAndGet(ran, 1) })
-    }))
+    Task.runScope(do {
+        var i = 0
+        loop {
+            if i == n { break }
+            i = i + 1
+            let _ = Task.spawn(fun() { let _ = Sync.addAndGet(ran, 1) })?
+            Task.yield()
+        }
+        pure(())
+    })
     Sync.load(ran)
 }
 
@@ -349,7 +352,6 @@ fun main() {
     print(Task.join(Task.runScope(Task.spawn(fun() = count(n)))))
 }
 """
-
 
 def _peak(binary, n: int) -> int:
     """Runs `binary` with `N=n` and returns its peak resident size, in the
@@ -366,11 +368,11 @@ def _peak(binary, n: int) -> int:
     return usage.ru_maxrss
 
 
-def test_spawn_each_runs_in_constant_memory():
-    """Millions of iterations of `spawnEach` take no more memory than a
-    hundred thousand, where a `loop` with `spawn(f)?` in a `do` block grows
-    the stack by a frame each."""
-    binary = lang.binary(SPAWN_EACH)
+def test_a_loop_that_spawns_runs_in_constant_memory():
+    """Millions of iterations of a `loop` with `spawn(f)?` in a `do` block
+    take no more memory than a hundred thousand: each `?` is a tail call, so
+    the loop does not grow the stack."""
+    binary = lang.binary(SPAWNING_LOOP)
     small = _peak(binary, 100_000)
     large = _peak(binary, 3_000_000)
     assert large < 4 * small, (small, large)

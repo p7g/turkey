@@ -21,7 +21,7 @@ export (
     ImportDecl(..),
     Decl(..),
     Program(..),
-    patternVars, varPatterns, freshNodeId, armBody, declBody,
+    patternVars, varPatterns, laterOccurrences, orPatterns, freshNodeId, armBody, declBody,
     Child(..), children, exprChildren, stmtChildren,
     Completion(..), completion, stmtCompletion, completes, stmtStops, breaksOut,
     LetElse(..),
@@ -156,6 +156,14 @@ type PatKind
     | PLit(Lit)
     | PTuple(Vec Pat)
     | PAnnot(Pat, Type)
+    -- `p1 | p2 | ...`, nested inside another pattern or written where a
+    -- single pattern is expected. Matches when one of the alternatives does,
+    -- trying them left to right. Every alternative binds the same names, so
+    -- the first alternative's variables are the pattern's binding occurrences
+    -- and the others' are further occurrences of the same binders. The
+    -- alternatives at the top of a `match` arm or a `let` guard are not one of
+    -- these; they are the arm's or the guard's list of patterns.
+    | POr(Vec Pat)
 
 -- -- expressions ------------------------------------------------------------------
 
@@ -478,9 +486,10 @@ fun patternVars(p : Pat) -> Vec String = Vec.map(varPatterns(p), fun(v) = match 
     _ -> error("Ast.patternVars: varPatterns returned a pattern that is not a variable")
 })
 
--- Every `PVar` node in a pattern, in the order `patternVars` lists their
--- names. What a stage wants when it records something against each binding
--- occurrence.
+-- Every binding occurrence in a pattern, a `PVar` node, in the order
+-- `patternVars` lists their names. What a stage wants when it records
+-- something against each binder. Under a `POr` these are the first
+-- alternative's; `orPatterns` finds the others.
 fun varPatterns(p : Pat) -> Vec Pat {
     let out = Vec.new(4)
     collectVarPatterns(p, out)
@@ -495,6 +504,42 @@ fun collectVarPatterns(p : Pat, out : Vec Pat) -> Unit = match p.kind {
     PRecord(_, fields, _) -> for (_, sub) in fields { collectVarPatterns(sub, out) }
     PTuple(elems) -> for e in elems { collectVarPatterns(e, out) }
     PAnnot(inner, _) -> collectVarPatterns(inner, out)
+    POr(alts) -> collectVarPatterns(alts[0], out)
+}
+
+-- Every `PVar` node that `varPatterns` leaves out: the variables of each
+-- alternative after the first, under every `POr` in the pattern. Each one is
+-- another occurrence of the binder its name has in the first alternative.
+fun laterOccurrences(p : Pat) -> Vec Pat {
+    let out = Vec.new(2)
+    for q in orPatterns(p) {
+        if let POr(alts) = q.kind {
+            for var i = 1; i < len(alts); i = i + 1 { collectVarPatterns(alts[i], out) }
+        }
+    }
+    out
+}
+
+-- Every `POr` node in a pattern, outermost first, including those inside an
+-- alternative of another.
+fun orPatterns(p : Pat) -> Vec Pat {
+    let out = Vec.new(1)
+    collectOrPatterns(p, out)
+    out
+}
+
+fun collectOrPatterns(p : Pat, out : Vec Pat) -> Unit = match p.kind {
+    PVar(_) -> {}
+    PWild -> {}
+    PLit(_) -> {}
+    PCon(_, args) -> for a in args { collectOrPatterns(a, out) }
+    PRecord(_, fields, _) -> for (_, sub) in fields { collectOrPatterns(sub, out) }
+    PTuple(elems) -> for e in elems { collectOrPatterns(e, out) }
+    PAnnot(inner, _) -> collectOrPatterns(inner, out)
+    POr(alts) -> {
+        Vec.push(out, p)
+        for a in alts { collectOrPatterns(a, out) }
+    }
 }
 
 -- -- the child enumerator -----------------------------------------------------------

@@ -40,6 +40,18 @@ export (Matcher(..), Body(..), compile)
 -- An arm with guards is a row like any other until its patterns have all
 -- matched. Its guards then run under its bindings, and a failing one jumps to
 -- the rows after it, which is a join point of its own.
+--
+-- Alternatives inside a pattern, `(GET | HEAD, path)`, are compiled where they
+-- stand rather than multiplied out into one row per combination, which would
+-- copy the rest of the row once per alternative and grow as the product of
+-- their counts. A row whose first pattern is alternatives is a run of its own:
+-- a join point that takes the variables the alternatives bind and matches the
+-- rest of the row, and a one-column matrix with a row per alternative, each
+-- jumping there with what it bound. This is Le Fessant and Maranget's scheme
+-- with exits that carry variables. The first alternative that matches is the
+-- one taken: when the rest of the row or a guard then fails, the rows after it
+-- are tried, not the other alternatives. Retrying them could only matter to a
+-- guard, since the rest of the row tests other columns.
 
 import Turkey.Ast (..)
 import Turkey.Core (..)
@@ -246,7 +258,7 @@ fun runs(st : State, columns : Vec Column, all : Vec (Vec Row), i : Int,
 }
 
 -- What a run's patterns are in its first column.
-type Head = Variable | Literal | Tuple | Constructor
+type Head = Variable | Literal | Tuple | Constructor | Alternatives
 
 fun headOf(row : Row) -> Head = match unannot(row.pats[0]).kind {
     PVar(_) -> Variable
@@ -255,6 +267,7 @@ fun headOf(row : Row) -> Head = match unannot(row.pats[0]).kind {
     PTuple(_) -> Tuple
     PCon(_, _) -> Constructor
     PRecord(_, _, _) -> Constructor
+    POr(_) -> Alternatives
     PAnnot(_, _) -> oops("an annotation under an annotation")
 }
 
@@ -266,18 +279,23 @@ fun sameHead(a : Head, b : Head) -> Bool = match (a, b) {
     _ -> False
 }
 
-fun opens(row : Row) -> Bool = Option.isSome(unannot(row.pats[0]).opening)
+-- Whether a row is a run by itself: an existential pattern, or alternatives.
+fun alone(row : Row) -> Bool = match headOf(row) {
+    Alternatives -> True
+    _ -> Option.isSome(unannot(row.pats[0]).opening)
+}
 
 -- The rows split where the kind of the first pattern changes. An existential
 -- pattern is a run of its own: what it opens is named by its own pattern, and
--- two rows opening one constructor name their constants differently.
+-- two rows opening one constructor name their constants differently. So are
+-- alternatives; see `alternatives`.
 fun runsOf(rows : Array Row) -> Vec (Vec Row) {
     let out = []
     var current = [rows[0]]
     for var i = 1; i < len(rows); i = i + 1 {
         let row = rows[i]
         let prev = current[len(current) - 1]
-        if sameHead(headOf(row), headOf(prev)) && !opens(row) && !opens(prev) {
+        if sameHead(headOf(row), headOf(prev)) && !alone(row) && !alone(prev) {
             Vec.push(current, row)
         } else {
             Vec.push(out, current)
@@ -318,7 +336,111 @@ fun run(st : State, columns : Vec Column, rows : Vec Row,
             switch(column, [CAlt { alt = ATuple(binders), body = body }], site)
         }
         Constructor -> constructors(st, column, after, rows, fail, site)
+        Alternatives -> alternatives(st, column, after, rows[0], fail, site)
     }
+}
+
+-- A row whose first pattern is alternatives: a join that matches the rest of
+-- the row, taking the variables the alternatives bind as columns, and a
+-- `match` of the column against each alternative in turn that jumps to it.
+--
+-- The join's parameters are columns, so the row binds its variables to them
+-- in `leafOf`, as it binds any other. Each alternative's variables are bound
+-- under fresh binders of their own, since every alternative binds the same
+-- names and a binder is bound once in a program; the jump passes those on.
+-- Both the join and the alternatives fall through to `fail`.
+fun alternatives(st : State, column : Column, after : Vec Column, row : Row,
+                 fail : Option (String, Int), site : Site) -> Core {
+    let bare = unannot(row.pats[0])
+    let alts = match bare.kind {
+        POr(ps) -> ps
+        _ -> oops("an alternatives run with a row that is not alternatives")
+    }
+    let types = Map.new()
+    variableTypes(st, bare, column.ty, types)
+    let vars = varPatterns(bare)
+    let params = Array.map(vars, fun(v) {
+        let name = varName(v)
+        let (spelled, id) = st.m.fresh(name)
+        CParam { name = spelled, id = id, ty = Map.getOr(types, name, TBottom) }
+    })
+    let binds = Array.append(row.binds, Array.init(len(vars), fun(i) {
+        let p = params[i]
+        (varName(vars[i]), st.m.binderOf(vars[i]), p.ty,
+         Column { name = p.name, id = p.id, ty = p.ty })
+    }))
+    let continued = matrix(st, after, [Row { pats = rest(row), binds = binds, body = row.body }],
+                      fail, site)
+    let (label, labelId) = st.m.fresh("matched")
+    -- A variable is bound under its own spelling, and only its binder is new.
+    let renamed = Map.new()
+    let rows = Array.map(alts, fun(alt) {
+        let mine = Map.new()
+        for v in varPatterns(alt) {
+            let (_, id) = st.m.fresh(varName(v))
+            Map.put(renamed, v.id, id)
+            Map.put(mine, varName(v), id)
+        }
+        let args = Vec.new(len(vars))
+        for var i = 0; i < len(vars); i = i + 1 {
+            let name = varName(vars[i])
+            let id = match Map.get(mine, name) {
+                Some(found) -> found
+                None -> oops("an alternative that does not bind '" + name + "'")
+            }
+            Vec.push(args, mkCore(params[i].ty, site.span, CVar(name, id)))
+        }
+        Row { pats = [alt], binds = [],
+              body = Taken(mkCore(TBottom, site.span, CJump(label, labelId, args))) }
+    })
+    let inner = State {
+        m = Matcher {
+            decls = st.m.decls, reduce = st.m.reduce, fresh = st.m.fresh,
+            binderOf = fun(p) = match Map.get(renamed, p.id) {
+                Some(id) -> id
+                None -> st.m.binderOf(p)
+            },
+        },
+        jumps = st.jumps, guarded = st.guarded,
+    }
+    let tried = matrix(inner, [column], rows, fail, site)
+    mkCore(site.ty, site.span, CJoin(label, labelId, params, continued, tried, False))
+}
+
+-- Adds to `out` the type of each variable `p` binds, matched against a value
+-- of type `ty`: the types the columns for them would have.
+fun variableTypes(st : State, p : Pat, ty : Ty.Type, out : Map String Ty.Type) -> Unit =
+    match p.kind {
+        PVar(name) -> Map.put(out, name, ty)
+        PWild -> {}
+        PLit(_) -> {}
+        PAnnot(inner, _) -> variableTypes(st, inner, ty, out)
+        POr(alts) -> variableTypes(st, alts[0], ty, out)
+        PTuple(elems) -> match st.m.reduce(ty) {
+            TTuple(ts) -> for var i = 0; i < len(elems) && i < len(ts); i = i + 1 {
+                variableTypes(st, elems[i], ts[i], out)
+            }
+            _ -> oops("a tuple pattern against " + Ty.show(ty))
+        }
+        PCon(name, _) | PRecord(name, _, _) -> {
+            let info = match Decls.con(st.m.decls, name) {
+                Some(i) -> i
+                None -> oops("unknown constructor '" + name + "'")
+            }
+            let fields = match Decls.conFieldTypes(st.m.decls, st.m.reduce(ty), name) {
+                Some(ts) -> ts
+                None -> oops("no field types for '" + name + "' at " + Ty.show(ty))
+            }
+            let subs = positional(info, p)
+            for var i = 0; i < len(subs) && i < len(fields); i = i + 1 {
+                variableTypes(st, subs[i], fields[i], out)
+            }
+        }
+    }
+
+fun varName(p : Pat) -> String = match p.kind {
+    PVar(name) -> name
+    _ -> oops("a binder from a pattern that is not a variable")
 }
 
 -- A row's patterns after its first.

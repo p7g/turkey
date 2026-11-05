@@ -15,8 +15,8 @@
 #   download    GET /1m, a 1 MiB response, 64 connections
 #   upload      POST /upload of 1 MiB, read and discarded, 64 connections
 #   stream      GET /stream, 1 MiB chunked, 64 connections
-#   tls         GET /hello over TLS: keep-alive by wrk, and a handshake per
-#               request by connload
+#   tls         GET /hello over TLS: keep-alive by wrk (tls_keepalive), and
+#               a handshake per request by connload (tls_handshake)
 #   client      each client against nginx: GET /hello, 1 and 64 at once
 #   idle        server RSS holding 10,000 idle keep-alive connections
 #
@@ -317,7 +317,15 @@ scenario_stream() {
 }
 
 scenario_tls() {
+    scenario_tls_keepalive
+    scenario_tls_handshake
+}
+
+scenario_tls_keepalive() {
     for impl in $servers; do measure tls-keepalive $impl 64 tls $s/hello; done
+}
+
+scenario_tls_handshake() {
     for impl in $servers; do measure tls-handshake $impl 64 tls $s/hello connload; done
 }
 

@@ -1,11 +1,12 @@
-// Opens N keep-alive connections to a server, sends GET /hello on each and
-// reads the response, then holds them all open, idle, for SECONDS:
-// `holdconns HOST:PORT N SECONDS`. Prints "ready" once every connection has
+// Opens N keep-alive connections to a server, over TLS if the fourth
+// argument is `tls`, sends GET /hello on each and reads the response, then
+// holds them all open, idle, for SECONDS: `holdconns HOST:PORT N SECONDS [tls]`. Prints "ready" once every connection has
 // had its response.
 package main
 
 import (
 	"bufio"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -28,7 +29,13 @@ func main() {
 		go func(i int) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			c, err := net.Dial("tcp", os.Args[1])
+			var c net.Conn
+			var err error
+			if len(os.Args) > 4 && os.Args[4] == "tls" {
+				c, err = tls.Dial("tcp", os.Args[1], &tls.Config{InsecureSkipVerify: true, NextProtos: []string{"http/1.1"}})
+			} else {
+				c, err = net.Dial("tcp", os.Args[1])
+			}
 			if err != nil {
 				log.Fatal(err)
 			}

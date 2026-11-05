@@ -18,7 +18,8 @@ The Prelude provides these names unqualified:
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
-| Functions | `print`, `write`, `error`, `fail`, `const`, `min`, `max` |
+| Functions | `print`, `write`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max` |
+| Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
 With the Prelude, a module also imports the library modules `Data.Array`,
 `Data.Bool`, `Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`,
@@ -508,6 +509,41 @@ class Monad m : Applicative m {
 ([The `?` operator](do-notation.md)). The library provides instances for
 `Option`, `Either l`, `Array` and `Vec`. A program can write instances for its
 own types; a `Monad` instance needs `Functor` and `Applicative` instances too.
+
+The Prelude's `fmap(f, xs)` is `map(xs, f)` with the function first. Three of
+its operators call these methods: `xs <&> f` is `map(xs, f)`, `f <$> xs` is
+`fmap(f, xs)`, and `m |>> f` is `bind(m, f)`
+([The Prelude's other operators](expressions.md#the-preludes-other-operators)):
+
+<!-- run -->
+```kotlin
+fun half(n : Int) -> Option Int = if n % 2 == 0 { Some(n / 2) } else { None }
+
+fun main() {
+    print(Some(20) |>> half <&> show)
+    print(fmap(half, [4, 5]))
+    print(half <$> Some(8))
+}
+```
+
+```text
+Some(10)
+[Some(2), None]
+Some(Some(4))
+```
+
+## `Semigroup` and `Monoid`
+
+```text
+class Semigroup a { fun combine(a, a) -> a }
+
+class Monoid a : Semigroup a { fun empty() -> a }
+```
+
+`combine` joins two values associatively, and `empty()` is its identity on
+either side. The operator `a <> b` calls `combine(a, b)`
+([The Prelude's other operators](expressions.md#the-preludes-other-operators)).
+`String`, `Array` and `Vec` have instances, which concatenate.
 
 ## `error`
 

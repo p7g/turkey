@@ -225,8 +225,9 @@ match e {
 
 and without an `else`, `B` is `()`. The variables `p` binds are visible in `A`
 only. `if var` is the same, except that the bound variables can be assigned
-inside `A`. Like a `match` arm, a `let` can list alternatives, `p | q`, and
-every alternative must bind the same variables.
+inside `A`. Like any pattern, `p` can be
+[alternatives](patterns.md#alternatives), `p | q`, and every alternative must
+bind the same variables.
 
 <!-- run -->
 ```kotlin
@@ -320,7 +321,7 @@ fun main() {
 
 ```ebnf
 match-expr ::= "match" expression "{" match-arm (separator match-arm)* "}"
-match-arm  ::= pattern ("|" pattern)* "->" expression
+match-arm  ::= pattern "->" expression
 ```
 
 `match` evaluates its subject, then tries each arm's [patterns](patterns.md)

@@ -283,6 +283,20 @@ fun successorsOf(graph : Map String (Set.Set String), name : String)
     None -> Set.new()
 }
 
+-- Returns `roots` and every name they reach in `graph`.
+fun reachable(graph : Map String (Set.Set String), roots : Vec String)
+        -> Set.Set String {
+    let seen = Set.new()
+    let work = []
+    for name in roots { Vec.push(work, name) }
+    for var k = 0; k < len(work); k = k + 1 {
+        if Set.contains(seen, work[k]) { continue }
+        Set.add(seen, work[k])
+        for next in Set.elements(successorsOf(graph, work[k])) { Vec.push(work, next) }
+    }
+    seen
+}
+
 -- -- the traversal --------------------------------------------------------------------
 
 -- What is being inlined around the term being reduced: the calls `inline`
@@ -300,10 +314,14 @@ type Inlining = Inlining {
     -- whatever is being inlined around it, and `expr` marks it so; one reduced
     -- while it moved may reduce further once those are lifted.
     var declined : Int,
+    -- The binding whose code the term is: the one being reduced, or the callee
+    -- `bodyOf` is reducing. Inlined code becomes part of it.
+    var within : String,
 }
 
 -- Returns the context of a term with nothing inlined around it.
-fun outermost() -> Inlining = Inlining { active = [], speculating = False, declined = 0 }
+fun outermost() -> Inlining =
+    Inlining { active = [], speculating = False, declined = 0, within = "" }
 
 type Reducer = Reducer {
     breakers : Set.Set String,
@@ -330,6 +348,9 @@ type Reducer = Reducer {
     -- Which call of `reduceProgram` this is. The second can inline what the
     -- first could not, so it must not trust the first's marks.
     run : Int,
+    -- The bindings whose inlined code takes the span of the call it replaces
+    -- (`placed`).
+    callSites : Set.Set String,
     -- A binding's body, reduced, computed once. Without it a chain `f` calls
     -- `g` calls `h` re-reduces `h` once per path that reaches it, which is
     -- exponential in the depth of the call graph.
@@ -402,7 +423,8 @@ type Done = Done {
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
-               walked : Array Walked, run : Int) -> Reducer {
+               walked : Array Walked, run : Int,
+               callSites : Set.Set String) -> Reducer {
     let all = Vec.append(program.dicts, program.binds)
     let bindings = Map.new()
     for b in all {
@@ -431,7 +453,8 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         dicts = Methods.dictionaries(program.dicts),
         inlining = outermost(), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
-        run = run, reduced = Map.new(), constants = Map.new(),
+        run = run, callSites = callSites,
+        reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written, counter = 0,
         scope = "", usedNames = used,
         homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
@@ -450,7 +473,8 @@ fun forComponent(base : Reducer, c : Int, scope : String, finished : fun(Int) ->
                  cache : Cache) -> Reducer = Reducer {
     breakers = base.breakers, decls = base.decls, bindings = base.bindings,
     dicts = base.dicts, inlining = outermost(), sizes = Map.new(), moves = Map.new(),
-    ends = Map.new(), cache = cache, run = base.run, reduced = Map.new(),
+    ends = Map.new(), cache = cache, run = base.run,
+    callSites = base.callSites, reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     counter = 0, scope = scope, usedNames = base.usedNames,
     homes = base.homes, component = c, finished = finished,
@@ -574,12 +598,18 @@ var runs = 0
 -- components, and so the same whoever asked first; and the names it invents
 -- are scoped to it (`fresh`). One component is reduced by one worker, in
 -- order, because within a cycle what is known depends on that order.
-fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
+fun reduceProgram(program : CProgram, decls : DeclTable,
+                  keepsCallSites : fun(String) -> Bool) -> CProgram {
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
     runs = runs + 1
-    let base = newReducer(program, decls, graph, walked, runs)
+    -- The giblet check follows a call out of a giblet and names the line in
+    -- each function along the way, so a binding reachable from one where
+    -- positions are read needs its call sites as much as that one does.
+    let wanted = Vec.filter(binds, \keepsCallSites(_.module_))
+    let callSites = reachable(graph, Vec.map(wanted, _.name))
+    let base = newReducer(program, decls, graph, walked, runs, callSites)
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
@@ -628,6 +658,7 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         for name in components[c] {
             match Map.get(first, name) {
                 Some(index) -> {
+                    r.inlining.within = name
                     let value = expr(r, binds[index].value)
                     Vec.push(values, (index, value))
                     memoize(r, name, value)
@@ -661,7 +692,10 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
     -- in no component, and are reduced last, with every component finished.
     let rest = forComponent(base, len(components), ".rest", fun(c) = made[c], newCache())
     for var i = 0; i < len(binds); i = i + 1 {
-        if !Map.contains(done, i) { Map.put(done, i, expr(rest, binds[i].value)) }
+        if !Map.contains(done, i) {
+            rest.inlining.within = binds[i].name
+            Map.put(done, i, expr(rest, binds[i].value))
+        }
     }
     let split = len(program.dicts)
     let dicts = Vec.new(split)
@@ -1017,7 +1051,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- the primitive costs. Held to the size limit, a bulk primitive's name
     -- would stay a call at every site and be specialized for every element type.
     if forwardsPrim(body) {
-        return Some(applyParams(r, params, args, rebaseSpans(body, e.span), e.ty))
+        return Some(applyParams(r, params, args, placed(r, body, e.span), e.ty))
     }
     let size = sizeOf(r, name, key, body)
     if size > speculativeInlineLimit { return None }
@@ -1044,7 +1078,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- A copied callee body becomes part of this call site. Keep spans on
     -- caller-supplied arguments, but make every node copied from the callee
     -- blame the invocation if a later Core check rejects the residual.
-    let made = applyParams(r, params, args, rebaseSpans(body, e.span), e.ty)
+    let made = applyParams(r, params, args, placed(r, body, e.span), e.ty)
     if size <= limit { return Some(made) }
     -- Restored to what it was, not to `False`. Speculation is meant not to
     -- nest -- the flag is the whole mechanism for that -- and clearing it on
@@ -1141,16 +1175,18 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
                 _ -> oops("a callee whose value is not a lambda")
             }
             let (counter, scope) = (r.counter, r.scope)
-            let speculating = r.inlining.speculating
+            let (speculating, within) = (r.inlining.speculating, r.inlining.within)
             r.counter = 0
             r.scope = ".k" + Int.toString(keyHash(key))
             r.inlining.speculating = False
+            r.inlining.within = name
             Vec.push(r.inlining.active, name)
             let made = expr(r, inner)
             discard(Vec.pop(r.inlining.active))
             r.counter = counter
             r.scope = scope
             r.inlining.speculating = speculating
+            r.inlining.within = within
             Map.put(if owned(r, name) { r.reduced } else { r.cache.reduced }, key, made)
             made
         }
@@ -2189,6 +2225,16 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
         },
     }))
 
+-- `body` where it lands at a call. Positions of inlined code are read in two
+-- places: the giblet check, which names the line that allocates in each
+-- function from a giblet on, and allocation counting by site. So code inlined
+-- into a binding either one reads takes the call's span, as a copy
+-- (`rebaseSpans`); elsewhere it keeps the callee's own spans and is shared
+-- rather than copied, and only an internal error would show the difference.
+fun placed(r : Reducer, body : Core, span : Option Span) -> Core =
+    if Set.contains(r.callSites, r.inlining.within) { rebaseSpans(body, span) }
+    else { body }
+
 -- Give a copied Core subtree one diagnostic origin.
 --
 -- This runs before value arguments are substituted, so those argument nodes
@@ -2210,16 +2256,26 @@ fun rebaseSpans(e : Core, span : Option Span) -> Core {
     copy
 }
 
-fun substituteNames(e : Core, mapping : Map String Core) -> Core = match e.kind {
-    CVar(name, _) -> match Map.get(mapping, name) {
-        Some(found) -> found
-        None -> e
+-- Returns `e` with each name in `mapping` replaced by its term. A subterm
+-- that mentions none of them is returned as it is rather than copied, so it
+-- keeps its mark from `expr` and is not reduced again.
+fun substituteNames(e : Core, mapping : Map String Core) -> Core {
+    var replaced = 0
+    fun into(x : Core) -> Core {
+        if let CVar(name, _) = x.kind {
+            if let Some(found) = Map.get(mapping, name) {
+                replaced = replaced + 1
+                return found
+            }
+            return x
+        }
+        let before = replaced
+        let copy = mkCore(x.ty, x.span, mapKind(x.kind, Mapper {
+            expr = into, type_ = \_, bind = \withValue(_, into(_.value)),
+        }))
+        if replaced == before { x } else { copy }
     }
-    _ -> mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
-        expr = fun(x) = substituteNames(x, mapping),
-        type_ = fun(t) = t,
-        bind = fun(b) = withValue(b, substituteNames(b.value, mapping)),
-    }))
+    into(e)
 }
 
 -- -- small questions about terms ------------------------------------------------------

@@ -12,11 +12,12 @@ export (Witness(..), check, checkPattern, render)
 import Turkey.Ast (..)
 import Turkey.Ast as Ast
 import Turkey.Decls as Decls
+import Turkey.Diag as Diag
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
 import Turkey.Types as Ty
 import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple)
 
--- The four shapes the algorithm understands. Not the surface patterns: a record
+-- The shapes the algorithm understands. Not the surface patterns: a record
 -- pattern is reordered into declaration order and filled out with wildcards, so
 -- that every row for a constructor has the same width.
 type Witness
@@ -24,11 +25,16 @@ type Witness
     | WCon(String, Array Witness)
     | WTuple(Array Witness)
     | WLit(Ast.Lit)
+    -- Alternatives. Only ever in a row of the matrix, never in a witness
+    -- `witness` returns: `expandOrs` splits a row on one before its first
+    -- column is looked at.
+    | WOr(Array Witness)
 
 fun normalize(p : Pat, decls : DeclTable) -> Witness = match p.kind {
     PVar(_) -> WWild
     PWild -> WWild
     PAnnot(inner, _) -> normalize(inner, decls)
+    POr(alts) -> WOr(Array.map(alts, normalize(_, decls)))
     PLit(l) -> WLit(l)
     PTuple(elems) -> WTuple(Array.map(elems, normalize(_, decls)))
     PCon(name, args) -> WCon(name, Array.map(args, normalize(_, decls)))
@@ -65,6 +71,7 @@ fun keyOf(w : Witness) -> Key = match w {
     WCon(name, _) -> KCon(name)
     WTuple(elems) -> KTuple(len(elems))
     WLit(l) -> KLit(Ast.litKind(l), litText(l))
+    WOr(_) -> oops("keyOf: alternatives that were not expanded")
 }
 
 fun sameKey(a : Key, b : Key) -> Bool = match (a, b) {
@@ -169,6 +176,7 @@ fun witness(decls : DeclTable, matrix : Vec (Array Witness),
     if len(types) == 0 {
         return if len(matrix) > 0 { None } else { Some([]) }
     }
+    let matrix = expandOrs(matrix)
     let headType = types[0]
     let restTypes = Array.slice(types, 1, len(types))
     let used = Vec.new(4)
@@ -239,6 +247,23 @@ fun witness(decls : DeclTable, matrix : Vec (Array Witness),
 
 fun wilds(n : Int) -> Array Witness = Array.filled(n, WWild)
 
+-- `matrix` with each row whose first pattern is alternatives replaced by one
+-- row per alternative, in order: a row `(p | q) rest` covers what `p rest` and
+-- `q rest` cover together. Only the first column is split, so alternatives
+-- deeper in a row are split when specialization brings them to the front,
+-- and only along the paths that reach them.
+fun expandOrs(matrix : Vec (Array Witness)) -> Vec (Array Witness) {
+    let out = Vec.new(len(matrix))
+    for row in matrix { pushExpanded(out, row[0], Array.slice(row, 1, len(row))) }
+    out
+}
+
+fun pushExpanded(out : Vec (Array Witness), head : Witness, rest : Array Witness) -> Unit =
+    match head {
+        WOr(alts) -> for alt in alts { pushExpanded(out, alt, rest) }
+        _ -> Vec.push(out, Array.append([head], rest))
+    }
+
 fun specialize(decls : DeclTable, matrix : Vec (Array Witness), key : Key,
                headType : Ty.Type) -> (Vec (Array Witness), Array Ty.Type) {
     let argTypes = subTypes(decls, key, headType)
@@ -297,6 +322,7 @@ fun render(w : Witness) -> String = match w {
     -- literal spelling regardless, so a witness always reads as something the
     -- author could have written.
     WLit(l) -> litText(l)
+    WOr(alts) -> String.join(Array.map(alts, render), " | ")
     WTuple(elems) -> "(" + String.join(Array.map(elems, render), ", ") + ")"
     -- A witness is shown the way the author would write it, so the constructor
     -- loses the module qualification resolution gave it.
@@ -308,3 +334,5 @@ fun render(w : Witness) -> String = match w {
         else { short + "(" + String.join(Array.map(args, render), ", ") + ")" }
     }
 }
+
+fun oops(message : String) -> a = Diag.fail(Diag.whole("internal error", message), "")

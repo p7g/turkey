@@ -269,10 +269,6 @@ makes `pow(_, 2)` a function, rather than passing a function to `pow`:
 
 <!-- run -->
 ```kotlin
-infix Sequence (|>) = pipe
-
-fun pipe(x, f) = f(x)
-
 fun pow(x, n) {
     var result = 1
     for var i = 0; i < n; i = i + 1 { result = result * x }

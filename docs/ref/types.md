@@ -866,7 +866,7 @@ fun unwrap(s) = match s {
 ```
 
 An existential pattern may not appear in a `let`, a `var`, a `for` loop's
-pattern, or a `match` arm that has `|` alternatives.
+pattern, or among `|` alternatives.
 
 A record constructor can be existential too. Its fields can hold functions
 over the hidden type, so a value can package state together with the

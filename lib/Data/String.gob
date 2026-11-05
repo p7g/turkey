@@ -360,20 +360,18 @@ fun repeat(s : String, times : Int) -> String {
 -- UTF-8 is self-synchronizing, so a well-formed needle only ever matches at a
 -- character boundary. That is why searching bytes for bytes is safe here.
 
--- Both ask the byte search, rather than slicing off a prefix of the right
--- length and comparing. Slicing would be wrong: `startsWith("é", "a")` would
--- cut the two-byte `é` in half, and `sliceBytes` panics on a non-boundary
--- offset rather than inventing a replacement character. The
--- search cannot make that mistake, because a well-formed needle only ever
--- matches at a boundary.
+-- Both compare the bytes where they stand, rather than slicing off a prefix
+-- of the right length and comparing. Slicing would be wrong:
+-- `startsWith("é", "a")` would cut the two-byte `é` in half, and `sliceBytes`
+-- panics on a non-boundary offset rather than inventing a replacement
+-- character. Comparing in place cannot make that mistake, because a
+-- well-formed needle only ever matches at a boundary.
 fun startsWith(s : String, prefix : String) -> Bool =
-    byteFind(s, prefix, 0) == 0
+    byteLength(s) >= byteLength(prefix) && matchesAt(s, prefix, 0)
 
--- The length test is not redundant: a search that finds nothing answers -1,
--- which is also the length difference when `s` is one byte shorter.
 fun endsWith(s : String, suffix : String) -> Bool =
     byteLength(s) >= byteLength(suffix)
-    && byteRfind(s, suffix) == byteLength(s) - byteLength(suffix)
+    && matchesAt(s, suffix, byteLength(s) - byteLength(suffix))
 
 fun contains(s : String, needle : String) -> Bool =
     byteFind(s, needle, 0) >= 0
@@ -544,27 +542,12 @@ fun trim(s : String) -> String = trimEnd(trimStart(s))
 -- it sorts `Z` before `a` and has no opinion about locale.
 
 instance Eq String {
-    fun eq(x, y) {
-        let n = byteLength(x)
-        if n != byteLength(y) { return False }
-        for var i = 0; i < n; i = i + 1 {
-            if byteAt(x, i) != byteAt(y, i) { return False }
-        }
-        True
-    }
+    fun eq(x, y) = byteLength(x) == byteLength(y) && matchesAt(x, y, 0)
 }
 
+-- By bytes, which for well-formed UTF-8 is the order of the code points.
 instance Ord String {
-    fun lt(x, y) {
-        let n = byteLength(x)
-        let m = byteLength(y)
-        for var i = 0; i < n && i < m; i = i + 1 {
-            let a = byteAt(x, i)
-            let b = byteAt(y, i)
-            if a != b { return a < b }
-        }
-        n < m
-    }
+    fun lt(x, y) = Scan.compare(bytesOf(x), bytesOf(y)) < 0
 }
 
 instance Add String { fun add(x, y) = concat(x, y) }
@@ -676,35 +659,29 @@ fun sliceBytes(s : String, start : Int, stop : Int) -> String {
 fun span(start : Int, stop : Int) -> String =
     "of bytes " + Int.toString(start) + ".." + Int.toString(stop)
 
--- Whether `needle` occurs in `haystack` at byte offset `at`.
-fun matchesAt(haystack : String, needle : String, at : Int) -> Bool {
-    let m = byteLength(needle)
-    for var k = 0; k < m; k = k + 1 {
-        if byteAt(haystack, at + k) != byteAt(needle, k) { return False }
-    }
-    True
-}
+-- Whether `needle` occurs in `haystack` at byte offset `at`, which leaves
+-- room for it.
+fun matchesAt(haystack : String, needle : String, at : Int) -> Bool =
+    Scan.equalAt(bytesOf(haystack), at, bytesOf(needle), byteLength(needle))
 
 -- The first offset at or after `start` where `needle` occurs, or -1. An empty
 -- needle occurs everywhere, the end included.
 fun byteFind(haystack : String, needle : String, start : Int) -> Int {
-    let n = byteLength(haystack)
-    let m = byteLength(needle)
     let from = if start < 0 { 0 } else { start }
-    if m == 0 { return if from > n { -1 } else { from } }
-    for var at = from; at <= n - m; at = at + 1 {
-        if matchesAt(haystack, needle, at) { return at }
-    }
-    -1
+    if from > byteLength(haystack) { return -1 }
+    Scan.search(bytesOf(haystack), bytesOf(needle), from)
 }
 
--- The last offset where `needle` occurs, or -1.
+-- The last offset where `needle` occurs, or -1. The C library has no search
+-- from the end, so this tests each offset from the last, comparing one byte
+-- before the whole needle.
 fun byteRfind(haystack : String, needle : String) -> Int {
     let n = byteLength(haystack)
     let m = byteLength(needle)
     if m == 0 { return n }
+    let first = byteAt(needle, 0)
     for var at = n - m; at >= 0; at = at - 1 {
-        if matchesAt(haystack, needle, at) { return at }
+        if byteAt(haystack, at) == first && matchesAt(haystack, needle, at) { return at }
     }
     -1
 }

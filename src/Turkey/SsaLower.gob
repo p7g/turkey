@@ -30,7 +30,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..), Alt(..),
-                    Mapper(..))
+                    Mapper(..), noId)
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), Compact(..))
 import Turkey.Diag as Diag
@@ -140,10 +140,13 @@ type Lower = Lower {
     decls   : DeclTable,
     func    : Ssa.Func Low,
     b       : Builder,
-    -- Local term name -> the value holding it.
-    var env     : Map String Value,
-    -- Join name -> the block it became, and the parameters it takes.
-    var joins   : Map String BlockId,
+    -- Each local in scope, by binder id -> the value holding it.
+    var env     : Map Int Value,
+    -- Each existential's evidence in scope, by spelling -> the value holding
+    -- it. See `Local`.
+    var evidence : Map String Value,
+    -- Each join in scope, by binder id -> the block it became.
+    var joins   : Map Int BlockId,
     -- Top-level names, which are globals rather than locals.
     globals : Set.Set String,
     -- Mutable giblet globals are plain storage, never reference cells.
@@ -170,8 +173,9 @@ type Lower = Lower {
     -- refusal of a program past a limit rather than an unhandled form.
     var stopped : Option String,
     var overLimit : Bool,
-    var flatRefs : Set.Set String,
-    var flatRecords : Set.Set String,
+    -- The ids of the `let`s `LocalEscape` found do not escape.
+    var flatRefs : Set.Set Int,
+    var flatRecords : Set.Set Int,
     localRefs : Map Int (Int, Rep),
     -- A local record's or dictionary's slots, by position.
     localObjects : Map Int (Array (Int, Rep)),
@@ -434,8 +438,8 @@ fun joinParams(l : Lower, target : BlockId, params : Array CParam, body : Core,
     let boxed = Array.map(params, fun(p) {
         if !isMulti(heldOf(l, p.ty)) { return False }
         let a = Uses { decls = l.decls, layouts = l.layouts, sigs = l.sigs,
-                       names = Set.new(), boxed = False, spread = Map.new() }
-        Set.add(a.names, p.name)
+                       ids = Set.new(), boxed = False, spread = Map.new() }
+        Set.add(a.ids, idOf(p.name, p.id))
         usesIn(a, body, returned)
         a.boxed
     })
@@ -792,14 +796,14 @@ fun boxParameters(program : CProgram, decls : DeclTable,
             }
             let (params, body) = shape
             let a = Uses { decls = decls, layouts = bind.layouts, sigs = sigs,
-                           names = Set.new(), boxed = False,
+                           ids = Set.new(), boxed = False,
                            spread = Map.getOr(spread, bind.name, Map.new()) }
             Map.put(spread, bind.name, a.spread)
             for var i = 0; i < len(params) && i < len(sig.params); i = i + 1 {
                 if len(sig.params[i]) > 1 {
-                    a.names = Set.new()
+                    a.ids = Set.new()
                     a.boxed = False
-                    Set.add(a.names, params[i].name)
+                    Set.add(a.ids, idOf(params[i].name, params[i].id))
                     usesIn(a, body, len(sig.results) == 1)
                     if a.boxed {
                         sig.params[i] = [Ssa.traced(Ptr)]
@@ -811,13 +815,17 @@ fun boxParameters(program : CProgram, decls : DeclTable,
     }
 }
 
--- What `usesIn` is looking for: a use of any of `names`, the parameter and
+-- What `usesIn` is looking for: a use of any of `ids`, the parameter and
 -- what a `let` renames it to, where a box of it is wanted.
+--
+-- No binder is bound inside the scope of another with its id, so a use of
+-- one of `ids` is a use of the parameter wherever it is, and an id added for
+-- a `let` need not be taken out after its body.
 type Uses = Uses {
     decls   : DeclTable,
     layouts : Map String Ssa.Layout,
     sigs    : Map String Signature,
-    var names : Set.Set String,
+    var ids : Set.Set Int,
     var boxed : Bool,
     -- `spreads` of each type asked about, by its `Ty.typeKey`.
     spread  : Map String Bool,
@@ -830,21 +838,16 @@ type Uses = Uses {
 fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
     if a.boxed { return }
     match e.kind {
-        CVar(n, _) -> if boxed && Set.contains(a.names, n) { a.boxed = True }
+        CVar(_, id) -> if boxed && Set.contains(a.ids, id) { a.boxed = True }
         CTyApp(inner, _) -> usesIn(a, inner, boxed)
         CTyLam(_, inner) -> usesIn(a, inner, boxed)
-        CLet(n, _, _, bound, body, _) -> {
+        CLet(_, id, _, bound, body, _) -> {
             usesIn(a, bound, False)
-            let renames = match bound.kind {
-                CVar(m, _) -> Set.contains(a.names, m)
-                _ -> False
+            match bound.kind {
+                CVar(_, m) -> if Set.contains(a.ids, m) { Set.add(a.ids, id) }
+                _ -> {}
             }
-            -- Names are not unique, so a `let` of another value hides the
-            -- parameter's name in its body.
-            let had = Set.contains(a.names, n)
-            if renames { Set.add(a.names, n) } else { discard(Set.remove(a.names, n)) }
             usesIn(a, body, boxed)
-            if had { Set.add(a.names, n) } else { discard(Set.remove(a.names, n)) }
         }
         CIf(c, then_, otherwise) -> {
             usesIn(a, c, False)
@@ -856,10 +859,10 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
         }
         CMatch(scrutinee, alts) -> {
             usesIn(a, scrutinee, False)
-            for alt in alts { hiding(a, Core.altVars(alt.alt), fun() = usesIn(a, alt.body, boxed)) }
+            for alt in alts { usesIn(a, alt.body, boxed) }
         }
-        CJoin(_, _, params, body, rest, _) -> {
-            hiding(a, Array.map(params, _.name), fun() = usesIn(a, body, boxed))
+        CJoin(_, _, _, body, rest, _) -> {
+            usesIn(a, body, boxed)
             usesIn(a, rest, boxed)
         }
         CJump(_, _, args) -> for x in args { usesIn(a, x, False) }
@@ -891,7 +894,7 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
             }
         }
         -- A lambda's result is boxed, and what it captures is held in slots.
-        CLam(params, body, _) -> hiding(a, Array.map(params, _.name), fun() = usesIn(a, body, True))
+        CLam(_, body, _) -> usesIn(a, body, True)
         _ -> discard(Core.mapKind(e.kind, Mapper {
             expr = fun(x) = {
                 usesIn(a, x, True)
@@ -904,19 +907,6 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
             },
         }))
     }
-}
-
--- `walk()`, with `names` not standing for the parameter while it runs.
-fun hiding[Iterator c, Item c ~ String](a : Uses, names : c, walk : fun() -> Unit) -> Unit {
-    let hidden = []
-    for n in names {
-        if Set.contains(a.names, n) {
-            discard(Set.remove(a.names, n))
-            Vec.push(hidden, n)
-        }
-    }
-    walk()
-    for n in hidden { Set.add(a.names, n) }
 }
 
 -- Whether a value of `ty` is held in several slots, so a component of it is
@@ -1100,7 +1090,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         let bound = if !isMulti(layout) { vs[0] }
             else if len(vs) == 1 { fromStored(l, layout, vs[0]) }
             else { fromSlots(l, layout, vs) }
-        Map.put(l.env, params[i].name, bound)
+        Map.put(l.env, idOf(params[i].name, params[i].id), bound)
     }
     prepareLocals(l, body)
     lower(l, body, ToReturn)
@@ -1126,7 +1116,7 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              sigs : Map String Signature, layouts : Map String Ssa.Layout,
              lifted : Vec (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0), shared.files),
-    env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
+    env = Map.new(), evidence = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
     sigs = sigs, layouts = layouts, lifted = lifted,
     shared = shared, stopped = None, overLimit = False, flatRefs = Set.new(), flatRecords = Set.new(),
@@ -1145,41 +1135,95 @@ fun spine(value : Core) -> Option (Array CParam, Core) = match value.kind {
 
 -- -- scope ------------------------------------------------------------------------
 
--- What `l.env` says about these names now, so it can be put back.
+-- A local binder as the scope files it.
 --
--- Core names are not unique. Monomorphization and inlining copy bodies, so two
--- unrelated bindings called `i` in one function are ordinary, and an
--- environment that only ever grows makes the second one read the first one's
--- value -- a capture the verifier catches as a dominance violation rather than
--- as a wrong answer, which is the argument for running it after every pass.
---
--- Saving the affected names rather than copying the map: a scope binds a
--- handful of names and the map holds every local in the function.
-fun saving[Iterator c, Item c ~ String](l : Lower, names : c) -> Vec (String, Option Value) {
+-- Every local binder after `Turkey.Opt` has an id, except an existential's
+-- evidence, which an arm has nowhere to keep one for. `Turkey.Opt` gives each
+-- evidence binder a spelling of its own, so evidence is filed by that, apart
+-- from the binders with ids. A reference with no id is to evidence or to a
+-- top-level binding, which is filed by its `Module#name` among the globals.
+type Local = LocalId(Int) | Evidence(String)
+
+-- Returns `id`. Raises an internal error if it is `noId`: a local binder
+-- other than evidence with no id would have to be found by its spelling, and
+-- two binders of one function may share a spelling.
+fun idOf(name : String, id : Int) -> Int {
+    if id == noId {
+        oops("the local '" + name + "' reached the backend with no binder id")
+    }
+    id
+}
+
+-- The locals an arm binds over its body.
+fun armLocals(alt : Alt) -> Vec Local {
     let out = []
-    for name in names { Vec.push(out, (name, Map.get(l.env, name))) }
+    let field = fun(binder) = if let Some((name, id)) = binder {
+        Vec.push(out, LocalId(idOf(name, id)))
+    }
+    match alt {
+        ACon(_, fields, opening) -> {
+            if let Some(o) = opening {
+                for d in o.evidence { Vec.push(out, Evidence(d)) }
+            }
+            for f in fields { field(f) }
+        }
+        ATuple(fields) -> for f in fields { field(f) }
+        ALit(_) -> {}
+        AAny(binder) -> field(binder)
+    }
     out
 }
 
--- The same, for a join label. One name rather than an array, because a
--- `CJoin` binds exactly one.
-fun savingJoin(l : Lower, name : String) -> Option BlockId =
-    Map.get(l.joins, name)
+-- The value the local a reference names holds, if it is in scope.
+fun lookupLocal(l : Lower, name : String, id : Int) -> Option Value =
+    if id == noId { Map.get(l.evidence, name) } else { Map.get(l.env, id) }
 
-fun restore1Join(l : Lower, name : String, was : Option BlockId) -> Unit =
+fun put(l : Lower, local : Local, v : Value) -> Unit = match local {
+    LocalId(id) -> Map.put(l.env, id, v)
+    Evidence(name) -> Map.put(l.evidence, name, v)
+}
+
+fun lookup(l : Lower, local : Local) -> Option Value = match local {
+    LocalId(id) -> Map.get(l.env, id)
+    Evidence(name) -> Map.get(l.evidence, name)
+}
+
+-- What the scope holds for these locals now, so it can be put back.
+--
+-- A binding `Turkey.Layout` copied binds each id once per copy, so two
+-- binders of one id may be lowered in one function, each in a scope of its
+-- own. An environment that only ever grew would carry the first one's value
+-- into the second's scope, where nothing defines it -- a capture the verifier
+-- catches as a dominance violation rather than as a wrong answer.
+--
+-- Saving the affected locals rather than copying the map: a scope binds a
+-- handful of them and the map holds every local in the function.
+fun saving[Iterator c, Item c ~ Local](l : Lower, locals : c) -> Vec (Local, Option Value) {
+    let out = []
+    for local in locals { Vec.push(out, (local, lookup(l, local))) }
+    out
+}
+
+-- The same, for a join label. One id rather than an array, because a
+-- `CJoin` binds exactly one.
+fun savingJoin(l : Lower, id : Int) -> Option BlockId =
+    Map.get(l.joins, id)
+
+fun restore1Join(l : Lower, id : Int, was : Option BlockId) -> Unit =
     match was {
-        Some(b) -> Map.put(l.joins, name, b)
+        Some(b) -> Map.put(l.joins, id, b)
         None -> {
-            let _ = Map.delete(l.joins, name)
+            let _ = Map.delete(l.joins, id)
         }
     }
 
-fun restore(l : Lower, saved : Vec (String, Option Value)) -> Unit {
-    for (name, was) in saved {
+fun restore(l : Lower, saved : Vec (Local, Option Value)) -> Unit {
+    for (local, was) in saved {
         match was {
-            Some(v) -> Map.put(l.env, name, v)
-            None -> {
-                let _ = Map.delete(l.env, name)
+            Some(v) -> put(l, local, v)
+            None -> match local {
+                LocalId(id) -> discard(Map.delete(l.env, id))
+                Evidence(name) -> discard(Map.delete(l.evidence, name))
             }
         }
     }
@@ -1214,30 +1258,29 @@ fun halt(l : Lower, what : String, overLimit : Bool) -> Unit {
     }
 }
 
--- Bindings retain their scoped env identity. A marker is never emitted as a
--- runtime value; shadowing therefore cannot mistake an ordinary pointer for a
--- flattened binding with the same source name.
+-- A marker is never emitted as a runtime value, and a flattened binding is
+-- found by its id, so no binding can take an ordinary pointer for one.
 fun prepareLocals(l : Lower, body : Core) -> Unit {
     let (refs, records) = LocalEscape.analyze(l.decls, body)
     l.flatRefs = refs
     l.flatRecords = records
 }
 
-fun localBinding(l : Lower, name : String, bound : Core) -> Value {
+fun localBinding(l : Lower, id : Int, bound : Core) -> Value {
     match bound.kind {
-        CRef(inner) -> if Set.contains(l.flatRefs, name) {
+        CRef(inner) -> if Set.contains(l.flatRefs, id) {
             let v = value(l, inner)
             let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
             Map.put(l.localRefs, Ssa.valueId(marker), localSlot(l, v))
             return marker
         }
-        CDict(_, items) -> if Set.contains(l.flatRecords, name) {
+        CDict(_, items) -> if Set.contains(l.flatRecords, id) {
             let slots = Array.map(items, fun(inner) = localSlot(l, value(l, inner)))
             let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
             Map.put(l.localObjects, Ssa.valueId(marker), slots)
             return marker
         }
-        CApp(fn, args) -> if Set.contains(l.flatRecords, name) && builds(l, fn)
+        CApp(fn, args) -> if Set.contains(l.flatRecords, id) && builds(l, fn)
                 && Option.isNone(flatHere(l, bound.ty)) {
             let slots = Array.map(args, fun(inner) = localSlot(l, value(l, inner)))
             let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
@@ -1250,8 +1293,7 @@ fun localBinding(l : Lower, name : String, bound : Core) -> Value {
 }
 
 -- Whether `fn` is the constructor of a record, so that applying it is the
--- build `LocalEscape` may have found does not escape. The answer there is by
--- name, so another binding of the same name may be anything else.
+-- build `LocalEscape` may have found does not escape.
 fun builds(l : Lower, fn : Core) -> Bool = match fn.kind {
     CCon(con) -> Decls.isRecordCon(l.decls, con)
     _ -> False
@@ -1278,7 +1320,7 @@ fun globalRef(l : Lower, e : Core) -> Option (String, Rep) = match e.kind {
 }
 
 fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
-    CVar(name, _) -> match Map.get(l.env, name) {
+    CVar(name, id) -> match lookupLocal(l, name, id) {
         Some(v) -> Map.get(l.localRefs, Ssa.valueId(v))
         None -> None
     }
@@ -1287,7 +1329,7 @@ fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
 
 fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
     match e.kind {
-        CVar(name, _) -> match Map.get(l.env, name) {
+        CVar(name, id) -> match lookupLocal(l, name, id) {
             Some(v) -> match Map.get(l.localObjects, Ssa.valueId(v)) {
                 Some(slots) -> if index < len(slots) { Some(slots[index]) } else { None }
                 None -> None
@@ -1330,27 +1372,28 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
                 None -> finish(l, L.emit(l.b, ConstUnit, Ssa.untraced(Unit)), dest)
             }
         }
-        CLet(name, _, ty, bound, body, _) -> {
-            let v = localBinding(l, name, bound)
-            let was = saving(l, [name])
-            Map.put(l.env, name, v)
+        CLet(name, id, ty, bound, body, _) -> {
+            let local = idOf(name, id)
+            let v = localBinding(l, local, bound)
+            let was = saving(l, [LocalId(local)])
+            Map.put(l.env, local, v)
             lower(l, body, dest)
             restore(l, was)
         }
         -- A join is a block, and a jump to it is a jump. This is the case the
         -- whole IR is shaped for.
-        CJoin(name, _, params, body, rest, recursive) -> {
+        CJoin(name, id, params, body, rest, recursive) -> {
             let target = L.block(l.b)
             let entered = joinParams(l, target, params, body, dest)
-            -- Join names are no more unique than term names are, and for the
-            -- same reason: inlining copies bodies, so a function inlined into
-            -- itself has two joins called `loop`. An unscoped map sends the
-            -- outer copy's jump to the inner copy's block, which is not a
-            -- wrong value but a wrong *edge* -- and the verifier catches it as
-            -- a definition that no longer dominates its use, exactly the way
-            -- it caught the same mistake before.
-            let hidden = savingJoin(l, name)
-            Map.put(l.joins, name, target)
+            -- Scoped as the term binders are, and for the same reason: a
+            -- join in a binding `Turkey.Layout` copied is bound once per
+            -- copy. An unscoped map sends one copy's jump to the other's
+            -- block, which is not a wrong value but a wrong *edge*, and the
+            -- verifier catches it as a definition that no longer dominates
+            -- its use.
+            let label = idOf(name, id)
+            let hidden = savingJoin(l, label)
+            Map.put(l.joins, label, target)
             -- `rest` first: it is what jumps, and the parameters have to exist
             -- before it can.
             lower(l, rest, dest)
@@ -1358,18 +1401,19 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
             -- The join is in scope in its own body only if it is recursive --
             -- a loop compiled as a label. A non-recursive one is the
             -- case-of-case duplication and its body cannot reach it.
-            if !recursive { restore1Join(l, name, hidden) }
-            let was = saving(l, Array.map(params, _.name))
+            if !recursive { restore1Join(l, label, hidden) }
+            let ids = Array.map(params, fun(p) = idOf(p.name, p.id))
+            let was = saving(l, Array.map(ids, LocalId))
             for var i = 0; i < len(params) && i < len(entered); i = i + 1 {
-                Map.put(l.env, params[i].name, entered[i])
+                Map.put(l.env, ids[i], entered[i])
             }
             lower(l, body, dest)
             restore(l, was)
-            if recursive { restore1Join(l, name, hidden) }
+            if recursive { restore1Join(l, label, hidden) }
         }
-        CJump(name, _, args) -> {
+        CJump(name, id, args) -> {
             let supplied = Array.map(args, fun(a) = value(l, a))
-            match Map.get(l.joins, name) {
+            match Map.get(l.joins, idOf(name, id)) {
                 Some(target) ->
                     L.terminate(l.b, Jump(target, argsFor(l, target, supplied)))
                 None -> {
@@ -1404,7 +1448,7 @@ fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Dest) 
         let success = L.block(l.b)
         let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
         L.into(l.b, test)
-        let was = saving(l, Core.altVars(alts[i].alt))
+        let was = saving(l, armLocals(alts[i].alt))
         -- An existential arm's copy is lowered under the layouts it names for
         -- the constants it opens.
         let outer = l.layouts
@@ -1643,7 +1687,7 @@ fun literalKey(lit : Lit) -> Int = match lit {
 -- then its body.
 fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Type,
           dest : Dest) -> Unit {
-    let was = saving(l, Core.altVars(alt.alt))
+    let was = saving(l, armLocals(alt.alt))
     match alt.alt {
         AAny(binder) -> bindTo(l, binder, whole)
         ACon(name, binders, _) -> match shape {
@@ -1762,7 +1806,7 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
 }
 
 fun bindTo(l : Lower, binder : Option (String, Int), v : Value) -> Unit = match binder {
-    Some((name, _)) -> Map.put(l.env, name, v)
+    Some((name, id)) -> Map.put(l.env, idOf(name, id), v)
     None -> {}
 }
 
@@ -1778,10 +1822,10 @@ fun bindFlat(l : Lower, v : Value, f : Layout.Flat, k : Int,
     let fields = f.fields[k]
     for var i = 0; i < len(binders) && i < len(fields); i = i + 1 {
         match binders[i] {
-            Some((name, _)) -> {
+            Some((name, id)) -> {
                 let at = fields[i]
                 let layout = Ssa.Layout { slots = Array.map(at, fun(j) = f.slots[j]) }
-                Map.put(l.env, name, fromSlots(l, layout, slotsAt(l, v, whole, at)))
+                Map.put(l.env, idOf(name, id), fromSlots(l, layout, slotsAt(l, v, whole, at)))
             }
             None -> {}
         }
@@ -1793,13 +1837,13 @@ fun flatTag(l : Lower, v : Value, f : Layout.Flat) -> Value =
     slotsAt(l, v, Ssa.Layout { slots = f.slots }, [0])[0]
 
 -- The fields an arm binds: each one's slot in the object, counting from
--- `first`, its name, and its type.
+-- `first`, its binder id, and its type.
 fun positions(binders : Array (Option (String, Int)), types : Array Ty.Type,
-              first : Int) -> Vec (Int, String, Ty.Type) {
+              first : Int) -> Vec (Int, Int, Ty.Type) {
     let out = []
     for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
         match binders[i] {
-            Some((name, _)) -> Vec.push(out, (first + i, name, types[i]))
+            Some((name, id)) -> Vec.push(out, (first + i, idOf(name, id), types[i]))
             None -> {}
         }
     }
@@ -1845,7 +1889,7 @@ fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o :
         L.into(l.b, next)
     }
     for var i = 0; i < len(o.evidence); i = i + 1 {
-        Map.put(l.env, o.evidence[i],
+        Map.put(l.evidence, o.evidence[i],
                 L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 1 + i)), Ssa.traced(Ptr)))
     }
     destructure(l, v, layout, positions(binders, types, 1 + carried))
@@ -1907,10 +1951,10 @@ fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
 -- Read each field an arm binds and bind it, from an object laid out as
 -- `layout`.
 fun destructure(l : Lower, object : Value, layout : Rt.Layout,
-                fields : Vec (Int, String, Ty.Type)) -> Unit {
-    for (index, name, fieldTy) in fields {
+                fields : Vec (Int, Int, Ty.Type)) -> Unit {
+    for (index, id, fieldTy) in fields {
         let held = heldOf(l, fieldTy)
-        Map.put(l.env, name, fromStored(l, held,
+        Map.put(l.env, id, fromStored(l, held,
             L.emit(l.b, ObjectGet(object, L.fieldRef(layout, index)), Layout.storedRep(held))))
     }
 }
@@ -2075,7 +2119,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     match e.kind {
         CUnit -> L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         CLit(lit) -> literal(l, lit, rep)
-        CVar(name, _) -> match Map.get(l.env, name) {
+        CVar(name, id) -> match lookupLocal(l, name, id) {
             Some(v) -> v
             -- A top-level *function* mentioned rather than called.
             -- `GlobalLoad` would load the symbol, which is a code address and
@@ -2195,10 +2239,11 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         CMatch(_, _) -> control(l, e, held)
         -- One path in and one out, so no block is needed for its value, and
         -- a value of several slots keeps the form its body gave it.
-        CLet(name, _, _, bound, body, _) -> {
-            let v = localBinding(l, name, bound)
-            let was = saving(l, [name])
-            Map.put(l.env, name, v)
+        CLet(name, id, _, bound, body, _) -> {
+            let local = idOf(name, id)
+            let v = localBinding(l, local, bound)
+            let was = saving(l, [LocalId(local)])
+            Map.put(l.env, local, v)
             let result = value(l, body)
             restore(l, was)
             result
@@ -2363,8 +2408,8 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 
 -- -- closures ----------------------------------------------------------------------
 
--- The captures a lambda needs: the names its body mentions that this body
--- holds, and what each is held at.
+-- The captures a lambda needs: the locals its body mentions that this body
+-- holds, and what each is held at, in the order the body first mentions them.
 --
 -- The *representation* and not the type. The parent writes the capture and the
 -- child reads it back, so passing a type would have them each derive a
@@ -2372,52 +2417,43 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 -- disagreement would be silent, because the graph still verifies and only the
 -- collector notices.
 --
--- `namesOf` collects every `CVar` in the body, including names bound inside it
--- and including those under nested lambdas -- which is what makes a transitive
--- capture work with no second traversal. Intersected with what this body holds
--- it over-approximates the free variables: a name bound inside the body that
--- also exists outside is captured needlessly, and the child's own
--- `saving`/`restore` shadows it, so the cost is a wasted slot. What it cannot
--- do is *miss* a free name, because a free mention is a `CVar` in the body.
+-- `Core.references` collects every `CVar` in the body, including those under
+-- nested lambdas -- which is what makes a transitive capture work with no
+-- second traversal. A binder the body binds itself is not in scope here, since
+-- no binder is bound inside the scope of another with its id, so what this
+-- body holds of them is exactly the free locals.
 --
--- Not the whole environment, which is what `turkey/backend_lower.py:1062`
--- captures. Two reasons it cannot be copied here. `turkey_object_new` refuses
--- more than 63 slots, and `l.env` in a body the size of `Turkey.Opt#expr`
--- holds far more than 63 names -- so capture-everything is not a slower
--- correct answer, it is a runtime panic on this compiler's own source. And
--- there an environment maps a name to a *slot*, which always exists; here it
--- maps a name to an SSA value, so every capture pins a live range from the
--- closure's creation to the end of the function, which the register allocator
--- would pay for.
+-- Not the whole environment. `turkey_object_new` refuses more than 63 slots,
+-- and the environment of a body the size of `Turkey.Opt#expr` holds far more
+-- than 63 locals -- so capturing everything is not a slower correct answer, it
+-- is a runtime panic on this compiler's own source. And every capture pins a
+-- live range from the closure's creation to the end of the function, which the
+-- register allocator would pay for.
 --
--- `extra` is `CLetRec`'s siblings: names that will hold closures but do not
+-- `extra` is `CLetRec`'s siblings: locals that will hold closures but do not
 -- yet, so their representation is known before their value is.
-fun capturesOf(l : Lower, body : Core,
-               extra : Set.Set String) -> Vec (String, Ssa.Layout) {
-    let mentioned = Core.namesOf(body)
+fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Local, Ssa.Layout) {
     let out = []
-    -- Sorted, so that what a lowering produces does not depend on a map's
-    -- iteration order.
-    for name in Array.sort(Set.elements(mentioned)) {
-        if Set.contains(extra, name) {
-            Vec.push(out, (name, Ssa.Layout { slots = [Ssa.traced(Ptr)] }))
+    for (name, id) in Core.references(body) {
+        if id != noId && Set.contains(extra, id) {
+            Vec.push(out, (LocalId(id), Ssa.Layout { slots = [Ssa.traced(Ptr)] }))
         } else {
-            match Map.get(l.env, name) {
+            match lookupLocal(l, name, id) {
                 -- A flattened `var` or record is a marker, never emitted, and
-                -- capturing one is a use of an undefined value. None is free
-                -- here: `LocalEscape` keeps any binding a closure mentions free
-                -- on the heap, and reads scope to decide it. So a marker found
-                -- by name belongs to an outer binding the body rebinds: inlining
-                -- makes one whenever a callee's pattern binder is spelled like
-                -- a `var` of the caller the closure sits in.
+                -- capturing one would be a use of an undefined value. None is
+                -- held here: `LocalEscape` keeps any binding a closure
+                -- mentions on the heap.
                 --
                 -- A `unit` holds nothing and `lift` makes the child its own;
                 -- the 63-slot cap makes that worth doing rather than merely
                 -- tidy.
-                Some(v) -> match multiOf(l, v) {
-                    Some(m) -> Vec.push(out, (name, multiLayout(m)))
-                    None -> if !isMarker(l, v) && Ssa.repOf(l.func, v).class_ != Unit {
-                        Vec.push(out, (name, Ssa.Layout { slots = [Ssa.repOf(l.func, v)] }))
+                Some(v) -> {
+                    let local = if id == noId { Evidence(name) } else { LocalId(id) }
+                    match multiOf(l, v) {
+                        Some(m) -> Vec.push(out, (local, multiLayout(m)))
+                        None -> if !isMarker(l, v) && Ssa.repOf(l.func, v).class_ != Unit {
+                            Vec.push(out, (local, Ssa.Layout { slots = [Ssa.repOf(l.func, v)] }))
+                        }
                     }
                 }
                 None -> {}
@@ -2435,7 +2471,7 @@ fun capturesOf(l : Lower, body : Core,
 -- array and the counter, which is what makes the symbols unique and the
 -- results collectable.
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
-         captures : Vec (String, Ssa.Layout)) -> Option String {
+         captures : Vec (Local, Ssa.Layout)) -> Option String {
     -- A capture of several slots takes a word for each (`environmentLayout`).
     let words = len(environmentReps(captures))
     if words > 63 {
@@ -2448,9 +2484,10 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
         return None
     }
     -- `%` is the compiler's own character: the lexer will not accept one in an
-    -- identifier, so no Turkey name mangles onto this. The same argument
-    -- `turkey/backend_lower.py`'s `_25_` escape makes, and the reason a
-    -- top-level name here already carries `#` and `@`.
+    -- identifier, so no Turkey name mangles onto this, and a top-level name
+    -- here already carries `#` and `@`. The symbol is the binding's name and
+    -- the lambda's place among the binding's lambdas in the order they are
+    -- lowered, so it depends on the program alone.
     let symbol = l.func.name + "%lambda" + Int.toString(l.shared.next)
     l.shared.next = l.shared.next + 1
     -- The body and every call site derive the signature from its types.
@@ -2483,12 +2520,13 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- has the environment -- and not this IR's.
     let environment = Ssa.freshValue(g, Ssa.traced(Ptr))
     Vec.push(g.params, environment)
-    -- The `unit` names `capturesOf` leaves out of the environment, made here
-    -- instead. Before the captures and the parameters, so either shadows one.
-    for name in Array.sort(Set.elements(Core.namesOf(body))) {
-        match Map.get(l.env, name) {
+    -- The `unit` locals `capturesOf` leaves out of the environment, made here
+    -- instead, in the order the body first mentions them.
+    for (name, id) in Core.references(body) {
+        match lookupLocal(l, name, id) {
             Some(v) -> if Ssa.repOf(l.func, v).class_ == Unit {
-                Map.put(child.env, name, L.emit(child.b, ConstUnit, Ssa.untraced(Unit)))
+                let local = if id == noId { Evidence(name) } else { LocalId(id) }
+                put(child, local, L.emit(child.b, ConstUnit, Ssa.untraced(Unit)))
             }
             None -> {}
         }
@@ -2502,15 +2540,15 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     let held = environmentLayout(captures)
     let firsts = environmentFirsts(captures)
     for var i = 0; i < len(captures); i = i + 1 {
-        let (name, layout) = captures[i]
+        let (local, layout) = captures[i]
         let values = Array.init(len(layout.slots), fun(k) =
             L.emit(child.b, ObjectGet(environment, L.fieldRef(held, firsts[i] + k)),
                    layout.slots[k]))
-        Map.put(child.env, name, fromSlots(child, layout, values))
+        put(child, local, fromSlots(child, layout, values))
     }
     for var i = 0; i < len(params) && i < len(taken); i = i + 1 {
         let layout = heldOf(l, params[i].ty)
-        Map.put(child.env, params[i].name,
+        Map.put(child.env, idOf(params[i].name, params[i].id),
                 fromStored(child, layout, coerce(child, taken[i], Layout.storedRep(layout))))
     }
     prepareLocals(child, body)
@@ -2534,23 +2572,23 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
 -- `later` is a sibling in a recursive group that does not exist yet: its slot
 -- starts null, which the collector skips, and is marked mutable, and `letrec`
 -- writes it with `ClosureCapture` once every shell exists.
-fun closureShell(l : Lower, symbol : String, captures : Vec (String, Ssa.Layout),
-                 later : Set.Set String) -> Value {
+fun closureShell(l : Lower, symbol : String, captures : Vec (Local, Ssa.Layout),
+                 later : Set.Set Int) -> Value {
     if len(captures) == 0 {
         return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
     var mutable = 0
     let values = []
-    for (name, layout) in captures {
-        if Set.contains(later, name) {
+    for (local, layout) in captures {
+        if isSibling(later, local) {
             mutable = mutable | 1 << len(values)
             for r in layout.slots { Vec.push(values, storageZero(l, r)) }
         } else {
-            match Map.get(l.env, name) {
+            match lookup(l, local) {
                 Some(v) -> for x in slotsOf(l, v, layout) { Vec.push(values, x) }
                 None -> {
                     for r in layout.slots { Vec.push(values, storageZero(l, r)) }
-                    let _ = stop(l, "a capture of the unbound name '" + name + "'")
+                    let _ = stop(l, "a capture of a local not in scope")
                 }
             }
         }
@@ -2565,23 +2603,29 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (String, Ssa.Layout)
 -- builds and writes and the child reads. A capture of several slots takes one
 -- field per slot: the environment is private to the two of them, so it need
 -- not hold the capture boxed, as a memory position every copy reads must.
-fun environmentLayout(captures : Vec (String, Ssa.Layout)) -> Rt.Layout =
+fun environmentLayout(captures : Vec (Local, Ssa.Layout)) -> Rt.Layout =
     Rt.layout(environmentReps(captures))
 
-fun environmentReps(captures : Vec (String, Ssa.Layout)) -> Array Rep {
+fun environmentReps(captures : Vec (Local, Ssa.Layout)) -> Array Rep {
     let out = []
     for (_, layout) in captures { for r in layout.slots { Vec.push(out, r) } }
     Vec.toArray(out)
 }
 
 -- The environment field each capture's first slot is in.
-fun environmentFirsts(captures : Vec (String, Ssa.Layout)) -> Array Int {
+fun environmentFirsts(captures : Vec (Local, Ssa.Layout)) -> Array Int {
     var at = 0
     Array.map(Vec.toArray(captures), fun(c) {
         let first = at
         at = at + len(c.1.slots)
         first
     })
+}
+
+-- Whether `local` is one of the recursive group's `siblings`.
+fun isSibling(siblings : Set.Set Int, local : Local) -> Bool = match local {
+    LocalId(id) -> Set.contains(siblings, id)
+    Evidence(_) -> False
 }
 
 -- A lambda in value position: lift it, then build the closure.
@@ -2608,7 +2652,7 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
     let siblings = Set.new()
     for bind in binds {
         match spine(bind.value) {
-            Some(_) -> Set.add(siblings, bind.name)
+            Some(_) -> Set.add(siblings, idOf(bind.name, bind.id))
             None -> {
                 -- Up front, so nothing is half emitted.
                 let _ = stop(l, "a recursive binding that is not a function")
@@ -2629,7 +2673,7 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
         }
         let captures = capturesOf(l, inner, siblings)
         match lift(l, params, inner, resultType(bind.ty), captures) {
-            Some(symbol) -> Vec.push(plans, (bind.name, symbol, captures))
+            Some(symbol) -> Vec.push(plans, (bind.id, symbol, captures))
             None -> return
         }
     }
@@ -2639,7 +2683,7 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
     for (_, symbol, captures) in plans {
         Vec.push(shells, closureShell(l, symbol, captures, siblings))
     }
-    let was = saving(l, Array.map(plans, _.0))
+    let was = saving(l, Vec.map(plans, fun(plan) = LocalId(plan.0)))
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
         Map.put(l.env, plans[i].0, shells[i])
     }
@@ -2647,8 +2691,8 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
         let (_, _, captures) = plans[i]
         let firsts = environmentFirsts(captures)
         for var j = 0; j < len(captures); j = j + 1 {
-            if Set.contains(siblings, captures[j].0) {
-                match Map.get(l.env, captures[j].0) {
+            if isSibling(siblings, captures[j].0) {
+                match lookup(l, captures[j].0) {
                     Some(v) -> L.effect(l.b, ClosureCapture(shells[i],
                         L.fieldRef(environmentLayout(captures), firsts[j]), v))
                     None -> {}
@@ -2851,7 +2895,7 @@ fun compactPayload(l : Lower, c : Compact, binders : Array (Option (String, Int)
                    ty : Ty.Type) -> Unit {
     let binder = if len(binders) == 1 { binders[0] } else { None }
     let bound = match binder {
-        Some((b, _)) -> b
+        Some((name, id)) -> idOf(name, id)
         None -> return
     }
     let field = compactField(l, c, ty)
@@ -3620,6 +3664,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
         -- nodes the compiler made.
         l.b.span = Map.getOr(spans, owner, None)
         l.env = Map.new()
+        l.evidence = Map.new()
         l.joins = Map.new()
         l.stopped = None
         act(l, a, held)

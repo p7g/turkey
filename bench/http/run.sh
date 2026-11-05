@@ -67,6 +67,7 @@ IDLE_PCT=${IDLE_PCT:-85}
 PORT=18080
 CC=${TURKEY_CC:-cc}
 RESULTS=$OUT/results.tsv
+servers=${SERVERS:-"turkey go rust node nginx asgi wsgi ruby java"}
 OS=$(uname -s)
 # The system's OpenSSL on Linux. On a Mac, Homebrew's, since the system's
 # libcrypto ends any process that loads it.
@@ -101,9 +102,9 @@ build() {
         "$OPENSSL_BIN" pkcs12 -export -in "$OUT/cert.pem" -inkey "$OUT/key.pem" \
             -out "$OUT/keystore.p12" -passout pass:bench -name localhost
     fi
-    if command -v javac > /dev/null; then
-        javac -d "$OUT/java" "$HERE/java/Server.java"
-    fi
+    case " $servers " in
+        *" java "*) javac -d "$OUT/java" "$HERE/java/Server.java" ;;
+    esac
     head -c 1048576 /dev/zero | tr '\0' x > "$OUT/1m"
 }
 
@@ -284,7 +285,6 @@ measure() {
     done
 }
 
-servers=${SERVERS:-"turkey go rust node nginx asgi wsgi ruby java"}
 u=http://127.0.0.1:$PORT
 s=https://127.0.0.1:$PORT
 

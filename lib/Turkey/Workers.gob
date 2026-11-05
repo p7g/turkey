@@ -12,8 +12,8 @@ export (
     blockingRenameat, blockingReadlinkat, blockingFlock, blockingMkdtemp, blockingFdopendir,
     blockingReaddir, blockingGetaddrinfo, blockingSpawnp, blockingSleepOn,
     claim, release, wakePoller, interestAdd, interest,
-    pollRead, pollWrite, pollReadWrite, pollChild, pollUnlock, pollForget, pollForgetChild,
-    pollForgetUnlock, pollWait, pollNow,
+    pollRegister, pollRead, pollWrite, pollReadWrite, pollChild, pollUnlock, pollForget,
+    pollForgetChild, pollForgetUnlock, pollWait, pollNow,
     resultToken, resultValue,
     pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
@@ -759,18 +759,25 @@ fun allIdle() -> Bool =
 -- `pollNow`, share one buffer of events and one of results, so a caller holds
 -- the claim (`claim`) across them and across reading the results back
 -- (`resultToken`, `resultValue`), and gives it up with `release`. Registering
--- and dropping interest are safe from any worker at any time.
+-- and dropping interest are safe from any worker, one at a time: they share
+-- one buffer (`changesAt`), and every caller holds the scheduler's lock
+-- (`Turkey.Poll`). `wakePoller`, which needs no lock, makes its own.
 --
--- **One-shot, level-triggered.** A registration delivers one event and is gone
--- (`EV_ONESHOT`, `EPOLLONESHOT`), and one made for a descriptor that is ready
--- already delivers at once, so readiness that arrived before the call is not
--- lost. A descriptor closed while it is registered is dropped by Darwin
--- without an event. On Linux, interest is dropped when every descriptor for
--- the same open file is closed, so a descriptor that may have been duplicated
--- is dropped with `pollForget` before it is closed. Linux keeps one
--- registration per descriptor, not one per direction: a second one for the
--- same descriptor, in either direction, replaces the first, and the first's
--- token is never delivered.
+-- **Two kinds of registration.** `pollRegister` registers a descriptor for the
+-- rest of its life, edge-triggered (`EV_CLEAR`, `EPOLLET`), in both
+-- directions: each time the descriptor becomes readable or writable again it
+-- delivers one event, whether anyone waits for it or not, so the caller keeps
+-- what an event said until a wait asks. `pollRead`, `pollWrite` and
+-- `pollReadWrite` register once, level-triggered (`EV_ONESHOT`,
+-- `EPOLLONESHOT`): one event, and the registration is gone. Either kind, made
+-- for a descriptor that is ready already, delivers at once, so readiness that
+-- arrived before the call is not lost. A descriptor closed while it is
+-- registered is dropped by Darwin without an event. On Linux, interest is
+-- dropped when every descriptor for the same open file is closed, so a
+-- descriptor that may have been duplicated is dropped with `pollForget` before
+-- it is closed. Linux keeps one registration per descriptor, not one per
+-- direction: a second one for the same descriptor, in either direction,
+-- replaces the first, and the first's token is never delivered.
 --
 -- **Results.** An event decodes to a `(token, value)` pair of Ints. For a
 -- descriptor the value is a mask of `pollReadable`, `pollWritable`, `pollEof`
@@ -801,6 +808,7 @@ let batch : Int = 64
 -- Linux's `eventfd`, registered with token 0. The negated `errno` a failed
 -- making left. The scratch block (`scratchAt`). The results block, `batch`
 -- `(token, value)` pairs of Ints. How many pairs the last wait left there.
+-- The changes block (`changesBytes`), for registering and dropping interest.
 var poller : Ptr = zeroed(64)
 
 let stateAt : Int = 0
@@ -810,6 +818,7 @@ let failureAt : Int = 24
 let scratchAt : Int = 32
 let resultsAt : Int = 40
 let countAt : Int = 48
+let changesAt : Int = 56
 
 -- The scratch block, which only the claimant and the maker use: `batch` events
 -- of the target's size (`Turkey.Sys.keventBytes`, `epollEventBytes`; 32 is the
@@ -821,6 +830,13 @@ let timespecAt : Int = 2048
 let oneAt : Int = 2064
 let drainAt : Int = 2072
 let scratchBytes : Int = 2080
+
+-- The changes block: two `struct kevent` changes, their two receipts, and a
+-- zero `struct timespec` after them; Linux uses the first 16 bytes for its
+-- one `struct epoll_event`.
+let receiptsAt : Int = 64
+let changeTimeoutAt : Int = 128
+let changesBytes : Int = 144
 
 -- The poller, made if it was not, or the negated `errno` of why it cannot be.
 -- Workers that arrive while another is making it wait for it; the making is a
@@ -848,14 +864,17 @@ fun pollerReady() -> Int {
 fun make() -> Int {
     let scratch = zeroed(scratchBytes)
     let results = Libc.malloc(Int.mulWrapping(batch, 16))
-    if Ptr.isNull(scratch) || Ptr.isNull(results) {
+    let changes = zeroed(changesBytes)
+    if Ptr.isNull(scratch) || Ptr.isNull(results) || Ptr.isNull(changes) {
         Libc.free(scratch)
         Libc.free(results)
+        Libc.free(changes)
         return -Sys.enomem
     }
     Ptr.store(scratch, oneAt, 1)
     Ptr.store(poller, scratchAt, scratch)
     Ptr.store(poller, resultsAt, results)
+    Ptr.store(poller, changesAt, changes)
     let r = match Target.os {
         Darwin -> makeKqueue()
         Linux -> makeEpoll()
@@ -863,8 +882,10 @@ fun make() -> Int {
     if r != 0 {
         Ptr.store(poller, scratchAt, Ptr.null())
         Ptr.store(poller, resultsAt, Ptr.null())
+        Ptr.store(poller, changesAt, Ptr.null())
         Libc.free(scratch)
         Libc.free(results)
+        Libc.free(changes)
     }
     r
 }
@@ -947,16 +968,13 @@ fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) ->
 
 -- -- Linux
 
--- `epoll_ctl`, with `events` and `token` as the `struct epoll_event`; 0 or
--- the negated `errno`.
+-- `epoll_ctl`, with `events` and `token` as the `struct epoll_event` in the
+-- changes block; 0 or the negated `errno`.
 fun epollControl(ep : Int, operation : Int, fd : Int, events : Int, token : Int) -> Int {
-    let event = Libc.malloc(16)
-    if Ptr.isNull(event) { return -Sys.enomem }
+    let event : Ptr = Ptr.load(poller, changesAt)
     Ptr.store(event, 0, events)
     Ptr.store(event, 8, token)
-    let r = Sys.cResult(Libc.epollCtl(ep, operation, fd, event))
-    Libc.free(event)
-    r
+    Sys.cResult(Libc.epollCtl(ep, operation, fd, event))
 }
 
 -- Interest in `fd`'s `events`, once, delivering `token`: a change of the
@@ -969,6 +987,52 @@ fun epollArm(fd : Int, events : Int, token : Int) -> Int {
 }
 
 -- -- registering
+
+-- Register `fd` for the rest of its life, edge-triggered, in both directions:
+-- `token` is delivered each time it becomes readable or writable, hangs up or
+-- fails, and once at once if it is ready now. 0, or the negated `errno`, in
+-- which case nothing stays registered. Only one registration per descriptor:
+-- a second answers `EEXIST` on Linux.
+fun pollRegister(fd : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> registerKqueue(fd, token)
+        Linux -> {
+            let events = Sys.epollIn | Sys.epollOut | Sys.epollRdHup | Sys.epollEdgeTriggered
+            epollControl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlAdd, fd, events, token)
+        }
+    }
+}
+
+-- Both filters in one `kevent`, each with a receipt. A filter whose change
+-- failed is not registered, and the other is deleted, so that a failure
+-- leaves nothing behind.
+fun registerKqueue(fd : Int, token : Int) -> Int {
+    let changes : Ptr = Ptr.load(poller, changesAt)
+    let flags = Sys.evAdd | Sys.evClear | Sys.evReceipt
+    setEvent(changes, 0, fd, Sys.filterRead(), flags, 0, 0, token)
+    setEvent(changes, 32, fd, Sys.filterWrite(), flags, 0, 0, token)
+    let kq = Ptr.atomicLoad(poller, descriptorAt)
+    let receipts = Ptr.add(changes, receiptsAt)
+    var answer = 0
+    while True {
+        let n = Sys.cInt(Libc.kevent(kq, changes, 2, receipts, 2, Ptr.add(changes, changeTimeoutAt)))
+        if n >= 0 {
+            for var i = 0; i < n; i = plus(i, 1) {
+                let at = Int.mulWrapping(i, 32)
+                let head : Int = Ptr.load(receipts, plus(at, 8))
+                let failure : Int = Ptr.load(receipts, plus(at, 16))
+                if head >> 16 & Sys.evError != 0 && failure != 0 && answer == 0 { answer = -failure }
+            }
+            break
+        }
+        answer = -Sys.errno()
+        if answer != -Sys.eintr { break }
+    }
+    if answer < 0 { pollForget(fd) }
+    answer
+}
 
 -- Tell the poller to deliver `token` once `fd` is readable, or at end of file
 -- or on an error; 0, or the negated `errno`.
@@ -1065,7 +1129,8 @@ fun pollForget(fd : Int) -> Unit {
             let _ = change(Sys.filterRead(), fd, Sys.evDelete, 0, 0)
             let _ = change(Sys.filterWrite(), fd, Sys.evDelete, 0, 0)
         }
-        Linux -> { let _ = epollControl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, 0, 0) }
+        -- `EPOLL_CTL_DEL` reads no event.
+        Linux -> { let _ = Libc.epollCtl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, Ptr.null()) }
     }
 }
 

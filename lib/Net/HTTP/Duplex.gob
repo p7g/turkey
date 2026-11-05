@@ -16,8 +16,10 @@ export (Duplex, duplex)
 -- runs over any of them.
 
 import Net (Connection(..))
+import Net as Net
 import Time (Timeout(..))
 import Time.Deadline (Deadline)
+import Time.Duration (Duration)
 import Turkey.Buffer (Buffer(..))
 import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
 
@@ -28,25 +30,47 @@ type Duplex = Duplex {
     bounding : fun(Option Deadline) -> Unit,
     halfClosing : fun() -> Either SomeError Unit,
     closing : fun() -> Either SomeError Unit,
+    -- What `setLimits` set, which each read, write and flush applies as it
+    -- begins: `bounding` takes only a deadline.
+    var limit : Option Deadline,
+    var each : Option Duration,
 }
 
 instance Read Duplex {
     type ReadError = SomeError
     fun readInto(d, into) {
         needsRoom(into)
+        begin(d)
         d.reading(into)
     }
 }
 
 instance Write Duplex {
     type WriteError = SomeError
-    fun writeFrom(d, from) = d.writing(from)
-    fun flush(d) = d.flushing()
+    fun writeFrom(d, from) {
+        begin(d)
+        d.writing(from)
+    }
+    fun flush(d) {
+        begin(d)
+        d.flushing()
+    }
 }
 
 instance Connection Duplex {
-    fun setDeadline(d, timeout) = d.bounding(Some(deadline(timeout)))
-    fun clearDeadline(d) = d.bounding(None)
+    fun setDeadline(d, timeout) {
+        d.each = None
+        d.bounding(Some(deadline(timeout)))
+    }
+    fun clearDeadline(d) {
+        d.each = None
+        d.bounding(None)
+    }
+    fun setLimits(d, deadline, each) {
+        d.limit = deadline
+        d.each = Some(each)
+        d.bounding(deadline)
+    }
     fun shutdownWrite(d) = d.halfClosing()
     fun close(d) = d.closing()
 }
@@ -57,4 +81,11 @@ instance Connection Duplex {
 fun duplex(reading : fun(Buffer) -> Either SomeError Int, writing : fun(Buffer) -> Either SomeError Unit,
            flushing : fun() -> Either SomeError Unit, bounding : fun(Option Deadline) -> Unit,
            halfClosing : fun() -> Either SomeError Unit, closing : fun() -> Either SomeError Unit) -> Duplex =
-    Duplex { reading, writing, flushing, bounding, halfClosing, closing }
+    Duplex { reading, writing, flushing, bounding, halfClosing, closing, limit = None, each = None }
+
+-- Bounds the connection under `d` for an operation that begins now, if
+-- `setLimits` gave each one a limit.
+fun begin(d : Duplex) -> Unit =
+    if let Some(e) = d.each {
+        d.bounding(Some(Net.operationDeadline(d.limit, e)))
+    }

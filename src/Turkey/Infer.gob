@@ -83,7 +83,6 @@ type LoopCtx = LoopCtx {
     -- loop | while | for
     kind         : String,
     var result   : Ty.Type,
-    var sawBreak : Bool,
 }
 
 -- One existential under construction: the variables and constraints so far.
@@ -119,9 +118,11 @@ type Generator = Generator {
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
     discardSites : Vec Expr,
-    -- See `Program.elseEnds`, as a list and by id.
-    elseEnds   : Vec Expr,
-    elseEndIds : Set.Set Int,
+    -- See `Program.letElses`.
+    letElses : Vec LetElse,
+    -- The ids of the nodes generation types bottom whatever they are: every
+    -- `else` block of a `let ... else`, and the calls in its tail positions.
+    bottoms  : Set.Set Int,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
     -- variables and its context.
     partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred),
@@ -140,8 +141,8 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
         warnings = Vec.new(4), matchSites = Vec.new(8),
-        binderSites = Vec.new(8), discardSites = Vec.new(8), elseEnds = [],
-        elseEndIds = Set.new(),
+        binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
+        bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
     }
 }
@@ -266,9 +267,10 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     let foreigns = Vec.new(4)
     let items = Vec.new(16)
     for (owner, program) in modules {
-        for e in program.elseEnds {
-            Vec.push(g.elseEnds, e)
-            Set.add(g.elseEndIds, e.id)
+        for le in program.letElses {
+            Vec.push(g.letElses, le)
+            Set.add(g.bottoms, le.block.id)
+            for call in le.tailCalls { Set.add(g.bottoms, call.id) }
         }
         for d in program.decls {
             match d {
@@ -899,20 +901,16 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
-    -- The parser has passed over every way an `else` block can end by a
-    -- transfer. What is left must be a call that never returns. A callee with
-    -- no recorded type was rebuilt by desugaring because it held a `?`, and
-    -- nothing shows that one never returns.
-    for end in g.elseEnds {
-        let leaves = match end.kind {
-            ECall(fn, _) -> Map.contains(g.types.exprs, fn.id)
-                            && neverReturns(Typed.of_(g.types, fn))
-            _ -> False
-        }
-        if !leaves {
+    -- When an `else` block falls through, it does so past its last statement.
+    for le in g.letElses {
+        if completes(le.completion, Typed.canReturn(g.types, _)) {
+            let at = match le.block.kind {
+                EBlock(stmts) -> if len(stmts) > 0 { stmts[len(stmts) - 1].span }
+                                 else { le.block.span }
+                _ -> le.block.span
+            }
             oops("this 'else' block can fall through; it must end in 'return', "
-                 + "'break', 'continue' or a call that never returns",
-                 Some(end.span))
+                 + "'break', 'continue' or a call that never returns", Some(at))
         }
     }
     -- A value computed and thrown away is an error unless there is no value.
@@ -922,7 +920,7 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             TCon(c) -> c.name == "Unit"
             _ -> False
         }
-        if !unit && !diverges(g, x) {
+        if !unit && completes(completion(x), Typed.canReturn(g.types, _)) {
             oops("this expression's value has type '" + Ty.show(ty)
                  + "' and is discarded; use it, or write 'let _ = ...'",
                  Some(x.span))
@@ -940,48 +938,6 @@ fun discardsLast(g : Generator, body : Expr) -> Unit = match body.kind {
         }
     }
     _ -> {}
-}
-
--- Whether `e` has no value to discard, by parametricity: bottom, or a call whose
--- result is a variable its parameters do not mention -- `fun(String) -> a` has no
--- way to make an `a` -- or a branch every way through which diverges. See
--- `turkey/infer.py`.
-fun diverges(g : Generator, e : Expr) -> Bool {
-    match Typed.of_(g.types, e) {
-        TBottom -> return True
-        _ -> {}
-    }
-    match e.kind {
-        ECall(fn, _) -> neverReturns(Typed.of_(g.types, fn))
-        EIf(_, then, otherwise) -> match otherwise {
-            Some(o) -> diverges(g, then) && diverges(g, o)
-            None -> False
-        }
-        EMatch(_, arms) -> {
-            for arm in arms { if !diverges(g, armBody(arm)) { return False } }
-            True
-        }
-        EBlock(stmts) -> if len(stmts) == 0 { False } else {
-            match stmts[len(stmts) - 1].kind {
-                SExpr(x) -> diverges(g, x)
-                _ -> False
-            }
-        }
-        _ -> False
-    }
-}
-
--- Whether a function of type `t` never returns, by parametricity: its result is
--- a variable its parameters do not mention.
-fun neverReturns(t : Ty.Type) -> Bool = match t {
-    TFun(params, ret) -> match Ty.prune(ret) {
-        TVar(cell) -> {
-            for v in Ty.varsOf(params) { if v.id == cell.id { return False } }
-            True
-        }
-        _ -> False
-    }
-    _ -> False
 }
 
 -- -- binders -----------------------------------------------------------------------
@@ -1433,26 +1389,31 @@ fun mergeInto(into : Map String Ty.Type, new : Map String Ty.Type,
 -- A block's value is its last statement's, and a declaration contributes Unit.
 -- A binder scopes over the statements that follow it, so it is
 -- generated as a binder *around* them rather than as one more statement.
+--
+-- A statement that cannot complete makes the block bottom, and lowering stops
+-- there. The statements after it are still generated, so that what is wrong
+-- with them is still reported.
+--
+-- `stmtStops` walks the whole statement, and a statement nested in this one
+-- is walked again by its own block, so the cost grows with the depth of
+-- nesting. Caching an answer per node would cost a table for a walk that is
+-- already linear at each level.
 fun genSequence(g : Generator, stmts : Vec Stmt, from : Int) -> Ty.Type {
     if from >= len(stmts) { return Ty.tUnit() }
     let stmt = stmts[from]
-    match stmt.kind {
-        SLet(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        SVar(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        SFun(_) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        _ -> {}
-    }
-    let value = genStmt(g, stmt)
-    if from + 1 < len(stmts) {
-        match stmt.kind {
-            SExpr(x) -> Vec.push(g.discardSites, x)
-            _ -> {}
+    let ty = match stmt.kind {
+        SLet(_, _) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        SVar(_, _) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        SFun(_) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        _ -> {
+            let value = genStmt(g, stmt)
+            if from + 1 < len(stmts) {
+                if let SExpr(x) = stmt.kind { Vec.push(g.discardSites, x) }
+                genSequence(g, stmts, from + 1)
+            } else { value }
         }
-        genSequence(g, stmts, from + 1)
-    } else { value }
+    }
+    if stmtStops(stmt) { TBottom } else { ty }
 }
 
 -- A statement that binds nothing. Binders go through `bindGroup`.
@@ -1497,13 +1458,17 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
 
 fun genExpr(g : Generator, e : Expr) -> Ty.Type {
     var ty = genExprKind(g, e)
-    -- Where an `else` block can end is bottom, like a `return`, and checked
-    -- once types are solved: only a call to a function whose result its
-    -- parameters do not mention passes. Answering the real type would unify a
-    -- call's result with the type of the names the `let` binds, and the check
-    -- could no longer tell; and an end that is plainly not bottom would be
-    -- reported as a mismatch between the arms instead.
-    if Set.contains(g.elseEndIds, e.id) { ty = TBottom }
+    -- An `else` block is bottom, like a `return`, and is checked once types
+    -- are solved not to fall through. Answering its real type would report a
+    -- block that falls through as a mismatch between the arms instead.
+    --
+    -- So is a call in its tail positions, for the block that desugaring
+    -- rewrote into a value and so is no longer here to be bottom. That call's
+    -- result would otherwise unify with the type of the names the `let` binds,
+    -- and the check could no longer see that the callee never returns. It is
+    -- sound because the check passes only if each such call never returns or
+    -- is never reached.
+    if Set.contains(g.bottoms, e.id) { ty = TBottom }
     -- One place, so no case can forget. What is recorded is the variable itself,
     -- not a snapshot of it: solving fills it in later.
     Typed.record(g.types, e, ty)
@@ -1669,7 +1634,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     EWhile(cond, body) -> {
         eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "a 'while' condition")
         Vec.push(g.loopStack, LoopCtx {
-            kind = "while", result = Ty.tUnit(), sawBreak = False,
+            kind = "while", result = Ty.tUnit(),
         })
         discard(genExpr(g, body))
         discardsLast(g, body)
@@ -1682,7 +1647,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let rest = fun() = {
             eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "a 'for' condition")
             Vec.push(g.loopStack, LoopCtx {
-                kind = "for", result = Ty.tUnit(), sawBreak = False,
+                kind = "for", result = Ty.tUnit(),
             })
             discard(genExpr(g, body))
             discardsLast(g, body)
@@ -1709,14 +1674,14 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         }
     }
     ELoop(body) -> {
-        let ctx = LoopCtx { kind = "loop", result = fresh(g), sawBreak = False }
+        let ctx = LoopCtx { kind = "loop", result = fresh(g) }
         Vec.push(g.loopStack, ctx)
         discard(genExpr(g, body))
         discardsLast(g, body)
         discard(Vec.pop(g.loopStack))
         -- A `loop` never falls through, so its value comes only from its
-        -- breaks. With no break at all it never produces one.
-        if ctx.sawBreak { ctx.result } else { TBottom }
+        -- breaks. With no break it can reach, it never produces one.
+        if breaksOut(body) { ctx.result } else { TBottom }
     }
     EMatch(scrutinee, arms) -> genMatch(g, e, scrutinee, arms)
     EReturn(value) -> {
@@ -1735,7 +1700,6 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
             oops("'break' cannot appear outside a loop", Some(e.span))
         }
         let ctx = g.loopStack[len(g.loopStack) - 1]
-        ctx.sawBreak = True
         match value {
             None -> eq(g, ctx.result, Ty.tUnit(), Some(e.span),
                        "a valueless 'break'")
@@ -2027,7 +1991,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     Vec.push(g.scopes, scope)
     push(g)
     Vec.push(g.loopStack, LoopCtx {
-        kind = "for", result = Ty.tUnit(), sawBreak = False,
+        kind = "for", result = Ty.tUnit(),
     })
     discard(genExpr(g, body))
     discardsLast(g, body)

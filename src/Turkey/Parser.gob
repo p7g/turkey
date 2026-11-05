@@ -39,8 +39,8 @@ type P = P {
     -- How many `_` placeholders have been read and not yet made into a
     -- parameter. Zero is the common case, and it lets a boundary skip the walk.
     var pending  : Int,
-    -- See `Program.elseEnds`.
-    elseEnds     : Vec Expr,
+    -- See `Program.letElses`.
+    letElses     : Vec LetElse,
 }
 
 fun parse(source : Source, known : Vec String) -> Program {
@@ -53,7 +53,7 @@ fun parse(source : Source, known : Vec String) -> Program {
         file = source.name,
         explicit = 0,
         pending = 0,
-        elseEnds = [],
+        letElses = [],
     }
     parseProgram(p)
 }
@@ -289,7 +289,7 @@ fun parseProgram(p : P) -> Program {
     }
     Program {
         span = s, exportDecl = exportDecl, imports = imports, decls = decls,
-        elseEnds = p.elseEnds,
+        letElses = p.letElses,
     }
 }
 
@@ -1213,7 +1213,11 @@ fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> St
     }
     skipToken(p, "else")
     let otherwise = parseBlock(p)
-    collectElseEnds(p, otherwise)
+    let tails = Vec.new(2)
+    tailCalls(otherwise, tails)
+    Vec.push(p.letElses, LetElse {
+        block = otherwise, completion = completion(otherwise), tailCalls = tails,
+    })
     let names = patternVars(pat)
     let vars = Vec.map(names, fun(n) = mkPat(p, pat.span, PVar(n)))
     let refs = Vec.map(names, fun(n) = mkExpr(p, pat.span, EVar(n, False)))
@@ -1230,46 +1234,20 @@ fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> St
     mkStmt(p, s, if mutable { SVar(bound, m) } else { SLet(bound, m) })
 }
 
--- Record in `p.elseEnds` every way `e`, an `else` block, can end that is not a
--- control transfer: each expression in tail position other than a `return`,
--- `break`, `continue` or a `loop` with no `break` of its own.
-fun collectElseEnds(p : P, e : Expr) -> Unit = match e.kind {
-    EReturn(_) | EBreak(_) | EContinue -> {}
-    EBlock(stmts) -> {
-        if len(stmts) > 0 {
-            if let SExpr(last) = stmts[len(stmts) - 1].kind {
-                return collectElseEnds(p, last)
-            }
-        }
-        Vec.push(p.elseEnds, e)
+-- Collect into `out` the calls in `e`'s tail positions: its value, through
+-- the last statement of a block, both branches of an `if` and every arm of a
+-- `match`.
+fun tailCalls(e : Expr, out : Vec Expr) -> Unit = match e.kind {
+    ECall(_, _) -> Vec.push(out, e)
+    EBlock(stmts) -> if len(stmts) > 0 {
+        if let SExpr(last) = stmts[len(stmts) - 1].kind { tailCalls(last, out) }
     }
-    EIf(_, then, Some(otherwise)) -> {
-        collectElseEnds(p, then)
-        collectElseEnds(p, otherwise)
+    EIf(_, then, otherwise) -> {
+        tailCalls(then, out)
+        if let Some(o) = otherwise { tailCalls(o, out) }
     }
-    EMatch(_, arms) -> for arm in arms { collectElseEnds(p, arm.body) }
-    ELoop(body) -> if breaksOut(ChExpr(body)) { Vec.push(p.elseEnds, e) }
-    _ -> Vec.push(p.elseEnds, e)
-}
-
--- Whether `c`, a loop's body, holds a `break` that leaves that loop: one not
--- inside a nested loop, a lambda or a local `fun`.
-fun breaksOut(c : Child) -> Bool {
-    match c {
-        ChExpr(e) -> match e.kind {
-            EBreak(_) -> return True
-            EWhile(_, _) | EForIn(_, _, _, _, _) | EForC(_, _, _, _) | ELoop(_) ->
-                return False
-            ELambda(_, _, _) -> return False
-            _ -> {}
-        }
-        ChStmt(s) -> if let SFun(_) = s.kind { return False }
-        _ -> {}
-    }
-    for ch in children(c) {
-        if breaksOut(ch) { return True }
-    }
-    False
+    EMatch(_, arms) -> for arm in arms { tailCalls(arm.body, out) }
+    _ -> {}
 }
 
 fun parseStmt(p : P) -> Stmt {

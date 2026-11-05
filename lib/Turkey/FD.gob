@@ -42,13 +42,15 @@ export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, write
 -- **The retry loop.** A call interrupted by a signal is made again at once.
 -- `EAGAIN`, from a descriptor in non-blocking mode, parks the task until the
 -- poller reports the descriptor ready for that direction
--- (`Turkey.Wait.readable`, `writable`) and then makes the call again. Each
--- park registers once and the registration fires once, level-triggered, so
--- readiness that arrived between the `EAGAIN` and the park is reported at
--- once and nothing needs remembering. The lock of the direction is held while
--- parked, so each direction has at most one parked task, and the parked
--- operation holds a reference, so the number cannot be closed and handed to
--- another file while a registration for it exists. `close` ends a parked wait
+-- (`Turkey.Wait.readable`, `writable`) and then makes the call again. The
+-- descriptor is registered with the poller at its first park and stays
+-- registered until its number is closed, and the poller keeps readiness that
+-- arrives while nobody waits, so readiness that arrived between the `EAGAIN`
+-- and the park ends the park at once. The lock of the direction is held while
+-- parked, so each direction has at most one parked task, which the poller
+-- relies on (`Turkey.Poll`), and the parked operation holds a reference, so
+-- the number is not closed under it; the registration is dropped before the
+-- number is closed (`closeNumber`). `close` ends a parked wait
 -- (`Turkey.Wait.cancel`) and the operation answers `closed`; a wait the poller
 -- cannot make (the kernel refuses the descriptor) answers its negated `errno`.
 -- Positional operations see `EAGAIN` from no descriptor that supports them, and
@@ -60,13 +62,14 @@ export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, write
 -- `read` wait in the kernel for as long as nothing arrives, holding its
 -- worker; so the first `read` looks at the descriptor once (`readMode`) and,
 -- for one of those, every `read` waits for readable first and then makes the
--- call, which returns what is there. Writes to it stay blocking. Regular
--- files and directories are never looked at again and never reach the poller.
--- If the poller refuses such a descriptor the `read` makes its call plainly
--- from then on, as a blocking read of any other descriptor. `polled` records
--- that a wait was ever made on the descriptor,
--- so that only then is its poller registration dropped before the number is
--- closed.
+-- call, which returns what is there; that wait is registered for itself and
+-- ends only when the descriptor is readable (`Wait.readableBlockingUnless`).
+-- Writes to it stay blocking. Regular files and directories are never looked
+-- at again and never reach the poller. If the poller refuses such a
+-- descriptor the `read` makes its call plainly from then on, as a blocking
+-- read of any other descriptor. `polled` records that a wait was ever made on
+-- the descriptor, so that only then is its poller registration dropped before
+-- the number is closed.
 --
 -- **A deadline.** `readBy` takes one, a point on `Turkey.Wait.now`'s clock or
 -- -1 for none, and gives up at it from either wait: the one before the call
@@ -596,7 +599,14 @@ fun sooner(a : Int, b : Int) -> Int = if a < 0 || (b >= 0 && b < a) { b } else {
 fun park(f : FD, writing : Bool, deadline : Int, now : Int) -> Int {
     f.polled = True
     let stop = fun() = Sync.load(f.state) & closedBit != 0
-    let w = if now < 0 {
+    let blocking = match f.readMode {
+        WaitFirst -> !writing
+        Unknown -> False
+        CallAtOnce -> False
+    }
+    let w = if blocking {
+        Wait.readableBlockingUnless(f.number, deadline, stop)
+    } else if now < 0 {
         if writing { Wait.writableUnless(f.number, deadline, stop) }
         else { Wait.readableUnless(f.number, deadline, stop) }
     } else if writing {

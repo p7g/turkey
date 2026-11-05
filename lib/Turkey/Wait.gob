@@ -1,6 +1,6 @@
 export (
     now, sleepUntil, readable, writable, readableUnless, writableUnless, readableUnlessAsOf,
-    writableUnlessAsOf, childExit, lockedUnless,
+    writableUnlessAsOf, readableBlockingUnless, childExit, lockedUnless,
     cancel, forget, park, parkApart, wakeEnded, timedOut, cancelled,
 )
 
@@ -91,6 +91,12 @@ fun readableUnlessAsOf(fd : Int, deadline : Int, now : Int, stop : fun() -> Bool
 fun writableUnlessAsOf(fd : Int, deadline : Int, now : Int, stop : fun() -> Bool) -> Int =
     if passedAsOf(deadline, now) { timedOut } else { parkUnless(fun() = Poll.writable(fd, deadline), stop) }
 
+-- `readableUnless` for a descriptor in blocking mode, before a `read` that
+-- must not wait in the kernel: it ends only once the descriptor is readable
+-- (`Turkey.Poll.readableBlocking`). The others are for after `EAGAIN`.
+fun readableBlockingUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
+    if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.readableBlocking(fd, deadline), stop) }
+
 -- Wait for the child `pid` to exit, and reap it. Only the one wait for a
 -- child may exist at a time, and nothing else in the program may reap it
 -- (`Turkey.Poll`).
@@ -108,19 +114,26 @@ fun lockedUnless(fd : Int, operation : Int, deadline : Int, stop : fun() -> Bool
 -- `fd` is about to be closed: end every wait on it with `cancelled`.
 fun cancel(fd : Int) -> Unit {
     Scheduler.lock()
-    if Poll.cancel(fd) > 0 {
+    wakeAll(Poll.cancel(fd))
+    Scheduler.unlock()
+}
+
+-- Drop the poller's interest in `fd`, before its number is closed, ending any
+-- wait still on it as `cancel` does. Every number that was waited on is
+-- forgotten before it is closed (`Turkey.Poll`).
+fun forget(fd : Int) -> Unit {
+    Scheduler.lock()
+    wakeAll(Poll.forget(fd))
+    Scheduler.unlock()
+}
+
+-- Wake the tasks of the `ended` waits the poller just ended, under the lock.
+fun wakeAll(ended : Int) -> Unit {
+    if ended > 0 {
         let tasks = Poll.takeWoken()
         for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
         Scheduler.changed()
     }
-    Scheduler.unlock()
-}
-
--- Drop the poller's interest in `fd`, before its number is closed.
-fun forget(fd : Int) -> Unit {
-    Scheduler.lock()
-    Poll.forget(fd)
-    Scheduler.unlock()
 }
 
 fun passed(deadline : Int) -> Bool = deadline >= 0 && Poll.now() >= deadline

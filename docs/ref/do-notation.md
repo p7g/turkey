@@ -372,6 +372,14 @@ fun main() {
 Variables captured by the rest of the block are shared, not copied, across
 those calls ([Closures](declarations.md#anonymous-functions)).
 
+A loop holding a `?` goes round again inside the function it hands to `bind`.
+When `bind` calls that function last, as `Option`'s does, or returns a
+function that does, as a reader's or a state monad's does, the call is a
+[tail call](declarations.md#functions) and the loop runs in constant stack
+however many times it goes round. `Array`'s `bind` still has to join the
+results when the function returns, so each round of a loop in `Array` holds
+on to stack until the loop ends.
+
 ## No implicit `pure`
 
 The last statement of a do-context is its result, and it is not wrapped

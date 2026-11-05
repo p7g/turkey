@@ -1,5 +1,5 @@
-export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt, writeAt, using, flock,
-        readingWith, writingWith, writeWith, close)
+export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, writeText, readAt, writeAt, using, flock,
+        readingWith, writingWith, writeWith, writeWithin, close)
 
 -- A descriptor that tasks share: the one place the I/O layer decides when a
 -- descriptor number stops being this file's, and which of two tasks using it
@@ -74,6 +74,9 @@ export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt
 -- `writeWith`, which make a call of the caller's in place of `read` or
 -- `write` -- `accept`, `connect`, `send` -- under the same lock and the same
 -- retry loop, for a descriptor the library made non-blocking itself.
+-- `readWithin` and `writeWithin` also take a limit on the operation alone,
+-- which starts at its first wait: an operation that never waits never reads
+-- the clock, which is most reads and writes on a busy socket.
 --
 -- Every result is a count, never negative, or the negated `errno`, as
 -- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
@@ -150,8 +153,18 @@ fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int =
 -- (`Turkey.Wait.now`) or -1 for none: `timedOut` if it came first. A read that
 -- timed out has transferred nothing, and leaves the descriptor as it was, so
 -- the caller may make it again as it would after `EAGAIN`.
-fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> Int {
+fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> Int =
+    readWithin(f, bytes, from, to, deadline, -1)
+
+-- `readBy`, giving up also `within` nanoseconds after the read first waits,
+-- unless `within` is -1.
+fun readWithin(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int, within : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
+    -- `at` is the deadline once `within` has started, which sets `pending`
+    -- to -1; `now` is the reading that started it, until a wait uses it.
+    var at = deadline
+    var pending = within
+    var now = -1
     var n = 0
     match f.readMode {
         Unknown -> { f.readMode = inherited(f.number) }
@@ -161,7 +174,13 @@ fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> 
     while True {
         match f.readMode {
             WaitFirst -> {
-                let w = park(f, False, deadline)
+                if pending >= 0 {
+                    now = Wait.now()
+                    at = sooner(at, now + pending)
+                    pending = -1
+                }
+                let w = park(f, False, at, now)
+                now = -1
                 if w == closed || w == timedOut {
                     n = w
                     break
@@ -174,7 +193,13 @@ fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> 
         n = IO.read(f.number, bytes, from, to)
         if n == -Sys.eintr { continue }
         if n == -Sys.eagain() {
-            let w = park(f, False, deadline)
+            if pending >= 0 {
+                now = Wait.now()
+                at = sooner(at, now + pending)
+                pending = -1
+            }
+            let w = park(f, False, at, now)
+            now = -1
             if w == 0 { continue }
             n = w
         }
@@ -189,7 +214,7 @@ fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> 
 -- write at a time per `FD`, so the bytes go out contiguously.
 fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1)
+    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1, -1)
     unlock(f, writeLock, writeWaited)
     n
 }
@@ -197,7 +222,7 @@ fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
 -- `write`, from a string's own bytes, counted in bytes.
 fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1)
+    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1, -1)
     unlock(f, writeLock, writeWaited)
     n
 }
@@ -228,9 +253,14 @@ fun writingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
 -- `write`, through `step(number, at)`, which writes from `at` up to `to` as
 -- `write` would and answers what it did: `send` with flags, say. Gives up at
 -- `deadline` with `timedOut`, after however much went out before it.
-fun writeWith(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int) -> Int {
+fun writeWith(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int) -> Int =
+    writeWithin(f, step, from, to, deadline, -1)
+
+-- `writeWith`, giving up also `within` nanoseconds after the write first
+-- waits, unless `within` is -1.
+fun writeWithin(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int, within : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline)
+    let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline, within)
     unlock(f, writeLock, writeWaited)
     n
 }
@@ -240,7 +270,7 @@ fun retried(f : FD, call : fun(Int) -> Int, writing : Bool, deadline : Int) -> I
         let n = call(f.number)
         if n == -Sys.eintr { continue }
         if n != -Sys.eagain() { return n }
-        let w = park(f, writing, deadline)
+        let w = park(f, writing, deadline, -1)
         if w != 0 { return w }
     }
     0
@@ -279,7 +309,7 @@ fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> In
 fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
-                     from, to, False, -1)
+                     from, to, False, -1, -1)
     let _ = release(f)
     n
 }
@@ -519,12 +549,17 @@ fun closeNumber(f : FD) -> Int {
 
 -- `write` until all of `from..to` is taken: `step(at)` writes from `at` and
 -- answers what the call did. Retried at once after a signal; after `EAGAIN`
--- the task parks until the descriptor is writable, or until `deadline`, if
--- `sequential`, and yields otherwise; 0 from a non-empty write, which would otherwise loop, is
+-- the task parks until the descriptor is writable, or until `deadline` or
+-- `within` from the first wait (as for `writeWithin`), if `sequential`, and
+-- yields otherwise; 0 from a non-empty write, which would otherwise loop, is
 -- reported as `EIO`.
 fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : Bool,
-             deadline : Int) -> Int {
+             deadline : Int, within : Int) -> Int {
     var at = from
+    -- As in `readWithin`.
+    var by = deadline
+    var pending = within
+    var now = -1
     while at < to {
         let n = step(at)
         if n == -Sys.eintr { continue }
@@ -533,7 +568,13 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
                 Scheduler.yield()
                 continue
             }
-            let w = park(f, True, deadline)
+            if pending >= 0 {
+                now = Wait.now()
+                by = sooner(by, now + pending)
+                pending = -1
+            }
+            let w = park(f, True, by, now)
+            now = -1
             if w == 0 { continue }
             return w
         }
@@ -544,15 +585,25 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
     to - from
 }
 
+-- The sooner of two deadlines, either -1 for none.
+fun sooner(a : Int, b : Int) -> Int = if a < 0 || (b >= 0 && b < a) { b } else { a }
+
 -- The descriptor was not ready, and the caller holds a reference and the
 -- direction's lock: wait until it is, and answer 0. `closed` if `close` ended
 -- the wait, `timedOut` if `deadline` came first, or the negated `errno` of a
--- wait the poller could not make.
-fun park(f : FD, writing : Bool, deadline : Int) -> Int {
+-- wait the poller could not make. `now` is a reading of `Turkey.Wait.now`
+-- taken just before, to judge the deadline by, or -1 to take one.
+fun park(f : FD, writing : Bool, deadline : Int, now : Int) -> Int {
     f.polled = True
     let stop = fun() = Sync.load(f.state) & closedBit != 0
-    let w = if writing { Wait.writableUnless(f.number, deadline, stop) }
-            else { Wait.readableUnless(f.number, deadline, stop) }
+    let w = if now < 0 {
+        if writing { Wait.writableUnless(f.number, deadline, stop) }
+        else { Wait.readableUnless(f.number, deadline, stop) }
+    } else if writing {
+        Wait.writableUnlessAsOf(f.number, deadline, now, stop)
+    } else {
+        Wait.readableUnlessAsOf(f.number, deadline, now, stop)
+    }
     if w == Wait.cancelled { closed } else { w }
 }
 

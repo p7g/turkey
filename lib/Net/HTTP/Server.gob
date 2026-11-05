@@ -124,9 +124,11 @@ import System.Sync as Sync
 import System.Sync (Event, Mutex, Semaphore)
 import System.Task as Task
 import System.Task (Spawn)
+import Time.Calendar as Calendar
 import Time.Clock as Clock
 import Time.Deadline as Deadline (Deadline)
 import Time.Duration as Duration (Duration)
+import Time.Instant as Instant
 import Time.Sleep as Sleep
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
@@ -552,10 +554,12 @@ fun dispatch(w : Work) -> Spawn Unit {
 
 -- -- deadlines ---------------------------------------------------------------------------
 
--- A connection that bounds each read and write by the deadline of the phase
--- it is in. Setting the connection's deadline before every operation costs
--- a clock reading each, and is what lets one deadline cover a whole head
--- while another bounds each wait for a body's bytes.
+-- A connection that bounds each read and write by the limits of the phase it
+-- is in: one deadline for a whole head, say, and the stall limit on each
+-- wait for a body's bytes. The limits are set before every operation, and a
+-- phase's own deadline is computed once, when the phase begins. The limit on
+-- each operation is handed down as a duration, so that the connection reads
+-- the clock for it only if the operation has to wait (`Net.setLimits`).
 type Guarded c = Guarded {
     conn        : c
     values      : Values
@@ -566,10 +570,17 @@ type Guarded c = Guarded {
     var carried : Option Deadline
     -- Where the response heads are written, lent a buffer for each exchange.
     outbox      : Outbox
+    -- The `Date` field's value for the response heads written in the second
+    -- `dateSecond`, counted from the Unix epoch.
+    var dateSecond : Int
+    var dateValue  : HeaderValue
 }
 
--- * `Idle(d)`: waiting for a request's first byte until `d`. The first byte
---   starts `ReadingHead`.
+-- * `Idle`: waiting for a request's first byte, for at most the idle
+--   timeout. The first byte starts `HeadBegun`.
+-- * `HeadBegun`: a head's first bytes are in. The head timeout starts at the
+--   next read, which is `ReadingHead`'s first: nothing between the two waits,
+--   and a head that arrives whole in one read needs no deadline.
 -- * `ReadingHead(d)`: reading a head that must be whole by `d`.
 -- * `Exchanging`: reading a body or writing a response, each wait bounded by
 --   the stall limit.
@@ -577,24 +588,32 @@ type Guarded c = Guarded {
 --   deadline its `Duplex` sets: the protocol keeps its own time.
 -- * `Lingering(d)`: discarding input before a close, each read bounded by
 --   `lingerIdle`, and all of them by `d`.
-type Phase = Idle(Deadline) | ReadingHead(Deadline) | Exchanging | Carrying | Lingering(Deadline)
+type Phase = Idle | HeadBegun | ReadingHead(Deadline) | Exchanging | Carrying | Lingering(Deadline)
 
--- Sets `g`'s connection's deadline for its next operation.
+-- Sets `g`'s connection's limits for its next operation.
 --
--- A read and a write may run at once, in two tasks, and the connection has
--- one deadline for both, so each operation's setting extends the other's.
--- The stall limit then bounds the two together: the connection is cut once
--- neither has moved a byte for the limit, which is when the client has
--- stopped both sending and reading.
+-- A read and a write may run at once, in two tasks. Each is bounded by the
+-- stall limit from when it begins, and a connection whose two directions
+-- share one deadline lets each operation's beginning extend the other's, so
+-- that the stall limit bounds the two together: the connection is then cut
+-- once neither has begun an operation for the limit.
+--
+-- `Idle` sets the idle timeout as the limit on one operation, which is
+-- exact, since the phase is one read: any bytes end it.
 fun bound[Connection c](g : Guarded c) -> Unit = match g.phase {
-    Idle(d) -> Net.setDeadline(g.conn, d)
-    ReadingHead(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.stall)))
-    Exchanging -> Net.setDeadline(g.conn, Deadline.after(g.stall))
+    Idle -> Net.setLimits(g.conn, None, g.values.idleTimeout)
+    HeadBegun -> {
+        let d = Deadline.after(g.values.headTimeout)
+        g.phase = ReadingHead(d)
+        Net.setLimits(g.conn, Some(d), g.stall)
+    }
+    ReadingHead(d) -> Net.setLimits(g.conn, Some(d), g.stall)
+    Exchanging -> Net.setLimits(g.conn, None, g.stall)
     Carrying -> match g.carried {
         Some(d) -> Net.setDeadline(g.conn, d)
         None -> Net.clearDeadline(g.conn)
     }
-    Lingering(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.values.lingerIdle)))
+    Lingering(d) -> Net.setLimits(g.conn, Some(d), g.values.lingerIdle)
 }
 
 instance Read (Guarded c) : Connection c {
@@ -602,8 +621,8 @@ instance Read (Guarded c) : Connection c {
     fun readInto(g, into) {
         bound(g)
         let n = readInto(g.conn, into)?
-        if let Idle(_) = g.phase, n > 0 {
-            g.phase = ReadingHead(Deadline.after(g.values.headTimeout))
+        if let Idle = g.phase, n > 0 {
+            g.phase = HeadBegun
         }
         Right(n)
     }
@@ -644,6 +663,8 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
         stall = values.stall
         carried = None
         outbox = Output.outbox(server.buffers)
+        dateSecond = Int.minValue()
+        dateValue = HeaderValue.literal("")
     }
     let id = Sync.withLock(server.registry, fun(r) {
         if r.stopping { return None }
@@ -694,7 +715,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
     loop {
         let found = Input.readHead(input, limits)
         let wasIdle = match g.phase {
-            Idle(_) -> True
+            Idle -> True
             _ -> False
         }
         let raw = match found {
@@ -735,11 +756,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
                         return
                     }
                     -- Bytes held already are a pipelined request's head, begun.
-                    g.phase = if Input.held(input) > 0 {
-                        ReadingHead(Deadline.after(g.values.headTimeout))
-                    } else {
-                        Idle(Deadline.after(g.values.idleTimeout))
-                    }
+                    g.phase = if Input.held(input) > 0 { HeadBegun } else { Idle }
                 }
                 CloseAfter -> return
                 LingerAfter -> return linger(g)
@@ -912,7 +929,7 @@ fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerRe
 fun headOf(g : Guarded c, response : ServerResponse, framing : Framing, persistence : Persistence) -> Unit {
     var fields = headers(response)
     if !Headers.has(fields, dateField) {
-        fields = Headers.add(fields, dateField, HeaderValue.literal(Date.toString(Clock.realtime())))
+        fields = Headers.add(fields, dateField, date(g))
     }
     Output.responseHead(g.outbox, OutgoingResponse {
         status = ServerResponse.status(response)
@@ -924,6 +941,24 @@ fun headOf(g : Guarded c, response : ServerResponse, framing : Framing, persiste
 }
 
 let dateField = HeaderName.literal("date")
+
+-- Returns the `Date` field's value for a response written now: formatted
+-- once a second, since a date is written to the whole second.
+--
+-- The value is kept per connection, as the outbox is. A connection writes
+-- one response head at a time, so no two tasks use the two fields at once,
+-- on any worker, and they need no lock. A value kept per server would be
+-- formatted once a second in all, but every response would then take a lock
+-- or make an atomic exchange on memory that every worker writes.
+fun date(g : Guarded c) -> HeaderValue {
+    let now = Clock.realtime()
+    let second = Calendar.floorDiv(Instant.unixNanos(now), 1000000000)
+    if second != g.dateSecond {
+        g.dateValue = HeaderValue.literal(Date.toString(now))
+        g.dateSecond = second
+    }
+    g.dateValue
+}
 
 -- Returns the response the server sends on its own behalf: `s` with its
 -- reason phrase as text.

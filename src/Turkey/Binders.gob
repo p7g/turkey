@@ -1,6 +1,6 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
-    newTable, owner, fresh, ownerOf, localOf, binderAt, unrecorded,
+    newTable, owner, unrecordedOwner, fresh, ownerOf, localOf, binderAt, unrecorded,
     declare, named, record, refer, leaveUnresolved,
     ownDeclaration, declarationOwner,
     checkReferences, checkInferred, methodRefs, boundIn, boundByPattern,
@@ -24,9 +24,12 @@ export (
 -- Ids are process-local. They are never printed, and nothing persisted may be
 -- keyed by one; a binder's stable name is its `moduleName` and `name`.
 --
--- An owner may also number binders it keeps no record of (`unrecorded`).
--- `Turkey.Opt` numbers every binder it makes so: it makes millions, nothing
--- after it reads their records, and the table lives as long as the compile.
+-- An owner may instead number binders it keeps no record of
+-- (`unrecordedOwner`, `unrecorded`). `Turkey.Opt` numbers every binder it
+-- makes so: it makes millions, nothing after it reads their records, and the
+-- table lives as long as the compile. An owner is one kind or the other, and
+-- `fresh` and `unrecorded` each refuse the other kind, because both number
+-- from 0 and would hand out one id twice.
 --
 -- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
 -- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
@@ -91,6 +94,9 @@ type Owner = Owner {
     name       : String,
     moduleName : String,
     binders    : Vec Binder,
+    -- Whether `fresh` records the owner's binders here. When it does not,
+    -- whoever numbers them keeps the count.
+    recorded   : Bool,
 }
 
 type Table = Table {
@@ -120,15 +126,30 @@ let localLimit = Int.shl(1, localBits)
 
 -- Returns a new owner in the module `moduleName`, with no binders.
 fun owner(t : Table, moduleName : String, hint : String) -> Int {
-    Vec.push(t.owners, Owner { name = hint, moduleName = moduleName, binders = [] })
+    Vec.push(t.owners, Owner {
+        name = hint, moduleName = moduleName, binders = [], recorded = True,
+    })
+    len(t.owners) - 1
+}
+
+-- Returns a new owner in the module `moduleName` whose binders are numbered
+-- by `unrecorded`, with no record in the table.
+fun unrecordedOwner(t : Table, moduleName : String, hint : String) -> Int {
+    Vec.push(t.owners, Owner {
+        name = hint, moduleName = moduleName, binders = [], recorded = False,
+    })
     len(t.owners) - 1
 }
 
 -- Returns the id of a new binder in `ownerId`, the next local index after
--- the ones it already has. Writes only that owner's table.
+-- the ones it already has. Writes only that owner's table. Raises an internal
+-- error if `ownerId` came from `unrecordedOwner`.
 fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
           origin : Origin) -> Int {
     let o = t.owners[ownerId]
+    if !o.recorded {
+        error("Binders.fresh: owner '" + o.name + "' numbers its binders unrecorded")
+    }
     let (span, mutable, from, args) = match origin {
         Written(where, isVar) -> (Some(where), isVar, None, [])
         Generated(where) -> (Some(where), False, None, [])
@@ -161,9 +182,15 @@ fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
 fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
 
 -- Returns the id with the owner `ownerId` and the local index `local`, for a
--- binder the table keeps no record of. Its owner must hold no recorded
--- binders, or the two would share ids.
-fun unrecorded(ownerId : Int, local : Int) -> Int = Int.shl(ownerId, localBits) + local
+-- binder the table keeps no record of. Raises an internal error unless
+-- `ownerId` came from `unrecordedOwner`.
+fun unrecorded(t : Table, ownerId : Int, local : Int) -> Int {
+    if t.owners[ownerId].recorded {
+        error("Binders.unrecorded: owner '" + t.owners[ownerId].name
+              + "' records its binders")
+    }
+    Int.shl(ownerId, localBits) + local
+}
 
 -- Returns whether the table has a record of the binder `id`.
 fun recorded(t : Table, id : Int) -> Bool =

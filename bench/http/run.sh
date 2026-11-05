@@ -17,6 +17,10 @@
 #   stream      GET /stream, 1 MiB chunked, 64 connections
 #   tls         GET /hello over TLS: keep-alive by wrk (tls_keepalive), and
 #               a handshake per request by connload (tls_handshake)
+#   rate        GET /hello over 64 keep-alive connections at each of $RATES
+#               requests per second (default 5000 and 40000), driven by oha
+#               with its correction for coordinated omission: every server
+#               does the same work, so its CPU time and RSS compare directly
 #   client      each client against nginx: GET /hello, 1 and 64 at once
 #   idle        server RSS holding 10,000 idle keep-alive connections
 #
@@ -37,7 +41,9 @@
 # quiet: at least $IDLE_PCT percent idle (default 85) over one second of
 # `top`, checked every 60 seconds for at most 30 minutes, after which the run
 # goes ahead marked noisy. Peak RSS is the largest sum, over the server's
-# processes, of `ps` samples taken every half second during the run.
+# processes, of `ps` samples taken every half second during the run. CPU
+# time is the server's user and system time, over all its processes,
+# during the measured run alone.
 #
 # Results go to build/bench/http/results.tsv, one line per run; summarize.py
 # prints the median and the range of each configuration.
@@ -46,7 +52,7 @@
 # arm64 Linux runner. Needs: go, cargo, node, the Turkey compiler at
 # $TURKEY_BOOT (default build/stages/stage3, from `sh scripts/build.sh
 # --fixpoint`: a stage2 runs the bootstrap's older code generator), OpenSSL
-# 3 (Homebrew's openssl@3 on a Mac), and wrk, nginx and curl on PATH; on
+# 3 (Homebrew's openssl@3 on a Mac), and wrk, oha, nginx and curl on PATH; on
 # Linux, GNU time too. The context servers need python3 with uvicorn,
 # uvloop, httptools and gunicorn, ruby with puma, and a JDK (21 or later);
 # $SERVERS lists the servers to run, all of them by default.
@@ -64,6 +70,7 @@ CONNLOAD_PROCS=${CONNLOAD_PROCS:-8}
 REPS=${REPS:-3}
 SECONDS_PER_RUN=${SECONDS_PER_RUN:-10}
 IDLE_PCT=${IDLE_PCT:-85}
+RATES=${RATES:-"5000 40000"}
 PORT=18080
 CC=${TURKEY_CC:-cc}
 RESULTS=$OUT/results.tsv
@@ -237,6 +244,24 @@ rss() {
     ps -o rss= -p "$(pids | tr ' ' ',')" | awk '{ s += $1 } END { print s }'
 }
 
+# Prints the CPU time, user and system, in seconds, that the server's
+# processes have used so far. On Linux from /proc, since `ps` there gives
+# whole seconds.
+cputime() {
+    if [ "$OS" = Darwin ]; then
+        # [[dd-]hh:]mm:ss.ss
+        ps -o time= -p "$(pids | tr ' ' ',')" | awk '{
+            n = split($1, f, ":"); t = 0
+            for (i = 1; i <= n; i++) t = t * 60 + f[i]
+            s += t
+        } END { printf "%.2f\n", s }'
+    else
+        hz=$(getconf CLK_TCK)
+        for p in $(pids); do cat "/proc/$p/stat" 2> /dev/null; done |
+            awk -v hz="$hz" '{ sub(/^.*\) /, ""); s += $12 + $13 } END { printf "%.2f\n", s / hz }'
+    fi
+}
+
 # Samples rss() every half second until $OUT/sampled exists, then writes the
 # peak to it. Run it in the background beside the load. It stops on a file
 # rather than when the load's process ends, because a shell may not reap
@@ -253,8 +278,9 @@ sample() {
 }
 
 # Runs wrk against the server: SCENARIO IMPL CONNS MODE URL [wrk options],
-# with $SCRIPT_ARGS passed to wrk.lua, or connload in its place when the
-# options are `connload`. Records one line per repetition.
+# with $SCRIPT_ARGS passed to wrk.lua; or connload in its place when the
+# options are `connload`, or oha at a fixed rate when they are `oha RATE`.
+# Records one line per repetition.
 measure() {
     scenario=$1 impl=$2 conns=$3 mode=$4 url=$5
     shift 5
@@ -268,18 +294,30 @@ measure() {
             GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" 2 > /dev/null 2>&1 || true
             sample &
             sampler=$!
+            cpu0=$(cputime)
             GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" "$SECONDS_PER_RUN" > "$OUT/wrk.out" 2>&1 || true
+        elif [ "${1:-}" = oha ]; then
+            oha --no-tui --output-format quiet -c "$conns" -z 2s -q "$2" "$url" > /dev/null 2>&1 || true
+            sample &
+            sampler=$!
+            cpu0=$(cputime)
+            oha --no-tui --output-format json -c "$conns" -z "${SECONDS_PER_RUN}s" -q "$2" --latency-correction "$url" \
+                > "$OUT/oha.json" 2> /dev/null || true
+            python3 "$HERE/oha.py" "$OUT/oha.json" > "$OUT/wrk.out" 2>&1 || true
         else
             wrk -t"$threads" -c"$conns" -d2s -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > /dev/null 2>&1 || true
             sample &
             sampler=$!
+            cpu0=$(cputime)
             wrk -t"$threads" -c"$conns" -d"${SECONDS_PER_RUN}s" -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > "$OUT/wrk.out" 2>&1 || true
         fi
+        cpu=$(awk -v a="$cpu0" -v b="$(cputime)" 'BEGIN { printf "%.2f", b - a }')
         touch "$OUT/sampled"
         wait $sampler || true
         top=$(cat "$OUT/sampled")
         stop
         line=$(grep '^rps=' "$OUT/wrk.out" || { cat "$OUT/wrk.out" >&2; echo "rps=0"; })
+        line="$line cpu_s=$cpu secs=$SECONDS_PER_RUN"
         echo "  $scenario $impl c=$conns #$rep: $line rss_kb=$top $state"
         printf '%s\t%s\t%s\t%s\t%s\trss_kb=%s\t%s\n' "$scenario" "$impl" "$conns" "$rep" "$line" "$top" "$state" >> "$RESULTS"
     done
@@ -291,6 +329,12 @@ s=https://127.0.0.1:$PORT
 scenario_keepalive() {
     for conns in 1 64 256; do
         for impl in $servers; do measure keepalive $impl $conns plain $u/hello; done
+    done
+}
+
+scenario_rate() {
+    for rate in $RATES; do
+        for impl in $servers; do measure "rate-$rate" $impl 64 plain $u/hello oha "$rate"; done
     done
 }
 
@@ -408,6 +452,7 @@ versions() {
         echo "node $(node --version)"
         nginx -v 2>&1
         wrk -v 2>&1 | head -1
+        oha --version 2>&1
         curl --version | head -1
         python3 -c 'import sys, uvicorn, uvloop, httptools, gunicorn; print("python", sys.version.split()[0], "uvicorn", uvicorn.__version__, "uvloop", uvloop.__version__, "httptools", httptools.__version__, "gunicorn", gunicorn.__version__)' 2>&1
         ruby --version 2>&1
@@ -422,7 +467,7 @@ if [ "${1:-}" = build ]; then
 fi
 build
 versions
-all="keepalive close download upload stream tls client idle"
+all="keepalive close download upload stream tls rate client idle"
 for sc in ${*:-$all}; do
     echo "== $sc"
     scenario_$sc

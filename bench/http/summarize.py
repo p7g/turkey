@@ -16,6 +16,7 @@ COLUMNS = {
     "p99_us": "p99 µs",
     "p999_us": "p99.9 µs",
     "rss_kb": "peak RSS MiB",
+    "cpu_us": "CPU µs/req",
     "before_kb": "RSS after 1 req, MiB",
     "held_kb": "RSS with 10k idle, MiB",
     "errors": "errors",
@@ -40,7 +41,7 @@ def cell(key, values):
         values = [v / 1024 for v in values]
     med = statistics.median(values)
     lo, hi = min(values), max(values)
-    digits = 1 if key == "mibps" or key.endswith("_kb") else 0
+    digits = 1 if key in ("mibps", "cpu_us") or key.endswith("_kb") else 0
     fmt = f"{{:,.{digits}f}}"
     if lo == hi:
         return fmt.format(med)
@@ -63,6 +64,9 @@ def main():
         # reads, so its throughput is one MiB per request.
         if scenario == "upload" and "rps" in r:
             r["mibps"] = r["rps"]
+        # The server's CPU time over the run, per request it served.
+        if r.get("cpu_s") and r.get("rps") and r.get("secs"):
+            r["cpu_us"] = r["cpu_s"] * 1e6 / (r["rps"] * r["secs"])
         runs[(scenario, impl, int(conns))].append(r)
         if parts[-1] == "noisy":
             noisy[(scenario, impl, int(conns))] += 1

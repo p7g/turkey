@@ -1,6 +1,6 @@
 export (
     Socket, Listener, connect, listen, accept, shutdownWrite, close, closeListener,
-    setDeadline, clearDeadline, localAddress, peerAddress, listenerAddress,
+    setDeadline, clearDeadline, setLimits, localAddress, peerAddress, listenerAddress,
 )
 
 -- TCP connections: a `Socket` to read and write, and a `Listener` that
@@ -52,6 +52,7 @@ export (
 import Net (Connection(..), HasConnectionInfo(..), ConnectionInfo(..), accept, closeListener)
 import Net as Net
 import Time (Timeout(..))
+import Time.Duration as Duration
 import Turkey.Buffer (Buffer(..))
 import Turkey.ConnectPolicy (Destination(..))
 import Turkey.ConnectPolicy as ConnectPolicy
@@ -64,9 +65,10 @@ import Turkey.Socket as Calls
 import Turkey.Sys as Sys
 
 -- A connection: its descriptor, the point every read and write on it gives up
--- at (on `Turkey.Wait.now`'s clock, or -1), and what its errors name: the
--- host and port it was connected to, or the peer it was accepted from.
-type Socket = Socket { fd : FD.FD, var deadline : Int, name : Option String }
+-- at (on `Turkey.Wait.now`'s clock, or -1), the nanoseconds each may wait from
+-- its first wait (or -1), and what its errors name: the host and port it was
+-- connected to, or the peer it was accepted from.
+type Socket = Socket { fd : FD.FD, var deadline : Int, var each : Int, name : Option String }
 
 -- A listening socket, and the address and port it is bound to.
 type Listener = Listener { fd : FD.FD, address : (IP, Int) }
@@ -79,7 +81,7 @@ instance Read Socket {
     type ReadError = IOError
     fun readInto(s, into) {
         needsRoom(into)
-        let n = FD.readBy(s.fd, into.storage, into.end, into.limit, s.deadline)
+        let n = FD.readWithin(s.fd, into.storage, into.end, into.limit, s.deadline, s.each)
         if n < 0 { return Left(failure("read", s.name, n)) }
         into.end = into.end + n
         Right(n)
@@ -91,8 +93,8 @@ instance Write Socket {
     fun writeFrom(s, from) {
         let storage = from.storage
         let to = from.end
-        let n = FD.writeWith(s.fd, fun(number, at) = Calls.send(number, storage, at, to),
-                             from.start, to, s.deadline)
+        let n = FD.writeWithin(s.fd, fun(number, at) = Calls.send(number, storage, at, to),
+                               from.start, to, s.deadline, s.each)
         if n < 0 { Left(failure("write", s.name, n)) } else { Right(()) }
     }
     -- Nothing is held back: each write is sent.
@@ -110,7 +112,7 @@ fun connect[Timeout t](d : Destination, timeout : t) -> Either IOError Socket {
     for ip in d.addresses {
         let r = attempt(ip, d.port, deadline)
         match r {
-            Right(fd) -> return Right(Socket { fd, deadline = -1, name })
+            Right(fd) -> return Right(Socket { fd, deadline = -1, each = -1, name })
             Left(n) -> {
                 if !movesOn(n) { return Left(failure("connect", name, n)) }
                 last = n
@@ -197,7 +199,7 @@ fun acceptNext(l : Listener) -> Either IOError Socket {
         Right((ip, port)) -> Some(endpoint(show(ip), port))
         Left(_) -> None
     }
-    Right(Socket { fd = FD.fd(n), deadline = -1, name })
+    Right(Socket { fd = FD.fd(n), deadline = -1, each = -1, name })
 }
 
 -- The address and port `l` is bound to.
@@ -207,12 +209,23 @@ fun listenerAddress(l : Listener) -> (IP, Int) = l.address
 
 -- `shutdownWrite` waits for a write in progress to finish, so it never lands
 -- inside one. A deadline bounds every read and write from when it is set.
+-- `setLimits`' `each` starts at an operation's first wait, so a read or write
+-- that does not wait reads no clock for it.
 instance Connection Socket {
     fun setDeadline(s, timeout) {
         s.deadline = ConnectPolicy.limit(timeout)
+        s.each = -1
     }
     fun clearDeadline(s) {
         s.deadline = -1
+        s.each = -1
+    }
+    fun setLimits(s, deadline, each) {
+        s.deadline = match deadline {
+            Some(d) -> ConnectPolicy.limit(d)
+            None -> -1
+        }
+        s.each = max(Duration.toNanos(each), 0)
     }
     fun shutdownWrite(s) {
         let r = FD.writingWith(s.fd, fun(n) = Calls.shutdownWrite(n), -1)

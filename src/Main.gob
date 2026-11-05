@@ -64,6 +64,7 @@ import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
+import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Polls as Polls
@@ -120,7 +121,7 @@ fun millis(d : Duration) -> String {
 -- What `--dump` can name, in the order the stages run. Its position is how far
 -- a compile has to go to print it.
 let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
-              "select", "listing"]
+              "select", "listing", "positions"]
 
 -- Where `check` stops when no dump asks for more: lowering to Core, the last
 -- stage that can reject a program. Everything after it reports only internal
@@ -322,7 +323,9 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name), slotNames(checked))) }
     write(String.drain(b))
     if through("opt") { return }
-    let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, path)
+    let files = Position.files(checked.files)
+    let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, files,
+                                         path)
     at = lap("ssa", at)
     if wants("ssa") { dumpSsa(b, module_, skipped) }
     write(String.drain(b))
@@ -337,6 +340,13 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("listing") {
         Vec.push(outs, Out { text = b, sink = Some(ToStdout), apart = False,
                                render = fun(d, code, t) { Encode.listing(listing, code, t) } })
+    }
+    let coverage = newCoverage()
+    if wants("positions") {
+        Vec.push(outs, Out { text = b, sink = Some(ToStdout), apart = False,
+                               render = fun(d, code, t) {
+                                   showPositions(d, files, coverage, code, t)
+                               } })
     }
     match sink {
         Some(Sink { to, format = Object }) -> {
@@ -364,6 +374,90 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             let _ = emitModule(path, entry, module_, outs)
         }
         None -> { let _ = emitModule(path, entry, module_, outs) }
+    }
+    if wants("positions") {
+        showCoverage(coverage, b)
+        write(String.drain(b))
+    }
+}
+
+-- -- the `positions` dump ----------------------------------------------------
+
+-- How many instructions the `positions` dump has seen, and which had no
+-- source position, by opcode and by the function they are in.
+type Coverage = Coverage {
+    var instructions : Int,
+    var missing      : Int,
+    byOpcode         : Map String Int,
+    byFunction       : Map String Int,
+    -- The function the instructions being read are in, or the empty string
+    -- outside every function.
+    var function     : String,
+}
+
+fun newCoverage() -> Coverage =
+    Coverage { instructions = 0, missing = 0, byOpcode = Map.new(), byFunction = Map.new(),
+               function = "" }
+
+-- Appends `code`'s labels and instructions to `b`, each instruction with its
+-- position, counts them into `coverage`, and empties `code`.
+--
+-- The position is printed here, beside `show`, never by it: `Show` of an
+-- instruction prints no position (`Turkey.Arm64.Inst`).
+fun showPositions(d : Asm.Dialect, files : Position.Files, coverage : Coverage,
+                  code : Vec (Stream.Item Arm64.Inst), b : String.Builder) -> Unit {
+    for item in code {
+        match item {
+            Stream.FunctionType(symbol) -> { coverage.function = symbol.name }
+            Stream.Section(_) -> { coverage.function = "" }
+            Stream.Label(symbol) -> String.push(b, Asm.spell(symbol) + ":\n")
+            Stream.Instruction(i) -> {
+                let text = show(i)
+                String.push(b, "    " + text)
+                let width = String.byteLength(text)
+                if width < 40 { String.push(b, String.repeat(" ", 40 - width)) }
+                String.push(b, " ; " + Position.describe(files, i.at) + "\n")
+                coverage.instructions = coverage.instructions + 1
+                if i.at == 0 {
+                    coverage.missing = coverage.missing + 1
+                    let opcode = match String.splitOnce(text, " ") {
+                        Some((first, _)) -> first
+                        None -> text
+                    }
+                    bump(coverage.byOpcode, opcode)
+                    bump(coverage.byFunction,
+                         if coverage.function == "" { "(outside any function)" }
+                         else { coverage.function })
+                }
+            }
+            _ -> {}
+        }
+    }
+    Vec.clear(code)
+}
+
+fun bump(counts : Map String Int, key : String) -> Unit =
+    Map.put(counts, key, Map.getOr(counts, key, 0) + 1)
+
+-- Appends the totals to `b`: the fraction of instructions with no position,
+-- then the opcodes and the functions that have most of them.
+fun showCoverage(c : Coverage, b : String.Builder) -> Unit {
+    let tenths = if c.instructions == 0 { 0 } else { c.missing * 1000 / c.instructions }
+    String.push(b, "-- positions: " + Int.toString(c.missing) + " of "
+                   + Int.toString(c.instructions) + " instructions have none ("
+                   + Int.toString(tenths / 10) + "." + Int.toString(tenths % 10) + "%)\n")
+    String.push(b, "-- without a position, by opcode:\n")
+    showCounts(c.byOpcode, len(c.byOpcode), b)
+    String.push(b, "-- without a position, by function (the 20 with most):\n")
+    showCounts(c.byFunction, 20, b)
+}
+
+-- The `most` largest of `counts`, largest first and then by name.
+fun showCounts(counts : Map String Int, most : Int, b : String.Builder) -> Unit {
+    let sorted = Vec.sortBy(Vec.fromArray(Map.entries(counts)), fun(x, y) =
+        if x.1 != y.1 { Array.threeWay(y.1, x.1) } else { Array.threeWay(x.0, y.0) })
+    for var k = 0; k < len(sorted) && k < most; k = k + 1 {
+        String.push(b, "--   " + Int.toString(sorted[k].1) + "\t" + sorted[k].0 + "\n")
     }
 }
 
@@ -555,20 +649,22 @@ fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
     -- Each step's time, for `--timings`, under `opt.`.
     var at = Stopwatch.start()
     let callSites = keepsCallSites()
-    let first = Opt.reduceProgram(specialized, checked.decls, callSites)
+    let first = Opt.reduceProgram(specialized, checked.decls, checked.binders, callSites)
     at = lap("opt.reduce", at)
     let discovered = Joins.discover(first)
     at = lap("opt.joins", at)
-    let second = Opt.reduceProgram(discovered, checked.decls, callSites)
+    let second = Opt.reduceProgram(discovered, checked.decls, checked.binders, callSites)
     at = lap("opt.reduce", at)
     -- Reachability again, now that the reductions have inlined calls away and
     -- folded the branches a constant decides: what only they reached is dead.
     let reduced = Mono.reachable(second, main, roots(checked), checked.decls.definitions,
                                  prunable(checked, Giblets.gibletModules(), _))
     at = lap("opt.reachable", at)
+    -- With `UniqueIds`, because every copy `Turkey.Opt` makes is given binders
+    -- of its own.
     Coretc.checkProgram(checked.decls, checked.classes, reduced,
                         Coretc.globalsOf(checked.env, checked.binders),
-                        Coretc.CopiedIds)
+                        Coretc.UniqueIds)
     at = lap("opt.check", at)
     -- Family applications reduced before the layouts are decided, since a stuck
     -- one has no representation and the backend would guess. See
@@ -655,9 +751,10 @@ fun roots(checked : Checked) -> Vec String =
 -- remove what the check objects to -- a literal on a branch proven dead, an
 -- allocation nothing reads -- and cannot make acceptable code unacceptable.
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
-                classes : Classes.ClassTable, path : String)
+                classes : Classes.ClassTable, files : Position.Files, path : String)
         -> (SsaLower.Module, Vec SsaLower.Unsupported) {
-    let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes))
+    let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes),
+                                                   files)
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
@@ -1290,6 +1387,9 @@ type Checked = Checked {
     library     : Set.Set String,
     -- Which binder each binding occurrence and reference means.
     binders     : Binders.Table,
+    -- Every module's file, in the order the modules were loaded: what a
+    -- source position's file number counts.
+    files       : Vec String,
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
@@ -1301,7 +1401,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
             Decls.newDeclTable()),
         env = initialEnv(binders), types = Typed.newTypeTable(),
         ordered = Vec.new(32), owners = Map.new(),
-        library = Set.new(), binders = binders,
+        library = Set.new(), binders = binders, files = [],
     }
     checked.classes = Classes.newClassTable(checked.decls)
     -- A component of modules is checked in one run: their bindings may use
@@ -1311,6 +1411,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         let owners = Map.new()
         let visibleByFile = Map.new()
         for m in group {
+            Vec.push(checked.files, m.file)
             if m.library { Set.add(checked.library, m.name) }
             Vec.push(programs, (m.name, m.program))
             for d in m.program.decls {

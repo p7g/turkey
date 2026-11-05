@@ -1,6 +1,6 @@
 export (
     Table(..), Owner(..), Binder(..), Kind(..), Origin(..),
-    newTable, owner, fresh, ownerOf, localOf, binderAt,
+    newTable, owner, unrecordedOwner, fresh, ownerOf, localOf, binderAt, unrecorded,
     declare, named, record, refer, leaveUnresolved,
     ownDeclaration, declarationOwner,
     checkReferences, checkInferred, methodRefs, boundIn, boundByPattern,
@@ -23,6 +23,13 @@ export (
 --
 -- Ids are process-local. They are never printed, and nothing persisted may be
 -- keyed by one; a binder's stable name is its `moduleName` and `name`.
+--
+-- An owner may instead number binders it keeps no record of
+-- (`unrecordedOwner`, `unrecorded`). `Turkey.Opt` numbers every binder it
+-- makes so: it makes millions, nothing after it reads their records, and the
+-- table lives as long as the compile. An owner is one kind or the other, and
+-- `fresh` and `unrecorded` each refuse the other kind, because both number
+-- from 0 and would hand out one id twice.
 --
 -- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
 -- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
@@ -55,13 +62,17 @@ type Origin
     | Generated(Span)
     -- A primitive.
     | Builtin
-    -- A copy of the binder with this id, whose span and mutability it takes.
+    -- A copy of the binder with this id, whose span and mutability it takes
+    -- when the table has a record of it.
     | CopyOf(Int)
     -- A copy of a polymorphic binding at these ground type arguments, made by
     -- `Turkey.Mono`. The binding is the one with the id, if it has one; the
     -- span is the binding's. A copy keyed by something other than its type
     -- arguments is a `CopyOf`.
     | Specialized(Option Int, Array Ty.Type, Option Span)
+    -- Made by a pass after `Turkey.Lower` for the term at the span, if it has
+    -- one, and not a copy of a recorded binder. Never a `var`.
+    | Synthesized(Option Span)
 
 type Binder = Binder {
     -- The source spelling, unqualified, or a hint for one the compiler made.
@@ -83,6 +94,9 @@ type Owner = Owner {
     name       : String,
     moduleName : String,
     binders    : Vec Binder,
+    -- Whether `fresh` records the owner's binders here. When it does not,
+    -- whoever numbers them keeps the count.
+    recorded   : Bool,
 }
 
 type Table = Table {
@@ -112,24 +126,42 @@ let localLimit = Int.shl(1, localBits)
 
 -- Returns a new owner in the module `moduleName`, with no binders.
 fun owner(t : Table, moduleName : String, hint : String) -> Int {
-    Vec.push(t.owners, Owner { name = hint, moduleName = moduleName, binders = [] })
+    Vec.push(t.owners, Owner {
+        name = hint, moduleName = moduleName, binders = [], recorded = True,
+    })
+    len(t.owners) - 1
+}
+
+-- Returns a new owner in the module `moduleName` whose binders are numbered
+-- by `unrecorded`, with no record in the table.
+fun unrecordedOwner(t : Table, moduleName : String, hint : String) -> Int {
+    Vec.push(t.owners, Owner {
+        name = hint, moduleName = moduleName, binders = [], recorded = False,
+    })
     len(t.owners) - 1
 }
 
 -- Returns the id of a new binder in `ownerId`, the next local index after
--- the ones it already has. Writes only that owner's table.
+-- the ones it already has. Writes only that owner's table. Raises an internal
+-- error if `ownerId` came from `unrecordedOwner`.
 fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
           origin : Origin) -> Int {
     let o = t.owners[ownerId]
+    if !o.recorded {
+        error("Binders.fresh: owner '" + o.name + "' numbers its binders unrecorded")
+    }
     let (span, mutable, from, args) = match origin {
         Written(where, isVar) -> (Some(where), isVar, None, [])
         Generated(where) -> (Some(where), False, None, [])
         Builtin -> (None, False, None, [])
-        CopyOf(id) -> {
+        CopyOf(id) -> if recorded(t, id) {
             let b = binderAt(t, id)
             (b.span, b.mutable, Some(id), [])
+        } else {
+            (None, False, Some(id), [])
         }
         Specialized(id, types, where) -> (where, False, id, types)
+        Synthesized(where) -> (where, False, None, [])
     }
     let local = len(o.binders)
     if local >= localLimit {
@@ -148,6 +180,21 @@ fun ownerOf(id : Int) -> Int = Int.shr(id, localBits)
 fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
 
 fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
+
+-- Returns the id with the owner `ownerId` and the local index `local`, for a
+-- binder the table keeps no record of. Raises an internal error unless
+-- `ownerId` came from `unrecordedOwner`.
+fun unrecorded(t : Table, ownerId : Int, local : Int) -> Int {
+    if t.owners[ownerId].recorded {
+        error("Binders.unrecorded: owner '" + t.owners[ownerId].name
+              + "' records its binders")
+    }
+    Int.shl(ownerId, localBits) + local
+}
+
+-- Returns whether the table has a record of the binder `id`.
+fun recorded(t : Table, id : Int) -> Bool =
+    id >= 0 && localOf(id) < len(t.owners[ownerOf(id)].binders)
 
 -- Returns the id of a new binder in `ownerId`, which references resolved to
 -- `internal` mean. A second declaration of `internal` still gets a binder of

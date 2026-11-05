@@ -39,6 +39,7 @@ import Turkey.Layout as Layout
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      AtomicOp(..), Callee(..), Builder(..), IndexCheck(..))
+import Turkey.Position as Position
 import Turkey.Prims as Prims
 import Turkey.Runtime as Rt
 import Turkey.LocalEscape as LocalEscape
@@ -105,7 +106,8 @@ type Lifting = Lifting {
     -- apart -- and it does not depend on the order the bindings are lowered
     -- in, which is any order (`lowerProgram`).
     var next : Int,
-
+    -- The program's source files, which every position is numbered against.
+    files : Position.Files,
 }
 
 -- A whole program's low IR: the functions, the storage the module initializer
@@ -130,6 +132,9 @@ type Module = Module {
 }
 
 let initializerName = "%module.initialize"
+
+-- The file table of code the compiler writes with no source behind it.
+let noFiles = Position.files([])
 
 type Lower = Lower {
     decls   : DeclTable,
@@ -477,8 +482,10 @@ fun argsFor(l : Lower, target : BlockId, values : Array Value) -> Vec Value {
 -- -- lowering -----------------------------------------------------------------------
 
 -- `classes` are the program's classes, whose dictionaries are numbered beside
--- its constructors (`tagsOf`).
-fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
+-- its constructors (`tagsOf`). `files` numbers the program's source files for
+-- the positions every instruction carries.
+fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
+                 files : Position.Files)
         -> (Module, Vec Unsupported) {
     let done : Vec (Ssa.Func Low) = []
     let skipped : Vec Unsupported = []
@@ -500,7 +507,8 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
     -- reads the tables above and writes only what it makes.
     let all = Vec.append(program.dicts, program.binds)
     let made = Parallel.map(all, fun(bind) =
-        lowerBind(bind, decls, globals, globalRefs, tags, sigs, Lifting { next = 0 }))
+        lowerBind(bind, decls, globals, globalRefs, tags, sigs,
+                  Lifting { next = 0, files = files }))
     for var i = 0; i < len(all); i = i + 1 {
         let bind = all[i]
         let (f, lifted, why) = made[i]
@@ -523,7 +531,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
     }
     -- Global initializers can also introduce lifted lambdas.
     let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
-                                              sigs, Lifting { next = 0 })
+                                              sigs, Lifting { next = 0, files = files })
     Vec.push(done, init)
     Vec.push(done, early)
     for g in lifted { Vec.push(done, g) }
@@ -580,7 +588,7 @@ fun adaptClosures(m : Module, sigs : Map String Signature) -> Unit {
 fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
     let boxes = len(sig.results) > 1
     let f = Ssa.newFunc(symbol, if boxes { [Ssa.traced(Ptr)] } else { sig.results })
-    let b = L.builder(f, BlockId(0))
+    let b = L.builder(f, BlockId(0), noFiles)
     L.into(b, L.block(b))
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let args = [L.emit(b, ConstInt(0), Ssa.traced(Ptr))]
@@ -664,7 +672,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     if len(objects) == 0 { return }
     -- A new entry block runs before all user initializers. Publish each
     -- object immediately: allocating the next one may collect under stress.
-    let b = L.builder(init, init.entry)
+    let b = L.builder(init, init.entry, noFiles)
     let start = L.block(b)
     L.into(b, start)
     for (name, shape) in objects {
@@ -1075,6 +1083,10 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, bind.layouts, [],
                      shared)
+    f.at = match bind.span {
+        Some(s) -> Position.fromSpan(l.b.files, s)
+        None -> 0
+    }
     let entry = L.block(l.b)
     L.into(l.b, entry)
     for var i = 0; i < len(params); i = i + 1 {
@@ -1113,7 +1125,7 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              tags : Map String Int,
              sigs : Map String Signature, layouts : Map String Ssa.Layout,
              lifted : Vec (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
-    decls = decls, func = f, b = L.builder(f, BlockId(0)),
+    decls = decls, func = f, b = L.builder(f, BlockId(0), shared.files),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
     sigs = sigs, layouts = layouts, lifted = lifted,
@@ -1285,8 +1297,19 @@ fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
         _ -> None
     }
 
--- Lower `e`, sending its value to `dest`.
+-- Lower `e`, sending its value to `dest`, with the builder's source position
+-- on it for the duration, as `value` has.
 fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
+    let outer = l.b.span
+    match e.span {
+        Some(_) -> { l.b.span = e.span }
+        None -> {}
+    }
+    lowerHere(l, e, dest)
+    l.b.span = outer
+}
+
+fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
     match l.stopped {
         Some(_) -> return
         None -> {}
@@ -2432,6 +2455,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     l.shared.next = l.shared.next + 1
     -- The body and every call site derive the signature from its types.
     let g = Ssa.newFunc(symbol, [repOf(l, result)])
+    g.at = L.here(l.b)
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
     -- forgot them would read its captures at the boxed width.
@@ -2447,6 +2471,9 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- layouts starts afresh (`setLayouts`) rather than emptying these.
     child.held.layouts = l.held.layouts
     child.held.flats = l.held.flats
+    -- What the body does before its own first node, reading the environment
+    -- and the parameters, is the lambda's.
+    child.b.span = l.b.span
     let entry = L.block(child.b)
     L.into(child.b, entry)
     -- The environment comes first and is not the closure: the callee is handed
@@ -3526,8 +3553,10 @@ fun initializer(program : CProgram, decls : DeclTable,
     let held = Map.new()
     for (name, r) in storage { Map.put(held, name, r) }
     let layouts = Map.new()
+    let spans = Map.new()
     for bind in Vec.append(program.dicts, program.binds) {
         Map.put(layouts, bind.name, bind.layouts)
+        Map.put(spans, bind.name, bind.span)
     }
 
     let actions : Vec Action = []
@@ -3563,9 +3592,9 @@ fun initializer(program : CProgram, decls : DeclTable,
         }
     }
     let (early, earlyLifted) = lowerActions(Giblets.initializerName, earlyActions,
-        decls, globals, globalRefs, tags, sigs, shared, layouts, held)
+        decls, globals, globalRefs, tags, sigs, shared, layouts, spans, held)
     let (init, lifted) = lowerActions(initializerName, actions,
-        decls, globals, globalRefs, tags, sigs, shared, layouts, held)
+        decls, globals, globalRefs, tags, sigs, shared, layouts, spans, held)
     (init, early, Array.append(earlyLifted, lifted), storage)
 }
 
@@ -3576,7 +3605,8 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
                  tags : Map String Int,
                  sigs : Map String Signature, shared : Lifting,
-                 layouts : Map String (Map String Ssa.Layout), held : Map String Rep)
+                 layouts : Map String (Map String Ssa.Layout),
+                 spans : Map String (Option Span), held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
     let f = Ssa.newFunc(name, [Ssa.untraced(Unit)])
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, Map.new(), [], shared)
@@ -3585,6 +3615,10 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
         let owner = ownerOf(a)
         -- The owning binding's layouts, restored per action.
         setLayouts(l, Map.getOr(layouts, owner, Map.new()))
+        -- The owning binding's position, which what the action lowers to
+        -- takes where its own nodes have none: a dictionary is built from
+        -- nodes the compiler made.
+        l.b.span = Map.getOr(spans, owner, None)
         l.env = Map.new()
         l.joins = Map.new()
         l.stopped = None

@@ -1,0 +1,117 @@
+export (Files(..), files, fileName, Cache, cache, fromSpan, pack, notStmt, isStmt,
+        line, column, file, site, describe)
+
+-- A source position packed into one `Int`, as every instruction from the low
+-- IR to emission carries it.
+--
+-- From the low bit:
+--
+-- | field   | bits | meaning                                            |
+-- |---------|------|----------------------------------------------------|
+-- | notStmt | 1    | the position is not a stepping target              |
+-- | column  | 10   | 0 unknown, saturates at 1023                       |
+-- | line    | 20   | 0 means no position at all, saturates at 1,048,575 |
+-- | file    | 14   | index into the program's `Files`, from 1           |
+-- | site    | 18   | inline site, 0 when not inlined                    |
+--
+-- The whole is 63 bits, so a position is never negative. A position with no
+-- line is 0 in every bit, whatever else was asked for: `notStmt(0)` is 0.
+--
+-- One word rather than a `Span` because it rides on every instruction, and a
+-- word costs nothing to copy and nothing to trace. It is decoded only to be
+-- printed or written as debug information, never to decide code.
+
+import Turkey.Source (Span(..))
+
+let columnShift = 1
+let lineShift = 11
+let fileShift = 31
+let siteShift = 45
+
+let columnMax = 1023
+let lineMax = 1048575
+let fileMax = 16383
+let siteMax = 262143
+
+-- The program's source files, numbered from 1 in the order they were given.
+--
+-- Built once, before lowering, and only read after that, so the lowering's
+-- workers share one.
+type Files = Files {
+    names : Array String,
+    index : Map String Int,
+}
+
+-- Returns the table numbering `names` from 1, in order. A name given twice
+-- keeps its first number.
+fun files(names : Vec String) -> Files {
+    let index = Map.new()
+    let kept = []
+    for name in names {
+        if Option.isNone(Map.get(index, name)) && len(kept) < fileMax {
+            Vec.push(kept, name)
+            Map.put(index, name, len(kept))
+        }
+    }
+    Files { names = Vec.toArray(kept), index = index }
+}
+
+-- Returns the name of file `n`, or `None` for 0 or a number the table does
+-- not have.
+fun fileName(fs : Files, n : Int) -> Option String =
+    if n >= 1 && n <= len(fs.names) { Some(fs.names[n - 1]) } else { None }
+
+-- A one-entry memo of the last file looked up. Consecutive spans are almost
+-- always in one file, so comparing a span's path with the last one replaces a
+-- hash and a table lookup per instruction.
+type Cache = Cache {
+    files     : Files,
+    var name  : String,
+    var found : Int,
+}
+
+fun cache(fs : Files) -> Cache = Cache { files = fs, name = "", found = 0 }
+
+-- Returns the position of the start of `s`, a statement, or 0 when `s` is in
+-- a file the table does not have.
+fun fromSpan(c : Cache, s : Span) -> Int {
+    if s.file != c.name {
+        c.name = s.file
+        c.found = Map.getOr(c.files.index, s.file, 0)
+    }
+    if c.found == 0 { 0 } else { pack(c.found, s.line, s.col) }
+}
+
+-- Returns the statement position `file:line:col`, outside any inline site.
+-- Each field saturates at its width; a line below 1 gives 0.
+fun pack(fileNumber : Int, lineNumber : Int, col : Int) -> Int =
+    if lineNumber < 1 || fileNumber < 1 { 0 }
+    else {
+        (clamp(fileNumber, fileMax) << fileShift)
+            | (clamp(lineNumber, lineMax) << lineShift)
+            | (clamp(col, columnMax) << columnShift)
+    }
+
+fun clamp(n : Int, most : Int) -> Int = if n < 0 { 0 } else if n > most { most } else { n }
+
+-- Returns `p` marked as not a stepping target: a spill, a reload, a copy.
+fun notStmt(p : Int) -> Int = if p == 0 { 0 } else { p | 1 }
+
+fun isStmt(p : Int) -> Bool = (p & 1) == 0
+
+fun line(p : Int) -> Int = (p >> lineShift) & lineMax
+
+fun column(p : Int) -> Int = (p >> columnShift) & columnMax
+
+fun file(p : Int) -> Int = (p >> fileShift) & fileMax
+
+fun site(p : Int) -> Int = (p >> siteShift) & siteMax
+
+-- Returns `p` as `file:line:col` for a dump, with ` ns` after a position that
+-- is not a statement, and `-` for 0.
+fun describe(fs : Files, p : Int) -> String =
+    if p == 0 { "-" }
+    else {
+        Option.unwrapOr(fileName(fs, file(p)), "?") + ":" + Int.toString(line(p)) + ":"
+            + Int.toString(column(p)) + (if isStmt(p) { "" } else { " ns" })
+    }

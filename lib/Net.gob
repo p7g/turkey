@@ -3,6 +3,7 @@ export (
     ConnectPolicy, ConnectRule(..), publicInternet, allowlist, anywhere,
     Destination, resolve, host, port, addresses,
     Connection(..), Listener(..), HasConnectionInfo(..), ConnectionInfo(..), TLSInfo(..),
+    operationDeadline,
 )
 
 -- Names to addresses, and where a program may connect: what a host name
@@ -91,6 +92,8 @@ export (
 -- that has some addresses it refuses keeps only the others.
 
 import Time (Timeout(..))
+import Time.Deadline as Deadline (Deadline)
+import Time.Duration (Duration)
 import Turkey.ConnectPolicy (ConnectPolicy, ConnectRule(..), Destination(..))
 import Turkey.ConnectPolicy as ConnectPolicy
 import Turkey.Errors (IOError)
@@ -157,12 +160,32 @@ class Connection c : Read c, Write c {
     fun setDeadline[Timeout t](c, t) -> Unit
     -- Let reads and writes on `c` wait without limit again.
     fun clearDeadline(c) -> Unit
+    -- Bound every read and write on `c` from now on by `deadline`, if there
+    -- is one, and each of them by `each` from when it begins. One that
+    -- reaches either is `TimedOut`. Replaces what
+    -- `setDeadline` set, as it and `clearDeadline` replace this.
+    --
+    -- An instance may start an operation's `each` at its first wait rather
+    -- than when it begins, since nothing between the two waits. A connection
+    -- whose two directions share one deadline underneath may let an
+    -- operation that begins extend one under way in the other direction.
+    fun setLimits(c, Option Deadline, Duration) -> Unit
     -- Send the end of input: the peer reads it after everything written
     -- before, and can go on writing. A write after it fails.
     fun shutdownWrite(c) -> Either (WriteError c) Unit
     -- Close `c`. A read or a write parked on it, in any task, ends with
     -- `Closed`, as does every later one. Closing it again does nothing.
     fun close(c) -> Either (WriteError c) Unit
+}
+
+-- Returns the deadline of an operation that begins now under `setLimits`'
+-- `deadline` and `each`: the sooner of the two.
+fun operationDeadline(deadline : Option Deadline, each : Duration) -> Deadline {
+    let own = Deadline.after(each)
+    match deadline {
+        Some(d) -> min(d, own)
+        None -> own
+    }
 }
 
 -- Where connections arrive: a TCP listener, a TLS acceptor over one, or an

@@ -20,8 +20,9 @@ export (Pipe, Listener, pair, listener, connect, accept, closeListener)
 --   writing, fails with `BrokenPipe`.
 -- * `close` ends every read and write parked on this end, in any task, with
 --   `Closed`, as it does every later one.
--- * A deadline bounds every read and write from when it is set; one that
---   passes is `TimedOut`.
+-- * A deadline bounds every read and write from when it is set, and
+--   `setLimits`' `each` each one from when it begins; one that passes is
+--   `TimedOut`.
 --
 -- Waiting suspends the task, as waiting on a socket does, so the far end
 -- may be served by another task of the same program.
@@ -32,6 +33,7 @@ import System.Sync as Sync
 import System.Sync (Condition, Mutex)
 import Time (Timeout(..))
 import Time.Deadline (Deadline)
+import Time.Duration (Duration)
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
 import Turkey.Errors (IOError(..), ErrorKind(..))
@@ -63,6 +65,8 @@ type Pipe = Pipe {
     shared       : Shared
     side         : Int
     var deadline : Option Deadline
+    -- How long each read or write may take, from when it begins.
+    var each     : Option Duration
     var closed   : Bool
 }
 
@@ -78,8 +82,8 @@ fun pair(capacity : Int) -> (Pipe, Pipe) {
         flows
         changed = [Sync.condition(flows), Sync.condition(flows)]
     }
-    (Pipe { shared, side = 0, deadline = None, closed = False },
-     Pipe { shared, side = 1, deadline = None, closed = False })
+    (Pipe { shared, side = 0, deadline = None, each = None, closed = False },
+     Pipe { shared, side = 1, deadline = None, each = None, closed = False })
 }
 
 fun ioError(kind : ErrorKind, op : String) -> IOError = IOError { kind, op, path = None }
@@ -89,14 +93,21 @@ fun peer(p : Pipe) -> Int = 1 - p.side
 -- Wakes every task waiting on end `side`.
 fun wake(shared : Shared, side : Int) -> Unit = Sync.notifyAll(shared.changed[side])
 
+-- Returns the deadline of a read or write of `p` that begins now.
+fun limitOf(p : Pipe) -> Option Deadline = match p.each {
+    Some(e) -> Some(Net.operationDeadline(p.deadline, e))
+    None -> p.deadline
+}
+
 -- Runs `look` on the flows, with the lock held, until it returns `Some`, and
 -- returns what that holds: at once, or after a change that wakes end
--- `p.side`. A wait that reaches the deadline is `TimedOut`, and a close of
--- this end, `Closed`.
-fun waitOnFlows(p : Pipe, op : String, look : fun(Array Flow) -> Option (Either IOError a)) -> Either IOError a {
+-- `p.side`. A wait that reaches `by`, the deadline of the read or write it
+-- is part of, is `TimedOut`, and a close of this end, `Closed`.
+fun waitOnFlows(p : Pipe, op : String, by : Option Deadline,
+                look : fun(Array Flow) -> Option (Either IOError a)) -> Either IOError a {
     let ready = fun(flows) = if p.closed { Some(Left(ioError(Closed, op))) } else { look(flows) }
     let changed = p.shared.changed[p.side]
-    if let Some(d) = p.deadline {
+    if let Some(d) = by {
         Option.unwrapOr(Sync.waitFor(changed, d, ready), Left(ioError(TimedOut, op)))
     } else {
         Sync.waitForUnbounded(changed, ready)
@@ -108,7 +119,7 @@ instance Read Pipe {
     fun readInto(p, into) {
         needsRoom(into)
         let side = p.side
-        let got = waitOnFlows(p, "read", fun(flows) {
+        let got = waitOnFlows(p, "read", limitOf(p), fun(flows) {
             let f = flows[side]
             let held = f.held
             let n = held.end - held.start
@@ -137,10 +148,11 @@ instance Write Pipe {
 -- reads.
 fun writeAll(p : Pipe, from : Buffer) -> Either IOError Unit {
     let side = peer(p)
+    let by = limitOf(p)
     var at = from.start
     while at < from.end {
         let start = at
-        let moved = waitOnFlows(p, "write", fun(flows) {
+        let moved = waitOnFlows(p, "write", by, fun(flows) {
             let f = flows[side]
             if f.abandoned || f.ended {
                 return Some(Left(ioError(BrokenPipe, "write")))
@@ -172,9 +184,15 @@ instance HasConnectionInfo Pipe {
 instance Connection Pipe {
     fun setDeadline(p, timeout) {
         p.deadline = Some(deadline(timeout))
+        p.each = None
     }
     fun clearDeadline(p) {
         p.deadline = None
+        p.each = None
+    }
+    fun setLimits(p, deadline, each) {
+        p.deadline = deadline
+        p.each = Some(each)
     }
     fun shutdownWrite(p) {
         if p.closed {

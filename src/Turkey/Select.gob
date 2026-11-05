@@ -43,6 +43,7 @@ import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(
 import Turkey.Asm as Asm
 import Turkey.Clean as Clean
 import Turkey.Asm (Asm(..))
+import Turkey.Position as Position
 import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
 import Turkey.Runtime (Entry(..))
@@ -103,6 +104,8 @@ type Sel = Sel {
     -- that answers in several registers. Shared by every function, and only
     -- read.
     results : Map String (Array Rep),
+    -- The position what is emitted next takes (`emit`).
+    var pos : Int,
 }
 
 -- `text`'s symbol, recorded as one this function names.
@@ -111,8 +114,10 @@ fun messageOf(s : Sel, text : String) -> Asm.Symbol {
     Asm.messageName(s.asm.dialect, text)
 }
 
+-- Every machine instruction and terminator takes `s.pos`, the position of the
+-- low instruction or terminator being selected, guards and checks included.
 fun emit(s : Sel, op : A.Arm) -> Unit {
-    Vec.push(s.out.blocks[s.at].insts, Inst { op = op })
+    Vec.push(s.out.blocks[s.at].insts, Inst { op = op, at = s.pos })
 }
 
 fun stop(s : Sel, what : String) -> Unit {
@@ -200,6 +205,7 @@ fun selectModule(m : Module, target : Target.Target, sizesRecorded : Bool)
 fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool,
           results : Map String (Array Rep)) -> Sel {
     let g = Ssa.newFunc(f.name, f.results)
+    g.at = f.at
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
     for r in f.reps { Vec.push(g.reps, r) }
@@ -215,7 +221,7 @@ fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool, sizesRecorded : Bool
           known = constantsOf(f), definedIn = [], definedAt = [],
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
           publishers = Map.new(), publishedIn = Map.new(), messages = [],
-          results = results }
+          results = results, pos = 0 }
 }
 
 fun placeDefinitions(s : Sel) -> Unit {
@@ -360,6 +366,9 @@ fun divisorOf(s : Sel, i : Low) -> Option Int = match i.op {
 --
 -- Past eight in a file, a parameter is on the stack: stack argument `k` in
 -- argument order, whatever its file, as `call` passes them.
+--
+-- The moves and the jump take the declaration's position, as no stepping
+-- target: they are part of entering the function.
 fun incoming(f : Func Low, g : Func Inst) -> BlockId {
     let entry = Ssa.newBlock()
     var general = 0
@@ -387,9 +396,10 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
                 A.Ldr(into, A.IncomingArg(at), A.W64)
             }
         }
-        Vec.push(entry.insts, Inst { op = op })
+        Vec.push(entry.insts, Inst { op = op, at = Position.notStmt(f.at) })
     }
     entry.term = Jump(f.entry, [])
+    entry.termAt = Position.notStmt(f.at)
     Vec.push(g.blocks, entry)
     BlockId(len(g.blocks) - 1)
 }
@@ -417,9 +427,17 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
 -- pointer is then stored once before the loop, and not at every call in it.
 -- The price is a store on a path that reaches no safepoint, after a
 -- definition that is live across one only on some other path.
+--
+-- Positions: what the entry does before its first instruction belongs to
+-- entering the function, and takes the declaration, as no stepping target. A
+-- root store takes its definition's position, as no stepping target; a block
+-- parameter's definition is the block's start, so its store takes the
+-- position of what the block does first.
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
+        s.pos = if b == Ssa.blockId(s.source.entry) { Position.notStmt(s.source.at) }
+                else { Position.notStmt(firstAt(s.source.blocks[b])) }
         -- The frame objects the collector may read before they are built
         -- (`Turkey.Roots.FrameObject`), cleared before anything can collect.
         if b == Ssa.blockId(s.source.entry) {
@@ -438,6 +456,7 @@ fun run(s : Sel) -> Unit {
         let insts = s.source.blocks[b].insts
         var tail = False
         for var n = 0; n < len(insts); n = n + 1 {
+            s.pos = insts[n].at
             if isTailCall(s, b, n) {
                 s.place = (b, n)
                 tailCall(s, insts[n])
@@ -459,15 +478,23 @@ fun run(s : Sel) -> Unit {
             -- store -- has nothing to mark, and nothing can collect inside it.
             s.pending = None
             -- After the call's map, where the result first exists.
+            s.pos = Position.notStmt(insts[n].at)
             storeRoot(s, insts[n].result)
         }
+        s.pos = s.source.blocks[b].termAt
         if tail {
+            s.out.blocks[s.at].termAt = s.pos
             s.out.blocks[s.at].term = Unreachable
         } else {
             terminate(s, s.source.blocks[b].term)
         }
     }
 }
+
+-- The position of the first thing `block` does: its first instruction, or
+-- its terminator if it has none.
+fun firstAt(block : Ssa.Block Low) -> Int =
+    if len(block.insts) > 0 { block.insts[0].at } else { block.termAt }
 
 -- -- tail calls ---------------------------------------------------------------------
 
@@ -596,6 +623,7 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
              Some(calleeOf(s, "turkey_panic_string")), A.xzr,
              [(A.reg(v), A.Gp)], A.Standard)
         s.panicking = False
+        s.out.blocks[s.at].termAt = s.pos
         s.out.blocks[s.at].term = Unreachable
     }
     Switch(v, cases, default) -> {
@@ -603,7 +631,10 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
         let width = widthOf(Ssa.repOf(s.source, v))
         search(s, A.reg(v), width, sorted, 0, len(sorted), default)
     }
-    _ -> { s.out.blocks[s.at].term = t }
+    _ -> {
+        s.out.blocks[s.at].termAt = s.pos
+        s.out.blocks[s.at].term = t
+    }
 }
 
 -- Cases `from` to `to` of a switch on `x`, in key order, from the current
@@ -629,6 +660,7 @@ fun search(s : Sel, x : Reg, width : A.Width, cases : Vec (Int, BlockId),
     for var i = from; i < to; i = i + 1 {
         let (key, target) = cases[i]
         if i + 1 == to && Option.isNone(default) {
+            s.out.blocks[s.at].termAt = s.pos
             s.out.blocks[s.at].term = Jump(target, [])
             return
         }
@@ -637,6 +669,7 @@ fun search(s : Sel, x : Reg, width : A.Width, cases : Vec (Int, BlockId),
         branchIf(s, A.Eq, Ssa.blockId(target), carry)
         s.at = carry
     }
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = match default {
         Some(d) -> Jump(d, [])
         None -> Unreachable
@@ -658,6 +691,7 @@ fun compareKey(s : Sel, x : Reg, width : A.Width, key : Int) -> Unit =
 fun branchIf(s : Sel, c : A.Cond, yes : Int, no : Int) -> Unit {
     let taken = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(taken), c))
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Branch(taken, BlockId(yes), BlockId(no))
 }
 
@@ -1304,6 +1338,7 @@ fun barrier(s : Sel, target : Reg, value : Reg) -> Unit {
     move(s, A.argRegs[0], A.Gp, target, A.Gp)
     emit(s, A.CallArgs([A.argRegs[0]], []))
     emit(s, A.Bl(calleeOf(s, "turkey_write_barrier"), A.Standard))
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Jump(BlockId(done), [])
     s.at = done
 }
@@ -1373,6 +1408,7 @@ fun skipIf(s : Sel, c : A.Cond, done : Int) -> Unit {
     let taken = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(taken), c))
     let carry = block(s)
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Branch(taken, BlockId(done), BlockId(carry))
     s.at = carry
 }
@@ -1802,17 +1838,20 @@ fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit 
     -- The result is the merge block's parameter, which is what a
     -- select is in a graph with block parameters rather than phis.
     Vec.push(s.out.blocks[after].params, i.result)
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Branch(special, BlockId(zero),
                                      BlockId(ordinary))
     s.at = zero
     let none = tempValue(s, Ssa.untraced(I64))
     emit(s, A.Mov(A.reg(none), A.xzr, A.W64))
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Jump(BlockId(after), [none])
     s.at = ordinary
     let quotient = temp(s, Ssa.untraced(I64))
     let rest = tempValue(s, Ssa.untraced(I64))
     emit(s, A.SDiv(quotient, a, b, w))
     emit(s, A.MSub(A.reg(rest), quotient, b, a, w))
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Jump(BlockId(after), [rest])
     s.at = after
 }
@@ -1869,6 +1908,7 @@ fun guardOn(s : Sel, c : A.Cond, message : String) -> Unit {
 fun guard(s : Sel, condition : Value, message : String) -> Unit {
     let failed = block(s)
     let carry = block(s)
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Branch(condition, BlockId(failed),
                                      BlockId(carry))
     s.at = failed
@@ -1882,6 +1922,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
              A.Standard)
         s.panicking = False
     }
+    s.out.blocks[s.at].termAt = s.pos
     s.out.blocks[s.at].term = Unreachable
     s.at = carry
 }

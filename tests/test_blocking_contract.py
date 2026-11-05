@@ -91,6 +91,11 @@ def _calls() -> list[tuple[str, str, str]]:
     `Turkey.Workers`: (module, function, where)."""
     calls = []
     for path in sorted(LIB.rglob("*.gob")):
+        # Skip a test's throwaway `Probe_*` module (`test_giblets`,
+        # `test_foreign_definitions`). It is not part of the library, and a
+        # test running in parallel may delete it between the glob and the read.
+        if path.name.startswith("Probe_"):
+            continue
         module = _module(path)
         if module in ("Turkey.Libc", "Turkey.Workers"):
             continue

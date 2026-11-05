@@ -1,6 +1,6 @@
 export (
     Waiter, timedOut, cancelled,
-    now, sleeper, readable, writable, childExit, locked,
+    now, sleeper, readable, writable, readableBlocking, childExit, locked,
     park, finished, outcome, complete, timeOut,
     timeout, pending, deliver, expire, cancel, forget, takeWoken, takeHeadMoved,
 )
@@ -26,19 +26,50 @@ export (
 -- **Descriptors.** The poller knows a descriptor's number and a token, and on
 -- Linux keeps one registration per descriptor, not one per direction. So a
 -- `Source` is one descriptor number, or one child, with the waiters on its
--- read side and on its write side, and one token for the kernel. It exists
--- while a waiter waits on it. A token is the source's slot and, above 20 bits,
--- its generation, which is raised each time the slot is freed: an event that
--- arrives for a slot that has been freed and used again carries the old
--- generation and is ignored. The kernel is told the directions that wait
--- (`arm`) and each registration delivers once, so a direction that still
--- waits after an event is told again. A direction whose waiter left first
--- may stay registered; its event wakes nobody.
+-- read side and on its write side, and one token for the kernel. A token is
+-- the source's slot and, above 20 bits, its generation, which is raised each
+-- time the slot is freed: an event that arrives for a slot that has been
+-- freed and used again carries the old generation and is ignored.
 --
--- **Interest.** `Turkey.Workers.interest` is the number of sources plus the
--- number of waiters on the deadline heap, kept exact at the places that make
--- or free one, so that a count of 0 means nothing can wake a waiter and a
--- worker that sees it need not poll.
+-- A descriptor is registered once, at its first wait, edge-triggered and in
+-- both directions (`Turkey.Workers.pollRegister`), and its source lives until
+-- `forget`, so a wait costs no system call. An edge comes once per change of
+-- readiness, whoever waits: so an event for a direction with waiters ends all
+-- of them, and one for a direction with none is kept (`latched`) and ends the
+-- next wait there at once. A kept event may be stale -- the operation it
+-- announced may have run already -- and then the woken operation finds
+-- nothing and waits again; that costs a call, where a lost event would cost
+-- the wait. Every waiter on a direction when its event comes is woken, so two
+-- tasks waiting on one descriptor are both woken. A waiter woken by an edge
+-- retries until `EAGAIN` before it waits again, or another edge may never
+-- come; one that saw `EAGAIN` before an edge that woke others, and registers
+-- after it, is not woken by it, which is why a descriptor shared by several
+-- waiters has to be drained by whichever of them wakes. `Turkey.FD` holds a
+-- direction's lock while it waits, so it has at most one waiter per direction.
+--
+-- **Every descriptor number that was waited on is forgotten before it is
+-- closed** (`forget`, which `Turkey.FD` calls before `close(2)`). A source
+-- left behind for a closed number would be found by the next descriptor with
+-- that number, which would then skip its registration and never be woken. On
+-- Linux, `forget` also removes the descriptor from the epoll set, which
+-- `close` does not do while a duplicate of it is open; on Darwin, `close`
+-- removes it.
+--
+-- A descriptor in blocking mode (`readableBlocking`) is not registered that
+-- way: a kept event that is stale would send a blocking `read` into the
+-- kernel. Its source registers once per wait, level-triggered, so the event
+-- means the descriptor is ready when the wait is made or after; it exists
+-- while a waiter waits on it, and a direction that still waits after an event
+-- is told again (`arm`). A direction whose waiter left first may stay
+-- registered; its event wakes nobody. One descriptor number is waited on in
+-- one of the two ways until it is forgotten.
+--
+-- **Interest.** `Turkey.Workers.interest` is the number of sources counted in
+-- it (`recount`) plus the number of waiters on the deadline heap, kept exact
+-- at the places that change either, so that a count of 0 means nothing can
+-- wake a waiter and a worker that sees it need not poll. A registered
+-- descriptor with no waiter is not counted: its events can wait in the kernel
+-- until a waiter comes.
 --
 -- **Children.** A child is reaped by the one wait that watches it, with
 -- `waitpid(pid, WNOHANG)`, never `wait` or `waitpid(-1, ...)`, and no one
@@ -74,6 +105,7 @@ import Control.Iterator (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Bool (Bool(..))
 import Data.Int ()
+import Data.Int as Int
 import Bits (BitAnd(..), BitOr(..), (&), (|))
 import Data.Option (Option(..))
 import Data.Option as Option
@@ -103,9 +135,10 @@ type Outcome = Waiting | Ready(Int) | TimedOut | Cancelled
 -- What a waiter waits for. A `Lock` carries the `flock` operation to take.
 type WaitKind = Sleep | Read | Write | Child | Lock(Int)
 
--- What a source stands for. A `FileLock` is a descriptor whose file's
--- unlocks are watched.
-type SourceKind = Descriptor | ChildProcess | FileLock
+-- What a source stands for. A `Descriptor` is registered for its life,
+-- edge-triggered; a `BlockingDescriptor` is registered for each wait. A
+-- `FileLock` is a descriptor whose file's unlocks are watched.
+type SourceKind = Descriptor | BlockingDescriptor | ChildProcess | FileLock
 
 -- One wait. `heapAt` is the waiter's place on the deadline heap, or -1;
 -- `source` is its source's slot, or 0. `coroutine` is the task to wake when it
@@ -120,12 +153,15 @@ type Waiter = Waiter {
     var coroutine : Option Co.Coroutine,
 }
 
--- A descriptor number or a child with waiters, and what the kernel has been
--- told about it. `armed` is the directions registered: 1 for read, 2 for
--- write, and on Linux what its one registration was made for; for a
--- `FileLock`, 1 while the unlock is registered. `added` is whether Linux's
--- epoll set holds the descriptor at all, which a one-shot that has fired
--- leaves it doing. A source's record is reused when its slot is.
+-- A descriptor number or a child, its waiters, and what the kernel has been
+-- told about it. Directions are bits: 1 for read, 2 for write. `armed` is
+-- the directions a `BlockingDescriptor` has registered, and on Linux what its
+-- one registration was made for; for a `FileLock`, 1 while the unlock is
+-- registered. `added` is whether Linux's epoll set holds the descriptor at
+-- all, which a one-shot that has fired leaves it doing. `latched` is the
+-- directions of a `Descriptor` that an event reported while nobody waited.
+-- `counted` is whether the source is counted in the interest. A source's
+-- record is reused when its slot is.
 type Source = Source {
     var generation : Int,
     var live       : Bool,
@@ -135,6 +171,8 @@ type Source = Source {
     writers        : Vec Waiter,
     var armed      : Int,
     var added      : Bool,
+    var latched    : Int,
+    var counted    : Bool,
     -- A child's: it has exited, but `waitpid` cannot reap it yet (`exiting`).
     -- `event` is what the poller reported for it, which on Darwin is its status.
     var exiting    : Bool,
@@ -152,16 +190,19 @@ fun newSourceRecord() -> Source = Source {
     writers = [],
     armed = 0,
     added = False,
+    latched = 0,
+    counted = False,
     exiting = False,
     event = 0,
 }
 
 -- The sources by slot; slot 0 is not one, since token 0 is the poller's own
--- break. The free slots, the live sources' count, the slot of the source for
--- each descriptor number (0 for none) and the slots of those for children.
+-- break. The free slots, how many sources are counted in the interest, the
+-- slot of the source for each descriptor number (0 for none) and the slots of
+-- those for children.
 var sources : Vec Source = [newSourceRecord()]
 var freeSlots : Vec Int = []
-var liveSources = 0
+var countedSources = 0
 var byFd : Vec Int = []
 var childSlots : Vec Int = []
 -- The slot of the `FileLock` source for each descriptor number, or 0.
@@ -331,7 +372,7 @@ fun leave(w : Waiter) -> Unit {
         Child -> drop(s.readers, w.id)
         Lock(_) -> drop(s.readers, w.id)
     }
-    if nobodyWaits(s) { freeSource(slot) }
+    settleSource(slot, s)
 }
 
 fun drop(waiters : Vec Waiter, id : Int) -> Unit {
@@ -363,6 +404,33 @@ fun tokenOf(slot : Int, s : Source) -> Int = slot + s.generation * slotBits
 
 fun nobodyWaits(s : Source) -> Bool = len(s.readers) == 0 && len(s.writers) == 0
 
+-- Whether the source outlives its waiters: a `Descriptor` lives until
+-- `forget`, every other kind while a waiter waits on it.
+fun persists(s : Source) -> Bool = match s.kind {
+    Descriptor -> True
+    BlockingDescriptor -> False
+    ChildProcess -> False
+    FileLock -> False
+}
+
+-- Count `s` in the interest while it is live and a waiter waits on it, or,
+-- for a kind that does not persist, while it is live at all.
+fun recount(s : Source) -> Unit {
+    let wanted = s.live && (!persists(s) || !nobodyWaits(s))
+    if wanted != s.counted {
+        s.counted = wanted
+        let n = if wanted { 1 } else { -1 }
+        countedSources = countedSources + n
+        Workers.interestAdd(n)
+    }
+}
+
+-- After waiters have left `s`: free it if nobody waits and it does not
+-- persist, else count it again.
+fun settleSource(slot : Int, s : Source) -> Unit {
+    if nobodyWaits(s) && !persists(s) { freeSource(slot) } else { recount(s) }
+}
+
 -- A source's slot, counted in the interest, or the negated error number.
 fun newSource(kind : SourceKind, number : Int) -> Int {
     var slot = 0
@@ -379,19 +447,27 @@ fun newSource(kind : SourceKind, number : Int) -> Int {
     s.number = number
     s.armed = 0
     s.added = False
+    s.latched = 0
     s.exiting = False
-    liveSources = liveSources + 1
-    Workers.interestAdd(1)
+    recount(s)
     slot
 }
 
 -- Release a source nobody waits on, and drop what the kernel holds for it: a
 -- Darwin one-shot that has fired is gone already, and a Linux descriptor stays
--- in the epoll set until it is removed.
+-- in the epoll set until it is removed. A `Descriptor` is freed only before
+-- its number is closed (`forget`), which on Darwin removes its filters.
 fun freeSource(slot : Int) -> Unit {
     let s = sources[slot]
     match s.kind {
         Descriptor -> {
+            match Target.os {
+                Darwin -> {}
+                Linux -> if s.added { Workers.pollForget(s.number) }
+            }
+            byFd[s.number] = 0
+        }
+        BlockingDescriptor -> {
             let registered = match Target.os {
                 Darwin -> s.armed != 0
                 Linux -> s.added
@@ -410,17 +486,18 @@ fun freeSource(slot : Int) -> Unit {
         }
     }
     s.live = False
+    recount(s)
     s.generation = s.generation + 1
     s.armed = 0
     s.added = False
+    s.latched = 0
     Vec.push(freeSlots, slot)
-    liveSources = liveSources - 1
-    Workers.interestAdd(-1)
 }
 
--- Tell the kernel about the directions that wait and are not registered; 0,
--- or the negated error number. On Linux the one registration is replaced by
--- one for exactly the directions that wait, when it does not cover them.
+-- Tell the kernel about the directions of `s`, a `BlockingDescriptor`, that
+-- wait and are not registered; 0, or the negated error number. On Linux the
+-- one registration is replaced by one for exactly the directions that wait,
+-- when it does not cover them.
 fun arm(slot : Int, s : Source) -> Int {
     var want = 0
     if len(s.readers) > 0 { want = 1 }
@@ -464,25 +541,47 @@ fun sleeper(deadline : Int) -> Waiter {
     w
 }
 
-fun readable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Read, deadline)
+-- Waits for a non-blocking descriptor, which the caller makes only after the
+-- operation answered `EAGAIN`.
+fun readable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Read, Descriptor, deadline)
 
-fun writable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Write, deadline)
+fun writable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Write, Descriptor, deadline)
+
+-- A wait for a descriptor in blocking mode to be readable, which ends only
+-- once a `read` would not wait.
+fun readableBlocking(fd : Int, deadline : Int) -> Waiter =
+    waitFd(fd, Read, BlockingDescriptor, deadline)
 
 -- A wait for `fd` to be ready for `kind` (`Read` or `Write`): it ends `Ready`
 -- with 0 when the descriptor is, or hangs up, or has an error -- the
 -- operation then reports which -- and `Ready` with the negated error number
--- if the kernel will not watch it.
-fun waitFd(fd : Int, kind : WaitKind, deadline : Int) -> Waiter {
+-- if the kernel will not watch it, or with `-EINVAL` if `fd` is waited on as
+-- the other of `Descriptor` and `BlockingDescriptor` (`mode`).
+fun waitFd(fd : Int, kind : WaitKind, mode : SourceKind, deadline : Int) -> Waiter {
     let w = newWaiter(kind, deadline)
     if fd < 0 { return done(w, -Sys.ebadf) }
     while len(byFd) <= fd { Vec.push(byFd, 0) }
     var slot = byFd[fd]
     if slot == 0 {
-        slot = newSource(Descriptor, fd)
+        slot = newSource(mode, fd)
         if slot < 0 { return done(w, slot) }
+        let r = register(slot, sources[slot])
+        if r < 0 {
+            freeSource(slot)
+            return done(w, r)
+        }
         byFd[fd] = slot
     }
     let s = sources[slot]
+    if persists(s) != isPersistent(mode) { return done(w, -Sys.einval) }
+    let direction = match kind {
+        Write -> 2
+        _ -> 1
+    }
+    if s.latched & direction != 0 {
+        s.latched = s.latched & Int.not(direction)
+        return done(w, 0)
+    }
     w.source = slot
     match kind {
         Write -> Vec.push(s.writers, w)
@@ -491,13 +590,31 @@ fun waitFd(fd : Int, kind : WaitKind, deadline : Int) -> Waiter {
         Child -> Vec.push(s.readers, w)
         Lock(_) -> Vec.push(s.readers, w)
     }
-    let r = arm(slot, s)
-    if r < 0 {
-        leave(w)
-        return done(w, r)
+    if persists(s) {
+        recount(s)
+    } else {
+        let r = arm(slot, s)
+        if r < 0 {
+            leave(w)
+            return done(w, r)
+        }
     }
     if deadline >= 0 { timerAdd(w) }
     w
+}
+
+fun isPersistent(mode : SourceKind) -> Bool = match mode {
+    Descriptor -> True
+    _ -> False
+}
+
+-- Register a new `Descriptor` for its life; 0, or the negated error number.
+-- A `BlockingDescriptor` is registered by each wait instead (`arm`).
+fun register(slot : Int, s : Source) -> Int {
+    if !persists(s) { return 0 }
+    let r = Workers.pollRegister(s.number, tokenOf(slot, s))
+    if r >= 0 { s.added = True }
+    r
 }
 
 -- A wait for the child `pid` to exit, which ends `Ready` with its wait status
@@ -644,7 +761,7 @@ fun timeOut(w : Waiter) -> Bool = finish(w, TimedOut)
 -- -- what the scheduler asks ----------------------------------------------------------------
 
 -- Whether any wait can still end: a source with waiters, or a deadline.
-fun pending() -> Bool = liveSources > 0 || len(timers) > 0
+fun pending() -> Bool = countedSources > 0 || len(timers) > 0
 
 -- What the poller should wait for, at time `now`: -1 if nothing can end a
 -- wait; -2 (`Turkey.Workers.pollTimeoutForever`) if only an event can; else
@@ -657,7 +774,7 @@ fun timeout(now : Int) -> Int {
     } else if len(timers) > 0 {
         let left = timers[0].deadline - now
         if left < 0 { 0 } else { left }
-    } else if liveSources > 0 {
+    } else if countedSources > 0 {
         Workers.pollTimeoutForever
     } else {
         -1
@@ -677,9 +794,10 @@ let writeMask : Int = Workers.pollWritable | Workers.pollEof | Workers.pollError
 
 -- The poller reported `value` for `token`; answers how many waiters ended.
 -- A descriptor that is readable, hung up or failed ends the waiters that
--- read, and one writable, hung up or failed those that write. Linux's one-shot
--- registration is gone whatever it reported, and Darwin's filter that
--- reported is.
+-- read, and one writable, hung up or failed those that write; for a
+-- `Descriptor`, a direction with no waiter keeps the event instead. For a
+-- `BlockingDescriptor`, Linux's one-shot registration is gone whatever it
+-- reported, and Darwin's filter that reported is.
 fun deliver(token : Int, value : Int) -> Int {
     let before = ended
     let slot = token % slotBits
@@ -688,12 +806,29 @@ fun deliver(token : Int, value : Int) -> Int {
         if s.live && s.generation == token / slotBits {
             match s.kind {
                 ChildProcess -> deliverChild(slot, s, value)
-                Descriptor -> deliverFd(slot, s, value)
+                Descriptor -> deliverEdge(s, value)
+                BlockingDescriptor -> deliverFd(slot, s, value)
                 FileLock -> deliverUnlock(slot, s)
             }
         }
     }
     ended - before
+}
+
+fun deliverEdge(s : Source, value : Int) -> Unit {
+    if value & readMask != 0 { reach(s, s.readers, 1) }
+    if value & writeMask != 0 { reach(s, s.writers, 2) }
+    recount(s)
+}
+
+-- An edge for `direction` of `s`: it ends `waiters`, or, if there are none,
+-- is kept for the next wait.
+fun reach(s : Source, waiters : Vec Waiter, direction : Int) -> Unit {
+    if len(waiters) > 0 {
+        endAll(waiters, Ready(0))
+    } else {
+        s.latched = s.latched | direction
+    }
 }
 
 fun deliverFd(slot : Int, s : Source, value : Int) -> Unit {
@@ -798,8 +933,8 @@ fun expire(now : Int) -> Int {
     ended - before
 }
 
--- `fd` is about to be closed: end every wait on it with `cancelled`, and drop
--- the kernel's interest. Answers how many ended.
+-- End every wait on `fd` with `cancelled`, as before it is closed. A
+-- `Descriptor` stays registered until `forget`. Answers how many ended.
 fun cancel(fd : Int) -> Int {
     let before = ended
     if fd >= 0 && fd < len(byFd) && byFd[fd] != 0 {
@@ -807,7 +942,7 @@ fun cancel(fd : Int) -> Int {
         let s = sources[slot]
         endAll(s.readers, Cancelled)
         endAll(s.writers, Cancelled)
-        freeSource(slot)
+        settleSource(slot, s)
     }
     if fd >= 0 && fd < len(byLockFd) && byLockFd[fd] != 0 {
         let slot = byLockFd[fd]
@@ -817,14 +952,18 @@ fun cancel(fd : Int) -> Int {
     ended - before
 }
 
--- Drop the kernel's interest in `fd` before its number is closed, which on
--- Linux a registration does not survive while another descriptor for the same
--- open file exists. `cancel` first: a wait still on `fd` is not woken by this.
-fun forget(fd : Int) -> Unit {
-    Workers.pollForget(fd)
+-- `fd` is about to be closed: end every wait on it with `cancelled`, free its
+-- source and drop the kernel's interest, which on Linux a registration does
+-- not survive while another descriptor for the same open file exists.
+-- Answers how many waits ended.
+fun forget(fd : Int) -> Int {
+    let before = ended
     if fd >= 0 && fd < len(byFd) && byFd[fd] != 0 {
-        let s = sources[byFd[fd]]
-        s.armed = 0
-        s.added = False
+        let slot = byFd[fd]
+        let s = sources[slot]
+        endAll(s.readers, Cancelled)
+        endAll(s.writers, Cancelled)
+        freeSource(slot)
     }
+    ended - before
 }

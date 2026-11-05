@@ -171,6 +171,11 @@ fun node(ty : Ty.Type, where : Option Span, k : CoreKind) -> Core =
 -- `Turkey.Match`.
 fun matched(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
             where : Option Span) -> Core =
+    matchedArms(l, scrutinee, Vec.map(arms, fun((pat, body)) = (pat, Match.Taken(body))),
+                ty, where)
+
+fun matchedArms(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Match.Body),
+                ty : Ty.Type, where : Option Span) -> Core =
     Match.compile(Match.Matcher {
         decls = l.decls,
         reduce = fun(t) = resolved(l, t),
@@ -1353,17 +1358,9 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 Some(o) -> Some(expr(l, o, scope))
                 None -> None
             }))
-        EMatch(scrutinee, arms) -> {
-            let alts = Vec.new(4)
-            for arm in arms {
-                for pat in arm.patterns {
-                    Vec.push(alts, (pat, celled(l, pat,
-                        arm.body, expr(l, arm.body, _),
-                        childScope(scope), Some(arm.span))))
-                }
-            }
-            matched(l, expr(l, scrutinee, scope), alts, ty, where)
-        }
+        EMatch(scrutinee, arms) -> matchedArms(l, expr(l, scrutinee, scope),
+            armBodies(l, arms, ty, scope, fun(body, inner) = expr(l, body, inner)),
+            ty, where)
         EBlock(stmts) -> block(l, stmts, ty, where, childScope(scope))
         _ -> oops("cannot lower this expression", where)
     }
@@ -1660,17 +1657,60 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Vec Arm,
               scope : Scope, k : Option String) -> Core {
     let ty = typeOfExpr(l, e)
     let where = Some(e.span)
-    scrutinized(l, scrutinee, ty, where, scope, fun(s) = {
-        let alts = Vec.new(4)
-        for arm in arms {
-            for pat in arm.patterns {
-                Vec.push(alts, (pat, celled(l, pat,
-                    arm.body, conv(l, arm.body, _, k),
-                    childScope(scope), Some(arm.span))))
+    scrutinized(l, scrutinee, ty, where, scope, fun(s) = matchedArms(l, s,
+        armBodies(l, arms, ty, scope, fun(body, inner) = conv(l, body, inner, k)),
+        ty, where))
+}
+
+-- Returns each arm's code for each of its patterns, with `lower` lowering a
+-- body in a scope. `ty` is the type of the `match`.
+fun armBodies(l : Lowerer, arms : Vec Arm, ty : Ty.Type, scope : Scope,
+              lower : fun(Expr, Scope) -> Core) -> Vec (Pat, Match.Body) {
+    let alts = Vec.new(4)
+    for arm in arms {
+        let where = Some(arm.span)
+        for pat in arm.patterns {
+            let body = if len(arm.guards) == 0 {
+                Match.Taken(celled(l, pat, ChArm(arm), lower(arm.body, _),
+                                   childScope(scope), where))
+            } else {
+                Match.Guarded(fun(fail) = celled(l, pat, ChArm(arm),
+                    guarded(l, arm, 0, ty, _, lower, fail), childScope(scope), where))
             }
+            Vec.push(alts, (pat, body))
         }
-        matched(l, s, alts, ty, where)
-    })
+    }
+    alts
+}
+
+-- Returns code that runs guards `i` onwards of `arm` and then its body, and
+-- jumps to `fail` when a guard does not hold.
+--
+-- A `let` guard is a `match` of its own, whose last arm is that jump. The
+-- guards after it, and the body, are lowered once per pattern of that guard,
+-- as an arm's body is lowered once per pattern of the arm.
+fun guarded(l : Lowerer, arm : Arm, i : Int, ty : Ty.Type, scope : Scope,
+            lower : fun(Expr, Scope) -> Core, fail : String) -> Core {
+    if i == len(arm.guards) { return lower(arm.body, scope) }
+    let g = arm.guards[i]
+    let where = Some(guardExpr(g).span)
+    let failing = node(TBottom, where, CJump(fail, []))
+    match g {
+        GTest(test) -> scrutinized(l, test, ty, where, scope, fun(c) =
+            node(ty, where, CIf(c, guarded(l, arm, i + 1, ty, scope, lower, fail),
+                                Some(failing))))
+        GLet(patterns, value) -> scrutinized(l, value, ty, where, scope, fun(v) = {
+            let alts = Vec.new(len(patterns) + 1)
+            for pat in patterns {
+                Vec.push(alts, (pat, Match.Taken(celled(l, pat, ChArm(arm),
+                    guarded(l, arm, i + 1, ty, _, lower, fail), childScope(scope), where))))
+            }
+            let other = Pat { id = patterns[0].id, span = patterns[0].span,
+                              kind = PWild, opening = None }
+            Vec.push(alts, (other, Match.Taken(failing)))
+            matchedArms(l, v, alts, ty, where)
+        })
+    }
 }
 
 -- A branch whose *scrutinee* may itself hold a transfer, which has to run before
@@ -2006,8 +2046,9 @@ fun convBlockFrom(l : Lowerer, stmts : Vec Stmt, from : Int, ty : Ty.Type,
                   where : Option Span, scope : Scope, k : Option String) -> Core {
     if from >= len(stmts) { return finish(l, node(ty, where, CUnit), k) }
     let head = stmts[from]
-    let isLast = from == len(stmts) - 1
-    if isLast {
+    -- What follows a statement that cannot complete is unreachable, so
+    -- nothing after it is lowered. See `stops`.
+    if from == len(stmts) - 1 || stops(l, head) {
         match head.kind {
             SExpr(e) -> return conv(l, e, scope, k)
             _ -> return convBind(l, head,
@@ -2039,6 +2080,15 @@ fun convBlockFrom(l : Lowerer, stmts : Vec Stmt, from : Int, ty : Ty.Type,
             ty, where, scope)
     }
 }
+
+-- Whether `s` cannot complete normally, with calls decided by their types.
+--
+-- Inference typed the block bottom when `s` stops whatever its calls do, so
+-- a block cut short here is never asked for a value. Where `s` stops only
+-- because a call never returns, the call's result type is a variable nothing
+-- constrains, which fits whatever type the block has.
+fun stops(l : Lowerer, s : Stmt) -> Bool =
+    !completes(stmtCompletion(s), Typed.canReturn(l.types, _))
 
 fun isFun(s : Stmt) -> Bool = match s.kind {
     SFun(_) -> True
@@ -2104,15 +2154,6 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
                  mutable : Bool, rest : fun() -> Core, ty : Ty.Type,
                  at : Option Span, scope : Scope) -> Core {
     let bare = unannot(pat)
-    let name = match bare.kind {
-        PVar(n) -> n
-        _ -> {
-            let keyword = if mutable { "var" } else { "let" }
-            unsupported("this '" + keyword + "' destructures a value that can 'return', "
-                        + "'break' or 'continue', which is not supported yet; bind the "
-                        + "value to one name first, then destructure that name", at)
-        }
-    }
     if len(letBinders(l, stmt, pat)) > 0 {
         oops("a control transfer under a polymorphic 'let'", at)
     }
@@ -2123,13 +2164,23 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
     -- under whatever this binding did to the scope -- a `var` becomes a cell,
     -- and every mention of it after this point has to be a read of that cell.
     let value = conv(l, src, scope, Some(joined))
-    Map.put(scope.binders, name, [])
-    let body = if mutable {
-        Set.add(scope.cells, name)
-        let cell = node(refOf(held), at, CRef(heldVar))
-        node(ty, at, CLet(name, cell.ty, cell, rest(), []))
-    } else {
-        node(ty, at, CLet(name, held, heldVar, rest(), []))
+    let body = match bare.kind {
+        PVar(name) -> {
+            Map.put(scope.binders, name, [])
+            if mutable {
+                Set.add(scope.cells, name)
+                let cell = node(refOf(held), at, CRef(heldVar))
+                node(ty, at, CLet(name, cell.ty, cell, rest(), []))
+            } else {
+                node(ty, at, CLet(name, held, heldVar, rest(), []))
+            }
+        }
+        PWild -> rest()
+        -- A destructuring binding is a one-armed match, as in `bindPattern`.
+        _ -> {
+            let inner = if mutable { varCells(l, pat, rest, scope, at) } else { rest() }
+            matched(l, heldVar, [(bare, inner)], ty, at)
+        }
     }
     node(ty, at, CJoin(joined, [CParam { name = valueName, ty = held }],
                        body, value, False))
@@ -2149,7 +2200,9 @@ fun blockFrom(l : Lowerer, stmts : Vec Stmt, from : Int, ty : Ty.Type,
               where : Option Span, scope : Scope) -> Core {
     if from >= len(stmts) { return node(ty, where, CUnit) }
     let head = stmts[from]
-    if from == len(stmts) - 1 { return tail(l, head, ty, where, scope) }
+    -- What follows a statement that cannot complete is unreachable, so
+    -- nothing after it is lowered. See `stops`.
+    if from == len(stmts) - 1 || stops(l, head) { return tail(l, head, ty, where, scope) }
     match head.kind {
         -- A local `fun` may recurse and may call its siblings, so it binds as a
         -- group even when the group has one member.
@@ -2289,21 +2342,36 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
         }
         -- A destructuring binding is a one-armed match, which is what it is.
         _ -> {
-            let body = rest()
+            let body = if mutable { varCells(l, pat, rest, scope, at) } else { rest() }
             matched(l, value, [(bare, body)], body.ty, at)
         }
     }
 }
 
--- Lower a pattern's body, making a cell of any binder it assigns.
+-- Lower `rest` with every name `pat` binds as a cell, for a `var` that
+-- destructures: any of them can be assigned in the statements that follow,
+-- which `rest` lowers under `scope`.
+fun varCells(l : Lowerer, pat : Pat, rest : fun() -> Core, scope : Scope,
+             where : Option Span) -> Core {
+    let types = Typed.ofPattern(l.types, pat)
+    let names = Vec.new(4)
+    for name in Map.keys(types) {
+        Vec.push(names, name)
+        Set.add(scope.cells, name)
+    }
+    cellsAround(l, types, names, rest(), where)
+}
+
+-- Lowers the code a pattern's binders scope over, making a cell of any binder
+-- that `within` assigns.
 --
 -- A pattern binder is reassignable like any other: reassigning a destructured
 -- parameter rebinds the local name and nothing else, because patterns bind, they
 -- do not alias. A cell is exactly that, and nothing more.
-fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
+fun celled(l : Lowerer, pat : Pat, within : Child, lower : fun(Scope) -> Core,
            scope : Scope, where : Option Span) -> Core {
     let types = Typed.ofPattern(l.types, pat)
-    let written = assignedIn(ChExpr(body))
+    let written = assignedIn(within)
     let here = Vec.new(2)
     for name in Map.keys(types) {
         if Set.contains(written, name) { Vec.push(here, name) }
@@ -2311,8 +2379,15 @@ fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
     if len(here) == 0 { return lower(scope) }
     let inner = childScope(scope)
     for name in here { Set.add(inner.cells, name) }
-    var out = lower(inner)
-    for name in Vec.reverse(Vec.sort(here)) {
+    cellsAround(l, types, here, lower(inner), where)
+}
+
+-- Wrap `body` in a cell for each of `names`, each holding the value the
+-- pattern bound to that name. `types` is what the pattern binds.
+fun cellsAround(l : Lowerer, types : Map String Ty.Type, names : Vec String,
+                body : Core, where : Option Span) -> Core {
+    var out = body
+    for name in Vec.reverse(Vec.sort(names)) {
         let ty = rigidly(l, Map.getOr(types, name, TBottom))
         out = node(out.ty, where, CLet(name, refOf(ty),
             node(refOf(ty), where, CRef(node(ty, where, CVar(name)))),
@@ -2563,9 +2638,4 @@ fun operands(e : Expr) -> Option (Vec Expr) = match e.kind {
     EBinary(op, left, right, _) ->
         if op == "&&" || op == "||" { None } else { Some([left, right]) }
     _ -> None
-}
-
-fun unsupported(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("unsupported", message), "")
-    Some(s) -> Diag.fail(Diag.at("unsupported", message, s), s.file)
 }

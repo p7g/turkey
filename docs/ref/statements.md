@@ -39,6 +39,43 @@ fun main() {
 12
 ```
 
+A statement **cannot complete** when no way of running it reaches its end: a
+`return`, `break` or `continue`; a `loop` that cannot reach one of its own
+`break`s; an `if` with an `else`, or a `match`, none of whose branches can
+complete; or any statement that evaluates one of these on every way through
+it. The statements after it are unreachable and never run, and the compiler
+warns about them. The block never produces a value, so it has any type, as
+`return` does:
+
+<!-- run -->
+```kotlin
+fun orZero(text : String) -> Int {
+    let n = match Int.parse(text) {
+        Some(n) -> n
+        None -> {
+            print("not a number: " + text)
+            return 0
+        }
+    }
+    n * 2
+}
+
+fun main() {
+    print(orZero("21"))
+    print(orZero("x"))
+}
+```
+
+```text
+42
+not a number: x
+0
+```
+
+A call to a function that never returns, such as `error`, also ends the run of
+a block, and the compiler warns about what follows it too, but the call does
+not change the block's type, which is still that of its last statement.
+
 A declaration in a block is visible from the next statement to the end of the
 block. A block is a scope: its declarations are not visible after it.
 
@@ -170,7 +207,10 @@ The condition cannot be a bare record expression; see
 **Syntax**
 
 ```ebnf
-if-let ::= "if" ("let" | "var") pattern "=" expression block ("else" (block | if-expr))?
+if-let     ::= "if" conditions block ("else" (block | if-expr))?
+conditions ::= condition ("," condition)*
+condition  ::= expression
+             | ("let" | "var") pattern ("|" pattern)* "=" expression
 ```
 
 `if let p = e { A } else { B }` evaluates `e`, and runs `A` with the pattern's
@@ -185,7 +225,8 @@ match e {
 
 and without an `else`, `B` is `()`. The variables `p` binds are visible in `A`
 only. `if var` is the same, except that the bound variables can be assigned
-inside `A`.
+inside `A`. Like a `match` arm, a `let` can list alternatives, `p | q`, and
+every alternative must bind the same variables.
 
 <!-- run -->
 ```kotlin
@@ -206,6 +247,71 @@ fun main() {
 ```text
 took 8
 42
+```
+
+### Condition lists
+
+A head can hold several conditions separated by commas, as long as one of
+them is a `let` or `var`. Each condition is either a `let` or a test, a
+`Bool` expression. They are evaluated left to right, and the first one that
+fails (a pattern that does not match, or a test that is `False`) runs `B`
+without evaluating the rest. `A` runs only when every condition holds. Each
+`let` binds its variables for the conditions after it and for `A`, and none
+of them is visible in `B`.
+
+`if let p1 = e1, c2, let p3 = e3 { A } else { B }` is approximately
+
+```text
+match e1 {
+    p1 -> if c2 {
+        match e3 {
+            p3 -> A
+            _ -> B
+        }
+    } else {
+        B
+    }
+    _ -> B
+}
+```
+
+except that `B` is written once, and every failing condition goes to it.
+
+Two tests in a row are an error, because `a && b` already says that: write
+`if let Some(n) = o, n > 0 && n < 10`, not `n > 0, n < 10`. A `?` can be in
+the first condition but not a later one, and only the first condition can
+match an [existential](types.md#existential-types) constructor.
+
+<!-- run -->
+```kotlin
+fun port(setting : String) -> Option Int {
+    if let Some((key, value)) = String.splitOnce(setting, "="), key == "port",
+       let Some(n) = Int.parse(value) {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+fun main() {
+    print(port("port=8080"))
+    print(port("host=example.com"))
+    print(port("port=eighty"))
+}
+```
+
+```text
+Some(8080)
+None
+None
+```
+
+<!-- error: two tests in a row cannot be separated by ','; join them with '&&' -->
+```kotlin
+fun main() {
+    let o = Some(4)
+    if let Some(n) = o, n > 0, n < 10 { print(n) }
+}
 ```
 
 ## `match`
@@ -289,7 +395,7 @@ fun main() {
 **Syntax**
 
 ```ebnf
-while-let ::= "while" ("let" | "var") pattern "=" expression block
+while-let ::= "while" conditions block
 ```
 
 `while let p = e { B }` evaluates `e` and runs `B` while `p` matches. It is
@@ -305,7 +411,9 @@ loop {
 ```
 
 so `e` is evaluated again before every iteration, including after a
-`continue`. `while var` makes the bound variables assignable inside `B`.
+`continue`. `while var` makes the bound variables assignable inside `B`. A
+`while` head takes a [condition list](#condition-lists) as an `if` head does,
+and the loop ends at the first condition that fails.
 
 <!-- run -->
 ```kotlin
@@ -314,6 +422,10 @@ fun main() {
     while let Some(task) = Vec.pop(pending) {
         print("doing " + task)
     }
+    let readings = [7, 120, 3, 5]
+    while let Some(r) = Vec.pop(readings), r < 100 {
+        print(r)
+    }
 }
 ```
 
@@ -321,6 +433,8 @@ fun main() {
 doing a
 doing b
 doing c
+5
+3
 ```
 
 ## `for` over a collection
@@ -557,7 +671,7 @@ fun main() {
 
 | Construct | Type |
 |---|---|
-| `{ ...; e }` | the type of `e`, or `Unit` if the last statement is a declaration |
+| `{ ...; e }` | the type of `e`, `Unit` if the last statement is a declaration, or any type if a statement cannot complete |
 | `if c { A } else { B }` | the type of `A` and `B`, which must agree |
 | `if c { A }` | `Unit` |
 | `if let p = e { A } else { B }` | the type of `A` and `B` |

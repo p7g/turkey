@@ -83,7 +83,6 @@ type LoopCtx = LoopCtx {
     -- loop | while | for
     kind         : String,
     var result   : Ty.Type,
-    var sawBreak : Bool,
 }
 
 -- One existential under construction: the variables and constraints so far.
@@ -119,6 +118,14 @@ type Generator = Generator {
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
     discardSites : Vec Expr,
+    -- See `Program.letElses`.
+    letElses : Vec LetElse,
+    -- Every block's statements, for the unreachable-code warning, which needs
+    -- solved types to tell which calls return.
+    blocks   : Vec (Vec Stmt),
+    -- The ids of the nodes generation types bottom whatever they are: every
+    -- `else` block of a `let ... else`, and the calls in its tail positions.
+    bottoms  : Set.Set Int,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
     -- variables and its context.
     partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred),
@@ -137,7 +144,8 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
         warnings = Vec.new(4), matchSites = Vec.new(8),
-        binderSites = Vec.new(8), discardSites = Vec.new(8),
+        binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
+        blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
     }
 }
@@ -262,6 +270,16 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     let foreigns = Vec.new(4)
     let items = Vec.new(16)
     for (owner, program) in modules {
+        for le in program.letElses {
+            -- One that falls through even if every call in it never returns
+            -- is reported now, before solving. Desugaring may have rewritten
+            -- the block into a value that is no longer bottom, and solving
+            -- would report that as a mismatch between the arms instead.
+            if completes(le.completion, fun(_) = False) { fallsThrough(le) }
+            Vec.push(g.letElses, le)
+            Set.add(g.bottoms, le.block.id)
+            for call in le.tailCalls { Set.add(g.bottoms, call.id) }
+        }
         for d in program.decls {
             match d {
                 DType(t) -> Vec.push(typeDecls, t)
@@ -891,6 +909,26 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
+    for le in g.letElses {
+        if completes(le.completion, Typed.canReturn(g.types, _)) { fallsThrough(le) }
+    }
+    -- One warning for each run of unreachable statements, at its first, in
+    -- the order they appear in the source. Blocks are recorded outermost
+    -- first, so a block nested in another is visited after it.
+    let unreachable = Vec.new(4)
+    for stmts in g.blocks {
+        for var i = 0; i + 1 < len(stmts); i = i + 1 {
+            if !completes(stmtCompletion(stmts[i]), Typed.canReturn(g.types, _)) {
+                Vec.push(unreachable, stmts[i + 1].span)
+                break
+            }
+        }
+    }
+    for at in Vec.sortByKey(unreachable, fun(sp) = (sp.file, (sp.line, sp.col))) {
+        Vec.push(g.warnings, Diag.render(Diag.at("warning",
+            "this statement is unreachable, since the one before it cannot "
+            + "complete; remove it", at), ""))
+    }
     -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
         let ty = Typed.of_(g.types, x)
@@ -898,12 +936,24 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             TCon(c) -> c.name == "Unit"
             _ -> False
         }
-        if !unit && !diverges(g, x) {
+        if !unit && completes(completion(x), Typed.canReturn(g.types, _)) {
             oops("this expression's value has type '" + Ty.show(ty)
                  + "' and is discarded; use it, or write 'let _ = ...'",
                  Some(x.span))
         }
     }
+}
+
+-- Reports that a `let ... else` block can fall through. It does so past its
+-- last statement, so that is where the report points.
+fun fallsThrough(le : LetElse) -> a {
+    let at = match le.block.kind {
+        EBlock(stmts) -> if len(stmts) > 0 { stmts[len(stmts) - 1].span }
+                         else { le.block.span }
+        _ -> le.block.span
+    }
+    oops("this 'else' block can fall through; it must end in 'return', "
+         + "'break', 'continue' or a call that never returns", Some(at))
 }
 
 -- A block whose value nobody reads -- a loop body, a one-armed `if` -- discards
@@ -916,44 +966,6 @@ fun discardsLast(g : Generator, body : Expr) -> Unit = match body.kind {
         }
     }
     _ -> {}
-}
-
--- Whether `e` has no value to discard, by parametricity: bottom, or a call whose
--- result is a variable its parameters do not mention -- `fun(String) -> a` has no
--- way to make an `a` -- or a branch every way through which diverges. See
--- `turkey/infer.py`.
-fun diverges(g : Generator, e : Expr) -> Bool {
-    match Typed.of_(g.types, e) {
-        TBottom -> return True
-        _ -> {}
-    }
-    match e.kind {
-        ECall(fn, _) -> match Typed.of_(g.types, fn) {
-            TFun(params, ret) -> match Ty.prune(ret) {
-                TVar(cell) -> {
-                    for v in Ty.varsOf(params) { if v.id == cell.id { return False } }
-                    True
-                }
-                _ -> False
-            }
-            _ -> False
-        }
-        EIf(_, then, otherwise) -> match otherwise {
-            Some(o) -> diverges(g, then) && diverges(g, o)
-            None -> False
-        }
-        EMatch(_, arms) -> {
-            for arm in arms { if !diverges(g, armBody(arm)) { return False } }
-            True
-        }
-        EBlock(stmts) -> if len(stmts) == 0 { False } else {
-            match stmts[len(stmts) - 1].kind {
-                SExpr(x) -> diverges(g, x)
-                _ -> False
-            }
-        }
-        _ -> False
-    }
 }
 
 -- -- binders -----------------------------------------------------------------------
@@ -1112,7 +1124,7 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
     Vec.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
-    Vec.push(g.binderSites, (pat, t, "use 'if let' or 'match'"))
+    Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'"))
     let binds = Vec.new(4)
     for (n, ty) in Map.entries(bound) { Vec.push(binds, (n, ty)) }
     let defn = pop(g)
@@ -1405,26 +1417,31 @@ fun mergeInto(into : Map String Ty.Type, new : Map String Ty.Type,
 -- A block's value is its last statement's, and a declaration contributes Unit.
 -- A binder scopes over the statements that follow it, so it is
 -- generated as a binder *around* them rather than as one more statement.
+--
+-- A statement that cannot complete makes the block bottom, and lowering stops
+-- there. The statements after it are still generated, so that what is wrong
+-- with them is still reported.
+--
+-- `stmtStops` walks the whole statement, and a statement nested in this one
+-- is walked again by its own block, so the cost grows with the depth of
+-- nesting. Caching an answer per node would cost a table for a walk that is
+-- already linear at each level.
 fun genSequence(g : Generator, stmts : Vec Stmt, from : Int) -> Ty.Type {
     if from >= len(stmts) { return Ty.tUnit() }
     let stmt = stmts[from]
-    match stmt.kind {
-        SLet(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        SVar(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        SFun(_) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1))
-        _ -> {}
-    }
-    let value = genStmt(g, stmt)
-    if from + 1 < len(stmts) {
-        match stmt.kind {
-            SExpr(x) -> Vec.push(g.discardSites, x)
-            _ -> {}
+    let ty = match stmt.kind {
+        SLet(_, _) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        SVar(_, _) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        SFun(_) -> bindGroup(g, [stmt], fun() = genSequence(g, stmts, from + 1))
+        _ -> {
+            let value = genStmt(g, stmt)
+            if from + 1 < len(stmts) {
+                if let SExpr(x) = stmt.kind { Vec.push(g.discardSites, x) }
+                genSequence(g, stmts, from + 1)
+            } else { value }
         }
-        genSequence(g, stmts, from + 1)
-    } else { value }
+    }
+    if stmtStops(stmt) { TBottom } else { ty }
 }
 
 -- A statement that binds nothing. Binders go through `bindGroup`.
@@ -1468,7 +1485,18 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
 -- -- expressions -------------------------------------------------------------------
 
 fun genExpr(g : Generator, e : Expr) -> Ty.Type {
-    let ty = genExprKind(g, e)
+    var ty = genExprKind(g, e)
+    -- An `else` block is bottom, like a `return`, and is checked once types
+    -- are solved not to fall through. Answering its real type would report a
+    -- block that falls through as a mismatch between the arms instead.
+    --
+    -- So is a call in its tail positions, for the block that desugaring
+    -- rewrote into a value and so is no longer here to be bottom. That call's
+    -- result would otherwise unify with the type of the names the `let` binds,
+    -- and the check could no longer see that the callee never returns. It is
+    -- sound because the check passes only if each such call never returns or
+    -- is never reached.
+    if Set.contains(g.bottoms, e.id) { ty = TBottom }
     -- One place, so no case can forget. What is recorded is the variable itself,
     -- not a snapshot of it: solving fills it in later.
     Typed.record(g.types, e, ty)
@@ -1617,7 +1645,10 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let annotated = typeOf(g, te)
         join(g, genExpr(g, inner), annotated, Some(e.span), "a type annotation")
     }
-    EBlock(stmts) -> genSequence(g, stmts, 0)
+    EBlock(stmts) -> {
+        Vec.push(g.blocks, stmts)
+        genSequence(g, stmts, 0)
+    }
     EIf(cond, then, otherwise) -> {
         eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "an 'if' condition")
         let thenType = genExpr(g, then)
@@ -1634,7 +1665,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     EWhile(cond, body) -> {
         eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "a 'while' condition")
         Vec.push(g.loopStack, LoopCtx {
-            kind = "while", result = Ty.tUnit(), sawBreak = False,
+            kind = "while", result = Ty.tUnit(),
         })
         discard(genExpr(g, body))
         discardsLast(g, body)
@@ -1647,7 +1678,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let rest = fun() = {
             eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "a 'for' condition")
             Vec.push(g.loopStack, LoopCtx {
-                kind = "for", result = Ty.tUnit(), sawBreak = False,
+                kind = "for", result = Ty.tUnit(),
             })
             discard(genExpr(g, body))
             discardsLast(g, body)
@@ -1674,14 +1705,14 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         }
     }
     ELoop(body) -> {
-        let ctx = LoopCtx { kind = "loop", result = fresh(g), sawBreak = False }
+        let ctx = LoopCtx { kind = "loop", result = fresh(g) }
         Vec.push(g.loopStack, ctx)
         discard(genExpr(g, body))
         discardsLast(g, body)
         discard(Vec.pop(g.loopStack))
         -- A `loop` never falls through, so its value comes only from its
-        -- breaks. With no break at all it never produces one.
-        if ctx.sawBreak { ctx.result } else { TBottom }
+        -- breaks. With no break it can reach, it never produces one.
+        if breaksOut(body) { ctx.result } else { TBottom }
     }
     EMatch(scrutinee, arms) -> genMatch(g, e, scrutinee, arms)
     EReturn(value) -> {
@@ -1700,7 +1731,6 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
             oops("'break' cannot appear outside a loop", Some(e.span))
         }
         let ctx = g.loopStack[len(g.loopStack) - 1]
-        ctx.sawBreak = True
         match value {
             None -> eq(g, ctx.result, Ty.tUnit(), Some(e.span),
                        "a valueless 'break'")
@@ -1992,7 +2022,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     Vec.push(g.scopes, scope)
     push(g)
     Vec.push(g.loopStack, LoopCtx {
-        kind = "for", result = Ty.tUnit(), sawBreak = False,
+        kind = "for", result = Ty.tUnit(),
     })
     discard(genExpr(g, body))
     discardsLast(g, body)
@@ -2012,24 +2042,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
     var result = TBottom
     for arm in arms {
         Vec.push(g.openings, Some(Vec.new(2)))
-        let bindings = matchPattern(g, arm.patterns[0], scrutineeType)
-        for var i = 1; i < len(arm.patterns); i = i + 1 {
-            let alt = arm.patterns[i]
-            let other = matchPattern(g, alt, scrutineeType)
-            match unshared(other, bindings) {
-                Some((name, True)) -> oops("this alternative binds '" + name
-                    + "' and the first does not; every alternative must bind "
-                    + "the same variables", Some(alt.span))
-                Some((name, False)) -> oops("this alternative does not bind '"
-                    + name + "' and the first does; every alternative must "
-                    + "bind the same variables", Some(alt.span))
-                None -> {}
-            }
-            for (name, ty) in Map.entries(other) {
-                eq(g, Map.getOr(bindings, name, ty), ty, Some(alt.span),
-                   "the binding '" + name + "'")
-            }
-        }
+        let bindings = alternatives(g, arm.patterns, scrutineeType)
         let openings = popOpenings(g)
         if len(openings) > 0 && len(arm.patterns) > 1 {
             oops("an arm with alternatives cannot match an existential "
@@ -2044,7 +2057,9 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         -- rigid constants.
         let answer = if len(openings) > 0 { Some(fresh(g)) } else { None }
         push(g)
+        let guardBindings = guards(g, arm.guards)
         var body = genExpr(g, arm.body)
+        closeGuards(g, guardBindings)
         match answer {
             Some(ans) -> match body {
                 TBottom -> {}
@@ -2068,6 +2083,71 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         result = join(g, result, body, Some(arm.span), "the arms of a 'match'")
     }
     result
+}
+
+-- Returns what the patterns of one arm or one `let` guard bind, each matched
+-- against `ty`. Raises a type error unless every pattern binds the names the
+-- first one does, at the same types.
+fun alternatives(g : Generator, patterns : Vec Pat, ty : Ty.Type) -> Map String Ty.Type {
+    let bindings = matchPattern(g, patterns[0], ty)
+    for var i = 1; i < len(patterns); i = i + 1 {
+        let alt = patterns[i]
+        let other = matchPattern(g, alt, ty)
+        match unshared(other, bindings) {
+            Some((name, True)) -> oops("this alternative binds '" + name
+                + "' and the first does not; every alternative must bind "
+                + "the same variables", Some(alt.span))
+            Some((name, False)) -> oops("this alternative does not bind '"
+                + name + "' and the first does; every alternative must "
+                + "bind the same variables", Some(alt.span))
+            None -> {}
+        }
+        for (name, t) in Map.entries(other) {
+            eq(g, Map.getOr(bindings, name, t), t, Some(alt.span),
+               "the binding '" + name + "'")
+        }
+    }
+    bindings
+}
+
+-- Generates an arm's guards, in order, and returns what each `let` guard
+-- binds. A test is a `Bool`. A `let` guard opens a scope for what its patterns
+-- bind, which stays open for the guards after it and the arm's body;
+-- `closeGuards` closes them, given what this returns.
+--
+-- Refuse an existential in a `let` guard: its rigid constants would have to
+-- scope over the guards after it and the body, inside the arm's own rank.
+fun guards(g : Generator, gs : Vec Guard) -> Vec (Map String Ty.Type) {
+    let opened = []
+    for guard in gs {
+        match guard {
+            GTest(test) ->
+                eq(g, genExpr(g, test), Ty.tBool(), Some(test.span), "a condition")
+            GLet(patterns, value) -> {
+                let ty = genExpr(g, value)
+                Vec.push(g.openings, None)
+                let bindings = alternatives(g, patterns, ty)
+                discard(Vec.pop(g.openings))
+                let scope = Map.new()
+                for (n, _) in Map.entries(bindings) { Map.put(scope, n, False) }
+                Vec.push(g.scopes, scope)
+                push(g)
+                Vec.push(opened, bindings)
+            }
+        }
+    }
+    opened
+}
+
+-- Closes the scopes `guards` opened, innermost first, binding what each bound.
+fun closeGuards(g : Generator, opened : Vec (Map String Ty.Type)) -> Unit {
+    for var i = len(opened) - 1; i >= 0; i = i - 1 {
+        let inner = pop(g)
+        discard(Vec.pop(g.scopes))
+        let bindList = Vec.new(4)
+        for (n, t) in Map.entries(opened[i]) { Vec.push(bindList, (n, t)) }
+        emit(g, CDef(bindList, inner, False))
+    }
 }
 
 -- Returns a name that exactly one of `alt` and `first` binds, paired with

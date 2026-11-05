@@ -1,7 +1,8 @@
 # Patterns
 
 A pattern describes the shape of a value and names its parts. Patterns appear
-in `match` arms, in `if let` and `while let`, in `let` and `var`, in function
+in `match` arms, in `if let` and `while let`, in `let` and `var` (with or
+without `else`), in function
 and lambda parameters, and in `for ... in` loops. This chapter covers the
 pattern forms, what it means for a `match` to be exhaustive, and which
 patterns each of those places accepts.
@@ -244,11 +245,11 @@ wildcards, tuples of irrefutable patterns, and constructors of types that have
 only one constructor, with irrefutable payload patterns, are irrefutable.
 
 Places that bind without a second arm to fall back on accept only irrefutable
-patterns: `let`, `var`, function and lambda parameters, and the pattern of a
-`for ... in` loop. Anything else there is an error that names a value the
+patterns: `let` and `var` without `else`, function and lambda parameters, and
+the pattern of a `for ... in` loop. Anything else there is an error that names a value the
 pattern would not match:
 
-<!-- error: this pattern does not match 'None'; use 'if let' or 'match' -->
+<!-- error: this pattern does not match 'None'; add an 'else' block, or use 'if let' or 'match' -->
 ```kotlin
 fun main() {
     let Some(x) = Vec.pop([1, 2, 3])
@@ -256,7 +257,8 @@ fun main() {
 }
 ```
 
-Use [`if let`](statements.md#if-let-and-if-var), [`while
+Use [`let ... else`](statements.md#let--else-and-var--else), [`if
+let`](statements.md#if-let-and-if-var), [`while
 let`](statements.md#while-let-and-while-var) or [`match`](statements.md#match)
 when a pattern may fail:
 

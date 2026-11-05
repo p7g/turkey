@@ -91,7 +91,9 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
             }
             None -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
-                emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
+                if !endsInTailCall(block) {
+                    emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
+                }
             }
         }
     }
@@ -117,7 +119,7 @@ fun exitLabel(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
 -- Whether anything in `f` branches to its exit.
 fun leaves(f : Func Inst) -> Bool {
     for block in f.blocks {
-        if unreachable(block.term) { return True }
+        if unreachable(block.term) && !endsInTailCall(block) { return True }
         for i in block.insts {
             if Option.isSome(A.allocationOf(i.op))
                || Option.isSome(A.arrayAllocationOf(i.op)) {
@@ -326,14 +328,50 @@ fun prologue(b : Code, l : Frame.Layout) -> Unit {
     saves(b, l, True)
 }
 
--- The prologue undone. `sp` comes back from `x29`, which is one instruction
--- whatever the frame's size, and is left out when the record is all the frame
--- there is.
+-- The prologue undone, and the return.
 fun epilogue(b : Code, l : Frame.Layout) -> Unit {
+    unwind(b, l)
+    instruction(b, A.Ret)
+}
+
+-- The prologue undone: the callee-saved registers, `sp` and the frame record
+-- as the caller left them. `sp` comes back from `x29`, which is one
+-- instruction whatever the frame's size, and is left out when the record is
+-- all the frame there is. Writes no argument register and no scratch, which
+-- is what lets a tail call unwind between its arguments and its branch.
+fun unwind(b : Code, l : Frame.Layout) -> Unit {
     saves(b, l, False)
     if l.size > 16 { instruction(b, A.AddImm(A.sp, A.fp, 0, A.W64)) }
     instruction(b, A.LdpPost(A.fp, A.lr, A.sp, 16))
-    instruction(b, A.Ret)
+}
+
+-- A tail call: the frame comes down with the arguments already in their
+-- registers, and the branch goes to the callee with this function's return
+-- address still in `x30`, so the callee answers this function's caller.
+--
+-- An indirect target goes into `scratch` first. The allocator may have given
+-- it a callee-saved register, which unwinding restores, and `scratch` is
+-- never allocated.
+fun tailCall(b : Code, f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
+             target : Either Asm.Symbol Reg) -> Unit = match target {
+    Left(sym) -> {
+        unwind(b, l)
+        instruction(b, A.B(sym))
+    }
+    Right(through) -> {
+        let r = coloured(f, a, through)
+        if !A.sameRegister(r, scratch) { instruction(b, A.Mov(scratch, r, A.W64)) }
+        unwind(b, l)
+        instruction(b, A.Br(scratch))
+    }
+}
+
+-- Whether a block ends in a tail call, after which it has nothing to emit:
+-- selection leaves such a block's terminator `Unreachable`, and the branch to
+-- the zero exit would be dead code.
+fun endsInTailCall(block : Block Inst) -> Bool {
+    if len(block.insts) == 0 { return False }
+    Option.isSome(A.tailCallOf(block.insts[len(block.insts) - 1].op))
 }
 
 -- The callee-saved registers the colouring actually used, saved on the way in
@@ -393,6 +431,13 @@ fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
     match A.safepointOf(i.op) {
         Some((sb, sn)) -> {
             emit(b, Label(safepointLabel(d, tag, sb, sn)))
+            return
+        }
+        None -> {}
+    }
+    match A.tailCallOf(i.op) {
+        Some(target) -> {
+            tailCall(b, f, a, l, target)
             return
         }
         None -> {}

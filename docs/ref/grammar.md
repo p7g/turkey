@@ -111,8 +111,8 @@ constraint    ::= qualified-CONID atype
 fun-decl  ::= "fun" IDENT context? "(" (pattern ("," pattern)*)? ")" ("->" type)? fun-body
 fun-body  ::= "=" expression
             | block
-let-decl  ::= "let" pattern "=" expression
-var-decl  ::= "var" pattern "=" expression
+let-decl  ::= "let" pattern "=" expression ("else" block)?
+var-decl  ::= "var" pattern "=" expression ("else" block)?
 ```
 
 ## Statements
@@ -161,7 +161,7 @@ atom ::= INT | FLOAT | STRING | CHAR
        | "_"                                                     -- placeholder
        | "\" expression                                          -- placeholder function
        | if-expr
-       | "while" condition block
+       | "while" conditions block
        | "for" pattern "in" condition block
        | "for" statement? ";" expression ";" statement? block
        | "loop" block
@@ -172,15 +172,18 @@ atom ::= INT | FLOAT | STRING | CHAR
 
 field-init ::= IDENT "=" expression
              | IDENT
-if-expr    ::= "if" condition block ("else" (block | if-expr))?
+if-expr    ::= "if" conditions block ("else" (block | if-expr))?
+conditions ::= condition ("," condition)*                        -- no two expressions in a row
 condition  ::= expression                                        -- no bare record expression
-             | ("let" | "var") pattern "=" expression            -- only after "if" and "while"
+             | ("let" | "var") pattern ("|" pattern)* "=" expression  -- only after "if" and "while"
 match-arm  ::= pattern ("|" pattern)* "->" expression
 ```
 
 In a `condition`, and in the collection of `for ... in`, a record expression
-must be parenthesized. `let` and `var` conditions are accepted only after
-`if` and `while`.
+must be parenthesized. `let` and `var` conditions, and lists of more than one
+condition, are accepted only after `if` and `while`. A list of more than one
+condition must contain a `let` or `var`, and two expressions cannot be next
+to each other in it.
 
 ## Operator declarations
 

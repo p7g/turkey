@@ -2,7 +2,7 @@ export (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
     FieldRef(..), fieldRef,
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
-    checkResults, showOpName,
+    checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
@@ -877,6 +877,69 @@ fun isResult(op : Op) -> Bool = match op {
     Result(_, _) -> True
     _ -> False
 }
+
+-- Whether the instruction at `(b, n)` is a call in tail position: followed by
+-- nothing but `Result`s of it, in a block that returns its first result
+-- first (`returned`). A call this answers `False` for is never compiled as a
+-- tail call, and one it answers `True` for may still be compiled as a call
+-- (`Turkey.Select.isTailCall`).
+fun inTailPosition(f : Ssa.Func Low, b : Int, n : Int) -> Bool {
+    let block = f.blocks[b]
+    let call = block.insts[n]
+    match call.op {
+        Call(_, _) -> {}
+        _ -> return False
+    }
+    match returned(f, b) {
+        Some(vs) -> if len(vs) == 0 || vs[0] != call.result { return False }
+        None -> return False
+    }
+    for var at = n + 1; at < len(block.insts); at = at + 1 {
+        match block.insts[at].op {
+            Result(of, _) -> if of != call.result { return False }
+            _ -> return False
+        }
+    }
+    True
+}
+
+-- What block `b` returns, as values of `b`, if its terminator returns
+-- directly or jumps to a block that does nothing but return its parameters.
+-- A branch out of a `match` or an `if` reaches the function's `ret` that way,
+-- through the block that merges them. Followed through a bounded number of
+-- such blocks, since empty blocks may jump around a cycle.
+fun returned(f : Ssa.Func Low, b : Int) -> Option (Vec Value) {
+    var term = f.blocks[b].term
+    -- Most blocks end some other way, and most that return do it directly.
+    match term {
+        Ret(vs) -> return Some(vs)
+        Jump(_, _) -> {}
+        _ -> return None
+    }
+    -- What each parameter of the block being looked at was given, in `b`'s
+    -- values: nothing yet, since `b`'s own terminator names `b`'s values.
+    var given : Map Int Value = Map.new()
+    let resolve = fun(v : Value) -> Value = Map.getOr(given, Ssa.valueId(v), v)
+    for var hops = 0; hops < returnHops; hops = hops + 1 {
+        match term {
+            Ret(vs) -> return Some(Vec.map(vs, resolve))
+            Jump(target, args) -> {
+                let next = Ssa.blockAt(f, target)
+                if len(next.insts) > 0 || len(next.params) != len(args) { return None }
+                let passed = Map.new()
+                for var k = 0; k < len(args); k = k + 1 {
+                    Map.put(passed, Ssa.valueId(next.params[k]), resolve(args[k]))
+                }
+                given = passed
+                term = next.term
+            }
+            _ -> return None
+        }
+    }
+    None
+}
+
+let returnHops = 8
 
 -- Where each `Result` is: directly after the direct call it reads, or after
 -- another result of that call, as instruction selection requires (`Result`).

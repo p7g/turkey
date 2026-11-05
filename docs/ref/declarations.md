@@ -94,6 +94,44 @@ fun main() {
 True
 ```
 
+**Tail calls.** A call is in *tail position* when its result is the
+function's result, with nothing left to do after it: the last expression of
+the body, or of a branch of an `if` or a `match` that is. A call in tail
+position takes the place of its caller's frame instead of adding one, so
+recursion through tail calls runs in constant stack however deep it goes.
+That holds for a call through a closure too, and between functions that call
+each other.
+
+<!-- run -->
+```kotlin
+fun sumTo(n, total) = if n == 0 { total } else { sumTo(n - 1, total + n) }
+
+fun main() {
+    print(sumTo(100000000, 0))
+}
+```
+
+```text
+5000000050000000
+```
+
+Two kinds of call in tail position are still ordinary calls, and keep the
+caller's frame until they return:
+
+* a call with more arguments than fit in registers: past seven arguments
+  other than `Float`s, or eight `Float`s, to a named function, and past
+  seven arguments of any type to a closure;
+* a call to a named function that passes a record or a closure the caller
+  built, which the callee neither keeps nor returns, when the callee can
+  call the caller again only through a closure. A visitor that hands each
+  child of a tree a closure to call back is the usual case, and keeps a
+  frame per level of the tree, as it would without the tail call.
+
+For readers new to this: recursion that is not in tail position, such as
+`n * factorial(n - 1)`, needs a frame per call, because the multiplication
+still has to happen when the call returns. Its depth is limited by the size
+of the stack.
+
 **Names.** A function's name is an `IDENT`. A top-level function belongs to
 its module's namespace, which it shares with top-level `let` and `var`
 bindings. A function may share a name with a [class method](classes.md): the
@@ -383,8 +421,8 @@ takes no parameter list. The parameter is `_`.
 **Syntax**
 
 ```ebnf
-let-decl ::= "let" pattern "=" expression
-var-decl ::= "var" pattern "=" expression
+let-decl ::= "let" pattern "=" expression ("else" block)?
+var-decl ::= "var" pattern "=" expression ("else" block)?
 ```
 
 `let` binds the names in a pattern to the parts of a value. The binding cannot
@@ -399,10 +437,12 @@ fun main() {
 }
 ```
 
-The pattern must be [irrefutable](patterns.md#irrefutable-patterns), so
-`let (x, y) = point` is fine and `let Some(x) = maybe` is an error. Use
-[`if let`](statements.md#if-let-and-if-var) or [`match`](statements.md#match)
-for a pattern that might not match.
+Without an `else`, the pattern must be
+[irrefutable](patterns.md#irrefutable-patterns), so `let (x, y) = point` is
+fine and `let Some(x) = maybe` is an error. For a pattern that might not match,
+add an `else` block that leaves
+([`let ... else`](statements.md#let--else-and-var--else)), or use
+[`if let`](statements.md#if-let-and-if-var) or [`match`](statements.md#match).
 
 `let` and `var` decide whether the *name* can be pointed at something else.
 They do not decide whether the value is mutable. A `let` binding of a

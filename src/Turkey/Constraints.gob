@@ -324,8 +324,8 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
                 -- one it will be is the caller's business. Such an equation is
                 -- merely stuck, and is reported as stuck.
                 Some(missing) -> if !granted(s, missing) {
-                    oops("no instance for '" + Ty.showPred(missing) + "', which '"
-                         + Ty.show(t) + "' needs", where)
+                    return Ty.typeError("no instance for '" + Ty.showPred(missing)
+                                        + "', which '" + Ty.show(t) + "' needs", where)
                 }
                 None -> {}
             }
@@ -640,21 +640,21 @@ fun checkRigid(s : Solver, c : LetCell, retainedPreds : Vec PredCell) -> Unit {
             match Ty.prune(t) {
                 TVar(cell) -> {
                     match Map.get(seen.names, cell.id) {
-                        Some(other) -> oops("the annotation on '" + name + "' says '"
-                            + other + "' and '" + varName + "' are separate types, "
-                            + "but its body makes them the same", Some(where))
+                        Some(other) -> return Ty.typeError("the annotation on '" + name
+                            + "' says '" + other + "' and '" + varName + "' are separate "
+                            + "types, but its body makes them the same", Some(where))
                         None -> {}
                     }
                     Map.put(seen.names, cell.id, varName)
                     if cell.level <= rank(s) {
-                        oops("the annotation on '" + name + "' says '" + varName
-                             + "' is any type, but its body ties it to a type from "
-                             + "outside '" + name + "'", Some(where))
+                        return Ty.typeError("the annotation on '" + name + "' says '"
+                            + varName + "' is any type, but its body ties it to a type "
+                            + "from outside '" + name + "'", Some(where))
                     }
                 }
-                other -> oops("the annotation on '" + name + "' says '" + varName
-                              + "' is any type, but its body makes it '"
-                              + Ty.show(other) + "'", Some(where))
+                other -> return Ty.typeError("the annotation on '" + name + "' says '"
+                    + varName + "' is any type, but its body makes it '"
+                    + Ty.show(other) + "'", Some(where))
             }
         }
         let allowed = Set.new()
@@ -675,14 +675,14 @@ fun checkRigid(s : Solver, c : LetCell, retainedPreds : Vec PredCell) -> Unit {
                         TSet(names) -> Ty.quoteLiteralSet(names)
                         other -> Ty.show(other)
                     }
-                    oops("the annotation on '" + name + "' says '" + varName
-                         + "' is any type, but its body makes it one of "
-                         + members, Some(where))
+                    return Ty.typeError("the annotation on '" + name + "' says '"
+                        + varName + "' is any type, but its body makes it one of "
+                        + members, Some(where))
                 }
-                oops("the body of '" + name + "' needs '"
-                     + Ty.showPredWith(cp.pred, seen) + "', which its "
-                     + "annotation's context does not list; add it to the "
-                     + "context", Some(where))
+                return Ty.typeError("the body of '" + name + "' needs '"
+                    + Ty.showPredWith(cp.pred, seen) + "', which its "
+                    + "annotation's context does not list; add it to the "
+                    + "context", Some(where))
             }
         }
     }
@@ -915,11 +915,14 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         TFam(_, _, _) -> return False
         _ -> {}
     }
-    checkFieldVisibility(s, p, t, c)
+    -- An unsatisfiable predicate is reported and taken as discharged: nothing
+    -- later can satisfy it, so deferring it would only report it again.
+    if checkFieldVisibility(s, p, t, c) { return True }
     match Classes.byInst(s.classes, p) {
         None -> {
-            if Classes.isGenerated(p.name) { noField(s, p, t, c) }
-            oops("no instance for '" + Ty.showPred(p) + "'", c.span)
+            if Classes.isGenerated(p.name) && noField(s, p, t, c) { return True }
+            Ty.typeError("no instance for '" + Ty.showPred(p) + "'", c.span)
+            True
         }
         Some(obligations) -> {
             -- The instance's own context becomes this site's, over the types the
@@ -933,11 +936,12 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
 -- Field evidence reveals representation just as a constructor pattern does.
 -- Check where the evidence is requested, including a polymorphic accessor's
 -- predicate when its caller instantiates it at an abstract record type.
+-- Returns whether it reported an error.
 fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
-                         c : PredCell) -> Unit {
+                         c : PredCell) -> Bool {
     let label = match fieldLabel(p.name) {
         Some(l) -> l
-        None -> return
+        None -> return False
     }
     let (h, _) = Ty.spine(receiver)
     match h {
@@ -945,15 +949,23 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
             Some(info) -> if len(info.variants) == 1 {
                 let ctor = info.variants[0]
                 if Decls.isRecord(ctor) && !Set.contains(s.visibleCons(c.span), ctor.name) {
-                    oops("cannot access field '" + label + "' of abstract type '"
-                         + Ty.show(receiver) + "': constructor '"
-                         + Ty.shortName(ctor.name) + "' is not in scope", c.span)
+                    return reported("cannot access field '" + label + "' of abstract type '"
+                                    + Ty.show(receiver) + "': constructor '"
+                                    + Ty.shortName(ctor.name) + "' is not in scope", c.span)
                 }
             }
             None -> {}
         }
         _ -> {}
     }
+    False
+}
+
+-- Reports a type error and returns `True`, for a check that returns whether
+-- it reported one.
+fun reported(message : String, where : Option Span) -> Bool {
+    Ty.typeError(message, where)
+    True
 }
 
 -- Why a generated field or projection class has no instance.
@@ -961,8 +973,9 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
 -- Ordinary instance resolution would say "no instance for `%HasField.cap Int`",
 -- which names a class the programmer cannot see and did not write. The class is
 -- an implementation of field access, so its failures have to read as field
--- errors.
-fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
+-- errors. Returns whether it reported an error; `False` leaves the predicate
+-- for the caller to report as a plain missing instance.
+fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Bool {
     let (h, _) = Ty.spine(receiver)
     -- Only an assignment's predicates carry "assign to"; any other context,
     -- such as a scheme's, is a read.
@@ -971,24 +984,25 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
         Some(label) -> {
             match h {
                 TCon(con) -> {
-                    if Option.isSome(Classes.setterLabel(p.name)) {
-                        notVar(s, con.name, label, c)
+                    if Option.isSome(Classes.setterLabel(p.name))
+                            && notVar(s, con.name, label, c) {
+                        return True
                     }
                     match Decls.recordFields(s.decls, con.name) {
                         Some(names) -> if !Array.contains(names, label) {
-                            oops("type '" + Ty.show(receiver) + "' has no field '"
-                                 + label + "'; its fields are "
-                                 + String.join(Array.map(names, fun(n) = "'" + n + "'"),
-                                               ", "), c.span)
+                            return reported("type '" + Ty.show(receiver) + "' has no field '"
+                                + label + "'; its fields are "
+                                + String.join(Array.map(names, fun(n) = "'" + n + "'"),
+                                              ", "), c.span)
                         }
                         None -> {}
                     }
                     match Decls.existentialFields(s.decls, con.name) {
                         Some(hidden) -> if Array.contains(hidden, label) {
-                            oops("cannot " + verb + " field '" + label
-                                 + "' of the existential type '"
-                                 + Ty.show(receiver) + "'; take it apart in a "
-                                 + "'match' arm instead", c.span)
+                            return reported("cannot " + verb + " field '" + label
+                                + "' of the existential type '"
+                                + Ty.show(receiver) + "'; take it apart in a "
+                                + "'match' arm instead", c.span)
                         }
                         None -> {}
                     }
@@ -1008,29 +1022,29 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
                 }
                 _ -> ""
             }
-            oops("cannot " + verb + " field '" + label + "': '"
-                 + Ty.show(receiver) + "' is not a record type with one "
-                 + "constructor" + fix, c.span)
+            return reported("cannot " + verb + " field '" + label + "': '"
+                + Ty.show(receiver) + "' is not a record type with one "
+                + "constructor" + fix, c.span)
         }
         None -> {}
     }
     let index = match Classes.generatedIndex(p.name) {
         Some(found) -> found
-        None -> return
+        None -> return False
     }
     let choices = match receiver {
         TTuple(elems) -> Some(elems)
         _ -> Decls.projectionTypes(s.decls, receiver)
     }
     match choices {
-        None -> oops("cannot take '." + Int.toString(index) + "' of '"
-                     + Ty.show(receiver) + "': '." + Int.toString(index)
-                     + "' can only be taken of a tuple or of a type with one "
-                     + "positional constructor", c.span)
-        Some(elems) -> oops("projection index " + Int.toString(index)
-                            + " is out of bounds for '" + Ty.show(receiver)
-                            + "', which has " + Int.toString(len(elems))
-                            + " element(s)", c.span)
+        None -> reported("cannot take '." + Int.toString(index) + "' of '"
+                         + Ty.show(receiver) + "': '." + Int.toString(index)
+                         + "' can only be taken of a tuple or of a type with one "
+                         + "positional constructor", c.span)
+        Some(elems) -> reported("projection index " + Int.toString(index)
+                                + " is out of bounds for '" + Ty.show(receiver)
+                                + "', which has " + Int.toString(len(elems))
+                                + " element(s)", c.span)
     }
 }
 
@@ -1043,18 +1057,19 @@ fun fieldLabel(cls : String) -> Option String = match Classes.generatedLabel(cls
 -- An assignment to a field the record has but did not declare `var`. Named with
 -- its declaration, because that is where the fix goes, and the assignment may
 -- be in another function -- or, for a polymorphic receiver, the error is
--- reported at the call that supplied the record type.
-fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Unit {
+-- reported at the call that supplied the record type. Returns whether it
+-- reported an error.
+fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Bool {
     match Decls.varFields(s.decls, tycon) {
-        Some(vars) -> if Vec.contains(vars, label) { return {} }
-        None -> return {}
+        Some(vars) -> if Vec.contains(vars, label) { return False }
+        None -> return False
     }
     match Decls.fieldSpan(s.decls, tycon, label) {
-        Some(at) -> oops("cannot assign to field '" + label + "': it is not 'var' in '"
+        Some(at) -> reported("cannot assign to field '" + label + "': it is not 'var' in '"
             + Ty.shortName(tycon) + "' (declared at " + at.file + ":"
             + showSpan(at) + "); declare it 'var " + label
             + "' to make it assignable", c.span)
-        None -> {}
+        None -> False
     }
 }
 
@@ -1115,8 +1130,8 @@ fun oneOfRule(s : Solver, c : PredCell) -> Bool {
     } else {
         "a numeric literal"
     }
-    oops(what + " cannot have type '" + Ty.show(t) + "'; it must be "
-         + "one of " + Ty.quoteLiteralSet(names), c.span)
+    reported(what + " cannot have type '" + Ty.show(t) + "'; it must be "
+             + "one of " + Ty.quoteLiteralSet(names), c.span)
 }
 
 -- The type a `OneOf` demand's member `name` stands for: the member itself for
@@ -1157,11 +1172,14 @@ fun improveNumeric(s : Solver) -> Unit {
                 let names = intersect(setNames(first.pred.args[1], first.span),
                                       setNames(c.pred.args[1], c.span))
                 if len(names) == 0 {
-                    oops("no numeric type is both one of "
-                         + Ty.quoteLiteralSet(setNames(first.pred.args[1], first.span))
-                         + " and one of "
-                         + Ty.quoteLiteralSet(setNames(c.pred.args[1], c.span)),
-                         c.span)
+                    -- Dropped once reported: an empty set describes no type, and
+                    -- nothing later could widen it.
+                    Ty.typeError("no numeric type is both one of "
+                                 + Ty.quoteLiteralSet(setNames(first.pred.args[1], first.span))
+                                 + " and one of "
+                                 + Ty.quoteLiteralSet(setNames(c.pred.args[1], c.span)),
+                                 c.span)
+                    continue
                 }
                 first.pred = Ty.pred(first.pred.name,
                                      [first.pred.args[0], TSet(names)])
@@ -1294,29 +1312,30 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
             _ -> "?"
         }
         match fieldLabel(owner) {
-            Some(label) -> unknownReceiver("field '" + label + "' is used",
-                                           c.span)
+            Some(label) -> return unknownReceiver("field '" + label + "' is used",
+                                                  c.span)
             None -> {}
         }
         match Classes.generatedIndex(owner) {
-            Some(index) -> unknownReceiver("'." + Int.toString(index)
-                                           + "' is taken", c.span)
+            Some(index) -> return unknownReceiver("'." + Int.toString(index)
+                                                  + "' is taken", c.span)
             None -> {}
         }
         let where = if c.context == "" { "" } else { " in " + c.context }
         -- Name the remedy. It is not "add a type annotation": an equality is
         -- something a context can state, and stating it is what fixes this.
         let equality = Ty.show(fam) + " ~ " + Ty.show(other)
-        oops("cannot tell whether '" + Ty.show(fam) + "' is '" + Ty.show(other)
-             + "'" + where + "; add '" + equality + "' to the context", c.span)
+        return Ty.typeError("cannot tell whether '" + Ty.show(fam) + "' is '"
+                            + Ty.show(other) + "'" + where + "; add '" + equality
+                            + "' to the context", c.span)
     }
     match fieldLabel(c.pred.name) {
-        Some(label) -> unknownReceiver("field '" + label + "' is used", c.span)
+        Some(label) -> return unknownReceiver("field '" + label + "' is used", c.span)
         None -> {}
     }
     match Classes.generatedIndex(c.pred.name) {
-        Some(index) -> unknownReceiver("'." + Int.toString(index) + "' is taken",
-                                       c.span)
+        Some(index) -> return unknownReceiver("'." + Int.toString(index) + "' is taken",
+                                              c.span)
         None -> {}
     }
     let names = Ty.namer("")
@@ -1324,16 +1343,16 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
     let vars = Ty.varsOf(c.pred.args)
     let unknown = if len(vars) == 0 { None } else { Map.get(names.names, vars[0].id) }
     match unknown {
-        Some(v) -> oops("cannot determine what type '" + v + "' is in '" + shown
-                        + "'; add a type annotation", c.span)
-        None -> oops("cannot determine a type satisfying '" + shown
-                     + "'; add a type annotation", c.span)
+        Some(v) -> Ty.typeError("cannot determine what type '" + v + "' is in '"
+                                + shown + "'; add a type annotation", c.span)
+        None -> Ty.typeError("cannot determine a type satisfying '" + shown
+                             + "'; add a type annotation", c.span)
     }
 }
 
-fun unknownReceiver(what : String, where : Option Span) -> a =
-    oops("cannot determine the type of the value whose " + what
-         + " here; add a type annotation", where)
+fun unknownReceiver(what : String, where : Option Span) -> Unit =
+    Ty.typeError("cannot determine the type of the value whose " + what
+                 + " here; add a type annotation", where)
 
 -- -- context splitting -------------------------------------------------------------
 
@@ -1394,11 +1413,6 @@ fun touches(c : PredCell, ids : Set.Set Int) -> Bool {
         if Set.contains(ids, v.id) { return True }
     }
     False
-}
-
-fun oops(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("type error", message), "")
-    Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
 }
 
 -- Reports a check that only a compiler bug can fail.

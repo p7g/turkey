@@ -2224,6 +2224,17 @@ fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
     copyTerm(copier(mint, subst, renamed, freshen, rebase), body)
 
 fun copyTerm(c : Copier, e : Core) -> Core {
+    -- A leaf that binds nothing and reads nothing renamed or replaced is
+    -- shared as it is, unless its span is to change.
+    if Option.isNone(c.rebase) {
+        match e.kind {
+            CLit(_) | CUnit | CCon(_) | CPrim(_) -> return e
+            CVar(_, id) -> if !Map.contains(c.subst, id) && !Map.contains(c.renamed, id) {
+                return e
+            }
+            _ -> {}
+        }
+    }
     let before = c.substituted
     let changedBefore = c.changed
     let kind = match e.kind {
@@ -2287,9 +2298,11 @@ fun copyTerm(c : Copier, e : Core) -> Core {
             bind = fun(_) = oops("a binding outside a letrec reached copyTerm"),
         })
     }
-    -- A term that moves keeps every subterm the walk changed nothing in, as
-    -- it was: not rebuilt, and still marked as settled.
-    if !c.freshen && Option.isNone(c.rebase) && c.changed == changedBefore { return e }
+    -- A subterm the walk changed nothing in -- one that binds nothing and
+    -- reads nothing renamed or replaced -- is shared as it was, not rebuilt
+    -- and still marked as settled. Sharing it is sound because only binders
+    -- have to be unique, and it has none.
+    if Option.isNone(c.rebase) && c.changed == changedBefore { return e }
     let span = match c.rebase {
         Some(s) -> s
         None -> e.span
@@ -2378,18 +2391,28 @@ type Adopter = Adopter {
     -- The binder each spelling means here, by id; `noId` for evidence.
     terms  : Map String Int,
     labels : Map String Int,
+    -- How many binders and references the walk has given an id so far.
+    var changed : Int,
 }
 
 fun adopt(table : Binders.Table, b : CBind) -> CBind = withValue(b, adoptTerm(Adopter {
-    table = table, bind = b, owner = -1, terms = Map.new(), labels = Map.new(),
+    table = table, bind = b, owner = -1, terms = Map.new(), labels = Map.new(), changed = 0,
 }, b.value))
 
-fun adoptTerm(a : Adopter, e : Core) -> Core = mkCore(e.ty, e.span, match e.kind {
+-- `e` as `adoptProgram` leaves it: the term itself when it has no binder or
+-- reference without an id, so that most of the program is not rebuilt.
+fun adoptTerm(a : Adopter, e : Core) -> Core {
+    let before = a.changed
+    let made = mkCore(e.ty, e.span, adoptKind(a, e))
+    if a.changed == before { e } else { made }
+}
+
+fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
     CVar(name, id) -> if id != noId { e.kind } else {
-        CVar(name, Map.getOr(a.terms, name, noId))
+        CVar(name, adoptReference(a, a.terms, name))
     }
     CJump(name, id, args) -> CJump(name,
-        if id != noId { id } else { Map.getOr(a.labels, name, noId) },
+        if id != noId { id } else { adoptReference(a, a.labels, name) },
         Vec.map(args, adoptTerm(a, _)))
     CLam(params, body, label) -> {
         let ps = Array.map(params, fun(p) =
@@ -2453,10 +2476,19 @@ fun adoptTerm(a : Adopter, e : Core) -> Core = mkCore(e.ty, e.span, match e.kind
         type_ = fun(t) = t,
         bind = fun(_) = oops("a binding outside a letrec reached adoptTerm"),
     })
-})
+}
+
+-- The id of the binder `name` means in `scope`, or `noId` for a top-level
+-- binding.
+fun adoptReference(a : Adopter, scope : Map String Int, name : String) -> Int {
+    let id = Map.getOr(scope, name, noId)
+    if id != noId { a.changed = a.changed + 1 }
+    id
+}
 
 fun adoptId(a : Adopter, name : String, id : Int) -> Int {
     if id != noId { return id }
+    a.changed = a.changed + 1
     if a.owner < 0 {
         a.owner = if a.bind.id != noId { Binders.ownerOf(a.bind.id) } else {
             Binders.owner(a.table, a.bind.module_, a.bind.name)

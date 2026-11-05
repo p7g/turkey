@@ -285,6 +285,26 @@ fun successorsOf(graph : Map String (Set.Set String), name : String)
 
 -- -- the traversal --------------------------------------------------------------------
 
+-- What is being inlined around the term being reduced: the calls `inline`
+-- leaves alone here that it would inline elsewhere.
+type Inlining = Inlining {
+    -- What is currently being inlined. Belt and braces beside the loop
+    -- breakers: this makes non-termination impossible in the code rather than
+    -- merely absent from the graph.
+    active : Vec String,
+    -- A speculative large inline may reduce ordinary small calls inside its
+    -- residual, but does not recursively speculate about another large call.
+    var speculating : Bool,
+    -- How many times a call was left alone only because of `active` or
+    -- `speculating`. A term reduced while this stayed put is at a fixed point
+    -- whatever is being inlined around it, and `expr` marks it so; one reduced
+    -- while it moved may reduce further once those are lifted.
+    var declined : Int,
+}
+
+-- Returns the context of a term with nothing inlined around it.
+fun outermost() -> Inlining = Inlining { active = [], speculating = False, declined = 0 }
+
 type Reducer = Reducer {
     breakers : Set.Set String,
     -- Which constructors are their type's only one, and a record constructor's
@@ -297,10 +317,7 @@ type Reducer = Reducer {
     bindings : Map String CBind,
     -- The dictionaries a projection is read out of (`Turkey.Methods`).
     dicts : Methods.Dictionaries,
-    -- What is currently being inlined. Belt and braces beside the loop
-    -- breakers: this makes non-termination impossible in the code rather than
-    -- merely absent from the graph.
-    active : Vec String,
+    inlining : Inlining,
     -- The size and the transfer question of each reduced body, beside the body
     -- itself: both are questions about the callee, so both are asked once per
     -- binding rather than once per call site. These, and `reduced` below,
@@ -310,9 +327,9 @@ type Reducer = Reducer {
     moves : Map String Bool,
     ends  : Map String Bool,
     cache : Cache,
-    -- A speculative large inline may reduce ordinary small calls inside its
-    -- residual, but does not recursively speculate about another large call.
-    var speculating : Bool,
+    -- Which call of `reduceProgram` this is. The second can inline what the
+    -- first could not, so it must not trust the first's marks.
+    run : Int,
     -- A binding's body, reduced, computed once. Without it a chain `f` calls
     -- `g` calls `h` re-reduces `h` once per path that reaches it, which is
     -- exponential in the depth of the call graph.
@@ -385,7 +402,7 @@ type Done = Done {
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
-               walked : Array Walked) -> Reducer {
+               walked : Array Walked, run : Int) -> Reducer {
     let all = Vec.append(program.dicts, program.binds)
     let bindings = Map.new()
     for b in all {
@@ -412,9 +429,9 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
     Reducer {
         breakers = loopBreakers(graph), decls = decls, bindings = bindings,
         dicts = Methods.dictionaries(program.dicts),
-        active = Vec.new(8), sizes = Map.new(), moves = Map.new(),
+        inlining = outermost(), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
-        speculating = False, reduced = Map.new(), constants = Map.new(),
+        run = run, reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written, counter = 0,
         scope = "", usedNames = used,
         homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
@@ -432,8 +449,8 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
 fun forComponent(base : Reducer, c : Int, scope : String, finished : fun(Int) -> Done,
                  cache : Cache) -> Reducer = Reducer {
     breakers = base.breakers, decls = base.decls, bindings = base.bindings,
-    dicts = base.dicts, active = Vec.new(8), sizes = Map.new(), moves = Map.new(),
-    ends = Map.new(), cache = cache, speculating = False, reduced = Map.new(),
+    dicts = base.dicts, inlining = outermost(), sizes = Map.new(), moves = Map.new(),
+    ends = Map.new(), cache = cache, run = base.run, reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     counter = 0, scope = scope, usedNames = base.usedNames,
     homes = base.homes, component = c, finished = finished,
@@ -530,6 +547,9 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
               + (if len(components) > 0 { components[largestAt][0] } else { "" }) + ")\n")
 }
 
+-- How many times `reduceProgram` has been called, which numbers its runs from 1.
+var runs = 0
+
 -- Every binding's body, reduced -- callees before their callers.
 --
 -- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
@@ -558,7 +578,8 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
-    let base = newReducer(program, decls, graph, walked)
+    runs = runs + 1
+    let base = newReducer(program, decls, graph, walked, runs)
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
@@ -682,6 +703,10 @@ fun memoize(r : Reducer, name : String, value : Core) -> Unit {
 -- are going to get -- which is what lets one traversal do the work of running
 -- three passes to a fixed point.
 fun expr(r : Reducer, e : Core) -> Core {
+    -- A rewrite's result is walked again below, and without this every
+    -- subterm it kept would be reduced again at every rewrite above it.
+    if e.settledIn == r.run { return e }
+    let declined = r.inlining.declined
     var out = children(r, e)
     var settled = False
     while !settled {
@@ -694,6 +719,8 @@ fun expr(r : Reducer, e : Core) -> Core {
             Some(made) -> { out = children(r, made) }
         }
     }
+    -- `out` is new, from `children`, so nothing else holds it yet.
+    if r.inlining.declined == declined { out.settledIn = r.run }
     out
 }
 
@@ -904,7 +931,9 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
         }
         _ -> return None
     }
-    if Set.contains(r.breakers, name) || Vec.contains(r.active, name) {
+    if Set.contains(r.breakers, name) { return None }
+    if Vec.contains(r.inlining.active, name) {
+        r.inlining.declined = r.inlining.declined + 1
         return None
     }
     let bind = match Map.get(r.bindings, name) {
@@ -991,7 +1020,9 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
         return Some(applyParams(r, params, args, rebaseSpans(body, e.span), e.ty))
     }
     let size = sizeOf(r, name, key, body)
-    if size > speculativeInlineLimit || (r.speculating && size > limit) {
+    if size > speculativeInlineLimit { return None }
+    if r.inlining.speculating && size > limit {
+        r.inlining.declined = r.inlining.declined + 1
         return None
     }
     -- A callee that always panics has no useful residual -- there is nothing
@@ -1021,10 +1052,10 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- large calls could speculate at every level after all. That is unbounded
     -- rather than merely expensive: the traversal's depth grew with whatever
     -- stack it was given.
-    let was = r.speculating
-    r.speculating = True
+    let was = r.inlining.speculating
+    r.inlining.speculating = True
     let residual = expr(r, made)
-    r.speculating = was
+    r.inlining.speculating = was
     if sizeOf_(residual) <= limit { Some(residual) } else { None }
 }
 
@@ -1109,16 +1140,17 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
                 CLam(_, body, _) -> body
                 _ -> oops("a callee whose value is not a lambda")
             }
-            let (counter, scope, speculating) = (r.counter, r.scope, r.speculating)
+            let (counter, scope) = (r.counter, r.scope)
+            let speculating = r.inlining.speculating
             r.counter = 0
             r.scope = ".k" + Int.toString(keyHash(key))
-            r.speculating = False
-            Vec.push(r.active, name)
+            r.inlining.speculating = False
+            Vec.push(r.inlining.active, name)
             let made = expr(r, inner)
-            discard(Vec.pop(r.active))
+            discard(Vec.pop(r.inlining.active))
             r.counter = counter
             r.scope = scope
-            r.speculating = speculating
+            r.inlining.speculating = speculating
             Map.put(if owned(r, name) { r.reduced } else { r.cache.reduced }, key, made)
             made
         }
@@ -2161,8 +2193,8 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
 --
 -- This runs before value arguments are substituted, so those argument nodes
 -- retain their own caller spans when the substitution inserts them.
-fun rebaseSpans(e : Core, span : Option Span) -> Core =
-    mkCore(e.ty, span, mapKind(e.kind, Mapper {
+fun rebaseSpans(e : Core, span : Option Span) -> Core {
+    let copy = mkCore(e.ty, span, mapKind(e.kind, Mapper {
         expr = fun(x) = rebaseSpans(x, span),
         type_ = fun(t) = t,
         bind = fun(b) = CBind {
@@ -2172,6 +2204,11 @@ fun rebaseSpans(e : Core, span : Option Span) -> Core =
             layouts = b.layouts,
         },
     }))
+    -- No reduction reads a span, so a copy of a settled body is settled too,
+    -- and an inlined body is not reduced again at every call site.
+    copy.settledIn = e.settledIn
+    copy
+}
 
 fun substituteNames(e : Core, mapping : Map String Core) -> Core = match e.kind {
     CVar(name, _) -> match Map.get(mapping, name) {

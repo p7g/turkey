@@ -206,12 +206,19 @@ start() {
     exit 1
 }
 
-# Stops the server and waits for every one of its processes to end.
+# Succeeds if any of the processes named is running. An exited process the
+# shell has not reaped yet is a zombie, which `kill -0` would count.
+running() {
+    ps -o stat= -p "$(echo "$@" | tr ' ' ',')" 2> /dev/null | grep -qv '^Z'
+}
+
+# Stops the server and waits for every one of its processes to end, for at
+# most five seconds before killing what is left.
 stop() {
     all=$(pids)
     kill $all 2> /dev/null || true
     for _ in $(seq 50); do
-        if ! kill -0 $all 2> /dev/null; then break; fi
+        if ! running $all; then break; fi
         sleep 0.1
     done
     kill -9 $all 2> /dev/null || true
@@ -229,15 +236,19 @@ rss() {
     ps -o rss= -p "$(pids | tr ' ' ',')" | awk '{ s += $1 } END { print s }'
 }
 
-# Samples rss() every half second while process $1 runs; prints the peak.
-peak() {
+# Samples rss() every half second until $OUT/sampled exists, then writes the
+# peak to it. Run it in the background beside the load. It stops on a file
+# rather than when the load's process ends, because a shell may not reap
+# that process while it waits for this one -- dash does not -- and
+# `kill -0` succeeds on an unreaped process.
+sample() {
     max=0
-    while kill -0 "$1" 2> /dev/null; do
+    while [ ! -e "$OUT/sampled" ]; do
         r=$(rss)
         if [ "$r" -gt "$max" ]; then max=$r; fi
         sleep 0.5
     done
-    echo $max
+    echo $max > "$OUT/sampled"
 }
 
 # Runs wrk against the server: SCENARIO IMPL CONNS MODE URL [wrk options],
@@ -251,16 +262,21 @@ measure() {
     for rep in $(seq "$REPS"); do
         state=$(quiet)
         start "$impl" "$mode"
+        rm -f "$OUT/sampled"
         if [ "${1:-}" = connload ]; then
             GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" 2 > /dev/null 2>&1 || true
-            GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" "$SECONDS_PER_RUN" > "$OUT/wrk.out" 2>&1 &
+            sample &
+            sampler=$!
+            GOMAXPROCS=$CONNLOAD_PROCS "$OUT/go-connload" "$url" "$conns" "$SECONDS_PER_RUN" > "$OUT/wrk.out" 2>&1 || true
         else
             wrk -t"$threads" -c"$conns" -d2s -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > /dev/null 2>&1 || true
-            wrk -t"$threads" -c"$conns" -d"${SECONDS_PER_RUN}s" -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > "$OUT/wrk.out" 2>&1 &
+            sample &
+            sampler=$!
+            wrk -t"$threads" -c"$conns" -d"${SECONDS_PER_RUN}s" -s "$HERE/wrk.lua" "$@" "$url" ${SCRIPT_ARGS:-} > "$OUT/wrk.out" 2>&1 || true
         fi
-        load=$!
-        top=$(peak $load)
-        wait $load || true
+        touch "$OUT/sampled"
+        wait $sampler || true
+        top=$(cat "$OUT/sampled")
         stop
         line=$(grep '^rps=' "$OUT/wrk.out" || { cat "$OUT/wrk.out" >&2; echo "rps=0"; })
         echo "  $scenario $impl c=$conns #$rep: $line rss_kb=$top $state"

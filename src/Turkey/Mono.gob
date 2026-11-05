@@ -253,6 +253,9 @@ type Mono = Mono {
     classes    : ClassTable,
     state      : State,
     byname     : Map String CBind,
+    -- The id of every top-level binding by name, the ones this round makes
+    -- included, for a reference this pass writes by name.
+    topIds     : Map String Int,
     generic    : Map String CBind,
     takesDicts : Set.Set String,
     -- Every top-level dictionary binding. A collapse may only be handed one of
@@ -269,7 +272,7 @@ type Mono = Mono {
 fun newMono(program : CProgram, table : Binders.Table, decls : DeclTable,
             classes : ClassTable, state : State) -> Mono = Mono {
     program = program, table = table, decls = decls, classes = classes,
-    state = state, byname = Map.new(), generic = Map.new(),
+    state = state, byname = Map.new(), topIds = Map.new(), generic = Map.new(),
     takesDicts = Set.new(), topDicts = Set.new(), dictGroup = Set.new(),
     made = Map.new(), queue = Vec.new(8),
 }
@@ -396,7 +399,8 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
     CVar(name, id) -> match Map.get(r.rename, name) {
         -- A dictionary parameter a collapse consumed: the dictionary it was
         -- handed, which is top-level.
-        Some(dict) -> mkCore(rTy(r, e.ty), e.span, CVar(dict, id))
+        Some(dict) -> mkCore(rTy(r, e.ty), e.span,
+                             CVar(dict, Map.getOr(r.owner.topIds, dict, noId)))
         None -> mkCore(rTy(r, e.ty), e.span, CVar(name, refId(r, id)))
     }
     CTyApp(fn, args) -> rewriteTyApp(r, e, fn, args)
@@ -767,6 +771,7 @@ fun runMono(m : Mono) -> CProgram {
     for (group, isDict) in [(m.program.dicts, True), (m.program.binds, False)] {
         for b in group {
             Map.put(m.byname, b.name, b)
+            Map.put(m.topIds, b.name, b.id)
             if len(b.binders) > 0 { Map.put(m.generic, b.name, b) }
             if isDict { Set.add(m.dictGroup, b.name) }
             if isDict && len(b.binders) == 0 { Set.add(m.topDicts, b.name) }
@@ -881,6 +886,7 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type,
     -- binding terminate: the copy's own call to itself, at its own arguments,
     -- finds this entry rather than asking for another copy.
     Map.put(m.state.done, key, (name, id))
+    Map.put(m.topIds, name, id)
     Vec.push(m.queue, (name, id, b, targs, dicts))
     Some((name, id))
 }

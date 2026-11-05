@@ -1,4 +1,7 @@
-export (CompileUnit(..), Subprogram(..), sourceFiles, emitUnit)
+export (
+    CompileUnit(..), Subprogram(..), sourceFiles, emitUnit,
+    Row(..), Sequence(..), LineTable(..), lineTable, uleb,
+)
 
 -- DWARF 5 debug information as stream items (`Turkey.Stream`): the sections
 -- `-g` adds besides the line table, which the assembler builds from the
@@ -7,6 +10,11 @@ export (CompileUnit(..), Subprogram(..), sourceFiles, emitUnit)
 -- Items rather than text, so the assembly printer and an object writer read
 -- the same entries, and the bytes one writes can be checked against what the
 -- system assembler makes of the other's.
+--
+-- And the line table itself, as bytes, for `Turkey.Assembler`: it holds the
+-- rows the `Loc` items leave, as the system assembler holds the `.loc` rows,
+-- and builds the table the same way, so that the two tables can be compared
+-- byte for byte.
 --
 -- What is written is one compile unit for the program, which is one object,
 -- and a subprogram for each function in it: its name and its range of
@@ -240,4 +248,297 @@ fun stringLabel(d : Asm.Dialect, k : Int) -> Symbol =
 fun half(n : Int, out : Vec (Item i)) -> Unit {
     Vec.push(out, Byte(n & 0xFF))
     Vec.push(out, Byte((n >> 8) & 0xFF))
+}
+
+-- -- the line table ------------------------------------------------------------
+
+-- A row of the line table: its offset in the section its code is in, the
+-- position it starts (`Turkey.Position`), and whether it is where a
+-- function's body begins.
+type Row = Row { offset : Int, at : Int, prologueEnd : Bool }
+
+-- The rows in one section, in order, and the section's length, which is
+-- where the last row ends.
+type Sequence = Sequence { rows : Vec Row, end : Int }
+
+-- `debug_line`, and `debug_line_str` with the paths it names. Each field of
+-- `line` the object writer relocates is listed by its offset in `line`: a
+-- four-byte path field with the offset in `strings` it holds, and each
+-- sequence's eight-byte start address, the offset of its first row.
+type LineTable = LineTable {
+    line      : Vec Byte,
+    strings   : Vec Byte,
+    paths     : Vec (Int, Int),
+    addresses : Vec Int,
+}
+
+let lineBase = -5
+let lineRange = 14
+let opcodeBase = 13
+-- The operands each standard opcode takes, from `DW_LNS_copy` to
+-- `DW_LNS_set_isa`.
+let standardLengths = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+
+let lnsCopy = 0x01
+let lnsAdvancePc = 0x02
+let lnsAdvanceLine = 0x03
+let lnsSetFile = 0x04
+let lnsSetColumn = 0x05
+let lnsNegateStmt = 0x06
+let lnsConstAddPc = 0x08
+let lnsSetPrologueEnd = 0x0a
+let lneEndSequence = 0x01
+let lneSetAddress = 0x02
+
+let lnctPath = 0x01
+let lnctDirectoryIndex = 0x02
+let formLineStrp = 0x1f
+let formUdata = 0x0f
+
+-- The largest address advance one special opcode can make.
+let specialAddressMost = (255 - opcodeBase) / lineRange
+
+-- The line table for the source files `files`, as the `SourceFile` items
+-- give them, and the rows in `sequences`.
+--
+-- The encoding is the system assembler's, choice for choice, which is what
+-- lets the bytes be compared rather than only the rows they decode to. Where
+-- DWARF leaves a choice, the choice here is LLVM's:
+--
+-- * Directory 0 is the compile directory. A file's path is cut at its last
+--   `/` into a directory and a name, and each directory is listed once, in
+--   the order first named. File 0's name is not cut.
+-- * Every path is a `DW_FORM_line_strp`, each distinct string stored once in
+--   `debug_line_str`, in the order first named: the directories, then the
+--   files.
+-- * A sequence starts with `DW_LNE_set_address` at its first row and ends
+--   with `DW_LNE_end_sequence` at its section's end. Between rows, a change
+--   of line and address is one special opcode where it fits, and where it
+--   does not, `DW_LNS_advance_line` and then a special opcode, or a
+--   `DW_LNS_const_add_pc` or `DW_LNS_advance_pc` before one.
+fun lineTable(files : Vec (Int, Option String, String), sequences : Vec Sequence) -> LineTable {
+    let t = LineTable { line = [], strings = [], paths = [], addresses = [] }
+    let interned = Map.new()
+    let path = fun(text : String) {
+        let offset = match Map.get(interned, text) {
+            Some(k) -> k
+            None -> {
+                let k = len(t.strings)
+                Map.put(interned, text, k)
+                for b in String.bytes(text) { Vec.push(t.strings, b) }
+                Vec.push(t.strings, Byte.truncate(0))
+                k
+            }
+        }
+        Vec.push(t.paths, (len(t.line), offset))
+        word(t.line, 4, 0)
+    }
+    -- File `n` at `names[n]`, cut into its directory's number and its name.
+    var directory = "."
+    var root = ""
+    var count = 0
+    for (n, _, _) in files { if n + 1 > count { count = n + 1 } }
+    let names = Array.filled(count, "")
+    let directories : Vec String = []
+    let indices = Array.filled(count, 0)
+    for (n, dir, name) in files {
+        if n == 0 {
+            directory = Option.unwrapOr(dir, ".")
+            names[0] = name
+        } else {
+            let (at, base) = cutPath(dir, name)
+            names[n] = base
+            if at != "" {
+                let found = Vec.indexOf(directories, at)
+                indices[n] = 1 + match found {
+                    Some(k) -> k
+                    None -> {
+                        Vec.push(directories, at)
+                        len(directories) - 1
+                    }
+                }
+            }
+        }
+    }
+    for var n = 1; n < count; n = n + 1 {
+        if names[n] == "" {
+            error("internal error: the line table has no source file " + Int.toString(n))
+        }
+    }
+
+    let out = t.line
+    -- The unit's length and the header's, filled in once known; each counts
+    -- from after its own field.
+    word(out, 4, 0)
+    word(out, 2, version)
+    Vec.push(out, Byte.truncate(addressSize))
+    Vec.push(out, Byte.truncate(0))
+    let headerLength = len(out)
+    word(out, 4, 0)
+    -- Instructions are counted in bytes, one operation each, and a row is a
+    -- statement unless it says otherwise.
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(lineBase & 0xFF))
+    Vec.push(out, Byte.truncate(lineRange))
+    Vec.push(out, Byte.truncate(opcodeBase))
+    for n in standardLengths { Vec.push(out, Byte.truncate(n)) }
+    Vec.push(out, Byte.truncate(1))
+    uleb(out, lnctPath)
+    uleb(out, formLineStrp)
+    uleb(out, len(directories) + 1)
+    path(directory)
+    for d in directories { path(d) }
+    Vec.push(out, Byte.truncate(2))
+    uleb(out, lnctPath)
+    uleb(out, formLineStrp)
+    uleb(out, lnctDirectoryIndex)
+    uleb(out, formUdata)
+    uleb(out, if count == 0 { 1 } else { count })
+    for var n = 0; n < count; n = n + 1 {
+        path(names[n])
+        uleb(out, indices[n])
+    }
+    Byte.putLE(out, headerLength, 4, len(out) - headerLength - 4)
+    for s in sequences { sequence(t, s) }
+    Byte.putLE(out, 0, 4, len(out) - 4)
+    t
+}
+
+-- A file's directory and name: the directory it was given if any, and
+-- otherwise its path cut at the last `/`. A path with no `/` has no
+-- directory, and so is in the compile directory.
+fun cutPath(dir : Option String, name : String) -> (String, String) = match dir {
+    Some(d) -> (d, name)
+    None -> match String.rsplitOnce(name, "/") {
+        Some(("", base)) -> ("/", base)
+        Some((d, base)) -> (d, base)
+        None -> ("", name)
+    }
+}
+
+-- One sequence's rows, from the state DWARF starts each sequence in: file
+-- 1, line 1, column 0, a statement.
+fun sequence(t : LineTable, s : Sequence) -> Unit {
+    let out = t.line
+    var file = 1
+    var line = 1
+    var column = 0
+    var stmt = True
+    var last = -1
+    for r in s.rows {
+        let f = Position.file(r.at)
+        let l = Position.line(r.at)
+        let c = Position.column(r.at)
+        if f != file {
+            file = f
+            Vec.push(out, Byte.truncate(lnsSetFile))
+            uleb(out, f)
+        }
+        if c != column {
+            column = c
+            Vec.push(out, Byte.truncate(lnsSetColumn))
+            uleb(out, c)
+        }
+        if Position.isStmt(r.at) != stmt {
+            stmt = !stmt
+            Vec.push(out, Byte.truncate(lnsNegateStmt))
+        }
+        if r.prologueEnd { Vec.push(out, Byte.truncate(lnsSetPrologueEnd)) }
+        if last < 0 {
+            Vec.push(out, Byte.truncate(0))
+            uleb(out, 1 + addressSize)
+            Vec.push(out, Byte.truncate(lneSetAddress))
+            Vec.push(t.addresses, len(out))
+            word(out, addressSize, 0)
+            advance(out, l - line, 0)
+        } else {
+            advance(out, l - line, r.offset - last)
+        }
+        line = l
+        last = r.offset
+    }
+    if last < 0 { return }
+    let rest = s.end - last
+    if rest == specialAddressMost {
+        Vec.push(out, Byte.truncate(lnsConstAddPc))
+    } else if rest > 0 {
+        Vec.push(out, Byte.truncate(lnsAdvancePc))
+        uleb(out, rest)
+    }
+    Vec.push(out, Byte.truncate(0))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(lneEndSequence))
+}
+
+-- A new row `lines` lines and `bytes` bytes on from the last.
+fun advance(out : Vec Byte, lines : Int, bytes : Int) -> Unit {
+    var delta = lines
+    var biased = lines - lineBase
+    var copy = False
+    if biased < 0 || biased >= lineRange {
+        Vec.push(out, Byte.truncate(lnsAdvanceLine))
+        sleb(out, lines)
+        delta = 0
+        biased = -lineBase
+        copy = True
+    }
+    if delta == 0 && bytes == 0 {
+        Vec.push(out, Byte.truncate(lnsCopy))
+        return
+    }
+    let special = biased + opcodeBase
+    if bytes < 256 + specialAddressMost {
+        if special + bytes * lineRange <= 255 {
+            Vec.push(out, Byte.truncate(special + bytes * lineRange))
+            return
+        }
+        let rest = special + (bytes - specialAddressMost) * lineRange
+        if rest <= 255 {
+            Vec.push(out, Byte.truncate(lnsConstAddPc))
+            Vec.push(out, Byte.truncate(rest))
+            return
+        }
+    }
+    Vec.push(out, Byte.truncate(lnsAdvancePc))
+    uleb(out, bytes)
+    Vec.push(out, Byte.truncate(if copy { lnsCopy } else { special }))
+}
+
+-- `n`, at least 0, in unsigned LEB128: seven bits a byte from the lowest, the
+-- top bit set on every byte but the last.
+fun uleb(out : Vec Byte, n : Int) -> Unit {
+    var rest = n
+    loop {
+        let low = rest & 0x7F
+        rest = rest >> 7
+        if rest == 0 {
+            Vec.push(out, Byte.truncate(low))
+            break
+        }
+        Vec.push(out, Byte.truncate(low | 0x80))
+    }
+}
+
+-- `n` in signed LEB128: as `uleb`, until what is left is all sign bits and
+-- the last byte's top data bit agrees with them.
+fun sleb(out : Vec Byte, n : Int) -> Unit {
+    var rest = n
+    loop {
+        let low = rest & 0x7F
+        rest = rest >> 7
+        if (rest == 0 && (low & 0x40) == 0) || (rest == -1 && (low & 0x40) != 0) {
+            Vec.push(out, Byte.truncate(low))
+            break
+        }
+        Vec.push(out, Byte.truncate(low | 0x80))
+    }
+}
+
+-- `n` in `width` bytes, least significant first.
+fun word(out : Vec Byte, width : Int, n : Int) -> Unit {
+    let at = len(out)
+    for var k = 0; k < width; k = k + 1 { Vec.push(out, Byte.truncate(0)) }
+    Byte.putLE(out, at, width, n)
 }

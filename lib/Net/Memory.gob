@@ -14,7 +14,7 @@ export (Pipe, Listener, pair, listener, connect, accept, closeListener)
 -- * Each direction holds at most the capacity it was made with. A write
 --   that does not fit waits for the peer to read, so a peer that stops
 --   reading stalls a writer, as a full socket buffer does.
--- * A read waits for bytes, and answers 0 once the peer has shut down its
+-- * A read waits for bytes, and returns 0 once the peer has shut down its
 --   writing or closed its end and every byte before that has been read.
 -- * A write after the peer closed its end, or after this end shut down its
 --   writing, fails with `BrokenPipe`.
@@ -27,7 +27,7 @@ export (Pipe, Listener, pair, listener, connect, accept, closeListener)
 -- may be served by another task of the same program.
 
 import Net as Net
-import Net (Connection(..), Described(..), ConnectionInfo(..), accept, closeListener)
+import Net (Connection(..), HasConnectionInfo(..), ConnectionInfo(..), accept, closeListener)
 import System.Sync as Sync
 import System.Sync (Mutex, Semaphore)
 import Time (Timeout(..))
@@ -42,7 +42,7 @@ import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
 type Flow = Flow {
     held : Buffer,
     -- The writing side shut down or closed: once `held` is empty, a read
-    -- answers 0.
+    -- returns 0.
     var ended : Bool,
     -- The reading side closed: a write fails.
     var abandoned : Bool,
@@ -72,7 +72,7 @@ type Pipe = Pipe {
 -- Returns the two ends of a new connection, each direction holding at most
 -- `capacity` bytes. Panics if `capacity` is below 1.
 fun pair(capacity : Int) -> (Pipe, Pipe) {
-    if capacity < 1 { error("Memory.pair: capacity " + Int.toString(capacity) + " is below 1") }
+    if capacity < 1 { error("Memory.pair: capacity " + Int.toString(capacity) + " must be at least 1") }
     let flow = fun() = Flow { held = Buf.buffer(capacity), ended = False, abandoned = False }
     let shared = Shared {
         flows = Sync.mutex([flow(), flow()]),
@@ -105,12 +105,12 @@ fun park(p : Pipe) -> Bool {
     woken
 }
 
--- What one look at a flow found: an answer, or nothing yet.
+-- What one look at a flow found: a result, or nothing yet.
 type Step a = Done(a) | Wait
 
--- Runs `look` on the flows under the lock until it answers, waiting between
--- looks. A wait that ends at the deadline is `TimedOut`, and a close of this
--- end, `Closed`.
+-- Runs `look` on the flows under the lock until it returns `Done`, waiting
+-- between looks. A wait that ends at the deadline is `TimedOut`, and a
+-- close of this end, `Closed`.
 fun until(p : Pipe, op : String, look : fun(Array Flow) -> Step (Either IOError a)) -> Either IOError a {
     loop {
         if p.closed { return Left(failure(Closed, op)) }
@@ -119,7 +119,7 @@ fun until(p : Pipe, op : String, look : fun(Array Flow) -> Step (Either IOError 
             if let Wait = step { let _ = Sync.addAndGet(p.shared.waiting[p.side], 1) }
             step
         })
-        if let Done(answer) = step { return answer }
+        if let Done(result) = step { return result }
         if !park(p) {
             if p.closed { return Left(failure(Closed, op)) }
             return Left(failure(TimedOut, op))
@@ -181,7 +181,7 @@ fun writeAll(p : Pipe, from : Buffer) -> Either IOError Unit {
 
 -- A deadline set on one end bounds that end's waits only.
 -- A pipe has no addresses, and no TLS.
-instance Described Pipe {
+instance HasConnectionInfo Pipe {
     fun connectionInfo(p) = ConnectionInfo { local = None, peer = None, tls = None }
 }
 
@@ -235,7 +235,7 @@ type Arrivals = Arrivals { pending : Vec Pipe, var next : Int, var closed : Bool
 -- Returns a listener whose connections hold at most `capacity` bytes in
 -- each direction. Panics if `capacity` is below 1.
 fun listener(capacity : Int) -> Listener {
-    if capacity < 1 { error("Memory.listener: capacity " + Int.toString(capacity) + " is below 1") }
+    if capacity < 1 { error("Memory.listener: capacity " + Int.toString(capacity) + " must be at least 1") }
     Listener {
         capacity,
         queue = Sync.mutex(Arrivals { pending = [], next = 0, closed = False }),
@@ -245,7 +245,7 @@ fun listener(capacity : Int) -> Listener {
 }
 
 -- Returns the near end of a new connection to `l`, whose far end the next
--- `accept` answers. Fails with `Closed` once `l` is closed. Never waits.
+-- `accept` returns. Fails with `Closed` once `l` is closed. Never waits.
 fun connect(l : Listener) -> Either IOError Pipe {
     let (near, far) = pair(l.capacity)
     let open = Sync.withLock(l.queue, fun(a) {
@@ -278,7 +278,7 @@ instance Net.Listener Listener {
                 }
                 Done(Right(p))
             })
-            if let Done(answer) = next { return answer }
+            if let Done(result) = next { return result }
             let _ = Sync.acquire(l.arrived, None)
             let _ = Sync.addAndGet(l.waiting, -1)
         }

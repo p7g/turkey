@@ -1,6 +1,6 @@
 -- A small HTTP API: routing by `match` on the method and the path, the
--- request body taken out of `POST`'s payload, an error type that says what
--- each error answers, and every path ending in `respond`.
+-- request body taken out of `POST`'s payload, an error type that says which
+-- response each error becomes, and every path ending in `respond`.
 --
 --     curl -i localhost:8080/health
 --     curl -i -X POST --data 'two eggs' localhost:8080/orders
@@ -8,6 +8,7 @@
 
 import Net as Net
 import Net.HTTP (..)
+import Net.HTTP.MediaType as MediaType
 import Net.HTTP.Server as Server
 import Net.HTTP.Server (Respond, Done, respond)
 import Net.TCP as TCP
@@ -15,32 +16,32 @@ import System.IO as IO
 import System.Sync as Sync
 import System.Sync (Mutex)
 
--- What can go wrong with a request. Each answers with its own status.
+-- What can go wrong with a request. Each becomes a response of its own status.
 type APIError = Missing | WrongMethod | BadBody(HTTPError) | NotText
 
--- `receive` lifts the body's errors into this type, so `?` needs no
+-- `receive` converts the body's errors into this type, so `?` needs no
 -- conversion.
 instance FromHTTP APIError { fun fromHTTP(e) = BadBody(e) }
 
-instance Reply APIError {
-    fun reply(e) = match e {
-        Missing -> reply(NotFound)
-        WrongMethod -> reply(MethodNotAllowed)
-        BadBody(TooLarge) -> text(ContentTooLarge, "an order is at most 1 KiB\n")
-        BadBody(other) -> text(BadRequest, show(other) + "\n")
-        NotText -> text(BadRequest, "an order is UTF-8 text\n")
+instance ToResponse APIError {
+    fun toResponse(e) = match e {
+        Missing -> statusOnly(NotFound)
+        WrongMethod -> statusOnly(MethodNotAllowed)
+        BadBody(TooLarge) -> body(ContentTooLarge, MediaType.plainText, "an order is at most 1 KiB\n")
+        BadBody(other) -> body(BadRequest, MediaType.plainText, show(other) + "\n")
+        NotText -> body(BadRequest, MediaType.plainText, "an order is UTF-8 text\n")
     }
 }
 
 type Orders = Orders { items : Mutex (Vec String) }
 
-fun handle(orders : Orders, req : Request Incoming, r : Respond) -> Done = respond(r, answer(orders, req))
+fun handle(orders : Orders, req : Request Incoming, r : Respond) -> Done = respond(r, route(orders, req))
 
-fun answer(orders : Orders, req : Request Incoming) -> Either APIError ServerResponse =
+fun route(orders : Orders, req : Request Incoming) -> Either APIError ServerResponse =
     match (req.method, req.target.path) {
-        (GET, "/health") | (HEAD, "/health") -> Right(text(OK, "ok\n"))
-        (POST(body), "/orders") -> {
-            let order = match String.fromBytes(IO.bytes(receive(body, 1024)?)) {
+        (GET, "/health") | (HEAD, "/health") -> Right(body(OK, MediaType.plainText, "ok\n"))
+        (POST(content), "/orders") -> {
+            let order = match String.fromBytes(IO.bytes(receive(content, 1024)?)) {
                 Some(t) -> t
                 None -> return Left(NotText)
             }
@@ -48,11 +49,11 @@ fun answer(orders : Orders, req : Request Incoming) -> Either APIError ServerRes
                 Vec.push(v, order)
                 len(v)
             })
-            Right(text(Created, show(id) + "\n"))
+            Right(body(Created, MediaType.plainText, show(id) + "\n"))
         }
         (GET, path) -> match orderNumber(path) {
             Some(n) -> match Sync.withLock(orders.items, fun(v : Vec String) = Vec.at(v, n - 1)) {
-                Some(order) -> Right(text(OK, order + "\n"))
+                Some(order) -> Right(body(OK, MediaType.plainText, order + "\n"))
                 None -> Left(Missing)
             }
             None -> Left(Missing)
@@ -70,7 +71,7 @@ fun main() {
         Right(l) -> {
             let orders = Orders { items = Sync.mutex([]) }
             print("listening on 127.0.0.1:8080")
-            Server.serve(l, Server.empty, fun(req, r) = handle(orders, req, r))
+            Server.serve(l, Server.defaultConfig, fun(req, r) = handle(orders, req, r))
         }
         Left(e) -> print("listen: " + show(e))
     }

@@ -1,37 +1,38 @@
 export (
     Server, Config, ServerEvent(..), Respond, Done,
-    empty, limits, onError, serve, start, stop, wait,
+    defaultConfig, limits, onError, serve, start, stop, wait,
     respond, inform, failed, background, setStall,
 )
 
 -- An HTTP/1 server: connections taken from a `Net.Listener`, each served by
--- a task of its own, requests read and answered in order, one at a time.
+-- a task of its own, its requests read and responded to in order, one at a
+-- time.
 --
 --     fun handle(req : Request Incoming, r : Respond) -> Done = match (req.method, req.target.path) {
---         (GET, "/health") | (HEAD, "/health") -> respond(r, text(OK, "ok"))
---         (POST(body), "/orders") -> respond(r, create(body))
+--         (GET, "/health") | (HEAD, "/health") -> respond(r, body(OK, MediaType.plainText, "ok"))
+--         (POST(content), "/orders") -> respond(r, create(content))
 --         _ -> respond(r, NotFound)
 --     }
 --
---     Server.serve(TCP.listen(address, 8080)?, Server.empty, handle)
+--     Server.serve(TCP.listen(address, 8080)?, Server.defaultConfig, handle)
 --
--- **A handler answers through its `Respond`.** It takes the request and a
--- `Respond`, and ends in `respond(r, x)`, where `x` is a `Reply`: a
--- `ServerResponse`, or a value that becomes one, its own error type among
--- them. `respond` writes the whole response, a stream's body and trailers
+-- **A handler sends its response through its `Respond`.** It takes the
+-- request and a `Respond`, and ends in `respond(r, x)`, where `x` is a
+-- `ToResponse`: a `ServerResponse`, or a value that becomes one, its own
+-- error type among them. `respond` writes the whole response, a stream's body and trailers
 -- included, before it returns, so whatever the handler holds open -- a file,
 -- an upstream connection whose body it relays -- is open for as long as the
 -- response needs it. The `respond` call is the commit point.
 --
--- **Every path answers, once.** `respond` returns a `Done`, whose
+-- **Every path responds, once.** `respond` returns a `Done`, whose
 -- constructor is hidden, and a handler must return one, so a handler that
--- can return has answered. A second `respond` is not sent: it is reported
--- to `onError`, as `RespondedTwice`.
+-- returns has sent a response. A second `respond` is not sent: it is
+-- reported to `onError`, as `RespondedTwice`.
 --
 -- * `inform(r, status, headers)` sends a 1xx before the final response,
 --   any number of them: 103 Early Hints, 104 for a resumable upload, or a
 --   proxy relaying its upstream's. An HTTP/1.0 client gets none.
--- * `failed(r, e)` answers 502 if nothing has been sent, and otherwise
+-- * `failed(r, e)` sends a 502 if nothing has been sent, and otherwise
 --   closes the connection, so a response cut short cannot pass as complete.
 -- * `background(r, f)` runs `f` as a task the server owns, for work that
 --   must outlive the request; `stop` waits for it.
@@ -40,12 +41,12 @@ export (
 --
 -- **Versions.** HTTP/1.1 and HTTP/1.0 requests are served. A 1.0 request's
 -- connection is closed after its response, and a body of unknown length is
--- sent to it until the close, since it cannot read chunks. Anything else is
--- answered 505.
+-- sent to it until the close, since it cannot read chunks. Any other
+-- version gets a 505.
 --
 -- **HEAD** reaches the handler as itself. `respond` sends the head of the
 -- response, with the length or the chunking a GET would have, and no body,
--- and never calls a stream's function. A handler that answers both alike
+-- and never calls a stream's function. A handler that treats both alike
 -- matches both: `(GET, "/") | (HEAD, "/") ->`.
 --
 -- **Request bodies.** A handler reaches a body only through
@@ -53,14 +54,15 @@ export (
 -- the client waits for `100 Continue`, it is sent from inside that first
 -- read, after the limit is checked, so a body declared too large is refused
 -- before the client sends it. The body stays readable while `respond`
--- writes, so a stream's function can answer a request as it reads it. A body
+-- writes, so a stream's function can write its response as it reads the
+-- request. A body
 -- still unread when `respond` returns is read and discarded if at most
 -- `drainBytes` of it remain, so the connection can carry the next request;
 -- a longer one, or one the client has not started sending, closes the
 -- connection instead.
 --
 -- **Closing while the client sends.** Closing a connection whose client is
--- still sending makes the system answer with a reset, which can destroy the
+-- still sending makes the system send a reset, which can destroy the
 -- response before the client reads it (RFC 9112 §9.6). So after an unread
 -- body, or a refused request, the server shuts down its own side, then reads
 -- and discards what comes, for at most `lingerIdle` between reads and
@@ -96,7 +98,7 @@ export (
 -- **Errors** go to the configuration's `onError`, and nowhere by default.
 
 import Net as Net
-import Net (Connection, Listener(..), Described(..), ConnectionInfo, shutdownWrite, close)
+import Net (Connection, Listener(..), HasConnectionInfo(..), ConnectionInfo, shutdownWrite, close)
 import Net.HTTP.Duplex as Duplex (Duplex)
 import Net.HTTP.Error (HTTPError(..), Refusal(..), refusalStatus)
 import Net.HTTP.H1.Body as Body (Body, Drained(..))
@@ -105,13 +107,14 @@ import Net.HTTP.H1.Input as Input (Input, HeadBytes(..))
 import Net.HTTP.H1.Output as Output (OutgoingResponse(..))
 import Net.HTTP.HeaderName as HeaderName (HeaderName)
 import Net.HTTP.HeaderValue as HeaderValue (HeaderValue)
-import Net.HTTP.Headers as Headers (Headers, HasHeaders(..), ContentType(..))
+import Net.HTTP.Headers as Headers (Headers, HasHeaders(..))
 import Net.HTTP.Date as Date
 import Net.HTTP.Incoming (Incoming)
+import Net.HTTP.MediaType as MediaType
 import Net.HTTP.Limits as Limits (Limits, Values)
 import Net.HTTP.Method (Method(..))
 import Net.HTTP.Request (Request(..))
-import Net.HTTP.ServerResponse as ServerResponse (ServerResponse, Outgoing(..), Reply(..))
+import Net.HTTP.ServerResponse as ServerResponse (ServerResponse, Outgoing(..), ToResponse(..))
 import Net.HTTP.Status as Status (Status(Continue, InternalServerError, BadGateway))
 import Net.HTTP.Stream as Stream (BodyLength(..))
 import Net.HTTP.Syntax as Syntax
@@ -135,28 +138,28 @@ import Turkey.ReadWrite (Read(..), Write(..))
 -- set of overrides, as `Limits` is: `empty` keeps every default, each
 -- function below overrides one setting, and `combine` joins two, the right
 -- side winning where both set one.
-type Config = Config { limits : Limits, reporter : Option (fun(ServerEvent) -> Unit) }
+type Config = Config { limits : Limits, onError : Option (fun(ServerEvent) -> Unit) }
 
-let empty = Config { limits = Limits.empty, reporter = None }
+let defaultConfig = Config { limits = Limits.empty, onError = None }
 
 instance Semigroup Config {
     fun combine(a, b) = Config {
         limits = combine(a.limits, b.limits),
-        reporter = match b.reporter {
-            Some(_) -> b.reporter
-            None -> a.reporter
+        onError = match b.onError {
+            Some(_) -> b.onError
+            None -> a.onError
         },
     }
 }
 
-instance Monoid Config { fun empty() = empty }
+instance Monoid Config { fun empty() = defaultConfig }
 
 -- Returns a configuration with `l` over the default limits.
-fun limits(l : Limits) -> Config = Config { limits = l, reporter = None }
+fun limits(l : Limits) -> Config = Config { limits = l, onError = None }
 
 -- Returns a configuration that reports each `ServerEvent` to `f`, which
 -- runs in the task of the connection it is about, and must not wait long.
-fun onError(f : fun(ServerEvent) -> Unit) -> Config = Config { limits = Limits.empty, reporter = Some(f) }
+fun onError(f : fun(ServerEvent) -> Unit) -> Config = Config { limits = Limits.empty, onError = Some(f) }
 
 -- What went wrong, as a server reports it to `onError`. None of them stops
 -- the server.
@@ -164,20 +167,20 @@ fun onError(f : fun(ServerEvent) -> Unit) -> Config = Config { limits = Limits.e
 -- * `AcceptFailed`: the listener failed to take a connection, for a reason
 --   other than being closed, such as running out of descriptors. The server
 --   waits a little, longer each time up to a second, and tries again.
--- * `Refused`: a request the codec refused. It was answered with the
---   refusal's status, and its connection closed.
+-- * `Refused`: a request the codec refused. It got a response of the
+--   refusal's status, and its connection was closed.
 -- * `ConnectionFailed`: a read or a write failed or timed out part-way
 --   through a request or its response, and the connection was closed.
 -- * `ResponseAborted`: a response failed after its head was sent: its
 --   stream's function failed, wrote other than its declared length, or the
 --   function a `switch` ran failed. The connection was closed.
--- * `BadSwitch`: a handler answered `switch` to a request that cannot be
---   switched to that protocol. It was answered 500 instead.
+-- * `BadSwitch`: a handler responded with `switch` to a request that
+--   cannot be switched to that protocol. It got a 500 instead.
 -- * `HandlerFailed`: a handler called `failed`.
 -- * `RespondedTwice`: a handler called `respond` again, with a response of
 --   this status, which was not sent.
 -- * `NoResponse`: a handler returned a `Done` it did not get from its own
---   `Respond`. The request was answered 500.
+--   `Respond`. The request got a 500.
 type ServerEvent =
     AcceptFailed(IOError)
     | Refused(Refusal)
@@ -201,9 +204,10 @@ instance Show ServerEvent {
     }
 }
 
--- -- answering ---------------------------------------------------------------------------
+-- -- responding --------------------------------------------------------------------------
 
--- The right to answer one request, which a handler is given with it.
+-- What a handler sends the response to one request through. `respond`,
+-- `inform` and `failed` take it.
 --
 -- It reaches the connection through closures, so that a handler's type
 -- names no transport, and one handler serves TCP, TLS and in-memory
@@ -211,38 +215,39 @@ instance Show ServerEvent {
 -- handler starts may call `inform` or `respond` only while the handler
 -- waits for it.
 type Respond = Respond {
-    var state : Answer,
-    sending : fun(ServerResponse) -> Unit,
-    informing : fun(Status, Headers) -> Either HTTPError Unit,
-    aborting : fun() -> Unit,
-    spawning : fun(fun() -> Unit) -> Unit,
-    stalling : fun(Duration) -> Unit,
-    reporting : fun(ServerEvent) -> Unit,
+    var state : RespondState,
+    send : fun(ServerResponse) -> Unit,
+    sendInformational : fun(Status, Headers) -> Either HTTPError Unit,
+    abort : fun() -> Unit,
+    spawn : fun(fun() -> Unit) -> Unit,
+    setStall : fun(Duration) -> Unit,
+    report : fun(ServerEvent) -> Unit,
 }
 
--- Where the answer to a request is: nothing sent yet, a final response
--- being written, or done.
-type Answer = Unanswered | Answering | Answered
+-- How far a request's response has got: nothing sent yet, a final response
+-- being written, or written.
+type RespondState = Unsent | Sending | Sent
 
--- Proof that a request was answered: only `respond` and `failed` make one.
+-- Proof that a request got its response: only `respond` and `failed` make
+-- one.
 type Done = Done
 
 -- Writes the response `x` becomes, its body and trailers included, and
 -- returns once it is written or has failed. A failure is reported to
 -- `onError`, and the connection is closed after the handler returns. A
 -- second call sends nothing, and is reported as `RespondedTwice`.
-fun respond[Reply x](r : Respond, x : x) -> Done {
-    let response = reply(x)
+fun respond[ToResponse x](r : Respond, x : x) -> Done {
+    let response = toResponse(x)
     match r.state {
-        Unanswered -> {}
+        Unsent -> {}
         _ -> {
-            r.reporting(RespondedTwice(ServerResponse.status(response)))
+            r.report(RespondedTwice(ServerResponse.status(response)))
             return Done
         }
     }
-    r.state = Answering
-    r.sending(response)
-    r.state = Answered
+    r.state = Sending
+    r.send(response)
+    r.state = Sent
     Done
 }
 
@@ -255,28 +260,28 @@ fun respond[Reply x](r : Respond, x : x) -> Done {
 fun inform(r : Respond, status : Status, headers : Headers) -> Either HTTPError Unit {
     let code = Status.code(status)
     if code / 100 != 1 || code == 101 {
-        error("Server.inform: " + Int.toString(code) + " is not an informational status other than 101")
+        error("Server.inform: status " + Int.toString(code) + " must be 1xx other than 101; send 101 with 'switch'")
     }
     match r.state {
-        Unanswered -> r.informing(status, headers)
+        Unsent -> r.sendInformational(status, headers)
         _ -> Left(Transport(fail(IOError { kind = Closed, op = "inform", path = None })))
     }
 }
 
--- Answers 502 Bad Gateway if no final response has begun, and otherwise
+-- Sends 502 Bad Gateway if no final response has begun, and otherwise
 -- closes the connection at once, so that a response cut short is not taken
 -- for a whole one. Reports `e` to `onError` as `HandlerFailed`.
 fun failed(r : Respond, e : HTTPError) -> Done {
-    r.reporting(HandlerFailed(e))
+    r.report(HandlerFailed(e))
     match r.state {
-        Unanswered -> {
-            r.state = Answering
-            r.sending(ServerResponse.text(BadGateway, "Bad Gateway\n"))
-            r.state = Answered
+        Unsent -> {
+            r.state = Sending
+            r.send(plain(BadGateway))
+            r.state = Sent
         }
         _ -> {
-            r.aborting()
-            r.state = Answered
+            r.abort()
+            r.state = Sent
         }
     }
     Done
@@ -286,13 +291,13 @@ fun failed(r : Respond, e : HTTPError) -> Done {
 -- cache filled from an upstream that later requests wait on, say. `stop`
 -- and `wait` wait for it. Once the server has stopped accepting and every
 -- connection has ended, `f` runs in the caller's task instead.
-fun background(r : Respond, f : fun() -> Unit) -> Unit = r.spawning(f)
+fun background(r : Respond, f : fun() -> Unit) -> Unit = r.spawn(f)
 
 -- Sets the stall limit for the rest of this request's reads and writes to
 -- `d`, in place of `Limits`' `stall`. Panics if `d` is not positive.
 fun setStall(r : Respond, d : Duration) -> Unit {
-    if Duration.toNanos(d) <= 0 { error("Server.setStall: " + show(d) + " is not positive") }
-    r.stalling(d)
+    if Duration.toNanos(d) <= 0 { error("Server.setStall: stall limit " + show(d) + " must be positive") }
+    r.setStall(d)
 }
 
 -- -- the server --------------------------------------------------------------------------
@@ -320,7 +325,7 @@ type Entry = Entry { close : fun() -> Unit, var idle : Bool }
 
 -- Serves the connections `l` accepts, each request with `handler`, until
 -- `l` is closed and every connection has ended.
-fun serve[Listener l, Connection (Accepted l), Described (Accepted l), Error (ReadError (Accepted l)),
+fun serve[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
           Error (WriteError (Accepted l))](
         l : l, config : Config, handler : fun(Request Incoming, Respond) -> Done) -> Unit =
     Task.runScope(map(start(l, config, handler), fun(_) = ()))
@@ -328,7 +333,7 @@ fun serve[Listener l, Connection (Accepted l), Described (Accepted l), Error (Re
 -- Returns a server of the connections `l` accepts, each request with
 -- `handler`, running as a task of the enclosing `Task.runScope`, which
 -- waits for it.
-fun start[Listener l, Connection (Accepted l), Described (Accepted l), Error (ReadError (Accepted l)),
+fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
           Error (WriteError (Accepted l))](
         l : l, config : Config, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Server {
     let values = Limits.values(config.limits)
@@ -379,7 +384,7 @@ fun closers(r : Registry, onlyIdle : Bool) -> Array (fun() -> Unit) {
 fun isStopping(server : Server) -> Bool = Sync.withLock(server.registry, fun(r : Registry) = r.stopping)
 
 fun report(server : Server, e : ServerEvent) -> Unit {
-    if let Some(f) = server.config.reporter { f(e) }
+    if let Some(f) = server.config.onError { f(e) }
 }
 
 -- Runs the accept loop and every connection it starts, and the background
@@ -388,8 +393,8 @@ fun report(server : Server, e : ServerEvent) -> Unit {
 -- The background tasks run in a scope of their own, beside the accept
 -- loop's, since a connection's task cannot spawn into a scope it is not in.
 -- That scope's dispatcher ends only once the accept loop's scope has, so a
--- connection can hand it work until its last request is answered.
-fun run[Listener l, Connection (Accepted l), Described (Accepted l), Error (ReadError (Accepted l)),
+-- connection can hand it work until its last response is written.
+fun run[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
         Error (WriteError (Accepted l))](
         server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     Task.runScope(do {
@@ -403,7 +408,7 @@ fun run[Listener l, Connection (Accepted l), Described (Accepted l), Error (Read
     Sync.set(server.done)
 }
 
-fun acceptAll[Listener l, Connection (Accepted l), Described (Accepted l), Error (ReadError (Accepted l)),
+fun acceptAll[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), Error (ReadError (Accepted l)),
               Error (WriteError (Accepted l))](
         server : Server, l : l, handler : fun(Request Incoming, Respond) -> Done) -> Spawn Unit {
     var pause = firstPause
@@ -520,9 +525,6 @@ type Guarded c = Guarded {
 --   `lingerIdle`, and all of them by `d`.
 type Phase = Idle(Deadline) | Heading(Deadline) | Exchanging | Carrying | Lingering(Deadline)
 
-fun earlier(a : Deadline, b : Deadline) -> Deadline =
-    if Clock.nanos(Deadline.reading(a)) < Clock.nanos(Deadline.reading(b)) { a } else { b }
-
 -- Sets `g`'s connection's deadline for its next operation.
 --
 -- A read and a write may run at once, in two tasks, and the connection has
@@ -532,13 +534,13 @@ fun earlier(a : Deadline, b : Deadline) -> Deadline =
 -- stopped both sending and reading.
 fun bound[Connection c](g : Guarded c) -> Unit = match g.phase {
     Idle(d) -> Net.setDeadline(g.conn, d)
-    Heading(d) -> Net.setDeadline(g.conn, earlier(d, Deadline.after(g.stall)))
+    Heading(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.stall)))
     Exchanging -> Net.setDeadline(g.conn, Deadline.after(g.stall))
     Carrying -> match g.carried {
         Some(d) -> Net.setDeadline(g.conn, d)
         None -> Net.clearDeadline(g.conn)
     }
-    Lingering(d) -> Net.setDeadline(g.conn, earlier(d, Deadline.after(g.values.lingerIdle)))
+    Lingering(d) -> Net.setDeadline(g.conn, min(d, Deadline.after(g.values.lingerIdle)))
 }
 
 instance Read (Guarded c) : Connection c {
@@ -578,7 +580,7 @@ let piece = 65536
 
 -- -- connections -------------------------------------------------------------------------
 
-fun connection[Connection c, Described c, Error (ReadError c), Error (WriteError c)](
+fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (WriteError c)](
         server : Server, conn : c, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let values = server.values
     let g = Guarded {
@@ -607,13 +609,13 @@ fun mark(server : Server, id : Int, idle : Bool) -> Bool = Sync.withLock(server.
     True
 })
 
--- What a connection does once a request is answered and its handler has
--- returned: read the next request, close, or shut down its side and linger
--- first.
+-- What a connection does once a request's response is written and its
+-- handler has returned: read the next request, close, or shut down its side
+-- and linger first.
 type After = KeepOpen | CloseAfter | LingerAfter
 
 -- Serves the requests on one connection, in order, until it is to close.
-fun exchanges[Connection c, Described c, Error (ReadError c), Error (WriteError c)](
+fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, id : Int, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let limits = server.config.limits
     let input = Input.input(g, limits)
@@ -674,18 +676,18 @@ fun exchanges[Connection c, Described c, Error (ReadError c), Error (WriteError 
 
 fun failure(server : Server, e : SomeError) -> Unit = report(server, ConnectionFailed(e))
 
--- Answers a request the codec refused with the refusal's status, and closes
--- the connection, lingering: the client may still be sending.
+-- Sends the refusal's status in response to a request the codec refused,
+-- and closes the connection, lingering: the client may still be sending.
 fun refuse[Connection c, Error (WriteError c)](server : Server, g : Guarded c, r : Refusal) -> Unit {
     report(server, Refused(r))
     g.phase = Exchanging
     let s = refusalStatus(r)
-    let response = ServerResponse.text(s, Status.reason(s) + "\n")
+    let response = plain(s)
     if let Left(e) = write(g, response, Close, False, Chunked) { return failure(server, e) }
     linger(g)
 }
 
--- One request's answer as it goes: what follows it, and whether
+-- One request's response as it goes: what follows it, and whether
 -- `100 Continue` has been sent.
 type Exchange = Exchange { var after : After, var continued : Bool }
 
@@ -703,36 +705,35 @@ fun exchange[Connection c, Error (ReadError c), Error (WriteError c)](
         control = Head.control(head), connection = info,
     }
     let r = Respond {
-        state = Unanswered,
-        sending = fun(response) { ex.after = answer(server, g, input, body, head, response) },
-        informing = fun(status, headers) = sendInformation(g, head, ex, status, headers),
-        aborting = fun() {
+        state = Unsent,
+        send = fun(response) { ex.after = writeResponse(server, g, input, body, head, response) },
+        sendInformational = fun(status, headers) = sendInformation(g, head, ex, status, headers),
+        abort = fun() {
             let _ = close(g.conn)
             ex.after = CloseAfter
         },
-        spawning = fun(f) = submit(server.background, f),
-        stalling = fun(d) { g.stall = d },
-        reporting = fun(e) = report(server, e),
+        spawn = fun(f) = submit(server.background, f),
+        setStall = fun(d) { g.stall = d },
+        report = fun(e) = report(server, e),
     }
     let _ = handler(req, r)
     match r.state {
-        Answered -> {}
+        Sent -> {}
         _ -> {
             report(server, NoResponse)
-            r.state = Answering
-            ex.after = answer(server, g, input, body, head, ServerResponse.text(InternalServerError,
-                                                                               "Internal Server Error\n"))
+            r.state = Sending
+            ex.after = writeResponse(server, g, input, body, head, plain(InternalServerError))
         }
     }
     -- A late `respond` or `inform`, from a task that outlived the handler,
     -- must not write into the next exchange.
-    r.state = Answered
+    r.state = Sent
     ex.after
 }
 
 -- Writes `response` to the request `head`, and returns what the connection
 -- does next.
-fun answer[Connection c, Error (ReadError c), Error (WriteError c)](
+fun writeResponse[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), body : Body (Guarded c), head : RequestHead,
         response : ServerResponse) -> After {
     let isHead = match head.method {
@@ -763,9 +764,9 @@ fun answer[Connection c, Error (ReadError c), Error (WriteError c)](
     }
 }
 
--- Sends a response whose body is fixed already, or that answers HEAD,
--- after draining what is left of the request's body, so the response says
--- whether the connection stays open.
+-- Sends a response whose body is fixed already, or the response to a HEAD
+-- request, after draining what is left of the request's body, so the
+-- response says whether the connection stays open.
 fun fixed[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, body : Body (Guarded c), response : ServerResponse, mayKeep : Bool,
         isHead : Bool, unknown : Framing) -> After {
@@ -783,8 +784,8 @@ fun fixed[Connection c, Error (ReadError c), Error (WriteError c)](
 
 -- Writes `response` with `persistence`, and no body for a response to
 -- HEAD. A stream's body is not written: its response is written here only
--- to answer HEAD, framed as a GET's would be, with `unknown` for a length
--- the stream does not know.
+-- for a HEAD request, framed as a GET's would be, with `unknown` for a
+-- length the stream does not know.
 fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerResponse, persistence : Persistence,
                                               isHead : Bool, unknown : Framing) -> Either SomeError Unit {
     let code = Status.code(ServerResponse.status(response))
@@ -796,27 +797,22 @@ fun write[Connection c, Error (WriteError c)](g : Guarded c, response : ServerRe
     }
     let w = Output.bodyWriter(g, headOf(response, framing, persistence), if isHead { NoBody } else { framing })
     if let Whole(b) = content {
-        if !isHead { lift(writeFrom(w, b))? }
+        if !isHead { Either.mapLeft(writeFrom(w, b), toSomeError)? }
     }
-    lift(Output.finish(w))
+    Either.mapLeft(Output.finish(w), toSomeError)
 }
 
-fun lift[Error e](x : Either (Either HTTPError e) a) -> Either SomeError a = match x {
-    Left(Left(h)) -> Left(fail(h))
-    Left(Right(t)) -> Left(fail(Transport(fail(t))))
-    Right(a) -> Right(a)
+-- Returns the error a codec operation failed with, as itself: an
+-- `HTTPError`, or the transport's own error.
+fun toSomeError[Error e](e : Either HTTPError e) -> SomeError = match e {
+    Left(h) -> fail(h)
+    Right(t) -> fail(t)
 }
 
--- Returns the head of `response`, with the fields the server adds: the
--- default content type if it has none, and `Date`, which an origin server
--- with a clock sends (RFC 9110 §6.6.1).
+-- Returns the head of `response`, with the one field the server adds:
+-- `Date`, which an origin server with a clock sends (RFC 9110 §6.6.1).
 fun headOf(response : ServerResponse, framing : Framing, persistence : Persistence) -> Buffer {
     var fields = headers(response)
-    if !Headers.has(fields, ContentType) {
-        if let Some(t) = ServerResponse.contentType(response) {
-            if framing != NoBody { fields = Headers.add(fields, ContentType, t) }
-        }
-    }
     if !Headers.has(fields, dateField) {
         fields = Headers.add(fields, dateField, HeaderValue.literal(Date.toString(Clock.realtime())))
     }
@@ -826,6 +822,10 @@ fun headOf(response : ServerResponse, framing : Framing, persistence : Persisten
 }
 
 let dateField = HeaderName.literal("date")
+
+-- Returns the response the server sends on its own behalf: `s` with its
+-- reason phrase as text.
+fun plain(s : Status) -> ServerResponse = ServerResponse.body(s, MediaType.plainText, Status.reason(s) + "\n")
 
 -- -- informational responses -------------------------------------------------------------
 
@@ -882,8 +882,8 @@ fun linger[Connection c](g : Guarded c) -> Unit {
 
 -- -- switching protocols ----------------------------------------------------------------
 
--- Answers 101 and runs `run` over the connection, if the request offered
--- `protocol` and its body has been read; or else answers 500. The
+-- Sends a 101 and runs `run` over the connection, if the request offered
+-- `protocol` and its body has been read; or else sends a 500. The
 -- connection is closed after either.
 fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
         server : Server, g : Guarded c, input : Input (Guarded c), body : Body (Guarded c), head : RequestHead,
@@ -894,7 +894,7 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
     }
     if isHTTP10(head.version) || !offers(Head.control(head).upgrade, protocol) || drained == MustClose {
         report(server, BadSwitch(protocol))
-        let _ = write(g, ServerResponse.text(InternalServerError, "Internal Server Error\n"), Close, False, Chunked)
+        let _ = write(g, plain(InternalServerError), Close, False, Chunked)
         return if drained == MustClose { LingerAfter } else { CloseAfter }
     }
     let name = HeaderValue.literal(Token.toString(protocol))
@@ -902,13 +902,13 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
         status = ServerResponse.status(response), headers = headers(response), framing = NoBody,
         persistence = Close, upgrade = Some(name),
     })
-    if let Left(e) = lift(Output.finish(Output.bodyWriter(g, switched, NoBody))) {
+    if let Left(e) = Either.mapLeft(Output.finish(Output.bodyWriter(g, switched, NoBody)), toSomeError) {
         failure(server, e)
         return CloseAfter
     }
     g.phase = Carrying
     let d = Duplex.duplex(
-        fun(into : Buffer) = Either.mapLeft(Input.take(input, into, Int.maxValue()), fun(e) = codecFailure(e)),
+        fun(into : Buffer) = Either.mapLeft(Input.take(input, into, Int.maxValue()), toSomeError),
         fun(from : Buffer) = Either.mapLeft(writeFrom(g, from), fun(e) = fail(e)),
         fun() = Either.mapLeft(flush(g), fun(e) = fail(e)),
         fun(limit : Option Deadline) { g.carried = limit },
@@ -922,11 +922,6 @@ fun switchTo[Connection c, Error (ReadError c), Error (WriteError c)](
 fun isHTTP10(v : Version) -> Bool = match v {
     HTTP10 -> True
     HTTP11 -> False
-}
-
-fun codecFailure[Error e](e : Either HTTPError e) -> SomeError = match e {
-    Left(h) -> fail(h)
-    Right(t) -> fail(t)
 }
 
 -- Whether the request's `Upgrade` offers `protocol`, compared without case.

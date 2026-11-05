@@ -244,6 +244,21 @@ fun bindersIn(g : Generator, pats : Vec Pat, where : Span,
 fun assignable(g : Generator, id : Int) -> Bool =
     Binders.binderAt(g.binders, id).mutable || Set.contains(g.parameters, id)
 
+-- Raises the type error for an assignment at `where` to the binder `id`,
+-- which cannot be assigned.
+fun notAssignable(g : Generator, id : Int, where : Span) -> Unit {
+    let b = Binders.binderAt(g.binders, id)
+    let prefix = "cannot assign to '" + b.name + "': "
+    if let Binders.Method = b.kind {
+        oops(prefix + "it is a class method", Some(where))
+    } else if Set.contains(g.decls.functions, id) {
+        oops(prefix + "it is a function", Some(where))
+    } else {
+        oops(prefix + "it was bound with 'let'; declare it with 'var' to make "
+             + "it reassignable", Some(where))
+    }
+}
+
 -- Translate an annotation, resolving its type variables in the innermost
 -- function's scope.
 fun typeOf(g : Generator, te : Type) -> Ty.Type =
@@ -458,7 +473,9 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
             name = d.name, symbol = d.symbol, params = params, fixed = d.fixed,
             ret = ret, span = Some(d.span),
         })
-        C.define(g.env, boundAt(g, d.id, d.name, d.span), d.name, Binding {
+        let id = boundAt(g, d.id, d.name, d.span)
+        Set.add(g.decls.functions, id)
+        C.define(g.env, id, d.name, Binding {
             scheme = Ty.mono(TFun(params, ret)), mutable = False,
         })
     }
@@ -1158,6 +1175,7 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
     let checks = Vec.new(4)
     let inferred = Vec.new(4)
     for decl in decls {
+        Set.add(g.decls.functions, boundAt(g, decl.id, decl.name, decl.span))
         match declaredScheme(g, decl) {
             None -> Vec.push(inferred, decl)
             Some((s, tyvars)) -> {
@@ -1462,11 +1480,7 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
     match target.kind {
         EVar(name, _) -> {
             let id = referent(g, target, name, where)
-            if !assignable(g, id) {
-                oops("cannot assign to '" + Binders.binderAt(g.binders, id).name
-                     + "': it was bound with 'let'; declare it with 'var' to make "
-                     + "it reassignable", Some(where))
-            }
+            if !assignable(g, id) { notAssignable(g, id, where) }
             eq(g, use(g, name, id, Some(where), None), genExpr(g, value), Some(where),
                "the assignment to '" + name + "'")
         }
@@ -1518,7 +1532,7 @@ fun use(g : Generator, name : String, id : Int, where : Option Span,
     let t = fresh(g)
     let marker = match node {
         Some(n) -> {
-            let u = newUse(name, id, where, None)
+            let u = newUse(name, Some(id), where, None)
             Map.put(g.types.uses, n.id, u)
             Some(u)
         }
@@ -1767,7 +1781,7 @@ fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
     }
     let params = Array.init(info.arity, fun(_) = fresh(g))
     let con = TFun(params, fresh(g))
-    let u = newUse(name, C.noBinder, Some(e.span), None)
+    let u = newUse(name, None, Some(e.span), None)
     Map.put(g.types.uses, e.id, u)
     emit(g, CInstance(name, con, Some(e.span), Some(u), OfScheme(info.scheme)))
     con
@@ -1938,7 +1952,7 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             let receiver = genExpr(g, obj)
             let cls = Classes.fieldClass(name)
             discard(Classes.ensureGenerated(g.classes, cls))
-            let u = newUse(cls, C.noBinder, Some(e.span), None)
+            let u = newUse(cls, None, Some(e.span), None)
             let reads = Ty.pred(cls, [receiver])
             Vec.push(u.preds, reads)
             emit(g, C.cpredOf(reads, Some(e.span),

@@ -29,6 +29,7 @@ import Turkey.Source (Source(..))
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Binders as Binders
+import Turkey.Prelude as Prelude
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TCon, TVar)
@@ -580,7 +581,7 @@ fun registerTables(path : String,
 -- input rather than its output, because a scheme is what a reader can check by
 -- eye and evidence is not.
 fun dumpTypes(b : String.Builder, checked : Checked, entry : Modules.Module) -> Unit {
-    for (name, scheme) in signatures(entry, checked.env, checked.classes) {
+    for (name, scheme) in signatures(entry, checked.env, checked.classes, checked.binders) {
         String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
     }
 }
@@ -604,7 +605,7 @@ fun slotNames(checked : Checked) -> fun(String, Int) -> String =
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
                                    checked.types, target, build, checked.binders)
-    let program = Lower.program(lowerer, checked.ordered, checked.owners)
+    let program = Lower.program(lowerer, checked.ordered)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env, checked.binders),
                         Coretc.UniqueIds)
@@ -797,8 +798,11 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
     -- pass. It only swaps an allocation for its frame form, with the same
     -- operands and result, so the checks above hold of what it leaves.
     let giblets = Giblets.gibletModules()
-    let isGiblet = fun(name) =
-        Set.contains(giblets, Giblets.moduleOf(name)) || name == Giblets.initializerName
+    let gibletCode = Set.new()
+    for f in module_.functions {
+        if Giblets.isGiblet(giblets, f) { Set.add(gibletCode, f.name) }
+    }
+    let isGiblet = fun(name) = Set.contains(gibletCode, name)
     Escape.run(module_.functions, isGiblet)
     -- Last, and after the giblets check: a poll is a call into the runtime,
     -- which giblet code may not make and gets none of.
@@ -1422,7 +1426,6 @@ type Checked = Checked {
     -- initialized before anything that reads it, and the lowering keeps that
     -- order because the running program depends on it.
     ordered     : Vec Stmt,
-    owners      : Map Int String,
     -- The modules that came from the shipped library.
     library     : Set.Set String,
     -- Which binder each binding occurrence and reference means.
@@ -1440,7 +1443,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
         env = initialEnv(binders), types = Typed.newTypeTable(),
-        ordered = Vec.new(32), owners = Map.new(),
+        ordered = Vec.new(32),
         library = Set.new(), binders = binders, files = [],
     }
     checked.classes = Classes.newClassTable(checked.decls)
@@ -1448,15 +1451,11 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
     -- each other, so they are inferred together.
     for group in groups {
         let programs = Vec.new(len(group))
-        let owners = Map.new()
         let visibleByFile = Map.new()
         for m in group {
             Vec.push(checked.files, m.file)
             if m.library { Set.add(checked.library, m.name) }
             Vec.push(programs, (m.name, m.program))
-            for d in m.program.decls {
-                if let DStmt(s) = d { Map.put(owners, s.id, m.name) }
-            }
             Map.put(visibleByFile, m.file, visibleConstructors(m))
         }
         let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
@@ -1480,10 +1479,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         Infer.checkExhaustiveness(g)
         Diag.stopOnErrors()
         Evidence.run(checked.classes, solver.uses)
-        for item in items {
-            Vec.push(checked.ordered, item)
-            Map.put(checked.owners, item.id, Map.getOr(owners, item.id, group[0].name))
-        }
+        for item in items { Vec.push(checked.ordered, item) }
     }
     if checkingBinders() { Binders.checkInferred(binders, path) }
     checkMain(entry, checked.env, checked.classes)
@@ -1513,7 +1509,7 @@ fun checkMain(entry : Modules.Module, env : Constraints.Env,
     for item in entry.program.decls {
         match item {
             DStmt(s) -> for name in bindingNames(s) {
-                if Ty.shortName(name) == "main" {
+                if name == Prelude.internal(entry.name, "main") {
                     if let Some(binding) = Constraints.lookup_(env, name) {
                         let scheme = reduced(classes, binding.scheme)
                         if !isEntryType(scheme) {
@@ -1595,7 +1591,8 @@ fun reduced(classes : Classes.ClassTable, scheme : Ty.Scheme) -> Ty.Scheme {
 }
 
 fun signatures(entry : Modules.Module, env : Constraints.Env,
-               classes : Classes.ClassTable) -> Vec (String, Ty.Scheme) {
+               classes : Classes.ClassTable, binders : Binders.Table)
+        -> Vec (String, Ty.Scheme) {
     let out = Vec.new(16)
     for item in entry.program.decls {
         match item {
@@ -1613,7 +1610,11 @@ fun signatures(entry : Modules.Module, env : Constraints.Env,
             }
             DStmt(s) -> for name in bindingNames(s) {
                 if let Some(binding) = Constraints.lookup_(env, name) {
-                    Vec.push(out, (Ty.shortName(name), reduced(classes, binding.scheme)))
+                    let written = match Binders.named(binders, name) {
+                        Some(id) -> Binders.binderAt(binders, id).name
+                        None -> name
+                    }
+                    Vec.push(out, (written, reduced(classes, binding.scheme)))
                 }
             }
             _ -> {}

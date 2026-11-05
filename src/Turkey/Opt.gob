@@ -165,7 +165,7 @@ let bottomInlineLimit = 1
 fun anyKid(k : CoreKind, p : fun(Core) -> Bool) -> Bool = match k {
     CLit(_) -> False
     CUnit -> False
-    CVar(_, _) -> False
+    CVar(_) -> False
     CCon(_) -> False
     CPrim(_) -> False
     CTuple(elems) -> anyOf(elems, p)
@@ -184,7 +184,7 @@ fun anyKid(k : CoreKind, p : fun(Core) -> Bool) -> Bool = match k {
         p(body)
     }
     CJoin(_, _, _, body, rest, _) -> p(body) || p(rest)
-    CJump(_, _, args) -> anyOf(args, p)
+    CJump(_, args) -> anyOf(args, p)
     CRef(value) -> p(value)
     CDeref(target) -> p(target)
     CAssign(target, value) -> p(target) || p(value)
@@ -817,7 +817,7 @@ fun children(r : Reducer, e : Core) -> Core =
 -- that came from here.
 fun step(r : Reducer, e : Core) -> Option Core {
     match e.kind {
-        CVar(_, _) -> return constant(r, e)
+        CVar(_) -> return constant(r, e)
         -- A method read out of a known dictionary. Inlining makes these: a
         -- generic function's dictionary parameter becomes the dictionary its
         -- caller passed. With the method's own types when it has some, which is
@@ -892,7 +892,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
         }
         CIf(_, _, _) -> return knownCondition(r.decls, e)
         CDeref(target) -> return match target.kind {
-            CVar(name, _) -> match unwrittenOf(r, name) {
+            CVar(BySpelling(name)) -> match unwrittenOf(r, name) {
                 Some(initial) -> Some(mkCore(e.ty, e.span, initial.kind))
                 None -> None
             }
@@ -907,9 +907,10 @@ fun step(r : Reducer, e : Core) -> Option Core {
 -- an assignment's target, a reference passed as a value. A top-level `var`
 -- no binding mentions so is never written.
 fun mentionsInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
-    CVar(name, _) -> Set.add(out, name)
+    CVar(BySpelling(name)) -> Set.add(out, name)
+    CVar(ById(_)) -> {}
     CDeref(target) -> match target.kind {
-        CVar(_, _) -> {}
+        CVar(_) -> {}
         _ -> mentionsInto(target, out)
     }
     _ -> eachKid(e.kind, mentionsInto(_, out))
@@ -1061,7 +1062,7 @@ fun mint(r : Reducer) -> Int {
 -- bare mention of one is the function position of that application.
 fun constant(r : Reducer, e : Core) -> Option Core {
     let name = match stripTyApp(e).kind {
-        CVar(n, _) -> n
+        CVar(BySpelling(n)) -> n
         _ -> return None
     }
     let applied = match e.kind {
@@ -1103,9 +1104,9 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     var name = ""
     var targs = None
     match fn.kind {
-        CVar(n, _) -> { name = n }
+        CVar(BySpelling(n)) -> { name = n }
         CTyApp(inner, ts) -> match inner.kind {
-            CVar(n, _) -> {
+            CVar(BySpelling(n)) -> {
                 name = n
                 targs = Some(ts)
             }
@@ -1517,7 +1518,7 @@ fun caseOfCaseOn(r : Reducer, e : Core, scrutinee : Core,
         let made = expr(r, mkCore(e.ty, e.span, CMatch(branch, copyAlts(r, alts))))
         if mentionsAlts(made, alts) {
             Vec.push(pushed, mkCore(TBottom, branch.span,
-                                      CJump(name, id, [branch])))
+                                      CJump(ById(id), [branch])))
         } else {
             Vec.push(pushed, made)
             landed = True
@@ -1528,7 +1529,7 @@ fun caseOfCaseOn(r : Reducer, e : Core, scrutinee : Core,
     let (cv, cvId) = fresh(r, "cv")
     let param = CParam { name = cv, id = cvId, ty = scrutinee.ty }
     let body = mkCore(e.ty, e.span, CMatch(
-        mkCore(scrutinee.ty, e.span, CVar(param.name, param.id)), alts))
+        mkCore(scrutinee.ty, e.span, CVar(ById(param.id))), alts))
     let rest = match scrutinee.kind {
         CMatch(inner, innerAlts) -> {
             let made = Vec.new(len(innerAlts))
@@ -1591,7 +1592,7 @@ fun trivialLet(r : Reducer, e : Core) -> Option Core = match e.kind {
     CLet(_, id, _, value, body, binders) -> {
         if len(binders) > 0 { return None }
         match value.kind {
-            CVar(_, _) -> {}
+            CVar(_) -> {}
             CLit(_) -> {}
             CUnit -> {}
             CCon(_) -> {}
@@ -1614,7 +1615,7 @@ fun letToMatch(e : Core) -> Option Core = match e.kind {
         match body.kind {
             CMatch(scrutinee, alts) -> {
                 match scrutinee.kind {
-                    CVar(_, n) -> if n != id { return None }
+                    CVar(r) -> if r != ById(id) { return None }
                     _ -> return None
                 }
                 for a in alts { if mentions(altBody(a), id) { return None } }
@@ -1731,12 +1732,12 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
             if !group.known[i] {
                 let (made, madeId) = fresh(r, "jv")
                 Vec.push(fresh_, CParam { name = made, id = madeId, ty = params[i].ty })
-                Vec.push(templates, mkCore(params[i].ty, arg.span, CVar(made, madeId)))
+                Vec.push(templates, mkCore(params[i].ty, arg.span, CVar(ById(madeId))))
             } else {
                 let vars = Array.map(constructorArgs(arg), fun(field) {
                     let (made, madeId) = fresh(r, "jf")
                     Vec.push(fresh_, CParam { name = made, id = madeId, ty = field.ty })
-                    mkCore(field.ty, field.span, CVar(made, madeId))
+                    mkCore(field.ty, field.span, CVar(ById(madeId)))
                 })
                 Vec.push(templates, rebuildConstructor(arg, vars))
             }
@@ -1807,7 +1808,7 @@ fun atTheJump(r : Reducer, params : Array CParam, args : Vec Core, body : Core,
 fun named(r : Reducer, lets : Vec (String, Int, Core), hint : String, value : Core) -> Core {
     let (name, id) = fresh(r, hint)
     Vec.push(lets, (name, id, value))
-    mkCore(value.ty, value.span, CVar(name, id))
+    mkCore(value.ty, value.span, CVar(ById(id)))
 }
 
 -- The jump a specialized copy wants in place of this one, if its signature
@@ -1832,7 +1833,7 @@ fun specialized(d : DeclTable, groups : Map String Variant, j : Core) -> Option 
             Vec.push(out, args[i])
         }
     }
-    Some(mkCore(TBottom, j.span, CJump(target, targetId, out)))
+    Some(mkCore(TBottom, j.span, CJump(ById(targetId), out)))
 }
 
 -- A join parameter passed as its fields, where every jump builds it on the
@@ -1885,12 +1886,12 @@ fun flattenJoin(r : Reducer, e : Core) -> Option Core = match e.kind {
                 let vars = Array.map(knownParts(first[i]), fun(field) {
                     let (v, vId) = fresh(r, "jf")
                     Vec.push(ps, CParam { name = v, id = vId, ty = field.ty })
-                    mkCore(field.ty, field.span, CVar(v, vId))
+                    mkCore(field.ty, field.span, CVar(ById(vId)))
                 })
                 Vec.push(lets, (params[i], rebuildKnown(first[i], vars)))
             }
         }
-        let split = fun(j) = Some(mkCore(j.ty, j.span, CJump(name, id,
+        let split = fun(j) = Some(mkCore(j.ty, j.span, CJump(ById(id),
                                                             flatArgs(flat, j))))
         var made = if recursive { replaceJumps(body, id, split) } else { body }
         for var i = len(lets) - 1; i >= 0; i = i - 1 {
@@ -2002,7 +2003,7 @@ fun nameArguments(r : Reducer, e : Core) -> Option Core = match e.kind {
             } else {
                 let (t, tId) = fresh(r, "arg")
                 Vec.push(names, (t, tId, part))
-                mkCore(part.ty, part.span, CVar(t, tId))
+                mkCore(part.ty, part.span, CVar(ById(tId)))
             })
         var out = mkCore(e.ty, e.span,
                          CLet(name, id, ty, rebuildKnown(value, atoms), body, binders))
@@ -2032,7 +2033,7 @@ fun knownLet(r : Reducer, e : Core) -> Option Core = match e.kind {
     CLet(name, id, ty, value, body, binders) -> {
         if len(binders) > 0 || !unfoldable(r, value) { return None }
         for part in knownParts(value) { if !isAtom(part) { return None } }
-        let whole = mkCore(value.ty, value.span, CVar(name, id))
+        let whole = mkCore(value.ty, value.span, CVar(ById(id)))
         let decided = onSpine(body, id, fun(m) = match m.kind {
             CMatch(_, alts) -> selectArm(r, m, value, whole, alts)
             _ -> None
@@ -2051,7 +2052,7 @@ fun knownLet(r : Reducer, e : Core) -> Option Core = match e.kind {
 fun onSpine(e : Core, id : Int, decide : fun(Core) -> Option Core) -> Option Core =
     match e.kind {
     CMatch(scrutinee, _) -> match scrutinee.kind {
-        CVar(_, n) -> if n == id { decide(e) } else { None }
+        CVar(r) -> if r == ById(id) { decide(e) } else { None }
         _ -> None
     }
     CLet(bound, boundId, ty, value, body, binders) -> {
@@ -2106,7 +2107,7 @@ fun rebuildKnown(e : Core, parts : Array Core) -> Core = match e.kind {
 
 -- Whether copying `e` copies no work and no allocation.
 fun isAtom(e : Core) -> Bool = match e.kind {
-    CVar(_, _) -> True
+    CVar(_) -> True
     CPrim(_) -> True
     CLit(_) -> True
     CUnit -> True
@@ -2267,7 +2268,7 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
 -- type also changes from the consumed value's type to `ty`.
 fun consumeTail(r : Reducer, e : Core, alts : Vec CAlt, ty : Ty.Type,
                 span : Option Span) -> Core = match e.kind {
-    CJump(_, _, _) -> e
+    CJump(_, _) -> e
     CIf(cond, then, otherwise) -> {
         let inner = match otherwise {
             Some(o) -> o
@@ -2385,17 +2386,17 @@ fun copyTerm(c : Copier, e : Core) -> Core {
     if Option.isNone(c.rebase) && len(c.skolems) == 0 {
         match e.kind {
             CLit(_) | CUnit | CCon(_) | CPrim(_) -> return e
-            CVar(name, id) -> if !Map.contains(c.subst, id) && !Map.contains(c.renamed, id)
-                                    && (id != noId || !Map.contains(c.evidence, name)) {
+            CVar(ById(id)) -> if !Map.contains(c.subst, id) && !Map.contains(c.renamed, id) {
                 return e
             }
+            CVar(BySpelling(name)) -> if !Map.contains(c.evidence, name) { return e }
             _ -> {}
         }
     }
     let before = c.substituted
     let changedBefore = c.changed
     let kind = match e.kind {
-        CVar(name, id) -> match Map.get(c.subst, id) {
+        CVar(ById(id)) -> match Map.get(c.subst, id) {
             -- With the value's own spans, and binders of its own: a value is
             -- substituted at every mention.
             Some(value) -> {
@@ -2403,23 +2404,19 @@ fun copyTerm(c : Copier, e : Core) -> Core {
                 c.changed = c.changed + 1
                 return copyWith(c.mint, value, Map.new(), Map.new(), True, None)
             }
-            None -> if id == noId {
-                match Map.get(c.evidence, name) {
-                    Some(made) -> {
-                        c.changed = c.changed + 1
-                        CVar(made, noId)
-                    }
-                    None -> e.kind
-                }
-            } else {
-                let (n, i) = referenceTo(c, name, id)
-                CVar(n, i)
+            None -> CVar(ById(referenceTo(c, id)))
+        }
+        CVar(BySpelling(name)) -> match Map.get(c.evidence, name) {
+            Some(made) -> {
+                c.changed = c.changed + 1
+                CVar(BySpelling(made))
             }
+            None -> e.kind
         }
-        CJump(name, id, args) -> {
-            let (n, i) = referenceTo(c, name, id)
-            CJump(n, i, Vec.map(args, copyTerm(c, _)))
-        }
+        CJump(target, args) -> CJump(match target {
+                                         ById(id) -> ById(referenceTo(c, id))
+                                         BySpelling(_) -> target
+                                     }, Vec.map(args, copyTerm(c, _)))
         CLam(params, body, label) -> {
             let ps = Array.map(params, bindParam(c, _))
             CLam(ps, copyTerm(c, body), label)
@@ -2527,13 +2524,13 @@ fun replaceSkolems(t : Ty.Type, skolems : Map Int Ty.Type) -> Ty.Type = match Ty
     other -> other
 }
 
-fun referenceTo(c : Copier, name : String, id : Int) -> (String, Int) =
+fun referenceTo(c : Copier, id : Int) -> Int =
     match Map.get(c.renamed, id) {
-        Some(made) -> {
+        Some((_, made)) -> {
             c.changed = c.changed + 1
             made
         }
-        None -> (name, id)
+        None -> id
     }
 
 -- An existential's evidence has no id and is found by its spelling, so a copy
@@ -2635,18 +2632,20 @@ fun adoptTerm(a : Adopter, e : Core) -> Core {
 }
 
 fun adoptKind(a : Adopter, e : Core) -> CoreKind = match e.kind {
-    CVar(name, id) -> if id != noId { e.kind } else {
-        match Map.get(a.terms, name) {
-            Some((n, i)) -> {
-                if n != name || i != noId { a.changed = a.changed + 1 }
-                CVar(n, i)
-            }
-            None -> e.kind
+    CVar(ById(_)) -> e.kind
+    CVar(BySpelling(name)) -> match Map.get(a.terms, name) {
+        Some((n, i)) -> {
+            let made = refTo(n, i)
+            if made != BySpelling(name) { a.changed = a.changed + 1 }
+            CVar(made)
         }
+        None -> e.kind
     }
-    CJump(name, id, args) -> CJump(name,
-        if id != noId { id } else { adoptReference(a, a.labels, name) },
-        Vec.map(args, adoptTerm(a, _)))
+    CJump(target, args) -> CJump(match target {
+                                     ById(_) -> target
+                                     BySpelling(name) ->
+                                         refTo(name, adoptReference(a, a.labels, name))
+                                 }, Vec.map(args, adoptTerm(a, _)))
     CLam(params, body, label) -> {
         let ps = Array.map(params, fun(p) =
             CParam { name = p.name, id = adoptId(a, p.name, p.id), ty = p.ty })
@@ -2796,7 +2795,7 @@ fun restore(scope : Map String v, saved : Vec (String, Option v)) -> Unit {
 fun isValue(d : DeclTable, e : Core) -> Bool = match e.kind {
     CLit(_) -> True
     CUnit -> True
-    CVar(_, _) -> True
+    CVar(_) -> True
     CCon(_) -> True
     CPrim(_) -> True
     CLam(_, _, _) -> True
@@ -2851,7 +2850,7 @@ fun atomic(e : Core) -> Bool = match e.kind {
 -- as the discounts already here: the budget should track what a call site
 -- actually grows by.
 fun sizeOf_(e : Core) -> Int = match e.kind {
-    CVar(_, _) -> 0
+    CVar(_) -> 0
     CPrim(_) -> 0
     CLit(_) -> 0
     CUnit -> 0
@@ -2897,7 +2896,7 @@ fun expansion(e : Core) -> Int = match e.kind {
 fun forwardsPrim(body : Core) -> Bool = match body.kind {
     CApp(fn, args) -> match stripTyApp(fn).kind {
         CPrim(_) -> Iterator.all(args, fun(a) = match a.kind {
-            CVar(_, _) | CLit(_) | CUnit -> True
+            CVar(_) | CLit(_) | CUnit -> True
             _ -> False
         })
         _ -> False
@@ -2950,7 +2949,7 @@ fun stripTyApp(e : Core) -> Core = match e.kind {
 -- assumed to fall through, which costs a rewrite declined rather than a value
 -- dropped.
 fun fallsThrough(e : Core) -> Bool = match e.kind {
-    CJump(_, _, _) -> False
+    CJump(_, _) -> False
     CLet(_, _, _, _, body, _) -> fallsThrough(body)
     CJoin(_, _, _, body, rest, _) -> fallsThrough(body) || fallsThrough(rest)
     CMatch(_, alts) -> {
@@ -3025,7 +3024,7 @@ fun mentionsAlts(e : Core, alts : Vec CAlt) -> Bool = False
 -- for its own `body` only when it says it is recursive, exactly as the checker
 -- does.
 fun transfers(e : Core, bound : Set.Set Int) -> Bool = match e.kind {
-    CJump(_, id, _) -> !Set.contains(bound, id)
+    CJump(target, _) -> !Set.contains(bound, binderId(target))
     CLam(_, _, _) -> False
     -- No label is bound twice, so the walk shares one set: a label added here
     -- is never one a jump outside this join names.
@@ -3081,7 +3080,7 @@ fun hasKnownArg(d : DeclTable, j : Core) -> Bool {
 }
 
 fun jumpArgs(j : Core) -> Vec Core = match j.kind {
-    CJump(_, _, args) -> args
+    CJump(_, args) -> args
     _ -> oops("not a jump")
 }
 
@@ -3103,8 +3102,8 @@ fun joinJumps(e : Core, id : Int) -> Vec Core {
 }
 
 fun collectJumps(e : Core, id : Int, out : Vec Core) -> Unit = match e.kind {
-    CJump(_, target, args) -> {
-        if target == id { Vec.push(out, e) }
+    CJump(target, args) -> {
+        if target == ById(id) { Vec.push(out, e) }
         for a in args { collectJumps(a, id, out) }
     }
     _ -> eachKid(e.kind, collectJumps(_, id, out))
@@ -3113,7 +3112,7 @@ fun collectJumps(e : Core, id : Int, out : Vec Core) -> Unit = match e.kind {
 -- Whether one of the jumps `joinJumps` would have found satisfies `p`,
 -- stopping at the first that does.
 fun someJump(e : Core, id : Int, p : fun(Core) -> Bool) -> Bool = match e.kind {
-    CJump(_, target, args) -> (target == id && p(e)) || anyOf(args, someJump(_, id, p))
+    CJump(target, args) -> (target == ById(id) && p(e)) || anyOf(args, someJump(_, id, p))
     _ -> anyKid(e.kind, someJump(_, id, p))
 }
 
@@ -3123,14 +3122,14 @@ fun someJump(e : Core, id : Int, p : fun(Core) -> Bool) -> Bool = match e.kind {
 -- replaced would rewrite the same arguments twice.
 fun replaceJumps(e : Core, id : Int, chosen : fun(Core) -> Option Core) -> Core =
     match e.kind {
-    CJump(target, targetId, args) -> {
-        if targetId == id {
+    CJump(target, args) -> {
+        if target == ById(id) {
             match chosen(e) {
                 Some(made) -> return made
                 None -> {}
             }
         }
-        mkCore(e.ty, e.span, CJump(target, targetId, Vec.map(args, fun(a) =
+        mkCore(e.ty, e.span, CJump(target, Vec.map(args, fun(a) =
             replaceJumps(a, id, chosen))))
     }
     _ -> mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
@@ -3142,7 +3141,7 @@ fun replaceJumps(e : Core, id : Int, chosen : fun(Core) -> Option Core) -> Core 
 
 fun jumpsTo(e : Core, id : Int) -> Bool {
     match e.kind {
-        CJump(_, target, _) -> if target == id { return True }
+        CJump(target, _) -> if target == ById(id) { return True }
         _ -> {}
     }
     anyKid(e.kind, jumpsTo(_, id))

@@ -22,11 +22,12 @@ export (program, arities, operators, declare, protocolMethod)
 -- * **Method references the compiler writes.** `-x` means the class method
 --   `neg`, `xs[i]` means `get`, and a `for` loop `iter` and `next`; a plain
 --   `neg` reference would resolve to whatever `neg` the module happens to
---   define. So these references are marked, and the marked ones are looked up
---   in the separate protocol-method scope -- so `-x` still means the imported
---   `Neg.neg` in a module whose own `neg` is unrelated. A binary operator needs
---   no such scope: its `infix` declaration names its target in the module that
---   declares it.
+--   define. So these references are marked, and a marked one means the one
+--   method `Turkey.Prelude.protocolMethod` names, by its internal name, when
+--   the module can see that method -- so `-x` still means `Neg.neg` in a
+--   module whose own `neg`, or own class with a method `neg`, is unrelated. A
+--   binary operator needs no such rule: its `infix` declaration names its
+--   target in the module that declares it.
 --
 -- Every term binder, locals included, also gets an id in `Turkey.Binders`, and
 -- every binding occurrence and every reference is recorded there against its
@@ -715,21 +716,20 @@ fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
     }
 }
 
--- Resolves the marked reference `e`, spelled `name`, in the protocol-method
--- scope.
+-- Resolves the marked reference `e`, spelled `name`.
 fun method(r : R, e : Expr, name : String) -> Unit {
     let found = protocolMethod(r.scope, r.binders, e.id, name, e.span)
     if let Some(target) = found { e.kind = EVar(target, True) }
 }
 
--- Returns the internal name of the class method `name` in the protocol-method
--- scope of `scope`, after recording the reference `nodeId`, spanned by
--- `where`, against its binder. Returns `None` when the scope has no such
--- method, after leaving `nodeId` for inference to report. Raises a diagnostic
--- at `where` when the scope imports two different methods named `name`.
+-- Returns the internal name of the class method a compiler-written reference
+-- marked `name` means, after recording the reference `nodeId` against its
+-- binder. Returns `None` when `scope` cannot see that method, after leaving
+-- `nodeId` for inference to report. Raises an internal error, at `where`, for
+-- a spelling that marks no method.
 fun protocolMethod(scope : Scope, binders : Binders.Table, nodeId : Int,
                    name : String, where : Span) -> Option String {
-    let found = lookupName(scope, MethodSpace, name, Some(where))
+    let found = visibleMethod(scope, name, where)
     match found {
         Some(target) -> Binders.refer(binders, nodeId, target)
         None -> Binders.leaveUnresolved(binders, nodeId, name)
@@ -737,11 +737,21 @@ fun protocolMethod(scope : Scope, binders : Binders.Table, nodeId : Int,
     found
 }
 
+-- The method `Turkey.Prelude.protocolMethod` names for `name`, if `scope`
+-- can see it. Whatever else the scope calls `name` is not a candidate.
+fun visibleMethod(scope : Scope, name : String, where : Span) -> Option String =
+    match Prelude.protocolMethod(name) {
+        Some(target) -> if Set.contains(scope.methods, target) { Some(target) } else { None }
+        None -> Diag.fail(Diag.at("internal error",
+                                  "'" + name + "' marks no class method", where),
+                          where.file)
+    }
+
 -- A method reference *this* stage writes, for a node the parser left bare.
 -- `None` when the module cannot see the method at all, which leaves the
 -- bracket unlowered for inference to complain about.
 fun methodRef(r : R, name : String, where : Span) -> Option Expr =
-    match lookupName(r.scope, MethodSpace, name, Some(where)) {
+    match visibleMethod(r.scope, name, where) {
         None -> None
         -- From the same supply as every parsed node's. A constant here would
         -- give every bracket in the program one id, and the tables keyed by it
@@ -816,12 +826,9 @@ fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
     }
 }
 
--- The module part of an operator's internal name, quoted. A module name has
--- no `#`, and an operator may.
-fun declaringModule(id : String) -> String = match String.splitOnce(id, "#") {
-    Some((m, _)) -> "'" + m + "'"
-    None -> "'" + id + "'"
-}
+-- The module that declares the operator `id`, an internal name, quoted.
+fun declaringModule(id : String) -> String =
+    "'" + Option.unwrapOr(Prelude.moduleOf(id), id) + "'"
 
 -- One operator of a chain, applied. A built-in operator's node is spanned by
 -- where its left operand begins; a declared one's is spanned by the operator,

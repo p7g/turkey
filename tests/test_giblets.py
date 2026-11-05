@@ -81,16 +81,19 @@ def lowered(request, tmp_path):
     giblet = LIB / f"Probe_giblet_{digest}.gob"
     helper = LIB / f"Probe_helper_{digest}.gob"
     entry = tmp_path / "main.gob"
-    # Called from `main`, since specialization keeps only what is reachable.
-    entry.write_text(f"import Probe_giblet_{digest} as P\n"
-                     f"fun main() {{ print(Int.toString(P.f(3))) }}\n",
-                     encoding="utf-8")
 
-    def lower(giblet_body: str, helper_body: str,
-              exports: str = "h") -> tuple[int, str, str]:
+    def lower(giblet_body: str, helper_body: str, exports: str = "h",
+              giblet_exports: str = "f",
+              main: str = "print(Int.toString(P.f(3)))") -> tuple[int, str, str]:
+        # Called from `main`, since specialization keeps only what is
+        # reachable.
+        entry.write_text(f"import Probe_giblet_{digest} as P\n"
+                         f"import Probe_giblet_{digest} (..)\n"
+                         f"fun main() {{ {main} }}\n",
+                         encoding="utf-8")
         helper.write_text(f"export ({exports})\n\n"
                           + helper_body, encoding="utf-8")
-        giblet.write_text(f"export (f)\n\n"
+        giblet.write_text(f"export ({giblet_exports})\n\n"
                           f"import Probe_helper_{digest} as H\n"
                           + giblet_body, encoding="utf-8")
         env = dict(os.environ, **{HOOK: f"Probe_giblet_{digest}"})
@@ -324,6 +327,58 @@ def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
                      r"\([^)]*Probe_giblet_\w+\.gob:4:\d+\), which "
                      r"builds an array \([^)]*Probe_helper_\w+\.gob:3:\d+\)",
                      stderr), stderr
+
+
+def test_an_instance_method_is_giblet_code(lowered):
+    """An instance's method belongs to the module that declares the instance,
+    though its symbol names no module, so the check holds it to the rule
+    even where nothing in the giblet module calls it."""
+    code, _, stderr = lowered(
+        "import Data.Ord (Ord(..))\n"
+        "import Data.Num (Add(..))\n"
+        "type Thing = Thing(Int)\n"
+        "class Sized t { fun size(t) -> Int }\n"
+        "instance Sized Thing {\n"
+        "    fun size(Thing(n)) {\n"
+        "        var i = 0\n"
+        "        var total = 0\n"
+        "        while i < n {\n"
+        "            total = total + len([i, n, total])\n"
+        "            i = i + 1\n"
+        "        }\n"
+        "        total\n"
+        "    }\n"
+        "}\n"
+        "fun f(n : Int) -> Int = n\n",
+        "fun h(n : Int) -> Int = n\n",
+        giblet_exports="f, Thing(..), Sized(..)",
+        # Called from three places, so it is not inlined into `main`.
+        main="print(Int.toString(P.f(3) + size(Thing(3)) + size(Thing(4))"
+             " + size(Thing(5))))")
+    assert code != 0
+    assert re.search(r"giblets: '[^']*size' in a giblet module builds an array "
+                     r"\([^)]*Probe_giblet_\w+\.gob:13:\d+\)", stderr), stderr
+
+
+CLOSURE = "let h : fun(Int) -> Int = fun(x : Int) -> Int = len([x, x])\n"
+
+
+def test_a_top_level_closure_is_giblet_code(lowered, tmp_path):
+    """A function a top-level `let` holds belongs to the module that declares
+    the `let`, so an allocating one in a giblet module is refused, and the
+    same one in an ordinary module compiles."""
+    code, _, stderr = lowered(
+        CLOSURE + "fun f(n : Int) -> Int = n\n",
+        "fun h(n : Int) -> Int = n\n",
+        giblet_exports="f, h",
+        main="print(Int.toString(P.f(3) + P.h(1) + P.h(2)))")
+    assert code != 0
+    assert re.search(r"giblets: 'h' in a giblet module builds an array "
+                     r"\([^)]*Probe_giblet_\w+\.gob:4:\d+\)", stderr), stderr
+    entry = tmp_path / "main.gob"
+    entry.write_text(CLOSURE + "fun main() { print(Int.toString(h(1) + h(2))) }\n",
+                     encoding="utf-8")
+    assert verdict(entry, "", "ssa") == ""
 
 
 def test_a_stack_switch_is_refused(lowered):

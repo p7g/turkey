@@ -7,8 +7,8 @@ client's can be driven from the other end: reuse only after an exact end,
 idle connections closed wherever they are in the pool,
 the one retry on a pooled connection the server closed and the rule that
 allows it, each redirect rule, the policy, the deadlines, an early 413,
-trailers both ways, `Expect` relayed for a body that waits for a 100,
-upgrades, and TLS with a test CA.
+trailers both ways, a proxy relaying responses, `Expect` relayed for a
+body that waits for a 100, upgrades, and TLS with a test CA.
 
 `tests/http_client/Main.gob` runs one scenario per process, named by its
 first argument, with the certificates of `tests/test_tls.py`'s `certs`
@@ -177,6 +177,13 @@ SCENARIOS = {
         "error MaybeSent(more body was written than the length declared)",
         "error MaybeSent(Transport(PermissionDenied))",
         "200 POST [hello] chunked True, trailers [x-checksum: abc]",
+    ],
+    # Through a server that relays each response: the upstream's status,
+    # fields, body and trailers; a 204 without a body.
+    "proxy": [
+        "201 [hello] x-up True, trailers x-checksum: abc",
+        "204 [] x-up True, trailers ",
+        "200 [POST /form [a=1]] x-up False, trailers ",
     ],
     "upgrades": [
         "101 hello world",

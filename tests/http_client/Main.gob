@@ -7,6 +7,9 @@ import Net
 import Net (ConnectRule(..))
 import Net.HTTP (..)
 import Net.HTTP.Client as Client
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Respond, Done, respond, failed)
+import Net.TCP as TCP
 import Net.HTTP.Client (Client, Received(..), exchange, next, send, sendUnbounded, sendUpgrade, redirect, expectStatus, retryAllowed)
 import Net.HTTP.Credentials as Credentials
 import Net.HTTP.Headers as Headers
@@ -391,6 +394,56 @@ fun early() {
 
 -- Trailers: read after a chunked response, sent after a streamed request,
 -- and relayed with a response's body; and the streams the codec refuses.
+-- A proxy: a server that sends each request on to `upstream` and relays
+-- its response, fields, body and trailers, as they arrive.
+fun proxy() {
+    let upstream = plain(fun(s) = match s.path {
+        "/chunked" -> reply("HTTP/1.1 201 Created\r\ntransfer-encoding: chunked\r\nx-up: yes\r\n\r\n"
+                            + "5\r\nhello\r\n0\r\nx-checksum: abc\r\n\r\n", Keep)
+        "/empty" -> reply("HTTP/1.1 204 No Content\r\nx-up: yes\r\n\r\n", Keep)
+        _ -> ok(s.method + " " + s.path + " [" + s.body + "]")
+    })
+    scenario([upstream], fun() {
+        let c = clientOf(local())
+        let l = match TCP.listen(Net.V4(0x7f000001), 0) {
+            Right(l) -> l
+            Left(e) -> error(show(e))
+        }
+        let at = "http://127.0.0.1:" + show(TCP.listenerAddress(l).1)
+        let forward = fun(req : Request Incoming, r : Respond) -> Done {
+            let onward = ClientRequest {
+                method = map(req.method, payload)
+                url = HTTPURL.parse(url(upstream, req.target.path))
+                headers = req.headers
+            }
+            match send(c, onward, Duration.seconds(10), fun(resp) = Right(respond(r, relay(resp)))) {
+                Right(done) -> done
+                Left(e) -> failed(r, e)
+            }
+        }
+        Task.runScope(do {
+            let server = Server.start(l, Server.defaultConfig, forward)?
+            print(throughProxy(c, request(GET, at + "/chunked")))
+            print(throughProxy(c, request(GET, at + "/empty")))
+            print(throughProxy(c, request(newPOST("a=1"), at + "/form")))
+            Server.stop(server, Duration.seconds(1))
+            Server.wait(server)
+            pure(())
+        })
+        Client.close(c)
+    })
+}
+
+-- A response through the proxy: its status, body, whether it has the
+-- upstream's `x-up`, and its trailers.
+fun throughProxy(c : Client, req : ClientRequest Payload) -> String =
+    outcome(send(c, req, Duration.seconds(10), fun(resp) {
+        let b = receive(resp.body, 1024)?
+        let up = Headers.has(resp.headers, HeaderName.literal("x-up"))
+        let after = Option.unwrapOr(trailers(resp.body), Headers.empty)
+        Right(show(Status.code(resp.status)) + " [" + text(b) + "] x-up " + show(up) + ", trailers " + show(after))
+    }))
+
 fun trailing() {
     let p = plain(fun(s) = match s.path {
         "/trailers" -> reply("HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc\r\n\r\n", Keep)
@@ -710,6 +763,7 @@ fun run(name : String, dir : String) = match name {
     "deadlines" -> deadlines()
     "early" -> early()
     "trailers" -> trailing()
+    "proxy" -> proxy()
     "relayed" -> relayed()
     "upgrades" -> upgrades()
     "expect" -> expected()

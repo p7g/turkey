@@ -40,7 +40,7 @@ from tests.test_debug_info import _first_difference, _split
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
-CORPUS = sorted(path.name for path in PROGRAMS.glob("*.gob") if not path.name.startswith("err_"))
+CORPUS = [path.name for path in bootc.corpus()]
 
 PATHS = ["asm", "obj"]
 

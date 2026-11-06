@@ -2,7 +2,7 @@ export (
     Kind(..), KCell(..),
     kstar, kvar, kprune, unifyKinds, defaultKind, kindArrow, showKind,
     VarCell(..), ConCell(..), Type(..), Fresh, tcon, skolemCon,
-    noScope, ground, equals,
+    noScope, ground, unranked, equals,
     newVar, freshVar, tvar,
     shortName, qualify, qualifyAll, clearQualified, display,
     tInt, tByte, tFloat, tString, tChar, tBool, tUnit,
@@ -197,9 +197,9 @@ type ConCell = ConCell {
     kind      : Kind,
     var level : Int,
     -- 0 for a real constructor and unique to each *skolem*. A skolem's name is
-    -- unique only within its scope and its level is lifted when the scope ends,
-    -- so without it two signatures' `s` compare equal by name and level, and
-    -- a wanted rule over one fires inside the other.
+    -- unique only within its scope, and two sibling scopes stamp their skolems
+    -- with the same rank, so without it two signatures' `s` compare equal by
+    -- name and level, and a wanted rule over one fires inside the other.
     uid       : Int,
 }
 
@@ -254,6 +254,11 @@ let noScope = 0 - 1
 
 -- A predicate mentioning no variables can be settled anywhere.
 let ground = 1073741824
+
+-- The level of a variable a pass after solving makes, to carry a solved type
+-- through a unification. Above every rank, so no skolem that type mentions
+-- counts as escaping into it.
+let unranked = ground
 
 -- The name of the equality predicate. It lives here, with
 -- `Pred`, because a scheme carries it like any other; it is deliberately not a
@@ -809,19 +814,7 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
     _ -> False
 }
 
--- The first skolem in `t` that outlives `var`, if there is one.
---
--- A signature's variable becomes a rigid constructor for the length of the body,
--- standing for a type the *caller* picks. So it means something only inside the
--- binder that made it. Letting it bind a variable born outside would state that
--- some type out there is equal to a type the callee never gets to see -- the
--- escape that makes a checked signature unsound rather than merely unchecked.
---
--- Ranks already say this exactly, which is why the test is one comparison: the
--- skolem carries the rank of its binder, `var` carries its own, and a skolem
--- younger than the variable it would bind is out of scope. Run before
--- `occursAndAdjust`, which lowers levels and would erase the evidence.
--- The rigid constants reachable from `types`, first occurrence first.
+-- Returns the rigid constants reachable from `types`, first occurrence first.
 fun skolemsOf(types : Array Type) -> Vec ConCell {
     let out = Vec.new(2)
     let seen = Set.new()
@@ -862,6 +855,21 @@ fun openedEscape(t : Type, name : String, level : Int) -> Option String {
     None
 }
 
+-- Returns the name of the first skolem in `t` that outlives `slot`, if there
+-- is one.
+--
+-- A signature's variable becomes a rigid constructor for the length of the body,
+-- standing for a type the *caller* picks. So it means something only inside the
+-- binder that made it. Letting it bind a variable born outside would state that
+-- some type out there is equal to a type the callee never gets to see -- the
+-- escape that makes a checked signature unsound rather than merely unchecked.
+--
+-- Ranks already say this exactly, which is why the test is one comparison: the
+-- skolem carries the rank of its binder, `slot` carries its own, and a skolem
+-- younger than the variable it would bind is out of scope. A skolem keeps its
+-- rank after its binder is solved, so the test holds for an equation solved
+-- later too. Run before `occursAndAdjust`, which lowers levels and would erase
+-- the evidence.
 fun escaping(slot : VarCell, t : Type) -> Option String = match prune(t) {
     TCon(c) -> if c.level > slot.level { Some(c.name) } else { None }
     TApp(fn, arg, _) -> firstOf(escaping(slot, fn), escaping(slot, arg))
@@ -960,10 +968,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
     }
 
     match (x, y) {
-        -- Levels distinguish two skolems that happen to share a name: a nested
+        -- `uid` distinguishes two skolems that happen to share a name: a nested
         -- signature may write `a` too, and those two are not the same type.
         (TCon(c1), TCon(c2)) ->
-            if c1.name != c2.name || c1.level != c2.level {
+            if c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid {
                 mismatch(x, y, where, context)
             }
         -- Decomposing an application is sound only because there are no

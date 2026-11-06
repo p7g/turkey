@@ -141,9 +141,12 @@ type Lower = Lower {
     decls   : DeclTable,
     func    : Ssa.Func Low,
     b       : Builder,
-    -- Each local in scope, by binder id -> the value holding it.
+    -- Each local bound so far in the function, by binder id -> the value
+    -- holding it, and each join, by binder id -> the block it became. Neither
+    -- is scoped. No id is bound twice in the program, which `Turkey.Coretc`
+    -- checks before this pass, and every reference is in its binder's scope,
+    -- so an entry left behind after its scope ends is one nothing reads.
     var env     : Map Int Value,
-    -- Each join in scope, by binder id -> the block it became.
     var joins   : Map Int BlockId,
     -- Top-level names, which are globals rather than locals.
     globals : Set.Set String,
@@ -814,9 +817,9 @@ fun boxParameters(program : CProgram, decls : DeclTable,
 -- What `usesIn` is looking for: a use of any of `ids`, the parameter and
 -- what a `let` renames it to, where a box of it is wanted.
 --
--- No binder is bound inside the scope of another with its id, so a use of
--- one of `ids` is a use of the parameter wherever it is, and an id added for
--- a `let` need not be taken out after its body.
+-- No id is bound twice in the program, so a use of one of `ids` is a use of
+-- the parameter wherever it is, and an id added for a `let` need not be taken
+-- out after its body.
 type Uses = Uses {
     decls   : DeclTable,
     layouts : Map String Ssa.Layout,
@@ -1146,26 +1149,6 @@ fun idOf(name : String, id : Int) -> Int {
     id
 }
 
--- The locals an arm binds over its body.
-fun armLocals(alt : Alt) -> Vec Ref {
-    let out = []
-    let field = fun(binder) = if let Some((name, id)) = binder {
-        Vec.push(out, ById(idOf(name, id)))
-    }
-    match alt {
-        ACon(_, fields, opening) -> {
-            if let Some(o) = opening {
-                for (d, id) in o.evidence { Vec.push(out, ById(idOf(d, id))) }
-            }
-            for f in fields { field(f) }
-        }
-        ATuple(fields) -> for f in fields { field(f) }
-        ALit(_) -> {}
-        AAny(binder) -> field(binder)
-    }
-    out
-}
-
 -- The label a jump to `target` goes to. Raises an internal error for a jump
 -- by spelling: every join after `Turkey.Opt` has an id.
 fun labelOf(target : Ref) -> Int = match target {
@@ -1183,44 +1166,6 @@ fun put(l : Lower, local : Ref, v : Value) -> Unit = match local {
 fun lookup(l : Lower, local : Ref) -> Option Value = match local {
     ById(id) -> Map.get(l.env, id)
     BySpelling(_) -> None
-}
-
--- What the scope holds for these locals now, so it can be put back.
---
--- A binding `Turkey.Layout` copied binds each id once per copy, so two
--- binders of one id may be lowered in one function, each in a scope of its
--- own. An environment that only ever grew would carry the first one's value
--- into the second's scope, where nothing defines it -- a capture the verifier
--- catches as a dominance violation rather than as a wrong answer.
---
--- Saving the affected locals rather than copying the map: a scope binds a
--- handful of them and the map holds every local in the function.
-fun saving[Iterator c, Item c ~ Ref](l : Lower, locals : c) -> Vec (Ref, Option Value) {
-    let out = []
-    for local in locals { Vec.push(out, (local, lookup(l, local))) }
-    out
-}
-
--- The same, for a join label. One id rather than an array, because a
--- `CJoin` binds exactly one.
-fun savingJoin(l : Lower, id : Int) -> Option BlockId =
-    Map.get(l.joins, id)
-
-fun restore1Join(l : Lower, id : Int, was : Option BlockId) -> Unit =
-    match was {
-        Some(b) -> Map.put(l.joins, id, b)
-        None -> {
-            let _ = Map.delete(l.joins, id)
-        }
-    }
-
-fun restore(l : Lower, saved : Vec (Ref, Option Value)) -> Unit {
-    for (local, was) in saved {
-        match was {
-            Some(v) -> put(l, local, v)
-            None -> discard(Map.delete(l.env, binderId(local)))
-        }
-    }
 }
 
 -- A function type's result, past the type abstraction.
@@ -1336,13 +1281,13 @@ fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
 -- Lower `e`, sending its value to `dest`, with the builder's source position
 -- on it for the duration, as `value` has.
 fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
-    let outer = l.b.span
+    let outer = L.place(l.b)
     match e.span {
-        Some(_) -> { l.b.span = e.span }
+        Some(_) -> L.setSpan(l.b, e.span)
         None -> {}
     }
     lowerHere(l, e, dest)
-    l.b.span = outer
+    L.setPlace(l.b, outer)
 }
 
 fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
@@ -1368,42 +1313,23 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
         }
         CLet(name, id, ty, bound, body, _) -> {
             let local = idOf(name, id)
-            let v = localBinding(l, local, bound)
-            let was = saving(l, [ById(local)])
-            Map.put(l.env, local, v)
+            Map.put(l.env, local, localBinding(l, local, bound))
             lower(l, body, dest)
-            restore(l, was)
         }
         -- A join is a block, and a jump to it is a jump. This is the case the
         -- whole IR is shaped for.
         CJoin(name, id, params, body, rest, recursive) -> {
             let target = L.block(l.b)
             let entered = joinParams(l, target, params, body, dest)
-            -- Scoped as the term binders are, and for the same reason: a
-            -- join in a binding `Turkey.Layout` copied is bound once per
-            -- copy. An unscoped map sends one copy's jump to the other's
-            -- block, which is not a wrong value but a wrong *edge*, and the
-            -- verifier catches it as a definition that no longer dominates
-            -- its use.
-            let label = idOf(name, id)
-            let hidden = savingJoin(l, label)
-            Map.put(l.joins, label, target)
+            Map.put(l.joins, idOf(name, id), target)
             -- `rest` first: it is what jumps, and the parameters have to exist
             -- before it can.
             lower(l, rest, dest)
             L.into(l.b, target)
-            -- The join is in scope in its own body only if it is recursive --
-            -- a loop compiled as a label. A non-recursive one is the
-            -- case-of-case duplication and its body cannot reach it.
-            if !recursive { restore1Join(l, label, hidden) }
-            let ids = Array.map(params, fun(p) = idOf(p.name, p.id))
-            let was = saving(l, Array.map(ids, ById))
             for var i = 0; i < len(params) && i < len(entered); i = i + 1 {
-                Map.put(l.env, ids[i], entered[i])
+                Map.put(l.env, idOf(params[i].name, params[i].id), entered[i])
             }
             lower(l, body, dest)
-            restore(l, was)
-            if recursive { restore1Join(l, label, hidden) }
         }
         CJump(target, args) -> {
             let supplied = Array.map(args, fun(a) = value(l, a))
@@ -1442,7 +1368,6 @@ fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Dest) 
         let success = L.block(l.b)
         let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
         L.into(l.b, test)
-        let was = saving(l, armLocals(alts[i].alt))
         -- An existential arm's copy is lowered under the layouts it names for
         -- the constants it opens.
         let outer = l.layouts
@@ -1451,7 +1376,6 @@ fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Dest) 
         L.into(l.b, success)
         lower(l, alts[i].body, dest)
         setLayouts(l, outer)
-        restore(l, was)
         test = failure
     }
     L.into(l.b, failed)
@@ -1681,7 +1605,6 @@ fun literalKey(lit : Lit) -> Int = match lit {
 -- then its body.
 fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Type,
           dest : Dest) -> Unit {
-    let was = saving(l, armLocals(alt.alt))
     match alt.alt {
         AAny(binder) -> bindTo(l, binder, whole)
         ACon(name, binders, _) -> match shape {
@@ -1698,7 +1621,6 @@ fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Typ
         _ -> {}
     }
     lower(l, alt.body, dest)
-    restore(l, was)
 }
 
 fun every(xs : Array a, p : fun(a) -> Bool) -> Bool {
@@ -2094,14 +2016,14 @@ fun retagged(l : Lower, v : Value, want : Rep) -> Value =
 -- construct that asked for it (`Func.origins`). A node with no span of its own
 -- -- one the compiler made -- keeps its parent's.
 fun value(l : Lower, e : Core) -> Value {
-    let outer = l.b.span
+    let outer = L.place(l.b)
     match e.span {
-        Some(_) -> { l.b.span = e.span }
+        Some(_) -> L.setSpan(l.b, e.span)
         None -> {}
     }
     let held = if Option.isSome(l.stopped) { Ssa.Layout { slots = [] } } else { heldOf(l, e.ty) }
     let v = adopted(l, e.ty, held, valueHere(l, e, held))
-    l.b.span = outer
+    L.setPlace(l.b, outer)
     v
 }
 
@@ -2239,12 +2161,8 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         -- a value of several slots keeps the form its body gave it.
         CLet(name, id, _, bound, body, _) -> {
             let local = idOf(name, id)
-            let v = localBinding(l, local, bound)
-            let was = saving(l, [ById(local)])
-            Map.put(l.env, local, v)
-            let result = value(l, body)
-            restore(l, was)
-            result
+            Map.put(l.env, local, localBinding(l, local, bound))
+            value(l, body)
         }
         CJoin(_, _, _, _, _, _) -> control(l, e, held)
         CLetRec(_, _) -> control(l, e, held)
@@ -2417,9 +2335,10 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 --
 -- `Core.references` collects every `CVar` in the body, including those under
 -- nested lambdas -- which is what makes a transitive capture work with no
--- second traversal. A binder the body binds itself is not in scope here, since
--- no binder is bound inside the scope of another with its id, so what this
--- body holds of them is exactly the free locals.
+-- second traversal. A binder the body binds itself is not in the environment
+-- yet, since no id is bound twice in the program, and a binder that is but whose
+-- scope has ended is one the body cannot mention. So what the environment holds
+-- of the body's references is exactly its free locals.
 --
 -- Not the whole environment. `turkey_object_new` refuses more than 63 slots,
 -- and the environment of a body the size of `Turkey.Opt#expr` holds far more
@@ -2489,7 +2408,6 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     l.shared.next = l.shared.next + 1
     -- The body and every call site derive the signature from its types.
     let g = Ssa.newFunc(symbol, [repOf(l, result)])
-    g.at = L.here(l.b)
     g.module_ = l.func.module_
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
@@ -2507,8 +2425,11 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     child.held.layouts = l.held.layouts
     child.held.flats = l.held.flats
     -- What the body does before its own first node, reading the environment
-    -- and the parameters, is the lambda's.
-    child.b.span = l.b.span
+    -- and the parameters, is the lambda's. Its position is made by the
+    -- child's builder, because a position's inline site is numbered in the
+    -- function it is in.
+    L.setSpan(child.b, l.b.span)
+    g.at = L.here(child.b)
     let entry = L.block(child.b)
     L.into(child.b, entry)
     -- The environment comes first and is not the closure: the callee is handed
@@ -2680,7 +2601,6 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
     for (_, symbol, captures) in plans {
         Vec.push(shells, closureShell(l, symbol, captures, siblings))
     }
-    let was = saving(l, Vec.map(plans, fun(plan) = ById(plan.0)))
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
         Map.put(l.env, plans[i].0, shells[i])
     }
@@ -2698,7 +2618,6 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
         }
     }
     lower(l, body, dest)
-    restore(l, was)
 }
 
 fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
@@ -3658,7 +3577,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
         -- The owning binding's position, which what the action lowers to
         -- takes where its own nodes have none: a dictionary is built from
         -- nodes the compiler made.
-        l.b.span = bind.span
+        L.setSpan(l.b, bind.span)
         -- The global's module, for the lambdas the action lifts to take.
         -- `Lower` has no room for a field of its own for it; the
         -- initializer's own is put back to empty below.

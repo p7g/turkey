@@ -6,7 +6,7 @@ export (
     ClassTable(..), newClassTable,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
-    reduceFam, normalize, normalizeUnder, givenRule, settled, settledFam,
+    reduceFam, normalize,
     uncovered,
     bySuper, byInst, entail, isClass, method, simplify,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
@@ -234,33 +234,6 @@ type ClassTable = ClassTable {
     -- Method name -> owning class. Methods share the value namespace with
     -- ordinary functions, so this is also what detects a collision.
     owner     : Map String String,
-    -- Equations the solver has stuck on, as rewrite rules for the families
-    -- they name. A *wanted* equality is a rule too: if the binding retains it
-    -- then every caller proves it, and if it is discharged later then
-    -- unification has made both sides one anyway -- so reducing by it is sound
-    -- either way. GHC calls this wanteds rewriting wanteds.
-    --
-    -- They live here rather than on the solver because everything that reduces
-    -- a family goes through this table -- predicate discharge, the type table
-    -- the lowering and exhaustiveness read, and the elaborator -- and those
-    -- three disagreeing is the whole defect. Teaching one is worse than
-    -- teaching none: solving then accepts a predicate whose evidence the
-    -- elaborator cannot reconstruct.
-    --
-    -- A rule names particular type *variables*, and `typeKey` prunes, so one
-    -- binding's rule cannot fire inside another: no other binding mentions its
-    -- variables. That is what makes a flat list correct where a scope stack
-    -- would be needed for anything else. A variable bound to a *skolem* keeps
-    -- the property only because a skolem's key carries its `uid`: by name and
-    -- level alone, two signatures' `s` would be one type.
-    rules     : Vec (Ty.Type, Ty.Type),
-    -- Turned off while an equation is being retried. A wanted equality may
-    -- rewrite *other* constraints and must never discharge itself: reducing
-    -- `Container.Elem c` by the very rule `Container.Elem c ~ Int` supplied
-    -- makes the equation trivially true, so a program that should be told to
-    -- state it in its context is accepted and fails in the Core checker
-    -- instead.
-    var rulesApply : Bool,
     -- Class -> the keyed slots `Turkey.Layout` adds to its dictionaries, as
     -- (method, layout key), in slot order. Empty until Layout settles, and
     -- written once when it does. See `dictSlots`.
@@ -272,8 +245,6 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     classes = Map.new()
     instances = Map.new()
     owner = Map.new()
-    rules = []
-    rulesApply = True
     keyed = Map.new()
 }
 
@@ -361,31 +332,6 @@ fun slotName(t : ClassTable, cls : String, index : Int) -> String =
         Some(KeyedSlot(m, k)) -> surfaceMember(m) + "@[" + k + "]"
         None -> "%" + Int.toString(index)
     }
-
--- `reduceFam`, refusing the wanted rules. See `settled`.
-fun settledFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
-    let was = t.rulesApply
-    t.rulesApply = False
-    let out = reduceFam(t, name, arg)
-    t.rulesApply = was
-    out
-}
-
--- `normalize`, refusing the wanted rules.
---
--- For the two questions that decide whether an equation *survives*: is it
--- already true, and can it be retried. Both must be answered from definitions
--- and givens alone, because an equation answered by the rule it supplied is
--- answered by itself -- and a scheme that drops it stops making its callers
--- prove it, which is the difference between a carried equation and an unsound
--- one.
-fun settled(t : ClassTable, ty : Ty.Type) -> Ty.Type {
-    let was = t.rulesApply
-    t.rulesApply = False
-    let out = normalize(t, ty)
-    t.rulesApply = was
-    out
-}
 
 -- -- registration ------------------------------------------------------------------
 
@@ -699,16 +645,11 @@ fun resolveContext(t : ClassTable, context : Vec Ast.Pred, tyvars : Map String T
 
 -- Translate a written `Item c ~ Op`.
 --
--- The left side must be a family application, and that restriction is what keeps
--- the rule sound as a *given*. A given equality is used by rewriting -- `Item c`
--- has to actually become `Op` for a `match` on the element to find its
--- constructors -- so each one is read as a reduction rule for the family it
--- names. Requiring the family on the left gives every rule a single,
--- syntactically evident left-hand side; requiring the right side not to mention
--- it keeps rewriting terminating.
---
--- A general equality between two arbitrary types would be neither. It is also
--- not needed: `Int ~ a` says nothing a plain annotation cannot.
+-- The left side must be a family application, and the right side may not
+-- mention it. `Turkey.Inert` makes the givens canonical whatever their shape;
+-- these are restrictions on what a context may say, not on what the solver can
+-- use. A general equality between two arbitrary types is not needed: `Int ~ a`
+-- says nothing a plain annotation cannot.
 fun resolveEquality(t : ClassTable, p : Ast.Pred, leftTe : Type, rightTe : Type,
                     tyvars : Map String Ty.Type, fresh : Ty.Fresh) -> Pred {
     let left = Decls.toType(t.decls, leftTe, tyvars, fresh)
@@ -1373,59 +1314,19 @@ fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
             }
         }
     }
-    -- Only once no instance decides it. A definition is the truth about a
-    -- family and a wanted equality is merely something else known to be equal
-    -- to it, so a rule can fill a gap and must never contradict an answer.
-    if !t.rulesApply {
-        return None
-    }
-    let wanted = TFam(name, target, Ty.kvar())
-    for (left, right) in t.rules {
-        if Ty.sameType(left, wanted) {
-            return Some(right)
-        }
-    }
     None
 }
 
--- Reduce family applications at the head of `t` until one sticks.
-fun normalize(t : ClassTable, ty : Ty.Type) -> Ty.Type =
-    normalizeUnder(t, ty, [])
-
--- What a given equality among `givens` says a family application is, if one
--- names it. A reflexive one is skipped rather than returned, so the instance
--- table still gets its turn.
-fun givenRule(givens : Vec Pred, ty : Ty.Type) -> Option Ty.Type {
-    for p in givens {
-        if p.name == Ty.equals && Ty.sameType(p.args[0], ty)
-                && !Ty.sameType(p.args[1], ty) {
-            return Some(p.args[1])
-        }
-    }
-    None
-}
-
--- `normalize`, with the given equalities among `givens` consulted first.
---
--- For a predicate being discharged, and for the evidence that proves it. A
--- class predicate over a family application that only a given decides is
--- stuck without the givens, and unification's reducer reads them too. The two
--- have to read the same givens, or solving accepts what elaboration cannot
--- prove.
-fun normalizeUnder(t : ClassTable, ty : Ty.Type, givens : Vec Pred) -> Ty.Type {
+-- Returns `ty` with family applications at its head reduced through the
+-- instances until one sticks. The givens are `Turkey.Inert`'s business.
+fun normalize(t : ClassTable, ty : Ty.Type) -> Ty.Type {
     var out = Ty.prune(ty)
     var going = True
     while going {
         match out {
-            TFam(name, arg, _) -> {
-                let reduced = match givenRule(givens, out) {
-                    Some(r) -> Some(r)
-                    None -> reduceFam(t, name, arg)
-                }
-                match reduced {
-                    None -> { going = False }
-                    Some(r) -> { out = Ty.prune(r) }
-                }
+            TFam(name, arg, _) -> match reduceFam(t, name, arg) {
+                None -> { going = False }
+                Some(r) -> { out = Ty.prune(r) }
             }
             _ -> { going = False }
         }
@@ -1599,24 +1500,18 @@ fun simplify(t : ClassTable, preds : Vec Pred) -> Vec Pred {
         let p = preds[i]
         if !isClass(t, p.name) {
             if p.name == Ty.equals && len(p.args) == 2 {
-                -- `Field.tag a ~ Field.tag a` states nothing, and it is not
-                -- merely noise: as a given it is a rewrite rule from a family
-                -- application to itself, so `normalize`'s loop -- reduce until
-                -- the head is no longer a family -- never terminates. Two
-                -- family applications are deferred while their arguments
-                -- differ and can become equal afterwards, which is where these
-                -- come from.
+                -- `Field.tag a ~ Field.tag a` states nothing. Two family
+                -- applications are deferred while their arguments differ and
+                -- can become equal afterwards, which is where these come from.
                 -- Normalized first: a side can become reducible after the last
                 -- time the equation was retried, so `Int ~ Int` is a shape this
-                -- actually reaches. It states nothing and, as a given, is a
-                -- rewrite from a type to itself.
-                if Ty.sameType(settled(t, p.args[0]), settled(t, p.args[1])) {
+                -- actually reaches.
+                if Ty.sameType(normalize(t, p.args[0]), normalize(t, p.args[1])) {
                     continue
                 }
                 -- Equality is symmetric. Inference can meet both directions when
-                -- two associated families meet through a mutable local. Carrying
-                -- both into a scheme creates a cyclic rewrite system for Core
-                -- checking, although they state one fact.
+                -- two associated families meet through a mutable local, and
+                -- they state one fact.
                 let key = symmetricKey(p)
                 if Set.contains(equalities, key) { continue }
                 Set.add(equalities, key)

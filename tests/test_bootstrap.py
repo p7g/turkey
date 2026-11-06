@@ -119,8 +119,7 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     point catches a miscompile of the compiler, and this catches one that
     only shows in what the compiler *emits* for other sources.
     """
-    programs = sorted(path for path in (REPO_ROOT / "tests" / "programs").glob("*.gob")
-                      if not path.name.startswith("err_"))
+    programs = bootc.corpus()
     stage2 = bootc.boot_each("select", programs, _split_asm)
     result = subprocess.run(
         toolchain.command(_stage3(), *bootc.argv("select"), *[str(p) for p in programs]),

@@ -44,6 +44,7 @@ import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
+import Turkey.Inert as Inert
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
@@ -110,19 +111,14 @@ type Generator = Generator {
     fnStack       : Vec Ty.Type,
     var loopStack : Vec LoopCtx,
     tyvarScopes   : Vec (Map String Ty.Type),
-    -- The given equalities of the signatures whose bodies are being
-    -- generated, outermost first. Replaced and never changed in place, so a
-    -- site may keep the list it was generated under.
-    var givens  : Vec Pred,
-    -- Exhaustiveness runs after solving, when scrutinee types are known, and
-    -- with the givens popped. So each site keeps the given equalities in scope
-    -- where it is, to reduce its type by.
-    matchSites  : Vec (Expr, Ty.Type, Vec Pred),
+    -- Exhaustiveness runs after solving, when scrutinee types are known. Each
+    -- site keeps the scopes the solver had open there (`siteScopes`).
+    matchSites  : Vec (Expr, Ty.Type, Use),
     -- And irrefutability: every pattern that binds with no second arm to fall
     -- to.
-    -- A binding pattern, the type it binds, what a refutable one should be
-    -- rewritten as, and the given equalities in scope.
-    binderSites : Vec (Pat, Ty.Type, String, Vec Pred),
+    -- A binding pattern, the type it binds, and what a refutable one should
+    -- be rewritten as.
+    binderSites : Vec (Pat, Ty.Type, String, Use),
     -- And every expression whose value is thrown away, recorded after it is
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
@@ -152,7 +148,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
         binders = binders, parameters = Set.new(), fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
-        givens = Vec.new(4), matchSites = Vec.new(8),
+        matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
@@ -760,7 +756,6 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     }
     -- The method's own name, unqualified: messages name its class apart.
     let method = Binders.nameAt(g.binders, decl.id, decl.span)
-    let outer = assume(g, givens)
     push(g)
     -- Check the body against the expected type rather than inferring it and
     -- comparing afterwards. Each parameter is bound at its class-declared type
@@ -779,13 +774,14 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     eq(g, inferred, expected, Some(decl.span),
        "the type of '" + method + "' that class '" + m.cls + "' declares")
     let defn = pop(g)
-    g.givens = outer
     -- A binder for the rank, not for the polymorphism: the expected type is
     -- rigid, so nothing generalizes. What the rank buys is that a predicate the
     -- body raised is settled here, against the assumptions, instead of escaping
     -- to the end of the program.
     -- A unit of diagnostics, as a top-level group is.
-    emit(g, CUnit(CAssume(givens, CLet(LetCell {
+    -- No context at this site wrote these: the class's signature grants them
+    -- to every override.
+    emit(g, CUnit(CAssume(Vec.map(givens, fun((n, p)) = (n, p, None)), CLet(LetCell {
         binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
         dicts = None, skolems = sk.made, rigid = [],
@@ -937,68 +933,69 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     }
     Map.put(g.types.abstractions, decl.id, dicts)
 
-    let outer = assume(g, givens)
     push(g)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                                decl.context, Some(rigid), -1, None)
     eq(g, inferred, expected, Some(decl.span),
        "the declared type of '" + decl.name + "'")
     let defn = pop(g)
-    g.givens = outer
-    CAssume(givens, CLet(LetCell {
+    let written = Vec.new(len(givens))
+    for var i = 0; i < len(givens); i = i + 1 {
+        let (n, p) = givens[i]
+        let at = if i < len(decl.context) { Some(decl.context[i].span) } else { None }
+        Vec.push(written, (n, p, at))
+    }
+    CAssume(written, CLet(LetCell {
         binds = [(C.noBinder, "%sig." + decl.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
         dicts = None, skolems = sk.made, rigid = [],
     }))
 }
 
--- Adds the equalities among `givens` to those in scope, and returns the
--- givens in scope before, for the caller to restore once the body is
--- generated.
-fun assume(g : Generator, givens : Vec (String, Pred)) -> Vec Pred {
-    let outer = g.givens
-    let inner = Vec.slice(outer, 0, len(outer))
-    for (_, p) in givens {
-        if p.name == Ty.equals { Vec.push(inner, p) }
-    }
-    g.givens = inner
-    outer
+-- Returns a record the solver fills with the scopes open at this point, for
+-- a check that runs after solving.
+fun siteScopes(g : Generator) -> Use {
+    -- A use with no predicates: the solver records its scopes as it does any
+    -- use's, and evidence finds nothing to resolve in it. No node holds it, so
+    -- the lowering never reads it.
+    let u = newUse("%site", None, None, None)
+    emit(g, CUse(u))
+    u
 }
 
--- Returns `ty` with every family application reduced, by the given
--- equalities among `givens` first and then by the instances.
-fun resolveUnder(g : Generator, ty : Ty.Type, givens : Vec Pred) -> Ty.Type {
-    -- Read the givens again, because solving records nowhere what only a given
-    -- decides. A family over a rigid type, such as the element type of
-    -- `advance(iterate(s))` with `s` a method's parameter, is rewritten by the
-    -- given when it is compared, and the type the body recorded keeps the
-    -- application.
-    if len(givens) == 0 { return Typed.resolve(g.types, ty) }
-    let classes = g.classes
-    Typed.reduceDeep(ty, Some(Ty.Families {
-        reduce = fun(t) = match t {
-            TFam(name, arg, _) -> match Classes.givenRule(givens, t) {
-                Some(r) -> Some(r)
-                None -> Classes.reduceFam(classes, name, arg)
-            }
-            _ -> None
-        },
-        defer = fun(_, _, _, _) = {},
-        untouchable = Ty.noScope,
-    }))
+-- Returns the solved type `ty`, reduced through the instances and rewritten
+-- by the equalities of the scopes `site` recorded: the givens of the
+-- signatures around it, and those the bindings around it retained.
+fun resolveUnder(g : Generator, ty : Ty.Type, site : Use) -> Ty.Type {
+    -- Both kinds matter: a scrutinee may be `Item s` under a given `Item s ~
+    -- Op`, or under a binding that matched it against `Op`'s constructors and
+    -- so retained the same equality as a wanted.
+    let t = Typed.resolve(g.types, ty)
+    let equalities = Vec.new(2)
+    for sc in site.scopes {
+        for (_, p) in sc.givens {
+            if p.name == Ty.equals { Vec.push(equalities, p) }
+        }
+    }
+    if len(equalities) == 0 { return t }
+    let (inert, _) = Inert.extend(Inert.empty(g.classes),
+                                  Array.map(Vec.toArray(equalities), Inert.given))
+    let out = Inert.rewrite(inert, t)
+    Inert.close(inert)
+    out
 }
 
 -- A non-exhaustive match is an error, and so is a refutable binding pattern.
 -- Runs after solving, since it needs the scrutinee types resolved.
 fun checkExhaustiveness(g : Generator) -> Unit {
-    for (site, scrutinee, givens) in g.matchSites {
+    for (site, scrutinee, scopes) in g.matchSites {
         let arms = match site.kind {
             EMatch(_, a) -> a
             _ -> []
         }
         -- Normalized, not merely pruned: the element of a `for ... in` loop is
         -- `Item xs`, and a family names a type only once it has reduced.
-        match Exhaustive.check(g.decls, arms, resolveUnder(g, scrutinee, givens)) {
+        match Exhaustive.check(g.decls, arms, resolveUnder(g, scrutinee, scopes)) {
             None -> {}
             Some(missing) -> {
                 -- A bare `_` witness means the scrutinee's type has too many
@@ -1015,8 +1012,8 @@ fun checkExhaustiveness(g : Generator) -> Unit {
         }
     }
     -- Refutable binding patterns, after every match.
-    for (pat, bound, fix, givens) in g.binderSites {
-        match Exhaustive.checkPattern(g.decls, pat, resolveUnder(g, bound, givens)) {
+    for (pat, bound, fix, scopes) in g.binderSites {
+        match Exhaustive.checkPattern(g.decls, pat, resolveUnder(g, bound, scopes)) {
             None -> {}
             Some(missing) -> {
                 let detail = if missing == "_" { "every value" }
@@ -1236,7 +1233,7 @@ fun letDefinition(g : Generator, pat : Pat, value : Expr, isVar : Bool)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
     Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'",
-                             g.givens))
+                             siteScopes(g)))
     let binds = bindersIn(g, [pat], pat.span, bound)
     let defn = pop(g)
     -- Only a `let` bound to a syntactic value generalizes.
@@ -1338,7 +1335,7 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
         }
         mergeInto(binds, matchPattern(g, param, tv), param.span)
         Vec.push(g.binderSites, (param, tv,
-            "name the parameter and 'match' on it in the body", g.givens))
+            "name the parameter and 'match' on it in the body", siteScopes(g)))
         tv
     })
     let openings = popOpenings(g)
@@ -1993,7 +1990,7 @@ fun openedConstraint(openings : Vec (Array (String, Pred), Vec ConCell),
     let givens = Vec.new(2)
     let skolems = Vec.new(2)
     for (gs, made) in openings {
-        for gv in gs { Vec.push(givens, gv) }
+        for (n, p) in gs { Vec.push(givens, (n, p, None)) }
         for s in made { Vec.push(skolems, s) }
     }
     CAssume(givens, CLet(LetCell {
@@ -2183,7 +2180,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     let binds = matchPattern(g, pat, element)
     discard(Vec.pop(g.openings))
     Vec.push(g.binderSites, (pat, element,
-        "name the element and 'match' on it in the loop body", g.givens))
+        "name the element and 'match' on it in the loop body", siteScopes(g)))
     push(g)
     Vec.push(g.loopStack, LoopCtx {
         kind = "for", result = Ty.tUnit(),
@@ -2199,7 +2196,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
 fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
              arms : Vec Arm) -> Ty.Type {
     let scrutineeType = genExpr(g, scrutinee)
-    Vec.push(g.matchSites, (e, scrutineeType, g.givens))
+    Vec.push(g.matchSites, (e, scrutineeType, siteScopes(g)))
     var result = TBottom
     for arm in arms {
         Vec.push(g.openings, Some(Vec.new(2)))

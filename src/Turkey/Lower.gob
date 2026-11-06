@@ -64,6 +64,7 @@ import Turkey.Core as Cr
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Match as Match
 import Turkey.Prelude as P
 import Turkey.Prims as Prims
@@ -970,8 +971,7 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
         if len(u.evidence) == 0 { return [] }
         let givens = givensOf(l, u)
         let count = fewer(len(u.evidence), len(u.preds))
-        Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                            givens))
+        Array.init(count, fun(i) = evidence(l, u.evidence[i], wantAt(l, u, i), givens))
     }
 }
 
@@ -991,8 +991,7 @@ fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
     }
     let givens = givensOf(l, u)
     let count = fewer(len(u.evidence), len(u.preds))
-    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                             givens)))
+    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], wantAt(l, u, i), givens)))
 }
 
 -- The constructor as Core applies it: dictionaries, then fields.
@@ -1313,6 +1312,29 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
         let p = inst.context[i]
         Map.put(out, plan.params[i], dictType(l, p.name, p.args[0]))
     }
+    out
+}
+
+-- The dictionary type the `i`th predicate of `u` needs. An instance found for it
+-- was found under the equalities in `u`'s scopes, so its type is rewritten by
+-- them: `Add (Field.pos a)` is `Add Int` under `Field.pos a ~ Int`.
+fun wantAt(l : Lowerer, u : Use, i : Int) -> Ty.Type {
+    let want = predType(l, u.preds[i])
+    match u.evidence[i] {
+        FromInstance(_, _) -> {}
+        _ -> return want
+    }
+    let equalities = Vec.new(2)
+    for sc in u.scopes {
+        for (_, p) in sc.givens {
+            if p.name == Ty.equals { Vec.push(equalities, p) }
+        }
+    }
+    if len(equalities) == 0 { return want }
+    let (inert, _) = Inert.extend(Inert.empty(l.classes),
+                                  Array.map(Vec.toArray(equalities), Inert.given))
+    let out = Inert.rewrite(inert, want)
+    Inert.close(inert)
     out
 }
 
@@ -1783,8 +1805,8 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
     }
     let givens = givensOf(l, use)
     let count = fewer(len(use.evidence), len(use.preds))
-    var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i],
-                                                    predType(l, use.preds[i]), givens))
+    var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i], wantAt(l, use, i),
+                                                    givens))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
     -- one is monomorphic and took the path above.

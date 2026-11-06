@@ -17,6 +17,7 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        InstancePlan(..), Evidence(..))
 import Turkey.Decls as Decls
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Prelude as P
 import Turkey.Solved (Scope(..), Use(..), newScope, dictName)
 import Turkey.Source (Span(..))
@@ -108,22 +109,37 @@ fun resolve(classes : ClassTable, p : Pred, scopes : Vec Scope,
     for scope in scopes {
         for (_, g) in scope.givens { Vec.push(givens, g) }
     }
-    let target = Classes.normalizeUnder(classes, p.args[0], givens)
+    let (inert, _) = Inert.extend(Inert.empty(classes),
+                                  Array.map(Vec.toArray(givens), Inert.given))
+    let target = Inert.rewrite(inert, p.args[0])
     match target {
-        TBottom -> return Absent(p.name)
+        TBottom -> {
+            Inert.close(inert)
+            return Absent(p.name)
+        }
         _ -> {}
     }
     let demand = Ty.pred(p.name, [target])
     let key = Ty.predKey(demand)
 
+    -- A given is compared rewritten too, as the solver compares it: `Ord (Item
+    -- a)` is the dictionary for `Ord (Index.Value a)` under `Item a ~ Index.Value
+    -- a`.
     for var i = len(scopes) - 1; i >= 0; i = i - 1 {
         for (name, given) in scopes[i].givens {
-            match superPath(classes, given, key, []) {
-                Some(path) -> return FromDict(name, path, Some(given))
-                None -> {}
+            if Classes.isClass(classes, given.name) {
+                let seen = Ty.pred(given.name, [Inert.rewrite(inert, given.args[0])])
+                match superPath(classes, seen, key, []) {
+                    Some(path) -> {
+                        Inert.close(inert)
+                        return FromDict(name, path, Some(given))
+                    }
+                    None -> {}
+                }
             }
         }
     }
+    Inert.close(inert)
 
     for inst in Map.getOr(classes.instances, demand.name, []) {
         match Classes.match_(inst.head, target) {

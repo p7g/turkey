@@ -417,17 +417,25 @@ fun stopLooking() -> Unit {
 }
 
 fun wait(seen : Int) -> Unit {
-    Poll.lock()
-    -- Read the clock under the lock, so that waiting for the lock does not
-    -- make the reading stale.
-    let now = Poll.now()
-    let timeout = Poll.timeout(now)
-    Poll.unlock()
-    if timeout == -1 || !Workers.claim() {
+    if Workers.interest() == 0 || !Workers.claim() {
         let _ = Heap.pause(seen, -1)
         return {}
     }
+    -- Watch from before the look at the deadlines, so that one made during
+    -- the look is either in it or noted, which breaks the wait
+    -- (`Turkey.Poll.timerAdd`, `Turkey.Wait.tell`).
+    Poll.watch(Poll.noDeadline)
+    let now = Poll.now()
+    let timeout = Poll.timeout(now)
+    if timeout == -1 {
+        Poll.watch(-1)
+        Workers.release()
+        let _ = Heap.pause(seen, -1)
+        return {}
+    }
+    if timeout >= 0 { Poll.watch(now + timeout) }
     let n = Heap.pause(seen, timeout)
+    Poll.watch(-1)
     if n < 0 {
         Workers.release()
         let _ = Heap.pause(seen, -1)

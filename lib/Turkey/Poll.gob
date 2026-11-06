@@ -1,6 +1,6 @@
 export (
     Waiter, Source, timedOut, cancelled,
-    mutex, lock, unlock, now, sleeper, readable, writable, readableBlocking, childExit, locked,
+    mutex, lock, unlock, now, watch, noDeadline, sleeper, readable, writable, readableBlocking, childExit, locked,
     sourceOf, lockSource, unlockSource, waitOn,
     park, finished, outcome, complete, timeOut,
     timeout, deliver, expire, cancel, forget, takeWoken, endings, takeHeadMoved,
@@ -17,13 +17,14 @@ export (
 -- * the poller's (`lock`), over every table below: the sources by slot and
 --   by descriptor, children, file locks, and the tasks to wake (`takeWoken`).
 --   Every function here but `now`, `lock`, `unlock`, `lockSource`,
---   `unlockSource`, `waitOn` and `takeHeadMoved` is called under it;
+--   `unlockSource`, `waitOn`, `takeHeadMoved`, `watch` and `timeout` is
+--   called under it;
 -- * each source's own (`lockSource`), over a persistent descriptor's waiters,
 --   its latch and whether it is counted in the interest. A task that has its
 --   descriptor's source (`sourceOf`) parks under that lock alone (`waitOn`),
 --   so tasks parking on different descriptors do not wait for each other;
--- * the deadline heap's, taken inside either of the others, by the functions
---   that touch the heap and only for as long as they do.
+-- * a deadline heap's (`Heap`), taken inside either of the others, by the
+--   functions that touch the heap and only for as long as they do.
 --
 -- So a descriptor waiter's state changes under its source's lock, and it
 -- ends only under the poller's lock as well: every waiter ends under the
@@ -134,6 +135,7 @@ import Data.Option as Option
 import Data.Vec (Vec)
 import Data.Vec as Vec
 import Turkey.Coroutine as Co
+import Turkey.Array as Storage
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Sys as Sys
@@ -163,7 +165,8 @@ type WaitKind = Sleep | Read | Write | Child | Lock(Int)
 -- `FileLock` is a descriptor whose file's unlocks are watched.
 type SourceKind = Descriptor | BlockingDescriptor | ChildProcess | FileLock
 
--- One wait. `heapAt` is the waiter's place on the deadline heap, or -1;
+-- One wait. `heapAt` is the waiter's place on its deadline heap, `heap`'s,
+-- or -1;
 -- `source` is its source's slot, or 0. `coroutine` is the task to wake when it
 -- ends, if one has parked on it.
 type Waiter = Waiter {
@@ -171,6 +174,7 @@ type Waiter = Waiter {
     kind          : WaitKind,
     deadline      : Int,
     var heapAt    : Int,
+    var heap      : Int,
     var source    : Int,
     id            : Int,
     var coroutine : Option Co.Coroutine,
@@ -238,10 +242,32 @@ var byLockFd : Vec Int = []
 var exiting : Vec Int = []
 let exitingRetry : Int = 1_000_000
 
--- The waiters with a deadline, as a binary min-heap on the deadline, under
--- the heap's lock.
-var timers : Vec Waiter = []
-let timersMutex : Ptr = Lock.new()
+-- The waiters with a deadline, in `heapCount` binary min-heaps on the
+-- deadline. A waiter goes on the heap of the thread that makes it
+-- (`Turkey.Workers.index`), so that threads parking at once take different
+-- heaps' locks, and stays there until it ends. `earliest` is the heap's first
+-- deadline, or `noDeadline`, kept so that `timeout` reads every heap's
+-- without taking its lock. Fixed in number, so that a heap is made once as
+-- the program starts and then only read: a heap made later would have to be
+-- published to the threads that read it.
+type Heap = Heap { lock : Ptr, items : Vec Waiter, earliest : Ptr }
+
+let heapCount : Int = 16
+let noDeadline : Int = 0x7FFF_FFFF_FFFF_FFFF
+
+let heaps : Prim.Array Heap = newHeaps()
+
+fun newHeaps() -> Prim.Array Heap {
+    let all = Storage.filled(heapCount, newHeap())
+    for var i = 1; i < heapCount; i = i + 1 { all[i] = newHeap() }
+    all
+}
+
+fun newHeap() -> Heap {
+    let earliest = Libc.malloc(8)
+    Ptr.atomicStore(earliest, 0, noDeadline)
+    Heap { lock = Lock.new(), items = [], earliest }
+}
 
 -- The tasks to wake, and how many waiters have ended: kept so that each
 -- function can answer how many it ended (a program's own stack waits too, and
@@ -251,11 +277,15 @@ var ended = 0
 
 -- Words changed by atomic instructions, since the locks above do not cover
 -- them: the next waiter's id; how many sources are counted in the interest;
--- and 1 when a waiter has become the earliest deadline since `takeHeadMoved`.
-let words : Ptr = zeroedWords(3)
+-- 1 when a deadline has come before the one the polling worker waits for
+-- since `takeHeadMoved`; that deadline (`watch`); and how many children are
+-- `exiting`.
+let words : Ptr = zeroedWords(5)
 let nextIdAt : Int = 0
 let countedAt : Int = 8
 let headMovedAt : Int = 16
+let watchedAt : Int = 24
+let exitingAt : Int = 32
 
 fun zeroedWords(n : Int) -> Ptr {
     let p = Libc.malloc(8 * n)
@@ -296,78 +326,100 @@ fun now() -> Int {
 
 -- -- the deadline heap --------------------------------------------------------------------
 
-fun place(i : Int, w : Waiter) -> Unit {
-    timers[i] = w
+fun place(h : Heap, i : Int, w : Waiter) -> Unit {
+    h.items[i] = w
     w.heapAt = i
 }
 
 -- Move the waiter at `start` up to where it belongs, answering where that is.
-fun siftUp(start : Int) -> Int {
+fun siftUp(h : Heap, start : Int) -> Int {
     var i = start
-    let w = timers[i]
+    let w = h.items[i]
     while i > 0 {
         let parent = (i - 1) / 2
-        let p = timers[parent]
+        let p = h.items[parent]
         if !(w.deadline < p.deadline) { break }
-        place(i, p)
+        place(h, i, p)
         i = parent
     }
-    place(i, w)
+    place(h, i, w)
     i
 }
 
-fun siftDown(start : Int) -> Unit {
+fun siftDown(h : Heap, start : Int) -> Unit {
     var i = start
-    let w = timers[i]
-    let n = len(timers)
+    let w = h.items[i]
+    let n = len(h.items)
     while True {
         var child = 2 * i + 1
         if child >= n { break }
-        if child + 1 < n && timers[child + 1].deadline < timers[child].deadline {
+        if child + 1 < n && h.items[child + 1].deadline < h.items[child].deadline {
             child = child + 1
         }
-        let c = timers[child]
+        let c = h.items[child]
         if !(c.deadline < w.deadline) { break }
-        place(i, c)
+        place(h, i, c)
         i = child
     }
-    place(i, w)
+    place(h, i, w)
 }
 
+-- Store `h`'s first deadline in `earliest`. Under `h`'s lock.
+fun publish(h : Heap) -> Unit {
+    let first = if len(h.items) > 0 { h.items[0].deadline } else { noDeadline }
+    Ptr.atomicStore(h.earliest, 0, first)
+}
+
+-- Put `w` on the running thread's heap. A deadline before the one the
+-- polling worker waits for is noted for `takeHeadMoved`: read after the heap
+-- shows `w`, so that a poller that set its deadline later saw `w` when it
+-- chose it (`watch`).
 fun timerAdd(w : Waiter) -> Unit {
-    Workers.acquire(timersMutex)
-    Vec.push(timers, w)
-    let at = siftUp(len(timers) - 1)
+    let at = Workers.index() % heapCount
+    let h = heaps[at]
+    Workers.acquire(h.lock)
+    w.heap = at
+    Vec.push(h.items, w)
+    if siftUp(h, len(h.items) - 1) == 0 { publish(h) }
     interestAdd(1)
-    if at == 0 { Ptr.atomicStore(words, headMovedAt, 1) }
-    Lock.release(timersMutex)
+    Lock.release(h.lock)
+    if w.deadline < Ptr.atomicLoad(words, watchedAt) { Ptr.atomicStore(words, headMovedAt, 1) }
 }
 
--- Take `w` off the heap, if it is on it.
+-- Take `w` off its heap, if it is on one. The caller holds the lock `w`'s
+-- waiting is changed under, which orders the read of `heapAt` after the
+-- store that put it on the heap.
 fun timerRemove(w : Waiter) -> Unit {
-    Workers.acquire(timersMutex)
-    unheap(w)
-    Lock.release(timersMutex)
+    if w.heapAt < 0 { return {} }
+    let h = heaps[w.heap]
+    Workers.acquire(h.lock)
+    unheap(h, w)
+    Lock.release(h.lock)
 }
 
--- `timerRemove`, under the heap's lock.
-fun unheap(w : Waiter) -> Unit {
+-- `timerRemove`, under `h`'s lock.
+fun unheap(h : Heap, w : Waiter) -> Unit {
     let i = w.heapAt
     if i < 0 { return {} }
     w.heapAt = -1
     interestAdd(-1)
-    let last = len(timers) - 1
-    let moved = timers[last]
-    let _ = Vec.pop(timers)
+    let last = len(h.items) - 1
+    let moved = h.items[last]
+    let _ = Vec.pop(h.items)
     if i < last {
-        place(i, moved)
-        siftDown(siftUp(i))
+        place(h, i, moved)
+        siftDown(h, siftUp(h, i))
     }
+    if i == 0 { publish(h) }
 }
 
--- Whether the earliest deadline is a different waiter's than when this was
--- last asked, which a worker that is waiting for the operating system with
--- the old one has to be told.
+-- The polling worker is about to wait until `deadline` (`noDeadline` while it
+-- works out which, and for no deadline at all), or, at -1, waits no more: a
+-- deadline added before it is noted (`timerAdd`).
+fun watch(deadline : Int) -> Unit = Ptr.atomicStore(words, watchedAt, deadline)
+
+-- Whether a deadline has come before the one the polling worker waits for
+-- since this was last asked: that worker has to be told.
 fun takeHeadMoved() -> Bool =
     Ptr.atomicLoad(words, headMovedAt) != 0 && Ptr.atomicCas(words, headMovedAt, 1, 0) == 1
 
@@ -380,6 +432,7 @@ fun newWaiter(kind : WaitKind, deadline : Int) -> Waiter {
         kind = kind,
         deadline = deadline,
         heapAt = -1,
+        heap = 0,
         source = 0,
         id = id,
         coroutine = None,
@@ -862,12 +915,17 @@ fun timeOut(w : Waiter) -> Bool = finish(w, TimedOut)
 -- wait; -2 (`Turkey.Workers.pollTimeoutForever`) if only an event can; else
 -- the nanoseconds to the earliest deadline, 0 if it has passed, and at most a
 -- millisecond while a child that has exited waits to be reaped.
+--
+-- Takes no lock: it reads each heap's `earliest`, and the counts, which are
+-- atomic words. So it may miss a wait made meanwhile, which `watch` is for.
 fun timeout(now : Int) -> Int {
-    Workers.acquire(timersMutex)
-    let timed = len(timers) > 0
-    let earliest = if timed { timers[0].deadline } else { 0 }
-    Lock.release(timersMutex)
-    if len(exiting) > 0 {
+    var earliest = noDeadline
+    for var i = 0; i < heapCount; i = i + 1 {
+        let first = Ptr.atomicLoad(heaps[i].earliest, 0)
+        if first < earliest { earliest = first }
+    }
+    let timed = earliest != noDeadline
+    if Ptr.atomicLoad(words, exitingAt) > 0 {
         let left = if timed { earliest - now } else { exitingRetry }
         if left < 0 { 0 } else if left > exitingRetry { exitingRetry } else { left }
     } else if timed {
@@ -1007,6 +1065,7 @@ fun markExiting(slot : Int, s : Source, event : Int) -> Unit {
     if !s.exiting {
         s.exiting = True
         Vec.push(exiting, slot)
+        let _ = Ptr.atomicAdd(words, exitingAt, 1)
     }
 }
 
@@ -1016,6 +1075,7 @@ fun forgetExiting(slot : Int) -> Unit {
         if exiting[i] == slot {
             Vec.swap(exiting, i, n - 1)
             let _ = Vec.pop(exiting)
+            let _ = Ptr.atomicAdd(words, exitingAt, -1)
             return {}
         }
     }
@@ -1036,13 +1096,18 @@ fun expire(now : Int) -> Int {
     -- Off the heap under its lock, then ended under each one's source's: the
     -- heap's lock is taken inside a source's, never around it.
     var due : Vec Waiter = []
-    Workers.acquire(timersMutex)
-    while len(timers) > 0 && timers[0].deadline <= now {
-        let w = timers[0]
-        unheap(w)
-        Vec.push(due, w)
+    for var i = 0; i < heapCount; i = i + 1 {
+        let h = heaps[i]
+        if Ptr.atomicLoad(h.earliest, 0) <= now {
+            Workers.acquire(h.lock)
+            while len(h.items) > 0 && h.items[0].deadline <= now {
+                let w = h.items[0]
+                unheap(h, w)
+                Vec.push(due, w)
+            }
+            Lock.release(h.lock)
+        }
     }
-    Lock.release(timersMutex)
     for var i = 0; i < len(due); i = i + 1 { end(due[i], TimedOut) }
     ended - before
 }

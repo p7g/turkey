@@ -267,6 +267,28 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
 
 
 @pytest.mark.parametrize("how", PATHS)
+def test_a_parameter_has_a_location_list(how):
+    """`fact`'s `n`: a formal parameter whose location list starts in the
+    register it arrives in."""
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how) / "prog.o")
+    n = [attributes for _, tag, attributes in entries
+         if tag == "DW_TAG_formal_parameter" and '("n")' in attributes]
+    assert n, "no formal parameter 'n'"
+    assert any(re.search(r"DW_AT_location\s+\(indexed .* loclist", a) and "DW_OP_reg" in a
+               for a in n), n
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_debug_lines_writes_no_variables(how):
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how, PROGRAM, "--debug=lines") / "prog.o")
+    assert not [tag for _, tag, _ in entries
+                if tag in ("DW_TAG_variable", "DW_TAG_formal_parameter")]
+    assert any(tag == "DW_TAG_subprogram" for _, tag, _ in entries)
+
+
+@pytest.mark.parametrize("how", PATHS)
 def test_the_macos_linker_records_the_object_in_the_debug_map(how):
     """ld64 writes an `N_OSO` stab, which is how lldb finds the DWARF left
     in the object, only for an object with a compile unit."""
@@ -307,7 +329,9 @@ def test_lldb_stops_at_a_line_and_names_the_frames(how):
     lldb = _lldb()
     out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --file prog.gob --line 2",
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"])
-    assert re.search(r"frame #0: .*`Main#fact at prog\.gob:2", out), out[-4000:]
+    # With `-g`, a frame shows its function's parameters, and `fact`'s `n` is
+    # in its register at the line.
+    assert re.search(r"frame #0: .*`Main#fact\(n=10\) at prog\.gob:2", out), out[-4000:]
     assert re.search(r"frame #1: .*`Main#main at prog\.gob:9", out), out[-4000:]
 
 
@@ -389,8 +413,8 @@ def test_gdb_stops_at_a_line_and_names_the_frames(how):
 
 # -- the object against the assembler ------------------------------------------
 
-DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists", "debug_str",
-                  "debug_line", "debug_line_str"]
+DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists",
+                  "debug_loclists", "debug_str", "debug_line", "debug_line_str"]
 # The sections GNU `as` builds its own way, compared by their rows on ELF.
 LINE_SECTIONS = {"debug_line", "debug_line_str"}
 
@@ -535,8 +559,10 @@ def _agree(ours: Path, theirs: Path) -> None:
     for name in DEBUG_SECTIONS:
         if name in LINE_SECTIONS and not exact:
             continue
-        assert mine.sections[name] == assembled.sections[name], (
-            f"{name}: " + _first_difference(mine.sections[name], assembled.sections[name]))
+        written, built = mine.sections.get(name), assembled.sections.get(name)
+        assert written == built, (
+            f"{name}: " + (_first_difference(written, built) if written and built
+                           else f"written {written is not None}, assembled {built is not None}"))
         assert mine.relocations.get(name, []) == assembled.relocations.get(name, []), name
     if not exact:
         tool = _needs_dwarfdump()

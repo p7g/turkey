@@ -170,9 +170,10 @@ A function's name is its symbol, such as `Main#area@Rectangle`, with its
 module in it. A call the optimizer inlined is still a frame: `breakpoint set
 --name Main#area@Rectangle` in lldb, or `break 'Main#area@Rectangle'` in gdb,
 stops in `Main#main` where `area`'s code was copied, and `bt` shows `area` at
-its own line above `main` at the line of the call. There is no information
-about variables or types yet, so a debugger shows registers and memory rather
-than values.
+its own line above `main` at the line of the call. `frame variable` in lldb
+and `info locals` in gdb show a function's parameters and locals wherever the
+code still holds them: in a register until its last use, or in the frame
+slot the collector or the register allocator keeps it in.
 
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and

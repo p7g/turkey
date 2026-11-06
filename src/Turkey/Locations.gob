@@ -1,0 +1,283 @@
+export (locate)
+
+-- Where each variable of an allocated function is, for `-g`: the location
+-- lists of its debug information, and the labels in its code they run
+-- between.
+--
+-- Computed after allocation and frame layout, from what they decided, and
+-- nothing is added to the code but labels, which have no size. A value holds
+-- the variables it is labeled with (`Ssa.Func.holds`), and a reload or a
+-- recomputation holds what the value it stands in for holds
+-- (`Regalloc.Spills.reloadOf`). Each value's range starts at its definition
+-- and ends at its last use, or at the end of a block it is live out of: past
+-- its last use its register may hold something else. Where two values of one
+-- variable overlap, the later one's range wins. Its location there is:
+--
+-- * a frame slot, from the store into it on, for a value the collector roots
+--   (`Turkey.Roots`) or the allocator spills: such a slot holds that one
+--   value until the frame ends, so the value is there for as long as any of
+--   its reloads is live, and between them too;
+-- * otherwise its register.
+--
+-- A slot is addressed from the frame base, `x29`, which the prologue sets
+-- before any range starts, at its offset in `Turkey.Frame`'s layout less the
+-- frame record's: `sp` is fixed for the whole body, so the offset is too.
+--
+-- Not covered: the prologue, before the parameters are moved out of their
+-- argument registers; a terminator's own code, whose parallel copies may
+-- overwrite a register a value dying there was in; and a function's cold
+-- code, its allocations' slow paths, which lies outside every range.
+
+import Data.BitSet as BitSet
+import Data.Map as Map
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Bank(..), Mem(..))
+import Turkey.Asm as Asm
+import Turkey.Dwarf as Dwarf
+import Turkey.Emit as Emit
+import Turkey.Frame as Frame
+import Turkey.Regalloc as Regalloc
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Func, BlockId(..), RepClass(..), Value(..))
+
+-- A range of code where a variable is in the location `expression`: from
+-- point `low` of block `lowBlock` to point `high` of block `highBlock`
+-- (`Emit.markKey`), with the keys that order the ends among the function's
+-- points.
+type Range = Range {
+    lowBlock      : Int,
+    low           : Int,
+    var highBlock : Int,
+    var high      : Int,
+    from          : Int,
+    var to        : Int,
+    expression    : Array Int,
+}
+
+-- The labels function `tag`'s code needs, by `Emit.markKey`; its variables
+-- with their location lists, in the order `f.variables` has them; and the
+-- label at the start of its first block, before every range, which is what
+-- the lists' offsets are from. `roots` is each rooted value's slot
+-- (`Turkey.Roots`).
+fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout,
+           roots : Map Int Int) -> (Map Int Asm.Symbol, Vec Dwarf.Variable, Asm.Symbol) {
+    let f = a.func
+    let marks = Map.new()
+    let order = Emit.blockOrder(f)
+    let base = mark(d, tag, marks, order[0], 0)
+    if len(f.variables) == 0 { return (marks, [], base) }
+    let count = len(f.reps)
+    -- Each value's origin: itself, or the value a reload stands in for.
+    let origin = Array.init(count, fun(id) = id)
+    for (t, from) in Map.entries(a.spills.reloadOf) {
+        var o = from
+        while Map.contains(a.spills.reloadOf, o) { o = Map.getOr(a.spills.reloadOf, o, o) }
+        origin[t] = o
+    }
+    -- The slot of each value kept in one.
+    let slots : Array (Option Mem) = Array.filled(count, None)
+    for (id, n) in Map.entries(roots) { if id < count { slots[id] = Some(RootSlot(n)) } }
+    for (id, m) in Map.entries(a.spills.slots) { slots[id] = Some(m) }
+    -- What the ranges follow: a value in a slot together with its reloads,
+    -- under its own id, and every other value on its own.
+    let follow = fun(id) = if Option.isSome(slots[origin[id]]) { origin[id] } else { id }
+    let followed = followedFunc(f, follow)
+    let (liveIn, liveOut) = Ssa.livenessInOut(followed)
+    let edges = Emit.computedAtEdges(f)
+    let rank = Array.filled(len(f.blocks), -1)
+    for var k = 0; k < len(order); k = k + 1 { rank[order[k]] = k }
+    let ranges : Array (Vec Range) = Array.init(len(f.variables), fun(_) = [])
+    let labeled = fun(id) = len(Ssa.holding(f, origin[id])) > 0
+                            && f.reps[id].class_ != Unit
+    for b in order {
+        let block = followed.blocks[b]
+        let n = len(block.insts)
+        -- Where each followed value's range in this block starts and ends.
+        let starts = Map.new()
+        let ends = Map.new()
+        for id in BitSet.elements(liveIn[b]) {
+            if labeled(id) { Map.put(starts, id, 0) }
+        }
+        -- A parameter is defined at the start, and so is its range unless
+        -- it is stored into a slot; a value live in was stored before.
+        let defined = Map.new()
+        for p in block.params {
+            let id = Ssa.valueId(p)
+            if labeled(id) {
+                Map.put(starts, id, 0)
+                Map.put(defined, id, ())
+            }
+        }
+        for var k = 0; k < n; k = k + 1 {
+            let i = block.insts[k]
+            Ssa.eachUse(i, fun(v) {
+                if Map.contains(starts, Ssa.valueId(v)) { Map.put(ends, Ssa.valueId(v), k + 1) }
+            })
+            Ssa.eachDef(i, fun(v) {
+                let id = Ssa.valueId(v)
+                if labeled(id) && follow(id) == id && !edges[id]
+                   && !Map.contains(starts, id) {
+                    Map.put(starts, id, k + 1)
+                    Map.put(defined, id, ())
+                }
+            })
+        }
+        for v in Ssa.termUses(block.term) {
+            if Map.contains(starts, Ssa.valueId(v)) { Map.put(ends, Ssa.valueId(v), n) }
+        }
+        for (id, start) in Map.entries(starts) {
+            let end = if BitSet.contains(liveOut[b], id) { n + 1 }
+                      else { Map.getOr(ends, id, start) }
+            let (low, expression) = match slots[id] {
+                Some(m) -> if !Map.contains(defined, id) { (start, slotted(l, m)) } else {
+                    let stored = storedAt(block.insts, id, start)
+                    if stored >= 0 { (stored, slotted(l, m)) }
+                    else { (start, register(f, a, id)) }
+                }
+                None -> (start, register(f, a, id))
+            }
+            if low < end && len(expression) > 0 {
+                for k in Ssa.holding(f, origin[id]) {
+                    Vec.push(ranges[k], Range {
+                        lowBlock = b, low = low, highBlock = b, high = end,
+                        from = rank[b] << 32 | low, to = rank[b] << 32 | end,
+                        expression = expression,
+                    })
+                }
+            }
+        }
+    }
+    let variables = []
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        let v = f.variables[k]
+        let locations = []
+        for r in merged(clipped(ranges[k]), f) {
+            Vec.push(locations, Dwarf.Location {
+                low = mark(d, tag, marks, r.lowBlock, r.low),
+                high = mark(d, tag, marks, r.highBlock, r.high),
+                expression = r.expression,
+            })
+        }
+        Vec.push(variables, Dwarf.Variable {
+            name = v.name, declared = v.declared, parameter = v.parameter, ty = v.ty,
+            locations = locations,
+        })
+    }
+    (marks, variables, base)
+}
+
+-- `f` with every read of a value renamed by `follow`, and nothing else
+-- changed: so a value in a slot is live, under its own id, wherever one of
+-- its reloads is, and from its definition to the last of them.
+fun followedFunc(f : Func A.Inst, follow : fun(Int) -> Int) -> Func A.Inst {
+    let g = Ssa.newFunc(f.name, f.results)
+    for r in f.reps { Vec.push(g.reps, r) }
+    for p in f.params { Vec.push(g.params, p) }
+    let rename = fun(v : Value) -> Value = Value(follow(Ssa.valueId(v)))
+    for block in f.blocks {
+        let made = Ssa.newBlock()
+        for p in block.params { Vec.push(made.params, p) }
+        for i in block.insts { Vec.push(made.insts, Ssa.renameUses(i, rename)) }
+        made.term = match block.term {
+            Ssa.Ret(vs) -> Ssa.Ret(Vec.map(vs, rename))
+            Ssa.Jump(target, args) -> Ssa.Jump(target, Vec.map(args, rename))
+            Ssa.Branch(c, yes, no) -> Ssa.Branch(rename(c), yes, no)
+            Ssa.Switch(v, cases, default) -> Ssa.Switch(rename(v), cases, default)
+            Ssa.Panic(v) -> Ssa.Panic(rename(v))
+            Ssa.Unreachable -> Ssa.Unreachable
+        }
+        Vec.push(g.blocks, made)
+    }
+    g.entry = f.entry
+    g
+}
+
+-- The point after the store of value `id` into its slot, at or after point
+-- `from` of a block with instructions `insts`, or -1 if none stores it.
+fun storedAt(insts : Vec A.Inst, id : Int, from : Int) -> Int {
+    for var k = from; k < len(insts); k = k + 1 {
+        if let Some((v, _)) = A.slotStore(insts[k].op) {
+            if v == id { return k + 1 }
+        }
+    }
+    -1
+}
+
+-- The ranges in code order, each cut short where the next one starts: the
+-- later value of a variable is the one a debugger should see. A range left
+-- empty is dropped. Each range is in one block, so one that the next starts
+-- inside is in the next one's block.
+fun clipped(ranges : Vec Range) -> Vec Range {
+    let sorted = Vec.sortBy(ranges, fun(x, y) = Array.threeWay(x.from, y.from))
+    let out = []
+    for var k = 0; k < len(sorted); k = k + 1 {
+        let r = sorted[k]
+        if k + 1 < len(sorted) && sorted[k + 1].from < r.to {
+            r.high = sorted[k + 1].low
+            r.to = sorted[k + 1].from
+        }
+        if r.from < r.to { Vec.push(out, r) }
+    }
+    out
+}
+
+-- The ranges with each pair that meet in the same location made one: a range
+-- that ends where the next starts, or at the end of its block where the next
+-- starts the block placed after it.
+fun merged(ranges : Vec Range, f : Func A.Inst) -> Vec Range {
+    let out : Vec Range = []
+    for r in ranges {
+        if len(out) > 0 {
+            let last = out[len(out) - 1]
+            let meets = last.to == r.from
+                        || (last.high == len(f.blocks[last.highBlock].insts) + 1 && r.low == 0
+                            && r.from >> 32 == (last.to >> 32) + 1)
+            if meets && same(last.expression, r.expression) {
+                last.highBlock = r.highBlock
+                last.high = r.high
+                last.to = r.to
+                continue
+            }
+        }
+        Vec.push(out, r)
+    }
+    out
+}
+
+fun same(x : Array Int, y : Array Int) -> Bool {
+    if len(x) != len(y) { return False }
+    for var k = 0; k < len(x); k = k + 1 { if x[k] != y[k] { return False } }
+    True
+}
+
+-- The label at point `p` of `block`, made the first time it is asked for.
+fun mark(d : Asm.Dialect, tag : Int, marks : Map Int Asm.Symbol, block : Int,
+         p : Int) -> Asm.Symbol {
+    let key = Emit.markKey(block, p)
+    match Map.get(marks, key) {
+        Some(s) -> s
+        None -> {
+            let s = Asm.localLabel(d, "f" + Int.toString(tag) + "m" + Int.toString(block) + "_"
+                                      + Int.toString(p))
+            Map.put(marks, key, s)
+            s
+        }
+    }
+}
+
+-- `DW_OP_reg` of value `id`'s register, or nothing if it has none.
+fun register(f : Func A.Inst, a : Regalloc.Allocation, id : Int) -> Array Int {
+    let n = a.colouring.of_[id]
+    if n < 0 { return [] }
+    match A.bankOf(f.reps[id]) {
+        Gp -> [Dwarf.opReg0 + n]
+        -- The vector registers are DWARF's 64 to 95, past `DW_OP_reg31`.
+        Fp -> Array.append([Dwarf.opRegx], Dwarf.ulebBytes(64 + n))
+    }
+}
+
+-- `DW_OP_fbreg` of slot `m`: its offset from `x29`, the frame base.
+fun slotted(l : Frame.Layout, m : Mem) -> Array Int = match Frame.offsetOf(l, m) {
+    Some(offset) -> Array.append([Dwarf.opFbreg], Dwarf.slebBytes(offset - l.recordAt))
+    None -> []
+}

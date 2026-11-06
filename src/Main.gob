@@ -58,6 +58,7 @@ import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Dwarf as Dwarf
+import Turkey.Locations as Locations
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
@@ -891,8 +892,12 @@ type Made = Made {
     skipped    : String,
     complaints : Vec String,
     code       : Vec (Stream.Item Arm64.Inst),
-    -- With `-g`, the calls inlined into it, for its debug information.
+    -- With `-g`, the calls inlined into it and its own variables, for its
+    -- debug information, and the label its variables' locations are offsets
+    -- from.
     inlined    : Vec Dwarf.Inlined,
+    variables  : Vec Dwarf.Variable,
+    base       : Asm.Symbol,
     texts      : Array (Option String),
     cost       : Duration,
 }
@@ -912,23 +917,28 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     let a = Regalloc.allocate(f, frame.slots)
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
-                            inlined = [], texts = [], cost = Stopwatch.elapsed(started) }
+                            inlined = [], variables = [], base = Emit.functionEnd(asm.dialect, i),
+                            texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
+            let (marks, located, base) = if debugVariables() {
+                Locations.locate(asm.dialect, i, a, l, frame.slots)
+            } else { (Map.new(), [], Emit.functionEnd(asm.dialect, i)) }
             let emitted = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), emitted)
-            let (code, inlined) = if debugInfo() {
-                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, emitted,
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, emitted)
+            let (code, inlined, variables) = if debugInfo() {
+                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, located, emitted,
                                    Emit.functionEnd(asm.dialect, i))
-            } else { (emitted, []) }
+            } else { (emitted, [], []) }
             let texts = Array.map(outs, fun(o) = if o.apart {
                 let text = String.builder()
                 o.render(asm.dialect, Vec.slice(code, 0, len(code)), text)
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   inlined = inlined, texts = texts, cost = Stopwatch.elapsed(started) }
+                   inlined = inlined, variables = variables, base = base, texts = texts,
+                   cost = Stopwatch.elapsed(started) }
         }
     }
 }
@@ -1025,8 +1035,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- Each function's frame layout is kept: the frame table is one section
     -- after the code, and its entries are those layouts' safepoint maps.
     let layouts = []
-    -- With `-g`, each laid-out function's inlined calls, beside its layout.
+    -- With `-g`, each laid-out function's inlined calls and variables, beside
+    -- its layout.
     let inlinedCalls = []
+    let variables = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
@@ -1054,6 +1066,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 flush()
                 Vec.push(layouts, (i, l))
                 Vec.push(inlinedCalls, m.inlined)
+                Vec.push(variables, (m.variables, m.base))
             }
         }
         if timings { Vec.push(costs, (selected[i].name, m.cost)) }
@@ -1098,9 +1111,11 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         let functions = []
         for var k = 0; k < len(layouts); k = k + 1 {
             let (i, _) = layouts[k]
+            let (own, base) = variables[k]
             Vec.push(functions, Dwarf.Subprogram {
                 name = selected[i].name, low = Asm.symbolFor(asm.dialect, selected[i].name),
                 high = Emit.functionEnd(asm.dialect, i), inlined = inlinedCalls[k],
+                variables = own, base = base,
             })
         }
         Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {

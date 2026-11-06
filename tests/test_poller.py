@@ -8,6 +8,7 @@ allocation and the heap verified around each.
 """
 
 import hashlib
+import sys
 
 import pytest
 
@@ -19,6 +20,7 @@ LIB = bootc.REPO_ROOT / "lib"
 PROBE = """export (
     sleepOrder, sleepFreesWorker, sleepOwn, readWake, readTimeout, childStatus,
     childAlready, childTimeout, joinSleeper, sleepBesideCompute, lockTimeout,
+    lockForBoth,
 )
 
 import System.Task as Task
@@ -223,6 +225,30 @@ fun lockTimeout(path : String) -> Unit {
     print(Workers.interest())
 }
 
+-- A task waits for a descriptor's lock, and a second wait on the same
+-- descriptor finds it free: its first try takes the lock for both, since a
+-- lock belongs to the open file. The task is woken. `release` lets the
+-- holder go from inside the second wait, after its `LOCK_NB` try and before
+-- it registers, so that the first try of `Wait.lockedUnless` is the one that
+-- ends both waits.
+fun lockForBoth(path : String) -> Unit {
+    let flags = Int.or(Sys.readWrite, Sys.create())
+    let a = FD.fd(IO.open(path, flags, 0o600))
+    let b = FD.fd(IO.open(path, flags, 0o600))
+    print(FD.flock(b, Sys.lockExclusive, -1))
+    let _ = Task.runScope(do {
+        let t = Task.spawn(fun() = FD.flock(a, Sys.lockExclusive, -1))?
+        Wait.sleepUntil(after(50))
+        let release = fun() {
+            let _ = IO.flock(FD.number(b), Sys.lockUnlock)
+            False
+        }
+        print(Wait.lockedUnless(FD.number(a), Sys.lockExclusive, -1, release))
+        print(Task.join(t))
+        pure(0)
+    })
+}
+
 -- The program's own stack waits for a task that sleeps, which is not a
 -- deadlock.
 fun joinSleeper() -> Unit {
@@ -332,3 +358,11 @@ def test_a_sleeper_is_woken_while_the_other_worker_computes(probe):
 def test_a_lock_wait_times_out_and_leaves_nothing_registered(probe, workers, stress, tmp_path):
     out = probe(f'P.lockTimeout("{tmp_path}/lock")', workers, stress=stress)
     assert out == ["0", "True", "True", "0", "0", "0", "0"]
+
+
+# Linux reports no release of a lock, so only Darwin parks a lock wait.
+@pytest.mark.skipif(sys.platform != "darwin", reason="lock waits park on Darwin only")
+@pytest.mark.parametrize("workers", WORKERS)
+def test_a_lock_wait_wakes_the_task_whose_wait_its_try_ended(probe, workers, tmp_path):
+    out = probe(f'P.lockForBoth("{tmp_path}/lock")', workers)
+    assert out == ["0", "0", "0"]

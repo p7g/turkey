@@ -1,0 +1,94 @@
+export (RapidHash)
+
+import Data.Hashable (Hasher(..))
+import Hash.Words (mulHigh, word64, word32, byteAt)
+
+-- rapidhash V3, in its smallest form (rapidhashNano, the "fast" rather than
+-- "protected" multiply), the hash Chromium, Node.js and Julia adopted: a
+-- wyhash successor that passes SMHasher3.
+--
+-- rapidhash hashes one buffer, not a stream. Each word or run absorbed here is
+-- hashed as a buffer of its own with the state as its seed, so a key of one
+-- word or one string costs exactly one rapidhash. The reference mixes its seed
+-- once more on entry (`seed ^= mix(seed ^ secret[2], secret[1])`); that is done
+-- once in `seeded`, and an absorbed state is already mixed.
+
+type RapidHash = RapidHash { var seed : Int }
+
+-- `rapid_secret[0]`, `[1]`, `[2]` and `[7]`.
+let r0 = 3257665815644502181
+let r1 = -8378864009470890807
+let r2 = 5418857496715711651
+let r7 = -6148914691236517206
+
+-- `rapid_mix`: the folded multiply.
+fun mix(a : Int, b : Int) -> Int = Int.xor(Int.mulWrapping(a, b), mulHigh(a, b))
+
+-- The shared tail of every input: `rapid_mum(a, b)` and the final mix.
+fun finish(a : Int, b : Int, seed : Int, n : Int) -> Int {
+    let x = Int.xor(a, r1)
+    let y = Int.xor(b, seed)
+    let lo = Int.mulWrapping(x, y)
+    let hi = mulHigh(x, y)
+    mix(Int.xor(lo, r7), Int.xor(Int.xor(hi, r1), n))
+}
+
+instance Hasher RapidHash {
+    fun seeded(seed) = RapidHash { seed = Int.xor(seed, mix(Int.xor(seed, r2), r1)) }
+
+    -- A word as an 8-byte buffer: both reads are the word itself.
+    fun writeInt(d, x) {
+        d.seed = finish(x, x, Int.xor(d.seed, 8), 8)
+    }
+
+    fun writeBytes(d, bytes, from, to) {
+        d.seed = nano(bytes, from, to, d.seed)
+    }
+
+    fun digest(d) = d.seed
+}
+
+-- `rapidhashNano_internal` from its seed-mixing line on.
+fun nano(bytes : Prim.Array Byte, from : Int, to : Int, start : Int) -> Int {
+    let n = to - from
+    var seed = start
+    var a = 0
+    var b = 0
+    if n <= 16 {
+        if n >= 4 {
+            seed = Int.xor(seed, n)
+            if n >= 8 {
+                a = word64(bytes, from)
+                b = word64(bytes, to - 8)
+            } else {
+                a = word32(bytes, from)
+                b = word32(bytes, to - 4)
+            }
+        } else if n > 0 {
+            a = Int.or(Prim.intShl(byteAt(bytes, from), 45), byteAt(bytes, to - 1))
+            b = byteAt(bytes, from + Prim.intShrUnsigned(n, 1))
+        }
+        return finish(a, b, seed, n)
+    }
+    var at = from
+    if to - at > 48 {
+        var see1 = seed
+        var see2 = seed
+        loop {
+            seed = mix(Int.xor(word64(bytes, at), r0), Int.xor(word64(bytes, at + 8), seed))
+            see1 = mix(Int.xor(word64(bytes, at + 16), r1), Int.xor(word64(bytes, at + 24), see1))
+            see2 = mix(Int.xor(word64(bytes, at + 32), r2), Int.xor(word64(bytes, at + 40), see2))
+            at = at + 48
+            if to - at <= 48 { break }
+        }
+        seed = Int.xor(Int.xor(seed, see1), see2)
+    }
+    let i = to - at
+    if i > 16 {
+        seed = mix(Int.xor(word64(bytes, at), r2), Int.xor(word64(bytes, at + 8), seed))
+        if i > 32 {
+            seed = mix(Int.xor(word64(bytes, at + 16), r2), Int.xor(word64(bytes, at + 24), seed))
+        }
+    }
+    finish(Int.xor(word64(bytes, to - 16), i), word64(bytes, to - 8), seed, i)
+}

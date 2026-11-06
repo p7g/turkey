@@ -1,0 +1,70 @@
+export (FxHash)
+
+import Data.Hashable (Hasher(..))
+import Hash.Words (fold, rotl, word64, word32, byteAt)
+
+-- rustc-hash 2.x, the hasher inside the Rust compiler: one add and one
+-- multiply per word, and a rotation at the end.
+--
+-- The multiply moves entropy only upward, so the state's well-mixed bits are
+-- its high ones, and a table indexes by the low ones. `digest` rotates left by
+-- 26 to bring the high bits down: enough for tables of up to 2^26 slots.
+--
+-- A byte run is first compressed to one word with a wyhash-style folded
+-- multiply, and that word is absorbed like any other.
+
+type FxHash = FxHash { var h : Int }
+
+-- 0xf1357aea2e62a9c5, an odd multiplier from Steele and Vigna's tables.
+let k = -1065810590584100411
+
+-- 0x243f6a8885a308d3, 0x13198a2e03707344 and 0xa4093822299f31d0: digits of pi.
+let seed1 = 2611923443488327891
+let seed2 = 1376283091369227076
+let preventTrivialZeroCollapse = -6626703657320631856
+
+fun absorb(d : FxHash, x : Int) -> Unit {
+    d.h = Int.mulWrapping(Int.addWrapping(d.h, x), k)
+}
+
+instance Hasher FxHash {
+    fun seeded(seed) = FxHash { h = seed }
+    fun writeInt(d, x) = absorb(d, x)
+    fun writeBytes(d, bytes, from, to) = absorb(d, hashBytes(bytes, from, to))
+    fun digest(d) = rotl(d.h, 26)
+}
+
+-- `hash_bytes` from rustc-hash.
+fun hashBytes(bytes : Prim.Array Byte, from : Int, to : Int) -> Int {
+    let n = to - from
+    var s0 = seed1
+    var s1 = seed2
+    if n <= 16 {
+        if n >= 8 {
+            s0 = Int.xor(s0, word64(bytes, from))
+            s1 = Int.xor(s1, word64(bytes, to - 8))
+        } else if n >= 4 {
+            s0 = Int.xor(s0, word32(bytes, from))
+            s1 = Int.xor(s1, word32(bytes, to - 4))
+        } else if n > 0 {
+            s0 = Int.xor(s0, byteAt(bytes, from))
+            s1 = Int.xor(s1, Int.or(Prim.intShl(byteAt(bytes, to - 1), 8),
+                                    byteAt(bytes, from + n / 2)))
+        }
+    } else {
+        -- Every whole 16-byte chunk of all but the last byte, then the last 16
+        -- bytes again, overlapping what came before.
+        var at = from
+        while to - 1 - at >= 16 {
+            let x = word64(bytes, at)
+            let y = word64(bytes, at + 8)
+            let t = fold(Int.xor(s0, x), Int.xor(preventTrivialZeroCollapse, y))
+            s0 = s1
+            s1 = t
+            at = at + 16
+        }
+        s0 = Int.xor(s0, word64(bytes, to - 16))
+        s1 = Int.xor(s1, word64(bytes, to - 8))
+    }
+    Int.xor(fold(s0, s1), n)
+}

@@ -1,0 +1,59 @@
+export (FNVMix)
+
+import Data.Hashable (Hasher(..))
+import Hash.Words (shru, word64, byteAt)
+
+-- FNV-1a's step taken a word at a time instead of a byte at a time, with
+-- MurmurHash3's 64-bit finalizer (`fmix64`) at the end.
+--
+-- The finalizer is what makes this usable at all. A multiply carries entropy
+-- only upward, so after the word steps bit `i` of the state depends only on
+-- bits 0 to `i` of the input, and a table that indexes by the low bits would
+-- see only the keys' low bits. The finalizer's shifts carry the high bits
+-- back down.
+
+type FNVMix = FNVMix { var h : Int }
+
+let offsetBasis = -3750763034362895579
+let prime = 0x100_0000_01B3
+
+-- `fmix64`'s multipliers, 0xff51afd7ed558ccd and 0xc4ceb9fe1a85ec53.
+let m1 = -49064778989728563
+let m2 = -4265267296055464877
+
+fun step(d : FNVMix, x : Int) -> Unit {
+    d.h = Int.mulWrapping(Int.xor(d.h, x), prime)
+}
+
+instance Hasher FNVMix {
+    fun seeded(seed) = FNVMix { h = Int.xor(offsetBasis, seed) }
+
+    fun writeInt(d, x) = step(d, x)
+
+    -- Whole words, then the 0 to 7 bytes left packed into one word with the
+    -- run's length in its top byte, so that every run ends on its own step.
+    fun writeBytes(d, bytes, from, to) {
+        var at = from
+        while to - at >= 8 {
+            step(d, word64(bytes, at))
+            at = at + 8
+        }
+        var last = Prim.intShl(Int.and(to - from, 255), 56)
+        var shift = 0
+        while at < to {
+            last = Int.or(last, Prim.intShl(byteAt(bytes, at), shift))
+            shift = shift + 8
+            at = at + 1
+        }
+        step(d, last)
+    }
+
+    fun digest(d) {
+        var k = d.h
+        k = Int.xor(k, shru(k, 33))
+        k = Int.mulWrapping(k, m1)
+        k = Int.xor(k, shru(k, 33))
+        k = Int.mulWrapping(k, m2)
+        Int.xor(k, shru(k, 33))
+    }
+}

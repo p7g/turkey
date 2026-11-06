@@ -1298,11 +1298,12 @@ fun ownerOf(head : Ty.Type) -> String = match head {
 }
 
 -- Returns what the instance that covers `arg` says the family `name` is at
--- `arg`, or `None` if no instance does: one reduction step. The step of the
--- compiler's one family reducer, `Turkey.Inert.rewrite`, which applies it at
--- every depth beside the givens; nothing else calls it.
+-- `arg`, or `None` if no instance does: one reduction step, with `arg` already
+-- reduced. The step of the compiler's one family reducer,
+-- `Turkey.Inert.rewrite`, which reduces the argument first and applies this
+-- at every depth beside the givens; nothing else calls it.
 fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
-    let target = normalize(t, arg)
+    let target = Ty.prune(arg)
     let cls = match Map.get(t.decls.families, name) {
         Some(f) -> f.cls
         None -> return None
@@ -1324,29 +1325,13 @@ fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
     None
 }
 
--- Returns `ty` with family applications at its head reduced through the
--- instances until one sticks. The givens are `Turkey.Inert`'s business.
-fun normalize(t : ClassTable, ty : Ty.Type) -> Ty.Type {
-    var out = Ty.prune(ty)
-    var going = True
-    while going {
-        match out {
-            TFam(name, arg, _) -> match reduceFam(t, name, arg) {
-                None -> { going = False }
-                Some(r) -> { out = Ty.prune(r) }
-            }
-            _ -> { going = False }
-        }
-    }
-    out
-}
-
 -- The instance a stuck family application is missing, if its argument is rigid
 -- enough. A family over a variable is waiting; one over a constructor that no
 -- instance names will wait forever, and saying so where the equation was written
--- beats a stranded-predicate report at the end of the group.
+-- beats a stranded-predicate report at the end of the group. `arg` is
+-- already reduced.
 fun uncovered(t : ClassTable, name : String, arg : Ty.Type) -> Option Pred {
-    let target = normalize(t, arg)
+    let target = Ty.prune(arg)
     let (h, _) = Ty.spine(target)
     match h {
         TCon(_) -> {}
@@ -1539,10 +1524,10 @@ fun simplify(t : ClassTable, preds : Vec Pred) -> Vec Pred {
                 -- `Field.tag a ~ Field.tag a` states nothing. Two family
                 -- applications are deferred while their arguments differ and
                 -- can become equal afterwards, which is where these come from.
-                -- Normalized first: a side can become reducible after the last
-                -- time the equation was retried, so `Int ~ Int` is a shape this
-                -- actually reaches.
-                if Ty.sameType(normalize(t, p.args[0]), normalize(t, p.args[1])) {
+                -- The caller passes both sides reduced: a side can become
+                -- reducible after the last time the equation was retried, so
+                -- `Int ~ Int` is a shape this actually reaches.
+                if Ty.sameType(p.args[0], p.args[1]) {
                     continue
                 }
                 -- Equality is symmetric. Inference can meet both directions when

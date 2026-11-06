@@ -254,6 +254,22 @@ def replace_built(command: list[str], output: Path) -> None:
     os.replace(command[command.index("-o") + 1], output)
 
 
+def corpus() -> list[Path]:
+    """The programs in `tests/programs/` that compile, sorted.
+
+    Every program there but an error case (`err_*`, whose point is to fail)
+    and a known failure (marked `--@ xfail`, which may stop `boot` partway).
+    A corpus test compiles them all in one `boot` run (`boot_each`), so one
+    program that cannot compile fails every test that shares the run, and
+    each of those tests then runs it again.
+    """
+    return sorted(
+        path for path in (REPO_ROOT / "tests" / "programs").glob("*.gob")
+        if not path.name.startswith("err_")
+        and "--@ xfail" not in path.read_text(encoding="utf-8")
+    )
+
+
 def boot_each(output: str, paths: list[Path],
               split: Callable[[str, list[Path]], list[str]],
               flags: tuple[str, ...] = ()) -> dict[Path, str]:

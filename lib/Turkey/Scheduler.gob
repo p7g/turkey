@@ -291,6 +291,44 @@ fun wakeAll(tasks : Vec Co.Coroutine) -> Unit {
 -- EXPERIMENT: TURKEY_SETTLEGLOBAL=1 queues the tasks a poll wakes on the global queue.
 var settleGlobal : Bool = !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_SETTLEGLOBAL")))
 
+-- EXPERIMENT: TURKEY_SETTLESPLIT=1 keeps `pollEvery` of a poll's tasks on the
+-- polling thread's queue and queues the rest globally.
+var settleSplit : Bool = !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_SETTLESPLIT")))
+
+fun wakeAllSplit(tasks : Vec Co.Coroutine) -> Unit {
+    var n = 0
+    for var i = 0; i < len(tasks); i = i + 1 {
+        if claim(tasks[i]) {
+            tasks[n] = tasks[i]
+            n = n + 1
+        }
+    }
+    if n == 0 { return {} }
+    let _ = Workers.tasksAdd(n, 0)
+    let s = mySlot()
+    var placed = 0
+    if s >= 0 {
+        let lock = localLock(s)
+        Workers.acquire(lock)
+        var tail = localTail(s)
+        let first = localHead(s)
+        while placed < n && placed < pollEvery && tail - first < localCapacity {
+            localTasks[s * localCapacity + tail % localCapacity] = Some(tasks[placed])
+            tail = tail + 1
+            placed = placed + 1
+        }
+        Ptr.atomicStore(localWords, s * 24 + 16, tail)
+        Lock.release(lock)
+    }
+    if placed < n {
+        Workers.acquire(queueLock)
+        for var i = placed; i < n; i = i + 1 { Vec.push(runnable, tasks[i]) }
+        let _ = Ptr.atomicAdd(globalCount, 0, n - placed)
+        Lock.release(queueLock)
+    }
+    if n > 1 || placed < n { notify() }
+}
+
 fun wakeAllGlobal(tasks : Vec Co.Coroutine) -> Unit {
     var n = 0
     for var i = 0; i < len(tasks); i = i + 1 {
@@ -630,7 +668,7 @@ fun settle(n : Int) -> Unit {
     let tasks = Poll.takeWoken()
     Poll.unlock()
     if ended > 0 {
-        if settleGlobal { wakeAllGlobal(tasks) } else { wakeAll(tasks) }
+        if settleSplit { wakeAllSplit(tasks) } else if settleGlobal { wakeAllGlobal(tasks) } else { wakeAll(tasks) }
         changed()
     }
     let _ = Ptr.atomicAdd(settling, 0, 1)

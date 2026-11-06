@@ -196,15 +196,13 @@ type Checker = Checker {
     -- The empty scope, shared by every node out of tail position, which is
     -- nearly every node. Never written: a scope is extended by copying.
     noJoins       : Joins,
-    -- `equations` made canonical, built when `equations` changes rather than
-    -- on every reduction.
+    -- The equalities the coercion parameters in scope bind, made canonical.
+    -- Consulted before the instance table, exactly as the solver consults its
+    -- givens first and for the same reason: a family over a rigid variable will
+    -- never reduce through an instance, and the context that promised it is the
+    -- only thing that can say what it is. Extended by the lambda that binds a
+    -- coercion, for its body alone.
     var inert     : Inert.Inert,
-    -- The equalities the binding being checked states. Consulted before the
-    -- instance table, exactly as the solver consults its assumptions first and
-    -- for the same reason: a family over a rigid variable will never reduce
-    -- through an instance, and the signature that promised it is the only thing
-    -- that can say what it is.
-    var equations : Vec (Ty.Type, Ty.Type),
     -- Every binder with an id that the top-level binding being checked binds
     -- below its top, with its spelling, for `checkUnique`.
     var bound     : Vec (Int, String),
@@ -215,7 +213,7 @@ type Checker = Checker {
 
 fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
     decls = decls, classes = classes, joins = Map.new(), noJoins = Map.new(),
-    inert = Inert.empty(classes), equations = [], bound = [], opened = Set.new(),
+    inert = Inert.empty(classes), bound = [], opened = Set.new(),
 }
 
 -- Checks `prog` against `globals` (see `globalsOf`), and raises an internal
@@ -309,24 +307,13 @@ fun resolve(env : CEnv, r : Ref, where : Option Span) -> Bound =
 
 fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     let want = if b.mutable && isRef(b.ty) { refElem(b.ty) } else { b.ty }
-    let saved = ck.equations
-    let savedInert = ck.inert
-    ck.equations = Vec.append(saved, b.equations)
-    ck.inert = Inert.ofEquations(ck.classes, ck.equations)
     var got = check(ck, b.value, env, None)
     if b.mutable && isRef(b.ty) {
         got = if isRef(got) { refElem(got) } else { got }
     }
-    -- Compared *under* the binding's own equations, which is the only place they
-    -- hold. Checking answers a reduced type, so a body checked with
-    -- `Elem a ~ Int` in scope hands back `Int` -- and comparing that against an
-    -- unreduced `Elem a` outside the scope asks the two sides to agree on a
-    -- rewrite only one of them was allowed to make.
     if !agrees(ck, want, got) {
         mismatch(ck, want, got, b.span, "the binding '" + b.name + "'")
     }
-    ck.equations = saved
-    ck.inert = savedInert
 }
 
 -- -- expressions --------------------------------------------------------------------
@@ -369,7 +356,17 @@ fun tail(ck : Checker, e : Core, field : String) -> Option Joins =
 fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
     -- Trivial forms: they are their own evidence.
     CLit(_) -> e.ty
-    CUnit -> e.ty
+    CUnit -> {
+        -- Evidence that two types are one: it holds where it stands, or the
+        -- term assumes an equality nothing in scope grants.
+        if let Some((left, right)) = coercionSides(e.ty) {
+            if !agrees(ck, left, right) {
+                fail("the evidence that " + Ty.show(reduce(ck, left)) + " is "
+                     + Ty.show(reduce(ck, right)) + " is not in scope", e.span)
+            }
+        }
+        e.ty
+    }
     CPrim(_) -> e.ty
     CCon(name) -> checkCon(ck, e, name)
     CVar(r) -> checkVar(ck, e, r, env)
@@ -390,9 +387,38 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
     CLam(params, body, _) -> {
         let mark = enter(env)
         for p in params { bind(ck, env, p.name, p.id, [], p.ty, e.span) }
-        let got = TFun(Array.map(params, _.ty), check(ck, body, env, None))
+        let given = Vec.new(0)
+        for p in params {
+            if let Some((left, right)) = coercionSides(p.ty) {
+                Vec.push(given, Inert.given(Ty.pred(Ty.equals, [left, right])))
+            }
+        }
+        if len(given) == 0 {
+            let got = TFun(Array.map(params, _.ty), check(ck, body, env, None))
+            leave(env, mark)
+            return got
+        }
+        -- The body may assume what the coercions grant, and nothing outside
+        -- it may. So the body's type is compared with the result the lambda
+        -- claims while they are in scope, and the claimed one is answered:
+        -- a body checked under `Elem a ~ Int` hands back `Int`, which agrees
+        -- with an unreduced `Elem a` only here.
+        let outside = ck.inert
+        -- A coercion that can never hold is dropped: its lambda can never be
+        -- applied, since every application has to supply the evidence.
+        let (inside, _) = Inert.extend(outside, Vec.toArray(given))
+        ck.inert = inside
+        let got = check(ck, body, env, None)
+        let claimed = match Ty.prune(e.ty) {
+            TFun(_, ret) -> ret
+            _ -> got
+        }
+        if !agrees(ck, claimed, got) {
+            mismatch(ck, claimed, got, e.span, "the body of this function")
+        }
+        ck.inert = outside
         leave(env, mark)
-        got
+        TFun(Array.map(params, _.ty), claimed)
     }
     CApp(fn, args) -> checkApp(ck, e, fn, args, env)
     CTyLam(_, body) -> check(ck, body, env, None)
@@ -565,6 +591,9 @@ fun checkVar(ck : Checker, e : Core, r : Ref, env : CEnv) -> Ty.Type {
     -- bound by the lambda that takes it. A name that reaches here unknown is a
     -- real hole, so say which name.
     let Bound { name = name, binders = binders, ty = ty, .. } = resolve(env, r, e.span)
+    if isCoercion(ty) {
+        fail("'" + name + "' is a coercion, which nothing may refer to", e.span)
+    }
     if len(binders) > 0 {
         -- A polymorphic name used with no type application: legitimate only
         -- under a type application, which does not check its operand this way.
@@ -640,15 +669,19 @@ fun methodScheme(ck : Checker, e : Core, dictTy : Ty.Type,
 -- Derived here rather than read off the term, and derived the same way the
 -- lowering derives it -- which is the point of a checker: two independent
 -- computations of one type, compared. A method's own context is per call, so
--- those dictionaries are the field's parameters and not the dictionary's.
+-- its dictionaries and coercions are the field's parameters and not the
+-- dictionary's.
 fun methodType(ck : Checker, m : MethodInfo, head : Ty.Type) -> Ty.Type {
     let mapping = Map.new()
     Map.put(mapping, m.classVar.id, head)
     let ty = Decls.substitute(m.scheme.body, mapping)
-    let own = Classes.methodDicts(m)
+    let own = Classes.methodEvidence(m)
     if len(own) == 0 { return ty }
-    TFun(Array.map(own, fun(p) =
-        dictType(ck, p.name, Decls.substitute(p.args[0], mapping))), ty)
+    TFun(Array.map(own, fun(p) = if p.name == Ty.equals {
+        coercionOf(Decls.substitute(p.args[0], mapping), Decls.substitute(p.args[1], mapping))
+    } else {
+        dictType(ck, p.name, Decls.substitute(p.args[0], mapping))
+    }), ty)
 }
 
 -- Read `%Dict.C t` back as the class `C` and the type `t`.

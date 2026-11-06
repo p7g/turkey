@@ -56,6 +56,7 @@ import Turkey.Diag as Diag
 import Turkey.Inert as Inert
 import Turkey.Methods as Methods
 import Turkey.Opt as Opt
+import Turkey.Prelude as P
 import Turkey.Deps as Deps
 import Turkey.Runtime as Rt
 import Turkey.Source (Span(..))
@@ -158,13 +159,7 @@ fun mangleAll(ts : Array Ty.Type) -> String = String.join(Array.map(ts, mangle),
 -- change. `%Dict.` is not a convention in the same sense: no source type can be
 -- spelled that way, so a parameter with one is evidence and nothing else.
 fun takesDictionaries(b : CBind) -> Bool = match b.value.kind {
-    CLam(params, _, _) -> {
-        if len(params) == 0 { return False }
-        for p in params {
-            if Option.isNone(dictClass(p.ty)) { return False }
-        }
-        True
-    }
+    CLam(params, _, _) -> len(params) > 0 && Iterator.all(params, fun(p) = isEvidence(p.ty))
     _ -> False
 }
 
@@ -287,8 +282,10 @@ fun newMono(program : CProgram, table : Binders.Table, decls : DeclTable,
 type Rewriter = Rewriter {
     owner      : Mono,
     subst      : Map Int Ty.Type,
-    equations  : Vec (Ty.Type, Ty.Type),
-    inert      : Inert.Inert,
+    -- The equalities the coercion parameters around the term being rewritten
+    -- grant, under the substitution. Extended by the lambda that binds one,
+    -- for its body alone.
+    var inert  : Inert.Inert,
     var rename : Map Ref String,
     -- A local that is nothing but another name for a top-level dictionary,
     -- by the reference that reads it in the output. An instance's own method
@@ -308,45 +305,29 @@ type Rewriter = Rewriter {
     ids        : Map Int Int,
 }
 
-fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
-                equations : Vec (Ty.Type, Ty.Type), copyInto : Option Int,
-                locals : Map Int Local, ids : Map Int Int) -> Rewriter {
-    -- Substituted before the family reducer is built from them: a given
-    -- `Item s ~ Op` becomes `Item (Array Int) ~ Op` under the specialization,
-    -- and it is the substituted form that is a rewrite rule for the types in the
-    -- body. Plain substitution and not the reducing one, since the reducing one
-    -- is what this makes.
-    let eqs = Vec.map(equations, fun(pair) = {
-        let (a, b) = pair
-        (Decls.substitute(a, subst), Decls.substitute(b, subst))
-    })
-    Rewriter {
-        owner = owner, subst = subst, equations = eqs,
-        inert = Inert.ofEquations(owner.classes, eqs),
-        rename = Map.new(), aliases = Map.new(), locals = locals,
-        copyInto = copyInto, ids = ids,
-    }
+fun newRewriter(owner : Mono, subst : Map Int Ty.Type, inert : Inert.Inert,
+                copyInto : Option Int, locals : Map Int Local,
+                ids : Map Int Int) -> Rewriter = Rewriter {
+    owner = owner, subst = subst, inert = inert,
+    rename = Map.new(), aliases = Map.new(), locals = locals,
+    copyInto = copyInto, ids = ids,
 }
 
--- A rewriter for a member of a group with equations of its own: the same
--- term, so it renames as `r` does.
-fun childRewriter(r : Rewriter, equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
-    let made = newRewriter(r.owner, r.subst, equations, r.copyInto, r.locals, r.ids)
-    for (k, v) in Map.entries(r.aliases) { Map.put(made.aliases, k, v) }
-    made.rename = r.rename
-    made
-}
+-- A rewriter for a term with no evidence around it.
+fun topRewriter(owner : Mono, subst : Map Int Ty.Type, copyInto : Option Int) -> Rewriter =
+    newRewriter(owner, subst, Inert.empty(owner.classes), copyInto, Map.new(), Map.new())
 
 -- A rewriter for a copy of a generalized local's value, at the substitution
 -- that specializes it. It shares the locals, so the copy can still reach the
 -- ones around it, and starts from `r`'s renaming, so it reads them under the
 -- ids they have here. Its own binders are minted into the owner `r` copies
 -- into, or the local's own when `r` rewrites an original.
-fun copyRewriter(r : Rewriter, local : Local, subst : Map Int Ty.Type,
-                 equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
+fun copyRewriter(r : Rewriter, local : Local, subst : Map Int Ty.Type) -> Rewriter {
     let ids = Map.new()
     for (k, v) in Map.entries(r.ids) { Map.put(ids, k, v) }
-    let made = newRewriter(r.owner, subst, equations, Some(homeOf(r, local.id)),
+    -- The local's own coercions are in its value. The ones around it are
+    -- already substituted, and the local's binders do not occur in them.
+    let made = newRewriter(r.owner, subst, r.inert, Some(homeOf(r, local.id)),
                            r.locals, ids)
     for (k, v) in Map.entries(r.aliases) { Map.put(made.aliases, k, v) }
     made.rename = r.rename
@@ -413,8 +394,25 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
     -- over is rewritten.
     CLam(params, body, name) -> {
         let ps = Array.map(params, rewriteParam(r, _))
-        mkCore(rTy(r, e.ty), e.span, CLam(ps, rewrite(r, body), name))
+        let outside = r.inert
+        let given = Vec.new(0)
+        if len(Map.keys(r.subst)) > 0 {
+            for p in ps {
+                if let Some((left, right)) = coercionSides(p.ty) {
+                    Vec.push(given, Inert.given(Ty.pred(Ty.equals, [left, right])))
+                }
+            }
+        }
+        if len(given) > 0 {
+            -- One that can never hold is dropped: nothing can apply the lambda.
+            let (inside, _) = Inert.extend(outside, Vec.toArray(given))
+            r.inert = inside
+        }
+        let b = rewrite(r, body)
+        r.inert = outside
+        mkCore(rTy(r, e.ty), e.span, CLam(ps, b, name))
     }
+    CDict(cls, slots) -> rewriteDict(r, e, cls, slots)
     CJoin(name, id, params, body, rest, recursive) -> {
         let made = bindId(r, name, id)
         let ps = Array.map(params, rewriteParam(r, _))
@@ -432,6 +430,81 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
             CAlt { alt = alt, body = rewrite(r, a.body) }
         })))
     _ -> generic(r, e)
+}
+
+-- A dictionary under the substitution, with every method slot that can never
+-- be called at its head replaced by a function of its evidence that panics.
+--
+-- A slot can never be called where one of its method's own equalities can
+-- never hold, since every call has to supply the evidence for it. Its body was
+-- checked under that equality, so it may be ill-typed here, and specializing
+-- what it calls could fail. So it is not rewritten at all. rustc decides the
+-- same, from the same test made after monomorphization, and leaves the
+-- vtable entry vacant (`impossible_clauses`, `VtblEntry::Vacant`).
+fun rewriteDict(r : Rewriter, e : Core, cls : String, slots : Array Core) -> Core {
+    if len(Map.keys(r.subst)) == 0 { return generic(r, e) }
+    let ty = rTy(r, e.ty)
+    let head = match Ty.spine(Ty.prune(ty)) {
+        (_, args) -> if len(args) == 1 { Some(args[0]) } else { None }
+    }
+    let info = Map.get(r.owner.classes.classes, cls)
+    let out = Array.init(len(slots), fun(i) {
+        let method = match (Classes.slotAt(r.owner.classes, cls, i), info) {
+            (Some(MethodSlot(name)), Some(c)) -> Map.get(c.methods, name)
+            (Some(KeyedSlot(name, _)), Some(c)) -> Map.get(c.methods, name)
+            _ -> None
+        }
+        match (method, head) {
+            (Some(m), Some(h)) -> if refutedAt(r.owner.classes, m, h) {
+                if let Some(stub) = vacant(r, slots[i], m, h) { return stub }
+            }
+            _ -> {}
+        }
+        rewrite(r, slots[i])
+    })
+    mkCore(ty, e.span, CDict(cls, out))
+}
+
+-- Returns whether one of `m`'s own equalities can never hold with its class
+-- variable at `head`.
+fun refutedAt(classes : ClassTable, m : MethodInfo, head : Ty.Type) -> Bool {
+    let mapping = Map.new()
+    Map.put(mapping, m.classVar.id, head)
+    Iterator.any(Classes.methodEqualities(m), fun(p) =
+        Inert.refutes(classes, Decls.substitute(p.args[0], mapping),
+                      Decls.substitute(p.args[1], mapping)))
+}
+
+-- The slot `slot` of the method `m` at `head`, as a function of its evidence
+-- that panics, or `None` if the slot is not a function of its evidence.
+fun vacant(r : Rewriter, slot : Core, m : MethodInfo, head : Ty.Type) -> Option Core {
+    let (own, inner) = match slot.kind {
+        CTyLam(vs, body) -> (Some(vs), body)
+        _ -> (None, slot)
+    }
+    let lam = match inner.kind {
+        CLam(params, _, name) -> (params, name)
+        _ -> return None
+    }
+    let (params, name) = lam
+    let ps = Array.map(params, rewriteParam(r, _))
+    let fnTy = rTy(r, inner.ty)
+    let ret = match Ty.prune(fnTy) {
+        TFun(_, rt) -> rt
+        _ -> return None
+    }
+    let message = "the method '" + Classes.surfaceMember(m.name) + "' cannot be called at "
+                  + Ty.show(head)
+    let errorTy = TFun([Ty.tString()], ret)
+    let fails = mkCore(errorTy, slot.span, CTyApp(
+        mkCore(errorTy, slot.span, CVar(BySpelling(P.error))), [ret]))
+    let failed = mkCore(ret, slot.span, CApp(fails, [mkCore(Ty.tString(), slot.span,
+                                                            CLit(LString(message)))]))
+    let made = mkCore(fnTy, slot.span, CLam(ps, failed, name))
+    Some(match own {
+        Some(vs) -> mkCore(fnTy, slot.span, CTyLam(vs, made))
+        None -> made
+    })
 }
 
 fun rewriteParam(r : Rewriter, p : CParam) -> CParam {
@@ -564,8 +637,10 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
     if len(b.binders) != len(targs) || len(params) != len(args) { return None }
     let lowered = Array.map(args, rewrite(r, _))
     let supplied = Vec.new(len(lowered))
-    for a in lowered {
-        match globalDict(r, a) {
+    for var i = 0; i < len(lowered); i = i + 1 {
+        -- A coercion's argument is passed to nothing: see `build`.
+        if isCoercion(params[i].ty) { continue }
+        match globalDict(r, lowered[i]) {
             -- A context this pass could not reduce to a *top-level* name -- a
             -- capped instance, or a dictionary parameter still in scope. The
             -- collapse hoists this application to the top level, so an argument
@@ -696,8 +771,7 @@ fun drain(r : Rewriter, local : Local, binders : Vec VarCell,
         for (key, made) in todo {
             Set.add(seen, key)
             let (name, id, args) = made
-            let sub = copyRewriter(r, local, extended(r.subst, binders, args),
-                                   r.equations)
+            let sub = copyRewriter(r, local, extended(r.subst, binders, args))
             Vec.push(out, (name, id, rewrite(sub, value)))
         }
     }
@@ -766,13 +840,11 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
                 Some(x) -> x
                 None -> oops("a local instantiation lost its original", e.span)
             }
-            let sub = copyRewriter(r, local, extended(r.subst, orig.binders, args),
-                                   orig.equations)
+            let sub = copyRewriter(r, local, extended(r.subst, orig.binders, args))
             let b = CBind {
                 name = name, id = id, ty = rTy(sub, orig.ty), binders = [],
                 value = rewrite(sub, orig.value), span = orig.span,
-                mutable = False, module_ = orig.module_,
-                equations = sub.equations, layouts = orig.layouts,
+                mutable = False, module_ = orig.module_, layouts = orig.layouts,
             }
             Vec.push(out, b)
         }
@@ -781,23 +853,13 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
 }
 
 -- One member of a group, generic or not, under this rewriter, with the id
--- `rewriteLetRec` renamed it to -- and with its own equations added, since a
--- member may carry some. A member records only the equations it states; the
--- enclosing binding's are on that binding.
+-- `rewriteLetRec` renamed it to.
 fun rewriteMember(r : Rewriter, renamed : (CBind, Int)) -> CBind {
     let (b, id) = renamed
-    if len(b.equations) == 0 {
-        return CBind {
-            name = b.name, id = id, ty = rTy(r, b.ty), binders = b.binders,
-            value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
-            module_ = b.module_, equations = b.equations, layouts = b.layouts,
-        }
-    }
-    let sub = childRewriter(r, b.equations)
     CBind {
-        name = b.name, id = id, ty = rTy(sub, b.ty), binders = b.binders,
-        value = rewrite(sub, b.value), span = b.span, mutable = b.mutable,
-        module_ = b.module_, equations = sub.equations, layouts = b.layouts,
+        name = b.name, id = id, ty = rTy(r, b.ty), binders = b.binders,
+        value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
+        module_ = b.module_, layouts = b.layouts,
     }
 }
 
@@ -866,11 +928,11 @@ fun runMono(m : Mono) -> CProgram {
 }
 
 fun rewriteTop(m : Mono, b : CBind) -> CBind {
-    let r = newRewriter(m, Map.new(), b.equations, None, Map.new(), Map.new())
+    let r = topRewriter(m, Map.new(), None)
     CBind {
         name = b.name, id = b.id, ty = b.ty, binders = b.binders,
         value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
-        module_ = b.module_, equations = b.equations,
+        module_ = b.module_,
         layouts = b.layouts,
     }
 }
@@ -948,8 +1010,7 @@ fun build(m : Mono, name : String, id : Int, b : CBind, targs : Array Ty.Type,
     for var i = 0; i < len(b.binders) && i < len(targs); i = i + 1 {
         Map.put(subst, b.binders[i].id, targs[i])
     }
-    let r = newRewriter(m, subst, b.equations, Some(Binders.ownerOf(id)),
-                        Map.new(), Map.new())
+    let r = topRewriter(m, subst, Some(Binders.ownerOf(id)))
     var ty = rTy(r, b.ty)
     var value = b.value
     match dicts {
@@ -959,13 +1020,19 @@ fun build(m : Mono, name : String, id : Int, b : CBind, targs : Array Ty.Type,
             -- are renamed to the dictionaries they were handed -- a rename and
             -- not a `let`, because the argument is a top-level name, so
             -- substituting it is capture-free and leaves what the body projects
-            -- out of something devirtualization can see through.
+            -- out of something devirtualization can see through. A coercion
+            -- is supplied nothing: nothing refers to it, and at ground types
+            -- the instances alone decide what it granted.
             let (params, body, _) = match value.kind {
                 CLam(ps, bd, n) -> (ps, bd, n)
                 _ -> oops("a collapsed binding is not a lambda", b.span)
             }
-            for var i = 0; i < len(params) && i < len(ds); i = i + 1 {
-                Map.put(r.rename, refTo(params[i].name, params[i].id), ds[i])
+            var k = 0
+            for p in params {
+                if !isCoercion(p.ty) && k < len(ds) {
+                    Map.put(r.rename, refTo(p.name, p.id), ds[k])
+                    k = k + 1
+                }
             }
             value = body
             ty = rTy(r, body.ty)
@@ -994,7 +1061,7 @@ fun build(m : Mono, name : String, id : Int, b : CBind, targs : Array Ty.Type,
     CBind {
         name = name, id = id, ty = ty, binders = binders, value = rewrite(r, value),
         span = b.span, mutable = b.mutable, module_ = b.module_,
-        equations = r.equations, layouts = b.layouts,
+        layouts = b.layouts,
     }
 }
 
@@ -1061,7 +1128,7 @@ fun reduceBind(b : CBind, instances : Inert.Inert) -> CBind {
 fun rewriteValue(b : CBind, value : Core) -> CBind = CBind {
     name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations, layouts = b.layouts,
+    layouts = b.layouts,
 }
 
 fun reduceCore(e : Core, instances : Inert.Inert) -> Core =
@@ -1217,7 +1284,7 @@ fun runDevirt(d : Devirt) -> CProgram {
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
     name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations, layouts = b.layouts,
+    layouts = b.layouts,
 }
 
 fun devirtBind(d : Devirt, b : CBind) -> CBind = withValue(b, devirt(d, b.value))
@@ -1306,7 +1373,6 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
     Vec.push(d.hoisted, CBind {
         name = made, id = noId, ty = body.ty, binders = binders, value = body,
         span = owner.span, mutable = False, module_ = owner.module_,
-        equations = Vec.slice(owner.equations, 0, len(owner.equations)),
         layouts = Map.new(),
     })
     let head = mkCore(body.ty, value.span, CVar(BySpelling(made)))
@@ -1315,7 +1381,7 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
     }
     let reference = if len(params) == 0 { applied } else {
         mkCore(inner.ty, value.span, CApp(applied,
-            Array.map(params, fun(p) = mkCore(p.ty, value.span, CVar(refTo(p.name, p.id))))))
+            Array.map(params, forwarded(_, value.span))))
     }
     -- A method that states its own quantification keeps stating it.
     match value.kind {

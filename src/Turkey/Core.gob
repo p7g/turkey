@@ -8,6 +8,7 @@ export (
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto, codeAddressName, mentions, references,
     dictName, classOfDict, dictClass, isDictionary,
+    coercionOf, coercionSides, isCoercion, isEvidence, coercion, forwarded, outerEqualities,
     abstractionBinders,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
@@ -293,11 +294,6 @@ type CBind = CBind {
     -- Which module declared it, including generated top-level holders.
     -- Giblet checking and early initialization rely on this ownership.
     var module_   : String,
-    -- The equalities the binding's context states: `Item s ~ Op`. They are not
-    -- evidence -- nothing is passed for them, and they are erased at run time --
-    -- but they are *facts the body was checked under*, and a family over a rigid
-    -- variable does not reduce without them.
-    var equations : Vec (Ty.Type, Ty.Type),
     -- The layout of each type this binding is compiled under that its parts do
     -- not decide -- an abstracted variable, `Item t`, `f a`, a local copy's
     -- variables -- keyed by `Ty.typeKey`. `Turkey.Layout` fills it; see its
@@ -418,7 +414,7 @@ fun mapParam(p : CParam, m : Mapper) -> CParam {
 fun bindValue(b : CBind) -> Core {
     let CBind {
         name = _, id = _, ty = _, binders = _, value, span = _, mutable = _,
-        module_ = _, equations = _, layouts = _,
+        module_ = _, layouts = _,
     } = b
     value
 }
@@ -462,6 +458,89 @@ fun dictClass(ty : Ty.Type) -> Option String {
 }
 
 fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
+
+-- -- equality evidence --------------------------------------------------------------
+--
+-- An equality in a context, `Elem a ~ Int`, is passed as evidence the way a
+-- class predicate is, by a parameter of the type `%Co (Elem a) Int`. A term may
+-- assume the equality only inside the lambda that binds such a parameter, so
+-- no pass can move a term that relies on it out of its scope without the
+-- checker seeing it: System FC's coercion abstraction (Sulzmann, Chakravarty,
+-- Peyton Jones and Donnelly, TLDI 2007, sec. 3), without coercion terms.
+--
+-- The evidence itself is a `CUnit` of a coercion type, checked where it stands:
+-- `Turkey.Coretc` accepts one only where its two sides agree under the
+-- equalities in scope. A coercion has the layout of `Unit`, which takes no
+-- register, so the parameters and arguments cost nothing at run time.
+--
+-- **Invariant.** Nothing refers to a coercion parameter. A term that passes
+-- one on passes a `CUnit` of its type instead (`forwarded`), which holds
+-- inside the lambda that binds it. So a pass may drop a coercion parameter
+-- along with its argument, as specialization does, without leaving a
+-- reference behind; `Turkey.Coretc` refuses a reference to one.
+--
+-- Every lambda over evidence lists its dictionaries before its coercions, and
+-- every application of one supplies them in that order.
+
+-- `%` cannot start a source identifier, so no program can name this type.
+let coercionName = "%Co"
+
+-- Returns the type of the evidence that `l` and `r` are one type.
+fun coercionOf(l : Ty.Type, r : Ty.Type) -> Ty.Type {
+    let con = Ty.tcon(coercionName, KFun(KStar, KFun(KStar, KStar)), Ty.noScope)
+    TApp(TApp(con, l, KFun(KStar, KStar)), r, KStar)
+}
+
+-- Returns the two sides of the coercion type `ty`, or `None` if it is not one.
+fun coercionSides(ty : Ty.Type) -> Option (Ty.Type, Ty.Type) {
+    let (h, args) = Ty.spine(Ty.prune(ty))
+    match h {
+        TCon(c) -> if c.name == coercionName && len(args) == 2 { Some((args[0], args[1])) }
+                   else { None }
+        _ -> None
+    }
+}
+
+fun isCoercion(ty : Ty.Type) -> Bool = Option.isSome(coercionSides(ty))
+
+-- Returns whether a parameter of type `ty` is evidence: a dictionary or a
+-- coercion.
+fun isEvidence(ty : Ty.Type) -> Bool = isDictionary(ty) || isCoercion(ty)
+
+-- Returns the evidence that `l` and `r` are one type.
+fun coercion(l : Ty.Type, r : Ty.Type, span : Option Span) -> Core =
+    mkCore(coercionOf(l, r), span, CUnit)
+
+-- Returns the parameter `p` as an argument: a reference to it, or, for a
+-- coercion, the evidence of its type.
+fun forwarded(p : CParam, span : Option Span) -> Core = match coercionSides(p.ty) {
+    Some((l, r)) -> coercion(l, r, span)
+    None -> mkCore(p.ty, span, CVar(refTo(p.name, p.id)))
+}
+
+-- Returns the equalities the coercion parameters at the top of `e` bind: those
+-- of every lambda, under its type abstractions, whose parameters are all
+-- evidence. These are the equalities a whole binding of `e` may assume.
+fun outerEqualities(e : Core) -> Vec (Ty.Type, Ty.Type) {
+    let out = Vec.new(2)
+    var value = e
+    loop {
+        match value.kind {
+            CTyLam(_, body) -> { value = body }
+            CLam(params, body, _) -> {
+                if len(params) == 0 || !Iterator.all(params, fun(p) = isEvidence(p.ty)) {
+                    break
+                }
+                for p in params {
+                    if let Some(sides) = coercionSides(p.ty) { Vec.push(out, sides) }
+                }
+                value = body
+            }
+            _ -> break
+        }
+    }
+    out
+}
 
 -- Every type variable a binding abstracts, wherever it states them.
 --

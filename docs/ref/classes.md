@@ -150,7 +150,10 @@ Box([Some(a)])
 ```
 
 `Show (Box a) : Show a` says: a `Box a` can be shown whenever an `a` can. The
-instance's methods may use those constraints.
+instance's methods may use those constraints. The context may also hold
+[equality constraints](#equality-constraints). It can mention only the head's
+type variables, because using the instance gives a type to those and to no
+others.
 
 > **Coming from Haskell.** `instance Show (Box a) : Show a` is
 > `instance Show a => Show (Box a)`: the context comes after the head.
@@ -375,3 +378,50 @@ associated type application at most one equality.
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.
+
+An instance's context can hold equalities too. Its methods may rely on them,
+and a use of the instance must satisfy them. Here a `Stars s` source pulls a
+count from the source it wraps, so it needs that source's items to be
+`Int`s:
+
+<!-- run -->
+```kotlin
+class Source s {
+    type Item s
+    fun pull(s) -> Option (Item s)
+}
+
+type Countdown = Countdown { var left : Int }
+
+instance Source Countdown {
+    type Item = Int
+    fun pull(c) {
+        if c.left == 0 { return None }
+        c.left = c.left - 1
+        Some(c.left)
+    }
+}
+
+type Stars s = Stars { inner : s }
+
+instance Source (Stars s) : Source s, Item s ~ Int {
+    type Item = String
+    fun pull(Stars { inner }) {
+        let n = pull(inner)?
+        Some("[" + String.repeat("*", n) + "]")
+    }
+}
+
+fun main() {
+    let stars = Stars { inner = Countdown { left = 3 } }
+    while let Some(line) = pull(stars) {
+        print(line)
+    }
+}
+```
+
+```text
+[**]
+[*]
+[]
+```

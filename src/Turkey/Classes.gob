@@ -192,7 +192,15 @@ fun classKind(info : ClassInfo) -> Kind = info.cvar.kind
 type InstInfo = InstInfo {
     cls      : String,
     head     : Ty.Type,
+    -- The class predicates of the instance's context, in the order written.
+    -- Each is one dictionary the instance's own dictionary is a function of.
     context  : Vec Pred,
+    -- The equalities of its context, such as `Key a ~ Int`. They are facts the
+    -- methods are checked under and obligations a use must prove, like a
+    -- function's, but they have no evidence, so they are kept apart from
+    -- `context` and its positional correspondence with the dictionary
+    -- parameters.
+    equalities : Vec Pred,
     decl     : InstanceDecl,
     names    : Map Int String,
     -- Family name -> what it is at this head, over the head's own variables.
@@ -768,6 +776,7 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         return None
     }
     if !checkHeadShape(d, h) { return None }
+    if !checkContextVariables(d) { return None }
 
     let key = instHeadKey(h)
     for other in instancesOf(t, d.cls) {
@@ -777,7 +786,11 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
             return None
         }
     }
-    let context = resolveContext(t, d.context, tyvars, None)
+    let context = Vec.new(len(d.context))
+    let equalities = Vec.new(1)
+    for p in resolveContext(t, d.context, tyvars, None) {
+        if p.name == Ty.equals { Vec.push(equalities, p) } else { Vec.push(context, p) }
+    }
     let families = resolveFamilies(t, d, info, h, tyvars, fresh)
     let names = Map.new()
     for (name, stood) in Map.entries(tyvars) {
@@ -790,6 +803,7 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         cls = d.cls
         head = h
         context
+        equalities
         decl = d
         names
         families
@@ -996,12 +1010,47 @@ fun checkHeadShape(d : InstanceDecl, h : Ty.Type) -> Bool {
     True
 }
 
+-- Returns whether every type variable `d`'s context mentions is one of its
+-- head's, reporting each that is not.
+--
+-- Using an instance matches its head and nothing else, so the head's variables
+-- are the only ones a use gives a type to. Any other would be one variable
+-- shared by every use of the instance -- `Show b` would ask for an instance
+-- at whatever type the first use happened to fix, and `Key a ~ Array b` would
+-- make every use agree on `b`.
+fun checkContextVariables(d : InstanceDecl) -> Bool {
+    let bound = Set.new()
+    for v in Decls.typeVariables(d.head) {
+        if let TEVar(name) = v.kind { Set.add(bound, name) }
+    }
+    var ok = True
+    for p in d.context {
+        let mentioned = match p.kind {
+            PClass(_, arg) -> Decls.typeVariables(arg)
+            PEq(left, right) -> Vec.append(Decls.typeVariables(left),
+                                           Decls.typeVariables(right))
+        }
+        for v in mentioned {
+            if let TEVar(name) = v.kind {
+                if !Set.contains(bound, name) {
+                    report("'" + name + "' is not a variable of the instance head; "
+                           + "an instance's context can only constrain those",
+                           Some(v.span))
+                    ok = False
+                    break
+                }
+            }
+        }
+    }
+    ok
+}
+
 -- Superclass coverage, and the method roster.
 fun checkInstance(t : ClassTable, inst : InstInfo) -> Unit {
     let info = classNamed(t, inst.cls)
     for sup in info.supers {
         let demand = Ty.pred(sup.name, [inst.head])
-        if !entail(t, inst.context, demand) {
+        if !entail(t, Vec.append(inst.context, inst.equalities), demand) {
             report("'" + Ty.showPred(demand) + "' is required by '" + inst.cls
                    + "', but there is no such instance", Some(inst.decl.span))
         }
@@ -1322,6 +1371,7 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
         cls = cls
         head = general
         context = []
+        equalities = []
         decl = InstanceDecl {
             span = generatedSpan()
             cls = cls
@@ -1529,7 +1579,7 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
     let context = []
     for arg in typedArgs(general) { Vec.push(context, Ty.pred(P.typedClass, [arg])) }
     let inst = InstInfo {
-        cls = P.typedClass, head = general, context = context,
+        cls = P.typedClass, head = general, context = context, equalities = [],
         decl = InstanceDecl {
             span = generatedSpan(), cls = P.typedClass,
             head = Type { id = 0, span = generatedSpan(),
@@ -1555,15 +1605,23 @@ fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) {
     }
     for inst in instancesOf(t, p.name) {
         if let Some(mapping) = match_(inst.head, p.args[0]) {
-            return Some(Array.map(inst.context, fun(q) =
-                Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)])))
+            let at = fun(q : Pred) = Ty.pred(q.name,
+                Array.map(q.args, Decls.substitute(_, mapping)))
+            return Some(Array.append(Array.map(inst.context, at),
+                                     Array.map(inst.equalities, at)))
         }
     }
     None
 }
 
--- Does `given` prove `p`? Superclasses first, then the instance table.
+-- Does `given` prove `p`? Superclasses first, then the instance table. An
+-- equality holds when both sides reduce to one type, by the given equalities
+-- and then the instance table.
 fun entail(t : ClassTable, given : Vec Pred, p : Pred) -> Bool {
+    if p.name == Ty.equals {
+        return Ty.sameType(normalizeUnder(t, p.args[0], given),
+                           normalizeUnder(t, p.args[1], given))
+    }
     let key = Ty.predKey(p)
     for a in given {
         for q in bySuper(t, a) {
@@ -1833,7 +1891,7 @@ fun showClasses(t : ClassTable) -> String {
             let n = Ty.namer("")
             String.push(b, "instance " + cls + " " + Ty.showAt(inst.head, n, 0)
                            + " [" + inst.module_ + "]\n")
-            for p in inst.context {
+            for p in Vec.append(inst.context, inst.equalities) {
                 String.push(b, "  context " + Ty.showPredWith(p, n) + "\n")
             }
             for (fam, body) in Map.entries(inst.families) {

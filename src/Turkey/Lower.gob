@@ -654,6 +654,9 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
     let value = overContext(l, inst, bound, record, result)
     let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
                     value, Some(inst.decl.span))
+    -- The instance's own equalities, over the head's variables, which are this
+    -- binding's binders. Every method body was checked under them.
+    for q in inst.equalities { Vec.push(b.equations, (q.args[0], q.args[1])) }
     -- A method's own equalities, at this head. A binding is where Core keeps the
     -- equalities a body was checked under, and a method body is a field of this
     -- one; `Elem s ~ Part (Option a)` names the method's own `s`, so it cannot
@@ -970,7 +973,7 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
         if len(u.evidence) == 0 { return [] }
         let givens = givensOf(l, u)
         let count = fewer(len(u.evidence), len(u.preds))
-        Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
+        Array.init(count, fun(i) = evidence(l, u.evidence[i], wantedType(l, u, u.preds[i]),
                                             givens))
     }
 }
@@ -991,7 +994,7 @@ fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
     }
     let givens = givensOf(l, u)
     let count = fewer(len(u.evidence), len(u.preds))
-    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
+    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], wantedType(l, u, u.preds[i]),
                                              givens)))
 }
 
@@ -1318,6 +1321,22 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
 
 fun predType(l : Lowerer, p : Pred) -> Ty.Type =
     dictType(l, p.name, resolved(l, p.args[0]))
+
+-- The dictionary type a use's predicate `p` wants, reduced by the given
+-- equalities in scope at the use.
+--
+-- `Evidence.resolve` chose the evidence under those givens, so the type has to
+-- be read under them too. A method body is inferred before it meets its
+-- signature, so a variable can be bound to `K a` before a given `K a ~ Int`
+-- applies, and the recorded predicate stays `Add (K a)` while its evidence is
+-- the `Add Int` instance.
+fun wantedType(l : Lowerer, u : Use, p : Pred) -> Ty.Type {
+    let givens = Vec.new(4)
+    for sc in u.scopes {
+        for (_, g) in sc.givens { Vec.push(givens, g) }
+    }
+    dictType(l, p.name, resolved(l, Classes.normalizeUnder(l.classes, p.args[0], givens)))
+}
 
 -- A type from the solver's own records, read the way a node's type is read:
 -- reduced, and back in terms of variables rather than skolems.
@@ -1784,7 +1803,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
     let givens = givensOf(l, use)
     let count = fewer(len(use.evidence), len(use.preds))
     var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i],
-                                                    predType(l, use.preds[i]), givens))
+                                                    wantedType(l, use, use.preds[i]), givens))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
     -- one is monomorphic and took the path above.

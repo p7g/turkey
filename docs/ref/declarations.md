@@ -592,6 +592,26 @@ fun main() {
 Without the annotation on `n`, the recursive call would force `a` and
 `Array a` to be the same type, which is an error.
 
+A signature's type variable belongs to its function. The body cannot make it
+equal to a type from outside the function, because each caller picks its own
+`a` and a value outside has only one type. This holds however the two meet,
+including through a field or an associated type whose value is decided only
+later in the program:
+
+<!-- error: the type variable 'a' from a signature cannot be equal to a type from outside its function -->
+```kotlin
+type Labeled t = Labeled { label : String, value : t }
+
+let entries = Vec.new(4)
+
+fun firstValue() -> a = entries[0].value
+
+fun main() {
+    Vec.push(entries, Labeled { label = "one", value = 1 })
+    print(firstValue() + 1)
+}
+```
+
 > **For readers new to this.** In a type like `fun(Array a) -> a`, `a` is
 > *universally quantified*: the function works for every choice of `a`. A
 > signature is a promise of that, and the compiler holds the body to it.

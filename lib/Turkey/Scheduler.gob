@@ -171,8 +171,9 @@ fun wake(c : Co.Coroutine) -> Unit {
     if claim(c) { ready(c) }
 }
 
--- Whether the caller is to queue `c`, which is waiting: it is parked, and now
--- active. Otherwise it is still running, and is now marked woken.
+-- Returns whether the caller is to queue `c`, which is waiting: True if it was
+-- parked, and is now active; False if it is still running, and is now marked
+-- woken.
 fun claim(c : Co.Coroutine) -> Bool {
     while True {
         if Co.waitingSwap(c, parked, active) { return True }
@@ -182,8 +183,8 @@ fun claim(c : Co.Coroutine) -> Bool {
     False
 }
 
--- Wake each of `tasks`, queuing the ones that are parked under one taking of
--- the queue's lock.
+-- Wakes each of `tasks`, queuing the ones that are parked under one taking of
+-- the queue's lock. Overwrites the front of `tasks` with the ones it queues.
 fun wakeAll(tasks : Vec Co.Coroutine) -> Unit {
     var n = 0
     for var i = 0; i < len(tasks); i = i + 1 {
@@ -270,7 +271,10 @@ fun waitOn(mutex : Ptr, done : fun() -> Bool, register : fun(Co.Coroutine) -> Un
         None -> while True {
             -- The task this stack ran last may have lost its permit (`afterCall`).
             if !Workers.permitHeld() { Workers.permitAwait(True) }
-            if holds(mutex, done) { return {} }
+            if holds(mutex, done) {
+                passOn()
+                return {}
+            }
             let seen = Workers.workSeen()
             match take() {
                 Some(c) -> {
@@ -310,13 +314,14 @@ fun holds(mutex : Ptr, done : fun() -> Bool) -> Bool {
     over
 }
 
--- Whether nothing is queued or running and nothing is registered with the
--- poller, so that no task can ever run again. A `settle` delivers events under
--- the poller's lock and then queues their tasks under this one, and between
--- the two neither shows them; it moves `settling` to odd before and back to
--- even after, so an answer is taken only from a look that no `settle`
--- overlapped. Waits end otherwise only by what a running task does.
+-- Returns whether nothing is queued or running and nothing is registered
+-- with the poller, so that no task can ever run again.
 fun stuck() -> Bool {
+    -- A `settle` delivers events under the poller's lock and then queues their
+    -- tasks under the queue's lock, and between the two neither shows them. It
+    -- moves `settling` to odd before and back to even after, so take an
+    -- answer only from a look that no `settle` overlapped. Waits end otherwise
+    -- only by what a running task does.
     while True {
         let before = Ptr.atomicLoad(settling, 0)
         if before % 2 == 0 {
@@ -388,15 +393,23 @@ fun poll() -> Unit {
 --
 -- A worker idle when `notify` woke one may be the one it woke, so it clears
 -- `looking` and looks at the queue once more, both on the way in and on the
--- way out. Each clearing is followed by a look -- here on the way in, by the
--- caller's `take` on the way out -- so a task queued while `looking` was set
--- is seen.
+-- way out. Each clearing is followed by a look, so a task queued while
+-- `looking` was set is seen: here on the way in, and on the way out by the
+-- caller, which either takes from the queue or, if it leaves without taking,
+-- calls `passOn`.
 fun idle(seen : Int) -> Unit {
     Workers.idleEnter()
     stopLooking()
     if Workers.queued() == 0 { wait(seen) }
     Workers.idleLeave()
     stopLooking()
+}
+
+-- Wakes an idle worker if tasks are queued, as `notify` does. Called by a
+-- worker that leaves without taking from the queue, which may be the one
+-- `notify` woke for them (`idle`).
+fun passOn() -> Unit {
+    if Workers.queued() > 0 { notify() }
 }
 
 fun stopLooking() -> Unit {
@@ -527,7 +540,10 @@ fun workerLoop() -> Unit {
 fun serve() -> Unit {
     var ran = 0
     while Workers.permitHeld() {
-        if Workers.permitWanted() && Workers.permitGive() { return {} }
+        if Workers.permitWanted() && Workers.permitGive() {
+            passOn()
+            return {}
+        }
         -- Before looking, so that a signal after the look ends its sleep
         -- (`Turkey.Workers.sleepForWork`).
         let seen = Workers.workSeen()
@@ -543,6 +559,7 @@ fun serve() -> Unit {
             None -> idle(seen)
         }
     }
+    passOn()
 }
 
 -- How many tasks a busy worker runs between looks for events (`poll`). A

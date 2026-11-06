@@ -425,35 +425,35 @@ fun endsInTailCall(block : Block Inst) -> Bool {
 }
 
 -- The callee-saved registers the colouring actually used, saved on the way in
--- and restored on the way out, two to an instruction where two share a file.
+-- and restored on the way out, a pair to an instruction (`Frame.savedPairs`).
 --
 -- They are addressed from `x29`, not `sp`. The area sits directly below the
--- frame record and holds at most eighteen registers, so it is never more than
--- 144 bytes below `x29`, which a pair's offset reaches whatever the frame's
--- size; from `sp` it would be as far up as the frame is big. `Frame.layout`
--- gives each file an even number of slots, so the pairs are 16-byte aligned
--- and the last general register, when the count is odd, has a slot of its own.
+-- frame record and holds at most nine pairs, so it is never more than 144
+-- bytes below `x29`, which a pair's offset reaches whatever the frame's size;
+-- from `sp` it would be as far up as the frame is big.
+--
+-- The order is compact unwind's frame mode: the pairs present, packed down
+-- from `x29 - 8`, each with its lower register at the higher address, so
+-- `stp x20, x19, [x29, #-16]` and then `stp x22, x21, [x29, #-32]`. That is
+-- the only layout an unwinder can read from one 32-bit encoding per
+-- function; any other needs a DWARF description of the function.
+--
+-- `x27`/`x28` is stored whole, for that shape, and only `x27` comes back:
+-- `x28` is the running worker (`A.worker`), which a coroutine resumed on
+-- another thread must not see restored to the first thread's.
 fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
-    var at = l.savesAt - l.recordAt
-    for var k = 0; k < len(l.savedGp); k = k + 2 {
-        let r = Physical(Gp, l.savedGp[k])
-        if k + 1 < len(l.savedGp) {
-            let s = Physical(Gp, l.savedGp[k + 1])
-            instruction(b, if saving { A.Stp(r, s, A.fp, at) }
-                           else { A.Ldp(r, s, A.fp, at) })
+    for var k = 0; k < len(l.pairs); k = k + 1 {
+        let (bank, first) = l.pairs[k]
+        let at = -16 * (k + 1)
+        let low = Physical(bank, first)
+        let high = Physical(bank, first + 1)
+        if saving {
+            instruction(b, A.Stp(high, low, A.fp, at))
+        } else if A.sameRegister(high, A.worker) {
+            instruction(b, A.Ldr(low, Offset(A.fp, at + 8), A.W64))
         } else {
-            instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
-                           else { A.Ldr(r, Offset(A.fp, at), A.W64) })
+            instruction(b, A.Ldp(high, low, A.fp, at))
         }
-        at = at + 16
-    }
-    -- One at a time: `Stp` and `Ldp` are the general file's, and a function
-    -- saving a `d` register is rare.
-    for n in l.savedFp {
-        let r = Physical(Fp, n)
-        instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
-                       else { A.Ldr(r, Offset(A.fp, at), A.W64) })
-        at = at + 8
     }
 }
 

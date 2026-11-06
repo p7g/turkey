@@ -640,13 +640,17 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- independently by threading a join scope. A pass that called a position a tail
 -- where the rule does not emits a jump with nowhere to go, and this is where
 -- that is caught.
--- Returns whether code the optimizer inlines into a module takes the span of
--- the call it replaces: in every module when allocations are counted by site,
--- and otherwise in the giblets, whose allocation check names the line.
-fun keepsCallSites() -> fun(String) -> Bool = match Env.get("TURKEY_ALLOC_SITES") {
-    Some(_) -> fun(_) = True
-    None -> Set.contains(Giblets.gibletModules(), _)
-}
+-- Returns whether code the optimizer inlines into a module records the call
+-- it replaces: in every module with `-g`, whose debug information shows the
+-- calls as frames, or when allocations are counted by site, and otherwise in
+-- the giblets, whose allocation check names the line.
+--
+-- Recording costs a copy of every inlined body, which is otherwise shared
+-- with the callee's. The code is the same either way: no reduction reads a
+-- span.
+fun keepsCallSites() -> fun(String) -> Bool =
+    if debugInfo || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
+    else { Set.contains(Giblets.gibletModules(), _) }
 
 -- Everything between the elaboration and the backend, in one place.
 --
@@ -868,6 +872,8 @@ type Made = Made {
     skipped    : String,
     complaints : Vec String,
     code       : Vec (Stream.Item Arm64.Inst),
+    -- With `-g`, the calls inlined into it, for its debug information.
+    inlined    : Vec Dwarf.Inlined,
     texts      : Array (Option String),
     cost       : Duration,
 }
@@ -887,19 +893,23 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     let a = Regalloc.allocate(f, frame.slots)
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
-                            texts = [], cost = Stopwatch.elapsed(started) }
+                            inlined = [], texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
-            let code = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, code)
+            let emitted = []
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, emitted)
+            let (code, inlined) = if debugInfo {
+                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, emitted,
+                                   Emit.functionEnd(asm.dialect, i))
+            } else { (emitted, []) }
             let texts = Array.map(outs, fun(o) = if o.apart {
                 let text = String.builder()
                 o.render(asm.dialect, Vec.slice(code, 0, len(code)), text)
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   texts = texts, cost = Stopwatch.elapsed(started) }
+                   inlined = inlined, texts = texts, cost = Stopwatch.elapsed(started) }
         }
     }
 }
@@ -996,6 +1006,8 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- Each function's frame layout is kept: the frame table is one section
     -- after the code, and its entries are those layouts' safepoint maps.
     let layouts = []
+    -- With `-g`, each laid-out function's inlined calls, beside its layout.
+    let inlinedCalls = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
@@ -1022,6 +1034,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 }
                 flush()
                 Vec.push(layouts, (i, l))
+                Vec.push(inlinedCalls, m.inlined)
             }
         }
         if timings { Vec.push(costs, (selected[i].name, m.cost)) }
@@ -1063,10 +1076,14 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         let textEnd = Asm.localLabel(asm.dialect, "text_end")
         Vec.push(code, Stream.Section(Asm.Text))
         Vec.push(code, Stream.Label(textEnd))
-        let functions = Vec.map(layouts, fun((i, _)) =
-            Dwarf.Subprogram { name = selected[i].name,
-                               low = Asm.symbolFor(asm.dialect, selected[i].name),
-                               high = Emit.functionEnd(asm.dialect, i) })
+        let functions = []
+        for var k = 0; k < len(layouts); k = k + 1 {
+            let (i, _) = layouts[k]
+            Vec.push(functions, Dwarf.Subprogram {
+                name = selected[i].name, low = Asm.symbolFor(asm.dialect, selected[i].name),
+                high = Emit.functionEnd(asm.dialect, i), inlined = inlinedCalls[k],
+            })
+        }
         Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {
             producer = "boot", name = path, directory = directory, low = textStart,
             high = textEnd, functions = functions,

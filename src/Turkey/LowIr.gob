@@ -4,7 +4,8 @@ export (
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
     checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
-    Builder(..), builder, here, into, emit, effect, terminate, block, param,
+    Builder(..), builder, Place, place, setPlace, setSpan, here, into, emit, effect,
+    terminate, block, param,
 )
 
 -- The virtual instruction set: what `Turkey.Ssa`'s graph is instantiated with
@@ -44,6 +45,7 @@ export (
 import Data.Map as Map
 import Turkey.Position as Position
 import Turkey.Runtime as Rt
+import Turkey.Source as Source
 import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
@@ -367,17 +369,46 @@ type Builder = Builder {
     -- it is recorded against every instruction that may allocate, and every
     -- string literal, since those are what the giblets check names
     -- (`Func.origins`).
-    var span : Option Span,
-    files    : Position.Cache,
+    --
+    -- Set through `setSpan` and `setPlace`, which keep `position` with it.
+    var span     : Option Span,
+    -- The packed position of `span`, or -1 until `here` has made it. Made once
+    -- per span rather than once per instruction, because a span inlined
+    -- through calls costs a lookup per call.
+    var position : Int,
+    -- The program's files, and the function's inline sites (`Func.sites`).
+    files        : Position.Cache,
 }
 
-fun builder(f : Ssa.Func Low, at : Ssa.BlockId, files : Position.Files) -> Builder =
-    Builder { func = f, at = at, span = None, files = Position.cache(files) }
+fun builder(f : Ssa.Func Low, at : Ssa.BlockId, files : Position.Files) -> Builder = Builder {
+    func = f, at = at, span = None, position = 0, files = Position.cache(files, f.sites),
+}
+
+-- The construct being lowered and its packed position, to put back after
+-- lowering another.
+type Place = Place { span : Option Span, position : Int }
+
+fun place(b : Builder) -> Place = Place { span = b.span, position = b.position }
+
+fun setPlace(b : Builder, p : Place) -> Unit {
+    b.span = p.span
+    b.position = p.position
+}
+
+fun setSpan(b : Builder, s : Option Span) -> Unit {
+    b.span = s
+    b.position = -1
+}
 
 -- Returns the packed position of the construct being lowered, or 0.
-fun here(b : Builder) -> Int = match b.span {
-    Some(s) -> Position.fromSpan(b.files, s)
-    None -> 0
+fun here(b : Builder) -> Int {
+    if b.position < 0 {
+        b.position = match b.span {
+            Some(s) -> Position.fromSpan(b.files, s)
+            None -> 0
+        }
+    }
+    b.position
 }
 
 fun isConstString(op : Op) -> Bool = match op {
@@ -401,8 +432,9 @@ fun emit(b : Builder, op : Op, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
     Vec.push(Ssa.blockAt(b.func, b.at).insts, low(v, op, here(b)))
     if effectsOf(op).allocates || isConstString(op) {
+        -- The function's own text, which is what a diagnostic names.
         match b.span {
-            Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), s)
+            Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), Source.outermost(s))
             None -> {}
         }
     }

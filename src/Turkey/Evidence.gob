@@ -1,15 +1,16 @@
-export (run, resolve, superPath)
+export (run)
 
--- Turning every recorded use into evidence.
+-- Reading out the evidence the solver produced, once solving is over.
 --
--- Resolution is entailment again, but constructive: where the solver's version
--- answers a `Bool`, this one answers the derivation that produced it.
--- Assumptions first, then the instance table -- the same order, and for the same
--- reason. An assumption is evidence the caller supplied, so preferring it is
--- what keeps a polymorphic function from silently committing to one instance.
+-- The solver fills a hole for each wanted class predicate as it discharges it
+-- (`Turkey.Solved.Hole`), so the evidence for a use is already decided: here
+-- the holes are read out into the immutable `Classes.Evidence` the lowering
+-- translates, as GHC zonks its mutable evidence bindings into immutable ones.
+-- Nothing here resolves a predicate, consults a given or reduces a family.
 --
--- The evidence *types* live in `Turkey.Classes`, because an instance holds the
--- plan that holds them; what is here is the algorithm alone.
+-- The one derivation left is an instance's superclass dictionaries, which no
+-- use asks for: `Classes.prove` builds them from the instance's context, the
+-- same entailment `Classes.checkInstance` accepted the instance with.
 
 import Turkey.Ast (InstanceDecl(..))
 import Turkey.Classes as Classes
@@ -17,9 +18,8 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        InstancePlan(..), Evidence(..))
 import Turkey.Decls as Decls
 import Turkey.Diag as Diag
-import Turkey.Inert as Inert
 import Turkey.Prelude as P
-import Turkey.Solved (Scope(..), Use(..), newScope, dictName)
+import Turkey.Solved (Use(..), Hole(..), Proof(..), dictName)
 import Turkey.Source (Span(..))
 import Turkey.Types as Ty
 import Turkey.Types (Pred(..), TBottom)
@@ -28,9 +28,29 @@ fun run(classes : ClassTable, uses : Vec Use) -> Unit {
     completeInstances(classes)
     for u in uses {
         u.method = Classes.method(classes, u.name)
-        u.evidence = Vec.map(u.preds, resolve(classes, _, u.scopes, u.span))
+        let evidence = Vec.new(len(u.holes))
+        for var i = 0; i < len(u.holes); i = i + 1 {
+            Vec.push(evidence, readOut(u.holes[i], fun() = u.preds[i], u.span))
+        }
+        u.evidence = evidence
     }
 }
+
+-- Returns the evidence in `hole`, with every hole below it read out too.
+-- `wanted` returns the predicate the hole is for, for the internal error an
+-- empty hole is.
+fun readOut(hole : Hole, wanted : fun() -> Pred, where : Option Span) -> Evidence =
+    match hole.proof {
+        Some(ByGiven(name, path, given)) -> FromDict(name, path, Some(given))
+        Some(ByInstance(inst, mapping, holes)) -> FromInstance(inst, mapping,
+            Array.init(len(holes), fun(i) = readOut(holes[i],
+                fun() = Classes.contextAt(inst, mapping)[i], where)))
+        Some(ByNothing(cls)) -> Absent(cls)
+        Some(Same(other)) -> readOut(other, wanted, where)
+        -- Solving finished without an error, so it discharged every wanted.
+        None -> oops("no evidence for '" + Ty.showPred(wanted()) + "', which solving "
+                     + "had already accepted", where)
+    }
 
 -- Fill in each instance's superclass dictionaries and default methods.
 --
@@ -75,16 +95,19 @@ fun completeInstances(classes : ClassTable) -> Unit {
                 None -> oops("instance '" + inst.cls
                              + "' was never given a plan", Some(inst.decl.span))
             }
-            let scope = newScope()
             let givens = Vec.new(len(plan.params))
             for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
                 Vec.push(givens, (plan.params[i], inst.context[i]))
             }
-            scope.givens = givens
-            let scopes = [scope]
             for sup in info.supers {
-                Map.put(plan.supers, sup.name, resolve(classes,
-                    Ty.pred(sup.name, [inst.head]), scopes, Some(inst.decl.span)))
+                let demand = Ty.pred(sup.name, [inst.head])
+                match Classes.prove(classes, givens, demand) {
+                    Some(ev) -> Map.put(plan.supers, sup.name, ev)
+                    -- `checkInstance` refused the instance, and with it the
+                    -- program, if its context does not imply this.
+                    None -> oops("no evidence for '" + Ty.showPred(demand) + "'",
+                                 Some(inst.decl.span))
+                }
             }
             for (name, _) in Map.entries(info.methods) {
                 if !Map.contains(plan.methods, name) {
@@ -94,85 +117,6 @@ fun completeInstances(classes : ClassTable) -> Unit {
                     }
                 }
             }
-        }
-    }
-}
-
-fun resolve(classes : ClassTable, p : Pred, scopes : Vec Scope,
-            where : Option Span) -> Evidence {
-    -- Normalized, not merely pruned: `Show (Elem (Array Int))` names an instance
-    -- only once the family has been reduced. This is the last place a family can
-    -- appear -- evidence is over types, and a family is not one until it is.
-    -- Under the givens in scope, as the solver's discharge is: a predicate a
-    -- given equality let solving accept has to be proved under it too.
-    let givens = Vec.new(8)
-    for scope in scopes {
-        for (_, g) in scope.givens { Vec.push(givens, g) }
-    }
-    let (inert, _) = Inert.extend(Inert.empty(classes),
-                                  Array.map(Vec.toArray(givens), Inert.given))
-    let target = Inert.rewrite(inert, p.args[0])
-    match target {
-        TBottom -> {
-            Inert.close(inert)
-            return Absent(p.name)
-        }
-        _ -> {}
-    }
-    let demand = Ty.pred(p.name, [target])
-    let key = Ty.predKey(demand)
-
-    -- A given is compared rewritten too, as the solver compares it: `Ord (Item
-    -- a)` is the dictionary for `Ord (Index.Value a)` under `Item a ~ Index.Value
-    -- a`.
-    for var i = len(scopes) - 1; i >= 0; i = i - 1 {
-        for (name, given) in scopes[i].givens {
-            if Classes.isClass(classes, given.name) {
-                let seen = Ty.pred(given.name, [Inert.rewrite(inert, given.args[0])])
-                match superPath(classes, seen, key, []) {
-                    Some(path) -> {
-                        Inert.close(inert)
-                        return FromDict(name, path, Some(given))
-                    }
-                    None -> {}
-                }
-            }
-        }
-    }
-    Inert.close(inert)
-
-    for inst in Map.getOr(classes.instances, demand.name, []) {
-        match Classes.match_(inst.head, target) {
-            None -> {}
-            Some(mapping) -> return FromInstance(inst,
-                Array.map(inst.context, fun(q) = resolve(classes,
-                    Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)]),
-                    scopes, where)))
-        }
-    }
-
-    -- Solving proved this predicate; failing to reconstruct *why* would be a bug
-    -- in one of the two, so say so rather than reporting it as the program's
-    -- fault.
-    oops("no evidence for '" + Ty.showPred(demand)
-         + "', which solving had already accepted", where)
-}
-
--- How to reach a predicate from a given one by selecting superclasses.
-fun superPath(classes : ClassTable, given : Pred, key : String,
-              path : Array String) -> Option (Array String) {
-    if Ty.predKey(given) == key { return Some(path) }
-    match Map.get(classes.classes, given.name) {
-        None -> None
-        Some(info) -> {
-            for sup in info.supers {
-                match superPath(classes, Ty.pred(sup.name, given.args), key,
-                                Array.append(path, [sup.name])) {
-                    Some(found) -> return Some(found)
-                    None -> {}
-                }
-            }
-            None
         }
     }
 }

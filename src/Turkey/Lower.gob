@@ -64,7 +64,6 @@ import Turkey.Core as Cr
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
-import Turkey.Inert as Inert
 import Turkey.Match as Match
 import Turkey.Prelude as P
 import Turkey.Prims as Prims
@@ -576,6 +575,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
             }
             let b = newBind(owner, name, id, body.ty, binders, body, Some(stmt.span))
             b.mutable = mutable
+            b.equations = equationsOf(s)
             return [b]
         }
         _ -> {}
@@ -971,7 +971,7 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
         if len(u.evidence) == 0 { return [] }
         let givens = givensOf(l, u)
         let count = fewer(len(u.evidence), len(u.preds))
-        Array.init(count, fun(i) = evidence(l, u.evidence[i], wantAt(l, u, i), givens))
+        Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]), givens))
     }
 }
 
@@ -991,7 +991,7 @@ fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
     }
     let givens = givensOf(l, u)
     let count = fewer(len(u.evidence), len(u.preds))
-    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], wantAt(l, u, i), givens)))
+    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]), givens)))
 }
 
 -- The constructor as Core applies it: dictionaries, then fields.
@@ -1240,7 +1240,7 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
         }
         out
     }
-    FromInstance(inst, args) -> instanceRef(l, inst, want, args)
+    FromInstance(inst, mapping, args) -> instanceRef(l, inst, mapping, args)
     -- The predicate's argument is bottom: there is no value here, so there is no
     -- dictionary to find. `error` diverges and so has whatever type its context
     -- wants.
@@ -1249,22 +1249,14 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
         [node(Ty.tString(), None, CLit(LString("no evidence for " + name)))]))
 }
 
--- A reference to an instance's dictionary, at the types it was selected at and
--- applied to the evidence for its own context.
---
--- The types are not recorded on the evidence -- it names the instance, not the
--- match that chose it -- so they are recovered the way instance selection
--- recovered them in the first place: by matching the head against the dictionary
--- type wanted here. It is the same one-way match, which is what makes this the
--- *same* answer rather than a second opinion.
-fun instanceRef(l : Lowerer, inst : InstInfo, want : Ty.Type,
+-- A reference to an instance's dictionary, at the match `mapping` the solver
+-- selected it by, applied to the evidence for its own context.
+fun instanceRef(l : Lowerer, inst : InstInfo, matched : Map Int Ty.Type,
                 args : Array Evidence) -> Core {
-    let head = dictArg(want)
-    let mapping = match Classes.match_(inst.head, head) {
-        Some(m) -> m
-        None -> oops("instance " + inst.cls + " does not cover " + Ty.show(want),
-                     Some(inst.decl.span))
-    }
+    -- The types the match recorded are read now that solving is over.
+    let mapping = Map.new()
+    for (id, t) in Map.entries(matched) { Map.put(mapping, id, resolved(l, t)) }
+    let head = Decls.substitute(inst.head, mapping)
     let binders = instanceBinders(inst)
     let typeArgs = Array.map(binders, fun(b) = Map.getOr(mapping, b.id, TVar(b)))
     let result = dictType(l, inst.cls, head)
@@ -1279,10 +1271,10 @@ fun instanceRef(l : Lowerer, inst : InstInfo, want : Ty.Type,
     let count = fewer(len(args), len(inst.context))
     let argTerms = Array.init(count, fun(i) {
         let p = inst.context[i]
-        let at = Decls.substitute(p.args[0], mapping)
+        let want = Decls.substitute(p.args[0], mapping)
         -- No givens: an instance's context arrives as its own parameters, which
         -- `instanceGivens` supplies where those are in scope.
-        evidence(l, args[i], dictType(l, p.name, resolved(l, at)), Map.new())
+        evidence(l, args[i], dictType(l, p.name, want), Map.new())
     })
     fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
@@ -1312,29 +1304,6 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
         let p = inst.context[i]
         Map.put(out, plan.params[i], dictType(l, p.name, p.args[0]))
     }
-    out
-}
-
--- The dictionary type the `i`th predicate of `u` needs. An instance found for it
--- was found under the equalities in `u`'s scopes, so its type is rewritten by
--- them: `Add (Field.pos a)` is `Add Int` under `Field.pos a ~ Int`.
-fun wantAt(l : Lowerer, u : Use, i : Int) -> Ty.Type {
-    let want = predType(l, u.preds[i])
-    match u.evidence[i] {
-        FromInstance(_, _) -> {}
-        _ -> return want
-    }
-    let equalities = Vec.new(2)
-    for sc in u.scopes {
-        for (_, p) in sc.givens {
-            if p.name == Ty.equals { Vec.push(equalities, p) }
-        }
-    }
-    if len(equalities) == 0 { return want }
-    let (inert, _) = Inert.extend(Inert.empty(l.classes),
-                                  Array.map(Vec.toArray(equalities), Inert.given))
-    let out = Inert.rewrite(inert, want)
-    Inert.close(inert)
     out
 }
 
@@ -1805,7 +1774,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
     }
     let givens = givensOf(l, use)
     let count = fewer(len(use.evidence), len(use.preds))
-    var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i], wantAt(l, use, i),
+    var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i], predType(l, use.preds[i]),
                                                     givens))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`

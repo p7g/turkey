@@ -50,16 +50,15 @@ import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Core (..)
 import Turkey.Core as Cr
-import Turkey.Coretc as Coretc
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ForeignInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Methods as Methods
 import Turkey.Opt as Opt
 import Turkey.Deps as Deps
 import Turkey.Runtime as Rt
 import Turkey.Source (Span(..))
-import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), TVar, TCon, TApp, TFam, TFun,
                      TTuple, TSet, TBottom)
@@ -289,7 +288,7 @@ type Rewriter = Rewriter {
     owner      : Mono,
     subst      : Map Int Ty.Type,
     equations  : Vec (Ty.Type, Ty.Type),
-    fams       : Ty.Families,
+    inert      : Inert.Inert,
     var rename : Map Ref String,
     -- A local that is nothing but another name for a top-level dictionary,
     -- by the reference that reads it in the output. An instance's own method
@@ -323,7 +322,7 @@ fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
     })
     Rewriter {
         owner = owner, subst = subst, equations = eqs,
-        fams = Coretc.famsOf(owner.classes, eqs),
+        inert = Inert.ofEquations(owner.classes, eqs),
         rename = Map.new(), aliases = Map.new(), locals = locals,
         copyInto = copyInto, ids = ids,
     }
@@ -389,7 +388,7 @@ fun refId(r : Rewriter, id : Int) -> Int = Map.getOr(r.ids, id, id)
 -- them would be a second opinion where the milestone wants none.
 fun rTy(r : Rewriter, t : Ty.Type) -> Ty.Type {
     if len(Map.keys(r.subst)) == 0 { return t }
-    Typed.reduceDeep(Decls.substitute(t, r.subst), Some(r.fams))
+    Inert.rewrite(r.inert, Decls.substitute(t, r.subst))
 }
 
 fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
@@ -1046,16 +1045,16 @@ fun promotedBinders(b : CBind, dicts : Option (Vec String)) -> Vec VarCell {
 -- reach it only if *every* such place remembered, and one pass is a thing that
 -- can be true rather than a rule five writers have to keep.
 fun reduceTypes(program : CProgram, classes : ClassTable) -> CProgram {
-    let fams = Some(Coretc.famsOf(classes, []))
+    let instances = Inert.empty(classes)
     CProgram {
-        dicts = Vec.map(program.dicts, reduceBind(_, fams)),
-        binds = Vec.map(program.binds, reduceBind(_, fams)),
+        dicts = Vec.map(program.dicts, reduceBind(_, instances)),
+        binds = Vec.map(program.binds, reduceBind(_, instances)),
     }
 }
 
-fun reduceBind(b : CBind, fams : Option Ty.Families) -> CBind {
-    let out = rewriteValue(b, reduceCore(b.value, fams))
-    out.ty = Typed.reduceDeep(b.ty, fams)
+fun reduceBind(b : CBind, instances : Inert.Inert) -> CBind {
+    let out = rewriteValue(b, reduceCore(b.value, instances))
+    out.ty = Inert.rewrite(instances, b.ty)
     out
 }
 
@@ -1065,11 +1064,11 @@ fun rewriteValue(b : CBind, value : Core) -> CBind = CBind {
     equations = b.equations, layouts = b.layouts,
 }
 
-fun reduceCore(e : Core, fams : Option Ty.Families) -> Core =
-    mkCore(Typed.reduceDeep(e.ty, fams), e.span, mapKind(e.kind, Mapper {
-        expr = fun(x) = reduceCore(x, fams),
-        type_ = fun(t) = Typed.reduceDeep(t, fams),
-        bind = fun(b) = reduceBind(b, fams),
+fun reduceCore(e : Core, instances : Inert.Inert) -> Core =
+    mkCore(Inert.rewrite(instances, e.ty), e.span, mapKind(e.kind, Mapper {
+        expr = fun(x) = reduceCore(x, instances),
+        type_ = fun(t) = Inert.rewrite(instances, t),
+        bind = fun(b) = reduceBind(b, instances),
     }))
 
 -- The bindings holding an existential arm `Turkey.Layout` did not copy.

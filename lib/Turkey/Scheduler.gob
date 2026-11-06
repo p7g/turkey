@@ -288,6 +288,26 @@ fun wakeAll(tasks : Vec Co.Coroutine) -> Unit {
     if n > 1 || placed < n { notify() }
 }
 
+-- EXPERIMENT: TURKEY_SETTLEGLOBAL=1 queues the tasks a poll wakes on the global queue.
+var settleGlobal : Bool = !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_SETTLEGLOBAL")))
+
+fun wakeAllGlobal(tasks : Vec Co.Coroutine) -> Unit {
+    var n = 0
+    for var i = 0; i < len(tasks); i = i + 1 {
+        if claim(tasks[i]) {
+            tasks[n] = tasks[i]
+            n = n + 1
+        }
+    }
+    if n == 0 { return {} }
+    let _ = Workers.tasksAdd(n, 0)
+    Workers.acquire(queueLock)
+    for var i = 0; i < n; i = i + 1 { Vec.push(runnable, tasks[i]) }
+    let _ = Ptr.atomicAdd(globalCount, 0, n)
+    Lock.release(queueLock)
+    notify()
+}
+
 -- The next coroutine on the global queue, counted as running until `run`
 -- has seen it suspend. Under the global queue's lock.
 fun next() -> Option Co.Coroutine {
@@ -610,7 +630,7 @@ fun settle(n : Int) -> Unit {
     let tasks = Poll.takeWoken()
     Poll.unlock()
     if ended > 0 {
-        wakeAll(tasks)
+        if settleGlobal { wakeAllGlobal(tasks) } else { wakeAll(tasks) }
         changed()
     }
     let _ = Ptr.atomicAdd(settling, 0, 1)

@@ -528,12 +528,8 @@ fun waitOn(mutex : Ptr, done : fun() -> Bool, register : fun(Co.Coroutine) -> Un
                     if more() { notify() }
                     run(c)
                     ran = ran + 1
-                    if ran == pollEvery {
-                        ran = 0
-                        poll(True)
-                    } else if pollEach {
-                        poll(True)
-                    }
+                    if ran % pollEvery == 0 { poll(True) }
+                    if ran == globalEvery { ran = 0 }
                 }
                 None -> {
                     Ptr.atomicStore(programWaits, 0, 1)
@@ -835,10 +831,8 @@ fun serve() -> Unit {
                 if more() { notify() }
                 run(c)
                 ran = ran + 1
-                if ran == pollEvery {
-                    ran = 0
-                    poll(True)
-                }
+                if ran % pollEvery == 0 { poll(True) }
+                if ran == globalEvery { ran = 0 }
             }
             None -> {
                 idle(seen)
@@ -856,7 +850,23 @@ fun serve() -> Unit {
 -- bounds an event's delay only while every worker is busy. A look after
 -- every task would cost most of a system call for each request a server
 -- answers, most of them finding nothing. 61 was not chosen by measurement.
-let pollEvery = 61
+-- EXPERIMENT: TURKEY_POLLEVERY overrides it.
+var pollEvery : Int = envCount(Prim.cString("TURKEY_POLLEVERY"), 61)
 
--- EXPERIMENT: TURKEY_POLLEACH=1 has the program's own stack poll after every task.
-var pollEach : Bool = !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_POLLEACH")))
+-- How many tasks a thread runs between looks at the global queue and the
+-- stalled permits' queues before its own (`findWork`).
+let globalEvery = 61
+
+fun envCount(name : Ptr, otherwise : Int) -> Int {
+    let text = Libc.getenv(name)
+    if Ptr.isNull(text) { return otherwise }
+    var n = 0
+    var at = 0
+    while True {
+        let digit = Byte.toInt(Ptr.load(text, at)) - 48
+        if digit < 0 || digit > 9 { break }
+        n = n * 10 + digit
+        at = at + 1
+    }
+    if n < 1 { 1 } else { n }
+}

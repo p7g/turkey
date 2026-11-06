@@ -51,16 +51,24 @@ export (
 --
 -- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
 -- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
--- carries the skolems, so the implication's level is that `CLet`'s rank.
+-- carries the skolems, so the implication's level is that `CLet`'s rank. Two
+-- rules hold of it:
 --
--- Its body is solved against its givens to a *residual*, the predicates
--- `settle` leaves deferred when the `CLet` generalizes. A residual predicate
--- over variables of the implication's own rank is reported by the split,
--- because no scheme of a signature carries it. One over an outer variable
--- floats to the enclosing scope, unless it mentions one of the skolems:
--- then it is reported where it arose (`confine`). So no predicate that
--- mentions a skolem outlives the skolem's scope, and no outer variable is
--- ever bound to a type built from one.
+-- * Its body is solved against its givens to a *residual*, the predicates
+--   `settle` leaves deferred when the `CLet` generalizes. A residual predicate
+--   over variables of the implication's own rank is reported by the split,
+--   because no scheme of a signature carries it. One over an outer variable
+--   floats to the enclosing scope, unless it mentions one of the skolems:
+--   then it is reported where it arose (`confine`). So no predicate that
+--   mentions a skolem outlives the skolem's scope, and no outer variable is
+--   ever bound to a type built from one.
+-- * While an equality given is in scope, a variable born outside the
+--   implication is *untouchable*: `Ty.unify` does not bind it, and defers the
+--   equation instead, which then floats out with the residual. A given such
+--   as `F b ~ Int` admits more than one solution for an outer `x` in
+--   `x ~ Int` -- `Int` and `F b` both fit -- and choosing one would be a
+--   guess the enclosing scope never sees (OutsideIn(X), Example 5.1). Class
+--   givens add no such choice, so they leave every variable touchable.
 --
 -- An associated family makes an *equation* deferrable, and it comes back as the
 -- equality predicate `~`, which is why there is one queue here rather than
@@ -241,6 +249,10 @@ type Solver = Solver {
     -- Predicates a `CAssume` currently grants. A stack in effect, restored on
     -- the way out of each one.
     var assumptions : Vec Pred,
+    -- The highest rank whose variables are untouchable: the rank a `CAssume`
+    -- with an equality among its givens was entered at, or `Ty.noScope` when
+    -- no such given is in scope. Restored on the way out of each `CAssume`.
+    var untouchable : Int,
     -- The dictionary scopes open at the point being solved, innermost last. A
     -- `Use` keeps the records rather than their contents, because what a binder
     -- makes available is only known once its definition is solved.
@@ -256,7 +268,8 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        assumptions = Vec.new(4), scopes = Vec.new(4), uses = Vec.new(16),
+        assumptions = Vec.new(4), untouchable = Ty.noScope,
+        scopes = Vec.new(4), uses = Vec.new(16),
         pools = [Vec.new(8)], deferred = Vec.new(8),
     }
 
@@ -266,6 +279,7 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
 fun families(s : Solver) -> Option Ty.Families = Some(Ty.Families {
     reduce = fun(t) = reduceFam(s, t),
     defer = fun(a, b, sp, ctx) = defer(s, a, b, sp, ctx),
+    untouchable = s.untouchable,
 })
 
 -- -- ranks -------------------------------------------------------------------------
@@ -423,12 +437,19 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     }
     CAssume(givens, body) -> {
         let saved = Vec.slice(s.assumptions, 0, len(s.assumptions))
-        for (_, p) in givens { Vec.push(s.assumptions, p) }
+        let savedUntouchable = s.untouchable
+        for (_, p) in givens {
+            Vec.push(s.assumptions, p)
+            if p.name == Ty.equals && rank(s) > s.untouchable {
+                s.untouchable = rank(s)
+            }
+        }
         let assumed = newScope()
         assumed.givens = givens
         Vec.push(s.scopes, assumed)
         solve(s, body)
         s.assumptions = saved
+        s.untouchable = savedUntouchable
         discard(Vec.pop(s.scopes))
     }
     CDef(binds, body, top) -> {

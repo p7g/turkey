@@ -736,14 +736,19 @@ fun prune(t : Type) -> Type = match t {
 --
 -- Two operations, and deliberately no more: reduce a family application if the
 -- instance table decides it, and take an equation that cannot yet be decided.
--- A record of two closures rather than an interface, which is also how this
--- compiler's module DAG is kept acyclic -- the solver knows about types, and
--- types know nothing about the solver.
+-- Beside them, the levels whose variables must not be bound. A record of
+-- closures rather than an interface, which is also how this compiler's module
+-- DAG is kept acyclic -- the solver knows about types, and types know nothing
+-- about the solver.
 type Families = Families {
     -- The family application's definition, or `None` if no instance decides it.
-    reduce : fun(Type) -> Option Type,
+    reduce      : fun(Type) -> Option Type,
     -- Put `a ~ b` back on the queue: neither solvable nor false, yet.
-    defer  : fun(Type, Type, Option Span, String) -> Unit,
+    defer       : fun(Type, Type, Option Span, String) -> Unit,
+    -- The highest level of an *untouchable* variable: `unify` binds no
+    -- variable at this level or below, and defers an equation that would
+    -- instead. `noScope` makes every variable touchable.
+    untouchable : Int,
 }
 
 -- Prune, then reduce family applications at the head until one sticks.
@@ -939,6 +944,21 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
 
     match x {
         TVar(cell) -> {
+            if untouchable(cell, fams) {
+                -- Bind the other side instead, if it may be bound: an
+                -- untouchable variable is still a fine *value* for a younger
+                -- one.
+                match y {
+                    TVar(other) -> if !untouchable(other, fams) {
+                        return unify(y, x, where, context, fams)
+                    }
+                    _ -> {}
+                }
+                return match fams {
+                    Some(f) -> f.defer(x, y, where, context)
+                    None -> {}
+                }
+            }
             match escaping(cell, y) {
                 Some(out) -> match openedEscape(y, out, cell.level) {
                     Some(opener) -> return typeError("the type '" + out + "' hidden by '"
@@ -1021,6 +1041,13 @@ fun unifyRest(x : Type, y : Type, where : Option Span, context : String,
         None -> mismatch(x, y, where, context)
         Some(f) -> f.defer(x, y, where, context)
     }
+}
+
+-- Returns whether `fams` forbids binding `cell`. Without a reducer nothing is
+-- being solved, so nothing is untouchable.
+fun untouchable(cell : VarCell, fams : Option Families) -> Bool = match fams {
+    Some(f) -> cell.level <= f.untouchable
+    None -> False
 }
 
 fun isFam(t : Type) -> Bool = match t {

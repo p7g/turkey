@@ -2,7 +2,7 @@ export (
     Kind(..), KCell(..),
     kstar, kvar, kprune, unifyKinds, defaultKind, kindArrow, showKind,
     VarCell(..), ConCell(..), Type(..), Fresh, tcon, skolemCon,
-    noScope, ground, equals,
+    noScope, ground, unranked, equals,
     newVar, freshVar, tvar,
     shortName, qualify, qualifyAll, clearQualified, display,
     tInt, tByte, tFloat, tString, tChar, tBool, tUnit,
@@ -18,7 +18,7 @@ export (
     Scheme(..), mono, scheme,
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
-    skolemsOf, markOpened, clearOpened,
+    skolemsOf, markOpened, openedBy, clearOpened,
     unify, join, generalize, instantiate, instantiateQual, typeError,
     typeKey, sameType, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
@@ -197,9 +197,9 @@ type ConCell = ConCell {
     kind      : Kind,
     var level : Int,
     -- 0 for a real constructor and unique to each *skolem*. A skolem's name is
-    -- unique only within its scope and its level is lifted when the scope ends,
-    -- so without it two signatures' `s` compare equal by name and level, and
-    -- a wanted rule over one fires inside the other.
+    -- unique only within its scope, and two sibling scopes stamp their skolems
+    -- with the same rank, so without it two signatures' `s` compare equal by
+    -- name and level, and a wanted rule over one fires inside the other.
     uid       : Int,
 }
 
@@ -255,6 +255,11 @@ let noScope = 0 - 1
 -- A predicate mentioning no variables can be settled anywhere.
 let ground = 1073741824
 
+-- The level of a variable a pass after solving makes, to carry a solved type
+-- through a unification. Above every rank, so no skolem that type mentions
+-- counts as escaping into it.
+let unranked = ground
+
 -- The name of the equality predicate. It lives here, with
 -- `Pred`, because a scheme carries it like any other; it is deliberately not a
 -- class name, which is what keeps it erased.
@@ -279,6 +284,10 @@ let opened = Opened { names = Map.new() }
 
 fun markOpened(uid : Int, constructor : String) -> Unit =
     Map.put(opened.names, uid, constructor)
+
+-- Returns the constructor whose pattern opened the skolem `c`, or `None` if a
+-- signature made it.
+fun openedBy(c : ConCell) -> Option String = Map.get(opened.names, c.uid)
 
 fun clearOpened() -> Unit {
     opened.names = Map.new()
@@ -727,14 +736,19 @@ fun prune(t : Type) -> Type = match t {
 --
 -- Two operations, and deliberately no more: reduce a family application if the
 -- instance table decides it, and take an equation that cannot yet be decided.
--- A record of two closures rather than an interface, which is also how this
--- compiler's module DAG is kept acyclic -- the solver knows about types, and
--- types know nothing about the solver.
+-- Beside them, the levels whose variables must not be bound. A record of
+-- closures rather than an interface, which is also how this compiler's module
+-- DAG is kept acyclic -- the solver knows about types, and types know nothing
+-- about the solver.
 type Families = Families {
     -- The family application's definition, or `None` if no instance decides it.
-    reduce : fun(Type) -> Option Type,
+    reduce      : fun(Type) -> Option Type,
     -- Put `a ~ b` back on the queue: neither solvable nor false, yet.
-    defer  : fun(Type, Type, Option Span, String) -> Unit,
+    defer       : fun(Type, Type, Option Span, String) -> Unit,
+    -- The highest level of an *untouchable* variable: `unify` binds no
+    -- variable at this level or below, and defers an equation that would
+    -- instead. `noScope` makes every variable touchable.
+    untouchable : Int,
 }
 
 -- Prune, then reduce family applications at the head until one sticks.
@@ -809,19 +823,7 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
     _ -> False
 }
 
--- The first skolem in `t` that outlives `var`, if there is one.
---
--- A signature's variable becomes a rigid constructor for the length of the body,
--- standing for a type the *caller* picks. So it means something only inside the
--- binder that made it. Letting it bind a variable born outside would state that
--- some type out there is equal to a type the callee never gets to see -- the
--- escape that makes a checked signature unsound rather than merely unchecked.
---
--- Ranks already say this exactly, which is why the test is one comparison: the
--- skolem carries the rank of its binder, `var` carries its own, and a skolem
--- younger than the variable it would bind is out of scope. Run before
--- `occursAndAdjust`, which lowers levels and would erase the evidence.
--- The rigid constants reachable from `types`, first occurrence first.
+-- Returns the rigid constants reachable from `types`, first occurrence first.
 fun skolemsOf(types : Array Type) -> Vec ConCell {
     let out = Vec.new(2)
     let seen = Set.new()
@@ -853,7 +855,7 @@ fun skolemsInto(t : Type, out : Vec ConCell, seen : Set.Set Int) -> Unit =
 fun openedEscape(t : Type, name : String, level : Int) -> Option String {
     for c in skolemsOf([t]) {
         if c.name == name && c.level > level {
-            match Map.get(opened.names, c.uid) {
+            match openedBy(c) {
                 Some(constructor) -> return Some(constructor)
                 None -> {}
             }
@@ -862,6 +864,21 @@ fun openedEscape(t : Type, name : String, level : Int) -> Option String {
     None
 }
 
+-- Returns the name of the first skolem in `t` that outlives `slot`, if there
+-- is one.
+--
+-- A signature's variable becomes a rigid constructor for the length of the body,
+-- standing for a type the *caller* picks. So it means something only inside the
+-- binder that made it. Letting it bind a variable born outside would state that
+-- some type out there is equal to a type the callee never gets to see -- the
+-- escape that makes a checked signature unsound rather than merely unchecked.
+--
+-- Ranks already say this exactly, which is why the test is one comparison: the
+-- skolem carries the rank of its binder, `slot` carries its own, and a skolem
+-- younger than the variable it would bind is out of scope. A skolem keeps its
+-- rank after its binder is solved, so the test holds for an equation solved
+-- later too. Run before `occursAndAdjust`, which lowers levels and would erase
+-- the evidence.
 fun escaping(slot : VarCell, t : Type) -> Option String = match prune(t) {
     TCon(c) -> if c.level > slot.level { Some(c.name) } else { None }
     TApp(fn, arg, _) -> firstOf(escaping(slot, fn), escaping(slot, arg))
@@ -927,6 +944,16 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
 
     match x {
         TVar(cell) -> {
+            -- Bind the other side instead, if it may be bound: an untouchable
+            -- variable is still a fine *value* for a younger one.
+            if untouchable(cell, fams) {
+                match y {
+                    TVar(other) -> if !untouchable(other, fams) {
+                        return unify(y, x, where, context, fams)
+                    }
+                    _ -> {}
+                }
+            }
             match escaping(cell, y) {
                 Some(out) -> match openedEscape(y, out, cell.level) {
                     Some(opener) -> return typeError("the type '" + out + "' hidden by '"
@@ -949,6 +976,19 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                                  + " = " + showAt(y, n, 0) + "'", where)
             }
             if !unifyKinds(cell.kind, kindOf(y)) { return kindMismatch(x, y, where) }
+            -- An untouchable variable is not bound, but the equation is
+            -- deferred only after every check a binding would make. The
+            -- occurs check above has already lowered the levels in `y` to
+            -- `cell`'s, as a binding would: the equation belongs to `cell`'s
+            -- scope, and a variable it mentions that stayed at a deeper rank
+            -- would be generalized there, and then bound when the equation is
+            -- solved outside.
+            if untouchable(cell, fams) {
+                return match fams {
+                    Some(f) -> f.defer(x, y, where, context)
+                    None -> {}
+                }
+            }
             cell.ref = Some(y)
             return {}
         }
@@ -960,10 +1000,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
     }
 
     match (x, y) {
-        -- Levels distinguish two skolems that happen to share a name: a nested
+        -- `uid` distinguishes two skolems that happen to share a name: a nested
         -- signature may write `a` too, and those two are not the same type.
         (TCon(c1), TCon(c2)) ->
-            if c1.name != c2.name || c1.level != c2.level {
+            if c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid {
                 mismatch(x, y, where, context)
             }
         -- Decomposing an application is sound only because there are no
@@ -1009,6 +1049,13 @@ fun unifyRest(x : Type, y : Type, where : Option Span, context : String,
         None -> mismatch(x, y, where, context)
         Some(f) -> f.defer(x, y, where, context)
     }
+}
+
+-- Returns whether `fams` forbids binding `cell`. Without a reducer nothing is
+-- being solved, so nothing is untouchable.
+fun untouchable(cell : VarCell, fams : Option Families) -> Bool = match fams {
+    Some(f) -> cell.level <= f.untouchable
+    None -> False
 }
 
 fun isFam(t : Type) -> Bool = match t {

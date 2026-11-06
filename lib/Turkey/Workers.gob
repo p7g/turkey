@@ -4,7 +4,7 @@ export (
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
     permits, permitsSet, permitHeld, permitWanted, permitGive, permitAwait,
-    queuedSet, idleEnter, idleLeave,
+    queuedSet, queued, idlers, idleEnter, idleLeave,
     monitorStart, monitoring, monitorState, monitorCalling, monitorWork, monitorHold, monitorTake,
     monitorHandOut, monitorSleep,
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
@@ -630,9 +630,14 @@ fun spareWake() -> Unit {
     }
 }
 
--- The scheduler's count of runnable tasks, which the monitor reads without
--- its lock. Under the scheduler's lock.
+-- The scheduler's count of runnable tasks, which the monitor and idle workers
+-- read without its lock. Set under the queue's lock (`Turkey.Scheduler`).
 fun queuedSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, queuedAt, n)
+
+fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt)
+
+-- How many holders are idle, between `idleEnter` and `idleLeave`.
+fun idlers() -> Int = Ptr.atomicLoad(permitWords, idlersAt)
 
 -- A holder with nothing to run is about to wait for work, and is back.
 fun idleEnter() -> Unit {
@@ -760,7 +765,7 @@ fun allIdle() -> Bool =
 -- the claim (`claim`) across them and across reading the results back
 -- (`resultToken`, `resultValue`), and gives it up with `release`. Registering
 -- and dropping interest are safe from any worker, one at a time: they share
--- one buffer (`changesAt`), and every caller holds the scheduler's lock
+-- one buffer (`changesAt`), and every caller holds the poller's lock
 -- (`Turkey.Poll`). `wakePoller`, which needs no lock, makes its own.
 --
 -- **Two kinds of registration.** `pollRegister` registers a descriptor for the
@@ -1223,10 +1228,8 @@ fun claim() -> Bool = Ptr.atomicCas(signals, claimedAt, 0, 1) == 0
 fun release() -> Unit = Ptr.atomicStore(signals, claimedAt, 0)
 
 -- Registrations and timers the scheduler is waiting on, `n` more (or fewer,
--- negative).
-fun interestAdd(n : Int) -> Unit {
-    let _ = Ptr.atomicAdd(signals, interestAt, n)
-}
+-- negative). Returns the count before.
+fun interestAdd(n : Int) -> Int = Ptr.atomicAdd(signals, interestAt, n)
 
 fun interest() -> Int = Ptr.atomicLoad(signals, interestAt)
 

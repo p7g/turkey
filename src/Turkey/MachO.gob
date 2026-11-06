@@ -23,6 +23,15 @@ export (objectFile)
 -- address would cut every function after its first call. The table is
 -- ordered locals, then exported, then undefined, as `LC_DYSYMTAB` describes
 -- it, and the last two by name.
+--
+-- **Debug sections.** An address in a debug section relocates against its
+-- target's section, a named symbol's as well as a temporary label's, with the
+-- address in the object stored in the field: a debugger reads the DWARF in
+-- an object without applying relocations, so the field must already hold
+-- the address. An offset from one debug section into another is never
+-- relocated at all. ld64 does not link debug sections; it leaves them in the
+-- object and points the executable's debug map at it, so an offset in the
+-- object is the offset a debugger reads.
 
 import Data.Set as Set
 import Turkey.Asm as Asm
@@ -57,6 +66,9 @@ fun names(kind : Asm.Section) -> (String, String, Int) = match kind {
     Asm.DebugInfo -> ("__DWARF", "__debug_info", 0x02000000)
     Asm.DebugStr -> ("__DWARF", "__debug_str", 0x02000000)
     Asm.DebugLine -> ("__DWARF", "__debug_line", 0x02000000)
+    Asm.DebugLineStr -> ("__DWARF", "__debug_line_str", 0x02000000)
+    Asm.DebugAddr -> ("__DWARF", "__debug_addr", 0x02000000)
+    Asm.DebugRnglists -> ("__DWARF", "__debug_rnglists", 0x02000000)
 }
 
 -- A symbol's place in the table and what goes in its entry.
@@ -77,11 +89,12 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
                    + dysymtabSize
     let contents = headerSize + commands
     -- Relocations after the contents, each section's together.
+    let relocations = Array.map(sections, fun(s) = Vec.filter(s.relocations, relocated))
     let relocationsAt = Array.filled(count, 0)
     var at = alignUp(contents + size, 8)
     for var k = 0; k < count; k = k + 1 {
         relocationsAt[k] = at
-        at = at + 8 * len(sections[k].relocations)
+        at = at + 8 * len(relocations[k])
     }
     let (entries, locals, exported) = symbols(obj, addresses)
     let indices = Map.new()
@@ -130,8 +143,8 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
         le(out, 8, len(s.bytes))
         le(out, 4, contents + addresses[k])
         le(out, 4, s.align)
-        le(out, 4, if len(s.relocations) == 0 { 0 } else { relocationsAt[k] })
-        le(out, 4, len(s.relocations))
+        le(out, 4, if len(relocations[k]) == 0 { 0 } else { relocationsAt[k] })
+        le(out, 4, len(relocations[k]))
         le(out, 4, flags)
         le(out, 4, 0)
         le(out, 4, 0)
@@ -168,13 +181,25 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
     }
     let definitions = Map.new()
     for d in obj.defined { Map.put(definitions, Asm.spell(d.symbol), d) }
-    pad(out, relocationsAt[0])
     for var k = 0; k < count; k = k + 1 {
         for r in sections[k].relocations {
+            if let Offset32 = r.use {
+                match Map.get(definitions, Asm.spell(r.target)) {
+                    Some(d) -> Byte.putLE(out, contents + addresses[k] + r.offset, 4, d.offset)
+                    None -> error("internal error: the section offset of "
+                                  + Asm.spell(r.target) + " has no definition")
+                }
+            }
+        }
+    }
+    pad(out, relocationsAt[0])
+    for var k = 0; k < count; k = k + 1 {
+        for r in relocations[k] {
             let (kind, pcrel, length) = relocationKind(r.use)
             -- The symbol's index with the extern bit, or the section's
             -- ordinal without it.
-            let target = match (sectionRelative(r), Map.get(definitions, Asm.spell(r.target))) {
+            let target = match (sectionRelative(sections[k].kind, r),
+                                Map.get(definitions, Asm.spell(r.target))) {
                 (True, Some(d)) -> {
                     -- Store the label's address as the implicit addend.
                     Byte.putLE(out, contents + addresses[k] + r.offset, 8,
@@ -206,7 +231,9 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
     let referenced = Set.new()
     for s in obj.sections {
         for r in s.relocations {
-            if !sectionRelative(r) { Set.add(referenced, Asm.spell(r.target)) }
+            if relocated(r) && !sectionRelative(s.kind, r) {
+                Set.add(referenced, Asm.spell(r.target))
+            }
         }
     }
     let locals = []
@@ -236,11 +263,27 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
     (entries, len(locals), len(exported))
 }
 
--- Whether the relocation names its target's section rather than a symbol:
--- an eight-byte word that holds a temporary label's address.
-fun sectionRelative(r : Relocation Fixup) -> Bool = match (r.use, r.target.kind) {
-    (Address64, Temporary) -> True
-    _ -> False
+-- Whether a field gets a relocation entry: every one but an offset, which is
+-- written into the field instead.
+fun relocated(r : Relocation Fixup) -> Bool = match r.use {
+    Offset32 -> False
+    Address64 | Code(_) -> True
+}
+
+-- Whether a relocation in a section of kind `holder` names its target's
+-- section rather than a symbol: an eight-byte word that holds a temporary
+-- label's address, or any address in a debug section.
+fun sectionRelative(holder : Asm.Section, r : Relocation Fixup) -> Bool =
+    match (r.use, r.target.kind) {
+        (Address64, Temporary) -> True
+        (Address64, Named) -> debug(holder)
+        _ -> False
+    }
+
+fun debug(kind : Asm.Section) -> Bool = match kind {
+    Asm.DebugAbbrev | Asm.DebugInfo | Asm.DebugStr | Asm.DebugLine | Asm.DebugLineStr
+        | Asm.DebugAddr | Asm.DebugRnglists -> True
+    Asm.Text | Asm.CStrings | Asm.Constants | Asm.Data | Asm.Relocated -> False
 }
 
 -- A symbol's name in the table: a named symbol's own, and a temporary
@@ -254,6 +297,7 @@ fun symbolName(sym : Symbol) -> String = match sym.kind {
 -- size as a power of two.
 fun relocationKind(use : Use Fixup) -> (Int, Int, Int) = match use {
     Address64 -> (0, 0, 3)
+    Offset32 -> error("internal error: a section offset is never relocated")
     Code(Jump26(_)) | Code(Call26(_)) -> (2, 1, 2)
     Code(Page21(_)) -> (3, 1, 2)
     Code(PageOffset12(_, _)) | Code(AddOffset12(_)) -> (4, 0, 2)

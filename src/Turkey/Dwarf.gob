@@ -1,4 +1,7 @@
-export (CompileUnit(..), Subprogram(..), sourceFiles, emitUnit)
+export (
+    CompileUnit(..), Subprogram(..), Inlined(..), sourceFiles, inlinedCalls, emitUnit,
+    Row(..), Sequence(..), LineTable(..), lineTable, uleb,
+)
 
 -- DWARF 5 debug information as stream items (`Turkey.Stream`): the sections
 -- `-g` adds besides the line table, which the assembler builds from the
@@ -8,10 +11,19 @@ export (CompileUnit(..), Subprogram(..), sourceFiles, emitUnit)
 -- the same entries, and the bytes one writes can be checked against what the
 -- system assembler makes of the other's.
 --
+-- And the line table itself, as bytes, for `Turkey.Assembler`: it holds the
+-- rows the `Loc` items leave, as the system assembler holds the `.loc` rows,
+-- and builds the table the same way, so that the two tables can be compared
+-- byte for byte.
+--
 -- What is written is one compile unit for the program, which is one object,
 -- and a subprogram for each function in it: its name and its range of
 -- addresses, which is what a debugger needs to name a frame and a profiler to
--- attribute a sample. On macOS the compile unit is what makes the line table
+-- attribute a sample. Inside each subprogram, an inlined subroutine for each
+-- call the optimizer inlined into it, nested as the calls were, with the code
+-- it covers and the position of the call, so that a debugger shows a frame
+-- for each; and one abstract subprogram per function inlined anywhere, which
+-- names them all. On macOS the compile unit is what makes the line table
 -- reachable at all: the linker records an object in the executable's debug
 -- map only if it has one, and a debugger finds an object's DWARF only through
 -- that map.
@@ -39,9 +51,30 @@ type CompileUnit = CompileUnit {
     functions : Vec Subprogram,
 }
 
--- A function, by the name its frames are shown with and the labels at its
--- first instruction and after its last.
-type Subprogram = Subprogram { name : String, low : Symbol, high : Symbol }
+-- A function, by the name its frames are shown with, the labels at its
+-- first instruction and after its last, and the calls inlined into it,
+-- outermost first.
+type Subprogram = Subprogram {
+    name    : String,
+    low     : Symbol,
+    high    : Symbol,
+    inlined : Vec Inlined,
+}
+
+-- A call inlined into a function: the name of the function inlined, the
+-- call's position (`Turkey.Position`), the code the inlined body covers as
+-- pairs of labels in address order, and the calls inlined into that body in
+-- turn. Each range lies within one of its parent's.
+type Inlined = Inlined {
+    callee   : String,
+    call     : Int,
+    ranges   : Vec (Symbol, Symbol),
+    children : Vec Inlined,
+}
+
+-- The name a debugger shows for the function named `name`: a subprogram's,
+-- and an inlined call's callee's.
+fun shownName(name : String) -> String = name
 
 -- -- encodings ------------------------------------------------------------------
 
@@ -50,6 +83,7 @@ let compileUnitType = 0x01
 let addressSize = 8
 
 let tagCompileUnit = 0x11
+let tagInlinedSubroutine = 0x1d
 let tagSubprogram = 0x2e
 
 let childrenNo = 0
@@ -62,14 +96,33 @@ let atHighPc = 0x12
 let atLanguage = 0x13
 let atCompDir = 0x1b
 let atProducer = 0x25
+let atInline = 0x20
 let atFrameBase = 0x40
+let atAbstractOrigin = 0x31
+let atRanges = 0x55
+let atCallColumn = 0x57
+let atCallFile = 0x58
+let atCallLine = 0x59
+let atAddrBase = 0x73
+let atRnglistsBase = 0x74
 
 let formAddr = 0x01
 let formData2 = 0x05
 let formData4 = 0x06
+let formData1 = 0x0b
+let formUdata = 0x0f
+let formRef4 = 0x13
 let formStrp = 0x0e
 let formSecOffset = 0x17
 let formExprloc = 0x18
+let formRnglistx = 0x23
+
+-- `DW_INL_inlined`: a function the compiler chose to inline.
+let inlineInlined = 1
+
+let rangeEndOfList = 0x00
+let rangeBaseAddressx = 0x01
+let rangeOffsetPair = 0x04
 
 -- C11, because Turkey has no language code of its own. A debugger reads the
 -- code to choose how it parses expressions and shows values; a line table and
@@ -82,9 +135,13 @@ let languageC11 = 0x1d
 let opReg29 = 0x50 + 29
 
 -- The abbreviation codes, numbered from 1 in the order `abbreviations` writes
--- them.
+-- them. An inlined subroutine's is `abbrevInlined` plus 1 if it has children,
+-- plus 2 if its code is a range list rather than one range.
 let abbrevCompileUnit = 1
 let abbrevSubprogram = 2
+let abbrevSubprogramParent = 3
+let abbrevAbstract = 4
+let abbrevInlined = 5
 
 -- -- the line table's files ---------------------------------------------------------
 
@@ -116,6 +173,11 @@ type Labels = Labels {
     abbrev    : Symbol,
     strings   : Symbol,
     line      : Symbol,
+    addresses     : Symbol,
+    addressesBase : Symbol,
+    ranges        : Symbol,
+    rangesBase    : Symbol,
+    unit      : Symbol,
     infoStart : Symbol,
     infoEnd   : Symbol,
 }
@@ -123,8 +185,20 @@ type Labels = Labels {
 -- The strings the entries name, each once, in the order first named.
 type Strings = Strings { d : Asm.Dialect, index : Map.Map String Int, texts : Vec String }
 
--- `debug_abbrev`, `debug_info` and `debug_str` for `u`, and the start of
--- `debug_line`, whose contents the assembler writes after it.
+-- What the entries refer to besides strings: the abstract subprogram of each
+-- function inlined anywhere, by its name, in the order first inlined; and the
+-- range lists of the inlined calls whose code is not one range, in the order
+-- written.
+type Refs = Refs {
+    d         : Asm.Dialect,
+    abstracts : Map.Map String Int,
+    callees   : Vec String,
+    lists     : Vec (Vec (Symbol, Symbol)),
+}
+
+-- `debug_abbrev`, `debug_info`, `debug_addr`, `debug_rnglists` and
+-- `debug_str` for `u`, and the start of `debug_line`, whose contents the
+-- assembler writes after it.
 --
 -- Leaves the current section `debug_line`: whatever follows has to name its
 -- own.
@@ -133,12 +207,19 @@ fun emitUnit(d : Asm.Dialect, u : CompileUnit, out : Vec (Item i)) -> Unit {
         abbrev = Asm.localLabel(d, "debug_abbrev"),
         strings = Asm.localLabel(d, "debug_str"),
         line = Asm.localLabel(d, "debug_line"),
+        addresses = Asm.localLabel(d, "debug_addr"),
+        addressesBase = Asm.localLabel(d, "debug_addr_base"),
+        ranges = Asm.localLabel(d, "debug_rnglists"),
+        rangesBase = Asm.localLabel(d, "debug_rnglists_base"),
+        unit = Asm.localLabel(d, "debug_info"),
         infoStart = Asm.localLabel(d, "debug_info_start"),
         infoEnd = Asm.localLabel(d, "debug_info_end"),
     }
     let strings = Strings { d = d, index = Map.new(), texts = [] }
+    let refs = Refs { d = d, abstracts = Map.new(), callees = [], lists = [] }
     abbreviations(labels, out)
-    info(labels, strings, u, out)
+    info(labels, strings, refs, u, out)
+    rangeLists(labels, refs, out)
     Vec.push(out, Section(Asm.DebugStr))
     Vec.push(out, Label(labels.strings))
     for var k = 0; k < len(strings.texts); k = k + 1 {
@@ -149,18 +230,36 @@ fun emitUnit(d : Asm.Dialect, u : CompileUnit, out : Vec (Item i)) -> Unit {
     Vec.push(out, Label(labels.line))
 }
 
--- One abbreviation for the compile unit and one for every subprogram: the
--- tag, whether children follow, then each attribute with its form.
+-- One abbreviation for the compile unit, two for a subprogram, with and
+-- without children, one for an abstract subprogram, and four for an inlined
+-- subroutine: the tag, whether children follow, then each attribute with its
+-- form.
+--
+-- A subprogram with children is written with them and one without is not,
+-- because a children flag with no children is a null entry for every
+-- function that inlined nothing.
 fun abbreviations(labels : Labels, out : Vec (Item i)) -> Unit {
     Vec.push(out, Section(Asm.DebugAbbrev))
     Vec.push(out, Label(labels.abbrev))
     abbreviation(abbrevCompileUnit, tagCompileUnit, childrenYes,
                  [(atProducer, formStrp), (atLanguage, formData2), (atName, formStrp),
                   (atCompDir, formStrp), (atStmtList, formSecOffset), (atLowPc, formAddr),
-                  (atHighPc, formAddr)], out)
-    abbreviation(abbrevSubprogram, tagSubprogram, childrenNo,
-                 [(atName, formStrp), (atLowPc, formAddr), (atHighPc, formData4),
-                  (atFrameBase, formExprloc)], out)
+                  (atHighPc, formAddr), (atAddrBase, formSecOffset),
+                  (atRnglistsBase, formSecOffset)], out)
+    let subprogram = [(atName, formStrp), (atLowPc, formAddr), (atHighPc, formData4),
+                      (atFrameBase, formExprloc)]
+    abbreviation(abbrevSubprogram, tagSubprogram, childrenNo, subprogram, out)
+    abbreviation(abbrevSubprogramParent, tagSubprogram, childrenYes, subprogram, out)
+    abbreviation(abbrevAbstract, tagSubprogram, childrenNo,
+                 [(atName, formStrp), (atInline, formData1)], out)
+    let one = [(atAbstractOrigin, formRef4), (atLowPc, formAddr), (atHighPc, formData4),
+               (atCallFile, formUdata), (atCallLine, formUdata), (atCallColumn, formUdata)]
+    let list = [(atAbstractOrigin, formRef4), (atRanges, formRnglistx),
+                (atCallFile, formUdata), (atCallLine, formUdata), (atCallColumn, formUdata)]
+    abbreviation(abbrevInlined, tagInlinedSubroutine, childrenNo, one, out)
+    abbreviation(abbrevInlined + 1, tagInlinedSubroutine, childrenYes, one, out)
+    abbreviation(abbrevInlined + 2, tagInlinedSubroutine, childrenNo, list, out)
+    abbreviation(abbrevInlined + 3, tagInlinedSubroutine, childrenYes, list, out)
     Vec.push(out, Byte(0))
 }
 
@@ -178,16 +277,21 @@ fun abbreviation(code : Int, tag : Int, children : Int, attributes : Array (Int,
 }
 
 -- The unit's header, its compile unit entry, a subprogram entry per function
--- and the end of the compile unit's children, each entry's attributes in its
+-- with its inlined calls, an abstract subprogram per function inlined, and
+-- the end of the compile unit's children, each entry's attributes in its
 -- abbreviation's order.
 --
 -- A function's high pc is in `DW_FORM_data4`, the length from its low pc,
 -- which the assembler fixes, so only the low pc is relocated. The compile
 -- unit's is an address like its low pc: its range has every function's symbol
 -- inside it, and a Mach-O assembler leaves a distance across a symbol as a
--- pair of relocations, which debuggers do not apply to an object's DWARF.
-fun info(labels : Labels, strings : Strings, u : CompileUnit, out : Vec (Item i)) -> Unit {
+-- pair of relocations, which debuggers do not apply to an object's DWARF. An
+-- inlined call's range is inside one function, so its length is a distance
+-- like a function's.
+fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
+         out : Vec (Item i)) -> Unit {
     Vec.push(out, Section(Asm.DebugInfo))
+    Vec.push(out, Label(labels.unit))
     -- The unit's length counts from after the length itself.
     Vec.push(out, Difference(labels.infoEnd, labels.infoStart))
     Vec.push(out, Label(labels.infoStart))
@@ -204,18 +308,248 @@ fun info(labels : Labels, strings : Strings, u : CompileUnit, out : Vec (Item i)
     Vec.push(out, SectionOffset(labels.line, labels.line))
     Vec.push(out, WordOf(u.low))
     Vec.push(out, WordOf(u.high))
+    Vec.push(out, SectionOffset(labels.addressesBase, labels.addresses))
+    Vec.push(out, SectionOffset(labels.rangesBase, labels.ranges))
 
     for f in u.functions {
-        Vec.push(out, Uleb(abbrevSubprogram))
-        string(strings, labels, f.name, out)
+        let parent = len(f.inlined) > 0
+        Vec.push(out, Uleb(if parent { abbrevSubprogramParent } else { abbrevSubprogram }))
+        string(strings, labels, shownName(f.name), out)
         Vec.push(out, WordOf(f.low))
         Vec.push(out, Difference(f.high, f.low))
         -- An expression one operation long.
         Vec.push(out, Uleb(1))
         Vec.push(out, Byte(opReg29))
+        if parent {
+            for call in f.inlined { inlinedEntry(labels, refs, call, out) }
+            Vec.push(out, Byte(0))
+        }
+    }
+    for var k = 0; k < len(refs.callees); k = k + 1 {
+        Vec.push(out, Label(abstractLabel(refs.d, k)))
+        Vec.push(out, Uleb(abbrevAbstract))
+        string(strings, labels, shownName(refs.callees[k]), out)
+        Vec.push(out, Byte(inlineInlined))
     }
     Vec.push(out, Byte(0))
     Vec.push(out, Label(labels.infoEnd))
+}
+
+-- The entry for `call` and its children.
+fun inlinedEntry(labels : Labels, refs : Refs, call : Inlined, out : Vec (Item i)) -> Unit {
+    let children = len(call.children) > 0
+    let listed = len(call.ranges) > 1
+    Vec.push(out, Uleb(abbrevInlined + (if children { 1 } else { 0 })
+                       + (if listed { 2 } else { 0 })))
+    -- A `DW_FORM_ref4` is an offset from the start of the unit.
+    Vec.push(out, Difference(abstractLabel(refs.d, abstractOf(refs, call.callee)), labels.unit))
+    if listed {
+        -- The list's number, which is also its base address's.
+        Vec.push(out, Uleb(len(refs.lists)))
+        Vec.push(refs.lists, call.ranges)
+    } else {
+        let (low, high) = call.ranges[0]
+        Vec.push(out, WordOf(low))
+        Vec.push(out, Difference(high, low))
+    }
+    Vec.push(out, Uleb(Position.file(call.call)))
+    Vec.push(out, Uleb(Position.line(call.call)))
+    Vec.push(out, Uleb(Position.column(call.call)))
+    if children {
+        for inner in call.children { inlinedEntry(labels, refs, inner, out) }
+        Vec.push(out, Byte(0))
+    }
+}
+
+-- The number of the abstract subprogram for `callee`, which `info` writes
+-- after the subprograms.
+fun abstractOf(refs : Refs, callee : String) -> Int = match Map.get(refs.abstracts, callee) {
+    Some(k) -> k
+    None -> {
+        let k = len(refs.callees)
+        Map.put(refs.abstracts, callee, k)
+        Vec.push(refs.callees, callee)
+        k
+    }
+}
+
+fun abstractLabel(d : Asm.Dialect, k : Int) -> Symbol =
+    Asm.localLabel(d, "debug_abstract" + Int.toString(k))
+
+fun listLabel(d : Asm.Dialect, k : Int) -> Symbol =
+    Asm.localLabel(d, "debug_rnglist" + Int.toString(k))
+
+-- `debug_addr` and `debug_rnglists`, for the inlined calls whose code is
+-- not one range. Each list is named by its number in the offset table after
+-- the range lists' header, and starts from a base address, its first
+-- range's start, which is the same number in the address table: a range is
+-- then a pair of offsets from it. Written even with no lists, since the
+-- compile unit names both tables.
+--
+-- A range's offsets are distances in one function, which the assembler
+-- fixes, as a subprogram's length is. They are the encoding the system
+-- symbolizer on macOS reads, as LLVM writes it; it stops reading an
+-- object's DWARF at a range written as two addresses, or as an address and
+-- a length.
+fun rangeLists(labels : Labels, refs : Refs, out : Vec (Item i)) -> Unit {
+    let d = refs.d
+    let n = len(refs.lists)
+    let addressesStart = Asm.localLabel(d, "debug_addr_start")
+    let addressesEnd = Asm.localLabel(d, "debug_addr_end")
+    Vec.push(out, Section(Asm.DebugAddr))
+    Vec.push(out, Label(labels.addresses))
+    Vec.push(out, Difference(addressesEnd, addressesStart))
+    Vec.push(out, Label(addressesStart))
+    half(version, out)
+    Vec.push(out, Byte(addressSize))
+    -- No segment selector.
+    Vec.push(out, Byte(0))
+    Vec.push(out, Label(labels.addressesBase))
+    for list in refs.lists {
+        let (base, _) = list[0]
+        Vec.push(out, WordOf(base))
+    }
+    Vec.push(out, Label(addressesEnd))
+
+    let start = Asm.localLabel(d, "debug_rnglists_start")
+    let end = Asm.localLabel(d, "debug_rnglists_end")
+    Vec.push(out, Section(Asm.DebugRnglists))
+    Vec.push(out, Label(labels.ranges))
+    Vec.push(out, Difference(end, start))
+    Vec.push(out, Label(start))
+    half(version, out)
+    Vec.push(out, Byte(addressSize))
+    Vec.push(out, Byte(0))
+    -- The offset table's length, in four bytes.
+    half(n & 0xFFFF, out)
+    half(n >> 16, out)
+    Vec.push(out, Label(labels.rangesBase))
+    for var k = 0; k < n; k = k + 1 {
+        Vec.push(out, Difference(listLabel(d, k), labels.rangesBase))
+    }
+    for var k = 0; k < n; k = k + 1 {
+        let list = refs.lists[k]
+        let (base, _) = list[0]
+        Vec.push(out, Label(listLabel(d, k)))
+        Vec.push(out, Byte(rangeBaseAddressx))
+        Vec.push(out, Uleb(k))
+        for (low, high) in list {
+            Vec.push(out, Byte(rangeOffsetPair))
+            Vec.push(out, UlebDifference(low, base))
+            Vec.push(out, UlebDifference(high, base))
+        }
+        Vec.push(out, Byte(rangeEndOfList))
+    }
+    Vec.push(out, Label(end))
+}
+
+-- -- inlined calls ---------------------------------------------------------------
+
+-- Returns `code`, the items of function `tag`, with a label before each line
+-- table row whose inline site differs from the last row's, and the calls
+-- `sites` numbers (`Func.sites`), outermost first, each with the code it
+-- covers. The rows run to `end`, the label after the function's last
+-- instruction.
+--
+-- A call's ranges are the maximal runs of rows whose site is the call's or
+-- one inlined into it. So each range lies within one of its parent's, and a
+-- call with no row of its own still covers the calls inlined into it.
+-- A label is an item of no size, so the code is the same with them.
+fun inlinedCalls(d : Asm.Dialect, tag : Int, sites : Vec Position.Site,
+                 code : Vec (Item i), end : Symbol) -> (Vec (Item i), Vec Inlined) {
+    if len(sites) == 0 { return (code, []) }
+    let calls = Calls {
+        sites = sites, open = Array.filled(len(sites) + 1, None),
+        nodes = Array.filled(len(sites) + 1, None), outermost = [],
+    }
+    let out = Vec.new(len(code))
+    var current = 0
+    var labels = 0
+    for item in code {
+        match item {
+            Loc(at, _) -> {
+                let site = Position.site(at)
+                if site != current {
+                    let here = Asm.localLabel(d, "f" + Int.toString(tag) + "i"
+                                                 + Int.toString(labels))
+                    labels = labels + 1
+                    Vec.push(out, Label(here))
+                    move(calls, current, site, here)
+                    current = site
+                }
+            }
+            _ -> {}
+        }
+        Vec.push(out, item)
+    }
+    move(calls, current, 0, end)
+    (out, calls.outermost)
+}
+
+-- The calls being found in one function: its sites, the label each one's
+-- current range opened at, by site, and the entry each has once its first
+-- range opens, also by site; and the entries of the outermost calls, in the
+-- order their code starts.
+type Calls = Calls {
+    sites     : Vec Position.Site,
+    open      : Array (Option Symbol),
+    nodes     : Array (Option Inlined),
+    outermost : Vec Inlined,
+}
+
+-- The sites `site` is inside, itself first and the outermost last; none for
+-- site 0.
+fun chain(calls : Calls, site : Int) -> Vec Int {
+    let out = []
+    var s = site
+    while s != 0 {
+        Vec.push(out, s)
+        s = Position.site(calls.sites[s - 1].call)
+    }
+    out
+}
+
+-- Closes at `here` the range of each site the rows leave in going from site
+-- `from` to site `to`, and opens one for each site they enter, outermost
+-- first so that a parent has its entry before a child is put in it.
+fun move(calls : Calls, from : Int, to : Int, here : Symbol) -> Unit {
+    let entering = chain(calls, to)
+    for s in chain(calls, from) {
+        if !Vec.contains(entering, s) {
+            match calls.open[s] {
+                Some(low) -> {
+                    match calls.nodes[s] {
+                        Some(node) -> Vec.push(node.ranges, (low, here))
+                        None -> {}
+                    }
+                    calls.open[s] = None
+                }
+                None -> {}
+            }
+        }
+    }
+    for var k = len(entering) - 1; k >= 0; k = k - 1 {
+        let s = entering[k]
+        if Option.isNone(calls.open[s]) {
+            calls.open[s] = Some(here)
+            if Option.isNone(calls.nodes[s]) { enter(calls, s) }
+        }
+    }
+}
+
+-- Makes the entry for site `s`, in its parent's or among the outermost.
+fun enter(calls : Calls, s : Int) -> Unit {
+    let site = calls.sites[s - 1]
+    let node = Inlined { callee = site.callee, call = site.call, ranges = [], children = [] }
+    calls.nodes[s] = Some(node)
+    let parent = Position.site(site.call)
+    if parent == 0 { Vec.push(calls.outermost, node) }
+    else {
+        match calls.nodes[parent] {
+            Some(p) -> Vec.push(p.children, node)
+            None -> Vec.push(calls.outermost, node)
+        }
+    }
 }
 
 -- A `DW_FORM_strp` naming `text`, which `emitUnit` writes into `debug_str`.
@@ -240,4 +574,296 @@ fun stringLabel(d : Asm.Dialect, k : Int) -> Symbol =
 fun half(n : Int, out : Vec (Item i)) -> Unit {
     Vec.push(out, Byte(n & 0xFF))
     Vec.push(out, Byte((n >> 8) & 0xFF))
+}
+
+-- -- the line table ------------------------------------------------------------
+
+-- A row of the line table: its offset in the section its code is in, the
+-- position it starts (`Turkey.Position`), and whether it is where a
+-- function's body begins.
+type Row = Row { offset : Int, at : Int, prologueEnd : Bool }
+
+-- The rows in one section, in order, and the section's length, which is
+-- where the last row ends.
+type Sequence = Sequence { rows : Vec Row, end : Int }
+
+-- `debug_line`, and `debug_line_str` with the paths it names. Each field of
+-- `line` the object writer relocates is listed by its offset in `line`: a
+-- four-byte path field with the offset in `strings` it holds, and each
+-- sequence's eight-byte start address, the offset of its first row.
+type LineTable = LineTable {
+    line      : Vec Byte,
+    strings   : Vec Byte,
+    paths     : Vec (Int, Int),
+    addresses : Vec Int,
+}
+
+let lineBase = -5
+let lineRange = 14
+let opcodeBase = 13
+-- The operands each standard opcode takes, from `DW_LNS_copy` to
+-- `DW_LNS_set_isa`.
+let standardLengths = [0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]
+
+let lnsCopy = 0x01
+let lnsAdvancePc = 0x02
+let lnsAdvanceLine = 0x03
+let lnsSetFile = 0x04
+let lnsSetColumn = 0x05
+let lnsNegateStmt = 0x06
+let lnsConstAddPc = 0x08
+let lnsSetPrologueEnd = 0x0a
+let lneEndSequence = 0x01
+let lneSetAddress = 0x02
+
+let lnctPath = 0x01
+let lnctDirectoryIndex = 0x02
+let formLineStrp = 0x1f
+
+-- The largest address advance one special opcode can make.
+let specialAddressMost = (255 - opcodeBase) / lineRange
+
+-- The line table for the source files `files`, as the `SourceFile` items
+-- give them, and the rows in `sequences`.
+--
+-- The encoding is the system assembler's, choice for choice, which is what
+-- lets the bytes be compared rather than only the rows they decode to. Where
+-- DWARF leaves a choice, the choice here is LLVM's:
+--
+-- * Directory 0 is the compile directory. A file's path is cut at its last
+--   `/` into a directory and a name, and each directory is listed once, in
+--   the order first named. File 0's name is not cut.
+-- * Every path is a `DW_FORM_line_strp`, each distinct string stored once in
+--   `debug_line_str`, in the order first named: the directories, then the
+--   files.
+-- * A sequence starts with `DW_LNE_set_address` at its first row and ends
+--   with `DW_LNE_end_sequence` at its section's end. Between rows, a change
+--   of line and address is one special opcode where it fits, and where it
+--   does not, `DW_LNS_advance_line` and then a special opcode, or a
+--   `DW_LNS_const_add_pc` or `DW_LNS_advance_pc` before one.
+fun lineTable(files : Vec (Int, Option String, String), sequences : Vec Sequence) -> LineTable {
+    let t = LineTable { line = [], strings = [], paths = [], addresses = [] }
+    let interned = Map.new()
+    let path = fun(text : String) {
+        let offset = match Map.get(interned, text) {
+            Some(k) -> k
+            None -> {
+                let k = len(t.strings)
+                Map.put(interned, text, k)
+                for b in String.bytes(text) { Vec.push(t.strings, b) }
+                Vec.push(t.strings, Byte.truncate(0))
+                k
+            }
+        }
+        Vec.push(t.paths, (len(t.line), offset))
+        word(t.line, 4, 0)
+    }
+    -- File `n` at `names[n]`, cut into its directory's number and its name.
+    var directory = "."
+    var root = ""
+    var count = 0
+    for (n, _, _) in files { if n + 1 > count { count = n + 1 } }
+    let names = Array.filled(count, "")
+    let directories : Vec String = []
+    let indices = Array.filled(count, 0)
+    for (n, dir, name) in files {
+        if n == 0 {
+            directory = Option.unwrapOr(dir, ".")
+            names[0] = name
+        } else {
+            let (at, base) = cutPath(dir, name)
+            names[n] = base
+            if at != "" {
+                let found = Vec.indexOf(directories, at)
+                indices[n] = 1 + match found {
+                    Some(k) -> k
+                    None -> {
+                        Vec.push(directories, at)
+                        len(directories) - 1
+                    }
+                }
+            }
+        }
+    }
+    for var n = 1; n < count; n = n + 1 {
+        if names[n] == "" {
+            error("internal error: the line table has no source file " + Int.toString(n))
+        }
+    }
+
+    let out = t.line
+    -- The unit's length and the header's, filled in once known; each counts
+    -- from after its own field.
+    word(out, 4, 0)
+    word(out, 2, version)
+    Vec.push(out, Byte.truncate(addressSize))
+    Vec.push(out, Byte.truncate(0))
+    let headerLength = len(out)
+    word(out, 4, 0)
+    -- Instructions are counted in bytes, one operation each, and a row is a
+    -- statement unless it says otherwise.
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(lineBase & 0xFF))
+    Vec.push(out, Byte.truncate(lineRange))
+    Vec.push(out, Byte.truncate(opcodeBase))
+    for n in standardLengths { Vec.push(out, Byte.truncate(n)) }
+    Vec.push(out, Byte.truncate(1))
+    uleb(out, lnctPath)
+    uleb(out, formLineStrp)
+    uleb(out, len(directories) + 1)
+    path(directory)
+    for d in directories { path(d) }
+    Vec.push(out, Byte.truncate(2))
+    uleb(out, lnctPath)
+    uleb(out, formLineStrp)
+    uleb(out, lnctDirectoryIndex)
+    uleb(out, formUdata)
+    uleb(out, if count == 0 { 1 } else { count })
+    for var n = 0; n < count; n = n + 1 {
+        path(names[n])
+        uleb(out, indices[n])
+    }
+    Byte.putLE(out, headerLength, 4, len(out) - headerLength - 4)
+    for s in sequences { sequence(t, s) }
+    Byte.putLE(out, 0, 4, len(out) - 4)
+    t
+}
+
+-- A file's directory and name: the directory it was given if any, and
+-- otherwise its path cut at the last `/`. A path with no `/` has no
+-- directory, and so is in the compile directory.
+fun cutPath(dir : Option String, name : String) -> (String, String) = match dir {
+    Some(d) -> (d, name)
+    None -> match String.rsplitOnce(name, "/") {
+        Some(("", base)) -> ("/", base)
+        Some((d, base)) -> (d, base)
+        None -> ("", name)
+    }
+}
+
+-- One sequence's rows, from the state DWARF starts each sequence in: file
+-- 1, line 1, column 0, a statement.
+fun sequence(t : LineTable, s : Sequence) -> Unit {
+    let out = t.line
+    var file = 1
+    var line = 1
+    var column = 0
+    var stmt = True
+    var last = -1
+    for r in s.rows {
+        let f = Position.file(r.at)
+        let l = Position.line(r.at)
+        let c = Position.column(r.at)
+        if f != file {
+            file = f
+            Vec.push(out, Byte.truncate(lnsSetFile))
+            uleb(out, f)
+        }
+        if c != column {
+            column = c
+            Vec.push(out, Byte.truncate(lnsSetColumn))
+            uleb(out, c)
+        }
+        if Position.isStmt(r.at) != stmt {
+            stmt = !stmt
+            Vec.push(out, Byte.truncate(lnsNegateStmt))
+        }
+        if r.prologueEnd { Vec.push(out, Byte.truncate(lnsSetPrologueEnd)) }
+        if last < 0 {
+            Vec.push(out, Byte.truncate(0))
+            uleb(out, 1 + addressSize)
+            Vec.push(out, Byte.truncate(lneSetAddress))
+            Vec.push(t.addresses, len(out))
+            word(out, addressSize, 0)
+            advance(out, l - line, 0)
+        } else {
+            advance(out, l - line, r.offset - last)
+        }
+        line = l
+        last = r.offset
+    }
+    if last < 0 { return }
+    let rest = s.end - last
+    if rest == specialAddressMost {
+        Vec.push(out, Byte.truncate(lnsConstAddPc))
+    } else if rest > 0 {
+        Vec.push(out, Byte.truncate(lnsAdvancePc))
+        uleb(out, rest)
+    }
+    Vec.push(out, Byte.truncate(0))
+    Vec.push(out, Byte.truncate(1))
+    Vec.push(out, Byte.truncate(lneEndSequence))
+}
+
+-- A new row `lines` lines and `bytes` bytes on from the last.
+fun advance(out : Vec Byte, lines : Int, bytes : Int) -> Unit {
+    var delta = lines
+    var biased = lines - lineBase
+    var copy = False
+    if biased < 0 || biased >= lineRange {
+        Vec.push(out, Byte.truncate(lnsAdvanceLine))
+        sleb(out, lines)
+        delta = 0
+        biased = -lineBase
+        copy = True
+    }
+    if delta == 0 && bytes == 0 {
+        Vec.push(out, Byte.truncate(lnsCopy))
+        return
+    }
+    let special = biased + opcodeBase
+    if bytes < 256 + specialAddressMost {
+        if special + bytes * lineRange <= 255 {
+            Vec.push(out, Byte.truncate(special + bytes * lineRange))
+            return
+        }
+        let rest = special + (bytes - specialAddressMost) * lineRange
+        if rest <= 255 {
+            Vec.push(out, Byte.truncate(lnsConstAddPc))
+            Vec.push(out, Byte.truncate(rest))
+            return
+        }
+    }
+    Vec.push(out, Byte.truncate(lnsAdvancePc))
+    uleb(out, bytes)
+    Vec.push(out, Byte.truncate(if copy { lnsCopy } else { special }))
+}
+
+-- `n`, at least 0, in unsigned LEB128: seven bits a byte from the lowest, the
+-- top bit set on every byte but the last.
+fun uleb(out : Vec Byte, n : Int) -> Unit {
+    var rest = n
+    loop {
+        let low = rest & 0x7F
+        rest = rest >> 7
+        if rest == 0 {
+            Vec.push(out, Byte.truncate(low))
+            break
+        }
+        Vec.push(out, Byte.truncate(low | 0x80))
+    }
+}
+
+-- `n` in signed LEB128: as `uleb`, until what is left is all sign bits and
+-- the last byte's top data bit agrees with them.
+fun sleb(out : Vec Byte, n : Int) -> Unit {
+    var rest = n
+    loop {
+        let low = rest & 0x7F
+        rest = rest >> 7
+        if (rest == 0 && (low & 0x40) == 0) || (rest == -1 && (low & 0x40) != 0) {
+            Vec.push(out, Byte.truncate(low))
+            break
+        }
+        Vec.push(out, Byte.truncate(low | 0x80))
+    }
+}
+
+-- `n` in `width` bytes, least significant first.
+fun word(out : Vec Byte, width : Int, n : Int) -> Unit {
+    let at = len(out)
+    for var k = 0; k < width; k = k + 1 { Vec.push(out, Byte.truncate(0)) }
+    Byte.putLE(out, at, width, n)
 }

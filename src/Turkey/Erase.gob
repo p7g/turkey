@@ -1,0 +1,80 @@
+export (program, eraseType)
+
+-- Coercion erasure: every coercion parameter, argument and type removed.
+--
+-- A coercion is evidence for the checker and nothing else (see the equality
+-- evidence in `Turkey.Core`). It runs right after the check that follows
+-- `Turkey.Mono`, the last check that reads what coercions grant, and before
+-- `Turkey.Opt`, so that nothing after it pays for one: an argument register,
+-- a curried layer that a call allocates a closure for, or a method slot whose
+-- machine type differs from the method's. GHC erases its coercions before
+-- code generation for the same reason.
+--
+-- Erasing earlier than code generation costs the later checks the equalities
+-- the coercions granted. After `Turkey.Mono` almost every binding is ground,
+-- and a ground family application reduces through the instances alone. What
+-- is left generic, a capped or polymorphically recursive binding, may hold a
+-- family application only an erased coercion decided, and the later checks
+-- treat a stuck one as undecided, as they treat a variable (`Coretc.erased`).
+-- Erasing after the last check instead would leave the curried layers in
+-- place through `Turkey.Opt`, which then cannot inline through them.
+--
+-- A lambda whose parameters were all coercions is replaced by its body, an
+-- application whose arguments were all coercions by its function, and a
+-- function type whose parameters were all coercions by its result. Since
+-- every application of a lambda over evidence supplies its coercions after its
+-- dictionaries, and nothing refers to a coercion parameter, the two sides are
+-- erased alike and nothing dangles.
+
+import Turkey.Core (..)
+import Turkey.Types as Ty
+import Turkey.Types (TApp, TFun, TTuple)
+
+-- Returns `p` with every coercion erased.
+fun program(p : CProgram) -> CProgram = CProgram {
+    dicts = Vec.map(p.dicts, eraseBind),
+    binds = Vec.map(p.binds, eraseBind),
+}
+
+fun eraseBind(b : CBind) -> CBind {
+    let CBind { name, id, ty, binders, value, span, mutable, module_, layouts } = b
+    CBind {
+        name = name, id = id, ty = eraseType(ty), binders = binders, value = erase(value),
+        span = span, mutable = mutable, module_ = module_, layouts = layouts,
+    }
+}
+
+-- Returns `t` with every coercion parameter removed from the function types
+-- in it, and every function type whose parameters were all coercions replaced
+-- by its result.
+fun eraseType(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
+    TFun(params, ret) -> {
+        let kept = Array.filter(params, fun(p) = !isCoercion(p))
+        if len(params) > 0 && len(kept) == 0 { eraseType(ret) }
+        else { TFun(Array.map(kept, eraseType), eraseType(ret)) }
+    }
+    TApp(fn, arg, k) -> TApp(eraseType(fn), eraseType(arg), k)
+    TTuple(elems) -> TTuple(Array.map(elems, eraseType))
+    other -> other
+}
+
+fun erase(e : Core) -> Core = match e.kind {
+    CLam(params, body, name) -> {
+        let kept = Array.filter(params, fun(p) = !isCoercion(p.ty))
+        if len(params) > 0 && len(kept) == 0 { return erase(body) }
+        mkCore(eraseType(e.ty), e.span, CLam(Array.map(kept, eraseParam), erase(body), name))
+    }
+    CApp(fn, args) -> {
+        let kept = Array.filter(args, fun(a) = !isCoercion(a.ty))
+        if len(args) > 0 && len(kept) == 0 { return erase(fn) }
+        mkCore(eraseType(e.ty), e.span, CApp(erase(fn), Array.map(kept, erase)))
+    }
+    _ -> mkCore(eraseType(e.ty), e.span, mapKind(e.kind, Mapper {
+        expr = erase, type_ = eraseType, bind = eraseBind,
+    }))
+}
+
+fun eraseParam(p : CParam) -> CParam {
+    let CParam { name, id, ty } = p
+    CParam { name = name, id = id, ty = eraseType(ty) }
+}

@@ -8,7 +8,7 @@ export (
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto, codeAddressName, mentions, references,
     dictName, classOfDict, dictClass, isDictionary,
-    coercionOf, coercionSides, isCoercion, isEvidence, coercion, forwarded, outerEqualities,
+    coercionOf, coercionSides, isCoercion, isEvidence, coercion, forwarded,
     abstractionBinders,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
@@ -470,14 +470,21 @@ fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
 --
 -- The evidence itself is a `CUnit` of a coercion type, checked where it stands:
 -- `Turkey.Coretc` accepts one only where its two sides agree under the
--- equalities in scope. A coercion has the layout of `Unit`, which takes no
--- register, so the parameters and arguments cost nothing at run time.
+-- equalities in scope. `Turkey.Erase` removes every coercion parameter,
+-- argument and type once the checker has no more use for them, before
+-- `Turkey.Opt`, so they cost nothing at run time and no pass after it meets
+-- one.
 --
 -- **Invariant.** Nothing refers to a coercion parameter. A term that passes
 -- one on passes a `CUnit` of its type instead (`forwarded`), which holds
 -- inside the lambda that binds it. So a pass may drop a coercion parameter
 -- along with its argument, as specialization does, without leaving a
 -- reference behind; `Turkey.Coretc` refuses a reference to one.
+--
+-- **A lambda over coercions alone delays nothing.** Erasure replaces it by
+-- its body. So a term that must wait for a call, such as a method's own
+-- dictionary or a panic in a slot that can never be called, waits under a
+-- lambda with a parameter that is not a coercion.
 --
 -- Every lambda over evidence lists its dictionaries before its coercions, and
 -- every application of one supplies them in that order.
@@ -516,30 +523,6 @@ fun coercion(l : Ty.Type, r : Ty.Type, span : Option Span) -> Core =
 fun forwarded(p : CParam, span : Option Span) -> Core = match coercionSides(p.ty) {
     Some((l, r)) -> coercion(l, r, span)
     None -> mkCore(p.ty, span, CVar(refTo(p.name, p.id)))
-}
-
--- Returns the equalities the coercion parameters at the top of `e` bind: those
--- of every lambda, under its type abstractions, whose parameters are all
--- evidence. These are the equalities a whole binding of `e` may assume.
-fun outerEqualities(e : Core) -> Vec (Ty.Type, Ty.Type) {
-    let out = Vec.new(2)
-    var value = e
-    loop {
-        match value.kind {
-            CTyLam(_, body) -> { value = body }
-            CLam(params, body, _) -> {
-                if len(params) == 0 || !Iterator.all(params, fun(p) = isEvidence(p.ty)) {
-                    break
-                }
-                for p in params {
-                    if let Some(sides) = coercionSides(p.ty) { Vec.push(out, sides) }
-                }
-                value = body
-            }
-            _ -> break
-        }
-    }
-    out
 }
 
 -- Every type variable a binding abstracts, wherever it states them.

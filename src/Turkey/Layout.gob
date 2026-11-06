@@ -337,8 +337,6 @@ fun unfold(decls : DeclTable, ty : Ty.Type, layouts : Map String Layout,
 -- anything else a pointer to its object. One constructor has nothing to hold.
 fun named(decls : DeclTable, t : Ty.Type, name : String, args : Array Ty.Type,
           layouts : Map String Layout, u : Unfolding) -> Option Layout {
-    -- Evidence that two types are one carries nothing, whatever the two are.
-    if isCoercion(t) { return Some(unit_) }
     if len(args) == 0 {
         match name {
             "Int" -> return Some(i64)
@@ -603,8 +601,6 @@ fun eachType(e : Core, visit : fun(Ty.Type) -> Unit) -> Unit {
 fun atomsInto(ty : Ty.Type, owned : Set.Set Int, visible : Set.Set Int,
               out : Vec Ty.Type, seen : Set.Set String) -> Unit {
     let t = Ty.prune(ty)
-    -- A coercion has no representation, so neither do the types it relates.
-    if isCoercion(t) { return {} }
     if isAtom(t) {
         let take = match t {
             TVar(cell) -> Set.contains(owned, cell.id) && isStar(cell.kind)
@@ -703,7 +699,7 @@ fun applications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
 -- `t = Wrap a` it may be `Elem a`, which the caller mentions nowhere. So each
 -- one is added to the caller's atoms, until nothing changes.
 fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
-               fams : Map String Inert.Inert) -> Map String (Vec Ty.Type) {
+               instances : Inert.Inert) -> Map String (Vec Ty.Type) {
     let extra = Map.new()
     let atoms = Map.new()
     for name in Set.elements(generic) {
@@ -738,7 +734,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
                         TVar(_) -> continue
                         _ -> {}
                     }
-                    let t = Inert.rewrite(fams[name], Decls.substitute(atom, mapping))
+                    let t = Inert.rewrite(instances, Decls.substitute(atom, mapping))
                     let found = Vec.new(2)
                     atomsInto(t, owned, owned, found, Set.new())
                     for a in found {
@@ -764,7 +760,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
 -- The layouts of `atoms` at one call, under the caller's `layouts`; or the
 -- first atom whose layout the caller cannot know.
 fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
-          args : Array Ty.Type, fams : Inert.Inert,
+          args : Array Ty.Type, instances : Inert.Inert,
           layouts : Map String Layout) -> Either Ty.Type (Vec Layout) {
     let mapping = Map.new()
     for var i = 0; i < len(binders) && i < len(args); i = i + 1 {
@@ -772,7 +768,7 @@ fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
     }
     let out = Vec.new(len(atoms))
     for atom in atoms {
-        let t = Inert.rewrite(fams, Decls.substitute(atom, mapping))
+        let t = Inert.rewrite(instances, Decls.substitute(atom, mapping))
         match layoutOf(s.decls, t, layouts) {
             Some(l) -> Vec.push(out, l)
             None -> return Left(t)
@@ -867,9 +863,9 @@ type Sharer = Sharer {
     -- Every top-level binding that abstracts a type: all of them are copied.
     generic : Set.Set String,
     atoms   : Map String (Vec Ty.Type),
-    -- Each binding's families, under the equalities its outermost coercions
-    -- grant the whole of it.
-    fams    : Map String Inert.Inert,
+    -- The instances, for reducing a family application. Coercions are erased
+    -- by now, so no equality is known beyond what the instances decide.
+    instances : Inert.Inert,
     -- Which keys each existential constructor is packed at, as far as the
     -- runs before this one found; an opened arm is copied for those alone.
     packed  : Packed,
@@ -929,8 +925,7 @@ type Local = Local {
 
 fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
 
-fun famsFor(s : Sharer, sc : Scope) -> Inert.Inert =
-    Map.getOr(s.fams, sc.owner, Inert.empty(s.classes))
+
 
 -- The program with every generic binding replaced by one copy per layout its
 -- callers need.
@@ -1122,7 +1117,7 @@ fun shareOnce(program : CProgram, table : Binders.Table, decls : DeclTable,
               keys : Keys) -> (CProgram, Keys) {
     let binds = Map.new()
     let generic = Set.new()
-    let fams = Map.new()
+    let instances = Inert.empty(classes)
     for b in Vec.append(program.dicts, program.binds) {
         Map.put(binds, b.name, b)
         -- `main` is called by the entry, at no types, and never by the
@@ -1131,7 +1126,6 @@ fun shareOnce(program : CProgram, table : Binders.Table, decls : DeclTable,
         if len(abstractionBinders(b)) > 0 && b.name != main {
             Set.add(generic, b.name)
         }
-        Map.put(fams, b.name, Inert.ofEqualities(classes, outerEqualities(b.value)))
     }
     let used = Set.new()
     for (name, _) in Map.entries(binds) { Set.add(used, name) }
@@ -1140,7 +1134,7 @@ fun shareOnce(program : CProgram, table : Binders.Table, decls : DeclTable,
         copies = Binders.unrecordedOwner(table, "", "the binders Turkey.Layout copies"),
         minted = 0,
         decls = decls, classes = classes, binds = binds, generic = generic,
-        atoms = closeAtoms(binds, generic, fams), fams = fams, packed = packed,
+        atoms = closeAtoms(binds, generic, instances), instances = instances, packed = packed,
         done = Map.new(), made = Map.new(), queue = Vec.new(8), used = used,
         keys = keys, asked = Map.new(),
     }
@@ -1375,7 +1369,7 @@ fun requestAt(s : Sharer, sc : Scope, n : String, args : Array Ty.Type,
                + Int.toString(len(args)) + " types, where it binds "
                + Int.toString(len(binders)), at)
     }
-    match keyAt(s, s.atoms[n], binders, args, famsFor(s, sc), current(sc)) {
+    match keyAt(s, s.atoms[n], binders, args, s.instances, current(sc)) {
         Right(parts) -> request(s, n, parts)
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a call to '"
                           + n + "' from '" + sc.owner + "'", at)
@@ -1449,7 +1443,7 @@ fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, index : Int,
         oopsAt("the method '" + method + "' applied to " + Int.toString(len(args))
                + " types, where it binds " + Int.toString(len(own)), e)
     }
-    let parts = match keyAt(s, methodAtoms(m), own, args, famsFor(s, sc),
+    let parts = match keyAt(s, methodAtoms(m), own, args, s.instances,
                             current(sc)) {
         Right(ps) -> ps
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a call to the "
@@ -1573,7 +1567,7 @@ fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Vec VarCe
     let mapping = Map.new()
     Map.put(mapping, m.classVar.id, head)
     let want = Decls.substitute(m.scheme.body, mapping)
-    let got = if len(Classes.methodEvidence(m)) == 0 { Ty.prune(inner.ty) } else {
+    let got = if len(Classes.methodDicts(m)) == 0 { Ty.prune(inner.ty) } else {
         match Ty.prune(inner.ty) {
             TFun(_, r) -> Ty.prune(r)
             other -> other
@@ -1735,7 +1729,7 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
                + Int.toString(len(args)) + " types, where it binds "
                + Int.toString(len(local.binders)), at)
     }
-    let parts = match keyAt(s, local.atoms, local.binders, args, famsFor(s, sc),
+    let parts = match keyAt(s, local.atoms, local.binders, args, s.instances,
                             current(sc)) {
         Right(ps) -> ps
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a use of the "

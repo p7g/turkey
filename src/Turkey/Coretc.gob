@@ -62,6 +62,7 @@ import Turkey.Core as Cr
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Erase as Erase
 import Turkey.Prims as Prims
 import Turkey.PrimTypes as PrimTypes
 import Turkey.Source (Span(..))
@@ -209,18 +210,24 @@ type Checker = Checker {
     -- The uids of the rigid constants the arms around the term being checked
     -- opened, for `openArm`.
     opened        : Set.Set Int,
+    -- Whether the program's coercions are erased (`Turkey.Erase`). A family
+    -- application that stays stuck may then be one an erased coercion
+    -- decided, so it agrees with any type, as a variable does. A method's
+    -- slot then takes no coercions.
+    erased        : Bool,
 }
 
-fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
+fun newChecker(decls : DeclTable, classes : ClassTable, erased : Bool) -> Checker = Checker {
     decls = decls, classes = classes, joins = Map.new(), noJoins = Map.new(),
-    inert = Inert.empty(classes), bound = [], opened = Set.new(),
+    inert = Inert.empty(classes), bound = [], opened = Set.new(), erased = erased,
 }
 
 -- Checks `prog` against `globals` (see `globalsOf`), and raises an internal
 -- error at the first term that is ill-typed or refers to a binder not in
--- scope, or if any binder id is bound twice.
+-- scope, or if any binder id is bound twice. `erased` says whether `prog`'s
+-- coercions are erased.
 fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
-                 globals : Vec Bound) -> Unit {
+                 globals : Vec Bound, erased : Bool) -> Unit {
     let all = Vec.append(prog.dicts, prog.binds)
     -- Each id's first binder: its spelling, and the top-level binding it is in.
     let first : Map Int (String, String) = Map.new()
@@ -238,7 +245,7 @@ fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
     for b in all { defineC(top, b.name, b.id, b.binders, b.ty) }
     -- Each binding against the top-level names alone, so they are checked on
     -- as many workers as there are, a checker to each worker's chunk.
-    let bound = Parallel.mapWith(all, fun() = newChecker(decls, classes),
+    let bound = Parallel.mapWith(all, fun() = newChecker(decls, classes, erased),
                                  fun(ck, b) = checkTop(ck, b, layered(top)))
     checkUnique(first, all, bound)
 }
@@ -411,7 +418,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         let got = check(ck, body, env, None)
         let claimed = match Ty.prune(e.ty) {
             TFun(_, ret) -> ret
-            _ -> got
+            _ -> fail("a function claims the type " + Ty.show(e.ty), e.span)
         }
         if !agrees(ck, claimed, got) {
             mismatch(ck, claimed, got, e.span, "the body of this function")
@@ -457,7 +464,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         Ty.tUnit()
     }
     CIndex(target, index) -> {
-        let t = Ty.prune(check(ck, target, env, None))
+        let t = Ty.prune(settled(ck, check(ck, target, env, None)))
         expect(ck, Ty.tInt(), check(ck, index, env, None), e.span, "an index")
         let (h, _) = Ty.spine(t)
         match h {
@@ -677,11 +684,12 @@ fun methodType(ck : Checker, m : MethodInfo, head : Ty.Type) -> Ty.Type {
     let ty = Decls.substitute(m.scheme.body, mapping)
     let own = Classes.methodEvidence(m)
     if len(own) == 0 { return ty }
-    TFun(Array.map(own, fun(p) = if p.name == Ty.equals {
+    let slot = TFun(Array.map(own, fun(p) = if p.name == Ty.equals {
         coercionOf(Decls.substitute(p.args[0], mapping), Decls.substitute(p.args[1], mapping))
     } else {
         dictType(ck, p.name, Decls.substitute(p.args[0], mapping))
     }), ty)
+    if ck.erased { Erase.eraseType(slot) } else { slot }
 }
 
 -- Read `%Dict.C t` back as the class `C` and the type `t`.
@@ -892,7 +900,7 @@ fun checkJump(ck : Checker, e : Core, target : Ref, args : Vec Core,
 -- the checker had been told about.
 fun pattern(ck : Checker, alt : Alt, scrutinee : Ty.Type,
             where : Option Span) -> Vec (String, Int, Ty.Type) {
-    let target = Ty.prune(reduce(ck, scrutinee))
+    let target = Ty.prune(settled(ck, scrutinee))
     match alt {
         AAny(binder) -> {
             let out = []
@@ -1021,8 +1029,28 @@ fun expect(ck : Checker, want : Ty.Type, got : Ty.Type, where : Option Span,
 
 -- `expect` in two halves, for a caller whose description has to be built: it
 -- runs once per node, and a message is only needed when one fails.
-fun agrees(ck : Checker, want : Ty.Type, got : Ty.Type) -> Bool =
-    compatible(reduce(ck, want), reduce(ck, got))
+fun agrees(ck : Checker, want : Ty.Type, got : Ty.Type) -> Bool {
+    let w = reduce(ck, want)
+    let g = reduce(ck, got)
+    if ck.erased { compatible(unstuck(w), unstuck(g)) } else { compatible(w, g) }
+}
+
+-- Returns `t` reduced, and, once coercions are erased, with each family
+-- application still stuck in it read as undecided.
+fun settled(ck : Checker, t : Ty.Type) -> Ty.Type =
+    if ck.erased { unstuck(reduce(ck, t)) } else { reduce(ck, t) }
+
+-- Returns `t` with each family application in it replaced by a fresh
+-- variable, which `compatible` lets match anything.
+fun unstuck(t : Ty.Type) -> Ty.Type = if familyFree(t) { t } else {
+    match Ty.prune(t) {
+        TFam(_, _, _) -> TVar(Ty.freshVar(0))
+        TApp(fn, arg, k) -> TApp(unstuck(fn), unstuck(arg), k)
+        TFun(params, ret) -> TFun(Array.map(params, unstuck), unstuck(ret))
+        TTuple(elems) -> TTuple(Array.map(elems, unstuck))
+        other -> other
+    }
+}
 
 fun mismatch(ck : Checker, want : Ty.Type, got : Ty.Type, where : Option Span,
              what : String) -> a =

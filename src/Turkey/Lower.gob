@@ -678,19 +678,15 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
             value, Some(inst.decl.span))
 }
 
--- Returns whether one of the method `name`'s own equalities can never hold at
--- the instance's head. Such a method can never be called at that head, since
--- every call has to supply the evidence for its equalities. Its body may also
--- be ill-typed there, since it was checked under an equality that is false,
--- so it is not lowered at all.
-fun refutedAt(l : Lowerer, inst : InstInfo, name : String) -> Bool {
-    let mi = methodOf(l, inst.cls, name, Some(inst.decl.span))
-    let mapping = Map.new()
-    Map.put(mapping, mi.classVar.id, inst.head)
-    Iterator.any(Classes.methodEqualities(mi), fun(p) =
-        Inert.refutes(l.classes, Decls.substitute(p.args[0], mapping),
-                      Decls.substitute(p.args[1], mapping)))
-}
+-- Returns whether the method `name`'s own equalities can never hold together
+-- at the instance's head, tested jointly as the solver tests the givens its
+-- override is checked under. Such a method can never be called at that head,
+-- since every call has to supply the evidence for its equalities. Its body may
+-- also be ill-typed there, since it was checked under equalities that are
+-- false, so it is not lowered at all.
+fun refutedAt(l : Lowerer, inst : InstInfo, name : String) -> Bool =
+    Inert.refutes(l.classes, methodEqualitiesAt(methodOf(l, inst.cls, name, Some(inst.decl.span)),
+                                                inst.head))
 
 -- The method `name` as a slot of the instance's dictionary that can never be
 -- called: a function of its evidence that panics.
@@ -702,15 +698,31 @@ fun unreachable(l : Lowerer, inst : InstInfo, name : String) -> Core {
             let params = Array.map(evidence, fun(t) = CParam { name = "%e", id = mint(l, "%e"), ty = t })
             let message = "the method '" + Classes.surfaceMember(name) + "' cannot be called at "
                           + Ty.show(inst.head)
-            let fails = node(TFun([Ty.tString()], rest), span, CTyApp(
-                node(unknown(), span, CVar(BySpelling(P.error))), [rest]))
-            let failed = node(rest, span, CApp(fails, [node(Ty.tString(), span,
-                                                             CLit(LString(message)))]))
+            let failed = panicking(l, rest, message, span)
             node(TFun(evidence, rest), span, CLam(params, failed, instName(inst) + "." + name))
         }
         _ -> oops("a method with equalities takes no evidence", span)
     }
     methodAbstraction(mi, lam, span)
+}
+
+-- A term of type `ty` that panics with `message` when it is called, or when it
+-- is evaluated if `ty` is not a function. It is a lambda over the method's own
+-- parameters, not only over its evidence, because the evidence is erased
+-- before the code is generated, and a dictionary evaluates its slots when it
+-- is built.
+fun panicking(l : Lowerer, ty : Ty.Type, message : String, span : Option Span) -> Core {
+    let fails = fun(t) = node(t, span, CApp(
+        node(TFun([Ty.tString()], t), span, CTyApp(
+            node(unknown(), span, CVar(BySpelling(P.error))), [t])),
+        [node(Ty.tString(), span, CLit(LString(message)))]))
+    match Ty.prune(ty) {
+        TFun(params, ret) -> {
+            let ps = Array.map(params, fun(t) = CParam { name = "%p", id = mint(l, "%p"), ty = t })
+            node(ty, span, CLam(ps, fails(ret), "<anonymous>"))
+        }
+        _ -> fails(ty)
+    }
 }
 
 fun methodOf(l : Lowerer, cls : String, name : String, where : Option Span) -> MethodInfo =
@@ -1191,16 +1203,25 @@ fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
     }
 }
 
+--
+-- A lambda over coercions alone delays nothing, since it is erased, so one is
+-- expanded through to the function it answers.
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
             let ps = Array.map(params, freshParam(l, "eta", _))
             let args = Array.map(ps, paramVar(_, where))
-            node(TFun(params, ret), where,
-                 CLam(ps, node(ret, where, CApp(called, args)), "<anonymous>"))
+            let applied = node(ret, where, CApp(called, args))
+            let body = if onlyCoercions(ps) { eta(l, applied, ret, where) } else { applied }
+            node(TFun(params, ret), where, CLam(ps, body, "<anonymous>"))
         }
         _ -> called
     }
+
+-- Returns whether `ps` are parameters only of coercions, which a lambda over
+-- them is erased with: such a lambda does not delay its body.
+fun onlyCoercions(ps : Array CParam) -> Bool =
+    len(ps) > 0 && Iterator.all(ps, fun(p) = isCoercion(p.ty))
 
 -- Bind the instance's own dictionary *inside* the method's lambda.
 --
@@ -1211,6 +1232,15 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- method is *called*, by which time the dictionary exists.
 fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
              body : Core, where : Option Span) -> Core {
+    -- Under the method's own parameters, not under a lambda over coercions
+    -- alone, which is erased and so delays nothing.
+    match body.kind {
+        CLam(ps, inner, lamName) -> if onlyCoercions(ps) {
+            return node(body.ty, body.span, CLam(ps,
+                bindSelf(l, inst, params, name, id, inner, where), lamName))
+        }
+        _ -> {}
+    }
     let own = selfDict(l, inst, params)
     match body.kind {
         CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,

@@ -465,14 +465,13 @@ fun rewriteDict(r : Rewriter, e : Core, cls : String, slots : Array Core) -> Cor
     mkCore(ty, e.span, CDict(cls, out))
 }
 
--- Returns whether one of `m`'s own equalities can never hold with its class
+-- Returns whether `m`'s own equalities can never hold together with its class
 -- variable at `head`.
 fun refutedAt(classes : ClassTable, m : MethodInfo, head : Ty.Type) -> Bool {
     let mapping = Map.new()
     Map.put(mapping, m.classVar.id, head)
-    Iterator.any(Classes.methodEqualities(m), fun(p) =
-        Inert.refutes(classes, Decls.substitute(p.args[0], mapping),
-                      Decls.substitute(p.args[1], mapping)))
+    Inert.refutes(classes, Vec.map(Classes.methodEqualities(m), fun(p) =
+        (Decls.substitute(p.args[0], mapping), Decls.substitute(p.args[1], mapping))))
 }
 
 -- The slot `slot` of the method `m` at `head`, as a function of its evidence
@@ -482,25 +481,37 @@ fun vacant(r : Rewriter, slot : Core, m : MethodInfo, head : Ty.Type) -> Option 
         CTyLam(vs, body) -> (Some(vs), body)
         _ -> (None, slot)
     }
-    let lam = match inner.kind {
-        CLam(params, _, name) -> (params, name)
-        _ -> return None
-    }
-    let (params, name) = lam
-    let ps = Array.map(params, rewriteParam(r, _))
+    -- Only a copy is rewritten under a substitution, so there is an owner to
+    -- mint the parameters into.
+    let owner = r.copyInto?
+    -- Made from the slot's type alone, so a slot that holds a reference to a
+    -- hoisted method is replaced as one that holds the method's lambda is.
     let fnTy = rTy(r, inner.ty)
-    let ret = match Ty.prune(fnTy) {
-        TFun(_, rt) -> rt
+    let (evidence, ret) = match Ty.prune(fnTy) {
+        TFun(ps, rt) -> (ps, rt)
         _ -> return None
     }
+    let params = fun(types : Array Ty.Type) = Array.map(types, fun(t) = CParam {
+        name = "%p", id = Binders.fresh(r.owner.table, owner, "%p", Binders.Local,
+                                        Generated(slot.span)),
+        ty = t,
+    })
     let message = "the method '" + Classes.surfaceMember(m.name) + "' cannot be called at "
                   + Ty.show(head)
-    let errorTy = TFun([Ty.tString()], ret)
-    let fails = mkCore(errorTy, slot.span, CTyApp(
-        mkCore(errorTy, slot.span, CVar(BySpelling(P.error))), [ret]))
-    let failed = mkCore(ret, slot.span, CApp(fails, [mkCore(Ty.tString(), slot.span,
-                                                            CLit(LString(message)))]))
-    let made = mkCore(fnTy, slot.span, CLam(ps, failed, name))
+    let fails = fun(t) {
+        let errorTy = TFun([Ty.tString()], t)
+        mkCore(t, slot.span, CApp(
+            mkCore(errorTy, slot.span, CTyApp(mkCore(errorTy, slot.span,
+                                                     CVar(BySpelling(P.error))), [t])),
+            [mkCore(Ty.tString(), slot.span, CLit(LString(message)))]))
+    }
+    -- A lambda over the method's own parameters too, as `Lower.panicking` is,
+    -- since erasing the evidence leaves the dictionary to evaluate the body.
+    let failed = match Ty.prune(ret) {
+        TFun(ps, rt) -> mkCore(ret, slot.span, CLam(params(ps), fails(rt), "<anonymous>"))
+        _ -> fails(ret)
+    }
+    let made = mkCore(fnTy, slot.span, CLam(params(evidence), failed, "<anonymous>"))
     Some(match own {
         Some(vs) -> mkCore(fnTy, slot.span, CTyLam(vs, made))
         None -> made

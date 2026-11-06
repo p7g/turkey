@@ -170,8 +170,16 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
         return cancelled
     }
     let before = Workers.interest()
+    let endedBefore = Poll.endings()
     let w = start()
     tell(before)
+    -- Wake the tasks of any other waits `start` ended, as `settle` would: a
+    -- lock wait retries every waiter on its file (`Poll.locked`), and one
+    -- that takes the lock ends. Skipping this would leave those tasks parked
+    -- on waiters that have ended. The count includes `w` itself when `start`
+    -- ended it, which costs at most a needless `Scheduler.changed`.
+    let ends = Poll.endings() - endedBefore
+    let others = Poll.takeWoken()
     -- A task parks on `w` before the lock is let go, as `waitOn`'s first
     -- look would, rather than taking the lock again for it.
     let parked = match Co.running() {
@@ -182,6 +190,7 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
         None -> False
     }
     Poll.unlock()
+    wakeAll(ends, others)
     if parked { Co.suspend() }
     await(w)
 }

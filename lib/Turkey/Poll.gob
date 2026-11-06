@@ -277,8 +277,8 @@ var ended = 0
 
 -- Words changed by atomic instructions, since the locks above do not cover
 -- them: the next waiter's id; how many sources are counted in the interest;
--- 1 when a deadline has come before the one the polling worker waits for
--- since `takeHeadMoved`; that deadline (`watch`); and how many children are
+-- 1 when a deadline earlier than the one the polling worker waits for has
+-- been added since `takeHeadMoved`; that deadline (`watch`); and how many children are
 -- `exiting`.
 let words : Ptr = zeroedWords(5)
 let nextIdAt : Int = 0
@@ -370,10 +370,8 @@ fun publish(h : Heap) -> Unit {
     Ptr.atomicStore(h.earliest, 0, first)
 }
 
--- Put `w` on the running thread's heap. A deadline before the one the
--- polling worker waits for is noted for `takeHeadMoved`: read after the heap
--- shows `w`, so that a poller that set its deadline later saw `w` when it
--- chose it (`watch`).
+-- Put `w` on the running thread's heap. A deadline earlier than the one the
+-- polling worker waits for is noted for `takeHeadMoved`.
 fun timerAdd(w : Waiter) -> Unit {
     let at = Workers.index() % heapCount
     let h = heaps[at]
@@ -383,13 +381,21 @@ fun timerAdd(w : Waiter) -> Unit {
     if siftUp(h, len(h.items) - 1) == 0 { publish(h) }
     interestAdd(1)
     Lock.release(h.lock)
+    -- Read the watched deadline after the heap shows `w`. The poller stores
+    -- it (`watch`) before it reads the heaps, so either the poller sees `w`
+    -- or this sees the deadline it chose. That holds only because both sides
+    -- store and then load with `Ptr`'s atomics, each of which orders every
+    -- access around it; with weaker ones each load could pass the other
+    -- side's store and both would miss.
     if w.deadline < Ptr.atomicLoad(words, watchedAt) { Ptr.atomicStore(words, headMovedAt, 1) }
 }
 
--- Take `w` off its heap, if it is on one. The caller holds the lock `w`'s
--- waiting is changed under, which orders the read of `heapAt` after the
--- store that put it on the heap.
+-- Take `w` off its heap, if it is on one.
 fun timerRemove(w : Waiter) -> Unit {
+    -- Read `heapAt` without the heap's lock. The caller holds the lock `w`'s
+    -- waiting is changed under, which orders the read after the store that
+    -- put `w` on the heap. A sift on the heap may move `w` meanwhile, but
+    -- only the sign is used here, and `unheap` reads it again under the lock.
     if w.heapAt < 0 { return {} }
     let h = heaps[w.heap]
     Workers.acquire(h.lock)
@@ -413,13 +419,13 @@ fun unheap(h : Heap, w : Waiter) -> Unit {
     if i == 0 { publish(h) }
 }
 
--- The polling worker is about to wait until `deadline` (`noDeadline` while it
--- works out which, and for no deadline at all), or, at -1, waits no more: a
--- deadline added before it is noted (`timerAdd`).
+-- Records that the polling worker is about to wait until `deadline`
+-- (`noDeadline` while it works out which, and for no deadline at all), or, at
+-- -1, that it waits no more, and no deadline is noted (`timerAdd`).
 fun watch(deadline : Int) -> Unit = Ptr.atomicStore(words, watchedAt, deadline)
 
--- Whether a deadline has come before the one the polling worker waits for
--- since this was last asked: that worker has to be told.
+-- Returns whether a deadline earlier than the one the polling worker waits
+-- for has been added since the last call: that worker has to be told.
 fun takeHeadMoved() -> Bool =
     Ptr.atomicLoad(words, headMovedAt) != 0 && Ptr.atomicCas(words, headMovedAt, 1, 0) == 1
 

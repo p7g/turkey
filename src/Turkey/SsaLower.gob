@@ -1244,30 +1244,47 @@ fun builds(l : Lower, fn : Core) -> Bool = match fn.kind {
 
 -- With `-g`, records that `v` holds the local `name`, of type `ty`, bound at
 -- packed position `declared`: a parameter if `parameter`, and a variable
--- otherwise. A `var` kept in a slot holds whatever the slot does, which
+-- otherwise. A value of several slots is held by each of its slots, or by
+-- its box; a `var` kept in a slot holds whatever the slot does, which
 -- `Turkey.Promote` follows.
 --
 -- Only a name the source wrote is recorded: the compiler's own locals carry a
--- `%` in theirs. So is a value of several slots, which no one register or
--- word holds, and a record kept in the frame's slots.
+-- `%` in theirs. A record kept in the frame's slots is not, since no value
+-- holds it.
 fun named(l : Lower, name : String, ty : Ty.Type, declared : Int, parameter : Bool,
           v : Value) -> Unit {
     if !l.shared.variables || String.contains(name, "%") { return }
     let id = Ssa.valueId(v)
-    if Map.contains(l.held.multis, id) || Map.contains(l.localObjects, id) { return }
+    if Map.contains(l.localObjects, id) { return }
     let f = l.func
     let k = len(f.variables)
+    let variable = fun(t : Ty.Type, boxed : Bool) = Ssa.Variable {
+        name = name, declared = declared, parameter = parameter, ty = t,
+        layout = heldOf(l, t), boxed = boxed,
+    }
     match Map.get(l.localRefs, id) {
         Some((slot, _)) -> {
-            Vec.push(f.variables, Ssa.Variable { name = name, declared = declared,
-                                                 parameter = parameter,
-                                                 ty = Core.refElem(ty) })
+            let content = Core.refElem(ty)
+            Vec.push(f.variables, variable(content, isMulti(heldOf(l, content))))
             Map.put(f.slotHolds, slot, k)
+            return
+        }
+        None -> {}
+    }
+    match Map.get(l.held.multis, id) {
+        Some(Slots(_, values)) -> {
+            Vec.push(f.variables, variable(ty, False))
+            for var j = 0; j < len(values); j = j + 1 {
+                Ssa.hold(f, Ssa.valueId(values[j]), k, j)
+            }
+        }
+        Some(Boxed(_, box)) -> {
+            Vec.push(f.variables, variable(ty, True))
+            Ssa.hold(f, Ssa.valueId(box), k, -1)
         }
         None -> {
-            Vec.push(f.variables, Ssa.Variable { name = name, declared = declared,
-                                                 parameter = parameter, ty = ty })
-            Ssa.hold(f, id, k)
+            Vec.push(f.variables, variable(ty, False))
+            Ssa.hold(f, id, k, -1)
         }
     }
 }

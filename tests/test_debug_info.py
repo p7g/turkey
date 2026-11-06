@@ -120,6 +120,52 @@ fun main() {
 }
 """
 
+# A function a debugger stops in twice, with a variable of each kind of type
+# live at both stops: `look` calls itself, so it is not inlined, and every
+# parameter is read after the second stop. The strings, the vector and the
+# tree are live across calls, so the collector roots them and they move from
+# their registers into frame slots.
+VALUES = """\
+type Point = Point { x : Int, y : Int }
+type Color = Red | Green | Blue
+type Tree = Leaf | Node(Tree, Int, Tree)
+
+fun depth(t : Tree) -> Int = match t {
+    Leaf -> 0
+    Node(l, _, r) -> 1 + depth(l) + depth(r)
+}
+
+fun look(n : Int, s : String, p : Point, c : Color, t : Tree, o : Option String,
+         v : Vec Int) -> Int {
+    if n > 1000 { return look(n - 1, s, p, c, t, o, v) }
+    let total = n * 2
+    print(s)
+    let d = depth(t)
+    print(Int.toString(len(v)))
+    print(s + Option.unwrapOr(o, ""))
+    let shade = match c {
+        Red -> 1
+        Green -> 2
+        Blue -> 3
+    }
+    print(s)
+    n + total + d + p.x + p.y + shade + len(v) + String.byteLength(Option.unwrapOr(o, ""))
+        + depth(t)
+}
+
+fun main() {
+    let v = Vec.new(4)
+    for x in [1, 2, 3] { Vec.push(v, x * 10) }
+    let tree = Node(Node(Leaf, 1, Leaf), 2, Leaf)
+    print(look(5, "hi", Point { x = 3, y = 4 }, Green, tree, Some("there"), v))
+}
+"""
+
+# The lines of `VALUES` a debugger stops at: before the first call, and
+# after two more.
+FIRST_STOP = 15
+SECOND_STOP = 18
+
 pytestmark = pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 
 
@@ -277,6 +323,95 @@ def test_a_parameter_has_a_location_list(how):
     assert n, "no formal parameter 'n'"
     assert any(re.search(r"DW_AT_location\s+\(indexed .* loclist", a) and "DW_OP_reg" in a
                for a in n), n
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_the_types_describe_how_values_are_held(how):
+    """An `Int` is a name for a C `long`; an enumeration is an enumeration of
+    its constructors; a record in its slots is a structure of its fields; a
+    boxed sum is a pointer to its object, whose tag is an enumeration and
+    whose constructors are a union; a compact `Option` is a union of its
+    word as its nullaries and as its payload."""
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how, VALUES) / "prog.o")
+    def named(tag: str, name: str) -> list[str]:
+        return [a for _, t, a in entries if t == tag and f'DW_AT_name\t("{name}")' in a]
+    assert named("DW_TAG_typedef", "Int") and named("DW_TAG_base_type", "long")
+    assert named("DW_TAG_enumeration_type", "Color")
+    assert named("DW_TAG_enumerator", "Green")
+    assert named("DW_TAG_structure_type", "Point")
+    assert named("DW_TAG_member", "x") and named("DW_TAG_member", "y")
+    assert named("DW_TAG_structure_type", "Tree")
+    assert named("DW_TAG_enumeration_type", "Tree tag")
+    assert named("DW_TAG_union_type", "Tree")
+    assert named("DW_TAG_union_type", "Option String")
+    assert named("DW_TAG_typedef", "String") and named("DW_TAG_typedef", "Vec Int")
+
+
+def _locals(text: str) -> dict[str, str]:
+    """Each `name = value` a debugger printed on a line of its own, nested
+    or not, the last one printed for each name."""
+    found = {}
+    for match in re.finditer(r"^\s*(?:\([^)]*\) )?(\w+) = (.*)$", text, re.MULTILINE):
+        found[match.group(1)] = match.group(2).strip()
+    return found
+
+
+def _stops(out: str, marker: str) -> list[str]:
+    """The text between each line that is `marker` and the next."""
+    return re.split(f"^{re.escape(marker)}$", out, flags=re.MULTILINE)[1:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_shows_the_variables_at_each_stop(how):
+    lldb = _lldb()
+    out = _debugged(how, [lldb, "--batch",
+                          "-o", f"breakpoint set --file prog.gob --line {FIRST_STOP}",
+                          "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
+                          "-o", "run", "-o", "script print('== stop')",
+                          "-o", "frame variable n c p total",
+                          "-o", "frame variable *t", "-o", "frame variable -- *s",
+                          "-o", "continue", "-o", "script print('== stop')",
+                          "-o", "frame variable n c p total d",
+                          "-o", "frame variable *v", "-o", "frame variable -- *s",
+                          "-o", "kill", "./prog"], VALUES)
+    stops = _stops(out, "== stop")
+    assert len(stops) == 2, out[-4000:]
+    for stop in stops:
+        seen = _locals(stop)
+        assert seen.get("n") == "5", stop
+        assert seen.get("c") == "Green", stop
+        assert seen.get("x") == "3" and seen.get("y") == "4", stop
+        assert seen.get("total") == "10", stop
+        assert seen.get("length") in ("2", "3"), stop
+    assert _locals(stops[0]).get("tag") == "Node", stops[0]
+    assert '"hi"' in stops[0] and '"hi"' in stops[1]
+    assert _locals(stops[1]).get("d") == "2", stops[1]
+    assert re.search(r"length = 3", stops[1]), stops[1]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_shows_the_variables_at_each_stop(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-ex", f"break prog.gob:{FIRST_STOP}",
+                          "-ex", f"break prog.gob:{SECOND_STOP}",
+                          "-ex", "run", "-ex", "echo == stop\\n", "-ex", "info args",
+                          "-ex", "info locals", "-ex", "print *t",
+                          "-ex", "continue", "-ex", "echo == stop\\n", "-ex", "info args",
+                          "-ex", "info locals", "-ex", "print *v",
+                          "-ex", "kill", "./prog"], VALUES)
+    stops = _stops(out, "== stop")
+    assert len(stops) == 2, out[-4000:]
+    for stop in stops:
+        seen = _locals(stop)
+        assert seen.get("n") == "5", stop
+        assert seen.get("c") == "Green", stop
+        assert re.search(r"p = \{x = 3, y = 4\}", stop), stop
+        assert seen.get("total") == "10", stop
+    assert re.search(r"tag = Node", stops[0]), stops[0]
+    assert _locals(stops[1]).get("d") == "2", stops[1]
+    assert re.search(r"length = 3", stops[1]), stops[1]
 
 
 @pytest.mark.parametrize("how", PATHS)

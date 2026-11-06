@@ -1,6 +1,6 @@
 export (
     Value(..), valueId, BlockId(..), blockId,
-    RepClass(..), Rep(..), traced, untraced, Layout(..), layoutName, keyName,
+    RepClass(..), Rep(..), traced, untraced, Layout(..), layoutName, keyName, slotName,
     Effects(..), reads_, writes, allocates, traps, diverges,
     isSafepoint, deletable,
     Term(..), successors, switchTargets,
@@ -339,11 +339,12 @@ type Func i = Func {
     -- from 1 by the site field of a position (`Turkey.Position`).
     var sites : Vec Position.Site,
     -- With `-g`, the variables of the source the function binds, and the
-    -- ones each value holds, by value id: a value holds a variable from its
-    -- definition on (`holding`). Debug information is the only reader, so
-    -- a pass that loses a value's entry loses only what a debugger shows.
+    -- ones each value holds, by value id: a value holds a variable, or one
+    -- slot of a variable held in several, from its definition on
+    -- (`holding`). Debug information is the only reader, so a pass that
+    -- loses a value's entry loses only what a debugger shows.
     var variables : Vec Variable,
-    var holds     : Map Int (Vec Int),
+    var holds     : Map Int (Vec (Int, Int)),
     -- The variable each slot of a `var` holds, by slot, which `Turkey.Promote`
     -- gives the values it puts in the slot's place.
     var slotHolds : Map Int Int,
@@ -364,23 +365,35 @@ fun newFunc(name : String, results : Array Rep) -> Func i = Func {
 
 -- A local of the source, as a debugger shows it: its name, the position of
 -- its binding (`Turkey.Position`), whether it is one of the function's
--- parameters, and its type.
-type Variable = Variable { name : String, declared : Int, parameter : Bool, ty : Ty.Type }
-
--- The variables value `id` holds, as indices into `Func.variables`.
-fun holding(f : Func i, id : Int) -> Vec Int = Map.getOr(f.holds, id, [])
-
--- Records that value `id` holds variable `k` from its definition on.
-fun hold(f : Func i, id : Int, k : Int) -> Unit = match Map.get(f.holds, id) {
-    Some(ks) -> if !Vec.contains(ks, k) { Vec.push(ks, k) }
-    None -> Map.put(f.holds, id, [k])
+-- parameters, its type, and how it is held: at `layout`, in its slots, or in
+-- one pointer to an object of them if `boxed`.
+type Variable = Variable {
+    name      : String,
+    declared  : Int,
+    parameter : Bool,
+    ty        : Ty.Type,
+    layout    : Layout,
+    boxed     : Bool,
 }
 
--- Gives value `to` the variables `from` holds: for a pass that replaces
--- every read of `from` with `to`.
+-- What value `id` holds: each variable, as an index into `Func.variables`,
+-- and which of its slots, or -1 for the whole of it.
+fun holding(f : Func i, id : Int) -> Vec (Int, Int) = Map.getOr(f.holds, id, [])
+
+-- Records that value `id` holds slot `slot` of variable `k`, or the whole of
+-- it if `slot` is -1, from its definition on.
+fun hold(f : Func i, id : Int, k : Int, slot : Int) -> Unit = match Map.get(f.holds, id) {
+    Some(held) -> if !Iterator.any(held, fun((k2, s2)) = k2 == k && s2 == slot) {
+        Vec.push(held, (k, slot))
+    }
+    None -> Map.put(f.holds, id, [(k, slot)])
+}
+
+-- Gives value `to` what `from` holds: for a pass that replaces every read
+-- of `from` with `to`.
 fun carryHolds(f : Func i, from : Int, to : Int) -> Unit {
     if from == to { return }
-    for k in holding(f, from) { hold(f, to, k) }
+    for (k, slot) in holding(f, from) { hold(f, to, k, slot) }
 }
 
 -- A value of the given representation, appended to the function's table.

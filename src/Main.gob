@@ -59,6 +59,7 @@ import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Dwarf as Dwarf
 import Turkey.Locations as Locations
+import Turkey.DebugTypes as DebugTypes
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
@@ -370,6 +371,9 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("select") { dumpSelect(b, path, module_) }
     write(String.drain(b))
     if through("select") { return }
+    -- With `-g`, the types of the variables, as they are named.
+    let types = DebugTypes.new(checked.decls,
+                               SsaLower.tagsOf(checked.decls, Map.keys(checked.classes.classes)))
     -- The listing and the assembly come from one emission, each consumer
     -- with its own text, since the program's text is too large to emit twice.
     let outs = []
@@ -389,7 +393,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
-            let refused = emitModule(path, entry, module_, files, outs)
+            let refused = emitModule(path, entry, module_, files, types, outs)
             -- A function that is not there is a link error at best, and no
             -- error at all if its callers were refused too.
             if len(refused) > 0 {
@@ -407,9 +411,9 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
         Some(Sink { to, .. }) -> {
             Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
                                    render = Stream.print })
-            let _ = emitModule(path, entry, module_, files, outs)
+            let _ = emitModule(path, entry, module_, files, types, outs)
         }
-        None -> { let _ = emitModule(path, entry, module_, files, outs) }
+        None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
     }
     if wants("positions") {
         showCoverage(coverage, b)
@@ -977,7 +981,7 @@ type Out = Out {
 --
 -- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
-              files : Position.Files, outs : Vec Out) -> Vec String {
+              files : Position.Files, types : DebugTypes.Types, outs : Vec Out) -> Vec String {
     let refused = []
     let note = fun(text) { for o in outs { String.push(o.text, text) } }
     -- Each consumer empties the array it is handed, so all but the last are
@@ -1120,7 +1124,8 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         }
         Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {
             producer = "boot", name = path, directory = directory, low = textStart,
-            high = textEnd, functions = functions,
+            high = textEnd, functions = functions, types = DebugTypes.entries(types),
+            typeOf = DebugTypes.typeOf(types, _),
         }, code)
     }
     consume(asm.dialect, code)

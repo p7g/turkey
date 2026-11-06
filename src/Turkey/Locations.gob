@@ -16,8 +16,18 @@ export (locate)
 -- * a frame slot, from the store into it on, for a value the collector roots
 --   (`Turkey.Roots`) or the allocator spills: such a slot holds that one
 --   value until the frame ends, so the value is there for as long as any of
---   its reloads is live, and between them too;
+--   its reloads is live, and between them too. Past its last use it is still
+--   there, to the end of its block and in every block its block dominates,
+--   since the store is behind each of those; a range that only that keeps
+--   gives way to any other of the variable's;
 -- * otherwise its register.
+--
+-- A variable held in several slots is in several values at once, one per
+-- slot: its location is each slot's in turn, each a piece of the slot's
+-- width, so that a debugger reads the slots as one structure
+-- (`Turkey.DebugTypes`). Such a variable is somewhere only where every one
+-- of its slots is: a debugger shows an empty piece as zero, which would be a
+-- value the program never had.
 --
 -- A slot is addressed from the frame base, `x29`, which the prologue sets
 -- before any range starts, at its offset in `Turkey.Frame`'s layout less the
@@ -37,6 +47,7 @@ import Turkey.Dwarf as Dwarf
 import Turkey.Emit as Emit
 import Turkey.Frame as Frame
 import Turkey.Regalloc as Regalloc
+import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Func, BlockId(..), RepClass(..), Value(..))
 
@@ -45,6 +56,8 @@ import Turkey.Ssa (Func, BlockId(..), RepClass(..), Value(..))
 -- (`Emit.markKey`), with the keys that order the ends among the function's
 -- points.
 type Range = Range {
+    -- Whether the range only follows a slot past the value's last use.
+    weak          : Bool,
     lowBlock      : Int,
     low           : Int,
     var highBlock : Int,
@@ -86,7 +99,16 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
     let edges = Emit.computedAtEdges(f)
     let rank = Array.filled(len(f.blocks), -1)
     for var k = 0; k < len(order); k = k + 1 { rank[order[k]] = k }
-    let ranges : Array (Vec Range) = Array.init(len(f.variables), fun(_) = [])
+    let idom = Ssa.dominators(followed)
+    -- Each value found in its slot so far, and the first block it was found
+    -- in, which every later block it dominates has the store behind: blocks
+    -- are placed in an order that puts a block after its dominator.
+    let homes : Vec (Int, Int) = []
+    let homed = Map.new()
+    -- Each variable's ranges, per slot: one list for a variable held as one
+    -- value.
+    let ranges : Array (Array (Vec Range)) = Array.map(f.variables, fun(v) =
+        Array.init(pieceCount(v), fun(_) = []))
     let labeled = fun(id) = len(Ssa.holding(f, origin[id])) > 0
                             && f.reps[id].class_ != Unit
     for b in order {
@@ -125,33 +147,60 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
         for v in Ssa.termUses(block.term) {
             if Map.contains(starts, Ssa.valueId(v)) { Map.put(ends, Ssa.valueId(v), n) }
         }
+        -- A value in a slot, in a block its own dominates, past its last use.
+        let weak = Map.new()
+        for (id, home) in homes {
+            if home != b && !Map.contains(starts, id)
+               && Ssa.dominates(idom, BlockId(home), BlockId(b)) {
+                Map.put(starts, id, 0)
+                Map.put(weak, id, ())
+            }
+        }
         for (id, start) in Map.entries(starts) {
-            let end = if BitSet.contains(liveOut[b], id) { n + 1 }
-                      else { Map.getOr(ends, id, start) }
-            let (low, expression) = match slots[id] {
-                Some(m) -> if !Map.contains(defined, id) { (start, slotted(l, m)) } else {
+            -- Where the range starts, its location, and whether that is a slot.
+            let (low, expression, inSlot) = match slots[id] {
+                Some(m) -> if !Map.contains(defined, id) { (start, slotted(l, m), True) } else {
                     let stored = storedAt(block.insts, id, start)
-                    if stored >= 0 { (stored, slotted(l, m)) }
-                    else { (start, register(f, a, id)) }
+                    if stored >= 0 { (stored, slotted(l, m), True) }
+                    else { (start, register(f, a, id), False) }
                 }
-                None -> (start, register(f, a, id))
+                None -> (start, register(f, a, id), False)
             }
-            if low < end && len(expression) > 0 {
-                for k in Ssa.holding(f, origin[id]) {
-                    Vec.push(ranges[k], Range {
-                        lowBlock = b, low = low, highBlock = b, high = end,
-                        from = rank[b] << 32 | low, to = rank[b] << 32 | end,
-                        expression = expression,
-                    })
+            if inSlot && !Map.contains(homed, id) {
+                Map.put(homed, id, ())
+                Vec.push(homes, (id, b))
+            }
+            let end = if inSlot || BitSet.contains(liveOut[b], id) { n + 1 }
+                      else { Map.getOr(ends, id, start) }
+            let add = fun(from : Int, to : Int, at : Array Int) {
+                if from < to && len(at) > 0 {
+                    for (k, slot) in Ssa.holding(f, origin[id]) {
+                        let pieces = ranges[k]
+                        let j = if slot < 0 { 0 } else { slot }
+                        if (slot < 0) == (len(pieces) == 1) && j < len(pieces) {
+                            Vec.push(pieces[j], Range {
+                                weak = Map.contains(weak, id),
+                                lowBlock = b, low = from, highBlock = b, high = to,
+                                from = rank[b] << 32 | from, to = rank[b] << 32 | to,
+                                expression = at,
+                            })
+                        }
+                    }
                 }
             }
+            -- Until the store, the value is only in its register.
+            if low > start { add(start, low, register(f, a, id)) }
+            add(low, end, expression)
         }
     }
     let variables = []
     for var k = 0; k < len(f.variables); k = k + 1 {
         let v = f.variables[k]
         let locations = []
-        for r in merged(clipped(ranges[k]), f) {
+        let whole = if len(ranges[k]) == 1 { clipped(ranges[k][0]) }
+                    else { pieced(Array.map(ranges[k], clipped),
+                                  Array.map(v.layout.slots, Rt.fieldWidth)) }
+        for r in merged(whole, f) {
             Vec.push(locations, Dwarf.Location {
                 low = mark(d, tag, marks, r.lowBlock, r.low),
                 high = mark(d, tag, marks, r.highBlock, r.high),
@@ -160,7 +209,7 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
         }
         Vec.push(variables, Dwarf.Variable {
             name = v.name, declared = v.declared, parameter = v.parameter, ty = v.ty,
-            locations = locations,
+            layout = v.layout, boxed = v.boxed, locations = locations,
         })
     }
     (marks, variables, base)
@@ -204,11 +253,15 @@ fun storedAt(insts : Vec A.Inst, id : Int, from : Int) -> Int {
 }
 
 -- The ranges in code order, each cut short where the next one starts: the
--- later value of a variable is the one a debugger should see. A range left
--- empty is dropped. Each range is in one block, so one that the next starts
--- inside is in the next one's block.
+-- later value of a variable is the one a debugger should see. Of two that
+-- start together, a weak one comes first, so that the other wins. A range
+-- left empty is dropped. Each range is in one block, so one that the next
+-- starts inside is in the next one's block.
 fun clipped(ranges : Vec Range) -> Vec Range {
-    let sorted = Vec.sortBy(ranges, fun(x, y) = Array.threeWay(x.from, y.from))
+    let sorted = Vec.sortBy(ranges, fun(x, y) = match Array.threeWay(x.from, y.from) {
+        EQ -> Array.threeWay(if x.weak { 0 } else { 1 }, if y.weak { 0 } else { 1 })
+        order -> order
+    })
     let out = []
     for var k = 0; k < len(sorted); k = k + 1 {
         let r = sorted[k]
@@ -217,6 +270,55 @@ fun clipped(ranges : Vec Range) -> Vec Range {
             r.to = sorted[k + 1].from
         }
         if r.from < r.to { Vec.push(out, r) }
+    }
+    out
+}
+
+-- How many slots variable `v` is held in apart: one if it is held as one
+-- value, its box included.
+fun pieceCount(v : Ssa.Variable) -> Int =
+    if v.boxed || len(v.layout.slots) <= 1 { 1 } else { len(v.layout.slots) }
+
+-- The ranges of a variable held in several slots, from each slot's ranges,
+-- clipped, and the slots' widths: a range for each stretch between two ends
+-- of any slot's ranges where every slot is somewhere, whose location is each
+-- slot's location there, as a piece of its width.
+fun pieced(slots : Array (Vec Range), widths : Array Int) -> Vec Range {
+    -- Every end, by its key, as its block and point.
+    let ends = Map.new()
+    for rs in slots {
+        for r in rs {
+            Map.put(ends, r.from, (r.lowBlock, r.low))
+            Map.put(ends, r.to, (r.highBlock, r.high))
+        }
+    }
+    let keys = Array.sort(Map.keys(ends))
+    let out = []
+    for var e = 0; e + 1 < len(keys); e = e + 1 {
+        let (from, to) = (keys[e], keys[e + 1])
+        -- A stretch lies in one block, as every range does.
+        if from >> 32 != to >> 32 { continue }
+        let expression = []
+        var everywhere = True
+        for var j = 0; j < len(slots) && everywhere; j = j + 1 {
+            var found = False
+            for r in slots[j] {
+                if !found && r.from <= from && to <= r.to {
+                    for byte in r.expression { Vec.push(expression, byte) }
+                    found = True
+                }
+            }
+            everywhere = found
+            Vec.push(expression, Dwarf.opPiece)
+            for byte in Dwarf.ulebBytes(widths[j]) { Vec.push(expression, byte) }
+        }
+        if everywhere {
+            let (lowBlock, low) = Map.getOr(ends, from, (0, 0))
+            let (highBlock, high) = Map.getOr(ends, to, (0, 0))
+            Vec.push(out, Range { weak = False, lowBlock = lowBlock, low = low, highBlock = highBlock,
+                                  high = high, from = from, to = to,
+                                  expression = Vec.toArray(expression) })
+        }
     }
     out
 }

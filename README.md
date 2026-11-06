@@ -175,6 +175,27 @@ and `info locals` in gdb show a function's parameters and locals wherever the
 code still holds them: in a register until its last use, or in the frame
 slot the collector or the register allocator keeps it in.
 
+The debug information describes values as the compiled code holds them, so
+without help a debugger shows a `String` as a pointer and a `Vec` as its
+storage. The formatters in `debugger/` show them as the source writes them --
+a `String` as its text, an `Array`, a `Vec` or a `Map` as its elements, a sum
+such as `Option` or `Either` as the constructor it holds, a record as its
+fields:
+
+```sh
+scripts/turkey-lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o 'frame variable'
+```
+
+`scripts/turkey-lldb` is lldb with `debugger/turkey_lldb.py` imported; in a
+session of your own, `command script import debugger/turkey_lldb.py` does the
+same. On Linux, a program built with `-g` names `turkey_gdb.py` for gdb to
+load, which it does once `~/.gdbinit` points it at the directory:
+
+```
+add-auto-load-scripts-directory /path/to/turkey/debugger
+add-auto-load-safe-path /path/to/turkey/debugger
+```
+
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and
 `perf record --call-graph=fp` on Linux, walk the stack and show the functions

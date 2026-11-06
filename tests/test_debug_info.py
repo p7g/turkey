@@ -47,6 +47,7 @@ from tests import bootc, toolchain
 from tests.test_encode import _code
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FORMATTERS = REPO_ROOT / "debugger"
 LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
@@ -136,8 +137,8 @@ fun depth(t : Tree) -> Int = match t {
 }
 
 fun look(n : Int, s : String, p : Point, c : Color, t : Tree, o : Option String,
-         v : Vec Int) -> Int {
-    if n > 1000 { return look(n - 1, s, p, c, t, o, v) }
+         v : Vec Int, m : Map String Int) -> Int {
+    if n > 1000 { return look(n - 1, s, p, c, t, o, v, m) }
     let total = n * 2
     print(s)
     let d = depth(t)
@@ -150,14 +151,17 @@ fun look(n : Int, s : String, p : Point, c : Color, t : Tree, o : Option String,
     }
     print(s)
     n + total + d + p.x + p.y + shade + len(v) + String.byteLength(Option.unwrapOr(o, ""))
-        + depth(t)
+        + depth(t) + Map.getOr(m, "one", 0)
 }
 
 fun main() {
     let v = Vec.new(4)
     for x in [1, 2, 3] { Vec.push(v, x * 10) }
     let tree = Node(Node(Leaf, 1, Leaf), 2, Leaf)
-    print(look(5, "hi", Point { x = 3, y = 4 }, Green, tree, Some("there"), v))
+    let m = Map.new()
+    Map.put(m, "one", 1)
+    Map.put(m, "two", 2)
+    print(look(5, "hi", Point { x = 3, y = 4 }, Green, tree, Some("there"), v, m))
 }
 """
 
@@ -415,6 +419,40 @@ def test_gdb_shows_the_variables_at_each_stop(how):
 
 
 @pytest.mark.parametrize("how", PATHS)
+def test_lldb_formatters_show_values_as_the_source_writes_them(how):
+    """`scripts/turkey-lldb`: a `String` as its text, a `Vec` as its
+    elements, a compact `Option` and a boxed sum as the constructor they
+    hold, a `Map` as its entries."""
+    _lldb()
+    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+                          "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
+                          "-o", "run", "-o", "frame variable s o v t m", "-o", "kill", "./prog"],
+                    VALUES)
+    assert re.search(r'\(String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
+    assert re.search(r'o = Some\("there"\)', out), out[-4000:]
+    assert re.search(r"v = 0x[0-9a-f]+ \[10, 20, 30\]", out), out[-4000:]
+    assert "t = 0x" in out and "Node(Node(Leaf, 1, Leaf), 2, Leaf)" in out, out[-4000:]
+    assert re.search(r'\["one"\] = 1', out) and re.search(r'\["two"\] = 2', out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_loads_the_formatters_the_program_names(how):
+    """gdb finds `turkey_gdb.py` by the name `.debug_gdb_scripts` gives it,
+    in the auto-load directory a user adds."""
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-iex", f"add-auto-load-safe-path {FORMATTERS}",
+                          "-iex", f"add-auto-load-scripts-directory {FORMATTERS}",
+                          "-ex", f"break prog.gob:{SECOND_STOP}", "-ex", "run",
+                          "-ex", "info args", "-ex", "kill", "./prog"], VALUES)
+    assert re.search(r'^s = "hi"', out, re.MULTILINE), out[-4000:]
+    assert re.search(r'^o = Some.*"there"', out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^v = .*10, 20, 30", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^t = Node", out, re.MULTILINE), out[-4000:]
+    assert re.search(r'"one".*1', out) and re.search(r'"two".*2', out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
 def test_debug_lines_writes_no_variables(how):
     tool = _needs_dwarfdump()
     entries = _entries(tool, _built(how, PROGRAM, "--debug=lines") / "prog.o")
@@ -549,7 +587,8 @@ def test_gdb_stops_at_a_line_and_names_the_frames(how):
 # -- the object against the assembler ------------------------------------------
 
 DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists",
-                  "debug_loclists", "debug_str", "debug_line", "debug_line_str"]
+                  "debug_loclists", "debug_str", "debug_line", "debug_line_str",
+                  "debug_gdb_scripts"]
 # The sections GNU `as` builds its own way, compared by their rows on ELF.
 LINE_SECTIONS = {"debug_line", "debug_line_str"}
 

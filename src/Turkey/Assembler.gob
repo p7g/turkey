@@ -29,12 +29,19 @@ export (
 -- a `.loc`'s row, and the two tables are compared byte for byte. A debug
 -- section is made only when an item names it, so a module that names none
 -- has the same sections, in the same order, as one built without `-g`.
+--
+-- **Unwind information.** In the same way, each function's frame rules
+-- (`Cfi`) are kept, and the sections an unwinder reads are written from them
+-- at finish (`Turkey.Unwind`): on Mach-O, a compact unwind entry for every
+-- function and a DWARF description in `__eh_frame` for one compact unwind
+-- cannot encode; on ELF, `.eh_frame` for every function.
 
 import Data.Set as Set
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
 import Turkey.Dwarf as Dwarf
-import Turkey.Stream (Item(..))
+import Turkey.Stream (Item(..), Cfi(..))
+import Turkey.Unwind as Unwind
 
 -- What the assembler needs to know about an instruction set, whose
 -- instructions are `i` and whose fields that refer to a symbol are `f`.
@@ -61,6 +68,10 @@ type Use f
     -- which is in this object: a reference from one debug section into
     -- another.
     | Offset32
+    -- Four bytes, or eight, holding the target's address less the field's
+    -- own: a function's address in `.eh_frame`.
+    | Relative32
+    | Relative64
 
 -- A field the linker fills in: at `offset` in its section, referring to
 -- `target`.
@@ -101,6 +112,18 @@ type Pending f = Pending { section : Int, offset : Int, use : Use f, target : Sy
 -- less `from`'s.
 type Distance = Distance { section : Int, offset : Int, to : Symbol, from : Symbol }
 
+-- A function's frame rules, from its `StartProc` to its `EndProc`: the
+-- section, a label the assembler made at its start, the named symbol defined
+-- there if there is one, and its offsets and rules (`Unwind.Proc`).
+type Frame = Frame {
+    section  : Int,
+    label    : Symbol,
+    function : Option Symbol,
+    start    : Int,
+    var end  : Int,
+    rules    : Vec (Int, Cfi),
+}
+
 type Assembler i f = Assembler {
     isa         : Isa i f,
     -- What the labels the assembler makes for itself are spelled for.
@@ -130,6 +153,10 @@ type Assembler i f = Assembler {
     -- whether it ends the prologue.
     var loc      : Int,
     var prologue : Bool,
+    -- Every function's rules, in order; the last is open until its
+    -- `EndProc`.
+    frames       : Vec Frame,
+    var open     : Bool,
 }
 
 -- The sections every object has, first and in this order, which is the
@@ -149,9 +176,11 @@ fun kindNumber(s : Asm.Section) -> Int = match s {
     Asm.DebugLineStr -> 9
     Asm.DebugAddr -> 10
     Asm.DebugRnglists -> 11
+    Asm.CompactUnwind -> 12
+    Asm.EhFrame -> 13
 }
 
-let kinds = 12
+let kinds = 14
 
 -- An assembler for `isa`, whose own labels are spelled for `d`.
 fun new(isa : Isa i f, d : Asm.Dialect) -> Assembler i f {
@@ -172,6 +201,8 @@ fun new(isa : Isa i f, d : Asm.Dialect) -> Assembler i f {
         sequenced = [],
         loc = -1,
         prologue = False,
+        frames = [],
+        open = False,
     }
     for kind in sectionOrder { let _ = sectionIndex(a, kind) }
     a
@@ -266,6 +297,7 @@ fun feedItem(a : Assembler i f, item : Item i) -> Unit {
             a.loc = at
             a.prologue = prologueEnd
         }
+        Cfi(rule) -> frameRule(a, rule)
     }
 }
 
@@ -276,7 +308,41 @@ fun takesRow(item : Item i) -> Bool = match item {
     Instruction(_) | Word(_) | WordOf(_) | Bytes(_) | CString(_) | Byte(_) | Uleb(_)
         | Difference(_, _) | UlebDifference(_, _) | SectionOffset(_, _) | Loc(_, _) -> True
     Architecture | Section(_) | Global(_) | FunctionType(_) | Align(_) | Label(_)
-        | Space(_) | Comment(_) | SourceFile(_, _, _) -> False
+        | Space(_) | Comment(_) | SourceFile(_, _, _) | Cfi(_) -> False
+}
+
+-- A rule of the open function, or its start or end.
+fun frameRule(a : Assembler i f, rule : Cfi) -> Unit {
+    let s = a.sections[a.current]
+    let at = len(s.bytes)
+    match rule {
+        StartProc -> {
+            if a.open { error("internal error: a function's frame rules start inside another's") }
+            let label = Asm.localLabel(a.dialect, "cfi" + Int.toString(len(a.frames)))
+            -- The function's own symbol, when its label is the one just
+            -- defined here.
+            var function = None
+            if len(a.defined) > 0 {
+                let d = a.defined[len(a.defined) - 1]
+                if d.section == a.current && d.offset == at {
+                    if let Named = d.symbol.kind { function = Some(d.symbol) }
+                }
+            }
+            defineAt(a, label, a.current, at)
+            Vec.push(a.frames, Frame { section = a.current, label = label, function = function,
+                                       start = at, end = at, rules = [] })
+            a.open = True
+        }
+        EndProc -> {
+            if !a.open { error("internal error: a function's frame rules end before they start") }
+            a.frames[len(a.frames) - 1].end = at
+            a.open = False
+        }
+        _ -> {
+            if !a.open { error("internal error: a frame rule outside any function") }
+            Vec.push(a.frames[len(a.frames) - 1].rules, (at, rule))
+        }
+    }
 }
 
 -- Returns the distance from `from` to `to`, both already placed in one
@@ -318,6 +384,13 @@ fun defineAt(a : Assembler i f, sym : Symbol, section : Int, offset : Int) -> Un
 -- offsets in one section, which is why only those fields are filled in.
 fun finish(a : Assembler i f) -> Object f {
     if len(a.files) > 0 { lines(a) }
+    if a.open { error("internal error: a function's frame rules never end") }
+    if len(a.frames) > 0 {
+        match a.dialect {
+            Asm.MachO -> compactUnwind(a)
+            Asm.Elf -> ehFrame(a, a.frames)
+        }
+    }
     for p in a.distances {
         let bytes = a.sections[p.section].bytes
         match (Map.get(a.labels, Asm.spell(p.to)), Map.get(a.labels, Asm.spell(p.from))) {
@@ -344,7 +417,8 @@ fun finish(a : Assembler i f) -> Object f {
                 } else {
                     Vec.push(s.relocations, relocation(p))
                 }
-                Address64 | Offset32 -> Vec.push(s.relocations, relocation(p))
+                Address64 | Offset32 | Relative32 | Relative64 ->
+                    Vec.push(s.relocations, relocation(p))
             }
             None -> {
                 if let Temporary = p.target.kind {
@@ -398,6 +472,53 @@ fun lines(a : Assembler i f) -> Unit {
         defineAt(a, sym, a.sequenced[k], sequences[k].rows[0].offset)
         Vec.push(a.pending, Pending { section = line, offset = base + t.addresses[k],
                                       use = Address64, target = sym })
+    }
+}
+
+-- `__compact_unwind`: per function, its address, its length, its encoding,
+-- and no personality or language-specific data. A function the encoding
+-- cannot describe is described in `__eh_frame` as well.
+fun compactUnwind(a : Assembler i f) -> Unit {
+    let k = sectionIndex(a, Asm.CompactUnwind)
+    let s = a.sections[k]
+    s.align = 3
+    let described = []
+    for frame in a.frames {
+        let encoding = Unwind.compactEncoding(frame.rules)
+        if Unwind.dwarfMode(encoding) { Vec.push(described, frame) }
+        let at = len(s.bytes)
+        zeros(s.bytes, 32)
+        Vec.push(a.pending, Pending { section = k, offset = at, use = Address64,
+                                      target = frame.label })
+        Byte.putLE(s.bytes, at + 8, 4, frame.end - frame.start)
+        Byte.putLE(s.bytes, at + 12, 4, encoding)
+    }
+    if len(described) > 0 { ehFrame(a, described) }
+}
+
+-- `.eh_frame`, for `frames`. On Mach-O each function's address refers to its
+-- own symbol, which the relocation has to name; on ELF, to the label at its
+-- start, which the writer turns into its section's.
+fun ehFrame(a : Assembler i f, frames : Vec Frame) -> Unit {
+    let k = sectionIndex(a, Asm.EhFrame)
+    let s = a.sections[k]
+    s.align = 3
+    let procs = Vec.map(frames, fun(frame) =
+        Unwind.Proc { start = frame.start, end = frame.end, rules = frame.rules })
+    let t = Unwind.ehFrame(a.dialect, procs)
+    let base = len(s.bytes)
+    for b in t.bytes { Vec.push(s.bytes, b) }
+    for var n = 0; n < len(frames); n = n + 1 {
+        let frame = frames[n]
+        let (use, target) = match a.dialect {
+            Asm.MachO -> match frame.function {
+                Some(sym) -> (Relative64, sym)
+                None -> error("internal error: a function described in __eh_frame has no symbol")
+            }
+            Asm.Elf -> (Relative32, frame.label)
+        }
+        Vec.push(a.pending, Pending { section = k, offset = base + t.addresses[n], use = use,
+                                      target = target })
     }
 }
 

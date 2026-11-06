@@ -170,12 +170,16 @@ its own line above `main` at the line of the call. There is no information
 about variables or types yet, so a debugger shows registers and memory rather
 than values.
 
-Profilers need no `-g` to name functions: every function keeps a frame pointer,
-so `sample PID` and Instruments on a Mac, and `perf record --call-graph=fp` on
-Linux, walk the stack and show the functions by name. With `-g`, Instruments
-and `perf report --sort srcline` also show the lines samples fall on, and
-Instruments shows inlined calls as frames. `sample` shows a sample in inlined
-code at the line of the outermost call.
+Profilers and backtraces need no `-g` to name functions. Every function keeps
+a frame pointer, so `sample PID` and Instruments on a Mac, and
+`perf record --call-graph=fp` on Linux, walk the stack and show the functions
+by name. Every build also carries unwind information -- compact unwind on a
+Mac, `.eh_frame` on Linux -- which lldb and gdb read to find a function's
+caller from any instruction in it, its first and its `ret` included. A
+backtrace inside a task or coroutine ends at the coroutine's base. With `-g`,
+Instruments and `perf report --sort srcline` also show the lines samples fall
+on, and Instruments shows inlined calls as frames. `sample` shows a sample in
+inlined code at the line of the outermost call.
 
 ### The C compiler, and running on another machine
 
@@ -235,9 +239,9 @@ programs run directly. CI does this on GitHub's arm64 runners
 running the suite and the fixed point split across jobs by
 `scripts/ci-shard.sh`.
 
-`tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump` and runs
-lldb on macOS and gdb on Linux, and skips a check, saying which tool is
-missing, where one is not installed.
+`tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump`, and it
+and `tests/test_unwind.py` run lldb on macOS and gdb on Linux; each skips a
+check, saying which tool is missing, where one is not installed.
 
 One group of tests depends on the C compiler, and skips, saying why, where it
 cannot do what it needs: under

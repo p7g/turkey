@@ -17,9 +17,10 @@ export (
 --
 --     sp + size + 8k    incoming stack argument k (the caller's outgoing area)
 --     recordAt          the frame record: saved x29, then x30; x29 points here
---     savesAt           callee-saved registers the colouring used, in pairs,
---                       directly below the record, where the emitter's
---                       `stp`s reach them from `x29` in any size of frame
+--     savesAt           callee-saved registers the colouring used, in whole
+--                       pairs (`pairs`), directly below the record, where
+--                       the emitter's `stp`s reach them from `x29` in any
+--                       size of frame
 --     rootsAt           root slots, one per rooted value (`Turkey.Roots`)
 --     spillsAt          spill slots, one per spilled untraced value
 --     objectsAt         objects built in the frame (`Turkey.Escape`), each
@@ -64,6 +65,9 @@ type Layout = Layout {
     savesAt  : Int,
     savedGp  : Vec Int,
     savedFp  : Vec Int,
+    -- The pairs the saves area holds, from the top down: each pair's bank
+    -- and lower register number (`savedPairs`).
+    pairs    : Vec (Bank, Int),
     rootsAt  : Int,
     roots    : Int,
     spillsAt : Int,
@@ -126,7 +130,8 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
         Vec.push(objectStarts, objectBytes)
         objectBytes = objectBytes + o.bytes
     }
-    let saves = 8 * even(len(savedGp)) + 8 * even(len(savedFp))
+    let pairs = savedPairs(savedGp, savedFp)
+    let saves = 16 * len(pairs)
     let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
     let size = (raw + 15) / 16 * 16
     let objectsAt = outgoing + (size - raw)
@@ -136,7 +141,8 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
     let recordAt = savesAt + saves
     let l = Layout {
         size = size, recordAt = recordAt, savesAt = savesAt,
-        savedGp = savedGp, savedFp = savedFp, rootsAt = rootsAt, roots = roots,
+        savedGp = savedGp, savedFp = savedFp, pairs = pairs, rootsAt = rootsAt,
+        roots = roots,
         spillsAt = spillsAt, spills = spills, objectsAt = objectsAt,
         objectStarts = objectStarts, objectBytes = objectBytes,
         outgoing = outgoing, maps = [], polls = Map.new(), stubs = Map.new(),
@@ -227,7 +233,27 @@ fun inRegister(a : Regalloc.Allocation, id : Int) -> Option Reg {
     Some(Physical(A.bankOf(a.func.reps[id]), colour))
 }
 
-fun even(n : Int) -> Int = n + n % 2
+-- The callee-saved pairs a function with these saved registers stores:
+-- `x19`/`x20` up to `x27`/`x28`, then `d8`/`d9` up to `d14`/`d15`, each one
+-- whose either register is saved, in that order. Each is named by its bank
+-- and its lower register.
+--
+-- Whole pairs, in this order, packed down from the frame record, because
+-- that is the one shape compact unwind's frame mode describes: a bit per
+-- pair, and the pairs present stored from `x29 - 8` down with the lower
+-- register at the higher address. A set that is not whole pairs stores the
+-- partner as well, which costs no instruction, since a lone register would
+-- take a `str` of its own.
+fun savedPairs(gp : Vec Int, fp : Vec Int) -> Vec (Bank, Int) {
+    let out = []
+    for var r = 19; r < 29; r = r + 2 {
+        if Vec.contains(gp, r) || Vec.contains(gp, r + 1) { Vec.push(out, (Gp, r)) }
+    }
+    for var r = 8; r < 16; r = r + 2 {
+        if Vec.contains(fp, r) || Vec.contains(fp, r + 1) { Vec.push(out, (Fp, r)) }
+    }
+    out
+}
 
 -- The callee-saved registers this function must save, in each file,
 -- ascending: the ones some value was coloured into, and the ones a call in it
@@ -307,7 +333,7 @@ fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
     if l.recordAt + 16 != l.size {
         Vec.push(out, "the frame record is not at the top of the frame")
     }
-    if l.savesAt + 8 * even(len(l.savedGp)) + 8 * even(len(l.savedFp)) != l.recordAt {
+    if l.savesAt + 16 * len(l.pairs) != l.recordAt {
         Vec.push(out, "the callee-saved registers are not directly below the frame record")
     }
     if l.outgoing > l.objectsAt || l.objectsAt + l.objectBytes != l.spillsAt

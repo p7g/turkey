@@ -1,0 +1,227 @@
+export (Proc(..), Frames(..), compactEncoding, dwarfMode, ehFrame)
+
+-- Functions' frame rules (`Turkey.Stream.Cfi`) as an unwinder reads them:
+-- compact unwind's one word per function, and `.eh_frame`'s DWARF
+-- description.
+--
+-- The system assembler is the oracle, as it is for the line table: what is
+-- built here is what it builds from the same rules printed as `.cfi_*`
+-- directives, byte for byte. Where the two formats differ below, in the code
+-- alignment, the address encoding and the padding, it is because their
+-- assemblers do, and the linkers and unwinders of each accept what their own
+-- assembler writes. Every function shares one CIE, whose only rule is the
+-- CFA at `sp`; a rule at a function's first instruction is the FDE's.
+
+import Turkey.Asm as Asm
+import Turkey.Dwarf as Dwarf
+import Turkey.Stream (Cfi(..))
+
+-- A function: its first and last offsets in its section, and each rule with
+-- the offset of the code it follows. `StartProc` and `EndProc` are the two
+-- offsets, not rules.
+type Proc = Proc { start : Int, end : Int, rules : Vec (Int, Cfi) }
+
+-- `.eh_frame`'s bytes, and where each function's address goes in them: the
+-- offset of each FDE's initial location, in the order of the functions.
+type Frames = Frames { bytes : Vec Byte, addresses : Vec Int }
+
+-- Compact unwind's modes on arm64.
+let frameless = 0x02000000
+let dwarf = 0x03000000
+let frame = 0x04000000
+
+-- The DWARF registers this reads the rules of.
+let fpColumn = 29
+let lrColumn = 30
+
+-- The compact unwind encoding of a function with these rules.
+--
+-- No rules is a function with no frame, whose return address is in `x30`
+-- throughout. Frame mode is the rules `Turkey.Emit` writes on Mach-O, in
+-- their order: the CFA at `x29` plus an offset, the return address and then
+-- `x29` saved in the record, and then each pair of registers below it, lower
+-- register first, at offsets that go down by 8 with no gap, the pairs
+-- ascending. Each pair present sets its bit. Anything else needs a DWARF
+-- description, whose mode the encoding then names.
+fun compactEncoding(rules : Vec (Int, Cfi)) -> Int {
+    if len(rules) == 0 { return frameless }
+    if len(rules) < 3 { return dwarf }
+    let record = match (rules[0], rules[1], rules[2]) {
+        ((_, DefCfa(base, _)), (_, SavedAt(lr, lrAt)), (_, SavedAt(fp, fpAt))) ->
+            if base == fpColumn && lr == lrColumn && fp == fpColumn && lrAt == fpAt + 8 {
+                Some(fpAt)
+            } else {
+                None
+            }
+        _ -> None
+    }
+    let fpAt = match record {
+        Some(at) -> at
+        None -> return dwarf
+    }
+    var encoding = frame
+    var at = fpAt
+    for var k = 3; k < len(rules); k = k + 2 {
+        if k + 1 >= len(rules) { return dwarf }
+        let bit = match (rules[k], rules[k + 1]) {
+            ((_, SavedAt(low, lowAt)), (_, SavedAt(high, highAt))) ->
+                if lowAt == at - 8 && highAt == at - 16 { pairBit(low, high) } else { 0 }
+            _ -> 0
+        }
+        -- The pairs ascend, x pairs before d pairs.
+        if bit == 0 || encoding & 0xFFF & -bit != 0 { return dwarf }
+        encoding = encoding | bit
+        at = at - 16
+    }
+    encoding
+}
+
+-- Whether a function with this encoding has a DWARF description instead.
+fun dwarfMode(encoding : Int) -> Bool = encoding == dwarf
+
+-- Frame mode's bit for a pair, 0 if it has none: `x19`/`x20` is 0x1 up to
+-- `x27`/`x28` at 0x10, and `d8`/`d9` is 0x100 up to `d14`/`d15` at 0x800.
+fun pairBit(low : Int, high : Int) -> Int {
+    if high != low + 1 { return 0 }
+    if low >= 19 && low <= 27 && low % 2 == 1 { return 1 << ((low - 19) / 2) }
+    if low >= 72 && low <= 78 && low % 2 == 0 { return 0x100 << ((low - 72) / 2) }
+    0
+}
+
+-- How each format's assembler lays out `.eh_frame`.
+type Layout = Layout {
+    -- The code alignment factor: every advance is a multiple of it.
+    codeAlign : Int,
+    -- The size of an FDE's address and length, and the encoding of the
+    -- address: relative to the field, in that many bytes.
+    pointer   : Int,
+    encoding  : Int,
+    -- What each FDE is padded to, and the last one.
+    padding   : Int,
+    lastPadding : Int,
+}
+
+fun layout(d : Asm.Dialect) -> Layout = match d {
+    Asm.MachO -> Layout { codeAlign = 1, pointer = 8, encoding = 0x10, padding = 8,
+                          lastPadding = 8 }
+    Asm.Elf -> Layout { codeAlign = 4, pointer = 4, encoding = 0x1B, padding = 4,
+                        lastPadding = 8 }
+}
+
+-- The data alignment factor: every saved register's offset is a multiple of
+-- it.
+let dataAlign = -8
+
+-- `.eh_frame` for `procs`, in order, in format `d`.
+fun ehFrame(d : Asm.Dialect, procs : Vec Proc) -> Frames {
+    let l = layout(d)
+    let out = []
+    let addresses = []
+    cie(out, l)
+    for var p = 0; p < len(procs); p = p + 1 {
+        let proc = procs[p]
+        let at = len(out)
+        le(out, 4, 0)
+        le(out, 4, at + 4)
+        Vec.push(addresses, len(out))
+        le(out, l.pointer, 0)
+        le(out, l.pointer, proc.end - proc.start)
+        Dwarf.uleb(out, 0)
+        var loc = proc.start
+        for var k = 0; k < len(proc.rules); k = k + 1 {
+            let (offset, r) = proc.rules[k]
+            if offset != loc {
+                advance(out, (offset - loc) / l.codeAlign)
+                loc = offset
+            }
+            rule(out, r)
+        }
+        pad(out, if p + 1 == len(procs) { l.lastPadding } else { l.padding })
+        Byte.putLE(out, at, 4, len(out) - at - 4)
+    }
+    Frames { bytes = out, addresses = addresses }
+}
+
+-- The CIE: version 1, augmentation "zR" for the address encoding, the return
+-- address in `x30`, and the CFA at `sp`, as at every function's entry.
+fun cie(out : Vec Byte, l : Layout) -> Unit {
+    let at = len(out)
+    le(out, 4, 0)
+    le(out, 4, 0)
+    for b in [1, 0x7A, 0x52, 0] { le(out, 1, b) }
+    Dwarf.uleb(out, l.codeAlign)
+    -- Signed LEB128 in one byte, which holds -64 to 63.
+    le(out, 1, dataAlign & 0x7F)
+    le(out, 1, lrColumn)
+    Dwarf.uleb(out, 1)
+    le(out, 1, l.encoding)
+    rule(out, DefCfa(31, 0))
+    pad(out, 4)
+    Byte.putLE(out, at, 4, len(out) - at - 4)
+}
+
+-- An advance of `delta` code alignment units, in the fewest bytes.
+fun advance(out : Vec Byte, delta : Int) -> Unit {
+    if delta < 0x40 {
+        le(out, 1, 0x40 | delta)
+    } else if delta < 0x100 {
+        le(out, 1, 0x02)
+        le(out, 1, delta)
+    } else if delta < 0x10000 {
+        le(out, 1, 0x03)
+        le(out, 2, delta)
+    } else {
+        le(out, 1, 0x04)
+        le(out, 4, delta)
+    }
+}
+
+-- A rule as a DWARF call frame instruction.
+fun rule(out : Vec Byte, r : Cfi) -> Unit = match r {
+    DefCfa(reg, offset) -> {
+        le(out, 1, 0x0C)
+        Dwarf.uleb(out, reg)
+        Dwarf.uleb(out, offset)
+    }
+    DefCfaOffset(offset) -> {
+        le(out, 1, 0x0E)
+        Dwarf.uleb(out, offset)
+    }
+    SavedAt(reg, offset) -> {
+        if offset % dataAlign != 0 || offset > 0 {
+            error("internal error: a register saved at CFA" + Int.toString(offset)
+                  + ", not a multiple of " + Int.toString(dataAlign) + " below it")
+        }
+        if reg < 64 {
+            le(out, 1, 0x80 | reg)
+        } else {
+            le(out, 1, 0x05)
+            Dwarf.uleb(out, reg)
+        }
+        Dwarf.uleb(out, offset / dataAlign)
+    }
+    Restored(reg) -> if reg < 64 {
+        le(out, 1, 0xC0 | reg)
+    } else {
+        le(out, 1, 0x06)
+        Dwarf.uleb(out, reg)
+    }
+    Undefined(reg) -> {
+        le(out, 1, 0x07)
+        Dwarf.uleb(out, reg)
+    }
+    RememberState -> le(out, 1, 0x0A)
+    RestoreState -> le(out, 1, 0x0B)
+    StartProc | EndProc -> error("internal error: a function's start or end as a frame rule")
+}
+
+fun le(out : Vec Byte, width : Int, n : Int) -> Unit {
+    let at = len(out)
+    for var k = 0; k < width; k = k + 1 { Vec.push(out, Byte.truncate(0)) }
+    Byte.putLE(out, at, width, n)
+}
+
+-- DW_CFA_nop up to a multiple of `to` bytes from the section's start.
+fun pad(out : Vec Byte, to : Int) -> Unit {
+    while len(out) % to != 0 { Vec.push(out, Byte.truncate(0)) }
+}

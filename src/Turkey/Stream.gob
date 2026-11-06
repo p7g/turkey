@@ -1,4 +1,4 @@
-export (Item(..), print)
+export (Item(..), Cfi(..), print)
 
 -- What the emitter produces: a module as a sequence of values, in the order
 -- they go into the object, over the target's instruction type `i`.
@@ -72,6 +72,37 @@ type Item i
     -- with no source line, which ends the previous row where a function
     -- with no position begins.
     | Loc(Int, Bool)
+    -- A rule of the call frame information at this point in the code, which
+    -- an unwinder reads to find the caller's frame. Takes no bytes.
+    | Cfi(Cfi)
+
+-- The call frame information's rules: where the canonical frame address
+-- (CFA) is, the value `sp` had before the call, and where each register's
+-- caller value is. A rule holds from the item it follows to the next rule,
+-- and every function starts with the CFA at `sp` and every register its
+-- caller's.
+--
+-- Registers are DWARF's numbers for arm64: `x0`-`x30` are 0-30, `sp` 31,
+-- and `d0`-`d31` 64-95.
+type Cfi
+    -- The function the rules describe starts at the next item, and ends at
+    -- the item before `EndProc`.
+    = StartProc
+    | EndProc
+    -- The CFA is the register plus the offset.
+    | DefCfa(Int, Int)
+    -- The CFA is its register plus this offset.
+    | DefCfaOffset(Int)
+    -- The register's caller value is saved at the CFA plus the offset.
+    | SavedAt(Int, Int)
+    -- The register holds its caller's value again.
+    | Restored(Int)
+    -- The register's caller value is lost. For the return address, the
+    -- frame is the outermost.
+    | Undefined(Int)
+    -- The rules as they stand, kept, and then put back.
+    | RememberState
+    | RestoreState
 
 -- The items as assembly text, appended to `b`, and the array emptied.
 --
@@ -131,7 +162,26 @@ fun printItem[Show i](d : Asm.Dialect, item : Item i, b : String.Builder) -> Uni
             String.push(b, if Position.isStmt(at) { " is_stmt 1" } else { " is_stmt 0" })
             String.push(b, "\n")
         }
+        Cfi(rule) -> line(b, "    " + directive(rule))
     }
+
+fun directive(rule : Cfi) -> String = match rule {
+    StartProc -> ".cfi_startproc"
+    EndProc -> ".cfi_endproc"
+    DefCfa(r, n) -> ".cfi_def_cfa " + register(r) + ", " + Int.toString(n)
+    DefCfaOffset(n) -> ".cfi_def_cfa_offset " + Int.toString(n)
+    SavedAt(r, n) -> ".cfi_offset " + register(r) + ", " + Int.toString(n)
+    Restored(r) -> ".cfi_restore " + register(r)
+    Undefined(r) -> ".cfi_undefined " + register(r)
+    RememberState -> ".cfi_remember_state"
+    RestoreState -> ".cfi_restore_state"
+}
+
+-- A DWARF register number as the assembler names the register.
+fun register(r : Int) -> String =
+    if r == 31 { "sp" }
+    else if r >= 64 { "d" + Int.toString(r - 64) }
+    else { "x" + Int.toString(r) }
 
 fun line(b : String.Builder, text : String) -> Unit {
     String.push(b, text)

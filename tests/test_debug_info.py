@@ -3,10 +3,13 @@
 `-g` works on both of `build`'s paths. As assembly, the `.file`/`.loc` rows
 are what the system assembler turns into `debug_line`; as an object, `boot`
 builds `debug_line` itself from the same rows. On both, `Turkey.Dwarf` writes
-the compile unit and the subprograms. So the checks are the tools a user would
-reach for, on a program built each way: `llvm-dwarfdump` reads the rows and
-verifies the DWARF, `nm` shows the debug map the macOS linker writes, and a
-debugger stops at a line and names the frames.
+the compile unit, the subprograms, and an inlined subroutine for each call the
+optimizer inlined. So the checks are the tools a user would reach for, on a
+program built each way: `llvm-dwarfdump` reads the rows and verifies the
+DWARF, `nm` shows the debug map the macOS linker writes, a debugger stops at a
+line and names the frames, inlined calls among them, and on macOS `atos`, which
+reads DWARF the way `sample` and Instruments do, names the inlined frames
+too.
 
 **The object's oracle is the assembler.** The object `boot` writes with `-g`
 has to carry the debug sections the system assembler makes of `boot`'s own
@@ -70,6 +73,53 @@ fun main() {
 FACT_LINES = {2, 3, 5}
 MAIN_LINES = {9, 10}
 
+# The README's example, whose `parseRectangle` and `area` the optimizer inlines
+# into `main`: `area` is called on line 18 and its body is line 11.
+RECTANGLES = """\
+type Rectangle = Rectangle { width : Int, height : Int }
+
+fun parseRectangle(text) {
+    let (width, height) = String.splitOnce(text, "x")?
+    Some(Rectangle {
+        width = Int.parse(width)?,
+        height = Int.parse(height)?
+    })
+}
+
+fun area(rect) = rect.width * rect.height
+
+fun main() {
+    var total = 0
+    for text in ["3x4", "5x2", "oops"] {
+        match parseRectangle(text) {
+            Some(rect) -> {
+                total = total + area(rect)
+            }
+            None -> print("Skipping: " + text)
+        }
+    }
+    print(total)
+}
+"""
+
+# A loop whose body is a call inlined into a call inlined into `main`, and
+# whose code the inlined calls cover in more than one range.
+LOOP = """\
+fun step(x : Int) -> Int = (x * 1103515245 + 12345) % 2147483648
+
+fun spin(n : Int) -> Int {
+    var x = 1
+    for var i = 0; i < n; i = i + 1 {
+        x = step(x)
+    }
+    x
+}
+
+fun main() {
+    print(spin(1000))
+}
+"""
+
 pytestmark = pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 
 
@@ -106,14 +156,14 @@ def _needs_dwarfdump() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _built(how: str) -> Path:
-    """`PROGRAM` built with `-g` and linked, in a directory of its own:
+def _built(how: str, program: str = PROGRAM) -> Path:
+    """`program` built with `-g` and linked, in a directory of its own:
     `prog.o` beside the executable as the macOS debug map needs it, and
     `prog`. `how` is `asm`, through `prog.s` and the assembler, or `obj`,
     with `boot` writing the object."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
-    source.write_text(PROGRAM, encoding="utf-8")
+    source.write_text(program, encoding="utf-8")
     output = "prog.s" if how == "asm" else "prog.o"
     compiled = subprocess.run(
         toolchain.command(bootc.binary(), "build", "-g", "-f", how, "-o", output,
@@ -171,11 +221,47 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how):
 
 @pytest.mark.parametrize("how", PATHS)
 @pytest.mark.parametrize("which", ["prog.o", "prog"])
-def test_the_dwarf_verifies(how, which):
+@pytest.mark.parametrize("program", [PROGRAM, RECTANGLES, LOOP], ids=["fact", "rectangles", "loop"])
+def test_the_dwarf_verifies(how, which, program):
     tool = _needs_dwarfdump()
-    result = subprocess.run([tool, "--verify", str(_built(how) / which)],
+    result = subprocess.run([tool, "--verify", str(_built(how, program) / which)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
+
+
+def _entries(tool: str, obj: Path) -> list[tuple[int, str, str]]:
+    """Every entry of `obj`'s `debug_info`, in order, as its depth, its tag,
+    and the text of its attributes."""
+    text = subprocess.run([tool, "--debug-info", str(obj)], capture_output=True,
+                          text=True, check=True).stdout
+    entries = []
+    for match in re.finditer(r"^0x[0-9a-f]+:( +)(DW_TAG_\w+)\n((?:[ \t]+\S.*\n)*)", text,
+                             re.MULTILINE):
+        entries.append((len(match.group(1)), match.group(2), match.group(3)))
+    return entries
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
+    """`area`'s body in `main`: an inlined subroutine inside `main`'s
+    subprogram, naming the abstract subprogram `area` and the line of the
+    call."""
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how, RECTANGLES) / "prog.o")
+    main = next(k for k, (_, tag, attributes) in enumerate(entries)
+                if tag == "DW_TAG_subprogram" and '("Main#main")' in attributes)
+    depth = entries[main][0]
+    inside = []
+    for entry in entries[main + 1:]:
+        if entry[0] <= depth:
+            break
+        inside.append(entry)
+    area = [attributes for _, tag, attributes in inside
+            if tag == "DW_TAG_inlined_subroutine" and '"Main#area@Rectangle")' in attributes]
+    assert area, "\n".join(a for _, _, a in inside)[-4000:]
+    assert any(re.search(r"DW_AT_call_line\s+\(18\)", a) for a in area), area
+    assert any(tag == "DW_TAG_subprogram" and '("Main#area@Rectangle")' in attributes
+               and "DW_INL_inlined" in attributes for _, tag, attributes in entries)
 
 
 @pytest.mark.parametrize("how", PATHS)
@@ -205,11 +291,11 @@ def _gdb() -> str:
     return "gdb"
 
 
-def _debugged(how: str, argv: list[str]) -> str:
-    """A debugger's batch run of the program, with what it printed. Bounded,
+def _debugged(how: str, argv: list[str], program: str = PROGRAM) -> str:
+    """A debugger's batch run of `program`, with what it printed. Bounded,
     since a breakpoint that never hits leaves the program to finish and the
     debugger to exit, and one that misbehaves must not hang the suite."""
-    result = subprocess.run(argv, cwd=_built(how), capture_output=True, text=True,
+    result = subprocess.run(argv, cwd=_built(how, program), capture_output=True, text=True,
                             timeout=120)
     return result.stdout + result.stderr
 
@@ -224,6 +310,73 @@ def test_lldb_stops_at_a_line_and_names_the_frames(how):
 
 
 @pytest.mark.parametrize("how", PATHS)
+def test_lldb_stops_in_an_inlined_function_and_shows_its_frame(how):
+    lldb = _lldb()
+    out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --name Main#area@Rectangle",
+                          "-o", "run", "-o", "bt", "-o", "kill", "./prog"], RECTANGLES)
+    assert re.search(r"frame #\d+: .*`Main#area@Rectangle at prog\.gob:11:\d+ \[inlined\]",
+                     out), out[-4000:]
+    assert re.search(r"frame #\d+: .*`Main#main at prog\.gob:18:\d+$", out,
+                     re.MULTILINE), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_stops_in_an_inlined_function_and_shows_its_frame(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break 'Main#area@Rectangle'",
+                          "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"], RECTANGLES)
+    assert re.search(r"#\d+ .*Main#area@Rectangle.* at prog\.gob:11", out), out[-4000:]
+    assert re.search(r"#\d+ .*Main#main.* at prog\.gob:18", out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_atos_names_the_inlined_frames(how):
+    """The system symbolizer, which `sample` and Instruments use, reads an
+    inlined call's range list and names each call around an address: at the
+    start of `step`'s code, `step`, then every call it is inside, then the
+    function they were all inlined into. It stops reading an object's DWARF
+    at an encoding it does not know, and then names no line at all."""
+    if not _darwin():
+        pytest.skip("atos is macOS's")
+    tool = _needs_dwarfdump()
+    directory = _built(how, LOOP)
+    entries = _entries(tool, directory / "prog.o")
+    assert any("DW_AT_ranges" in attributes for _, _, attributes in entries)
+    # The entries around the first inlined `step`, innermost first.
+    around: list[tuple[int, str, str]] = []
+    step = None
+    for entry in entries:
+        depth, tag, attributes = entry
+        around = [e for e in around if e[0] < depth]
+        if tag == "DW_TAG_inlined_subroutine" and '"Main#step")' in attributes:
+            step = attributes
+            break
+        if tag in ("DW_TAG_subprogram", "DW_TAG_inlined_subroutine"):
+            around.append(entry)
+    assert step is not None
+    function = re.search(r'DW_AT_name\s+\("([^"]+)"\)', around[0][2]).group(1)
+    callers = [re.search(r'DW_AT_abstract_origin\s+\(0x[0-9a-f]+ "([^"]+)"\)', a).group(1)
+               for _, _, a in reversed(around[1:])]
+    low = int(re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", around[0][2]).group(1), 16)
+    start = int(re.search(r"(?:DW_AT_low_pc\s+\(|\[)(0x[0-9a-f]+)", step).group(1), 16)
+    symbols = subprocess.run(["nm", str(directory / "prog")], capture_output=True, text=True,
+                             check=True).stdout
+    linked = int(re.search(r"^([0-9a-f]+) T _" + re.escape(function) + "$", symbols,
+                           re.MULTILINE).group(1), 16)
+    result = subprocess.run(["atos", "-i", "-o", "prog", "-l", "0x100000000",
+                             hex(linked + start - low)],
+                            cwd=directory, capture_output=True, text=True)
+    out = result.stdout + result.stderr
+    # A call inlined into `step` may start where it starts, and be named first.
+    frames = re.findall(r"^(\S+) \(in prog\) \((\S+):(\d+)\)$", out, re.MULTILINE)
+    names = [name for name, _, _ in frames]
+    assert "Main#step" in names, out
+    k = names.index("Main#step")
+    assert names[k:] == ["Main#step", *callers, function], out
+    assert frames[k][1:] == ("prog.gob", "1"), out
+
+
+@pytest.mark.parametrize("how", PATHS)
 def test_gdb_stops_at_a_line_and_names_the_frames(how):
     gdb = _gdb()
     out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break prog.gob:2", "-ex", "run",
@@ -234,7 +387,8 @@ def test_gdb_stops_at_a_line_and_names_the_frames(how):
 
 # -- the object against the assembler ------------------------------------------
 
-DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_str", "debug_line", "debug_line_str"]
+DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists", "debug_str",
+                  "debug_line", "debug_line_str"]
 # The sections GNU `as` builds its own way, compared by their rows on ELF.
 LINE_SECTIONS = {"debug_line", "debug_line_str"}
 

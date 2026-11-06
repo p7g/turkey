@@ -104,7 +104,7 @@ import Turkey.Prims as Prims
 import Turkey.Diag as Diag
 import Turkey.Methods as Methods
 import Turkey.Prelude as P
-import Turkey.Source (Span)
+import Turkey.Source (Span(..), InlineSite(..), inlinedAt)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), ConCell(..), TBottom, TCon, TApp, TFam, TFun, TTuple)
 import System.IO as IO
@@ -1213,7 +1213,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- the primitive costs. Held to the size limit, a bulk primitive's name
     -- would stay a call at every site and be specialized for every element type.
     if forwardsPrim(body) {
-        return Some(applyParams(r, params, args, body, e.ty, placing(r, e.span)))
+        return Some(applyParams(r, params, args, body, e.ty, placing(r, name, e.span)))
     }
     let size = sizeOf(r, name, key, body)
     if size > speculativeInlineLimit { return None }
@@ -1238,7 +1238,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- pointing at the standard library rather than at the code that failed.
     if endsOf(r, name, key, body) && size > bottomInlineLimit { return None }
     -- A copied callee body becomes part of this call site (`placing`).
-    let made = applyParams(r, params, args, body, e.ty, placing(r, e.span))
+    let made = applyParams(r, params, args, body, e.ty, placing(r, name, e.span))
     if size <= limit { return Some(made) }
     -- Restored to what it was, not to `False`. Speculation is meant not to
     -- nest -- the flag is the whole mechanism for that -- and clearing it on
@@ -2207,18 +2207,20 @@ type Placing
     -- The body is a second copy of a term that stays where it is, so every
     -- binder in it gets a fresh id.
     | Copying
-    -- As `Copying`, for a callee's body inlined at a call with this span, which
-    -- every node copied from the body takes.
-    | Inlined(Option Span)
+    -- As `Copying`, for the body of the binding named here inlined at a call
+    -- with this span, which every node copied from the body records
+    -- (`inlinedThrough`).
+    | Inlined(String, Option Span)
 
--- How a callee's body is placed at a call with `span`. Positions of inlined
--- code are read in two places: the giblet check, which names the line that
--- allocates in each function from a giblet on, and allocation counting by
--- site. So code inlined into a binding either one reads takes the call's span;
--- elsewhere the copy keeps the callee's own spans, which only an internal
--- error from a later Core check would show.
-fun placing(r : Reducer, span : Option Span) -> Placing =
-    if Set.contains(r.callSites, r.inlining.within) { Inlined(span) } else { Copying }
+-- How the body of `callee` is placed at a call with `span`. Positions of
+-- inlined code are read by the giblet check, which names the line that
+-- allocates in each function from a giblet on, by allocation counting by
+-- site, and by debug information. So code inlined into a binding one of them
+-- reads records the call; elsewhere the copy keeps the callee's own spans and
+-- shares every node it does not change, and only an internal error from a
+-- later Core check would show the difference.
+fun placing(r : Reducer, callee : String, span : Option Span) -> Placing =
+    if Set.contains(r.callSites, r.inlining.within) { Inlined(callee, span) } else { Copying }
 
 fun applyParams[Iterator p, Length p, Item p ~ CParam,
                 Index c, Key c ~ Int, Value c ~ Core, Iterator c, Item c ~ Core](
@@ -2265,7 +2267,10 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     var out = match how {
         Moving -> if len(subst) == 0 { body } else { moved(r, body, subst) }
         Copying -> copyWith(fun() = mint(r), body, subst, renamed, True, None)
-        Inlined(span) -> copyWith(fun() = mint(r), body, subst, renamed, True, Some(span))
+        Inlined(callee, span) -> {
+            let site = Option.map(span, fun(call) = InlineSite { callee = callee, call = call })
+            copyWith(fun() = mint(r), body, subst, renamed, True, Some(site))
+        }
     }
     for var i = len(lets) - 1; i >= 0; i = i - 1 {
         let ((name, id), arg) = lets[i]
@@ -2369,8 +2374,9 @@ type Copier = Copier {
     subst : Map Int Core,
     -- Whether a binder not in `renamed` gets a fresh id.
     freshen : Bool,
-    -- The span every node copied takes, if one does.
-    rebase : Option (Option Span),
+    -- The call every node copied is inlined through, if it is: with no span
+    -- for a call that has none (`inlinedThrough`).
+    rebase : Option (Option InlineSite),
     -- How many variables `subst` has replaced so far.
     var substituted : Int,
     -- How many binders and references `renamed` has renumbered so far, with
@@ -2380,7 +2386,7 @@ type Copier = Copier {
 
 fun copier(mint : fun() -> Int, subst : Map Int Core,
            renamed : Map Int (String, Int), freshen : Bool,
-           rebase : Option (Option Span)) -> Copier = Copier {
+           rebase : Option (Option InlineSite)) -> Copier = Copier {
     mint = mint, renamed = renamed, skolems = Map.new(), subst = subst,
     freshen = freshen,
     rebase = rebase, substituted = 0, changed = 0,
@@ -2389,13 +2395,13 @@ fun copier(mint : fun() -> Int, subst : Map Int Core,
 -- Returns `body` with each variable `subst` maps replaced by a copy of its own
 -- of the term it maps to, and each binder renamed as `renamed` says. When
 -- `freshen` holds, every other binder gets a fresh id from `mint`; when
--- `rebase` holds a span, every node copied from `body` takes it.
+-- `rebase` holds a call, every node copied from `body` is inlined through it.
 --
 -- Every rule that puts a second copy of a term into the program makes it
 -- here, which is what keeps each binder id bound once.
 fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
              renamed : Map Int (String, Int), freshen : Bool,
-             rebase : Option (Option Span)) -> Core =
+             rebase : Option (Option InlineSite)) -> Core =
     copyTerm(copier(mint, subst, renamed, freshen, rebase), body)
 
 fun copyTerm(c : Copier, e : Core) -> Core {
@@ -2482,7 +2488,7 @@ fun copyTerm(c : Copier, e : Core) -> Core {
         return e
     }
     let span = match c.rebase {
-        Some(s) -> s
+        Some(site) -> inlinedThrough(e.span, site)
         None -> e.span
     }
     let out = mkCore(typeIn(c, e.ty), span, kind)
@@ -2493,6 +2499,24 @@ fun copyTerm(c : Copier, e : Core) -> Core {
     if c.substituted == before { out.settledIn = e.settledIn }
     out
 }
+
+-- Returns the span a node with `span` takes in a copy inlined through `site`:
+-- its own text, with `site` at the root of its chain, so that a node already
+-- inlined into the callee keeps the calls it came through. A node with no
+-- span of its own takes the call's, and every node takes none at a call with
+-- no span.
+fun inlinedThrough(span : Option Span, site : Option InlineSite) -> Option Span = match site {
+    None -> None
+    Some(call) -> match span {
+        None -> Some(call.call)
+        Some(s) -> Some(atRoot(s, call))
+    }
+}
+
+fun atRoot(s : Span, site : InlineSite) -> Span = inlinedAt(s, Some(match s.inlined {
+    None -> site
+    Some(inner) -> InlineSite { callee = inner.callee, call = atRoot(inner.call, site) }
+}))
 
 -- What the binder spelled `name` with the id `id` becomes in the copy.
 fun bindName(c : Copier, name : String, id : Int) -> (String, Int) {

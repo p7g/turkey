@@ -758,20 +758,24 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
         Some(d) -> d
         None -> m.decl
     }
+    -- The method's own name, unqualified: messages name its class apart.
+    let method = Binders.nameAt(g.binders, decl.id, decl.span)
     let outer = assume(g, givens)
     push(g)
     -- Check the body against the expected type rather than inferring it and
     -- comparing afterwards. Each parameter is bound at its class-declared type
     -- and the body meets the declared result, so the givens apply to them from
     -- the first constraint on. Inferred, an unannotated parameter would be a
-    -- variable until the final equation, and a field read through it, or a
+    -- variable until a final equation, and a field read through it, or a
     -- family over it, would wait on that equation.
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
-                               decl.context, None, -1, Some(expected))
-    -- With the expected type pushed in, this equation fails only on an arity
-    -- mismatch, and it is the one that reports it. The class is named
-    -- separately.
-    let method = Binders.nameAt(g.binders, decl.id, decl.span)
+        decl.context, None, -1, Some((expected, "the result type of '" + method
+                                      + "' that class '" + m.cls + "' declares")))
+    -- With the arity right, `genFunction` has already equated the two types
+    -- part by part, so this equation fails only on the arity, and reports it.
+    -- It is a constraint rather than an error raised here, because an error
+    -- raised while generating ends the check before the errors of other units
+    -- are collected.
     eq(g, inferred, expected, Some(decl.span),
        "the type of '" + method + "' that class '" + m.cls + "' declares")
     let defn = pop(g)
@@ -1299,14 +1303,14 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
 -- `key` is the declaration's id when the caller wants a partial annotation's
 -- header recorded (an inferred member of a binding group), and -1 otherwise.
 -- `expected` is the function type the body is checked against, if the caller
--- has one. Its parameter types and result type are used in place of fresh
--- variables, so every constraint the body raises meets them from the start.
--- A type of a different arity is ignored here; the caller's own equation
--- with it reports the mismatch.
+-- has one, and the reason a mismatch with its result type is reported in. Its
+-- parameter types are used in place of fresh variables, and so is its result
+-- type unless a parameter pattern opens an existential. A type of a different
+-- arity is ignored here, and the caller reports the mismatch.
 fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
                 bodyExpr : Option Expr, where : Span, context : Vec Ast.Pred,
                 rigid : Option (Map String Ty.Type), key : Int,
-                expected : Option Ty.Type) -> Ty.Type {
+                expected : Option (Ty.Type, String)) -> Ty.Type {
     let scope = Map.new()
     match rigid {
         Some(r) -> for (n, t) in Map.entries(r) { Map.put(scope, n, t) }
@@ -1316,8 +1320,8 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     push(g)
 
     let (expectedParams, expectedRet) = match expected {
-        Some(TFun(ps, r)) -> if len(ps) == len(params) {
-            (Some(ps), Some(r))
+        Some((TFun(ps, r), why)) -> if len(ps) == len(params) {
+            (Some(ps), Some((r, why)))
         } else {
             (None, None)
         }
@@ -1338,13 +1342,23 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     })
     let openings = popOpenings(g)
 
-    let ret = match expectedRet {
-        Some(r) -> r
-        None -> fresh(g)
+    -- A constant a parameter pattern opens must not reach the result. Give the
+    -- result a fresh variable from outside the opened scope in that case, and
+    -- equate it with the declared result type only after the body, so the
+    -- body's equation with the variable reports the escape. Equating the body
+    -- with a rigid result first would report a plain mismatch with the hidden
+    -- type instead. The cost is that such a body is generated without its
+    -- result type known.
+    let opens = len(openings) > 0
+    let (ret, bodyWhy) = match expectedRet {
+        Some((r, why)) -> if opens { (fresh(g), "the function body") } else { (r, why) }
+        None -> (fresh(g), "the function body")
     }
-    match retAnnot {
-        Some(r) -> eq(g, ret, typeOf(g, r), Some(where), "the return type annotation")
-        None -> {}
+    if !opens {
+        match retAnnot {
+            Some(r) -> eq(g, ret, typeOf(g, r), Some(where), "the return type annotation")
+            None -> {}
+        }
     }
 
     -- On the inference path a declared context is emitted as an ordinary demand
@@ -1395,15 +1409,23 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     g.loopStack = loops
     discard(Vec.pop(g.fnStack))
     -- A body of type bottom leaves `ret` to be fixed by the `return`s.
-    eq(g, ret, bodyType, Some(where), "the function body")
+    eq(g, ret, bodyType, Some(where), bodyWhy)
     let inner = pop(g)
 
     -- A parameter that opened an existential scopes its rigid constants over
     -- the body and its `return`s; `ret` was made outside, so neither can hand
     -- one back.
     let defined = CDef(bindList, inner, False)
-    if len(openings) > 0 {
+    if opens {
         emit(g, openedConstraint(openings, defined, Some(where)))
+        match retAnnot {
+            Some(r) -> eq(g, ret, typeOf(g, r), Some(where), "the return type annotation")
+            None -> {}
+        }
+        match expectedRet {
+            Some((r, why)) -> eq(g, r, ret, Some(where), why)
+            None -> {}
+        }
     } else {
         emit(g, defined)
     }

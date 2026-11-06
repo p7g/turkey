@@ -2,6 +2,7 @@ export (
     Scope(..), newScope,
     Abstraction(..), newAbstraction,
     Use(..), newUse,
+    Hole(..), Proof(..), newHole,
     dictName, resetDictNames,
 )
 
@@ -14,7 +15,7 @@ export (
 -- definition has been solved -- so what travels is the record and not its
 -- contents.
 
-import Turkey.Classes (Evidence(..), MethodInfo(..))
+import Turkey.Classes (Evidence(..), InstInfo(..), MethodInfo(..))
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (Scheme(..), Pred(..))
@@ -61,7 +62,7 @@ fun newAbstraction() -> Abstraction = Abstraction {
     schemes = Map.new(), skolems = Map.new(),
 }
 
--- One occurrence of a name, and the evidence it turned out to need.
+-- One occurrence of a name, and the evidence the solver found it needs.
 --
 -- `typeArgs` is the other half of the same story, filled in beside the
 -- predicates by the same line of the solver. A use of a polymorphic name
@@ -77,6 +78,10 @@ type Use = Use {
     span         : Option Span,
     var preds    : Vec Pred,
     var scopes   : Vec Scope,
+    -- One per predicate, in the same order: where the solver puts the
+    -- evidence for it when it discharges it.
+    var holes    : Vec Hole,
+    -- The holes read out once solving is over (`Turkey.Evidence.run`).
     var evidence : Vec Evidence,
     var method   : Option MethodInfo,
     var typeArgs : Vec Ty.Type,
@@ -85,8 +90,48 @@ type Use = Use {
 fun newUse(name : String, binder : Option Int, where : Option Span,
            m : Option MethodInfo) -> Use = Use {
     name = name, binder = binder, span = where, preds = Vec.new(2), scopes = Vec.new(2),
-    evidence = Vec.new(2), method = m, typeArgs = Vec.new(2),
+    holes = Vec.new(2), evidence = Vec.new(2), method = m, typeArgs = Vec.new(2),
 }
+
+-- -- evidence ------------------------------------------------------------------------
+
+-- Where the evidence for one wanted class predicate goes: empty until the
+-- solver discharges the predicate, and filled exactly once, by the rule that
+-- discharges it. GHC's evidence variable for a wanted dictionary, and the
+-- binding `setWantedDict` adds for it (`GHC/Tc/Solver/Monad.hs`).
+--
+-- **Invariant.** The evidence for a wanted is fixed when the wanted is
+-- solved, by the same rule and under the same givens that solved it, and
+-- nothing downstream recomputes it: `Turkey.Evidence` only reads the holes out,
+-- and the lowering only translates what it reads. So the solver and the
+-- lowering cannot disagree about which dictionary a predicate needs, or about
+-- the type the solver found it at.
+--
+-- That type may differ from the predicate's own: `Add Int` for `Add (Elem a)`
+-- found under `Elem a ~ Int`. Core accepts the dictionary only under the
+-- equalities of the binding it is in, so the lowering has to hand Core every
+-- equality a dictionary was found under, given or retained.
+type Hole = Hole { var proof : Option Proof }
+
+fun newHole() -> Hole = Hole { proof = None }
+
+-- How the solver discharged a wanted. An instance's context is itself a list
+-- of wanteds, solved later or elsewhere, so its evidence is holes too: the
+-- whole tree is complete only when solving is, as in ICFP 2008's §5, where the
+-- substitution of evidence grows with each rule that fires.
+type Proof
+    -- A dictionary in scope under this name, and the superclasses to select
+    -- from it: a given of a signature or of an opened existential, or a
+    -- predicate a binding group retained in its scheme.
+    = ByGiven(String, Array String, Pred)
+    -- An instance, the match of its head against the class argument, and
+    -- the holes of its context under that match.
+    | ByInstance(InstInfo, Map Int Ty.Type, Array Hole)
+    -- The class argument is bottom; the class's name.
+    | ByNothing(String)
+    -- The evidence of an identical wanted, which a binding group's context
+    -- kept in place of this one.
+    | Same(Hole)
 
 -- -- generated dictionary names ----------------------------------------------------
 

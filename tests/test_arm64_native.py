@@ -28,10 +28,7 @@ from tests.bootc import digest as _digest, replace_built as _replace_built
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
-CORPUS = sorted(
-    path.name for path in PROGRAMS.glob("*.gob")
-    if not path.name.startswith("err_")
-)
+CORPUS = [path.name for path in bootc.corpus()]
 
 # Programs the arm64 path cannot run yet. Named rather than skipped silently,
 # because a program listed here is a test that starts passing.

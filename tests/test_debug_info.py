@@ -49,7 +49,7 @@ from tests.test_encode import _code
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
-CORPUS = sorted(path.name for path in PROGRAMS.glob("*.gob") if not path.name.startswith("err_"))
+CORPUS = [path.name for path in bootc.corpus()]
 
 # The two ways `build -g` makes an object: assembly through the system
 # assembler, and an object directly.

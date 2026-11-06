@@ -1,0 +1,122 @@
+export (SipHash)
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Byte (Byte)
+import Data.Tuple (Unit)
+import Data.Num (Add(..), Sub(..), Neg(..), (+), (-))
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<))
+import Data.Index (Index(..))
+import Data.Int as Int
+import Data.Hashable (Hasher(..))
+import Hash.Words (rotl, Words64(..), byteAt)
+
+-- SipHash-1-3 (Aumasson and Bernstein): one compression round per 8-byte
+-- block and three at the end, the variant Rust's `HashMap`, Python and Swift
+-- use. Unlike the others in `Hash` it is a keyed pseudorandom function, so an
+-- attacker who sees no hash values cannot build keys that collide.
+--
+-- A word is one block. A run of bytes is its whole words as blocks and then
+-- one block holding the remaining 0 to 7 bytes with the run's length in its
+-- top byte, so that every run ends on a block boundary and two runs cannot
+-- run together. The final block is SipHash's: the total length in the top
+-- byte.
+--
+-- The state is changed in place and each method returns the state it was
+-- given, which `Hasher` allows because a caller uses each state once. A state
+-- returned by value would be a new four-word record from a compression too
+-- large to inline, and the optimizer allocates such a record.
+type SipHash = SipHash {
+    var v0 : Int,
+    var v1 : Int,
+    var v2 : Int,
+    var v3 : Int,
+    -- Bytes compressed so far.
+    var length : Int,
+}
+
+-- "somepseudorandomlygeneratedbytes", as four little-endian words.
+let c0 = 8317987319222330741
+let c1 = 7237128888997146477
+let c2 = 7816392313619706465
+let c3 = 8387220255154660723
+
+-- The second key word, which a seed of one word leaves fixed.
+let k1 = -6148914691236517206
+
+-- Compresses block `m` into `s` with one round.
+fun absorb(s : SipHash, m : Int) -> Unit {
+    var v0 = s.v0
+    var v1 = s.v1
+    var v2 = s.v2
+    var v3 = s.v3 ^ m
+    v0 = Int.addWrapping(v0, v1)
+    v1 = rotl(v1, 13) ^ v0
+    v0 = rotl(v0, 32)
+    v2 = Int.addWrapping(v2, v3)
+    v3 = rotl(v3, 16) ^ v2
+    v0 = Int.addWrapping(v0, v3)
+    v3 = rotl(v3, 21) ^ v0
+    v2 = Int.addWrapping(v2, v1)
+    v1 = rotl(v1, 17) ^ v2
+    v2 = rotl(v2, 32)
+    s.v0 = v0 ^ m
+    s.v1 = v1
+    s.v2 = v2
+    s.v3 = v3
+    s.length = s.length + 8
+}
+
+instance Hasher SipHash {
+    fun startHash(seed) = SipHash { v0 = seed ^ c0, v1 = k1 ^ c1, v2 = seed ^ c2, v3 = k1 ^ c3, length = 0 }
+
+    fun hashInt(s, x) {
+        absorb(s, x)
+        s
+    }
+
+    fun hashBytes(s, bytes, from, to) {
+        let words = Words64(bytes)
+        var at = from
+        while to - at >= 8 {
+            absorb(s, words[at])
+            at = at + 8
+        }
+        var last = ((to - from) & 255) << 56
+        var shift = 0
+        for var i = at; i < to; i = i + 1 {
+            last = last | byteAt(bytes, i) << shift
+            shift = shift + 8
+        }
+        absorb(s, last)
+        s
+    }
+
+    -- Compresses the last block, then runs the three finishing rounds.
+    fun finishHash(s) {
+        let m = (s.length & 255) << 56
+        var v0 = s.v0
+        var v1 = s.v1
+        var v2 = s.v2
+        var v3 = s.v3 ^ m
+        for var r = 0; r < 4; r = r + 1 {
+            v0 = Int.addWrapping(v0, v1)
+            v1 = rotl(v1, 13) ^ v0
+            v0 = rotl(v0, 32)
+            v2 = Int.addWrapping(v2, v3)
+            v3 = rotl(v3, 16) ^ v2
+            v0 = Int.addWrapping(v0, v3)
+            v3 = rotl(v3, 21) ^ v0
+            v2 = Int.addWrapping(v2, v1)
+            v1 = rotl(v1, 17) ^ v2
+            v2 = rotl(v2, 32)
+            if r == 0 {
+                v0 = v0 ^ m
+                v2 = v2 ^ 255
+            }
+        }
+        v0 ^ v1 ^ v2 ^ v3
+    }
+}

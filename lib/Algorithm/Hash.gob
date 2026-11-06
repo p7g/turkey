@@ -1,32 +1,56 @@
-export (FNV1a, fnv1a)
+export (FNV1a)
 
 import Prelude ()
 import Data.Int (Int)
 import Data.Byte (Byte)
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitXor(..), (^))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Bits (BitAnd(..), BitXor(..), Shift(..), (&), (^), (>>))
+import Data.Index (Index(..))
 import Data.Hashable (Hash(..), Hasher(..))
 import Data.Byte as Byte
 import Data.Int as Int
 
--- The mixer has to *wrap*, and now says so.
---
 -- FNV-1a over 64 bits.
 --
 -- The arithmetic is the explicit *wrapping* primitives, not `*` and `+`: a
 -- mixer is supposed to overflow, and the trapping operators would panic the
 -- moment a full-width key reached them.
+--
+-- A word is absorbed as its eight bytes, least significant first, and a run of
+-- bytes byte by byte with nothing marking where it ends. `Turkey.Asm` names
+-- message labels by this hash, so changing what it computes changes the
+-- compiler's output.
 
-type FNV1a = FNV1a { var h : Int }
+type FNV1a = FNV1a(Int)
 
 -- The 64-bit FNV offset basis, 0xCBF2_9CE4_8422_2325, is larger than `Int`'s
 -- maximum, so it is written as the two's-complement value it denotes.
-fun fnv1a() -> FNV1a = FNV1a { h = -3750763034362895579 }
+let offsetBasis = -3750763034362895579
+
+let prime = 0x100_0000_01B3
+
+fun round(h : Int, byte : Int) -> Int = Int.mulWrapping(h ^ byte, prime)
 
 instance Hasher FNV1a {
-    fun digest(d) = d.h
-    fun update(d, x) {
-        d.h = d.h ^ Byte.toInt(x)
-        d.h = Int.mulWrapping(d.h, 0x100_0000_01B3)
+    -- FNV has no seed, so every state starts at the offset basis.
+    fun startHash(_) = FNV1a(offsetBasis)
+
+    fun finishHash(FNV1a(h)) = h
+
+    fun hashInt(FNV1a(start), x) {
+        var h = start
+        for var shift = 0; shift < 64; shift = shift + 8 {
+            h = round(h, x >> shift & 255)
+        }
+        FNV1a(h)
+    }
+
+    fun hashBytes(FNV1a(start), bytes, from, to) {
+        var h = start
+        for var i = from; i < to; i = i + 1 {
+            h = round(h, Byte.toInt(bytes[i]))
+        }
+        FNV1a(h)
     }
 }

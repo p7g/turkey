@@ -1,6 +1,8 @@
 export (
     Map,
+    BaseMap,
     new,
+    withHasher,
     get,
     put,
     delete,
@@ -18,7 +20,6 @@ import Data.Int (Int)
 import Data.Float (Float)
 import Data.Tuple (Unit)
 import Data.String (String)
-import Algorithm.Hash (fnv1a)
 import Data.Int as Int
 import Data.Bool (Bool(..))
 import Data.Float ()
@@ -29,8 +30,10 @@ import Data.String ()
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Bits (BitAnd(..), (&))
 import Text.Show (Show(..))
 import Data.Hashable (Hash(..), Hasher(..))
+import Hash.FoldHash (FoldHash)
 import Control.Iterator (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Control.Panic (error)
@@ -40,13 +43,20 @@ import Turkey.Array as Storage
 let loadFactor = 0.6
 let defaultSize = 16
 
-type Map k v = Map {
+-- A hash map with the default hasher.
+type Map k v = BaseMap FoldHash k v
+
+-- A map whose keys are hashed by `h`. `h` is the first parameter because it is
+-- the one fixed longest: a program picks a hasher once, and keys and values
+-- per map.
+type BaseMap h k v = BaseMap {
     var table          : Prim.Array (Entry k v),
     var cap            : Int,
     var size           : Int,
     var tombstoneCount : Int,
     var head           : Option (Bucket k v),
     var tail           : Option (Bucket k v),
+    seed               : Int,
 }
 
 type Bucket k v = Bucket {
@@ -62,21 +72,32 @@ type Entry k v
     | Tombstone
     | Active (Bucket k v)
 
-fun hashKey(k) {
-    let d = fnv1a()
-    hashInto(k, d)
-    digest(d)
-}
+fun hashKey[Hash k, Hasher h](m : BaseMap h k v, key : k) -> Int = finishHash(hashInto(key, stateFor(m)))
 
-fun new() -> Map k v {
+-- A fresh hasher of the type `m` names, seeded with `m`'s seed.
+fun stateFor[Hasher h](m : BaseMap h k v) -> h = startHash(m.seed)
+
+-- The slot for hash `h` in a table of `cap` slots: `h` mod `cap`, floored, so
+-- never negative for a negative `h`. `cap` must be a power of two, which every
+-- capacity is: it starts at `defaultSize` and only doubles. That is what lets
+-- a mask stand in for the division, which is a `sdiv` on every probe step.
+fun slotOf(h : Int, cap : Int) -> Int = h & (cap - 1)
+
+-- Returns an empty map with the default hasher.
+fun new() -> Map k v = withHasher()
+
+-- Returns an empty map whose keys `h` hashes, for the `h` the call site's
+-- type names.
+fun withHasher() -> BaseMap h k v {
     let table = Storage.filled(defaultSize, Empty)
-    Map {
+    BaseMap {
         table,
         cap = defaultSize,
         size = 0,
         tombstoneCount = 0,
         head = None,
         tail = None,
+        seed = 0,
     }
 }
 
@@ -87,12 +108,8 @@ fun new() -> Map k v {
 -- still worth saying: the receiver is a `Map` at every call site, so the
 -- annotation costs nothing and saves specialization the work of taking a
 -- dictionary back out of every field access.
-fun findSlot[Eq k](m : Map k v, h : Int, key : k, isSearching : Bool) -> Int {
-    -- `Int.mod`, not `%`. A 64-bit hash is signed and half of them are
-    -- negative, and `%` is *remainder*: it takes the sign of the dividend, so
-    -- `h % cap` would be a negative bucket index roughly half the time. This
-    -- is the case floored `mod` exists for.
-    var index = Int.mod(h, m.cap)
+fun findSlot[Eq k](m : BaseMap h k v, h : Int, key : k, isSearching : Bool) -> Int {
+    var index = slotOf(h, m.cap)
     var firstTombstone = None
 
     loop {
@@ -123,12 +140,12 @@ fun findSlot[Eq k](m : Map k v, h : Int, key : k, isSearching : Bool) -> Int {
             }
         }
 
-        index = (index + 1) % m.cap
+        index = slotOf(index + 1, m.cap)
     }
 }
 
-fun put[Hash k](m : Map k v, key : k, value : v) -> Unit {
-    let h = hashKey(key)
+fun put[Hash k, Hasher h](m : BaseMap h k v, key : k, value : v) -> Unit {
+    let h = hashKey(m, key)
     let i = findSlot(m, h, key, False)
 
     match m.table[i] {
@@ -168,8 +185,8 @@ fun put[Hash k](m : Map k v, key : k, value : v) -> Unit {
     }
 }
 
-fun get[Hash k](m : Map k v, key : k) -> Option v {
-    let h = hashKey(key)
+fun get[Hash k, Hasher h](m : BaseMap h k v, key : k) -> Option v {
+    let h = hashKey(m, key)
     let i = findSlot(m, h, key, True)
     match m.table[i] {
         Active(bucket) -> Some(bucket.value)
@@ -177,8 +194,8 @@ fun get[Hash k](m : Map k v, key : k) -> Option v {
     }
 }
 
-fun delete[Hash k](m : Map k v, key : k) -> Bool {
-    let h = hashKey(key)
+fun delete[Hash k, Hasher h](m : BaseMap h k v, key : k) -> Bool {
+    let h = hashKey(m, key)
     let i = findSlot(m, h, key, True)
 
     let bucket = match m.table[i] {
@@ -220,7 +237,7 @@ fun delete[Hash k](m : Map k v, key : k) -> Bool {
 -- at least `cap * loadFactor / 2` puts before the next one, so rehashing stays
 -- amortized constant per operation instead of firing on every put when `size`
 -- sits just under the threshold.
-fun resize(m : Map k v) -> Unit {
+fun resize(m : BaseMap h k v) -> Unit {
     let newCap = if Float.fromInt(m.size) > Float.fromInt(m.cap) * loadFactor / 2.0 {
         m.cap * 2
     } else {
@@ -235,12 +252,12 @@ fun resize(m : Map k v) -> Unit {
         match current {
             None -> break
             Some(bucket) -> {
-                var i = Int.mod(bucket.hash, newCap)
+                var i = slotOf(bucket.hash, newCap)
                 loop {
                     match m.table[i] {
                         Empty -> break
                         _ -> {
-                            i = (i + 1) % newCap
+                            i = slotOf(i + 1, newCap)
                         }
                     }
                 }
@@ -257,7 +274,7 @@ fun resize(m : Map k v) -> Unit {
 -- `Option`. These are the three shapes built on `get` that every caller was
 -- otherwise writing out by hand.
 
-fun contains[Hash k](m : Map k v, key : k) -> Bool = match get(m, key) {
+fun contains[Hash k, Hasher h](m : BaseMap h k v, key : k) -> Bool = match get(m, key) {
     Some(_) -> True
     None -> False
 }
@@ -265,14 +282,14 @@ fun contains[Hash k](m : Map k v, key : k) -> Bool = match get(m, key) {
 -- The default is evaluated whether or not it is used: arguments are strict and
 -- left to right. A default
 -- that is expensive to build belongs behind a `match` on `get`.
-fun getOr[Hash k](m : Map k v, key : k, fallback : v) -> v = match get(m, key) {
+fun getOr[Hash k, Hasher h](m : BaseMap h k v, key : k, fallback : v) -> v = match get(m, key) {
     Some(found) -> found
     None -> fallback
 }
 
 -- Read, modify, write, in one place. `update(counts, word, 0, _ + 1)`
 -- is the frequency count that is otherwise four lines and two lookups.
-fun update[Hash k](m : Map k v, key : k, initial : v, f : fun(v) -> v) -> Unit =
+fun update[Hash k, Hasher h](m : BaseMap h k v, key : k, initial : v, f : fun(v) -> v) -> Unit =
     put(m, key, f(getOr(m, key, initial)))
 
 -- -- reading the whole thing out ------------------------------------------------
@@ -283,14 +300,14 @@ fun update[Hash k](m : Map k v, key : k, initial : v, f : fun(v) -> v) -> Unit =
 -- hash is what makes a program's output reproducible: iterating a map cannot
 -- reorder between runs, or between two builds of the same program.
 
-fun keys(m : Map k v) -> Array k = inOrder(m, fun((key, _value)) = key)
+fun keys(m : BaseMap h k v) -> Array k = inOrder(m, fun((key, _value)) = key)
 
-fun values(m : Map k v) -> Array v = inOrder(m, fun((_key, value)) = value)
+fun values(m : BaseMap h k v) -> Array v = inOrder(m, fun((_key, value)) = value)
 
-fun entries(m : Map k v) -> Array (k, v) = inOrder(m, fun(pair) = pair)
+fun entries(m : BaseMap h k v) -> Array (k, v) = inOrder(m, fun(pair) = pair)
 
 -- `f` of each entry, in iteration order, allocated once at the map's size.
-fun inOrder(m : Map k v, f : fun((k, v)) -> a) -> Array a {
+fun inOrder(m : BaseMap h k v, f : fun((k, v)) -> a) -> Array a {
     let cursor = iter(m)
     Array.init(len(m), fun(_) = match next(m, cursor) {
         Some(pair) -> f(pair)
@@ -298,7 +315,7 @@ fun inOrder(m : Map k v, f : fun((k, v)) -> a) -> Array a {
     })
 }
 
-instance Index (Map k v) : Hash k {
+instance Index (BaseMap h k v) : Hash k, Hasher h {
     type Key = k
     type Value = v
 
@@ -310,9 +327,9 @@ instance Index (Map k v) : Hash k {
     }
 }
 
-instance SetIndex (Map k v) : Hash k { fun set(m, k, v) = put(m, k, v) }
+instance SetIndex (BaseMap h k v) : Hash k, Hasher h { fun set(m, k, v) = put(m, k, v) }
 
-instance Length (Map k v) {
+instance Length (BaseMap h k v) {
     fun len(m) = m.size
 }
 
@@ -324,7 +341,7 @@ instance Length (Map k v) {
 -- makes family reduction terminate, so the export is the cheaper side.
 type MapCursor k v = MapCursor { var bucket : Option (Bucket k v) }
 
-instance Iterator (Map k v) {
+instance Iterator (BaseMap h k v) {
     type Item = (k, v)
     type Cursor = MapCursor k v
 
@@ -340,7 +357,7 @@ instance Iterator (Map k v) {
     }
 }
 
-instance Show (Map k v) : Show k, Show v {
+instance Show (BaseMap h k v) : Show k, Show v {
     fun show(m) {
         var s = "{"
         var first = True

@@ -156,17 +156,17 @@ def _needs_dwarfdump() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _built(how: str, program: str = PROGRAM) -> Path:
-    """`program` built with `-g` and linked, in a directory of its own:
-    `prog.o` beside the executable as the macOS debug map needs it, and
-    `prog`. `how` is `asm`, through `prog.s` and the assembler, or `obj`,
-    with `boot` writing the object."""
+def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
+    """`program` built with `level`, `-g` or a `--debug`, and linked, in a
+    directory of its own: `prog.o` beside the executable as the macOS debug
+    map needs it, and `prog`. `how` is `asm`, through `prog.s` and the
+    assembler, or `obj`, with `boot` writing the object."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
     source.write_text(program, encoding="utf-8")
     output = "prog.s" if how == "asm" else "prog.o"
     compiled = subprocess.run(
-        toolchain.command(bootc.binary(), "build", "-g", "-f", how, "-o", output,
+        toolchain.command(bootc.binary(), "build", level, "-f", how, "-o", output,
                           "prog.gob"),
         cwd=directory, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
@@ -209,9 +209,10 @@ def test_the_line_table_has_a_row_for_each_statement(how):
 
 
 @pytest.mark.parametrize("how", PATHS)
-def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how):
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level):
     tool = _needs_dwarfdump()
-    text = subprocess.run([tool, "--debug-info", str(_built(how) / "prog.o")],
+    text = subprocess.run([tool, "--debug-info", str(_built(how, PROGRAM, level) / "prog.o")],
                           capture_output=True, text=True, check=True).stdout
     assert "DW_TAG_compile_unit" in text
     assert '("prog.gob")' in text
@@ -222,9 +223,10 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how):
 @pytest.mark.parametrize("how", PATHS)
 @pytest.mark.parametrize("which", ["prog.o", "prog"])
 @pytest.mark.parametrize("program", [PROGRAM, RECTANGLES, LOOP], ids=["fact", "rectangles", "loop"])
-def test_the_dwarf_verifies(how, which, program):
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_dwarf_verifies(how, which, program, level):
     tool = _needs_dwarfdump()
-    result = subprocess.run([tool, "--verify", str(_built(how, program) / which)],
+    result = subprocess.run([tool, "--verify", str(_built(how, program, level) / which)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
 

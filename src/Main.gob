@@ -107,11 +107,35 @@ var build = Build.plain
 -- whether the work in them is even enough to split.
 var timings = False
 
--- `-g`: write a line table and the debug information a debugger and a
--- profiler need to find it. The code is the same either way; only the items
--- `Turkey.Emit` and `Turkey.Dwarf` add, none of which has a byte in the
--- code, tell the two builds apart.
-var debugInfo = False
+-- How much debug information `build` writes (`Debug`). The code is the
+-- same at every level; only the items `Turkey.Emit` and `Turkey.Dwarf` add,
+-- none of which has a byte in the code, tell the builds apart.
+var debug = NoDebug
+
+-- What `--debug` and `-g` ask for: nothing; the line table, each function's
+-- name and range, and the calls inlined into it (`--debug=lines`), which is
+-- what a profiler and a backtrace need; or that and each function's
+-- variables, with their locations and types (`-g`, `--debug=full`), which is
+-- what a debugger needs to show values.
+type Debug = NoDebug | Lines | Full
+
+-- Whether `build` writes any debug information.
+fun debugInfo() -> Bool = match debug {
+    NoDebug -> False
+    _ -> True
+}
+
+-- Whether it writes the variables, with their locations and types.
+fun debugVariables() -> Bool = match debug {
+    Full -> True
+    _ -> False
+}
+
+fun debugNamed(level : String) -> Debug = match level {
+    "lines" -> Lines
+    "full" -> Full
+    _ -> die("unknown debug level '" + level + "'; the levels are lines and full")
+}
 
 -- A stopwatch started now, after reporting `phase` as having run since
 -- `since` was started.
@@ -169,7 +193,8 @@ fun main() {
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
                 Short('f') -> { format = Some(formatNamed(valueOf(p))) }
-                Short('g') -> { debugInfo = True }
+                Short('g') -> { debug = Full }
+                Long("debug") -> { debug = debugNamed(valueOf(p)) }
                 Long("target") -> {
                     let name = valueOf(p)
                     target = match Target.named(name) {
@@ -648,7 +673,7 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- with the callee's. The code is the same either way: no reduction reads a
 -- span.
 fun keepsCallSites() -> fun(String) -> Bool =
-    if debugInfo || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
+    if debugInfo() || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
     else { Set.contains(Giblets.gibletModules(), _) }
 
 -- Everything between the elaboration and the backend, in one place.
@@ -892,8 +917,8 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
             let emitted = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, emitted)
-            let (code, inlined) = if debugInfo {
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), emitted)
+            let (code, inlined) = if debugInfo() {
                 Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, emitted,
                                    Emit.functionEnd(asm.dialect, i))
             } else { (emitted, []) }
@@ -986,7 +1011,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- label at the start of the code, where the compile unit's range begins.
     let directory = Option.unwrapOr(Env.currentDirectory(), ".")
     let textStart = Asm.localLabel(asm.dialect, "text_start")
-    if debugInfo {
+    if debugInfo() {
         Dwarf.sourceFiles(directory, path, files, code)
         Vec.push(code, Stream.Label(textStart))
     }
@@ -1049,7 +1074,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- The entry and the stubs after it have no source position, so with `-g`
     -- one row with no line covers them all, rather than the last function's
     -- last row.
-    if debugInfo { Vec.push(code, Stream.Loc(0, False)) }
+    if debugInfo() { Vec.push(code, Stream.Loc(0, False)) }
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
     -- Each only in a program that needs it: the switch names the runtime's
@@ -1065,7 +1090,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
-    if debugInfo {
+    if debugInfo() {
         -- The end of the code, after everything the text section holds.
         let textEnd = Asm.localLabel(asm.dialect, "text_end")
         Vec.push(code, Stream.Section(Asm.Text))
@@ -1647,7 +1672,8 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
-        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] FILE...\n"
+        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
+        + "                  FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))

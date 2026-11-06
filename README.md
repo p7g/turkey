@@ -148,6 +148,10 @@ cc -o rectangles rectangles.o
 Assembly written with `-g` needs the assembler to build the line table, in
 DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
 
+`-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
+functions and the calls inlined into them, which is all a profiler or a
+backtrace reads, and none of what a debugger needs to show a variable.
+
 On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
 object and writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run

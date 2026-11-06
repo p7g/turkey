@@ -18,7 +18,7 @@ The Prelude provides these names unqualified:
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
-| Functions | `print`, `write`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max` |
+| Functions | `print`, `write`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
 With the Prelude, a module also imports the library modules `Data.Array`,
@@ -488,6 +488,31 @@ class Length c { fun len(c) -> Int }
 `len(xs)` is the number of elements in an `Array`, a `Vec`, a `Map` or a
 `Set`.
 `String` has no `Length` instance ([String](types.md#string)).
+
+## `hash`
+
+```text
+fun hash[Hash a](x : a) -> Int
+```
+
+`hash(x)` is a hash of `x`: equal values hash equal for as long as the program
+runs, and nothing else is promised. The function may differ between runs of a
+program and between versions of Turkey, so a hash that is stored or sent to
+another process is computed with a hash function the library names, not with
+`hash`.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(hash("turkey") == hash("tur" + "key"))
+    print(hash((1, "a")) == hash((1, "a")))
+}
+```
+
+```text
+True
+True
+```
 
 ## `Functor`, `Applicative` and `Monad`
 

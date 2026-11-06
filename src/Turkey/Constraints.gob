@@ -27,7 +27,8 @@ export (
 --     def x : t in C     CDef        monomorphic binding
 --     let x = C1 in C2   CLet        generalize C1, bind the schemes, solve C2
 --     x <= t             CInstance   a use site
---     given |- C         CAssume     the obligations a signature already grants
+--     forall k. Q => C   CAssume     an implication: the obligations a signature
+--                                    grants, over the skolems it makes
 --     evidence for P     CUse        a site that needs a dictionary it did not ask for
 --
 -- **Ranks live here, not in the generator.** A variable's rank is the depth of
@@ -47,6 +48,19 @@ export (
 -- table, or from the assumptions a `CAssume` has in scope: checking an instance
 -- method against its class's signature is the one place a predicate is *granted*
 -- rather than proved, because the signature said so.
+--
+-- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
+-- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
+-- carries the skolems, so the implication's level is that `CLet`'s rank.
+--
+-- Its body is solved against its givens to a *residual*, the predicates
+-- `settle` leaves deferred when the `CLet` generalizes. A residual predicate
+-- over variables of the implication's own rank is reported by the split,
+-- because no scheme of a signature carries it. One over an outer variable
+-- floats to the enclosing scope, unless it mentions one of the skolems:
+-- then it is reported where it arose (`confine`). So no predicate that
+-- mentions a skolem outlives the skolem's scope, and no outer variable is
+-- ever bound to a type built from one.
 --
 -- An associated family makes an *equation* deferrable, and it comes back as the
 -- equality predicate `~`, which is why there is one queue here rather than
@@ -105,12 +119,14 @@ type Constraint
     -- Solve the definition one rank deeper, generalize, bind the schemes, solve
     -- the body. The single place generalization happens.
     | CLet(LetCell)
-    -- Solve the body with `givens` taken as facts. The only source of
-    -- assumptions is a *declared* type a body is being checked against, where
-    -- the class's own predicate, the instance's context and the method's context
-    -- are all facts. This is the local-assumption form and deliberately the
-    -- whole of it: an assumption introduced by a *pattern* is what makes GADTs
-    -- destroy principal types, and none is introduced here.
+    -- Solve the body with `givens` taken as facts: the implication described
+    -- at the top of this module. The body is a `CLet` whose skolems are the
+    -- implication's. The sources of assumptions are a *declared* type a body
+    -- is being checked against, where the class's own predicate, the
+    -- instance's context and the method's context are all facts, and the
+    -- class context an existential pattern opens. An *equality* introduced by
+    -- a pattern is what makes GADTs destroy principal types, and none is
+    -- introduced here.
     | CAssume(Vec (String, Pred), Constraint)
     -- `name <= t`: instantiate a scheme at `t`. The generator emits this
     -- instead of looking the name up, which is what lets it run without a type
@@ -526,6 +542,7 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     solve(s, c.defn)
     discard(Vec.pop(s.scopes))
     settle(s)
+    confine(s, c.skolems)
     let types = Array.map(c.binds, _.2)
     let retainedPreds = split(s, types)
     -- An equation tied to a variable this binder quantifies can never be decided
@@ -1254,11 +1271,74 @@ fun undecided(c : PredCell) -> Bool {
     }
 }
 
+-- Refuses every predicate of the residual that would float out of the
+-- implication whose skolems are `skolems` but mentions one of them, reporting
+-- each where it arose, and removes it from the queue.
+--
+-- Such a predicate is over a variable born outside, so the split would hand it
+-- to the enclosing scope. There the skolem stands for nothing and the givens
+-- that might have decided it are gone. Deciding it there can only bind the
+-- outer variable to a type built from the skolem, which is an escape. So the
+-- only place to judge it is here, and here it is stuck.
+fun confine(s : Solver, skolems : Vec ConCell) -> Unit {
+    if len(skolems) == 0 { return {} }
+    let own = Set.new()
+    for k in skolems { Set.add(own, k.uid) }
+    let outer = rank(s) - 1
+    let keep = Vec.new(len(s.deferred))
+    for c in s.deferred {
+        if Ty.predLevel(c.pred) <= outer {
+            match ownSkolem(c.pred, own) {
+                Some(k) -> {
+                    trapped(c, k)
+                    continue
+                }
+                None -> {}
+            }
+        }
+        Vec.push(keep, c)
+    }
+    s.deferred = keep
+}
+
+-- The first skolem of `pred`'s arguments whose `uid` is in `own`.
+fun ownSkolem(pred : Pred, own : Set.Set Int) -> Option ConCell {
+    for k in Ty.skolemsOf(pred.args) {
+        if Set.contains(own, k.uid) { return Some(k) }
+    }
+    None
+}
+
+-- Reports a predicate that mentions the skolem `k` and a type from outside
+-- `k`'s scope. An equality is an escape, and is reported in the words
+-- `Ty.unify` uses for one.
+fun trapped(c : PredCell, k : ConCell) -> Unit {
+    let opener = Ty.openedBy(k)
+    if c.pred.name == Ty.equals {
+        return match opener {
+            Some(con) -> Ty.typeError("the type '" + k.name + "' hidden by '"
+                + Ty.shortName(con) + "' cannot leave the 'match' arm or "
+                + "function that opened it", c.span)
+            None -> Ty.typeError("the type variable '" + k.name + "' from a "
+                + "signature cannot be equal to a type from outside its "
+                + "function", c.span)
+        }
+    }
+    let scope = match opener {
+        Some(con) -> "the type '" + k.name + "' hidden by '" + Ty.shortName(con) + "'"
+        None -> "the type variable '" + k.name + "' from a signature"
+    }
+    Ty.typeError("cannot determine a type satisfying '" + Ty.showPred(c.pred)
+                 + "' in the scope of " + scope + "; add a type annotation", c.span)
+}
+
 -- Deferred predicates general enough to be quantified at `level`.
 --
 -- The test is the one generalization applies to type variables: a predicate tied
 -- to a variable created deeper than the binder travels in the scheme; one tied
--- to an outer variable stays behind for an enclosing binding to settle.
+-- to an outer variable stays behind for an enclosing binding to settle. The
+-- caller has already refused one that also mentions the binder's skolems
+-- (`confine`).
 fun retained(s : Solver, level : Int) -> Vec PredCell {
     let keep = Vec.new(len(s.deferred))
     let out = Vec.new(len(s.deferred))

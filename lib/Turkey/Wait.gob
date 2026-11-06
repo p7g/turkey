@@ -1,6 +1,7 @@
 export (
     now, sleepUntil, readable, writable, readableUnless, writableUnless, readableUnlessAsOf,
     writableUnlessAsOf, readableBlockingUnless, childExit, lockedUnless,
+    sourceOf, onUnlessAsOf,
     cancel, forget, park, parkApart, sleeper, complete, finished, timedOut, cancelled,
 )
 
@@ -16,8 +17,9 @@ export (
 -- `waitOn`.
 --
 -- A wait is made, checked and parked on under the poller's lock
--- (`Turkey.Poll.lock`), not the scheduler's, and the tasks of the waits that
--- end are woken after it is let go. Waits that another task ends
+-- (`Turkey.Poll.lock`), not the scheduler's, or, for a descriptor whose
+-- source is known already (`onUnlessAsOf`), under that source's lock alone.
+-- The tasks of the waits that end are woken after the lock is let go. Waits that another task ends
 -- (`parkApart`) are made under the scheduler's lock too, which guards what
 -- their owners keep beside them, a semaphore's queue, say; the poller's is
 -- taken inside it, never the other way round.
@@ -155,10 +157,11 @@ fun passedAsOf(deadline : Int, now : Int) -> Bool = deadline >= 0 && now >= dead
 -- Make the wait `start` makes, and park until it ends.
 --
 -- The workers that may not be watching for it are told. A first wait wakes an
--- idle worker to poll for it. A deadline earlier than the others wakes the one
--- that polls, which is waiting for a later one: the signal moves the work
--- epoch too, so that a worker that computed its timeout before this wait was
--- made and has not yet begun to wait does not begin.
+-- idle worker to poll for it (`Turkey.Poll`'s interest). A deadline earlier
+-- than the others wakes the one that polls, which is waiting for a later one:
+-- the signal moves the work epoch too, so that a worker that computed its
+-- timeout before this wait was made and has not yet begun to wait does not
+-- begin.
 fun park(start : fun() -> Poll.Waiter) -> Int = parkUnless(start, fun() = False)
 
 fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
@@ -167,10 +170,8 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
         Poll.unlock()
         return cancelled
     }
-    let before = Workers.interest()
     let endedBefore = Poll.endings()
     let w = start()
-    tell(before)
     -- Wake the tasks of any other waits `start` ended, as `settle` would: a
     -- lock wait retries every waiter on its file (`Poll.locked`), and one
     -- that takes the lock ends. Skipping this would leave those tasks parked
@@ -178,17 +179,52 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     -- ended it, which costs at most a needless `Scheduler.changed`.
     let ends = Poll.endings() - endedBefore
     let others = Poll.takeWoken()
-    -- A task parks on `w` before the lock is let go, as `waitOn`'s first
-    -- look would, rather than taking the lock again for it.
-    let parked = match Co.running() {
-        Some(c) -> if Poll.finished(w) { False } else {
-            Poll.park(w, c)
-            True
-        }
-        None -> False
-    }
+    let parked = parkNow(w)
     Poll.unlock()
     wakeAll(ends, others)
+    settleIn(w, parked)
+}
+
+-- `readableUnlessAsOf` or, if `writing`, `writableUnlessAsOf`, for the
+-- descriptor whose source `s` is (`sourceOf`), under the source's lock alone.
+-- `now` is -1 to have the deadline judged by a reading of its own.
+fun onUnlessAsOf(s : Poll.Source, writing : Bool, deadline : Int, now : Int, stop : fun() -> Bool) -> Int {
+    if (if now < 0 { passed(deadline) } else { passedAsOf(deadline, now) }) { return timedOut }
+    Poll.lockSource(s)
+    if stop() {
+        Poll.unlockSource(s)
+        return cancelled
+    }
+    let w = Poll.waitOn(s, writing, deadline)
+    let parked = parkNow(w)
+    Poll.unlockSource(s)
+    settleIn(w, parked)
+}
+
+-- The source of `fd`, for `onUnlessAsOf`, once a wait on `fd` has been
+-- made: it is `fd`'s until `forget`.
+fun sourceOf(fd : Int) -> Option Poll.Source {
+    Poll.lock()
+    let s = Poll.sourceOf(fd)
+    Poll.unlock()
+    s
+}
+
+-- Whether the running task, if one runs, is now parked on `w`, which was just
+-- made: rather than taking a lock again for it, as `await`'s first look
+-- would. Under the lock `w` was made under.
+fun parkNow(w : Poll.Waiter) -> Bool = match Co.running() {
+    Some(c) -> if Poll.finished(w) { False } else {
+        Poll.park(w, c)
+        True
+    }
+    None -> False
+}
+
+-- Tell the workers about the wait `w` just made, park until it ends if
+-- `parked`, and answer how it ended. Without the lock it was made under.
+fun settleIn(w : Poll.Waiter, parked : Bool) -> Int {
+    tell()
     if parked {
         Co.suspend()
         -- Nothing queues a task parked on `w` but the wake that follows `w`'s
@@ -203,12 +239,12 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     await(w)
 }
 
--- Tell the workers about the waits just made, `before` being the interest
--- before them. Under the poller's lock.
-fun tell(before : Int) -> Unit {
-    let earlier = Poll.takeHeadMoved()
-    if earlier || (before == 0 && Workers.interest() > 0) { Workers.signalWork(False) }
-    if earlier { Workers.wakePoller() }
+-- Tell the polling worker if a wait just made has the earliest deadline.
+fun tell() -> Unit {
+    if Poll.takeHeadMoved() {
+        Workers.signalWork(False)
+        Workers.wakePoller()
+    }
 }
 
 -- Park until `w` ends, and answer how. Without either lock.
@@ -285,10 +321,9 @@ fun sleepApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
 -- `deadline` ends. Takes the poller's lock, so the caller must not hold it.
 fun sleeper(deadline : Int) -> Poll.Waiter {
     Poll.lock()
-    let before = Workers.interest()
     let w = Poll.sleeper(deadline)
-    tell(before)
     Poll.unlock()
+    tell()
     w
 }
 

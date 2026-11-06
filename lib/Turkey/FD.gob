@@ -50,9 +50,13 @@ export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, write
 -- parked, so each direction has at most one parked task, which the poller
 -- relies on (`Turkey.Poll`), and the parked operation holds a reference, so
 -- the number is not closed under it; the registration is dropped before the
--- number is closed (`closeNumber`). `close` ends a parked wait
--- (`Turkey.Wait.cancel`) and the operation answers `closed`; a wait the poller
--- cannot make (the kernel refuses the descriptor) answers its negated `errno`.
+-- number is closed (`closeNumber`). After the first wait, the descriptor's
+-- source is kept here (`source`), and a wait parks under that source's lock,
+-- so waits on different descriptors share no lock but the deadline heap's,
+-- and that only if they have deadlines. `close` ends a parked wait
+-- (`Turkey.Wait.cancel`) and the operation answers `closed`; a wait the
+-- poller cannot make (the kernel refuses the descriptor) answers its negated
+-- `errno`.
 -- Positional operations see `EAGAIN` from no descriptor that supports them, and
 -- yield instead of parking.
 --
@@ -87,6 +91,7 @@ export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, write
 import Turkey.Coroutine as Co
 import Turkey.Detach as Detach
 import Turkey.IO as IO
+import Turkey.Poll as Poll
 import Turkey.Scheduler as Scheduler
 import Turkey.Semaphore as Semaphore
 import Turkey.Sys as Sys
@@ -118,6 +123,15 @@ type FD = FD {
     number       : Int,
     var readMode : ReadMode,
     var polled   : Bool,
+    -- The poller's source for the descriptor, once a wait has been made on
+    -- it (`Turkey.Wait.sourceOf`), so that a wait parks under the source's
+    -- lock rather than the poller's (`Turkey.Wait.onUnlessAsOf`). It is
+    -- published through `sourced`: 0 while there is none, 1 while one
+    -- operation fetches it, 2 once it is in `source`, which is read only
+    -- after `sourced` is seen at 2. The two directions' operations run at
+    -- once, and that read is what orders the store of `source` before it.
+    var source   : Option Poll.Source,
+    sourced      : Sync.AtomicInt,
     var readers  : Vec Co.Coroutine,
     var writers  : Vec Co.Coroutine,
     -- Linux's `flock` calls on the descriptor, one at a time (`flockLinux`).
@@ -131,6 +145,8 @@ fun fd(number : Int) -> FD = FD {
     number = number,
     readMode = Unknown,
     polled = False,
+    source = None,
+    sourced = Sync.atomicInt(0),
     readers = [],
     writers = [],
     flocking = None,
@@ -606,15 +622,34 @@ fun park(f : FD, writing : Bool, deadline : Int, now : Int) -> Int {
     }
     let w = if blocking {
         Wait.readableBlockingUnless(f.number, deadline, stop)
-    } else if now < 0 {
-        if writing { Wait.writableUnless(f.number, deadline, stop) }
-        else { Wait.readableUnless(f.number, deadline, stop) }
-    } else if writing {
-        Wait.writableUnlessAsOf(f.number, deadline, now, stop)
+    } else if let Some(s) = source(f) {
+        Wait.onUnlessAsOf(s, writing, deadline, now, stop)
     } else {
-        Wait.readableUnlessAsOf(f.number, deadline, now, stop)
+        let w = if now < 0 {
+            if writing { Wait.writableUnless(f.number, deadline, stop) }
+            else { Wait.readableUnless(f.number, deadline, stop) }
+        } else if writing {
+            Wait.writableUnlessAsOf(f.number, deadline, now, stop)
+        } else {
+            Wait.readableUnlessAsOf(f.number, deadline, now, stop)
+        }
+        learnSource(f)
+        w
     }
     if w == Wait.cancelled { closed } else { w }
+}
+
+-- `f`'s source, if it has been published (`sourced`).
+fun source(f : FD) -> Option Poll.Source =
+    if Sync.load(f.sourced) == 2 { f.source } else { None }
+
+-- After a wait the poller made, publish `f`'s source, unless another
+-- operation is publishing it. A wait it could not make leaves none.
+fun learnSource(f : FD) -> Unit {
+    if !Sync.compareAndSet(f.sourced, 0, 1) { return {} }
+    let s = Wait.sourceOf(f.number)
+    f.source = s
+    Sync.store(f.sourced, if Option.isSome(s) { 2 } else { 0 })
 }
 
 -- How `read` treats a descriptor it has not looked at: `WaitFirst` for one in

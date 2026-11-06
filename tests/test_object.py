@@ -74,6 +74,9 @@ class Reloc:
     symbol: int | None
     target_section: int | None
     addend: int
+    # The symbol subtracted from the target, for a `delta64`: a Mach-O
+    # SUBTRACTOR's.
+    minus: int | None = None
 
 
 @dataclass
@@ -123,6 +126,7 @@ def _macho(data: bytes) -> Obj:
                                   not name.startswith(("L", "l"))))
     for index, reloff, nreloc in raw_relocs:
         addend = 0
+        minus = None
         for k in range(nreloc):
             address, info = struct.unpack_from("<iI", data, reloff + 8 * k)
             number = info & 0xFFFFFF
@@ -131,12 +135,20 @@ def _macho(data: bytes) -> Obj:
             if kind == 10:  # ARM64_RELOC_ADDEND, for the relocation after it
                 addend = number if number < 0x800000 else number - 0x1000000
                 continue
+            if kind == 1:  # ARM64_RELOC_SUBTRACTOR, for the UNSIGNED after it
+                minus = number
+                continue
             name = {0: "abs64", 2: "branch26", 3: "page21", 4: "pageoff12"}.get(kind)
             assert name, f"relocation type {kind}"
             section = obj.sections[index]
             if name == "abs64":
                 (implicit,) = struct.unpack_from("<q", section.data, address)
                 struct.pack_into("<q", section.data, address, 0)
+                if minus is not None:
+                    obj.relocs.append(Reloc(index, address, "delta64", number, None,
+                                            implicit, minus))
+                    minus = None
+                    continue
                 if not extern:
                     # Non-extern: the word holds the target's object address.
                     target = number - 1
@@ -150,7 +162,7 @@ def _macho(data: bytes) -> Obj:
     return obj
 
 
-ELF_KINDS = {257: "abs64", 282: "branch26", 283: "branch26", 280: "branch19",
+ELF_KINDS = {257: "abs64", 261: "prel32", 282: "branch26", 283: "branch26", 280: "branch19",
              275: "page21", 277: "pageoff12", 278: "pageoff12", 284: "pageoff12",
              285: "pageoff12", 286: "pageoff12", 299: "pageoff12"}
 
@@ -260,6 +272,14 @@ def _link(obj: Obj) -> Linked:
         data = obj.sections[r.section].data
         if r.kind == "abs64":
             struct.pack_into("<Q", data, r.offset, target)
+            continue
+        if r.kind == "delta64":
+            assert r.minus is not None
+            struct.pack_into("<q", data, r.offset,
+                             target - symbol_address(obj.symbols[r.minus]))
+            continue
+        if r.kind == "prel32":
+            struct.pack_into("<i", data, r.offset, target - place)
             continue
         (word,) = struct.unpack_from("<I", data, r.offset)
         if r.kind == "branch26":

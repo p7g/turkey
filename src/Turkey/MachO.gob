@@ -32,6 +32,14 @@ export (objectFile)
 -- relocated at all. ld64 does not link debug sections; it leaves them in the
 -- object and points the executable's debug map at it, so an offset in the
 -- object is the offset a debugger reads.
+--
+-- **Unwind sections.** A compact unwind entry's function address is a word
+-- like any other, against `__text` for the label at the function's start.
+-- An address in `__eh_frame` is relative to its own field, which Mach-O
+-- spells as a pair: a `SUBTRACTOR` naming a local symbol at the start of
+-- `__eh_frame`, then an `UNSIGNED` naming the function, with the field
+-- holding minus its offset in the section. Both halves must name a symbol,
+-- so that section symbol is in the table too, and it is not in `__text`.
 
 import Data.Set as Set
 import Turkey.Asm as Asm
@@ -67,6 +75,12 @@ fun names(kind : Asm.Section) -> (String, String, Int) = match kind {
     Asm.DebugStr -> ("__DWARF", "__debug_str", 0x02000000)
     Asm.DebugLine -> ("__DWARF", "__debug_line", 0x02000000)
     Asm.DebugLineStr -> ("__DWARF", "__debug_line_str", 0x02000000)
+    -- The linker reads both and builds the image's `__unwind_info` from
+    -- them: the compact entries as debug information it does not copy, and
+    -- `__eh_frame` as coalesced, live support for the functions it
+    -- describes.
+    Asm.CompactUnwind -> ("__LD", "__compact_unwind", 0x02000000)
+    Asm.EhFrame -> ("__TEXT", "__eh_frame", 0x6800000B)
 }
 
 -- A symbol's place in the table and what goes in its entry.
@@ -88,11 +102,16 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
     let contents = headerSize + commands
     -- Relocations after the contents, each section's together.
     let relocations = Array.map(sections, fun(s) = Vec.filter(s.relocations, relocated))
+    let entryCounts = Array.map(relocations, fun(rs) {
+        var n = 0
+        for r in rs { n = n + entries(r) }
+        n
+    })
     let relocationsAt = Array.filled(count, 0)
     var at = alignUp(contents + size, 8)
     for var k = 0; k < count; k = k + 1 {
         relocationsAt[k] = at
-        at = at + 8 * len(relocations[k])
+        at = at + 8 * entryCounts[k]
     }
     let (entries, locals, exported) = symbols(obj, addresses)
     let indices = Map.new()
@@ -141,8 +160,8 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
         le(out, 8, len(s.bytes))
         le(out, 4, contents + addresses[k])
         le(out, 4, s.align)
-        le(out, 4, if len(relocations[k]) == 0 { 0 } else { relocationsAt[k] })
-        le(out, 4, len(relocations[k]))
+        le(out, 4, if entryCounts[k] == 0 { 0 } else { relocationsAt[k] })
+        le(out, 4, entryCounts[k])
         le(out, 4, flags)
         le(out, 4, 0)
         le(out, 4, 0)
@@ -193,6 +212,17 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
     pad(out, relocationsAt[0])
     for var k = 0; k < count; k = k + 1 {
         for r in relocations[k] {
+            if let Relative64 = r.use {
+                -- The field's offset from the section symbol, negated, is
+                -- the addend.
+                Byte.putLE(out, contents + addresses[k] + r.offset, 8, -r.offset)
+                le(out, 4, r.offset)
+                le(out, 4, Map.getOr(indices, sectionSymbol(k), 0) | 1 << 27 | 3 << 25
+                           | 1 << 28)
+                le(out, 4, r.offset)
+                le(out, 4, Map.getOr(indices, symbolName(r.target), 0) | 1 << 27 | 3 << 25)
+                continue
+            }
             let (kind, pcrel, length) = relocationKind(r.use)
             -- The symbol's index with the extern bit, or the section's
             -- ordinal without it.
@@ -236,6 +266,12 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
     }
     let locals = []
     let exported = []
+    for var k = 0; k < len(obj.sections); k = k + 1 {
+        if Iterator.any(obj.sections[k].relocations, fun(r) = isRelative64(r.use)) {
+            Vec.push(locals, Entry { name = sectionSymbol(k), kind = 0xE, section = k + 1,
+                                     value = addresses[k] })
+        }
+    }
     for d in obj.defined {
         let e = Entry { name = symbolName(d.symbol), kind = 0xE, section = d.section + 1,
                         value = addresses[d.section] + d.offset }
@@ -265,8 +301,21 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
 -- written into the field instead.
 fun relocated(r : Relocation Fixup) -> Bool = match r.use {
     Offset32 -> False
-    Address64 | Code(_) -> True
+    Address64 | Code(_) | Relative32 | Relative64 -> True
 }
+
+-- How many entries a relocation takes: two for an address relative to its
+-- field, the `SUBTRACTOR` and the `UNSIGNED`.
+fun entries(r : Relocation Fixup) -> Int = if isRelative64(r.use) { 2 } else { 1 }
+
+fun isRelative64(use : Use Fixup) -> Bool = match use {
+    Relative64 -> True
+    _ -> False
+}
+
+-- The local symbol at the start of section `k`, which a `SUBTRACTOR` there
+-- names.
+fun sectionSymbol(k : Int) -> String = "ltmp" + Int.toString(k)
 
 -- Whether a relocation in a section of kind `holder` names its target's
 -- section rather than a symbol: an eight-byte word that holds a temporary
@@ -280,7 +329,8 @@ fun sectionRelative(holder : Asm.Section, r : Relocation Fixup) -> Bool =
 
 fun debug(kind : Asm.Section) -> Bool = match kind {
     Asm.DebugAbbrev | Asm.DebugInfo | Asm.DebugStr | Asm.DebugLine | Asm.DebugLineStr -> True
-    Asm.Text | Asm.CStrings | Asm.Constants | Asm.Data | Asm.Relocated -> False
+    Asm.Text | Asm.CStrings | Asm.Constants | Asm.Data | Asm.Relocated | Asm.CompactUnwind
+        | Asm.EhFrame -> False
 }
 
 -- A symbol's name in the table: a named symbol's own, and a temporary
@@ -295,6 +345,8 @@ fun symbolName(sym : Symbol) -> String = match sym.kind {
 fun relocationKind(use : Use Fixup) -> (Int, Int, Int) = match use {
     Address64 -> (0, 0, 3)
     Offset32 -> error("internal error: a section offset is never relocated")
+    Relative64 -> error("internal error: a relative address is a pair of relocations")
+    Relative32 -> error("internal error: a four-byte relative address on Mach-O")
     Code(Jump26(_)) | Code(Call26(_)) -> (2, 1, 2)
     Code(Page21(_)) -> (3, 1, 2)
     Code(PageOffset12(_, _)) | Code(AddOffset12(_)) -> (4, 0, 2)

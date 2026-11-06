@@ -12,7 +12,8 @@
 # a shard on its own runner pays for every such run it touches:
 #
 #   bootstrap  the fixed point, and the emitter over the compiler's source,
-#              which test_emit, test_bootstrap and test_debug_info share
+#              which test_emit, test_bootstrap, test_debug_info and
+#              test_unwind share
 #   native     the corpus built by the arm64 backend, run under GC stress
 #              with every collection full
 #   generational
@@ -36,7 +37,7 @@
 
 set -eu
 
-BOOTSTRAP="test_bootstrap test_emit test_debug_info"
+BOOTSTRAP="test_bootstrap test_emit test_debug_info test_unwind"
 NATIVE="test_arm64_native"
 ASSEMBLER="test_encode test_object"
 PASSES="test_select test_machine_check test_ssa_lower test_ssa test_sccp

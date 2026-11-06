@@ -400,9 +400,45 @@ fun poll() -> Unit {
 fun idle(seen : Int) -> Unit {
     Workers.idleEnter()
     stopLooking()
-    if Workers.queued() == 0 { wait(seen) }
+    if Workers.queued() == 0 && !spin(seen) { wait(seen) }
     Workers.idleLeave()
     stopLooking()
+}
+
+-- EXPERIMENT: looks at the queue before sleeping, from TURKEY_SPIN.
+var spinLooks : Int = spinFrom(Libc.getenv(Prim.cString("TURKEY_SPIN")))
+
+fun spinFrom(s : Ptr) -> Int {
+    if Ptr.isNull(s) { return 0 }
+    var n = 0
+    var i = 0
+    while True {
+        let c = Prim.byteToInt(Prim.loadI8(s, i))
+        if c < 48 || c > 57 { return n }
+        n = n * 10 + (c - 48)
+        i = i + 1
+    }
+    n
+}
+
+-- Returns whether a task was queued, or the work epoch moved past `seen`,
+-- while this worker looked for a while before sleeping. Looks only while it
+-- holds `looking`, so at most one worker spins and `notify` wakes nobody
+-- meanwhile, and only while two other workers are busy.
+fun spin(seen : Int) -> Bool {
+    if spinLooks == 0 || Workers.permits() - Workers.idlers() < 2 { return False }
+    if Ptr.atomicLoad(looking, 0) != 0 || Ptr.atomicCas(looking, 0, 0, 1) != 0 { return False }
+    var found = False
+    for var i = 0; i < spinLooks; i = i + 1 {
+        if Workers.queued() > 0 || Workers.workSeen() != seen {
+            found = True
+            break
+        }
+    }
+    -- Clear `looking` and then look once more, as `idle` does, so that a task
+    -- queued while it was set is seen.
+    stopLooking()
+    found || Workers.queued() > 0
 }
 
 -- Wakes an idle worker if tasks are queued, as `notify` does. Called by a

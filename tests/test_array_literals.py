@@ -149,7 +149,7 @@ def test_an_annotation_cannot_make_the_container_generic() -> None:
 
 
 @pytest.mark.parametrize("annotation", ["Int", "Option String",
-                                        "Map String Int"])
+                                        "Either String Int"])
 def test_a_literal_where_no_container_fits(annotation) -> None:
     message = lang.fails(f'let x : {annotation} = ["a"]\n')
     assert message == (f"an array literal cannot have type '{annotation}'; "

@@ -8,7 +8,7 @@ export (
     registerAll, resolveContext,
     reduceFam,
     uncovered,
-    bySuper, byInst, selectInstance, entail, prove, superPath, isClass, method, simplify,
+    bySuper, byInst, selectInstance, contextAt, entail, prove, superPath, isClass, method, simplify,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -96,10 +96,11 @@ type Evidence
     -- The dictionary of an instance at the class argument it was selected
     -- for, given evidence for that instance's context. `instance Semigroup
     -- (Array a)` is a *function* from a `Semigroup a` dictionary to a
-    -- `Semigroup (Array a)` one. The type is the one the head was matched
-    -- against, after the solver rewrote it by the equalities in scope: `Add
-    -- Int` for a demand `Add (Elem a)` under `Elem a ~ Int`.
-    | FromInstance(InstInfo, Ty.Type, Array Evidence)
+    -- `Semigroup (Array a)` one. The map is the match that selected it, from
+    -- each of the head's variables to a type, against the argument as the
+    -- solver rewrote it by the equalities in scope: `Add Int` for a demand
+    -- `Add (Elem a)` under `Elem a ~ Int`.
+    | FromInstance(InstInfo, Map Int Ty.Type, Array Evidence)
     -- A predicate whose argument is bottom, and so has no instance to find. The
     -- mirror of the same rule in the solver: bottom is absorbed by whatever it
     -- meets, so there is no type to look up and no value that would ever ask
@@ -1437,11 +1438,16 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
 }
 
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) =
-    Option.map(selectInstance(t, p), _.1)
+    Option.map(selectInstance(t, p), fun((inst, mapping)) = contextAt(inst, mapping))
 
--- Returns the instance that covers `p` and its context at `p`'s argument, or
--- `None` if no instance does.
-fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Array Pred) {
+-- Returns `inst`'s context under `mapping`, a match of its head.
+fun contextAt(inst : InstInfo, mapping : Map Int Ty.Type) -> Array Pred =
+    Array.map(Vec.toArray(inst.context), fun(q) =
+        Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)]))
+
+-- Returns the instance that covers `p` and the match of its head against
+-- `p`'s argument, or `None` if no instance does.
+fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Type) {
     if isGenerated(p.name) {
         let _ = synthesize(t, p)
     }
@@ -1450,8 +1456,7 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Array Pred) {
     }
     for inst in instancesOf(t, p.name) {
         if let Some(mapping) = match_(inst.head, p.args[0]) {
-            return Some((inst, Array.map(inst.context, fun(q) =
-                Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)]))))
+            return Some((inst, mapping))
         }
     }
     None
@@ -1478,10 +1483,10 @@ fun prove(t : ClassTable, given : Vec (String, Pred), p : Pred) -> Option Eviden
             return Some(FromDict(name, path, Some(g)))
         }
     }
-    let (inst, obligations) = selectInstance(t, p)?
-    let args = Vec.new(len(obligations))
-    for q in obligations { Vec.push(args, prove(t, given, q)?) }
-    Some(FromInstance(inst, p.args[0], Vec.toArray(args)))
+    let (inst, mapping) = selectInstance(t, p)?
+    let args = Vec.new(len(inst.context))
+    for q in contextAt(inst, mapping) { Vec.push(args, prove(t, given, q)?) }
+    Some(FromInstance(inst, mapping, Vec.toArray(args)))
 }
 
 -- Returns the superclass names to select, in order, to reach the predicate

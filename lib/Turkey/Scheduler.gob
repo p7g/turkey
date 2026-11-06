@@ -105,11 +105,14 @@ import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 
 -- A coroutine's `waiting` state: neither queued nor parked (running, or
--- queued to run); parked, until something wakes it; or woken while it was
--- still running, to be queued when it suspends.
+-- queued to run); parked, until something wakes it; woken while it was still
+-- running, to be queued when it suspends; or yielding, to be queued when it
+-- suspends, on the global queue (`yield`). A wake finds a yielding coroutine
+-- as it finds a woken one, already to be queued.
 let active = 0
 let parked = 1
 let woken = 2
+let yielding = 3
 
 -- The lock of what tasks wait on (`lock`).
 var waitsLock : Ptr = Lock.new()
@@ -243,7 +246,8 @@ fun claim(c : Co.Coroutine) -> Bool {
     while True {
         if Co.waitingSwap(c, parked, active) { return True }
         if Co.waitingSwap(c, active, woken) { return False }
-        if Co.waiting(c) == woken { return False }
+        let state = Co.waiting(c)
+        if state == woken || state == yielding { return False }
     }
     False
 }
@@ -333,10 +337,9 @@ fun localTake(s : Int) -> Option Co.Coroutine {
     c
 }
 
--- Take half of another permit's queue onto slot `s`'s, which is empty, and
--- return the oldest of the tasks taken, counted as running. One pass over the
--- other slots, from a start that moves on with each call so that thieves
--- spread out.
+-- Take half of another permit's queue onto slot `s`'s, and return the oldest
+-- of the tasks taken, counted as running. One pass over the other slots, from
+-- a start that moves on with each call so that thieves spread out.
 fun steal(s : Int) -> Option Co.Coroutine {
     let n = localSlots
     let from = Ptr.atomicAdd(stealStart, 0, 1) % n
@@ -354,10 +357,10 @@ fun steal(s : Int) -> Option Co.Coroutine {
 
 let stealStart : Ptr = zeroedWord()
 
--- Move half of slot `v`'s tasks, rounded up, to slot `s`'s queue, which is
--- empty, and return the oldest, counted as running. Takes both queues'
--- locks, the lower slot's first, so that two thieves stealing from each
--- other cannot each hold one and wait for the other.
+-- Move half of slot `v`'s tasks, rounded up, to slot `s`'s queue, as many as
+-- it has room for, and return the oldest, counted as running. Takes both
+-- queues' locks, the lower slot's first, so that two thieves stealing from
+-- each other cannot each hold one and wait for the other.
 fun stealFrom(v : Int, s : Int) -> Option Co.Coroutine {
     let low = if v < s { v } else { s }
     let high = if v < s { s } else { v }
@@ -370,13 +373,15 @@ fun stealFrom(v : Int, s : Int) -> Option Co.Coroutine {
         Lock.release(localLock(low))
         return None
     }
-    let taken = available - available / 2
+    -- Only a slot's own thread puts tasks on its queue, and that is the
+    -- caller, so the room seen here is still there below. The oldest task
+    -- is returned rather than queued, so it needs none.
+    let room = localCapacity - localLength(s)
+    let half = available - available / 2
+    let taken = if half > room + 1 { room + 1 } else { half }
     let at = v * localCapacity + first % localCapacity
     let c = localTasks[at]
     localTasks[at] = None
-    -- Only a slot's own thread puts tasks on its queue, and that is the
-    -- caller, which found it empty: so it still is, with room for half of a
-    -- full queue.
     var tail = localTail(s)
     for var j = 1; j < taken; j = j + 1 {
         let entry = v * localCapacity + (first + j) % localCapacity
@@ -393,9 +398,10 @@ fun stealFrom(v : Int, s : Int) -> Option Co.Coroutine {
 }
 
 -- The next task for the running thread to run, if any: from its permit's
--- queue, the global queue (first, when `globalFirst`, so that the global
--- queue cannot starve), what a poll finds, or half of another permit's
--- queue.
+-- queue, the queue of a permit no thread runs tasks with (`orphanTake`), the
+-- global queue, what a poll finds, or half of another permit's queue. When `globalFirst`, the global queue and the queues of permits no
+-- thread holds come before the thread's own, so that neither can starve
+-- behind a thread whose own queue never empties.
 fun findWork(globalFirst : Bool) -> Option Co.Coroutine {
     let s = mySlot()
     if s < 0 { return globalTake() }
@@ -404,8 +410,16 @@ fun findWork(globalFirst : Bool) -> Option Co.Coroutine {
             Some(c) -> return Some(c)
             None -> {}
         }
+        match orphanTake(s) {
+            Some(c) -> return Some(c)
+            None -> {}
+        }
     }
     match localTake(s) {
+        Some(c) -> return Some(c)
+        None -> {}
+    }
+    match orphanTake(s) {
         Some(c) -> return Some(c)
         None -> {}
     }
@@ -421,6 +435,25 @@ fun findWork(globalFirst : Bool) -> Option Co.Coroutine {
         None -> {}
     }
     steal(s)
+}
+
+-- Take half of the queue of a permit that no thread runs tasks with onto
+-- slot `s`'s, as `stealFrom` does, and return the oldest: a permit no thread
+-- holds, or one whose holder is blocked in a call
+-- (`Turkey.Workers.slotStalled`). A busy thread never steals, so without
+-- this the tasks on such a queue would wait for the monitor to hand the
+-- permit to a spare thread, and the monitor cannot start one while a
+-- collection holds the threads' registration (`Turkey.Workers.spareNew`).
+fun orphanTake(s : Int) -> Option Co.Coroutine {
+    for var v = 0; v < localSlots; v = v + 1 {
+        if v != s && localLength(v) > 0 && Workers.slotStalled(v) {
+            match stealFrom(v, s) {
+                Some(c) -> return Some(c)
+                None -> {}
+            }
+        }
+    }
+    None
 }
 
 -- Whether the running thread leaves tasks queued that another worker could
@@ -441,8 +474,13 @@ fun run(c : Co.Coroutine) -> Unit {
     -- `push` requires.
     if Workers.tasksAdd(if again { 1 } else { 0 }, -1) >> 32 == 1 { changed() }
     if again {
+        -- A yield goes to the global queue, behind every other runnable
+        -- task, as Go's `Gosched` does: on the permit's own queue the
+        -- thread would take it back at once whenever the queue held nothing
+        -- else.
+        let yielded = Co.waiting(c) == yielding
         Co.waitingSet(c, active)
-        push(c)
+        if yielded { globalPush(c) } else { push(c) }
         notify()
     }
 }
@@ -679,9 +717,9 @@ fun afterCall() -> Unit {
 -- that is each task runnable now, once.
 fun yield() -> Unit = match Co.running() {
     Some(c) -> {
-        -- Running, so the only other change to its word is a wake's, to
-        -- woken too.
-        Co.waitingSet(c, woken)
+        -- Running, so the only other change to its word is a wake's, which
+        -- leaves a yielding coroutine as it is (`claim`).
+        Co.waitingSet(c, yielding)
         Co.suspend()
     }
     None -> {

@@ -438,9 +438,8 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
 -- A slot can never be called where one of its method's own equalities can
 -- never hold, since every call has to supply the evidence for it. Its body was
 -- checked under that equality, so it may be ill-typed here, and specializing
--- what it calls could fail. So it is not rewritten at all. rustc decides the
--- same, from the same test made after monomorphization, and leaves the
--- vtable entry vacant (`impossible_clauses`, `VtblEntry::Vacant`).
+-- what it calls could fail. So it is not rewritten at all. An equality that
+-- is only undecided, because a side is still a variable, is not false.
 fun rewriteDict(r : Rewriter, e : Core, cls : String, slots : Array Core) -> Core {
     if len(Map.keys(r.subst)) == 0 { return generic(r, e) }
     let ty = rTy(r, e.ty)
@@ -491,27 +490,19 @@ fun vacant(r : Rewriter, slot : Core, m : MethodInfo, head : Ty.Type) -> Option 
         TFun(ps, rt) -> (ps, rt)
         _ -> return None
     }
-    let params = fun(types : Array Ty.Type) = Array.map(types, fun(t) = CParam {
-        name = "%p", id = Binders.fresh(r.owner.table, owner, "%p", Binders.Local,
+    let params = Array.map(evidence, fun(t) = CParam {
+        name = "%e", id = Binders.fresh(r.owner.table, owner, "%e", Binders.Local,
                                         Generated(slot.span)),
         ty = t,
     })
     let message = "the method '" + Classes.surfaceMember(m.name) + "' cannot be called at "
                   + Ty.show(head)
-    let fails = fun(t) {
-        let errorTy = TFun([Ty.tString()], t)
-        mkCore(t, slot.span, CApp(
-            mkCore(errorTy, slot.span, CTyApp(mkCore(errorTy, slot.span,
-                                                     CVar(BySpelling(P.error))), [t])),
-            [mkCore(Ty.tString(), slot.span, CLit(LString(message)))]))
-    }
-    -- A lambda over the method's own parameters too, as `Lower.panicking` is,
-    -- since erasing the evidence leaves the dictionary to evaluate the body.
-    let failed = match Ty.prune(ret) {
-        TFun(ps, rt) -> mkCore(ret, slot.span, CLam(params(ps), fails(rt), "<anonymous>"))
-        _ -> fails(ret)
-    }
-    let made = mkCore(fnTy, slot.span, CLam(params(evidence), failed, "<anonymous>"))
+    let errorTy = TFun([Ty.tString()], ret)
+    let failed = mkCore(ret, slot.span, CApp(
+        mkCore(errorTy, slot.span, CTyApp(mkCore(errorTy, slot.span,
+                                                 CVar(BySpelling(P.error))), [ret])),
+        [mkCore(Ty.tString(), slot.span, CLit(LString(message)))]))
+    let made = mkCore(fnTy, slot.span, CLam(params, failed, "<anonymous>"))
     Some(match own {
         Some(vs) -> mkCore(fnTy, slot.span, CTyLam(vs, made))
         None -> made

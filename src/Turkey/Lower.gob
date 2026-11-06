@@ -698,31 +698,15 @@ fun unreachable(l : Lowerer, inst : InstInfo, name : String) -> Core {
             let params = Array.map(evidence, fun(t) = CParam { name = "%e", id = mint(l, "%e"), ty = t })
             let message = "the method '" + Classes.surfaceMember(name) + "' cannot be called at "
                           + Ty.show(inst.head)
-            let failed = panicking(l, rest, message, span)
+            let failed = node(rest, span, CApp(
+                node(TFun([Ty.tString()], rest), span, CTyApp(
+                    node(unknown(), span, CVar(BySpelling(P.error))), [rest])),
+                [node(Ty.tString(), span, CLit(LString(message)))]))
             node(TFun(evidence, rest), span, CLam(params, failed, instName(inst) + "." + name))
         }
         _ -> oops("a method with equalities takes no evidence", span)
     }
     methodAbstraction(mi, lam, span)
-}
-
--- A term of type `ty` that panics with `message` when it is called, or when it
--- is evaluated if `ty` is not a function. It is a lambda over the method's own
--- parameters, not only over its evidence, because the evidence is erased
--- before the code is generated, and a dictionary evaluates its slots when it
--- is built.
-fun panicking(l : Lowerer, ty : Ty.Type, message : String, span : Option Span) -> Core {
-    let fails = fun(t) = node(t, span, CApp(
-        node(TFun([Ty.tString()], t), span, CTyApp(
-            node(unknown(), span, CVar(BySpelling(P.error))), [t])),
-        [node(Ty.tString(), span, CLit(LString(message)))]))
-    match Ty.prune(ty) {
-        TFun(params, ret) -> {
-            let ps = Array.map(params, fun(t) = CParam { name = "%p", id = mint(l, "%p"), ty = t })
-            node(ty, span, CLam(ps, fails(ret), "<anonymous>"))
-        }
-        _ -> fails(ty)
-    }
 }
 
 fun methodOf(l : Lowerer, cls : String, name : String, where : Option Span) -> MethodInfo =
@@ -1203,23 +1187,19 @@ fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
     }
 }
 
---
--- A lambda over coercions alone delays nothing, since it is erased, so one is
--- expanded through to the function it answers.
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
             let ps = Array.map(params, freshParam(l, "eta", _))
             let args = Array.map(ps, paramVar(_, where))
-            let applied = node(ret, where, CApp(called, args))
-            let body = if onlyCoercions(ps) { eta(l, applied, ret, where) } else { applied }
-            node(TFun(params, ret), where, CLam(ps, body, "<anonymous>"))
+            node(TFun(params, ret), where,
+                 CLam(ps, node(ret, where, CApp(called, args)), "<anonymous>"))
         }
         _ -> called
     }
 
 -- Returns whether `ps` are parameters only of coercions, which a lambda over
--- them is erased with: such a lambda does not delay its body.
+-- them is erased with.
 fun onlyCoercions(ps : Array CParam) -> Bool =
     len(ps) > 0 && Iterator.all(ps, fun(p) = isCoercion(p.ty))
 
@@ -1233,7 +1213,8 @@ fun onlyCoercions(ps : Array CParam) -> Bool =
 fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
              body : Core, where : Option Span) -> Core {
     -- Under the method's own parameters, not under a lambda over coercions
-    -- alone, which is erased and so delays nothing.
+    -- alone. Erasure would eta-expand that lambda through the method's, which
+    -- would build a closure, besides the dictionary, at every call.
     match body.kind {
         CLam(ps, inner, lamName) -> if onlyCoercions(ps) {
             return node(body.ty, body.span, CLam(ps,

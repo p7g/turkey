@@ -1600,22 +1600,30 @@ fun fuseRecursiveJoinResult(r : Reducer, e : Core) -> Option Core = match e.kind
 --
 -- Only names and literals, not every value: substituting a `CLam` would
 -- duplicate its body at each mention, which is inlining and has a size limit
--- for a reason.
+-- for a reason. A lambda over coercions alone is the exception, when its body
+-- is trivial too: a generalized `let f = g` under an equality is one around
+-- the name it stands for, and once its argument is substituted, `beta` leaves
+-- only the name.
 fun trivialLet(r : Reducer, e : Core) -> Option Core = match e.kind {
     CLet(_, id, _, value, body, binders) -> {
-        if len(binders) > 0 { return None }
-        match value.kind {
-            CVar(_) -> {}
-            CLit(_) -> {}
-            CUnit -> {}
-            CCon(_) -> {}
-            _ -> return None
-        }
+        if len(binders) > 0 || !trivial(value) { return None }
         let mapping = Map.new()
         Map.put(mapping, id, value)
         Some(moved(r, body, mapping))
     }
     _ -> None
+}
+
+-- Whether `e` is a name or a literal, possibly under lambdas over coercions
+-- alone and applications to coercions alone, which copy no work, since a
+-- coercion is evidence and nothing else.
+fun trivial(e : Core) -> Bool = match e.kind {
+    CVar(_) | CLit(_) | CUnit | CCon(_) -> True
+    CLam(params, body, _) ->
+        len(params) > 0 && Iterator.all(params, fun(p) = isCoercion(p.ty)) && trivial(body)
+    CApp(fn, args) ->
+        len(args) > 0 && Iterator.all(args, fun(a) = isCoercion(a.ty)) && trivial(fn)
+    _ -> False
 }
 
 -- `let x = v in match x {...}` is `match v {...}`, when `x` is read only there.

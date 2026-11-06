@@ -18,7 +18,8 @@ export (
     Scheme(..), mono, scheme,
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
-    skolemsOf, markOpened, openedBy, clearOpened,
+    skolemsOf, markOpened, openedBy, clearOpened, markBreaker, breakerFor,
+    isFam, occursRigidly, occursIn,
     unify, join, generalize, instantiate, instantiateQual, typeError,
     typeKey, sameType, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
@@ -291,7 +292,23 @@ fun openedBy(c : ConCell) -> Option String = Map.get(opened.names, c.uid)
 
 fun clearOpened() -> Unit {
     opened.names = Map.new()
+    breakers.standsFor = Map.new()
 }
+
+-- The cycle breakers the solver has made, by variable id, and the family
+-- application each stands for (`Turkey.Inert`). Wherever a breaker appears, no
+-- unification binds it, and a diagnostic shows its family application.
+type Breakers = Breakers { var standsFor : Map Int Type }
+
+let breakers = Breakers { standsFor = Map.new() }
+
+-- Records `cell` as a cycle breaker standing for the family application `fam`.
+fun markBreaker(cell : VarCell, fam : Type) -> Unit =
+    Map.put(breakers.standsFor, cell.id, fam)
+
+-- Returns the family application the cycle breaker `cell` stands for, or
+-- `None` if `cell` is no breaker.
+fun breakerFor(cell : VarCell) -> Option Type = Map.get(breakers.standsFor, cell.id)
 
 fun newVar(level : Int, kind : Kind) -> VarCell {
     counters.tyvar = counters.tyvar + 1
@@ -824,24 +841,34 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
     _ -> False
 }
 
--- Returns whether `slot` occurs in `t` other than inside the argument of a
+-- Returns whether `lhs` occurs in `t` other than inside the argument of a
 -- family application.
-fun occursRigidly(slot : VarCell, t : Type) -> Bool = match prune(t) {
-    TVar(cell) -> cell.id == slot.id
-    TApp(fn, arg, _) -> occursRigidly(slot, fn) || occursRigidly(slot, arg)
-    TFun(params, ret) -> {
-        for p in params {
-            if occursRigidly(slot, p) { return True }
+fun occursRigidly(lhs : Type, t : Type) -> Bool {
+    if sameType(t, lhs) { return True }
+    match prune(t) {
+        TApp(fn, arg, _) -> occursRigidly(lhs, fn) || occursRigidly(lhs, arg)
+        TFun(params, ret) -> {
+            for p in params {
+                if occursRigidly(lhs, p) { return True }
+            }
+            occursRigidly(lhs, ret)
         }
-        occursRigidly(slot, ret)
-    }
-    TTuple(elems) -> {
-        for e in elems {
-            if occursRigidly(slot, e) { return True }
+        TTuple(elems) -> {
+            for e in elems {
+                if occursRigidly(lhs, e) { return True }
+            }
+            False
         }
-        False
+        _ -> False
     }
-    _ -> False
+}
+
+-- Returns whether `lhs` occurs anywhere in `t`, family arguments included.
+fun occursIn(lhs : Type, t : Type) -> Bool {
+    for sub in subterms(t) {
+        if sameType(sub, lhs) { return True }
+    }
+    False
 }
 
 -- Returns the rigid constants reachable from `types`, first occurrence first.
@@ -854,6 +881,8 @@ fun skolemsOf(types : Array Type) -> Vec ConCell {
 
 fun skolemsInto(t : Type, out : Vec ConCell, seen : Set.Set Int) -> Unit =
     match prune(t) {
+        -- A cycle breaker mentions the skolems of what it stands for.
+        TVar(cell) -> if let Some(fam) = breakerFor(cell) { skolemsInto(fam, out, seen) }
         TCon(c) -> if c.uid != 0 && !Set.contains(seen, c.uid) {
             Set.add(seen, c.uid)
             Vec.push(out, c)
@@ -981,7 +1010,11 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             -- reporting one, rewrite `y` at every depth and ask again.
             if Option.isSome(escaping(cell, y)) {
                 let deep = normalizeDeep(y, fams)
-                if !sameType(deep, y) { return unify(x, deep, where, context, fams) }
+                -- Only if that clears it: an escape still there is reported
+                -- in the types the expression wrote, not the rewritten ones.
+                if !sameType(deep, y) && Option.isNone(escaping(cell, deep)) {
+                    return unify(x, deep, where, context, fams)
+                }
             }
             match escaping(cell, y) {
                 Some(out) -> match openedEscape(y, out, cell.level) {
@@ -1003,7 +1036,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 -- (F a)` holds once `a` is `Option (Option Int)` and `F` of
                 -- that is `Option Int`. Only an occurrence outside every
                 -- family makes the type infinite.
-                if !occursRigidly(cell, y) {
+                if !occursRigidly(x, y) {
                     return match fams {
                         Some(f) -> f.defer(x, y, where, context)
                         None -> mismatch(x, y, where, context)
@@ -1105,11 +1138,12 @@ fun normalizeDeep(t : Type, fams : Option Families) -> Type {
 -- Returns whether `fams` forbids binding `cell`. Without a reducer nothing is
 -- being solved, so nothing is untouchable.
 fun untouchable(cell : VarCell, fams : Option Families) -> Bool = match fams {
-    Some(f) -> cell.level <= f.untouchable
+    Some(f) -> cell.level <= f.untouchable || Option.isSome(breakerFor(cell))
     None -> False
 }
 
-fun isFam(t : Type) -> Bool = match t {
+-- Returns whether `t` is a family application.
+fun isFam(t : Type) -> Bool = match prune(t) {
     TFam(_, _, _) -> True
     _ -> False
 }
@@ -1444,18 +1478,25 @@ fun varName(index : Int) -> String {
     if index < 26 { letter } else { letter + Int.toString(index / 26) }
 }
 
+-- Returns the name `n` gives the variable `cell`, giving it the next one if it
+-- has none yet.
+fun showVar(cell : VarCell, n : Namer) -> String = match Map.get(n.names, cell.id) {
+    Some(name) -> name
+    None -> {
+        let name = n.prefix + varName(n.next)
+        Map.put(n.names, cell.id, name)
+        n.next = n.next + 1
+        name
+    }
+}
+
 -- Render a type in surface syntax, naming variables a, b, c, ... in order.
 fun show(t : Type) -> String = showAt(t, namer(""), 0)
 
 fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
-    TVar(cell) -> match Map.get(n.names, cell.id) {
-        Some(name) -> name
-        None -> {
-            let name = n.prefix + varName(n.next)
-            Map.put(n.names, cell.id, name)
-            n.next = n.next + 1
-            name
-        }
+    TVar(cell) -> match breakerFor(cell) {
+        Some(fam) -> showAt(fam, n, prec)
+        None -> showVar(cell, n)
     }
     TBottom -> "!"
     TSet(names) -> "{" + showLiteralSet(names) + "}"

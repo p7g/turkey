@@ -93,6 +93,7 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Inert as Inert
+import Turkey.Inert (Given(..), Refusal(..))
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
@@ -145,7 +146,11 @@ type Constraint
     -- class context an existential pattern opens. An *equality* introduced by
     -- a pattern is what makes GADTs destroy principal types, and none is
     -- introduced here.
-    | CAssume(Vec (String, Pred), Constraint)
+    -- Each given comes with where a context at this site wrote it, or `None`
+    -- where none did: a class's method signature grants its context to every
+    -- override, and an existential pattern grants the class context its
+    -- constructor declares.
+    | CAssume(Vec (String, Pred, Option Span), Constraint)
     -- `name <= t`: instantiate a scheme at `t`. The generator emits this
     -- instead of looking the name up, which is what lets it run without a type
     -- environment at all. The name is the occurrence's spelling, for
@@ -324,8 +329,9 @@ fun adopt(s : Solver, vars : Vec VarCell) -> Unit {
 
 -- -- families ----------------------------------------------------------------------
 
--- What a family application, a skolem or a variable is, by the givens in
--- scope and the instances, rewritten at every depth; `None` if neither says.
+-- Returns what a family application, a skolem or a variable is by the givens
+-- in scope and the instances, rewritten at every depth, or `None` if neither
+-- says.
 --
 -- At every depth, though `unify` asks only about a head: two applications of
 -- one family are the same type when their arguments are, and an argument the
@@ -373,17 +379,12 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     -- Oriented family-first, so a carried equality reads the way a written one
     -- has to be written: `Item a ~ Op`, never `Op ~ Item a`. Nothing depends on
     -- the order, but a scheme is read by people.
-    let flip = isFam(right0) && !isFam(left0)
+    let flip = familyLike(right0) && !familyLike(left0)
     let left = if flip { right0 } else { left0 }
     let right = if flip { left0 } else { right0 }
     Vec.push(s.deferred, PredCell {
         pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
     })
-}
-
-fun isFam(t : Ty.Type) -> Bool = match t {
-    TFam(_, _, _) -> True
-    _ -> False
 }
 
 -- -- solving -----------------------------------------------------------------------
@@ -429,27 +430,47 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         let savedInert = s.inert
         let savedUntouchable = s.untouchable
         let equalities = Vec.new(len(givens))
-        for (_, p) in givens {
+        let named = Vec.new(len(givens))
+        for (n, p, at) in givens {
+            Vec.push(named, (n, p))
             if p.name == Ty.equals {
-                Vec.push(equalities, p)
+                Vec.push(equalities, Given { pred = p, span = at })
                 if rank(s) > s.untouchable { s.untouchable = rank(s) }
             } else {
                 Vec.push(s.assumptions, p)
             }
         }
+        -- The inert set this implication made, if it made one: only that one
+        -- is closed on the way out (`Inert.close`), never the enclosing one it
+        -- extends or shares.
+        var made = None
+        var inaccessible = False
         if len(equalities) > 0 {
-            let (inert, refused) = Inert.extend(s.inert, Vec.toArray(equalities))
-            for (p, why) in refused {
-                Ty.typeError("the equality '" + Ty.showPred(p) + "' in this context "
-                             + "can never hold; " + why, assumptionSpan(body))
+            -- Breakers at the rank of the body's `CLet`, so their equations
+            -- stay inside the implication.
+            let (inert, refused) = Inert.extendAt(s.inert, Vec.toArray(equalities),
+                                                  rank(s) + 1)
+            for r in refused {
+                if refusedHere(r, body) { inaccessible = True }
             }
             s.inert = inert
+            made = Some(inert)
         }
         let assumed = newScope()
-        assumed.givens = givens
+        assumed.givens = named
         Vec.push(s.scopes, assumed)
+        -- A given no context here wrote, and that can never hold, makes the body
+        -- *inaccessible*: an override checked under it can never be called
+        -- (System FC, Sulzmann et al. 2007, §3.5). So the body is solved, but
+        -- nothing it reports is shown, as GHC treats an implication whose givens
+        -- are insoluble.
+        if inaccessible { Diag.beginMuted() }
         solve(s, body)
-        Inert.close(s.inert)
+        if inaccessible { Diag.endMuted() }
+        match made {
+            Some(i) -> Inert.close(i)
+            None -> {}
+        }
         s.assumptions = saved
         s.inert = savedInert
         s.untouchable = savedUntouchable
@@ -484,8 +505,29 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     }
 }
 
--- Where the declaration an implication checks is: the body of a `CAssume` is
--- the `CLet` that carries its skolems.
+-- Reports the refusal `r` of an implication's given where its context wrote
+-- it, and returns whether it instead makes the implication, whose body is
+-- `body`, inaccessible: a given that can never hold and that no context here
+-- wrote.
+fun refusedHere(r : Inert.Refusal, body : Constraint) -> Bool = match r {
+    Never(g, why) -> match g.span {
+        Some(_) -> {
+            Ty.typeError("the equality '" + Ty.showPred(g.pred) + "' in this context "
+                         + "can never hold; " + why, g.span)
+            False
+        }
+        None -> True
+    }
+    GaveUp(g, left) -> {
+        Ty.typeError("cannot resolve the equalities in this context: the checker "
+                     + "gave up with " + Int.toString(left) + " of them still to "
+                     + "add; state fewer of them", firstSpan(g.span, assumptionSpan(body)))
+        False
+    }
+}
+
+-- Returns where the declaration an implication checks is: the body of a
+-- `CAssume` is the `CLet` that carries its skolems.
 fun assumptionSpan(body : Constraint) -> Option Span = match body {
     CLet(cell) -> cell.span
     _ -> None
@@ -760,9 +802,13 @@ fun split(s : Solver, types : Array Ty.Type) -> Vec PredCell {
         -- choice per use. So such a binding takes the default -- `fun empty()
         -- = []` is `fun() -> Array a` -- and a use wanting another container
         -- is a plain mismatch against `Array` at that use.
-        let stranded = Vec.filter(retainedPreds, isArrayLiteralDemand)
+        -- Nor is an equation whose variable occurs in its other side under a
+        -- family, `a ~ Option (F a)`: no signature can state it, and once
+        -- nothing more can decide `F a` it is the infinite type it looks like.
+        let stranded = Vec.filter(retainedPreds, fun(p) = isArrayLiteralDemand(p)
+                                                         || isOccursEquation(p))
         for p in unattributed(retainedPreds, types) {
-            if !isArrayLiteralDemand(p) { Vec.push(stranded, p) }
+            if !isArrayLiteralDemand(p) && !isOccursEquation(p) { Vec.push(stranded, p) }
         }
         if len(stranded) == 0 || !applyDefaults(s, stranded) {
             rejectStranded(s, stranded)
@@ -800,18 +846,25 @@ fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
 
 -- -- predicates --------------------------------------------------------------------
 
--- Retry deferred predicates until no further one can be discharged.
+-- Retries the deferred predicates until a round no longer shrinks the queue.
 --
--- Each round re-solves what is left; a predicate that is still stuck goes
--- straight back on the queue. Discharging one can bind variables another was
--- waiting on, which is why this iterates -- and why it may stop only when a
--- round discharges nothing.
+-- Each round improves the queue and re-solves what is in it; a predicate that is
+-- still stuck goes straight back on the queue. Discharging one can bind
+-- variables another was waiting on, which is why this iterates.
+--
+-- **Termination.** A round goes on to the next only if it leaves fewer
+-- predicates than the queue held before the round began, improvement included,
+-- so the length of the queue strictly decreases from round to round and this
+-- runs at most as many rounds as it started with predicates. Improvement may
+-- add predicates (unifying two answers can defer an equation) and solving may
+-- too (an instance's context), which is why the count is taken before both.
 --
 -- Equalities go first within a round: a family that has become reducible decides
 -- a type, and a predicate waiting on that type can then settle in the same
 -- round.
 fun settle(s : Solver) -> Unit {
     while len(s.deferred) > 0 {
+        let before = len(s.deferred)
         improve(s)
         let pending = Vec.sortBy(s.deferred, fun(a, b) = {
             let ka = if a.pred.name == Ty.equals { 0 } else { 1 }
@@ -820,10 +873,17 @@ fun settle(s : Solver) -> Unit {
         })
         s.deferred = Vec.new(8)
         let saved = s.wanteds
-        s.wanteds = waiting(s, pending)
+        let round = waiting(s, pending)
+        s.wanteds = round
         for c in pending { solve(s, CPred(c)) }
         s.wanteds = saved
-        if len(s.deferred) >= len(pending) { return {} }
+        -- The round's own cycle breakers, if its equalities needed any: an
+        -- obligation of an instance found under them may mention one.
+        match round {
+            Some(i) -> Inert.close(i)
+            None -> {}
+        }
+        if len(s.deferred) >= before { return {} }
     }
 }
 
@@ -837,12 +897,14 @@ fun waiting(s : Solver, pending : Vec PredCell) -> Option Inert.Inert {
     -- equality (`equals` reads only the givens), so none proves itself.
     let eqs = Vec.new(4)
     for c in pending {
-        if c.pred.name == Ty.equals && isFam(Ty.prune(c.pred.args[0])) {
-            Vec.push(eqs, c.pred)
+        if c.pred.name == Ty.equals && Ty.isFam(c.pred.args[0]) {
+            Vec.push(eqs, Given { pred = c.pred, span = c.span })
         }
     }
     if len(eqs) == 0 { return None }
-    let (extended, _) = Inert.extend(s.inert, Vec.toArray(eqs))
+    -- What it refuses is a wanted that is false or stuck, which retrying it
+    -- reports where it arose.
+    let (extended, _) = Inert.extendAt(s.inert, Vec.toArray(eqs), rank(s))
     Some(extended)
 }
 
@@ -863,34 +925,39 @@ fun improve(s : Solver) -> Unit {
     improveFamilies(s)
 }
 
--- Equate the answers of two equalities on one family application.
+-- Replaces each equality on a family application that another before it in
+-- the queue is also on, by the equation between their two answers.
 --
--- The same rule as `improve`'s, and for the same reason: a family is a
--- *function* of its argument, so `Item c ~ Op` and `Item c ~ Char` cannot both
--- hold. Neither is discharged while `Item c` is stuck, so without this they
--- would both be carried and the contradiction would never be reported at all.
+-- OutsideIn(X)'s rule for two equalities on one family application (its
+-- `feqfeq`), and the same reason as `improve`'s: a family is a *function* of
+-- its argument, so `Item c ~ Op` and `Item c ~ Char` cannot both hold. Neither
+-- is discharged while `Item c` is stuck, so without this they would both be
+-- carried and the contradiction would never be reported at all. The second is
+-- dropped rather than kept beside the first, so this never leaves the queue
+-- longer than the equations it adds.
 fun improveFamilies(s : Solver) -> Unit {
     let seen = Map.new()
+    let keep = Vec.new(len(s.deferred))
+    let answers = Vec.new(2)
     for c in s.deferred {
-        if c.pred.name == Ty.equals {
+        if c.pred.name == Ty.equals && Ty.isFam(c.pred.args[0]) {
             let left = c.pred.args[0]
-            if isFam(Ty.prune(left)) {
-                let key = Ty.typeKey(left)
-                match Map.get(seen, key) {
-                    -- The test is not only a shortcut. Once two answers are
-                    -- unified they stay deferred, alike, until the family
-                    -- reduces, and every later round would otherwise build the
-                    -- message again for a unification that cannot fail.
-                    Some((first, at)) -> if !Ty.sameType(first, c.pred.args[1]) {
-                        Ty.unify(first, c.pred.args[1], firstSpan(c.span, at),
-                                 "the uses of '" + Ty.show(left) + "'",
-                                 families(s))
+            let key = Ty.typeKey(left)
+            match Map.get(seen, key) {
+                Some((first, at)) -> {
+                    if !Ty.sameType(first, c.pred.args[1]) {
+                        Vec.push(answers, (first, c.pred.args[1], firstSpan(c.span, at),
+                                           "the uses of '" + Ty.show(left) + "'"))
                     }
-                    None -> Map.put(seen, key, (c.pred.args[1], c.span))
+                    continue
                 }
+                None -> Map.put(seen, key, (c.pred.args[1], c.span))
             }
         }
+        Vec.push(keep, c)
     }
+    s.deferred = keep
+    for (a, b, at, context) in answers { Ty.unify(a, b, at, context, families(s)) }
 }
 
 fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
@@ -920,17 +987,17 @@ fun equals(s : Solver, c : PredCell) -> Bool {
     let right = Inert.rewrite(s.inert, c.pred.args[1])
     c.pred = Ty.pred(c.pred.name, [left, right])
     if Ty.sameType(left, right) { return True }
-    if isFam(left) || isFam(right) { return False }
+    if Ty.isFam(left) || Ty.isFam(right) { return False }
     Ty.unify(left, right, c.span, c.context, families(s))
     True
 }
 
--- A type rewritten for discharging a predicate over it, by the givens in scope,
--- the equalities waiting in the queue (`waiting`) and the instances. The givens
--- are not optional here: a type that reached the predicate through a variable
--- bound before a given could rewrite it is still the family application, and
--- only the given says what it is.
+-- Returns `t` rewritten for discharging a predicate over it, by the givens in
+-- scope, the equalities waiting in the queue (`waiting`) and the instances.
 fun discharging(s : Solver, t : Ty.Type) -> Ty.Type = match s.wanteds {
+    -- The givens are not optional here: a type that reached the predicate
+    -- through a variable bound before a given could rewrite it is still the
+    -- family application, and only the given says what it is.
     Some(w) -> Inert.rewrite(w, t)
     None -> Inert.rewrite(s.inert, t)
 }
@@ -1441,7 +1508,22 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
     -- A predicate left open after an error is most often open because of it:
     -- the error left a variable unbound that would have decided it.
     if Diag.hasErrors() { return {} }
-    let c = stranded[0]
+    -- An infinite type first: what else is stranded is most often stranded
+    -- because of it.
+    var c = stranded[0]
+    for p in stranded {
+        if isOccursEquation(p) && !isOccursEquation(c) { c = p }
+    }
+    match occursSide(c) {
+        -- In the words `Ty.unify` uses for the same cycle.
+        Some((v, other)) -> {
+            let n = Ty.namer("")
+            return Ty.typeError("cannot construct the infinite type '"
+                                + Ty.showAt(v, n, 0) + " = " + Ty.showAt(other, n, 0)
+                                + "'", c.span)
+        }
+        None -> {}
+    }
     if c.pred.name == Ty.equals {
         -- An equality that reaches here is not wrong, it is undecidable, and the
         -- blame goes on the family rather than on what it was compared with:
@@ -1450,7 +1532,7 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
         -- type being generalized mentions the family's argument.
         let left = c.pred.args[0]
         let right = c.pred.args[1]
-        let leftIsFam = isFam(Ty.prune(left))
+        let leftIsFam = familyLike(left)
         let fam = if leftIsFam { left } else { right }
         let other = if leftIsFam { right } else { left }
         -- A generated field family is machinery, not something a context can
@@ -1498,6 +1580,34 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
         None -> Ty.typeError("cannot determine a type satisfying '" + shown
                              + "'; add a type annotation", c.span)
     }
+}
+
+-- Returns whether `c` is an equation whose variable occurs in its other side,
+-- under a family (`occursSide`).
+fun isOccursEquation(c : PredCell) -> Bool = Option.isSome(occursSide(c))
+
+-- Returns the variable side of the equation `c` and the other side, if the
+-- variable occurs in the other side. `Ty.unify` defers such an equation only
+-- while a family stands between the two, so the occurrence is under one.
+fun occursSide(c : PredCell) -> Option (Ty.Type, Ty.Type) {
+    if c.pred.name != Ty.equals { return None }
+    for (v, other) in [(c.pred.args[0], c.pred.args[1]), (c.pred.args[1], c.pred.args[0])] {
+        match Ty.prune(v) {
+            TVar(cell) -> if Option.isNone(Ty.breakerFor(cell)) && Ty.occursIn(v, other) {
+                return Some((Ty.prune(v), other))
+            }
+            _ -> {}
+        }
+    }
+    None
+}
+
+-- Returns whether `t` is a family application, or a cycle breaker standing for
+-- one.
+fun familyLike(t : Ty.Type) -> Bool = match Ty.prune(t) {
+    TFam(_, _, _) -> True
+    TVar(cell) -> Option.isSome(Ty.breakerFor(cell))
+    _ -> False
 }
 
 fun unknownReceiver(what : String, where : Option Span) -> Unit =

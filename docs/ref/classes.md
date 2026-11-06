@@ -425,6 +425,38 @@ fun unwrap[Elem (Option a) ~ Option a](x : a) -> a = x
 fun main() { }
 ```
 
+A class method's own equality is different, because an instance does not
+write it. If it can never hold at an instance, that instance's override can
+never be called, so the override is accepted without being checked:
+
+<!-- run -->
+```kotlin
+class Box a {
+    type Elem a
+    fun open(a) -> Elem a
+    fun code[Elem a ~ Int](x : a) -> Int = open(x)
+}
+
+type Flag = Flag(Bool)
+
+instance Box Flag {
+    type Elem = Bool
+    fun open(Flag(b)) = b
+    fun code(f) = 0
+}
+
+fun main() {
+    print(open(Flag(True)))
+}
+```
+
+```text
+True
+```
+
+Here `Elem Flag` is `Bool`, so `code`'s context can never hold for a `Flag`,
+and a call `code(Flag(True))` is refused.
+
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.

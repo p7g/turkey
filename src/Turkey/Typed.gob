@@ -1,7 +1,7 @@
 export (
     TypeTable(..), newTypeTable, observe,
     record, recordDecl, ofDecl, recordPattern, ofPattern, of_, resolve,
-    unresolved, reduceDeep, typeChildren, canReturn,
+    unresolved, typeChildren, canReturn,
 )
 
 -- What inference discovered about each expression, kept rather than dropped
@@ -29,8 +29,8 @@ import Data.Set as Set
 import Turkey.Ast (..)
 import Turkey.Source (Span(..))
 import Turkey.Diag as Diag
-import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..))
+import Turkey.Inert as Inert
 import Turkey.Solved (Abstraction(..), Use(..))
 import Turkey.Types as Ty
 import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple, TSet, TBottom)
@@ -39,7 +39,7 @@ type TypeTable = TypeTable {
     exprs    : Map Int Ty.Type,
     decls    : Map Int Ty.Type,
     pats     : Map Int (Map String Ty.Type),
-    var fams : Option Ty.Families,
+    var inert : Option Inert.Inert,
     -- The dictionary abstraction of a binding group, and the evidence a use
     -- site turned out to need. Neither can be a field on the node, since the
     -- modules that define their types sit above `Turkey.Ast`; both are keyed
@@ -49,28 +49,20 @@ type TypeTable = TypeTable {
 }
 
 fun newTypeTable() -> TypeTable = TypeTable {
-    exprs = Map.new(), decls = Map.new(), pats = Map.new(), fams = None,
+    exprs = Map.new(), decls = Map.new(), pats = Map.new(), inert = None,
     abstractions = Map.new(), uses = Map.new(),
 }
 
--- Take the family reducer to read recorded types back with: the instances.
+-- Takes the instances of `classes` to read recorded types back with.
 --
--- Not the solver's, which consults the givens in scope first. Those are
--- per-body and gone by the time anything reads this table. A given rewrites a
--- family application where unification compares it, and the recorded type
--- that spells the application keeps it: under `Elem (Iter s) ~ Int`,
--- `advance(iterate(s))` records `Option (Elem (Iter s))`. So a reader that
--- needs the givens rewrites under them itself, through `Turkey.Inert`.
+-- With no givens: those are per-body and gone by the time anything reads
+-- this table. A given rewrites a family application where unification
+-- compares it, and the recorded type that spells the application keeps it:
+-- under `Elem (Iter s) ~ Int`, `advance(iterate(s))` records `Option (Elem
+-- (Iter s))`. So a reader that needs the givens rewrites under them itself,
+-- through `Turkey.Inert`.
 fun observe(t : TypeTable, classes : ClassTable) -> Unit {
-    t.fams = Some(Ty.Families {
-        reduce = fun(ty) = match ty {
-            TFam(name, arg, _) -> Classes.reduceFam(classes, name, arg)
-            _ -> None
-        },
-        -- Nothing is being solved here, so there is nothing to defer to.
-        defer = fun(_, _, _, _) = {},
-        untouchable = Ty.noScope,
-    })
+    t.inert = Some(Inert.empty(classes))
 }
 
 fun record(t : TypeTable, e : Expr, ty : Ty.Type) -> Unit =
@@ -147,7 +139,10 @@ fun of_(t : TypeTable, e : Expr) -> Ty.Type = match Map.get(t.exprs, e.id) {
 -- never reduced. A family under a signature's own context is legitimate and
 -- stays: it is a family over a rigid argument, and `Item c` where `c` is bound
 -- by the enclosing type abstraction is as much a type as `Int` is.
-fun resolve(t : TypeTable, ty : Ty.Type) -> Ty.Type = reduceDeep(ty, t.fams)
+fun resolve(t : TypeTable, ty : Ty.Type) -> Ty.Type = match t.inert {
+    Some(i) -> Inert.rewrite(i, ty)
+    None -> Ty.prune(ty)
+}
 
 -- Every expression whose type is still a decision. The self-check: after
 -- solving, this must be empty. A diagnostic rather than an assertion, because
@@ -159,35 +154,6 @@ fun unresolved(t : TypeTable) -> Vec Ty.Type {
         if stuck(settled) { Vec.push(out, settled) }
     }
     out
-}
-
--- Head reduction applied at every level rather than at the head.
---
--- Head-only is right for unification, which only ever compares heads. It is not
--- enough for anything that reads a type *whole* -- a lowering writing it into an
--- IR, or a checker comparing two of them -- because `Option (Item (Array Int))`
--- and `Option Int` are the same type and only one of them has been reduced.
-fun reduceDeep(ty : Ty.Type, fams : Option Ty.Families) -> Ty.Type {
-    let here = Ty.normalize(Ty.prune(ty), fams)
-    match here {
-        TApp(fn, arg, k) -> TApp(reduceDeep(fn, fams), reduceDeep(arg, fams), k)
-        TFun(params, ret) -> TFun(
-            Array.map(params, reduceDeep(_, fams)),
-            reduceDeep(ret, fams))
-        TTuple(elems) -> TTuple(Array.map(elems, reduceDeep(_, fams)))
-        -- The head stuck, so reduce the argument and ask once more: what blocked
-        -- `Item (Elem c)` may have been the `Elem c`, and one retry is all it can
-        -- take, since the argument is now reduced.
-        TFam(name, arg, k) -> {
-            let reduced = reduceDeep(arg, fams)
-            let again = Ty.normalize(TFam(name, reduced, k), fams)
-            match again {
-                TFam(_, _, _) -> TFam(name, reduced, k)
-                _ -> again
-            }
-        }
-        _ -> here
-    }
 }
 
 -- Whether a resolved type still contains an undecided literal set.

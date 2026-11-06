@@ -1,6 +1,6 @@
 export (
     Ids(..), Bound(..), CEnv(..), newCEnv, defineC, globalsOf,
-    Checker(..), newChecker, checkProgram, compatible, famsOf,
+    Checker(..), newChecker, checkProgram, compatible,
 )
 
 -- The Core typechecker: what makes evidence checked rather than trusted.
@@ -211,9 +211,9 @@ type Checker = Checker {
     -- The empty scope, shared by every node out of tail position, which is
     -- nearly every node. Never written: a scope is extended by copying.
     noJoins       : Joins,
-    -- `equations` and the instance table as a reducer, built when `equations`
-    -- changes rather than on every reduction.
-    var fams      : Ty.Families,
+    -- `equations` made canonical, built when `equations` changes rather than
+    -- on every reduction.
+    var inert     : Inert.Inert,
     -- The equalities the binding being checked states. Consulted before the
     -- instance table, exactly as the solver consults its assumptions first and
     -- for the same reason: a family over a rigid variable will never reduce
@@ -231,7 +231,7 @@ type Checker = Checker {
 
 fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
     decls = decls, classes = classes, joins = Map.new(), noJoins = Map.new(),
-    fams = famsOf(classes, []), equations = [], bound = [], opened = Set.new(),
+    inert = Inert.empty(classes), equations = [], bound = [], opened = Set.new(),
 }
 
 -- Checks `prog` against `globals` (see `globalsOf`), and raises an internal
@@ -335,9 +335,9 @@ fun resolve(env : CEnv, r : Ref, where : Option Span) -> Bound =
 fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     let want = if b.mutable && isRef(b.ty) { refElem(b.ty) } else { b.ty }
     let saved = ck.equations
-    let savedFams = ck.fams
+    let savedInert = ck.inert
     ck.equations = Vec.append(saved, b.equations)
-    ck.fams = famsOf(ck.classes, ck.equations)
+    ck.inert = Inert.ofEquations(ck.classes, ck.equations)
     var got = check(ck, b.value, env, None)
     if b.mutable && isRef(b.ty) {
         got = if isRef(got) { refElem(got) } else { got }
@@ -351,7 +351,7 @@ fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
         mismatch(ck, want, got, b.span, "the binding '" + b.name + "'")
     }
     ck.equations = saved
-    ck.fams = savedFams
+    ck.inert = savedInert
 }
 
 -- -- expressions --------------------------------------------------------------------
@@ -1022,9 +1022,9 @@ fun mismatch(ck : Checker, want : Ty.Type, got : Ty.Type, where : Option Span,
          + Ty.show(reduce(ck, got)), where)
 
 -- A type with no family application in it is already reduced, and most are:
--- deciding that allocates nothing, where `reduceDeep` rebuilds every node.
+-- deciding that allocates nothing.
 fun reduce(ck : Checker, ty : Ty.Type) -> Ty.Type =
-    if familyFree(ty) { ty } else { Typed.reduceDeep(ty, Some(ck.fams)) }
+    if familyFree(ty) { ty } else { Inert.rewrite(ck.inert, ty) }
 
 fun familyFree(ty : Ty.Type) -> Bool = match Ty.prune(ty) {
     TFam(_, _, _) -> False
@@ -1042,33 +1042,6 @@ fun familyFree(ty : Ty.Type) -> Bool = match Ty.prune(ty) {
         True
     }
     _ -> True
-}
-
--- Returns a reducer for checking under `equations`: the binding's equalities,
--- made canonical as the solver makes its givens, and the instances.
-fun famsOf(classes : ClassTable,
-           equations : Vec (Ty.Type, Ty.Type)) -> Ty.Families {
-    let givens = Vec.new(len(equations))
-    for (left, right) in equations {
-        Vec.push(givens, Inert.given(Ty.pred(Ty.equals, [left, right])))
-    }
-    -- An equality that can never hold is dropped: the solver has already
-    -- refused it where it was written, and a specialization that made one
-    -- false is a binding that can never be called.
-    --
-    -- A cycle breaker this makes is never closed: the set lives as long as the
-    -- reducer, and a type rewritten with it lives only as long as one
-    -- comparison. It is unregistered and at `Ty.noScope`, so no unification
-    -- binds it. An equation on it that does not hold goes to `defer`, which here
-    -- accepts it, as it accepts any equation on a stuck family application:
-    -- this checker does not decide equalities it cannot reduce, and Core has no
-    -- evidence for one yet.
-    let (inert, _) = Inert.extend(Inert.empty(classes), Vec.toArray(givens))
-    Ty.Families {
-        reduce = fun(t) = Inert.rewritten(inert, t),
-        defer = fun(_, _, _, _) = {},
-        untouchable = Ty.noScope,
-    }
 }
 
 -- Whether `ty` is an instantiation of a scheme. One-way: the scheme's variables

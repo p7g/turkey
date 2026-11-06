@@ -74,16 +74,15 @@ import Turkey.Binders as Binders
 import Turkey.Binders (Origin(..))
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
-import Turkey.Coretc as Coretc
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Prims as Prims
 import Turkey.Source (Span(..))
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Layout(..), Rep(..), RepClass(..))
 import Turkey.Opt as Opt
-import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), TVar, TCon, TApp, TFam,
                      TFun, TTuple, TSet, TBottom)
@@ -700,7 +699,7 @@ fun applications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
 -- `t = Wrap a` it may be `Elem a`, which the caller mentions nowhere. So each
 -- one is added to the caller's atoms, until nothing changes.
 fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
-               fams : Map String (Option Ty.Families)) -> Map String (Vec Ty.Type) {
+               fams : Map String Inert.Inert) -> Map String (Vec Ty.Type) {
     let extra = Map.new()
     let atoms = Map.new()
     for name in Set.elements(generic) {
@@ -735,8 +734,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
                         TVar(_) -> continue
                         _ -> {}
                     }
-                    let t = Typed.reduceDeep(Decls.substitute(atom, mapping),
-                                             fams[name])
+                    let t = Inert.rewrite(fams[name], Decls.substitute(atom, mapping))
                     let found = Vec.new(2)
                     atomsInto(t, owned, owned, found, Set.new())
                     for a in found {
@@ -762,7 +760,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
 -- The layouts of `atoms` at one call, under the caller's `layouts`; or the
 -- first atom whose layout the caller cannot know.
 fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
-          args : Array Ty.Type, fams : Option Ty.Families,
+          args : Array Ty.Type, fams : Inert.Inert,
           layouts : Map String Layout) -> Either Ty.Type (Vec Layout) {
     let mapping = Map.new()
     for var i = 0; i < len(binders) && i < len(args); i = i + 1 {
@@ -770,7 +768,7 @@ fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
     }
     let out = Vec.new(len(atoms))
     for atom in atoms {
-        let t = Typed.reduceDeep(Decls.substitute(atom, mapping), fams)
+        let t = Inert.rewrite(fams, Decls.substitute(atom, mapping))
         match layoutOf(s.decls, t, layouts) {
             Some(l) -> Vec.push(out, l)
             None -> return Left(t)
@@ -862,7 +860,7 @@ type Sharer = Sharer {
     generic : Set.Set String,
     atoms   : Map String (Vec Ty.Type),
     -- Each binding's families, with the equations it was checked under.
-    fams    : Map String (Option Ty.Families),
+    fams    : Map String Inert.Inert,
     -- Which keys each existential constructor is packed at, as far as the
     -- runs before this one found; an opened arm is copied for those alone.
     packed  : Packed,
@@ -921,8 +919,8 @@ type Local = Local {
 
 fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
 
-fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
-    Map.getOr(s.fams, sc.owner, None)
+fun famsFor(s : Sharer, sc : Scope) -> Inert.Inert =
+    Map.getOr(s.fams, sc.owner, Inert.empty(s.classes))
 
 -- The program with every generic binding replaced by one copy per layout its
 -- callers need.
@@ -1123,7 +1121,7 @@ fun shareOnce(program : CProgram, table : Binders.Table, decls : DeclTable,
         if len(abstractionBinders(b)) > 0 && b.name != main {
             Set.add(generic, b.name)
         }
-        Map.put(fams, b.name, Some(Coretc.famsOf(classes, b.equations)))
+        Map.put(fams, b.name, Inert.ofEquations(classes, b.equations))
     }
     let used = Set.new()
     for (name, _) in Map.entries(binds) { Set.add(used, name) }

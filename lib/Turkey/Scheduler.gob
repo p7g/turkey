@@ -127,9 +127,6 @@ let programWaits : Ptr = zeroedWord()
 -- looked at the queue (`idle`).
 let looking : Ptr = zeroedWord()
 
--- How many idle workers are spinning (`spin`).
-let spinning : Ptr = zeroedWord()
-
 fun zeroedWord() -> Ptr {
     let word = Libc.malloc(8)
     Ptr.atomicStore(word, 0, 0)
@@ -155,7 +152,7 @@ fun push(c : Co.Coroutine) -> Unit {
 -- first, so a task queued before that is in what it sees, and one queued after
 -- wakes another.
 fun notify() -> Unit {
-    if Workers.idlers() > 0 && Ptr.atomicLoad(spinning, 0) == 0 && Ptr.atomicLoad(looking, 0) == 0
+    if Workers.idlers() > 0 && Ptr.atomicLoad(looking, 0) == 0
             && Ptr.atomicCas(looking, 0, 0, 1) == 0 {
         Workers.signalWork(False)
     }
@@ -443,12 +440,8 @@ fun spinFrom(s : Ptr) -> Int {
 -- holds `looking`, so at most one worker spins and `notify` wakes nobody
 -- meanwhile, and only while two other workers are busy.
 fun spin(seen : Int) -> Bool {
-    if spinLooks == 0 { return False }
-    let n = Ptr.atomicAdd(spinning, 0, 1) + 1
-    if 2 * n > Workers.permits() - Workers.idlers() {
-        let _ = Ptr.atomicAdd(spinning, 0, -1)
-        return False
-    }
+    if spinLooks == 0 || Workers.permits() - Workers.idlers() < 2 { return False }
+    if Ptr.atomicLoad(looking, 0) != 0 || Ptr.atomicCas(looking, 0, 0, 1) != 0 { return False }
     var found = False
     for var i = 0; i < spinLooks; i = i + 1 {
         if spinPolls && i % 1000 == 999 { poll() }
@@ -457,9 +450,9 @@ fun spin(seen : Int) -> Bool {
             break
         }
     }
-    -- Stop spinning and then look once more, so that a task queued while
-    -- `notify` skipped its wake is seen.
-    let _ = Ptr.atomicAdd(spinning, 0, -1)
+    -- Clear `looking` and then look once more, as `idle` does, so that a task
+    -- queued while it was set is seen.
+    stopLooking()
     found || Workers.queued() > 0
 }
 

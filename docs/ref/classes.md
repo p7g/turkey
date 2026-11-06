@@ -74,8 +74,10 @@ name its parameters, and a function with a body must name them.
 
 Every method is also a function in the module's namespace, with the class
 constraint added to its type: `describe : [Describe a] fun(a) -> String`. A
-method's signature may have its own context, for constraints on type variables
-other than the class parameter.
+method's signature may have its own context. Every call must satisfy it, and
+an instance that defines the method may rely on it, with the class parameter
+replaced by the head. [Equality constraints](#equality-constraints) has an
+example.
 
 The class parameter may stand for a type constructor rather than a complete
 type. In `class Functor f { fun map(f a, fun(a) -> b) -> f b }`, `f` is
@@ -371,6 +373,66 @@ fun main() {
 The left side of `~` must be an associated type applied to a type, and the
 right side may not mention that same application. A context may give each
 associated type application at most one equality.
+
+A method's own context may state an equality about the class's associated
+type. An instance that defines the method may rely on it, with the class
+parameter replaced by the head. That holds also when the head's associated
+type is another type's, as it is for a wrapper that delegates to what it wraps:
+
+<!-- run -->
+```kotlin
+class Bag b {
+    type Elem b
+    fun items(b) -> Array (Elem b)
+    fun total[Elem b ~ Int](bag : b) -> Int {
+        var sum = 0
+        for n in items(bag) {
+            sum = sum + n
+        }
+        sum
+    }
+}
+
+type Pair a = Pair(a, a)
+
+instance Bag (Pair a) {
+    type Elem = a
+    fun items(Pair(x, y)) = [x, y]
+    fun total(pair) {
+        let both = items(pair)
+        both[0] + both[1]
+    }
+}
+
+type Tagged b = Tagged(String, b)
+
+instance Bag (Tagged b) : Bag b {
+    type Elem = Elem b
+    fun items(Tagged(_, bag)) = items(bag)
+    fun total(Tagged(tag, bag)) {
+        print(tag)
+        total(bag)
+    }
+}
+
+fun main() {
+    print(total(Pair(1, 2)))
+    print(total(Tagged("ages", Pair(30, 12))))
+}
+```
+
+```text
+3
+ages
+42
+```
+
+In the `Pair a` instance the equality is `Elem (Pair a) ~ Int`, so the
+`Elem (Pair a)` values that `items` returns are `Int`s and can be added. It is
+about `Elem (Pair a)` and not about `a`: the `x` and `y` that the pattern
+`Pair(x, y)` binds have type `a`, and cannot be added. In the `Tagged b`
+instance the equality is `Elem (Tagged b) ~ Int`, which is `Elem b ~ Int`:
+what the inner call to `total` asks for.
 
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the

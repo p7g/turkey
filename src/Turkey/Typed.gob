@@ -1,7 +1,7 @@
 export (
     TypeTable(..), newTypeTable, observe,
     record, recordDecl, ofDecl, recordPattern, ofPattern, of_, resolve,
-    unresolved, reduceDeep, typeChildren, canReturn,
+    resolveUnder, unresolved, reduceDeep, typeChildren, canReturn,
 )
 
 -- What inference discovered about each expression, kept rather than dropped
@@ -153,6 +153,29 @@ fun of_(t : TypeTable, e : Expr) -> Ty.Type = match Map.get(t.exprs, e.id) {
 -- stays: it is a family over a rigid argument, and `Item c` where `c` is bound
 -- by the enclosing type abstraction is as much a type as `Int` is.
 fun resolve(t : TypeTable, ty : Ty.Type) -> Ty.Type = reduceDeep(ty, t.fams)
+
+-- Returns `ty` resolved as `resolve` does, with the given equalities among
+-- `givens` consulted before the class table.
+fun resolveUnder(t : TypeTable, ty : Ty.Type, givens : Vec Ty.Pred) -> Ty.Type {
+    -- Solving applied a given in place only where it met a family application
+    -- already formed. One formed over a variable that the signature fixed later
+    -- is recorded unreduced, and the class table alone may reduce it to
+    -- something other than what the given says: under `Elem (Option a) ~ Int`,
+    -- to `a`. Evidence is resolved under the givens, so a dictionary's type
+    -- has to be too.
+    if len(givens) == 0 { return resolve(t, ty) }
+    let base = t.fams
+    reduceDeep(ty, Some(Ty.Families {
+        reduce = fun(f) = match Classes.givenRule(givens, f) {
+            Some(r) -> Some(r)
+            None -> match base {
+                Some(b) -> b.reduce(f)
+                None -> None
+            }
+        },
+        defer = fun(_, _, _, _) = {},
+    }))
+}
 
 -- Every expression whose type is still a decision. The self-check: after
 -- solving, this must be empty. A diagnostic rather than an assertion, because

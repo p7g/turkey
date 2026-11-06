@@ -665,9 +665,12 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                 Some(mi) -> {
                     let mapping = Map.new()
                     Map.put(mapping, mi.classVar.id, inst.head)
+                    -- Reduced as the solver's given was, so that Core reads
+                    -- the body under the rule it was checked under.
                     for (a, rt) in equationsOf(Some(mi.scheme)) {
-                        Vec.push(b.equations, (Decls.substitute(a, mapping),
-                                                 Decls.substitute(rt, mapping)))
+                        let q = Classes.reducedGiven(l.classes, Ty.pred(Ty.equals,
+                            [Decls.substitute(a, mapping), Decls.substitute(rt, mapping)]))
+                        Vec.push(b.equations, (q.args[0], q.args[1]))
                     }
                 }
                 None -> {}
@@ -970,8 +973,8 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
         if len(u.evidence) == 0 { return [] }
         let givens = givensOf(l, u)
         let count = fewer(len(u.evidence), len(u.preds))
-        Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                            givens))
+        Array.init(count, fun(i) = evidence(l, u.evidence[i],
+                                            usePredType(l, u, u.preds[i]), givens))
     }
 }
 
@@ -991,8 +994,8 @@ fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
     }
     let givens = givensOf(l, u)
     let count = fewer(len(u.evidence), len(u.preds))
-    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                             givens)))
+    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i],
+                                             usePredType(l, u, u.preds[i]), givens)))
 }
 
 -- The constructor as Core applies it: dictionaries, then fields.
@@ -1318,6 +1321,18 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
 
 fun predType(l : Lowerer, p : Pred) -> Ty.Type =
     dictType(l, p.name, resolved(l, p.args[0]))
+
+-- Returns the dictionary type of `p`, a predicate `u` demands, resolved under
+-- the given equalities in scope at `u`, which is how its evidence was chosen.
+fun usePredType(l : Lowerer, u : Use, p : Pred) -> Ty.Type {
+    let equalities = Vec.new(2)
+    for sc in u.scopes {
+        for (_, q) in sc.givens {
+            if q.name == Ty.equals { Vec.push(equalities, q) }
+        }
+    }
+    dictType(l, p.name, rigidly(l, Typed.resolveUnder(l.types, p.args[0], equalities)))
+}
 
 -- A type from the solver's own records, read the way a node's type is read:
 -- reduced, and back in terms of variables rather than skolems.
@@ -1784,7 +1799,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
     let givens = givensOf(l, use)
     let count = fewer(len(use.evidence), len(use.preds))
     var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i],
-                                                    predType(l, use.preds[i]), givens))
+        usePredType(l, use, use.preds[i]), givens))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
     -- one is monomorphic and took the path above.

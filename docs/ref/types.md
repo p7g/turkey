@@ -113,7 +113,8 @@ The library module `Int` has arithmetic that wraps around or returns an
 `Option` instead of panicking, a floored modulus (`Int.mod`), and the bitwise
 operations, which the [bitwise operators](expressions.md#bitwise-operators)
 `&`, `|`, `^`, `<<` and `>>` also spell. The shifts panic when the shift amount
-is outside 0 to 63 rather than masking it, and `>>` copies the sign bit.
+is outside 0 to 63 rather than masking it, and `>>` copies the sign bit, where
+`Int.shrUnsigned` shifts in zeros.
 
 <!-- panic: Int.shl: shift amount 64 is outside 0..63 -->
 ```kotlin

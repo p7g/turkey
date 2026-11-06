@@ -3,12 +3,15 @@ export (FoldHash)
 import Prelude ()
 import Data.Int (Int)
 import Data.Byte (Byte)
+import Data.Array (Array)
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Bits (BitOr(..), BitXor(..), Shift(..), (|), (^), (<<))
+import Data.Index (Index(..))
 import Data.Int as Int
 import Data.Hashable (Hasher(..))
-import Hash.Words (fold, rotr, word64, word32, byteAt)
+import Hash.Words (fold, rotr, Words64(..), Words32(..), byteAt)
 
 -- foldhash's fast variant (foldhash-f), the default hasher of Rust's
 -- hashbrown: every step is one folded multiply of the input xored with the
@@ -38,11 +41,11 @@ let s5 = -5124621466747896170
 let perHasher = 589684135938649225
 
 instance Hasher FoldHash {
-    fun seeded(seed) = FoldHash { acc = Int.xor(seed, perHasher), lo = 0, hi = 0, held = 0 }
+    fun seeded(seed) = FoldHash { acc = seed ^ perHasher, lo = 0, hi = 0, held = 0 }
 
     fun writeInt(FoldHash { acc, lo, hi, held }, x) =
         if held == 2 {
-            FoldHash { acc = fold(Int.xor(lo, acc), Int.xor(hi, s0)), lo = x, hi = 0, held = 1 }
+            FoldHash { acc = fold(lo ^ acc, hi ^ s0), lo = x, hi = 0, held = 1 }
         } else if held == 1 {
             FoldHash { acc, lo, hi = x, held = 2 }
         } else {
@@ -57,23 +60,25 @@ instance Hasher FoldHash {
     }
 
     fun digest(FoldHash { acc, lo, hi, held }) =
-        if held > 0 { fold(Int.xor(lo, acc), Int.xor(hi, s0)) } else { acc }
+        if held > 0 { fold(lo ^ acc, hi ^ s0) } else { acc }
 }
 
 -- `hash_bytes_short`: at most 16 bytes, as two possibly overlapping reads.
-fun short(bytes : Prim.Array Byte, from : Int, to : Int, acc : Int) -> Int {
+fun short(bytes : Array Byte, from : Int, to : Int, acc : Int) -> Int {
+    let words = Words64(bytes)
+    let halves = Words32(bytes)
     let n = to - from
     var a = acc
     var b = s1
     if n >= 8 {
-        a = Int.xor(a, word64(bytes, from))
-        b = Int.xor(b, word64(bytes, to - 8))
+        a = a ^ words[from]
+        b = b ^ words[to - 8]
     } else if n >= 4 {
-        a = Int.xor(a, word32(bytes, from))
-        b = Int.xor(b, word32(bytes, to - 4))
+        a = a ^ halves[from]
+        b = b ^ halves[to - 4]
     } else if n > 0 {
-        a = Int.xor(a, byteAt(bytes, from))
-        b = Int.xor(b, Int.or(Prim.intShl(byteAt(bytes, to - 1), 8), byteAt(bytes, from + n / 2)))
+        a = a ^ byteAt(bytes, from)
+        b = b ^ (byteAt(bytes, to - 1) << 8 | byteAt(bytes, from + n / 2))
     }
     fold(a, b)
 }
@@ -81,7 +86,8 @@ fun short(bytes : Prim.Array Byte, from : Int, to : Int, acc : Int) -> Int {
 -- `hash_bytes_long`: more than 16 bytes. Two lanes over the run, four over a
 -- run longer than 128 bytes and six over one longer than 256, then up to eight
 -- reads from each end of what is left.
-fun long(bytes : Prim.Array Byte, from : Int, to : Int, acc : Int) -> Int {
+fun long(bytes : Array Byte, from : Int, to : Int, acc : Int) -> Int {
+    let words = Words64(bytes)
     var at = from
     var a = acc
     var b = Int.addWrapping(acc, s1)
@@ -92,43 +98,44 @@ fun long(bytes : Prim.Array Byte, from : Int, to : Int, acc : Int) -> Int {
             var f = Int.addWrapping(acc, s4)
             var g = Int.addWrapping(acc, s5)
             loop {
-                a = fold(Int.xor(word64(bytes, at), a), Int.xor(word64(bytes, at + 48), s0))
-                b = fold(Int.xor(word64(bytes, at + 8), b), Int.xor(word64(bytes, at + 56), s0))
-                c = fold(Int.xor(word64(bytes, at + 16), c), Int.xor(word64(bytes, at + 64), s0))
-                e = fold(Int.xor(word64(bytes, at + 24), e), Int.xor(word64(bytes, at + 72), s0))
-                f = fold(Int.xor(word64(bytes, at + 32), f), Int.xor(word64(bytes, at + 80), s0))
-                g = fold(Int.xor(word64(bytes, at + 40), g), Int.xor(word64(bytes, at + 88), s0))
+                a = fold(words[at] ^ a, words[at + 48] ^ s0)
+                b = fold(words[at + 8] ^ b, words[at + 56] ^ s0)
+                c = fold(words[at + 16] ^ c, words[at + 64] ^ s0)
+                e = fold(words[at + 24] ^ e, words[at + 72] ^ s0)
+                f = fold(words[at + 32] ^ f, words[at + 80] ^ s0)
+                g = fold(words[at + 40] ^ g, words[at + 88] ^ s0)
                 at = at + 96
                 if to - at <= 256 { break }
             }
-            a = Int.xor(a, f)
-            b = Int.xor(b, g)
+            a = a ^ f
+            b = b ^ g
         }
         loop {
-            a = fold(Int.xor(word64(bytes, at), a), Int.xor(word64(bytes, at + 32), s0))
-            b = fold(Int.xor(word64(bytes, at + 8), b), Int.xor(word64(bytes, at + 40), s0))
-            c = fold(Int.xor(word64(bytes, at + 16), c), Int.xor(word64(bytes, at + 48), s0))
-            e = fold(Int.xor(word64(bytes, at + 24), e), Int.xor(word64(bytes, at + 56), s0))
+            a = fold(words[at] ^ a, words[at + 32] ^ s0)
+            b = fold(words[at + 8] ^ b, words[at + 40] ^ s0)
+            c = fold(words[at + 16] ^ c, words[at + 48] ^ s0)
+            e = fold(words[at + 24] ^ e, words[at + 56] ^ s0)
             at = at + 64
             if to - at <= 128 { break }
         }
-        a = Int.xor(a, c)
-        b = Int.xor(b, e)
+        a = a ^ c
+        b = b ^ e
     }
     let n = to - at
-    a = fold(Int.xor(word64(bytes, at), a), Int.xor(word64(bytes, to - 16), s0))
-    b = fold(Int.xor(word64(bytes, at + 8), b), Int.xor(word64(bytes, to - 8), s0))
+    a = fold(words[at] ^ a, words[to - 16] ^ s0)
+    b = fold(words[at + 8] ^ b, words[to - 8] ^ s0)
     if n >= 32 {
-        a = fold(Int.xor(word64(bytes, at + 16), a), Int.xor(word64(bytes, to - 32), s0))
-        b = fold(Int.xor(word64(bytes, at + 24), b), Int.xor(word64(bytes, to - 24), s0))
+        a = fold(words[at + 16] ^ a, words[to - 32] ^ s0)
+        b = fold(words[at + 24] ^ b, words[to - 24] ^ s0)
         if n >= 64 {
-            a = fold(Int.xor(word64(bytes, at + 32), a), Int.xor(word64(bytes, to - 48), s0))
-            b = fold(Int.xor(word64(bytes, at + 40), b), Int.xor(word64(bytes, to - 40), s0))
+            a = fold(words[at + 32] ^ a, words[to - 48] ^ s0)
+            b = fold(words[at + 40] ^ b, words[to - 40] ^ s0)
             if n >= 96 {
-                a = fold(Int.xor(word64(bytes, at + 48), a), Int.xor(word64(bytes, to - 64), s0))
-                b = fold(Int.xor(word64(bytes, at + 56), b), Int.xor(word64(bytes, to - 56), s0))
+                a = fold(words[at + 48] ^ a, words[to - 64] ^ s0)
+                b = fold(words[at + 56] ^ b, words[to - 56] ^ s0)
             }
         }
     }
-    Int.xor(a, b)
+    a ^ b
 }
+

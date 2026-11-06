@@ -347,6 +347,23 @@ def _line_rows(tool: str, obj: Path) -> list[tuple]:
     return rows
 
 
+def _kept_by_gnu_as(rows: list[tuple]) -> list[tuple]:
+    """The rows of a line table that GNU `as` writes too.
+
+    GNU `as` drops a `.loc` at line 0, which marks code with no source
+    position, so its previous row runs on over that code. An end of sequence
+    carries the line of the row before it, which is then a dropped row's, so
+    only its address is compared."""
+    kept = []
+    for row in rows:
+        address, line, _, _, flags = row
+        if "end_sequence" in flags:
+            kept.append((address, "end_sequence"))
+        elif line != 0:
+            kept.append(row)
+    return kept
+
+
 def _first_difference(ours: bytes, theirs: bytes) -> str:
     at = next((k for k, (a, b) in enumerate(zip(ours, theirs)) if a != b),
               min(len(ours), len(theirs)))
@@ -367,10 +384,11 @@ def _agree(ours: Path, theirs: Path) -> None:
         assert mine.relocations.get(name, []) == assembled.relocations.get(name, []), name
     if not exact:
         tool = _needs_dwarfdump()
-        mine_rows, assembled_rows = _line_rows(tool, ours), _line_rows(tool, theirs)
-        assert len(mine_rows) == len(assembled_rows)
+        mine_rows = _kept_by_gnu_as(_line_rows(tool, ours))
+        assembled_rows = _kept_by_gnu_as(_line_rows(tool, theirs))
         for k, (a, b) in enumerate(zip(mine_rows, assembled_rows)):
             assert a == b, f"row {k}: written {a}, assembled {b}"
+        assert len(mine_rows) == len(assembled_rows)
 
 
 def _object(path: Path) -> bytes:

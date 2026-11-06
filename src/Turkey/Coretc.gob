@@ -1,5 +1,5 @@
 export (
-    Ids(..), Bound(..), CEnv(..), newCEnv, defineC, globalsOf,
+    Bound(..), CEnv(..), newCEnv, defineC, globalsOf,
     Checker(..), newChecker, checkProgram, compatible, famsOf,
 )
 
@@ -73,20 +73,6 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
 
 -- -- the environment ---------------------------------------------------------------
 
--- How often a program may bind one id. In either case no binder is bound
--- inside the scope of another binder with its id, so a reference with an id
--- means the one binder with that id in scope.
-type Ids
-    -- Each id is bound at most once in the program, which `checkProgram`
-    -- checks.
-    = UniqueIds
-    -- An id may be bound more than once: `Turkey.Layout` copies a binding, or
-    -- a local's value, once per layout, and the copies keep the binders'
-    -- ids. Each copy is a separate binding or a separate scope, so the rule
-    -- above still holds, and the backend, which keeps a scope per binding,
-    -- relies on it.
-    | ScopedIds
-
 -- What a binder in scope stands for.
 type Bound = Bound {
     name    : String,
@@ -114,7 +100,6 @@ type Bound = Bound {
 -- a table that only grows by the distinct binders of the program is the
 -- smaller cost.
 type CEnv = CEnv {
-    ids     : Ids,
     inScope : Map Ref (Option Bound),
     -- What `inScope` does not say, read and never written: the top-level
     -- binders, which every binding's check shares (`layered`).
@@ -123,13 +108,13 @@ type CEnv = CEnv {
     undo    : Vec (Ref, Option Bound),
 }
 
-fun newCEnv(ids : Ids) -> CEnv =
-    CEnv { ids = ids, inScope = Map.new(), outer = Map.new(), undo = [] }
+fun newCEnv() -> CEnv =
+    CEnv { inScope = Map.new(), outer = Map.new(), undo = [] }
 
 -- A scope over `e`, which it reads and never writes: so checks over one `e`
 -- can run at once. `e` must be a flat environment, one with nothing outer.
 fun layered(e : CEnv) -> CEnv =
-    CEnv { ids = e.ids, inScope = Map.new(), outer = e.inScope, undo = [] }
+    CEnv { inScope = Map.new(), outer = e.inScope, undo = [] }
 
 -- Brings a top-level binder into scope: under its spelling, which every
 -- reference to it uses, and under its id if it has one, so that `bind`
@@ -221,11 +206,10 @@ type Checker = Checker {
     -- that can say what it is.
     var equations : Vec (Ty.Type, Ty.Type),
     -- Every binder with an id that the top-level binding being checked binds
-    -- below its top, with its spelling. Collected only when ids are unique,
-    -- for `checkUnique`.
+    -- below its top, with its spelling, for `checkUnique`.
     var bound     : Vec (Int, String),
     -- The uids of the rigid constants the arms around the term being checked
-    -- opened. Kept only when ids are unique, for `openArm`.
+    -- opened, for `openArm`.
     opened        : Set.Set Int,
 }
 
@@ -236,22 +220,19 @@ fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
 
 -- Checks `prog` against `globals` (see `globalsOf`), and raises an internal
 -- error at the first term that is ill-typed or refers to a binder not in
--- scope. With `UniqueIds`, also raises one if any binder id is bound twice.
+-- scope, or if any binder id is bound twice.
 fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
-                 globals : Vec Bound, ids : Ids) -> Unit {
+                 globals : Vec Bound) -> Unit {
     let all = Vec.append(prog.dicts, prog.binds)
     -- Each id's first binder: its spelling, and the top-level binding it is in.
     let first : Map Int (String, String) = Map.new()
     -- The top-level ids are claimed before any binding is checked, because a
     -- second top-level binding with an id replaces the first in `top`, and a
     -- reference to the first would then fail on whichever worker reached it.
-    match ids {
-        UniqueIds -> for b in all {
-            if b.id != noId { claim(first, b.id, b.name, b) }
-        }
-        ScopedIds -> {}
+    for b in all {
+        if b.id != noId { claim(first, b.id, b.name, b) }
     }
-    let top = newCEnv(ids)
+    let top = newCEnv()
     for g in globals { defineC(top, g.name, g.id, g.binders, g.ty) }
     -- Every top-level name is in scope for every other: the dictionaries refer
     -- to each other, and the bindings were ordered by dependency but may still
@@ -261,10 +242,7 @@ fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
     -- as many workers as there are, a checker to each worker's chunk.
     let bound = Parallel.mapWith(all, fun() = newChecker(decls, classes),
                                  fun(ck, b) = checkTop(ck, b, layered(top)))
-    match ids {
-        UniqueIds -> checkUnique(first, all, bound)
-        ScopedIds -> {}
-    }
+    checkUnique(first, all, bound)
 }
 
 -- Checks one top-level binding, and returns the binders below its top that
@@ -298,28 +276,25 @@ fun claim(first : Map Int (String, String), id : Int, name : String,
 
 -- Brings a binder the term binds into scope, under its id alone, and notes
 -- it for `checkUnique`. Raises an internal error if it has no id, or if a
--- binder with its id is in scope already, which protects SsaLower's rule that
--- a reference with an id means the one binder of that id its scoped
--- environment holds.
+-- binder with its id is in scope already. `checkUnique` would report the
+-- second too, but only once every binding is checked, and without saying
+-- that one is inside the other.
 fun bind(ck : Checker, env : CEnv, name : String, id : Int, binders : Vec VarCell,
          ty : Ty.Type, where : Option Span) -> Unit {
     if let Some(outer) = lookupKey(env, ById(id)) {
         fail("'" + name + "' is bound inside the scope of '" + outer.name
              + "', which has the same id", where)
     }
-    noteBound(ck, env, name, id, where)
+    noteBound(ck, name, id, where)
     file(env, ById(id), Some(Bound { name = name, id = id, binders = binders, ty = ty }))
 }
 
 -- Notes the local binder `id` for `checkUnique`. Raises an internal error if
 -- it has no id: every local binder has one from the lowering on, and no pass
 -- finds a local binder by its spelling.
-fun noteBound(ck : Checker, env : CEnv, name : String, id : Int, where : Option Span) -> Unit {
+fun noteBound(ck : Checker, name : String, id : Int, where : Option Span) -> Unit {
     if id == noId { fail("the local binder '" + name + "' has no id", where) }
-    match env.ids {
-        UniqueIds -> Vec.push(ck.bound, (id, name))
-        ScopedIds -> {}
-    }
+    Vec.push(ck.bound, (id, name))
 }
 
 -- The binder the reference `r` finds, which must be in scope. A reference by
@@ -482,7 +457,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
             for (name, id, ty) in pattern(ck, alt.alt, s, e.span) {
                 bind(ck, env, name, id, [], ty, e.span)
             }
-            let opened = openArm(ck, env, alt.alt, e.span)
+            let opened = openArm(ck, alt.alt, e.span)
             let got = check(ck, alt.body, env, joins)
             for uid in opened { let _ = Set.remove(ck.opened, uid) }
             leave(env, mark)
@@ -518,15 +493,15 @@ fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
 }
 
 -- Returns the uids of the constants `alt` opens, now open around its body.
--- With `UniqueIds`, raises an internal error if an arm around it opened one
--- already. Copying an arm gives its constants fresh uids, as it gives its
--- binders fresh ids; a copy nested in its original that kept them would open
--- one constant twice, and the backend gives a constant the layout of the
--- innermost arm that opened it.
-fun openArm(ck : Checker, env : CEnv, alt : Alt, where : Option Span) -> Vec Int {
+-- Raises an internal error if an arm around it opened one already. Copying
+-- an arm gives its constants fresh uids, as it gives its binders fresh ids; a
+-- copy nested in its original that kept them would open one constant twice,
+-- and the backend gives a constant the layout of the innermost arm that
+-- opened it.
+fun openArm(ck : Checker, alt : Alt, where : Option Span) -> Vec Int {
     let out = []
-    match (env.ids, alt) {
-        (UniqueIds, ACon(name, _, Some(o))) -> for c in o.skolems {
+    match alt {
+        ACon(name, _, Some(o)) -> for c in o.skolems {
             if Set.contains(ck.opened, c.uid) {
                 fail("'" + name + "' opens '" + c.name + "' inside an arm that "
                      + "opened the same constant", where)
@@ -827,7 +802,7 @@ fun checkJoin(ck : Checker, e : Core, name : String, id : Int, params : Array CP
              + outer.name + "', which has the same id", e.span)
     }
     Map.put(innerJoins, ById(id), j)
-    noteBound(ck, env, name, id, e.span)
+    noteBound(ck, name, id, e.span)
     let mark = enter(env)
     for p in params { bind(ck, env, p.name, p.id, [], p.ty, e.span) }
     let bodyTy = check(ck, body, env,

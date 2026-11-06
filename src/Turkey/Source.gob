@@ -1,5 +1,5 @@
-export (Span(..), span, endingAt, through, emptyAt, isEmpty, contains, before,
-        showSpan, Source(..), read)
+export (Span(..), InlineSite(..), span, endingAt, through, emptyAt, isEmpty, contains,
+        before, outermost, inlinedAt, showSpan, Source(..), read)
 
 -- Where a thing is, and what it is in.
 --
@@ -19,21 +19,48 @@ import System.File as File
 -- An empty range marks something the compiler wrote rather than the source: a
 -- method a `+` means, the wildcard arm of an `if let`. It sits where that
 -- thing's diagnostics point, and it covers no text.
+--
+-- `inlined` is the innermost call the text was inlined through, when the
+-- optimizer has copied it out of a function into a caller. The range is still
+-- the callee's own text; the call says where it now runs.
 type Span = Span {
     line    : Int,
     col     : Int,
     endLine : Int,
     endCol  : Int,
     file    : String,
+    inlined : Option InlineSite,
 }
+
+-- A call the optimizer replaced with a copy of `callee`'s body, by the
+-- callee's name and the call's own span. The call's own `inlined` is the call
+-- it was in turn inlined through, so a chain runs from the innermost call to
+-- the outermost, whose span is in the function the code ends up in.
+type InlineSite = InlineSite { callee : String, call : Span }
 
 -- Returns the empty range at `line:col`.
 fun span(file : String, line : Int, col : Int) -> Span =
-    Span { line = line, col = col, endLine = line, endCol = col, file = file }
+    Span { line = line, col = col, endLine = line, endCol = col, file = file, inlined = None }
 
 -- Returns `s` with its end moved to `endLine:endCol`.
-fun endingAt(s : Span, endLine : Int, endCol : Int) -> Span =
-    Span { line = s.line, col = s.col, endLine = endLine, endCol = endCol, file = s.file }
+fun endingAt(s : Span, endLine : Int, endCol : Int) -> Span = Span {
+    line = s.line, col = s.col, endLine = endLine, endCol = endCol, file = s.file,
+    inlined = s.inlined,
+}
+
+-- Returns `s` inlined through `site`, as its innermost call.
+fun inlinedAt(s : Span, site : Option InlineSite) -> Span = Span {
+    line = s.line, col = s.col, endLine = s.endLine, endCol = s.endCol, file = s.file,
+    inlined = site,
+}
+
+-- Returns the span of the outermost call `s` was inlined through, or `s` when
+-- it was not inlined: the text in the function the code runs in, which is
+-- what a diagnostic about that function names.
+fun outermost(s : Span) -> Span = match s.inlined {
+    Some(site) -> outermost(site.call)
+    None -> s
+}
 
 -- Returns the range from the start of `first` to the end of `last`.
 fun through(first : Span, last : Span) -> Span = endingAt(first, last.endLine, last.endCol)

@@ -20,6 +20,7 @@ export (program)
 
 import Data.Map as Map
 import Data.Set as Set
+import Turkey.Binders as Binders
 import Turkey.Core (..)
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TVar)
@@ -28,13 +29,27 @@ import Turkey.Types (TFun, TVar)
 -- reach it.
 type Worker = Worker { name : String, dicts : Int, params : Int }
 
-fun program(p : CProgram) -> CProgram {
+-- Numbers the wrappers' parameters, unrecorded: nothing after this pass reads
+-- a local's record. One thread splits the bindings in program order, so the
+-- ids are deterministic.
+type Minter = Minter { table : Binders.Table, owner : Int, var count : Int }
+
+fun mint(m : Minter) -> Int {
+    m.count = m.count + 1
+    Binders.unrecorded(m.table, m.owner, m.count - 1)
+}
+
+fun program(p : CProgram, table : Binders.Table) -> CProgram {
     let workers = Map.new()
     let used = Set.new()
     for b in Vec.append(p.dicts, p.binds) { Set.add(used, b.name) }
     let made = Map.new()
+    let m = Minter {
+        table = table, owner = Binders.unrecordedOwner(table, "", "Turkey.Uncurry's wrappers"),
+        count = 0,
+    }
     for b in Vec.append(p.dicts, p.binds) {
-        match split(b, used) {
+        match split(b, used, m) {
             Some((worker, wrapper, w)) -> {
                 Map.put(workers, b.name, w)
                 Map.put(made, b.name, (worker, wrapper))
@@ -72,19 +87,19 @@ fun withValue(b : CBind, value : Core) -> CBind = CBind {
 }
 
 -- A binding `fun(dicts) = fun(params) = body`, as its worker and its wrapper.
-fun split(b : CBind, used : Set.Set String) -> Option (CBind, CBind, Worker) {
+fun split(b : CBind, used : Set.Set String, m : Minter) -> Option (CBind, CBind, Worker) {
     if b.mutable { return None }
     match b.value.kind {
         CLam(dicts, inner, outerName) -> match inner.kind {
             CLam(params, body, innerName) ->
-                splitAt(b, used, dicts, inner, outerName, params, body, innerName)
+                splitAt(b, used, m, dicts, inner, outerName, params, body, innerName)
             _ -> None
         }
         _ -> None
     }
 }
 
-fun splitAt(b : CBind, used : Set.Set String, dicts : Array CParam, inner : Core,
+fun splitAt(b : CBind, used : Set.Set String, m : Minter, dicts : Array CParam, inner : Core,
             outerName : String, params : Array CParam, body : Core,
             innerName : String) -> Option (CBind, CBind, Worker) {
     if len(dicts) == 0 { return None }
@@ -92,8 +107,7 @@ fun splitAt(b : CBind, used : Set.Set String, dicts : Array CParam, inner : Core
         if !isDictionary(d.ty) { return None }
     }
     -- The dictionaries and the parameters become one list, which binds no id
-    -- twice: the parameters were bound inside the dictionaries' scope, where
-    -- no binder may have the id of one in scope.
+    -- twice, because no id is bound twice in the program.
     let flat = flatten(b.ty)
     let flatTy = match flat {
         Some(t) -> t
@@ -113,13 +127,23 @@ fun splitAt(b : CBind, used : Set.Set String, dicts : Array CParam, inner : Core
     let applied = if len(b.binders) == 0 { head } else {
         mkCore(flatTy, b.value.span, CTyApp(head, Array.map(b.binders, TVar)))
     }
-    let args = Array.map(Array.append(dicts, params),
+    -- The worker keeps the original's parameters, and the wrapper binds fresh
+    -- ones, so that no id is bound in both.
+    let ownDicts = Array.map(dicts, renewed(m, _))
+    let ownParams = Array.map(params, renewed(m, _))
+    let args = Array.map(Array.append(ownDicts, ownParams),
                          fun(p) = mkCore(p.ty, b.value.span, CVar(refTo(p.name, p.id))))
     let call = mkCore(body.ty, b.value.span, CApp(applied, args))
-    let wrapper = withValue(b, mkCore(b.value.ty, b.value.span, CLam(dicts,
-        mkCore(inner.ty, inner.span, CLam(params, call, innerName)), outerName)))
+    let wrapper = withValue(b, mkCore(b.value.ty, b.value.span, CLam(ownDicts,
+        mkCore(inner.ty, inner.span, CLam(ownParams, call, innerName)), outerName)))
     Some((worker, wrapper, Worker { name = name, dicts = len(dicts),
                                     params = len(params) }))
+}
+
+-- `p` with a fresh id.
+fun renewed(m : Minter, p : CParam) -> CParam {
+    let CParam { name, id = _, ty } = p
+    CParam { name = name, id = mint(m), ty = ty }
 }
 
 -- `fun(ds) -> fun(xs) -> r` as `fun(ds ++ xs) -> r`.

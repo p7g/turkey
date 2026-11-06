@@ -1,5 +1,5 @@
-export (Files(..), files, fileName, Cache, cache, fromSpan, pack, notStmt, isStmt,
-        line, column, file, site, describe)
+export (Files(..), files, fileName, Site(..), Cache, cache, fromSpan, pack, notStmt,
+        isStmt, line, column, file, site, describe)
 
 -- A source position packed into one `Int`, as every instruction from the low
 -- IR to emission carries it.
@@ -14,6 +14,10 @@ export (Files(..), files, fileName, Cache, cache, fromSpan, pack, notStmt, isStm
 -- | file    | 14   | index into the program's `Files`, from 1           |
 -- | site    | 18   | inline site, 0 when not inlined                    |
 --
+-- An inline site is the function's own `Site` numbered from 1. A position
+-- with one is the callee's own text, and the site says which call it was
+-- inlined through.
+--
 -- The whole is 63 bits, so a position is never negative. A position with no
 -- line is 0 in every bit, whatever else was asked for: `notStmt(0)` is 0.
 --
@@ -21,7 +25,8 @@ export (Files(..), files, fileName, Cache, cache, fromSpan, pack, notStmt, isStm
 -- word costs nothing to copy and nothing to trace. It is decoded only to be
 -- printed or written as debug information, never to decide code.
 
-import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Source (Span(..), InlineSite(..))
 
 let columnShift = 1
 let lineShift = 11
@@ -61,25 +66,64 @@ fun files(names : Vec String) -> Files {
 fun fileName(fs : Files, n : Int) -> Option String =
     if n >= 1 && n <= len(fs.names) { Some(fs.names[n - 1]) } else { None }
 
--- A one-entry memo of the last file looked up. Consecutive spans are almost
--- always in one file, so comparing a span's path with the last one replaces a
--- hash and a table lookup per instruction.
+-- A call one function's code was inlined through: the name of the function
+-- inlined, and the position of the call, whose own site is the call that one
+-- was inlined through in turn, or 0 for a call in the function itself.
+--
+-- A function's sites are numbered from 1 in the order its positions first
+-- name them, so a site's parent always has a smaller number.
+type Site = Site { callee : String, call : Int }
+
+-- The program's files, a one-entry memo of the last file looked up, and the
+-- sites of the function whose positions are being made, with an index of
+-- them by call position.
+--
+-- Consecutive spans are almost always in one file, so comparing a span's path
+-- with the last one replaces a hash and a table lookup per instruction.
 type Cache = Cache {
     files     : Files,
     var name  : String,
     var found : Int,
+    sites     : Vec Site,
+    byCall    : Map Int (Vec Int),
 }
 
-fun cache(fs : Files) -> Cache = Cache { files = fs, name = "", found = 0 }
+-- Returns a cache that numbers inline sites into `sites`.
+fun cache(fs : Files, sites : Vec Site) -> Cache =
+    Cache { files = fs, name = "", found = 0, sites = sites, byCall = Map.new() }
 
--- Returns the position of the start of `s`, a statement, or 0 when `s` is in
--- a file the table does not have.
+-- Returns the position of the start of `s`, a statement, with the site of
+-- the call it was inlined through, or 0 when `s` is in a file the table does
+-- not have. A new site is appended to the cache's sites.
+--
+-- Past the field's width, inlined text takes the position of its outermost
+-- call instead, as though it had not been inlined.
 fun fromSpan(c : Cache, s : Span) -> Int {
+    let at = match s.inlined {
+        None -> 0
+        Some(inner) -> siteOf(c, inner)
+    }
+    if at < 0 { return fromSpan(c, Source.outermost(s)) }
     if s.file != c.name {
         c.name = s.file
         c.found = Map.getOr(c.files.index, s.file, 0)
     }
-    if c.found == 0 { 0 } else { pack(c.found, s.line, s.col) }
+    if c.found == 0 { 0 } else { pack(c.found, s.line, s.col) | (at << siteShift) }
+}
+
+-- Returns the number of `site` in the cache's sites, adding it and its
+-- parents if they are not there, or -1 when there is no room.
+fun siteOf(c : Cache, site : InlineSite) -> Int {
+    let call = fromSpan(c, site.call)
+    let same = Map.getOr(c.byCall, call, [])
+    for k in same {
+        if c.sites[k - 1].callee == site.callee { return k }
+    }
+    if len(c.sites) >= siteMax { return -1 }
+    Vec.push(c.sites, Site { callee = site.callee, call = call })
+    let made = len(c.sites)
+    if len(same) == 0 { Map.put(c.byCall, call, [made]) } else { Vec.push(same, made) }
+    made
 }
 
 -- Returns the statement position `file:line:col`, outside any inline site.

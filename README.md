@@ -163,15 +163,19 @@ gdb ./rectangles -ex 'break rectangles.gob:4' -ex run -ex bt
 ```
 
 A function's name is its symbol, such as `Main#area@Rectangle`, with its
-module in it. A function the optimizer inlined has no frame of its own: its
-code is part of its caller's, so a breakpoint on one of its lines stops in the
-caller, here `Main#main`. There is no information about variables or types
-yet, so a debugger shows registers and memory rather than values.
+module in it. A call the optimizer inlined is still a frame: `breakpoint set
+--name Main#area@Rectangle` in lldb, or `break 'Main#area@Rectangle'` in gdb,
+stops in `Main#main` where `area`'s code was copied, and `bt` shows `area` at
+its own line above `main` at the line of the call. There is no information
+about variables or types yet, so a debugger shows registers and memory rather
+than values.
 
 Profilers need no `-g` to name functions: every function keeps a frame pointer,
 so `sample PID` and Instruments on a Mac, and `perf record --call-graph=fp` on
 Linux, walk the stack and show the functions by name. With `-g`, Instruments
-and `perf report --sort srcline` also show the lines samples fall on.
+and `perf report --sort srcline` also show the lines samples fall on, and
+Instruments shows inlined calls as frames. `sample` shows a sample in inlined
+code at the line of the outermost call.
 
 ### The C compiler, and running on another machine
 

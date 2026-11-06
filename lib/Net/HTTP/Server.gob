@@ -121,7 +121,7 @@ import Net.HTTP.Stream as Stream (BodyLength(..))
 import Net.HTTP.Syntax as Syntax
 import Net.HTTP.Token as Token (Token)
 import System.Sync as Sync
-import System.Sync (Event, Mutex, Semaphore)
+import System.Sync (AtomicInt, Event, Mutex, Semaphore)
 import System.Task as Task
 import System.Task (Spawn)
 import Time.Calendar as Calendar
@@ -309,6 +309,9 @@ type Server = Server {
     config         : Config
     values         : Values
     registry       : Mutex Registry
+    -- 1 once `stop` has begun. Set under the registry's lock, so that a
+    -- connection registers only before it; read without it (`markIdle`).
+    stopping       : AtomicInt
     -- One permit per connection the limit allows: taken before an accept,
     -- and given back when the connection ends.
     permits        : Semaphore
@@ -321,18 +324,18 @@ type Server = Server {
     buffers        : Buffers
 }
 
--- The connections being served, and whether the server is stopping.
+-- The connections being served.
 type Registry = Registry {
-    var stopping : Bool
-    entries      : Map Int Entry
-    var next     : Int
+    entries  : Map Int Entry
+    var next : Int
 }
 
 -- A connection `stop` may have to close: at once if it waits for a request,
 -- or at the end of the drain time.
 type Entry = Entry {
-    close    : fun() -> Unit
-    var idle : Bool
+    close : fun() -> Unit
+    -- 1 while the connection waits for a request (`markIdle`).
+    idle  : AtomicInt
 }
 
 -- Serves the connections `l` accepts, each request with `handler`, until
@@ -353,7 +356,8 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
     let server = Server {
         config,
         values,
-        registry = Sync.mutex(Registry { stopping = False, entries = Map.new(), next = 0 }),
+        registry = Sync.mutex(Registry { entries = Map.new(), next = 0 }),
+        stopping = Sync.atomicInt(0),
         permits = Sync.semaphore(values.connections),
         done = Sync.event(),
         closeListener = fun() { let _ = closeListener(l) },
@@ -364,9 +368,10 @@ fun start[Listener l, Connection (Accepted l), HasConnectionInfo (Accepted l), E
     pure(server)
 }
 
--- How many output buffers a server keeps for its connections' next
--- requests: at 4 KiB each, at most 512 KiB, however many connections were
--- busy at once.
+-- About how many output buffers a server keeps for its connections' next
+-- requests, at 4 KiB each, however many connections were busy at once. The
+-- bound is per thread (`Output.Buffers`), so threads that stand in for
+-- blocked ones add to it.
 let keptBuffers = 128
 
 -- Stops `server`: closes its listener and its idle connections, lets the
@@ -377,7 +382,7 @@ let keptBuffers = 128
 fun stop(server : Server, drain : Duration) -> Unit {
     let deadline = Deadline.after(drain)
     let idle = Sync.withLock(server.registry, fun(r) {
-        r.stopping = True
+        Sync.store(server.stopping, 1)
         idleClosers(r)
     })
     server.closeListener()
@@ -399,7 +404,7 @@ fun wait(server : Server) -> Unit = Sync.waitEventUnbounded(server.done)
 fun idleClosers(r : Registry) -> Array (fun() -> Unit) {
     let out = []
     for e in Map.values(r.entries) {
-        if e.idle {
+        if Sync.load(e.idle) != 0 {
             Vec.push(out, e.close)
         }
     }
@@ -415,7 +420,7 @@ fun allClosers(r : Registry) -> Array (fun() -> Unit) {
     Vec.toArray(out)
 }
 
-fun isStopping(server : Server) -> Bool = Sync.withLock(server.registry, _.stopping)
+fun isStopping(server : Server) -> Bool = Sync.load(server.stopping) != 0
 
 fun report(server : Server, e : ServerEvent) -> Unit =
     if let Some(f) = server.config.onError {
@@ -666,15 +671,16 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
         dateSecond = Int.minValue()
         dateValue = HeaderValue.literal("")
     }
+    let entry = Entry { close = fun() { let _ = close(conn) }, idle = Sync.atomicInt(0) }
     let id = Sync.withLock(server.registry, fun(r) {
-        if r.stopping { return None }
+        if isStopping(server) { return None }
         let id = r.next
         r.next = id + 1
-        Map.put(r.entries, id, Entry { close = fun() { let _ = close(conn) }, idle = False })
+        Map.put(r.entries, id, entry)
         Some(id)
     })
     if let Some(id) = id {
-        exchanges(server, g, id, handler)
+        exchanges(server, g, entry, handler)
         let _ = Sync.withLock(server.registry, \Map.delete(_.entries, id))
     }
     Output.release(g.outbox)
@@ -682,24 +688,25 @@ fun connection[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wr
     Sync.release(server.permits)
 }
 
--- Marks the connection `id` as waiting for a request. Returns `False`, and
+-- Marks `e`'s connection as waiting for a request. Returns `False`, and
 -- leaves it busy, if the server is stopping: the connection is to close.
-fun markIdle(server : Server, id : Int) -> Bool =
-    Sync.withLock(server.registry, fun(r) {
-        if r.stopping {
-            return False
-        }
-        setIdle(r, id, True)
-        True
-    })
-
--- Marks the connection `id` as serving a request.
-fun markBusy(server : Server, id : Int) -> Unit = Sync.withLock(server.registry, setIdle(_, id, False))
-
-fun setIdle(r : Registry, id : Int, idle : Bool) -> Unit =
-    if let Some(e) = Map.get(r.entries, id) {
-        e.idle = idle
+-- Takes no lock.
+fun markIdle(server : Server, e : Entry) -> Bool {
+    -- Store the mark before reading `stopping`. `stop` stores `stopping`
+    -- before it reads the marks, so at least one of the two sees the other's
+    -- store: `stop` closes the idle connection, or the connection sees that
+    -- the server is stopping and closes itself, or both, and a second close
+    -- does nothing.
+    Sync.store(e.idle, 1)
+    if isStopping(server) {
+        Sync.store(e.idle, 0)
+        return False
     }
+    True
+}
+
+-- Marks `e`'s connection as serving a request.
+fun markBusy(e : Entry) -> Unit = Sync.store(e.idle, 0)
 
 -- What a connection does once a request's response is written and its
 -- handler has returned: read the next request, close, or shut down its side
@@ -708,7 +715,7 @@ type After = KeepOpen | CloseAfter | LingerAfter
 
 -- Serves the requests on one connection, in order, until it is to close.
 fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (WriteError c)](
-        server : Server, g : Guarded c, id : Int, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
+        server : Server, g : Guarded c, entry : Entry, handler : fun(Request Incoming, Respond) -> Done) -> Unit {
     let limits = server.config.limits
     let input = Input.input(g, limits)
     var known = None
@@ -733,7 +740,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
                 return
             }
         }
-        markBusy(server, id)
+        markBusy(entry)
         g.phase = Exchanging
         g.stall = g.values.stall
         -- Read once the first head is in, so a TLS handshake is done.
@@ -752,7 +759,7 @@ fun exchanges[Connection c, HasConnectionInfo c, Error (ReadError c), Error (Wri
                     -- A connection waiting for its next request holds no
                     -- output buffer.
                     Output.release(g.outbox)
-                    if !markIdle(server, id) {
+                    if !markIdle(server, entry) {
                         return
                     }
                     -- Bytes held already are a pipelined request's head, begun.

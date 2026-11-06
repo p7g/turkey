@@ -19,10 +19,21 @@ export (
 -- left as a `Relocation` for the format's writer: a page address depends on
 -- where the 4KB boundaries fall, and a symbol defined elsewhere is not here at
 -- all. Whether a field is resolved here or by the linker, it means the same.
+--
+-- **The line table.** As the system assembler does with `.file` and `.loc`,
+-- this keeps the `SourceFile` items and a row for each `Loc`, and writes
+-- `debug_line` and `debug_line_str` from them once every item is in
+-- (`Turkey.Dwarf.lineTable`). A row is at the offset of the next instruction
+-- or data item, or of the next `Loc` if one comes first; a label, an
+-- alignment and zeros do not take it. That is where the system assembler puts
+-- a `.loc`'s row, and the two tables are compared byte for byte. A debug
+-- section is made only when an item names it, so a module that names none
+-- has the same sections, in the same order, as one built without `-g`.
 
 import Data.Set as Set
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
+import Turkey.Dwarf as Dwarf
 import Turkey.Stream (Item(..))
 
 -- What the assembler needs to know about an instruction set, whose
@@ -46,6 +57,10 @@ type Use f
     = Code(f)
     -- An eight-byte word holding the target's address.
     | Address64
+    -- Four bytes holding the target's offset from the start of its section,
+    -- which is in this object: a reference from one debug section into
+    -- another.
+    | Offset32
 
 -- A field the linker fills in: at `offset` in its section, referring to
 -- `target`.
@@ -82,46 +97,94 @@ type Object f = Object {
 -- A field waiting for its target to be defined.
 type Pending f = Pending { section : Int, offset : Int, use : Use f, target : Symbol }
 
+-- A four-byte field waiting for two labels in one section: `to`'s offset
+-- less `from`'s.
+type Distance = Distance { section : Int, offset : Int, to : Symbol, from : Symbol }
+
 type Assembler i f = Assembler {
     isa         : Isa i f,
-    sections    : Array (SectionData f),
+    -- What the labels the assembler makes for itself are spelled for.
+    dialect     : Asm.Dialect,
+    -- Every section in `sectionOrder`, then each debug section in the order
+    -- an item first names it. `slots` holds each kind's index, by
+    -- `kindNumber`, or -1.
+    sections    : Vec (SectionData f),
+    slots       : Array Int,
     var current : Int,
     -- Every label, by its spelling, which tells a temporary from a named
     -- symbol of the same name.
     labels      : Map String Definition,
     defined     : Vec Definition,
     pending     : Vec (Pending f),
+    distances   : Vec Distance,
     -- `Global` and `FunctionType` may come before the label they describe.
     exported    : Set.Set String,
     functions   : Set.Set String,
+    -- The line table's source files, as their items gave them; each
+    -- section's rows, by section index; and the sections that have rows, in
+    -- the order of their first.
+    files       : Vec (Int, Option String, String),
+    rows        : Vec (Vec Dwarf.Row),
+    sequenced   : Vec Int,
+    -- The last `Loc`, until an item takes its row: its position, or -1, and
+    -- whether it ends the prologue.
+    var loc      : Int,
+    var prologue : Bool,
 }
 
--- The sections in the order they are laid out in the object, which is the
+-- The sections every object has, first and in this order, which is the
 -- order the emitter fills them in.
 let sectionOrder = [Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data, Asm.Relocated]
 
-fun sectionIndex(s : Asm.Section) -> Int = match s {
+fun kindNumber(s : Asm.Section) -> Int = match s {
     Asm.Text -> 0
     Asm.CStrings -> 1
     Asm.Constants -> 2
     Asm.Data -> 3
     Asm.Relocated -> 4
-    Asm.DebugAbbrev | Asm.DebugInfo | Asm.DebugStr | Asm.DebugLine ->
-        error("internal error: the object writer has no debug sections")
+    Asm.DebugAbbrev -> 5
+    Asm.DebugInfo -> 6
+    Asm.DebugStr -> 7
+    Asm.DebugLine -> 8
+    Asm.DebugLineStr -> 9
 }
 
-fun new(isa : Isa i f) -> Assembler i f =
-    Assembler {
+let kinds = 10
+
+-- An assembler for `isa`, whose own labels are spelled for `d`.
+fun new(isa : Isa i f, d : Asm.Dialect) -> Assembler i f {
+    let a = Assembler {
         isa = isa,
-        sections = Array.map(sectionOrder, fun(kind) =
-            SectionData { kind = kind, bytes = [], align = 0, relocations = [] }),
+        dialect = d,
+        sections = [],
+        slots = Array.filled(kinds, -1),
         current = 0,
         labels = Map.new(),
         defined = [],
         pending = [],
+        distances = [],
         exported = Set.new(),
         functions = Set.new(),
+        files = [],
+        rows = [],
+        sequenced = [],
+        loc = -1,
+        prologue = False,
     }
+    for kind in sectionOrder { let _ = sectionIndex(a, kind) }
+    a
+}
+
+-- The index of section `kind`, made empty if no item has named it yet.
+fun sectionIndex(a : Assembler i f, kind : Asm.Section) -> Int {
+    let n = kindNumber(kind)
+    if a.slots[n] < 0 {
+        a.slots[n] = len(a.sections)
+        Vec.push(a.sections, SectionData { kind = kind, bytes = [], align = 0, relocations = [] })
+        Vec.push(a.rows, [])
+    }
+    a.slots[n]
+}
 
 -- One piece of the stream, appended, and the array emptied as
 -- `Stream.print` empties it.
@@ -132,9 +195,15 @@ fun feed(a : Assembler i f, items : Vec (Item i)) -> Unit {
 
 fun feedItem(a : Assembler i f, item : Item i) -> Unit {
     let s = a.sections[a.current]
+    if a.loc >= 0 && takesRow(item) {
+        let rows = a.rows[a.current]
+        if len(rows) == 0 { Vec.push(a.sequenced, a.current) }
+        Vec.push(rows, Dwarf.Row { offset = len(s.bytes), at = a.loc, prologueEnd = a.prologue })
+        a.loc = -1
+    }
     match item {
         Architecture -> {}
-        Section(kind) -> { a.current = sectionIndex(kind) }
+        Section(kind) -> { a.current = sectionIndex(a, kind) }
         Global(sym) -> {
             Set.add(a.exported, Asm.spell(sym))
             if let Some(d) = Map.get(a.labels, Asm.spell(sym)) { d.exported = True }
@@ -176,41 +245,50 @@ fun feedItem(a : Assembler i f, item : Item i) -> Unit {
         }
         Comment(_) -> {}
         Byte(n) -> Vec.push(s.bytes, Byte.truncate(n))
-        Uleb(n) -> uleb(s.bytes, n)
-        Difference(_, _) | SectionOffset(_, _) ->
-            error("internal error: the object writer has no debug sections")
-        -- The line table is the assembler's to build, and this one builds
-        -- none.
-        SourceFile(_, _, _) | Loc(_, _) -> {}
+        Uleb(n) -> Dwarf.uleb(s.bytes, n)
+        Difference(to, from) -> {
+            Vec.push(a.distances, Distance { section = a.current, offset = len(s.bytes),
+                                             to = to, from = from })
+            zeros(s.bytes, 4)
+        }
+        -- The section's start label is for the assembly's spelling of the
+        -- offset; here the offset is the target's own.
+        SectionOffset(label, _) -> {
+            Vec.push(a.pending, Pending { section = a.current, offset = len(s.bytes),
+                                          use = Offset32, target = label })
+            zeros(s.bytes, 4)
+        }
+        SourceFile(n, directory, path) -> Vec.push(a.files, (n, directory, path))
+        Loc(at, prologueEnd) -> {
+            a.loc = at
+            a.prologue = prologueEnd
+        }
     }
 }
 
--- `n`, at least 0, in unsigned LEB128: seven bits a byte from the lowest, the
--- top bit set on every byte but the last.
-fun uleb(bytes : Vec Byte, n : Int) -> Unit {
-    var rest = n
-    loop {
-        let low = rest & 0x7F
-        rest = rest >> 7
-        if rest == 0 {
-            Vec.push(bytes, Byte.truncate(low))
-            break
-        }
-        Vec.push(bytes, Byte.truncate(low | 0x80))
-    }
+-- Whether `item` takes the row a `Loc` before it starts: an instruction, any
+-- data with bytes of its own, and the next `Loc`, so that two in a row each
+-- leave one.
+fun takesRow(item : Item i) -> Bool = match item {
+    Instruction(_) | Word(_) | WordOf(_) | Bytes(_) | CString(_) | Byte(_) | Uleb(_)
+        | Difference(_, _) | SectionOffset(_, _) | Loc(_, _) -> True
+    Architecture | Section(_) | Global(_) | FunctionType(_) | Align(_) | Label(_)
+        | Space(_) | Comment(_) | SourceFile(_, _, _) -> False
 }
 
 fun zeros(bytes : Vec Byte, n : Int) -> Unit {
     for var k = 0; k < n; k = k + 1 { Vec.push(bytes, Byte.truncate(0)) }
 }
 
-fun define(a : Assembler i f, sym : Symbol) -> Unit {
+fun define(a : Assembler i f, sym : Symbol) -> Unit =
+    defineAt(a, sym, a.current, len(a.sections[a.current].bytes))
+
+fun defineAt(a : Assembler i f, sym : Symbol, section : Int, offset : Int) -> Unit {
     let key = Asm.spell(sym)
     if Map.contains(a.labels, key) {
         error("internal error: the label " + key + " is defined twice")
     }
-    let d = Definition { symbol = sym, section = a.current,
-                         offset = len(a.sections[a.current].bytes),
+    let d = Definition { symbol = sym, section = section, offset = offset,
                          exported = Set.contains(a.exported, key),
                          function = Set.contains(a.functions, key) }
     Map.put(a.labels, key, d)
@@ -224,6 +302,21 @@ fun define(a : Assembler i f, sym : Symbol) -> Unit {
 -- Section addresses are not known here, so a distance is computed between
 -- offsets in one section, which is why only those fields are filled in.
 fun finish(a : Assembler i f) -> Object f {
+    if len(a.files) > 0 { lines(a) }
+    for p in a.distances {
+        let bytes = a.sections[p.section].bytes
+        match (Map.get(a.labels, Asm.spell(p.to)), Map.get(a.labels, Asm.spell(p.from))) {
+            (Some(to), Some(from)) -> {
+                if to.section != from.section {
+                    error("internal error: the distance from " + Asm.spell(p.from) + " to "
+                          + Asm.spell(p.to) + " crosses a section")
+                }
+                Byte.putLE(bytes, p.offset, 4, to.offset - from.offset)
+            }
+            _ -> error("internal error: the distance from " + Asm.spell(p.from) + " to "
+                       + Asm.spell(p.to) + " names a label never defined")
+        }
+    }
     let undefined = []
     let seen = Set.new()
     for p in a.pending {
@@ -236,11 +329,15 @@ fun finish(a : Assembler i f) -> Object f {
                 } else {
                     Vec.push(s.relocations, relocation(p))
                 }
-                Address64 -> Vec.push(s.relocations, relocation(p))
+                Address64 | Offset32 -> Vec.push(s.relocations, relocation(p))
             }
             None -> {
                 if let Temporary = p.target.kind {
                     error("internal error: the label " + key + " is never defined")
+                }
+                if let Offset32 = p.use {
+                    error("internal error: the section offset of " + key
+                          + " names a symbol outside the object")
                 }
                 if !Set.contains(seen, key) {
                     Set.add(seen, key)
@@ -250,7 +347,43 @@ fun finish(a : Assembler i f) -> Object f {
             }
         }
     }
-    Object { sections = a.sections, defined = a.defined, undefined = undefined }
+    Object { sections = Vec.toArray(a.sections), defined = a.defined, undefined = undefined }
+}
+
+-- `debug_line`, after whatever the stream put there, and `debug_line_str`.
+-- Each sequence's start address refers to a label made here at its first
+-- row, and each path to a label at its string, so the object writers
+-- relocate them as they would the stream's own.
+fun lines(a : Assembler i f) -> Unit {
+    let sequences = Vec.map(a.sequenced, fun(k) =
+        Dwarf.Sequence { rows = a.rows[k], end = len(a.sections[k].bytes) })
+    let t = Dwarf.lineTable(a.files, sequences)
+    let line = sectionIndex(a, Asm.DebugLine)
+    let strings = sectionIndex(a, Asm.DebugLineStr)
+    let base = len(a.sections[line].bytes)
+    for b in t.line { Vec.push(a.sections[line].bytes, b) }
+    let stringsBase = len(a.sections[strings].bytes)
+    for b in t.strings { Vec.push(a.sections[strings].bytes, b) }
+    let named = Map.new()
+    for (field, offset) in t.paths {
+        let sym = match Map.get(named, offset) {
+            Some(sym) -> sym
+            None -> {
+                let sym = Asm.localLabel(a.dialect, "debug_line_str" + Int.toString(len(named)))
+                Map.put(named, offset, sym)
+                defineAt(a, sym, strings, stringsBase + offset)
+                sym
+            }
+        }
+        Vec.push(a.pending, Pending { section = line, offset = base + field, use = Offset32,
+                                      target = sym })
+    }
+    for var k = 0; k < len(a.sequenced); k = k + 1 {
+        let sym = Asm.localLabel(a.dialect, "debug_line_sequence" + Int.toString(k))
+        defineAt(a, sym, a.sequenced[k], sequences[k].rows[0].offset)
+        Vec.push(a.pending, Pending { section = line, offset = base + t.addresses[k],
+                                      use = Address64, target = sym })
+    }
 }
 
 fun relocation(p : Pending f) -> Relocation f =

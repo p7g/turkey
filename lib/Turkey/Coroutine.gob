@@ -1,4 +1,4 @@
-export (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet)
+export (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet, waitingSwap)
 
 -- Coroutines: a function run on a stack of its own, which can stop part way
 -- through -- at any depth of ordinary calls -- and be continued later.
@@ -15,6 +15,7 @@ export (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet)
 import Prelude ()
 import Data.Int (Int)
 import Data.Tuple (Unit)
+import Data.Eq (Eq(..), (==))
 import Data.Array (Array)
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Control.Panic (error)
@@ -33,9 +34,10 @@ type Coroutine = Coroutine {
     body         : fun() -> Unit,
     var running  : Bool,
     var finished : Bool,
-    -- The scheduler's (`Turkey.Scheduler`), and only ever read or written
-    -- under its lock.
-    var waiting  : Int,
+    -- The scheduler's (`Turkey.Scheduler`), read and written only by atomic
+    -- instructions, since a waker and the coroutine's own worker change it
+    -- at once.
+    waiting      : Prim.Atomic,
 }
 
 -- Each thread's running coroutine, if any, by the thread's index in its
@@ -59,14 +61,18 @@ fun new(body : fun() -> Unit) -> Coroutine = Coroutine {
     body = body,
     running = False,
     finished = False,
-    waiting = 0,
+    waiting = Prim.atomicNew(0),
 }
 
 fun finished(c : Coroutine) -> Bool = c.finished
 
-fun waiting(c : Coroutine) -> Int = c.waiting
+fun waiting(c : Coroutine) -> Int = Prim.atomicGet(c.waiting)
 
-fun waitingSet(c : Coroutine, state : Int) -> Unit { c.waiting = state }
+fun waitingSet(c : Coroutine, state : Int) -> Unit = Prim.atomicSet(c.waiting, state)
+
+-- Returns whether `c`'s `waiting` was `expected`, and sets it to `new` if so.
+fun waitingSwap(c : Coroutine, expected : Int, new : Int) -> Bool =
+    Prim.atomicSwapIf(c.waiting, expected, new) == expected
 
 -- The coroutine whose stack is running, or `None` on the program's own stack.
 fun running() -> Option Coroutine = current()

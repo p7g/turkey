@@ -262,7 +262,16 @@ fun callGraph(binds : Vec CBind, walked : Array Walked) -> Map String (Set.Set S
 -- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
 -- the first is the lexicographically first name, and a golden that depends on
 -- which binding was broken does not move when an unrelated one is added.
-fun loopBreakers(graph : Map String (Set.Set String)) -> Set.Set String {
+--
+-- The breaker is the first member that is not in `dicts`, and a dictionary
+-- only when every member is one. A method read out of a known dictionary
+-- (`Methods.knownField`) is a step that never asks the breakers, so a cycle
+-- broken only at a dictionary is still followed by inlining, round and round.
+-- A directly recursive instance method is exactly such a cycle: it calls
+-- itself through its own instance's dictionary, and the dictionary's name
+-- sorts first because it is a prefix of the method's.
+fun loopBreakers(graph : Map String (Set.Set String), dicts : Methods.Dictionaries)
+        -> Set.Set String {
     let out = Set.new()
     let pending = [graph]
     var k = 0
@@ -270,19 +279,25 @@ fun loopBreakers(graph : Map String (Set.Set String)) -> Set.Set String {
         let current = pending[k]
         k = k + 1
         for component in Deps.sccs(current) {
-            let first = component[0]
             if len(component) == 1 {
-                if Set.contains(successorsOf(current, first), first) {
-                    Set.add(out, first)
+                let only = component[0]
+                if Set.contains(successorsOf(current, only), only) {
+                    Set.add(out, only)
                 }
             } else {
-                Set.add(out, first)
+                var broken = 0
+                while broken < len(component) && Map.contains(dicts, component[broken]) {
+                    broken = broken + 1
+                }
+                if broken == len(component) { broken = 0 }
+                Set.add(out, component[broken])
                 let rest = Set.new()
-                for var m = 1; m < len(component); m = m + 1 {
-                    Set.add(rest, component[m])
+                for var m = 0; m < len(component); m = m + 1 {
+                    if m != broken { Set.add(rest, component[m]) }
                 }
                 let sub = Map.new()
-                for var m = 1; m < len(component); m = m + 1 {
+                for var m = 0; m < len(component); m = m + 1 {
+                    if m == broken { continue }
                     let kept = Set.new()
                     for n in Set.elements(successorsOf(current, component[m])) {
                         if Set.contains(rest, n) { Set.add(kept, n) }
@@ -471,9 +486,10 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
     for var i = 0; i < len(all); i = i + 1 {
         for n in Set.elements(walked[i].mentions) { Set.add(written, n) }
     }
+    let dicts = Methods.dictionaries(program.dicts)
     Reducer {
-        breakers = loopBreakers(graph), decls = decls, bindings = bindings,
-        dicts = Methods.dictionaries(program.dicts),
+        breakers = loopBreakers(graph, dicts), decls = decls, bindings = bindings,
+        dicts = dicts,
         inlining = outermost(), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
         run = run, callSites = callSites,

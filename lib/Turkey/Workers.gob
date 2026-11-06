@@ -4,7 +4,7 @@ export (
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
     permits, permitsSet, permitHeld, permitSlot, permitWanted, permitGive, permitAwait,
-    queuedSet, queued, idlers, idleEnter, idleLeave,
+    tasksAdd, queued, tasksNone, idlers, idleEnter, idleLeave,
     monitorStart, monitoring, monitorState, monitorCalling, monitorWork, monitorHold, monitorTake,
     monitorHandOut, monitorSleep,
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
@@ -150,8 +150,8 @@ var freeSlots : Ptr = zeroed(threadLimit() / 8)
 -- the program's own stack waits for one, and 2 once a holder has given it one
 -- (`permitAwait`); the epoch it sleeps on; the epoch spare threads sleep on,
 -- and how many do; how many spares the monitor has woken or started that
--- have not yet looked for a permit; the scheduler's count of runnable tasks
--- (`queuedSet`); how many holders are idle, waiting for work; and 1 while the
+-- have not yet looked for a permit; the scheduler's counts of queued and
+-- running tasks (`tasksAdd`); how many holders are idle, waiting for work; and 1 while the
 -- monitor sleeps because every holder is.
 var permitWords : Ptr = zeroed(80)
 
@@ -693,11 +693,21 @@ fun spareWake() -> Unit {
     }
 }
 
--- The scheduler's count of runnable tasks, which the monitor and idle workers
--- read without its lock. Set under the queue's lock (`Turkey.Scheduler`).
-fun queuedSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, queuedAt, n)
+-- The scheduler's counts of tasks: how many are queued, in the low 32 bits,
+-- and how many a thread has taken to run and not yet seen suspend, in the
+-- high 32. One word, so that one atomic add moves a task between the two and
+-- a single load sees every task queued, running, or neither
+-- (`Turkey.Scheduler.stuck`). Adds `queued` and `running` to them and
+-- returns the word as it was.
+fun tasksAdd(queued : Int, running : Int) -> Int =
+    Ptr.atomicAdd(permitWords, queuedAt, plus(queued, running << 32))
 
-fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt)
+-- Returns how many tasks are queued, on any queue. Read by the monitor and by
+-- idle workers without a lock.
+fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt) & 0xFFFF_FFFF
+
+-- Returns whether no task is queued or running.
+fun tasksNone() -> Bool = Ptr.atomicLoad(permitWords, queuedAt) == 0
 
 -- How many holders are idle, between `idleEnter` and `idleLeave`.
 fun idlers() -> Int = Ptr.atomicLoad(permitWords, idlersAt)
@@ -747,7 +757,7 @@ fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
 fun monitorWork() -> Bool {
     let free = Ptr.atomicLoad(permitWords, permitFreeAt)
     let supply = plus(Ptr.atomicLoad(permitWords, idlersAt), free)
-    Ptr.atomicLoad(permitWords, queuedAt) > supply
+    queued() > supply
         || (Ptr.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
 }
 

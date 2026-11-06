@@ -339,9 +339,9 @@ def test_gdb_stops_in_an_inlined_function_and_shows_its_frame(how):
 
 
 # The breakpoints the README gives, each with what it finds in RECTANGLES:
-# both copies of `area` by its display form or a regular expression, the
-# out-of-line copy alone by its symbol, and an instance's method, which has
-# parentheses in its display form.
+# both copies of `area` by its display form, and by a regular expression in
+# lldb; the out-of-line copy alone by its symbol, and by `rbreak` in gdb; and
+# an instance's method, which has parentheses in its display form.
 @pytest.mark.parametrize("how", PATHS)
 def test_lldb_takes_each_kind_of_breakpoint(how):
     lldb = _lldb()
@@ -369,7 +369,11 @@ def test_gdb_takes_each_kind_of_breakpoint(how):
                           "-ex", "break 'HasField.width(Rectangle).get'",
                           "-ex", "info breakpoints", "./prog"], RECTANGLES)
     assert re.search(r"^Breakpoint 1 at .*\(2 locations\)$", out, re.MULTILINE), out[-4000:]
-    assert re.search(r"^Breakpoint 2 at .*\(2 locations\)$", out, re.MULTILINE), out[-4000:]
+    # `rbreak` sets a breakpoint for each function it matches, and that
+    # breakpoint finds the out-of-line copy alone, as one by symbol does.
+    assert re.search(r"^Breakpoint 2 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
+                     re.MULTILINE), out[-4000:]
+    assert re.search(r"^static void Main\.area\[Rectangle\]\(\);$", out, re.MULTILINE), out[-4000:]
     assert re.search(r"^Breakpoint 3 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
                      re.MULTILINE), out[-4000:]
     assert re.search(r"^Breakpoint 4 at 0x[0-9a-f]+", out, re.MULTILINE), out[-4000:]

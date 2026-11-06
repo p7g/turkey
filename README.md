@@ -180,9 +180,12 @@ stops in `Main.main` where `area`'s code was copied, and in `area` itself
 where it was not, and `bt` shows `area` at its own line above `main` at the
 line of the call. gdb needs the quotes around a name with brackets in it. A
 breakpoint by symbol, `breakpoint set --name Main#area@Rectangle` or
-`break 'Main#area@Rectangle'`, stops only in the copy that has the symbol,
-and a breakpoint on every specialization of `area` is a regular expression:
-`breakpoint set --func-regex '^Main\.area\['` or `rbreak ^Main\.area\[`.
+`break 'Main#area@Rectangle'`, stops only in the copy that has the symbol.
+In lldb a breakpoint on every specialization of `area`, inlined copies
+included, is a regular expression: `breakpoint set --func-regex
+'^Main\.area\['`. gdb's `rbreak ^Main\.area\[` sets a breakpoint on each
+specialization it matches, but each one stops only in the copy that has the
+symbol, as a breakpoint by symbol does.
 There is no information about variables or types yet, so a debugger shows
 registers and memory rather than values.
 

@@ -130,9 +130,9 @@ fun newCEnv(ids : Ids) -> CEnv =
 fun layered(e : CEnv) -> CEnv =
     CEnv { ids = e.ids, inScope = Map.new(), outer = e.inScope, undo = [] }
 
--- Brings a binder into scope, under its spelling, and under its id if it has
--- one. A reference by spelling may mean a binder with an id: every reference
--- to a top-level binding is by spelling.
+-- Brings a top-level binder into scope: under its spelling, which every
+-- reference to it uses, and under its id if it has one, so that `bind`
+-- refuses a local binder with that id.
 fun defineC(e : CEnv, name : String, id : Int, binders : Vec VarCell,
             ty : Ty.Type) -> Unit {
     let b = Some(Bound { name = name, id = id, binders = binders, ty = ty })
@@ -295,59 +295,41 @@ fun claim(first : Map Int (String, String), id : Int, name : String,
     None -> Map.put(first, id, (name, within.name))
 }
 
--- Brings a binder the term binds into scope, and notes it for `checkUnique`.
--- Raises an internal error if a binder with its id is in scope already, which
--- protects SsaLower's rule that a reference with an id means the one binder
--- of that id its scoped environment holds.
+-- Brings a binder the term binds into scope, under its id alone, and notes
+-- it for `checkUnique`. Raises an internal error if it has no id, or if a
+-- binder with its id is in scope already, which protects SsaLower's rule that
+-- a reference with an id means the one binder of that id its scoped
+-- environment holds.
 fun bind(ck : Checker, env : CEnv, name : String, id : Int, binders : Vec VarCell,
          ty : Ty.Type, where : Option Span) -> Unit {
-    if id != noId {
-        if let Some(outer) = lookupKey(env, ById(id)) {
-            fail("'" + name + "' is bound inside the scope of '" + outer.name
-                 + "', which has the same id", where)
-        }
+    if let Some(outer) = lookupKey(env, ById(id)) {
+        fail("'" + name + "' is bound inside the scope of '" + outer.name
+             + "', which has the same id", where)
     }
-    noteBound(ck, env, name, id)
-    defineC(env, name, id, binders, ty)
+    noteBound(ck, env, name, id, where)
+    file(env, ById(id), Some(Bound { name = name, id = id, binders = binders, ty = ty }))
 }
 
-fun noteBound(ck : Checker, env : CEnv, name : String, id : Int) -> Unit = match env.ids {
-    UniqueIds -> if id != noId { Vec.push(ck.bound, (id, name)) }
-    ScopedIds -> {}
+-- Notes the local binder `id` for `checkUnique`. Raises an internal error if
+-- it has no id: every local binder has one from the lowering on, and no pass
+-- finds a local binder by its spelling.
+fun noteBound(ck : Checker, env : CEnv, name : String, id : Int, where : Option Span) -> Unit {
+    if id == noId { fail("the local binder '" + name + "' has no id", where) }
+    match env.ids {
+        UniqueIds -> Vec.push(ck.bound, (id, name))
+        ScopedIds -> {}
+    }
 }
 
 -- The binder the reference `r` finds, which must be in scope. A reference by
 -- an id is found by the id alone, so a copy may sit under a binder it shares
--- a spelling with.
-fun resolve(env : CEnv, r : Ref, where : Option Span) -> Bound {
-    let found = match lookupKey(env, r) {
+-- a spelling with. A reference by spelling finds a top-level binding, since
+-- a local binder is filed under its id alone.
+fun resolve(env : CEnv, r : Ref, where : Option Span) -> Bound =
+    match lookupKey(env, r) {
         Some(found) -> found
         None -> fail(shown(r) + " is not in scope", where)
     }
-    -- Protects SsaLower's rule that a reference with no id is to evidence or
-    -- to a top-level binding: it looks such a reference up among the
-    -- evidence, never among the locals with ids. Checked only on the program
-    -- the backend is handed, since the lowering and the specializer write
-    -- such references to locals, and `Turkey.Opt` gives them their binders'
-    -- ids.
-    match env.ids {
-        ScopedIds -> if let BySpelling(name) = r {
-            if found.id != noId && Option.isSome(local(env, r)) {
-                fail("'" + name + "' has no id, but refers to a local binder that has one",
-                     where)
-            }
-        }
-        UniqueIds -> {}
-    }
-    found
-}
-
--- The binder a scope inside the binding being checked has filed under
--- `key`, if any. A top-level binder is in `outer` and is not one.
-fun local(e : CEnv, key : Ref) -> Option Bound = match Map.get(e.inScope, key) {
-    Some(found) -> found
-    None -> None
-}
 
 fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     let want = if b.mutable && isRef(b.ty) { refElem(b.ty) } else { b.ty }
@@ -496,7 +478,6 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         var result : Option Ty.Type = None
         for alt in alts {
             let mark = enter(env)
-            refuseNestedEvidence(env, alt.alt, e.span)
             for (name, id, ty) in pattern(ck, alt.alt, s, e.span) {
                 bind(ck, env, name, id, [], ty, e.span)
             }
@@ -535,24 +516,6 @@ fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
     }
 }
 
--- Raises an internal error if `alt` opens evidence spelled like a local
--- binder in scope, on the program the backend is handed. Evidence has no id,
--- so `bind`'s check by id does not reach it. Protects SsaLower's rule that
--- evidence, which it files by spelling, is never bound inside the scope of
--- a binder of its spelling. Before `Turkey.Opt` gives each evidence binder a
--- spelling of its own, every opening of one class spells its evidence alike.
-fun refuseNestedEvidence(env : CEnv, alt : Alt, where : Option Span) -> Unit {
-    match (env.ids, openingOf(alt)) {
-        (ScopedIds, Some(o)) -> for d in o.evidence {
-            if Option.isSome(local(env, BySpelling(d))) {
-                fail("the evidence '" + d + "' is bound inside the scope of a "
-                     + "binder spelled alike", where)
-            }
-        }
-        _ -> {}
-    }
-}
-
 -- Returns the uids of the constants `alt` opens, now open around its body.
 -- With `UniqueIds`, raises an internal error if an arm around it opened one
 -- already. Copying an arm gives its constants fresh uids, as it gives its
@@ -584,7 +547,7 @@ fun refuseEscape(alt : Alt, got : Ty.Type, where : Option Span) -> Unit {
     }
 }
 
-fun refuseOpened(name : String, o : Opening, got : Ty.Type, where : Option Span) -> Unit {
+fun refuseOpened(name : String, o : Opened, got : Ty.Type, where : Option Span) -> Unit {
     let opened = Set.new()
     for s in o.skolems { Set.add(opened, s.uid) }
     for s in Ty.skolemsOf([got]) {
@@ -858,15 +821,12 @@ fun checkJoin(ck : Checker, e : Core, name : String, id : Int, params : Array CP
     let innerJoins = Map.new()
     for (k, v) in Map.entries(joins) { Map.put(innerJoins, k, v) }
     let j = JoinPoint { name = name, id = id, params = params, ty = e.ty }
-    if id != noId {
-        if let Some(outer) = Map.get(joins, ById(id)) {
-            fail("the join point '" + name + "' is bound inside the scope of '"
-                 + outer.name + "', which has the same id", e.span)
-        }
+    if let Some(outer) = Map.get(joins, ById(id)) {
+        fail("the join point '" + name + "' is bound inside the scope of '"
+             + outer.name + "', which has the same id", e.span)
     }
-    Map.put(innerJoins, BySpelling(name), j)
-    if id != noId { Map.put(innerJoins, ById(id), j) }
-    noteBound(ck, env, name, id)
+    Map.put(innerJoins, ById(id), j)
+    noteBound(ck, env, name, id, e.span)
     let mark = enter(env)
     for p in params { bind(ck, env, p.name, p.id, [], p.ty, e.span) }
     let bodyTy = check(ck, body, env,
@@ -957,7 +917,7 @@ fun bindAll(binders : Array (Option (String, Int)),
 }
 
 fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option (String, Int)),
-               opening : Option Opening, target : Ty.Type,
+               opening : Option Opened, target : Ty.Type,
                where : Option Span) -> Vec (String, Int, Ty.Type) {
     let info = match Map.get(ck.decls.constructors, name) {
         Some(i) -> i
@@ -999,7 +959,8 @@ fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option (S
         }
         for var i = 0; i < len(info.scheme.preds); i = i + 1 {
             let pr = info.scheme.preds[i]
-            Vec.push(carriedTypes, (o.evidence[i],
+            let (d, id) = o.evidence[i]
+            Vec.push(carriedTypes, (d, id,
                 dictType(ck, pr.name, Decls.substitute(pr.args[0], mapping))))
         }
     }
@@ -1013,8 +974,7 @@ fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option (S
              + " arguments, matched with " + Int.toString(len(fields)), where)
     }
     let out = bindAll(fields, fieldTypes)
-    -- The dictionaries an opening binds have no ids.
-    for (n, t) in carriedTypes { Vec.push(out, (n, noId, t)) }
+    for carried in carriedTypes { Vec.push(out, carried) }
     out
 }
 
@@ -1026,7 +986,7 @@ fun freshBinders(alt : Alt) -> Vec (String, Int, Ty.Type) {
     match alt {
         ACon(_, fields, opening) -> {
             if let Some(o) = opening {
-                for d in o.evidence { Vec.push(out, (d, noId, freshType())) }
+                for (d, id) in o.evidence { Vec.push(out, (d, id, freshType())) }
             }
             for f in fields { add(f) }
         }

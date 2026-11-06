@@ -30,6 +30,7 @@ import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..), Alt(..),
+                    Opened(..),
                     Mapper(..), Ref(..), noId, binderId)
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), Compact(..))
@@ -51,7 +52,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
 import Turkey.Types as Ty
 import Turkey.Types (TCon, TTuple, TFun, TBottom)
 import Turkey.Ast as Ast
-import Turkey.Ast (Lit(..), Opening(..))
+import Turkey.Ast (Lit(..))
 import Turkey.Bulk as Bulk
 
 -- What is not lowered yet: the binding, and the form that stopped it.
@@ -142,9 +143,6 @@ type Lower = Lower {
     b       : Builder,
     -- Each local in scope, by binder id -> the value holding it.
     var env     : Map Int Value,
-    -- Each existential's evidence in scope, by spelling -> the value holding
-    -- it. See `Ref`.
-    var evidence : Map String Value,
     -- Each join in scope, by binder id -> the block it became.
     var joins   : Map Int BlockId,
     -- Top-level names, which are globals rather than locals.
@@ -1115,7 +1113,7 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              sigs : Map String Signature, layouts : Map String Ssa.Layout,
              lifted : Vec (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0), shared.files),
-    env = Map.new(), evidence = Map.new(), joins = Map.new(), globals = globals, tags = tags,
+    env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
     sigs = sigs, layouts = layouts, lifted = lifted,
     shared = shared, stopped = None, overLimit = False, flatRefs = Set.new(), flatRecords = Set.new(),
@@ -1134,17 +1132,13 @@ fun spine(value : Core) -> Option (Array CParam, Core) = match value.kind {
 
 -- -- scope ------------------------------------------------------------------------
 
--- The scope files a local binder as a `Ref`, as a reference finds it.
---
--- Every local binder after `Turkey.Opt` has an id, except an existential's
--- evidence, which an arm has nowhere to keep one for. `Turkey.Opt` gives each
--- evidence binder a spelling of its own, so evidence is filed by that, apart
--- from the binders with ids. A reference by spelling is to evidence or to a
--- top-level binding, which is filed by its `Module#name` among the globals.
+-- The scope files a local binder by its id. Every local binder has one, and
+-- a reference by spelling is to a top-level binding, which is filed by its
+-- `Module#name` among the globals.
 
--- Returns `id`. Raises an internal error if it is `noId`: a local binder
--- other than evidence with no id would have to be found by its spelling, and
--- two binders of one function may share a spelling.
+-- Returns `id`. Raises an internal error if it is `noId`: a local binder with
+-- no id would have to be found by its spelling, and two binders of one
+-- function may share a spelling.
 fun idOf(name : String, id : Int) -> Int {
     if id == noId {
         oops("the local '" + name + "' reached the backend with no binder id")
@@ -1161,7 +1155,7 @@ fun armLocals(alt : Alt) -> Vec Ref {
     match alt {
         ACon(_, fields, opening) -> {
             if let Some(o) = opening {
-                for d in o.evidence { Vec.push(out, BySpelling(d)) }
+                for (d, id) in o.evidence { Vec.push(out, ById(idOf(d, id))) }
             }
             for f in fields { field(f) }
         }
@@ -1181,13 +1175,14 @@ fun labelOf(target : Ref) -> Int = match target {
 
 fun put(l : Lower, local : Ref, v : Value) -> Unit = match local {
     ById(id) -> Map.put(l.env, id, v)
-    BySpelling(name) -> Map.put(l.evidence, name, v)
+    BySpelling(name) -> oops("the top-level binding '" + name + "' is bound as a local")
 }
 
--- The value the local `local` names holds, if it is in scope.
+-- The value the local `local` names holds, if it is in scope. A reference by
+-- spelling is to a top-level binding, which is no local.
 fun lookup(l : Lower, local : Ref) -> Option Value = match local {
     ById(id) -> Map.get(l.env, id)
-    BySpelling(name) -> Map.get(l.evidence, name)
+    BySpelling(_) -> None
 }
 
 -- What the scope holds for these locals now, so it can be put back.
@@ -1223,10 +1218,7 @@ fun restore(l : Lower, saved : Vec (Ref, Option Value)) -> Unit {
     for (local, was) in saved {
         match was {
             Some(v) -> put(l, local, v)
-            None -> match local {
-                ById(id) -> discard(Map.delete(l.env, id))
-                BySpelling(name) -> discard(Map.delete(l.evidence, name))
-            }
+            None -> discard(Map.delete(l.env, binderId(local)))
         }
     }
 }
@@ -1855,7 +1847,7 @@ fun positions(binders : Array (Option (String, Int)), types : Array Ty.Type,
 -- Opening a packed existential: the tag, then the stored index against the one
 -- this copy of the arm was lowered for, then the carried dictionaries, then
 -- the fields.
-fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o : Opening,
+fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o : Opened,
            v : Value, ty : Ty.Type, success : BlockId, failure : BlockId) -> Unit {
     let layouts = match o.layouts {
         Some(ls) -> ls
@@ -1891,7 +1883,8 @@ fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o :
         L.into(l.b, next)
     }
     for var i = 0; i < len(o.evidence); i = i + 1 {
-        Map.put(l.evidence, o.evidence[i],
+        let (d, id) = o.evidence[i]
+        Map.put(l.env, idOf(d, id),
                 L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 1 + i)), Ssa.traced(Ptr)))
     }
     destructure(l, v, layout, positions(binders, types, 1 + carried))
@@ -3671,7 +3664,6 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
         -- initializer's own is put back to empty below.
         f.module_ = bind.module_
         l.env = Map.new()
-        l.evidence = Map.new()
         l.joins = Map.new()
         l.stopped = None
         act(l, a, held)

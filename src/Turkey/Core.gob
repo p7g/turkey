@@ -1,11 +1,12 @@
 export (
     refName, refOf, isRef, refElem,
-    Core(..), CoreKind(..), Ref(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..),
+    Core(..), CoreKind(..), Ref(..), CParam(..), CAlt(..), Alt(..), Opened(..), CBind(..),
+    CProgram(..),
     noId, refTo, spellingOf, binderId,
     openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
-    namesOf, namesInto, codeAddressName, mentions, references, withoutRespelling,
+    namesOf, namesInto, codeAddressName, mentions, references,
     dictName, classOfDict, dictClass, isDictionary,
     abstractionBinders,
     Aliases(..), newAliases, alias,
@@ -107,27 +108,26 @@ fun mkCore(ty : Ty.Type, span : Option Span, kind : CoreKind) -> Core =
 -- A binder carries a spelling and an id. A binder with an id is found by the
 -- id, and its spelling is only what a dump prints it as: two binders of one
 -- binding may share one. The id may be one `Turkey.Binders` keeps no record
--- of, which is why the spelling stays on the binder. A binder with no id is
--- found by its spelling: a top-level binding by its `Module#name`, which is
--- unique and is its symbol; a dictionary or instance parameter, which
--- `Turkey.Lower` and `Turkey.Mono` bind with no id and `Turkey.Opt` gives
--- one; and an existential's evidence, which `Alt` has nowhere to keep an id
--- for, by the spelling of its own that `Turkey.Opt` gives it.
+-- of, which is why the spelling stays on the binder. Every local binder has
+-- an id, and `Turkey.Coretc` refuses one without. A binder with no id is a
+-- top-level binding, found by its `Module#name`, which is unique and is its
+-- symbol.
 type CParam = CParam {
     name : String,
     id   : Int,
     ty   : Ty.Type,
 }
 
--- The id a binder carries when `Turkey.Binders` has no record of it: a
--- dictionary, or a binder a pass after `Turkey.Lower` made.
+-- The id a top-level binding carries when `Turkey.Binders` has no record of
+-- it: an instance's dictionary, a default method, or a binding a pass after
+-- `Turkey.Lower` made.
 let noId = -1
 
--- What a reference refers to: a local binder by its id, or a binder with no
--- id by its spelling (see `CParam`). A reference to a top-level binding is
--- by its spelling, even where the binding has an id, because the passes
--- after the lowering find top-level bindings by name. A reference carries no
--- spelling of its own beside an id: a dump prints it as its binder.
+-- What a reference refers to: a local binder by its id, or a top-level
+-- binding by its spelling, even where the binding has an id, because the
+-- passes after the lowering find top-level bindings by name. A reference
+-- carries no spelling of its own beside an id: a dump prints it as its
+-- binder.
 type Ref = ById(Int) | BySpelling(String)
 
 instance Eq Ref {
@@ -177,11 +177,27 @@ type CAlt = CAlt {
 type Alt
     -- A constructor and a binder per field, in declaration order -- a record's
     -- too -- and, for an existential, what it opens.
-    = ACon(String, Array (Option (String, Int)), Option Opening)
+    = ACon(String, Array (Option (String, Int)), Option Opened)
     | ATuple(Array (Option (String, Int)))
     | ALit(Ast.Lit)
     -- Anything at all, binding the whole scrutinee when named.
     | AAny(Option (String, Int))
+
+-- What an arm opening an existential binds besides its fields: a binder for
+-- each dictionary the constructor carries, the rigid constants that stand for
+-- its hidden types, and, once `Turkey.Layout` has copied the arm, the layouts
+-- this copy is for.
+--
+-- Its own record, not the `Turkey.Ast.Opening` inference left on the pattern,
+-- because the binders belong to the arm and not to the pattern. Inference
+-- names a pattern's dictionaries once, but the lowering may lower a pattern
+-- more than once, and each lowering binds them under ids of its own, as it
+-- does the fields'.
+type Opened = Opened {
+    evidence : Array (String, Int),
+    skolems  : Vec ConCell,
+    layouts  : Option (Vec Ssa.Layout),
+}
 
 type CoreKind
     = CLit(Ast.Lit)
@@ -609,9 +625,9 @@ fun untyped(e : Core) -> Core = match e.kind {
     _ -> e
 }
 
--- Returns the spelling of every binder a reference by spelling in `e` finds
--- -- a top-level binding, a dictionary, an existential's evidence -- and the
--- `codeAddressName` of each C symbol a `Prim.codeAddress` names.
+-- Returns the spelling of every top-level binding a reference in `e` finds by
+-- spelling, and the `codeAddressName` of each C symbol a `Prim.codeAddress`
+-- names.
 fun namesOf(e : Core) -> Set.Set String {
     let out = Set.new()
     namesInto(e, out)
@@ -760,31 +776,9 @@ fun settle(a : Aliases) -> Unit {
 -- The id goes first: it holds no `:`, so the key splits back unambiguously.
 fun identity(name : String, id : Int) -> String = Int.toString(id) + ":" + name
 
-fun baseName(spelled : String) -> String {
-    let name = withoutRespelling(spelled)
-    match generatedParts(name) {
-        Some((hint, suffix)) -> "%" + hint + suffix
-        None -> name
-    }
-}
-
--- `name` without the `~` and number `Turkey.Opt` adds, as many times as it
--- added one, to give an existential's evidence a spelling of its own.
-fun withoutRespelling(name : String) -> String {
-    let chars = Vec.new(String.byteLength(name))
-    for c in String.codePoints(name) { Vec.push(chars, c) }
-    var end = len(chars)
-    var stripping = True
-    while stripping {
-        var i = end
-        while i > 0 && Char.isDigit(chars[i - 1]) { i = i - 1 }
-        if i == end || i < 2 || chars[i - 1] != '~' {
-            stripping = False
-        } else {
-            end = i - 1
-        }
-    }
-    if end == len(chars) { name } else { String.fromCodePoints(Vec.slice(chars, 0, end)) }
+fun baseName(name : String) -> String = match generatedParts(name) {
+    Some((hint, suffix)) -> "%" + hint + suffix
+    None -> name
 }
 
 -- A generated name is `%hint123` or `%hint123.suffix`, taken apart by scanning.
@@ -1024,7 +1018,7 @@ fun showBinder(binder : Option (String, Int), a : Aliases) -> String = match bin
 -- What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid
 -- constants, the layouts this copy of the arm was made for, and the
 -- dictionaries, named as the body prints them.
-fun showOpening(opening : Option Opening, a : Aliases) -> String = match opening {
+fun showOpening(opening : Option Opened, a : Aliases) -> String = match opening {
     None -> ""
     Some(o) -> {
         let layouts = match o.layouts {
@@ -1032,13 +1026,14 @@ fun showOpening(opening : Option Opening, a : Aliases) -> String = match opening
             Some(ls) -> "@" + Ssa.keyName(ls)
         }
         "[" + String.join(Array.map(o.skolems, _.name), ", ") + layouts
-            + "](" + String.join(Array.map(o.evidence, alias(a, _, noId)), ", ")
+            + "](" + String.join(Array.map(o.evidence, fun((name, id)) = alias(a, name, id)),
+                                 ", ")
             + ")"
     }
 }
 
 -- What an arm opens, if it opens an existential.
-fun openingOf(alt : Alt) -> Option Opening = match alt {
+fun openingOf(alt : Alt) -> Option Opened = match alt {
     ACon(_, _, opening) -> opening
     _ -> None
 }

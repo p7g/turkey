@@ -146,16 +146,19 @@ A local `fun` declaration or `let` binding is generalized only if it is
 **closed**: every variable it uses, other than those it defines itself, must
 be closed. A variable is closed if it is
 
-* defined at the top level or imported, or
+* defined at the top level or imported, except inside its own recursive
+  group: a top-level function without a signature is not closed in the
+  bodies of the functions it is defined together with, itself included, or
 * a local `fun` with a [signature](declarations.md#signatures) that mentions
   no type variable of the function around it, or
 * a local `fun` or `let` that was itself generalized, and whose type mentions
-  no type of the function around it.
+  no type variable of the function around it, or
+* a `let` that the value restriction keeps from being generalized, if every
+  variable it uses is closed and its type has no type variables.
 
-A parameter, a variable bound by a pattern, a `var`, a `do` binder, and a
-`let` that the value restriction keeps from being generalized are never
-closed. The value restriction applies as well: a closed `let` is generalized
-only if its right-hand side is a value.
+A parameter, a variable bound by a pattern, a `var` and a `do` binder are
+never closed. The value restriction applies as well: a closed `let` is
+generalized only if its right-hand side is a value.
 
 `show` is defined at the top level, so `describe` is closed and is generalized,
 and so is `both`, which uses only `describe`:
@@ -175,6 +178,25 @@ fun main() {
 1
 True
 2.5 and two
+```
+
+A `let` whose right-hand side is a call is not generalized, but when its
+type has no type variables there is nothing to generalize, and it is closed
+like any other. Here `suffix` is a `String`, so `tag` is generalized:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let suffix = show(1) + "!"
+    let tag = fun(v) = show(v) + suffix
+    print(tag(2))
+    print(tag(True))
+}
+```
+
+```text
+21!
+True1!
 ```
 
 A local binding that uses a parameter is not generalized. It has one type,
@@ -216,10 +238,13 @@ type of its own.
 
 > **For readers new to this.** A binding that uses a parameter can have the
 > parameter's type in its own type, and that type belongs to the function
-> around it. When that function's context has an [equality
+> around it, where inference may still be working it out. When that
+> function's context has an [equality
 > constraint](classes.md#equality-constraints), generalizing over such a type
-> can leave the binding with no single most general type. A closed binding's
-> type mentions nothing from around it, so generalizing it is always safe.
+> can leave the binding with no single most general type. A closed binding
+> shares no such undecided type with the function around it: its type can
+> mention one of that function's type variables only where an annotation
+> names it, and then the type is fixed. So generalizing it is always safe.
 > GHC calls this rule `MonoLocalBinds`.
 
 **Recursive groups.** Functions that call each other are inferred together,

@@ -139,6 +139,11 @@ type Constraint
     -- binder comes with its id and its name as the tree spells it. The flag
     -- says the binders are top-level.
     | CDef(Vec (Int, String, Ty.Type), Constraint, Bool)
+    -- `let x = C1 in C2` for a group that is not generalized: a `let` the
+    -- value restriction keeps monomorphic, or a `fun` declared monomorphic.
+    -- Solve the definition, then bind as `CDef` does. Unlike a `CDef`
+    -- binder, one bound here may be closed (`solveMonoLet`).
+    | CMonoLet(Constraint, Vec (Int, String, Ty.Type), Constraint, Bool)
     -- Bind binders to *schemes* already built, each with its id and spelling
     -- as in `CDef`. The one binder whose schemes
     -- solving does not discover: a `fun` with a complete annotation states its
@@ -340,6 +345,10 @@ type Solver = Solver {
     -- not closed, and whose types have variables generalization would have
     -- quantified.
     refusals        : Map Int Refusal,
+    -- The refusals whose later uses `checkRefusals` has yet to check.
+    var unchecked   : Vec Refusal,
+    -- The binders of the top-level group being solved.
+    var solving     : Set.Set Int,
 }
 
 -- A local binder that its group did not generalize, though the group's type
@@ -347,19 +356,25 @@ type Solver = Solver {
 --
 -- Its first use instantiates its one type as any monomorphic binder's does.
 -- Each later use instead gets a copy of that type with fresh variables for
--- `quantifiable`, and `checkRefused` equates each copy with the one type once
--- the binder's scope is solved. A use that needs the binder at a second type
--- is then reported as that, at the use, rather than as a mismatch inside
--- whichever expression meets the two types first.
+-- `quantifiable`, and `checkRefusals` equates each copy with the one type
+-- once the enclosing generalizing group's definition is solved and settled,
+-- which is when everything that rank will learn about the uses is known. A
+-- use that needs the binder at a second type is then reported as that, at
+-- the use, rather than as a mismatch inside whichever expression meets the
+-- two types first.
 type Refusal = Refusal {
     -- The binder as the tree spells it.
     name         : String,
     -- A variable the group uses that is not closed.
     because      : String,
+    -- What to suggest, after a semicolon, or "".
+    fix          : String,
     -- The binder's one type.
     bound        : Ty.Type,
-    -- The variables of `bound` that generalization would have quantified,
-    -- unbound when the binder was bound.
+    -- `bound` as it was when the binder was bound (`snapshot`), with
+    -- `quantifiable` unbound in it.
+    template     : Ty.Type,
+    -- The variables of `bound` that generalization would have quantified.
     quantifiable : Vec VarCell,
     -- The rank `quantifiable` belongs to, where the copies are born.
     level        : Int,
@@ -379,7 +394,8 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
         entered = 0, wanteds = None,
         scopes = Vec.new(4), uses = Vec.new(16),
         pools = [Vec.new(8)], deferred = Vec.new(8),
-        open = Map.new(), refusals = Map.new(),
+        open = Map.new(), refusals = Map.new(), unchecked = Vec.new(4),
+        solving = Set.new(),
     }
 
 -- The two operations unification needs from the solver, as the record
@@ -478,6 +494,9 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
 fun run(s : Solver, c : Constraint) -> Unit {
     solve(s, c)
     settle(s)
+    -- A refusal made at the outermost rank, in a top-level `let` the value
+    -- restriction keeps monomorphic, has no group of its own to check it.
+    if checkRefusals(s, 0) { settle(s) }
     -- What is left open after an error is most often open because of it, so
     -- defaulting it would only guess, and `rejectStranded` reports nothing.
     if Diag.hasErrors() { return }
@@ -593,6 +612,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         solve(s, body)
         if !top { for (id, _, _) in binds { unbind(s.env, id) } }
     }
+    CMonoLet(defn, binds, body, top) -> solveMonoLet(s, defn, binds, body, top)
     CBind(binds, body, top) -> {
         for (id, name, sch) in binds {
             bindFor(s, id, name, Binding { scheme = sch, mutable = top }, top)
@@ -732,8 +752,12 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
 -- `MonoLocalBinds`. Under a local equality given, generalizing a binding
 -- over a type from its surroundings loses principal types (Vytiniotis,
 -- Peyton Jones and Schrijvers, "Let should not be generalised", TLDI 2010).
--- A closed group's type mentions nothing from its surroundings, so
--- generalizing it is safe under any given. The rule applies everywhere, not
+-- A closed group shares no variable with its surroundings that solving may
+-- still bind there: the binders it uses have fully general schemes, so what
+-- its type takes from around it is at most a rigid type an annotation in it
+-- names, or the type of a top-level binding. Every variable it would
+-- quantify is its own, so generalizing it is safe under any given. The rule
+-- applies everywhere, not
 -- only under an equality given, so that adding an equality to a signature
 -- cannot change how the body's locals are typed. A group that is
 -- not closed is solved where it stands, at the enclosing rank, as a `let`
@@ -746,7 +770,12 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
 -- of its own is a signature being checked, and its type is rigid anyway.
 fun solveLet(s : Solver, c : LetCell) -> Unit {
     let free = Vec.new(2)
-    if !c.topLevel { openRefs(c.defn, s.open, free) }
+    if c.topLevel {
+        s.solving = Set.new()
+        for (id, _, _) in c.binds { Set.add(s.solving, id) }
+    } else {
+        openRefs(c.defn, s.open, free)
+    }
     let named = Iterator.any(c.binds, fun((id, _, _)) = id != noBinder)
     if len(free) > 0 && named && len(c.rigid) == 0 { return monoLet(s, c, free) }
     Vec.push(s.pools, Vec.new(8))
@@ -793,26 +822,68 @@ fun monoLet(s : Solver, c : LetCell, free : Vec Int) -> Unit {
         -- The variables a generalized group would have quantified.
         let quantifiable = Vec.filter(Ty.varsOf([ty]), fun(v) =
             v.level >= rank(s) && !Set.contains(outer, v.id))
-        if len(quantifiable) > 0 {
-            Map.put(s.refusals, id, Refusal {
-                name = name, because = because, bound = ty,
-                quantifiable = quantifiable, level = rank(s), used = False,
-                later = Vec.new(2),
-            })
+        if len(quantifiable) == 0 { continue }
+        -- A top-level function used inside its own recursive group is not
+        -- closed only because its type is still being inferred, and its
+        -- signature is what fixes that.
+        let fix = if Set.contains(s.solving, free[0]) {
+            "; give '" + because + "' a signature"
+        } else {
+            match Ty.prune(ty) {
+                TFun(_, _) -> "; write '" + name + "' as a 'fun' with a signature"
+                _ -> ""
+            }
         }
+        let r = Refusal {
+            name = name, because = because, fix = fix, bound = ty,
+            template = snapshot(ty), quantifiable = quantifiable, level = rank(s),
+            used = False, later = Vec.new(2),
+        }
+        Map.put(s.refusals, id, r)
+        Vec.push(s.unchecked, r)
     }
     solve(s, c.body)
-    -- Settled first, so that what the uses learned through a predicate, such
-    -- as a projection's type, is in the copies the check compares.
-    let later = Iterator.any(c.binds, fun((id, _, _)) = match Map.get(s.refusals, id) {
-        Some(r) -> len(r.later) > 0
-        None -> False
-    })
-    if later { settle(s) }
-    for (id, _, _) in c.binds {
-        if let Some(r) = Map.get(s.refusals, id) { checkRefused(s, r) }
-        unbind(s.env, id)
+    for (id, _, _) in c.binds { unbind(s.env, id) }
+}
+
+-- Solves `let x = defn in body` for a group the generator does not
+-- generalize. Its binders are bound monomorphically, as by `CDef`, and are
+-- closed if every variable the definition uses is closed and their types
+-- mention no type variable: generalizing such a type would change nothing,
+-- so the binding is as good as fully generalized.
+fun solveMonoLet(s : Solver, defn : Constraint, binds : Vec (Int, String, Ty.Type),
+                 body : Constraint, top : Bool) -> Unit {
+    let free = Vec.new(2)
+    if !top { openRefs(defn, s.open, free) }
+    solve(s, defn)
+    if top { decideTopLevelLiterals(s) }
+    for (id, name, ty) in binds {
+        bindFor(s, id, name, Binding { scheme = Ty.mono(ty), mutable = top }, top)
+        if id == noBinder { continue }
+        -- A monomorphic `fun` group's placeholders are in `open` from its
+        -- definition; a top-level binder is closed.
+        if top || len(free) == 0 && fullyGeneral(Ty.mono(ty)) {
+            let _ = Map.delete(s.open, id)
+        } else {
+            Map.put(s.open, id, name)
+        }
     }
+    solve(s, body)
+    if !top { for (id, _, _) in binds { unbind(s.env, id) } }
+}
+
+-- Returns `t` with every variable bound by now replaced by what it stands
+-- for, at every depth. Later unification cannot reach into the result's
+-- structure, only bind the variables still in it.
+fun snapshot(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
+    TVar(cell) -> TVar(cell)
+    TCon(con) -> TCon(con)
+    TApp(f, a, k) -> TApp(snapshot(f), snapshot(a), k)
+    TFam(name, a, k) -> TFam(name, snapshot(a), k)
+    TFun(params, ret) -> TFun(Array.map(params, snapshot), snapshot(ret))
+    TTuple(elems) -> TTuple(Array.map(elems, snapshot))
+    TSet(names) -> TSet(names)
+    TBottom -> TBottom
 }
 
 -- Returns the type a use of the refused binder `r`, whose one type is
@@ -828,7 +899,7 @@ fun refusedUse(s : Solver, r : Refusal, bound : Ty.Type, where : Option Span) ->
         Vec.push(s.pools[r.level], copy)
         Map.put(fresh, v.id, TVar(copy))
     }
-    let copy = copied(bound, fresh)
+    let copy = copied(r.template, fresh)
     Vec.push(r.later, (copy, where))
     copy
 }
@@ -838,6 +909,8 @@ fun refusedUse(s : Solver, r : Refusal, bound : Ty.Type, where : Option Span) ->
 -- A variable is looked up before it is pruned, unlike in `Ty.instantiate`.
 -- Earlier uses may have bound a variable `fresh` replaces, and the copy has
 -- to be of the type the binder was bound at, not of what those uses made it.
+-- `t` is a `snapshot`, so every variable `fresh` replaces is reached: pruning
+-- elsewhere cannot have compressed a path past one.
 fun copied(t : Ty.Type, fresh : Map Int Ty.Type) -> Ty.Type = match t {
     TVar(cell) -> match Map.get(fresh, cell.id) {
         Some(replacement) -> replacement
@@ -861,24 +934,38 @@ fun copied(t : Ty.Type, fresh : Map Int Ty.Type) -> Ty.Type = match t {
 fun quantifiableNow(r : Refusal) -> Vec VarCell =
     Vec.filter(Ty.varsOf(Array.map(Vec.toArray(r.quantifiable), TVar)), _.level >= r.level)
 
--- Equates each later use of the refused binder `r` with its one type, and
--- reports a use that needs another type.
-fun checkRefused(s : Solver, r : Refusal) -> Unit {
-    for (copy, where) in r.later {
-        if !clashes(s, copy, r.bound) {
-            Ty.unify(copy, r.bound, where, "", families(s))
+-- Checks the refusals made at `level` or deeper, and returns whether any
+-- had a later use. Each later use is equated with its binder's one type, and
+-- one that needs another type is reported.
+fun checkRefusals(s : Solver, level : Int) -> Bool {
+    var any = False
+    let keep = Vec.new(len(s.unchecked))
+    for r in s.unchecked {
+        if r.level < level {
+            Vec.push(keep, r)
             continue
         }
-        let fix = match Ty.prune(r.bound) {
-            TFun(_, _) -> "; write '" + r.name + "' as a 'fun' with a signature"
-            _ -> ""
+        for (copy, where) in r.later {
+            any = True
+            if !clashes(s, copy, r.bound) {
+                Ty.unify(copy, r.bound, where, "", families(s))
+                continue
+            }
+            -- The other type is not shown, and this one only when it is
+            -- decided: a numeric literal's type is still open, and would read
+            -- as a type variable.
+            let at = if len(Ty.varsOf([copy])) == 0 {
+                " at a second type, '" + Ty.show(copy) + "',"
+            } else {
+                " at a second type,"
+            }
+            Ty.typeError("'" + r.name + "' is used here" + at + " but it cannot be "
+                         + "polymorphic because it uses '" + r.because + "'" + r.fix,
+                         where)
         }
-        -- The other type is not shown: a numeric literal's is still open
-        -- here, and would read as a type variable.
-        Ty.typeError("'" + r.name + "' is used here at a second type, '" + Ty.show(copy)
-                     + "', but it cannot be polymorphic because it uses '" + r.because
-                     + "'" + fix, where)
     }
+    s.unchecked = keep
+    any
 }
 
 -- Returns whether `a` and `b` differ where no unification could make them
@@ -946,6 +1033,10 @@ fun openRefs(c : Constraint, open : Map Int String, out : Vec Int) -> Unit = mat
     CAnd(parts) -> for p in parts { openRefs(p, open, out) }
     CExists(_, body) -> openRefs(body, open, out)
     CDef(_, body, _) -> openRefs(body, open, out)
+    CMonoLet(defn, _, body, _) -> {
+        openRefs(defn, open, out)
+        openRefs(body, open, out)
+    }
     CBind(_, body, _) -> openRefs(body, open, out)
     CLet(cell) -> {
         openRefs(cell.defn, open, out)
@@ -978,6 +1069,7 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     solve(s, c.defn)
     discard(Vec.pop(s.scopes))
     settle(s)
+    if checkRefusals(s, rank(s)) { settle(s) }
     confine(s, c.skolems)
     let types = Array.map(c.binds, _.2)
     let retainedPreds = split(s, types)

@@ -138,14 +138,15 @@ explain themselves at the top.
 `build -g` adds a line table and the DWARF a debugger needs to find it: a
 compile unit for the program and an entry for each function. It changes no
 code: a program built with `-g` runs the same instructions as one built
-without. For now `-g` writes assembly only, so assemble it with DWARF 5,
-which is what the compile unit is:
+without. It works for an object and for assembly alike:
 
 ```sh
-build/stages/stage2 build -g -o rectangles.s rectangles.gob
-cc -gdwarf-5 -c rectangles.s -o rectangles.o
+build/stages/stage2 build -g -o rectangles.o rectangles.gob
 cc -o rectangles rectangles.o
 ```
+
+Assembly written with `-g` needs the assembler to build the line table, in
+DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
 
 On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
 object and writes only a map to it into the executable, which is how lldb and

@@ -11,7 +11,10 @@ export (objectFile)
 -- ones as global, the rest as local -- so that `nm` and `perf` name every
 -- function. A temporary label never is: a relocation that refers to one
 -- refers instead to its section's symbol, with the label's offset in the
--- section as the addend, which an ELF relocation carries in the record.
+-- section as the addend, which an ELF relocation carries in the record. So
+-- does an offset from one debug section into another, whatever its target:
+-- the linker joins each debug section's pieces from every object, and the
+-- offset has to move with its piece.
 --
 -- The panic messages and the string literals are two sections that are both
 -- called `.rodata`; the linker gathers input sections by name, so they end up
@@ -52,6 +55,7 @@ fun names(kind : Asm.Section) -> (String, Int) = match kind {
     Asm.DebugInfo -> (".debug_info", 0)
     Asm.DebugStr -> (".debug_str", 0)
     Asm.DebugLine -> (".debug_line", 0)
+    Asm.DebugLineStr -> (".debug_line_str", 0)
 }
 
 -- One section header: name, type, flags, offset in the file, size, link,
@@ -103,10 +107,12 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
             pad(out, alignUp(len(out), 8))
             let at = len(out)
             for r in s.relocations {
-                let (symbol, addend) = match (r.target.kind, Map.get(definitions, Asm.spell(r.target))) {
+                let (symbol, addend) = match (r.use, r.target.kind,
+                                              Map.get(definitions, Asm.spell(r.target))) {
                     -- A section's symbol is entry `section + 1`, after the
                     -- empty first entry.
-                    (Temporary, Some(d)) -> (d.section + 1, d.offset)
+                    (Offset32, _, Some(d)) -> (d.section + 1, d.offset)
+                    (_, Temporary, Some(d)) -> (d.section + 1, d.offset)
                     _ -> (Map.getOr(indices, r.target.name, 0), 0)
                 }
                 le(out, 8, r.offset)
@@ -224,6 +230,7 @@ fun symbols(obj : Object Fixup) -> (Vec Entry, Int) {
 -- AArch64's relocation types.
 fun relocationKind(use : Use Fixup) -> Int = match use {
     Address64 -> 257
+    Offset32 -> 258
     Code(Call26(_)) -> 283
     Code(Jump26(_)) -> 282
     Code(Branch19(_)) -> 280

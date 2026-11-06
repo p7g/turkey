@@ -27,7 +27,9 @@ export (locate)
 -- width, so that a debugger reads the slots as one structure
 -- (`Turkey.DebugTypes`). Such a variable is somewhere only where every one
 -- of its slots is: a debugger shows an empty piece as zero, which would be a
--- value the program never had.
+-- value the program never had. A slot that only ever holds one constant is
+-- that constant everywhere, though no register may hold it: a sum's slots
+-- that its constructor does not use are zero.
 --
 -- A slot is addressed from the frame base, `x29`, which the prologue sets
 -- before any range starts, at its offset in `Turkey.Frame`'s layout less the
@@ -41,7 +43,7 @@ export (locate)
 import Data.BitSet as BitSet
 import Data.Map as Map
 import Turkey.Arm64 as A
-import Turkey.Arm64 (Bank(..), Mem(..))
+import Turkey.Arm64 (Bank(..), Mem(..), Reg(..), Arm(..))
 import Turkey.Asm as Asm
 import Turkey.Dwarf as Dwarf
 import Turkey.Emit as Emit
@@ -109,6 +111,7 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
     -- value.
     let ranges : Array (Array (Vec Range)) = Array.map(f.variables, fun(v) =
         Array.init(pieceCount(v), fun(_) = []))
+    let constants = slotConstants(f, a, ranges)
     let labeled = fun(id) = len(Ssa.holding(f, origin[id])) > 0
                             && f.reps[id].class_ != Unit
     for b in order {
@@ -199,7 +202,7 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
         let locations = []
         let whole = if len(ranges[k]) == 1 { clipped(ranges[k][0]) }
                     else { pieced(Array.map(ranges[k], clipped),
-                                  Array.map(v.layout.slots, Rt.fieldWidth)) }
+                                  Array.map(v.layout.slots, Rt.fieldWidth), constants[k]) }
         for r in merged(whole, f) {
             Vec.push(locations, Dwarf.Location {
                 low = mark(d, tag, marks, r.lowBlock, r.low),
@@ -274,16 +277,67 @@ fun clipped(ranges : Vec Range) -> Vec Range {
     out
 }
 
+-- For each variable held in slots apart, and each slot, the location of the
+-- one constant every value holding the slot is, if there is one: the
+-- constant as the value of the expression rather than where it is.
+fun slotConstants(f : Func A.Inst, a : Regalloc.Allocation,
+                  ranges : Array (Array (Vec Range))) -> Array (Array (Option Int)) {
+    let defined = Map.new()
+    for block in f.blocks {
+        for i in block.insts {
+            if let Some((d, n)) = constantOf(i.op) { Map.put(defined, d, n) }
+        }
+    }
+    for (id, op) in Map.entries(a.spills.remat) {
+        if let Some((_, n)) = constantOf(op) { Map.put(defined, id, n) }
+    }
+    -- `None` before any value is seen, `Some(Some(n))` while every one is
+    -- the constant `n`, and `Some(None)` once one is not.
+    let seen : Array (Array (Option (Option Int))) =
+        Array.map(ranges, fun(pieces) = Array.filled(len(pieces), None))
+    for (id, held) in Map.entries(f.holds) {
+        for (k, slot) in held {
+            if slot >= 0 && len(seen[k]) > 1 && slot < len(seen[k]) {
+                let here = Map.get(defined, id)
+                seen[k][slot] = match seen[k][slot] {
+                    None -> Some(here)
+                    Some(Some(n)) -> if here == Some(n) { Some(Some(n)) } else { Some(None) }
+                    Some(None) -> Some(None)
+                }
+            }
+        }
+    }
+    Array.map(seen, fun(slots) = Array.map(slots, fun(s) = match s {
+        Some(Some(n)) -> Some(n)
+        _ -> None
+    }))
+}
+
+-- The value an instruction defines and the constant it is, if it defines a
+-- constant: a `MovConst`, or a zero of either file.
+fun constantOf(op : A.Arm) -> Option (Int, Int) = match op {
+    MovConst(Virtual(d), n) -> Some((d, n))
+    Mov(Virtual(d), Physical(Gp, 31), _) -> Some((d, 0))
+    FMovIn(Virtual(d), Physical(Gp, 31)) -> Some((d, 0))
+    _ -> None
+}
+
+-- `DW_OP_consts n DW_OP_stack_value`: the constant `n` itself.
+fun constant(n : Int) -> Array Int =
+    Array.append(Array.append([Dwarf.opConsts], Dwarf.slebBytes(n)), [Dwarf.opStackValue])
+
 -- How many slots variable `v` is held in apart: one if it is held as one
 -- value, its box included.
 fun pieceCount(v : Ssa.Variable) -> Int =
     if v.boxed || len(v.layout.slots) <= 1 { 1 } else { len(v.layout.slots) }
 
 -- The ranges of a variable held in several slots, from each slot's ranges,
--- clipped, and the slots' widths: a range for each stretch between two ends
--- of any slot's ranges where every slot is somewhere, whose location is each
--- slot's location there, as a piece of its width.
-fun pieced(slots : Array (Vec Range), widths : Array Int) -> Vec Range {
+-- clipped, the slots' widths, and the constant each slot always holds, if it
+-- does: a range for each stretch between two ends of any slot's ranges where
+-- every slot is somewhere or a constant, whose location is each slot's
+-- location there, as a piece of its width.
+fun pieced(slots : Array (Vec Range), widths : Array Int,
+           constants : Array (Option Int)) -> Vec Range {
     -- Every end, by its key, as its block and point.
     let ends = Map.new()
     for rs in slots {
@@ -305,6 +359,12 @@ fun pieced(slots : Array (Vec Range), widths : Array Int) -> Vec Range {
             for r in slots[j] {
                 if !found && r.from <= from && to <= r.to {
                     for byte in r.expression { Vec.push(expression, byte) }
+                    found = True
+                }
+            }
+            if !found {
+                if let Some(n) = constants[j] {
+                    for byte in constant(n) { Vec.push(expression, byte) }
                     found = True
                 }
             }

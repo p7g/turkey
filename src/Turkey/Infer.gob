@@ -20,7 +20,7 @@ export (
 -- back its result whether or not the receiver is known.
 --
 -- Which instance a method call means is *not* decided here. Each occurrence is
--- marked with a `Use` for elaboration to fill in later, because the answer
+-- marked with a `Use` for the solver to fill in later, because the answer
 -- depends on what solving decides the name's predicates are about.
 --
 -- Variables invented here have no rank: generation has no idea what binder depth
@@ -48,7 +48,7 @@ import Turkey.Inert as Inert
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
-import Turkey.Solved (Abstraction(..), Use(..), newAbstraction, newUse, dictName)
+import Turkey.Solved (Abstraction(..), Use(..), newAbstraction, newUse, newHole, dictName)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
@@ -852,7 +852,7 @@ fun declaredScheme(g : Generator,
     -- variable the type does not reach can never be decided by a use site,
     -- because there is nothing at a use site to decide it with.
     let cells = Array.map(preds, fun(p) =
-        PredCell { pred = p, span = Some(decl.span), context = "read" })
+        PredCell { pred = p, span = Some(decl.span), context = "read", hole = newHole() })
     let ids = C.reach(cells, [body])
     -- Blamed in the names the signature wrote, not in the letters printing would
     -- invent: the whole point of a declared type is that it is the programmer's
@@ -1658,7 +1658,7 @@ fun genExpr(g : Generator, e : Expr) -> Ty.Type {
 -- `name <= t` for a fresh `t`. No lookup: that is the solver's job.
 --
 -- A `Use` rides along when there is an occurrence to attach it to, so that
--- elaboration has somewhere to put the evidence this site turns out to need.
+-- the solver has somewhere to put the evidence this site turns out to need.
 -- What that is cannot be known here -- it depends on what the solver decides the
 -- name's predicates are about -- which is why the site is marked rather than
 -- resolved.
@@ -1907,7 +1907,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
 
 -- A constructor's type at a use: an existential with a context is used like a
 -- constrained function, so its predicates are wanted here and the `Use` its node
--- carries is where elaboration puts the dictionaries.
+-- carries is where the solver puts the evidence for them.
 fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
     let info = match Decls.con(g.decls, name) {
         Some(i) -> i
@@ -2106,15 +2106,19 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             discard(Classes.ensureGenerated(g.classes, cls))
             let u = newUse(cls, None, Some(e.span), None)
             let reads = Ty.pred(cls, [receiver])
+            let readHole = newHole()
             Vec.push(u.preds, reads)
-            emit(g, C.cpredOf(reads, Some(e.span),
+            Vec.push(u.holes, readHole)
+            emit(g, C.cpredInto(reads, readHole, Some(e.span),
                 if assigning { "assign to" } else { "read" }))
             if assigning {
                 let setter = Classes.setterClass(name)
                 discard(Classes.ensureGenerated(g.classes, setter))
                 let writes = Ty.pred(setter, [receiver])
+                let writeHole = newHole()
                 Vec.push(u.preds, writes)
-                emit(g, C.cpredOf(writes, Some(e.span), "assign to"))
+                Vec.push(u.holes, writeHole)
+                emit(g, C.cpredInto(writes, writeHole, Some(e.span), "assign to"))
             }
             Map.put(g.types.uses, e.id, u)
             emit(g, CUse(u))

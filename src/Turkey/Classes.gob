@@ -8,7 +8,7 @@ export (
     registerAll, resolveContext,
     reduceFam, normalize,
     uncovered,
-    bySuper, byInst, entail, isClass, method, simplify,
+    bySuper, byInst, selectInstance, entail, prove, superPath, isClass, method, simplify,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -93,10 +93,13 @@ type Evidence
     -- looking its type up later by generated name is fragile when evidence is
     -- completed away from a use site.
     = FromDict(String, Array String, Option Pred)
-    -- The dictionary of an instance, given evidence for that instance's
-    -- context. `instance Semigroup (Array a)` is a *function* from a
-    -- `Semigroup a` dictionary to a `Semigroup (Array a)` one.
-    | FromInstance(InstInfo, Array Evidence)
+    -- The dictionary of an instance at the class argument it was selected
+    -- for, given evidence for that instance's context. `instance Semigroup
+    -- (Array a)` is a *function* from a `Semigroup a` dictionary to a
+    -- `Semigroup (Array a)` one. The type is the one the head was matched
+    -- against, after the solver rewrote it by the equalities in scope: `Add
+    -- Int` for a demand `Add (Elem a)` under `Elem a ~ Int`.
+    | FromInstance(InstInfo, Ty.Type, Array Evidence)
     -- A predicate whose argument is bottom, and so has no instance to find. The
     -- mirror of the same rule in the solver: bottom is absorbed by whatever it
     -- meets, so there is no type to look up and no value that would ever ask
@@ -1444,7 +1447,12 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
     Some(inst)
 }
 
-fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) {
+fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) =
+    Option.map(selectInstance(t, p), _.1)
+
+-- Returns the instance that covers `p` and its context at `p`'s argument, or
+-- `None` if no instance does.
+fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Array Pred) {
     if isGenerated(p.name) {
         let _ = synthesize(t, p)
     }
@@ -1453,30 +1461,54 @@ fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) {
     }
     for inst in instancesOf(t, p.name) {
         if let Some(mapping) = match_(inst.head, p.args[0]) {
-            return Some(Array.map(inst.context, fun(q) =
-                Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)])))
+            return Some((inst, Array.map(inst.context, fun(q) =
+                Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)]))))
         }
     }
     None
 }
 
--- Does `given` prove `p`? Superclasses first, then the instance table.
+-- Returns whether `given` proves `p`, by `prove`.
 fun entail(t : ClassTable, given : Vec Pred, p : Pred) -> Bool {
+    let named = Vec.new(len(given))
+    for g in given { Vec.push(named, ("", g)) }
+    Option.isSome(prove(t, named, p))
+}
+
+-- Returns the evidence that the dictionaries `given`, each under its name,
+-- prove `p` with: a given reached through superclasses first, then an
+-- instance. Returns `None` if they do not prove it.
+--
+-- Entailment as THIH has it, with no families and no equalities. It serves an
+-- instance declaration, whose head and context are constructors applied to
+-- variables and whose context has no equality, so there is nothing to rewrite.
+fun prove(t : ClassTable, given : Vec (String, Pred), p : Pred) -> Option Evidence {
     let key = Ty.predKey(p)
-    for a in given {
-        for q in bySuper(t, a) {
-            if Ty.predKey(q) == key { return True }
+    for (name, g) in given {
+        if let Some(path) = superPath(t, g, key, []) {
+            return Some(FromDict(name, path, Some(g)))
         }
     }
-    match byInst(t, p) {
-        None -> False
-        Some(qs) -> {
-            for q in qs {
-                if !entail(t, given, q) { return False }
-            }
-            True
+    let (inst, obligations) = selectInstance(t, p)?
+    let args = Vec.new(len(obligations))
+    for q in obligations { Vec.push(args, prove(t, given, q)?) }
+    Some(FromInstance(inst, p.args[0], Vec.toArray(args)))
+}
+
+-- Returns the superclass names to select, in order, to reach the predicate
+-- whose key is `key` from `given`, or `None` if no chain of superclasses does.
+-- `path` is the chain already walked.
+fun superPath(t : ClassTable, given : Pred, key : String,
+              path : Array String) -> Option (Array String) {
+    if Ty.predKey(given) == key { return Some(path) }
+    let info = Map.get(t.classes, given.name)?
+    for sup in info.supers {
+        if let Some(found) = superPath(t, Ty.pred(sup.name, given.args), key,
+                                       Array.append(path, [sup.name])) {
+            return Some(found)
         }
     }
+    None
 }
 
 fun isClass(t : ClassTable, name : String) -> Bool = Map.contains(t.classes, name)

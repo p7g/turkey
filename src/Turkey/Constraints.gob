@@ -1,6 +1,6 @@
 export (
     oneOf,
-    Constraint(..), Instantiates(..), PredCell(..), LetCell(..), cpredOf,
+    Constraint(..), Instantiates(..), PredCell(..), LetCell(..), cpredOf, cpredInto,
     noBinder,
     Binding(..), Env(..), newEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
@@ -49,6 +49,16 @@ export (
 -- method against its class's signature is the one place a predicate is *granted*
 -- rather than proved, because the signature said so.
 --
+-- **Evidence is fixed when a class predicate is solved.** Each wanted carries
+-- a hole (`Solved.Hole`), and the rule that discharges it fills the hole with
+-- the derivation it used, at the types and under the givens it used them:
+-- `classRule` for a given, an instance or bottom, and `letBody` for a
+-- predicate a binding group retains as one of its dictionary parameters.
+-- Nothing after solving looks a predicate up again, so no later pass can find
+-- a different dictionary from the one solving accepted (Schrijvers et al.,
+-- "Type checking with open type functions", ICFP 2008, §5; GHC's evidence
+-- bindings).
+--
 -- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
 -- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
 -- carries the skolems, so the implication's level is that `CLet`'s rank. Two
@@ -94,7 +104,8 @@ import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Inert as Inert
 import Turkey.Inert (Given(..), Refusal(..))
-import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
+import Turkey.Solved (Scope(..), Abstraction(..), Use(..), Hole(..), Proof(..), dictName,
+                      newScope, newHole)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
@@ -156,12 +167,11 @@ type Constraint
     -- environment at all. The name is the occurrence's spelling, for
     -- diagnostics.
     | CInstance(String, Ty.Type, Option Span, Option Use, Instantiates)
-    -- A site whose predicates were emitted on their own, as `CPred`s, but whose
-    -- lowering needs the dictionaries that prove them. Solving it demands
-    -- nothing; it records which scopes are open here, which is what elaboration
-    -- resolves the `Use`'s predicates against. A field access is one: its
-    -- predicates carry the verb a diagnostic needs, and a use emitted through
-    -- `CInstance` would re-emit them as reads.
+    -- A site whose predicates were emitted on their own, as `CPred`s sharing
+    -- the `Use`'s holes, but whose lowering needs the dictionaries that prove
+    -- them. Solving it demands nothing; it records the use and the scopes open
+    -- here. A field access is one: its predicates carry the verb a diagnostic
+    -- needs, and a use emitted through `CInstance` would re-emit them as reads.
     | CUse(Use)
     -- Solve the body as one unit of diagnostics (`Diag.beginUnit`): after its
     -- first error, the rest of what it reports is dropped. The generator puts
@@ -174,10 +184,17 @@ type PredCell = PredCell {
     var pred : Pred,
     span     : Option Span,
     context  : String,
+    -- Where the evidence for a class predicate goes once it is discharged.
+    -- Unused for any other predicate.
+    hole     : Hole,
 }
 
 fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
-    CPred(PredCell { pred = p, span = where, context = context })
+    cpredInto(p, newHole(), where, context)
+
+-- Returns the constraint that `p` holds, with its evidence to go into `hole`.
+fun cpredInto(p : Pred, hole : Hole, where : Option Span, context : String) -> Constraint =
+    CPred(PredCell { pred = p, span = where, context = context, hole = hole })
 
 -- What a `CInstance` instantiates.
 type Instantiates
@@ -261,9 +278,10 @@ type Solver = Solver {
     -- in: a component of modules is solved in one run, and each of its
     -- modules sees its own.
     visibleCons     : fun(Option Span) -> Set.Set String,
-    -- The class predicates a `CAssume` currently grants. A stack in effect,
-    -- restored on the way out of each one.
-    var assumptions : Vec Pred,
+    -- The class predicates a `CAssume` currently grants, each under the name
+    -- of its dictionary. A stack in effect, restored on the way out of each
+    -- one.
+    var assumptions : Vec (String, Pred),
     -- The equalities the `CAssume`s in scope grant, canonical. Restored on the
     -- way out of each one, which is what keeps a given inside its implication.
     var inert       : Inert.Inert,
@@ -367,7 +385,7 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
                 -- It is not: the declaration assumed that instance, and which
                 -- one it will be is the caller's business. Such an equation is
                 -- merely stuck, and is reported as stuck.
-                Some(missing) -> if !granted(s, missing) {
+                Some(missing) -> if Option.isNone(granted(s, missing)) {
                     return Ty.typeError("no instance for '" + Ty.showPred(missing)
                                         + "', which '" + Ty.show(t) + "' needs", where)
                 }
@@ -384,6 +402,7 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     let right = if flip { left0 } else { right0 }
     Vec.push(s.deferred, PredCell {
         pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
+        hole = newHole(),
     })
 }
 
@@ -437,7 +456,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
                 Vec.push(equalities, Given { pred = p, span = at })
                 if rank(s) > s.untouchable { s.untouchable = rank(s) }
             } else {
-                Vec.push(s.assumptions, p)
+                Vec.push(s.assumptions, (n, p))
             }
         }
         -- The inert set this implication made, if it made one: only that one
@@ -565,10 +584,15 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
             -- Only the class predicates: `HasField` and `OneOf` are discharged
             -- by a lookup and a decision, and leave nothing behind to pass.
             let kept = Vec.new(len(preds))
+            let holes = Vec.new(len(preds))
             for p in preds {
-                if Classes.isClass(s.classes, p.name) { Vec.push(kept, p) }
+                if Classes.isClass(s.classes, p.name) {
+                    Vec.push(kept, p)
+                    Vec.push(holes, newHole())
+                }
             }
             u.preds = kept
+            u.holes = holes
             -- Every type argument, though, and unfiltered: a type application
             -- has to name one per quantified variable or it is not the scheme's
             -- instantiation. They are recorded before unification has run to
@@ -581,7 +605,20 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
         None -> {}
     }
     let context = "the context of '" + Ty.shortName(name) + "'"
-    for p in preds { solve(s, cpredOf(p, where, context)) }
+    -- A class predicate's evidence goes into the hole the use reads it from.
+    var k = 0
+    for p in preds {
+        let hole = match use {
+            Some(u) -> if Classes.isClass(s.classes, p.name) {
+                k = k + 1
+                u.holes[k - 1]
+            } else {
+                newHole()
+            }
+            None -> newHole()
+        }
+        solve(s, cpredInto(p, hole, where, context))
+    }
 }
 
 -- Solve the definition one rank in, generalize, then solve the body.
@@ -639,9 +676,18 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     let shared = Classes.simplify(s.classes, classPreds)
     let givens = Vec.new(len(shared))
     for p in shared { Vec.push(givens, (dictName(p.name), p)) }
+    -- A retained class predicate is discharged by the dictionary parameter
+    -- that carries it, or by a superclass of one: `simplify` keeps a
+    -- predicate unless another implies it.
+    for p in retainedPreds {
+        if Classes.isClass(s.classes, p.pred.name) {
+            p.hole.proof = Some(fromContext(s, givens, p))
+        }
+    }
     -- The scope holds the retained equalities too, though they pass no
-    -- dictionary: a class predicate in the body may have been discharged under
-    -- one (`waiting`), and its evidence has to be found under the same.
+    -- dictionary: a scrutinee in the body may be a family application that
+    -- only one of them decides, and exhaustiveness reads it under the same
+    -- (`Infer.resolveUnder`).
     let scopeGivens = Vec.slice(givens, 0, len(givens))
     for p in retainedPreds {
         if p.pred.name == Ty.equals { Vec.push(scopeGivens, ("", p.pred)) }
@@ -662,6 +708,8 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
             }
             if len(u.preds) == 0 && inGroup && holdsScope(u.scopes, scope) {
                 u.preds = shared
+                u.holes = Vec.map(givens, fun((name, p)) =
+                    Hole { proof = Some(ByGiven(name, [], p)) })
             }
         }
     }
@@ -707,6 +755,19 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     }
     solve(s, c.body)
     if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
+}
+
+-- Returns the evidence for the retained predicate `c` from `givens`, the
+-- dictionary parameters of the binding group that retained it.
+fun fromContext(s : Solver, givens : Vec (String, Pred), c : PredCell) -> Proof {
+    let key = Ty.predKey(c.pred)
+    for (name, g) in givens {
+        if let Some(path) = Classes.superPath(s.classes, g, key, []) {
+            return ByGiven(name, path, g)
+        }
+    }
+    bug("the context of a binding group does not imply '" + Ty.showPred(c.pred)
+        + "', which it retained", c.span)
 }
 
 -- A partial annotation is an assertion too: each variable its header wrote must
@@ -1002,20 +1063,23 @@ fun discharging(s : Solver, t : Ty.Type) -> Ty.Type = match s.wanteds {
     None -> Inert.rewrite(s.inert, t)
 }
 
--- Is this a fact the enclosing declaration already assumed?
+-- Returns the evidence for `p` from a fact the enclosing declarations already
+-- assumed, the innermost first, or `None` if none of them grants it.
 --
--- Both sides are normalized before they are compared, since an assumption is
+-- Both sides are rewritten before they are compared, since an assumption is
 -- written down and a demand is discovered, and the two may name the same type by
--- different routes.
-fun granted(s : Solver, p : Pred) -> Bool {
+-- different routes: `Ord (Item a)` is granted by `Ord (Index.Value a)` under
+-- `Item a ~ Index.Value a`.
+fun granted(s : Solver, p : Pred) -> Option Proof {
     let key = Ty.predKey(Ty.pred(p.name, [discharging(s, p.args[0])]))
-    for a in s.assumptions {
-        for q in Classes.bySuper(s.classes, a) {
-            let qk = Ty.predKey(Ty.pred(q.name, [discharging(s, q.args[0])]))
-            if qk == key { return True }
+    for var i = len(s.assumptions) - 1; i >= 0; i = i - 1 {
+        let (name, a) = s.assumptions[i]
+        let seen = Ty.pred(a.name, [discharging(s, a.args[0])])
+        if let Some(path) = Classes.superPath(s.classes, seen, key, []) {
+            return Some(ByGiven(name, path, a))
         }
     }
-    False
+    None
 }
 
 -- `C t`: an assumption grants it, or an instance covers it.
@@ -1024,11 +1088,18 @@ fun granted(s : Solver, p : Pred) -> Bool {
 -- unification may yet decide which instance applies. One headed by anything
 -- rigid is decided here and now, which is what keeps a missing instance a local
 -- error naming the type that lacks one.
+--
+-- Discharging the predicate fills its hole, by the rule that discharged it
+-- and with the types it was discharged at. A predicate reported as an error
+-- leaves its hole empty: nothing reads evidence once an error is reported.
 fun classRule(s : Solver, c : PredCell) -> Bool {
     let t = discharging(s, c.pred.args[0])
     match t {
         -- Absorbed; there is no value to find a method for.
-        TBottom -> return True
+        TBottom -> {
+            c.hole.proof = Some(ByNothing(c.pred.name))
+            return True
+        }
         _ -> {}
     }
     let p = Ty.pred(c.pred.name, [t])
@@ -1036,7 +1107,10 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
     -- order matters: a given may be *about* a family application, as
     -- `[Container c, Show (Elem c)]` is, and `Elem c` over a skolem never
     -- reduces. Testing the head first would defer such a predicate for ever.
-    if granted(s, p) { return True }
+    if let Some(proof) = granted(s, p) {
+        c.hole.proof = Some(proof)
+        return True
+    }
     let (h, _) = Ty.spine(t)
     match h {
         TVar(_) -> return False
@@ -1046,16 +1120,21 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
     -- An unsatisfiable predicate is reported and taken as discharged: nothing
     -- later can satisfy it, so deferring it would only report it again.
     if checkFieldVisibility(s, p, t, c) { return True }
-    match Classes.byInst(s.classes, p) {
+    match Classes.selectInstance(s.classes, p) {
         None -> {
             if Classes.isGenerated(p.name) && noField(s, p, t, c) { return True }
             Ty.typeError("no instance for '" + Ty.showPred(p) + "'", c.span)
             True
         }
-        Some(obligations) -> {
+        Some((inst, obligations)) -> {
             -- The instance's own context becomes this site's, over the types the
-            -- match supplied: `Eq (Array a)` leaves `Eq a` behind.
-            for q in obligations { solve(s, cpredOf(q, c.span, c.context)) }
+            -- match supplied: `Eq (Array a)` leaves `Eq a` behind. Each is a
+            -- wanted of its own, whose hole the instance's evidence holds.
+            let holes = Array.map(obligations, fun(_) = newHole())
+            c.hole.proof = Some(ByInstance(inst, t, holes))
+            for var i = 0; i < len(obligations); i = i + 1 {
+                solve(s, cpredInto(obligations[i], holes[i], c.span, c.context))
+            }
             True
         }
     }
@@ -1458,17 +1537,21 @@ fun retained(s : Solver, level : Int) -> Vec PredCell {
     promoteFloating(s, level)
     let keep = Vec.new(len(s.deferred))
     let out = Vec.new(len(s.deferred))
-    let seen = Set.new()
+    let seen = Map.new()
     for c in s.deferred {
         if Ty.predLevel(c.pred) <= level {
             Vec.push(keep, c)
         } else {
             -- Two demands for the same field of the same type are one
             -- obligation; the context should not repeat itself.
+            -- The one dropped takes the evidence of the one kept.
             let key = Ty.predKey(c.pred)
-            if !Set.contains(seen, key) {
-                Set.add(seen, key)
-                Vec.push(out, c)
+            match Map.get(seen, key) {
+                Some(kept) -> { c.hole.proof = Some(Same(kept)) }
+                None -> {
+                    Map.put(seen, key, c.hole)
+                    Vec.push(out, c)
+                }
             }
         }
     }

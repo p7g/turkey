@@ -4,7 +4,7 @@ export (
     Effects(..), reads_, writes, allocates, traps, diverges,
     isSafepoint, deletable,
     Term(..), successors, switchTargets,
-    Block(..), newBlock, Func(..), newFunc,
+    Block(..), newBlock, Func(..), newFunc, Variable(..), holding, hold, carryHolds,
     Inst(..), eachUse, eachDef,
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
@@ -47,12 +47,13 @@ export (
 -- promoting it a precondition for every optimization rather than one of them.
 
 -- No diagnostics: `verify` answers with complaints rather than failing, so
--- this module depends on nothing but the standard library.
+-- this module reports nothing itself.
 import Data.BitSet as BitSet
 import Data.BitSet (BitSet)
 import Data.Set as Set
 import Turkey.Position as Position
 import Turkey.Source (Span)
+import Turkey.Types as Ty
 
 -- -- values and representations ---------------------------------------------------
 
@@ -337,6 +338,15 @@ type Func i = Func {
     -- The calls inlined into the function that its positions name, numbered
     -- from 1 by the site field of a position (`Turkey.Position`).
     var sites : Vec Position.Site,
+    -- With `-g`, the variables of the source the function binds, and the
+    -- ones each value holds, by value id: a value holds a variable from its
+    -- definition on (`holding`). Debug information is the only reader, so
+    -- a pass that loses a value's entry loses only what a debugger shows.
+    var variables : Vec Variable,
+    var holds     : Map Int (Vec Int),
+    -- The variable each slot of a `var` holds, by slot, which `Turkey.Promote`
+    -- gives the values it puts in the slot's place.
+    var slotHolds : Map Int Int,
     -- The module that declares the binding the function was lowered from,
     -- lambdas and instance methods included, and for a lambda lifted out of
     -- an initializer, the module of the global it initializes; empty for one
@@ -348,7 +358,29 @@ type Func i = Func {
 fun newFunc(name : String, results : Array Rep) -> Func i = Func {
     name = name, params = [], results = results,
     blocks = [], entry = BlockId(0), reps = [], origins = Map.new(),
-    reasons = Map.new(), at = 0, sites = [], module_ = "",
+    reasons = Map.new(), at = 0, sites = [], variables = [], holds = Map.new(),
+    slotHolds = Map.new(), module_ = "",
+}
+
+-- A local of the source, as a debugger shows it: its name, the position of
+-- its binding (`Turkey.Position`), whether it is one of the function's
+-- parameters, and its type.
+type Variable = Variable { name : String, declared : Int, parameter : Bool, ty : Ty.Type }
+
+-- The variables value `id` holds, as indices into `Func.variables`.
+fun holding(f : Func i, id : Int) -> Vec Int = Map.getOr(f.holds, id, [])
+
+-- Records that value `id` holds variable `k` from its definition on.
+fun hold(f : Func i, id : Int, k : Int) -> Unit = match Map.get(f.holds, id) {
+    Some(ks) -> if !Vec.contains(ks, k) { Vec.push(ks, k) }
+    None -> Map.put(f.holds, id, [k])
+}
+
+-- Gives value `to` the variables `from` holds: for a pass that replaces
+-- every read of `from` with `to`.
+fun carryHolds(f : Func i, from : Int, to : Int) -> Unit {
+    if from == to { return }
+    for k in holding(f, from) { hold(f, to, k) }
 }
 
 -- A value of the given representation, appended to the function's table.
@@ -1123,6 +1155,9 @@ fun pruneUnreachable[Inst i](f : Func i) -> Func i {
     out.reasons = f.reasons
     out.at = f.at
     out.sites = f.sites
+    out.variables = f.variables
+    out.holds = f.holds
+    out.slotHolds = f.slotHolds
     for at in order {
         let block = f.blocks[blockId(at)]
         let made = newBlock()

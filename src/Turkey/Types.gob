@@ -806,10 +806,8 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
         False
     }
     TApp(fn, arg, _) -> occursAndAdjust(slot, fn) || occursAndAdjust(slot, arg)
-    -- Over-strict, strictly speaking: a family is not injective, so `a ~ Elem a`
-    -- is not obviously a cycle. Rejecting it is the standard choice and the safe
-    -- one -- admitting it would need the family's definition to prove the
-    -- recursion bottoms out.
+    -- An occurrence under a family counts here, and `unify` then asks
+    -- `occursRigidly` whether it is a cycle or only an equation to defer.
     TFam(_, arg, _) -> occursAndAdjust(slot, arg)
     TFun(params, ret) -> {
         for p in params {
@@ -820,6 +818,26 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
     TTuple(elems) -> {
         for e in elems {
             if occursAndAdjust(slot, e) { return True }
+        }
+        False
+    }
+    _ -> False
+}
+
+-- Returns whether `slot` occurs in `t` other than inside the argument of a
+-- family application.
+fun occursRigidly(slot : VarCell, t : Type) -> Bool = match prune(t) {
+    TVar(cell) -> cell.id == slot.id
+    TApp(fn, arg, _) -> occursRigidly(slot, fn) || occursRigidly(slot, arg)
+    TFun(params, ret) -> {
+        for p in params {
+            if occursRigidly(slot, p) { return True }
+        }
+        occursRigidly(slot, ret)
+    }
+    TTuple(elems) -> {
+        for e in elems {
+            if occursRigidly(slot, e) { return True }
         }
         False
     }
@@ -981,6 +999,16 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 None -> {}
             }
             if occursAndAdjust(cell, y) {
+                -- Under a family the occurrence is no cycle yet: `a ~ Option
+                -- (F a)` holds once `a` is `Option (Option Int)` and `F` of
+                -- that is `Option Int`. Only an occurrence outside every
+                -- family makes the type infinite.
+                if !occursRigidly(cell, y) {
+                    return match fams {
+                        Some(f) -> f.defer(x, y, where, context)
+                        None -> mismatch(x, y, where, context)
+                    }
+                }
                 -- One namer for both sides, so the variable keeps its name.
                 let n = namer("")
                 return typeError("cannot construct the infinite type '" + showAt(x, n, 0)

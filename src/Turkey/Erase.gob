@@ -15,9 +15,11 @@ export (program, eraseType)
 -- `Elem b` is `Array Int`. So every type is rewritten by the equalities the
 -- coercions around it grant as they are erased, as `Turkey.Coretc` reads it
 -- under them. A binder's type is rewritten under the coercions its value
--- binds at its top as well (`outerEqualities`), since every use of the binder
--- has supplied them, and the binder and its value then agree on every
--- parameter's type, which is what a call's layout is read from.
+-- binds at its top as well (`outerEqualities`): every lambda over evidence
+-- there, and the first that takes other parameters too, as a worker does.
+-- Every use of the binder has supplied them, and the binder and its value
+-- then agree on every parameter's type, which is what a call's layout is read
+-- from.
 --
 -- **What erasure keeps.** The backend reads a call's arity off its callee's
 -- type, so a type has to erase the same way wherever it appears. A function
@@ -32,16 +34,16 @@ export (program, eraseType)
 -- method's dictionary builds its slots when it is built, so a slot whose body
 -- builds the dictionary again would never finish, and a slot that panics
 -- would panic. So such a lambda is replaced by its body only where the body
--- is itself a lambda. Where the body is some other function, it is
--- eta-expanded instead: `fun(co) = e`, with `e : fun(x) -> r`, becomes
--- `fun(x') = e(x')`, which evaluates `e` at each call where the lambda
--- evaluated it at each application to the evidence. What sits there is what
--- the lowering put under the evidence: a method's own dictionary, an
--- application of a default method, or a panic in a slot nothing can call.
--- Each is either pure or meant to happen only once the slot is called, so
--- evaluating it at each call changes only what it costs. A body that is not a
--- function is a value, since a binding is generalized over an equality only if
--- it is one, so evaluating it early cannot be observed.
+-- is itself a lambda, or a name, which costs nothing to evaluate. Where the
+-- body is some other function, it is eta-expanded instead: `fun(co) = e`,
+-- with `e : fun(x) -> r`, becomes `fun(x') = e(x')`, which evaluates `e` at
+-- each call where the lambda evaluated it at each application to the
+-- evidence. The lowering puts a method's own dictionary and a default
+-- method's application under the method's own parameters, so what is left is
+-- a panic in a slot nothing can call, which is meant to happen only once the
+-- slot is called. A body that is not a function is a value, since a binding
+-- is generalized over an equality only if it is one, so evaluating it early
+-- cannot be observed.
 
 import Turkey.Binders as Binders
 import Turkey.Classes (ClassTable)
@@ -154,11 +156,15 @@ fun erase(x : Eraser, e : Core) -> Core = match e.kind {
 }
 
 -- The erased body of a lambda over coercions alone, delayed as the lambda
--- delayed it: itself if it is a lambda or is not a function, and otherwise
--- eta-expanded.
+-- delayed it: itself if it is a lambda, a name or not a function, and
+-- otherwise eta-expanded.
 fun delayed(x : Eraser, body : Core) -> Core {
     match body.kind {
-        CLam(_, _, _) -> return body
+        CLam(_, _, _) | CVar(_) -> return body
+        CTyApp(fn, _) -> match fn.kind {
+            CVar(_) -> return body
+            _ -> {}
+        }
         _ -> {}
     }
     match Ty.prune(body.ty) {

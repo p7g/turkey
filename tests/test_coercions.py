@@ -105,3 +105,63 @@ def test_a_coercion_adds_no_curried_layer():
     assert code[0].startswith("fun @%inst.Main#Box.Int#code(%0:ptr*, %1:i64) -> i64"), code[0]
     for body in _functions(ssa, "%inst.Main#Box.Data.Option#Option#code"):
         assert ":unit" not in body.splitlines()[0], body
+
+
+# A default method with an equality in its context, used at a known instance
+# and through a dictionary that is a parameter.
+DEFAULTED = """
+class Box b {
+    type Elem b
+    fun open(b) -> Elem b
+    fun code[Elem b ~ Int](x : b) -> Int = open(x) * 2
+}
+
+instance Box Int {
+    type Elem = Int
+    fun open(x) = x
+}
+
+instance Box (Option a) : Box a {
+    type Elem = Elem a
+    fun open(o) = match o {
+        Some(x) -> open(x)
+        None -> error("empty")
+    }
+}
+
+fun deep[Box b, Elem b ~ Int](n : Int, o : b) -> Int {
+    var t = 0
+    for i in [1, 2, 3] { t = t + code(o) }
+    if n == 0 { t } else { t + deep(n - 1, Some(o)) }
+}
+
+fun main() {
+    var t = 0
+    for i in [1, 2, 3] { t = t + code(i) }
+    print(t)
+    print(deep(5, 1))
+}
+"""
+
+
+def _allocations(body: str) -> int:
+    return len(re.findall(r"object\.new|closure\.new|stack\.closure|stack\.object", body))
+
+
+def test_a_default_method_s_coercion_costs_nothing():
+    assert lang.output(DEFAULTED) == "12\n36\n"
+    ssa = _ssa(DEFAULTED)
+    # At a known instance the default is inlined into the loop, as one without
+    # the equality is.
+    main = _functions(ssa, "Main#main")[0]
+    assert "mul" in main and "#code" not in main, main
+    # Through a dictionary, it costs what the same default without the
+    # equality does.
+    plain = DEFAULTED.replace("fun code[Elem b ~ Int](x : b) -> Int", "fun code(x : b) -> Int") \
+                     .replace("fun open(b) -> Elem b", "fun open(b) -> Int") \
+                     .replace("fun deep[Box b, Elem b ~ Int]", "fun deep[Box b]")
+    assert lang.output(plain) == "12\n36\n"
+    without = _ssa(plain)
+    prefix = "%inst.Main#Box.Data.Option#Option#code@"
+    assert [_allocations(f) for f in _functions(ssa, prefix)] == \
+        [_allocations(f) for f in _functions(without, prefix)]

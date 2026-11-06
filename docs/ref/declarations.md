@@ -184,9 +184,9 @@ Ada is 36
 [1, 4, 9]
 ```
 
-A lambda cannot have a context. Unlike a declared function, it is not
-generalized: its parameters have one type each, fixed by how it is used
-([Type inference](inference.md#generalization)).
+A lambda cannot have a context. A lambda on its own is not generalized: its
+parameters have one type each, fixed by how it is used. A `let` that binds a
+lambda can be ([Type inference](inference.md#generalization)).
 
 **Closures.** A lambda or local function can use the variables of the scopes
 around it. It captures them by reference, not by copying: if it assigns a

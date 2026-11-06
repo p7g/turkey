@@ -39,11 +39,8 @@ from tests import bootc, toolchain
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
-# The corpus, minus the programs whose point is to fail to typecheck.
-CORPUS = sorted(
-    path.name for path in PROGRAMS.glob("*.gob")
-    if not path.name.startswith("err_")
-)
+# The corpus: the programs that compile (`bootc.corpus`).
+CORPUS = [path.name for path in bootc.corpus()]
 
 # What selection can still refuse. A reason outside this set fails the run: the
 # histogram is only a progress signal if a new entry is an event.

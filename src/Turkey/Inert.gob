@@ -1,0 +1,352 @@
+export (Inert(..), empty, extend, close, rewrite, rewritten)
+
+-- The given equalities in scope, kept canonical: OutsideIn(X)'s inert set
+-- (Vytiniotis, Peyton Jones, Schrijvers and Sulzmann, JFP 2011, §7.4 and
+-- §8.2), for the givens only.
+--
+-- A given is added by rewriting both of its sides with what is already here
+-- and with the instances, then decomposing, orienting and checking it, and
+-- finally kicking out every equality the new one could rewrite, to be added
+-- again. What results is a *substitution*: each equality is a rule from its
+-- left side to its right, and the rules are used to rewrite wanteds and other
+-- givens. A wanted never rewrites a given, so nothing a body discovers can
+-- change what its signature granted (§7.4.3).
+--
+-- **Invariant.** Every equality `lhs ~ rhs` here satisfies:
+--
+-- * `lhs` is a skolem, a variable no solving binds (a cycle breaker, below),
+--   or a family application that no instance reduces;
+-- * no left side here occurs in `rhs`, nor in the argument of any other left
+--   side, and no instance reduces a family application in either;
+-- * no two equalities have the same left side.
+--
+-- So the set is an *idempotent* substitution, and rewriting a type with it is
+-- one bottom-up pass that replaces each left side by its right side and
+-- reduces each family application through the instances. That pass ends
+-- because instance reduction does: an associated type's right side may apply a
+-- family only to a variable of the instance head.
+--
+-- **Why not flattening.** OutsideIn(X) flattens every nested family application
+-- into a fresh variable before canonicalizing. The variables would then reach
+-- the types the solver records for the rest of the compiler, and the schemes
+-- and diagnostics a reader sees, and each would need undoing afterwards. Instead
+-- we rewrite family applications where they stand, as GHC has since 9.2 (Note
+-- [inert_eqs: the inert equalities] in `GHC/Tc/Solver/InertSet.hs`).
+--
+-- **Why idempotent.** GHC keeps its inert set only *terminating* (its WF1-WF3),
+-- and kicks out as little as it can, because it holds wanteds too and there
+-- may be thousands of them. This set holds the givens a signature wrote, a
+-- handful at most, so kicking out every equality the new one rewrites costs
+-- nothing, and the stronger invariant makes rewriting a single pass with no
+-- termination argument of its own.
+--
+-- **Cycle breakers.** A given such as `a ~ Option (F a)` cannot be a rule from
+-- `a`, since rewriting `a` would never stop, yet it is consistent and `a` is
+-- not infinite. Its family application is replaced by a fresh variable `b`,
+-- untouchable by any unification, giving `a ~ Option b` and `F a ~ b` (GHC's
+-- Note [Type equality cycles]). `close` binds `b` to `F a` when the scope of
+-- the givens ends, so a type recorded with `b` in it reads as `F a` afterwards.
+-- A left side that occurs in its right side outside any family application, as
+-- in `a ~ Option a`, has no solution, and the given is refused.
+--
+-- Adding a set of givens runs on fuel. Interaction among givens and instances
+-- terminates under the instance restrictions as far as we know, but a given
+-- set that exhausted it is refused rather than allowed to hang the compiler.
+
+import Turkey.Classes as Classes
+import Turkey.Classes (ClassTable(..))
+import Turkey.Types as Ty
+import Turkey.Types (VarCell(..), ConCell(..), Pred(..),
+                     TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
+
+type Inert = Inert {
+    classes  : ClassTable,
+    -- Each equality's left side, right side, and the given it came from.
+    eqs      : Vec (Ty.Type, Ty.Type, Pred),
+    -- The cycle breakers `extend` made, with the family application each
+    -- stands for. Only the breakers of the givens added last, which are the
+    -- ones whose scope `close` ends.
+    breakers : Vec (VarCell, Ty.Type),
+}
+
+-- Returns the inert set with no givens.
+fun empty(classes : ClassTable) -> Inert =
+    Inert { classes = classes, eqs = [], breakers = [] }
+
+-- The number of steps `extend` may take for one set of givens.
+let fuel = 1000
+
+-- Returns `base` extended with the equalities among `givens`, and the givens
+-- refused, each with the reason it can never hold. `base` is unchanged.
+fun extend(base : Inert, givens : Array Pred) -> (Inert, Vec (Pred, String)) {
+    let out = Inert {
+        classes = base.classes, eqs = Vec.slice(base.eqs, 0, len(base.eqs)),
+        breakers = [],
+    }
+    let refused = Vec.new(1)
+    let work = Vec.new(len(givens))
+    -- The work list is a stack: pushed in reverse, the givens are added in the
+    -- order they were written.
+    for var i = len(givens) - 1; i >= 0; i = i - 1 {
+        let p = givens[i]
+        if p.name == Ty.equals { Vec.push(work, (p.args[0], p.args[1], p)) }
+    }
+    var left = fuel
+    loop {
+        match Vec.pop(work) {
+            None -> break
+            Some((l, r, origin)) -> {
+                if left == 0 {
+                    Vec.push(refused, (origin, "its equalities are too intricate to "
+                                       + "resolve; state fewer of them"))
+                    break
+                }
+                left = left - 1
+                match add(out, l, r, origin, work) {
+                    Some(why) -> Vec.push(refused, (origin, why))
+                    None -> {}
+                }
+            }
+        }
+    }
+    (out, refused)
+}
+
+-- Binds each cycle breaker `extend` made for `i` to the family application it
+-- stands for. Call it once the scope of the givens has ended.
+fun close(i : Inert) -> Unit {
+    for (cell, fam) in i.breakers { cell.ref = Some(fam) }
+}
+
+-- Adds `l ~ r` from the given `origin`, pushing onto `work` whatever it
+-- decomposes into and whatever it kicks out. Returns why the given can never
+-- hold, if it cannot.
+fun add(i : Inert, l : Ty.Type, r : Ty.Type, origin : Pred,
+        work : Vec (Ty.Type, Ty.Type, Pred)) -> Option String {
+    let a = rewrite(i, l)
+    let b = rewrite(i, r)
+    if Ty.sameType(a, b) { return None }
+    match (a, b) {
+        -- A side that is already an error has nothing more to say.
+        (TBottom, _) -> return None
+        (_, TBottom) -> return None
+        _ -> {}
+    }
+    if !isLhs(a) && !isLhs(b) { return decompose(a, b, origin, work) }
+    let (lhs, rhs) = orient(a, b)
+    if occursRigidly(lhs, rhs) {
+        return Some(match lhs {
+            TVar(_) -> "it would make a type contain itself"
+            _ -> "it would make '" + Ty.show(lhs) + "' contain itself"
+        })
+    }
+    let broken = breakCycles(i, lhs, rhs, origin, work)
+    -- Kick out every equality the new one rewrites: re-added, each is
+    -- rewritten by it, which keeps the set idempotent.
+    let keep = Vec.new(len(i.eqs))
+    for (l2, r2, o2) in i.eqs {
+        if occurs(lhs, l2) || occurs(lhs, r2) {
+            Vec.push(work, (l2, r2, o2))
+        } else {
+            Vec.push(keep, (l2, r2, o2))
+        }
+    }
+    Vec.clear(i.eqs)
+    for e in keep { Vec.push(i.eqs, e) }
+    Vec.push(i.eqs, (lhs, broken, origin))
+    None
+}
+
+-- Splits an equality between two types with rigid heads into equalities
+-- between their parts, or returns why they cannot be equal.
+fun decompose(a : Ty.Type, b : Ty.Type, origin : Pred,
+              work : Vec (Ty.Type, Ty.Type, Pred)) -> Option String {
+    -- Sound for the reason `Ty.unify` decomposes: there are no type-level
+    -- lambdas, so every head here is rigid.
+    match (a, b) {
+        (TApp(f1, a1, _), TApp(f2, a2, _)) -> {
+            Vec.push(work, (a1, a2, origin))
+            Vec.push(work, (f1, f2, origin))
+            return None
+        }
+        (TFun(p1, r1), TFun(p2, r2)) -> if len(p1) == len(p2) {
+            Vec.push(work, (r1, r2, origin))
+            for var k = len(p1) - 1; k >= 0; k = k - 1 { Vec.push(work, (p1[k], p2[k], origin)) }
+            return None
+        }
+        (TTuple(e1), TTuple(e2)) -> if len(e1) == len(e2) {
+            for var k = len(e1) - 1; k >= 0; k = k - 1 { Vec.push(work, (e1[k], e2[k], origin)) }
+            return None
+        }
+        _ -> {}
+    }
+    Some("it would make '" + Ty.show(a) + "' equal to '" + Ty.show(b) + "'")
+}
+
+-- Returns `(lhs, rhs)` for two rewritten sides of which at least one may be a
+-- left side.
+fun orient(a : Ty.Type, b : Ty.Type) -> (Ty.Type, Ty.Type) {
+    -- A family application goes on the left, as OutsideIn(X) orients it, and as
+    -- a context has to be written. A variable or skolem goes on the left of a
+    -- rigid type. Between two family applications, the one the other does not
+    -- contain goes on the left, so that the rule can be used at all. Anything
+    -- else keeps the order it was written in.
+    if isFam(a) && isFam(b) { return if occurs(a, b) { (b, a) } else { (a, b) } }
+    if isFam(a) { return (a, b) }
+    if isFam(b) { return (b, a) }
+    if !isLhs(a) { return (b, a) }
+    match (a, b) {
+        -- A breaker is rewritten to the skolem rather than the skolem to it.
+        (TCon(_), TVar(_)) -> (b, a)
+        _ -> (a, b)
+    }
+}
+
+-- Replaces each outermost family application in `rhs` that contains `lhs` by a
+-- fresh cycle breaker, and pushes the equality that defines the breaker.
+fun breakCycles(i : Inert, lhs : Ty.Type, rhs : Ty.Type, origin : Pred,
+                work : Vec (Ty.Type, Ty.Type, Pred)) -> Ty.Type {
+    if !occurs(lhs, rhs) { return rhs }
+    let t = Ty.prune(rhs)
+    match t {
+        TFam(_, _, k) -> {
+            let cell = Ty.newVar(Ty.noScope, k)
+            Vec.push(i.breakers, (cell, t))
+            Vec.push(work, (t, TVar(cell), origin))
+            TVar(cell)
+        }
+        TApp(fn, arg, k) -> TApp(breakCycles(i, lhs, fn, origin, work),
+                                 breakCycles(i, lhs, arg, origin, work), k)
+        TFun(params, ret) -> TFun(Array.map(params, breakCycles(i, lhs, _, origin, work)),
+                                  breakCycles(i, lhs, ret, origin, work))
+        TTuple(elems) -> TTuple(Array.map(elems, breakCycles(i, lhs, _, origin, work)))
+        _ -> t
+    }
+}
+
+-- Returns whether `t` may be the left side of a rule: a family application, a
+-- skolem, or a variable nothing has bound.
+fun isLhs(t : Ty.Type) -> Bool = match Ty.prune(t) {
+    TFam(_, _, _) -> True
+    TCon(c) -> c.uid != 0
+    TVar(_) -> True
+    _ -> False
+}
+
+fun isFam(t : Ty.Type) -> Bool = match Ty.prune(t) {
+    TFam(_, _, _) -> True
+    _ -> False
+}
+
+-- Returns whether `lhs` occurs in `t`.
+fun occurs(lhs : Ty.Type, t : Ty.Type) -> Bool {
+    for sub in Ty.subterms(t) {
+        if Ty.sameType(sub, lhs) { return True }
+    }
+    False
+}
+
+-- Returns whether `lhs` occurs in `t` other than inside the argument of a
+-- family application, where a cycle breaker cannot take it out.
+fun occursRigidly(lhs : Ty.Type, t : Ty.Type) -> Bool {
+    if Ty.sameType(t, lhs) { return True }
+    match Ty.prune(t) {
+        TApp(fn, arg, _) -> occursRigidly(lhs, fn) || occursRigidly(lhs, arg)
+        TFun(params, ret) -> {
+            for p in params {
+                if occursRigidly(lhs, p) { return True }
+            }
+            occursRigidly(lhs, ret)
+        }
+        TTuple(elems) -> {
+            for e in elems {
+                if occursRigidly(lhs, e) { return True }
+            }
+            False
+        }
+        _ -> False
+    }
+}
+
+-- Returns `t` rewritten by the givens in `i` and reduced through the
+-- instances, at every depth.
+fun rewrite(i : Inert, t : Ty.Type) -> Ty.Type = match rewritten(i, t) {
+    Some(r) -> r
+    None -> Ty.prune(t)
+}
+
+-- Returns `rewrite(i, t)`, or `None` if that is `t` itself.
+fun rewritten(i : Inert, t : Ty.Type) -> Option Ty.Type {
+    -- `None` for "unchanged" rather than a copy, so that rewriting a type
+    -- nothing applies to allocates nothing: the solver asks this of every
+    -- family application and skolem it unifies.
+    let here = Ty.prune(t)
+    match here {
+        TVar(_) -> lookup(i, here)
+        TCon(c) -> if c.uid == 0 { None } else { lookup(i, here) }
+        TApp(fn, arg, k) -> {
+            let f2 = rewritten(i, fn)
+            let a2 = rewritten(i, arg)
+            if Option.isNone(f2) && Option.isNone(a2) { return None }
+            Some(TApp(Option.unwrapOr(f2, fn), Option.unwrapOr(a2, arg), k))
+        }
+        TFam(name, arg, k) -> {
+            let a2 = rewritten(i, arg)
+            let fam = match a2 {
+                Some(r) -> TFam(name, r, k)
+                None -> here
+            }
+            match step(i, fam) {
+                Some(r) -> Some(r)
+                None -> if Option.isSome(a2) { Some(fam) } else { None }
+            }
+        }
+        TFun(params, ret) -> {
+            let ps = Array.map(params, rewritten(i, _))
+            let r2 = rewritten(i, ret)
+            if !anySome(ps) && Option.isNone(r2) { return None }
+            Some(TFun(pick(ps, params), Option.unwrapOr(r2, ret)))
+        }
+        TTuple(elems) -> {
+            let es = Array.map(elems, rewritten(i, _))
+            if anySome(es) { Some(TTuple(pick(es, elems))) } else { None }
+        }
+        _ -> None
+    }
+}
+
+fun anySome(xs : Array (Option Ty.Type)) -> Bool = Iterator.any(xs, Option.isSome)
+
+-- Each rewritten type in `xs`, or the original in `of` where nothing changed.
+fun pick(xs : Array (Option Ty.Type), of : Array Ty.Type) -> Array Ty.Type {
+    let out = Vec.new(len(of))
+    for var k = 0; k < len(of); k = k + 1 { Vec.push(out, Option.unwrapOr(xs[k], of[k])) }
+    Vec.toArray(out)
+}
+
+-- What one family application, whose argument is already rewritten, is: by a
+-- given, or by an instance. `None` if neither decides it.
+fun step(i : Inert, fam : Ty.Type) -> Option Ty.Type {
+    -- A given's right side is already rewritten, so it is returned as it is.
+    -- The order of the two does not matter: no left side is a family
+    -- application an instance reduces.
+    match lookup(i, fam) {
+        Some(r) -> return Some(r)
+        None -> {}
+    }
+    match fam {
+        TFam(name, arg, _) -> match Classes.reduceFam(i.classes, name, arg) {
+            Some(body) -> Some(rewrite(i, body))
+            None -> None
+        }
+        _ -> None
+    }
+}
+
+-- The right side of the given whose left side is `t`.
+fun lookup(i : Inert, t : Ty.Type) -> Option Ty.Type {
+    for (l, r, _) in i.eqs {
+        if Ty.sameType(l, t) { return Some(r) }
+    }
+    None
+}

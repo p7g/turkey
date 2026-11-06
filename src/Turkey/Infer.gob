@@ -44,6 +44,7 @@ import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
+import Turkey.Inert as Inert
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
@@ -110,13 +111,18 @@ type Generator = Generator {
     fnStack       : Vec Ty.Type,
     var loopStack : Vec LoopCtx,
     tyvarScopes   : Vec (Map String Ty.Type),
+    -- The equalities the signatures being checked grant, outermost first.
+    -- Exhaustiveness runs after solving, when they are no longer in scope, and
+    -- a scrutinee's type may be what one of them decides, so each site below
+    -- keeps the ones in scope where it is.
+    var assumed : Vec Pred,
     -- Exhaustiveness runs after solving, when scrutinee types are known.
-    matchSites  : Vec (Expr, Ty.Type),
+    matchSites  : Vec (Expr, Ty.Type, Array Pred),
     -- And irrefutability: every pattern that binds with no second arm to fall
     -- to.
     -- A binding pattern, the type it binds, and what a refutable one should
     -- be rewritten as.
-    binderSites : Vec (Pat, Ty.Type, String),
+    binderSites : Vec (Pat, Ty.Type, String, Array Pred),
     -- And every expression whose value is thrown away, recorded after it is
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
@@ -146,7 +152,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
         binders = binders, parameters = Set.new(), fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
-        matchSites = Vec.new(8),
+        assumed = Vec.new(2), matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
         partialHeaders = Map.new(), openings = Vec.new(4),
@@ -753,8 +759,10 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
         None -> m.decl
     }
     push(g)
+    let outer = assume(g, givens)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                                decl.context, None, -1)
+    g.assumed = outer
     -- The class is named separately.
     let method = Binders.nameAt(g.binders, decl.id, decl.span)
     eq(g, inferred, expected, Some(decl.span),
@@ -918,8 +926,10 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     Map.put(g.types.abstractions, decl.id, dicts)
 
     push(g)
+    let outer = assume(g, givens)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                                decl.context, Some(rigid), -1)
+    g.assumed = outer
     eq(g, inferred, expected, Some(decl.span),
        "the declared type of '" + decl.name + "'")
     let defn = pop(g)
@@ -930,17 +940,39 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     }))
 }
 
+-- Adds the equalities among `givens` to those in scope for the sites
+-- generated next, and returns the ones in scope before, to restore.
+fun assume(g : Generator, givens : Vec (String, Pred)) -> Vec Pred {
+    let outer = g.assumed
+    g.assumed = Vec.slice(outer, 0, len(outer))
+    for (_, p) in givens {
+        if p.name == Ty.equals { Vec.push(g.assumed, p) }
+    }
+    outer
+}
+
+-- Returns the solved type `ty`, rewritten by the equalities `givens` as well as
+-- reduced through the instances.
+fun resolveUnder(g : Generator, ty : Ty.Type, givens : Array Pred) -> Ty.Type {
+    let t = Typed.resolve(g.types, ty)
+    if len(givens) == 0 { return t }
+    let (inert, _) = Inert.extend(Inert.empty(g.classes), givens)
+    let out = Inert.rewrite(inert, t)
+    Inert.close(inert)
+    out
+}
+
 -- A non-exhaustive match is an error, and so is a refutable binding pattern.
 -- Runs after solving, since it needs the scrutinee types resolved.
 fun checkExhaustiveness(g : Generator) -> Unit {
-    for (site, scrutinee) in g.matchSites {
+    for (site, scrutinee, givens) in g.matchSites {
         let arms = match site.kind {
             EMatch(_, a) -> a
             _ -> []
         }
         -- Normalized, not merely pruned: the element of a `for ... in` loop is
         -- `Item xs`, and a family names a type only once it has reduced.
-        match Exhaustive.check(g.decls, arms, Typed.resolve(g.types, scrutinee)) {
+        match Exhaustive.check(g.decls, arms, resolveUnder(g, scrutinee, givens)) {
             None -> {}
             Some(missing) -> {
                 -- A bare `_` witness means the scrutinee's type has too many
@@ -957,8 +989,8 @@ fun checkExhaustiveness(g : Generator) -> Unit {
         }
     }
     -- Refutable binding patterns, after every match.
-    for (pat, bound, fix) in g.binderSites {
-        match Exhaustive.checkPattern(g.decls, pat, Typed.resolve(g.types, bound)) {
+    for (pat, bound, fix, givens) in g.binderSites {
+        match Exhaustive.checkPattern(g.decls, pat, resolveUnder(g, bound, givens)) {
             None -> {}
             Some(missing) -> {
                 let detail = if missing == "_" { "every value" }
@@ -1177,7 +1209,8 @@ fun letDefinition(g : Generator, pat : Pat, value : Expr, isVar : Bool)
     Vec.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
-    Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'"))
+    Vec.push(g.binderSites, (pat, t, "add an 'else' block, or use 'if let' or 'match'",
+                             Vec.toArray(g.assumed)))
     let binds = bindersIn(g, [pat], pat.span, bound)
     let defn = pop(g)
     -- Only a `let` bound to a syntactic value generalizes.
@@ -1261,7 +1294,7 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
         let tv = fresh(g)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
         Vec.push(g.binderSites, (param, tv,
-            "name the parameter and 'match' on it in the body"))
+            "name the parameter and 'match' on it in the body", Vec.toArray(g.assumed)))
         tv
     })
     let openings = popOpenings(g)
@@ -2085,7 +2118,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     let binds = matchPattern(g, pat, element)
     discard(Vec.pop(g.openings))
     Vec.push(g.binderSites, (pat, element,
-        "name the element and 'match' on it in the loop body"))
+        "name the element and 'match' on it in the loop body", Vec.toArray(g.assumed)))
     push(g)
     Vec.push(g.loopStack, LoopCtx {
         kind = "for", result = Ty.tUnit(),
@@ -2101,7 +2134,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
 fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
              arms : Vec Arm) -> Ty.Type {
     let scrutineeType = genExpr(g, scrutinee)
-    Vec.push(g.matchSites, (e, scrutineeType))
+    Vec.push(g.matchSites, (e, scrutineeType, Vec.toArray(g.assumed)))
     var result = TBottom
     for arm in arms {
         Vec.push(g.openings, Some(Vec.new(2)))

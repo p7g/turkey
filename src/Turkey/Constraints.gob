@@ -70,6 +70,15 @@ export (
 --   guess the enclosing scope never sees (OutsideIn(X), Example 5.1). Class
 --   givens add no such choice, so they leave every variable touchable.
 --
+-- **Equalities are rewrites, in two sets.** The equality givens in scope are
+-- `inert`, a canonical substitution `Turkey.Inert` maintains, and a given that
+-- can never hold is refused at its context. Every wanted is kept rewritten by
+-- them: `unify` asks them about each family application and skolem it meets,
+-- `defer` queues an equation in rewritten form, and `equals` retries one the
+-- same way. The family equalities waiting in the queue rewrite the class
+-- predicates beside them (`waiting`), but nothing else. So a wanted never
+-- rewrites a given, and never proves itself.
+--
 -- An associated family makes an *equation* deferrable, and it comes back as the
 -- equality predicate `~`, which is why there is one queue here rather than
 -- two. `OneOf` is the last predicate: the closed set of
@@ -83,6 +92,7 @@ import Turkey.Classes (ClassTable(..), InstInfo(..), MethodInfo(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
@@ -246,9 +256,17 @@ type Solver = Solver {
     -- in: a component of modules is solved in one run, and each of its
     -- modules sees its own.
     visibleCons     : fun(Option Span) -> Set.Set String,
-    -- Predicates a `CAssume` currently grants. A stack in effect, restored on
-    -- the way out of each one.
+    -- The class predicates a `CAssume` currently grants. A stack in effect,
+    -- restored on the way out of each one.
     var assumptions : Vec Pred,
+    -- The equalities the `CAssume`s in scope grant, canonical. Restored on the
+    -- way out of each one, which is what keeps a given inside its implication.
+    var inert       : Inert.Inert,
+    -- While `settle` retries the queue: the givens extended with the family
+    -- equalities waiting in it, which is what a class predicate is discharged
+    -- under. A wanted rewrites other wanteds of its own work list, and never a
+    -- given or itself.
+    var wanteds     : Option Inert.Inert,
     -- The highest rank whose variables are untouchable: the rank a `CAssume`
     -- with an equality among its givens was entered at, or `Ty.noScope` when
     -- no such given is in scope. Restored on the way out of each `CAssume`.
@@ -268,7 +286,8 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        assumptions = Vec.new(4), untouchable = Ty.noScope,
+        assumptions = Vec.new(4), inert = Inert.empty(classes), wanteds = None,
+        untouchable = Ty.noScope,
         scopes = Vec.new(4), uses = Vec.new(16),
         pools = [Vec.new(8)], deferred = Vec.new(8),
     }
@@ -305,34 +324,14 @@ fun adopt(s : Solver, vars : Vec VarCell) -> Unit {
 
 -- -- families ----------------------------------------------------------------------
 
--- A family application's definition, from an assumption first and an instance
--- after.
+-- What a family application, a skolem or a variable is, by the givens in
+-- scope and the instances, rewritten at every depth; `None` if neither says.
 --
--- A *given* equality is a reduction rule for the family it names, and this is
--- where it is used. Discharging `Item c ~ Op` is not enough on its own: the
--- body's `match op { Inc(n) -> ... }` cannot find its constructors unless
--- `Item c` genuinely *becomes* `Op`, and `Item c` over a skolem will never
--- reduce through the instance table. So the assumptions are consulted first, and
--- the rule they supply is applied exactly as an instance's would be.
-fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type {
-    -- Reflexive rules are skipped, not returned: a rule from a family
-    -- application to itself is no rule, and returning it would leave
-    -- `Field.tag Auto` unreduced next to the `Int` it is.
-    match Classes.givenRule(s.assumptions, t) {
-        Some(r) -> return Some(r)
-        None -> {}
-    }
-    -- Without the wanted rules. This reducer is what `unify` calls, and a
-    -- unification is irreversible: reducing `Container.Elem a` to `Int` by an
-    -- equation nobody has proved yet *binds* a variable to `Int`, and the
-    -- family is then gone from the scheme that was supposed to carry it. The
-    -- rules answer whether a predicate can be discharged, which `classRule`
-    -- asks explicitly; they do not decide what a type is.
-    match t {
-        TFam(name, arg, _) -> Classes.settledFam(s.classes, name, arg)
-        _ -> None
-    }
-}
+-- At every depth, though `unify` asks only about a head: two applications of
+-- one family are the same type when their arguments are, and an argument the
+-- instances decide has to be rewritten before that comparison can see it
+-- (`Field.inner (Wrapped r)` is `r`).
+fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type = Inert.rewritten(s.inert, t)
 
 -- Take an equation unification could not decide.
 --
@@ -345,7 +344,16 @@ fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type {
 -- is the best place to say so. A family over a variable is merely waiting.
 fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
           context : String) -> Unit {
-    for t in [a, b] {
+    -- Rewritten by the givens first, at every depth: a wanted is always kept
+    -- in that form. Unification decomposes an equation before it defers a
+    -- part, so the part it defers is stuck at its head, but what is below the
+    -- head may be what a given decides -- `x ~ Option (Elem b)` for an
+    -- untouchable `x`, under `Elem b ~ Int`, is `x ~ Option Int`, which no
+    -- longer mentions `b` and may leave the implication.
+    let left0 = Inert.rewrite(s.inert, a)
+    let right0 = Inert.rewrite(s.inert, b)
+    if Ty.sameType(left0, right0) { return {} }
+    for t in [left0, right0] {
         match t {
             TFam(name, arg, _) -> match Classes.uncovered(s.classes, name, arg) {
                 -- A skolem is a nullary constructor, so a family over one looks
@@ -365,31 +373,12 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     -- Oriented family-first, so a carried equality reads the way a written one
     -- has to be written: `Item a ~ Op`, never `Op ~ Item a`. Nothing depends on
     -- the order, but a scheme is read by people.
-    let flip = isFam(Ty.prune(b)) && !isFam(Ty.prune(a))
-    let left = if flip { b } else { a }
-    let right = if flip { a } else { b }
+    let flip = isFam(right0) && !isFam(left0)
+    let left = if flip { right0 } else { left0 }
+    let right = if flip { left0 } else { right0 }
     Vec.push(s.deferred, PredCell {
         pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
     })
-    -- And it is a rewrite rule from here on. `x.pos` used where an `Int` is
-    -- wanted leaves `Field.pos a ~ Int`, and without this every predicate about
-    -- the field's type stays stuck and rides into the scheme, while
-    -- exhaustiveness reads a scrutinee type the equality would have decided.
-    --
-    -- Only a rule that makes progress. `Field.pos a ~ Int` says what the family
-    -- is; `Field.bucket c ~ Field.next b` -- which `c.bucket = b.next` produces
-    -- -- says only that two stuck families agree, and rewriting one to the
-    -- other is a step sideways that can step back. A bare variable on the right
-    -- teaches nothing either.
-    let l = Ty.prune(left)
-    let rt = Ty.prune(right)
-    var teaches = isFam(l)
-    match rt {
-        TFam(_, _, _) -> { teaches = False }
-        TVar(_) -> { teaches = False }
-        _ -> {}
-    }
-    if teaches { Vec.push(s.classes.rules, (l, rt)) }
 }
 
 fun isFam(t : Ty.Type) -> Bool = match t {
@@ -437,18 +426,32 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     }
     CAssume(givens, body) -> {
         let saved = Vec.slice(s.assumptions, 0, len(s.assumptions))
+        let savedInert = s.inert
         let savedUntouchable = s.untouchable
+        let equalities = Vec.new(len(givens))
         for (_, p) in givens {
-            Vec.push(s.assumptions, p)
-            if p.name == Ty.equals && rank(s) > s.untouchable {
-                s.untouchable = rank(s)
+            if p.name == Ty.equals {
+                Vec.push(equalities, p)
+                if rank(s) > s.untouchable { s.untouchable = rank(s) }
+            } else {
+                Vec.push(s.assumptions, p)
             }
+        }
+        if len(equalities) > 0 {
+            let (inert, refused) = Inert.extend(s.inert, Vec.toArray(equalities))
+            for (p, why) in refused {
+                Ty.typeError("the equality '" + Ty.showPred(p) + "' in this context "
+                             + "can never hold; " + why, assumptionSpan(body))
+            }
+            s.inert = inert
         }
         let assumed = newScope()
         assumed.givens = givens
         Vec.push(s.scopes, assumed)
         solve(s, body)
+        Inert.close(s.inert)
         s.assumptions = saved
+        s.inert = savedInert
         s.untouchable = savedUntouchable
         discard(Vec.pop(s.scopes))
     }
@@ -479,6 +482,13 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         solve(s, body)
         discard(Diag.endUnit())
     }
+}
+
+-- Where the declaration an implication checks is: the body of a `CAssume` is
+-- the `CLet` that carries its skolems.
+fun assumptionSpan(body : Constraint) -> Option Span = match body {
+    CLet(cell) -> cell.span
+    _ -> None
 }
 
 -- Binds `id` to `b`: for good and under its internal name `name` when the
@@ -587,7 +597,14 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     let shared = Classes.simplify(s.classes, classPreds)
     let givens = Vec.new(len(shared))
     for p in shared { Vec.push(givens, (dictName(p.name), p)) }
-    scope.givens = givens
+    -- The scope holds the retained equalities too, though they pass no
+    -- dictionary: a class predicate in the body may have been discharged under
+    -- one (`waiting`), and its evidence has to be found under the same.
+    let scopeGivens = Vec.slice(givens, 0, len(givens))
+    for p in retainedPreds {
+        if p.pred.name == Ty.equals { Vec.push(scopeGivens, ("", p.pred)) }
+    }
+    scope.givens = scopeGivens
     -- A call from one member of the group to another -- or to itself -- was
     -- solved against the *monomorphic* placeholder `CDef` bound, so it demanded
     -- nothing and would be handed the undischarged binding at run time. It needs
@@ -628,15 +645,7 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
         -- signature a reader has to read. Head-only reduction is right for
         -- unification and not for anything that reads a type whole, which a
         -- scheme is.
-        -- Reduced without the wanted rules. A scheme is an interface: it
-        -- carries `Container.Elem a ~ Int` and its body should say
-        -- `Container.Elem a`, not the `Int` that equation happens to make it.
-        -- The rules are for discharging predicates inside the body, not for
-        -- restating the body in terms a caller has not been told yet.
-        let was = s.classes.rulesApply
-        s.classes.rulesApply = False
         let body = Typed.reduceDeep(ty, families(s))
-        s.classes.rulesApply = was
         let b = Binding {
             scheme = Ty.generalize(body, rank(s), preds), mutable = False,
         }
@@ -810,9 +819,31 @@ fun settle(s : Solver) -> Unit {
             Int.compare(ka, kb)
         })
         s.deferred = Vec.new(8)
+        let saved = s.wanteds
+        s.wanteds = waiting(s, pending)
         for c in pending { solve(s, CPred(c)) }
+        s.wanteds = saved
         if len(s.deferred) >= len(pending) { return {} }
     }
+}
+
+-- Returns the givens extended with the family equalities among `pending`, or
+-- `None` if there are none.
+fun waiting(s : Solver, pending : Vec PredCell) -> Option Inert.Inert {
+    -- An equality the queue holds is one nothing has proved yet. Used as a
+    -- rule for the class predicates beside it, it is sound either way: if a
+    -- scheme retains it, every caller proves it, and if it is solved later,
+    -- unification makes both sides one anyway. It is never used to retry an
+    -- equality (`equals` reads only the givens), so none proves itself.
+    let eqs = Vec.new(4)
+    for c in pending {
+        if c.pred.name == Ty.equals && isFam(Ty.prune(c.pred.args[0])) {
+            Vec.push(eqs, c.pred)
+        }
+    }
+    if len(eqs) == 0 { return None }
+    let (extended, _) = Inert.extend(s.inert, Vec.toArray(eqs))
+    Some(extended)
 }
 
 -- Improvement: what the deferred set decides between two of its own members.
@@ -879,18 +910,14 @@ fun entail(s : Solver, c : PredCell) -> Bool {
 
 -- `s ~ t`: retry the equation now that something may have moved.
 --
--- Normalizing is what makes progress: reduction consults the assumptions and
--- then the instance table, so a side that has become reducible reduces here.
--- Two identical family applications are equal by reflexivity, and a side that is
--- *still* a stuck family means the equation is not yet decidable.
+-- Rewriting is what makes progress: a side that has become reducible, through
+-- an instance or a given, is rewritten here. Two identical family applications
+-- are equal by reflexivity, and a side that is *still* a stuck family means the
+-- equation is not yet decidable. Only the givens and the instances rewrite it:
+-- no wanted is a rule, so an equation is never proved by itself.
 fun equals(s : Solver, c : PredCell) -> Bool {
-    -- Without the wanted rules: an equation proved by a rule it supplied is
-    -- proved by itself. See `Classes.settled`. With the givens, though, which
-    -- is what the solver's own reducer adds: the equation may have been deferred
-    -- while its family's argument was a variable, and a given decides it now --
-    -- `Elem s ~ Option a` under `Elem s ~ Part (Option c)`.
-    let left = Ty.normalize(c.pred.args[0], families(s))
-    let right = Ty.normalize(c.pred.args[1], families(s))
+    let left = Inert.rewrite(s.inert, c.pred.args[0])
+    let right = Inert.rewrite(s.inert, c.pred.args[1])
     c.pred = Ty.pred(c.pred.name, [left, right])
     if Ty.sameType(left, right) { return True }
     if isFam(left) || isFam(right) { return False }
@@ -898,14 +925,15 @@ fun equals(s : Solver, c : PredCell) -> Bool {
     True
 }
 
--- A type normalized for discharging a predicate over it: everything the
--- solver's reducer consults, and the wanted rules besides. The givens are not
--- optional here: a type that reached the predicate through a variable bound
--- before a given could rewrite it is still the family application, and only the
--- given says what it is. See `Classes.normalizeUnder`, which elaboration uses
--- too.
-fun discharging(s : Solver, t : Ty.Type) -> Ty.Type =
-    Classes.normalizeUnder(s.classes, t, s.assumptions)
+-- A type rewritten for discharging a predicate over it, by the givens in scope,
+-- the equalities waiting in the queue (`waiting`) and the instances. The givens
+-- are not optional here: a type that reached the predicate through a variable
+-- bound before a given could rewrite it is still the family application, and
+-- only the given says what it is.
+fun discharging(s : Solver, t : Ty.Type) -> Ty.Type = match s.wanteds {
+    Some(w) -> Inert.rewrite(w, t)
+    None -> Inert.rewrite(s.inert, t)
+}
 
 -- Is this a fact the enclosing declaration already assumed?
 --

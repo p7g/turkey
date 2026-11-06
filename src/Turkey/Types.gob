@@ -734,14 +734,15 @@ fun prune(t : Type) -> Type = match t {
 
 -- What unification needs from the solver once families exist.
 --
--- Two operations, and deliberately no more: reduce a family application if the
--- instance table decides it, and take an equation that cannot yet be decided.
+-- Two operations, and deliberately no more: rewrite a type that the givens or
+-- the instance table decide, and take an equation that cannot yet be decided.
 -- Beside them, the levels whose variables must not be bound. A record of
 -- closures rather than an interface, which is also how this compiler's module
 -- DAG is kept acyclic -- the solver knows about types, and types know nothing
 -- about the solver.
 type Families = Families {
-    -- The family application's definition, or `None` if no instance decides it.
+    -- What a family application, a skolem or an unbound variable is, by a
+    -- given or by an instance; `None` if neither decides it.
     reduce      : fun(Type) -> Option Type,
     -- Put `a ~ b` back on the queue: neither solvable nor false, yet.
     defer       : fun(Type, Type, Option Span, String) -> Unit,
@@ -751,12 +752,12 @@ type Families = Families {
     untouchable : Int,
 }
 
--- Prune, then reduce family applications at the head until one sticks.
+-- Prune, then rewrite the head with `fams` until it sticks.
 --
 -- `None` means "no reducer available" -- the post-solving passes, where every
--- family that was going to reduce already has. Only the head is reduced: a
--- family buried inside an argument is reduced when something compares it, which
--- is the only moment its value can matter.
+-- family that was going to reduce already has. A skolem and an unbound variable
+-- are asked about as well as a family application, because a given can say what
+-- one is: `a ~ Int` makes the skolem `a` an `Int` while the given is in scope.
 fun normalize(t : Type, fams : Option Families) -> Type {
     var out = prune(t)
     match fams {
@@ -764,32 +765,34 @@ fun normalize(t : Type, fams : Option Families) -> Type {
         Some(f) -> {
             var going = True
             while going {
-                match out {
-                    TFam(_, _, _) -> match f.reduce(out) {
-                        None -> { going = False }
-                        Some(raw) -> {
-                            let reduced = prune(raw)
-                            -- A rule that rewrites a family application to
-                            -- itself is stuck, not progress. `simplify` drops
-                            -- the reflexive equations that produce one, so this
-                            -- should be unreachable; it is here so that a rule
-                            -- which fails to make progress costs an answer
-                            -- rather than the compiler, which is what it cost
-                            -- when a retained `Field.tag a ~ Field.tag a`
-                            -- reached the reducer.
-                            if sameType(reduced, out) {
-                                going = False
-                            } else {
-                                out = reduced
-                            }
+                match (if rewritable(out) { f.reduce(out) } else { None }) {
+                    None -> { going = False }
+                    Some(raw) -> {
+                        let reduced = prune(raw)
+                        -- A rewrite to the same type is stuck, not progress.
+                        -- A reducer should answer `None` instead; the test
+                        -- makes one that does not cost an answer rather than
+                        -- a loop.
+                        if sameType(reduced, out) {
+                            going = False
+                        } else {
+                            out = reduced
                         }
                     }
-                    _ -> { going = False }
                 }
             }
             out
         }
     }
+}
+
+-- Returns whether a given may decide what `t` is: whether it is a family
+-- application, a skolem, or a variable.
+fun rewritable(t : Type) -> Bool = match t {
+    TFam(_, _, _) -> True
+    TCon(c) -> c.uid != 0
+    TVar(_) -> True
+    _ -> False
 }
 
 -- Occurs check, lowering levels along the way.
@@ -954,6 +957,14 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                     _ -> {}
                 }
             }
+            -- A skolem below the head may be one a given rewrites away:
+            -- under `Elem b ~ Int`, `Option (Elem b)` is `Option Int`, and
+            -- binding a variable from outside to it is no escape. So before
+            -- reporting one, rewrite `y` at every depth and ask again.
+            if Option.isSome(escaping(cell, y)) {
+                let deep = normalizeDeep(y, fams)
+                if !sameType(deep, y) { return unify(x, deep, where, context, fams) }
+            }
             match escaping(cell, y) {
                 Some(out) -> match openedEscape(y, out, cell.level) {
                     Some(opener) -> return typeError("the type '" + out + "' hidden by '"
@@ -1048,6 +1059,18 @@ fun unifyRest(x : Type, y : Type, where : Option Span, context : String,
     match fams {
         None -> mismatch(x, y, where, context)
         Some(f) -> f.defer(x, y, where, context)
+    }
+}
+
+-- Returns `t` with `normalize` applied at every depth.
+fun normalizeDeep(t : Type, fams : Option Families) -> Type {
+    let here = normalize(t, fams)
+    match here {
+        TApp(fn, arg, k) -> TApp(normalizeDeep(fn, fams), normalizeDeep(arg, fams), k)
+        TFun(params, ret) -> TFun(Array.map(params, normalizeDeep(_, fams)),
+                                  normalizeDeep(ret, fams))
+        TTuple(elems) -> TTuple(Array.map(elems, normalizeDeep(_, fams)))
+        _ -> here
     }
 }
 

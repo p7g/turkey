@@ -56,6 +56,7 @@ import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Env(..))
+import Turkey.Inert as Inert
 import Turkey.Core (..)
 import Turkey.Core as Cr
 import Turkey.Decls as Decls
@@ -1043,31 +1044,22 @@ fun familyFree(ty : Ty.Type) -> Bool = match Ty.prune(ty) {
     _ -> True
 }
 
--- The binding's equalities first, then the instances.
+-- A reducer for checking under `equations`: the binding's equalities, made
+-- canonical as the solver makes its givens, and the instances.
 --
--- The order is the solver's, and copied deliberately. A given equality is a
--- reduction rule for the family it names, and it has to be consulted first
--- because a family over a rigid variable never reduces through the instance
--- table at all.
+-- An equality that can never hold is dropped: the solver has already refused
+-- it where it was written, and a specialization that made one false is a
+-- binding that can never be called.
 fun famsOf(classes : ClassTable,
-           equations : Vec (Ty.Type, Ty.Type)) -> Ty.Families = Ty.Families {
-    reduce = fun(t) = {
-        for (left, right) in equations {
-            -- A rule from a family application to itself is no rule. Skipped
-            -- rather than returned, so the instance table still gets its turn:
-            -- returning it would leave `Field.tag Auto` unreduced next to the
-            -- `Int` it is, and stop the comparison that needs them equal.
-            if Ty.sameType(left, t) && !Ty.sameType(right, t) {
-                return Some(right)
-            }
-        }
-        match t {
-            TFam(name, arg, _) -> Classes.reduceFam(classes, name, arg)
-            _ -> None
-        }
-    },
-    defer = fun(_, _, _, _) = {},
-    untouchable = Ty.noScope,
+           equations : Vec (Ty.Type, Ty.Type)) -> Ty.Families {
+    let givens = Vec.new(len(equations))
+    for (left, right) in equations { Vec.push(givens, Ty.pred(Ty.equals, [left, right])) }
+    let (inert, _) = Inert.extend(Inert.empty(classes), Vec.toArray(givens))
+    Ty.Families {
+        reduce = fun(t) = Inert.rewritten(inert, t),
+        defer = fun(_, _, _, _) = {},
+        untouchable = Ty.noScope,
+    }
 }
 
 -- Whether `ty` is an instantiation of a scheme. One-way: the scheme's variables

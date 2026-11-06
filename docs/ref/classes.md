@@ -372,6 +372,59 @@ The left side of `~` must be an associated type applied to a type, and the
 right side may not mention that same application. A context may give each
 associated type application at most one equality.
 
+Before the body is checked, the compiler works out what the context's
+equalities say together. Each associated type in them is reduced through the
+instances first, so an equality may turn out to be about one of the function's
+own type variables. Then that variable and the type are interchangeable inside
+the function:
+
+<!-- run -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+instance Bag (Option a) {
+    type Elem = a
+}
+
+fun double[Elem (Option a) ~ Int](x : a) -> Int = x * 2
+
+fun main() {
+    print(double(21))
+}
+```
+
+```text
+42
+```
+
+`Elem (Option a)` is `a` by the instance, so the context says that `a` is
+`Int`, and `x * 2` is an `Int`. A caller still has to prove the equality as
+written: `double("s")` is refused, because `Elem (Option String)` is not `Int`.
+
+The equalities also rewrite each other. `[F a ~ G a, G a ~ F a]` states one
+fact twice, and `[F a ~ F (G b), G b ~ a]` says only that `G b` is `a`, since
+the first equality follows from the second.
+
+An equality that can never hold, whatever the caller picks, is an error at
+the signature:
+
+<!-- error: the equality 'Bag.Elem (Option a) ~ Option a' in this context can never hold; it would make 'a' contain itself -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+instance Bag (Option a) {
+    type Elem = a
+}
+
+fun unwrap[Elem (Option a) ~ Option a](x : a) -> a = x
+
+fun main() { }
+```
+
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.

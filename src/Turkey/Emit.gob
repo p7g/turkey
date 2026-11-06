@@ -40,7 +40,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..
                    RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
-import Turkey.Stream (Item(..))
+import Turkey.Stream (Item(..), Cfi(..))
 
 -- The items emitted so far, and the source position the next instruction
 -- takes (`Turkey.Position`).
@@ -63,10 +63,12 @@ type Code = Code {
     rows             : Bool,
     var row          : Int,
     var prologueDone : Bool,
+    -- The format, which decides the shape of the frame rules (`cfi`).
+    dialect          : Asm.Dialect,
 }
 
-fun code(items : Vec (Item Inst), rows : Bool) -> Code =
-    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False }
+fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
+    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d }
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -106,9 +108,10 @@ fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
 -- Function `tag`, with a line table row at each change of position if `rows`.
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
              l : Frame.Layout, tag : Int, rows : Bool, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, rows)
+    let b = code(out, rows, asm.dialect)
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
+    cfi(b, StartProc)
     -- A function the compiler made has no position. A row with no line
     -- starts it, or the last row of whatever came before would cover it.
     if rows && f.at == 0 { emit(b, Loc(0, False)) }
@@ -122,7 +125,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
-    let cold = Cold { text = code([], rows), count = 0 }
+    let cold = Cold { text = code([], rows, d), count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
@@ -150,6 +153,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
         zero(b, f)
         epilogue(b, l)
     }
+    cfi(b, EndProc)
     if rows { emit(b, Label(functionEnd(d, tag))) }
 }
 
@@ -373,15 +377,19 @@ fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> Asm.Symbol =
 -- reaches only 504 bytes up from `sp`: frames are often bigger than that.
 fun prologue(b : Code, l : Frame.Layout) -> Unit {
     instruction(b, A.StpPre(A.fp, A.lr, A.sp, -16))
+    exactly(b, [DefCfaOffset(16), SavedAt(fpColumn, -16), SavedAt(lrColumn, -8)])
     instruction(b, A.AddImm(A.fp, A.sp, 0, A.W64))
+    exactly(b, [DefCfa(fpColumn, 16)])
     adjust(b, l.size - 16, False)
     saves(b, l, True)
+    frameMode(b, l.pairs)
 }
 
 -- The prologue undone, and the return.
 fun epilogue(b : Code, l : Frame.Layout) -> Unit {
     unwind(b, l)
     instruction(b, A.Ret)
+    exactly(b, [RestoreState])
 }
 
 -- The prologue undone: the callee-saved registers, `sp` and the frame record
@@ -389,10 +397,15 @@ fun epilogue(b : Code, l : Frame.Layout) -> Unit {
 -- instruction whatever the frame's size, and is left out when the record is
 -- all the frame there is. Writes no argument register and no scratch, which
 -- is what lets a tail call unwind between its arguments and its branch.
+--
+-- The body's frame rules are remembered before it, and the caller puts them
+-- back after its last instruction (`exactly`), for the code that follows.
 fun unwind(b : Code, l : Frame.Layout) -> Unit {
+    exactly(b, [RememberState])
     saves(b, l, False)
     if l.size > 16 { instruction(b, A.AddImm(A.sp, A.fp, 0, A.W64)) }
     instruction(b, A.LdpPost(A.fp, A.lr, A.sp, 16))
+    exactly(b, [DefCfa(spColumn, 0), Restored(fpColumn), Restored(lrColumn)])
 }
 
 -- A tail call: the frame comes down with the arguments already in their
@@ -407,12 +420,14 @@ fun tailCall(b : Code, f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
     Left(sym) -> {
         unwind(b, l)
         instruction(b, A.B(sym))
+        exactly(b, [RestoreState])
     }
     Right(through) -> {
         let r = coloured(f, a, through)
         if !A.sameRegister(r, scratch) { instruction(b, A.Mov(scratch, r, A.W64)) }
         unwind(b, l)
         instruction(b, A.Br(scratch))
+        exactly(b, [RestoreState])
     }
 }
 
@@ -425,37 +440,100 @@ fun endsInTailCall(block : Block Inst) -> Bool {
 }
 
 -- The callee-saved registers the colouring actually used, saved on the way in
--- and restored on the way out, two to an instruction where two share a file.
+-- and restored on the way out, a pair to an instruction (`Frame.savedPairs`).
 --
 -- They are addressed from `x29`, not `sp`. The area sits directly below the
--- frame record and holds at most eighteen registers, so it is never more than
--- 144 bytes below `x29`, which a pair's offset reaches whatever the frame's
--- size; from `sp` it would be as far up as the frame is big. `Frame.layout`
--- gives each file an even number of slots, so the pairs are 16-byte aligned
--- and the last general register, when the count is odd, has a slot of its own.
+-- frame record and holds at most nine pairs, so it is never more than 144
+-- bytes below `x29`, which a pair's offset reaches whatever the frame's size;
+-- from `sp` it would be as far up as the frame is big.
+--
+-- The order is compact unwind's frame mode: the pairs present, packed down
+-- from `x29 - 8`, each with its lower register at the higher address, so
+-- `stp x20, x19, [x29, #-16]` and then `stp x22, x21, [x29, #-32]`. That is
+-- the only layout an unwinder can read from one 32-bit encoding per
+-- function; any other needs a DWARF description of the function.
+--
+-- `x27`/`x28` is stored whole, for that shape, and only `x27` comes back:
+-- `x28` is the running worker (`A.worker`), which a coroutine resumed on
+-- another thread must not see restored to the first thread's.
 fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
-    var at = l.savesAt - l.recordAt
-    for var k = 0; k < len(l.savedGp); k = k + 2 {
-        let r = Physical(Gp, l.savedGp[k])
-        if k + 1 < len(l.savedGp) {
-            let s = Physical(Gp, l.savedGp[k + 1])
-            instruction(b, if saving { A.Stp(r, s, A.fp, at) }
-                           else { A.Ldp(r, s, A.fp, at) })
+    for var k = 0; k < len(l.pairs); k = k + 1 {
+        let (bank, first) = l.pairs[k]
+        let at = -16 * (k + 1)
+        let low = Physical(bank, first)
+        let high = Physical(bank, first + 1)
+        if saving {
+            instruction(b, A.Stp(high, low, A.fp, at))
+            exactly(b, [SavedAt(column(low), at - 8)])
+            if !A.sameRegister(high, A.worker) {
+                exactly(b, [SavedAt(column(high), at - 16)])
+            }
+        } else if A.sameRegister(high, A.worker) {
+            instruction(b, A.Ldr(low, Offset(A.fp, at + 8), A.W64))
+            exactly(b, [Restored(column(low))])
         } else {
-            instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
-                           else { A.Ldr(r, Offset(A.fp, at), A.W64) })
+            instruction(b, A.Ldp(high, low, A.fp, at))
+            exactly(b, [Restored(column(low)), Restored(column(high))])
         }
-        at = at + 16
-    }
-    -- One at a time: `Stp` and `Ldp` are the general file's, and a function
-    -- saving a `d` register is rare.
-    for n in l.savedFp {
-        let r = Physical(Fp, n)
-        instruction(b, if saving { A.Str(r, Offset(A.fp, at), A.W64) }
-                       else { A.Ldr(r, Offset(A.fp, at), A.W64) })
-        at = at + 8
     }
 }
+
+-- -- the frame rules ---------------------------------------------------------
+
+-- Each function is described from a `StartProc` to an `EndProc`, in one of
+-- two shapes, by format.
+--
+-- **Mach-O: one block (`frameMode`)** after the prologue's last save: the CFA
+-- at `x29 + 16`, the frame record below it, and the saved pairs below that.
+-- That is the form an assembler encodes as compact unwind's frame mode, one
+-- word for the whole function. Rules that change from one instruction to the
+-- next have no compact encoding and need a DWARF description instead, which
+-- every function would then carry. The block is wrong inside the prologue
+-- and the epilogues, since frame mode does not look at the pc; a debugger
+-- stopped there reads the instructions of the frame it stopped in.
+--
+-- **ELF: exact at every instruction (`exactly`)**, since `.eh_frame` is the
+-- only description there is. The CFA moves from `sp` to `x29` in the
+-- prologue; each epilogue remembers the body's rules, undoes them load by
+-- load, and puts them back after its last instruction for the code that
+-- follows it. `x28`, the worker, is never described as saved: a frame never
+-- restores it, so its caller's value is the one it holds.
+fun cfi(b : Code, rule : Cfi) -> Unit = emit(b, Cfi(rule))
+
+-- The rules, on ELF.
+fun exactly(b : Code, rules : Array Cfi) -> Unit = match b.dialect {
+    Asm.Elf -> for rule in rules { cfi(b, rule) }
+    Asm.MachO -> {}
+}
+
+-- On Mach-O, the block frame mode encodes: the frame record at `x29`, and
+-- the pairs below it in the order `saves` stores them. Each pair is a bank
+-- and its lower register, as `Frame.savedPairs` gives it.
+fun frameMode(b : Code, pairs : Vec (Bank, Int)) -> Unit = match b.dialect {
+    Asm.MachO -> {
+        cfi(b, DefCfa(fpColumn, 16))
+        cfi(b, SavedAt(lrColumn, -8))
+        cfi(b, SavedAt(fpColumn, -16))
+        for var k = 0; k < len(pairs); k = k + 1 {
+            let (bank, first) = pairs[k]
+            cfi(b, SavedAt(column(Physical(bank, first)), -16 * k - 24))
+            cfi(b, SavedAt(column(Physical(bank, first + 1)), -16 * k - 32))
+        }
+    }
+    Asm.Elf -> {}
+}
+
+-- DWARF's number for a register.
+fun column(r : Reg) -> Int = match r {
+    Physical(Gp, n) -> n
+    Physical(Fp, n) -> 64 + n
+    Virtual(n) -> error("internal error: frame rules for the unallocated register %"
+                        + Int.toString(n))
+}
+
+let fpColumn = 29
+let lrColumn = 30
+let spColumn = 31
 
 -- `sp` up by `size` when `up`, down otherwise.
 fun adjust(b : Code, size : Int, up : Bool) -> Unit {
@@ -1013,7 +1091,7 @@ fun move(b : Code, d : Reg, s : Reg) -> Unit = match (d, s) {
 -- `turkey_panic` takes a C string (`lib/Turkey/Process.gob`), so each one
 -- ends in a zero.
 fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let ordered = byIndex(asm.messages)
     if len(ordered) == 0 { return }
     emit(b, Section(Asm.CStrings))
@@ -1033,7 +1111,7 @@ fun emitMessages(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- ran, which is what lets `ConstString` name literal *n* long before anything
 -- defined it.
 fun emitData(m : Module, asm : Asm.Asm, sites : Int, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     emitLiterals(asm, b)
     emit(b, Section(Asm.Data))
     -- A build that counts allocations (`Turkey.Sites`): the number of sites,
@@ -1131,6 +1209,12 @@ fun byIndex(table : Map.Map String Int) -> Vec String {
 -- is the same steps the other way round, ending in a `ret` to the return
 -- address the other stack parked with.
 --
+-- Its frame rules are exact at every instruction on both formats, and so on
+-- Mach-O they are a DWARF description rather than a compact encoding. The
+-- CFA is `sp + 16` from the record's stores to its loads, across the switch
+-- of `sp` as well: the record parked on the other stack has the same shape,
+-- so a stop just after the switch shows the stack being resumed.
+--
 -- It saves no register but the record: the call preserves none
 -- (`A.PreservesNone`), so the caller has already put everything it needs
 -- after the call in its frame. The worker's running stack changes here and
@@ -1138,15 +1222,19 @@ fun byIndex(table : Map.Map String Int) -> Vec String {
 -- it name the wrong one. `x16` and `x17` are the scratch registers, which the allocator
 -- never hands out.
 fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     let x16 = Physical(Gp, 16)
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.swapStackSymbol))
+    cfi(b, StartProc)
     instruction(b, A.SubImm(A.sp, A.sp, 16, A.W64))
+    cfi(b, DefCfaOffset(16))
     instruction(b, A.Str(A.fp, Offset(A.sp, 0), A.W64))
+    cfi(b, SavedAt(fpColumn, -16))
     instruction(b, A.Str(A.lr, Offset(A.sp, 8), A.W64))
+    cfi(b, SavedAt(lrColumn, -8))
     instruction(b, A.AddImm(x16, A.sp, 0, A.W64))
     instruction(b, A.Str(x16, Offset(A.x0, Rt.stackParked), A.W64))
     instruction(b, A.Str(x1, Offset(A.worker, Rt.workerRunningStack), A.W64))
@@ -1154,9 +1242,13 @@ fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
     instruction(b, A.Str(A.xzr, Offset(x1, Rt.stackParked), A.W64))
     instruction(b, A.AddImm(A.sp, x16, 0, A.W64))
     instruction(b, A.Ldr(A.fp, Offset(A.sp, 0), A.W64))
+    cfi(b, Restored(fpColumn))
     instruction(b, A.Ldr(A.lr, Offset(A.sp, 8), A.W64))
+    cfi(b, Restored(lrColumn))
     instruction(b, A.AddImm(A.sp, A.sp, 16, A.W64))
+    cfi(b, DefCfaOffset(0))
     instruction(b, A.Ret)
+    cfi(b, EndProc)
 }
 
 -- `turkey_stack_start`, where a new coroutine stack's first switch lands:
@@ -1170,18 +1262,30 @@ fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- this one, for the last time: nothing resumes a stack whose body has
 -- returned, and the `brk` says so if something does. `sp` is where it was on
 -- the way in, since the callee restores it, so the word is still there.
+--
+-- It is the outermost frame of the coroutine's stack, and its frame rules say
+-- so: an unwinder stops here, at the coroutine's base, as the collector's walk
+-- does, and not at whatever resumed it. On ELF the return address is
+-- undefined, the convention for an outermost frame. On Mach-O frame mode
+-- describes the record `x29` already points at, whose return address is 0.
 fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.stackStartSymbol))
+    cfi(b, StartProc)
+    match d {
+        Asm.Elf -> cfi(b, Undefined(lrColumn))
+        Asm.MachO -> frameMode(b, [])
+    }
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     instruction(b, A.Bl(Asm.symbolFor(d, Rt.coroutineStart), A.Standard))
     instruction(b, A.Ldr(A.x0, Offset(A.sp, 0), A.W64))
     instruction(b, A.Ldr(x1, Offset(A.x0, Rt.stackResumedBy), A.W64))
     call(b, d, Rt.swapStackSymbol)
     instruction(b, A.Brk(1))
+    cfi(b, EndProc)
 }
 
 -- `turkey_worker_start(record)`, a worker thread's start routine for
@@ -1192,21 +1296,19 @@ fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- that `x28` is still this worker's. A full frame record, so that the worker's
 -- stack has an outermost one, and `x28` saved, since C keeps it.
 fun emitWorkerStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.workerStartSymbol))
-    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
-    instruction(b, A.Str(A.fp, Offset(A.sp, 16), A.W64))
-    instruction(b, A.Str(A.lr, Offset(A.sp, 24), A.W64))
-    instruction(b, A.AddImm(A.fp, A.sp, 16, A.W64))
-    instruction(b, A.Str(A.worker, Offset(A.sp, 0), A.W64))
+    cfi(b, StartProc)
+    frameFromC(b)
     instruction(b, A.Mov(A.worker, A.x0, A.W64))
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     instruction(b, A.Bl(Asm.symbolFor(d, Rt.workerRun), A.Standard))
     instruction(b, A.Bl(Asm.turkeyEntry(d, "turkey_worker_ended"), A.Standard))
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     returnToC(b)
+    cfi(b, EndProc)
 }
 
 -- What has to happen before the program's own code, and `main`.
@@ -1222,16 +1324,15 @@ fun emitWorkerStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 -- on it.
 fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
               out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let d = asm.dialect
     emit(b, Section(Asm.Text))
     function(b, Asm.entrySymbol(d))
+    cfi(b, StartProc)
     -- A frame of its own, because everything below is a call. Thirty-two
     -- bytes: the record, and the alignment Apple requires.
-    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
-    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
-    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
-    instruction(b, A.AddImm(Physical(Gp, 29), A.sp, 16, A.W64))
+    record(b, 32)
+    frameMode(b, [])
     instruction(b, A.Bl(Asm.symbolFor(d, m.early), A.Standard))
     symbolInto(b, A.x0, Asm.runtimeFor(d, Rt.processState))
     instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W64))
@@ -1281,33 +1382,53 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     emit(b, Label(Asm.localLabel(d, "entry_done")))
     if sites > 0 { writeSites(b, d, sites) }
     call(b, d, "turkey_entry_returned")
-
-    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
-    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
-    instruction(b, A.AddImm(A.sp, A.sp, 32, A.W64))
-    instruction(b, A.Ret)
+    unrecord(b, 32)
+    cfi(b, EndProc)
 
     -- Early initialization, for a C caller that runs the program's Turkey
     -- code without running the program: the runtime's own C tests. It takes
     -- no environment, and comes in from C as a `foreign` definition does.
     function(b, Asm.runtimeFor(d, "turkey_giblets_initialize"))
+    cfi(b, StartProc)
     enterFromC(b, d)
     instruction(b, A.Bl(Asm.symbolFor(d, m.early), A.Standard))
     returnToC(b)
+    cfi(b, EndProc)
 
     -- `main` itself: `Turkey.Entry`'s, reached by its C symbol. `argv` is
     -- already in `x1`, and `argc` in `w0`, widened to the `Int` a foreign
     -- definition takes: AAPCS64 leaves the upper half of an `int` undefined.
     function(b, Asm.runtimeFor(d, "main"))
-    instruction(b, A.SubImm(A.sp, A.sp, 16, A.W64))
-    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
-    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
-    instruction(b, A.AddImm(Physical(Gp, 29), A.sp, 0, A.W64))
+    cfi(b, StartProc)
+    record(b, 16)
+    frameMode(b, [])
     instruction(b, A.Sxtw(A.x0, A.x0))
     call(b, d, "turkey_main")
-    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
-    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
-    instruction(b, A.AddImm(A.sp, A.sp, 16, A.W64))
+    unrecord(b, 16)
+    cfi(b, EndProc)
+}
+
+-- A frame of `size` bytes with its record at the top, made with `sp` moved
+-- once and then the record stored, as code that C calls makes it.
+fun record(b : Code, size : Int) -> Unit {
+    instruction(b, A.SubImm(A.sp, A.sp, size, A.W64))
+    exactly(b, [DefCfaOffset(size)])
+    instruction(b, A.Str(A.fp, Offset(A.sp, size - 16), A.W64))
+    exactly(b, [SavedAt(fpColumn, -16)])
+    instruction(b, A.Str(A.lr, Offset(A.sp, size - 8), A.W64))
+    exactly(b, [SavedAt(lrColumn, -8)])
+    instruction(b, A.AddImm(A.fp, A.sp, size - 16, A.W64))
+    exactly(b, [DefCfa(fpColumn, 16)])
+}
+
+-- `record` undone, and the return.
+fun unrecord(b : Code, size : Int) -> Unit {
+    instruction(b, A.Ldr(A.fp, Offset(A.sp, size - 16), A.W64))
+    exactly(b, [DefCfa(spColumn, size), Restored(fpColumn)])
+    instruction(b, A.Ldr(A.lr, Offset(A.sp, size - 8), A.W64))
+    exactly(b, [Restored(lrColumn)])
+    instruction(b, A.AddImm(A.sp, A.sp, size, A.W64))
+    exactly(b, [DefCfaOffset(0)])
     instruction(b, A.Ret)
 }
 
@@ -1353,7 +1474,7 @@ fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
 -- and making no frame: the body's frame record then holds its Turkey
 -- caller's return address, as at any call.
 fun emitDefinitions(m : Module, asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     for (sym, name) in m.definitions {
         for f in m.functions {
             if f.name == name {
@@ -1365,13 +1486,19 @@ fun emitDefinitions(m : Module, asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
                     }
                 }
                 function(b, Asm.runtimeFor(asm.dialect, sym))
+                cfi(b, StartProc)
                 enterFromC(b, asm.dialect)
                 shiftArguments(b, general)
                 instruction(b, A.Bl(Asm.symbolFor(asm.dialect, name), A.Standard))
                 returnToC(b)
+                cfi(b, EndProc)
+                -- No frame, and so no rules: the return address is in `x30`
+                -- throughout.
                 emit(b, Label(Asm.turkeyEntry(asm.dialect, sym)))
+                cfi(b, StartProc)
                 shiftArguments(b, general)
                 instruction(b, A.B(Asm.symbolFor(asm.dialect, name)))
+                cfi(b, EndProc)
             }
         }
     }
@@ -1390,20 +1517,25 @@ fun shiftArguments(b : Code, general : Int) -> Unit {
 -- `x28` saved and the worker's set (`emitDefinitions` says why both). Leaves
 -- every argument register as it found it.
 fun enterFromC(b : Code, d : Asm.Dialect) -> Unit {
-    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
-    instruction(b, A.Str(A.fp, Offset(A.sp, 16), A.W64))
-    instruction(b, A.Str(A.lr, Offset(A.sp, 24), A.W64))
-    instruction(b, A.AddImm(A.fp, A.sp, 16, A.W64))
-    instruction(b, A.Str(A.worker, Offset(A.sp, 0), A.W64))
+    frameFromC(b)
     symbolInto(b, A.worker, Asm.runtimeFor(d, Rt.processState))
+}
+
+-- The frame record, and the caller's `x28` below it, stored with `x27` as a
+-- pair: `x27` at `x29 - 8` and `x28` at `x29 - 16` is the shape compact
+-- unwind's frame mode describes for the pair (`saves`). Only `x28` comes back
+-- (`returnToC`); `x27` is one the body preserves.
+fun frameFromC(b : Code) -> Unit {
+    record(b, 32)
+    instruction(b, A.Stp(A.worker, Physical(Gp, 27), A.sp, 0))
+    exactly(b, [SavedAt(column(A.worker), -32)])
+    frameMode(b, [(Gp, 27)])
 }
 
 fun returnToC(b : Code) -> Unit {
     instruction(b, A.Ldr(A.worker, Offset(A.sp, 0), A.W64))
-    instruction(b, A.Ldr(A.fp, Offset(A.sp, 16), A.W64))
-    instruction(b, A.Ldr(A.lr, Offset(A.sp, 24), A.W64))
-    instruction(b, A.AddImm(A.sp, A.sp, 32, A.W64))
-    instruction(b, A.Ret)
+    exactly(b, [Restored(column(A.worker))])
+    unrecord(b, 32)
 }
 
 -- A symbol's address, in a register: the page, then the offset within it.
@@ -1452,7 +1584,7 @@ fun byteLength(text : String) -> Int {
 -- computing them since phase 4.
 fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
                    out : Vec (Item Inst)) -> Unit {
-    let b = code(out, False)
+    let b = code(out, False, asm.dialect)
     let d = asm.dialect
     emit(b, Section(Asm.Relocated))
     emit(b, Align(3))

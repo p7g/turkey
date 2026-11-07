@@ -1,0 +1,92 @@
+-- The benchmark server: `server PORT [CERT KEY]`, over TLS when given a
+-- certificate chain and its key. Every implementation under bench/http/
+-- serves the same four routes:
+--
+--     GET  /hello    "Hello, world!\n", 14 bytes
+--     GET  /1m       1 MiB, with its length
+--     POST /upload   reads the body, up to 2 MiB, discards it, returns "ok\n"
+--     GET  /stream   1 MiB as 64 writes of 16 KiB, chunked
+--
+-- The limit on connections is raised to 20000, over the default 1024, so
+-- the 10,000-connection run is not refused.
+
+import Net as Net
+import Net.HTTP (..)
+import Net.HTTP.Headers as Headers
+import Net.HTTP.Limits as Limits
+import Net.HTTP.MediaType as MediaType
+import Net.HTTP.Server as Server
+import Net.HTTP.Server (Respond, Done, respond)
+import Net.TCP as TCP
+import Net.TLS as TLS
+import System.Env as Env
+import System.IO as IO
+import System.IO (Read(..), Write(..))
+
+let hello = "Hello, world!\n"
+
+let piece = 16384
+
+let pieces = 64
+
+-- One 16 KiB buffer the stream writes 64 times, and one 1 MiB buffer every
+-- `/1m` response sends. Neither is changed once filled.
+let chunk = filled(piece)
+
+let mebibyte = filled(piece * pieces)
+
+fun filled(n : Int) -> IO.Buffer {
+    let b = IO.buffer(n)
+    let x = String.toBytes("x")[0]
+    for _ in Int.range(0, n) { IO.push(b, x) }
+    b
+}
+
+fun handle(req : Request Incoming, r : Respond) -> Done = match (req.method, req.target.path) {
+    (GET, "/hello") -> respond(r, body(OK, MediaType.plainText, hello))
+    (GET, "/1m") -> respond(r, body(OK, MediaType.octetStream, mebibyte))
+    (POST(content), "/upload") -> respond(r, discard(content))
+    (GET, "/stream") -> respond(r, stream(OK, MediaType.octetStream, LengthUnknown, fun(sink) {
+        for _ in Int.range(0, pieces) { writeFrom(sink, chunk)? }
+        Right(Headers.empty)
+    }))
+    _ -> respond(r, NotFound)
+}
+
+-- Reads the body 64 KiB at a time into one buffer, keeping none of it.
+fun discard(content : Incoming) -> ServerResponse {
+    let from = limited(content, 2 * 1048576)
+    let buf = IO.buffer(65536)
+    loop {
+        IO.clear(buf)
+        match readInto(from, buf) {
+            Right(0) -> break
+            Right(_) -> {}
+            Left(_) -> return statusOnly(BadRequest)
+        }
+    }
+    body(OK, MediaType.plainText, "ok\n")
+}
+
+fun main() {
+    let args = Env.args()
+    if len(args) != 1 && len(args) != 3 {
+        error("usage: server PORT [CERT KEY]")
+    }
+    let port = Option.expect(Int.parse(args[0]), "a port")
+    let address = Option.expect(Net.parse("127.0.0.1"), "an address")
+    let l = match TCP.listen(address, port) {
+        Right(l) -> l
+        Left(e) -> error("listen: " + show(e))
+    }
+    let config = Server.limits(Limits.connections(20000))
+    if len(args) == 1 {
+        Server.serve(l, config, handle)
+    } else {
+        let tls = match TLS.serverConfig([TLS.Certificate { chain = args[1], key = args[2] }], ["http/1.1"]) {
+            Right(c) -> c
+            Left(e) -> error("tls: " + show(e))
+        }
+        Server.serve(TLS.acceptor(l, tls), config, handle)
+    }
+}

@@ -1,0 +1,87 @@
+# The HTTP benchmark, bench/http/run.sh, on a free arm64 Linux runner: on a
+# pull request that changes it, and on demand, for some scenarios or all.
+#
+# A free runner has four cores, so each server gets two and the load
+# generator the other two. A runner is a virtual machine on a shared host,
+# so its numbers are noisier than a quiet machine's; compare runs from the
+# same job, not across jobs. The job summary has a table per scenario and
+# every tool's version, and results.tsv is kept as an artifact.
+name: http-bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "Scenarios to run, separated by spaces; empty for all"
+        required: false
+        default: ""
+  pull_request:
+    paths:
+      - bench/http/**
+      - "!bench/http/profile.sh"
+      - lib/Net/**
+      - .github/workflows/http-bench.yml
+
+env:
+  TURKEY_CC: gcc
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: bench/http/go/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "23"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install wrk, nginx, OpenSSL, GNU time, Ruby, Python
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk nginx libssl-dev openssl time ruby ruby-dev python3-venv
+          sudo systemctl stop nginx || true
+          python3 -m venv "$HOME/venv"
+          "$HOME/venv/bin/pip" install --quiet uvicorn uvloop httptools gunicorn
+          echo "$HOME/venv/bin" >> "$GITHUB_PATH"
+          gem install --user-install --no-document puma
+          echo "$(ruby -e 'print Gem.user_dir')/bin" >> "$GITHUB_PATH"
+          cargo install --locked --quiet oha
+      - run: sh scripts/build.sh --fixpoint
+      - name: Run the benchmark
+        env:
+          CORES: 2
+          LOAD_THREADS: 2
+          CONNLOAD_PROCS: 2
+          IDLE_PCT: 80
+        run: |
+          ulimit -n "$(ulimit -Hn)"
+          sh bench/http/run.sh ${{ inputs.scenarios }}
+      - name: Summarize
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '## HTTP benchmark'
+            echo
+            echo 'Median of 3 runs [range]. Each server has 2 cores, the load generator 2.'
+            echo
+            echo '```'
+            cat build/bench/http/versions.txt
+            echo '```'
+            echo
+            python3 bench/http/summarize.py
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: http-bench
+          path: |
+            build/bench/http/results.tsv
+            build/bench/http/versions.txt

@@ -138,6 +138,35 @@ fun main() {{
     assert result.stdout == "4099\nz True 19\n"
 
 
+def test_pointer_fields_past_an_immediate_offset_keep_their_strings():
+    # Traced fields come first, so 4200 strings put pointers past 4095 bytes
+    # and past 32760: the collector must scan every one of them, and a store
+    # or load of the far ones needs the offset in a register. The loop after
+    # building them allocates enough to collect while they are live.
+    count = 4200
+    fields = ", ".join(f"f{i} : String" for i in range(count))
+    values = ", ".join(f"f{i} = Int.toString(i + {i})" for i in range(count))
+    src = f"""
+type Strings = Strings {{ {fields}, var n : Int }}
+
+fun make(i : Int) -> Strings = Strings {{ {values}, n = i }}
+
+fun main() {{
+    let kept = []
+    for var i = 0; i < 20; i = i + 1 {{ Vec.push(kept, make(i)) }}
+    let churn = []
+    for var i = 0; i < 2000; i = i + 1 {{ Vec.push(churn, Int.toString(i)) }}
+    let h = kept[19]
+    h.n = h.n + len(churn)
+    print(h.f0 + " " + h.f511 + " " + h.f4094 + " " + h.f{count - 1})
+    print(h.n)
+}}
+"""
+    result = lang.run(src, env=STRESS, flags=("--gc-verify",))
+    assert result.code == 0, result.stderr
+    assert result.stdout == f"19 530 4113 {19 + count - 1}\n2019\n"
+
+
 def test_a_closure_capturing_more_pointers_than_a_header_counts_is_an_error():
     # Parameters rather than locals, so the source does not nest 65536 deep.
     count = 65536

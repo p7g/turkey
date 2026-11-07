@@ -17,7 +17,7 @@ export (
 
 import System.Env as Env
 import System.IO as IO
-import Turkey.Source (Span(..), outermost, showSpan)
+import Turkey.Source (Span(..), generated, isGenerated, outermost, showSpan)
 
 -- An `Error` stops the compile at the end of the stage that reports it. A
 -- `Warning` is printed and stops nothing.
@@ -39,7 +39,7 @@ type Diag = Diag {
 -- diagnostic is about the function the code runs in, and the callee's own
 -- text is in another function and perhaps another file.
 fun at(stage : String, message : String, where : Span) -> Diag = Diag {
-    stage = stage, message = short(message), span = Some(outermost(where)), severity = Error,
+    stage = stage, message = short(message), span = placed(where), severity = Error,
 }
 
 -- A diagnostic about a whole file rather than a place in it: a file that cannot
@@ -48,8 +48,16 @@ fun whole(stage : String, message : String) -> Diag =
     Diag { stage = stage, message = short(message), span = None, severity = Error }
 
 fun warningAt(message : String, where : Span) -> Diag = Diag {
-    stage = "warning", message = short(message), span = Some(outermost(where)),
-    severity = Warning,
+    stage = "warning", message = short(message), span = placed(where), severity = Warning,
+}
+
+-- Returns where a diagnostic at `where` points. A generated span points at no
+-- text, so a diagnostic there is about the whole file, rather than printed at
+-- `<generated>:0:0`, a place no reader can open. Generated code inlined into
+-- a caller still points at the call.
+fun placed(where : Span) -> Option Span {
+    let s = outermost(where)
+    if isGenerated(s) { None } else { Some(s) }
 }
 
 fun render(d : Diag, filename : String) -> String = match d.span {
@@ -179,7 +187,8 @@ fun fail(d : Diag, filename : String) -> a {
     printCollected()
     let cascade = unitFailed || (errorSeen && d.stage == "internal error")
     if !cascade {
-        let name = if filename == "" { entryFile } else { filename }
+        let name = if filename == "" || filename == generated().file { entryFile }
+                   else { filename }
         let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
     }
     Env.exit(1)

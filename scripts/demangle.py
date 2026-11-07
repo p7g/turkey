@@ -145,6 +145,11 @@ class _Scan:
                 and (self.peek(1) or "").isupper():
             self.at += 1
             last = self.ident()
+        # A derived `Typed` instance's count of arguments.
+        if self.peek() == "/":
+            self.at += 1
+            while (self.peek() or "").isdigit():
+                self.at += 1
         if self.peek() == "@" and self.peek(1) != "[":
             self.at += 1
             args = self.type_arguments()

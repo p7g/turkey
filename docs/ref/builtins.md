@@ -274,18 +274,47 @@ Ada Bo
 
 The instances the library provides for built-in types:
 
-| Type | `Eq` | `Ord` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
-|---|---|---|---|---|---|---|
-| `Int` | yes | yes | yes | yes | yes | yes |
-| `Float` | yes | yes | yes | yes | no | yes |
-| `Byte`, `Char`, `Bool` | yes | yes | no | no | no | yes |
-| `String` | yes | yes | concatenation | no | no | yes |
-| tuples of 2 to 4 elements | if the elements have it | if the elements have it | no | no | no | if the elements have it |
-| `Option a`, `Either l r` | if the contents have it | no | no | no | no | if the contents have it |
-| `Array a`, `Vec a` | no | no | concatenation | no | no | if the elements have it |
-| `Unit` | no | no | no | no | no | no |
+| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
+|---|---|---|---|---|---|---|---|
+| `Int` | yes | yes | yes | yes | yes | yes | yes |
+| `Float` | yes | yes | no | yes | yes | no | yes |
+| `Byte`, `Char`, `Bool` | yes | yes | yes | no | no | no | yes |
+| `String` | yes | yes | yes | concatenation | no | no | yes |
+| tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
+| `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
+| `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
+| `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | no | no | if the elements have it |
+| `Unit` | yes | no | yes | no | no | no | no |
 
-Tuples compare lexicographically, and strings compare byte by byte.
+Tuples compare lexicographically, and strings compare byte by byte. Two
+arrays are equal when they have the same length and equal elements at each
+index, and so are two `Vec`s, whatever their capacity. Two maps are equal when
+they have the same keys with equal values, and two `Set`s when they have the
+same elements, whatever order the entries were added in.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let stack = []
+    Vec.push(stack, 1)
+    Vec.push(stack, 2)
+    print(stack == [1, 2])
+
+    let ages = Map.new()
+    Map.put(ages, "Ada", 36)
+    Map.put(ages, "Bo", 41)
+    let again = Map.new()
+    Map.put(again, "Bo", 41)
+    Map.put(again, "Ada", 36)
+    print(ages == again)
+}
+```
+
+```text
+True
+True
+```
 
 ## `Show` and printing
 

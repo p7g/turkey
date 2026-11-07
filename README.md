@@ -307,6 +307,18 @@ cannot do what it needs: under
 statically needs compiler-rt built for aarch64, which Ubuntu's clang does not
 ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
 
+### Editor support
+
+`vim/` is a Vim and Neovim plugin for `.gob` files: filetype detection,
+syntax highlighting and indentation. Add the directory to `runtimepath`, or
+point a plugin manager at it (`Plug '~/path/to/turkey/vim'`). Its tests run
+headless in whichever of `vim` and `nvim` are installed, and check that the
+fixture parses when `TURKEY_BOOT` or `build/stages/stage2` is a compiler:
+
+```sh
+sh vim/test/run.sh
+```
+
 ## Project status
 
 Turkey is an experimental language under active development. The compiler is

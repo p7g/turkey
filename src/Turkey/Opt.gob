@@ -38,9 +38,11 @@ export (
 -- expression into a body that mentions its parameter twice would evaluate it
 -- twice, and into one that mentions it never would evaluate it never. So an
 -- argument becomes a `CLet`, which is exactly a call-by-value binding. The
--- exception is an argument that is already a **value**: duplicating one costs
--- nothing and evaluates nothing, and substituting it is what lets the next
--- reduction see through it.
+-- exception is an argument that is already a **value**: duplicating one
+-- evaluates nothing, and substituting it is what lets the next reduction see
+-- through it. A value that builds a heap object is the one whose copies cost
+-- something, an object each, so it is substituted whole only where its
+-- parameter is used at most once (`applyNames`).
 --
 -- ## Every binder is bound once
 --
@@ -654,6 +656,10 @@ fun reduceProgram(program : CProgram, decls : DeclTable, table : Binders.Table,
     let wanted = Vec.filter(binds, \keepsCallSites(_.module_))
     let callSites = reachable(graph, Vec.map(wanted, _.name))
     let base = newReducer(program, decls, graph, walked, runs, table, callSites)
+    -- `builds` reads these, and each is computed on first use and cached in
+    -- `decls`, so the first use must not race another.
+    discard(Decls.newtypes(decls))
+    discard(Decls.flatCandidates(decls))
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
@@ -1813,9 +1819,9 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
 -- fields, as `flattenJoin` passes them to a join that stays: each such field
 -- is bound to a name, and the parameter to the constructor rebuilt from those
 -- names, which `knownLet` can take apart where the body matches on it. A
--- constructor of values is a value, and is substituted like any other. Every
--- other argument that is not a value is bound to a name too, so that the
--- arguments are still evaluated left to right, before the body.
+-- constructor of values is a value, and is bound as `applyNames` binds one.
+-- Every other argument that is not a value is bound to a name too, so that
+-- the arguments are still evaluated left to right, before the body.
 fun atTheJump(r : Reducer, params : Array CParam, args : Vec Core, body : Core,
               ty : Ty.Type) -> Core {
     let lets = []
@@ -2261,14 +2267,19 @@ fun applyParams[Iterator p, Length p, Item p ~ CParam,
 -- `body` with each binder bound to its argument.
 --
 -- A value argument is substituted, because seeing through it is what lets the
--- next reduction fire, and each mention gets a copy of its own. Everything
--- else becomes a `CLet`, which is call by value written down.
+-- next reduction fire, and each mention gets a copy of its own. A value that
+-- builds a heap object (`builds`) is substituted whole only when `body` makes
+-- at most one copy of a heap object in it (`usesOf`), since each copy is an
+-- object of its own. Otherwise each heap object in it is built once, and
+-- every `match` on the binder that can take it apart still gets the build. Everything else becomes a `CLet`, which is call by value written
+-- down. The `let`s around an argument become `let`s here, and what they
+-- surround is the argument.
 --
 -- The `let`s are sequential where a call is not: `let a = e1 in let b = e2`
 -- puts `a` in scope for `e2`, where a call evaluates every argument in the
 -- caller's scope. That is sound because no argument mentions a binder this
 -- binds: an argument is the caller's term, and each of these binders is bound
--- only in the body, or, for a copy, is fresh.
+-- only in the body, is fresh, or was bound inside that one argument.
 fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
                Index c, Key c ~ Int, Value c ~ Core, Iterator c, Item c ~ Core](
         r : Reducer, binders : n, args : c, body : Core, ty : Ty.Type,
@@ -2277,44 +2288,114 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     let names = Array.map(binders, fun((name, _)) = name)
     let ids = Array.map(binders, fun((_, id)) = id)
     let subst = Map.new()
+    let scrutinees = Map.new()
     let renamed = Map.new()
     let lets = Vec.new(len(names))
-    for var i = 0; i < len(names); i = i + 1 {
-        if isValue(d, args[i]) {
-            Map.put(subst, ids[i], args[i])
-        } else {
-            let bound = match how {
-                Moving -> (names[i], ids[i])
-                _ -> {
-                    let made = (names[i], mint(r))
-                    Map.put(renamed, ids[i], made)
-                    made
-                }
-            }
-            Vec.push(lets, (bound, args[i]))
-        }
-    }
-    var out = match how {
-        Moving -> if len(subst) == 0 { body } else { moved(r, body, subst) }
-        Copying -> copyWith(fun() = mint(r), body, subst, renamed, True, None)
-        Inlined(callee, span) -> {
-            let site = Option.map(span, fun(call) = InlineSite { callee = callee, call = call })
-            copyWith(fun() = mint(r), body, subst, renamed, True, Some(site))
+    let boundAs = fun(i) = match how {
+        Moving -> (names[i], ids[i])
+        _ -> {
+            let made = (names[i], mint(r))
+            Map.put(renamed, ids[i], made)
+            made
         }
     }
     -- A parameter of an inlined call is bound inside the call, where a
     -- debugger shows the callee's variables, though its value is the
     -- caller's: so its binding's span is the argument's, at the call's site.
-    let bindingSpan = fun(arg : Core) -> Option Span = match how {
-        Inlined(callee, Some(call)) -> Option.map(arg.span, fun(s) =
+    let bindingSpan = fun(span : Option Span) -> Option Span = match how {
+        Inlined(callee, Some(call)) -> Option.map(span, fun(s) =
             inlinedAt(s, Some(InlineSite { callee = callee, call = call })))
-        _ -> arg.span
+        _ -> span
+    }
+    for var i = 0; i < len(names); i = i + 1 {
+        -- The argument's own `let`s keep their order, their ids and their
+        -- spans, since the argument is placed once. Peeling them is what
+        -- shows the value an inlined call answers when it bound a build
+        -- once: `let t = C(..) in D(t, t)`.
+        let arg = peeled(args[i], lets)
+        let binder = ids[i]
+        if !isValue(d, arg) {
+            Vec.push(lets, (boundAs(i), arg, bindingSpan(arg.span)))
+        } else if !builds(d, arg) {
+            Map.put(subst, binder, arg)
+        } else {
+            let uses = usesOf(body, binder)
+            -- A copy at a `match` that takes the root apart leaves no root
+            -- behind, but each of its heap parts is a second object, which an
+            -- arm may bind.
+            let partsBuild = Iterator.any(knownParts(arg), builds(d, _))
+            let copies = if partsBuild { plus(uses.reads, uses.matches) } else { uses.reads }
+            if atMostOnce(copies) {
+                Map.put(subst, binder, arg)
+            } else {
+                -- So every heap part is built once, and only the root is
+                -- copied.
+                let shared = sharedParts(r, lets, arg)
+                if heapRoot(d, shared) && !never(uses.reads) {
+                    Map.put(scrutinees, binder, shared)
+                    Vec.push(lets, (boundAs(i), shared, bindingSpan(shared.span)))
+                } else {
+                    Map.put(subst, binder, shared)
+                }
+            }
+        }
+    }
+    let minted = fun() = mint(r)
+    var out = match how {
+        Moving -> if len(subst) == 0 && len(scrutinees) == 0 {
+            body
+        } else {
+            copyTerm(copier(minted, subst, scrutinees, Map.new(), False, None), body)
+        }
+        Copying -> copyTerm(copier(minted, subst, scrutinees, renamed, True, None), body)
+        Inlined(callee, span) -> {
+            let site = Option.map(span, fun(call) = InlineSite { callee = callee, call = call })
+            copyTerm(copier(minted, subst, scrutinees, renamed, True, Some(site)), body)
+        }
     }
     for var i = len(lets) - 1; i >= 0; i = i - 1 {
-        let ((name, id), arg) = lets[i]
-        out = mkCore(ty, bindingSpan(arg), CLet(name, id, arg.ty, arg, out, []))
+        let ((name, id), value, span) = lets[i]
+        out = mkCore(ty, span, CLet(name, id, value.ty, value, out, []))
     }
     out
+}
+
+-- Returns the term inside `e`'s `let`s, and pushes each `let`'s binder, value
+-- and span to `lets`, outermost first. Stops at a `let` that generalizes.
+fun peeled(e : Core, lets : Vec ((String, Int), Core, Option Span)) -> Core =
+    match e.kind {
+    CLet(name, id, _, value, body, binders) -> if len(binders) == 0 {
+        Vec.push(lets, ((name, id), value, e.span))
+        peeled(body, lets)
+    } else {
+        e
+    }
+    _ -> e
+}
+
+-- Returns `e` with each of its parts that builds a heap object bound to a
+-- fresh name in `lets`, after that part's own parts. `e`'s root is left as
+-- it is.
+fun sharedParts(r : Reducer, lets : Vec ((String, Int), Core, Option Span),
+                e : Core) -> Core {
+    let part = fun(p) {
+        let made = sharedParts(r, lets, p)
+        if heapRoot(r.decls, made) {
+            let (name, id) = fresh(r, "part")
+            Vec.push(lets, ((name, id), made, made.span))
+            mkCore(made.ty, made.span, CVar(ById(id)))
+        } else {
+            made
+        }
+    }
+    match e.kind {
+        CTuple(parts) -> mkCore(e.ty, e.span, CTuple(Array.map(parts, part)))
+        CApp(fn, args) -> match fn.kind {
+            CCon(_) -> mkCore(e.ty, e.span, CApp(fn, Array.map(args, part)))
+            _ -> e
+        }
+        _ -> e
+    }
 }
 
 -- Apply a result match at every yielding tail of `e`, each a copy of `alts`.
@@ -2386,7 +2467,7 @@ fun freshened(mint : fun() -> Int, e : Core) -> Core =
 
 -- Returns a copy of `alts` as `freshened` copies a term, patterns included.
 fun freshenedAlts(mint : fun() -> Int, alts : Vec CAlt) -> Vec CAlt {
-    let c = copier(mint, Map.new(), Map.new(), True, None)
+    let c = copier(mint, Map.new(), noScrutinees, Map.new(), True, None)
     Vec.map(alts, fun(a) = CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) })
 }
 
@@ -2405,7 +2486,12 @@ type Copier = Copier {
     -- What each skolem an opening in the copy rigidified is replaced by, by
     -- its uid: the copy's own skolem. Empty until the copy meets an opening.
     skolems : Map Int Ty.Type,
+    -- What each variable is replaced by, by its id, wherever it is read.
     subst : Map Int Core,
+    -- What each variable is replaced by, by its id, where it is the
+    -- scrutinee of a `match` that can take it apart (`takesApart`), and
+    -- nowhere else.
+    scrutinees : Map Int Core,
     -- Whether a binder not in `renamed` gets a fresh id.
     freshen : Bool,
     -- The call every node copied is inlined through, if it is: with no span
@@ -2418,13 +2504,18 @@ type Copier = Copier {
     var changed : Int,
 }
 
-fun copier(mint : fun() -> Int, subst : Map Int Core,
+fun copier(mint : fun() -> Int, subst : Map Int Core, scrutinees : Map Int Core,
            renamed : Map Int (String, Int), freshen : Bool,
            rebase : Option (Option InlineSite)) -> Copier = Copier {
     mint = mint, renamed = renamed, skolems = Map.new(), subst = subst,
-    freshen = freshen,
+    scrutinees = scrutinees, freshen = freshen,
     rebase = rebase, substituted = 0, changed = 0,
 }
+
+-- The `scrutinees` of a copier that has none. Shared, because a copier only
+-- reads the map, and most copies have none: a map for each would be a
+-- fifth of a percent of the self-compile's allocations.
+let noScrutinees : Map Int Core = Map.new()
 
 -- Returns `body` with each variable `subst` maps replaced by a copy of its own
 -- of the term it maps to, and each binder renamed as `renamed` says. When
@@ -2436,7 +2527,7 @@ fun copier(mint : fun() -> Int, subst : Map Int Core,
 fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
              renamed : Map Int (String, Int), freshen : Bool,
              rebase : Option (Option InlineSite)) -> Core =
-    copyTerm(copier(mint, subst, renamed, freshen, rebase), body)
+    copyTerm(copier(mint, subst, noScrutinees, renamed, freshen, rebase), body)
 
 fun copyTerm(c : Copier, e : Core) -> Core {
     -- A leaf that binds nothing and reads nothing renamed or replaced is
@@ -2455,13 +2546,7 @@ fun copyTerm(c : Copier, e : Core) -> Core {
     let changedBefore = c.changed
     let kind = match e.kind {
         CVar(ById(id)) -> match Map.get(c.subst, id) {
-            -- With the value's own spans, and binders of its own: a value is
-            -- substituted at every mention.
-            Some(value) -> {
-                c.substituted = c.substituted + 1
-                c.changed = c.changed + 1
-                return copyWith(c.mint, value, Map.new(), Map.new(), True, None)
-            }
+            Some(value) -> return replacement(c, value)
             None -> CVar(ById(referenceTo(c, id)))
         }
         CVar(BySpelling(_)) -> e.kind
@@ -2500,11 +2585,16 @@ fun copyTerm(c : Copier, e : Core) -> Core {
             let ps = Array.map(params, bindParam(c, _))
             CJoin(n, i, ps, copyTerm(c, body), copyTerm(c, rest), recursive)
         }
-        CMatch(scrutinee, alts) -> {
-            let s = copyTerm(c, scrutinee)
-            CMatch(s, Vec.map(alts, fun(a) = CAlt {
-                alt = bindAlt(c, a.alt), body = copyTerm(c, a.body),
-            }))
+        CMatch(scrutinee, alts) -> match scrutinee.kind {
+            CVar(ById(id)) -> match Map.get(c.scrutinees, id) {
+                Some(value) -> if takesApart(alts) {
+                    takenApart(c, id, value, alts)
+                } else {
+                    CMatch(copyTerm(c, scrutinee), copiedAlts(c, alts))
+                }
+                None -> CMatch(copyTerm(c, scrutinee), copiedAlts(c, alts))
+            }
+            _ -> CMatch(copyTerm(c, scrutinee), copiedAlts(c, alts))
         }
         _ -> mapKind(e.kind, Mapper {
             expr = copyTerm(c, _),
@@ -2530,6 +2620,39 @@ fun copyTerm(c : Copier, e : Core) -> Core {
     -- reduction, so a node above one is not.
     if c.substituted == before { out.settledIn = e.settledIn }
     out
+}
+
+fun copiedAlts(c : Copier, alts : Vec CAlt) -> Vec CAlt =
+    Vec.map(alts, fun(a) = CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) })
+
+-- Returns the `match` on the variable `id` with `alts`, in a copy, with the
+-- build `value` substituted for the variable. An arm that binds the whole
+-- scrutinee binds a name for the variable instead, so that selecting it makes
+-- no second object.
+fun takenApart(c : Copier, id : Int, value : Core, alts : Vec CAlt) -> CoreKind {
+    let whole = mkCore(value.ty, value.span, CVar(ById(referenceTo(c, id))))
+    let s = replacement(c, value)
+    CMatch(s, Vec.map(alts, fun(a) = match a.alt {
+        AAny(Some((name, binder))) -> {
+            let (n, i) = bindName(c, name, binder)
+            let inner = copyTerm(c, a.body)
+            CAlt {
+                alt = AAny(None),
+                body = mkCore(inner.ty, inner.span,
+                              CLet(n, i, value.ty, whole, inner, [])),
+            }
+        }
+        _ -> CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) }
+    }))
+}
+
+-- Returns a copy of `value` for one variable it replaces, counted in `c`. The
+-- copy keeps the value's own spans and gets binders of its own, since a value
+-- may be substituted at several mentions.
+fun replacement(c : Copier, value : Core) -> Core {
+    c.substituted = c.substituted + 1
+    c.changed = c.changed + 1
+    copyWith(c.mint, value, Map.new(), Map.new(), True, None)
 }
 
 -- Returns the span a node with `span` takes in a copy inlined through `site`:
@@ -2650,7 +2773,9 @@ fun bindPart(c : Copier, binder : Option (String, Int)) -> Option (String, Int) 
 --
 -- A `CVar` counts: variables are immutable bindings, and a `var` is a `CRef`
 -- read through a `CDeref`, which is not this. A build with identity
--- (`Decls.hasIdentity`) does not: done twice, it is two objects.
+-- (`Decls.hasIdentity`) does not: done twice, it is two objects a program can
+-- tell apart. Any other build of values does count, though done twice it may
+-- still be two objects (`builds`).
 fun isValue(d : DeclTable, e : Core) -> Bool = match e.kind {
     CLit(_) -> True
     CUnit -> True
@@ -2672,6 +2797,136 @@ fun isValue(d : DeclTable, e : Core) -> Bool = match e.kind {
     }
     _ -> False
 }
+
+-- Returns whether evaluating `e` builds a heap object (`heapRoot`), at its
+-- root or in a part of a tuple or constructor application.
+fun builds(d : DeclTable, e : Core) -> Bool =
+    heapRoot(d, e) || Iterator.any(knownParts(e), builds(d, _))
+
+-- Returns whether `e` is a constructor application of a type whose values are
+-- always objects of their own on the heap.
+--
+-- Not a newtype's constructor, whose value is its payload, nor a constructor
+-- of a type that may be flat (`Decls.mayBeFlat`), whose value is held as its
+-- fields' slots where its layout allows, as a tuple's is: a copy copies
+-- slots. Binding one to a name would cost more than it saves. The name hides
+-- the constructor from the inliner, which decides by what reduces once a
+-- known argument is in place, and a lambda that reads the name captures it.
+-- Where a layout boxes such a value after all, each copy is an object of its
+-- own, which this accepts. Lowering builds a boxed value whose fields are all
+-- constants once, before `main`.
+fun heapRoot(d : DeclTable, e : Core) -> Bool = match e.kind {
+    CApp(fn, _) -> match fn.kind {
+        CCon(_) -> match Ty.spine(e.ty) {
+            (TCon(c), _) -> !Decls.mayBeFlat(d, c.name)
+            _ -> True
+        }
+        _ -> False
+    }
+    _ -> False
+}
+
+-- How many times something happens in one evaluation.
+type Count = Never | Once | Many
+
+fun plus(a : Count, b : Count) -> Count = match (a, b) {
+    (Never, n) -> n
+    (n, Never) -> n
+    _ -> Many
+}
+
+fun most(a : Count, b : Count) -> Count = match (a, b) {
+    (Many, _) | (_, Many) -> Many
+    (Once, _) | (_, Once) -> Once
+    _ -> Never
+}
+
+fun atMostOnce(n : Count) -> Bool = match n {
+    Many -> False
+    _ -> True
+}
+
+fun never(n : Count) -> Bool = match n {
+    Never -> True
+    _ -> False
+}
+
+-- How a body uses a binder: as a variable it reads, and as the scrutinee of a
+-- `match` that can take it apart (`takesApart`).
+type Uses = Uses { reads : Count, matches : Count }
+
+let unused = Uses { reads = Never, matches = Never }
+
+let readOnce = Uses { reads = Once, matches = Never }
+
+fun both(a : Uses, b : Uses) -> Uses =
+    Uses { reads = plus(a.reads, b.reads), matches = plus(a.matches, b.matches) }
+
+fun either(a : Uses, b : Uses) -> Uses =
+    Uses { reads = most(a.reads, b.reads), matches = most(a.matches, b.matches) }
+
+fun repeated(u : Uses) -> Uses = both(u, u)
+
+-- Returns how one evaluation of `e` may use the binder `id`. An arm that binds
+-- the whole scrutinee of a `match` on `id` reads `id`, and a `match` on `id`
+-- that cannot take it apart reads it.
+fun usesOf(e : Core, id : Int) -> Uses = match e.kind {
+    CVar(r) -> if r == ById(id) { readOnce } else { unused }
+    -- A lambda, a `letrec` binding and a recursive join's body may run any
+    -- number of times.
+    CLam(_, body, _) -> repeated(usesOf(body, id))
+    CLetRec(binds, body) -> {
+        var u = usesOf(body, id)
+        for b in binds { u = both(u, repeated(usesOf(bindValue(b), id))) }
+        u
+    }
+    CJoin(_, _, _, body, rest, recursive) -> {
+        let inBody = usesOf(body, id)
+        both(if recursive { repeated(inBody) } else { inBody }, usesOf(rest, id))
+    }
+    -- Only one arm of an `if` or a `match` runs.
+    CIf(cond, then, otherwise) -> {
+        let taken = match otherwise {
+            Some(o) -> either(usesOf(then, id), usesOf(o, id))
+            None -> usesOf(then, id)
+        }
+        both(usesOf(cond, id), taken)
+    }
+    CMatch(scrutinee, alts) -> {
+        let apart = match scrutinee.kind {
+            CVar(r) -> r == ById(id) && takesApart(alts)
+            _ -> False
+        }
+        var taken = unused
+        for a in alts {
+            let inArm = usesOf(altBody(a), id)
+            -- A build taken apart leaves an arm that binds the whole
+            -- scrutinee reading the binder (`takenApart`).
+            taken = either(taken, match a.alt {
+                AAny(Some(_)) -> if apart { both(inArm, readOnce) } else { inArm }
+                _ -> inArm
+            })
+        }
+        let atRoot = if apart {
+            Uses { reads = Never, matches = Once }
+        } else {
+            usesOf(scrutinee, id)
+        }
+        both(atRoot, taken)
+    }
+    _ -> {
+        var u = unused
+        eachKid(e.kind, fun(kid) { u = both(u, usesOf(kid, id)) })
+        u
+    }
+}
+
+-- Returns whether a `match` with `alts` can take apart a build substituted
+-- for its scrutinee, which no arm that opens an existential can (`decide`).
+fun takesApart(alts : Vec CAlt) -> Bool = !Iterator.any(alts, fun(a) = match a.alt {
+    ACon(_, _, Some(_)) -> True
+    _ -> False
+})
 
 -- Whether `e` can stand for a top-level binding at every mention of it.
 --

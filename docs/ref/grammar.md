@@ -73,7 +73,8 @@ In `atype atype*`, the head must be a type constructor or a type variable.
 ## Type declarations
 
 ```ebnf
-type-decl    ::= "type" CONID IDENT* "=" type-rhs
+type-decl    ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" type-rhs
+derive       ::= "!"? qualified-CONID
 type-rhs     ::= constructor ("|" constructor)*
                | type                                      -- alias
 constructor  ::= CONID existential? payload?
@@ -85,7 +86,7 @@ field        ::= "var"? IDENT ":" type
 ```
 
 Whether `type T = C args` is an alias or a data type is decided as described
-in [Type aliases](types.md#type-aliases).
+in [Type aliases](types.md#type-aliases). An alias cannot have a derive list.
 
 ## Classes and instances
 

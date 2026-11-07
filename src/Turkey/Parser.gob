@@ -562,6 +562,7 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     let name = text(expectWhat(p, "CONID", "a type name"))
     let params = Vec.new(2)
     while at(p, "IDENT") { Vec.push(params, text(advance(p))) }
+    let derives = if eat(p, ":") { parseDerives(p) } else { [] }
     skipToken(p, "=")
 
     -- A `|` or a `{` payload means data type outright. A bare `C` or `C(...)`
@@ -581,18 +582,33 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     if at(p, "CONID") && Token.kindName(peek(p, 1).kind) != "." {
         let headName = text(cur(p))
         if Token.kindName(peek(p, 1).kind) == "{" || rhsHasAlternatives(p) {
-            return parseDataRhs(p, s, name, params)
+            return parseDataRhs(p, s, name, params, derives)
         }
         if headName == name
                 || (!Vec.contains(p.tycons, headName) && constructorShaped(p)) {
-            return parseDataRhs(p, s, name, params)
+            return parseDataRhs(p, s, name, params, derives)
         }
     }
     let alias = parseTypeExpr(p)
     TypeDecl {
-        span = close(p, s), name = name, params = params, variants = None,
-        alias = Some(alias),
+        span = close(p, s), name = name, params = params, derives = derives,
+        variants = None, alias = Some(alias),
     }
+}
+
+-- `Eq, !Hash` -- a derive list, after its `:`. Each entry is a class name,
+-- qualified or not, with a `!` before it to refuse the class.
+fun parseDerives(p : P) -> Vec Derive {
+    let out = Vec.new(2)
+    loop {
+        let s = cur(p).span
+        let refused = eat(p, "!")
+        let first = expectWhat(p, "CONID", "a class name")
+        let cls = dottedFrom(p, first)
+        Vec.push(out, Derive { span = close(p, s), cls = cls, refused = refused })
+        if !eat(p, ",") { break }
+    }
+    out
 }
 
 -- Whether the right-hand side at the cursor, a `CONID`, has a constructor's
@@ -641,7 +657,8 @@ fun rhsHasAlternatives(p : P) -> Bool {
     False
 }
 
-fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDecl {
+fun parseDataRhs(p : P, s : Span, name : String, params : Vec String,
+                 derives : Vec Derive) -> TypeDecl {
     let variants = Vec.new(4)
     Vec.push(variants, parseConDecl(p))
     while eat(p, "|") {
@@ -649,8 +666,8 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDec
         Vec.push(variants, parseConDecl(p))
     }
     TypeDecl {
-        span = close(p, s), name = name, params = params, variants = Some(variants),
-        alias = None,
+        span = close(p, s), name = name, params = params, derives = derives,
+        variants = Some(variants), alias = None,
     }
 }
 

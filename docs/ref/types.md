@@ -475,7 +475,8 @@ A function with no parameters has type `fun() -> T`.
 **Syntax**
 
 ```ebnf
-type-decl    ::= "type" CONID IDENT* "=" constructor ("|" constructor)*
+type-decl    ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" constructor ("|" constructor)*
+derive       ::= "!"? qualified-CONID
 constructor  ::= CONID existential? payload?
 payload      ::= "(" type ("," type)* ")"          -- positional
                | "{" field (separator field)* "}"   -- record
@@ -534,6 +535,9 @@ The parts of a declaration:
   uses is allowed; it is sometimes called a *phantom* parameter.
 * **Recursion.** A type may refer to itself, as `Hand` does, and a group of
   types may refer to each other.
+* **A derive list**, after `:`, asks the compiler to write instances of `Eq`,
+  `Ord` or `Hash` from the declaration: `type Suit : Ord = Hearts | ...`. See
+  [Derived instances](classes.md#derived-instances).
 
 A single constructor may have the same name as its type, as in
 `type Card = Card(Int, Suit)`. The two live in different namespaces: `Card`
@@ -636,6 +640,13 @@ fun main() {
 ```text
 3
 (2, 1)
+```
+
+An alias has no constructors of its own, so it cannot have a derive list:
+
+<!-- error: 'Pair' is a type alias, and an alias cannot derive classes -->
+```kotlin
+type Pair a : Eq = (a, a)
 ```
 
 An alias may apply a type to any of its arguments, including two:

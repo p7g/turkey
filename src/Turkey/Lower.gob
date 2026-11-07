@@ -65,7 +65,7 @@ import Turkey.Constraints (Env(..), Binding(..))
 import Turkey.Core (..)
 import Turkey.Core as Cr
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), ConInfo(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Inert as Inert
 import Turkey.Match as Match
@@ -679,11 +679,15 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                 let e = Classes.equalityAt(info, info.equalities[k], inst.head)
                 Cr.coercion(e.args[0], e.args[1], Some(inst.decl.span))
             }
-            MethodSlot(name) -> match Map.get(plan.methods, name) {
-                Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
-                              else { methodBody(l, inst, name, impl, plan.params) }
-                None -> oops("no body for the method '" + name + "'",
-                             Some(inst.decl.span))
+            MethodSlot(name) -> if isDerivedMethod(inst, name) {
+                derivedBody(l, inst, name, plan, givens)
+            } else {
+                match Map.get(plan.methods, name) {
+                    Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
+                                  else { methodBody(l, inst, name, impl, plan.params) }
+                    None -> oops("no body for the method '" + name + "'",
+                                 Some(inst.decl.span))
+                }
             }
             KeyedSlot(_, _) -> oops("a keyed slot before layouts are shared",
                                     Some(inst.decl.span))
@@ -795,6 +799,282 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
     let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
                     value, span)
     b
+}
+
+-- -- derived methods ----------------------------------------------------------------
+
+-- Returns whether the slot `name` of `inst`'s dictionary is the method a
+-- derived instance writes, rather than one of the class's defaults.
+fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
+    inst.derived && Classes.derivedMethod(inst.cls) == Some(Classes.surfaceMember(name))
+
+-- What writing one derived method needs: the instance, the evidence its
+-- context names, and each constructor with its fields' types at the head.
+type DerivedSite = DerivedSite {
+    inst   : InstInfo,
+    given  : Vec (String, Pred),
+    givens : Map String Ty.Type,
+    cons   : Vec (ConInfo, Array Ty.Type),
+    span   : Option Span,
+}
+
+-- The method `name` of a derived instance, as a slot of its dictionary.
+--
+-- Written in Core, as `typeRepDict` is. `Classes` derives an instance when
+-- the solver first asks for it, after every body written in Turkey has been
+-- generated, so there is no later point at which a Turkey body could be
+-- checked. Each field's instance is what `Classes.prove` finds under the
+-- instance's context, which is the proof the derivation was decided by.
+fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan,
+                givens : Map String Ty.Type) -> Core {
+    let span = Some(inst.decl.span)
+    let given = Vec.new(len(inst.context))
+    for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+        Vec.push(given, (plan.params[i], inst.context[i]))
+    }
+    let (h, _) = Ty.spine(inst.head)
+    let tycon = match h {
+        TCon(c) -> c.name
+        _ -> oops("a derived instance whose head is not a declared type", span)
+    }
+    let info = match Map.get(l.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> oops("a derived instance for the unknown type '" + tycon + "'", span)
+    }
+    let cons = Vec.new(len(info.variants))
+    for c in info.variants {
+        match Decls.conFieldTypes(l.decls, inst.head, c.name) {
+            Some(types) -> Vec.push(cons, (c, types))
+            None -> oops("no field types for '" + c.name + "'", span)
+        }
+    }
+    let d = DerivedSite { inst = inst, given = given, givens = givens, cons = cons, span = span }
+    let mi = methodOf(l, inst.cls, name, span)
+    let lam = if inst.cls == P.eqClass { derivedEq(l, d, mi) }
+              else if inst.cls == P.ordClass { derivedLt(l, d, mi) }
+              else if inst.cls == P.hashClass { derivedHash(l, d, mi) }
+              else { oops("no derived method for '" + inst.cls + "'", span) }
+    methodAbstraction(mi, lam, span)
+}
+
+-- `eq(x, y)`: the same constructor, and each field equal to its counterpart.
+fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let y = freshParam(l, "y", head)
+    let several = len(d.cons) > 1
+    let alts = Vec.new(len(d.cons))
+    for (c, types) in d.cons {
+        let xs = fieldBinders(l, types)
+        let ys = fieldBinders(l, types)
+        let same = allOf(Array.init(len(types), fun(i) =
+            fieldCall(l, d, P.eqClass, "eq", types[i], [bound(l, xs[i], types[i], d.span),
+                                                       bound(l, ys[i], types[i], d.span)])),
+            d.span)
+        let inner = [CAlt { alt = ACon(c.name, Array.map(ys, Some), None), body = same }]
+        if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
+        Vec.push(alts, CAlt {
+            alt = ACon(c.name, Array.map(xs, Some), None),
+            body = node(Ty.tBool(), d.span, CMatch(paramVar(y, d.span), inner)),
+        })
+    }
+    node(TFun([head, head], Ty.tBool()), d.span,
+         CLam([x, y], node(Ty.tBool(), d.span, CMatch(paramVar(x, d.span), alts)),
+              instName(d.inst) + "#" + Classes.surfaceMember(mi.name)))
+}
+
+-- `lt(x, y)`: a constructor declared earlier is less, and two values of one
+-- constructor compare their fields in order, the first that differs deciding.
+fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let y = freshParam(l, "y", head)
+    -- A node is never shared between two places in a term, so each mention
+    -- is made anew.
+    let xv = fun() = paramVar(x, d.span)
+    let yv = fun() = paramVar(y, d.span)
+    let several = len(d.cons) > 1
+    let nullary = Iterator.all(d.cons, fun((_, types)) = len(types) == 0)
+    let body = if nullary {
+        intLess(tagOf(l, d, xv()), tagOf(l, d, yv()), d.span)
+    } else {
+        let alts = Vec.new(len(d.cons))
+        for (c, types) in d.cons {
+            let xs = fieldBinders(l, types)
+            let ys = fieldBinders(l, types)
+            let inner = [CAlt { alt = ACon(c.name, Array.map(ys, Some), None),
+                                body = lexically(l, d, types, xs, ys, 0) }]
+            if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
+            Vec.push(alts, CAlt {
+                alt = ACon(c.name, Array.map(xs, Some), None),
+                body = node(Ty.tBool(), d.span, CMatch(yv(), inner)),
+            })
+        }
+        let same = node(Ty.tBool(), d.span, CMatch(xv(), alts))
+        if several {
+            -- Two constructors are ordered by their tags, compared each way,
+            -- rather than by an arm for every pair of them.
+            let (xName, xId) = freshName(l, "tag")
+            let (yName, yId) = freshName(l, "tag")
+            let xTag = fun() = node(Ty.tInt(), d.span, CVar(refAt(l, xName, xId)))
+            let yTag = fun() = node(Ty.tInt(), d.span, CVar(refAt(l, yName, yId)))
+            let decided = node(Ty.tBool(), d.span, CIf(intLess(xTag(), yTag(), d.span),
+                boolean(True, d.span),
+                Some(node(Ty.tBool(), d.span, CIf(intLess(yTag(), xTag(), d.span),
+                    boolean(False, d.span), Some(same))))))
+            node(Ty.tBool(), d.span, CLet(xName, xId, Ty.tInt(), tagOf(l, d, xv()),
+                node(Ty.tBool(), d.span, CLet(yName, yId, Ty.tInt(), tagOf(l, d, yv()),
+                                              decided, [])), []))
+        } else { same }
+    }
+    node(TFun([head, head], Ty.tBool()), d.span,
+         CLam([x, y], body, instName(d.inst) + "#" + Classes.surfaceMember(mi.name)))
+}
+
+-- Whether the fields `xs` are less than the fields `ys`, from field `k` on:
+-- `x0 < y0 || (x0 == y0 && ...)`, and false when there are none left.
+fun lexically(l : Lowerer, d : DerivedSite, types : Array Ty.Type,
+              xs : Array (String, Int), ys : Array (String, Int), k : Int) -> Core {
+    if k >= len(types) { return boolean(False, d.span) }
+    let ty = types[k]
+    let a = bound(l, xs[k], ty, d.span)
+    let b = bound(l, ys[k], ty, d.span)
+    let less = fieldCall(l, d, P.ordClass, "lt", ty, [a, b])
+    if k == len(types) - 1 { return less }
+    -- The field's `Eq` is its `Ord`'s superclass, which is how a derived
+    -- `Ord` agrees with the `Eq` its field's `Ord` was declared with.
+    let ord = fieldDict(l, d, P.ordClass, ty)
+    let eqDict = node(dictType(l, P.eqClass, ty), d.span,
+        CSlot(ord, match Classes.superSlot(l.classes, P.ordClass, P.eqClass) {
+            Some(i) -> i
+            None -> oops("'Eq' is not a superclass of 'Ord'", d.span)
+        }))
+    let equal = methodCall(l, eqDict, P.eqClass, "eq", ty, [bound(l, xs[k], ty, d.span),
+                                                          bound(l, ys[k], ty, d.span)], d.span)
+    node(Ty.tBool(), d.span, CIf(less, boolean(True, d.span),
+        Some(node(Ty.tBool(), d.span, CIf(equal, lexically(l, d, types, xs, ys, k + 1),
+                                          Some(boolean(False, d.span)))))))
+}
+
+-- `hashInto(x, h)`: the constructor's tag, when there is more than one
+-- constructor, and then each field, in order.
+fun derivedHash(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let (evidenceTypes, inner) = match methodType(l, mi, head) {
+        TFun(e, r) -> (e, r)
+        _ -> oops("'hashInto' takes no 'Hasher'", d.span)
+    }
+    let stateTy = match inner {
+        TFun(_, r) -> r
+        _ -> oops("'hashInto' is not a function", d.span)
+    }
+    let hasher = freshParam(l, "hasher", evidenceTypes[0])
+    let x = freshParam(l, "x", head)
+    let state = freshParam(l, "state", stateTy)
+    let several = len(d.cons) > 1
+    let alts = Vec.new(len(d.cons))
+    for var tag = 0; tag < len(d.cons); tag = tag + 1 {
+        let (c, types) = d.cons[tag]
+        let xs = fieldBinders(l, types)
+        var acc = paramVar(state, d.span)
+        if several {
+            acc = methodCall(l, paramVar(hasher, d.span), P.hasherClass, "hashInt", stateTy,
+                             [acc, node(Ty.tInt(), d.span, CLit(LInt(tag)))], d.span)
+        }
+        for var i = 0; i < len(types); i = i + 1 {
+            acc = hashField(l, d, mi, types[i], stateTy, paramVar(hasher, d.span),
+                            bound(l, xs[i], types[i], d.span), acc)
+        }
+        Vec.push(alts, CAlt { alt = ACon(c.name, Array.map(xs, Some), None), body = acc })
+    }
+    let body = node(stateTy, d.span, CMatch(paramVar(x, d.span), alts))
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
+        CLam([x, state], body, name)), "<anonymous>"))
+}
+
+-- `hashInto(field, state)` with the field's `Hash` and the hasher this
+-- `hashInto` was given, at the same state type.
+fun hashField(l : Lowerer, d : DerivedSite, mi : MethodInfo, ty : Ty.Type, stateTy : Ty.Type,
+              hasher : Core, field : Core, state : Core) -> Core {
+    let dict = fieldDict(l, d, P.hashClass, ty)
+    let (evidenceTypes, inner) = match methodType(l, mi, ty) {
+        TFun(e, r) -> (e, r)
+        _ -> oops("'hashInto' takes no 'Hasher'", d.span)
+    }
+    let own = Vec.filter(mi.scheme.quantified, fun(q) = q.id != mi.classVar.id)
+    let slot = node(unknown(), d.span, CSlot(dict, slotFor(l, P.hashClass, mi.name, d.span)))
+    let applied = node(TFun(evidenceTypes, inner), d.span,
+                       CTyApp(slot, Array.map(Vec.toArray(own), TVar)))
+    let withHasher = node(inner, d.span, CApp(applied, [hasher]))
+    node(stateTy, d.span, CApp(withHasher, [field, state]))
+}
+
+-- The dictionary of `cls` at `ty`, a field's type, under the instance's
+-- context.
+fun fieldDict(l : Lowerer, d : DerivedSite, cls : String, ty : Ty.Type) -> Core =
+    match Classes.prove(l.classes, d.given, Ty.pred(cls, [ty])) {
+        Some(ev) -> evidence(l, ev, dictType(l, cls, ty), d.givens)
+        None -> oops("no '" + cls + " " + Ty.show(ty) + "' for a field of '"
+                     + Classes.showDeclared(d.inst) + "'", d.span)
+    }
+
+-- A call of the method of `cls` spelled `short`, at the field type `ty`, with
+-- the field's own dictionary.
+fun fieldCall(l : Lowerer, d : DerivedSite, cls : String, short : String, ty : Ty.Type,
+              args : Array Core) -> Core =
+    methodCall(l, fieldDict(l, d, cls, ty), cls, short, ty, args, d.span)
+
+-- A call of the method of `cls` spelled `short`, from `dict`, a dictionary at
+-- `ty`. The method takes no evidence of its own.
+fun methodCall(l : Lowerer, dict : Core, cls : String, short : String, ty : Ty.Type,
+               args : Array Core, span : Option Span) -> Core {
+    let name = match Classes.memberNamed(Map.keys(classNamed(l, cls).methods), short) {
+        Some(n) -> n
+        None -> oops("'" + cls + "' has no method '" + short + "'", span)
+    }
+    let fnTy = methodType(l, methodOf(l, cls, name, span), ty)
+    let result = match fnTy {
+        TFun(_, r) -> r
+        _ -> oops("the method '" + short + "' is not a function", span)
+    }
+    node(result, span, CApp(node(fnTy, span, CSlot(dict, slotFor(l, cls, name, span))), args))
+}
+
+-- A new binder for each of a constructor's fields.
+fun fieldBinders(l : Lowerer, types : Array Ty.Type) -> Array (String, Int) =
+    Array.map(types, fun(_) = freshName(l, "f"))
+
+fun bound(l : Lowerer, binder : (String, Int), ty : Ty.Type, span : Option Span) -> Core =
+    node(ty, span, CVar(refAt(l, binder.0, binder.1)))
+
+-- The constructor `value` was built with, as its position in the declaration.
+fun tagOf(l : Lowerer, d : DerivedSite, value : Core) -> Core {
+    let alts = Vec.new(len(d.cons))
+    for var i = 0; i < len(d.cons); i = i + 1 {
+        let (c, types) = d.cons[i]
+        Vec.push(alts, CAlt { alt = ACon(c.name, Array.map(types, fun(_) = None), None),
+                              body = node(Ty.tInt(), d.span, CLit(LInt(i))) })
+    }
+    node(Ty.tInt(), d.span, CMatch(value, alts))
+}
+
+fun intLess(a : Core, b : Core, span : Option Span) -> Core =
+    node(Ty.tBool(), span, CApp(
+        node(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()), span, CPrim(Prims.IntLt)), [a, b]))
+
+fun boolean(b : Bool, span : Option Span) -> Core =
+    node(Ty.tBool(), span, CCon(if b { P.boolTrue } else { P.boolFalse }))
+
+-- Whether every one of `tests` holds, testing them in order and stopping at
+-- the first that does not: `true` when there are none.
+fun allOf(tests : Array Core, span : Option Span) -> Core {
+    if len(tests) == 0 { return boolean(True, span) }
+    var out = tests[len(tests) - 1]
+    for var i = len(tests) - 2; i >= 0; i = i - 1 {
+        out = node(Ty.tBool(), span, CIf(tests[i], out, Some(boolean(False, span))))
+    }
+    out
 }
 
 -- Returns `Proxy t`, for a `t` of any kind.

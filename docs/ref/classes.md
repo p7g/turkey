@@ -206,10 +206,134 @@ a data type of your own and write the instance for the wrapper.
 
 ### Derived instances
 
-The compiler provides the instances of the class `Typed` itself, for every
-type, and a program may not write one. See [`Typed` and
-`cast`](builtins.md#typed-and-cast). No other class has derived instances: a
-type gets `Show`, `Eq` and the rest only from instances someone writes.
+**Syntax**
+
+```ebnf
+type-decl ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" constructor ("|" constructor)*
+derive    ::= "!"? qualified-CONID
+```
+
+A type declaration can ask the compiler to write some of its instances. The
+classes follow the type's parameters, after a `:`, the same `:` that gives an
+instance its requirements: `type Card : Ord, Hash = ...` says that `Card` has
+`Ord` and `Hash`. The compiler writes each instance from the declaration's
+constructors, and it can write instances of three classes:
+
+* **`Eq`.** Two values are equal when they were built by the same
+  constructor and each field of one equals the same field of the other, by
+  the field type's own `Eq`.
+* **`Ord`.** A value built by a constructor declared earlier is less than one
+  built by a constructor declared later. Two values built by the same
+  constructor compare their fields from first to last, and the first pair of
+  fields that are not equal decides.
+* **`Hash`.** A value is hashed by its constructor and then its fields, in
+  order, so equal values hash alike.
+
+Only `eq`, `lt` and `hashInto` are written; the other methods are the class's
+defaults, so `<=` is `lt(x, y) || eq(x, y)`.
+
+<!-- run -->
+```kotlin
+type Suit : Ord = Hearts | Diamonds | Clubs | Spades
+
+type Card : Ord = Card { rank : Int, suit : Suit }
+
+fun main() {
+    print(Hearts < Spades)
+    print(Card { rank = 10, suit = Clubs } < Card { rank = 10, suit = Spades })
+    print(Card { rank = 2, suit = Hearts } == Card { rank = 2, suit = Hearts })
+}
+```
+
+```text
+True
+True
+True
+```
+
+`Ord` and `Hash` both have `Eq` as a superclass, and a derived `Ord` or
+`Hash` derives `Eq` along with it, as `Card` shows: its list does not name
+`Eq`, and `==` works. A derived order must agree with the type's equality, so
+a type whose `Eq` is written by hand cannot derive `Ord` or `Hash`; it writes
+those too.
+
+A field of type `Float` compares as a `Float` does, so a value holding a NaN
+is not equal to itself.
+
+Only a type's own declaration can derive its instances. A type declared
+elsewhere gets an instance written by hand, under the
+[orphan rule](#coherence).
+
+**Requirements.** A derived instance requires the class for each type
+parameter that some field's type mentions, so `type Pair a b : Eq =
+Pair(a, b)` has the instance `Eq (Pair a b) : Eq a, Eq b`. A parameter that no
+field mentions is a *phantom*, and the instance requires nothing of it:
+
+<!-- run -->
+```kotlin
+type Measure unit : Ord = Measure(Float)
+
+type Metres = Metres
+
+fun metres(x : Float) -> Measure Metres = Measure(x)
+
+fun main() {
+    print(metres(1.0) < metres(2.0))
+}
+```
+
+```text
+True
+```
+
+`Metres` has no `Ord`, and `Measure Metres` does. A type may refer to itself,
+or a group of types to each other, and each derived instance uses the others:
+`type List a : Eq = Nil | Cons(a, List a)` compares a list field by field
+down to its end.
+
+Each field uses its own type's instance, written by hand or derived, so a
+field whose `Eq` is written by hand is compared by that `Eq`.
+
+**When an instance cannot be derived.** Every field's type must have the class,
+under the requirements above. A field that is a function, a type that has no
+instance, or a type `f a` built from a parameter `f`, has none. Nor does a
+constructor that hides a type in an [existential
+bracket](types.md#existential-types): two of its values may hide different
+types. The error is reported at the entry in the list, and says which field is
+to blame, following fields through each type the compiler tried to derive the
+class for:
+
+<!-- error: 'File' cannot derive 'Eq': field 'fd' has type 'Fd', whose field 'state' has type 'fun() -> Int', which has no 'Eq' -->
+```kotlin
+type Fd : Eq = Fd { state : fun() -> Int }
+
+type File : Eq = File { fd : Fd }
+```
+
+A field whose type has an instance that needs the class for a part of it
+names that part: a field of type `Array (fun() -> Int)` *contains*
+`fun() -> Int`, which has no `Eq`.
+
+**Opting out.** `!Eq` or `!Hash` in the list says that the type has none:
+no instance may be written for it, and a type that holds one cannot derive
+the class. Comparing such a value says why it cannot be compared:
+
+<!-- error: 'Handle' has no 'Eq': its declaration says '!Eq' -->
+```kotlin
+type Handle : !Eq = Handle(Int)
+
+fun main() {
+    print(Handle(1) == Handle(1))
+}
+```
+
+**What a list may name.** Each class appears at most once. Only `Eq`, `Ord`
+and `Hash` can be derived, and only `Eq` and `Hash` refused. A type whose
+instance of a class is written by hand cannot also name that class, whether
+to derive it or to refuse it. `Typed` is never named: the compiler provides
+its instances for every type, and a program may not write one. See [`Typed`
+and `cast`](builtins.md#typed-and-cast). Every other class gets its instances
+only from instances someone writes.
 
 ## Using a class
 

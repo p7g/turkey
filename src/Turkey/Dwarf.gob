@@ -36,6 +36,7 @@ export (
 import Data.Map as Map
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol)
+import Turkey.Demangle (displayName)
 import Turkey.Position as Position
 import Turkey.Stream (Item(..))
 
@@ -51,9 +52,8 @@ type CompileUnit = CompileUnit {
     functions : Vec Subprogram,
 }
 
--- A function, by the name its frames are shown with, the labels at its
--- first instruction and after its last, and the calls inlined into it,
--- outermost first.
+-- A function, by its internal name, the labels at its first instruction and
+-- after its last, and the calls inlined into it, outermost first.
 type Subprogram = Subprogram {
     name    : String,
     low     : Symbol,
@@ -61,20 +61,16 @@ type Subprogram = Subprogram {
     inlined : Vec Inlined,
 }
 
--- A call inlined into a function: the name of the function inlined, the
--- call's position (`Turkey.Position`), the code the inlined body covers as
--- pairs of labels in address order, and the calls inlined into that body in
--- turn. Each range lies within one of its parent's.
+-- A call inlined into a function: the internal name of the function inlined,
+-- the call's position (`Turkey.Position`), the code the inlined body covers
+-- as pairs of labels in address order, and the calls inlined into that body
+-- in turn. Each range lies within one of its parent's.
 type Inlined = Inlined {
     callee   : String,
     call     : Int,
     ranges   : Vec (Symbol, Symbol),
     children : Vec Inlined,
 }
-
--- The name a debugger shows for the function named `name`: a subprogram's,
--- and an inlined call's callee's.
-fun shownName(name : String) -> String = name
 
 -- -- encodings ------------------------------------------------------------------
 
@@ -314,7 +310,7 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
     for f in u.functions {
         let parent = len(f.inlined) > 0
         Vec.push(out, Uleb(if parent { abbrevSubprogramParent } else { abbrevSubprogram }))
-        string(strings, labels, shownName(f.name), out)
+        named(strings, labels, f.name, out)
         Vec.push(out, WordOf(f.low))
         Vec.push(out, Difference(f.high, f.low))
         -- An expression one operation long.
@@ -328,7 +324,7 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
     for var k = 0; k < len(refs.callees); k = k + 1 {
         Vec.push(out, Label(abstractLabel(refs.d, k)))
         Vec.push(out, Uleb(abbrevAbstract))
-        string(strings, labels, shownName(refs.callees[k]), out)
+        named(strings, labels, refs.callees[k], out)
         Vec.push(out, Byte(inlineInlined))
     }
     Vec.push(out, Byte(0))
@@ -551,6 +547,17 @@ fun enter(calls : Calls, s : Int) -> Unit {
         }
     }
 }
+
+-- A function's `DW_AT_name`: its display form (`Turkey.Demangle`), which a
+-- debugger shows for its frames and takes as a breakpoint.
+--
+-- There is no `DW_AT_linkage_name` with the symbol. lldb and atos show a
+-- function's linkage name in place of its name whenever it has one, and
+-- show it as it is when they cannot demangle it, which they cannot; lldb
+-- then also stops taking the display form as a breakpoint. A breakpoint by
+-- symbol still finds a function's out-of-line copy in the symbol table.
+fun named(strings : Strings, labels : Labels, name : String, out : Vec (Item i)) -> Unit =
+    string(strings, labels, displayName(name), out)
 
 -- A `DW_FORM_strp` naming `text`, which `emitUnit` writes into `debug_str`.
 fun string(strings : Strings, labels : Labels, text : String, out : Vec (Item i)) -> Unit {

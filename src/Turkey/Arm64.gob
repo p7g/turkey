@@ -2,7 +2,8 @@ export (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
     Mem(..), Arm(..), Inst(..), Convention(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, foldDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
     sameRegister, moveHint, safepointOf, pollOf, allocationOf, arrayAllocationOf, tailCallOf,
-    writesBeforeReading, memOf, rematerializable,
+    writesBeforeReading, memOf, rematerializable, scaledOffset, unscaledOffset, offsetFits,
+    wideOffset, accessSize, registerSize,
     xzr, sp, fp, lr, x0, d0, worker, argRegs, fpArgRegs, resultRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall, callClobbers,
     calleeSavedMask,
@@ -698,6 +699,44 @@ fun memOf(op : Arm) -> Option Mem = match op {
     Str(_, m, _) -> Some(m)
     Strb(_, m) -> Some(m)
     _ -> None
+}
+
+-- Returns whether a load or store of `1 << size` bytes encodes `n` as a
+-- scaled immediate: a non-negative multiple of the size, at most 4095 of them.
+fun scaledOffset(n : Int, size : Int) -> Bool =
+    n >= 0 && n & ((1 << size) - 1) == 0 && n >> size <= 4095
+
+-- Returns whether a load or store of any size encodes `n` as the 9-bit signed
+-- unscaled immediate of `ldur` and `stur`.
+fun unscaledOffset(n : Int) -> Bool = n >= -256 && n <= 255
+
+-- Returns whether an access of `1 << size` bytes encodes `Offset(base, n)`.
+-- An offset that it does not has to be put in a register, and the access made
+-- with `Indexed`.
+fun offsetFits(n : Int, size : Int) -> Bool = scaledOffset(n, size) || unscaledOffset(n)
+
+-- Returns the base and offset of `m` if it is an `Offset` that an access of
+-- `1 << size` bytes cannot encode, and `None` otherwise.
+fun wideOffset(m : Mem, size : Int) -> Option (Reg, Int) = match m {
+    Offset(base, n) -> if offsetFits(n, size) { None } else { Some((base, n)) }
+    _ -> None
+}
+
+-- Returns log2 of the bytes a load or store moves: 0 for `ldrb` and `strb`,
+-- and 0 for an instruction that is not an access.
+fun accessSize(op : Arm) -> Int = match op {
+    Ldr(r, _, w) -> registerSize(r, w)
+    Str(r, _, w) -> registerSize(r, w)
+    Ldrsw(_, _) -> 2
+    _ -> 0
+}
+
+-- Returns log2 of the bytes a register of width `w` occupies in memory: 3 for
+-- a double, whatever the width.
+fun registerSize(r : Reg, w : Width) -> Int = match (r, w) {
+    (Physical(Fp, _), _) -> 3
+    (_, W64) -> 3
+    (_, W32) -> 2
 }
 
 -- A move from a register into itself, which is what a taken hint looks like

@@ -77,11 +77,6 @@ fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
 let scratch = Physical(Gp, 16)
 let fpScratch = Physical(Fp, 31)
 
--- The largest byte offset a scaled unsigned immediate reaches on a 64-bit
--- load or store. Past it the offset goes into `scratch` and the access uses
--- the register form.
-let widestOffset = 32760
-
 -- The largest `add` immediate without a shift, which is how a frame slot's
 -- address is formed.
 let widestAddend = 4095
@@ -596,12 +591,20 @@ fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
 -- what lets the allocator see one instruction: the destination holds each
 -- intermediate in turn, so no other value is disturbed. An empty cursor
 -- branches to its stub, after the function, which keeps `save` across its
--- call.
+-- call; so does every object too large for a size class.
 fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
              l : Frame.Layout, tag : Int, dest : Reg, al : A.Allocation,
              save : Frame.CallSave, safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
+    -- Past `Rt.fastBytes` there is no cursor, and the runtime places the
+    -- object.
+    if al.size > Rt.fastBytes {
+        instruction(b, A.B(allocationLabel(d, tag, n, "s")))
+        emit(b, Label(allocationLabel(d, tag, n, "r")))
+        stub(cold.text, d, f, l, tag, n, dest, al, save, safepoint)
+        return
+    }
     let cursor = scratch
     let word = Physical(Gp, 17)
     instruction(b, A.AddImm(cursor, A.worker,
@@ -881,8 +884,11 @@ fun placed(l : Frame.Layout, m : Mem, wide : Option Int) -> Mem =
 fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
     Some(m) -> match Frame.offsetOf(l, m) {
         Some(offset) -> {
-            let widest = if A.isFrameAddress(op) { widestAddend } else { widestOffset }
-            if offset > widest { Some(offset) } else { None }
+            -- Past what the access encodes, the offset goes into `scratch`
+            -- and the access uses the register form.
+            let fits = if A.isFrameAddress(op) { offset <= widestAddend }
+                       else { A.offsetFits(offset, A.accessSize(op)) }
+            if fits { None } else { Some(offset) }
         }
         None -> None
     }
@@ -1553,7 +1559,7 @@ fun call(b : Code, d : Asm.Dialect, name : String) -> Unit =
 -- immediate does not reach. `boot` interns thousands of literals, so the root
 -- array is past 32,760 bytes long before the corpus is.
 fun storeAt(b : Code, r : Reg, base : Reg, offset : Int) -> Unit {
-    if offset <= widestOffset {
+    if A.offsetFits(offset, 3) {
         instruction(b, A.Str(r, Offset(base, offset), A.W64))
         return
     }

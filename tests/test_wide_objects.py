@@ -1,6 +1,6 @@
 """Objects of many fields: a record, a tuple and a closure's environment of any
 width keep every field through collections, including fields written after
-the object is built.
+the object is built and fields past the reach of an immediate offset.
 """
 
 from tests import lang
@@ -105,3 +105,31 @@ def test_a_closure_of_seventy_captures_keeps_them_through_collections():
     assert result.code == 0, result.stderr
     assert result.stdout == "1292 68\n"
 
+
+def test_fields_past_an_immediate_offset_load_and_store():
+    # A word field past 32760 bytes, a four-byte one past 16380 and a byte one
+    # past 4095 each need the offset in a register.
+    words = 4100
+    fields = ", ".join(f"f{i} : Int" for i in range(words))
+    values = ", ".join(f"f{i} = {i}" for i in range(words))
+    src = f"""
+type Huge = Huge {{ {fields}, var c : Char, var b : Bool, s : String }}
+
+fun make(i : Int) -> Huge {{
+    let h = Huge {{ {values}, c = 'a', b = False, s = Int.toString(i) }}
+    h.c = 'z'
+    h.b = i % 2 == 1
+    h
+}}
+
+fun main() {{
+    let kept = []
+    for var i = 0; i < 20; i = i + 1 {{ Vec.push(kept, make(i)) }}
+    let h = kept[19]
+    print(h.f0 + h.f{words - 1})
+    print(Char.toString(h.c) + " " + Bool.toString(h.b) + " " + h.s)
+}}
+"""
+    result = lang.run(src, env=STRESS, flags=("--gc-verify",))
+    assert result.code == 0, result.stderr
+    assert result.stdout == "4099\nz True 19\n"

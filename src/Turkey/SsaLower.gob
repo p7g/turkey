@@ -879,6 +879,11 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
                 usesIn(a, receiver, False)
                 usesIn(a, assigned, !inlinedAt(a, receiver.ty, index))
             }
+            CIndex(array, index) -> {
+                usesIn(a, array, False)
+                usesIn(a, index, False)
+                usesIn(a, assigned, !inlinedIn(a, assigned.ty))
+            }
             _ -> {
                 usesIn(a, target, True)
                 usesIn(a, assigned, True)
@@ -906,6 +911,11 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
                 }
                 None -> for x in args { usesIn(a, x, True) }
             }
+            -- An array's element holds a value of several slots as its slots,
+            -- where `Layout.inlined` says so (`elementParts`), and no other
+            -- operand of these primitives is a value of several slots.
+            CPrim(Prims.ArraySet) | CPrim(Prims.ArrayNew) | CPrim(Prims.ArrayFill) ->
+                for x in args { usesIn(a, x, !inlinedIn(a, x.ty)) }
             _ -> {
                 usesIn(a, fn, False)
                 for x in args { usesIn(a, x, True) }
@@ -2023,8 +2033,10 @@ fun writeField(l : Lower, object : Value, p : Placed, index : Int, v : Value) ->
 }
 
 -- How an array holds elements of a type: the element's own layout, whether
--- it holds the layout's slots or the one `storedRep`, and how the array lays
--- those out. Every element is held at `storedRep`.
+-- it holds the layout's slots (`Layout.inlined`) or the one `storedRep`, and
+-- how the array lays those out. The rule is the one an object's field has
+-- (`Layout.fieldReps`). It is a function of the layout alone, so every copy
+-- of a body that writes an array and every copy that reads it agree.
 type Elements = Elements {
     held    : Ssa.Layout,
     inline  : Bool,
@@ -2048,11 +2060,18 @@ fun elementsAt(l : Lower, ty : Ty.Type) -> Elements = elementsHeld(heldOf(l, ty)
 
 -- Returns how an array holds elements held at `held`.
 fun elementsHeld(held : Ssa.Layout) -> Elements =
-    Elements { held = held, inline = False, element = Rt.element([Layout.storedRep(held)]) }
+    Elements {
+        held = held,
+        inline = Layout.inlined(held),
+        element = Rt.element(Layout.fieldReps(held)),
+    }
 
 -- Returns element `index` of `array`: its slots, loaded here, or what memory
 -- holds it as. Panics if `index` is out of bounds.
 fun readElement(l : Lower, array : Value, index : Value, es : Elements) -> Value {
+    -- Check the index at every slot, so that no slot is read unchecked
+    -- wherever a pass moves it. `Turkey.Bounds` removes every check after the
+    -- first, since the first passing proves the rest.
     let reps = es.element.layout.reps
     let loaded = Array.init(len(reps), fun(k) =
         L.emit(l.b, ArrayGet(array, index, L.elementRef(es.element, k), Checked), reps[k]))

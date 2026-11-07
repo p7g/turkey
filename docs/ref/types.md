@@ -768,12 +768,13 @@ Immutable values can never be changed, so a program cannot tell whether they
 are copied or shared. The same holds for a field that is not `var`: reading
 it through any reference gives the value the record was built with.
 
-Tasks running at the same time can read and assign the same `var` field.
-Reading a `var` field while another task assigns it gives a value that some
-assignment stored there, or the value the record was built with, with one
-exception. A `var` field whose type is a tuple or a type with one constructor
-may be read **torn**: what the read gives combines fields of different values
-stored in it. Each of its fields is that field of some value stored there,
+Tasks running at the same time can read and assign the same `var` field, or
+the same element of an array. Reading either while another task assigns it
+gives a value that some assignment stored there, or the value the record or
+the array was built with, with one exception. A `var` field or an array
+element whose type is a tuple or a type with one constructor may be read
+**torn**: what the read gives combines fields of different values stored in
+it. Each of its fields is that field of some value stored there,
 and the same holds of their own fields in turn, down to a field of a
 primitive type or of a type with more than one constructor, which is read
 whole. So a torn read always gives a value of the field's type, possibly one
@@ -787,8 +788,9 @@ type Body = Body { var pos : Vec3, mass : Float }
 
 A task that reads `body.pos` while another assigns
 `Vec3 { x = 1.0, y = 1.0, z = 1.0 }` over `Vec3 { x = 0.0, y = 0.0, z = 0.0 }`
-may see `Vec3 { x = 1.0, y = 0.0, z = 0.0 }`. Where a value must be read
-whole, make the reads and the assignments exclude each other, with
+may see `Vec3 { x = 1.0, y = 0.0, z = 0.0 }`, and so may one that reads
+`points[i]` of an `Array Vec3` while another assigns it. Where a value must
+be read whole, make the reads and the assignments exclude each other, with
 `System.Sync.withLock` for instance.
 
 > **For readers new to this.** A read is *torn* when it sees part of one write

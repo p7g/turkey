@@ -375,18 +375,29 @@ fun tagOf(t : Types, ty : Ty.Type, name : String) -> Int =
         Enumeration(name + " tag", 4, enumerators)
     })
 
--- An array of `element`s: its header, its length, and its elements. An
--- element is `Rt.element`'s stride apart from the next, which for `unit` is
--- wider than its value: such an element is a structure of that width, its
+-- An array of `element`s: its header, its length, and its elements, each
+-- `Rt.element`'s stride apart. An element held as its slots
+-- (`Layout.inlined`) is a structure of them, at the offsets the array gives
+-- them. An element held in one slot is its value, unless the stride is wider,
+-- as it is for `unit`: then it is a structure of the stride's width, its
 -- value the member `value` at its start.
 fun array(t : Types, ty : Ty.Type, element : Ty.Type) -> Int {
-    let rep = Layout.storedRep(layoutOf(t, element))
-    let stride = Rt.element([rep]).stride
-    let value = held(t, element)
-    let elements = if Rt.fieldWidth(rep) == stride { value } else {
+    let layout = layoutOf(t, element)
+    let e = Rt.element(Layout.fieldReps(layout))
+    let elements = if Layout.inlined(layout) {
         entry(t, "element " + Ty.typeKey(element), fun() =
-            Structure(typeName(element) + " element", stride,
-                      [Member { name = "value", ty = value, offset = 0 }]))
+            match Layout.flatOf(t.decls, element, Map.new()) {
+                Some(flat) -> Structure(typeName(element) + " element", e.stride,
+                                        flatMembers(t, element, flat, e.layout.offsets, False))
+                None -> entryOf(t, byLayout(t, layout, False))
+            })
+    } else {
+        let value = held(t, element)
+        if Rt.fieldWidth(Layout.storedRep(layout)) == e.stride { value } else {
+            entry(t, "element " + Ty.typeKey(element), fun() =
+                Structure(typeName(element) + " element", e.stride,
+                          [Member { name = "value", ty = value, offset = 0 }]))
+        }
     }
     object(t, ty, typeName(ty), "", [
         Member { name = "length", ty = scalar(t, "long", Dwarf.encodingSigned, 8),

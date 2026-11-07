@@ -631,29 +631,41 @@ only when the packed value has exactly the requested type.
 The requested type is compared argument by argument, and that includes an
 argument that is itself a type constructor. With `type Cell f = Cell(f Int)`,
 `Cell Option` and `Cell Array` are different types with different
-descriptions, so a `SomeError` holding one never casts to the other:
+descriptions, and a value packed as one never casts to the other:
 
 <!-- run -->
 ```kotlin
-import Data.Typed (Proxy(..), typeRep, describe)
-
 type Cell f = Cell(f Int)
 
+-- The payload: `Cell` itself cannot have an `Error` instance (see below).
+type Packed a = Packed(a)
+
+instance Error (Packed a) : Typed a {
+    fun message(_) = "packed"
+}
+
 fun main() {
-    let p : Proxy (Cell Option) = Proxy
-    print(describe(typeRep(p)))
-    let q : Proxy (Cell Array) = Proxy
-    print(typeRep(p) == typeRep(q))
+    let err = fail(Packed(Cell(Some(1))))
+    match Error.cast(err) : Option (Packed (Cell Option)) {
+        Some(Packed(Cell(o))) -> print(o)
+        None -> print("not a Cell Option")
+    }
+    match Error.cast(err) : Option (Packed (Cell Array)) {
+        Some(_) -> print("a Cell Array")
+        None -> print("not a Cell Array")
+    }
 }
 ```
 
 ```text
-Main#Cell Data.Option#Option
-False
+Some(1)
+not a Cell Array
 ```
 
 A context can ask for `Typed` only of a type, though, and not of a type
-constructor such as `f`:
+constructor such as `f`. So `Cell` cannot have an `Error` instance: the
+instance would need `Typed (Cell f)`, which needs `Typed f`, and no context
+can say so. A payload like `Packed` above carries such a type instead.
 
 <!-- error: but 'Typed' constrains a type of kind * -->
 ```kotlin
@@ -662,4 +674,18 @@ import Data.Typed (Proxy(..), typeRep, describe)
 type Cell f = Cell(f Int)
 
 fun shown[Typed f](p : Proxy (Cell f)) -> String = describe(typeRep(p))
+```
+
+Inference is not bound by that rule. A function with no signature that
+needs the rep of a `Cell f` is inferred with exactly the context no program
+can write, and works, but cannot be given a signature that restates its type:
+
+```text
+import Data.Typed (Proxy(..), typeRep)
+
+type Cell f = Cell(f Int)
+
+fun proxyFor(x : a) -> Proxy a = Proxy
+fun repOf(x) = match x { Cell(_) -> typeRep(proxyFor(x)) }
+-- repOf : [Typed a] fun(Cell a) -> TypeRep, where `a` has kind * -> *
 ```

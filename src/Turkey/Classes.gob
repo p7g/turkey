@@ -2,7 +2,7 @@ export (
     Evidence(..), MethodImpl(..), InstancePlan(..), newInstancePlan,
     MethodInfo(..), hasDefault, methodDicts, methodEqualities, methodEvidence,
     ClassInfo(..), classKind,
-    InstInfo(..), instCon, instHeadKey, typedArgs, showDeclared, writtenNamer,
+    InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
@@ -1211,7 +1211,7 @@ fun accessor(cls : String, which : String) -> String = cls + "#" + which
 
 -- A declaration for something nobody wrote. Spans are not optional on `FunDecl`
 -- and `InstanceDecl`, and a generated class has no source to point at.
-fun generatedSpan() -> Span = Source.span("<generated>", 0, 0)
+fun generatedSpan() -> Span = Source.generated()
 
 -- Declare a field, setter or projection class, once per label.
 --
@@ -1530,9 +1530,11 @@ fun typedArgs(general : Ty.Type) -> Array Ty.Type = match general {
 
 -- The `Typed` instance for one type constructor, on demand.
 --
--- Coherent for the same reason `synthesize` is: one instance per constructor,
--- and the compiler is the only thing that may write one, so nothing overlaps
--- and nothing can disagree about what a type is called.
+-- Coherent for the same reason `synthesize` is: one instance per constructor
+-- and count of arguments, and the compiler is the only thing that may write
+-- one, so nothing overlaps and nothing can disagree about what a type is
+-- called. `Either a` and `Either a b` are two instances, for two types of
+-- different kinds.
 --
 -- The head is the *general* one -- `Map k v`, not `Map String Int` -- so one
 -- instance serves every use, and its context is `Typed` over each parameter.
@@ -1551,6 +1553,11 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
         -- recovering a pointer out of a dynamic value is a pointer forged
         -- from data whose provenance the checker gave up on.
         TCon(c) -> if c.name == "Prim.Ptr" { return None }
+                   -- A skolem, the rigid variable of a signature or of an
+                   -- opened existential, stands for a type nobody here knows,
+                   -- so its rep can come only from a given, never from its
+                   -- name.
+                   else if c.uid != 0 { return None }
                    else if len(args) == 0 { receiver } else {
             match Map.get(t.decls.tycons, c.name) {
                 None -> return None
@@ -1593,11 +1600,19 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
 }
 
 -- Returns the key that tells derived `Typed` instances apart: the head's
--- constructor and how many arguments it is applied to. The constructor alone
--- would not do, because `Either a` and `Either a b` are both heads, of
--- different kinds, and so are `Option` and `Option a`.
-fun typedHeadKey(head : Ty.Type) -> String =
-    instHeadKey(head) + "/" + Int.toString(len(typedArgs(head)))
+-- constructor, then `typedSuffix`.
+fun typedHeadKey(head : Ty.Type) -> String = instHeadKey(head) + typedSuffix(head)
+
+-- Returns what tells apart two derived `Typed` heads over one constructor:
+-- nothing for a head of kind `*`, and `/` and its count of arguments for a
+-- head of another kind. The constructor alone would not do, because
+-- `Either a` and `Either a b` are both heads, of different kinds, and so are
+-- `Option` and `Option a`. A head of kind `*` applies its constructor to every
+-- parameter, so it needs no count.
+fun typedSuffix(head : Ty.Type) -> String = match Ty.kprune(Ty.kindOf(head)) {
+    KStar -> ""
+    _ -> "/" + Int.toString(len(typedArgs(head)))
+}
 
 -- Returns `general`, a constructor applied to all its parameters, applied to
 -- only the first `n` of them.

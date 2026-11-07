@@ -606,27 +606,18 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
     }
 }
 
--- Refuses a class whose equality superclasses can never hold together, a
--- method whose own context contradicts them, and an instance whose context
--- does not prove its class's equality superclasses at its head.
+-- Refuses a class whose equality superclasses can never hold together, and a
+-- method whose own context contradicts them. What an instance must prove is
+-- `checkInstanceEqualities`'s.
 --
--- After every instance is registered, since a proof reduces associated types
--- through all of them. Not in `Classes.checkInstance` with the class
--- superclasses, because a proof rewrites by the context's givens, which is
+-- After every class is registered, since a class's closure reaches classes
+-- declared after it. Not in `Classes`, because it rewrites by givens, which is
 -- `Turkey.Inert`'s, and `Turkey.Inert` is built on `Turkey.Classes`.
 fun checkSuperEqualities(classes : ClassTable) -> Unit {
     for (_, info) in Map.entries(classes.classes) {
         let own = Ty.pred(info.name, [TVar(info.cvar)])
         if len(Classes.superEqualities(classes, own)) == 0 { continue }
         checkClassEqualities(classes, info, own)
-    }
-    for (cls, insts) in Map.entries(classes.instances) {
-        let info = match Map.get(classes.classes, cls) {
-            Some(i) -> i
-            None -> continue
-        }
-        if len(info.equalities) == 0 { continue }
-        for inst in insts { proveSuperEqualities(classes, info, inst) }
     }
 }
 
@@ -636,7 +627,9 @@ fun checkSuperEqualities(classes : ClassTable) -> Unit {
 -- would be checked under a contradiction; a context that writes both sides
 -- of one is refused the same way.
 fun checkClassEqualities(classes : ClassTable, info : ClassInfo, own : Pred) -> Unit {
-    let n = writtenNamer([(info.cvar.id, info.param)])
+    let names = Map.new()
+    Map.put(names, info.cvar.id, info.param)
+    let n = Classes.writtenNamer(names)
     -- As the givens a `C a` grants over a rigid `a`, inherited ones included.
     let (inert, refused) = Inert.extend(Inert.empty(classes), [Inert.given(own)])
     for r in refused {
@@ -678,52 +671,6 @@ fun writtenEqualities(m : MethodInfo) -> Vec Given {
         })
     }
     out
-}
-
--- Returns a namer that calls each variable by the name the program wrote.
-fun writtenNamer(names : Array (Int, String)) -> Namer {
-    let map = Map.new()
-    for (id, name) in names { Map.put(map, id, name) }
-    Namer { names = map, next = 0, prefix = "" }
-}
-
--- Reports each equality superclass of `info` that the context of `inst` does
--- not prove at its head: one that can never hold, or one the context does not
--- decide. The context's class predicates grant their own equality superclasses.
-fun proveSuperEqualities(classes : ClassTable, info : ClassInfo, inst : InstInfo) -> Unit {
-    -- An instance missing a class superclass is reported by `Classes.checkInstance`
-    -- already, and its associated types are what this would report again.
-    for sup in info.supers {
-        if !Classes.entail(classes, inst.context, Ty.pred(sup.name, [inst.head])) { return {} }
-    }
-    let n = writtenNamer(Map.entries(inst.names))
-    let shown = info.name + " " + Ty.showAt(inst.head, n, 2)
-    let (inert, _) = Inert.extend(Inert.empty(classes),
-                                  Vec.toArray(Vec.map(inst.context, Inert.given)))
-    for e in info.equalities {
-        let want = Classes.equalityAt(info, e, inst.head)
-        let left = Inert.rewrite(inert, want.args[0])
-        let right = Inert.rewrite(inert, want.args[1])
-        if Ty.sameType(left, right) { continue }
-        let required = "'" + shown + "' requires '" + Ty.showPredWith(want, n) + "'"
-        let (_, never) = Inert.extend(inert, [Inert.given(Ty.pred(Ty.equals, [left, right]))])
-        let refuted = Iterator.any(never, fun(r) = match r {
-            Never(_, _) -> True
-            GaveUp(_, _) -> False
-        })
-        if refuted {
-            Ty.typeError(required + ", which can never hold: '" + Ty.showAt(left, n, 1)
-                         + "' is not '" + Ty.showAt(right, n, 1) + "'", Some(inst.decl.span))
-        } else if let Some(missing) = missingInstance(classes, [left, right]) {
-            Ty.typeError(required + ", and there is no instance '"
-                         + Ty.showPredWith(missing, n) + "' to define it", Some(inst.decl.span))
-        } else {
-            Ty.typeError(required + ", and its context cannot tell whether '"
-                         + Ty.showAt(left, n, 1) + "' is '" + Ty.showAt(right, n, 1) + "'",
-                         Some(inst.decl.span))
-        }
-    }
-    Inert.close(inert)
 }
 
 -- Returns the instance that some associated type at the top of `sides` is
@@ -787,7 +734,7 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
                     -- as its dictionary is built.
                     Diag.beginUnit()
                     Map.put(info.defaults, m.name, checkMethod(g, m, sk,
-                        [], [],
+                        [], [], [],
                         "the default definition of '" + m.name + "'", None, None))
                     let _ = Diag.endUnit()
                 }
@@ -797,6 +744,7 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
     for decl in instDecls {
         let inst = instanceFor(g, decl)
         let info = classNamed(g, decl.cls)
+        checkInstanceEqualities(g, inst, info)
         let params = Vec.new(len(inst.context))
         for q in inst.context { Vec.push(params, dictName(q.name)) }
         let plan = Classes.newInstancePlan(params)
@@ -818,14 +766,116 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
             }
             -- The class variable is not made rigid: the instance fixes it.
             Map.put(sk.mapping, m.classVar.id, Classes.skolemApply(sk, inst.head))
-            let context = Array.map(inst.context, fun(q) =
-                Ty.pred(q.name, [Classes.skolemApply(sk, q.args[0])]))
+            let context = Array.map(inst.context, Classes.skolemApplyPred(sk, _))
+            let equalities = Array.map(inst.equalities, Classes.skolemApplyPred(sk, _))
             Diag.beginUnit()
             Map.put(plan.methods, methodDecl.name, checkMethod(g, m, sk, context,
-                plan.params, "instance '" + decl.cls + " " + Ty.show(inst.head)
+                plan.params, equalities, "instance '" + decl.cls + " " + Ty.show(inst.head)
                 + "'", Some(methodDecl), Some(selfName)))
             let _ = Diag.endUnit()
         }
+    }
+}
+
+-- Reports what `inst`'s context cannot give it: an equality in the context
+-- that can never hold, where the context writes it; an equality that a
+-- superclass's instance needs; and an equality superclass of its own class,
+-- at its head.
+--
+-- Each is decided under the instance's givens, which are its whole context
+-- expanded at once (`Classes.contextPreds`, `Inert.granted`): its written
+-- equalities, and the equality superclasses of its class predicates. Its
+-- methods are checked under the same givens.
+fun checkInstanceEqualities(g : Generator, inst : InstInfo, info : ClassInfo) -> Unit {
+    -- Checked once per instance rather than in each method's check, though
+    -- every override is granted the same equalities: a refusal there would be
+    -- reported once per method, or never for an instance with no methods.
+    let spans = Vec.new(len(inst.equalities))
+    for p in inst.decl.context {
+        if let PEq(_, _) = p.kind { Vec.push(spans, Some(p.span)) }
+    }
+    -- Over skolems named as the declaration names its variables, as a
+    -- method's check sees them, so a refusal prints them as written.
+    let sk = Classes.newSkolems()
+    for v in Ty.varsOf([inst.head]) {
+        discard(Classes.skolemBind(sk, v, Map.getOr(inst.names, v.id, "a")))
+    }
+    let n = Classes.writtenNamer(inst.names)
+    -- The class predicates first: an equality the context writes that
+    -- contradicts what they grant is then the one refused, where it is written.
+    let preds = Classes.contextPreds(inst)
+    let givens = Array.init(len(preds), fun(i) = Inert.Given {
+        pred = Classes.skolemApplyPred(sk, preds[i]),
+        span = if i < len(inst.context) { None } else { spans[i - len(inst.context)] },
+    })
+    let (inert, refused) = Inert.extend(Inert.empty(g.classes), givens)
+    for r in refused {
+        match r {
+            Never(Given { pred, span = None }, why) ->
+                Ty.typeError("the context of '" + Classes.showDeclared(inst) + "' grants '"
+                             + Ty.showPredWith(pred, n) + "', which can never hold with the "
+                             + "rest of it; " + why, Some(inst.decl.span))
+            _ -> discard(C.refusedHere(r, CAnd([])))
+        }
+    }
+    if len(refused) > 0 { return {} }
+    let named = Vec.map(inst.context, fun(p) = ("", p))
+    var supersHold = True
+    for sup in info.supers {
+        let demand = Ty.pred(sup.name, [inst.head])
+        -- `Classes.checkInstance` has reported a superclass with no evidence.
+        let ev = match Classes.prove(g.classes, named, demand) {
+            Some(found) -> found
+            None -> {
+                supersHold = False
+                continue
+            }
+        }
+        for q in Classes.provenEqualities(ev) {
+            if !Inert.implies(inert, Classes.skolemApplyPred(sk, q)) {
+                Ty.typeError("'" + Ty.showPredWith(demand, n) + "' is required by '"
+                             + inst.cls + "', and its instance needs '"
+                             + Ty.showPredWith(q, n) + "'; add it to the context",
+                             Some(inst.decl.span))
+            }
+        }
+    }
+    -- A missing superclass instance would leave its associated types stuck,
+    -- and this would report it again.
+    if supersHold {
+        for e in info.equalities {
+            proveEquality(g.classes, inst, inert, n,
+                          Classes.skolemApplyPred(sk, Classes.equalityAt(info, e, inst.head)))
+        }
+    }
+    Inert.close(inert)
+}
+
+-- Reports the equality superclass `want` of `inst`'s class, at its head, if
+-- the instance's givens `inert` do not prove it: if it can never hold, or if
+-- they do not decide it.
+fun proveEquality(classes : ClassTable, inst : InstInfo, inert : Inert.Inert, n : Namer,
+                  want : Pred) -> Unit {
+    let left = Inert.rewrite(inert, want.args[0])
+    let right = Inert.rewrite(inert, want.args[1])
+    if Ty.sameType(left, right) { return {} }
+    let required = "'" + Classes.showDeclared(inst) + "' requires '"
+                   + Ty.showPredWith(want, n) + "'"
+    let (_, never) = Inert.extend(inert, [Inert.given(Ty.pred(Ty.equals, [left, right]))])
+    let refuted = Iterator.any(never, fun(r) = match r {
+        Never(_, _) -> True
+        GaveUp(_, _) -> False
+    })
+    if refuted {
+        Ty.typeError(required + ", which can never hold: '" + Ty.showAt(left, n, 1)
+                     + "' is not '" + Ty.showAt(right, n, 1) + "'", Some(inst.decl.span))
+    } else if let Some(missing) = missingInstance(classes, [left, right]) {
+        Ty.typeError(required + ", and there is no instance '"
+                     + Ty.showPredWith(missing, n) + "' to define it", Some(inst.decl.span))
+    } else {
+        Ty.typeError(required + ", and its context cannot tell whether '"
+                     + Ty.showAt(left, n, 1) + "' is '" + Ty.showAt(right, n, 1) + "'",
+                     Some(inst.decl.span))
     }
 }
 
@@ -846,6 +896,7 @@ fun classNamed(g : Generator, name : String) -> ClassInfo =
 
 fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
                 context : Array Pred, contextNames : Vec String,
+                equalities : Array Pred,
                 what : String, override : Option FunDecl,
                 selfNameIn : Option String) -> MethodImpl {
     for v in m.scheme.quantified {
@@ -882,6 +933,9 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     for var i = 0; i < len(context) && i < len(contextNames); i = i + 1 {
         Vec.push(givens, (contextNames[i], context[i]))
     }
+    -- The instance's equalities pass no dictionary, so their name is never
+    -- read.
+    for q in equalities { Vec.push(givens, (dictName(q.name), q)) }
 
     let decl = match override {
         Some(d) -> d

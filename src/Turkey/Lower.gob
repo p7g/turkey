@@ -689,15 +689,19 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
 }
 
 -- Returns whether the method `name`'s own equalities can never hold together
--- at the instance's head with those the instance's context grants through its
--- equality superclasses, tested jointly as the solver tests the givens its
--- override is checked under. Such a method can never be called at that head,
+-- at the instance's head with those the instance's context grants, tested
+-- jointly as the solver tests the givens its override is checked under. Such a method can never be called at that head,
 -- since every call has to supply the evidence for its equalities. Its body may
 -- also be ill-typed there, since it was checked under equalities that are
 -- false, so it is not lowered at all.
 fun refutedAt(l : Lowerer, inst : InstInfo, name : String) -> Bool {
     let own = methodEqualitiesAt(methodOf(l, inst.cls, name, Some(inst.decl.span)), inst.head)
-    let context = Inert.granted(l.classes, Vec.toArray(Vec.map(inst.context, Inert.given)))
+    if len(own) == 0 { return False }
+    -- With what the instance's context grants, which the override is checked
+    -- under too: its equalities, and its class predicates' equality
+    -- superclasses.
+    let context = Inert.granted(l.classes,
+                                Vec.toArray(Vec.map(Classes.contextPreds(inst), Inert.given)))
     for g in context { Vec.push(own, (g.pred.args[0], g.pred.args[1])) }
     Inert.refutes(l.classes, own)
 }
@@ -797,18 +801,27 @@ fun contextParams(l : Lowerer, inst : InstInfo, plan : InstancePlan)
                             fun(i) = plan.params[i]))
 
 -- An instance's dictionary `record`, of type `result`, as a function of its
--- context `bound`, or `record` itself for an instance with none.
+-- context: the dictionaries `bound`, then a coercion for each equality. It is
+-- `record` itself for an instance with no context.
 fun overContext(l : Lowerer, inst : InstInfo, bound : Array (String, Int), record : Core,
                 result : Ty.Type) -> Core {
-    if len(bound) == 0 { return record }
-    let params = Array.init(len(bound), fun(i) {
+    if len(bound) == 0 && len(inst.equalities) == 0 { return record }
+    let dicts = Array.init(len(bound), fun(i) {
         let p = inst.context[i]
         let (name, id) = bound[i]
         CParam { name = name, id = id, ty = dictType(l, p.name, p.args[0]) }
     })
+    let coercions = Array.map(Vec.toArray(instanceEqualities(inst)), fun((left, right)) =
+        CParam { name = "%co", id = mint(l, "%co"), ty = coercionOf(left, right) })
+    let params = Array.append(dicts, coercions)
     node(TFun(Array.map(params, _.ty), result), Some(inst.decl.span),
          CLam(params, record, instName(inst)))
 }
+
+-- The equalities of an instance's context, over its head's variables: what
+-- its coercion parameters grant.
+fun instanceEqualities(inst : InstInfo) -> Vec (Ty.Type, Ty.Type) =
+    Vec.map(inst.equalities, fun(p) = (p.args[0], p.args[1]))
 
 fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
     let span = Some(inst.decl.span)
@@ -891,15 +904,20 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
         fn = node(unknown(), Some(inst.decl.span),
                   CTyApp(fn, Array.map(binders, TVar)))
     }
-    if len(inst.context) == 0 {
+    if len(inst.context) == 0 && len(inst.equalities) == 0 {
         fn.ty = result
         return fn
     }
     let count = fewer(len(params), len(inst.context))
-    let args = Array.init(count, fun(i) {
+    let dicts = Array.init(count, fun(i) {
         node(predType(l, inst.context[i]), Some(inst.decl.span),
              CVar(dictRef(l, params[i], Some(inst.decl.span))))
     })
+    -- Fresh coercions rather than the instance's parameters, since nothing
+    -- refers to a coercion parameter.
+    let coercions = Array.map(Vec.toArray(instanceEqualities(inst)), fun((left, right)) =
+        coercion(left, right, Some(inst.decl.span)))
+    let args = Array.append(dicts, coercions)
     fn.ty = TFun(Array.map(args, _.ty), result)
     node(result, Some(inst.decl.span), CApp(fn, args))
 }
@@ -1346,18 +1364,23 @@ fun instanceRef(l : Lowerer, inst : InstInfo, matched : Map Int Ty.Type,
     if len(typeArgs) > 0 {
         fn = node(unknown(), None, CTyApp(fn, typeArgs))
     }
-    if len(args) == 0 {
+    if len(args) == 0 && len(inst.equalities) == 0 {
         fn.ty = result
         return fn
     }
     let count = fewer(len(args), len(inst.context))
-    let argTerms = Array.init(count, fun(i) {
+    let dicts = Array.init(count, fun(i) {
         let p = inst.context[i]
         let want = Decls.substitute(p.args[0], mapping)
         -- No givens: an instance's context arrives as its own parameters, which
         -- `instanceGivens` supplies where those are in scope.
         evidence(l, args[i], dictType(l, p.name, want), Map.new())
     })
+    -- The solver proved each equality at this match, and a coercion carries
+    -- nothing but its type.
+    let coercions = Array.map(Classes.equalitiesAt(inst, mapping), fun(q) =
+        coercion(q.args[0], q.args[1], None))
+    let argTerms = Array.append(dicts, coercions)
     fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
 }

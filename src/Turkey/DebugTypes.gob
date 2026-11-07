@@ -83,10 +83,7 @@ fun layoutOf(t : Types, ty : Ty.Type) -> Ssa.Layout =
 -- index is taken before `make` runs, so a type whose entry names itself, a
 -- recursive type's, finds it.
 fun entry(t : Types, key : String, make : fun() -> Dwarf.TypeEntry) -> Int {
-    match Map.get(t.index, key) {
-        Some(k) -> return k
-        None -> {}
-    }
+    if let Some(k) = Map.get(t.index, key) { return k }
     let k = len(t.entries)
     Map.put(t.index, key, k)
     Vec.push(t.entries, PointerTo(None))
@@ -172,6 +169,26 @@ fun entryName(t : Types, k : Int) -> String = match t.entries[k] {
     _ -> "ptr"
 }
 
+-- Returns the bytes a value of the entry at index `k` occupies. An entry
+-- still being made is a pointer until it is done, so a structure that holds
+-- itself is measured as pointing to itself.
+fun width(t : Types, k : Int) -> Int = match t.entries[k] {
+    BaseType(_, _, size) -> size
+    Typedef(_, of) -> width(t, of)
+    Structure(_, size, _) -> size
+    UnionOf(_, size, _) -> size
+    Enumeration(_, size, _) -> size
+    PointerTo(_) -> 8
+    ArrayOf(_) -> 0
+}
+
+-- Returns the bytes a structure of `members` needs to hold each of them.
+fun extent(t : Types, members : Vec Member) -> Int {
+    var size = 0
+    for m in members { size = max(size, m.offset + width(t, m.ty)) }
+    size
+}
+
 fun scalar(t : Types, name : String, encoding : Int, size : Int) -> Int =
     entry(t, "scalar " + name, fun() = BaseType(name, encoding, size))
 
@@ -233,12 +250,8 @@ fun object(t : Types, ty : Ty.Type, name : String, tagged : String,
         if tagged != "" {
             Vec.push(all, Member { name = "tag", ty = tagOf(t, ty, tagged), offset = 4 })
         }
-        var size = Rt.objectFields
-        for m in members {
-            Vec.push(all, m)
-            if m.offset + 8 > size { size = m.offset + 8 }
-        }
-        Structure(name, size, all)
+        for m in members { Vec.push(all, m) }
+        Structure(name, max(Rt.objectFields, extent(t, all)), all)
     })
 
 -- The fields of an object of the one constructor of `ty`, at their offsets.
@@ -299,7 +312,7 @@ fun unionOf(t : Types, name : String, members : Vec (String, Int)) -> Int {
     let all = []
     for (member, k) in members {
         Vec.push(all, Member { name = member, ty = k, offset = 0 })
-        if let Structure(_, n, _) = t.entries[k] { if n > size { size = n } }
+        size = max(size, width(t, k))
     }
     Vec.push(t.entries, UnionOf(name, size, all))
     len(t.entries) - 1
@@ -440,9 +453,7 @@ fun flatMembers(t : Types, ty : Ty.Type, flat : Layout.Flat, at : Array Int,
         }
         let members = slotMembers(t, flat, flat.fields[k], types, fieldNames, at, start,
                                   inSlots)
-        var size = 0
-        for m in members { if m.offset + 8 > size { size = m.offset + 8 } }
-        Vec.push(t.entries, Structure(Ty.shortName(flat.names[k]), size, members))
+        Vec.push(t.entries, Structure(Ty.shortName(flat.names[k]), extent(t, members), members))
         Vec.push(variants, (Ty.shortName(flat.names[k]), len(t.entries) - 1))
     }
     let out = [Member { name = "tag", ty = tag, offset = at[0] }]

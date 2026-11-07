@@ -1,0 +1,106 @@
+-- Scoped values (`ScopedValue`): a binding lasts for the extent of its
+-- `with`, shadows and is restored when nested, follows a task across its
+-- suspensions, and is inherited by a task made inside it and not by one
+-- made before it, where a task is made when `runScope` runs its `spawn`.
+
+import ScopedValue (ScopedValue)
+import ScopedValue as ScopedValue
+import System.Task as Task
+
+let user : ScopedValue String = ScopedValue.new()
+let depth : ScopedValue Int = ScopedValue.new()
+
+fun describe() -> String {
+    let name = Option.unwrapOr(ScopedValue.get(user), "nobody")
+    match ScopedValue.get(depth) {
+        Some(d) -> name + " at " + Int.toString(d)
+        None -> name
+    }
+}
+
+fun nesting() {
+    print("unbound: " + describe())
+    ScopedValue.with(user, "ada", fun() {
+        print("bound: " + describe())
+        ScopedValue.with(depth, 1, fun() {
+            ScopedValue.with(user, "grace", fun() = print("shadowed: " + describe()))
+            print("restored: " + describe())
+        })
+        print("after the inner with: " + describe())
+    })
+    print("after the outer with: " + describe())
+}
+
+-- Two keys of one type are distinct.
+fun distinctKeys() {
+    let first : ScopedValue Int = ScopedValue.new()
+    let second : ScopedValue Int = ScopedValue.new()
+    ScopedValue.with(first, 1, fun() {
+        print("second while first is bound: " + show(ScopedValue.get(second)))
+    })
+}
+
+-- `with` returns what its function returns.
+fun result() {
+    let n = ScopedValue.with(depth, 20, fun() = Option.unwrapOr(ScopedValue.get(depth), 0) + 1)
+    print("result: " + Int.toString(n))
+}
+
+-- A task that suspends inside a `with` finds its binding when it resumes,
+-- although the other task ran meanwhile under bindings of its own.
+fun suspension() {
+    let log : Vec String = []
+    Task.runScope(do {
+        for name in ["ada", "grace"] {
+            let _ = Task.spawn(fun() {
+                ScopedValue.with(user, name, fun() {
+                    for var i = 0; i < 3; i = i + 1 {
+                        ScopedValue.with(depth, i, fun() {
+                            Task.yield()
+                            Vec.push(log, describe())
+                        })
+                    }
+                    Vec.push(log, "done: " + describe())
+                })
+            })?
+        }
+        pure(())
+    })
+    for line in log { print("task: " + line) }
+}
+
+-- A task made inside a `with` starts with its bindings; one made before the
+-- `with` does not see it, even though it runs inside it, while the scope
+-- below waits.
+fun inheritance() {
+    ScopedValue.with(user, "ada", fun() {
+        let (early, late) = Task.runScope(do {
+            let early = Task.spawn(fun() = describe())?
+            let late = ScopedValue.with(depth, 7, fun() =
+                Task.runScope(Task.spawn(fun() = describe())))
+            pure((early, late))
+        })
+        print("made before the with: " + Task.join(early))
+        print("made inside the with: " + Task.join(late))
+    })
+    -- A task's own `with` does not reach the code that made it.
+    let inner = Task.runScope(Task.spawn(fun() =
+        ScopedValue.with(user, "grace", fun() = describe())))
+    print("the task's binding: " + Task.join(inner) + "; here: " + describe())
+    -- A task starts with the bindings where `runScope` runs its `spawn`, not
+    -- where `spawn` was called: this `with` returns the action unrun.
+    let outside = Task.runScope(ScopedValue.with(user, "grace", fun() =
+        Task.spawn(fun() = describe())))
+    print("spawn called inside a with, run outside: " + Task.join(outside))
+    let action = Task.spawn(fun() = describe())
+    let inside = ScopedValue.with(user, "grace", fun() = Task.runScope(action))
+    print("spawn called outside a with, run inside: " + Task.join(inside))
+}
+
+fun main() {
+    nesting()
+    distinctKeys()
+    result()
+    suspension()
+    inheritance()
+}

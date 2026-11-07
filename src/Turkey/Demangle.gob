@@ -1,0 +1,239 @@
+export (displayName)
+
+import Turkey.Lexer as Lexer
+
+-- The display form of a name the compiler made: what a debugger and a
+-- profiler show for a function, in place of its symbol.
+--
+-- A symbol is the binding's internal name, which carries the separators the
+-- namers use to keep names apart. The display form spells each one the way a
+-- reader would, and keeps everything a reader needs to tell two copies of one
+-- function apart:
+--
+--   symbol                                        display form
+--   Main#area                                     Main.area
+--   Main#area@Rectangle                           Main.area[Rectangle]
+--   Data.Map#put@String,Unit                      Data.Map.put[String,Unit]
+--   Data.Int#badShift@[unit]                      Data.Int.badShift{unit}
+--   Turkey.Stdout#makeRoom%lambda1                Turkey.Stdout.makeRoom.<lambda1>
+--   %inst.Data.Hashable#Hash.Int#hashInto@FNV1a   Hash(Int).hashInto[FNV1a]
+--   %inst.Data.Eq#Eq.Data.Option#Option@String#eq Eq(Option(String)).eq
+--   %inst.%HasField.width.Main#Rectangle#get      HasField.width(Rectangle).get
+--   %default.Data.Eq#Eq.Data.Eq#Eq.ne@Int         Eq.<default>.ne[Int]
+--   %giblet.initialize                            <giblet>.initialize
+--
+-- * `#`, between a module and a name in it, is `.`.
+-- * A specialization's type arguments, which follow `@`, are in square
+--   brackets, spelled as the specializer spells them. A specialization at no
+--   type arguments adds nothing.
+-- * A copy made for the layouts of its existential arguments, `@[...]`, has
+--   them in braces.
+-- * A name the compiler made, which follows `%`, is in angle brackets and
+--   follows a `.`: a lambda, `<lambda0>`, numbered from 0 in the order its
+--   parent's lambdas are lowered, and `<boxed>`, `<worker>` and the like.
+-- * An instance's method is `Class(Type).method`, the class and the type
+--   without their modules, and the type's own arguments in parentheses, as a
+--   type argument spells them, when the instance was specialized.
+-- * A class's default for a method is `Class.<default>.method`.
+-- * A `~` the namers add to keep two names apart stays, with what follows it.
+--
+-- A name with none of these, such as a C function's, is its own display form.
+--
+-- The display form has no spaces, so it can be given to a debugger as a
+-- breakpoint by name. Two functions may share one display form, where they
+-- differ only in the modules an instance's class and type come from; the
+-- symbol tells them apart.
+--
+-- Returns the display form of the internal name `name`. Takes the name, not
+-- the symbol, so a Mach-O symbol's leading `_` is not part of it.
+fun displayName(name : String) -> String {
+    let chars = []
+    for c in String.codePoints(name) { Vec.push(chars, c) }
+    let s = Scan { chars = chars, at = 0, out = [] }
+    if String.startsWith(name, instancePrefix) {
+        s.at = String.byteLength(instancePrefix)
+        instanceOf(s)
+    } else if String.startsWith(name, defaultPrefix) {
+        s.at = String.byteLength(defaultPrefix)
+        classDefault(s)
+    }
+    rest(s)
+    String.fromCodePoints(s.out)
+}
+
+let instancePrefix = "%inst."
+let defaultPrefix = "%default."
+
+-- The name being read, where reading has reached, and the display form so far.
+type Scan = Scan {
+    chars  : Vec Char,
+    var at : Int,
+    out    : Vec Char,
+}
+
+fun peek(s : Scan, ahead : Int) -> Option Char =
+    if s.at + ahead < len(s.chars) { Some(s.chars[s.at + ahead]) } else { None }
+
+fun emit(s : Scan, text : String) -> Unit {
+    for c in String.codePoints(text) { Vec.push(s.out, c) }
+}
+
+-- Whether `c` can be part of an identifier. Every character outside ASCII
+-- can, because no separator the namers use is outside it.
+fun isNameChar(c : Char) -> Bool =
+    Char.isAsciiAlphanumeric(c) || c == '_' || c == '\'' || !Char.isAscii(c)
+
+-- Reads an identifier, which may be empty.
+fun ident(s : Scan) -> String {
+    let start = s.at
+    while s.at < len(s.chars) && isNameChar(s.chars[s.at]) { s.at = s.at + 1 }
+    String.fromCodePoints(Vec.slice(s.chars, start, s.at))
+}
+
+-- Whether the character `ahead` of the current one starts a name in
+-- `Module#Name`'s second half, as a type does and a function does not.
+fun upperAt(s : Scan, ahead : Int) -> Bool = match peek(s, ahead) {
+    Some(c) -> Char.isAsciiUpper(c)
+    None -> False
+}
+
+-- Reads the rest of the name: separators and what they introduce, and
+-- everything between them as it is.
+fun rest(s : Scan) -> Unit {
+    while s.at < len(s.chars) {
+        let c = s.chars[s.at]
+        s.at = s.at + 1
+        match c {
+            '#' -> {
+                emit(s, ".")
+                operator(s)
+            }
+            '%' -> made(s)
+            '@' -> specialization(s)
+            _ -> Vec.push(s.out, c)
+        }
+    }
+}
+
+-- A name the compiler made, after its `%`.
+fun made(s : Scan) -> Unit {
+    if len(s.out) > 0 && s.out[len(s.out) - 1] != '.' { emit(s, ".") }
+    emit(s, "<" + ident(s) + ">")
+}
+
+-- What follows `@`: layouts in square brackets, or type arguments.
+fun specialization(s : Scan) -> Unit {
+    if peek(s, 0) == Some('[') {
+        s.at = s.at + 1
+        let start = s.at
+        while s.at < len(s.chars) && s.chars[s.at] != ']' { s.at = s.at + 1 }
+        emit(s, "{" + String.fromCodePoints(Vec.slice(s.chars, start, s.at)) + "}")
+        s.at = s.at + 1
+    } else {
+        let args = typeArguments(s)
+        if args != "" { emit(s, "[" + args + "]") }
+    }
+}
+
+-- Reads a specialization's type arguments, after the `@`: up to the next
+-- separator outside parentheses, which no type the specializer spells holds.
+fun typeArguments(s : Scan) -> String {
+    let start = s.at
+    var depth = 0
+    while s.at < len(s.chars) {
+        match s.chars[s.at] {
+            '(' -> { depth = depth + 1 }
+            ')' -> { depth = depth - 1 }
+            c -> if depth == 0 && isSeparator(c) { break }
+        }
+        s.at = s.at + 1
+    }
+    String.fromCodePoints(Vec.slice(s.chars, start, s.at))
+}
+
+-- An operator's name, copied whole, where the name after a `#` is one. Its
+-- characters include the separators, so one is part of the operator unless
+-- it starts something an operator cannot hold: `@Int`, `%lambda0`, `#show`.
+fun operator(s : Scan) -> Unit {
+    while s.at < len(s.chars) {
+        let c = s.chars[s.at]
+        if !Lexer.isOperatorChar(c) { return }
+        if isSeparator(c) && startsName(peek(s, 1)) { return }
+        Vec.push(s.out, c)
+        s.at = s.at + 1
+    }
+}
+
+fun isSeparator(c : Char) -> Bool = match c {
+    '#' | '%' | '~' | '@' -> True
+    _ -> False
+}
+
+fun startsName(c : Option Char) -> Bool = match c {
+    Some(next) -> isNameChar(next) || next == '(' || next == '['
+    None -> False
+}
+
+-- An instance's dictionary, after `%inst.`: the class, then the type.
+fun instanceOf(s : Scan) -> Unit {
+    let cls = className(s)
+    emit(s, cls + "(" + instanceType(s) + ")")
+}
+
+-- A class's default for a method, after `%default.`: the class, then the
+-- method by its own internal name, which starts with the class's again.
+fun classDefault(s : Scan) -> Unit {
+    let start = s.at
+    let cls = className(s)
+    -- The class's internal name and its `.`, which the method's starts with.
+    let prefix = Vec.slice(s.chars, start, s.at)
+    emit(s, cls + ".<default>.")
+    var same = s.at + len(prefix) <= len(s.chars)
+    for var i = 0; same && i < len(prefix); i = i + 1 {
+        same = s.chars[s.at + i] == prefix[i]
+    }
+    if same { s.at = s.at + len(prefix) }
+}
+
+-- Reads a class's internal name and the `.` after it, and returns the class
+-- without its module: `Data.Eq#Eq` is `Eq`. A generated class, such as
+-- `%HasField.width`, is its own name and its label.
+fun className(s : Scan) -> String {
+    if peek(s, 0) == Some('%') {
+        s.at = s.at + 1
+        let head = ident(s)
+        s.at = s.at + 1
+        let label = ident(s)
+        s.at = s.at + 1
+        return head + "." + label
+    }
+    -- The module's components, up to the `#`, then the class.
+    var last = ident(s)
+    while peek(s, 0) == Some('.') || peek(s, 0) == Some('#') {
+        let hash = peek(s, 0) == Some('#')
+        s.at = s.at + 1
+        last = ident(s)
+        if hash { break }
+    }
+    -- The `.` between the class and the type.
+    s.at = s.at + 1
+    last
+}
+
+-- Reads an instance's type, and returns it without its module, with its
+-- arguments if the instance was specialized: `Data.Option#Option@String` is
+-- `Option(String)`. Module components and type names start with a capital
+-- letter, and the method that may follow does not.
+fun instanceType(s : Scan) -> String {
+    var last = ident(s)
+    while (peek(s, 0) == Some('.') || peek(s, 0) == Some('#')) && upperAt(s, 1) {
+        s.at = s.at + 1
+        last = ident(s)
+    }
+    if peek(s, 0) == Some('@') && peek(s, 1) != Some('[') {
+        s.at = s.at + 1
+        let args = typeArguments(s)
+        if args != "" { return last + "(" + args + ")" }
+    }
+    last
+}

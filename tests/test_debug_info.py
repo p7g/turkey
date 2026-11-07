@@ -48,6 +48,7 @@ from tests import bootc, toolchain
 from tests.test_encode import _code
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+FORMATTERS = REPO_ROOT / "debugger"
 LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
@@ -121,6 +122,55 @@ fun main() {
 }
 """
 
+# A function a debugger stops in twice, with a variable of each kind of type
+# live at both stops: `look` calls itself, so it is not inlined, and every
+# parameter is read after the second stop. The strings, the vector and the
+# tree are live across calls, so the collector roots them and they move from
+# their registers into frame slots.
+VALUES = """\
+type Point = Point { x : Int, y : Int }
+type Color = Red | Green | Blue
+type Tree = Leaf | Node(Tree, Int, Tree)
+
+fun depth(t : Tree) -> Int = match t {
+    Leaf -> 0
+    Node(l, _, r) -> 1 + depth(l) + depth(r)
+}
+
+fun look(n : Int, s : String, p : Point, c : Color, t : Tree, o : Option String,
+         v : Vec Int, m : Map String Int) -> Int {
+    if n > 1000 { return look(n - 1, s, p, c, t, o, v, m) }
+    let total = n * 2
+    print(s)
+    let d = depth(t)
+    print(Int.toString(len(v)))
+    print(s + Option.unwrapOr(o, ""))
+    let shade = match c {
+        Red -> 1
+        Green -> 2
+        Blue -> 3
+    }
+    print(s)
+    n + total + d + p.x + p.y + shade + len(v) + String.byteLength(Option.unwrapOr(o, ""))
+        + depth(t) + Map.getOr(m, "one", 0)
+}
+
+fun main() {
+    let v = Vec.new(4)
+    for x in [1, 2, 3] { Vec.push(v, x * 10) }
+    let tree = Node(Node(Leaf, 1, Leaf), 2, Leaf)
+    let m = Map.new()
+    Map.put(m, "one", 1)
+    Map.put(m, "two", 2)
+    print(look(5, "hi", Point { x = 3, y = 4 }, Green, tree, Some("there"), v, m))
+}
+"""
+
+# The lines of `VALUES` a debugger stops at: before the first call, and
+# after two more.
+FIRST_STOP = 15
+SECOND_STOP = 18
+
 pytestmark = pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 
 
@@ -165,17 +215,17 @@ def _needs_dwarfdump() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _built(how: str, program: str = PROGRAM) -> Path:
-    """`program` built with `-g` and linked, in a directory of its own:
-    `prog.o` beside the executable as the macOS debug map needs it, and
-    `prog`. `how` is `asm`, through `prog.s` and the assembler, or `obj`,
-    with `boot` writing the object."""
+def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
+    """`program` built with `level`, `-g` or a `--debug`, and linked, in a
+    directory of its own: `prog.o` beside the executable as the macOS debug
+    map needs it, and `prog`. `how` is `asm`, through `prog.s` and the
+    assembler, or `obj`, with `boot` writing the object."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
     source.write_text(program, encoding="utf-8")
     output = "prog.s" if how == "asm" else "prog.o"
     compiled = subprocess.run(
-        toolchain.command(bootc.binary(), "build", "-g", "-f", how, "-o", output,
+        toolchain.command(bootc.binary(), "build", level, "-f", how, "-o", output,
                           "prog.gob"),
         cwd=directory, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
@@ -218,9 +268,10 @@ def test_the_line_table_has_a_row_for_each_statement(how):
 
 
 @pytest.mark.parametrize("how", PATHS)
-def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how):
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level):
     tool = _needs_dwarfdump()
-    text = subprocess.run([tool, "--debug-info", str(_built(how) / "prog.o")],
+    text = subprocess.run([tool, "--debug-info", str(_built(how, PROGRAM, level) / "prog.o")],
                           capture_output=True, text=True, check=True).stdout
     assert "DW_TAG_compile_unit" in text
     assert '("prog.gob")' in text
@@ -231,9 +282,10 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how):
 @pytest.mark.parametrize("how", PATHS)
 @pytest.mark.parametrize("which", ["prog.o", "prog"])
 @pytest.mark.parametrize("program", [PROGRAM, RECTANGLES, LOOP], ids=["fact", "rectangles", "loop"])
-def test_the_dwarf_verifies(how, which, program):
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_dwarf_verifies(how, which, program, level):
     tool = _needs_dwarfdump()
-    result = subprocess.run([tool, "--verify", str(_built(how, program) / which)],
+    result = subprocess.run([tool, "--verify", str(_built(how, program, level) / which)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
 
@@ -271,6 +323,332 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
     assert any(re.search(r"DW_AT_call_line\s+\(18\)", a) for a in area), area
     assert any(tag == "DW_TAG_subprogram" and '("Main.area[Rectangle]")' in attributes
                and "DW_INL_inlined" in attributes for _, tag, attributes in entries)
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_a_parameter_has_a_location_list(how):
+    """`fact`'s `n`: a formal parameter whose location list starts in the
+    register it arrives in."""
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how) / "prog.o")
+    n = [attributes for _, tag, attributes in entries
+         if tag == "DW_TAG_formal_parameter" and '("n")' in attributes]
+    assert n, "no formal parameter 'n'"
+    assert any(re.search(r"DW_AT_location\s+\(indexed .* loclist", a) and "DW_OP_reg" in a
+               for a in n), n
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_the_types_describe_how_values_are_held(how):
+    """An `Int` is a name for a C `long`; an enumeration is an enumeration of
+    its constructors; a record in its slots is a structure of its fields; a
+    boxed sum is a pointer to its object, whose tag is an enumeration and
+    whose constructors are a union; a compact `Option` is a union of its
+    word as its nullaries and as its payload."""
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how, VALUES) / "prog.o")
+    def named(tag: str, name: str) -> list[str]:
+        return [a for _, t, a in entries if t == tag and f'DW_AT_name\t("{name}")' in a]
+    assert named("DW_TAG_typedef", "Int") and named("DW_TAG_base_type", "long")
+    assert named("DW_TAG_enumeration_type", "Main.Color")
+    assert named("DW_TAG_enumerator", "Green")
+    assert named("DW_TAG_structure_type", "Main.Point")
+    assert named("DW_TAG_member", "x") and named("DW_TAG_member", "y")
+    assert named("DW_TAG_structure_type", "Main.Tree")
+    assert named("DW_TAG_enumeration_type", "Main.Tree tag")
+    assert named("DW_TAG_union_type", "Main.Tree")
+    assert named("DW_TAG_union_type", "Data.Option.Option Data.String.String")
+    assert named("DW_TAG_typedef", "Data.String.String")
+    assert named("DW_TAG_typedef", "Data.Vec.Vec Int")
+    # The runtime's constants the formatters read values by.
+    assert named("DW_TAG_enumeration_type", "Turkey.Runtime")
+    assert named("DW_TAG_typedef", "Turkey.Runtime")
+    assert named("DW_TAG_enumerator", "immediates") and named("DW_TAG_enumerator", "wrapTag")
+
+
+def _locals(text: str) -> dict[str, str]:
+    """Each `name = value` a debugger printed on a line of its own, nested
+    or not, the last one printed for each name."""
+    found = {}
+    for match in re.finditer(r"^\s*(?:\([^)]*\) )?(\w+) = (.*)$", text, re.MULTILINE):
+        found[match.group(1)] = match.group(2).strip()
+    return found
+
+
+def _stops(out: str, marker: str) -> list[str]:
+    """The text between each line that is `marker` and the next."""
+    return re.split(f"^{re.escape(marker)}$", out, flags=re.MULTILINE)[1:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_shows_the_variables_at_each_stop(how):
+    lldb = _lldb()
+    out = _debugged(how, [lldb, "--batch",
+                          "-o", f"breakpoint set --file prog.gob --line {FIRST_STOP}",
+                          "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
+                          "-o", "run", "-o", "script print('== stop')",
+                          "-o", "frame variable n c p total",
+                          "-o", "frame variable *t", "-o", "frame variable -- *s",
+                          "-o", "continue", "-o", "script print('== stop')",
+                          "-o", "frame variable n c p total d",
+                          "-o", "frame variable *v", "-o", "frame variable -- *s",
+                          "-o", "kill", "./prog"], VALUES)
+    stops = _stops(out, "== stop")
+    assert len(stops) == 2, out[-4000:]
+    for stop in stops:
+        seen = _locals(stop)
+        assert seen.get("n") == "5", stop
+        assert seen.get("c") == "Green", stop
+        # lldb prints a structure of scalars on one line or a line per member.
+        assert re.search(r"p = [({]\s*x = 3,?\s*y = 4\s*[)}]", stop), stop
+        assert seen.get("total") == "10", stop
+        assert seen.get("length") in ("2", "3"), stop
+    assert _locals(stops[0]).get("tag") == "Node", stops[0]
+    assert '"hi"' in stops[0] and '"hi"' in stops[1]
+    assert _locals(stops[1]).get("d") == "2", stops[1]
+    assert re.search(r"length = 3", stops[1]), stops[1]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_shows_the_variables_at_each_stop(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-ex", f"break prog.gob:{FIRST_STOP}",
+                          "-ex", f"break prog.gob:{SECOND_STOP}",
+                          "-ex", "run", "-ex", "echo == stop\\n", "-ex", "info args",
+                          "-ex", "info locals", "-ex", "print *t",
+                          "-ex", "continue", "-ex", "echo == stop\\n", "-ex", "info args",
+                          "-ex", "info locals", "-ex", "print *v",
+                          "-ex", "kill", "./prog"], VALUES)
+    stops = _stops(out, "== stop")
+    assert len(stops) == 2, out[-4000:]
+    for stop in stops:
+        seen = _locals(stop)
+        assert seen.get("n") == "5", stop
+        assert seen.get("c") == "Green", stop
+        assert re.search(r"p = \{x = 3, y = 4\}", stop), stop
+        assert seen.get("total") == "10", stop
+    assert re.search(r"tag = Node", stops[0]), stops[0]
+    assert _locals(stops[1]).get("d") == "2", stops[1]
+    assert re.search(r"length = 3", stops[1]), stops[1]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_formatters_show_values_as_the_source_writes_them(how):
+    """`scripts/turkey-lldb`: a `String` as its text, a `Vec` as its
+    elements, a compact `Option` and a boxed sum as the constructor they
+    hold, a `Map` as its entries."""
+    _lldb()
+    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+                          "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
+                          "-o", "run", "-o", "frame variable s o v t m", "-o", "kill", "./prog"],
+                    VALUES)
+    assert re.search(r'\(Data\.String\.String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
+    assert re.search(r'o = Some\("there"\)', out), out[-4000:]
+    assert re.search(r"v = 0x[0-9a-f]+ \[10, 20, 30\]", out), out[-4000:]
+    assert "t = 0x" in out and "Node(Node(Leaf, 1, Leaf), 2, Leaf)" in out, out[-4000:]
+    assert re.search(r'\["one"\] = 1', out) and re.search(r'\["two"\] = 2', out), out[-4000:]
+
+
+# A program's own type named like one of the library's.
+OWN_VEC = """\
+type Vec a = Vec { x : a, y : a, z : a, w : a, label : String }
+
+fun total(n : Int, v : Vec Int) -> Int {
+    if n > 1000 { return total(n - 1, v) }
+    print(v.label)
+    n + v.x + v.y + v.z + v.w
+}
+
+fun main() {
+    print(Int.toString(total(0, Vec { x = 1, y = 2, z = 3, w = 4, label = "own" })))
+}
+"""
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_formatters_tell_a_programs_type_from_the_librarys(how):
+    """A type is named with its module, so the library's `Vec` formatter
+    leaves a program's own `Vec` alone, and it shows as its fields."""
+    _lldb()
+    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+                          "-o", "breakpoint set --file prog.gob --line 5",
+                          "-o", "run", "-o", "frame variable v", "-o", "kill", "./prog"],
+                    OWN_VEC)
+    assert re.search(r'\(Main\.Vec Int \*\) v = 0x[0-9a-f]+ '
+                     r'\{ x = 1, y = 2, z = 3, w = 4, label = "own" \}', out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_formatters_tell_a_programs_type_from_the_librarys(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-iex", f"add-auto-load-safe-path {FORMATTERS}",
+                          "-iex", f"directory {FORMATTERS}",
+                          "-ex", "break prog.gob:5", "-ex", "run",
+                          "-ex", "print *v", "-ex", "kill", "./prog"], OWN_VEC)
+    assert re.search(r"x = 1.*y = 2.*w = 4", out, re.DOTALL), out[-4000:]
+    assert '"own"' in out, out[-4000:]
+
+# A `var` assigned unconditionally and on one branch, one overwritten on a
+# path to where it is dead, and a `let` that shadows another.
+ASSIGNED = """\
+fun highest(n : Int, items : Vec Int) -> Int {
+    if n > 1000 { return highest(n - 1, items) }
+    var best = 0
+    for item in items {
+        let score = item * 3 % 7
+        if score > best { best = score }
+        print(Int.toString(best))
+    }
+    best
+}
+
+fun twice(n : Int) -> Int {
+    if n > 1000 { return twice(n - 1) }
+    var s = "first" + Int.toString(n)
+    print(s)
+    s = "again" + Int.toString(n)
+    print("between")
+    if n > 0 {
+        s = "second" + Int.toString(n)
+        print("inside")
+    }
+    print("joined")
+    print(s)
+    n
+}
+
+fun stale(n : Int) -> Int {
+    if n > 1000 { return stale(n - 1) }
+    var s = "first" + Int.toString(n)
+    print(s)
+    if n > 0 {
+        s = "second" + Int.toString(n)
+        print(s)
+    }
+    print("met")
+    n
+}
+
+fun shadow(n : Int) -> Int {
+    if n > 1000 { return shadow(n - 1) }
+    let x = "outer" + Int.toString(n)
+    print(x)
+    let x = String.byteLength(x) * 2
+    print(Int.toString(x))
+    print("after")
+    print(Int.toString(x))
+    n
+}
+
+fun main() {
+    print(Int.toString(highest(0, [2, 3])))
+    print(Int.toString(twice(1)))
+    print(Int.toString(stale(1)))
+    print(Int.toString(shadow(1)))
+}
+"""
+
+
+def _line(source: str, text: str, after: str = "") -> int:
+    """The number of the first line of `source` containing `text`, after the
+    first containing `after`."""
+    lines = source.splitlines()
+    start = next(i for i, line in enumerate(lines) if after in line)
+    return next(i for i in range(start, len(lines)) if text in lines[i]) + 1
+
+
+# Each stop in ASSIGNED, and what each variable there must be: a value, or
+# None where no value may show.
+ASSIGNED_STOPS = [
+    (_line(ASSIGNED, "if score > best"), {"best": "0", "score": "6"}),
+    (_line(ASSIGNED, "if score > best"), {"best": "6", "score": "2"}),
+    (_line(ASSIGNED, 'print("between")'), {"s": '"again1"'}),
+    (_line(ASSIGNED, 'print("inside")'), {"s": '"second1"'}),
+    (_line(ASSIGNED, 'print("joined")'), {"s": '"second1"'}),
+    (_line(ASSIGNED, 'print("met")'), {"s": None}),
+    (_line(ASSIGNED, 'print("after")'), {"x": "12"}),
+]
+
+
+def _assigned_stops(out: str) -> list[str]:
+    stops = _stops(out, "== stop")
+    assert len(stops) == len(ASSIGNED_STOPS), out[-4000:]
+    return stops
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_shows_each_variable_as_last_assigned(how):
+    """A `var` shows its old value until the statement that assigns it, not
+    from where the new value is computed; one overwritten on the way to a
+    point shows nothing there rather than what it held before; and a shadowed
+    `let` gives way to the one that shadows it."""
+    _lldb()
+    lines = sorted({line for line, _ in ASSIGNED_STOPS})
+    command = [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch"]
+    for line in lines:
+        command += ["-o", f"breakpoint set --file prog.gob --line {line}"]
+    command += ["-o", "run"]
+    for _ in ASSIGNED_STOPS:
+        command += ["-o", "script print('== stop')", "-o", "frame variable", "-o", "continue"]
+    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
+        for name, value in expected.items():
+            shown = re.findall(rf"^\([^)]*\) {name} = (.*)$", stop, re.MULTILINE)
+            available = [v for v in shown if "not available" not in v]
+            if value is None:
+                assert available == [], stop
+            else:
+                assert len(available) == 1 and available[0].endswith(value), stop
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_shows_each_variable_as_last_assigned(how):
+    gdb = _gdb()
+    lines = sorted({line for line, _ in ASSIGNED_STOPS})
+    command = [gdb, "-nx", "-batch",
+               "-iex", f"add-auto-load-safe-path {FORMATTERS}", "-iex", f"directory {FORMATTERS}"]
+    for line in lines:
+        command += ["-ex", f"break prog.gob:{line}"]
+    command += ["-ex", "run"]
+    for _ in ASSIGNED_STOPS:
+        command += ["-ex", "echo == stop\\n", "-ex", "info args", "-ex", "info locals",
+                    "-ex", "continue"]
+    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
+        for name, value in expected.items():
+            shown = re.findall(rf"^{name} = (.*)$", stop, re.MULTILINE)
+            available = [v for v in shown if "optimized out" not in v]
+            if value is None:
+                assert available == [], stop
+            else:
+                assert len(available) == 1 and available[0].endswith(value), stop
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_loads_the_formatters_the_program_names(how):
+    """gdb finds `turkey_gdb.py` by the name `.debug_gdb_scripts` gives it,
+    along the source path a user adds it to."""
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-iex", f"add-auto-load-safe-path {FORMATTERS}",
+                          "-iex", f"directory {FORMATTERS}",
+                          "-ex", f"break prog.gob:{SECOND_STOP}", "-ex", "run",
+                          "-ex", "info args", "-ex", "kill", "./prog"], VALUES)
+    assert re.search(r'^s = "hi"', out, re.MULTILINE), out[-4000:]
+    assert re.search(r'^o = Some.*"there"', out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^v = .*10, 20, 30", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^t = Node", out, re.MULTILINE), out[-4000:]
+    assert re.search(r'"one".*1', out) and re.search(r'"two".*2', out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_debug_lines_writes_no_variables(how):
+    tool = _needs_dwarfdump()
+    entries = _entries(tool, _built(how, PROGRAM, "--debug=lines") / "prog.o")
+    assert not [tag for _, tag, _ in entries
+                if tag in ("DW_TAG_variable", "DW_TAG_formal_parameter")]
+    assert any(tag == "DW_TAG_subprogram" for _, tag, _ in entries)
 
 
 @pytest.mark.parametrize("how", PATHS)
@@ -314,7 +692,9 @@ def test_lldb_stops_at_a_line_and_names_the_frames(how):
     lldb = _lldb()
     out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --file prog.gob --line 2",
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"])
-    assert re.search(r"frame #0: .*`Main\.fact at prog\.gob:2", out), out[-4000:]
+    # With `-g`, a frame shows its function's parameters, and `fact`'s `n` is
+    # in its register at the line.
+    assert re.search(r"frame #0: .*`Main\.fact\(n=10\) at prog\.gob:2", out), out[-4000:]
     assert re.search(r"frame #1: .*`Main\.main at prog\.gob:9", out), out[-4000:]
 
 
@@ -373,7 +753,7 @@ def test_gdb_takes_each_kind_of_breakpoint(how):
     # breakpoint finds the out-of-line copy alone, as one by symbol does.
     assert re.search(r"^Breakpoint 2 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
                      re.MULTILINE), out[-4000:]
-    assert re.search(r"^static void Main\.area\[Rectangle\]\(\);$", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^static void Main\.area\[Rectangle\]\([^;]*\);$", out, re.MULTILINE), out[-4000:]
     assert re.search(r"^Breakpoint 3 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
                      re.MULTILINE), out[-4000:]
     assert re.search(r"^Breakpoint 4 at 0x[0-9a-f]+", out, re.MULTILINE), out[-4000:]
@@ -504,8 +884,9 @@ def test_the_filter_rewrites_the_symbols_in_a_report():
 
 # -- the object against the assembler ------------------------------------------
 
-DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists", "debug_str",
-                  "debug_line", "debug_line_str"]
+DEBUG_SECTIONS = ["debug_abbrev", "debug_info", "debug_addr", "debug_rnglists",
+                  "debug_loclists", "debug_str", "debug_line", "debug_line_str",
+                  "debug_gdb_scripts"]
 # The sections GNU `as` builds its own way, compared by their rows on ELF.
 LINE_SECTIONS = {"debug_line", "debug_line_str"}
 
@@ -650,8 +1031,10 @@ def _agree(ours: Path, theirs: Path) -> None:
     for name in DEBUG_SECTIONS:
         if name in LINE_SECTIONS and not exact:
             continue
-        assert mine.sections[name] == assembled.sections[name], (
-            f"{name}: " + _first_difference(mine.sections[name], assembled.sections[name]))
+        written, built = mine.sections.get(name), assembled.sections.get(name)
+        assert written == built, (
+            f"{name}: " + (_first_difference(written, built) if written and built
+                           else f"written {written is not None}, assembled {built is not None}"))
         assert mine.relocations.get(name, []) == assembled.relocations.get(name, []), name
     if not exact:
         tool = _needs_dwarfdump()

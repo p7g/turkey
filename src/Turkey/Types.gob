@@ -22,7 +22,7 @@ export (
     isFam, occursRigidly, occursIn,
     unify, join, generalize, instantiate, instantiateQual, typeError,
     typeKey, sameType, subterms, varsOf, freeVars,
-    Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
+    Namer(..), namer, namerFrom, show, showAt, showWritten, showScheme, showPred,
     showPredWith,
 )
 
@@ -353,6 +353,13 @@ fun shortName(name : String) -> String {
         None -> name
         Some((_, after)) -> after
     }
+}
+
+-- The name a context writes the associated type `name` by: the member alone,
+-- without its class.
+fun bareName(name : String) -> String = match String.rsplitOnce(shortName(name), ".") {
+    Some((_, member)) -> member
+    None -> shortName(name)
 }
 
 -- An internal name written the way a program would qualify it.
@@ -1453,10 +1460,21 @@ type Namer = Namer {
     names    : Map Int String,
     var next : Int,
     prefix   : String,
+    -- Whether an associated type is rendered bare, as a context writes it
+    -- (`Trouble s`), rather than under its class (`Sink.Trouble s`).
+    var bare : Bool,
 }
 
 fun namer(prefix : String) -> Namer =
-    Namer { names = Map.new(), next = 0, prefix = prefix }
+    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False }
+
+-- Returns `p` as a program writes it in a context: variables named `a`, `b`,
+-- ... and associated types bare, `Trouble s` and not `Sink.Trouble s`.
+fun showWritten(p : Pred) -> String {
+    let n = namer("")
+    n.bare = True
+    showPredWith(p, n)
+}
 
 -- A namer that has already named a scheme's quantified variables, positionally.
 fun namerFrom(quantified : Vec VarCell, prefix : String) -> Namer {
@@ -1464,7 +1482,7 @@ fun namerFrom(quantified : Vec VarCell, prefix : String) -> Namer {
     for var i = 0; i < len(quantified); i = i + 1 {
         Map.put(names, quantified[i].id, varName(i))
     }
-    Namer { names = names, next = len(quantified), prefix = prefix }
+    Namer { names = names, next = len(quantified), prefix = prefix, bare = False }
 }
 
 -- `a`..`z`, then `a1`, `b1`, ... Built from the code point rather than from a
@@ -1508,7 +1526,8 @@ fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
     }
     TCon(c) -> display(c.name)
     TFam(name, arg, _) -> {
-        let out = shortName(name) + " " + showAt(arg, n, 2)
+        let spelled = if n.bare { bareName(name) } else { shortName(name) }
+        let out = spelled + " " + showAt(arg, n, 2)
         if prec > 1 { "(" + out + ")" } else { out }
     }
     TApp(_, _, _) -> {

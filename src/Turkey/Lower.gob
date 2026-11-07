@@ -83,8 +83,17 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
 -- An instance's dictionary, whose methods are named after it with `#`. A
 -- method's display form (`Turkey.Demangle`) is `Class(Type).method`, and a
 -- default's `Class.<default>.method`.
-fun instName(inst : InstInfo) -> String =
-    "%inst." + inst.cls + "." + Classes.instCon(inst)
+fun instName(inst : InstInfo) -> String {
+    let name = "%inst." + inst.cls + "." + Classes.instCon(inst)
+    if inst.cls != P.typedClass { return name }
+    -- A derived `Typed` instance's head need not be of kind `*`: `Either a`
+    -- and `Either a b` are two instances over one constructor, so a head of
+    -- another kind is named with its count of arguments too.
+    match Ty.kprune(Ty.kindOf(inst.head)) {
+        KStar -> name
+        _ -> name + "/" + Int.toString(len(Classes.typedArgs(inst.head)))
+    }
+}
 
 fun defaultName(cls : String, method : String) -> String =
     "%default." + cls + "." + method
@@ -769,8 +778,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
     let elems = Array.init(len(bound), fun(i) {
         let pred = inst.context[i]
         let argument = pred.args[0]
-        let proxyTy = Ty.applyTo(Decls.head(l.decls, P.proxyCon),
-                                 [argument], span)
+        let proxyTy = proxyOf(l, argument)
         let dictTy = dictType(l, pred.name, argument)
         let method = node(TFun([proxyTy], repTy), span,
                           CSlot(node(dictTy, span, CVar(ById(bound[i].1))),
@@ -782,7 +790,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
         node(TFun([Ty.tString(), arrayTy], repTy), span, CCon(P.typeRepCon)),
         [node(Ty.tString(), span, CLit(LString(name))),
          node(arrayTy, span, CArray(elems))]))
-    let ownProxy = Ty.applyTo(Decls.head(l.decls, P.proxyCon), [inst.head], span)
+    let ownProxy = proxyOf(l, inst.head)
     let body = node(TFun([ownProxy], repTy), span,
                     CLam([CParam { name = "%p", id = mint(l, "%p"), ty = ownProxy }], made,
                          instName(inst) + "#typeRep"))
@@ -792,6 +800,17 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
                     value, span)
     b
 }
+
+-- Returns `Proxy t`, for a `t` of any kind.
+--
+-- Built as a `TApp`, as `dictType` builds a dictionary's type, and not through
+-- `Ty.applyTo`: `Proxy` has kind `* -> *`, and a derived `Typed` instance's
+-- head or context argument may be a constructor of any kind, `Option` in
+-- `Typed (T Option)`. `Coretc` checks no kinds, and the layout of `Proxy t`
+-- does not depend on `t`, so the badly kinded `Proxy Option` is harmless past
+-- here.
+fun proxyOf(l : Lowerer, t : Ty.Type) -> Ty.Type =
+    TApp(Decls.head(l.decls, P.proxyCon), t, KStar)
 
 -- The binders of an instance's context, one for each dictionary it takes,
 -- under the names the plan gave them.

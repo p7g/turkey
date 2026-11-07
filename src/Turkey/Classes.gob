@@ -2,7 +2,7 @@ export (
     Evidence(..), MethodImpl(..), InstancePlan(..), newInstancePlan,
     MethodInfo(..), hasDefault, methodDicts, methodEqualities, methodEvidence,
     ClassInfo(..), classKind,
-    InstInfo(..), instCon, instHeadKey, showDeclared, writtenNamer,
+    InstInfo(..), instCon, instHeadKey, typedArgs, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
@@ -1560,7 +1560,7 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
                     -- their kinds already right. A type with no constructor to
                     -- read has no instance, and says so rather than guessing.
                     match Ty.prune(info.variants[0].scheme.body) {
-                        TFun(_, ret) -> ret
+                        TFun(_, ret) -> appliedTo(ret, len(args))
                         _ -> return None
                     }
                 }
@@ -1568,9 +1568,9 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
         }
         _ -> return None
     }
-    let key = instHeadKey(general)
+    let key = typedHeadKey(general)
     for inst in instancesOf(t, P.typedClass) {
-        if instHeadKey(inst.head) == key { return Some(inst) }
+        if typedHeadKey(inst.head) == key { return Some(inst) }
     }
     let context = []
     for arg in typedArgs(general) { Vec.push(context, Ty.pred(P.typedClass, [arg])) }
@@ -1590,6 +1590,34 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
         None -> Map.put(t.instances, P.typedClass, [inst])
     }
     Some(inst)
+}
+
+-- Returns the key that tells derived `Typed` instances apart: the head's
+-- constructor and how many arguments it is applied to. The constructor alone
+-- would not do, because `Either a` and `Either a b` are both heads, of
+-- different kinds, and so are `Option` and `Option a`.
+fun typedHeadKey(head : Ty.Type) -> String =
+    instHeadKey(head) + "/" + Int.toString(len(typedArgs(head)))
+
+-- Returns `general`, a constructor applied to all its parameters, applied to
+-- only the first `n` of them.
+--
+-- A partial application is a type of its own kind, and `Typed` covers every
+-- kind: `Either String` is the argument of `T (Either String)`, and its rep is
+-- `Either` applied to `String`, so it needs the head `Either a` and not
+-- `Either a b`, which would not match it. Peeling off the outer applications
+-- keeps the kind each `TApp` already has.
+fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
+    var t = general
+    var extra = len(Ty.spine(general).1) - n
+    while extra > 0 {
+        t = match t {
+            TApp(f, _, _) -> f
+            _ -> t
+        }
+        extra = extra - 1
+    }
+    t
 }
 
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) =

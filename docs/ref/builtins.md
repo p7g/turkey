@@ -627,3 +627,39 @@ could create notes.txt
 
 `fail(e)` packs a value into a `SomeError`, and `Error.cast` returns `Some`
 only when the packed value has exactly the requested type.
+
+The requested type is compared argument by argument, and that includes an
+argument that is itself a type constructor. With `type Cell f = Cell(f Int)`,
+`Cell Option` and `Cell Array` are different types with different
+descriptions, so a `SomeError` holding one never casts to the other:
+
+<!-- run -->
+```kotlin
+import Data.Typed (Proxy(..), typeRep, describe)
+
+type Cell f = Cell(f Int)
+
+fun main() {
+    let p : Proxy (Cell Option) = Proxy
+    print(describe(typeRep(p)))
+    let q : Proxy (Cell Array) = Proxy
+    print(typeRep(p) == typeRep(q))
+}
+```
+
+```text
+Main#Cell Data.Option#Option
+False
+```
+
+A context can ask for `Typed` only of a type, though, and not of a type
+constructor such as `f`:
+
+<!-- error: but 'Typed' constrains a type of kind * -->
+```kotlin
+import Data.Typed (Proxy(..), typeRep, describe)
+
+type Cell f = Cell(f Int)
+
+fun shown[Typed f](p : Proxy (Cell f)) -> String = describe(typeRep(p))
+```

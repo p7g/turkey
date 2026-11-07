@@ -290,8 +290,30 @@ Tuples compare lexicographically, and strings compare byte by byte. Two
 arrays are equal when they have the same length and equal elements at each
 index, and so are two `Vec`s, whatever their capacity. Two maps are equal when
 they have the same keys with equal values, and two `Set`s when they have the
-same elements, whatever order the entries were added in. `==` never compares
-identity; [`same`](#same) does.
+same elements, whatever order the entries were added in.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let stack : Vec Int = Vec.new(16)
+    Vec.push(stack, 1)
+    Vec.push(stack, 2)
+    print(stack == [1, 2])
+
+    let ages = Map.new()
+    Map.put(ages, "Ada", 36)
+    Map.put(ages, "Bo", 41)
+    let again = Map.new()
+    Map.put(again, "Bo", 41)
+    Map.put(again, "Ada", 36)
+    print(ages == again)
+}
+```
+
+```text
+True
+True
+```
 
 ## `Show` and printing
 

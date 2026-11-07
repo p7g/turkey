@@ -44,6 +44,7 @@ import Turkey.Layout as Layout
 import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), RepClass(..))
+import Turkey.SsaLower as SsaLower
 import Turkey.Types as Ty
 import Turkey.Types (TCon, TTuple, TFun, TApp)
 
@@ -61,6 +62,20 @@ fun new(decls : DeclTable, tags : Map String Int) -> Types =
 
 -- The entries made so far, which `typeOf` adds to.
 fun entries(t : Types) -> Vec Dwarf.TypeEntry = t.entries
+
+-- Where an object's tag is in its header.
+let tagOffset = 4
+
+-- An enumeration of the runtime's constants that the formatters read values
+-- by, so that they read them from the program rather than repeat them: the
+-- bound below which a compact sum's word is a nullary (`Rt.immediates`),
+-- the tag of the object a compact sum wraps its payload in
+-- (`SsaLower.wrapTag`), and where an object's tag and its first field are.
+fun runtime(t : Types) -> Int = entry(t, "runtime", fun() =
+    Enumeration("Turkey.Runtime", 4, [
+        ("immediates", Rt.immediates), ("wrapTag", SsaLower.wrapTag),
+        ("tagOffset", tagOffset), ("fieldsOffset", Rt.objectFields),
+    ]))
 
 -- Returns the name a debugger shows for type `ty`: the type as the source
 -- writes it, with each type constructor by its display form, which names
@@ -90,6 +105,8 @@ fun nameAt(ty : Ty.Type, prec : Int) -> String = match Ty.prune(ty) {
 -- The index of the entry for variable `v`'s type, as `v` is held: in its
 -- slots, or in its box.
 fun typeOf(t : Types, v : Dwarf.Variable) -> Int {
+    -- A program that has a variable has the runtime's constants too.
+    let _ = runtime(t)
     if !ground(t, v.ty) { return byLayout(t, v.layout, v.boxed) }
     if v.boxed { return boxOf(t, v.ty) }
     if len(v.layout.slots) > 1 { return slotsOf(t, v.ty) } else { held(t, v.ty) }
@@ -271,7 +288,7 @@ fun object(t : Types, ty : Ty.Type, name : String, tagged : String,
     entry(t, "object " + Ty.typeKey(ty), fun() {
         let all = [Member { name = "header", ty = header(t), offset = 0 }]
         if tagged != "" {
-            Vec.push(all, Member { name = "tag", ty = tagOf(t, ty, tagged), offset = 4 })
+            Vec.push(all, Member { name = "tag", ty = tagOf(t, ty, tagged), offset = tagOffset })
         }
         for m in members { Vec.push(all, m) }
         Structure(name, max(Rt.objectFields, extent(t, all)), all)

@@ -22,8 +22,6 @@ from __future__ import annotations
 import gdb
 import gdb.printing
 
-IMMEDIATES = 4096
-WRAP_TAG = -2
 # The most elements or entries a printer lists.
 SHOWN = 100
 
@@ -73,15 +71,23 @@ def _record(obj: gdb.Value) -> gdb.Value:
     return obj
 
 
+def _runtime() -> dict[str, int]:
+    """The program's runtime constants, from the `Turkey.Runtime`
+    enumeration `boot build -g` writes."""
+    return {field.name: int(field.enumval) for field in gdb.lookup_type("Turkey.Runtime").fields()}
+
+
 def _payload(compact: gdb.Value) -> gdb.Value | None:
     """A compact sum's payload, or None for a nullary."""
+    runtime = _runtime()
     word = int(compact["nullary"].cast(gdb.lookup_type("unsigned long")))
-    if word < IMMEDIATES:
+    if word < runtime["immediates"]:
         return None
     payload = compact[_fields(compact.type)[1]]
-    tag = int(gdb.Value(word + 4).cast(gdb.lookup_type("int").pointer()).dereference())
-    if tag == WRAP_TAG:
-        return gdb.Value(word + 8).cast(payload.type.pointer()).dereference()
+    tag = int(gdb.Value(word + runtime["tagOffset"]).cast(gdb.lookup_type("int").pointer())
+              .dereference())
+    if tag == runtime["wrapTag"]:
+        return gdb.Value(word + runtime["fieldsOffset"]).cast(payload.type.pointer()).dereference()
     return payload
 
 

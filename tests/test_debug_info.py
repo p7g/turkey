@@ -360,6 +360,9 @@ def test_the_types_describe_how_values_are_held(how):
     assert named("DW_TAG_union_type", "Data.Option.Option Data.String.String")
     assert named("DW_TAG_typedef", "Data.String.String")
     assert named("DW_TAG_typedef", "Data.Vec.Vec Int")
+    # The runtime's constants the formatters read values by.
+    assert named("DW_TAG_enumeration_type", "Turkey.Runtime")
+    assert named("DW_TAG_enumerator", "immediates") and named("DW_TAG_enumerator", "wrapTag")
 
 
 def _locals(text: str) -> dict[str, str]:

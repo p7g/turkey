@@ -13,8 +13,10 @@ the module that declares each type, and by their shapes:
   order they were added, from `head` along each bucket's `next`.
 * A compact sum, such as `Data.Option.Option Data.String.String`: a union of
   the one word as the enumeration of the nullaries, `nullary`, and as the
-  payload. A word below 4096 is a nullary; any other is the payload, or a
-  wrap of it, an object tagged -2 whose one field is the payload.
+  payload. A word below `immediates` is a nullary; any other is the
+  payload, or a wrap of it, an object tagged `wrapTag` whose one field is
+  the payload. These constants, and where an object's tag and fields are,
+  are read from the `Turkey.Runtime` enumeration the program carries.
 * A sum held in slots or as an object: a structure with a `tag` member, an
   enumeration of the constructors, and a union of one structure per
   constructor; the constructor the tag names is the value.
@@ -29,8 +31,6 @@ from __future__ import annotations
 
 import lldb
 
-IMMEDIATES = 4096
-WRAP_TAG = -2
 # The most elements or entries a summary lists, and children a collection
 # shows.
 SHOWN = 100
@@ -243,6 +243,26 @@ def _record(obj: lldb.SBValue) -> lldb.SBValue:
     return obj
 
 
+# Each program's runtime constants, by its module's UUID.
+_constants: dict[str, dict[str, int]] = {}
+
+
+def _runtime(value: lldb.SBValue) -> dict[str, int]:
+    """The runtime constants of the program `value` is in, from the
+    `Turkey.Runtime` enumeration `boot build -g` writes."""
+    target = value.GetTarget()
+    key = target.GetModuleAtIndex(0).GetUUIDString() or str(target.GetExecutable())
+    if key not in _constants:
+        t = target.FindFirstType("Turkey.Runtime")
+        if not t.IsValid():
+            raise ValueError("the program has no Turkey.Runtime type")
+        members = t.GetEnumMembers()
+        _constants[key] = {members.GetTypeEnumMemberAtIndex(k).GetName():
+                           members.GetTypeEnumMemberAtIndex(k).GetValueAsSigned()
+                           for k in range(members.GetSize())}
+    return _constants[key]
+
+
 def _is_compact(t: lldb.SBType) -> bool:
     t = t.GetCanonicalType()
     members = _members(t)
@@ -252,13 +272,15 @@ def _is_compact(t: lldb.SBType) -> bool:
 
 def _payload(compact: lldb.SBValue) -> lldb.SBValue | None:
     """A compact sum's payload, or None for a nullary."""
+    runtime = _runtime(compact)
     word = compact.GetChildMemberWithName("nullary").GetValueAsUnsigned(0)
-    if word < IMMEDIATES:
+    if word < runtime["immediates"]:
         return None
     payload = compact.GetChildAtIndex(1)
-    tag = int.from_bytes(_read(compact, word + 4, 4), "little", signed=True)
-    if tag == WRAP_TAG:
-        return compact.CreateValueFromAddress(payload.GetName(), word + 8, payload.GetType())
+    tag = int.from_bytes(_read(compact, word + runtime["tagOffset"], 4), "little", signed=True)
+    if tag == runtime["wrapTag"]:
+        return compact.CreateValueFromAddress(payload.GetName(), word + runtime["fieldsOffset"],
+                                              payload.GetType())
     return payload
 
 
@@ -306,7 +328,7 @@ def _is_object(t: lldb.SBType) -> bool:
 def compact_summary(value: lldb.SBValue, internal: dict) -> str:
     raw = value.GetNonSyntheticValue()
     word = raw.GetChildMemberWithName("nullary")
-    if word.GetValueAsUnsigned(0) < IMMEDIATES:
+    if word.GetValueAsUnsigned(0) < _runtime(raw)["immediates"]:
         return word.GetValue() or str(word.GetValueAsUnsigned(0))
     payload = _payload(raw)
     return f"{raw.GetChildAtIndex(1).GetName()}({_shown(payload)})"

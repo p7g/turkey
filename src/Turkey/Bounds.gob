@@ -15,7 +15,7 @@ export (run)
 -- **What a proof may use.** The check an access carries reads only the
 -- object it protects, so that no race between tasks can turn into an access
 -- outside an object. A proof that removes it has to keep that property, and
--- so it uses three kinds of fact and nothing else:
+-- so it uses four kinds of fact and nothing else:
 --
 --   * arithmetic on SSA values -- `i + 1` is one more than `i`, exactly,
 --     because `add` panics rather than wrap;
@@ -25,7 +25,11 @@ export (run)
 --   * the length of the array being accessed, read from its own header --
 --     every `ArrayLength` of one array value answers the same, because an
 --     array's length is fixed when it is allocated, and an array built here
---     has the length it was built with.
+--     has the length it was built with;
+--   * a checked access that executed: what follows it is reached only if its
+--     index was within its array. This is what proves every slot but the
+--     first of an element of several slots, each of which is an access of
+--     its own at the same index.
 --
 -- What it may never use is an invariant one object keeps about another. A
 -- `Vec` checks its index against its own `length` field, and that field is
@@ -117,8 +121,8 @@ fun hasWork(f : Ssa.Func Low) -> Bool {
     for block in f.blocks {
         for i in block.insts {
             match i.op {
-                ArrayGet(_, _, Checked) -> return True
-                ArraySet(_, _, _, Checked) -> return True
+                ArrayGet(_, _, _, Checked) -> return True
+                ArraySet(_, _, _, _, Checked) -> return True
                 Cmp(_, x, _) -> if Ssa.repOf(f, x).class_ == I64 { return True }
                 _ -> {}
             }
@@ -338,6 +342,7 @@ fun walk(p : Prover) -> Bool {
         if len(preds[b]) == 1 { enterFrom(p, added, Ssa.blockId(preds[b][0]), b) }
         for i in f.blocks[b].insts {
             if prove(p, i) { folded = True }
+            passed(p, added, i)
         }
         Vec.push(stack, -1 - b)
         for c in children[b] { Vec.push(stack, c) }
@@ -405,10 +410,10 @@ fun assume(p : Prover, added : Vec (Int, Int), a : Affine, b : Affine, gap : Int
 -- was a comparison.
 fun prove(p : Prover, i : Low) -> Bool {
     match i.op {
-        ArrayGet(array, index, Checked) ->
-            if within(p, array, index) { i.op = ArrayGet(array, index, Proven) }
-        ArraySet(array, index, x, Checked) ->
-            if within(p, array, index) { i.op = ArraySet(array, index, x, Proven) }
+        ArrayGet(array, index, at, Checked) ->
+            if within(p, array, index) { i.op = ArrayGet(array, index, at, Proven) }
+        ArraySet(array, index, at, x, Checked) ->
+            if within(p, array, index) { i.op = ArraySet(array, index, at, x, Proven) }
         Cmp(op, x, y) -> if Ssa.repOf(p.func, x).class_ == I64 {
             match decide(p, op, valueOf(p, x), valueOf(p, y)) {
                 -- The constant an `i1` holds, as constant propagation
@@ -423,6 +428,19 @@ fun prove(p : Prover, i : Low) -> Bool {
         _ -> {}
     }
     False
+}
+
+-- The facts that hold after `i` if it is an access that checks its index:
+-- `0 <= index <= length - 1`, since the check traps otherwise.
+fun passed(p : Prover, added : Vec (Int, Int), i : Low) -> Unit {
+    let (array, index) = match i.op {
+        ArrayGet(a, x, _, Checked) -> (a, x)
+        ArraySet(a, x, _, _, Checked) -> (a, x)
+        _ -> return {}
+    }
+    let at = valueOf(p, index)
+    assume(p, added, Affine { node = p.zero, offset = 0 }, at, 0)
+    assume(p, added, at, lengthOf(p, array), 1)
 }
 
 fun within(p : Prover, array : Value, index : Value) -> Bool =

@@ -667,8 +667,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
                     } else if shared && kind == 0 && tag == -1 && len(mutable) == 0 {
                         match constantsOf(constants, fields) {
                             Some(ops) -> {
-                                let name = "%box." + String.join(Array.map(layout.reps, fun(r) =
-                                               Int.toString(Rt.layoutCode(r))), "")
+                                let name = "%box." + String.join(Array.map(layout.reps, repCode), "")
                                            + "." + String.join(Array.map(ops, constantName), ".")
                                 Map.put(objects, name, (kind, tag, layout, ops))
                                 inst.op = GlobalLoad(name)
@@ -880,6 +879,11 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
                 usesIn(a, receiver, False)
                 usesIn(a, assigned, !inlinedAt(a, receiver.ty, index))
             }
+            CIndex(array, index) -> {
+                usesIn(a, array, False)
+                usesIn(a, index, False)
+                usesIn(a, assigned, !inlinedIn(a, assigned.ty))
+            }
             _ -> {
                 usesIn(a, target, True)
                 usesIn(a, assigned, True)
@@ -907,6 +911,11 @@ fun usesIn(a : Uses, e : Core, boxed : Bool) -> Unit {
                 }
                 None -> for x in args { usesIn(a, x, True) }
             }
+            -- An array's element holds a value of several slots as its slots,
+            -- where `Layout.inlined` says so (`elementParts`), and no other
+            -- operand of these primitives is a value of several slots.
+            CPrim(Prims.ArraySet) | CPrim(Prims.ArrayNew) | CPrim(Prims.ArrayFill) ->
+                for x in args { usesIn(a, x, !inlinedIn(a, x.ty)) }
             _ -> {
                 usesIn(a, fn, False)
                 for x in args { usesIn(a, x, True) }
@@ -2023,6 +2032,91 @@ fun writeField(l : Lower, object : Value, p : Placed, index : Int, v : Value) ->
     }
 }
 
+-- How an array holds elements of a type: the element's own layout, whether
+-- it holds the layout's slots (`Layout.inlined`) or the one `storedRep`, and
+-- how the array lays those out. The rule is the one an object's field has
+-- (`Layout.fieldReps`). It is a function of the layout alone, so every copy
+-- of a body that writes an array and every copy that reads it agree.
+type Elements = Elements {
+    held    : Ssa.Layout,
+    inline  : Bool,
+    element : Rt.Element,
+}
+
+-- Returns how an array of type `ty` holds its elements.
+--
+-- Read off `ty`'s argument, so only for an array type written as one, as a
+-- library function's `Prim.Array a` is. A type that is an array only under an
+-- equality, such as an associated type's application, has some other
+-- argument; where an element's own type is at hand, use `elementsAt`.
+fun elementsOf(l : Lower, ty : Ty.Type) -> Elements {
+    let (_, args) = Ty.spine(Ty.prune(ty))
+    if len(args) > 0 { elementsAt(l, args[0]) }
+    else { elementsHeld(Ssa.Layout { slots = [Ssa.traced(Ptr)] }) }
+}
+
+-- Returns how an array holds elements of type `ty`.
+fun elementsAt(l : Lower, ty : Ty.Type) -> Elements = elementsHeld(heldOf(l, ty))
+
+-- Returns how an array holds elements held at `held`.
+fun elementsHeld(held : Ssa.Layout) -> Elements =
+    Elements {
+        held = held,
+        inline = Layout.inlined(held),
+        element = Rt.element(Layout.fieldReps(held)),
+    }
+
+-- Returns element `index` of `array`: its slots, loaded here, or what memory
+-- holds it as. Panics if `index` is out of bounds.
+fun readElement(l : Lower, array : Value, index : Value, es : Elements) -> Value {
+    -- Check the index at every slot, so that no slot is read unchecked
+    -- wherever a pass moves it. `Turkey.Bounds` removes every check after the
+    -- first, since the first passing proves the rest.
+    let reps = es.element.layout.reps
+    let loaded = Array.init(len(reps), fun(k) =
+        L.emit(l.b, ArrayGet(array, index, L.elementRef(es.element, k), Checked), reps[k]))
+    if es.inline { fromSlots(l, es.held, loaded) } else { fromStored(l, es.held, loaded[0]) }
+}
+
+-- Returns what an element is written as for `v`: its slots, or what memory
+-- holds it as.
+fun elementParts(l : Lower, v : Value, es : Elements) -> Array Value =
+    if es.inline { slotsOf(l, v, es.held) } else { [stored(l, v)] }
+
+-- Stores `v` into element `index` of `array`, one store per slot, so a
+-- racing reader may see some slots of `v` and some of what was there before.
+-- Panics if `index` is out of bounds.
+fun writeElement(l : Lower, array : Value, index : Value, es : Elements, v : Value) -> Unit =
+    writeParts(l, array, index, es, elementParts(l, v, es))
+
+-- Stores `parts`, an `elementParts`, into element `index` of `array`.
+fun writeParts(l : Lower, array : Value, index : Value, es : Elements,
+               parts : Array Value) -> Unit {
+    for var k = 0; k < len(parts); k = k + 1 {
+        L.effect(l.b, ArraySet(array, index, L.elementRef(es.element, k), parts[k], Checked))
+    }
+}
+
+-- Returns a new array of `length` elements, each `v`.
+fun newArray(l : Lower, length : Value, es : Elements, v : Value) -> Value {
+    if !es.inline {
+        return L.emit(l.b, ArrayNew(length, stored(l, v), es.element), Ssa.traced(Ptr))
+    }
+    let slots = slotsOf(l, v, es.held)
+    let made = L.emit(l.b, ArrayNew(length, L.emit(l.b, ConstInt(0), Ssa.untraced(I64)),
+                                    es.element),
+                      Ssa.traced(Ptr))
+    Bulk.fillArray(l.b, es.element, made, L.emit(l.b, ConstInt(0), Ssa.untraced(I64)),
+                   length, slots)
+    made
+}
+
+-- Returns the fill `ArrayNew` takes for elements nothing has written: a zero
+-- of the element's one slot, or a zero word for an element of several.
+fun arrayZero(l : Lower, es : Elements) -> Value =
+    if es.inline { L.emit(l.b, ConstInt(0), Ssa.untraced(I64)) }
+    else { storageZero(l, es.element.layout.reps[0]) }
+
 -- Which fields of a value built with this constructor may be assigned: its
 -- `var` fields. A constructor the declarations do not know -- a dictionary's
 -- -- is taken to be mutable throughout.
@@ -2086,7 +2180,8 @@ fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
         L.terminate(l.b, Branch(same, next, failure))
         L.into(l.b, next)
         let index = L.emit(l.b, ConstInt(i), Ssa.untraced(I64))
-        let got = L.emit(l.b, ArrayGet(v, index, Checked), Ssa.untraced(I8))
+        let got = L.emit(l.b, ArrayGet(v, index, L.soleElement(Ssa.untraced(I8)), Checked),
+                         Ssa.untraced(I8))
         let byte = scalar(l, ConstInt(Byte.toInt(bytes[i])), Ssa.untraced(I64),
                           Ssa.untraced(I8))
         same = L.emit(l.b, Cmp(Eq, got, byte), Ssa.untraced(I1))
@@ -2260,7 +2355,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         }
         CIndex(target, index) -> {
             let array = value(l, target)
-            L.emit(l.b, ArrayGet(array, value(l, index), Checked), rep)
+            readElement(l, array, value(l, index), elementsHeld(held))
         }
         -- Core assignment evaluates the value before its target, and the
         -- target decides which of three stores it is: all three are assignment
@@ -2361,13 +2456,15 @@ fun control(l : Lower, e : Core, held : Ssa.Layout) -> Value {
     arrived
 }
 
--- The shapes of assignment target. A field may hold the value as its slots
--- (`writeField`); every other position holds what `stored` gives.
+-- The shapes of assignment target. A field or an element may hold the value
+-- as its slots (`writeField`, `writeElement`); every other position holds
+-- what `stored` gives.
 fun store(l : Lower, target : Core, assigned : Value) -> Unit = match target.kind {
     CIndex(array, index) -> {
-        let x = stored(l, assigned)
+        let es = elementsAt(l, target.ty)
+        let parts = elementParts(l, assigned, es)
         let a = value(l, array)
-        L.effect(l.b, ArraySet(a, value(l, index), x, Checked))
+        writeParts(l, a, value(l, index), es, parts)
     }
     CProject(receiver, index) -> match localPosition(l, receiver, index) {
         Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, stored(l, assigned), held)))
@@ -2767,20 +2864,25 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
 }
 
 fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
-    let (_, args) = Ty.spine(Ty.prune(e.ty))
-    let element = if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
-    let values = storedAll(l, Array.map(elems, value(l, _)))
+    let es = if len(elems) > 0 { elementsAt(l, elems[0].ty) } else { elementsOf(l, e.ty) }
+    let values = Array.map(elems, value(l, _))
     let length = L.emit(l.b, ConstInt(len(values)), Ssa.untraced(I64))
+    if es.inline {
+        let made = L.emit(l.b, ArrayNew(length, arrayZero(l, es), es.element), Ssa.traced(Ptr))
+        for var i = 0; i < len(values); i = i + 1 {
+            writeElement(l, made, L.emit(l.b, ConstInt(i), Ssa.untraced(I64)), es, values[i])
+        }
+        return made
+    }
+    let parts = storedAll(l, values)
     -- `ArrayNew` wants something to fill with. An array with elements is
     -- filled over anyway, and an empty one has no slot to read, so a zero of
     -- the element's own representation is enough in both cases.
-    let initial = if len(values) > 0 { values[0] }
-                  else { storageZero(l, element) }
-    let made = L.emit(l.b, ArrayNew(length, initial, element),
-                      Ssa.traced(Ptr))
-    for var i = 1; i < len(values); i = i + 1 {
+    let initial = if len(parts) > 0 { parts[0] } else { arrayZero(l, es) }
+    let made = L.emit(l.b, ArrayNew(length, initial, es.element), Ssa.traced(Ptr))
+    for var i = 1; i < len(parts); i = i + 1 {
         let at = L.emit(l.b, ConstInt(i), Ssa.untraced(I64))
-        L.effect(l.b, ArraySet(made, at, values[i], Checked))
+        L.effect(l.b, ArraySet(made, at, L.elementRef(es.element, 0), parts[i], Checked))
     }
     made
 }
@@ -3303,11 +3405,11 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
         let xs = operands(l, p, args, 2)
         let (_, held) = Ty.spine(Ty.prune(args[0].ty))
         if len(held) != 1 { return stop(l, "the element address of a non-array") }
-        let element = repOf(l, held[0])
+        let element = elementsOf(l, args[0].ty).element
         let base = L.emit(l.b, Convert(PtrToInt, L.emit(l.b, Convert(Retag, xs[0]),
                                                         Ssa.untraced(Ptr))),
                           Ssa.untraced(I64))
-        let width = L.emit(l.b, ConstInt(Rt.elementWidth(element.class_)), Ssa.untraced(I64))
+        let width = L.emit(l.b, ConstInt(element.stride), Ssa.untraced(I64))
         let skipped = L.emit(l.b, Bin(MulWrap, xs[1], width), Ssa.untraced(I64))
         let header = L.emit(l.b, ConstInt(Rt.arrayElements), Ssa.untraced(I64))
         let at = L.emit(l.b, Bin(AddWrap, L.emit(l.b, Bin(AddWrap, base, header),
@@ -3408,36 +3510,41 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
         L.emit(l.b, ArrayLength(operands(l, p, args, 1)[0]), Ssa.untraced(I64))
     Prims.ArrayGet -> {
         let xs = operands(l, p, args, 2)
-        L.emit(l.b, ArrayGet(xs[0], xs[1], Checked), rep)
+        readElement(l, xs[0], xs[1], elementsAt(l, e.ty))
     }
+    -- An element held as its slots takes the value's slots, not its box, so
+    -- this operand is not `stored`.
     Prims.ArraySet -> {
-        let xs = operands(l, p, args, 3)
-        L.effect(l.b, ArraySet(xs[0], xs[1], xs[2], Checked))
+        let xs = elementOperands(l, p, args, 3)
+        writeElement(l, xs[0], xs[1], elementsAt(l, args[2].ty), xs[2])
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     Prims.ArrayNew -> {
-        let xs = operands(l, p, args, 2)
-        L.emit(l.b, ArrayNew(xs[0], xs[1], Ssa.repOf(l.func, xs[1])), Ssa.traced(Ptr))
+        let xs = elementOperands(l, p, args, 2)
+        newArray(l, xs[0], elementsAt(l, args[1].ty), xs[1])
     }
     Prims.ArrayCopy -> {
         let xs = operands(l, p, args, 5)
-        Bulk.copyArray(l.b, elementRep(l, args[0].ty), xs[0], xs[1], xs[2], xs[3], xs[4])
+        Bulk.copyArray(l.b, elementsOf(l, args[0].ty).element, xs[0], xs[1], xs[2], xs[3],
+                       xs[4])
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     -- Raw memory holds nothing the collector follows, so neither may the
     -- array it is copied into.
     Prims.ArrayCopyIn -> {
         let xs = operands(l, p, args, 4)
-        let element = elementRep(l, args[0].ty)
-        if element.traced || element.class_ == Unit {
-            return stop(l, "Prim.arrayCopyIn into an array of " + show(element))
+        let element = elementsOf(l, args[0].ty).element
+        if element.layout.pointers > 0 || element.layout.size == 0 {
+            return stop(l, "Prim.arrayCopyIn into an array of "
+                           + String.join(Array.map(element.layout.reps, show), ", "))
         }
         Bulk.copyIn(l.b, element, xs[0], xs[1], xs[2], xs[3])
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     Prims.ArrayFill -> {
-        let xs = operands(l, p, args, 4)
-        Bulk.fillArray(l.b, Ssa.repOf(l.func, xs[3]), xs[0], xs[1], xs[2], xs[3])
+        let xs = elementOperands(l, p, args, 4)
+        let es = elementsAt(l, args[3].ty)
+        Bulk.fillArray(l.b, es.element, xs[0], xs[1], xs[2], elementParts(l, xs[3], es))
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     -- Uninitialized in the source language and not in the heap: the
@@ -3445,8 +3552,8 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     -- traced slot must hold something it can follow.
     Prims.ArrayNewUninit -> {
         let xs = operands(l, p, args, 1)
-        let element = elementRep(l, e.ty)
-        L.emit(l.b, ArrayNew(xs[0], storageZero(l, element), element), Ssa.traced(Ptr))
+        let es = elementsOf(l, e.ty)
+        L.emit(l.b, ArrayNew(xs[0], arrayZero(l, es), es.element), Ssa.traced(Ptr))
     }
     -- The conversion half of a checked cast. `Data.Error.cast` compared the
     -- two type reps first, so equal reps mean equal types mean equal
@@ -3546,6 +3653,20 @@ fun operands(l : Lower, p : Prims.Prim, args : Array Core, arity : Int) -> Array
     Array.map(args, fun(a) = stored(l, value(l, a)))
 }
 
+-- The operands of a primitive that stores its last operand into an array's
+-- element: the others `stored`, and the last as its value, which
+-- `elementParts` takes apart or boxes as the element holds it.
+fun elementOperands(l : Lower, p : Prims.Prim, args : Array Core, arity : Int) -> Array Value {
+    if len(args) != arity {
+        oops(Prims.name(p) + " applied to " + Int.toString(len(args))
+             + " arguments, not " + Int.toString(arity))
+    }
+    Array.init(arity, fun(i) {
+        let v = value(l, args[i])
+        if i == arity - 1 { v } else { stored(l, v) }
+    })
+}
+
 fun noOperands(l : Lower, p : Prims.Prim, args : Array Core) -> Unit {
     if len(args) != 0 {
         oops(Prims.name(p) + " applied to " + Int.toString(len(args)) + " arguments")
@@ -3587,10 +3708,15 @@ fun primIntrinsic(l : Lower, p : Prims.Prim, args : Array Core, k : L.Intrinsic,
               rep : Rep) -> Value =
     L.emit(l.b, Intrinsic(k, operands(l, p, args, 1)[0]), rep)
 
--- The element representation of an array type.
-fun elementRep(l : Lower, ty : Ty.Type) -> Rep {
-    let (_, args) = Ty.spine(Ty.prune(ty))
-    if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
+-- A digit per representation, for naming a constant box by its slots.
+fun repCode(r : Rep) -> String = match r.class_ {
+    Unit -> "0"
+    I1 -> "1"
+    I8 -> "2"
+    I32 -> "3"
+    I64 -> "4"
+    F64 -> "5"
+    Ptr -> if r.traced { "7" } else { "6" }
 }
 
 -- The name of a Core form, for reporting what is not lowered yet. Not

@@ -601,3 +601,71 @@ def test_inline_fields_of_an_object_in_the_frame_survive_collections():
         result = lang.run(STACKED, env=env, flags=VERIFY)
         assert result.code == 0, result.stderr
         assert result.stdout == plain
+
+
+# Arrays of flat products, each element held as its slots: two integers,
+# three floats, and a traced slot beside an untraced one. Each is built by a
+# literal, `Array.init` and `Array.filled`, assigned element by element, and
+# moved by `Array.copy`, `Array.fill` and the growth of a `Vec`.
+ARRAYS = """
+type Vec3 = Vec3 { x : Float, y : Float, z : Float }
+
+fun pairs(n : Int) -> Array (Int, Int) = Array.init(n, fun(i) = (i, i * 10))
+
+fun points(n : Int) -> Array Vec3 =
+    Array.init(n, fun(i) = Vec3 { x = Float.fromInt(i), y = 0.5, z = -1.0 })
+
+fun named(n : Int) -> Array (String, Int) = Array.init(n, fun(i) = (Int.toString(i), i))
+
+fun weigh(xs : Array (String, Int)) -> Int {
+    var n = 0
+    for (s, k) in xs { n = n + String.byteLength(s) + k }
+    n
+}
+
+fun main() {
+    let ps = pairs(6)
+    ps[2] = (7, 70)
+    Array.copy(ps, 3, [(1, 1), (2, 2)], 0, 2)
+    var total = 0
+    for (a, b) in ps { total = total + a + b }
+    print(total)
+
+    let vs = points(4)
+    vs[1] = Vec3 { x = vs[0].x + 2.0, y = vs[3].y, z = 0.25 }
+    Array.fill(vs, 2, 2, Vec3 { x = 1.0, y = 1.0, z = 1.0 })
+    var sum = 0.0
+    for v in vs { sum = sum + v.x + v.y + v.z }
+    print(sum)
+
+    let ns = named(500)
+    ns[10] = ("ten", -10)
+    let grown : Vec (String, Int) = []
+    for (s, k) in ns { Vec.push(grown, (s + "!", k + 1)) }
+    let kept = Array.filled(3, (Int.toString(total), 1))
+    Array.copy(ns, 0, kept, 0, 3)
+    print(weigh(ns))
+    print(Vec.toArray(grown)[499])
+    print(ns[1])
+    print([(1.5, 2.5), (3.5, 4.5)][1])
+}
+"""
+
+
+def test_an_array_holds_flat_products_as_their_slots():
+    plain = lang.output(ARRAYS)
+    assert plain == "149\n8.25\n126127\n(499!, 500)\n(149, 1)\n(3.5, 4.5)\n", plain
+    result = lang.dump("ssa", ARRAYS)
+    assert result.code == 0, result.stderr
+    # One allocation for the whole array, and no element boxed.
+    for name, layout in [("pairs", r"\[i64, i64\] stride=16 pointers=0"),
+                         ("points", r"\[f64, f64, f64\] stride=24 pointers=0"),
+                         ("named", r"\[ptr\*, i64\] stride=16 pointers=1")]:
+        body = _function(result.stdout, name)
+        assert len(re.findall(r"= array\.new ", body)) == 1, body
+        assert re.search(r"= array\.new .*" + layout, body), body
+        assert "object.new" not in body and "stack.object" not in body, body
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(ARRAYS, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain

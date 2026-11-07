@@ -48,8 +48,9 @@ label : [Show a] fun(a) -> String
 A binding is **generalized** when its inferred type is made polymorphic, so
 that each use of it may pick different types for its type variables.
 
-* **Top-level functions** and **local `fun` declarations** are always
-  generalized.
+* **Top-level functions** are always generalized.
+* **Local `fun` declarations and `let` bindings** are generalized only when
+  they are *closed*, as described [below](#local-bindings).
 * **`let` bindings** are generalized only when the right-hand side is a
   *value*: a literal, a variable, a lambda, a constructor of an
   [immutable](types.md#mutability-and-sharing) type applied to values, or a
@@ -139,6 +140,113 @@ fun main() {
 An [array literal](#array-literals) in a top-level `let` is decided sooner
 still, by the binding's own definition.
 
+### Local bindings
+
+A local `fun` declaration or `let` binding is generalized only if it is
+**closed**: every variable it uses, other than those it defines itself, must
+be closed. A variable is closed if it is
+
+* defined at the top level or imported, except inside its own recursive
+  group: a top-level function without a signature is not closed in the
+  bodies of the functions it is defined together with, itself included, or
+* a local `fun` with a [signature](declarations.md#signatures) that mentions
+  no type variable of the function around it, or
+* a local `fun` or `let` that was itself generalized, and whose type mentions
+  no type variable of the function around it, or
+* a `let` that the value restriction keeps from being generalized, if every
+  variable it uses is closed and its type has no type variables.
+
+A parameter, a variable bound by a pattern, a `var` and a `do` binder are
+never closed. The value restriction applies as well: a closed `let` is
+generalized only if its right-hand side is a value.
+
+`show` is defined at the top level, so `describe` is closed and is generalized,
+and so is `both`, which uses only `describe`:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let describe = show
+    let both = fun(a, b) = describe(a) + " and " + describe(b)
+    print(describe(1))
+    print(describe(True))
+    print(both(2.5, "two"))
+}
+```
+
+```text
+1
+True
+2.5 and two
+```
+
+A `let` whose right-hand side is a call is not generalized, but when its
+type has no type variables there is nothing to generalize, and it is closed
+like any other. Here `suffix` is a `String`, so `tag` is generalized:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let suffix = show(1) + "!"
+    let tag = fun(v) = show(v) + suffix
+    print(tag(2))
+    print(tag(True))
+}
+```
+
+```text
+21!
+True1!
+```
+
+A local binding that uses a parameter is not generalized. It has one type,
+fixed by its uses, as a `var` has:
+
+<!-- error: 'line' is used here at a second type, 'fun(Bool) -> String', but it cannot be polymorphic because it uses 'prefix' -->
+```kotlin
+fun report(prefix : String) {
+    let line = fun(v) = prefix + show(v)
+    print(line(1))
+    print(line(True))
+}
+```
+
+A signature states the type, so a local `fun` with one is polymorphic whatever
+its body uses:
+
+<!-- run -->
+```kotlin
+fun report(prefix : String) {
+    fun line[Show a](v : a) -> String = prefix + show(v)
+    print(line(1))
+    print(line(True))
+}
+
+fun main() {
+    report("> ")
+}
+```
+
+```text
+> 1
+> True
+```
+
+A [partial annotation](declarations.md#partial-annotations) also keeps a local
+`fun` generalized, because each type variable its header writes must stay a
+type of its own.
+
+> **For readers new to this.** A binding that uses a parameter can have the
+> parameter's type in its own type, and that type belongs to the function
+> around it, where inference may still be working it out. When that
+> function's context has an [equality
+> constraint](classes.md#equality-constraints), generalizing over such a type
+> can leave the binding with no single most general type. A closed binding
+> shares no such undecided type with the function around it: its type can
+> mention one of that function's type variables only where an annotation
+> names it, and then the type is fixed. So generalizing it is always safe.
+> GHC calls this rule `MonoLocalBinds`.
+
 **Recursive groups.** Functions that call each other are inferred together,
 and inside the group each has a single, monomorphic type. So a function
 cannot be inferred to call itself at a different type. With a complete
@@ -171,7 +279,8 @@ fun main() {
 3.0
 ```
 
-`count` is bound to a value with `let`, so it is generalized, and each use
+`count` is bound to a value with `let` and uses no local variable, so it is
+[generalized](#local-bindings), and each use
 picks a type: `Int` in `count + 1` and `Float` in `count + 1.5`. In `1.0 + 2`,
 both operands of `+` have the same type, so the `2` is a `Float`.
 

@@ -1789,16 +1789,15 @@ fun opened(l : Lower, name : String, binders : Array (Option (String, Int)), o :
     -- What `packed` built: the index, the dictionaries, the fields.
     let carried = len(o.evidence)
     let reps = Array.init(1 + carried + len(types), fun(i) =
-        if i == 0 { Ssa.untraced(I64) }
-        else if i <= carried { Ssa.traced(Ptr) }
+        if i <= carried { Ssa.traced(Ptr) }
         else { repOf(l, types[i - 1 - carried]) })
     let layout = Rt.layout(reps)
     if !tested(l, v, name, failure) { return }
     -- A constructor packed at one key has one copy of each arm opening it, and
     -- nothing to tell apart, as `tested` reasons for a tag.
     if Layout.packingCount(l.decls, name) > 1 {
-        let code = L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 0)), Ssa.untraced(I64))
-        let want = L.emit(l.b, ConstInt(index), Ssa.untraced(I64))
+        let code = L.emit(l.b, ObjectGet(v, L.fieldRef(layout, 0)), Ssa.traced(Ptr))
+        let want = L.emit(l.b, ConstInt(index), Ssa.traced(Ptr))
         let test = L.emit(l.b, Cmp(Eq, code, want), Ssa.untraced(I1))
         let next = L.block(l.b)
         L.terminate(l.b, Branch(test, next, failure))
@@ -2920,6 +2919,12 @@ fun fieldsOf(subject : String) -> fun(Int) -> String =
 -- table of keys the constructor is packed at, then the carried dictionaries,
 -- then the fields. The index is what an opening compares against the one its
 -- arm's copy was lowered for.
+--
+-- The opening reads the index before it knows the key, so the index is where
+-- no key moves it: the first traced word, at the same offset whatever the
+-- fields' representations. An untraced index would follow every traced field,
+-- at an offset the key decides. It is an immediate, below `Rt.immediates`,
+-- which the collector skips as it does a compact sum's nullaries.
 fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
            tag : Int) -> Value {
     let parts = match Layout.packedKeyParts(l.decls, info, args, l.layouts) {
@@ -2942,9 +2947,15 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
     if wide(l, 1 + len(args), refusal) {
         return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
+    if index >= Rt.immediates {
+        refuse(l, "constructor '" + Ty.shortName(name) + "' hides values of "
+                  + Int.toString(Layout.packingCount(l.decls, name)) + " different layouts, "
+                  + "and a constructor can hide at most " + Int.toString(Rt.immediates))
+        return Ssa.freshValue(l.func, Ssa.traced(Ptr))
+    }
     let values = Array.init(1 + len(args), fun(i) =
         if i == 0 {
-            L.emit(l.b, ConstInt(index), Ssa.untraced(I64))
+            L.emit(l.b, ConstInt(index), Ssa.traced(Ptr))
         } else {
             value(l, args[i - 1])
         })

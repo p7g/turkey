@@ -2291,14 +2291,6 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     var scrutinees : Option (Map Int Core) = None
     let renamed = Map.new()
     let lets = Vec.new(len(names))
-    let boundAs = fun(i) = match how {
-        Moving -> (names[i], ids[i])
-        _ -> {
-            let made = (names[i], mint(r))
-            Map.put(renamed, ids[i], made)
-            made
-        }
-    }
     for var i = 0; i < len(names); i = i + 1 {
         -- Peel the argument's own `let`s, so that a value inside them is
         -- seen as one: an inlined call that bound a build once answers
@@ -2306,7 +2298,7 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
         -- since the argument is placed once.
         let arg = peeled(args[i], lets)
         if !isValue(d, arg) {
-            Vec.push(lets, (boundAs(i), arg))
+            Vec.push(lets, (boundAs(r, how, renamed, names[i], ids[i]), arg))
         } else if !builds(d, arg) || readsOf(body, ids[i]) <= 1 {
             Map.put(subst, ids[i], arg)
         } else {
@@ -2320,7 +2312,7 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
                 }
                 Map.put(at, ids[i], shared)
                 scrutinees = Some(at)
-                Vec.push(lets, (boundAs(i), shared))
+                Vec.push(lets, (boundAs(r, how, renamed, names[i], ids[i]), shared))
             } else {
                 -- Its heap parts are names now, so copies of it copy slots.
                 Map.put(subst, ids[i], shared)
@@ -2345,6 +2337,19 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
         out = mkCore(ty, arg.span, CLet(name, id, arg.ty, arg, out, []))
     }
     out
+}
+
+-- Returns the binder a `let` of the parameter `name`, `id` binds when its
+-- body is placed `how`: the parameter's own for a body that moves, and a fresh
+-- one, recorded in `renamed`, for a copy.
+fun boundAs(r : Reducer, how : Placing, renamed : Map Int (String, Int), name : String,
+            id : Int) -> (String, Int) = match how {
+    Moving -> (name, id)
+    _ -> {
+        let made = (name, mint(r))
+        Map.put(renamed, id, made)
+        made
+    }
 }
 
 -- Returns the term inside `e`'s `let`s, and pushes each `let`'s binder and
@@ -2761,8 +2766,11 @@ fun isValue(d : DeclTable, e : Core) -> Bool = match e.kind {
 
 -- Returns whether evaluating `e` builds a heap object (`heapRoot`), at its
 -- root or in a part of a tuple or constructor application.
-fun builds(d : DeclTable, e : Core) -> Bool =
-    heapRoot(d, e) || Iterator.any(knownParts(e), builds(d, _))
+fun builds(d : DeclTable, e : Core) -> Bool {
+    if heapRoot(d, e) { return True }
+    for part in knownParts(e) { if builds(d, part) { return True } }
+    False
+}
 
 -- Returns whether `e` is a constructor application of a type whose values are
 -- always objects of their own on the heap.

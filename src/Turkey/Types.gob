@@ -19,10 +19,10 @@ export (
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
     skolemsOf, markOpened, openedBy, clearOpened, markBreaker, breakerFor,
-    isFam, occursRigidly, occursIn,
+    isFam, occursRigidly, occursIn, untouchable,
     unify, join, generalize, instantiate, instantiateQual, typeError,
     typeKey, sameType, subterms, varsOf, freeVars,
-    Namer(..), namer, namerFrom, show, showAt, showWritten, showScheme, showPred,
+    Namer(..), namer, namerAvoiding, namerFrom, show, showAt, showWritten, showScheme, showPred,
     showPredWith,
 )
 
@@ -774,6 +774,10 @@ type Families = Families {
     -- variable at this level or below, and defers an equation that would
     -- instead. `noScope` makes every variable touchable.
     untouchable : Int,
+    -- Called with each variable `unify` binds, right after binding it: a
+    -- constraint the solver set aside because it was stuck on the variable
+    -- may now make progress.
+    bound       : fun(VarCell) -> Unit,
 }
 
 -- Prune, then rewrite the head with `fams` until it sticks.
@@ -1069,7 +1073,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 }
             }
             cell.ref = Some(y)
-            return {}
+            return match fams {
+                Some(f) -> f.bound(cell)
+                None -> {}
+            }
         }
         _ -> {}
     }
@@ -1455,10 +1462,19 @@ type Namer = Namer {
     -- Whether an associated type is rendered bare, as a context writes it
     -- (`Trouble s`), rather than under its class (`Sink.Trouble s`).
     var bare : Bool,
+    -- Names no variable is given, because something else shown beside it
+    -- already has them.
+    taken    : Set.Set String,
 }
 
 fun namer(prefix : String) -> Namer =
-    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False }
+    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False, taken = Set.new() }
+
+-- Returns a namer that gives no variable a name in `taken`: the names of the
+-- skolems a message may also show, so that an unknown type cannot be read as
+-- one of them.
+fun namerAvoiding(prefix : String, taken : Set.Set String) -> Namer =
+    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False, taken = taken }
 
 -- Returns `p` as a program writes it in a context: variables named `a`, `b`,
 -- ... and associated types bare, `Trouble s` and not `Sink.Trouble s`.
@@ -1474,7 +1490,10 @@ fun namerFrom(quantified : Vec VarCell, prefix : String) -> Namer {
     for var i = 0; i < len(quantified); i = i + 1 {
         Map.put(names, quantified[i].id, varName(i))
     }
-    Namer { names = names, next = len(quantified), prefix = prefix, bare = False }
+    Namer {
+        names = names, next = len(quantified), prefix = prefix, bare = False,
+        taken = Set.new(),
+    }
 }
 
 -- `a`..`z`, then `a1`, `b1`, ... Built from the code point rather than from a
@@ -1493,6 +1512,7 @@ fun varName(index : Int) -> String {
 fun showVar(cell : VarCell, n : Namer) -> String = match Map.get(n.names, cell.id) {
     Some(name) -> name
     None -> {
+        while Set.contains(n.taken, n.prefix + varName(n.next)) { n.next = n.next + 1 }
         let name = n.prefix + varName(n.next)
         Map.put(n.names, cell.id, name)
         n.next = n.next + 1

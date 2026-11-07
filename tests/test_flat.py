@@ -389,8 +389,8 @@ def test_fields_of_several_slots_are_held_as_their_slots():
     main = _function(result.stdout, "main")
     # `T` is its five slots, two traced. `Moving` is the pairs' four slots and
     # a pointer each to the record and the sum; the sum's is not assignable.
-    assert re.search(r"object\.new kind=1 tag=\d+ count=5 bytes=48 pointers=2 mutable=0 ", main), main
-    assert re.search(r"object\.new kind=1 tag=\d+ count=6 bytes=56 pointers=4 mutable=31 ", main), main
+    assert re.search(r"object\.new kind=1 tag=\d+ count=5 bytes=48 pointers=2 mutable=\[\] ", main), main
+    assert re.search(r"object\.new kind=1 tag=\d+ count=6 bytes=56 pointers=4 mutable=\[0, 1, 2, 3, 4\] ", main), main
     # No pair is boxed to be stored, and the record with a `Bool` is, each time.
     assert "kind=0 tag=-1 count=2 bytes=24 pointers=1 " not in main, main
     assert main.count("count=2 bytes=24 pointers=0 ") == 2, main

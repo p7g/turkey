@@ -1,9 +1,12 @@
-export (Inert(..), Given(..), Refusal(..), given, granted, empty, extend, extendAt, close,
-        refutes, ofGivens, implies, rewrite, rewritten)
+export (Inert(..), Given(..), Refusal(..), Rules, given, granted, empty, extend, extendAt,
+        close, refutes, ofGivens, implies, rewrite, rewritten, rewriteOver)
 
 -- The given equalities in scope, kept canonical: OutsideIn(X)'s inert set
 -- (Vytiniotis, Peyton Jones, Schrijvers and Sulzmann, JFP 2011, §7.4 and
--- §8.2), for the givens only.
+-- §8.2), for the givens only. The solver keeps the wanted side itself, and
+-- rewrites a wanted with its inert wanted equalities layered over this set
+-- (`rewriteOver`). The givens are kept idempotent, which the wanted side is
+-- not: see `rewriteOver`.
 --
 -- A given is added by rewriting both of its sides with what is already here
 -- and with the instances, then decomposing, orienting and checking it, and
@@ -343,39 +346,67 @@ fun rewrite(i : Inert, t : Ty.Type) -> Ty.Type = match rewritten(i, t) {
 }
 
 -- Returns `rewrite(i, t)`, or `None` if that is `t` itself.
-fun rewritten(i : Inert, t : Ty.Type) -> Option Ty.Type {
+fun rewritten(i : Inert, t : Ty.Type) -> Option Ty.Type = rewrittenBy(i, None, t)
+
+-- What a wanted equality says a type is: the right side of the inert wanted
+-- whose left side is the given family application or variable, or `None`.
+type Rules = fun(Ty.Type) -> Option Ty.Type
+
+-- Returns `t` rewritten by the wanted equalities `rules`, by the givens in
+-- `i` and by the instances, at every depth. This is how a wanted is rewritten:
+-- by the givens and by the other wanteds of its implication (OutsideIn(X),
+-- Fig. 22 and 23). A given is never rewritten this way, so no wanted rewrites
+-- a given.
+--
+-- `rules` must be a *terminating generalised substitution* over `i`, as the
+-- solver keeps its inert wanteds (GHC's Note [inert_eqs: the inert
+-- equalities], WF1-WF3): no left side occurs in another, none occurs in its
+-- own right side, and none occurs in a family argument of a right side.
+-- That is not idempotence: a right side may contain another rule's left
+-- side, so whatever a rule or a given produces is rewritten again, until
+-- nothing applies. The conditions are what make that end.
+fun rewriteOver(i : Inert, rules : Rules, t : Ty.Type) -> Ty.Type =
+    match rewrittenBy(i, Some(rules), t) {
+        Some(r) -> r
+        None -> Ty.prune(t)
+    }
+
+-- Returns `t` rewritten by `rules`, if any, over the givens in `i`, or `None`
+-- if that is `t` itself.
+fun rewrittenBy(i : Inert, rules : Option Rules, t : Ty.Type) -> Option Ty.Type {
     -- `None` for "unchanged" rather than a copy, so that rewriting a type
     -- nothing applies to allocates nothing: the solver asks this of every
     -- family application and skolem it unifies.
     let here = Ty.prune(t)
+    let again = rewrittenBy(i, rules, _)
     match here {
-        TVar(_) -> lookup(i, here)
-        TCon(c) -> if c.uid == 0 { None } else { lookup(i, here) }
+        TVar(_) -> lookupBy(i, rules, here)
+        TCon(c) -> if c.uid == 0 { None } else { lookupBy(i, rules, here) }
         TApp(fn, arg, k) -> {
-            let f2 = rewritten(i, fn)
-            let a2 = rewritten(i, arg)
+            let f2 = again(fn)
+            let a2 = again(arg)
             if Option.isNone(f2) && Option.isNone(a2) { return None }
             Some(TApp(Option.unwrapOr(f2, fn), Option.unwrapOr(a2, arg), k))
         }
         TFam(name, arg, k) -> {
-            let a2 = rewritten(i, arg)
+            let a2 = again(arg)
             let fam = match a2 {
                 Some(r) -> TFam(name, r, k)
                 None -> here
             }
-            match step(i, fam) {
+            match step(i, rules, fam) {
                 Some(r) -> Some(r)
                 None -> if Option.isSome(a2) { Some(fam) } else { None }
             }
         }
         TFun(params, ret) -> {
-            let ps = Array.map(params, rewritten(i, _))
-            let r2 = rewritten(i, ret)
+            let ps = Array.map(params, again)
+            let r2 = again(ret)
             if !anySome(ps) && Option.isNone(r2) { return None }
             Some(TFun(pick(ps, params), Option.unwrapOr(r2, ret)))
         }
         TTuple(elems) -> {
-            let es = Array.map(elems, rewritten(i, _))
+            let es = Array.map(elems, again)
             if anySome(es) { Some(TTuple(pick(es, elems))) } else { None }
         }
         _ -> None
@@ -394,23 +425,51 @@ fun pick(xs : Array (Option Ty.Type), of : Array Ty.Type) -> Array Ty.Type {
 }
 
 -- Returns what the family application `fam`, whose argument is already
--- rewritten, is by a given or by an instance, or `None` if neither decides it.
-fun step(i : Inert, fam : Ty.Type) -> Option Ty.Type {
-    -- A given's right side is already rewritten, so it is returned as it is.
-    -- The order of the two does not matter: no left side is a family
-    -- application an instance reduces.
-    match lookup(i, fam) {
+-- rewritten, is by a rule, a given or an instance, or `None` if none of them
+-- decides it.
+fun step(i : Inert, rules : Option Rules, fam : Ty.Type) -> Option Ty.Type {
+    -- The order of the three does not matter: no left side of a rule or a
+    -- given is a family application that another of them, or an instance,
+    -- reduces.
+    match lookupBy(i, rules, fam) {
         Some(r) -> return Some(r)
         None -> {}
     }
     match fam {
         TFam(name, arg, _) -> match Classes.reduceFam(i.classes, name, arg) {
-            Some(body) -> Some(rewrite(i, body))
+            Some(body) -> Some(rewriteBy(i, rules, body))
             None -> None
         }
         _ -> None
     }
 }
+
+-- Returns what `t`, a family application, skolem or variable, is by a rule
+-- or a given.
+fun lookupBy(i : Inert, rules : Option Rules, t : Ty.Type) -> Option Ty.Type {
+    match rules {
+        Some(r) -> match r(t) {
+            Some(found) -> return Some(rewriteBy(i, rules, found))
+            None -> {}
+        }
+        None -> {}
+    }
+    match lookup(i, t) {
+        -- A given's right side is already rewritten by the givens, which are
+        -- idempotent, so only rules can apply to it.
+        Some(found) -> Some(match rules {
+            Some(_) -> rewriteBy(i, rules, found)
+            None -> found
+        })
+        None -> None
+    }
+}
+
+fun rewriteBy(i : Inert, rules : Option Rules, t : Ty.Type) -> Ty.Type =
+    match rewrittenBy(i, rules, t) {
+        Some(r) -> r
+        None -> Ty.prune(t)
+    }
 
 -- Returns the right side of the given whose left side is `t`.
 fun lookup(i : Inert, t : Ty.Type) -> Option Ty.Type {

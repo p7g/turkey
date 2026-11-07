@@ -20,6 +20,11 @@ most general type the binding can have. Every other type it could be given is
 an instance of that one. So an annotation is never needed for a program to
 type-check, except in the few places listed [below](#where-annotations-are-needed),
 and adding one can only make a type more specific or state the same type.
+A few constraints that appear in inferred types cannot be written in an
+annotation: [`OneOf`](#numeric-literals) and the [field
+constraints](#field-and-projection-constraints), and `Typed` of a type constructor
+([`Typed` and `cast`](builtins.md#typed-and-cast)). A binding inferred with
+one of those has no annotation that restates its type.
 
 <!-- check -->
 ```kotlin

@@ -293,8 +293,8 @@ python3 bench/http/summarize.py    # a table per scenario: median [range]
 ```
 
 It needs Go, Cargo, Node, OpenSSL 3, and `wrk` and `nginx` on `PATH`; the
-comment at the top of `run.sh` lists the rest. Every server gets `CORES`
-threads (4 by default) and wrk gets `LOAD_THREADS` (4); each configuration
+comment at the top of `run.sh` lists the rest. Each server runs once per core
+count in `CORES` ("2 8" by default) and wrk gets `LOAD_THREADS` (4); each configuration
 runs `REPS` times (3) for `SECONDS_PER_RUN` seconds (10), each once the
 machine is quiet. The same comment lists the scenarios and how each number is
 taken. `.github/workflows/http-bench.yml` runs it on an arm64 Linux runner

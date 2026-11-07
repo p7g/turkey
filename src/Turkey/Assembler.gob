@@ -40,7 +40,7 @@ import Data.Set as Set
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
 import Turkey.Dwarf as Dwarf
-import Turkey.Stream (Item(..), Cfi(..))
+import Turkey.Stream (Item(..), Cfi(..), fits32)
 import Turkey.Unwind as Unwind
 
 -- What the assembler needs to know about an instruction set, whose
@@ -365,9 +365,6 @@ fun placedDistance(a : Assembler i f, to : Symbol, from : Symbol) -> Int =
                    + Asm.spell(to) + " names a label not yet placed")
     }
 
--- Whether `n` is a signed 32-bit integer.
-fun fits32(n : Int) -> Bool = n >= -0x80000000 && n < 0x80000000
-
 fun zeros(bytes : Vec Byte, n : Int) -> Unit {
     for var k = 0; k < n; k = k + 1 { Vec.push(bytes, Byte.truncate(0)) }
 }
@@ -402,6 +399,14 @@ fun finish(a : Assembler i f) -> Object f {
             Asm.Elf -> ehFrame(a, a.frames)
         }
     }
+    -- Each distance is final here because a section's bytes stay together:
+    -- the object never sets `MH_SUBSECTIONS_VIA_SYMBOLS`, and there is one
+    -- section per kind, so the linker moves `__text` and `.text` whole and
+    -- cannot strip or reorder what lies between two labels. With
+    -- subsections on, ld64 could move a function to a new place or drop it,
+    -- and every frame-table return address after it would name the wrong
+    -- instruction. Turning subsections on means writing each distance as a
+    -- `SUBTRACTOR` and `UNSIGNED` pair instead, as the system assembler does.
     for p in a.distances {
         let bytes = a.sections[p.section].bytes
         match (Map.get(a.labels, Asm.spell(p.to)), Map.get(a.labels, Asm.spell(p.from))) {

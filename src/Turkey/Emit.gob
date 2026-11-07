@@ -40,7 +40,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..
                    RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
-import Turkey.Stream (Item(..), Cfi(..))
+import Turkey.Stream (Item(..), Cfi(..), fits32)
 
 -- The items emitted so far, and the source position the next instruction
 -- takes (`Turkey.Position`).
@@ -1576,10 +1576,9 @@ fun byteLength(text : String) -> Int {
 -- Every safepoint's live roots, keyed by return address.
 --
 -- The emitter cannot sort this: it writes labels, whose addresses are not
--- known until the assembler has placed them. So the runtime owns the lookup
--- structure, which is OCaml's division and the one LLVM states outright --
--- the compiler's format is for getting the facts across, not for being
--- queried.
+-- known until the assembler has placed them. So the emitted format only
+-- carries the facts across, and the runtime builds the structure it
+-- queries.
 --
 -- Every field is four bytes: the count, then per safepoint its return
 -- address's distance from the entry, its number of roots, and each root's
@@ -1590,6 +1589,10 @@ fun byteLength(text : String) -> Int {
 -- absolute address would be a rebase per safepoint at every start, in a
 -- section the loader writes. The entry passes its own address to
 -- `turkey_frame_table_set`, which adds it back.
+--
+-- A distance fits in four bytes, signed, while the code is under 2 GB.
+-- `Turkey.Assembler` refuses one that does not. On the assembly path nothing
+-- here checks it, and nothing needs to: `boot`'s own code is under 10 MB.
 fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
                    out : Vec (Item Inst)) -> Unit {
     let b = code(out, False, asm.dialect)
@@ -1614,7 +1617,7 @@ fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
 -- than written truncated: a wrong offset is a root the collector reads from
 -- the wrong slot.
 fun tableField(b : Code, n : Int, what : String) -> Unit {
-    if n < -0x80000000 || n >= 0x80000000 {
+    if !fits32(n) {
         error("internal error: the frame table's " + what + " " + Int.toString(n)
               + " does not fit in four bytes")
     }

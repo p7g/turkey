@@ -24,6 +24,7 @@ difference is when that check fails.
 from __future__ import annotations
 
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -382,3 +383,51 @@ def test_no_label_in_the_code_has_a_symbol():
               if not s.named and s.section is not None
               and obj.sections[s.section].name in ("__TEXT,__text", ".text")]
     assert not labels, labels[:10]
+
+
+def _ours(entry: Path) -> bytes:
+    """`boot`'s object for the program, alone."""
+    with tempfile.TemporaryDirectory() as directory:
+        ours = Path(directory) / "ours.o"
+        env = dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib"))
+        result = subprocess.run(
+            toolchain.command(bootc.binary(), "build", "-o", str(ours), str(entry)),
+            capture_output=True, env=env, timeout=600)
+        assert result.returncode == 0, result.stderr.decode()[:4000]
+        return ours.read_bytes()
+
+
+# A loaded section that holds an absolute address costs the loader a rebase
+# per address at every start, and the linker writes one without complaint, so
+# nothing else notices one coming back. `__DWARF` stays in the object and
+# `__LD` is the linker's own; the ELF reader keeps only allocated sections.
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
+def test_no_loaded_section_of_the_compiler_holds_an_absolute_address():
+    obj = _parse(_ours(bootc.BOOT_MAIN))
+    absolute = [(obj.sections[r.section].name, hex(r.offset)) for r in obj.relocs
+                if r.kind == "abs64"
+                and not obj.sections[r.section].name.startswith(("__DWARF,", "__LD,"))]
+    assert not absolute, absolute[:10]
+
+
+# The frame table holds no relocated field, so it is read-only: its pages are
+# shared and never written at load.
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
+def test_the_frame_table_is_read_only():
+    obj = _parse(_ours(PROGRAMS / "adt.gob"))
+    tables = [s for s in obj.symbols if s.name == toolchain.c_symbol("turkey_frame_table")]
+    assert len(tables) == 1 and tables[0].section is not None, tables
+    assert obj.sections[tables[0].section].name in ("__TEXT,__const", ".rodata")
+
+
+@pytest.mark.skipif(toolchain.target() != "arm64-darwin" or not shutil.which("dyld_info"),
+                    reason="dyld_info reads Mach-O executables")
+def test_the_loader_applies_binds_only(tmp_path):
+    executable = tmp_path / "adt"
+    bootc.link(PROGRAMS / "adt.gob", executable,
+               env=dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib")))
+    result = subprocess.run(["dyld_info", "-fixups", str(executable)],
+                            capture_output=True, text=True, check=True)
+    kinds = [line.split()[3] for line in result.stdout.splitlines()
+             if len(line.split()) >= 5 and line.split()[0].startswith("__")]
+    assert kinds and set(kinds) == {"bind"}, sorted(set(kinds))

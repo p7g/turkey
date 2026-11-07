@@ -580,8 +580,9 @@ argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.
 
 The equalities a body needs rewrite each other as they are found, as a
-context's do. Two that cannot hold together are an error where the second
-arises, rather than an inferred context that no caller could satisfy:
+context's do. Two that cannot hold together are an error at the one that
+the other makes impossible, rather than an inferred context that no caller
+could satisfy:
 
 <!-- error: expected 'Char', found 'Int' in the annotation on 'i' -->
 ```kotlin
@@ -611,7 +612,8 @@ fun main() { }
 ```
 
 `b`'s annotation makes `G a` be `Bool`, so `fold(g)` is an `F Bool`, which is
-a `Char`.
+a `Char`, and `i`'s annotation cannot hold. The error is at `i`'s annotation
+whichever of the two lines comes first.
 
 ### Equality superclasses
 

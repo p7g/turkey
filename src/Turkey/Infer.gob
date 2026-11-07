@@ -654,7 +654,7 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
                     -- as its dictionary is built.
                     Diag.beginUnit()
                     Map.put(info.defaults, m.name, checkMethod(g, m, sk,
-                        [], [],
+                        [], [], [],
                         "the default definition of '" + m.name + "'", None, None))
                     let _ = Diag.endUnit()
                 }
@@ -664,6 +664,7 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
     for decl in instDecls {
         let inst = instanceFor(g, decl)
         let info = classNamed(g, decl.cls)
+        checkInstanceEqualities(g, inst, info)
         let params = Vec.new(len(inst.context))
         for q in inst.context { Vec.push(params, dictName(q.name)) }
         let plan = Classes.newInstancePlan(params)
@@ -685,13 +686,57 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
             }
             -- The class variable is not made rigid: the instance fixes it.
             Map.put(sk.mapping, m.classVar.id, Classes.skolemApply(sk, inst.head))
-            let context = Array.map(inst.context, fun(q) =
-                Ty.pred(q.name, [Classes.skolemApply(sk, q.args[0])]))
+            let context = Array.map(inst.context, Classes.skolemApplyPred(sk, _))
+            let equalities = Array.map(inst.equalities, Classes.skolemApplyPred(sk, _))
             Diag.beginUnit()
             Map.put(plan.methods, methodDecl.name, checkMethod(g, m, sk, context,
-                plan.params, "instance '" + decl.cls + " " + Ty.show(inst.head)
+                plan.params, equalities, "instance '" + decl.cls + " " + Ty.show(inst.head)
                 + "'", Some(methodDecl), Some(selfName)))
             let _ = Diag.endUnit()
+        }
+    }
+}
+
+-- Reports an equality in `inst`'s context that can never hold, where the
+-- context writes it, and an equality that a superclass's instance needs and
+-- that `inst`'s context does not imply.
+fun checkInstanceEqualities(g : Generator, inst : InstInfo, info : ClassInfo) -> Unit {
+    -- Checked once per instance rather than in each method's check, though
+    -- every override is granted the same equalities: a refusal there would be
+    -- reported once per method, or never for an instance with no methods.
+    let spans = Vec.new(len(inst.equalities))
+    for p in inst.decl.context {
+        if let PEq(_, _) = p.kind { Vec.push(spans, Some(p.span)) }
+    }
+    -- Over skolems named as the declaration names its variables, as a
+    -- method's check sees them, so a refusal prints them as written.
+    let sk = Classes.newSkolems()
+    for v in Ty.varsOf([inst.head]) {
+        discard(Classes.skolemBind(sk, v, Map.getOr(inst.names, v.id, "a")))
+    }
+    let givens = Array.init(len(inst.equalities), fun(i) = Inert.Given {
+        pred = Classes.skolemApplyPred(sk, inst.equalities[i]), span = spans[i],
+    })
+    let (inert, refused) = Inert.extend(Inert.empty(g.classes), givens)
+    -- Each given has a span, so each refusal is reported.
+    for r in refused { discard(C.refusedHere(r, CAnd([]))) }
+    if len(refused) > 0 { return {} }
+    let named = Vec.map(inst.context, fun(p) = ("", p))
+    for sup in info.supers {
+        let demand = Ty.pred(sup.name, [inst.head])
+        -- `Classes.checkInstance` has reported a superclass with no evidence.
+        let ev = match Classes.prove(g.classes, named, demand) {
+            Some(found) -> found
+            None -> continue
+        }
+        for q in Classes.provenEqualities(ev) {
+            if !Inert.implies(inert, Classes.skolemApplyPred(sk, q)) {
+                let n = Classes.writtenNamer(inst.names)
+                Ty.typeError("'" + Ty.showPredWith(demand, n) + "' is required by '"
+                             + inst.cls + "', and its instance needs '"
+                             + Ty.showPredWith(q, n) + "'; add it to the context",
+                             Some(inst.decl.span))
+            }
         }
     }
 }
@@ -713,6 +758,7 @@ fun classNamed(g : Generator, name : String) -> ClassInfo =
 
 fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
                 context : Array Pred, contextNames : Vec String,
+                equalities : Array Pred,
                 what : String, override : Option FunDecl,
                 selfNameIn : Option String) -> MethodImpl {
     for v in m.scheme.quantified {
@@ -749,6 +795,9 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     for var i = 0; i < len(context) && i < len(contextNames); i = i + 1 {
         Vec.push(givens, (contextNames[i], context[i]))
     }
+    -- The instance's equalities pass no dictionary, so their name is never
+    -- read.
+    for q in equalities { Vec.push(givens, (dictName(q.name), q)) }
 
     let decl = match override {
         Some(d) -> d

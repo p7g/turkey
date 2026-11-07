@@ -2,13 +2,14 @@ export (
     Evidence(..), MethodImpl(..), InstancePlan(..), newInstancePlan,
     MethodInfo(..), hasDefault, methodDicts, methodEqualities, methodEvidence,
     ClassInfo(..), classKind,
-    InstInfo(..), instCon, instHeadKey,
+    InstInfo(..), instCon, instHeadKey, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
     uncovered,
-    bySuper, byInst, selectInstance, contextAt, entail, prove, superPath, isClass, method, simplify,
+    bySuper, byInst, selectInstance, contextAt, equalitiesAt, provenEqualities,
+    entail, prove, superPath, isClass, method, simplify,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -204,7 +205,12 @@ fun classKind(info : ClassInfo) -> Kind = info.cvar.kind
 type InstInfo = InstInfo {
     cls      : String,
     head     : Ty.Type,
+    -- The class predicates of the context, one per dictionary parameter, in
+    -- order.
     context  : Vec Pred,
+    -- The equalities of the context, one per coercion parameter, in order.
+    -- They follow the dictionaries, and every use proves them at its types.
+    equalities : Vec Pred,
     decl     : InstanceDecl,
     names    : Map Int String,
     -- Family name -> what it is at this head, over the head's own variables.
@@ -229,6 +235,20 @@ fun instCon(inst : InstInfo) -> String {
 -- parenthesized where it needs to be: `Iterator (Bag a)`.
 fun showInstance(cls : String, head : Ty.Type) -> String =
     cls + " " + Ty.showAt(head, Ty.namer(""), 2)
+
+-- Returns a namer that calls each of an instance's variables what the
+-- declaration does, and a family bare, as a context writes it.
+fun writtenNamer(names : Map Int String) -> Ty.Namer {
+    let n = Ty.namer("")
+    for (id, name) in Map.entries(names) { Map.put(n.names, id, name) }
+    n.bare = True
+    n
+}
+
+-- Returns `inst` as its declaration writes it, with the declaration's own
+-- variable names: `Source (Layer s)`.
+fun showDeclared(inst : InstInfo) -> String =
+    inst.cls + " " + Ty.showAt(inst.head, writtenNamer(inst.names), 2)
 
 fun instHeadKey(t : Ty.Type) -> String {
     let (h, _) = Ty.spine(t)
@@ -730,19 +750,34 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
             return None
         }
     }
-    let context = resolveContext(t, d.context, tyvars, None)
-    let families = resolveFamilies(t, d, info, h, tyvars, fresh)
-    let names = Map.new()
-    for (name, stood) in Map.entries(tyvars) {
-        if let TVar(cell) = stood {
-            let _ = Ty.defaultKind(cell.kind)
-            Map.put(names, cell.id, name)
+    -- A context constrains the head's variables and binds none of its own:
+    -- an instance is selected by its head alone, so nothing at a use could
+    -- say what another variable is.
+    for p in d.context {
+        let sides = match p.kind {
+            PClass(_, arg) -> [arg]
+            PEq(left, right) -> [left, right]
+        }
+        for side in sides {
+            if let Some((name, at)) = strayVar(side, tyvars) {
+                report("'" + name + "' is not bound by the instance head '"
+                       + Ty.showAt(h, writtenNamer(namesOf(tyvars)), 0) + "'", Some(at))
+            }
         }
     }
+    let written = resolveContext(t, d.context, tyvars, None)
+    let context = Vec.filter(written, fun(p) = p.name != Ty.equals)
+    let equalities = Vec.filter(written, fun(p) = p.name == Ty.equals)
+    let families = resolveFamilies(t, d, info, h, tyvars, fresh)
+    for (_, stood) in Map.entries(tyvars) {
+        if let TVar(cell) = stood { let _ = Ty.defaultKind(cell.kind) }
+    }
+    let names = namesOf(tyvars)
     let inst = InstInfo {
         cls = d.cls
         head = h
         context
+        equalities
         decl = d
         names
         families
@@ -755,6 +790,39 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         None -> Map.put(t.instances, d.cls, [inst])
     }
     Some(inst)
+}
+
+-- Returns what each variable of the annotation scope `tyvars` is called, by
+-- its id.
+fun namesOf(tyvars : Map String Ty.Type) -> Map Int String {
+    let names = Map.new()
+    for (name, stood) in Map.entries(tyvars) {
+        if let TVar(cell) = stood { Map.put(names, cell.id, name) }
+    }
+    names
+}
+
+-- Returns the first type variable in `te` that `bound` does not name, and
+-- where it is written.
+fun strayVar(te : Type, bound : Map String Ty.Type) -> Option (String, Span) = match te.kind {
+    TEVar(name) -> if Map.contains(bound, name) { None } else { Some((name, te.span)) }
+    TECon(_, args) -> strayIn(args, bound)
+    TEApp(fn, args) -> match strayVar(fn, bound) {
+        Some(found) -> Some(found)
+        None -> strayIn(args, bound)
+    }
+    TETuple(elems) -> strayIn(elems, bound)
+    TEFun(params, ret) -> match strayIn(params, bound) {
+        Some(found) -> Some(found)
+        None -> strayVar(ret, bound)
+    }
+}
+
+fun strayIn(tes : Vec Type, bound : Map String Ty.Type) -> Option (String, Span) {
+    for te in tes {
+        if let Some(found) = strayVar(te, bound) { return Some(found) }
+    }
+    None
 }
 
 -- Where `other` is declared, for a message about an instance in `module_`.
@@ -1275,6 +1343,7 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
         cls = cls
         head = general
         context = []
+        equalities = []
         decl = InstanceDecl {
             span = generatedSpan()
             cls = cls
@@ -1428,7 +1497,7 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
     let context = []
     for arg in typedArgs(general) { Vec.push(context, Ty.pred(P.typedClass, [arg])) }
     let inst = InstInfo {
-        cls = P.typedClass, head = general, context = context,
+        cls = P.typedClass, head = general, context = context, equalities = [],
         decl = InstanceDecl {
             span = generatedSpan(), cls = P.typedClass,
             head = Type { id = 0, span = generatedSpan(),
@@ -1448,10 +1517,32 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) =
     Option.map(selectInstance(t, p), fun((inst, mapping)) = contextAt(inst, mapping))
 
--- Returns `inst`'s context under `mapping`, a match of its head.
+-- Returns `inst`'s class context under `mapping`, a match of its head.
 fun contextAt(inst : InstInfo, mapping : Map Int Ty.Type) -> Array Pred =
     Array.map(Vec.toArray(inst.context), fun(q) =
         Ty.pred(q.name, [Decls.substitute(q.args[0], mapping)]))
+
+-- Returns `inst`'s equalities under `mapping`, a match of its head.
+fun equalitiesAt(inst : InstInfo, mapping : Map Int Ty.Type) -> Array Pred =
+    Array.map(Vec.toArray(inst.equalities), fun(q) =
+        Ty.pred(q.name, Array.map(q.args, Decls.substitute(_, mapping))))
+
+-- Returns every equality the instances in `ev` need, at the types `ev` uses
+-- them at. `prove` does not decide them.
+fun provenEqualities(ev : Evidence) -> Vec Pred {
+    let out = Vec.new(1)
+    let work = [ev]
+    while len(work) > 0 {
+        match Vec.pop(work) {
+            Some(FromInstance(inst, mapping, args)) -> {
+                for q in equalitiesAt(inst, mapping) { Vec.push(out, q) }
+                for a in args { Vec.push(work, a) }
+            }
+            _ -> {}
+        }
+    }
+    out
+}
 
 -- Returns the instance that covers `p` and the match of its head against
 -- `p`'s argument, or `None` if no instance does.
@@ -1482,8 +1573,11 @@ fun entail(t : ClassTable, given : Vec Pred, p : Pred) -> Bool {
 -- instance. Returns `None` if they do not prove it.
 --
 -- Entailment as THIH has it, with no families and no equalities. It serves an
--- instance declaration, whose head and context are constructors applied to
--- variables and whose context has no equality, so there is nothing to rewrite.
+-- instance declaration, whose head and class context are constructors applied
+-- to variables, so there is nothing to rewrite. An instance it selects may
+-- have equalities in its context, and those are left to the caller
+-- (`provenEqualities`), since deciding them needs the instance's own given
+-- equalities.
 fun prove(t : ClassTable, given : Vec (String, Pred), p : Pred) -> Option Evidence {
     let key = Ty.predKey(p)
     for (name, g) in given {
@@ -1759,7 +1853,7 @@ fun showClasses(t : ClassTable) -> String {
             let n = Ty.namer("")
             String.push(b, "instance " + cls + " " + Ty.showAt(inst.head, n, 0)
                            + " [" + inst.module_ + "]\n")
-            for p in inst.context {
+            for p in Vec.append(inst.context, inst.equalities) {
                 String.push(b, "  context " + Ty.showPredWith(p, n) + "\n")
             }
             for (fam, body) in Map.entries(inst.families) {

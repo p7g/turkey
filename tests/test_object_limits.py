@@ -1,7 +1,6 @@
 """How wide a value can be: a tuple or constructed value has at most 21
-fields, which the parser enforces, and a closure at most 63 captures, one bit
-each in the mask of captures written after it is made. What fits must work,
-collector included; what does not is a compile error.
+fields, which the parser enforces. What fits must work, collector included;
+what does not is a compile error.
 """
 
 import pytest
@@ -50,20 +49,3 @@ def test_a_tuple_of_twenty_two_elements_is_an_error(where):
            else f"fun first(t : ({types})) -> Int = t.0\nfun main() {{ print(1) }}")
     assert "has 22 fields, and a value can have at most 21" in lang.fails(src)
 
-
-def test_a_closure_of_sixty_five_captures_does_not_compile():
-    # One bit a capture in the mask of captures written after the closure is
-    # made: 63 is the most it can say.
-    names = [f"v{i}" for i in range(65)]
-    lets = "\n".join(f"    let {n} = Int.toString({i})" for i, n in enumerate(names))
-    src = f"""
-fun main() {{
-{lets}
-    let f = fun() = {" + ".join(names)}
-    print(f())
-}}
-"""
-    with pytest.raises(lang.CompileError) as error:
-        lang.run(src)
-    assert ("a nested function captures 65 variables, and a function can capture at "
-            "most 63") in str(error.value)

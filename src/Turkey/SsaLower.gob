@@ -364,7 +364,7 @@ fun stored(l : Lower, v : Value) -> Value = match multiOf(l, v) {
     None -> v
     Some(Boxed(_, box)) -> box
     Some(Slots(layout, values)) -> {
-        let made = L.emit(l.b, ObjectNew(0, -1, Rt.layout(layout.slots), values, 0),
+        let made = L.emit(l.b, ObjectNew(0, -1, Rt.layout(layout.slots), values, []),
                           Ssa.traced(Ptr))
         -- Named as building the value it holds, which is what memory holds of
         -- it.
@@ -622,7 +622,7 @@ fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
     }
     let results = Array.init(len(sig.results), fun(k) =
         if k == 0 { first } else { L.emit(b, Result(first, k), sig.results[k]) })
-    let box = L.emit(b, ObjectNew(0, -1, Rt.layout(sig.results), results, 0), Ssa.traced(Ptr))
+    let box = L.emit(b, ObjectNew(0, -1, Rt.layout(sig.results), results, []), Ssa.traced(Ptr))
     L.terminate(b, Ret([box]))
     f
 }
@@ -661,7 +661,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
                                    + Int.toString(tag)
                         Map.put(objects, name, (kind, tag, layout, []))
                         inst.op = GlobalLoad(name)
-                    } else if shared && kind == 0 && tag == -1 && mutable == 0 {
+                    } else if shared && kind == 0 && tag == -1 && len(mutable) == 0 {
                         match constantsOf(constants, fields) {
                             Some(ops) -> {
                                 let name = "%box." + String.join(Array.map(layout.reps, fun(r) =
@@ -688,7 +688,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
         let (kind, tag, layout, ops) = shape
         Vec.push(m.globals, (name, Ssa.traced(Ptr)))
         let values = Array.init(len(ops), fun(i) = L.emit(b, ops[i], layout.reps[i]))
-        let made = L.emit(b, ObjectNew(kind, tag, layout, values, 0), Ssa.traced(Ptr))
+        let made = L.emit(b, ObjectNew(kind, tag, layout, values, []), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
     L.terminate(b, Jump(init.entry, []))
@@ -2122,7 +2122,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         }
         CTuple(elems) -> match flatHere(l, e.ty) {
             Some(f) -> flatValue(l, f, held, 0, elems)
-            None -> aggregate(l, elems, 0, -1, 0, "builds a tuple", fieldsOf("this tuple"))
+            None -> aggregate(l, elems, 0, -1, [], "builds a tuple", fieldsOf("this tuple"))
         }
         CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
@@ -2241,17 +2241,17 @@ fun storeStored(l : Lower, target : Core, x : Value) -> Unit = match target.kind
 -- A heap object built with its fields.
 --
 -- `kind` is 0 for a tuple and 1 for a constructed value, which is what the
--- runtime's own object header distinguishes. `mutable` has a bit set for each
--- field that may be assigned later.
+-- runtime's own object header distinguishes. `mutable` lists the fields that
+-- may be assigned later.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             mutable : Int, what : String, refusal : fun(Int) -> String) -> Value {
+             mutable : Array Int, what : String, refusal : fun(Int) -> String) -> Value {
     if wide(l, len(items), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(items, fun(x) = value(l, x))
     built(l, kind, tag, values, mutable, what)
 }
 
 -- An object of these fields, laid out from their representations.
-fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Int,
+fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Array Int,
           what : String) -> Value {
     let values = storedAll(l, fields)
     let layout = Rt.layout(Array.map(values, Ssa.repOf(l.func, _)))
@@ -2264,7 +2264,7 @@ fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Int,
 -- A dictionary: a constructed value whose slots are all traced pointers, which
 -- is what lets a slot be read knowing only its index (`dictionarySlot`).
 -- Mutable throughout, as a dictionary the initializer fills one slot at a time
--- must be: the masks of all dictionaries of a class agree.
+-- must be: the mutable fields of all dictionaries of a class agree.
 fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
     let what = "builds a dictionary, " + cls
     let refusal = fun(n) = "an instance of class '" + Ty.shortName(cls) + "' needs "
@@ -2278,7 +2278,7 @@ fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
             return stop(l, "a dictionary slot of " + cls + " held at " + show(Ssa.repOf(l.func, v)))
         }
     }
-    built(l, 1, Map.getOr(l.tags, Core.dictName(cls), -1), values, allFields(len(slots)), what)
+    built(l, 1, Map.getOr(l.tags, Core.dictName(cls), -1), values, everyField(len(slots)), what)
 }
 
 -- Which fields of a value built with this constructor may be assigned: its
@@ -2286,20 +2286,21 @@ fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
 -- `ObjectGet` of it from an object built in view is the value it was built
 -- with. A constructor the declarations do not know -- a dictionary's -- is
 -- taken to be mutable throughout.
-fun mutableMask(l : Lower, con : String, count : Int) -> Int =
+fun mutableFields(l : Lower, con : String, count : Int) -> Array Int =
     match Decls.con(l.decls, con) {
         Some(info) -> {
-            var mask = 0
+            let out = []
             for var i = 0; i < len(info.mutable); i = i + 1 {
-                if info.mutable[i] { mask = mask | 1 << i }
+                if info.mutable[i] { Vec.push(out, i) }
             }
-            mask
+            Vec.toArray(out)
         }
-        None -> allFields(count)
+        None -> everyField(count)
     }
 
--- The mutable mask with every one of `count` fields set.
-fun allFields(count : Int) -> Int = (1 << count) - 1
+-- Returns the indices of all `count` fields, for an object any of whose
+-- fields may be written.
+fun everyField(count : Int) -> Array Int = Array.init(count, fun(i) = i)
 
 -- Whether an object of `count` fields is past `Rt.fieldLimit`, stopping the
 -- lowering with `refusal(count)` if it is. The parser holds a declared
@@ -2340,12 +2341,11 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 -- scope has ended is one the body cannot mention. So what the environment holds
 -- of the body's references is exactly its free locals.
 --
--- Not the whole environment. `turkey_object_new` refuses more than 63 slots,
--- and the environment of a body the size of `Turkey.Opt#expr` holds far more
--- than 63 locals -- so capturing everything is not a slower correct answer, it
--- is a runtime panic on this compiler's own source. And every capture pins a
--- live range from the closure's creation to the end of the function, which the
--- register allocator would pay for.
+-- Not the whole environment. The environment of a body the size of
+-- `Turkey.Opt#expr` holds far more locals than any of its lambdas mentions, and
+-- every capture is a word the parent writes and a live range from the
+-- closure's creation to the end of the function, which the register allocator
+-- would pay for.
 --
 -- `extra` is `CLetRec`'s siblings: locals that will hold closures but do not
 -- yet, so their representation is known before their value is.
@@ -2361,9 +2361,8 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
                 -- held here: `LocalEscape` keeps any binding a closure
                 -- mentions on the heap.
                 --
-                -- A `unit` holds nothing and `lift` makes the child its own;
-                -- the 63-slot cap makes that worth doing rather than merely
-                -- tidy.
+                -- A `unit` holds nothing, and `lift` makes the child its own
+                -- rather than spend an environment field on it.
                 Some(v) -> {
                     match multiOf(l, v) {
                         Some(m) -> Vec.push(out, (local, multiLayout(m)))
@@ -2388,17 +2387,6 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
 -- results collectable.
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
          captures : Vec (Ref, Ssa.Layout)) -> Option String {
-    -- A capture of several slots takes a word for each (`environmentLayout`).
-    let words = len(environmentReps(captures))
-    if words > 63 {
-        let counted = if words == len(captures) { Int.toString(words) + " variables" }
-            else { Int.toString(len(captures)) + " variables in " + Int.toString(words)
-                   + " words" }
-        refuse(l, "a nested function captures " + counted + ", and a function can "
-                  + "capture at most 63; pass some as parameters, or group them in a "
-                  + "record")
-        return None
-    }
     -- `%` is the compiler's own character: the lexer will not accept one in an
     -- identifier, so no Turkey name mangles onto this, and a top-level name
     -- here already carries `#` and `@`. The symbol is the binding's name and
@@ -2496,11 +2484,11 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (Ref, Ssa.Layout),
     if len(captures) == 0 {
         return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
-    var mutable = 0
+    let mutable = []
     let values = []
     for (local, layout) in captures {
         if isSibling(later, local) {
-            mutable = mutable | 1 << len(values)
+            Vec.push(mutable, len(values))
             for r in layout.slots { Vec.push(values, storageZero(l, r)) }
         } else {
             match lookup(l, local) {
@@ -2513,7 +2501,7 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (Ref, Ssa.Layout),
         }
     }
     let environment = L.emit(l.b, ObjectNew(4, -1, environmentLayout(captures),
-                                            Vec.toArray(values), mutable),
+                                            Vec.toArray(values), Vec.toArray(mutable)),
                              Ssa.traced(Ptr))
     L.emit(l.b, ClosureNew(symbol, Some(environment)), Ssa.traced(Ptr))
 }
@@ -2774,7 +2762,7 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     L.into(l.b, as_)
     L.terminate(l.b, Jump(after, [x]))
     L.into(l.b, wrap)
-    let object = L.emit(l.b, ObjectNew(1, wrapTag, wrapLayout, [x], 0),
+    let object = L.emit(l.b, ObjectNew(1, wrapTag, wrapLayout, [x], []),
                         Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(object),
             "wraps a nested value in " + Ty.shortName(name))
@@ -2877,11 +2865,11 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
             Some(info) -> if len(info.exists) > 0 {
                 packed(l, info, name, args, tag)
             } else {
-                aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
+                aggregate(l, args, 1, tag, mutableFields(l, name, len(args)),
                           "builds a value with " + Ty.shortName(name),
                           fieldsOf("constructor '" + Ty.shortName(name) + "'"))
             }
-            None -> aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
+            None -> aggregate(l, args, 1, tag, mutableFields(l, name, len(args)),
                               "builds a value with " + Ty.shortName(name),
                               fieldsOf("constructor '" + Ty.shortName(name) + "'"))
         }
@@ -2948,7 +2936,7 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
         } else {
             value(l, args[i - 1])
         })
-    built(l, 1, tag, values, 0, "packs an existential, " + Ty.shortName(name))
+    built(l, 1, tag, values, [], "packs an existential, " + Ty.shortName(name))
 }
 
 fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {
@@ -3645,7 +3633,7 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         if !countable(l, layout) { return {} }
         let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), layout,
                                          Array.map(reps, storageZero(l, _)),
-                                         allFields(len(slots))),
+                                         everyField(len(slots))),
                           Ssa.traced(Ptr))
         L.effect(l.b, GlobalStore(name, made))
     }

@@ -1,7 +1,10 @@
 """Objects of many fields: a record, a tuple and a closure's environment of any
 width keep every field through collections, including fields written after
-the object is built and fields past the reach of an immediate offset.
+the object is built and fields past the reach of an immediate offset. An
+object with more pointers than its header counts is a compile error.
 """
+
+import pytest
 
 from tests import lang
 
@@ -133,3 +136,35 @@ fun main() {{
     result = lang.run(src, env=STRESS, flags=("--gc-verify",))
     assert result.code == 0, result.stderr
     assert result.stdout == "4099\nz True 19\n"
+
+
+def test_a_closure_capturing_more_pointers_than_a_header_counts_is_an_error():
+    # Parameters rather than locals, so the source does not nest 65536 deep.
+    count = 65536
+    params = ", ".join(f"v{i} : String" for i in range(count))
+    src = f"""
+fun make({params}) -> fun() -> Array String =
+    fun() = [{", ".join(f"v{i}" for i in range(count))}]
+
+fun main() {{
+    let s = "x"
+    print(len(make({", ".join(["s"] * count)})()))
+}}
+"""
+    with pytest.raises(lang.CompileError) as error:
+        lang.run(src)
+    assert ("in 'make': a nested function captures 65536 values held by reference, and "
+            "a function can capture at most 65535 of them") in str(error.value)
+
+
+def test_a_tuple_of_more_pointers_than_a_header_counts_is_an_error():
+    count = 65536
+    src = f"""
+fun make(s : String) = ({", ".join(["s"] * count)})
+
+fun main() {{ print(make("x").0) }}
+"""
+    with pytest.raises(lang.CompileError) as error:
+        lang.run(src)
+    assert ("a value needs 65536 pointer fields, and a value can have at most 65535"
+            in str(error.value))

@@ -150,7 +150,8 @@ Box([Some(a)])
 ```
 
 `Show (Box a) : Show a` says: a `Box a` can be shown whenever an `a` can. The
-instance's methods may use those constraints.
+instance's methods may use those constraints. The context may also hold
+[equalities](#equality-constraints) about the head's variables.
 
 > **Coming from Haskell.** `instance Show (Box a) : Show a` is
 > `instance Show a => Show (Box a)`: the context comes after the head.
@@ -494,6 +495,83 @@ True
 
 Here `Elem Flag` is `Bool`, so `code`'s context can never hold for a `Flag`,
 and a call `code(Flag(True))` is refused.
+
+An instance's context can hold equalities too. `Echo s` reads from a stream
+and writes back what it read, so a failure to read and a failure to write both
+come out of its `pull`. The equality says that `s` fails both ways with one
+type:
+
+<!-- run -->
+```kotlin
+class Source s {
+    type Failure s
+    fun pull(s) -> Either (Failure s) Int
+}
+
+class Sink s {
+    type Trouble s
+    fun push(s, Int) -> Either (Trouble s) Unit
+}
+
+type Echo s = Echo(s)
+
+instance Source (Echo s) : Source s, Sink s, Failure s ~ Trouble s {
+    type Failure = Failure s
+    fun pull(Echo(inner)) {
+        let n = pull(inner)?
+        push(inner, n)?
+        Right(n)
+    }
+}
+
+type Pipe = Pipe(Int)
+
+instance Source Pipe {
+    type Failure = String
+    fun pull(Pipe(n)) = if n < 0 { Left("closed") } else { Right(n) }
+}
+
+instance Sink Pipe {
+    type Trouble = String
+    fun push(_, n) = if n > 9 { Left("full") } else { Right(()) }
+}
+
+fun main() {
+    print(pull(Echo(Pipe(3))))
+    print(pull(Echo(Pipe(12))))
+    print(pull(Echo(Pipe(-1))))
+}
+```
+
+```text
+Right(3)
+Left(full)
+Left(closed)
+```
+
+Inside the instance's methods `Failure s` and `Trouble s` are
+interchangeable, so `push(inner, n)?` can return a write failure from `pull`.
+Every use of the instance has to prove the equality at its own types:
+`pull(Echo(p))` is refused for a `p` whose `Failure` and `Trouble` differ.
+
+An instance's context may mention only the head's type variables, since a use
+selects the instance by its head alone and nothing there could say what
+another variable is:
+
+<!-- error: 'b' is not bound by the instance head 'Box a' -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+type Box a = Box(a)
+
+instance Show (Box a) : Show a, Elem b ~ a {
+    fun show(Box(x)) = show(x)
+}
+
+fun main() { }
+```
 
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the

@@ -863,7 +863,7 @@ fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
     let x = freshParam(l, "x", head)
     let y = freshParam(l, "y", head)
     let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
-    if let Some(body) = enumCompare(l, d, Prims.EnumEq, True, x, y) {
+    if let Some(body) = enumCompare(l, d, Prims.IntEq, True, x, y) {
         return node(TFun([head, head], Ty.tBool()), d.span, CLam([x, y], body, name))
     }
     let several = len(d.cons) > 1
@@ -886,24 +886,24 @@ fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
          CLam([x, y], node(Ty.tBool(), d.span, CMatch(paramVar(x, d.span), alts)), name))
 }
 
--- `x` and `y` compared by `prim`, when the type is an enumeration
--- (`Decls.enumSize`): a value of one is its constructor's index, so one
--- comparison of the two decides, and folds when both are known. An
--- enumeration of one constructor is held at no width, and is `alike` to
--- itself. Returns `None` for any other type.
+-- `x` and `y` compared by the `Int` comparison `prim` of their constructor
+-- indices, when the type is an enumeration (`Decls.enumSize`): the index is
+-- the whole of a value of one, so one comparison decides, and it folds when
+-- both are known. An enumeration of one constructor is `alike` to itself.
+-- Returns `None` for any other type.
 fun enumCompare(l : Lowerer, d : DerivedSite, prim : Prims.Prim, alike : Bool, x : CParam,
                 y : CParam) -> Option Core {
-    let (h, _) = Ty.spine(d.inst.head)
-    let tycon = match h {
-        TCon(c) -> c.name
-        _ -> return None
-    }
-    let size = Decls.enumSize(l.decls, tycon)?
+    let size = Decls.enumSize(l.decls, derivedTycon(d))?
     if size == 1 { return Some(boolean(alike, d.span)) }
-    let head = d.inst.head
     Some(node(Ty.tBool(), d.span, CApp(
-        node(TFun([head, head], Ty.tBool()), d.span, CPrim(prim)),
-        [paramVar(x, d.span), paramVar(y, d.span)])))
+        node(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()), d.span, CPrim(prim)),
+        [indexOf(l, d, paramVar(x, d.span)), indexOf(l, d, paramVar(y, d.span))])))
+}
+
+-- The type constructor a derived instance is for.
+fun derivedTycon(d : DerivedSite) -> String = match Ty.spine(d.inst.head).0 {
+    TCon(c) -> c.name
+    _ -> ""
 }
 
 -- `lt(x, y)`: a constructor declared earlier is less, and two values of one
@@ -917,7 +917,7 @@ fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
     let xv = fun() = paramVar(x, d.span)
     let yv = fun() = paramVar(y, d.span)
     let several = len(d.cons) > 1
-    let body = if let Some(compared) = enumCompare(l, d, Prims.EnumLt, False, x, y) {
+    let body = if let Some(compared) = enumCompare(l, d, Prims.IntLt, False, x, y) {
         compared
     } else {
         let alts = Vec.new(len(d.cons))
@@ -944,8 +944,8 @@ fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
                 boolean(True, d.span),
                 Some(node(Ty.tBool(), d.span, CIf(intLess(yTag(), xTag(), d.span),
                     boolean(False, d.span), Some(same))))))
-            node(Ty.tBool(), d.span, CLet(xName, xId, Ty.tInt(), tagOf(l, d, xv()),
-                node(Ty.tBool(), d.span, CLet(yName, yId, Ty.tInt(), tagOf(l, d, yv()),
+            node(Ty.tBool(), d.span, CLet(xName, xId, Ty.tInt(), indexOf(l, d, xv()),
+                node(Ty.tBool(), d.span, CLet(yName, yId, Ty.tInt(), indexOf(l, d, yv()),
                                               decided, [])), []))
         } else { same }
     }
@@ -994,6 +994,16 @@ fun derivedHash(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
     let x = freshParam(l, "x", head)
     let state = freshParam(l, "state", stateTy)
     let several = len(d.cons) > 1
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    -- An enumeration's value is its index, absorbed with no match.
+    if Option.isSome(Decls.enumSize(l.decls, derivedTycon(d))) {
+        let absorbed = if !several { paramVar(state, d.span) } else {
+            methodCall(l, paramVar(hasher, d.span), P.hasherClass, "hashInt", stateTy,
+                       [paramVar(state, d.span), indexOf(l, d, paramVar(x, d.span))], d.span)
+        }
+        return node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
+            CLam([x, state], absorbed, name)), "<anonymous>"))
+    }
     let alts = Vec.new(len(d.cons))
     for var tag = 0; tag < len(d.cons); tag = tag + 1 {
         let (c, types) = d.cons[tag]
@@ -1010,7 +1020,6 @@ fun derivedHash(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
         Vec.push(alts, CAlt { alt = ACon(c.name, Array.map(xs, Some), None), body = acc })
     }
     let body = node(stateTy, d.span, CMatch(paramVar(x, d.span), alts))
-    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
     node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
         CLam([x, state], body, name)), "<anonymous>"))
 }
@@ -1071,15 +1080,9 @@ fun bound(l : Lowerer, binder : (String, Int), ty : Ty.Type, span : Option Span)
     node(ty, span, CVar(refAt(l, binder.0, binder.1)))
 
 -- The constructor `value` was built with, as its position in the declaration.
-fun tagOf(l : Lowerer, d : DerivedSite, value : Core) -> Core {
-    let alts = Vec.new(len(d.cons))
-    for var i = 0; i < len(d.cons); i = i + 1 {
-        let (c, types) = d.cons[i]
-        Vec.push(alts, CAlt { alt = ACon(c.name, Array.map(types, fun(_) = None), None),
-                              body = node(Ty.tInt(), d.span, CLit(LInt(i))) })
-    }
-    node(Ty.tInt(), d.span, CMatch(value, alts))
-}
+fun indexOf(l : Lowerer, d : DerivedSite, value : Core) -> Core =
+    node(Ty.tInt(), d.span, CApp(
+        node(TFun([d.inst.head], Ty.tInt()), d.span, CPrim(Prims.ConstructorIndex)), [value]))
 
 fun intLess(a : Core, b : Core, span : Option Span) -> Core =
     node(Ty.tBool(), span, CApp(

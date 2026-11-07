@@ -3368,8 +3368,8 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.IntShr -> primBinary(l, p, args, Shr, rep)
     Prims.IntShrUnsigned -> primBinary(l, p, args, ShrU, rep)
     Prims.IntMulHighUnsigned -> primBinary(l, p, args, MulHighU, rep)
-    Prims.IntEq -> primCompare(l, p, args, Eq)
-    Prims.IntLt -> primCompare(l, p, args, Lt)
+    Prims.IntEq -> indexCompare(l, p, args, Eq)
+    Prims.IntLt -> indexCompare(l, p, args, Lt)
     Prims.IntToFloat -> primConvert(l, p, args, IntToFloat, rep)
     Prims.FloatAdd -> primBinary(l, p, args, Add, rep)
     Prims.FloatSub -> primBinary(l, p, args, Sub, rep)
@@ -3390,8 +3390,7 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.Not -> L.emit(l.b, Not(operands(l, p, args, 1)[0]), rep)
     Prims.BoolEq -> primCompare(l, p, args, Eq)
     Prims.BoolLt -> primCompare(l, p, args, Lt)
-    Prims.EnumEq -> enumCompare(l, p, args, Eq)
-    Prims.EnumLt -> enumCompare(l, p, args, Lt)
+    Prims.ConstructorIndex -> constructorIndex(l, e, p, args, rep)
 }
 
 -- A primitive's operands, lowered left to right. The type checker fixed the
@@ -3428,20 +3427,82 @@ fun primCompare(l : Lower, p : Prims.Prim, args : Array Core, o : CmpOp) -> Valu
     L.emit(l.b, Cmp(o, xs[0], xs[1]), Ssa.untraced(I1))
 }
 
--- Two values of an enumeration, compared as the indices they are held as.
--- Any other type is held some other way, which a comparison of the two
--- values would read as though it were an index.
-fun enumCompare(l : Lower, p : Prims.Prim, args : Array Core, o : CmpOp) -> Value {
-    let ty = if len(args) > 0 { args[0].ty } else { Ty.tUnit() }
-    let (h, _) = Ty.spine(Ty.prune(ty))
-    let size = match h {
-        TCon(c) -> Decls.enumSize(l.decls, c.name)
-        _ -> None
-    }
-    if Option.isNone(size) {
-        oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which is not an enumeration")
+-- An `Int` comparison, of two enumeration values' indices compared as the
+-- values themselves, which hold those indices at a narrower width
+-- (`Decls.enumSize`). Comparing at that width is what `Prim.byteLt` does, and
+-- it saves widening each side first.
+fun indexCompare(l : Lower, p : Prims.Prim, args : Array Core, o : CmpOp) -> Value {
+    if len(args) == 2 {
+        match (enumIndexOf(l, args[0]), enumIndexOf(l, args[1])) {
+            -- One of a single constructor is held at no width, and its
+            -- index is the constant `constructorIndex` makes.
+            (Some((a, ta)), Some((b, tb))) -> if ta == tb && repOf(l, a.ty).class_ != Unit {
+                let x = value(l, a)
+                let y = value(l, b)
+                return L.emit(l.b, Cmp(o, x, y), Ssa.untraced(I1))
+            }
+            _ -> {}
+        }
     }
     primCompare(l, p, args, o)
+}
+
+-- The value `e` takes the constructor index of, and its enumeration, when
+-- `e` is `Prim.constructorIndex` of a value of one.
+fun enumIndexOf(l : Lower, e : Core) -> Option (Core, String) {
+    if let CApp(fn, xs) = e.kind {
+        if len(xs) == 1 && isIndexPrim(fn) {
+            if let TCon(c) = Ty.spine(Ty.prune(xs[0].ty)).0 {
+                if Option.isSome(Decls.enumSize(l.decls, c.name)) { return Some((xs[0], c.name)) }
+            }
+        }
+    }
+    None
+}
+
+fun isIndexPrim(fn : Core) -> Bool = match fn.kind {
+    CPrim(Prims.ConstructorIndex) -> True
+    CTyApp(inner, _) -> isIndexPrim(inner)
+    _ -> False
+}
+
+-- The index of the constructor `args[0]` was built with, as an `Int`.
+--
+-- An enumeration's value is that index already (`Decls.enumSize`), held at
+-- a narrower width, so it is widened, and one of a single constructor is
+-- held at no width and is 0. Any other data type holds its constructor
+-- however its layout does, so the index is what a match on it answers, and
+-- the match is lowered as any match is, at whatever layout the value has.
+fun constructorIndex(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
+                     rep : Rep) -> Value {
+    if len(args) != 1 { oops(Prims.name(p) + " applied to " + Int.toString(len(args)) + " arguments") }
+    let ty = args[0].ty
+    let (h, _) = Ty.spine(Ty.prune(ty))
+    let tycon = match h {
+        TCon(c) -> c.name
+        _ -> oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which is not a data type")
+    }
+    let variants = match Map.get(l.decls.tycons, tycon) {
+        Some(info) -> info.variants
+        None -> oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which is not a data type")
+    }
+    if len(variants) == 0 {
+        oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which has no constructors")
+    }
+    if Option.isSome(Decls.enumSize(l.decls, tycon)) {
+        let v = value(l, args[0])
+        if Ssa.repOf(l.func, v).class_ == Unit { return L.emit(l.b, ConstInt(0), rep) }
+        return L.emit(l.b, Convert(Widen, v), rep)
+    }
+    let alts = Vec.new(len(variants))
+    for var i = 0; i < len(variants); i = i + 1 {
+        let c = variants[i]
+        Vec.push(alts, CAlt {
+            alt = ACon(c.name, Array.init(c.arity, fun(_) = None), None),
+            body = Core.mkCore(Ty.tInt(), e.span, CLit(LInt(i))),
+        })
+    }
+    value(l, Core.mkCore(Ty.tInt(), e.span, CMatch(args[0], alts)))
 }
 
 fun primConvert(l : Lower, p : Prims.Prim, args : Array Core, c : Conv, rep : Rep) -> Value =

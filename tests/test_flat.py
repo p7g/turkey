@@ -325,3 +325,121 @@ def test_boxes_arriving_at_a_merge_pass_through_it_boxed():
     # A value built from its slots arrives in them, and the merge takes slots.
     mixed = _function(result.stdout, "mixed")
     assert re.search(r"b\d+\(%\d+:i64, %\d+:i1\):", mixed), mixed
+
+
+# Two fields that each hold a traced slot and a raw one, so the object's
+# traced slots are first only if each field's slots are placed apart: `a.0`,
+# `b.0`, then `a.1`, `b.1`, `c`. `T` is five slots, too many to be flat itself.
+# `Moving` holds the same pairs in `var` fields, and a record with a narrow
+# slot and a sum, which are held boxed.
+INLINE = """
+type T = T { a : (String, Int), b : (String, Int), c : Int }
+type R = R { flag : Bool, n : Int }
+type Moving = Moving {
+    var a : (String, Int),
+    var b : (String, Int),
+    var r : R,
+    e : Either String Int,
+}
+
+fun total(ts : Vec T, ms : Vec Moving) -> Int {
+    var n = 0
+    for t in ts {
+        let T { a = (s, i), b, c } = t
+        n = n + String.byteLength(s) + i + String.byteLength(b.0) + b.1 + c
+    }
+    for m in ms {
+        let (s, i) = m.a
+        n = n + String.byteLength(s) + i + String.byteLength(m.b.0) + m.b.1 + m.r.n
+        n = n + match m.e {
+            Left(s) -> String.byteLength(s)
+            Right(k) -> k
+        }
+    }
+    n
+}
+
+fun main() {
+    let ts : Vec T = []
+    let ms : Vec Moving = []
+    for var i = 0; i < 300; i = i + 1 {
+        let s = Int.toString(i)
+        Vec.push(ts, T { a = (s + "a", i), b = (s + "bb", i * 2), c = 3 })
+        let e = if i % 2 == 0 { Left(s + "e") } else { Right(i) }
+        Vec.push(ms, Moving { a = (s, i), b = (s + "!", 1), r = R { flag = True, n = i }, e = e })
+    }
+    for m in ms {
+        let old = m.a
+        m.a = (m.b.0 + "~", m.b.1 + 1)
+        m.b = old
+        m.r = R { flag = !m.r.flag, n = m.r.n + 1 }
+    }
+    print(total(ts, ms))
+    print(ts[7].a)
+    print(ms[7].b)
+}
+"""
+
+
+def test_fields_of_several_slots_are_held_as_their_slots():
+    plain = lang.output(INLINE)
+    assert plain == "253755\n(7a, 7)\n(7, 7)\n"
+    result = lang.dump("ssa", INLINE)
+    assert result.code == 0, result.stderr
+    main = _function(result.stdout, "main")
+    # `T` is its five slots, two traced. `Moving` is the pairs' four slots and
+    # a pointer each to the record and the sum; the sum's is not assignable.
+    assert re.search(r"object\.new kind=1 tag=\d+ count=5 bytes=48 pointers=2 mutable=0 ", main), main
+    assert re.search(r"object\.new kind=1 tag=\d+ count=6 bytes=56 pointers=4 mutable=31 ", main), main
+    # No pair is boxed to be stored, and the record with a `Bool` is, each time.
+    assert "kind=0 tag=-1 count=2 bytes=24 pointers=1 " not in main, main
+    assert main.count("count=2 bytes=24 pointers=0 ") == 2, main
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(INLINE, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain
+
+
+# The kernel of n-body: each `Vec3` read from a body, combined and stored back
+# moves only slots.
+BODIES = """
+type Vec3 = Vec3 { x : Float, y : Float, z : Float }
+type Body = Body { var pos : Vec3, var vel : Vec3, mass : Float }
+
+instance Add Vec3 {
+    fun add(a, b) = Vec3 { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
+}
+
+fun scale(v : Vec3, k : Float) -> Vec3 = Vec3 { x = v.x * k, y = v.y * k, z = v.z * k }
+
+fun step(bodies : Array Body, dt : Float) -> Unit {
+    for b in bodies {
+        let v = b.vel
+        b.vel = v + scale(b.pos, -dt * b.mass)
+        b.pos = b.pos + scale(v, dt)
+    }
+}
+
+fun main() {
+    let bodies = [
+        Body { pos = Vec3 { x = 1.0, y = 0.0, z = 0.0 }, vel = Vec3 { x = 0.0, y = 1.0, z = 0.0 },
+               mass = 1.0 },
+        Body { pos = Vec3 { x = 0.0, y = 2.0, z = 0.0 }, vel = Vec3 { x = 0.5, y = 0.0, z = 0.0 },
+               mass = 0.25 },
+    ]
+    for var i = 0; i < 100; i = i + 1 { step(bodies, 0.01) }
+    for b in bodies { print(b.pos.x + b.pos.y + b.pos.z + b.vel.x + b.vel.y + b.vel.z) }
+}
+"""
+
+
+def test_a_flat_value_moves_between_fields_without_allocating():
+    plain = lang.output(BODIES)
+    result = lang.dump("ssa", BODIES)
+    assert result.code == 0, result.stderr
+    step = _function(result.stdout, "step")
+    assert "object.new" not in step and "stack.object" not in step, step
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(BODIES, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain

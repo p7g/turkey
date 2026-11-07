@@ -1,6 +1,6 @@
 export (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
-    FieldRef(..), fieldRef,
+    FieldRef(..), fieldRef, mutableMask, assignable,
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
     checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
@@ -179,6 +179,26 @@ type FieldRef = FieldRef { index : Int, offset : Int }
 fun fieldRef(layout : Rt.Layout, index : Int) -> FieldRef =
     FieldRef { index = index, offset = Rt.fieldOffset(layout, index) }
 
+-- Returns the mask `ObjectNew` takes for fields that may be assigned where
+-- `writable` says. Only the first `maskedFields` fields have a bit, and a
+-- reader of the mask takes any later field to be assignable, whether or not
+-- it is: an object whose field values are spliced in from several slots each
+-- can have more fields than an integer has bits.
+fun mutableMask(writable : Array Bool) -> Int {
+    var mask = 0
+    for var i = 0; i < len(writable) && i < maskedFields; i = i + 1 {
+        if writable[i] { mask = mask | 1 << i }
+    }
+    mask
+}
+
+-- Returns whether field `index` of an object built with `mask` may be
+-- assigned after it is built.
+fun assignable(mask : Int, index : Int) -> Bool =
+    index >= maskedFields || mask >> index & 1 != 0
+
+let maskedFields = 62
+
 fun showField(f : FieldRef) -> String =
     Int.toString(f.index) + "@" + Int.toString(f.offset)
 
@@ -201,7 +221,7 @@ type Op
     -- `tag` as the runtime understands them, the layout of its fields
     -- (`Turkey.Runtime.layout` of their representations, which `checkReps`
     -- holds the operands to), the field values, and a mask with a bit set for
-    -- each field that may be written after this.
+    -- each field that may be written after this (`mutableMask`).
     --
     -- The values are operands, so an `ObjectGet` of an immutable field of this
     -- object is the operand, and an object nothing reads is dead code: no

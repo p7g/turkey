@@ -579,6 +579,40 @@ Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.
 
+The equalities a body needs rewrite each other as they are found, as a
+context's do. Two that cannot hold together are an error where the second
+arises, rather than an inferred context that no caller could satisfy:
+
+<!-- error: expected 'Char', found 'Int' in the annotation on 'i' -->
+```kotlin
+class Glue a {
+    type G a
+    fun glue(a) -> G a
+}
+
+class Fold a {
+    type F a
+    fun fold(a) -> F a
+}
+
+instance Fold Bool {
+    type F = Char
+    fun fold(b) = 'c'
+}
+
+fun weird(x) {
+    let g = glue(x)
+    let b : Bool = g
+    let i : Int = fold(g)
+    i
+}
+
+fun main() { }
+```
+
+`b`'s annotation makes `G a` be `Bool`, so `fold(g)` is an `F Bool`, which is
+a `Char`.
+
 ### Equality superclasses
 
 An equality among a class's superclasses restricts the class to the

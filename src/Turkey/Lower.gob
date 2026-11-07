@@ -64,6 +64,7 @@ import Turkey.Core as Cr
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Inert as Inert
 import Turkey.Match as Match
 import Turkey.Prelude as P
 import Turkey.Prims as Prims
@@ -79,6 +80,9 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
 
 -- -- naming -------------------------------------------------------------------------
 
+-- An instance's dictionary, whose methods are named after it with `#`. A
+-- method's display form (`Turkey.Demangle`) is `Class(Type).method`, and a
+-- default's `Class.<default>.method`.
 fun instName(inst : InstInfo) -> String =
     "%inst." + inst.cls + "." + Classes.instCon(inst)
 
@@ -118,6 +122,9 @@ type Scope = Scope {
     -- type arguments -- correctly, there is nothing yet to record. System F
     -- still wants the application, at the binding's own variables.
     binders  : Map Int (Vec VarCell),
+    -- The equalities each local function in scope takes coercions for, at its
+    -- own variables, for the same recursive occurrences.
+    equalities : Map Int (Vec (Ty.Type, Ty.Type)),
     -- Where a `return`, a `break` and a `continue` written here jump to. Each is
     -- a join, or absent where writing that transfer would have been a compile
     -- error anyway. This is what replaces "the transfer names its target by
@@ -128,14 +135,14 @@ type Scope = Scope {
 }
 
 fun newScope() -> Scope = Scope {
-    parent = None, cells = Map.new(), binders = Map.new(),
+    parent = None, cells = Map.new(), binders = Map.new(), equalities = Map.new(),
     ret = None, brk = None, cont = None,
 }
 
 -- Returns a scope nested in `s`, with the same transfer targets. Takes
 -- constant time.
 fun childScope(s : Scope) -> Scope = Scope {
-    parent = Some(s), cells = Map.new(), binders = Map.new(),
+    parent = Some(s), cells = Map.new(), binders = Map.new(), equalities = Map.new(),
     ret = s.ret, brk = s.brk, cont = s.cont,
 }
 
@@ -157,6 +164,18 @@ fun localBinders(s : Scope, id : Int) -> Option (Vec VarCell) =
         Some(binders) -> Some(binders)
         None -> match s.parent {
             Some(outer) -> localBinders(outer, id)
+            None -> None
+        }
+    }
+
+-- Returns the equalities the local function `id` takes coercions for, or
+-- `None` if it is not a local function in scope. Takes time proportional to
+-- the depth of `s`.
+fun localEqualities(s : Scope, id : Int) -> Option (Vec (Ty.Type, Ty.Type)) =
+    match Map.get(s.equalities, id) {
+        Some(found) -> Some(found)
+        None -> match s.parent {
+            Some(outer) -> localEqualities(outer, id)
             None -> None
         }
     }
@@ -418,7 +437,7 @@ fun refAt(l : Lowerer, name : String, id : Int) -> Ref {
 }
 
 -- A mention of the parameter `p`.
-fun paramVar(p : CParam, where : Option Span) -> Core = node(p.ty, where, CVar(refTo(p.name, p.id)))
+fun paramVar(p : CParam, where : Option Span) -> Core = forwarded(p, where)
 
 -- A `match`, with its patterns compiled into ones that do not nest; see
 -- `Turkey.Match`.
@@ -499,8 +518,7 @@ fun program(l : Lowerer, ordered : Vec Stmt) -> CProgram {
 fun newBind(module_ : String, name : String, id : Int, ty : Ty.Type,
             binders : Vec VarCell, value : Core, where : Option Span) -> CBind = CBind {
     name = name, id = id, ty = ty, binders = binders, value = value, span = where,
-    mutable = False, module_ = module_, equations = [],
-    layouts = Map.new(),
+    mutable = False, module_ = module_, layouts = Map.new(),
 }
 
 -- One top-level statement. Only bindings occur here.
@@ -530,27 +548,32 @@ fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
         None -> funType(l, decl)
     }
     let dicts = abstractionOf(l, decl.id)
+    let equalities = equalitiesOf(s)
     let id = binderOf(l, decl.id, decl.name, Some(decl.span))
-    let b = newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
-                    abstracted(l, ty, dicts), binders,
-                    function(l, decl, ty, scope, None, None), Some(decl.span))
-    b.equations = equationsOf(s)
-    b
+    newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
+            abstracted(l, ty, dicts, equalities), binders,
+            function(l, decl, ty, scope, None, None, equalities), Some(decl.span))
 }
 
--- A binding's type as Core sees it: dictionaries first.
+-- A binding's type as Core sees it: evidence first.
 --
 -- The scheme says `[Show a] fun(a) -> Unit`, with the context to one side of the
 -- type. In Core there is no "to one side" -- a dictionary is an argument, so it
--- is in the type. Every use site is already built to match: a type application,
--- and then an application to the dictionaries.
-fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction) -> Ty.Type =
+-- is in the type, and so is a coercion for each equality. Every use site is
+-- already built to match: a type application, and then an application to the
+-- dictionaries and the coercions.
+fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction,
+               equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type {
+    let evidence = Vec.new(4)
     match dicts {
-        None -> ty
-        Some(a) -> if len(a.params) == 0 { ty } else {
-            TFun(Array.map(a.preds, predType(l, _)), ty)
+        None -> {}
+        Some(a) -> if len(a.params) > 0 {
+            for p in a.preds { Vec.push(evidence, predType(l, p)) }
         }
     }
+    for (left, right) in equalities { Vec.push(evidence, coercionOf(left, right)) }
+    if len(evidence) == 0 { ty } else { TFun(Vec.toArray(evidence), ty) }
+}
 
 -- A top-level `let` or `var`, possibly binding several names.
 --
@@ -568,14 +591,14 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
                 Some(sc) -> sc.quantified
                 None -> []
             }
-            var body = abstract(l, abstractionOf(l, stmt.id), fun() = expr(l, value, scope))
+            var body = abstract(l, abstractionOf(l, stmt.id), equalitiesOf(s),
+                                fun() = expr(l, value, scope))
             if mutable {
                 Map.put(scope.cells, id, (name, id))
                 body = node(refOf(body.ty), Some(stmt.span), CRef(body))
             }
             let b = newBind(owner, name, id, body.ty, binders, body, Some(stmt.span))
             b.mutable = mutable
-            b.equations = equationsOf(s)
             return [b]
         }
         _ -> {}
@@ -645,7 +668,8 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                              Some(inst.decl.span))
             }
             MethodSlot(name) -> match Map.get(plan.methods, name) {
-                Some(impl) -> methodBody(l, inst, name, impl, plan.params)
+                Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
+                              else { methodBody(l, inst, name, impl, plan.params) }
                 None -> oops("no body for the method '" + name + "'",
                              Some(inst.decl.span))
             }
@@ -653,30 +677,46 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                                     Some(inst.decl.span))
         }))
     let value = overContext(l, inst, bound, record, result)
-    let b = newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
-                    value, Some(inst.decl.span))
-    -- A method's own equalities, at this head. A binding is where Core keeps the
-    -- equalities a body was checked under, and a method body is a field of this
-    -- one; `Elem s ~ Part (Option a)` names the method's own `s`, so it cannot
-    -- fire in a sibling.
-    let info = classNamed(l, inst.cls)
-    for (name, impl) in Map.entries(plan.methods) {
-        if !isDefaultOf(info, name, impl) {
-            match Map.get(info.methods, name) {
-                Some(mi) -> {
-                    let mapping = Map.new()
-                    Map.put(mapping, mi.classVar.id, inst.head)
-                    for (a, rt) in equationsOf(Some(mi.scheme)) {
-                        Vec.push(b.equations, (Decls.substitute(a, mapping),
-                                                 Decls.substitute(rt, mapping)))
-                    }
-                }
-                None -> {}
-            }
-        }
-    }
-    b
+    newBind(inst.module_, instName(inst), noId, value.ty, instanceBinders(inst),
+            value, Some(inst.decl.span))
 }
+
+-- Returns whether the method `name`'s own equalities can never hold together
+-- at the instance's head, tested jointly as the solver tests the givens its
+-- override is checked under. Such a method can never be called at that head,
+-- since every call has to supply the evidence for its equalities. Its body may
+-- also be ill-typed there, since it was checked under equalities that are
+-- false, so it is not lowered at all.
+fun refutedAt(l : Lowerer, inst : InstInfo, name : String) -> Bool =
+    Inert.refutes(l.classes, methodEqualitiesAt(methodOf(l, inst.cls, name, Some(inst.decl.span)),
+                                                inst.head))
+
+-- The method `name` as a slot of the instance's dictionary that can never be
+-- called: a function of its evidence that panics.
+fun unreachable(l : Lowerer, inst : InstInfo, name : String) -> Core {
+    let mi = methodOf(l, inst.cls, name, Some(inst.decl.span))
+    let span = Some(inst.decl.span)
+    let lam = match methodType(l, mi, inst.head) {
+        TFun(evidence, rest) -> {
+            let params = Array.map(evidence, fun(t) = CParam { name = "%e", id = mint(l, "%e"), ty = t })
+            let message = "the method '" + Classes.surfaceMember(name) + "' cannot be called at "
+                          + Ty.show(inst.head)
+            let failed = node(rest, span, CApp(
+                node(TFun([Ty.tString()], rest), span, CTyApp(
+                    node(unknown(), span, CVar(BySpelling(P.error))), [rest])),
+                [node(Ty.tString(), span, CLit(LString(message)))]))
+            node(TFun(evidence, rest), span, CLam(params, failed, instName(inst) + "." + name))
+        }
+        _ -> oops("a method with equalities takes no evidence", span)
+    }
+    methodAbstraction(mi, lam, span)
+}
+
+fun methodOf(l : Lowerer, cls : String, name : String, where : Option Span) -> MethodInfo =
+    match Map.get(classNamed(l, cls).methods, name) {
+        Some(m) -> m
+        None -> oops("unknown method '" + name + "'", where)
+    }
 
 -- The dictionary of a generated field or projection class.
 --
@@ -855,17 +895,28 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
 
 -- A method's type as it sits in a dictionary, at one head.
 --
--- A method with its own context takes those dictionaries per *call* rather than
--- per instance, so they are parameters of the field, not of the dictionary that
--- holds it.
+-- A method with its own context takes those dictionaries and coercions per
+-- *call* rather than per instance, so they are parameters of the field, not of
+-- the dictionary that holds it.
 fun methodType(l : Lowerer, info : MethodInfo, head : Ty.Type) -> Ty.Type {
     let mapping = Map.new()
     Map.put(mapping, info.classVar.id, head)
     let ty = Decls.substitute(info.scheme.body, mapping)
-    let own = Classes.methodDicts(info)
+    let own = Classes.methodEvidence(info)
     if len(own) == 0 { return ty }
-    TFun(Array.map(own, fun(p) =
-        dictType(l, p.name, Decls.substitute(p.args[0], mapping))), ty)
+    TFun(Array.map(own, fun(p) = if p.name == Ty.equals {
+        coercionOf(Decls.substitute(p.args[0], mapping), Decls.substitute(p.args[1], mapping))
+    } else {
+        dictType(l, p.name, Decls.substitute(p.args[0], mapping))
+    }), ty)
+}
+
+-- The method's own equalities, with the class variable at `head`.
+fun methodEqualitiesAt(info : MethodInfo, head : Ty.Type) -> Vec (Ty.Type, Ty.Type) {
+    let mapping = Map.new()
+    Map.put(mapping, info.classVar.id, head)
+    Vec.map(Classes.methodEqualities(info), fun(p) =
+        (Decls.substitute(p.args[0], mapping), Decls.substitute(p.args[1], mapping)))
 }
 
 -- A class's default method, lowered once, for every instance to share.
@@ -893,17 +944,15 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
     let self = mint(l, impl.selfName)
     var body = withDicts(l, [(impl.selfName, self)], fun() =
         function(l, impl.decl, mi.scheme.body, newScope(), Some(impl.dictParams),
-                 Some(Classes.methodDicts(mi))))
+                 Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, TVar(cvar))))
     l.rigid = saved
     leave(l, owned)
     body = methodAbstraction(mi, body, Some(impl.decl.span))
     let lam = node(TFun([selfTy], body.ty), Some(impl.decl.span),
         CLam([CParam { name = impl.selfName, id = self, ty = selfTy }], body,
              defaultName(cls, name)))
-    let b = newBind(info.module_, defaultName(cls, name), noId, lam.ty, [cvar], lam,
-                    Some(impl.decl.span))
-    b.equations = equationsOf(Some(mi.scheme))
-    b
+    newBind(info.module_, defaultName(cls, name), noId, lam.ty, [cvar], lam,
+            Some(impl.decl.span))
 }
 
 -- One method body, as a lambda inside its dictionary.
@@ -944,7 +993,7 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let self = if impl.selfName != "" { [(impl.selfName, mint(l, impl.selfName))] } else { [] }
     var body = withDicts(l, self, fun() =
         function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
-                 Some(Classes.methodDicts(mi))))
+                 Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, head)))
     l.rigid = saved
     leave(l, owned)
     for (selfName, selfId) in self {
@@ -1141,16 +1190,28 @@ fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
     }
 }
 
+--
+-- Through a layer of coercions alone, it goes on to the function that layer
+-- answers, as `bindSelf` places a method's own dictionary: a slot that is a
+-- lambda over the method's own parameters is one that specialization and the
+-- optimizer see a call through, where one that answers a function leaves a
+-- closure called at each call.
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
             let ps = Array.map(params, freshParam(l, "eta", _))
             let args = Array.map(ps, paramVar(_, where))
-            node(TFun(params, ret), where,
-                 CLam(ps, node(ret, where, CApp(called, args)), "<anonymous>"))
+            let applied = node(ret, where, CApp(called, args))
+            let body = if onlyCoercions(ps) { eta(l, applied, ret, where) } else { applied }
+            node(TFun(params, ret), where, CLam(ps, body, "<anonymous>"))
         }
         _ -> called
     }
+
+-- Returns whether `ps` are parameters only of coercions, which a lambda over
+-- them is erased with.
+fun onlyCoercions(ps : Array CParam) -> Bool =
+    len(ps) > 0 && Iterator.all(ps, fun(p) = isCoercion(p.ty))
 
 -- Bind the instance's own dictionary *inside* the method's lambda.
 --
@@ -1161,6 +1222,16 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- method is *called*, by which time the dictionary exists.
 fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
              body : Core, where : Option Span) -> Core {
+    -- Under the method's own parameters, not under a lambda over coercions
+    -- alone. Erasure would eta-expand that lambda through the method's, which
+    -- would build a closure, besides the dictionary, at every call.
+    match body.kind {
+        CLam(ps, inner, lamName) -> if onlyCoercions(ps) {
+            return node(body.ty, body.span, CLam(ps,
+                bindSelf(l, inst, params, name, id, inner, where), lamName))
+        }
+        _ -> {}
+    }
     let own = selfDict(l, inst, params)
     match body.kind {
         CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,
@@ -1329,10 +1400,11 @@ fun funType(l : Lowerer, decl : FunDecl) -> Ty.Type = match decl.body {
                  Some(decl.span))
 }
 
--- A `fun` declaration, as a lambda -- possibly under dictionary ones.
+-- A `fun` declaration, as a lambda -- possibly under one over its
+-- dictionaries and the coercions for `equalities`.
 fun function(l : Lowerer, decl : FunDecl, ty : Ty.Type, scope : Scope,
-             dictParams : Option (Vec String),
-             preds : Option (Vec Pred)) -> Core {
+             dictParams : Option (Vec String), preds : Option (Vec Pred),
+             equalities : Vec (Ty.Type, Ty.Type)) -> Core {
     let body = match decl.body {
         Some(b) -> b
         None -> oops("a function with no body reached the lowering",
@@ -1355,7 +1427,7 @@ fun function(l : Lowerer, decl : FunDecl, ty : Ty.Type, scope : Scope,
         l.rigid = saved
         made
     })
-    wrapDicts(l, inner, bound, Option.unwrapOr(ps, []), Some(decl.span))
+    wrapDicts(l, inner, bound, Option.unwrapOr(ps, []), equalities, Some(decl.span))
 }
 
 -- The constant-to-variable map for a signature-checked body.
@@ -1393,30 +1465,35 @@ fun signatureSkolems(l : Lowerer, dicts : Option Abstraction,
 fun dictBinders(l : Lowerer, names : Vec String, preds : Vec Pred) -> Array (String, Int) =
     mintDicts(l, Array.init(fewer(len(names), len(preds)), fun(i) = names[i]))
 
--- `inner` under a lambda over the dictionaries `bound`, at `preds`, or `inner`
--- itself when there are none.
+-- `inner` under a lambda over the dictionaries `bound`, at `preds`, and then a
+-- coercion for each of `equalities`, or `inner` itself when there are none.
+-- Nothing refers to a coercion parameter: what it grants is in scope for the
+-- lambda's body.
 fun wrapDicts(l : Lowerer, inner : Core, bound : Array (String, Int), preds : Vec Pred,
-              where : Option Span) -> Core {
-    if len(bound) == 0 { return inner }
-    let cparams = Array.init(len(bound), fun(i) {
+              equalities : Vec (Ty.Type, Ty.Type), where : Option Span) -> Core {
+    if len(bound) == 0 && len(equalities) == 0 { return inner }
+    let dicts = Array.init(len(bound), fun(i) {
         let (name, id) = bound[i]
         CParam { name = name, id = id, ty = dictType(l, preds[i].name, preds[i].args[0]) }
     })
+    let coercions = Array.map(Vec.toArray(equalities), fun((left, right)) =
+        CParam { name = "%co", id = mint(l, "%co"), ty = coercionOf(left, right) })
+    let cparams = Array.append(dicts, coercions)
     node(TFun(Array.map(cparams, _.ty), inner.ty), where,
          CLam(cparams, inner, "<anonymous>"))
 }
 
 -- Returns `lower()` under a lambda over the dictionaries `dicts` takes, which
--- are in scope while it runs.
-fun abstract(l : Lowerer, dicts : Option Abstraction, lower : fun() -> Core) -> Core =
-    match dicts {
-        None -> lower()
-        Some(a) -> {
-            let bound = dictBinders(l, a.params, a.preds)
-            let value = withDicts(l, bound, lower)
-            wrapDicts(l, value, bound, a.preds, value.span)
-        }
+-- are in scope while it runs, and the coercions for `equalities`.
+fun abstract(l : Lowerer, dicts : Option Abstraction, equalities : Vec (Ty.Type, Ty.Type),
+             lower : fun() -> Core) -> Core {
+    let (bound, preds) = match dicts {
+        None -> ([], [])
+        Some(a) -> (dictBinders(l, a.params, a.preds), a.preds)
     }
+    let value = withDicts(l, bound, lower)
+    wrapDicts(l, value, bound, preds, equalities, value.span)
+}
 
 -- Parameters come from the function's *type*, not from the patterns.
 --
@@ -1757,10 +1834,14 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         let binders = bindersOf(l, id, name, scope)
         if len(binders) > 0 {
             -- A recursive occurrence: monomorphic to inference, still a type
-            -- application here, at the binding's own variables.
-            return node(result, where, CTyApp(
-                node(unknown(), where, CVar(refAt(l, name, id))),
-                Array.map(binders, TVar)))
+            -- application here, at the binding's own variables, and applied to
+            -- the coercions it takes at them.
+            let applied = CTyApp(node(unknown(), where, CVar(refAt(l, name, id))),
+                                 Array.map(binders, TVar))
+            let own = ownCoercions(l, id, name, scope, where)
+            if len(own) == 0 { return node(result, where, applied) }
+            return node(result, where, CApp(
+                node(TFun(Array.map(own, _.ty), result), where, applied), own))
         }
         return match Prims.parse(name) {
             Some(Prims.Fixed(c)) -> node(result, where, CCon(chosen(l, c, where)))
@@ -1776,6 +1857,8 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
     let count = fewer(len(use.evidence), len(use.preds))
     var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i], predType(l, use.preds[i]),
                                                     givens))
+    var coercions = Array.map(Vec.toArray(use.equalities), fun(p) =
+        coercion(resolved(l, p.args[0]), resolved(l, p.args[1]), where))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
     -- one is monomorphic and took the path above.
@@ -1803,10 +1886,13 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- monomorphically while its own bodies are checked, so nothing was
             -- recorded, and the application is at the group's own variables. It
             -- does carry dictionaries -- the solver patched those in -- which is
-            -- why the test cannot be "no evidence either".
+            -- why the test cannot be "no evidence either". Its coercions are
+            -- the group's own too, at its own variables.
             typeArgs = Array.map(bindersOf(l, id, name, scope), TVar)
+            coercions = ownCoercions(l, id, name, scope, where)
         }
     }
+    dicts = Array.append(dicts, coercions)
     let afterTypes = if len(dicts) > 0 {
         TFun(Array.map(dicts, _.ty), result)
     } else { result }
@@ -1817,6 +1903,19 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         base.ty = afterTypes
     }
     if len(dicts) > 0 { node(result, where, CApp(base, dicts)) } else { base }
+}
+
+-- The coercions an occurrence of the binder `id`, spelled `name`, inside its
+-- own definition passes: one for each equality the binding takes, at its own
+-- variables. Inference bound the name monomorphically there, so the
+-- occurrence demanded none.
+fun ownCoercions(l : Lowerer, id : Int, name : String, scope : Scope,
+                 where : Option Span) -> Array Core {
+    let equalities = match localEqualities(scope, id) {
+        Some(found) -> found
+        None -> equalitiesOf(schemeOf(l, name))
+    }
+    Array.map(Vec.toArray(equalities), fun((left, right)) = coercion(left, right, where))
 }
 
 -- A method's type arguments, less the one its dictionary already fixed. They are
@@ -2560,7 +2659,9 @@ fun localFuns(l : Lowerer, group : Vec Stmt, scope : Scope,
         _ -> oops("a statement among a group of functions", where)
     })
     for d in decls {
-        Map.put(scope.binders, binderOf(l, d.id, d.name, Some(d.span)), funBinders(l, d))
+        let id = binderOf(l, d.id, d.name, Some(d.span))
+        Map.put(scope.binders, id, funBinders(l, d))
+        Map.put(scope.equalities, id, resolvedEqualities(l, localScheme(l, d)))
     }
     Vec.map(decls, localFun(l, _, scope))
 }
@@ -2587,12 +2688,11 @@ fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
         None -> (rigidly(l, declType(l, decl)), [])
     }
     let dicts = abstractionOf(l, decl.id)
+    let equalities = resolvedEqualities(l, s)
     let id = binderOf(l, decl.id, decl.name, Some(decl.span))
-    let b = newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
-                    abstracted(l, fnTy, dicts), binders,
-                    function(l, decl, fnTy, scope, None, None), Some(decl.span))
-    b.equations = equationsOf(s)
-    b
+    newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
+            abstracted(l, fnTy, dicts, equalities), binders,
+            function(l, decl, fnTy, scope, None, None, equalities), Some(decl.span))
 }
 
 fun localScheme(l : Lowerer, decl : FunDecl) -> Option Scheme =
@@ -2642,7 +2742,8 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
 fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
                 mutable : Bool, rest : fun() -> Core, scope : Scope) -> Core {
     let at = Some(stmt.span)
-    let value = abstract(l, abstractionOf(l, stmt.id), fun() = expr(l, source, scope))
+    let value = abstract(l, abstractionOf(l, stmt.id), resolvedEqualities(l, letScheme(l, stmt, pat)),
+                         fun() = expr(l, source, scope))
     let bare = unannot(pat)
     let binders = letBinders(l, stmt, pat)
     match bare.kind {
@@ -2733,19 +2834,19 @@ fun cellAround(bound : (String, Int, Ty.Type), cell : Int, body : Core,
 }
 
 -- What a local `let` generalized over, if it generalized.
-fun letBinders(l : Lowerer, stmt : Stmt, pat : Pat) -> Vec VarCell {
-    let bare = unannot(pat)
-    let name = match bare.kind {
+fun letBinders(l : Lowerer, stmt : Stmt, pat : Pat) -> Vec VarCell = match letScheme(l, stmt, pat) {
+    Some(s) -> s.quantified
+    None -> []
+}
+
+-- The scheme a local `let` of one name generalized to, or `None`.
+fun letScheme(l : Lowerer, stmt : Stmt, pat : Pat) -> Option Scheme {
+    let name = match unannot(pat).kind {
         PVar(n) -> n
-        _ -> return []
+        _ -> return None
     }
-    match abstractionOf(l, stmt.id) {
-        None -> []
-        Some(a) -> match Map.get(a.schemes, name) {
-            Some(s) -> s.quantified
-            None -> []
-        }
-    }
+    let a = abstractionOf(l, stmt.id)?
+    Map.get(a.schemes, name)
 }
 
 -- A statement in a position that wants an expression: a C-style `for`'s init and
@@ -2818,10 +2919,9 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
 
 -- -- looking things up --------------------------------------------------------------
 
--- The equalities a scheme's context states, as rewrite rules. The shape is
--- already guaranteed: a family application on the left, not mentioning itself on
--- the right, so the pair can be used as a rule exactly as reduction uses it.
-fun equationsOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
+-- The equalities a scheme's context states, in order: the coercions a binding
+-- of it takes.
+fun equalitiesOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
     None -> []
     Some(sc) -> {
         let out = Vec.new(2)
@@ -2833,6 +2933,11 @@ fun equationsOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
         out
     }
 }
+
+-- The equalities of a local binding's scheme, read as the binding's own type
+-- is: from the solver's records, in terms of variables rather than skolems.
+fun resolvedEqualities(l : Lowerer, s : Option Scheme) -> Vec (Ty.Type, Ty.Type) =
+    Vec.map(equalitiesOf(s), fun((left, right)) = (resolved(l, left), resolved(l, right)))
 
 -- What the binder `id`, spelled `name`, abstracts over, local bindings
 -- before top-level ones.

@@ -33,6 +33,7 @@ section, byte for byte.
 from __future__ import annotations
 
 import functools
+import importlib.util
 import os
 import re
 import shutil
@@ -173,6 +174,14 @@ SECOND_STOP = 18
 pytestmark = pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 
 
+def _demangle():
+    """`scripts/demangle.py`, the filter, as a module."""
+    spec = importlib.util.spec_from_file_location("demangle", REPO_ROOT / "scripts" / "demangle.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _darwin() -> bool:
     return toolchain.target() == "arm64-darwin"
 
@@ -266,8 +275,8 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level)
                           capture_output=True, text=True, check=True).stdout
     assert "DW_TAG_compile_unit" in text
     assert '("prog.gob")' in text
-    assert '("Main#fact")' in text
-    assert '("Main#main")' in text
+    assert '("Main.fact")' in text
+    assert '("Main.main")' in text
 
 
 @pytest.mark.parametrize("how", PATHS)
@@ -301,7 +310,7 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
     tool = _needs_dwarfdump()
     entries = _entries(tool, _built(how, RECTANGLES) / "prog.o")
     main = next(k for k, (_, tag, attributes) in enumerate(entries)
-                if tag == "DW_TAG_subprogram" and '("Main#main")' in attributes)
+                if tag == "DW_TAG_subprogram" and '("Main.main")' in attributes)
     depth = entries[main][0]
     inside = []
     for entry in entries[main + 1:]:
@@ -309,10 +318,10 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
             break
         inside.append(entry)
     area = [attributes for _, tag, attributes in inside
-            if tag == "DW_TAG_inlined_subroutine" and '"Main#area@Rectangle")' in attributes]
+            if tag == "DW_TAG_inlined_subroutine" and '"Main.area[Rectangle]")' in attributes]
     assert area, "\n".join(a for _, _, a in inside)[-4000:]
     assert any(re.search(r"DW_AT_call_line\s+\(18\)", a) for a in area), area
-    assert any(tag == "DW_TAG_subprogram" and '("Main#area@Rectangle")' in attributes
+    assert any(tag == "DW_TAG_subprogram" and '("Main.area[Rectangle]")' in attributes
                and "DW_INL_inlined" in attributes for _, tag, attributes in entries)
 
 
@@ -504,28 +513,69 @@ def test_lldb_stops_at_a_line_and_names_the_frames(how):
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"])
     # With `-g`, a frame shows its function's parameters, and `fact`'s `n` is
     # in its register at the line.
-    assert re.search(r"frame #0: .*`Main#fact\(n=10\) at prog\.gob:2", out), out[-4000:]
-    assert re.search(r"frame #1: .*`Main#main at prog\.gob:9", out), out[-4000:]
+    assert re.search(r"frame #0: .*`Main\.fact\(n=10\) at prog\.gob:2", out), out[-4000:]
+    assert re.search(r"frame #1: .*`Main\.main at prog\.gob:9", out), out[-4000:]
 
 
 @pytest.mark.parametrize("how", PATHS)
 def test_lldb_stops_in_an_inlined_function_and_shows_its_frame(how):
     lldb = _lldb()
-    out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --name Main#area@Rectangle",
+    out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --name Main.area[Rectangle]",
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"], RECTANGLES)
-    assert re.search(r"frame #\d+: .*`Main#area@Rectangle at prog\.gob:11:\d+ \[inlined\]",
+    assert re.search(r"frame #\d+: .*`Main\.area\[Rectangle\] at prog\.gob:11:\d+ \[inlined\]",
                      out), out[-4000:]
-    assert re.search(r"frame #\d+: .*`Main#main at prog\.gob:18:\d+$", out,
+    assert re.search(r"frame #\d+: .*`Main\.main at prog\.gob:18:\d+$", out,
                      re.MULTILINE), out[-4000:]
 
 
 @pytest.mark.parametrize("how", PATHS)
 def test_gdb_stops_in_an_inlined_function_and_shows_its_frame(how):
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break 'Main#area@Rectangle'",
+    out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break 'Main.area[Rectangle]'",
                           "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"], RECTANGLES)
-    assert re.search(r"#\d+ .*Main#area@Rectangle.* at prog\.gob:11", out), out[-4000:]
-    assert re.search(r"#\d+ .*Main#main.* at prog\.gob:18", out), out[-4000:]
+    assert re.search(r"#\d+ .*Main\.area\[Rectangle\].* at prog\.gob:11", out), out[-4000:]
+    assert re.search(r"#\d+ .*Main\.main.* at prog\.gob:18", out), out[-4000:]
+
+
+# The breakpoints the README gives, each with what it finds in RECTANGLES:
+# both copies of `area` by its display form, and by a regular expression in
+# lldb; the out-of-line copy alone by its symbol, and by `rbreak` in gdb; and
+# an instance's method, which has parentheses in its display form.
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_takes_each_kind_of_breakpoint(how):
+    lldb = _lldb()
+    out = _debugged(how, [lldb, "--batch",
+                          "-o", "breakpoint set --name Main.area[Rectangle]",
+                          "-o", "breakpoint set --func-regex '^Main\\.area\\['",
+                          "-o", "breakpoint set --name Main#area@Rectangle",
+                          "-o", "breakpoint set --name 'HasField.width(Rectangle).get'",
+                          "./prog"], RECTANGLES)
+    assert re.search(r"^Breakpoint 1: 2 locations\.$", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^Breakpoint 2: 2 locations\.$", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^Breakpoint 3: where = prog`Main\.area\[Rectangle\]", out,
+                     re.MULTILINE), out[-4000:]
+    assert re.search(r"^Breakpoint 4: where = prog`HasField\.width\(Rectangle\)\.get", out,
+                     re.MULTILINE), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_takes_each_kind_of_breakpoint(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-ex", "break 'Main.area[Rectangle]'",
+                          "-ex", "rbreak ^Main\\.area\\[",
+                          "-ex", "break 'Main#area@Rectangle'",
+                          "-ex", "break 'HasField.width(Rectangle).get'",
+                          "-ex", "info breakpoints", "./prog"], RECTANGLES)
+    assert re.search(r"^Breakpoint 1 at .*\(2 locations\)$", out, re.MULTILINE), out[-4000:]
+    # `rbreak` sets a breakpoint for each function it matches, and that
+    # breakpoint finds the out-of-line copy alone, as one by symbol does.
+    assert re.search(r"^Breakpoint 2 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
+                     re.MULTILINE), out[-4000:]
+    assert re.search(r"^static void Main\.area\[Rectangle\]\([^;]*\);$", out, re.MULTILINE), out[-4000:]
+    assert re.search(r"^Breakpoint 3 at 0x[0-9a-f]+: file prog\.gob, line 11\.$", out,
+                     re.MULTILINE), out[-4000:]
+    assert re.search(r"^Breakpoint 4 at 0x[0-9a-f]+", out, re.MULTILINE), out[-4000:]
 
 
 @pytest.mark.parametrize("how", PATHS)
@@ -547,7 +597,7 @@ def test_atos_names_the_inlined_frames(how):
     for entry in entries:
         depth, tag, attributes = entry
         around = [e for e in around if e[0] < depth]
-        if tag == "DW_TAG_inlined_subroutine" and '"Main#step")' in attributes:
+        if tag == "DW_TAG_inlined_subroutine" and '"Main.step")' in attributes:
             step = attributes
             break
         if tag in ("DW_TAG_subprogram", "DW_TAG_inlined_subroutine"):
@@ -560,8 +610,10 @@ def test_atos_names_the_inlined_frames(how):
     start = int(re.search(r"(?:DW_AT_low_pc\s+\(|\[)(0x[0-9a-f]+)", step).group(1), 16)
     symbols = subprocess.run(["nm", str(directory / "prog")], capture_output=True, text=True,
                              check=True).stdout
-    linked = int(re.search(r"^([0-9a-f]+) T _" + re.escape(function) + "$", symbols,
-                           re.MULTILINE).group(1), 16)
+    display_name = _demangle().display_name
+    linked, symbol = next((int(address, 16), symbol) for address, symbol
+                          in re.findall(r"^([0-9a-f]+) T _(.+)$", symbols, re.MULTILINE)
+                          if display_name(symbol) == function)
     result = subprocess.run(["atos", "-i", "-o", "prog", "-l", "0x100000000",
                              hex(linked + start - low)],
                             cwd=directory, capture_output=True, text=True)
@@ -569,9 +621,11 @@ def test_atos_names_the_inlined_frames(how):
     # A call inlined into `step` may start where it starts, and be named first.
     frames = re.findall(r"^(\S+) \(in prog\) \((\S+):(\d+)\)$", out, re.MULTILINE)
     names = [name for name, _, _ in frames]
-    assert "Main#step" in names, out
-    k = names.index("Main#step")
-    assert names[k:] == ["Main#step", *callers, function], out
+    # The inlined calls by their display forms, from the DWARF, and the
+    # function by its symbol, from the symbol table.
+    assert "Main.step" in names, out
+    k = names.index("Main.step")
+    assert names[k:] == ["Main.step", *callers, symbol], out
     assert frames[k][1:] == ("prog.gob", "1"), out
 
 
@@ -580,8 +634,71 @@ def test_gdb_stops_at_a_line_and_names_the_frames(how):
     gdb = _gdb()
     out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break prog.gob:2", "-ex", "run",
                           "-ex", "bt", "-ex", "kill", "./prog"])
-    assert re.search(r"#0 .*Main#fact.* at prog\.gob:2", out), out[-4000:]
-    assert re.search(r"#1 .*Main#main.* at prog\.gob:9", out), out[-4000:]
+    assert re.search(r"#0 .*Main\.fact.* at prog\.gob:2", out), out[-4000:]
+    assert re.search(r"#1 .*Main\.main.* at prog\.gob:9", out), out[-4000:]
+
+
+# -- display names --------------------------------------------------------------
+
+def _named_functions(tool: str, obj: Path) -> list[tuple[str, str]]:
+    """Each function of `obj` that has a symbol, as its symbol without a
+    Mach-O symbol's leading `_` and the name its subprogram gives it, paired
+    by address."""
+    symbols = {}
+    listed = subprocess.run(["nm", str(obj)], capture_output=True, text=True, check=True).stdout
+    for address, symbol in re.findall(r"^([0-9a-f]+) [Tt] (.+)$", listed, re.MULTILINE):
+        symbols.setdefault(int(address, 16), symbol[1:] if _darwin() else symbol)
+    pairs = []
+    for _, tag, attributes in _entries(tool, obj):
+        low = re.search(r"DW_AT_low_pc\s+\((0x[0-9a-f]+)\)", attributes)
+        name = re.search(r'DW_AT_name\s+\("([^"]*)"\)', attributes)
+        if tag == "DW_TAG_subprogram" and low and name and int(low.group(1), 16) in symbols:
+            pairs.append((symbols[int(low.group(1), 16)], name.group(1)))
+    return pairs
+
+
+def _check_display_names(obj: Path) -> None:
+    pairs = _named_functions(_needs_dwarfdump(), obj)
+    assert pairs
+    display_name = _demangle().display_name
+    wrong = [(symbol, name, display_name(symbol)) for symbol, name in pairs
+             if display_name(symbol) != name]
+    assert not wrong, "\n".join(f"{s}: DWARF {n}, filter {f}" for s, n, f in wrong[:40])
+
+
+@pytest.mark.parametrize("program", [RECTANGLES, LOOP], ids=["rectangles", "loop"])
+def test_the_filter_names_each_function_as_the_dwarf_does(program):
+    """`Turkey.Demangle` names the subprograms and `scripts/demangle.py`
+    names symbols in a profiler's output, by one set of rules written
+    twice. So for every function with a symbol, the filter turns the symbol
+    into the subprogram's name."""
+    _check_display_names(_built("obj", program) / "prog.o")
+
+
+@pytest.mark.bootstrap
+def test_the_filter_names_each_function_of_the_compiler_as_the_dwarf_does():
+    """`boot` itself, whose namers make every kind of name: instances and
+    their methods, defaults, specializations, layout copies and lambdas."""
+    with tempfile.TemporaryDirectory() as directory:
+        obj = Path(directory) / "boot.o"
+        obj.write_bytes(_object(bootc.BOOT_MAIN))
+        _check_display_names(obj)
+
+
+def test_the_filter_rewrites_the_symbols_in_a_report():
+    """A line of each of `sample`, `perf script` and a crash report, and
+    text around a symbol that is not part of it."""
+    demangle = _demangle().demangle
+    report = (
+        "    +   2620 Main#area@Rectangle  (in prog) + 120  [0x100003f20]  prog.gob:11\n"
+        "\t    100003f20 _%inst.Data.Hashable#Hash.Int#hashInto@FNV1a+0x1c (/tmp/prog)\n"
+        "3   prog   0x0000000100003f20 Turkey.Stdout#makeRoom%lambda1 + 28\n"
+        '"symbol":"Data.Map#put@String,Unit", (Main#main), turkey_entry, a#b\n')
+    assert demangle(report) == (
+        "    +   2620 Main.area[Rectangle]  (in prog) + 120  [0x100003f20]  prog.gob:11\n"
+        "\t    100003f20 Hash(Int).hashInto[FNV1a]+0x1c (/tmp/prog)\n"
+        "3   prog   0x0000000100003f20 Turkey.Stdout.makeRoom.<lambda1> + 28\n"
+        '"symbol":"Data.Map.put[String,Unit]", (Main.main), turkey_entry, a#b\n')
 
 
 # -- the object against the assembler ------------------------------------------

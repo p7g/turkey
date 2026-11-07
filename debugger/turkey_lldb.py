@@ -256,7 +256,7 @@ def _runtime(value: lldb.SBValue) -> dict[str, int]:
         t = target.FindFirstType("Turkey.Runtime")
         if not t.IsValid():
             raise ValueError("the program has no Turkey.Runtime type")
-        members = t.GetEnumMembers()
+        members = t.GetCanonicalType().GetEnumMembers()
         _constants[key] = {members.GetTypeEnumMemberAtIndex(k).GetName():
                            members.GetTypeEnumMemberAtIndex(k).GetValueAsSigned()
                            for k in range(members.GetSize())}

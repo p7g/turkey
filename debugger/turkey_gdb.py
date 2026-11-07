@@ -74,7 +74,8 @@ def _record(obj: gdb.Value) -> gdb.Value:
 def _runtime() -> dict[str, int]:
     """The program's runtime constants, from the `Turkey.Runtime`
     enumeration `boot build -g` writes."""
-    return {field.name: int(field.enumval) for field in gdb.lookup_type("Turkey.Runtime").fields()}
+    constants = gdb.lookup_type("Turkey.Runtime").strip_typedefs()
+    return {field.name: int(field.enumval) for field in constants.fields()}
 
 
 def _payload(compact: gdb.Value) -> gdb.Value | None:

@@ -538,17 +538,17 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         let assumptions = Vec.slice(outside.assumptions, 0, len(outside.assumptions))
         var untouchable = outside.untouchable
         var inert = outside.inert
-        let equalities = Vec.new(len(givens))
+        let written = Vec.new(len(givens))
         let named = Vec.new(len(givens))
         for (n, p, at) in givens {
             Vec.push(named, (n, p))
-            if p.name == Ty.equals {
-                Vec.push(equalities, Given { pred = p, span = at })
-                if rank(s) > untouchable { untouchable = rank(s) }
-            } else {
-                Vec.push(assumptions, (n, p))
-            }
+            Vec.push(written, Given { pred = p, span = at })
+            if p.name != Ty.equals { Vec.push(assumptions, (n, p)) }
         }
+        -- The equalities written here, and those the class givens' equality
+        -- superclasses grant: either kind makes outer variables untouchable.
+        let equalities = Inert.granted(s.classes, Vec.toArray(written))
+        if len(equalities) > 0 && rank(s) > untouchable { untouchable = rank(s) }
         -- The inert set this implication made, if it made one: only that one
         -- is closed on the way out (`Inert.close`), never the enclosing one it
         -- extends or shares.
@@ -557,8 +557,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         if len(equalities) > 0 {
             -- Breakers at the rank of the body's `CLet`, so the equalities
             -- defining them stay inside the implication.
-            let (extended, refused) = Inert.extendAt(outside.inert, Vec.toArray(equalities),
-                                                     rank(s) + 1)
+            let (extended, refused) = Inert.extendAt(outside.inert, equalities, rank(s) + 1)
             for r in refused {
                 if refusedHere(r, body) { inaccessible = True }
             }
@@ -1077,7 +1076,7 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     if checkRefusals(s, rank(s)) { settle(s) }
     confine(s, c.skolems)
     let types = Array.map(c.binds, _.2)
-    let retainedPreds = split(s, types)
+    let retainedPreds = underScheme(s, split(s, types), types)
     -- An equation tied to a variable this binder quantifies can never be decided
     -- by an enclosing one -- nothing outside mentions the variable -- so this is
     -- where it is stuck for good.
@@ -1192,6 +1191,44 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     }
     solve(s, c.body)
     if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
+}
+
+-- Returns `retained` solved again under the equalities its class predicates
+-- grant through their equality superclasses, and split again.
+--
+-- The retained class predicates are the scheme's givens: every use of the
+-- binding proves them, and its body receives their dictionaries, which carry
+-- the equalities (`Inert.granted`). So a retained equality they imply is no
+-- obligation, a class predicate over an associated type they fix may be
+-- solved at the type it is, and a literal over one is decided. This is
+-- OutsideIn(X)'s simplification at generalization (Vytiniotis, Peyton Jones,
+-- Schrijvers and Sulzmann, JFP 2011): the wanteds are solved under the
+-- constraints being quantified.
+--
+-- The class predicates are not assumptions here, only their equalities: one
+-- retained class predicate is discharged by another through `fromContext`.
+fun underScheme(s : Solver, retained : Vec PredCell, types : Array Ty.Type) -> Vec PredCell {
+    let givens = Vec.new(len(retained))
+    for p in retained {
+        if Classes.isClass(s.classes, p.pred.name) { Vec.push(givens, Inert.given(p.pred)) }
+    }
+    let equalities = Inert.granted(s.classes, Vec.toArray(givens))
+    if len(equalities) == 0 { return retained }
+    let outside = s.here
+    let (inert, _) = Inert.extend(outside.inert, equalities)
+    s.entered = s.entered + 1
+    let scheme = Implication {
+        id = s.entered, assumptions = outside.assumptions, inert = inert,
+        untouchable = outside.untouchable,
+    }
+    for p in retained {
+        p.at = Some(scheme)
+        Vec.push(s.deferred, p)
+    }
+    settle(s)
+    let out = split(s, types)
+    Inert.close(inert)
+    out
 }
 
 -- Returns the evidence for the retained predicate `c` from `givens`, the

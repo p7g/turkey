@@ -667,6 +667,13 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
                 None -> oops("no evidence for the superclass '" + sup + "'",
                              Some(inst.decl.span))
             }
+            -- Proved at the head when the instance was declared, and checked
+            -- again by Coretc under the context's dictionaries.
+            EqualitySlot(k) -> {
+                let info = classNamed(l, inst.cls)
+                let e = Classes.equalityAt(info, info.equalities[k], inst.head)
+                Cr.coercion(e.args[0], e.args[1], Some(inst.decl.span))
+            }
             MethodSlot(name) -> match Map.get(plan.methods, name) {
                 Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
                               else { methodBody(l, inst, name, impl, plan.params) }
@@ -682,16 +689,21 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
 }
 
 -- Returns whether the method `name`'s own equalities can never hold together
--- at the instance's head, tested jointly as the solver tests the givens its
--- override is checked under. Such a method can never be called at that head,
+-- at the instance's head with those the instance's context grants, tested
+-- jointly as the solver tests the givens its override is checked under. Such a method can never be called at that head,
 -- since every call has to supply the evidence for its equalities. Its body may
 -- also be ill-typed there, since it was checked under equalities that are
 -- false, so it is not lowered at all.
 fun refutedAt(l : Lowerer, inst : InstInfo, name : String) -> Bool {
     let own = methodEqualitiesAt(methodOf(l, inst.cls, name, Some(inst.decl.span)), inst.head)
     if len(own) == 0 { return False }
-    -- With the instance's equalities, which the override is checked under too.
-    Inert.refutes(l.classes, Vec.append(own, instanceEqualities(inst)))
+    -- With what the instance's context grants, which the override is checked
+    -- under too: its equalities, and its class predicates' equality
+    -- superclasses.
+    let context = Inert.granted(l.classes,
+                                Vec.toArray(Vec.map(Classes.contextPreds(inst), Inert.given)))
+    for g in context { Vec.push(own, (g.pred.args[0], g.pred.args[1])) }
+    Inert.refutes(l.classes, own)
 }
 
 -- The method `name` as a slot of the instance's dictionary that can never be

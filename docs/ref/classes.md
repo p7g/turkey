@@ -29,6 +29,7 @@ coherent.
 ```ebnf
 class-decl ::= "class" CONID IDENT (":" superclass ("," superclass)*)? "{" class-item* "}"
 superclass ::= qualified-CONID IDENT
+             | type "~" type                                                   -- equality superclass
 class-item ::= "fun" IDENT context? "(" (type ("," type)*)? ")" "->" type      -- signature
              | fun-decl                                                        -- default method
              | "type" CONID IDENT                                              -- associated type
@@ -89,7 +90,8 @@ applied to an argument, so it has [kind](types.md#type-expressions)
 with an `Ord` instance must also have an `Eq` instance, and a function with an
 `Ord a` constraint can use `Eq`'s methods on `a` without asking for `Eq`
 separately. A superclass constrains the class's own parameter, never a type
-built from it.
+built from it. A superclass may also be an equality that fixes an associated
+type, as described in [Equality superclasses](#equality-superclasses).
 
 <!-- error: 'Show Cat' is required by 'Named', but there is no such instance -->
 ```kotlin
@@ -576,3 +578,84 @@ fun main() { }
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.
+
+### Equality superclasses
+
+An equality among a class's superclasses restricts the class to the
+instances of its superclasses where an associated type is fixed. `class
+Bytes s : Index s, Key s ~ Int, Value s ~ Byte` is the class of `Index` types
+whose keys are `Int`s and whose values are `Byte`s. A function with a `Bytes s`
+constraint may use both equalities, as if its own context had written them:
+
+<!-- run -->
+```kotlin
+class Bytes s : Index s, Key s ~ Int, Value s ~ Byte {}
+
+type Packet = Packet(Array Byte)
+
+instance Index Packet {
+    type Key = Int
+    type Value = Byte
+    fun get(Packet(bytes), i) = bytes[i]
+}
+
+instance Bytes Packet {}
+
+fun firstTwo[Bytes s](bytes : s) -> Int = Byte.toInt(bytes[0]) + Byte.toInt(bytes[1])
+
+fun main() {
+    print(firstTwo(Packet(Array.map([7, 8], Byte.truncate))))
+}
+```
+
+```text
+15
+```
+
+The equalities hold wherever `Bytes s` does: in a default method of `Bytes`,
+in the methods of an instance whose context has a `Bytes s`, and for a
+subclass of `Bytes`. An inferred type with a `Bytes a` constraint leaves them
+out, and a partial annotation's context need not list them. An equality
+superclass follows the rules of an equality
+in a context, and it may mention no type variable other than the class
+parameter. The equalities a class inherits from its superclasses must agree
+with its own, and a method's own context may not contradict them:
+
+<!-- error: the equality 'Value s ~ Int' in this context contradicts the superclasses of 'Bytes'; it would make 'Byte' equal to 'Int' -->
+```kotlin
+class Bytes s : Index s, Value s ~ Byte {
+    fun asInt[Value s ~ Int](x : s) -> Int = x[0]
+}
+
+fun main() { }
+```
+
+Each instance has to prove the class's equalities at its head, using the
+equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
+`View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
+context's `Value s ~ Byte`. An instance where an equality is false, or where
+its context does not decide it, is refused:
+
+<!-- error: 'Bytes Words' requires 'Value Words ~ Byte', which can never hold: 'String' is not 'Byte' -->
+```kotlin
+class Bytes s : Index s, Value s ~ Byte {}
+
+type Words = Words(Array String)
+
+instance Index Words {
+    type Key = Int
+    type Value = String
+    fun get(Words(ws), i) = ws[i]
+}
+
+instance Bytes Words {}
+
+fun main() { }
+```
+
+An equality superclass and a method context that constrains the class
+variable both say that an operation exists only where an associated type is
+fixed. A method context keeps the operation in the class, so every instance
+has it, and a default can serve them all. An equality superclass makes a new
+class, so each type needs its own instance, even an empty one, and only the
+types that have one have the operation.

@@ -71,8 +71,8 @@ class Reloc:
     symbol: int | None
     target_section: int | None
     addend: int
-    # The symbol subtracted from the target, for a `delta64`: a Mach-O
-    # SUBTRACTOR's.
+    # The symbol subtracted from the target, for a `delta64` or a `delta32`:
+    # a Mach-O SUBTRACTOR's.
     minus: int | None = None
 
 
@@ -138,6 +138,14 @@ def _macho(data: bytes) -> Obj:
             name = {0: "abs64", 2: "branch26", 3: "page21", 4: "pageoff12"}.get(kind)
             assert name, f"relocation type {kind}"
             section = obj.sections[index]
+            if name == "abs64" and minus is not None and (info >> 25) & 3 == 2:
+                # A four-byte difference: the frame table's return addresses.
+                (implicit,) = struct.unpack_from("<i", section.data, address)
+                struct.pack_into("<i", section.data, address, 0)
+                obj.relocs.append(Reloc(index, address, "delta32", number, None,
+                                        implicit, minus))
+                minus = None
+                continue
             if name == "abs64":
                 (implicit,) = struct.unpack_from("<q", section.data, address)
                 struct.pack_into("<q", section.data, address, 0)
@@ -273,6 +281,11 @@ def _link(obj: Obj) -> Linked:
         if r.kind == "delta64":
             assert r.minus is not None
             struct.pack_into("<q", data, r.offset,
+                             target - symbol_address(obj.symbols[r.minus]))
+            continue
+        if r.kind == "delta32":
+            assert r.minus is not None
+            struct.pack_into("<i", data, r.offset,
                              target - symbol_address(obj.symbols[r.minus]))
             continue
         if r.kind == "prel32":

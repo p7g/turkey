@@ -3,17 +3,18 @@
 Load with `command script import debugger/turkey_lldb.py`, or run
 `scripts/turkey-lldb`, which does.
 
-They read the types `Turkey.DebugTypes` writes, by their names and shapes:
+They read the types `Turkey.DebugTypes` writes, by their names, which name
+the module that declares each type, and by their shapes:
 
-* `String`, `Array a`, `Prim.Array a` and `Vec a`: a pointer to an array
-  object, its length at 8 and its elements at 16, or to a vector's storage
-  and its length.
-* `Map k v`: a map's buckets, in the order they were added, from `head`
-  along each bucket's `next`.
-* A compact sum, such as `Option String`: a union of the one word as the
-  enumeration of the nullaries, `nullary`, and as the payload. A word below
-  4096 is a nullary; any other is the payload, or a wrap of it, an object
-  tagged -2 whose one field is the payload.
+* `Data.String.String`, `Data.Array.Array a`, `Prim.Array a` and
+  `Data.Vec.Vec a`: a pointer to an array object, its length at 8 and its
+  elements at 16, or to a vector's storage and its length.
+* `Data.Map.BaseMap h k v`, which a `Map k v` is: a map's buckets, in the
+  order they were added, from `head` along each bucket's `next`.
+* A compact sum, such as `Data.Option.Option Data.String.String`: a union of
+  the one word as the enumeration of the nullaries, `nullary`, and as the
+  payload. A word below 4096 is a nullary; any other is the payload, or a
+  wrap of it, an object tagged -2 whose one field is the payload.
 * A sum held in slots or as an object: a structure with a `tag` member, an
   enumeration of the constructors, and a union of one structure per
   constructor; the constructor the tag names is the value.
@@ -401,15 +402,14 @@ def is_object(t: lldb.SBType, internal: dict) -> bool:
 def __lldb_init_module(debugger: lldb.SBDebugger, internal: dict) -> None:
     m = __name__
     add = lambda command: debugger.HandleCommand(f"{command} -w {CATEGORY}")
-    add(f'type summary add -F {m}.string_summary "String"')
-    for pattern in ("^Array ", "^Prim.Array "):
+    add(f'type summary add -F {m}.string_summary "Data.String.String"')
+    for pattern in (r"^Data\.Array\.Array ", r"^Prim\.Array "):
         add(f'type synthetic add -l {m}.ArrayChildren -x "{pattern}"')
         add(f'type summary add -e -F {m}.collection_summary -x "{pattern}"')
-    add(f'type synthetic add -l {m}.VecChildren -x "^Vec "')
-    add(f'type summary add -e -F {m}.collection_summary -x "^Vec "')
-    for pattern in ("^Map ", "^BaseMap "):
-        add(f'type synthetic add -l {m}.MapChildren -x "{pattern}"')
-        add(f'type summary add -e -F {m}.map_summary -x "{pattern}"')
+    add(f'type synthetic add -l {m}.VecChildren -x "^Data\\.Vec\\.Vec "')
+    add(f'type summary add -e -F {m}.collection_summary -x "^Data\\.Vec\\.Vec "')
+    add(f'type synthetic add -l {m}.MapChildren -x "^Data\\.Map\\.BaseMap "')
+    add(f'type summary add -e -F {m}.map_summary -x "^Data\\.Map\\.BaseMap "')
     add(f"type synthetic add -l {m}.CompactChildren --recognizer-function {m}.is_compact")
     add(f"type summary add -e -F {m}.compact_summary --recognizer-function {m}.is_compact")
     add(f"type synthetic add -l {m}.ObjectChildren --recognizer-function {m}.is_object")

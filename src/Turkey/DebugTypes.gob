@@ -35,6 +35,7 @@ export (Types, new, typeOf, entries, typeName)
 
 import Data.Map as Map
 import Turkey.Core as Core
+import Turkey.Demangle (displayName)
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Dwarf as Dwarf
@@ -44,7 +45,7 @@ import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), RepClass(..))
 import Turkey.Types as Ty
-import Turkey.Types (TCon, TTuple, TFun)
+import Turkey.Types (TCon, TTuple, TFun, TApp)
 
 -- The entries made so far, in `entries`, and each one's index by its key.
 -- `tags` is each constructor's runtime tag (`SsaLower.tagsOf`).
@@ -61,8 +62,30 @@ fun new(decls : DeclTable, tags : Map String Int) -> Types =
 -- The entries made so far, which `typeOf` adds to.
 fun entries(t : Types) -> Vec Dwarf.TypeEntry = t.entries
 
--- The name a debugger shows for type `ty`.
-fun typeName(ty : Ty.Type) -> String = Ty.show(ty)
+-- Returns the name a debugger shows for type `ty`: the type as the source
+-- writes it, with each type constructor by its display form, which names
+-- the module that declares it (`Data.Vec.Vec Int`).
+fun typeName(ty : Ty.Type) -> String = nameAt(ty, 0)
+
+-- Qualify every constructor, not only where two modules declare one name,
+-- because the formatters recognize the library's types by name. A program's
+-- own `Vec` named `Vec` would be read as the library's and shown as
+-- nonsense. The cost is longer names in a debugger's `(type) name = value`.
+fun nameAt(ty : Ty.Type, prec : Int) -> String = match Ty.prune(ty) {
+    TCon(c) -> displayName(c.name)
+    TTuple(elements) -> "(" + String.join(Vec.map(elements, nameAt(_, 0)), ", ") + ")"
+    TFun(params, ret) -> {
+        let out = "fun(" + String.join(Vec.map(params, nameAt(_, 0)), ", ") + ") -> "
+                  + nameAt(ret, 0)
+        if prec > 0 { "(" + out + ")" } else { out }
+    }
+    TApp(_, _, _) -> {
+        let (head, args) = Ty.spine(ty)
+        let out = nameAt(head, 2) + " " + String.join(Vec.map(args, nameAt(_, 2)), " ")
+        if prec > 1 { "(" + out + ")" } else { out }
+    }
+    _ -> Ty.show(ty)
+}
 
 -- The index of the entry for variable `v`'s type, as `v` is held: in its
 -- slots, or in its box.

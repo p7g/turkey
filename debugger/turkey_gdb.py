@@ -11,9 +11,10 @@ the source path includes this directory and the safe path allows it:
 or by hand, with `source debugger/turkey_gdb.py`.
 
 They read the types `Turkey.DebugTypes` writes, by their names and shapes,
-as `turkey_lldb.py` does for lldb, and print `String`, `Array a`,
-`Prim.Array a`, `Vec a`, `Map k v`, compact sums such as `Option String`,
-sums in their slots and as objects, and records as objects.
+as `turkey_lldb.py` does for lldb, and print `Data.String.String`,
+`Data.Array.Array a`, `Prim.Array a`, `Data.Vec.Vec a`, `Data.Map.BaseMap h k
+v`, compact sums such as `Data.Option.Option Data.String.String`, sums in
+their slots and as objects, and records as objects.
 """
 
 from __future__ import annotations
@@ -229,13 +230,13 @@ def _is_object(t: gdb.Type) -> bool:
 
 def lookup(value: gdb.Value):
     name = value.type.name or ""
-    if name == "String":
+    if name == "Data.String.String":
         return StringPrinter(value)
-    if name.startswith("Vec "):
+    if name.startswith("Data.Vec.Vec "):
         return VecPrinter(value)
-    if name.startswith(("Array ", "Prim.Array ")):
+    if name.startswith(("Data.Array.Array ", "Prim.Array ")):
         return ArrayPrinter(value)
-    if name.startswith(("Map ", "BaseMap ")):
+    if name.startswith("Data.Map.BaseMap "):
         return MapPrinter(value)
     if _is_compact(value.type):
         return CompactPrinter(value)

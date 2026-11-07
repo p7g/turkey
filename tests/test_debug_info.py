@@ -350,15 +350,16 @@ def test_the_types_describe_how_values_are_held(how):
     def named(tag: str, name: str) -> list[str]:
         return [a for _, t, a in entries if t == tag and f'DW_AT_name\t("{name}")' in a]
     assert named("DW_TAG_typedef", "Int") and named("DW_TAG_base_type", "long")
-    assert named("DW_TAG_enumeration_type", "Color")
+    assert named("DW_TAG_enumeration_type", "Main.Color")
     assert named("DW_TAG_enumerator", "Green")
-    assert named("DW_TAG_structure_type", "Point")
+    assert named("DW_TAG_structure_type", "Main.Point")
     assert named("DW_TAG_member", "x") and named("DW_TAG_member", "y")
-    assert named("DW_TAG_structure_type", "Tree")
-    assert named("DW_TAG_enumeration_type", "Tree tag")
-    assert named("DW_TAG_union_type", "Tree")
-    assert named("DW_TAG_union_type", "Option String")
-    assert named("DW_TAG_typedef", "String") and named("DW_TAG_typedef", "Vec Int")
+    assert named("DW_TAG_structure_type", "Main.Tree")
+    assert named("DW_TAG_enumeration_type", "Main.Tree tag")
+    assert named("DW_TAG_union_type", "Main.Tree")
+    assert named("DW_TAG_union_type", "Data.Option.Option Data.String.String")
+    assert named("DW_TAG_typedef", "Data.String.String")
+    assert named("DW_TAG_typedef", "Data.Vec.Vec Int")
 
 
 def _locals(text: str) -> dict[str, str]:
@@ -394,7 +395,8 @@ def test_lldb_shows_the_variables_at_each_stop(how):
         seen = _locals(stop)
         assert seen.get("n") == "5", stop
         assert seen.get("c") == "Green", stop
-        assert seen.get("x") == "3" and seen.get("y") == "4", stop
+        # lldb prints a structure of scalars on one line or a line per member.
+        assert re.search(r"p = [({]\s*x = 3,?\s*y = 4\s*[)}]", stop), stop
         assert seen.get("total") == "10", stop
         assert seen.get("length") in ("2", "3"), stop
     assert _locals(stops[0]).get("tag") == "Node", stops[0]
@@ -437,12 +439,52 @@ def test_lldb_formatters_show_values_as_the_source_writes_them(how):
                           "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
                           "-o", "run", "-o", "frame variable s o v t m", "-o", "kill", "./prog"],
                     VALUES)
-    assert re.search(r'\(String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
+    assert re.search(r'\(Data\.String\.String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
     assert re.search(r'o = Some\("there"\)', out), out[-4000:]
     assert re.search(r"v = 0x[0-9a-f]+ \[10, 20, 30\]", out), out[-4000:]
     assert "t = 0x" in out and "Node(Node(Leaf, 1, Leaf), 2, Leaf)" in out, out[-4000:]
     assert re.search(r'\["one"\] = 1', out) and re.search(r'\["two"\] = 2', out), out[-4000:]
 
+
+# A program's own type named like one of the library's.
+OWN_VEC = """\
+type Vec a = Vec { x : a, y : a, z : a, w : a, label : String }
+
+fun total(n : Int, v : Vec Int) -> Int {
+    if n > 1000 { return total(n - 1, v) }
+    print(v.label)
+    n + v.x + v.y + v.z + v.w
+}
+
+fun main() {
+    print(Int.toString(total(0, Vec { x = 1, y = 2, z = 3, w = 4, label = "own" })))
+}
+"""
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_formatters_tell_a_programs_type_from_the_librarys(how):
+    """A type is named with its module, so the library's `Vec` formatter
+    leaves a program's own `Vec` alone, and it shows as its fields."""
+    _lldb()
+    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+                          "-o", "breakpoint set --file prog.gob --line 5",
+                          "-o", "run", "-o", "frame variable v", "-o", "kill", "./prog"],
+                    OWN_VEC)
+    assert re.search(r'\(Main\.Vec Int \*\) v = 0x[0-9a-f]+ '
+                     r'\{ x = 1, y = 2, z = 3, w = 4, label = "own" \}', out), out[-4000:]
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_formatters_tell_a_programs_type_from_the_librarys(how):
+    gdb = _gdb()
+    out = _debugged(how, [gdb, "-nx", "-batch",
+                          "-iex", f"add-auto-load-safe-path {FORMATTERS}",
+                          "-iex", f"directory {FORMATTERS}",
+                          "-ex", "break prog.gob:5", "-ex", "run",
+                          "-ex", "print *v", "-ex", "kill", "./prog"], OWN_VEC)
+    assert re.search(r"x = 1.*y = 2.*w = 4", out, re.DOTALL), out[-4000:]
+    assert '"own"' in out, out[-4000:]
 
 @pytest.mark.parametrize("how", PATHS)
 def test_gdb_loads_the_formatters_the_program_names(how):

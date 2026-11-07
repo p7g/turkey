@@ -17,8 +17,11 @@ export (locate)
 -- point an assignment to a `var` or a copy was (`Ssa.Func.anchors`), and it
 -- stops being the variable's at the next assignment on any path to a point.
 -- So a value shows neither before the statement that assigns it, nor after
--- another has, nor where paths that assigned different values meet. Its
--- location, where it is the variable's, is:
+-- another has, nor where paths that assigned different values meet. An
+-- assignment to a variable also ends every other variable of the same name
+-- in the same function or inlined call: there are no lexical scopes in the
+-- debug information, and a variable a later one shadows would otherwise show
+-- beside it. Its location, where it is the variable's, is:
 --
 -- * a frame slot, from the store into it on, for a value the collector roots
 --   (`Turkey.Roots`) or the allocator spills: such a slot holds that one
@@ -54,6 +57,7 @@ import Turkey.Asm as Asm
 import Turkey.Dwarf as Dwarf
 import Turkey.Emit as Emit
 import Turkey.Frame as Frame
+import Turkey.Position as Position
 import Turkey.Regalloc as Regalloc
 import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
@@ -244,7 +248,8 @@ type Reach = Reach {
     base     : Array Int,
     inState  : Array (Array Int),
     assigned : Array (Vec (Int, Int, Int)),
-    -- The pieces each assignment to a piece ends besides its own.
+    -- The pieces each assignment to a piece ends: every piece of each other
+    -- variable of its name in its function or inlined call.
     ends     : Array (Vec Int),
 }
 
@@ -261,7 +266,30 @@ fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach 
         base[k] = total
         total = total + pieceCount(f.variables[k])
     }
+    -- The variables of each name in each scope.
+    let scopes = Map.new()
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        let v = f.variables[k]
+        let key = v.name + " " + Int.toString(Position.site(v.declared))
+        match Map.get(scopes, key) {
+            Some(ks) -> Vec.push(ks, k)
+            None -> Map.put(scopes, key, [k])
+        }
+    }
     let ends : Array (Vec Int) = Array.init(total, fun(_) = [])
+    for ks in Map.values(scopes) {
+        for k in ks {
+            for other in ks {
+                if other != k {
+                    for var j = 0; j < pieceCount(f.variables[other]); j = j + 1 {
+                        for var i = 0; i < pieceCount(f.variables[k]); i = i + 1 {
+                            Vec.push(ends[base[k] + i], base[other] + j)
+                        }
+                    }
+                }
+            }
+        }
+    }
     -- Where each value is defined: its block, and the point after it.
     let definedAt = Map.new()
     for b in order {

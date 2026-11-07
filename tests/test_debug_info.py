@@ -564,6 +564,7 @@ ASSIGNED_STOPS = [
     (_line(ASSIGNED, 'print("inside")'), {"s": '"second1"'}),
     (_line(ASSIGNED, 'print("joined")'), {"s": '"second1"'}),
     (_line(ASSIGNED, 'print("met")'), {"s": None}),
+    (_line(ASSIGNED, 'print("after")'), {"x": "12"}),
 ]
 
 
@@ -576,8 +577,9 @@ def _assigned_stops(out: str) -> list[str]:
 @pytest.mark.parametrize("how", PATHS)
 def test_lldb_shows_each_variable_as_last_assigned(how):
     """A `var` shows its old value until the statement that assigns it, not
-    from where the new value is computed; and one overwritten on the way to
-    a point shows nothing there rather than what it held before."""
+    from where the new value is computed; one overwritten on the way to a
+    point shows nothing there rather than what it held before; and a shadowed
+    `let` gives way to the one that shadows it."""
     _lldb()
     lines = sorted({line for line, _ in ASSIGNED_STOPS})
     command = [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch"]

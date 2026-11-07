@@ -29,7 +29,12 @@ SHOWN = 100
 
 
 def _fields(t: gdb.Type) -> list[gdb.Field]:
-    return list(t.strip_typedefs().fields())
+    """A structure's or a union's members, and nothing for any other type,
+    whose `fields()` gdb either refuses or answers with something else."""
+    t = t.strip_typedefs()
+    if t.code not in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+        return []
+    return list(t.fields())
 
 
 def _target(value: gdb.Value) -> gdb.Value:

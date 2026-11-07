@@ -1,10 +1,11 @@
 """gdb pretty-printers for programs `boot build -g` compiled.
 
 A program built with `-g` for Linux names this file in its
-`.debug_gdb_scripts` section, so gdb loads it from its auto-load scripts
-directory once that includes this directory and the safe path allows it:
+`.debug_gdb_scripts` section. gdb looks for a file named there in the
+current directory and then along the source path, so it loads this one once
+the source path includes this directory and the safe path allows it:
 
-    add-auto-load-scripts-directory /path/to/turkey/debugger
+    directory /path/to/turkey/debugger
     add-auto-load-safe-path /path/to/turkey/debugger
 
 or by hand, with `source debugger/turkey_gdb.py`.

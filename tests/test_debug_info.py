@@ -438,11 +438,11 @@ def test_lldb_formatters_show_values_as_the_source_writes_them(how):
 @pytest.mark.parametrize("how", PATHS)
 def test_gdb_loads_the_formatters_the_program_names(how):
     """gdb finds `turkey_gdb.py` by the name `.debug_gdb_scripts` gives it,
-    in the auto-load directory a user adds."""
+    along the source path a user adds it to."""
     gdb = _gdb()
     out = _debugged(how, [gdb, "-nx", "-batch",
                           "-iex", f"add-auto-load-safe-path {FORMATTERS}",
-                          "-iex", f"add-auto-load-scripts-directory {FORMATTERS}",
+                          "-iex", f"directory {FORMATTERS}",
                           "-ex", f"break prog.gob:{SECOND_STOP}", "-ex", "run",
                           "-ex", "info args", "-ex", "kill", "./prog"], VALUES)
     assert re.search(r'^s = "hi"', out, re.MULTILINE), out[-4000:]

@@ -189,10 +189,11 @@ scripts/turkey-lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line
 `scripts/turkey-lldb` is lldb with `debugger/turkey_lldb.py` imported; in a
 session of your own, `command script import debugger/turkey_lldb.py` does the
 same. On Linux, a program built with `-g` names `turkey_gdb.py` for gdb to
-load, which it does once `~/.gdbinit` points it at the directory:
+load. gdb looks for it along its source path, so it loads it once
+`~/.gdbinit` adds the directory there and to the safe path:
 
 ```
-add-auto-load-scripts-directory /path/to/turkey/debugger
+directory /path/to/turkey/debugger
 add-auto-load-safe-path /path/to/turkey/debugger
 ```
 

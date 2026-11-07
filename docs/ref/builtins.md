@@ -284,6 +284,7 @@ The instances the library provides for built-in types:
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |
 
 Tuples compare lexicographically, and strings compare byte by byte. Two
@@ -295,7 +296,7 @@ same elements, whatever order the entries were added in.
 <!-- run -->
 ```kotlin
 fun main() {
-    let stack : Vec Int = Vec.new(16)
+    let stack = []
     Vec.push(stack, 1)
     Vec.push(stack, 2)
     print(stack == [1, 2])

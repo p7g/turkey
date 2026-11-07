@@ -1,6 +1,6 @@
 export (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
-    FieldRef(..), fieldRef, mutableMask, assignable,
+    FieldRef(..), fieldRef, mutableFields, assignable,
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
     checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
@@ -179,25 +179,19 @@ type FieldRef = FieldRef { index : Int, offset : Int }
 fun fieldRef(layout : Rt.Layout, index : Int) -> FieldRef =
     FieldRef { index = index, offset = Rt.fieldOffset(layout, index) }
 
--- Returns the mask `ObjectNew` takes for fields that may be assigned where
--- `writable` says. Only the first `maskedFields` fields have a bit, and a
--- reader of the mask takes any later field to be assignable, whether or not
--- it is: an object whose field values are spliced in from several slots each
--- can have more fields than an integer has bits.
-fun mutableMask(writable : Array Bool) -> Int {
-    var mask = 0
-    for var i = 0; i < len(writable) && i < maskedFields; i = i + 1 {
-        if writable[i] { mask = mask | 1 << i }
+-- Returns the indices `ObjectNew` takes for the fields that may be assigned,
+-- those where `writable` is true, in increasing order.
+fun mutableFields(writable : Array Bool) -> Array Int {
+    let out = []
+    for var i = 0; i < len(writable); i = i + 1 {
+        if writable[i] { Vec.push(out, i) }
     }
-    mask
+    Vec.toArray(out)
 }
 
--- Returns whether field `index` of an object built with `mask` may be
+-- Returns whether field `index` of an object built with `mutable` may be
 -- assigned after it is built.
-fun assignable(mask : Int, index : Int) -> Bool =
-    index >= maskedFields || mask >> index & 1 != 0
-
-let maskedFields = 62
+fun assignable(mutable : Array Int, index : Int) -> Bool = Array.contains(mutable, index)
 
 fun showField(f : FieldRef) -> String =
     Int.toString(f.index) + "@" + Int.toString(f.offset)
@@ -220,19 +214,20 @@ type Op
     -- A heap object, allocated and initialized in one instruction: `kind` and
     -- `tag` as the runtime understands them, the layout of its fields
     -- (`Turkey.Runtime.layout` of their representations, which `checkReps`
-    -- holds the operands to), the field values, and a mask with a bit set for
-    -- each field that may be written after this (`mutableMask`).
+    -- holds the operands to), the field values, and the indices of the fields
+    -- that may be written after this, in increasing order and empty for an
+    -- object no store writes (`mutableFields`).
     --
     -- The values are operands, so an `ObjectGet` of an immutable field of this
     -- object is the operand, and an object nothing reads is dead code: no
     -- `ObjectSet` follows the allocation to keep it alive. `ObjectSet` is only
-    -- for a field whose mask bit is set.
+    -- for a field among the indices.
     --
     -- The operands are read *after* the allocation, which may collect, so they
     -- have to be live across it. `Turkey.Roots.across` roots every traced
     -- operand of a safepoint, which is what makes that true; the collector
     -- also never sees the object with a field unwritten.
-    | ObjectNew(Int, Int, Rt.Layout, Array Value, Int)
+    | ObjectNew(Int, Int, Rt.Layout, Array Value, Array Int)
     -- A field, by index and by where it is (`FieldRef`), at the width of its
     -- representation: the result's for a get and the operand's for a set.
     | ObjectGet(Value, FieldRef)
@@ -765,7 +760,10 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
         }
         ClosureCapture(c, _, _) ->
             wantClass(f, out, c, Ptr, "the target of a closure capture")
-        ObjectNew(_, _, layout, fields, _) -> laidOut(f, out, layout, fields)
+        ObjectNew(_, _, layout, fields, mutable) -> {
+            laidOut(f, out, layout, fields)
+            writable(out, len(fields), mutable)
+        }
         StackObject(_, _, layout, fields) -> laidOut(f, out, layout, fields)
         -- An address and an integer are the same bits, so nothing at run time
         -- distinguishes a wrong pairing here. And a *traced* pointer turned
@@ -1176,6 +1174,19 @@ fun laidOut(f : Ssa.Func Low, out : Vec String, layout : Rt.Layout,
     }
 }
 
+-- Reports into `out` each index in `mutable` that is not a field of an object
+-- of `count` fields or is out of increasing order.
+fun writable(out : Vec String, count : Int, mutable : Array Int) -> Unit {
+    var last = -1
+    for k in mutable {
+        if k <= last || k >= count {
+            Vec.push(out, "an object of " + Int.toString(count) + " fields marks field "
+                            + Int.toString(k) + " mutable, after " + Int.toString(last))
+        }
+        last = k
+    }
+}
+
 fun sameRep(f : Ssa.Func Low, out : Vec String, a : Value, b : Value,
             what : String) -> Unit {
     if Ssa.repOf(f, a) != Ssa.repOf(f, b) {
@@ -1279,7 +1290,8 @@ instance Show Op {
     Intrinsic(k, a) -> intrinsicName(k) + " " + v(a)
     ObjectNew(kind, tag, layout, fields, mutable) ->
         "object.new kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
-        + " count=" + Int.toString(len(fields)) + showLayout(layout) + " mutable=" + Int.toString(mutable)
+        + " count=" + Int.toString(len(fields)) + showLayout(layout)
+        + " mutable=[" + String.join(Array.map(mutable, Int.toString), ", ") + "]"
         + " [" + String.join(Array.map(fields, v), ", ") + "]"
     ObjectGet(a, f) -> "object.get " + v(a) + ", " + showField(f)
     ObjectSet(a, f, b) -> "object.set " + v(a) + ", " + showField(f) + ", " + v(b)

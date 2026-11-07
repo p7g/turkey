@@ -367,7 +367,7 @@ fun stored(l : Lower, v : Value) -> Value = match multiOf(l, v) {
     None -> v
     Some(Boxed(_, box)) -> box
     Some(Slots(layout, values)) -> {
-        let made = L.emit(l.b, ObjectNew(0, -1, Rt.layout(layout.slots), values, 0),
+        let made = L.emit(l.b, ObjectNew(0, -1, Rt.layout(layout.slots), values, []),
                           Ssa.traced(Ptr))
         -- Named as building the value it holds, which is what memory holds of
         -- it.
@@ -625,7 +625,7 @@ fun adapter(name : String, symbol : String, sig : Signature) -> Ssa.Func Low {
     }
     let results = Array.init(len(sig.results), fun(k) =
         if k == 0 { first } else { L.emit(b, Result(first, k), sig.results[k]) })
-    let box = L.emit(b, ObjectNew(0, -1, Rt.layout(sig.results), results, 0), Ssa.traced(Ptr))
+    let box = L.emit(b, ObjectNew(0, -1, Rt.layout(sig.results), results, []), Ssa.traced(Ptr))
     L.terminate(b, Ret([box]))
     f
 }
@@ -664,7 +664,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
                                    + Int.toString(tag)
                         Map.put(objects, name, (kind, tag, layout, []))
                         inst.op = GlobalLoad(name)
-                    } else if shared && kind == 0 && tag == -1 && mutable == 0 {
+                    } else if shared && kind == 0 && tag == -1 && len(mutable) == 0 {
                         match constantsOf(constants, fields) {
                             Some(ops) -> {
                                 let name = "%box." + String.join(Array.map(layout.reps, fun(r) =
@@ -691,7 +691,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
         let (kind, tag, layout, ops) = shape
         Vec.push(m.globals, (name, Ssa.traced(Ptr)))
         let values = Array.init(len(ops), fun(i) = L.emit(b, ops[i], layout.reps[i]))
-        let made = L.emit(b, ObjectNew(kind, tag, layout, values, 0), Ssa.traced(Ptr))
+        let made = L.emit(b, ObjectNew(kind, tag, layout, values, []), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
     L.terminate(b, Jump(init.entry, []))
@@ -2272,8 +2272,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         }
         CTuple(elems) -> match flatHere(l, e.ty) {
             Some(f) -> flatValue(l, f, held, 0, elems)
-            None -> aggregate(l, elems, 0, -1, Array.filled(len(elems), False), "builds a tuple",
-                              fieldsOf("this tuple"))
+            None -> aggregate(l, elems, 0, -1, Array.filled(len(elems), False), "builds a tuple")
         }
         CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
@@ -2397,8 +2396,7 @@ fun store(l : Lower, target : Core, assigned : Value) -> Unit = match target.kin
 -- runtime's own object header distinguishes. `mutable` says which fields may
 -- be assigned later.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             mutable : Array Bool, what : String, refusal : fun(Int) -> String) -> Value {
-    if wide(l, len(items), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
+             mutable : Array Bool, what : String) -> Value {
     let values = Array.map(items, fun(x) = value(l, x))
     built(l, kind, tag, values, mutable, what)
 }
@@ -2438,7 +2436,7 @@ fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Arra
     let layout = Rt.layout(Array.map(operands, Ssa.repOf(l.func, _)))
     if !countable(l, layout) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let made = L.emit(l.b, ObjectNew(kind, tag, layout, operands,
-                                     L.mutableMask(Vec.toArray(writable))),
+                                     L.mutableFields(Vec.toArray(writable))),
                       Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made), what)
     made
@@ -2447,14 +2445,9 @@ fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Arra
 -- A dictionary: a constructed value whose slots are all traced pointers, which
 -- is what lets a slot be read knowing only its index (`dictionarySlot`).
 -- Mutable throughout, as a dictionary the initializer fills one slot at a time
--- must be: the masks of all dictionaries of a class agree.
+-- must be: the mutable fields of all dictionaries of a class agree.
 fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
     let what = "builds a dictionary, " + cls
-    let refusal = fun(n) = "an instance of class '" + Ty.shortName(cls) + "' needs "
-        + Int.toString(n) + " slots, one for each method and superclass, and an instance "
-        + "can have at most " + Int.toString(Rt.fieldLimit) + "; split the class into "
-        + "smaller ones"
-    if wide(l, len(slots), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(slots, fun(x) = value(l, x))
     for v in values {
         if Ssa.repOf(l.func, v) != Ssa.traced(Ptr) {
@@ -2463,16 +2456,6 @@ fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
     }
     built(l, 1, Map.getOr(l.tags, Core.dictName(cls), -1), values,
           Array.filled(len(slots), True), what)
-}
-
--- Whether an object of `count` fields is past `Rt.fieldLimit`, stopping the
--- lowering with `refusal(count)` if it is. The parser holds a declared
--- constructor and a tuple to the limit; this stops anything else that wide --
--- a dictionary of a class with many methods, a packed existential.
-fun wide(l : Lower, count : Int, refusal : fun(Int) -> String) -> Bool {
-    if count <= Rt.fieldLimit { return False }
-    refuse(l, refusal(count))
-    True
 }
 
 -- Whether an object of this layout can say where its pointers are, stopping
@@ -2504,12 +2487,11 @@ fun countable(l : Lower, layout : Rt.Layout) -> Bool {
 -- scope has ended is one the body cannot mention. So what the environment holds
 -- of the body's references is exactly its free locals.
 --
--- Not the whole environment. `turkey_object_new` refuses more than 63 slots,
--- and the environment of a body the size of `Turkey.Opt#expr` holds far more
--- than 63 locals -- so capturing everything is not a slower correct answer, it
--- is a runtime panic on this compiler's own source. And every capture pins a
--- live range from the closure's creation to the end of the function, which the
--- register allocator would pay for.
+-- Not the whole environment. The environment of a body the size of
+-- `Turkey.Opt#expr` holds far more locals than any of its lambdas mentions, and
+-- every capture is a word the parent writes and a live range from the
+-- closure's creation to the end of the function, which the register allocator
+-- would pay for.
 --
 -- `extra` is `CLetRec`'s siblings: locals that will hold closures but do not
 -- yet, so their representation is known before their value is.
@@ -2525,9 +2507,8 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
                 -- held here: `LocalEscape` keeps any binding a closure
                 -- mentions on the heap.
                 --
-                -- A `unit` holds nothing and `lift` makes the child its own;
-                -- the 63-slot cap makes that worth doing rather than merely
-                -- tidy.
+                -- A `unit` holds nothing, and `lift` makes the child its own
+                -- rather than spend an environment field on it.
                 Some(v) -> {
                     match multiOf(l, v) {
                         Some(m) -> Vec.push(out, (local, multiLayout(m)))
@@ -2552,17 +2533,6 @@ fun capturesOf(l : Lower, body : Core, extra : Set.Set Int) -> Vec (Ref, Ssa.Lay
 -- results collectable.
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
          captures : Vec (Ref, Ssa.Layout)) -> Option String {
-    -- A capture of several slots takes a word for each (`environmentLayout`).
-    let words = len(environmentReps(captures))
-    if words > 63 {
-        let counted = if words == len(captures) { Int.toString(words) + " variables" }
-            else { Int.toString(len(captures)) + " variables in " + Int.toString(words)
-                   + " words" }
-        refuse(l, "a nested function captures " + counted + ", and a function can "
-                  + "capture at most 63; pass some as parameters, or group them in a "
-                  + "record")
-        return None
-    }
     -- `%` is the compiler's own character: the lexer will not accept one in an
     -- identifier, so no Turkey name mangles onto this, and a top-level name
     -- here already carries `#` and `@`. The symbol is the binding's name and
@@ -2661,11 +2631,11 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (Ref, Ssa.Layout),
     if len(captures) == 0 {
         return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
-    var mutable = 0
+    let mutable = []
     let values = []
     for (local, layout) in captures {
         if isSibling(later, local) {
-            mutable = mutable | 1 << len(values)
+            Vec.push(mutable, len(values))
             for r in layout.slots { Vec.push(values, storageZero(l, r)) }
         } else {
             match lookup(l, local) {
@@ -2677,8 +2647,18 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (Ref, Ssa.Layout),
             }
         }
     }
-    let environment = L.emit(l.b, ObjectNew(4, -1, environmentLayout(captures),
-                                            Vec.toArray(values), mutable),
+    -- The environment's header counts its traced words, as any object's does
+    -- (`countable`).
+    let layout = environmentLayout(captures)
+    if layout.pointers > Rt.tracedLimit {
+        refuse(l, "a nested function captures " + Int.toString(layout.pointers)
+                  + " values held by reference, and a function can capture at most "
+                  + Int.toString(Rt.tracedLimit)
+                  + " of them; pass some as parameters, or group them in a record")
+        return Ssa.freshValue(l.func, Ssa.traced(Ptr))
+    }
+    let environment = L.emit(l.b, ObjectNew(4, -1, layout, Vec.toArray(values),
+                                            Vec.toArray(mutable)),
                              Ssa.traced(Ptr))
     L.emit(l.b, ClosureNew(symbol, Some(environment)), Ssa.traced(Ptr))
 }
@@ -2939,7 +2919,7 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     L.into(l.b, as_)
     L.terminate(l.b, Jump(after, [x]))
     L.into(l.b, wrap)
-    let object = L.emit(l.b, ObjectNew(1, wrapTag, wrapLayout, [x], 0),
+    let object = L.emit(l.b, ObjectNew(1, wrapTag, wrapLayout, [x], []),
                         Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(object),
             "wraps a nested value in " + Ty.shortName(name))
@@ -3043,12 +3023,10 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 packed(l, info, name, args, tag)
             } else {
                 aggregate(l, args, 1, tag, mutability(l, name, len(args)),
-                          "builds a value with " + Ty.shortName(name),
-                          fieldsOf("constructor '" + Ty.shortName(name) + "'"))
+                          "builds a value with " + Ty.shortName(name))
             }
             None -> aggregate(l, args, 1, tag, mutability(l, name, len(args)),
-                              "builds a value with " + Ty.shortName(name),
-                              fieldsOf("constructor '" + Ty.shortName(name) + "'"))
+                              "builds a value with " + Ty.shortName(name))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
@@ -3075,12 +3053,6 @@ fun flatValue(l : Lower, f : Layout.Flat, held : Ssa.Layout, k : Int,
     fromSlots(l, held, slots)
 }
 
--- The refusal of a tuple or constructed value too wide to build, in the
--- parser's words: it refuses the ones a program declares.
-fun fieldsOf(subject : String) -> fun(Int) -> String =
-    fun(n) = subject + " has " + Int.toString(n) + " fields, and a value can have at most "
-             + Int.toString(Rt.fieldLimit)
-
 -- A packed existential: the index of its hidden variables' layouts in the
 -- table of keys the constructor is packed at, then the carried dictionaries,
 -- then the fields. The index is what an opening compares against the one its
@@ -3105,13 +3077,6 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
             None -> return stop(l, "packing '" + name + "' at " + Ssa.keyName(parts)
                                 + ", which is not in its table")
         }
-    }
-    let refusal = fun(n) = "constructor '" + Ty.shortName(name) + "' needs " + Int.toString(n)
-        + " fields, counting one for its hidden types and one for each constraint, and a "
-        + "value can have at most " + Int.toString(Rt.fieldLimit)
-        + "; move some fields into a record"
-    if wide(l, 1 + len(args), refusal) {
-        return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
     if index >= Rt.immediates {
         refuse(l, "constructor '" + Ty.shortName(name) + "' hides values of "
@@ -3823,7 +3788,7 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         if !countable(l, layout) { return {} }
         let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), layout,
                                          Array.map(reps, storageZero(l, _)),
-                                         L.mutableMask(Array.filled(len(slots), True))),
+                                         L.mutableFields(Array.filled(len(slots), True))),
                           Ssa.traced(Ptr))
         L.effect(l.b, GlobalStore(name, made))
     }

@@ -944,12 +944,13 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- by design (`Turkey.LowIr`'s header): untyped, so a double crosses as
         -- its 64-bit word rather than in its own file.
         --
-        -- A cell, an object and a closure shell are small and of a size known
-        -- here, so they are allocated in line (`allocate`) and the runtime is
-        -- called only when the size class's cursor is empty. Their headers
-        -- and slots are written after the allocation, on either path, which is
-        -- why the operands are rooted across it (`Turkey.Roots.across`); after
-        -- the runtime's own allocator this rewrites what it wrote.
+        -- A cell, an object and a closure shell are of a size known here, so
+        -- they are allocated in line (`allocate`). The runtime is called when
+        -- the size class's cursor is empty, and always for an object past
+        -- `Rt.fastBytes`, which no size class holds. Their headers and slots
+        -- are written after the allocation, on either path, which is why the
+        -- operands are rooted across it (`Turkey.Roots.across`); after the
+        -- runtime's own allocator this rewrites what it wrote.
         CellNew(a) -> {
             let value = raw(s, a)
             let traced = Rt.traceBit(Ssa.repOf(s.source, a))
@@ -1289,9 +1290,9 @@ fun objectHeader(s : Sel, object : Reg, kind : Int, tag : Int, layout : Rt.Layou
 fun storeField(s : Sel, at : A.Mem, v : Value) -> Unit =
     match Rt.fieldWidth(Ssa.repOf(s.source, v)) {
         0 -> {}
-        1 -> emit(s, A.Strb(A.reg(v), at))
-        4 -> emit(s, A.Str(A.reg(v), at, A.W32))
-        _ -> emit(s, A.Str(A.reg(v), at, A.W64))
+        1 -> emit(s, A.Strb(A.reg(v), reachable(s, at, 0)))
+        4 -> emit(s, A.Str(A.reg(v), reachable(s, at, 2), A.W32))
+        _ -> emit(s, A.Str(A.reg(v), reachable(s, at, 3), A.W64))
     }
 
 -- The field at `at` into `d`, at the width `storeField` wrote it. A narrow
@@ -1299,10 +1300,21 @@ fun storeField(s : Sel, at : A.Mem, v : Value) -> Unit =
 fun loadField(s : Sel, d : Reg, at : A.Mem, r : Rep) -> Unit =
     match Rt.fieldWidth(r) {
         0 -> emit(s, A.Mov(d, A.xzr, A.W64))
-        1 -> emit(s, A.Ldrb(d, at))
-        4 -> emit(s, A.Ldr(d, at, A.W32))
-        _ -> emit(s, A.Ldr(d, at, A.W64))
+        1 -> emit(s, A.Ldrb(d, reachable(s, at, 0)))
+        4 -> emit(s, A.Ldr(d, reachable(s, at, 2), A.W32))
+        _ -> emit(s, A.Ldr(d, reachable(s, at, 3), A.W64))
     }
+
+-- Returns `at` in a form an access of `1 << size` bytes encodes, emitting the
+-- offset into a register first when the immediate forms do not reach it
+-- (`A.offsetFits`). Leaves a frame slot as it is: the emitter places those
+-- once the frame is laid out.
+fun reachable(s : Sel, at : A.Mem, size : Int) -> A.Mem = match A.wideOffset(at, size) {
+    -- A field's offset is bounded only by its object's size, so a wide object
+    -- has fields past every immediate form.
+    Some((base, n)) -> A.Indexed(base, immediate(s, n))
+    None -> at
+}
 
 -- Where a closure keeps its code and its environment.
 fun closureCode(closure : Reg) -> A.Mem =

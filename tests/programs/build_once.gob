@@ -1,10 +1,15 @@
--- A constructor application passed to a parameter its body reads twice.
+-- A constructor application passed to a parameter its body reads more than
+-- once, with each callee inlined into the case that calls it.
 --
--- `twin` and `labelled` are inlined into `grow` and `regrow`, and the
--- `.opt` golden shows each building the inner `Node` once, bound to a name
--- both fields read. In `labelled`, the inlined `label` leaves a `match` on the
--- parameter inside the constructor application, off the `let` chain: it still
--- gets the build itself, and selects its arm, so no test of the tag is left.
+-- The `.opt` golden shows each heap object built once, bound to a name every
+-- read shares: `t` in `grow`, `kept`, `looped`, `rooted` and `classed`, and
+-- `%part`, the `Node` inside a flat `Some`, in `nested`. `branched` reads its
+-- parameter once in each arm, so each arm builds its own. In `regrow` and
+-- `classed` a `match` on the parameter sits inside a constructor application,
+-- off the `let` chain, and still selects its arm. `rooted`'s arm binds the
+-- whole value, so its `match` keeps the name rather than a second `Node`.
+--
+-- `main` calls the cases through an array, so none is inlined into it.
 
 type Tree = Leaf | Node(Tree, Int, Tree)
 
@@ -13,20 +18,77 @@ fun size(t : Tree) -> Int = match t {
     Node(left, _, right) -> size(left) + 1 + size(right)
 }
 
-fun twin(t : Tree) -> Tree = Node(t, 0, t)
-
 fun label(t : Tree) -> Int = match t {
     Node(_, n, _) -> n
     Leaf -> 0
 }
 
+fun twin(t : Tree) -> Tree = Node(t, 0, t)
+
+fun grow(n : Int) -> Int = size(twin(Node(Leaf, n, Leaf)))
+
 fun labelled(t : Tree) -> Tree = Node(t, label(t), t)
 
-fun grow(n : Int) -> Tree = twin(Node(Leaf, n, Leaf))
+fun regrow(n : Int) -> Int = size(labelled(Node(Leaf, n, Leaf)))
 
-fun regrow(n : Int) -> Tree = labelled(Node(Leaf, n, Leaf))
+-- Read once, but under a lambda, which may run any number of times.
+fun later(t : Tree) -> fun() -> Tree = fun() = Node(t, 0, Leaf)
+
+fun kept(n : Int) -> Int {
+    let thunks = [later(Node(Leaf, n, Leaf))]
+    size(thunks[0]())
+}
+
+-- Read once, but in a loop.
+fun repeat(t : Tree, times : Int) -> Int {
+    var total = 0
+    for _ in Int.range(0, times) { total = total + size(t) }
+    total
+}
+
+fun looped(n : Int) -> Int = repeat(Node(Leaf, n, Leaf), 3)
+
+-- Read once in each arm.
+fun either(t : Tree, left : Bool) -> Tree = if left { Node(t, 1, Leaf) } else { Node(Leaf, 2, t) }
+
+fun branched(n : Int) -> Int = size(either(Node(Leaf, n, Leaf), n > 0))
+
+-- A heap object inside a flat one.
+fun both(o : Option Tree) -> (Option Tree, Option Tree) = (o, o)
+
+fun count(o : Option Tree) -> Int = match o {
+    Some(t) -> size(t)
+    None -> 0
+}
+
+fun nested(n : Int) -> Int {
+    let (a, b) = both(Some(Node(Leaf, n, Leaf)))
+    count(a) + count(b)
+}
+
+-- An arm that binds the whole value.
+fun rootTwice(t : Tree) -> Tree = match t {
+    Leaf -> Leaf
+    other -> Node(other, size(t), t)
+}
+
+fun rooted(n : Int) -> Int = size(rootTwice(Node(Leaf, n, Leaf)))
+
+-- An inlined call whose own argument was bound once, inlined again.
+class Grow a {
+    fun grown(a) -> a
+}
+
+instance Grow Tree {
+    fun grown(t) = Node(t, label(t), t)
+}
+
+fun growTwice[Grow a](x : a) -> a = grown(grown(x))
+
+fun classed(n : Int) -> Int = size(growTwice(Node(Leaf, n, Leaf)))
+
+let cases = [grow, regrow, kept, looped, branched, nested, rooted, classed]
 
 fun main() {
-    print(size(grow(1)))
-    print(size(regrow(2)))
+    for case in cases { print(case(2)) }
 }

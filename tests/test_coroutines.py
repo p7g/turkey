@@ -235,3 +235,69 @@ def test_misuse_panics(coroutines, body, message):
     result = coroutines(body)
     assert result.returncode == 1
     assert result.stderr == f"panic: {message}\n"
+
+
+def test_a_scoped_value_follows_a_task_to_another_worker(coroutines):
+    """A binding is the coroutine's, not the thread's (`ScopedValue`): each
+    task binds its own number, yields until it has resumed on a worker other
+    than the one it started on, and must read its own number throughout,
+    with the inner binding it made around the yield restored after it. Run
+    collecting at every allocation too, since while a task is parked its
+    bindings are reachable only through the coroutine."""
+    body = """
+import ScopedValue (ScopedValue)
+import ScopedValue as ScopedValue
+import System.Task as Task
+import Turkey.Process as Process
+import Turkey.Ptr as Ptr
+
+let tag : ScopedValue Int = ScopedValue.new()
+let inner : ScopedValue String = ScopedValue.new()
+
+-- The running thread's index, as `Turkey.Coroutine` reads it.
+fun worker() -> Int = Ptr.load(Process.workerRecord(), 288)
+
+-- Whether the task moved to another worker, and how many reads were wrong.
+fun probe(n : Int) -> (Bool, Int) = ScopedValue.with(tag, n, fun() {
+    let first = worker()
+    var moved = False
+    var wrong = 0
+    for var i = 0; i < 100000 && !moved; i = i + 1 {
+        ScopedValue.with(inner, Int.toString(n), fun() {
+            Task.yield()
+            if ScopedValue.get(inner) != Some(Int.toString(n)) { wrong = wrong + 1 }
+        })
+        if Option.isSome(ScopedValue.get(inner)) { wrong = wrong + 1 }
+        if ScopedValue.get(tag) != Some(n) { wrong = wrong + 1 }
+        moved = worker() != first
+    }
+    (moved, wrong)
+})
+
+fun run() {
+    let tasks = Task.runScope(do {
+        let made : Vec (Task.Task (Bool, Int)) = []
+        for var n = 0; n < 8; n = n + 1 {
+            let k = n
+            Vec.push(made, Task.spawn(fun() = probe(k))?)
+        }
+        pure(made)
+    })
+    var moved = 0
+    var wrong = 0
+    for t in tasks {
+        let (m, w) = Task.join(t)
+        if m { moved = moved + 1 }
+        wrong = wrong + w
+    }
+    print("moved: " + Int.toString(moved) + ", wrong: " + Int.toString(wrong))
+    print("outside: " + show(ScopedValue.get(tag)))
+}
+"""
+    workers = {"TURKEY_WORKERS": "4"}
+    plain = coroutines(body, env=workers)
+    assert plain.returncode == 0, plain.stderr
+    assert plain.stdout == "moved: 8, wrong: 0\noutside: None\n"
+    stressed = coroutines(body, verified=True, env=dict(workers, **STRESS))
+    assert stressed.returncode == 0, stressed.stderr
+    assert stressed.stdout == plain.stdout

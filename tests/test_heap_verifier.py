@@ -52,7 +52,7 @@ typedef struct Frame {
    elements, which a `String` is. */
 typedef struct Object { Header header; uint64_t slots[]; } Object;
 typedef struct Array { Header header; int64_t length; unsigned char elements[]; } Array;
-typedef struct Entry { uintptr_t retaddr; int64_t count; const int64_t *offsets; } Entry;
+typedef struct Entry { uintptr_t retaddr; int64_t count; const int32_t *offsets; } Entry;
 _Static_assert(sizeof(Header) == 8, "header");
 _Static_assert(offsetof(Region, marked_slots) == 568, "marked slots");
 _Static_assert(offsetof(Region, sizes) == 1080, "size table");
@@ -326,7 +326,7 @@ int main(int argc, char **argv) {
         _Alignas(16) uintptr_t other[16] = {0};
         other[0] = (uintptr_t)&other[8]; other[1] = 1234;
         other[6] = (uintptr_t)child;
-        int64_t offset = -16;
+        int32_t offset = -16;
         Entry entry = {1234, 1, &offset};
         /* The stack records: the outermost record a walk may reach, the
            record the stack is parked at, and the next on the list. */
@@ -345,7 +345,7 @@ int main(int argc, char **argv) {
         if (!strcmp(which, "native-invalid")) stack[6] = 4096;
         if (!strcmp(which, "native-parked-invalid")) other[6] = 4096;
         if (!strcmp(which, "native-unlisted")) state[10] = (int64_t)(uintptr_t)parked;
-        if (!strcmp(which, "native-offset")) offset = INT64_MIN;
+        if (!strcmp(which, "native-offset")) offset = INT32_MIN;
         if (!strcmp(which, "native-table")) state[8] = 0;
         /* No collection has marked anything. */
         if (!strcmp(which, "native-unmarked")) native_phase = 1;

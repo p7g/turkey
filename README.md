@@ -148,6 +148,10 @@ cc -o rectangles rectangles.o
 Assembly written with `-g` needs the assembler to build the line table, in
 DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
 
+`-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
+functions and the calls inlined into them, which is all a profiler or a
+backtrace reads, and none of what a debugger needs to show a variable.
+
 On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
 object and writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run
@@ -186,8 +190,33 @@ included, is a regular expression: `breakpoint set --func-regex
 '^Main\.area\['`. gdb's `rbreak ^Main\.area\[` sets a breakpoint on each
 specialization it matches, but each one stops only in the copy that has the
 symbol, as a breakpoint by symbol does.
-There is no information about variables or types yet, so a debugger shows
-registers and memory rather than values.
+
+`frame variable` in lldb and `info locals` in gdb show a function's
+parameters and locals wherever the code still holds them: in a register until
+its last use, or in the frame slot the collector or the register allocator
+keeps it in.
+
+The debug information describes values as the compiled code holds them, so
+without help a debugger shows a `String` as a pointer and a `Vec` as its
+storage. The formatters in `debugger/` show them as the source writes them --
+a `String` as its text, an `Array`, a `Vec` or a `Map` as its elements, a sum
+such as `Option` or `Either` as the constructor it holds, a record as its
+fields:
+
+```sh
+scripts/turkey-lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o 'frame variable'
+```
+
+`scripts/turkey-lldb` is lldb with `debugger/turkey_lldb.py` imported; in a
+session of your own, `command script import debugger/turkey_lldb.py` does the
+same. On Linux, a program built with `-g` names `turkey_gdb.py` for gdb to
+load. gdb looks for it along its source path, so it loads it once
+`~/.gdbinit` adds the directory there and to the safe path:
+
+```
+directory /path/to/turkey/debugger
+add-auto-load-safe-path /path/to/turkey/debugger
+```
 
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and
@@ -277,6 +306,18 @@ cannot do what it needs: under
 `test_allocators.py` and `test_runtime_gc.py`. Linking `-fsanitize=undefined`
 statically needs compiler-rt built for aarch64, which Ubuntu's clang does not
 ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
+
+### Editor support
+
+`vim/` is a Vim and Neovim plugin for `.gob` files: filetype detection,
+syntax highlighting and indentation. Add the directory to `runtimepath`, or
+point a plugin manager at it (`Plug '~/path/to/turkey/vim'`). Its tests run
+headless in whichever of `vim` and `nvim` are installed, and check that the
+fixture parses when `TURKEY_BOOT` or `build/stages/stage2` is a compiler:
+
+```sh
+sh vim/test/run.sh
+```
 
 ## Project status
 

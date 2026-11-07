@@ -325,3 +325,279 @@ def test_boxes_arriving_at_a_merge_pass_through_it_boxed():
     # A value built from its slots arrives in them, and the merge takes slots.
     mixed = _function(result.stdout, "mixed")
     assert re.search(r"b\d+\(%\d+:i64, %\d+:i1\):", mixed), mixed
+
+
+# Two fields that each hold a traced slot and a raw one, so the object's
+# traced slots are first only if each field's slots are placed apart: `a.0`,
+# `b.0`, then `a.1`, `b.1`, `c`. `T` is five slots, too many to be flat itself.
+# `Moving` holds the same pairs in `var` fields, and a record with a narrow
+# slot and a sum, which are held boxed.
+INLINE = """
+type T = T { a : (String, Int), b : (String, Int), c : Int }
+type R = R { flag : Bool, n : Int }
+type Moving = Moving {
+    var a : (String, Int),
+    var b : (String, Int),
+    var r : R,
+    e : Either String Int,
+}
+
+fun total(ts : Vec T, ms : Vec Moving) -> Int {
+    var n = 0
+    for t in ts {
+        let T { a = (s, i), b, c } = t
+        n = n + String.byteLength(s) + i + String.byteLength(b.0) + b.1 + c
+    }
+    for m in ms {
+        let (s, i) = m.a
+        n = n + String.byteLength(s) + i + String.byteLength(m.b.0) + m.b.1 + m.r.n
+        n = n + match m.e {
+            Left(s) -> String.byteLength(s)
+            Right(k) -> k
+        }
+    }
+    n
+}
+
+fun main() {
+    let ts : Vec T = []
+    let ms : Vec Moving = []
+    for var i = 0; i < 300; i = i + 1 {
+        let s = Int.toString(i)
+        Vec.push(ts, T { a = (s + "a", i), b = (s + "bb", i * 2), c = 3 })
+        let e = if i % 2 == 0 { Left(s + "e") } else { Right(i) }
+        Vec.push(ms, Moving { a = (s, i), b = (s + "!", 1), r = R { flag = True, n = i }, e = e })
+    }
+    for m in ms {
+        let old = m.a
+        m.a = (m.b.0 + "~", m.b.1 + 1)
+        m.b = old
+        m.r = R { flag = !m.r.flag, n = m.r.n + 1 }
+    }
+    print(total(ts, ms))
+    print(ts[7].a)
+    print(ms[7].b)
+}
+"""
+
+
+def test_fields_of_several_slots_are_held_as_their_slots():
+    plain = lang.output(INLINE)
+    assert plain == "253755\n(7a, 7)\n(7, 7)\n"
+    result = lang.dump("ssa", INLINE)
+    assert result.code == 0, result.stderr
+    main = _function(result.stdout, "main")
+    # `T` is its five slots, two traced. `Moving` is the pairs' four slots and
+    # a pointer each to the record and the sum; the sum's is not assignable.
+    assert re.search(r"object\.new kind=1 tag=\d+ count=5 bytes=48 pointers=2 mutable=\[\] ", main), main
+    assert re.search(r"object\.new kind=1 tag=\d+ count=6 bytes=56 pointers=4 mutable=\[0, 1, 2, 3, 4\] ", main), main
+    # No pair is boxed to be stored, and the record with a `Bool` is, each time.
+    assert "kind=0 tag=-1 count=2 bytes=24 pointers=1 " not in main, main
+    assert main.count("count=2 bytes=24 pointers=0 ") == 2, main
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(INLINE, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain
+
+
+# The kernel of n-body: each `Vec3` read from a body, combined and stored back
+# moves only slots.
+BODIES = """
+type Vec3 = Vec3 { x : Float, y : Float, z : Float }
+type Body = Body { var pos : Vec3, var vel : Vec3, mass : Float }
+
+instance Add Vec3 {
+    fun add(a, b) = Vec3 { x = a.x + b.x, y = a.y + b.y, z = a.z + b.z }
+}
+
+fun scale(v : Vec3, k : Float) -> Vec3 = Vec3 { x = v.x * k, y = v.y * k, z = v.z * k }
+
+fun step(bodies : Array Body, dt : Float) -> Unit {
+    for b in bodies {
+        let v = b.vel
+        b.vel = v + scale(b.pos, -dt * b.mass)
+        b.pos = b.pos + scale(v, dt)
+    }
+}
+
+fun main() {
+    let bodies = [
+        Body { pos = Vec3 { x = 1.0, y = 0.0, z = 0.0 }, vel = Vec3 { x = 0.0, y = 1.0, z = 0.0 },
+               mass = 1.0 },
+        Body { pos = Vec3 { x = 0.0, y = 2.0, z = 0.0 }, vel = Vec3 { x = 0.5, y = 0.0, z = 0.0 },
+               mass = 0.25 },
+    ]
+    for var i = 0; i < 100; i = i + 1 { step(bodies, 0.01) }
+    for b in bodies { print(b.pos.x + b.pos.y + b.pos.z + b.vel.x + b.vel.y + b.vel.z) }
+}
+"""
+
+
+def test_a_flat_value_moves_between_fields_without_allocating():
+    plain = lang.output(BODIES)
+    result = lang.dump("ssa", BODIES)
+    assert result.code == 0, result.stderr
+    step = _function(result.stdout, "step")
+    assert "object.new" not in step and "stack.object" not in step, step
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(BODIES, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain
+
+
+
+# A pair with a narrow slot is not inlined, so a tuple of three of them holds
+# three pointers to its box. The parameter arrives boxed and the tuple reuses
+# that box, rather than taking the pair in slots and boxing it again.
+TRIPLE = """
+fun triple(p : (Bool, Int)) -> ((Bool, Int), (Bool, Int), (Bool, Int)) = (p, p, p)
+
+fun main() {
+    let xs = [(True, 1), (False, 2)]
+    for x in xs { print(triple(x).1) }
+}
+"""
+
+
+def test_a_field_that_boxes_its_value_takes_the_box_it_was_passed():
+    assert lang.output(TRIPLE) == "(True, 1)\n(False, 2)\n"
+    result = lang.dump("ssa", TRIPLE)
+    assert result.code == 0, result.stderr
+    triple = _function(result.stdout, "triple")
+    assert triple.startswith("fun @Main#triple(%0:ptr*, %1:ptr*)"), triple
+    assert triple.count("object.new") == 1, triple
+
+
+# Inline fields where the layout has the most to get wrong: `Big` is 81 slots,
+# so its last `var` fields are past the mutable mask's bits; a sum's
+# constructors each hold their own inline pairs; `Wrap a` is copied per layout
+# of `a`, inline at a pair of words and at a four-word record, boxed at a pair
+# with a `Bool`; and an existential holds an inline pair beside its payload.
+WIDE = """
+type Q = Q { a : Int, b : Int, c : Int, d : Int }
+type Big = Big {
+    f0 : Q, f1 : Q, f2 : Q, f3 : Q, f4 : Q, f5 : Q, f6 : Q, f7 : Q,
+    f8 : Q, f9 : Q, f10 : Q, f11 : Q, f12 : Q, f13 : Q, f14 : Q,
+    var f15 : Q, var f16 : Q, var f17 : (String, String, String, String), f18 : Q, var f19 : Q, var last : Int,
+}
+
+type S = A { p : (String, Int), q : Int, r : String, s : String, t : (Int, String) } | B { n : Int } | C { z : (String, String) }
+
+type Wrap a = Wrap { var v : a, n : Int, m : Int, k : Int, j : Int }
+
+type Any = Any[Show a] { payload : a, more : (String, Int) }
+
+fun mk(x : a) -> Wrap a = Wrap { v = x, n = 1, m = 2, k = 3, j = 4 }
+
+fun swap(w : Wrap a, x : a) -> a {
+    let old = w.v
+    w.v = x
+    old
+}
+
+fun q(n : Int) -> Q = Q { a = n, b = n + 1, c = n + 2, d = n + 3 }
+
+fun sumQ(x : Q) -> Int = x.a + x.b + x.c + x.d
+
+fun describe(s : S) -> String = match s {
+    A { p = (x, i), q, r, s, t = (j, y) } -> x + Int.toString(i + q + j) + r + s + y
+    B { n } -> Int.toString(n)
+    C { z = (a, b) } -> a + b
+}
+
+fun look(v : Any) -> String = match v {
+    Any { payload, more = (s, i) } -> show(payload) + s + Int.toString(i)
+}
+
+fun main() {
+    var total = 0
+    let bigs : Vec Big = []
+    for var i = 0; i < 50; i = i + 1 {
+        let s = Int.toString(i)
+        let b = Big { f0 = q(i), f1 = q(1), f2 = q(2), f3 = q(3), f4 = q(4), f5 = q(5), f6 = q(6),
+                      f7 = q(7), f8 = q(8), f9 = q(9), f10 = q(10), f11 = q(11), f12 = q(12),
+                      f13 = q(13), f14 = q(14), f15 = q(15), f16 = q(16), f17 = (s, s + "x", s + "y", s + "z"),
+                      f18 = q(18), f19 = q(19), last = 0 }
+        b.f16 = q(i * 2)
+        b.f19 = q(i * 3)
+        b.f17 = (b.f17.3, b.f17.2, b.f17.1, b.f17.0)
+        b.last = b.f19.d
+        total = total + sumQ(b.f16) + sumQ(b.f19) + b.last + sumQ(b.f18) + String.byteLength(b.f17.0)
+        Vec.push(bigs, b)
+    }
+    for b in bigs { total = total + sumQ(b.f19) + sumQ(b.f0) + String.byteLength(b.f17.3) }
+    print(total)
+    print(bigs[7].f17)
+    let ss = [A { p = ("a", 1), q = 2, r = "r", s = "s", t = (3, "t") }, B { n = 5 }, C { z = ("c", "d") }]
+    for s in ss { print(describe(s)) }
+    let w = mk(("one", 1))
+    let old = swap(w, ("two", 2))
+    print(old)
+    print(w.v)
+    let w2 = mk((True, 7))
+    let _ = swap(w2, (False, 8))
+    print(w2.v)
+    let w3 = mk(Q { a = 1, b = 2, c = 3, d = 4 })
+    let _ = swap(w3, q(10))
+    print(sumQ(w3.v))
+    let f = fun(k : Int) -> Int = sumQ(w3.v) + k
+    print(f(1))
+    let xs = [Any { payload = ("p", 1), more = ("m", 2) }, Any { payload = 3, more = ("n", 4) },
+              Any { payload = ("x", "y"), more = ("o", 5) }, Any { payload = 2.5, more = ("q", 6) }]
+    for x in xs { print(look(x)) }
+}
+"""
+
+
+def test_inline_fields_in_wide_objects_sums_and_generic_copies():
+    plain = lang.output(WIDE)
+    assert plain == '53255\n(7z, 7y, 7x, 7)\na6rst\n5\ncd\n(one, 1)\n(two, 2)\n(False, 8)\n46\n47\n(p, 1)m2\n3n4\n(x, y)o5\n2.5q6\n'
+    result = lang.dump("ssa", WIDE)
+    assert result.code == 0, result.stderr
+    assert re.search(r"object\.new kind=1 tag=\d+ count=81 ", _function(result.stdout, "main"))
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(WIDE, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain
+
+
+# `m` never escapes, so it is built in `f`'s frame, and its inline `var` pairs
+# are assigned across calls that allocate and so may collect.
+STACKED = """
+type M = M { var a : (String, Int), var b : (String, String), c : Int, d : (Int, String) }
+
+fun churn(n : Int) -> Int {
+    var k = 0
+    for var i = 0; i < n; i = i + 1 { k = k + String.byteLength(Int.toString(i) + "x") }
+    k
+}
+
+fun f(s : String, i : Int) -> Int {
+    let m = M { a = (s + "1", i), b = (s + "2", s + "3"), c = i, d = (i, s + "4") }
+    let k = churn(50)
+    m.a = (m.b.1 + "!", m.a.1 + k)
+    let k2 = churn(50)
+    m.b = (m.d.1, s + "5")
+    let M { a = (x, n), b = (y, z), c, d = (e, w) } = m
+    String.byteLength(x + y + z + w) + n + c + e + k2
+}
+
+fun main() {
+    var t = 0
+    for var i = 0; i < 200; i = i + 1 { t = t + f(Int.toString(i), i) }
+    print(t)
+}
+"""
+
+
+def test_inline_fields_of_an_object_in_the_frame_survive_collections():
+    plain = lang.output(STACKED)
+    assert plain == '118660\n'
+    result = lang.dump("ssa", STACKED)
+    assert result.code == 0, result.stderr
+    f = _function(result.stdout, "f")
+    assert "stack.object" in f and "object.set" in f, f
+    for env in (STRESS, GENERATIONAL):
+        result = lang.run(STACKED, env=env, flags=VERIFY)
+        assert result.code == 0, result.stderr
+        assert result.stdout == plain

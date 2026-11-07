@@ -37,7 +37,7 @@ void *turkey_closure_shell(uint64_t code);
 void turkey_root_enter(void *frame, void *values, int64_t count,
                        const char *function_name);
 void turkey_root_leave(void *frame);
-void turkey_frame_table_register(const void *table);
+void turkey_frame_table_set(const void *table, const void *base);
 void turkey_entry_stack_set(void *frame);
 const void *turkey_roots_head(void);
 void turkey_collect(void);

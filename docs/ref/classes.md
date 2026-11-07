@@ -264,10 +264,36 @@ Only a type's own declaration can derive its instances. A type declared
 elsewhere gets an instance written by hand, under the
 [orphan rule](#coherence).
 
-**Requirements.** A derived instance requires the class for each type
-parameter that some field's type mentions, so `type Pair a b : Eq =
-Pair(a, b)` has the instance `Eq (Pair a b) : Eq a, Eq b`. A parameter that no
-field mentions is a *phantom*, and the instance requires nothing of it:
+**Requirements.** A derived instance requires what its fields' instances
+require, stated over the type's parameters. The compiler finds this by
+asking for the class at each field's type and following the instances that
+provide it until only requirements on parameters are left. `type Pair a b :
+Eq = Pair(a, b)` gets the instance `Eq (Pair a b) : Eq a, Eq b`, and a field
+of type `Map k v`, whose `Eq` needs `Hash k` and `Eq v`, passes those on:
+
+<!-- run -->
+```kotlin
+type Index k v : Eq = Index { name : String, entries : Map k v }
+
+fun same[Eq v](a : Index String v, b : Index String v) -> Bool = a == b
+
+fun main() {
+    let a : Index String Int = Index { name = "a", entries = Map.new() }
+    print(same(a, Index { name = "a", entries = Map.new() }))
+}
+```
+
+```text
+True
+```
+
+`Index` has the instance `Eq (Index k v) : Hash k, Eq v`, so `same` can ask
+for `Eq v` alone, since `String` has `Hash`. A requirement that the class's
+superclass already implies is left out: a derived `Ord` that needs `Ord a`
+does not also list `Eq a`.
+
+A parameter that no field mentions is a *phantom*, and the instance requires
+nothing of it:
 
 <!-- run -->
 ```kotlin
@@ -289,7 +315,8 @@ True
 `Metres` has no `Ord`, and `Measure Metres` does. A type may refer to itself,
 or a group of types to each other, and each derived instance uses the others:
 `type List a : Eq = Nil | Cons(a, List a)` compares a list field by field
-down to its end.
+down to its end. The requirements of such a group are found together, each
+type's from what the others' turn out to be.
 
 Each field uses its own type's instance, written by hand or derived, so a
 field whose `Eq` is written by hand is compared by that `Eq`.
@@ -297,7 +324,9 @@ field whose `Eq` is written by hand is compared by that `Eq`.
 **When an instance cannot be derived.** Every field's type must have the class,
 under the requirements above. A field that is a function, a type that has no
 instance, or a type `f a` built from a parameter `f`, has none. Nor does a
-constructor that hides a type in an [existential
+field whose instances need the class at ever larger types without end,
+which a written instance such as `instance Eq (W a) : Eq (W (Array a))` can
+cause. Nor does a constructor that hides a type in an [existential
 bracket](types.md#existential-types): two of its values may hide different
 types. The error is reported at the entry in the list, and says which field is
 to blame, following fields through each type the compiler tried to derive the

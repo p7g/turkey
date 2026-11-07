@@ -198,7 +198,7 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
                         let j = if slot < 0 { 0 } else { slot }
                         if (slot < 0) == (len(pieces) == 1) && j < len(pieces) {
                             let piece = reach.base[k] + j
-                            for (low, high) in current(timeline, piece, origin[id], from, to) {
+                            for (low, high) in current(reach, timeline, piece, origin[id], from, to) {
                                 Vec.push(pieces[j], Range {
                                     weak = Map.contains(weak, id),
                                     lowBlock = b, low = low, highBlock = b, high = high,
@@ -238,18 +238,24 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
 }
 
 -- Which value is each variable's at each point, as a forward analysis of
--- assignments: `base` numbers each variable's pieces from `base[k]`, one
--- for a variable held as one value; `inState` is each piece's at the start
--- of each block, by block; and `assigned` each block's assignments, as
--- (point, piece, value), in the order of their points. A piece's state is a
--- value, `unassigned`, or `several`, where paths that assigned different
--- values meet.
+-- assignments. `base` numbers each variable's pieces from `base[k]`, one for
+-- a variable held as one value. Only some pieces are tracked: a piece with
+-- one assignment, at its value's definition, and no other variable of its
+-- name to end it, is its value wherever that value is, which is most of
+-- them, since most variables are `let`s. `tracked` numbers the others, or
+-- is -1. Of those, `inState` is each one's state at the start of each block,
+-- by block; and `assigned` each block's assignments, as (point, tracked
+-- piece, value), in the order of their points. A piece's state is a value,
+-- `unassigned`, or `several`, where paths that assigned different values
+-- meet.
 type Reach = Reach {
     base     : Array Int,
+    tracked  : Array Int,
     inState  : Array (Array Int),
     assigned : Array (Vec (Int, Int, Int)),
-    -- The pieces each assignment to a piece ends: every piece of each other
-    -- variable of its name in its function or inlined call.
+    -- The tracked pieces each assignment to a tracked piece ends: every
+    -- piece of each other variable of its name in its function or inlined
+    -- call.
     ends     : Array (Vec Int),
 }
 
@@ -266,6 +272,7 @@ fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach 
         base[k] = total
         total = total + pieceCount(f.variables[k])
     }
+    let wanted = Array.filled(total, False)
     -- The variables of each name in each scope.
     let scopes = Map.new()
     for var k = 0; k < len(f.variables); k = k + 1 {
@@ -276,18 +283,10 @@ fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach 
             None -> Map.put(scopes, key, [k])
         }
     }
-    let ends : Array (Vec Int) = Array.init(total, fun(_) = [])
-    for ks in Map.values(scopes) {
+    let shadowing = Array.filter(Map.values(scopes), \len(_) > 1)
+    for ks in shadowing {
         for k in ks {
-            for other in ks {
-                if other != k {
-                    for var j = 0; j < pieceCount(f.variables[other]); j = j + 1 {
-                        for var i = 0; i < pieceCount(f.variables[k]); i = i + 1 {
-                            Vec.push(ends[base[k] + i], base[other] + j)
-                        }
-                    }
-                }
-            }
+            for var j = 0; j < pieceCount(f.variables[k]); j = j + 1 { wanted[base[k] + j] = True }
         }
     }
     -- Where each value is defined: its block, and the point after it.
@@ -299,14 +298,17 @@ fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach 
             Ssa.eachDef(block.insts[k], fun(v) = Map.put(definedAt, Ssa.valueId(v), (b, k + 1)))
         }
     }
-    let assigned : Array (Vec (Int, Int, Int)) = Array.init(len(f.blocks), fun(_) = [])
+    -- Each piece's assignments, as (block, point, value).
+    let assignments : Array (Vec (Int, Int, Int)) = Array.init(total, fun(_) = [])
     for (id, held) in Map.entries(f.holds) {
         for (k, slot) in held {
             let j = if slot < 0 { 0 } else { slot }
             if (slot < 0) != (pieceCount(f.variables[k]) == 1) || j >= pieceCount(f.variables[k]) {
                 continue
             }
+            let piece = base[k] + j
             let anchors = Ssa.anchorsOf(f, id, k, slot)
+            if len(anchors) > 0 { wanted[piece] = True }
             let points = if len(anchors) == 0 { [Map.get(definedAt, id)] } else {
                 Vec.map(anchors, fun(a) = match a {
                     Ssa.After(w) -> Map.get(definedAt, w)
@@ -315,40 +317,76 @@ fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach 
                 })
             }
             for point in points {
-                if let Some((b, p)) = point { Vec.push(assigned[b], (p, base[k] + j, id)) }
+                if let Some((b, p)) = point { Vec.push(assignments[piece], (b, p, id)) }
             }
+            if len(assignments[piece]) > 1 { wanted[piece] = True }
+        }
+    }
+    let tracked = Array.filled(total, -1)
+    var count = 0
+    for var i = 0; i < total; i = i + 1 {
+        if wanted[i] {
+            tracked[i] = count
+            count = count + 1
+        }
+    }
+    let ends : Array (Vec Int) = Array.init(count, fun(_) = [])
+    for ks in shadowing {
+        for k in ks {
+            for other in ks {
+                if other != k {
+                    for var i = 0; i < pieceCount(f.variables[k]); i = i + 1 {
+                        for var j = 0; j < pieceCount(f.variables[other]); j = j + 1 {
+                            Vec.push(ends[tracked[base[k] + i]], tracked[base[other] + j])
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let assigned : Array (Vec (Int, Int, Int)) = Array.init(len(f.blocks), fun(_) = [])
+    for var i = 0; i < total; i = i + 1 {
+        if tracked[i] >= 0 {
+            for (b, p, id) in assignments[i] { Vec.push(assigned[b], (p, tracked[i], id)) }
         }
     }
     for var b = 0; b < len(assigned); b = b + 1 {
-        assigned[b] = Vec.sortBy(assigned[b], fun((x, _, _), (y, _, _)) = Array.threeWay(x, y))
+        if len(assigned[b]) > 1 {
+            assigned[b] = Vec.sortBy(assigned[b], fun((x, _, _), (y, _, _)) = Array.threeWay(x, y))
+        }
     }
-    let preds = Ssa.predecessors(followed)
-    let inState = Array.init(len(f.blocks), fun(_) = Array.filled(total, unassigned))
-    let outState : Array (Option (Array Int)) = Array.filled(len(f.blocks), None)
-    var changed = True
-    while changed {
-        changed = False
-        for b in order {
-            let here = Array.filled(total, unassigned)
-            for p in preds[b] {
-                if let Some(out) = outState[Ssa.blockId(p)] {
-                    for var i = 0; i < total; i = i + 1 { here[i] = join(here[i], out[i]) }
+    let inState = Array.init(len(f.blocks), fun(_) = Array.filled(count, unassigned))
+    if count > 0 {
+        let preds = Ssa.predecessors(followed)
+        let outState : Array (Option (Array Int)) = Array.filled(len(f.blocks), None)
+        var changed = True
+        while changed {
+            changed = False
+            for b in order {
+                let here = Array.filled(count, unassigned)
+                for p in preds[b] {
+                    if let Some(out) = outState[Ssa.blockId(p)] {
+                        for var i = 0; i < count; i = i + 1 { here[i] = join(here[i], out[i]) }
+                    }
                 }
-            }
-            inState[b] = here
-            let out = Array.map(here, fun(x) = x)
-            for (_, piece, id) in assigned[b] { assign(out, ends, piece, id) }
-            let same = match outState[b] {
-                Some(before) -> same(before, out)
-                None -> False
-            }
-            if !same {
-                outState[b] = Some(out)
-                changed = True
+                inState[b] = here
+                let out = if len(assigned[b]) == 0 { here } else {
+                    let copy = Array.map(here, fun(x) = x)
+                    for (_, piece, id) in assigned[b] { assign(copy, ends, piece, id) }
+                    copy
+                }
+                let same = match outState[b] {
+                    Some(before) -> same(before, out)
+                    None -> False
+                }
+                if !same {
+                    outState[b] = Some(out)
+                    changed = True
+                }
             }
         }
     }
-    Reach { base = base, inState = inState, assigned = assigned, ends = ends }
+    Reach { base = base, tracked = tracked, inState = inState, assigned = assigned, ends = ends }
 }
 
 fun join(x : Int, y : Int) -> Int =
@@ -359,11 +397,12 @@ fun assign(state : Array Int, ends : Array (Vec Int), piece : Int, id : Int) -> 
     for other in ends[piece] { state[other] = several }
 }
 
--- Each piece's states through block `b`: (point, state) from point 0, for
--- the pieces an assignment in the block changes.
+-- Each tracked piece's states through block `b`: (point, state) from point
+-- 0, for the pieces an assignment in the block changes.
 fun timelineOf(reach : Reach, b : Int) -> (Array Int, Map Int (Vec (Int, Int))) {
     let start = reach.inState[b]
     let changes = Map.new()
+    if len(reach.assigned[b]) == 0 { return (start, changes) }
     let state = Array.map(start, fun(x) = x)
     let note = fun(piece : Int, p : Int) {
         match Map.get(changes, piece) {
@@ -379,13 +418,19 @@ fun timelineOf(reach : Reach, b : Int) -> (Array Int, Map Int (Vec (Int, Int))) 
     (start, changes)
 }
 
--- The stretches of `from` to `to` where `id` is `piece`'s value.
-fun current(timeline : (Array Int, Map Int (Vec (Int, Int))), piece : Int, id : Int,
-            from : Int, to : Int) -> Vec (Int, Int) {
-    let (start, changes) = timeline
+-- The stretches of `from` to `to` where `id` is `piece`'s value: all of it
+-- for a piece that is not tracked.
+fun current(reach : Reach, timeline : (Array Int, Map Int (Vec (Int, Int))), piece : Int,
+            id : Int, from : Int, to : Int) -> Vec (Int, Int) {
     let out = []
-    match Map.get(changes, piece) {
-        None -> if start[piece] == id { Vec.push(out, (from, to)) }
+    let at = reach.tracked[piece]
+    if at < 0 {
+        Vec.push(out, (from, to))
+        return out
+    }
+    let (start, changes) = timeline
+    match Map.get(changes, at) {
+        None -> if start[at] == id { Vec.push(out, (from, to)) }
         Some(cs) -> for var i = 0; i < len(cs); i = i + 1 {
             let (p, state) = cs[i]
             let (next, _) = if i + 1 < len(cs) { cs[i + 1] } else { (to, 0) }

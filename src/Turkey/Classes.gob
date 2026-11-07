@@ -1671,8 +1671,9 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- mentions.** `type Box a : Eq = Box(a)` gives `Eq (Box a) : Eq a`, and a
 -- parameter no field mentions, a phantom, is constrained by nothing. The
 -- instance exists when, under that context, every field's type has the class:
--- `prove` decides it the way it decides a written instance's obligations. A field whose type needs the class over something other than a
--- parameter, `f a` or `Elem c`, has no instance and so no derived one either.
+-- `prove` decides it the way it decides a written instance's obligations. A
+-- field whose type needs the class over something other than a parameter,
+-- `f a` or `Elem c`, has no instance and so no derived one either.
 --
 -- **Recursion is assumed, and a failure is taken back.** `type List a : Eq =
 -- Nil | Cons(a, List a)` needs `Eq (List a)` to derive `Eq (List a)`. An
@@ -1992,16 +1993,21 @@ fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
     for d in decls {
         if Option.isSome(d.alias) || !Map.contains(t.decls.tycons, d.name) { continue }
         let wanted = []
-        let seen = []
+        let seen : Vec Derive = []
         var valid = True
         for entry in d.derives {
-            if Vec.contains(seen, entry.cls) {
-                report("'" + Ty.shortName(entry.cls) + "' appears twice in the derive "
-                       + "list of '" + Ty.shortName(d.name) + "'", Some(entry.span))
+            if let Some(earlier) = Iterator.find(seen, fun(e) = e.cls == entry.cls) {
+                let cls = "'" + Ty.shortName(entry.cls) + "'"
+                let ty = "'" + Ty.shortName(d.name) + "'"
+                report(if earlier.refused == entry.refused {
+                    cls + " appears twice in the derive list of " + ty
+                } else {
+                    ty + " both derives and refuses " + cls
+                }, Some(entry.span))
                 valid = False
                 continue
             }
-            Vec.push(seen, entry.cls)
+            Vec.push(seen, entry)
             if !checkEntry(t, d, entry) {
                 valid = False
             } else if !entry.refused {
@@ -2012,12 +2018,14 @@ fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
         if !valid { continue }
         for entry in wanted {
             if Option.isNone(derive(t, entry.cls, d.name)) {
-                let reason = match Map.get(t.derivations, derivationKey(entry.cls, d.name)) {
-                    Some(Underivable(r)) -> r
-                    _ -> "it has no constructors"
+                -- A derivation that failed with no reason found no
+                -- constructors to read, which the declaration table has
+                -- reported already.
+                let state = Map.get(t.derivations, derivationKey(entry.cls, d.name))
+                if let Some(Underivable(reason)) = state {
+                    report("'" + Ty.shortName(d.name) + "' cannot derive '"
+                           + Ty.shortName(entry.cls) + "': " + reason, Some(entry.span))
                 }
-                report("'" + Ty.shortName(d.name) + "' cannot derive '"
-                       + Ty.shortName(entry.cls) + "': " + reason, Some(entry.span))
             }
         }
     }
@@ -2082,7 +2090,9 @@ fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
         if Option.isSome(writtenInstance(t, sup, d.name)) {
             report(ty + " cannot derive " + cls + " while its " + supName
                    + " is written by hand; write 'instance " + Ty.shortName(entry.cls)
-                   + " " + Ty.shortName(d.name) + "' too, or derive " + supName, at)
+                   + " " + Ty.shortName(d.name) + "' too, or remove 'instance "
+                   + Ty.shortName(sup) + " " + Ty.shortName(d.name) + "' and derive "
+                   + supName, at)
             return False
         }
     }

@@ -536,7 +536,9 @@ fun main() {
 
 The equalities hold wherever `Bytes s` does: in a default method of `Bytes`,
 in the methods of an instance whose context has a `Bytes s`, and for a
-subclass of `Bytes`. An equality superclass follows the rules of an equality
+subclass of `Bytes`. An inferred type with a `Bytes a` constraint leaves them
+out, and a partial annotation's context need not list them. An equality
+superclass follows the rules of an equality
 in a context, and it may mention no type variable other than the class
 parameter. The equalities a class inherits from its superclasses must agree
 with its own, and a method's own context may not contradict them:

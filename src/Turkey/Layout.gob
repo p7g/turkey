@@ -1,5 +1,5 @@
 export (
-    Flat(..), layoutOf, flatOf, unfolds, storedRep, flatLimit, share, packedKeyParts,
+    Flat(..), layoutOf, flatOf, unfolds, storedRep, inlined, fieldReps, flatLimit, share, packedKeyParts,
     packingIndex, packingCount, isOpened, skolemKey, unknownLayouts,
 )
 
@@ -170,6 +170,43 @@ fun storedRep(l : Layout) -> Rep = match len(l.slots) {
     1 -> l.slots[0]
     _ -> Ssa.traced(Ptr)
 }
+
+-- Returns whether an object holds a field of this layout as the layout's own
+-- slots rather than at `storedRep`: a layout of several slots, every one of
+-- them a whole word. Like `storedRep`, this is a function of the layout alone,
+-- which the object's builder and every reader know.
+--
+-- Two things narrow it to whole words, and both are about sums, whose tag is
+-- always narrower than a word (`indexLayout`). A layout of whole words is
+-- therefore a product of products and words.
+--
+-- * A `var` field is written slot by slot, so a reader racing a write may see
+--   slots of two different values. That is memory safe only where each slot
+--   holds a value of its own field of a product. A sum's slots are valid only
+--   together, since its tag says which of them hold what: a torn tag would
+--   make a pointer of one constructor out of an integer of another.
+-- * A sum read out of a field is often passed on boxed, to a closure, an
+--   array or a compact sum's payload, and a sum held inline must then be
+--   boxed again where the boxed field's pointer was passed as it was. On the
+--   compiler's own source, holding sums inline in immutable fields cost more
+--   allocations than it saved.
+--
+-- So a product with a narrow slot is held boxed too: nothing in the layout
+-- alone tells it from a sum.
+fun inlined(l : Layout) -> Bool = len(l.slots) > 1 && Iterator.all(l.slots, isWord)
+
+fun isWord(r : Rep) -> Bool = match r.class_ {
+    I64 | F64 | Ptr -> True
+    _ -> False
+}
+
+-- Returns the representations an object holds a field of this layout at: its
+-- slots if `inlined`, and otherwise the one `storedRep`. An object's layout is
+-- `Turkey.Runtime.layout` of these for all its fields, concatenated, so an
+-- inlined field's slots are placed one by one among the object's, traced
+-- slots first, and the object's header still describes its traced words with
+-- one count.
+fun fieldReps(l : Layout) -> Array Rep = if inlined(l) { l.slots } else { [storedRep(l)] }
 
 -- The layout a value of `ty` is held at, or `None` if that is not known.
 --

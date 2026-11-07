@@ -20,8 +20,9 @@ def allocator_probe(stats_object, tmp_path_factory):
 #include <string.h>
 
 /* An object's header, as `Turkey.Alloc` writes it: the generation, the
-   kind, the count -- the traced words the fields start with, an array's
-   element layout code, or a cell's flag -- and the tag. Then the fields; an
+   kind, the count -- the traced words the fields start with, those each
+   element of an array starts with, or a cell's flag -- and the tag, an
+   array's stride. Then the fields; an
    array's length and elements; or a cell's value. A `String` is a byte
    array. */
 typedef struct Header { uint8_t generation, kind; uint16_t count; int32_t tag; } Header;

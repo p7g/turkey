@@ -274,18 +274,47 @@ Ada Bo
 
 The instances the library provides for built-in types:
 
-| Type | `Eq` | `Ord` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
-|---|---|---|---|---|---|---|
-| `Int` | yes | yes | yes | yes | yes | yes |
-| `Float` | yes | yes | yes | yes | no | yes |
-| `Byte`, `Char`, `Bool` | yes | yes | no | no | no | yes |
-| `String` | yes | yes | concatenation | no | no | yes |
-| tuples of 2 to 4 elements | if the elements have it | if the elements have it | no | no | no | if the elements have it |
-| `Option a`, `Either l r` | if the contents have it | no | no | no | no | if the contents have it |
-| `Array a`, `Vec a` | no | no | concatenation | no | no | if the elements have it |
-| `Unit` | no | no | no | no | no | no |
+| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
+|---|---|---|---|---|---|---|---|
+| `Int` | yes | yes | yes | yes | yes | yes | yes |
+| `Float` | yes | yes | no | yes | yes | no | yes |
+| `Byte`, `Char`, `Bool` | yes | yes | yes | no | no | no | yes |
+| `String` | yes | yes | yes | concatenation | no | no | yes |
+| tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
+| `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
+| `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
+| `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | no | no | if the elements have it |
+| `Unit` | yes | no | yes | no | no | no | no |
 
-Tuples compare lexicographically, and strings compare byte by byte.
+Tuples compare lexicographically, and strings compare byte by byte. Two
+arrays are equal when they have the same length and equal elements at each
+index, and so are two `Vec`s, whatever their capacity. Two maps are equal when
+they have the same keys with equal values, and two `Set`s when they have the
+same elements, whatever order the entries were added in.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let stack = []
+    Vec.push(stack, 1)
+    Vec.push(stack, 2)
+    print(stack == [1, 2])
+
+    let ages = Map.new()
+    Map.put(ages, "Ada", 36)
+    Map.put(ages, "Bo", 41)
+    let again = Map.new()
+    Map.put(again, "Bo", 41)
+    Map.put(again, "Ada", 36)
+    print(ages == again)
+}
+```
+
+```text
+True
+True
+```
 
 ## `Show` and printing
 
@@ -627,3 +656,80 @@ could create notes.txt
 
 `fail(e)` packs a value into a `SomeError`, and `Error.cast` returns `Some`
 only when the packed value has exactly the requested type.
+
+The requested type is compared argument by argument, and that includes an
+argument that is itself a type constructor. With `type Cell f = Cell(f Int)`,
+`Cell Option` and `Cell Array` are different types with different
+descriptions, and a value packed as one never casts to the other:
+
+<!-- run -->
+```kotlin
+type Cell f = Cell(f Int)
+
+-- The payload: `Cell` itself cannot have an `Error` instance (see below).
+type Packed a = Packed(a)
+
+instance Error (Packed a) : Typed a {
+    fun message(_) = "packed"
+}
+
+fun main() {
+    let err = fail(Packed(Cell(Some(1))))
+    match Error.cast(err) : Option (Packed (Cell Option)) {
+        Some(Packed(Cell(o))) -> print(o)
+        None -> print("not a Cell Option")
+    }
+    match Error.cast(err) : Option (Packed (Cell Array)) {
+        Some(_) -> print("a Cell Array")
+        None -> print("not a Cell Array")
+    }
+}
+```
+
+```text
+Some(1)
+not a Cell Array
+```
+
+A context can ask for `Typed` only of a type, though, and not of a type
+constructor such as `f`. So `Cell` cannot have an `Error` instance: the
+instance would need `Typed (Cell f)`, which needs `Typed f`, and no context
+can say so. A payload like `Packed` above carries such a type instead.
+
+<!-- error: but 'Typed' constrains a type of kind * -->
+```kotlin
+import Data.Typed (Proxy(..), typeRep, describe)
+
+type Cell f = Cell(f Int)
+
+fun shown[Typed f](p : Proxy (Cell f)) -> String = describe(typeRep(p))
+```
+
+Inference is not bound by that rule. A function with no signature that
+needs the rep of a `Cell f` is inferred with exactly the context no program
+can write, and works, but cannot be given a signature that restates its type:
+
+<!-- run -->
+```kotlin
+import Data.Typed (Proxy(..), typeRep, describe)
+
+type Cell f = Cell(f Int)
+
+fun proxyFor(x : a) -> Proxy a = Proxy
+
+-- repOf : [Typed a] fun(Cell a) -> TypeRep, where `a` has kind * -> *
+fun repOf(cell) {
+    let Cell(_) = cell
+    typeRep(proxyFor(cell))
+}
+
+fun main() {
+    print(describe(repOf(Cell(Some(1)))))
+    print(repOf(Cell(Some(1))) == repOf(Cell([1])))
+}
+```
+
+```text
+Main#Cell Data.Option#Option
+False
+```

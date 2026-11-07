@@ -1,4 +1,4 @@
-export (Item(..), Cfi(..), print)
+export (Item(..), Cfi(..), print, fits32)
 
 -- What the emitter produces: a module as a sequence of values, in the order
 -- they go into the object, over the target's instruction type `i`.
@@ -34,6 +34,8 @@ type Item i
     -- An eight-byte word: a constant, or the address of a symbol.
     | Word(Int)
     | WordOf(Symbol)
+    -- A four-byte constant, which `fits32` must accept.
+    | Word32(Int)
     -- `n` zero bytes.
     | Space(Int)
     -- A string's bytes. `CString` adds the terminating zero.
@@ -46,11 +48,13 @@ type Item i
     | Byte(Int)
     | Uleb(Int)
     -- Four bytes holding the distance from the second label to the first,
-    -- both in the same section: a length, or a function's size. Fixed by the
-    -- assembler, so the linker never changes it -- provided, on Mach-O, that
-    -- no global symbol lies between the two. Across one, the assembler writes
-    -- a pair of relocations instead, which nothing applies to debug
-    -- information.
+    -- both in the same section, signed: a length, a function's size, or a
+    -- return address's offset from the entry. `Turkey.Assembler` fixes it
+    -- in the field. The Mach-O system assembler does too, except where both
+    -- an alignment and a symbol that is not a temporary label lie between
+    -- the two: there it writes a `SUBTRACTOR` and `UNSIGNED` pair, wherever
+    -- the field is. The linker resolves the pair to the same distance in the
+    -- image.
     | Difference(Symbol, Symbol)
     -- The same distance in LEB128, for a range list. Its length depends on
     -- its value, so both labels must be placed before it.
@@ -104,6 +108,10 @@ type Cfi
     | RememberState
     | RestoreState
 
+-- Whether `n` is a signed 32-bit integer, which is what a `Word32` and a
+-- `Difference` hold.
+fun fits32(n : Int) -> Bool = n >= -0x80000000 && n < 0x80000000
+
 -- The items as assembly text, appended to `b`, and the array emptied.
 --
 -- Emptied because the caller prints a function at a time: held until the end,
@@ -130,6 +138,7 @@ fun printItem[Show i](d : Asm.Dialect, item : Item i, b : String.Builder) -> Uni
         Instruction(i) -> line(b, "    " + show(i))
         Word(n) -> line(b, "    .quad " + Int.toString(n))
         WordOf(sym) -> line(b, "    .quad " + Asm.spell(sym))
+        Word32(n) -> line(b, "    .long " + Int.toString(n))
         Space(n) -> line(b, "    .space " + Int.toString(n))
         Bytes(text) -> byteList(b, text, False)
         CString(text) -> byteList(b, text, True)

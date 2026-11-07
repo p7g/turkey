@@ -1,6 +1,10 @@
 export (
-    CompileUnit(..), Subprogram(..), Inlined(..), sourceFiles, inlinedCalls, emitUnit,
-    Row(..), Sequence(..), LineTable(..), lineTable, uleb,
+    CompileUnit(..), Subprogram(..), Inlined(..), Variable(..), Location(..),
+    TypeEntry(..), Member(..), sourceFiles, inlinedCalls, emitUnit, Row(..), Sequence(..),
+    LineTable(..), lineTable, uleb, opReg0, opRegx, opFbreg, opPiece, opConsts, opStackValue,
+    ulebBytes, slebBytes,
+    encodingBoolean, encodingFloat, encodingSigned, encodingUnsigned, encodingUnsignedChar,
+    encodingUtf,
 )
 
 -- DWARF 5 debug information as stream items (`Turkey.Stream`): the sections
@@ -28,6 +32,11 @@ export (
 -- map only if it has one, and a debugger finds an object's DWARF only through
 -- that map.
 --
+-- With variables, each subprogram and inlined call also holds a variable or
+-- a formal parameter entry for each local of the source it binds, with its
+-- type and a location list (`debug_loclists`) of where it is from one range
+-- of its code to the next; and the unit holds one entry per type.
+--
 -- Every string is a `DW_FORM_strp` offset into `debug_str` and every address
 -- a `DW_FORM_addr`, which needs no `debug_str_offsets` or `debug_addr` table.
 -- The indexed forms would save a relocation per string and address, and cost
@@ -38,11 +47,14 @@ import Turkey.Asm as Asm
 import Turkey.Asm (Symbol)
 import Turkey.Demangle (displayName)
 import Turkey.Position as Position
+import Turkey.Ssa as Ssa
 import Turkey.Stream (Item(..))
+import Turkey.Types as Ty
 
 -- The program as one compile unit: what made it, its main file and the
 -- directory its relative paths start from, the labels around all of its code,
--- and its functions.
+-- and its functions; and the entries of its variables' types, which
+-- `typeOf` gives a variable's index in, adding what it needs.
 type CompileUnit = CompileUnit {
     producer  : String,
     name      : String,
@@ -50,27 +62,72 @@ type CompileUnit = CompileUnit {
     low       : Symbol,
     high      : Symbol,
     functions : Vec Subprogram,
+    types     : Vec TypeEntry,
+    typeOf    : fun(Variable) -> Int,
 }
 
 -- A function, by its internal name, the labels at its first instruction and
--- after its last, and the calls inlined into it, outermost first.
+-- after its last, the calls inlined into it, outermost first, and its own
+-- variables. Its variables' locations are offsets from `base`, a label no
+-- later than any of them.
 type Subprogram = Subprogram {
-    name    : String,
-    low     : Symbol,
-    high    : Symbol,
-    inlined : Vec Inlined,
+    name      : String,
+    low       : Symbol,
+    high      : Symbol,
+    inlined   : Vec Inlined,
+    variables : Vec Variable,
+    base      : Symbol,
 }
 
 -- A call inlined into a function: the internal name of the function inlined,
 -- the call's position (`Turkey.Position`), the code the inlined body covers
--- as pairs of labels in address order, and the calls inlined into that body
--- in turn. Each range lies within one of its parent's.
+-- as pairs of labels in address order, the calls inlined into that body in
+-- turn, and the variables the body binds. Each range lies within one of its
+-- parent's.
 type Inlined = Inlined {
-    callee   : String,
-    call     : Int,
-    ranges   : Vec (Symbol, Symbol),
-    children : Vec Inlined,
+    callee    : String,
+    call      : Int,
+    ranges    : Vec (Symbol, Symbol),
+    children  : Vec Inlined,
+    variables : Vec Variable,
 }
+
+-- A local of the source: its name, the position of its binding
+-- (`Turkey.Position`), whether it is a parameter, its type, how it is held
+-- (`Ssa.Variable`), and where it is, range by range in address order. No
+-- location means the code keeps it nowhere a debugger can read.
+type Variable = Variable {
+    name      : String,
+    declared  : Int,
+    parameter : Bool,
+    ty        : Ty.Type,
+    layout    : Ssa.Layout,
+    boxed     : Bool,
+    locations : Vec Location,
+}
+
+-- A type's entry, which refers to others by their index among the unit's
+-- types: a scalar, by its name, `DW_ATE` encoding and size; a pointer, to a
+-- type or to nothing; another name for a type; a structure or a union, by
+-- its name, size and members; an enumeration, by its name, size and each
+-- constructor's name and number; and an array of a type, whose length the
+-- entry does not say.
+type TypeEntry
+    = BaseType(String, Int, Int)
+    | PointerTo(Option Int)
+    | Typedef(String, Int)
+    | Structure(String, Int, Vec Member)
+    | UnionOf(String, Int, Vec Member)
+    | Enumeration(String, Int, Vec (String, Int))
+    | ArrayOf(Int)
+
+-- A member of a structure or a union: its name, its type, and its offset in
+-- bytes.
+type Member = Member { name : String, ty : Int, offset : Int }
+
+-- Where a variable is over the code from label `low` to label `high`: a
+-- DWARF location expression, as its bytes.
+type Location = Location { low : Symbol, high : Symbol, expression : Array Int }
 
 -- -- encodings ------------------------------------------------------------------
 
@@ -78,14 +135,28 @@ let version = 5
 let compileUnitType = 0x01
 let addressSize = 8
 
+let tagArrayType = 0x01
+let tagEnumerationType = 0x04
+let tagFormalParameter = 0x05
+let tagMember = 0x0d
+let tagPointerType = 0x0f
 let tagCompileUnit = 0x11
+let tagStructureType = 0x13
+let tagTypedef = 0x16
+let tagUnionType = 0x17
 let tagInlinedSubroutine = 0x1d
+let tagSubrangeType = 0x21
+let tagBaseType = 0x24
+let tagEnumerator = 0x28
 let tagSubprogram = 0x2e
+let tagVariable = 0x34
 
 let childrenNo = 0
 let childrenYes = 1
 
+let atLocation = 0x02
 let atName = 0x03
+let atByteSize = 0x0b
 let atStmtList = 0x10
 let atLowPc = 0x11
 let atHighPc = 0x12
@@ -99,18 +170,27 @@ let atRanges = 0x55
 let atCallColumn = 0x57
 let atCallFile = 0x58
 let atCallLine = 0x59
+let atConstValue = 0x1c
+let atDataMemberLocation = 0x38
+let atDeclFile = 0x3a
+let atDeclLine = 0x3b
+let atEncoding = 0x3e
+let atType = 0x49
 let atAddrBase = 0x73
 let atRnglistsBase = 0x74
+let atLoclistsBase = 0x8c
 
 let formAddr = 0x01
 let formData2 = 0x05
 let formData4 = 0x06
 let formData1 = 0x0b
+let formSdata = 0x0d
 let formUdata = 0x0f
 let formRef4 = 0x13
 let formStrp = 0x0e
 let formSecOffset = 0x17
 let formExprloc = 0x18
+let formLoclistx = 0x22
 let formRnglistx = 0x23
 
 -- `DW_INL_inlined`: a function the compiler chose to inline.
@@ -120,24 +200,72 @@ let rangeEndOfList = 0x00
 let rangeBaseAddressx = 0x01
 let rangeOffsetPair = 0x04
 
--- C11, because Turkey has no language code of its own. A debugger reads the
--- code to choose how it parses expressions and shows values; a line table and
--- a function's name and range do not depend on it, and a code in the vendor
--- range would leave each debugger to guess. Revisit once there are variables
--- to show.
+-- A location list's entries are numbered as a range list's are.
+let locationEndOfList = 0x00
+let locationBaseAddressx = 0x01
+let locationOffsetPair = 0x04
+
+let encodingBoolean = 0x02
+let encodingFloat = 0x04
+let encodingSigned = 0x05
+let encodingUnsigned = 0x07
+let encodingUnsignedChar = 0x08
+let encodingUtf = 0x10
+
+-- C11, because Turkey has no language code of its own, and a code from the
+-- vendor range costs every variable. A debugger reads the code to choose how
+-- it parses expressions and shows values, and lldb has no type system for a
+-- language it does not know: with `DW_LANG_lo_user` codes (0x8001, 0x8123,
+-- 0x8e57 and 0xfff0 tried), both Apple's lldb 1703 and LLVM's lldb 21 stop at
+-- a breakpoint, print the frame without its parameters, and answer
+-- `frame variable` with nothing, warning that inspecting variables will be
+-- limited. C is the language whose values the type entries are written as,
+-- so it is the one both debuggers then show them in.
 let languageC11 = 0x1d
 
+-- `DW_OP_reg0`, to which a general register's number is added; and
+-- `DW_OP_regx` and `DW_OP_fbreg`, which take a ULEB128 register and a SLEB128
+-- offset from the frame base.
+let opReg0 = 0x50
+let opRegx = 0x90
+let opFbreg = 0x91
+
+-- `DW_OP_piece`, which ends one piece of a location made of several and
+-- takes its size in bytes as a ULEB128.
+let opPiece = 0x93
+
+-- `DW_OP_consts`, which pushes its SLEB128 operand, and `DW_OP_stack_value`,
+-- which makes the value on the stack the variable's value rather than its
+-- address.
+let opConsts = 0x11
+let opStackValue = 0x9f
+
 -- `x29`, the frame record, which a function's frame is addressed from.
-let opReg29 = 0x50 + 29
+let opReg29 = opReg0 + 29
 
 -- The abbreviation codes, numbered from 1 in the order `abbreviations` writes
 -- them. An inlined subroutine's is `abbrevInlined` plus 1 if it has children,
--- plus 2 if its code is a range list rather than one range.
+-- plus 2 if its code is a range list rather than one range. A variable's is
+-- `abbrevVariable`, plus 1 if it has a location list, plus 2 if it is a
+-- parameter.
 let abbrevCompileUnit = 1
 let abbrevSubprogram = 2
 let abbrevSubprogramParent = 3
 let abbrevAbstract = 4
 let abbrevInlined = 5
+let abbrevListedUnit = 9
+let abbrevVariable = 10
+let abbrevBaseType = 14
+let abbrevPointer = 15
+let abbrevVoidPointer = 16
+let abbrevTypedef = 17
+let abbrevStructure = 18
+let abbrevMember = 19
+let abbrevUnion = 20
+let abbrevEnumeration = 21
+let abbrevEnumerator = 22
+let abbrevArray = 23
+let abbrevSubrange = 24
 
 -- -- the line table's files ---------------------------------------------------------
 
@@ -173,6 +301,8 @@ type Labels = Labels {
     addressesBase : Symbol,
     ranges        : Symbol,
     rangesBase    : Symbol,
+    locations     : Symbol,
+    locationsBase : Symbol,
     unit      : Symbol,
     infoStart : Symbol,
     infoEnd   : Symbol,
@@ -182,14 +312,19 @@ type Labels = Labels {
 type Strings = Strings { d : Asm.Dialect, index : Map.Map String Int, texts : Vec String }
 
 -- What the entries refer to besides strings: the abstract subprogram of each
--- function inlined anywhere, by its name, in the order first inlined; and the
+-- function inlined anywhere, by its name, in the order first inlined; the
 -- range lists of the inlined calls whose code is not one range, in the order
--- written.
+-- written; the location lists of the variables, each with the number of the
+-- label its offsets are from among `bases`; and what gives each variable's
+-- type entry (`CompileUnit.typeOf`).
 type Refs = Refs {
     d         : Asm.Dialect,
     abstracts : Map.Map String Int,
     callees   : Vec String,
     lists     : Vec (Vec (Symbol, Symbol)),
+    locations : Vec (Int, Vec Location),
+    bases     : Vec Symbol,
+    typeOf    : fun(Variable) -> Int,
 }
 
 -- `debug_abbrev`, `debug_info`, `debug_addr`, `debug_rnglists` and
@@ -207,15 +342,24 @@ fun emitUnit(d : Asm.Dialect, u : CompileUnit, out : Vec (Item i)) -> Unit {
         addressesBase = Asm.localLabel(d, "debug_addr_base"),
         ranges = Asm.localLabel(d, "debug_rnglists"),
         rangesBase = Asm.localLabel(d, "debug_rnglists_base"),
+        locations = Asm.localLabel(d, "debug_loclists"),
+        locationsBase = Asm.localLabel(d, "debug_loclists_base"),
         unit = Asm.localLabel(d, "debug_info"),
         infoStart = Asm.localLabel(d, "debug_info_start"),
         infoEnd = Asm.localLabel(d, "debug_info_end"),
     }
     let strings = Strings { d = d, index = Map.new(), texts = [] }
-    let refs = Refs { d = d, abstracts = Map.new(), callees = [], lists = [] }
-    abbreviations(labels, out)
-    info(labels, strings, refs, u, out)
+    let refs = Refs { d = d, abstracts = Map.new(), callees = [], lists = [],
+                      locations = [], bases = [], typeOf = u.typeOf }
+    let shown = Iterator.any(u.functions, fun(f) = len(f.variables) > 0
+                                                   || Iterator.any(f.inlined, showsVariables))
+    let listed = Iterator.any(u.functions, fun(f) =
+        Iterator.any(f.variables, listedVariable) || Iterator.any(f.inlined, listsVariables))
+    abbreviations(labels, shown, out)
+    info(labels, strings, refs, u, listed, out)
     rangeLists(labels, refs, out)
+    if listed { locationLists(labels, refs, out) }
+    if shown { gdbScripts(d, out) }
     Vec.push(out, Section(Asm.DebugStr))
     Vec.push(out, Label(labels.strings))
     for var k = 0; k < len(strings.texts); k = k + 1 {
@@ -226,22 +370,33 @@ fun emitUnit(d : Asm.Dialect, u : CompileUnit, out : Vec (Item i)) -> Unit {
     Vec.push(out, Label(labels.line))
 }
 
+-- Whether a call inlined, or one inlined into it, binds a variable; and
+-- whether one of those has a location list.
+fun showsVariables(call : Inlined) -> Bool =
+    len(call.variables) > 0 || Iterator.any(call.children, showsVariables)
+
+fun listsVariables(call : Inlined) -> Bool =
+    Iterator.any(call.variables, listedVariable) || Iterator.any(call.children, listsVariables)
+
+fun listedVariable(v : Variable) -> Bool = len(v.locations) > 0
+
 -- One abbreviation for the compile unit, two for a subprogram, with and
 -- without children, one for an abstract subprogram, and four for an inlined
--- subroutine: the tag, whether children follow, then each attribute with its
--- form.
+-- subroutine; and if `shown`, one for a compile unit with location lists,
+-- four for a variable, and one for a type: the tag, whether children follow,
+-- then each attribute with its form.
 --
 -- A subprogram with children is written with them and one without is not,
 -- because a children flag with no children is a null entry for every
 -- function that inlined nothing.
-fun abbreviations(labels : Labels, out : Vec (Item i)) -> Unit {
+fun abbreviations(labels : Labels, shown : Bool, out : Vec (Item i)) -> Unit {
     Vec.push(out, Section(Asm.DebugAbbrev))
     Vec.push(out, Label(labels.abbrev))
-    abbreviation(abbrevCompileUnit, tagCompileUnit, childrenYes,
-                 [(atProducer, formStrp), (atLanguage, formData2), (atName, formStrp),
-                  (atCompDir, formStrp), (atStmtList, formSecOffset), (atLowPc, formAddr),
-                  (atHighPc, formAddr), (atAddrBase, formSecOffset),
-                  (atRnglistsBase, formSecOffset)], out)
+    let unit = [(atProducer, formStrp), (atLanguage, formData2), (atName, formStrp),
+                (atCompDir, formStrp), (atStmtList, formSecOffset), (atLowPc, formAddr),
+                (atHighPc, formAddr), (atAddrBase, formSecOffset),
+                (atRnglistsBase, formSecOffset)]
+    abbreviation(abbrevCompileUnit, tagCompileUnit, childrenYes, unit, out)
     let subprogram = [(atName, formStrp), (atLowPc, formAddr), (atHighPc, formData4),
                       (atFrameBase, formExprloc)]
     abbreviation(abbrevSubprogram, tagSubprogram, childrenNo, subprogram, out)
@@ -256,6 +411,39 @@ fun abbreviations(labels : Labels, out : Vec (Item i)) -> Unit {
     abbreviation(abbrevInlined + 1, tagInlinedSubroutine, childrenYes, one, out)
     abbreviation(abbrevInlined + 2, tagInlinedSubroutine, childrenNo, list, out)
     abbreviation(abbrevInlined + 3, tagInlinedSubroutine, childrenYes, list, out)
+    if shown {
+        abbreviation(abbrevListedUnit, tagCompileUnit, childrenYes,
+                     Array.append(unit, [(atLoclistsBase, formSecOffset)]), out)
+        let variable = [(atName, formStrp), (atDeclFile, formUdata), (atDeclLine, formUdata),
+                        (atType, formRef4)]
+        let located = Array.append(variable, [(atLocation, formLoclistx)])
+        abbreviation(abbrevVariable, tagVariable, childrenNo, variable, out)
+        abbreviation(abbrevVariable + 1, tagVariable, childrenNo, located, out)
+        abbreviation(abbrevVariable + 2, tagFormalParameter, childrenNo, variable, out)
+        abbreviation(abbrevVariable + 3, tagFormalParameter, childrenNo, located, out)
+        abbreviation(abbrevBaseType, tagBaseType, childrenNo,
+                     [(atName, formStrp), (atEncoding, formData1), (atByteSize, formData1)],
+                     out)
+        abbreviation(abbrevPointer, tagPointerType, childrenNo,
+                     [(atType, formRef4), (atByteSize, formData1)], out)
+        abbreviation(abbrevVoidPointer, tagPointerType, childrenNo,
+                     [(atByteSize, formData1)], out)
+        abbreviation(abbrevTypedef, tagTypedef, childrenNo,
+                     [(atName, formStrp), (atType, formRef4)], out)
+        abbreviation(abbrevStructure, tagStructureType, childrenYes,
+                     [(atName, formStrp), (atByteSize, formUdata)], out)
+        abbreviation(abbrevMember, tagMember, childrenNo,
+                     [(atName, formStrp), (atType, formRef4), (atDataMemberLocation, formUdata)],
+                     out)
+        abbreviation(abbrevUnion, tagUnionType, childrenYes,
+                     [(atName, formStrp), (atByteSize, formUdata)], out)
+        abbreviation(abbrevEnumeration, tagEnumerationType, childrenYes,
+                     [(atName, formStrp), (atByteSize, formData1)], out)
+        abbreviation(abbrevEnumerator, tagEnumerator, childrenNo,
+                     [(atName, formStrp), (atConstValue, formSdata)], out)
+        abbreviation(abbrevArray, tagArrayType, childrenYes, [(atType, formRef4)], out)
+        abbreviation(abbrevSubrange, tagSubrangeType, childrenNo, [], out)
+    }
     Vec.push(out, Byte(0))
 }
 
@@ -284,7 +472,7 @@ fun abbreviation(code : Int, tag : Int, children : Int, attributes : Array (Int,
 -- pair of relocations, which debuggers do not apply to an object's DWARF. An
 -- inlined call's range is inside one function, so its length is a distance
 -- like a function's.
-fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
+fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit, listed : Bool,
          out : Vec (Item i)) -> Unit {
     Vec.push(out, Section(Asm.DebugInfo))
     Vec.push(out, Label(labels.unit))
@@ -296,7 +484,7 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
     Vec.push(out, Byte(addressSize))
     Vec.push(out, SectionOffset(labels.abbrev, labels.abbrev))
 
-    Vec.push(out, Uleb(abbrevCompileUnit))
+    Vec.push(out, Uleb(if listed { abbrevListedUnit } else { abbrevCompileUnit }))
     string(strings, labels, u.producer, out)
     half(languageC11, out)
     string(strings, labels, u.name, out)
@@ -306,9 +494,10 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
     Vec.push(out, WordOf(u.high))
     Vec.push(out, SectionOffset(labels.addressesBase, labels.addresses))
     Vec.push(out, SectionOffset(labels.rangesBase, labels.ranges))
+    if listed { Vec.push(out, SectionOffset(labels.locationsBase, labels.locations)) }
 
     for f in u.functions {
-        let parent = len(f.inlined) > 0
+        let parent = len(f.inlined) > 0 || len(f.variables) > 0
         Vec.push(out, Uleb(if parent { abbrevSubprogramParent } else { abbrevSubprogram }))
         named(strings, labels, f.name, out)
         Vec.push(out, WordOf(f.low))
@@ -317,7 +506,18 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
         Vec.push(out, Uleb(1))
         Vec.push(out, Byte(opReg29))
         if parent {
-            for call in f.inlined { inlinedEntry(labels, refs, call, out) }
+            -- The number of the label the function's location lists are
+            -- offsets from, made once it has a list.
+            var base = -1
+            let baseOf = fun() {
+                if base < 0 {
+                    base = len(refs.bases)
+                    Vec.push(refs.bases, f.base)
+                }
+                base
+            }
+            for v in f.variables { variableEntry(labels, strings, refs, baseOf, v, out) }
+            for call in f.inlined { inlinedEntry(labels, strings, refs, baseOf, call, out) }
             Vec.push(out, Byte(0))
         }
     }
@@ -327,13 +527,21 @@ fun info(labels : Labels, strings : Strings, refs : Refs, u : CompileUnit,
         named(strings, labels, refs.callees[k], out)
         Vec.push(out, Byte(inlineInlined))
     }
+    -- Each type, after every variable, since a variable's type is made
+    -- when the variable is written.
+    for var k = 0; k < len(u.types); k = k + 1 {
+        Vec.push(out, Label(typeLabel(refs.d, k)))
+        typeEntry(labels, strings, refs, u.types[k], out)
+    }
     Vec.push(out, Byte(0))
     Vec.push(out, Label(labels.infoEnd))
 }
 
--- The entry for `call` and its children.
-fun inlinedEntry(labels : Labels, refs : Refs, call : Inlined, out : Vec (Item i)) -> Unit {
-    let children = len(call.children) > 0
+-- The entry for `call` and its children, its variables first. `base` gives
+-- the number of the label their location lists are offsets from.
+fun inlinedEntry(labels : Labels, strings : Strings, refs : Refs, base : fun() -> Int,
+                 call : Inlined, out : Vec (Item i)) -> Unit {
+    let children = len(call.children) > 0 || len(call.variables) > 0
     let listed = len(call.ranges) > 1
     Vec.push(out, Uleb(abbrevInlined + (if children { 1 } else { 0 })
                        + (if listed { 2 } else { 0 })))
@@ -352,9 +560,96 @@ fun inlinedEntry(labels : Labels, refs : Refs, call : Inlined, out : Vec (Item i
     Vec.push(out, Uleb(Position.line(call.call)))
     Vec.push(out, Uleb(Position.column(call.call)))
     if children {
-        for inner in call.children { inlinedEntry(labels, refs, inner, out) }
+        for v in call.variables { variableEntry(labels, strings, refs, base, v, out) }
+        for inner in call.children { inlinedEntry(labels, strings, refs, base, inner, out) }
         Vec.push(out, Byte(0))
     }
+}
+
+-- The entry for `v`: its name, where it is bound, its type, and its
+-- location list if it has one, which `base` gives the number of the label
+-- its offsets are from.
+fun variableEntry(labels : Labels, strings : Strings, refs : Refs, base : fun() -> Int,
+                  v : Variable, out : Vec (Item i)) -> Unit {
+    let listed = len(v.locations) > 0
+    Vec.push(out, Uleb(abbrevVariable + (if listed { 1 } else { 0 })
+                       + (if v.parameter { 2 } else { 0 })))
+    string(strings, labels, v.name, out)
+    Vec.push(out, Uleb(Position.file(v.declared)))
+    Vec.push(out, Uleb(Position.line(v.declared)))
+    typeRef(labels, refs, refs.typeOf(v), out)
+    if listed {
+        Vec.push(out, Uleb(len(refs.locations)))
+        Vec.push(refs.locations, (base(), v.locations))
+    }
+}
+
+-- A `DW_FORM_ref4` to type entry `k`, which `info` writes after the
+-- subprograms.
+fun typeRef(labels : Labels, refs : Refs, k : Int, out : Vec (Item i)) -> Unit =
+    Vec.push(out, Difference(typeLabel(refs.d, k), labels.unit))
+
+fun typeLabel(d : Asm.Dialect, k : Int) -> Symbol =
+    Asm.localLabel(d, "debug_type" + Int.toString(k))
+
+-- The entry for `t`, with its members or enumerators as its children.
+fun typeEntry(labels : Labels, strings : Strings, refs : Refs, t : TypeEntry,
+              out : Vec (Item i)) -> Unit = match t {
+    BaseType(name, encoding, size) -> {
+        Vec.push(out, Uleb(abbrevBaseType))
+        string(strings, labels, name, out)
+        Vec.push(out, Byte(encoding))
+        Vec.push(out, Byte(size))
+    }
+    PointerTo(Some(k)) -> {
+        Vec.push(out, Uleb(abbrevPointer))
+        typeRef(labels, refs, k, out)
+        Vec.push(out, Byte(addressSize))
+    }
+    PointerTo(None) -> {
+        Vec.push(out, Uleb(abbrevVoidPointer))
+        Vec.push(out, Byte(addressSize))
+    }
+    Typedef(name, k) -> {
+        Vec.push(out, Uleb(abbrevTypedef))
+        string(strings, labels, name, out)
+        typeRef(labels, refs, k, out)
+    }
+    Structure(name, size, members) -> aggregateEntry(labels, strings, refs, abbrevStructure,
+                                                      name, size, members, out)
+    UnionOf(name, size, members) -> aggregateEntry(labels, strings, refs, abbrevUnion, name,
+                                                    size, members, out)
+    Enumeration(name, size, enumerators) -> {
+        Vec.push(out, Uleb(abbrevEnumeration))
+        string(strings, labels, name, out)
+        Vec.push(out, Byte(size))
+        for (enumerator, value) in enumerators {
+            Vec.push(out, Uleb(abbrevEnumerator))
+            string(strings, labels, enumerator, out)
+            for byte in slebBytes(value) { Vec.push(out, Byte(byte)) }
+        }
+        Vec.push(out, Byte(0))
+    }
+    ArrayOf(k) -> {
+        Vec.push(out, Uleb(abbrevArray))
+        typeRef(labels, refs, k, out)
+        Vec.push(out, Uleb(abbrevSubrange))
+        Vec.push(out, Byte(0))
+    }
+}
+
+fun aggregateEntry(labels : Labels, strings : Strings, refs : Refs, code : Int, name : String,
+                   size : Int, members : Vec Member, out : Vec (Item i)) -> Unit {
+    Vec.push(out, Uleb(code))
+    string(strings, labels, name, out)
+    Vec.push(out, Uleb(size))
+    for m in members {
+        Vec.push(out, Uleb(abbrevMember))
+        string(strings, labels, m.name, out)
+        typeRef(labels, refs, m.ty, out)
+        Vec.push(out, Uleb(m.offset))
+    }
+    Vec.push(out, Byte(0))
 }
 
 -- The number of the abstract subprogram for `callee`, which `info` writes
@@ -380,7 +675,8 @@ fun listLabel(d : Asm.Dialect, k : Int) -> Symbol =
 -- the range lists' header, and starts from a base address, its first
 -- range's start, which is the same number in the address table: a range is
 -- then a pair of offsets from it. Written even with no lists, since the
--- compile unit names both tables.
+-- compile unit names both tables. The location lists' base addresses
+-- follow the range lists' in the address table.
 --
 -- A range's offsets are distances in one function, which the assembler
 -- fixes, as a subprogram's length is. They are the encoding the system
@@ -405,6 +701,7 @@ fun rangeLists(labels : Labels, refs : Refs, out : Vec (Item i)) -> Unit {
         let (base, _) = list[0]
         Vec.push(out, WordOf(base))
     }
+    for base in refs.bases { Vec.push(out, WordOf(base)) }
     Vec.push(out, Label(addressesEnd))
 
     let start = Asm.localLabel(d, "debug_rnglists_start")
@@ -439,21 +736,89 @@ fun rangeLists(labels : Labels, refs : Refs, out : Vec (Item i)) -> Unit {
     Vec.push(out, Label(end))
 }
 
+-- `debug_loclists`: each variable's location list, named by its number in
+-- the offset table after the header as a range list is, and in the same
+-- encoding. A list starts from its function's base address, which is a
+-- number in the address table after the range lists'; each entry is then a
+-- pair of offsets from it, and the location expression there.
+--
+-- The offsets are distances in one function, which the assembler fixes, as
+-- a range list's are.
+fun locationLists(labels : Labels, refs : Refs, out : Vec (Item i)) -> Unit {
+    let d = refs.d
+    let n = len(refs.locations)
+    let start = Asm.localLabel(d, "debug_loclists_start")
+    let end = Asm.localLabel(d, "debug_loclists_end")
+    Vec.push(out, Section(Asm.DebugLoclists))
+    Vec.push(out, Label(labels.locations))
+    Vec.push(out, Difference(end, start))
+    Vec.push(out, Label(start))
+    half(version, out)
+    Vec.push(out, Byte(addressSize))
+    Vec.push(out, Byte(0))
+    half(n & 0xFFFF, out)
+    half(n >> 16, out)
+    Vec.push(out, Label(labels.locationsBase))
+    for var k = 0; k < n; k = k + 1 {
+        Vec.push(out, Difference(locationListLabel(d, k), labels.locationsBase))
+    }
+    for var k = 0; k < n; k = k + 1 {
+        let (b, locations) = refs.locations[k]
+        let base = refs.bases[b]
+        Vec.push(out, Label(locationListLabel(d, k)))
+        Vec.push(out, Byte(locationBaseAddressx))
+        Vec.push(out, Uleb(len(refs.lists) + b))
+        for at in locations {
+            Vec.push(out, Byte(locationOffsetPair))
+            Vec.push(out, UlebDifference(at.low, base))
+            Vec.push(out, UlebDifference(at.high, base))
+            Vec.push(out, Uleb(len(at.expression)))
+            for byte in at.expression { Vec.push(out, Byte(byte)) }
+        }
+        Vec.push(out, Byte(locationEndOfList))
+    }
+    Vec.push(out, Label(end))
+}
+
+-- On ELF, the entry that has gdb load the formatters for the types written
+-- here, by the name of their file: gdb looks for it in the current
+-- directory and then along its source path, which a user adds the
+-- formatters' directory to, so the program does not name where they are
+-- installed. The first byte says the entry names a Python file.
+fun gdbScripts(d : Asm.Dialect, out : Vec (Item i)) -> Unit = match d {
+    Asm.Elf -> {
+        Vec.push(out, Section(Asm.DebugGdbScripts))
+        Vec.push(out, Byte(1))
+        Vec.push(out, CString(gdbScript))
+    }
+    Asm.MachO -> {}
+}
+
+let gdbScript = "turkey_gdb.py"
+
+fun locationListLabel(d : Asm.Dialect, k : Int) -> Symbol =
+    Asm.localLabel(d, "debug_loclist" + Int.toString(k))
+
 -- -- inlined calls ---------------------------------------------------------------
 
 -- Returns `code`, the items of function `tag`, with a label before each line
--- table row whose inline site differs from the last row's, and the calls
+-- table row whose inline site differs from the last row's; the calls
 -- `sites` numbers (`Func.sites`), outermost first, each with the code it
--- covers. The rows run to `end`, the label after the function's last
--- instruction.
+-- covers; and of `variables`, the function's own. The rows run to `end`, the
+-- label after the function's last instruction.
 --
 -- A call's ranges are the maximal runs of rows whose site is the call's or
 -- one inlined into it. So each range lies within one of its parent's, and a
 -- call with no row of its own still covers the calls inlined into it.
 -- A label is an item of no size, so the code is the same with them.
+--
+-- A variable belongs to the call its binding is in, or to the function if
+-- that is in no call. One bound in a call that has no code is dropped: it
+-- is the callee's, and the frame a debugger would show it in is not there.
 fun inlinedCalls(d : Asm.Dialect, tag : Int, sites : Vec Position.Site,
-                 code : Vec (Item i), end : Symbol) -> (Vec (Item i), Vec Inlined) {
-    if len(sites) == 0 { return (code, []) }
+                 variables : Vec Variable, code : Vec (Item i),
+                 end : Symbol) -> (Vec (Item i), Vec Inlined, Vec Variable) {
+    if len(sites) == 0 { return (code, [], variables) }
     let calls = Calls {
         sites = sites, open = Array.filled(len(sites) + 1, None),
         nodes = Array.filled(len(sites) + 1, None), outermost = [],
@@ -479,7 +844,13 @@ fun inlinedCalls(d : Asm.Dialect, tag : Int, sites : Vec Position.Site,
         Vec.push(out, item)
     }
     move(calls, current, 0, end)
-    (out, calls.outermost)
+    let own = []
+    for v in variables {
+        let s = Position.site(v.declared)
+        if s == 0 { Vec.push(own, v) }
+        else if let Some(node) = calls.nodes[s] { Vec.push(node.variables, v) }
+    }
+    (out, calls.outermost, own)
 }
 
 -- The calls being found in one function: its sites, the label each one's
@@ -536,7 +907,8 @@ fun move(calls : Calls, from : Int, to : Int, here : Symbol) -> Unit {
 -- Makes the entry for site `s`, in its parent's or among the outermost.
 fun enter(calls : Calls, s : Int) -> Unit {
     let site = calls.sites[s - 1]
-    let node = Inlined { callee = site.callee, call = site.call, ranges = [], children = [] }
+    let node = Inlined { callee = site.callee, call = site.call, ranges = [], children = [],
+                         variables = [] }
     calls.nodes[s] = Some(node)
     let parent = Position.site(site.call)
     if parent == 0 { Vec.push(calls.outermost, node) }
@@ -851,6 +1223,17 @@ fun uleb(out : Vec Byte, n : Int) -> Unit {
         }
         Vec.push(out, Byte.truncate(low | 0x80))
     }
+}
+
+-- `n` in unsigned and in signed LEB128, as the values of the bytes.
+fun ulebBytes(n : Int) -> Array Int = bytesOf(uleb(_, n))
+
+fun slebBytes(n : Int) -> Array Int = bytesOf(sleb(_, n))
+
+fun bytesOf(write : fun(Vec Byte) -> Unit) -> Array Int {
+    let out = []
+    write(out)
+    Array.map(out, Byte.toInt)
 }
 
 -- `n` in signed LEB128: as `uleb`, until what is left is all sign bits and

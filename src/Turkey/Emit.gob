@@ -1,6 +1,7 @@
 export (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
     emitSwapStack, emitStackStart, emitWorkerStart, functionEnd,
+    blockOrder, computedAtEdges, markKey,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -40,7 +41,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..
                    RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
-import Turkey.Stream (Item(..), Cfi(..))
+import Turkey.Stream (Item(..), Cfi(..), fits32)
 
 -- The items emitted so far, and the source position the next instruction
 -- takes (`Turkey.Position`).
@@ -65,10 +66,39 @@ type Code = Code {
     var prologueDone : Bool,
     -- The format, which decides the shape of the frame rules (`cfi`).
     dialect          : Asm.Dialect,
+    -- The labels debug information asks for, by `markKey` of where each
+    -- goes, and the last point of the block being emitted that has had
+    -- its label placed. Labels, like rows, are items of no size.
+    marks            : Map.Map Int Asm.Symbol,
+    var markedTo     : Int,
 }
 
 fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
-    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d }
+    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d,
+           marks = Map.new(), markedTo = 0 }
+
+-- The key of point `p` of block `block`, for the labels `emitFunc` places.
+-- Point 0 is the block's start, point `n + 1` is after its instruction `n`,
+-- so the point after the last instruction is before the terminator, and the
+-- point one past that is after the terminator.
+fun markKey(block : Int, p : Int) -> Int = block << 32 | p
+
+-- Places the label of each point of `block` after the last one placed, up
+-- to and including `upTo`, that the marks ask for.
+fun markTo(b : Code, block : Int, upTo : Int) -> Unit {
+    while b.markedTo < upTo {
+        b.markedTo = b.markedTo + 1
+        if let Some(label) = Map.get(b.marks, markKey(block, b.markedTo)) {
+            emit(b, Label(label))
+        }
+    }
+}
+
+-- Places the label at the start of `block`, if the marks ask for one.
+fun markStart(b : Code, block : Int) -> Unit {
+    b.markedTo = 0
+    if let Some(label) = Map.get(b.marks, markKey(block, 0)) { emit(b, Label(label)) }
+}
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -105,10 +135,13 @@ fun instruction(b : Code, op : A.Arm) -> Unit {
 fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
     Asm.localLabel(d, "f" + Int.toString(tag) + "end")
 
--- Function `tag`, with a line table row at each change of position if `rows`.
+-- Function `tag`, with a line table row at each change of position if `rows`,
+-- and the labels `marks` asks for (`markKey`).
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, rows : Bool, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, rows, asm.dialect)
+             l : Frame.Layout, tag : Int, rows : Bool, marks : Map.Map Int Asm.Symbol,
+             out : Vec (Item Inst)) -> Unit {
+    let b = Code { items = out, at = 0, rows = rows, row = -1, prologueDone = False,
+                   dialect = asm.dialect, marks = marks, markedTo = 0 }
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
     cfi(b, StartProc)
@@ -118,33 +151,34 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     b.at = f.at
     prologue(b, l)
     b.prologueDone = rows
-    -- Reverse postorder, so a block's most likely successor is the next block
-    -- and its edge costs no instruction at all. A block that is only the exit
-    -- is not placed: its edges go to the exit itself.
     let exits = exitBlocks(f)
-    let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
+    let order = blockOrder(f)
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
     let cold = Cold { text = code([], rows, d), count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
-        let at = Ssa.blockId(order[k])
-        let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
+        let at = order[k]
+        let next = if k + 1 < len(order) { order[k + 1] } else { -1 }
         emit(b, Label(blockLabel(d, tag, at)))
+        markStart(b, at)
         let block = f.blocks[at]
         match fused(block, reads) {
             Some((c, yes, no)) -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts) - 1)
+                markTo(b, at, len(block.insts))
                 b.at = block.termAt
                 conditional(b, d, tag, exits, c, yes, no, next)
             }
             None -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
+                markTo(b, at, len(block.insts))
                 if !endsInTailCall(block) {
                     b.at = block.termAt
                     emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
                 }
             }
         }
+        markTo(b, at, len(block.insts) + 1)
     }
     for item in cold.text.items { emit(b, item) }
     if leaves(f) {
@@ -156,6 +190,25 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     cfi(b, EndProc)
     if rows { emit(b, Label(functionEnd(d, tag))) }
 }
+
+-- The blocks of `f` in the order `emitFunc` places them: reverse postorder,
+-- so a block's most likely successor is the next block and its edge costs no
+-- instruction at all. A block that is only the exit is not placed: its edges
+-- go to the exit itself.
+fun blockOrder(f : Func Inst) -> Vec Int {
+    let exits = exitBlocks(f)
+    let out = []
+    for at in Ssa.reversePostorder(f) {
+        if !exits[Ssa.blockId(at)] { Vec.push(out, Ssa.blockId(at)) }
+    }
+    out
+}
+
+-- For each value, whether a jump computes it into a block parameter's
+-- register in place of its definition (`atEdges`): until the jump, no
+-- register holds it.
+fun computedAtEdges(f : Func Inst) -> Array Bool =
+    Array.map(atEdges(f, useCounts(f)), Option.isSome)
 
 -- -- the zero exit -----------------------------------------------------------
 
@@ -216,6 +269,7 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
               edges : Array (Option A.Arm), at : Int, insts : Vec Inst,
               upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
+        markTo(b, at, n)
         -- Skip a definition the jump computes, rather than filtering the block
         -- beforehand, so that `n` stays the instruction's index in its block:
         -- `Frame.stubAt` names an allocation by that index.
@@ -1363,7 +1417,8 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- The frame table, before anything allocates: a collection that cannot
     -- read the table sees no frame's roots at all.
     symbolInto(b, A.x0, Asm.frameTableSymbol(d))
-    call(b, d, "turkey_frame_table_register")
+    symbolInto(b, Physical(Gp, 1), Asm.entrySymbol(d))
+    call(b, d, "turkey_frame_table_set")
 
     -- The literals' static objects, before any code that can read one runs.
     -- After early initialization, which sets the collector's range to empty;
@@ -1574,30 +1629,51 @@ fun byteLength(text : String) -> Int {
 
 -- Every safepoint's live roots, keyed by return address.
 --
--- The emitter cannot sort this: the addresses do not exist until the linker
--- has run, and all it can write is a word naming the label, for the linker to
--- relocate. So the runtime owns the lookup structure, which is OCaml's
--- division and the one LLVM states outright -- the compiler's format is for
--- getting the facts across, not for being queried.
+-- The emitter cannot sort this: it writes labels, whose addresses are not
+-- known until the assembler has placed them. So the emitted format only
+-- carries the facts across, and the runtime builds the structure it
+-- queries.
 --
--- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
--- computing them since phase 4.
+-- Every field is four bytes: the count, then per safepoint its return
+-- address's distance from the entry, its number of roots, and each root's
+-- offset from `x29`, signed (`Turkey.Frame.layout`). The return address is a
+-- distance and not an address because both labels are in the code, so the
+-- distance is fixed once the program is linked, and the table needs no
+-- relocation at load: it is read-only, and the loader never touches it. An
+-- absolute address would be a rebase per safepoint at every start, in a
+-- section the loader writes. The entry passes its own address to
+-- `turkey_frame_table_set`, which adds it back.
+--
+-- A distance must fit in a signed 32-bit field, so the code must be under
+-- 2 GB. `Turkey.Assembler` refuses a distance that does not fit; on the
+-- assembly path nothing here checks it.
 fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
                    out : Vec (Item Inst)) -> Unit {
     let b = code(out, False, asm.dialect)
     let d = asm.dialect
-    emit(b, Section(Asm.Relocated))
-    emit(b, Align(3))
+    emit(b, Section(Asm.Constants))
+    emit(b, Align(2))
     emit(b, Global(Asm.frameTableSymbol(d)))
     emit(b, Label(Asm.frameTableSymbol(d)))
     var n = 0
     for (_, l) in layouts { n = n + len(l.maps) }
-    emit(b, Word(n))
+    tableField(b, n, "safepoint count")
     for (tag, l) in layouts {
         for m in l.maps {
-            emit(b, WordOf(safepointLabel(d, tag, m.block, m.index)))
-            emit(b, Word(len(m.offsets)))
-            for o in m.offsets { emit(b, Word(o)) }
+            emit(b, Difference(safepointLabel(d, tag, m.block, m.index), Asm.entrySymbol(d)))
+            tableField(b, len(m.offsets), "root count")
+            for o in m.offsets { tableField(b, o, "root offset") }
         }
     }
+}
+
+-- A four-byte field of the frame table, refused if it does not fit rather
+-- than written truncated: a wrong offset is a root the collector reads from
+-- the wrong slot.
+fun tableField(b : Code, n : Int, what : String) -> Unit {
+    if !fits32(n) {
+        error("internal error: the frame table's " + what + " " + Int.toString(n)
+              + " does not fit in four bytes")
+    }
+    emit(b, Word32(n))
 }

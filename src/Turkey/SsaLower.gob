@@ -1,6 +1,6 @@
 export (
     Unsupported(..), Signature(..), Lifting(..), Module(..),
-    lowerBind, lowerProgram, tagsOf, signatures, signatureOf,
+    lowerBind, lowerProgram, tagsOf, wrapTag, signatures, signatureOf,
 )
 
 -- Core to the low IR.
@@ -109,6 +109,9 @@ type Lifting = Lifting {
     var next : Int,
     -- The program's source files, which every position is numbered against.
     files : Position.Files,
+    -- Whether each function records the variables it binds
+    -- (`Func.variables`), for `-g`.
+    variables : Bool,
 }
 
 -- A whole program's low IR: the functions, the storage the module initializer
@@ -490,7 +493,7 @@ fun argsFor(l : Lower, target : BlockId, values : Array Value) -> Vec Value {
 -- its constructors (`tagsOf`). `files` numbers the program's source files for
 -- the positions every instruction carries.
 fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
-                 files : Position.Files)
+                 files : Position.Files, variables : Bool)
         -> (Module, Vec Unsupported) {
     let done : Vec (Ssa.Func Low) = []
     let skipped : Vec Unsupported = []
@@ -513,7 +516,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
     let all = Vec.append(program.dicts, program.binds)
     let made = Parallel.map(all, fun(bind) =
         lowerBind(bind, decls, globals, globalRefs, tags, sigs,
-                  Lifting { next = 0, files = files }))
+                  Lifting { next = 0, files = files, variables = variables }))
     for var i = 0; i < len(all); i = i + 1 {
         let bind = all[i]
         let (f, lifted, why) = made[i]
@@ -536,7 +539,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
     }
     -- Global initializers can also introduce lifted lambdas.
     let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
-                                              sigs, Lifting { next = 0, files = files })
+                                              sigs, Lifting { next = 0, files = files, variables = variables })
     Vec.push(done, init)
     Vec.push(done, early)
     for g in lifted { Vec.push(done, g) }
@@ -1121,6 +1124,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
             else if len(vs) == 1 { fromStored(l, layout, vs[0]) }
             else { fromSlots(l, layout, vs) }
         Map.put(l.env, idOf(params[i].name, params[i].id), bound)
+        named(l, params[i].name, params[i].ty, f.at, True, bound)
     }
     prepareLocals(l, body)
     lower(l, body, ToReturn)
@@ -1268,6 +1272,53 @@ fun builds(l : Lower, fn : Core) -> Bool = match fn.kind {
     _ -> False
 }
 
+-- With `-g`, records that `v` holds the local `name`, of type `ty`, bound at
+-- packed position `declared`: a parameter if `parameter`, and a variable
+-- otherwise. A value of several slots is held by each of its slots, or by
+-- its box; a `var` kept in a slot holds whatever the slot does, which
+-- `Turkey.Promote` follows.
+--
+-- Only a name the source wrote is recorded: the compiler's own locals carry a
+-- `%` in theirs. A record kept in the frame's slots is not, since no value
+-- holds it.
+fun named(l : Lower, name : String, ty : Ty.Type, declared : Int, parameter : Bool,
+          v : Value) -> Unit {
+    if !l.shared.variables || String.contains(name, "%") { return }
+    let id = Ssa.valueId(v)
+    if Map.contains(l.localObjects, id) { return }
+    let f = l.func
+    let k = len(f.variables)
+    let variable = fun(t : Ty.Type, boxed : Bool) = Ssa.Variable {
+        name = name, declared = declared, parameter = parameter, ty = t,
+        layout = heldOf(l, t), boxed = boxed,
+    }
+    match Map.get(l.localRefs, id) {
+        Some((slot, _)) -> {
+            let content = Core.refElem(ty)
+            Vec.push(f.variables, variable(content, isMulti(heldOf(l, content))))
+            Map.put(f.slotHolds, slot, k)
+            return
+        }
+        None -> {}
+    }
+    match Map.get(l.held.multis, id) {
+        Some(Slots(_, values)) -> {
+            Vec.push(f.variables, variable(ty, False))
+            for var j = 0; j < len(values); j = j + 1 {
+                Ssa.hold(f, Ssa.valueId(values[j]), k, j)
+            }
+        }
+        Some(Boxed(_, box)) -> {
+            Vec.push(f.variables, variable(ty, True))
+            Ssa.hold(f, Ssa.valueId(box), k, -1)
+        }
+        None -> {
+            Vec.push(f.variables, variable(ty, False))
+            Ssa.hold(f, id, k, -1)
+        }
+    }
+}
+
 fun isMarker(l : Lower, v : Value) -> Bool =
     Map.contains(l.localRefs, Ssa.valueId(v))
         || Map.contains(l.localObjects, Ssa.valueId(v))
@@ -1343,7 +1394,9 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
         }
         CLet(name, id, ty, bound, body, _) -> {
             let local = idOf(name, id)
-            Map.put(l.env, local, localBinding(l, local, bound))
+            let v = localBinding(l, local, bound)
+            Map.put(l.env, local, v)
+            named(l, name, ty, L.here(l.b), False, v)
             lower(l, body, dest)
         }
         -- A join is a block, and a jump to it is a jump. This is the case the
@@ -1358,6 +1411,7 @@ fun lowerHere(l : Lower, e : Core, dest : Dest) -> Unit {
             L.into(l.b, target)
             for var i = 0; i < len(params) && i < len(entered); i = i + 1 {
                 Map.put(l.env, idOf(params[i].name, params[i].id), entered[i])
+                named(l, params[i].name, params[i].ty, L.here(l.b), False, entered[i])
             }
             lower(l, body, dest)
         }
@@ -1636,7 +1690,7 @@ fun literalKey(lit : Lit) -> Int = match lit {
 fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Type,
           dest : Dest) -> Unit {
     match alt.alt {
-        AAny(binder) -> bindTo(l, binder, whole)
+        AAny(binder) -> bindTo(l, binder, whole, ty)
         ACon(name, binders, _) -> match shape {
             Words(c) -> if Option.isNone(Vec.indexOf(c.nullaries, name)) {
                 compactPayload(l, c, binders, whole, ty)
@@ -1673,7 +1727,7 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
     }
     match alt {
         AAny(binder) -> {
-            bindTo(l, binder, v)
+            bindTo(l, binder, v, ty)
             L.terminate(l.b, Jump(success, []))
         }
         ALit(LString(text)) -> stringTest(l, text, v, success, failure)
@@ -1710,10 +1764,12 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
             -- The wrapper is not there, so there is no tag to test and nothing
             -- to take out: the value in hand already *is* the payload. See
             -- `Decls.newtypes`.
-            if Option.isSome(Decls.erasedPayload(l.decls, ty)) && len(binders) == 1 {
-                bindTo(l, binders[0], v)
-                L.terminate(l.b, Jump(success, []))
-                return
+            if let Some(payload) = Decls.erasedPayload(l.decls, ty) {
+                if len(binders) == 1 {
+                    bindTo(l, binders[0], v, payload)
+                    L.terminate(l.b, Jump(success, []))
+                    return
+                }
             }
             match compactAt(l, name, ty) {
                 Some(c) -> {
@@ -1751,10 +1807,14 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
     }
 }
 
-fun bindTo(l : Lower, binder : Option (String, Int), v : Value) -> Unit = match binder {
-    Some((name, id)) -> Map.put(l.env, idOf(name, id), v)
-    None -> {}
-}
+fun bindTo(l : Lower, binder : Option (String, Int), v : Value, ty : Ty.Type) -> Unit =
+    match binder {
+        Some((name, id)) -> {
+            Map.put(l.env, idOf(name, id), v)
+            named(l, name, ty, L.here(l.b), False, v)
+        }
+        None -> {}
+    }
 
 -- Bind the fields an arm binds of `v`, a value of a flat type built with its
 -- `k`th constructor, from the slots `f` puts them in. A field nobody binds is
@@ -1783,13 +1843,13 @@ fun flatTag(l : Lower, v : Value, f : Layout.Flat) -> Value =
     slotsAt(l, v, Ssa.Layout { slots = f.slots }, [0])[0]
 
 -- The fields an arm binds: each one's index among the object's fields,
--- counting from `first`, and its binder id.
+-- counting from `first`, its binder's name and id, and its type.
 fun positions(binders : Array (Option (String, Int)), types : Array Ty.Type,
-              first : Int) -> Vec (Int, Int) {
+              first : Int) -> Vec (Int, String, Int, Ty.Type) {
     let out = []
     for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
         match binders[i] {
-            Some((name, id)) -> Vec.push(out, (first + i, idOf(name, id)))
+            Some((name, id)) -> Vec.push(out, (first + i, name, idOf(name, id), types[i]))
             None -> {}
         }
     }
@@ -1895,8 +1955,13 @@ fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
 
 -- Read each field an arm binds and bind it, from an object whose fields are
 -- placed as `p` says.
-fun destructure(l : Lower, object : Value, p : Placed, fields : Vec (Int, Int)) -> Unit {
-    for (index, id) in fields { Map.put(l.env, id, readField(l, object, p, index)) }
+fun destructure(l : Lower, object : Value, p : Placed,
+                fields : Vec (Int, String, Int, Ty.Type)) -> Unit {
+    for (index, name, id, fieldTy) in fields {
+        let v = readField(l, object, p, index)
+        Map.put(l.env, id, v)
+        named(l, name, fieldTy, L.here(l.b), False, v)
+    }
 }
 
 -- Where each field of an object is among the object's slots: the layout of
@@ -2245,9 +2310,11 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         CMatch(_, _) -> control(l, e, held)
         -- One path in and one out, so no block is needed for its value, and
         -- a value of several slots keeps the form its body gave it.
-        CLet(name, id, _, bound, body, _) -> {
+        CLet(name, id, ty, bound, body, _) -> {
             let local = idOf(name, id)
-            Map.put(l.env, local, localBinding(l, local, bound))
+            let v = localBinding(l, local, bound)
+            Map.put(l.env, local, v)
+            named(l, name, ty, L.here(l.b), False, v)
             value(l, body)
         }
         CJoin(_, _, _, _, _, _) -> control(l, e, held)
@@ -2564,8 +2631,9 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     }
     for var i = 0; i < len(params) && i < len(taken); i = i + 1 {
         let layout = heldOf(l, params[i].ty)
-        Map.put(child.env, idOf(params[i].name, params[i].id),
-                fromStored(child, layout, coerce(child, taken[i], Layout.storedRep(layout))))
+        let bound = fromStored(child, layout, coerce(child, taken[i], Layout.storedRep(layout)))
+        Map.put(child.env, idOf(params[i].name, params[i].id), bound)
+        named(child, params[i].name, params[i].ty, g.at, True, bound)
     }
     prepareLocals(child, body)
     lower(child, body, ToReturn)

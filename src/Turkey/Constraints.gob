@@ -213,6 +213,9 @@ type PredCell = PredCell {
     var stage : Stage,
     -- Unique to the cell, so that a list holding a cell twice can tell.
     serial   : Int,
+    -- When the cell first became inert, counted across the run; 0 until
+    -- then. A scheme lists its predicates in this order.
+    var stuck : Int,
     -- How many instances deep below a wanted the program demanded this one
     -- arose, and that wanted: GHC's reduction depth (`subGoalDepthExceeded`).
     depth    : Int,
@@ -229,16 +232,16 @@ type Stage
     -- Discharged, reported, or taken into a scheme.
     | Finished
 
-type Serials = Serials { var next : Int }
+type Serials = Serials { var next : Int, var stuck : Int }
 
-let serials = Serials { next = 0 }
+let serials = Serials { next = 0, stuck = 0 }
 
 -- Returns a wanted that `p` holds, with its evidence to go into `hole`.
 fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> PredCell {
     serials.next = serials.next + 1
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
-        serial = serials.next, depth = 0, root = p,
+        serial = serials.next, stuck = 0, depth = 0, root = p,
     }
 }
 
@@ -249,7 +252,7 @@ fun subgoal(parent : PredCell, p : Pred, where : Option Span, context : String,
     serials.next = serials.next + 1
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None,
-        stage = Queued, serial = serials.next, depth = parent.depth + 1,
+        stage = Queued, serial = serials.next, stuck = 0, depth = parent.depth + 1,
         root = parent.root,
     }
 }
@@ -1697,6 +1700,10 @@ fun rest(s : Solver, c : PredCell) -> Unit {
         if Option.isNone(inertAt(w.dicts, key, impl)) { Map.put(w.dicts, key, c) }
     }
     c.stage = Resting
+    if c.stuck == 0 {
+        serials.stuck = serials.stuck + 1
+        c.stuck = serials.stuck
+    }
     Vec.push(w.cells, c)
     for v in Ty.varsOf(c.pred.args) {
         match Map.get(s.watchers, v.id) {
@@ -2532,13 +2539,13 @@ fun trapped(c : PredCell, k : ConCell) -> Unit {
 -- caller has already refused one that also mentions the binder's skolems
 -- (`confine`).
 fun retained(s : Solver, level : Int) -> Vec PredCell {
-    -- In an order the schedule does not decide, since a scheme lists them:
-    -- the equalities first, as the work list takes them, and within each kind
-    -- in the order the body demanded them.
+    -- In the order a scheme lists them: the equalities first, as the work
+    -- list takes them, and within each kind in the order solving first found
+    -- each stuck, which a kick-out or a wake does not change.
     let inert = Vec.sortBy(members(s.here), fun(a, b) = if kindRank(a) != kindRank(b) {
         Int.compare(kindRank(a), kindRank(b))
     } else {
-        Int.compare(a.serial, b.serial)
+        Int.compare(a.stuck, b.stuck)
     })
     promoteFloating(inert, level)
     -- No two of these are the same predicate: an inert set holds one of each,

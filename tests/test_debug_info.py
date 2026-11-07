@@ -486,6 +486,139 @@ def test_gdb_formatters_tell_a_programs_type_from_the_librarys(how):
     assert re.search(r"x = 1.*y = 2.*w = 4", out, re.DOTALL), out[-4000:]
     assert '"own"' in out, out[-4000:]
 
+# A `var` assigned unconditionally and on one branch, one overwritten on a
+# path to where it is dead, and a `let` that shadows another.
+ASSIGNED = """\
+fun highest(n : Int, items : Vec Int) -> Int {
+    if n > 1000 { return highest(n - 1, items) }
+    var best = 0
+    for item in items {
+        let score = item * 3 % 7
+        if score > best { best = score }
+        print(Int.toString(best))
+    }
+    best
+}
+
+fun twice(n : Int) -> Int {
+    if n > 1000 { return twice(n - 1) }
+    var s = "first" + Int.toString(n)
+    print(s)
+    s = "again" + Int.toString(n)
+    print("between")
+    if n > 0 {
+        s = "second" + Int.toString(n)
+        print("inside")
+    }
+    print("joined")
+    print(s)
+    n
+}
+
+fun stale(n : Int) -> Int {
+    if n > 1000 { return stale(n - 1) }
+    var s = "first" + Int.toString(n)
+    print(s)
+    if n > 0 {
+        s = "second" + Int.toString(n)
+        print(s)
+    }
+    print("met")
+    n
+}
+
+fun shadow(n : Int) -> Int {
+    if n > 1000 { return shadow(n - 1) }
+    let x = "outer" + Int.toString(n)
+    print(x)
+    let x = String.byteLength(x) * 2
+    print(Int.toString(x))
+    print("after")
+    print(Int.toString(x))
+    n
+}
+
+fun main() {
+    print(Int.toString(highest(0, [2, 3])))
+    print(Int.toString(twice(1)))
+    print(Int.toString(stale(1)))
+    print(Int.toString(shadow(1)))
+}
+"""
+
+
+def _line(source: str, text: str, after: str = "") -> int:
+    """The number of the first line of `source` containing `text`, after the
+    first containing `after`."""
+    lines = source.splitlines()
+    start = next(i for i, line in enumerate(lines) if after in line)
+    return next(i for i in range(start, len(lines)) if text in lines[i]) + 1
+
+
+# Each stop in ASSIGNED, and what each variable there must be: a value, or
+# None where no value may show.
+ASSIGNED_STOPS = [
+    (_line(ASSIGNED, "if score > best"), {"best": "0", "score": "6"}),
+    (_line(ASSIGNED, "if score > best"), {"best": "6", "score": "2"}),
+    (_line(ASSIGNED, 'print("between")'), {"s": '"again1"'}),
+    (_line(ASSIGNED, 'print("inside")'), {"s": '"second1"'}),
+    (_line(ASSIGNED, 'print("joined")'), {"s": '"second1"'}),
+    (_line(ASSIGNED, 'print("met")'), {"s": None}),
+]
+
+
+def _assigned_stops(out: str) -> list[str]:
+    stops = _stops(out, "== stop")
+    assert len(stops) == len(ASSIGNED_STOPS), out[-4000:]
+    return stops
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_lldb_shows_each_variable_as_last_assigned(how):
+    """A `var` shows its old value until the statement that assigns it, not
+    from where the new value is computed; and one overwritten on the way to
+    a point shows nothing there rather than what it held before."""
+    _lldb()
+    lines = sorted({line for line, _ in ASSIGNED_STOPS})
+    command = [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch"]
+    for line in lines:
+        command += ["-o", f"breakpoint set --file prog.gob --line {line}"]
+    command += ["-o", "run"]
+    for _ in ASSIGNED_STOPS:
+        command += ["-o", "script print('== stop')", "-o", "frame variable", "-o", "continue"]
+    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
+        for name, value in expected.items():
+            shown = re.findall(rf"^\([^)]*\) {name} = (.*)$", stop, re.MULTILINE)
+            available = [v for v in shown if "not available" not in v]
+            if value is None:
+                assert available == [], stop
+            else:
+                assert len(available) == 1 and available[0].endswith(value), stop
+
+
+@pytest.mark.parametrize("how", PATHS)
+def test_gdb_shows_each_variable_as_last_assigned(how):
+    gdb = _gdb()
+    lines = sorted({line for line, _ in ASSIGNED_STOPS})
+    command = [gdb, "-nx", "-batch",
+               "-iex", f"add-auto-load-safe-path {FORMATTERS}", "-iex", f"directory {FORMATTERS}"]
+    for line in lines:
+        command += ["-ex", f"break prog.gob:{line}"]
+    command += ["-ex", "run"]
+    for _ in ASSIGNED_STOPS:
+        command += ["-ex", "echo == stop\\n", "-ex", "info args", "-ex", "info locals",
+                    "-ex", "continue"]
+    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
+        for name, value in expected.items():
+            shown = re.findall(rf"^{name} = (.*)$", stop, re.MULTILINE)
+            available = [v for v in shown if "optimized out" not in v]
+            if value is None:
+                assert available == [], stop
+            else:
+                assert len(available) == 1 and available[0].endswith(value), stop
+
 @pytest.mark.parametrize("how", PATHS)
 def test_gdb_loads_the_formatters_the_program_names(how):
     """gdb finds `turkey_gdb.py` by the name `.debug_gdb_scripts` gives it,

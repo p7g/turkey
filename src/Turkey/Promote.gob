@@ -80,6 +80,19 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
         panic("slot promotion: uninitialized local in " + f.name)
     }
     let slots = needed
+    -- The values that outlast this pass, for naming where an assignment is
+    -- (`Ssa.anchorAt`): not a load's, which an alias replaces, nor the
+    -- parameters made below, which may be removed.
+    let made = len(f.reps)
+    let loaded = BitSet.new(made)
+    if len(f.variables) > 0 {
+        for block in f.blocks {
+            for inst in block.insts {
+                if let SlotLoad(_) = inst.op { BitSet.add(loaded, Ssa.valueId(inst.result)) }
+            }
+        }
+    }
+    let kept = fun(v : Value) = Ssa.valueId(v) < made && !BitSet.contains(loaded, Ssa.valueId(v))
     let incoming : Vec (Map Int Value) = []
     let original : Vec Int = []
     for var b = 0; b < len(f.blocks); b = b + 1 {
@@ -98,22 +111,34 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
         Vec.push(incoming, values)
     }
     let aliases = Map.new()
+    -- Where each alias's value was defined, for what it held.
+    let aliasedAt : Map Int (Option Ssa.Anchor) = Map.new()
     let outgoing : Vec (Map Int Value) = []
     let count = len(f.blocks)
     for var b = 0; b < count; b = b + 1 {
         let values = incoming[b]
-        let kept = []
-        for inst in f.blocks[b].insts {
+        let remaining = []
+        let block = f.blocks[b]
+        for var i = 0; i < len(block.insts); i = i + 1 {
+            let inst = block.insts[i]
             match inst.op {
-                SlotLoad(slot) -> Map.put(aliases, Ssa.valueId(inst.result), get(values, slot))
+                SlotLoad(slot) -> {
+                    let id = Ssa.valueId(inst.result)
+                    Map.put(aliases, id, get(values, slot))
+                    if Map.contains(f.holds, id) {
+                        Map.put(aliasedAt, id, Ssa.anchorAt(block, i, kept))
+                    }
+                }
                 SlotStore(slot, v) -> {
                     Map.put(values, slot, v)
-                    holdsSlot(f, slot, v)
+                    if let Some(k) = Map.get(f.slotHolds, slot) {
+                        Ssa.holdFrom(f, Ssa.valueId(v), k, -1, Ssa.anchorAt(block, i, kept))
+                    }
                 }
-                _ -> Vec.push(kept, inst)
+                _ -> Vec.push(remaining, inst)
             }
         }
-        f.blocks[b].insts = kept
+        block.insts = remaining
         Vec.push(outgoing, values)
     }
     for var b = 0; b < count; b = b + 1 {
@@ -166,6 +191,9 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
                 match unique {
                     Some(v) -> if !multiple {
                         Map.put(aliases, Ssa.valueId(p), v)
+                        if Map.contains(f.holds, Ssa.valueId(p)) {
+                            Map.put(aliasedAt, Ssa.valueId(p), Ssa.anchorAt(f.blocks[b], 0, kept))
+                        }
                         changed = True
                     }
                     None -> {}
@@ -177,7 +205,8 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
     -- give what they held to the value that replaces them.
     for id in Map.keys(f.holds) {
         if Map.contains(aliases, id) {
-            Ssa.carryHolds(f, id, Ssa.valueId(resolve(aliases, Value(id))))
+            Ssa.carryHolds(f, id, Ssa.valueId(resolve(aliases, Value(id))),
+                           Map.getOr(aliasedAt, id, None))
         }
     }
     let keep = Array.map(f.blocks, fun(block) = Array.map(block.params,

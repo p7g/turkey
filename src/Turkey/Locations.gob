@@ -10,16 +10,22 @@ export (locate)
 -- recomputation holds what the value it stands in for holds
 -- (`Regalloc.Spills.reloadOf`). Each value's range starts at its definition
 -- and ends at its last use, or at the end of a block it is live out of: past
--- its last use its register may hold something else. Where two values of one
--- variable overlap, the later one's range wins. Its location there is:
+-- its last use its register may hold something else.
+--
+-- A value is the variable's only where it is the variable's one reaching
+-- assignment: a value is assigned to a variable at its definition, or at the
+-- point an assignment to a `var` or a copy was (`Ssa.Func.anchors`), and it
+-- stops being the variable's at the next assignment on any path to a point.
+-- So a value shows neither before the statement that assigns it, nor after
+-- another has, nor where paths that assigned different values meet. Its
+-- location, where it is the variable's, is:
 --
 -- * a frame slot, from the store into it on, for a value the collector roots
 --   (`Turkey.Roots`) or the allocator spills: such a slot holds that one
 --   value until the frame ends, so the value is there for as long as any of
 --   its reloads is live, and between them too. Past its last use it is still
 --   there, to the end of its block and in every block its block dominates,
---   since the store is behind each of those; a range that only that keeps
---   gives way to any other of the variable's;
+--   since the store is behind each of those;
 -- * otherwise its register.
 --
 -- A variable held in several slots is in several values at once, one per
@@ -102,11 +108,13 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
     let rank = Array.filled(len(f.blocks), -1)
     for var k = 0; k < len(order); k = k + 1 { rank[order[k]] = k }
     let idom = Ssa.dominators(followed)
-    -- Each value found in its slot so far, and the first block it was found
-    -- in, which every later block it dominates has the store behind: blocks
-    -- are placed in an order that puts a block after its dominator.
-    let homes : Vec (Int, Int) = []
+    -- The values first found in their slots in each block, which every block
+    -- it dominates has the store behind: blocks are placed in an order that
+    -- puts a block after its dominator, so a block's dominators have theirs
+    -- by the time it is reached.
+    let homes : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
     let homed = Map.new()
+    let reach = reaching(f, followed, order)
     -- Each variable's ranges, per slot: one list for a variable held as one
     -- value.
     let ranges : Array (Array (Vec Range)) = Array.map(f.variables, fun(v) =
@@ -152,13 +160,17 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
         }
         -- A value in a slot, in a block its own dominates, past its last use.
         let weak = Map.new()
-        for (id, home) in homes {
-            if home != b && !Map.contains(starts, id)
-               && Ssa.dominates(idom, BlockId(home), BlockId(b)) {
-                Map.put(starts, id, 0)
-                Map.put(weak, id, ())
+        var above = b
+        while above != Ssa.blockId(f.entry) {
+            above = Option.unwrapOr(idom[above], Ssa.blockId(f.entry))
+            for id in homes[above] {
+                if !Map.contains(starts, id) {
+                    Map.put(starts, id, 0)
+                    Map.put(weak, id, ())
+                }
             }
         }
+        let timeline = timelineOf(reach, b)
         for (id, start) in Map.entries(starts) {
             -- Where the range starts, its location, and whether that is a slot.
             let (low, expression, inSlot) = match slots[id] {
@@ -171,7 +183,7 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
             }
             if inSlot && !Map.contains(homed, id) {
                 Map.put(homed, id, ())
-                Vec.push(homes, (id, b))
+                Vec.push(homes[b], id)
             }
             let end = if inSlot || BitSet.contains(liveOut[b], id) { n + 1 }
                       else { Map.getOr(ends, id, start) }
@@ -181,12 +193,15 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
                         let pieces = ranges[k]
                         let j = if slot < 0 { 0 } else { slot }
                         if (slot < 0) == (len(pieces) == 1) && j < len(pieces) {
-                            Vec.push(pieces[j], Range {
-                                weak = Map.contains(weak, id),
-                                lowBlock = b, low = from, highBlock = b, high = to,
-                                from = rank[b] << 32 | from, to = rank[b] << 32 | to,
-                                expression = at,
-                            })
+                            let piece = reach.base[k] + j
+                            for (low, high) in current(timeline, piece, origin[id], from, to) {
+                                Vec.push(pieces[j], Range {
+                                    weak = Map.contains(weak, id),
+                                    lowBlock = b, low = low, highBlock = b, high = high,
+                                    from = rank[b] << 32 | low, to = rank[b] << 32 | high,
+                                    expression = at,
+                                })
+                            }
                         }
                     }
                 }
@@ -216,6 +231,141 @@ fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout
         })
     }
     (marks, variables, base)
+}
+
+-- Which value is each variable's at each point, as a forward analysis of
+-- assignments: `base` numbers each variable's pieces from `base[k]`, one
+-- for a variable held as one value; `inState` is each piece's at the start
+-- of each block, by block; and `assigned` each block's assignments, as
+-- (point, piece, value), in the order of their points. A piece's state is a
+-- value, `unassigned`, or `several`, where paths that assigned different
+-- values meet.
+type Reach = Reach {
+    base     : Array Int,
+    inState  : Array (Array Int),
+    assigned : Array (Vec (Int, Int, Int)),
+    -- The pieces each assignment to a piece ends besides its own.
+    ends     : Array (Vec Int),
+}
+
+let unassigned = -1
+let several = -2
+
+-- Returns `f`'s variables' assignments and their states at the start of
+-- each block of `followed`, `f` with reloads read as their origins, whose
+-- blocks `order` lists with each block after its dominator.
+fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach {
+    let base = Array.filled(len(f.variables), 0)
+    var total = 0
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        base[k] = total
+        total = total + pieceCount(f.variables[k])
+    }
+    let ends : Array (Vec Int) = Array.init(total, fun(_) = [])
+    -- Where each value is defined: its block, and the point after it.
+    let definedAt = Map.new()
+    for b in order {
+        let block = followed.blocks[b]
+        for p in block.params { Map.put(definedAt, Ssa.valueId(p), (b, 0)) }
+        for var k = 0; k < len(block.insts); k = k + 1 {
+            Ssa.eachDef(block.insts[k], fun(v) = Map.put(definedAt, Ssa.valueId(v), (b, k + 1)))
+        }
+    }
+    let assigned : Array (Vec (Int, Int, Int)) = Array.init(len(f.blocks), fun(_) = [])
+    for (id, held) in Map.entries(f.holds) {
+        for (k, slot) in held {
+            let j = if slot < 0 { 0 } else { slot }
+            if (slot < 0) != (pieceCount(f.variables[k]) == 1) || j >= pieceCount(f.variables[k]) {
+                continue
+            }
+            let anchors = Ssa.anchorsOf(f, id, k, slot)
+            let points = if len(anchors) == 0 { [Map.get(definedAt, id)] } else {
+                Vec.map(anchors, fun(a) = match a {
+                    Ssa.After(w) -> Map.get(definedAt, w)
+                    Ssa.Before(u) -> Option.map(Map.get(definedAt, u),
+                                                fun((b, p)) = (b, max(p - 1, 0)))
+                })
+            }
+            for point in points {
+                if let Some((b, p)) = point { Vec.push(assigned[b], (p, base[k] + j, id)) }
+            }
+        }
+    }
+    for var b = 0; b < len(assigned); b = b + 1 {
+        assigned[b] = Vec.sortBy(assigned[b], fun((x, _, _), (y, _, _)) = Array.threeWay(x, y))
+    }
+    let preds = Ssa.predecessors(followed)
+    let inState = Array.init(len(f.blocks), fun(_) = Array.filled(total, unassigned))
+    let outState : Array (Option (Array Int)) = Array.filled(len(f.blocks), None)
+    var changed = True
+    while changed {
+        changed = False
+        for b in order {
+            let here = Array.filled(total, unassigned)
+            for p in preds[b] {
+                if let Some(out) = outState[Ssa.blockId(p)] {
+                    for var i = 0; i < total; i = i + 1 { here[i] = join(here[i], out[i]) }
+                }
+            }
+            inState[b] = here
+            let out = Array.map(here, fun(x) = x)
+            for (_, piece, id) in assigned[b] { assign(out, ends, piece, id) }
+            let same = match outState[b] {
+                Some(before) -> same(before, out)
+                None -> False
+            }
+            if !same {
+                outState[b] = Some(out)
+                changed = True
+            }
+        }
+    }
+    Reach { base = base, inState = inState, assigned = assigned, ends = ends }
+}
+
+fun join(x : Int, y : Int) -> Int =
+    if x == unassigned { y } else if y == unassigned || x == y { x } else { several }
+
+fun assign(state : Array Int, ends : Array (Vec Int), piece : Int, id : Int) -> Unit {
+    state[piece] = id
+    for other in ends[piece] { state[other] = several }
+}
+
+-- Each piece's states through block `b`: (point, state) from point 0, for
+-- the pieces an assignment in the block changes.
+fun timelineOf(reach : Reach, b : Int) -> (Array Int, Map Int (Vec (Int, Int))) {
+    let start = reach.inState[b]
+    let changes = Map.new()
+    let state = Array.map(start, fun(x) = x)
+    let note = fun(piece : Int, p : Int) {
+        match Map.get(changes, piece) {
+            Some(cs) -> Vec.push(cs, (p, state[piece]))
+            None -> Map.put(changes, piece, [(0, start[piece]), (p, state[piece])])
+        }
+    }
+    for (p, piece, id) in reach.assigned[b] {
+        assign(state, reach.ends, piece, id)
+        note(piece, p)
+        for other in reach.ends[piece] { note(other, p) }
+    }
+    (start, changes)
+}
+
+-- The stretches of `from` to `to` where `id` is `piece`'s value.
+fun current(timeline : (Array Int, Map Int (Vec (Int, Int))), piece : Int, id : Int,
+            from : Int, to : Int) -> Vec (Int, Int) {
+    let (start, changes) = timeline
+    let out = []
+    match Map.get(changes, piece) {
+        None -> if start[piece] == id { Vec.push(out, (from, to)) }
+        Some(cs) -> for var i = 0; i < len(cs); i = i + 1 {
+            let (p, state) = cs[i]
+            let (next, _) = if i + 1 < len(cs) { cs[i + 1] } else { (to, 0) }
+            let (low, high) = (max(from, p), min(to, next))
+            if state == id && low < high { Vec.push(out, (low, high)) }
+        }
+    }
+    out
 }
 
 -- `f` with every read of a value renamed by `follow`, and nothing else

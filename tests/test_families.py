@@ -231,7 +231,7 @@ def test_an_equation_that_can_never_be_decided_is_rejected():
     assert "cannot tell whether 'Container.Elem c' is 'Int'" in message
     # And the remedy, which is the equality itself: `f` is rejected for saying
     # too little, not for being wrong, and adding it to the context fixes it.
-    assert "add 'Container.Elem c ~ Int' to the context" in message
+    assert "add 'Elem c ~ Int' to the context" in message
     assert scheme(
         CONTAINER + "fun f[Elem c ~ Int, Container c](xs : c) -> Int = first(xs)",
         "f",

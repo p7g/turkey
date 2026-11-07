@@ -14,8 +14,9 @@ export (program, eraseType)
 -- unpacks a `y : Elem b` matched as an `Array` only if it can see that
 -- `Elem b` is `Array Int`. So every type is rewritten by the equalities the
 -- coercions around it grant as they are erased, as `Turkey.Coretc` reads it
--- under them. A binder's type is rewritten under the coercions its value
--- binds at its top as well (`outerEqualities`): every lambda over evidence
+-- under them. A dictionary parameter grants its class's equality
+-- superclasses the same way. A binder's type is rewritten under the evidence
+-- its value binds at its top as well (`outerEvidence`): every lambda over evidence
 -- there, and the first that takes other parameters too, as a worker does.
 -- Every use of the binder has supplied them, and the binder and its value
 -- then agree on every parameter's type, which is what a call's layout is read
@@ -46,7 +47,8 @@ export (program, eraseType)
 -- cannot be observed.
 
 import Turkey.Binders as Binders
-import Turkey.Classes (ClassTable)
+import Turkey.Classes as Classes
+import Turkey.Classes (ClassTable(..), Slot(..))
 import Turkey.Core (..)
 import Turkey.Inert as Inert
 import Turkey.Types as Ty
@@ -76,18 +78,20 @@ fun program(p : CProgram, table : Binders.Table, classes : ClassTable) -> CProgr
         table = table, owner = Binders.unrecordedOwner(table, "", "Turkey.Erase's parameters"),
         count = 0, classes = classes, inert = Inert.empty(classes),
     }
-    CProgram {
+    let out = CProgram {
         dicts = Vec.map(p.dicts, eraseBind(x, _)),
         binds = Vec.map(p.binds, eraseBind(x, _)),
     }
+    classes.erased = True
+    out
 }
 
--- Returns `x`'s equalities with `equalities` added. One that can never hold is
--- dropped: nothing can apply the lambda that binds it.
-fun granting(x : Eraser, equalities : Vec (Ty.Type, Ty.Type)) -> Inert.Inert {
-    if len(equalities) == 0 { return x.inert }
-    let givens = Vec.map(equalities, fun((l, r)) = Inert.given(Ty.pred(Ty.equals, [l, r])))
-    let (out, _) = Inert.extend(x.inert, Vec.toArray(givens))
+-- Returns `x`'s equalities with those `evidence` grants added. One that can
+-- never hold is dropped: nothing can apply the lambda that binds it.
+fun granting(x : Eraser, evidence : Vec Ty.Pred) -> Inert.Inert {
+    let givens = Inert.granted(x.classes, Vec.toArray(Vec.map(evidence, Inert.given)))
+    if len(givens) == 0 { return x.inert }
+    let (out, _) = Inert.extend(x.inert, givens)
     out
 }
 
@@ -98,7 +102,7 @@ fun typeIn(x : Eraser, t : Ty.Type) -> Ty.Type = Inert.rewrite(x.inert, eraseTyp
 -- value's top too.
 fun binderType(x : Eraser, t : Ty.Type, value : Core) -> Ty.Type {
     let outside = x.inert
-    x.inert = granting(x, outerEqualities(value))
+    x.inert = granting(x, outerEvidence(value))
     let out = typeIn(x, t)
     x.inert = outside
     out
@@ -129,12 +133,8 @@ fun eraseType(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
 
 fun erase(x : Eraser, e : Core) -> Core = match e.kind {
     CLam(params, body, name) -> {
-        let granted = Vec.new(0)
-        for p in params {
-            if let Some(sides) = coercionSides(p.ty) { Vec.push(granted, sides) }
-        }
         let outside = x.inert
-        x.inert = granting(x, granted)
+        x.inert = granting(x, evidencePreds(params))
         let kept = Array.filter(params, fun(p) = !isCoercion(p.ty))
         let out = if len(params) > 0 && len(kept) == 0 { delayed(x, erase(x, body)) } else {
             mkCore(typeIn(x, e.ty), e.span,
@@ -148,11 +148,45 @@ fun erase(x : Eraser, e : Core) -> Core = match e.kind {
         if len(args) > 0 && len(kept) == 0 { return erase(x, fn) }
         mkCore(typeIn(x, e.ty), e.span, CApp(erase(x, fn), Array.map(kept, erase(x, _))))
     }
+    -- An existential arm's dictionaries grant their equality superclasses to
+    -- its body, as a lambda's do.
+    CMatch(scrutinee, alts) -> mkCore(typeIn(x, e.ty), e.span, CMatch(erase(x, scrutinee),
+        Vec.map(alts, fun(a) {
+            let outside = x.inert
+            x.inert = granting(x, match a.alt {
+                ACon(name, _, Some(o)) -> Classes.openedPreds(x.classes, name, o.skolems)
+                _ -> []
+            })
+            let body = erase(x, a.body)
+            x.inert = outside
+            CAlt { alt = a.alt, body = body }
+        })))
+    -- A dictionary loses its equality slots, which hold coercions, and a read
+    -- of a slot after them moves down.
+    CDict(cls, slots) -> mkCore(typeIn(x, e.ty), e.span, CDict(cls,
+        Array.map(Array.filter(slots, fun(v) = !isCoercion(v.ty)), erase(x, _))))
+    CSlot(target, index) -> mkCore(typeIn(x, e.ty), e.span,
+        CSlot(erase(x, target), erasedSlot(x, target.ty, index)))
     CLet(name, id, bound, value, body, binders) -> mkCore(typeIn(x, e.ty), e.span,
         CLet(name, id, binderType(x, bound, value), erase(x, value), erase(x, body), binders))
     _ -> mkCore(typeIn(x, e.ty), e.span, mapKind(e.kind, Mapper {
         expr = erase(x, _), type_ = typeIn(x, _), bind = eraseBind(x, _),
     }))
+}
+
+-- Returns where slot `index` of a dictionary of type `dictTy` is once its
+-- equality slots are gone.
+fun erasedSlot(x : Eraser, dictTy : Ty.Type, index : Int) -> Int {
+    let cls = match dictClass(dictTy) {
+        Some(c) -> c
+        None -> return index
+    }
+    let slots = Classes.dictSlots(x.classes, cls)
+    var out = index
+    for var i = 0; i < index && i < len(slots); i = i + 1 {
+        if let EqualitySlot(_) = slots[i] { out = out - 1 }
+    }
+    out
 }
 
 -- The erased body of a lambda over coercions alone, delayed as the lambda

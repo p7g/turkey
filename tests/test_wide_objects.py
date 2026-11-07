@@ -197,3 +197,35 @@ fun main() {{ print(make("x").0) }}
         lang.run(src)
     assert ("a value needs 65536 pointer fields, and a value can have at most 65535"
             in str(error.value))
+
+
+def test_a_var_field_after_many_inline_slots_keeps_its_writes():
+    # Each `P` is held in line as two slots, so `n` is the 81st slot of the
+    # object but its 41st field. Its writes must not be forwarded past.
+    count = 40
+    fields = ", ".join(f"p{i} : P" for i in range(count))
+    values = ", ".join(f"p{i} = P {{ a = i + {i}, b = Int.toString({i}) }}"
+                       for i in range(count))
+    src = f"""
+type P = P {{ a : Int, b : String }}
+
+type Wide = Wide {{ {fields}, var n : Int, last : P }}
+
+fun make(i : Int) -> Wide {{
+    let w = Wide {{ {values}, n = 0, last = P {{ a = i, b = "last" }} }}
+    w.n = w.n + i + 1
+    w.n = w.n * 2
+    w
+}}
+
+fun main() {{
+    let kept = []
+    for var i = 0; i < 300; i = i + 1 {{ Vec.push(kept, make(i)) }}
+    let w = kept[299]
+    print(Int.toString(w.n) + " " + Int.toString(w.p{count - 1}.a) + " " + w.p{count - 1}.b
+          + " " + w.last.b + Int.toString(w.last.a))
+}}
+"""
+    result = lang.run(src, env=STRESS, flags=("--gc-verify",))
+    assert result.code == 0, result.stderr
+    assert result.stdout == f"600 {299 + count - 1} {count - 1} last299\n"

@@ -1,0 +1,88 @@
+export (ScopedValue, new, with, get)
+
+-- Scoped values: a value bound for the extent of a call, which every call
+-- inside it can read without being passed it.
+--
+--     let depth : ScopedValue Int = ScopedValue.new()
+--
+--     fun indent() -> String =
+--         String.repeat("  ", Option.unwrapOr(ScopedValue.get(depth), 0))
+--
+--     fun nested(f : fun() -> a) -> a =
+--         ScopedValue.with(depth, Option.unwrapOr(ScopedValue.get(depth), 0) + 1, f)
+--
+-- `with(key, value, f)` binds `key` to `value` while `f()` runs, and `get`
+-- returns the innermost binding of `key`, or `None` outside every one. When
+-- `with` returns, the binding it made is gone and any it shadowed is back.
+-- Nothing assigns a binding; a value that has to change is a mutable object,
+-- bound once.
+--
+-- Bindings belong to the running coroutine, not to the thread: a task that
+-- suspends inside a `with` and resumes on another worker still sees them.
+-- A task starts with the bindings of the code that made it (`System.Task`'s
+-- `spawn`), and later `with`s on either side do not reach the other.
+--
+-- A key is made once, usually as a top-level `let`. Each `new()` makes a
+-- distinct key, even for the same type.
+--
+-- **Costs.** A coroutine's bindings are an immutable list, innermost first,
+-- because there are a handful of them at most: `with` allocates one node and
+-- does no copying, a new task shares its creator's list, and `get` walks the
+-- list to its key. A key bound deep under many others, or shadowed by many
+-- rebindings, costs a step per binding in front of it.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Eq (Eq(..), (==))
+import Data.Option (Option(..))
+import Turkey.Coroutine as Co
+import Turkey.Coroutine (Binding(..))
+
+-- A key for scoped values of type `a`: its number, unique among keys.
+--
+-- The constructor is not exported, and `get`'s cast relies on that. Only
+-- `new` makes a key, each with a fresh number, and a call is never
+-- generalized, so a number belongs to one key at one type. A key built from a
+-- constructor would be a value, and a polymorphic one could bind a `String`
+-- and be read as an `Int`.
+type ScopedValue a = ScopedValue(Int)
+
+-- The next key's number. Atomic, since tasks on several workers may make
+-- keys at once.
+let keys : Prim.Atomic = Prim.atomicNew(0)
+
+-- Returns a new key, distinct from every other.
+fun new() -> ScopedValue a = ScopedValue(Prim.atomicAddTo(keys, 1))
+
+-- Returns `f()`, run with `key` bound to `value`.
+fun with(key : ScopedValue a, value : a, f : fun() -> b) -> b {
+    let ScopedValue(id) = key
+    let outer = Co.bindings()
+    Co.bindingsSet(Some(Binding { key = id, value = value, next = outer }))
+    let result = f()
+    -- Restore by reading the slot again rather than keeping a reference to
+    -- it: `f` may have suspended and resumed on another thread, and the
+    -- running coroutine's slot is the one to restore. A panic in `f` ends
+    -- the program without returning here, so nothing else needs restoring.
+    Co.bindingsSet(outer)
+    result
+}
+
+-- Returns the value of the innermost binding of `key`, or `None` if no
+-- `with` around the running code binds it.
+fun get(key : ScopedValue a) -> Option a {
+    let ScopedValue(id) = key
+    var at = Co.bindings()
+    loop {
+        match at {
+            None -> return None
+            Some(Binding { key = k, value, next }) -> {
+                -- Each key's number is its own, and `with` binds a key only
+                -- to a value of its type, so an equal number means the
+                -- hidden type is `a`, and the cast is the identity.
+                if k == id { return Some(Prim.castAs(value)) }
+                at = next
+            }
+        }
+    }
+}

@@ -1,7 +1,7 @@
 export (
     oneOf,
-    Constraint(..), Instantiates(..), PredCell(..), Implication(..), LetCell(..), cpredOf,
-    cpredInto,
+    Constraint(..), Instantiates(..), PredCell(..), Stage(..), Implication(..), LetCell(..),
+    cpredOf, cpredInto, newCell,
     noBinder,
     Binding(..), Env(..), newEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
@@ -43,7 +43,10 @@ export (
 --
 -- `HasField` is Gaster & Jones's `r \ l` with the rows removed; in that shape it
 -- is GHC's `HasField x r a | x r -> a`. Records here are nominal, so entailment
--- is a declaration lookup. See `improve` for what the missing rows cost.
+-- is a declaration lookup. Without rows a third argument would carry the
+-- field's type, and two demands for one field would need an improvement rule
+-- to agree; here `r.f` has the type `Field.f r`, so two reads are one type
+-- expression and unification equates them unasked.
 --
 -- A class predicate is the fourth form. It is discharged from the instance
 -- table, or from the assumptions a `CAssume` has in scope: checking an instance
@@ -65,8 +68,8 @@ export (
 -- carries the skolems, so the implication's level is that `CLet`'s rank. Two
 -- rules hold of it:
 --
--- * Its body is solved against its givens to a *residual*, the predicates
---   `settle` leaves deferred when the `CLet` generalizes. A residual predicate
+-- * Its body is solved against its givens to a *residual*, the wanteds
+--   still inert when the `CLet` generalizes. A residual predicate
 --   over variables of the implication's own rank is reported by the split,
 --   because no scheme of a signature carries it. One over an outer variable
 --   floats to the enclosing scope, unless it mentions one of the skolems:
@@ -81,20 +84,30 @@ export (
 --   guess the enclosing scope never sees (OutsideIn(X), Example 5.1). Class
 --   givens add no such choice, so they leave every variable touchable.
 --
+-- **The wanteds are solved by OutsideIn(X)'s simplifier** (§7, and §8.2 for
+-- its shape): each implication has a work list and an inert set of wanteds,
+-- and `solveSimples` moves wanteds from one to the other until the work list
+-- is empty. See there for the loop, its fixpoint and its termination.
+--
 -- **Equalities are rewrites, in two sets.** The equality givens in scope are
 -- `inert`, a canonical substitution `Turkey.Inert` maintains, and a given that
--- can never hold is refused at its context. Every wanted is kept rewritten by
--- them: `unify` asks them about each family application and skolem it meets,
--- `defer` queues an equation in rewritten form, and `equals` retries one the
--- same way. The family equalities waiting in the queue rewrite the class
--- predicates beside them (`waiting`), but nothing else. So a wanted never
--- rewrites a given, and never proves itself.
+-- can never hold is refused at its context. The inert wanted equalities of an
+-- implication that can be rewrite rules are the second set, layered over the
+-- first (`rewriteW`, `Inert.rewriteOver`). A wanted is rewritten by both
+-- before any rule looks at it: that is how two wanted equalities interact and
+-- how a given simplifies a wanted (Fig. 22 and 23). A given is rewritten only
+-- by givens, inside `Turkey.Inert`, which no wanted ever enters. So a wanted
+-- never rewrites a given, as §7.4.3 requires: "allowing given constraints to
+-- contain evidence from wanted constraints can easily make the algorithm
+-- sensitive to the order in which the rewrite rules fire". `unify`, during
+-- generation, asks only the givens, and defers what they do not decide to
+-- the work list, where the wanteds are asked too.
 --
 -- An associated family makes an *equation* deferrable, and it comes back as the
--- equality predicate `~`, which is why there is one queue here rather than
--- two. `OneOf` is the last predicate: the closed set of
+-- equality predicate `~`, which is why there is one work list here rather
+-- than two. `OneOf` is the last predicate: the closed set of
 -- types a numeric literal could have, settled by three rules -- a singleton set
--- is an equation, two sets over one variable intersect, and a set nothing can
+-- is an equation, two sets over one type intersect, and a set nothing can
 -- narrow further is defaulted.
 
 import Data.Set as Set
@@ -126,7 +139,7 @@ type Constraint
     -- predicate carries the verb instead -- "read" or "assign to" -- which is
     -- the one thing about a field access the predicate itself does not record;
     -- any other phrase is spliced into "expected ..., found ... in <phrase>".
-    -- Mutable, because `improve` rewrites a predicate's arguments in place.
+    -- Mutable, because the solver rewrites a predicate's arguments in place.
     | CPred(PredCell)
     | CAnd(Vec Constraint)
     -- `exists vars. body` -- the variables generation invented under a binder.
@@ -184,8 +197,9 @@ type Constraint
     -- one around each top-level binding group's definition.
     | CUnit(Constraint)
 
--- A deferred predicate keeps its identity across rounds, and `improve` rewrites
--- its arguments where it stands, so it is a record rather than a variant field.
+-- A wanted keeps its identity while it moves between its implication's work
+-- list and inert set, and is rewritten where it stands, so it is a record
+-- rather than a variant field.
 type PredCell = PredCell {
     var pred : Pred,
     span     : Option Span,
@@ -196,37 +210,159 @@ type PredCell = PredCell {
     -- The innermost implication enclosing where the predicate arose, whose
     -- givens alone may discharge it. `None` until the solver first meets it.
     var at   : Option Implication,
+    var stage : Stage,
+    -- Unique to the cell, so that a list holding a cell twice can tell.
+    serial   : Int,
+    -- How many instances deep below a wanted the program demanded this one
+    -- arose, and that wanted: GHC's reduction depth (`subGoalDepthExceeded`).
+    depth    : Int,
+    root     : Pred,
 }
+
+-- Where a wanted is in the solver.
+type Stage
+    -- On its implication's work list, or being solved.
+    = Queued
+    -- In its implication's inert set: no rule applies to it until something
+    -- it mentions changes.
+    | Resting
+    -- Discharged, reported, or taken into a scheme.
+    | Finished
+
+type Serials = Serials { var next : Int }
+
+let serials = Serials { next = 0 }
+
+-- Returns a wanted that `p` holds, with its evidence to go into `hole`.
+fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> PredCell {
+    serials.next = serials.next + 1
+    PredCell {
+        pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
+        serial = serials.next, depth = 0, root = p,
+    }
+}
+
+-- Returns a wanted that `p` holds, arising at `where` from solving `parent`:
+-- one level deeper, with the same root.
+fun subgoal(parent : PredCell, p : Pred, where : Option Span, context : String,
+            hole : Hole) -> PredCell {
+    serials.next = serials.next + 1
+    PredCell {
+        pred = p, span = where, context = context, hole = hole, at = None,
+        stage = Queued, serial = serials.next, depth = parent.depth + 1,
+        root = parent.root,
+    }
+}
+
+-- How deep below a wanted the program demanded its instances may go: GHC's
+-- default `-freduction-depth`.
+let reductionDepth = 200
 
 fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
     cpredInto(p, newHole(), where, context)
 
 -- Returns the constraint that `p` holds, with its evidence to go into `hole`.
 fun cpredInto(p : Pred, hole : Hole, where : Option Span, context : String) -> Constraint =
-    CPred(PredCell { pred = p, span = where, context = context, hole = hole, at = None })
+    CPred(newCell(p, where, context, hole))
 
 -- The givens of one `CAssume` together with those of every `CAssume` around
 -- it: what a wanted that arose inside it may be discharged with.
 --
 -- A wanted is solved only under the givens of the implications that enclose
--- it, wherever the solver happens to be when it retries the wanted: `settle`
--- re-enters each wanted's own implication first. An outer wanted retried while
--- an inner signature's givens are in force would otherwise be discharged by
--- them, and its evidence would name a dictionary that is out of scope where
--- it is used (OutsideIn(X) keeps each wanted in its implication's tree for
--- the same reason).
+-- it: `entail` enters the wanted's own implication first. An outer wanted
+-- solved while an inner signature's givens are in force would otherwise be
+-- discharged by them, and its evidence would name a dictionary that is out of
+-- scope where it is used (OutsideIn(X) keeps each wanted in its
+-- implication's tree for the same reason).
 type Implication = Implication {
     -- Unique per `CAssume` solved, and 0 for the top level, which has none.
     id          : Int,
     -- The class givens, innermost last, each under the name of its
     -- dictionary. Never changed once made.
     assumptions : Vec (String, Pred),
+    -- The class givens and all their superclasses, rewritten by the equality
+    -- givens: what a wanted might yet match (`classRule`).
+    matchable   : Vec Pred,
     -- The equality givens, canonical.
     inert       : Inert.Inert,
     -- The highest rank whose variables are untouchable: the rank a `CAssume`
     -- with an equality among its givens was entered at, or `Ty.noScope` when
     -- no such given is in scope.
     untouchable : Int,
+    -- The wanteds of this implication still to be solved.
+    work        : WorkList,
+    -- The wanteds of this implication that no rule applies to.
+    wanted      : Inerts,
+}
+
+-- Returns an implication with no wanteds.
+fun implication(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
+                inert : Inert.Inert, untouchable : Int) -> Implication {
+    let matchable = Vec.new(len(assumptions))
+    for (_, a) in assumptions {
+        for q in Classes.bySuper(classes, a) {
+            Vec.push(matchable, Ty.pred(q.name, Array.map(q.args, Inert.rewrite(inert, _))))
+        }
+    }
+    Implication {
+        id = id, assumptions = assumptions, matchable = matchable, inert = inert,
+        untouchable = untouchable,
+        work = WorkList {
+            eqs = Vec.new(4), nextEq = 0, rest = Vec.new(8), nextRest = 0,
+            eqsNow = Vec.new(4), restNow = Vec.new(4),
+        },
+        wanted = Inerts {
+            cells = Vec.new(8), rules = Map.new(), count = 0, dicts = Map.new(),
+            numerals = Map.new(), irreducibles = Map.new(),
+        },
+    }
+}
+
+-- A work list, with the equalities taken before anything else (GHC's Note
+-- [Prioritise equalities]: an equality processed first may decide a type that
+-- a class predicate is waiting on, which would otherwise become inert only to
+-- be kicked out again).
+--
+-- Within each kind, what solving produces -- a rule's subgoals, the parts an
+-- equation decomposes into, what a unification wakes or a rule kicks out --
+-- is taken last in, first out, from `eqsNow` and `restNow`, before what the
+-- program demanded, which is taken in the order it was demanded. GHC's
+-- `solveSimples` examines its constraints "initially ... in left-to-right
+-- order" and `emitWork` pushes what solving emits onto the front. So a
+-- wanted woken by a unification is solved next, and a contradiction it
+-- holds is reported at its own origin rather than at whichever wanted the
+-- queue reaches first.
+type WorkList = WorkList {
+    eqs          : Vec PredCell,
+    var nextEq   : Int,
+    rest         : Vec PredCell,
+    var nextRest : Int,
+    eqsNow       : Vec PredCell,
+    restNow      : Vec PredCell,
+}
+
+-- An implication's inert wanteds: OutsideIn(X)'s inert set (§8.2) for the
+-- wanted side. The givens beside them are the implication's `assumptions`
+-- and `inert`, which nothing here changes.
+--
+-- A cell is in the set while its stage is `Resting` and its `at` is this
+-- implication. Leaving the set only changes the cell, so the tables below may
+-- hold cells that have left, and every read skips them.
+type Inerts = Inerts {
+    -- Every cell that entered the set, in order.
+    var cells : Vec PredCell,
+    -- The wanted equalities that are rewrite rules, by `ruleKey` of their left
+    -- side.
+    rules     : Map String (Vec PredCell),
+    -- How many rules ever entered: `rewriteW` skips the lookup while none has.
+    var count : Int,
+    -- The class wanteds, by `Ty.predKey`.
+    dicts     : Map String PredCell,
+    -- The numeric literals' `OneOf` demands, by `Ty.typeKey` of the type each
+    -- constrains.
+    numerals  : Map String PredCell,
+    -- The equalities that are not rules, by `Ty.predKey`.
+    irreducibles : Map String PredCell,
 }
 
 -- What a `CInstance` instantiates.
@@ -312,18 +448,22 @@ type Solver = Solver {
     -- modules sees its own.
     visibleCons     : fun(Option Span) -> Set.Set String,
     -- The implication being solved in: the innermost `CAssume` around the
-    -- constraint being solved, or around the wanted `settle` is retrying.
+    -- constraint being solved, or around the wanted `entail` is solving.
     -- Restored on the way out of each `CAssume`, which is what keeps a given
     -- inside its implication.
     var here        : Implication,
     -- How many `CAssume`s have been entered, for `Implication.id`.
     var entered     : Int,
-    -- While `settle` retries the queue: the givens of `here` extended with the
-    -- family equalities waiting in it from the same implication, which is
-    -- what a class predicate is discharged under. A wanted rewrites other
-    -- wanteds of its own implication's work list, and never a given or
-    -- itself.
-    var wanteds     : Option Inert.Inert,
+    -- Whether `solveSimples` is running, so that a rule which emits a
+    -- constraint only queues it.
+    var draining    : Bool,
+    -- The wanted a rule is being applied to, whose subgoals are one level
+    -- deeper than it.
+    var current     : Option PredCell,
+    -- For each unification variable, by id, the inert wanteds that mentioned
+    -- it when they entered their inert set. A cell that has left its set since
+    -- may still be listed.
+    watchers        : Map Int (Vec PredCell),
     -- The dictionary scopes open at the point being solved, innermost last. A
     -- `Use` keeps the records rather than their contents, because what a binder
     -- makes available is only known once its definition is solved.
@@ -331,8 +471,6 @@ type Solver = Solver {
     uses            : Vec Use,
     -- `pools[r]` holds the variables born at rank r.
     pools           : Vec (Vec VarCell),
-    -- Predicates that could not be settled yet.
-    var deferred    : Vec PredCell,
     -- Every binder that is not *closed*, with its name as the tree spells
     -- it. A binder missing from it is closed: it is top-level or imported,
     -- or let-bound with a scheme that mentions no type from the scopes
@@ -387,13 +525,10 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        here = Implication {
-            id = 0, assumptions = [], inert = Inert.empty(classes),
-            untouchable = Ty.noScope,
-        },
-        entered = 0, wanteds = None,
+        here = implication(classes, 0, [], Inert.empty(classes), Ty.noScope),
+        entered = 0, draining = False, current = None, watchers = Map.new(),
         scopes = Vec.new(4), uses = Vec.new(16),
-        pools = [Vec.new(8)], deferred = Vec.new(8),
+        pools = [Vec.new(8)],
         open = Map.new(), refusals = Map.new(), unchecked = Vec.new(4),
         solving = Set.new(),
     }
@@ -405,6 +540,7 @@ fun families(s : Solver) -> Option Ty.Families = Some(Ty.Families {
     reduce = fun(t) = reduceFam(s, t),
     defer = fun(a, b, sp, ctx) = defer(s, a, b, sp, ctx),
     untouchable = s.here.untouchable,
+    bound = fun(v) = woken(s, v),
 })
 
 -- -- ranks -------------------------------------------------------------------------
@@ -442,9 +578,11 @@ fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type = Inert.rewritten(s.her
 
 -- Take an equation unification could not decide.
 --
--- It becomes an equality *predicate* rather than joining a queue of its own.
--- A stuck equation and a deferred predicate are waiting on the same thing, so
--- the binder that can carry one can carry the other.
+-- It becomes an equality *predicate* on the work list of the implication
+-- being solved, as OutsideIn(X)'s on-the-fly unifier "bales out by adding a
+-- new, unsolved, equality constraint" (§8.2). A stuck equation and a stuck
+-- predicate are waiting on the same thing, so the binder that can carry one
+-- can carry the other.
 --
 -- Before queueing it, ask whether it *could* ever be decided: a family over a
 -- constructor no instance covers is stuck for good, and the equation's own span
@@ -468,7 +606,8 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
                 -- It is not: the declaration assumed that instance, and which
                 -- one it will be is the caller's business. Such an equation is
                 -- merely stuck, and is reported as stuck.
-                Some(missing) -> if Option.isNone(granted(s, missing)) {
+                Some(missing) -> if Option.isNone(granted(s, Ty.pred(missing.name,
+                        Array.map(missing.args, rewriteW(s, _))))) {
                     return Ty.typeError("no instance for '" + Ty.showPred(missing)
                                         + "', which '" + Ty.show(t) + "' needs", where)
                 }
@@ -483,20 +622,25 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     let flip = familyLike(right0) && !familyLike(left0)
     let left = if flip { right0 } else { left0 }
     let right = if flip { left0 } else { right0 }
-    Vec.push(s.deferred, PredCell {
-        pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
-        hole = newHole(), at = Some(s.here),
-    })
+    let p = Ty.pred(Ty.equals, [left, right])
+    -- An equation unification defers while a rule runs is a subgoal of the
+    -- wanted the rule is solving, as an instance's context is.
+    let c = match s.current {
+        Some(parent) -> subgoal(parent, p, where, context, newHole())
+        None -> newCell(p, where, context, newHole())
+    }
+    c.at = Some(s.here)
+    enqueue(s, c)
 }
 
 -- -- solving -----------------------------------------------------------------------
 
 fun run(s : Solver, c : Constraint) -> Unit {
     solve(s, c)
-    settle(s)
+    solveSimples(s)
     -- A refusal made at the outermost rank, in a top-level `let` the value
     -- restriction keeps monomorphic, has no group of its own to check it.
-    if checkRefusals(s, 0) { settle(s) }
+    if checkRefusals(s, 0) { solveSimples(s) }
     -- What is left open after an error is most often open because of it, so
     -- defaulting it would only guess, and `rejectStranded` reports nothing.
     if Diag.hasErrors() { return }
@@ -511,14 +655,15 @@ fun run(s : Solver, c : Constraint) -> Unit {
     -- nothing here defaults them, so they stay open in the shared environment
     -- and an importer's uses fix them.
     var going = True
-    while going && len(s.deferred) > 0 {
-        if applyDefaults(s, Vec.slice(s.deferred, 0, len(s.deferred))) {
-            settle(s)
+    while going {
+        let open = members(s.here)
+        if len(open) > 0 && applyDefaults(s, open) {
+            solveSimples(s)
         } else {
             going = False
         }
     }
-    rejectStranded(s, s.deferred)
+    rejectStranded(s, members(s.here))
 }
 
 fun solve(s : Solver, c : Constraint) -> Unit = match c {
@@ -526,7 +671,10 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         Ty.unify(left, right, where, context, families(s))
     CPred(cell) -> {
         if Option.isNone(cell.at) { cell.at = Some(s.here) }
-        if !entail(s, cell) { Vec.push(s.deferred, cell) }
+        -- Tried once as it arises, so that what is decided at once is
+        -- reported where the generator is. One that a rule emits joins the
+        -- work list instead.
+        if s.draining { enqueue(s, cell) } else { solveOne(s, cell) }
     }
     CAnd(parts) -> for p in parts { solve(s, p) }
     CExists(vars, body) -> {
@@ -565,10 +713,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
             made = Some(extended)
         }
         s.entered = s.entered + 1
-        let inside = Implication {
-            id = s.entered, assumptions = assumptions, inert = inert,
-            untouchable = untouchable,
-        }
+        let inside = implication(s.classes, s.entered, assumptions, inert, untouchable)
         s.here = inside
         let assumed = newScope()
         assumed.givens = named
@@ -581,20 +726,17 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         let firstUse = len(s.uses)
         if inaccessible { Diag.beginMuted() }
         solve(s, body)
+        solveSimples(s)
         if inaccessible {
             Diag.endMuted()
             for var i = firstUse; i < len(s.uses); i = i + 1 { s.uses[i].inaccessible = True }
         }
-        -- What is still queued from inside has floated out: it mentions no
-        -- skolem of this implication (`confine`), so it is solved outside it,
-        -- with the givens there. Moved before the inert set is closed, after
-        -- which its cycle breakers stand for their family applications and
+        -- What is still inert inside has floated out: it mentions no skolem
+        -- of this implication (`confine`), so it is solved outside it, with
+        -- the givens there. Moved before the inert set is closed, after which
+        -- its cycle breakers stand for their family applications and
         -- rewriting with it would not end.
-        for c in s.deferred {
-            if let Some(impl) = c.at {
-                if impl.id == inside.id { c.at = Some(outside) }
-            }
-        }
+        floatOut(inside, outside)
         match made {
             Some(i) -> Inert.close(i)
             None -> {}
@@ -999,8 +1141,9 @@ fun clashesAll(s : Solver, a : Array Ty.Type, b : Array Ty.Type) -> Bool {
 -- Returns whether the variable `v` may become the constructor `con`, as far
 -- as the numeric literals waiting on it say.
 fun numeralAdmits(s : Solver, v : VarCell, con : ConCell) -> Bool {
-    for c in s.deferred {
-        if c.pred.name != oneOf || isArrayLiteralDemand(c) { continue }
+    -- A demand on `v` that is inert mentions `v`, so it is among its watchers.
+    for c in Map.getOr(s.watchers, v.id, []) {
+        if !resting(c) || c.pred.name != oneOf || isArrayLiteralDemand(c) { continue }
         match Ty.prune(c.pred.args[0]) {
             TVar(w) -> if w.id == v.id
                           && !Array.contains(setNames(c.pred.args[1], c.span), con.name) {
@@ -1072,8 +1215,8 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     let firstUse = len(s.uses)
     solve(s, c.defn)
     discard(Vec.pop(s.scopes))
-    settle(s)
-    if checkRefusals(s, rank(s)) { settle(s) }
+    solveSimples(s)
+    if checkRefusals(s, rank(s)) { solveSimples(s) }
     confine(s, c.skolems)
     let types = Array.map(c.binds, _.2)
     let retainedPreds = underScheme(s, split(s, types), types)
@@ -1110,8 +1253,8 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     -- dictionary: a scrutinee in the body may be a family application that
     -- only one of them decides, and exhaustiveness reads it under the same
     -- (`Infer.resolveUnder`). The scheme carries them as well, and a class
-    -- predicate in the body may have been discharged under one (`waiting`),
-    -- at a type Core accepts only under the same equality.
+    -- predicate in the body may have been rewritten by one (`rewriteW`) and
+    -- discharged at a type Core accepts only under the same equality.
     let scopeGivens = Vec.slice(givens, 0, len(givens))
     for p in retainedPreds {
         if p.pred.name == Ty.equals { Vec.push(scopeGivens, ("", p.pred)) }
@@ -1217,17 +1360,21 @@ fun underScheme(s : Solver, retained : Vec PredCell, types : Array Ty.Type) -> V
     let outside = s.here
     let (inert, _) = Inert.extend(outside.inert, equalities)
     s.entered = s.entered + 1
-    let scheme = Implication {
-        id = s.entered, assumptions = outside.assumptions, inert = inert,
-        untouchable = outside.untouchable,
-    }
+    let scheme = implication(s.classes, s.entered, outside.assumptions, inert,
+                             outside.untouchable)
+    s.here = scheme
     for p in retained {
         p.at = Some(scheme)
-        Vec.push(s.deferred, p)
+        queue(p)
     }
-    settle(s)
+    solveSimples(s)
     let out = split(s, types)
+    -- What the scheme does not take is for an enclosing binding, which does
+    -- not receive the scheme's givens: it goes back to `outside`.
+    floatOut(scheme, outside)
     Inert.close(inert)
+    s.here = outside
+    solveSimples(s)
     out
 }
 
@@ -1350,10 +1497,10 @@ fun split(s : Solver, types : Array Ty.Type) -> Vec PredCell {
             out = retainedPreds
             going = False
         } else {
-            -- Something was decided. Put the split back and settle again, so the
+            -- Something was decided. Put the split back and solve again, so the
             -- choice is visible to everything that was waiting on it.
-            for p in retainedPreds { Vec.push(s.deferred, p) }
-            settle(s)
+            for p in retainedPreds { queue(p) }
+            solveSimples(s)
         }
     }
     out
@@ -1379,140 +1526,333 @@ fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
     }
 }
 
--- -- predicates --------------------------------------------------------------------
+-- -- the simplifier -----------------------------------------------------------------
 
--- Retries the deferred predicates until a round no longer shrinks the queue.
+-- Solves the wanteds on the work list of `s.here` until none is left.
 --
--- Each round improves the queue and re-solves what is in it; a predicate that is
--- still stuck goes straight back on the queue. Discharging one can bind
--- variables another was waiting on, which is why this iterates.
+-- This is OutsideIn(X)'s simplifier (§7.3-7.5, Fig. 19): the rules of
+-- canonicalization, interaction, simplification and top-level reaction are
+-- applied "until it no longer applies", and the implementation's shape is
+-- the paper's §8.2 and GHC's `solveSimples`: "maintaining an inert set of
+-- (canonical) constraints that have no pairwise interactions, and a work set
+-- of un-processed (canonical) constraints. We repeatedly take a constraint
+-- from the work set, interact it with each member of the inert set, and add
+-- any 'reaction products' back to the work set."
 --
--- **Termination.** A round goes on to the next only if it leaves fewer
--- predicates than the queue held before the round began, improvement included,
--- so the length of the queue strictly decreases from round to round and this
--- runs at most as many rounds as it started with predicates. Improvement may
--- add predicates (unifying two answers can defer an equation) and solving may
--- too (an instance's context), which is why the count is taken before both.
+-- **The fixpoint is an empty work list.** A wanted that no rule discharges
+-- becomes inert (`rest`), and leaves its inert set again only when something
+-- that could make a rule apply to it happens, at which point it is queued:
 --
--- Equalities go first within a round: a family that has become reducible decides
--- a type, and a predicate waiting on that type can then settle in the same
--- round.
-fun settle(s : Solver) -> Unit {
-    while len(s.deferred) > 0 {
-        let before = len(s.deferred)
-        improve(s)
-        let pending = Vec.sortBy(s.deferred, fun(a, b) = {
-            let ka = if a.pred.name == Ty.equals { 0 } else { 1 }
-            let kb = if b.pred.name == Ty.equals { 0 } else { 1 }
-            Int.compare(ka, kb)
-        })
-        s.deferred = Vec.new(8)
-        let saved = s.wanteds
-        let outside = s.here
-        -- Each wanted is retried in its own implication, under that
-        -- implication's givens and the equalities waiting beside it there.
-        let rounds = Map.new()
-        for c in pending {
-            let impl = Option.unwrapOr(c.at, outside)
-            if !Map.contains(rounds, impl.id) {
-                Map.put(rounds, impl.id, waiting(s, impl, pending))
-            }
-            s.here = impl
-            s.wanteds = Map.getOr(rounds, impl.id, None)
-            solve(s, CPred(c))
+-- * a variable it mentions is bound (`woken`; GHC's
+--   `kickOutAfterUnification`);
+-- * a wanted equality that rewrites it becomes inert (`kickOut`; GHC's
+--   `kickOutRewritable`, Note [The KickOut Criteria]);
+-- * another numeric literal's demand on the same type narrows its set
+--   (`narrowed`);
+-- * its implication ends, and it floats to the enclosing one (`floatOut`).
+--
+-- Nothing else changes what an inert wanted rewrites to. The givens and the
+-- instances are fixed, and a variable's level only ever drops, which can
+-- make a variable untouchable but never touchable. So when the work list is
+-- empty no rule applies to anything, and there is nothing to retry: GHC's
+-- Note [When to iterate the solver: unifications] says of a unification at
+-- the current level, "No need to track this, because the kick-out mechanism
+-- deals with it."
+--
+-- **When it runs.** A wanted the generator emits is tried once as it arises
+-- (`solveOne`), so that what is decided at once is reported in the order the
+-- program is read. What it cannot decide, and what a unification wakes or a
+-- rule kicks out, waits on the work list until the next solve point: before
+-- a binding group generalizes, when an implication ends, and before
+-- defaulting and reporting. GHC generates a whole binding group's
+-- constraints before solving any. The rules are meant to be confluent
+-- (§7.4: "Our intention is that the rewrite relation induced by these rules
+-- is confluent and terminating"), so the schedule decides the order errors
+-- are found in, not which programs check.
+--
+-- Only `s.here`'s own work list is solved. A wanted of an enclosing
+-- implication that a unification here wakes waits on its own work list until
+-- that implication is solved again, as GHC iterates an outer level once its
+-- inner implications have unified one of its variables.
+--
+-- **Termination.** Each step takes one wanted off the list and discharges
+-- it, binds a variable, or makes it inert.
+--
+-- * A variable is bound at most once, and no rule makes a variable, so the
+--   wanteds woken by bindings are bounded by the variables that exist.
+-- * A wanted kicked out by a new rule comes back rewritten by it, and the
+--   rules stay a terminating generalised substitution (`kickOut`), so
+--   rewriting ends and kick-out cannot cycle.
+-- * Reducing a family through the instances ends, because an associated
+--   type's right side may apply a family only to a variable of the instance
+--   head.
+-- * A discharge may emit subgoals: an instance's context, and the parts an
+--   equation decomposes into. Nothing bounds an instance's context: it may
+--   demand a larger constraint than its head solves, without end. So each
+--   subgoal is one level deeper than the wanted it came from, and a wanted
+--   more than `reductionDepth` levels below one the program demanded is
+--   reported instead of solved (`tooDeep`), as GHC bounds its subgoals
+--   (`subGoalDepthExceeded`).
+fun solveSimples(s : Solver) -> Unit {
+    -- A rule that emits a wanted calls back into here; the loop already
+    -- running reaches it.
+    if s.draining { return {} }
+    s.draining = True
+    loop {
+        match next(s.here.work) {
+            None -> break
+            Some(c) -> solveOne(s, c)
         }
-        s.here = outside
-        s.wanteds = saved
-        -- The rounds' own cycle breakers, if their equalities needed any: an
-        -- obligation of an instance found under them may mention one.
-        for (_, round) in Map.entries(rounds) {
-            match round {
-                Some(i) -> Inert.close(i)
-                None -> {}
-            }
+    }
+    s.draining = False
+}
+
+-- Applies the rules to the wanted `c` once: it is discharged, or it becomes
+-- inert.
+fun solveOne(s : Solver, c : PredCell) -> Unit =
+    if entail(s, c) { c.stage = Finished } else { rest(s, c) }
+
+-- Puts `c`, which the program demanded, at the back of its implication's
+-- work list.
+fun queue(c : PredCell) -> Unit {
+    let w = workOf(c)
+    c.stage = Queued
+    Vec.push(if c.pred.name == Ty.equals { w.eqs } else { w.rest }, c)
+}
+
+-- Puts `c`, which solving produced, at the front of its implication's work
+-- list while `solveSimples` runs, and at the back otherwise.
+fun enqueue(s : Solver, c : PredCell) -> Unit {
+    if !s.draining { return queue(c) }
+    let w = workOf(c)
+    c.stage = Queued
+    Vec.push(if c.pred.name == Ty.equals { w.eqsNow } else { w.restNow }, c)
+}
+
+fun workOf(c : PredCell) -> WorkList = match c.at {
+    Some(i) -> i.work
+    None -> bug("a wanted was queued before it was placed", c.span)
+}
+
+-- Takes the next wanted off `w`, an equality if there is one.
+fun next(w : WorkList) -> Option PredCell {
+    if let Some(c) = Vec.pop(w.eqsNow) { return Some(c) }
+    if w.nextEq < len(w.eqs) {
+        w.nextEq = w.nextEq + 1
+        return Some(w.eqs[w.nextEq - 1])
+    }
+    if len(w.eqs) > 0 {
+        Vec.clear(w.eqs)
+        w.nextEq = 0
+    }
+    if let Some(c) = Vec.pop(w.restNow) { return Some(c) }
+    if w.nextRest < len(w.rest) {
+        w.nextRest = w.nextRest + 1
+        return Some(w.rest[w.nextRest - 1])
+    }
+    if len(w.rest) > 0 {
+        Vec.clear(w.rest)
+        w.nextRest = 0
+    }
+    None
+}
+
+-- Returns whether `c` is in an inert set.
+fun resting(c : PredCell) -> Bool = match c.stage {
+    Resting -> True
+    _ -> False
+}
+
+-- Returns whether `c` is in the inert set of `impl`.
+fun restsIn(c : PredCell, impl : Implication) -> Bool = resting(c) && match c.at {
+    Some(i) -> i.id == impl.id
+    None -> False
+}
+
+-- Makes `c`, which no rule discharged, inert in its implication.
+fun rest(s : Solver, c : PredCell) -> Unit {
+    let impl = match c.at {
+        Some(i) -> i
+        None -> bug("a wanted was solved before it was placed", c.span)
+    }
+    let w = impl.wanted
+    if c.pred.name == Ty.equals {
+        if isRule(c.pred) {
+            let lhs = c.pred.args[0]
+            -- Before the rule joins: an inert wanted the new rule could rewrite
+            -- leaves, to be rewritten by it when it is solved again.
+            kickOut(s, impl, lhs)
+            let key = ruleKey(lhs)
+            let filed = Vec.filter(Map.getOr(w.rules, key, []), restsIn(_, impl))
+            Vec.push(filed, c)
+            Map.put(w.rules, key, filed)
+            w.count = w.count + 1
+        } else {
+            Map.put(w.irreducibles, Ty.predKey(c.pred), c)
         }
-        if len(s.deferred) >= before { return {} }
+    } else if c.pred.name == oneOf {
+        if !isArrayLiteralDemand(c) { Map.put(w.numerals, Ty.typeKey(c.pred.args[0]), c) }
+    } else {
+        let key = Ty.predKey(c.pred)
+        if Option.isNone(inertAt(w.dicts, key, impl)) { Map.put(w.dicts, key, c) }
+    }
+    c.stage = Resting
+    Vec.push(w.cells, c)
+    for v in Ty.varsOf(c.pred.args) {
+        match Map.get(s.watchers, v.id) {
+            Some(list) -> Vec.push(list, c)
+            None -> Map.put(s.watchers, v.id, [c])
+        }
     }
 }
 
--- Returns the givens of `impl` extended with the family equalities among
--- `pending` that arose in it, or `None` if there are none.
-fun waiting(s : Solver, impl : Implication, pending : Vec PredCell) -> Option Inert.Inert {
-    -- An equality the queue holds is one nothing has proved yet. Used as a
-    -- rule for the class predicates beside it, it is sound either way: if a
-    -- scheme retains it, every caller proves it, and if it is solved later,
-    -- unification makes both sides one anyway. It is never used to retry an
-    -- equality (`equals` reads only the givens), so none proves itself.
-    let eqs = Vec.new(4)
-    for c in pending {
-        if c.pred.name == Ty.equals && Ty.isFam(c.pred.args[0])
-                && Option.unwrapOr(c.at, impl).id == impl.id {
-            Vec.push(eqs, Given { pred = c.pred, span = c.span })
-        }
+-- Returns whether the canonical equality `p` is a rule: a left side that a
+-- rewrite can replace, not occurring in the right side. One whose left side
+-- occurs in its right side is inert but rewrites nothing, GHC's
+-- `CIrredCan` (T3 in Note [Extending the inert equalities]).
+fun isRule(p : Pred) -> Bool {
+    let lhs = Ty.prune(p.args[0])
+    let replaceable = match lhs {
+        TFam(_, _, _) -> True
+        TVar(_) -> True
+        _ -> False
     }
-    if len(eqs) == 0 { return None }
-    -- What it refuses is a wanted that is false or stuck, which retrying it
-    -- reports where it arose.
-    let (extended, _) = Inert.extendAt(impl.inert, Vec.toArray(eqs), rank(s))
-    Some(extended)
+    replaceable && !Ty.occursIn(lhs, p.args[1])
 }
 
--- Improvement: what the deferred set decides between two of its own members.
---
--- There used to be a third rule here, equating the results of two demands for
--- one field of one receiver -- `HasField l r a` and `HasField l r b` forcing
--- `a ~ b` -- because a record type has exactly one type for a given field and
--- with the field type in a third argument nothing else said so. In Gaster &
--- Jones the rule does not exist, since with rows the field's type sits inside
--- the receiver's and two accesses agree by ordinary unification.
---
--- It is gone for the same reason: `r.f` has the type `Field.f r`, so two reads
--- are the same type expression rather than two variables, and unification
--- equates them without being told to.
-fun improve(s : Solver) -> Unit {
-    improveNumeric(s)
-    improveFamilies(s)
+-- The key a rule's left side is filed under: a variable by its id, and a
+-- family application by its family.
+fun ruleKey(lhs : Ty.Type) -> String = match Ty.prune(lhs) {
+    TVar(cell) -> "'" + Int.toString(cell.id)
+    TFam(name, _, _) -> name
+    _ -> ""
 }
 
--- Replaces each equality on a family application that another before it in
--- the queue is also on, by the equation between their two answers.
+-- Moves back onto the work list every inert wanted of `impl` that the new rule
+-- with left side `lhs` could rewrite, by GHC's KickOut Criteria (Note [The
+-- KickOut Criteria] in `GHC.Tc.Solver.InertSet`) for a wanted added to
+-- wanteds:
 --
--- OutsideIn(X)'s rule for two equalities on one family application (its
--- `feqfeq`), and the same reason as `improve`'s: a family is a *function* of
--- its argument, so `Item c ~ Op` and `Item c ~ Char` cannot both hold. Neither
--- is discharged while `Item c` is stuck, so without this they would both be
--- carried and the contradiction would never be reported at all. The second is
--- dropped rather than kept beside the first, so this never leaves the queue
--- longer than the equalities it adds.
-fun improveFamilies(s : Solver) -> Unit {
-    let seen = Map.new()
-    let keep = Vec.new(len(s.deferred))
-    let answers = Vec.new(2)
-    for c in s.deferred {
-        if c.pred.name == Ty.equals && Ty.isFam(c.pred.args[0]) {
-            let left = c.pred.args[0]
-            let key = Ty.typeKey(left)
-            match Map.get(seen, key) {
-                Some((first, at)) -> {
-                    if !Ty.sameType(first, c.pred.args[1]) {
-                        Vec.push(answers, (first, c.pred.args[1], firstSpan(c.span, at),
-                                           "the uses of '" + Ty.show(left) + "'",
-                                           Option.unwrapOr(c.at, s.here)))
-                    }
-                    continue
-                }
-                None -> Map.put(seen, key, (c.pred.args[1], c.span))
+-- * a class wanted, a numeric demand or an irreducible equality goes if
+--   `lhs` occurs in it anywhere;
+-- * a rule goes if `lhs` occurs in its left side (KK1), or in its right
+--   side under a family application (KK2b). A wanted rule can rewrite the
+--   new one too, so KK2 looks only under families, and KK3 does not apply.
+--
+-- What stays is a *terminating generalised substitution* (WF1-WF3 in Note
+-- [inert_eqs: the inert equalities]), not an idempotent one: a rule's right
+-- side may mention another rule's left side, and rewriting applies the
+-- rules again to what a rule produced (`Inert.rewriteOver`). Kicking out
+-- every rule in whose right side `lhs` occurs would keep the rules
+-- idempotent, but each kicked-out rule is rewritten in full when it comes
+-- back, and a chain such as `F1 a ~ Pair (F2 a) (F2 a)`, `F2 a ~ Pair (F3 a)
+-- (F3 a)`, ... would grow to a tree with 2^n leaves. The Note warns of the
+-- same: "excessive kicking out can lead to exponentially big constraints".
+fun kickOut(s : Solver, impl : Implication, lhs : Ty.Type) -> Unit {
+    let w = impl.wanted
+    let keep = Vec.new(len(w.cells))
+    let seen = Set.new()
+    for c in w.cells {
+        if !restsIn(c, impl) || Set.contains(seen, c.serial) { continue }
+        Set.add(seen, c.serial)
+        let rewritable = if c.pred.name == Ty.equals && isRule(c.pred) {
+            Ty.occursIn(lhs, c.pred.args[0]) || underFamily(lhs, c.pred.args[1])
+        } else {
+            Iterator.any(c.pred.args, fun(a) = Ty.occursIn(lhs, a))
+        }
+        if rewritable { enqueue(s, c) } else { Vec.push(keep, c) }
+    }
+    w.cells = keep
+}
+
+-- Returns whether `lhs` occurs in an argument of a family application in `t`.
+fun underFamily(lhs : Ty.Type, t : Ty.Type) -> Bool = match Ty.prune(t) {
+    TFam(_, arg, _) -> Ty.occursIn(lhs, arg)
+    TApp(f, a, _) -> underFamily(lhs, f) || underFamily(lhs, a)
+    TFun(ps, r) -> Iterator.any(ps, underFamily(lhs, _)) || underFamily(lhs, r)
+    TTuple(es) -> Iterator.any(es, underFamily(lhs, _))
+    _ -> False
+}
+
+-- Queues every inert wanted that was watching `v`, which `Ty.unify` has just
+-- bound.
+--
+-- Each leaves its inert set at once, before `Ty.unify` returns, so no rule in
+-- any inert set ever mentions a bound variable: a rule's sides stay as they
+-- were when the rule joined, which the termination of `Inert.rewriteOver`
+-- relies on (T1 and T2 in GHC's Note [Extending the inert equalities]).
+fun woken(s : Solver, v : VarCell) -> Unit {
+    match Map.get(s.watchers, v.id) {
+        Some(list) -> {
+            discard(Map.delete(s.watchers, v.id))
+            for c in list {
+                if resting(c) { enqueue(s, c) }
             }
         }
-        Vec.push(keep, c)
+        None -> {}
     }
-    s.deferred = keep
-    let outside = s.here
-    for (a, b, at, context, impl) in answers {
-        s.here = impl
-        Ty.unify(a, b, at, context, families(s))
+}
+
+-- Returns the inert wanteds of `impl`, each once, in the order they entered.
+fun members(impl : Implication) -> Vec PredCell {
+    let w = impl.wanted
+    let out = Vec.new(len(w.cells))
+    let seen = Set.new()
+    for c in w.cells {
+        if restsIn(c, impl) && !Set.contains(seen, c.serial) {
+            Set.add(seen, c.serial)
+            Vec.push(out, c)
+        }
     }
-    s.here = outside
+    w.cells = out
+    Vec.slice(out, 0, len(out))
+}
+
+-- Returns the cell `table` files under `key`, if it is still in the inert set
+-- of `impl`.
+fun inertAt(table : Map String PredCell, key : String, impl : Implication) -> Option PredCell =
+    match Map.get(table, key) {
+        Some(c) -> if restsIn(c, impl) { Some(c) } else { None }
+        None -> None
+    }
+
+-- Takes `c` out of its inert set for good.
+fun take(c : PredCell) -> Unit { c.stage = Finished }
+
+-- Moves every wanted of `from` into `to`, as wanteds of `to`: the residual of
+-- an implication that has ended, which mentions none of its skolems.
+fun floatOut(from : Implication, to : Implication) -> Unit {
+    let moving = members(from)
+    loop {
+        match next(from.work) {
+            Some(c) -> Vec.push(moving, c)
+            None -> break
+        }
+    }
+    for c in moving {
+        c.at = Some(to)
+        queue(c)
+    }
+}
+
+-- Returns `t` rewritten as a wanted of `s.here` is: by the implication's
+-- inert wanted equalities and its givens, and through the instances, at
+-- every depth (OutsideIn(X), Fig. 22 and 23).
+fun rewriteW(s : Solver, t : Ty.Type) -> Ty.Type {
+    let impl = s.here
+    if impl.wanted.count == 0 { return Inert.rewrite(impl.inert, t) }
+    Inert.rewriteOver(impl.inert, fun(u) = ruleFor(impl, u), t)
+}
+
+-- Returns the right side of the inert wanted equality of `impl` whose left
+-- side is `t`.
+fun ruleFor(impl : Implication, t : Ty.Type) -> Option Ty.Type {
+    let key = ruleKey(t)
+    if key == "" { return None }
+    for c in Map.getOr(impl.wanted.rules, key, []) {
+        if restsIn(c, impl) && Ty.sameType(c.pred.args[0], t) { return Some(c.pred.args[1]) }
+    }
+    None
 }
 
 fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
@@ -1520,56 +1860,120 @@ fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
     None -> b
 }
 
--- Try to discharge one predicate. `False` means "not yet" -- defer it. An
--- unsatisfiable predicate reports; only genuine lack of information answers
--- `False`, so nothing can be quietly dropped.
+-- Try to discharge one predicate. `False` means "not yet": it becomes inert.
+-- An unsatisfiable predicate reports; only genuine lack of information
+-- answers `False`, so nothing can be quietly dropped. Runs in the predicate's
+-- own implication, under its givens alone.
 fun entail(s : Solver, c : PredCell) -> Bool {
-    if c.pred.name == Ty.equals { return equals(s, c) }
-    if c.pred.name == oneOf { return oneOfRule(s, c) }
-    if Classes.isClass(s.classes, c.pred.name) { return classRule(s, c) }
-    bug("no rule for predicate '" + c.pred.name + "'", c.span)
+    if c.depth > reductionDepth { return tooDeep(c) }
+    let outside = s.here
+    let parent = s.current
+    s.here = match c.at {
+        Some(impl) -> impl
+        None -> bug("a wanted was solved before it was placed", c.span)
+    }
+    s.current = Some(c)
+    let out = if c.pred.name == Ty.equals {
+        equals(s, c)
+    } else if c.pred.name == oneOf {
+        oneOfRule(s, c)
+    } else if Classes.isClass(s.classes, c.pred.name) {
+        classRule(s, c)
+    } else {
+        bug("no rule for predicate '" + c.pred.name + "'", c.span)
+    }
+    s.here = outside
+    s.current = parent
+    out
 }
 
--- `s ~ t`: retry the equation now that something may have moved.
+-- Reports that solving `c`'s root did not terminate, and returns `True`, to
+-- take `c` as discharged.
 --
--- Rewriting is what makes progress: a side that has become reducible, through
--- an instance or a given, is rewritten here. Two identical family applications
--- are equal by reflexivity, and a side that is *still* a stuck family means the
--- equation is not yet decidable. Only the givens and the instances rewrite it:
--- no wanted is a rule, so an equation is never proved by itself.
+-- The instance restrictions make every instance's head a constructor applied
+-- to distinct variables, and every associated type's right side apply a
+-- family only to such a variable, so reducing a family terminates. They do
+-- not bound an instance's *context*: `instance C (Box a) : C (Box (Box a))`
+-- demands a bigger wanted than it solves, without end. GHC rejects such an
+-- instance unless `UndecidableInstances` is on (its Paterson conditions), and
+-- bounds the depth of subgoals either way (`subGoalDepthExceeded`); here the
+-- depth bound is all there is.
+fun tooDeep(c : PredCell) -> Bool =
+    reported("cannot solve '" + Ty.showPred(c.root) + "': solving it does not terminate, "
+             + "and the checker gave up " + Int.toString(reductionDepth) + " levels deep",
+             c.span)
+
+-- `l ~ r`: canonicalize the equation (OutsideIn(X), §7.4.1).
+--
+-- Both sides are rewritten first, by the givens and the inert wanted
+-- equalities (`rewriteW`). That is the interaction of two wanted equalities
+-- and the simplification of one by a given (Fig. 22 and 23). With no
+-- flattening, a rule `F t ~ a` rewrites `F t` where it stands, so a wanted
+-- `F t ~ b` becomes `a ~ b`: feqfeq and sfeqfeq. Then, in GHC's order
+-- (`canEqCanLHS2`, Note [Orienting TyVarLHS/TyFamLHS]):
+--
+-- * a side that is a variable unification may bind, and that does not occur
+--   in the other side, is bound, in place (Note [Unification preconditions]);
+-- * if neither side can be a left side, both heads are rigid and the
+--   equation is decomposed (`Ty.unify`, whose stuck parts come back as new
+--   wanteds);
+-- * otherwise the equation is canonical, oriented family first, and becomes
+--   inert (`rest`).
 fun equals(s : Solver, c : PredCell) -> Bool {
-    let left = Inert.rewrite(s.here.inert, c.pred.args[0])
-    let right = Inert.rewrite(s.here.inert, c.pred.args[1])
+    let left = rewriteW(s, c.pred.args[0])
+    let right = rewriteW(s, c.pred.args[1])
     c.pred = Ty.pred(c.pred.name, [left, right])
     if Ty.sameType(left, right) { return True }
-    if Ty.isFam(left) || Ty.isFam(right) { return False }
-    Ty.unify(left, right, c.span, c.context, families(s))
-    True
+    match (left, right) {
+        (TBottom, _) | (_, TBottom) -> return True
+        _ -> {}
+    }
+    let fams = families(s)
+    if bindable(left, right, fams) || bindable(right, left, fams) || !(stuck(left, right, fams)
+                                                                      || stuck(right, left, fams)) {
+        Ty.unify(left, right, c.span, c.context, fams)
+        return True
+    }
+    if familyLike(right) && !familyLike(left) { c.pred = Ty.pred(c.pred.name, [right, left]) }
+    -- An irreducible equality rewrites nothing, so an identical one is not
+    -- rewritten away; it is the same obligation, as GHC's `tryInertIrreds`
+    -- finds. An equality carries no evidence to share.
+    !isRule(c.pred) && Option.isSome(inertAt(s.here.wanted.irreducibles,
+                                             Ty.predKey(c.pred), s.here))
 }
 
--- Returns `t` rewritten for discharging a predicate over it, by the givens in
--- scope, the equalities waiting in the queue (`waiting`) and the instances.
-fun discharging(s : Solver, t : Ty.Type) -> Ty.Type = match s.wanteds {
-    -- The givens are not optional here: a type that reached the predicate
-    -- through a variable bound before a given could rewrite it is still the
-    -- family application, and only the given says what it is.
-    Some(w) -> Inert.rewrite(w, t)
-    None -> Inert.rewrite(s.here.inert, t)
+-- Returns whether `t` is a variable that unification may bind to `other`.
+fun bindable(t : Ty.Type, other : Ty.Type, fams : Option Ty.Families) -> Bool = match t {
+    TVar(cell) -> !Ty.untouchable(cell, fams) && !Ty.occursIn(t, other)
+    _ -> False
 }
 
--- Returns the evidence for `p` from a fact the enclosing declarations already
--- assumed, the innermost first, or `None` if none of them grants it.
+-- Returns whether `t ~ other` is stuck on `t`: `t` is a family application
+-- no rule reduces, or a variable that cannot be bound to `other`. A variable
+-- that occurs in `other` outside every family is not stuck but an infinite
+-- type, which `Ty.unify` reports.
+fun stuck(t : Ty.Type, other : Ty.Type, fams : Option Ty.Families) -> Bool = match t {
+    TFam(_, _, _) -> True
+    TVar(cell) -> Ty.untouchable(cell, fams)
+                  || Ty.occursIn(t, other) && !Ty.occursRigidly(t, other)
+    _ -> False
+}
+
+-- Returns the evidence for `p`, whose argument is already rewritten, from a
+-- fact the enclosing declarations already assumed, the innermost first, or
+-- `None` if none of them grants it.
 --
--- Both sides are rewritten before they are compared, since an assumption is
--- written down and a demand is discovered, and the two may name the same type by
--- different routes: `Ord (Item a)` is granted by `Ord (Index.Value a)` under
--- `Item a ~ Index.Value a`.
+-- Each assumption is rewritten by the givens alone before it is compared,
+-- since an assumption is written down and a demand is discovered, and the
+-- two may name the same type by different routes: `Ord (Item a)` is granted
+-- by `Ord (Index.Value a)` under `Item a ~ Index.Value a`. A wanted equality
+-- never rewrites an assumption.
 fun granted(s : Solver, p : Pred) -> Option Proof {
-    let key = Ty.predKey(Ty.pred(p.name, [discharging(s, p.args[0])]))
+    let key = Ty.predKey(p)
     let assumptions = s.here.assumptions
     for var i = len(assumptions) - 1; i >= 0; i = i - 1 {
         let (name, a) = assumptions[i]
-        let seen = Ty.pred(a.name, [discharging(s, a.args[0])])
+        let seen = Ty.pred(a.name, [Inert.rewrite(s.here.inert, a.args[0])])
         if let Some(path) = Classes.superPath(s.classes, seen, key, []) {
             return Some(ByGiven(name, path, a))
         }
@@ -1577,12 +1981,107 @@ fun granted(s : Solver, p : Pred) -> Option Proof {
     None
 }
 
--- `C t`: an assumption grants it, or an instance covers it.
+-- Returns whether a class given of `s.here`, or a superclass of one, might
+-- yet equal the wanted `p`, whose argument is already rewritten.
+--
+-- GHC's `noMatchableGivenDicts` and `mightEqualLater`, by Note [Instance and
+-- Given overlap]: "we return a matching instance only when there is no
+-- Given in the inerts which is unifiable to this particular dictionary. We
+-- treat any meta-tyvar as 'unifiable' for this purpose, *including*
+-- untouchable ones. But not skolems". Choosing the instance while such a
+-- given could still match would make the answer depend on the order the
+-- rules fire: the given, once it matches, may solve what the instance's
+-- context cannot.
+fun matchableGiven(s : Solver, p : Pred) -> Bool {
+    for g in s.here.matchable {
+        if g.name == p.name && mightEqual(g.args[0], p.args[0], Map.new()) { return True }
+    }
+    False
+}
+
+-- Returns whether `a` and `b` might become the same type, if unification
+-- variables in either were bound, under the bindings `binds` already
+-- assumed. Note [What might equal later?] in GHC's `GHC.Tc.Utils.Unify`:
+--
+-- * any unification variable may be bound, touchable or not;
+-- * a skolem is rigid;
+-- * a family application that mentions a unification variable might equal
+--   anything, and one that mentions none matches only itself: if a given
+--   could rewrite it, it already has been;
+-- * a cycle breaker is the family application it stands for;
+-- * a variable that would have to contain itself cannot be bound
+--   (`MARInfinite`).
+fun mightEqual(a : Ty.Type, b : Ty.Type, binds : Map Int Ty.Type) -> Bool {
+    let x = resolved(a, binds)
+    let y = resolved(b, binds)
+    if Ty.sameType(x, y) { return True }
+    match (x, y) {
+        (TBottom, _) | (_, TBottom) -> True
+        (TVar(v), other) | (other, TVar(v)) -> if Ty.occursIn(TVar(v), substituted(other, binds)) {
+            False
+        } else {
+            Map.put(binds, v.id, other)
+            True
+        }
+        (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> mentionsMeta(x) || mentionsMeta(y)
+        (TCon(c1), TCon(c2)) -> c1.name == c2.name && c1.level == c2.level && c1.uid == c2.uid
+        (TApp(f1, a1, _), TApp(f2, a2, _)) -> mightEqual(f1, f2, binds) && mightEqual(a1, a2, binds)
+        (TFun(p1, r1), TFun(p2, r2)) -> mightEqualAll(p1, p2, binds) && mightEqual(r1, r2, binds)
+        (TTuple(e1), TTuple(e2)) -> mightEqualAll(e1, e2, binds)
+        _ -> False
+    }
+}
+
+fun mightEqualAll(a : Array Ty.Type, b : Array Ty.Type, binds : Map Int Ty.Type) -> Bool {
+    if len(a) != len(b) { return False }
+    for var i = 0; i < len(a); i = i + 1 {
+        if !mightEqual(a[i], b[i], binds) { return False }
+    }
+    True
+}
+
+-- Returns `t` pruned, with a cycle breaker replaced by what it stands for and
+-- a variable `binds` assumes bound replaced by its binding.
+fun resolved(t : Ty.Type, binds : Map Int Ty.Type) -> Ty.Type = match Ty.prune(t) {
+    TVar(cell) -> match Ty.breakerFor(cell) {
+        Some(fam) -> resolved(fam, binds)
+        None -> match Map.get(binds, cell.id) {
+            Some(bound) -> resolved(bound, binds)
+            None -> TVar(cell)
+        }
+    }
+    other -> other
+}
+
+-- Returns `t` with every variable `binds` assumes bound replaced, at every
+-- depth.
+fun substituted(t : Ty.Type, binds : Map Int Ty.Type) -> Ty.Type =
+    match resolved(t, binds) {
+        TApp(f, a, k) -> TApp(substituted(f, binds), substituted(a, binds), k)
+        TFam(name, a, k) -> TFam(name, substituted(a, binds), k)
+        TFun(ps, r) -> TFun(Array.map(ps, substituted(_, binds)), substituted(r, binds))
+        TTuple(es) -> TTuple(Array.map(es, substituted(_, binds)))
+        other -> other
+    }
+
+-- Returns whether `t` is a family application whose argument mentions a
+-- unification variable, a cycle breaker's included.
+fun mentionsMeta(t : Ty.Type) -> Bool = match t {
+    TFam(_, arg, _) -> Iterator.any(Ty.varsOf([arg]), fun(v) = match Ty.breakerFor(v) {
+        Some(fam) -> mentionsMeta(fam)
+        None -> True
+    })
+    _ -> False
+}
+
+-- `C t`: an assumption grants it, an identical inert wanted shares its
+-- evidence, or an instance covers it.
 --
 -- A predicate whose argument is still headed by a variable defers -- a later
 -- unification may yet decide which instance applies. One headed by anything
 -- rigid is decided here and now, which is what keeps a missing instance a local
--- error naming the type that lacks one.
+-- error naming the type that lacks one, unless a given might yet match it
+-- (`matchableGiven`).
 --
 -- Discharging the predicate fills its hole, by the rule that discharged it
 -- and with the types it was discharged at. A predicate reported as an error
@@ -1591,7 +2090,7 @@ fun granted(s : Solver, p : Pred) -> Option Proof {
 -- (`CAssume`), so the program is lowered, but a use there is marked
 -- inaccessible and its holes are never read.
 fun classRule(s : Solver, c : PredCell) -> Bool {
-    let t = discharging(s, c.pred.args[0])
+    let t = rewriteW(s, c.pred.args[0])
     match t {
         -- Absorbed; there is no value to find a method for.
         TBottom -> {
@@ -1601,6 +2100,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         _ -> {}
     }
     let p = Ty.pred(c.pred.name, [t])
+    c.pred = p
     -- Assumptions are consulted before the shape of the argument is, and that
     -- order matters: a given may be *about* a family application, as
     -- `[Container c, Show (Elem c)]` is, and `Elem c` over a skolem never
@@ -1609,12 +2109,19 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         c.hole.proof = Some(proof)
         return True
     }
+    -- Two identical wanteds of one implication are one obligation (ddict,
+    -- Fig. 22): evidence for the inert one is evidence for this one.
+    if let Some(inert) = inertAt(s.here.wanted.dicts, Ty.predKey(p), s.here) {
+        c.hole.proof = Some(Same(inert.hole))
+        return True
+    }
     let (h, _) = Ty.spine(t)
     match h {
         TVar(_) -> return False
         TFam(_, _, _) -> return False
         _ -> {}
     }
+    if matchableGiven(s, p) { return False }
     -- An unsatisfiable predicate is reported and taken as discharged: nothing
     -- later can satisfy it, so deferring it would only report it again.
     if checkFieldVisibility(s, p, t, c) { return True }
@@ -1632,14 +2139,14 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
             let holes = Array.map(obligations, fun(_) = newHole())
             c.hole.proof = Some(ByInstance(inst, mapping, holes))
             for var i = 0; i < len(obligations); i = i + 1 {
-                solve(s, cpredInto(obligations[i], holes[i], c.span, c.context))
+                solve(s, CPred(subgoal(c, obligations[i], c.span, c.context, holes[i])))
             }
             -- Its equalities are wanteds too. Their evidence is a coercion,
             -- which has no content, so no hole holds it: the lowering makes
             -- one from the instance and the match alone.
             let context = "the context of the instance '" + Classes.showDeclared(inst) + "'"
             for q in Classes.equalitiesAt(inst, mapping) {
-                solve(s, cpredInto(q, newHole(), c.span, context))
+                solve(s, CPred(subgoal(c, q, c.span, context, newHole())))
             }
             True
         }
@@ -1810,7 +2317,7 @@ fun oneOfRule(s : Solver, c : PredCell) -> Bool {
                  c.context, families(s))
         return True
     }
-    let t = discharging(s, c.pred.args[0])
+    let t = rewriteW(s, c.pred.args[0])
     if isArrayLiteralDemand(c) {
         let (head, args) = Ty.spine(t)
         match head {
@@ -1828,9 +2335,12 @@ fun oneOfRule(s : Solver, c : PredCell) -> Bool {
         match t {
             -- Absorbed; there is no value to represent.
             TBottom -> return True
-            -- Still open -- improvement or defaulting will decide.
-            TVar(_) -> return False
-            TFam(_, _, _) -> return False
+            -- Still open: another demand on the same type, a use or
+            -- defaulting will decide.
+            TVar(_) | TFam(_, _, _) -> {
+                c.pred = Ty.pred(c.pred.name, [t, c.pred.args[1]])
+                return narrowed(s, c, t, names)
+            }
             TCon(con) -> if Array.contains(names, con.name) { return True }
             _ -> {}
         }
@@ -1857,49 +2367,38 @@ fun memberType(p : Ty.Pred, name : String) -> Ty.Type =
         Ty.literalSetType(name)
     }
 
--- Intersect numeric `OneOf` sets that constrain the same variable.
+-- Returns whether the numeric demand `c`, that the still open `t` is one of
+-- `names`, was absorbed by the inert demand on the same type: two demands on
+-- one type are one demand on the intersection of their sets. The inert one
+-- keeps its place and takes the intersection, and is solved again if that
+-- narrowed it, which is what lets a singleton be discharged as an equation.
+-- Returns `False` when there is no such demand, and `c` becomes it.
 --
--- Two demands on one variable are one demand on the intersection, and an empty
--- intersection is an error rather than a deferral -- nothing later can widen a
--- closed set. Narrowing to a singleton is what lets the next round discharge it
--- as an equation.
+-- An empty intersection is an error rather than a deferral: nothing later
+-- can widen a closed set.
 --
 -- Array literals' demands are left alone: every one has the same set, so there
 -- is nothing to narrow, and each carries its own element, which merging would
 -- drop.
-fun improveNumeric(s : Solver) -> Unit {
-    let merged = Map.new()
-    let out = Vec.new(len(s.deferred))
-    for c in s.deferred {
-        if c.pred.name != oneOf || isArrayLiteralDemand(c) {
-            Vec.push(out, c)
-            continue
-        }
-        let key = Ty.typeKey(c.pred.args[0])
-        match Map.get(merged, key) {
-            None -> {
-                Map.put(merged, key, c)
-                Vec.push(out, c)
-            }
-            Some(first) -> {
-                let names = intersect(setNames(first.pred.args[1], first.span),
-                                      setNames(c.pred.args[1], c.span))
-                if len(names) == 0 {
-                    -- Dropped once reported: an empty set describes no type, and
-                    -- nothing later could widen it.
-                    Ty.typeError("no numeric type is both one of "
-                                 + Ty.quoteLiteralSet(setNames(first.pred.args[1], first.span))
-                                 + " and one of "
-                                 + Ty.quoteLiteralSet(setNames(c.pred.args[1], c.span)),
-                                 c.span)
-                    continue
-                }
-                first.pred = Ty.pred(first.pred.name,
-                                     [first.pred.args[0], TSet(names)])
-            }
-        }
+fun narrowed(s : Solver, c : PredCell, t : Ty.Type, names : Array String) -> Bool {
+    let first = match inertAt(s.here.wanted.numerals, Ty.typeKey(t), s.here) {
+        Some(f) -> f
+        None -> return False
     }
-    s.deferred = out
+    let old = setNames(first.pred.args[1], first.span)
+    let both = intersect(old, names)
+    if len(both) == 0 {
+        -- Dropped once reported: an empty set describes no type, and nothing
+        -- later could widen it.
+        Ty.typeError("no numeric type is both one of " + Ty.quoteLiteralSet(old)
+                     + " and one of " + Ty.quoteLiteralSet(names), c.span)
+        return True
+    }
+    if len(both) < len(old) {
+        first.pred = Ty.pred(first.pred.name, [first.pred.args[0], TSet(both)])
+        enqueue(s, first)
+    }
+    True
 }
 
 fun setNames(t : Ty.Type, where : Option Span) -> Array String = match t {
@@ -1946,18 +2445,17 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
 --
 -- Such a binding is one the value restriction keeps monomorphic, `let table =
 -- [...]`, so no generalization decides its literal, and only the end of the
--- module would otherwise. Until then its demand would be carried through every
--- later top-level binding, together with every family equation over its
--- container that a use of the table adds -- `Index.Value t ~ a` for each
--- `table[i]` -- and every `settle` in those bindings, one per local `let`,
--- retries them all. That is quadratic in the module, and on the compiler's own
--- source it does not finish. Deciding here makes a top-level binding's
--- container a fact about its own definition: the same for a use later in the
--- module as for one in a module that imports it, which is checked afterwards
--- and could never decide it.
+-- module would otherwise. Until then its demand would stay inert at the top
+-- level, together with every family equation over its container that a use
+-- of the table adds -- `Index.Value t ~ a` for each `table[i]` -- for the rest
+-- of the module. Deciding here makes a top-level binding's container a fact
+-- about its own definition: the same for a use later in the module as for one
+-- in a module that imports it, which is checked afterwards and could never
+-- decide it.
 fun decideTopLevelLiterals(s : Solver) -> Unit {
-    let open = Vec.filter(s.deferred, fun(c) = isArrayLiteralDemand(c) && undecided(c))
-    if applyDefaults(s, open) { settle(s) }
+    solveSimples(s)
+    let open = Vec.filter(members(s.here), fun(c) = isArrayLiteralDemand(c) && undecided(c))
+    if applyDefaults(s, open) { solveSimples(s) }
 }
 
 -- Whether a `OneOf` demand's type is still open, which is when defaulting may
@@ -1985,20 +2483,14 @@ fun confine(s : Solver, skolems : Vec ConCell) -> Unit {
     let own = Set.new()
     for k in skolems { Set.add(own, k.uid) }
     let outer = rank(s) - 1
-    let keep = Vec.new(len(s.deferred))
-    for c in s.deferred {
+    for c in members(s.here) {
         if Ty.predLevel(c.pred) <= outer {
-            match ownSkolem(c.pred, own) {
-                Some(k) -> {
-                    trapped(c, k)
-                    continue
-                }
-                None -> {}
+            if let Some(k) = ownSkolem(c.pred, own) {
+                take(c)
+                trapped(c, k)
             }
         }
-        Vec.push(keep, c)
     }
-    s.deferred = keep
 }
 
 -- The first skolem of `pred`'s arguments whose `uid` is in `own`.
@@ -2040,34 +2532,34 @@ fun trapped(c : PredCell, k : ConCell) -> Unit {
 -- caller has already refused one that also mentions the binder's skolems
 -- (`confine`).
 fun retained(s : Solver, level : Int) -> Vec PredCell {
-    promoteFloating(s, level)
-    let keep = Vec.new(len(s.deferred))
-    let out = Vec.new(len(s.deferred))
-    let seen = Map.new()
-    for c in s.deferred {
-        if Ty.predLevel(c.pred) <= level {
-            Vec.push(keep, c)
-        } else {
-            -- Two demands for the same field of the same type are one
-            -- obligation; the context should not repeat itself.
-            -- The one dropped takes the evidence of the one kept.
-            let key = Ty.predKey(c.pred)
-            match Map.get(seen, key) {
-                Some(kept) -> { c.hole.proof = Some(Same(kept)) }
-                None -> {
-                    Map.put(seen, key, c.hole)
-                    Vec.push(out, c)
-                }
-            }
+    -- In an order the schedule does not decide, since a scheme lists them:
+    -- the equalities first, as the work list takes them, and within each kind
+    -- in the order the body demanded them.
+    let inert = Vec.sortBy(members(s.here), fun(a, b) = if kindRank(a) != kindRank(b) {
+        Int.compare(kindRank(a), kindRank(b))
+    } else {
+        Int.compare(a.serial, b.serial)
+    })
+    promoteFloating(inert, level)
+    -- No two of these are the same predicate: an inert set holds one of each,
+    -- the second having taken the first's evidence when it arrived (ddict,
+    -- `tryInertIrreds`).
+    let out = Vec.new(len(inert))
+    for c in inert {
+        if Ty.predLevel(c.pred) > level {
+            take(c)
+            Vec.push(out, c)
         }
     }
-    s.deferred = keep
     out
 }
 
+-- Returns 0 for an equality and 1 for any other predicate.
+fun kindRank(c : PredCell) -> Int = if c.pred.name == Ty.equals { 0 } else { 1 }
+
 -- Lowers to `level` every variable of a deferred predicate tied to `level`
 -- or an outer one, until no predicate changes.
-fun promoteFloating(s : Solver, level : Int) -> Unit {
+fun promoteFloating(inert : Vec PredCell, level : Int) -> Unit {
     -- A predicate tied to an outer variable floats to the enclosing scope, and
     -- its other variables go with it. Solving it there may bind them, as
     -- `F r ~ Option y` binds `y` once `r` is known, so none of them may stay
@@ -2078,7 +2570,7 @@ fun promoteFloating(s : Solver, level : Int) -> Unit {
     var changed = True
     while changed {
         changed = False
-        for c in s.deferred {
+        for c in inert {
             if Ty.predLevel(c.pred) <= level {
                 for v in Ty.varsOf(c.pred.args) {
                     if v.level > level {
@@ -2159,7 +2651,9 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
                                               c.span)
         None -> {}
     }
-    let names = Ty.namer("")
+    -- The skolems the reader can see beside it keep their names, so that the
+    -- unknown type is not called by one of them.
+    let names = Ty.namerAvoiding("", skolemNames(s, c.pred))
     let shown = Ty.showPredWith(c.pred, names)
     let vars = Ty.varsOf(c.pred.args)
     let unknown = if len(vars) == 0 { None } else { Map.get(names.names, vars[0].id) }
@@ -2169,6 +2663,18 @@ fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
         None -> Ty.typeError("cannot determine a type satisfying '" + shown
                              + "'; add a type annotation", c.span)
     }
+}
+
+-- Returns the names of the skolems in `p` and in the givens of `s.here`.
+fun skolemNames(s : Solver, p : Pred) -> Set.Set String {
+    let types = Vec.new(4)
+    for a in p.args { Vec.push(types, a) }
+    for (_, g) in s.here.assumptions {
+        for a in g.args { Vec.push(types, a) }
+    }
+    let out = Set.new()
+    for k in Ty.skolemsOf(Vec.toArray(types)) { Set.add(out, k.name) }
+    out
 }
 
 -- Returns whether `c` is an equation whose variable occurs in its other side,

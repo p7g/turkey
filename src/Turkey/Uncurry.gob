@@ -1,6 +1,6 @@
 export (program)
 
--- A function that takes dictionaries takes them with its other arguments.
+-- A function that takes evidence takes it with its other arguments.
 --
 -- A constrained binding the specializer left generic is a function of its
 -- dictionaries answering a function of its parameters: `f(dict)(x)`. Lowered
@@ -25,9 +25,9 @@ import Turkey.Core (..)
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TVar)
 
--- A worker, and how many dictionaries and parameters a call must supply to
--- reach it.
-type Worker = Worker { name : String, dicts : Int, params : Int }
+-- A worker, and how many arguments a call must supply to reach it: one count
+-- per layer of evidence, then the parameters'.
+type Worker = Worker { name : String, layers : Array Int }
 
 -- Numbers the wrappers' parameters, unrecorded: nothing after this pass reads
 -- a local's record. One thread splits the bindings in program order, so the
@@ -83,45 +83,66 @@ fun rewriteAll(binds : Vec CBind, workers : Map String Worker,
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
     name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations, layouts = b.layouts,
+    layouts = b.layouts,
 }
 
--- A binding `fun(dicts) = fun(params) = body`, as its worker and its wrapper.
+-- A binding `fun(dicts) = fun(cos) = fun(params) = body`, as its worker and its
+-- wrapper. Its evidence may come in more than one layer: a method's
+-- coercions follow its instance's dictionaries. Each layer is a lambda all of
+-- whose parameters are evidence, and the first that is not ends them. A
+-- binding with no dictionary among its evidence is not split: its coercions
+-- are erased with their layers after the last check, which leaves no closure
+-- to remove.
 fun split(b : CBind, used : Set.Set String, m : Minter) -> Option (CBind, CBind, Worker) {
     if b.mutable { return None }
-    match b.value.kind {
-        CLam(dicts, inner, outerName) -> match inner.kind {
-            CLam(params, body, innerName) ->
-                splitAt(b, used, m, dicts, inner, outerName, params, body, innerName)
-            _ -> None
+    let layers = Vec.new(2)
+    var value = b.value
+    loop {
+        match value.kind {
+            CLam(ps, body, name) -> {
+                let evidence = len(ps) > 0 && Iterator.all(ps, fun(p) = isEvidence(p.ty))
+                let more = match body.kind {
+                    CLam(_, _, _) -> True
+                    _ -> False
+                }
+                if !evidence || !more { break }
+                Vec.push(layers, (ps, name, value.ty))
+                value = body
+            }
+            _ -> return None
         }
+    }
+    if len(layers) == 0 { return None }
+    if !Iterator.any(layers, fun((ps, _, _)) = Iterator.any(ps, fun(p) = isDictionary(p.ty))) {
+        return None
+    }
+    match value.kind {
+        CLam(params, body, innerName) ->
+            splitAt(b, used, m, Vec.toArray(layers), value, params, body, innerName)
         _ -> None
     }
 }
 
-fun splitAt(b : CBind, used : Set.Set String, m : Minter, dicts : Array CParam, inner : Core,
-            outerName : String, params : Array CParam, body : Core,
+fun splitAt(b : CBind, used : Set.Set String, m : Minter,
+            layers : Array (Array CParam, String, Ty.Type), inner : Core,
+            params : Array CParam, body : Core,
             innerName : String) -> Option (CBind, CBind, Worker) {
-    if len(dicts) == 0 { return None }
-    for d in dicts {
-        if !isDictionary(d.ty) { return None }
-    }
-    -- The dictionaries and the parameters become one list, which binds no id
+    -- The evidence and the parameters become one list, which binds no id
     -- twice, because no id is bound twice in the program.
-    let flat = flatten(b.ty)
-    let flatTy = match flat {
+    let flatTy = match flatten(b.ty, len(layers)) {
         Some(t) -> t
         None -> return None
     }
     var name = b.name + "%worker"
     while Set.contains(used, name) { name = name + "~" }
     Set.add(used, name)
+    var all = []
+    for (ps, _, _) in layers { all = Array.append(all, ps) }
     let worker = CBind {
         name = name, id = noId, ty = flatTy, binders = b.binders,
-        value = mkCore(flatTy, b.value.span,
-                       CLam(Array.append(dicts, params), body, innerName)),
+        value = mkCore(flatTy, b.value.span, CLam(Array.append(all, params), body, innerName)),
         span = b.span, mutable = False, module_ = b.module_,
-        equations = b.equations, layouts = b.layouts,
+        layouts = b.layouts,
     }
     let head = mkCore(flatTy, b.value.span, CVar(BySpelling(name)))
     let applied = if len(b.binders) == 0 { head } else {
@@ -129,15 +150,20 @@ fun splitAt(b : CBind, used : Set.Set String, m : Minter, dicts : Array CParam, 
     }
     -- The worker keeps the original's parameters, and the wrapper binds fresh
     -- ones, so that no id is bound in both.
-    let ownDicts = Array.map(dicts, renewed(m, _))
+    let own = Array.map(layers, fun((ps, _, _)) = Array.map(ps, renewed(m, _)))
     let ownParams = Array.map(params, renewed(m, _))
-    let args = Array.map(Array.append(ownDicts, ownParams),
-                         fun(p) = mkCore(p.ty, b.value.span, CVar(refTo(p.name, p.id))))
+    var ownAll = []
+    for ps in own { ownAll = Array.append(ownAll, ps) }
+    let args = Array.map(Array.append(ownAll, ownParams), forwarded(_, b.value.span))
     let call = mkCore(body.ty, b.value.span, CApp(applied, args))
-    let wrapper = withValue(b, mkCore(b.value.ty, b.value.span, CLam(ownDicts,
-        mkCore(inner.ty, inner.span, CLam(ownParams, call, innerName)), outerName)))
-    Some((worker, wrapper, Worker { name = name, dicts = len(dicts),
-                                    params = len(params) }))
+    var wrapped = mkCore(inner.ty, inner.span, CLam(ownParams, call, innerName))
+    for var k = len(layers) - 1; k >= 0; k = k - 1 {
+        let (_, layerName, layerTy) = layers[k]
+        wrapped = mkCore(layerTy, b.value.span, CLam(own[k], wrapped, layerName))
+    }
+    let wrapper = withValue(b, wrapped)
+    let counts = Array.append(Array.map(layers, fun((ps, _, _)) = len(ps)), [len(params)])
+    Some((worker, wrapper, Worker { name = name, layers = counts }))
 }
 
 -- `p` with a fresh id.
@@ -146,26 +172,41 @@ fun renewed(m : Minter, p : CParam) -> CParam {
     CParam { name = name, id = mint(m), ty = ty }
 }
 
--- `fun(ds) -> fun(xs) -> r` as `fun(ds ++ xs) -> r`.
-fun flatten(t : Ty.Type) -> Option Ty.Type = match Ty.prune(t) {
-    TFun(ds, inner) -> match Ty.prune(inner) {
-        TFun(xs, r) -> Some(TFun(Array.append(ds, xs), r))
-        _ -> None
+-- `fun(ds) -> fun(cs) -> fun(xs) -> r`, with `layers` layers of evidence, as
+-- `fun(ds ++ cs ++ xs) -> r`.
+fun flatten(t : Ty.Type, layers : Int) -> Option Ty.Type = match Ty.prune(t) {
+    TFun(ds, inner) -> if layers == 0 { Some(TFun(ds, inner)) } else {
+        match flatten(inner, layers - 1)? {
+            TFun(xs, r) -> Some(TFun(Array.append(ds, xs), r))
+            _ -> None
+        }
     }
     _ -> None
 }
 
--- Every call that supplies a split binding's dictionaries and parameters, as
--- one call to its worker.
+-- Every call that supplies a split binding's evidence and parameters, as one
+-- call to its worker.
 fun rewrite(workers : Map String Worker, e : Core) -> Core {
     match e.kind {
-        CApp(fn, args) -> match fn.kind {
-            CApp(head, dargs) -> match direct(workers, head, len(dargs), len(args)) {
-                Some(worker) -> return mkCore(e.ty, e.span, CApp(worker,
-                    Array.map(Array.append(dargs, args), rewrite(workers, _))))
-                None -> {}
+        CApp(_, _) -> {
+            -- The argument lists from the head out, and the head.
+            let groups = Vec.new(3)
+            var head = e
+            loop {
+                match head.kind {
+                    CApp(fn, args) -> {
+                        Vec.push(groups, args)
+                        head = fn
+                    }
+                    _ -> break
+                }
             }
-            _ -> {}
+            let outward = Vec.toArray(Vec.reverse(groups))
+            if let Some(worker) = direct(workers, head, outward) {
+                var all = []
+                for g in outward { all = Array.append(all, g) }
+                return mkCore(e.ty, e.span, CApp(worker, Array.map(all, rewrite(workers, _))))
+            }
         }
         _ -> {}
     }
@@ -177,29 +218,31 @@ fun rewrite(workers : Map String Worker, e : Core) -> Core {
 }
 
 -- The worker a head reaches, applied to the same types, when the call supplies
--- exactly what the worker takes.
-fun direct(workers : Map String Worker, head : Core, dicts : Int,
-           params : Int) -> Option Core = match head.kind {
-    CVar(BySpelling(n)) -> directTo(workers, head, n, None, dicts, params)
+-- exactly what the worker takes, layer by layer.
+fun direct(workers : Map String Worker, head : Core,
+           groups : Array (Array Core)) -> Option Core = match head.kind {
+    CVar(BySpelling(n)) -> directTo(workers, head, n, None, groups)
     CTyApp(inner, ts) -> match inner.kind {
-        CVar(BySpelling(n)) -> directTo(workers, head, n, Some(ts), dicts, params)
+        CVar(BySpelling(n)) -> directTo(workers, head, n, Some(ts), groups)
         _ -> None
     }
     _ -> None
 }
 
 fun directTo(workers : Map String Worker, head : Core, name : String,
-             types : Option (Array Ty.Type), dicts : Int,
-             params : Int) -> Option Core {
-    let flatTy = match flatten(head.ty) {
-        Some(t) -> t
-        None -> return None
-    }
+             types : Option (Array Ty.Type), groups : Array (Array Core)) -> Option Core {
     let w = match Map.get(workers, name) {
         Some(found) -> found
         None -> return None
     }
-    if w.dicts != dicts || w.params != params { return None }
+    if len(w.layers) != len(groups) { return None }
+    for var i = 0; i < len(groups); i = i + 1 {
+        if len(groups[i]) != w.layers[i] { return None }
+    }
+    let flatTy = match flatten(head.ty, len(groups) - 1) {
+        Some(t) -> t
+        None -> return None
+    }
     let target = mkCore(flatTy, head.span, CVar(BySpelling(w.name)))
     match types {
         Some(ts) -> Some(mkCore(flatTy, head.span, CTyApp(target, ts)))

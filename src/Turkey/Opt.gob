@@ -213,7 +213,7 @@ fun anyOf[Iterator c, Item c ~ Core](xs : c, p : fun(Core) -> Bool) -> Bool {
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
     name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations, layouts = b.layouts,
+    layouts = b.layouts,
 }
 
 -- -- the call graph, and the cycles in it ---------------------------------------------
@@ -840,6 +840,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
         }
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
+            CLet(_, _, _, _, _, _) -> floatLetFromCall(e)
             CSlot(_, _) -> knownLambda(r.decls, e)
             CPrim(_) -> knownPrim(e)
             CProject(_, _) -> match knownLambda(r.decls, e) {
@@ -1446,6 +1447,27 @@ fun floatLet(e : Core) -> Option Core = match e.kind {
     _ -> None
 }
 
+-- `(let x = v in f)(args)` is `let x = v in f(args)`.
+--
+-- What beta reduction leaves when a lambda over a dictionary answers a lambda
+-- over coercions, applied to both: `(fun(d) = fun(co) = b)(D)(co)` binds `d`
+-- around the inner lambda, and the outer application then faces a `let`. Like
+-- `floatLet`, not a reduction in itself, but it puts the lambda back in front
+-- of its arguments for `beta`. The order is the call's: the function, and so
+-- the binding, is evaluated before the arguments, and no argument mentions `x`,
+-- since no id is bound twice.
+fun floatLetFromCall(e : Core) -> Option Core = match e.kind {
+    CApp(fn, args) -> match fn.kind {
+        CLet(name, id, bound, value, body, binders) -> {
+            if len(binders) > 0 { return None }
+            let inner = mkCore(e.ty, e.span, CApp(body, args))
+            Some(mkCore(e.ty, fn.span, CLet(name, id, bound, value, inner, [])))
+        }
+        _ -> None
+    }
+    _ -> None
+}
+
 -- `match (join j(p) = B in R) { alts }`, with the match moved into B.
 --
 -- What an inlined `Iterator.next` leaves behind. The callee's early `return`
@@ -1600,22 +1622,30 @@ fun fuseRecursiveJoinResult(r : Reducer, e : Core) -> Option Core = match e.kind
 --
 -- Only names and literals, not every value: substituting a `CLam` would
 -- duplicate its body at each mention, which is inlining and has a size limit
--- for a reason.
+-- for a reason. A lambda over coercions alone is the exception, when its body
+-- is trivial too: a generalized `let f = g` under an equality is one around
+-- the name it stands for, and once its argument is substituted, `beta` leaves
+-- only the name.
 fun trivialLet(r : Reducer, e : Core) -> Option Core = match e.kind {
     CLet(_, id, _, value, body, binders) -> {
-        if len(binders) > 0 { return None }
-        match value.kind {
-            CVar(_) -> {}
-            CLit(_) -> {}
-            CUnit -> {}
-            CCon(_) -> {}
-            _ -> return None
-        }
+        if len(binders) > 0 || !trivial(value) { return None }
         let mapping = Map.new()
         Map.put(mapping, id, value)
         Some(moved(r, body, mapping))
     }
     _ -> None
+}
+
+-- Whether `e` is a name or a literal, possibly under lambdas over coercions
+-- alone and applications to coercions alone, which copy no work, since a
+-- coercion is evidence and nothing else.
+fun trivial(e : Core) -> Bool = match e.kind {
+    CVar(_) | CLit(_) | CUnit | CCon(_) -> True
+    CLam(params, body, _) ->
+        len(params) > 0 && Iterator.all(params, fun(p) = isCoercion(p.ty)) && trivial(body)
+    CApp(fn, args) ->
+        len(args) > 0 && Iterator.all(args, fun(a) = isCoercion(a.ty)) && trivial(fn)
+    _ -> False
 }
 
 -- `let x = v in match x {...}` is `match v {...}`, when `x` is read only there.
@@ -2332,10 +2362,6 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
             name = b.name, id = b.id, ty = substitute(b.ty, mapping),
             binders = b.binders, value = instantiateTypes(b.value, mapping),
             span = b.span, mutable = b.mutable, module_ = b.module_,
-            equations = Vec.map(b.equations, fun(pair) = {
-                let (l, r) = pair
-                (substitute(l, mapping), substitute(r, mapping))
-            }),
             layouts = b.layouts,
         },
     }))
@@ -2450,15 +2476,13 @@ fun copyTerm(c : Copier, e : Core) -> Core {
             for var k = 0; k < len(binds); k = k + 1 {
                 let CBind {
                     name = _, id = _, ty, binders, value, span, mutable, module_,
-                    equations, layouts,
+                    layouts,
                 } = binds[k]
                 let (n, i) = named[k]
                 Vec.push(made, CBind {
                     name = n, id = i, ty = typeIn(c, ty), binders = binders,
                     value = copyTerm(c, value), span = span, mutable = mutable,
-                    module_ = module_,
-                    equations = Vec.map(equations, fun((l, r)) = (typeIn(c, l), typeIn(c, r))),
-                    layouts = layouts,
+                    module_ = module_, layouts = layouts,
                 })
             }
             CLetRec(made, copyTerm(c, body))

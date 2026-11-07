@@ -425,9 +425,47 @@ fun unwrap[Elem (Option a) ~ Option a](x : a) -> a = x
 fun main() { }
 ```
 
-A class method's own equality is different, because an instance does not
-write it. If it can never hold at an instance, that instance's override can
-never be called, so the override is accepted without being checked:
+A class method's own context may constrain the class variable. Every call of
+the method has to prove the equality, so an instance's override may rely on
+it. Here `Elem (Option a)` is `a`, so inside `Option`'s override the context
+says that `a` is `Int`, and the override adds `Int`s:
+
+<!-- run -->
+```kotlin
+class Box a {
+    type Elem a
+    fun open(a) -> Elem a
+    fun code[Elem a ~ Int](x : a) -> Int = open(x)
+}
+
+instance Box (Option a) {
+    type Elem = a
+    fun open(o) = match o {
+        Some(x) -> x
+        None -> error("empty")
+    }
+    fun code(o) = open(o) + 100
+}
+
+fun main() {
+    print(code(Some(3)))
+    print(open(Some("s")))
+}
+```
+
+```text
+103
+s
+```
+
+The instance is still an instance at every `a`. `open(Some("s"))` uses it at
+`String`, where `code`'s equality is false, and that is not an error:
+`code(Some("s"))` would be refused, so at `String` the override can never be
+called.
+
+The same equality at an instance whose head decides it can never hold makes
+that instance's override uncallable altogether, so the override is accepted
+without being checked:
 
 <!-- run -->
 ```kotlin

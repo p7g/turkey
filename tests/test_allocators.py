@@ -193,7 +193,7 @@ def test_allocator_exports_before_initialization(allocator_probe, stress):
 def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
     names = ["turkey_cell_new", "turkey_object_new", "turkey_array_new",
              "turkey_closure_shell", "turkey_string_new",
-             "turkey_root_enter", "turkey_root_leave", "turkey_frame_table_register",
+             "turkey_root_enter", "turkey_root_leave", "turkey_frame_table_set",
              "turkey_entry_stack_set", "turkey_collect", "turkey_gc_report",
              "turkey_gc_set_stress", "turkey_heap_objects", "turkey_roots_head",
              "turkey_giblets_initialize", "turkey_panic", "turkey_panic_string",

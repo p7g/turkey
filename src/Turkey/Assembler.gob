@@ -40,7 +40,7 @@ import Data.Set as Set
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
 import Turkey.Dwarf as Dwarf
-import Turkey.Stream (Item(..), Cfi(..))
+import Turkey.Stream (Item(..), Cfi(..), fits32)
 import Turkey.Unwind as Unwind
 
 -- What the assembler needs to know about an instruction set, whose
@@ -161,28 +161,27 @@ type Assembler i f = Assembler {
 
 -- The sections every object has, first and in this order, which is the
 -- order the emitter fills them in.
-let sectionOrder = [Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data, Asm.Relocated]
+let sectionOrder = [Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data]
 
 fun kindNumber(s : Asm.Section) -> Int = match s {
     Asm.Text -> 0
     Asm.CStrings -> 1
     Asm.Constants -> 2
     Asm.Data -> 3
-    Asm.Relocated -> 4
-    Asm.DebugAbbrev -> 5
-    Asm.DebugInfo -> 6
-    Asm.DebugStr -> 7
-    Asm.DebugLine -> 8
-    Asm.DebugLineStr -> 9
-    Asm.DebugAddr -> 10
-    Asm.DebugRnglists -> 11
-    Asm.DebugLoclists -> 12
-    Asm.DebugGdbScripts -> 13
-    Asm.CompactUnwind -> 14
-    Asm.EhFrame -> 15
+    Asm.DebugAbbrev -> 4
+    Asm.DebugInfo -> 5
+    Asm.DebugStr -> 6
+    Asm.DebugLine -> 7
+    Asm.DebugLineStr -> 8
+    Asm.DebugAddr -> 9
+    Asm.DebugRnglists -> 10
+    Asm.DebugLoclists -> 11
+    Asm.DebugGdbScripts -> 12
+    Asm.CompactUnwind -> 13
+    Asm.EhFrame -> 14
 }
 
-let kinds = 16
+let kinds = 15
 
 -- An assembler for `isa`, whose own labels are spelled for `d`.
 fun new(isa : Isa i f, d : Asm.Dialect) -> Assembler i f {
@@ -272,6 +271,14 @@ fun feedItem(a : Assembler i f, item : Item i) -> Unit {
                                           use = Address64, target = sym })
             zeros(s.bytes, 8)
         }
+        Word32(n) -> {
+            if !fits32(n) {
+                error("internal error: " + Int.toString(n) + " does not fit in four bytes")
+            }
+            let at = len(s.bytes)
+            zeros(s.bytes, 4)
+            Byte.putLE(s.bytes, at, 4, n)
+        }
         Space(n) -> zeros(s.bytes, n)
         Bytes(text) -> for b in String.bytes(text) { Vec.push(s.bytes, b) }
         CString(text) -> {
@@ -307,8 +314,9 @@ fun feedItem(a : Assembler i f, item : Item i) -> Unit {
 -- data with bytes of its own, and the next `Loc`, so that two in a row each
 -- leave one.
 fun takesRow(item : Item i) -> Bool = match item {
-    Instruction(_) | Word(_) | WordOf(_) | Bytes(_) | CString(_) | Byte(_) | Uleb(_)
-        | Difference(_, _) | UlebDifference(_, _) | SectionOffset(_, _) | Loc(_, _) -> True
+    Instruction(_) | Word(_) | WordOf(_) | Word32(_) | Bytes(_) | CString(_) | Byte(_)
+        | Uleb(_) | Difference(_, _) | UlebDifference(_, _) | SectionOffset(_, _)
+        | Loc(_, _) -> True
     Architecture | Section(_) | Global(_) | FunctionType(_) | Align(_) | Label(_)
         | Space(_) | Comment(_) | SourceFile(_, _, _) | Cfi(_) -> False
 }
@@ -393,6 +401,15 @@ fun finish(a : Assembler i f) -> Object f {
             Asm.Elf -> ehFrame(a, a.frames)
         }
     }
+    -- Each distance is final here because a section's bytes stay together:
+    -- the object never sets `MH_SUBSECTIONS_VIA_SYMBOLS`, and there is one
+    -- section per kind, so the linker moves `__text` and `.text` whole and
+    -- cannot strip or reorder what lies between two labels. Subsections, or
+    -- dead-stripping within a section, would let the linker move a function
+    -- or drop it, and every frame-table return address past it would name
+    -- the wrong instruction. Either needs each distance left to the linker,
+    -- as a `SUBTRACTOR` and `UNSIGNED` pair, so that it is computed after
+    -- the code has moved.
     for p in a.distances {
         let bytes = a.sections[p.section].bytes
         match (Map.get(a.labels, Asm.spell(p.to)), Map.get(a.labels, Asm.spell(p.from))) {
@@ -401,7 +418,12 @@ fun finish(a : Assembler i f) -> Object f {
                     error("internal error: the distance from " + Asm.spell(p.from) + " to "
                           + Asm.spell(p.to) + " crosses a section")
                 }
-                Byte.putLE(bytes, p.offset, 4, to.offset - from.offset)
+                let distance = to.offset - from.offset
+                if !fits32(distance) {
+                    error("internal error: the distance from " + Asm.spell(p.from) + " to "
+                          + Asm.spell(p.to) + " does not fit in four bytes")
+                }
+                Byte.putLE(bytes, p.offset, 4, distance)
             }
             _ -> error("internal error: the distance from " + Asm.spell(p.from) + " to "
                        + Asm.spell(p.to) + " names a label never defined")

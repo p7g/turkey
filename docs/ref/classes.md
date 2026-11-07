@@ -90,8 +90,8 @@ applied to an argument, so it has [kind](types.md#type-expressions)
 with an `Ord` instance must also have an `Eq` instance, and a function with an
 `Ord a` constraint can use `Eq`'s methods on `a` without asking for `Eq`
 separately. A superclass constrains the class's own parameter, never a type
-built from it. A superclass may also be an equality between associated types,
-as described in [Equality superclasses](#equality-superclasses).
+built from it. A superclass may also be an equality that fixes an associated
+type, as described in [Equality superclasses](#equality-superclasses).
 
 <!-- error: 'Show Cat' is required by 'Named', but there is no such instance -->
 ```kotlin
@@ -538,7 +538,17 @@ The equalities hold wherever `Bytes s` does: in a default method of `Bytes`,
 in the methods of an instance whose context has a `Bytes s`, and for a
 subclass of `Bytes`. An equality superclass follows the rules of an equality
 in a context, and it may mention no type variable other than the class
-parameter.
+parameter. The equalities a class inherits from its superclasses must agree
+with its own, and a method's own context may not contradict them:
+
+<!-- error: the equality 'Index.Value s ~ Int' in this context contradicts the superclasses of 'Bytes'; it would make 'Byte' equal to 'Int' -->
+```kotlin
+class Bytes s : Index s, Value s ~ Byte {
+    fun asInt[Value s ~ Int](x : s) -> Int = x[0]
+}
+
+fun main() { }
+```
 
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a

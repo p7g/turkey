@@ -45,7 +45,7 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
 import Turkey.Inert as Inert
-import Turkey.Inert (Refusal(..))
+import Turkey.Inert (Refusal(..), Given(..))
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
@@ -54,7 +54,7 @@ import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
 import Turkey.Types as Ty
-import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..),
+import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..), Namer(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
@@ -606,9 +606,9 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
     }
 }
 
--- Refuses a class whose equality superclasses can never hold together, and
--- an instance whose context does not prove its class's equality superclasses
--- at its head.
+-- Refuses a class whose equality superclasses can never hold together, a
+-- method whose own context contradicts them, and an instance whose context
+-- does not prove its class's equality superclasses at its head.
 --
 -- After every instance is registered, since a proof reduces associated types
 -- through all of them. Not in `Classes.checkInstance` with the class
@@ -616,22 +616,9 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
 -- `Turkey.Inert`'s, and `Turkey.Inert` is built on `Turkey.Classes`.
 fun checkSuperEqualities(classes : ClassTable) -> Unit {
     for (_, info) in Map.entries(classes.classes) {
-        if len(info.equalities) == 0 { continue }
-        -- As the givens `C a` grants over a rigid `a`: `Inert` refuses one
-        -- that contradicts another.
-        let n = Ty.namerFrom([info.cvar], "")
-        let own = Vec.map(info.equalities, Inert.given)
-        let (inert, refused) = Inert.extend(Inert.empty(classes), Vec.toArray(own))
-        Inert.close(inert)
-        for r in refused {
-            let (g, why) = match r {
-                Never(g, why) -> (g, why)
-                GaveUp(g, _) -> (g, "the checker gave up on it")
-            }
-            Ty.typeError("the superclass equality '" + Ty.showPredWith(g.pred, n) + "' of '"
-                         + info.name + "' can never hold together with the others; " + why,
-                         info.span)
-        }
+        let own = Ty.pred(info.name, [TVar(info.cvar)])
+        if len(Classes.superEqualities(classes, own)) == 0 { continue }
+        checkClassEqualities(classes, info, own)
     }
     for (cls, insts) in Map.entries(classes.instances) {
         let info = match Map.get(classes.classes, cls) {
@@ -643,11 +630,73 @@ fun checkSuperEqualities(classes : ClassTable) -> Unit {
     }
 }
 
+-- Reports equalities in the superclass closure of `info` that contradict each
+-- other, at the class, and then each method equality that contradicts them, at
+-- the method's context. Such a method could never be called, and its default
+-- would be checked under a contradiction; a context that writes both sides
+-- of one is refused the same way.
+fun checkClassEqualities(classes : ClassTable, info : ClassInfo, own : Pred) -> Unit {
+    let n = writtenNamer([(info.cvar.id, info.param)])
+    -- As the givens a `C a` grants over a rigid `a`, inherited ones included.
+    let (inert, refused) = Inert.extend(Inert.empty(classes), [Inert.given(own)])
+    for r in refused {
+        let (g, why) = match r {
+            Never(g, why) -> (g, why)
+            GaveUp(g, _) -> (g, "the checker gave up on it")
+        }
+        Ty.typeError("the superclass equality '" + Ty.showPredWith(g.pred, n) + "' of '"
+                     + info.name + "' can never hold together with the others; " + why,
+                     info.span)
+    }
+    if len(refused) == 0 {
+        for (_, m) in Map.entries(info.methods) {
+            let (_, contradicted) = Inert.extend(inert, Vec.toArray(writtenEqualities(m)))
+            for r in contradicted {
+                if let Never(g, why) = r {
+                    Ty.typeError("the equality '" + Ty.showPredWith(g.pred, n) + "' in this "
+                                 + "context contradicts the superclasses of '" + info.name
+                                 + "'; " + why, g.span)
+                }
+            }
+        }
+    }
+    Inert.close(inert)
+}
+
+-- Returns the method's own equalities, each where its context wrote it.
+fun writtenEqualities(m : MethodInfo) -> Vec Given {
+    let spans = Vec.new(2)
+    for p in m.decl.context {
+        if let PEq(_, _) = p.kind { Vec.push(spans, p.span) }
+    }
+    let equalities = Classes.methodEqualities(m)
+    let out = Vec.new(len(equalities))
+    for var i = 0; i < len(equalities); i = i + 1 {
+        Vec.push(out, Given {
+            pred = equalities[i],
+            span = Some(if i < len(spans) { spans[i] } else { m.decl.span }),
+        })
+    }
+    out
+}
+
+-- Returns a namer that calls each variable by the name the program wrote.
+fun writtenNamer(names : Array (Int, String)) -> Namer {
+    let map = Map.new()
+    for (id, name) in names { Map.put(map, id, name) }
+    Namer { names = map, next = 0, prefix = "" }
+}
+
 -- Reports each equality superclass of `info` that the context of `inst` does
 -- not prove at its head: one that can never hold, or one the context does not
 -- decide. The context's class predicates grant their own equality superclasses.
 fun proveSuperEqualities(classes : ClassTable, info : ClassInfo, inst : InstInfo) -> Unit {
-    let n = Ty.namer("")
+    -- An instance missing a class superclass is reported by `Classes.checkInstance`
+    -- already, and its associated types are what this would report again.
+    for sup in info.supers {
+        if !Classes.entail(classes, inst.context, Ty.pred(sup.name, [inst.head])) { return {} }
+    }
+    let n = writtenNamer(Map.entries(inst.names))
     let shown = info.name + " " + Ty.showAt(inst.head, n, 2)
     let (inert, _) = Inert.extend(Inert.empty(classes),
                                   Vec.toArray(Vec.map(inst.context, Inert.given)))
@@ -658,12 +707,16 @@ fun proveSuperEqualities(classes : ClassTable, info : ClassInfo, inst : InstInfo
         if Ty.sameType(left, right) { continue }
         let required = "'" + shown + "' requires '" + Ty.showPredWith(want, n) + "'"
         let (_, never) = Inert.extend(inert, [Inert.given(Ty.pred(Ty.equals, [left, right]))])
-        if Iterator.any(never, fun(r) = match r {
+        let refuted = Iterator.any(never, fun(r) = match r {
             Never(_, _) -> True
             GaveUp(_, _) -> False
-        }) {
+        })
+        if refuted {
             Ty.typeError(required + ", which can never hold: '" + Ty.showAt(left, n, 1)
                          + "' is not '" + Ty.showAt(right, n, 1) + "'", Some(inst.decl.span))
+        } else if let Some(missing) = missingInstance(classes, [left, right]) {
+            Ty.typeError(required + ", and there is no instance '"
+                         + Ty.showPredWith(missing, n) + "' to define it", Some(inst.decl.span))
         } else {
             Ty.typeError(required + ", and its context cannot tell whether '"
                          + Ty.showAt(left, n, 1) + "' is '" + Ty.showAt(right, n, 1) + "'",
@@ -671,6 +724,17 @@ fun proveSuperEqualities(classes : ClassTable, info : ClassInfo, inst : InstInfo
         }
     }
     Inert.close(inert)
+}
+
+-- Returns the instance that some associated type at the top of `sides` is
+-- stuck for want of, if one is: over a constructor that no instance covers.
+fun missingInstance(classes : ClassTable, sides : Array Ty.Type) -> Option Pred {
+    for side in sides {
+        if let TFam(name, arg, _) = Ty.prune(side) {
+            if let Some(p) = Classes.uncovered(classes, name, arg) { return Some(p) }
+        }
+    }
+    None
 }
 
 fun bindMethods(g : Generator) -> Unit {

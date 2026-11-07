@@ -680,12 +680,27 @@ Inference is not bound by that rule. A function with no signature that
 needs the rep of a `Cell f` is inferred with exactly the context no program
 can write, and works, but cannot be given a signature that restates its type:
 
-```text
-import Data.Typed (Proxy(..), typeRep)
+<!-- run -->
+```kotlin
+import Data.Typed (Proxy(..), typeRep, describe)
 
 type Cell f = Cell(f Int)
 
 fun proxyFor(x : a) -> Proxy a = Proxy
-fun repOf(x) = match x { Cell(_) -> typeRep(proxyFor(x)) }
+
 -- repOf : [Typed a] fun(Cell a) -> TypeRep, where `a` has kind * -> *
+fun repOf(cell) {
+    let Cell(_) = cell
+    typeRep(proxyFor(cell))
+}
+
+fun main() {
+    print(describe(repOf(Cell(Some(1)))))
+    print(repOf(Cell(Some(1))) == repOf(Cell([1])))
+}
+```
+
+```text
+Main#Cell Data.Option#Option
+False
 ```

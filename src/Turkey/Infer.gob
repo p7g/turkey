@@ -45,6 +45,7 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
 import Turkey.Inert as Inert
+import Turkey.Inert (Refusal(..))
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
@@ -329,6 +330,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     }
     Decls.registerAll(g.decls, typeDecls)
     Classes.registerAll(g.classes, ownedClasses, ownedInstances)
+    checkSuperEqualities(g.classes)
     -- A declaration that failed to register leaves a gap in the tables that
     -- every use of it would report again, so nothing is generated past one.
     if Diag.hasErrors() { return ([], CAnd([])) }
@@ -602,6 +604,73 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
                          + Int.toString(limit), Some(span))
         }
     }
+}
+
+-- Refuses a class whose equality superclasses can never hold together, and
+-- an instance whose context does not prove its class's equality superclasses
+-- at its head.
+--
+-- After every instance is registered, since a proof reduces associated types
+-- through all of them. Not in `Classes.checkInstance` with the class
+-- superclasses, because a proof rewrites by the context's givens, which is
+-- `Turkey.Inert`'s, and `Turkey.Inert` is built on `Turkey.Classes`.
+fun checkSuperEqualities(classes : ClassTable) -> Unit {
+    for (_, info) in Map.entries(classes.classes) {
+        if len(info.equalities) == 0 { continue }
+        -- As the givens `C a` grants over a rigid `a`: `Inert` refuses one
+        -- that contradicts another.
+        let n = Ty.namerFrom([info.cvar], "")
+        let own = Vec.map(info.equalities, Inert.given)
+        let (inert, refused) = Inert.extend(Inert.empty(classes), Vec.toArray(own))
+        Inert.close(inert)
+        for r in refused {
+            let (g, why) = match r {
+                Never(g, why) -> (g, why)
+                GaveUp(g, _) -> (g, "the checker gave up on it")
+            }
+            Ty.typeError("the superclass equality '" + Ty.showPredWith(g.pred, n) + "' of '"
+                         + info.name + "' can never hold together with the others; " + why,
+                         info.span)
+        }
+    }
+    for (cls, insts) in Map.entries(classes.instances) {
+        let info = match Map.get(classes.classes, cls) {
+            Some(i) -> i
+            None -> continue
+        }
+        if len(info.equalities) == 0 { continue }
+        for inst in insts { proveSuperEqualities(classes, info, inst) }
+    }
+}
+
+-- Reports each equality superclass of `info` that the context of `inst` does
+-- not prove at its head: one that can never hold, or one the context does not
+-- decide. The context's class predicates grant their own equality superclasses.
+fun proveSuperEqualities(classes : ClassTable, info : ClassInfo, inst : InstInfo) -> Unit {
+    let n = Ty.namer("")
+    let shown = info.name + " " + Ty.showAt(inst.head, n, 2)
+    let (inert, _) = Inert.extend(Inert.empty(classes),
+                                  Vec.toArray(Vec.map(inst.context, Inert.given)))
+    for e in info.equalities {
+        let want = Classes.equalityAt(info, e, inst.head)
+        let left = Inert.rewrite(inert, want.args[0])
+        let right = Inert.rewrite(inert, want.args[1])
+        if Ty.sameType(left, right) { continue }
+        let required = "'" + shown + "' requires '" + Ty.showPredWith(want, n) + "'"
+        let (_, never) = Inert.extend(inert, [Inert.given(Ty.pred(Ty.equals, [left, right]))])
+        if Iterator.any(never, fun(r) = match r {
+            Never(_, _) -> True
+            GaveUp(_, _) -> False
+        }) {
+            Ty.typeError(required + ", which can never hold: '" + Ty.showAt(left, n, 1)
+                         + "' is not '" + Ty.showAt(right, n, 1) + "'", Some(inst.decl.span))
+        } else {
+            Ty.typeError(required + ", and its context cannot tell whether '"
+                         + Ty.showAt(left, n, 1) + "' is '" + Ty.showAt(right, n, 1) + "'",
+                         Some(inst.decl.span))
+        }
+    }
+    Inert.close(inert)
 }
 
 fun bindMethods(g : Generator) -> Unit {
@@ -972,15 +1041,14 @@ fun resolveUnder(g : Generator, ty : Ty.Type, site : Use) -> Ty.Type {
     -- Op`, or under a binding that matched it against `Op`'s constructors and
     -- so retained the same equality as a wanted.
     let t = Typed.resolve(g.types, ty)
-    let equalities = Vec.new(2)
+    let givens = Vec.new(2)
     for sc in site.scopes {
-        for (_, p) in sc.givens {
-            if p.name == Ty.equals { Vec.push(equalities, p) }
-        }
+        for (_, p) in sc.givens { Vec.push(givens, Inert.given(p)) }
     }
+    -- A class given grants its equality superclasses.
+    let equalities = Inert.granted(g.classes, Vec.toArray(givens))
     if len(equalities) == 0 { return t }
-    let (inert, _) = Inert.extend(Inert.empty(g.classes),
-                                  Array.map(Vec.toArray(equalities), Inert.given))
+    let (inert, _) = Inert.extend(Inert.empty(g.classes), equalities)
     let out = Inert.rewrite(inert, t)
     Inert.close(inert)
     out

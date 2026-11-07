@@ -1,5 +1,5 @@
-export (Inert(..), Given(..), Refusal(..), given, empty, extend, extendAt, close, refutes,
-        ofEqualities, rewrite, rewritten)
+export (Inert(..), Given(..), Refusal(..), given, granted, empty, extend, extendAt, close,
+        refutes, ofGivens, rewrite, rewritten)
 
 -- The given equalities in scope, kept canonical: OutsideIn(X)'s inert set
 -- (Vytiniotis, Peyton Jones, Schrijvers and Sulzmann, JFP 2011, §7.4 and
@@ -93,13 +93,38 @@ type Refusal
     -- still to add, itself included.
     | GaveUp(Given, Int)
 
+-- Returns the equalities `givens` grant, in order: an equality grants itself,
+-- and a class predicate grants the equalities among its superclasses
+-- (`Classes.superEqualities`), each written where the predicate was. This is
+-- superclass expansion of a given, as GHC's canonicalizer does it eagerly for
+-- givens and never for wanteds (Note [The superclass story] in
+-- `GHC/Tc/Solver/Dict.hs`): a wanted's superclasses are never facts.
+--
+-- Expansion terminates because a class's superclasses form no cycle and each
+-- constrains the class variable itself, so the closure is finite, and an
+-- equality grants nothing further.
+fun granted(classes : ClassTable, givens : Array Given) -> Array Given {
+    let out = Vec.new(len(givens))
+    for g in givens {
+        if g.pred.name == Ty.equals {
+            Vec.push(out, g)
+        } else if len(g.pred.args) == 1 {
+            for e in Classes.superEqualities(classes, g.pred) {
+                Vec.push(out, Given { pred = e, span = g.span })
+            }
+        }
+    }
+    Vec.toArray(out)
+}
+
 -- Returns the inert set with no givens.
 fun empty(classes : ClassTable) -> Inert =
     Inert { classes = classes, eqs = [], breakers = [] }
 
--- Returns `base` extended with the equalities among `givens`, and what was
--- refused. `base` is unchanged. A cycle breaker it makes is untouchable by its
--- level alone (`Ty.noScope`), and is not recorded anywhere else.
+-- Returns `base` extended with the equalities `givens` grant (`granted`), and
+-- what was refused. `base` is unchanged. A cycle breaker it makes is
+-- untouchable by its level alone (`Ty.noScope`), and is not recorded anywhere
+-- else.
 fun extend(base : Inert, givens : Array Given) -> (Inert, Vec Refusal) =
     extendWith(base, givens, Ty.noScope, False)
 
@@ -118,12 +143,13 @@ fun extendWith(base : Inert, givens : Array Given, level : Int,
         breakers = [],
     }
     let refused = Vec.new(1)
-    let work = Vec.new(len(givens))
+    let equalities = granted(base.classes, givens)
+    let work = Vec.new(len(equalities))
     -- The work list is a stack: pushed in reverse, the givens are added in the
     -- order they were written.
-    for var i = len(givens) - 1; i >= 0; i = i - 1 {
-        let g = givens[i]
-        if g.pred.name == Ty.equals { Vec.push(work, (g.pred.args[0], g.pred.args[1], g)) }
+    for var i = len(equalities) - 1; i >= 0; i = i - 1 {
+        let g = equalities[i]
+        Vec.push(work, (g.pred.args[0], g.pred.args[1], g))
     }
     let n = len(work) + len(base.eqs) + 1
     var left = 64 + 4 * n * n
@@ -287,13 +313,11 @@ fun isLhs(t : Ty.Type) -> Bool = match Ty.prune(t) {
     _ -> False
 }
 
--- Returns the set of the equalities `equalities` states, for reading a type
--- under them once solving is over: those a Core term's coercions grant.
-fun ofEqualities(classes : Classes.ClassTable, equalities : Vec (Ty.Type, Ty.Type)) -> Inert {
-    let givens = Vec.new(len(equalities))
-    for (left, right) in equalities {
-        Vec.push(givens, given(Ty.pred(Ty.equals, [left, right])))
-    }
+-- Returns the set of the equalities `preds` grant (`granted`), for reading a
+-- type under them once solving is over: those a Core term's evidence
+-- parameters grant.
+fun ofGivens(classes : Classes.ClassTable, preds : Vec Pred) -> Inert {
+    let givens = Vec.map(preds, given)
     -- An equality that can never hold is dropped: the solver has already
     -- refused it where it was written, and a specialization that made one
     -- false is a binding that can never be called.

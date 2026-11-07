@@ -8,7 +8,7 @@ export (
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto, codeAddressName, mentions, references,
     dictName, classOfDict, dictClass, isDictionary,
-    coercionOf, coercionSides, isCoercion, isEvidence, coercion, forwarded, outerEqualities,
+    coercionOf, coercionSides, isCoercion, isEvidence, coercion, forwarded, evidencePreds, outerEvidence,
     abstractionBinders,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
@@ -521,21 +521,37 @@ fun forwarded(p : CParam, span : Option Span) -> Core = match coercionSides(p.ty
     None -> mkCore(p.ty, span, CVar(refTo(p.name, p.id)))
 }
 
--- Returns the equalities the coercion parameters at the top of `e` bind: those
--- of every lambda, under its type abstractions, whose parameters are all
--- evidence, and of the first lambda that takes other parameters too, as a
--- worker takes its evidence beside its parameters. These are the equalities a
--- whole binding of `e` may assume, since every call supplies them.
-fun outerEqualities(e : Core) -> Vec (Ty.Type, Ty.Type) {
+-- Returns what the evidence parameters among `params` stand for, in order: a
+-- coercion's equality, and a dictionary's class predicate. The predicates are
+-- what a term under the lambda may assume. A dictionary is one because of its
+-- equality superclasses, which `Turkey.Inert.granted` reads off it, as it
+-- reads them off a given class predicate while solving.
+fun evidencePreds(params : Array CParam) -> Vec Ty.Pred {
+    let out = Vec.new(0)
+    for p in params {
+        match coercionSides(p.ty) {
+            Some((l, r)) -> Vec.push(out, Ty.pred(Ty.equals, [l, r]))
+            None -> if let Some(cls) = dictClass(p.ty) {
+                Vec.push(out, Ty.pred(cls, [Ty.spine(Ty.prune(p.ty)).1[0]]))
+            }
+        }
+    }
+    out
+}
+
+-- Returns what the evidence parameters at the top of `e` stand for
+-- (`evidencePreds`): those of every lambda, under its type abstractions, whose
+-- parameters are all evidence, and of the first lambda that takes other
+-- parameters too, as a worker takes its evidence beside its parameters. These
+-- are what a whole binding of `e` may assume, since every call supplies them.
+fun outerEvidence(e : Core) -> Vec Ty.Pred {
     let out = Vec.new(2)
     var value = e
     loop {
         match value.kind {
             CTyLam(_, body) -> { value = body }
             CLam(params, body, _) -> {
-                for p in params {
-                    if let Some(sides) = coercionSides(p.ty) { Vec.push(out, sides) }
-                }
+                for q in evidencePreds(params) { Vec.push(out, q) }
                 if len(params) == 0 || !Iterator.all(params, fun(p) = isEvidence(p.ty)) {
                     break
                 }

@@ -93,6 +93,7 @@ in [Type aliases](types.md#type-aliases).
 class-decl    ::= "class" CONID IDENT (":" superclass ("," superclass)*)?
                   "{" (class-item (separator class-item)*)? "}"
 superclass    ::= qualified-CONID atype
+                | type "~" type
 class-item    ::= "fun" IDENT context? "(" (type ("," type)*)? ")" "->" type
                 | fun-decl
                 | "type" CONID IDENT

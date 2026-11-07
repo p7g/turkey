@@ -1,5 +1,5 @@
 export (
-    Entry(..), Routine(..), routineName, layoutCode, traceBit, elementWidth, arrayElements, cellValue, accessWidth, entryPoint,
+    Entry(..), Routine(..), routineName, traceBit, Element(..), element, arrayElements, cellValue, accessWidth, entryPoint,
     processState, processStateBytes, voidSymbols, immediates, fieldLimit, tracedLimit,
     Layout(..), layout, fieldWidth, objectFields, objectBytes, fieldOffset, closureShell,
     closureCode, closureEnvironment, headerWord, staticHeaderWord, closureKind, arrayKind, cellKind, cellBytes,
@@ -14,8 +14,8 @@ export (
 --
 -- **The test for what belongs here is not "two passes read it".** It is
 -- whether the thing is a fact about an artifact this compiler does not own.
--- The layout codes are a number `mark_children` reads out of an object header;
--- the entry points are symbols the runtime exports. Neither is a decision a
+-- An array's element descriptor is two numbers the collector reads out of an
+-- object header; the entry points are symbols the runtime exports. Neither is a decision a
 -- pass gets to make, so a pass holding its own copy is not a second
 -- implementation of a rule -- it is a second transcription of someone else's
 -- constant, which is the kind that drifts without anything going red.
@@ -34,27 +34,6 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), RepClass(..))
 
 -- -- representations ------------------------------------------------------------------
-
--- The number the runtime calls this representation.
---
--- An array's tag, and the argument `turkey_array_new` and `turkey_cell_new`
--- take, by every emitter. One numbering, read by the collector -- so it
--- follows an array's elements iff the writer and the caller agreed, and there
--- is no diagnostic when they do not.
---
--- The two pointer codes are the whole reason `Rep` carries a trace bit as far
--- as the runtime: 7 is a pointer the collector follows and 6 is a
--- pointer-sized word it must not. A reader that tests `>= 6` follows both and
--- collects through a raw address.
-fun layoutCode(r : Rep) -> Int = match r.class_ {
-    Unit -> 0
-    I1 -> 1
-    I8 -> 2
-    I32 -> 3
-    I64 -> 4
-    F64 -> 5
-    Ptr -> if r.traced { 7 } else { 6 }
-}
 
 -- The most fields a tuple or constructed value can have; the parser refuses a
 -- wider one. Nothing in an object's layout or its header is bounded by it.
@@ -102,10 +81,9 @@ type Layout = Layout {
 
 -- Bytes a field of this representation occupies, and the alignment it needs.
 --
--- Not `elementWidth`: an `Array Bool` gives an element a whole word, and a
--- `Bool` field takes one byte. Not `accessWidth` either, though the two agree:
--- that one is C's layout, and this one is this compiler's choice for its own
--- objects.
+-- An array's element of one slot takes the same bytes (`element`). Not
+-- `accessWidth`, though the two agree: that one is C's layout, and this one is
+-- this compiler's choice for its own objects.
 fun fieldWidth(r : Rep) -> Int = match r.class_ {
     Unit -> 0
     I1 -> 1
@@ -151,14 +129,15 @@ fun layout(reps : Array Rep) -> Layout {
 --   +0  u8   the generation: 0 young, 1 old, 2 old and remembered
 --   +1  u8   the kind: 0 constructor, 1 record, 2 array, 3 closure,
 --            4 environment, 5 cell
---   +2  u16  an array's element layout code (`layoutCode`), a cell's 1 if its
---            value is traced, and any other object's count of the traced words
---            its fields start with
---   +4  i32  the tag, which generated code reads with one 32-bit load; unused
---            in an array or a cell
+--   +2  u16  the count of the traced words an object's fields start with: in
+--            an array, the count each element starts with; in a cell, 1 if
+--            its value is traced
+--   +4  i32  the tag, which generated code reads with one 32-bit load; in an
+--            array, its element's stride in bytes; unused in a cell
 --
 -- An array's length is the word after the header, and its elements follow
--- (`arrayElements`); a cell's value is that word (`cellValue`).
+-- (`arrayElements`), laid out as `element` says; a cell's value is that word
+-- (`cellValue`).
 --
 -- No object records its size. The heap knows it from the slot, since a small
 -- object's size class is chosen from it, a large object has a region of its
@@ -171,8 +150,9 @@ let arrayKind = 2
 let cellKind = 5
 
 -- The header of an object of `kind` and `tag` whose fields start with
--- `traced` traced words, young. `traced` is an array's element layout code
--- or a cell's flag for those kinds.
+-- `traced` traced words, young. For a cell, `traced` is its flag. For an
+-- array, it is the traced words each element starts with, and `tag` is the
+-- stride (`Element`), the two numbers `turkey_array_new` is called with.
 fun headerWord(kind : Int, traced : Int, tag : Int) -> Int =
     kind << 8 | traced << 16 | (tag & 0xFFFF_FFFF) << 32
 
@@ -197,19 +177,33 @@ let closureCode = 0
 let closureEnvironment = 1
 let closureShell = layout([Ssa.untraced(Ptr), Ssa.traced(Ptr)])
 
--- Whether the collector must follow a slot, for the one-bit-per-slot encoding
--- that closures and environments use. Not `layoutCode`: one C field carries
--- both encodings and the object's kind is what says which.
+-- A cell's header count: 1 if the collector must follow its value.
 fun traceBit(r : Rep) -> Int = if r.traced { 1 } else { 0 }
 
--- Bytes one array element occupies. `turkey_array_new` is called with this
--- width and the element is then read at this stride, so the two uses have to
--- be the same rule -- as they must also stay the same rule as
--- `turkey/backend_lower._layout_width`.
-fun elementWidth(c : RepClass) -> Int = match c {
-    I8 -> 1
-    I32 -> 4
-    _ -> 8
+-- -- arrays ---------------------------------------------------------------------------
+
+-- How an array lays out its elements: one element's slots, placed by `layout`
+-- as an object's fields are, and the bytes from one element to the next. So
+-- every element starts with `layout.pointers` traced words, and the array's
+-- header holds that count and the stride (`headerWord`): the collector scans
+-- that many words at every stride.
+--
+-- The stride is the layout's size, which is a multiple of its alignment, so
+-- every slot of every element is at its natural alignment. An element of one
+-- slot is that slot's `fieldWidth`, and an `Array Bool` gives an element one
+-- byte. A bit per element would make a store a read, a change and a write of
+-- a byte that other elements share, and two tasks storing into neighbouring
+-- elements would lose one of the stores; a byte is stored on its own.
+--
+-- An element of no bytes, `unit`, is given a word anyway. A stride of 0 would
+-- need its own case wherever a stride divides or scales a length (the
+-- allocator's size classes, the collector, the copy loops), and an array of
+-- `unit` is too rare for those cases to pay for themselves.
+type Element = Element { layout : Layout, stride : Int }
+
+fun element(reps : Array Rep) -> Element {
+    let l = layout(reps)
+    Element { layout = l, stride = if l.size == 0 { 8 } else { l.size } }
 }
 
 -- Where an array's first element is, in bytes from the array's address: after
@@ -224,11 +218,9 @@ let cellBytes = 16
 
 -- Bytes a *raw* access at this class touches.
 --
--- Not `elementWidth`, and the difference is `I1`. An `Array Bool` gives a
--- whole word to an element, which is this compiler's choice about arrays; a
--- raw load at `i1` touches one byte, which is not a choice -- it is C's
--- `bool`, and raw memory is a layout someone else already decided. Sharing
--- one rule here would read a word out of a struct with a `bool` in it.
+-- Not `fieldWidth`, though the two agree on every class: this one is C's
+-- layout, and raw memory is a layout someone else already decided, where
+-- `fieldWidth` is this compiler's choice for its own objects and arrays.
 fun accessWidth(c : RepClass) -> Int = match c {
     Unit -> 0
     I1 -> 1

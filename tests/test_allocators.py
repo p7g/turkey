@@ -76,14 +76,13 @@ int main(void) {
     int slot = 3;
     for (int width = 1; width <= 8; width *= 2) {
         if (width == 2) continue;
-        /* The layout code that gives this width. */
-        int code = width == 1 ? 2 : width == 4 ? 3 : 6;
         for (int filled = 0; filled < 2; filled++) {
             uint64_t bits = filled ? UINT64_C(0xfedcba98deadbeef) : 0;
-            held[slot] = turkey_array_new(3, bits, width, code);
+            held[slot] = turkey_array_new(3, bits, width, 0);
             TurkeyArray *array = held[slot++];
             assert(array->header.generation == 0 && array->header.kind == 2);
-            assert(array->header.count == code && array->length == 3);
+            assert(array->header.count == 0 && array->header.tag == width);
+            assert(array->length == 3);
             for (int i = 0; i < 3; i++) {
                 uint64_t actual = 0;
                 memcpy(&actual, array->elements + i * width, width);
@@ -91,7 +90,7 @@ int main(void) {
                 assert(actual == (bits & mask));
             }
         }
-        held[slot] = turkey_array_new(0, 42, width, code);
+        held[slot] = turkey_array_new(0, 42, width, 0);
         assert(((TurkeyArray *)held[slot++])->length == 0);
     }
 
@@ -116,7 +115,7 @@ int main(void) {
     assert(memcmp(string_bytes(held[16]), "a\0b", 3) == 0);
     held[17] = turkey_string_new(NULL, 0);
     assert(string_length(held[17]) == 0);
-    held[18] = turkey_array_new(3, (uintptr_t)held[16], 8, 7);
+    held[18] = turkey_array_new(3, (uintptr_t)held[16], 8, 1);
     held[16] = NULL;
     turkey_collect();
     uint64_t element = 0;
@@ -141,21 +140,28 @@ int main(void) {
     panic_is("array length -1 is negative");
     assert(turkey_array_new(INT64_MIN, 0, 8, 0) == NULL);
     panic_is("array length -9223372036854775808 is negative");
+    /* A stride is a byte, four bytes or a whole number of words, and every
+       element's traced words fit in it. */
     assert(turkey_array_new(0, 0, 2, 0) == NULL);
-    panic_is("invalid array element width");
-    /* The layout code is all the header keeps, so it has to give the width. */
-    assert(turkey_array_new(1, 0, 1, 6) == NULL);
-    panic_is("invalid array element width");
-    assert(turkey_array_new(1, 0, 8, 8) == NULL);
-    panic_is("invalid array element width");
-    assert(turkey_array_new(INT64_C(4611686018427387900), 0, 4, 3) == NULL);
+    panic_is("invalid array element layout");
+    assert(turkey_array_new(1, 0, 12, 0) == NULL);
+    panic_is("invalid array element layout");
+    assert(turkey_array_new(1, 0, 4, 1) == NULL);
+    panic_is("invalid array element layout");
+    assert(turkey_array_new(1, 0, 16, 3) == NULL);
+    panic_is("invalid array element layout");
+    assert(turkey_array_new(1, 0, 8, -1) == NULL);
+    panic_is("invalid array element layout");
+    assert(turkey_array_new(INT64_C(4611686018427387900), 0, 4, 0) == NULL);
     panic_is("array length 4611686018427387900 is too large");
-    assert(turkey_array_new(INT64_C(2305843009213693950), 0, 8, 4) == NULL);
+    assert(turkey_array_new(INT64_C(2305843009213693950), 0, 8, 0) == NULL);
     panic_is("array length 2305843009213693950 is too large");
+    assert(turkey_array_new(INT64_C(768614336404564650), 0, 24, 1) == NULL);
+    panic_is("array length 768614336404564650 is too large");
     /* Accepted payload sizes still have to leave room for a region's own fields. */
-    assert(turkey_array_new(INT64_C(4611686018427387899), 0, 4, 3) == NULL);
+    assert(turkey_array_new(INT64_C(4611686018427387899), 0, 4, 0) == NULL);
     panic_is("allocation of 18446744073709551612 bytes is too large");
-    assert(turkey_array_new(INT64_C(2305843009213693949), 0, 8, 4) == NULL);
+    assert(turkey_array_new(INT64_C(2305843009213693949), 0, 8, 0) == NULL);
     panic_is("allocation of 18446744073709551608 bytes is too large");
     turkey_root_leave(&frame);
     turkey_collect();

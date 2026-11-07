@@ -279,9 +279,9 @@ fun publisher(s : Sel, v : Value, b : Int, n : Int) -> Unit {
 -- itself -- is what keeps `unpublished` sound.
 fun publishingUses(op : Op) -> Array Value = match op {
     ObjectGet(_, _) | ObjectTag(_) | ArrayLength(_) | CellLoad(_) -> []
-    ArrayGet(_, index, _) -> [index]
+    ArrayGet(_, index, _, _) -> [index]
     ObjectSet(_, _, v) -> [v]
-    ArraySet(_, index, v, _) -> [index, v]
+    ArraySet(_, index, _, v, _) -> [index, v]
     CellStore(_, v) -> [v]
     Move(_, _, at, _, from) -> [at, from]
     Fill(_, _, at, v) -> [at, v]
@@ -894,27 +894,18 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         -- An array's elements start after the header, and are the element's
-        -- own width apart -- not eight, which is why the width comes from
-        -- `Turkey.Runtime` rather than being assumed here.
-        ArrayGet(target, index, check) -> {
+        -- stride apart -- not eight, which is why the stride comes from
+        -- `Turkey.Runtime` rather than being assumed here. A slot is as wide
+        -- in an element as in an object's fields.
+        ArrayGet(target, index, slot, check) -> {
             withinStorage(s, check, A.reg(target), A.reg(index))
-            let at = elementAt(s, A.reg(target), A.reg(index), r.class_)
-            match Rt.elementWidth(r.class_) {
-                1 -> emit(s, A.Ldrb(d, at))
-                4 -> emit(s, A.Ldr(d, at, A.W32))
-                _ -> emit(s, A.Ldr(d, at, A.W64))
-            }
+            loadField(s, d, elementAt(s, A.reg(target), A.reg(index), slot, Rt.fieldWidth(r)), r)
         }
-        ArraySet(target, index, v, check) -> {
+        ArraySet(target, index, slot, v, check) -> {
             ordered(s, target)
             withinStorage(s, check, A.reg(target), A.reg(index))
-            let held = Ssa.repOf(s.source, v)
-            let at = elementAt(s, A.reg(target), A.reg(index), held.class_)
-            match Rt.elementWidth(held.class_) {
-                1 -> emit(s, A.Strb(A.reg(v), at))
-                4 -> emit(s, A.Str(A.reg(v), at, A.W32))
-                _ -> emit(s, A.Str(A.reg(v), at, A.W64))
-            }
+            let width = Rt.fieldWidth(Ssa.repOf(s.source, v))
+            storeField(s, elementAt(s, A.reg(target), A.reg(index), slot, width), v)
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
@@ -979,10 +970,12 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- looked up then, and an array too large for a size class is the
         -- runtime's (`allocateArray`).
         ArrayNew(length, initial, element) -> {
-            let width = Rt.elementWidth(element.class_)
+            -- An element of several slots is a whole number of words, filled
+            -- with a zero word.
+            let width = if element.stride < 8 { element.stride } else { 8 }
             emit(s, A.AllocateArray(d, A.reg(length), fillPattern(s, initial, width),
                                     A.ArrayAllocation {
-                width = width, layout = Rt.layoutCode(element),
+                stride = element.stride, pointers = element.layout.pointers,
                 slow = calleeOf(s, "turkey_array_new"),
                 classes = untracedGlobal(s, Rt.classesGlobal), sizes = s.sizesRecorded,
             }))
@@ -1728,20 +1721,37 @@ fun calleeOf(s : Sel, name : String) -> Asm.Symbol = Asm.calleeFor(s.asm, name)
 fun runtimeSymbolOf(s : Sel, name : String) -> Asm.Symbol =
     Asm.runtimeFor(s.asm.dialect, name)
 
--- One element of an array, by address. The header first, then the index scaled
--- by the element's width, which the access does itself: every width an
--- element has is one an access of that width can shift its index by.
-fun elementAt(s : Sel, array : Reg, index : Reg, c : RepClass) -> A.Mem {
+-- A slot `width` bytes wide of element `index` of an array, by address: the
+-- header and the slot's offset first, then the index scaled by the stride.
+-- The access scales by its own width, and only an element of several slots
+-- needs the rest of the stride first: by a shift, since its stride is a
+-- power of two words, or else by a multiply.
+fun elementAt(s : Sel, array : Reg, index : Reg, slot : L.ElementRef, width : Int) -> A.Mem {
     let base = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.AddImm(base, array, Rt.arrayElements, A.W64))
-    let width = Rt.elementWidth(c)
-    if width == 1 { return A.Indexed(base, index) }
-    A.Scaled(base, index, shiftFor(width))
+    emit(s, A.AddImm(base, array, Rt.arrayElements + slot.offset, A.W64))
+    if width == 0 { return A.Offset(base, 0) }
+    let factor = slot.stride / width
+    let scaled = if factor == 1 { index } else {
+        let t = temp(s, Ssa.untraced(I64))
+        match powerOfTwo(factor) {
+            Some(k) -> emit(s, A.LslImm(t, index, k, A.W64))
+            None -> emit(s, A.Mul(t, index, immediate(s, factor), A.W64))
+        }
+        t
+    }
+    if width == 1 { A.Indexed(base, scaled) } else { A.Scaled(base, scaled, shiftFor(width)) }
 }
 
 fun shiftFor(width : Int) -> Int = match width {
     4 -> 2
     _ -> 3
+}
+
+-- The `k` with `n == 1 << k`, if there is one.
+fun powerOfTwo(n : Int) -> Option Int {
+    var k = 0
+    while k < 62 && 1 << k < n { k = k + 1 }
+    if 1 << k == n { Some(k) } else { None }
 }
 
 -- A 64-bit constant, in as few instructions as it takes.

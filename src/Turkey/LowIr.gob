@@ -1,6 +1,6 @@
 export (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
-    FieldRef(..), fieldRef, mutableMask, assignable,
+    FieldRef(..), fieldRef, ElementRef(..), elementRef, soleElement, mutableMask, assignable,
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls,
     checkResults, showOpName, inTailPosition, returned,
     Allocation(..), summarize, allocatingOp,
@@ -199,6 +199,21 @@ fun assignable(mask : Int, index : Int) -> Bool =
 
 let maskedFields = 62
 
+-- A slot of an array's elements: the elements' stride, and the slot's offset
+-- from the start of its element, both in bytes and both from the array's
+-- `Turkey.Runtime.Element`. An access reads or writes as many bytes as its
+-- representation's `Turkey.Runtime.fieldWidth`.
+type ElementRef = ElementRef { stride : Int, offset : Int }
+
+fun elementRef(e : Rt.Element, slot : Int) -> ElementRef =
+    ElementRef { stride = e.stride, offset = e.layout.offsets[slot] }
+
+-- The slot of an element that is one slot of representation `r`.
+fun soleElement(r : Rep) -> ElementRef = elementRef(Rt.element([r]), 0)
+
+fun showElement(e : ElementRef) -> String =
+    Int.toString(e.offset) + "/" + Int.toString(e.stride)
+
 fun showField(f : FieldRef) -> String =
     Int.toString(f.index) + "@" + Int.toString(f.offset)
 
@@ -238,15 +253,20 @@ type Op
     | ObjectGet(Value, FieldRef)
     | ObjectSet(Value, FieldRef, Value)
     | ObjectTag(Value)
-    -- Length, initial element, and the element's representation. The class
+    -- Length, fill, and how the elements are laid out (`Rt.Element`), which
     -- decides the stride -- `Array Byte` is packed because of this and not by
-    -- name -- and the trace bit decides whether the collector walks the
-    -- elements. A `RepClass` here was enough only while every `Ptr` was
-    -- traced: it made `Array Ptr` and `Array String` the same array to the
-    -- collector.
-    | ArrayNew(Value, Value, Rep)
-    | ArrayGet(Value, Value, IndexCheck)
-    | ArraySet(Value, Value, Value, IndexCheck)
+    -- name -- and which words of each element the collector follows. An
+    -- element of one slot is filled with the fill, a value of that slot's
+    -- representation. An element of several slots starts with every word
+    -- zero, and the fill is a zero `i64`: no single value repeated fills
+    -- slots of different values.
+    | ArrayNew(Value, Value, Rt.Element)
+    -- One slot of an element, by index and by where the slot is in the
+    -- element (`ElementRef`), at the width of its representation: the
+    -- result's for a get and the operand's for a set. An element of several
+    -- slots is read and written slot by slot.
+    | ArrayGet(Value, Value, ElementRef, IndexCheck)
+    | ArraySet(Value, Value, ElementRef, Value, IndexCheck)
     | ArrayLength(Value)
     -- Raw memory: base, a *byte* offset, and the class to access at.
     --
@@ -521,10 +541,10 @@ fun effectsOf(op : Op) -> Effects = match op {
     ArrayNew(_, _, _) -> Ssa.allocates()
     -- Reads *and* traps: an index out of range panics. One proven in range
     -- cannot, and is a plain access.
-    ArrayGet(_, _, Checked) -> Ssa.reads_() <> Ssa.traps()
-    ArrayGet(_, _, Proven) -> Ssa.reads_()
-    ArraySet(_, _, _, Checked) -> Ssa.writes() <> Ssa.traps()
-    ArraySet(_, _, _, Proven) -> Ssa.writes()
+    ArrayGet(_, _, _, Checked) -> Ssa.reads_() <> Ssa.traps()
+    ArrayGet(_, _, _, Proven) -> Ssa.reads_()
+    ArraySet(_, _, _, _, Checked) -> Ssa.writes() <> Ssa.traps()
+    ArraySet(_, _, _, _, Proven) -> Ssa.writes()
     ArrayLength(_) -> Ssa.reads_()
     -- Reads and writes, and deliberately *not* `traps`. An access off the end
     -- of a block is undefined and not checked, so claiming it can trap would
@@ -600,8 +620,8 @@ fun opUses(op : Op) -> Array Value = match op {
     Ordered(a) -> [a]
     Poll -> []
     KeepAlive(a) -> [a]
-    ArrayGet(a, b, _) -> [a, b]
-    ArraySet(a, b, c, _) -> [a, b, c]
+    ArrayGet(a, b, _, _) -> [a, b]
+    ArraySet(a, b, _, c, _) -> [a, b, c]
     ArrayLength(a) -> [a]
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
@@ -653,8 +673,8 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Ordered(a) -> Ordered(f(a))
     Poll -> Poll
     KeepAlive(a) -> KeepAlive(f(a))
-    ArrayGet(a, b, c) -> ArrayGet(f(a), f(b), c)
-    ArraySet(a, b, c, d) -> ArraySet(f(a), f(b), f(c), d)
+    ArrayGet(a, b, e, c) -> ArrayGet(f(a), f(b), e, c)
+    ArraySet(a, b, e, c, d) -> ArraySet(f(a), f(b), e, f(c), d)
     ArrayLength(a) -> ArrayLength(f(a))
     CellNew(a) -> CellNew(f(a))
     CellLoad(a) -> CellLoad(f(a))
@@ -725,7 +745,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     StackObject(_, _, _, _) -> Some(Ssa.traced(Ptr))
     StackClosure(_, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
-    ArraySet(_, _, _, _) -> Some(Ssa.untraced(Unit))
+    ArraySet(_, _, _, _, _) -> Some(Ssa.untraced(Unit))
     CellStore(_, _) -> Some(Ssa.untraced(Unit))
     ClosureCapture(_, _, _) -> Some(Ssa.untraced(Unit))
     GlobalStore(_, _) -> Some(Ssa.untraced(Unit))
@@ -755,9 +775,22 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
         Not(a) -> wantClass(f, out, a, I1, "the operand of a logical not")
         Intrinsic(k, a) ->
             wantClass(f, out, a, intrinsicOperand(k), "the operand of " + intrinsicName(k))
-        ArrayGet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
-        ArraySet(_, index, _, _) -> wantClass(f, out, index, I64, "an array index")
-        ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
+        ArrayGet(_, index, at, _) -> {
+            wantClass(f, out, index, I64, "an array index")
+            withinElement(out, at, Ssa.repOf(f, i.result))
+        }
+        ArraySet(_, index, at, x, _) -> {
+            wantClass(f, out, index, I64, "an array index")
+            withinElement(out, at, Ssa.repOf(f, x))
+        }
+        ArrayNew(length, fill, element) -> {
+            wantClass(f, out, length, I64, "an array length")
+            if len(element.layout.reps) == 1 {
+                wantClass(f, out, fill, element.layout.reps[0].class_, "an array's fill")
+            } else {
+                wantClass(f, out, fill, I64, "an array's fill")
+            }
+        }
         -- A machine has no integer constant of floating type, so an integer
         -- literal at `f64` has to have become a float before it gets here.
         ConstInt(_) -> if Ssa.repOf(f, i.result).class_ == F64 {
@@ -1184,6 +1217,17 @@ fun sameRep(f : Ssa.Func Low, out : Vec String, a : Value, b : Value,
     }
 }
 
+-- An access at `at` of a value of `r` touches bytes of its own element only,
+-- at the slot's alignment.
+fun withinElement(out : Vec String, at : ElementRef, r : Rep) -> Unit {
+    let width = Rt.fieldWidth(r)
+    if at.offset < 0 || at.offset + width > at.stride
+            || (width > 0 && at.offset % width != 0) {
+        Vec.push(out, "an access of " + show(r) + " at " + showElement(at)
+                        + " is outside its element")
+    }
+}
+
 fun wantClass(f : Ssa.Func Low, out : Vec String, v : Value, c : RepClass,
               what : String) -> Unit {
     if Ssa.repOf(f, v).class_ != c {
@@ -1224,8 +1268,8 @@ fun showOpName(op : Op) -> String = match op {
     Ordered(_) -> "ordered"
     Poll -> "poll"
     KeepAlive(_) -> "keep.alive"
-    ArrayGet(_, _, _) -> "array.get"
-    ArraySet(_, _, _, _) -> "array.set"
+    ArrayGet(_, _, _, _) -> "array.get"
+    ArraySet(_, _, _, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
     CellNew(_) -> "cell.new"
     CellLoad(_) -> "cell.load"
@@ -1284,8 +1328,9 @@ instance Show Op {
     ObjectGet(a, f) -> "object.get " + v(a) + ", " + showField(f)
     ObjectSet(a, f, b) -> "object.set " + v(a) + ", " + showField(f) + ", " + v(b)
     ObjectTag(a) -> "object.tag " + v(a)
-    ArrayNew(n, init, c) ->
-        "array.new " + v(n) + ", " + v(init) + ", " + show(c)
+    ArrayNew(n, init, e) ->
+        "array.new " + v(n) + ", " + v(init) + " [" + String.join(Array.map(e.layout.reps, show), ", ")
+        + "] stride=" + Int.toString(e.stride) + " pointers=" + Int.toString(e.layout.pointers)
     PtrLoad(a, off, c) ->
         "ptr.load " + v(a) + ", " + v(off) + ", " + show(c)
     PtrStore(a, off, x, c) ->
@@ -1299,8 +1344,9 @@ instance Show Op {
     Ordered(target) -> "ordered " + v(target)
     Poll -> "poll"
     KeepAlive(a) -> "keep.alive " + v(a)
-    ArrayGet(a, i, c) -> "array.get " + v(a) + ", " + v(i) + showCheck(c)
-    ArraySet(a, i, x, c) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x) + showCheck(c)
+    ArrayGet(a, i, e, c) -> "array.get " + v(a) + ", " + v(i) + "@" + showElement(e) + showCheck(c)
+    ArraySet(a, i, e, x, c) ->
+        "array.set " + v(a) + ", " + v(i) + "@" + showElement(e) + ", " + v(x) + showCheck(c)
     ArrayLength(a) -> "array.length " + v(a)
     CellNew(a) -> "cell.new " + v(a)
     CellLoad(a) -> "cell.load " + v(a)

@@ -713,17 +713,12 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     let top = allocationLabel(d, tag, n, "l")
     let cursor = scratch
     let word = Physical(Gp, 17)
-    let shift = match al.width {
-        1 -> 0
-        4 -> 2
-        _ -> 3
-    }
-    instruction(b, A.MovConst(cursor, (Rt.fastBytes - Rt.arrayElements) / al.width + 1))
+    instruction(b, A.MovConst(cursor, (Rt.fastBytes - Rt.arrayElements) / al.stride + 1))
     instruction(b, A.Cmp(length, cursor, A.W64))
     instruction(b, A.BCond(A.Hs, slow))
     -- The class, from the array's size: the header, the length and the
     -- elements.
-    instruction(b, A.LslImm(word, length, shift, A.W64))
+    multiply(b, word, length, al.stride)
     instruction(b, A.AddImm(word, word, Rt.arrayElements + Rt.classStep, A.W64))
     instruction(b, A.LsrImm(word, word, Rt.classShift, A.W64))
     instruction(b, A.Adrp(cursor, al.classes))
@@ -746,12 +741,12 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.Add(dest, dest, word, A.W64))
     if al.sizes {
         sizeEntry(b, dest, cursor, word)
-        instruction(b, A.LslImm(word, length, shift, A.W64))
+        multiply(b, word, length, al.stride)
         instruction(b, A.AddImm(word, word, Rt.arrayElements, A.W64))
         instruction(b, A.Str(word, Offset(cursor, 0), A.W64))
     }
-    -- The header, young, with the element's layout code, and the length.
-    instruction(b, A.MovConst(cursor, Rt.headerWord(Rt.arrayKind, al.layout, 0)))
+    -- The header, young, with the element's descriptor, and the length.
+    instruction(b, A.MovConst(cursor, Rt.headerWord(Rt.arrayKind, al.pointers, al.stride)))
     instruction(b, A.Str(cursor, Offset(dest, 0), A.W64))
     instruction(b, A.Str(length, Offset(dest, 8), A.W64))
     -- Every element, including an array of pointers to nothing, which the
@@ -770,11 +765,20 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     -- `cursor` starts 8 below the last pair, at the elements' bytes rounded
     -- up to a word less one word, so that the pair is stored at `cursor + 8`
     -- and the loop runs while `cursor` is above `dest`: it stops at `dest`
-    -- for an odd count of words and at `dest - 8` for an even one.
+    -- for an odd count of words and at `dest - 8` for an even one. A stride
+    -- below a word divides one, and any other is a whole number of words.
     instruction(b, A.Cbz(length, back, A.W64))
     instruction(b, A.Str(fill, Offset(dest, Rt.arrayElements), A.W64))
-    instruction(b, A.SubImm(cursor, length, 1, A.W64))
-    if shift < 3 { instruction(b, A.LsrImm(cursor, cursor, 3 - shift, A.W64)) }
+    if al.stride < 8 {
+        instruction(b, A.SubImm(cursor, length, 1, A.W64))
+        let shift = if al.stride == 1 { 0 } else { 2 }
+        instruction(b, A.LsrImm(cursor, cursor, 3 - shift, A.W64))
+    } else if al.stride == 8 {
+        instruction(b, A.SubImm(cursor, length, 1, A.W64))
+    } else {
+        multiply(b, cursor, length, al.stride / 8)
+        instruction(b, A.SubImm(cursor, cursor, 1, A.W64))
+    }
     instruction(b, A.LslImm(cursor, cursor, 3, A.W64))
     instruction(b, A.Add(cursor, dest, cursor, A.W64))
     instruction(b, A.Cmp(cursor, dest, A.W64))
@@ -804,9 +808,32 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
         argument(text, A.x0, length)
         argument(text, x1, fill)
     }
-    instruction(text, A.MovConst(A.argRegs[2], al.width))
-    instruction(text, A.MovConst(A.argRegs[3], al.layout))
+    instruction(text, A.MovConst(A.argRegs[2], al.stride))
+    instruction(text, A.MovConst(A.argRegs[3], al.pointers))
     returnFromStub(text, d, f, l, tag, n, dest, al.slow, save, safepoint)
+}
+
+-- `d` set to `s` times `n`, a positive constant, touching no register but
+-- `d`: the stub's scratch registers are all in use where an array's size is
+-- worked out. Shifts and adds by the bits of `n`, from the highest down, so a
+-- power of two is one shift. `d` must not be `s` unless `n` is a power of
+-- two, since each add reads `s` after `d` is written.
+fun multiply(b : Code, d : Reg, s : Reg, n : Int) -> Unit {
+    var top = 0
+    while n >> (top + 1) > 0 { top = top + 1 }
+    var from = s
+    var pending = 0
+    for var k = top - 1; k >= 0; k = k - 1 {
+        pending = pending + 1
+        if n >> k & 1 == 1 {
+            instruction(b, A.LslImm(d, from, pending, A.W64))
+            instruction(b, A.Add(d, d, s, A.W64))
+            from = d
+            pending = 0
+        }
+    }
+    if pending > 0 { instruction(b, A.LslImm(d, from, pending, A.W64)) }
+    else { argument(b, d, from) }
 }
 
 -- `mov d, s`, left out when `s` is `d`, as `emitInst` leaves out a taken hint.
@@ -1230,7 +1257,8 @@ fun emitLiterals(asm : Asm.Asm, b : Code) -> Unit {
     emit(b, Section(Asm.Data))
     emit(b, Align(3))
     emit(b, Label(Asm.staticStart(asm.dialect)))
-    let header = Rt.staticHeaderWord(Rt.arrayKind, Rt.layoutCode(Ssa.untraced(I8)), 0)
+    let bytes = Rt.element([Ssa.untraced(I8)])
+    let header = Rt.staticHeaderWord(Rt.arrayKind, bytes.layout.pointers, bytes.stride)
     for var i = 0; i < len(ordered); i = i + 1 {
         emit(b, Align(3))
         emit(b, Label(Asm.literalName(asm.dialect, i)))

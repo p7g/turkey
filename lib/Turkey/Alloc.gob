@@ -70,50 +70,54 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
 fun header(object : Ptr, kind : Int, count : Int, tag : Int) -> Unit =
     Ptr.store(object, 0, kind << 8 | count << 16 | (tag & 0xFFFF_FFFF) << 32)
 
--- An array of `length` elements, each `initial`. The element's layout code
--- (`Turkey.Runtime.layoutCode`) is all the header keeps of it, so the width
--- must be the one the code gives: a byte for code 2, four bytes for code 3,
--- and a word for any other.
+-- An array of `length` elements, `stride` bytes apart, each starting with
+-- `pointers` traced words (`Turkey.Runtime.Element`), which is what the
+-- header keeps of them. The stride is a byte, four bytes, or a whole number
+-- of words. Every element is `initial` at the stride's width, or at a word's
+-- for a stride of several: an element of several words is filled with one
+-- word repeated, which generated code passes as 0.
 foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
-                                        elementWidth : Int, elementLayout : Int)
+                                        stride : Int, pointers : Int)
         -> Ptr {
     if length < 0 {
         Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is negative"))
         return Ptr.null()
     }
-    -- floor((SIZE_MAX - 16) / width). Every nonnegative Int fits at width 1;
-    -- widths 4 and 8 have signed-representable bounds. After this check the
-    -- size is an unsigned word, passed bit-for-bit to the heap allocator.
-    let width = if elementLayout == 2 { 1 } else if elementLayout == 3 { 4 } else { 8 }
-    if elementLayout < 0 || elementLayout > 7 || elementWidth != width {
-        Process.panic(Prim.cString("invalid array element width"))
+    if !(stride == 1 || stride == 4 || (stride >= 8 && stride % 8 == 0 && stride < 0x8000_0000))
+            || pointers < 0 || pointers * 8 > stride {
+        Process.panic(Prim.cString("invalid array element layout"))
         return Ptr.null()
     }
-    if (elementWidth == 4 && length > 4611686018427387899)
-            || (elementWidth == 8 && length > 2305843009213693949) {
+    -- floor((SIZE_MAX - 16) / stride). Every nonnegative Int fits at stride
+    -- 1. Any other stride is even, and for an even `s`, (2^64 - 17) / s and
+    -- (2^63 - 9) / (s / 2) have the same floor, which fits in an Int. After
+    -- this check the size is an unsigned word, passed bit-for-bit to the heap
+    -- allocator.
+    if stride > 1 && length > (9223372036854775807 - 8) / (stride / 2) {
         Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is too large"))
         return Ptr.null()
     }
-    let size = Int.addWrapping(16, Int.mulWrapping(length, elementWidth))
+    let size = Int.addWrapping(16, Int.mulWrapping(length, stride))
     let array = Heap.allocate(size, 2, Prim.frameAddress())
     if Ptr.isNull(array) { return array }
-    header(array, 2, elementLayout, 0)
+    header(array, 2, pointers, stride)
     Ptr.store(array, 8, length)
     let bytes = Ptr.add(array, 16)
-    if elementWidth == 1 {
+    if stride == 1 {
         Memory.fill(bytes, length, initial)
     } else if length > 0 {
         -- One element, then the elements filled so far copied after
         -- themselves, doubling them each time: `Memory.copy` moves 32 bytes
         -- at a time, where a loop over the elements would store one element
         -- at a time. The two runs of each copy never overlap.
-        if elementWidth == 4 {
+        let width = if stride == 4 { 4 } else { 8 }
+        if width == 4 {
             Ptr.store32(bytes, 0, initial)
         } else {
             Ptr.store(bytes, 0, initial)
         }
-        let total = Int.mulWrapping(length, elementWidth)
-        var filled = elementWidth
+        let total = Int.mulWrapping(length, stride)
+        var filled = width
         while filled < total {
             let count = if filled < total - filled { filled } else { total - filled }
             Memory.copy(Ptr.add(bytes, filled), bytes, count)
@@ -134,7 +138,7 @@ foreign "turkey_closure_shell" fun closureShell(code : Int) -> Ptr {
 }
 
 foreign "turkey_string_new" fun stringNew(bytes : Ptr, length : Int) -> Ptr {
-    let array = arrayNew(length, 0, 1, 2)
+    let array = arrayNew(length, 0, 1, 0)
     if !Ptr.isNull(array) && length > 0 {
         Memory.copy(Ptr.add(array, 16), bytes, length)
     }

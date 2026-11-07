@@ -16,8 +16,10 @@ export (copyArray, copyIn, fillArray, copyBytes, fillBytes)
 --
 -- **Traced elements are not.** A pointer stored into an array the collector
 -- may already have scanned needs the write barrier, and the barrier is per
--- pointer, so a traced run is an `ArrayGet` and an `ArraySet` per element,
--- with the fence and the barrier each store is given anywhere else.
+-- pointer, so a run of elements with a traced slot is an `ArrayGet` and an
+-- `ArraySet` per slot of each element, with the fence and the barrier each
+-- store is given anywhere else. A fill of elements of several slots is a
+-- store per slot as well: no one word repeated is every slot's value.
 --
 -- **Overlap.** A run copied within one array may overlap its source, and
 -- arrives as it was before the copy started, as C's `memmove` does: front to
@@ -35,8 +37,9 @@ import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value, BlockId, Rep(..), RepClass(..), Term(..))
 
--- `count` elements from `source[from]` on to `target[at]` on.
-fun copyArray(b : Builder, element : Rep, target : Value, at : Value,
+-- `count` elements, laid out as `element`, from `source[from]` on to
+-- `target[at]` on.
+fun copyArray(b : Builder, element : Rt.Element, target : Value, at : Value,
               source : Value, from : Value, count : Value) -> Unit {
     checkRuns(b, count, [(target, at), (source, from)])
     let backward = L.emit(b, Cmp(Lt, from, at), Ssa.untraced(I1))
@@ -50,7 +53,7 @@ fun copyArray(b : Builder, element : Rep, target : Value, at : Value,
         })
         return
     }
-    let width = Rt.elementWidth(element.class_)
+    let width = element.stride
     L.effect(b, Ordered(target))
     let into = offsetOf(b, at, width)
     let out = offsetOf(b, from, width)
@@ -62,27 +65,31 @@ fun copyArray(b : Builder, element : Rep, target : Value, at : Value,
 -- `count` elements from raw memory at `source`, laid out as the array lays
 -- them out, to `target[at]` on. Untraced elements only: raw memory holds no
 -- pointer the collector may follow.
-fun copyIn(b : Builder, element : Rep, target : Value, at : Value, source : Value,
+fun copyIn(b : Builder, element : Rt.Element, target : Value, at : Value, source : Value,
            count : Value) -> Unit {
     checkRuns(b, count, [(target, at)])
-    let width = Rt.elementWidth(element.class_)
+    let width = element.stride
     L.effect(b, Ordered(target))
     moveUp(b, width, target, offsetOf(b, at, width), source, int(b, 0),
            scaled(b, count, width))
 }
 
--- `count` copies of `value` from `target[at]` on.
-fun fillArray(b : Builder, element : Rep, target : Value, at : Value, count : Value,
-              value : Value) -> Unit {
+-- `count` copies of the value whose slots are `slots` from `target[at]` on.
+fun fillArray(b : Builder, element : Rt.Element, target : Value, at : Value, count : Value,
+              slots : Array Value) -> Unit {
     checkRuns(b, count, [(target, at)])
-    if !bytewise(element) {
-        let _ = upward(b, 1, int(b, 0), count, fun(k) =
-            L.effect(b, ArraySet(target, add(b, at, k), value, Proven)))
+    if !bytewise(element) || len(slots) != 1 {
+        let _ = upward(b, 1, int(b, 0), count, fun(k) {
+            let index = add(b, at, k)
+            for var j = 0; j < len(slots); j = j + 1 {
+                L.effect(b, ArraySet(target, index, L.elementRef(element, j), slots[j], Proven))
+            }
+        })
         return
     }
-    let width = Rt.elementWidth(element.class_)
+    let width = element.stride
     L.effect(b, Ordered(target))
-    fillUp(b, width, target, offsetOf(b, at, width), pattern(b, value, width),
+    fillUp(b, width, target, offsetOf(b, at, width), pattern(b, slots[0], width),
            scaled(b, count, width))
 }
 
@@ -106,18 +113,23 @@ fun fillBytes(b : Builder, target : Value, count : Value, value : Value) -> Unit
 
 -- -- the loops ------------------------------------------------------------------------
 
--- Whether elements at this representation are moved as bytes. `Unit` is
--- not, having no value to make a pattern of.
-fun bytewise(element : Rep) -> Bool = !element.traced && element.class_ != Unit
+-- Whether elements laid out as this are moved as bytes: those with no traced
+-- slot. `unit` is not, having no value to make a pattern of.
+fun bytewise(element : Rt.Element) -> Bool =
+    element.layout.pointers == 0 && element.layout.size > 0
 
-fun elementCopy(b : Builder, element : Rep, target : Value, at : Value, source : Value,
+fun elementCopy(b : Builder, element : Rt.Element, target : Value, at : Value, source : Value,
                 from : Value) -> Unit {
-    let x = L.emit(b, ArrayGet(source, from, Proven), element)
-    L.effect(b, ArraySet(target, at, x, Proven))
+    for var j = 0; j < len(element.layout.reps); j = j + 1 {
+        let slot = L.elementRef(element, j)
+        let x = L.emit(b, ArrayGet(source, from, slot, Proven), element.layout.reps[j])
+        L.effect(b, ArraySet(target, at, slot, x, Proven))
+    }
 }
 
 -- `n` bytes, front to back: 32 at a time, then 8, then `width`, the element's
--- own, for what is left. `width` divides `n`, so nothing is left after that.
+-- stride, for what is left if it is below 8. `width` divides `n`, and so does
+-- 8 when `width` is a whole number of words, so nothing is left after that.
 fun moveUp(b : Builder, width : Int, target : Value, at : Value, source : Value,
            from : Value, n : Value) -> Unit {
     let step = fun(w : Int) -> fun(Value) -> Unit = fun(k) =

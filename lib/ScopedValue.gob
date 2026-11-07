@@ -19,8 +19,13 @@ export (ScopedValue, new, with, get)
 --
 -- Bindings belong to the running coroutine, not to the thread: a task that
 -- suspends inside a `with` and resumes on another worker still sees them.
--- A task starts with the bindings of the code that made it (`System.Task`'s
--- `spawn`), and later `with`s on either side do not reach the other.
+-- A task starts with the bindings in force where its coroutine is made, and
+-- later `with`s on either side do not reach the other. For `System.Task`,
+-- that is where `runScope` runs the `spawn` action, the same place the task
+-- takes its scope from, and not where `spawn` was called. So
+-- `runScope(with(k, v, fun() = spawn(f)))` starts a task without `k`: the
+-- `with` returns the action, and it runs outside. Inside a `do` block the two
+-- places are one, since each `spawn(...)?` is called as it runs.
 --
 -- A key is made once, usually as a top-level `let`. Each `new()` makes a
 -- distinct key, even for the same type.
@@ -60,10 +65,11 @@ fun with(key : ScopedValue a, value : a, f : fun() -> b) -> b {
     let outer = Co.bindings()
     Co.bindingsSet(Some(Binding { key = id, value = value, next = outer }))
     let result = f()
-    -- Restore by reading the slot again rather than keeping a reference to
-    -- it: `f` may have suspended and resumed on another thread, and the
-    -- running coroutine's slot is the one to restore. A panic in `f` ends
-    -- the program without returning here, so nothing else needs restoring.
+    -- Find the slot again rather than keep the worker's index across `f`:
+    -- `f` may suspend and resume on another worker, and the index kept
+    -- would then name another thread's slot. A panic in `f` ends the
+    -- program without reaching the restore, so nothing else needs
+    -- restoring.
     Co.bindingsSet(outer)
     result
 }

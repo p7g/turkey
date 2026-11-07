@@ -162,13 +162,32 @@ lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o b
 gdb ./rectangles -ex 'break rectangles.gob:4' -ex run -ex bt
 ```
 
-A function's name is its symbol, such as `Main#area@Rectangle`, with its
-module in it. A call the optimizer inlined is still a frame: `breakpoint set
---name Main#area@Rectangle` in lldb, or `break 'Main#area@Rectangle'` in gdb,
-stops in `Main#main` where `area`'s code was copied, and `bt` shows `area` at
-its own line above `main` at the line of the call. There is no information
-about variables or types yet, so a debugger shows registers and memory rather
-than values.
+A debugger names a function by its display form, which spells the
+compiler's separators the way a reader would: `Main#area@Rectangle`, `area`
+specialized to `Rectangle`, is `Main.area[Rectangle]`; an instance's method,
+`%inst.Data.Hashable#Hash.Int#hashInto@FNV1a`, is
+`Hash(Int).hashInto[FNV1a]`; a lambda in `makeRoom` is
+`Turkey.Stdout.makeRoom.<lambda0>`. `src/Turkey/Demangle.gob` has the rules.
+The display form is also a breakpoint, and a call the optimizer inlined is
+still a frame:
+
+```sh
+lldb ./rectangles -o 'breakpoint set --name Main.area[Rectangle]' -o run -o bt
+gdb ./rectangles -ex "break 'Main.area[Rectangle]'" -ex run -ex bt
+```
+
+stops in `Main.main` where `area`'s code was copied, and in `area` itself
+where it was not, and `bt` shows `area` at its own line above `main` at the
+line of the call. gdb needs the quotes around a name with brackets in it. A
+breakpoint by symbol, `breakpoint set --name Main#area@Rectangle` or
+`break 'Main#area@Rectangle'`, stops only in the copy that has the symbol.
+In lldb a breakpoint on every specialization of `area`, inlined copies
+included, is a regular expression: `breakpoint set --func-regex
+'^Main\.area\['`. gdb's `rbreak ^Main\.area\[` sets a breakpoint on each
+specialization it matches, but each one stops only in the copy that has the
+symbol, as a breakpoint by symbol does.
+There is no information about variables or types yet, so a debugger shows
+registers and memory rather than values.
 
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and
@@ -180,6 +199,15 @@ backtrace inside a task or coroutine ends at the coroutine's base. With `-g`,
 Instruments and `perf report --sort srcline` also show the lines samples fall
 on, and Instruments shows inlined calls as frames. `sample` shows a sample in
 inlined code at the line of the outermost call.
+
+A profiler names a function by its symbol, which `scripts/demangle.py`
+rewrites to the display form, in `sample`'s and `perf script`'s output and
+in a crash report:
+
+```sh
+sample rectangles 5 -file report.txt && python3 scripts/demangle.py report.txt
+perf script | python3 scripts/demangle.py
+```
 
 ### The C compiler, and running on another machine
 

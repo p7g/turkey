@@ -2285,7 +2285,8 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     let names = Array.map(binders, fun((name, _)) = name)
     let ids = Array.map(binders, fun((_, id)) = id)
     let subst = Map.new()
-    let scrutinees = Map.new()
+    -- Made at the first build that needs it, since most calls bind none.
+    var atMatches : Option (Map Int Core) = None
     let renamed = Map.new()
     let lets = Vec.new(len(names))
     for var i = 0; i < len(names); i = i + 1 {
@@ -2296,7 +2297,14 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
             -- A `match` on the binder still gets the build itself, which it
             -- takes apart; `knownLet` would see only the matches on the
             -- spine.
-            if copyable { Map.put(scrutinees, ids[i], args[i]) }
+            if copyable {
+                let at = match atMatches {
+                    Some(made) -> made
+                    None -> Map.new()
+                }
+                Map.put(at, ids[i], args[i])
+                atMatches = Some(at)
+            }
             let bound = match how {
                 Moving -> (names[i], ids[i])
                 _ -> {
@@ -2310,15 +2318,15 @@ fun applyNames[Iterator n, Length n, Item n ~ (String, Int),
     }
     let minted = fun() = mint(r)
     var out = match how {
-        Moving -> if len(subst) == 0 && len(scrutinees) == 0 {
+        Moving -> if len(subst) == 0 && Option.isNone(atMatches) {
             body
         } else {
-            copyTerm(copier(minted, subst, scrutinees, Map.new(), False, None), body)
+            copyTerm(copier(minted, subst, atMatches, Map.new(), False, None), body)
         }
-        Copying -> copyTerm(copier(minted, subst, scrutinees, renamed, True, None), body)
+        Copying -> copyTerm(copier(minted, subst, atMatches, renamed, True, None), body)
         Inlined(callee, span) -> {
             let site = Option.map(span, fun(call) = InlineSite { callee = callee, call = call })
-            copyTerm(copier(minted, subst, scrutinees, renamed, True, Some(site)), body)
+            copyTerm(copier(minted, subst, atMatches, renamed, True, Some(site)), body)
         }
     }
     for var i = len(lets) - 1; i >= 0; i = i - 1 {
@@ -2397,7 +2405,7 @@ fun freshened(mint : fun() -> Int, e : Core) -> Core =
 
 -- Returns a copy of `alts` as `freshened` copies a term, patterns included.
 fun freshenedAlts(mint : fun() -> Int, alts : Vec CAlt) -> Vec CAlt {
-    let c = copier(mint, Map.new(), Map.new(), Map.new(), True, None)
+    let c = copier(mint, Map.new(), None, Map.new(), True, None)
     Vec.map(alts, fun(a) = CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) })
 }
 
@@ -2419,8 +2427,9 @@ type Copier = Copier {
     -- What each variable is replaced by, by its id, wherever it is read.
     subst : Map Int Core,
     -- What each variable is replaced by, by its id, where it is read as a
-    -- `match` scrutinee and nowhere else.
-    scrutinees : Map Int Core,
+    -- `match` scrutinee and nowhere else. `None` for a copy that has none,
+    -- which is most of them, so that a copy allocates no map for it.
+    scrutinees : Option (Map Int Core),
     -- Whether a binder not in `renamed` gets a fresh id.
     freshen : Bool,
     -- The call every node copied is inlined through, if it is: with no span
@@ -2433,7 +2442,7 @@ type Copier = Copier {
     var changed : Int,
 }
 
-fun copier(mint : fun() -> Int, subst : Map Int Core, scrutinees : Map Int Core,
+fun copier(mint : fun() -> Int, subst : Map Int Core, scrutinees : Option (Map Int Core),
            renamed : Map Int (String, Int), freshen : Bool,
            rebase : Option (Option InlineSite)) -> Copier = Copier {
     mint = mint, renamed = renamed, skolems = Map.new(), subst = subst,
@@ -2451,7 +2460,7 @@ fun copier(mint : fun() -> Int, subst : Map Int Core, scrutinees : Map Int Core,
 fun copyWith(mint : fun() -> Int, body : Core, subst : Map Int Core,
              renamed : Map Int (String, Int), freshen : Bool,
              rebase : Option (Option InlineSite)) -> Core =
-    copyTerm(copier(mint, subst, Map.new(), renamed, freshen, rebase), body)
+    copyTerm(copier(mint, subst, None, renamed, freshen, rebase), body)
 
 fun copyTerm(c : Copier, e : Core) -> Core {
     -- A leaf that binds nothing and reads nothing renamed or replaced is
@@ -2510,8 +2519,8 @@ fun copyTerm(c : Copier, e : Core) -> Core {
             CJoin(n, i, ps, copyTerm(c, body), copyTerm(c, rest), recursive)
         }
         CMatch(scrutinee, alts) -> {
-            let s = match scrutinee.kind {
-                CVar(ById(id)) -> match Map.get(c.scrutinees, id) {
+            let s = match (scrutinee.kind, c.scrutinees) {
+                (CVar(ById(id)), Some(at)) -> match Map.get(at, id) {
                     Some(value) -> substituted(c, value)
                     None -> copyTerm(c, scrutinee)
                 }

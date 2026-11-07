@@ -862,6 +862,10 @@ fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
     let head = d.inst.head
     let x = freshParam(l, "x", head)
     let y = freshParam(l, "y", head)
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    if let Some(body) = enumCompare(l, d, Prims.EnumEq, True, x, y) {
+        return node(TFun([head, head], Ty.tBool()), d.span, CLam([x, y], body, name))
+    }
     let several = len(d.cons) > 1
     let alts = Vec.new(len(d.cons))
     for (c, types) in d.cons {
@@ -879,8 +883,27 @@ fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
         })
     }
     node(TFun([head, head], Ty.tBool()), d.span,
-         CLam([x, y], node(Ty.tBool(), d.span, CMatch(paramVar(x, d.span), alts)),
-              instName(d.inst) + "#" + Classes.surfaceMember(mi.name)))
+         CLam([x, y], node(Ty.tBool(), d.span, CMatch(paramVar(x, d.span), alts)), name))
+}
+
+-- `x` and `y` compared by `prim`, when the type is an enumeration
+-- (`Decls.enumSize`): a value of one is its constructor's index, so one
+-- comparison of the two decides, and folds when both are known. An
+-- enumeration of one constructor is held at no width, and is `alike` to
+-- itself. Returns `None` for any other type.
+fun enumCompare(l : Lowerer, d : DerivedSite, prim : Prims.Prim, alike : Bool, x : CParam,
+                y : CParam) -> Option Core {
+    let (h, _) = Ty.spine(d.inst.head)
+    let tycon = match h {
+        TCon(c) -> c.name
+        _ -> return None
+    }
+    let size = Decls.enumSize(l.decls, tycon)?
+    if size == 1 { return Some(boolean(alike, d.span)) }
+    let head = d.inst.head
+    Some(node(Ty.tBool(), d.span, CApp(
+        node(TFun([head, head], Ty.tBool()), d.span, CPrim(prim)),
+        [paramVar(x, d.span), paramVar(y, d.span)])))
 }
 
 -- `lt(x, y)`: a constructor declared earlier is less, and two values of one
@@ -894,9 +917,8 @@ fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
     let xv = fun() = paramVar(x, d.span)
     let yv = fun() = paramVar(y, d.span)
     let several = len(d.cons) > 1
-    let nullary = Iterator.all(d.cons, fun((_, types)) = len(types) == 0)
-    let body = if nullary {
-        intLess(tagOf(l, d, xv()), tagOf(l, d, yv()), d.span)
+    let body = if let Some(compared) = enumCompare(l, d, Prims.EnumLt, False, x, y) {
+        compared
     } else {
         let alts = Vec.new(len(d.cons))
         for (c, types) in d.cons {

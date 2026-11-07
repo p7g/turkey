@@ -2122,7 +2122,7 @@ fun valueHere(l : Lower, e : Core, held : Ssa.Layout) -> Value {
         }
         CTuple(elems) -> match flatHere(l, e.ty) {
             Some(f) -> flatValue(l, f, held, 0, elems)
-            None -> aggregate(l, elems, 0, -1, [], "builds a tuple", fieldsOf("this tuple"))
+            None -> aggregate(l, elems, 0, -1, [], "builds a tuple")
         }
         CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
@@ -2244,8 +2244,7 @@ fun storeStored(l : Lower, target : Core, x : Value) -> Unit = match target.kind
 -- runtime's own object header distinguishes. `mutable` lists the fields that
 -- may be assigned later.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             mutable : Array Int, what : String, refusal : fun(Int) -> String) -> Value {
-    if wide(l, len(items), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
+             mutable : Array Int, what : String) -> Value {
     let values = Array.map(items, fun(x) = value(l, x))
     built(l, kind, tag, values, mutable, what)
 }
@@ -2267,11 +2266,6 @@ fun built(l : Lower, kind : Int, tag : Int, fields : Array Value, mutable : Arra
 -- must be: the mutable fields of all dictionaries of a class agree.
 fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
     let what = "builds a dictionary, " + cls
-    let refusal = fun(n) = "an instance of class '" + Ty.shortName(cls) + "' needs "
-        + Int.toString(n) + " slots, one for each method and superclass, and an instance "
-        + "can have at most " + Int.toString(Rt.fieldLimit) + "; split the class into "
-        + "smaller ones"
-    if wide(l, len(slots), refusal) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(slots, fun(x) = value(l, x))
     for v in values {
         if Ssa.repOf(l.func, v) != Ssa.traced(Ptr) {
@@ -2301,16 +2295,6 @@ fun mutableFields(l : Lower, con : String, count : Int) -> Array Int =
 -- Returns the indices of all `count` fields, for an object any of whose
 -- fields may be written.
 fun everyField(count : Int) -> Array Int = Array.init(count, fun(i) = i)
-
--- Whether an object of `count` fields is past `Rt.fieldLimit`, stopping the
--- lowering with `refusal(count)` if it is. The parser holds a declared
--- constructor and a tuple to the limit; this stops anything else that wide --
--- a dictionary of a class with many methods, a packed existential.
-fun wide(l : Lower, count : Int, refusal : fun(Int) -> String) -> Bool {
-    if count <= Rt.fieldLimit { return False }
-    refuse(l, refusal(count))
-    True
-}
 
 -- Whether an object of this layout can say where its pointers are, stopping
 -- the lowering if it cannot: its header counts its traced words in 16 bits
@@ -2866,12 +2850,10 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 packed(l, info, name, args, tag)
             } else {
                 aggregate(l, args, 1, tag, mutableFields(l, name, len(args)),
-                          "builds a value with " + Ty.shortName(name),
-                          fieldsOf("constructor '" + Ty.shortName(name) + "'"))
+                          "builds a value with " + Ty.shortName(name))
             }
             None -> aggregate(l, args, 1, tag, mutableFields(l, name, len(args)),
-                              "builds a value with " + Ty.shortName(name),
-                              fieldsOf("constructor '" + Ty.shortName(name) + "'"))
+                              "builds a value with " + Ty.shortName(name))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
@@ -2898,12 +2880,6 @@ fun flatValue(l : Lower, f : Layout.Flat, held : Ssa.Layout, k : Int,
     fromSlots(l, held, slots)
 }
 
--- The refusal of a tuple or constructed value too wide to build, in the
--- parser's words: it refuses the ones a program declares.
-fun fieldsOf(subject : String) -> fun(Int) -> String =
-    fun(n) = subject + " has " + Int.toString(n) + " fields, and a value can have at most "
-             + Int.toString(Rt.fieldLimit)
-
 -- A packed existential: the index of its hidden variables' layouts in the
 -- table of keys the constructor is packed at, then the carried dictionaries,
 -- then the fields. The index is what an opening compares against the one its
@@ -2922,13 +2898,6 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
             None -> return stop(l, "packing '" + name + "' at " + Ssa.keyName(parts)
                                 + ", which is not in its table")
         }
-    }
-    let refusal = fun(n) = "constructor '" + Ty.shortName(name) + "' needs " + Int.toString(n)
-        + " fields, counting one for its hidden types and one for each constraint, and a "
-        + "value can have at most " + Int.toString(Rt.fieldLimit)
-        + "; move some fields into a record"
-    if wide(l, 1 + len(args), refusal) {
-        return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
     let values = Array.init(1 + len(args), fun(i) =
         if i == 0 {

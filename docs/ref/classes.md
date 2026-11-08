@@ -288,9 +288,9 @@ True
 ```
 
 `Index` has the instance `Eq (Index k v) : Hash k, Eq v`, so `same` can ask
-for `Eq v` alone, since `String` has `Hash`. A requirement that the class's
-superclass already implies is left out: a derived `Ord` that needs `Ord a`
-does not also list `Eq a`.
+for `Eq v` alone, since `String` has `Hash`. A requirement that another
+requirement's superclass implies is left out: a derived `Ord` that needs
+`Ord a` does not also list `Eq a`, since `Eq` is a superclass of `Ord`.
 
 A parameter that no field mentions is a *phantom*, and the instance requires
 nothing of it:

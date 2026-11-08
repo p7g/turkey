@@ -290,6 +290,11 @@ type ClassTable = ClassTable {
     -- Whether a call of `derive` is running, which settles any derivation
     -- begun inside it.
     var deriving : Bool,
+    -- Returns a type with its associated types reduced through the instances,
+    -- at every depth. The reducer is `Turkey.Inert.rewrite`, which imports
+    -- this module, so it is installed here (`Turkey.Infer.newGenerator`)
+    -- rather than called; until then a type is read as it stands.
+    var reduced : fun(Ty.Type) -> Ty.Type,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -302,6 +307,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     derivations = Map.new()
     provisional = []
     deriving = False
+    reduced = Ty.prune
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1830,10 +1836,11 @@ fun begin(t : ClassTable, cls : String, info : TyconInfo, general : Ty.Type,
 -- the least fixed point of `inferContext` over all of them together.
 --
 -- Each round infers every context again under the contexts the last round
--- found, and withdraws an instance that has none. A context only grows from
--- round to round, since the contexts it is inferred under only grow, and a
--- withdrawn instance stays withdrawn, since every instance that relied on it
--- fails next round. A context holds only classes over its own type's
+-- found, and withdraws an instance that has none. What a context implies
+-- only grows from round to round, since what the contexts it is inferred
+-- under imply only grows. Its predicates may change as it does, when `Ord a`
+-- comes to stand for an `Eq a` it implies. A withdrawn instance stays
+-- withdrawn, since every instance that relied on it fails next round. A context holds only classes over its own type's
 -- parameters, so there are finitely many it can grow to, and the rounds
 -- stop.
 fun settle(t : ClassTable) -> Unit {
@@ -1998,44 +2005,69 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
 type Unmet
     -- No instance covers `cls` at the type.
     = Missing(String, Ty.Type)
-    -- The wanted kept needing more after `reductionLimit` steps.
+    -- The wanted kept needing more after `reductionLimit` steps that grew.
     | Diverges(Pred)
 
--- Reductions deeper than this are taken not to end. A written instance's
--- context may be no smaller than its head, `Eq (W a) : Eq (W (Array a))`,
--- and nothing else stops it reducing for ever; every other step reduces a
--- part of the type, and no field's type is nested this deep.
+-- More steps than this that do not reduce to a proper part of their wanted's
+-- type are taken not to end. A step to a proper part always ends, since a
+-- type is finite, so only these are counted, and a field's type nested any
+-- depth reduces. A written instance's context may be no smaller than its
+-- head, `Eq (W a) : Eq (W (Array a))`, and nothing else stops it reducing
+-- for ever.
 let reductionLimit = 64
 
 -- Reduces the wanted `p` through the instances that cover it, adding each
 -- class over one of `params` it leaves to `out`, once. Returns what it could
--- not reduce, if anything.
-fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, depth : Int,
+-- not reduce, if anything. `grown` is how many steps so far did not reduce
+-- to a proper part.
+--
+-- Each type is read with its associated types reduced first (`t.reduced`),
+-- as the solver reads it, so `Key (Array Bool)` is the type it stands for and
+-- an instance's equality is decided as the solver decides it.
+fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
            out : Vec Pred) -> Option Unmet {
-    if depth > reductionLimit { return Some(Diverges(p)) }
-    let ty = Ty.prune(p.args[0])
+    if grown > reductionLimit { return Some(Diverges(p)) }
+    let ty = t.reduced(p.args[0])
+    let wanted = Ty.pred(p.name, [ty])
     if let TVar(cell) = ty {
         if !Set.contains(params, cell.id) { return Some(Missing(p.name, ty)) }
-        let key = Ty.predKey(p)
-        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, p) }
+        let key = Ty.predKey(wanted)
+        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, wanted) }
         return None
     }
     if let TVar(_) = Ty.spine(ty).0 { return Some(Missing(p.name, ty)) }
-    match selectInstance(t, p) {
+    match selectInstance(t, wanted) {
         None -> Some(Missing(p.name, ty))
         Some((inst, mapping)) -> {
             -- An instance whose equalities do not hold here as they stand
             -- has nothing a context of classes could supply.
             for e in equalitiesAt(inst, mapping) {
-                if !Ty.sameType(e.args[0], e.args[1]) { return Some(Missing(p.name, ty)) }
+                if !Ty.sameType(t.reduced(e.args[0]), t.reduced(e.args[1])) {
+                    return Some(Missing(p.name, ty))
+                }
             }
             for q in contextAt(inst, mapping) {
-                if let Some(unmet) = reduce(t, q, params, depth + 1, out) { return Some(unmet) }
+                let next = if properPart(t.reduced(q.args[0]), ty) { grown } else { grown + 1 }
+                if let Some(unmet) = reduce(t, Ty.pred(q.name, [q.args[0]]), params, next, out) {
+                    return Some(unmet)
+                }
             }
             None
         }
     }
 }
+
+-- Returns whether `part` is a type inside `whole` other than `whole` itself.
+fun properPart(part : Ty.Type, whole : Ty.Type) -> Bool = match Ty.prune(whole) {
+    TApp(fn, arg, _) -> partOf(part, fn) || partOf(part, arg)
+    TFun(params, ret) -> Iterator.any(params, partOf(part, _)) || partOf(part, ret)
+    TTuple(elems) -> Iterator.any(elems, partOf(part, _))
+    TFam(_, arg, _) -> partOf(part, arg)
+    _ -> False
+}
+
+fun partOf(part : Ty.Type, whole : Ty.Type) -> Bool =
+    Ty.sameType(part, whole) || properPart(part, whole)
 
 -- How a reason chain names field `i` of constructor `c`.
 fun fieldName(c : ConInfo, i : Int) -> String = match c.fields {

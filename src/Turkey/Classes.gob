@@ -4,7 +4,7 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
-    Derivation(..), derivedMethod, derive, checkDerives, whyMissing,
+    derivedMethod, isDerivedMethod, checkDerives, whyMissing,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -311,6 +311,9 @@ type ClassTable = ClassTable {
     -- Every instance derived so far, in the order each settled. The generator
     -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
     derived : Vec InstInfo,
+    -- Whether `checkDerives` is running. Only it begins a derivation that no
+    -- other derivation began; see `derive`.
+    var checking : Bool,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -324,6 +327,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     provisional = []
     deriving = False
     derived = []
+    checking = False
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1689,8 +1693,8 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- `Eq (M k v) : Hash k, Eq v`, from `Map`'s own instance, and a phantom
 -- parameter, in no field's type, gets nothing. The instance is sound
 -- because its context is exactly what its fields' instances need: each
--- method the lowering writes calls a field's instance, which `prove` finds
--- under that context by the same reduction.
+-- method the lowering writes calls a field's instance, which the solver
+-- checks under that context (`Turkey.Infer.derivedFields`).
 --
 -- **A group is solved together, from below.** `type List a : Eq = Nil |
 -- Cons(a, List a)` needs `Eq (List a)` to derive `Eq (List a)`. Every
@@ -1721,6 +1725,12 @@ fun derivedMethod(cls : String) -> Option String =
     else if cls == P.ordClass { Some("lt") }
     else if cls == P.hashClass { Some("hashInto") }
     else { None }
+
+-- Returns whether the method `name` of `inst`'s class is the one `inst`, a
+-- derived instance, writes itself rather than taking from the class's
+-- default.
+fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
+    inst.derived && derivedMethod(inst.cls) == Some(surfaceMember(name))
 
 -- Whether `!` may refuse `cls`. `Ord` is derived only for a type that asks:
 -- a derived order follows the order the constructors are declared in, so a
@@ -1796,6 +1806,16 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
         None -> return None
     }
     let general = declaredHead(info)?
+    -- `checkDerives` begins every derivation an error-free program has, and
+    -- each begins those it needs, so the generator can check them all
+    -- (`Turkey.Infer.genDerived`). One the solver or the lowering would begin
+    -- later would never be checked. After an error the program stops before
+    -- solving, so a derivation not begun there is not needed.
+    if !t.checking && !t.deriving {
+        if Diag.hasErrors() { return None }
+        bug("'" + Ty.shortName(cls) + " " + Ty.shortName(tycon) + "' was first asked for "
+            + "after derive lists were checked", None)
+    }
     let inst = begin(t, cls, info, general, key)
     -- A derivation begun inside another is settled by the outermost one,
     -- with the rest of its group.
@@ -2054,10 +2074,10 @@ fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
     -- Match types against instances as they stand, with no associated type
     -- reduced, and refuse a wanted that would need one reduced. The refusal
     -- is conservative: it rejects some instances the solver would accept,
-    -- and accepts none it would reject. Reducing here alone is not enough,
-    -- because `Turkey.Lower` proves each field's instance at the field's
-    -- type as written, and it would have to prove it at the same reduced
-    -- type.
+    -- and accepts none it would reject. Whatever this accepts, the solver
+    -- must accept too, since it checks each field's instance under the
+    -- context found here (`Turkey.Infer.derivedFields`); a reduction here
+    -- that the solver did not make the same way would break that.
     if let TFam(_, _, _) = ty { return Some(Associated(ty)) }
     if let TVar(_) = Ty.spine(ty).0 { return Some(Missing(p.name, ty)) }
     match selectInstance(t, p) {
@@ -2186,6 +2206,12 @@ fun whyMissing(t : ClassTable, p : Pred) -> Option String {
 -- and instance they could name is in the table, and derives each class an
 -- entry asks for, reporting at the entry why one cannot be.
 fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
+    t.checking = True
+    checkDeclarations(t, decls)
+    t.checking = False
+}
+
+fun checkDeclarations(t : ClassTable, decls : Vec TypeDecl) -> Unit {
     for d in decls {
         if Option.isSome(d.alias) || !Map.contains(t.decls.tycons, d.name) { continue }
         let wanted = []

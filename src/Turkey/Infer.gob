@@ -1,5 +1,5 @@
 export (
-    Generator(..), newGenerator, generate, genDerived, bindMethods, checkExhaustiveness,
+    Generator(..), newGenerator, generate, bindMethods, checkExhaustiveness,
 )
 
 -- Constraint generation.
@@ -424,6 +424,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     -- top-level binding. Nothing calls *them* by name, so their position is
     -- otherwise free.
     genMethodBodies(g, classDecls, instDecls)
+    genDerived(g)
     (ordered, pop(g))
 }
 
@@ -834,9 +835,7 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
     for (name, _) in Map.entries(info.defaults) {
         if Set.contains(defined, name) { continue }
         -- A derived instance writes this one itself (`Turkey.Lower`).
-        if inst.derived && Classes.derivedMethod(inst.cls) == Some(Classes.surfaceMember(name)) {
-            continue
-        }
+        if Classes.isDerivedMethod(inst, name) { continue }
         let hole = newHole()
         Vec.push(defaults, (name, hole))
         Vec.push(wanteds, C.cpredInto(self, hole, where, "the default definition of '"
@@ -876,12 +875,17 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
 
 -- Adds to `wanteds` the derived instance `inst`'s class at each of its
 -- fields' types, once per type, over the skolems `sk`, and returns each
--- one's hole by `Ty.typeKey` of the type at the head. Their evidence is
--- what the method `Turkey.Lower` writes compares or hashes each field with,
--- as a written method's would be. The derivation inferred the context so
--- that they hold, so one that fails is the derivation's mistake.
+-- one's predicate at the head and its hole, by `Ty.typeKey` of the type.
+-- Their evidence is what the method `Turkey.Lower` writes compares or hashes
+-- each field with, as a written method's would be.
+--
+-- The derivation inferred the context so that these hold, and refused the
+-- instance where it could not, so the solver rejects one only if the two
+-- disagree. That would be a compiler bug, but the solver reports it as it
+-- reports any instance it cannot check, at the derive-list entry that asked
+-- for the class.
 fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
-                  wanteds : Vec Constraint) -> Vec (String, Hole) {
+                  wanteds : Vec Constraint) -> Vec (String, Pred, Hole) {
     let out = Vec.new(4)
     let tycon = match Ty.spine(inst.head).0 {
         TCon(c) -> c.name
@@ -893,6 +897,7 @@ fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
                     Some(inst.decl.span))
     }
     let required = "the derived '" + Classes.showDeclared(inst) + "'"
+    let where = Some(derivedAt(info, inst))
     let seen = Set.new()
     for c in info.variants {
         for ty in Option.unwrapOr(Decls.conFieldTypes(g.decls, inst.head, c.name), []) {
@@ -900,33 +905,36 @@ fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
             if Set.contains(seen, key) { continue }
             Set.add(seen, key)
             let hole = newHole()
-            Vec.push(out, (key, hole))
+            Vec.push(out, (key, Ty.pred(inst.cls, [ty]), hole))
             Vec.push(wanteds, C.cpredInto(Ty.pred(inst.cls, [Classes.skolemApply(sk, ty)]),
-                                          hole, Some(inst.decl.span), required))
+                                          hole, where, required))
         }
     }
     out
 }
 
--- Returns the constraint that checks every instance derived since the last
--- call, or `None` if there is none. Each is checked as `genInstance` checks a
--- written one, and its fields' instances besides (`derivedFields`). Solving
--- these may derive more instances, so the caller solves the constraint and
--- asks again until there is none.
-fun genDerived(g : Generator) -> Option Constraint {
-    push(g)
-    var any = False
+-- Returns the span of the derive-list entry of `info` that asked for
+-- `inst`'s class: its own, or for an `Eq` that `: Ord` or `: Hash` implies,
+-- the first entry that implies it.
+fun derivedAt(info : TyconInfo, inst : InstInfo) -> Span {
+    for d in info.derives { if !d.refused && d.cls == inst.cls { return d.span } }
+    for d in info.derives { if !d.refused { return d.span } }
+    inst.decl.span
+}
+
+-- Checks every instance derived and not checked yet, as `genInstance`
+-- checks a written one, and its fields' instances besides
+-- (`derivedFields`). `Classes.checkDerives` has begun every derivation the
+-- program has (`Classes.derive`), so one call after it checks them all.
+fun genDerived(g : Generator) -> Unit {
     for inst in g.classes.derived {
         if Option.isSome(inst.plan) { continue }
-        any = True
         let params = Vec.new(len(inst.context))
         for q in inst.context { Vec.push(params, dictName(q.name)) }
         let plan = Classes.newInstancePlan(params)
         inst.plan = Some(plan)
         genInstance(g, inst, classNamed(g, inst.cls), plan)
     }
-    let c = pop(g)
-    if any { Some(c) } else { None }
 }
 
 -- Returns the implication that checks the instance whose head is `self`,

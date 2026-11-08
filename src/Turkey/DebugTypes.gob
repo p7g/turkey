@@ -46,19 +46,21 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.Types as Ty
-import Turkey.Types (TCon, TTuple, TFun, TApp)
+import Turkey.Types (TCon, TTuple, TFun, TApp, TFam)
 
 -- The entries made so far, in `entries`, and each one's index by its key.
--- `tags` is each constructor's runtime tag (`SsaLower.tagsOf`).
+-- `tags` is each constructor's runtime tag (`SsaLower.tagsOf`). `making` is
+-- each type whose entry `held` is making, outermost first.
 type Types = Types {
     decls   : DeclTable,
     tags    : Map String Int,
     index   : Map String Int,
     entries : Vec Dwarf.TypeEntry,
+    making  : Vec Ty.Type,
 }
 
 fun new(decls : DeclTable, tags : Map String Int) -> Types =
-    Types { decls = decls, tags = tags, index = Map.new(), entries = [] }
+    Types { decls = decls, tags = tags, index = Map.new(), entries = [], making = [] }
 
 -- The entries made so far, which `typeOf` adds to.
 fun entries(t : Types) -> Vec Dwarf.TypeEntry = t.entries
@@ -139,11 +141,52 @@ fun entry(t : Types, key : String, make : fun() -> Dwarf.TypeEntry) -> Int {
 -- several slots is held there as its box.
 fun held(t : Types, ty : Ty.Type) -> Int {
     let layout = layoutOf(t, ty)
-    if len(layout.slots) > 1 { return boxOf(t, ty) }
     if len(layout.slots) == 0 { return entry(t, "unit", fun() = Structure("Unit", 0, [])) }
-    let rep = layout.slots[0]
     let ty = Ty.prune(ty)
-    entry(t, "held " + Ty.typeKey(ty), fun() = heldEntry(t, ty, rep))
+    -- A non-regular type, `type Nest a = Nil | Cons(a, Nest (Array a))`,
+    -- holds itself at ever larger types, and an entry for each would never
+    -- end. So a type held inside the entry of a smaller type with the same
+    -- constructor is described by its layout alone. Along a chain of entries
+    -- being made, no type is then larger than the first with its
+    -- constructor, so finitely many types can be on it, and `entry` makes
+    -- each at most once.
+    if grows(t, ty) { return byLayout(t, layout, len(layout.slots) > 1) }
+    Vec.push(t.making, ty)
+    let k = if len(layout.slots) > 1 { boxOf(t, ty) }
+            else { entry(t, "held " + Ty.typeKey(ty), fun() = heldEntry(t, ty, layout.slots[0])) }
+    let _ = Vec.pop(t.making)
+    k
+}
+
+-- Returns whether `ty` is larger than a type with the same constructor whose
+-- entry is being made.
+fun grows(t : Types, ty : Ty.Type) -> Bool {
+    let head = match Ty.spine(ty).0 {
+        TCon(c) -> c.name
+        _ -> return False
+    }
+    let size = nodes(ty)
+    Iterator.any(t.making, fun(m) = match Ty.spine(m).0 {
+        TCon(c) -> c.name == head && size > nodes(m)
+        _ -> False
+    })
+}
+
+-- Returns the number of nodes in `ty` as a tree.
+fun nodes(ty : Ty.Type) -> Int = match Ty.prune(ty) {
+    TApp(fn, arg, _) -> 1 + nodes(fn) + nodes(arg)
+    TFam(_, arg, _) -> 1 + nodes(arg)
+    TFun(params, ret) -> {
+        var n = 1 + nodes(ret)
+        for p in params { n = n + nodes(p) }
+        n
+    }
+    TTuple(elems) -> {
+        var n = 1
+        for e in elems { n = n + nodes(e) }
+        n
+    }
+    _ -> 1
 }
 
 fun heldEntry(t : Types, ty : Ty.Type, rep : Rep) -> Dwarf.TypeEntry {

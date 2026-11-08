@@ -65,6 +65,7 @@ import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
 import Turkey.MachO as MachO
+import Turkey.ElfExecutable as ElfExecutable
 import Turkey.MachOExecutable as MachOExecutable
 import Turkey.Elf as Elf
 import Turkey.Escape as Escape
@@ -302,10 +303,6 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                 die("an executable boot writes carries no debug information yet; "
                     + "write an object with -f obj and link it with a C compiler")
             }
-            if let Asm.Elf = Asm.dialectFor(target) {
-                die("an executable can be written only for arm64-darwin; write an "
-                    + "object with -f obj and link it with a C compiler")
-            }
         }
         (Executable, None) -> die("an executable is written only with -f exe, since it has "
                                   + "no debug information yet; or write an object with "
@@ -492,9 +489,13 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             let obj = Assembler.finish(assembler)
             match format {
                 Executable -> {
-                    refuseLibraries(checked.decls, obj.undefined, path)
-                    let main = Asm.runtimeFor(Asm.MachO, "main")
-                    sendBytes(to, MachOExecutable.executableFile(obj, main, name))
+                    let dialect = Asm.dialectFor(target)
+                    refuseLibraries(checked.decls, obj.undefined, dialect, path)
+                    let main = Asm.runtimeFor(dialect, "main")
+                    sendBytes(to, match dialect {
+                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name)
+                        Asm.Elf -> ElfExecutable.executableFile(obj, main)
+                    })
                     let _ = lap("executable", started)
                 }
                 _ -> {
@@ -1280,11 +1281,17 @@ fun sendBytes(to : Destination, array : Array Byte) -> Unit {
 
 -- Refuses, naming the first of them, a program whose `imports` include a
 -- symbol from a library besides the C library: an executable `boot` writes
--- links libSystem alone.
-fun refuseLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol, path : String) -> Unit {
+-- links libSystem alone on Darwin, and libc and libm alone on Linux.
+-- `dialect` is the one the imports are named in.
+fun refuseLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol, dialect : Asm.Dialect,
+                    path : String) -> Unit {
     let declared = Map.new()
     for (_, info) in Map.entries(decls.foreigns) {
-        Map.put(declared, Asm.symbolFor(Asm.MachO, info.symbol).name, info)
+        Map.put(declared, Asm.symbolFor(dialect, info.symbol).name, info)
+    }
+    let linked = match dialect {
+        Asm.MachO -> "libSystem"
+        Asm.Elf -> "libc and libm"
     }
     for sym in imports {
         let info = match Map.get(declared, sym.name) {
@@ -1295,7 +1302,7 @@ fun refuseLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol, path : St
         if let Some(library) = Modules.foreignLibrary(owner) {
             die("cannot write '" + path + "' as an executable: it calls '" + info.symbol
                 + "' from " + library + ", and an executable boot writes can link "
-                + "only libSystem; write an object with -f obj and link it with a C "
+                + "only " + linked + "; write an object with -f obj and link it with a C "
                 + "compiler")
         }
     }

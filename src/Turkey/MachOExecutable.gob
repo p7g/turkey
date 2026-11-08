@@ -48,12 +48,11 @@ export (executableFile)
 import Hash.SHA256 as SHA256
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
-import Turkey.Arm64 as A
-import Turkey.Arm64 (Mem(..), Width(..))
 import Turkey.Arm64.Encode as Encode
 import Turkey.Arm64.Encode (Fixup)
 import Turkey.Assembler (Object(..), SectionData(..))
 import Turkey.CodeSignature as CodeSignature
+import Turkey.Executable (stubSize, stubs, check, copy, alignUp)
 import Turkey.Image as Image
 
 let base = 0x100000000
@@ -83,9 +82,6 @@ let libSystem = "/usr/lib/libSystem.B.dylib"
 -- `__DATA_CONST`'s index among the segments, from `__PAGEZERO`'s 0, by
 -- which the bind opcodes name it.
 let offsetTableSegment = 2
-
--- A stub's size in bytes.
-let stubSize = 12
 
 -- The section ordinals of the module's code, C strings, constants and
 -- data: ordinals count from 1, across every segment, and `__stubs` and
@@ -344,17 +340,6 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     out
 }
 
--- Raises an internal error unless the module's first sections are its
--- code, C strings, constants and data, in that order.
-fun check(sections : Array (SectionData Fixup)) -> Unit {
-    let ordered = len(sections) >= 4 && match (sections[0].kind, sections[1].kind,
-                                               sections[2].kind, sections[3].kind) {
-        (Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data) -> True
-        _ -> False
-    }
-    if !ordered { error("internal error: the module's sections are not in the order expected") }
-}
-
 -- The bind opcodes that fill in the offset table: one slot per import, in
 -- order from its start, each bound to a pointer to the import in the first
 -- library. Ends with `BIND_OPCODE_DONE` and padded to eight bytes.
@@ -410,43 +395,11 @@ fun symbols(obj : Object Fixup, imports : Array Symbol, addresses : Array Int)
     (entries, len(locals), len(exported))
 }
 
--- The `n` stubs, loaded at `at`, each jumping through its slot of the
--- offset table at `table`: `adrp x16, slot@PAGE; ldr x16, [x16,
--- slot@PAGEOFF]; br x16`.
-fun stubs(at : Int, table : Int, n : Int) -> Vec Byte {
-    let out = []
-    let words = []
-    let x16 = A.physical(16)
-    for var k = 0; k < n; k = k + 1 {
-        let slot = Asm.localLabel(Asm.MachO, "slot" + Int.toString(k))
-        for op in [A.Adrp(x16, slot), A.Ldr(x16, PageOffset(x16, slot), W64), A.Br(x16)] {
-            let offset = len(out)
-            Vec.clear(words)
-            Encode.encode(op, words)
-            for w in words {
-                let p = len(out)
-                for var b = 0; b < 4; b = b + 1 { Vec.push(out, Byte.truncate(0)) }
-                Byte.putLE(out, p, 4, w)
-            }
-            if let Some(f) = Encode.fixupOf(op) {
-                Encode.patch(f, out, offset, at + offset, table + 8 * k)
-            }
-        }
-    }
-    out
-}
-
-fun copy(out : Array Byte, at : Int, bytes : Vec Byte) -> Unit {
-    for var k = 0; k < len(bytes); k = k + 1 { out[at + k] = bytes[k] }
-}
-
 -- `text`'s bytes at `at`, the zeros after them already there.
 fun string(out : Array Byte, at : Int, text : String) -> Unit {
     let bytes = String.toBytes(text)
     for var k = 0; k < len(bytes); k = k + 1 { out[at + k] = bytes[k] }
 }
-
-fun alignUp(n : Int, to : Int) -> Int = (n + to - 1) / to * to
 
 -- A segment's size for `n` bytes: whole pages, and at least one.
 fun pages(n : Int) -> Int = max(alignUp(n, page), page)

@@ -101,9 +101,10 @@ cc -o hello hello.s
 ./hello
 ```
 
-On Linux, add `-lm` to the link. On a Mac, `boot build -f exe -o hello
-hello.gob` writes a signed executable itself, with nothing to assemble or
-link, for a program that needs no library beyond libSystem.
+On Linux, add `-lm` to the link. `boot build -f exe -o hello hello.gob`
+writes the executable itself, with nothing to assemble or link, for a program
+that needs no library beyond the C library: a signed executable on a Mac, and
+on Linux one that runs on glibc 2.34 or later.
 
 The project README says how to build `boot` itself.
 

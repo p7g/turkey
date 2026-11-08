@@ -12,6 +12,7 @@ export (
     variantCount, Compact(..), compactShape, compactOf, enumSize, enumIndex,
     constructorIndex,
     FlatDecl(..), flatCandidates, flatDecl, mayBeFlat, showDeclarations,
+    SelfPath(..), SelfReach(..), newSelfReach, selfAssigned,
 )
 
 -- Type and constructor declarations, resolved into semantic types
@@ -1363,6 +1364,222 @@ fun bug(message : String, where : Option Span) -> a = match where {
 }
 
 fun discard(x : a) -> Unit = {}
+
+-- -- types that can hold themselves where a program assigns ---------------------------
+--
+-- A value is built after its fields, so it cannot contain itself; every cycle
+-- in the heap was closed by an assignment, into a `var` field or an array
+-- element. Types are named and recursive only through their names, so a type
+-- whose values can lie on such a cycle reaches itself through one of those
+-- positions, and one whose values cannot does not. `selfAssigned` decides this
+-- for each declaration group, after substituting type arguments:
+-- `type Node = Node { next : Cell Node }` with `type Cell a = Cell { var x : a }`
+-- reaches itself through `Cell`'s field.
+--
+-- Walking every instantiation would not end on a non-regular type, which
+-- holds itself at ever larger types, so the walk is in two steps over type
+-- constructors, never over their instantiations. First, for each parameter
+-- of each type, how its fields hold it (`holdings`): `Cell`'s field holds its
+-- parameter assignably. Then an edge from each type to each type its fields
+-- hold, through the arguments of the types they name as those holdings say:
+-- `Node`'s field holds `Cell` plainly and, through `Cell`'s parameter, `Node`
+-- assignably. A type reaches itself assignably exactly when its component of
+-- that graph has an assignable edge inside it.
+
+-- How a type holds something: not at all, only in positions a program cannot
+-- assign, or in at least one it can. Ordered, so that two ways of holding one
+-- thing combine by `max`.
+let notHeld = 0
+let heldPlainly = 1
+let heldAssignably = 2
+
+-- A field through which a type can reach itself: field `field` of `con`,
+-- which is a `var` field or holds an array element.
+type SelfPath = SelfPath { con : ConInfo, field : Int }
+
+-- What `selfAssigned` has found, for the types registered so far.
+type SelfReach = SelfReach {
+    -- How each declared type holds each of its parameters (`holdings`).
+    holds : Map String (Array Int),
+    -- A field through which each type that can reach itself assignably does.
+    paths : Map String SelfPath,
+    -- How much of the registration order has been read.
+    var done : Int,
+}
+
+fun newSelfReach() -> SelfReach = SelfReach { holds = Map.new(), paths = Map.new(), done = 0 }
+
+-- Adds to `r` the types registered since it was last brought up to date: for
+-- each whose values can reach themselves through an assignable position, a
+-- field of a type in its declaration group that does the assigning.
+--
+-- Modules are registered a group at a time, dependencies first, and a type
+-- can name only types registered with it or before it. So a later group
+-- cannot change what an earlier one holds or reaches, and each type is read
+-- once.
+fun selfAssigned(t : DeclTable, r : SelfReach) -> Unit {
+    let fresh = []
+    while r.done < len(t.order) {
+        let name = t.order[r.done]
+        r.done = r.done + 1
+        let info = tyconOf(t, name)
+        if info.isAlias || len(info.variants) == 0 { continue }
+        Vec.push(fresh, name)
+        Map.put(r.holds, name, Array.filled(len(info.params), notHeld))
+    }
+    holdings(t, r.holds, fresh)
+    -- Each type's edges, as (type held, how, the field holding it).
+    let edges : Map String (Vec (String, Int, SelfPath)) = Map.new()
+    let graph = Map.new()
+    for name in fresh {
+        let out = []
+        let succ = Set.new()
+        for c in tyconOf(t, name).variants {
+            let fields = conParams(c)
+            for var i = 0; i < len(fields); i = i + 1 {
+                let path = SelfPath { con = c, field = i }
+                let held = []
+                heldTypes(r.holds, fields[i], fieldHolding(c, i), held)
+                for (to, at) in held {
+                    Vec.push(out, (to, at, path))
+                    Set.add(succ, to)
+                }
+            }
+        }
+        Map.put(edges, name, out)
+        Map.put(graph, name, succ)
+    }
+    for component in Deps.sccs(graph) {
+        let members = Set.new()
+        for name in component { Set.add(members, name) }
+        -- Name a field of the type itself where it has one, and otherwise the
+        -- first the group has.
+        var first : Option SelfPath = None
+        for name in component {
+            if let Some(path) = assigningEdge(edges, members, name) {
+                first = Some(path)
+                break
+            }
+        }
+        if let Some(any) = first {
+            for name in component {
+                Map.put(r.paths, name, Option.unwrapOr(assigningEdge(edges, members, name), any))
+            }
+        }
+    }
+}
+
+-- Returns the field of the type `name` whose edge to a type in `members`, its
+-- declaration group, is assignable, if one is.
+fun assigningEdge(edges : Map String (Vec (String, Int, SelfPath)), members : Set.Set String,
+                  name : String) -> Option SelfPath {
+    for (to, at, path) in Map.getOr(edges, name, []) {
+        if at == heldAssignably && Set.contains(members, to) { return Some(path) }
+    }
+    None
+}
+
+-- How field `i` of `c` holds its value: assignably when it is `var`.
+fun fieldHolding(c : ConInfo, i : Int) -> Int =
+    if c.mutable[i] { heldAssignably } else { heldPlainly }
+
+-- Returns `c`'s field types, over the variables of its declared result.
+fun conParams(c : ConInfo) -> Array Ty.Type = match Ty.prune(c.scheme.body) {
+    TFun(params, _) -> params
+    _ -> []
+}
+
+-- Finds how each of `names`, declared types, holds each of its parameters,
+-- by position, into `holds`, where their entries start at `notHeld`: the
+-- least fixed point, since a type may hold its parameter through itself or
+-- through another type that holds it. Each round only raises entries, and
+-- there are finitely many, so it ends.
+fun holdings(t : DeclTable, holds : Map String (Array Int), names : Vec String) -> Unit {
+    var changed = True
+    while changed {
+        changed = False
+        for name in names {
+            let held = holds[name]
+            for c in tyconOf(t, name).variants {
+                let position = Map.new()
+                let (_, args) = match Ty.prune(c.scheme.body) {
+                    TFun(_, ret) -> Ty.spine(ret)
+                    other -> Ty.spine(other)
+                }
+                for var i = 0; i < len(args); i = i + 1 {
+                    if let TVar(cell) = Ty.prune(args[i]) { Map.put(position, cell.id, i) }
+                }
+                let fields = conParams(c)
+                for var i = 0; i < len(fields); i = i + 1 {
+                    let found = []
+                    heldParams(holds, fields[i], fieldHolding(c, i), found)
+                    for (id, at) in found {
+                        if let Some(p) = Map.get(position, id) {
+                            if at > held[p] {
+                                held[p] = at
+                                changed = True
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- Adds to `out` each type variable `ty` holds, with how, where `level` is how
+-- `ty` itself is held and `holds` says how the types it names hold their
+-- arguments.
+fun heldParams(holds : Map String (Array Int), ty : Ty.Type, level : Int,
+               out : Vec (Int, Int)) -> Unit {
+    let (h, args) = Ty.spine(Ty.prune(ty))
+    match h {
+        TVar(cell) -> {
+            Vec.push(out, (cell.id, level))
+            -- How a parameter of a higher kind holds its arguments is not
+            -- known here; take it to hold them as it is held.
+            for a in args { heldParams(holds, a, level, out) }
+        }
+        TCon(con) -> for var i = 0; i < len(args); i = i + 1 {
+            let at = argumentHolding(holds, con.name, i)
+            if at != notHeld { heldParams(holds, args[i], max(level, at), out) }
+        }
+        TTuple(elems) -> for e in elems { heldParams(holds, e, level, out) }
+        -- A function holds nothing a derived instance could compare, and what
+        -- an associated type stands for is not known here.
+        _ -> {}
+    }
+}
+
+-- How the type constructor `name` holds its argument `i`: an array assigns
+-- its elements, and a type with no constructors, a primitive, holds nothing.
+fun argumentHolding(holds : Map String (Array Int), name : String, i : Int) -> Int {
+    if name == "Prim.Array" { return heldAssignably }
+    match Map.get(holds, name) {
+        Some(held) -> if i < len(held) { held[i] } else { notHeld }
+        None -> notHeld
+    }
+}
+
+-- Adds to `out` each declared type `ty` holds, with how, where `level` is how
+-- `ty` itself is held and `holds` says how the types it names hold their
+-- arguments.
+fun heldTypes(holds : Map String (Array Int), ty : Ty.Type, level : Int,
+              out : Vec (String, Int)) -> Unit {
+    let (h, args) = Ty.spine(Ty.prune(ty))
+    match h {
+        TVar(_) -> for a in args { heldTypes(holds, a, level, out) }
+        TCon(con) -> {
+            if Map.contains(holds, con.name) { Vec.push(out, (con.name, level)) }
+            for var i = 0; i < len(args); i = i + 1 {
+                let at = argumentHolding(holds, con.name, i)
+                if at != notHeld { heldTypes(holds, args[i], max(level, at), out) }
+            }
+        }
+        TTuple(elems) -> for e in elems { heldTypes(holds, e, level, out) }
+        _ -> {}
+    }
+}
 
 -- -- the dump -----------------------------------------------------------------------
 

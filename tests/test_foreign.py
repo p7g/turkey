@@ -364,3 +364,105 @@ def test_variadic_arguments_count_against_the_registers(probe):
         "export (f)\n"
         f'foreign "probe" fun f({params}, ... b : Int, c : Int) -> Int\n'))
     assert "9 non-'Float' parameters" in fails(entry)
+
+
+# -- libraries ---------------------------------------------------------------
+
+# A block names the shared library its declarations come from, by name and
+# major version; a declaration outside every block comes from the C library.
+# Both checks run over every declaration of every module loaded, called or
+# not, and report once, at the later site, naming the earlier one's
+# `file:line:col`. `Turkey.Libc` and `Turkey.OpenSSL` are loaded before the
+# probe, which imports them, so they hold the earlier sites.
+
+
+def test_a_block_declares_from_its_library(probe):
+    entry = probe((
+        "export (f, g)\n"
+        'foreign "probe" 2 {\n'
+        '    "probe_f" fun f(x : Int) -> Int\n'
+        "\n"
+        "    -- A comment between declarations.\n"
+        '    "probe_g" fun g(p : Prim.Ptr,\n'
+        "                    n : Int) -> Unit\n"
+        "}\n"))
+    check(entry)
+
+
+def test_two_majors_of_one_library_are_refused(probe):
+    entry = probe((
+        "export (legacyNew, legacyFree)\n"
+        "import Turkey.OpenSSL as O\n"
+        'foreign "ssl" 1 {\n'
+        '    "SSL_new" fun legacyNew(ctx : Prim.Ptr) -> Prim.Ptr\n'
+        '    "SSL_free" fun legacyFree(ssl : Prim.Ptr) -> Unit\n'
+        "}\n"))
+    message = fails(entry)
+    assert re.search(r"Probe_\w+\.gob:3:1: type error: library 'ssl' is declared here with "
+                     r"version 1, and with version 3 at \S*lib/Turkey/OpenSSL\.gob:\d+:\d+; a "
+                     r"program can load only one version of a library", message), message
+    # The block is reported, not each declaration in it.
+    assert message.count("only one version") == 1, message
+
+
+def test_two_majors_in_one_module_are_refused(probe):
+    entry = probe((
+        "export (f, g)\n"
+        'foreign "probe" 1 {\n'
+        '    "probe_f" fun f() -> Int\n'
+        "}\n"
+        'foreign "probe" 2 {\n'
+        '    "probe_g" fun g() -> Int\n'
+        "}\n"))
+    assert re.search(r":5:1: type error: library 'probe' is declared here with version 2, "
+                     r"and with version 1 at \S*Probe_\w+\.gob:2:1;", fails(entry))
+
+
+def test_one_symbol_from_the_c_library_and_a_block_is_refused(probe):
+    entry = probe((
+        "export (cryptoFree)\n"
+        'foreign "crypto" 3 {\n'
+        '    "free" fun cryptoFree(p : Prim.Ptr) -> Unit\n'
+        "}\n"))
+    message = fails(entry)
+    assert re.search(r"Probe_\w+\.gob:3:5: type error: 'free' is declared here from library "
+                     r"'crypto', and from the C library at \S*lib/Turkey/Libc\.gob:\d+:\d+; a "
+                     r"symbol can come from only one library", message), message
+
+
+def test_one_symbol_from_two_libraries_is_refused(probe):
+    entry = probe((
+        "export (cryptoNew)\n"
+        "import Turkey.OpenSSL as O\n"
+        'foreign "crypto" 3 {\n'
+        '    "SSL_new" fun cryptoNew(ctx : Prim.Ptr) -> Prim.Ptr\n'
+        "}\n"))
+    assert re.search(r"'SSL_new' is declared here from library 'crypto', and from library "
+                     r"'ssl' at \S*lib/Turkey/OpenSSL\.gob:\d+:\d+; a symbol can come from only "
+                     r"one library", fails(entry))
+
+
+def test_a_block_holds_no_definitions(probe):
+    entry = probe((
+        "export (f)\n"
+        'foreign "probe" 1 {\n'
+        '    "probe_f" fun f(x : Int) -> Int = x\n'
+        "}\n"))
+    assert "foreign 'f' is inside a library's block, so it cannot have a body" in fails(entry)
+
+
+def test_a_library_needs_a_name(probe):
+    entry = probe((
+        "export (f)\n"
+        'foreign "" 1 {\n'
+        '    "probe_f" fun f() -> Int\n'
+        "}\n"))
+    assert "the library's name is empty" in fails(entry)
+
+
+def test_a_program_may_not_declare_a_library():
+    message = fails('foreign "ssl" 3 {\n'
+                    '    "SSL_new" fun sslNew(ctx : Prim.Ptr) -> Prim.Ptr\n'
+                    "}\n"
+                    "fun main() { }\n")
+    assert "a 'foreign' function without a body can appear only in" in message

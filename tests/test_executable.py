@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import struct
 import subprocess
@@ -40,9 +41,9 @@ darwin = pytest.mark.skipif(
     reason="runs the executable, and checks it with Apple's tools")
 
 
-def _boot(*args: str) -> subprocess.CompletedProcess[str]:
+def _boot(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(toolchain.command(bootc.binary(), "build", *args),
-                          capture_output=True, text=True, env=ENV, timeout=600)
+                          capture_output=True, text=True, env=env or ENV, timeout=600)
 
 
 def _write(entry: Path, output: Path) -> None:
@@ -131,26 +132,190 @@ def _tls(tmp_path: Path) -> Path:
     return entry
 
 
-def test_a_program_that_needs_openssl_is_refused(tmp_path):
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
-                   str(_tls(tmp_path)))
+# A library beyond the C library is named by the install name of the file
+# `lib<name>.<major>.dylib`, searched for first in `$TURKEY_DYLIB_PATH`. These
+# write for arm64-darwin with only made-up libraries on that path, so they
+# check the search and the load commands on any host.
+
+CPU_ARM64, CPU_X86_64 = 0x0100000C, 0x01000007
+
+
+def _dylib(path: Path, install_name: str, cpu: int = CPU_ARM64) -> bytes:
+    """A thin dylib holding a header and an `LC_ID_DYLIB`, and nothing else,
+    which is all the search reads. Written to `path`; also answered."""
+    name = install_name.encode() + b"\0"
+    size = -(-(24 + len(name)) // 8) * 8
+    command = struct.pack("<6I", 0xD, size, 24, 2, 0x30000, 0x30000) + name
+    command += bytes(size - len(command))
+    data = struct.pack("<8I", 0xFEEDFACF, cpu, 0, 6, 1, size, 0, 0) + command
+    path.write_bytes(data)
+    return data
+
+
+def _universal(path: Path, slices: list[tuple[int, bytes]]) -> None:
+    """A universal file of `slices`, each a CPU type and a thin file."""
+    header = struct.pack(">2I", 0xCAFEBABE, len(slices))
+    at = 0x1000
+    body = b""
+    for cpu, data in slices:
+        header += struct.pack(">5I", cpu, 0, at + len(body), len(data), 12)
+        body += data + bytes(-len(data) % 0x1000)
+    path.write_bytes(header + bytes(at - len(header)) + body)
+
+
+def _dylibs(data: bytes) -> list[tuple[str, int, int]]:
+    """Each `LC_LOAD_DYLIB`: its install name and its current and
+    compatibility versions."""
+    out = []
+    for command, body in _commands(data):
+        if command == 0xC:
+            offset, _, current, compatibility = struct.unpack_from("<4I", body, 8)
+            out.append((body[offset:].split(b"\0")[0].decode(), current, compatibility))
+    return out
+
+
+def _undefined(data: bytes) -> dict[str, int]:
+    """Each undefined symbol, and the library ordinal its description holds."""
+    commands = dict(_commands(data))
+    symbols, count, strings, _ = struct.unpack_from("<4I", commands[0x2], 8)
+    out = {}
+    for k in range(count):
+        name_at, kind, _, desc, _ = struct.unpack_from("<IBBHQ", data, symbols + 16 * k)
+        if kind == 0x1:
+            name = data[strings + name_at:data.index(b"\0", strings + name_at)].decode()
+            out[name] = desc >> 8
+    return out
+
+
+def _openssl_dylibs(directory: Path) -> Path:
+    directory.mkdir()
+    _dylib(directory / "libssl.3.dylib", "/made/up/ssl/libssl.3.dylib")
+    _dylib(directory / "libcrypto.3.dylib", "/made/up/crypto/libcrypto.3.dylib")
+    return directory
+
+
+def test_each_library_is_loaded_once_and_bound_by_its_ordinal(tmp_path):
+    executable = tmp_path / "tls"
+    found = _openssl_dylibs(tmp_path / "dylibs")
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+                   str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=f"{found}:"))
+    assert result.returncode == 0, result.stderr[-4000:]
+    data = executable.read_bytes()
+    # libSystem first, then the others by install name, at version 0.
+    assert _dylibs(data) == [("/usr/lib/libSystem.B.dylib", 0x10000, 0x10000),
+                             ("/made/up/crypto/libcrypto.3.dylib", 0, 0),
+                             ("/made/up/ssl/libssl.3.dylib", 0, 0)]
+    undefined = _undefined(data)
+    assert undefined["_SSL_CTX_new"] == 3 and undefined["_ERR_get_error"] == 2
+    assert undefined["_write"] == 1
+    ordinals = list(undefined.values())
+    assert ordinals == sorted(ordinals)
+
+
+def test_a_library_is_found_in_a_universal_file_past_one_for_intel(tmp_path):
+    intel, universal = tmp_path / "intel", tmp_path / "universal"
+    intel.mkdir()
+    universal.mkdir()
+    _dylib(intel / "libssl.3.dylib", "/intel/libssl.3.dylib", CPU_X86_64)
+    _dylib(intel / "libcrypto.3.dylib", "/intel/libcrypto.3.dylib", CPU_X86_64)
+    for name in ("ssl", "crypto"):
+        leaf = f"lib{name}.3.dylib"
+        _universal(universal / leaf,
+                   [(CPU_X86_64, _dylib(tmp_path / "x", f"/x86/{leaf}", CPU_X86_64)),
+                    (CPU_ARM64, _dylib(tmp_path / "a", f"/universal/{leaf}"))])
+    executable = tmp_path / "tls"
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+                   str(_tls(tmp_path)),
+                   env=dict(ENV, TURKEY_DYLIB_PATH=f"{intel}:{universal}"))
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert [name for name, _, _ in _dylibs(executable.read_bytes())] == [
+        "/usr/lib/libSystem.B.dylib", "/universal/libcrypto.3.dylib",
+        "/universal/libssl.3.dylib"]
+
+
+def _never_calls(tmp_path: Path) -> Path:
+    entry = tmp_path / "quiet.gob"
+    entry.write_text("import Net.TLS as TLS\n\n"
+                     "fun main() {\n"
+                     '    print("no TLS")\n'
+                     "}\n", encoding="utf-8")
+    return entry
+
+
+# Needs no `$TURKEY_DYLIB_PATH`, even for another machine: nothing is looked for.
+def test_a_program_that_never_calls_openssl_loads_neither_library(tmp_path):
+    env = {k: v for k, v in ENV.items() if k != "TURKEY_DYLIB_PATH"}
+    macho, elf = tmp_path / "macho", tmp_path / "elf"
+    for target, output in (("arm64-darwin", macho), ("arm64-linux", elf)):
+        result = _boot("-f", "exe", "--target", target, "-o", str(output),
+                       str(_never_calls(tmp_path)), env=env)
+        assert result.returncode == 0, result.stderr[-4000:]
+    assert [name for name, _, _ in _dylibs(macho.read_bytes())] == ["/usr/lib/libSystem.B.dylib"]
+    assert Elf(elf.read_bytes()).needed() == ["libc.so.6"]
+
+
+@pytest.fixture
+def missing_library(monkeypatch, tmp_path):
+    """A program calling a function of a library no machine has, declared by
+    a throwaway module in the real `lib/`, which `TURKEY_TEST_FOREIGN` lets
+    declare it."""
+    stem = "Probe_executable_" + secrets.token_hex(4)
+    module = REPO_ROOT / "lib" / f"{stem}.gob"
+    module.write_text("export (nothing)\n"
+                      'foreign "turkeynothere" 7 {\n'
+                      '    "turkey_nothing" fun nothing() -> Int\n'
+                      "}\n", encoding="utf-8")
+    monkeypatch.setitem(ENV, "TURKEY_TEST_FOREIGN", stem)
+    entry = tmp_path / "missing.gob"
+    entry.write_text(f"import {stem} as P\n\nfun main() {{\n    let _ = P.nothing()\n}}\n",
+                     encoding="utf-8")
+    try:
+        yield entry
+    finally:
+        module.unlink(missing_ok=True)
+
+
+def test_a_library_not_found_is_an_error_naming_where_it_was_looked_for(tmp_path,
+                                                                        missing_library):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "out"),
+                   str(missing_library), env=dict(ENV, TURKEY_DYLIB_PATH=str(empty)))
     assert result.returncode == 2
-    assert re.search(r"it calls '\w+' from OpenSSL's libssl and libcrypto", result.stderr), \
-        result.stderr
-    assert "-f obj" in result.stderr
+    assert ("it calls 'turkey_nothing' from library 'turkeynothere' 7, and no "
+            f"'libturkeynothere.7.dylib' is in '{empty}'") in result.stderr, result.stderr
+    if toolchain.target() == "arm64-darwin":
+        assert "'/opt/homebrew/opt/*/lib', '/usr/local/opt/*/lib'" in result.stderr
+    assert "set TURKEY_DYLIB_PATH" in result.stderr
+
+
+@pytest.mark.skipif(toolchain.target() == "arm64-darwin",
+                    reason="writes for another machine than this one")
+def test_another_machines_library_needs_a_directory_to_read_it_from(tmp_path):
+    env = {k: v for k, v in ENV.items() if k != "TURKEY_DYLIB_PATH"}
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
+                   str(_tls(tmp_path)), env=env)
+    assert result.returncode == 2
+    assert re.search(r"cannot write '\S+' for arm64-darwin on this machine: it calls '\w+' "
+                     r"from library '(ssl|crypto)' 3, whose install name is read from "
+                     r"'lib(ssl|crypto)\.3\.dylib' itself; set TURKEY_DYLIB_PATH",
+                     result.stderr), result.stderr
 
 
 # The output is written only once its bytes are complete, so a build that
 # fails leaves what was there before, and nothing beside it.
-def test_a_refused_build_leaves_the_output_as_it_was(tmp_path):
-    entry = _tls(tmp_path)
-    existing = tmp_path / "existing"
+def test_a_refused_build_leaves_the_output_as_it_was(tmp_path, missing_library):
+    builds = tmp_path / "builds"
+    builds.mkdir()
+    existing = builds / "existing"
     existing.write_bytes(b"before")
-    for output in (existing, tmp_path / "absent"):
-        result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(output), str(entry))
+    env = dict(ENV, TURKEY_DYLIB_PATH=str(builds))
+    for output in (existing, builds / "absent"):
+        result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(output),
+                       str(missing_library), env=env)
         assert result.returncode == 2, result.stderr
     assert existing.read_bytes() == b"before"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["existing", "tls.gob"]
+    assert sorted(p.name for p in builds.iterdir()) == ["existing"]
 
 
 # Each build writes a partial file of its own, made exclusively, so one that
@@ -490,13 +655,18 @@ def test_libm_is_needed_only_for_its_names(tmp_path):
     assert imports[:-2] == sorted(imports[:-2])
 
 
-def test_an_elf_with_openssl_is_refused(tmp_path):
-    result = _boot("-f", "exe", "--target", "arm64-linux", "-o", str(tmp_path / "tls"),
-                   str(_tls(tmp_path)))
-    assert result.returncode == 2
-    assert re.search(r"it calls '\w+' from OpenSSL's libssl and libcrypto, and an executable "
-                     r"boot writes can link only libc and libm", result.stderr), result.stderr
-    assert "-f obj" in result.stderr
+def test_an_elf_needs_each_library_by_its_soname(tmp_path):
+    executable = tmp_path / "tls"
+    _write_elf(_tls(tmp_path), executable)
+    elf = Elf(executable.read_bytes())
+    needed = elf.needed()
+    # libc first, then libm if it is needed, then the others by soname.
+    assert needed[0] == "libc.so.6" and needed[-2:] == ["libcrypto.so.3", "libssl.so.3"]
+    assert len(needed) == len(set(needed))
+    imports = [name for name, *_ in elf.symbols(".dynsym")[1:]]
+    ssl = [name for name in imports if name.startswith(("SSL_", "TLS_"))]
+    assert ssl and imports[-len(ssl):] == ssl == sorted(ssl)
+    assert "ERR_get_error" in imports[:-len(ssl)]
 
 
 def test_one_module_writes_the_same_elf(tmp_path):

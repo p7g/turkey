@@ -21,9 +21,10 @@ export (
 
 -- The OpenSSL 3 functions `Net.TLS` calls, and the constants it passes them.
 --
--- One of the modules the compiler lets declare a C symbol. Nothing here is
--- linked into a program unless it reaches `Net.TLS`, and one that does links
--- with `-lssl -lcrypto` (on macOS, Homebrew's `openssl@3`).
+-- One of the modules the compiler lets declare a C symbol, in a block for
+-- each of OpenSSL 3's two libraries. A program loads a library only if it
+-- calls one of the library's functions. An object written with `-f obj` is
+-- linked with `-lssl -lcrypto` (on macOS, Homebrew's `openssl@3`).
 --
 -- **The surface is what a TLS library over memory has to offer, and no
 -- more:** a configuration (roots, a certificate and key, the protocol
@@ -51,170 +52,176 @@ import Data.Tuple (Unit)
 import Data.Num (Neg(..))
 import Turkey.Ptr (Ptr)
 
--- -- contexts ---------------------------------------------------------------------------
+foreign "ssl" 3 {
+    -- -- contexts ----------------------------------------------------------------------
 
-foreign "TLS_client_method" fun tlsClientMethod() -> Ptr
+    "TLS_client_method" fun tlsClientMethod() -> Ptr
 
-foreign "TLS_server_method" fun tlsServerMethod() -> Ptr
+    "TLS_server_method" fun tlsServerMethod() -> Ptr
 
--- A new context with one reference, or null.
-foreign "SSL_CTX_new" fun ctxNew(method : Ptr) -> Ptr
+    -- A new context with one reference, or null.
+    "SSL_CTX_new" fun ctxNew(method : Ptr) -> Ptr
 
--- Drop one reference; the last frees the context.
-foreign "SSL_CTX_free" fun ctxFree(ctx : Ptr) -> Unit
+    -- Drop one reference; the last frees the context.
+    "SSL_CTX_free" fun ctxFree(ctx : Ptr) -> Unit
 
--- What `SSL_CTX_set_min_proto_version` is a macro for.
-foreign "SSL_CTX_ctrl" fun ctxCtrl(ctx : Ptr, command : Int, larg : Int,
-                                   parg : Ptr) -> Int
+    -- What `SSL_CTX_set_min_proto_version` is a macro for.
+    "SSL_CTX_ctrl" fun ctxCtrl(ctx : Ptr, command : Int, larg : Int,
+                               parg : Ptr) -> Int
 
--- The options after adding `options` (a `uint64_t`).
-foreign "SSL_CTX_set_options" fun ctxSetOptions(ctx : Ptr, options : Int) -> Int
+    -- The options after adding `options` (a `uint64_t`).
+    "SSL_CTX_set_options" fun ctxSetOptions(ctx : Ptr, options : Int) -> Int
 
--- `callback` null: OpenSSL's own verification, and nothing else.
-foreign "SSL_CTX_set_verify" fun ctxSetVerify(ctx : Ptr, mode : Int,
-                                              callback : Ptr) -> Unit
+    -- `callback` null: OpenSSL's own verification, and nothing else.
+    "SSL_CTX_set_verify" fun ctxSetVerify(ctx : Ptr, mode : Int,
+                                          callback : Ptr) -> Unit
 
--- The roots in OpenSSL's default places: `$SSL_CERT_FILE` and
--- `$SSL_CERT_DIR` if set, and otherwise the `cert.pem` and `certs/` of the
--- directory OpenSSL was built with. 1 on success.
-foreign "SSL_CTX_set_default_verify_paths" fun ctxSetDefaultVerifyPaths(ctx : Ptr) -> Int
+    -- The roots in OpenSSL's default places: `$SSL_CERT_FILE` and
+    -- `$SSL_CERT_DIR` if set, and otherwise the `cert.pem` and `certs/` of the
+    -- directory OpenSSL was built with. 1 on success.
+    "SSL_CTX_set_default_verify_paths" fun ctxSetDefaultVerifyPaths(ctx : Ptr) -> Int
 
--- The roots in the PEM file at the NUL-terminated `path`. 1 on success.
-foreign "SSL_CTX_load_verify_file" fun ctxLoadVerifyFile(ctx : Ptr, path : Ptr) -> Int
+    -- The roots in the PEM file at the NUL-terminated `path`. 1 on success.
+    "SSL_CTX_load_verify_file" fun ctxLoadVerifyFile(ctx : Ptr, path : Ptr) -> Int
 
--- The certificate and the chain after it, from a PEM file. 1 on success.
-foreign "SSL_CTX_use_certificate_chain_file" fun ctxUseCertificateChainFile(ctx : Ptr,
-                                                                            path : Ptr) -> Int
+    -- The certificate and the chain after it, from a PEM file. 1 on success.
+    "SSL_CTX_use_certificate_chain_file" fun ctxUseCertificateChainFile(ctx : Ptr,
+                                                                        path : Ptr) -> Int
 
-foreign "SSL_CTX_use_PrivateKey_file" fun ctxUsePrivateKeyFile(ctx : Ptr, path : Ptr,
-                                                               filetype : Int) -> Int
+    "SSL_CTX_use_PrivateKey_file" fun ctxUsePrivateKeyFile(ctx : Ptr, path : Ptr,
+                                                           filetype : Int) -> Int
 
--- Whether the key is the certificate's: 1 if it is.
-foreign "SSL_CTX_check_private_key" fun ctxCheckPrivateKey(ctx : Ptr) -> Int
+    -- Whether the key is the certificate's: 1 if it is.
+    "SSL_CTX_check_private_key" fun ctxCheckPrivateKey(ctx : Ptr) -> Int
 
--- The context's certificate, which the context owns.
-foreign "SSL_CTX_get0_certificate" fun ctxGet0Certificate(ctx : Ptr) -> Ptr
+    -- The context's certificate, which the context owns.
+    "SSL_CTX_get0_certificate" fun ctxGet0Certificate(ctx : Ptr) -> Ptr
 
--- `callback` is a C function pointer: a `foreign` definition's address.
-foreign "SSL_CTX_set_alpn_select_cb" fun ctxSetAlpnSelectCb(ctx : Ptr, callback : Ptr,
-                                                            argument : Ptr) -> Unit
+    -- `callback` is a C function pointer: a `foreign` definition's address.
+    "SSL_CTX_set_alpn_select_cb" fun ctxSetAlpnSelectCb(ctx : Ptr, callback : Ptr,
+                                                        argument : Ptr) -> Unit
 
-foreign "SSL_CTX_set_client_hello_cb" fun ctxSetClientHelloCb(ctx : Ptr, callback : Ptr,
-                                                              argument : Ptr) -> Unit
+    "SSL_CTX_set_client_hello_cb" fun ctxSetClientHelloCb(ctx : Ptr, callback : Ptr,
+                                                          argument : Ptr) -> Unit
 
--- 1 if the certificate names the host `name[0..length)`, by RFC 6125's rules,
--- wildcards included. `peername` null.
-foreign "X509_check_host" fun x509CheckHost(certificate : Ptr, name : Ptr, length : Int,
-                                            flags : Int, peername : Ptr) -> Int
+    -- -- connections -------------------------------------------------------------------
 
--- -- connections ------------------------------------------------------------------------
+    -- A connection holding a reference to `ctx`, or null.
+    "SSL_new" fun sslNew(ctx : Ptr) -> Ptr
 
--- A connection holding a reference to `ctx`, or null.
-foreign "SSL_new" fun sslNew(ctx : Ptr) -> Ptr
+    -- Frees the connection, both its BIOs, and its reference to its context.
+    "SSL_free" fun sslFree(ssl : Ptr) -> Unit
 
--- Frees the connection, both its BIOs, and its reference to its context.
-foreign "SSL_free" fun sslFree(ssl : Ptr) -> Unit
+    "SSL_set_connect_state" fun sslSetConnectState(ssl : Ptr) -> Unit
 
-foreign "SSL_set_connect_state" fun sslSetConnectState(ssl : Ptr) -> Unit
+    "SSL_set_accept_state" fun sslSetAcceptState(ssl : Ptr) -> Unit
 
-foreign "SSL_set_accept_state" fun sslSetAcceptState(ssl : Ptr) -> Unit
+    -- The connection takes ownership of both BIOs.
+    "SSL_set_bio" fun sslSetBio(ssl : Ptr, rbio : Ptr, wbio : Ptr) -> Unit
 
--- The connection takes ownership of both BIOs.
-foreign "SSL_set_bio" fun sslSetBio(ssl : Ptr, rbio : Ptr, wbio : Ptr) -> Unit
+    -- What `SSL_set_tlsext_host_name` is a macro for.
+    "SSL_ctrl" fun sslCtrl(ssl : Ptr, command : Int, larg : Int, parg : Ptr) -> Int
 
--- What `SSL_set_tlsext_host_name` is a macro for.
-foreign "SSL_ctrl" fun sslCtrl(ssl : Ptr, command : Int, larg : Int, parg : Ptr) -> Int
+    -- The name the peer's certificate must have: a DNS name, or an IP address
+    -- written as text. 1 on success.
+    "SSL_set1_host" fun sslSet1Host(ssl : Ptr, name : Ptr) -> Int
 
--- The name the peer's certificate must have: a DNS name, or an IP address
--- written as text. 1 on success.
-foreign "SSL_set1_host" fun sslSet1Host(ssl : Ptr, name : Ptr) -> Int
+    -- The protocols to offer, in ALPN's wire form. **0** on success.
+    "SSL_set_alpn_protos" fun sslSetAlpnProtos(ssl : Ptr, protocols : Ptr,
+                                               length : Int) -> Int
 
--- The protocols to offer, in ALPN's wire form. **0** on success.
-foreign "SSL_set_alpn_protos" fun sslSetAlpnProtos(ssl : Ptr, protocols : Ptr,
-                                                   length : Int) -> Int
+    -- 1 when the handshake is done, and otherwise what `SSL_get_error` explains.
+    "SSL_do_handshake" fun sslDoHandshake(ssl : Ptr) -> Int
 
--- 1 when the handshake is done, and otherwise what `SSL_get_error` explains.
-foreign "SSL_do_handshake" fun sslDoHandshake(ssl : Ptr) -> Int
+    -- How many bytes were read or written, or `<= 0` and what `SSL_get_error`
+    -- explains.
+    "SSL_read" fun sslRead(ssl : Ptr, buffer : Ptr, length : Int) -> Int
 
--- How many bytes were read or written, or `<= 0` and what `SSL_get_error`
--- explains.
-foreign "SSL_read" fun sslRead(ssl : Ptr, buffer : Ptr, length : Int) -> Int
+    "SSL_write" fun sslWrite(ssl : Ptr, buffer : Ptr, length : Int) -> Int
 
-foreign "SSL_write" fun sslWrite(ssl : Ptr, buffer : Ptr, length : Int) -> Int
+    -- Queue a close_notify. 0 or 1 once it is queued.
+    "SSL_shutdown" fun sslShutdown(ssl : Ptr) -> Int
 
--- Queue a close_notify. 0 or 1 once it is queued.
-foreign "SSL_shutdown" fun sslShutdown(ssl : Ptr) -> Int
+    -- Why the call that answered `result` stopped. It reads this thread's error
+    -- queue, so it is asked straight after the call, with nothing between.
+    "SSL_get_error" fun sslGetError(ssl : Ptr, result : Int) -> Int
 
--- Why the call that answered `result` stopped. It reads this thread's error
--- queue, so it is asked straight after the call, with nothing between.
-foreign "SSL_get_error" fun sslGetError(ssl : Ptr, result : Int) -> Int
+    -- The verification's `X509_V_` code: `X509_V_OK`, or why the peer's
+    -- certificate was refused.
+    "SSL_get_verify_result" fun sslGetVerifyResult(ssl : Ptr) -> Int
 
--- The verification's `X509_V_` code: `X509_V_OK`, or why the peer's
--- certificate was refused.
-foreign "SSL_get_verify_result" fun sslGetVerifyResult(ssl : Ptr) -> Int
+    -- The protocol ALPN chose: a pointer to its bytes into `data`, and their
+    -- count, a C `unsigned int`, into `length`; a null pointer and 0 if none.
+    "SSL_get0_alpn_selected" fun sslGet0AlpnSelected(ssl : Ptr, data : Ptr,
+                                                     length : Ptr) -> Unit
 
--- The protocol ALPN chose: a pointer to its bytes into `data`, and their
--- count, a C `unsigned int`, into `length`; a null pointer and 0 if none.
-foreign "SSL_get0_alpn_selected" fun sslGet0AlpnSelected(ssl : Ptr, data : Ptr,
-                                                         length : Ptr) -> Unit
+    -- The server name the client sent, NUL-terminated, or null.
+    "SSL_get_servername" fun sslGetServername(ssl : Ptr, nameType : Int) -> Ptr
 
--- The server name the client sent, NUL-terminated, or null.
-foreign "SSL_get_servername" fun sslGetServername(ssl : Ptr, nameType : Int) -> Ptr
+    -- During the client-hello callback, or after it asked for a retry: the body
+    -- of the client's extension `extension`, a pointer into `out` and a `size_t`
+    -- into `length`. 1 if the client sent it.
+    "SSL_client_hello_get0_ext" fun sslClientHelloGet0Ext(ssl : Ptr, extension : Int,
+                                                          out : Ptr,
+                                                          length : Ptr) -> Int
 
--- During the client-hello callback, or after it asked for a retry: the body
--- of the client's extension `extension`, a pointer into `out` and a `size_t`
--- into `length`. 1 if the client sent it.
-foreign "SSL_client_hello_get0_ext" fun sslClientHelloGet0Ext(ssl : Ptr, extension : Int,
-                                                              out : Ptr,
-                                                              length : Ptr) -> Int
+    -- Move the connection to `ctx`'s certificate, taking a reference to `ctx`
+    -- and dropping the one to its old context.
+    "SSL_set_SSL_CTX" fun sslSetSSLCtx(ssl : Ptr, ctx : Ptr) -> Ptr
 
--- Move the connection to `ctx`'s certificate, taking a reference to `ctx`
--- and dropping the one to its old context.
-foreign "SSL_set_SSL_CTX" fun sslSetSSLCtx(ssl : Ptr, ctx : Ptr) -> Ptr
+    -- Slot 0 is the application's, what `SSL_get_app_data` reads.
+    "SSL_get_ex_data" fun sslGetExData(ssl : Ptr, index : Int) -> Ptr
 
--- Slot 0 is the application's, what `SSL_get_app_data` reads.
-foreign "SSL_get_ex_data" fun sslGetExData(ssl : Ptr, index : Int) -> Ptr
+    "SSL_set_ex_data" fun sslSetExData(ssl : Ptr, index : Int, data : Ptr) -> Int
 
-foreign "SSL_set_ex_data" fun sslSetExData(ssl : Ptr, index : Int, data : Ptr) -> Int
+    -- The first of the server's protocols that the client offers too, as a
+    -- pointer into the server's list in `out` and a length byte in `outLength`.
+    -- `OPENSSL_NPN_NEGOTIATED` if there was one.
+    "SSL_select_next_proto" fun sslSelectNextProto(out : Ptr, outLength : Ptr,
+                                                   server : Ptr, serverLength : Int,
+                                                   client : Ptr, clientLength : Int) -> Int
+}
 
--- The first of the server's protocols that the client offers too, as a
--- pointer into the server's list in `out` and a length byte in `outLength`.
--- `OPENSSL_NPN_NEGOTIATED` if there was one.
-foreign "SSL_select_next_proto" fun sslSelectNextProto(out : Ptr, outLength : Ptr,
-                                                       server : Ptr, serverLength : Int,
-                                                       client : Ptr, clientLength : Int) -> Int
+foreign "crypto" 3 {
+    -- -- certificates ------------------------------------------------------------------
 
--- -- memory BIOs ------------------------------------------------------------------------
+    -- 1 if the certificate names the host `name[0..length)`, by RFC 6125's rules,
+    -- wildcards included. `peername` null.
+    "X509_check_host" fun x509CheckHost(certificate : Ptr, name : Ptr, length : Int,
+                                        flags : Int, peername : Ptr) -> Int
 
-foreign "BIO_s_mem" fun bioSMem() -> Ptr
+    -- -- memory BIOs -------------------------------------------------------------------
 
--- An empty memory BIO, which grows as it is written and, read while empty,
--- asks to be retried rather than reporting an end. Null if out of memory.
-foreign "BIO_new" fun bioNew(method : Ptr) -> Ptr
+    "BIO_s_mem" fun bioSMem() -> Ptr
 
-foreign "BIO_free" fun bioFree(bio : Ptr) -> Int
+    -- An empty memory BIO, which grows as it is written and, read while empty,
+    -- asks to be retried rather than reporting an end. Null if out of memory.
+    "BIO_new" fun bioNew(method : Ptr) -> Ptr
 
-foreign "BIO_read" fun bioRead(bio : Ptr, buffer : Ptr, length : Int) -> Int
+    "BIO_free" fun bioFree(bio : Ptr) -> Int
 
-foreign "BIO_write" fun bioWrite(bio : Ptr, buffer : Ptr, length : Int) -> Int
+    "BIO_read" fun bioRead(bio : Ptr, buffer : Ptr, length : Int) -> Int
 
--- How many bytes the BIO holds, a `size_t`.
-foreign "BIO_ctrl_pending" fun bioCtrlPending(bio : Ptr) -> Int
+    "BIO_write" fun bioWrite(bio : Ptr, buffer : Ptr, length : Int) -> Int
 
--- -- errors -----------------------------------------------------------------------------
+    -- How many bytes the BIO holds, a `size_t`.
+    "BIO_ctrl_pending" fun bioCtrlPending(bio : Ptr) -> Int
 
--- The error queue is the thread's: cleared before each call whose failure is
--- read, and read before anything else runs on the thread.
-foreign "ERR_clear_error" fun errClearError() -> Unit
+    -- -- errors ------------------------------------------------------------------------
 
--- The oldest error on the queue, removed from it, or 0. An `unsigned long`.
-foreign "ERR_get_error" fun errGetError() -> Int
+    -- The error queue is the thread's: cleared before each call whose failure is
+    -- read, and read before anything else runs on the thread.
+    "ERR_clear_error" fun errClearError() -> Unit
 
--- A static description of the error's reason, or null.
-foreign "ERR_reason_error_string" fun errReasonErrorString(code : Int) -> Ptr
+    -- The oldest error on the queue, removed from it, or 0. An `unsigned long`.
+    "ERR_get_error" fun errGetError() -> Int
 
--- A static description of an `X509_V_` code.
-foreign "X509_verify_cert_error_string" fun x509VerifyCertErrorString(code : Int) -> Ptr
+    -- A static description of the error's reason, or null.
+    "ERR_reason_error_string" fun errReasonErrorString(code : Int) -> Ptr
+
+    -- A static description of an `X509_V_` code.
+    "X509_verify_cert_error_string" fun x509VerifyCertErrorString(code : Int) -> Ptr
+}
 
 -- -- constants --------------------------------------------------------------------------
 

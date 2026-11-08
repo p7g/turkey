@@ -415,7 +415,9 @@ implicit `Eq` or `Hash`.** A value is built after its fields, so it cannot
 contain itself until an assignment makes it, and a derived `==` on such a
 cycle would compare forever. The compiler follows the fields' types, with
 each type's arguments put in, so a type that holds itself in a `var` field
-of another type, or in an array, counts:
+of another type, or in an array, counts. A field whose type applies a type
+parameter, as `f a` does, counts as holding `a` in an assignable position,
+since `f` may be `Array`:
 
 <!-- error: 'Node' has no 'Eq': it can reach itself through its 'var' field 'next'; write ': Eq' in its declaration to derive one anyway -->
 ```kotlin
@@ -501,8 +503,8 @@ type Counted : Eq = Counted(Key (Array Bool))
 **Opting out.** `!Eq` or `!Hash` in the list says that the type has none:
 no instance may be written for it, and a type that holds one cannot derive
 the class. A type whose fields would compare without meaning to opt out this
-way: a builder whose text may be split into pieces differently, or a handle
-whose identity, not its contents, tells it apart. Refusing `Eq` refuses
+way: a view of part of a buffer, whose contents are the buffer's, or a
+handle whose identity, not its contents, tells it apart. Refusing `Eq` refuses
 `Hash` too, which needs it. Comparing such a value says why it cannot be
 compared:
 

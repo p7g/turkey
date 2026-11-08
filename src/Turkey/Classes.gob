@@ -4,7 +4,7 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
-    derivedMethod, isDerivedMethod, checkDerives, whyMissing,
+    derivedMethod, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -311,6 +311,8 @@ type ClassTable = ClassTable {
     -- Every instance derived so far, in the order each settled. The generator
     -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
     derived : Vec InstInfo,
+    -- How many of `derived` the generator has checked.
+    var checkedUpTo : Int,
     -- Whether a derivation begun now is checked: from the start of
     -- `Turkey.Infer.generate` for a component of modules to the end of
     -- `Turkey.Infer.solve` for it. See `derive`.
@@ -332,6 +334,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     provisional = []
     deriving = False
     derived = []
+    checkedUpTo = 0
     open = False
     selfReach = Decls.newSelfReach()
 }
@@ -1814,8 +1817,14 @@ fun isImplicit(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
 -- might have the class, as a phrase about the type: "can reach itself
 -- through its 'var' field 'next'". `None` when nothing rules it out, and
 -- always when the derive list asks for `cls`, which overrides both reasons.
+-- `None` too when a superclass of `cls` is written by hand or refused, which
+-- rules the instance out whatever the list says, so that the diagnostic
+-- gives that reason and not a fix that cannot work (`checkEntry`).
 fun implicitExclusion(t : ClassTable, cls : String, tycon : String) -> Option String {
     if !isImplicit(cls) || listsFor(t, tycon, cls) { return None }
+    for sup in superclassesOf(t, cls) {
+        if refuses(t, tycon, sup) || Option.isSome(writtenInstance(t, sup, tycon)) { return None }
+    }
     let info = Map.get(t.decls.tycons, tycon)?
     -- A derived `==` follows every field, so on a value that reaches itself
     -- it would not end. Every cycle in the heap passes through an assignable
@@ -1897,8 +1906,9 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
     -- begins the rest the first time a predicate needs one.
     -- `Turkey.Infer.solve` checks each in the run of the solver that began
     -- it. One begun once a component is solved, by the lowering or a later
-    -- pass, would never be checked. After an error the program stops before
-    -- solving, so a derivation not begun by then is not needed.
+    -- pass, would never be checked. After an error the program stops once
+    -- its component is solved, before anything is lowered, so a derivation
+    -- not begun by then is not needed.
     if !t.open {
         if Diag.hasErrors() { return None }
         bug("'" + Ty.shortName(cls) + " " + Ty.shortName(tycon) + "' was first asked for "
@@ -2447,11 +2457,16 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     -- A derived instance is the only one for its type, so it is found by
     -- name rather than among every instance of the class.
     let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
+    let derivable = Option.isSome(derivedMethod(p.name))
     if let TCon(c) = receiver {
-        match Map.get(t.derivations, derivationKey(p.name, c.name)) {
-            Some(Derived(inst)) | Some(Deriving(inst)) ->
-                if let Some(mapping) = match_(inst.head, p.args[0]) { return Some((inst, mapping)) }
-            _ -> {}
+        if derivable {
+            match Map.get(t.derivations, derivationKey(p.name, c.name)) {
+                Some(Derived(inst)) | Some(Deriving(inst)) ->
+                    if let Some(mapping) = match_(inst.head, p.args[0]) {
+                        return Some((inst, mapping))
+                    }
+                _ -> {}
+            }
         }
     }
     for inst in instancesOf(t, p.name) {
@@ -2461,6 +2476,7 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     }
     -- After the table, so that an instance written by hand is the one found
     -- and nothing is derived beside it.
+    if !derivable { return None }
     if let TCon(c) = receiver {
         if let Some(inst) = derive(t, p.name, c.name) {
             if let Some(mapping) = match_(inst.head, p.args[0]) {

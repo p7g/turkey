@@ -1,0 +1,72 @@
+export (apply)
+
+-- An assembled module's fields filled in at their final addresses, for a
+-- writer that lays the sections out itself rather than leaving them to a
+-- linker: every relocation the assembler left, resolved here.
+--
+-- The writer says where each section is loaded, and what address each
+-- symbol from outside the module stands for -- on Mach-O, the stub that
+-- jumps to it. A section it leaves out of the image keeps its relocations
+-- unapplied, and nothing loaded may refer into it.
+--
+-- **No absolute addresses.** An image is loaded at an address chosen when it
+-- runs, so an eight-byte word holding an address is wrong unless the loader
+-- rewrites it: a rebase for a symbol here, a bind for one from outside. The
+-- loaded sections hold none -- the frame table names return addresses by
+-- their distance from the entry -- and one that did is an internal error
+-- here rather than a word that is silently wrong after the image slides.
+
+import Turkey.Asm as Asm
+import Turkey.Asm (Symbol)
+import Turkey.Assembler (Isa(..), Object(..), Relocation(..), Use(..), Definition(..),
+                         SectionData(..))
+
+-- Fills in every relocated field of `obj`'s loaded sections, in place.
+-- `addresses` holds each section's load address, by index, or -1 for one
+-- left out of the image. `imported` returns the address standing for a
+-- symbol `obj` does not define. Raises an internal error for a field that
+-- would need the loader to rewrite it, or that refers into a section left
+-- out.
+fun apply(isa : Isa i f, obj : Object f, addresses : Array Int,
+          imported : fun(Symbol) -> Int) -> Unit {
+    let defined = Map.new()
+    for d in obj.defined { Map.put(defined, Asm.spell(d.symbol), d) }
+    for var k = 0; k < len(obj.sections); k = k + 1 {
+        let base = addresses[k]
+        if base < 0 { continue }
+        let s = obj.sections[k]
+        for r in s.relocations {
+            let place = base + r.offset
+            match r.use {
+                Code(field) -> isa.patch(field, s.bytes, r.offset, place,
+                                         address(defined, addresses, imported, r.target))
+                Relative32 -> Byte.putLE(s.bytes, r.offset, 4,
+                                         address(defined, addresses, imported, r.target) - place)
+                Relative64 -> Byte.putLE(s.bytes, r.offset, 8,
+                                         address(defined, addresses, imported, r.target) - place)
+                Address64 -> error("internal error: the address of " + Asm.spell(r.target)
+                                   + " is stored in the image, which would need the loader "
+                                   + "to rewrite it")
+                Offset32 -> match Map.get(defined, Asm.spell(r.target)) {
+                    Some(d) -> Byte.putLE(s.bytes, r.offset, 4, d.offset)
+                    None -> error("internal error: the section offset of "
+                                  + Asm.spell(r.target) + " has no definition")
+                }
+            }
+        }
+    }
+}
+
+-- The address `sym` is loaded at.
+fun address(defined : Map String Definition, addresses : Array Int,
+            imported : fun(Symbol) -> Int, sym : Symbol) -> Int =
+    match Map.get(defined, Asm.spell(sym)) {
+        Some(d) -> {
+            if addresses[d.section] < 0 {
+                error("internal error: " + Asm.spell(sym)
+                      + " is referred to from the image and is not in it")
+            }
+            addresses[d.section] + d.offset
+        }
+        None -> imported(sym)
+    }

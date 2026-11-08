@@ -1,0 +1,93 @@
+export (size, sign)
+
+-- An ad-hoc code signature, as the linker writes one into an arm64 Mach-O
+-- executable: no certificate, only the SHA-256 of each 4KB page of the file
+-- before the signature. The kernel refuses to run arm64 code that has none.
+--
+-- The signature is an embedded-signature superblob holding one blob, a code
+-- directory, version 0x20400 (the first with the executable segment's
+-- bounds). Every field is big-endian. The directory carries no special
+-- slots: an executable with no `Info.plist`, entitlements or requirements
+-- has nothing for them to hash, and `codesign -v` accepts the signature
+-- without them, as it does the linker's.
+--
+-- Nothing in it depends on when or where it was made, so the same file
+-- signs to the same bytes on any host.
+
+import Hash.SHA256 as SHA256
+
+let pageShift = 12
+let pageSize = 1 << pageShift
+let superBlobSize = 20
+let directorySize = 88
+let hashSize = 32
+
+-- `CS_ADHOC | CS_LINKER_SIGNED`: no signer, and a signature a later
+-- `codesign` may replace without being asked to force it.
+let adhocFlags = 0x20002
+
+-- `CS_EXECSEG_MAIN_BINARY`.
+let mainBinary = 1
+
+-- Returns the size in bytes of the signature of a file whose first `limit`
+-- bytes it covers, under `identifier`.
+fun size(identifier : String, limit : Int) -> Int =
+    superBlobSize + directoryLength(identifier, limit)
+
+fun directoryLength(identifier : String, limit : Int) -> Int =
+    directorySize + len(String.toBytes(identifier)) + 1 + hashSize * slots(limit)
+
+fun slots(limit : Int) -> Int = (limit + pageSize - 1) / pageSize
+
+-- Writes the signature of `file`'s first `limit` bytes at `limit`, taking
+-- `size(identifier, limit)` bytes there. `text` is the file offset and size
+-- of the segment holding the code, which the directory records.
+fun sign(file : Array Byte, limit : Int, identifier : String, text : (Int, Int)) -> Unit {
+    let (textOffset, textSize) = text
+    let name = String.toBytes(identifier)
+    let length = directoryLength(identifier, limit)
+    let n = slots(limit)
+    let be = fun(at, width, value) = Byte.putBE(file, limit + at, width, value)
+    -- The superblob: its magic, its length, one blob, and that blob's slot
+    -- (the code directory's, 0) and offset.
+    be(0, 4, 0xFADE0CC0)
+    be(4, 4, superBlobSize + length)
+    be(8, 4, 1)
+    be(12, 4, 0)
+    be(16, 4, superBlobSize)
+    let d = superBlobSize
+    be(d, 4, 0xFADE0C02)
+    be(d + 4, 4, length)
+    be(d + 8, 4, 0x20400)
+    be(d + 12, 4, adhocFlags)
+    -- Where the hashes start, then the identifier.
+    be(d + 16, 4, directorySize + len(name) + 1)
+    be(d + 20, 4, directorySize)
+    -- No special slots, then the code slots and the bytes they cover.
+    be(d + 24, 4, 0)
+    be(d + 28, 4, n)
+    be(d + 32, 4, limit)
+    -- The hash's size and kind (SHA-256), no platform, and the page size as
+    -- a power of two.
+    be(d + 36, 1, hashSize)
+    be(d + 37, 1, 2)
+    be(d + 38, 1, 0)
+    be(d + 39, 1, pageShift)
+    -- A spare word, no scatter list, no team, another spare word, and no
+    -- 64-bit limit, since the 32-bit one holds it.
+    for var k = 40; k < 64; k = k + 4 { be(d + k, 4, 0) }
+    be(d + 64, 8, textOffset)
+    be(d + 72, 8, textSize)
+    be(d + 80, 8, mainBinary)
+    let at = limit + d + directorySize
+    for var k = 0; k < len(name); k = k + 1 { file[at + k] = name[k] }
+    file[at + len(name)] = Byte.truncate(0)
+    let hashes = at + len(name) + 1
+    for var page = 0; page < n; page = page + 1 {
+        let from = page * pageSize
+        let h = SHA256.new()
+        SHA256.update(h, file, from, min(from + pageSize, limit))
+        let digest = SHA256.finish(h)
+        for var k = 0; k < hashSize; k = k + 1 { file[hashes + page * hashSize + k] = digest[k] }
+    }
+}

@@ -237,12 +237,17 @@ type PredCell = PredCell {
     -- Whether the superclasses of this class wanted have been expanded.
     var expanded : Bool,
     -- Whether this is a superclass of an instance's head that the
-    -- instance's declaration must prove: GHC's `ScOrigin NakedSc`. Its
-    -- evidence may not be selected from a given no smaller than the head
-    -- (`granted`, `matchableGiven`), so that a superclass is never proved by
-    -- the dictionary it belongs to (Note [Recursive superclasses]). What an
-    -- instance it is solved by demands is not naked.
+    -- instance's declaration must prove: GHC's `ScOrigin NakedSc`. It may be
+    -- solved by a given itself, but not through the superclasses of a given
+    -- no smaller than the head (`granted`, `matchableGiven`), so that a
+    -- superclass is never proved by the dictionary it belongs to (Note
+    -- [Recursive superclasses]). What an instance it is solved by demands is
+    -- not naked.
     naked    : Bool,
+    -- Whether this arose below a naked wanted, from the instance that solved
+    -- it: its root is that superclass, and a diagnostic says so
+    -- (`superclassOrigin`).
+    belowSuper : Bool,
     -- The predicate as the cell was created, before solving rewrote it. An
     -- equality's coercion has this type (`ByCoercion`).
     posed    : Pred,
@@ -268,7 +273,7 @@ fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> Pre
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
         serial = serials.next, stuck = 0, depth = 0, root = p, superclass = False,
-        expanded = False, naked = False, posed = p,
+        expanded = False, naked = False, belowSuper = False, posed = p,
     }
 }
 
@@ -279,7 +284,7 @@ fun nakedCell(p : Pred, where : Option Span, context : String, hole : Hole) -> P
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
         serial = serials.next, stuck = 0, depth = 0, root = p, superclass = False,
-        expanded = False, naked = True, posed = p,
+        expanded = False, naked = True, belowSuper = False, posed = p,
     }
 }
 
@@ -293,7 +298,7 @@ fun subgoal(parent : PredCell, p : Pred, where : Option Span, context : String,
         pred = p, span = where, context = context, hole = hole, at = None,
         stage = Queued, serial = serials.next, stuck = 0, depth = parent.depth + 1,
         root = parent.root, superclass = parent.superclass, expanded = False,
-        naked = False, posed = p,
+        naked = False, belowSuper = parent.naked || parent.belowSuper, posed = p,
     }
 }
 
@@ -305,7 +310,7 @@ fun superclassOf(parent : PredCell, p : Pred) -> PredCell {
         pred = p, span = parent.span, context = parent.context, hole = newHole(),
         at = parent.at, stage = Queued, serial = serials.next, stuck = 0,
         depth = parent.depth + 1, root = parent.root, superclass = True, expanded = False,
-        naked = False, posed = p,
+        naked = False, belowSuper = parent.naked || parent.belowSuper, posed = p,
     }
 }
 
@@ -770,7 +775,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         let named = Vec.new(len(givens))
         for (n, p, at) in givens {
             Vec.push(named, (n, p))
-            Vec.push(written, Given { pred = p, span = at })
+            Vec.push(written, Given { pred = p, span = at, grantedBy = None })
             if p.name != Ty.equals {
                 -- GHC's `newly_blocked (InstSkol _ head_size)`: a superclass
                 -- of an instance given is blocked unless the given is
@@ -881,8 +886,12 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 fun refusedHere(r : Inert.Refusal, body : Constraint) -> Bool = match r {
     Never(g, why) -> match g.span {
         Some(_) -> {
-            Ty.typeError("the equality '" + Ty.showPred(g.pred) + "' in this context "
-                         + "can never hold; " + why, g.span)
+            let what = match g.grantedBy {
+                Some(cp) -> "'" + Ty.showPred(cp) + "' grants '" + Ty.showPred(g.pred)
+                            + "', which in this context"
+                None -> "the equality '" + Ty.showPred(g.pred) + "' in this context"
+            }
+            Ty.typeError(what + " can never hold; " + why, g.span)
             False
         }
         None -> True
@@ -2518,7 +2527,10 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         None -> {
             if Classes.isGenerated(p.name) && noField(s, p, t, c) { return True }
             if c.naked { return missingSuperclass(s, c) }
-            Ty.typeError("no instance for '" + Ty.showPred(p) + "'", c.span)
+            match superclassOrigin(s, c, p) {
+                Some(origin) -> Ty.typeError(origin + ", but there is no such instance", c.span)
+                None -> Ty.typeError("no instance for '" + Ty.showPred(p) + "'", c.span)
+            }
             True
         }
         Some((inst, mapping)) -> {
@@ -2536,6 +2548,12 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
                 solve(s, CPred(subgoal(c, obligations[i], c.span, c.context, holes[i])))
             }
             let context = "the context of the instance '" + Classes.showDeclared(inst) + "'"
+                          + match s.here.checks {
+                              Some(h) -> if c.naked || c.belowSuper {
+                                  ", which the superclasses of '" + Ty.showPred(h) + "' need"
+                              } else { "" }
+                              None -> ""
+                          }
             for var i = 0; i < len(equalities); i = i + 1 {
                 solve(s, CPred(subgoal(c, equalities[i], c.span, context,
                                        holes[len(obligations) + i])))
@@ -2555,11 +2573,24 @@ fun missingSuperclass(s : Solver, c : PredCell) -> Bool {
     }
     let shown = "'" + Ty.showPred(c.pred) + "' is required by '" + cls + "'"
     match blockedGiven(s, c.pred) {
-        Some(g) -> reported(shown + ", but a superclass can come from the superclasses of '"
-                            + Ty.showPred(g) + "' only if it is smaller than the instance "
-                            + "head; add '" + Ty.showPred(c.pred) + "' to the context", c.span)
+        Some(g) -> reported(shown + ", and it cannot come from the superclasses of the "
+                            + "context's '" + Ty.showPred(g) + "', which is about the head "
+                            + "itself; add '" + Ty.showPred(c.pred) + "' to the context", c.span)
         None -> reported(shown + ", but there is no such instance", c.span)
     }
+}
+
+-- Returns what a wanted `c`, now `p`, that arose below a superclass of an
+-- instance's head was demanded for, in the words a diagnostic starts with:
+-- "'B (W t)' needs 'A (W t)', whose instance needs 'B t'". `None` for any
+-- other wanted. Every type is spelled as a context writes it, since the fix
+-- is to write `p` into the instance's context.
+fun superclassOrigin(s : Solver, c : PredCell, p : Pred) -> Option String {
+    if !c.belowSuper { return None }
+    let h = s.here.checks?
+    let which = if c.depth == 1 { "whose instance needs" } else { "which needs" }
+    Some("'" + Ty.showWritten(h) + "' needs '" + Ty.showWritten(c.root) + "', " + which
+         + " '" + Ty.showWritten(p) + "'")
 }
 
 -- Field evidence reveals representation just as a constructor pattern does.
@@ -3034,6 +3065,11 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
         }
         None -> {}
     }
+    -- Below a superclass of an instance's head, the fix is in that instance's
+    -- context, so the message says what the wanted was needed for.
+    if let Some(origin) = superclassOrigin(s, c, c.pred) {
+        return Ty.typeError(origin + "; add it to the context", c.span)
+    }
     if c.pred.name == Ty.equals {
         -- An equality that reaches here is not wrong, it is undecidable, and the
         -- blame goes on the family rather than on what it was compared with:
@@ -3063,10 +3099,35 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
                                                   + "' is taken", c.span)
             None -> {}
         }
-        let where = if c.context == "" { "" } else { " in " + c.context }
         -- Name the remedy. It is not "add a type annotation": an equality is
         -- something a context can state, and stating it is what fixes this.
         let equality = Ty.showWritten(Ty.pred(Ty.equals, [fam, other]))
+        -- An equality superclass of an instance's head, which its context
+        -- does not decide.
+        if c.naked {
+            let n = Ty.namer("")
+            n.bare = True
+            let h = match s.here.checks {
+                Some(checked) -> "'" + Ty.showWritten(checked) + "' requires '"
+                None -> "the instance requires '"
+            }
+            let required = h + Ty.showWritten(c.posed) + "'"
+            -- A skolem is a nullary constructor that no instance covers, so
+            -- only a family over a type without one is missing an instance.
+            if let TFam(name, arg, _) = Ty.prune(fam) {
+                let missing = if len(Ty.skolemsOf([arg])) == 0 {
+                    Classes.uncovered(s.classes, name, arg)
+                } else { None }
+                if let Some(missing) = missing {
+                    return Ty.typeError(required + ", and there is no instance '"
+                                        + Ty.showWritten(missing) + "' to define it", c.span)
+                }
+            }
+            return Ty.typeError(required + ", and its context cannot tell whether '"
+                                + Ty.showAt(fam, n, 1) + "' is '" + Ty.showAt(other, n, 1)
+                                + "'; add '" + equality + "' to the context", c.span)
+        }
+        let where = if c.context == "" { "" } else { " in " + c.context }
         return Ty.typeError("cannot tell whether '" + Ty.show(fam) + "' is '"
                             + Ty.show(other) + "'" + where + "; add '" + equality
                             + "' to the context", c.span)

@@ -871,7 +871,10 @@ them can mix integers, strings and options, and they all have the one type
 Each entry in the bracket is either a bare type variable, which hides a type
 with no requirements, or a class applied to a type variable, as in `Show a`,
 which hides the type and also stores that class's instance for it. A variable
-in the bracket must not also be one of the type's parameters.
+in the bracket must not also be one of the type's parameters. A class in
+the bracket must constrain a type the fields decide: `Hidden[Show a](Int)` is
+refused as [ambiguous](inference.md#ambiguity), since building one could never
+choose the instance.
 
 **Building** an existential value is an ordinary constructor call. Its hidden
 types are the types of the arguments, and the instances the bracket asks for

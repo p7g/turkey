@@ -193,8 +193,7 @@ def test_a_declared_context_is_asked_for_rather_than_asserted():
 def test_a_declared_context_over_a_variable_the_type_omits_is_ambiguous():
     src = EQ + "fun f[Egal b](x : Int) -> Int = x"
     assert bad(src) == (
-        "'Egal b' constrains a type variable that the declared type of 'f' "
-        "does not mention; remove it from the context"
+        "the type of 'f' is ambiguous: no use of 'f' can determine 'b'"
     )
 
 

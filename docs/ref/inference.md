@@ -480,8 +480,44 @@ fun main() {
 }
 ```
 
-A signature that states a constraint on a variable its type does not mention
-is rejected for the same reason, where it is written.
+A **type** is ambiguous when no use of it could decide one of its variables,
+and an ambiguous type is rejected where it is declared, whether a signature
+writes it or it is inferred. The test is whether the type is as general as
+itself: a use instantiates each variable with an unknown type, matches the
+type it gets against the declared one, and must then satisfy the context from
+what that match decided. A variable that the context constrains and the match
+leaves unknown is one that no call can decide either:
+
+<!-- error: the type of 'f' is ambiguous: no use of 'f' can determine 'b' -->
+```kotlin
+fun f[Show b](x : Int) -> Int = x
+
+fun main() {
+    print(f(1))
+}
+```
+
+The match decides a variable that appears in a parameter or the result,
+outside any [associated type](classes.md#associated-types). Through the
+context, it also decides a variable on one side of an
+[equality](classes.md#equality-constraints) whose other side it has decided:
+in `[Iterator s, Item s ~ e, Show e]`, a use that decides `s` decides `e`. A
+variable that appears only as the argument of an associated type is not
+decided, since an associated type is not injective:
+
+<!-- error: the type of 'first' is ambiguous: no use of 'first' can determine 's' -->
+```kotlin
+fun first[Iterator s](x : Item s) -> Int = 0
+
+fun main() {
+    print(first(1))
+}
+```
+
+Many iterators have `Int` elements, so a call with an `Int` cannot tell which
+`Iterator` instance it is to use. Each of a class's method types and each
+[existential](types.md#existential-types) constructor's type is held to the
+same rule.
 
 ## Where annotations are needed
 

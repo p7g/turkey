@@ -40,7 +40,7 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        Skolems(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..),
-                           PredCell(..), LetCell(..))
+                           PredCell(..), LetCell(..), Ambiguity(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
@@ -344,6 +344,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     bindMethods(g)
     bindForeigns(g, foreigns)
     checkDefinitions(g, items)
+    checkDeclaredAmbiguity(g, typeDecls, classDecls)
 
     -- The graph is keyed by item, not by bound name: a single binding may
     -- introduce several names, and keying by name would split one item across
@@ -426,6 +427,50 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     genMethodBodies(g, classDecls, instDecls)
     genDerived(g)
     (ordered, pop(g))
+}
+
+-- Emits the ambiguity check (`C.checkAmbiguity`) of each class method's
+-- type and each existential constructor's type that `typeDecls` and
+-- `classDecls` declare, as GHC's `checkValidClass` and `checkValidDataCon`
+-- check the type of a method selector and of a constructor wrapper. A
+-- function's signature is checked with its group (`buildFunGroup`).
+fun checkDeclaredAmbiguity(g : Generator, typeDecls : Vec TypeDecl,
+                           classDecls : Vec ClassDecl) -> Unit {
+    for decl in classDecls {
+        let info = classNamed(g, decl.name)
+        for m in decl.methods {
+            if let Some(mi) = Map.get(info.methods, m.name) {
+                -- The class predicate comes first, and no context wrote it.
+                let written = Vec.new(len(mi.scheme.preds))
+                Vec.push(written, None)
+                for p in m.context { Vec.push(written, Some(p.span)) }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = Ty.bareName(m.name), scheme = mi.scheme, span = Some(m.span),
+                    written = written, names = mi.names, inferred = False,
+                }))
+            }
+        }
+    }
+    for decl in typeDecls {
+        let variants = match decl.variants {
+            Some(vs) -> vs
+            None -> continue
+        }
+        for con in variants {
+            if len(con.context) == 0 { continue }
+            if let Some(ci) = Map.get(g.decls.constructors, con.name) {
+                let names = Map.new()
+                for var i = 0; i < len(ci.exists) && i < len(ci.existsNames); i = i + 1 {
+                    Map.put(names, ci.exists[i].id, ci.existsNames[i])
+                }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = con.name, scheme = ci.scheme, span = Some(con.span),
+                    written = Vec.map(con.context, fun(p) = Some(p.span)), names = names,
+                    inferred = False,
+                }))
+            }
+        }
+    }
 }
 
 fun itemNames(item : Stmt) -> Vec String = match item.kind {
@@ -1109,35 +1154,33 @@ fun declaredScheme(g : Generator,
         }
     }
     let body = TFun(params, retType)
-    -- The ambiguity test the inference path applies at generalization, run here
-    -- instead, where it is purely syntactic: a written context that constrains a
-    -- variable the type does not reach can never be decided by a use site,
-    -- because there is nothing at a use site to decide it with.
-    let cells = Array.map(preds, fun(p) = C.newCell(p, Some(decl.span), "read", newHole()))
-    let ids = C.reach(cells, [body])
-    -- Blamed in the names the signature wrote, not in the letters printing would
-    -- invent: the whole point of a declared type is that it is the programmer's
-    -- text, so a complaint about it should quote that text.
-    let written = Ty.namer("")
-    for (name, v) in Map.entries(tyvars) {
-        match v {
-            TVar(cell) -> Map.put(written.names, cell.id, name)
-            _ -> {}
-        }
-    }
+    -- A constraint is about the function's type variables: a class applied to
+    -- one or to a type built from one. Whether the type determines them is
+    -- the ambiguity check's business (`ambiguityOf`).
     for var i = 0; i < len(preds) && i < len(decl.context); i = i + 1 {
-        var touches = False
-        for v in Ty.varsOf(preds[i].args) {
-            if Set.contains(ids, v.id) { touches = True }
-        }
-        if !touches {
-            Ty.typeError("'" + Ty.showPredWith(preds[i], written) + "' constrains a type "
-                         + "variable that the declared type of '" + decl.name + "' does "
-                         + "not mention; remove it from the context",
-                         Some(decl.context[i].span))
+        if len(Ty.varsOf(preds[i].args)) == 0 {
+            Ty.typeError("'" + Ty.showWritten(preds[i]) + "' constrains no type variable; "
+                         + "remove it from the context", Some(decl.context[i].span))
         }
     }
     Some((Ty.scheme(quantified, body, preds), tyvars))
+}
+
+-- Returns the check that the signature of `decl`, which declares `s` over
+-- the variables `tyvars`, is not ambiguous (`C.checkAmbiguity`). An ambiguous
+-- signature is reported in the names the signature wrote: the whole point of a
+-- declared type is that it is the programmer's text, so a complaint about it
+-- should quote that text.
+fun ambiguityOf(decl : FunDecl, s : Scheme, tyvars : Map String Ty.Type) -> Constraint {
+    let names = Map.new()
+    for (name, v) in Map.entries(tyvars) {
+        if let TVar(cell) = v { Map.put(names, cell.id, name) }
+    }
+    let written = Vec.map(decl.context, fun(p) = Some(p.span))
+    CAmbiguity(C.Ambiguity {
+        name = decl.name, scheme = s, span = Some(decl.span), written = written,
+        names = names, inferred = False,
+    })
 }
 
 -- Check a body against the type its `fun` declared.
@@ -1536,6 +1579,7 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
     }
     push(g)
     for (decl, s, tyvars) in checks {
+        emit(g, ambiguityOf(decl, s, tyvars))
         emit(g, checkSignature(g, decl, s, tyvars))
     }
     for var i = 0; i < len(inferred); i = i + 1 {

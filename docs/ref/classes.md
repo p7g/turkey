@@ -513,7 +513,10 @@ to one of those variables, which guarantees that working out an associated
 type always terminates.
 
 An associated type is not *injective*: knowing `Elem c` says nothing about
-`c`, because different containers can have the same element type.
+`c`, because different containers can have the same element type. So a
+signature whose type mentions `c` only as `Elem c`, as in `fun f[Container
+c](x : Elem c) -> Int`, is [ambiguous](inference.md#ambiguity), and so is a
+context `[Container c, Elem c ~ Elem d]` whose type decides `c` and not `d`.
 
 > **For readers new to this.** An associated type is a *type family*: a
 > function from types to types, defined piece by piece by instances. It lets

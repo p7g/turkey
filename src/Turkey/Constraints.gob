@@ -1,12 +1,13 @@
 export (
     oneOf,
     Constraint(..), Instantiates(..), PredCell(..), Stage(..), Implication(..), LetCell(..),
+    Ambiguity(..),
     cpredOf, cpredInto, newCell, nakedCell,
     noBinder,
     Binding(..), Env(..), newEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
     fresh, adopt, rank,
-    reach, refusedHere,
+    refusedHere,
 )
 
 -- The constraint language, and the solver that settles it.
@@ -31,6 +32,7 @@ export (
 --     forall k. Q => C   CAssume     an implication: the obligations a signature
 --                                    grants, over the skolems it makes
 --     evidence for P     CUse        a site that needs a dictionary it did not ask for
+--     sigma <= sigma     CAmbiguity  a scheme some use can instantiate
 --
 -- **Ranks live here, not in the generator.** A variable's rank is the depth of
 -- the binder it was created under, and `CLet` is where that depth changes -- so
@@ -217,6 +219,27 @@ type Constraint
     -- first error, the rest of what it reports is dropped. The generator puts
     -- one around each top-level binding group's definition.
     | CUnit(Constraint)
+    -- Check that a use of a declared scheme can be solved, and report the
+    -- scheme as ambiguous otherwise (`checkAmbiguity`). Solving it binds
+    -- nothing and leaves nothing behind.
+    | CAmbiguity(Ambiguity)
+
+-- A scheme to check for ambiguity, and how to report it.
+type Ambiguity = Ambiguity {
+    -- The binder whose scheme it is, as the tree spells it.
+    name     : String,
+    scheme   : Scheme,
+    -- Where the scheme was declared or inferred.
+    span     : Option Span,
+    -- Where a context wrote each of the scheme's predicates, by index, or
+    -- `None` for one no context wrote.
+    written  : Vec (Option Span),
+    -- The name each quantified variable was written with, by variable id.
+    -- An inferred scheme has none, and its variables are named as it is
+    -- printed.
+    names    : Map Int String,
+    inferred : Bool,
+}
 
 -- A wanted keeps its identity while it moves between its implication's work
 -- list and inert set, and is rewritten where it stands, so it is a record
@@ -816,97 +839,12 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         solve(s, body)
     }
     CAssume(givens, head, body) -> {
-        let outside = s.here
-        let assumptions = Vec.slice(outside.assumptions, 0, len(outside.assumptions))
-        let blocked = Set.new()
-        for i in Set.elements(outside.blocked) { Set.add(blocked, i) }
-        var untouchable = outside.untouchable
-        var inert = outside.inert
-        let written = Vec.new(len(givens))
-        let named = Vec.new(len(givens))
-        for (n, p, at) in givens {
-            Vec.push(named, (n, p))
-            Vec.push(written, Given { pred = p, span = at, grantedBy = None })
-            if p.name != Ty.equals {
-                -- GHC's `newly_blocked (InstSkol _ head_size)`: a superclass
-                -- of an instance given is blocked unless the given is
-                -- Paterson-smaller than the head. Every link of a chain of
-                -- superclasses has the given's own argument, and so its size.
-                if let Some(h) = head {
-                    if !Classes.patersonSmaller(p, h) { Set.add(blocked, len(assumptions)) }
-                }
-                Vec.push(assumptions, (n, p))
-            }
+        let (skolems, owner) = match body {
+            CLet(cell) -> (cell.skolems, if len(cell.binds) == 0 { "" } else { cell.binds[0].1 })
+            _ -> (Vec.new(0), "")
         }
-        let skolems = match body {
-            CLet(cell) -> cell.skolems
-            _ -> Vec.new(0)
-        }
-        -- The equalities written here, and those the class givens' equality
-        -- superclasses grant.
-        let equalities = Inert.granted(s.classes, Vec.toArray(written))
-        -- The inert set this implication made, if it made one: only that one
-        -- is closed on the way out (`Inert.close`), never the enclosing one it
-        -- extends or shares.
-        var made = None
-        var inaccessible = False
-        var givenEqs = False
-        if len(equalities) > 0 {
-            -- Breakers at the rank of the body's `CLet`, so the equalities
-            -- defining them stay inside the implication.
-            let (extended, refused) = Inert.extendAt(outside.inert, equalities, rank(s) + 1)
-            for r in refused {
-                if refusedHere(r, body) { inaccessible = True }
-            }
-            inert = extended
-            made = Some(extended)
-            -- A given that was refused is not in the set, but it is an
-            -- equality all the same, as GHC's `updGivenEqs` counts every
-            -- given that "is an equality ... or /might/ be".
-            givenEqs = len(refused) > 0 || hasGivenEqs(extended, outside.inert, skolems, rank(s))
-        }
-        if givenEqs && rank(s) > untouchable { untouchable = rank(s) }
-        s.entered = s.entered + 1
-        let owner = match body {
-            CLet(cell) -> if len(cell.binds) == 0 { "" } else { cell.binds[0].1 }
-            _ -> ""
-        }
-        let checks = match head {
-            Some(h) -> Some(h)
-            None -> outside.checks
-        }
-        let inside = nested(s.classes, s.entered, assumptions, blocked, checks, inert,
-                            untouchable, skolems, givenEqs, made, inaccessible, owner,
-                            Some(outside))
-        s.here = inside
-        let assumed = newScope()
-        assumed.givens = named
-        Vec.push(s.scopes, assumed)
-        -- A given no context here wrote, and that can never hold, makes the body
-        -- *inaccessible*: an override checked under it can never be called
-        -- (System FC, Sulzmann et al. 2007, §3.5). So the body is solved, but
-        -- nothing it reports is shown, as GHC treats an implication whose givens
-        -- are insoluble.
-        let firstUse = len(s.uses)
-        if inaccessible { Diag.beginMuted() }
-        solve(s, body)
-        solveWanteds(s)
-        if inaccessible {
-            Diag.endMuted()
-            for var i = firstUse; i < len(s.uses); i = i + 1 { s.uses[i].inaccessible = True }
-        }
-        match made {
-            Some(i) -> Inert.close(i)
-            None -> {}
-        }
-        s.here = outside
-        discard(Vec.pop(s.scopes))
-        -- What is left stays in this implication, with its givens, as GHC
-        -- keeps an unsolved implication in its parent's `wc_impl`: nothing
-        -- floats out of an implication. A unification outside may wake one of
-        -- its wanteds, and then it is solved here again (`solveNested`); a
-        -- binding group reads its candidates out of it (`approximate`).
-        if unsolved(inside) { Vec.push(outside.children, inside) }
+        assume(s, givens, head, skolems, owner, assumptionSpan(body), False,
+               fun() = solve(s, body))
     }
     CDef(binds, body, top) -> {
         if top { decideTopLevelLiterals(s) }
@@ -942,13 +880,108 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         solve(s, body)
         discard(Diag.endUnit())
     }
+    CAmbiguity(a) -> checkAmbiguity(s, a)
+}
+
+-- Solves `inner` in a new implication nested in `s.here`, with `givens`,
+-- binding `skolems`, for the declaration `owner`: the implication of a
+-- `CAssume`. The implication's level is the rank `inner` pushes, one deeper
+-- than the current one. A given that can never hold is reported at `where`
+-- if no context wrote it. `sealed` makes every variable born outside the
+-- implication untouchable inside it, whatever the givens are.
+fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option Pred,
+           skolems : Vec ConCell, owner : String, where : Option Span, sealed : Bool,
+           inner : fun() -> Unit) -> Unit {
+    let outside = s.here
+    let assumptions = Vec.slice(outside.assumptions, 0, len(outside.assumptions))
+    let blocked = Set.new()
+    for i in Set.elements(outside.blocked) { Set.add(blocked, i) }
+    var untouchable = outside.untouchable
+    var inert = outside.inert
+    let written = Vec.new(len(givens))
+    let named = Vec.new(len(givens))
+    for (n, p, at) in givens {
+        Vec.push(named, (n, p))
+        Vec.push(written, Given { pred = p, span = at, grantedBy = None })
+        if p.name != Ty.equals {
+            -- GHC's `newly_blocked (InstSkol _ head_size)`: a superclass
+            -- of an instance given is blocked unless the given is
+            -- Paterson-smaller than the head. Every link of a chain of
+            -- superclasses has the given's own argument, and so its size.
+            if let Some(h) = head {
+                if !Classes.patersonSmaller(p, h) { Set.add(blocked, len(assumptions)) }
+            }
+            Vec.push(assumptions, (n, p))
+        }
+    }
+    -- The equalities written here, and those the class givens' equality
+    -- superclasses grant.
+    let equalities = Inert.granted(s.classes, Vec.toArray(written))
+    -- The inert set this implication made, if it made one: only that one
+    -- is closed on the way out (`Inert.close`), never the enclosing one it
+    -- extends or shares.
+    var made = None
+    var inaccessible = False
+    var givenEqs = False
+    if len(equalities) > 0 {
+        -- Breakers at the rank of the body's `CLet`, so the equalities
+        -- defining them stay inside the implication.
+        let (extended, refused) = Inert.extendAt(outside.inert, equalities, rank(s) + 1)
+        for r in refused {
+            if refusedHere(r, where) { inaccessible = True }
+        }
+        inert = extended
+        made = Some(extended)
+        -- A given that was refused is not in the set, but it is an
+        -- equality all the same, as GHC's `updGivenEqs` counts every
+        -- given that "is an equality ... or /might/ be".
+        givenEqs = len(refused) > 0 || hasGivenEqs(extended, outside.inert, skolems, rank(s))
+    }
+    if (givenEqs || sealed) && rank(s) > untouchable { untouchable = rank(s) }
+    s.entered = s.entered + 1
+    let checks = match head {
+        Some(h) -> Some(h)
+        None -> outside.checks
+    }
+    let inside = nested(s.classes, s.entered, assumptions, blocked, checks, inert,
+                        untouchable, skolems, givenEqs, made, inaccessible, owner,
+                        Some(outside))
+    s.here = inside
+    let assumed = newScope()
+    assumed.givens = named
+    Vec.push(s.scopes, assumed)
+    -- A given no context here wrote, and that can never hold, makes the body
+    -- *inaccessible*: an override checked under it can never be called
+    -- (System FC, Sulzmann et al. 2007, §3.5). So the body is solved, but
+    -- nothing it reports is shown, as GHC treats an implication whose givens
+    -- are insoluble.
+    let firstUse = len(s.uses)
+    if inaccessible { Diag.beginMuted() }
+    inner()
+    solveWanteds(s)
+    if inaccessible {
+        Diag.endMuted()
+        for var i = firstUse; i < len(s.uses); i = i + 1 { s.uses[i].inaccessible = True }
+    }
+    match made {
+        Some(i) -> Inert.close(i)
+        None -> {}
+    }
+    s.here = outside
+    discard(Vec.pop(s.scopes))
+    -- What is left stays in this implication, with its givens, as GHC
+    -- keeps an unsolved implication in its parent's `wc_impl`: nothing
+    -- floats out of an implication. A unification outside may wake one of
+    -- its wanteds, and then it is solved here again (`solveNested`); a
+    -- binding group reads its candidates out of it (`approximate`).
+    if unsolved(inside) { Vec.push(outside.children, inside) }
 }
 
 -- Reports the refusal `r` of an implication's given where its context wrote
--- it, and returns whether it instead makes the implication, whose body is
--- `body`, inaccessible: a given that can never hold and that no context here
--- wrote.
-fun refusedHere(r : Inert.Refusal, body : Constraint) -> Bool = match r {
+-- it, and returns whether it instead makes the implication inaccessible: a
+-- given that can never hold and that no context here wrote. The implication
+-- checks the declaration at `where`.
+fun refusedHere(r : Inert.Refusal, where : Option Span) -> Bool = match r {
     Never(g, why) -> match g.span {
         Some(_) -> {
             let what = match g.grantedBy {
@@ -964,7 +997,7 @@ fun refusedHere(r : Inert.Refusal, body : Constraint) -> Bool = match r {
     GaveUp(g, left) -> {
         Ty.typeError("cannot resolve the equalities in this context: the checker "
                      + "gave up with " + Int.toString(left) + " of them still to "
-                     + "add; state fewer of them", firstSpan(g.span, assumptionSpan(body)))
+                     + "add; state fewer of them", firstSpan(g.span, where))
         False
     }
 }
@@ -1399,6 +1432,7 @@ fun openRefs(c : Constraint, open : Map Int String, out : Vec Int) -> Unit = mat
     }
     CUse(_) -> {}
     CUnit(body) -> openRefs(body, open, out)
+    CAmbiguity(_) -> {}
 }
 
 -- A top-level binding group is a unit (`Diag.beginUnit`), its generalization
@@ -1561,6 +1595,18 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         let b = Binding {
             scheme = Ty.generalize(body, rank(s), preds), mutable = False,
         }
+        -- GHC checks an inferred type as it does a signature (Note [Validity
+        -- of inferred types] in `GHC.Tc.Gen.Bind`), unless the group had an
+        -- error: "if we found an insoluble error in the function definition,
+        -- don't do this check". Nor is it checked after any error, for the
+        -- reason `rejectStranded` reports nothing then: a predicate left open
+        -- after an error is most often open because of it.
+        if !definite && id != noBinder && !Diag.hasErrors() {
+            checkAmbiguity(s, Ambiguity {
+                name = name, scheme = b.scheme, span = c.span, written = [],
+                names = Map.new(), inferred = True,
+            })
+        }
         match c.dicts {
             -- Recorded here because here is the only place it exists: a local
             -- binding's scheme goes into an environment popped as soon as the
@@ -1584,6 +1630,110 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     }
     solve(s, c.body)
     if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
+}
+
+-- Reports `a.scheme` if it is ambiguous: if a use of `a.name` can never be
+-- solved, however its type is decided. Binds nothing outside the check, and
+-- leaves no wanted behind.
+--
+-- This is GHC's `checkAmbiguity` (Note [The ambiguity check for type
+-- signatures] in `GHC.Tc.Validity`), which is subsumption of the scheme by
+-- itself, `tcSubTypeAmbiguity ty ty`: as if `g : sigma; g = f` were checked
+-- for an `f : sigma`. The scheme is skolemised, its predicates becoming the
+-- givens of an implication, and instantiated inside it; the instance's type
+-- is unified with the skolemised type, and its predicates are solved as
+-- wanteds under the givens (`simplifyAmbiguityCheck`). A wanted left over is
+-- one no use can solve either, since a use knows no more about the
+-- variables than the type tells it. In `[Cf a, Cg b, F a ~ G b] fun(a) ->
+-- Int` the instance's `a` becomes the skolem `a`, but `b` stays open: the
+-- wanted `F a ~ G b'` is rewritten by the given to `G b ~ G b'`, which
+-- does not decide `b'` because an associated type need not be injective,
+-- and `Cg b'` cannot be the given `Cg b` until it is.
+--
+-- The variables outside the check are untouchable in it (`sealed`), since
+-- GHC's free variables "are skolemised". Literal defaulting does not run, as
+-- GHC's `tryDefaultingForAmbiguityCheck` defaults no class: `[Add a]
+-- fun(Int) -> Int` is ambiguous, not `Int`'s. That function also defaults
+-- equalities (`defaultEqualities`), which here could only bind one of those
+-- untouchable variables, so that does not run either. Nothing the check
+-- solves is reported, and its evidence is thrown away; a given that can
+-- never hold is reported by the declaration's own check, and makes this one
+-- report nothing.
+fun checkAmbiguity(s : Solver, a : Ambiguity) -> Unit {
+    let sc = a.scheme
+    if len(sc.quantified) == 0 { return {} }
+    let names = Ty.namerFrom(sc.quantified, "_")
+    for (id, written) in Map.entries(a.names) { Map.put(names.names, id, written) }
+    let sk = Classes.newSkolems()
+    for v in sc.quantified {
+        discard(Classes.skolemBind(sk, v, Map.getOr(names.names, v.id, "a")))
+    }
+    let expected = Classes.skolemApply(sk, sc.body)
+    let givens = Vec.map(sc.preds, fun(p) =
+        ("%ambiguity." + p.name, Classes.skolemApplyPred(sk, p), None))
+    -- The residual, and what each quantified variable was instantiated at.
+    let left = Vec.new(1)
+    Diag.beginMuted()
+    assume(s, givens, None, sk.made, "%ambiguity." + a.name, a.span, True, fun() {
+        Vec.push(s.pools, Vec.new(8))
+        for con in sk.made { con.level = rank(s) }
+        let (preds, actual, args) = Ty.instantiateQual(sc, fun() = fresh(s))
+        Ty.unify(actual, expected, a.span, "", families(s))
+        for p in preds { solve(s, cpredInto(p, newHole(), a.span, "")) }
+        solveWanteds(s)
+        let residual = everywhere(s.here)
+        if !s.here.muted && len(residual) > 0 {
+            Vec.push(left, (Vec.map(residual, _.pred), args))
+        }
+        for c in residual { take(c) }
+        s.here.children = Vec.new(0)
+        discard(Vec.pop(s.pools))
+    })
+    Diag.endMuted()
+    if len(left) > 0 {
+        let (residual, args) = left[0]
+        reportAmbiguous(a, names, residual, args)
+    }
+}
+
+-- Reports the ambiguous scheme of `a`, whose check left `residual` with the
+-- scheme's variables instantiated at `args`, and named by `names`.
+--
+-- An instantiated variable still open that the residual mentions is one the
+-- type does not determine: GHC's "The type variable 'b0' is ambiguous". The
+-- first one is named, at the first predicate a context wrote over it.
+fun reportAmbiguous(a : Ambiguity, names : Ty.Namer, residual : Vec Pred,
+                    args : Vec Ty.Type) -> Unit {
+    let sc = a.scheme
+    let open = Set.new()
+    for p in residual {
+        for v in Ty.varsOf(p.args) { Set.add(open, v.id) }
+    }
+    let name = Ty.shortName(a.name)
+    let what = if a.inferred {
+        "the inferred type of '" + name + "', '" + Ty.showScheme(sc) + "', is ambiguous"
+    } else {
+        "the type of '" + name + "' is ambiguous"
+    }
+    for var i = 0; i < len(args); i = i + 1 {
+        if let TVar(v) = Ty.prune(args[i]) {
+            if !Set.contains(open, v.id) { continue }
+            let q = sc.quantified[i]
+            var at = a.span
+            for var j = 0; j < len(sc.preds) && j < len(a.written); j = j + 1 {
+                if Option.isSome(a.written[j])
+                   && Iterator.any(Ty.varsOf(sc.preds[j].args), fun(u) = u.id == q.id) {
+                    at = a.written[j]
+                    break
+                }
+            }
+            Ty.typeError(what + ": no use of '" + name + "' can determine '"
+                         + Map.getOr(names.names, q.id, "a") + "'", at)
+            return {}
+        }
+    }
+    Ty.typeError(what + ": no use of '" + name + "' can satisfy '"
+                 + Ty.showPredWith(residual[0], names) + "'", a.span)
 }
 
 -- Returns whether `c` arose in `impl` itself, not in an implication nested
@@ -3605,13 +3755,18 @@ fun unknownReceiver(what : String, where : Option Span) -> Unit =
 
 -- -- context splitting -------------------------------------------------------------
 
--- The variables `types` pin, following predicates to a fixed point.
+-- The variables `types` reach, following predicates to a fixed point: a
+-- predicate that mentions a reached variable reaches all of its variables.
 --
--- Membership is transitive because a `HasField` is a *function* of its receiver:
--- fix the record and the field type follows. So a variable that appears nowhere
--- in the type is still determined, as long as some chain of predicates connects
--- it to one that is. That functional reading is also why the usual ambiguity
--- objection to a variable appearing only in the context does not apply here.
+-- This is GHC's `growThetaTyVars`, and it decides only which predicates a
+-- group's schemes may carry and which are left to defaulting and reporting
+-- (`split`). It is generous on purpose. A `HasField` is a function of its
+-- receiver, so fixing the record fixes the field type, but an equality
+-- `F a ~ G b` reaches `b` from `a` although no use that decides `a` decides
+-- `b`: an associated type need not be injective. So a variable it reaches
+-- may still be undetermined by the type, and a scheme over one is ambiguous.
+-- `checkAmbiguity` refuses such a scheme once it is chosen, as GHC checks an
+-- inferred type after choosing its quantifiers.
 fun reach[Iterator c, Item c ~ PredCell](preds : c, types : Array Ty.Type) -> Set.Set Int {
     let all = Vec.new(8)
     for c in preds { Vec.push(all, c.pred) }

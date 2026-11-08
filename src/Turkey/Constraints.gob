@@ -287,6 +287,10 @@ type PredCell = PredCell {
     -- The predicate as the cell was created, before solving rewrote it. An
     -- equality's coercion has this type (`ByCoercion`).
     posed    : Pred,
+    -- The binder whose scheme is a wrapper around its group's (`exportOf`),
+    -- as the tree spells it, if this is a wanted of the wrapper or one it
+    -- reduced to, and "" otherwise.
+    var exported : String,
 }
 
 -- Where a wanted is in the solver.
@@ -309,7 +313,7 @@ fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> Pre
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
         serial = serials.next, stuck = 0, depth = 0, root = p, superclass = False,
-        expanded = False, naked = False, belowSuper = False, posed = p,
+        expanded = False, naked = False, belowSuper = False, posed = p, exported = "",
     }
 }
 
@@ -320,7 +324,7 @@ fun nakedCell(p : Pred, where : Option Span, context : String, hole : Hole) -> P
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None, stage = Queued,
         serial = serials.next, stuck = 0, depth = 0, root = p, superclass = False,
-        expanded = False, naked = True, belowSuper = False, posed = p,
+        expanded = False, naked = True, belowSuper = False, posed = p, exported = "",
     }
 }
 
@@ -335,6 +339,7 @@ fun subgoal(parent : PredCell, p : Pred, where : Option Span, context : String,
         stage = Queued, serial = serials.next, stuck = 0, depth = parent.depth + 1,
         root = parent.root, superclass = parent.superclass, expanded = False,
         naked = False, belowSuper = parent.naked || parent.belowSuper, posed = p,
+        exported = parent.exported,
     }
 }
 
@@ -347,6 +352,7 @@ fun superclassOf(parent : PredCell, p : Pred) -> PredCell {
         at = parent.at, stage = Queued, serial = serials.next, stuck = 0,
         depth = parent.depth + 1, root = parent.root, superclass = True, expanded = False,
         naked = False, belowSuper = parent.naked || parent.belowSuper, posed = p,
+        exported = parent.exported,
     }
 }
 
@@ -540,6 +546,10 @@ type LetCell = LetCell {
     -- the span of each predicate, checked for rigidity when the group
     -- generalizes.
     rigid    : Vec (String, Span, Vec (String, Ty.Type), Vec Ty.Pred, Vec Span),
+    -- For a group of `fun`s, where each binder's `fun` is, in the order of
+    -- `binds`. Empty for any other group: only a `fun`'s scheme may be a
+    -- wrapper around its group's (`exportOf`).
+    members  : Vec Span,
 }
 
 -- -- the environment ---------------------------------------------------------------
@@ -1600,15 +1610,18 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         None -> {}
     }
 
-    for (id, name, ty) in c.binds {
-        -- Rewritten once more, by the givens and the instances: a side may
-        -- have become reducible since the equation was last retried.
+    for var i = 0; i < len(c.binds); i = i + 1 {
+        let (id, name, ty) = c.binds[i]
         -- The predicates the binder's type reaches, and those a partial
         -- annotation's header names: GHC's `chooseInferredQuantifiers`
-        -- (`growThetaTyVars`, then `pickCapturedPreds`).
+        -- (`growThetaTyVars`, then `pickCapturedPreds`). A partial
+        -- annotation's written context is kept whole, as GHC's
+        -- `choose_psig_context` returns `annotated_theta ++ diff_theta`.
         let ids = reachOf(candidates, Vec.toArray(Vec.append([ty], headerTypes(c, name))))
+        let written = writtenKeys(c, name)
+        let captures = fun(p) = touchesAny(p, ids) || Set.contains(written, Ty.predKey(p))
         -- `own` are the predicates of the binder's scheme that pass no
-        -- dictionary, and `internal` those of the scheme its body is lowered
+        -- dictionary, and `inside` those of the scheme its body is lowered
         -- at, which take every equality of the group as well: a body may call
         -- another member at the group's types, and pass a coercion for each
         -- of that member's equalities.
@@ -1616,9 +1629,11 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         let inside = Vec.new(4)
         for p in theta {
             if !Classes.isClass(s.classes, p.name) {
+                -- Rewritten once more, by the givens and the instances: a side
+                -- may have become reducible since the equation was last retried.
                 let rewritten = Ty.pred(p.name, Array.map(p.args, Inert.rewrite(s.here.inert, _)))
-                if touchesAny(p, ids) { Vec.push(own, rewritten) }
-                if touchesAny(p, ids) || p.name == Ty.equals { Vec.push(inside, rewritten) }
+                if captures(p) { Vec.push(own, rewritten) }
+                if captures(p) || p.name == Ty.equals { Vec.push(inside, rewritten) }
             }
         }
         -- Reduced at every level, not just the head. A field access has the
@@ -1628,19 +1643,24 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         -- unification and not for anything that reads a type whole, which a
         -- scheme is.
         let body = Inert.rewrite(s.here.inert, ty)
-        -- The group's bodies take every class predicate and equality of the
-        -- group, at this scheme. The binder's own scheme takes only those its
-        -- type reaches, and is a wrapper around the group's when that is
-        -- fewer (`exportOf`).
-        let internal = Ty.generalize(body, rank(s),
-                                     Classes.minimal(s.classes, Vec.append(inside, shared)))
-        let captured = Vec.filter(shared, touchesAny(_, ids))
-        var scheme = internal
+        -- A `fun`'s body is lowered at a scheme that takes every class
+        -- predicate and equality of the group, and the binder's own scheme
+        -- takes only those it captures. It is a wrapper around the group's
+        -- when that is fewer (`exportOf`). A pattern `let`'s binders, which
+        -- have no lowering for a wrapper yet, each take every class
+        -- predicate of the group.
+        let captured = Vec.filter(shared, captures)
+        var scheme = Ty.generalize(body, rank(s),
+                                   Classes.minimal(s.classes, Vec.append(own, shared)))
         if let Some(a) = c.dicts {
-            if (len(captured) < len(shared) || len(own) < len(inside)) && id != noBinder {
+            let fewer = len(captured) < len(shared) || len(own) < len(inside)
+            if len(c.members) == len(c.binds) && fewer && id != noBinder {
+                let internal = Ty.generalize(body, rank(s),
+                                             Classes.minimal(s.classes, Vec.append(inside, shared)))
                 scheme = Ty.generalize(body, rank(s),
                                        Classes.minimal(s.classes, Vec.append(own, captured)))
-                Map.put(a.exports, id, exportOf(s, name, id, internal, scheme, theta, c.span))
+                Map.put(a.exports, id, exportOf(s, name, id, internal, scheme, theta,
+                                                Some(c.members[i])))
             }
         }
         let b = Binding { scheme = scheme, mutable = False }
@@ -1807,6 +1827,18 @@ fun headerTypes(c : LetCell, name : String) -> Vec Ty.Type {
     out
 }
 
+-- Returns the keys (`Ty.predKey`) of the context a partial annotation in
+-- `c` wrote for the binder `name`.
+fun writtenKeys(c : LetCell, name : String) -> Set.Set String {
+    let out = Set.new()
+    for (n, _, _, context, _) in c.rigid {
+        if n == Ty.shortName(name) {
+            for p in context { Set.add(out, Ty.predKey(p)) }
+        }
+    }
+    out
+}
+
 -- Returns the ambiguity check of `scheme`, inferred for the binder `name` of
 -- `c`. A partial annotation's variables keep the names its header wrote, and
 -- its context the spans it was written at.
@@ -1818,8 +1850,8 @@ fun inferredAmbiguity(c : LetCell, name : String, scheme : Scheme) -> Ambiguity 
     for (n, at, header, context, spans) in c.rigid {
         if n != Ty.shortName(name) { continue }
         span = Some(at)
-        for (written, t) in header {
-            if let TVar(cell) = Ty.prune(t) { Map.put(names, cell.id, written) }
+        for (spelling, t) in header {
+            if let TVar(cell) = Ty.prune(t) { Map.put(names, cell.id, spelling) }
         }
         for var i = 0; i < len(scheme.preds); i = i + 1 {
             let key = Ty.predKey(scheme.preds[i])
@@ -1907,7 +1939,9 @@ fun exportOf(s : Solver, name : String, id : Int, internal : Scheme, exported : 
                 Vec.push(u.preds, at)
                 Vec.push(u.holes, hole)
             }
-            solve(s, cpredInto(at, hole, where, context))
+            let cell = newCell(at, where, context, hole)
+            cell.exported = name
+            solve(s, CPred(cell))
         }
         u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
     })
@@ -3801,6 +3835,11 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
     if let Some(origin) = superclassOrigin(s, c, c.pred) {
         return Ty.typeError(origin + "; add it to the context", c.span)
     }
+    -- A wanted of a wrapper is over a variable the binder's type does not
+    -- mention, so the binder's context cannot state it: the variable itself
+    -- is what nothing decides.
+    if c.exported != "" { return undetermined(s, c, ", which '" + Ty.shortName(c.exported)
+                                                     + "' needs from its recursive group") }
     if c.pred.name == Ty.equals && !familyLike(c.pred.args[0]) && !familyLike(c.pred.args[1]) {
         -- Neither side is a family application, so the equality is stuck on
         -- a variable that an equality given makes untouchable where it is.
@@ -3877,6 +3916,12 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
                                               c.span)
         None -> {}
     }
+    undetermined(s, c, "")
+}
+
+-- Reports that the stranded wanted `c` mentions a type nothing decides, with
+-- `why` after the predicate.
+fun undetermined(s : Solver, c : PredCell, why : String) -> Unit {
     -- The skolems the reader can see beside it keep their names, so that the
     -- unknown type is not called by one of them.
     let names = Ty.namerAvoiding("", skolemNames(s, c.pred))
@@ -3885,9 +3930,9 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
     let unknown = if len(vars) == 0 { None } else { Map.get(names.names, vars[0].id) }
     match unknown {
         Some(v) -> Ty.typeError("cannot determine what type '" + v + "' is in '"
-                                + shown + "'; add a type annotation", c.span)
-        None -> Ty.typeError("cannot determine a type satisfying '" + shown
-                             + "'; add a type annotation", c.span)
+                                + shown + "'" + why + "; add a type annotation", c.span)
+        None -> Ty.typeError("cannot determine a type satisfying '" + shown + "'" + why
+                             + "; add a type annotation", c.span)
     }
 }
 

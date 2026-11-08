@@ -333,8 +333,8 @@ fun under(l : Lowerer, copies : Map Int Int, lower : fun() -> a) -> a {
 -- -- dictionaries in scope ----------------------------------------------------------
 
 -- Inference names each dictionary a term takes or opens -- a function's
--- context, an instance's, a method's own, the instance's own dictionary
--- inside one of its methods, an existential's evidence -- and the evidence it
+-- context, an instance's, a method's own, a default's class dictionary, an
+-- existential's evidence -- and the evidence it
 -- records for a use refers to a dictionary by that name. No two places in the
 -- source share a name, but one name may still have several binders: this
 -- pass lowers some source more than once (see `copiesOf`), and every member
@@ -667,24 +667,26 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
     let record = withDicts(l, bound, fun() = dictionary(l, inst.cls, result,
                                                       Some(inst.decl.span), fun(slot) =
         match slot {
+            -- What the solver found for the instance's own obligations
+            -- (`Infer.genInstance`), over the skolems it checked them with.
             SuperSlot(sup) -> match Map.get(plan.supers, sup) {
-                Some(ev) -> evidence(l, ev, dictType(l, sup, inst.head), givens)
+                Some(ev) -> underInstance(l, inst, plan, fun() =
+                    evidence(l, ev, dictType(l, sup, inst.head), givens))
                 None -> oops("no evidence for the superclass '" + sup + "'",
                              Some(inst.decl.span))
             }
-            -- Proved at the head when the instance was declared, and checked
-            -- again by Coretc under the context's dictionaries.
-            EqualitySlot(k) -> {
-                let info = classNamed(l, inst.cls)
-                let e = Classes.equalityAt(info, info.equalities[k], inst.head)
-                Cr.coercion(e.args[0], e.args[1], Some(inst.decl.span))
+            EqualitySlot(k) -> if k < len(plan.superEqualities) {
+                underInstance(l, inst, plan, fun() =
+                    evidence(l, plan.superEqualities[k], unknown(), givens))
+            } else {
+                oops("no evidence for an equality superclass", Some(inst.decl.span))
             }
             MethodSlot(name) -> if isDerivedMethod(inst, name) {
                 derivedBody(l, inst, name, plan, givens)
             } else {
                 match Map.get(plan.methods, name) {
                     Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
-                                  else { methodBody(l, inst, name, impl, plan.params) }
+                                  else { methodBody(l, inst, name, impl) }
                     None -> oops("no body for the method '" + name + "'",
                                  Some(inst.decl.span))
                 }
@@ -808,11 +810,12 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
 fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
     inst.derived && Classes.derivedMethod(inst.cls) == Some(Classes.surfaceMember(name))
 
--- What writing one derived method needs: the instance, the evidence its
--- context names, and each constructor with its fields' types at the head.
+-- What writing one derived method needs: the instance, its plan, the types
+-- of the dictionaries its context names, and each constructor with its
+-- fields' types at the head.
 type DerivedSite = DerivedSite {
     inst   : InstInfo,
-    given  : Vec (String, Pred),
+    plan   : InstancePlan,
     givens : Map String Ty.Type,
     cons   : Vec (ConInfo, Array Ty.Type),
     span   : Option Span,
@@ -823,15 +826,11 @@ type DerivedSite = DerivedSite {
 -- Written in Core, as `typeRepDict` is. `Classes` derives an instance when
 -- the solver first asks for it, after every body written in Turkey has been
 -- generated, so there is no later point at which a Turkey body could be
--- checked. Each field's instance is what `Classes.prove` finds under the
--- instance's context, which is the proof the derivation was decided by.
+-- checked. Each field's instance is the evidence the solver found for it
+-- under the instance's context (`Turkey.Infer.derivedFields`).
 fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan,
                 givens : Map String Ty.Type) -> Core {
     let span = Some(inst.decl.span)
-    let given = Vec.new(len(inst.context))
-    for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
-        Vec.push(given, (plan.params[i], inst.context[i]))
-    }
     let (h, _) = Ty.spine(inst.head)
     let tycon = match h {
         TCon(c) -> c.name
@@ -848,7 +847,7 @@ fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan
             None -> oops("no field types for '" + c.name + "'", span)
         }
     }
-    let d = DerivedSite { inst = inst, given = given, givens = givens, cons = cons, span = span }
+    let d = DerivedSite { inst = inst, plan = plan, givens = givens, cons = cons, span = span }
     let mi = methodOf(l, inst.cls, name, span)
     let lam = if inst.cls == P.eqClass { derivedEq(l, d, mi) }
               else if inst.cls == P.ordClass { derivedLt(l, d, mi) }
@@ -1041,14 +1040,18 @@ fun hashField(l : Lowerer, d : DerivedSite, mi : MethodInfo, ty : Ty.Type, state
     node(stateTy, d.span, CApp(withHasher, [field, state]))
 }
 
--- The dictionary of `cls` at `ty`, a field's type, under the instance's
--- context.
-fun fieldDict(l : Lowerer, d : DerivedSite, cls : String, ty : Ty.Type) -> Core =
-    match Classes.prove(l.classes, d.given, Ty.pred(cls, [ty])) {
-        Some(ev) -> evidence(l, ev, dictType(l, cls, ty), d.givens)
+-- The dictionary of `cls` at `ty`, a field's type, as the solver found it
+-- under the instance's context (`Turkey.Infer.derivedFields`). `cls` is the
+-- instance's own class, the only one the solver was asked for.
+fun fieldDict(l : Lowerer, d : DerivedSite, cls : String, ty : Ty.Type) -> Core {
+    let found = if cls == d.inst.cls { Map.get(d.plan.fieldDicts, Ty.typeKey(ty)) } else { None }
+    let ev = match found {
+        Some(ev) -> ev
         None -> oops("no '" + cls + " " + Ty.show(ty) + "' for a field of '"
                      + Classes.showDeclared(d.inst) + "'", d.span)
     }
+    underInstance(l, d.inst, d.plan, fun() = evidence(l, ev, dictType(l, cls, ty), d.givens))
+}
 
 -- A call of the method of `cls` spelled `short`, at the field type `ty`, with
 -- the field's own dictionary.
@@ -1213,35 +1216,6 @@ fun typeRepMethod(l : Lowerer) -> String =
 -- definition and every reference so the two cannot disagree.
 fun instanceBinders(inst : InstInfo) -> Vec VarCell = Ty.varsOf([inst.head])
 
--- The instance's own dictionary, as seen from inside one of its methods: applied
--- to its own binders and to its own context, which is what makes the reference
--- well-typed rather than merely well-named.
-fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
-    let result = dictType(l, inst.cls, inst.head)
-    var fn = node(unknown(), Some(inst.decl.span), CVar(BySpelling(instName(inst))))
-    let binders = instanceBinders(inst)
-    if len(binders) > 0 {
-        fn = node(unknown(), Some(inst.decl.span),
-                  CTyApp(fn, Array.map(binders, TVar)))
-    }
-    if len(inst.context) == 0 && len(inst.equalities) == 0 {
-        fn.ty = result
-        return fn
-    }
-    let count = fewer(len(params), len(inst.context))
-    let dicts = Array.init(count, fun(i) {
-        node(predType(l, inst.context[i]), Some(inst.decl.span),
-             CVar(dictRef(l, params[i], Some(inst.decl.span))))
-    })
-    -- Fresh coercions rather than the instance's parameters, since nothing
-    -- refers to a coercion parameter.
-    let coercions = Array.map(Vec.toArray(instanceEqualities(inst)), fun((left, right)) =
-        coercion(left, right, Some(inst.decl.span)))
-    let args = Array.append(dicts, coercions)
-    fn.ty = TFun(Array.map(args, _.ty), result)
-    node(result, Some(inst.decl.span), CApp(fn, args))
-}
-
 -- A method's type as it sits in a dictionary, at one head.
 --
 -- A method with its own context takes those dictionaries and coercions per
@@ -1304,14 +1278,9 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
             Some(impl.decl.span))
 }
 
--- One method body, as a lambda inside its dictionary.
---
--- The self name is the dictionary the body belongs to, bound so that a method
--- may call another of its own class without anything being passed -- which is
--- what makes a *default* method work at all. In Core it is a `let` around the
--- body rather than a name the evaluator arranges to have in scope.
-fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
-               params : Vec String) -> Core {
+-- One method body, as a lambda inside its dictionary: the instance's own, or
+-- the class's default applied to the dictionary the solver found for it.
+fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl) -> Core {
     let info = classNamed(l, inst.cls)
     let mi = match Map.get(info.methods, name) {
         Some(m) -> m
@@ -1320,17 +1289,26 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let head = inst.head
     if isDefaultOf(info, name, impl) {
         -- Not this instance's body: the class's, shared. Applied at this head
-        -- and to this dictionary.
-        let own = selfDict(l, inst, params)
+        -- and to the dictionary the solver found for it there.
+        let plan = match inst.plan {
+            Some(p) -> p
+            None -> oops("instance has no plan", Some(inst.decl.span))
+        }
+        let own = match Map.get(plan.defaultDicts, name) {
+            Some(ev) -> underInstance(l, inst, plan, fun() =
+                evidence(l, ev, dictType(l, inst.cls, head), instanceGivens(l, inst, plan)))
+            None -> oops("no dictionary for the default of '" + name + "'",
+                         Some(impl.decl.span))
+        }
         let result = methodType(l, mi, head)
         let fn = node(TFun([own.ty], result), Some(impl.decl.span),
             CTyApp(node(unknown(), Some(impl.decl.span),
                         CVar(BySpelling(defaultName(inst.cls, name)))), [head]))
         let called = node(result, Some(impl.decl.span), CApp(fn, [own]))
-        -- Eta-expanded, for the same reason the self dictionary goes under the
-        -- lambda: the argument is the dictionary this field belongs to, so
-        -- evaluating the application while the record is being built would build
-        -- it again, for ever. Under a lambda it waits until the method is called.
+        -- Eta-expanded: the argument is the dictionary this field belongs to,
+        -- so evaluating the application while the record is being built would
+        -- build it again, for ever. Under a lambda it waits until the method
+        -- is called.
         return eta(l, called, result, Some(impl.decl.span))
     }
     let mapping = Map.new()
@@ -1339,15 +1317,10 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let owned = enter(l, impl.decl.id, inst.module_,
                       instName(inst) + "." + name, impl.decl.span)
     let saved = setSkolems(l, impl, mi, Ty.varsOf([inst.head]))
-    let self = if impl.selfName != "" { [(impl.selfName, mint(l, impl.selfName))] } else { [] }
-    var body = withDicts(l, self, fun() =
-        function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
-                 Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, head)))
+    let body = function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
+                        Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, head))
     l.rigid = saved
     leave(l, owned)
-    for (selfName, selfId) in self {
-        body = bindSelf(l, inst, params, selfName, selfId, body, Some(impl.decl.span))
-    }
     methodAbstraction(mi, body, Some(impl.decl.span))
 }
 
@@ -1539,12 +1512,13 @@ fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
     }
 }
 
+-- Returns `called`, whose type is `result`, as a lambda over `result`'s
+-- parameters that applies it, if `result` is a function.
 --
 -- Through a layer of coercions alone, it goes on to the function that layer
--- answers, as `bindSelf` places a method's own dictionary: a slot that is a
--- lambda over the method's own parameters is one that specialization and the
--- optimizer see a call through, where one that answers a function leaves a
--- closure called at each call.
+-- answers: a slot that is a lambda over the method's own parameters is one
+-- that specialization and the optimizer see a call through, where one that
+-- answers a function leaves a closure called at each call.
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
@@ -1561,35 +1535,6 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- them is erased with.
 fun onlyCoercions(ps : Array CParam) -> Bool =
     len(ps) > 0 && Iterator.all(ps, fun(p) = isCoercion(p.ty))
-
--- Bind the instance's own dictionary *inside* the method's lambda.
---
--- Inside, not around it, and that placement is the difference between a program
--- that runs and one that does not. `instance [Show a] Show (Array a)` names
--- itself, so a binding evaluated while the dictionary is being built would build
--- the dictionary again, for ever. Under the lambda it is evaluated when the
--- method is *called*, by which time the dictionary exists.
-fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
-             body : Core, where : Option Span) -> Core {
-    -- Under the method's own parameters, not under a lambda over coercions
-    -- alone. Erasure would eta-expand that lambda through the method's, which
-    -- would build a closure, besides the dictionary, at every call.
-    match body.kind {
-        CLam(ps, inner, lamName) -> if onlyCoercions(ps) {
-            return node(body.ty, body.span, CLam(ps,
-                bindSelf(l, inst, params, name, id, inner, where), lamName))
-        }
-        _ -> {}
-    }
-    let own = selfDict(l, inst, params)
-    match body.kind {
-        CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,
-            node(inner.ty, where, CLet(name, id, own.ty, own, inner, [])),
-            lamName))
-        _ -> node(body.ty, where,
-                  CLet(name, id, own.ty, own, body, []))
-    }
-}
 
 -- A method is polymorphic in its *own* variables, and the dictionary that holds
 -- it does not fix those -- only the class variable. `map` in a `Functor
@@ -1661,6 +1606,7 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
         out
     }
     FromInstance(inst, mapping, args) -> instanceRef(l, inst, mapping, args)
+    Coerced(left, right) -> coercion(resolved(l, left), resolved(l, right), None)
     -- The predicate's argument is bottom: there is no value here, so there is no
     -- dictionary to find. `error` diverges and so has whatever type its context
     -- wants.
@@ -1688,19 +1634,17 @@ fun instanceRef(l : Lowerer, inst : InstInfo, matched : Map Int Ty.Type,
         fn.ty = result
         return fn
     }
-    let count = fewer(len(args), len(inst.context))
-    let dicts = Array.init(count, fun(i) {
+    -- The context's dictionaries, then a coercion for each of its equalities,
+    -- as the solver's holes hold them. No givens: an instance's context
+    -- arrives as its own parameters, which `instanceGivens` supplies where
+    -- those are in scope.
+    let argTerms = Array.init(len(args), fun(i) = if i < len(inst.context) {
         let p = inst.context[i]
-        let want = Decls.substitute(p.args[0], mapping)
-        -- No givens: an instance's context arrives as its own parameters, which
-        -- `instanceGivens` supplies where those are in scope.
-        evidence(l, args[i], dictType(l, p.name, want), Map.new())
+        evidence(l, args[i], dictType(l, p.name, Decls.substitute(p.args[0], mapping)),
+                 Map.new())
+    } else {
+        evidence(l, args[i], unknown(), Map.new())
     })
-    -- The solver proved each equality at this match, and a coercion carries
-    -- nothing but its type.
-    let coercions = Array.map(Classes.equalitiesAt(inst, mapping), fun(q) =
-        coercion(q.args[0], q.args[1], None))
-    let argTerms = Array.append(dicts, coercions)
     fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
 }
@@ -1729,6 +1673,21 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
         let p = inst.context[i]
         Map.put(out, plan.params[i], dictType(l, p.name, p.args[0]))
     }
+    out
+}
+
+-- Returns `f()`, run with the skolems the solver checked `inst`'s own
+-- obligations over read as the instance's variables.
+fun underInstance(l : Lowerer, inst : InstInfo, plan : InstancePlan,
+                  f : fun() -> Core) -> Core {
+    let rigid = Map.new()
+    for v in instanceBinders(inst) {
+        if let Some(TCon(c)) = Map.get(plan.skolems, v.id) { Map.put(rigid, c.name, v) }
+    }
+    let saved = l.rigid
+    l.rigid = rigid
+    let out = f()
+    l.rigid = saved
     out
 }
 

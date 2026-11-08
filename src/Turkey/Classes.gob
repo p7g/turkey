@@ -10,8 +10,8 @@ export (
     reduceFam,
     uncovered,
     bySuper, superEqualities, equalityAt, openedPreds,
-    byInst, selectInstance, contextAt, equalitiesAt, provenEqualities, contextPreds,
-    entail, prove, superPath, isClass, method, minimal,
+    byInst, selectInstance, contextAt, equalitiesAt, contextPreds,
+    superPath, patersonSmaller, isClass, method, minimal,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -109,13 +109,16 @@ type Evidence
     -- meets, so there is no type to look up and no value that would ever ask
     -- for a method.
     | Absent(String)
+    -- A coercion between the two sides of an equality the solver proved. It
+    -- carries nothing but its type, the equality as the wanted posed it.
+    | Coerced(Ty.Type, Ty.Type)
 
 -- One method body, and the names its dictionaries arrive under.
 --
--- `selfName` is the dictionary the body belongs to -- the instance's own, or for
--- a default the one the class is being defaulted into. It is bound when the
--- dictionary is built, which is why a default method may call another method of
--- its own class without anything being passed.
+-- `selfName` is, for a default, the dictionary the class is being defaulted
+-- into: the default's parameter, which is why a default method may call
+-- another method of its own class without anything being passed. It is empty
+-- for an override, which gets its own class at its head from the instance.
 --
 -- `dictParams` are the method's *own* context, which is per call rather than per
 -- instance and so arrives as arguments.
@@ -133,14 +136,29 @@ type MethodImpl = MethodImpl {
 }
 
 -- Everything the evaluator needs to build one instance's dictionary.
+--
+-- The evidence here is what the solver found for the instance's own
+-- obligations, read out of their holes by `Turkey.Evidence`: each superclass at
+-- the head, each equality superclass at the head, and, for each method the
+-- instance takes from its class's default, the dictionary that default is
+-- applied to. It was found over the skolems `skolems` maps the head's
+-- variables to, as a method body's is.
 type InstancePlan = InstancePlan {
     params  : Vec String,
     methods : Map String MethodImpl,
     supers  : Map String Evidence,
+    var superEqualities : Vec Evidence,
+    defaultDicts : Map String Evidence,
+    -- A derived instance's class at each of its fields' types, by
+    -- `Ty.typeKey` of the type at the head.
+    fieldDicts : Map String Evidence,
+    var skolems : Map Int Ty.Type,
 }
 
-fun newInstancePlan(params : Vec String) -> InstancePlan =
-    InstancePlan { params = params, methods = Map.new(), supers = Map.new() }
+fun newInstancePlan(params : Vec String) -> InstancePlan = InstancePlan {
+    params = params, methods = Map.new(), supers = Map.new(), superEqualities = Vec.new(0),
+    defaultDicts = Map.new(), fieldDicts = Map.new(), skolems = Map.new(),
+}
 
 -- -- the tables --------------------------------------------------------------------
 
@@ -290,6 +308,9 @@ type ClassTable = ClassTable {
     -- Whether a call of `derive` is running, which settles any derivation
     -- begun inside it.
     var deriving : Bool,
+    -- Every instance derived so far, in the order each settled. The generator
+    -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
+    derived : Vec InstInfo,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -302,6 +323,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     derivations = Map.new()
     provisional = []
     deriving = False
+    derived = []
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -459,9 +481,6 @@ fun registerAll(t : ClassTable, classes : Vec (ClassDecl, String),
     for (d, owner) in instances {
         if let Some(inst) = resolveInstance(t, d, owner) { Vec.push(registered, inst) }
     }
-    -- Coverage is checked only once every instance is in the table, since
-    -- `instance Monoid (Array a)` is entitled to be satisfied by a
-    -- `Semigroup (Array a)` written further down the file.
     for inst in registered { checkInstance(t, inst) }
 }
 
@@ -1072,16 +1091,10 @@ fun checkHeadShape(d : InstanceDecl, h : Ty.Type) -> Bool {
     True
 }
 
--- Superclass coverage, and the method roster.
+-- The method roster. The superclasses are the solver's to check
+-- (`Turkey.Infer.genInstance`).
 fun checkInstance(t : ClassTable, inst : InstInfo) -> Unit {
     let info = classNamed(t, inst.cls)
-    for sup in info.supers {
-        let demand = Ty.pred(sup.name, [inst.head])
-        if !entail(t, inst.context, demand) {
-            report("'" + Ty.showPred(demand) + "' is required by '" + inst.cls
-                   + "', but there is no such instance", Some(inst.decl.span))
-        }
-    }
     let defined = Set.new()
     for m in inst.decl.methods {
         let resolved = match memberNamed(Map.keys(info.methods), m.name) {
@@ -1870,6 +1883,7 @@ fun settle(t : ClassTable) -> Unit {
     for key in t.provisional {
         if let Some(Deriving(inst)) = Map.get(t.derivations, key) {
             Map.put(t.derivations, key, Derived(inst))
+            Vec.push(t.derived, inst)
         }
     }
 }
@@ -2300,23 +2314,6 @@ fun equalitiesAt(inst : InstInfo, mapping : Map Int Ty.Type) -> Array Pred =
     Array.map(Vec.toArray(inst.equalities), fun(q) =
         Ty.pred(q.name, Array.map(q.args, Decls.substitute(_, mapping))))
 
--- Returns every equality the instances in `ev` need, at the types `ev` uses
--- them at. `prove` does not decide them.
-fun provenEqualities(ev : Evidence) -> Vec Pred {
-    let out = Vec.new(1)
-    let work = [ev]
-    while len(work) > 0 {
-        match Vec.pop(work) {
-            Some(FromInstance(inst, mapping, args)) -> {
-                for q in equalitiesAt(inst, mapping) { Vec.push(out, q) }
-                for a in args { Vec.push(work, a) }
-            }
-            _ -> {}
-        }
-    }
-    out
-}
-
 -- Returns the instance that covers `p` and the match of its head against
 -- `p`'s argument, or `None` if no instance does.
 fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Type) {
@@ -2344,36 +2341,6 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     None
 }
 
--- Returns whether `given` proves `p`, by `prove`.
-fun entail(t : ClassTable, given : Vec Pred, p : Pred) -> Bool {
-    let named = Vec.new(len(given))
-    for g in given { Vec.push(named, ("", g)) }
-    Option.isSome(prove(t, named, p))
-}
-
--- Returns the evidence that the dictionaries `given`, each under its name,
--- prove `p` with: a given reached through superclasses first, then an
--- instance. Returns `None` if they do not prove it.
---
--- Entailment as THIH has it, with no families and no equalities. It serves an
--- instance declaration, whose head and class context are constructors applied
--- to variables, so there is nothing to rewrite. An instance it selects may
--- have equalities in its context, and those are left to the caller
--- (`provenEqualities`), since deciding them needs the instance's own given
--- equalities.
-fun prove(t : ClassTable, given : Vec (String, Pred), p : Pred) -> Option Evidence {
-    let key = Ty.predKey(p)
-    for (name, g) in given {
-        if let Some(path) = superPath(t, g, key, []) {
-            return Some(FromDict(name, path, Some(g)))
-        }
-    }
-    let (inst, mapping) = selectInstance(t, p)?
-    let args = Vec.new(len(inst.context))
-    for q in contextAt(inst, mapping) { Vec.push(args, prove(t, given, q)?) }
-    Some(FromInstance(inst, mapping, Vec.toArray(args)))
-}
-
 -- Returns the superclass names to select, in order, to reach the predicate
 -- whose key is `key` from `given`, or `None` if no chain of superclasses does.
 -- `path` is the chain already walked.
@@ -2388,6 +2355,54 @@ fun superPath(t : ClassTable, given : Pred, key : String,
         }
     }
     None
+}
+
+-- Returns whether the class predicate `p` is Paterson-smaller than `head`:
+-- for every type its arguments may become, it is smaller. That is GHC's
+-- `ltPatersonSize` of `pSizeClassPred`s (Note [The PatersonSize of a type] in
+-- `GHC.Tc.Utils.TcType`): its argument has strictly fewer constructors and
+-- variables than `head`'s, no variable occurs in it more often than in
+-- `head`'s, and it applies no family, whose size could be anything. A skolem
+-- counts as the variable it stands for. Every class has one parameter, so the
+-- class's own constructor is on both sides and drops out.
+fun patersonSmaller(p : Pred, head : Pred) -> Bool {
+    let small = Map.new()
+    let large = Map.new()
+    match (patersonSize(p.args[0], small), patersonSize(head.args[0], large)) {
+        (Some(pSize), Some(headSize)) -> if pSize >= headSize { return False }
+        _ -> return False
+    }
+    for (v, n) in Map.entries(small) {
+        if n > Map.getOr(large, v, 0) { return False }
+    }
+    True
+}
+
+-- Returns how many constructors and variables `t` has, counting each
+-- variable's occurrences into `vars`, or `None` if it applies a family.
+fun patersonSize(t : Ty.Type, vars : Map String Int) -> Option Int = match Ty.prune(t) {
+    TVar(cell) -> Some(occurrence(vars, "v" + Int.toString(cell.id)))
+    TCon(con) -> Some(if con.uid == 0 { 1 }
+                      else { occurrence(vars, "k" + Int.toString(con.uid)) })
+    TApp(fn, arg, _) -> Some(patersonSize(fn, vars)? + patersonSize(arg, vars)?)
+    TFun(params, ret) -> {
+        var n = 1 + patersonSize(ret, vars)?
+        for q in params { n = n + patersonSize(q, vars)? }
+        Some(n)
+    }
+    TTuple(elems) -> {
+        var n = 1
+        for e in elems { n = n + patersonSize(e, vars)? }
+        Some(n)
+    }
+    TFam(_, _, _) -> None
+    _ -> Some(1)
+}
+
+-- Counts one occurrence of the variable `key` in `vars`, and returns 1.
+fun occurrence(vars : Map String Int, key : String) -> Int {
+    Map.put(vars, key, Map.getOr(vars, key, 0) + 1)
+    1
 }
 
 fun isClass(t : ClassTable, name : String) -> Bool = Map.contains(t.classes, name)

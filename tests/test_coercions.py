@@ -103,8 +103,10 @@ def test_a_coercion_adds_no_curried_layer():
     # The method's slot answers its `Int`, not a closure that would.
     code = _functions(ssa, "%inst.Main#Box.Int#code")
     assert code[0].startswith("fun @%inst.Main#Box.Int#code(%0:ptr*, %1:i64) -> i64"), code[0]
-    for body in _functions(ssa, "%inst.Main#Box.Data.Option#Option#code"):
-        assert ":unit" not in body.splitlines()[0], body
+    # The `Option` instance's method is built where its dictionary is, so it
+    # may be inlined there: no function anywhere takes a coercion's `unit`.
+    for header in re.findall(r"^fun @.*$", ssa, re.M):
+        assert ":unit" not in header, header
 
 
 # A default method with an equality in its context, used at a known instance

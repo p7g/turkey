@@ -106,6 +106,28 @@ instance Named Cat {
 }
 ```
 
+An instance's superclasses must hold at its head, under the instance's
+context. Each comes from a constraint the context writes, or from an
+instance, and what that instance requires in turn may use anything the
+context provides. A superclass cannot come from the superclasses of a
+constraint in the context: such a constraint would be about the head's own
+type, so the dictionary the instance defines could end up supplying its own
+superclass:
+
+<!-- error: 'Sem (W a)' is required by 'Mon', and it cannot come from the superclasses of the context's 'Mon (W a)', which is about the head itself; add 'Sem (W a)' to the context -->
+```kotlin
+class Sem a { fun op(a, a) -> a }
+class Mon a : Sem a { fun unit() -> a }
+
+type W a = W(a)
+
+instance Mon (W a) : Mon (W a) {
+    fun unit() = unit()
+}
+
+fun main() { }
+```
+
 ## Instances
 
 **Syntax**
@@ -835,10 +857,15 @@ fun main() { }
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
 `View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
-context's `Value s ~ Byte`. An instance where an equality is false, or where
-its context does not decide it, is refused:
+context's `Value s ~ Byte`, which its `Bytes s` grants. A constraint of the
+context grants its equality superclasses here only if it is *smaller* than
+the head: it has fewer type constructors and variables, no variable more
+often than the head has it, and no associated type. `Bytes s` is smaller
+than `Bytes (View s)`, while a `Bytes (View s)` in the context would grant
+nothing here, for the same reason as above. An instance where an equality
+is false, or where its context does not decide it, is refused:
 
-<!-- error: 'Bytes Words' requires 'Value Words ~ Byte', which can never hold: 'String' is not 'Byte' -->
+<!-- error: expected 'Byte', found 'String' in the superclasses of 'Bytes Words' -->
 ```kotlin
 class Bytes s : Index s, Value s ~ Byte {}
 

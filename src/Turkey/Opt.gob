@@ -848,7 +848,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
             CLam(_, _, _) -> beta(r, e)
             CLet(_, _, _, _, _, _) -> floatLetFromCall(e)
             CSlot(_, _) -> knownLambda(r.decls, e)
-            CPrim(_) -> knownPrim(e)
+            CPrim(_) -> knownPrim(r.decls, e)
             CProject(_, _) -> match knownLambda(r.decls, e) {
                 Some(made) -> Some(made)
                 None -> inline(r, e, inlineLimit)
@@ -953,12 +953,12 @@ fun knownCondition(d : DeclTable, e : Core) -> Option Core = match e.kind {
 
 -- A primitive applied to constants: the constant it computes, or `None` where
 -- an operand is not a constant or the primitive would trap.
-fun knownPrim(e : Core) -> Option Core {
+fun knownPrim(d : DeclTable, e : Core) -> Option Core {
     -- Two `if let`s rather than one with both conditions: the committed
     -- bootstrap, which compiles this file, does not parse the chained form.
     if let CApp(fn, args) = e.kind {
         if let CPrim(p) = stripTyApp(fn).kind {
-            return map(folded(p, args), mkCore(e.ty, e.span, _))
+            return map(folded(d, p, args), mkCore(e.ty, e.span, _))
         }
     }
     None
@@ -967,7 +967,7 @@ fun knownPrim(e : Core) -> Option Core {
 -- A primitive left out is never folded, which is always correct: the floats,
 -- which `Turkey.Sccp` does not fold either, and the bytes, which have no
 -- literal to fold to or from.
-fun folded(p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
+fun folded(d : DeclTable, p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
     Prims.CharToInt -> map(charAt(args, 0), intLit)
     Prims.CharFromInt -> bind(intAt(args, 0), fun(n) =
         if Fold.isScalar(n) { map(Char.fromInt(n), fun(c) = CLit(LChar(c))) }
@@ -979,6 +979,7 @@ fun folded(p : Prims.Prim, args : Array Core) -> Option CoreKind = match p {
     Prims.IntLt -> relation(L.Lt, intAt(args, 0), intAt(args, 1))
     Prims.BoolEq -> relation(L.Eq, boolAt(args, 0), boolAt(args, 1))
     Prims.BoolLt -> relation(L.Lt, boolAt(args, 0), boolAt(args, 1))
+    Prims.ConstructorIndex -> map(indexAt(d, args, 0), intLit)
     Prims.Not -> map(boolAt(args, 0), fun(b) = boolCon(b == 0))
     Prims.IntAdd -> arithmetic(L.Add, intAt(args, 0), intAt(args, 1))
     Prims.IntSub -> arithmetic(L.Sub, intAt(args, 0), intAt(args, 1))
@@ -1018,6 +1019,11 @@ fun intAt(args : Array Core, i : Int) -> Option Int =
 
 fun charAt(args : Array Core, i : Int) -> Option Int =
     if let CLit(LChar(c)) = args[i].kind { Some(Char.toInt(c)) } else { None }
+
+-- A constructor with no fields as its index in its declaration. One with
+-- fields is left alone, since folding it would drop its arguments.
+fun indexAt(d : DeclTable, args : Array Core, i : Int) -> Option Int =
+    if let CCon(name) = args[i].kind { Decls.constructorIndex(d, name) } else { None }
 
 -- `True` as 1 and `False` as 0, which is how `Fold.compare` orders them.
 fun boolAt(args : Array Core, i : Int) -> Option Int =

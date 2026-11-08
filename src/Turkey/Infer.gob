@@ -50,7 +50,7 @@ import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
 import Turkey.Solved (Abstraction(..), Use(..), InstanceCheck(..), newAbstraction, newUse,
-                      newHole, dictName)
+                      Hole, newHole, dictName)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
@@ -334,6 +334,9 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     }
     Decls.registerAll(g.decls, typeDecls)
     Classes.registerAll(g.classes, ownedClasses, ownedInstances)
+    -- A declaration that failed to register may have no constructors to
+    -- derive from, so derive lists are checked only when every one did.
+    if !Diag.hasErrors() { Classes.checkDerives(g.classes, typeDecls) }
     checkSuperEqualities(g.classes)
     -- A declaration that failed to register leaves a gap in the tables that
     -- every use of it would report again, so nothing is generated past one.
@@ -421,6 +424,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     -- top-level binding. Nothing calls *them* by name, so their position is
     -- otherwise free.
     genMethodBodies(g, classDecls, instDecls)
+    genDerived(g)
     (ordered, pop(g))
 }
 
@@ -830,11 +834,14 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
     for m in inst.decl.methods { Set.add(defined, m.name) }
     for (name, _) in Map.entries(info.defaults) {
         if Set.contains(defined, name) { continue }
+        -- A derived instance writes this one itself (`Turkey.Lower`).
+        if Classes.isDerivedMethod(inst, name) { continue }
         let hole = newHole()
         Vec.push(defaults, (name, hole))
         Vec.push(wanteds, C.cpredInto(self, hole, where, "the default definition of '"
                                       + Classes.surfaceMember(name) + "'"))
     }
+    let fields = if inst.derived { derivedFields(g, inst, sk, wanteds) } else { [] }
     emit(g, instanceImplication(givens, self, sk, CAnd(wanteds), where))
 
     let equalityGivens = Vec.new(len(equalities))
@@ -862,8 +869,72 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
     }
     Vec.push(g.instanceChecks, InstanceCheck {
         inst = inst, supers = supers, equalities = holes, defaults = defaults,
-        skolems = sk.mapping,
+        fields = fields, skolems = sk.mapping,
     })
+}
+
+-- Adds to `wanteds` the derived instance `inst`'s class at each of its
+-- fields' types, once per type, over the skolems `sk`, and returns each
+-- one's predicate at the head and its hole, by `Ty.typeKey` of the type.
+-- Their evidence is what the method `Turkey.Lower` writes compares or hashes
+-- each field with, as a written method's would be.
+--
+-- The derivation inferred the context so that these hold, and refused the
+-- instance where it could not, so the solver rejects one only if the two
+-- disagree. That would be a compiler bug, but the solver reports it as it
+-- reports any instance it cannot check, at the derive-list entry that asked
+-- for the class.
+fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
+                  wanteds : Vec Constraint) -> Vec (String, Pred, Hole) {
+    let out = Vec.new(4)
+    let tycon = match Ty.spine(inst.head).0 {
+        TCon(c) -> c.name
+        _ -> bug("a derived instance whose head is not a declared type", Some(inst.decl.span))
+    }
+    let info = match Map.get(g.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> bug("a derived instance for the unknown type '" + tycon + "'",
+                    Some(inst.decl.span))
+    }
+    let required = "the derived '" + Classes.showDeclared(inst) + "'"
+    let where = Some(derivedAt(info, inst))
+    let seen = Set.new()
+    for c in info.variants {
+        for ty in Option.unwrapOr(Decls.conFieldTypes(g.decls, inst.head, c.name), []) {
+            let key = Ty.typeKey(ty)
+            if Set.contains(seen, key) { continue }
+            Set.add(seen, key)
+            let hole = newHole()
+            Vec.push(out, (key, Ty.pred(inst.cls, [ty]), hole))
+            Vec.push(wanteds, C.cpredInto(Ty.pred(inst.cls, [Classes.skolemApply(sk, ty)]),
+                                          hole, where, required))
+        }
+    }
+    out
+}
+
+-- Returns the span of the derive-list entry of `info` that asked for
+-- `inst`'s class: its own, or for an `Eq` that `: Ord` or `: Hash` implies,
+-- the first entry that implies it.
+fun derivedAt(info : TyconInfo, inst : InstInfo) -> Span {
+    for d in info.derives { if !d.refused && d.cls == inst.cls { return d.span } }
+    for d in info.derives { if !d.refused { return d.span } }
+    inst.decl.span
+}
+
+-- Checks every instance derived and not checked yet, as `genInstance`
+-- checks a written one, and its fields' instances besides
+-- (`derivedFields`). `Classes.checkDerives` has begun every derivation the
+-- program has (`Classes.derive`), so one call after it checks them all.
+fun genDerived(g : Generator) -> Unit {
+    for inst in g.classes.derived {
+        if Option.isSome(inst.plan) { continue }
+        let params = Vec.new(len(inst.context))
+        for q in inst.context { Vec.push(params, dictName(q.name)) }
+        let plan = Classes.newInstancePlan(params)
+        inst.plan = Some(plan)
+        genInstance(g, inst, classNamed(g, inst.cls), plan)
+    }
 }
 
 -- Returns the implication that checks the instance whose head is `self`,

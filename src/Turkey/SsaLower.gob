@@ -3640,6 +3640,7 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.Not -> L.emit(l.b, Not(operands(l, p, args, 1)[0]), rep)
     Prims.BoolEq -> primCompare(l, p, args, Eq)
     Prims.BoolLt -> primCompare(l, p, args, Lt)
+    Prims.ConstructorIndex -> constructorIndex(l, e, p, args, rep)
 }
 
 -- A primitive's operands, lowered left to right. The type checker fixed the
@@ -3688,6 +3689,45 @@ fun primBinary(l : Lower, p : Prims.Prim, args : Array Core, o : BinOp, rep : Re
 fun primCompare(l : Lower, p : Prims.Prim, args : Array Core, o : CmpOp) -> Value {
     let xs = operands(l, p, args, 2)
     L.emit(l.b, Cmp(o, xs[0], xs[1]), Ssa.untraced(I1))
+}
+
+-- The index of the constructor `args[0]` was built with, as an `Int`.
+--
+-- An enumeration's value is that index already (`Decls.enumSize`), held at
+-- a narrower width, so it is widened, and one of a single constructor is
+-- held at no width and is 0. Any other data type holds its constructor
+-- however its layout does, so the index is what a match on it answers, and
+-- the match is lowered as any match is, at whatever layout the value has.
+fun constructorIndex(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
+                     rep : Rep) -> Value {
+    if len(args) != 1 { oops(Prims.name(p) + " applied to " + Int.toString(len(args)) + " arguments") }
+    let ty = args[0].ty
+    let (h, _) = Ty.spine(Ty.prune(ty))
+    let tycon = match h {
+        TCon(c) -> c.name
+        _ -> oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which is not a data type")
+    }
+    let variants = match Map.get(l.decls.tycons, tycon) {
+        Some(info) -> info.variants
+        None -> oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which is not a data type")
+    }
+    if len(variants) == 0 {
+        oops(Prims.name(p) + " applied to '" + Ty.show(ty) + "', which has no constructors")
+    }
+    if Option.isSome(Decls.enumSize(l.decls, tycon)) {
+        let v = value(l, args[0])
+        if Ssa.repOf(l.func, v).class_ == Unit { return L.emit(l.b, ConstInt(0), rep) }
+        return L.emit(l.b, Convert(Widen, v), rep)
+    }
+    let alts = Vec.new(len(variants))
+    for var i = 0; i < len(variants); i = i + 1 {
+        let c = variants[i]
+        Vec.push(alts, CAlt {
+            alt = ACon(c.name, Array.init(c.arity, fun(_) = None), None),
+            body = Core.mkCore(Ty.tInt(), e.span, CLit(LInt(i))),
+        })
+    }
+    value(l, Core.mkCore(Ty.tInt(), e.span, CMatch(args[0], alts)))
 }
 
 fun primConvert(l : Lower, p : Prims.Prim, args : Array Core, c : Conv, rep : Rep) -> Value =

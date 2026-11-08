@@ -4,6 +4,7 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
+    derivedMethod, isDerivedMethod, checkDerives, whyMissing,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -73,7 +74,7 @@ import Turkey.Ast (Pred as _, ..)
 -- written as is `Ast.Pred`.
 import Turkey.Ast as Ast
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), FamilyInfo(..), ConInfo(..))
+import Turkey.Decls (DeclTable(..), FamilyInfo(..), ConInfo(..), TyconInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
 import Turkey.Source as Source
@@ -148,12 +149,15 @@ type InstancePlan = InstancePlan {
     supers  : Map String Evidence,
     var superEqualities : Vec Evidence,
     defaultDicts : Map String Evidence,
+    -- A derived instance's class at each of its fields' types, by
+    -- `Ty.typeKey` of the type at the head.
+    fieldDicts : Map String Evidence,
     var skolems : Map Int Ty.Type,
 }
 
 fun newInstancePlan(params : Vec String) -> InstancePlan = InstancePlan {
     params = params, methods = Map.new(), supers = Map.new(), superEqualities = Vec.new(0),
-    defaultDicts = Map.new(), skolems = Map.new(),
+    defaultDicts = Map.new(), fieldDicts = Map.new(), skolems = Map.new(),
 }
 
 -- -- the tables --------------------------------------------------------------------
@@ -240,6 +244,9 @@ type InstInfo = InstInfo {
     var plan : Option InstancePlan,
     -- The module that declared it, for the orphan rule.
     module_  : String,
+    -- Whether the compiler built it from a type declaration's derive list,
+    -- with the method `derivedMethod` names left for the lowering to write.
+    derived  : Bool,
 }
 
 fun instCon(inst : InstInfo) -> String {
@@ -293,6 +300,20 @@ type ClassTable = ClassTable {
     -- Set by `Turkey.Erase` once it has removed every coercion: from then on
     -- a dictionary has no `EqualitySlot`. See `dictSlots`.
     var erased : Bool,
+    -- How far deriving each instance got, by `derivationKey`. See `derive`.
+    derivations : Map String Derivation,
+    -- The keys of the derivations begun since the outermost one still
+    -- running began, which its failure takes back.
+    provisional : Vec String,
+    -- Whether a call of `derive` is running, which settles any derivation
+    -- begun inside it.
+    var deriving : Bool,
+    -- Every instance derived so far, in the order each settled. The generator
+    -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
+    derived : Vec InstInfo,
+    -- Whether `checkDerives` is running. Only it begins a derivation that no
+    -- other derivation began; see `derive`.
+    var checking : Bool,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -302,6 +323,11 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     owner = Map.new()
     keyed = Map.new()
     erased = False
+    derivations = Map.new()
+    provisional = []
+    deriving = False
+    derived = []
+    checking = False
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -834,6 +860,7 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         families
         plan = None
         module_ = owner
+        derived = False
     }
     checkOrphan(t, inst, d)
     match Map.get(t.instances, d.cls) {
@@ -1406,6 +1433,7 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
         families
         plan = None
         module_ = ""
+        derived = False
     }
     match Map.get(t.instances, cls) {
         Some(found) -> Vec.push(found, inst)
@@ -1597,6 +1625,7 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
             families = Vec.new(1),
         },
         names = Map.new(), families = Map.new(), plan = None, module_ = "",
+        derived = False,
     }
     match Map.get(t.instances, P.typedClass) {
         Some(found) -> Vec.push(found, inst)
@@ -1641,6 +1670,657 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
     t
 }
 
+-- -- derived instances ---------------------------------------------------------------
+--
+-- A type declaration's derive list, `type Suit : Ord = ...`, asks the
+-- compiler for an instance it builds from the declaration: each method
+-- compares, orders or hashes the constructors and then their fields, through
+-- the fields' own instances. Only the method `derivedMethod` names is built;
+-- the class's other methods are its defaults. `Turkey.Lower` writes the
+-- method, in Core, from the constructors; this section decides whether the
+-- instance exists and what its context is.
+--
+-- **On demand.** An instance is built the first time something asks for it:
+-- the check of its type's derive list (`checkDerives`), or a predicate that
+-- no written instance covers (`selectInstance`). A class a type's list does
+-- not ask for is never built for it.
+--
+-- **Its context is inferred, as GHC's deriving infers it**
+-- (`GHC.Tc.Deriv.Infer`). The class is wanted at each field's type, and
+-- each wanted is reduced through the instances that cover it until only
+-- classes over the type's own parameters remain: those are the context
+-- (`inferContext`). So `type M k v : Eq = M(Map k v)` gets
+-- `Eq (M k v) : Hash k, Eq v`, from `Map`'s own instance, and a phantom
+-- parameter, in no field's type, gets nothing. The instance is sound
+-- because its context is exactly what its fields' instances need: each
+-- method the lowering writes calls a field's instance, which the solver
+-- checks under that context (`Turkey.Infer.derivedFields`).
+--
+-- **A group is solved together, from below.** `type List a : Eq = Nil |
+-- Cons(a, List a)` needs `Eq (List a)` to derive `Eq (List a)`. Every
+-- instance begun while a derivation runs is in the table from the start,
+-- with an empty context, and `settle` infers each context again under the
+-- others until none changes: the least fixed point, as GHC's
+-- `inferInstanceContexts` finds it. It is never looped on: a context holds
+-- only classes over parameters, so it can grow only so far, and one
+-- reduction that grows without end, through a written instance whose
+-- context is no smaller than its head, stops at `reductionLimit` and is no
+-- instance. A non-regular type is not such a case: `Nest a` holding a
+-- `Nest (Array a)` reduces `Eq (Nest (Array a))` back to `Eq a`.
+
+type Derivation
+    -- Begun and not finished: assumed to exist, by what it is being derived
+    -- from.
+    = Deriving(InstInfo)
+    | Derived(InstInfo)
+    -- Cannot be derived, with the reason, as a diagnostic quotes it after
+    -- "'T' cannot derive 'Eq': " or "'T' has no 'Eq': ".
+    | Underivable(String)
+
+-- Returns the method a derived instance of `cls` defines, or `None` when
+-- `cls` cannot be derived. A derive list may name any class this accepts;
+-- one more is a line here and the body `Turkey.Lower` writes for its method.
+fun derivedMethod(cls : String) -> Option String =
+    if cls == P.eqClass { Some("eq") }
+    else if cls == P.ordClass { Some("lt") }
+    else if cls == P.hashClass { Some("hashInto") }
+    else { None }
+
+-- Returns whether the method `name` of `inst`'s class is the one `inst`, a
+-- derived instance, writes itself rather than taking from the class's
+-- default.
+fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
+    inst.derived && derivedMethod(inst.cls) == Some(surfaceMember(name))
+
+-- Whether `!` may refuse `cls`. `Ord` is derived only for a type that asks:
+-- a derived order follows the order the constructors are declared in, so a
+-- type should not acquire one unasked, and `!Ord` would refuse nothing.
+fun refusable(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
+
+fun derivationKey(cls : String, tycon : String) -> String = cls + " " + tycon
+
+-- Returns `cls`'s superclasses, transitively, each once, nearest first.
+fun superclassesOf(t : ClassTable, cls : String) -> Vec String {
+    let out = []
+    var i = -1
+    while i < len(out) {
+        let next = if i < 0 { cls } else { out[i] }
+        i = i + 1
+        if let Some(info) = Map.get(t.classes, next) {
+            for sup in info.supers {
+                if !Vec.contains(out, sup.name) && sup.name != cls { Vec.push(out, sup.name) }
+            }
+        }
+    }
+    out
+}
+
+-- Returns whether `tycon`'s derive list refuses `cls` with `!`.
+fun refuses(t : ClassTable, tycon : String, cls : String) -> Bool =
+    match Map.get(t.decls.tycons, tycon) {
+        Some(info) -> Iterator.any(info.derives, fun(d) = d.refused && d.cls == cls)
+        None -> False
+    }
+
+-- Returns whether `tycon`'s declaration asks for `cls`: its derive list names
+-- `cls`, or a class `cls` is a superclass of, and does not refuse `cls`. A
+-- derived `Hash` or `Ord` needs the type's `Eq` derived too, so asking for
+-- either asks for `Eq`.
+fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return False
+    }
+    if refuses(t, tycon, cls) { return False }
+    for d in info.derives {
+        if !d.refused && (d.cls == cls || Vec.contains(superclassesOf(t, d.cls), cls)) {
+            return True
+        }
+    }
+    False
+}
+
+-- Returns the instance of `cls` for `tycon` that a program wrote, if one did.
+fun writtenInstance(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
+    let key = "con " + tycon
+    for inst in instancesOf(t, cls) {
+        if !inst.derived && instHeadKey(inst.head) == key { return Some(inst) }
+    }
+    None
+}
+
+-- Returns the derived instance of `cls` for the type constructor `tycon`,
+-- deriving it now if it is not derived yet, or `None` when the declaration
+-- does not ask for it or it cannot be derived. The section comment says how.
+fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
+    let key = derivationKey(cls, tycon)
+    match Map.get(t.derivations, key) {
+        Some(Deriving(inst)) -> return Some(inst)
+        Some(Derived(inst)) -> return Some(inst)
+        Some(Underivable(_)) -> return None
+        None -> {}
+    }
+    if Option.isNone(derivedMethod(cls)) || !asksFor(t, tycon, cls) { return None }
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return None
+    }
+    let general = declaredHead(info)?
+    -- `checkDerives` begins every derivation an error-free program has, and
+    -- each begins those it needs, so the generator can check them all
+    -- (`Turkey.Infer.genDerived`). One the solver or the lowering would begin
+    -- later would never be checked. After an error the program stops before
+    -- solving, so a derivation not begun there is not needed.
+    if !t.checking && !t.deriving {
+        if Diag.hasErrors() { return None }
+        bug("'" + Ty.shortName(cls) + " " + Ty.shortName(tycon) + "' was first asked for "
+            + "after derive lists were checked", None)
+    }
+    let inst = begin(t, cls, info, general, key)
+    -- A derivation begun inside another is settled by the outermost one,
+    -- with the rest of its group.
+    if t.deriving { return Some(inst) }
+    t.deriving = True
+    settle(t)
+    t.deriving = False
+    Vec.clear(t.provisional)
+    match Map.get(t.derivations, key) {
+        Some(Derived(found)) -> Some(found)
+        _ -> None
+    }
+}
+
+-- Puts the derived instance of `cls` for `info` in the table with an empty
+-- context, the first approximation of its context, and returns it.
+fun begin(t : ClassTable, cls : String, info : TyconInfo, general : Ty.Type,
+          key : String) -> InstInfo {
+    let names = Map.new()
+    let (_, args) = Ty.spine(general)
+    for var i = 0; i < len(args) && i < len(info.params); i = i + 1 {
+        if let TVar(cell) = Ty.prune(args[i]) { Map.put(names, cell.id, info.params[i]) }
+    }
+    let span = Option.unwrapOr(info.span, generatedSpan())
+    let inst = InstInfo {
+        cls = cls, head = general, context = [], equalities = [],
+        decl = InstanceDecl {
+            span = span, cls = cls,
+            head = Type { id = 0, span = span, kind = TECon(info.name, Vec.new(1)) },
+            context = Vec.new(1), methods = Vec.new(1), families = Vec.new(1),
+        },
+        names = names, families = Map.new(), plan = None, module_ = "",
+        derived = True,
+    }
+    match Map.get(t.instances, cls) {
+        Some(found) -> Vec.push(found, inst)
+        None -> Map.put(t.instances, cls, [inst])
+    }
+    Map.put(t.derivations, key, Deriving(inst))
+    Vec.push(t.provisional, key)
+    inst
+}
+
+-- Finds the context of every derivation begun since the outermost one, as
+-- the least fixed point of `inferContext` over all of them together.
+--
+-- Each round infers every context again under the contexts the last round
+-- found, and withdraws an instance that has none. What a context implies
+-- only grows from round to round, since what the contexts it is inferred
+-- under imply only grows. Its predicates may change as it does, when `Ord a`
+-- comes to stand for an `Eq a` it implies. A withdrawn instance stays
+-- withdrawn, since every instance that relied on it fails next round. A
+-- context holds only classes over its own type's parameters, so there are
+-- finitely many it can grow to, and the rounds stop.
+fun settle(t : ClassTable) -> Unit {
+    var rounds = 0
+    loop {
+        var changed = False
+        -- A round may begin derivations of its own, which join this one.
+        var i = 0
+        while i < len(t.provisional) {
+            let key = t.provisional[i]
+            i = i + 1
+            if let Some(Deriving(inst)) = Map.get(t.derivations, key) {
+                match inferContext(t, inst) {
+                    Left(reason) -> {
+                        withdraw(t, inst)
+                        Map.put(t.derivations, key, Underivable(reason))
+                        changed = True
+                    }
+                    Right(context) -> if !sameContext(context, inst.context) {
+                        Vec.clear(inst.context)
+                        for q in context { Vec.push(inst.context, q) }
+                        changed = True
+                    }
+                }
+            }
+        }
+        if !changed { break }
+        rounds = rounds + 1
+        if rounds > roundLimit(t) {
+            bug("the contexts of derived instances did not settle", None)
+        }
+    }
+    for key in t.provisional {
+        if let Some(Deriving(inst)) = Map.get(t.derivations, key) {
+            Map.put(t.derivations, key, Derived(inst))
+            Vec.push(t.derived, inst)
+        }
+    }
+}
+
+-- More rounds than `settle` can take: one per class a context can gain over
+-- one parameter, and one per instance that can fail.
+fun roundLimit(t : ClassTable) -> Int {
+    var params = 0
+    for key in t.provisional {
+        if let Some(Deriving(inst)) = Map.get(t.derivations, key) {
+            params = params + len(Ty.spine(inst.head).1)
+        }
+    }
+    params * len(Map.keys(t.classes)) + len(t.provisional) + 1
+}
+
+fun sameContext(a : Vec Pred, b : Vec Pred) -> Bool {
+    if len(a) != len(b) { return False }
+    let keys = Set.new()
+    for p in a { Set.add(keys, Ty.predKey(p)) }
+    Iterator.all(b, fun(q) = Set.contains(keys, Ty.predKey(q)))
+}
+
+-- Takes the derived instance `inst` out of the table.
+fun withdraw(t : ClassTable, inst : InstInfo) -> Unit {
+    let found = instancesOf(t, inst.cls)
+    let key = instHeadKey(inst.head)
+    let kept = Vec.filter(found, fun(other) = !(other.derived && instHeadKey(other.head) == key))
+    Vec.clear(found)
+    for other in kept { Vec.push(found, other) }
+}
+
+-- Returns the type `info` declares, applied to its parameters as the
+-- constructors' results are: `Map k v`, over the variables they share.
+fun declaredHead(info : TyconInfo) -> Option Ty.Type {
+    if len(info.variants) == 0 { return None }
+    match Ty.prune(info.variants[0].scheme.body) {
+        TFun(_, ret) -> Some(ret)
+        _ -> None
+    }
+}
+
+-- Returns the context `inst` needs under the contexts the derivations being
+-- settled have now, or why it can have none.
+--
+-- This is GHC's `inferConstraints` with `simplifyDeriv`. What is wanted is
+-- the class at each field's type, and each superclass at the head itself, so
+-- that a derived `Ord`'s context entails its derived `Eq`'s. Each wanted is
+-- reduced through the instances that cover it until only classes over the
+-- type's own parameters are left. Those are the context, less any implied
+-- by another's superclasses. A wanted that reaches anything else, a type
+-- with no instance or `f a` over a parameter `f`, leaves no context that
+-- could hold, so there is no instance. A parameter only a phantom position
+-- mentions is in no field's type, so nothing is ever wanted of it.
+fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
+    let cls = inst.cls
+    let (h, args) = Ty.spine(inst.head)
+    let tycon = match h {
+        TCon(c) -> c.name
+        _ -> return Left("it is not a declared type")
+    }
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return Left("it is not a declared type")
+    }
+    let params = Set.new()
+    for a in args {
+        if let TVar(cell) = Ty.prune(a) { Set.add(params, cell.id) }
+    }
+    let n = writtenNamer(inst.names)
+    let wanted = []
+    for c in info.variants {
+        -- Two values of one existential constructor may hide different
+        -- types, so no instance for one hidden type compares them.
+        if len(c.existsNames) > 0 {
+            return Left("constructor '" + Ty.shortName(c.name) + "' hides the type '"
+                        + c.existsNames[0] + "'")
+        }
+        let types = match Decls.conFieldTypes(t.decls, inst.head, c.name) {
+            Some(ts) -> ts
+            None -> return Left("it is not a declared type")
+        }
+        for var i = 0; i < len(types); i = i + 1 {
+            if let Some(unmet) = reduce(t, Ty.pred(cls, [types[i]]), params, 0, wanted) {
+                let written = if i < len(c.written) { writtenType(t, c.written[i], 0) }
+                              else { Ty.showAt(types[i], n, 0) }
+                let fix = match unmet {
+                    Associated(_) | Equality(_, _) ->
+                        "; write 'instance " + Ty.shortName(cls) + " "
+                        + Ty.showAt(inst.head, n, 2) + "' by hand"
+                    _ -> ""
+                }
+                return Left(fieldName(c, i) + " has type '" + written + "'"
+                            + unmetTail(t, unmet, types[i], n) + fix)
+            }
+        }
+    }
+    match Map.get(t.classes, cls) {
+        Some(ci) -> for sup in ci.supers {
+            let shown = "'" + Ty.shortName(sup.name) + "'"
+            if Option.isSome(writtenInstance(t, sup.name, tycon)) {
+                return Left(shown + " is written by hand")
+            }
+            if refuses(t, tycon, sup.name) {
+                return Left(shown + " is refused with '!" + Ty.shortName(sup.name) + "'")
+            }
+            if Option.isSome(reduce(t, Ty.pred(sup.name, [inst.head]), params, 0, wanted)) {
+                return match Map.get(t.derivations, derivationKey(sup.name, tycon)) {
+                    Some(Underivable(reason)) -> Left(reason)
+                    _ -> Left(shown + " cannot be derived")
+                }
+            }
+        }
+        None -> {}
+    }
+    -- In the order of the parameters, then of the classes, so that a
+    -- dictionary's parameters do not depend on the order of the fields.
+    let position = Map.new()
+    for var i = 0; i < len(args); i = i + 1 {
+        if let TVar(cell) = Ty.prune(args[i]) { Map.put(position, cell.id, i) }
+    }
+    let ordered = Vec.sortByKey(minimal(t, wanted), fun(q) {
+        let at = match Ty.prune(q.args[0]) {
+            TVar(cell) -> Map.getOr(position, cell.id, 0)
+            _ -> 0
+        }
+        (at, q.name)
+    })
+    Right(ordered)
+}
+
+-- What stopped a wanted from reducing to classes over parameters.
+type Unmet
+    -- No instance covers `cls` at the type.
+    = Missing(String, Ty.Type)
+    -- The wanted kept needing more after `reductionLimit` steps that grew.
+    | Diverges(Pred)
+    -- The type is an associated type applied to a type.
+    | Associated(Ty.Type)
+    -- The instance for `cls` needs the equality, which does not hold as its
+    -- sides stand.
+    | Equality(String, Pred)
+
+-- More steps than this that do not ask for one of their instance head's
+-- variables (`shrinks`) are taken not to end. A step that does asks for a
+-- proper part of its wanted's type, and a run of those always ends, since a
+-- type is finite, so only the others are counted. A field's type nested any
+-- depth therefore reduces through instances like `Eq (Array a) : Eq a`, but
+-- not through more than this many like `Eq (R a) : Eq (Array a)`. A written
+-- instance's context may be no smaller than its head,
+-- `Eq (W a) : Eq (W (Array a))`, and nothing else stops it reducing for ever.
+let reductionLimit = 64
+
+-- Reduces the wanted `p` through the instances that cover it, adding each
+-- class over one of `params` it leaves to `out`, once. Returns what it could
+-- not reduce, if anything. `grown` is how many steps so far did not ask for
+-- one of their instance head's variables (`shrinks`).
+fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
+           out : Vec Pred) -> Option Unmet {
+    if grown > reductionLimit { return Some(Diverges(p)) }
+    let ty = Ty.prune(p.args[0])
+    if let TVar(cell) = ty {
+        if !Set.contains(params, cell.id) { return Some(Missing(p.name, ty)) }
+        let key = Ty.predKey(p)
+        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, p) }
+        return None
+    }
+    -- Match types against instances as they stand, with no associated type
+    -- reduced, and refuse a wanted that would need one reduced. The refusal
+    -- is conservative: it rejects some instances the solver would accept,
+    -- and accepts none it would reject. Whatever this accepts, the solver
+    -- must accept too, since it checks each field's instance under the
+    -- context found here (`Turkey.Infer.derivedFields`); a reduction here
+    -- that the solver did not make the same way would break that.
+    if let TFam(_, _, _) = ty { return Some(Associated(ty)) }
+    if let TVar(_) = Ty.spine(ty).0 { return Some(Missing(p.name, ty)) }
+    match selectInstance(t, p) {
+        None -> Some(Missing(p.name, ty))
+        Some((inst, mapping)) -> {
+            -- An equality whose sides are not one type as they stand has an
+            -- associated type on its left, which would have to be reduced.
+            for e in equalitiesAt(inst, mapping) {
+                if !Ty.sameType(e.args[0], e.args[1]) { return Some(Equality(p.name, e)) }
+            }
+            let headVars = Ty.freeVars(inst.head)
+            let wanted = contextAt(inst, mapping)
+            for var i = 0; i < len(wanted); i = i + 1 {
+                let next = if shrinks(inst.context[i], headVars) { grown } else { grown + 1 }
+                if let Some(unmet) = reduce(t, wanted[i], params, next, out) { return Some(unmet) }
+            }
+            None
+        }
+    }
+}
+
+-- Returns whether the instance context predicate `q` asks for a proper part
+-- of whatever type its instance's head matches, given `headVars`, the
+-- variables of that head. A head is never a bare variable, so a variable of
+-- the head stands for a proper part of the matched type. Deciding this from
+-- the instance rather than from the types it is matched at costs only the
+-- instance's size; a matched type can be exponentially large as a tree,
+-- `W ((a, a), (a, a))` after two steps of `Eq (W a) : Eq (W (a, a))`, though
+-- its nodes are shared.
+fun shrinks(q : Pred, headVars : Set.Set Int) -> Bool = match Ty.prune(q.args[0]) {
+    TVar(cell) -> Set.contains(headVars, cell.id)
+    _ -> False
+}
+
+-- How a reason chain names field `i` of constructor `c`.
+fun fieldName(c : ConInfo, i : Int) -> String = match c.fields {
+    Some(labels) -> "field '" + labels[i] + "'"
+    None -> "field " + Int.toString(i) + " of '" + Ty.shortName(c.name) + "'"
+}
+
+-- Returns the rest of a reason chain about a field of type `ty`, which
+-- `unmet` stopped from having the class.
+fun unmetTail(t : ClassTable, unmet : Unmet, ty : Ty.Type, n : Ty.Namer) -> String =
+    match unmet {
+        Missing(cls, leaf) -> {
+            let inside = if Ty.sameType(leaf, ty) { "" }
+                         else { ", which contains '" + Ty.showAt(leaf, n, 0) + "'" }
+            inside + whyNot(t, cls, leaf)
+        }
+        Diverges(p) -> ", whose '" + Ty.shortName(p.name) + "' needs '"
+                       + Ty.shortName(p.name) + "' at ever larger types"
+        Associated(leaf) -> {
+            let shown = "'" + Ty.showAt(leaf, n, 0) + "'"
+            let what = if Ty.sameType(leaf, ty) { ", which is an associated type" }
+                       else { ", which contains " + shown + ", an associated type" }
+            what + ", and a derived instance cannot reduce one"
+        }
+        Equality(cls, e) -> ", whose '" + Ty.shortName(cls) + "' needs '"
+                            + Ty.showAt(e.args[0], n, 0) + " ~ " + Ty.showAt(e.args[1], n, 0)
+                            + "', and a derived instance cannot reduce an associated type"
+    }
+
+-- Returns `te`, a type as a declaration wrote it, as a diagnostic quotes it:
+-- an alias by its own name, not by what it stands for.
+fun writtenType(t : ClassTable, te : Type, prec : Int) -> String = match te.kind {
+    TEVar(name) -> name
+    TECon(name, args) -> applied(t, writtenName(t, name), args, prec)
+    TEApp(head, args) -> applied(t, writtenType(t, head, 2), args, prec)
+    TETuple(elems) -> "(" + String.join(Vec.map(elems, writtenType(t, _, 0)), ", ") + ")"
+    TEFun(ps, ret) -> {
+        let out = "fun(" + String.join(Vec.map(ps, writtenType(t, _, 0)), ", ") + ") -> "
+                  + writtenType(t, ret, 0)
+        if prec > 0 { "(" + out + ")" } else { out }
+    }
+}
+
+-- An alias by its short name: one that names a built-in type, `Int` for
+-- `Prim.Int`, shares that name with the type, and a type is qualified where
+-- two share a name. An associated type is named by its member alone, as a
+-- program writes it.
+fun writtenName(t : ClassTable, name : String) -> String = match Map.get(t.decls.tycons, name) {
+    Some(info) -> if info.isAlias { Ty.shortName(name) } else { Ty.display(name) }
+    None -> if Map.contains(t.decls.families, name) { Ty.bareName(name) }
+            else { Ty.display(name) }
+}
+
+fun applied(t : ClassTable, head : String, args : Vec Type, prec : Int) -> String {
+    if len(args) == 0 { return head }
+    let out = head + " " + String.join(Vec.map(args, writtenType(t, _, 2)), " ")
+    if prec > 1 { "(" + out + ")" } else { out }
+}
+
+-- The end of a reason chain about `ty`, which has no `cls`.
+fun whyNot(t : ClassTable, cls : String, ty : Ty.Type) -> String {
+    let shown = "'" + Ty.shortName(cls) + "'"
+    let (h, _) = Ty.spine(Ty.prune(ty))
+    if let TCon(c) = h {
+        if refuses(t, c.name, cls) { return ", which opts out of " + shown }
+        if let Some(Underivable(reason)) = Map.get(t.derivations, derivationKey(cls, c.name)) {
+            return ", whose " + reason
+        }
+    }
+    ", which has no " + shown
+}
+
+-- Returns why the predicate `p`, which no instance covers, has none, when the
+-- declaration of its type says why: it refuses the class, or asks for it and
+-- it cannot be derived.
+fun whyMissing(t : ClassTable, p : Pred) -> Option String {
+    let (h, _) = Ty.spine(Ty.prune(p.args[0]))
+    let c = match h {
+        TCon(c) -> c
+        _ -> return None
+    }
+    let lead = "'" + Ty.shortName(c.name) + "' has no '" + Ty.shortName(p.name) + "': "
+    if refuses(t, c.name, p.name) {
+        return Some(lead + "its declaration says '!" + Ty.shortName(p.name) + "'")
+    }
+    match Map.get(t.derivations, derivationKey(p.name, c.name)) {
+        Some(Underivable(reason)) -> Some(lead + reason)
+        _ -> None
+    }
+}
+
+-- Checks the derive list of each declaration in `decls`, once every class
+-- and instance they could name is in the table, and derives each class an
+-- entry asks for, reporting at the entry why one cannot be.
+fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
+    t.checking = True
+    checkDeclarations(t, decls)
+    t.checking = False
+}
+
+fun checkDeclarations(t : ClassTable, decls : Vec TypeDecl) -> Unit {
+    for d in decls {
+        if Option.isSome(d.alias) || !Map.contains(t.decls.tycons, d.name) { continue }
+        let wanted = []
+        let seen : Vec Derive = []
+        var valid = True
+        for entry in d.derives {
+            if let Some(earlier) = Iterator.find(seen, fun(e) = e.cls == entry.cls) {
+                let cls = "'" + Ty.shortName(entry.cls) + "'"
+                let ty = "'" + Ty.shortName(d.name) + "'"
+                report(if earlier.refused == entry.refused {
+                    cls + " appears twice in the derive list of " + ty
+                } else {
+                    ty + " both derives and refuses " + cls
+                }, Some(entry.span))
+                valid = False
+                continue
+            }
+            Vec.push(seen, entry)
+            if !checkEntry(t, d, entry) {
+                valid = False
+            } else if !entry.refused {
+                Vec.push(wanted, entry)
+            }
+        }
+        -- A list with a mistake in it does not say what to derive.
+        if !valid { continue }
+        for entry in wanted {
+            if Option.isNone(derive(t, entry.cls, d.name)) {
+                -- A derivation that failed with no reason found no
+                -- constructors to read, which the declaration table has
+                -- reported already.
+                let state = Map.get(t.derivations, derivationKey(entry.cls, d.name))
+                if let Some(Underivable(reason)) = state {
+                    report("'" + Ty.shortName(d.name) + "' cannot derive '"
+                           + Ty.shortName(entry.cls) + "': " + reason, Some(entry.span))
+                }
+            }
+        }
+    }
+}
+
+-- Reports what is wrong with one derive list entry, other than whether its
+-- class can be derived for the type, and returns whether nothing is.
+fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
+    let ty = "'" + Ty.shortName(d.name) + "'"
+    let cls = "'" + Ty.shortName(entry.cls) + "'"
+    let refusal = "'!" + Ty.shortName(entry.cls) + "'"
+    let at = Some(entry.span)
+    if !Map.contains(t.classes, entry.cls) {
+        report("unknown class '" + entry.cls + "'", at)
+        return False
+    }
+    if entry.cls == P.typedClass {
+        if entry.refused {
+            report("every type has 'Typed', so '!Typed' cannot refuse it", at)
+        } else {
+            report("every type has 'Typed' already, so it cannot be derived; "
+                   + "remove it from the list", at)
+        }
+        return False
+    }
+    if Option.isNone(derivedMethod(entry.cls)) {
+        if entry.refused {
+            report(cls + " is never derived, so " + refusal + " has no effect; remove it", at)
+        } else {
+            report(cls + " cannot be derived; write 'instance " + Ty.shortName(entry.cls)
+                   + " " + Ty.shortName(d.name) + "' instead", at)
+        }
+        return False
+    }
+    if let Some(inst) = writtenInstance(t, entry.cls, d.name) {
+        if entry.refused {
+            report(ty + " has an instance of " + cls + " at "
+                   + Source.showSpan(inst.decl.span) + ", so " + refusal
+                   + " cannot refuse it; remove one of them", at)
+        } else {
+            report(ty + " already has an instance of " + cls + " at "
+                   + Source.showSpan(inst.decl.span) + ", so it cannot also derive one; "
+                   + "remove one of them", at)
+        }
+        return False
+    }
+    if entry.refused {
+        if !refusable(entry.cls) {
+            report(cls + " is derived only when a type asks for it, so " + refusal
+                   + " has no effect; remove it", at)
+            return False
+        }
+        return True
+    }
+    for sup in superclassesOf(t, entry.cls) {
+        let supName = "'" + Ty.shortName(sup) + "'"
+        if refuses(t, d.name, sup) {
+            report("deriving " + cls + " derives " + supName + " as well, which '!"
+                   + Ty.shortName(sup) + "' refuses; remove one of them", at)
+            return False
+        }
+        if Option.isSome(writtenInstance(t, sup, d.name)) {
+            report(ty + " cannot derive " + cls + " while its " + supName
+                   + " is written by hand; write 'instance " + Ty.shortName(entry.cls)
+                   + " " + Ty.shortName(d.name) + "' too, or remove 'instance "
+                   + Ty.shortName(sup) + " " + Ty.shortName(d.name) + "' and derive "
+                   + supName, at)
+            return False
+        }
+    }
+    True
+}
+
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) =
     Option.map(selectInstance(t, p), fun((inst, mapping)) = contextAt(inst, mapping))
 
@@ -1672,6 +2352,16 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     for inst in instancesOf(t, p.name) {
         if let Some(mapping) = match_(inst.head, p.args[0]) {
             return Some((inst, mapping))
+        }
+    }
+    -- After the table, so that an instance written by hand is the one found
+    -- and nothing is derived beside it.
+    let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
+    if let TCon(c) = receiver {
+        if let Some(inst) = derive(t, p.name, c.name) {
+            if let Some(mapping) = match_(inst.head, p.args[0]) {
+                return Some((inst, mapping))
+            }
         }
     }
     None

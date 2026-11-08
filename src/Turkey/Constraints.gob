@@ -67,24 +67,37 @@ export (
 --
 -- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
 -- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
--- carries the skolems, so the implication's level is that `CLet`'s rank. Two
--- rules hold of it:
+-- carries the skolems, so the implication's level is that `CLet`'s rank.
+-- Three rules hold of it:
 --
--- * Its body is solved against its givens to a *residual*, the wanteds
---   still inert when the `CLet` generalizes. A residual predicate
---   over variables of the implication's own rank is reported by the split,
---   because no scheme of a signature carries it. One over an outer variable
---   floats to the enclosing scope, unless it mentions one of the skolems:
---   then it is reported where it arose (`confine`). So no predicate that
---   mentions a skolem outlives the skolem's scope, and no outer variable is
---   ever bound to a type built from one.
--- * While an equality given is in scope, a variable born outside the
---   implication is *untouchable*: `Ty.unify` does not bind it, and defers the
---   equation instead, which then floats out with the residual. A given such
---   as `F b ~ Int` admits more than one solution for an outer `x` in
---   `x ~ Int` -- `Int` and `F b` both fit -- and choosing one would be a
---   guess the enclosing scope never sees (OutsideIn(X), Example 5.1). Class
---   givens add no such choice, so they leave every variable touchable.
+-- * **Nothing floats out of it.** Its body is solved against its givens, and
+--   what is still inert when the body has been solved is its *residual*,
+--   which stays in it, with its givens. The implication then stays nested in
+--   the enclosing one (`Implication.children`, GHC's `wc_impl`) until a
+--   unification outside wakes a wanted of the residual, which is then solved
+--   in the implication again (`solveNested`). The paper's rule solve (Fig.
+--   14) solves each implication completely and floats nothing; §5.6.1
+--   describes floating as an extension it does not formalize, and GHC
+--   replaced it with unifying in place (Note [Unification preconditions]:
+--   "It's much easier to unify in-place, with no floating").
+-- * **A residual reaches a scheme only through `approximate`**, GHC's
+--   `approximateWC`: a binding group may quantify over a residual wanted that
+--   mentions no skolem of the implications it is in, unless it is an
+--   equality under an equality given (`retained`). A residual over the
+--   implication's own rank that no scheme carries is reported by the split,
+--   and one over an outer variable that mentions a skolem by `confine`, so
+--   no outer variable is ever bound to a type built from a skolem.
+-- * **An equality given makes outer variables untouchable.** While one is
+--   in scope, `Ty.unify` binds no variable born outside the implication, and
+--   defers the equation instead, which stays in the residual. Under
+--   `F Bool ~ Int`, the outer `a` in `(g ~ Bool) => a ~ Int`, for a `g` from
+--   outside the implication too, has two incomparable solutions, `Int` and
+--   `F g`, and choosing one would be a guess the enclosing scope never sees
+--   (OutsideIn(X), Example 5.1). Were `g` a skolem of the implication, the
+--   given would be let-bound, as below. A
+--   let-bound given such as `a ~ Int`, for a skolem `a` of the implication
+--   itself, rewrites `a` away and adds no such choice, and neither does a
+--   class given, so those leave every variable touchable (`hasGivenEqs`).
 --
 -- **The wanteds are solved by OutsideIn(X)'s simplifier** (§7, and §8.2 for
 -- its shape): each implication has a work list and an inert set of wanteds,
@@ -356,19 +369,51 @@ type Implication = Implication {
     -- The equality givens, canonical.
     inert       : Inert.Inert,
     -- The highest rank whose variables are untouchable: the rank a `CAssume`
-    -- with an equality among its givens was entered at, or `Ty.noScope` when
-    -- no such given is in scope.
+    -- was entered at whose givens include an equality that is not let-bound
+    -- (`hasGivenEqs`) or one that was refused, or `Ty.noScope` when no such
+    -- given is in scope.
     untouchable : Int,
+    -- The skolems this implication binds: GHC's `ic_skols`.
+    skolems     : Vec ConCell,
+    -- Whether its own givens make outer variables untouchable: GHC's
+    -- `ic_given_eqs` being `MaybeGivenEqs`.
+    givenEqs    : Bool,
+    -- The inert set its own equality givens made, if they made one, which
+    -- only it may close (`Inert.close`) and reopen.
+    made        : Option Inert.Inert,
+    -- Whether its givens can never hold, so that nothing solved in it is
+    -- reported.
+    muted       : Bool,
+    -- The binder of the declaration it checks, as the tree spells it, for a
+    -- diagnostic: `%sig.f` for a signature, `%opened` for a pattern.
+    owner       : String,
+    -- The implication it is nested in, if it is a `CAssume`'s.
+    parent      : Option Implication,
     -- The wanteds of this implication still to be solved.
     work        : WorkList,
     -- The wanteds of this implication that no rule applies to.
     wanted      : Inerts,
+    -- The implications nested in this one that ended with wanteds left:
+    -- GHC's `wc_impl`. Each is solved again when a unification wakes one of
+    -- its wanteds (`solveNested`), and is dropped once nothing is left in it.
+    var children : Vec Implication,
 }
 
--- Returns an implication with no wanteds.
+-- Returns an implication with no wanteds, binding no skolems: the top level,
+-- or a binding group's scheme.
 fun implication(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
                 blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
-                untouchable : Int) -> Implication {
+                untouchable : Int) -> Implication =
+    nested(classes, id, assumptions, blocked, checks, inert, untouchable, [], False, None,
+           False, "", None)
+
+-- Returns an implication with no wanteds, for a `CAssume` that binds
+-- `skolems` and checks the declaration `owner`.
+fun nested(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
+           blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
+           untouchable : Int, skolems : Vec ConCell, givenEqs : Bool,
+           made : Option Inert.Inert, muted : Bool, owner : String,
+           parent : Option Implication) -> Implication {
     let matchable = Vec.new(len(assumptions))
     for var i = 0; i < len(assumptions); i = i + 1 {
         let a = assumptions[i].1
@@ -380,9 +425,9 @@ fun implication(classes : ClassTable, id : Int, assumptions : Vec (String, Pred)
     }
     Implication {
         id = id, assumptions = assumptions, blocked = blocked, checks = checks,
-        matchable = matchable,
-        inert = inert,
-        untouchable = untouchable,
+        matchable = matchable, inert = inert,
+        untouchable = untouchable, skolems = skolems, givenEqs = givenEqs, made = made,
+        muted = muted, owner = owner, parent = parent, children = Vec.new(0),
         work = WorkList {
             eqs = Vec.new(4), nextEq = 0, rest = Vec.new(8), nextRest = 0,
             eqsNow = Vec.new(4), restNow = Vec.new(4),
@@ -675,7 +720,8 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     -- part, so the part it defers is stuck at its head, but what is below the
     -- head may be what a given decides -- `x ~ Option (Elem b)` for an
     -- untouchable `x`, under `Elem b ~ Int`, is `x ~ Option Int`, which no
-    -- longer mentions `b` and may leave the implication.
+    -- longer mentions `b`, so `confine` does not refuse it, and a later
+    -- binding of `x` decides it.
     let left0 = Inert.rewrite(s.here.inert, a)
     let right0 = Inert.rewrite(s.here.inert, b)
     if Ty.sameType(left0, right0) { return {} }
@@ -732,19 +778,24 @@ fun run(s : Solver, c : Constraint) -> Unit {
     -- a single module. So a top-level binding the value restriction keeps
     -- monomorphic has its literals and class constraints settled by the uses
     -- in its own component, and a module that imports it from outside,
-    -- checked in a later run, is too late to decide them. Its plain type variables are another matter:
-    -- nothing here defaults them, so they stay open in the shared environment
-    -- and an importer's uses fix them.
+    -- checked in a later run, is too late to decide them. Its plain type
+    -- variables are another matter: only an equality that an equality given
+    -- left stuck decides one here (`defaultEqualities`), so the rest stay open
+    -- in the shared environment and an importer's uses fix them.
+    --
+    -- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
+    -- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal
+    -- whose type an equality decides takes that type, not the default.
     var going = True
     while going {
-        let open = members(s.here)
-        if len(open) > 0 && applyDefaults(s, open) {
+        let open = everywhere(s.here)
+        if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open) {
             solveWanteds(s)
         } else {
             going = False
         }
     }
-    rejectStranded(s, members(s.here))
+    rejectStranded(s, everywhere(s.here))
     if !Diag.hasErrors() { discard(unsuppress(s, 0)) }
     forgetSuppressed(s, 0)
 }
@@ -787,15 +838,19 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
                 Vec.push(assumptions, (n, p))
             }
         }
+        let skolems = match body {
+            CLet(cell) -> cell.skolems
+            _ -> Vec.new(0)
+        }
         -- The equalities written here, and those the class givens' equality
-        -- superclasses grant: either kind makes outer variables untouchable.
+        -- superclasses grant.
         let equalities = Inert.granted(s.classes, Vec.toArray(written))
-        if len(equalities) > 0 && rank(s) > untouchable { untouchable = rank(s) }
         -- The inert set this implication made, if it made one: only that one
         -- is closed on the way out (`Inert.close`), never the enclosing one it
         -- extends or shares.
         var made = None
         var inaccessible = False
+        var givenEqs = False
         if len(equalities) > 0 {
             -- Breakers at the rank of the body's `CLet`, so the equalities
             -- defining them stay inside the implication.
@@ -805,14 +860,24 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
             }
             inert = extended
             made = Some(extended)
+            -- A given that was refused is not in the set, but it is an
+            -- equality all the same, as GHC's `updGivenEqs` counts every
+            -- given that "is an equality ... or /might/ be".
+            givenEqs = len(refused) > 0 || hasGivenEqs(extended, outside.inert, skolems, rank(s))
         }
+        if givenEqs && rank(s) > untouchable { untouchable = rank(s) }
         s.entered = s.entered + 1
+        let owner = match body {
+            CLet(cell) -> if len(cell.binds) == 0 { "" } else { cell.binds[0].1 }
+            _ -> ""
+        }
         let checks = match head {
             Some(h) -> Some(h)
             None -> outside.checks
         }
-        let inside = implication(s.classes, s.entered, assumptions, blocked, checks, inert,
-                                 untouchable)
+        let inside = nested(s.classes, s.entered, assumptions, blocked, checks, inert,
+                            untouchable, skolems, givenEqs, made, inaccessible, owner,
+                            Some(outside))
         s.here = inside
         let assumed = newScope()
         assumed.givens = named
@@ -830,18 +895,18 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
             Diag.endMuted()
             for var i = firstUse; i < len(s.uses); i = i + 1 { s.uses[i].inaccessible = True }
         }
-        -- What is still inert inside has floated out: it mentions no skolem
-        -- of this implication (`confine`), so it is solved outside it, with
-        -- the givens there. Moved before the inert set is closed, after which
-        -- its cycle breakers stand for their family applications and
-        -- rewriting with it would not end.
-        floatOut(inside, outside)
         match made {
             Some(i) -> Inert.close(i)
             None -> {}
         }
         s.here = outside
         discard(Vec.pop(s.scopes))
+        -- What is left stays in this implication, with its givens, as GHC
+        -- keeps an unsolved implication in its parent's `wc_impl`: nothing
+        -- floats out of an implication. A unification outside may wake one of
+        -- its wanteds, and then it is solved here again (`solveNested`); a
+        -- binding group reads its candidates out of it (`approximate`).
+        if unsolved(inside) { Vec.push(outside.children, inside) }
     }
     CDef(binds, body, top) -> {
         if top { decideTopLevelLiterals(s) }
@@ -902,6 +967,41 @@ fun refusedHere(r : Inert.Refusal, body : Constraint) -> Bool = match r {
                      + "add; state fewer of them", firstSpan(g.span, assumptionSpan(body)))
         False
     }
+}
+
+-- Returns whether the equality givens an implication entered at rank `level`
+-- added to `base`, making `extended`, make the variables of outer ranks
+-- untouchable inside it. The implication binds `skolems`.
+--
+-- This is GHC's `updGivenEqs` (Note [Tracking Given equalities] in
+-- `GHC.Tc.Solver.InertSet`): a given equality counts unless it is a
+-- *let-bound skolem* (TGE1, Note [Let-bound skolems]). Such a given, `a ~ ty`
+-- with `a` bound by this very implication, "is pretty much a let-binding ...
+-- It is not adding any new, local equality information": every `a` is
+-- rewritten away, and no outer variable gains a second solution. The test is
+-- made on the canonical givens, after rewriting by the instances and the
+-- enclosing givens (TGE3), so `Elem (Option a) ~ Int`, which reduces to
+-- `a ~ Int`, is one. An equality the new givens kicked out of `base` and
+-- rewrote is added here too, and is judged like the rest, as GHC adds it
+-- again at the inner level.
+fun hasGivenEqs(extended : Inert.Inert, base : Inert.Inert, skolems : Vec ConCell,
+                level : Int) -> Bool {
+    let own = Set.new()
+    for k in skolems { Set.add(own, k.uid) }
+    !Iterator.all(Inert.added(extended, base), fun((lhs, rhs)) = match Ty.prune(lhs) {
+        -- `F tys ~ a` (LBS2), and a cycle breaker on either side (LBS3).
+        TFam(_, _, _) -> bindsHere(rhs, own, level)
+        _ -> bindsHere(lhs, own, level)
+    })
+}
+
+-- Returns whether `t` is a skolem in `own` or a variable younger than
+-- `level`: one bound by the implication entered at `level`, not an outer one
+-- (GHC's `not (isOuterTyVar tclvl tv)`).
+fun bindsHere(t : Ty.Type, own : Set.Set Int, level : Int) -> Bool = match Ty.prune(t) {
+    TCon(con) -> con.uid != 0 && Set.contains(own, con.uid)
+    TVar(v) -> v.level > level
+    _ -> False
 }
 
 -- Returns where the declaration an implication checks is: the body of a
@@ -1319,6 +1419,8 @@ fun openRefs(c : Constraint, open : Map Int String, out : Vec Int) -> Unit = mat
 fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     if c.topLevel { Diag.beginUnit() }
     let mark = len(s.suppressed)
+    -- The implications the definition nests are entered after this.
+    let after = s.entered
     let scope = newScope()
     Vec.push(s.scopes, scope)
     let firstUse = len(s.uses)
@@ -1328,20 +1430,27 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     if checkRefusals(s, rank(s)) { solveWanteds(s) }
     confine(s, c.skolems)
     let types = Array.map(c.binds, _.2)
-    let retainedPreds = split(s, types)
+    let retainedPreds = split(s, c, types, after)
+    -- Read before the scheme's implication rewrites the retained wanteds. A
+    -- `superclass` wanted is no candidate: it exists to rewrite others, and
+    -- the wanted it came from implies it.
+    let candidates = Vec.new(len(retainedPreds))
+    let nested = Vec.new(0)
+    for w in retainedPreds {
+        if w.superclass { continue }
+        if placedIn(w, s.here) {
+            Vec.push(candidates, w.pred)
+        } else {
+            Vec.push(nested, w)
+        }
+    }
+    for p in resimplified(s, nested) { Vec.push(candidates, p) }
     -- An equation tied to a variable this binder quantifies can never be decided
     -- by an enclosing one -- nothing outside mentions the variable -- so this is
     -- where it is stuck for good.
     match Vec.pop(s.pools) {
         Some(young) -> dischargePool(s, young)
         None -> {}
-    }
-    -- Read before the scheme's implication rewrites the retained wanteds. A
-    -- `superclass` wanted is no candidate: it exists to rewrite others, and
-    -- the wanted it came from implies it.
-    let candidates = Vec.new(len(retainedPreds))
-    for w in retainedPreds {
-        if !w.superclass { Vec.push(candidates, w.pred) }
     }
     -- A wanted that can never hold is a definite error, and then the group
     -- quantifies over nothing: OutsideIn(X) §7.3, "We do not want to
@@ -1477,6 +1586,51 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
     if !c.topLevel { for (id, _, _) in c.binds { unbind(s.env, id) } }
 }
 
+-- Returns whether `c` arose in `impl` itself, not in an implication nested
+-- in it.
+fun placedIn(c : PredCell, impl : Implication) -> Bool = match c.at {
+    Some(i) -> i.id == impl.id
+    None -> True
+}
+
+-- Returns the residual of `nested`, wanteds that a binding group takes as
+-- candidates from implications nested in its own, solved again as fresh
+-- wanteds at the group's rank. This is GHC's `simplify_cand`
+-- (`defaultTyVarsAndSimplify`, Note [Unconditionally resimplify constraints
+-- when quantifying]), which solves clones of the candidates "setTcLevel
+-- rhs_tclvl" and quantifies over what is left.
+--
+-- A wanted in a nested implication was solved under that implication's
+-- givens, which may have kept it from an instance: under `C (Box b)`, the
+-- wanted `C (Box a)` might yet be the given, so it waited. At the group's
+-- rank no such given is in scope, and `C (Box a)` reduces through the
+-- instance to its context. The clones are solved with the givens of `s.here`
+-- and every variable outside the group untouchable, and their evidence is
+-- thrown away. The wanteds themselves are solved in the scheme's
+-- implication, as every retained wanted is (`solveUnderScheme`). The group's
+-- own residual needs no second solve: it was solved at this rank already.
+fun resimplified(s : Solver, nested : Vec PredCell) -> Vec Pred {
+    if len(nested) == 0 { return Vec.new(0) }
+    let outside = s.here
+    s.entered = s.entered + 1
+    let impl = implication(s.classes, s.entered, outside.assumptions, outside.blocked,
+                           outside.checks, outside.inert, rank(s) - 1)
+    s.here = impl
+    for w in nested {
+        let clone = newCell(w.pred, w.span, w.context, newHole())
+        clone.at = Some(impl)
+        queue(clone)
+    }
+    solveWanteds(s)
+    let out = Vec.new(len(nested))
+    for c in members(impl) {
+        if !c.superclass { Vec.push(out, c.pred) }
+        take(c)
+    }
+    s.here = outside
+    out
+}
+
 -- Returns the predicates the group's schemes quantify over, given the
 -- `candidates` it retained: `decideQuantification`'s Step 4 in GHC's
 -- `GHC.Tc.Solver`.
@@ -1566,11 +1720,11 @@ fun inferredDiff(s : Solver, annotated : Vec Pred, inferred : Vec Pred) -> Vec P
 -- a superclass, and `classRule` asks the givens before it looks for an
 -- instance.
 --
--- Every wanted mentions only variables of the group's rank, so nothing
--- floats out, and nothing the enclosing scope learns later could change the
--- outcome: the implication is solved at once rather than emitted. The
--- quantified predicates entail every wanted by construction (`quantified`),
--- so a wanted left over is a bug, unless an error left it. After a
+-- Every wanted mentions only variables of the group's rank, so nothing the
+-- enclosing scope learns later could change the outcome: the implication is
+-- solved at once rather than emitted. The quantified predicates entail every
+-- wanted by construction (`quantified`), so a wanted left over is a bug,
+-- unless an error left it. After a
 -- `definite` error nothing is quantified, and what is left over is the
 -- residual, which `blame` or `unsuppress` reports.
 fun solveUnderScheme(s : Solver, c : LetCell, named : Vec (String, Pred),
@@ -1754,11 +1908,11 @@ fun holdsScope(scopes : Vec Scope, wanted : Scope) -> Bool {
 -- mentions a variable that appears in no type being generalized, so no use site
 -- will ever pin it. Choosing for one can unblock another, so the split is redone
 -- until it stops moving.
-fun split(s : Solver, types : Array Ty.Type) -> Vec PredCell {
+fun split(s : Solver, c : LetCell, types : Array Ty.Type, after : Int) -> Vec PredCell {
     var going = True
     var out = []
     while going {
-        let retainedPreds = retained(s, rank(s) - 1)
+        let retainedPreds = retained(s, rank(s) - 1, after, c.topLevel, types)
         -- An array literal's container is never quantified, even when the
         -- binding's type mentions it: lowering builds each literal as one
         -- constructor, chosen once, where a quantified container would need a
@@ -1774,6 +1928,9 @@ fun split(s : Solver, types : Array Ty.Type) -> Vec PredCell {
             if !isArrayLiteralDemand(p) && !isOccursEquation(p) { Vec.push(stranded, p) }
         }
         if len(stranded) == 0 || !applyDefaults(s, stranded) {
+            -- An equality that can never be solved is what leaves the others
+            -- undecided, most often, so it is reported first.
+            if c.topLevel { rejectQuantified(s, c, after) }
             rejectStranded(s, stranded)
             out = retainedPreds
             going = False
@@ -1830,7 +1987,7 @@ fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
 --   `kickOutRewritable`, Note [The KickOut Criteria]);
 -- * another numeric literal's demand on the same type narrows its set
 --   (`narrowed`);
--- * its implication ends, and it floats to the enclosing one (`floatOut`).
+-- * a binding group takes it into a scheme (`retained`).
 --
 -- Nothing else changes what an inert wanted rewrites to. The givens and the
 -- instances are fixed, and a variable's level only ever drops, which can
@@ -1892,16 +2049,75 @@ fun solveSimples(s : Solver) -> Unit {
 -- work list is empty, and then, if wanteds are left, expanding their
 -- superclasses and solving again, until there is nothing new to expand
 -- (`simplify_loop` and `maybe_simplify_again` in `GHC.Tc.Solver.Solve`).
+-- Then the nested implications a unification has woken a wanted in are
+-- solved (`solveNested`), and if that woke a wanted here, all of it again.
 --
 -- The givens' superclasses were expanded when the implication was made
 -- (`implication`, `Inert.granted`), so only the wanteds' are pending here.
 -- Each class wanted is expanded once, and what it expands to is equalities,
--- which expand to nothing, so this ends when solving does.
+-- which expand to nothing. A nested implication wakes a wanted here only by
+-- binding a variable, and each variable is bound once. So this ends when
+-- solving does.
 fun solveWanteds(s : Solver) -> Unit {
     if s.draining { return {} }
-    solveSimples(s)
-    while expandSuperclasses(s) { solveSimples(s) }
+    loop {
+        solveSimples(s)
+        while expandSuperclasses(s) { solveSimples(s) }
+        solveNested(s)
+        if !hasWork(s.here.work) { break }
+    }
 }
+
+-- Solves each implication nested in `s.here` that has a wanted to solve,
+-- inside it, and drops each that has nothing left: GHC's
+-- `solveNestedImplications`.
+--
+-- Inside one, its own givens and untouchable rank apply, and its inert set is
+-- reopened for the duration (`Inert.reopen`), since its cycle breakers were
+-- closed when its scope first ended. What is solved under givens that can
+-- never hold is not reported, as when it was first solved.
+--
+-- Only an implication with a woken wanted is entered. Nothing else changes
+-- what its inert wanteds rewrite to (`solveSimples`), so the rest are as
+-- solved as they were.
+fun solveNested(s : Solver) -> Unit {
+    let here = s.here
+    if len(here.children) == 0 { return {} }
+    let left = Vec.new(len(here.children))
+    for child in here.children {
+        if pending(child) {
+            match child.made {
+                Some(i) -> Inert.reopen(i)
+                None -> {}
+            }
+            if child.muted { Diag.beginMuted() }
+            s.here = child
+            solveWanteds(s)
+            s.here = here
+            if child.muted { Diag.endMuted() }
+            match child.made {
+                Some(i) -> Inert.close(i)
+                None -> {}
+            }
+        }
+        if unsolved(child) { Vec.push(left, child) }
+    }
+    here.children = left
+}
+
+-- Returns whether `w` holds a wanted not yet taken off it.
+fun hasWork(w : WorkList) -> Bool =
+    len(w.eqsNow) > 0 || w.nextEq < len(w.eqs) || len(w.restNow) > 0 || w.nextRest < len(w.rest)
+
+-- Returns whether `impl`, or an implication nested in it, has a wanted on its
+-- work list.
+fun pending(impl : Implication) -> Bool =
+    hasWork(impl.work) || Iterator.any(impl.children, pending)
+
+-- Returns whether `impl`, or an implication nested in it, has a wanted left.
+fun unsolved(impl : Implication) -> Bool =
+    pending(impl) || Iterator.any(impl.wanted.cells, restsIn(_, impl))
+        || Iterator.any(impl.children, unsolved)
 
 -- Queues the equality superclasses of every inert class wanted of `s.here`
 -- not yet expanded, and returns whether it queued any.
@@ -2185,20 +2401,61 @@ fun inertAt(table : Map String PredCell, key : String, impl : Implication) -> Op
 -- Takes `c` out of its inert set for good.
 fun take(c : PredCell) -> Unit { c.stage = Finished }
 
--- Moves every wanted of `from` into `to`, as wanteds of `to`: the residual of
--- an implication that has ended, which mentions none of its skolems.
-fun floatOut(from : Implication, to : Implication) -> Unit {
-    let moving = members(from)
-    loop {
-        match next(from.work) {
-            Some(c) -> Vec.push(moving, c)
-            None -> break
+-- Returns the inert wanteds of `impl` and of every implication nested in it,
+-- each once: GHC's `approximateWC True`, which takes every wanted out of
+-- the tree, for defaulting and reporting (W3 in Note [ApproximateWC]).
+fun everywhere(impl : Implication) -> Vec PredCell {
+    let out = members(impl)
+    for child in impl.children {
+        for c in everywhere(child) { Vec.push(out, c) }
+    }
+    out
+}
+
+-- Returns the inert wanteds of the implications nested in `impl` with an id
+-- above `after`, and of those nested in them, that mention none of the
+-- skolems of the implications they are in, in two lists: those a binding
+-- group may quantify over, and the equalities it may not. This is GHC's
+-- `approximateWCX` (Note [ApproximateWC]):
+--
+-- * a class predicate or a numeric demand may be quantified, even under an
+--   equality given (W2);
+-- * an equality may be quantified only if neither it nor any implication
+--   between it and `impl` has an equality given that counts (W1: "we do
+--   *not* quantify over equality constraint if the implication binds
+--   equality constraints, because that defeats the OutsideIn story"), and a
+--   side is a family application (Note [Quantifying over equality
+--   constraints]).
+--
+-- What mentions a skolem of an implication it is in is neither: it can only
+-- be solved inside that implication.
+fun approximate(impl : Implication, after : Int) -> (Vec PredCell, Vec PredCell) {
+    let quantifiable = Vec.new(4)
+    let not = Vec.new(4)
+    for child in impl.children {
+        if child.id > after { approximateIn(child, Set.new(), False, quantifiable, not) }
+    }
+    (quantifiable, not)
+}
+
+fun approximateIn(impl : Implication, outer : Set.Set Int, outerEqs : Bool,
+                  quantifiable : Vec PredCell, not : Vec PredCell) -> Unit {
+    let skolems = Set.new()
+    for k in Set.elements(outer) { Set.add(skolems, k) }
+    for k in impl.skolems { Set.add(skolems, k.uid) }
+    let eqs = outerEqs || impl.givenEqs
+    for c in members(impl) {
+        if Iterator.any(Ty.skolemsOf(c.pred.args), fun(k) = Set.contains(skolems, k.uid)) {
+            continue
+        }
+        if c.pred.name == Ty.equals
+           && (eqs || !familyLike(c.pred.args[0]) && !familyLike(c.pred.args[1])) {
+            Vec.push(not, c)
+        } else {
+            Vec.push(quantifiable, c)
         }
     }
-    for c in moving {
-        c.at = Some(to)
-        queue(c)
-    }
+    for child in impl.children { approximateIn(child, skolems, eqs, quantifiable, not) }
 }
 
 -- Returns `t` rewritten as a wanted of `s.here` is: by the implication's
@@ -2897,6 +3154,52 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
     progress
 }
 
+-- Solves each equality of `open` that is stuck only because a variable on
+-- one side is untouchable where it is, by binding that variable, and returns
+-- whether it bound any. This is GHC's `defaultEquality` (Note [Defaulting
+-- equalities]): "if the only reason for not unifying is that either lhs or
+-- rhs is an untouchable metavariable then, in top-level defaulting, go ahead
+-- and unify". It runs only at the end of a run, when every binding group has
+-- been generalized, so it cannot change what a group quantifies: "by the
+-- time defaulting takes place all let-bound variables have got their final
+-- types" (DE1). The skolem-escape and occurs checks still apply (DE2), and a
+-- cycle breaker is never bound.
+fun defaultEqualities(s : Solver, open : Vec PredCell) -> Bool {
+    var any = False
+    for c in open {
+        -- An equality an earlier binding here woke is solved again first.
+        if !resting(c) || c.pred.name != Ty.equals { continue }
+        let left = Ty.prune(c.pred.args[0])
+        let right = Ty.prune(c.pred.args[1])
+        -- The left side is tried first, and only a variable: GHC's
+        -- `getTyVar_maybe` on each side in turn.
+        let (v, other) = match (left, right) {
+            (TVar(cell), _) -> (cell, right)
+            (_, TVar(cell)) -> (cell, left)
+            _ -> continue
+        }
+        if Option.isSome(Ty.breakerFor(v)) || Ty.occursIn(TVar(v), other)
+           || Option.isSome(Ty.escaping(v, other)) {
+            continue
+        }
+        let outside = s.here
+        s.here = match c.at {
+            Some(i) -> i
+            None -> outside
+        }
+        let fams = Some(Ty.Families {
+            reduce = fun(t) = reduceFam(s, t),
+            defer = fun(a, b, sp, ctx) = defer(s, a, b, sp, ctx),
+            untouchable = Ty.noScope,
+            bound = fun(x) = woken(s, x),
+        })
+        Ty.unify(TVar(v), other, c.span, c.context, fams)
+        s.here = outside
+        any = True
+    }
+    any
+}
+
 -- Default the container of every array literal a top-level binding has left
 -- open, once that binding's definition is solved and before anything uses it.
 --
@@ -2911,7 +3214,7 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
 -- decide it.
 fun decideTopLevelLiterals(s : Solver) -> Unit {
     solveWanteds(s)
-    let open = Vec.filter(members(s.here), fun(c) = isArrayLiteralDemand(c) && undecided(c))
+    let open = Vec.filter(everywhere(s.here), fun(c) = isArrayLiteralDemand(c) && undecided(c))
     if applyDefaults(s, open) { solveWanteds(s) }
 }
 
@@ -2927,20 +3230,21 @@ fun undecided(c : PredCell) -> Bool {
     }
 }
 
--- Refuses every predicate of the residual that would float out of the
--- implication whose skolems are `skolems` but mentions one of them, reporting
--- each where it arose, and removes it from the queue.
+-- Refuses every wanted left in `s.here`, or in an implication nested in it,
+-- that mentions both one of `skolems` and a variable of an outer rank,
+-- reporting each where it arose, and takes it out of the solver.
 fun confine(s : Solver, skolems : Vec ConCell) -> Unit {
-    -- Such a predicate is over a variable born outside, so the split would
-    -- hand it to the enclosing scope. There the skolem stands for nothing and
-    -- the givens that might have decided it are gone. Deciding it there can
-    -- only bind the outer variable to a type built from the skolem, which is
-    -- an escape. So the only place to judge it is here, and here it is stuck.
+    -- Such a wanted is judged when the declaration whose skolems these are
+    -- has been solved. GHC instead keeps it in its implication, where a
+    -- unification outside may still decide it, and reports it only if
+    -- nothing does. Judging it here reports the escape at the wanted's own
+    -- span, but it refuses some programs GHC accepts: `Show (f a)` would be
+    -- solved once `f` is decided as `Option` outside.
     if len(skolems) == 0 { return {} }
     let own = Set.new()
     for k in skolems { Set.add(own, k.uid) }
     let outer = rank(s) - 1
-    for c in members(s.here) {
+    for c in everywhere(s.here) {
         if Ty.predLevel(c.pred) <= outer {
             if let Some(k) = ownSkolem(c.pred, own) {
                 take(c)
@@ -2981,26 +3285,51 @@ fun trapped(c : PredCell, k : ConCell) -> Unit {
                  + "' in the scope of " + scope + "; add a type annotation", c.span)
 }
 
--- Deferred predicates general enough to be quantified at `level`.
+-- Deferred predicates general enough to be quantified at `level`, taken out
+-- of the solver: those of `s.here`, and those `approximate` finds in the
+-- implications nested in it that were entered after `after`. A `top` group
+-- is a top-level one.
 --
 -- The test is the one generalization applies to type variables: a predicate tied
 -- to a variable created deeper than the binder travels in the scheme; one tied
 -- to an outer variable stays behind for an enclosing binding to settle. The
 -- caller has already refused one that also mentions the binder's skolems
 -- (`confine`).
-fun retained(s : Solver, level : Int) -> Vec PredCell {
+--
+-- The variables of an equality that no scheme may carry (`approximate`) are
+-- not quantified by a local group: GHC's `decideAndPromoteTyVars`, Step 3
+-- (b), since "if we quantify over the /tyvars/ in t1 or t2, we may simply
+-- make that constraint insoluble" (DP1). A use of the group may still decide
+-- them, and then the equality is solved where it is. A top-level group
+-- quantifies those that `types` reach all the same (DP2, Note [The top-level
+-- Any principle]), and the equality is then reported (`rejectQuantified`).
+-- The others it does not quantify, as GHC quantifies only what the types
+-- reach (`growThetaTyVars`), and they are left to the end of the run, where
+-- `defaultEqualities` may decide them.
+fun retained(s : Solver, level : Int, after : Int, top : Bool,
+             types : Array Ty.Type) -> Vec PredCell {
+    let (quantifiable, not) = approximate(s.here, after)
+    let all = members(s.here)
+    for c in quantifiable { Vec.push(all, c) }
     -- In the order a scheme lists them: the equalities first, as the work
     -- list takes them, and within each kind in the order solving first found
     -- each stuck, which a kick-out or a wake does not change.
-    let inert = Vec.sortBy(members(s.here), fun(a, b) = if kindRank(a) != kindRank(b) {
+    let inert = Vec.sortBy(all, fun(a, b) = if kindRank(a) != kindRank(b) {
         Int.compare(kindRank(a), kindRank(b))
     } else {
         Int.compare(a.stuck, b.stuck)
     })
+    let pinned = if top { reach(inert, types) } else { Set.new() }
+    for c in not {
+        for v in Ty.varsOf(c.pred.args) {
+            if v.level > level && !Set.contains(pinned, v.id) { v.level = level }
+        }
+    }
     promoteFloating(inert, level)
     -- No two of these are the same predicate: an inert set holds one of each,
     -- the second having taken the first's evidence when it arrived (ddict,
-    -- `tryInertIrreds`).
+    -- `tryInertIrreds`). Two implications may each hold one, and then the
+    -- scheme's implication solves the second from the first.
     let out = Vec.new(len(inert))
     for c in inert {
         if Ty.predLevel(c.pred) > level {
@@ -3011,17 +3340,85 @@ fun retained(s : Solver, level : Int) -> Vec PredCell {
     out
 }
 
+-- Reports each equality that no scheme may carry (`approximate`), in an
+-- implication the top-level group `c` entered after `after`, that mentions a
+-- variable still at the group's rank. `retained` lowered every other
+-- variable of such an equality, so this one is one the group's types reach,
+-- and the group quantifies it. Nothing can bind a quantified variable, so
+-- the equality can never be solved where it is (W1 in Note [ApproximateWC];
+-- GHC's "'p' is a rigid type variable bound by the inferred type").
+fun rejectQuantified(s : Solver, c : LetCell, after : Int) -> Unit {
+    let (_, not) = approximate(s.here, after)
+    for w in not {
+        if Iterator.any(Ty.varsOf(w.pred.args), _.level >= rank(s)) {
+            take(w)
+            undeducible(w, "; add a type annotation to '" + groupName(c) + "'")
+        }
+    }
+}
+
+-- Reports the equality `w`, which no rule can decide where it is because an
+-- equality given makes a variable of it untouchable there, with `fix` as the
+-- remedy. It names the context of each implication around `w`, innermost
+-- first, whose equality givens make one of `w`'s variables untouchable, as
+-- GHC lists each context a wanted could not be deduced from.
+fun undeducible(w : PredCell, fix : String) -> Unit {
+    let vars = Ty.varsOf(w.pred.args)
+    let names = Vec.new(2)
+    var at = w.at
+    while let Some(i) = at {
+        if i.givenEqs && Iterator.any(vars, _.level <= i.untouchable) {
+            Vec.push(names, contextName(i.owner))
+        }
+        at = i.parent
+    }
+    let context = match len(names) {
+        0 -> "the context around it"
+        1 -> "the context of " + names[0]
+        _ -> "the contexts of " + String.join(Vec.slice(names, 0, len(names) - 1), ", ")
+             + " and " + names[len(names) - 1]
+    }
+    -- The skolems the reader can see beside it keep their names, so that the
+    -- unknown type is not called by one of them.
+    let types = Vec.new(4)
+    for a in w.pred.args { Vec.push(types, a) }
+    match w.at {
+        Some(i) -> for (_, g) in i.assumptions {
+            for a in g.args { Vec.push(types, a) }
+        }
+        None -> {}
+    }
+    let taken = Set.new()
+    for k in Ty.skolemsOf(Vec.toArray(types)) { Set.add(taken, k.name) }
+    -- The unknown type first: `a ~ Int`, whichever way the equation was
+    -- written.
+    let shown = match (Ty.prune(w.pred.args[0]), Ty.prune(w.pred.args[1])) {
+        (TVar(_), _) -> w.pred
+        (_, TVar(_)) -> Ty.pred(Ty.equals, [w.pred.args[1], w.pred.args[0]])
+        _ -> w.pred
+    }
+    Ty.typeError("cannot deduce '" + Ty.showPredWith(shown, Ty.namerAvoiding("", taken))
+                 + "' from " + context + fix, w.span)
+}
+
+-- Returns how a diagnostic names the declaration whose binder is `owner`: a
+-- declaration's binder is `%sig.f` or `%C.f`, and a pattern's has no dot.
+fun contextName(owner : String) -> String = match String.rsplitOnce(owner, ".") {
+    Some((_, name)) -> "'" + Ty.shortName(name) + "'"
+    None -> "the pattern"
+}
+
 -- Returns 0 for an equality and 1 for any other predicate.
 fun kindRank(c : PredCell) -> Int = if c.pred.name == Ty.equals { 0 } else { 1 }
 
 -- Lowers to `level` every variable of a deferred predicate tied to `level`
 -- or an outer one, until no predicate changes.
 fun promoteFloating(inert : Vec PredCell, level : Int) -> Unit {
-    -- A predicate tied to an outer variable floats to the enclosing scope, and
-    -- its other variables go with it. Solving it there may bind them, as
-    -- `F r ~ Option y` binds `y` once `r` is known, so none of them may stay
-    -- at this rank to be generalized: the scheme would quantify a variable
-    -- that the floated predicate binds later, for every instantiation at
+    -- A predicate tied to an outer variable stays behind for an enclosing
+    -- binding, and its other variables go with it. Solving it later may bind
+    -- them, as `F r ~ Option y` binds `y` once `r` is known, so none of them
+    -- may stay at this rank to be generalized: the scheme would quantify a
+    -- variable that the predicate binds later, for every instantiation at
     -- once. Lowering one can tie another predicate to `level`, so repeat
     -- until nothing moves.
     var changed = True
@@ -3069,6 +3466,11 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
     -- context, so the message says what the wanted was needed for.
     if let Some(origin) = superclassOrigin(s, c, c.pred) {
         return Ty.typeError(origin + "; add it to the context", c.span)
+    }
+    if c.pred.name == Ty.equals && !familyLike(c.pred.args[0]) && !familyLike(c.pred.args[1]) {
+        -- Neither side is a family application, so the equality is stuck on
+        -- a variable that an equality given makes untouchable where it is.
+        return undeducible(c, "; add a type annotation")
     }
     if c.pred.name == Ty.equals {
         -- An equality that reaches here is not wrong, it is undecidable, and the

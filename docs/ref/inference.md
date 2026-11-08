@@ -492,6 +492,10 @@ Inference covers everything except:
   needs a complete [signature](declarations.md#signatures).
 * **Recursive groups that use a member at two types**: every function in the
   group that is used polymorphically needs a signature.
+* **A type that only a body under an equality decides**: a type from outside
+  a function whose context has an
+  [equality constraint](classes.md#equality-constraints) has to be decided
+  outside it.
 
 Annotations are also useful as documentation at module boundaries. A
 signature is always checked, so it cannot drift from the code

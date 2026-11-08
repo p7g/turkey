@@ -432,6 +432,72 @@ The equalities also rewrite each other. `[F a ~ G a, G a ~ F a]` states one
 fact twice, and `[F a ~ F (G b), G b ~ a]` says only that `G b` is `a`, since
 the first equality follows from the second.
 
+Inside a function whose context has an equality, the body cannot decide a
+type from outside the function while the functions around it are inferred.
+Something outside has to decide it: an annotation, or a use. If nothing does
+and an inferred type generalizes over it, that is an error. Here only
+`inner`'s body says that `x` is an `Int`, and `outer` is inferred to take any
+type:
+
+<!-- error: cannot deduce 'a ~ Int' from the context of 'inner'; add a type annotation to 'outer' -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+fun outer(x) {
+    fun inner[Bag b, Elem b ~ Int](y : b) -> Int = x
+    0
+}
+
+fun main() { print(outer(1)) }
+```
+
+With `x` annotated, the same `inner` checks:
+
+<!-- run -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+instance Bag (Option a) {
+    type Elem = a
+}
+
+fun outer(x : Int) -> Int {
+    fun inner[Bag b, Elem b ~ Int](y : b) -> Int = x
+    inner(Some(0))
+}
+
+fun main() { print(outer(1)) }
+```
+
+```text
+1
+```
+
+A type that no inferred type generalizes over is decided by the body after
+all, once the whole program has been checked, and before any numeric literal
+takes its default type. A `let log = Vec.new(4)` at the top level that only
+such a body pushes `Int`s into is a `Vec Int`.
+
+A class whose [superclasses include an equality](#equality-superclasses)
+counts as an equality here, in a function's context and in the class context
+an [existential](types.md#existential-types) opens. An equality that only says
+what one of the function's own type variables is does not count.
+`Elem (Option a) ~ Int` makes `a` be `Int` and says nothing else, so a body
+under it may decide a type from outside: in
+`fun inner[Elem (Option a) ~ Int](y : a) -> Int = x + y`, `x` is an `Int`.
+
+> **For readers new to this.** Under `Elem b ~ Int`, the types `Int` and
+> `Elem b` are the same inside `inner`, so what the body demands of a type
+> can often be met in more than one way. Inference never picks one answer of
+> several, which is what keeps every inferred type
+> [principal](inference.md#principal-types). So it leaves a type from
+> outside for the outside to decide. Such a type is called *untouchable*
+> inside `inner`.
+
 An equality that can never hold, whatever the caller picks, is an error at
 the signature:
 

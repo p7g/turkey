@@ -4,7 +4,7 @@ export (
     cpredOf, cpredInto, newCell, nakedCell,
     noBinder,
     Binding(..), Env(..), newEnv, define, lookup_,
-    Solver(..), newSolver, run, solve, families,
+    Solver(..), newSolver, solveMore, solveRefusals, defaultOnce, finish, solve, families,
     fresh, adopt, rank,
     reach, refusedHere,
 )
@@ -762,39 +762,57 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
 
 -- -- solving -----------------------------------------------------------------------
 
-fun run(s : Solver, c : Constraint) -> Unit {
+-- A run solves one component of modules: `solveMore` with its constraint,
+-- `solveRefusals`, then `defaultOnce` until it makes no progress, and
+-- `finish`. `Turkey.Infer.solve` drives it, because solving can begin a
+-- derived instance (`Classes.derive`) whose own constraint the generator
+-- has to build, and that constraint joins the run between those steps.
+
+-- Solves `c` and every wanted it leaves, as far as they go before defaulting.
+fun solveMore(s : Solver, c : Constraint) -> Unit {
     solve(s, c)
     solveWanteds(s)
-    -- A refusal made at the outermost rank, in a top-level `let` the value
-    -- restriction keeps monomorphic, has no group of its own to check it.
+}
+
+-- Checks the refusals made at the outermost rank, in a top-level `let` the
+-- value restriction keeps monomorphic, which have no group of their own to
+-- check them, and solves what that leaves.
+fun solveRefusals(s : Solver) -> Unit {
     if checkRefusals(s, 0) { solveWanteds(s) }
-    -- What is left open after an error is most often open because of it, so
-    -- defaulting it would only guess, and `rejectStranded` reports nothing.
-    if Diag.hasErrors() { return }
-    -- The outermost boundary: nothing further can narrow what is left, so
-    -- anything still open that has a default takes it, and the rest is an error.
-    --
-    -- A run is one component of modules that import each other -- most often
-    -- a single module. So a top-level binding the value restriction keeps
-    -- monomorphic has its literals and class constraints settled by the uses
-    -- in its own component, and a module that imports it from outside,
-    -- checked in a later run, is too late to decide them. Its plain type
-    -- variables are another matter: only an equality that an equality given
-    -- left stuck decides one here (`defaultEqualities`), so the rest stay open
-    -- in the shared environment and an importer's uses fix them.
-    --
-    -- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
-    -- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal
-    -- whose type an equality decides takes that type, not the default.
-    var going = True
-    while going {
-        let open = everywhere(s.here)
-        if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open) {
-            solveWanteds(s)
-        } else {
-            going = False
-        }
+}
+
+-- Takes one round of defaults at the outermost boundary, and solves what it
+-- leaves. Returns whether anything took a default.
+--
+-- Nothing further can narrow what is left at the outermost boundary, so
+-- anything still open that has a default takes it, and the rest is an error
+-- (`finish`).
+--
+-- A run is one component of modules that import each other -- most often a
+-- single module. So a top-level binding the value restriction keeps
+-- monomorphic has its literals and class constraints settled by the uses in
+-- its own component, and a module that imports it from outside, checked in a
+-- later run, is too late to decide them. Its plain type variables are another
+-- matter: only an equality that an equality given left stuck decides one here
+-- (`defaultEqualities`), so the rest stay open in the shared environment and
+-- an importer's uses fix them.
+--
+-- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
+-- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal whose
+-- type an equality decides takes that type, not the default.
+fun defaultOnce(s : Solver) -> Bool {
+    let open = everywhere(s.here)
+    if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open) {
+        solveWanteds(s)
+        True
+    } else {
+        False
     }
+}
+
+-- Reports what is still open at the outermost boundary, once defaulting is
+-- done, and releases the errors held back until then.
+fun finish(s : Solver) -> Unit {
     rejectStranded(s, everywhere(s.here))
     if !Diag.hasErrors() { discard(unsuppress(s, 0)) }
     forgetSuppressed(s, 0)

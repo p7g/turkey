@@ -274,7 +274,8 @@ linux = pytest.mark.skipif(toolchain.target() != "arm64-linux",
 
 PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_NOTE, PT_PHDR = 1, 2, 3, 4, 6
 PT_GNU_STACK, PT_GNU_RELRO = 0x6474E551, 0x6474E552
-DT_NEEDED, DT_STRTAB, DT_FLAGS, DT_FLAGS_1 = 1, 5, 30, 0x6FFFFFFB
+DT_NEEDED, DT_STRTAB, DT_SYMTAB, DT_RELA = 1, 5, 6, 7
+DT_FLAGS, DT_FLAGS_1 = 30, 0x6FFFFFFB
 DT_GNU_HASH = 0x6FFFFEF5
 SHT_DYNSYM, SHT_NOBITS, SHT_GNU_HASH = 11, 8, 0x6FFFFFF6
 SHF_ALLOC = 0x2
@@ -344,7 +345,7 @@ class Elf:
         return next(value for t, value in self.dynamic if t == tag)
 
     def needed(self) -> list[str]:
-        strings = self.tag(DT_STRTAB)
+        strings = self.section(".dynstr")[4]
         return [self.string(strings + value) for t, value in self.dynamic if t == DT_NEEDED]
 
     def symbols(self, name: str) -> list[tuple[str, int, int, int]]:
@@ -400,8 +401,23 @@ def test_the_elf_is_what_the_loader_needs(tmp_path):
         if kind != SHT_NOBITS:
             assert address + size <= start + filesz, name
 
-    assert [t for t, _ in elf.dynamic] == [DT_NEEDED, 21, 7, 8, 9, 6, 11, 5, 10, DT_GNU_HASH,
-                                           DT_FLAGS, DT_FLAGS_1, 0]
+    # The program headers lie in the first segment, the dynamic segment is
+    # `.dynamic` exactly, and the entry is in the code segment.
+    phdr = elf.segment(PT_PHDR)
+    assert loads[0][3] <= phdr[3] and phdr[3] + phdr[5] <= loads[0][3] + loads[0][4]
+    assert phdr[2] - loads[0][2] == phdr[3] - loads[0][3]
+    dynamic = elf.segment(PT_DYNAMIC)
+    _, _, _, address, offset, size, _, _ = elf.section(".dynamic")
+    assert dynamic[2:6] == (offset, address, size, size)
+    assert loads[1][3] <= elf.entry < loads[1][3] + loads[1][4]
+
+    assert [t for t, _ in elf.dynamic] == [DT_NEEDED, 21, DT_RELA, 8, 9, DT_SYMTAB, 11,
+                                           DT_STRTAB, 10, DT_GNU_HASH, DT_FLAGS, DT_FLAGS_1, 0]
+    # The tables the loader reads are found by address, so each tag must
+    # hold its section's address, not its file offset.
+    for tag, name in [(DT_SYMTAB, ".dynsym"), (DT_STRTAB, ".dynstr"), (DT_RELA, ".rela.dyn"),
+                      (DT_GNU_HASH, ".gnu.hash")]:
+        assert elf.tag(tag) == elf.section(name)[3], name
     assert elf.needed() == ["libc.so.6"]
     assert elf.tag(DT_FLAGS) == 0x8 and elf.tag(DT_FLAGS_1) == 0x08000001
 

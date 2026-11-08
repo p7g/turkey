@@ -113,11 +113,10 @@ build/stages/stage2 build -f exe -o rectangles rectangles.gob
 It is written for either target from any host, with `--target`, and links
 the C library alone -- libSystem on a Mac, glibc's `libc.so.6` and
 `libm.so.6` on Linux -- so a program that imports `Net.TLS` is refused and
-keeps the object path. It carries no debug or unwind
-information yet, so it takes no `-g`, and a file name without an extension
-will not choose it until the executable has what lldb and a profiler read.
-`check` compiles as far as the last stage that
-can reject a program and writes nothing. Either takes `--dump STAGE,...` to
+keeps the object path. It carries no debug or unwind information yet, so it
+takes no `-g`, and a file name without an extension will not choose it until
+the executable has what lldb and a profiler read. `check` compiles as far as
+the last stage that can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no
 arguments lists the stages. `build --timings` reports on standard error how
@@ -315,10 +314,10 @@ minutes once `boot` is built and two hours from a cold cache; the few tests
 that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
-programs run directly, and `-f exe` needs no C compiler at all. CI does this on GitHub's arm64 runners
-(`.github/workflows/linux.yml`), building from the bootstrap under gcc and
-running the suite and the fixed point split across jobs by
-`scripts/ci-shard.sh`.
+programs run directly, and `-f exe` needs no C compiler at all. CI does this on
+GitHub's arm64 runners (`.github/workflows/linux.yml`), building from the
+bootstrap under gcc and running the suite and the fixed point split across jobs
+by `scripts/ci-shard.sh`.
 
 `tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump`, and it
 and `tests/test_unwind.py` run lldb on macOS and gdb on Linux; each skips a

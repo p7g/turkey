@@ -37,11 +37,10 @@ export (executableFile)
 -- `DT_NEEDED` each, libc first. The references are unversioned: there is no
 -- `.gnu.version`, `.gnu.version_r` or `.gnu.version_d`. An unversioned
 -- reference binds to the library's oldest version of the name, which for
--- every import the library makes is either its only version or one that
--- behaves as the newest does. A glibc older than every import needs then
--- fails at startup with `undefined symbol` rather than with a missing
--- version; the oldest that has them all is 2.34, the first with
--- `pthread_create` in libc.
+-- every import is either its only version or one that behaves as the newest
+-- does. A glibc that lacks one of the imports fails at startup with
+-- `undefined symbol`, not with a missing version. The oldest glibc that has
+-- them all is 2.34, the first with `pthread_create` in libc.
 --
 -- The executable exports nothing, so the dynamic symbol table holds only
 -- the imports, and its `DT_GNU_HASH` table is empty: one bucket, holding no
@@ -109,20 +108,69 @@ let startMain = "__libc_start_main"
 let startSize = 44
 
 -- Section header types.
-let progbits = 1
-let symtab = 2
-let strtab = 3
-let rela = 4
-let dynamicType = 6
-let note = 7
-let nobits = 8
-let dynsym = 11
-let gnuHash = 0x6FFFFFF6
+let shtProgbits = 1
+let shtSymtab = 2
+let shtStrtab = 3
+let shtRela = 4
+let shtDynamic = 6
+let shtNote = 7
+let shtNobits = 8
+let shtDynsym = 11
+let shtGnuHash = 0x6FFFFFF6
 
 -- Section header flags.
-let writable = 0x1
-let allocated = 0x2
-let executable = 0x4
+let shfWrite = 0x1
+let shfAlloc = 0x2
+let shfExecInstr = 0x4
+
+-- The file's type and machine: `ET_DYN`, which a position-independent
+-- executable is, and `EM_AARCH64`.
+let etDyn = 3
+let emAArch64 = 183
+
+-- Program header types.
+let ptLoad = 1
+let ptDynamic = 2
+let ptInterp = 3
+let ptNote = 4
+let ptPhdr = 6
+let ptGnuStack = 0x6474E551
+let ptGnuRelro = 0x6474E552
+
+-- Program header flags: read, write, execute.
+let pfR = 4
+let pfW = 2
+let pfX = 1
+
+-- Dynamic tags. `DT_GNU_HASH` is not `SHT_GNU_HASH`, the section type.
+let dtNull = 0
+let dtNeeded = 1
+let dtStrtab = 5
+let dtSymtab = 6
+let dtRela = 7
+let dtRelasz = 8
+let dtRelaent = 9
+let dtStrsz = 10
+let dtSyment = 11
+let dtDebug = 21
+let dtFlags = 30
+let dtGnuHash = 0x6FFFFEF5
+let dtFlags1 = 0x6FFFFFFB
+
+-- `DT_FLAGS`'s `DF_BIND_NOW`, and `DT_FLAGS_1`'s `DF_1_NOW` and `DF_1_PIE`.
+let dfBindNow = 0x8
+let df1Now = 0x1
+let df1Pie = 0x08000000
+
+-- `R_AARCH64_GLOB_DAT`: a slot filled with the address of its symbol.
+let rAArch64GlobDat = 1025
+
+-- Symbol bindings and types, for `st_info`'s high and low nibbles.
+let stbGlobal = 0x10
+let sttFunc = 2
+
+-- The note type of a build ID, `NT_GNU_BUILD_ID`.
+let ntGnuBuildId = 3
 
 -- The section headers, by index. `.rodata` covers the C strings and the
 -- constants, which are adjacent.
@@ -246,52 +294,54 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     let headers = [
         Section { name = "", kind = 0, flags = 0, address = 0, offset = 0, size = 0, link = 0,
                   info = 0, align = 0, entry = 0 },
-        loaded(".interp", progbits, allocated, interpAt, 0, len(String.toBytes(interpreter)) + 1,
+        loaded(".interp", shtProgbits, shfAlloc, interpAt, 0, len(String.toBytes(interpreter)) + 1,
                1),
-        loaded(".note.gnu.build-id", note, allocated, noteAt, 0, noteSize, 4),
-        Section { name = ".dynsym", kind = dynsym, flags = allocated, address = dynsymAt,
+        loaded(".note.gnu.build-id", shtNote, shfAlloc, noteAt, 0, noteSize, 4),
+        Section { name = ".dynsym", kind = shtDynsym, flags = shfAlloc, address = dynsymAt,
                   offset = dynsymAt, size = symbolSize * (n + 1), link = dynstrSection,
                   info = 1, align = 8, entry = symbolSize },
-        Section { name = ".gnu.hash", kind = gnuHash, flags = allocated, address = hashAt,
+        Section { name = ".gnu.hash", kind = shtGnuHash, flags = shfAlloc, address = hashAt,
                   offset = hashAt, size = hashSize, link = dynsymSection, info = 0, align = 8,
                   entry = 0 },
-        loaded(".dynstr", strtab, allocated, dynstrAt, 0, len(dynstr), 1),
-        Section { name = ".rela.dyn", kind = rela, flags = allocated, address = relaAt,
+        loaded(".dynstr", shtStrtab, shfAlloc, dynstrAt, 0, len(dynstr), 1),
+        Section { name = ".rela.dyn", kind = shtRela, flags = shfAlloc, address = relaAt,
                   offset = relaAt, size = relocationSize * n, link = dynsymSection, info = 0,
                   align = 8, entry = relocationSize },
-        loaded(".rodata", progbits, allocated, cstringsAt, 0, readOnlyEnd - cstringsAt,
+        loaded(".rodata", shtProgbits, shfAlloc, cstringsAt, 0, readOnlyEnd - cstringsAt,
                1 << max(sections[cstrings].align, sections[constants].align)),
-        loaded(".text", progbits, allocated + executable, textAt, codeSlide, stubsAt - textAt,
-               1 << max(sections[text].align, 2)),
+        loaded(".text", shtProgbits, shfAlloc + shfExecInstr, textAt, codeSlide,
+               stubsAt - textAt, 1 << max(sections[text].align, 2)),
         -- No procedure linkage table, which has a shape of its own that tools
         -- read, so not called `.plt`.
-        loaded(".stubs", progbits, allocated + executable, stubsAt, codeSlide, stubSize * n, 4),
-        Section { name = ".dynamic", kind = dynamicType, flags = allocated + writable,
+        loaded(".stubs", shtProgbits, shfAlloc + shfExecInstr, stubsAt, codeSlide,
+               stubSize * n, 4),
+        Section { name = ".dynamic", kind = shtDynamic, flags = shfAlloc + shfWrite,
                   address = dynamicAt + relroSlide, offset = dynamicAt,
                   size = gotAt - dynamicAt, link = dynstrSection, info = 0, align = 8,
                   entry = dynamicSize },
-        Section { name = ".got", kind = progbits, flags = allocated + writable,
+        Section { name = ".got", kind = shtProgbits, flags = shfAlloc + shfWrite,
                   address = gotAt + relroSlide, offset = gotAt, size = 8 * n, link = 0,
                   info = 0, align = 8, entry = 8 },
         -- The RELRO segment's padding to its page end, which takes no file.
-        Section { name = ".relro_padding", kind = nobits, flags = allocated + writable,
+        Section { name = ".relro_padding", kind = shtNobits, flags = shfAlloc + shfWrite,
                   address = relroEnd + relroSlide, offset = relroEnd,
                   size = relroMemory - (relroEnd - dynamicAt), link = 0, info = 0, align = 1,
                   entry = 0 },
-        loaded(".data", progbits, allocated + writable, dataAt, dataSlide, dataEnd - dataAt,
+        loaded(".data", shtProgbits, shfAlloc + shfWrite, dataAt, dataSlide, dataEnd - dataAt,
                1 << sections[data].align),
-        Section { name = ".symtab", kind = symtab, flags = 0, address = 0, offset = symtabAt,
-                  size = strtabAt - symtabAt, link = strtabSection, info = locals, align = 8,
-                  entry = symbolSize },
-        Section { name = ".strtab", kind = strtab, flags = 0, address = 0, offset = strtabAt,
-                  size = len(strings), link = 0, info = 0, align = 1, entry = 0 },
+        Section { name = ".symtab", kind = shtSymtab, flags = 0, address = 0,
+                  offset = symtabAt, size = strtabAt - symtabAt, link = strtabSection,
+                  info = locals, align = 8, entry = symbolSize },
+        Section { name = ".strtab", kind = shtStrtab, flags = 0, address = 0,
+                  offset = strtabAt, size = len(strings), link = 0, info = 0, align = 1,
+                  entry = 0 },
     ]
     let shstrtab = []
     Vec.push(shstrtab, Byte.truncate(0))
     let shstrtabAt = strtabAt + len(strings)
     let headerNameAt = Vec.map(headers, fun(h) = intern(shstrtab, h.name))
     let shstrtabName = intern(shstrtab, ".shstrtab")
-    Vec.push(headers, Section { name = ".shstrtab", kind = strtab, flags = 0, address = 0,
+    Vec.push(headers, Section { name = ".shstrtab", kind = shtStrtab, flags = 0, address = 0,
                                 offset = shstrtabAt, size = len(shstrtab), link = 0,
                                 info = 0, align = 1, entry = 0 })
     Vec.push(headerNameAt, shstrtabName)
@@ -323,8 +373,8 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     -- a position-independent executable for AArch64.
     for b in [0x7F, 0x45, 0x4C, 0x46, 2, 1, 1, 0] { le(1, b) }
     at = 16
-    le(2, 3)
-    le(2, 183)
+    le(2, etDyn)
+    le(2, emAArch64)
     le(4, 1)
     le(8, startAt + codeSlide)
     le(8, headerSize)
@@ -336,20 +386,24 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     le(2, sectionHeaderSize)
     le(2, sectionCount)
     le(2, shstrtabSection)
-    -- The program headers. Flags: 4 is read, 2 write, 1 execute.
-    segment(6, 4, headerSize, headerSize, interpAt - headerSize, interpAt - headerSize, 8)
-    segment(3, 4, interpAt, interpAt, len(String.toBytes(interpreter)) + 1,
-            len(String.toBytes(interpreter)) + 1, 1)
-    segment(1, 4, 0, 0, readOnlyEnd, readOnlyEnd, page)
-    segment(1, 5, textAt, textAt + codeSlide, codeEnd - textAt, codeEnd - textAt, page)
-    segment(1, 6, dynamicAt, dynamicAt + relroSlide, relroEnd - dynamicAt, relroMemory, page)
-    segment(1, 6, dataAt, dataAt + dataSlide, dataEnd - dataAt, dataEnd - dataAt, page)
-    segment(2, 6, dynamicAt, dynamicAt + relroSlide, gotAt - dynamicAt, gotAt - dynamicAt, 8)
-    segment(0x6474E552, 4, dynamicAt, dynamicAt + relroSlide, relroEnd - dynamicAt,
+    -- The program headers.
+    let interpSize = len(String.toBytes(interpreter)) + 1
+    segment(ptPhdr, pfR, headerSize, headerSize, interpAt - headerSize, interpAt - headerSize, 8)
+    segment(ptInterp, pfR, interpAt, interpAt, interpSize, interpSize, 1)
+    segment(ptLoad, pfR, 0, 0, readOnlyEnd, readOnlyEnd, page)
+    segment(ptLoad, pfR + pfX, textAt, textAt + codeSlide, codeEnd - textAt, codeEnd - textAt,
+            page)
+    segment(ptLoad, pfR + pfW, dynamicAt, dynamicAt + relroSlide, relroEnd - dynamicAt,
+            relroMemory, page)
+    segment(ptLoad, pfR + pfW, dataAt, dataAt + dataSlide, dataEnd - dataAt, dataEnd - dataAt,
+            page)
+    segment(ptDynamic, pfR + pfW, dynamicAt, dynamicAt + relroSlide, gotAt - dynamicAt,
+            gotAt - dynamicAt, 8)
+    segment(ptGnuRelro, pfR, dynamicAt, dynamicAt + relroSlide, relroEnd - dynamicAt,
             relroMemory, 1)
-    -- `PT_GNU_STACK`, without which the loader makes the stack executable.
-    segment(0x6474E551, 6, 0, 0, 0, 0, 16)
-    segment(4, 4, noteAt, noteAt, noteSize, noteSize, 4)
+    -- Without `PT_GNU_STACK`, the loader makes the stack executable.
+    segment(ptGnuStack, pfR + pfW, 0, 0, 0, 0, 16)
+    segment(ptNote, pfR, noteAt, noteAt, noteSize, noteSize, 4)
     if at != interpAt {
         error("internal error: the program headers end at " + Int.toString(at) + ", not "
               + Int.toString(interpAt))
@@ -359,7 +413,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     at = noteAt
     le(4, 4)
     le(4, 20)
-    le(4, 3)
+    le(4, ntGnuBuildId)
     string(out, at, "GNU")
     let buildIdAt = noteAt + 16
     -- `.dynsym`: the empty symbol, then each import, a function undefined
@@ -367,7 +421,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     for var k = 0; k < n; k = k + 1 {
         let p = dynsymAt + symbolSize * (k + 1)
         Byte.putLE(out, p, 4, importNameAt[k])
-        Byte.putLE(out, p + 4, 1, 0x12)
+        Byte.putLE(out, p + 4, 1, stbGlobal + sttFunc)
     }
     -- `.gnu.hash`: one bucket, the symbols to hash starting past the last
     -- import, one bloom word and a bloom shift. With the word zero, every
@@ -382,24 +436,26 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     for var k = 0; k < n; k = k + 1 {
         let p = relaAt + relocationSize * k
         Byte.putLE(out, p, 8, gotAt + relroSlide + 8 * k)
-        Byte.putLE(out, p + 8, 8, (k + 1) << 32 | 1025)
+        Byte.putLE(out, p + 8, 8, (k + 1) << 32 | rAArch64GlobDat)
     }
     copy(out, cstringsAt, sections[cstrings].bytes)
     copy(out, constantsAt, sections[constants].bytes)
     copy(out, textAt, sections[text].bytes)
     copy(out, startAt, start(startAt + codeSlide, mainAt, startMainStub))
-    copy(out, stubsAt, stubs(Asm.Elf, stubsAt + codeSlide, gotAt + relroSlide, n))
+    copy(out, stubsAt, stubs(stubsAt + codeSlide, gotAt + relroSlide, n))
     -- `.dynamic`. `DT_DEBUG` is the loader's to fill in, for debuggers.
     -- `DF_BIND_NOW` and `DF_1_NOW` bind every slot at startup; `DF_1_PIE`
     -- marks the file an executable rather than a library.
     at = dynamicAt
     for k in sonameAt {
-        le(8, 1)
+        le(8, dtNeeded)
         le(8, k)
     }
-    for (tag, value) in [(21, 0), (7, relaAt), (8, relocationSize * n), (9, relocationSize),
-                         (6, dynsymAt), (11, symbolSize), (5, dynstrAt), (10, len(dynstr)),
-                         (0x6FFFFEF5, hashAt), (30, 0x8), (0x6FFFFFFB, 0x08000001), (0, 0)] {
+    for (tag, value) in [(dtDebug, 0), (dtRela, relaAt), (dtRelasz, relocationSize * n),
+                         (dtRelaent, relocationSize), (dtSymtab, dynsymAt),
+                         (dtSyment, symbolSize), (dtStrtab, dynstrAt), (dtStrsz, len(dynstr)),
+                         (dtGnuHash, hashAt), (dtFlags, dfBindNow),
+                         (dtFlags1, df1Now + df1Pie), (dtNull, 0)] {
         le(8, tag)
         le(8, value)
     }
@@ -455,7 +511,8 @@ fun librariesOf(undefined : Vec Symbol) -> Array Library {
     }
     if !started { Vec.push(fromLibc, Asm.symbolFor(Asm.Elf, startMain)) }
     let byName = fun(a : Symbol, b : Symbol) = Array.threeWay(a.name, b.name)
-    let libraries = [Library { soname = libc, symbols = Vec.toArray(Vec.sortBy(fromLibc, byName)) }]
+    let libraries = [Library { soname = libc,
+                               symbols = Vec.toArray(Vec.sortBy(fromLibc, byName)) }]
     if len(fromLibm) > 0 {
         Vec.push(libraries, Library { soname = libm,
                                       symbols = Vec.toArray(Vec.sortBy(fromLibm, byName)) })
@@ -483,32 +540,38 @@ fun symbols(obj : Object Fixup, imports : Vec Symbol, addresses : Array Int,
     let entries = []
     Vec.push(entries, Entry { name = "", info = 0, section = 0, value = 0 })
     -- `STB_GLOBAL` and `STT_FUNC`.
-    let globals = [Entry { name = "_start", info = 0x12, section = textSection, value = start }]
+    let globals = [Entry { name = "_start", info = stbGlobal + sttFunc, section = textSection,
+                           value = start }]
     for d in obj.defined {
         if let Temporary = d.symbol.kind { continue }
         if addresses[d.section] < 0 {
             error("internal error: " + d.symbol.name + " is in a section the image leaves out")
         }
-        let kind = if d.function { 2 } else { 0 }
-        let e = Entry { name = d.symbol.name, info = if d.exported { 0x10 + kind } else { kind },
+        let kind = if d.function { sttFunc } else { 0 }
+        let e = Entry { name = d.symbol.name,
+                        info = if d.exported { stbGlobal + kind } else { kind },
                         section = sectionOf[d.section], value = addresses[d.section] + d.offset }
         Vec.push(if d.exported { globals } else { entries }, e)
     }
     let locals = len(entries)
     for e in globals { Vec.push(entries, e) }
-    for sym in imports { Vec.push(entries, Entry { name = sym.name, info = 0x12, section = 0,
-                                                   value = 0 }) }
+    for sym in imports {
+        Vec.push(entries, Entry { name = sym.name, info = stbGlobal + sttFunc, section = 0,
+                                  value = 0 })
+    }
     (entries, locals)
 }
 
--- Returns `_start`, loaded at `at`, calling `__libc_start_main` through its
--- stub at `stub` with `main` at `main`. The kernel starts it with
--- `argc` at `[sp]`, `argv` after it, and the loader's finalizer in `x0`.
--- glibc's own sequence: it clears the frame pointer and the link register,
--- which ends a backtrace here, and passes `main`, `argc`, `argv`, no
--- initializer or finalizer, the loader's finalizer, and the stack's end.
--- `__libc_start_main` never returns.
+-- Returns `_start`'s `startSize` bytes, loaded at `at`, which call
+-- `__libc_start_main` through its stub at `stub`, passing `main` at `main`,
+-- `argc`, `argv`, no initializer or finalizer, the loader's finalizer and the
+-- stack's end. It expects the state the kernel and the loader start a
+-- program in: `argc` at `[sp]`, `argv` after it, and the loader's finalizer
+-- in `x0`. It never returns, since `__libc_start_main` does not.
 fun start(at : Int, main : Int, stub : Int) -> Vec Byte {
+    -- glibc's own sequence. Clearing the frame pointer and the link register
+    -- first ends a backtrace at `_start`, since a frame-pointer walk stops at
+    -- a zero frame.
     let x = A.physical
     let sp = x(31)
     let mainLabel = Asm.localLabel(Asm.Elf, "main")

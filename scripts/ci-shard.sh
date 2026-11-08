@@ -20,7 +20,8 @@
 #              the same programs with seven collections in eight minor; split
 #              from `native` because each holds a few programs that take
 #              minutes under stress, and each pays the corpus's one emission
-#   assembler  the encoder and the object writer, checked against `as`
+#   assembler  the encoder and the object writer, checked against `as`, and
+#              the executable writer
 #   passes     instruction selection, SSA, the machine checks, the runtime,
 #              the inference corpus and diagnostics
 #   system     I/O, processes, tasks and the poller
@@ -39,7 +40,7 @@ set -eu
 
 BOOTSTRAP="test_bootstrap test_emit test_debug_info test_unwind"
 NATIVE="test_arm64_native"
-ASSEMBLER="test_encode test_object"
+ASSEMBLER="test_encode test_object test_executable"
 PASSES="test_select test_machine_check test_ssa_lower test_ssa test_sccp
         test_mono test_heap_verifier test_runtime_gc test_allocators
         test_alloc_sites test_infer_corpus test_errors test_entry

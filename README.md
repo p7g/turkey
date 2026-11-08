@@ -101,7 +101,20 @@ Run the compiler from the repository root, where it finds `lib/`. It has two
 commands. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or
 `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. `check` compiles as far as the last stage that
+object needs no assembler, only a linker. On a Mac, `-f exe` writes a signed
+executable that runs as it is, with no assembler and no linker:
+
+```sh
+build/stages/stage2 build -f exe -o rectangles rectangles.gob
+./rectangles
+```
+
+It is written for arm64-darwin only, from any host with `--target
+arm64-darwin`, and links libSystem alone, so a program that imports `Net.TLS`
+is refused and keeps the object path. It carries no debug or unwind
+information yet, so it takes no `-g`, and a file name without an extension
+will not choose it until the executable has what lldb and a profiler read.
+`check` compiles as far as the last stage that
 can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no

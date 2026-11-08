@@ -18,6 +18,12 @@
 # set `TURKEY_REQUIRE_OPENSSL` so that those tests fail rather than skip if it
 # is missing. Nothing else links it. They also install gdb and LLVM's tools,
 # which `tests/test_debug_info.py` reads `-g`'s DWARF with and skips without.
+#
+# Each shard also runs its cases through the executable writer
+# (`scripts/test.sh --exe`), which links nothing, against the same goldens.
+# The `floor` job runs what that writer makes on the oldest glibc it
+# supports, 2.34, in an AlmaLinux 9 container: hello world, and `boot`
+# written by itself, compiling itself to the same bytes there.
 name: linux
 
 on:
@@ -82,3 +88,30 @@ jobs:
         run: sh scripts/test.sh --selftest
       - if: ${{ !cancelled() }}
         run: sh scripts/test.sh --shard ${{ matrix.number }}/7
+      - if: ${{ !cancelled() }}
+        run: sh scripts/test.sh --exe --shard ${{ matrix.number }}/7
+
+  floor:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: boot
+          path: boot
+      - run: chmod +x boot/stage2
+      - run: |
+          mkdir out
+          printf 'fun main() {\n    print("hello, world")\n}\n' > out/hello.gob
+          boot/stage2 build -f exe -o out/hello out/hello.gob
+          boot/stage2 build -f exe -o out/boot src/Main.gob
+      - run: |
+          docker run --rm -v "$PWD:/w" -w /w almalinux:9 sh -euxc '
+            ldd --version | head -n 1 | grep -q " 2\.34$"
+            test "$(out/hello)" = "hello, world"
+            out/boot build -f exe -o /tmp/hello out/hello.gob
+            test "$(/tmp/hello)" = "hello, world"
+            out/boot build -f exe -o /tmp/boot src/Main.gob
+            test "$(sha256sum < /tmp/boot)" = "$(sha256sum < out/boot)"'

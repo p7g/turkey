@@ -7,8 +7,8 @@
 #
 # --exe has boot write every program as an executable itself, with -f exe,
 # instead of linking its object with the C compiler: the same goldens, through
-# the other path. It works on arm64-darwin only, and CI does not run it, so
-# run it on a Mac after changing the executable writer or what it is fed.
+# the other path. CI runs it on Linux; run it on a Mac after changing the
+# Mach-O writer or what it is fed.
 #
 # --bless writes the actual results of the cases selected over their goldens,
 # refusing any that look like a broken compiler; tests/harness/Bless.gob says

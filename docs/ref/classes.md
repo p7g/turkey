@@ -106,6 +106,28 @@ instance Named Cat {
 }
 ```
 
+An instance's superclasses must hold at its head under the instance's
+context, which may supply them in three ways: a constraint of the context
+itself, an instance, or a superclass of a constraint of the context. The
+last is allowed only for a constraint *smaller* than the head: one with
+fewer type constructors and variables, no variable more often than the head
+has it, and no associated type. Taken from anything larger, the superclass
+could be the very dictionary the instance defines:
+
+<!-- error: 'Sem (W a)' is required by 'Mon', but a superclass can come from the superclasses of 'Mon (W a)' only if it is smaller than the instance head; add 'Sem (W a)' to the context -->
+```kotlin
+class Sem a { fun op(a, a) -> a }
+class Mon a : Sem a { fun unit() -> a }
+
+type W a = W(a)
+
+instance Mon (W a) : Mon (W a) {
+    fun unit() = unit()
+}
+
+fun main() { }
+```
+
 ## Instances
 
 **Syntax**
@@ -669,10 +691,12 @@ fun main() { }
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
 `View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
-context's `Value s ~ Byte`. An instance where an equality is false, or where
-its context does not decide it, is refused:
+context's `Value s ~ Byte`. As for a class superclass, an equality that a
+constraint of the context grants through its superclasses counts only if
+that constraint is smaller than the head. An instance where an equality is
+false, or where its context does not decide it, is refused:
 
-<!-- error: 'Bytes Words' requires 'Value Words ~ Byte', which can never hold: 'String' is not 'Byte' -->
+<!-- error: expected 'Byte', found 'String' in the superclasses of 'Bytes Words' -->
 ```kotlin
 class Bytes s : Index s, Value s ~ Byte {}
 

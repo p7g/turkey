@@ -535,9 +535,10 @@ The parts of a declaration:
   uses is allowed; it is sometimes called a *phantom* parameter.
 * **Recursion.** A type may refer to itself, as `Hand` does, and a group of
   types may refer to each other.
-* **A derive list**, after `:`, asks the compiler to write instances of `Eq`,
-  `Ord` or `Hash` from the declaration: `type Suit : Ord = Hearts | ...`. See
-  [Derived instances](classes.md#derived-instances).
+* **Derived instances.** The compiler writes `Eq` and `Hash` for a type from
+  its declaration, where its fields have them. A derive list, after `:`, asks
+  for `Ord` as well, `type Suit : Ord = Hearts | ...`, or refuses one with
+  `!`. See [Derived instances](classes.md#derived-instances).
 
 A single constructor may have the same name as its type, as in
 `type Card = Card(Int, Suit)`. The two live in different namespaces: `Card`

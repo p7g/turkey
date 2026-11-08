@@ -4,7 +4,7 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable,
-    derivedMethod, isDerivedMethod, checkDerives, whyMissing,
+    derivedMethod, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -311,9 +311,19 @@ type ClassTable = ClassTable {
     -- Every instance derived so far, in the order each settled. The generator
     -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
     derived : Vec InstInfo,
-    -- Whether `checkDerives` is running. Only it begins a derivation that no
-    -- other derivation began; see `derive`.
-    var checking : Bool,
+    -- How many of `derived` the generator has checked.
+    var checkedUpTo : Int,
+    -- A type and a class its derive list is taken to name, while
+    -- `listedReason` finds out what naming it would do.
+    var assumedListed : Option (String, String),
+    -- Whether a derivation begun now is checked: from the start of
+    -- `Turkey.Infer.generate` for a component of modules to the end of
+    -- `Turkey.Infer.solve` for it. See `derive`.
+    var open : Bool,
+    -- The types that can reach themselves through an assignable position,
+    -- among those registered when they were last asked for
+    -- (`Decls.selfAssigned`).
+    selfReach : Decls.SelfReach,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -327,7 +337,10 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     provisional = []
     deriving = False
     derived = []
-    checking = False
+    checkedUpTo = 0
+    assumedListed = None
+    open = False
+    selfReach = Decls.newSelfReach()
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1672,18 +1685,24 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 
 -- -- derived instances ---------------------------------------------------------------
 --
--- A type declaration's derive list, `type Suit : Ord = ...`, asks the
--- compiler for an instance it builds from the declaration: each method
+-- The compiler builds some instances from a type's declaration: each method
 -- compares, orders or hashes the constructors and then their fields, through
--- the fields' own instances. Only the method `derivedMethod` names is built;
--- the class's other methods are its defaults. `Turkey.Lower` writes the
--- method, in Core, from the constructors; this section decides whether the
--- instance exists and what its context is.
+-- the fields' own instances. Every type gets `Eq` and `Hash` this way unless
+-- something rules them out (`asksFor`), and its derive list,
+-- `type Suit : Ord = ...`, asks for more or refuses some. Only the method
+-- `derivedMethod` names is built; the class's other methods are its
+-- defaults. `Turkey.Lower` writes the method, in Core, from the
+-- constructors; this section decides whether the instance exists and what
+-- its context is.
 --
--- **On demand.** An instance is built the first time something asks for it:
--- the check of its type's derive list (`checkDerives`), or a predicate that
--- no written instance covers (`selectInstance`). A class a type's list does
--- not ask for is never built for it.
+-- **When.** A derive list's instances are begun when it is checked
+-- (`checkDerives`), so its mistakes are reported at the declaration whether
+-- or not anything uses the type. An instance a type gets without asking is
+-- begun the first time a predicate that no written instance covers needs it
+-- (`selectInstance`), so a type nothing compares or hashes gets none. Each
+-- derivation begins those its fields need. Either way the instance is
+-- checked, as a written one is, in the run of the solver that begins it
+-- (`Turkey.Infer.solve`).
 --
 -- **Its context is inferred, as GHC's deriving infers it**
 -- (`GHC.Tc.Deriv.Infer`). The class is wanted at each field's type, and
@@ -1762,22 +1781,149 @@ fun refuses(t : ClassTable, tycon : String, cls : String) -> Bool =
         None -> False
     }
 
--- Returns whether `tycon`'s declaration asks for `cls`: its derive list names
--- `cls`, or a class `cls` is a superclass of, and does not refuse `cls`. A
--- derived `Hash` or `Ord` needs the type's `Eq` derived too, so asking for
--- either asks for `Eq`.
-fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
+-- Returns whether `tycon`'s derive list asks for `cls`: it names `cls`, or a
+-- class `cls` is a superclass of. A derived `Hash` or `Ord` needs the type's
+-- `Eq` derived too, so asking for either asks for `Eq`.
+fun listsFor(t : ClassTable, tycon : String, cls : String) -> Bool {
     let info = match Map.get(t.decls.tycons, tycon) {
         Some(i) -> i
         None -> return False
     }
-    if refuses(t, tycon, cls) { return False }
+    if let Some((assumed, listed)) = t.assumedListed {
+        if assumed == tycon && (listed == cls || Vec.contains(superclassesOf(t, listed), cls)) {
+            return True
+        }
+    }
     for d in info.derives {
         if !d.refused && (d.cls == cls || Vec.contains(superclassesOf(t, d.cls), cls)) {
             return True
         }
     }
     False
+}
+
+-- Returns whether `tycon` should have a derived instance of `cls`: its derive
+-- list asks for one, or `cls` is derived without asking and nothing rules
+-- the implicit instance out. A hand-written instance replaces the implicit
+-- one, and `implicitExclusion` gives the other reasons. Whether the derived
+-- instance then exists is up to its fields.
+fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
+    if refuses(t, tycon, cls) { return False }
+    if listsFor(t, tycon, cls) { return True }
+    -- A written instance is in the type's module or the class's, by the
+    -- orphan rule, and a predicate can name the class and the type only once
+    -- both modules are registered. So whenever this is asked, every
+    -- instance that could replace the implicit one is in the table.
+    isImplicit(cls) && Option.isNone(writtenInstance(t, cls, tycon))
+        && Option.isNone(implicitExclusion(t, cls, tycon))
+}
+
+-- Whether every type derives `cls` without asking. `Ord` is not among them,
+-- for the reason `refusable` gives.
+fun isImplicit(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
+
+-- Returns why `tycon` gets no implicit instance of `cls` though its fields
+-- might have the class, as a phrase about the type: "can reach itself
+-- through its 'var' field 'next'". `None` when nothing rules it out, and
+-- always when the derive list asks for `cls`, which overrides both reasons.
+-- `None` too when a superclass of `cls` is written by hand or refused, which
+-- rules the instance out whatever the list says, so that the diagnostic
+-- gives that reason and not a fix that cannot work (`checkEntry`).
+fun implicitExclusion(t : ClassTable, cls : String, tycon : String) -> Option String {
+    if !isImplicit(cls) || listsFor(t, tycon, cls) { return None }
+    for sup in superclassesOf(t, cls) {
+        if refuses(t, tycon, sup) || Option.isSome(writtenInstance(t, sup, tycon)) { return None }
+    }
+    let info = Map.get(t.decls.tycons, tycon)?
+    -- A derived `==` follows every field, so on a value that reaches itself
+    -- it would not end. Every cycle in the heap passes through an assignable
+    -- position, so a type that cannot reach itself through one has no cyclic
+    -- value (`Decls.selfAssigned`).
+    if let Some(path) = Map.get(selfPaths(t), tycon) {
+        return Some("can reach itself through " + assignedAt(path, tycon))
+    }
+    -- A hash of a value that can change would change while the value is a
+    -- key in a table, which would then not find it.
+    if cls == P.hashClass {
+        for c in info.variants {
+            for var i = 0; i < len(c.mutable); i = i + 1 {
+                if c.mutable[i] { return Some("has the 'var' field " + quotedField(c, i)) }
+            }
+        }
+    }
+    None
+}
+
+-- Returns why `tycon` has no implicit `cls`, when `implicitExclusion` rules
+-- one out: `Right` of its phrase when naming `cls` in the derive list would
+-- derive one, and `Left` of why it cannot be derived when that would fail
+-- too. A diagnostic offers the derive list as a fix only in the first case.
+fun exclusion(t : ClassTable, cls : String, tycon : String) -> Option (Either String String) {
+    let why = implicitExclusion(t, cls, tycon)?
+    match listedReason(t, cls, tycon) {
+        Some(reason) -> Some(Left(reason))
+        None -> Some(Right(why))
+    }
+}
+
+-- Returns why `tycon` would have no derived `cls` even with `cls` in its
+-- derive list, or `None` if it would have one. Leaves the table as it found
+-- it, so that what the attempt derives is not there for anything to use.
+-- Called only for a diagnostic at a use (`whyMissing`), never while a
+-- derivation runs.
+fun listedReason(t : ClassTable, cls : String, tycon : String) -> Option String {
+    if t.deriving { bug("a derive list was tried while a derivation ran", None) }
+    let before = Set.new()
+    for key in Map.keys(t.derivations) { Set.add(before, key) }
+    let derived = len(t.derived)
+    t.assumedListed = Some((tycon, cls))
+    let _ = derive(t, cls, tycon)
+    t.assumedListed = None
+    let reason = match Map.get(t.derivations, derivationKey(cls, tycon)) {
+        Some(Underivable(r)) -> Some(r)
+        _ -> None
+    }
+    for key in Map.keys(t.derivations) {
+        if Set.contains(before, key) { continue }
+        match Map.get(t.derivations, key) {
+            Some(Deriving(inst)) | Some(Derived(inst)) -> withdraw(t, inst)
+            _ -> {}
+        }
+        let _ = Map.delete(t.derivations, key)
+    }
+    while len(t.derived) > derived { let _ = Vec.pop(t.derived) }
+    reason
+}
+
+-- Returns a field through which each type registered so far that can reach
+-- itself through an assignable position does.
+fun selfPaths(t : ClassTable) -> Map String Decls.SelfPath {
+    if t.selfReach.done < len(t.decls.order) { Decls.selfAssigned(t.decls, t.selfReach) }
+    t.selfReach.paths
+}
+
+-- How an exclusion names the assignable position `path`, a field of `tycon`
+-- or of another type in its group.
+fun assignedAt(path : Decls.SelfPath, tycon : String) -> String {
+    let c = path.con
+    let i = path.field
+    let owner = if c.tycon == tycon { "" } else { " of '" + Ty.shortName(c.tycon) + "'" }
+    if c.mutable[i] {
+        let its = if c.tycon == tycon { "its " } else { "the " }
+        its + "'var' field " + quotedField(c, i) + owner
+    } else {
+        let named = match c.fields {
+            Some(_) -> fieldName(c, i) + owner
+            None -> fieldName(c, i)
+        }
+        "an assignable position in " + named
+    }
+}
+
+-- Field `i` of `c` as a diagnostic quotes it: its label, or its position.
+fun quotedField(c : ConInfo, i : Int) -> String = match c.fields {
+    Some(labels) -> "'" + labels[i] + "'"
+    None -> Int.toString(i) + " of '" + Ty.shortName(c.name) + "'"
 }
 
 -- Returns the instance of `cls` for `tycon` that a program wrote, if one did.
@@ -1806,15 +1952,17 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
         None -> return None
     }
     let general = declaredHead(info)?
-    -- `checkDerives` begins every derivation an error-free program has, and
-    -- each begins those it needs, so the generator can check them all
-    -- (`Turkey.Infer.genDerived`). One the solver or the lowering would begin
-    -- later would never be checked. After an error the program stops before
-    -- solving, so a derivation not begun there is not needed.
-    if !t.checking && !t.deriving {
+    -- `checkDerives` begins a derive list's derivations, and the solver
+    -- begins the rest the first time a predicate needs one.
+    -- `Turkey.Infer.solve` checks each in the run of the solver that began
+    -- it. One begun once a component is solved, by the lowering or a later
+    -- pass, would never be checked. After an error the program stops once
+    -- its component is solved, before anything is lowered, so a derivation
+    -- not begun by then is not needed.
+    if !t.open {
         if Diag.hasErrors() { return None }
         bug("'" + Ty.shortName(cls) + " " + Ty.shortName(tycon) + "' was first asked for "
-            + "after derive lists were checked", None)
+            + "after its component was solved", None)
     }
     let inst = begin(t, cls, info, general, key)
     -- A derivation begun inside another is settled by the outermost one,
@@ -1973,6 +2121,20 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     for a in args {
         if let TVar(cell) = Ty.prune(a) { Set.add(params, cell.id) }
     }
+    -- A derived instance's laws relate it to its superclasses' instances,
+    -- so those must be derived too. Checked before the fields, which would
+    -- otherwise begin derivations for nothing.
+    if let Some(ci) = Map.get(t.classes, cls) {
+        for sup in ci.supers {
+            let shown = "'" + Ty.shortName(sup.name) + "'"
+            if Option.isSome(writtenInstance(t, sup.name, tycon)) {
+                return Left(shown + " is written by hand")
+            }
+            if refuses(t, tycon, sup.name) {
+                return Left(shown + " is refused with '!" + Ty.shortName(sup.name) + "'")
+            }
+        }
+    }
     let n = writtenNamer(inst.names)
     let wanted = []
     for c in info.variants {
@@ -2004,12 +2166,6 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     match Map.get(t.classes, cls) {
         Some(ci) -> for sup in ci.supers {
             let shown = "'" + Ty.shortName(sup.name) + "'"
-            if Option.isSome(writtenInstance(t, sup.name, tycon)) {
-                return Left(shown + " is written by hand")
-            }
-            if refuses(t, tycon, sup.name) {
-                return Left(shown + " is refused with '!" + Ty.shortName(sup.name) + "'")
-            }
             if Option.isSome(reduce(t, Ty.pred(sup.name, [inst.head]), params, 0, wanted)) {
                 return match Map.get(t.derivations, derivationKey(sup.name, tycon)) {
                     Some(Underivable(reason)) -> Left(reason)
@@ -2176,6 +2332,10 @@ fun whyNot(t : ClassTable, cls : String, ty : Ty.Type) -> String {
     let (h, _) = Ty.spine(Ty.prune(ty))
     if let TCon(c) = h {
         if refuses(t, c.name, cls) { return ", which opts out of " + shown }
+        -- The plain exclusion, not `exclusion`: a reason is built for every
+        -- failed derivation, `listedReason`'s own among them, so trying the
+        -- derive list here would try again at every level of a chain.
+        if let Some(why) = implicitExclusion(t, cls, c.name) { return ", which " + why }
         if let Some(Underivable(reason)) = Map.get(t.derivations, derivationKey(cls, c.name)) {
             return ", whose " + reason
         }
@@ -2196,6 +2356,13 @@ fun whyMissing(t : ClassTable, p : Pred) -> Option String {
     if refuses(t, c.name, p.name) {
         return Some(lead + "its declaration says '!" + Ty.shortName(p.name) + "'")
     }
+    match exclusion(t, p.name, c.name) {
+        Some(Right(why)) -> return Some(lead + "it " + why + "; write ': "
+                                        + Ty.shortName(p.name)
+                                        + "' in its declaration to derive one anyway")
+        Some(Left(reason)) -> return Some(lead + reason)
+        None -> {}
+    }
     match Map.get(t.derivations, derivationKey(p.name, c.name)) {
         Some(Underivable(reason)) -> Some(lead + reason)
         _ -> None
@@ -2206,12 +2373,6 @@ fun whyMissing(t : ClassTable, p : Pred) -> Option String {
 -- and instance they could name is in the table, and derives each class an
 -- entry asks for, reporting at the entry why one cannot be.
 fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
-    t.checking = True
-    checkDeclarations(t, decls)
-    t.checking = False
-}
-
-fun checkDeclarations(t : ClassTable, decls : Vec TypeDecl) -> Unit {
     for d in decls {
         if Option.isSome(d.alias) || !Map.contains(t.decls.tycons, d.name) { continue }
         let wanted = []
@@ -2349,6 +2510,21 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     if p.name == P.typedClass {
         let _ = deriveTyped(t, p)
     }
+    -- A derived instance is the only one for its type, so it is found by
+    -- name rather than among every instance of the class.
+    let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
+    let derivable = Option.isSome(derivedMethod(p.name))
+    if let TCon(c) = receiver {
+        if derivable {
+            match Map.get(t.derivations, derivationKey(p.name, c.name)) {
+                Some(Derived(inst)) | Some(Deriving(inst)) ->
+                    if let Some(mapping) = match_(inst.head, p.args[0]) {
+                        return Some((inst, mapping))
+                    }
+                _ -> {}
+            }
+        }
+    }
     for inst in instancesOf(t, p.name) {
         if let Some(mapping) = match_(inst.head, p.args[0]) {
             return Some((inst, mapping))
@@ -2356,7 +2532,7 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     }
     -- After the table, so that an instance written by hand is the one found
     -- and nothing is derived beside it.
-    let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
+    if !derivable { return None }
     if let TCon(c) = receiver {
         if let Some(inst) = derive(t, p.name, c.name) {
             if let Some(mapping) = match_(inst.head, p.args[0]) {

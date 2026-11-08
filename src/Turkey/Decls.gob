@@ -1386,12 +1386,17 @@ fun discard(x : a) -> Unit = {}
 -- assignably. A type reaches itself assignably exactly when its component of
 -- that graph has an assignable edge inside it.
 --
--- Two kinds of field are taken at their worst, because what they hold is
--- not known here. A parameter applied to a type, `f a`, is taken to hold
--- `a` assignably, because `f` may be `Array`. A type a constructor hides in
--- an existential bracket may be any type at all, an array of the type
--- holding it included, so a type that holds one, directly or through the
--- types it holds, is taken to reach itself.
+-- A parameter applied to a type, `f a`, is taken to hold `a` assignably,
+-- because `f` may be `Array`. That is the one place the walk assumes the
+-- worst rather than knowing.
+--
+-- So the walk is exact about every cycle the declared types show. A type a
+-- constructor hides in an existential bracket shows nothing, and is not
+-- followed: a derived instance never compares one, so a derived `==` cannot
+-- loop through it. A hand-written instance that compares the hidden value
+-- can, on a cycle closed through it, as any hand-written instance can; no
+-- rule about derived instances could prevent that, since the loop needs no
+-- derived instance at all.
 
 -- How a type holds something: not at all, only in positions a program cannot
 -- assign, or in at least one it can. Ordered, so that two ways of holding one
@@ -1401,9 +1406,8 @@ let heldPlainly = 1
 let heldAssignably = 2
 
 -- A field through which a type can reach itself: field `field` of `con`,
--- which is a `var` field or holds an array element, or, when `hidden`, holds
--- a type that a constructor hides.
-type SelfPath = SelfPath { con : ConInfo, field : Int, hidden : Bool }
+-- which is a `var` field or holds an array element.
+type SelfPath = SelfPath { con : ConInfo, field : Int }
 
 -- What `selfAssigned` has found, for the types registered so far.
 type SelfReach = SelfReach {
@@ -1411,15 +1415,11 @@ type SelfReach = SelfReach {
     holds : Map String (Array Int),
     -- A field through which each type that can reach itself assignably does.
     paths : Map String SelfPath,
-    -- The types that hold a hidden type, directly or through the types
-    -- they hold, with a field that leads to one.
-    hiding : Map String SelfPath,
     -- How much of the registration order has been read.
     var done : Int,
 }
 
-fun newSelfReach() -> SelfReach =
-    SelfReach { holds = Map.new(), paths = Map.new(), hiding = Map.new(), done = 0 }
+fun newSelfReach() -> SelfReach = SelfReach { holds = Map.new(), paths = Map.new(), done = 0 }
 
 -- Adds to `r` the types registered since it was last brought up to date: for
 -- each whose values can reach themselves through an assignable position, a
@@ -1447,30 +1447,19 @@ fun selfAssigned(t : DeclTable, r : SelfReach) -> Unit {
         let out = []
         let succ = Set.new()
         for c in tyconOf(t, name).variants {
-            let params = resultParams(c)
             let fields = conParams(c)
             for var i = 0; i < len(fields); i = i + 1 {
-                let path = SelfPath { con = c, field = i, hidden = False }
+                let path = SelfPath { con = c, field = i }
                 let held = []
-                heldTypes(r.holds, params, fields[i], fieldHolding(c, i), held)
+                heldTypes(r.holds, fields[i], fieldHolding(c, i), held)
                 for (to, at) in held {
-                    if to == hiddenType {
-                        if !Map.contains(r.hiding, name) {
-                            Map.put(r.hiding, name, SelfPath { con = c, field = i, hidden = True })
-                        }
-                    } else {
-                        Vec.push(out, (to, at, path))
-                        Set.add(succ, to)
-                    }
+                    Vec.push(out, (to, at, path))
+                    Set.add(succ, to)
                 }
             }
         }
         Map.put(edges, name, out)
         Map.put(graph, name, succ)
-    }
-    hidingThrough(edges, r.hiding, fresh)
-    for name in fresh {
-        if let Some(path) = Map.get(r.hiding, name) { Map.put(r.paths, name, path) }
     }
     for component in Deps.sccs(graph) {
         let members = Set.new()
@@ -1486,30 +1475,7 @@ fun selfAssigned(t : DeclTable, r : SelfReach) -> Unit {
         }
         if let Some(any) = first {
             for name in component {
-                if Map.contains(r.paths, name) { continue }
                 Map.put(r.paths, name, Option.unwrapOr(assigningEdge(edges, members, name), any))
-            }
-        }
-    }
-}
-
--- Adds to `hiding` each of `names` that holds a type in it, through its
--- edges, with the field that does: the least fixed point, since a type may
--- hold one through another of `names`. Each round only adds, so it ends.
-fun hidingThrough(edges : Map String (Vec (String, Int, SelfPath)),
-                  hiding : Map String SelfPath, names : Vec String) -> Unit {
-    var changed = True
-    while changed {
-        changed = False
-        for name in names {
-            if Map.contains(hiding, name) { continue }
-            for (to, _, path) in Map.getOr(edges, name, []) {
-                if Map.contains(hiding, to) {
-                    Map.put(hiding, name, SelfPath { con = path.con, field = path.field,
-                                                     hidden = True })
-                    changed = True
-                    break
-                }
             }
         }
     }
@@ -1528,22 +1494,6 @@ fun assigningEdge(edges : Map String (Vec (String, Int, SelfPath)), members : Se
 -- How field `i` of `c` holds its value: assignably when it is `var`.
 fun fieldHolding(c : ConInfo, i : Int) -> Int =
     if c.mutable[i] { heldAssignably } else { heldPlainly }
-
--- Returns the ids of the variables of `c`'s declared result: its type's
--- parameters. A variable in a field and not among them is hidden.
-fun resultParams(c : ConInfo) -> Set.Set Int {
-    let out = Set.new()
-    let (_, args) = match Ty.prune(c.scheme.body) {
-        TFun(_, ret) -> Ty.spine(ret)
-        other -> Ty.spine(other)
-    }
-    for a in args { if let TVar(cell) = Ty.prune(a) { Set.add(out, cell.id) } }
-    out
-}
-
--- What `heldTypes` names a type hidden by a constructor as: no declared
--- type has an empty name.
-let hiddenType = ""
 
 -- Returns `c`'s field types, over the variables of its declared result.
 fun conParams(c : ConInfo) -> Array Ty.Type = match Ty.prune(c.scheme.body) {
@@ -1625,28 +1575,24 @@ fun argumentHolding(holds : Map String (Array Int), name : String, i : Int) -> I
 
 -- Adds to `out` each declared type `ty` holds, with how, where `level` is how
 -- `ty` itself is held and `holds` says how the types it names hold their
--- arguments. A variable not among `params` is a hidden type, which it adds as
--- `hiddenType`.
-fun heldTypes(holds : Map String (Array Int), params : Set.Set Int, ty : Ty.Type, level : Int,
+-- arguments.
+fun heldTypes(holds : Map String (Array Int), ty : Ty.Type, level : Int,
               out : Vec (String, Int)) -> Unit {
     let (h, args) = Ty.spine(Ty.prune(ty))
-    if let TVar(cell) = h {
-        if !Set.contains(params, cell.id) { Vec.push(out, (hiddenType, heldAssignably)) }
-    }
     match h {
         -- A parameter of a higher kind may stand for `Array`, and which type
         -- it stands for is not known here. Holding its arguments plainly
         -- would miss `App Array T` reaching `T` through an array element,
         -- where a written `Eq (App f a) : Eq (f a)` lets `==` follow it.
-        TVar(_) -> for a in args { heldTypes(holds, params, a, heldAssignably, out) }
+        TVar(_) -> for a in args { heldTypes(holds, a, heldAssignably, out) }
         TCon(con) -> {
             if Map.contains(holds, con.name) { Vec.push(out, (con.name, level)) }
             for var i = 0; i < len(args); i = i + 1 {
                 let at = argumentHolding(holds, con.name, i)
-                if at != notHeld { heldTypes(holds, params, args[i], max(level, at), out) }
+                if at != notHeld { heldTypes(holds, args[i], max(level, at), out) }
             }
         }
-        TTuple(elems) -> for e in elems { heldTypes(holds, params, e, level, out) }
+        TTuple(elems) -> for e in elems { heldTypes(holds, e, level, out) }
         _ -> {}
     }
 }

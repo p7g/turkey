@@ -415,13 +415,10 @@ implicit `Eq` or `Hash`.** A value is built after its fields, so it cannot
 contain itself until an assignment makes it, and a derived `==` on such a
 cycle would compare forever. The compiler follows the fields' types, with
 each type's arguments put in, so a type that holds itself in a `var` field
-of another type, or in an array, counts. Where the compiler cannot see what
-a field holds, it assumes the worst. A field whose type applies a type
+of another type, or in an array, counts. A field whose type applies a type
 parameter, as `f a` does, counts as holding `a` in an assignable position,
-since `f` may be `Array`. A type hidden in an [existential
-bracket](types.md#existential-types) may be any type, the type holding it
-included, so a type that holds one, directly or through its fields' types,
-counts as reaching itself:
+since `f` may be `Array`. A node that links to the next is the plainest
+case:
 
 <!-- error: 'Node' has no 'Eq': it can reach itself through its 'var' field 'next'; write ': Eq' in its declaration to derive one anyway -->
 ```kotlin
@@ -432,6 +429,12 @@ fun main() {
     print(a == a)
 }
 ```
+
+The rule covers the cycles the declared types show. A type hidden in an
+[existential bracket](types.md#existential-types) shows none, and a derived
+instance never compares one. A hand-written instance that compares the
+hidden value can still loop on a cycle closed through it, as any
+hand-written instance can.
 
 **A type with a `var` field has no implicit `Hash`.** Its hash could change
 while it is a key in a map, which would then not find it. It still has `Eq`,

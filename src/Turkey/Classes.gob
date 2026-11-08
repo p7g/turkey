@@ -1840,10 +1840,6 @@ fun implicitExclusion(t : ClassTable, cls : String, tycon : String) -> Option St
     -- position, so a type that cannot reach itself through one has no cyclic
     -- value (`Decls.selfAssigned`).
     if let Some(path) = Map.get(selfPaths(t), tycon) {
-        if path.hidden {
-            return Some("may reach itself through the hidden type in "
-                        + fieldName(path.con, path.field))
-        }
         return Some("can reach itself through " + assignedAt(path, tycon))
     }
     -- A hash of a value that can change would change while the value is a
@@ -1873,23 +1869,16 @@ fun exclusion(t : ClassTable, cls : String, tycon : String) -> Option (Either St
 -- Returns why `tycon` would have no derived `cls` even with `cls` in its
 -- derive list, or `None` if it would have one. Leaves the table as it found
 -- it, so that what the attempt derives is not there for anything to use.
---
--- The attempt is a derivation of its own, with its own fixed point, and may
--- run inside another's (`whyNot` reports a field's reason while a context is
--- inferred), so the outer one's state is put aside and restored. What the
--- outer one has begun is in the table and taken to exist, as it is for
--- every derivation begun inside it.
+-- Called only for a diagnostic at a use (`whyMissing`), never while a
+-- derivation runs.
 fun listedReason(t : ClassTable, cls : String, tycon : String) -> Option String {
+    if t.deriving { bug("a derive list was tried while a derivation ran", None) }
     let before = Set.new()
     for key in Map.keys(t.derivations) { Set.add(before, key) }
-    let provisional = Vec.append(t.provisional, [])
-    let deriving = t.deriving
     let derived = len(t.derived)
-    let assumed = t.assumedListed
-    Vec.clear(t.provisional)
-    t.deriving = False
     t.assumedListed = Some((tycon, cls))
     let _ = derive(t, cls, tycon)
+    t.assumedListed = None
     let reason = match Map.get(t.derivations, derivationKey(cls, tycon)) {
         Some(Underivable(r)) -> Some(r)
         _ -> None
@@ -1903,10 +1892,6 @@ fun listedReason(t : ClassTable, cls : String, tycon : String) -> Option String 
         let _ = Map.delete(t.derivations, key)
     }
     while len(t.derived) > derived { let _ = Vec.pop(t.derived) }
-    Vec.clear(t.provisional)
-    for key in provisional { Vec.push(t.provisional, key) }
-    t.deriving = deriving
-    t.assumedListed = assumed
     reason
 }
 
@@ -2347,11 +2332,10 @@ fun whyNot(t : ClassTable, cls : String, ty : Ty.Type) -> String {
     let (h, _) = Ty.spine(Ty.prune(ty))
     if let TCon(c) = h {
         if refuses(t, c.name, cls) { return ", which opts out of " + shown }
-        match exclusion(t, cls, c.name) {
-            Some(Right(why)) -> return ", which " + why
-            Some(Left(reason)) -> return ", whose " + reason
-            None -> {}
-        }
+        -- The plain exclusion, not `exclusion`: a reason is built for every
+        -- failed derivation, `listedReason`'s own among them, so trying the
+        -- derive list here would try again at every level of a chain.
+        if let Some(why) = implicitExclusion(t, cls, c.name) { return ", which " + why }
         if let Some(Underivable(reason)) = Map.get(t.derivations, derivationKey(cls, c.name)) {
             return ", whose " + reason
         }

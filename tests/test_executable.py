@@ -151,6 +151,17 @@ def test_a_refused_build_leaves_the_output_as_it_was(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["existing", "tls.gob"]
 
 
+# Each build writes a partial file of its own, made exclusively, so one that
+# is already there -- another build's, still being written -- is never
+# touched.
+def test_a_build_leaves_another_builds_partial_file_alone(tmp_path):
+    other = tmp_path / ".adt.partial0"
+    other.write_bytes(b"another build's")
+    _write(PROGRAMS / "adt.gob", tmp_path / "adt")
+    assert other.read_bytes() == b"another build's"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [".adt.partial0", "adt"]
+
+
 def test_an_executable_is_written_only_when_asked_for(tmp_path):
     result = _boot("--target", "arm64-darwin", "-o", str(tmp_path / "adt"),
                    str(PROGRAMS / "adt.gob"))

@@ -369,16 +369,11 @@ fun baseName(path : String) -> String {
 -- the code signature of a file it has run, and kills a process started from
 -- that file once its bytes change in place.
 fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
-    let partial = match String.rsplitOnce(path, "/") {
+    let stem = match String.rsplitOnce(path, "/") {
         Some((directory, base)) -> directory + "/." + base + ".partial"
         None -> "." + path + ".partial"
     }
-    -- Left by a build that was killed while writing.
-    if let Right(_) = File.symlinkMetadata(partial) { let _ = File.removeFile(partial) }
-    let out = match File.createExecutable(partial, File.Exclusive) {
-        Right(out) -> out
-        Left(e) -> die(message(e))
-    }
+    let (partial, out) = createPartial(stem, 0)
     let failed = fun(e) {
         let _ = File.removeFile(partial)
         die(message(e))
@@ -389,6 +384,22 @@ fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
     }
     if let Left(e) = File.close(out) { failed(e) }
     if let Left(e) = File.rename(partial, path) { failed(e) }
+}
+
+-- Returns the first of `stem` followed by `n`, `n + 1`, ... that names
+-- nothing yet, made exclusively, and the file open. The exclusive create is
+-- what gives each build of one output a file of its own: one never writes
+-- into, removes or renames another's. A build killed while writing leaves
+-- its file, which only moves the next build to a later number.
+fun createPartial(stem : String, n : Int) -> (String, File.File File.WriteOnly) {
+    let candidate = stem + Int.toString(n)
+    match File.createExecutable(candidate, File.Exclusive) {
+        Right(out) -> (candidate, out)
+        Left(e) -> match e.kind {
+            IO.AlreadyExists -> createPartial(stem, n + 1)
+            _ -> die(message(e))
+        }
+    }
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this

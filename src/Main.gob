@@ -170,12 +170,13 @@ let checkedThrough = "core"
 -- linker, or an executable, with the linker's work done here as well.
 type Format = Executable | Object | Assembly
 
--- Where the output goes.
-type Destination = ToStdout | ToFile(File.File File.WriteOnly)
+-- Where the output goes: standard output, a file open for it, or an
+-- executable's path, written whole once its bytes are complete
+-- (`writeExecutable`).
+type Destination = ToStdout | ToFile(File.File File.WriteOnly) | ToExecutable(String)
 
--- What `build` writes, and where. `name` is what the output is called: the
--- file's own name, or the entry's without its extension for the standard
--- output.
+-- What `build` writes, and where. `name` is what the program is called: the
+-- entry file's name without its extension, whatever the output's.
 type Sink = Sink { to : Destination, format : Format, name : String }
 
 fun main() {
@@ -328,18 +329,7 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                     + "file separately, or write to standard output with -o -")
             }
             match chosen {
-                -- A new file rather than the old one rewritten: macOS keeps
-                -- the code signature of a file it has run, and kills a
-                -- process started from that file once its bytes change.
-                Executable -> {
-                    if let Right(_) = File.symlinkMetadata(path) {
-                        if let Left(e) = File.removeFile(path) { die(message(e)) }
-                    }
-                    match File.createExecutable(path, File.Exclusive) {
-                        Right(out) -> ToFile(out)
-                        Left(e) -> die(message(e))
-                    }
-                }
+                Executable -> ToExecutable(path)
                 Object | Assembly -> match File.create(path, File.Truncate) {
                     Right(out) -> ToFile(out)
                     Left(e) -> die(message(e))
@@ -358,15 +348,10 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                 + "one " + what + "; build each file separately")
         }
     }
-    let name = match output {
-        None | Some("-") -> {
-            let base = baseName(paths[0])
-            match String.rsplitOnce(base, ".") {
-                Some((stem, _)) -> stem
-                None -> base
-            }
-        }
-        Some(path) -> baseName(path)
+    let base = baseName(paths[0])
+    let name = match String.rsplitOnce(base, ".") {
+        Some((stem, _)) -> stem
+        None -> base
     }
     Sink { to = to, format = chosen, name = name }
 }
@@ -375,6 +360,35 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
 fun baseName(path : String) -> String {
     let parts = String.split(path, "/")
     parts[len(parts) - 1]
+}
+
+-- Writes `bytes` as an executable at `path`, through a new file beside it
+-- that is renamed over `path` once every byte is in. So `path` is never
+-- half written, a build that fails before this leaves it as it was, and the
+-- executable is a new file rather than the old one rewritten: macOS keeps
+-- the code signature of a file it has run, and kills a process started from
+-- that file once its bytes change in place.
+fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
+    let partial = match String.rsplitOnce(path, "/") {
+        Some((directory, base)) -> directory + "/." + base + ".partial"
+        None -> "." + path + ".partial"
+    }
+    -- Left by a build that was killed while writing.
+    if let Right(_) = File.symlinkMetadata(partial) { let _ = File.removeFile(partial) }
+    let out = match File.createExecutable(partial, File.Exclusive) {
+        Right(out) -> out
+        Left(e) -> die(message(e))
+    }
+    let failed = fun(e) {
+        let _ = File.removeFile(partial)
+        die(message(e))
+    }
+    if let Left(e) = IO.writeFrom(out, bytes) {
+        let _ = File.close(out)
+        failed(e)
+    }
+    if let Left(e) = File.close(out) { failed(e) }
+    if let Left(e) = File.rename(partial, path) { failed(e) }
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this
@@ -1233,6 +1247,7 @@ fun reportCosts(costs : Vec (String, Duration)) -> Unit {
 fun send(to : Destination, text : String) -> Unit = match to {
     ToStdout -> write(text)
     ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
+    ToExecutable(_) -> die("internal error: an executable is written as bytes, not text")
 }
 
 fun sendBytes(to : Destination, array : Array Byte) -> Unit {
@@ -1248,6 +1263,7 @@ fun sendBytes(to : Destination, array : Array Byte) -> Unit {
             }
         }
         ToFile(out) -> if let Left(e) = IO.writeFrom(out, buffer) { die(message(e)) }
+        ToExecutable(path) -> writeExecutable(path, buffer)
     }
 }
 

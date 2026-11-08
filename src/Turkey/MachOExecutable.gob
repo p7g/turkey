@@ -1,8 +1,7 @@
 export (executableFile)
 
 -- An assembled arm64 module as a Mach-O executable (`MH_EXECUTE`), signed
--- and ready to run, with no linker: what the system linker would make of the
--- module's object, linked against libSystem alone.
+-- and ready to run, linked against libSystem alone.
 --
 -- **Layout.** Five segments, each a whole number of 16KB pages, the arm64
 -- page size: `__PAGEZERO`, the unmapped first 4GB that catches a null
@@ -19,14 +18,16 @@ export (executableFile)
 -- layout gives. The image has no rebases: the loaded sections hold no
 -- absolute address. A call to a libSystem function goes to a stub of three
 -- instructions, `adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16`,
--- which jumps through that function's slot in the offset table, as the
--- linker's stubs do. The loader fills the slots in from classic bind opcodes
+-- which jumps through that function's slot in the offset table, so that a
+-- call needs one word per import bound and no code patched. The loader
+-- fills the slots in from classic bind opcodes
 -- (`LC_DYLD_INFO_ONLY`) rather than chained fixups: a handful of binds needs
 -- no more, and every arm64 macOS reads them.
 --
--- **What is left out.** The debug sections, and the unwind sections, from
--- which the linker would build `__unwind_info`. The runtime finds frames by
--- their frame pointers and the frame table, and needs neither.
+-- **What is left out.** The debug sections, and the unwind sections, which
+-- an unwinder reads only through an `__unwind_info` this does not build.
+-- The runtime finds frames by their frame pointers and the frame table, and
+-- needs neither.
 --
 -- **Symbols.** Every named symbol defined in the module is in the table, so
 -- that `nm`, a profiler and a crash report name every function; the
@@ -37,10 +38,11 @@ export (executableFile)
 -- last two by name, as `LC_DYSYMTAB` describes it.
 --
 -- **Deterministic.** Nothing in the file depends on the host, the time or
--- the path it is written to. `LC_UUID`, which the loader requires, is taken
--- from a SHA-256 of the rest of the file, and the signature is ad hoc, with
--- no timestamp (`Turkey.CodeSignature`). So one module always writes the
--- same bytes, which is what lets the compiler's fixed point compare
+-- the path it is written to: the signature's identifier is the caller's,
+-- from the program's own name. `LC_UUID`, which the loader requires, is
+-- taken from a SHA-256 of the rest of the file, and the signature is ad hoc,
+-- with no timestamp (`Turkey.CodeSignature`). So one module always writes
+-- the same bytes, which is what lets the compiler's fixed point compare
 -- executables.
 
 import Hash.SHA256 as SHA256
@@ -329,13 +331,14 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     }
     copy(out, stringsAt, strings)
 
-    -- The UUID is a hash of the file with the UUID and signature still
-    -- zero, marked as a name-based UUID, as RFC 4122 lays them out.
+    -- The UUID is the first half of a SHA-256 of the file with the UUID
+    -- and signature still zero, marked as RFC 9562's version 8, a UUID of
+    -- the maker's own construction, with the RFC 4122 variant.
     let h = SHA256.new()
     SHA256.update(h, out, 0, signatureAt)
     let digest = SHA256.finish(h)
     for var k = 0; k < 16; k = k + 1 { out[uuidAt + k] = digest[k] }
-    out[uuidAt + 6] = Byte.truncate(Byte.toInt(digest[6]) & 0x0F | 0x30)
+    out[uuidAt + 6] = Byte.truncate(Byte.toInt(digest[6]) & 0x0F | 0x80)
     out[uuidAt + 8] = Byte.truncate(Byte.toInt(digest[8]) & 0x3F | 0x80)
     CodeSignature.sign(out, signatureAt, identifier, (0, textSegment))
     out

@@ -101,7 +101,20 @@ Run the compiler from the repository root, where it finds `lib/`. It has two
 commands. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or
 `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. `check` compiles as far as the last stage that
+object needs no assembler, only a linker. On a Mac, `-f exe` writes a signed
+executable that runs as it is, with no assembler and no linker:
+
+```sh
+build/stages/stage2 build -f exe -o rectangles rectangles.gob
+./rectangles
+```
+
+It is written for arm64-darwin only, from any host with `--target
+arm64-darwin`, and links libSystem alone, so a program that imports `Net.TLS`
+is refused and keeps the object path. It carries no debug or unwind
+information yet, so it takes no `-g`, and a file name without an extension
+will not choose it until the executable has what lldb and a profiler read.
+`check` compiles as far as the last stage that
 can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no
@@ -148,6 +161,10 @@ cc -o rectangles rectangles.o
 Assembly written with `-g` needs the assembler to build the line table, in
 DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
 
+`-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
+functions and the calls inlined into them, which is all a profiler or a
+backtrace reads, and none of what a debugger needs to show a variable.
+
 On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
 object and writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run
@@ -186,8 +203,33 @@ included, is a regular expression: `breakpoint set --func-regex
 '^Main\.area\['`. gdb's `rbreak ^Main\.area\[` sets a breakpoint on each
 specialization it matches, but each one stops only in the copy that has the
 symbol, as a breakpoint by symbol does.
-There is no information about variables or types yet, so a debugger shows
-registers and memory rather than values.
+
+`frame variable` in lldb and `info locals` in gdb show a function's
+parameters and locals wherever the code still holds them: in a register until
+its last use, or in the frame slot the collector or the register allocator
+keeps it in.
+
+The debug information describes values as the compiled code holds them, so
+without help a debugger shows a `String` as a pointer and a `Vec` as its
+storage. The formatters in `debugger/` show them as the source writes them --
+a `String` as its text, an `Array`, a `Vec` or a `Map` as its elements, a sum
+such as `Option` or `Either` as the constructor it holds, a record as its
+fields:
+
+```sh
+scripts/turkey-lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o 'frame variable'
+```
+
+`scripts/turkey-lldb` is lldb with `debugger/turkey_lldb.py` imported; in a
+session of your own, `command script import debugger/turkey_lldb.py` does the
+same. On Linux, a program built with `-g` names `turkey_gdb.py` for gdb to
+load. gdb looks for it along its source path, so it loads it once
+`~/.gdbinit` adds the directory there and to the safe path:
+
+```
+directory /path/to/turkey/debugger
+add-auto-load-safe-path /path/to/turkey/debugger
+```
 
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and

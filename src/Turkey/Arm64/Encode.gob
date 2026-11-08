@@ -141,10 +141,10 @@ fun fixupOf(op : Arm) -> Option Fixup = match op {
     Cbnz(_, label, _) -> Some(Branch19(label))
     Adrp(_, at) -> Some(Page21(at))
     AddLo(_, _, at) -> Some(AddOffset12(at))
-    Ldr(d, PageOffset(_, at), w) -> Some(PageOffset12(at, scale(d, w)))
+    Ldr(d, PageOffset(_, at), w) -> Some(PageOffset12(at, A.registerSize(d, w)))
     Ldrb(_, PageOffset(_, at)) -> Some(PageOffset12(at, 0))
     Ldrsw(_, PageOffset(_, at)) -> Some(PageOffset12(at, 2))
-    Str(v, PageOffset(_, at), w) -> Some(PageOffset12(at, scale(v, w)))
+    Str(v, PageOffset(_, at), w) -> Some(PageOffset12(at, A.registerSize(v, w)))
     Strb(_, PageOffset(_, at)) -> Some(PageOffset12(at, 0))
     _ -> None
 }
@@ -205,10 +205,10 @@ fun encode(op : Arm, out : Vec Int) -> Unit = match op {
                                                  lsb + width - 1))
     Rbit(d, a)             -> word(out, 0xDAC00000 | rn(a) | rd(d))
     Clz(d, a)              -> word(out, 0xDAC01000 | rn(a) | rd(d))
-    Ldr(d, m, w)           -> word(out, access(load(d, w), d, m, scale(d, w)))
+    Ldr(d, m, w)           -> word(out, access(load(d, w), d, m, A.registerSize(d, w)))
     Ldrb(d, m)             -> word(out, access(ldrb, d, m, 0))
     Ldrsw(d, m)            -> word(out, access(ldrsw, d, m, 2))
-    Str(v, m, w)           -> word(out, access(store(v, w), v, m, scale(v, w)))
+    Str(v, m, w)           -> word(out, access(store(v, w), v, m, A.registerSize(v, w)))
     Strb(v, m)             -> word(out, access(strb, v, m, 0))
     Stp(a, b, base, n)     -> word(out, pair(0xA9000000, a, b, base, n))
     Ldp(a, b, base, n)     -> word(out, pair(0xA9400000, a, b, base, n))
@@ -396,22 +396,14 @@ fun store(r : Reg, w : Width) -> Access = match (r, w) {
     (_, W32) -> Access { scaled = 0xB9000000, unscaled = 0xB8000000, indexed = 0xB8206800 }
 }
 
--- Log2 of the access size: a double is eight bytes whatever the width says.
-fun scale(r : Reg, w : Width) -> Int = match (r, w) {
-    (Physical(Fp, _), _) -> 3
-    (_, W64) -> 3
-    (_, W32) -> 2
-}
-
 -- The scaled form where the offset is a non-negative multiple of the access
 -- size that fits, the unscaled `ldur`/`stur` form for a small offset that is
 -- not, as the assembler chooses for the same operand.
 fun access(op : Access, t : Reg, m : Mem, size : Int) -> Int = match m {
     Offset(base, n) -> {
-        let step = 1 << size
-        if n >= 0 && n & (step - 1) == 0 && n >> size <= 4095 {
+        if A.scaledOffset(n, size) {
             op.scaled | (n >> size) << 10 | rn(base) | rd(t)
-        } else if n >= -256 && n <= 255 {
+        } else if A.unscaledOffset(n) {
             op.unscaled | (n & 0x1FF) << 12 | rn(base) | rd(t)
         } else {
             unencodable("the memory offset " + Int.toString(n))

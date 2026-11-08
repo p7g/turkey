@@ -639,6 +639,42 @@ fun pick(x : a, y : b) = if True { x } else { y }
 fun describe(x : a, label) = label + show(x)
 ```
 
+The context covers a constraint it implies, not only one it spells: through a
+class's superclasses, including its equality superclasses, and through the
+equalities it writes. Here the body needs `Show (Key c)`, which the context
+does not spell, but `Show (Elem c)` and `Elem c ~ Key c` together imply it.
+The function's type has the context as written, and the constraints the body
+places on the unannotated `n`, `Show` and a numeric type, are inferred and
+added to it:
+
+<!-- run -->
+```kotlin
+class Container c {
+    type Elem c
+    type Key c
+    fun firstKey(c) -> Key c
+}
+
+type Tags = Tags(Array String)
+
+instance Container Tags {
+    type Elem = String
+    type Key = String
+    fun firstKey(Tags(ts)) = ts[0]
+}
+
+fun describe[Container c, Show (Elem c), Elem c ~ Key c](x : c, n) -> String =
+    show(firstKey(x)) + " x" + show(n + 1)
+
+fun main() {
+    print(describe(Tags(["a", "b"]), 2))
+}
+```
+
+```text
+a x3
+```
+
 Annotations on types that contain no type variables, such as `n : Int`, simply
 fix that type.
 

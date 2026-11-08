@@ -13,10 +13,10 @@ import subprocess
 from tests import bootc, lang
 
 PROGRAM = """
-type Pair = Pair(Int, Int)
+type Pair = Pair { var a : Int, b : Int }
 
 fun keep(xs : Vec Pair, n : Int) -> Unit {
-    for var i = 0; i < n; i = i + 1 { Vec.push(xs, Pair(i, n)) }
+    for var i = 0; i < n; i = i + 1 { Vec.push(xs, Pair { a = i, b = n }) }
 }
 
 fun main() {

@@ -11,7 +11,7 @@ export (
     uncovered,
     bySuper, superEqualities, equalityAt, openedPreds,
     byInst, selectInstance, contextAt, equalitiesAt, provenEqualities, contextPreds,
-    entail, prove, superPath, isClass, method, simplify,
+    entail, prove, superPath, isClass, method, minimal,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -2394,56 +2394,54 @@ fun method(t : ClassTable, name : String) -> Option MethodInfo =
         Some(cls) -> Map.get(classNamed(t, cls).methods, name)
     }
 
--- Drop a class predicate that the others already imply.
---
--- `[Ord a, Eq a]` is `[Ord a]` when `Eq` is a superclass of `Ord`. This is
--- cosmetic for soundness and load-bearing for legibility: an inferred context
--- that restates its own superclasses is noise.
-fun simplify(t : ClassTable, preds : Vec Pred) -> Vec Pred {
+-- Returns `preds` without each predicate that another of them implies by
+-- superclasses, without a duplicate, and without an equality whose sides are
+-- the same type, in the order given: GHC's `mkMinimalBySCs` (Note [Minimize
+-- by Superclasses] in `GHC.Tc.Solver`). `[Ord a, Eq a]` is `[Ord a]`, and
+-- `[Value a ~ Byte, Bytes a]` is `[Bytes a]` when `Value s ~ Byte` is a
+-- superclass of `Bytes s`.
+fun minimal(t : ClassTable, preds : Vec Pred) -> Vec Pred {
+    -- What each predicate implies, its own key included, as GHC's
+    -- `implicants`: a class predicate's superclass closure with the
+    -- equalities that closure declares, and an equality in both directions.
+    let clouds = Vec.map(preds, fun(p) {
+        let keys = Set.new()
+        Set.add(keys, minimalKey(p))
+        if isClass(t, p.name) {
+            for q in bySuper(t, p) { Set.add(keys, minimalKey(q)) }
+            for e in superEqualities(t, p) { Set.add(keys, minimalKey(e)) }
+        }
+        keys
+    })
+    let kept = Vec.new(len(preds))
     let out = Vec.new(len(preds))
-    let equalities = Set.new()
     for var i = 0; i < len(preds); i = i + 1 {
         let p = preds[i]
-        if !isClass(t, p.name) {
-            if p.name == Ty.equals && len(p.args) == 2 {
-                -- `Field.tag a ~ Field.tag a` states nothing. Two family
-                -- applications are deferred while their arguments differ and
-                -- can become equal afterwards, which is where these come from.
-                -- The caller passes both sides reduced: a side can become
-                -- reducible after the last time the equation was retried, so
-                -- `Int ~ Int` is a shape this actually reaches.
-                if Ty.sameType(p.args[0], p.args[1]) {
-                    continue
-                }
-                -- Equality is symmetric. Inference can meet both directions when
-                -- two associated families meet through a mutable local, and
-                -- they state one fact.
-                let key = symmetricKey(p)
-                if Set.contains(equalities, key) { continue }
-                Set.add(equalities, key)
-            }
-            Vec.push(out, p)
+        if p.name == Ty.equals && len(p.args) == 2 && Ty.sameType(p.args[0], p.args[1]) {
             continue
         }
+        -- Against what is still to come and what was kept, as GHC's `go`:
+        -- `Eq a` before `Ord a` goes, and of two copies the second stays.
+        let key = minimalKey(p)
         var implied = False
-        for var j = 0; j < len(preds) && !implied; j = j + 1 {
-            let q = preds[j]
-            if i != j && isClass(t, q.name) {
-                if Ty.predKey(q) == Ty.predKey(p) {
-                    -- A duplicate implies itself; keep the first of the pair.
-                    if j < i { implied = True }
-                } else {
-                    let supers = bySuper(t, q)
-                    for var k = 1; k < len(supers); k = k + 1 {
-                        if Ty.predKey(supers[k]) == Ty.predKey(p) { implied = True }
-                    }
-                }
-            }
+        for var j = i + 1; j < len(preds) && !implied; j = j + 1 {
+            if Set.contains(clouds[j], key) { implied = True }
         }
-        if !implied { Vec.push(out, p) }
+        for j in kept {
+            if Set.contains(clouds[j], key) { implied = True }
+        }
+        if !implied {
+            Vec.push(kept, i)
+            Vec.push(out, p)
+        }
     }
     out
 }
+
+-- Returns the key `minimal` compares `p` by, which is the same for an
+-- equality and its mirror.
+fun minimalKey(p : Pred) -> String =
+    if p.name == Ty.equals && len(p.args) == 2 { symmetricKey(p) } else { Ty.predKey(p) }
 
 fun symmetricKey(p : Pred) -> String {
     let parts = Array.sort([Ty.typeKey(p.args[0]), Ty.typeKey(p.args[1])])

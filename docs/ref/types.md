@@ -587,20 +587,6 @@ the same field names. A field marked `var` can be assigned after the value is
 built; every other field keeps the value it was built with (see
 [Mutability and sharing](#mutability-and-sharing)).
 
-A constructor has at most 21 fields, positional or named, and a tuple at most
-21 elements. A wider value is an error where it is declared or written; group
-related fields into a record of their own instead.
-
-<!-- error: constructor 'Wide' has 22 fields, and a value can have at most 21 -->
-```kotlin
-type Wide = Wide {
-    f0 : Int, f1 : Int, f2 : Int, f3 : Int, f4 : Int, f5 : Int
-    f6 : Int, f7 : Int, f8 : Int, f9 : Int, f10 : Int, f11 : Int
-    f12 : Int, f13 : Int, f14 : Int, f15 : Int, f16 : Int, f17 : Int
-    f18 : Int, f19 : Int, f20 : Int, f21 : Int
-}
-```
-
 A record constructor is still a constructor with a payload. `Item("pen", 3, 12)`
 builds the same value as the record expression above, with the fields in
 declaration order, and `Item(n, p, q)` is a valid pattern for it.
@@ -778,6 +764,36 @@ fun main() {
 Immutable values can never be changed, so a program cannot tell whether they
 are copied or shared. The same holds for a field that is not `var`: reading
 it through any reference gives the value the record was built with.
+
+Tasks running at the same time can read and assign the same `var` field, or
+the same element of an array. Reading either while another task assigns it
+gives a value that some assignment stored there, or the value the record or
+the array was built with, with one exception. A `var` field or an array
+element whose type is a tuple or a type with one constructor may be read
+**torn**: what the read gives combines fields of different values stored in
+it. Each of its fields is that field of some value stored there,
+and the same holds of their own fields in turn, down to a field of a
+primitive type or of a type with more than one constructor, which is read
+whole. So a torn read always gives a value of the field's type, possibly one
+no assignment stored.
+
+<!-- check -->
+```kotlin
+type Vec3 = Vec3 { x : Float, y : Float, z : Float }
+type Body = Body { var pos : Vec3, mass : Float }
+```
+
+A task that reads `body.pos` while another assigns
+`Vec3 { x = 1.0, y = 1.0, z = 1.0 }` over `Vec3 { x = 0.0, y = 0.0, z = 0.0 }`
+may see `Vec3 { x = 1.0, y = 0.0, z = 0.0 }`, and so may one that reads
+`points[i]` of an `Array Vec3` while another assigns it. Where a value must
+be read whole, make the reads and the assignments exclude each other, with
+`System.Sync.withLock` for instance.
+
+> **For readers new to this.** A read is *torn* when it sees part of one write
+> and part of another. A field that holds a value of several parts is written
+> one part at a time, and a reader that runs between those writes sees the
+> parts it reaches before and after them.
 
 Assigning a field that is not `var` is an error, and the message says where
 the field is declared, since that is where the fix goes:

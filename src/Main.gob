@@ -59,10 +59,13 @@ import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Dwarf as Dwarf
+import Turkey.Locations as Locations
+import Turkey.DebugTypes as DebugTypes
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
 import Turkey.MachO as MachO
+import Turkey.MachOExecutable as MachOExecutable
 import Turkey.Elf as Elf
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
@@ -108,11 +111,35 @@ var build = Build.plain
 -- whether the work in them is even enough to split.
 var timings = False
 
--- `-g`: write a line table and the debug information a debugger and a
--- profiler need to find it. The code is the same either way; only the items
--- `Turkey.Emit` and `Turkey.Dwarf` add, none of which has a byte in the
--- code, tell the two builds apart.
-var debugInfo = False
+-- How much debug information `build` writes (`Debug`). The code is the
+-- same at every level; only the items `Turkey.Emit` and `Turkey.Dwarf` add,
+-- none of which has a byte in the code, tell the builds apart.
+var debug = NoDebug
+
+-- What `--debug` and `-g` ask for: nothing; the line table, each function's
+-- name and range, and the calls inlined into it (`--debug=lines`), which is
+-- what a profiler and a backtrace need; or that and each function's
+-- variables, with their locations and types (`-g`, `--debug=full`), which is
+-- what a debugger needs to show values.
+type Debug = NoDebug | Lines | Full
+
+-- Whether `build` writes any debug information.
+fun debugInfo() -> Bool = match debug {
+    NoDebug -> False
+    _ -> True
+}
+
+-- Whether it writes the variables, with their locations and types.
+fun debugVariables() -> Bool = match debug {
+    Full -> True
+    _ -> False
+}
+
+fun debugNamed(level : String) -> Debug = match level {
+    "lines" -> Lines
+    "full" -> Full
+    _ -> die("unknown debug level '" + level + "'; the levels are lines and full")
+}
 
 -- A stopwatch started now, after reporting `phase` as having run since
 -- `since` was started.
@@ -139,15 +166,18 @@ let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
 -- to move this.
 let checkedThrough = "core"
 
--- What `build` writes: assembly, or a relocatable object for the system
--- linker. An executable needs the linker's work done here as well.
+-- What `build` writes: assembly, a relocatable object for the system
+-- linker, or an executable, with the linker's work done here as well.
 type Format = Executable | Object | Assembly
 
--- Where the output goes.
-type Destination = ToStdout | ToFile(File.File File.WriteOnly)
+-- Where the output goes: standard output, a file open for it, or an
+-- executable's path, written whole once its bytes are complete
+-- (`writeExecutable`).
+type Destination = ToStdout | ToFile(File.File File.WriteOnly) | ToExecutable(String)
 
--- What `build` writes, and where.
-type Sink = Sink { to : Destination, format : Format }
+-- What `build` writes, and where. `name` is what the program is called: the
+-- entry file's name without its extension, whatever the output's.
+type Sink = Sink { to : Destination, format : Format, name : String }
 
 fun main() {
     let p = Args.parser(Env.args())
@@ -170,7 +200,8 @@ fun main() {
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
                 Short('f') -> { format = Some(formatNamed(valueOf(p))) }
-                Short('g') -> { debugInfo = True }
+                Short('g') -> { debug = Full }
+                Long("debug") -> { debug = debugNamed(valueOf(p)) }
                 Long("target") -> {
                     let name = valueOf(p)
                     target = match Target.named(name) {
@@ -262,10 +293,24 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
         (None, Some(path)) -> formatOf(path)
         (None, None) -> Executable
     }
-    match chosen {
-        Executable -> die("boot cannot write an executable yet; write assembly "
-                          + "with -o NAME.s and link it with a C compiler")
-        Object | Assembly -> {}
+    -- An executable only when asked for by name: it carries no debug or
+    -- unwind information yet, so it is not what a name without an extension
+    -- gets.
+    match (chosen, format) {
+        (Executable, Some(_)) -> {
+            if debugInfo() {
+                die("an executable boot writes carries no debug information yet; "
+                    + "write an object with -f obj and link it with a C compiler")
+            }
+            if let Asm.Elf = Asm.dialectFor(target) {
+                die("an executable can be written only for arm64-darwin; write an "
+                    + "object with -f obj and link it with a C compiler")
+            }
+        }
+        (Executable, None) -> die("an executable is written only with -f exe, since it has "
+                                  + "no debug information yet; or write an object with "
+                                  + "-o NAME.o and link it with a C compiler")
+        _ -> {}
     }
     let to = match output {
         None | Some("-") -> {
@@ -283,19 +328,78 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                     + Int.toString(len(paths)) + " were given; build each "
                     + "file separately, or write to standard output with -o -")
             }
-            match File.create(path, File.Truncate) {
-                Right(out) -> ToFile(out)
-                Left(e) -> die(message(e))
+            match chosen {
+                Executable -> ToExecutable(path)
+                Object | Assembly -> match File.create(path, File.Truncate) {
+                    Right(out) -> ToFile(out)
+                    Left(e) -> die(message(e))
+                }
             }
         }
     }
-    if let Object = chosen {
+    let one = match chosen {
+        Object -> Some("object")
+        Executable -> Some("executable")
+        Assembly -> None
+    }
+    if let Some(what) = one {
         if len(paths) > 1 {
             die(Int.toString(len(paths)) + " input files cannot be written as "
-                + "one object; build each file separately")
+                + "one " + what + "; build each file separately")
         }
     }
-    Sink { to = to, format = chosen }
+    let base = baseName(paths[0])
+    let name = match String.rsplitOnce(base, ".") {
+        Some((stem, _)) -> stem
+        None -> base
+    }
+    Sink { to = to, format = chosen, name = name }
+}
+
+-- The last component of `path`.
+fun baseName(path : String) -> String {
+    let parts = String.split(path, "/")
+    parts[len(parts) - 1]
+}
+
+-- Writes `bytes` as an executable at `path`, through a new file beside it
+-- that is renamed over `path` once every byte is in. So `path` is never
+-- half written, a build that fails before this leaves it as it was, and the
+-- executable is a new file rather than the old one rewritten: macOS keeps
+-- the code signature of a file it has run, and kills a process started from
+-- that file once its bytes change in place.
+fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
+    let stem = match String.rsplitOnce(path, "/") {
+        Some((directory, base)) -> directory + "/." + base + ".partial"
+        None -> "." + path + ".partial"
+    }
+    let (partial, out) = createPartial(stem, 0)
+    let failed = fun(e) {
+        let _ = File.removeFile(partial)
+        die(message(e))
+    }
+    if let Left(e) = IO.writeFrom(out, bytes) {
+        let _ = File.close(out)
+        failed(e)
+    }
+    if let Left(e) = File.close(out) { failed(e) }
+    if let Left(e) = File.rename(partial, path) { failed(e) }
+}
+
+-- Returns the first of `stem` followed by `n`, `n + 1`, ... that names
+-- nothing yet, made exclusively, and the file open. The exclusive create is
+-- what gives each build of one output a file of its own: one never writes
+-- into, removes or renames another's. A build killed while writing leaves
+-- its file, which only moves the next build to a later number.
+fun createPartial(stem : String, n : Int) -> (String, File.File File.WriteOnly) {
+    let candidate = stem + Int.toString(n)
+    match File.createExecutable(candidate, File.Exclusive) {
+        Right(out) -> (candidate, out)
+        Left(e) -> match e.kind {
+            IO.AlreadyExists -> createPartial(stem, n + 1)
+            _ -> die(message(e))
+        }
+    }
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this
@@ -345,6 +449,14 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("select") { dumpSelect(b, path, module_) }
     write(String.drain(b))
     if through("select") { return }
+    -- With `-g`, the types of the variables, as they are named. Nothing
+    -- asks for a type without it, so the tags are not worked out.
+    let tags = if debugVariables() {
+        SsaLower.tagsOf(checked.decls, Map.keys(checked.classes.classes))
+    } else {
+        Map.new()
+    }
+    let types = DebugTypes.new(checked.decls, tags)
     -- The listing and the assembly come from one emission, each consumer
     -- with its own text, since the program's text is too large to emit twice.
     let outs = []
@@ -360,11 +472,16 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
                                } })
     }
     match sink {
-        Some(Sink { to, format = Object }) -> {
+        Some(Sink { to, format = Assembly, .. }) -> {
+            Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
+                                   render = Stream.print })
+            let _ = emitModule(path, entry, module_, files, types, outs)
+        }
+        Some(Sink { to, format, name }) -> {
             let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
-            let refused = emitModule(path, entry, module_, files, outs)
+            let refused = emitModule(path, entry, module_, files, types, outs)
             -- A function that is not there is a link error at best, and no
             -- error at all if its callers were refused too.
             if len(refused) > 0 {
@@ -373,18 +490,23 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             }
             let started = Stopwatch.start()
             let obj = Assembler.finish(assembler)
-            sendBytes(to, match Asm.dialectFor(target) {
-                Asm.MachO -> MachO.objectFile(obj)
-                Asm.Elf -> Elf.objectFile(obj)
-            })
-            let _ = lap("object", started)
+            match format {
+                Executable -> {
+                    refuseLibraries(checked.decls, obj.undefined, path)
+                    let main = Asm.runtimeFor(Asm.MachO, "main")
+                    sendBytes(to, MachOExecutable.executableFile(obj, main, name))
+                    let _ = lap("executable", started)
+                }
+                _ -> {
+                    sendBytes(to, Vec.toArray(match Asm.dialectFor(target) {
+                        Asm.MachO -> MachO.objectFile(obj)
+                        Asm.Elf -> Elf.objectFile(obj)
+                    }))
+                    let _ = lap("object", started)
+                }
+            }
         }
-        Some(Sink { to, .. }) -> {
-            Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
-                                   render = Stream.print })
-            let _ = emitModule(path, entry, module_, files, outs)
-        }
-        None -> { let _ = emitModule(path, entry, module_, files, outs) }
+        None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
     }
     if wants("positions") {
         showCoverage(coverage, b)
@@ -649,7 +771,7 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- with the callee's. The code is the same either way: no reduction reads a
 -- span.
 fun keepsCallSites() -> fun(String) -> Bool =
-    if debugInfo || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
+    if debugInfo() || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
     else { Set.contains(Giblets.gibletModules(), _) }
 
 -- Everything between the elaboration and the backend, in one place.
@@ -769,7 +891,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
                 classes : Classes.ClassTable, files : Position.Files, path : String)
         -> (SsaLower.Module, Vec SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes),
-                                                   files)
+                                                   files, debugVariables())
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
@@ -872,8 +994,12 @@ type Made = Made {
     skipped    : String,
     complaints : Vec String,
     code       : Vec (Stream.Item Arm64.Inst),
-    -- With `-g`, the calls inlined into it, for its debug information.
+    -- With `-g`, the calls inlined into it and its own variables, for its
+    -- debug information, and the label its variables' locations are offsets
+    -- from.
     inlined    : Vec Dwarf.Inlined,
+    variables  : Vec Dwarf.Variable,
+    base       : Asm.Symbol,
     texts      : Array (Option String),
     cost       : Duration,
 }
@@ -893,23 +1019,28 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     let a = Regalloc.allocate(f, frame.slots)
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
-                            inlined = [], texts = [], cost = Stopwatch.elapsed(started) }
+                            inlined = [], variables = [], base = Emit.functionEnd(asm.dialect, i),
+                            texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
+            let (marks, located, base) = if debugVariables() {
+                Locations.locate(asm.dialect, i, a, l, frame.slots)
+            } else { (Map.new(), [], Emit.functionEnd(asm.dialect, i)) }
             let emitted = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, emitted)
-            let (code, inlined) = if debugInfo {
-                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, emitted,
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, emitted)
+            let (code, inlined, variables) = if debugInfo() {
+                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, located, emitted,
                                    Emit.functionEnd(asm.dialect, i))
-            } else { (emitted, []) }
+            } else { (emitted, [], []) }
             let texts = Array.map(outs, fun(o) = if o.apart {
                 let text = String.builder()
                 o.render(asm.dialect, Vec.slice(code, 0, len(code)), text)
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   inlined = inlined, texts = texts, cost = Stopwatch.elapsed(started) }
+                   inlined = inlined, variables = variables, base = base, texts = texts,
+                   cost = Stopwatch.elapsed(started) }
         }
     }
 }
@@ -948,7 +1079,7 @@ type Out = Out {
 --
 -- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
-              files : Position.Files, outs : Vec Out) -> Vec String {
+              files : Position.Files, types : DebugTypes.Types, outs : Vec Out) -> Vec String {
     let refused = []
     let note = fun(text) { for o in outs { String.push(o.text, text) } }
     -- Each consumer empties the array it is handed, so all but the last are
@@ -992,7 +1123,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- label at the start of the code, where the compile unit's range begins.
     let directory = Option.unwrapOr(Env.currentDirectory(), ".")
     let textStart = Asm.localLabel(asm.dialect, "text_start")
-    if debugInfo {
+    if debugInfo() {
         Dwarf.sourceFiles(directory, path, files, code)
         Vec.push(code, Stream.Label(textStart))
     }
@@ -1006,8 +1137,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- Each function's frame layout is kept: the frame table is one section
     -- after the code, and its entries are those layouts' safepoint maps.
     let layouts = []
-    -- With `-g`, each laid-out function's inlined calls, beside its layout.
+    -- With `-g`, each laid-out function's inlined calls and variables, beside
+    -- its layout.
     let inlinedCalls = []
+    let variables = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
@@ -1035,6 +1168,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 flush()
                 Vec.push(layouts, (i, l))
                 Vec.push(inlinedCalls, m.inlined)
+                Vec.push(variables, (m.variables, m.base))
             }
         }
         if timings { Vec.push(costs, (selected[i].name, m.cost)) }
@@ -1055,7 +1189,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- The entry and the stubs after it have no source position, so with `-g`
     -- one row with no line covers them all, rather than the last function's
     -- last row.
-    if debugInfo { Vec.push(code, Stream.Loc(0, False)) }
+    if debugInfo() { Vec.push(code, Stream.Loc(0, False)) }
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
     -- Each only in a program that needs it: the switch names the runtime's
@@ -1071,7 +1205,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
-    if debugInfo {
+    if debugInfo() {
         -- The end of the code, after everything the text section holds.
         let textEnd = Asm.localLabel(asm.dialect, "text_end")
         Vec.push(code, Stream.Section(Asm.Text))
@@ -1079,14 +1213,17 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         let functions = []
         for var k = 0; k < len(layouts); k = k + 1 {
             let (i, _) = layouts[k]
+            let (own, base) = variables[k]
             Vec.push(functions, Dwarf.Subprogram {
                 name = selected[i].name, low = Asm.symbolFor(asm.dialect, selected[i].name),
                 high = Emit.functionEnd(asm.dialect, i), inlined = inlinedCalls[k],
+                variables = own, base = base,
             })
         }
         Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {
             producer = "boot", name = path, directory = directory, low = textStart,
-            high = textEnd, functions = functions,
+            high = textEnd, functions = functions, types = DebugTypes.entries(types),
+            typeOf = DebugTypes.typeOf(types, _),
         }, code)
     }
     consume(asm.dialect, code)
@@ -1121,22 +1258,46 @@ fun reportCosts(costs : Vec (String, Duration)) -> Unit {
 fun send(to : Destination, text : String) -> Unit = match to {
     ToStdout -> write(text)
     ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
+    ToExecutable(_) -> die("internal error: an executable is written as bytes, not text")
 }
 
-fun sendBytes(to : Destination, bytes : Vec Byte) -> Unit {
-    let array = Vec.toArray(bytes)
+fun sendBytes(to : Destination, array : Array Byte) -> Unit {
     let buffer = IO.buffer(len(array))
     IO.append(buffer, array, 0, len(array))
     match to {
         ToStdout -> {
             if let Left(_) = IO.writeFrom(IO.stdout(), buffer) {
-                die("cannot write the object to standard output")
+                die("cannot write the output to standard output")
             }
             if let Left(_) = IO.flush(IO.stdout()) {
-                die("cannot write the object to standard output")
+                die("cannot write the output to standard output")
             }
         }
         ToFile(out) -> if let Left(e) = IO.writeFrom(out, buffer) { die(message(e)) }
+        ToExecutable(path) -> writeExecutable(path, buffer)
+    }
+}
+
+-- Refuses, naming the first of them, a program whose `imports` include a
+-- symbol from a library besides the C library: an executable `boot` writes
+-- links libSystem alone.
+fun refuseLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol, path : String) -> Unit {
+    let declared = Map.new()
+    for (_, info) in Map.entries(decls.foreigns) {
+        Map.put(declared, Asm.symbolFor(Asm.MachO, info.symbol).name, info)
+    }
+    for sym in imports {
+        let info = match Map.get(declared, sym.name) {
+            Some(info) -> info
+            None -> die("internal error: '" + sym.name + "' is called and never declared")
+        }
+        let owner = Option.unwrapOr(Prelude.moduleOf(info.name), info.name)
+        if let Some(library) = Modules.foreignLibrary(owner) {
+            die("cannot write '" + path + "' as an executable: it calls '" + info.symbol
+                + "' from " + library + ", and an executable boot writes can link "
+                + "only libSystem; write an object with -f obj and link it with a C "
+                + "compiler")
+        }
     }
 }
 
@@ -1653,7 +1814,8 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
-        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] FILE...\n"
+        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
+        + "                  FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))

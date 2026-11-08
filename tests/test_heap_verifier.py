@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
         cycle->slots[0] = (uintptr_t)cycle;
         for (int i = 1; i < 8; i++) cycle->slots[i] = 1;
         held[2] = cycle;
-        held[3] = turkey_array_new(3, (uintptr_t)child, 8, 7);
+        held[3] = turkey_array_new(3, (uintptr_t)child, 8, 1);
         held[4] = turkey_cell_new((uintptr_t)child, 1);
         held[5] = turkey_closure_shell(123);
         Object *env = turkey_object_new(4, 0, 16, 1);
@@ -138,10 +138,10 @@ int main(int argc, char **argv) {
         env->slots[1] = 1;
         ((Object *)held[5])->slots[0] = (uintptr_t)env;
         held[6] = turkey_cell_new(123, 0);
-        held[7] = turkey_array_new(8, 1, 1, 2);
-        held[8] = turkey_array_new(8, 1, 4, 3);
+        held[7] = turkey_array_new(8, 1, 1, 0);
+        held[8] = turkey_array_new(8, 1, 4, 0);
         held[9] = turkey_cell_new(1, 0);
-        held[10] = turkey_array_new(0, 0, 8, 7);
+        held[10] = turkey_array_new(0, 0, 8, 1);
         /* Words below 4096 in a traced slot or a root are immediates -- a
            compact sum's nullary constructors -- and are never followed. */
         uint64_t immediate = 4095;
@@ -211,9 +211,19 @@ int main(int argc, char **argv) {
         held[2] = turkey_closure_shell(123);
         ((Object *)held[2])->header.count = 2;
     }
-    else if (!strcmp(which, "array-width")) child->header.count = 3;
-    else if (!strcmp(which, "array-pointer-width")) child->header.count = 7;
+    /* An array's count is the traced words per element and its tag the
+       stride, which the string `child` has as 0 and 1. */
+    else if (!strcmp(which, "array-width")) child->header.tag = 4;
+    else if (!strcmp(which, "array-pointer-width")) {
+        child->header.tag = 8;
+        child->header.count = 1;
+    }
     else if (!strcmp(which, "array-code")) child->header.count = 99;
+    else if (!strcmp(which, "array-stride")) child->header.tag = 12;
+    else if (!strcmp(which, "array-traced-stride")) {
+        child->header.tag = 16;
+        child->header.count = 3;
+    }
     else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); *size_of(held[2]) = 8; }
     else if (!strcmp(which, "cell-flag")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->count = 2; }
     else if (!strcmp(which, "interior")) parent->slots[0]++;
@@ -389,6 +399,8 @@ CASES = {
     "array-width": "payload size disagrees",
     "array-pointer-width": "payload size disagrees",
     "array-code": "invalid array layout",
+    "array-stride": "invalid array layout",
+    "array-traced-stride": "invalid array layout",
     "cell-size": "invalid cell size",
     "cell-flag": "invalid object header",
     "interior": "invalid traced pointer",

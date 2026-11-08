@@ -101,17 +101,19 @@ Run the compiler from the repository root, where it finds `lib/`. It has two
 commands. `build` writes the program to `-o`, in the format the file's
 extension names -- a relocatable object for `.o`, assembly for `.s` -- or
 `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. On a Mac, `-f exe` writes a signed
-executable that runs as it is, with no assembler and no linker:
+object needs no assembler, only a linker. `-f exe` writes an executable
+that runs as it is, with no assembler and no linker: a signed Mach-O on a
+Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
 
 ```sh
 build/stages/stage2 build -f exe -o rectangles rectangles.gob
 ./rectangles
 ```
 
-It is written for arm64-darwin only, from any host with `--target
-arm64-darwin`, and links libSystem alone, so a program that imports `Net.TLS`
-is refused and keeps the object path. It carries no debug or unwind
+It is written for either target from any host, with `--target`, and links
+the C library alone -- libSystem on a Mac, glibc's `libc.so.6` and
+`libm.so.6` on Linux -- so a program that imports `Net.TLS` is refused and
+keeps the object path. It carries no debug or unwind
 information yet, so it takes no `-g`, and a file name without an extension
 will not choose it until the executable has what lldb and a profiler read.
 `check` compiles as far as the last stage that
@@ -294,6 +296,15 @@ With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 `bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
 any platform emit Linux objects and assembly.
 
+`--target arm64-linux -f exe` needs none of the cross toolchain: it writes a
+dynamically linked executable on any host, with no linker and no arm64 libc.
+That executable runs on glibc 2.34 or later -- RHEL 9 and its rebuilds,
+Ubuntu 22.04, Debian 12, and anything newer -- the first release with
+`pthread_create` in `libc.so.6`. On an older glibc it stops before `main`
+with `symbol lookup error: undefined symbol`. It names its loader
+`/lib/ld-linux-aarch64.so.1`, as every glibc distribution installs it; on
+NixOS or Guix, `patchelf` it as any prebuilt binary.
+
 The whole test suite runs and passes this way, `pytest -m bootstrap` and the
 fixed point included, and the goldens in `tests/programs/` are the same on
 both platforms. It is slow: qemu runs the compiler about fifteen times slower
@@ -304,7 +315,7 @@ minutes once `boot` is built and two hours from a cold cache; the few tests
 that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
-programs run directly. CI does this on GitHub's arm64 runners
+programs run directly, and `-f exe` needs no C compiler at all. CI does this on GitHub's arm64 runners
 (`.github/workflows/linux.yml`), building from the bootstrap under gcc and
 running the suite and the fixed point split across jobs by
 `scripts/ci-shard.sh`.

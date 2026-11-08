@@ -1,5 +1,5 @@
 export (
-    Generator(..), newGenerator, generate, bindMethods, checkExhaustiveness,
+    Generator(..), newGenerator, generate, solve, bindMethods, checkExhaustiveness,
 )
 
 -- Constraint generation.
@@ -297,6 +297,8 @@ fun freshCell(g : Generator) -> VarCell {
 -- through. So the constraint is as deep as one group, not as deep as the
 -- module is long.
 fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Constraint) {
+    -- Until `solve` is done, an instance derived now is checked.
+    g.classes.open = True
     let typeDecls = Vec.new(8)
     let classDecls = Vec.new(4)
     let instDecls = Vec.new(4)
@@ -424,7 +426,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     -- top-level binding. Nothing calls *them* by name, so their position is
     -- otherwise free.
     genMethodBodies(g, classDecls, instDecls)
-    genDerived(g)
+    let _ = genDerived(g)
     (ordered, pop(g))
 }
 
@@ -924,9 +926,10 @@ fun derivedAt(info : TyconInfo, inst : InstInfo) -> Span {
 
 -- Checks every instance derived and not checked yet, as `genInstance`
 -- checks a written one, and its fields' instances besides
--- (`derivedFields`). `Classes.checkDerives` has begun every derivation the
--- program has (`Classes.derive`), so one call after it checks them all.
-fun genDerived(g : Generator) -> Unit {
+-- (`derivedFields`), by adding their constraints to the frame being built.
+-- Returns whether there were any.
+fun genDerived(g : Generator) -> Bool {
+    var any = False
     for inst in g.classes.derived {
         if Option.isSome(inst.plan) { continue }
         let params = Vec.new(len(inst.context))
@@ -934,6 +937,50 @@ fun genDerived(g : Generator) -> Unit {
         let plan = Classes.newInstancePlan(params)
         inst.plan = Some(plan)
         genInstance(g, inst, classNamed(g, inst.cls), plan)
+        any = True
+    }
+    any
+}
+
+-- Solves `c`, the constraint `generate` built, with `s`, and checks every
+-- instance derived while it does. Once this returns, a new derivation is a
+-- compiler bug (`Classes.derive`).
+--
+-- A derive list's instances are derived before generation, and `generate`
+-- checks them with the written ones. An instance a type gets without asking
+-- is derived the first time a predicate needs it (`Classes.selectInstance`),
+-- which is while `c` is solved, and defaulting can lead to more. So after
+-- each step of the run, the constraints of the instances begun during it are
+-- built and solved in the same run, as a written instance's are, and a
+-- default round follows only once they are. Checking one instance can begin
+-- another, so `solveDerived` repeats until a pass begins none.
+--
+-- It ends because each derivation is begun at most once, by its class and
+-- type constructor, of which there are finitely many, and each derived
+-- instance is checked once: the first time it is seen without a plan.
+fun solve(g : Generator, s : C.Solver, c : Constraint) -> Unit {
+    C.solveMore(s, c)
+    solveDerived(g, s)
+    C.solveRefusals(s)
+    solveDerived(g, s)
+    -- What is left open after an error is most often open because of it, so
+    -- defaulting it would only guess, and nothing is reported as stranded.
+    if !Diag.hasErrors() {
+        while C.defaultOnce(s) { solveDerived(g, s) }
+        C.finish(s)
+    }
+    g.classes.open = False
+}
+
+-- Checks the instances derived since the last call, and those checking them
+-- derives, until there are none.
+fun solveDerived(g : Generator, s : C.Solver) -> Unit {
+    loop {
+        push(g)
+        let any = genDerived(g)
+        let c = pop(g)
+        if !any { break }
+        C.solveMore(s, c)
     }
 }
 

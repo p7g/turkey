@@ -389,9 +389,10 @@ Some(east)
 
 **When there is no implicit instance.** A type whose fields do not all have
 the class, under the requirements above, simply has no implicit instance of
-it. Nothing is reported until something needs the instance, and then the
-error says why, following fields through each type the compiler tried to
-derive the class for:
+it. The compiler writes an implicit instance only when the program first
+needs it, so nothing is reported until something does, and then the error
+says why, following fields through each type the compiler tried to derive
+the class for:
 
 <!-- error: 'Job' has no 'Eq': field 'callback' has type 'Callback', whose field 'run' has type 'fun() -> Int', which has no 'Eq' -->
 ```kotlin
@@ -469,8 +470,9 @@ field whose instances need the class at ever larger types without end,
 which a written instance such as `instance Eq (W a) : Eq (W (Array a))` can
 cause. Nor does a constructor that hides a type in an [existential
 bracket](types.md#existential-types): two of its values may hide different
-types. The error is reported at the entry in the list, and says which field is
-to blame, as the error at a use does:
+types. The error is reported at the entry in the list, whether or not
+anything uses the instance, and says which field is to blame, as the error
+at a use does:
 
 <!-- error: 'File' cannot derive 'Eq': field 'fd' has type 'Fd', whose field 'state' has type 'fun() -> Int', which has no 'Eq' -->
 ```kotlin

@@ -311,16 +311,14 @@ type ClassTable = ClassTable {
     -- Every instance derived so far, in the order each settled. The generator
     -- checks each one's obligations with the solver (`Turkey.Infer.genDerived`).
     derived : Vec InstInfo,
-    -- Whether `checkDerives` is running. Only it begins a derivation that no
-    -- other derivation began; see `derive`.
-    var checking : Bool,
+    -- Whether a derivation begun now is checked: from the start of
+    -- `Turkey.Infer.generate` for a component of modules to the end of
+    -- `Turkey.Infer.solve` for it. See `derive`.
+    var open : Bool,
     -- The types that can reach themselves through an assignable position,
     -- among those registered when they were last asked for
     -- (`Decls.selfAssigned`).
     selfReach : Decls.SelfReach,
-    -- Types declared before a class they would derive without asking was,
-    -- which `checkDerives` derives it for once the class is registered.
-    awaiting : Vec String,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -334,9 +332,8 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     provisional = []
     deriving = False
     derived = []
-    checking = False
+    open = False
     selfReach = Decls.newSelfReach()
-    awaiting = []
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1691,13 +1688,14 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- constructors; this section decides whether the instance exists and what
 -- its context is.
 --
--- **When.** `checkDerives` begins every derivation of a declaration group
--- once the group is registered, the implicit ones included, and each begins
--- those its fields need. So the generator checks every derived instance with
--- the group (`Turkey.Infer.genDerived`), along with the written instances,
--- and nothing the solver selects later can be a derivation not yet checked. An implicit
--- instance that nothing uses costs its context and its check here, and its
--- code is dropped with every other unreachable binding (`Turkey.Mono`).
+-- **When.** A derive list's instances are begun when it is checked
+-- (`checkDerives`), so its mistakes are reported at the declaration whether
+-- or not anything uses the type. An instance a type gets without asking is
+-- begun the first time a predicate that no written instance covers needs it
+-- (`selectInstance`), so a type nothing compares or hashes gets none. Each
+-- derivation begins those its fields need. Either way the instance is
+-- checked, as a written one is, in the run of the solver that begins it
+-- (`Turkey.Infer.solve`).
 --
 -- **Its context is inferred, as GHC's deriving infers it**
 -- (`GHC.Tc.Deriv.Infer`). The class is wanted at each field's type, and
@@ -1800,8 +1798,11 @@ fun listsFor(t : ClassTable, tycon : String, cls : String) -> Bool {
 fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
     if refuses(t, tycon, cls) { return False }
     if listsFor(t, tycon, cls) { return True }
-    isImplicit(cls) && Map.contains(t.classes, cls)
-        && Option.isNone(writtenInstance(t, cls, tycon))
+    -- A written instance is in the type's module or the class's, by the
+    -- orphan rule, and a predicate can name the class and the type only once
+    -- both modules are registered. So whenever this is asked, every
+    -- instance that could replace the implicit one is in the table.
+    isImplicit(cls) && Option.isNone(writtenInstance(t, cls, tycon))
         && Option.isNone(implicitExclusion(t, cls, tycon))
 }
 
@@ -1892,15 +1893,16 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
         None -> return None
     }
     let general = declaredHead(info)?
-    -- `checkDerives` begins every derivation an error-free program has, and
-    -- each begins those it needs, so the generator can check them all
-    -- (`Turkey.Infer.genDerived`). One the solver or the lowering would begin
-    -- later would never be checked. After an error the program stops before
-    -- solving, so a derivation not begun there is not needed.
-    if !t.checking && !t.deriving {
+    -- `checkDerives` begins a derive list's derivations, and the solver
+    -- begins the rest the first time a predicate needs one.
+    -- `Turkey.Infer.solve` checks each in the run of the solver that began
+    -- it. One begun once a component is solved, by the lowering or a later
+    -- pass, would never be checked. After an error the program stops before
+    -- solving, so a derivation not begun by then is not needed.
+    if !t.open {
         if Diag.hasErrors() { return None }
         bug("'" + Ty.shortName(cls) + " " + Ty.shortName(tycon) + "' was first asked for "
-            + "after derive lists were checked", None)
+            + "after its component was solved", None)
     }
     let inst = begin(t, cls, info, general, key)
     -- A derivation begun inside another is settled by the outermost one,
@@ -2305,34 +2307,6 @@ fun whyMissing(t : ClassTable, p : Pred) -> Option String {
 -- and instance they could name is in the table, and derives each class an
 -- entry asks for, reporting at the entry why one cannot be.
 fun checkDerives(t : ClassTable, decls : Vec TypeDecl) -> Unit {
-    t.checking = True
-    checkDeclarations(t, decls)
-    -- Begin every implicit derivation here too, so that the generator
-    -- checks each one; one that fails is silent until a use asks for it.
-    --
-    -- A hand-written instance replaces the implicit one, and may be in the
-    -- class's module rather than the type's. That module is registered no
-    -- later than the class, so a type declared before the class is derived
-    -- for only once the class is, when every such instance is known.
-    let types = Vec.filter(Vec.map(decls, fun(d) = d.name),
-                           fun(name) = Map.contains(t.decls.tycons, name))
-    let candidates = Vec.append(t.awaiting, types)
-    Vec.clear(t.awaiting)
-    for name in candidates {
-        var waiting = False
-        for cls in [P.eqClass, P.hashClass] {
-            if !Map.contains(t.classes, cls) {
-                waiting = True
-            } else if !listsFor(t, name, cls) {
-                let _ = derive(t, cls, name)
-            }
-        }
-        if waiting { Vec.push(t.awaiting, name) }
-    }
-    t.checking = False
-}
-
-fun checkDeclarations(t : ClassTable, decls : Vec TypeDecl) -> Unit {
     for d in decls {
         if Option.isSome(d.alias) || !Map.contains(t.decls.tycons, d.name) { continue }
         let wanted = []

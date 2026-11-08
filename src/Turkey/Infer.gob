@@ -40,7 +40,7 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        Skolems(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..),
-                           PredCell(..), LetCell(..))
+                           PredCell(..), LetCell(..), Ambiguity(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
@@ -134,8 +134,8 @@ type Generator = Generator {
     -- `else` block of a `let ... else`, and the calls in its tail positions.
     bottoms  : Set.Set Int,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
-    -- variables and its context.
-    partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred),
+    -- variables, its context, and where each predicate of the context is.
+    partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred, Vec Span),
     -- What the patterns being matched have opened: one list
     -- per `match` arm or function whose patterns may open an existential, and
     -- `None` for a binding that may not.
@@ -346,6 +346,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     bindMethods(g)
     bindForeigns(g, foreigns)
     checkDefinitions(g, items)
+    checkDeclaredAmbiguity(g, typeDecls, classDecls)
 
     -- The graph is keyed by item, not by bound name: a single binding may
     -- introduce several names, and keying by name would split one item across
@@ -428,6 +429,50 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     genMethodBodies(g, classDecls, instDecls)
     let _ = genDerived(g)
     (ordered, pop(g))
+}
+
+-- Emits the ambiguity check (`C.checkAmbiguity`) of each class method's
+-- type and each existential constructor's type that `typeDecls` and
+-- `classDecls` declare, as GHC's `checkValidClass` and `checkValidDataCon`
+-- check the type of a method selector and of a constructor wrapper. A
+-- function's signature is checked with its group (`buildFunGroup`).
+fun checkDeclaredAmbiguity(g : Generator, typeDecls : Vec TypeDecl,
+                           classDecls : Vec ClassDecl) -> Unit {
+    for decl in classDecls {
+        let info = classNamed(g, decl.name)
+        for m in decl.methods {
+            if let Some(mi) = Map.get(info.methods, m.name) {
+                -- The class predicate comes first, and no context wrote it.
+                let written = Vec.new(len(mi.scheme.preds))
+                Vec.push(written, None)
+                for p in m.context { Vec.push(written, Some(p.span)) }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = Ty.bareName(m.name), scheme = mi.scheme, span = Some(m.span),
+                    written = written, names = mi.names, inferred = False,
+                }))
+            }
+        }
+    }
+    for decl in typeDecls {
+        let variants = match decl.variants {
+            Some(vs) -> vs
+            None -> continue
+        }
+        for con in variants {
+            if len(con.context) == 0 { continue }
+            if let Some(ci) = Map.get(g.decls.constructors, con.name) {
+                let names = Map.new()
+                for var i = 0; i < len(ci.exists) && i < len(ci.existsNames); i = i + 1 {
+                    Map.put(names, ci.exists[i].id, ci.existsNames[i])
+                }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = con.name, scheme = ci.scheme, span = Some(con.span),
+                    written = Vec.map(con.context, fun(p) = Some(p.span)), names = names,
+                    inferred = False,
+                }))
+            }
+        }
+    }
 }
 
 fun itemNames(item : Stmt) -> Vec String = match item.kind {
@@ -998,7 +1043,7 @@ fun instanceImplication(givens : Vec (String, Pred, Option Span), self : Pred, s
     CUnit(CAssume(givens, Some(self), CLet(LetCell {
         binds = [(C.noBinder, "%instance " + Ty.showPred(self), Ty.tUnit())],
         defn = wanteds, body = CAnd([]), span = where, topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [],
+        dicts = None, skolems = sk.made, rigid = [], members = [],
     })))
 
 -- Returns the `i`th of `spans`, if there is one.
@@ -1099,7 +1144,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     emit(g, CUnit(CAssume(Vec.map(givens, fun((n, p)) = (n, p, None)), None, CLet(LetCell {
         binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [],
+        dicts = None, skolems = sk.made, rigid = [], members = [],
     }))))
     -- Only the constants this scope actually *made*. The mapping also holds the
     -- class variable, whose entry is the instance head rather than a skolem, and
@@ -1162,35 +1207,33 @@ fun declaredScheme(g : Generator,
         }
     }
     let body = TFun(params, retType)
-    -- The ambiguity test the inference path applies at generalization, run here
-    -- instead, where it is purely syntactic: a written context that constrains a
-    -- variable the type does not reach can never be decided by a use site,
-    -- because there is nothing at a use site to decide it with.
-    let cells = Array.map(preds, fun(p) = C.newCell(p, Some(decl.span), "read", newHole()))
-    let ids = C.reach(cells, [body])
-    -- Blamed in the names the signature wrote, not in the letters printing would
-    -- invent: the whole point of a declared type is that it is the programmer's
-    -- text, so a complaint about it should quote that text.
-    let written = Ty.namer("")
-    for (name, v) in Map.entries(tyvars) {
-        match v {
-            TVar(cell) -> Map.put(written.names, cell.id, name)
-            _ -> {}
-        }
-    }
+    -- A constraint is about the function's type variables: a class applied to
+    -- one or to a type built from one. Whether the type determines them is
+    -- the ambiguity check's business (`ambiguityOf`).
     for var i = 0; i < len(preds) && i < len(decl.context); i = i + 1 {
-        var touches = False
-        for v in Ty.varsOf(preds[i].args) {
-            if Set.contains(ids, v.id) { touches = True }
-        }
-        if !touches {
-            Ty.typeError("'" + Ty.showPredWith(preds[i], written) + "' constrains a type "
-                         + "variable that the declared type of '" + decl.name + "' does "
-                         + "not mention; remove it from the context",
-                         Some(decl.context[i].span))
+        if len(Ty.varsOf(preds[i].args)) == 0 {
+            Ty.typeError("'" + Ty.showWritten(preds[i]) + "' constrains no type variable; "
+                         + "remove it from the context", Some(decl.context[i].span))
         }
     }
     Some((Ty.scheme(quantified, body, preds), tyvars))
+}
+
+-- Returns the check that the signature of `decl`, which declares `s` over
+-- the variables `tyvars`, is not ambiguous (`C.checkAmbiguity`). An ambiguous
+-- signature is reported in the names the signature wrote: the whole point of a
+-- declared type is that it is the programmer's text, so a complaint about it
+-- should quote that text.
+fun ambiguityOf(decl : FunDecl, s : Scheme, tyvars : Map String Ty.Type) -> Constraint {
+    let names = Map.new()
+    for (name, v) in Map.entries(tyvars) {
+        if let TVar(cell) = v { Map.put(names, cell.id, name) }
+    }
+    let written = Vec.map(decl.context, fun(p) = Some(p.span))
+    CAmbiguity(C.Ambiguity {
+        name = decl.name, scheme = s, span = Some(decl.span), written = written,
+        names = names, inferred = False,
+    })
 }
 
 -- Check a body against the type its `fun` declared.
@@ -1262,7 +1305,7 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     CAssume(written, None, CLet(LetCell {
         binds = [(C.noBinder, "%sig." + decl.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [],
+        dicts = None, skolems = sk.made, rigid = [], members = [],
     }))
 }
 
@@ -1475,18 +1518,27 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
         for item in group {
             match item.kind {
                 SFun(d) -> match Map.get(g.partialHeaders, d.id) {
-                    Some((header, written)) ->
+                    Some((header, written, spans)) ->
                         Vec.push(rigid, (Binders.nameAt(g.binders, d.id, d.span), d.span,
-                                         header, written))
+                                         header, written, spans))
                     None -> {}
                 }
                 _ -> {}
             }
         }
+        -- Where each binder's `fun` is, if the group is one of `fun`s.
+        let at = Map.new()
+        for item in group {
+            if let SFun(d) = item.kind { Map.put(at, boundAt(g, d.id, d.name, d.span), d.span) }
+        }
+        let members = Vec.new(len(binds))
+        for (id, _, _) in binds {
+            if let Some(where) = Map.get(at, id) { Vec.push(members, where) }
+        }
         node = CLet(LetCell {
             binds = binds, defn = defn, body = body, span = Some(group[0].span),
             topLevel = top, dicts = Some(dicts), skolems = [],
-            rigid = rigid,
+            rigid = rigid, members = if len(members) == len(binds) { members } else { [] },
         })
     } else {
         -- No generalization means no new rank, so the definition is solved right
@@ -1589,6 +1641,7 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
     }
     push(g)
     for (decl, s, tyvars) in checks {
+        emit(g, ambiguityOf(decl, s, tyvars))
         emit(g, checkSignature(g, decl, s, tyvars))
     }
     for var i = 0; i < len(inferred); i = i + 1 {
@@ -1700,7 +1753,10 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
                         _ -> {}
                     }
                 }
-                if len(header) > 0 { Map.put(g.partialHeaders, key, (header, written)) }
+                if len(header) > 0 {
+                    Map.put(g.partialHeaders, key,
+                            (header, written, Vec.map(context, fun(p) = p.span)))
+                }
             }
         }
         Some(_) -> {}
@@ -2319,7 +2375,7 @@ fun openedConstraint(openings : Vec (Array (String, Pred), Vec ConCell),
     CAssume(givens, None, CLet(LetCell {
         binds = [(C.noBinder, "%opened", Ty.tUnit())], defn = inner,
         body = CAnd([]), span = where, topLevel = False,
-        dicts = None, skolems = skolems, rigid = [],
+        dicts = None, skolems = skolems, rigid = [], members = [],
     }))
 }
 

@@ -257,6 +257,34 @@ and inside the group each has a single, monomorphic type. So a function
 cannot be inferred to call itself at a different type. With a complete
 [signature](declarations.md#signatures), it can.
 
+Each function of the group is then generalized with only the constraints its
+own type reaches. A constraint that the others need on a type it does not
+mention is decided where the function is defined, as an unused literal's type
+is: by its default, or else it is an error.
+
+<!-- run -->
+```kotlin
+fun describe(x) = show(x) + countdown(0)
+
+fun countdown(n) = if n == 0 { "" } else { describe(True) }
+
+fun main() {
+    print(countdown(1))
+    print(countdown(1.5))
+}
+```
+
+```text
+True
+True
+```
+
+`describe` has the type `fun(Bool) -> String`. `countdown`, whose parameter
+is compared with `0`, keeps its constraints: `[OneOf a {Int, Float}, Eq a]
+fun(a) -> String`. A call of `describe` runs the group with `countdown`'s
+parameter at a type nothing decides, so the default of the literal `0`,
+`Int`, decides it.
+
 > **For readers new to this.** The *value restriction* is the rule ML uses to
 > keep polymorphism and mutation apart. Without it, `let cell = []` could be
 > both a `Vec Int` and a `Vec String`, and a program could push an `Int` and
@@ -480,8 +508,44 @@ fun main() {
 }
 ```
 
-A signature that states a constraint on a variable its type does not mention
-is rejected for the same reason, where it is written.
+A **type** is ambiguous when no use of it could decide one of its variables,
+and an ambiguous type is rejected where it is declared, whether a signature
+writes it or it is inferred. The test is whether the type is as general as
+itself: a use instantiates each variable with an unknown type, matches the
+type it gets against the declared one, and must then satisfy the context from
+what that match decided. A variable that the context constrains and the match
+leaves unknown is one that no call can decide either:
+
+<!-- error: the type of 'f' is ambiguous: no use of 'f' can determine 'b' -->
+```kotlin
+fun f[Show b](x : Int) -> Int = x
+
+fun main() {
+    print(f(1))
+}
+```
+
+The match decides a variable that appears in a parameter or the result,
+outside any [associated type](classes.md#associated-types). Through the
+context, it also decides a variable that is one side of an
+[equality](classes.md#equality-constraints) whose other side it has decided:
+in `[Iterator s, Item s ~ e, Show e]`, a use that decides `s` decides `e`. A
+variable that appears only as the argument of an associated type is not
+decided, since an associated type is not injective:
+
+<!-- error: the type of 'first' is ambiguous: no use of 'first' can determine 's' -->
+```kotlin
+fun first[Iterator s](x : Item s) -> Int = 0
+
+fun main() {
+    print(first(1))
+}
+```
+
+Many iterators have `Int` elements, so a call with an `Int` cannot tell which
+`Iterator` instance it is to use. Each of a class's method types and each
+[existential](types.md#existential-types) constructor's type is held to the
+same rule.
 
 ## Where annotations are needed
 

@@ -12,7 +12,10 @@ The cases were generated once from seeded RNGs, with a naive substitution
 checker answering, and written to `tests/infer_corpus.json`. The generator and
 the naive checker are not kept; the frozen corpus is the
 oracle, and is what `boot` is held to. `expected` is `null` for a program the
-naive checker rejected.
+naive checker rejected, and for the three it accepted with an ambiguous type
+(seeds 299, 559 and 598): each reads a field of a numeric literal, so its type
+is `[OneOf c {Int, Float}, HasField "a" c] ... -> Field.a c`, and no use can
+decide `c`. The naive checker had no ambiguity check.
 """
 
 from __future__ import annotations

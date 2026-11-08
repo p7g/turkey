@@ -73,7 +73,7 @@ import Turkey.Prelude as P
 import Turkey.Prims as Prims
 import Turkey.Build as Build
 import Turkey.Target as Target
-import Turkey.Solved (Scope(..), Abstraction(..), Use(..))
+import Turkey.Solved (Scope(..), Abstraction(..), Export(..), Use(..))
 import Turkey.Source (Span(..), span as sourceSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
@@ -222,6 +222,11 @@ type Lowerer = Lowerer {
     -- What each pattern that opens an existential binds, by the pattern's
     -- node, from when `openPattern` mints it until `Turkey.Match` reads it.
     opened       : Map Int Opened,
+    -- By binder id, each binder whose scheme is a wrapper around its group's
+    -- (`Export`), and the spelling and id of the internal binding, once
+    -- minted (`internalOf`).
+    exports      : Map Int Export,
+    internals    : Map Int (String, Int),
 }
 
 fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
@@ -232,6 +237,36 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
     rigid = Map.new(), placeholders = Map.new(), counter = 0,
     owner = 0, site = sourceSpan("", 0, 0),
     copies = Map.new(), dicts = Map.new(), opened = Map.new(),
+    exports = exportsIn(types), internals = Map.new(),
+}
+
+-- Returns every `Export` the solver recorded, by binder id.
+fun exportsIn(types : TypeTable) -> Map Int Export {
+    let out = Map.new()
+    for (_, a) in Map.entries(types.abstractions) {
+        for (id, x) in Map.entries(a.exports) { Map.put(out, id, x) }
+    }
+    out
+}
+
+-- Returns the spelling and id of the binding the binder `id`, spelled
+-- `name`, has its body lowered at, with its `Export`, if its scheme is a
+-- wrapper around its group's. Every reference to the binding is by these.
+fun internalOf(l : Lowerer, id : Int, name : String) -> Option (String, Int, Export) {
+    let x = match Map.get(l.exports, id) {
+        Some(found) -> found
+        None -> return None
+    }
+    match Map.get(l.internals, id) {
+        Some((n, i)) -> return Some((n, i, x))
+        None -> {}
+    }
+    let b = Binders.binderAt(l.binders, id)
+    let internalName = name + "%group"
+    let internalId = Binders.fresh(l.binders, Binders.ownerOf(id), internalName, b.kind,
+                                   Generated(b.span))
+    Map.put(l.internals, id, (internalName, internalId))
+    Some((internalName, internalId, x))
 }
 
 -- A binder this pass invents: its spelling, and its id.
@@ -529,7 +564,7 @@ fun newBind(module_ : String, name : String, id : Int, ty : Ty.Type,
 -- One top-level statement. Only bindings occur here.
 fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
         -> Vec CBind = match stmt.kind {
-    SFun(decl) -> [funBind(l, decl, scope)]
+    SFun(decl) -> funBinds(l, decl, scope)
     SLet(pat, value) -> letBinds(l, stmt, pat, value, False, scope, owner)
     SVar(pat, value) -> letBinds(l, stmt, pat, value, True, scope, owner)
     -- A bare expression at the top level: evaluated for effect, so it is a
@@ -540,6 +575,68 @@ fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
         [newBind(owner, owner + "#" + name, id, value.ty, [], value, Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
+}
+
+-- The bindings a top-level `fun` lowers to: itself, or, if its scheme is a
+-- wrapper around its group's (`Export`), the internal binding its body is
+-- lowered at and the wrapper.
+fun funBinds(l : Lowerer, decl : FunDecl, scope : Scope) -> Vec CBind {
+    let id = binderOf(l, decl.id, decl.name, Some(decl.span))
+    let (internalName, internalId, x) = match internalOf(l, id, decl.name) {
+        Some(found) -> found
+        None -> return [funBind(l, decl, scope)]
+    }
+    let module_ = Binders.binderAt(l.binders, id).moduleName
+    let ty = x.internal.body
+    let inside = equalitiesOf(Some(x.internal))
+    let internal = newBind(module_, internalName, internalId,
+                           abstracted(l, ty, abstractionOf(l, decl.id), inside),
+                           x.internal.quantified,
+                           function(l, decl, ty, scope, None, None, inside),
+                           Some(decl.span))
+    let s = schemeOf(l, decl.name)
+    let equalities = equalitiesOf(s)
+    let binders = schemeBinders(s)
+    let wrapper = newBind(module_, decl.name, id, evidenced(l, ty, x.preds, equalities),
+                          binders,
+                          exportValue(l, x, binders, internalName, internalId, ty, equalities,
+                                      Some(decl.span)),
+                          Some(decl.span))
+    [internal, wrapper]
+}
+
+-- The value of a binder whose scheme is a wrapper around its group's: under
+-- a lambda over its own dictionaries and coercions, the internal binding
+-- applied at `x.use`. Its type is `ty`, the group's type for the binder.
+fun exportValue(l : Lowerer, x : Export, binders : Vec VarCell, internalName : String,
+                internalId : Int, ty : Ty.Type, equalities : Vec (Ty.Type, Ty.Type),
+                where : Option Span) -> Core {
+    let bound = dictBinders(l, x.params, x.preds)
+    -- The use names the scheme's variables, `binders`, by skolems.
+    let saved = l.rigid
+    let rigid = Map.new()
+    for (k, v) in Map.entries(saved) { Map.put(rigid, k, v) }
+    for v in binders {
+        if let Some(TCon(c)) = Map.get(x.skolems, v.id) { Map.put(rigid, c.name, v) }
+    }
+    l.rigid = rigid
+    let inner = withDicts(l, bound, fun() {
+        let givens = givensOf(l, x.use)
+        let dicts = Array.init(fewer(len(x.use.evidence), len(x.use.preds)), fun(i) =
+            evidence(l, x.use.evidence[i], predType(l, x.use.preds[i]), givens))
+        let coercions = Array.map(Vec.toArray(x.use.equalities), fun(p) =
+            coercion(resolved(l, p.args[0]), resolved(l, p.args[1]), where))
+        instantiated(l, CVar(refAt(l, internalName, internalId)),
+                     Array.map(x.use.typeArgs, resolved(l, _)),
+                     Array.append(dicts, coercions), ty, where)
+    })
+    l.rigid = saved
+    wrapDicts(l, inner, bound, x.preds, equalities, where)
+}
+
+fun schemeBinders(s : Option Scheme) -> Vec VarCell = match s {
+    Some(sc) -> sc.quantified
+    None -> []
 }
 
 fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
@@ -568,14 +665,18 @@ fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
 -- already built to match: a type application, and then an application to the
 -- dictionaries and the coercions.
 fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction,
-               equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type {
+               equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type = match dicts {
+    Some(a) -> if len(a.params) > 0 { evidenced(l, ty, a.preds, equalities) }
+               else { evidenced(l, ty, [], equalities) }
+    None -> evidenced(l, ty, [], equalities)
+}
+
+-- `ty` taking a dictionary for each of `preds`, then a coercion for each of
+-- `equalities`.
+fun evidenced(l : Lowerer, ty : Ty.Type, preds : Vec Pred,
+              equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type {
     let evidence = Vec.new(4)
-    match dicts {
-        None -> {}
-        Some(a) -> if len(a.params) > 0 {
-            for p in a.preds { Vec.push(evidence, predType(l, p)) }
-        }
-    }
+    for p in preds { Vec.push(evidence, predType(l, p)) }
     for (left, right) in equalities { Vec.push(evidence, coercionOf(left, right)) }
     if len(evidence) == 0 { ty } else { TFun(Vec.toArray(evidence), ty) }
 }
@@ -2139,12 +2240,13 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 CDeref(node(refOf(result), where, CVar(refAt(l, cell, cellId)))))
             None -> {}
         }
-        let binders = bindersOf(l, id, name, scope)
-        if len(binders) > 0 {
+        let own = bindersOf(l, id, name, scope)
+        if len(own) > 0 {
             -- A recursive occurrence: monomorphic to inference, still a type
             -- application here, at the binding's own variables, and applied to
             -- the coercions it takes at them.
-            let applied = CTyApp(node(unknown(), where, CVar(refAt(l, name, id))),
+            let (ref, binders) = recursiveRef(l, id, name, own)
+            let applied = CTyApp(node(unknown(), where, CVar(ref)),
                                  Array.map(binders, TVar))
             let own = ownCoercions(l, id, name, scope, where)
             if len(own) == 0 { return node(result, where, applied) }
@@ -2196,21 +2298,36 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- does carry dictionaries -- the solver patched those in -- which is
             -- why the test cannot be "no evidence either". Its coercions are
             -- the group's own too, at its own variables.
-            typeArgs = Array.map(bindersOf(l, id, name, scope), TVar)
+            let (ref, binders) = recursiveRef(l, id, name, bindersOf(l, id, name, scope))
+            base = node(unknown(), where, CVar(ref))
+            typeArgs = Array.map(binders, TVar)
             coercions = ownCoercions(l, id, name, scope, where)
         }
     }
-    dicts = Array.append(dicts, coercions)
-    let afterTypes = if len(dicts) > 0 {
-        TFun(Array.map(dicts, _.ty), result)
-    } else { result }
-    if len(typeArgs) > 0 {
-        base.ty = unknown()
-        base = node(afterTypes, where, CTyApp(base, typeArgs))
+    instantiated(l, base.kind, typeArgs, Array.append(dicts, coercions), result, where)
+}
+
+-- `fn` applied to `typeArgs`, then to `args`, giving a `result`.
+fun instantiated(l : Lowerer, fn : CoreKind, typeArgs : Array Ty.Type, args : Array Core,
+                 result : Ty.Type, where : Option Span) -> Core {
+    let afterArgs = if len(args) > 0 { TFun(Array.map(args, _.ty), result) } else { result }
+    let base = if len(typeArgs) > 0 {
+        node(afterArgs, where, CTyApp(node(unknown(), where, fn), typeArgs))
     } else {
-        base.ty = afterTypes
+        node(afterArgs, where, fn)
     }
-    if len(dicts) > 0 { node(result, where, CApp(base, dicts)) } else { base }
+    if len(args) > 0 { node(result, where, CApp(base, args)) } else { base }
+}
+
+-- Returns the reference an occurrence of the binder `id` inside its own
+-- group makes, and the variables it is applied at, given `binders`, those
+-- of the binder's scheme. The group's bodies call each other's internal
+-- bindings when a binder's scheme is a wrapper (`Export`).
+fun recursiveRef(l : Lowerer, id : Int, name : String,
+                 binders : Vec VarCell) -> (Ref, Vec VarCell) = match internalOf(l, id, name) {
+    Some((internalName, internalId, x)) -> (refAt(l, internalName, internalId),
+                                            x.internal.quantified)
+    None -> (refAt(l, name, id), binders)
 }
 
 -- The coercions an occurrence of the binder `id`, spelled `name`, inside its
@@ -2219,9 +2336,12 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
 -- occurrence demanded none.
 fun ownCoercions(l : Lowerer, id : Int, name : String, scope : Scope,
                  where : Option Span) -> Array Core {
-    let equalities = match localEqualities(scope, id) {
-        Some(found) -> found
-        None -> equalitiesOf(schemeOf(l, name))
+    let equalities = match internalOf(l, id, name) {
+        Some((_, _, x)) -> resolvedEqualities(l, Some(x.internal))
+        None -> match localEqualities(scope, id) {
+            Some(found) -> found
+            None -> equalitiesOf(schemeOf(l, name))
+        }
     }
     Array.map(Vec.toArray(equalities), fun((left, right)) = coercion(left, right, where))
 }
@@ -2971,7 +3091,11 @@ fun localFuns(l : Lowerer, group : Vec Stmt, scope : Scope,
         Map.put(scope.binders, id, funBinders(l, d))
         Map.put(scope.equalities, id, resolvedEqualities(l, localScheme(l, d)))
     }
-    Vec.map(decls, localFun(l, _, scope))
+    let out = Vec.new(len(decls))
+    for d in decls {
+        for b in localFun(l, d, scope) { Vec.push(out, b) }
+    }
+    out
 }
 
 fun funBinders(l : Lowerer, decl : FunDecl) -> Vec VarCell =
@@ -2986,7 +3110,10 @@ fun funBinders(l : Lowerer, decl : FunDecl) -> Vec VarCell =
 -- scope the solver pops -- so it comes from the group's own abstraction, which
 -- is where the solver recorded it, and failing that from the type the generator
 -- bound it at.
-fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
+--
+-- A binder whose scheme is a wrapper around its group's (`Export`) is two
+-- bindings, as at the top level (`funBinds`).
+fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> Vec CBind {
     let s = localScheme(l, decl)
     let (fnTy, binders) = match s {
         -- `resolved`, not a bare resolve: inside a signature-checked body the
@@ -2998,9 +3125,25 @@ fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
     let dicts = abstractionOf(l, decl.id)
     let equalities = resolvedEqualities(l, s)
     let id = binderOf(l, decl.id, decl.name, Some(decl.span))
-    newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
-            abstracted(l, fnTy, dicts, equalities), binders,
-            function(l, decl, fnTy, scope, None, None, equalities), Some(decl.span))
+    let module_ = Binders.binderAt(l.binders, id).moduleName
+    match internalOf(l, id, decl.name) {
+        None -> [newBind(module_, decl.name, id, abstracted(l, fnTy, dicts, equalities), binders,
+                         function(l, decl, fnTy, scope, None, None, equalities),
+                         Some(decl.span))]
+        Some((internalName, internalId, x)) -> {
+            let inside = resolvedEqualities(l, Some(x.internal))
+            let internal = newBind(module_, internalName, internalId,
+                                   abstracted(l, fnTy, dicts, inside), x.internal.quantified,
+                                   function(l, decl, fnTy, scope, None, None, inside),
+                                   Some(decl.span))
+            let wrapper = newBind(module_, decl.name, id, evidenced(l, fnTy, x.preds, equalities),
+                                  binders,
+                                  exportValue(l, x, binders, internalName, internalId, fnTy,
+                                              equalities, Some(decl.span)),
+                                  Some(decl.span))
+            [internal, wrapper]
+        }
+    }
 }
 
 fun localScheme(l : Lowerer, decl : FunDecl) -> Option Scheme =

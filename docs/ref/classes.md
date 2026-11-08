@@ -343,6 +343,18 @@ A field whose type has an instance that needs the class for a part of it
 names that part: a field of type `Array (fun() -> Int)` *contains*
 `fun() -> Int`, which has no `Eq`.
 
+A derivation reads each field's type as it is written, and never works out
+what an [associated type](#associated-types) stands for. A field whose type
+is or contains one, such as `Key (Array Bool)`, cannot derive the class, even
+where the associated type stands for a type that has it. Neither can a field
+whose instance needs an [equality](#equality-constraints) such as
+`Key c ~ Int`. Write the instance by hand instead:
+
+<!-- error: 'Counted' cannot derive 'Eq': field 0 of 'Counted' has type 'Key (Array Bool)', which is an associated type, and a derived instance cannot reduce one; write 'instance Eq Counted' by hand -->
+```kotlin
+type Counted : Eq = Counted(Key (Array Bool))
+```
+
 **Opting out.** `!Eq` or `!Hash` in the list says that the type has none:
 no instance may be written for it, and a type that holds one cannot derive
 the class. Comparing such a value says why it cannot be compared:

@@ -290,11 +290,6 @@ type ClassTable = ClassTable {
     -- Whether a call of `derive` is running, which settles any derivation
     -- begun inside it.
     var deriving : Bool,
-    -- Returns a type with its associated types reduced through the instances,
-    -- at every depth. The reducer is `Turkey.Inert.rewrite`, which imports
-    -- this module, so it is installed here (`Turkey.Infer.newGenerator`)
-    -- rather than called; until then a type is read as it stands.
-    var reduced : fun(Ty.Type) -> Ty.Type,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -307,7 +302,6 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     derivations = Map.new()
     provisional = []
     deriving = False
-    reduced = Ty.prune
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1962,8 +1956,14 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
             if let Some(unmet) = reduce(t, Ty.pred(cls, [types[i]]), params, 0, wanted) {
                 let written = if i < len(c.written) { writtenType(t, c.written[i], 0) }
                               else { Ty.showAt(types[i], n, 0) }
+                let fix = match unmet {
+                    Associated(_) | Equality(_, _) ->
+                        "; write 'instance " + Ty.shortName(cls) + " " + Ty.shortName(tycon)
+                        + "' by hand"
+                    _ -> ""
+                }
                 return Left(fieldName(c, i) + " has type '" + written + "'"
-                            + unmetTail(t, unmet, types[i], n))
+                            + unmetTail(t, unmet, types[i], n) + fix)
             }
         }
     }
@@ -2007,6 +2007,11 @@ type Unmet
     = Missing(String, Ty.Type)
     -- The wanted kept needing more after `reductionLimit` steps that grew.
     | Diverges(Pred)
+    -- The type is an associated type applied to a type.
+    | Associated(Ty.Type)
+    -- The instance for `cls` needs the equality, which does not hold as its
+    -- sides stand.
+    | Equality(String, Pred)
 
 -- More steps than this that do not reduce to a proper part of their wanted's
 -- type are taken not to end. A step to a proper part always ends, since a
@@ -2020,37 +2025,36 @@ let reductionLimit = 64
 -- class over one of `params` it leaves to `out`, once. Returns what it could
 -- not reduce, if anything. `grown` is how many steps so far did not reduce
 -- to a proper part.
---
--- Each type is read with its associated types reduced first (`t.reduced`),
--- as the solver reads it, so `Key (Array Bool)` is the type it stands for and
--- an instance's equality is decided as the solver decides it.
 fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
            out : Vec Pred) -> Option Unmet {
     if grown > reductionLimit { return Some(Diverges(p)) }
-    let ty = t.reduced(p.args[0])
-    let wanted = Ty.pred(p.name, [ty])
+    let ty = Ty.prune(p.args[0])
     if let TVar(cell) = ty {
         if !Set.contains(params, cell.id) { return Some(Missing(p.name, ty)) }
-        let key = Ty.predKey(wanted)
-        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, wanted) }
+        let key = Ty.predKey(p)
+        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, p) }
         return None
     }
+    -- Match types against instances as they stand, with no associated type
+    -- reduced, and refuse a wanted that would need one reduced. The refusal
+    -- is conservative: it rejects some instances the solver would accept,
+    -- and accepts none it would reject. Reducing here alone is not enough,
+    -- because `Turkey.Lower` proves each field's instance at the field's
+    -- type as written, and it would have to prove it at the same reduced
+    -- type.
+    if let TFam(_, _, _) = ty { return Some(Associated(ty)) }
     if let TVar(_) = Ty.spine(ty).0 { return Some(Missing(p.name, ty)) }
-    match selectInstance(t, wanted) {
+    match selectInstance(t, p) {
         None -> Some(Missing(p.name, ty))
         Some((inst, mapping)) -> {
-            -- An instance whose equalities do not hold here as they stand
-            -- has nothing a context of classes could supply.
+            -- An equality whose sides are not one type as they stand has an
+            -- associated type on its left, which would have to be reduced.
             for e in equalitiesAt(inst, mapping) {
-                if !Ty.sameType(t.reduced(e.args[0]), t.reduced(e.args[1])) {
-                    return Some(Missing(p.name, ty))
-                }
+                if !Ty.sameType(e.args[0], e.args[1]) { return Some(Equality(p.name, e)) }
             }
             for q in contextAt(inst, mapping) {
-                let next = if properPart(t.reduced(q.args[0]), ty) { grown } else { grown + 1 }
-                if let Some(unmet) = reduce(t, Ty.pred(q.name, [q.args[0]]), params, next, out) {
-                    return Some(unmet)
-                }
+                let next = if properPart(q.args[0], ty) { grown } else { grown + 1 }
+                if let Some(unmet) = reduce(t, q, params, next, out) { return Some(unmet) }
             }
             None
         }
@@ -2086,6 +2090,15 @@ fun unmetTail(t : ClassTable, unmet : Unmet, ty : Ty.Type, n : Ty.Namer) -> Stri
         }
         Diverges(p) -> ", whose '" + Ty.shortName(p.name) + "' needs '"
                        + Ty.shortName(p.name) + "' at ever larger types"
+        Associated(leaf) -> {
+            let shown = "'" + Ty.showAt(leaf, n, 0) + "'"
+            let what = if Ty.sameType(leaf, ty) { ", which is an associated type" }
+                       else { ", which contains " + shown + ", an associated type" }
+            what + ", and a derived instance cannot reduce one"
+        }
+        Equality(cls, e) -> ", whose '" + Ty.shortName(cls) + "' needs '"
+                            + Ty.showAt(e.args[0], n, 0) + " ~ " + Ty.showAt(e.args[1], n, 0)
+                            + "', and a derived instance cannot reduce an associated type"
     }
 
 -- Returns `te`, a type as a declaration wrote it, as a diagnostic quotes it:
@@ -2104,10 +2117,12 @@ fun writtenType(t : ClassTable, te : Type, prec : Int) -> String = match te.kind
 
 -- An alias by its short name: one that names a built-in type, `Int` for
 -- `Prim.Int`, shares that name with the type, and a type is qualified where
--- two share a name.
+-- two share a name. An associated type is named by its member alone, as a
+-- program writes it.
 fun writtenName(t : ClassTable, name : String) -> String = match Map.get(t.decls.tycons, name) {
     Some(info) -> if info.isAlias { Ty.shortName(name) } else { Ty.display(name) }
-    None -> Ty.display(name)
+    None -> if Map.contains(t.decls.families, name) { Ty.bareName(name) }
+            else { Ty.display(name) }
 }
 
 fun applied(t : ClassTable, head : String, args : Vec Type, prec : Int) -> String {

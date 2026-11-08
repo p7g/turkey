@@ -223,9 +223,11 @@ type PredCell = PredCell {
     -- arose, and that wanted: GHC's reduction depth (`subGoalDepthExceeded`).
     depth    : Int,
     root     : Pred,
-    -- Whether this is an equality superclass of a class wanted, emitted only
-    -- so that it may rewrite other wanteds (`expandSuperclasses`). Nothing
-    -- reads its evidence, and it is never reported.
+    -- Whether this is an equality superclass of a class wanted, or a part of
+    -- one, emitted only so that it may rewrite other wanteds
+    -- (`expandSuperclasses`). Nothing reads its evidence, it is never
+    -- quantified over, and what it would report is held back
+    -- (`Solver.suppressed`).
     superclass : Bool,
     -- Whether the superclasses of this class wanted have been expanded.
     var expanded : Bool,
@@ -256,14 +258,15 @@ fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> Pre
 }
 
 -- Returns a wanted that `p` holds, arising at `where` from solving `parent`:
--- one level deeper, with the same root.
+-- one level deeper, with the same root, and `superclass` if `parent` is, as
+-- GHC's origin carries over to what a wanted decomposes into.
 fun subgoal(parent : PredCell, p : Pred, where : Option Span, context : String,
             hole : Hole) -> PredCell {
     serials.next = serials.next + 1
     PredCell {
         pred = p, span = where, context = context, hole = hole, at = None,
         stage = Queued, serial = serials.next, stuck = 0, depth = parent.depth + 1,
-        root = parent.root, superclass = False, expanded = False,
+        root = parent.root, superclass = parent.superclass, expanded = False,
     }
 }
 
@@ -512,10 +515,11 @@ type Solver = Solver {
     var unchecked   : Vec Refusal,
     -- The binders of the top-level group being solved.
     var solving     : Set.Set Int,
-    -- What `superclass` wanteds would have reported, in order: GHC's
-    -- suppressed errors (Note [ei_suppress: suppressing confusing errors]),
-    -- reported only where no other error says the same (`unsuppress`).
-    suppressed      : Vec Diag.Diag,
+    -- What `superclass` wanteds would have reported, in order, each with the
+    -- wanted as it was when it was tried: GHC's suppressed errors (Note
+    -- [ei_suppress: suppressing confusing errors]), reported only where no
+    -- other error says the same (`unsuppress`, `blame`).
+    var suppressed  : Vec (Diag.Diag, Pred),
 }
 
 -- A local binder that its group did not generalize, though the group's type
@@ -694,6 +698,7 @@ fun run(s : Solver, c : Constraint) -> Unit {
     }
     rejectStranded(s, members(s.here))
     if !Diag.hasErrors() { discard(unsuppress(s, 0)) }
+    forgetSuppressed(s, 0)
 }
 
 fun solve(s : Solver, c : Constraint) -> Unit = match c {
@@ -1263,9 +1268,27 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         Some(young) -> dischargePool(s, young)
         None -> {}
     }
-    -- Read before the scheme's implication rewrites the retained wanteds.
-    let candidates = Vec.map(retainedPreds, _.pred)
-    let theta = quantified(s, c, candidates)
+    -- Read before the scheme's implication rewrites the retained wanteds. A
+    -- `superclass` wanted is no candidate: it exists to rewrite others, and
+    -- the wanted it came from implies it.
+    let candidates = Vec.new(len(retainedPreds))
+    for w in retainedPreds {
+        if !w.superclass { Vec.push(candidates, w.pred) }
+    }
+    -- A wanted that can never hold is a definite error, and then the group
+    -- quantifies over nothing: OutsideIn(X) §7.3, "We do not want to
+    -- quantify over obviously-inconsistent constraints", and GHC's Note
+    -- [Quantification with errors], "Abandon all attempts to find a context
+    -- to quantify over". Every
+    -- other error has been reported where it arose; one a `superclass`
+    -- wanted met is held back, so that is what is checked for.
+    let definite = len(s.suppressed) > mark
+    let theta = if definite {
+        checkRigid(s, c, [])
+        Vec.new(0)
+    } else {
+        quantified(s, c, candidates)
+    }
 
     -- The class predicates are shared across the group, and the dictionary
     -- parameters with them. One member's body may call another's, so a per-name
@@ -1327,7 +1350,8 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
             Vec.push(named, ("", p))
         }
     }
-    solveUnderScheme(s, c, named, wanteds, mark)
+    solveUnderScheme(s, c, named, wanteds, mark, definite)
+    forgetSuppressed(s, mark)
     match c.dicts {
         Some(a) -> {
             let params = Vec.new(len(givens))
@@ -1420,10 +1444,11 @@ fun quantified(s : Solver, c : LetCell, candidates : Vec Pred) -> Vec Pred {
 }
 
 -- Returns the predicates of `inferred` that `annotated` does not entail, in
--- order: GHC's `findInferredDiff`. They are solved as fresh wanteds, with
--- `annotated` as givens, by the simplifier alone, as GHC uses
--- `solveSimpleWanteds` there, and nothing the solve finds or reports is
--- kept. A wanted it finds insoluble counts as entailed: the scheme's own
+-- order and as the solve left them, rewritten by `annotated`: GHC's
+-- `findInferredDiff`, which returns its residual's `ctPred`s. They are solved
+-- as fresh wanteds, with `annotated` as givens, by the simplifier alone, as
+-- GHC uses `solveSimpleWanteds` there, and nothing else the solve finds or
+-- reports is kept. A wanted it finds insoluble counts as entailed: the scheme's own
 -- implication meets it again and reports it (`solveUnderScheme`).
 fun inferredDiff(s : Solver, annotated : Vec Pred, inferred : Vec Pred) -> Vec Pred {
     if len(annotated) == 0 { return inferred }
@@ -1441,7 +1466,7 @@ fun inferredDiff(s : Solver, annotated : Vec Pred, inferred : Vec Pred) -> Vec P
     Diag.endMuted()
     let out = Vec.new(len(inferred))
     for var i = 0; i < len(cells); i = i + 1 {
-        if resting(cells[i]) { Vec.push(out, inferred[i]) }
+        if resting(cells[i]) { Vec.push(out, cells[i].pred) }
         take(cells[i])
     }
     for w in members(impl) { take(w) }
@@ -1464,32 +1489,35 @@ fun inferredDiff(s : Solver, annotated : Vec Pred, inferred : Vec Pred) -> Vec P
 -- qtvs, ic_given = full_theta_vars, ic_given_eqs = MaybeGivenEqs }`. Every
 -- variable is untouchable inside it: the quantified ones, and the outer ones,
 -- as `MaybeGivenEqs` makes them. So no variable of a given is touchable, the
--- paper's invariant "αtch # fuv(Qgiven)" (§7.2). The quantified variables are
+-- paper's invariant "αtch # fuv(Qgiven)" (§5.5). The quantified variables are
 -- unification variables rather than skolems, because the schemes quantify
--- those very cells. `mightEqual` treats them as possibly equal, which only
--- matters to a wanted with a rigid head, and no retained class wanted has one.
+-- those very cells. So `mightEqual` treats them as possibly equal, where GHC
+-- would see two skolems apart, and a given over one of them can delay an
+-- instance for a wanted over another. That never decides the outcome here:
+-- a quantified predicate entails each class wanted, by identity or through
+-- a superclass, and `classRule` asks the givens before it looks for an
+-- instance.
 --
 -- Every wanted mentions only variables of the group's rank, so nothing
 -- floats out, and nothing the enclosing scope learns later could change the
 -- outcome: the implication is solved at once rather than emitted. The
 -- quantified predicates entail every wanted by construction (`quantified`),
--- so a wanted left over is a bug, unless an error left it.
+-- so a wanted left over is a bug, unless an error left it. After a
+-- `definite` error nothing is quantified, and what is left over is the
+-- residual, which `blame` or `unsuppress` reports.
 fun solveUnderScheme(s : Solver, c : LetCell, named : Vec (String, Pred),
-                     wanteds : Vec PredCell, mark : Int) -> Unit {
+                     wanteds : Vec PredCell, mark : Int, definite : Bool) -> Unit {
     if len(wanteds) == 0 { return {} }
     let (impl, made, refused) = schemeImplication(s, named)
     -- Two of the predicates contradict each other, so the group can never be
-    -- used. Solving found that already, in a `superclass` wanted that met the
-    -- contradiction and was not reported, so that is reported now; failing
-    -- that, the contradiction itself.
-    if len(refused) > 0 && !unsuppress(s, mark) {
-        for r in refused {
-            match r {
-                Never(g, why) -> Ty.typeError("the body of '" + groupName(c) + "' needs '"
-                    + Ty.showPred(g.pred) + "' and constraints that contradict it; " + why,
-                    c.span)
-                GaveUp(_, _) -> {}
-            }
+    -- used. A contradiction solving met is a definite error, after which
+    -- nothing is quantified, so this is one that solving did not see.
+    for r in refused {
+        match r {
+            Never(g, why) -> Ty.typeError("the body of '" + groupName(c) + "' needs '"
+                + Ty.showPred(g.pred) + "' and constraints that contradict it; " + why,
+                c.span)
+            GaveUp(_, _) -> {}
         }
     }
     let outside = s.here
@@ -1499,11 +1527,16 @@ fun solveUnderScheme(s : Solver, c : LetCell, named : Vec (String, Pred),
         queue(w)
     }
     solveWanteds(s)
-    for w in members(impl) {
-        take(w)
-        if !w.superclass && !Diag.hasErrors() {
-            bug("the context of a binding group does not imply '" + Ty.showPred(w.pred)
-                + "', which it retained", w.span)
+    let left = members(impl)
+    for w in left { take(w) }
+    if definite {
+        if !Diag.hasErrors() && !blame(s, left, mark) { discard(unsuppress(s, mark)) }
+    } else {
+        for w in left {
+            if !w.superclass && !Diag.hasErrors() {
+                bug("the context of a binding group does not imply '" + Ty.showPred(w.pred)
+                    + "', which it retained", w.span)
+            }
         }
     }
     match made {
@@ -1511,6 +1544,33 @@ fun solveUnderScheme(s : Solver, c : LetCell, named : Vec (String, Pred),
         None -> {}
     }
     s.here = outside
+}
+
+-- Reports, at its own origin, a wanted equality of `left` that a
+-- `superclass` wanted held back since `mark` met and found contradictory,
+-- and returns whether there was one.
+--
+-- With nothing quantified, `left` is the residual GHC reports, and it
+-- reports a wanted that is not suppressed in preference to one that is:
+-- the superclass wanted met the contradiction, but the program's mistake is
+-- where the other wanted arose. It is reported as that wanted rewritten by
+-- the superclass equality, which is the equation that cannot hold.
+fun blame(s : Solver, left : Vec PredCell, mark : Int) -> Bool {
+    for var i = mark; i < len(s.suppressed); i = i + 1 {
+        let (_, p) = s.suppressed[i]
+        if p.name != Ty.equals { continue }
+        for w in left {
+            if w.superclass || w.pred.name != Ty.equals { continue }
+            if Ty.sameType(w.pred.args[0], p.args[0]) {
+                Ty.mismatch(p.args[1], w.pred.args[1], w.span, w.context)
+                return True
+            } else if Ty.sameType(w.pred.args[1], p.args[0]) {
+                Ty.mismatch(w.pred.args[0], p.args[1], w.span, w.context)
+                return True
+            }
+        }
+    }
+    False
 }
 
 -- Returns the group's name for a diagnostic: its first binder's.
@@ -1783,9 +1843,10 @@ fun solveWanteds(s : Solver) -> Unit {
 -- it may rewrite other wanteds, as `[W] Bytes a` gives `[W] Key a ~ Int` and
 -- that rewrites `OneOf (Key a) {Int, Float}` to `OneOf Int` (Example 2 of
 -- Note [Why adding superclasses can help] in `GHC.Tc.Solver.Dict`). Such a
--- wanted is `superclass`: it is solved like any other, but never reported,
--- because it can fail only where the wanted it came from fails, and that one
--- says more (`suppressCtError`, (SCE2)).
+-- wanted is `superclass`: it is solved like any other, but what it would
+-- report is held back (`solveOne`), because the wanted it came from, or the
+-- wanted it contradicts, says more about the program (`suppressCtError`,
+-- (SCE2)). It is reported only when nothing else is (`blame`, `unsuppress`).
 --
 -- Only equality superclasses are expanded. GHC expands class superclasses too,
 -- to expose functional dependencies; there are none here, and a class
@@ -1814,20 +1875,26 @@ fun expandSuperclasses(s : Solver) -> Bool {
 -- inert. What a `superclass` wanted would report is held back
 -- (`Solver.suppressed`).
 fun solveOne(s : Solver, c : PredCell) -> Unit {
+    let tried = c.pred
     if c.superclass { Diag.beginHeld() }
     let discharged = entail(s, c)
-    if c.superclass { for d in Diag.endHeld() { Vec.push(s.suppressed, d) } }
+    if c.superclass { for d in Diag.endHeld() { Vec.push(s.suppressed, (d, tried)) } }
     if discharged { c.stage = Finished } else { rest(s, c) }
 }
 
--- Reports the first error a `superclass` wanted would have reported since
+-- Reports every error a `superclass` wanted would have reported since
 -- `s.suppressed` held `mark` of them, and returns whether there was one.
 -- GHC's (SCE3): when every error left is a suppressed one, "just un-suppress
 -- all of them. Brutal but safe."
 fun unsuppress(s : Solver, mark : Int) -> Bool {
-    if len(s.suppressed) <= mark { return False }
-    Diag.report(s.suppressed[mark])
-    True
+    for var i = mark; i < len(s.suppressed); i = i + 1 { Diag.report(s.suppressed[i].0) }
+    len(s.suppressed) > mark
+}
+
+-- Forgets the errors held back since `s.suppressed` held `mark` of them: the
+-- binding group they arose in has dealt with them.
+fun forgetSuppressed(s : Solver, mark : Int) -> Unit {
+    if len(s.suppressed) > mark { s.suppressed = Vec.slice(s.suppressed, 0, mark) }
 }
 
 -- Puts `c`, which the program demanded, at the back of its implication's

@@ -641,23 +641,38 @@ fun describe(x : a, label) = label + show(x)
 
 The context covers a constraint it implies, not only one it spells: through a
 class's superclasses, including its equality superclasses, and through the
-equalities it writes. Here `Ord a` covers the `Eq a` that `==` needs, and the
-function's type has the context as written, `[Ord a]`. Constraints the body
-places on types the header does not name, such as the unannotated `label`'s,
-are inferred and added to it:
+equalities it writes. Here the body needs `Show (Key c)`, which the context
+does not spell, but `Show (Elem c)` and `Elem c ~ Key c` together imply it.
+The function's type has the context as written, and the constraints the body
+places on the unannotated `n`, `Show` and a numeric type, are inferred and
+added to it:
 
 <!-- run -->
 ```kotlin
-fun tally[Ord a](x : a, y : a, label) -> String =
-    label + (if x == y { "same" } else if x < y { "less" } else { "more" })
+class Container c {
+    type Elem c
+    type Key c
+    fun firstKey(c) -> Key c
+}
+
+type Tags = Tags(Array String)
+
+instance Container Tags {
+    type Elem = String
+    type Key = String
+    fun firstKey(Tags(ts)) = ts[0]
+}
+
+fun describe[Container c, Show (Elem c), Elem c ~ Key c](x : c, n) -> String =
+    show(firstKey(x)) + " x" + show(n + 1)
 
 fun main() {
-    print(tally(1, 2, "1 vs 2: "))
+    print(describe(Tags(["a", "b"]), 2))
 }
 ```
 
 ```text
-1 vs 2: less
+a x3
 ```
 
 Annotations on types that contain no type variables, such as `n : Int`, simply

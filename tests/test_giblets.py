@@ -438,8 +438,9 @@ HIDDEN = (
     ("packs", "packs an existential, Hidden", 11),
     # A class-polymorphic function on an expanding cycle: the dictionary its
     # generic body builds for the pair it passes on, reached through the call.
-    # The dictionary is an argument before the pair, so it is named first.
-    ("dicts", "builds a dictionary, Show", 8),
+    # The pair's `show` is inlined into the dictionary, so the environment of
+    # its closure is the first object built, and is named only as an object.
+    ("dicts", "builds an object -- a constructor, tuple, record or dictionary", 8),
 ])
 def test_an_allocation_nobody_wrote_is_named_where_it_came_from(
         lowered, helper, reason, line):

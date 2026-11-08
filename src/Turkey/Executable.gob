@@ -1,0 +1,65 @@
+export (stubSize, stubs, check, copy, alignUp)
+
+-- What the executable writers share: the import stubs, which call through a
+-- table of addresses the loader fills in, and the module's section order.
+--
+-- An import is called through a stub rather than at the address the loader
+-- binds it to, so that the code stays read-only and each import costs one
+-- word bound however often it is called. Every import is a call -- none is
+-- data, and no import's address is taken -- so a stub is all an import ever
+-- needs.
+
+import Turkey.Asm as Asm
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Mem(..), Width(..))
+import Turkey.Arm64.Encode as Encode
+import Turkey.Assembler (SectionData(..))
+
+-- A stub's size in bytes.
+let stubSize = 12
+
+-- Returns the `n` stubs, loaded at `at`, each jumping through its slot of
+-- the offset table at `table`: `adrp x16, slot@PAGE; ldr x16, [x16,
+-- slot@PAGEOFF]; br x16`. Stub `k` uses slot `k`. `format` is the dialect
+-- the labels are named in, which never reach the output.
+fun stubs(format : Asm.Dialect, at : Int, table : Int, n : Int) -> Vec Byte {
+    let out = []
+    let words = []
+    let x16 = A.physical(16)
+    for var k = 0; k < n; k = k + 1 {
+        let slot = Asm.localLabel(format, "slot" + Int.toString(k))
+        for op in [A.Adrp(x16, slot), A.Ldr(x16, PageOffset(x16, slot), W64), A.Br(x16)] {
+            let offset = len(out)
+            Vec.clear(words)
+            Encode.encode(op, words)
+            for w in words {
+                let p = len(out)
+                for var b = 0; b < 4; b = b + 1 { Vec.push(out, Byte.truncate(0)) }
+                Byte.putLE(out, p, 4, w)
+            }
+            if let Some(f) = Encode.fixupOf(op) {
+                Encode.patch(f, out, offset, at + offset, table + 8 * k)
+            }
+        }
+    }
+    out
+}
+
+-- Raises an internal error unless the module's first sections are its
+-- code, C strings, constants and data, in that order.
+fun check(sections : Array (SectionData f)) -> Unit {
+    let ordered = len(sections) >= 4 && match (sections[0].kind, sections[1].kind,
+                                               sections[2].kind, sections[3].kind) {
+        (Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data) -> True
+        _ -> False
+    }
+    if !ordered { error("internal error: the module's sections are not in the order expected") }
+}
+
+-- Writes `bytes` into `out` from `at`.
+fun copy(out : Array Byte, at : Int, bytes : Vec Byte) -> Unit {
+    for var k = 0; k < len(bytes); k = k + 1 { out[at + k] = bytes[k] }
+}
+
+-- Returns `n` rounded up to a multiple of `to`.
+fun alignUp(n : Int, to : Int) -> Int = (n + to - 1) / to * to

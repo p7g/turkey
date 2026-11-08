@@ -1834,9 +1834,9 @@ fun begin(t : ClassTable, cls : String, info : TyconInfo, general : Ty.Type,
 -- only grows from round to round, since what the contexts it is inferred
 -- under imply only grows. Its predicates may change as it does, when `Ord a`
 -- comes to stand for an `Eq a` it implies. A withdrawn instance stays
--- withdrawn, since every instance that relied on it fails next round. A context holds only classes over its own type's
--- parameters, so there are finitely many it can grow to, and the rounds
--- stop.
+-- withdrawn, since every instance that relied on it fails next round. A
+-- context holds only classes over its own type's parameters, so there are
+-- finitely many it can grow to, and the rounds stop.
 fun settle(t : ClassTable) -> Unit {
     var rounds = 0
     loop {
@@ -1958,8 +1958,8 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
                               else { Ty.showAt(types[i], n, 0) }
                 let fix = match unmet {
                     Associated(_) | Equality(_, _) ->
-                        "; write 'instance " + Ty.shortName(cls) + " " + Ty.shortName(tycon)
-                        + "' by hand"
+                        "; write 'instance " + Ty.shortName(cls) + " "
+                        + Ty.showAt(inst.head, n, 2) + "' by hand"
                     _ -> ""
                 }
                 return Left(fieldName(c, i) + " has type '" + written + "'"
@@ -2013,18 +2013,20 @@ type Unmet
     -- sides stand.
     | Equality(String, Pred)
 
--- More steps than this that do not reduce to a proper part of their wanted's
--- type are taken not to end. A step to a proper part always ends, since a
--- type is finite, so only these are counted, and a field's type nested any
--- depth reduces. A written instance's context may be no smaller than its
--- head, `Eq (W a) : Eq (W (Array a))`, and nothing else stops it reducing
--- for ever.
+-- More steps than this that do not ask for one of their instance head's
+-- variables (`shrinks`) are taken not to end. A step that does asks for a
+-- proper part of its wanted's type, and a run of those always ends, since a
+-- type is finite, so only the others are counted. A field's type nested any
+-- depth therefore reduces through instances like `Eq (Array a) : Eq a`, but
+-- not through more than this many like `Eq (R a) : Eq (Array a)`. A written
+-- instance's context may be no smaller than its head,
+-- `Eq (W a) : Eq (W (Array a))`, and nothing else stops it reducing for ever.
 let reductionLimit = 64
 
 -- Reduces the wanted `p` through the instances that cover it, adding each
 -- class over one of `params` it leaves to `out`, once. Returns what it could
--- not reduce, if anything. `grown` is how many steps so far did not reduce
--- to a proper part.
+-- not reduce, if anything. `grown` is how many steps so far did not ask for
+-- one of their instance head's variables (`shrinks`).
 fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
            out : Vec Pred) -> Option Unmet {
     if grown > reductionLimit { return Some(Diverges(p)) }
@@ -2052,26 +2054,29 @@ fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
             for e in equalitiesAt(inst, mapping) {
                 if !Ty.sameType(e.args[0], e.args[1]) { return Some(Equality(p.name, e)) }
             }
-            for q in contextAt(inst, mapping) {
-                let next = if properPart(q.args[0], ty) { grown } else { grown + 1 }
-                if let Some(unmet) = reduce(t, q, params, next, out) { return Some(unmet) }
+            let headVars = Ty.freeVars(inst.head)
+            let wanted = contextAt(inst, mapping)
+            for var i = 0; i < len(wanted); i = i + 1 {
+                let next = if shrinks(inst.context[i], headVars) { grown } else { grown + 1 }
+                if let Some(unmet) = reduce(t, wanted[i], params, next, out) { return Some(unmet) }
             }
             None
         }
     }
 }
 
--- Returns whether `part` is a type inside `whole` other than `whole` itself.
-fun properPart(part : Ty.Type, whole : Ty.Type) -> Bool = match Ty.prune(whole) {
-    TApp(fn, arg, _) -> partOf(part, fn) || partOf(part, arg)
-    TFun(params, ret) -> Iterator.any(params, partOf(part, _)) || partOf(part, ret)
-    TTuple(elems) -> Iterator.any(elems, partOf(part, _))
-    TFam(_, arg, _) -> partOf(part, arg)
+-- Returns whether the instance context predicate `q` asks for a proper part
+-- of whatever type its instance's head matches, given `headVars`, the
+-- variables of that head. A head is never a bare variable, so a variable of
+-- the head stands for a proper part of the matched type. Deciding this from
+-- the instance rather than from the types it is matched at costs only the
+-- instance's size; a matched type can be exponentially large as a tree,
+-- `W ((a, a), (a, a))` after two steps of `Eq (W a) : Eq (W (a, a))`, though
+-- its nodes are shared.
+fun shrinks(q : Pred, headVars : Set.Set Int) -> Bool = match Ty.prune(q.args[0]) {
+    TVar(cell) -> Set.contains(headVars, cell.id)
     _ -> False
 }
-
-fun partOf(part : Ty.Type, whole : Ty.Type) -> Bool =
-    Ty.sameType(part, whole) || properPart(part, whole)
 
 -- How a reason chain names field `i` of constructor `c`.
 fun fieldName(c : ConInfo, i : Int) -> String = match c.fields {

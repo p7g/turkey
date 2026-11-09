@@ -1405,22 +1405,34 @@ fun checkRefusals(s : Solver, level : Int) -> Bool {
 -- agree: at two constructors, at two arities, or at a constructor and a
 -- numeric literal's type that cannot be it. Any other variable, a family
 -- application or bottom may still become anything, and clashes with nothing.
-fun clashes(s : Solver, a : Ty.Type, b : Ty.Type) -> Bool = match (Ty.prune(a), Ty.prune(b)) {
-    (TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)
-    (TVar(_), _) | (_, TVar(_)) -> False
-    (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> False
-    (TBottom, _) | (_, TBottom) -> False
-    (TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid
-    (TApp(f1, a1, _), TApp(f2, a2, _)) -> clashes(s, f1, f2) || clashes(s, a1, a2)
-    (TFun(p1, r1), TFun(p2, r2)) -> clashesAll(s, p1, p2) || clashes(s, r1, r2)
-    (TTuple(e1), TTuple(e2)) -> clashesAll(s, e1, e2)
-    (x, y) -> !Ty.sameType(x, y)
+fun clashes(s : Solver, a : Ty.Type, b : Ty.Type) -> Bool = clashing(s, a, b, Set.new())
+
+-- Returns whether `a` and `b` clash as `clashes` says, with each skolem
+-- whose uid is in `open` taken to stand for any type, as a variable does.
+fun clashing(s : Solver, a : Ty.Type, b : Ty.Type, open : Set.Set Int) -> Bool {
+    if opened(a, open) || opened(b, open) { return False }
+    match (Ty.prune(a), Ty.prune(b)) {
+        (TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)
+        (TVar(_), _) | (_, TVar(_)) -> False
+        (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> False
+        (TBottom, _) | (_, TBottom) -> False
+        (TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid
+        (TApp(f1, a1, _), TApp(f2, a2, _)) -> clashing(s, f1, f2, open) || clashing(s, a1, a2, open)
+        (TFun(p1, r1), TFun(p2, r2)) -> clashingAll(s, p1, p2, open) || clashing(s, r1, r2, open)
+        (TTuple(e1), TTuple(e2)) -> clashingAll(s, e1, e2, open)
+        (x, y) -> !Ty.sameType(x, y)
+    }
 }
 
-fun clashesAll(s : Solver, a : Array Ty.Type, b : Array Ty.Type) -> Bool {
+fun opened(t : Ty.Type, open : Set.Set Int) -> Bool = match Ty.prune(t) {
+    TCon(c) -> Set.contains(open, c.uid)
+    _ -> False
+}
+
+fun clashingAll(s : Solver, a : Array Ty.Type, b : Array Ty.Type, open : Set.Set Int) -> Bool {
     if len(a) != len(b) { return True }
     for var i = 0; i < len(a); i = i + 1 {
-        if clashes(s, a[i], b[i]) { return True }
+        if clashing(s, a[i], b[i], open) { return True }
     }
     False
 }
@@ -1785,20 +1797,18 @@ fun checkAmbiguity(s : Solver, a : Ambiguity) -> Unit {
 
 -- Returns what is left of `wanteds`, a derivation's, once they are solved
 -- over `skolems`, the skolems for its type's parameters, under `givens` and
--- nothing else.
--- Reports nothing, and leaves the solver as it found it: a derivation may
--- begin while a rule is being applied (`Classes.selectInstance`), with an
--- implication of its own being solved.
---
--- This is the solve of GHC's `simplifyDeriv` (`GHC.Tc.Deriv.Infer`):
--- `solveWanteds` in an implication over the skolems, at the top level,
--- since an instance holds everywhere and no given around the rule that
--- began the derivation may help it. Its residual is GHC's `approximateWC`
--- of the solved wanteds, with nothing nested to approximate: no wanted
--- here is under a given. Every wanted no rule can discharge stays in it,
--- for the derivation to judge (`Implication.reports`).
+-- nothing else, in the order each became inert. Reports nothing, and leaves
+-- the solver as it found it, even when called while a rule is being applied.
 fun simplifyDerived(s : Solver, givens : Vec Pred, wanteds : Vec Pred,
                     skolems : Vec ConCell) -> Vec Leftover {
+    -- This is the solve of GHC's `simplifyDeriv` (`GHC.Tc.Deriv.Infer`):
+    -- `solveWanteds` in an implication over the skolems. It is entered at
+    -- the top level, because an instance holds everywhere, so no given
+    -- around the rule that began the derivation (`Classes.selectInstance`)
+    -- may help it. Its residual is GHC's `approximateWC` of the solved
+    -- wanteds, with nothing nested to approximate, since no wanted here
+    -- opens an implication of its own. Every wanted no rule can discharge
+    -- stays in it, for the derivation to judge (`Implication.reports`).
     let here = s.here
     let draining = s.draining
     let current = s.current
@@ -1806,34 +1816,40 @@ fun simplifyDerived(s : Solver, givens : Vec Pred, wanteds : Vec Pred,
     s.draining = False
     s.current = None
     let out = Vec.new(2)
+    -- Stamp the skolems with the rank of the implication's body first:
+    -- `assume` keys the givens' equalities by them, and so does `index`.
+    let params = Set.new()
+    for con in skolems {
+        con.level = rank(s) + 1
+        Set.add(params, con.uid)
+    }
+    let index = Map.new()
+    for var i = 0; i < len(wanteds); i = i + 1 { Map.put(index, Ty.predKey(wanteds[i]), i) }
+    -- We assume no held stretch is open here, since `Diag.beginHeld` does
+    -- not nest: `solveOne` holds only an equality superclass's reports, and
+    -- no equality rule selects an instance, which is how a derivation
+    -- begins.
     Diag.beginMuted()
     let assumed = Vec.map(givens, fun(p) = ("%derive." + p.name, p, None))
     assume(s, assumed, None, skolems, "%derive", None, True, False, fun() {
         Vec.push(s.pools, Vec.new(0))
-        for con in skolems { con.level = rank(s) }
-        -- Keyed once the skolems are stamped, which changes their keys.
-        let index = Map.new()
-        for var i = 0; i < len(wanteds); i = i + 1 {
-            Map.put(index, Ty.predKey(wanteds[i]), i)
-        }
         for p in wanteds { solve(s, cpredOf(p, None, "")) }
         solveWanteds(s)
-        -- In the order they became inert, so that the first to fail is the
-        -- first reported.
-        let left = Vec.sortByKey(everywhere(s.here), _.stuck)
-        for c in left {
+        for c in Vec.sortByKey(everywhere(s.here), _.stuck) {
             -- An equality that mentions no parameter is about types that
-            -- are already known, and nothing can decide it later.
+            -- are already known, and nothing can decide it later. One that
+            -- mentions a parameter may hold for some of its types, unless
+            -- its sides clash whatever the parameters are.
+            let ground = len(Ty.skolemsOf(c.pred.args)) == 0 && len(Ty.varsOf(c.pred.args)) == 0
             let insoluble = c.pred.name == Ty.equals
-                            && (clashes(s, c.pred.args[0], c.pred.args[1])
-                                || len(Ty.skolemsOf(c.pred.args)) == 0
-                                   && len(Ty.varsOf(c.pred.args)) == 0)
+                            && (ground || clashing(s, c.pred.args[0], c.pred.args[1], params))
             let root = match Map.get(index, Ty.predKey(c.root)) {
                 Some(i) -> i
                 None -> bug("a derivation's wanted arose from none it asked for", c.span)
             }
             Vec.push(out, Leftover {
-                root = root, pred = c.pred, posed = c.posed, insoluble = insoluble,
+                root = root, pred = c.pred, posed = c.posed, asked = c.depth == 0,
+                insoluble = insoluble,
                 diverged = c.depth > reductionDepth,
             })
             take(c)
@@ -2479,7 +2495,8 @@ fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
 --   subgoal is one level deeper than the wanted it came from, and a wanted
 --   more than `reductionDepth` levels below one the program demanded is
 --   reported instead of solved (`tooDeep`), as GHC bounds its subgoals
---   (`subGoalDepthExceeded`).
+--   (`subGoalDepthExceeded`). In an implication that does not report, it
+--   stays inert instead (`Implication.reports`).
 fun solveSimples(s : Solver) -> Unit {
     -- A rule that emits a wanted calls back into here; the loop already
     -- running reaches it.
@@ -2934,8 +2951,10 @@ fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
 
 -- Try to discharge one predicate. `False` means "not yet": it becomes inert.
 -- An unsatisfiable predicate reports; only genuine lack of information
--- answers `False`, so nothing can be quietly dropped. Runs in the predicate's
--- own implication, under its givens alone.
+-- answers `False`, so nothing can be quietly dropped. In an implication that
+-- does not report (`Implication.reports`), an unsatisfiable predicate answers
+-- `False` too, and stays inert for its caller to judge. Runs in the
+-- predicate's own implication, under its givens alone.
 fun entail(s : Solver, c : PredCell) -> Bool {
     if c.depth > reductionDepth {
         -- Left as it is, and marked by its depth (`simplifyDerived`).
@@ -3195,7 +3214,9 @@ fun mentionsMeta(t : Ty.Type) -> Bool = match t {
 -- unification may yet decide which instance applies. One headed by anything
 -- rigid is decided here and now, which is what keeps a missing instance a local
 -- error naming the type that lacks one, unless a given might yet match it
--- (`matchableGiven`).
+-- (`matchableGiven`). In an implication that does not report
+-- (`Implication.reports`), a missing instance leaves the predicate inert
+-- instead.
 --
 -- Discharging the predicate fills its hole, by the rule that discharged it
 -- and with the types it was discharged at. A predicate reported as an error

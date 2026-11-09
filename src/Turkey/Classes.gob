@@ -1727,12 +1727,15 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- instance begun while a derivation runs is in the table from the start,
 -- with an empty context, and `settle` infers each context again under the
 -- others until none changes: the least fixed point, as GHC's
--- `inferInstanceContexts` finds it. It is never looped on: a context holds
--- only classes over parameters, so it can grow only so far, and a wanted
--- that grows without end, through a written instance whose context is no
--- smaller than its head, goes deeper than the solver follows instances and
--- is no instance. A non-regular type is not such a case: `Nest a` holding a
--- `Nest (Array a)` reduces `Eq (Nest (Array a))` back to `Eq a`.
+-- `simplifyInstanceContexts` finds it. The rounds end: a context holds only
+-- classes over parameters, so it can grow only so far. A wanted that grows
+-- without end, through a written instance whose context is no smaller than
+-- its head, goes deeper than the solver follows instances and is no
+-- instance. A context that doubles its argument, `Eq (W a) : Eq (W (a, a))`,
+-- is the exception: the solver bounds how deep it goes, not how large the
+-- types grow, so it never gets that deep. A non-regular type is not such a
+-- case: `Nest a` holding a `Nest (Array a)` reduces `Eq (Nest (Array a))`
+-- back to `Eq a`.
 
 -- A wanted the solver left unsolved when it simplified a derivation's
 -- wanteds (`ClassTable.simplify`).
@@ -1744,7 +1747,12 @@ type Leftover = Leftover {
     pred      : Pred,
     -- The wanted as it arose.
     posed     : Pred,
-    -- Whether it is an equality whose sides can never be one type.
+    -- Whether it is the wanted the derivation asked for, as the solver left
+    -- it, rather than one that arose from it.
+    asked     : Bool,
+    -- Whether it is an equality that holds for no types of the parameters:
+    -- one that mentions none, which nothing can then decide, or one whose
+    -- sides clash whatever they are.
     insoluble : Bool,
     -- Whether it arose deeper below its root than the solver follows
     -- instances, and was left there unsolved.
@@ -2175,11 +2183,11 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     -- Each wanted once, beside what asked for it, which a reason names.
     let wanted = []
     let asked = []
-    let seen = Set.new()
+    let asking = Set.new()
     let ask = fun(p : Pred, why : Asked) {
         let key = Ty.predKey(p)
-        if !Set.contains(seen, key) {
-            Set.add(seen, key)
+        if !Set.contains(asking, key) {
+            Set.add(asking, key)
             Vec.push(wanted, p)
             Vec.push(asked, why)
         }
@@ -2219,23 +2227,25 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     -- `forall tvs. theta => rest`, as an equality superclass of `Bytes s`
     -- does. What does not is why there is no instance. One that went too
     -- deep would only go too deep again.
-    let failed = Vec.filter(rest, _.diverged)
     let again = []
-    let from = []
-    let seen = Set.new()
+    let posed = Set.new()
     for l in rest {
-        if l.diverged || Set.contains(seen, Ty.predKey(l.pred)) { continue }
-        Set.add(seen, Ty.predKey(l.pred))
-        Vec.push(again, l.pred)
-        Vec.push(from, l)
+        let key = Ty.predKey(l.pred)
+        if !l.diverged && !Set.contains(posed, key) {
+            Set.add(posed, key)
+            Vec.push(again, l.pred)
+        }
     }
+    let unentailed = Set.new()
     if len(again) > 0 {
-        for l in t.simplify(theta, again, sk.made) { Vec.push(failed, from[l.root]) }
+        for l in t.simplify(theta, again, sk.made) { Set.add(unentailed, Ty.predKey(again[l.root])) }
     }
     -- The first field to fail, as a reader goes through them, and the first
-    -- of its wanteds to fail, as the solver went through them.
+    -- of its wanteds to fail, as the solver went through them: `rest` is in
+    -- the order its wanteds became inert.
     var blamed : Option Leftover = None
-    for l in failed {
+    for l in rest {
+        if !l.diverged && !Set.contains(unentailed, Ty.predKey(l.pred)) { continue }
         let earlier = match blamed {
             Some(before) -> l.root < before.root
             None -> True
@@ -2280,7 +2290,7 @@ fun leftoverReason(t : ClassTable, inst : InstInfo, tycon : String, asked : Aske
         let n = writtenNamer(inst.names)
         let written = if i < len(c.written) { writtenType(t, c.written[i], 0) }
                       else { Ty.showAt(ty, n, 0) }
-        let (tail, writeIt) = unmetTail(t, inst.cls, l, params, ty, n)
+        let (tail, writeIt) = unmetTail(t, inst.cls, l, params, n)
         let fix = if writeIt {
             "; write 'instance " + Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2)
             + "' by hand"
@@ -2295,13 +2305,13 @@ fun fieldName(c : ConInfo, i : Int) -> String = match c.fields {
     None -> "field " + Int.toString(i) + " of '" + Ty.shortName(c.name) + "'"
 }
 
--- Returns the rest of a reason chain about a field of type `ty`, whose `cls`
--- the solver left `l` of, and whether writing the instance by hand is the
+-- Returns the rest of a reason chain about a field whose `cls` the solver
+-- left `l` of, and whether writing the instance by hand is the
 -- fix. `params` maps each skolem in `l` back to its variable, which `n`
 -- names. Writing it by hand can avoid an equality or an associated type the
 -- derived instance would need, by not comparing the field through its
 -- instance, but it cannot give a type an instance it lacks.
-fun unmetTail(t : ClassTable, cls : String, l : Leftover, params : Map Int Ty.Type, ty : Ty.Type,
+fun unmetTail(t : ClassTable, cls : String, l : Leftover, params : Map Int Ty.Type,
               n : Ty.Namer) -> (String, Bool) {
     let p = unskolemPred(l.pred, params)
     let shown = fun(x) = "'" + Ty.showAt(x, n, 0) + "'"
@@ -2316,13 +2326,15 @@ fun unmetTail(t : ClassTable, cls : String, l : Leftover, params : Map Int Ty.Ty
         return (", whose '" + Ty.shortName(cls) + "' needs '" + Ty.showAt(e.args[0], n, 0) + " ~ "
                 + Ty.showAt(e.args[1], n, 0) + "'" + why, True)
     }
+    -- A leftover that is the field's own wanted names the field's type as
+    -- it reduced, which the chain has already named as written.
     let leaf = p.args[0]
     if let Some(fam) = associatedIn(leaf) {
-        let what = if Ty.sameType(fam, ty) { ", which is an associated type" }
+        let what = if l.asked && Ty.sameType(fam, leaf) { ", which is an associated type" }
                    else { ", which contains " + shown(fam) + ", an associated type" }
         return (what + " that does not reduce", True)
     }
-    let inside = if Ty.sameType(leaf, ty) { "" } else { ", which contains " + shown(leaf) }
+    let inside = if l.asked { "" } else { ", which contains " + shown(leaf) }
     (inside + whyNot(t, p.name, leaf), False)
 }
 

@@ -477,7 +477,10 @@ requirements above. A field that is a function, a type that has no
 instance, or a type `f a` built from a parameter `f`, has none. Nor does a
 field whose instances need the class at ever larger types without end,
 which a written instance such as `instance Eq (W a) : Eq (W (Array a))` can
-cause. Nor does a constructor that hides a type in an [existential
+cause. A written instance whose context doubles its argument at each step,
+such as `instance Eq (W a) : Eq (W (a, a))`, is not caught this way:
+checking a derivation through it, or any use of it, does not finish. Nor
+does a constructor that hides a type in an [existential
 bracket](types.md#existential-types): two of its values may hide different
 types. The error is reported at the entry in the list, whether or not
 anything uses the instance, and says which field is to blame, as the error
@@ -495,10 +498,32 @@ names that part: a field of type `Array (fun() -> Int)` *contains*
 `fun() -> Int`, which has no `Eq`.
 
 A derivation reads each field's type as the type checker reads any type:
-an [associated type](#associated-types) it applies is worked out, so a field
-of type `Key (Array Bool)` compares as the `Int` it stands for, and an
-[equality](#equality-constraints) a field's instance needs is checked. What a
-derived instance can require of the type's parameters is only classes. A
+an [associated type](#associated-types) is worked out, and an
+[equality](#equality-constraints) a field's instance needs is checked. With
+`instance Eq (K c) : Key c ~ Int`, a field of type `K (Array Bool)` needs
+`Key (Array Bool) ~ Int`, which holds:
+
+<!-- run -->
+```kotlin
+type K c = K(Int)
+
+instance Eq (K c) : Key c ~ Int {
+    fun eq(K(a), K(b)) = a == b
+}
+
+type Tagged : Eq = Tagged(K (Array Bool))
+
+fun main() {
+    print(Tagged(K(1)) == Tagged(K(1)))
+}
+```
+
+```text
+True
+```
+
+What a derived instance can require of the type's parameters is only
+classes. A
 field whose instance needs the class at an associated type of a parameter,
 such as `Array (Key c)`, or needs an equality about one, such as
 `Key c ~ Int`, cannot derive it. Write the instance by hand instead:

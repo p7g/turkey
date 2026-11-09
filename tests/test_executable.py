@@ -276,9 +276,19 @@ def test_a_malformed_library_is_passed_over(tmp_path):
     struct.pack_into("<I", huge, 20, 0xFFFFFFF0)
     (corrupt / "libssl.3.dylib").write_bytes(huge)
     (corrupt / "libcrypto.3.dylib").write_bytes(struct.pack(">2I", 0xCAFEBABE, 0x10000000))
+    # An `LC_ID_DYLIB` too short to hold a name's offset, and in the next
+    # directory one whose name starts past its command's end.
+    short = tmp_path / "short"
+    short.mkdir()
+    (short / "libssl.3.dylib").write_bytes(
+        struct.pack("<8I", 0xFEEDFACF, CPU_ARM64, 0, 6, 1, 8, 0, 0) + struct.pack("<2I", 0xD, 8))
+    outside = bytearray(_dylib(short / "libcrypto.3.dylib", "/outside/libcrypto.3.dylib"))
+    struct.pack_into("<I", outside, 32 + 8, 0x1000)
+    (short / "libcrypto.3.dylib").write_bytes(outside)
     executable = tmp_path / "tls"
     result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
-                   str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=f"{corrupt}:{good}"))
+                   str(_tls(tmp_path)),
+                   env=dict(ENV, TURKEY_DYLIB_PATH=f"{short}:{corrupt}:{good}"))
     assert result.returncode == 0, result.stderr[-4000:]
     assert [name for name, _, _ in _dylibs(executable.read_bytes())][1:] == [
         "/made/up/crypto/libcrypto.3.dylib", "/made/up/ssl/libssl.3.dylib"]

@@ -17,8 +17,12 @@ export (soname, leaf, searchPath, searched, find)
 -- installs under `/opt/homebrew` on arm64 and `/usr/local` on Intel, and a
 -- keg-only formula such as `openssl@3` only under its own `opt/` directory.
 -- So the file `lib<name>.<major>.dylib` is searched for, and the executable
--- names it by the file's own install name (`LC_ID_DYLIB`), as ld64 does. The
--- major is in that leaf name and nowhere else: dyld checks neither the
+-- names it by the file's own install name (`LC_ID_DYLIB`). dyld loads exactly
+-- the path an executable names, and the install name is the path the library
+-- is installed to be loaded from, which survives a search directory that only
+-- links to it. Only an absolute one does: the executable has no `LC_RPATH`
+-- for an `@rpath/` name to be resolved against. The major is in that leaf
+-- name and nowhere else: dyld checks neither the
 -- compatibility version of a library built for macOS 10.14 or later, which
 -- every arm64 one is, nor that an install name matches the path it was
 -- loaded by.
@@ -66,17 +70,17 @@ fun searched(given : Array String, native : Bool) -> String {
     String.join(Array.map(places, fun(d) = "'" + d + "'"), ", ")
 }
 
--- Returns the install name of the first file named `name` in `directories`
--- that is an arm64 dylib, or the files of that name that are not one, which
--- were passed over: an Intel Homebrew's under `/usr/local` on an arm64 Mac,
--- say.
-fun find(name : String, directories : Vec String) -> Either (Vec String) String {
+-- Returns the first file named `name` in `directories` that is an arm64
+-- dylib, and the install name it holds; or the files of that name that are
+-- not one, which were passed over: an Intel Homebrew's under `/usr/local` on
+-- an arm64 Mac, say, or a file too short or malformed to read.
+fun find(name : String, directories : Vec String) -> Either (Vec String) (String, String) {
     let passed = []
     for d in directories {
         let path = d + "/" + name
         if let Left(_) = File.metadata(path) { continue }
         match installName(path) {
-            Some(found) -> return Right(found)
+            Some(found) -> return Right((path, found))
             None -> Vec.push(passed, path)
         }
     }
@@ -136,7 +140,9 @@ fun thinInstallName(path : String, offset : Int) -> Option String {
         if command == lcIdDylib {
             -- `dylib_command`: the name's offset in the command, then the
             -- timestamp and the two versions, then the NUL-terminated name.
-            let start = at + Byte.getLE(commands, at + 8, 4)
+            let nameAt = Byte.getLE(commands, at + 8, 4)
+            if nameAt < 24 || nameAt >= length { return None }
+            let start = at + nameAt
             let bytes = []
             for var j = start; j < at + length && Byte.toInt(commands[j]) != 0; j = j + 1 {
                 Vec.push(bytes, commands[j])
@@ -151,13 +157,19 @@ fun thinInstallName(path : String, offset : Int) -> Option String {
 -- Up to `n` bytes of `path`'s file from `offset`: fewer only at its end, and
 -- `None` if it cannot be read.
 fun window(path : String, offset : Int, n : Int) -> Option (Array Byte) {
+    -- Never more than the file holds: `n` is read from the file, and a
+    -- corrupt one can ask for gigabytes.
+    let size = match File.metadata(path) {
+        Right(stat) -> max(0, min(n, stat.size - offset))
+        Left(_) -> return None
+    }
     let read = File.use(File.openRead(path), fun(f) {
-        let into = IO.buffer(n)
+        let into = IO.buffer(size)
         var total = 0
-        loop {
+        while total < size {
             let got = File.readAt(f, offset + total, into)?
+            if got == 0 { break }
             total = total + got
-            if got == 0 || total == n { break }
         }
         Right(IO.bytes(into))
     })

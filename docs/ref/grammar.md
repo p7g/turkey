@@ -221,7 +221,7 @@ field-pattern ::= IDENT "=" pattern
 
 ```ebnf
 foreign-decl ::= "foreign" foreign-sig body?
-               | "foreign" STRING INT "{" (foreign-sig (separator foreign-sig)*)? "}"
+               | "foreign" STRING INT "{" foreign-sig (separator foreign-sig)* "}"
 foreign-sig ::= STRING "fun" IDENT "(" foreign-params? ")" "->" type
 foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type

@@ -502,10 +502,10 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     out
 }
 
--- Returns the imports grouped by the library that defines them, each group
--- sorted by name: libc first, holding `__libc_start_main` as well, then libm,
--- then those `needed` names, by soname. Every library but libc is in the
--- list only if something is imported from it.
+-- Returns the imports grouped by the library that defines them, one group
+-- per soname, each sorted by name: libc first, holding `__libc_start_main` as
+-- well, then libm, then those `needed` names, by soname. Every library but
+-- libc is in the list only if something is imported from it.
 fun librariesOf(undefined : Vec Symbol, needed : Map String String) -> Array Library {
     let fromLibc = []
     let fromLibm = []
@@ -513,19 +513,13 @@ fun librariesOf(undefined : Vec Symbol, needed : Map String String) -> Array Lib
     var started = False
     for sym in undefined {
         if sym.name == startMain { started = True }
-        if let Some(soname) = Map.get(needed, sym.name) {
-            let group = match Map.get(others, soname) {
-                Some(group) -> group
-                None -> {
-                    let group = []
-                    Map.put(others, soname, group)
-                    group
-                }
-            }
-            Vec.push(group, sym)
-        } else {
-            Vec.push(if Array.contains(mathNames, sym.name) { fromLibm } else { fromLibc }, sym)
+        let group = match Map.get(needed, sym.name) {
+            None -> if Array.contains(mathNames, sym.name) { fromLibm } else { fromLibc }
+            Some(soname) -> if soname == libc { fromLibc }
+                            else if soname == libm { fromLibm }
+                            else { groupOf(others, soname) }
         }
+        Vec.push(group, sym)
     }
     if !started { Vec.push(fromLibc, Asm.symbolFor(Asm.Elf, startMain)) }
     let byName = fun(a : Symbol, b : Symbol) = Array.threeWay(a.name, b.name)
@@ -538,6 +532,17 @@ fun librariesOf(undefined : Vec Symbol, needed : Map String String) -> Array Lib
     }
     Vec.toArray(libraries)
 }
+
+-- Returns the group `groups` holds for `soname`, made empty if it has none.
+fun groupOf(groups : Map String (Vec Symbol), soname : String) -> Vec Symbol =
+    match Map.get(groups, soname) {
+        Some(group) -> group
+        None -> {
+            let group = []
+            Map.put(groups, soname, group)
+            group
+        }
+    }
 
 -- Returns the address of a segment that starts at file offset `offset` and
 -- follows one ending at address `end`: the first address past `end`'s page

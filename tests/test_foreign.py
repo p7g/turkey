@@ -466,3 +466,10 @@ def test_a_program_may_not_declare_a_library():
                     "}\n"
                     "fun main() { }\n")
     assert "a 'foreign' function without a body can appear only in" in message
+
+
+def test_a_block_declares_something():
+    """An empty block declares no function, so nothing would check where it
+    appears or the version it gives its library."""
+    message = fails('foreign "ssl" 1 {\n}\nfun main() { }\n')
+    assert "the block for library 'ssl' declares nothing" in message

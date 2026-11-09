@@ -187,6 +187,46 @@ def _undefined(data: bytes) -> dict[str, int]:
     return out
 
 
+def _uleb(data: bytes, at: int) -> tuple[int, int]:
+    value = shift = 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if byte < 0x80:
+            return value, at
+
+
+def _binds(data: bytes) -> dict[str, int]:
+    """What `LC_DYLD_INFO_ONLY`'s bind opcodes bind, each symbol to its
+    library ordinal: the stream dyld itself reads. Only the opcodes the writer
+    emits are understood."""
+    _, _, _, _, offset, size = struct.unpack_from("<6I", dict(_commands(data))[0x80000022], 0)
+    stream = data[offset:offset + size]
+    binds, ordinal, symbol, at = {}, None, None, 0
+    while True:
+        op, at = stream[at], at + 1
+        kind, immediate = op & 0xF0, op & 0x0F
+        if op == 0:
+            return binds
+        if kind == 0x10:
+            ordinal = immediate
+        elif kind == 0x20:
+            ordinal, at = _uleb(stream, at)
+        elif kind == 0x40:
+            end = stream.index(b"\0", at)
+            symbol, at = stream[at:end].decode(), end + 1
+        elif kind == 0x50:
+            assert immediate == 1, "BIND_TYPE_POINTER"
+        elif kind == 0x70:
+            _, at = _uleb(stream, at)
+        elif kind == 0x90:
+            binds[symbol] = ordinal
+        else:
+            raise AssertionError(f"bind opcode {op:#x}")
+
+
 def _openssl_dylibs(directory: Path) -> Path:
     directory.mkdir()
     _dylib(directory / "libssl.3.dylib", "/made/up/ssl/libssl.3.dylib")
@@ -210,6 +250,38 @@ def test_each_library_is_loaded_once_and_bound_by_its_ordinal(tmp_path):
     assert undefined["_write"] == 1
     ordinals = list(undefined.values())
     assert ordinals == sorted(ordinals)
+    # The symbol table and the binds dyld reads agree.
+    assert _binds(data) == undefined
+
+
+def test_a_library_must_be_installed_at_an_absolute_path(tmp_path):
+    found = tmp_path / "dylibs"
+    found.mkdir()
+    _dylib(found / "libssl.3.dylib", "@rpath/libssl.3.dylib")
+    _dylib(found / "libcrypto.3.dylib", "@rpath/libcrypto.3.dylib")
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
+                   str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=str(found)))
+    assert result.returncode == 2
+    assert re.search(r"and '\S+/dylibs/lib(ssl|crypto)\.3\.dylib' is installed as "
+                     r"'@rpath/lib(ssl|crypto)\.3\.dylib', which is not an absolute path",
+                     result.stderr), result.stderr
+
+
+# A file whose header asks for more than the file holds is passed over, as any
+# other malformed one is, rather than read at the size it claims.
+def test_a_malformed_library_is_passed_over(tmp_path):
+    corrupt, good = tmp_path / "corrupt", _openssl_dylibs(tmp_path / "good")
+    corrupt.mkdir()
+    huge = bytearray(_dylib(corrupt / "libssl.3.dylib", "/corrupt/libssl.3.dylib"))
+    struct.pack_into("<I", huge, 20, 0xFFFFFFF0)
+    (corrupt / "libssl.3.dylib").write_bytes(huge)
+    (corrupt / "libcrypto.3.dylib").write_bytes(struct.pack(">2I", 0xCAFEBABE, 0x10000000))
+    executable = tmp_path / "tls"
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+                   str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=f"{corrupt}:{good}"))
+    assert result.returncode == 0, result.stderr[-4000:]
+    assert [name for name, _, _ in _dylibs(executable.read_bytes())][1:] == [
+        "/made/up/crypto/libcrypto.3.dylib", "/made/up/ssl/libssl.3.dylib"]
 
 
 def test_a_library_is_found_in_a_universal_file_past_one_for_intel(tmp_path):
@@ -255,24 +327,34 @@ def test_a_program_that_never_calls_openssl_loads_neither_library(tmp_path):
 
 
 @pytest.fixture
-def missing_library(monkeypatch, tmp_path):
-    """A program calling a function of a library no machine has, declared by
-    a throwaway module in the real `lib/`, which `TURKEY_TEST_FOREIGN` lets
-    declare it."""
+def probe(monkeypatch, tmp_path):
+    """Writes a throwaway module into the real `lib/`, which
+    `TURKEY_TEST_FOREIGN` lets declare foreign functions, and an entry that
+    imports it as `P` and runs `body`. Answers the entry."""
     stem = "Probe_executable_" + secrets.token_hex(4)
     module = REPO_ROOT / "lib" / f"{stem}.gob"
-    module.write_text("export (nothing)\n"
-                      'foreign "turkeynothere" 7 {\n'
-                      '    "turkey_nothing" fun nothing() -> Int\n'
-                      "}\n", encoding="utf-8")
     monkeypatch.setitem(ENV, "TURKEY_TEST_FOREIGN", stem)
-    entry = tmp_path / "missing.gob"
-    entry.write_text(f"import {stem} as P\n\nfun main() {{\n    let _ = P.nothing()\n}}\n",
-                     encoding="utf-8")
+
+    def write(declarations: str, body: str) -> Path:
+        module.write_text(declarations, encoding="utf-8")
+        entry = tmp_path / "probe.gob"
+        entry.write_text(f"import {stem} as P\n\nfun main() {{\n    {body}\n}}\n",
+                         encoding="utf-8")
+        return entry
+
     try:
-        yield entry
+        yield write
     finally:
         module.unlink(missing_ok=True)
+
+
+@pytest.fixture
+def missing_library(probe):
+    """A program calling a function of a library no machine has."""
+    return probe("export (nothing)\n"
+                 'foreign "turkeynothere" 7 {\n'
+                 '    "turkey_nothing" fun nothing() -> Int\n'
+                 "}\n", "let _ = P.nothing()")
 
 
 def test_a_library_not_found_is_an_error_naming_where_it_was_looked_for(tmp_path,
@@ -667,6 +749,22 @@ def test_an_elf_needs_each_library_by_its_soname(tmp_path):
     ssl = [name for name in imports if name.startswith(("SSL_", "TLS_"))]
     assert ssl and imports[-len(ssl):] == ssl == sorted(ssl)
     assert "ERR_get_error" in imports[:-len(ssl)]
+
+
+# A block that names one of the C library's own sonames adds its imports to
+# that library's group, so the library is still needed once.
+def test_a_block_naming_libm_needs_libm_once(tmp_path, probe):
+    entry = probe("export (cbrt)\n"
+                  'foreign "m" 6 {\n'
+                  '    "cbrt" fun cbrt(x : Float) -> Float\n'
+                  "}\n",
+                  "print(Float.toString(P.cbrt(Float.floor(8.5))))")
+    executable = tmp_path / "maths"
+    _write_elf(entry, executable)
+    elf = Elf(executable.read_bytes())
+    assert elf.needed() == ["libc.so.6", "libm.so.6"]
+    imports = [name for name, *_ in elf.symbols(".dynsym")[1:]]
+    assert imports[-2:] == ["cbrt", "floor"]
 
 
 def test_one_module_writes_the_same_elf(tmp_path):

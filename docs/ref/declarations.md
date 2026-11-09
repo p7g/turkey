@@ -738,7 +738,7 @@ type, and the inferred type shows them in the same bracket form.
 
 ```ebnf
 foreign-decl ::= "foreign" foreign-sig body?
-               | "foreign" STRING INT "{" (foreign-sig (separator foreign-sig)*)? "}"
+               | "foreign" STRING INT "{" foreign-sig (separator foreign-sig)* "}"
 foreign-sig ::= STRING "fun" IDENT "(" foreign-params? ")" "->" type
 foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type
@@ -789,8 +789,8 @@ A declaration outside a block calls a function of the C library: libSystem
 on macOS, and glibc's `libc.so.6` or `libm.so.6` on Linux. A function of any
 other shared library is declared inside a block that names the library and
 its major version: the name without its `lib` prefix or file extension, and
-the version as a whole number. The block holds declarations only, written
-without `foreign`, one per line:
+the version as a whole number. The block holds at least one declaration
+and nothing else, each written without `foreign`, one per line:
 
 <!-- error: a 'foreign' function without a body can appear only in -->
 ```kotlin
@@ -810,8 +810,9 @@ A program loads a library only if it calls one of the library's functions, so
 importing a module with such a block costs nothing until a call to one is
 reached. An executable `boot` writes with `-f exe` names the library on
 Linux as `libssl.so.3`, the name and the major. On macOS it names the library
-by the install name of `libssl.3.dylib`, which the build finds in the
-directories of `$TURKEY_DYLIB_PATH`, separated by colons, then in Homebrew's
+by the install name of `libssl.3.dylib`, which must be an absolute path.
+The build reads it from the first such file in the directories of
+`$TURKEY_DYLIB_PATH`, separated by colons, then in Homebrew's
 `/opt/homebrew/lib` and `/usr/local/lib`, then in each Homebrew package's
 `opt/*/lib` under those two. A build for macOS on another machine searches
 `$TURKEY_DYLIB_PATH` alone, and is refused without it.

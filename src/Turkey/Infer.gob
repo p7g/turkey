@@ -529,10 +529,12 @@ fun checkGroupRecursion(group : Vec Stmt, boundNames : Vec String,
 -- a set of mutually recursive definitions is; a declaration with no definition
 -- has nothing to contribute to one.
 fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
+    let reported = Set.new()
     for d in decls {
         if Map.contains(g.decls.foreigns, d.name) {
             Ty.typeError("'" + d.name + "' is declared more than once", Some(d.span))
         }
+        checkLibrary(g, d, reported)
         let params = Array.map(d.params, fun(param) = match param.kind {
             PAnnot(_, te) -> foreignType(g, te, d.name)
             -- The parser builds every one of these, so this cannot
@@ -547,7 +549,7 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
         }
         Map.put(g.decls.foreigns, d.name, ForeignInfo {
             name = d.name, symbol = d.symbol, params = params, fixed = d.fixed,
-            ret = ret, span = Some(d.span),
+            ret = ret, span = Some(d.span), library = d.library,
         })
         let id = boundAt(g, d.id, d.name, d.span)
         Set.add(g.decls.functions, id)
@@ -556,6 +558,57 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
         })
     }
 }
+
+-- Refuses `d` if its block names a library that an earlier block names with
+-- another major version, or if an earlier declaration takes its symbol from
+-- another library, the C library counting as one. Each is reported once, at
+-- `d`'s site, naming the earlier one's.
+--
+-- The earlier declarations are those already in `g.decls.foreigns`: every
+-- module checked before this one, live or not, and the declarations of this
+-- one before `d`, in that order, since the table is insertion-ordered.
+-- `reported` holds the blocks whose version is already reported, so that the
+-- rest of a block's declarations say nothing more.
+fun checkLibrary(g : Generator, d : ForeignDecl, reported : Set.Set String) -> Unit {
+    if let Some(library) = d.library {
+        let here = site(library.span)
+        if !Set.contains(reported, here) {
+            for (_, other) in Map.entries(g.decls.foreigns) {
+                let Some(earlier) = other.library else { continue }
+                if earlier.name == library.name && earlier.major != library.major {
+                    Set.add(reported, here)
+                    Ty.typeError("library '" + library.name + "' is declared here with version "
+                                 + Int.toString(library.major) + ", and with version "
+                                 + Int.toString(earlier.major) + " at " + site(earlier.span)
+                                 + "; a program can load only one version of a library",
+                                 Some(library.span))
+                    break
+                }
+            }
+        }
+    }
+    let from = libraryName(d.library)
+    for (_, other) in Map.entries(g.decls.foreigns) {
+        if other.symbol == d.symbol && libraryName(other.library) != from {
+            let at = match other.span {
+                Some(s) -> " at " + site(s)
+                None -> ""
+            }
+            Ty.typeError("'" + d.symbol + "' is declared here from " + from + ", and from "
+                         + libraryName(other.library) + at
+                         + "; a symbol can come from only one library", Some(d.span))
+            break
+        }
+    }
+}
+
+-- The library a declaration's block names, as a message names it.
+fun libraryName(library : Option ForeignLibrary) -> String = match library {
+    Some(l) -> "library '" + l.name + "'"
+    None -> "the C library"
+}
+
+fun site(s : Span) -> String = s.file + ":" + showSpan(s)
 
 -- Record each `foreign` definition's C signature.
 --
@@ -599,7 +652,7 @@ fun checkDefinitions(g : Generator, items : Vec Stmt) -> Unit {
                 }
                 Map.put(g.decls.definitions, d.name, ForeignInfo {
                     name = d.name, symbol = symbol, params = params,
-                    fixed = len(params), ret = ret, span = Some(d.span),
+                    fixed = len(params), ret = ret, span = Some(d.span), library = None,
                 })
             }
         }

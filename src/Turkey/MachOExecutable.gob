@@ -1,7 +1,8 @@
 export (executableFile)
 
 -- An assembled arm64 module as a Mach-O executable (`MH_EXECUTE`), signed
--- and ready to run, linked against libSystem alone.
+-- and ready to run, linked against libSystem and the libraries its imports
+-- come from.
 --
 -- **Layout.** Five segments, each a whole number of 16KB pages, the arm64
 -- page size: `__PAGEZERO`, the unmapped first 4GB that catches a null
@@ -16,7 +17,7 @@ export (executableFile)
 --
 -- **Every field is filled in here** (`Turkey.Image`), at the addresses this
 -- layout gives. The image has no rebases: the loaded sections hold no
--- absolute address. A call to a libSystem function goes to a stub of three
+-- absolute address. A call to an imported function goes to a stub of three
 -- instructions, `adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16`,
 -- which jumps through that function's slot in the offset table, so that a
 -- call needs one word per import bound and no code patched. The loader
@@ -33,15 +34,19 @@ export (executableFile)
 -- that `nm`, a profiler and a crash report name every function; the
 -- module's exported ones as external, the rest as local. A temporary label
 -- never is: with every field filled in, nothing refers to one by symbol.
--- Each import is an undefined symbol bound to libSystem, the first and only
--- library loaded. The order is locals, then exported, then undefined, the
--- last two by name, as `LC_DYSYMTAB` describes it.
+-- Each import is an undefined symbol bound to the library it comes from, by
+-- that library's ordinal: libSystem is the first library loaded, and the
+-- others follow it by install name, one `LC_LOAD_DYLIB` each, and only if
+-- something is imported from them. The order is locals, then exported, then
+-- undefined, the last two by name, the undefined ones by library first, as
+-- `LC_DYSYMTAB` describes it.
 --
--- **Deterministic.** Nothing in the file depends on the host, the time or
--- the path it is written to: the signature's identifier is the caller's,
--- from the program's own name. `LC_UUID`, which the loader requires, is
--- taken from a SHA-256 of the rest of the file, and the signature is ad hoc,
--- with no timestamp (`Turkey.CodeSignature`). So one module always writes
+-- **Deterministic.** Nothing in the file depends on the time or the path it
+-- is written to, and nothing on the host but the install names `dylibOf`
+-- gives, which the caller reads from the host's libraries: the signature's
+-- identifier is the caller's, from the program's own name. `LC_UUID`, which
+-- the loader requires, is taken from a SHA-256 of the rest of the file, and
+-- the signature is ad hoc, with no timestamp (`Turkey.CodeSignature`). So one module always writes
 -- the same bytes, which is what lets the compiler's fixed point compare
 -- executables.
 
@@ -61,16 +66,16 @@ let page = 0x4000
 let headerSize = 32
 let segmentSize = 72
 let sectionSize = 80
-let commandCount = 14
+-- The load commands besides one `LC_LOAD_DYLIB` per library.
+let fixedCommands = 13
 -- The sections in `__TEXT`: `__text`, `__stubs`, `__cstring`, `__const`.
 let textSections = 4
 -- The segments, `__DATA_CONST` and `__DATA` with a section each; then
 -- `LC_DYLD_INFO_ONLY`, `LC_SYMTAB`, `LC_DYSYMTAB`, `LC_LOAD_DYLINKER`,
--- `LC_UUID`, `LC_BUILD_VERSION`, `LC_MAIN`, `LC_LOAD_DYLIB` and
--- `LC_CODE_SIGNATURE`.
-let commandsSize = segmentSize + segmentSize + textSections * sectionSize
-                   + 2 * (segmentSize + sectionSize) + segmentSize
-                   + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 56 + 16
+-- `LC_UUID`, `LC_BUILD_VERSION`, `LC_MAIN` and `LC_CODE_SIGNATURE`.
+let fixedCommandsSize = segmentSize + segmentSize + textSections * sectionSize
+                        + 2 * (segmentSize + sectionSize) + segmentSize
+                        + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 16
 
 -- The oldest macOS the runtime runs on, `os_sync_wait_on_address`'s, which
 -- is also the SDK recorded.
@@ -92,10 +97,12 @@ let ordinals = [1, 3, 4, 6]
 type Entry = Entry { name : String, kind : Int, section : Int, desc : Int, value : Int }
 
 -- Returns `obj` as a signed executable whose code signature names it
--- `identifier`, with `obj.undefined` all bound to libSystem. `entry` is the
--- symbol the program starts at, which `obj` defines. Fills in `obj`'s
+-- `identifier`, with each of `obj.undefined` bound to the library `dylibOf`
+-- maps its name to, by install name, and every other to libSystem. `entry` is
+-- the symbol the program starts at, which `obj` defines. Fills in `obj`'s
 -- sections in place, so `obj` is spent.
-fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> Array Byte {
+fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
+                   dylibOf : Map String String) -> Array Byte {
     let sections = obj.sections
     -- The assembler puts these first, in this order.
     let text = 0
@@ -103,9 +110,25 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     let constants = 2
     let data = 3
     check(sections)
-    let byName = fun(a : Symbol, b : Symbol) = Array.threeWay(a.name, b.name)
-    let imports = Vec.toArray(Vec.sortBy(obj.undefined, byName))
+    let dylibs = [libSystem]
+    for name in Array.sort(Map.values(dylibOf)) {
+        if name != libSystem && dylibs[len(dylibs) - 1] != name { Vec.push(dylibs, name) }
+    }
+    -- A library's ordinal is its place among the `LC_LOAD_DYLIB`s, from 1.
+    let ordinalOf = Map.new()
+    for var k = 0; k < len(dylibs); k = k + 1 { Map.put(ordinalOf, dylibs[k], k + 1) }
+    let ordinal = fun(sym : Symbol) = match Map.get(dylibOf, sym.name) {
+        Some(name) -> Map.getOr(ordinalOf, name, 1)
+        None -> 1
+    }
+    let byLibrary = fun(a : Symbol, b : Symbol) =
+        Array.threeWay((ordinal(a), a.name), (ordinal(b), b.name))
+    let imports = Vec.toArray(Vec.sortBy(obj.undefined, byLibrary))
+    let ordinals = Array.map(imports, ordinal)
     let n = len(imports)
+    let dylibSizes = Vec.map(dylibs, fun(name) = alignUp(24 + len(String.toBytes(name)) + 1, 8))
+    var commandsSize = fixedCommandsSize
+    for size in dylibSizes { commandsSize = commandsSize + size }
 
     -- `__TEXT`, from the header.
     let textAt = alignUp(headerSize + commandsSize, 1 << sections[text].align)
@@ -121,13 +144,13 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     let dataSegment = pages(len(sections[data].bytes))
     -- `__LINKEDIT`.
     let linkeditAt = dataAt + dataSegment
-    let binds = bindOpcodes(imports)
+    let binds = bindOpcodes(imports, ordinals)
     let addresses = Array.filled(len(sections), -1)
     addresses[text] = base + textAt
     addresses[cstrings] = base + cstringsAt
     addresses[constants] = base + constantsAt
     addresses[data] = base + dataAt
-    let (entries, locals, exported) = symbols(obj, imports, addresses)
+    let (entries, locals, exported) = symbols(obj, imports, ordinals, addresses)
     let strings = []
     Vec.push(strings, Byte.truncate(0))
     let nameAt = Vec.map(entries, fun(e) {
@@ -208,7 +231,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     le(4, 0x0100000C)
     le(4, 0)
     le(4, 2)
-    le(4, commandCount)
+    le(4, fixedCommands + len(dylibs))
     le(4, commandsSize)
     le(4, 0x00200085)
     le(4, 0)
@@ -287,15 +310,19 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
     le(4, 24)
     le(8, start)
     le(8, 0)
-    -- LC_LOAD_DYLIB: libSystem, at version 1.0.0 or later.
-    le(4, 0xC)
-    le(4, 56)
-    le(4, 24)
-    le(4, 2)
-    le(4, 0x10000)
-    le(4, 0x10000)
-    string(out, at, libSystem)
-    at = at + 32
+    -- LC_LOAD_DYLIB: libSystem, at version 1.0.0 or later, and then each
+    -- other library with both versions 0, which dyld does not check.
+    for var k = 0; k < len(dylibs); k = k + 1 {
+        let version = if k == 0 { 0x10000 } else { 0 }
+        le(4, 0xC)
+        le(4, dylibSizes[k])
+        le(4, 24)
+        le(4, 2)
+        le(4, version)
+        le(4, version)
+        string(out, at, dylibs[k])
+        at = at + dylibSizes[k] - 24
+    }
     -- LC_CODE_SIGNATURE
     le(4, 0x1D)
     le(4, 16)
@@ -341,21 +368,33 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String) -> A
 }
 
 -- The bind opcodes that fill in the offset table: one slot per import, in
--- order from its start, each bound to a pointer to the import in the first
--- library. Ends with `BIND_OPCODE_DONE` and padded to eight bytes.
-fun bindOpcodes(imports : Array Symbol) -> Vec Byte {
+-- order from its start, each bound to a pointer to the import in the library
+-- of the same place in `ordinals`. Ends with `BIND_OPCODE_DONE` and padded to
+-- eight bytes.
+fun bindOpcodes(imports : Array Symbol, ordinals : Array Int) -> Vec Byte {
     let out = []
     let op = fun(n) = Vec.push(out, Byte.truncate(n))
-    -- BIND_OPCODE_SET_DYLIB_ORDINAL_IMM 1, BIND_OPCODE_SET_TYPE_IMM
-    -- BIND_TYPE_POINTER, and BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB at the
-    -- table's start.
-    op(0x11)
+    -- BIND_OPCODE_SET_TYPE_IMM BIND_TYPE_POINTER, and
+    -- BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB at the table's start.
     op(0x51)
     op(0x70 | offsetTableSegment)
     op(0)
-    -- BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM with no flags, then
+    -- For each import: its library, when it is not the last one's, by
+    -- BIND_OPCODE_SET_DYLIB_ORDINAL_IMM, or _ULEB past the immediate's four
+    -- bits; BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM with no flags; then
     -- BIND_OPCODE_DO_BIND, which steps to the next slot.
-    for sym in imports {
+    var library = 0
+    for var k = 0; k < len(imports); k = k + 1 {
+        let sym = imports[k]
+        if ordinals[k] != library {
+            library = ordinals[k]
+            if library < 16 {
+                op(0x10 | library)
+            } else {
+                op(0x20)
+                uleb(out, library)
+            }
+        }
         op(0x40)
         for b in String.bytes(sym.name) { Vec.push(out, b) }
         op(0)
@@ -367,10 +406,11 @@ fun bindOpcodes(imports : Array Symbol) -> Vec Byte {
 }
 
 -- The symbol table, and how many of its entries are local and how many
--- exported. `addresses` holds each section's address, or -1 for one the
+-- exported. Each import is from the library of the same place in
+-- `ordinals`. `addresses` holds each section's address, or -1 for one the
 -- image leaves out.
-fun symbols(obj : Object Fixup, imports : Array Symbol, addresses : Array Int)
-    -> (Vec Entry, Int, Int) {
+fun symbols(obj : Object Fixup, imports : Array Symbol, ordinals : Array Int,
+            addresses : Array Int) -> (Vec Entry, Int, Int) {
     let locals = []
     let exported = []
     for d in obj.defined {
@@ -387,12 +427,27 @@ fun symbols(obj : Object Fixup, imports : Array Symbol, addresses : Array Int)
     let entries = []
     for e in locals { Vec.push(entries, e) }
     for e in Vec.sortBy(exported, byName) { Vec.push(entries, e) }
-    -- N_UNDF | N_EXT, from library ordinal 1.
-    for sym in imports {
-        Vec.push(entries, Entry { name = sym.name, kind = 0x1, section = 0, desc = 0x100,
-                                  value = 0 })
+    -- N_UNDF | N_EXT, with the library's ordinal in the description's high
+    -- byte.
+    for var k = 0; k < len(imports); k = k + 1 {
+        Vec.push(entries, Entry { name = imports[k].name, kind = 0x1, section = 0,
+                                  desc = ordinals[k] << 8, value = 0 })
     }
     (entries, len(locals), len(exported))
+}
+
+-- Appends `n`, unsigned, as LEB128.
+fun uleb(out : Vec Byte, n : Int) -> Unit {
+    var rest = n
+    loop {
+        let low = rest & 0x7F
+        rest = rest >> 7
+        if rest == 0 {
+            Vec.push(out, Byte.truncate(low))
+            break
+        }
+        Vec.push(out, Byte.truncate(low | 0x80))
+    }
 }
 
 -- `text`'s bytes at `at`, the zeros after them already there.

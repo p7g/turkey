@@ -320,11 +320,12 @@ type ClassTable = ClassTable {
     -- `Turkey.Infer.generate` for a component of modules to the end of
     -- `Turkey.Infer.solve` for it. See `derive`.
     var open : Bool,
-    -- Solves the wanteds a derivation asks for, over the skolems that stand
-    -- for its type's parameters, and returns what is left of them: the
-    -- solver's own simplifier, which `Turkey.Constraints.newSolver` puts
-    -- here, because this module is below the solver's. See `inferContext`.
-    var simplify : fun(Vec Pred, Vec ConCell) -> Vec Leftover,
+    -- Solves wanteds a derivation asks for under givens, both over the
+    -- skolems that stand for its type's parameters, and returns what is left
+    -- of the wanteds: the solver's own simplifier, which
+    -- `Turkey.Constraints.newSolver` puts here, because this module is below
+    -- the solver's. See `inferContext`.
+    var simplify : fun(Vec Pred, Vec Pred, Vec ConCell) -> Vec Leftover,
     -- The types that can reach themselves through an assignable position,
     -- among those registered when they were last asked for
     -- (`Decls.selfAssigned`).
@@ -345,7 +346,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     checkedUpTo = 0
     assumedListed = None
     open = False
-    simplify = fun(_, _) = bug("a derivation was begun with no solver to simplify it", None)
+    simplify = fun(_, _, _) = bug("a derivation was begun with no solver to simplify it", None)
     selfReach = Decls.newSelfReach()
 }
 
@@ -2126,11 +2127,12 @@ fun declaredHead(info : TyconInfo) -> Option Ty.Type {
 -- context entails its derived `Eq`'s. The type's parameters become skolems,
 -- and the solver simplifies the wanteds under no givens (`t.simplify`), as
 -- it simplifies any implication's, reducing associated types and proving an
--- instance's equalities as it goes. What it leaves is the context, less any
--- implied by another's superclasses, provided each is a class over a
--- parameter. Anything else left, a type with no instance, `f a` over a
--- parameter `f`, an associated type that does not reduce or an equality,
--- leaves no context that could hold, so there is no instance. A parameter
+-- instance's equalities as it goes. The classes over a parameter that it
+-- leaves are the context, less any implied by another's superclasses.
+-- Anything else left must follow from that context. What does not, a type
+-- with no instance, `f a` over a parameter `f`, an associated type that
+-- does not reduce or an equality, leaves no context that could hold, so
+-- there is no instance. A parameter
 -- only a phantom position mentions is in no field's type, so nothing is
 -- ever wanted of it.
 fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
@@ -2202,37 +2204,53 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     -- also admits `Eq (f a)`, which a context here cannot hold. A class over
     -- one parameter is Paterson-smaller than the head, as (VD1) requires,
     -- and there are finitely many, so `settle` reaches its fixed point.
-    let context = []
-    var blamed : Option (Int, Leftover) = None
-    for l in t.simplify(wanted, sk.made) {
+    let good = []
+    let rest = []
+    for l in t.simplify([], wanted, sk.made) {
         let over = match Ty.prune(l.pred.args[0]) {
-            TCon(con) -> Map.get(params, con.uid)
-            _ -> None
+            TCon(con) -> Map.contains(params, con.uid)
+            _ -> False
         }
-        match over {
-            Some(param) -> if !l.diverged && isClass(t, l.pred.name) {
-                Vec.push(context, Ty.pred(l.pred.name, [param]))
-                continue
-            }
-            None -> {}
-        }
-        let at = l.root
-        -- The first field to fail, as a reader goes through them, and the
-        -- first of its wanteds to fail, as the solver went through them.
+        if over && !l.diverged && isClass(t, l.pred.name) { Vec.push(good, l.pred) }
+        else { Vec.push(rest, l) }
+    }
+    let theta = minimal(t, good)
+    -- GHC's [STEP DAC RESIDUAL]: the rest must follow from the context,
+    -- `forall tvs. theta => rest`, as an equality superclass of `Bytes s`
+    -- does. What does not is why there is no instance. One that went too
+    -- deep would only go too deep again.
+    let failed = Vec.filter(rest, _.diverged)
+    let again = []
+    let from = []
+    let seen = Set.new()
+    for l in rest {
+        if l.diverged || Set.contains(seen, Ty.predKey(l.pred)) { continue }
+        Set.add(seen, Ty.predKey(l.pred))
+        Vec.push(again, l.pred)
+        Vec.push(from, l)
+    }
+    if len(again) > 0 {
+        for l in t.simplify(theta, again, sk.made) { Vec.push(failed, from[l.root]) }
+    }
+    -- The first field to fail, as a reader goes through them, and the first
+    -- of its wanteds to fail, as the solver went through them.
+    var blamed : Option Leftover = None
+    for l in failed {
         let earlier = match blamed {
-            Some((before, _)) -> at < before
+            Some(before) -> l.root < before.root
             None -> True
         }
-        if earlier { blamed = Some((at, l)) }
+        if earlier { blamed = Some(l) }
     }
-    if let Some((at, l)) = blamed { return Left(leftoverReason(t, inst, tycon, asked[at], l, params)) }
+    if let Some(l) = blamed { return Left(leftoverReason(t, inst, tycon, asked[l.root], l, params)) }
+    let context = Vec.map(theta, unskolemPred(_, params))
     -- In the order of the parameters, then of the classes, so that a
     -- dictionary's parameters do not depend on the order of the fields.
     let position = Map.new()
     for var i = 0; i < len(args); i = i + 1 {
         if let TVar(cell) = Ty.prune(args[i]) { Map.put(position, cell.id, i) }
     }
-    let ordered = Vec.sortByKey(minimal(t, context), fun(q) {
+    let ordered = Vec.sortByKey(context, fun(q) {
         let at = match Ty.prune(q.args[0]) {
             TVar(cell) -> Map.getOr(position, cell.id, 0)
             _ -> 0

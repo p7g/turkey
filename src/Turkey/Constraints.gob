@@ -130,7 +130,7 @@ export (
 
 import Data.Set as Set
 import Turkey.Classes as Classes
-import Turkey.Classes (ClassTable(..), InstInfo(..), MethodInfo(..))
+import Turkey.Classes (ClassTable(..), InstInfo(..), MethodInfo(..), Leftover(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
@@ -413,6 +413,11 @@ type Implication = Implication {
     -- Whether its givens can never hold, so that nothing solved in it is
     -- reported.
     muted       : Bool,
+    -- Whether a wanted no rule can discharge is reported where a rule finds
+    -- it. In a derivation's implication none is: it stays in the residual
+    -- for the derivation to judge (`simplifyDerived`), as every unsolved
+    -- wanted stays in GHC's, whose solver reports nothing itself.
+    reports     : Bool,
     -- The binder of the declaration it checks, as the tree spells it, for a
     -- diagnostic: `%sig.f` for a signature, `%opened` for a pattern.
     owner       : String,
@@ -434,14 +439,14 @@ fun implication(classes : ClassTable, id : Int, assumptions : Vec (String, Pred)
                 blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
                 untouchable : Int) -> Implication =
     nested(classes, id, assumptions, blocked, checks, inert, untouchable, [], False, None,
-           False, "", None)
+           False, True, "", None)
 
 -- Returns an implication with no wanteds, for a `CAssume` that binds
 -- `skolems` and checks the declaration `owner`.
 fun nested(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
            blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
            untouchable : Int, skolems : Vec ConCell, givenEqs : Bool,
-           made : Option Inert.Inert, muted : Bool, owner : String,
+           made : Option Inert.Inert, muted : Bool, reports : Bool, owner : String,
            parent : Option Implication) -> Implication {
     let matchable = Vec.new(len(assumptions))
     for var i = 0; i < len(assumptions); i = i + 1 {
@@ -456,7 +461,8 @@ fun nested(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
         id = id, assumptions = assumptions, blocked = blocked, checks = checks,
         matchable = matchable, inert = inert,
         untouchable = untouchable, skolems = skolems, givenEqs = givenEqs, made = made,
-        muted = muted, owner = owner, parent = parent, children = Vec.new(0),
+        muted = muted, reports = reports, owner = owner, parent = parent,
+        children = Vec.new(0),
         work = WorkList {
             eqs = Vec.new(4), nextEq = 0, rest = Vec.new(8), nextRest = 0,
             eqsNow = Vec.new(4), restNow = Vec.new(4),
@@ -607,6 +613,9 @@ type Solver = Solver {
     -- Restored on the way out of each `CAssume`, which is what keeps a given
     -- inside its implication.
     var here        : Implication,
+    -- The top level, which has no givens, and around which every other
+    -- implication is nested.
+    root            : Implication,
     -- How many `CAssume`s have been entered, for `Implication.id`.
     var entered     : Int,
     -- Whether `solveSimples` is running, so that a rule which emits a
@@ -681,17 +690,23 @@ type Refusal = Refusal {
     later        : Vec (Ty.Type, Option Span),
 }
 
+-- Returns a solver, and makes it the one `classes` simplifies a
+-- derivation's wanteds with (`ClassTable.simplify`).
 fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
-              visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
-    Solver {
+              visibleCons : fun(Option Span) -> Set.Set String) -> Solver {
+    let top = implication(classes, 0, [], Set.new(), None, Inert.empty(classes), Ty.noScope)
+    let s = Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        here = implication(classes, 0, [], Set.new(), None, Inert.empty(classes), Ty.noScope),
+        here = top, root = top,
         entered = 0, draining = False, current = None, watchers = Map.new(),
         scopes = Vec.new(4), uses = Vec.new(16),
         pools = [Vec.new(8)],
         open = Map.new(), refusals = Map.new(), unchecked = Vec.new(4),
         solving = Set.new(), suppressed = Vec.new(0),
     }
+    classes.simplify = fun(wanteds, skolems) = simplifyDerived(s, wanteds, skolems)
+    s
+}
 
 -- The two operations unification needs from the solver, as the record
 -- `Turkey.Types` asks for. A record of closures rather than an interface, which
@@ -872,7 +887,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
             CLet(cell) -> (cell.skolems, if len(cell.binds) == 0 { "" } else { cell.binds[0].1 })
             _ -> (Vec.new(0), "")
         }
-        assume(s, givens, head, skolems, owner, assumptionSpan(body), False,
+        assume(s, givens, head, skolems, owner, assumptionSpan(body), False, True,
                fun() = solve(s, body))
     }
     CDef(binds, body, top) -> {
@@ -921,10 +936,11 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 -- in it is reported. A set of equalities the checker gives up on is
 -- reported at `where` if no context wrote the one it stopped at
 -- (`refusedHere`). `sealed` makes every variable born outside the
--- implication untouchable inside it, whatever the givens are.
+-- implication untouchable inside it, whatever the givens are, and
+-- `reports` is `Implication.reports`.
 fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option Pred,
            skolems : Vec ConCell, owner : String, where : Option Span, sealed : Bool,
-           inner : fun() -> Unit) -> Unit {
+           reports : Bool, inner : fun() -> Unit) -> Unit {
     let outside = s.here
     let assumptions = Vec.slice(outside.assumptions, 0, len(outside.assumptions))
     let blocked = Set.new()
@@ -977,7 +993,7 @@ fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option P
         None -> outside.checks
     }
     let inside = nested(s.classes, s.entered, assumptions, blocked, checks, inert,
-                        untouchable, skolems, givenEqs, made, inaccessible, owner,
+                        untouchable, skolems, givenEqs, made, inaccessible, reports, owner,
                         Some(outside))
     s.here = inside
     let assumed = newScope()
@@ -1733,7 +1749,7 @@ fun checkAmbiguity(s : Solver, a : Ambiguity) -> Unit {
     Diag.beginMuted()
     -- The variables outside the check are untouchable in it (`sealed`), as
     -- GHC's free variables "are skolemised".
-    assume(s, givens, None, sk.made, "%ambiguity." + a.name, a.span, True, fun() {
+    assume(s, givens, None, sk.made, "%ambiguity." + a.name, a.span, True, True, fun() {
         -- Instantiate the scheme inside the implication, at its own rank,
         -- and unify the instance's type with the skolemised one.
         Vec.push(s.pools, Vec.new(8))
@@ -1763,6 +1779,65 @@ fun checkAmbiguity(s : Solver, a : Ambiguity) -> Unit {
         let (residual, args) = left[0]
         reportAmbiguous(a, names, residual, args)
     }
+}
+
+-- Returns what is left of `wanteds`, a derivation's, once they are solved
+-- over `skolems`, the skolems for its type's parameters, under no givens.
+-- Reports nothing, and leaves the solver as it found it: a derivation may
+-- begin while a rule is being applied (`Classes.selectInstance`), with an
+-- implication of its own being solved.
+--
+-- This is the solve of GHC's `simplifyDeriv` (`GHC.Tc.Deriv.Infer`):
+-- `solveWanteds` in an implication over the skolems, at the top level,
+-- since an instance holds everywhere and no given around the rule that
+-- began the derivation may help it. Its residual is GHC's `approximateWC`
+-- of the solved wanteds, with nothing nested to approximate: no wanted
+-- here is under a given. Every wanted no rule can discharge stays in it,
+-- for the derivation to judge (`Implication.reports`).
+fun simplifyDerived(s : Solver, wanteds : Vec Pred,
+                    skolems : Vec ConCell) -> Vec Leftover {
+    let here = s.here
+    let draining = s.draining
+    let current = s.current
+    s.here = s.root
+    s.draining = False
+    s.current = None
+    let out = Vec.new(2)
+    Diag.beginMuted()
+    assume(s, [], None, skolems, "%derive", None, True, False, fun() {
+        Vec.push(s.pools, Vec.new(0))
+        for con in skolems { con.level = rank(s) }
+        -- Keyed once the skolems are stamped, which changes their keys.
+        let index = Map.new()
+        for var i = 0; i < len(wanteds); i = i + 1 {
+            Map.put(index, Ty.predKey(wanteds[i]), i)
+        }
+        for p in wanteds { solve(s, cpredOf(p, None, "")) }
+        solveWanteds(s)
+        -- In the order they became inert, so that the first to fail is the
+        -- first reported.
+        let left = Vec.sortByKey(everywhere(s.here), _.stuck)
+        for c in left {
+            let insoluble = c.pred.name == Ty.equals
+                            && clashes(s, c.pred.args[0], c.pred.args[1])
+            let root = match Map.get(index, Ty.predKey(c.root)) {
+                Some(i) -> i
+                None -> bug("a derivation's wanted arose from none it asked for", c.span)
+            }
+            Vec.push(out, Leftover {
+                root = root, pred = c.pred, posed = c.posed, insoluble = insoluble,
+                diverged = c.depth > reductionDepth,
+            })
+            take(c)
+        }
+        s.here.children = Vec.new(0)
+        discard(Vec.pop(s.pools))
+    })
+    Diag.endMuted()
+    s.here = here
+    s.draining = draining
+    s.current = current
+    out
 }
 
 -- Returns `sc` as `Ty.showScheme` writes it, with its variables named by
@@ -1915,7 +1990,7 @@ fun exportOf(s : Solver, name : String, id : Int, internal : Scheme, exported : 
     -- The internal binding's coercions, instantiated beside `theta`.
     let equalities = Vec.filter(internal.preds, fun(p) = p.name == Ty.equals)
     let context = "the context of '" + Ty.shortName(name) + "'"
-    assume(s, givens, None, sk.made, name, where, False, fun() {
+    assume(s, givens, None, sk.made, name, where, False, True, fun() {
         let (both, _, fresh) = Ty.instantiateQual(
             Ty.scheme(dropped, internal.body, Vec.append(Vec.slice(theta, 0, len(theta)), equalities)),
             fun() = fresh(s))
@@ -2854,7 +2929,13 @@ fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
 -- answers `False`, so nothing can be quietly dropped. Runs in the predicate's
 -- own implication, under its givens alone.
 fun entail(s : Solver, c : PredCell) -> Bool {
-    if c.depth > reductionDepth { return tooDeep(c) }
+    if c.depth > reductionDepth {
+        -- Left as it is, and marked by its depth (`simplifyDerived`).
+        return match c.at {
+            Some(impl) -> if impl.reports { tooDeep(c) } else { False }
+            None -> tooDeep(c)
+        }
+    }
     let outside = s.here
     let parent = s.current
     s.here = match c.at {
@@ -2927,6 +3008,10 @@ fun equals(s : Solver, c : PredCell) -> Bool {
     let fams = families(s)
     if bindable(left, right, fams) || bindable(right, left, fams) || !(stuck(left, right, fams)
                                                                       || stuck(right, left, fams)) {
+        -- An insoluble equality stays unsolved, GHC's `insolubleEqCt`, for
+        -- the derivation to report (`simplifyDerived`). Its wanteds have
+        -- no unification variable, so `unify` would report only a clash.
+        if !s.here.reports && clashes(s, left, right) { return False }
         Ty.unify(left, right, c.span, c.context, fams)
         return True
     }
@@ -3148,6 +3233,8 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
     if checkFieldVisibility(s, p, t, c) { return True }
     match Classes.selectInstance(s.classes, p) {
         None -> {
+            -- GHC's `NoInstance`: the wanted stays unsolved.
+            if !s.here.reports { return False }
             if Classes.isGenerated(p.name) && noField(s, p, t, c) { return True }
             if c.naked { return missingSuperclass(s, c) }
             match superclassOrigin(s, c, p) {

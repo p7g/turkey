@@ -110,10 +110,17 @@ build/stages/stage2 build -f exe -o rectangles rectangles.gob
 ./rectangles
 ```
 
-It is written for either target from any host, with `--target`, and links
-the C library alone -- libSystem on a Mac, glibc's `libc.so.6` and
-`libm.so.6` on Linux -- so a program that imports `Net.TLS` is refused and
-keeps the object path. It carries no debug or unwind information yet, so it
+It is written for either target from any host, with `--target`. It loads the
+C library -- libSystem on a Mac, glibc's `libc.so.6` and `libm.so.6` on
+Linux -- and the libraries the program calls into: a program that calls
+`Net.TLS` loads OpenSSL 3's `libssl` and `libcrypto`. On Linux they are
+`libssl.so.3` and `libcrypto.so.3`, and nothing is read to write them. On a
+Mac, `boot` reads each library's install name from `libssl.3.dylib` (and so
+on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
+then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
+`opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
+that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
+naming a directory that holds a copy of the library. It carries no debug or unwind information yet, so it
 takes no `-g`, and a file name without an extension will not choose it until
 the executable has what lldb and a profiler read. `check` compiles as far as
 the last stage that can reject a program and writes nothing. Either takes `--dump STAGE,...` to

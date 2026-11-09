@@ -308,7 +308,7 @@ fun parseProgram(p : P) -> Program {
         } else if at(p, "instance") {
             Vec.push(decls, DInstance(parseInstanceDecl(p)))
         } else if at(p, "foreign") {
-            Vec.push(decls, parseForeignDecl(p))
+            parseForeign(p, decls)
         } else if at(p, "fun") {
             let s2 = cur(p).span
             Vec.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
@@ -942,9 +942,45 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
     }
 }
 
--- `foreign "symbol" fun name(params) -> ret`, with or without a body.
--- Without a body C defines the symbol; with one Turkey defines it and C may
--- call it. A definition is an ordinary function carrying an exported symbol.
+-- A `foreign` declaration, appended to `decls`, or a block of them, each
+-- appended in order: `foreign "name" major { "symbol" fun name(params) -> ret
+-- ... }`. Every declaration in a block carries the block's library, and a
+-- block holds declarations only, since a definition is not imported from
+-- anywhere.
+fun parseForeign(p : P, decls : Vec Decl) -> Unit {
+    let s = expect(p, "foreign").span
+    if Token.kindName(peek(p, 1).kind) != "INT" {
+        Vec.push(decls, parseForeignDecl(p, s, None))
+        return {}
+    }
+    let tok = expectWhat(p, "STRING", "the library's name as a string")
+    let name = text(tok)
+    if name == "" {
+        oops(p, "the library's name is empty; write it between the quotes, as in "
+                + "'foreign \"ssl\" 3'", tok.span)
+    }
+    let major = intOf(advance(p))
+    let library = Some(ForeignLibrary { name = name, major = major, span = close(p, s) })
+    skipToken(p, "{")
+    skipNewlines(p)
+    -- An empty block would be no declaration at all, so neither the gate on
+    -- where declarations may appear nor the check of the library's version
+    -- would ever see it.
+    if at(p, "}") {
+        oops(p, "the block for library '" + name + "' declares nothing; declare a function "
+                + "in it, or remove it", cur(p).span)
+    }
+    while !at(p, "}") {
+        Vec.push(decls, parseForeignDecl(p, cur(p).span, library))
+        endOfStatement(p)
+    }
+    skipToken(p, "}")
+}
+
+-- `"symbol" fun name(params) -> ret`, with or without a body, after the
+-- `foreign` at `s` or inside a block of `library`. Without a body C defines
+-- the symbol; with one Turkey defines it and C may call it. A definition is
+-- an ordinary function carrying an exported symbol.
 --
 -- The C symbol is always written, even when it is the Turkey name spelled the
 -- same way, so which of the two names is which is never something a reader has
@@ -953,8 +989,7 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
 -- There is no context, and a body only for a definition. A return type is
 -- required either way: a C function that returns nothing writes `-> Unit`, because "the signature is stated in
 -- full" is the only property that makes the declaration worth trusting.
-fun parseForeignDecl(p : P) -> Decl {
-    let s = expect(p, "foreign").span
+fun parseForeignDecl(p : P, s : Span, library : Option ForeignLibrary) -> Decl {
     let tok = cur(p)
     if Token.kindName(tok.kind) != "STRING" {
         oops(p, "expected the C symbol as a string, found " + describe(tok),
@@ -976,6 +1011,10 @@ fun parseForeignDecl(p : P) -> Decl {
     }
     let ret = parseTypeExpr(p)
     if at(p, "{") || at(p, "=") {
+        if Option.isSome(library) {
+            oops(p, "foreign '" + name + "' is inside a library's block, so it cannot have "
+                    + "a body; move it out of the block", cur(p).span)
+        }
         if let Some((_, marker)) = variadic {
             oops(p, "foreign '" + name + "' has a body, so it cannot be "
                     + "variadic; remove the '...'", marker)
@@ -1007,8 +1046,8 @@ fun parseForeignDecl(p : P) -> Decl {
         None -> len(params)
     }
     DForeign(ForeignDecl {
-        id = freshId(p), span = close(p, s), name = name, symbol = symbol, params = params, fixed = fixed,
-        ret = ret,
+        id = freshId(p), span = close(p, s), name = name, symbol = symbol, params = params,
+        fixed = fixed, ret = ret, library = library,
     })
 }
 

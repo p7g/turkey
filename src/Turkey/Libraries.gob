@@ -1,0 +1,181 @@
+export (soname, leaf, searchPath, searched, find)
+
+-- The shared libraries beyond the C library that an executable loads, by the
+-- names the loaders look them up by: a soname on ELF and an install name on
+-- Mach-O, each from a library's name and major version, as a `foreign` block
+-- writes them.
+--
+-- **ELF reads nothing.** The soname is `lib<name>.so.<major>`, which is what
+-- the library's own `DT_SONAME` holds by the convention every distribution
+-- follows. The file a system linker would read it from, the unversioned
+-- `lib<name>.so`, is in the development package, which a machine that only
+-- runs the program does not have. So writing for Linux needs nothing from the
+-- host, and every host writes the same bytes.
+--
+-- **Mach-O reads the library.** dyld loads a library from the path the
+-- executable names, and that path differs from machine to machine: Homebrew
+-- installs under `/opt/homebrew` on arm64 and `/usr/local` on Intel, and a
+-- keg-only formula such as `openssl@3` only under its own `opt/` directory.
+-- So the file `lib<name>.<major>.dylib` is searched for, and the executable
+-- names it by the file's own install name (`LC_ID_DYLIB`). dyld loads exactly
+-- the path an executable names, and the install name is the path the library
+-- is installed to be loaded from, which survives a search directory that only
+-- links to it. Only an absolute one does: the executable has no `LC_RPATH`
+-- for an `@rpath/` name to be resolved against. The major is in that leaf
+-- name and nowhere else: dyld checks neither the
+-- compatibility version of a library built for macOS 10.14 or later, which
+-- every arm64 one is, nor that an install name matches the path it was
+-- loaded by.
+
+import System.File as File
+import System.IO as IO
+import Turkey.Ast (ForeignLibrary(..))
+
+-- `lib<name>.so.<major>`, the name ELF's loader looks the library up by.
+fun soname(l : ForeignLibrary) -> String = "lib" + l.name + ".so." + Int.toString(l.major)
+
+-- `lib<name>.<major>.dylib`, the file searched for on Mach-O.
+fun leaf(l : ForeignLibrary) -> String = "lib" + l.name + "." + Int.toString(l.major) + ".dylib"
+
+-- Homebrew's prefixes, the arm64 one first.
+let prefixes = ["/opt/homebrew", "/usr/local"]
+
+-- Returns the directories searched for a Mach-O library, in order: `given`,
+-- then, when `native`, each of Homebrew's prefixes' `lib`, then the `lib` of
+-- each keg under each prefix's `opt`, by the keg's name. A program written
+-- for another machine is searched for in `given` alone, since this machine's
+-- libraries say nothing about where that one's are.
+fun searchPath(given : Array String, native : Bool) -> Vec String {
+    let out = []
+    for d in given { Vec.push(out, d) }
+    if !native { return out }
+    for prefix in prefixes { Vec.push(out, prefix + "/lib") }
+    for prefix in prefixes {
+        if let Right(kegs) = File.listPath(prefix + "/opt") {
+            for keg in kegs { Vec.push(out, prefix + "/opt/" + keg + "/lib") }
+        }
+    }
+    out
+}
+
+-- `searchPath(given, native)` as a message lists it, with the kegs as one
+-- pattern per prefix.
+fun searched(given : Array String, native : Bool) -> String {
+    let places = []
+    for d in given { Vec.push(places, d) }
+    if native {
+        for prefix in prefixes { Vec.push(places, prefix + "/lib") }
+        for prefix in prefixes { Vec.push(places, prefix + "/opt/*/lib") }
+    }
+    String.join(Array.map(places, fun(d) = "'" + d + "'"), ", ")
+}
+
+-- Returns the first file named `name` in `directories` that is an arm64
+-- dylib, and the install name it holds; or the files of that name that are
+-- not one, which were passed over: an Intel Homebrew's under `/usr/local` on
+-- an arm64 Mac, say, or a file too short or malformed to read.
+fun find(name : String, directories : Vec String) -> Either (Vec String) (String, String) {
+    let passed = []
+    for d in directories {
+        let path = d + "/" + name
+        if let Left(_) = File.metadata(path) { continue }
+        match installName(path) {
+            Some(found) -> return Right((path, found))
+            None -> Vec.push(passed, path)
+        }
+    }
+    Left(passed)
+}
+
+let fatMagic = 0xCAFEBABE
+let fatMagic64 = 0xCAFEBABF
+let magic64 = 0xFEEDFACF
+let cpuArm64 = 0x0100000C
+let mhDylib = 6
+let lcIdDylib = 0xD
+let headerSize = 32
+
+-- The install name of the arm64 dylib at `path`, a thin file or a slice of a
+-- universal one, or `None` if it is neither.
+fun installName(path : String) -> Option String {
+    let head = window(path, 0, 8)?
+    if len(head) < 8 { return None }
+    let fat = Byte.getBE(head, 0, 4)
+    if fat != fatMagic && fat != fatMagic64 { return thinInstallName(path, 0) }
+    -- `fat_arch` is five 32-bit words, `fat_arch_64` four words around two
+    -- 64-bit ones; each starts with the CPU type, and the offset follows the
+    -- subtype. All are big-endian.
+    let wide = fat == fatMagic64
+    let entry = if wide { 32 } else { 20 }
+    let count = Byte.getBE(head, 4, 4)
+    let arches = window(path, 8, entry * count)?
+    if len(arches) < entry * count { return None }
+    for var k = 0; k < count; k = k + 1 {
+        let at = entry * k
+        if Byte.getBE(arches, at, 4) == cpuArm64 {
+            let offset = Byte.getBE(arches, at + 8, if wide { 8 } else { 4 })
+            return thinInstallName(path, offset)
+        }
+    }
+    None
+}
+
+-- The install name of the thin arm64 dylib at `offset` in `path`'s file.
+fun thinInstallName(path : String, offset : Int) -> Option String {
+    let header = window(path, offset, headerSize)?
+    if len(header) < headerSize || Byte.getLE(header, 0, 4) != magic64
+            || Byte.getLE(header, 4, 4) != cpuArm64 || Byte.getLE(header, 12, 4) != mhDylib {
+        return None
+    }
+    let count = Byte.getLE(header, 16, 4)
+    let size = Byte.getLE(header, 20, 4)
+    let commands = window(path, offset + headerSize, size)?
+    if len(commands) < size { return None }
+    var at = 0
+    for var k = 0; k < count; k = k + 1 {
+        if at + 8 > size { return None }
+        let command = Byte.getLE(commands, at, 4)
+        let length = Byte.getLE(commands, at + 4, 4)
+        if length < 8 || at + length > size { return None }
+        if command == lcIdDylib {
+            -- `dylib_command`: the name's offset in the command, then the
+            -- timestamp and the two versions, then the NUL-terminated name.
+            if length < 24 { return None }
+            let nameAt = Byte.getLE(commands, at + 8, 4)
+            if nameAt < 24 || nameAt >= length { return None }
+            let start = at + nameAt
+            let bytes = []
+            for var j = start; j < at + length && Byte.toInt(commands[j]) != 0; j = j + 1 {
+                Vec.push(bytes, commands[j])
+            }
+            return String.fromBytes(bytes)
+        }
+        at = at + length
+    }
+    None
+}
+
+-- Up to `n` bytes of `path`'s file from `offset`: fewer only at its end, and
+-- `None` if it cannot be read.
+fun window(path : String, offset : Int, n : Int) -> Option (Array Byte) {
+    -- Never more than the file holds: `n` is read from the file, and a
+    -- corrupt one can ask for gigabytes.
+    let size = match File.metadata(path) {
+        Right(stat) -> max(0, min(n, stat.size - offset))
+        Left(_) -> return None
+    }
+    let read = File.use(File.openRead(path), fun(f) {
+        let into = IO.buffer(size)
+        var total = 0
+        while total < size {
+            let got = File.readAt(f, offset + total, into)?
+            if got == 0 { break }
+            total = total + got
+        }
+        Right(IO.bytes(into))
+    })
+    match read {
+        Right(bytes) -> Some(bytes)
+        Left(_) -> None
+    }
+}

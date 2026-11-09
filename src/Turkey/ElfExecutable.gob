@@ -34,13 +34,16 @@ export (executableFile)
 -- writable.
 --
 -- The imports are grouped by the shared library that defines them, one
--- `DT_NEEDED` each, libc first. The references are unversioned: there is no
--- `.gnu.version`, `.gnu.version_r` or `.gnu.version_d`. An unversioned
--- reference binds to the library's oldest version of the name, which for
--- every import is either its only version or one that behaves as the newest
--- does. A glibc that lacks one of the imports fails at startup with
--- `undefined symbol`, not with a missing version. The oldest glibc that has
--- them all is 2.34, the first with `pthread_create` in libc.
+-- `DT_NEEDED` each: libc first, then libm, then the others by soname. A
+-- library is needed only when an import comes from it. The references are
+-- unversioned: there is no `.gnu.version`, `.gnu.version_r` or
+-- `.gnu.version_d`. An unversioned reference binds to the library's oldest
+-- version of the name, which for every C library import is either its only
+-- version or one that behaves as the newest does, and to a library that
+-- gives each name one version, as OpenSSL does, at that version. A library
+-- that lacks one of the imports fails at startup with `undefined symbol`, not
+-- with a missing version. The oldest glibc that has them all is 2.34, the
+-- first with `pthread_create` in libc.
 --
 -- The executable exports nothing, so the dynamic symbol table holds only
 -- the imports, and its `DT_GNU_HASH` table is empty: one bucket, holding no
@@ -205,9 +208,10 @@ type Section = Section {
 }
 
 -- Returns `obj` as an executable that starts at `entry`, a function `obj`
--- defines, with `obj.undefined` imported from libc and libm. Fills in
+-- defines, with each of `obj.undefined` imported from the library `needed`
+-- maps its name to, by soname, and every other from libc or libm. Fills in
 -- `obj`'s sections in place, so `obj` is spent.
-fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
+fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String String) -> Array Byte {
     let sections = obj.sections
     -- The assembler puts these first, in this order.
     let text = 0
@@ -215,7 +219,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     let constants = 2
     let data = 3
     check(sections)
-    let libraries = librariesOf(obj.undefined)
+    let libraries = librariesOf(obj.undefined, needed)
     let imports = []
     for l in libraries { for sym in l.symbols { Vec.push(imports, sym) } }
     let n = len(imports)
@@ -498,27 +502,47 @@ fun executableFile(obj : Object Fixup, entry : Symbol) -> Array Byte {
     out
 }
 
--- Returns the imports grouped by the library that defines them, libc first
--- and holding `__libc_start_main` as well, each group sorted by name. libm
--- is in the list only if something is imported from it.
-fun librariesOf(undefined : Vec Symbol) -> Array Library {
+-- Returns the imports grouped by the library that defines them, one group
+-- per soname, each sorted by name: libc first, holding `__libc_start_main` as
+-- well, then libm, then those `needed` names, by soname. Every library but
+-- libc is in the list only if something is imported from it.
+fun librariesOf(undefined : Vec Symbol, needed : Map String String) -> Array Library {
     let fromLibc = []
     let fromLibm = []
+    let others = Map.new()
     var started = False
     for sym in undefined {
         if sym.name == startMain { started = True }
-        Vec.push(if Array.contains(mathNames, sym.name) { fromLibm } else { fromLibc }, sym)
+        let group = match Map.get(needed, sym.name) {
+            None -> if Array.contains(mathNames, sym.name) { fromLibm } else { fromLibc }
+            Some(soname) -> if soname == libc { fromLibc }
+                            else if soname == libm { fromLibm }
+                            else { groupOf(others, soname) }
+        }
+        Vec.push(group, sym)
     }
     if !started { Vec.push(fromLibc, Asm.symbolFor(Asm.Elf, startMain)) }
     let byName = fun(a : Symbol, b : Symbol) = Array.threeWay(a.name, b.name)
-    let libraries = [Library { soname = libc,
-                               symbols = Vec.toArray(Vec.sortBy(fromLibc, byName)) }]
-    if len(fromLibm) > 0 {
-        Vec.push(libraries, Library { soname = libm,
-                                      symbols = Vec.toArray(Vec.sortBy(fromLibm, byName)) })
+    let sorted = fun(soname, symbols) =
+        Library { soname = soname, symbols = Vec.toArray(Vec.sortBy(symbols, byName)) }
+    let libraries = [sorted(libc, fromLibc)]
+    if len(fromLibm) > 0 { Vec.push(libraries, sorted(libm, fromLibm)) }
+    for soname in Array.sort(Map.keys(others)) {
+        Vec.push(libraries, sorted(soname, Map.getOr(others, soname, [])))
     }
     Vec.toArray(libraries)
 }
+
+-- Returns the group `groups` holds for `soname`, made empty if it has none.
+fun groupOf(groups : Map String (Vec Symbol), soname : String) -> Vec Symbol =
+    match Map.get(groups, soname) {
+        Some(group) -> group
+        None -> {
+            let group = []
+            Map.put(groups, soname, group)
+            group
+        }
+    }
 
 -- Returns the address of a segment that starts at file offset `offset` and
 -- follows one ending at address `end`: the first address past `end`'s page

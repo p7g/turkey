@@ -78,6 +78,14 @@ def openssl_libraries() -> list[str]:
     return [*found, "-lssl", "-lcrypto"]
 
 
+def openssl_dylib_path() -> str | None:
+    """The `$TURKEY_DYLIB_PATH` for an executable `boot` writes itself, for a
+    program that imports `Net.TLS`: the `lib/` of the same installation the
+    tests link with, or None for the places `boot` searches by default."""
+    prefix = _openssl_prefix()
+    return str(prefix / "lib") if prefix else None
+
+
 def openssl_includes() -> list[str]:
     """The flags a C file that includes OpenSSL's headers compiles with."""
     prefix = _openssl_prefix()

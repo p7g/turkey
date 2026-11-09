@@ -88,7 +88,8 @@ import Turkey.Opt as Opt
 import Turkey.Build as Build
 import Turkey.Target as Target
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
-                   FunDecl(..), ClassDecl(..), patternVars)
+                   FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
+import Turkey.Libraries as Libraries
 
 -- Where the language's own library lives: `TURKEY_LIB` if it is set, and
 -- otherwise `lib` relative to the working directory. A compiled binary has no
@@ -490,11 +491,12 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             match format {
                 Executable -> {
                     let dialect = Asm.dialectFor(target)
-                    refuseLibraries(checked.decls, obj.undefined, dialect, path)
+                    let imported = importedLibraries(checked.decls, obj.undefined, dialect)
                     let main = Asm.runtimeFor(dialect, "main")
                     sendBytes(to, match dialect {
-                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name)
-                        Asm.Elf -> ElfExecutable.executableFile(obj, main)
+                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
+                                                                    installNames(imported, path))
+                        Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
                     })
                     let _ = lap("executable", started)
                 }
@@ -1279,33 +1281,91 @@ fun sendBytes(to : Destination, array : Array Byte) -> Unit {
     }
 }
 
--- Refuses, naming the first of them, a program whose `imports` include a
--- symbol from a library besides the C library: an executable `boot` writes
--- links libSystem alone on Darwin, and libc and libm alone on Linux.
--- `dialect` is the one the imports are named in.
-fun refuseLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol, dialect : Asm.Dialect,
-                    path : String) -> Unit {
+-- Returns the library each of `imports` comes from, with its C symbol, by
+-- the import's name, for each one declared inside a library's block. Every
+-- other import comes from the C library. `dialect` is the one the imports are
+-- named in.
+fun importedLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol,
+                      dialect : Asm.Dialect) -> Map String (String, ForeignLibrary) {
     let declared = Map.new()
     for (_, info) in Map.entries(decls.foreigns) {
         Map.put(declared, Asm.symbolFor(dialect, info.symbol).name, info)
     }
-    let linked = match dialect {
-        Asm.MachO -> "libSystem"
-        Asm.Elf -> "libc and libm"
-    }
+    let out = Map.new()
     for sym in imports {
         let info = match Map.get(declared, sym.name) {
             Some(info) -> info
             None -> die("internal error: '" + sym.name + "' is called and never declared")
         }
-        let owner = Option.unwrapOr(Prelude.moduleOf(info.name), info.name)
-        if let Some(library) = Modules.foreignLibrary(owner) {
-            die("cannot write '" + path + "' as an executable: it calls '" + info.symbol
-                + "' from " + library + ", and an executable boot writes can link "
-                + "only " + linked + "; write an object with -f obj and link it with a C "
-                + "compiler")
-        }
+        if let Some(library) = info.library { Map.put(out, sym.name, (info.symbol, library)) }
     }
+    out
+}
+
+-- Returns the soname of each import's library, by the import's name.
+fun sonames(imported : Map String (String, ForeignLibrary)) -> Map String String {
+    let out = Map.new()
+    for (name, (_, library)) in Map.entries(imported) {
+        Map.put(out, name, Libraries.soname(library))
+    }
+    out
+}
+
+-- The directories searched for a Mach-O library before any other, separated
+-- by colons.
+let dylibPath = "TURKEY_DYLIB_PATH"
+
+-- Returns the install name of each import's library, by the import's name,
+-- read from the library's file where `Libraries.searchPath` finds it. Dies
+-- naming the file and the places searched if it is not found, and if the
+-- program is for another machine and `$TURKEY_DYLIB_PATH` names no directory.
+fun installNames(imported : Map String (String, ForeignLibrary), path : String)
+        -> Map String String {
+    let out = Map.new()
+    let given = Array.filter(Vec.toArray(String.split(Option.unwrapOr(Env.get(dylibPath), ""),
+                                                      ":")),
+                             fun(d) = d != "")
+    let native = target.spelling == Target.host().spelling
+    let directories = Libraries.searchPath(given, native)
+    let found = Map.new()
+    for (name, (symbol, library)) in Map.entries(imported) {
+        let leaf = Libraries.leaf(library)
+        let calls = "it calls '" + symbol + "' from library '" + library.name + "' "
+                    + Int.toString(library.major)
+        if !native && len(given) == 0 {
+            die("cannot write '" + path + "' for " + target.spelling + " on this machine: "
+                + calls + ", whose install name is read from '" + leaf + "' itself; set "
+                + dylibPath + " to a directory holding a copy of it")
+        }
+        let installName = match Map.get(found, leaf) {
+            Some(known) -> known
+            None -> match Libraries.find(leaf, directories) {
+                Right((file, known)) -> {
+                    if !String.startsWith(known, "/") {
+                        die("cannot write '" + path + "' as an executable: " + calls + ", and '"
+                            + file + "' is installed as '" + known + "', which is not an "
+                            + "absolute path; an executable boot writes can load a library "
+                            + "only by an absolute install name")
+                    }
+                    Map.put(found, leaf, known)
+                    known
+                }
+                Left(passed) -> {
+                    let others = if len(passed) == 0 { "" } else {
+                        " (" + String.join(Vec.map(passed, fun(p) = "'" + p + "'"), ", ")
+                        + (if len(passed) == 1 { " is not an arm64 library" }
+                           else { " are not arm64 libraries" }) + ")"
+                    }
+                    die("cannot write '" + path + "' as an executable: " + calls
+                        + ", and no '" + leaf + "' is in " + Libraries.searched(given, native)
+                        + others + "; install it, or set " + dylibPath
+                        + " to the directory that holds it")
+                }
+            }
+        }
+        Map.put(out, name, installName)
+    }
+    out
 }
 
 -- The machine IR, with what selection could not translate.

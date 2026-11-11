@@ -93,8 +93,8 @@ fun main() {
     print(IO.bytes(IO.bytesOf("ab")))
 }
 """)
-    assert out == ["(8, 0, 8)", "(6, 2, 6)", "(104, 33)", "Some(llo!)",
-                   str(sum(b"llo!")), "(0, 8)", "Some(text)", "[97, 98]"]
+    assert out == ["(8, 0, 8)", "(6, 2, 6)", "(104, 33)", 'Some("llo!")',
+                   str(sum(b"llo!")), "(0, 8)", 'Some("text")', "[97, 98]"]
 
 
 def test_fromBytes_refuses_bytes_that_are_not_utf8():
@@ -107,7 +107,7 @@ fun main() {
     print(String.fromBytes(b))
 }
 """)
-    assert out == ["None", "Some(é)"]
+    assert out == ["None", 'Some("é")']
 
 
 def test_lines_across_refills_and_a_carriage_return():
@@ -119,8 +119,8 @@ fun main() {
     for line in IO.lines(b) { print(line) }
 }
 """)
-    assert out == ["Right(one)", "Right(two)", "Right()", "Right(the-twenty-byte-line)",
-                   "Right(last)"]
+    assert out == ['Right("one")', 'Right("two")', 'Right("")', 'Right("the-twenty-byte-line")',
+                   'Right("last")']
 
 
 def test_readLine_reports_invalid_utf8_and_a_failed_source():
@@ -138,8 +138,8 @@ fun main() {
     print(IO.readLine(one))
 }
 """)
-    assert out == ["Right(Some(ok))", "Left(Left(InvalidUTF8))", "Left(Right(broken))",
-                   "Right(Some(a))", "Right(None)"]
+    assert out == ['Right(Some("ok"))', "Left(Left(InvalidUTF8))", 'Left(Right("broken"))',
+                   'Right(Some("a"))', "Right(None)"]
 
 
 def test_lines_stops_after_its_first_error():
@@ -153,7 +153,7 @@ fun main() {
     print(n)
 }
 """)
-    assert out == ["Left(Right(broken))", "1"]
+    assert out == ['Left(Right("broken"))', "1"]
 
 
 def test_readLineInto_appends_each_line_to_the_callers_buffer():
@@ -210,7 +210,7 @@ fun main() {
     print(source.at)
 }
 """)
-    assert out == ["Right(2)", "Right(2)", "Some(23)", "Right(10)", "Some(456789abcd)", "14"]
+    assert out == ["Right(2)", "Right(2)", 'Some("23")', "Right(10)", 'Some("456789abcd")', "14"]
 
 
 def test_a_buffered_write_holds_small_writes_and_passes_large_ones():
@@ -236,8 +236,8 @@ fun main() {
        + """
 fun check(r : Either String Unit) { print(Either.isRight(r)) }
 """)
-    assert out == ["True", "True", "(, 0)", "True", "(abcdefgh, 1)", "True",
-                   "(abcdefghijklm, 2)", "True", "(abcdefghijklm0123456789, 3)"]
+    assert out == ["True", "True", '("", 0)', "True", '("abcdefgh", 1)', "True",
+                   '("abcdefghijklm", 2)', "True", '("abcdefghijklm0123456789", 3)']
 
 
 def test_readExact_takes_no_more_than_asked():
@@ -260,8 +260,8 @@ fun check(r : Either (IO.ExactError String) Unit) = match r {
     Left(e) -> print(e)
 }
 """)
-    assert out == ["Right", "Some(head)", "Right", "Some(body)", "Left(EndedEarly)",
-                   "Right(broken)"]
+    assert out == ["Right", 'Some("head")', "Right", 'Some("body")', "Left(EndedEarly)",
+                   'Right("broken")']
 
 
 def test_readAll_copy_and_writeText():
@@ -287,7 +287,7 @@ fun main() {
     }
 }
 """)
-    assert out == ["(500000, True)", "(6, copied, 2)", "broken", "Reading(broken)"]
+    assert out == ["(500000, True)", '(6, "copied", 2)', "broken", "Reading(broken)"]
 
 
 def test_any_read_and_any_write_choose_at_run_time():
@@ -306,7 +306,7 @@ fun main() {
     print(s.got)
 }
 """)
-    assert out == ["Right(x)", "Right(y)", "Left(Right(lifted broken))", "via any"]
+    assert out == ['Right("x")', 'Right("y")', 'Left(Right("lifted broken"))', "via any"]
 
 
 def test_reading_into_a_full_buffer_is_a_bug():

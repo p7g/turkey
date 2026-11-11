@@ -24,7 +24,7 @@ import Time.Instant as Instant
 
 fun report(r : Either IO.IOError a) -> String = match r {
     Right(_) -> "ok"
-    Left(e) -> show(e.kind) + ": " + message(e)
+    Left(e) -> debug(e.kind) + ": " + message(e)
 }
 
 fun must(r : Either IO.IOError a) -> a = match r {
@@ -34,7 +34,7 @@ fun must(r : Either IO.IOError a) -> a = match r {
 
 fun names(r : Either IO.IOError (Array String)) -> String = match r {
     Right(xs) -> String.join(xs, " ")
-    Left(e) -> show(e.kind) + ": " + message(e)
+    Left(e) -> debug(e.kind) + ": " + message(e)
 }
 """
 
@@ -53,13 +53,13 @@ def test_a_stat_is_a_value(tmp_path):
     os.mkfifo(tmp_path / "fifo")
     out = lines("""
 fun describe(r : Either IO.IOError File.Stat) -> String = match r {
-    Right(s) -> show(s.kind) + " " + show(s.size) + " " + show(s.permissions) + " "
+    Right(s) -> debug(s.kind) + " " + show(s.size) + " " + show(s.permissions) + " "
                 + show(Instant.unixNanos(s.modified))
-    Left(e) -> show(e.kind) + ": " + message(e)
+    Left(e) -> debug(e.kind) + ": " + message(e)
 }
 
 fun kindOf(r : Either IO.IOError File.Stat) -> String = match r {
-    Right(s) -> show(s.kind)
+    Right(s) -> debug(s.kind)
     Left(e) -> message(e)
 }
 
@@ -100,7 +100,7 @@ def test_a_stat_compares_by_kind():
 fun main() {
     print(File.Regular == File.Regular)
     print(File.Regular == File.Directory)
-    print(File.BlockDevice)
+    print(debug(File.BlockDevice))
 }
 """).stdout.split("\n")[:-1]
     assert out == ["True", "False", "BlockDevice"]
@@ -302,7 +302,7 @@ fun main() {
         "ok",
         "ok",
         "made sub",
-        "Some(text)",
+        'Some("text")',
         "ok",
         "4",
         "ok",
@@ -563,7 +563,7 @@ def test_readLink_answers_the_target_as_written(tmp_path):
     out = lines("""
 fun target(r : Either IO.IOError String) -> String = match r {
     Right(t) -> t
-    Left(e) -> show(e.kind) + ": " + message(e)
+    Left(e) -> debug(e.kind) + ": " + message(e)
 }
 
 fun main() {

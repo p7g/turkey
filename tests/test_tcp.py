@@ -142,7 +142,7 @@ fun dial(address : Net.IP, port : Int) -> Either IO.IOError TCP.Socket {
 -- What is left of an error to compare: its operation and kind.
 fun brief(r : Either IO.IOError a) -> String = match r {
     Right(_) -> "Right"
-    Left(e) -> e.op + " " + show(e.kind)
+    Left(e) -> e.op + " " + debug(e.kind)
 }
 """
 
@@ -168,7 +168,7 @@ fun exchange(address : Net.IP) -> String {
         let server = Task.spawn(fun() = match TCP.accept(l) {
             Right(s) -> {
                 let peer = TCP.peerAddress(s)
-                talk(s, "from the server, " + show(Either.map(peer, fun(p) = p.0)))
+                talk(s, "from the server, " + show(Either.map(peer, fun(p) = show(p.0))))
             }
             Left(e) -> Left(e)
         })?
@@ -195,7 +195,7 @@ fun exchange(address : Net.IP) -> String {
 fun main() {
     print(exchange(loopback))
     let six = exchange(Net.V6(0, 1, 0))
-    print(six == "no ::1" || six == "from the client ...::1 / from the server, Right(::1)")
+    print(six == "no ::1" || six == "from the client ...::1 / from the server, Right(\\"::1\\")")
 }
 """
 
@@ -204,7 +204,7 @@ fun main() {
 def test_a_loopback_exchange_both_ways_ends_at_the_half_close(tmp_path, workers):
     binary = _build(tmp_path, EXCHANGE)
     assert _run(binary, workers).splitlines() == [
-        "from the client ...127.0.0.1 / from the server, Right(127.0.0.1)",
+        'from the client ...127.0.0.1 / from the server, Right("127.0.0.1")',
         "True",
     ]
 
@@ -267,7 +267,7 @@ fun main() {
             Right(s) -> Vec.push(held, s)
             Left(e) -> {
                 let took = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-                outcome = e.op + " " + show(e.kind) + " " + show(took >= 300 && took < 5000)
+                outcome = e.op + " " + debug(e.kind) + " " + show(took >= 300 && took < 5000)
                 break
             }
         }
@@ -378,7 +378,7 @@ fun main() {
             while got < 6 {
                 match IO.readInto(s, IO.buffer(16)) {
                     Right(n) -> { got = got + n }
-                    Left(e) -> return show(e.kind) + " after " + Int.toString(got)
+                    Left(e) -> return debug(e.kind) + " after " + Int.toString(got)
                 }
             }
             -- Nothing more comes, so the next read waits its 200 ms.
@@ -418,8 +418,8 @@ import Time.Duration as Duration
 
 fun check(policy : Net.ConnectPolicy, host : String) -> String =
     match Net.resolve(host, 443, policy, Duration.seconds(5)) {
-        Right(d) -> "allowed " + show(Net.addresses(d))
-        Left(e) -> show(e.kind)
+        Right(d) -> "allowed [" + String.join(Array.map(Net.addresses(d), show), ", ") + "]"
+        Left(e) -> debug(e.kind)
     }
 
 fun main() {
@@ -510,7 +510,7 @@ let fixed : Resolve.Resolver = Resolve.Resolver {
 
 fun check(policy : Net.ConnectPolicy, host : String) -> String =
     match ConnectPolicy.resolve(fixed, host, 80, policy, -1) {
-        Right(d) -> "allowed " + d.host + " " + show(d.addresses)
+        Right(d) -> "allowed " + d.host + " [" + String.join(Array.map(d.addresses, show), ", ") + "]"
         Left(e) -> show(e)
     }
 

@@ -28,9 +28,9 @@ fun main() {
     print(say(Zone.named("America/New_York")))
     print(say(Zone.named("Nowhere/Zone")))
     print(say(Zone.named("Bad/Zone")))
-    print(DateTime.parse("2026-07-04T12:00:00-04:00[America/New_York]"))
-    print(DateTime.parse("2026-07-04T12:00:00-05:00[America/New_York]"))
-    print(DateTime.parse("2026-07-04T12:00:00-04:00[Nowhere/Zone]"))
+    print(Option.map(DateTime.parse("2026-07-04T12:00:00-04:00[America/New_York]"), show))
+    print(Option.map(DateTime.parse("2026-07-04T12:00:00-05:00[America/New_York]"), show))
+    print(Option.map(DateTime.parse("2026-07-04T12:00:00-04:00[Nowhere/Zone]"), show))
 }
 """
 
@@ -74,7 +74,7 @@ def test_named_zones_come_from_tzdir(tmp_path):
         "America/New_York",
         "no time zone named 'Nowhere/Zone'",
         f"{zones}/Bad/Zone is not a valid time zone file",
-        "Some(2026-07-04T12:00:00-04:00[America/New_York])",
+        'Some("2026-07-04T12:00:00-04:00[America/New_York]")',
         "None",
         "None",
     ]

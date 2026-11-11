@@ -414,15 +414,15 @@ def test_a_stack_switch_in_a_callee_is_refused_with_the_path_to_it(lowered):
 # lowers to an allocation its source does not spell. Recursive, so each stays a call; the line is where the
 # construct the diagnostic should point at is written.
 HIDDEN = (
-    "type Hidden = Hidden[Show a](a)\n"                                   # 3
+    "type Hidden = Hidden[Debug a](a)\n"                                  # 3
     "fun poly(x : a, k : Int) -> Int =\n"                                 # 4
     "    if k == 0 { 0 } else { poly((x, x), k - 1) }\n"                  # 5
-    "fun showAll[Show a](x : a, k : Int) -> Int =\n"                      # 6
-    "    if k == 0 { String.byteLength(show(x)) }\n"                      # 7
+    "fun showAll[Debug a](x : a, k : Int) -> Int =\n"                     # 6
+    "    if k == 0 { String.byteLength(debug(x)) }\n"                     # 7
     "    else { showAll((x, x), k - 1) }\n"                               # 8
     "fun nests(n : Int) -> Int = if n == 0 { poly(n, 3) } else { nests(n - 1) }\n"   # 9
     "fun packs(n : Int) -> Int = if n == 0 {\n"                           # 10
-    "    match [Hidden(n)][0] { Hidden(x) -> String.byteLength(show(x)) }\n"  # 11
+    "    match [Hidden(n)][0] { Hidden(x) -> String.byteLength(debug(x)) }\n"  # 11
     "} else { packs(n - 1) }\n"                                           # 12
     "fun dicts(n : Int) -> Int = if n == 0 { showAll(n, 3) } else { dicts(n - 1) }\n"  # 13
 )
@@ -438,7 +438,7 @@ HIDDEN = (
     ("packs", "packs an existential, Hidden", 11),
     # A class-polymorphic function on an expanding cycle: the dictionary its
     # generic body builds for the pair it passes on, reached through the call.
-    # The pair's `show` is inlined into the dictionary, so the environment of
+    # The pair's `debug` is inlined into the dictionary, so the environment of
     # its closure is the first object built, and is named only as an object.
     ("dicts", "builds an object -- a constructor, tuple, record or dictionary", 8),
 ])

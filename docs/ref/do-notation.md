@@ -127,7 +127,7 @@ fun main() {
 
 ```text
 Right(10)
-Left(division by zero)
+Left("division by zero")
 ```
 
 ### Errors from different sources: `SomeError`

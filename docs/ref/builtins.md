@@ -17,8 +17,8 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object` |
-| Functions | `print`, `write`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
+| Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
 With the Prelude, a module also imports the library modules `Data.Array`,
@@ -202,8 +202,8 @@ fun main() {
 ```
 
 ```text
-Some(b)
-[a]
+Some("b")
+["a"]
 ```
 
 Nothing has to say that `stack` is a `Vec`: `Vec.push` takes one, so the
@@ -322,15 +322,155 @@ True
 
 ```text
 class Show a { fun show(a) -> String }
+class Debug a { fun debug(a) -> String }
 
 fun print[Show a](x : a) -> Unit
 fun write[Show a](x : a) -> Unit
+fun dbg[Debug a](x : a) -> a
 ```
 
-`show` converts a value to text. `print` writes `show(x)` and a line break to
-standard output; `write` does the same without the line break. `show` of a
-`String` is the string itself, without quotes. A type gets a `Show` instance
-only if someone writes one; there is no automatic derivation.
+Two classes turn a value into text. `Show` is text for the program's user,
+and `Debug` is text for its programmer.
+
+`show` converts a value to display text. `print` writes `show(x)` and a line
+break to standard output; `write` does the same without the line break.
+`show` of a `String` is the string itself, without quotes. A type gets a
+`Show` instance only if someone writes one; `Show` is never derived.
+
+`debug` converts a value to text that shows its structure, written as Turkey
+would build it. Every type whose fields have `Debug` has it: the compiler
+derives an instance for each type declaration with none written, and the
+library writes those for the built-in types. A type whose fields do not all
+have one, such as `type T f = T(f Int)`, has none, as [Derived
+instances](classes.md#derived-instances) says under "When there is no
+implicit instance".
+`dbg(x)` writes `debug(x)` and a line break to standard error, after what
+standard output holds, and returns `x`, so it can wrap any expression.
+
+* A constructor prints as it is written, `Some(1)` or `Pair(1, 2)`, and a
+  record with its field names, `Point { x = 1, y = 2 }`.
+* A string prints in double quotes, a character in single quotes, with `"`
+  or `'`, `\` and every control character escaped as a literal would write
+  them.
+* A `Float` prints with the shortest digits that read back as the same
+  number. A `Byte` has no literal, so it prints as the integer it holds.
+* An array or a `Vec` prints as an array literal, a `Map` as
+  `{key: value, ...}` and a `Set` as `{element, ...}`, in the order the
+  entries were first added.
+* What has no syntax prints as a placeholder: a function as `<fun>`, and a
+  field whose type mentions a type an [existential
+  constructor](types.md#existential-types) hides as `<hidden>`, unless its
+  `Debug` follows from the classes the constructor carries.
+
+A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
+`Vec`, `Map`, `Set`, `Option`, `Either` and the tuples is their `Debug`, so a
+string inside one is quoted and two lists of strings cannot print alike:
+
+<!-- run -->
+```kotlin
+type Point = Point { x : Int, y : Int }
+
+type Shape = Circle(Point, Float) | Dot
+
+fun main() {
+    print("say \"hi\"")
+    print(debug("say \"hi\""))
+    print(["a,b", "c"])
+    print(["a", "b,c"])
+    print(Some('x'))
+    print(debug([Circle(Point { x = 1, y = 2 }, 0.5), Dot]))
+    print(dbg(2 + 3) * 2)
+}
+```
+
+```text
+say "hi"
+"say \"hi\""
+["a,b", "c"]
+["a", "b,c"]
+Some('x')
+[Circle(Point { x = 1, y = 2 }, 0.5), Dot]
+10
+```
+
+The last line also writes `5` to standard error.
+
+**Cycles.** Only an object, an array or a record with a `var` field, can
+come to contain itself, through an assignment. `debug` keeps the objects it
+is in the middle of printing, and an object met again inside itself prints
+as `<cycle>`. An object reached twice by different routes, and not inside
+itself, prints twice:
+
+<!-- run -->
+```kotlin
+type Node = Node { value : Int, var next : Option Node }
+
+fun main() {
+    let a = Node { value = 1, next = None }
+    let b = Node { value = 2, next = Some(a) }
+    a.next = Some(b)
+    print(debug(a))
+    let shared = [1]
+    print(debug([shared, shared]))
+}
+```
+
+```text
+Node { value = 1, next = Some(Node { value = 2, next = Some(<cycle>) }) }
+[[1], [1]]
+```
+
+**Hiding a type's fields.** `!Debug` in a type's [derive
+list](classes.md#derived-instances) keeps its instance and makes it print as
+`<Name>` without reading a field: for a secret, or for state that may be read
+only under a protocol, as a lock's contents may:
+
+<!-- run -->
+```kotlin
+type Password : !Debug = Password(String)
+
+fun main() {
+    print(Some(Password("hunter2")))
+}
+```
+
+```text
+Some(<Password>)
+```
+
+**Writing one by hand.** A `Debug` instance written by hand replaces the
+derived one. What it prints is checked for cycles at each object it reaches
+through an instance:
+
+* an instance for a type whose every value is an object, such as a record
+  with a `var` field or a wrapper over an array, is checked as a derived one
+  is, with nothing written for it;
+* an instance for a value type is not checked itself. A cycle through it
+  ends only if it passes through an object some checked instance prints. One
+  that reads an array's elements itself and calls `debug` on each, rather
+  than calling `debug` on the array, can run until the stack overflows.
+
+A cycle through a checked instance prints `<cycle>` where it comes back to
+the object:
+
+<!-- run -->
+```kotlin
+type Stack = Stack { var items : Array Stack, name : String }
+
+instance Debug Stack {
+    fun debug(s) = s.name + " holding " + debug(s.items)
+}
+
+fun main() {
+    let s = Stack { items = [], name = "s" }
+    s.items = [s]
+    print(debug(s))
+}
+```
+
+```text
+s holding [<cycle>]
+```
 
 ### When standard output is written
 
@@ -464,7 +604,7 @@ fun main() {
 True
 False
 2
-Some(pear)
+Some("pear")
 ```
 
 ## `Index`
@@ -583,7 +723,7 @@ fun main() {
 ```
 
 ```text
-Some(10)
+Some("10")
 [Some(2), None]
 Some(Some(4))
 ```

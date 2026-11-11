@@ -764,6 +764,7 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
     if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
     let bound = contextParams(l, inst, plan)
     if inst.cls == P.typedClass { return typeRepDict(l, inst, result, bound) }
+    if Classes.isFunctionDebug(inst) { return functionDebugDict(l, inst, result) }
     let givens = instanceGivens(l, inst, plan)
     let record = withDicts(l, bound, fun() = dictionary(l, inst.cls, result,
                                                       Some(inst.decl.span), fun(slot) =
@@ -787,7 +788,9 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
             } else {
                 match Map.get(plan.methods, name) {
                     Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
-                                  else { methodBody(l, inst, name, impl) }
+                                  else if guardsCycles(l, inst) {
+                                      guardedDebug(l, inst, methodBody(l, inst, name, impl))
+                                  } else { methodBody(l, inst, name, impl) }
                     None -> oops("no body for the method '" + name + "'",
                                  Some(inst.decl.span))
                 }
@@ -904,6 +907,47 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
     b
 }
 
+-- Returns whether `inst` is a `Debug` instance written by hand for a type
+-- every value of which is an object (`Classes.alwaysObject`), whose `debug`
+-- the lowering puts through the cycle guard (`guardedDebug`).
+fun guardsCycles(l : Lowerer, inst : InstInfo) -> Bool {
+    if inst.cls != P.debugClass || inst.derived { return False }
+    match Ty.spine(inst.head).0 {
+        TCon(c) -> Classes.alwaysObject(l.classes, c.name)
+        _ -> False
+    }
+}
+
+-- `debug`, the hand-written method `body`, put through the object guard
+-- (`Turkey.DebugText.debugObject`) as a derived `debug` is, so that a cycle
+-- through a hand-written instance prints `<cycle>` with nothing the
+-- instance has to do. It is done here, not left to the instance, because
+-- an instance that did not do it would run until the stack overflowed.
+fun guardedDebug(l : Lowerer, inst : InstInfo, body : Core) -> Core {
+    let span = Some(inst.decl.span)
+    let head = inst.head
+    let x = freshParam(l, "x", head)
+    let thunk = TFun([], Ty.tString())
+    let called = node(Ty.tString(), span, CApp(body, [paramVar(x, span)]))
+    let guarded = wellKnownCall(P.debugObject, [head, Ty.tString(), thunk], [head],
+        [paramVar(x, span), text(instName(inst), span),
+         node(thunk, span, CLam([], called, "<anonymous>"))], span)
+    node(TFun([head], Ty.tString()), span, CLam([x], guarded, instName(inst) + "#debug"))
+}
+
+-- The dictionary of the `Debug` instance for functions of one arity
+-- (`Classes.deriveFunctionDebug`): `debug` is `<fun>` whatever the function.
+fun functionDebugDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
+    let span = Some(inst.decl.span)
+    let f = freshParam(l, "f", inst.head)
+    let body = node(TFun([inst.head], Ty.tString()), span,
+                    CLam([f], text("<fun>", span), instName(inst) + "#debug"))
+    let record = dictionary(l, inst.cls, result, span, fun(_) = body)
+    newBind(inst.module_, instName(inst), noId, record.ty, instanceBinders(inst), record, span)
+}
+
+fun text(s : String, span : Option Span) -> Core = node(Ty.tString(), span, CLit(LString(s)))
+
 -- -- derived methods ----------------------------------------------------------------
 
 -- What writing one derived method needs: the instance, its plan, the types
@@ -949,8 +993,113 @@ fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan
               else if inst.cls == P.ordClass { derivedLt(l, d, mi) }
               else if inst.cls == P.hashClass { derivedHash(l, d, mi) }
               else if inst.cls == P.objectClass { derivedIdentical(l, d, mi) }
+              else if inst.cls == P.debugClass { derivedDebug(l, d, mi) }
               else { oops("no derived method for '" + inst.cls + "'", span) }
     methodAbstraction(mi, lam, span)
+}
+
+-- `debug(x)`: the constructor as a program would build it, with each
+-- field's own `debug`, by `Turkey.DebugText`'s `debugConstructor` and
+-- `debugRecord`. A constructor with a `var` field builds an object, whose
+-- text goes through `debugObject`, which prints `<cycle>` for an object
+-- already being printed. A type that says `!Debug` prints as `<Name>`,
+-- reading nothing.
+fun derivedDebug(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    let tycon = derivedTycon(d)
+    let refused = match Map.get(l.decls.tycons, tycon) {
+        Some(info) -> Iterator.any(info.derives, fun(e) = e.refused && e.cls == P.debugClass)
+        None -> False
+    }
+    let body = if refused { text("<" + Ty.shortName(tycon) + ">", d.span) } else {
+        let alts = Vec.new(len(d.cons))
+        for (c, types) in d.cons { Vec.push(alts, debugArm(l, d, c, types, x)) }
+        node(Ty.tString(), d.span, CMatch(paramVar(x, d.span), alts))
+    }
+    node(TFun([head], Ty.tString()), d.span, CLam([x], body, name))
+}
+
+-- The arm of a derived `debug` for the constructor `c`, whose fields have
+-- `types` at the instance's head, and which matched `x`.
+--
+-- An existential constructor's arm opens it, as a pattern in a program
+-- would, binding a dictionary for each class it carries. A field whose type
+-- is a hidden type the constructor carries `Debug` for prints with it, and
+-- any other field whose type mentions a hidden type prints as `<hidden>`.
+fun debugArm(l : Lowerer, d : DerivedSite, c : ConInfo, types : Array Ty.Type,
+             x : CParam) -> CAlt {
+    let span = d.span
+    -- The constants and dictionary names the solver checked the hidden
+    -- fields with (`Turkey.Infer.carriedFields`), so that its evidence for
+    -- them is about this arm's types. An arm with none to print opens the
+    -- constructor over constants of its own.
+    let carried = match Map.get(l.classes.carried, Classes.carriedKey(d.inst, c.name)) {
+        Some(found) -> found
+        None -> {
+            let sk = Classes.newSkolems()
+            for var i = 0; i < len(c.exists) && i < len(c.existsNames); i = i + 1 {
+                discard(Classes.skolemBind(sk, c.exists[i], c.existsNames[i]))
+            }
+            let preds = Array.map(c.scheme.preds, Classes.skolemApplyPred(sk, _))
+            Classes.Carried { skolems = sk.made, mapping = sk.mapping,
+                              givens = Array.map(preds, fun(p) = ("%carried", p)) }
+        }
+    }
+    let opened = Array.map(types, Decls.substitute(_, carried.mapping))
+    let dicts = Array.map(carried.givens, fun((name, _)) = (name, mint(l, name)))
+    let givens = Map.new()
+    for (name, ty) in Map.entries(d.givens) { Map.put(givens, name, ty) }
+    for (name, p) in carried.givens { Map.put(givens, name, dictType(l, p.name, p.args[0])) }
+    let xs = fieldBinders(l, opened)
+    let parts = Array.init(len(types), fun(i) {
+        let field = bound(l, xs[i], opened[i], span)
+        if !Classes.hides(c, types[i]) {
+            return fieldCall(l, d, P.debugClass, "debug", types[i], [field])
+        }
+        match Map.get(d.plan.fieldDicts, Classes.fieldKey(c.name, i)) {
+            Some(ev) -> {
+                let dict = withDicts(l, dicts, fun() = underInstance(l, d.inst, d.plan, fun() =
+                    evidence(l, ev, dictType(l, P.debugClass, opened[i]), givens)))
+                methodCall(l, dict, P.debugClass, "debug", opened[i], [field], span)
+            }
+            None -> text("<hidden>", span)
+        }
+    })
+    let shown = text(Ty.shortName(c.name), span)
+    let strings = Ty.rawArrayOf(Ty.tString())
+    let made = if len(types) == 0 { shown } else {
+        let partsArray = node(strings, span, CArray(parts))
+        match c.fields {
+            Some(labels) -> wellKnownCall(P.debugRecord, [Ty.tString(), strings, strings], [],
+                [shown, node(strings, span, CArray(Array.map(labels, text(_, span)))), partsArray],
+                span)
+            None -> wellKnownCall(P.debugConstructor, [Ty.tString(), strings], [],
+                                  [shown, partsArray], span)
+        }
+    }
+    let body = if !Decls.hasMutable(c) { made } else {
+        let thunk = TFun([], Ty.tString())
+        wellKnownCall(P.debugObject, [x.ty, Ty.tString(), thunk], [x.ty],
+                      [paramVar(x, span), text(instName(d.inst), span),
+                       node(thunk, span, CLam([], made, "<anonymous>"))], span)
+    }
+    let opening = if len(c.exists) == 0 { None } else {
+        Some(Opened { evidence = dicts, skolems = carried.skolems, layouts = None })
+    }
+    CAlt { alt = ACon(c.name, Array.map(xs, Some), opening), body = body }
+}
+
+-- A call of the library function `name`, whose parameters have `params`
+-- and which returns a `String`, at the type arguments `tyArgs`.
+fun wellKnownCall(name : String, params : Array Ty.Type, tyArgs : Array Ty.Type,
+                  args : Array Core, span : Option Span) -> Core {
+    let fnTy = TFun(params, Ty.tString())
+    let fn = if len(tyArgs) == 0 { node(fnTy, span, CVar(BySpelling(name))) } else {
+        node(fnTy, span, CTyApp(node(unknown(), span, CVar(BySpelling(name))), tyArgs))
+    }
+    node(Ty.tString(), span, CApp(fn, args))
 }
 
 -- `identical(x, y)`: the two words compared. A type with an `Object`

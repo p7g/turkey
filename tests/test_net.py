@@ -122,10 +122,13 @@ let never : Resolve.Resolver = Resolve.Resolver {
     freeaddrinfo = fun(_) = {},
 }
 
+-- Each address found, as its text.
+fun shown(found) = Either.map(found, fun(ips) = Array.map(ips, show))
+
 fun main() {
-    print(Resolve.lookup(never, "192.0.2.1", -1))
-    print(Resolve.lookup(never, "2001:db8::1", -1))
-    print(Resolve.lookup(never, "fe80::1%3", -1))
+    print(shown(Resolve.lookup(never, "192.0.2.1", -1)))
+    print(shown(Resolve.lookup(never, "2001:db8::1", -1)))
+    print(shown(Resolve.lookup(never, "fe80::1%3", -1)))
     -- `localhost` comes from the hosts file, which has the IPv4 loopback
     -- address on every system the suite runs on; whether it lists `::1` too
     -- differs.
@@ -135,7 +138,11 @@ fun main() {
             Left(e) -> print(e)
         }
     }
-    print(Net.lookup("bad\\u{0}name", Duration.seconds(30)))
+    -- The message, which names the failure, rather than the error's fields.
+    match Net.lookup("bad\\u{0}name", Duration.seconds(30)) {
+        Left(e) -> print("Left(" + message(e) + ")")
+        other -> print(shown(other))
+    }
 }
 """
 
@@ -145,9 +152,9 @@ def test_literals_and_localhost_resolve_offline(tmp_path, workers):
     binary = _build(tmp_path, OFFLINE)
     out, _ = _run(binary, workers)
     assert out.split("\n")[:-1] == [
-        "Right([192.0.2.1])",
-        "Right([2001:db8::1])",
-        "Right([fe80::1%3])",
+        'Right(["192.0.2.1"])',
+        'Right(["2001:db8::1"])',
+        'Right(["fe80::1%3"])',
         "True",
         "True",
         "Left(lookup bad\0name: invalid argument)",
@@ -207,7 +214,11 @@ fun main() {
     from(fun() {
         let start = Wait.now()
         let found = Resolve.lookup(slow, "localhost", start + 200000000)
-        say(show(found) + " after " + show((Wait.now() - start) / 1000000) + " ms")
+        let shown = match found {
+            Left(e) -> "Left(" + message(e) + ")"
+            Right(_) -> "Right"
+        }
+        say(shown + " after " + show((Wait.now() - start) / 1000000) + " ms")
     })
     -- Until the helper has freed the list, which it does once the test has
     -- let its call return.

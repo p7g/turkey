@@ -771,6 +771,7 @@ The compiler supplies an instance of `Object` for each type whose values are
 objects, and a program may not declare one. Those types are:
 
 * `Array a`, whose elements can be assigned;
+* `System.Sync.AtomicInt`, an atomic cell, which every copy of it shares;
 * a record with a `var` field;
 * a type with one constructor and one field, not `var`, whose type has
   `Object`. Such a value is its field, so `Vec a`, `Map k v` and

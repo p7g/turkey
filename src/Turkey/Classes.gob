@@ -2368,20 +2368,41 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
     Right(Vec.toArray(out))
 }
 
--- Returns whether `tycon`'s values are not objects whatever its fields'
--- types are (`objectParts`). A wrapper's may be, so it is not.
-fun isValue(t : ClassTable, tycon : String) -> Bool {
+-- Returns whether no value of `tycon` is an object, whatever its type
+-- arguments: `objectParts` rules it out, or it wraps a type that is not an
+-- object. A wrapper over a parameter may be one, so it is not.
+fun isValue(t : ClassTable, tycon : String) -> Bool = valueType(t, tycon, False, wrapperDepth)
+
+-- How many wrappers `valueType` looks through. Wrappers may wrap each other
+-- in a cycle, which has no value at all, so the answer past this many is
+-- the safe one: perhaps an object.
+let wrapperDepth = 16
+
+-- `isValue` of `tycon`, which is a wrapper's field type when `inner` is
+-- set: then its own `!Object` makes it a value too.
+fun valueType(t : ClassTable, tycon : String, inner : Bool, depth : Int) -> Bool {
+    if depth == 0 || tycon == "Prim.Array" || tycon == "Prim.Atomic" { return False }
+    if inner && refuses(t, tycon, P.objectClass) { return True }
     let info = match Map.get(t.decls.tycons, tycon) {
         Some(i) -> i
         None -> return False
     }
+    -- A built-in type with no constructor to read, such as `Int`.
     let head = match declaredHead(info) {
         Some(h) -> h
-        None -> return False
+        None -> return True
     }
     match objectParts(t.decls, info, head) {
         Left(_) -> True
-        Right(_) -> False
+        Right(parts) -> {
+            if len(parts) == 0 { return False }
+            let (_, _, field) = parts[0]
+            match Ty.spine(Ty.prune(field)).0 {
+                TCon(c) -> c.uid == 0 && valueType(t, c.name, True, depth - 1)
+                TTuple(_) | TFun(_, _) -> True
+                _ -> False
+            }
+        }
     }
 }
 

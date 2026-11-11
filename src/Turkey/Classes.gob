@@ -2098,12 +2098,14 @@ fun withdraw(t : ClassTable, inst : InstInfo) -> Unit {
 }
 
 -- Returns the head of the derived instance of `cls` for `info`: the type
--- `info` declares, at its parameters (`declaredHead`). `Prim.Array` declares
--- no constructor to read them from, and of the derived classes only
--- `Object` has an instance for it.
+-- `info` declares, at its parameters (`declaredHead`). `Prim.Array` and
+-- `Prim.Atomic` declare no constructor to read them from, and of the derived
+-- classes only `Object` has an instance for them.
 fun derivedHead(cls : String, info : TyconInfo) -> Option Ty.Type =
     if info.name == "Prim.Array" {
         if cls == P.objectClass { Some(Ty.rawArrayOf(TVar(Ty.newVar(1, KStar)))) } else { None }
+    } else if info.name == "Prim.Atomic" {
+        if cls == P.objectClass { Some(Ty.tAtomic()) } else { None }
     } else {
         declaredHead(info)
     }
@@ -2232,6 +2234,23 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
     Right(Vec.toArray(out))
 }
 
+-- Returns whether `tycon`'s values are not objects whatever its fields'
+-- types are (`objectParts`). A wrapper's may be, so it is not.
+fun isValue(t : ClassTable, tycon : String) -> Bool {
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return False
+    }
+    let head = match declaredHead(info) {
+        Some(h) -> h
+        None -> return False
+    }
+    match objectParts(t.decls, info, head) {
+        Left(_) -> True
+        Right(_) -> False
+    }
+}
+
 -- Returns the fields that must be objects for the values of `info` at
 -- `head` to be objects, or `Left` of why they are values whatever the
 -- fields' types are.
@@ -2239,11 +2258,15 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
 -- A value of a type `Object` covers must keep its identity wherever the
 -- program moves it, which leaves three kinds of type:
 --
--- * `Prim.Array`, whose elements can be assigned;
+-- * `Prim.Array`, whose elements can be assigned, and `Prim.Atomic`, a cell
+--   that `Prim.atomicNew` allocates and nothing copies;
 -- * a type whose every constructor is an object, with a 'var' field
 --   (`Decls.hasIdentity`), or is nullary, and one of them at least is an
 --   object. A nullary constructor is one value however the type is held,
---   so it keeps its identity too;
+--   so it keeps its identity too. The language allows `var` only in a type
+--   with one constructor, so no type mixes the two kinds; the rule is
+--   stated for every constructor because identity is a property of a
+--   build, and it stays right for a type that did;
 -- * a wrapper, whose value is its field's (`Decls.newtypes`), when the
 --   field's type is one of these. That field is the one returned.
 --
@@ -2252,7 +2275,7 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
 -- covered, and nor is a type of nullary constructors alone.
 fun objectParts(d : DeclTable, info : TyconInfo,
                 head : Ty.Type) -> Either String (Array (ConInfo, Int, Ty.Type)) {
-    if info.name == "Prim.Array" { return Right([]) }
+    if info.name == "Prim.Array" || info.name == "Prim.Atomic" { return Right([]) }
     if Decls.isWrapper(info) {
         let c = info.variants[0]
         return match Decls.conFieldTypes(d, head, c.name) {
@@ -2261,16 +2284,19 @@ fun objectParts(d : DeclTable, info : TyconInfo,
         }
     }
     var objects = 0
+    var values = 0
     for c in info.variants {
         if Decls.hasMutable(c) {
             objects = objects + 1
-        } else if c.arity > 0 && len(info.variants) > 1 {
-            return Left("constructor '" + Ty.shortName(c.name) + "' has fields and no 'var' field")
+        } else if c.arity > 0 {
+            values = values + 1
         }
     }
-    if objects > 0 { Right([]) }
-    else if len(info.variants) == 1 { Left("it has no 'var' field") }
-    else { Left("none of its constructors has a 'var' field") }
+    if objects > 0 && values == 0 { return Right([]) }
+    -- Only a type with one constructor may have a 'var' field, so a
+    -- diagnostic for a type with several does not suggest one.
+    if len(info.variants) == 1 { Left("it has no 'var' field") }
+    else { Left("it has more than one constructor") }
 }
 
 -- What stopped a wanted from reducing to classes over parameters.
@@ -2573,6 +2599,10 @@ fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
         if !refusable(entry.cls) {
             report(cls + " is derived only when a type asks for it, so " + refusal
                    + " has no effect; remove it", at)
+            return False
+        }
+        if entry.cls == P.objectClass && isValue(t, d.name) {
+            report(ty + " is not an object, so " + refusal + " has no effect; remove it", at)
             return False
         }
         return True

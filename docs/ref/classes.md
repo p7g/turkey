@@ -240,8 +240,10 @@ type declaration gets `Eq` and `Hash` without asking, where its fields have
 them, and a *derive list* after the parameters asks for more or refuses
 some. It follows a `:`, the same `:` that gives an instance its
 requirements: `type Card : Ord = ...` says that `Card` has `Ord`. The
-compiler writes each instance from the declaration's constructors, and it
-can write instances of three classes:
+compiler writes each instance from the declaration's constructors. It can
+write instances of three classes that a list may ask for, and it writes one
+more, `Object`, for every type whose values are objects, without being asked
+([`Object` and `identical`](builtins.md#object-and-identical)):
 
 * **`Eq`.** Two values are equal when they were built by the same
   constructor and each field of one equals the same field of the other, by
@@ -507,9 +509,9 @@ by hand instead:
 type Counted : Eq = Counted(Key (Array Bool))
 ```
 
-**Opting out.** `!Eq` or `!Hash` in the list says that the type has none:
-no instance may be written for it, and a type that holds one cannot derive
-the class. A type whose fields would compare without meaning to opt out this
+**Opting out.** `!Eq`, `!Hash` or `!Object` in the list says that the type
+has none: no instance may be written for it, and a type that holds one cannot
+derive the class. A type whose fields would compare without meaning to opt out this
 way: a view of part of a buffer, whose contents are the buffer's, or a
 handle whose identity, not its contents, tells it apart. Refusing `Eq` refuses
 `Hash` too, which needs it. Comparing such a value says why it cannot be

@@ -763,10 +763,11 @@ fun main() {
 ```
 
 Immutable values can never be changed, so a program cannot tell whether they
-are copied or shared. A mutable value is one object however many references
-hold it, and `identical` asks whether two references hold the same one
-([`Object` and `identical`](builtins.md#object-and-identical)). The same holds for a field that is not `var`: reading
-it through any reference gives the value the record was built with.
+are copied or shared. The same holds for a field that is not `var`: reading
+it through any reference gives the value the record was built with. A
+mutable value is one object however many references hold it, and
+`identical` asks whether two references hold the same one
+([`Object` and `identical`](builtins.md#object-and-identical)).
 
 Tasks running at the same time can read and assign the same `var` field, or
 the same element of an array. Reading either while another task assigns it

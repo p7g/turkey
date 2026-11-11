@@ -72,7 +72,7 @@ fun main() {
     let signals = listening([Signal.Terminate, Signal.Interrupt])
     ready()
     let got = Signal.waitUnbounded(signals)
-    print("shutting down on " + show(got))
+    print("shutting down on " + debug(got))
     print("done")
 }
 """, workers)
@@ -100,7 +100,7 @@ fun main() {
             }
         })?
         let _ = Task.spawn(fun() {
-            print("stopping on " + show(Signal.waitUnbounded(signals)))
+            print("stopping on " + debug(Signal.waitUnbounded(signals)))
             Sync.setEvent(stopping)
         })?
         pure({})
@@ -123,7 +123,7 @@ fun main() {
     Sleep.sleep(Duration.millis(500))
     loop {
         match Signal.wait(signals, Duration.millis(200)) {
-            Some(s) -> print(s)
+            Some(s) -> print(debug(s))
             None -> break
         }
     }
@@ -143,8 +143,8 @@ fun main() {
     let a = listening([Signal.Terminate])
     let b = listening([Signal.Terminate, Signal.Hangup])
     ready()
-    print("a " + show(Signal.waitUnbounded(a)))
-    print("b " + show(Signal.waitUnbounded(b)))
+    print("a " + debug(Signal.waitUnbounded(a)))
+    print("b " + debug(Signal.waitUnbounded(b)))
     print(Signal.wait(b, Duration.millis(50)))
 }
 """, workers)
@@ -160,7 +160,7 @@ fun main() {
     let b = listening([Signal.Terminate])
     Signal.stop(a)
     ready()
-    print(Signal.waitUnbounded(b))
+    print(debug(Signal.waitUnbounded(b)))
     let _ = IO.flush(IO.stdout())
     Signal.stop(b)
     Signal.stop(b)
@@ -186,7 +186,7 @@ def test_a_signal_ignored_at_start_is_ignored_again_after_stop(workers):
 fun main() {
     let signals = listening([Signal.Hangup])
     ready()
-    print(Signal.waitUnbounded(signals))
+    print(debug(Signal.waitUnbounded(signals)))
     Signal.stop(signals)
     print("stopped")
     let _ = IO.flush(IO.stdout())

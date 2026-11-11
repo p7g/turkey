@@ -126,7 +126,7 @@ def test_a_two_argument_alias_is_the_type_it_names() -> None:
             print(half(4))
             print(half(3))
         }
-    """) == 'Right(2)\nLeft(odd)\n'
+    """) == 'Right(2)\nLeft("odd")\n'
 
 
 @pytest.mark.parametrize("src, constructor", [

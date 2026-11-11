@@ -17,7 +17,7 @@ import System.Task as Task
 
 fun report(r : Either IO.IOError a) -> String = match r {
     Right(_) -> "ok"
-    Left(e) -> show(e.kind) + ": " + message(e)
+    Left(e) -> debug(e.kind) + ": " + message(e)
 }
 
 fun must(r : Either IO.IOError a) -> a = match r {
@@ -78,7 +78,7 @@ fun main() {
 """, tmp_path)
     assert out == ["made", "ok", "ok", "ok",
                    "Closed: write made: file already closed", "ok", "ok",
-                   "Right(13)", "Some(first", "second", ")", "Right(0)", "ok"]
+                   "Right(13)", 'Some("first\\nsecond\\n")', "Right(0)", "ok"]
 
 
 def test_positional_reads_and_writes_leave_the_position_alone(tmp_path):
@@ -99,8 +99,8 @@ fun main() {
     print(String.fromBytes(into))
 }
 """, tmp_path)
-    assert out == ["Right(4)", "Some(3456)", "Right(2)", "Some(89)", "ok",
-                   "Right(4)", "Some(01ab)"]
+    assert out == ["Right(4)", 'Some("3456")', "Right(2)", 'Some("89")', "ok",
+                   "Right(4)", 'Some("01ab")']
     assert (tmp_path / "data").read_bytes() == b"01ab456789"
 
 
@@ -176,7 +176,11 @@ fun main() {
         Left(e) -> print(message(e))
     }
     print(File.readText("bad"))
-    print(File.readText("missing"))
+    -- The message, which names the failure, rather than the error's fields.
+    match File.readText("missing") {
+        Left(Right(e)) -> print("Left(Right(" + message(e) + "))")
+        other -> print(other)
+    }
     print(report(File.writeAll("copy", IO.bytesOf("bytes"))))
     print(File.readText("copy"))
     -- A device that fstat gives no size for, read until it ends.
@@ -186,9 +190,9 @@ fun main() {
     }
 }
 """, tmp_path)
-    assert out == ["ok", "Right(héllo", ")", "7", "Left(Left(InvalidUTF8))",
+    assert out == ["ok", 'Right("héllo\\n")', "7", "Left(Left(InvalidUTF8))",
                    "Left(Right(open missing: no such file or directory))",
-                   "ok", "Right(bytes)", "0"]
+                   "ok", 'Right("bytes")', "0"]
 
 
 def test_a_layers_error_reads_as_whichever_side_failed(tmp_path):

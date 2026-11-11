@@ -253,8 +253,8 @@ def test_a_flat_result_comes_back_in_registers():
     plain = lang.output(RETURNED)
     assert plain == (
         "Right(16)\nLeft(bad y, 7)\nLeft(bad z, 7)\n(10, 8.0)\n(12.0, 13.0, 14.0)\n"
-        "(abbb, 3, z123)\nRight(2)\nLeft(bad q, 7)\nRight(10)\nRight(10)\n"
-        "(abb, 2, z12)\n3968\n")
+        '("abbb", 3, "z123")\nRight(2)\nLeft(bad q, 7)\nRight(10)\nRight(10)\n'
+        '("abb", 2, "z12")\n3968\n')
     result = lang.dump("ssa", RETURNED)
     assert result.code == 0, result.stderr
     # One register per slot, the integer ones numbered apart from the float
@@ -383,7 +383,7 @@ fun main() {
 
 def test_fields_of_several_slots_are_held_as_their_slots():
     plain = lang.output(INLINE)
-    assert plain == "253755\n(7a, 7)\n(7, 7)\n"
+    assert plain == '253755\n("7a", 7)\n("7", 7)\n'
     result = lang.dump("ssa", INLINE)
     assert result.code == 0, result.stderr
     main = _function(result.stdout, "main")
@@ -551,7 +551,7 @@ fun main() {
 
 def test_inline_fields_in_wide_objects_sums_and_generic_copies():
     plain = lang.output(WIDE)
-    assert plain == '53255\n(7z, 7y, 7x, 7)\na6rst\n5\ncd\n(one, 1)\n(two, 2)\n(False, 8)\n46\n47\n(p, 1)m2\n3n4\n(x, y)o5\n2.5q6\n'
+    assert plain == '53255\n("7z", "7y", "7x", "7")\na6rst\n5\ncd\n("one", 1)\n("two", 2)\n(False, 8)\n46\n47\n("p", 1)m2\n3n4\n("x", "y")o5\n2.5q6\n'
     result = lang.dump("ssa", WIDE)
     assert result.code == 0, result.stderr
     assert re.search(r"object\.new kind=1 tag=\d+ count=81 ", _function(result.stdout, "main"))
@@ -654,7 +654,7 @@ fun main() {
 
 def test_an_array_holds_flat_products_as_their_slots():
     plain = lang.output(ARRAYS)
-    assert plain == "149\n8.25\n126127\n(499!, 500)\n(149, 1)\n(3.5, 4.5)\n", plain
+    assert plain == '149\n8.25\n126127\n("499!", 500)\n("149", 1)\n(3.5, 4.5)\n', plain
     result = lang.dump("ssa", ARRAYS)
     assert result.code == 0, result.stderr
     # One allocation for the whole array, and no element boxed.

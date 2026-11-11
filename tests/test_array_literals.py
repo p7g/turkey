@@ -101,7 +101,7 @@ def test_a_vec_literal_runs() -> None:
                        "    print(len(v))\n"
                        "    for s in v { print(s) }\n"
                        "    print(Vec.pop(v))\n"
-                       "}\n") == "3\nz\nb\nc\nSome(c)\n"
+                       "}\n") == '3\nz\nb\nc\nSome("c")\n'
 
 
 def test_the_generic_readers_take_a_vec() -> None:
@@ -120,7 +120,7 @@ def test_the_generic_readers_take_a_vec() -> None:
         "    let xs = []\n"
         "    for i in [1, 2, 3] { Vec.push(xs, i) }\n"
         "    print(Parallel.map(xs, fun(x) = x * x))\n"
-        "}\n") == "x,y\nSome(hi)\n[1, 4, 9]\n"
+        "}\n") == 'x,y\nSome("hi")\n[1, 4, 9]\n'
 
 
 # ------------------------------------------------------ never quantified

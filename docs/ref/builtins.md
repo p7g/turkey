@@ -435,18 +435,26 @@ Some(<Password>)
 ```
 
 **Writing one by hand.** A `Debug` instance written by hand replaces the
-derived one. One for an object that prints what the object holds passes its
-text through `Debug.guard`, so that a cycle through it prints `<cycle>`
-rather than running forever:
+derived one. What it prints is checked for cycles at each object it reaches
+through an instance:
+
+* an instance for a type whose every value is an object, such as a record
+  with a `var` field or a wrapper over an array, is checked as a derived one
+  is, with nothing written for it;
+* an instance for a value type is not checked itself. A cycle through it
+  ends only if it passes through an object some checked instance prints. One
+  that reads an array's elements itself and calls `debug` on each, rather
+  than calling `debug` on the array, can run until the stack overflows.
+
+A cycle through a checked instance prints `<cycle>` where it comes back to
+the object:
 
 <!-- run -->
 ```kotlin
-import Debug as Debug
-
 type Stack = Stack { var items : Array Stack, name : String }
 
 instance Debug Stack {
-    fun debug(s) = Debug.guard(s, fun() = s.name + " holding " + debug(s.items))
+    fun debug(s) = s.name + " holding " + debug(s.items)
 }
 
 fun main() {

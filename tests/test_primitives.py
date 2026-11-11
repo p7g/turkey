@@ -227,11 +227,11 @@ def test_signed_zero_compares_equal_but_has_a_distinct_bit_pattern():
 def test_total_compare_is_ieee_total_order():
     src = """
     fun main() {
-        print(Float.totalCompare(-0.0, 0.0))
-        print(Float.totalCompare(Float.nan(), Float.infinity()))
-        print(Float.totalCompare(-Float.nan(), -Float.infinity()))
-        print(Float.totalCompare(1.0, 1.0))
-        print(Float.totalCompare(Float.nan(), Float.nan()))
+        print(debug(Float.totalCompare(-0.0, 0.0)))
+        print(debug(Float.totalCompare(Float.nan(), Float.infinity())))
+        print(debug(Float.totalCompare(-Float.nan(), -Float.infinity())))
+        print(debug(Float.totalCompare(1.0, 1.0)))
+        print(debug(Float.totalCompare(Float.nan(), Float.nan())))
     }
     """
     assert out(src) == "LT\nGT\nLT\nEQ\nEQ\n"
@@ -310,7 +310,7 @@ def test_views_are_lazy_and_iterate_the_encoding():
 def test_bytes_are_the_only_door_and_the_way_in_is_checked():
     assert out('fun main() { print(String.toBytes("hé")) }') == "[104, 195, 169]\n"
     assert out('fun main() { print(String.fromBytes(String.toBytes("hé"))) }') == \
-        "Some(hé)\n"
+        'Some("hé")\n'
     # 0xC3 alone is a truncated two-byte sequence.
     src = """
     fun main() {
@@ -322,12 +322,12 @@ def test_bytes_are_the_only_door_and_the_way_in_is_checked():
 
 
 def test_search_and_split():
-    assert out('fun main() { print(String.split("a,b,c", ",")) }') == "[a, b, c]\n"
-    assert out('fun main() { print(String.split("abc", "")) }') == "[a, b, c]\n"
+    assert out('fun main() { print(String.split("a,b,c", ",")) }') == '["a", "b", "c"]\n'
+    assert out('fun main() { print(String.split("abc", "")) }') == '["a", "b", "c"]\n'
     assert out('fun main() { print(String.splitOnce("a=b=c", "=")) }') == \
-        "Some((a, b=c))\n"
+        'Some(("a", "b=c"))\n'
     assert out('fun main() { print(String.stripPrefix("foobar", "foo")) }') == \
-        "Some(bar)\n"
+        'Some("bar")\n'
     assert out('fun main() { print(String.stripSuffix("foobar", "baz")) }') == \
         "None\n"
     assert out('fun main() { print(String.replace("a-b-c", "-", "+")) }') == \
@@ -364,11 +364,11 @@ def test_builder_joins_once():
 
 
 def test_char_is_a_scalar_value_so_surrogates_are_rejected():
-    assert out("fun main() { print(Char.fromInt(97)) }") == "Some(a)\n"
+    assert out("fun main() { print(Char.fromInt(97)) }") == "Some('a')\n"
     assert out("fun main() { print(Char.fromInt(55296)) }") == "None\n"  # D800
     assert out("fun main() { print(Char.fromInt(57343)) }") == "None\n"  # DFFF
     assert out("fun main() { print(Char.fromInt(1114112)) }") == "None\n"  # 10FFFF+1
-    assert out("fun main() { print(Char.fromInt(1114111)) }") == "Some(\U0010ffff)\n"
+    assert out("fun main() { print(Char.fromInt(1114111)) }") == "Some('\U0010ffff')\n"
 
 
 def test_lexer_rejects_surrogate_and_oversized_escapes():

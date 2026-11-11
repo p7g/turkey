@@ -89,7 +89,7 @@ fun main() { print(Point { x = 1 }) }
 
 def test_the_container_instances_nest(capsys):
     src = 'fun main() { print([Some(1), None]) ; print([["a"]]) }'
-    assert output(src, capsys) == ["[Some(1), None]", "[[a]]"]
+    assert output(src, capsys) == ["[Some(1), None]", '[["a"]]']
 
 
 def test_a_primitive_is_not_in_the_surface_language():
@@ -139,7 +139,7 @@ fun main() {
 """
     assert output(src, capsys) == [
         "[2, 4, 6]", "[2, 4]", "6", "[3, 2, 1]", "[1, 2, 3]",
-        "a-b", "4", "5", "(1, x)", "True",
+        "a-b", "4", "5", '(1, "x")', "True",
     ]
 
 
@@ -382,4 +382,4 @@ fun main() {
     print(Either.right(r))
 }
 """
-    assert output(src, capsys) == ["Some(no)", "None", "None", "Some(7)"]
+    assert output(src, capsys) == ['Some("no")', "None", "None", "Some(7)"]

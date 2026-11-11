@@ -17,7 +17,7 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object` |
 | Functions | `print`, `write`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
@@ -734,4 +734,99 @@ fun main() {
 ```text
 Main#Cell Data.Option#Option
 False
+```
+
+## `Object` and `identical`
+
+```text
+class Object a { fun identical(a, a) -> Bool }
+```
+
+`==` compares what two values hold, so two arrays with the same elements are
+equal. `identical(x, y)` asks instead whether `x` and `y` are one object:
+whether an assignment through one would be seen through the other
+([Mutability and sharing](types.md#mutability-and-sharing)).
+
+<!-- run -->
+```kotlin
+type Account = Account { owner : String, var balance : Int }
+
+fun main() {
+    let a = Account { owner = "alice", balance = 10 }
+    let b = Account { owner = "alice", balance = 10 }
+    let alsoA = a
+    print(a == b)
+    print(identical(a, b))
+    print(identical(a, alsoA))
+}
+```
+
+```text
+True
+False
+True
+```
+
+The compiler supplies an instance of `Object` for each type whose values are
+objects, and a program may not declare one. Those types are:
+
+* `Array a`, whose elements can be assigned;
+* `System.Sync.AtomicInt`, an atomic cell, which every copy of it shares;
+* a record with a `var` field;
+* a type with one constructor and one field, not `var`, whose type has
+  `Object`. Such a value is its field, so `Vec a`, `Map k v` and
+  `Set a` are objects, and `type Box a = Box(a)` has the instance
+  `Object (Box a) : Object a`.
+
+Every other type is a value: the primitive types, strings, tuples,
+functions, and the types whose constructors have no `var` field. A value
+can be copied, or rebuilt from its fields, without the program telling the
+difference, so it has no identity to ask about, and calling `identical` on
+one is an error:
+
+<!-- error: 'Int' is a value, not an object -->
+```kotlin
+fun main() {
+    print(identical(1, 1))
+}
+```
+
+A `String` is a value too, although its text is held in an array: two
+strings with the same text may be one string or two, however they were
+built. So a wrapper over one is a value, and the error says why:
+
+<!-- error: 'Name' is a value, not an object: field 0 of 'Name' has type 'String', which opts out of 'Object' -->
+```kotlin
+type Name = Name(String)
+
+fun main() {
+    print(identical(Name("a"), Name("a")))
+}
+```
+
+`!Object` in a type's [derive list](classes.md#derived-instances) refuses
+the instance, as `String` does, for a type whose values the program should
+not tell apart by identity.
+
+A function that compares by identity asks for `Object` of its type
+parameter. This one asks whether an array holds one particular object,
+where `==` would accept any equal one:
+
+<!-- run -->
+```kotlin
+type Task = Task { name : String, var done : Bool }
+
+fun holds[Object a](xs : Array a, x : a) -> Bool = Iterator.any(xs, identical(_, x))
+
+fun main() {
+    let first = Task { name = "write", done = False }
+    let second = Task { name = "write", done = False }
+    print(holds([first], second))
+    print(holds([first, second], second))
+}
+```
+
+```text
+False
+True
 ```

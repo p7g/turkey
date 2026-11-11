@@ -4,7 +4,7 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable, Leftover(..),
-    derivedMethod, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
+    derivedMethod, derivedParts, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -244,8 +244,8 @@ type InstInfo = InstInfo {
     var plan : Option InstancePlan,
     -- The module that declared it, for the orphan rule.
     module_  : String,
-    -- Whether the compiler built it from a type declaration's derive list,
-    -- with the method `derivedMethod` names left for the lowering to write.
+    -- Whether the compiler built it from a type declaration, with the
+    -- method `derivedMethod` names left for the lowering to write.
     derived  : Bool,
 }
 
@@ -824,6 +824,15 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         -- the type it is deriving for.
         report("'Typed' instances cannot be declared; the compiler derives one "
                + "for every type", Some(d.span))
+        return None
+    }
+    if d.cls == P.objectClass {
+        -- `identical` compares two words, which is identity only at a type
+        -- whose values are never copied or rebuilt (`objectParts`). An
+        -- instance anywhere else would answer as the optimizer happened to
+        -- leave the program.
+        report("'Object' instances cannot be declared; the compiler derives one "
+               + "for every type whose values are objects", Some(d.span))
         return None
     }
     let tyvars = Map.new()
@@ -1830,6 +1839,7 @@ fun derivedMethod(cls : String) -> Option String =
     if cls == P.eqClass { Some("eq") }
     else if cls == P.ordClass { Some("lt") }
     else if cls == P.hashClass { Some("hashInto") }
+    else if cls == P.objectClass { Some("identical") }
     else { None }
 
 -- Returns whether the method `name` of `inst`'s class is the one `inst`, a
@@ -1841,7 +1851,7 @@ fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
 -- Whether `!` may refuse `cls`. `Ord` is derived only for a type that asks:
 -- a derived order follows the order the constructors are declared in, so a
 -- type should not acquire one unasked, and `!Ord` would refuse nothing.
-fun refusable(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
+fun refusable(cls : String) -> Bool = isImplicit(cls)
 
 fun derivationKey(cls : String, tycon : String) -> String = cls + " " + tycon
 
@@ -1907,7 +1917,8 @@ fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
 
 -- Whether every type derives `cls` without asking. `Ord` is not among them,
 -- for the reason `refusable` gives.
-fun isImplicit(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
+fun isImplicit(cls : String) -> Bool =
+    cls == P.eqClass || cls == P.hashClass || cls == P.objectClass
 
 -- Returns why `tycon` gets no implicit instance of `cls` though its fields
 -- might have the class, as a phrase about the type: "can reach itself
@@ -1917,7 +1928,9 @@ fun isImplicit(cls : String) -> Bool = cls == P.eqClass || cls == P.hashClass
 -- rules the instance out whatever the list says, so that the diagnostic
 -- gives that reason and not a fix that cannot work (`checkEntry`).
 fun implicitExclusion(t : ClassTable, cls : String, tycon : String) -> Option String {
-    if !isImplicit(cls) || listsFor(t, tycon, cls) { return None }
+    -- Both reasons below are about following a value's fields, which an
+    -- `Object` instance never does.
+    if !isImplicit(cls) || cls == P.objectClass || listsFor(t, tycon, cls) { return None }
     for sup in superclassesOf(t, cls) {
         if refuses(t, tycon, sup) || Option.isSome(writtenInstance(t, sup, tycon)) { return None }
     }
@@ -2038,7 +2051,7 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
         Some(i) -> i
         None -> return None
     }
-    let general = declaredHead(info)?
+    let general = derivedHead(cls, info)?
     -- `checkDerives` begins a derive list's derivations, and the solver
     -- begins the rest the first time a predicate needs one.
     -- `Turkey.Infer.solve` checks each in the run of the solver that began
@@ -2171,6 +2184,19 @@ fun withdraw(t : ClassTable, inst : InstInfo) -> Unit {
     for other in kept { Vec.push(found, other) }
 }
 
+-- Returns the head of the derived instance of `cls` for `info`: the type
+-- `info` declares, at its parameters (`declaredHead`). `Prim.Array` and
+-- `Prim.Atomic` declare no constructor to read them from, and of the derived
+-- classes only `Object` has an instance for them.
+fun derivedHead(cls : String, info : TyconInfo) -> Option Ty.Type =
+    if info.name == "Prim.Array" {
+        if cls == P.objectClass { Some(Ty.rawArrayOf(TVar(Ty.newVar(1, KStar)))) } else { None }
+    } else if info.name == "Prim.Atomic" {
+        if cls == P.objectClass { Some(Ty.tAtomic()) } else { None }
+    } else {
+        declaredHead(info)
+    }
+
 -- Returns the type `info` declares, applied to its parameters as the
 -- constructors' results are: `Map k v`, over the variables they share.
 fun declaredHead(info : TyconInfo) -> Option Ty.Type {
@@ -2247,20 +2273,12 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
             Vec.push(asked, why)
         }
     }
-    for c in info.variants {
-        -- Two values of one existential constructor may hide different
-        -- types, so no instance for one hidden type compares them.
-        if len(c.existsNames) > 0 {
-            return Left("constructor '" + Ty.shortName(c.name) + "' hides the type '"
-                        + c.existsNames[0] + "'")
-        }
-        let types = match Decls.conFieldTypes(t.decls, inst.head, c.name) {
-            Some(ts) -> ts
-            None -> return Left("it is not a declared type")
-        }
-        for var i = 0; i < len(types); i = i + 1 {
-            ask(Ty.pred(cls, [skolemApply(sk, types[i])]), AtField(c, i, types[i]))
-        }
+    let parts = match derivedParts(t.decls, cls, info, inst.head) {
+        Left(reason) -> return Left(reason)
+        Right(found) -> found
+    }
+    for (c, i, ty) in parts {
+        ask(Ty.pred(cls, [skolemApply(sk, ty)]), AtField(c, i, ty))
     }
     for sup in supers { ask(Ty.pred(sup.name, [skolemApply(sk, inst.head)]), AtHead(sup.name)) }
     -- GHC's `validDerivPred`, restricted to a class over a parameter: it
@@ -2323,6 +2341,117 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
         (at, q.name)
     })
     Right(ordered)
+}
+
+-- Returns the fields whose types the derived instance of `cls` for `info`
+-- at `head` needs `cls` at, each with its constructor and position, or
+-- `Left` of why there can be no instance whatever the fields' types are.
+-- The fields are those the derived method reads: every field, except that
+-- an `Object` instance reads none (`objectParts`).
+fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
+                 head : Ty.Type) -> Either String (Array (ConInfo, Int, Ty.Type)) {
+    if cls == P.objectClass { return objectParts(d, info, head) }
+    let out = []
+    for c in info.variants {
+        -- Two values of one existential constructor may hide different
+        -- types, so no instance for one hidden type compares them.
+        if len(c.existsNames) > 0 {
+            return Left("constructor '" + Ty.shortName(c.name) + "' hides the type '"
+                        + c.existsNames[0] + "'")
+        }
+        let types = match Decls.conFieldTypes(d, head, c.name) {
+            Some(ts) -> ts
+            None -> return Left("it is not a declared type")
+        }
+        for var i = 0; i < len(types); i = i + 1 { Vec.push(out, (c, i, types[i])) }
+    }
+    Right(Vec.toArray(out))
+}
+
+-- Returns whether no value of `tycon` is an object, whatever its type
+-- arguments: `objectParts` rules it out, or it wraps a type that is not an
+-- object. A wrapper over a parameter may be one, so it is not.
+fun isValue(t : ClassTable, tycon : String) -> Bool = valueType(t, tycon, False, wrapperDepth)
+
+-- How many wrappers `valueType` looks through. Wrappers may wrap each other
+-- in a cycle, which has no value at all, so the answer past this many is
+-- the safe one: perhaps an object.
+let wrapperDepth = 16
+
+-- `isValue` of `tycon`, which is a wrapper's field type when `inner` is
+-- set: then its own `!Object` makes it a value too.
+fun valueType(t : ClassTable, tycon : String, inner : Bool, depth : Int) -> Bool {
+    if depth == 0 || tycon == "Prim.Array" || tycon == "Prim.Atomic" { return False }
+    if inner && refuses(t, tycon, P.objectClass) { return True }
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return False
+    }
+    -- A built-in type with no constructor to read, such as `Int`.
+    let head = match declaredHead(info) {
+        Some(h) -> h
+        None -> return True
+    }
+    match objectParts(t.decls, info, head) {
+        Left(_) -> True
+        Right(parts) -> {
+            if len(parts) == 0 { return False }
+            let (_, _, field) = parts[0]
+            match Ty.spine(Ty.prune(field)).0 {
+                TCon(c) -> c.uid == 0 && valueType(t, c.name, True, depth - 1)
+                TTuple(_) | TFun(_, _) -> True
+                _ -> False
+            }
+        }
+    }
+}
+
+-- Returns the fields that must be objects for the values of `info` at
+-- `head` to be objects, or `Left` of why they are values whatever the
+-- fields' types are.
+--
+-- A value of a type `Object` covers must keep its identity wherever the
+-- program moves it, which leaves three kinds of type:
+--
+-- * `Prim.Array`, whose elements can be assigned, and `Prim.Atomic`, a cell
+--   that `Prim.atomicNew` allocates and nothing copies;
+-- * a type whose every constructor is an object, with a 'var' field
+--   (`Decls.hasIdentity`), or is nullary, and one of them at least is an
+--   object. A nullary constructor is one value however the type is held,
+--   so it keeps its identity too. The language allows `var` only in a type
+--   with one constructor, so no type mixes the two kinds; the rule is
+--   stated for every constructor because identity is a property of a
+--   build, and it stays right for a type that did;
+-- * a wrapper, whose value is its field's (`Decls.newtypes`), when the
+--   field's type is one of these. That field is the one returned.
+--
+-- A constructor with fields and no 'var' builds a value, which the
+-- optimizer may copy or rebuild from its fields, so a type with one is not
+-- covered, and nor is a type of nullary constructors alone.
+fun objectParts(d : DeclTable, info : TyconInfo,
+                head : Ty.Type) -> Either String (Array (ConInfo, Int, Ty.Type)) {
+    if info.name == "Prim.Array" || info.name == "Prim.Atomic" { return Right([]) }
+    if Decls.isWrapper(info) {
+        let c = info.variants[0]
+        return match Decls.conFieldTypes(d, head, c.name) {
+            Some(types) -> Right([(c, 0, types[0])])
+            None -> Left("it is not a declared type")
+        }
+    }
+    var objects = 0
+    var values = 0
+    for c in info.variants {
+        if Decls.hasMutable(c) {
+            objects = objects + 1
+        } else if c.arity > 0 {
+            values = values + 1
+        }
+    }
+    if objects > 0 && values == 0 { return Right([]) }
+    -- Only a type with one constructor may have a 'var' field, so a
+    -- diagnostic for a type with several does not suggest one.
+    if len(info.variants) == 1 { Left("it has no 'var' field") }
+    else { Left("it has more than one constructor") }
 }
 
 -- What asked a derivation for one of its wanteds.
@@ -2470,13 +2599,14 @@ fun whyNot(t : ClassTable, cls : String, ty : Ty.Type) -> String {
             return ", whose " + reason
         }
     }
-    ", which has no " + shown
+    if cls == P.objectClass { ", which is a value" } else { ", which has no " + shown }
 }
 
 -- Returns why the predicate `p`, which no instance covers, has none, when the
 -- declaration of its type says why: it refuses the class, or asks for it and
 -- it cannot be derived.
 fun whyMissing(t : ClassTable, p : Pred) -> Option String {
+    if p.name == P.objectClass { return notAnObject(t, p) }
     let (h, _) = Ty.spine(Ty.prune(p.args[0]))
     let c = match h {
         TCon(c) -> c
@@ -2495,6 +2625,32 @@ fun whyMissing(t : ClassTable, p : Pred) -> Option String {
     }
     match Map.get(t.derivations, derivationKey(p.name, c.name)) {
         Some(Underivable(reason)) -> Some(lead + reason)
+        _ -> None
+    }
+}
+
+-- Returns why `p`, an `Object` predicate no instance covers, has none, when
+-- its type is one a program wrote down rather than a type variable.
+fun notAnObject(t : ClassTable, p : Pred) -> Option String {
+    let ty = Ty.prune(p.args[0])
+    let (h, _) = Ty.spine(ty)
+    let lead = "'" + Ty.show(ty) + "' is a value, not an object"
+    match h {
+        TCon(c) -> {
+            -- A skolem stands for a type nobody here knows.
+            if c.uid != 0 { return None }
+            -- A refused type may well hold an object; what it lacks is the
+            -- instance.
+            if refuses(t, c.name, p.name) {
+                return Some("'" + Ty.show(ty) + "' has no '" + Ty.shortName(p.name)
+                            + "': its declaration says '!" + Ty.shortName(p.name) + "'")
+            }
+            match Map.get(t.derivations, derivationKey(p.name, c.name)) {
+                Some(Underivable(reason)) -> Some(lead + ": " + reason)
+                _ -> Some(lead)
+            }
+        }
+        TTuple(_) | TFun(_, _) -> Some(lead)
         _ -> None
     }
 }
@@ -2564,6 +2720,11 @@ fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
         }
         return False
     }
+    if entry.cls == P.objectClass && !entry.refused {
+        report("every type whose values are objects has 'Object' already, so it cannot "
+               + "be derived; remove it from the list", at)
+        return False
+    }
     if Option.isNone(derivedMethod(entry.cls)) {
         if entry.refused {
             report(cls + " is never derived, so " + refusal + " has no effect; remove it", at)
@@ -2589,6 +2750,10 @@ fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
         if !refusable(entry.cls) {
             report(cls + " is derived only when a type asks for it, so " + refusal
                    + " has no effect; remove it", at)
+            return False
+        }
+        if entry.cls == P.objectClass && isValue(t, d.name) {
+            report(ty + " is not an object, so " + refusal + " has no effect; remove it", at)
             return False
         }
         return True
@@ -2643,9 +2808,9 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     -- A derived instance is the only one for its type, so it is found by
     -- name rather than among every instance of the class.
     let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
-    let derivable = Option.isSome(derivedMethod(p.name))
+    let derived = Option.isSome(derivedMethod(p.name))
     if let TCon(c) = receiver {
-        if derivable {
+        if derived {
             match Map.get(t.derivations, derivationKey(p.name, c.name)) {
                 Some(Derived(inst)) | Some(Deriving(inst)) ->
                     if let Some(mapping) = match_(inst.head, p.args[0]) {
@@ -2662,7 +2827,7 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     }
     -- After the table, so that an instance written by hand is the one found
     -- and nothing is derived beside it.
-    if !derivable { return None }
+    if !derived { return None }
     if let TCon(c) = receiver {
         if let Some(inst) = derive(t, p.name, c.name) {
             if let Some(mapping) = match_(inst.head, p.args[0]) {

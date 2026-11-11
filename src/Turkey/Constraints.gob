@@ -200,9 +200,8 @@ type Constraint
     -- override, and an existential pattern grants the class context its
     -- constructor declares.
     -- The `Option Pred` is the head of the instance whose declaration the
-    -- implication checks, if it checks one: GHC's `InstSkol` origin, which
-    -- decides whether a naked superclass wanted may be solved through a
-    -- given's superclasses (`granted`).
+    -- implication checks, if it checks one: GHC's `InstSkol` origin, which a
+    -- diagnostic about the instance's superclasses names.
     | CAssume(Vec (String, Pred, Option Span), Option Pred, Constraint)
     -- `name <= t`: instantiate a scheme at `t`. The generator emits this
     -- instead of looking the name up, which is what lets it run without a type
@@ -273,12 +272,19 @@ type PredCell = PredCell {
     -- Whether the superclasses of this class wanted have been expanded.
     var expanded : Bool,
     -- Whether this is a superclass of an instance's head that the
-    -- instance's declaration must prove: GHC's `ScOrigin NakedSc`. It may be
-    -- solved by a given itself, but not through the superclasses of a given
-    -- no smaller than the head (`granted`, `matchableGiven`), so that a
-    -- superclass is never proved by the dictionary it belongs to (Note
-    -- [Recursive superclasses]). What an instance it is solved by demands is
-    -- not naked.
+    -- instance's declaration must prove: GHC's `ScOrigin NakedSc`, which a
+    -- diagnostic names (`missingSuperclass`). What an instance it is solved
+    -- by demands is not naked.
+    --
+    -- A naked wanted may be solved through any given's superclasses. No
+    -- class given of an instance's declaration is the dictionary being
+    -- built, so a superclass is never proved by the dictionary it belongs to
+    -- (Note [Recursive superclasses] in `GHC.Tc.TyCl.Instance`). A written
+    -- instance's class givens are smaller than its head
+    -- (`Classes.checkTermination`), except a `Typed` one, which is exempt:
+    -- `Typed` has no superclasses and no written instances. A derived
+    -- instance's givens are classes over its parameters, smaller by
+    -- construction.
     naked    : Bool,
     -- Whether this arose below a naked wanted, from the instance that solved
     -- it: its root is that superclass, and a diagnostic says so
@@ -383,18 +389,12 @@ type Implication = Implication {
     -- dictionary, and the literal sets a scheme's context grants
     -- (`givenSet`), under "". Never changed once made.
     assumptions : Vec (String, Pred),
-    -- The indices into `assumptions` of the instance givens no smaller than
-    -- the instance's head, whose superclasses a naked wanted may not be
-    -- solved by: GHC's `GivenSCOrigin` with `blocked` set
-    -- (`mk_strict_superclasses`).
-    blocked     : Set.Set Int,
     -- The head of the instance whose declaration this implication checks, if
     -- it checks one: GHC's `InstSkol` skolem info.
     checks      : Option Pred,
     -- The class givens and all their superclasses, rewritten by the equality
-    -- givens: what a wanted might yet match (`classRule`). Each says whether
-    -- it is a superclass of a blocked given.
-    matchable   : Vec (Pred, Bool),
+    -- givens: what a wanted might yet match (`classRule`).
+    matchable   : Vec Pred,
     -- The equality givens, canonical.
     inert       : Inert.Inert,
     -- The highest rank whose variables are untouchable: the rank a `CAssume`
@@ -431,29 +431,25 @@ type Implication = Implication {
 -- Returns an implication with no wanteds, binding no skolems: the top level,
 -- or a binding group's scheme.
 fun implication(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
-                blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
-                untouchable : Int) -> Implication =
-    nested(classes, id, assumptions, blocked, checks, inert, untouchable, [], False, None,
-           False, "", None)
+                checks : Option Pred, inert : Inert.Inert, untouchable : Int) -> Implication =
+    nested(classes, id, assumptions, checks, inert, untouchable, [], False, None, False, "",
+           None)
 
 -- Returns an implication with no wanteds, for a `CAssume` that binds
 -- `skolems` and checks the declaration `owner`.
 fun nested(classes : ClassTable, id : Int, assumptions : Vec (String, Pred),
-           blocked : Set.Set Int, checks : Option Pred, inert : Inert.Inert,
+           checks : Option Pred, inert : Inert.Inert,
            untouchable : Int, skolems : Vec ConCell, givenEqs : Bool,
            made : Option Inert.Inert, muted : Bool, owner : String,
            parent : Option Implication) -> Implication {
     let matchable = Vec.new(len(assumptions))
-    for var i = 0; i < len(assumptions); i = i + 1 {
-        let a = assumptions[i].1
-        let key = Ty.predKey(a)
+    for (_, a) in assumptions {
         for q in Classes.bySuper(classes, a) {
-            Vec.push(matchable, (Ty.pred(q.name, Array.map(q.args, Inert.rewrite(inert, _))),
-                                 Set.contains(blocked, i) && Ty.predKey(q) != key))
+            Vec.push(matchable, Ty.pred(q.name, Array.map(q.args, Inert.rewrite(inert, _))))
         }
     }
     Implication {
-        id = id, assumptions = assumptions, blocked = blocked, checks = checks,
+        id = id, assumptions = assumptions, checks = checks,
         matchable = matchable, inert = inert,
         untouchable = untouchable, skolems = skolems, givenEqs = givenEqs, made = made,
         muted = muted, owner = owner, parent = parent, children = Vec.new(0),
@@ -685,7 +681,7 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        here = implication(classes, 0, [], Set.new(), None, Inert.empty(classes), Ty.noScope),
+        here = implication(classes, 0, [], None, Inert.empty(classes), Ty.noScope),
         entered = 0, draining = False, current = None, watchers = Map.new(),
         scopes = Vec.new(4), uses = Vec.new(16),
         pools = [Vec.new(8)],
@@ -767,7 +763,7 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
                 -- It is not: the declaration assumed that instance, and which
                 -- one it will be is the caller's business. Such an equation is
                 -- merely stuck, and is reported as stuck.
-                Some(missing) -> if Option.isNone(granted(s, False, Ty.pred(missing.name,
+                Some(missing) -> if Option.isNone(granted(s, Ty.pred(missing.name,
                         Array.map(missing.args, rewriteW(s, _))))) {
                     return Ty.typeError("no instance for '" + Ty.showPred(missing)
                                         + "', which '" + Ty.show(t) + "' needs", where)
@@ -927,8 +923,6 @@ fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option P
            inner : fun() -> Unit) -> Unit {
     let outside = s.here
     let assumptions = Vec.slice(outside.assumptions, 0, len(outside.assumptions))
-    let blocked = Set.new()
-    for i in Set.elements(outside.blocked) { Set.add(blocked, i) }
     var untouchable = outside.untouchable
     var inert = outside.inert
     let written = Vec.new(len(givens))
@@ -936,16 +930,7 @@ fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option P
     for (n, p, at) in givens {
         Vec.push(named, (n, p))
         Vec.push(written, Given { pred = p, span = at, grantedBy = None })
-        if p.name != Ty.equals {
-            -- GHC's `newly_blocked (InstSkol _ head_size)`: a superclass
-            -- of an instance given is blocked unless the given is
-            -- Paterson-smaller than the head. Every link of a chain of
-            -- superclasses has the given's own argument, and so its size.
-            if let Some(h) = head {
-                if !Classes.patersonSmaller(p, h) { Set.add(blocked, len(assumptions)) }
-            }
-            Vec.push(assumptions, (n, p))
-        }
+        if p.name != Ty.equals { Vec.push(assumptions, (n, p)) }
     }
     -- The equalities written here, and those the class givens' equality
     -- superclasses grant.
@@ -976,7 +961,7 @@ fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option P
         Some(h) -> Some(h)
         None -> outside.checks
     }
-    let inside = nested(s.classes, s.entered, assumptions, blocked, checks, inert,
+    let inside = nested(s.classes, s.entered, assumptions, checks, inert,
                         untouchable, skolems, givenEqs, made, inaccessible, owner,
                         Some(outside))
     s.here = inside
@@ -1979,7 +1964,7 @@ fun resimplified(s : Solver, nested : Vec PredCell) -> Vec Pred {
     if len(nested) == 0 { return Vec.new(0) }
     let outside = s.here
     s.entered = s.entered + 1
-    let impl = implication(s.classes, s.entered, outside.assumptions, outside.blocked,
+    let impl = implication(s.classes, s.entered, outside.assumptions,
                            outside.checks, outside.inert, rank(s) - 1)
     s.here = impl
     for w in nested {
@@ -2192,7 +2177,7 @@ fun schemeImplication(s : Solver, named : Vec (String, Pred))
         refused = r
     }
     s.entered = s.entered + 1
-    (implication(s.classes, s.entered, assumptions, outside.blocked, outside.checks, inert,
+    (implication(s.classes, s.entered, assumptions, outside.checks, inert,
                  rank(s) + 1), made, refused)
 }
 
@@ -2883,21 +2868,20 @@ fun entail(s : Solver, c : PredCell) -> Bool {
     out
 }
 
--- Reports that solving `c`'s root did not terminate, and returns `True`, to
--- take `c` as discharged.
+-- Reports that solving `c`'s root went deeper than `reductionDepth`, and
+-- returns `True`, to take `c` as discharged.
 --
--- The instance restrictions make every instance's head a constructor applied
--- to distinct variables, and every associated type's right side apply a
--- family only to such a variable, so reducing a family terminates. They do
--- not bound an instance's *context*: `instance C (Box a) : C (Box (Box a))`
--- demands a bigger wanted than it solves, without end. GHC rejects such an
--- instance unless `UndecidableInstances` is on (its Paterson conditions), and
--- bounds the depth of subgoals either way (`subGoalDepthExceeded`); here the
--- depth bound is all there is.
+-- The bound is GHC's `subGoalDepthExceeded`. The instance restrictions are
+-- what make solving terminate: every instance's head is a constructor applied
+-- to distinct variables, every associated type's right side applies a family
+-- only to such a variable, and every class predicate of an instance's context
+-- is smaller than its head (`Classes.checkTermination`). So what reaches the
+-- bound is a finite chain longer than it, such as `Eq` at a type nested more
+-- than 200 deep, and the message must not say that solving would not end.
 fun tooDeep(c : PredCell) -> Bool =
-    reported("cannot solve '" + Ty.showPred(c.root) + "': solving it does not terminate, "
-             + "and the checker gave up " + Int.toString(reductionDepth) + " levels deep",
-             c.span)
+    reported("cannot solve '" + Ty.showPred(c.root) + "': the checker follows instances "
+             + "at most " + Int.toString(reductionDepth) + " levels deep, and solving it "
+             + "needs more", c.span)
 
 -- `l ~ r`: canonicalize the equation (OutsideIn(X), §7.4.1).
 --
@@ -2959,40 +2943,20 @@ fun stuck(t : Ty.Type, other : Ty.Type, fams : Option Ty.Families) -> Bool = mat
 -- fact the enclosing declarations already assumed, the innermost first, or
 -- `None` if none of them grants it.
 --
--- For a `naked` wanted, a given whose superclasses are blocked grants only
--- itself: GHC's `prohibitedSuperClassSolve`, (sc1) and (sc2) of Note
--- [Solving superclass constraints]. Selecting the wanted from the
--- superclasses of a given no smaller than the instance's head could make a
--- dictionary's superclass the dictionary itself, as
--- `instance Mon (W a) : Mon (W a)` would.
---
 -- Each assumption is rewritten by the givens alone before it is compared,
 -- since an assumption is written down and a demand is discovered, and the
 -- two may name the same type by different routes: `Ord (Item a)` is granted
 -- by `Ord (Index.Value a)` under `Item a ~ Index.Value a`. A wanted equality
 -- never rewrites an assumption.
-fun granted(s : Solver, naked : Bool, p : Pred) -> Option Proof {
+fun granted(s : Solver, p : Pred) -> Option Proof {
     let key = Ty.predKey(p)
     let assumptions = s.here.assumptions
     for var i = len(assumptions) - 1; i >= 0; i = i - 1 {
         let (name, a) = assumptions[i]
         let seen = Ty.pred(a.name, [Inert.rewrite(s.here.inert, a.args[0])])
         if let Some(path) = Classes.superPath(s.classes, seen, key, []) {
-            if naked && len(path) > 0 && Set.contains(s.here.blocked, i) { continue }
             return Some(ByGiven(name, path, a))
         }
-    }
-    None
-}
-
--- Returns a class given of `s.here` whose superclasses would grant `p`, but
--- are blocked for a naked wanted (`granted`), if there is one.
-fun blockedGiven(s : Solver, p : Pred) -> Option Pred {
-    let key = Ty.predKey(p)
-    for i in Set.elements(s.here.blocked) {
-        let a = s.here.assumptions[i].1
-        let seen = Ty.pred(a.name, [Inert.rewrite(s.here.inert, a.args[0])])
-        if Option.isSome(Classes.superPath(s.classes, seen, key, [])) { return Some(a) }
     }
     None
 }
@@ -3008,13 +2972,8 @@ fun blockedGiven(s : Solver, p : Pred) -> Option Pred {
 -- given could still match would make the answer depend on the order the
 -- rules fire: the given, once it matches, may solve what the instance's
 -- context cannot.
---
--- A superclass of a blocked given could never solve a `naked` wanted, so it
--- does not delay one: `mightEqualLater` answers `Nothing` when
--- `prohibitedSuperClassSolve` holds.
-fun matchableGiven(s : Solver, naked : Bool, p : Pred) -> Bool {
-    for (g, blocked) in s.here.matchable {
-        if naked && blocked { continue }
+fun matchableGiven(s : Solver, p : Pred) -> Bool {
+    for g in s.here.matchable {
         if g.name == p.name && mightEqual(g.args[0], p.args[0], Map.new()) { return True }
     }
     False
@@ -3126,7 +3085,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
     -- order matters: a given may be *about* a family application, as
     -- `[Container c, Show (Elem c)]` is, and `Elem c` over a skolem never
     -- reduces. Testing the head first would defer such a predicate for ever.
-    if let Some(proof) = granted(s, c.naked, p) {
+    if let Some(proof) = granted(s, p) {
         c.hole.proof = Some(proof)
         return True
     }
@@ -3142,7 +3101,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         TFam(_, _, _) -> return False
         _ -> {}
     }
-    if matchableGiven(s, c.naked, p) { return False }
+    if matchableGiven(s, p) { return False }
     -- An unsatisfiable predicate is reported and taken as discharged: nothing
     -- later can satisfy it, so deferring it would only report it again.
     if checkFieldVisibility(s, p, t, c) { return True }
@@ -3196,13 +3155,8 @@ fun missingSuperclass(s : Solver, c : PredCell) -> Bool {
         Some(h) -> h.name
         None -> bug("a naked superclass wanted outside an instance's check", c.span)
     }
-    let shown = "'" + Ty.showPred(c.pred) + "' is required by '" + cls + "'"
-    match blockedGiven(s, c.pred) {
-        Some(g) -> reported(shown + ", and it cannot come from the superclasses of the "
-                            + "context's '" + Ty.showPred(g) + "', which is about the head "
-                            + "itself; add '" + Ty.showPred(c.pred) + "' to the context", c.span)
-        None -> reported(shown + ", but there is no such instance", c.span)
-    }
+    reported("'" + Ty.showPred(c.pred) + "' is required by '" + cls
+             + "', but there is no such instance", c.span)
 }
 
 -- Returns what a wanted `c`, now `p`, that arose below a superclass of an

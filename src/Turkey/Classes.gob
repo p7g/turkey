@@ -843,6 +843,7 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
     -- A context constrains the head's variables and binds none of its own:
     -- an instance is selected by its head alone, so nothing at a use could
     -- say what another variable is.
+    var stray = False
     for p in d.context {
         let sides = match p.kind {
             PClass(_, arg) -> [arg]
@@ -852,11 +853,14 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
             if let Some((name, at)) = strayVar(side, tyvars) {
                 report("'" + name + "' is not bound by the instance head '"
                        + Ty.showAt(h, writtenNamer(namesOf(tyvars)), 0) + "'", Some(at))
+                stray = True
             }
         }
     }
     let written = resolveContext(t, d.context, tyvars, None)
-    if !checkTermination(d, h, written, tyvars) { return None }
+    -- A stray variable occurs in the context and not in the head, so the
+    -- termination check would only report it again, as a repeated variable.
+    if !stray && !checkTermination(d, h, written, tyvars) { return None }
     let context = Vec.filter(written, fun(p) = p.name != Ty.equals)
     let equalities = Vec.filter(written, fun(p) = p.name == Ty.equals)
     let families = resolveFamilies(t, d, info, h, tyvars, fresh)
@@ -1774,10 +1778,11 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- with an empty context, and `settle` infers each context again under the
 -- others until none changes: the least fixed point, as GHC's
 -- `inferInstanceContexts` finds it. It is never looped on: a context holds
--- only classes over parameters, so it can grow only so far, and one
--- reduction that grows without end, through a written instance whose
--- context is no smaller than its head, stops at `reductionLimit` and is no
--- instance. A non-regular type is not such a case: `Nest a` holding a
+-- only classes over parameters, so it can grow only so far. Every written
+-- instance's context is smaller than its head (`checkTermination`), so every
+-- reduction ends, but a long one, through more than `reductionLimit` steps
+-- that do not ask for a head variable, is cut off there and is no instance.
+-- A non-regular type is not such a case: `Nest a` holding a
 -- `Nest (Array a)` reduces `Eq (Nest (Array a))` back to `Eq a`.
 
 type Derivation
@@ -2261,9 +2266,11 @@ type Unmet
 -- proper part of its wanted's type, and a run of those always ends, since a
 -- type is finite, so only the others are counted. A field's type nested any
 -- depth therefore reduces through instances like `Eq (Array a) : Eq a`, but
--- not through more than this many like `Eq (R a) : Eq (Array a)`. A written
--- instance's context may be no smaller than its head,
--- `Eq (W a) : Eq (W (Array a))`, and nothing else stops it reducing for ever.
+-- not through more than this many like `Eq (R a) : Eq (Array a)`. Every
+-- written instance's context is smaller than its head (`checkTermination`),
+-- so a reduction always ends. What reaches the limit is a long finite chain,
+-- such as a field of type `T (T (... Int) Int) Int` under
+-- `Eq (T a b) : Eq (W a)`, and the limit refuses it.
 let reductionLimit = 64
 
 -- Reduces the wanted `p` through the instances that cover it, adding each
@@ -2674,10 +2681,13 @@ fun patersonSize(t : Ty.Type, vars : Occurrences) -> Either String Int = match T
         Right(1)
     }
     TApp(fn, arg, _) -> Right(patersonSize(fn, vars)? + patersonSize(arg, vars)?)
+    -- Left to right, as `pSizeTypeX` visits a function's argument before its
+    -- result, so that a diagnostic names the first family and variable as
+    -- written.
     TFun(params, ret) -> {
-        var n = 1 + patersonSize(ret, vars)?
+        var n = 1
         for q in params { n = n + patersonSize(q, vars)? }
-        Right(n)
+        Right(n + patersonSize(ret, vars)?)
     }
     TTuple(elems) -> {
         var n = 1

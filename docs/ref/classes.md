@@ -184,7 +184,7 @@ head** (the *Paterson conditions*):
   counting each occurrence;
 * no type variable may occur in it more often than in the head.
 
-Equalities in the context are not restricted, and nor are
+Equalities in the context are exempt from this rule, and so are
 [`Typed`](builtins.md#typed-and-cast) constraints. `Show a` for `Show (Box a)` is
 smaller, and so is `Eq (f a)` for `Eq (App f a)`. `Eq (W (a, a))` for
 `Eq (W a)` is not:
@@ -1094,13 +1094,10 @@ fun main() { }
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
 `View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
-context's `Value s ~ Byte`, which its `Bytes s` grants. A constraint of the
-context grants its equality superclasses here only if it is *smaller* than
-the head: it has fewer type constructors and variables, no variable more
-often than the head has it, and no associated type. `Bytes s` is smaller
-than `Bytes (View s)`, while a `Bytes (View s)` in the context would grant
-nothing here, for the same reason as above. An instance where an equality
-is false, or where its context does not decide it, is refused:
+context's `Value s ~ Byte`, which its `Bytes s` grants. Every class
+constraint of the context grants its equality superclasses this way. An
+instance where an equality is false, or where its context does not decide
+it, is refused:
 
 <!-- error: expected 'Byte', found 'String' in the superclasses of 'Bytes Words' -->
 ```kotlin

@@ -592,7 +592,8 @@ fun main() {
 and `Hash` can be asked for, and only `Eq`, `Hash`, `Object` and `Debug`
 refused. A type whose instance of a class is written by hand cannot also name
 that class, whether to derive it or to refuse it. `Debug` is never asked for,
-since every type has it, and `!Debug` does not remove the instance: it makes
+since every type whose fields allow it has it, and `!Debug` does not remove
+the instance: it makes
 the type print as `<Name>`, reading no field. `Object` is never asked for:
 the compiler provides its instances for every type whose values are objects,
 a program may not write one, and `!Object` refuses it. See [`Object` and

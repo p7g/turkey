@@ -338,9 +338,12 @@ break to standard output; `write` does the same without the line break.
 `Show` instance only if someone writes one; `Show` is never derived.
 
 `debug` converts a value to text that shows its structure, written as Turkey
-would build it. Every type has `Debug`: the compiler derives an instance for
-each type declaration with none written ([Derived
-instances](classes.md#derived-instances)), and the library writes the rest.
+would build it. Every type whose fields have `Debug` has it: the compiler
+derives an instance for each type declaration with none written, and the
+library writes those for the built-in types. A type whose fields do not all
+have one, such as `type T f = T(f Int)`, has none, as [Derived
+instances](classes.md#derived-instances) says under "When there is no
+implicit instance".
 `dbg(x)` writes `debug(x)` and a line break to standard error, after what
 standard output holds, and returns `x`, so it can wrap any expression.
 
@@ -354,9 +357,10 @@ standard output holds, and returns `x`, so it can wrap any expression.
 * An array or a `Vec` prints as an array literal, a `Map` as
   `{key: value, ...}` and a `Set` as `{element, ...}`, in the order the
   entries were first added.
-* What has no syntax prints as a placeholder: a function as `<fun>`, and
-  the value an [existential type](types.md#existential-types) hides as
-  `<hidden>`, unless the constructor carries `Debug` for exactly that type.
+* What has no syntax prints as a placeholder: a function as `<fun>`, and a
+  field whose type mentions a type an [existential
+  constructor](types.md#existential-types) hides as `<hidden>`, unless its
+  `Debug` follows from the classes the constructor carries.
 
 A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
 `Vec`, `Map`, `Set`, `Option`, `Either` and the tuples is their `Debug`, so a

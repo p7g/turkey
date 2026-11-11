@@ -1,0 +1,159 @@
+export (debugConstructor, debugRecord, debugObject, quoted, quotedChar, hex)
+
+-- What a derived `Debug` is written in: a constructor and its fields, a
+-- record and its fields, and the guard every object passes through, which
+-- prints `<cycle>` for an object already on the path being printed.
+--
+-- The compiler writes calls to the first three by name, with the
+-- fields' text in a `Prim.Array`, so they take one.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Char (Char)
+import Data.Byte (Byte)
+import Data.String (String)
+import Data.Array (Array)
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Bits (BitAnd(..), Shift(..), (&), (>>))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Control.Iterator (Iterator(..))
+import Control.Iterator as Iterator
+import Data.Bool (Bool(..))
+import Data.Option (Option(..))
+import Data.Char as Char
+import Data.Int as Int
+import Data.String as String
+import Data.Vec (Vec)
+import Data.Vec as Vec
+import ScopedValue (ScopedValue)
+import ScopedValue as ScopedValue
+import Turkey.Coroutine as Co
+
+-- Returns `name(p0, p1, ...)`, or `name` alone for no fields.
+fun debugConstructor(name : String, parts : Prim.Array String) -> String {
+    if Prim.arrayLength(parts) == 0 { return name }
+    let b = String.builder()
+    String.push(b, name)
+    String.push(b, "(")
+    for var i = 0; i < Prim.arrayLength(parts); i = i + 1 {
+        if i > 0 { String.push(b, ", ") }
+        String.push(b, Prim.arrayGet(parts, i))
+    }
+    String.push(b, ")")
+    String.build(b)
+}
+
+-- Returns `name { l0 = p0, l1 = p1, ... }`, as the record is built.
+fun debugRecord(name : String, labels : Prim.Array String, parts : Prim.Array String) -> String {
+    let b = String.builder()
+    String.push(b, name)
+    String.push(b, " {")
+    for var i = 0; i < Prim.arrayLength(parts); i = i + 1 {
+        String.push(b, if i > 0 { ", " } else { " " })
+        String.push(b, Prim.arrayGet(labels, i))
+        String.push(b, " = ")
+        String.push(b, Prim.arrayGet(parts, i))
+    }
+    String.push(b, " }")
+    String.build(b)
+}
+
+-- The objects on the path from the outermost `debug` call to the one
+-- running, each with the instance printing it, and the task that path
+-- belongs to.
+--
+-- Each object is held as a `Prim.Array Byte`, which it need not be. Nothing
+-- reads one as an array: `Prim.identical` compares the word alone, and every
+-- object is held as one word. One type for all of them is what lets one
+-- path hold objects of every type.
+--
+-- The path lives in a scoped value, so a nested `debug` call finds it
+-- however it was reached, through a hand-written instance included. A task
+-- inherits its creator's bindings, so it would find its creator's path too,
+-- and could change it while the creator does. A path therefore records the
+-- task that made it, and a call from any other task makes its own.
+type Path = Path { owner : Option Co.Coroutine, objects : Vec (Prim.Array Byte), sites : Vec String }
+
+let path : ScopedValue Path = ScopedValue.new()
+
+-- Returns `show()`, or `<cycle>` if the instance `site` is already printing
+-- `x` on the path being printed, with `x` and `site` on the path while
+-- `show` runs. `x` must be an object.
+--
+-- The instance is part of the key because one object can be printed by two
+-- instances in turn: a wrapper's own, then its field's, which is the same
+-- word. Only the same instance meeting the same object again goes round a
+-- cycle.
+--
+-- A path tracks only the objects being printed now, not every object
+-- printed so far, so an object reached twice by different routes prints
+-- twice, and only a cycle prints `<cycle>`.
+fun debugObject(x : a, site : String, show : fun() -> String) -> String {
+    let key : Prim.Array Byte = Prim.castAs(x)
+    let here = Co.running()
+    if let Some(p) = ScopedValue.get(path) {
+        if sameTask(p.owner, here) { return within(p, key, site, show) }
+    }
+    let fresh = Path { owner = here, objects = Vec.new(8), sites = Vec.new(8) }
+    ScopedValue.with(path, fresh, fun() = within(fresh, key, site, show))
+}
+
+fun within(p : Path, key : Prim.Array Byte, site : String, show : fun() -> String) -> String {
+    -- A scan rather than a set keyed by address: a path is as deep as the
+    -- printing recursion, and this keeps addresses out of the program.
+    for var i = 0; i < len(p.objects); i = i + 1 {
+        if Prim.identical(p.objects[i], key) && p.sites[i] == site { return "<cycle>" }
+    }
+    Vec.push(p.objects, key)
+    Vec.push(p.sites, site)
+    let out = show()
+    let _ = Vec.pop(p.objects)
+    let _ = Vec.pop(p.sites)
+    out
+}
+
+fun sameTask(a : Option Co.Coroutine, b : Option Co.Coroutine) -> Bool = match (a, b) {
+    (Some(x), Some(y)) -> Prim.identical(x, y)
+    (None, None) -> True
+    _ -> False
+}
+
+-- Returns `s` as a string literal that reads back as `s`: in double quotes,
+-- with `"` and `\` escaped, and every control character, C0, DEL or C1,
+-- as an escape.
+fun quoted(s : String) -> String {
+    let b = String.builder()
+    String.push(b, "\"")
+    for c in String.codePoints(s) {
+        String.push(b, if c == '"' { "\\\"" } else { escaped(c) })
+    }
+    String.push(b, "\"")
+    String.build(b)
+}
+
+-- Returns `c` as a character literal that reads back as `c`.
+fun quotedChar(c : Char) -> String =
+    "'" + (if c == '\'' { "\\'" } else { escaped(c) }) + "'"
+
+-- `c` as it stands in a literal, but for a quote, which only the literal
+-- around it knows whether to escape.
+fun escaped(c : Char) -> String = match c {
+    '\\' -> "\\\\"
+    '\n' -> "\\n"
+    '\t' -> "\\t"
+    '\r' -> "\\r"
+    '\0' -> "\\0"
+    _ -> {
+        let n = Char.toInt(c)
+        if n < 0x20 || (n >= 0x7F && n <= 0x9F) { "\\u{" + hex(n) + "}" } else { Char.toString(c) }
+    }
+}
+
+-- Returns `n`, which must not be negative, in hexadecimal, upper case,
+-- with no prefix.
+fun hex(n : Int) -> String =
+    if n < 16 { hexDigits[n] } else { hex(n >> 4) + hexDigits[n & 15] }
+
+let hexDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C", "D", "E", "F"]

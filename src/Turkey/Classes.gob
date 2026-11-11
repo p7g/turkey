@@ -4,7 +4,9 @@ export (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
     ClassTable(..), newClassTable, Leftover(..),
-    derivedMethod, derivedParts, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
+    derivedMethod, derivedParts, hides, isFunctionDebug, alwaysObject,
+    Carried(..), carriedKey, fieldKey, entailed, Opening(..), openHidden, isDerivedMethod, checkDerives,
+    whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam,
@@ -254,6 +256,7 @@ fun instCon(inst : InstInfo) -> String {
     match h {
         TCon(c) -> c.name
         TTuple(elems) -> "Tuple" + Int.toString(len(elems))
+        TFun(params, _) -> "Fun" + Int.toString(len(params))
         _ -> bug("validated instance head has no stable key", None)
     }
 }
@@ -282,6 +285,9 @@ fun instHeadKey(t : Ty.Type) -> String {
     match h {
         TCon(c) -> "con " + c.name
         TTuple(elems) -> "tuple " + Int.toString(len(elems))
+        -- Only the compiler makes an instance at a function type
+        -- (`deriveFunctionDebug`).
+        TFun(params, _) -> "fun " + Int.toString(len(params))
         _ -> bug("instance head was not shape-checked", None)
     }
 }
@@ -330,6 +336,75 @@ type ClassTable = ClassTable {
     -- among those registered when they were last asked for
     -- (`Decls.selfAssigned`).
     selfReach : Decls.SelfReach,
+    -- How a derived `debug` opens each existential constructor whose hidden
+    -- fields it prints with the dictionaries the constructor carries, by
+    -- `carriedKey`. `Turkey.Infer.derivedFields` writes it as it checks the
+    -- instance, and `Turkey.Lower` reads it as it writes the method.
+    carried : Map String Carried,
+}
+
+-- An existential constructor opened by a derived `debug`: the rigid
+-- constants that stand for its hidden types, the substitution that puts
+-- them in place of its hidden variables, and the name and class of each
+-- dictionary it carries, in the order of its declaration's context.
+type Carried = Carried {
+    skolems : Vec ConCell,
+    mapping : Map Int Ty.Type,
+    givens  : Array (String, Pred),
+}
+
+-- The key `carried` records the constructor `con` of `inst`'s type under.
+fun carriedKey(inst : InstInfo, con : String) -> String = instHeadKey(inst.head) + " " + con
+
+-- The key a derived `debug`'s field `i` of the existential constructor
+-- `con` has among its field dictionaries (`InstancePlan.fieldDicts`), apart
+-- from every type key.
+fun fieldKey(con : String, i : Int) -> String = "%field " + con + " " + Int.toString(i)
+
+-- Returns whether `wanted` follows from `givens`, over `skolems`, as the
+-- solver finds it (`simplify`).
+fun entailed(t : ClassTable, givens : Vec Pred, wanted : Pred, skolems : Vec ConCell) -> Bool =
+    len(t.simplify(givens, [wanted], skolems)) == 0
+
+-- An existential constructor of a derived `Debug` instance's type, opened
+-- inside the instance: `Debug` at each field whose type it hides, by the
+-- field's position, over the head's skolems and rigid constants of its own
+-- for the hidden types, and the classes the constructor carries.
+type Opening = Opening {
+    carried : Carried,
+    wanted  : Array (Int, Pred),
+    -- The head's skolems and the opening's own constants together: what
+    -- the wanteds are solved over.
+    skolems : Vec ConCell,
+}
+
+-- Returns `c`, a constructor of the type of `inst`, which a derived
+-- `Debug` is for, opened over `sk`, the skolems that stand for the head's
+-- variables. Its own constants are named apart from those, since the
+-- lowering tells the head's apart by name (`Turkey.Lower.underInstance`).
+fun openHidden(t : ClassTable, inst : InstInfo, c : ConInfo, sk : Skolems) -> Opening {
+    let types = Option.unwrapOr(Decls.conFieldTypes(t.decls, inst.head, c.name), [])
+    let inner = newSkolems()
+    for name in Set.elements(sk.used) { Set.add(inner.used, name) }
+    for (_, name) in Map.entries(inst.names) { Set.add(inner.used, name) }
+    for var i = 0; i < len(c.exists) && i < len(c.existsNames); i = i + 1 {
+        let _ = skolemBind(inner, c.exists[i], c.existsNames[i])
+    }
+    let opened = fun(ty : Ty.Type) = skolemApply(sk, skolemApply(inner, ty))
+    let preds = Array.map(c.scheme.preds, fun(p) = Ty.pred(p.name, Array.map(p.args, opened)))
+    let givens = Array.init(len(preds), fun(k) =
+        ("%carried." + Int.toString(k) + "." + preds[k].name, preds[k]))
+    let wanted = []
+    for var i = 0; i < len(types); i = i + 1 {
+        if hides(c, types[i]) { Vec.push(wanted, (i, Ty.pred(P.debugClass, [opened(types[i])]))) }
+    }
+    let skolems = Vec.new(len(sk.made) + len(inner.made))
+    for s in sk.made { Vec.push(skolems, s) }
+    for s in inner.made { Vec.push(skolems, s) }
+    Opening {
+        carried = Carried { skolems = inner.made, mapping = inner.mapping, givens = givens },
+        wanted = Vec.toArray(wanted), skolems = skolems,
+    }
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -348,6 +423,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     open = False
     simplify = fun(_, _, _) = bug("a derivation was begun with no solver to simplify it", None)
     selfReach = Decls.newSelfReach()
+    carried = Map.new()
 }
 
 -- -- dictionary slots ---------------------------------------------------------------
@@ -1720,6 +1796,50 @@ fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
     Some(inst)
 }
 
+-- Puts in the table, if it is not there, the `Debug` instance for
+-- functions of the arity `p` asks about, when it asks about a function.
+--
+-- A function has nothing to print but that it is one, so its instance
+-- needs nothing of its parameters or result, and the lowering writes its
+-- `debug` as `<fun>` (`Turkey.Lower.functionDebugDict`). One instance
+-- serves every function type of an arity. A program cannot write an
+-- instance head that is a function type, so nothing overlaps it.
+fun deriveFunctionDebug(t : ClassTable, p : Pred) -> Unit {
+    let arity = match Ty.prune(p.args[0]) {
+        TFun(params, _) -> len(params)
+        _ -> return {}
+    }
+    let key = "fun " + Int.toString(arity)
+    for inst in instancesOf(t, P.debugClass) {
+        if instHeadKey(inst.head) == key { return {} }
+    }
+    let inst = InstInfo {
+        cls = P.debugClass, head = TFun(Array.init(arity, fun(_) = Ty.tvar(1)), Ty.tvar(1)),
+        context = [], equalities = [],
+        decl = InstanceDecl {
+            span = generatedSpan(), cls = P.debugClass,
+            head = Type { id = 0, span = generatedSpan(),
+                          kind = TECon(P.debugClass, Vec.new(1)) },
+            context = Vec.new(1), methods = Vec.new(1),
+            families = Vec.new(1),
+        },
+        names = Map.new(), families = Map.new(), plan = None, module_ = "",
+        derived = False,
+    }
+    match Map.get(t.instances, P.debugClass) {
+        Some(found) -> Vec.push(found, inst)
+        None -> Map.put(t.instances, P.debugClass, [inst])
+    }
+}
+
+-- Returns whether `inst` is the `Debug` instance for functions of one arity
+-- (`deriveFunctionDebug`).
+fun isFunctionDebug(inst : InstInfo) -> Bool =
+    inst.cls == P.debugClass && match inst.head {
+        TFun(_, _) -> True
+        _ -> False
+    }
+
 -- Returns the key that tells derived `Typed` instances apart: the head's
 -- constructor, then `typedSuffix`.
 fun typedHeadKey(head : Ty.Type) -> String = instHeadKey(head) + typedSuffix(head)
@@ -1840,6 +1960,7 @@ fun derivedMethod(cls : String) -> Option String =
     else if cls == P.ordClass { Some("lt") }
     else if cls == P.hashClass { Some("hashInto") }
     else if cls == P.objectClass { Some("identical") }
+    else if cls == P.debugClass { Some("debug") }
     else { None }
 
 -- Returns whether the method `name` of `inst`'s class is the one `inst`, a
@@ -1905,7 +2026,9 @@ fun listsFor(t : ClassTable, tycon : String, cls : String) -> Bool {
 -- one, and `implicitExclusion` gives the other reasons. Whether the derived
 -- instance then exists is up to its fields.
 fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
-    if refuses(t, tycon, cls) { return False }
+    -- `!Debug` keeps the instance and makes it read no field
+    -- (`derivedParts`).
+    if refuses(t, tycon, cls) && cls != P.debugClass { return False }
     if listsFor(t, tycon, cls) { return True }
     -- A written instance is in the type's module or the class's, by the
     -- orphan rule, and a predicate can name the class and the type only once
@@ -1918,7 +2041,7 @@ fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
 -- Whether every type derives `cls` without asking. `Ord` is not among them,
 -- for the reason `refusable` gives.
 fun isImplicit(cls : String) -> Bool =
-    cls == P.eqClass || cls == P.hashClass || cls == P.objectClass
+    cls == P.eqClass || cls == P.hashClass || cls == P.objectClass || cls == P.debugClass
 
 -- Returns why `tycon` gets no implicit instance of `cls` though its fields
 -- might have the class, as a phrase about the type: "can reach itself
@@ -1928,9 +2051,12 @@ fun isImplicit(cls : String) -> Bool =
 -- rules the instance out whatever the list says, so that the diagnostic
 -- gives that reason and not a fix that cannot work (`checkEntry`).
 fun implicitExclusion(t : ClassTable, cls : String, tycon : String) -> Option String {
-    -- Both reasons below are about following a value's fields, which an
-    -- `Object` instance never does.
-    if !isImplicit(cls) || cls == P.objectClass || listsFor(t, tycon, cls) { return None }
+    -- Both reasons below are about `Eq` and `Hash`. An `Object` instance
+    -- follows no field, and a derived `Debug` prints a cycle as `<cycle>`.
+    if !isImplicit(cls) || cls == P.objectClass || cls == P.debugClass
+            || listsFor(t, tycon, cls) {
+        return None
+    }
     for sup in superclassesOf(t, cls) {
         if refuses(t, tycon, sup) || Option.isSome(writtenInstance(t, sup, tycon)) { return None }
     }
@@ -2295,6 +2421,28 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
         if over && !l.diverged && isClass(t, l.pred.name) { Vec.push(good, l.pred) }
         else { Vec.push(rest, l) }
     }
+    -- A field whose type an existential hides prints with what its
+    -- constructor carries. What the solver leaves of its `Debug` under
+    -- those, when all of it is classes over the head's variables, floats
+    -- out into the context, as GHC's `approximateWC` floats what mentions no
+    -- inner skolem out of an implication. A field that leaves anything else
+    -- prints as `<hidden>` and asks nothing (`Turkey.Infer.carriedFields`).
+    if cls == P.debugClass {
+        for c in info.variants {
+            if len(c.exists) == 0 { continue }
+            let o = openHidden(t, inst, c, sk)
+            let carried = Vec.fromArray(Array.map(o.carried.givens, _.1))
+            for (_, want) in o.wanted {
+                let left = t.simplify(carried, [want], o.skolems)
+                let floats = Iterator.all(left, fun(l) = !l.diverged && isClass(t, l.pred.name)
+                    && match Ty.prune(l.pred.args[0]) {
+                        TCon(con) -> Map.contains(params, con.uid)
+                        _ -> False
+                    })
+                if floats { for l in left { Vec.push(good, l.pred) } }
+            }
+        }
+    }
     let theta = minimal(t, good)
     -- GHC's [STEP DAC RESIDUAL]: the rest must follow from the context,
     -- `forall tvs. theta => rest`, as an equality superclass of `Bytes s`
@@ -2347,15 +2495,21 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
 -- at `head` needs `cls` at, each with its constructor and position, or
 -- `Left` of why there can be no instance whatever the fields' types are.
 -- The fields are those the derived method reads: every field, except that
--- an `Object` instance reads none (`objectParts`).
+-- an `Object` instance reads none (`objectParts`), a `Debug` instance reads
+-- none of a type that says `!Debug`, and none whose type an existential
+-- hides.
 fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
                  head : Ty.Type) -> Either String (Array (ConInfo, Int, Ty.Type)) {
     if cls == P.objectClass { return objectParts(d, info, head) }
+    let debug = cls == P.debugClass
+    if debug && Iterator.any(info.derives, fun(e) = e.refused && e.cls == cls) {
+        return Right([])
+    }
     let out = []
     for c in info.variants {
         -- Two values of one existential constructor may hide different
         -- types, so no instance for one hidden type compares them.
-        if len(c.existsNames) > 0 {
+        if len(c.existsNames) > 0 && !debug {
             return Left("constructor '" + Ty.shortName(c.name) + "' hides the type '"
                         + c.existsNames[0] + "'")
         }
@@ -2363,7 +2517,11 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
             Some(ts) -> ts
             None -> return Left("it is not a declared type")
         }
-        for var i = 0; i < len(types); i = i + 1 { Vec.push(out, (c, i, types[i])) }
+        for var i = 0; i < len(types); i = i + 1 {
+            -- A derived `debug` prints such a field as `<hidden>`.
+            if debug && hides(c, types[i]) { continue }
+            Vec.push(out, (c, i, types[i]))
+        }
     }
     Right(Vec.toArray(out))
 }
@@ -2400,6 +2558,43 @@ fun valueType(t : ClassTable, tycon : String, inner : Bool, depth : Int) -> Bool
             match Ty.spine(Ty.prune(field)).0 {
                 TCon(c) -> c.uid == 0 && valueType(t, c.name, True, depth - 1)
                 TTuple(_) | TFun(_, _) -> True
+                _ -> False
+            }
+        }
+    }
+}
+
+-- Returns whether `ty`, the type of a field of `c`, mentions a type `c`
+-- hides in an existential bracket.
+fun hides(c : ConInfo, ty : Ty.Type) -> Bool {
+    if len(c.exists) == 0 { return False }
+    let free = Ty.freeVars(ty)
+    Iterator.any(c.exists, fun(v) = Set.contains(free, v.id))
+}
+
+-- Returns whether every value of `tycon` is an object, whatever its type
+-- arguments: it has `Object` with no context. A wrapper over a parameter
+-- may hold a value, so it is not.
+fun alwaysObject(t : ClassTable, tycon : String) -> Bool = objectType(t, tycon, wrapperDepth)
+
+fun objectType(t : ClassTable, tycon : String, depth : Int) -> Bool {
+    if depth == 0 || refuses(t, tycon, P.objectClass) { return False }
+    if tycon == "Prim.Array" || tycon == "Prim.Atomic" { return True }
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(i) -> i
+        None -> return False
+    }
+    let head = match declaredHead(info) {
+        Some(h) -> h
+        None -> return False
+    }
+    match objectParts(t.decls, info, head) {
+        Left(_) -> False
+        Right(parts) -> {
+            if len(parts) == 0 { return True }
+            let (_, _, field) = parts[0]
+            match Ty.spine(Ty.prune(field)).0 {
+                TCon(c) -> c.uid == 0 && objectType(t, c.name, depth - 1)
                 _ -> False
             }
         }
@@ -2720,6 +2915,11 @@ fun checkEntry(t : ClassTable, d : TypeDecl, entry : Derive) -> Bool {
         }
         return False
     }
+    if entry.cls == P.debugClass && !entry.refused {
+        report("every type has 'Debug' already, so it cannot be derived; "
+               + "remove it from the list", at)
+        return False
+    }
     if entry.cls == P.objectClass && !entry.refused {
         report("every type whose values are objects has 'Object' already, so it cannot "
                + "be derived; remove it from the list", at)
@@ -2805,6 +3005,7 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     if p.name == P.typedClass {
         let _ = deriveTyped(t, p)
     }
+    if p.name == P.debugClass { deriveFunctionDebug(t, p) }
     -- A derived instance is the only one for its type, so it is found by
     -- name rather than among every instance of the class.
     let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))

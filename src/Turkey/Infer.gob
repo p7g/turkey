@@ -995,7 +995,48 @@ fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
         Vec.push(wanteds, C.cpredInto(Ty.pred(inst.cls, [Classes.skolemApply(sk, ty)]),
                                       hole, where, required))
     }
+    if inst.cls == P.debugClass { carriedFields(g, inst, info, sk, where, required, out, wanteds) }
     out
+}
+
+-- Adds to `out`, for each existential constructor of `info`, the derived
+-- `Debug` at each field whose type it hides and whose `Debug` follows from
+-- the instance's context and the classes the constructor carries, keyed
+-- `Classes.fieldKey`, and adds to `wanteds` an implication that checks
+-- them: under the carried classes, over the head's skolems `sk` and
+-- constants of the opening's own (`Classes.openHidden`), which
+-- `Classes.carried` records for the lowering to open the constructor with.
+-- The derivation floated what those fields need of the head's variables
+-- into the context (`Classes.inferContext`), so a field this asks for
+-- holds. A field whose `Debug` does not follow prints as `<hidden>`, and
+-- nothing is asked of it.
+fun carriedFields(g : Generator, inst : InstInfo, info : Decls.TyconInfo, sk : Skolems,
+                  where : Option Span, required : String, out : Vec (String, Pred, Hole),
+                  wanteds : Vec Constraint) -> Unit {
+    let context = Array.map(Vec.toArray(inst.context), Classes.skolemApplyPred(sk, _))
+    for c in info.variants {
+        if len(c.exists) == 0 { continue }
+        let o = Classes.openHidden(g.classes, inst, c, sk)
+        let givens = Vec.new(len(context) + len(o.carried.givens))
+        for p in context { Vec.push(givens, p) }
+        for (_, p) in o.carried.givens { Vec.push(givens, p) }
+        let inner = Vec.new(2)
+        for (i, want) in o.wanted {
+            if !Classes.entailed(g.classes, givens, want, o.skolems) { continue }
+            let hole = newHole()
+            Vec.push(out, (Classes.fieldKey(c.name, i), want, hole))
+            Vec.push(inner, C.cpredInto(want, hole, where, required))
+        }
+        if len(inner) == 0 { continue }
+        Map.put(g.classes.carried, Classes.carriedKey(inst, c.name), o.carried)
+        let assumed = Vec.new(len(o.carried.givens))
+        for (name, p) in o.carried.givens { Vec.push(assumed, (name, p, None)) }
+        Vec.push(wanteds, CAssume(assumed, None, CLet(LetCell {
+            binds = [(C.noBinder, "%carried", Ty.tUnit())], defn = CAnd(inner),
+            body = CAnd([]), span = where, topLevel = False, dicts = None,
+            skolems = o.carried.skolems, rigid = [], members = [],
+        })))
+    }
 }
 
 -- Returns the span of the derive-list entry of `info` that asked for

@@ -11,7 +11,7 @@ export (
     uncovered,
     bySuper, superEqualities, equalityAt, openedPreds,
     byInst, selectInstance, contextAt, equalitiesAt, contextPreds,
-    superPath, patersonSmaller, isClass, method, minimal,
+    superPath, isClass, method, minimal,
     fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
@@ -850,6 +850,7 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
     -- A context constrains the head's variables and binds none of its own:
     -- an instance is selected by its head alone, so nothing at a use could
     -- say what another variable is.
+    var stray = False
     for p in d.context {
         let sides = match p.kind {
             PClass(_, arg) -> [arg]
@@ -859,10 +860,14 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
             if let Some((name, at)) = strayVar(side, tyvars) {
                 report("'" + name + "' is not bound by the instance head '"
                        + Ty.showAt(h, writtenNamer(namesOf(tyvars)), 0) + "'", Some(at))
+                stray = True
             }
         }
     }
     let written = resolveContext(t, d.context, tyvars, None)
+    -- A stray variable occurs in the context and not in the head, so the
+    -- termination check would only report it again, as a repeated variable.
+    if !stray && !checkTermination(d, h, written, tyvars) { return None }
     let context = Vec.filter(written, fun(p) = p.name != Ty.equals)
     let equalities = Vec.filter(written, fun(p) = p.name == Ty.equals)
     let families = resolveFamilies(t, d, info, h, tyvars, fresh)
@@ -888,6 +893,58 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> Option 
         None -> Map.put(t.instances, d.cls, [inst])
     }
     Some(inst)
+}
+
+-- The Paterson conditions: every class predicate of an instance's context must
+-- be smaller than the instance's head (`unsmaller`).
+--
+-- That is what makes instance resolution terminate. Solving a wanted through
+-- an instance leaves its context's predicates, each smaller than the wanted it
+-- replaced, for every type the head's variables stand for, and a size cannot
+-- shrink for ever. The depth bound on subgoals (`Turkey.Constraints.tooDeep`)
+-- does not do this alone: a context that doubles its argument, as
+-- `Eq (W (a, a))` does for `Eq (W a)`, makes the type at depth d of size 2^d,
+-- and the solver, which walks a type as a tree, never gets near the bound.
+--
+-- An equality is not checked. Solving one reduces families, which terminates
+-- by `checkFamDecreasing`, and never leads back to a class predicate. Its
+-- variables are the head's (`strayVar`), so it cannot give a class predicate
+-- a variable to grow on either. Nor is a `Typed` predicate: only the
+-- compiler's own instances solve one, and each of those needs `Typed` only
+-- of its head's arguments.
+--
+-- Returns whether the context obeys the rule, reporting the first predicate
+-- that does not, at the predicate.
+fun checkTermination(d : InstanceDecl, h : Ty.Type, written : Vec Pred,
+                     tyvars : Map String Ty.Type) -> Bool {
+    -- `resolveContext` resolves one predicate for each written one unless it
+    -- reported an unknown class, which is error enough for this instance.
+    if len(written) != len(d.context) { return True }
+    let head = Ty.pred(d.cls, [h])
+    let n = writtenNamer(namesOf(tyvars))
+    for var i = 0; i < len(written); i = i + 1 {
+        let p = written[i]
+        if p.name == Ty.equals || p.name == P.typedClass { continue }
+        let why = match unsmaller(p, head) {
+            Some(w) -> w
+            None -> continue
+        }
+        let shown = "'" + Ty.showPredWith(p, n) + "'"
+        let shownHead = "'" + Ty.showPredWith(head, n) + "'"
+        let reason = match why {
+            AppliesFamily(name) -> "it applies the associated type '" + surfaceMember(name) + "'"
+            NoSmaller -> "it is no smaller than the instance head " + shownHead
+            Repeats(vars) -> {
+                let names = Vec.map(vars, fun(v) = "'" + Ty.showAt(v, n, 0) + "'")
+                String.join(names, ", ")
+                    + (if len(vars) == 1 { " occurs" } else { " occur" })
+                    + " in it more often than in the instance head " + shownHead
+            }
+        }
+        report(shown + " cannot be in an instance's context: " + reason, Some(d.context[i].span))
+        return False
+    }
+    True
 }
 
 -- Returns what each variable of the annotation scope `tyvars` is called, by
@@ -1728,14 +1785,12 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- with an empty context, and `settle` infers each context again under the
 -- others until none changes: the least fixed point, as GHC's
 -- `simplifyInstanceContexts` finds it. The rounds end: a context holds only
--- classes over parameters, so it can grow only so far. A wanted that grows
--- without end, through a written instance whose context is no smaller than
--- its head, goes deeper than the solver follows instances and is no
--- instance. A context that doubles its argument, `Eq (W a) : Eq (W (a, a))`,
--- is the exception: the solver bounds how deep it goes, not how large the
--- types grow, so it never gets that deep. A non-regular type is not such a
--- case: `Nest a` holding a `Nest (Array a)` reduces `Eq (Nest (Array a))`
--- back to `Eq a`.
+-- classes over parameters, so it can grow only so far. Every written
+-- instance's context is smaller than its head (`checkTermination`), so every
+-- wanted the solver reduces for a derivation ends, though a long chain may
+-- go deeper than the solver follows instances, and is then no instance. A
+-- non-regular type is not such a case: `Nest a` holding a `Nest (Array a)`
+-- reduces `Eq (Nest (Array a))` back to `Eq a`.
 
 -- A wanted the solver left unsolved when it simplified a derivation's
 -- wanteds (`ClassTable.simplify`).
@@ -2634,52 +2689,83 @@ fun superPath(t : ClassTable, given : Pred, key : String,
     None
 }
 
--- Returns whether the class predicate `p` is Paterson-smaller than `head`:
--- for every type its arguments may become, it is smaller. That is GHC's
--- `ltPatersonSize` of `pSizeClassPred`s (Note [The PatersonSize of a type] in
--- `GHC.Tc.Utils.TcType`): its argument has strictly fewer constructors and
--- variables than `head`'s, no variable occurs in it more often than in
--- `head`'s, and it applies no family, whose size could be anything. A skolem
--- counts as the variable it stands for. Every class has one parameter, so the
--- class's own constructor is on both sides and drops out.
-fun patersonSmaller(p : Pred, head : Pred) -> Bool {
-    let small = Map.new()
-    let large = Map.new()
-    match (patersonSize(p.args[0], small), patersonSize(head.args[0], large)) {
-        (Some(pSize), Some(headSize)) -> if pSize >= headSize { return False }
-        _ -> return False
+-- Why a class predicate in an instance's context is not Paterson-smaller
+-- than the instance's head.
+type Unsmaller
+    -- It applies the associated type of this name, which could be any size.
+    = AppliesFamily(String)
+    -- It has at least as many constructors and variables as the head.
+    | NoSmaller
+    -- Each of these variables occurs in it more often than in the head.
+    | Repeats(Vec Ty.Type)
+
+-- Returns why the class predicate `p` is not Paterson-smaller than `head`, or
+-- `None` if it is: for every type its variables may become, it then has fewer
+-- constructors than `head`. Every class has one parameter, so the class's own
+-- constructor is on both sides and drops out.
+fun unsmaller(p : Pred, head : Pred) -> Option Unsmaller {
+    -- GHC's `ltPatersonSize` of `pSizeClassPred`s (Note [The PatersonSize of
+    -- a type] in `GHC.Tc.Utils.TcType`), in its order: a family first, then
+    -- the size, then each variable's occurrences.
+    let small = noOccurrences()
+    let large = noOccurrences()
+    let pSize = match patersonSize(p.args[0], small) {
+        Left(family) -> return Some(AppliesFamily(family))
+        Right(n) -> n
     }
-    for (v, n) in Map.entries(small) {
-        if n > Map.getOr(large, v, 0) { return False }
+    let headSize = match patersonSize(head.args[0], large) {
+        Left(family) -> return Some(AppliesFamily(family))
+        Right(n) -> n
     }
-    True
+    if pSize >= headSize { return Some(NoSmaller) }
+    let repeated = Vec.new(1)
+    for key in small.order {
+        if Map.getOr(small.counts, key, 0) > Map.getOr(large.counts, key, 0) {
+            Vec.push(repeated, Map.get(small.types, key)?)
+        }
+    }
+    if len(repeated) > 0 { Some(Repeats(repeated)) } else { None }
 }
 
+-- The variables of a type, by id: how often each occurs, the type it is, and
+-- the order they first occur in.
+type Occurrences = Occurrences {
+    counts : Map String Int,
+    types : Map String Ty.Type,
+    order : Vec String,
+}
+
+fun noOccurrences() -> Occurrences =
+    Occurrences { counts = Map.new(), types = Map.new(), order = Vec.new(2) }
+
 -- Returns how many constructors and variables `t` has, counting each
--- variable's occurrences into `vars`, or `None` if it applies a family.
-fun patersonSize(t : Ty.Type, vars : Map String Int) -> Option Int = match Ty.prune(t) {
-    TVar(cell) -> Some(occurrence(vars, "v" + Int.toString(cell.id)))
-    TCon(con) -> Some(if con.uid == 0 { 1 }
-                      else { occurrence(vars, "k" + Int.toString(con.uid)) })
-    TApp(fn, arg, _) -> Some(patersonSize(fn, vars)? + patersonSize(arg, vars)?)
+-- variable's occurrences into `vars`, or the name of a family it applies.
+fun patersonSize(t : Ty.Type, vars : Occurrences) -> Either String Int = match Ty.prune(t) {
+    TVar(cell) -> {
+        let key = Int.toString(cell.id)
+        if !Map.contains(vars.counts, key) {
+            Vec.push(vars.order, key)
+            Map.put(vars.types, key, t)
+        }
+        Map.put(vars.counts, key, Map.getOr(vars.counts, key, 0) + 1)
+        Right(1)
+    }
+    TApp(fn, arg, _) -> Right(patersonSize(fn, vars)? + patersonSize(arg, vars)?)
+    -- Left to right, as `pSizeTypeX` visits a function's argument before its
+    -- result, so that a diagnostic names the first family and variable as
+    -- written.
     TFun(params, ret) -> {
-        var n = 1 + patersonSize(ret, vars)?
+        var n = 1
         for q in params { n = n + patersonSize(q, vars)? }
-        Some(n)
+        Right(n + patersonSize(ret, vars)?)
     }
     TTuple(elems) -> {
         var n = 1
         for e in elems { n = n + patersonSize(e, vars)? }
-        Some(n)
+        Right(n)
     }
-    TFam(_, _, _) -> None
-    _ -> Some(1)
-}
-
--- Counts one occurrence of the variable `key` in `vars`, and returns 1.
-fun occurrence(vars : Map String Int, key : String) -> Int {
-    Map.put(vars, key, Map.getOr(vars, key, 0) + 1)
-    1
+    TFam(name, _, _) -> Left(name)
+    _ -> Right(1)
 }
 
 fun isClass(t : ClassTable, name : String) -> Bool = Map.contains(t.classes, name)

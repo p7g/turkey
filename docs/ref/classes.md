@@ -525,12 +525,15 @@ fun main() {
 ```
 
 **What a list may name.** Each class appears at most once. Only `Eq`, `Ord`
-and `Hash` can be derived, and only `Eq` and `Hash` refused. A type whose
-instance of a class is written by hand cannot also name that class, whether
-to derive it or to refuse it. `Typed` is never named: the compiler provides
-its instances for every type, and a program may not write one. See [`Typed`
-and `cast`](builtins.md#typed-and-cast). Every other class gets its instances
-only from instances someone writes.
+and `Hash` can be asked for, and only `Eq`, `Hash` and `Object` refused. A
+type whose instance of a class is written by hand cannot also name that
+class, whether to derive it or to refuse it. `Object` is never asked for:
+the compiler provides its instances for every type whose values are objects,
+a program may not write one, and `!Object` refuses it. See [`Object` and
+`identical`](builtins.md#object-and-identical). `Typed` is never named: the
+compiler provides its instances for every type, and a program may not write
+one. See [`Typed` and `cast`](builtins.md#typed-and-cast). Every other class
+gets its instances only from instances someone writes.
 
 ## Using a class
 

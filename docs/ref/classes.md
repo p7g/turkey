@@ -529,17 +529,39 @@ A field whose type has an instance that needs the class for a part of it
 names that part: a field of type `Array (fun() -> Int)` *contains*
 `fun() -> Int`, which has no `Eq`.
 
-A derivation reads each field's type as it is written, and never works out
-what an [associated type](#associated-types) stands for. A field whose
-instance needs the class at an associated type, such as `Array (Key c)` or
-`Key (Array Bool)`, cannot derive it, even where the associated type stands
-for a type that has the class. Neither can a field whose instance needs an
-[equality](#equality-constraints) such as `Key c ~ Int`. Write the instance
-by hand instead:
+A derivation reads each field's type as the type checker reads any type:
+an [associated type](#associated-types) is worked out, and an
+[equality](#equality-constraints) a field's instance needs is checked. With
+`instance Eq (K c) : Key c ~ Int`, a field of type `K (Array Bool)` needs
+`Key (Array Bool) ~ Int`, which holds:
 
-<!-- error: 'Counted' cannot derive 'Eq': field 0 of 'Counted' has type 'Key (Array Bool)', which is an associated type, and a derived instance cannot reduce one; write 'instance Eq Counted' by hand -->
+<!-- run -->
 ```kotlin
-type Counted : Eq = Counted(Key (Array Bool))
+type K c = K(Int)
+
+instance Eq (K c) : Key c ~ Int {
+    fun eq(K(a), K(b)) = a == b
+}
+
+type Tagged : Eq = Tagged(K (Array Bool))
+
+fun main() {
+    print(Tagged(K(1)) == Tagged(K(1)))
+}
+```
+
+```text
+True
+```
+
+What a derived instance can require of the type's parameters is only
+classes. A field whose instance needs the class at an associated type of a
+parameter, such as `Array (Key c)`, or needs an equality about one, such as
+`Key c ~ Int`, cannot derive it. Write the instance by hand instead:
+
+<!-- error: 'Keys' cannot derive 'Eq': field 0 of 'Keys' has type 'Array (Key c)', which contains 'Key c', an associated type that does not reduce; write 'instance Eq (Keys c)' by hand -->
+```kotlin
+type Keys c : Eq = Keys(Array (Key c))
 ```
 
 **Opting out.** `!Eq` or `!Hash` in the list says that the type has none:

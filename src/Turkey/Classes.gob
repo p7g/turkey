@@ -3,7 +3,7 @@ export (
     MethodInfo(..), hasDefault, methodDicts, methodEqualities, methodEvidence,
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
-    ClassTable(..), newClassTable,
+    ClassTable(..), newClassTable, Leftover(..),
     derivedMethod, isDerivedMethod, checkDerives, whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
@@ -320,6 +320,12 @@ type ClassTable = ClassTable {
     -- `Turkey.Infer.generate` for a component of modules to the end of
     -- `Turkey.Infer.solve` for it. See `derive`.
     var open : Bool,
+    -- Solves wanteds a derivation asks for under givens, both over the
+    -- skolems that stand for its type's parameters, and returns what is left
+    -- of the wanteds: the solver's own simplifier, which
+    -- `Turkey.Constraints.newSolver` puts here, because this module is below
+    -- the solver's. See `inferContext`.
+    var simplify : fun(Vec Pred, Vec Pred, Vec ConCell) -> Vec Leftover,
     -- The types that can reach themselves through an assignable position,
     -- among those registered when they were last asked for
     -- (`Decls.selfAssigned`).
@@ -340,6 +346,7 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     checkedUpTo = 0
     assumedListed = None
     open = False
+    simplify = fun(_, _, _) = bug("a derivation was begun with no solver to simplify it", None)
     selfReach = Decls.newSelfReach()
 }
 
@@ -1763,8 +1770,8 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 --
 -- **Its context is inferred, as GHC's deriving infers it**
 -- (`GHC.Tc.Deriv.Infer`). The class is wanted at each field's type, and
--- each wanted is reduced through the instances that cover it until only
--- classes over the type's own parameters remain: those are the context
+-- the solver simplifies those wanteds, with the type's parameters as
+-- skolems, until only classes over them remain: those are the context
 -- (`inferContext`). So `type M k v : Eq = M(Map k v)` gets
 -- `Eq (M k v) : Hash k, Eq v`, from `Map`'s own instance, and a phantom
 -- parameter, in no field's type, gets nothing. The instance is sound
@@ -1777,13 +1784,35 @@ fun appliedTo(general : Ty.Type, n : Int) -> Ty.Type {
 -- instance begun while a derivation runs is in the table from the start,
 -- with an empty context, and `settle` infers each context again under the
 -- others until none changes: the least fixed point, as GHC's
--- `inferInstanceContexts` finds it. It is never looped on: a context holds
--- only classes over parameters, so it can grow only so far. Every written
+-- `simplifyInstanceContexts` finds it. The rounds end: a context holds only
+-- classes over parameters, so it can grow only so far. Every written
 -- instance's context is smaller than its head (`checkTermination`), so every
--- reduction ends, but a long one, through more than `reductionLimit` steps
--- that do not ask for a head variable, is cut off there and is no instance.
--- A non-regular type is not such a case: `Nest a` holding a
--- `Nest (Array a)` reduces `Eq (Nest (Array a))` back to `Eq a`.
+-- wanted the solver reduces for a derivation ends, though a long chain may
+-- go deeper than the solver follows instances, and is then no instance. A
+-- non-regular type is not such a case: `Nest a` holding a `Nest (Array a)`
+-- reduces `Eq (Nest (Array a))` back to `Eq a`.
+
+-- A wanted the solver left unsolved when it simplified a derivation's
+-- wanteds (`ClassTable.simplify`).
+type Leftover = Leftover {
+    -- The position among the derivation's wanteds of the one this arose
+    -- from.
+    root      : Int,
+    -- The wanted as the solver left it, rewritten.
+    pred      : Pred,
+    -- The wanted as it arose.
+    posed     : Pred,
+    -- Whether it is the wanted the derivation asked for, as the solver left
+    -- it, rather than one that arose from it.
+    asked     : Bool,
+    -- Whether it is an equality that holds for no types of the parameters:
+    -- one that mentions none, which nothing can then decide, or one whose
+    -- sides clash whatever they are.
+    insoluble : Bool,
+    -- Whether it arose deeper below its root than the solver follows
+    -- instances, and was left there unsolved.
+    diverged  : Bool,
+}
 
 type Derivation
     -- Begun and not finished: assumed to exist, by what it is being derived
@@ -2155,15 +2184,20 @@ fun declaredHead(info : TyconInfo) -> Option Ty.Type {
 -- Returns the context `inst` needs under the contexts the derivations being
 -- settled have now, or why it can have none.
 --
--- This is GHC's `inferConstraints` with `simplifyDeriv`. What is wanted is
--- the class at each field's type, and each superclass at the head itself, so
--- that a derived `Ord`'s context entails its derived `Eq`'s. Each wanted is
--- reduced through the instances that cover it until only classes over the
--- type's own parameters are left. Those are the context, less any implied
--- by another's superclasses. A wanted that reaches anything else, a type
--- with no instance or `f a` over a parameter `f`, leaves no context that
--- could hold, so there is no instance. A parameter only a phantom position
--- mentions is in no field's type, so nothing is ever wanted of it.
+-- This is GHC's `inferConstraintsStock` and `simplifyDeriv`. What is wanted
+-- is the class at each field's type, and each superclass at the head itself
+-- (Note [Superclasses of derived instance]), so that a derived `Ord`'s
+-- context entails its derived `Eq`'s. The type's parameters become skolems,
+-- and the solver simplifies the wanteds under no givens (`t.simplify`), as
+-- it simplifies any implication's, reducing associated types and proving an
+-- instance's equalities as it goes. The classes over a parameter that it
+-- leaves are the context, less any implied by another's superclasses.
+-- Anything else left must follow from that context. What does not, a type
+-- with no instance, `f a` over a parameter `f`, an associated type that
+-- does not reduce or an equality, leaves no context that could hold, so
+-- there is no instance. A parameter
+-- only a phantom position mentions is in no field's type, so nothing is
+-- ever wanted of it.
 fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     let cls = inst.cls
     let (h, args) = Ty.spine(inst.head)
@@ -2175,26 +2209,44 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
         Some(i) -> i
         None -> return Left("it is not a declared type")
     }
-    let params = Set.new()
-    for a in args {
-        if let TVar(cell) = Ty.prune(a) { Set.add(params, cell.id) }
-    }
     -- A derived instance's laws relate it to its superclasses' instances,
     -- so those must be derived too. Checked before the fields, which would
     -- otherwise begin derivations for nothing.
-    if let Some(ci) = Map.get(t.classes, cls) {
-        for sup in ci.supers {
-            let shown = "'" + Ty.shortName(sup.name) + "'"
-            if Option.isSome(writtenInstance(t, sup.name, tycon)) {
-                return Left(shown + " is written by hand")
-            }
-            if refuses(t, tycon, sup.name) {
-                return Left(shown + " is refused with '!" + Ty.shortName(sup.name) + "'")
-            }
+    let supers = match Map.get(t.classes, cls) {
+        Some(ci) -> ci.supers
+        None -> []
+    }
+    for sup in supers {
+        let shown = "'" + Ty.shortName(sup.name) + "'"
+        if Option.isSome(writtenInstance(t, sup.name, tycon)) {
+            return Left(shown + " is written by hand")
+        }
+        if refuses(t, tycon, sup.name) {
+            return Left(shown + " is refused with '!" + Ty.shortName(sup.name) + "'")
         }
     }
-    let n = writtenNamer(inst.names)
+    -- Skolemise the head's variables, each under the name the declaration
+    -- gives it, and remember which variable each skolem stands for.
+    let sk = newSkolems()
+    let params = Map.new()
+    for a in args {
+        if let TVar(cell) = Ty.prune(a) {
+            let name = Map.getOr(inst.names, cell.id, "a")
+            if let TCon(con) = skolemBind(sk, cell, name) { Map.put(params, con.uid, TVar(cell)) }
+        }
+    }
+    -- Each wanted once, beside what asked for it, which a reason names.
     let wanted = []
+    let asked = []
+    let asking = Set.new()
+    let ask = fun(p : Pred, why : Asked) {
+        let key = Ty.predKey(p)
+        if !Set.contains(asking, key) {
+            Set.add(asking, key)
+            Vec.push(wanted, p)
+            Vec.push(asked, why)
+        }
+    }
     for c in info.variants {
         -- Two values of one existential constructor may hide different
         -- types, so no instance for one hidden type compares them.
@@ -2207,39 +2259,63 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
             None -> return Left("it is not a declared type")
         }
         for var i = 0; i < len(types); i = i + 1 {
-            if let Some(unmet) = reduce(t, Ty.pred(cls, [types[i]]), params, 0, wanted) {
-                let written = if i < len(c.written) { writtenType(t, c.written[i], 0) }
-                              else { Ty.showAt(types[i], n, 0) }
-                let fix = match unmet {
-                    Associated(_) | Equality(_, _) ->
-                        "; write 'instance " + Ty.shortName(cls) + " "
-                        + Ty.showAt(inst.head, n, 2) + "' by hand"
-                    _ -> ""
-                }
-                return Left(fieldName(c, i) + " has type '" + written + "'"
-                            + unmetTail(t, unmet, types[i], n) + fix)
-            }
+            ask(Ty.pred(cls, [skolemApply(sk, types[i])]), AtField(c, i, types[i]))
         }
     }
-    match Map.get(t.classes, cls) {
-        Some(ci) -> for sup in ci.supers {
-            let shown = "'" + Ty.shortName(sup.name) + "'"
-            if Option.isSome(reduce(t, Ty.pred(sup.name, [inst.head]), params, 0, wanted)) {
-                return match Map.get(t.derivations, derivationKey(sup.name, tycon)) {
-                    Some(Underivable(reason)) -> Left(reason)
-                    _ -> Left(shown + " cannot be derived")
-                }
-            }
+    for sup in supers { ask(Ty.pred(sup.name, [skolemApply(sk, inst.head)]), AtHead(sup.name)) }
+    -- GHC's `validDerivPred`, restricted to a class over a parameter: it
+    -- also admits `Eq (f a)`, which a context here cannot hold. A class over
+    -- one parameter is Paterson-smaller than the head, as (VD1) requires,
+    -- and there are finitely many, so `settle` reaches its fixed point.
+    let good = []
+    let rest = []
+    for l in t.simplify([], wanted, sk.made) {
+        let over = match Ty.prune(l.pred.args[0]) {
+            TCon(con) -> Map.contains(params, con.uid)
+            _ -> False
         }
-        None -> {}
+        if over && !l.diverged && isClass(t, l.pred.name) { Vec.push(good, l.pred) }
+        else { Vec.push(rest, l) }
     }
+    let theta = minimal(t, good)
+    -- GHC's [STEP DAC RESIDUAL]: the rest must follow from the context,
+    -- `forall tvs. theta => rest`, as an equality superclass of `Bytes s`
+    -- does. What does not is why there is no instance. One that went too
+    -- deep would only go too deep again.
+    let again = []
+    let posed = Set.new()
+    for l in rest {
+        let key = Ty.predKey(l.pred)
+        if !l.diverged && !Set.contains(posed, key) {
+            Set.add(posed, key)
+            Vec.push(again, l.pred)
+        }
+    }
+    let unentailed = Set.new()
+    if len(again) > 0 {
+        for l in t.simplify(theta, again, sk.made) { Set.add(unentailed, Ty.predKey(again[l.root])) }
+    }
+    -- The first field to fail, as a reader goes through them, and the first
+    -- of its wanteds to fail, as the solver went through them: `rest` is in
+    -- the order its wanteds became inert.
+    var blamed : Option Leftover = None
+    for l in rest {
+        if !l.diverged && !Set.contains(unentailed, Ty.predKey(l.pred)) { continue }
+        let earlier = match blamed {
+            Some(before) -> l.root < before.root
+            None -> True
+        }
+        if earlier { blamed = Some(l) }
+    }
+    if let Some(l) = blamed { return Left(leftoverReason(t, inst, tycon, asked[l.root], l, params)) }
+    let context = Vec.map(theta, unskolemPred(_, params))
     -- In the order of the parameters, then of the classes, so that a
     -- dictionary's parameters do not depend on the order of the fields.
     let position = Map.new()
     for var i = 0; i < len(args); i = i + 1 {
         if let TVar(cell) = Ty.prune(args[i]) { Map.put(position, cell.id, i) }
     }
-    let ordered = Vec.sortByKey(minimal(t, wanted), fun(q) {
+    let ordered = Vec.sortByKey(context, fun(q) {
         let at = match Ty.prune(q.args[0]) {
             TVar(cell) -> Map.getOr(position, cell.id, 0)
             _ -> 0
@@ -2249,83 +2325,33 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     Right(ordered)
 }
 
--- What stopped a wanted from reducing to classes over parameters.
-type Unmet
-    -- No instance covers `cls` at the type.
-    = Missing(String, Ty.Type)
-    -- The wanted kept needing more after `reductionLimit` steps that grew.
-    | Diverges(Pred)
-    -- The type is an associated type applied to a type.
-    | Associated(Ty.Type)
-    -- The instance for `cls` needs the equality, which does not hold as its
-    -- sides stand.
-    | Equality(String, Pred)
+-- What asked a derivation for one of its wanteds.
+type Asked
+    -- Field `i` of the constructor, whose type is the type given.
+    = AtField(ConInfo, Int, Ty.Type)
+    -- The superclass named, at the derived instance's head.
+    | AtHead(String)
 
--- More steps than this that do not ask for one of their instance head's
--- variables (`shrinks`) are taken not to end. A step that does asks for a
--- proper part of its wanted's type, and a run of those always ends, since a
--- type is finite, so only the others are counted. A field's type nested any
--- depth therefore reduces through instances like `Eq (Array a) : Eq a`, but
--- not through more than this many like `Eq (R a) : Eq (Array a)`. Every
--- written instance's context is smaller than its head (`checkTermination`),
--- so a reduction always ends. What reaches the limit is a long finite chain,
--- such as a field of type `T (T (... Int) Int) Int` under
--- `Eq (T a b) : Eq (W a)`, and the limit refuses it.
-let reductionLimit = 64
-
--- Reduces the wanted `p` through the instances that cover it, adding each
--- class over one of `params` it leaves to `out`, once. Returns what it could
--- not reduce, if anything. `grown` is how many steps so far did not ask for
--- one of their instance head's variables (`shrinks`).
-fun reduce(t : ClassTable, p : Pred, params : Set.Set Int, grown : Int,
-           out : Vec Pred) -> Option Unmet {
-    if grown > reductionLimit { return Some(Diverges(p)) }
-    let ty = Ty.prune(p.args[0])
-    if let TVar(cell) = ty {
-        if !Set.contains(params, cell.id) { return Some(Missing(p.name, ty)) }
-        let key = Ty.predKey(p)
-        if !Iterator.any(out, fun(q) = Ty.predKey(q) == key) { Vec.push(out, p) }
-        return None
+-- Returns why the derived `inst`, for `tycon`, has no context, given `l`,
+-- a wanted the solver left that is not a class over one of `params`, the
+-- skolems that stand for the head's variables.
+fun leftoverReason(t : ClassTable, inst : InstInfo, tycon : String, asked : Asked,
+                   l : Leftover, params : Map Int Ty.Type) -> String = match asked {
+    AtHead(sup) -> match Map.get(t.derivations, derivationKey(sup, tycon)) {
+        Some(Underivable(reason)) -> reason
+        _ -> "'" + Ty.shortName(sup) + "' cannot be derived"
     }
-    -- Match types against instances as they stand, with no associated type
-    -- reduced, and refuse a wanted that would need one reduced. The refusal
-    -- is conservative: it rejects some instances the solver would accept,
-    -- and accepts none it would reject. Whatever this accepts, the solver
-    -- must accept too, since it checks each field's instance under the
-    -- context found here (`Turkey.Infer.derivedFields`); a reduction here
-    -- that the solver did not make the same way would break that.
-    if let TFam(_, _, _) = ty { return Some(Associated(ty)) }
-    if let TVar(_) = Ty.spine(ty).0 { return Some(Missing(p.name, ty)) }
-    match selectInstance(t, p) {
-        None -> Some(Missing(p.name, ty))
-        Some((inst, mapping)) -> {
-            -- An equality whose sides are not one type as they stand has an
-            -- associated type on its left, which would have to be reduced.
-            for e in equalitiesAt(inst, mapping) {
-                if !Ty.sameType(e.args[0], e.args[1]) { return Some(Equality(p.name, e)) }
-            }
-            let headVars = Ty.freeVars(inst.head)
-            let wanted = contextAt(inst, mapping)
-            for var i = 0; i < len(wanted); i = i + 1 {
-                let next = if shrinks(inst.context[i], headVars) { grown } else { grown + 1 }
-                if let Some(unmet) = reduce(t, wanted[i], params, next, out) { return Some(unmet) }
-            }
-            None
-        }
+    AtField(c, i, ty) -> {
+        let n = writtenNamer(inst.names)
+        let written = if i < len(c.written) { writtenType(t, c.written[i], 0) }
+                      else { Ty.showAt(ty, n, 0) }
+        let (tail, writeIt) = unmetTail(t, inst.cls, l, params, n)
+        let fix = if writeIt {
+            "; write 'instance " + Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2)
+            + "' by hand"
+        } else { "" }
+        fieldName(c, i) + " has type '" + written + "'" + tail + fix
     }
-}
-
--- Returns whether the instance context predicate `q` asks for a proper part
--- of whatever type its instance's head matches, given `headVars`, the
--- variables of that head. A head is never a bare variable, so a variable of
--- the head stands for a proper part of the matched type. Deciding this from
--- the instance rather than from the types it is matched at costs only the
--- instance's size; a matched type can be exponentially large as a tree,
--- `W ((a, a), (a, a))` after two steps of `Eq (W a) : Eq (W (a, a))`, though
--- its nodes are shared.
-fun shrinks(q : Pred, headVars : Set.Set Int) -> Bool = match Ty.prune(q.args[0]) {
-    TVar(cell) -> Set.contains(headVars, cell.id)
-    _ -> False
 }
 
 -- How a reason chain names field `i` of constructor `c`.
@@ -2334,27 +2360,71 @@ fun fieldName(c : ConInfo, i : Int) -> String = match c.fields {
     None -> "field " + Int.toString(i) + " of '" + Ty.shortName(c.name) + "'"
 }
 
--- Returns the rest of a reason chain about a field of type `ty`, which
--- `unmet` stopped from having the class.
-fun unmetTail(t : ClassTable, unmet : Unmet, ty : Ty.Type, n : Ty.Namer) -> String =
-    match unmet {
-        Missing(cls, leaf) -> {
-            let inside = if Ty.sameType(leaf, ty) { "" }
-                         else { ", which contains '" + Ty.showAt(leaf, n, 0) + "'" }
-            inside + whyNot(t, cls, leaf)
-        }
-        Diverges(p) -> ", whose '" + Ty.shortName(p.name) + "' needs '"
-                       + Ty.shortName(p.name) + "' at ever larger types"
-        Associated(leaf) -> {
-            let shown = "'" + Ty.showAt(leaf, n, 0) + "'"
-            let what = if Ty.sameType(leaf, ty) { ", which is an associated type" }
-                       else { ", which contains " + shown + ", an associated type" }
-            what + ", and a derived instance cannot reduce one"
-        }
-        Equality(cls, e) -> ", whose '" + Ty.shortName(cls) + "' needs '"
-                            + Ty.showAt(e.args[0], n, 0) + " ~ " + Ty.showAt(e.args[1], n, 0)
-                            + "', and a derived instance cannot reduce an associated type"
+-- Returns the rest of a reason chain about a field whose `cls` the solver
+-- left `l` of, and whether writing the instance by hand is the
+-- fix. `params` maps each skolem in `l` back to its variable, which `n`
+-- names. Writing it by hand can avoid an equality or an associated type the
+-- derived instance would need, by not comparing the field through its
+-- instance, but it cannot give a type an instance it lacks.
+fun unmetTail(t : ClassTable, cls : String, l : Leftover, params : Map Int Ty.Type,
+              n : Ty.Namer) -> (String, Bool) {
+    let p = unskolemPred(l.pred, params)
+    let shown = fun(x) = "'" + Ty.showAt(x, n, 0) + "'"
+    if l.diverged {
+        return (", whose '" + Ty.shortName(p.name) + "' needs '" + Ty.shortName(p.name)
+                + "' at ever larger types", False)
     }
+    if p.name == Ty.equals {
+        let e = unskolemPred(l.posed, params)
+        let why = if l.insoluble { ", which does not hold" }
+                  else { ", and a derived instance cannot require an equality" }
+        return (", whose '" + Ty.shortName(cls) + "' needs '" + Ty.showAt(e.args[0], n, 0) + " ~ "
+                + Ty.showAt(e.args[1], n, 0) + "'" + why, True)
+    }
+    -- A leftover that is the field's own wanted names the field's type as
+    -- it reduced, which the chain has already named as written.
+    let leaf = p.args[0]
+    if let Some(fam) = associatedIn(leaf) {
+        let what = if l.asked && Ty.sameType(fam, leaf) { ", which is an associated type" }
+                   else { ", which contains " + shown(fam) + ", an associated type" }
+        return (what + " that does not reduce", True)
+    }
+    let inside = if l.asked { "" } else { ", which contains " + shown(leaf) }
+    (inside + whyNot(t, p.name, leaf), False)
+}
+
+-- Returns the first associated type applied in `t` that is still applied,
+-- outermost first.
+fun associatedIn(t : Ty.Type) -> Option Ty.Type = match Ty.prune(t) {
+    TFam(_, _, _) -> Some(Ty.prune(t))
+    TApp(f, a, _) -> match associatedIn(f) {
+        Some(found) -> Some(found)
+        None -> associatedIn(a)
+    }
+    TFun(ps, r) -> {
+        for x in ps { if let Some(found) = associatedIn(x) { return Some(found) } }
+        associatedIn(r)
+    }
+    TTuple(es) -> {
+        for x in es { if let Some(found) = associatedIn(x) { return Some(found) } }
+        None
+    }
+    _ -> None
+}
+
+-- Returns `p` with each skolem in `params` replaced by the variable it
+-- stands for.
+fun unskolemPred(p : Pred, params : Map Int Ty.Type) -> Pred =
+    Ty.pred(p.name, Array.map(p.args, unskolem(_, params)))
+
+fun unskolem(t : Ty.Type, params : Map Int Ty.Type) -> Ty.Type = match Ty.prune(t) {
+    TCon(c) -> Map.getOr(params, c.uid, TCon(c))
+    TApp(f, a, k) -> TApp(unskolem(f, params), unskolem(a, params), k)
+    TFam(name, a, k) -> TFam(name, unskolem(a, params), k)
+    TFun(ps, r) -> TFun(Array.map(ps, unskolem(_, params)), unskolem(r, params))
+    TTuple(es) -> TTuple(Array.map(es, unskolem(_, params)))
+    other -> other
+}
 
 -- Returns `te`, a type as a declaration wrote it, as a diagnostic quotes it:
 -- an alias by its own name, not by what it stands for.

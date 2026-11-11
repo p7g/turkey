@@ -169,7 +169,7 @@ fun main() {
 
 ```text
 Box(3)
-Box([Some(a)])
+Box([Some("a")])
 ```
 
 `Show (Box a) : Show a` says: a `Box a` can be shown whenever an `a` can. The
@@ -278,9 +278,10 @@ them, and a *derive list* after the parameters asks for more or refuses
 some. It follows a `:`, the same `:` that gives an instance its
 requirements: `type Card : Ord = ...` says that `Card` has `Ord`. The
 compiler writes each instance from the declaration's constructors. It can
-write instances of three classes that a list may ask for, and it writes one
-more, `Object`, for every type whose values are objects, without being asked
-([`Object` and `identical`](builtins.md#object-and-identical)):
+write instances of three classes that a list may ask for, and it writes two
+more without being asked: `Debug` for every type, and `Object` for every type
+whose values are objects ([`Object` and
+`identical`](builtins.md#object-and-identical)):
 
 * **`Eq`.** Two values are equal when they were built by the same
   constructor and each field of one equals the same field of the other, by
@@ -291,9 +292,13 @@ more, `Object`, for every type whose values are objects, without being asked
   fields that are not equal decides.
 * **`Hash`.** A value is hashed by its constructor and then its fields, in
   order, so equal values hash alike.
+* **`Debug`.** A value prints as the constructor that built it with each
+  field's own `Debug`, as a program would write it: `Pair(1, "a")`,
+  `Point { x = 1, y = 2 }`. See [`Show` and
+  printing](builtins.md#show-and-printing).
 
-Only `eq`, `lt` and `hashInto` are written; the other methods are the class's
-defaults, so `<=` is `lt(x, y) || eq(x, y)`.
+Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
+class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
 
 <!-- run -->
 ```kotlin
@@ -315,7 +320,7 @@ fun main() {
 
 ```text
 True
-Some(origin)
+Some("origin")
 True
 True
 ```
@@ -423,7 +428,7 @@ fun main() {
 
 ```text
 True
-Some(east)
+Some("east")
 ```
 
 **When there is no implicit instance.** A type whose fields do not all have
@@ -584,9 +589,11 @@ fun main() {
 ```
 
 **What a list may name.** Each class appears at most once. Only `Eq`, `Ord`
-and `Hash` can be asked for, and only `Eq`, `Hash` and `Object` refused. A
-type whose instance of a class is written by hand cannot also name that
-class, whether to derive it or to refuse it. `Object` is never asked for:
+and `Hash` can be asked for, and only `Eq`, `Hash`, `Object` and `Debug`
+refused. A type whose instance of a class is written by hand cannot also name
+that class, whether to derive it or to refuse it. `Debug` is never asked for,
+since every type has it, and `!Debug` does not remove the instance: it makes
+the type print as `<Name>`, reading no field. `Object` is never asked for:
 the compiler provides its instances for every type whose values are objects,
 a program may not write one, and `!Object` refuses it. See [`Object` and
 `identical`](builtins.md#object-and-identical). `Typed` is never named: the
@@ -999,8 +1006,8 @@ fun main() {
 
 ```text
 Right(3)
-Left(full)
-Left(closed)
+Left("full")
+Left("closed")
 ```
 
 Inside the instance's methods `Failure s` and `Trouble s` are

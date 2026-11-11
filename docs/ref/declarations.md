@@ -243,8 +243,8 @@ fun main() {
 
 ```text
 [2, 4, 6]
-[Mars, Venus]
-[Mars]
+["Mars", "Venus"]
+["Mars"]
 ```
 
 Each is shorthand for a lambda. `_ * 2` means `fun($x) = $x * 2`, and
@@ -284,7 +284,7 @@ fun main() {
 
 ```text
 [1, 4, 9]
-[(a, 0), (b, 0)]
+[("a", 0), ("b", 0)]
 [4, 9]
 ```
 
@@ -389,8 +389,8 @@ fun main() {
 ```
 
 ```text
-[<Mars>, <Venus>]
-[Mars has 2, Venus has 0]
+["<Mars>", "<Venus>"]
+["Mars has 2", "Venus has 0"]
 [[2, 11], [3, 21], [4, 31]]
 ```
 

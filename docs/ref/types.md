@@ -148,8 +148,8 @@ fun main() {
     let nan = 0.0 / 0.0
     print(nan < 1.0)
     print(nan > 1.0)
-    print(Float.totalCompare(nan, 1.0))
-    print(Float.totalCompare(-0.0, 0.0))
+    print(debug(Float.totalCompare(nan, 1.0)))
+    print(debug(Float.totalCompare(-0.0, 0.0)))
 }
 ```
 
@@ -319,7 +319,7 @@ fun main() {
 
 ```text
 65
-Some(B)
+Some('B')
 None
 ```
 
@@ -655,7 +655,7 @@ fun main() {
 
 ```text
 Right(5)
-Left(odd)
+Left("odd")
 ```
 
 The right-hand side of `type T = C`, or `type T = C(...)`, can read either

@@ -380,7 +380,7 @@ fun main() {
 ```
 
 ```text
-[to, be, or, not]
+["to", "be", "or", "not"]
 ```
 
 `seen` is a `Vec` because `Vec.contains` and `Vec.push` take one. The words are

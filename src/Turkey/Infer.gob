@@ -886,14 +886,8 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
 -- instance's own class at the head once for each method it takes from its
 -- class's default (`mkDefMethBind`). Their holes are the evidence the
 -- dictionary is built from, so an instance with no methods is checked too.
---
--- The equality superclasses are checked in an implication of their own whose
--- givens are the context's equalities and its class predicates that are
--- Paterson-smaller than the head. A coercion is zero-width and never forced,
--- so it must never be proved by the dictionary it belongs to, as a class
--- superclass must not be (Note [Recursive superclasses] in
--- `GHC.Tc.TyCl.Instance`); all a given no smaller than the head could grant an
--- equality superclass is an equality selected from its own superclasses.
+-- An equality superclass is a naked wanted like a class superclass, and its
+-- coercion's hole is the evidence for its slot.
 fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
                 plan : Classes.InstancePlan) -> Unit {
     let sk = Classes.newSkolems()
@@ -942,17 +936,7 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
                                       + Classes.surfaceMember(name) + "'"))
     }
     let fields = if inst.derived { derivedFields(g, inst, sk, wanteds) } else { [] }
-    emit(g, instanceImplication(givens, self, sk, CAnd(wanteds), where))
-
-    let equalityGivens = Vec.new(len(equalities))
-    for var i = 0; i < len(context) && i < len(plan.params); i = i + 1 {
-        if Classes.patersonSmaller(context[i], self) {
-            Vec.push(equalityGivens, (plan.params[i], context[i], None))
-        }
-    }
-    for q in equalities { Vec.push(equalityGivens, ("", q, None)) }
     let holes = Vec.new(len(info.equalities))
-    let demanded = Vec.new(len(info.equalities))
     for e in info.equalities {
         let hole = newHole()
         Vec.push(holes, hole)
@@ -962,11 +946,9 @@ fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
         -- class expecting what it declares. The coercion keeps the side
         -- order the dictionary's slot has (`PredCell.posed`).
         cell.pred = Ty.pred(Ty.equals, [want.args[1], want.args[0]])
-        Vec.push(demanded, CPred(cell))
+        Vec.push(wanteds, CPred(cell))
     }
-    if len(demanded) > 0 {
-        emit(g, instanceImplication(equalityGivens, self, sk, CAnd(demanded), where))
-    }
+    emit(g, instanceImplication(givens, self, sk, CAnd(wanteds), where))
     Vec.push(g.instanceChecks, InstanceCheck {
         inst = inst, supers = supers, equalities = holes, defaults = defaults,
         fields = fields, skolems = sk.mapping,

@@ -107,22 +107,21 @@ instance Named Cat {
 ```
 
 An instance's superclasses must hold at its head, under the instance's
-context. Each comes from a constraint the context writes, or from an
-instance, and what that instance requires in turn may use anything the
-context provides. A superclass cannot come from the superclasses of a
-constraint in the context: such a constraint would be about the head's own
-type, so the dictionary the instance defines could end up supplying its own
-superclass:
+context. Each comes from a constraint the context writes, from a superclass
+of one, or from an instance, and what that instance requires in turn may use
+anything the context provides. Here the context's `Mon a` provides `Sem a`,
+which is about `a`, not about `W a`, so `Sem (W a)` needs an instance of its
+own:
 
-<!-- error: 'Sem (W a)' is required by 'Mon', and it cannot come from the superclasses of the context's 'Mon (W a)', which is about the head itself; add 'Sem (W a)' to the context -->
+<!-- error: 'Sem (W a)' is required by 'Mon', but there is no such instance -->
 ```kotlin
 class Sem a { fun op(a, a) -> a }
 class Mon a : Sem a { fun unit() -> a }
 
 type W a = W(a)
 
-instance Mon (W a) : Mon (W a) {
-    fun unit() = unit()
+instance Mon (W a) : Mon a {
+    fun unit() = W(unit())
 }
 
 fun main() { }
@@ -176,6 +175,44 @@ Box([Some(a)])
 `Show (Box a) : Show a` says: a `Box a` can be shown whenever an `a` can. The
 instance's methods may use those constraints. The context may also hold
 [equalities](#equality-constraints) about the head's variables.
+
+Each class constraint in an instance's context must be **smaller than the
+head** (the *Paterson conditions*):
+
+* it cannot apply an [associated type](#associated-types);
+* it must have fewer type constructors and type variables than the head,
+  counting each occurrence;
+* no type variable may occur in it more often than in the head.
+
+Equalities in the context are exempt from this rule, and so are
+[`Typed`](builtins.md#typed-and-cast) constraints. `Show a` for `Show (Box a)` is
+smaller, and so is `Eq (f a)` for `Eq (App f a)`. `Eq (W (a, a))` for
+`Eq (W a)` is not:
+
+<!-- error: 'Eq (W (a, a))' cannot be in an instance's context: it is no smaller than the instance head 'Eq (W a)' -->
+```kotlin
+type W a = W(a)
+
+instance Eq (W a) : Eq (W (a, a)) {
+    fun eq(_, _) = True
+}
+
+fun main() { print(W(1) == W(1)) }
+```
+
+The rule is what makes finding an instance terminate. Using an instance to
+satisfy a constraint replaces that constraint with the instance's context.
+Each constraint there is smaller, whatever types the head's variables stand
+for, and a size cannot shrink for ever. The instance above would turn
+`Eq (W Int)` into `Eq (W (Int, Int))`, then into
+`Eq (W ((Int, Int), (Int, Int)))`, without end.
+
+> **For readers new to this.** "Smaller" is about the types written, not
+> about values. A constraint that applies an associated type is refused
+> because the associated type may stand for a type of any size:
+> `Elem (Box a)` could be `Box (Box a)`. Such a constraint can still go in a
+> function's context, as `Show (Elem c)` does in `describeFirst` under
+> [Associated types](#associated-types).
 
 > **Coming from Haskell.** `instance Show (Box a) : Show a` is
 > `instance Show a => Show (Box a)`: the context comes after the head.
@@ -477,9 +514,7 @@ True
 derived or reported. Every field's type must have the class, under the
 requirements above. A field that is a function, a type that has no
 instance, or a type `f a` built from a parameter `f`, has none. Nor does a
-field whose instances need the class at ever larger types without end,
-which a written instance such as `instance Eq (W a) : Eq (W (Array a))` can
-cause. Nor does a constructor that hides a type in an [existential
+constructor that hides a type in an [existential
 bracket](types.md#existential-types): two of its values may hide different
 types. The error is reported at the entry in the list, whether or not
 anything uses the instance, and says which field is to blame, as the error
@@ -496,17 +531,39 @@ A field whose type has an instance that needs the class for a part of it
 names that part: a field of type `Array (fun() -> Int)` *contains*
 `fun() -> Int`, which has no `Eq`.
 
-A derivation reads each field's type as it is written, and never works out
-what an [associated type](#associated-types) stands for. A field whose
-instance needs the class at an associated type, such as `Array (Key c)` or
-`Key (Array Bool)`, cannot derive it, even where the associated type stands
-for a type that has the class. Neither can a field whose instance needs an
-[equality](#equality-constraints) such as `Key c ~ Int`. Write the instance
-by hand instead:
+A derivation reads each field's type as the type checker reads any type:
+an [associated type](#associated-types) is worked out, and an
+[equality](#equality-constraints) a field's instance needs is checked. With
+`instance Eq (K c) : Key c ~ Int`, a field of type `K (Array Bool)` needs
+`Key (Array Bool) ~ Int`, which holds:
 
-<!-- error: 'Counted' cannot derive 'Eq': field 0 of 'Counted' has type 'Key (Array Bool)', which is an associated type, and a derived instance cannot reduce one; write 'instance Eq Counted' by hand -->
+<!-- run -->
 ```kotlin
-type Counted : Eq = Counted(Key (Array Bool))
+type K c = K(Int)
+
+instance Eq (K c) : Key c ~ Int {
+    fun eq(K(a), K(b)) = a == b
+}
+
+type Tagged : Eq = Tagged(K (Array Bool))
+
+fun main() {
+    print(Tagged(K(1)) == Tagged(K(1)))
+}
+```
+
+```text
+True
+```
+
+What a derived instance can require of the type's parameters is only
+classes. A field whose instance needs the class at an associated type of a
+parameter, such as `Array (Key c)`, or needs an equality about one, such as
+`Key c ~ Int`, cannot derive it. Write the instance by hand instead:
+
+<!-- error: 'Keys' cannot derive 'Eq': field 0 of 'Keys' has type 'Array (Key c)', which contains 'Key c', an associated type that does not reduce; write 'instance Eq (Keys c)' by hand -->
+```kotlin
+type Keys c : Eq = Keys(Array (Key c))
 ```
 
 **Opting out.** `!Eq`, `!Hash` or `!Object` in the list says that the type
@@ -1064,13 +1121,10 @@ fun main() { }
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
 `View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
-context's `Value s ~ Byte`, which its `Bytes s` grants. A constraint of the
-context grants its equality superclasses here only if it is *smaller* than
-the head: it has fewer type constructors and variables, no variable more
-often than the head has it, and no associated type. `Bytes s` is smaller
-than `Bytes (View s)`, while a `Bytes (View s)` in the context would grant
-nothing here, for the same reason as above. An instance where an equality
-is false, or where its context does not decide it, is refused:
+context's `Value s ~ Byte`, which its `Bytes s` grants. Every class
+constraint of the context grants its equality superclasses this way. An
+instance where an equality is false, or where its context does not decide
+it, is refused:
 
 <!-- error: expected 'Byte', found 'String' in the superclasses of 'Bytes Words' -->
 ```kotlin

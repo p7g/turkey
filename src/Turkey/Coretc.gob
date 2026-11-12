@@ -797,8 +797,89 @@ fun checkDict(ck : Checker, e : Core, cls : String, slots : Array Core,
             mismatch(ck, want, got, e.span, "the '" + Classes.slotName(ck.classes, cls, i)
                      + "' of a '" + cls + "' dictionary")
         }
+        match declared[i] {
+            MethodSlot(name) | KeyedSlot(name, _) ->
+                checkOwnBound(ck, methodNamed(ck, cls, name, e.span), slots[i], cls, i)
+            _ -> {}
+        }
     }
     e.ty
+}
+
+-- Fails unless every variable of `m`'s own that `slot` mentions is bound by a
+-- type abstraction inside it.
+--
+-- A method slot binds its method's own variables itself, by a type
+-- abstraction at its top, and every use of the slot applies it to types. The
+-- dictionary binds only the class variable, so one of the method's own left
+-- free belongs to no binding, and `agrees` cannot see that: a free variable
+-- matches anything. `Turkey.Layout` gives a variable free in a binding with no
+-- type parameters the layout `unit`, so such a slot is compiled once at
+-- `unit` and called at every layout. This checks the method's own variables
+-- alone, by identity, because inference leaves unconstrained variables free
+-- elsewhere on purpose.
+fun checkOwnBound(ck : Checker, m : MethodInfo, slot : Core, cls : String,
+                  index : Int) -> Unit {
+    let own = Set.new()
+    for q in m.scheme.quantified {
+        if q.id != m.classVar.id { Set.add(own, q.id) }
+    }
+    if len(Set.elements(own)) == 0 { return {} }
+    let found = Vec.new(1)
+    freeAmong(slot, own, found)
+    if len(found) > 0 {
+        fail("the '" + Classes.slotName(ck.classes, cls, index) + "' of a '" + cls
+             + "' dictionary leaves its method's own type variable '"
+             + Ty.show(TVar(found[0])) + "' unbound", slot.span)
+    }
+}
+
+-- Pushes onto `found` each of `own` that `e` mentions outside every binder of
+-- it in `e`: a type abstraction's, a generalized `let`'s or a local binding's.
+fun freeAmong(e : Core, own : Set.Set Int, found : Vec VarCell) -> Unit {
+    match e.kind {
+        -- A type abstraction's own type is its body's, which mentions what it
+        -- binds, so only the body is read.
+        CTyLam(vs, body) -> return freeAmong(body, withoutVars(own, vs), found)
+        CLet(_, _, bound, value, body, binders) -> {
+            let inner = withoutVars(own, binders)
+            mentionedAmong(e.ty, own, found)
+            mentionedAmong(bound, inner, found)
+            freeAmong(value, inner, found)
+            return freeAmong(body, own, found)
+        }
+        _ -> {}
+    }
+    mentionedAmong(e.ty, own, found)
+    let _ = mapKind(e.kind, Mapper {
+        expr = fun(x) {
+            freeAmong(x, own, found)
+            x
+        },
+        type_ = fun(t) {
+            mentionedAmong(t, own, found)
+            t
+        },
+        bind = fun(b) {
+            let inner = withoutVars(own, b.binders)
+            mentionedAmong(b.ty, inner, found)
+            freeAmong(b.value, inner, found)
+            b
+        },
+    })
+}
+
+fun mentionedAmong(t : Ty.Type, own : Set.Set Int, found : Vec VarCell) -> Unit {
+    for v in Ty.varsOf([t]) {
+        if Set.contains(own, v.id) { Vec.push(found, v) }
+    }
+}
+
+fun withoutVars(own : Set.Set Int, vs : Vec VarCell) -> Set.Set Int {
+    let out = Set.new()
+    for id in Set.elements(own) { Set.add(out, id) }
+    for v in vs { let _ = Set.remove(out, v.id) }
+    out
 }
 
 -- The type of the evidence for `cls`'s equality superclass `index` at `head`.

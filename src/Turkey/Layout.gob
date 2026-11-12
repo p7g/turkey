@@ -1375,7 +1375,7 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
         -- layout is one nothing applies to a type -- `(/\a. f)(d)`, as
         -- instantiating a method leaves it -- so its variables are as free as
         -- `defaultsInto`'s, and get the same layout.
-        CTyLam(vs, body) -> defaultAtoms(unknownBinders(vs, sc), body.ty, sc)
+        CTyLam(vs, body) -> defaultAtoms(unknownBinders(vs, body.ty, sc), body.ty, sc)
         CLetRec(binds, body) -> {
             var any = False
             for b in binds {
@@ -1538,7 +1538,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
             Some(found) -> found
             None -> []
         }
-        if len(vs) == 0 || len(unknownBinders(vs, sc)) == 0 {
+        if len(vs) == 0 || len(unknownBinders(vs, inner.ty, sc)) == 0 {
             Vec.push(out, rewrite(s, value, sc))
             Map.put(shared, name, value)
             continue
@@ -1628,10 +1628,34 @@ fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Vec VarCe
     Some(out)
 }
 
--- The variables of kind `*` among `vs` that the scope has no layout for.
-fun unknownBinders(vs : Vec VarCell, sc : Scope) -> Vec VarCell =
+-- The variables among `vs` that the scope has no layout for, as they appear
+-- in `ty`: one of kind `*` that has none itself, and a higher-kinded one that
+-- heads an atom of `ty` that has none.
+--
+-- A higher-kinded variable has no layout of its own: `m` takes none, and
+-- `m Int` and `m String` take one each. So whether the scope knows it depends
+-- on which of its applications `ty` holds, and a test of the variable alone
+-- would find every higher-kinded binder known.
+fun unknownBinders(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Vec VarCell {
+    let known = current(sc)
+    let higher = Set.new()
+    for v in vs {
+        if !isStar(v.kind) { Set.add(higher, v.id) }
+    }
+    let visible = Set.new()
+    for v in Ty.varsOf([ty]) { Set.add(visible, v.id) }
+    let atoms = Vec.new(2)
+    atomsInto(ty, higher, visible, atoms, Set.new())
+    let missing = Set.new()
+    for t in atoms {
+        if !Map.contains(known, Ty.typeKey(t)) {
+            for v in Ty.varsOf([t]) { Set.add(missing, v.id) }
+        }
+    }
     Vec.filter(vs, fun(v) =
-        isStar(v.kind) && !Map.contains(current(sc), Ty.typeKey(TVar(v))))
+        if isStar(v.kind) { !Map.contains(known, Ty.typeKey(TVar(v))) }
+        else { Set.contains(missing, v.id) })
+}
 
 -- `unit` for every atom of `ty` over `vs`, in every map on the chain.
 fun defaultAtoms(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Unit {

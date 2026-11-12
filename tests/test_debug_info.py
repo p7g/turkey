@@ -357,8 +357,8 @@ def test_the_types_describe_how_values_are_held(how):
     assert named("DW_TAG_structure_type", "Main.Tree")
     assert named("DW_TAG_enumeration_type", "Main.Tree tag")
     assert named("DW_TAG_union_type", "Main.Tree")
-    assert named("DW_TAG_union_type", "Data.Option.Option Data.String.String")
-    assert named("DW_TAG_typedef", "Data.String.String")
+    assert named("DW_TAG_union_type", "Data.Option.Option Turkey.String.String")
+    assert named("DW_TAG_typedef", "Turkey.String.String")
     assert named("DW_TAG_typedef", "Data.Vec.Vec Int")
     # The runtime's constants the formatters read values by.
     assert named("DW_TAG_enumeration_type", "Turkey.Runtime")
@@ -443,7 +443,7 @@ def test_lldb_formatters_show_values_as_the_source_writes_them(how):
                           "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
                           "-o", "run", "-o", "frame variable s o v t m", "-o", "kill", "./prog"],
                     VALUES)
-    assert re.search(r'\(Data\.String\.String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
+    assert re.search(r'\(Turkey\.String\.String\) s = 0x[0-9a-f]+ "hi"', out), out[-4000:]
     assert re.search(r'o = Some\("there"\)', out), out[-4000:]
     assert re.search(r"v = 0x[0-9a-f]+ \[10, 20, 30\]", out), out[-4000:]
     assert "t = 0x" in out and "Node(Node(Leaf, 1, Leaf), 2, Leaf)" in out, out[-4000:]

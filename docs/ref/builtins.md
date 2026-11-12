@@ -30,6 +30,11 @@ names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
 for a program to use. An explicit Prelude import keeps these, and only
 `import Prelude ()` leaves them out.
 
+No module a program can import exports the constructor of `String`, so a
+program reaches a string's bytes only through `String.toBytes`, which copies
+them, and `String.bytes`, which iterates over them
+([String](types.md#string)).
+
 A type is in scope only through an import, the implicit Prelude import
 included. A module that replaces the Prelude import imports the types it
 names, as it does anything else:

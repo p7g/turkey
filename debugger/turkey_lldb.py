@@ -6,12 +6,12 @@ Load with `command script import debugger/turkey_lldb.py`, or run
 They read the types `Turkey.DebugTypes` writes, by their names, which name
 the module that declares each type, and by their shapes:
 
-* `Data.String.String`, `Data.Array.Array a`, `Prim.Array a` and
+* `Turkey.String.String`, `Data.Array.Array a`, `Prim.Array a` and
   `Data.Vec.Vec a`: a pointer to an array object, its length at 8 and its
   elements at 16, or to a vector's storage and its length.
 * `Data.Map.BaseMap h k v`, which a `Map k v` is: a map's buckets, in the
   order they were added, from `head` along each bucket's `next`.
-* A compact sum, such as `Data.Option.Option Data.String.String`: a union of
+* A compact sum, such as `Data.Option.Option Turkey.String.String`: a union of
   the one word as the enumeration of the nullaries, `nullary`, and as the
   payload. A word below `immediates` is a nullary; any other is the
   payload, or a wrap of it, an object tagged `wrapTag` whose one field is
@@ -424,7 +424,7 @@ def is_object(t: lldb.SBType, internal: dict) -> bool:
 def __lldb_init_module(debugger: lldb.SBDebugger, internal: dict) -> None:
     m = __name__
     add = lambda command: debugger.HandleCommand(f"{command} -w {CATEGORY}")
-    add(f'type summary add -F {m}.string_summary "Data.String.String"')
+    add(f'type summary add -F {m}.string_summary "Turkey.String.String"')
     for pattern in (r"^Data\.Array\.Array ", r"^Prim\.Array "):
         add(f'type synthetic add -l {m}.ArrayChildren -x "{pattern}"')
         add(f'type summary add -e -F {m}.collection_summary -x "{pattern}"')

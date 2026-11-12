@@ -1,0 +1,101 @@
+export (String(..), bytesOf, concat)
+
+-- `String` with its representation open, for the library. `Data.String`
+-- re-exports the type abstractly, with every operation that keeps its
+-- invariant, so a program can neither build a `String` that skips the UTF-8
+-- check nor reach the bytes of one it has.
+--
+-- The instances are here rather than in `Data.String` because an instance
+-- lives with its class or its type, and this is the type's module.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Byte (Byte)
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Text.Show (Show(..))
+import Data.Hashable (Hash(..), Hasher(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Semigroup (Semigroup(..))
+import Data.Monoid (Monoid(..))
+import Data.Array as Array
+import Data.Bool (Bool(..))
+import Data.Int ()
+import Object (Object)
+import Turkey.Scan as Scan
+import Turkey.Array as Storage
+
+-- Its representation is its bytes: an exact-sized `Prim.Array Byte`, never written
+-- after the string is made, and always well-formed UTF-8. Both backends erase
+-- a single-field newtype, so at run time a `String` *is* the byte array -- no
+-- wrapper object, no header of its own.
+--
+-- Nothing outside `lib/` may hold that array. `Prim.Array` has `SetIndex`, so
+-- whoever holds a string's bytes can write them, and literals are shared
+-- constants: one write would change every use of the literal, or leave bytes
+-- that are not UTF-8. So the constructor and `bytesOf` are exported only from
+-- this module, which only a library module may import.
+--
+-- A string is a value, though its bytes are an array: literals are shared
+-- constants, so two strings built apart may be one array. `!Object` keeps
+-- `identical` off it, and off every wrapper over it.
+type String : !Object = String(Prim.Array Byte)
+
+-- Returns the array `s` is, not a copy. The caller must not write to it.
+fun bytesOf(s : String) -> Prim.Array Byte = match s { String(b) -> b }
+
+fun concat(a : String, b : String) -> String {
+    let x = bytesOf(a)
+    let y = bytesOf(b)
+    let n = len(x)
+    let m = len(y)
+    let out = Storage.uninitialized(n + m)
+    Storage.move(out, 0, x, 0, n)
+    Storage.move(out, n, y, 0, m)
+    String(out)
+}
+
+-- Equality is byte equality, which for well-formed UTF-8 is exactly
+-- code-point equality. It performs *no* Unicode normalization:
+--
+--     "\u{00E9}" == "\u{0065}\u{0301}"   -- False. Both render as e-acute.
+--
+-- Normalization is a library operation and will never be something `==` does
+-- implicitly. Ordering is byte-lexicographic, which for well-formed UTF-8
+-- coincides with code-point-lexicographic -- and which is not a collation:
+-- it sorts `Z` before `a` and has no opinion about locale.
+
+instance Eq String {
+    fun eq(x, y) {
+        let a = bytesOf(x)
+        let b = bytesOf(y)
+        len(a) == len(b) && Scan.equalAt(a, 0, b, len(b))
+    }
+}
+
+-- By bytes, which for well-formed UTF-8 is the order of the code points.
+instance Ord String {
+    fun lt(x, y) = Scan.compare(bytesOf(x), bytesOf(y)) < 0
+}
+
+instance Add String { fun add(x, y) = concat(x, y) }
+instance Show String { fun show(x) = x }
+instance Semigroup String { fun combine(x, y) = add(x, y) }
+instance Monoid String { fun empty() = "" }
+
+-- No `Length String`. `len` means an O(1) count of elements, and a string has
+-- no single answer to give: `byteLength` is the cheap one, `codePointCount`
+-- the one people usually mean, and graphemes the one they usually want.
+
+instance Hash String {
+    -- Over the bytes, which for well-formed UTF-8 is the same equivalence as
+    -- over the code points and allocates nothing.
+    --
+    -- A trap: `hashBytes` takes an `Array Byte`, so a `Hasher` a program
+    -- writes is handed the string's own bytes, and can write to them.
+    fun hashInto(s, d) {
+        let b = bytesOf(s)
+        hashBytes(d, Array.ofStorage(b), 0, len(b))
+    }
+}

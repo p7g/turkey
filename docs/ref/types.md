@@ -353,6 +353,32 @@ True
 2
 ```
 
+A string's bytes are read through `String.bytes`, an iterator over them, or
+`String.toBytes`, which returns them in a new `Array Byte`. Neither shares
+storage with the string, so writing to the array leaves the string as it was.
+`String.fromBytes` goes the other way, and returns `None` for bytes that are
+not UTF-8:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let word = "hé"
+    for b in String.bytes(word) { print(b) }
+    let copy = String.toBytes(word)
+    copy[0] = Byte.truncate(72)
+    print(String.fromBytes(copy))
+    print(word)
+}
+```
+
+```text
+104
+195
+169
+Some("Hé")
+hé
+```
+
 Comparing bytes is the same as comparing scalar values, one after another, and
 nothing more. `==` does not normalize, so two strings that display the same
 can be unequal, and `<` is not alphabetical order in any language: every

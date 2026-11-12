@@ -31,8 +31,10 @@ for a program to use. An explicit Prelude import keeps these, and only
 `import Prelude ()` leaves them out.
 
 No module a program can import exports the constructor of `String`. A
-program reads a string's bytes with `String.toBytes`, which copies them, or
-`String.bytes`, which iterates over them ([String](types.md#string)).
+program reads a string's bytes with `String.toBytes`, which copies them,
+`String.bytes`, which iterates over them ([String](types.md#string)), or
+`String.view`, which reads them in place and cannot write
+([`ByteView`](#byteview)).
 
 A type is in scope only through an import, the implicit Prelude import
 included. A module that replaces the Prelude import imports the types it

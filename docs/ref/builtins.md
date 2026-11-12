@@ -689,6 +689,112 @@ True
 True
 ```
 
+`hash` feeds its argument to a hasher, the state of a hash function, through
+the argument's `Hash` instance. Both classes are in `Data.Hashable`:
+
+```text
+class Hasher h {
+    fun startHash(Int) -> h
+    fun hashInt(h, Int) -> h
+    fun hashBytes(h, ByteView) -> h
+    fun finishHash(h) -> Int
+}
+
+class Hash a : Eq a {
+    fun hashInto[Hasher h](a, h) -> h
+}
+```
+
+A `Hash` instance hands its value's parts to the hasher in order: each scalar
+as an `Int` through `hashInt`, and each run of bytes, such as a string's,
+through `hashBytes`. Every method returns the next state, and the caller uses
+each state once. A program can write its own `Hasher`, which reads each run of
+bytes through a [`ByteView`](#byteview):
+
+<!-- run -->
+```kotlin
+import Data.Hashable (Hasher(..))
+
+-- Counts what it is fed instead of hashing it.
+type Tally = Tally { words : Int, bytes : Int }
+
+instance Hasher Tally {
+    fun startHash(_) = Tally { words = 0, bytes = 0 }
+    fun hashInt(t, _) = Tally { words = t.words + 1, bytes = t.bytes }
+    fun hashBytes(t, run) = Tally { words = t.words, bytes = t.bytes + len(run) }
+    fun finishHash(t) = t.words * 1000 + t.bytes
+}
+
+fun main() {
+    let start : Tally = startHash(0)
+    print(finishHash(hashInto((7, "hé"), start)))
+}
+```
+
+```text
+1003
+```
+
+A run of bytes is one part, and a hasher marks where each run ends. The pairs
+`("ab", "c")` and `("a", "bc")` feed the same bytes, but in runs that end in
+different places, so the hasher sees them as different keys. For the same
+reason, a run fed to `hashBytes` in pieces need not hash as the whole run does:
+a hasher hashes a key's parts, not a stream of bytes.
+
+### `ByteView`
+
+**Syntax**
+
+```text
+import Bytes (ByteView)
+String.view(s)
+Array.view(xs)
+```
+
+A `ByteView` is a run of bytes that can be read but not written. It has
+`Index` with `Int` keys and `Byte` values, `Length` and `Iterator`, and no
+`SetIndex`. `String.view(s)` views the bytes of a string, and `Array.view(xs)`
+those of an `Array Byte`, neither by copying them. Nothing a program can import
+returns the storage a view reads.
+
+A view of a string never changes, because a string is never written. A view of
+an array is read-only but not *frozen*: whoever holds the array can still
+assign its elements, and the view shows each change as it happens:
+
+<!-- run -->
+```kotlin
+import Bytes (ByteView)
+
+fun total(v : ByteView) -> Int {
+    var n = 0
+    for b in v { n = n + Byte.toInt(b) }
+    n
+}
+
+fun main() {
+    let xs = [Byte.truncate(1), Byte.truncate(2), Byte.truncate(3)]
+    let v = Array.view(xs)
+    print(total(v))
+    xs[0] = Byte.truncate(10)
+    print(total(v))
+    print(len(String.view("hé")))
+}
+```
+
+```text
+6
+15
+3
+```
+
+<!-- error: no instance for 'SetIndex ByteView' -->
+```kotlin
+fun main() {
+    let v = String.view("abc")
+    v[0] = Byte.truncate(122)
+}
+```
+
 ## `Functor`, `Applicative` and `Monad`
 
 ```text

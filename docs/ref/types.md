@@ -354,8 +354,10 @@ True
 ```
 
 A string's bytes are read through `String.bytes`, an iterator over them, or
-`String.toBytes`, which returns them in a new `Array Byte`. Neither shares
+`String.toBytes`, which returns them in a new `Array Byte`. `toBytes` shares no
 storage with the string, so writing to the array leaves the string as it was.
+`String.view` reads the bytes in place, without copying them, as a
+[`ByteView`](builtins.md#byteview), which cannot be written.
 `String.fromBytes` goes the other way, and returns `None` for bytes that are
 not UTF-8:
 

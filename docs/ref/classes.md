@@ -300,6 +300,30 @@ whose values are objects ([`Object` and
 Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
 class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
 
+A tuple of any length gets the same instances, and `Ord` and `Show` too,
+without asking, wherever its elements have them. It is treated as a type with
+one positional constructor holding its elements: two tuples are equal when
+their elements are, the first unequal element decides their order, and a
+tuple prints as its elements in parentheses, each with its `Debug`, for both
+`Debug` and `Show`. So a tuple of any length can be a `Map` key:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let costs = Map.new()
+    costs[(1, 2, 'n', "east", True)] = 5
+    print(costs[(1, 2, 'n', "east", True)])
+    print((1, 2, 3, 4, 9) < (1, 2, 3, 5, 0))
+    print((1, "a", 'b', 2.5, False))
+}
+```
+
+```text
+5
+True
+(1, "a", 'b', 2.5, False)
+```
+
 <!-- run -->
 ```kotlin
 type Point = Point { x : Int, y : Int }

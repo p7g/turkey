@@ -319,20 +319,6 @@ fun successorsOf(graph : Map String (Set.Set String), name : String)
     None -> Set.new()
 }
 
--- Returns `roots` and every name they reach in `graph`.
-fun reachable(graph : Map String (Set.Set String), roots : Vec String)
-        -> Set.Set String {
-    let seen = Set.new()
-    let work = []
-    for name in roots { Vec.push(work, name) }
-    for var k = 0; k < len(work); k = k + 1 {
-        if Set.contains(seen, work[k]) { continue }
-        Set.add(seen, work[k])
-        for next in Set.elements(successorsOf(graph, work[k])) { Vec.push(work, next) }
-    }
-    seen
-}
-
 -- -- the traversal --------------------------------------------------------------------
 
 -- What is being inlined around the term being reduced: the calls `inline`
@@ -384,9 +370,6 @@ type Reducer = Reducer {
     -- Which call of `reduceProgram` this is. The second can inline what the
     -- first could not, so it must not trust the first's marks.
     run : Int,
-    -- The bindings whose inlined code takes the span of the call it replaces
-    -- (`placed`).
-    callSites : Set.Set String,
     -- A binding's body, reduced, computed once. Without it a chain `f` calls
     -- `g` calls `h` re-reduces `h` once per path that reaches it, which is
     -- exponential in the depth of the call graph.
@@ -467,8 +450,7 @@ type Done = Done {
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
-               walked : Array Walked, run : Int, table : Binders.Table,
-               callSites : Set.Set String) -> Reducer {
+               walked : Array Walked, run : Int, table : Binders.Table) -> Reducer {
     let all = Vec.append(program.dicts, program.binds)
     let bindings = Map.new()
     for b in all {
@@ -494,7 +476,7 @@ fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Se
         dicts = dicts,
         inlining = outermost(), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
-        run = run, callSites = callSites,
+        run = run,
         reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = written,
         minting = Minting {
@@ -516,7 +498,7 @@ fun forComponent(base : Reducer, c : Int, owner : Int, finished : fun(Int) -> Do
     breakers = base.breakers, decls = base.decls, bindings = base.bindings,
     dicts = base.dicts, inlining = outermost(), sizes = Map.new(), moves = Map.new(),
     ends = Map.new(), cache = cache, run = base.run,
-    callSites = base.callSites, reduced = Map.new(),
+    reduced = Map.new(),
     constants = Map.new(), unwritten = Map.new(), written = base.written,
     minting = Minting {
         table = base.minting.table, owner = owner, count = 0,
@@ -645,18 +627,12 @@ var runs = 0
 -- it makes are minted into an owner of its own (`mint`). One component is
 -- reduced by one worker, in order, because within a cycle what is known
 -- depends on that order.
-fun reduceProgram(program : CProgram, decls : DeclTable, table : Binders.Table,
-                  keepsCallSites : fun(String) -> Bool) -> CProgram {
+fun reduceProgram(program : CProgram, decls : DeclTable, table : Binders.Table) -> CProgram {
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
     runs = runs + 1
-    -- The giblet check follows a call out of a giblet and names the line in
-    -- each function along the way, so a binding reachable from one where
-    -- positions are read needs its call sites as much as that one does.
-    let wanted = Vec.filter(binds, \keepsCallSites(_.module_))
-    let callSites = reachable(graph, Vec.map(wanted, _.name))
-    let base = newReducer(program, decls, graph, walked, runs, table, callSites)
+    let base = newReducer(program, decls, graph, walked, runs, table)
     -- `builds` reads these, and each is computed on first use and cached in
     -- `decls`, so the first use must not race another.
     discard(Decls.newtypes(decls))
@@ -1225,7 +1201,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- the primitive costs. Held to the size limit, a bulk primitive's name
     -- would stay a call at every site and be specialized for every element type.
     if forwardsPrim(body) {
-        return Some(applyParams(r, params, args, body, e.ty, placing(r, name, e.span)))
+        return Some(applyParams(r, params, args, body, e.ty, placing(name, e.span)))
     }
     let size = sizeOf(r, name, key, body)
     if size > speculativeInlineLimit { return None }
@@ -1250,7 +1226,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- pointing at the standard library rather than at the code that failed.
     if endsOf(r, name, key, body) && size > bottomInlineLimit { return None }
     -- A copied callee body becomes part of this call site (`placing`).
-    let made = applyParams(r, params, args, body, e.ty, placing(r, name, e.span))
+    let made = applyParams(r, params, args, body, e.ty, placing(name, e.span))
     if size <= limit { return Some(made) }
     -- Restored to what it was, not to `False`. Speculation is meant not to
     -- nest -- the flag is the whole mechanism for that -- and clearing it on
@@ -2264,15 +2240,15 @@ type Placing
     -- (`inlinedThrough`).
     | Inlined(String, Option Span)
 
--- How the body of `callee` is placed at a call with `span`. Positions of
--- inlined code are read by the giblet check, which names the line that
--- allocates in each function from a giblet on, by allocation counting by
--- site, and by debug information. So code inlined into a binding one of them
--- reads records the call; elsewhere the copy keeps the callee's own spans and
--- shares every node it does not change, and only an internal error from a
--- later Core check would show the difference.
-fun placing(r : Reducer, callee : String, span : Option Span) -> Placing =
-    if Set.contains(r.callSites, r.inlining.within) { Inlined(callee, span) } else { Copying }
+-- How the body of `callee` is placed at a call with `span`: as a copy that
+-- records the call. A panic's trace names each inlined call as the frame it
+-- would have been, and without the record an inlined function's lines are
+-- reported as its caller's, in a file the caller is not in. The giblet
+-- check, allocation counting by site and debug information read the same
+-- record. Recording costs a copy of every node of the body, where a copy
+-- that kept the callee's own spans would share each node it does not
+-- change. The code is the same either way: no reduction reads a span.
+fun placing(callee : String, span : Option Span) -> Placing = Inlined(callee, span)
 
 fun applyParams[Iterator p, Length p, Item p ~ CParam,
                 Index c, Key c ~ Int, Value c ~ Core, Iterator c, Item c ~ Core](

@@ -330,7 +330,7 @@ def execute(src: Source, modules: dict[str, str] | None = None,
 
 
 _FRAME = re.compile(r"  at \S.* \(.+:[0-9]+:[0-9]+\)")
-_LEFT_OUT = re.compile(r"  \.\.\. [0-9]+ more calls")
+_LEFT_OUT = re.compile(r"  \.\.\. [0-9]+ more frames?")
 
 
 def panic_message(result: Result) -> str:
@@ -349,7 +349,7 @@ def panic_trace(result: Result) -> list[tuple[str, str]]:
 
     A panic is the last thing a program writes, so each of those lines must be
     `  at FUNCTION (FILE:LINE:COLUMN)`, and there must be at least one. The
-    line `  ... N more calls`, where a deep trace leaves its middle out, is
+    line `  ... N more frames`, where a deep trace leaves its middle out, is
     allowed among them and is not returned.
     """
     lines = result.stderr.splitlines()

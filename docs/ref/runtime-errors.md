@@ -60,8 +60,10 @@ through its call on line 10.
   the same trace wherever it is built.
 * **Functions.** A function is named without its module. A method of an
   instance is named with its class and type, as in `Index(Array(Int)).get`
-  for indexing an array, and an anonymous function by the function it is
-  written in, as in `main.<lambda0>`.
+  for indexing an array. An anonymous function is named by the function it
+  is written in, as in `scale.<lambda>`, or with a number after `lambda`
+  that tells that function's anonymous functions apart, as in
+  `main.<lambda0>`.
 * **Library calls are listed too.** Most panics are raised inside the
   library, so a trace usually starts with a line or more of library
   functions, as this one starts with `error`.
@@ -71,9 +73,12 @@ through its call on line 10.
   called function's body usually keeps its line, but a call to a function
   that was passed as an argument can lose it: the lines of an anonymous
   function's body are then listed under the function it is written in.
-* **A deep trace is shortened.** When more than 64 calls are active, the
-  trace has the innermost 48 and the outermost 16, with a line between them
-  such as `  ... 939 more calls`.
+* **A deep trace is shortened.** A function that is running has a frame
+  on the stack. When the stack holds more than 64 frames, the trace covers
+  the innermost 48 and the outermost 16, and a line between them such as
+  `  ... 939 more frames` counts the rest. A frame can print more than one
+  line, one for each call the compiler replaced with the called function's
+  body there, so the lines on either side can number more than 48 and 16.
 
 ## What panics
 

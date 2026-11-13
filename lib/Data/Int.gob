@@ -154,18 +154,9 @@ fun mulChecked(a : Int, b : Int) -> Option Int {
 fun negChecked(a : Int) -> Option Int =
     if a == minValue() { None } else { Some(-a) }
 
--- -- parsing ------------------------------------------------------------------
---
--- The counterpart of `toString`, and the one `Float.parse` has had all along.
---
--- Written against the bytes rather than against `Data.Char`, which costs
--- nothing here: every digit this accepts is ASCII, so every one of
--- them is a single byte, and asking for a byte cannot land mid-character.
---
--- The accumulator runs *negative*. Parsing into a positive number and negating
--- at the end cannot represent `minValue()`, whose magnitude is one past
--- `maxValue()` -- so the sign that has the extra value is the one accumulated
--- in, and it is the positive result that is checked on the way out.
+-- -- parsing
+
+-- Returns `s` read as a decimal `Int`, or `None`; see `parseRadix`.
 fun parse(s : String) -> Option Int = parseRadix(s, 10)
 
 -- Returns the value of the digit byte `b` (`0`-`9`, then `a`-`z` or `A`-`Z`
@@ -183,7 +174,10 @@ fun digitOf(b : Int) -> Int {
 -- `0x` prefix, no `_`, no surrounding space. Returns `None` for a digit
 -- outside the radix or a value outside `Int`.
 fun parseRadix(s : String, radix : Int) -> Option Int {
-    checkRadix(radix)
+    checkRadix("Int.parseRadix", radix)
+    -- Read the bytes rather than `Data.Char`, which costs nothing here: every
+    -- digit accepted is ASCII, so each is a single byte, and asking for a
+    -- byte cannot land mid-character.
     let n = len(bytesOf(s))
     var i = 0
     var negative = False
@@ -198,6 +192,11 @@ fun parseRadix(s : String, radix : Int) -> Option Int {
     }
     -- A sign on its own is not a number, and neither is the empty string.
     if i >= n { return None }
+    -- The accumulator runs *negative*. Parsing into a positive number and
+    -- negating at the end cannot represent `minValue()`, whose magnitude is
+    -- one past `maxValue()` -- so the sign that has the extra value is the one
+    -- accumulated in, and it is the positive result that is checked on the
+    -- way out.
     var acc = 0
     while i < n {
         let digit = digitOf(Byte.toInt(bytesOf(s)[i]))
@@ -216,15 +215,15 @@ fun parseRadix(s : String, radix : Int) -> Option Int {
     if negative { Some(acc) } else { negChecked(acc) }
 }
 
-fun checkRadix(radix : Int) -> Unit {
-    if radix < 2 || radix > 36 { error("Int: radix must be in 2..36") }
+fun checkRadix(caller : String, radix : Int) -> Unit {
+    if radix < 2 || radix > 36 { error(caller + ": radix must be in 2..36") }
 }
 
 -- Formats `n` in base `radix` (2..36, a panic otherwise) with lowercase
--- letters for the digits above 9 and a leading `-` for a negative number. The
--- digits come off a non-positive copy, as in `toString`.
+-- letters for the digits above 9 and a leading `-` for a negative number.
 fun toStringRadix(n : Int, radix : Int) -> String {
-    checkRadix(radix)
+    checkRadix("Int.toStringRadix", radix)
+    -- As in `toString`, the digits come off a non-positive copy.
     -- 64 digits is the most any radix needs, which is base 2 for `minValue()`.
     let digits = Storage.uninitialized(64)
     var count = 0
@@ -236,11 +235,11 @@ fun toStringRadix(n : Int, radix : Int) -> String {
         rest = rest / radix
         if rest == 0 { break }
     }
-    let sign = if n < 0 { 1 } else { 0 }
-    let out = Storage.uninitialized(sign + count)
+    let signLength = if n < 0 { 1 } else { 0 }
+    let out = Storage.uninitialized(signLength + count)
     if n < 0 { out[0] = Byte.truncate(45) }
     for var i = 0; i < count; i = i + 1 {
-        out[sign + i] = digits[count - 1 - i]
+        out[signLength + i] = digits[count - 1 - i]
     }
     String(out)
 }
@@ -262,16 +261,21 @@ fun floorDiv(a : Int, b : Int) -> Int {
 fun divMod(a : Int, b : Int) -> (Int, Int) = (floorDiv(a, b), mod(a, b))
 
 -- Returns the greatest common divisor, never negative; `gcd(0, 0)` is 0.
--- Panics when an argument is `minValue()`, whose absolute value is not an `Int`.
+-- Panics only when the answer is 2^63, which is `gcd(minValue(), 0)` and
+-- `gcd(minValue(), minValue())`.
 fun gcd(a : Int, b : Int) -> Int {
-    var x = abs(a)
-    var y = abs(b)
+    -- Run Euclid on non-positive values, which can all be represented, so
+    -- that `minValue()` is an ordinary argument. `x % y` takes the sign of
+    -- `x`, so every remainder stays non-positive. `x % -1` is skipped:
+    -- it is 0, and `minValue() % -1` would trap.
+    var x = if a > 0 { -a } else { a }
+    var y = if b > 0 { -b } else { b }
     while y != 0 {
-        let t = x % y
+        let t = if y == -1 { 0 } else { x % y }
         x = y
         y = t
     }
-    x
+    -x
 }
 
 -- Returns the least common multiple, never negative; zero when either argument
@@ -298,13 +302,12 @@ fun pow(base : Int, exp : Int) -> Int {
     result
 }
 
--- Returns `(a * b) mod m` for `0 <= a, b < m` without overflow, by adding `a`
--- into the sum once per set bit of `b` when the plain product does not fit.
+-- Returns `(a * b) mod m` for `0 <= a, b < m`, without overflow.
 fun mulMod(a : Int, b : Int, m : Int) -> Int {
-    match mulChecked(a, b) {
-        Some(p) -> { return p % m }
-        None -> {}
-    }
+    if let Some(p) = mulChecked(a, b) { return p % m }
+    -- The product does not fit, so add `a` into the sum once per set bit of
+    -- `b`, doubling `a` each step. That costs 64 additions where the product
+    -- cost one multiplication, and is only paid for large moduli.
     var result = 0
     var x = a
     var y = b
@@ -360,7 +363,7 @@ fun countOnes(n : Int) -> Int {
     var count = 0
     var rest = n
     while rest != 0 {
-        -- Clears the lowest set bit. The subtraction wraps because `rest` may be
+        -- Clear the lowest set bit. The subtraction wraps because `rest` may be
         -- `minValue()`. (`Bits` imports this module, so the bit operators are
         -- spelled out.)
         rest = and(rest, subWrapping(rest, 1))

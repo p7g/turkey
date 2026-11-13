@@ -459,6 +459,9 @@ fun main() {
 ab..|
 ```
 
+Padding does not know about a sign: `String.padStart("-42", 6, '0')` is
+`000-42`.
+
 Comparing bytes is the same as comparing scalar values, one after another, and
 nothing more. `==` does not normalize, so two strings that display the same
 can be unequal, and `<` is not alphabetical order in any language: every

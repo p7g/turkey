@@ -1755,7 +1755,14 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
     let jumps = joinJumps(rest, id)
 
     -- One jump: the body moves there, and nothing is copied.
+    --
+    -- Unless the body yields a value and the jump sits inside the body of a
+    -- join typed `!`, such as a loop that leaves only by jumping: the value
+    -- would fall through a join whose type says it cannot. A loop whose only
+    -- exit is a `return` (an iterator that never ends) is the case: the
+    -- function's `%ret` join is jumped to once, from inside the loop.
     if len(jumps) == 1 {
+        if fallsThrough(body) && jumpsFromBottomJoin(rest, id) { return None }
         let made = expr(r, atTheJump(r, params, jumpArgs(jumps[0]), body, e.ty))
         return Some(replaceJumps(rest, id, fun(_) = Some(made)))
     }
@@ -3256,6 +3263,15 @@ fun replaceJumps(e : Core, id : Int, chosen : fun(Core) -> Option Core) -> Core 
         type_ = fun(t) = t,
         bind = fun(b) = withValue(b, replaceJumps(b.value, id, chosen)),
     }))
+}
+
+-- Whether a jump to `id` sits, at any depth, in the body of a join of `e`
+-- typed `!`.
+fun jumpsFromBottomJoin(e : Core, id : Int) -> Bool = match e.kind {
+    CJoin(_, _, _, body, rest, _) ->
+        (Ty.isBottom(e.ty) && jumpsTo(body, id))
+            || jumpsFromBottomJoin(body, id) || jumpsFromBottomJoin(rest, id)
+    _ -> anyKid(e.kind, jumpsFromBottomJoin(_, id))
 }
 
 fun jumpsTo(e : Core, id : Int) -> Bool {

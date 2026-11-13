@@ -972,18 +972,14 @@ type DerivedSite = DerivedSite {
 fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan,
                 givens : Map String Ty.Type) -> Core {
     let span = Some(inst.decl.span)
-    let (h, _) = Ty.spine(inst.head)
-    let tycon = match h {
-        TCon(c) -> c.name
-        _ -> oops("a derived instance whose head is not a declared type", span)
-    }
-    let info = match Map.get(l.decls.tycons, tycon) {
+    let tycon = Classes.headTycon(inst.head)
+    let info = match Classes.derivableInfo(l.decls, tycon) {
         Some(i) -> i
         None -> oops("a derived instance for the unknown type '" + tycon + "'", span)
     }
     let cons = Vec.new(len(info.variants))
     for c in info.variants {
-        match Decls.conFieldTypes(l.decls, inst.head, c.name) {
+        match Classes.fieldTypes(l.decls, inst.head, c) {
             Some(types) -> Vec.push(cons, (c, types))
             None -> oops("no field types for '" + c.name + "'", span)
         }
@@ -994,7 +990,9 @@ fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan
               else if inst.cls == P.ordClass { derivedLt(l, d, mi) }
               else if inst.cls == P.hashClass { derivedHash(l, d, mi) }
               else if inst.cls == P.objectClass { derivedIdentical(l, d, mi) }
-              else if inst.cls == P.debugClass { derivedDebug(l, d, mi) }
+              else if inst.cls == P.debugClass || inst.cls == P.showClass {
+                  derivedDebug(l, d, mi)
+              }
               else { oops("no derived method for '" + inst.cls + "'", span) }
     methodAbstraction(mi, lam, span)
 }
@@ -1068,7 +1066,13 @@ fun debugArm(l : Lowerer, d : DerivedSite, c : ConInfo, types : Array Ty.Type,
             None -> text("<hidden>", span)
         }
     })
-    let shown = text(Ty.shortName(c.name), span)
+    -- A tuple prints as its elements in parentheses, the constructor's text
+    -- with no name.
+    let isTuple = match Ty.prune(d.inst.head) {
+        TTuple(_) -> True
+        _ -> False
+    }
+    let shown = text(if isTuple { "" } else { Ty.shortName(c.name) }, span)
     let strings = Ty.rawArrayOf(Ty.tString())
     let made = if len(types) == 0 { shown } else {
         let partsArray = node(strings, span, CArray(parts))
@@ -1089,7 +1093,7 @@ fun debugArm(l : Lowerer, d : DerivedSite, c : ConInfo, types : Array Ty.Type,
     let opening = if len(c.exists) == 0 { None } else {
         Some(Opened { evidence = dicts, skolems = carried.skolems, layouts = None })
     }
-    CAlt { alt = ACon(c.name, Array.map(xs, Some), opening), body = body }
+    CAlt { alt = conAlt(d, c, xs, opening), body = body }
 }
 
 -- A call of the library function `name`, whose parameters have `params`
@@ -1136,10 +1140,10 @@ fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
             fieldCall(l, d, P.eqClass, "eq", types[i], [bound(l, xs[i], types[i], d.span),
                                                        bound(l, ys[i], types[i], d.span)])),
             d.span)
-        let inner = [CAlt { alt = ACon(c.name, Array.map(ys, Some), None), body = same }]
+        let inner = [CAlt { alt = conAlt(d, c, ys, None), body = same }]
         if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
         Vec.push(alts, CAlt {
-            alt = ACon(c.name, Array.map(xs, Some), None),
+            alt = conAlt(d, c, xs, None),
             body = node(Ty.tBool(), d.span, CMatch(paramVar(y, d.span), inner)),
         })
     }
@@ -1162,9 +1166,15 @@ fun enumCompare(l : Lowerer, d : DerivedSite, prim : Prims.Prim, alike : Bool, x
 }
 
 -- The type constructor a derived instance is for.
-fun derivedTycon(d : DerivedSite) -> String = match Ty.spine(d.inst.head).0 {
-    TCon(c) -> c.name
-    _ -> ""
+fun derivedTycon(d : DerivedSite) -> String = Classes.headTycon(d.inst.head)
+
+-- The pattern that matches the constructor `c` of a derived instance's type,
+-- binding its fields to `xs`: the constructor, or for a tuple, which has no
+-- constructor to name, the tuple pattern.
+fun conAlt(d : DerivedSite, c : ConInfo, xs : Array (String, Int), opening : Option Opened)
+        -> Alt = match Ty.prune(d.inst.head) {
+    TTuple(_) -> ATuple(Array.map(xs, Some))
+    _ -> ACon(c.name, Array.map(xs, Some), opening)
 }
 
 -- `lt(x, y)`: a constructor declared earlier is less, and two values of one
@@ -1185,11 +1195,11 @@ fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
         for (c, types) in d.cons {
             let xs = fieldBinders(l, types)
             let ys = fieldBinders(l, types)
-            let inner = [CAlt { alt = ACon(c.name, Array.map(ys, Some), None),
+            let inner = [CAlt { alt = conAlt(d, c, ys, None),
                                 body = lexically(l, d, types, xs, ys, 0) }]
             if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
             Vec.push(alts, CAlt {
-                alt = ACon(c.name, Array.map(xs, Some), None),
+                alt = conAlt(d, c, xs, None),
                 body = node(Ty.tBool(), d.span, CMatch(yv(), inner)),
             })
         }
@@ -1278,7 +1288,7 @@ fun derivedHash(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
             acc = hashField(l, d, mi, types[i], stateTy, paramVar(hasher, d.span),
                             bound(l, xs[i], types[i], d.span), acc)
         }
-        Vec.push(alts, CAlt { alt = ACon(c.name, Array.map(xs, Some), None), body = acc })
+        Vec.push(alts, CAlt { alt = conAlt(d, c, xs, None), body = acc })
     }
     let body = node(stateTy, d.span, CMatch(paramVar(x, d.span), alts))
     node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
@@ -1306,7 +1316,9 @@ fun hashField(l : Lowerer, d : DerivedSite, mi : MethodInfo, ty : Ty.Type, state
 -- under the instance's context (`Turkey.Infer.derivedFields`). `cls` is the
 -- instance's own class, the only one the solver was asked for.
 fun fieldDict(l : Lowerer, d : DerivedSite, cls : String, ty : Ty.Type) -> Core {
-    let found = if cls == d.inst.cls { Map.get(d.plan.fieldDicts, Ty.typeKey(ty)) } else { None }
+    let found = if cls == Classes.derivedFieldClass(d.inst.cls, derivedTycon(d)) {
+        Map.get(d.plan.fieldDicts, Ty.typeKey(ty))
+    } else { None }
     let ev = match found {
         Some(ev) -> ev
         None -> oops("no '" + cls + " " + Ty.show(ty) + "' for a field of '"

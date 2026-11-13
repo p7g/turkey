@@ -518,7 +518,10 @@ elements: `(x)` is just `x` in parentheses, `(x,)` is an error, and `()` is
 
 Tuples are immutable. Their elements are read with a
 [pattern](patterns.md#tuple-patterns) or with
-[projection](expressions.md#tuple-projection), `t.0`, `t.1`, and so on.
+[projection](expressions.md#tuple-projection), `t.0`, `t.1`, and so on. A tuple
+of any length has `Eq`, `Ord`, `Hash`, `Debug` and `Show` wherever its
+elements do ([Derived instances](classes.md#derived-instances)), so it can be
+a `Map` key or a `Set` element.
 
 <!-- run -->
 ```kotlin

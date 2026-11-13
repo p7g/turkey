@@ -379,7 +379,7 @@ The instances the library provides for built-in types:
 | `Float` | yes | yes | no | yes | yes | no | yes |
 | `Byte`, `Char`, `Bool` | yes | yes | yes | no | no | no | yes |
 | `String` | yes | yes | yes | concatenation | no | no | yes |
-| tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
+| tuples | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `FrozenArray a` | if the elements have it | if the elements have it | if the elements have it | concatenation | no | no | if the elements have it |

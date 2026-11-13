@@ -339,25 +339,24 @@ Ada Bo
 
 The instances the library provides for built-in types:
 
-| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Show` |
-|---|---|---|---|---|---|---|---|
-| `Int` | yes | yes | yes | yes | yes | yes | yes |
-| `Float` | yes | yes | no | yes | yes | no | yes |
-| `Byte`, `Char`, `Bool` | yes | yes | yes | no | no | no | yes |
-| `String` | yes | yes | yes | concatenation | no | no | yes |
-| tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
-| `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
-| `Array a`, `Vec a` | if the elements have it | if the elements have it | no | concatenation | no | no | if the elements have it |
-| `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
-| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | if the elements have it |
-| `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
-| `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
-| `Unit` | yes | no | yes | no | no | no | no |
+| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Zero` `One` | `Show` |
+|---|---|---|---|---|---|---|---|---|
+| `Int` | yes | yes | yes | yes | yes | yes | yes | yes |
+| `Float` | yes | yes | no | yes | yes | no | yes | yes |
+| `Byte`, `Char`, `Bool` | yes | yes | yes | no | no | no | no | yes |
+| `String` | yes | yes | yes | concatenation | no | no | no | yes |
+| tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | no | if the elements have it |
+| `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | no | if the contents have it |
+| `Array a`, `Vec a` | if the elements have it | if the elements have it | no | concatenation | no | no | no | if the elements have it |
+| `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | no | if the keys and values have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | no | if the elements have it |
+| `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | no | if the elements have it |
+| `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | no | if the elements have it |
+| `Unit` | yes | no | yes | no | no | no | no | no |
 
 Tuples compare lexicographically, and strings compare byte by byte. Arrays and
 `Vec`s compare lexicographically too, and one that is a proper prefix of
-another is the lesser. `Int`
-and `Float` have `Zero` and `One`, the identities of `+` and `*`. Two
+another is the lesser. Two
 arrays are equal when they have the same length and equal elements at each
 index, and so are two `Vec`s or two `Deque`s, whatever their capacity. Two
 maps are equal when they have the same keys with equal values, and two `Set`s
@@ -679,13 +678,16 @@ False
 Some("pear")
 ```
 
-`Iter.fold` threads an accumulator through the elements of any iterator in
-order. `Iter.sum` and `Iter.product` fold with `+` and `*` from `zero()`
-and `one()`, so they answer `0` and `1` for no elements. `Iter.minimum` and
-`Iter.maximum` answer the least and greatest element as an `Option`, and
-`Iter.minBy` and `Iter.maxBy` the element whose key is least or
-greatest; each calls the key function once per element. When several elements
-tie, all four answer the first.
+`Iter.fold` returns the result of calling a step function on an accumulator
+and each element in turn, with the arguments in the order of `Array.fold`.
+`Iter.sum` and `Iter.product` return the elements added or multiplied from
+`zero()` and `one()`, so they return `0` and `1` for no elements.
+`Iter.minimum` and `Iter.maximum` return the least and greatest element as an
+`Option`, and `Iter.minBy` and `Iter.maxBy` return the element whose key is
+least or greatest; each calls the key function once per element. When several
+elements tie, all four return the first. A NaN is neither less than nor greater
+than anything, so `Iter.minimum` and `Iter.maximum` of `Float`s depend on where
+a NaN sits in the input.
 
 <!-- run -->
 ```kotlin
@@ -707,6 +709,40 @@ Some(1)
 None
 Some("bb")
 31415
+```
+
+### `Zero` and `One`
+
+```text
+class Zero a { fun zero() -> a }
+class One a { fun one() -> a }
+```
+
+`zero()` is the identity of `+` and `one()` the identity of `*`:
+`zero() + x` and `x + zero()` are both `x`, and likewise for `one()` and `*`.
+`Int` and `Float` have both. `Iter.sum` needs `Add` and `Zero` and no more, so a
+type that can be added and has a zero can be summed without having `*`.
+
+<!-- run -->
+```kotlin
+type Pt = Pt { x : Int, y : Int }
+
+instance Add Pt { fun add(a, b) = Pt { x = a.x + b.x, y = a.y + b.y } }
+instance Zero Pt { fun zero() = Pt { x = 0, y = 0 } }
+
+fun main() {
+    let total = Iter.sum([Pt { x = 1, y = 2 }, Pt { x = 3, y = 4 }])
+    print(total.x)
+    print(total.y)
+    let none = Iter.sum(([] : Array Pt))
+    print(none.x)
+}
+```
+
+```text
+4
+6
+0
 ```
 
 ## `Index`

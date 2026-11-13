@@ -23,7 +23,7 @@ The Prelude provides these names unqualified:
 
 With the Prelude, a module also imports the library modules `Data.Array`,
 `Data.Bool`, `Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`,
-`Data.Float`, `Data.Int`, `Control.Iterator`, `Data.Map`, `Data.Option`,
+`Data.Float`, `Data.Int`, `Iter`, `Data.Map`, `Data.Option`,
 `Data.Ordering`, `Data.String` and `Data.Vec` under the last part of their
 names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
@@ -590,7 +590,7 @@ fun main() {
 1
 ```
 
-`Iterator.any`, `Iterator.all`, `Iterator.count` and `Iterator.find` ask a
+`Iter.any`, `Iter.all`, `Iter.count` and `Iter.find` ask a
 predicate of each element of any iterator in turn: whether it holds for some
 element, for every element, for how many, and the first it holds for. `any`,
 `all` and `find` stop at the element that decides, and take nothing after it.
@@ -599,10 +599,10 @@ element, for every element, for how many, and the first it holds for. `any`,
 ```kotlin
 fun main() {
     let words = ["fig", "pear", "plum"]
-    print(Iterator.any(words, String.startsWith(_, "p")))
-    print(Iterator.all(words, String.startsWith(_, "p")))
-    print(Iterator.count(words, String.startsWith(_, "p")))
-    print(Iterator.find(words, String.startsWith(_, "p")))
+    print(Iter.any(words, String.startsWith(_, "p")))
+    print(Iter.all(words, String.startsWith(_, "p")))
+    print(Iter.count(words, String.startsWith(_, "p")))
+    print(Iter.find(words, String.startsWith(_, "p")))
 }
 ```
 
@@ -1068,7 +1068,7 @@ where `==` would accept any equal one:
 ```kotlin
 type Task = Task { name : String, var done : Bool }
 
-fun holds[Object a](xs : Array a, x : a) -> Bool = Iterator.any(xs, identical(_, x))
+fun holds[Object a](xs : Array a, x : a) -> Bool = Iter.any(xs, identical(_, x))
 
 fun main() {
     let first = Task { name = "write", done = False }

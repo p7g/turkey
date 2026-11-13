@@ -231,9 +231,9 @@ def test_any_and_find_pull_nothing_past_the_deciding_element(capsys):
     src = NOISY + """
 fun main() {
     let xs = Noisy { stop = 10 }
-    print(Iterator.any(xs, _ == 2))
-    print(Iterator.find(xs, _ == 1))
-    print(Iterator.all(xs, _ < 1))
+    print(Iter.any(xs, _ == 2))
+    print(Iter.find(xs, _ == 1))
+    print(Iter.all(xs, _ < 1))
 }
 """
     assert output(src, capsys) == [

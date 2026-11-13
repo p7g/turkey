@@ -102,9 +102,9 @@ printf '%s\r\n' \
 
 source=tests/programs/http_codec/Bench.gob
 dir=$(dirname "$source")
-(cd "$dir" && TURKEY_LIB="$ROOT/lib" "$BOOT" build -o "$out/bench.o" Bench.gob)
+(cd "$dir" && TURKEY_LIB="$ROOT/lib" "$BOOT" build -f obj -o "$out/bench.o" Bench.gob)
 $CC -o "$out/bench" "$out/bench.o"
-(cd "$dir" && TURKEY_LIB="$ROOT/lib" TURKEY_ALLOC_SITES=1 "$BOOT" build -o "$out/counted.o" Bench.gob \
+(cd "$dir" && TURKEY_LIB="$ROOT/lib" TURKEY_ALLOC_SITES=1 "$BOOT" build -f obj -o "$out/counted.o" Bench.gob \
     2> "$out/sites.txt")
 $CC -o "$out/counted" "$out/counted.o"
 

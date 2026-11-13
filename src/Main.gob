@@ -3,7 +3,10 @@
 --
 -- Three commands. `check` compiles as far as the last stage that can reject a
 -- program, and writes nothing. `build` compiles all the way and writes the
--- result to `-o`, in the format its extension names or `-f` overrides. `doc`
+-- result to `-o`, in the format `-f` names, or else the one the extension of
+-- `-o` names, or else an executable. Without `-o`, an executable goes to the
+-- working directory, named after the entry file, and the other formats to
+-- standard output (`openSink`). `doc`
 -- checks the modules it is given and writes what each exports as JSON
 -- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print
 -- what a stage produced, which is how a pass is read while it is being
@@ -351,47 +354,17 @@ fun formatOf(path : String) -> Format {
     }
 }
 
--- Where `build` writes, refused here if it is something this cannot write
--- yet, before any compiling is spent on it.
+-- Where `build` writes, refused here if it is something this cannot write,
+-- before any compiling is spent on it. With no `-f`, the format is the one
+-- `-o` names by its extension, or an executable. With no `-o`, an executable
+-- goes to the working directory, named after the entry file without its
+-- extension, and assembly or an object to standard output.
 fun openSink(output : Option String, format : Option Format, paths : Vec String,
              dumping : Bool) -> Sink {
     let chosen = match (format, output) {
         (Some(f), _) -> f
-        (None, Some("-")) -> die("-o - has no extension to tell the format "
-                                 + "from; add -f asm or -f obj")
+        (None, None) | (None, Some("-")) -> Executable
         (None, Some(path)) -> formatOf(path)
-        (None, None) -> Executable
-    }
-    -- An executable only when asked for by name: it is not what a name
-    -- without an extension gets on any target.
-    if let (Executable, None) = (chosen, format) {
-        die("an executable is written only with -f exe; or write an object with "
-            + "-o NAME.o and link it with a C compiler")
-    }
-    let to = match output {
-        None | Some("-") -> {
-            -- Dumps go to standard output too, and two things in one stream
-            -- can be told apart only by parsing both.
-            if dumping {
-                die("--dump and the build would both write to standard "
-                    + "output; write the build to a file with -o PATH")
-            }
-            ToStdout
-        }
-        Some(path) -> {
-            if len(paths) > 1 {
-                die("-o '" + path + "' can take only one input file, and "
-                    + Int.toString(len(paths)) + " were given; build each "
-                    + "file separately, or write to standard output with -o -")
-            }
-            match chosen {
-                Executable -> ToExecutable(path)
-                Object | Assembly -> match File.create(path, File.Truncate) {
-                    Right(out) -> ToFile(out)
-                    Left(e) -> die(message(e))
-                }
-            }
-        }
     }
     let one = match chosen {
         Object -> Some("object")
@@ -409,7 +382,56 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
         Some((stem, _)) -> stem
         None -> base
     }
+    let to = match (output, chosen) {
+        (None, Executable) -> {
+            -- An entry file without an extension has the executable's name,
+            -- and in the working directory it is the executable's path.
+            if name == base {
+                die("cannot name the executable after '" + base + "', which "
+                    + "has no extension to drop; name it with -o PATH")
+            }
+            if name == "" {
+                die("cannot name the executable after '" + base + "', which "
+                    + "has nothing before its extension; name it with -o PATH")
+            }
+            ToExecutable(executablePath(name, "./" + name))
+        }
+        (None, _) | (Some("-"), _) -> {
+            -- Dumps go to standard output too, and two things in one stream
+            -- can be told apart only by parsing both.
+            if dumping {
+                die("--dump and the build would both write to standard "
+                    + "output; write the build to a file with -o PATH")
+            }
+            ToStdout
+        }
+        (Some(path), _) -> {
+            if len(paths) > 1 {
+                die("-o '" + path + "' can take only one input file, and "
+                    + Int.toString(len(paths)) + " were given; build each "
+                    + "file separately, or write to standard output with -o -")
+            }
+            match chosen {
+                Executable -> ToExecutable(executablePath(path, path))
+                Object | Assembly -> match File.create(path, File.Truncate) {
+                    Right(out) -> ToFile(out)
+                    Left(e) -> die(message(e))
+                }
+            }
+        }
+    }
     Sink { to = to, format = chosen, name = name }
+}
+
+-- Returns `path`, refusing it if it names a directory. `writeExecutable`
+-- renames over `path` only once the program is compiled, so without this a
+-- directory would be found only after all of that work. `shown` is `path` as
+-- the diagnostic names it.
+fun executablePath(path : String, shown : String) -> String = match File.metadata(path) {
+    Right(File.Stat { kind = File.Directory, .. }) ->
+        die("cannot write the executable to '" + shown + "', which is a "
+            + "directory; name a file with -o PATH")
+    _ -> path
 }
 
 -- The last component of `path`.

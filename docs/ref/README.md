@@ -92,20 +92,22 @@ hello
 Examples that the compiler rejects say so in the surrounding text, and the
 test checks that the error message says what the text claims it says.
 
-Source files use the extension `.gob`. The compiler, `boot`, emits assembly
-for the whole program, which a C compiler assembles and links:
+Source files use the extension `.gob`. The compiler, `boot`, writes the
+whole program as an executable, named after the file and placed in the working
+directory, with nothing to assemble or link:
 
 ```sh
-boot build -o hello.s hello.gob
-cc -o hello hello.s
+boot build hello.gob
 ./hello
 ```
 
-On Linux, add `-lm` to the link. `boot build -f exe -o hello hello.gob`
-writes the executable itself, with nothing to assemble or link: a signed
-executable on a Mac, and on Linux one that runs on glibc 2.34 or later. It
-loads the shared libraries the program calls into, as
-[Foreign functions](declarations.md#foreign-functions) describes.
+The executable is signed on a Mac, and on Linux it runs on glibc 2.34 or
+later. It loads the shared libraries the program calls into, as
+[Foreign functions](declarations.md#foreign-functions) describes. `-o PATH`
+names it, and `-o -` writes it to standard output. `-f asm` writes assembly
+instead and `-f obj` a relocatable object, either of which a C compiler links;
+without `-o`, either goes to standard output. On Linux, add `-lm` to the
+link.
 
 The project README says how to build `boot` itself.
 

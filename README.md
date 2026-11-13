@@ -76,9 +76,54 @@ That leaves a compiler in `build/stages/stage2`. Save the example as
 `rectangles.gob`, then compile and run it:
 
 ```sh
+build/stages/stage2 build rectangles.gob
+./rectangles
+```
+
+To run it from anywhere as `turkey`, link it onto your `PATH`:
+
+```sh
+sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/stage2
+sh scripts/install.sh ~/bin    # or a directory of your choosing
+```
+
+The checkout is the installation: the compiler finds its library by resolving
+its own path, symbolic links included, and taking the nearest `lib/` holding
+`Prelude.gob` in that directory or one above it. `$TURKEY_LIB`, if it is set,
+names the library instead. The working directory is never searched, so a
+`lib/` in your own project cannot stand in for it. Rebuilding updates what
+`turkey` runs; after moving the checkout, run `install.sh` again.
+
+Besides `doc` ("Library documentation" below), the compiler has two commands.
+`build` writes the program in the format `-f` names: `exe`, an executable that
+runs as it is, with no assembler and no linker; `obj`, a relocatable object,
+which needs only a linker; or `asm`, assembly. Without `-f`, the file `-o`
+names chooses: a relocatable object for `.o`, assembly for `.s`, and an
+executable for a name without an extension. Without either, `build` writes an
+executable. Without `-o`, the executable goes to the working directory, named
+after the entry file without its extension, and an object or assembly goes to
+standard output. `-o -` writes any of the three to standard output.
+
+The executable is a signed Mach-O on a Mac, and on arm64 Linux an ELF that
+loads glibc 2.34 or later. It is written for either target from any host, with
+`--target`. It loads the C library -- libSystem on a Mac, glibc's `libc.so.6`
+and `libm.so.6` on Linux -- and the libraries the program calls into: a program
+that calls `Net.TLS` loads OpenSSL 3's `libssl` and `libcrypto`. On Linux they
+are `libssl.so.3` and `libcrypto.so.3`, and nothing is read to write them. On a
+Mac, `boot` reads each library's install name from `libssl.3.dylib` (and so
+on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
+then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
+`opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
+that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
+naming a directory that holds a copy of the library. Either executable
+carries the unwind information and, with `-g`, the debug information a linked
+one does (see "Debugging and profiling").
+
+An object links with the C compiler:
+
+```sh
 build/stages/stage2 build -o rectangles.o rectangles.gob
 cc -o rectangles rectangles.o
-./rectangles
 ```
 
 On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
@@ -97,49 +142,8 @@ cc -o client client.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
 The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
-To run it from anywhere as `turkey`, link it onto your `PATH`:
-
-```sh
-sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/stage2
-sh scripts/install.sh ~/bin    # or a directory of your choosing
-```
-
-The checkout is the installation: the compiler finds its library by resolving
-its own path, symbolic links included, and taking the nearest `lib/` holding
-`Prelude.gob` in that directory or one above it. `$TURKEY_LIB`, if it is set,
-names the library instead. The working directory is never searched, so a
-`lib/` in your own project cannot stand in for it. Rebuilding updates what
-`turkey` runs; after moving the checkout, run `install.sh` again.
-
-Besides `doc` ("Library documentation" below), the compiler has two commands.
-`build` writes the program to `-o`, in the format the file's extension names
--- a relocatable object for `.o`, assembly for `.s` -- or `-f obj` or `-f asm`
-says; `-o - -f asm` writes it to standard output. An object needs no
-assembler, only a linker. `-f exe` writes an executable that runs as it is,
-with no assembler and no linker: a signed Mach-O on a Mac, and on arm64 Linux
-an ELF that loads glibc 2.34 or later.
-
-```sh
-build/stages/stage2 build -f exe -o rectangles rectangles.gob
-./rectangles
-```
-
-It is written for either target from any host, with `--target`. It loads the
-C library -- libSystem on a Mac, glibc's `libc.so.6` and `libm.so.6` on
-Linux -- and the libraries the program calls into: a program that calls
-`Net.TLS` loads OpenSSL 3's `libssl` and `libcrypto`. On Linux they are
-`libssl.so.3` and `libcrypto.so.3`, and nothing is read to write them. On a
-Mac, `boot` reads each library's install name from `libssl.3.dylib` (and so
-on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
-then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
-`opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
-that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
-naming a directory that holds a copy of the library. Either executable
-carries the unwind information and, with `-g`, the debug information a linked
-one does (see "Debugging and profiling"). A file name without an extension
-does not choose an executable yet; name it with `-f exe`. `check` compiles as far
-as the last stage that can reject a program and writes nothing. Either takes
-`--dump STAGE,...` to print what a stage produced:
+`check` compiles as far as the last stage that can reject a program and
+writes nothing. Either command takes `--dump STAGE,...` to print what a stage produced:
 `build/stages/stage2 check --dump types rectangles.gob` shows the inferred
 types, and running the compiler with no arguments lists the stages.
 `build --timings` reports on standard error how long each phase took, how the
@@ -175,37 +179,36 @@ explain themselves at the top.
 `build -g` adds a line table and the DWARF a debugger needs to find it: a
 compile unit for the program and an entry for each function. It changes no
 code: a program built with `-g` runs the same instructions as one built
-without. It works for an object and for assembly alike:
+without.
 
 ```sh
-build/stages/stage2 build -g -o rectangles.o rectangles.gob
-cc -o rectangles rectangles.o
+build/stages/stage2 build -g rectangles.gob
 ```
 
-Assembly written with `-g` needs the assembler to build the line table, in
-DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
+On a Mac, the executable carries the DWARF itself, in a `__DWARF` segment
+that is never loaded, and lldb, `atos`, `sample`, Instruments and crash
+reports read it there. There is nothing to keep beside it and nothing to run
+afterwards. Do not run `dsymutil` on such an executable: it reads only a
+linker's map, so it writes a `.dSYM` with no DWARF in it, which lldb then
+prefers to the executable's own. `strip` leaves the DWARF in place; build
+without `-g` for an executable without it.
+
+On Linux, the DWARF goes in the ELF's debug sections, which are never loaded,
+as a linker does: gdb reads them there, `strip` removes them and
+`objcopy --only-keep-debug` copies them out.
 
 `-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
 functions and the calls inlined into them, which is all a profiler or a
 backtrace reads, and none of what a debugger needs to show a variable.
 
-On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
-object and writes only a map to it into the executable, which is how lldb and
+`-g` works for an object and for assembly alike. Assembly written with `-g`
+needs the assembler to build the line table, in DWARF 5 as the rest is:
+`cc -gdwarf-5 -c rectangles.s -o rectangles.o`. On a Mac, keep a linked
+program's object where it is. The linker leaves the DWARF in the object and
+writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run
 `dsymutil rectangles`, which writes `rectangles.dSYM` beside it. On Linux the
 DWARF is linked into the executable.
-
-`build -g -f exe` on a Mac writes the DWARF into the executable itself, in a
-`__DWARF` segment that is never loaded, and lldb, `atos`, `sample`,
-Instruments and crash reports read it there. There is no object to keep and
-nothing to run afterwards. Do not run `dsymutil` on such an executable: it
-reads only a linker's map, so it writes a `.dSYM` with no DWARF in it, which
-lldb then prefers to the executable's own. `strip` leaves the DWARF in place;
-build without `-g` for an executable without it.
-
-`build -g -f exe` on Linux puts the DWARF in the ELF's debug sections, which
-are never loaded, as a linker does: gdb reads them there, `strip` removes
-them and `objcopy --only-keep-debug` copies them out.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:
@@ -330,9 +333,9 @@ With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 `bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
 any platform emit Linux objects and assembly.
 
-`--target arm64-linux -f exe` needs none of the cross toolchain: it writes a
-dynamically linked executable on any host, with no linker and no arm64 libc.
-That executable runs on glibc 2.34 or later -- RHEL 9 and its rebuilds,
+An executable for `--target arm64-linux` needs none of the cross toolchain:
+`boot` writes it, dynamically linked, on any host, with no linker and no arm64
+libc. It runs on glibc 2.34 or later -- RHEL 9 and its rebuilds,
 Ubuntu 22.04, Debian 12, and anything newer -- the first release with
 `pthread_create` in `libc.so.6`. On an older glibc it stops before `main`
 with `symbol lookup error: undefined symbol`. It names its loader
@@ -349,8 +352,8 @@ minutes once `boot` is built and two hours from a cold cache; the few tests
 that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
-programs run directly, and `-f exe` needs no C compiler at all. CI does this on
-GitHub's arm64 runners (`.github/workflows/linux.yml`), building from the
+programs run directly, and an executable needs no C compiler at all. CI does
+this on GitHub's arm64 runners (`.github/workflows/linux.yml`), building from the
 bootstrap under gcc and running the suite and the fixed point split across jobs
 by `scripts/ci-shard.sh`.
 

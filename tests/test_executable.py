@@ -1,5 +1,5 @@
-"""The executable writers: `boot build -f exe` writes a signed Mach-O, or an
-ELF for glibc, that the loader takes as it takes the linker's, with nothing
+"""The executable writers: `boot build` writes a signed Mach-O, or an ELF
+for glibc, that the loader takes as it takes the linker's, with nothing
 linked.
 
 `scripts/test.sh --exe` runs every program through this path against the
@@ -423,11 +423,82 @@ def test_a_build_leaves_another_builds_partial_file_alone(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == [".adt.partial0", "adt"]
 
 
-def test_an_executable_is_written_only_when_asked_for(tmp_path):
-    result = _boot("--target", "arm64-darwin", "-o", str(tmp_path / "adt"),
-                   str(PROGRAMS / "adt.gob"))
+# With neither -f nor -o, `build` writes an executable for the host into the
+# working directory, named after the entry file without its extension, and
+# not beside the entry file.
+def test_a_build_writes_an_executable_named_after_its_entry(tmp_path):
+    (tmp_path / "sub").mkdir()
+    shutil.copy(PROGRAMS / "adt.gob", tmp_path / "sub" / "01.gob")
+    result = _boot("sub/01.gob", cwd=tmp_path)
+    assert result.returncode == 0, result.stderr[-4000:]
+    executable = tmp_path / "01"
+    assert os.stat(executable).st_mode & 0o111 == 0o111
+    assert not (tmp_path / "sub" / "01").exists()
+    ran = subprocess.run(toolchain.command(executable), capture_output=True, text=True,
+                         timeout=60, cwd=tmp_path)
+    assert (ran.returncode, ran.stdout) == (
+        0, (PROGRAMS / "adt.expected").read_text(encoding="utf-8")), ran.stderr
+
+
+# A file name without an extension is an executable, written with the
+# executable bit, and runs as one built with `-f exe` does.
+def test_an_output_without_an_extension_is_an_executable(tmp_path):
+    (tmp_path / "named").mkdir()
+    (tmp_path / "explicit").mkdir()
+    named = tmp_path / "named" / "adt"
+    result = _boot("-o", str(named), str(PROGRAMS / "adt.gob"))
+    assert result.returncode == 0, result.stderr[-4000:]
+    explicit = tmp_path / "explicit" / "adt"
+    _write(PROGRAMS / "adt.gob", explicit, "--target", toolchain.target())
+    assert os.stat(named).st_mode & 0o111 == 0o111
+    assert named.read_bytes() == explicit.read_bytes()
+
+
+# `-o -` writes the executable to standard output, the same bytes `-f exe`
+# writes to a file.
+@pytest.mark.parametrize("target", ["arm64-darwin", "arm64-linux"])
+def test_dash_writes_the_executable_to_standard_output(tmp_path, target):
+    result = subprocess.run(
+        toolchain.command(bootc.binary(), "build", "--target", target, "-o", "-",
+                          str(PROGRAMS / "adt.gob")),
+        capture_output=True, env=ENV, timeout=600)
+    assert result.returncode == 0, result.stderr.decode()[-4000:]
+    written = tmp_path / "adt"
+    built = _boot("-f", "exe", "--target", target, "-o", str(written),
+                  str(PROGRAMS / "adt.gob"))
+    assert built.returncode == 0, built.stderr[-4000:]
+    assert result.stdout == written.read_bytes()
+
+
+# An entry file without an extension has the executable's own name, so
+# without `-o` the build is refused rather than writing over it.
+def test_an_entry_without_an_extension_needs_an_output_name(tmp_path):
+    entry = tmp_path / "adt"
+    shutil.copy(PROGRAMS / "adt.gob", entry)
+    result = _boot("adt", cwd=tmp_path)
     assert result.returncode == 2
-    assert "only with -f exe" in result.stderr
+    assert "cannot name the executable after 'adt'" in result.stderr
+    assert entry.read_bytes() == (PROGRAMS / "adt.gob").read_bytes()
+
+
+# The executable's path is checked before anything is compiled: a directory
+# there, or an entry file with nothing before its extension, is refused at
+# once and nothing is written.
+@pytest.mark.parametrize("entry, args, message", [
+    ("adt.gob", (), "cannot write the executable to './adt', which is a directory"),
+    ("adt.gob", ("-o", "adt"), "cannot write the executable to 'adt', which is a directory"),
+    (".gob", (), "cannot name the executable after '.gob'"),
+])
+def test_an_executable_path_that_cannot_be_written_is_refused_at_once(tmp_path, entry,
+                                                                      args, message):
+    shutil.copy(PROGRAMS / "adt.gob", tmp_path / entry)
+    (tmp_path / "adt").mkdir()
+    result = _boot(*args, "--timings", entry, cwd=tmp_path)
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "time\t" not in result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([entry, "adt"])
+    assert list((tmp_path / "adt").iterdir()) == []
 
 
 def _commands(data: bytes):

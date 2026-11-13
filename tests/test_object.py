@@ -328,7 +328,7 @@ def _objects(entry: Path) -> tuple[bytes, bytes]:
         source = Path(directory) / "t.s"
         theirs = Path(directory) / "theirs.o"
         env = dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib"))
-        for args in (["-o", str(ours)], ["-o", str(source)]):
+        for args in (["-f", "obj", "-o", str(ours)], ["-f", "asm", "-o", str(source)]):
             result = subprocess.run(
                 toolchain.command(bootc.binary(), "build", *args, str(entry)),
                 capture_output=True, env=env, timeout=600)
@@ -391,7 +391,8 @@ def _ours(entry: Path) -> bytes:
         ours = Path(directory) / "ours.o"
         env = dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib"))
         result = subprocess.run(
-            toolchain.command(bootc.binary(), "build", "-o", str(ours), str(entry)),
+            toolchain.command(bootc.binary(), "build", "-f", "obj", "-o", str(ours),
+                              str(entry)),
             capture_output=True, env=env, timeout=600)
         assert result.returncode == 0, result.stderr.decode()[:4000]
         return ours.read_bytes()

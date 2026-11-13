@@ -18,52 +18,52 @@ export (
     pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
 
--- The threads that run Turkey code, each with a record of its own
--- (`Turkey.Process` lays it out) that `x28` holds while it runs; the run
--- permits that say which of them may take tasks; and how a collection stops
--- all but itself.
---
--- A giblet module, since the collector and the allocator call it.
---
--- **Records and permits.** A thread's record is what makes it a mutator: its
--- allocator cursors, its remembered set, its stop word, its stack and its
--- index. A thread keeps the record it starts with for life, so every table
--- indexed by a thread's index (`Turkey.Coroutine`'s, the heap's) has one
--- owner. What `TURKEY_WORKERS` counts is permits: a thread takes tasks from
--- the queue only while it holds one (`Turkey.Scheduler.workerLoop`). Permits
--- are interchangeable, so what is kept is how many no thread holds.
---
--- **Blocking calls.** A thread about to wait in a C call that may take as long
--- as something outside the program does -- a file read, `flock` -- says so
--- with one store (`callEnter`) and keeps its permit. If it is still in the
--- same call on two ticks of the monitor while tasks wait for a thread, the
--- monitor takes the permit and hands it to a spare thread (`Turkey.Monitor`).
--- A call that returns first costs one compare-and-swap (`callExit`). One that
--- finds its permit gone takes a free one if there is one. Otherwise its
--- record is still its own, so it can still take the scheduler's lock: it
--- gives its task back to the scheduler to queue and parks as a spare
--- (`Turkey.Scheduler.afterCall`). Which C calls are made this way, and which
--- may wait inline, is the contract under "C calls that may block" below.
---
--- **Stopping the world.** A collection runs with every other thread stopped at
--- a safepoint, where the frame tables describe its roots. The collecting
--- thread raises each other thread's stop word -- the word every loop's poll
--- tests (`Turkey.Polls`), which the allocator's slow path tests too -- and
--- waits until each is either stopped or blocked:
---
--- * **stopped**: it saw its stop word at a safepoint, recorded that frame as
---   its running stack's parked frame, so that the collection walks its stack
---   like any parked one, and waits for the word to come down, marking for
---   the collection meanwhile if it is asked to (`Turkey.Heap.stopAt`);
--- * **blocked**: it declared, before waiting on something outside Turkey code
---   -- a lock, work, a permit or a C call -- that its stack is parked at a
---   frame and that it holds nothing else. The collector claims a blocked
---   thread (*held*) so that it cannot run again until the collection ends.
---   The monitor holds a blocked thread the same way while it takes its permit.
---
--- The collector waits at the end until every thread it stopped is running
--- again, so that a second collection never mistakes a thread still leaving
--- the first for one stopped for it.
+--- The threads that run Turkey code, each with a record of its own
+--- (`Turkey.Process` lays it out) that `x28` holds while it runs; the run
+--- permits that say which of them may take tasks; and how a collection stops
+--- all but itself.
+---
+--- A giblet module, since the collector and the allocator call it.
+---
+--- **Records and permits.** A thread's record is what makes it a mutator: its
+--- allocator cursors, its remembered set, its stop word, its stack and its
+--- index. A thread keeps the record it starts with for life, so every table
+--- indexed by a thread's index (`Turkey.Coroutine`'s, the heap's) has one
+--- owner. What `TURKEY_WORKERS` counts is permits: a thread takes tasks from
+--- the queue only while it holds one (`Turkey.Scheduler.workerLoop`). Permits
+--- are interchangeable, so what is kept is how many no thread holds.
+---
+--- **Blocking calls.** A thread about to wait in a C call that may take as long
+--- as something outside the program does -- a file read, `flock` -- says so
+--- with one store (`callEnter`) and keeps its permit. If it is still in the
+--- same call on two ticks of the monitor while tasks wait for a thread, the
+--- monitor takes the permit and hands it to a spare thread (`Turkey.Monitor`).
+--- A call that returns first costs one compare-and-swap (`callExit`). One that
+--- finds its permit gone takes a free one if there is one. Otherwise its
+--- record is still its own, so it can still take the scheduler's lock: it
+--- gives its task back to the scheduler to queue and parks as a spare
+--- (`Turkey.Scheduler.afterCall`). Which C calls are made this way, and which
+--- may wait inline, is the contract under "C calls that may block" below.
+---
+--- **Stopping the world.** A collection runs with every other thread stopped at
+--- a safepoint, where the frame tables describe its roots. The collecting
+--- thread raises each other thread's stop word -- the word every loop's poll
+--- tests (`Turkey.Polls`), which the allocator's slow path tests too -- and
+--- waits until each is either stopped or blocked:
+---
+--- * **stopped**: it saw its stop word at a safepoint, recorded that frame as
+---   its running stack's parked frame, so that the collection walks its stack
+---   like any parked one, and waits for the word to come down, marking for
+---   the collection meanwhile if it is asked to (`Turkey.Heap.stopAt`);
+--- * **blocked**: it declared, before waiting on something outside Turkey code
+---   -- a lock, work, a permit or a C call -- that its stack is parked at a
+---   frame and that it holds nothing else. The collector claims a blocked
+---   thread (*held*) so that it cannot run again until the collection ends.
+---   The monitor holds a blocked thread the same way while it takes its permit.
+---
+--- The collector waits at the end until every thread it stopped is running
+--- again, so that a second collection never mistakes a thread still leaving
+--- the first for one stopped for it.
 
 import Prelude ()
 import Data.Int (Int)
@@ -86,19 +86,19 @@ import Data.Int as Int
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 
--- At most this many threads run Turkey code, the program's own included, and
--- every table indexed by a thread is this long: about 80 bytes a thread, all
--- of it allocated at start. One more crashes the program
--- (`threadsExhausted`), as Go's runtime crashes past 10000.
---
--- A thread beyond the permits exists only to carry a permit while another
--- thread is blocked in a call, so this bounds the calls blocked at once. Past
--- about a thousand, synchronous calls stop paying: Haas and Leis (VLDB 2023)
--- needed a little over 1000 `pread`s in flight to keep an NVMe drive busy,
--- and found more threads than that spending most of their time in the
--- kernel. A program that blocks more threads than this is more likely stuck,
--- with tasks waiting on each other's file locks, than busy; and every
--- collection visits every thread.
+--- At most this many threads run Turkey code, the program's own included, and
+--- every table indexed by a thread is this long: about 80 bytes a thread, all
+--- of it allocated at start. One more crashes the program
+--- (`threadsExhausted`), as Go's runtime crashes past 10000.
+---
+--- A thread beyond the permits exists only to carry a permit while another
+--- thread is blocked in a call, so this bounds the calls blocked at once. Past
+--- about a thousand, synchronous calls stop paying: Haas and Leis (VLDB 2023)
+--- needed a little over 1000 `pread`s in flight to keep an NVMe drive busy,
+--- and found more threads than that spending most of their time in the
+--- kernel. A program that blocks more threads than this is more likely stuck,
+--- with tasks waiting on each other's file locks, than busy; and every
+--- collection visits every thread.
 fun threadLimit() -> Int = 1024
 
 -- Each thread's record, by index; index 0 is the program's own thread's, the
@@ -210,10 +210,10 @@ fun sleepOn(word : Int, seen : Int) -> Unit {
     let _ = Ptr.atomicAdd(signals, plus(word, 8), -1)
 }
 
--- Something for an idle thread to do: wake one, or, `all`, every one. A
--- poller is one more idle thread: it is broken out of its wait when every one
--- is to be woken, and when no sleeper on the epoch was there to take a single
--- wake.
+--- Something for an idle thread to do: wake one, or, `all`, every one. A
+--- poller is one more idle thread: it is broken out of its wait when every one
+--- is to be woken, and when no sleeper on the epoch was there to take a single
+--- wake.
 fun signalWork(all : Bool) -> Unit {
     let _ = Ptr.atomicAdd(signals, 0, 1)
     var woken = False
@@ -234,34 +234,34 @@ fun zeroed(bytes : Int) -> Ptr {
     p
 }
 
--- How many threads there are: 1 until the program's own is registered.
+--- How many threads there are: 1 until the program's own is registered.
 fun count() -> Int {
     let n = Ptr.atomicLoad(control, 8)
     if n == 0 { 1 } else { n }
 }
 
--- The running thread's index, a word of its record.
+--- The running thread's index, a word of its record.
 fun index() -> Int = Ptr.load(Process.workerRecord(), 288)
 
 -- The offset of the running thread's state word in `states`.
 fun mine() -> Int = index() << 3
 
--- Whether the running thread is running Turkey code, rather than blocked or
--- stopped -- which it may be in a loop of this module's, inlined into a
--- caller and so given a poll (`Turkey.Polls`).
+--- Whether the running thread is running Turkey code, rather than blocked or
+--- stopped -- which it may be in a loop of this module's, inlined into a
+--- caller and so given a poll (`Turkey.Polls`).
 fun running() -> Bool = (Ptr.atomicLoad(states, mine()) & 7) == 0
 
 fun recordOf(i : Int) -> Ptr =
     if i == 0 && Ptr.atomicLoad(control, 8) == 0 { Process.workerRecord() }
     else { Ptr.load(records, 8 * i) }
 
--- Whether the program's own thread is registered (`mainRegister`), which it is
--- once the workers have started.
+--- Whether the program's own thread is registered (`mainRegister`), which it is
+--- once the workers have started.
 fun started() -> Bool = Ptr.atomicLoad(control, 8) != 0
 
--- Register the program's own thread, as the first, holding a permit: from
--- here on its waits and calls are counted. Called once, before any other
--- thread starts.
+--- Register the program's own thread, as the first, holding a permit: from
+--- here on its waits and calls are counted. Called once, before any other
+--- thread starts.
 fun mainRegister() -> Unit {
     if Ptr.atomicLoad(control, 8) != 0 { return {} }
     Ptr.store(records, 0, Process.workerRecord())
@@ -338,10 +338,10 @@ fun say(text : Ptr) -> Unit {
     let _ = Libc.write(2, text, Libc.strlen(text))
 }
 
--- Stop every other thread, for a collection. False if another thread is
--- stopping them already: that one collects, and this one stops at its next
--- safepoint like the rest. A registration under way is waited for, since it
--- ends without a safepoint.
+--- Stop every other thread, for a collection. False if another thread is
+--- stopping them already: that one collects, and this one stops at its next
+--- safepoint like the rest. A registration under way is waited for, since it
+--- ends without a safepoint.
 fun stopTheWorld() -> Bool {
     if Ptr.atomicLoad(control, 8) == 0 { return True }
     while True {
@@ -374,8 +374,8 @@ fun stoppedOrHeld(i : Int) -> Bool {
             && Ptr.atomicCas(states, 8 * i, s, plus(s, 1)) == s)
 }
 
--- Let the other threads go again, and wait until every one that stopped is
--- running before another collection may stop them.
+--- Let the other threads go again, and wait until every one that stopped is
+--- running before another collection may stop them.
 fun startTheWorld() -> Unit {
     if Ptr.atomicLoad(control, 8) == 0 { return {} }
     let n = count()
@@ -402,17 +402,17 @@ fun startTheWorld() -> Unit {
     Ptr.atomicStore(control, 0, 0)
 }
 
--- At a safepoint whose caller's frame record is `frame`, with the running
--- thread's stop word raised: stopped, until `stopLeave`. The collection may
--- ask a stopped thread to help it mark (`Turkey.Heap.stopAt`), which is why
--- the wait between the two is the heap's.
+--- At a safepoint whose caller's frame record is `frame`, with the running
+--- thread's stop word raised: stopped, until `stopLeave`. The collection may
+--- ask a stopped thread to help it mark (`Turkey.Heap.stopAt`), which is why
+--- the wait between the two is the heap's.
 fun stopEnter(frame : Ptr) -> Unit {
     parkAt(frame)
     let at = mine()
     Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), stoppedState))
 }
 
--- Whether the collection that stopped the running thread is still going.
+--- Whether the collection that stopped the running thread is still going.
 fun stopWanted() -> Bool = Ptr.atomicLoad(Process.workerRecord(), 272) & 1 != 0
 
 fun stopLeave() -> Unit {
@@ -421,13 +421,13 @@ fun stopLeave() -> Unit {
     Ptr.atomicStore(states, at, Int.subWrapping(Ptr.atomicLoad(states, at), stoppedState))
 }
 
--- Whether thread `i` is stopped at a safepoint, rather than held while
--- blocked; only the collecting thread asks, with the world stopped.
+--- Whether thread `i` is stopped at a safepoint, rather than held while
+--- blocked; only the collecting thread asks, with the world stopped.
 fun stopped(i : Int) -> Bool = (Ptr.atomicLoad(states, 8 * i) & 7) == stoppedState
 
--- About to wait outside Turkey code, with every root the caller holds in its
--- frames and the caller's frame record at `frame`: from here a collection may
--- run without this thread stopping.
+--- About to wait outside Turkey code, with every root the caller holds in its
+--- frames and the caller's frame record at `frame`: from here a collection may
+--- run without this thread stopping.
 fun blockEnter(frame : Ptr) -> Unit {
     if Ptr.atomicLoad(control, 8) == 0 { return {} }
     parkAt(frame)
@@ -435,7 +435,7 @@ fun blockEnter(frame : Ptr) -> Unit {
     Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), waitingState))
 }
 
--- Back from waiting: running again once nobody holds this thread.
+--- Back from waiting: running again once nobody holds this thread.
 fun blockExit() -> Unit {
     while True {
         let epoch = collectionSeen()
@@ -446,7 +446,7 @@ fun blockExit() -> Unit {
     }
 }
 
--- Running again, True, unless a collection or the monitor holds this thread.
+--- Running again, True, unless a collection or the monitor holds this thread.
 fun unblock() -> Bool {
     if Ptr.atomicLoad(control, 8) == 0 { return True }
     let at = mine()
@@ -521,8 +521,8 @@ foreign "turkey_lock_acquire" fun acquire(mutex : Ptr) -> Unit {
 
 -- -- permits ----------------------------------------------------------------------------
 
--- How many permits there are: what `TURKEY_WORKERS` asked for, or 1 before
--- the workers start.
+--- How many permits there are: what `TURKEY_WORKERS` asked for, or 1 before
+--- the workers start.
 fun permits() -> Int {
     let n = Ptr.atomicLoad(permitWords, permitCountAt)
     if n == 0 { 1 } else { n }
@@ -530,18 +530,18 @@ fun permits() -> Int {
 
 fun permitsSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, permitCountAt, n)
 
--- Whether the running thread holds a permit, which every thread does until
--- the workers start.
+--- Whether the running thread holds a permit, which every thread does until
+--- the workers start.
 fun permitHeld() -> Bool =
     Ptr.atomicLoad(control, 8) == 0 || (Ptr.atomicLoad(states, mine()) & noPermit) == 0
 
--- Whether the program's own stack is waiting for a permit, which the next
--- holder to look gives it (`permitGive`).
+--- Whether the program's own stack is waiting for a permit, which the next
+--- holder to look gives it (`permitGive`).
 fun permitWanted() -> Bool = Ptr.atomicLoad(permitWords, wantedAt) == 1
 
--- Give the running thread's permit to the program's own stack, which waits
--- for one: True if this thread gave it, False if another holder did first.
--- The thread holds none after.
+--- Give the running thread's permit to the program's own stack, which waits
+--- for one: True if this thread gave it, False if another holder did first.
+--- The thread holds none after.
 fun permitGive() -> Bool {
     if Ptr.atomicCas(permitWords, wantedAt, 1, 2) != 1 { return False }
     permitDrop()
@@ -630,16 +630,16 @@ fun spareWake() -> Unit {
     }
 }
 
--- The scheduler's count of runnable tasks, which the monitor and idle workers
--- read without its lock. Set under the queue's lock (`Turkey.Scheduler`).
+--- The scheduler's count of runnable tasks, which the monitor and idle workers
+--- read without its lock. Set under the queue's lock (`Turkey.Scheduler`).
 fun queuedSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, queuedAt, n)
 
 fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt)
 
--- How many holders are idle, between `idleEnter` and `idleLeave`.
+--- How many holders are idle, between `idleEnter` and `idleLeave`.
 fun idlers() -> Int = Ptr.atomicLoad(permitWords, idlersAt)
 
--- A holder with nothing to run is about to wait for work, and is back.
+--- A holder with nothing to run is about to wait for work, and is back.
 fun idleEnter() -> Unit {
     let _ = Ptr.atomicAdd(permitWords, idlersAt, 1)
 }
@@ -654,11 +654,11 @@ fun idleLeave() -> Unit {
 
 -- -- the monitor's side -----------------------------------------------------------------
 
--- Start the monitor's thread (`Turkey.Monitor`), whose record is registered
--- nowhere, so that no collection waits for it: it never allocates, and it
--- touches the heap only under the heap's lock while it holds the thread whose
--- cursors it retires. Its index is -1, which no table has. False if it could
--- not be started.
+--- Start the monitor's thread (`Turkey.Monitor`), whose record is registered
+--- nowhere, so that no collection waits for it: it never allocates, and it
+--- touches the heap only under the heap's lock while it holds the thread whose
+--- cursors it retires. Its index is -1, which no table has. False if it could
+--- not be started.
 fun monitorStart() -> Bool {
     let record = zeroed(1752)
     let thread = Libc.malloc(8)
@@ -669,18 +669,18 @@ fun monitorStart() -> Bool {
         & 0xFFFF_FFFF) == 0
 }
 
--- Whether the running thread is the monitor's.
+--- Whether the running thread is the monitor's.
 fun monitoring() -> Bool =
     !Ptr.isNull(monitorRecord) && Process.workerRecord() == monitorRecord
 
 fun monitorState(i : Int) -> Int = Ptr.atomicLoad(states, 8 * i)
 
--- Whether `state` is a blocking call by a thread that holds its permit.
+--- Whether `state` is a blocking call by a thread that holds its permit.
 fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
 
--- Whether there is more to run than the threads free to run it: runnable
--- tasks beyond the idle holders and the free permits, or the program's own
--- stack waiting for a permit with none free.
+--- Whether there is more to run than the threads free to run it: runnable
+--- tasks beyond the idle holders and the free permits, or the program's own
+--- stack waiting for a permit with none free.
 fun monitorWork() -> Bool {
     let free = Ptr.atomicLoad(permitWords, permitFreeAt)
     let supply = plus(Ptr.atomicLoad(permitWords, idlersAt), free)
@@ -688,22 +688,22 @@ fun monitorWork() -> Bool {
         || (Ptr.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
 }
 
--- Hold thread `i`, whose state was `state`, a call (`monitorCalling`):
--- whether it still was.
+--- Hold thread `i`, whose state was `state`, a call (`monitorCalling`):
+--- whether it still was.
 fun monitorHold(i : Int, state : Int) -> Bool =
     Ptr.atomicCas(states, 8 * i, state, plus(state, 1)) == state
 
--- Let thread `i`, held from `state`, go without its permit, which is free
--- first so that the thread may take it back. A thread that returned from its
--- call meanwhile sleeps on the collection epoch.
+--- Let thread `i`, held from `state`, go without its permit, which is free
+--- first so that the thread may take it back. A thread that returned from its
+--- call meanwhile sleeps on the collection epoch.
 fun monitorTake(i : Int, state : Int) -> Unit {
     let _ = Ptr.atomicAdd(permitWords, permitFreeAt, 1)
     Ptr.atomicStore(states, 8 * i, plus(state, noPermit))
     signalCollection()
 }
 
--- Hand a free permit on: to the program's own stack, if it waits for one,
--- else to a spare thread, waking one or starting one. Whether it did.
+--- Hand a free permit on: to the program's own stack, if it waits for one,
+--- else to a spare thread, waking one or starting one. Whether it did.
 fun monitorHandOut() -> Bool {
     let free = Ptr.atomicLoad(permitWords, permitFreeAt)
     if free <= 0 { return False }
@@ -734,9 +734,9 @@ fun monitorHandOut() -> Bool {
     True
 }
 
--- Sleep while every holder is idle, with nothing free to hand out: then no
--- thread can be in a call holding a permit until a holder stops being idle,
--- which wakes this (`idleLeave`). Whether it slept.
+--- Sleep while every holder is idle, with nothing free to hand out: then no
+--- thread can be in a call holding a permit until a holder stops being idle,
+--- which wakes this (`idleLeave`). Whether it slept.
 fun monitorSleep() -> Bool {
     if !allIdle() { return False }
     Ptr.atomicStore(permitWords, monitorAsleepAt, 1)
@@ -802,7 +802,7 @@ let pollWritable : Int = 2
 let pollEof : Int = 4
 let pollError : Int = 8
 
--- `pollWait`'s timeout for "until an event or a break".
+--- `pollWait`'s timeout for "until an event or a break".
 let pollTimeoutForever : Int = -2
 
 -- How many events a wait takes at once; the rest wait for the next call.
@@ -993,11 +993,11 @@ fun epollArm(fd : Int, events : Int, token : Int) -> Int {
 
 -- -- registering
 
--- Register `fd` for the rest of its life, edge-triggered, in both directions:
--- `token` is delivered each time it becomes readable or writable, hangs up or
--- fails, and once at once if it is ready now. 0, or the negated `errno`, in
--- which case nothing stays registered. Only one registration per descriptor:
--- a second answers `EEXIST` on Linux.
+--- Register `fd` for the rest of its life, edge-triggered, in both directions:
+--- `token` is delivered each time it becomes readable or writable, hangs up or
+--- fails, and once at once if it is ready now. 0, or the negated `errno`, in
+--- which case nothing stays registered. Only one registration per descriptor:
+--- a second answers `EEXIST` on Linux.
 fun pollRegister(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1039,8 +1039,8 @@ fun registerKqueue(fd : Int, token : Int) -> Int {
     answer
 }
 
--- Tell the poller to deliver `token` once `fd` is readable, or at end of file
--- or on an error; 0, or the negated `errno`.
+--- Tell the poller to deliver `token` once `fd` is readable, or at end of file
+--- or on an error; 0, or the negated `errno`.
 fun pollRead(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1050,7 +1050,7 @@ fun pollRead(fd : Int, token : Int) -> Int {
     }
 }
 
--- The same for `fd` writable.
+--- The same for `fd` writable.
 fun pollWrite(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1060,10 +1060,10 @@ fun pollWrite(fd : Int, token : Int) -> Int {
     }
 }
 
--- The same for either: `token` is delivered once `fd` is readable or
--- writable. On Linux this is the one registration the descriptor has, which
--- replaces a read or a write registration made before it; on Darwin it is
--- both filters, each of which delivers its own event and is gone when it has.
+--- The same for either: `token` is delivered once `fd` is readable or
+--- writable. On Linux this is the one registration the descriptor has, which
+--- replaces a read or a write registration made before it; on Darwin it is
+--- both filters, each of which delivers its own event and is gone when it has.
 fun pollReadWrite(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1077,14 +1077,14 @@ fun pollReadWrite(fd : Int, token : Int) -> Int {
     }
 }
 
--- Tell the poller to deliver `token` once the child `pid` has exited: 0 if it
--- will; 1 if it has exited already -- Darwin reports a child that is a zombie,
--- or gone, as `ESRCH`, and nothing will be delivered -- in which case the
--- caller reaps it with `waitpid`; or the negated `errno`. On Linux the child
--- is watched through a descriptor from `pidfd_open`, which is kept in a table
--- under `token` until `pollForgetChild`. A zombie is registered like any
--- other and delivers at once; `pidfd_open` fails with `ESRCH` for a pid that
--- no longer exists, which is the negated result.
+--- Tell the poller to deliver `token` once the child `pid` has exited: 0 if it
+--- will; 1 if it has exited already -- Darwin reports a child that is a zombie,
+--- or gone, as `ESRCH`, and nothing will be delivered -- in which case the
+--- caller reaps it with `waitpid`; or the negated `errno`. On Linux the child
+--- is watched through a descriptor from `pidfd_open`, which is kept in a table
+--- under `token` until `pollForgetChild`. A zombie is registered like any
+--- other and delivers at once; `pidfd_open` fails with `ESRCH` for a pid that
+--- no longer exists, which is the negated result.
 fun pollChild(pid : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1098,9 +1098,9 @@ fun pollChild(pid : Int, token : Int) -> Int {
     }
 }
 
--- Tell the poller to deliver `token` once a `flock` lock on `fd`'s file is
--- released, by anyone; 0, or the negated `errno`. Darwin only: Linux reports
--- no release, and answers `-EINVAL`.
+--- Tell the poller to deliver `token` once a `flock` lock on `fd`'s file is
+--- released, by anyone; 0, or the negated `errno`. Darwin only: Linux reports
+--- no release, and answers `-EINVAL`.
 fun pollUnlock(fd : Int, token : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1125,8 +1125,8 @@ fun watchPid(pid : Int, token : Int) -> Int {
     0
 }
 
--- Drop interest in `fd`, both directions, ignoring that there may be none.
--- Before it is closed, on Linux (see above).
+--- Drop interest in `fd`, both directions, ignoring that there may be none.
+--- Before it is closed, on Linux (see above).
 fun pollForget(fd : Int) -> Unit {
     if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
     match Target.os {
@@ -1139,9 +1139,9 @@ fun pollForget(fd : Int) -> Unit {
     }
 }
 
--- Drop interest in the child registered under `token`, and release what
--- watched it, ignoring that it may have fired or never been registered:
--- the caller does this once the child's result has been delivered, too.
+--- Drop interest in the child registered under `token`, and release what
+--- watched it, ignoring that it may have fired or never been registered:
+--- the caller does this once the child's result has been delivered, too.
 fun pollForgetChild(pid : Int, token : Int) -> Unit {
     if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
     match Target.os {
@@ -1155,8 +1155,8 @@ fun pollForgetChild(pid : Int, token : Int) -> Unit {
     }
 }
 
--- Drop interest in releases of locks on `fd`'s file, ignoring that there may
--- be none.
+--- Drop interest in releases of locks on `fd`'s file, ignoring that there may
+--- be none.
 fun pollForgetUnlock(fd : Int) -> Unit {
     if Ptr.atomicLoad(poller, stateAt) != 2 { return }
     match Target.os {
@@ -1221,26 +1221,26 @@ fun childTake(token : Int) -> Int {
 
 -- -- electing and breaking
 
--- Whether the caller is now the one worker that may poll: it stays so until
--- `release`.
+--- Whether the caller is now the one worker that may poll: it stays so until
+--- `release`.
 fun claim() -> Bool = Ptr.atomicCas(signals, claimedAt, 0, 1) == 0
 
 fun release() -> Unit = Ptr.atomicStore(signals, claimedAt, 0)
 
--- Registrations and timers the scheduler is waiting on, `n` more (or fewer,
--- negative). Returns the count before.
+--- Registrations and timers the scheduler is waiting on, `n` more (or fewer,
+--- negative). Returns the count before.
 fun interestAdd(n : Int) -> Int = Ptr.atomicAdd(signals, interestAt, n)
 
 fun interest() -> Int = Ptr.atomicLoad(signals, interestAt)
 
--- End the poller's wait, if it is in one, or keep its next from starting: a
--- Darwin user event is triggered, a Linux `eventfd` written. A break is one
--- event that a wait takes whenever it comes, so one sent a moment after the
--- wait ended wakes the next wait early, which is harmless. Only the signaller
--- that sets word 48 sends it, and a send that fails clears the word again so
--- that the next signaller tries.
+--- End the poller's wait, if it is in one, or keep its next from starting: a
+--- Darwin user event is triggered, a Linux `eventfd` written. A break is one
+--- event that a wait takes whenever it comes, so one sent a moment after the
+--- wait ended wakes the next wait early, which is harmless.
 fun wakePoller() -> Unit {
     if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
+    -- Only the signaller that sets word 48 sends the break, and a send that
+    -- fails clears the word again so that the next signaller tries.
     if Ptr.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return {} }
     let failed = match Target.os {
         Darwin -> change(Sys.filterUser(), 0, 0, Sys.noteTrigger, 0) < 0
@@ -1258,16 +1258,16 @@ fun wakePoller() -> Unit {
 
 -- -- waiting
 
--- Wait for events, as the worker that holds the claim (`claim`) and is blocked
--- already (`blockEnter`; `Turkey.Heap.pause` does it): until a registered
--- event, a break, `timeout` nanoseconds (rounded up to the kernel's
--- granularity, so that a deadline is never met early), or never if `timeout`
--- is `pollTimeoutForever`. `seen` is the work epoch the caller read before it
--- looked for work and found none: if the epoch has moved, the wait is skipped.
---
--- Answers how many results there are to read (`resultToken`, `resultValue`),
--- which is 0 for a break, a timeout, or a signal that interrupted the wait, or
--- the negated `errno` if the poller cannot be had or the wait failed.
+--- Wait for events, as the worker that holds the claim (`claim`) and is blocked
+--- already (`blockEnter`; `Turkey.Heap.pause` does it): until a registered
+--- event, a break, `timeout` nanoseconds (rounded up to the kernel's
+--- granularity, so that a deadline is never met early), or never if `timeout`
+--- is `pollTimeoutForever`. `seen` is the work epoch the caller read before it
+--- looked for work and found none: if the epoch has moved, the wait is skipped.
+---
+--- Answers how many results there are to read (`resultToken`, `resultValue`),
+--- which is 0 for a break, a timeout, or a signal that interrupted the wait, or
+--- the negated `errno` if the poller cannot be had or the wait failed.
 fun pollWait(seen : Int, timeout : Int) -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }
@@ -1280,9 +1280,9 @@ fun pollWait(seen : Int, timeout : Int) -> Int {
     n
 }
 
--- Take the events that are ready now, as the worker that holds the claim,
--- without blocking and without `blockEnter`: how many results, or the
--- negated `errno`.
+--- Take the events that are ready now, as the worker that holds the claim,
+--- without blocking and without `blockEnter`: how many results, or the
+--- negated `errno`.
 fun pollNow() -> Int {
     let ready = pollerReady()
     if ready < 0 { return ready }

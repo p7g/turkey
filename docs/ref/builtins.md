@@ -749,6 +749,10 @@ Some("bb")
 31415
 ```
 
+`Iter` also has lazy adapters over any iterator, such as `Iter.enumerate`,
+`Iter.zip` and `Iter.pairwise`; their doc comments in `lib/Iter.gob` say what
+each yields.
+
 ### `Zero` and `One`
 
 ```text

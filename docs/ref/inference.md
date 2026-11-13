@@ -363,8 +363,8 @@ written in a program.
 ## Array literals
 
 An [array literal](expressions.md#array-literals) does not have a single type
-either. It is an `Array` or a `Vec` of its elements, decided by how its value is
-used, and an `Array` when nothing decides:
+either. It is an `Array`, a `Vec` or a `FrozenArray` of its elements, decided
+by how its value is used, and an `Array` when nothing decides:
 
 <!-- run -->
 ```kotlin
@@ -405,8 +405,9 @@ fun main() {
 
 `empty` is `fun() -> Array a`: generic in the element, but not in the
 container. Declaring `fun empty() -> Vec a` makes it build a `Vec`. A signature
-cannot ask for both: `fun empty() -> c a = []` is rejected with `an array
-literal cannot have type 'c a'; it must be one of 'Array', 'Vec'`.
+cannot ask for several: `fun empty() -> c a = []` is rejected with `an array
+literal cannot have type 'c a'; it must be one of 'Array', 'Vec',
+'FrozenArray'`.
 
 A literal in a top-level `let` is decided by that `let`'s own definition. The
 binding is not generalized ([the value restriction](#generalization)), and uses
@@ -423,16 +424,16 @@ fun remember(x : Int) = Vec.push(pending, x)
 
 Annotate the binding, `let pending : Vec Int = []`, to make it a `Vec`.
 
-The constraint a literal contributes is `OneOf t {Array, Vec} e`: `t` must be
-one of the listed containers applied to the element type `e`. Like the numeric
+The constraint a literal contributes is `OneOf t {Array, Vec, FrozenArray} e`:
+`t` must be one of the listed containers applied to the element type `e`. Like the numeric
 one, it cannot be written in a program, and a mismatch names the set:
 
-<!-- error: an array literal cannot have type 'Int'; it must be one of 'Array', 'Vec' -->
+<!-- error: an array literal cannot have type 'Int'; it must be one of 'Array', 'Vec', 'FrozenArray' -->
 ```kotlin
 let count : Int = [1, 2]
 ```
 
-> **Coming from Haskell.** This is `OverloadedLists`, with a closed set of two
+> **Coming from Haskell.** This is `OverloadedLists`, with a closed set of three
 > containers instead of the class `IsList`, and with a default: a literal
 > nothing decides is an `Array` rather than ambiguous.
 

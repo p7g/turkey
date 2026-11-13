@@ -3,7 +3,8 @@
 A literal's type is one of a closed set of containers applied to its element,
 as a numeral's is one of a closed set of numeric types: decided by how the
 literal is used, and `Array` when nothing decides. The set holds `Array`, and
-`Vec` when the program declares `Data.Vec#Vec`, which the Prelude does.
+`Vec` and `FrozenArray` when the program declares them, which the Prelude
+does.
 """
 
 from __future__ import annotations
@@ -142,7 +143,7 @@ def test_a_use_wanting_another_container_is_a_mismatch_with_array() -> None:
 def test_an_annotation_cannot_make_the_container_generic() -> None:
     message = lang.fails("fun empty() -> c a = []\n")
     assert message == ("an array literal cannot have type 'c a'; it must be "
-                       "one of 'Array', 'Vec'")
+                       "one of 'Array', 'Vec', 'FrozenArray'")
 
 
 # ------------------------------------------------------ what a mismatch says
@@ -153,7 +154,7 @@ def test_an_annotation_cannot_make_the_container_generic() -> None:
 def test_a_literal_where_no_container_fits(annotation) -> None:
     message = lang.fails(f'let x : {annotation} = ["a"]\n')
     assert message == (f"an array literal cannot have type '{annotation}'; "
-                       "it must be one of 'Array', 'Vec'")
+                       "it must be one of 'Array', 'Vec', 'FrozenArray'")
 
 
 def test_a_wrong_element_is_reported_against_the_element() -> None:

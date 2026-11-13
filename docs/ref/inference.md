@@ -470,20 +470,23 @@ Four rules go beyond Haskell's:
 * Numerals are defaulted before array literals, and array literals with a
   class before those without one, a round at a time, so that a container is
   judged once its elements' type is known.
-* A literal inside another is decided after the outer one, and the outer
-  one's needs of its elements become the inner one's.
+* A literal inside another is decided after the outer one. A container whose
+  needs are met outright is taken first; one whose needs fall only on the
+  inner literal is taken only when none is, and only if some container of the
+  inner literal could meet them. Those needs then become the inner literal's.
 * When no container's needs are met outright, but exactly one's fall only on
   an element type that nothing will default, such as a function's type
   parameter, that one is taken, and the function's context carries its needs.
   When several could be taken so with the same needs, those needs do not tell
   them apart, and the first is taken. When their needs differ, the literal is
-  ambiguous and must be annotated.
+  ambiguous and must be annotated, since taking the first would ask callers
+  for something the program never did.
 * A top-level `let`'s literal is decided before the module's other uses of
   the binding are seen, and so are the numerals its choice depends on.
 
 When no container fits, the literal is rejected:
 
-<!-- error: no container this array literal could be has both 'SetIndex' and 'Hash': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
+<!-- error: no container this array literal could be has both 'Hash' and 'SetIndex': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
 ```kotlin
 fun main() {
     let costs = Map.new()

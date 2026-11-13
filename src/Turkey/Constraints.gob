@@ -3725,6 +3725,8 @@ type Round = Round {
     -- The variable heading each undecided literal's type, and the variables
     -- of that literal's elements.
     literals : Map Int (Set.Set Int),
+    -- The demand of each undecided literal, by the variable heading its type.
+    demands  : Map Int PredCell,
     -- The variables heading literals that are among another literal's
     -- elements.
     nested   : Set.Set Int,
@@ -3753,8 +3755,12 @@ fun roundOf(s : Solver, literals : Vec PredCell, consulted : Vec PredCell,
         }
     }
     let heads = Map.new()
+    let demands = Map.new()
     for c in literals {
-        if let Some(v) = literalVar(c) { Map.put(heads, v.id, Ty.freeVars(c.pred.args[2])) }
+        if let Some(v) = literalVar(c) {
+            Map.put(heads, v.id, Ty.freeVars(c.pred.args[2]))
+            Map.put(demands, v.id, c)
+        }
     }
     let nested = Set.new()
     for (_, inside) in Map.entries(heads) {
@@ -3770,7 +3776,8 @@ fun roundOf(s : Solver, literals : Vec PredCell, consulted : Vec PredCell,
             None -> Map.put(sharing, key, Vec.fromArray([c]))
         }
     }
-    Round { classes = classes, numerals = numerals, literals = heads, nested = nested,
+    Round { classes = classes, numerals = numerals, literals = heads, demands = demands,
+            nested = nested,
             waited = Set.new(), sharing = sharing }
 }
 
@@ -3831,9 +3838,11 @@ fun nestedInAnother(round : Round, c : PredCell) -> Bool = match literalVar(c) {
 
 -- What solving a candidate container's group left (`judge`).
 type Verdict
-    -- Nothing, or only what the givens entail or what passes to the literals
-    -- nested in this one: the candidate's instances hold.
+    -- Nothing, or only what the givens entail: the candidate's instances hold.
     = Holds
+    -- Only classes at literals nested in this one, each of which some
+    -- container of that literal has: this literal's needs passed down.
+    | Passes
     -- Classes at variables that no defaulting decides, or at skolems the
     -- givens say nothing of: what a scheme would have to carry.
     | Carried(String)
@@ -3853,10 +3862,11 @@ type Verdict
 -- instance of all the ambiguous variable's classes", and it is a static error
 -- if there is none. GHC implements it in `GHC.Tc.Solver.Default`:
 -- `findDefaultableGroups` collects the unary constraints `C v` on each
--- variable, `tryDefaultGroup` substitutes each default type in turn and
--- solves the group, and `disambigProposalSequences` keeps a choice only when
--- every success agrees (`allConsistent`). Here the default list is the
--- literal's set, in `Ty.literalOrder`: `Array`, `Vec`, `FrozenArray`.
+-- variable, and `tryDefaultGroup` substitutes each default type in turn,
+-- solves the group, and takes the first whose residual is empty
+-- (`firstSuccess`); a candidate with any residual is rejected. Here the
+-- default list is the literal's set, in `Ty.literalOrder`: `Array`, `Vec`,
+-- `FrozenArray`.
 --
 -- The relaxations are those `ExtendedDefaultRules` makes, and for the reason
 -- GHC makes them in GHCi: the literal itself is what asks for a default, as a
@@ -3866,21 +3876,26 @@ type Verdict
 -- constraints are not consulted in choosing.
 --
 -- The first candidate that holds -- its residual empty once the givens are
--- assumed -- is taken, as GHC takes it. Beyond GHC, and stated as deviations:
+-- assumed -- is taken, as GHC takes it. GHC rejects every other candidate;
+-- the rules below are Turkey's own, and deviations from GHC. Its defaults
+-- are nullary types, so no residual of theirs can fall on an element, and
+-- none of these cases arises there.
 --
--- * A residual at a literal nested in this one holds: it is this literal's
---   need passed down, and that literal is judged by it in a later round, where
---   a need it cannot meet is reported against it.
--- * When none holds, the one candidate whose residual sits only at variables
---   no defaulting decides is taken (`Carried`), as in
+-- * When none holds, the first candidate whose residual falls only on
+--   literals nested in this one is taken (`Passes`): those needs pass down,
+--   and each inner literal is judged by them in a later round. A candidate
+--   passing down a class that no container of the inner literal has fails.
+--   This is what lets `Set.add(seen, [[1, 2]])` freeze both literals.
+-- * When none passes, the one candidate whose residual sits only at
+--   variables no defaulting decides is taken (`Carried`), as in
 --   `fun add(seen, p) { Set.add(seen, [p, p]) }`, whose `FrozenArray` leaves
---   `Hash a` for the scheme to carry. GHC's defaults are nullary types, for
---   which this never arises. When several candidates are left so with the
---   same residual, as `Debug` of an element every container prints alike,
---   the residual does not tell them apart, and the first is taken, as for a
---   literal with no class. When their residuals differ, the choice is
---   ambiguous and reported, as GHC chooses nothing when its successes
---   disagree.
+--   `Hash a` for the scheme to carry.
+-- * When several candidates are left so with the same residual, as `Debug`
+--   of an element every container prints alike, the residual does not tell
+--   them apart, and the first is taken, as for a literal with no class.
+-- * When their residuals differ, the literal is reported as ambiguous: taking
+--   the first would put a constraint in the scheme that the program's types
+--   never asked for, which no caller may be able to meet.
 --
 -- When every candidate fails, the literal is reported, naming what each
 -- lacks. A reported literal's demand is absorbed, so that neither a later
@@ -3894,6 +3909,9 @@ fun decideLiteral(s : Solver, round : Round, c : PredCell, patient : Bool) -> Op
     let verdicts = Array.map(candidates, fun((_, ty)) = judge(s, round, c, classes, ty, givens))
     for var i = 0; i < len(verdicts); i = i + 1 {
         if let Holds = verdicts[i] { return Some(candidates[i].1) }
+    }
+    for var i = 0; i < len(verdicts); i = i + 1 {
+        if let Passes = verdicts[i] { return Some(candidates[i].1) }
     }
     let waits = Iter.any(verdicts, fun(v) = match v {
         Waits(_, _) -> True
@@ -3928,7 +3946,8 @@ fun decideLiteral(s : Solver, round : Round, c : PredCell, patient : Bool) -> Op
     for var i = 0; i < len(verdicts); i = i + 1 {
         if let Fails(why) = verdicts[i] { Vec.push(rejections, quote(i) + " " + why) }
     }
-    let quoted = Array.map(classes, fun(cls) = "'" + Ty.shortName(cls) + "'")
+    -- Sorted, so that the message does not depend on the order of the uses.
+    let quoted = Array.sort(Array.map(classes, fun(cls) = "'" + Ty.shortName(cls) + "'"))
     let needed = match len(quoted) {
         1 -> quoted[0]
         2 -> "both " + quoted[0] + " and " + quoted[1]
@@ -4009,6 +4028,18 @@ fun hopeless(s : Solver, l : Classes.Leftover) -> Bool {
     }
 }
 
+-- Returns whether some container of the literal whose type the variable
+-- `id` heads has an instance of `cls`, whatever its context asks.
+fun nestedCanHave(s : Solver, round : Round, id : Int, cls : String) -> Bool {
+    let c = match Map.get(round.demands, id) {
+        Some(c) -> c
+        None -> return True
+    }
+    let names = setNames(c.pred.args[1], c.span)
+    Iter.any(names, fun(n) =
+        Option.isSome(Classes.selectInstance(s.classes, Ty.pred(cls, [memberType(c.pred, n)]))))
+}
+
 -- Returns what solving the group of `classes` leaves with `candidate` in
 -- place, for the literal whose demand is `c` (`Verdict`). The group is solved
 -- in an implication of its own under `givens`, and the solver is left as it
@@ -4024,6 +4055,7 @@ fun judge(s : Solver, round : Round, c : PredCell, classes : Array String,
     -- else one that waits, else one carried.
     var waits : Option (Int, String) = None
     let carried = []
+    var passes = False
     for l in simplifyDerived(s, givens, wanteds, Vec.new(1)) {
         if hopeless(s, l) {
             if l.asked { return Fails("has no '" + Ty.shortName(l.pred.name) + "'") }
@@ -4036,7 +4068,12 @@ fun judge(s : Solver, round : Round, c : PredCell, classes : Array String,
             _ -> -1
         }
         if Set.contains(inner, id) && Map.contains(round.literals, id) {
-            -- Passed down to a literal nested in this one.
+            -- Passed down to a literal nested in this one, which must have a
+            -- container with the class for the need to be met there.
+            if !nestedCanHave(s, round, id, l.pred.name) {
+                return Fails("needs '" + need + "', which no container of the literal inside has")
+            }
+            passes = True
         } else if Set.contains(round.numerals, id) || Map.contains(round.literals, id) {
             if Option.isNone(waits) { waits = Some((id, need)) }
         } else if !Vec.contains(carried, need) {
@@ -4045,7 +4082,7 @@ fun judge(s : Solver, round : Round, c : PredCell, classes : Array String,
     }
     match waits {
         Some((id, need)) -> Waits(id, need)
-        None -> if len(carried) == 0 { Holds } else {
+        None -> if len(carried) == 0 { if passes { Passes } else { Holds } } else {
             Carried(String.join(Array.sort(Vec.toArray(carried)), "', '"))
         }
     }

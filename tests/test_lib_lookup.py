@@ -146,3 +146,45 @@ def test_executable_path_is_absolute_and_resolved(tree: Path, tmp_path: Path):
     path = ran.stdout.strip()
     assert os.path.isabs(path)
     assert path == os.path.realpath(real)
+
+
+def test_empty_turkey_lib_is_unset(tree: Path, project: Path):
+    checked = _run(toolchain.command(tree / "build" / "stages" / "stage2", "check", "01.gob"),
+                   project, TURKEY_LIB="")
+    assert checked.returncode == 0, checked.stderr
+
+
+def test_sibling_with_working_directory_as_prefix_is_absolute(tree: Path, project: Path):
+    # `tre` is a prefix of `tree` by characters but not by components, so the
+    # root is not under it and keeps its absolute name.
+    working = tree.parent / "tre"
+    working.mkdir()
+    (project / "missing.gob").write_text("import NoSuchModule\nfun main() {}\n")
+    checked = _run(toolchain.command(tree / "build" / "stages" / "stage2",
+                                     "check", str(project / "missing.gob")), working)
+    assert checked.returncode != 0
+    root = (tree / "lib").parent.resolve() / "lib"
+    assert f"(searched {project}, {root})" in checked.stderr, checked.stderr
+
+
+def _install(bindir: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["sh", str(REPO_ROOT / "scripts" / "install.sh"), str(bindir)],
+                          capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.skipif(not (REPO_ROOT / "build" / "stages" / "stage2").exists(),
+                    reason="install.sh links build/stages/stage2, which is not built")
+def test_install_replaces_only_a_turkey_link(tmp_path: Path):
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "turkey").symlink_to("/elsewhere/build/stages/stage2")
+    replaced = _install(bindir)
+    assert replaced.returncode == 0, replaced.stderr
+    assert os.readlink(bindir / "turkey") == str(REPO_ROOT / "build" / "stages" / "stage2")
+
+    (bindir / "turkey").unlink()
+    (bindir / "turkey").symlink_to("/usr/bin/true")
+    refused = _install(bindir)
+    assert refused.returncode == 1
+    assert "not a Turkey compiler" in refused.stderr
+    assert os.readlink(bindir / "turkey") == "/usr/bin/true"

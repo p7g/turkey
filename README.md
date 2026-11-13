@@ -111,9 +111,9 @@ names the library instead. The working directory is never searched, so a
 `lib/` in your own project cannot stand in for it. Rebuilding updates what
 `turkey` runs; after moving the checkout, run `install.sh` again.
 
-The compiler has two commands. `build` writes the program to `-o`, in the format the file's
-extension names -- a relocatable object for `.o`, assembly for `.s` -- or
-`-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
+The compiler has two commands. `build` writes the program to `-o`, in the
+format the file's extension names -- a relocatable object for `.o`, assembly
+for `.s` -- or `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
 object needs no assembler, only a linker. `-f exe` writes an executable
 that runs as it is, with no assembler and no linker: a signed Mach-O on a
 Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.

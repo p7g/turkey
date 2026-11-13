@@ -11,5 +11,7 @@ os.environ.setdefault("TURKEY_CHECK_SPANS", "1")
 # The compiler under test is cached under the temporary directory, where no
 # `lib/` lies above it, so the suite names the library: `lib` relative to each
 # process's working directory, which is the repository root unless a test
-# says otherwise. A test of the lookup itself removes the variable.
-os.environ.setdefault("TURKEY_LIB", "lib")
+# says otherwise. It is assigned rather than defaulted, so a `TURKEY_LIB` in
+# the developer's shell cannot point the suite at another checkout's library.
+# A test of the lookup itself removes the variable.
+os.environ["TURKEY_LIB"] = "lib"

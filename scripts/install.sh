@@ -22,8 +22,17 @@ if [ ! -x "$compiler" ]; then
     echo "install.sh: no compiler at $compiler; run scripts/build.sh first" >&2
     exit 1
 fi
-# Replace an earlier link, but never a file someone put there.
-if [ -e "$link" ] && [ ! -L "$link" ]; then
+# Replace an earlier link to a Turkey compiler, from this checkout or another,
+# but nothing else: not a file, and not a link to some other tool.
+if [ -L "$link" ]; then
+    case $(readlink "$link") in
+        */build/stages/*) ;;
+        *)
+            echo "install.sh: $link links to $(readlink "$link"), not a Turkey" \
+                 "compiler; remove it first" >&2
+            exit 1 ;;
+    esac
+elif [ -e "$link" ]; then
     echo "install.sh: $link exists and is not a symbolic link; remove it first" >&2
     exit 1
 fi

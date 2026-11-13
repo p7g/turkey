@@ -11,9 +11,11 @@ Each `.gob` file is one module, and a module's name is its path: the file
 `Shapes/Circle.gob` is the module `Shapes.Circle`, and `import Shapes.Circle`
 loads it. The compiler looks for the file first relative to the directory of
 the program's entry file, then in the standard library: the directory
-`$TURKEY_LIB` names, or without it the nearest `lib` directory at or above the
-compiler's own executable. The working directory is not searched. Moving a file renames
-the module, and every import of it has to change with it.
+`$TURKEY_LIB` names, or without it the nearest `lib` directory holding
+`Prelude.gob` in the directory of the compiler's own executable or one above
+it, with symbolic links in the executable's path resolved. The working
+directory is not searched. Moving a file renames the module, and every import
+of it has to change with it.
 
 The path is spelled exactly as the name is, letter case included, even where
 the filesystem ignores case, as macOS's usually does. A file whose name

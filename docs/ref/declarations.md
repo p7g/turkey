@@ -596,9 +596,9 @@ A type variable that a signature quantifies belongs to its function. That is
 a name the signature writes for the first time, not one it takes from a
 function around it ([Scope of type variables](#scope-of-type-variables)). The
 body cannot make it equal to a type from outside the function, because each
-caller picks its own `a` and a value outside has only one type. This holds however the two meet,
-including through a field or an associated type whose value is decided only
-later in the program:
+caller picks its own `a` and a value outside has only one type. This holds
+however the two meet, including through a field or an associated type whose
+value is decided only later in the program:
 
 <!-- error: the type variable 'a' from a signature cannot be equal to a type from outside its function -->
 ```kotlin
@@ -748,7 +748,9 @@ fun pick(n : Int) -> String {
 The exception is a name new to the pattern of a `match` arm. It stands for
 whatever type is in its place, and only in that arm. After the arm, the name
 is free again. A name new to a pattern inside a parameter is the same, for the
-function's body. This is how to name the type an
+function's body, unless the header also writes it in an annotation on a whole
+parameter, the return type or the context. Then it is the header's type
+variable, wherever it is written first. This is how to name the type an
 [existential](types.md#existential-types) constructor hides, whether the arm
 opened it or an enclosing one did:
 

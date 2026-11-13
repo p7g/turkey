@@ -1861,9 +1861,12 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     }
     let binds = Map.new()
     Vec.push(g.openings, Some(Vec.new(2)))
-    -- A name a parameter's pattern writes inside it, rather than in the
-    -- annotation on the whole parameter, is the pattern's, as in a `match`
-    -- arm, and not part of the header a partial annotation states.
+    -- A name that only a parameter's pattern writes, inside it, is the
+    -- pattern's, as in a `match` arm, and not part of the header a partial
+    -- annotation states. A name the header also writes is the header's,
+    -- wherever it is written first: GHC reads the signature before the
+    -- patterns, and its variable scopes over them.
+    let stated = headerNames(g, params, retAnnot, context)
     let patternOnly = Set.new()
     let paramTypes = Array.init(len(params), fun(i) {
         let param = params[i]
@@ -1871,7 +1874,6 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
             Some(ps) -> ps[i]
             None -> fresh(g)
         }
-        let stated = annotationNames(g, param)
         let named = len(g.patternNames)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
         for var k = named; k < len(g.patternNames); k = k + 1 {
@@ -2544,20 +2546,25 @@ fun openedCon(g : Generator, pat : Pat, name : String) -> Ty.Type {
     con
 }
 
--- Returns the names new to the scope that the annotation on the whole of
--- `param` writes, if it has one.
-fun annotationNames(g : Generator, param : Pat) -> Set.Set String {
+-- Returns the names new to the scope that a function's header states: those
+-- the annotations on whole parameters, the return annotation and the context
+-- write.
+fun headerNames(g : Generator, params : Vec Pat, retAnnot : Option Type,
+                context : Vec Ast.Pred) -> Set.Set String {
+    let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
+    -- Read them into a copy, with variables made in no frame, so that nothing
+    -- is bound or constrained.
+    let probe = Map.new()
+    for (n, t) in Map.entries(scope) { Map.put(probe, n, t) }
+    let made = fun() = Ty.freshVar(0)
+    for param in params {
+        if let PAnnot(_, te) = param.kind { discard(Decls.star(g.decls, te, probe, made)) }
+    }
+    if let Some(r) = retAnnot { discard(Decls.star(g.decls, r, probe, made)) }
+    discard(Classes.resolveContext(g.classes, context, probe, Some(made)))
     let out = Set.new()
-    if let PAnnot(_, te) = param.kind {
-        let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
-        -- Read it into a copy, with variables made in no frame, so that
-        -- nothing is bound or constrained.
-        let probe = Map.new()
-        for (n, t) in Map.entries(scope) { Map.put(probe, n, t) }
-        discard(Decls.star(g.decls, te, probe, fun() = Ty.freshVar(0)))
-        for (n, _) in Map.entries(probe) {
-            if !Map.contains(scope, n) { Set.add(out, n) }
-        }
+    for (n, _) in Map.entries(probe) {
+        if !Map.contains(scope, n) { Set.add(out, n) }
     }
     out
 }

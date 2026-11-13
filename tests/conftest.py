@@ -8,3 +8,8 @@ os.environ.setdefault("TURKEY_WORKERS", "1")
 # every file it parses, on everything the suite compiles, the bootstrap included.
 os.environ.setdefault("TURKEY_CHECK_BINDERS", "1")
 os.environ.setdefault("TURKEY_CHECK_SPANS", "1")
+# The compiler under test is cached under the temporary directory, where no
+# `lib/` lies above it, so the suite names the library: `lib` relative to each
+# process's working directory, which is the repository root unless a test
+# says otherwise. A test of the lookup itself removes the variable.
+os.environ.setdefault("TURKEY_LIB", "lib")

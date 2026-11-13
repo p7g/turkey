@@ -10,7 +10,9 @@ how names are resolved, and the entry point.
 Each `.gob` file is one module, and a module's name is its path: the file
 `Shapes/Circle.gob` is the module `Shapes.Circle`, and `import Shapes.Circle`
 loads it. The compiler looks for the file first relative to the directory of
-the program's entry file, then in the standard library. Moving a file renames
+the program's entry file, then in the standard library: the directory
+`$TURKEY_LIB` names, or without it the nearest `lib` directory at or above the
+compiler's own executable. The working directory is not searched. Moving a file renames
 the module, and every import of it has to change with it.
 
 The path is spelled exactly as the name is, letter case included, even where

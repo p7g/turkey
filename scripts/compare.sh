@@ -19,8 +19,8 @@
 #             optimizations
 #
 # Both sides compile the same input: BASE's src/ and lib/, copied before
-# anything runs. The compiler reads lib/ relative to its working directory, so
-# the input is both what is compiled and where each run happens. Comparing
+# anything runs. Every run has TURKEY_LIB=lib, the lib/ of its working
+# directory, so the input is both what is compiled and where each run happens. Comparing
 # each side compiling its own source would change the workload with the code.
 #
 # Builds and the counted runs go in parallel; the timed runs go one at a time,
@@ -43,6 +43,8 @@ RUN=${TURKEY_RUN:-}
 CALLER=$(pwd)
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+TURKEY_LIB=lib
+export TURKEY_LIB
 
 SOURCE=src/Main.gob
 

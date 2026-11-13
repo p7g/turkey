@@ -16,13 +16,18 @@ Output printed before the panic is written out before the panic's message,
 including output still waiting in standard output's buffer
 ([When standard output is written](builtins.md#when-standard-output-is-written)).
 
-<!-- panic: array index out of bounds -->
+<!-- panic: there are no scores -->
 ```kotlin
-fun lastScore(scores) = scores[len(scores)]
+fun lastScore(scores : Array Int) -> Int {
+    if len(scores) == 0 {
+        error("there are no scores")
+    }
+    scores[len(scores) - 1]
+}
 
 fun main() {
     print("checking")
-    print(lastScore([90, 75]))
+    print(lastScore([]))
 }
 ```
 
@@ -32,16 +37,38 @@ checking
 
 prints, on standard error:
 
+<!-- stderr -->
 ```text
-panic: array index out of bounds: read at index 2, length 2
-  at outOfBounds (Data/Array.gob:85:5)
-  at main (main.gob:5:11)
+panic: there are no scores
+  at error (Control/Panic.gob:8:36)
+  at lastScore (Main.gob:3:9)
+  at main (Main.gob:10:11)
 ```
 
-Each line gives a function and the position of the call or operation that was
-running in it. The list is a guide rather than a complete call stack: a
-function the compiler has inlined into its caller does not appear, and a line
-may point at the caller instead.
+### The trace
+
+Each line after the message is one call that was active when the program
+panicked, innermost first: the function, then the file, line and column of
+the call or operation it had reached. Reading down from the top, the first
+line in one of the program's own files is usually the place to look. Here
+that is line 3 of `Main.gob`, the call to `error`, which `main` reached
+through its call on line 10.
+
+* **Files.** A file of the program is named by its path from the directory
+  of the file the program was built from. A library file is named by its path
+  in the library, as `Control/Panic.gob` is above, so the same program prints
+  the same trace wherever it is built.
+* **Functions.** A function is named without its module. A method of an
+  instance is named with its class and type, as in `Index(Array(Int)).get`
+  for indexing an array, and an anonymous function by the function it is
+  written in, as in `main.<lambda0>`.
+* **Library calls are listed too.** Most panics are raised inside the
+  library, so a trace usually starts with a line or more of library
+  functions, as this one starts with `error`.
+* **Tail calls leave no line.** A function that ends in a
+  [tail call](declarations.md#functions) is no longer active once the call is
+  made, so it is not in the trace.
+* **At most 64 lines are printed**, the innermost 64 calls.
 
 ## What panics
 

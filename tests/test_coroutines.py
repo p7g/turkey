@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc, toolchain
+from tests import bootc, lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "lib"
@@ -200,8 +200,8 @@ fun run() {
 """)
     assert result.returncode == 1
     assert result.stdout == "before\n"
-    assert result.stderr == \
-        "panic: array index out of bounds: read at index 5, length 2\n"
+    assert lang.panic_message(result) == \
+        "array index out of bounds: read at index 5, length 2"
 
 
 @pytest.mark.parametrize("body,message", [
@@ -234,7 +234,7 @@ fun run() { Co.suspend() }
 def test_misuse_panics(coroutines, body, message):
     result = coroutines(body)
     assert result.returncode == 1
-    assert result.stderr == f"panic: {message}\n"
+    assert lang.panic_message(result) == message
 
 
 def test_a_scoped_value_follows_a_task_to_another_worker(coroutines):

@@ -2,7 +2,7 @@ export (
     argsSet, argCount, argBytes, argLength, environment,
     panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
-    workerRecord,
+    workerRecord, traceCount, traceAddress, traceHand,
 )
 
 -- What the program was started with, and how it is ending: its arguments, and
@@ -116,6 +116,7 @@ fun environment() -> Ptr {
 -- constant.
 foreign "turkey_panic" fun panic(message : Ptr) -> Unit {
     if pending() { return {} }
+    capture(Prim.frameAddress())
     record(message, Libc.strlen(message))
 }
 
@@ -124,6 +125,7 @@ foreign "turkey_panic" fun panic(message : Ptr) -> Unit {
 -- the header. A null one is a panic with no message of its own.
 foreign "turkey_panic_string" fun panicString(message : Ptr) -> Unit {
     if pending() { return {} }
+    capture(Prim.frameAddress())
     if Ptr.isNull(message) {
         record(Prim.cString("error"), 5)
     } else {
@@ -152,6 +154,7 @@ fun record(bytes : Ptr, length : Int) -> Unit {
 -- allocate a message to hand to `panic`.
 fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
+    capture(Prim.frameAddress())
     -- The magnitude of `minValue` is 2^63, which the unsigned reading of its
     -- wrapped negation is.
     compose(before, n < 0, if n < 0 { Int.subWrapping(0, n) } else { n }, after)
@@ -160,6 +163,7 @@ fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
 -- `panicInt` with `n`'s bits read as an unsigned number, for a byte count.
 fun panicUnsigned(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
+    capture(Prim.frameAddress())
     compose(before, False, n, after)
 }
 
@@ -229,6 +233,87 @@ fun putDigits(buffer : Ptr, at : Int, limit : Int, u : Int) -> Int {
 
 fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 
+-- -- the trace --------------------------------------------------------------------------
+--
+-- The calls that were active when a panic was raised, as return addresses,
+-- innermost first. They are taken when the panic is raised because by the
+-- time it is reported every one of those calls has returned.
+--
+-- One panic's, for the whole process: the first to be raised since the last
+-- `panicClear`, which in a program that ends by panicking is the one
+-- reported. A buffer per worker would need room in the worker's record, whose
+-- size the compiler fixes.
+
+-- Raw words: the worker record of the panic the trace is of, or 0 while there
+-- is none; how many addresses it has; then the addresses.
+let traceWords : Ptr = traceState()
+
+-- Functions for the reason the offsets above are.
+fun traceLimit() -> Int = 64
+fun traceBytes() -> Int = 16 + 8 * traceLimit()
+
+fun traceState() -> Ptr {
+    let words = Libc.malloc(traceBytes())
+    if !Ptr.isNull(words) {
+        Ptr.store(words, 0, 0)
+        Ptr.store(words, 8, 0)
+    }
+    words
+}
+
+-- Take the trace from the frame record at `frame` outwards, unless a panic
+-- already has one. Called before the flag is raised, as the copy of the
+-- message is.
+--
+-- The walk reads frame records only up to the running stack's outermost one
+-- (`Turkey.Stack`: the worker's running stack is the word at 280 of its
+-- record, and a stack's first word is that bound). Beyond it are C's frames,
+-- which need not keep records at all. So a panic raised before the entry has
+-- recorded its stack has no trace, and one raised in a coroutine has only the
+-- coroutine's own calls.
+fun capture(frame : Ptr) -> Unit {
+    let words = traceWords
+    if Ptr.isNull(words) { return {} }
+    if Ptr.atomicCas(words, 0, 0, Ptr.toInt(workerRecord())) != 0 { return {} }
+    let stack : Ptr = Ptr.load(workerRecord(), 280)
+    var count = 0
+    if !Ptr.isNull(stack) {
+        let top : Int = Ptr.load(stack, 0)
+        var here = Ptr.toInt(frame)
+        -- The same conditions as the collector's walk: a record stays below
+        -- the bound and aligned, and each is above the last.
+        while count < traceLimit() && here & 7 == 0 && here + 16 <= top {
+            let record = Ptr.fromInt(here)
+            Ptr.store(words, 16 + 8 * count, Ptr.load(record, 8) : Int)
+            count = count + 1
+            let next : Int = Ptr.load(record, 0)
+            if next <= here { break }
+            here = next
+        }
+    }
+    Ptr.store(words, 8, count)
+}
+
+-- Whether the trace is of the running worker's panic.
+fun traceMine() -> Bool =
+    !Ptr.isNull(traceWords)
+    && Ptr.atomicLoad(traceWords, 0) == Ptr.toInt(workerRecord())
+
+-- How many return addresses the running worker's panic has a trace of; 0 if
+-- the trace is another panic's or there is none.
+fun traceCount() -> Int = if traceMine() { Ptr.load(traceWords, 8) } else { 0 }
+
+-- Return address `index` of the trace, counting from the innermost call. An
+-- index outside `0..traceCount()` is undefined.
+fun traceAddress(index : Int) -> Ptr = Ptr.load(traceWords, 16 + 8 * index)
+
+-- Make the trace of the panic of the worker whose record is `from` the trace
+-- of `to`'s, for a panic handed from one worker to another.
+fun traceHand(from : Ptr, to : Ptr) -> Unit {
+    if Ptr.isNull(traceWords) { return {} }
+    let _ = Ptr.atomicCas(traceWords, 0, Ptr.toInt(from), Ptr.toInt(to))
+}
+
 -- Whether a panic or an exit is unwinding right now.
 fun pending() -> Bool = Ptr.load(workerRecord(), flagAt()) != 0
 
@@ -248,6 +333,7 @@ foreign "turkey_panic_clear" fun panicClear() -> Unit {
     let state = workerRecord()
     Ptr.store(state, flagAt(), 0)
     Ptr.store(state, messageAt(), Byte.truncate(0))
+    if !Ptr.isNull(traceWords) { Ptr.atomicStore(traceWords, 0, 0) }
     ended = False
     exitRequested = False
     status = 0

@@ -1,4 +1,4 @@
-export (cases, message, diagnostic, panicMessage)
+export (cases, message, diagnostic, panicMessage, traceProblem)
 
 -- Cases from the language reference, `docs/ref/`: every Turkey example in
 -- every chapter, checked against what the chapter says of it.
@@ -14,6 +14,9 @@ export (cases, message, diagnostic, panicMessage)
 --   <!-- panic: TEXT -->     it compiles, then panics, and TEXT is in the
 --                            panic's message; an optional `text` fence is its
 --                            exact stdout
+--   <!-- stderr -->          the next `text` fence is the exact stderr of the
+--                            `panic` example before it: the panic and its
+--                            trace
 --   <!-- module: F.gob -->   another file of the next example's program
 --
 -- Every example requires a C compiler, since even one that is only checked
@@ -48,16 +51,18 @@ type Mode = Run | Check | Fails(String) | Panic(String)
 
 -- What a directive marks the fence after it as: another file, by name, of
 -- the next example's program, or an example checked as `Mode` says.
-type Marker = ModuleFile(String) | Marked(Mode)
+type Marker = ModuleFile(String) | Marked(Mode) | Stderr
 
 -- One example as its chapter gives it: the line of its opening fence, how
--- it is checked, its source, the `text` fence after it, and the modules
--- before it, as (file name, source).
+-- it is checked, its source, the `text` fence after it, the `text` fence a
+-- `stderr` directive marks, and the modules before it, as (file name,
+-- source).
 type Example = Example {
     line : Int,
     mode : Mode,
     source : String,
     stdout : Option String,
+    stderr : Option String,
     modules : Array (String, String),
 }
 
@@ -100,7 +105,7 @@ fun broken(name : String, directory : String, entry : String, why : String) -> C
     directory = directory,
     entry = entry,
     sources = [],
-    golden = Quoted(Quote { stdout = None, message = None }),
+    golden = Quoted(Quote { stdout = None, message = None, stderr = None }),
     dumps = [],
     expected = Exits(0),
     timeout = None,
@@ -123,7 +128,7 @@ fun example(work : String, name : String, e : Example) -> Case {
         directory = Either.unwrapOr(written, work),
         entry = "Main.gob",
         sources = Array.map(files, _.0),
-        golden = Quoted(Quote { stdout = e.stdout, message = quoted }),
+        golden = Quoted(Quote { stdout = e.stdout, message = quoted, stderr = e.stderr }),
         dumps = [],
         expected = match e.mode {
             Fails(_) -> Rejected
@@ -162,11 +167,27 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                     }
                     i = i + 1
                 }
+                Some(Right(Stderr)) -> {
+                    let f = fence(lines, i + 1)?
+                    if f.language != "text" { return Left(Malformed(i + 1, "'stderr' must precede a text fence")) }
+                    i = f.next
+                    let quoted = match Vec.pop(found) {
+                        Some(e) -> match e.mode {
+                            Panic(_) -> Example { line = e.line, mode = e.mode, source = e.source, stdout = e.stdout,
+                                                  stderr = Some(f.body), modules = e.modules }
+                            _ -> return Left(Malformed(f.line, "'stderr' must follow a panic example"))
+                        }
+                        None -> return Left(Malformed(f.line, "'stderr' must follow a panic example"))
+                    }
+                    Vec.push(found, quoted)
+                }
                 Some(marked) -> {
                     let f = fence(lines, i + 1)?
                     if f.language != "kotlin" { return Left(Malformed(i + 1, "a directive must precede a kotlin fence")) }
                     i = f.next
                     match Either.mapLeft(marked, \Malformed(f.line, _))? {
+                        -- Matched above.
+                        Stderr -> {}
                         ModuleFile(file) -> {
                             Vec.push(modules, (file, f.body))
                             lastModule = f.line
@@ -184,7 +205,8 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                                 stdout = Some(t.body)
                                 i = t.next
                             }
-                            Vec.push(found, Example { line = f.line, mode, source = f.body, stdout, modules = Vec.toArray(modules) })
+                            Vec.push(found, Example { line = f.line, mode, source = f.body, stdout, stderr = None,
+                                                      modules = Vec.toArray(modules) })
                             modules = []
                         }
                     }
@@ -211,6 +233,7 @@ fun marker(name : String, arg : String) -> Option (Either String Marker) = match
     "check" -> Some(Right(Marked(Check)))
     "error" -> Some(quoting(name, arg, \Fails(_)))
     "panic" -> Some(quoting(name, arg, \Panic(_)))
+    "stderr" -> Some(Right(Stderr))
     _ -> None
 }
 
@@ -292,4 +315,37 @@ fun panicMessage(stderr : String) -> String {
         if let Some(rest) = String.stripPrefix(line, "panic: ") { return rest }
     }
     ""
+}
+
+-- Returns what is wrong with the trace of the panic in `stderr`, or `None`
+-- if nothing is, or if there is no panic. A panic is the last thing a
+-- program writes, so every line after `panic: ` must be a line of its trace,
+-- `  at FUNCTION (FILE:LINE:COLUMN)`, and there must be at least one.
+fun traceProblem(stderr : String) -> Option String {
+    let lines = String.lines(stderr)
+    var at = 0
+    while at < len(lines) && !String.startsWith(lines[at], "panic: ") { at = at + 1 }
+    if at >= len(lines) { return None }
+    if at + 1 >= len(lines) { return Some("the panic has no trace") }
+    for line in Vec.slice(lines, at + 1, len(lines)) {
+        if !isFrame(line) { return Some("not a line of a trace: " + line) }
+    }
+    None
+}
+
+-- Whether `line` is `  at FUNCTION (FILE:LINE:COLUMN)`.
+fun isFrame(line : String) -> Bool = match frame(line) {
+    Some((function, file)) -> !String.isEmpty(function) && !String.isEmpty(file)
+    None -> False
+}
+
+-- The function and the file of a line of a trace, if `line` is one.
+fun frame(line : String) -> Option (String, String) {
+    let called = String.stripPrefix(line, "  at ")?
+    let (function, place) = String.rsplitOnce(called, " (")?
+    let (before, column) = String.rsplitOnce(String.stripSuffix(place, ")")?, ":")?
+    let (file, row) = String.rsplitOnce(before, ":")?
+    let _ = Int.parse(row)?
+    let _ = Int.parse(column)?
+    Some((function, file))
 }

@@ -35,6 +35,7 @@ import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Binders as Binders
 import Turkey.Prelude as Prelude
+import Turkey.Demangle as Demangle
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TCon, TVar)
@@ -969,16 +970,16 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- where the rule does not emits a jump with nowhere to go, and this is where
 -- that is caught.
 -- Returns whether code the optimizer inlines into a module records the call
--- it replaces: in every module with `-g`, whose debug information shows the
--- calls as frames, or when allocations are counted by site, and otherwise in
--- the giblets, whose allocation check names the line.
+-- it replaces: in every module. A panic's trace names each inlined call as
+-- the frame it would have been, and without the record an inlined function's
+-- lines are reported as its caller's, in a file the caller is not in. Debug
+-- information, the count of allocations by site and the giblets' allocation
+-- check read the same record.
 --
 -- Recording costs a copy of every inlined body, which is otherwise shared
 -- with the callee's. The code is the same either way: no reduction reads a
 -- span.
-fun keepsCallSites() -> fun(String) -> Bool =
-    if debugInfo() || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
-    else { Set.contains(Giblets.gibletModules(), _) }
+fun keepsCallSites() -> fun(String) -> Bool = fun(_) = True
 
 -- Everything between the elaboration and the backend, in one place.
 --
@@ -1206,6 +1207,8 @@ type Made = Made {
     inlined    : Vec Dwarf.Inlined,
     variables  : Vec Dwarf.Variable,
     base       : Asm.Symbol,
+    -- Its calls' return addresses and positions, for the trace table.
+    calls      : Vec (Asm.Symbol, Int),
     texts      : Array (Option String),
     cost       : Duration,
 }
@@ -1226,7 +1229,7 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
                             inlined = [], variables = [], base = Emit.functionEnd(asm.dialect, i),
-                            texts = [], cost = Stopwatch.elapsed(started) }
+                            calls = [], texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
@@ -1234,7 +1237,8 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
                 Locations.locate(asm.dialect, i, a, l, frame.slots)
             } else { (Map.new(), [], Emit.functionEnd(asm.dialect, i)) }
             let emitted = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, emitted)
+            let calls = []
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, calls, emitted)
             let (code, inlined, variables) = if debugInfo() {
                 Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, located, emitted,
                                    Emit.functionEnd(asm.dialect, i))
@@ -1245,10 +1249,53 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   inlined = inlined, variables = variables, base = base, texts = texts,
+                   inlined = inlined, variables = variables, base = base, calls = calls,
+                   texts = texts,
                    cost = Stopwatch.elapsed(started) }
         }
     }
+}
+
+-- Returns the name a panic's trace prints for the function whose internal
+-- name is `name`: its display form (`Demangle.displayName`) without the
+-- modules before it and without the type arguments and the namers' suffixes
+-- after it, so `Data.Vec#reserve@Int` is `reserve`. A trace names the file
+-- and line beside it, which tell two functions of one name apart.
+fun tracedName(name : String) -> String {
+    let shown = String.builder()
+    for c in String.codePoints(Demangle.displayName(name)) {
+        if c == '[' || c == '{' || c == '~' { break }
+        String.push(shown, Char.toString(c))
+    }
+    let parts = String.split(String.build(shown), ".")
+    var from = 0
+    while from + 1 < len(parts) && isModulePart(parts[from]) { from = from + 1 }
+    String.join(Vec.slice(parts, from, len(parts)), ".")
+}
+
+-- Whether `part` of a display name is a module's: capitalized, and not an
+-- instance's `Class(Type)`.
+fun isModulePart(part : String) -> Bool {
+    var first = True
+    for c in String.codePoints(part) {
+        if first && !Char.isAsciiUpper(c) { return False }
+        if c == '(' { return False }
+        first = False
+    }
+    !first
+}
+
+-- Each of `files` as a panic's trace names it: a library file by its path
+-- below the library, and any other by its path below the directory of
+-- `path`, the program's main file, when it is in it. So a trace does not
+-- depend on where the library is installed or where the program was built.
+fun tracedFiles(files : Position.Files, path : String) -> Array String {
+    let library = libRoot() + "/"
+    let directory = directoryOf(path) + "/"
+    Array.map(files.names, fun(name) = match String.stripPrefix(name, library) {
+        Some(below) -> below
+        None -> Option.unwrapOr(String.stripPrefix(name, directory), name)
+    })
 }
 
 -- One emission's consumer: what it makes of each piece of code, the text it
@@ -1347,6 +1394,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- its layout.
     let inlinedCalls = []
     let variables = []
+    let traced = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
@@ -1375,6 +1423,8 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 Vec.push(layouts, (i, l))
                 Vec.push(inlinedCalls, m.inlined)
                 Vec.push(variables, (m.variables, m.base))
+                Vec.push(traced, Emit.Traced { name = selected[i].name,
+                                               sites = selected[i].sites, calls = m.calls })
             }
         }
         if timings { Vec.push(costs, (selected[i].name, m.cost)) }
@@ -1411,6 +1461,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
+    Emit.emitTraceTable(asm, tracedFiles(files, path), traced, tracedName, code)
     if debugInfo() {
         -- The end of the code, after everything the text section holds.
         let textEnd = Asm.localLabel(asm.dialect, "text_end")

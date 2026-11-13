@@ -183,7 +183,7 @@ fun main() {
 }
 """, env={"TURKEY_WORKERS": workers})
     assert result.code == 1
-    assert result.stderr == "panic: deadlock: every task is waiting\n"
+    assert lang.panic_message(result) == "deadlock: every task is waiting"
 
 
 def test_a_panic_in_a_task_ends_the_program():
@@ -204,8 +204,8 @@ fun main() {
 """)
     assert result.code == 1
     assert result.stdout == "before\n"
-    assert result.stderr == \
-        "panic: array index out of bounds: read at index 3, length 1\n"
+    assert lang.panic_message(result) == \
+        "array index out of bounds: read at index 3, length 1"
 
 
 # -- several workers ---------------------------------------------------------------------
@@ -321,8 +321,8 @@ fun main() {
 """, env=WORKERS)
     assert result.code == 1
     assert result.stdout == ""
-    assert result.stderr == \
-        "panic: array index out of bounds: read at index 3, length 1\n"
+    assert lang.panic_message(result) == \
+        "array index out of bounds: read at index 3, length 1"
 
 
 # A `loop` in a `do` block that starts a task per iteration, for as many

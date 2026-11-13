@@ -122,6 +122,7 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- check -->` | Must compile. |
 | `<!-- error: TEXT -->` | Must be rejected, and the error message must contain `TEXT`. |
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
+| `<!-- stderr -->` | The next `text` fence is the exact standard error of the `panic` example before it: the panic and its trace. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
 
 Every example is compiled and run by `boot`, the way a reader who copies one

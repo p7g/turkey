@@ -1,5 +1,5 @@
 export (
-    main, entryThread, crashReport, installCrashHandler,
+    main, entryThread, crashReport, installCrashHandler, traceTableSet,
     signalNote, signalHandler, signalPipeSet, signalTake,
 )
 
@@ -18,11 +18,12 @@ import Data.Tuple (Unit)
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), (&))
+import Bits (BitAnd(..), Shift(..), (&), (<<), (>>))
 -- For the instances alone. This module is loaded ahead of every program's
 -- entry, so it cannot count on the Prelude having brought them in first, as
 -- `Turkey.Memory` does.
 import Data.Int ()
+import Data.Int as Int
 import Data.Bool (Bool(..))
 import Target (OS(..))
 import Target as Target
@@ -124,12 +125,118 @@ foreign "turkey_entry_thread" fun entryThread(argument : Ptr) -> Ptr {
     Ptr.null()
 }
 
--- `panic: <message>`.
+-- `panic: <message>`, then a line for each call that was active when the
+-- panic was raised, innermost first.
 fun reportPanic() -> Unit {
     writeText(2, Prim.cString("panic: "))
     writeText(2, Process.panicMessage())
     writeText(2, Prim.cString("\n"))
+    let count = Process.traceCount()
+    for var i = 0; i < count; i = i + 1 { reportCall(Process.traceAddress(i)) }
 }
+
+-- -- the trace table -------------------------------------------------------------------
+--
+-- The compiler writes one table for the program: for each call that has a
+-- source position, where the call returns to, the function it is in, and the
+-- position. A frame record holds the address its function returns to, so
+-- those are the addresses a trace is made of.
+--
+-- Every field is four bytes:
+--
+--     function count, file count, the strings' size in bytes
+--     per file          its name's offset in the strings
+--     the strings       each NUL-terminated
+--     per function      its name's offset, its call count, its site count
+--       per call        the return address's distance from `traceBase`;
+--                       the line, and the column from bit 20;
+--                       the file's number, and the site's from bit 14
+--       per site        the inlined function's name's offset, then the
+--                       position of the call it was inlined at, as a call's
+--
+-- A file's number counts from 1 and 0 is no file. A site is a call the
+-- compiler inlined into the function: code with a site's number is the text
+-- of the function the site names, and the site's own position is the call
+-- that was replaced, which may itself be in a site. Site 0 is the function
+-- itself, and a site's number is above the number of the site its call is
+-- in.
+--
+-- The table is scanned from the start for each address. It is read only to
+-- report a panic, so nothing is spent on it in a program that does not.
+
+var traceTable : Ptr = Ptr.null()
+var traceBase : Ptr = Ptr.null()
+
+-- Record the program's trace table, whose distances are from `base`. The
+-- generated entry calls it. A program that never does prints no trace.
+foreign "turkey_trace_table_set" fun traceTableSet(table : Ptr, base : Ptr) -> Unit {
+    traceTable = table
+    traceBase = base
+}
+
+-- Write the lines of the call that returns to `address`: `  at function
+-- (file:line:column)`, first for each function inlined around it, innermost
+-- first, and then for the function the code is in. An address the table does
+-- not have, which is a call with no source position or one in C, writes
+-- nothing.
+fun reportCall(address : Ptr) -> Unit {
+    let table = traceTable
+    if Ptr.isNull(table) { return {} }
+    let distance = Int.subWrapping(Ptr.toInt(address), Ptr.toInt(traceBase))
+    let functions = Ptr.load32(table, 0)
+    let files = Ptr.add(table, 12)
+    let strings = Ptr.add(files, 4 * Ptr.load32(table, 4))
+    var function = Ptr.add(strings, Ptr.load32(table, 8))
+    for var f = 0; f < functions; f = f + 1 {
+        let calls = Ptr.load32(function, 4)
+        let sites = Ptr.add(function, 12 + 12 * calls)
+        for var c = 0; c < calls; c = c + 1 {
+            let call = Ptr.add(function, 12 + 12 * c)
+            if signed32(Ptr.load32(call, 0)) == distance {
+                reportPosition(files, strings, Ptr.load32(function, 0), sites,
+                               Ptr.add(call, 4))
+                return {}
+            }
+        }
+        function = Ptr.add(sites, 12 * Ptr.load32(function, 8))
+    }
+}
+
+-- Write the lines of the position at `position`, two fields, in the function
+-- whose name is at `name` in `strings` and whose sites are at `sites`.
+fun reportPosition(files : Ptr, strings : Ptr, name : Int, sites : Ptr,
+                   position : Ptr) -> Unit {
+    var at = position
+    loop {
+        let lineColumn = Ptr.load32(at, 0)
+        let fileSite = Ptr.load32(at, 4)
+        let site = fileSite >> 14
+        let file = fileSite & 0x3FFF
+        let inlined = Ptr.add(sites, 12 * (site - 1))
+        writeText(2, Prim.cString("  at "))
+        writeText(2, Ptr.add(strings, if site == 0 { name } else { Ptr.load32(inlined, 0) }))
+        writeText(2, Prim.cString(" ("))
+        if file == 0 {
+            writeText(2, Prim.cString("?"))
+        } else {
+            writeText(2, Ptr.add(strings, Ptr.load32(files, 4 * (file - 1))))
+        }
+        writeText(2, Prim.cString(":"))
+        writeNumber(2, lineColumn & 0xF_FFFF)
+        writeText(2, Prim.cString(":"))
+        writeNumber(2, lineColumn >> 20)
+        writeText(2, Prim.cString(")\n"))
+        if site == 0 { return {} }
+        -- The call the site replaced. Its own site has a lower number, which
+        -- is what ends the loop; a table that says otherwise is not followed.
+        let outer = Ptr.load32(inlined, 8) >> 14
+        if outer >= site { return {} }
+        at = Ptr.add(inlined, 4)
+    }
+}
+
+-- The low 32 bits of `n`, as a signed integer.
+fun signed32(n : Int) -> Int = (n << 32) >> 32
 
 -- -- a fault ---------------------------------------------------------------------------
 
@@ -266,6 +373,12 @@ fun errnoLocation() -> Ptr = match Target.os {
 -- there is nowhere left to report a failure to.
 fun writeText(fd : Int, text : Ptr) -> Unit {
     let _ = Libc.write(fd, text, Libc.strlen(text))
+}
+
+-- A number that is not negative, in decimal, to a descriptor.
+fun writeNumber(fd : Int, n : Int) -> Unit {
+    if n >= 10 { writeNumber(fd, n / 10) }
+    let _ = Libc.write(fd, Ptr.add(Prim.cString("0123456789"), n % 10), 1)
 }
 
 fun orQuery(text : Ptr) -> Ptr =

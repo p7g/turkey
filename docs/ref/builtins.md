@@ -347,7 +347,7 @@ The instances the library provides for built-in types:
 | `String` | yes | yes | yes | concatenation | no | no | yes |
 | tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
-| `Array a`, `Vec a` | if the elements have it | if the elements have it | if the elements have it | concatenation | no | no | if the elements have it |
+| `Array a`, `Vec a` | if the elements have it | if the elements have it | no | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
 | `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | if the elements have it |
 | `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
@@ -356,7 +356,7 @@ The instances the library provides for built-in types:
 
 Tuples compare lexicographically, and strings compare byte by byte. Arrays and
 `Vec`s compare lexicographically too, and one that is a proper prefix of
-another is the lesser; both hash their length and then their elements. `Int`
+another is the lesser. `Int`
 and `Float` have `Zero` and `One`, the identities of `+` and `*`. Two
 arrays are equal when they have the same length and equal elements at each
 index, and so are two `Vec`s or two `Deque`s, whatever their capacity. Two

@@ -430,13 +430,6 @@ def test_an_executable_is_written_only_when_asked_for(tmp_path):
     assert "only with -f exe" in result.stderr
 
 
-def test_an_elf_executable_with_debug_information_is_refused(tmp_path):
-    result = _boot("-f", "exe", "--target", "arm64-linux", "-g", "-o", str(tmp_path / "adt"),
-                   str(PROGRAMS / "adt.gob"))
-    assert result.returncode == 2
-    assert "no debug information" in result.stderr
-
-
 def _commands(data: bytes):
     """Each load command of a Mach-O file: its number and its bytes."""
     count, size = struct.unpack_from("<II", data, 16)
@@ -829,12 +822,13 @@ linux = pytest.mark.skipif(toolchain.target() != "arm64-linux",
                            reason="runs the executable against the host's glibc")
 
 PT_LOAD, PT_DYNAMIC, PT_INTERP, PT_NOTE, PT_PHDR = 1, 2, 3, 4, 6
-PT_GNU_STACK, PT_GNU_RELRO = 0x6474E551, 0x6474E552
+PT_GNU_EH_FRAME, PT_GNU_STACK, PT_GNU_RELRO = 0x6474E550, 0x6474E551, 0x6474E552
 DT_NEEDED, DT_STRTAB, DT_SYMTAB, DT_RELA = 1, 5, 6, 7
 DT_FLAGS, DT_FLAGS_1 = 30, 0x6FFFFFFB
 DT_GNU_HASH = 0x6FFFFEF5
-SHT_DYNSYM, SHT_NOBITS, SHT_GNU_HASH = 11, 8, 0x6FFFFFF6
+SHT_PROGBITS, SHT_RELA, SHT_DYNSYM, SHT_NOBITS, SHT_GNU_HASH = 1, 4, 11, 8, 0x6FFFFFF6
 SHF_ALLOC = 0x2
+R_AARCH64_ABS64, R_AARCH64_ABS32, R_AARCH64_PREL32 = 257, 258, 261
 R_AARCH64_GLOB_DAT, R_AARCH64_RELATIVE = 1025, 1027
 PAGE = 0x10000
 
@@ -859,14 +853,14 @@ def _maths(tmp_path: Path) -> Path:
 
 
 class Elf:
-    """An ELF executable's header, program headers, section headers by name,
-    and dynamic tags in order."""
+    """An ELF file's header, program headers, section headers by name, and
+    an executable's dynamic tags in order."""
 
     def __init__(self, data: bytes):
         self.data = data
         (self.ident, self.type, self.machine, _, self.entry, phoff, shoff, _, _, phentsize,
          phnum, shentsize, shnum, shstrndx) = struct.unpack_from("<16sHHIQQQIHHHHHH", data, 0)
-        assert (phentsize, shentsize) == (56, 64)
+        assert phentsize in (0, 56) and shentsize == 64
         # Each: type, flags, offset, address, file size, memory size, align.
         self.segments = []
         for k in range(phnum):
@@ -880,9 +874,9 @@ class Elf:
         for name, kind, flags, address, offset, size, link, info, _, _ in raw:
             self.sections.append((self.string(names + name), kind, flags, address, offset,
                                   size, link, info))
-        dynamic = self.segment(PT_DYNAMIC)
-        self.dynamic = [struct.unpack_from("<qQ", data, dynamic[2] + 16 * k)
-                        for k in range(dynamic[4] // 16)]
+        self.dynamic = [struct.unpack_from("<qQ", data, s[2] + 16 * k)
+                        for s in self.segments if s[0] == PT_DYNAMIC
+                        for k in range(s[4] // 16)]
 
     def string(self, at: int) -> str:
         return self.data[at:self.data.index(b"\0", at)].decode()
@@ -923,8 +917,8 @@ def test_the_elf_is_what_the_loader_needs(tmp_path):
     assert elf.ident[:8] == b"\x7fELF\x02\x01\x01\x00"
     assert (elf.type, elf.machine) == (3, 183)
     assert [s[0] for s in elf.segments] == [PT_PHDR, PT_INTERP, PT_LOAD, PT_LOAD, PT_LOAD,
-                                            PT_LOAD, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_STACK,
-                                            PT_NOTE]
+                                            PT_LOAD, PT_DYNAMIC, PT_GNU_RELRO, PT_GNU_EH_FRAME,
+                                            PT_GNU_STACK, PT_NOTE]
     interp = elf.segment(PT_INTERP)
     assert elf.data[interp[2]:interp[2] + interp[4]] == b"/lib/ld-linux-aarch64.so.1\0"
     assert elf.segment(PT_GNU_STACK)[1] == 6
@@ -1018,6 +1012,189 @@ def test_the_elf_is_what_the_loader_needs(tmp_path):
     assert all(info >> 4 == 1 for _, info, _, _ in symtab[locals_end:])
     assert "main" in [n for n, info, section, _ in symtab[locals_end:] if section != 0]
     assert not [n for n, *_ in symtab if n.startswith(".L")]
+
+
+def _written_elf(tmp_path: Path, source: str, *flags: str) -> tuple[Elf, Elf]:
+    """`source` for arm64-linux as an object and as an executable, each
+    written by `boot` with `flags`."""
+    (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
+    for output, form in (("prog.o", "obj"), ("prog", "exe")):
+        result = _boot("-f", form, "--target", "arm64-linux", *flags, "-o", output,
+                       "prog.gob", cwd=tmp_path)
+        assert result.returncode == 0, result.stderr[-4000:]
+    return Elf((tmp_path / "prog.o").read_bytes()), Elf((tmp_path / "prog").read_bytes())
+
+
+def _contents(elf: Elf, name: str) -> bytes:
+    _, _, _, _, offset, size, _, _ = elf.section(name)
+    return elf.data[offset:offset + size]
+
+
+def _relocated(obj: Elf, name: str, image: Elf) -> bytes:
+    """The object's section `name` with each of its relocations applied at
+    the addresses `image` gives: a symbol in the object is at its offset in
+    its section, and that section where `image` puts the section of the same
+    name, which is 0 for one `image` does not load."""
+    [index] = [k for k, s in enumerate(obj.sections) if s[0] == name]
+    out = bytearray(_contents(obj, name))
+    records = [(s[4], s[5]) for s in obj.sections if s[1] == SHT_RELA and s[7] == index]
+    symbols = obj.symbols(".symtab")
+    place = image.section(name)[3]
+    for at in (at for start, size in records for at in range(start, start + size, 24)):
+        offset, info, addend = struct.unpack_from("<QQq", obj.data, at)
+        _, _, section, value = symbols[info >> 32]
+        assert 0 < section < len(obj.sections), (name, offset)
+        # The object's two `.rodata` sections are one in the image, so a
+        # field there could not be placed by name; none refers into them.
+        target = obj.sections[section][0]
+        assert target != ".rodata", (name, offset)
+        result = image.section(target)[3] + value + addend
+        match info & 0xFFFFFFFF:
+            case 257:
+                out[offset:offset + 8] = result.to_bytes(8, "little")
+            case 258:
+                out[offset:offset + 4] = result.to_bytes(4, "little")
+            case 261:
+                out[offset:offset + 4] = (result - place - offset).to_bytes(4, "little",
+                                                                            signed=True)
+            case kind:
+                raise AssertionError(f"{name}+{offset:#x}: relocation {kind}")
+    return bytes(out)
+
+
+def _eh_frame(elf: Elf) -> dict[int, tuple[int, int, bytes]]:
+    """Each FDE of `.eh_frame`, up to its terminator, by its offset in the
+    section: its function's address, its length, and its instructions from
+    the augmentation data on, without the padding that ends them."""
+    data = _contents(elf, ".eh_frame")
+    address = elf.section(".eh_frame")[3]
+    fdes = {}
+    at = 0
+    while at < len(data):
+        (length,) = struct.unpack_from("<I", data, at)
+        if length == 0:
+            break
+        (cie,) = struct.unpack_from("<I", data, at + 4)
+        if cie != 0:
+            (pc,) = struct.unpack_from("<i", data, at + 8)
+            (size,) = struct.unpack_from("<I", data, at + 12)
+            fdes[at] = (address + at + 8 + pc, size,
+                        data[at + 16:at + 4 + length].rstrip(b"\0"))
+        at += 4 + length
+    return fdes
+
+
+def _eh_frame_hdr(elf: Elf) -> tuple[int, list[tuple[int, int]]]:
+    """`.eh_frame_hdr`'s address for `.eh_frame`, and its table as each
+    function's address with its FDE's, in the order written."""
+    data = _contents(elf, ".eh_frame_hdr")
+    address = elf.section(".eh_frame_hdr")[3]
+    assert data[:4] == bytes([1, 0x1B, 0x03, 0x3B])
+    pointer, count = struct.unpack_from("<iI", data, 4)
+    assert len(data) == 12 + 8 * count
+    table = [struct.unpack_from("<ii", data, 12 + 8 * k) for k in range(count)]
+    return address + 4 + pointer, [(address + pc, address + fde) for pc, fde in table]
+
+
+def test_eh_frame_is_the_objects_with_its_functions_addresses(tmp_path):
+    obj, image = _written_elf(tmp_path, TASKS)
+    ours = _contents(image, ".eh_frame")
+    assert ours == _relocated(obj, ".eh_frame", image) + bytes(4)
+    _, kind, flags, address, offset, size, _, _ = image.section(".eh_frame")
+    assert (kind, flags) == (SHT_PROGBITS, SHF_ALLOC)
+    [first] = [s for s in image.segments if s[0] == PT_LOAD][:1]
+    assert first[1] == 4 and address + size <= first[3] + first[4]
+
+
+def test_eh_frame_hdr_indexes_every_fde_by_its_function(tmp_path):
+    _, image = _written_elf(tmp_path, TASKS)
+    eh_frame, table = _eh_frame_hdr(image)
+    assert eh_frame == image.section(".eh_frame")[3]
+    fdes = _eh_frame(image)
+    assert fdes
+    pcs = [pc for pc, _ in table]
+    assert pcs == sorted(set(pcs))
+    for pc, fde in table:
+        assert fdes[fde - eh_frame][0] == pc, hex(pc)
+    assert set(pcs) == {pc for pc, _, _ in fdes.values()}
+    text = image.section(".text")
+    assert all(text[3] <= pc < text[3] + text[5] for pc in pcs)
+
+
+def test_pt_gnu_eh_frame_is_the_index(tmp_path):
+    _, image = _written_elf(tmp_path, TASKS)
+    _, flags, offset, address, filesz, memsz, _ = image.segment(PT_GNU_EH_FRAME)
+    _, kind, section_flags, at, file_at, size, _, _ = image.section(".eh_frame_hdr")
+    assert (kind, section_flags) == (SHT_PROGBITS, SHF_ALLOC)
+    assert (flags, offset, address, filesz, memsz) == (4, file_at, at, size, size)
+    # A loader refuses `PT_GNU_EH_FRAME` outside every `PT_LOAD`.
+    first = next(s for s in image.segments if s[0] == PT_LOAD)
+    assert first[2] <= offset and offset + filesz <= first[2] + first[4]
+    assert first[3] <= address and address + memsz <= first[3] + first[5]
+
+
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_elf_debug_sections_are_the_objects_with_final_addresses(tmp_path, level):
+    obj, image = _written_elf(tmp_path, TASKS, level)
+    debug = [s[0] for s in obj.sections if s[0].startswith(".debug_")]
+    assert debug and debug == [s[0] for s in image.sections if s[0].startswith(".debug_")]
+    assert (".debug_gdb_scripts" in debug) == (level == "-g")
+    end = max(s[2] + s[4] for s in image.segments if s[0] == PT_LOAD)
+    for name in debug:
+        _, kind, flags, address, offset, _, _, _ = image.section(name)
+        assert (kind, flags, address) == (SHT_PROGBITS, 0, 0), name
+        assert offset >= end, name
+        assert _contents(image, name) == _relocated(obj, name, image), name
+
+
+def test_without_debug_information_the_elf_has_no_debug_sections(tmp_path):
+    _, image = _written_elf(tmp_path, TASKS)
+    assert not [s for s in image.sections if s[0].startswith(".debug_")]
+    assert image.section(".eh_frame_hdr")
+
+
+@linux
+@pytest.mark.skipif(toolchain.missing(), reason="links the object with the system linker")
+def test_the_linker_builds_the_same_eh_frame_hdr(tmp_path):
+    obj, image = _written_elf(tmp_path, TASKS)
+    linked = subprocess.run([*toolchain.cc(), "-o", "prog_ld", "prog.o",
+                             *toolchain.libraries()],
+                            cwd=tmp_path, capture_output=True, text=True)
+    assert linked.returncode == 0, linked.stderr[-4000:]
+    theirs = Elf((tmp_path / "prog_ld").read_bytes())
+
+    def indexed(elf: Elf) -> dict[int, tuple[int, bytes]]:
+        """Each function the index names, by its distance from `main`, with
+        its FDE's length and instructions."""
+        main = next(value for name, _, _, value in elf.symbols(".symtab") if name == "main")
+        eh_frame, table = _eh_frame_hdr(elf)
+        fdes = _eh_frame(elf)
+        return {pc - main: fdes[fde - eh_frame][1:] for pc, fde in table}
+
+    ours, all_theirs = indexed(image), indexed(theirs)
+    assert ours and set(ours) <= set(all_theirs)
+    assert ours == {at: fde for at, fde in all_theirs.items() if at in ours}
+    # Every FDE the linker indexes within the module's code is one of ours.
+    low, high = min(ours), max(ours)
+    assert [at for at in all_theirs if low <= at <= high] == sorted(ours)
+
+
+@linux
+@pytest.mark.skipif(not (shutil.which("strip") and shutil.which("objcopy")),
+                    reason="no binutils")
+def test_strip_and_objcopy_take_the_debug_sections(tmp_path):
+    _, image = _written_elf(tmp_path, TASKS, "-g")
+    for argv in (["strip", "-o", "stripped", "prog"],
+                 ["objcopy", "--only-keep-debug", "prog", "prog.debug"]):
+        subprocess.run(argv, cwd=tmp_path, check=True, capture_output=True)
+    stripped = Elf((tmp_path / "stripped").read_bytes())
+    assert not [s for s in stripped.sections if s[0].startswith(".debug_")]
+    kept = Elf((tmp_path / "prog.debug").read_bytes())
+    for name in (".debug_info", ".debug_line", ".debug_gdb_scripts"):
+        assert _contents(kept, name) == _contents(image, name), name
+    ran = subprocess.run([str(tmp_path / "stripped")], capture_output=True, text=True,
+                         timeout=60)
+    assert (ran.returncode, ran.stdout) == (0, "10\n"), ran.stderr
 
 
 def test_the_build_id_hashes_the_elf(tmp_path):

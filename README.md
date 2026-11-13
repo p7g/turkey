@@ -120,11 +120,10 @@ on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
 then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
 `opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
 that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
-naming a directory that holds a copy of the library. A Mac executable carries
-the unwind information and, with `-g`, the debug information a linked one
-does (see "Debugging and profiling"). An ELF carries neither yet, so it takes
-no `-g`, and a file name without an extension will not choose an executable
-until both have what a debugger and a profiler read. `check` compiles as far
+naming a directory that holds a copy of the library. Either executable
+carries the unwind information and, with `-g`, the debug information a linked
+one does (see "Debugging and profiling"). A file name without an extension
+does not choose an executable yet; name it with `-f exe`. `check` compiles as far
 as the last stage that can reject a program and writes nothing. Either takes
 `--dump STAGE,...` to print what a stage produced:
 `build/stages/stage2 check --dump types rectangles.gob` shows the inferred
@@ -189,6 +188,10 @@ nothing to run afterwards. Do not run `dsymutil` on such an executable: it
 reads only a linker's map, so it writes a `.dSYM` with no DWARF in it, which
 lldb then prefers to the executable's own. `strip` leaves the DWARF in place;
 build without `-g` for an executable without it.
+
+`build -g -f exe` on Linux puts the DWARF in the ELF's debug sections, which
+are never loaded, as a linker does: gdb reads them there, `strip` removes
+them and `objcopy --only-keep-debug` copies them out.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:

@@ -14,9 +14,9 @@ imports it, and it already provides:
 - every class -- `Eq`, `Ord`, `Show`, `Iterator`, `Index`, `Length`, `Monad`, …
 - `Bool(..)`, `Option(..)`, `Either(..)`, `Ordering(..)`, `Array`, `Map`
 - `print`, `write`, `show`, `len`, `error`, `hash`
-- thirteen `Data.*` modules and `Control.Iterator` under their own
+- thirteen `Data.*` modules and `Iter` under their own
   qualification: `Vec.push`, `String.slice`, `Int.toString`, `Char.isDigit`,
-  `Map.get`, `Option.map`, `Iterator.any`
+  `Map.get`, `Option.map`, `Iter.any`
 
 So a module that lexes text needs **no imports at all**. Write `String.push`
 and `Vec.new` and be done.
@@ -30,6 +30,8 @@ What still needs importing:
 
 - `System.IO`, `System.Env`, `Data.Set` -- not among the Prelude's qualifiers.
 - other `Turkey.*` modules.
+- `Iter`, as `import Iter`: the compiler in `bootstrap/`, which builds `src/`,
+  does not qualify it.
 
 `import Turkey.Ast` gives `Turkey.Ast.Expr` and no bare names; a module that
 works on the tree writes `import Turkey.Ast (..)`, and one whose own `Pred`

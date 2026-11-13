@@ -1,45 +1,42 @@
 export (eliminateCopies, eliminateDead, mergeBlocks)
 
--- Copy elimination and dead instruction elimination, written once against
--- `class Inst i` and run on both sides of instruction selection.
---
--- Neither pass asks what an opcode computes. Copy elimination needs to know
--- which instructions are copies and how to rename an operand; dead code
--- elimination needs `uses`, `defs` and whether `effects` let an instruction
--- go. Everything else they read is the graph -- terminators and block
--- parameters -- which every instantiation shares.
---
--- Both keep the value numbering: a removed value simply stops being defined
--- or used, and its `reps` entry stays, so a side table indexed by value --
--- `origins`, the machine graph's shared numbering -- still means what it did.
+--- Copy elimination and dead instruction elimination, written once against
+--- `class Inst i` and run on both sides of instruction selection.
+---
+--- Neither pass asks what an opcode computes. Copy elimination needs to know
+--- which instructions are copies and how to rename an operand; dead code
+--- elimination needs `uses`, `defs` and whether `effects` let an instruction
+--- go. Everything else they read is the graph -- terminators and block
+--- parameters -- which every instantiation shares.
+---
+--- Both keep the value numbering: a removed value simply stops being defined
+--- or used, and its `reps` entry stays, so a side table indexed by value --
+--- `origins`, the machine graph's shared numbering -- still means what it did.
 
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Term(..), Inst(..), Func(..))
 
 -- -- copies --------------------------------------------------------------------------
 
--- Replace every copy by its source.
---
--- Two kinds. An instruction the instantiation calls a copy, whose destination
--- is renamed to its source everywhere and which is then deleted. And a block
--- parameter every incoming jump passes the same value to -- or itself, round a
--- loop -- which is a copy on every edge, and is removed along with the
--- arguments that fed it. That rule is the one Braun et al. use to remove a
--- trivial phi, and it is sound for the same reason: the one value passed
--- reaches the block along every edge, so it dominates the block, so it
--- dominates every use of the parameter.
---
--- An entry block takes no parameters, and a block no jump enters keeps its
--- own: with nothing passed there is nothing to be a copy of.
---
--- An instruction copy is renamed only between two equal representations:
--- across representations the copy is the point.
---
--- `traced` says whether a traced value may be renamed at all, and it is false
--- after selection. `Turkey.Roots` analyses the low IR, and the safepoint maps
--- and root stores it produces name the values they root by number; renaming a
--- traced value after that would leave a map naming a value no instruction
--- stores. Before the analysis there is nothing to disagree with.
+--- Replace every copy by its source.
+---
+--- Two kinds. An instruction the instantiation calls a copy, whose destination
+--- is renamed to its source everywhere and which is then deleted. And a block
+--- parameter every incoming jump passes the same value to -- or itself, round a
+--- loop -- which is a copy on every edge, and is removed along with the
+--- arguments that fed it.
+---
+--- An entry block takes no parameters, and a block no jump enters keeps its
+--- own: with nothing passed there is nothing to be a copy of.
+---
+--- An instruction copy is renamed only between two equal representations:
+--- across representations the copy is the point.
+---
+--- `traced` says whether a traced value may be renamed at all, and it is false
+--- after selection. `Turkey.Roots` analyses the low IR, and the safepoint maps
+--- and root stores it produces name the values they root by number; renaming a
+--- traced value after that would leave a map naming a value no instruction
+--- stores. Before the analysis there is nothing to disagree with.
 fun eliminateCopies[Inst i](f : Func i, traced : Bool) -> Unit {
     let aliases = Array.filled(len(f.reps), -1)
     var found = False
@@ -57,6 +54,10 @@ fun eliminateCopies[Inst i](f : Func i, traced : Bool) -> Unit {
             }
         }
     }
+    -- The block parameter rule is the one Braun et al. use to remove a
+    -- trivial phi, and it is sound for the same reason: the one value passed
+    -- reaches the block along every edge, so it dominates the block, so it
+    -- dominates every use of the parameter.
     let jumps = jumpsInto(f)
     var changed = True
     while changed {
@@ -170,20 +171,20 @@ fun renameTerm(t : Term, rename : fun(Value) -> Value,
 
 -- -- dead code -----------------------------------------------------------------------
 
--- Delete every instruction and block parameter whose value nothing needs.
---
--- Mark and sweep. The roots are what a terminator other than a jump reads, and
--- the operands of every instruction `Ssa.deletable` refuses -- a write, a
--- trap, a divergence. A needed instruction needs its operands; a needed block
--- parameter needs the argument each jump into its block passes it. So a value
--- that only ever flows round a loop into itself, and out to nothing, is dead
--- even though it is used.
---
--- An allocation is deletable, which is only true because this runs before
--- `Turkey.Roots` reads the graph: a safepoint map lists values by what the
--- low IR said was live, and a map naming a value this deleted would describe
--- a root that is not there. After selection a call is not deletable, so no
--- safepoint is ever removed there.
+--- Delete every instruction and block parameter whose value nothing needs.
+---
+--- Mark and sweep. The roots are what a terminator other than a jump reads, and
+--- the operands of every instruction `Ssa.deletable` refuses -- a write, a
+--- trap, a divergence. A needed instruction needs its operands; a needed block
+--- parameter needs the argument each jump into its block passes it. So a value
+--- that only ever flows round a loop into itself, and out to nothing, is dead
+--- even though it is used.
+---
+--- An allocation is deletable, which is only true because this runs before
+--- `Turkey.Roots` reads the graph: a safepoint map lists values by what the
+--- low IR said was live, and a map naming a value this deleted would describe
+--- a root that is not there. After selection a call is not deletable, so no
+--- safepoint is ever removed there.
 fun eliminateDead[Inst i](f : Func i) -> Unit {
     let count = len(f.reps)
     -- Where each value is defined: a block and an instruction index, or a
@@ -257,19 +258,20 @@ fun needed[Inst i](live : Array Bool, inst : i) -> Bool {
 
 -- -- blocks --------------------------------------------------------------------------
 
--- Merge each block into its predecessor where that predecessor's jump is the
--- only way in, and answer the function without the emptied blocks.
---
--- Lowering makes these chains -- a block per statement, a block for each
--- value a `match` or an `if` delivers -- and a chain of fallthroughs costs no
--- instructions, but it keeps apart what a later pass reads as one: a
--- comparison in one block and the branch on it in the next cannot become one
--- conditional branch. A merged block takes no parameters: copy elimination has
--- already removed a parameter whose only jump passes it one value.
---
--- Blocks are renumbered, like `Ssa.pruneUnreachable`, so this runs before
--- anything records a `BlockId`.
+--- Merge each block into its predecessor where that predecessor's jump is the
+--- only way in, and answer the function without the emptied blocks.
+---
+--- A merged block takes no parameters: copy elimination has already removed
+--- a parameter whose only jump passes it one value.
+---
+--- Blocks are renumbered, like `Ssa.pruneUnreachable`, so this runs before
+--- anything records a `BlockId`.
 fun mergeBlocks[Inst i](f : Func i) -> Func i {
+    -- Lowering makes these chains -- a block per statement, a block for each
+    -- value a `match` or an `if` delivers -- and a chain of fallthroughs costs
+    -- no instructions, but it keeps apart what a later pass reads as one: a
+    -- comparison in one block and the branch on it in the next cannot become
+    -- one conditional branch.
     let preds = Ssa.predecessors(f)
     var merged = False
     for var b = 0; b < len(f.blocks); b = b + 1 {

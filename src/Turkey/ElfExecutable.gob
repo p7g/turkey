@@ -1,92 +1,92 @@
 export (executableFile)
 
--- An assembled arm64 module as a dynamically linked ELF executable for
--- glibc on Linux: position independent (`ET_DYN`, linked at address 0), with
--- every import bound when it starts, and nothing else linked in.
---
--- **Layout.** Four `PT_LOAD` segments, each aligned to 64KB, the largest
--- page an arm64 kernel uses. Every segment's address is congruent to its file
--- offset modulo 64KB, which is what the kernel and the loader need to map
--- it, so the address space has gaps between segments and the file has none.
---
--- * Read-only: the ELF header and program headers, the interpreter's path,
---   the build ID note, the dynamic symbols, their hash table and strings,
---   the dynamic relocations, the C strings and the constants, then
---   `.eh_frame` and `.eh_frame_hdr`.
--- * Read and execute: the module's code, `_start`, and the import stubs.
--- * Read and write, then read-only once relocated (`PT_GNU_RELRO`): the
---   dynamic section and the global offset table.
--- * Read and write: the data.
---
--- After them, outside every segment, the debug sections, the symbol table,
--- its strings, the section names and the section headers.
---
--- **Imports.** Every field is filled in here (`Turkey.Image`); the image has
--- no `R_AARCH64_RELATIVE`, since the loaded sections hold no absolute
--- address. A call to an import goes to a stub that jumps through the
--- import's slot of the offset table (`Turkey.Executable`), and the loader
--- fills each slot from an `R_AARCH64_GLOB_DAT` relocation. `DF_BIND_NOW`
--- has it fill every slot before the program starts, so no slot is ever
--- bound lazily and there is no procedure linkage table. The offset table is
--- in the RELRO segment, which the loader makes read-only once it has filled
--- the slots in. The loader rounds both ends of `PT_GNU_RELRO` down to its
--- page, so the segment is padded to the next 64KB boundary: otherwise a
--- kernel with 64KB pages would leave the slots after the last whole page
--- writable.
---
--- The imports are grouped by the shared library that defines them, one
--- `DT_NEEDED` each: libc first, then libm, then the others by soname. A
--- library is needed only when an import comes from it. The references are
--- unversioned: there is no `.gnu.version`, `.gnu.version_r` or
--- `.gnu.version_d`. An unversioned reference binds to the library's oldest
--- version of the name, which for every C library import is either its only
--- version or one that behaves as the newest does, and to a library that
--- gives each name one version, as OpenSSL does, at that version. A library
--- that lacks one of the imports fails at startup with `undefined symbol`, not
--- with a missing version. The oldest glibc that has them all is 2.34, the
--- first with `pthread_create` in libc.
---
--- The executable exports nothing, so the dynamic symbol table holds only
--- the imports, and its `DT_GNU_HASH` table is empty: one bucket, holding no
--- chain, and one bloom word with no bit set, so that every lookup misses.
--- The loader does not need a hash table for an object that defines nothing,
--- but readers of ELF files expect one.
---
--- **Starting.** The kernel starts the program at `_start`, written here,
--- which calls glibc's `__libc_start_main` with `main`, `argc` and `argv`,
--- no initializer or finalizer, the loader's finalizer and the stack's end.
--- From glibc 2.34, `__libc_start_main` runs the program's own initializers
--- from its dynamic section when it is given none, and the module has none.
---
--- **Symbols.** Every named symbol the module defines is in `.symtab`, with
--- a section header for every loaded section, so that `nm`, `perf` and gdb
--- name every function: locals first, then `_start` and the module's
--- exported symbols, then the imports, undefined. A temporary label never
--- is.
---
--- **Unwind information**, which every build carries: the module's
--- `.eh_frame`, ended by a zero length, which is how an unwinder that walks
--- it finds its end. `.eh_frame_hdr` indexes it, and `PT_GNU_EH_FRAME` covers
--- exactly the index, which is how libgcc's and LLVM's unwinders, and so
--- glibc's `backtrace`, find a function's FDE: without the program header
--- they find none. The index holds one FDE per function, sorted by the
--- function's address, for a binary search. gdb and lldb read `.eh_frame`
--- through its section header instead, and never read the index. The
--- runtime finds frames by their frame pointers and the frame table, and
--- reads neither.
---
--- **Debug information**, when the module has any, is its debug sections as
--- they are, with their addresses filled in, written after the last segment
--- and loaded by none: section headers of their own with no flags and no
--- address, so that `strip` removes them and
--- `objcopy --only-keep-debug` keeps them. `.debug_gdb_scripts` is among
--- them. They are not compressed.
---
--- **Deterministic.** Nothing in the file depends on the host, the time or
--- the path it is written to. The build ID (`NT_GNU_BUILD_ID`), which
--- profilers and crash collectors key on, is taken from a SHA-256 of the rest
--- of the file, so one module always writes the same bytes, which is what
--- lets the compiler's fixed point compare executables.
+--- An assembled arm64 module as a dynamically linked ELF executable for
+--- glibc on Linux: position independent (`ET_DYN`, linked at address 0), with
+--- every import bound when it starts, and nothing else linked in.
+---
+--- **Layout.** Four `PT_LOAD` segments, each aligned to 64KB, the largest
+--- page an arm64 kernel uses. Every segment's address is congruent to its file
+--- offset modulo 64KB, which is what the kernel and the loader need to map
+--- it, so the address space has gaps between segments and the file has none.
+---
+--- * Read-only: the ELF header and program headers, the interpreter's path,
+---   the build ID note, the dynamic symbols, their hash table and strings,
+---   the dynamic relocations, the C strings and the constants, then
+---   `.eh_frame` and `.eh_frame_hdr`.
+--- * Read and execute: the module's code, `_start`, and the import stubs.
+--- * Read and write, then read-only once relocated (`PT_GNU_RELRO`): the
+---   dynamic section and the global offset table.
+--- * Read and write: the data.
+---
+--- After them, outside every segment, the debug sections, the symbol table,
+--- its strings, the section names and the section headers.
+---
+--- **Imports.** Every field is filled in here (`Turkey.Image`); the image has
+--- no `R_AARCH64_RELATIVE`, since the loaded sections hold no absolute
+--- address. A call to an import goes to a stub that jumps through the
+--- import's slot of the offset table (`Turkey.Executable`), and the loader
+--- fills each slot from an `R_AARCH64_GLOB_DAT` relocation. `DF_BIND_NOW`
+--- has it fill every slot before the program starts, so no slot is ever
+--- bound lazily and there is no procedure linkage table. The offset table is
+--- in the RELRO segment, which the loader makes read-only once it has filled
+--- the slots in. The loader rounds both ends of `PT_GNU_RELRO` down to its
+--- page, so the segment is padded to the next 64KB boundary: otherwise a
+--- kernel with 64KB pages would leave the slots after the last whole page
+--- writable.
+---
+--- The imports are grouped by the shared library that defines them, one
+--- `DT_NEEDED` each: libc first, then libm, then the others by soname. A
+--- library is needed only when an import comes from it. The references are
+--- unversioned: there is no `.gnu.version`, `.gnu.version_r` or
+--- `.gnu.version_d`. An unversioned reference binds to the library's oldest
+--- version of the name, which for every C library import is either its only
+--- version or one that behaves as the newest does, and to a library that
+--- gives each name one version, as OpenSSL does, at that version. A library
+--- that lacks one of the imports fails at startup with `undefined symbol`, not
+--- with a missing version. The oldest glibc that has them all is 2.34, the
+--- first with `pthread_create` in libc.
+---
+--- The executable exports nothing, so the dynamic symbol table holds only
+--- the imports, and its `DT_GNU_HASH` table is empty: one bucket, holding no
+--- chain, and one bloom word with no bit set, so that every lookup misses.
+--- The loader does not need a hash table for an object that defines nothing,
+--- but readers of ELF files expect one.
+---
+--- **Starting.** The kernel starts the program at `_start`, written here,
+--- which calls glibc's `__libc_start_main` with `main`, `argc` and `argv`,
+--- no initializer or finalizer, the loader's finalizer and the stack's end.
+--- From glibc 2.34, `__libc_start_main` runs the program's own initializers
+--- from its dynamic section when it is given none, and the module has none.
+---
+--- **Symbols.** Every named symbol the module defines is in `.symtab`, with
+--- a section header for every loaded section, so that `nm`, `perf` and gdb
+--- name every function: locals first, then `_start` and the module's
+--- exported symbols, then the imports, undefined. A temporary label never
+--- is.
+---
+--- **Unwind information**, which every build carries: the module's
+--- `.eh_frame`, ended by a zero length, which is how an unwinder that walks
+--- it finds its end. `.eh_frame_hdr` indexes it, and `PT_GNU_EH_FRAME` covers
+--- exactly the index, which is how libgcc's and LLVM's unwinders, and so
+--- glibc's `backtrace`, find a function's FDE: without the program header
+--- they find none. The index holds one FDE per function, sorted by the
+--- function's address, for a binary search. gdb and lldb read `.eh_frame`
+--- through its section header instead, and never read the index. The
+--- runtime finds frames by their frame pointers and the frame table, and
+--- reads neither.
+---
+--- **Debug information**, when the module has any, is its debug sections as
+--- they are, with their addresses filled in, written after the last segment
+--- and loaded by none: section headers of their own with no flags and no
+--- address, so that `strip` removes them and
+--- `objcopy --only-keep-debug` keeps them. `.debug_gdb_scripts` is among
+--- them. They are not compressed.
+---
+--- **Deterministic.** Nothing in the file depends on the host, the time or
+--- the path it is written to. The build ID (`NT_GNU_BUILD_ID`), which
+--- profilers and crash collectors key on, is taken from a SHA-256 of the rest
+--- of the file, so one module always writes the same bytes, which is what
+--- lets the compiler's fixed point compare executables.
 
 import Hash.SHA256 as SHA256
 import Turkey.Asm as Asm
@@ -237,10 +237,10 @@ type Section = Section {
     link : Int, info : Int, align : Int, entry : Int,
 }
 
--- Returns `obj` as an executable that starts at `entry`, a function `obj`
--- defines, with each of `obj.undefined` imported from the library `needed`
--- maps its name to, by soname, and every other from libc or libm. Fills in
--- `obj`'s sections in place, so `obj` is spent.
+--- Returns `obj` as an executable that starts at `entry`, a function `obj`
+--- defines, with each of `obj.undefined` imported from the library `needed`
+--- maps its name to, by soname, and every other from libc or libm. Fills in
+--- `obj`'s sections in place, so `obj` is spent.
 fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String String) -> Array Byte {
     let sections = obj.sections
     -- The assembler puts these first, in this order.

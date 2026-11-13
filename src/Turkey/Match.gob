@@ -1,57 +1,57 @@
 export (Matcher(..), Body(..), compile)
 
--- Match compilation: a `match` over source patterns, which nest, becomes nested
--- `match`es over `Turkey.Core.Alt`s, which do not.
---
--- `Turkey.Lower` calls this for every `match` it builds, so Core never holds a
--- nested pattern and every pass after it sees one level of test at a time. That
--- is the shape `Turkey.Opt`'s case-of-known-constructor decides, so a
--- constructor built in one place and taken apart by a nested pattern in
--- another meets a rule that can delete it, and a group of arms that test the
--- same value tests it once.
---
--- The automaton is a backtracking one, in the style of Wadler's chapter of
--- *The Implementation of Functional Programming Languages* (Peyton Jones,
--- 1987) and of Le Fessant and Maranget, "Optimizing pattern matching" (ICFP
--- 2001). The arms are rows of a matrix with one column per value under test.
--- The first column splits the rows into maximal runs whose patterns there are
--- all variables or all constructors (the *mixture rule*). A run of
--- constructors is one `match` on the column with one arm per constructor, in
--- the order the rows first name them, so rows that name the same constructor
--- share a test and the rows for different constructors, which cannot both
--- match, are not tested against each other. A run of variables binds the
--- column and drops it. When a run fails, control goes to the code for the next
--- run, which is a join point the run jumps to.
---
--- Backtracking rather than a decision tree because the size of the output is
--- linear in the size of the input: no arm body and no pattern is copied. A
--- decision tree tests fewer things on some paths and copies arms to do it, and
--- `Opt` then inlines whatever this emits.
---
--- What this does not decide: whether the arms are exhaustive and which are
--- unreachable. `Turkey.Exhaustive` has said so already, on the patterns as
--- written. A value no arm matches reaches a `match` with no arm for it, and the
--- backend panics there.
---
--- The order of tests is the order of the source: columns left to right, a
--- constructor's fields before the columns after it. A run is never reordered
--- with another, so an arm that might match is tried before every arm after it.
---
--- An arm with guards is a row like any other until its patterns have all
--- matched. Its guards then run under its bindings, and a failing one jumps to
--- the rows after it, which is a join point of its own.
---
--- Alternatives inside a pattern, `(GET | HEAD, path)`, are compiled where they
--- stand rather than multiplied out into one row per combination, which would
--- copy the rest of the row once per alternative and grow as the product of
--- their counts. A row whose first pattern is alternatives is a run of its own:
--- a join point that takes the variables the alternatives bind and matches the
--- rest of the row, and a one-column matrix with a row per alternative, each
--- jumping there with what it bound. This is Le Fessant and Maranget's scheme
--- with exits that carry variables. The first alternative that matches is the
--- one taken: when the rest of the row or a guard then fails, the rows after it
--- are tried, not the other alternatives. Retrying them could only matter to a
--- guard, since the rest of the row tests other columns.
+--- Match compilation: a `match` over source patterns, which nest, becomes nested
+--- `match`es over `Turkey.Core.Alt`s, which do not.
+---
+--- `Turkey.Lower` calls this for every `match` it builds, so Core never holds a
+--- nested pattern and every pass after it sees one level of test at a time. That
+--- is the shape `Turkey.Opt`'s case-of-known-constructor decides, so a
+--- constructor built in one place and taken apart by a nested pattern in
+--- another meets a rule that can delete it, and a group of arms that test the
+--- same value tests it once.
+---
+--- The automaton is a backtracking one, in the style of Wadler's chapter of
+--- *The Implementation of Functional Programming Languages* (Peyton Jones,
+--- 1987) and of Le Fessant and Maranget, "Optimizing pattern matching" (ICFP
+--- 2001). The arms are rows of a matrix with one column per value under test.
+--- The first column splits the rows into maximal runs whose patterns there are
+--- all variables or all constructors (the *mixture rule*). A run of
+--- constructors is one `match` on the column with one arm per constructor, in
+--- the order the rows first name them, so rows that name the same constructor
+--- share a test and the rows for different constructors, which cannot both
+--- match, are not tested against each other. A run of variables binds the
+--- column and drops it. When a run fails, control goes to the code for the next
+--- run, which is a join point the run jumps to.
+---
+--- Backtracking rather than a decision tree because the size of the output is
+--- linear in the size of the input: no arm body and no pattern is copied. A
+--- decision tree tests fewer things on some paths and copies arms to do it, and
+--- `Opt` then inlines whatever this emits.
+---
+--- What this does not decide: whether the arms are exhaustive and which are
+--- unreachable. `Turkey.Exhaustive` has said so already, on the patterns as
+--- written. A value no arm matches reaches a `match` with no arm for it, and the
+--- backend panics there.
+---
+--- The order of tests is the order of the source: columns left to right, a
+--- constructor's fields before the columns after it. A run is never reordered
+--- with another, so an arm that might match is tried before every arm after it.
+---
+--- An arm with guards is a row like any other until its patterns have all
+--- matched. Its guards then run under its bindings, and a failing one jumps to
+--- the rows after it, which is a join point of its own.
+---
+--- Alternatives inside a pattern, `(GET | HEAD, path)`, are compiled where they
+--- stand rather than multiplied out into one row per combination, which would
+--- copy the rest of the row once per alternative and grow as the product of
+--- their counts. A row whose first pattern is alternatives is a run of its own:
+--- a join point that takes the variables the alternatives bind and matches the
+--- rest of the row, and a one-column matrix with a row per alternative, each
+--- jumping there with what it bound. This is Le Fessant and Maranget's scheme
+--- with exits that carry variables. The first alternative that matches is the
+--- one taken: when the rest of the row or a guard then fails, the rows after it
+--- are tried, not the other alternatives. Retrying them could only matter to a
+--- guard, since the rest of the row tests other columns.
 
 import Turkey.Ast (..)
 import Turkey.Core (..)
@@ -62,11 +62,11 @@ import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (TTuple, TBottom, TCon)
 
--- What compiling needs from the pass that calls it: the declarations, how to
--- reduce a field's type to the one its constructors are read off, how to name
--- a binder it invents, the id of the binder a pattern variable binds, and
--- what a pattern that opens an existential binds. A binder is a spelling and
--- an id; see `Turkey.Core.CParam`.
+--- What compiling needs from the pass that calls it: the declarations, how to
+--- reduce a field's type to the one its constructors are read off, how to name
+--- a binder it invents, the id of the binder a pattern variable binds, and
+--- what a pattern that opens an existential binds. A binder is a spelling and
+--- an id; see `Turkey.Core.CParam`.
 type Matcher = Matcher {
     decls    : DeclTable,
     reduce   : fun(Ty.Type) -> Ty.Type,
@@ -75,13 +75,13 @@ type Matcher = Matcher {
     opened   : fun(Pat) -> Opened,
 }
 
--- What an arm does once its patterns have matched.
+--- What an arm does once its patterns have matched.
 type Body
-    -- Returns its value.
+    --- Returns its value.
     = Taken(Core)
-    -- Runs its guards and then returns its value. Given a join that takes no
-    -- arguments, its spelling and id, returns code that jumps there when a
-    -- guard fails.
+    --- Runs its guards and then returns its value. Given a join that takes no
+    --- arguments, its spelling and id, returns code that jumps there when a
+    --- guard fails.
     | Guarded(fun((String, Int)) -> Core)
 
 -- One compilation's state: how many jumps there are to each fallthrough, and
@@ -92,7 +92,7 @@ type State = State {
     guarded : Map Int Bool,
 }
 
--- `match scrutinee { arms }`, of type `ty`, compiled.
+--- `match scrutinee { arms }`, of type `ty`, compiled.
 fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Body), ty : Ty.Type,
             span : Option Span) -> Core {
     let st = State { m = m, jumps = Map.new(), guarded = Map.new() }

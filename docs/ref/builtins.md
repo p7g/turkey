@@ -230,14 +230,16 @@ they were added. Adding an element the set holds changes nothing, and an
 element removed and added again goes last.
 
 `Set.union`, `Set.intersection`, `Set.difference` and
-`Set.symmetricDifference` return a new set and leave their arguments as they
-were, so each costs a copy. So do the operators, which call them: `a | b` is the union, `a & b` the
-intersection, `a - b` the elements of `a` not in `b`, and `a ^ b` the elements
-in exactly one of them. `a <> b` is the union too, and `empty()` is its
-identity. `Set.isSubset(a, b)`, `Set.isDisjoint(a, b)` and `Set.isEmpty(a)`
-test sets. `Set.unionInto(into, from)` adds the elements of `from` to
-`into` in place, and returns whether that added any: a set grown in a loop is
-grown with it, or with `Set.add`, since `seen = seen | more` copies `seen`
+`Set.symmetricDifference` return a new set and leave their operands alone.
+The operators are those functions: `a | b` is the union, `a & b` the
+intersection, `a - b` the elements of `a` not in `b`, and `a ^ b` the
+elements in exactly one of them. `a <> b` is the union too, and `empty()` is
+its identity. `Set.isSubset(a, b)`, `Set.isDisjoint(a, b)` and
+`Set.isEmpty(a)` test sets.
+
+`Set.unionInto(into, from)` is the one that changes a set in place. It adds
+the elements of `from` to `into`, and returns whether that added any. Grow a
+set in a loop with it or with `Set.add`: `seen = seen | more` copies `seen`
 every time.
 
 <!-- run -->
@@ -254,7 +256,7 @@ fun main() {
     print(Set.isSubset(odd & prime, odd))
 
     let seen = empty() : Set Int
-    for step in [[1, 2], [2, 3]] { let _ = Set.unionInto(seen, Set.fromIterator(step)) }
+    for step in [[1, 2], [2, 1]] { print(Set.unionInto(seen, Set.fromIterator(step))) }
     print(seen)
 }
 ```
@@ -264,7 +266,9 @@ fun main() {
 {1}
 {1, 2}
 True
-{1, 2, 3}
+True
+False
+{1, 2}
 ```
 
 Equal sets hash equal whatever order their elements were added in, so a set

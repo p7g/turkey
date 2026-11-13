@@ -106,7 +106,8 @@ later. It loads the shared libraries the program calls into, as
 [Foreign functions](declarations.md#foreign-functions) describes. `-o PATH`
 names it, and `-o -` writes it to standard output. `-f asm` writes assembly
 instead and `-f obj` a relocatable object, either of which a C compiler links;
-on Linux, add `-lm` to the link.
+without `-o`, either goes to standard output. On Linux, add `-lm` to the
+link.
 
 The project README says how to build `boot` itself.
 

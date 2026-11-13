@@ -424,13 +424,16 @@ def test_a_build_leaves_another_builds_partial_file_alone(tmp_path):
 
 
 # With neither -f nor -o, `build` writes an executable for the host into the
-# working directory, named after the entry file without its extension.
+# working directory, named after the entry file without its extension, and
+# not beside the entry file.
 def test_a_build_writes_an_executable_named_after_its_entry(tmp_path):
-    shutil.copy(PROGRAMS / "adt.gob", tmp_path / "adt.gob")
-    result = _boot("adt.gob", cwd=tmp_path)
+    (tmp_path / "sub").mkdir()
+    shutil.copy(PROGRAMS / "adt.gob", tmp_path / "sub" / "01.gob")
+    result = _boot("sub/01.gob", cwd=tmp_path)
     assert result.returncode == 0, result.stderr[-4000:]
-    executable = tmp_path / "adt"
+    executable = tmp_path / "01"
     assert os.stat(executable).st_mode & 0o111 == 0o111
+    assert not (tmp_path / "sub" / "01").exists()
     ran = subprocess.run(toolchain.command(executable), capture_output=True, text=True,
                          timeout=60, cwd=tmp_path)
     assert (ran.returncode, ran.stdout) == (
@@ -476,6 +479,26 @@ def test_an_entry_without_an_extension_needs_an_output_name(tmp_path):
     assert result.returncode == 2
     assert "cannot name the executable after 'adt'" in result.stderr
     assert entry.read_bytes() == (PROGRAMS / "adt.gob").read_bytes()
+
+
+# The executable's path is checked before anything is compiled: a directory
+# there, or an entry file with nothing before its extension, is refused at
+# once and nothing is written.
+@pytest.mark.parametrize("entry, args, message", [
+    ("adt.gob", (), "cannot write the executable to './adt', which is a directory"),
+    ("adt.gob", ("-o", "adt"), "cannot write the executable to 'adt', which is a directory"),
+    (".gob", (), "cannot name the executable after '.gob'"),
+])
+def test_an_executable_path_that_cannot_be_written_is_refused_at_once(tmp_path, entry,
+                                                                      args, message):
+    shutil.copy(PROGRAMS / "adt.gob", tmp_path / entry)
+    (tmp_path / "adt").mkdir()
+    result = _boot(*args, "--timings", entry, cwd=tmp_path)
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "time\t" not in result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted([entry, "adt"])
+    assert list((tmp_path / "adt").iterdir()) == []
 
 
 def _commands(data: bytes):

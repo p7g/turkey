@@ -149,7 +149,7 @@ giving typed sums and arrays without unboxing or unchecked casts.
 From the repository root:
 
 ```sh
-build/stages/stage2 build -o main.s examples/regex/main.gob && cc -o main main.s && ./main
+build/stages/stage2 build examples/regex/main.gob && ./main
 python3 -m pytest tests/test_regex.py -q
 sh scripts/test.sh tests/programs/regex_library
 ```

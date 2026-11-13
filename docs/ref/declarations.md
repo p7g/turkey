@@ -811,11 +811,11 @@ importing a module with such a block costs nothing until a call to one is
 reached. The executable `boot` writes names the library on Linux as
 `libssl.so.3`, the name and the major. On macOS it names the library by the
 install name of `libssl.3.dylib`, which must be an absolute path.
-The build reads it from the first such file in the directories of
-`$TURKEY_DYLIB_PATH`, separated by colons, then in Homebrew's
+Writing that executable reads it from the first such file in the directories
+of `$TURKEY_DYLIB_PATH`, separated by colons, then in Homebrew's
 `/opt/homebrew/lib` and `/usr/local/lib`, then in each Homebrew package's
-`opt/*/lib` under those two. A build for macOS on another machine searches
-`$TURKEY_DYLIB_PATH` alone, and is refused without it.
+`opt/*/lib` under those two. Writing a macOS executable on another machine
+searches `$TURKEY_DYLIB_PATH` alone, and is refused without it.
 
 Every block and declaration of every module the program loads, called or not,
 must agree on two things, and a program in which they do not is refused at

@@ -861,7 +861,7 @@ fun solveRefusals(s : Solver) -> Unit {
 -- type an equality decides takes that type, not the default.
 fun defaultOnce(s : Solver) -> Bool {
     let open = everywhere(s.here)
-    if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open) {
+    if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open, open) {
         solveWanteds(s)
         True
     } else {
@@ -2439,7 +2439,7 @@ fun split(s : Solver, c : LetCell, types : Array Ty.Type, after : Int) -> Vec Pr
         for p in unattributed(retainedPreds, types) {
             if !isArrayLiteralDemand(p) && !isOccursEquation(p) { Vec.push(stranded, p) }
         }
-        if len(stranded) == 0 || !applyDefaults(s, stranded) {
+        if len(stranded) == 0 || !applyDefaults(s, stranded, retainedPreds) {
             -- An equality that can never be solved is what leaves the others
             -- undecided, most often, so it is reported first.
             if c.topLevel { rejectQuantified(s, c, after) }
@@ -3632,16 +3632,17 @@ fun isArrayLiteralDemand(c : PredCell) -> Bool =
 -- appears in no type being generalized, so no use site can pin it and no scheme
 -- can carry it. A numeral takes the set's first member in `Ty.literalOrder`,
 -- the head of the numeric tower. An array literal takes the first member that
--- satisfies its class constraints (`defaultArrayLiteral`).
+-- satisfies its class constraints (`defaultArrayLiteral`), which are read from
+-- `consulted` as well as from the inert sets.
 --
 -- Only `OneOf` defaults. A stranded `HasField` is a genuine error: there is no
 -- preferred record type to guess.
-fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
+fun applyDefaults(s : Solver, stuck : Vec PredCell, consulted : Vec PredCell) -> Bool {
     var progress = False
     for c in stuck {
         if c.pred.name == oneOf && undecided(c) {
             if isArrayLiteralDemand(c) {
-                if defaultArrayLiteral(s, c, stuck) { progress = True }
+                if defaultArrayLiteral(s, c, consulted) { progress = True }
             } else {
                 let names = setNames(c.pred.args[1], c.span)
                 var chosen = False
@@ -3668,8 +3669,8 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
 -- the ambiguous variable's classes", and it is a static error if there is
 -- none. GHC implements it in `GHC.Tc.Solver.Default`: `findDefaultableGroups`
 -- collects the unary constraints `C v` on each variable, and `tryDefaultGroup`
--- tries each default type in order, keeping the first under which those
--- constraints solve. Here the default list is the literal's set, in
+-- substitutes each default type in turn, solves the group, and keeps the first
+-- whose residual is empty. Here the default list is the literal's set, in
 -- `Ty.literalOrder`: `Array`, `Vec`, `FrozenArray`.
 --
 -- The conditions under which a variable is defaultable at all are GHC's
@@ -3681,34 +3682,35 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
 -- consulted in choosing. Requiring the Report's conditions instead would
 -- leave `let xs = [1, 2]` followed by `xs[0]` ambiguous.
 --
--- One step deviates from GHC. `tryDefaultGroup` accepts a candidate only if
--- solving the constraints leaves nothing, and the Report's defaults are nullary
--- types whose instances have no context, for which the two coincide. A
--- container is applied to the literal's element, so its instance can have a
--- context about the element (`Hash (FrozenArray a) : Hash a`). That context
--- constrains the element's own variable, which may not be decided yet -- it is
--- often a numeral, defaulted in this same round. So a candidate is accepted
--- when an instance of each class matches it, and the instance's context is left
--- to the solver, which reports it at the use as it would without a default.
+-- One step deviates from GHC: what residual is acceptable. GHC's defaults are
+-- nullary types, so solving their group either discharges it or fails on a
+-- known type. A container is applied to the literal's element, so its
+-- instance can leave a constraint on the element (`Hash (FrozenArray a) :
+-- Hash a`), and the element may not be decided yet -- it is often a numeral,
+-- defaulted in this same round, or a variable the binding will quantify. So a
+-- candidate is rejected only when its residual holds a constraint that no
+-- later decision can discharge (`hopeless`). A residual class constraint at
+-- a variable or a skolem is left to the solver, which reports it at the use
+-- as it would without a default. Requiring an empty residual instead would reject every container
+-- for `Set.add(seen, [1, 2])`, whose `Hash` leaves `Hash` of the numeral.
 --
 -- When no container has every class, nothing is chosen. The literal is
 -- reported once, and its demand is absorbed, so that neither a later round
 -- nor the classes left open report it again.
-fun defaultArrayLiteral(s : Solver, c : PredCell, stuck : Vec PredCell) -> Bool {
+fun defaultArrayLiteral(s : Solver, c : PredCell, consulted : Vec PredCell) -> Bool {
     let t = Ty.prune(c.pred.args[0])
     let names = setNames(c.pred.args[1], c.span)
-    let classes = literalClasses(s, t, stuck)
-    let missing = []
+    let classes = literalClasses(s, t, consulted)
+    let rejections = []
     for n in Ty.literalOrder() {
         if Array.contains(names, n) {
             let candidate = memberType(c.pred, n)
-            match Iter.find(classes, fun(cls) = !hasInstance(s, cls, candidate)) {
+            match rejection(s, classes, candidate) {
                 None -> {
                     Ty.unify(t, candidate, c.span, c.context, families(s))
                     return True
                 }
-                Some(cls) -> Vec.push(missing, "'" + Ty.display(n) + "' has no '"
-                                               + Ty.shortName(cls) + "'")
+                Some(why) -> Vec.push(rejections, "'" + Ty.display(n) + "' " + why)
             }
         }
     }
@@ -3720,7 +3722,7 @@ fun defaultArrayLiteral(s : Solver, c : PredCell, stuck : Vec PredCell) -> Bool 
              + " and " + quoted[len(quoted) - 1]
     }
     Ty.typeError("no container this array literal could be has " + needed + ": "
-                 + String.join(Vec.toArray(missing), ", "), c.span)
+                 + String.join(Vec.toArray(rejections), ", "), c.span)
     c.pred = Ty.pred(oneOf, [TBottom, c.pred.args[1], c.pred.args[2]])
     False
 }
@@ -3733,11 +3735,13 @@ fun defaultArrayLiteral(s : Solver, c : PredCell, stuck : Vec PredCell) -> Bool 
 -- counts in the Report: `Show (Option t)` constrains `t` only through an
 -- instance, and is not consulted.
 --
--- The wanteds are the ones `stuck` holds and the inert ones that mention
--- `t`'s variables. Both are needed: generalization takes the predicates it
--- splits out of the inert sets before defaulting them (`split`), and the
--- outermost boundary hands over every open cell (`defaultOnce`).
-fun literalClasses(s : Solver, t : Ty.Type, stuck : Vec PredCell) -> Array String {
+-- The wanteds are those in `consulted` and the inert ones that mention `t`'s
+-- variables. Both are needed. Generalization takes every predicate it splits
+-- out of the inert sets, whether a scheme could carry it or not, and passes
+-- them all as `consulted` (`split`), so `Hash (c a)` in a function generic in
+-- `a` is found there and not among the inert. The outermost boundary passes
+-- every open cell (`defaultOnce`).
+fun literalClasses(s : Solver, t : Ty.Type, consulted : Vec PredCell) -> Array String {
     let seen = Set.new()
     let found = []
     let consider = fun(w : PredCell) {
@@ -3749,7 +3753,7 @@ fun literalClasses(s : Solver, t : Ty.Type, stuck : Vec PredCell) -> Array Strin
             Vec.push(found, name)
         }
     }
-    for w in stuck { consider(w) }
+    for w in consulted { consider(w) }
     for v in Ty.varsOf([t]) {
         for w in Map.getOr(s.watchers, v.id, []) {
             if resting(w) { consider(w) }
@@ -3758,10 +3762,37 @@ fun literalClasses(s : Solver, t : Ty.Type, stuck : Vec PredCell) -> Array Strin
     Vec.toArray(found)
 }
 
--- Returns whether an instance of `cls` matches `t`, without solving its
--- context.
-fun hasInstance(s : Solver, cls : String, t : Ty.Type) -> Bool =
-    Option.isSome(Classes.selectInstance(s.classes, Ty.pred(cls, [t])))
+-- Returns whether the residual `l` can never be discharged, whatever is
+-- decided later: an equality the solver found insoluble or a wanted that went
+-- too deep, or a class at a type whose head is a known constructor. Instances
+-- are chosen by the head, so a class wanted the solver left at such a type
+-- has no instance; `Hash (Array a)` stays unsolved whatever `a` becomes. One
+-- at a variable, a skolem or an associated type waits on what decides it.
+fun hopeless(s : Solver, l : Classes.Leftover) -> Bool {
+    if l.insoluble || l.diverged { return True }
+    if !Classes.isClass(s.classes, l.pred.name) || len(l.pred.args) == 0 { return False }
+    match Ty.spine(Ty.prune(l.pred.args[0])).0 {
+        TCon(con) -> con.uid == 0
+        TTuple(_) | TFun(_, _) -> True
+        _ -> False
+    }
+}
+
+-- Returns why `candidate` cannot be the container of a literal whose classes
+-- are `classes`, as a phrase after its name -- "has no 'Hash'", "needs
+-- 'Hash (fun(Int) -> Int)'" -- or `None` when it can. The group is solved
+-- with the candidate in place, and the residual judged as
+-- `defaultArrayLiteral` says.
+fun rejection(s : Solver, classes : Array String, candidate : Ty.Type) -> Option String {
+    let wanteds = Vec.fromArray(Array.map(classes, fun(cls) = Ty.pred(cls, [candidate])))
+    for l in simplifyDerived(s, Vec.new(1), wanteds, Vec.new(1)) {
+        if hopeless(s, l) {
+            if l.asked { return Some("has no '" + Ty.shortName(l.pred.name) + "'") }
+            return Some("needs '" + Ty.showPred(l.pred) + "'")
+        }
+    }
+    None
+}
 
 -- Solves each equality of `open` that is stuck only because a variable on
 -- one side is untouchable where it is, by binding that variable, and returns
@@ -3824,7 +3855,7 @@ fun defaultEqualities(s : Solver, open : Vec PredCell) -> Bool {
 fun decideTopLevelLiterals(s : Solver) -> Unit {
     solveWanteds(s)
     let open = Vec.filter(everywhere(s.here), fun(c) = isArrayLiteralDemand(c) && undecided(c))
-    if applyDefaults(s, open) { solveWanteds(s) }
+    if applyDefaults(s, open, open) { solveWanteds(s) }
 }
 
 -- Whether a `OneOf` demand's type is still open, which is when defaulting may

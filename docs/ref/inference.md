@@ -429,8 +429,11 @@ decides too, as in `let names : Vec String = []`, and so does a function's
 declared parameter or result type.
 
 A literal that nothing decides takes the first of `Array`, `Vec` and
-`FrozenArray` that has an instance of every class its uses need of it. Most
-need nothing an `Array` lacks, so most are arrays. A literal used as a `Set`
+`FrozenArray` that has an instance of every class its uses need of it. The
+order puts the plainest container first: an `Array` is fixed in length and a
+`Vec` adds growth, and a `FrozenArray` gives up writing, which only a use that
+needs `Hash` or `Ord` asks for. Most uses need nothing an `Array` lacks, so
+most literals are arrays. A literal used as a `Set`
 element or a `Map` key needs `Hash`, which only `FrozenArray` has, and one
 compared with `<` needs `Ord`, which only `FrozenArray` has too:
 
@@ -456,8 +459,12 @@ Only a class of the literal's own type counts: `Hash` in `Set.add(seen, [0,
 1])` is about the literal, but `Show` in `print(Some([1]))` is about the
 `Option`, and the literal is an `Array`. This is the Haskell 2010 Report's
 defaulting rule (section 4.3.4), which picks the first type in a default list
-that is an instance of all the ambiguous variable's classes. When no container
-has them all, the literal is rejected:
+that is an instance of all the ambiguous variable's classes, with the
+relaxations GHC's `ExtendedDefaultRules` makes: the classes need not be
+standard ones, and the literal may also be used in ways that are not a class,
+such as being indexed. A container whose instance needs something of the
+elements that they lack is passed over too. When no container has them all,
+the literal is rejected:
 
 <!-- error: no container this array literal could be has both 'SetIndex' and 'Hash': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
 ```kotlin
@@ -468,6 +475,11 @@ fun main() {
     costs[key] = 1
 }
 ```
+
+A function or a top-level `let` decides its literals from its own
+definition, before any use of it elsewhere is seen: `let key =
+[1, 2]` at the top level is an `Array`, and using it as a key is an error that
+suggests an annotation, `let key : FrozenArray Int = [1, 2]`.
 
 A key that changes cannot be found again, so build the key once it is final,
 with `FrozenArray.freeze(key)`.

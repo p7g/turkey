@@ -17,7 +17,7 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
@@ -283,6 +283,8 @@ class Mul a { fun mul(a, a) -> a }
 class Div a { fun div(a, a) -> a }
 class Rem a { fun rem(a, a) -> a }
 class Neg a { fun neg(a) -> a }
+class Zero a { fun zero() -> a }
+class One a { fun one() -> a }
 
 class Eq a {
     fun eq(a, a) -> Bool
@@ -345,14 +347,17 @@ The instances the library provides for built-in types:
 | `String` | yes | yes | yes | concatenation | no | no | yes |
 | tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
-| `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
+| `Array a`, `Vec a` | if the elements have it | if the elements have it | if the elements have it | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
 | `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | if the elements have it |
 | `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |
 
-Tuples compare lexicographically, and strings compare byte by byte. Two
+Tuples compare lexicographically, and strings compare byte by byte. Arrays and
+`Vec`s compare lexicographically too, and one that is a proper prefix of
+another is the lesser; both hash their length and then their elements. `Int`
+and `Float` have `Zero` and `One`, the identities of `+` and `*`. Two
 arrays are equal when they have the same length and equal elements at each
 index, and so are two `Vec`s or two `Deque`s, whatever their capacity. Two
 maps are equal when they have the same keys with equal values, and two `Set`s
@@ -672,6 +677,36 @@ True
 False
 2
 Some("pear")
+```
+
+`Iter.fold` threads an accumulator through the elements of any iterator in
+order. `Iter.sum` and `Iter.product` fold with `+` and `*` from `zero()`
+and `one()`, so they answer `0` and `1` for no elements. `Iter.minimum` and
+`Iter.maximum` answer the least and greatest element as an `Option`, and
+`Iter.minBy` and `Iter.maxBy` the element whose key is least or
+greatest; each calls the key function once per element. When several elements
+tie, all four answer the first.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let xs = [3, 1, 4, 1, 5]
+    print(Iter.sum(xs))
+    print(Iter.product(Int.range(1, 6)))
+    print(Iter.minimum(xs))
+    print(Iter.maximum(([] : Array Int)))
+    print(Iter.maxBy(["bb", "a", "cc"], String.byteLength))
+    print(Iter.fold(xs, "", fun(acc, x) = acc + Int.toString(x)))
+}
+```
+
+```text
+14
+120
+Some(1)
+None
+Some("bb")
+31415
 ```
 
 ## `Index`

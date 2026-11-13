@@ -113,10 +113,10 @@ names the library instead. The working directory is never searched, so a
 
 The compiler has two commands. `build` writes the program to `-o`, in the
 format the file's extension names -- a relocatable object for `.o`, assembly
-for `.s` -- or `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. `-f exe` writes an executable
-that runs as it is, with no assembler and no linker: a signed Mach-O on a
-Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
+for `.s` -- or `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard
+output. An object needs no assembler, only a linker. `-f exe` writes an
+executable that runs as it is, with no assembler and no linker: a signed
+Mach-O on a Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
 
 ```sh
 build/stages/stage2 build -f exe -o rectangles rectangles.gob

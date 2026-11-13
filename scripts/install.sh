@@ -26,7 +26,7 @@ fi
 # but nothing else: not a file, and not a link to some other tool.
 if [ -L "$link" ]; then
     case $(readlink "$link") in
-        */build/stages/*) ;;
+        */build/stages/stage2) ;;
         *)
             echo "install.sh: $link links to $(readlink "$link"), not a Turkey" \
                  "compiler; remove it first" >&2

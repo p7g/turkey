@@ -1,0 +1,279 @@
+export (
+    FrozenArray,
+    freeze,
+    toArray,
+    toVec,
+    filled,
+    init,
+    with,
+    at,
+    last,
+    slice,
+    append,
+    map,
+    filter,
+    fold,
+    reverse,
+    indexOf,
+    contains,
+    sortBy,
+    sort,
+)
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Text.Show (Show(..))
+import Debug (Debug(..))
+import Data.Hashable (Hash(..), Hasher(..))
+import Data.Functor (Functor(..))
+import Iter (Iterator(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Semigroup (Semigroup(..))
+import Data.Monoid (Monoid(..))
+import Data.Foldable (Foldable(..))
+import Data.Bool (Bool(..))
+import Data.Option (Option(..))
+import Data.Ordering (Ordering(..))
+import Data.Array (Array)
+import Data.Array as Array
+import Data.Vec (Vec)
+import Data.Vec as Vec
+import Turkey.Array (outOfBounds, sliceOutOfBounds, endedEarly, threeWay)
+import Turkey.Array as Storage
+
+-- An array that nobody can write: its length and its elements are fixed when
+-- it is made. Equal frozen arrays hash alike, so one can be a `Map` key or a
+-- `Set` element, which a mutable `Array` cannot.
+--
+-- Its one field is not exported, and no function here writes to storage it
+-- has wrapped, so module privacy is the whole guarantee. That holds only
+-- while every function that makes one wraps storage nothing else holds:
+-- `freeze` copies, because its caller keeps the source.
+--
+-- An array literal the program uses as a `FrozenArray` is built as this
+-- constructor applied to the literal's fresh storage, by name; renaming it
+-- means changing how the compiler lowers a literal in the same commit.
+type FrozenArray a = FrozenArray(Prim.Array a)
+
+fun raw(FrozenArray(storage)) = storage
+
+-- Returns a frozen copy of the elements of `xs`, in iteration order. Copies,
+-- so later writes to `xs` do not show. `xs` is anything with a length that
+-- can be iterated, such as an `Array`, a `Vec` or a `Deque`.
+fun freeze[Iterator c, Length c, Item c ~ a](xs : c) -> FrozenArray a {
+    let n = len(xs)
+    let out = Storage.uninitialized(n)
+    let cursor = iter(xs)
+    for var i = 0; i < n; i = i + 1 {
+        match next(xs, cursor) {
+            Some(x) -> { out[i] = x }
+            None -> endedEarly("FrozenArray.freeze", i, n)
+        }
+    }
+    FrozenArray(out)
+}
+
+-- Returns a new, writable `Array` of the same elements.
+fun toArray(xs : FrozenArray a) -> Array a {
+    let storage = raw(xs)
+    Array.ofStorage(Storage.copy(storage, len(storage)))
+}
+
+-- Returns a new `Vec` of the same elements.
+fun toVec(xs : FrozenArray a) -> Vec a = Vec.fromArray(toArray(xs))
+
+-- Returns a frozen array of `length` elements, each `value`.
+fun filled(length : Int, value : a) -> FrozenArray a = FrozenArray(Storage.filled(length, value))
+
+-- Returns a frozen array whose element `i` is `f(i)`, computed in order from 0.
+fun init(length : Int, f : fun(Int) -> a) -> FrozenArray a {
+    let out = Storage.uninitialized(length)
+    for var i = 0; i < length; i = i + 1 { out[i] = f(i) }
+    FrozenArray(out)
+}
+
+-- Returns a copy of `xs` with element `i` replaced by `x`. Copies once, so it
+-- is the way to make a neighbouring state: building an `Array` and freezing
+-- it copies twice. Panics unless `0 <= i < len(xs)`.
+fun with(xs : FrozenArray a, i : Int, x : a) -> FrozenArray a {
+    let storage = raw(xs)
+    if i < 0 || i >= len(storage) { outOfBounds("FrozenArray.with at", i, len(storage)) }
+    let out = Storage.copy(storage, len(storage))
+    out[i] = x
+    FrozenArray(out)
+}
+
+-- Returns `Some` of element `i`, or `None` when `i` is not an index of `xs`.
+fun at(xs : FrozenArray a, i : Int) -> Option a =
+    if i < 0 || i >= len(xs) { None } else { Some(raw(xs)[i]) }
+
+-- Returns `Some` of the last element, or `None` when `xs` is empty.
+fun last(xs : FrozenArray a) -> Option a = at(xs, len(xs) - 1)
+
+-- Returns the elements from index `from` up to but not including `to`.
+-- Panics unless `0 <= from <= to <= len(xs)`.
+fun slice(xs : FrozenArray a, from : Int, to : Int) -> FrozenArray a {
+    if from < 0 || to > len(xs) || from > to {
+        sliceOutOfBounds("FrozenArray.slice", from, to, len(xs))
+    }
+    let out = Storage.uninitialized(to - from)
+    Storage.move(out, 0, raw(xs), from, to - from)
+    FrozenArray(out)
+}
+
+-- Returns the elements of `xs` followed by those of `ys`.
+fun append(xs : FrozenArray a, ys : FrozenArray a) -> FrozenArray a {
+    let n = len(xs)
+    let m = len(ys)
+    let out = Storage.uninitialized(n + m)
+    Storage.move(out, 0, raw(xs), 0, n)
+    Storage.move(out, n, raw(ys), 0, m)
+    FrozenArray(out)
+}
+
+-- Returns `f` of each element, in order.
+fun map(xs : FrozenArray a, f : fun(a) -> b) -> FrozenArray b = init(len(xs), fun(i) = f(raw(xs)[i]))
+
+-- Returns the elements for which `keep` is true, in order. `keep` is called
+-- once per element, in order.
+fun filter(xs : FrozenArray a, keep : fun(a) -> Bool) -> FrozenArray a {
+    -- Count only at the end: the kept elements go into scratch storage as
+    -- long as `xs`, copied once to their number unless they are all of it.
+    let kept = Storage.uninitialized(len(xs))
+    var count = 0
+    for x in xs {
+        if keep(x) {
+            kept[count] = x
+            count = count + 1
+        }
+    }
+    if count == len(kept) { return FrozenArray(kept) }
+    FrozenArray(Storage.copy(kept, count))
+}
+
+-- Returns `step` applied to `initial` and each element in turn.
+fun fold(xs : FrozenArray a, initial : b, step : fun(b, a) -> b) -> b {
+    var acc = initial
+    for x in xs { acc = step(acc, x) }
+    acc
+}
+
+-- Returns the elements in reverse order.
+fun reverse(xs : FrozenArray a) -> FrozenArray a {
+    let n = len(xs)
+    init(n, fun(i) = raw(xs)[n - 1 - i])
+}
+
+-- Returns the index of the first element equal to `wanted`, or `None`.
+fun indexOf[Eq a](xs : FrozenArray a, wanted : a) -> Option Int {
+    let storage = raw(xs)
+    for var i = 0; i < len(storage); i = i + 1 {
+        if storage[i] == wanted { return Some(i) }
+    }
+    None
+}
+
+-- Returns whether some element equals `wanted`.
+fun contains[Eq a](xs : FrozenArray a, wanted : a) -> Bool = match indexOf(xs, wanted) {
+    Some(_) -> True
+    None -> False
+}
+
+-- Returns the elements sorted by `compare`. The sort is stable.
+fun sortBy(xs : FrozenArray a, compare : fun(a, a) -> Ordering) -> FrozenArray a {
+    let storage = raw(xs)
+    FrozenArray(Storage.sorted(storage, len(storage), compare))
+}
+
+-- Returns the elements in ascending order. The sort is stable.
+fun sort[Ord a](xs : FrozenArray a) -> FrozenArray a = sortBy(xs, threeWay)
+
+instance Index (FrozenArray a) {
+    type Key = Int
+    type Value = a
+    fun get(xs, i) {
+        let storage = raw(xs)
+        if i < 0 || i >= len(storage) {
+            outOfBounds("read at", i, len(storage))
+        }
+        storage[i]
+    }
+}
+
+instance Length (FrozenArray a) { fun len(xs) = len(raw(xs)) }
+
+type FrozenArrayCursor = FrozenArrayCursor { var at : Int }
+
+instance Iterator (FrozenArray a) {
+    type Item = a
+    type Cursor = FrozenArrayCursor
+    fun iter(xs) = FrozenArrayCursor { at = 0 }
+    fun next(xs, cur) {
+        let storage = raw(xs)
+        if cur.at >= len(storage) { return None }
+        let x = storage[cur.at]
+        cur.at = cur.at + 1
+        Some(x)
+    }
+}
+
+instance Add (FrozenArray a) { fun add(xs, ys) = append(xs, ys) }
+instance Semigroup (FrozenArray a) { fun combine(xs, ys) = append(xs, ys) }
+instance Monoid (FrozenArray a) { fun empty() = FrozenArray(Storage.uninitialized(0)) }
+
+instance Foldable FrozenArray {
+    fun foldMap[Monoid m](xs, f) {
+        var acc : m = empty()
+        for x in xs { acc = combine(acc, f(x)) }
+        acc
+    }
+}
+
+instance Functor FrozenArray { fun map(xs, f) = map(xs, f) }
+
+-- Equal when they have the same length and equal elements at each index.
+instance Eq (FrozenArray a) : Eq a {
+    fun eq(xs, ys) {
+        let left = raw(xs)
+        let right = raw(ys)
+        if len(left) != len(right) { return False }
+        for var i = 0; i < len(left); i = i + 1 {
+            if left[i] != right[i] { return False }
+        }
+        True
+    }
+}
+
+-- Lexicographic: the first unequal element decides, and a proper prefix is
+-- less than the longer array.
+instance Ord (FrozenArray a) : Ord a {
+    fun lt(xs, ys) {
+        let left = raw(xs)
+        let right = raw(ys)
+        let n = if len(left) < len(right) { len(left) } else { len(right) }
+        for var i = 0; i < n; i = i + 1 {
+            if left[i] != right[i] { return left[i] < right[i] }
+        }
+        len(left) < len(right)
+    }
+}
+
+-- The length, then each element in order. The length goes first so that
+-- nested arrays split into parts differently hash differently: `[[1], [2, 3]]`
+-- and `[[1, 2], [3]]` feed different words.
+instance Hash (FrozenArray a) : Hash a {
+    fun hashInto(xs, h) {
+        let storage = raw(xs)
+        var state = hashInt(h, len(storage))
+        for var i = 0; i < len(storage); i = i + 1 { state = hashInto(storage[i], state) }
+        state
+    }
+}
+
+-- Its elements, as the array literal that builds it.
+instance Debug (FrozenArray a) : Debug a { fun debug(xs) = debug(raw(xs)) }
+
+instance Show (FrozenArray a) : Debug a { fun show(xs) = debug(xs) }

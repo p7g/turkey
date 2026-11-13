@@ -3,60 +3,60 @@ export (
     buffers, outbox, release, requestHead, responseHead, hostField, bodyWriter, finish, finishWith,
 )
 
--- The writing side of HTTP/1: heads written from the HTTP values, and a body
--- writer that frames what a program writes.
---
--- **The reserved fields come from the framing and the request alone.**
--- `Host` is the URL's authority; Content-Length and Transfer-Encoding are the
--- framing's; Connection, Expect and Upgrade are the head's own fields. None
--- can come from `Headers`, which cannot hold them, so one message cannot be
--- framed two ways.
---
--- **Outgoing values are as valid as incoming ones.** Every byte written is
--- from a value whose type checked it when it was made: a `HeaderName` is a
--- token, a `HeaderValue` has no CR, LF, NUL or other control byte, a method's
--- name is a token, a status's reason is a constant. The request target and
--- `Host` come from an `HTTPURL`, and are checked again here, byte by byte,
--- against the bytes a request line can hold.
---
--- **One buffer per busy connection.** HTTP/1 runs one exchange at a time on
--- a connection, so everything the connection writes goes through one
--- buffer, its `Outbox`'s, lent to each exchange in turn: the heads, and the
--- bytes a body writer holds back. The outbox takes a buffer from a pool its
--- connections share (`Buffers`) when an exchange writes its first head, and
--- `release` gives it back when the exchange ends, so a connection waiting
--- for its next request holds none. A head too large for the buffer moves to
--- a larger one of its exchange's own, which is dropped at `release`.
---
--- **The head goes out with the first body bytes,** in one write. The body
--- writer copies as much of the first write as fits after the head, sends
--- both, and sends the rest of that write straight from where it is; a
--- write with nothing held back before it goes out uncopied. A connection
--- without Nagle's algorithm sends each write at once, so a head written
--- alone would be a packet of its own.
---
--- **A writer is valid only during its exchange.** A body writer can be kept
--- past its exchange's end, as a `Stream.Sink` handed to another task can,
--- and by then the buffer it wrote into may be lent to another connection.
--- So each exchange is a turn of the outbox's, and `release` ends it: every
--- later write, flush or finish of a writer made in that turn fails with
--- `Transport`, holding an `IOError` of kind `Closed`, and touches no buffer.
--- A writer that is inside a write when the turn ends keeps the buffer:
--- `release` gives it to no one, and the next exchange takes another.
---
--- **A body is written exactly as its framing declared.**
---
--- * `ContentLength(n)`: writing past `n` bytes is `Overrun`, and finishing
---   short of them is `Truncated`. Nothing past `n` is sent.
--- * `Chunked`: each write is a chunk; `finish` writes the last chunk and any
---   trailers. A chunk's closing CRLF is held back and goes out with the next
---   chunk's size line, so a chunk is one write.
--- * `UntilClose`: written as it comes; the connection's close ends it.
--- * `NoBody`: any byte written is `Overrun`.
---
--- Either refusal leaves the message unfinishable, so every later write fails
--- too, and the connection must be closed: the peer has seen a head that
--- promised more than it will get.
+--- The writing side of HTTP/1: heads written from the HTTP values, and a body
+--- writer that frames what a program writes.
+---
+--- **The reserved fields come from the framing and the request alone.**
+--- `Host` is the URL's authority; Content-Length and Transfer-Encoding are the
+--- framing's; Connection, Expect and Upgrade are the head's own fields. None
+--- can come from `Headers`, which cannot hold them, so one message cannot be
+--- framed two ways.
+---
+--- **Outgoing values are as valid as incoming ones.** Every byte written is
+--- from a value whose type checked it when it was made: a `HeaderName` is a
+--- token, a `HeaderValue` has no CR, LF, NUL or other control byte, a method's
+--- name is a token, a status's reason is a constant. The request target and
+--- `Host` come from an `HTTPURL`, and are checked again here, byte by byte,
+--- against the bytes a request line can hold.
+---
+--- **One buffer per busy connection.** HTTP/1 runs one exchange at a time on
+--- a connection, so everything the connection writes goes through one
+--- buffer, its `Outbox`'s, lent to each exchange in turn: the heads, and the
+--- bytes a body writer holds back. The outbox takes a buffer from a pool its
+--- connections share (`Buffers`) when an exchange writes its first head, and
+--- `release` gives it back when the exchange ends, so a connection waiting
+--- for its next request holds none. A head too large for the buffer moves to
+--- a larger one of its exchange's own, which is dropped at `release`.
+---
+--- **The head goes out with the first body bytes,** in one write. The body
+--- writer copies as much of the first write as fits after the head, sends
+--- both, and sends the rest of that write straight from where it is; a
+--- write with nothing held back before it goes out uncopied. A connection
+--- without Nagle's algorithm sends each write at once, so a head written
+--- alone would be a packet of its own.
+---
+--- **A writer is valid only during its exchange.** A body writer can be kept
+--- past its exchange's end, as a `Stream.Sink` handed to another task can,
+--- and by then the buffer it wrote into may be lent to another connection.
+--- So each exchange is a turn of the outbox's, and `release` ends it: every
+--- later write, flush or finish of a writer made in that turn fails with
+--- `Transport`, holding an `IOError` of kind `Closed`, and touches no buffer.
+--- A writer that is inside a write when the turn ends keeps the buffer:
+--- `release` gives it to no one, and the next exchange takes another.
+---
+--- **A body is written exactly as its framing declared.**
+---
+--- * `ContentLength(n)`: writing past `n` bytes is `Overrun`, and finishing
+---   short of them is `Truncated`. Nothing past `n` is sent.
+--- * `Chunked`: each write is a chunk; `finish` writes the last chunk and any
+---   trailers. A chunk's closing CRLF is held back and goes out with the next
+---   chunk's size line, so a chunk is one write.
+--- * `UntilClose`: written as it comes; the connection's close ends it.
+--- * `NoBody`: any byte written is `Overrun`.
+---
+--- Either refusal leaves the message unfinishable, so every later write fails
+--- too, and the connection must be closed: the peer has seen a head that
+--- promised more than it will get.
 
 import Net.HTTP.Error (HTTPError(..))
 import Net.HTTP.H1.Classes (targetChar)
@@ -78,12 +78,12 @@ import Turkey.Workers as Workers
 import URL (URLError(..))
 import Turkey.String (bytesOf)
 
--- A request head to write. `framing` must not be `UntilClose`, which only a
--- response can be framed by. A request whose method has a body, and whose
--- body is empty, is `ContentLength(0)`, not `NoBody` (RFC 9110 §8.6).
---
--- `upgrade`, when it is not empty, is written as `Upgrade`, in order, with
--- `Connection: upgrade`.
+--- A request head to write. `framing` must not be `UntilClose`, which only a
+--- response can be framed by. A request whose method has a body, and whose
+--- body is empty, is `ContentLength(0)`, not `NoBody` (RFC 9110 §8.6).
+---
+--- `upgrade`, when it is not empty, is written as `Upgrade`, in order, with
+--- `Connection: upgrade`.
 type OutgoingRequest b = OutgoingRequest {
     method : Method b,
     url : HTTPURL,
@@ -94,11 +94,11 @@ type OutgoingRequest b = OutgoingRequest {
     upgrade : Array Token,
 }
 
--- A response head to write. A 1xx or 204 response must be `NoBody`, and a
--- 304 must not be `Chunked`. A response to HEAD gives the framing a GET
--- would have had, and its body writer is made with `NoBody`.
---
--- `upgrade`, for a 101, is written as `Upgrade` with `Connection: upgrade`.
+--- A response head to write. A 1xx or 204 response must be `NoBody`, and a
+--- 304 must not be `Chunked`. A response to HEAD gives the framing a GET
+--- would have had, and its body writer is made with `NoBody`.
+---
+--- `upgrade`, for a 101, is written as `Upgrade` with `Connection: upgrade`.
 type OutgoingResponse = OutgoingResponse {
     status : Status,
     headers : Headers,
@@ -109,20 +109,20 @@ type OutgoingResponse = OutgoingResponse {
 
 -- -- buffers -------------------------------------------------------------------------
 
--- Output buffers no connection is using. Taking and giving back take no lock.
--- The pool keeps at most `max(1, keep / Turkey.Workers.permits())` buffers
--- for each thread that has given one back. That is about `keep` while only
--- the permit holders run tasks, and more once a task blocked in a C call has
--- had its permit handed to a spare thread, up to
--- `Turkey.Workers.threadLimit()` threads.
---
--- Keep a list for each thread (`Turkey.Workers.index`), which only the task
--- running on that thread touches: a task does not suspend between reading the
--- thread's index and touching its list, so no other task runs on that thread
--- meanwhile. A buffer taken on one thread may go back on another.
+--- Output buffers no connection is using. Taking and giving back take no lock.
+--- The pool keeps at most `max(1, keep / Turkey.Workers.permits())` buffers
+--- for each thread that has given one back. That is about `keep` while only
+--- the permit holders run tasks, and more once a task blocked in a C call has
+--- had its permit handed to a spare thread, up to
+--- `Turkey.Workers.threadLimit()` threads.
+---
+--- Keep a list for each thread (`Turkey.Workers.index`), which only the task
+--- running on that thread touches: a task does not suspend between reading the
+--- thread's index and touching its list, so no other task runs on that thread
+--- meanwhile. A buffer taken on one thread may go back on another.
 type Buffers = Buffers { free : Array (Option (Vec Buffer)), keep : Int }
 
--- Returns an empty pool that keeps about `keep` buffers (`Buffers`).
+--- Returns an empty pool that keeps about `keep` buffers (`Buffers`).
 fun buffers(keep : Int) -> Buffers =
     Buffers { free = Array.filled(Workers.threadLimit(), None), keep }
 
@@ -139,10 +139,10 @@ fun mine(p : Buffers) -> Vec Buffer {
 -- the first few KiB of its body.
 let size = 4096
 
--- A connection's output: the buffer lent to its exchange, while it has one,
--- and the exchange's turn.
--- It holds a message's raw bytes, which may carry credentials, so `!Debug`
--- keeps them out of a derived `Debug`.
+--- A connection's output: the buffer lent to its exchange, while it has one,
+--- and the exchange's turn.
+--- It holds a message's raw bytes, which may carry credentials, so `!Debug`
+--- keeps them out of a derived `Debug`.
 type Outbox : !Debug = Outbox {
     pool : Buffers,
     var lent : Option Buffer,
@@ -153,13 +153,13 @@ type Outbox : !Debug = Outbox {
     turn : AtomicInt,
 }
 
--- Returns an outbox holding no buffer, which takes one from `pool` when it
--- has a head to write.
+--- Returns an outbox holding no buffer, which takes one from `pool` when it
+--- has a head to write.
 fun outbox(pool : Buffers) -> Outbox = Outbox { pool, lent = None, turn = Sync.atomicInt(0) }
 
--- Ends the outbox's exchange, so that every body writer made for it fails
--- from now on, and gives its buffer back to the pool. Bytes a writer held
--- back are dropped.
+--- Ends the outbox's exchange, so that every body writer made for it fails
+--- from now on, and gives its buffer back to the pool. Bytes a writer held
+--- back are dropped.
 fun release(o : Outbox) -> Unit {
     loop {
         let t = Sync.load(o.turn)
@@ -207,14 +207,14 @@ fun keep(o : Outbox, out : Writer) -> Unit = if out.grown { o.lent = Some(out.bu
 
 -- -- heads -----------------------------------------------------------------------------
 
--- Returns the value a request head's `Host` has for `u`: its host as
--- written, lowercase, and the port if the URL gave one.
+--- Returns the value a request head's `Host` has for `u`: its host as
+--- written, lowercase, and the port if the URL gave one.
 fun hostField(u : HTTPURL) -> String = HTTPURL.authority(u)
 
--- Writes the request head into `o`'s buffer, for `bodyWriter` to send, or
--- returns `BadURL`, and writes nothing, if the URL's target or authority
--- holds a byte a request line cannot. Discards what the buffer held, so a
--- writer of this exchange must not have bytes held back.
+--- Writes the request head into `o`'s buffer, for `bodyWriter` to send, or
+--- returns `BadURL`, and writes nothing, if the URL's target or authority
+--- holds a byte a request line cannot. Discards what the buffer held, so a
+--- writer of this exchange must not have bytes held back.
 fun requestHead(o : Outbox, r : OutgoingRequest b) -> Either HTTPError Unit {
     let target = HTTPURL.target(r.url)
     let authority = hostField(r.url)
@@ -244,9 +244,9 @@ fun requestHead(o : Outbox, r : OutgoingRequest b) -> Either HTTPError Unit {
     Right(())
 }
 
--- Writes the response head into `o`'s buffer, for `bodyWriter` to send.
--- Panics if the framing is one the status cannot have. Discards what the
--- buffer held, so a writer of this exchange must not have bytes held back.
+--- Writes the response head into `o`'s buffer, for `bodyWriter` to send.
+--- Panics if the framing is one the status cannot have. Discards what the
+--- buffer held, so a writer of this exchange must not have bytes held back.
 fun responseHead(o : Outbox, r : OutgoingResponse) -> Unit {
     let code = Status.code(r.status)
     let bodiless = code / 100 == 1 || code == 204
@@ -367,9 +367,9 @@ type State =
     | Done
     | Broken(HTTPError)
 
--- Returns a writer of a body framed by `framing`, which sends the head that
--- `requestHead` or `responseHead` wrote into `o` before it. The writer is
--- valid until `release(o)`.
+--- Returns a writer of a body framed by `framing`, which sends the head that
+--- `requestHead` or `responseHead` wrote into `o` before it. The writer is
+--- valid until `release(o)`.
 fun bodyWriter(sink : w, o : Outbox, framing : Framing) -> BodyWriter w {
     let state = match framing {
         ContentLength(n) -> Sending(n)
@@ -495,16 +495,16 @@ fun hex(b : Buffer, n : Int) -> Unit {
 
 let hexDigits = String.toBytes("0123456789abcdef")
 
--- Ends the body: the last chunk of a chunked one, the head of a bodiless
--- one, and whatever else is pending, then flushes the sink. `Truncated` if a
--- declared length was not reached. Finishing twice does nothing more.
+--- Ends the body: the last chunk of a chunked one, the head of a bodiless
+--- one, and whatever else is pending, then flushes the sink. `Truncated` if a
+--- declared length was not reached. Finishing twice does nothing more.
 fun finish[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit =
     finishWith(bw, Headers.empty)
 
--- Ends a chunked body with `trailers` after its last chunk, as `finish`
--- does. `UnframedTrailers` if the body is not chunked and `trailers` holds
--- any field: only a chunked body has anywhere to put them. The message is
--- then left unfinished, as after any other refusal.
+--- Ends a chunked body with `trailers` after its last chunk, as `finish`
+--- does. `UnframedTrailers` if the body is not chunked and `trailers` holds
+--- any field: only a chunked body has anywhere to put them. The message is
+--- then left unfinished, as after any other refusal.
 fun finishWith[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecError (WriteError w)) Unit {
     if !enter(bw) { return Left(ended("BodyWriter.finish")) }
     let r = finishIn(bw, trailers)

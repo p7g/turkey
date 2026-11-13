@@ -3,28 +3,28 @@ export (
     body, beforeFirstRead, declaredLength, isEnded, trailers, drain, incoming,
 )
 
--- An HTTP/1 message body as a `Read`: the bytes after a head, decoded from
--- their framing, ending exactly where the message ends, so that what follows
--- is the next message.
---
--- * `ContentLength(n)`: `n` bytes. A stream that ends first is `Truncated`.
--- * `Chunked`: chunks, each `chunk-size [ chunk-ext ] CRLF data CRLF`, then
---   the last chunk and the trailers.
--- * `UntilClose`: everything until the stream ends.
--- * `NoBody`: nothing.
---
--- **A chunk is read as strictly as a head.** The size is hex digits only (no
--- `+`, `-`, `0x` or whitespace), at most 16 of them, and overflow-checked.
--- The whole chunk-size line, extensions included, is at most
--- `chunkLineBytes`, which bounds the bytes a peer can send that no reader
--- looks at. Extensions must be well-formed, though their meaning is ignored.
--- The data must be followed by exactly CRLF. The trailers are field lines as
--- a head's are, at most `trailerBytes` of them, and may not hold a reserved
--- field. Any of these refused is a `BadMessage`, and the body fails from
--- then on: its framing is lost, so the connection cannot be reused.
---
--- **The limit a program reads under** is `Net.HTTP.Incoming`'s, applied to
--- what this reader returns; `incoming` wraps a body as one.
+--- An HTTP/1 message body as a `Read`: the bytes after a head, decoded from
+--- their framing, ending exactly where the message ends, so that what follows
+--- is the next message.
+---
+--- * `ContentLength(n)`: `n` bytes. A stream that ends first is `Truncated`.
+--- * `Chunked`: chunks, each `chunk-size [ chunk-ext ] CRLF data CRLF`, then
+---   the last chunk and the trailers.
+--- * `UntilClose`: everything until the stream ends.
+--- * `NoBody`: nothing.
+---
+--- **A chunk is read as strictly as a head.** The size is hex digits only (no
+--- `+`, `-`, `0x` or whitespace), at most 16 of them, and overflow-checked.
+--- The whole chunk-size line, extensions included, is at most
+--- `chunkLineBytes`, which bounds the bytes a peer can send that no reader
+--- looks at. Extensions must be well-formed, though their meaning is ignored.
+--- The data must be followed by exactly CRLF. The trailers are field lines as
+--- a head's are, at most `trailerBytes` of them, and may not hold a reserved
+--- field. Any of these refused is a `BadMessage`, and the body fails from
+--- then on: its framing is lost, so the connection cannot be reused.
+---
+--- **The limit a program reads under** is `Net.HTTP.Incoming`'s, applied to
+--- what this reader returns; `incoming` wraps a body as one.
 
 import Net.HTTP.Error (HTTPError(..), Refusal(..))
 import Net.HTTP.H1.Classes (..)
@@ -62,7 +62,7 @@ type State =
     | Ended
     | Failed(HTTPError)
 
--- Returns the body framed by `framing` that starts at what `input` holds.
+--- Returns the body framed by `framing` that starts at what `input` holds.
 fun body(input : Input r, framing : Framing, limits : Limits) -> Body r {
     let (state, declared) = match framing {
         ContentLength(0) -> (Ended, Some(0))
@@ -74,30 +74,30 @@ fun body(input : Input r, framing : Framing, limits : Limits) -> Body r {
     Body { input, limits, declared, state, hook = None, trailerFields = Headers.empty }
 }
 
--- Makes `hook` run once, just before the body's first read from the stream,
--- and fail that read if it fails.
---
--- This is the seam for `100 Continue`. A client that sent
--- `Expect: 100-continue` waits for it before sending the body, so the server
--- sets a hook that writes it. `Net.HTTP.Incoming` checks a declared length
--- against the program's limit before it reads at all, so a body refused as
--- too large never runs the hook, and the client is refused before it sends
--- a byte.
+--- Makes `hook` run once, just before the body's first read from the stream,
+--- and fail that read if it fails.
+---
+--- This is the seam for `100 Continue`. A client that sent
+--- `Expect: 100-continue` waits for it before sending the body, so the server
+--- sets a hook that writes it. `Net.HTTP.Incoming` checks a declared length
+--- against the program's limit before it reads at all, so a body refused as
+--- too large never runs the hook, and the client is refused before it sends
+--- a byte.
 fun beforeFirstRead(b : Body r, hook : fun() -> Either HTTPError Unit) -> Unit {
     if !isEnded(b) { b.hook = Some(hook) }
 }
 
--- Returns the body's length if its framing declared one.
+--- Returns the body's length if its framing declared one.
 fun declaredLength(b : Body r) -> Option Int = b.declared
 
--- Whether the body has been read to its end.
+--- Whether the body has been read to its end.
 fun isEnded(b : Body r) -> Bool = match b.state {
     Ended -> True
     _ -> False
 }
 
--- Returns the trailers of a chunked body that has been read to its end, and
--- no fields for any other.
+--- Returns the trailers of a chunked body that has been read to its end, and
+--- no fields for any other.
 fun trailers(b : Body r) -> Headers = b.trailerFields
 
 instance Read (Body r) : Read r {
@@ -264,30 +264,30 @@ fun readTrailers[Read r](b : Body r) -> Either (CodecError (ReadError r)) (Eithe
 
 -- -- unread bodies ---------------------------------------------------------------------
 
--- Whether a connection can carry another message once this body is behind
--- it: `Reusable` when the body has been read to its end, `MustClose` when it
--- cannot be, or not cheaply enough.
+--- Whether a connection can carry another message once this body is behind
+--- it: `Reusable` when the body has been read to its end, `MustClose` when it
+--- cannot be, or not cheaply enough.
 type Drained = Reusable | MustClose
 
--- Reads and discards what is left of `b`, if that is cheap, and returns
--- whether the connection can be reused. RFC 9112 §9.3: a server must read a
--- whole body or close the connection, or the rest is read as the next
--- message; a client reusing a pooled connection is in the same place.
---
--- * Read to its end already: `Reusable`.
--- * A declared remainder: discarded if it is at most `drainBytes`, else
---   `MustClose` at once, without reading. Skipping gigabytes to save one
---   handshake is a bad trade.
--- * Chunked: discarded until it ends, or until `drainBytes` have been, and
---   then `MustClose`.
--- * Until the stream closes: `MustClose`.
--- * A body whose first-read hook has not run: `MustClose`. That is a client
---   still waiting for `100 Continue`, which may never send the body, or may
---   send it later, after the next message has been looked for.
--- * A body that already failed: `MustClose`.
---
--- The server and the client both end a message with this, and close the
--- connection, staged as they see fit, on `MustClose` or on an error.
+--- Reads and discards what is left of `b`, if that is cheap, and returns
+--- whether the connection can be reused. RFC 9112 §9.3: a server must read a
+--- whole body or close the connection, or the rest is read as the next
+--- message; a client reusing a pooled connection is in the same place.
+---
+--- * Read to its end already: `Reusable`.
+--- * A declared remainder: discarded if it is at most `drainBytes`, else
+---   `MustClose` at once, without reading. Skipping gigabytes to save one
+---   handshake is a bad trade.
+--- * Chunked: discarded until it ends, or until `drainBytes` have been, and
+---   then `MustClose`.
+--- * Until the stream closes: `MustClose`.
+--- * A body whose first-read hook has not run: `MustClose`. That is a client
+---   still waiting for `100 Continue`, which may never send the body, or may
+---   send it later, after the next message has been looked for.
+--- * A body that already failed: `MustClose`.
+---
+--- The server and the client both end a message with this, and close the
+--- connection, staged as they see fit, on `MustClose` or on an error.
 fun drain[Read r](b : Body r) -> Either (CodecError (ReadError r)) Drained {
     if isEnded(b) { return Right(Reusable) }
     if Option.isSome(b.hook) { return Right(MustClose) }
@@ -308,8 +308,8 @@ fun drain[Read r](b : Body r) -> Either (CodecError (ReadError r)) Drained {
     Right(MustClose)
 }
 
--- Returns `b` as the `Incoming` a program reads, with the stream's errors
--- made `HTTPError`s by `lift`.
+--- Returns `b` as the `Incoming` a program reads, with the stream's errors
+--- made `HTTPError`s by `lift`.
 fun incoming[Read r](b : Body r, lift : fun(ReadError r) -> SomeError) -> Incoming =
     Incoming.incoming(IO.anyRead(b, fun(e) = match e {
         Left(h) -> h

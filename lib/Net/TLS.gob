@@ -7,89 +7,89 @@ export (
     Acceptor, acceptor, accept, closeListener,
 )
 
--- TLS over any connection: a client that verifies the server it reaches, a
--- server that presents a certificate chosen by the name the client asks for,
--- and a `TLS` connection that is read and written like the one under it.
---
---     let roots = TLS.clientConfig(TLS.SystemRoots, ["http/1.1"])?
---     let d = Net.resolve("example.com", 443, Net.publicInternet, Duration.seconds(10))?
---     let s = TCP.connect(d, Duration.seconds(10))?
---     let t = TLS.client(s, d, roots, Duration.seconds(10))?
---     IO.writeText(t, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")?
---
--- **Linking.** The protocol is OpenSSL 3's, and a program that imports this
--- module links with `-lssl -lcrypto`. On macOS that is Homebrew's
--- `openssl@3`, with `-L$(brew --prefix openssl@3)/lib`: the system's
--- `/usr/lib/libcrypto.dylib` ends a process that loads it.
---
--- **OpenSSL never sees a descriptor.** It reads the peer's bytes from a
--- buffer this module fills from the connection underneath, and writes the
--- bytes to send into another, which this module writes to the connection.
--- So a wait for the network parks the task, as on a plain socket, and TLS
--- is a layer over any `Net.Connection` whose errors are `IOError`s. A `TLS`
--- is itself a `Net.Connection`.
---
--- **The client always verifies.** The server's chain must lead to a trusted
--- root, its certificate must be valid now, and it must name the host the
--- `Destination` was resolved from. There is no setting that turns any of it
--- off. A test against a certificate of its own makes its own CA a root
--- (`RootsFile`). The name is sent as SNI, and checked against the
--- certificate, without its trailing dot (RFC 6066 forbids the dot in SNI,
--- and certificates are written without it). An IP address is checked
--- against the certificate's IP addresses, and sent as no SNI at all.
---
--- **The trusted roots (`SystemRoots`)** are OpenSSL's defaults: the files
--- `$SSL_CERT_FILE` and `$SSL_CERT_DIR` name if they are set, and otherwise
--- the `cert.pem` and `certs/` of the directory OpenSSL was built for. On
--- Linux that is the distribution's bundle (`/etc/ssl/certs` on Debian). On
--- macOS it is Homebrew's `etc/openssl@3/cert.pem`, which Homebrew's
--- `ca-certificates` builds from the system keychains: the roots in
--- `SystemRootCertificates.keychain` and `System.keychain` that pass
--- `security verify-cert`, as of when it was installed. That is used rather
--- than reading the keychain at run time, which would need the Security
--- framework, a second library beyond libSystem, for each process, to get the
--- same roots. What it costs: a root added to the keychain later (by device
--- management, say) is trusted only after `brew postinstall ca-certificates`.
---
--- **Versions.** TLS 1.2 and 1.3, as OpenSSL negotiates them. Renegotiation is
--- refused.
---
--- **ALPN.** Each side lists the protocols it speaks (`"http/1.1"`), and
--- `protocol` returns the one the handshake chose. A server picks the first of
--- its own list that the client offers too, and with none in common the
--- handshake fails, as RFC 7301 asks. Either side may list none.
---
--- **The server** holds one or more certificates, each a chain and its key.
--- The client's SNI picks the first whose certificate names the host, by
--- RFC 6125's rules, wildcards included; a client that sends no name, or one
--- no certificate names, gets the first. `server` and `accept` make the
--- connection without waiting: its handshake runs inside its first read or
--- write, bounded by its deadline, so a slow client holds up only its own
--- task. `handshake` runs it first, under a limit of its own.
---
--- **Errors.** A failure of the connection underneath is `Stream` with its
--- `IOError`, `TimedOut` and `Closed` among them. A certificate the client
--- refuses is `Untrusted`, `Expired`, `NotYetValid`, `WrongHost` or
--- `BadCertificate`; anything else the protocol fails with, an alert from the
--- peer included, is `Refused` with OpenSSL's reason. A handshake that fails
--- fails for good: every later read and write fails with the same error.
---
--- **A connection that ends without the peer's close_notify is `Truncated`,**
--- not an end of input. The peer said nothing about whether it meant to stop
--- there, and an attacker who can cut a connection can choose where. A read
--- returns 0 only after a close_notify, which `shutdownWrite` sends.
---
--- **Sharing.** As with a TCP socket, any number of tasks may hold a `TLS`:
--- reads take turns with reads, writes with writes, and a read and a write run
--- at once. Ciphertext reaches the connection in the order OpenSSL made it,
--- whichever task made it.
---
--- **Closing** closes the connection underneath, so a read or write parked on
--- it ends with `Stream` of `Closed`, as does every later one. The OpenSSL
--- connection is freed once the last operation using it has returned. A
--- configuration is freed by `releaseClient` or `releaseServer`; a connection
--- made from it keeps what it needs, so releasing one while its connections
--- run is safe.
+--- TLS over any connection: a client that verifies the server it reaches, a
+--- server that presents a certificate chosen by the name the client asks for,
+--- and a `TLS` connection that is read and written like the one under it.
+---
+---     let roots = TLS.clientConfig(TLS.SystemRoots, ["http/1.1"])?
+---     let d = Net.resolve("example.com", 443, Net.publicInternet, Duration.seconds(10))?
+---     let s = TCP.connect(d, Duration.seconds(10))?
+---     let t = TLS.client(s, d, roots, Duration.seconds(10))?
+---     IO.writeText(t, "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")?
+---
+--- **Linking.** The protocol is OpenSSL 3's, and a program that imports this
+--- module links with `-lssl -lcrypto`. On macOS that is Homebrew's
+--- `openssl@3`, with `-L$(brew --prefix openssl@3)/lib`: the system's
+--- `/usr/lib/libcrypto.dylib` ends a process that loads it.
+---
+--- **OpenSSL never sees a descriptor.** It reads the peer's bytes from a
+--- buffer this module fills from the connection underneath, and writes the
+--- bytes to send into another, which this module writes to the connection.
+--- So a wait for the network parks the task, as on a plain socket, and TLS
+--- is a layer over any `Net.Connection` whose errors are `IOError`s. A `TLS`
+--- is itself a `Net.Connection`.
+---
+--- **The client always verifies.** The server's chain must lead to a trusted
+--- root, its certificate must be valid now, and it must name the host the
+--- `Destination` was resolved from. There is no setting that turns any of it
+--- off. A test against a certificate of its own makes its own CA a root
+--- (`RootsFile`). The name is sent as SNI, and checked against the
+--- certificate, without its trailing dot (RFC 6066 forbids the dot in SNI,
+--- and certificates are written without it). An IP address is checked
+--- against the certificate's IP addresses, and sent as no SNI at all.
+---
+--- **The trusted roots (`SystemRoots`)** are OpenSSL's defaults: the files
+--- `$SSL_CERT_FILE` and `$SSL_CERT_DIR` name if they are set, and otherwise
+--- the `cert.pem` and `certs/` of the directory OpenSSL was built for. On
+--- Linux that is the distribution's bundle (`/etc/ssl/certs` on Debian). On
+--- macOS it is Homebrew's `etc/openssl@3/cert.pem`, which Homebrew's
+--- `ca-certificates` builds from the system keychains: the roots in
+--- `SystemRootCertificates.keychain` and `System.keychain` that pass
+--- `security verify-cert`, as of when it was installed. That is used rather
+--- than reading the keychain at run time, which would need the Security
+--- framework, a second library beyond libSystem, for each process, to get the
+--- same roots. What it costs: a root added to the keychain later (by device
+--- management, say) is trusted only after `brew postinstall ca-certificates`.
+---
+--- **Versions.** TLS 1.2 and 1.3, as OpenSSL negotiates them. Renegotiation is
+--- refused.
+---
+--- **ALPN.** Each side lists the protocols it speaks (`"http/1.1"`), and
+--- `protocol` returns the one the handshake chose. A server picks the first of
+--- its own list that the client offers too, and with none in common the
+--- handshake fails, as RFC 7301 asks. Either side may list none.
+---
+--- **The server** holds one or more certificates, each a chain and its key.
+--- The client's SNI picks the first whose certificate names the host, by
+--- RFC 6125's rules, wildcards included; a client that sends no name, or one
+--- no certificate names, gets the first. `server` and `accept` make the
+--- connection without waiting: its handshake runs inside its first read or
+--- write, bounded by its deadline, so a slow client holds up only its own
+--- task. `handshake` runs it first, under a limit of its own.
+---
+--- **Errors.** A failure of the connection underneath is `Stream` with its
+--- `IOError`, `TimedOut` and `Closed` among them. A certificate the client
+--- refuses is `Untrusted`, `Expired`, `NotYetValid`, `WrongHost` or
+--- `BadCertificate`; anything else the protocol fails with, an alert from the
+--- peer included, is `Refused` with OpenSSL's reason. A handshake that fails
+--- fails for good: every later read and write fails with the same error.
+---
+--- **A connection that ends without the peer's close_notify is `Truncated`,**
+--- not an end of input. The peer said nothing about whether it meant to stop
+--- there, and an attacker who can cut a connection can choose where. A read
+--- returns 0 only after a close_notify, which `shutdownWrite` sends.
+---
+--- **Sharing.** As with a TCP socket, any number of tasks may hold a `TLS`:
+--- reads take turns with reads, writes with writes, and a read and a write run
+--- at once. Ciphertext reaches the connection in the order OpenSSL made it,
+--- whichever task made it.
+---
+--- **Closing** closes the connection underneath, so a read or write parked on
+--- it ends with `Stream` of `Closed`, as does every later one. The OpenSSL
+--- connection is freed once the last operation using it has returned. A
+--- configuration is freed by `releaseClient` or `releaseServer`; a connection
+--- made from it keeps what it needs, so releasing one while its connections
+--- run is safe.
 
 import Net (Connection(..), HasConnectionInfo(..), ConnectionInfo(..), TLSInfo(..), accept, closeListener)
 import Net as Net
@@ -118,28 +118,28 @@ import Turkey.TLSCallbacks as Callbacks
 
 -- -- errors ---------------------------------------------------------------------------
 
--- What a TLS operation fails with. See the module comment.
+--- What a TLS operation fails with. See the module comment.
 type TLSError
-    -- The connection underneath failed, timed out, or was closed.
+    --- The connection underneath failed, timed out, or was closed.
     = Stream(IOError)
-    -- The peer's chain does not lead to a trusted root.
+    --- The peer's chain does not lead to a trusted root.
     | Untrusted
-    -- A certificate in the peer's chain has expired.
+    --- A certificate in the peer's chain has expired.
     | Expired
-    -- A certificate in the peer's chain is not valid yet.
+    --- A certificate in the peer's chain is not valid yet.
     | NotYetValid
-    -- The peer's certificate does not name the host connected to.
+    --- The peer's certificate does not name the host connected to.
     | WrongHost
-    -- Verification refused the peer's certificate for another reason, which
-    -- this is OpenSSL's text for.
+    --- Verification refused the peer's certificate for another reason, which
+    --- this is OpenSSL's text for.
     | BadCertificate(String)
-    -- The connection ended without the peer's close_notify.
+    --- The connection ended without the peer's close_notify.
     | Truncated
-    -- The protocol failed: an alert from the peer, or a message out of place.
-    -- OpenSSL's reason.
+    --- The protocol failed: an alert from the peer, or a message out of place.
+    --- OpenSSL's reason.
     | Refused(String)
-    -- A configuration could not be made: a file that would not load, a key
-    -- that is not the certificate's, a protocol name out of range.
+    --- A configuration could not be made: a file that would not load, a key
+    --- that is not the certificate's, a protocol name out of range.
     | Configuration(String)
 
 instance Show TLSError {
@@ -172,14 +172,14 @@ instance Error TLSError {
 
 -- -- configuration --------------------------------------------------------------------
 
--- The roots a client trusts: the system's, or only those in a PEM file.
+--- The roots a client trusts: the system's, or only those in a PEM file.
 type Roots = SystemRoots | RootsFile(String)
 
--- A certificate chain and its private key: the paths of two PEM files, the
--- chain leaf first.
+--- A certificate chain and its private key: the paths of two PEM files, the
+--- chain leaf first.
 type Certificate = Certificate { chain : String, key : String }
 
--- A client's roots and protocols, in an OpenSSL context.
+--- A client's roots and protocols, in an OpenSSL context.
 type ClientConfig = ClientConfig {
     -- One reference, dropped by `releaseClient`, which leaves it null. Each
     -- connection takes a reference of its own (`SSL_new`).
@@ -188,7 +188,7 @@ type ClientConfig = ClientConfig {
     protocols : Array Byte,
 }
 
--- A server's certificates and protocols, in one OpenSSL context each.
+--- A server's certificates and protocols, in one OpenSSL context each.
 type ServerConfig = ServerConfig {
     -- One context per certificate, each holding one reference that
     -- `releaseServer` drops, leaving this empty. The first is the default.
@@ -196,7 +196,7 @@ type ServerConfig = ServerConfig {
     protocols : Array Byte,
 }
 
--- A client configuration trusting `roots` and offering `protocols` by ALPN.
+--- A client configuration trusting `roots` and offering `protocols` by ALPN.
 fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError ClientConfig {
     let wire = alpnWire(protocols)?
     SSL.errClearError()
@@ -227,8 +227,8 @@ fun configureClient(ctx : Ptr, roots : Roots) -> Either TLSError Unit {
     Right(())
 }
 
--- A server configuration presenting `certificates`, chosen among by SNI, and
--- accepting `protocols` by ALPN.
+--- A server configuration presenting `certificates`, chosen among by SNI, and
+--- accepting `protocols` by ALPN.
 fun serverConfig(certificates : Array Certificate, protocols : Array String)
         -> Either TLSError ServerConfig {
     if len(certificates) == 0 {
@@ -288,15 +288,15 @@ fun configureCommon(ctx : Ptr) -> Either TLSError Unit {
     Right(())
 }
 
--- Free `c`'s context. Connections made from it keep working; a `client` after
--- it fails with `Configuration`. Releasing it again does nothing.
+--- Free `c`'s context. Connections made from it keep working; a `client` after
+--- it fails with `Configuration`. Releasing it again does nothing.
 fun releaseClient(c : ClientConfig) -> Unit = Sync.update(c.ctx, fun(ctx) {
     if !Ptr.isNull(ctx) { SSL.ctxFree(ctx) }
     Ptr.null()
 })
 
--- Free `c`'s contexts. Connections made from it keep working; a `server` or
--- `accept` after it fails. Releasing it again does nothing.
+--- Free `c`'s contexts. Connections made from it keep working; a `server` or
+--- `accept` after it fails. Releasing it again does nothing.
 fun releaseServer(c : ServerConfig) -> Unit = Sync.update(c.contexts, fun(contexts) {
     for ctx in contexts { SSL.ctxFree(ctx) }
     []
@@ -361,20 +361,20 @@ fun streamOf[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](c : c)
         closing = fun() = close(c),
     }
 
--- A TLS connection over a `Net.Connection`.
---
--- Three locks, always taken in this order, and the last never held while
--- the task waits:
---
--- * `reading`, by the task reading from the connection underneath: a read,
---   or the handshake. So the peer's bytes go into OpenSSL in order. It holds
---   them on their way.
--- * `sending`, by the task taking ciphertext out of `wbio` and writing it to
---   the connection, held until it is written. So it goes out in order,
---   whichever task's call made it. It holds the bytes on their way. Only a
---   write or `shutdownWrite` waits for it; see `send`.
--- * `engine`, around every call into OpenSSL with this connection, since one
---   `SSL` is not to be used from two threads at once.
+--- A TLS connection over a `Net.Connection`.
+---
+--- Three locks, always taken in this order, and the last never held while
+--- the task waits:
+---
+--- * `reading`, by the task reading from the connection underneath: a read,
+---   or the handshake. So the peer's bytes go into OpenSSL in order. It holds
+---   them on their way.
+--- * `sending`, by the task taking ciphertext out of `wbio` and writing it to
+---   the connection, held until it is written. So it goes out in order,
+---   whichever task's call made it. It holds the bytes on their way. Only a
+---   write or `shutdownWrite` waits for it; see `send`.
+--- * `engine`, around every call into OpenSSL with this connection, since one
+---   `SSL` is not to be used from two threads at once.
 type TLS = TLS {
     stream  : Under,
     reading : Sync.Mutex Buffer,
@@ -449,8 +449,8 @@ instance Write TLS {
     fun flush(t) = Right(())
 }
 
--- `shutdownWrite` sends a close_notify, then ends the connection's output
--- underneath. `close` closes the connection underneath.
+--- `shutdownWrite` sends a close_notify, then ends the connection's output
+--- underneath. `close` closes the connection underneath.
 instance Connection TLS {
     fun setDeadline(t, timeout) {
         let at = deadline(timeout)
@@ -516,14 +516,14 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
 
 -- -- making one -----------------------------------------------------------------------
 
--- A TLS client over `conn`, which is connected to `to`, with the handshake
--- done within `timeout`. The server must present a certificate for `to`'s
--- host that `config`'s roots vouch for.
---
--- If the handshake fails, `conn` is left open, and closing it is the
--- caller's. Once this returns a `TLS`, the `TLS` owns `conn`: `close` it
--- rather than `conn`, and bound it with the `TLS`'s `setDeadline`. The
--- handshake replaces any deadline `conn` had, and leaves it with none.
+--- A TLS client over `conn`, which is connected to `to`, with the handshake
+--- done within `timeout`. The server must present a certificate for `to`'s
+--- host that `config`'s roots vouch for.
+---
+--- If the handshake fails, `conn` is left open, and closing it is the
+--- caller's. Once this returns a `TLS`, the `TLS` owns `conn`: `close` it
+--- rather than `conn`, and bound it with the `TLS`'s `setDeadline`. The
+--- handshake replaces any deadline `conn` had, and leaves it with none.
 fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
         conn : c, to : Destination, config : ClientConfig, timeout : t) -> Either TLSError TLS {
     let name = checkedName(to.host)?
@@ -557,10 +557,10 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
     }
 }
 
--- A TLS server over `conn`, presenting `config`'s certificates. Nothing is
--- waited for: the handshake runs inside the first read or write, or in
--- `handshake`. The `TLS` owns `conn`: `close` it rather than `conn`. A
--- configuration released already is `Configuration`, and leaves `conn` open.
+--- A TLS server over `conn`, presenting `config`'s certificates. Nothing is
+--- waited for: the handshake runs inside the first read or write, or in
+--- `handshake`. The `TLS` owns `conn`: `close` it rather than `conn`. A
+--- configuration released already is `Configuration`, and leaves `conn` open.
 fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
         conn : c, config : ServerConfig) -> Either TLSError TLS = serverAt(conn, config, None, None)
 
@@ -710,8 +710,8 @@ fun withEngine(t : TLS, f : fun(Engine) -> a) -> a = Sync.withLock(t.engine, f)
 
 -- -- the handshake --------------------------------------------------------------------
 
--- Run `t`'s handshake if it has not run, within `timeout` and the deadline
--- `t` has, whichever comes first.
+--- Run `t`'s handshake if it has not run, within `timeout` and the deadline
+--- `t` has, whichever comes first.
 fun handshake[Timeout d](t : TLS, timeout : d) -> Either TLSError Unit = using(t, "handshake", fun() {
     let own = withEngine(t, fun(engine) = engine.limit)
     let at = deadline(timeout)
@@ -995,8 +995,8 @@ fun staticText(p : Ptr, otherwise : String) -> String =
 
 -- -- what the handshake chose ---------------------------------------------------------
 
--- The protocol ALPN chose, once the handshake is done; `None` before, without
--- ALPN, or once `t` is closed.
+--- The protocol ALPN chose, once the handshake is done; `None` before, without
+--- ALPN, or once `t` is closed.
 fun protocol(t : TLS) -> Option String = Either.unwrapOr(using(t, "protocol", fun() = Right(withEngine(t, fun(engine) {
     if !engine.shaken { return None }
     let out = Ptr.alloc(16)
@@ -1012,15 +1012,15 @@ fun protocol(t : TLS) -> Option String = Either.unwrapOr(using(t, "protocol", fu
     String.fromBytes(Array.init(n, fun(i) = (Ptr.load(data, i) : Byte)))
 }))), None)
 
--- The host name the client sent by SNI, once the handshake is done: on a
--- client, the one it sent. `None` without one, or once `t` is closed.
+--- The host name the client sent by SNI, once the handshake is done: on a
+--- client, the one it sent. `None` without one, or once `t` is closed.
 fun serverName(t : TLS) -> Option String = Either.unwrapOr(using(t, "serverName", fun() = Right(withEngine(t, fun(engine) {
     if !engine.shaken { return None }
     Ptr.fromCString(SSL.sslGetServername(engine.ssl, SSL.nameTypeHostName))
 }))), None)
 
--- The addresses underneath, for a connection an `Acceptor` accepted, and
--- the SNI name and ALPN protocol once the handshake is done.
+--- The addresses underneath, for a connection an `Acceptor` accepted, and
+--- the SNI name and ALPN protocol once the handshake is done.
 instance HasConnectionInfo TLS {
     fun connectionInfo(t) = ConnectionInfo {
         local = t.local,
@@ -1031,18 +1031,18 @@ instance HasConnectionInfo TLS {
 
 -- -- accepting ------------------------------------------------------------------------
 
--- A TCP listener whose connections are TLS servers presenting `config`.
+--- A TCP listener whose connections are TLS servers presenting `config`.
 type Acceptor = Acceptor { listener : Listener, config : ServerConfig }
 
 fun acceptor(l : Listener, config : ServerConfig) -> Acceptor = Acceptor { listener = l, config }
 
--- The next connection, as `server` makes it: its handshake runs in its first
--- read or write, so a slow client does not hold up the next `accept`. Once
--- `config` is released, a connection is closed as it arrives, and `accept`
--- returns `Closed`. A connection whose TLS state cannot be made, for want of
--- memory, is closed too, and `accept` returns an `Other` of `ENOMEM`, which
--- a server reports and retries. Closing the acceptor closes the TCP listener
--- under it.
+--- The next connection, as `server` makes it: its handshake runs in its first
+--- read or write, so a slow client does not hold up the next `accept`. Once
+--- `config` is released, a connection is closed as it arrives, and `accept`
+--- returns `Closed`. A connection whose TLS state cannot be made, for want of
+--- memory, is closed too, and `accept` returns an `Other` of `ENOMEM`, which
+--- a server reports and retries. Closing the acceptor closes the TCP listener
+--- under it.
 instance Net.Listener Acceptor {
     type Accepted = TLS
     fun closeListener(a) = closeListener(a.listener)

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build the standard library's API documentation as one page:
 #
-#   scripts/docs.sh [OUT]       (default OUT: build/docs)
+#   scripts/docs.sh [OUT]       (default OUT: build/docs in the repository)
 #
 # writes OUT/docs.json, what `boot doc` says every library module exports, and
 # OUT/index.html, scripts/docs.html with that JSON spliced into it. The page
@@ -13,10 +13,22 @@
 # if it is not there.
 
 set -eu
-cd "$(dirname "$0")/.."
 
-out=${1:-build/docs}
-boot=${TURKEY_BOOT:-build/stages/stage2}
+# OUT is relative to the directory the script is run from, and absolute from
+# here on, since the script works from the repository root.
+out=${1:-}
+if [ -n "$out" ]; then
+    mkdir -p "$out"
+    out=$(cd "$out" && pwd)
+fi
+# So is $TURKEY_BOOT, when it is a path with a directory in it.
+boot=${TURKEY_BOOT:-}
+case $boot in
+    */*) boot=$(cd "$(dirname "$boot")" && pwd)/$(basename "$boot") ;;
+esac
+cd "$(dirname "$0")/.."
+out=${out:-$(pwd)/build/docs}
+boot=${boot:-build/stages/stage2}
 if [ ! -x "$boot" ]; then
     sh scripts/build.sh
 fi

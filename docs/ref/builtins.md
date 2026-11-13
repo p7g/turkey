@@ -226,15 +226,19 @@ with `Hash`. It is not in the Prelude, so a program imports it, usually as
 `Set.fromIterator(xs)` a set of the elements of anything `for` can walk.
 `Set.add` and `Set.remove` change a set in place, `Set.contains` tests for an
 element, and `len`, `for` and `Set.elements` see the elements in the order
-they were first added.
+they were added. Adding an element the set holds changes nothing, and an
+element removed and added again goes last.
 
 `Set.union`, `Set.intersection`, `Set.difference` and
 `Set.symmetricDifference` return a new set and leave their arguments as they
-were. So do the operators, which call them: `a | b` is the union, `a & b` the
+were, so each costs a copy. So do the operators, which call them: `a | b` is the union, `a & b` the
 intersection, `a - b` the elements of `a` not in `b`, and `a ^ b` the elements
 in exactly one of them. `a <> b` is the union too, and `empty()` is its
 identity. `Set.isSubset(a, b)`, `Set.isDisjoint(a, b)` and `Set.isEmpty(a)`
-test sets.
+test sets. `Set.unionInto(into, from)` adds the elements of `from` to
+`into` in place, and returns whether that added any: a set grown in a loop is
+grown with it, or with `Set.add`, since `seen = seen | more` copies `seen`
+every time.
 
 <!-- run -->
 ```kotlin
@@ -249,8 +253,8 @@ fun main() {
     print(odd ^ prime)
     print(Set.isSubset(odd & prime, odd))
 
-    var seen = empty() : Set Int
-    for step in [[1, 2], [2, 3]] { seen = seen | Set.fromIterator(step) }
+    let seen = empty() : Set Int
+    for step in [[1, 2], [2, 3]] { let _ = Set.unionInto(seen, Set.fromIterator(step)) }
     print(seen)
 }
 ```
@@ -264,7 +268,9 @@ True
 ```
 
 Equal sets hash equal whatever order their elements were added in, so a set
-can be a key of a `Map` or an element of another set.
+can be a key of a `Map` or an element of another set. Like any mutable value
+used as a key, it must not change while it is one: its hash changes with it,
+and the map or set holding it can no longer find it.
 
 ## Operator classes
 

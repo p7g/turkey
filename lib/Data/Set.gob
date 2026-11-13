@@ -8,6 +8,7 @@ export (
     isEmpty,
     elements,
     union,
+    unionInto,
     intersection,
     difference,
     symmetricDifference,
@@ -35,7 +36,8 @@ import Data.Int as Int
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Semigroup (Semigroup(..))
 import Data.Monoid (Monoid(..))
-import Bits (BitAnd(..), BitOr(..), BitXor(..), (&), (|), (^))
+import Bits (BitAnd(..), BitOr(..), BitXor(..))
+import Hash.Words as Words
 
 type Set a = Set(Map a Unit)
 
@@ -60,11 +62,11 @@ fun isEmpty(s : Set a) -> Bool = len(s) == 0
 -- Insertion-ordered.
 fun elements(Set(table) : Set a) -> Array a = Map.keys(table)
 
--- The functions below return a new set and leave their arguments as they
--- were. Each keeps the order of `a`'s elements, then of `b`'s where `b`
--- contributes any.
+-- The four functions below return a new set and leave their arguments as
+-- they were.
 
--- Returns the elements in `a` or `b`.
+-- Returns the elements in `a` or `b`: `a`'s in order, then those of `b` not
+-- in `a`.
 fun union[Hash a](a : Set a, b : Set a) -> Set a {
     let s = new()
     for x in a { add(s, x) }
@@ -72,19 +74,34 @@ fun union[Hash a](a : Set a, b : Set a) -> Set a {
     s
 }
 
--- Returns the elements in both `a` and `b`.
-fun intersection[Hash a](a : Set a, b : Set a) -> Set a = keep(a, fun(x) = contains(b, x))
+-- Returns the elements in both `a` and `b`, in the order of the smaller of
+-- the two, or of `a` when they are the same size. Costs a probe per element
+-- of the smaller set.
+fun intersection[Hash a](a : Set a, b : Set a) -> Set a {
+    let (small, large) = if len(a) <= len(b) { (a, b) } else { (b, a) }
+    keep(small, fun(x) = contains(large, x))
+}
 
--- Returns the elements in `a` and not in `b`.
+-- Returns the elements in `a` and not in `b`, in `a`'s order.
 fun difference[Hash a](a : Set a, b : Set a) -> Set a = keep(a, fun(x) = !contains(b, x))
 
--- Returns the elements in exactly one of `a` and `b`.
+-- Returns the elements in exactly one of `a` and `b`: those of `a` in order,
+-- then those of `b`.
 fun symmetricDifference[Hash a](a : Set a, b : Set a) -> Set a {
     let s = difference(a, b)
     for x in b {
         if !contains(a, x) { add(s, x) }
     }
     s
+}
+
+-- Adds every element of `from` to `into`, and returns True if that added any.
+-- Costs a probe per element of `from`, where `into = into | from` would copy
+-- both sets.
+fun unionInto[Hash a](into : Set a, from : Set a) -> Bool {
+    let before = len(into)
+    for x in from { add(into, x) }
+    len(into) != before
 }
 
 -- Returns True if every element of `a` is in `b`.
@@ -131,17 +148,27 @@ instance Eq (Set a) : Hash a {
 instance Hash (Set a) : Hash a {
     fun hashInto(s, h) {
         -- Hash each element on its own, from a fresh state of the same hasher,
-        -- and add the results: addition does not see the order. The fresh
-        -- states take seed 0 because a `Hasher` does not hand out its seed,
-        -- so the per-element hashes are the same for every table; the length
-        -- and the sum then go through `h`, which is seeded. Feeding the
+        -- and add the results: addition does not see the order. Feeding the
         -- elements to `h` in order would be cheaper and would make two equal
         -- sets hash differently.
+        --
+        -- The fresh states take seed 0 because a `Hasher` does not hand out
+        -- its seed, so the per-element hashes are the same for every table;
+        -- the length and the sum then go through `h`, which is seeded.
+        --
+        -- Each element's hash is mixed by a folded multiply before it is
+        -- added. A weak hasher such as `FxHash` leaves a small integer's
+        -- hash close to linear in it, and a sum of those is close to a
+        -- function of the elements' sum: `{1, 4}` and `{2, 3}` would collide.
         var sum = 0
-        for x in s { sum = Int.addWrapping(sum, hashAlone(x, h)) }
+        for x in s { sum = Int.addWrapping(sum, Words.fold(hashAlone(x, h), mixer)) }
         hashInt(hashInt(h, len(s)), sum)
     }
 }
+
+-- An odd constant with its bits spread evenly, the multiplier of the fold that
+-- mixes each element's hash.
+let mixer = 0x2D358DCCAA6C78A5
 
 -- Returns the hash of `x` from a fresh state of `like`'s hasher, seeded 0.
 -- `like` is not read; it names the hasher.

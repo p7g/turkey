@@ -16,7 +16,7 @@ The Prelude provides these names unqualified:
 
 | Kind | Names |
 |---|---|
-| Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
+| Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec`, `FrozenArray` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
@@ -24,8 +24,8 @@ The Prelude provides these names unqualified:
 With the Prelude, a module also imports the library modules `Data.Array`,
 `Data.Bool`, `Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`,
 `Data.Float`, `Data.Int`, `Iter`, `Data.Map`, `Data.Option`,
-`Data.Ordering`, `Data.String` and `Data.Vec` under the last part of their
-names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
+`Data.Ordering`, `Data.String`, `Data.Vec` and `FrozenArray` under the last
+part of their names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
 for a program to use. An explicit Prelude import keeps these, and only
 `import Prelude ()` leaves them out.
@@ -215,6 +215,41 @@ Some("b")
 Nothing has to say that `stack` is a `Vec`: `Vec.push` takes one, so the
 literal it was made from is one ([Array literals](inference.md#array-literals)).
 
+## `FrozenArray`
+
+`FrozenArray a` is a sequence of `a` that cannot be changed: its length and
+its elements are fixed when it is made. It has `Index`, `Length`,
+`Iterator`, `Eq`, `Ord`, `Hash`, `Functor`, `Foldable`, `+`, `Semigroup`,
+`Monoid` and `Show` instances, and no `SetIndex`, so `xs[i] = v` on it is
+rejected. Because it cannot change, a `FrozenArray` can be a `Map` key or a
+`Set` element, which an `Array` or a `Vec` cannot.
+
+Its constructor is hidden. A `FrozenArray` is made with an [array
+literal](expressions.md#array-literals) that is used as one, or by copying:
+`FrozenArray.freeze(xs)` copies anything with a length that can be iterated,
+and `FrozenArray.toArray` and `FrozenArray.toVec` copy it back out. Changing
+one makes a new one: `FrozenArray.with(xs, i, x)` is a copy of `xs` with
+element `i` replaced.
+
+<!-- run -->
+```kotlin
+import Data.Set as Set
+
+fun main() {
+    let seen : Set.Set (FrozenArray Int) = Set.new()
+    let start : FrozenArray Int = [0, 0]
+    Set.add(seen, start)
+    let next = FrozenArray.with(start, 1, 1)
+    Set.add(seen, next)
+    Set.add(seen, FrozenArray.freeze([0, 1]))
+    print((start, next, len(seen)))
+}
+```
+
+```text
+([0, 0], [0, 1], 2)
+```
+
 `Map k v`, a hash map, also has `Index`, `Length` and `Iterator` instances,
 and iterates over `(key, value)` pairs in insertion order.
 
@@ -346,15 +381,18 @@ The instances the library provides for built-in types:
 | tuples of 2 to 4 elements | if the elements have it | if the elements have it | if the elements have it | no | no | no | if the elements have it |
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
+| `FrozenArray a` | if the elements have it | if the elements have it | if the elements have it | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
 | `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | if the elements have it |
 | `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |
 
-Tuples compare lexicographically, and strings compare byte by byte. Two
+Tuples and frozen arrays compare lexicographically, a frozen array that is a
+proper prefix of another being less, and strings compare byte by byte. Two
 arrays are equal when they have the same length and equal elements at each
-index, and so are two `Vec`s or two `Deque`s, whatever their capacity. Two
+index, and so are two `FrozenArray`s, and two `Vec`s or two `Deque`s,
+whatever their capacity. Two
 maps are equal when they have the same keys with equal values, and two `Set`s
 when they have the same elements, whatever order the entries were added in.
 
@@ -417,7 +455,7 @@ standard output holds, and returns `x`, so it can wrap any expression.
   them.
 * A `Float` prints with the shortest digits that read back as the same
   number. A `Byte` has no literal, so it prints as the integer it holds.
-* An array or a `Vec` prints as an array literal, a `Map` as
+* An array, a `Vec` or a `FrozenArray` prints as an array literal, a `Map` as
   `{key: value, ...}` and a `Set` as `{element, ...}`, in the order the
   entries were first added.
 * A `Deque` prints as the call that builds it, `Deque.fromArray([x, ...])`,
@@ -429,7 +467,7 @@ standard output holds, and returns `x`, so it can wrap any expression.
   `Debug` follows from the classes the constructor carries.
 
 A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
-`Vec`, `Map`, `Set`, `Deque`, `PriorityQueue`, `Option`, `Either` and the
+`Vec`, `FrozenArray`, `Map`, `Set`, `Deque`, `PriorityQueue`, `Option`, `Either` and the
 tuples is their `Debug`, so a string inside one is quoted and two lists of
 strings cannot print alike:
 
@@ -689,8 +727,8 @@ class SetIndex c : Index c { fun set(c, Key c, Value c) -> Unit }
 
 `c[k]` calls `get(c, k)`, and the assignment `c[k] = v` calls `set(c, k, v)`
 ([Indexing](expressions.md#indexing)). `Key c` and `Value c` are the key and
-element types: `Int` and `a` for `Array a` and `Vec a`, and `k` and `v` for
-`Map k v`. All three have both instances.
+element types: `Int` and `a` for `Array a`, `Vec a` and `FrozenArray a`, and
+`k` and `v` for `Map k v`. All but `FrozenArray` have both instances.
 
 Writing is a class of its own so that a type can be read by key without being
 writable. A type with only an `Index` instance can be read with `c[k]`, and
@@ -723,8 +761,8 @@ fun main() {
 class Length c { fun len(c) -> Int }
 ```
 
-`len(xs)` is the number of elements in an `Array`, a `Vec`, a `Map`, a
-`Set`, a `Deque` or a `PriorityQueue`.
+`len(xs)` is the number of elements in an `Array`, a `Vec`, a `FrozenArray`,
+a `Map`, a `Set`, a `Deque` or a `PriorityQueue`.
 `String` has no `Length` instance ([String](types.md#string)).
 
 ## `hash`
@@ -912,8 +950,8 @@ class Monoid a : Semigroup a { fun empty() -> a }
 `combine` joins two values associatively, and `empty()` is its identity on
 either side. The operator `a <> b` calls `combine(a, b)`
 ([The Prelude's other operators](expressions.md#the-preludes-other-operators)).
-`String`, `Array` and `Vec` have instances, which concatenate, and `Set`
-has one, which takes the union.
+`String`, `Array`, `Vec` and `FrozenArray` have instances, which concatenate,
+and `Set` has one, which takes the union.
 
 ## `error`
 

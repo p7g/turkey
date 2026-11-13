@@ -21,9 +21,14 @@ if [ -n "$out" ]; then
     mkdir -p "$out"
     out=$(cd "$out" && pwd)
 fi
+# So is $TURKEY_BOOT, when it is a path with a directory in it.
+boot=${TURKEY_BOOT:-}
+case $boot in
+    */*) boot=$(cd "$(dirname "$boot")" && pwd)/$(basename "$boot") ;;
+esac
 cd "$(dirname "$0")/.."
 out=${out:-$(pwd)/build/docs}
-boot=${TURKEY_BOOT:-build/stages/stage2}
+boot=${boot:-build/stages/stage2}
 if [ ! -x "$boot" ]; then
     sh scripts/build.sh
 fi

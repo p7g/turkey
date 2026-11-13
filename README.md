@@ -111,12 +111,13 @@ names the library instead. The working directory is never searched, so a
 `lib/` in your own project cannot stand in for it. Rebuilding updates what
 `turkey` runs; after moving the checkout, run `install.sh` again.
 
-The compiler has two commands. `build` writes the program to `-o`, in the
-format the file's extension names -- a relocatable object for `.o`, assembly
-for `.s` -- or `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard
-output. An object needs no assembler, only a linker. `-f exe` writes an
-executable that runs as it is, with no assembler and no linker: a signed
-Mach-O on a Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
+Besides `doc` ("Library documentation" below), the compiler has two commands.
+`build` writes the program to `-o`, in the format the file's extension names
+-- a relocatable object for `.o`, assembly for `.s` -- or `-f obj` or `-f asm`
+says; `-o - -f asm` writes it to standard output. An object needs no
+assembler, only a linker. `-f exe` writes an executable that runs as it is,
+with no assembler and no linker: a signed Mach-O on a Mac, and on arm64 Linux
+an ELF that loads glibc 2.34 or later.
 
 ```sh
 build/stages/stage2 build -f exe -o rectangles rectangles.gob
@@ -375,6 +376,23 @@ fixture parses when `TURKEY_BOOT` or `build/stages/stage2` is a compiler:
 ```sh
 sh vim/test/run.sh
 ```
+
+### Library documentation
+
+`boot doc FILE...` checks the modules in the files and writes JSON describing
+what each one exports. Every function, value, type, class, instance and
+operator gets its type as the checker has it, its line, and the comment
+directly above its declaration. A comment counts only when no blank line
+separates it from the declaration, and the module's own comment is the first
+comment before its first declaration. To build a page for the whole library
+that searches names, types and comments:
+
+```sh
+sh scripts/docs.sh
+```
+
+That writes `build/docs/index.html`, one self-contained file to open in a
+browser, along with the JSON it is built from.
 
 ## Project status
 

@@ -39,6 +39,7 @@ import Case (Case(..))
 import Files as Files
 import Toolchain (Toolchain(..))
 import Toolchain as Toolchain
+import Iter
 
 type Cache = Cache { root : String, base : String }
 
@@ -81,12 +82,14 @@ fun keyOf(cache : Cache, c : Case, argv : Array String) -> Either SomeError Stri
 
 -- Whether `stderr` holds a panic: a line starting `panic: `.
 fun panicked(stderr : String) -> Bool =
-    Iterator.any(String.lines(stderr), String.startsWith(_, "panic: "))
+    Iter.any(String.lines(stderr), String.startsWith(_, "panic: "))
 
 -- `c` compiled and linked, from the cache or now. `Left` is a harness error:
 -- a source that cannot be read, or a cache that cannot be written.
 fun compile(cache : Cache, t : Toolchain, c : Case) -> Either SomeError Compiled {
-    let flags = if c.checkOnly { ["check"] } else { ["build", "-f", "obj"] }
+    let flags = if c.checkOnly { ["check"] }
+                else if t.executables { ["build", "-f", "exe"] }
+                else { ["build", "-f", "obj"] }
     let key = keyOf(cache, c, flags)?
     let entry = cache.root + "/compile/" + key
     if let Some(found) = load(entry, c.checkOnly) { return Right(found) }
@@ -147,10 +150,13 @@ fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
 }
 
 -- `boot` on the case, writing its object and then the linked binary into
--- `staging`; or, for a case that is only checked, `boot check` alone.
+-- `staging`, or under `--exe` the binary alone; or, for a case that is only
+-- checked, `boot check` alone.
 fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> Compiled {
     let object = staging + "/main.o"
-    let output = if c.checkOnly { [] } else { ["-o", object] }
+    let output = if c.checkOnly { [] }
+                 else if t.executables { ["-o", staging + "/bin"] }
+                 else { ["-o", object] }
     let argv = t.run + [t.boot] + flags + output + [c.entry]
     let limit = Toolchain.limit(t, 300)
     let compiled = match Process.run(Toolchain.caseCommand(t, c, argv), Some(limit)) {
@@ -167,6 +173,7 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
         }
     }
     if c.checkOnly { return Accepted(stderr) }
+    if t.executables { return Built(staging + "/bin", stderr) }
     let link = Toolchain.linkCommand(t, object, staging + "/bin", c.directory)
     match Process.run(link, Some(limit)) {
         Right(Output { status = Exited(0), .. }) -> Built(staging + "/bin", stderr)

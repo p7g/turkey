@@ -1,6 +1,6 @@
 export (
     Diag(..), Severity(..), at, whole, warningAt, render, fail, short, compiling,
-    report, beginUnit, endUnit, beginMuted, endMuted, hasErrors, errorCount, stopOnErrors,
+    report, beginUnit, endUnit, beginMuted, endMuted, beginHeld, endHeld, hasErrors, errorCount, stopOnErrors,
     stopCollecting,
 )
 
@@ -17,7 +17,7 @@ export (
 
 import System.Env as Env
 import System.IO as IO
-import Turkey.Source (Span(..), outermost, showSpan)
+import Turkey.Source (Span(..), generated, isGenerated, outermost, showSpan)
 
 -- An `Error` stops the compile at the end of the stage that reports it. A
 -- `Warning` is printed and stops nothing.
@@ -39,7 +39,7 @@ type Diag = Diag {
 -- diagnostic is about the function the code runs in, and the callee's own
 -- text is in another function and perhaps another file.
 fun at(stage : String, message : String, where : Span) -> Diag = Diag {
-    stage = stage, message = short(message), span = Some(outermost(where)), severity = Error,
+    stage = stage, message = short(message), span = placed(where), severity = Error,
 }
 
 -- A diagnostic about a whole file rather than a place in it: a file that cannot
@@ -48,8 +48,16 @@ fun whole(stage : String, message : String) -> Diag =
     Diag { stage = stage, message = short(message), span = None, severity = Error }
 
 fun warningAt(message : String, where : Span) -> Diag = Diag {
-    stage = "warning", message = short(message), span = Some(outermost(where)),
-    severity = Warning,
+    stage = "warning", message = short(message), span = placed(where), severity = Warning,
+}
+
+-- Returns where a diagnostic at `where` points. A generated span points at no
+-- text, so a diagnostic there is about the whole file, rather than printed at
+-- `<generated>:0:0`, a place no reader can open. Generated code inlined into
+-- a caller still points at the call.
+fun placed(where : Span) -> Option Span {
+    let s = outermost(where)
+    if isGenerated(s) { None } else { Some(s) }
 }
 
 fun render(d : Diag, filename : String) -> String = match d.span {
@@ -87,8 +95,12 @@ var errorsKept = 0
 -- Whether `report` collects, or ends the compile on an error.
 var collecting = True
 
--- How many stretches of code that can never run are open (`beginMuted`).
+-- How many muted stretches are open (`beginMuted`).
 var muted = 0
+
+-- The errors `report` holds back instead of recording, while `beginHeld` is
+-- in force, for a caller to report later or not at all.
+var held : Option (Vec Diag) = None
 
 -- How deep the current unit is, and whether it has reported an error. Only the
 -- outermost unit counts.
@@ -103,6 +115,10 @@ var unitFailed = False
 -- its first error is most often that error seen again from another use.
 fun report(d : Diag) -> Unit {
     if muted > 0 { return }
+    if let Some(errors) = held {
+        if let Error = d.severity { Vec.push(errors, d) }
+        return
+    }
     if let Error = d.severity {
         if !collecting { fail(d, "") }
         if unitFailed { return }
@@ -127,8 +143,9 @@ fun endUnit() -> Bool {
     failed
 }
 
--- Starts a stretch of code that can never run, whose diagnostics are dropped
--- until the matching `endMuted`.
+-- Starts a stretch whose diagnostics are dropped until the matching
+-- `endMuted`: code that can never run, or a solve whose outcome its caller
+-- reports in its own words. Stretches nest.
 fun beginMuted() -> Unit {
     muted = muted + 1
 }
@@ -136,6 +153,23 @@ fun beginMuted() -> Unit {
 -- Ends the stretch `beginMuted` started.
 fun endMuted() -> Unit {
     muted = muted - 1
+}
+
+-- Starts a stretch whose errors are held back rather than reported, until
+-- the matching `endHeld`, and whose warnings are dropped. Stretches do not
+-- nest.
+fun beginHeld() -> Unit {
+    held = Some([])
+}
+
+-- Ends the stretch `beginHeld` started, and returns the errors it held back.
+fun endHeld() -> Vec Diag {
+    let out = match held {
+        Some(errors) -> errors
+        None -> []
+    }
+    held = None
+    out
 }
 
 -- Returns whether an error has been reported.
@@ -179,7 +213,8 @@ fun fail(d : Diag, filename : String) -> a {
     printCollected()
     let cascade = unitFailed || (errorSeen && d.stage == "internal error")
     if !cascade {
-        let name = if filename == "" { entryFile } else { filename }
+        let name = if filename == "" || filename == generated().file { entryFile }
+                   else { filename }
         let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
     }
     Env.exit(1)

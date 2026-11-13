@@ -22,7 +22,6 @@ import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Lexer as Lexer
-import Turkey.Runtime as Rt
 import Turkey.Source as Source
 import Turkey.Source (Source(..), Span)
 import Turkey.Token as Token
@@ -309,7 +308,7 @@ fun parseProgram(p : P) -> Program {
         } else if at(p, "instance") {
             Vec.push(decls, DInstance(parseInstanceDecl(p)))
         } else if at(p, "foreign") {
-            Vec.push(decls, parseForeignDecl(p))
+            parseForeign(p, decls)
         } else if at(p, "fun") {
             let s2 = cur(p).span
             Vec.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
@@ -562,6 +561,7 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     let name = text(expectWhat(p, "CONID", "a type name"))
     let params = Vec.new(2)
     while at(p, "IDENT") { Vec.push(params, text(advance(p))) }
+    let derives = if eat(p, ":") { parseDerives(p) } else { [] }
     skipToken(p, "=")
 
     -- A `|` or a `{` payload means data type outright. A bare `C` or `C(...)`
@@ -581,18 +581,33 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     if at(p, "CONID") && Token.kindName(peek(p, 1).kind) != "." {
         let headName = text(cur(p))
         if Token.kindName(peek(p, 1).kind) == "{" || rhsHasAlternatives(p) {
-            return parseDataRhs(p, s, name, params)
+            return parseDataRhs(p, s, name, params, derives)
         }
         if headName == name
                 || (!Vec.contains(p.tycons, headName) && constructorShaped(p)) {
-            return parseDataRhs(p, s, name, params)
+            return parseDataRhs(p, s, name, params, derives)
         }
     }
     let alias = parseTypeExpr(p)
     TypeDecl {
-        span = close(p, s), name = name, params = params, variants = None,
-        alias = Some(alias),
+        span = close(p, s), name = name, params = params, derives = derives,
+        variants = None, alias = Some(alias),
     }
+}
+
+-- `Eq, !Hash` -- a derive list, after its `:`. Each entry is a class name,
+-- qualified or not, with a `!` before it to refuse the class.
+fun parseDerives(p : P) -> Vec Derive {
+    let out = Vec.new(2)
+    loop {
+        let s = cur(p).span
+        let refused = eat(p, "!")
+        let first = expectWhat(p, "CONID", "a class name")
+        let cls = dottedFrom(p, first)
+        Vec.push(out, Derive { span = close(p, s), cls = cls, refused = refused })
+        if !eat(p, ",") { break }
+    }
+    out
 }
 
 -- Whether the right-hand side at the cursor, a `CONID`, has a constructor's
@@ -641,7 +656,8 @@ fun rhsHasAlternatives(p : P) -> Bool {
     False
 }
 
-fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDecl {
+fun parseDataRhs(p : P, s : Span, name : String, params : Vec String,
+                 derives : Vec Derive) -> TypeDecl {
     let variants = Vec.new(4)
     Vec.push(variants, parseConDecl(p))
     while eat(p, "|") {
@@ -649,8 +665,8 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDec
         Vec.push(variants, parseConDecl(p))
     }
     TypeDecl {
-        span = close(p, s), name = name, params = params, variants = Some(variants),
-        alias = None,
+        span = close(p, s), name = name, params = params, derives = derives,
+        variants = Some(variants), alias = None,
     }
 }
 
@@ -693,7 +709,6 @@ fun parseConDecl(p : P) -> ConDecl {
     let (binders, context) = parseConContext(p)
     if at(p, "{") {
         let (fields, vars, spans) = parseRecordPayload(p)
-        fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(fields))
         return ConDecl {
             span = close(p, tok.span), name = text(tok), args = [],
             fields = Some(fields), vars = vars, fieldSpans = spans,
@@ -710,7 +725,6 @@ fun parseConDecl(p : P) -> ConDecl {
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
-        fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(args))
     } else if at(p, "IDENT") || at(p, "CONID") || at(p, "fun") {
         oops(p, "the payload of constructor '" + text(tok) + "' is not in "
                 + "parentheses; write '" + text(tok) + "(...)'", cur(p).span)
@@ -737,15 +751,6 @@ fun fieldSeparator(p : P) -> Bool {
                 + describe(cur(p)), cur(p).span)
     }
     True
-}
-
--- A value's fields are described to the collector in one word, so there is a
--- most it can have (`Turkey.Runtime.fieldLimit`).
-fun fieldLimit(p : P, at : Token, what : String, count : Int) -> Unit {
-    if count > Rt.fieldLimit {
-        oops(p, what + " has " + Int.toString(count) + " fields, and a value can have at most "
-                + Int.toString(Rt.fieldLimit), at.span)
-    }
 }
 
 -- A record constructor's fields, the names of those declared `var`, and where
@@ -859,7 +864,6 @@ fun parseParenType(p : P, tok : Token) -> Type {
     }
     skipToken(p, ")")
     if len(elems) == 1 { return elems[0] }
-    fieldLimit(p, tok, "this tuple type", len(elems))
     mkType(p, tok.span, TETuple(elems))
 }
 
@@ -938,9 +942,45 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
     }
 }
 
--- `foreign "symbol" fun name(params) -> ret`, with or without a body.
--- Without a body C defines the symbol; with one Turkey defines it and C may
--- call it. A definition is an ordinary function carrying an exported symbol.
+-- A `foreign` declaration, appended to `decls`, or a block of them, each
+-- appended in order: `foreign "name" major { "symbol" fun name(params) -> ret
+-- ... }`. Every declaration in a block carries the block's library, and a
+-- block holds declarations only, since a definition is not imported from
+-- anywhere.
+fun parseForeign(p : P, decls : Vec Decl) -> Unit {
+    let s = expect(p, "foreign").span
+    if Token.kindName(peek(p, 1).kind) != "INT" {
+        Vec.push(decls, parseForeignDecl(p, s, None))
+        return {}
+    }
+    let tok = expectWhat(p, "STRING", "the library's name as a string")
+    let name = text(tok)
+    if name == "" {
+        oops(p, "the library's name is empty; write it between the quotes, as in "
+                + "'foreign \"ssl\" 3'", tok.span)
+    }
+    let major = intOf(advance(p))
+    let library = Some(ForeignLibrary { name = name, major = major, span = close(p, s) })
+    skipToken(p, "{")
+    skipNewlines(p)
+    -- An empty block would be no declaration at all, so neither the gate on
+    -- where declarations may appear nor the check of the library's version
+    -- would ever see it.
+    if at(p, "}") {
+        oops(p, "the block for library '" + name + "' declares nothing; declare a function "
+                + "in it, or remove it", cur(p).span)
+    }
+    while !at(p, "}") {
+        Vec.push(decls, parseForeignDecl(p, cur(p).span, library))
+        endOfStatement(p)
+    }
+    skipToken(p, "}")
+}
+
+-- `"symbol" fun name(params) -> ret`, with or without a body, after the
+-- `foreign` at `s` or inside a block of `library`. Without a body C defines
+-- the symbol; with one Turkey defines it and C may call it. A definition is
+-- an ordinary function carrying an exported symbol.
 --
 -- The C symbol is always written, even when it is the Turkey name spelled the
 -- same way, so which of the two names is which is never something a reader has
@@ -949,8 +989,7 @@ fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDec
 -- There is no context, and a body only for a definition. A return type is
 -- required either way: a C function that returns nothing writes `-> Unit`, because "the signature is stated in
 -- full" is the only property that makes the declaration worth trusting.
-fun parseForeignDecl(p : P) -> Decl {
-    let s = expect(p, "foreign").span
+fun parseForeignDecl(p : P, s : Span, library : Option ForeignLibrary) -> Decl {
     let tok = cur(p)
     if Token.kindName(tok.kind) != "STRING" {
         oops(p, "expected the C symbol as a string, found " + describe(tok),
@@ -972,6 +1011,10 @@ fun parseForeignDecl(p : P) -> Decl {
     }
     let ret = parseTypeExpr(p)
     if at(p, "{") || at(p, "=") {
+        if Option.isSome(library) {
+            oops(p, "foreign '" + name + "' is inside a library's block, so it cannot have "
+                    + "a body; move it out of the block", cur(p).span)
+        }
         if let Some((_, marker)) = variadic {
             oops(p, "foreign '" + name + "' has a body, so it cannot be "
                     + "variadic; remove the '...'", marker)
@@ -1003,8 +1046,8 @@ fun parseForeignDecl(p : P) -> Decl {
         None -> len(params)
     }
     DForeign(ForeignDecl {
-        id = freshId(p), span = close(p, s), name = name, symbol = symbol, params = params, fixed = fixed,
-        ret = ret,
+        id = freshId(p), span = close(p, s), name = name, symbol = symbol, params = params,
+        fixed = fixed, ret = ret, library = library,
     })
 }
 
@@ -1663,7 +1706,6 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     -- Grouping parentheses are not a boundary: they exist for precedence, so
     -- `(_ + 1) * 2` is one function. A tuple's components are.
     if len(elems) == 1 { return elems[0] }
-    fieldLimit(p, tok, "this tuple", len(elems))
     let parts = Vec.map(elems, closePart(p, _))
     closeAround(p, mkExpr(p, tok.span, ETuple(parts)), parts)
 }

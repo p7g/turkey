@@ -172,8 +172,22 @@ def test_a_context_the_signature_omits_is_not_granted():
 def test_a_context_over_a_variable_the_type_omits_is_rejected_where_written():
     src = "fun f[Iterator b](x : Int) -> Int = x"
     assert fails(src) == (
-        "'Iterator b' constrains a type variable that the declared type of 'f' "
-        "does not mention; remove it from the context"
+        "the type of 'f' is ambiguous: no use of 'f' can determine 'b'"
+    )
+
+
+def test_a_context_over_no_variable_is_rejected_where_written():
+    src = "fun f[Show Int](x : Int) -> Int = x"
+    assert fails(src) == (
+        "'Show Int' constrains no type variable; remove it from the context"
+    )
+
+
+def test_a_variable_only_under_a_family_is_ambiguous():
+    """`Item s` does not determine `s`: an associated type is not injective."""
+    src = "fun f[Iterator s](x : Item s) -> Int = 0"
+    assert fails(src) == (
+        "the type of 'f' is ambiguous: no use of 'f' can determine 's'"
     )
 
 

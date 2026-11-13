@@ -1,9 +1,14 @@
 #!/bin/sh
 # Run the test harness, tests/harness/, with the arguments given:
 #
-#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [PATH[::CASE]...]
+#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [--exe] [PATH[::CASE]...]
 #   scripts/test.sh --selftest
 #   scripts/test.sh --bless [PATH[::CASE]...]
+#
+# --exe has boot write every program as an executable itself, with -f exe,
+# instead of linking its object with the C compiler: the same goldens, through
+# the other path. CI runs it on Linux; run it on a Mac after changing the
+# Mach-O writer or what it is fed.
 #
 # --bless writes the actual results of the cases selected over their goldens,
 # refusing any that look like a broken compiler; tests/harness/Bless.gob says

@@ -1,5 +1,5 @@
 export (
-    Generator(..), newGenerator, generate, bindMethods, checkExhaustiveness,
+    Generator(..), newGenerator, generate, solve, bindMethods, checkExhaustiveness,
 )
 
 -- Constraint generation.
@@ -40,7 +40,7 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        Skolems(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..),
-                           PredCell(..), LetCell(..))
+                           PredCell(..), LetCell(..), Exporting(..), Ambiguity(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
@@ -49,7 +49,8 @@ import Turkey.Inert (Refusal(..), Given(..))
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
 import Turkey.Prelude as P
-import Turkey.Solved (Abstraction(..), Use(..), newAbstraction, newUse, newHole, dictName)
+import Turkey.Solved (Abstraction(..), Use(..), InstanceCheck(..), newAbstraction, newUse,
+                      Hole, newHole, dictName)
 import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
@@ -133,12 +134,15 @@ type Generator = Generator {
     -- `else` block of a `let ... else`, and the calls in its tail positions.
     bottoms  : Set.Set Int,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
-    -- variables and its context.
-    partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred),
+    -- variables, its context, and where each predicate of the context is.
+    partialHeaders : Map Int (Vec (String, Ty.Type), Vec Ty.Pred, Vec Span),
     -- What the patterns being matched have opened: one list
     -- per `match` arm or function whose patterns may open an existential, and
     -- `None` for a binding that may not.
     openings : Vec (Option (Vec (Array (String, Pred), Vec ConCell))),
+    -- Each instance declaration's own obligations, whose evidence
+    -- `Turkey.Evidence` reads into its plan once solving is over.
+    instanceChecks : Vec InstanceCheck,
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -152,7 +156,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
-        partialHeaders = Map.new(), openings = Vec.new(4),
+        partialHeaders = Map.new(), openings = Vec.new(4), instanceChecks = Vec.new(8),
     }
 }
 
@@ -293,6 +297,8 @@ fun freshCell(g : Generator) -> VarCell {
 -- through. So the constraint is as deep as one group, not as deep as the
 -- module is long.
 fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Constraint) {
+    -- Until `solve` is done, an instance derived now is checked.
+    g.classes.open = True
     let typeDecls = Vec.new(8)
     let classDecls = Vec.new(4)
     let instDecls = Vec.new(4)
@@ -330,6 +336,9 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     }
     Decls.registerAll(g.decls, typeDecls)
     Classes.registerAll(g.classes, ownedClasses, ownedInstances)
+    -- A declaration that failed to register may have no constructors to
+    -- derive from, so derive lists are checked only when every one did.
+    if !Diag.hasErrors() { Classes.checkDerives(g.classes, typeDecls) }
     checkSuperEqualities(g.classes)
     -- A declaration that failed to register leaves a gap in the tables that
     -- every use of it would report again, so nothing is generated past one.
@@ -337,6 +346,7 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     bindMethods(g)
     bindForeigns(g, foreigns)
     checkDefinitions(g, items)
+    checkDeclaredAmbiguity(g, typeDecls, classDecls)
 
     -- The graph is keyed by item, not by bound name: a single binding may
     -- introduce several names, and keying by name would split one item across
@@ -417,7 +427,52 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
     -- top-level binding. Nothing calls *them* by name, so their position is
     -- otherwise free.
     genMethodBodies(g, classDecls, instDecls)
+    let _ = genDerived(g)
     (ordered, pop(g))
+}
+
+-- Emits the ambiguity check (`C.checkAmbiguity`) of each class method's
+-- type and each existential constructor's type that `typeDecls` and
+-- `classDecls` declare, as GHC's `checkValidClass` and `checkValidDataCon`
+-- check the type of a method selector and of a constructor wrapper. A
+-- function's signature is checked with its group (`buildFunGroup`).
+fun checkDeclaredAmbiguity(g : Generator, typeDecls : Vec TypeDecl,
+                           classDecls : Vec ClassDecl) -> Unit {
+    for decl in classDecls {
+        let info = classNamed(g, decl.name)
+        for m in decl.methods {
+            if let Some(mi) = Map.get(info.methods, m.name) {
+                -- The class predicate comes first, and no context wrote it.
+                let written = Vec.new(len(mi.scheme.preds))
+                Vec.push(written, None)
+                for p in m.context { Vec.push(written, Some(p.span)) }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = Ty.bareName(m.name), scheme = mi.scheme, span = Some(m.span),
+                    written = written, names = mi.names, inferred = False,
+                }))
+            }
+        }
+    }
+    for decl in typeDecls {
+        let variants = match decl.variants {
+            Some(vs) -> vs
+            None -> continue
+        }
+        for con in variants {
+            if len(con.context) == 0 { continue }
+            if let Some(ci) = Map.get(g.decls.constructors, con.name) {
+                let names = Map.new()
+                for var i = 0; i < len(ci.exists) && i < len(ci.existsNames); i = i + 1 {
+                    Map.put(names, ci.exists[i].id, ci.existsNames[i])
+                }
+                emit(g, CAmbiguity(C.Ambiguity {
+                    name = con.name, scheme = ci.scheme, span = Some(con.span),
+                    written = Vec.map(con.context, fun(p) = Some(p.span)), names = names,
+                    inferred = False,
+                }))
+            }
+        }
+    }
 }
 
 fun itemNames(item : Stmt) -> Vec String = match item.kind {
@@ -474,10 +529,12 @@ fun checkGroupRecursion(group : Vec Stmt, boundNames : Vec String,
 -- a set of mutually recursive definitions is; a declaration with no definition
 -- has nothing to contribute to one.
 fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
+    let reported = Set.new()
     for d in decls {
         if Map.contains(g.decls.foreigns, d.name) {
             Ty.typeError("'" + d.name + "' is declared more than once", Some(d.span))
         }
+        checkLibrary(g, d, reported)
         let params = Array.map(d.params, fun(param) = match param.kind {
             PAnnot(_, te) -> foreignType(g, te, d.name)
             -- The parser builds every one of these, so this cannot
@@ -492,7 +549,7 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
         }
         Map.put(g.decls.foreigns, d.name, ForeignInfo {
             name = d.name, symbol = d.symbol, params = params, fixed = d.fixed,
-            ret = ret, span = Some(d.span),
+            ret = ret, span = Some(d.span), library = d.library,
         })
         let id = boundAt(g, d.id, d.name, d.span)
         Set.add(g.decls.functions, id)
@@ -501,6 +558,57 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
         })
     }
 }
+
+-- Refuses `d` if its block names a library that an earlier block names with
+-- another major version, or if an earlier declaration takes its symbol from
+-- another library, the C library counting as one. Each is reported once, at
+-- `d`'s site, naming the earlier one's.
+--
+-- The earlier declarations are those already in `g.decls.foreigns`: every
+-- module checked before this one, live or not, and the declarations of this
+-- one before `d`, in that order, since the table is insertion-ordered.
+-- `reported` holds the blocks whose version is already reported, so that the
+-- rest of a block's declarations say nothing more.
+fun checkLibrary(g : Generator, d : ForeignDecl, reported : Set.Set String) -> Unit {
+    if let Some(library) = d.library {
+        let here = site(library.span)
+        if !Set.contains(reported, here) {
+            for (_, other) in Map.entries(g.decls.foreigns) {
+                let Some(earlier) = other.library else { continue }
+                if earlier.name == library.name && earlier.major != library.major {
+                    Set.add(reported, here)
+                    Ty.typeError("library '" + library.name + "' is declared here with version "
+                                 + Int.toString(library.major) + ", and with version "
+                                 + Int.toString(earlier.major) + " at " + site(earlier.span)
+                                 + "; a program can load only one version of a library",
+                                 Some(library.span))
+                    break
+                }
+            }
+        }
+    }
+    let from = libraryName(d.library)
+    for (_, other) in Map.entries(g.decls.foreigns) {
+        if other.symbol == d.symbol && libraryName(other.library) != from {
+            let at = match other.span {
+                Some(s) -> " at " + site(s)
+                None -> ""
+            }
+            Ty.typeError("'" + d.symbol + "' is declared here from " + from + ", and from "
+                         + libraryName(other.library) + at
+                         + "; a symbol can come from only one library", Some(d.span))
+            break
+        }
+    }
+}
+
+-- The library a declaration's block names, as a message names it.
+fun libraryName(library : Option ForeignLibrary) -> String = match library {
+    Some(l) -> "library '" + l.name + "'"
+    None -> "the C library"
+}
+
+fun site(s : Span) -> String = s.file + ":" + showSpan(s)
 
 -- Record each `foreign` definition's C signature.
 --
@@ -544,7 +652,7 @@ fun checkDefinitions(g : Generator, items : Vec Stmt) -> Unit {
                 }
                 Map.put(g.decls.definitions, d.name, ForeignInfo {
                     name = d.name, symbol = symbol, params = params,
-                    fixed = len(params), ret = ret, span = Some(d.span),
+                    fixed = len(params), ret = ret, span = Some(d.span), library = None,
                 })
             }
         }
@@ -608,7 +716,7 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
 
 -- Refuses a class whose equality superclasses can never hold together, and a
 -- method whose own context contradicts them. What an instance must prove is
--- `checkInstanceEqualities`'s.
+-- `genInstance`'s.
 --
 -- After every class is registered, since a class's closure reaches classes
 -- declared after it. Not in `Classes`, because it rewrites by givens, which is
@@ -668,20 +776,10 @@ fun writtenEqualities(m : MethodInfo) -> Vec Given {
         Vec.push(out, Given {
             pred = equalities[i],
             span = Some(if i < len(spans) { spans[i] } else { m.decl.span }),
+            grantedBy = None,
         })
     }
     out
-}
-
--- Returns the instance that some associated type at the top of `sides` is
--- stuck for want of, if one is: over a constructor that no instance covers.
-fun missingInstance(classes : ClassTable, sides : Array Ty.Type) -> Option Pred {
-    for side in sides {
-        if let TFam(name, arg, _) = Ty.prune(side) {
-            if let Some(p) = Classes.uncovered(classes, name, arg) { return Some(p) }
-        }
-    }
-    None
 }
 
 fun bindMethods(g : Generator) -> Unit {
@@ -735,7 +833,8 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
                     Diag.beginUnit()
                     Map.put(info.defaults, m.name, checkMethod(g, m, sk,
                         [], [], [],
-                        "the default definition of '" + m.name + "'", None, None))
+                        "the default definition of '" + m.name + "'", None,
+                        Some(dictName(m.cls))))
                     let _ = Diag.endUnit()
                 }
             }
@@ -744,15 +843,13 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
     for decl in instDecls {
         let inst = instanceFor(g, decl)
         let info = classNamed(g, decl.cls)
-        checkInstanceEqualities(g, inst, info)
         let params = Vec.new(len(inst.context))
         for q in inst.context { Vec.push(params, dictName(q.name)) }
         let plan = Classes.newInstancePlan(params)
         inst.plan = Some(plan)
-        -- The instance's own dictionary and its context are named once and
-        -- shared by every method, because that is how they are bound: once, when
-        -- the dictionary is built.
-        let selfName = dictName(decl.cls)
+        genInstance(g, inst, info, plan)
+        -- The instance's context is named once and shared by every method,
+        -- because that is how it is bound: once, when the dictionary is built.
         for methodDecl in decl.methods {
             let m = match Map.get(info.methods, methodDecl.name) {
                 Some(x) -> x
@@ -771,113 +868,265 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
             Diag.beginUnit()
             Map.put(plan.methods, methodDecl.name, checkMethod(g, m, sk, context,
                 plan.params, equalities, "instance '" + decl.cls + " " + Ty.show(inst.head)
-                + "'", Some(methodDecl), Some(selfName)))
+                + "'", Some(methodDecl), None))
             let _ = Diag.endUnit()
         }
     }
 }
 
--- Reports what `inst`'s context cannot give it: an equality in the context
--- that can never hold, where the context writes it; an equality that a
--- superclass's instance needs; and an equality superclass of its own class,
--- at its head.
+-- Emits the check of `inst`'s declaration: GHC's `tcInstDecl2` without the
+-- methods, which `genMethodBodies` checks, each in an implication of its own
+-- under the same givens.
 --
--- Each is decided under the instance's givens, which are its whole context
--- expanded at once (`Classes.contextPreds`, `Inert.granted`): its written
--- equalities, and the equality superclasses of its class predicates. Its
--- methods are checked under the same givens.
-fun checkInstanceEqualities(g : Generator, inst : InstInfo, info : ClassInfo) -> Unit {
-    -- Checked once per instance rather than in each method's check, though
-    -- every override is granted the same equalities: a refusal there would be
-    -- reported once per method, or never for an instance with no methods.
-    let spans = Vec.new(len(inst.equalities))
-    for p in inst.decl.context {
-        if let PEq(_, _) = p.kind { Vec.push(spans, Some(p.span)) }
-    }
-    -- Over skolems named as the declaration names its variables, as a
-    -- method's check sees them, so a refusal prints them as written.
+-- The head's variables are skolems, named as the declaration names them, and
+-- the givens are the instance's context, each where the context wrote it, so
+-- a context that can never hold is refused there (`C.refusedHere`). The
+-- wanteds are what the instance's dictionary holds that the instance does not
+-- define: each superclass at the head, naked (`tcSuperClasses`), and the
+-- instance's own class at the head once for each method it takes from its
+-- class's default (`mkDefMethBind`). Their holes are the evidence the
+-- dictionary is built from, so an instance with no methods is checked too.
+-- An equality superclass is a naked wanted like a class superclass, and its
+-- coercion's hole is the evidence for its slot.
+fun genInstance(g : Generator, inst : InstInfo, info : ClassInfo,
+                plan : Classes.InstancePlan) -> Unit {
     let sk = Classes.newSkolems()
     for v in Ty.varsOf([inst.head]) {
         discard(Classes.skolemBind(sk, v, Map.getOr(inst.names, v.id, "a")))
     }
-    let n = Classes.writtenNamer(inst.names)
-    -- The class predicates first: an equality the context writes that
-    -- contradicts what they grant is then the one refused, where it is written.
-    let preds = Classes.contextPreds(inst)
-    let givens = Array.init(len(preds), fun(i) = Inert.Given {
-        pred = Classes.skolemApplyPred(sk, preds[i]),
-        span = if i < len(inst.context) { None } else { spans[i - len(inst.context)] },
-    })
-    let (inert, refused) = Inert.extend(Inert.empty(g.classes), givens)
-    for r in refused {
-        match r {
-            Never(Given { pred, span = None }, why) ->
-                Ty.typeError("the context of '" + Classes.showDeclared(inst) + "' grants '"
-                             + Ty.showPredWith(pred, n) + "', which can never hold with the "
-                             + "rest of it; " + why, Some(inst.decl.span))
-            _ -> discard(C.refusedHere(r, CAnd([])))
+    let head = Classes.skolemApply(sk, inst.head)
+    let self = Ty.pred(inst.cls, [head])
+    let where = Some(inst.decl.span)
+    let classSpans = Vec.new(len(inst.context))
+    let equalitySpans = Vec.new(len(inst.equalities))
+    for p in inst.decl.context {
+        match p.kind {
+            PEq(_, _) -> Vec.push(equalitySpans, p.span)
+            _ -> Vec.push(classSpans, p.span)
         }
     }
-    if len(refused) > 0 { return {} }
-    let named = Vec.map(inst.context, fun(p) = ("", p))
-    var supersHold = True
+    let context = Array.map(inst.context, Classes.skolemApplyPred(sk, _))
+    let equalities = Array.map(inst.equalities, Classes.skolemApplyPred(sk, _))
+
+    let givens = Vec.new(len(context) + len(equalities))
+    for var i = 0; i < len(context) && i < len(plan.params); i = i + 1 {
+        Vec.push(givens, (plan.params[i], context[i], spanAt(classSpans, i)))
+    }
+    for var i = 0; i < len(equalities); i = i + 1 {
+        Vec.push(givens, ("", equalities[i], spanAt(equalitySpans, i)))
+    }
+    let required = "the superclasses of '" + Classes.showDeclared(inst) + "'"
+    let wanteds = Vec.new(len(info.supers) + 1)
+    let supers = Vec.new(len(info.supers))
     for sup in info.supers {
-        let demand = Ty.pred(sup.name, [inst.head])
-        -- `Classes.checkInstance` has reported a superclass with no evidence.
-        let ev = match Classes.prove(g.classes, named, demand) {
-            Some(found) -> found
-            None -> {
-                supersHold = False
-                continue
-            }
-        }
-        for q in Classes.provenEqualities(ev) {
-            if !Inert.implies(inert, Classes.skolemApplyPred(sk, q)) {
-                Ty.typeError("'" + Ty.showPredWith(demand, n) + "' is required by '"
-                             + inst.cls + "', and its instance needs '"
-                             + Ty.showPredWith(q, n) + "'; add it to the context",
-                             Some(inst.decl.span))
-            }
-        }
+        let hole = newHole()
+        Vec.push(supers, (sup.name, hole))
+        Vec.push(wanteds, CPred(C.nakedCell(Ty.pred(sup.name, [head]), where, required, hole)))
     }
-    -- A missing superclass instance would leave its associated types stuck,
-    -- and this would report it again.
-    if supersHold {
-        for e in info.equalities {
-            proveEquality(g.classes, inst, inert, n,
-                          Classes.skolemApplyPred(sk, Classes.equalityAt(info, e, inst.head)))
-        }
+    let defaults = Vec.new(2)
+    let defined = Set.new()
+    for m in inst.decl.methods { Set.add(defined, m.name) }
+    for (name, _) in Map.entries(info.defaults) {
+        if Set.contains(defined, name) { continue }
+        -- A derived instance writes this one itself (`Turkey.Lower`).
+        if Classes.isDerivedMethod(inst, name) { continue }
+        let hole = newHole()
+        Vec.push(defaults, (name, hole))
+        Vec.push(wanteds, C.cpredInto(self, hole, where, "the default definition of '"
+                                      + Classes.surfaceMember(name) + "'"))
     }
-    Inert.close(inert)
+    let fields = if inst.derived { derivedFields(g, inst, sk, wanteds) } else { [] }
+    let holes = Vec.new(len(info.equalities))
+    for e in info.equalities {
+        let hole = newHole()
+        Vec.push(holes, hole)
+        let want = Classes.skolemApplyPred(sk, Classes.equalityAt(info, e, inst.head))
+        let cell = C.nakedCell(want, where, required, hole)
+        -- Solved with the class's side first, so that a mismatch reads as the
+        -- class expecting what it declares. The coercion keeps the side
+        -- order the dictionary's slot has (`PredCell.posed`).
+        cell.pred = Ty.pred(Ty.equals, [want.args[1], want.args[0]])
+        Vec.push(wanteds, CPred(cell))
+    }
+    emit(g, instanceImplication(givens, self, sk, CAnd(wanteds), where))
+    Vec.push(g.instanceChecks, InstanceCheck {
+        inst = inst, supers = supers, equalities = holes, defaults = defaults,
+        fields = fields, skolems = sk.mapping,
+    })
 }
 
--- Reports the equality superclass `want` of `inst`'s class, at its head, if
--- the instance's givens `inert` do not prove it: if it can never hold, or if
--- they do not decide it.
-fun proveEquality(classes : ClassTable, inst : InstInfo, inert : Inert.Inert, n : Namer,
-                  want : Pred) -> Unit {
-    let left = Inert.rewrite(inert, want.args[0])
-    let right = Inert.rewrite(inert, want.args[1])
-    if Ty.sameType(left, right) { return {} }
-    let required = "'" + Classes.showDeclared(inst) + "' requires '"
-                   + Ty.showPredWith(want, n) + "'"
-    let (_, never) = Inert.extend(inert, [Inert.given(Ty.pred(Ty.equals, [left, right]))])
-    let refuted = Iterator.any(never, fun(r) = match r {
-        Never(_, _) -> True
-        GaveUp(_, _) -> False
-    })
-    if refuted {
-        Ty.typeError(required + ", which can never hold: '" + Ty.showAt(left, n, 1)
-                     + "' is not '" + Ty.showAt(right, n, 1) + "'", Some(inst.decl.span))
-    } else if let Some(missing) = missingInstance(classes, [left, right]) {
-        Ty.typeError(required + ", and there is no instance '"
-                     + Ty.showPredWith(missing, n) + "' to define it", Some(inst.decl.span))
-    } else {
-        Ty.typeError(required + ", and its context cannot tell whether '"
-                     + Ty.showAt(left, n, 1) + "' is '" + Ty.showAt(right, n, 1) + "'",
-                     Some(inst.decl.span))
+-- Adds to `wanteds` the derived instance `inst`'s class at the type of each
+-- field its method reads (`Classes.derivedParts`), once per type, over the
+-- skolems `sk`, and returns each one's predicate at the head and its hole,
+-- by `Ty.typeKey` of the type.
+-- Their evidence is what the method `Turkey.Lower` writes compares or hashes
+-- each field with, as a written method's would be.
+--
+-- The derivation inferred the context so that these hold, and refused the
+-- instance where it could not, so the solver rejects one only if the two
+-- disagree. That would be a compiler bug, but the solver reports it as it
+-- reports any instance it cannot check, where `derivedAt` says.
+fun derivedFields(g : Generator, inst : InstInfo, sk : Skolems,
+                  wanteds : Vec Constraint) -> Vec (String, Pred, Hole) {
+    let out = Vec.new(4)
+    let tycon = Classes.headTycon(inst.head)
+    let info = match Classes.derivableInfo(g.decls, tycon) {
+        Some(i) -> i
+        None -> bug("a derived instance for the unknown type '" + tycon + "'",
+                    Some(inst.decl.span))
+    }
+    let atFields = Classes.derivedFieldClass(inst.cls, tycon)
+    let required = "the derived '" + Classes.showDeclared(inst) + "'"
+    let where = Some(derivedAt(g, info, inst))
+    let parts = match Classes.derivedParts(g.decls, inst.cls, info, inst.head) {
+        Right(found) -> found
+        Left(_) -> bug("a derived instance whose fields cannot have its class",
+                       Some(inst.decl.span))
+    }
+    let seen = Set.new()
+    for (_, _, ty) in parts {
+        let key = Ty.typeKey(ty)
+        if Set.contains(seen, key) { continue }
+        Set.add(seen, key)
+        let hole = newHole()
+        Vec.push(out, (key, Ty.pred(atFields, [ty]), hole))
+        Vec.push(wanteds, C.cpredInto(Ty.pred(atFields, [Classes.skolemApply(sk, ty)]),
+                                      hole, where, required))
+    }
+    if inst.cls == P.debugClass { carriedFields(g, inst, info, sk, where, required, out, wanteds) }
+    out
+}
+
+-- Adds to `out`, for each existential constructor of `info`, the derived
+-- `Debug` at each field whose type it hides and whose `Debug` follows from
+-- the instance's context and the classes the constructor carries, keyed
+-- `Classes.fieldKey`, and adds to `wanteds` an implication that checks
+-- them: under the carried classes, over the head's skolems `sk` and
+-- constants of the opening's own (`Classes.openHidden`), which
+-- `Classes.carried` records for the lowering to open the constructor with.
+-- The derivation floated what those fields need of the head's variables
+-- into the context (`Classes.inferContext`), so a field this asks for
+-- holds. A field whose `Debug` does not follow prints as `<hidden>`, and
+-- nothing is asked of it.
+fun carriedFields(g : Generator, inst : InstInfo, info : Decls.TyconInfo, sk : Skolems,
+                  where : Option Span, required : String, out : Vec (String, Pred, Hole),
+                  wanteds : Vec Constraint) -> Unit {
+    let context = Array.map(Vec.toArray(inst.context), Classes.skolemApplyPred(sk, _))
+    for c in info.variants {
+        if len(c.exists) == 0 { continue }
+        let o = Classes.openHidden(g.classes, inst, c, sk)
+        let givens = Vec.new(len(context) + len(o.carried.givens))
+        for p in context { Vec.push(givens, p) }
+        for (_, p) in o.carried.givens { Vec.push(givens, p) }
+        let inner = Vec.new(2)
+        for (i, want) in o.wanted {
+            if !Classes.entailed(g.classes, givens, want, o.skolems) { continue }
+            let hole = newHole()
+            Vec.push(out, (Classes.fieldKey(c.name, i), want, hole))
+            Vec.push(inner, C.cpredInto(want, hole, where, required))
+        }
+        if len(inner) == 0 { continue }
+        Map.put(g.classes.carried, Classes.carriedKey(inst, c.name), o.carried)
+        let assumed = Vec.new(len(o.carried.givens))
+        for (name, p) in o.carried.givens { Vec.push(assumed, (name, p, None)) }
+        Vec.push(wanteds, CAssume(assumed, None, CLet(LetCell {
+            binds = [(C.noBinder, "%carried", Ty.tUnit())], defn = CAnd(inner),
+            body = CAnd([]), span = where, topLevel = False, dicts = None,
+            skolems = o.carried.skolems, rigid = [], exporting = NoExports,
+        })))
     }
 }
+
+-- Returns the span of the derive-list entry of `info` that asked for
+-- `inst`'s class: its own, or for an `Eq` that `: Ord` or `: Hash` implies,
+-- the first entry that implies it. An instance no entry asked for, one the
+-- type gets without asking, is at the declaration.
+fun derivedAt(g : Generator, info : TyconInfo, inst : InstInfo) -> Span {
+    for d in info.derives { if !d.refused && d.cls == inst.cls { return d.span } }
+    for d in info.derives {
+        if !d.refused && Vec.contains(Classes.superclassesOf(g.classes, d.cls), inst.cls) {
+            return d.span
+        }
+    }
+    inst.decl.span
+}
+
+-- Checks every instance derived and not checked yet, as `genInstance`
+-- checks a written one, and its fields' instances besides
+-- (`derivedFields`), by adding their constraints to the frame being built.
+-- Returns whether there were any.
+fun genDerived(g : Generator) -> Bool {
+    let derived = g.classes.derived
+    let any = g.classes.checkedUpTo < len(derived)
+    -- `derived` only grows, so those past the cursor are those not checked.
+    while g.classes.checkedUpTo < len(derived) {
+        let inst = derived[g.classes.checkedUpTo]
+        g.classes.checkedUpTo = g.classes.checkedUpTo + 1
+        let params = Vec.new(len(inst.context))
+        for q in inst.context { Vec.push(params, dictName(q.name)) }
+        let plan = Classes.newInstancePlan(params)
+        inst.plan = Some(plan)
+        genInstance(g, inst, classNamed(g, inst.cls), plan)
+    }
+    any
+}
+
+-- Solves `c`, the constraint `generate` built, with `s`, and checks every
+-- instance derived while it does. Once this returns, a new derivation is a
+-- compiler bug (`Classes.derive`).
+--
+-- A derive list's instances are derived before generation, and `generate`
+-- checks them with the written ones. An instance a type gets without asking
+-- is derived the first time a predicate needs it (`Classes.selectInstance`),
+-- which is while `c` is solved, and defaulting can lead to more. So after
+-- each step of the run, the constraints of the instances begun during it are
+-- built and solved in the same run, as a written instance's are, and a
+-- default round follows only once they are. Checking one instance can begin
+-- another, so `solveDerived` repeats until a pass begins none.
+--
+-- It ends because each derivation is begun at most once, by its class and
+-- type constructor, of which there are finitely many, and each derived
+-- instance is checked once, by `genDerived`, which reads each only once.
+fun solve(g : Generator, s : C.Solver, c : Constraint) -> Unit {
+    C.solveMore(s, c)
+    solveDerived(g, s)
+    C.solveRefusals(s)
+    solveDerived(g, s)
+    -- What is left open after an error is most often open because of it, so
+    -- defaulting it would only guess, and nothing is reported as stranded.
+    if !Diag.hasErrors() {
+        while C.defaultOnce(s) { solveDerived(g, s) }
+        C.finish(s)
+    }
+    g.classes.open = False
+}
+
+-- Checks the instances derived since the last call, and those checking them
+-- derives, until there are none.
+fun solveDerived(g : Generator, s : C.Solver) -> Unit {
+    loop {
+        push(g)
+        let any = genDerived(g)
+        let c = pop(g)
+        if !any { break }
+        C.solveMore(s, c)
+    }
+}
+
+-- Returns the implication that checks the instance whose head is `self`,
+-- over the skolems `sk`, under `givens`, that `wanteds` hold, as one unit of
+-- diagnostics.
+fun instanceImplication(givens : Vec (String, Pred, Option Span), self : Pred, sk : Skolems,
+                        wanteds : Constraint, where : Option Span) -> Constraint =
+    CUnit(CAssume(givens, Some(self), CLet(LetCell {
+        binds = [(C.noBinder, "%instance " + Ty.showPred(self), Ty.tUnit())],
+        defn = wanteds, body = CAnd([]), span = where, topLevel = False,
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
+    })))
+
+-- Returns the `i`th of `spans`, if there is one.
+fun spanAt(spans : Vec Span, i : Int) -> Option Span =
+    if i < len(spans) { Some(spans[i]) } else { None }
 
 fun instanceFor(g : Generator, decl : InstanceDecl) -> InstInfo {
     for inst in Map.getOr(g.classes.instances, decl.cls, []) {
@@ -898,7 +1147,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
                 context : Array Pred, contextNames : Vec String,
                 equalities : Array Pred,
                 what : String, override : Option FunDecl,
-                selfNameIn : Option String) -> MethodImpl {
+                self : Option String) -> MethodImpl {
     for v in m.scheme.quantified {
         if !Map.contains(sk.mapping, v.id) {
             discard(Classes.skolemBind(sk, v, Map.getOr(m.names, v.id, "a")))
@@ -906,16 +1155,16 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     }
     let expected = Classes.skolemApply(sk, m.scheme.body)
     -- A method's scheme states its class's predicate first, then its own
-    -- context. The two are given to the body for different reasons and arrive by
-    -- different routes: the first is the dictionary the body belongs to, the
-    -- rest are parameters of every call.
+    -- context. The rest are parameters of every call. The first is a given
+    -- only of a default, under the name `self`, since a default is a function
+    -- of the dictionary it is defaulted into (GHC's `$dm`). An override is
+    -- checked under its instance's context and nothing else (`tcMethodBody`):
+    -- what it needs of its own class at its own head, the instance itself
+    -- provides, as it would anywhere else (Note [Subtle interaction of
+    -- recursion and overlap] in `GHC.Tc.TyCl.Instance`).
     let own = Vec.new(len(m.scheme.preds))
     for var i = 1; i < len(m.scheme.preds); i = i + 1 {
         Vec.push(own, Classes.skolemApplyPred(sk, m.scheme.preds[i]))
-    }
-    let selfName = match selfNameIn {
-        Some(n) -> n
-        None -> dictName(m.cls)
     }
     -- An equality in that context is a given too, and not a parameter: it has
     -- no evidence, so only the class predicates are named as dictionaries
@@ -926,7 +1175,9 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
         if own[i].name != Ty.equals { Vec.push(params, names[i]) }
     }
     let givens = Vec.new(4)
-    Vec.push(givens, (selfName, Classes.skolemApplyPred(sk, m.scheme.preds[0])))
+    if let Some(name) = self {
+        Vec.push(givens, (name, Classes.skolemApplyPred(sk, m.scheme.preds[0])))
+    }
     for var i = 0; i < len(own); i = i + 1 {
         Vec.push(givens, (names[i], own[i]))
     }
@@ -968,10 +1219,10 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     -- A unit of diagnostics, as a top-level group is.
     -- No context at this site wrote these: the class's signature grants them
     -- to every override.
-    emit(g, CUnit(CAssume(Vec.map(givens, fun((n, p)) = (n, p, None)), CLet(LetCell {
+    emit(g, CUnit(CAssume(Vec.map(givens, fun((n, p)) = (n, p, None)), None, CLet(LetCell {
         binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [],
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
     }))))
     -- Only the constants this scope actually *made*. The mapping also holds the
     -- class variable, whose entry is the instance head rather than a skolem, and
@@ -986,7 +1237,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
             _ -> {}
         }
     }
-    MethodImpl { decl = decl, selfName = selfName, dictParams = params,
+    MethodImpl { decl = decl, selfName = Option.unwrapOr(self, ""), dictParams = params,
                  skolems = skolems }
 }
 
@@ -1034,37 +1285,33 @@ fun declaredScheme(g : Generator,
         }
     }
     let body = TFun(params, retType)
-    -- The ambiguity test the inference path applies at generalization, run here
-    -- instead, where it is purely syntactic: a written context that constrains a
-    -- variable the type does not reach can never be decided by a use site,
-    -- because there is nothing at a use site to decide it with.
-    let cells = Array.map(preds, fun(p) =
-        PredCell { pred = p, span = Some(decl.span), context = "read", hole = newHole(),
-                   at = None })
-    let ids = C.reach(cells, [body])
-    -- Blamed in the names the signature wrote, not in the letters printing would
-    -- invent: the whole point of a declared type is that it is the programmer's
-    -- text, so a complaint about it should quote that text.
-    let written = Ty.namer("")
-    for (name, v) in Map.entries(tyvars) {
-        match v {
-            TVar(cell) -> Map.put(written.names, cell.id, name)
-            _ -> {}
-        }
-    }
+    -- A constraint is about the function's type variables: a class applied to
+    -- one or to a type built from one. Whether the type determines them is
+    -- the ambiguity check's business (`ambiguityOf`).
     for var i = 0; i < len(preds) && i < len(decl.context); i = i + 1 {
-        var touches = False
-        for v in Ty.varsOf(preds[i].args) {
-            if Set.contains(ids, v.id) { touches = True }
-        }
-        if !touches {
-            Ty.typeError("'" + Ty.showPredWith(preds[i], written) + "' constrains a type "
-                         + "variable that the declared type of '" + decl.name + "' does "
-                         + "not mention; remove it from the context",
-                         Some(decl.context[i].span))
+        if len(Ty.varsOf(preds[i].args)) == 0 {
+            Ty.typeError("'" + Ty.showWritten(preds[i]) + "' constrains no type variable; "
+                         + "remove it from the context", Some(decl.context[i].span))
         }
     }
     Some((Ty.scheme(quantified, body, preds), tyvars))
+}
+
+-- Returns the check that the signature of `decl`, which declares `s` over
+-- the variables `tyvars`, is not ambiguous (`C.checkAmbiguity`). An ambiguous
+-- signature is reported in the names the signature wrote: the whole point of a
+-- declared type is that it is the programmer's text, so a complaint about it
+-- should quote that text.
+fun ambiguityOf(decl : FunDecl, s : Scheme, tyvars : Map String Ty.Type) -> Constraint {
+    let names = Map.new()
+    for (name, v) in Map.entries(tyvars) {
+        if let TVar(cell) = v { Map.put(names, cell.id, name) }
+    }
+    let written = Vec.map(decl.context, fun(p) = Some(p.span))
+    CAmbiguity(C.Ambiguity {
+        name = decl.name, scheme = s, span = Some(decl.span), written = written,
+        names = names, inferred = False,
+    })
 }
 
 -- Check a body against the type its `fun` declared.
@@ -1133,10 +1380,10 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
         let at = if i < len(decl.context) { Some(decl.context[i].span) } else { None }
         Vec.push(written, (n, p, at))
     }
-    CAssume(written, CLet(LetCell {
+    CAssume(written, None, CLet(LetCell {
         binds = [(C.noBinder, "%sig." + decl.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [],
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
     }))
 }
 
@@ -1349,9 +1596,9 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
         for item in group {
             match item.kind {
                 SFun(d) -> match Map.get(g.partialHeaders, d.id) {
-                    Some((header, written)) ->
+                    Some((header, written, spans)) ->
                         Vec.push(rigid, (Binders.nameAt(g.binders, d.id, d.span), d.span,
-                                         header, written))
+                                         header, written, spans))
                     None -> {}
                 }
                 _ -> {}
@@ -1360,7 +1607,7 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
         node = CLet(LetCell {
             binds = binds, defn = defn, body = body, span = Some(group[0].span),
             topLevel = top, dicts = Some(dicts), skolems = [],
-            rigid = rigid,
+            rigid = rigid, exporting = exportingOf(g, group, binds),
         })
     } else {
         -- No generalization means no new rank, so the definition is solved right
@@ -1376,6 +1623,41 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
     -- is what makes a recursive occurrence an instantiation.
     if len(sigs) > 0 { node = CBind(sigs, node, top) }
     node
+}
+
+-- Returns which binders of the generalizing group `group`, which binds
+-- `binds`, may be exports, and where each is bound.
+fun exportingOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type))
+        -> Exporting {
+    let at = Map.new()
+    for item in group {
+        match item.kind {
+            SFun(d) -> Map.put(at, boundAt(g, d.id, d.name, d.span), d.span)
+            SLet(pat, _) -> for v in varPatterns(pat) {
+                if let PVar(name) = v.kind { Map.put(at, boundAt(g, v.id, name, v.span), v.span) }
+            }
+            _ -> {}
+        }
+    }
+    let sites = Vec.new(len(binds))
+    for (id, _, _) in binds {
+        match Map.get(at, id) {
+            Some(where) -> Vec.push(sites, where)
+            None -> return NoExports
+        }
+    }
+    match group[0].kind {
+        SFun(_) -> FunExports(sites)
+        SLet(pat, _) -> if isVariable(pat) { NoExports } else { PatternExports(sites) }
+        _ -> NoExports
+    }
+}
+
+-- Returns whether `p` is a name, possibly annotated.
+fun isVariable(p : Pat) -> Bool = match p.kind {
+    PVar(_) -> True
+    PAnnot(inner, _) -> isVariable(inner)
+    _ -> False
 }
 
 -- The binders a group binds, the definition's constraint, whether it
@@ -1463,6 +1745,7 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
     }
     push(g)
     for (decl, s, tyvars) in checks {
+        emit(g, ambiguityOf(decl, s, tyvars))
         emit(g, checkSignature(g, decl, s, tyvars))
     }
     for var i = 0; i < len(inferred); i = i + 1 {
@@ -1574,7 +1857,10 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
                         _ -> {}
                     }
                 }
-                if len(header) > 0 { Map.put(g.partialHeaders, key, (header, written)) }
+                if len(header) > 0 {
+                    Map.put(g.partialHeaders, key,
+                            (header, written, Vec.map(context, fun(p) = p.span)))
+                }
             }
         }
         Some(_) -> {}
@@ -1597,8 +1883,14 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     }
     g.loopStack = loops
     discard(Vec.pop(g.fnStack))
-    -- A body of type bottom leaves `ret` to be fixed by the `return`s.
-    eq(g, ret, bodyType, Some(where), bodyWhy)
+    -- A body of type bottom leaves `ret` to be fixed by the `return`s. The
+    -- equation arises from the body, so a mismatch found in it later, once
+    -- the solver knows more, is reported there and not at the header.
+    let bodyAt = match bodyExpr {
+        Some(b) -> Some(b.span)
+        None -> Some(where)
+    }
+    eq(g, ret, bodyType, bodyAt, bodyWhy)
     let inner = pop(g)
 
     -- A parameter that opened an existential scopes its rigid constants over
@@ -2184,10 +2476,10 @@ fun openedConstraint(openings : Vec (Array (String, Pred), Vec ConCell),
         for (n, p) in gs { Vec.push(givens, (n, p, None)) }
         for s in made { Vec.push(skolems, s) }
     }
-    CAssume(givens, CLet(LetCell {
+    CAssume(givens, None, CLet(LetCell {
         binds = [(C.noBinder, "%opened", Ty.tUnit())], defn = inner,
         body = CAnd([]), span = where, topLevel = False,
-        dicts = None, skolems = skolems, rigid = [],
+        dicts = None, skolems = skolems, rigid = [], exporting = NoExports,
     }))
 }
 

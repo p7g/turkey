@@ -42,10 +42,11 @@ import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Text.Show (Show(..))
+import Debug (Debug(..))
 import Data.Functor (Functor(..))
 import Control.Applicative (Applicative(..))
 import Control.Monad (Monad(..))
-import Control.Iterator (Iterator(..))
+import Iter (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Monoid (Monoid(..))
@@ -64,8 +65,9 @@ import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 
 -- The first `length` slots of `storage` are the elements; the rest is room to
--- grow into, and is never read.
-type VecStorage a = VecStorage {
+-- grow into, and is never read, so `!Debug` keeps a derived `Debug` from
+-- reading it.
+type VecStorage a : !Debug = VecStorage {
     var storage : Prim.Array a,
     var length  : Int,
 }
@@ -164,6 +166,8 @@ fun filter(xs : Vec a, keep : fun(a) -> Bool) -> Vec a {
     out
 }
 
+-- Returns the result of calling `step` on the accumulator and each element in
+-- turn. `Iter.fold` takes the same arguments and works on anything iterable.
 fun fold(xs : Vec a, initial : b, step : fun(b, a) -> b) -> b {
     var acc = initial
     for x in xs { acc = step(acc, x) }
@@ -335,15 +339,53 @@ instance Monad Vec {
     }
 }
 
-instance Show (Vec a) : Show a {
-    fun show(xs) {
+-- Equal when they have the same length and equal elements at each index.
+instance Eq (Vec a) : Eq a {
+    fun eq(xs, ys) {
+        let left = state(xs)
+        let right = state(ys)
+        if left.length != right.length { return False }
+        -- Test both lengths on every step, not once: the slots past `length`
+        -- are not elements and may be uninitialized, and an element's `eq`
+        -- may pop from either.
+        for var i = 0; i < left.length && i < right.length; i = i + 1 {
+            if left.storage[i] != right.storage[i] { return False }
+        }
+        left.length == right.length
+    }
+}
+
+-- Compares element by element from the front: the first index where the two
+-- differ decides, and a vector that is a proper prefix of the other is less.
+instance Ord (Vec a) : Ord a {
+    fun lt(xs, ys) {
+        let left = state(xs)
+        let right = state(ys)
+        -- Test both lengths on every step, as `eq` does: an element's `lt`
+        -- may pop from either vector.
+        for var i = 0; i < left.length && i < right.length; i = i + 1 {
+            if left.storage[i] < right.storage[i] { return True }
+            if right.storage[i] < left.storage[i] { return False }
+        }
+        left.length < right.length
+    }
+}
+
+-- Its elements, as the array literal that builds it. Only the first
+-- `length` slots are read: the rest may never have been written.
+instance Debug (Vec a) : Debug a {
+    fun debug(xs) {
         var out = "["
         var rest = False
         for x in xs {
             if rest { out = Str.concat(out, ", ") }
-            out = Str.concat(out, show(x))
+            out = Str.concat(out, debug(x))
             rest = True
         }
         Str.concat(out, "]")
     }
 }
+
+-- What its `Debug` prints: a container's text shows its elements' `Debug`,
+-- so that a string in it is quoted.
+instance Show (Vec a) : Debug a { fun show(xs) = debug(xs) }

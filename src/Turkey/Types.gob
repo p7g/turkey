@@ -4,7 +4,7 @@ export (
     VarCell(..), ConCell(..), Type(..), Fresh, tcon, skolemCon,
     noScope, ground, unranked, equals,
     newVar, freshVar, tvar,
-    shortName, qualify, qualifyAll, clearQualified, display,
+    shortName, bareName, qualify, qualifyAll, clearQualified, display,
     tInt, tByte, tFloat, tString, tChar, tBool, tUnit,
     primitives, isPrimitive,
     intMin, intMax, byteMin, byteMax, charMax, isScalarValue,
@@ -19,10 +19,10 @@ export (
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
     skolemsOf, markOpened, openedBy, clearOpened, markBreaker, breakerFor,
-    isFam, occursRigidly, occursIn,
-    unify, join, generalize, instantiate, instantiateQual, typeError,
+    isFam, occursRigidly, occursIn, untouchable,
+    unify, join, generalize, instantiate, instantiateQual, typeError, mismatch,
     typeKey, sameType, subterms, varsOf, freeVars,
-    Namer(..), namer, namerFrom, show, showAt, showWritten, showScheme, showPred,
+    Namer(..), namer, namerAvoiding, namerFrom, show, showAt, showWritten, showScheme, showPred,
     showPredWith,
 )
 
@@ -55,7 +55,7 @@ export (
 import Data.Set as Set
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
-import Turkey.Source (Span(..))
+import Turkey.Source (Span(..), isGenerated)
 
 -- -- kinds --------------------------------------------------------------------------
 --
@@ -622,20 +622,21 @@ fun floatLiteralSet() -> Array String = Array.map(decimalMantissas, _.0)
 fun numericType(name : String) -> Type = tcon(name, KStar, noScope)
 
 -- Every container an array literal could be, most-preferred first.
-let arrayLiteralNames = ["Data.Array#Array", "Data.Vec#Vec"]
+let arrayLiteralNames = ["Data.Array#Array", "Data.Vec#Vec", "FrozenArray#FrozenArray"]
 
 -- The containers an array literal could be, given which of them the program
 -- declares. `declared` answers that for a qualified type name.
 --
 -- The fixed `Array` is always a member, and first: it is what a literal
 -- nothing decides defaults to, and the builtin every literal could always be.
--- `Vec` is a member only when the program has declared `Data.Vec#Vec` by the
--- time the module holding the literal is checked. Modules are checked after
--- everything they import, so every module that could be handed a `Vec`, through
--- any chain of imports, has it in the set. A program that never loads
--- `Data.Vec` has the set `{Array}`, which `Turkey.Infer` gives a literal as
--- plain `Array`. So a diagnostic about a literal never names a container the
--- program does not have.
+-- Every other member is in the set only when the program has declared it by
+-- the time the module holding the literal is checked: `Vec` once
+-- `Data.Vec#Vec` is declared, `FrozenArray` once `FrozenArray#FrozenArray` is.
+-- Modules are checked after everything they import, so every module that could
+-- be handed one, through any chain of imports, has it in the set. A program
+-- that loads neither has the set `{Array}`, which `Turkey.Infer` gives a
+-- literal as plain `Array`. So a diagnostic about a literal never names a
+-- container the program does not have.
 --
 -- Each member is a constructor of kind `* -> *`, applied to the literal's
 -- element type.
@@ -774,6 +775,10 @@ type Families = Families {
     -- variable at this level or below, and defers an equation that would
     -- instead. `noScope` makes every variable touchable.
     untouchable : Int,
+    -- Called with each variable `unify` binds, right after binding it: a
+    -- constraint the solver set aside because it was stuck on the variable
+    -- may now make progress.
+    bound       : fun(VarCell) -> Unit,
 }
 
 -- Prune, then rewrite the head with `fams` until it sticks.
@@ -980,7 +985,14 @@ fun firstOf(a : Option v, b : Option v) -> Option v = match a {
 -- an occurs check or a kind error has failed would build a cyclic or ill-kinded
 -- type for the rest of the solve to trip over.
 fun unify(a : Type, b : Type, where : Option Span, context : String,
-          fams : Option Families) -> Unit {
+          fams : Option Families) -> Unit = unifyIn(a, b, where, context, fams, False)
+
+-- Equates `a` and `b` as `unify` does. `flipped` says that they are swapped
+-- from the equation as written. An equation this defers keeps the written
+-- order, so a mismatch found when it is solved later names its sides as a
+-- mismatch found here would.
+fun unifyIn(a : Type, b : Type, where : Option Span, context : String,
+            fams : Option Families, flipped : Bool) -> Unit {
     let x = normalize(a, fams)
     let y = normalize(b, fams)
 
@@ -1006,7 +1018,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             if untouchable(cell, fams) {
                 match y {
                     TVar(other) -> if !untouchable(other, fams) {
-                        return unify(y, x, where, context, fams)
+                        return unifyIn(y, x, where, context, fams, !flipped)
                     }
                     _ -> {}
                 }
@@ -1020,7 +1032,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 -- Only if that clears it: an escape still there is reported
                 -- in the types the expression wrote, not the rewritten ones.
                 if !sameType(deep, y) && Option.isNone(escaping(cell, deep)) {
-                    return unify(x, deep, where, context, fams)
+                    return unifyIn(x, deep, where, context, fams, flipped)
                 }
             }
             match escaping(cell, y) {
@@ -1045,7 +1057,7 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
                 -- family makes the type infinite.
                 if !occursRigidly(x, y) {
                     return match fams {
-                        Some(f) -> f.defer(x, y, where, context)
+                        Some(f) -> deferAs(f, x, y, flipped, where, context)
                         None -> mismatch(x, y, where, context)
                     }
                 }
@@ -1064,17 +1076,20 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             -- solved outside.
             if untouchable(cell, fams) {
                 return match fams {
-                    Some(f) -> f.defer(x, y, where, context)
+                    Some(f) -> deferAs(f, x, y, flipped, where, context)
                     None -> {}
                 }
             }
             cell.ref = Some(y)
-            return {}
+            return match fams {
+                Some(f) -> f.bound(cell)
+                None -> {}
+            }
         }
         _ -> {}
     }
     match y {
-        TVar(_) -> return unify(y, x, where, context, fams)
+        TVar(_) -> return unifyIn(y, x, where, context, fams, !flipped)
         _ -> {}
     }
 
@@ -1109,6 +1124,11 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
         _ -> unifyRest(x, y, where, context, fams)
     }
 }
+
+-- Defers `x ~ y` through `f`, with its sides swapped back if `flipped`.
+fun deferAs(f : Families, x : Type, y : Type, flipped : Bool, where : Option Span,
+            context : String) -> Unit =
+    if flipped { f.defer(y, x, where, context) } else { f.defer(x, y, where, context) }
 
 -- A family that did not reduce, or a plain mismatch.
 --
@@ -1299,7 +1319,7 @@ fun sameType(a : Type, b : Type) -> Bool {
         (TFam(n1, a1, _), TFam(n2, a2, _)) -> n1 == n2 && sameType(a1, a2)
         (TFun(p1, r1), TFun(p2, r2)) -> sameTypes(p1, p2) && sameType(r1, r2)
         (TTuple(e1), TTuple(e2)) -> sameTypes(e1, e2)
-        (TSet(n1), TSet(n2)) -> sameNames(n1, n2)
+        (TSet(n1), TSet(n2)) -> n1 == n2
         (TBottom, TBottom) -> True
         _ -> False
     }
@@ -1309,14 +1329,6 @@ fun sameTypes(a : Array Type, b : Array Type) -> Bool {
     if len(a) != len(b) { return False }
     for var i = 0; i < len(a); i = i + 1 {
         if !sameType(a[i], b[i]) { return False }
-    }
-    True
-}
-
-fun sameNames(a : Array String, b : Array String) -> Bool {
-    if len(a) != len(b) { return False }
-    for var i = 0; i < len(a); i = i + 1 {
-        if a[i] != b[i] { return False }
     }
     True
 }
@@ -1463,10 +1475,19 @@ type Namer = Namer {
     -- Whether an associated type is rendered bare, as a context writes it
     -- (`Trouble s`), rather than under its class (`Sink.Trouble s`).
     var bare : Bool,
+    -- Names no variable is given, because something else shown beside it
+    -- already has them.
+    taken    : Set.Set String,
 }
 
 fun namer(prefix : String) -> Namer =
-    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False }
+    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False, taken = Set.new() }
+
+-- Returns a namer that gives no variable a name in `taken`: the names of the
+-- skolems a message may also show, so that an unknown type cannot be read as
+-- one of them.
+fun namerAvoiding(prefix : String, taken : Set.Set String) -> Namer =
+    Namer { names = Map.new(), next = 0, prefix = prefix, bare = False, taken = taken }
 
 -- Returns `p` as a program writes it in a context: variables named `a`, `b`,
 -- ... and associated types bare, `Trouble s` and not `Sink.Trouble s`.
@@ -1482,7 +1503,10 @@ fun namerFrom(quantified : Vec VarCell, prefix : String) -> Namer {
     for var i = 0; i < len(quantified); i = i + 1 {
         Map.put(names, quantified[i].id, varName(i))
     }
-    Namer { names = names, next = len(quantified), prefix = prefix, bare = False }
+    Namer {
+        names = names, next = len(quantified), prefix = prefix, bare = False,
+        taken = Set.new(),
+    }
 }
 
 -- `a`..`z`, then `a1`, `b1`, ... Built from the code point rather than from a
@@ -1501,6 +1525,7 @@ fun varName(index : Int) -> String {
 fun showVar(cell : VarCell, n : Namer) -> String = match Map.get(n.names, cell.id) {
     Some(name) -> name
     None -> {
+        while Set.contains(n.taken, n.prefix + varName(n.next)) { n.next = n.next + 1 }
         let name = n.prefix + varName(n.next)
         Map.put(n.names, cell.id, name)
         n.next = n.next + 1
@@ -1582,10 +1607,18 @@ fun showPredWith(p : Pred, n : Namer) -> String {
 -- -- diagnostics --------------------------------------------------------------------
 
 -- Reports a type error and returns, for a site that can leave its types as
--- they are and carry on.
+-- they are and carry on. Raises an internal error instead at a span
+-- `Turkey.Source.generated` made.
 fun typeError(message : String, where : Option Span) -> Unit = match where {
     None -> Diag.report(Diag.whole("type error", message))
-    Some(s) -> Diag.report(Diag.at("type error", message, s))
+    -- Every declaration at a generated span is one the compiler wrote, with
+    -- its types built by the compiler too, such as a derived `Typed`
+    -- instance. A type error there is a compiler bug.
+    Some(s) -> if isGenerated(s) {
+        Diag.fail(Diag.at("internal error", message, s), s.file)
+    } else {
+        Diag.report(Diag.at("type error", message, s))
+    }
 }
 
 fun discard(x : a) -> Unit = {}

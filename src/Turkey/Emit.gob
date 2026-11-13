@@ -1,6 +1,7 @@
 export (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
     emitSwapStack, emitStackStart, emitWorkerStart, functionEnd,
+    blockOrder, computedAtEdges, markKey,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -65,10 +66,39 @@ type Code = Code {
     var prologueDone : Bool,
     -- The format, which decides the shape of the frame rules (`cfi`).
     dialect          : Asm.Dialect,
+    -- The labels debug information asks for, by `markKey` of where each
+    -- goes, and the last point of the block being emitted that has had
+    -- its label placed. Labels, like rows, are items of no size.
+    marks            : Map.Map Int Asm.Symbol,
+    var markedTo     : Int,
 }
 
 fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
-    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d }
+    Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d,
+           marks = Map.new(), markedTo = 0 }
+
+-- The key of point `p` of block `block`, for the labels `emitFunc` places.
+-- Point 0 is the block's start, point `n + 1` is after its instruction `n`,
+-- so the point after the last instruction is before the terminator, and the
+-- point one past that is after the terminator.
+fun markKey(block : Int, p : Int) -> Int = block << 32 | p
+
+-- Places the label of each point of `block` after the last one placed, up
+-- to and including `upTo`, that the marks ask for.
+fun markTo(b : Code, block : Int, upTo : Int) -> Unit {
+    while b.markedTo < upTo {
+        b.markedTo = b.markedTo + 1
+        if let Some(label) = Map.get(b.marks, markKey(block, b.markedTo)) {
+            emit(b, Label(label))
+        }
+    }
+}
+
+-- Places the label at the start of `block`, if the marks ask for one.
+fun markStart(b : Code, block : Int) -> Unit {
+    b.markedTo = 0
+    if let Some(label) = Map.get(b.marks, markKey(block, 0)) { emit(b, Label(label)) }
+}
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -76,11 +106,6 @@ fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
 -- no value holds. `d31` is the vector file's, for a cycle of doubles.
 let scratch = Physical(Gp, 16)
 let fpScratch = Physical(Fp, 31)
-
--- The largest byte offset a scaled unsigned immediate reaches on a 64-bit
--- load or store. Past it the offset goes into `scratch` and the access uses
--- the register form.
-let widestOffset = 32760
 
 -- The largest `add` immediate without a shift, which is how a frame slot's
 -- address is formed.
@@ -105,10 +130,13 @@ fun instruction(b : Code, op : A.Arm) -> Unit {
 fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
     Asm.localLabel(d, "f" + Int.toString(tag) + "end")
 
--- Function `tag`, with a line table row at each change of position if `rows`.
+-- Function `tag`, with a line table row at each change of position if `rows`,
+-- and the labels `marks` asks for (`markKey`).
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, rows : Bool, out : Vec (Item Inst)) -> Unit {
-    let b = code(out, rows, asm.dialect)
+             l : Frame.Layout, tag : Int, rows : Bool, marks : Map.Map Int Asm.Symbol,
+             out : Vec (Item Inst)) -> Unit {
+    let b = Code { items = out, at = 0, rows = rows, row = -1, prologueDone = False,
+                   dialect = asm.dialect, marks = marks, markedTo = 0 }
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
     cfi(b, StartProc)
@@ -118,33 +146,34 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     b.at = f.at
     prologue(b, l)
     b.prologueDone = rows
-    -- Reverse postorder, so a block's most likely successor is the next block
-    -- and its edge costs no instruction at all. A block that is only the exit
-    -- is not placed: its edges go to the exit itself.
     let exits = exitBlocks(f)
-    let order = Vec.filter(Ssa.reversePostorder(f), fun(at) = !exits[Ssa.blockId(at)])
+    let order = blockOrder(f)
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
     let cold = Cold { text = code([], rows, d), count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
-        let at = Ssa.blockId(order[k])
-        let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
+        let at = order[k]
+        let next = if k + 1 < len(order) { order[k + 1] } else { -1 }
         emit(b, Label(blockLabel(d, tag, at)))
+        markStart(b, at)
         let block = f.blocks[at]
         match fused(block, reads) {
             Some((c, yes, no)) -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts) - 1)
+                markTo(b, at, len(block.insts))
                 b.at = block.termAt
                 conditional(b, d, tag, exits, c, yes, no, next)
             }
             None -> {
                 emitInsts(b, cold, d, f, a, l, tag, edges, at, block.insts, len(block.insts))
+                markTo(b, at, len(block.insts))
                 if !endsInTailCall(block) {
                     b.at = block.termAt
                     emitTerm(b, d, f, a, l, tag, edges, exits, block.term, next)
                 }
             }
         }
+        markTo(b, at, len(block.insts) + 1)
     }
     for item in cold.text.items { emit(b, item) }
     if leaves(f) {
@@ -156,6 +185,25 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     cfi(b, EndProc)
     if rows { emit(b, Label(functionEnd(d, tag))) }
 }
+
+-- The blocks of `f` in the order `emitFunc` places them: reverse postorder,
+-- so a block's most likely successor is the next block and its edge costs no
+-- instruction at all. A block that is only the exit is not placed: its edges
+-- go to the exit itself.
+fun blockOrder(f : Func Inst) -> Vec Int {
+    let exits = exitBlocks(f)
+    let out = []
+    for at in Ssa.reversePostorder(f) {
+        if !exits[Ssa.blockId(at)] { Vec.push(out, Ssa.blockId(at)) }
+    }
+    out
+}
+
+-- For each value, whether a jump computes it into a block parameter's
+-- register in place of its definition (`atEdges`): until the jump, no
+-- register holds it.
+fun computedAtEdges(f : Func Inst) -> Array Bool =
+    Array.map(atEdges(f, useCounts(f)), Option.isSome)
 
 -- -- the zero exit -----------------------------------------------------------
 
@@ -216,6 +264,7 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
               edges : Array (Option A.Arm), at : Int, insts : Vec Inst,
               upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
+        markTo(b, at, n)
         -- Skip a definition the jump computes, rather than filtering the block
         -- beforehand, so that `n` stays the instruction's index in its block:
         -- `Frame.stubAt` names an allocation by that index.
@@ -596,12 +645,20 @@ fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
 -- what lets the allocator see one instruction: the destination holds each
 -- intermediate in turn, so no other value is disturbed. An empty cursor
 -- branches to its stub, after the function, which keeps `save` across its
--- call.
+-- call; so does every object too large for a size class.
 fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
              l : Frame.Layout, tag : Int, dest : Reg, al : A.Allocation,
              save : Frame.CallSave, safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
+    -- Past `Rt.fastBytes` there is no cursor, and the runtime places the
+    -- object.
+    if al.size > Rt.fastBytes {
+        instruction(b, A.B(allocationLabel(d, tag, n, "s")))
+        emit(b, Label(allocationLabel(d, tag, n, "r")))
+        stub(cold.text, d, f, l, tag, n, dest, al, save, safepoint)
+        return
+    }
     let cursor = scratch
     let word = Physical(Gp, 17)
     instruction(b, A.AddImm(cursor, A.worker,
@@ -659,17 +716,12 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     let top = allocationLabel(d, tag, n, "l")
     let cursor = scratch
     let word = Physical(Gp, 17)
-    let shift = match al.width {
-        1 -> 0
-        4 -> 2
-        _ -> 3
-    }
-    instruction(b, A.MovConst(cursor, (Rt.fastBytes - Rt.arrayElements) / al.width + 1))
+    instruction(b, A.MovConst(cursor, (Rt.fastBytes - Rt.arrayElements) / al.stride + 1))
     instruction(b, A.Cmp(length, cursor, A.W64))
     instruction(b, A.BCond(A.Hs, slow))
     -- The class, from the array's size: the header, the length and the
     -- elements.
-    instruction(b, A.LslImm(word, length, shift, A.W64))
+    multiply(b, word, length, al.stride)
     instruction(b, A.AddImm(word, word, Rt.arrayElements + Rt.classStep, A.W64))
     instruction(b, A.LsrImm(word, word, Rt.classShift, A.W64))
     instruction(b, A.Adrp(cursor, al.classes))
@@ -692,12 +744,12 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.Add(dest, dest, word, A.W64))
     if al.sizes {
         sizeEntry(b, dest, cursor, word)
-        instruction(b, A.LslImm(word, length, shift, A.W64))
+        multiply(b, word, length, al.stride)
         instruction(b, A.AddImm(word, word, Rt.arrayElements, A.W64))
         instruction(b, A.Str(word, Offset(cursor, 0), A.W64))
     }
-    -- The header, young, with the element's layout code, and the length.
-    instruction(b, A.MovConst(cursor, Rt.headerWord(Rt.arrayKind, al.layout, 0)))
+    -- The header, young, with the element's descriptor, and the length.
+    instruction(b, A.MovConst(cursor, Rt.headerWord(Rt.arrayKind, al.pointers, al.stride)))
     instruction(b, A.Str(cursor, Offset(dest, 0), A.W64))
     instruction(b, A.Str(length, Offset(dest, 8), A.W64))
     -- Every element, including an array of pointers to nothing, which the
@@ -716,11 +768,20 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     -- `cursor` starts 8 below the last pair, at the elements' bytes rounded
     -- up to a word less one word, so that the pair is stored at `cursor + 8`
     -- and the loop runs while `cursor` is above `dest`: it stops at `dest`
-    -- for an odd count of words and at `dest - 8` for an even one.
+    -- for an odd count of words and at `dest - 8` for an even one. A stride
+    -- below a word divides one, and any other is a whole number of words.
     instruction(b, A.Cbz(length, back, A.W64))
     instruction(b, A.Str(fill, Offset(dest, Rt.arrayElements), A.W64))
-    instruction(b, A.SubImm(cursor, length, 1, A.W64))
-    if shift < 3 { instruction(b, A.LsrImm(cursor, cursor, 3 - shift, A.W64)) }
+    if al.stride < 8 {
+        instruction(b, A.SubImm(cursor, length, 1, A.W64))
+        let shift = if al.stride == 1 { 0 } else { 2 }
+        instruction(b, A.LsrImm(cursor, cursor, 3 - shift, A.W64))
+    } else if al.stride == 8 {
+        instruction(b, A.SubImm(cursor, length, 1, A.W64))
+    } else {
+        multiply(b, cursor, length, al.stride / 8)
+        instruction(b, A.SubImm(cursor, cursor, 1, A.W64))
+    }
     instruction(b, A.LslImm(cursor, cursor, 3, A.W64))
     instruction(b, A.Add(cursor, dest, cursor, A.W64))
     instruction(b, A.Cmp(cursor, dest, A.W64))
@@ -750,9 +811,32 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
         argument(text, A.x0, length)
         argument(text, x1, fill)
     }
-    instruction(text, A.MovConst(A.argRegs[2], al.width))
-    instruction(text, A.MovConst(A.argRegs[3], al.layout))
+    instruction(text, A.MovConst(A.argRegs[2], al.stride))
+    instruction(text, A.MovConst(A.argRegs[3], al.pointers))
     returnFromStub(text, d, f, l, tag, n, dest, al.slow, save, safepoint)
+}
+
+-- `d` set to `s` times `n`, a positive constant, touching no register but
+-- `d`: the stub's scratch registers are all in use where an array's size is
+-- worked out. Shifts and adds by the bits of `n`, from the highest down, so a
+-- power of two is one shift. `d` must not be `s` unless `n` is a power of
+-- two, since each add reads `s` after `d` is written.
+fun multiply(b : Code, d : Reg, s : Reg, n : Int) -> Unit {
+    var top = 0
+    while n >> (top + 1) > 0 { top = top + 1 }
+    var from = s
+    var pending = 0
+    for var k = top - 1; k >= 0; k = k - 1 {
+        pending = pending + 1
+        if n >> k & 1 == 1 {
+            instruction(b, A.LslImm(d, from, pending, A.W64))
+            instruction(b, A.Add(d, d, s, A.W64))
+            from = d
+            pending = 0
+        }
+    }
+    if pending > 0 { instruction(b, A.LslImm(d, from, pending, A.W64)) }
+    else { argument(b, d, from) }
 }
 
 -- `mov d, s`, left out when `s` is `d`, as `emitInst` leaves out a taken hint.
@@ -881,8 +965,11 @@ fun placed(l : Frame.Layout, m : Mem, wide : Option Int) -> Mem =
 fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
     Some(m) -> match Frame.offsetOf(l, m) {
         Some(offset) -> {
-            let widest = if A.isFrameAddress(op) { widestAddend } else { widestOffset }
-            if offset > widest { Some(offset) } else { None }
+            -- Past what the access encodes, the offset goes into `scratch`
+            -- and the access uses the register form.
+            let fits = if A.isFrameAddress(op) { offset <= widestAddend }
+                       else { A.offsetFits(offset, A.accessSize(op)) }
+            if fits { None } else { Some(offset) }
         }
         None -> None
     }
@@ -1176,7 +1263,8 @@ fun emitLiterals(asm : Asm.Asm, b : Code) -> Unit {
     emit(b, Section(Asm.Data))
     emit(b, Align(3))
     emit(b, Label(Asm.staticStart(asm.dialect)))
-    let header = Rt.staticHeaderWord(Rt.arrayKind, Rt.layoutCode(Ssa.untraced(I8)), 0)
+    let bytes = Rt.element([Ssa.untraced(I8)])
+    let header = Rt.staticHeaderWord(Rt.arrayKind, bytes.layout.pointers, bytes.stride)
     for var i = 0; i < len(ordered); i = i + 1 {
         emit(b, Align(3))
         emit(b, Label(Asm.literalName(asm.dialect, i)))
@@ -1554,7 +1642,7 @@ fun call(b : Code, d : Asm.Dialect, name : String) -> Unit =
 -- immediate does not reach. `boot` interns thousands of literals, so the root
 -- array is past 32,760 bytes long before the corpus is.
 fun storeAt(b : Code, r : Reg, base : Reg, offset : Int) -> Unit {
-    if offset <= widestOffset {
+    if A.offsetFits(offset, 3) {
         instruction(b, A.Str(r, Offset(base, offset), A.W64))
         return
     }

@@ -1,4 +1,5 @@
-export (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet, waitingSwap)
+export (Coroutine, Binding(..), new, resume, suspend, finished, running, waiting, waitingSet,
+        waitingSwap, bindings, bindingsSet)
 
 -- Coroutines: a function run on a stack of its own, which can stop part way
 -- through -- at any depth of ordinary calls -- and be continued later.
@@ -13,6 +14,7 @@ export (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet,
 -- resumed to the end keeps its stack and everything its frames hold.
 
 import Prelude ()
+import Debug (Debug(..))
 import Data.Int (Int)
 import Data.Tuple (Unit)
 import Data.Eq (Eq(..), (==))
@@ -28,7 +30,9 @@ import Turkey.Ptr as Ptr
 import Turkey.Array as Storage
 import Turkey.Process as Process
 
-type Coroutine = Coroutine {
+-- Its state is read and written only under its protocol, by tasks that may
+-- run in parallel, so `!Debug` keeps a derived `Debug` from reading it.
+type Coroutine : !Debug = Coroutine {
     -- `Turkey.Stack`'s record of this coroutine's stack.
     stack        : Ptr,
     body         : fun() -> Unit,
@@ -38,7 +42,17 @@ type Coroutine = Coroutine {
     -- instructions, since a waker and the coroutine's own worker change it
     -- at once.
     waiting      : Prim.Atomic,
+    -- The scoped values (`ScopedValue`) bound on this stack, innermost first.
+    -- They live here rather than per thread because a coroutine can suspend
+    -- on one worker and resume on another, and its bindings must go with it.
+    var bindings : Option Binding,
 }
+
+-- One scoped value's binding, and the bindings it shadows or extends. `key`
+-- is the `ScopedValue`'s number, which is unique to it, so two bindings with
+-- one key hold values of one type. Immutable, so a coroutine made inside
+-- the binding can share the whole list with its creator.
+type Binding = Binding[v] { key : Int, value : v, next : Option Binding }
 
 -- Each thread's running coroutine, if any, by the thread's index in its
 -- record (`Turkey.Process`). Held here rather than in the record because it
@@ -48,6 +62,24 @@ var currents : Prim.Array (Option Coroutine) = Storage.filled(Workers.threadLimi
 
 fun current() -> Option Coroutine = currents[worker()]
 
+-- Each thread's bindings for code on the thread's own stack, by the thread's
+-- index, as `currents` is. That code never moves to another thread, so a
+-- slot per thread is a slot per stack.
+var threadBindings : Prim.Array (Option Binding) =
+    Storage.filled(Workers.threadLimit(), None)
+
+-- Returns the scoped values bound on the running stack.
+fun bindings() -> Option Binding = match current() {
+    Some(c) -> c.bindings
+    None -> threadBindings[worker()]
+}
+
+-- Replaces the scoped values bound on the running stack.
+fun bindingsSet(b : Option Binding) -> Unit = match current() {
+    Some(c) -> { c.bindings = b }
+    None -> { threadBindings[worker()] = b }
+}
+
 fun currentSet(c : Option Coroutine) -> Unit { currents[worker()] = c }
 
 fun worker() -> Int = Ptr.load(Process.workerRecord(), 288)
@@ -56,12 +88,15 @@ fun worker() -> Int = Ptr.load(Process.workerRecord(), 288)
 -- coroutine touches cost memory.
 let stackBytes = 1048576
 
+-- Returns a coroutine that runs `body` when first resumed. It starts with
+-- the scoped values bound where it is made, not where it is resumed.
 fun new(body : fun() -> Unit) -> Coroutine = Coroutine {
     stack = Stack.new(stackBytes),
     body = body,
     running = False,
     finished = False,
     waiting = Prim.atomicNew(0),
+    bindings = bindings(),
 }
 
 fun finished(c : Coroutine) -> Bool = c.finished

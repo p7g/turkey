@@ -183,12 +183,14 @@ def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, s
 
 @pytest.fixture(scope="module")
 def code_probe(tmp_path_factory, allocator_object):
-    """Layout code 7 is traced and 6 is not, for both of the collector's readers.
+    """A word the header counts as traced is followed and one it does not is
+    not, for both of the collector's readers.
 
-    Reading `>= 6` as "traced" would pass every test that had no untraced
-    pointer in it, since the two codes would be one code. This is what makes
-    the distinction a property rather than a convention: an array's element tag and an object's three-bit slot metadata
-    are read by different branches of `mark_children`, and both are pinned.
+    A collector that followed every pointer-sized word would pass every test
+    that had no untraced pointer in it. An array's count of traced words per
+    element and an object's count of traced fields are read by different
+    branches of `drain`, and both are pinned, each with a word that points at
+    a live string and is not counted.
     """
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
@@ -237,32 +239,34 @@ static int survives(void *holder, void *s) {
     return alive;
 }
 
-static void *array_holding(int32_t code, void *s) {
-    TurkeyArray *a = turkey_array_new(1, 0, 8, code);
+/* One element of one word, traced if the header counts it. */
+static void *array_holding(int64_t traced, void *s) {
+    TurkeyArray *a = turkey_array_new(1, 0, 8, traced);
+    assert(a != NULL);
     a->elements[0] = (uint64_t)(uintptr_t)s;
     return a;
 }
 
-static void *object_holding(int32_t code, void *s) {
-    /* One word of fields, traced if the header counts it. */
-    TurkeyObject *o = turkey_object_new(0, 0, 8, code == 7 ? 1 : 0);
+/* One word of fields, traced if the header counts it. */
+static void *object_holding(int64_t traced, void *s) {
+    TurkeyObject *o = turkey_object_new(0, 0, 8, traced);
     o->slots[0] = (uint64_t)(uintptr_t)s;
     return o;
 }
 
 int main(void) {
     turkey_giblets_initialize();
-    void *a7 = turkey_string_new((const unsigned char *)"a7", 2);
-    assert(survives(array_holding(7, a7), a7));
+    void *a1 = turkey_string_new((const unsigned char *)"a1", 2);
+    assert(survives(array_holding(1, a1), a1));
 
-    void *a6 = turkey_string_new((const unsigned char *)"a6", 2);
-    assert(!survives(array_holding(6, a6), a6));
+    void *a0 = turkey_string_new((const unsigned char *)"a0", 2);
+    assert(!survives(array_holding(0, a0), a0));
 
-    void *o7 = turkey_string_new((const unsigned char *)"o7", 2);
-    assert(survives(object_holding(7, o7), o7));
+    void *o1 = turkey_string_new((const unsigned char *)"o1", 2);
+    assert(survives(object_holding(1, o1), o1));
 
-    void *o6 = turkey_string_new((const unsigned char *)"o6", 2);
-    assert(!survives(object_holding(6, o6), o6));
+    void *o0 = turkey_string_new((const unsigned char *)"o0", 2);
+    assert(!survives(object_holding(0, o0), o0));
 
     return turkey_has_panicked != 0;
 }
@@ -275,7 +279,7 @@ int main(void) {
     return binary
 
 
-def test_only_layout_code_seven_is_traced(code_probe):
+def test_only_the_traced_words_a_header_counts_are_followed(code_probe):
     result = subprocess.run(toolchain.command(code_probe), capture_output=True,
                             text=True)
     assert result.returncode == 0, result.stdout + result.stderr

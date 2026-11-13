@@ -8,7 +8,7 @@ import Data.Num (Add(..), Sub(..), Neg(..), (+), (-))
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<))
-import Data.Index (Index(..))
+import Data.Index (Index(..), Length(..))
 import Data.Int as Int
 import Data.Hashable (Hasher(..))
 import Hash.Words (rotl, Words64(..), byteAt)
@@ -18,11 +18,13 @@ import Hash.Words (rotl, Words64(..), byteAt)
 -- use. Unlike the others in `Hash` it is a keyed pseudorandom function, so an
 -- attacker who sees no hash values cannot build keys that collide.
 --
--- A word is one block. A run of bytes is its whole words as blocks and then
--- one block holding the remaining 0 to 7 bytes with the run's length in its
--- top byte, so that every run ends on a block boundary and two runs cannot
--- run together. The final block is SipHash's: the total length in the top
--- byte.
+-- A word is one block. A run of bytes is its length as one block, then its
+-- whole words as blocks, then, if 1 to 7 bytes remain, one block holding them
+-- zero-padded. The length comes first, so the blocks say where every run
+-- ends, whatever its length, and two runs cannot run together. That costs one
+-- round per run; a length byte in the last block would be free, but would
+-- keep only the length modulo 256. The final block is SipHash's: the total
+-- length in the top byte.
 --
 -- The state is changed in place and each method returns the state it was
 -- given, which `Hasher` allows because a caller uses each state once. A state
@@ -77,20 +79,24 @@ instance Hasher SipHash {
         s
     }
 
-    fun hashBytes(s, bytes, from, to) {
+    fun hashBytes(s, bytes) {
         let words = Words64(bytes)
-        var at = from
-        while to - at >= 8 {
+        let n = len(bytes)
+        absorb(s, n)
+        var at = 0
+        while n - at >= 8 {
             absorb(s, words[at])
             at = at + 8
         }
-        var last = ((to - from) & 255) << 56
-        var shift = 0
-        for var i = at; i < to; i = i + 1 {
-            last = last | byteAt(bytes, i) << shift
-            shift = shift + 8
+        if at < n {
+            var last = 0
+            var shift = 0
+            for var i = at; i < n; i = i + 1 {
+                last = last | byteAt(bytes, i) << shift
+                shift = shift + 8
+            }
+            absorb(s, last)
         }
-        absorb(s, last)
         s
     }
 

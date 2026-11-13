@@ -16,7 +16,7 @@ export (
 -- * it decodes pointer membership, object layouts and roots itself, and never
 --   calls the collector's tracing, marking or lookup helpers;
 -- * it is written against the heap's *format* -- the region, header, object,
---   size-table and root-frame layouts, the layout codes and the frame table,
+--   size-table and root-frame layouts, the array descriptor and the frame table,
 --   copied below -- and not against how the collector happens to walk them.
 --
 -- The first is structural: `Turkey.Heap` imports this module, so this one
@@ -110,8 +110,9 @@ let stateStaticBytes : Int = 152
 
 -- An object's header, the word its address points at: the generation (u8),
 -- the kind (u8), the count of the traced words its fields start with (u16),
--- and the tag (i32). An array has its element's layout code in the count's
--- place, and a cell 1 if its value is traced and 0 if not.
+-- and the tag (i32). An array has the count of traced words each of its
+-- elements starts with in the count's place and its elements' stride in bytes
+-- in the tag's, and a cell 1 if its value is traced and 0 if not.
 --
 -- The generation's values: young, old, and old and remembered.
 let young : Int = 0
@@ -376,6 +377,7 @@ fun nibble(n : Int, shift : Int) -> Int = n >> shift & 15
 fun generationOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) & 255
 fun kindOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) >> 8 & 255
 fun countOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 0) >> 16
+fun strideOf(h : Int) -> Int = Ptr.load32(Ptr.fromInt(h), 4)
 
 fun word(address : Int, offset : Int) -> Int =
     Ptr.load(Ptr.fromInt(address), offset)
@@ -761,9 +763,9 @@ fun checkSpares() -> Bool {
 -- The object at `h`, slot `slot` of region `r`, which `checkRegions` has
 -- bounded at `slotSize` bytes.
 --
--- An array's count is its element's layout code, which gives the element's
--- width; code 7 is a traced pointer, and 6 a raw address that must not be
--- followed. Any other object's count is the number of traced words its fields
+-- An array's count is the number of traced words each element starts with,
+-- and its tag is the elements' stride, a byte, four bytes or a whole number
+-- of words. Any other object's count is the number of traced words its fields
 -- start with, and its fields are a whole number of words. A closure is its
 -- environment and then its code's address. Read from the header and the size
 -- table alone, by this module's own rules: nothing here knows what the
@@ -787,21 +789,28 @@ fun checkObject(r : Int, slot : Int, h : Int, slotSize : Int) -> Bool {
         return count == 0
             || (checkPointer(value, marked, h, 0) && (!unremembered || notYoung(value, h, 0)))
     }
-    -- The words to check, from the first at `first`.
+    -- The words to check: `runs` runs of `per` words, one every `step` bytes
+    -- from `first`. An object other than an array is runs of one word.
     var first = objectFields
-    var traced = count
+    var runs = count
+    var per = 1
+    var step = 8
     if kind == arrayKind {
         let length = word(h, arrayLength)
-        if count > 7 { return fail(Prim.cString("invalid array layout"), h, -1) }
+        let stride = strideOf(h)
+        if !strideValid(stride) || count * 8 > stride {
+            return fail(Prim.cString("invalid array layout"), h, -1)
+        }
         if length < 0 { return fail(Prim.cString("invalid object header"), h, -1) }
-        let width = elementWidth(count)
         -- `size` is below a slot's size, so neither side of this can overflow.
-        if size < arrayElements || length > (size - arrayElements) / width
-                || (sizesKept && arrayElements + length * width != size) {
+        if size < arrayElements || length > (size - arrayElements) / stride
+                || (sizesKept && arrayElements + length * stride != size) {
             return fail(Prim.cString("payload size disagrees with header"), h, -1)
         }
         first = arrayElements
-        traced = if count == 7 { length } else { 0 }
+        runs = if count > 0 { length } else { 0 }
+        per = count
+        step = stride
     } else {
         if size < objectFields || size % 8 != 0 {
             return fail(Prim.cString("payload size disagrees with header"), h, -1)
@@ -811,17 +820,21 @@ fun checkObject(r : Int, slot : Int, h : Int, slotSize : Int) -> Bool {
             return fail(Prim.cString("invalid object descriptor"), h, -1)
         }
     }
-    for var field = 0; field < traced; field = field + 1 {
-        let child = word(h, first + 8 * field)
-        if !checkPointer(child, marked, h, field) { return False }
-        if unremembered && !notYoung(child, h, field) { return False }
+    for var run = 0; run < runs; run = run + 1 {
+        for var k = 0; k < per; k = k + 1 {
+            let field = run * per + k
+            let child = word(h, first + run * step + 8 * k)
+            if !checkPointer(child, marked, h, field) { return False }
+            if unremembered && !notYoung(child, h, field) { return False }
+        }
     }
     True
 }
 
--- Bytes one element of an array occupies, by its layout code: a byte, a
--- 32-bit word, or a word for every other code.
-fun elementWidth(code : Int) -> Int = if code == 2 { 1 } else if code == 3 { 4 } else { 8 }
+-- Whether an array's elements can be this many bytes apart: a byte, a 32-bit
+-- word, or a whole number of words.
+fun strideValid(stride : Int) -> Bool =
+    stride == 1 || stride == 4 || (stride >= 8 && stride % 8 == 0)
 
 -- `value`, found at slot `at` of `owner`, is an immediate, a static object or an allocated
 -- object; if `marked`, that object is marked too.

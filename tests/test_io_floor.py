@@ -63,7 +63,7 @@ fun main() {
     print(IO.close(fd) == 0 - Sys.ebadf)
 }
 """, tmp_path)
-    assert out == ["True", "7", "True", "6", "Some(o, wor)", "0", "2", "0", "True"]
+    assert out == ["True", "7", "True", "6", 'Some("o, wor")', "0", "2", "0", "True"]
     assert (tmp_path / "made").read_bytes() == b"he, wor"
     mask = os.umask(0)
     os.umask(mask)
@@ -155,7 +155,7 @@ fun main() {
     IO.copy(line, 10, line, 10, 10)
 }
 """, tmp_path)
-    assert out == ["Some(..uvwxyz..)", "Some(3456789789)"]
+    assert out == ['Some("..uvwxyz..")', 'Some("3456789789")']
 
 
 def test_copy_toward_the_end_of_one_array_is_a_memmove(tmp_path):
@@ -167,7 +167,7 @@ fun main() {
     print(String.fromBytes(Vec.fromArray(line)))
 }
 """, tmp_path)
-    assert out == ["Some(0120123456)"]
+    assert out == ['Some("0120123456")']
 
 
 @pytest.mark.parametrize("call", [
@@ -289,7 +289,7 @@ fun main() {
     seen = {}
     for line in out[:-2]:
         name, kind = line.rsplit(" ", 1)
-        seen[name.removeprefix("Some(").removesuffix(")")] = int(kind)
+        seen[name.removeprefix('Some("').removesuffix('")')] = int(kind)
     # `d_type` against Python's reading of the same directory.
     expected = {".": 4, "..": 4}
     for entry in os.scandir(tmp_path / "d"):
@@ -321,7 +321,7 @@ fun main() {
     print(String.fromBytes(Vec.fromArray(Array.slice(template, 0, 3))))
 }
 """, tmp_path)
-    assert out == ["0", "Some(dir)"]
+    assert out == ["0", 'Some("dir")']
     made = [p for p in os.listdir(tmp_path) if p.startswith("dir")]
     assert len(made) == 1 and len(made[0]) == 9 and (tmp_path / made[0]).is_dir()
 

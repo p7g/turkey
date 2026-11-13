@@ -9,7 +9,9 @@ never by turning verification off, which `Net.TLS` cannot do.
 
 Each program links with OpenSSL (`toolchain.openssl_libraries()`); a machine
 where that does not link skips these, unless `$TURKEY_REQUIRE_OPENSSL` says
-it must.
+it must. One is also written as an executable by `boot` itself, with no
+linker, which loads `libssl` and `libcrypto` by the names its declarations
+give them.
 """
 
 import os
@@ -102,11 +104,20 @@ def certs(tmp_path_factory):
     return d
 
 
-def _build(tmp_path, source):
+def _build(tmp_path, source, executable=False):
     entry = tmp_path / "main.gob"
     entry.write_text(source)
     binary = tmp_path / "tls"
-    bootc.link(entry, binary, libraries=tuple(toolchain.openssl_libraries()))
+    if not executable:
+        bootc.link(entry, binary, libraries=tuple(toolchain.openssl_libraries()))
+        return binary
+    env = dict(os.environ)
+    if (path := toolchain.openssl_dylib_path()):
+        env["TURKEY_DYLIB_PATH"] = path
+    written = subprocess.run(toolchain.command(bootc.binary(), "build", "-f", "exe", "-o",
+                                               str(binary), str(entry)),
+                             capture_output=True, text=True, env=env, timeout=600)
+    assert written.returncode == 0, written.stderr[-4000:]
     return binary
 
 
@@ -277,6 +288,12 @@ fun ask(host : String, port : Int, config : TLS.ClientConfig) -> Either TLSError
     Right(text(heard) + " / " + show(chosen))
 }
 
+-- A side's outcome, with the text it ended with unquoted.
+fun outcome(r : Either TLSError String) -> String = match r {
+    Right(t) -> "Right(" + t + ")"
+    Left(_) -> show(r)
+}
+
 -- The client's answer, and the server's.
 fun exchange(server : TLS.ServerConfig, client : TLS.ClientConfig, host : String) -> String {
     let (l, port) = listening()
@@ -287,7 +304,7 @@ fun exchange(server : TLS.ServerConfig, client : TLS.ClientConfig, host : String
         pure((s, c))
     })
     let _ = TCP.closeListener(l)
-    show(Task.join(c)) + " | " + show(Task.join(s))
+    outcome(Task.join(c)) + " | " + outcome(Task.join(s))
 }
 """
 
@@ -306,21 +323,27 @@ fun main() {
 """
 
 
+LOOPBACK_OUT = [
+    'Right(hello from localhost, sni Some("localhost"), alpn Some("http/1.1")'
+    ' / Some("http/1.1")) | Right(served)',
+    # SNI and the check go without the trailing dot.
+    'Right(hello from localhost., sni Some("localhost"), alpn Some("http/1.1")'
+    ' / Some("http/1.1")) | Right(served)',
+    # An address is checked against the certificate's addresses, and is
+    # not sent as SNI.
+    'Right(hello from 127.0.0.1, sni None, alpn Some("http/1.1")'
+    ' / Some("http/1.1")) | Right(served)',
+    'Right(hello from localhost, sni Some("localhost"), alpn None / None) | Right(served)',
+]
+
+
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_a_client_and_a_server_over_loopback(tmp_path, certs, workers):
-    out = _run(_build(tmp_path, LOOPBACK), certs, workers=workers)
-    assert out == [
-        'Right(hello from localhost, sni Some(localhost), alpn Some(http/1.1)'
-        ' / Some(http/1.1)) | Right(served)',
-        # SNI and the check go without the trailing dot.
-        'Right(hello from localhost., sni Some(localhost), alpn Some(http/1.1)'
-        ' / Some(http/1.1)) | Right(served)',
-        # An address is checked against the certificate's addresses, and is
-        # not sent as SNI.
-        'Right(hello from 127.0.0.1, sni None, alpn Some(http/1.1)'
-        ' / Some(http/1.1)) | Right(served)',
-        'Right(hello from localhost, sni Some(localhost), alpn None / None) | Right(served)',
-    ]
+    assert _run(_build(tmp_path, LOOPBACK), certs, workers=workers) == LOOPBACK_OUT
+
+
+def test_an_executable_boot_writes_runs_over_loopback(tmp_path, certs):
+    assert _run(_build(tmp_path, LOOPBACK, executable=True), certs) == LOOPBACK_OUT
 
 
 SNI = COMMON + """
@@ -337,8 +360,8 @@ fun main() {
 def test_sni_picks_the_certificate_that_names_the_host(tmp_path, certs):
     out = _run(_build(tmp_path, SNI), certs)
     for host, line in zip(["alpha.test", "beta.test", "www.beta.test", "localhost"], out):
-        assert line == (f'{host}: Right(hello from {host}, sni Some({host}), alpn '
-                        'Some(http/1.1) / Some(http/1.1)) | Right(served)')
+        assert line == (f'{host}: Right(hello from {host}, sni Some("{host}"), alpn '
+                        'Some("http/1.1") / Some("http/1.1")) | Right(served)')
     # A name no certificate has gets the first, which does not name it.
     assert out[4].startswith("elsewhere.test: Left(WrongHost) | Left(Refused(")
 
@@ -375,7 +398,7 @@ import Time.Sleep as Sleep
 
 fun brief(r : Either TLSError a) -> String = match r {
     Right(_) -> "Right"
-    Left(Stream(e)) -> "Stream " + e.op + " " + show(e.kind)
+    Left(Stream(e)) -> "Stream " + e.op + " " + debug(e.kind)
     Left(e) -> show(e)
 }
 
@@ -529,7 +552,7 @@ fun main() {
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_a_mebibyte_each_way_at_once(tmp_path, certs, workers):
     out = _run(_build(tmp_path, DUPLEX), certs, workers=workers)
-    assert out == ["Right(received 1048576)", "True", "Right(1048576)"]
+    assert out == ['Right("received 1048576")', "True", "Right(1048576)"]
 
 
 CONFIGURATION = COMMON + """

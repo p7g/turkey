@@ -203,7 +203,8 @@ not the others:
 | `a << n`, `a >> n` | `shl(a, n)`, `shr(a, n)` | `Shift` |
 
 The shift amount is an `Int` whatever is shifted. `Int` and `Byte` have all
-four classes ([Built-in types and classes](builtins.md#operator-classes)).
+four classes ([Built-in types and classes](builtins.md#operator-classes)),
+and a `Set` has the first three, for set algebra ([`Set`](builtins.md#set)).
 
 The bitwise groups bind tighter than the comparisons, so a mask test needs no
 parentheses, but they are unrelated to the arithmetic groups and to each other
@@ -635,19 +636,22 @@ parentheses, and `()` is the unit value ([Tuples](types.md#tuples)).
 array ::= "[" (expression ("," expression)*)? "]"
 ```
 
-`[e1, e2, ..., en]` builds a new [`Array`](builtins.md#array) or
-[`Vec`](builtins.md#vec) holding the values of `e1` to `en` in order. All
-elements must have the same type. `[]` is a new empty one, and its element type
-is inferred from how it is used.
+`[e1, e2, ..., en]` builds a new [`Array`](builtins.md#array),
+[`Vec`](builtins.md#vec) or [`FrozenArray`](builtins.md#frozenarray) holding
+the values of `e1` to `en` in order. All elements must have the same type.
+`[]` is a new empty one, and its element type is inferred from how it is used.
 
-Which of the two a literal builds is also inferred from how it is used, the
+Which of the three a literal builds is also inferred from how it is used, the
 way a numeric literal's type is: a literal passed to a function that takes a
-`Vec` is a `Vec`, and one that nothing decides is an `Array`
+`Vec` is a `Vec`, one used where a `FrozenArray` is expected is a
+`FrozenArray`, and one that nothing decides is an `Array`
 ([Array literals](inference.md#array-literals)).
 
-Each evaluation of an array literal creates a new container, which is
-[mutable](types.md#mutability-and-sharing). When it is an `Array`, it is
-approximately equivalent to:
+Each evaluation of an array literal creates a new container. An `Array` or a
+`Vec` is [mutable](types.md#mutability-and-sharing); a `FrozenArray` is not,
+and is approximately `FrozenArray.freeze` of the `Array` the literal would
+otherwise build, without the copy. When it is an `Array`, it is approximately
+equivalent to:
 
 ```ebnf
 {
@@ -726,7 +730,7 @@ fun main() {
 ```
 
 ```text
-[Ada]
+["Ada"]
 3.0
 ```
 

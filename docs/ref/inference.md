@@ -20,6 +20,11 @@ most general type the binding can have. Every other type it could be given is
 an instance of that one. So an annotation is never needed for a program to
 type-check, except in the few places listed [below](#where-annotations-are-needed),
 and adding one can only make a type more specific or state the same type.
+A few constraints that appear in inferred types cannot be written in an
+annotation: [`OneOf`](#numeric-literals) and the [field
+constraints](#field-and-projection-constraints), and `Typed` of a type constructor
+([`Typed` and `cast`](builtins.md#typed-and-cast)). A binding inferred with
+one of those has no annotation that restates its type.
 
 <!-- check -->
 ```kotlin
@@ -156,9 +161,10 @@ be closed. A variable is closed if it is
 * a `let` that the value restriction keeps from being generalized, if every
   variable it uses is closed and its type has no type variables.
 
-A parameter, a variable bound by a pattern, a `var` and a `do` binder are
-never closed. The value restriction applies as well: a closed `let` is
-generalized only if its right-hand side is a value.
+A parameter, a variable bound by the pattern of a `match` arm, an `if let`, a
+`while let` or a `for`, a `var` and a `do` binder are never closed. The value
+restriction applies as well: a closed `let` is generalized only if its
+right-hand side is a value.
 
 `show` is defined at the top level, so `describe` is closed and is generalized,
 and so is `both`, which uses only `describe`:
@@ -252,6 +258,73 @@ and inside the group each has a single, monomorphic type. So a function
 cannot be inferred to call itself at a different type. With a complete
 [signature](declarations.md#signatures), it can.
 
+Each function of the group is then generalized with only the constraints its
+own type reaches. A constraint that the others need on a type it does not
+mention is decided where the function is defined, as an unused literal's type
+is: by its default, or else it is an error.
+
+<!-- run -->
+```kotlin
+fun describe(x) = show(x) + countdown(0)
+
+fun countdown(n) = if n == 0 { "" } else { describe(True) }
+
+fun main() {
+    print(countdown(1))
+    print(countdown(1.5))
+}
+```
+
+```text
+True
+True
+```
+
+`describe` has the type `fun(Bool) -> String`. `countdown`, whose parameter
+is compared with `0`, keeps its constraints: `[OneOf a {Int, Float}, Eq a]
+fun(a) -> String`. A call of `describe` runs the group with `countdown`'s
+parameter at a type nothing decides, so the default of the literal `0`,
+`Int`, decides it.
+
+**Pattern bindings.** A `let` whose pattern is more than a name is
+generalized or not as a whole, by the same rules as a `let` of a name. When
+it is, each name it binds gets a type of its own, as each function of a
+recursive group does: it quantifies only the type variables its own type
+reaches, with only the constraints on them. A constraint that the right-hand
+side puts on a type that only the other names mention is decided where the
+`let` is, by its default, or else it is an error.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let (inc, isZero) = (fun(x) = x + 1, fun(n) = n == 0)
+    print(inc(1))
+    print(inc(1.5))
+    print(isZero(0))
+}
+```
+
+```text
+2
+2.5
+True
+```
+
+`inc` has the type `[OneOf a {Int, Float}, Add a] fun(a) -> a`, and `isZero`
+has `[OneOf b {Int, Float}, Eq b] fun(b) -> Bool`. No use of `inc` decides
+the type of `n`, so the default of the literal `0`, `Int`, decides it.
+
+Here only `Show` constrains the type of the parameter of `describe`, and
+`Show` has no default, so the type `count` needs it at is undecided:
+
+<!-- error: cannot determine what type 'a' is in 'Show a', which 'count' needs from the 'let' that binds it; add a type annotation -->
+```kotlin
+fun main() {
+    let (describe, count) = (fun(x) = show(x), 0)
+    print(describe(count))
+}
+```
+
 > **For readers new to this.** The *value restriction* is the rule ML uses to
 > keep polymorphism and mutation apart. Without it, `let cell = []` could be
 > both a `Vec Int` and a `Vec String`, and a program could push an `Int` and
@@ -330,8 +403,8 @@ written in a program.
 ## Array literals
 
 An [array literal](expressions.md#array-literals) does not have a single type
-either. It is an `Array` or a `Vec` of its elements, decided by how its value is
-used, and an `Array` when nothing decides:
+either. It is an `Array`, a `Vec` or a `FrozenArray` of its elements, decided
+by how its value is used, and an `Array` when nothing decides:
 
 <!-- run -->
 ```kotlin
@@ -347,7 +420,7 @@ fun main() {
 ```
 
 ```text
-[to, be, or, not]
+["to", "be", "or", "not"]
 ```
 
 `seen` is a `Vec` because `Vec.contains` and `Vec.push` take one. The words are
@@ -372,8 +445,9 @@ fun main() {
 
 `empty` is `fun() -> Array a`: generic in the element, but not in the
 container. Declaring `fun empty() -> Vec a` makes it build a `Vec`. A signature
-cannot ask for both: `fun empty() -> c a = []` is rejected with `an array
-literal cannot have type 'c a'; it must be one of 'Array', 'Vec'`.
+cannot ask for several: `fun empty() -> c a = []` is rejected with `an array
+literal cannot have type 'c a'; it must be one of 'Array', 'Vec',
+'FrozenArray'`.
 
 A literal in a top-level `let` is decided by that `let`'s own definition. The
 binding is not generalized ([the value restriction](#generalization)), and uses
@@ -390,16 +464,16 @@ fun remember(x : Int) = Vec.push(pending, x)
 
 Annotate the binding, `let pending : Vec Int = []`, to make it a `Vec`.
 
-The constraint a literal contributes is `OneOf t {Array, Vec} e`: `t` must be
-one of the listed containers applied to the element type `e`. Like the numeric
+The constraint a literal contributes is `OneOf t {Array, Vec, FrozenArray} e`:
+`t` must be one of the listed containers applied to the element type `e`. Like the numeric
 one, it cannot be written in a program, and a mismatch names the set:
 
-<!-- error: an array literal cannot have type 'Int'; it must be one of 'Array', 'Vec' -->
+<!-- error: an array literal cannot have type 'Int'; it must be one of 'Array', 'Vec', 'FrozenArray' -->
 ```kotlin
 let count : Int = [1, 2]
 ```
 
-> **Coming from Haskell.** This is `OverloadedLists`, with a closed set of two
+> **Coming from Haskell.** This is `OverloadedLists`, with a closed set of three
 > containers instead of the class `IsList`, and with a default: a literal
 > nothing decides is an `Array` rather than ambiguous.
 
@@ -475,8 +549,44 @@ fun main() {
 }
 ```
 
-A signature that states a constraint on a variable its type does not mention
-is rejected for the same reason, where it is written.
+A **type** is ambiguous when no use of it could decide one of its variables,
+and an ambiguous type is rejected where it is declared, whether a signature
+writes it or it is inferred. The test is whether the type is as general as
+itself: a use instantiates each variable with an unknown type, matches the
+type it gets against the declared one, and must then satisfy the context from
+what that match decided. A variable that the context constrains and the match
+leaves unknown is one that no call can decide either:
+
+<!-- error: the type of 'f' is ambiguous: no use of 'f' can determine 'b' -->
+```kotlin
+fun f[Show b](x : Int) -> Int = x
+
+fun main() {
+    print(f(1))
+}
+```
+
+The match decides a variable that appears in a parameter or the result,
+outside any [associated type](classes.md#associated-types). Through the
+context, it also decides a variable that is one side of an
+[equality](classes.md#equality-constraints) whose other side it has decided:
+in `[Iterator s, Item s ~ e, Show e]`, a use that decides `s` decides `e`. A
+variable that appears only as the argument of an associated type is not
+decided, since an associated type is not injective:
+
+<!-- error: the type of 'first' is ambiguous: no use of 'first' can determine 's' -->
+```kotlin
+fun first[Iterator s](x : Item s) -> Int = 0
+
+fun main() {
+    print(first(1))
+}
+```
+
+Many iterators have `Int` elements, so a call with an `Int` cannot tell which
+`Iterator` instance it is to use. Each of a class's method types and each
+[existential](types.md#existential-types) constructor's type is held to the
+same rule.
 
 ## Where annotations are needed
 
@@ -487,6 +597,10 @@ Inference covers everything except:
   needs a complete [signature](declarations.md#signatures).
 * **Recursive groups that use a member at two types**: every function in the
   group that is used polymorphically needs a signature.
+* **A type that only a body under an equality decides**: a type from outside
+  a function whose context has an
+  [equality constraint](classes.md#equality-constraints) has to be decided
+  outside it.
 
 Annotations are also useful as documentation at module boundaries. A
 signature is always checked, so it cannot drift from the code

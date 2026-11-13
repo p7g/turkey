@@ -1,6 +1,5 @@
 export (
-    String(..),
-    bytesOf,
+    String,
     concat,
     Bytes,
     CodePoints,
@@ -10,6 +9,7 @@ export (
     codePointCount,
     bytes,
     codePoints,
+    toCodePoints,
     fromCodePoints,
     Index,
     start,
@@ -20,6 +20,7 @@ export (
     slice,
     find,
     toBytes,
+    view,
     fromBytes,
     fromBytesLossy,
     builder,
@@ -37,6 +38,8 @@ export (
     rsplitOnce,
     replace,
     repeat,
+    padStart,
+    padEnd,
     trim,
     trimStart,
     trimEnd,
@@ -54,12 +57,8 @@ import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Bits (BitAnd(..), BitOr(..), Shift(..), (&), (|), (<<), (>>))
-import Text.Show (Show(..))
-import Data.Hashable (Hash(..), Hasher(..))
-import Control.Iterator (Iterator(..))
+import Iter (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
-import Data.Semigroup (Semigroup(..))
-import Data.Monoid (Monoid(..))
 import Control.Panic (error)
 import Data.Array (Array)
 import Data.Array as Array
@@ -74,6 +73,7 @@ import Data.Tuple ()
 import Data.Vec (Vec)
 import Data.Vec as Vec
 import Turkey.Scan as Scan
+import Turkey.String (String(..), bytesOf, concat, view)
 import Turkey.Array as Storage
 
 -- A `String` is an immutable sequence of bytes that is guaranteed to be
@@ -87,32 +87,6 @@ import Turkey.Array as Storage
 -- one; there is no `Index String` and no `Length String`, for
 -- the same reason; and no byte offset ever reaches the surface language, so
 -- there is no way to construct a slice that cuts a character in half.
-
--- Its representation is its bytes: an exact-sized `Prim.Array Byte`, never written
--- after the string is made, and always well-formed UTF-8. Both backends erase
--- a single-field newtype, so at run time a `String` *is* the byte array -- no
--- wrapper object, no header of its own. Slicing copies rather than sharing,
--- because a shared backing store is how a small substring keeps a large
--- parent alive, which is the leak Java removed sharing over in 7u6.
---
--- The invariants are this module's to keep, and the constructor is exported
--- for the library: it takes a `Prim.Array`, which only a library module can
--- name, so nothing outside `lib/` can build a `String` that skips the checks.
--- The Prelude's `String.` names leave it out, with `bytesOf` and `concat`.
-type String = String(Prim.Array Byte)
-
-fun bytesOf(s : String) -> Prim.Array Byte = match s { String(b) -> b }
-
-fun concat(a : String, b : String) -> String {
-    let x = bytesOf(a)
-    let y = bytesOf(b)
-    let n = len(x)
-    let m = len(y)
-    let out = Storage.uninitialized(n + m)
-    Storage.move(out, 0, x, 0, n)
-    Storage.move(out, n, y, 0, m)
-    String(out)
-}
 
 -- O(1). The only cheap count a string has.
 fun byteLength(s : String) -> Int = len(bytesOf(s))
@@ -190,8 +164,10 @@ instance Iterator CodePoints {
 -- string is not caught -- it would cost a tag per index to catch -- and lands
 -- on a boundary of the wrong string or panics. That is the same discipline
 -- `Iterator`'s `Cursor` already runs on.
-
-type Index = Index(Int)
+--
+-- Ordering is by position in the string, which is what a slice's two ends
+-- have to be compared for. It is not a comparison between strings.
+type Index : Ord = Index(Int)
 
 fun start(s : String) -> Index = Index(0)
 
@@ -221,11 +197,6 @@ fun find(s : String, needle : String, Index(from)) -> Option Index {
     let found = byteFind(s, needle, from)
     if found < 0 { None } else { Some(Index(found)) }
 }
-
--- Ordering is by position in the string, which is what a slice's two ends
--- have to be compared for. It is not a comparison between strings.
-instance Eq Index { fun eq(Index(a), Index(b)) = a == b }
-instance Ord Index { fun lt(Index(a), Index(b)) = a < b }
 
 -- -- interchange --------------------------------------------------------------
 --
@@ -296,8 +267,15 @@ fun wellFormed(bytes : Prim.Array Byte) -> Bool =
 --
 -- `+` in a loop is quadratic. A builder collects the pieces and joins once,
 -- which is what `fromCodePoints` and `join` are both written on.
+--
+-- Two builders of the same text may hold it in different pieces, so they
+-- compare by the text they would build, not by their pieces.
 
 type Builder = Builder { parts : Vec String }
+
+instance Eq Builder {
+    fun eq(a, b) = build(a) == build(b)
+}
 
 fun builder() -> Builder = Builder { parts = Vec.new(8) }
 
@@ -326,6 +304,14 @@ fun drain(b : Builder) -> String {
     out
 }
 
+-- Returns the code points of `s` as an array: the one-call form of a grid
+-- line. `fromCodePoints` is the inverse. Allocates O(n).
+fun toCodePoints(s : String) -> Array Char {
+    let out = []
+    for c in codePoints(s) { Vec.push(out, c) }
+    Vec.toArray(out)
+}
+
 fun fromCodePoints[Iterator c, Item c ~ Char](cs : c) -> String {
     let b = builder()
     for c in cs { push(b, Char.toString(c)) }
@@ -348,6 +334,15 @@ fun repeat(s : String, times : Int) -> String {
     for var i = 0; i < times; i = i + 1 { push(b, s) }
     build(b)
 }
+
+-- Returns `s` with `fill` repeated in front of it until it has `width` code
+-- points. Returns `s` unchanged when it already has `width` or more.
+fun padStart(s : String, width : Int, fill : Char) -> String =
+    repeat(Char.toString(fill), width - codePointCount(s)) + s
+
+-- As `padStart`, with the fill after `s`.
+fun padEnd(s : String, width : Int, fill : Char) -> String =
+    s + repeat(Char.toString(fill), width - codePointCount(s))
 
 -- -- searching and cutting ----------------------------------------------------
 --
@@ -529,42 +524,6 @@ fun trimEnd(s : String) -> String {
 
 fun trim(s : String) -> String = trimEnd(trimStart(s))
 
--- -- instances ----------------------------------------------------------------
---
--- Equality is byte equality, which for well-formed UTF-8 is exactly
--- code-point equality. It performs *no* Unicode normalization:
---
---     "\u{00E9}" == "\u{0065}\u{0301}"   -- False. Both render as e-acute.
---
--- Normalization is a library operation and will never be something `==` does
--- implicitly. Ordering is byte-lexicographic, which for well-formed UTF-8
--- coincides with code-point-lexicographic -- and which is not a collation:
--- it sorts `Z` before `a` and has no opinion about locale.
-
-instance Eq String {
-    fun eq(x, y) = byteLength(x) == byteLength(y) && matchesAt(x, y, 0)
-}
-
--- By bytes, which for well-formed UTF-8 is the order of the code points.
-instance Ord String {
-    fun lt(x, y) = Scan.compare(bytesOf(x), bytesOf(y)) < 0
-}
-
-instance Add String { fun add(x, y) = concat(x, y) }
-instance Show String { fun show(x) = x }
-instance Semigroup String { fun combine(x, y) = add(x, y) }
-instance Monoid String { fun empty() = "" }
-
--- No `Length String`. `len` means an O(1) count of elements, and a string has
--- no single answer to give: `byteLength` is the cheap one, `codePointCount`
--- the one people usually mean, and graphemes the one they usually want.
-
-instance Hash String {
-    -- Over the bytes, which for well-formed UTF-8 is the same equivalence as
-    -- over the code points and allocates nothing.
-    fun hashInto(s, d) = hashBytes(d, Array.ofStorage(bytesOf(s)), 0, byteLength(s))
-}
-
 -- -- the bytes, privately ------------------------------------------------------
 --
 -- Byte offsets never leave this module, and these are what every operation
@@ -630,6 +589,10 @@ fun isBoundary(s : String, i : Int) -> Bool {
 
 -- The bytes from `start` to `stop`, which must both be boundaries: a cut
 -- anywhere else would make a string that is not UTF-8.
+--
+-- The slice copies rather than sharing, because a shared backing store is how
+-- a small substring keeps a large parent alive, which is the leak Java removed
+-- sharing over in 7u6.
 fun sliceBytes(s : String, start : Int, stop : Int) -> String {
     if start > stop {
         error("string slice runs backwards, from byte " + Int.toString(start) + " to byte "

@@ -1,0 +1,590 @@
+export (Types, new, typeOf, entries, typeName)
+
+-- The type entries `-g` writes (`Dwarf.TypeEntry`): what a debugger needs to
+-- read a variable's bytes as the value the program holds, made as each
+-- variable asks for its type, and one per ground type and form, keyed by
+-- `Ty.typeKey`.
+--
+-- Each entry describes the representation the backend chose, so it follows
+-- `Turkey.Layout` and `Turkey.SsaLower`, which choose it:
+--
+-- * `Int`, `Float`, `Char`, `Byte` and `Bool` are names for the C scalar of
+--   their width, so a C debugger reads and prints them as numbers;
+-- * an enumeration is a C enumeration of its constructors, at its width;
+-- * a newtype is a name for its payload's type;
+-- * a compact sum (`Decls.Compact`) is a union of its one word read as the
+--   enumeration of its nullaries and as its payload, since the word is a
+--   nullary's index when it is below `Rt.immediates` and the payload or a wrap
+--   of it otherwise;
+-- * a flat type (`Layout.flatOf`) of several slots is a structure of its
+--   slots: where its value is in its slots, at their widths one after
+--   another, as a variable's location pieces them together
+--   (`Turkey.Locations`); and where it is in its box, a pointer to an object
+--   of its slots at their `Rt.layout` offsets. A sum's first slot is its tag,
+--   an enumeration of its constructors, and its constructors are a union of
+--   a structure each, whose members are the slots holding their fields;
+-- * any other declared type, a tuple, an array, a closure or a `var`'s cell is
+--   a pointer to its object: the header, then each field at its `Rt.layout`
+--   offset. A sum of several constructors has its tag, the header's last
+--   four bytes, as an enumeration of its constructors by their runtime tags,
+--   and a union of a structure per constructor where its fields start;
+-- * a type that is not ground, which a body copied per layout holds a
+--   variable of, has no one representation to describe: it is named by its
+--   layout (`ptr`, `i64`, ...), and a formatter reads a pointer's object
+--   header to say more.
+
+import Data.Map as Map
+import Turkey.Core as Core
+import Turkey.Demangle (displayName)
+import Turkey.Decls as Decls
+import Turkey.Decls (DeclTable(..))
+import Turkey.Dwarf as Dwarf
+import Turkey.Dwarf (TypeEntry(..), Member(..))
+import Turkey.Layout as Layout
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Rep(..), RepClass(..))
+import Turkey.SsaLower as SsaLower
+import Turkey.Types as Ty
+import Turkey.Types (TCon, TTuple, TFun, TApp, TFam)
+import Iter
+
+-- The entries made so far, in `entries`, and each one's index by its key.
+-- `tags` is each constructor's runtime tag (`SsaLower.tagsOf`). `making` is
+-- each type whose entry `held` is making, outermost first.
+type Types = Types {
+    decls   : DeclTable,
+    tags    : Map String Int,
+    index   : Map String Int,
+    entries : Vec Dwarf.TypeEntry,
+    making  : Vec Ty.Type,
+}
+
+fun new(decls : DeclTable, tags : Map String Int) -> Types =
+    Types { decls = decls, tags = tags, index = Map.new(), entries = [], making = [] }
+
+-- The entries made so far, which `typeOf` adds to.
+fun entries(t : Types) -> Vec Dwarf.TypeEntry = t.entries
+
+-- Where an object's tag is in its header.
+let tagOffset = 4
+
+-- An enumeration of the runtime's constants that the formatters read values
+-- by, so that they read them from the program rather than repeat them: the
+-- bound below which a compact sum's word is a nullary (`Rt.immediates`),
+-- the tag of the object a compact sum wraps its payload in
+-- (`SsaLower.wrapTag`), and where an object's tag and its first field are.
+-- It is also a typedef of the same name, since a C debugger looks a name up
+-- among typedefs, and an enumeration's name is only a tag.
+fun runtime(t : Types) -> Int = entry(t, "runtime", fun() =
+    Typedef("Turkey.Runtime", entry(t, "runtime constants", fun() =
+        Enumeration("Turkey.Runtime", 4, [
+            ("immediates", Rt.immediates), ("wrapTag", SsaLower.wrapTag),
+            ("tagOffset", tagOffset), ("fieldsOffset", Rt.objectFields),
+        ]))))
+
+-- Returns the name a debugger shows for type `ty`: the type as the source
+-- writes it, with each type constructor by its display form, which names
+-- the module that declares it (`Data.Vec.Vec Int`).
+fun typeName(ty : Ty.Type) -> String = nameAt(ty, 0)
+
+-- Qualify every constructor, not only where two modules declare one name,
+-- because the formatters recognize the library's types by name. A program's
+-- own `Vec` named `Vec` would be read as the library's and shown as
+-- nonsense. The cost is longer names in a debugger's `(type) name = value`.
+fun nameAt(ty : Ty.Type, prec : Int) -> String = match Ty.prune(ty) {
+    TCon(c) -> displayName(c.name)
+    TTuple(elements) -> "(" + String.join(Vec.map(elements, nameAt(_, 0)), ", ") + ")"
+    TFun(params, ret) -> {
+        let out = "fun(" + String.join(Vec.map(params, nameAt(_, 0)), ", ") + ") -> "
+                  + nameAt(ret, 0)
+        if prec > 0 { "(" + out + ")" } else { out }
+    }
+    TApp(_, _, _) -> {
+        let (head, args) = Ty.spine(ty)
+        let out = nameAt(head, 2) + " " + String.join(Vec.map(args, nameAt(_, 2)), " ")
+        if prec > 1 { "(" + out + ")" } else { out }
+    }
+    _ -> Ty.show(ty)
+}
+
+-- The index of the entry for variable `v`'s type, as `v` is held: in its
+-- slots, or in its box.
+fun typeOf(t : Types, v : Dwarf.Variable) -> Int {
+    -- A program that has a variable has the runtime's constants too.
+    let _ = runtime(t)
+    if !ground(t, v.ty) { return byLayout(t, v.layout, v.boxed) }
+    if v.boxed { return boxOf(t, v.ty) }
+    if len(v.layout.slots) > 1 { return slotsOf(t, v.ty) } else { held(t, v.ty) }
+}
+
+-- Whether `ty` has a layout of its own, whatever copy of a body holds it.
+fun ground(t : Types, ty : Ty.Type) -> Bool =
+    Option.isSome(Layout.layoutOf(t.decls, ty, Map.new()))
+
+fun layoutOf(t : Types, ty : Ty.Type) -> Ssa.Layout =
+    Option.unwrapOr(Layout.layoutOf(t.decls, ty, Map.new()), Ssa.Layout { slots = [] })
+
+-- The entry under `key`, made by `make` the first time it is asked for. The
+-- index is taken before `make` runs, so a type whose entry names itself, a
+-- recursive type's, finds it.
+fun entry(t : Types, key : String, make : fun() -> Dwarf.TypeEntry) -> Int {
+    if let Some(k) = Map.get(t.index, key) { return k }
+    let k = len(t.entries)
+    Map.put(t.index, key, k)
+    Vec.push(t.entries, PointerTo(None))
+    let made = make()
+    t.entries[k] = made
+    k
+}
+
+-- `ty` as one slot holds it: a register, a field, an element. A value of
+-- several slots is held there as its box.
+fun held(t : Types, ty : Ty.Type) -> Int {
+    let layout = layoutOf(t, ty)
+    if len(layout.slots) == 0 { return entry(t, "unit", fun() = Structure("Unit", 0, [])) }
+    let ty = Ty.prune(ty)
+    -- A non-regular type, `type Nest a = Nil | Cons(a, Nest (Array a))`,
+    -- holds itself at ever larger types, and an entry for each would never
+    -- end. So a type held inside the entry of a smaller type with the same
+    -- constructor is described by its layout alone. Along a chain of entries
+    -- being made, no type is then larger than the first with its
+    -- constructor, so finitely many types can be on it, and `entry` makes
+    -- each at most once.
+    if grows(t, ty) { return byLayout(t, layout, len(layout.slots) > 1) }
+    Vec.push(t.making, ty)
+    let k = if len(layout.slots) > 1 { boxOf(t, ty) }
+            else { entry(t, "held " + Ty.typeKey(ty), fun() = heldEntry(t, ty, layout.slots[0])) }
+    let _ = Vec.pop(t.making)
+    k
+}
+
+-- Returns whether `ty` is larger than a type with the same constructor whose
+-- entry is being made.
+fun grows(t : Types, ty : Ty.Type) -> Bool {
+    let head = match Ty.spine(ty).0 {
+        TCon(c) -> c.name
+        _ -> return False
+    }
+    let size = nodes(ty)
+    Iter.any(t.making, fun(m) = match Ty.spine(m).0 {
+        TCon(c) -> c.name == head && size > nodes(m)
+        _ -> False
+    })
+}
+
+-- Returns the number of nodes in `ty` as a tree.
+fun nodes(ty : Ty.Type) -> Int = match Ty.prune(ty) {
+    TApp(fn, arg, _) -> 1 + nodes(fn) + nodes(arg)
+    TFam(_, arg, _) -> 1 + nodes(arg)
+    TFun(params, ret) -> {
+        var n = 1 + nodes(ret)
+        for p in params { n = n + nodes(p) }
+        n
+    }
+    TTuple(elems) -> {
+        var n = 1
+        for e in elems { n = n + nodes(e) }
+        n
+    }
+    _ -> 1
+}
+
+fun heldEntry(t : Types, ty : Ty.Type, rep : Rep) -> Dwarf.TypeEntry {
+    let name = typeName(ty)
+    match ty {
+        TFun(_, _) -> return PointerTo(Some(closure(t, name)))
+        TTuple(_) -> return PointerTo(Some(object(t, ty, name, "", [payload(t, ty)])))
+        _ -> {}
+    }
+    let (head, args) = Ty.spine(ty)
+    let tycon = match head {
+        TCon(c) -> c.name
+        _ -> return entryOf(t, byRep(t, rep))
+    }
+    match tycon {
+        "Int" -> return Typedef(name, scalar(t, "long", Dwarf.encodingSigned, 8))
+        "Float" -> return Typedef(name, scalar(t, "double", Dwarf.encodingFloat, 8))
+        "Char" -> return Typedef(name, scalar(t, "char32_t", Dwarf.encodingUtf, 4))
+        "Byte" -> return Typedef(name, scalar(t, "unsigned char", Dwarf.encodingUnsignedChar, 1))
+        "Bool" -> return Typedef(name, scalar(t, "bool", Dwarf.encodingBoolean, 1))
+        "Prim.Ptr" -> return Typedef(name, voidPointer(t))
+        "Prim.Array" -> if len(args) == 1 { return PointerTo(Some(array(t, ty, args[0]))) }
+        _ -> {}
+    }
+    if tycon == Core.refName && len(args) == 1 {
+        return PointerTo(Some(object(t, ty, name, "", [Member {
+            name = "value", ty = held(t, args[0]), offset = Rt.cellValue,
+        }])))
+    }
+    if let Some(p) = Decls.erasedPayload(t.decls, ty) { return Typedef(name, held(t, p)) }
+    let info = match Map.get(t.decls.tycons, tycon) {
+        Some(info) -> info
+        None -> return entryOf(t, byRep(t, rep))
+    }
+    if let Some(_) = Decls.enumSize(t.decls, tycon) {
+        let enumerators = []
+        for var k = 0; k < len(info.variants); k = k + 1 {
+            Vec.push(enumerators, (Ty.shortName(info.variants[k].name), k))
+        }
+        return Enumeration(name, Rt.fieldWidth(rep), enumerators)
+    }
+    if let Some(c) = Decls.compactShape(t.decls, tycon) {
+        if rep == Ssa.traced(Ptr) {
+            if let Some(fields) = Decls.conFieldTypes(t.decls, ty, c.payload) {
+                if len(fields) == 1 && Layout.storedRep(layoutOf(t, fields[0])) == rep {
+                    return compact(t, ty, name, c, fields[0])
+                }
+            }
+        }
+    }
+    -- A flat type of one slot is that slot, so its structure of slots is
+    -- its value.
+    if let Some(_) = Layout.flatOf(t.decls, ty, Map.new()) { return entryOf(t, slotsOf(t, ty)) }
+    PointerTo(Some(constructed(t, ty, name, info.variants)))
+}
+
+-- The entry at index `k`, to stand for another key's.
+fun entryOf(t : Types, k : Int) -> Dwarf.TypeEntry = Typedef(entryName(t, k), k)
+
+fun entryName(t : Types, k : Int) -> String = match t.entries[k] {
+    BaseType(name, _, _) -> name
+    Typedef(name, _) -> name
+    Structure(name, _, _) -> name
+    UnionOf(name, _, _) -> name
+    Enumeration(name, _, _) -> name
+    _ -> "ptr"
+}
+
+-- Returns the bytes a value of the entry at index `k` occupies. An entry
+-- still being made is a pointer until it is done, so a structure that holds
+-- itself is measured as pointing to itself.
+fun width(t : Types, k : Int) -> Int = match t.entries[k] {
+    BaseType(_, _, size) -> size
+    Typedef(_, of) -> width(t, of)
+    Structure(_, size, _) -> size
+    UnionOf(_, size, _) -> size
+    Enumeration(_, size, _) -> size
+    PointerTo(_) -> 8
+    ArrayOf(_) -> 0
+}
+
+-- Returns the bytes a structure of `members` needs to hold each of them.
+fun extent(t : Types, members : Vec Member) -> Int {
+    var size = 0
+    for m in members { size = max(size, m.offset + width(t, m.ty)) }
+    size
+}
+
+fun scalar(t : Types, name : String, encoding : Int, size : Int) -> Int =
+    entry(t, "scalar " + name, fun() = BaseType(name, encoding, size))
+
+fun voidPointer(t : Types) -> Int = entry(t, "void*", fun() = PointerTo(None))
+
+-- A slot of `rep` with no type to say more: named by its representation.
+fun byRep(t : Types, rep : Rep) -> Int {
+    let name = Ssa.slotName(rep)
+    entry(t, "rep " + name, fun() = match rep.class_ {
+        I64 -> Typedef(name, scalar(t, "long", Dwarf.encodingSigned, 8))
+        I32 -> Typedef(name, scalar(t, "int", Dwarf.encodingSigned, 4))
+        I8 -> Typedef(name, scalar(t, "unsigned char", Dwarf.encodingUnsignedChar, 1))
+        I1 -> Typedef(name, scalar(t, "bool", Dwarf.encodingBoolean, 1))
+        F64 -> Typedef(name, scalar(t, "double", Dwarf.encodingFloat, 8))
+        Ptr -> Typedef(name, voidPointer(t))
+        Unit -> Structure(name, 0, [])
+    })
+}
+
+-- A variable of a type that is not ground, by its layout: one slot as that
+-- slot, a box as a pointer, and several slots as a structure of them.
+fun byLayout(t : Types, layout : Ssa.Layout, boxed : Bool) -> Int {
+    if boxed { return byRep(t, Ssa.traced(Ptr)) }
+    if len(layout.slots) == 1 { return byRep(t, layout.slots[0]) }
+    let name = Ssa.layoutName(layout)
+    entry(t, "layout " + name, fun() {
+        let members = []
+        var at = 0
+        for var j = 0; j < len(layout.slots); j = j + 1 {
+            Vec.push(members, Member { name = Int.toString(j), ty = byRep(t, layout.slots[j]),
+                                       offset = at })
+            at = at + Rt.fieldWidth(layout.slots[j])
+        }
+        Structure(name, at, members)
+    })
+}
+
+-- -- objects ---------------------------------------------------------------------------
+
+-- The header every object starts with, but for its last four bytes, its tag,
+-- which an object that has one names with its own type.
+fun header(t : Types) -> Int = entry(t, "header", fun() {
+    let byte = scalar(t, "unsigned char", Dwarf.encodingUnsignedChar, 1)
+    let half = scalar(t, "unsigned short", Dwarf.encodingUnsigned, 2)
+    Structure("Turkey.Header", 4, [
+        Member { name = "generation", ty = byte, offset = 0 },
+        Member { name = "kind", ty = byte, offset = 1 },
+        Member { name = "traced", ty = half, offset = 2 },
+    ])
+})
+
+-- The structure of an object of type `ty` named `name`: its header, then
+-- `members`. `tagged` names the enumeration its tag is read as, or is empty
+-- for an object whose tag says nothing.
+fun object(t : Types, ty : Ty.Type, name : String, tagged : String,
+           members : Vec Member) -> Int =
+    entry(t, "object " + Ty.typeKey(ty), fun() {
+        let all = [Member { name = "header", ty = header(t), offset = 0 }]
+        if tagged != "" {
+            Vec.push(all, Member { name = "tag", ty = tagOf(t, ty, tagged), offset = tagOffset })
+        }
+        for m in members { Vec.push(all, m) }
+        Structure(name, max(Rt.objectFields, extent(t, all)), all)
+    })
+
+-- The fields of an object of the one constructor of `ty`, at their offsets.
+fun payload(t : Types, ty : Ty.Type) -> Member {
+    let types = match Ty.prune(ty) {
+        TTuple(ts) -> ts
+        _ -> Option.unwrapOr(Decls.payloadTypes(t.decls, ty), [])
+    }
+    let names = match Ty.spine(ty) {
+        (TCon(c), _) -> Option.unwrapOr(Decls.recordFields(t.decls, c.name), [])
+        _ -> []
+    }
+    Member { name = "", ty = fieldsOf(t, typeName(ty), types, names), offset = Rt.objectFields }
+}
+
+-- A structure of fields of these types at the offsets an object's fields
+-- have, from where the fields start, each named by `names` or by its
+-- position.
+fun fieldsOf(t : Types, name : String, types : Array Ty.Type, names : Array String) -> Int {
+    let reps = Array.map(types, fun(x) = Layout.storedRep(layoutOf(t, x)))
+    let layout = Rt.layout(reps)
+    let members = []
+    for var i = 0; i < len(types); i = i + 1 {
+        if reps[i].class_ != Unit {
+            Vec.push(members, Member {
+                name = if i < len(names) { names[i] } else { Int.toString(i) },
+                ty = held(t, types[i]), offset = layout.offsets[i],
+            })
+        }
+    }
+    Vec.push(t.entries, Structure(name, layout.size, members))
+    len(t.entries) - 1
+}
+
+-- An object of a declared type of these constructors: one's fields after
+-- the header, or several's tag and a union of each one's fields.
+fun constructed(t : Types, ty : Ty.Type, name : String, variants : Vec Decls.ConInfo) -> Int {
+    if len(variants) == 1 {
+        let fields = fieldsFor(t, ty, variants[0])
+        return object(t, ty, name, "", [Member { name = Ty.shortName(variants[0].name),
+                                                 ty = fields, offset = Rt.objectFields }])
+    }
+    object(t, ty, name, name, [Member {
+        name = "", ty = unionOf(t, name, Vec.map(variants, fun(v) = (Ty.shortName(v.name),
+                                                                     fieldsFor(t, ty, v)))),
+        offset = Rt.objectFields,
+    }])
+}
+
+fun fieldsFor(t : Types, ty : Ty.Type, v : Decls.ConInfo) -> Int =
+    fieldsOf(t, Ty.shortName(v.name), Option.unwrapOr(Decls.conFieldTypes(t.decls, ty, v.name), []),
+             Option.unwrapOr(v.fields, []))
+
+-- A union of these structures at offset 0, each a member named for its
+-- constructor.
+fun unionOf(t : Types, name : String, members : Vec (String, Int)) -> Int {
+    var size = 0
+    let all = []
+    for (member, k) in members {
+        Vec.push(all, Member { name = member, ty = k, offset = 0 })
+        size = max(size, width(t, k))
+    }
+    Vec.push(t.entries, UnionOf(name, size, all))
+    len(t.entries) - 1
+}
+
+-- The enumeration of `ty`'s constructors by their runtime tags.
+fun tagOf(t : Types, ty : Ty.Type, name : String) -> Int =
+    entry(t, "tags " + Ty.typeKey(ty), fun() {
+        let enumerators = []
+        if let (TCon(c), _) = Ty.spine(ty) {
+            if let Some(info) = Map.get(t.decls.tycons, c.name) {
+                for v in info.variants {
+                    Vec.push(enumerators, (Ty.shortName(v.name), Map.getOr(t.tags, v.name, -1)))
+                }
+            }
+        }
+        Enumeration(name + " tag", 4, enumerators)
+    })
+
+-- An array of `element`s: its header, its length, and its elements, each
+-- `Rt.element`'s stride apart. An element held as its slots
+-- (`Layout.inlined`) is a structure of them, at the offsets the array gives
+-- them. An element held in one slot is its value, unless the stride is wider,
+-- as it is for `unit`: then it is a structure of the stride's width, its
+-- value the member `value` at its start.
+fun array(t : Types, ty : Ty.Type, element : Ty.Type) -> Int {
+    let layout = layoutOf(t, element)
+    let e = Rt.element(Layout.fieldReps(layout))
+    let elements = if Layout.inlined(layout) {
+        entry(t, "element " + Ty.typeKey(element), fun() =
+            match Layout.flatOf(t.decls, element, Map.new()) {
+                Some(flat) -> Structure(typeName(element) + " element", e.stride,
+                                        flatMembers(t, element, flat, e.layout.offsets, False))
+                None -> entryOf(t, byLayout(t, layout, False))
+            })
+    } else {
+        let value = held(t, element)
+        if Rt.fieldWidth(Layout.storedRep(layout)) == e.stride { value } else {
+            entry(t, "element " + Ty.typeKey(element), fun() =
+                Structure(typeName(element) + " element", e.stride,
+                          [Member { name = "value", ty = value, offset = 0 }]))
+        }
+    }
+    object(t, ty, typeName(ty), "", [
+        Member { name = "length", ty = scalar(t, "long", Dwarf.encodingSigned, 8),
+                 offset = Rt.objectFields },
+        Member { name = "elements", ty = entry(t, "elements " + Ty.typeKey(element),
+                                               fun() = ArrayOf(elements)),
+                 offset = Rt.arrayElements },
+    ])
+}
+
+-- A closure: its header, then its code and its environment.
+fun closure(t : Types, name : String) -> Int = entry(t, "closure " + name, fun() {
+    let code = Rt.fieldOffset(Rt.closureShell, Rt.closureCode)
+    let environment = Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)
+    Structure(name, Rt.objectBytes(Rt.closureShell), [
+        Member { name = "header", ty = header(t), offset = 0 },
+        Member { name = "code", ty = voidPointer(t), offset = code },
+        Member { name = "environment", ty = voidPointer(t), offset = environment },
+    ])
+})
+
+-- A compact sum's word, as the enumeration of its nullaries and as its
+-- payload, of type `field`.
+fun compact(t : Types, ty : Ty.Type, name : String, c : Decls.Compact,
+            field : Ty.Type) -> Dwarf.TypeEntry {
+    let nullaries = []
+    for var k = 0; k < len(c.nullaries); k = k + 1 {
+        Vec.push(nullaries, (Ty.shortName(c.nullaries[k]), k))
+    }
+    let words = entry(t, "nullaries " + Ty.typeKey(ty), fun() =
+        Enumeration(name + " nullaries", 8, nullaries))
+    UnionOf(name, 8, [
+        Member { name = "nullary", ty = words, offset = 0 },
+        Member { name = Ty.shortName(c.payload), ty = held(t, field), offset = 0 },
+    ])
+}
+
+-- -- flat values --------------------------------------------------------------------------
+
+-- A flat value of `ty` in its slots, at their widths one after another.
+fun slotsOf(t : Types, ty : Ty.Type) -> Int = entry(t, "slots " + Ty.typeKey(ty), fun() {
+    match Layout.flatOf(t.decls, ty, Map.new()) {
+        Some(flat) -> {
+            let at = Array.filled(len(flat.slots), 0)
+            var size = 0
+            for var j = 0; j < len(flat.slots); j = j + 1 {
+                at[j] = size
+                size = size + Rt.fieldWidth(flat.slots[j])
+            }
+            Structure(typeName(ty), size, flatMembers(t, ty, flat, at, True))
+        }
+        None -> entryOf(t, byLayout(t, layoutOf(t, ty), False))
+    }
+})
+
+-- A flat value of `ty` in its box: a pointer to an object of its slots.
+fun boxOf(t : Types, ty : Ty.Type) -> Int = entry(t, "box " + Ty.typeKey(ty), fun() {
+    match Layout.flatOf(t.decls, ty, Map.new()) {
+        Some(flat) -> {
+            let layout = Rt.layout(flat.slots)
+            let at = Array.map(Array.init(len(flat.slots), fun(j) = j), Rt.fieldOffset(layout, _))
+            let members = [Member { name = "header", ty = header(t), offset = 0 }]
+            for m in flatMembers(t, ty, flat, at, False) { Vec.push(members, m) }
+            PointerTo(Some(entry(t, "boxed " + Ty.typeKey(ty), fun() =
+                Structure(typeName(ty), Rt.objectBytes(layout), members))))
+        }
+        None -> entryOf(t, byRep(t, Ssa.traced(Ptr)))
+    }
+})
+
+-- The members of a structure holding `flat`'s slots, slot `j` at `at[j]`:
+-- a product's fields, or a sum's tag and a union of each constructor's. A
+-- field of one slot is a member of its type. One of several is a member of
+-- its own structure of slots where it is in its slots, and they are in
+-- order, and otherwise a member for each slot.
+fun flatMembers(t : Types, ty : Ty.Type, flat : Layout.Flat, at : Array Int,
+                inSlots : Bool) -> Vec Member {
+    let name = typeName(ty)
+    let names = match Ty.spine(ty) {
+        (TCon(c), _) -> Option.unwrapOr(Decls.recordFields(t.decls, c.name), [])
+        _ -> []
+    }
+    if len(flat.names) == 0 {
+        let types = match Ty.prune(ty) {
+            TTuple(ts) -> ts
+            _ -> Option.unwrapOr(Decls.payloadTypes(t.decls, ty), [])
+        }
+        return slotMembers(t, flat, flat.fields[0], types, names, at, 0, inSlots)
+    }
+    let tag = entry(t, "flat tags " + Ty.typeKey(ty), fun() {
+        let enumerators = []
+        for var k = 0; k < len(flat.names); k = k + 1 {
+            Vec.push(enumerators, (Ty.shortName(flat.names[k]), k))
+        }
+        Enumeration(name + " tag", Rt.fieldWidth(flat.slots[0]), enumerators)
+    })
+    -- The constructors' slots follow the tag, so the union starts where the
+    -- first of them is.
+    var start = -1
+    for var j = 1; j < len(at); j = j + 1 { if start < 0 || at[j] < start { start = at[j] } }
+    let variants = []
+    for var k = 0; k < len(flat.names); k = k + 1 {
+        let types = Option.unwrapOr(Decls.conFieldTypes(t.decls, ty, flat.names[k]), [])
+        let fieldNames = match Decls.con(t.decls, flat.names[k]) {
+            Some(info) -> Option.unwrapOr(info.fields, [])
+            None -> []
+        }
+        let members = slotMembers(t, flat, flat.fields[k], types, fieldNames, at, start,
+                                  inSlots)
+        Vec.push(t.entries, Structure(Ty.shortName(flat.names[k]), extent(t, members), members))
+        Vec.push(variants, (Ty.shortName(flat.names[k]), len(t.entries) - 1))
+    }
+    let out = [Member { name = "tag", ty = tag, offset = at[0] }]
+    if len(variants) > 0 && start >= 0 {
+        Vec.push(out, Member { name = "", ty = unionOf(t, name, variants), offset = start })
+    }
+    out
+}
+
+-- A member for each field `fields` puts in slots, at `at` less `base`.
+fun slotMembers(t : Types, flat : Layout.Flat, fields : Array (Array Int), types : Array Ty.Type,
+                names : Array String, at : Array Int, base : Int, inSlots : Bool) -> Vec Member {
+    let out = []
+    for var i = 0; i < len(fields) && i < len(types); i = i + 1 {
+        let slots = fields[i]
+        let name = if i < len(names) { names[i] } else { Int.toString(i) }
+        if len(slots) == 1 {
+            Vec.push(out, Member { name = name, ty = held(t, types[i]), offset = at[slots[0]] - base })
+        } else if len(slots) > 1 && inSlots && consecutive(slots) {
+            Vec.push(out, Member { name = name, ty = slotsOf(t, types[i]),
+                                   offset = at[slots[0]] - base })
+        } else {
+            for var j = 0; j < len(slots); j = j + 1 {
+                Vec.push(out, Member { name = name + "." + Int.toString(j),
+                                       ty = byRep(t, flat.slots[slots[j]]),
+                                       offset = at[slots[j]] - base })
+            }
+        }
+    }
+    out
+}
+
+fun consecutive(slots : Array Int) -> Bool {
+    for var j = 1; j < len(slots); j = j + 1 { if slots[j] != slots[j - 1] + 1 { return False } }
+    True
+}

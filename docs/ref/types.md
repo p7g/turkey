@@ -123,6 +123,43 @@ fun main() {
 }
 ```
 
+`Int.floorDiv` is the quotient that pairs with `Int.mod`, rounding toward
+negative infinity, and `Int.divMod` returns both. `Int.gcd` and `Int.lcm` are
+never negative, `Int.pow` and `Int.powMod` raise to a power (a negative
+exponent panics, and `pow` panics on overflow like `*`; `powMod` never
+overflows), and `Int.isqrt` is the floor of the square root. `Int.countOnes`,
+`Int.leadingZeros` and `Int.trailingZeros` count the bits of the 64-bit
+representation. `Int.parseRadix` and `Int.toStringRadix` read and write a
+number in a base from 2 to 36, with letters for the digits above 9; a base
+outside that range panics.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Int.divMod(-7, 2))
+    print(Int.gcd(12, 18))
+    print(Int.lcm(4, 6))
+    print(Int.pow(2, 10))
+    print(Int.powMod(3, 200, 13))
+    print(Int.isqrt(99))
+    print(Int.countOnes(255))
+    print(Int.parseRadix("ff", 16))
+    print(Int.toStringRadix(255, 2))
+}
+```
+
+```text
+(-4, 1)
+6
+12
+1024
+9
+9
+8
+Some(255)
+11111111
+```
+
 ### Float
 
 A `Float` is an IEEE 754 binary64 number, and arithmetic on it follows IEEE
@@ -148,8 +185,8 @@ fun main() {
     let nan = 0.0 / 0.0
     print(nan < 1.0)
     print(nan > 1.0)
-    print(Float.totalCompare(nan, 1.0))
-    print(Float.totalCompare(-0.0, 0.0))
+    print(debug(Float.totalCompare(nan, 1.0)))
+    print(debug(Float.totalCompare(-0.0, 0.0)))
 }
 ```
 
@@ -319,8 +356,26 @@ fun main() {
 
 ```text
 65
-Some(B)
+Some('B')
 None
+```
+
+`Char.digitValue` reads a decimal digit, and `Char.digitValueRadix` a digit in a
+base from 2 to 36, where `a` to `z` in either case are 10 to 35:
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Char.digitValue('7'))
+    print(Char.digitValue('x'))
+    print(Char.digitValueRadix('f', 16))
+}
+```
+
+```text
+Some(7)
+None
+Some(15)
 ```
 
 A `Char` is not always what a reader would call a character. `é` can be one
@@ -352,6 +407,60 @@ hello, world
 True
 2
 ```
+
+A string's bytes are read through `String.bytes`, an iterator over them, or
+`String.toBytes`, which returns them in a new `Array Byte`. `toBytes` shares no
+storage with the string, so writing to the array leaves the string as it was.
+`String.view` reads the bytes in place, without copying them, as a
+[`ByteView`](builtins.md#byteview), which cannot be written.
+`String.fromBytes` goes the other way, and returns `None` for bytes that are
+not UTF-8:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let word = "hé"
+    for b in String.bytes(word) { print(b) }
+    let copy = String.toBytes(word)
+    copy[0] = Byte.truncate(72)
+    print(String.fromBytes(copy))
+    print(word)
+}
+```
+
+```text
+104
+195
+169
+Some("Hé")
+hé
+```
+
+`String.toCodePoints` returns the scalar values of a string in a new
+`Array Char`, such as one row of a grid, and `String.fromCodePoints` builds a
+string from any iterator of `Char`. `String.padStart` and `String.padEnd`
+extend a string to a width, counted in scalar values, with a fill `Char`, and
+leave a string that is already wide enough as it is:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let row = String.toCodePoints("#.#")
+    row[1] = '@'
+    print(String.fromCodePoints(row))
+    print(String.padStart("42", 5, '0'))
+    print(String.padEnd("ab", 4, '.') + "|")
+}
+```
+
+```text
+#@#
+00042
+ab..|
+```
+
+Padding does not know about a sign: `String.padStart("-42", 6, '0')` is
+`000-42`.
 
 Comparing bytes is the same as comparing scalar values, one after another, and
 nothing more. `==` does not normalize, so two strings that display the same
@@ -409,7 +518,10 @@ elements: `(x)` is just `x` in parentheses, `(x,)` is an error, and `()` is
 
 Tuples are immutable. Their elements are read with a
 [pattern](patterns.md#tuple-patterns) or with
-[projection](expressions.md#tuple-projection), `t.0`, `t.1`, and so on.
+[projection](expressions.md#tuple-projection), `t.0`, `t.1`, and so on. A tuple
+of any length has `Eq`, `Ord`, `Hash`, `Debug` and `Show` wherever its
+elements do ([Derived instances](classes.md#derived-instances)), so it can be
+a `Map` key or a `Set` element.
 
 <!-- run -->
 ```kotlin
@@ -475,7 +587,8 @@ A function with no parameters has type `fun() -> T`.
 **Syntax**
 
 ```ebnf
-type-decl    ::= "type" CONID IDENT* "=" constructor ("|" constructor)*
+type-decl    ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" constructor ("|" constructor)*
+derive       ::= "!"? qualified-CONID
 constructor  ::= CONID existential? payload?
 payload      ::= "(" type ("," type)* ")"          -- positional
                | "{" field (separator field)* "}"   -- record
@@ -534,6 +647,10 @@ The parts of a declaration:
   uses is allowed; it is sometimes called a *phantom* parameter.
 * **Recursion.** A type may refer to itself, as `Hand` does, and a group of
   types may refer to each other.
+* **Derived instances.** The compiler writes `Eq` and `Hash` for a type from
+  its declaration, where its fields have them. A derive list, after `:`, asks
+  for `Ord` as well, `type Suit : Ord = Hearts | ...`, or refuses one with
+  `!`. See [Derived instances](classes.md#derived-instances).
 
 A single constructor may have the same name as its type, as in
 `type Card = Card(Int, Suit)`. The two live in different namespaces: `Card`
@@ -583,20 +700,6 @@ the same field names. A field marked `var` can be assigned after the value is
 built; every other field keeps the value it was built with (see
 [Mutability and sharing](#mutability-and-sharing)).
 
-A constructor has at most 21 fields, positional or named, and a tuple at most
-21 elements. A wider value is an error where it is declared or written; group
-related fields into a record of their own instead.
-
-<!-- error: constructor 'Wide' has 22 fields, and a value can have at most 21 -->
-```kotlin
-type Wide = Wide {
-    f0 : Int, f1 : Int, f2 : Int, f3 : Int, f4 : Int, f5 : Int
-    f6 : Int, f7 : Int, f8 : Int, f9 : Int, f10 : Int, f11 : Int
-    f12 : Int, f13 : Int, f14 : Int, f15 : Int, f16 : Int, f17 : Int
-    f18 : Int, f19 : Int, f20 : Int, f21 : Int
-}
-```
-
 A record constructor is still a constructor with a payload. `Item("pen", 3, 12)`
 builds the same value as the record expression above, with the fields in
 declaration order, and `Item(n, p, q)` is a valid pattern for it.
@@ -638,6 +741,13 @@ fun main() {
 (2, 1)
 ```
 
+An alias has no constructors of its own, so it cannot have a derive list:
+
+<!-- error: 'Pair' is a type alias, and an alias cannot derive classes -->
+```kotlin
+type Pair a : Eq = (a, a)
+```
+
 An alias may apply a type to any of its arguments, including two:
 
 <!-- run -->
@@ -657,7 +767,7 @@ fun main() {
 
 ```text
 Right(5)
-Left(odd)
+Left("odd")
 ```
 
 The right-hand side of `type T = C`, or `type T = C(...)`, can read either
@@ -766,7 +876,40 @@ fun main() {
 
 Immutable values can never be changed, so a program cannot tell whether they
 are copied or shared. The same holds for a field that is not `var`: reading
-it through any reference gives the value the record was built with.
+it through any reference gives the value the record was built with. A
+mutable value is one object however many references hold it, and
+`identical` asks whether two references hold the same one
+([`Object` and `identical`](builtins.md#object-and-identical)).
+
+Tasks running at the same time can read and assign the same `var` field, or
+the same element of an array. Reading either while another task assigns it
+gives a value that some assignment stored there, or the value the record or
+the array was built with, with one exception. A `var` field or an array
+element whose type is a tuple or a type with one constructor may be read
+**torn**: what the read gives combines fields of different values stored in
+it. Each of its fields is that field of some value stored there,
+and the same holds of their own fields in turn, down to a field of a
+primitive type or of a type with more than one constructor, which is read
+whole. So a torn read always gives a value of the field's type, possibly one
+no assignment stored.
+
+<!-- check -->
+```kotlin
+type Vec3 = Vec3 { x : Float, y : Float, z : Float }
+type Body = Body { var pos : Vec3, mass : Float }
+```
+
+A task that reads `body.pos` while another assigns
+`Vec3 { x = 1.0, y = 1.0, z = 1.0 }` over `Vec3 { x = 0.0, y = 0.0, z = 0.0 }`
+may see `Vec3 { x = 1.0, y = 0.0, z = 0.0 }`, and so may one that reads
+`points[i]` of an `Array Vec3` while another assigns it. Where a value must
+be read whole, make the reads and the assignments exclude each other, with
+`System.Sync.withLock` for instance.
+
+> **For readers new to this.** A read is *torn* when it sees part of one write
+> and part of another. A field that holds a value of several parts is written
+> one part at a time, and a reader that runs between those writes sees the
+> parts it reaches before and after them.
 
 Assigning a field that is not `var` is an error, and the message says where
 the field is declared, since that is where the fix goes:
@@ -844,7 +987,10 @@ them can mix integers, strings and options, and they all have the one type
 Each entry in the bracket is either a bare type variable, which hides a type
 with no requirements, or a class applied to a type variable, as in `Show a`,
 which hides the type and also stores that class's instance for it. A variable
-in the bracket must not also be one of the type's parameters.
+in the bracket must not also be one of the type's parameters. A class in
+the bracket must constrain a type the fields decide: `Hidden[Show a](Int)` is
+refused as [ambiguous](inference.md#ambiguity), since building one could never
+choose the instance.
 
 **Building** an existential value is an ordinary constructor call. Its hidden
 types are the types of the arguments, and the instances the bracket asks for

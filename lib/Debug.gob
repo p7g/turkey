@@ -1,0 +1,103 @@
+export (Debug(..), dbg)
+
+-- Text for a programmer to read: a value as Turkey syntax would build it.
+--
+-- `Show` is text for the program's user and is written by hand. `Debug` is
+-- structural, and every type whose fields have it has it: the compiler
+-- derives an instance for each declared type that has none written, on
+-- demand. A derived instance
+-- prints the constructor and each field's own `Debug`, `Pair(1, "a")` or
+-- `Point { x = 1, y = 2 }`. A type with `!Debug` in its derive list prints
+-- as `<Name>` without reading a field, for state that may not be read
+-- outside a protocol, or storage that is never read at all.
+--
+-- What has no syntax prints as a placeholder: a function as `<fun>`, a
+-- field whose type mentions a type an existential hides as `<hidden>`,
+-- unless its `Debug` follows from the classes the constructor carries, and
+-- an object already on the path being printed as `<cycle>`, since only a
+-- cycle through objects can make printing a value loop.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Float (Float)
+import Data.Char (Char)
+import Data.Byte (Byte)
+import Data.String (String)
+import Data.Tuple (Unit)
+import Data.Num (Add(..), (+))
+import Data.Ord (Ord(..), (<), (<=), (>))
+import Data.Int as Int
+import Data.Float as Float
+import Data.Byte as Byte
+import Data.String as String
+import Turkey.IO as IO
+import Turkey.Stdout as Stdout
+import Turkey.DebugText as Text
+
+class Debug a { fun debug(a) -> String }
+
+-- Returns `x`, having written `debug(x)` and a line break to standard
+-- error, after what standard output holds: a value can be shown from the
+-- middle of an expression. A failed write is not reported.
+fun dbg[Debug a](x : a) -> a {
+    -- Written with the system call rather than through `System.IO`, which
+    -- every program would then load, since every program loads this
+    -- module.
+    Stdout.flushPending()
+    let text = debug(x) + "\n"
+    var at = 0
+    while at < String.byteLength(text) {
+        let n = IO.writeText(2, text, at, String.byteLength(text))
+        if n <= 0 { break }
+        at = at + n
+    }
+    x
+}
+
+instance Debug Int { fun debug(n) = Int.toString(n) }
+
+-- The shortest decimal that reads back as the same `Float`.
+instance Debug Float { fun debug(x) = Float.toString(x) }
+
+instance Debug Char { fun debug(c) = Text.quotedChar(c) }
+
+-- There is no literal for a `Byte`, so it prints as the `Int` it holds.
+instance Debug Byte { fun debug(b) = Int.toString(Byte.toInt(b)) }
+
+instance Debug String { fun debug(s) = Text.quoted(s) }
+
+instance Debug () { fun debug(_) = "()" }
+
+-- Written for the reason `Data.Tuple`'s tuple instances are: the compiler in
+-- `bootstrap/`, which builds `src/`, cannot derive tuple instances. A written
+-- instance is found before a derived one.
+instance Debug (a, b) : Debug a, Debug b {
+    fun debug((a, b)) = "(" + debug(a) + ", " + debug(b) + ")"
+}
+
+instance Debug (a, b, c) : Debug a, Debug b, Debug c {
+    fun debug((a, b, c)) = "(" + debug(a) + ", " + debug(b) + ", " + debug(c) + ")"
+}
+
+instance Debug (a, b, c, d) : Debug a, Debug b, Debug c, Debug d {
+    fun debug((a, b, c, d)) =
+        "(" + debug(a) + ", " + debug(b) + ", " + debug(c) + ", " + debug(d) + ")"
+}
+
+-- An address, in hexadecimal.
+instance Debug Prim.Ptr { fun debug(p) = "0x" + Text.hex(Prim.ptrToInt(p)) }
+
+-- The value it holds, read atomically.
+instance Debug Prim.Atomic { fun debug(a) = Int.toString(Prim.atomicGet(a)) }
+
+-- Its elements, as an array literal.
+instance Debug (Prim.Array a) : Debug a {
+    fun debug(xs) {
+        var out = "["
+        for var i = 0; i < Prim.arrayLength(xs); i = i + 1 {
+            if i > 0 { out = out + ", " }
+            out = out + debug(Prim.arrayGet(xs, i))
+        }
+        out + "]"
+    }
+}

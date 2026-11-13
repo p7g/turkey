@@ -1,5 +1,5 @@
 export (
-    Flat(..), layoutOf, flatOf, unfolds, storedRep, flatLimit, share, packedKeyParts,
+    Flat(..), layoutOf, flatOf, unfolds, storedRep, inlined, fieldReps, flatLimit, share, packedKeyParts,
     packingIndex, packingCount, isOpened, skolemKey, unknownLayouts,
 )
 
@@ -86,6 +86,7 @@ import Turkey.Opt as Opt
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), TVar, TCon, TApp, TFam,
                      TFun, TTuple, TSet, TBottom)
+import Iter
 
 -- The layouts a type can have. Each is one slot, except `unit_`, which has
 -- none.
@@ -171,6 +172,43 @@ fun storedRep(l : Layout) -> Rep = match len(l.slots) {
     _ -> Ssa.traced(Ptr)
 }
 
+-- Returns whether an object holds a field of this layout as the layout's own
+-- slots rather than at `storedRep`: a layout of several slots, every one of
+-- them a whole word. Like `storedRep`, this is a function of the layout alone,
+-- which the object's builder and every reader know.
+--
+-- Two things narrow it to whole words, and both are about sums, whose tag is
+-- always narrower than a word (`indexLayout`). A layout of whole words is
+-- therefore a product of products and words.
+--
+-- * A `var` field is written slot by slot, so a reader racing a write may see
+--   slots of two different values. That is memory safe only where each slot
+--   holds a value of its own field of a product. A sum's slots are valid only
+--   together, since its tag says which of them hold what: a torn tag would
+--   make a pointer of one constructor out of an integer of another.
+-- * A sum read out of a field is often passed on boxed, to a closure, an
+--   array or a compact sum's payload, and a sum held inline must then be
+--   boxed again where the boxed field's pointer was passed as it was. On the
+--   compiler's own source, holding sums inline in immutable fields cost more
+--   allocations than it saved.
+--
+-- So a product with a narrow slot is held boxed too: nothing in the layout
+-- alone tells it from a sum.
+fun inlined(l : Layout) -> Bool = len(l.slots) > 1 && Iter.all(l.slots, isWord)
+
+fun isWord(r : Rep) -> Bool = match r.class_ {
+    I64 | F64 | Ptr -> True
+    _ -> False
+}
+
+-- Returns the representations an object holds a field of this layout at: its
+-- slots if `inlined`, and otherwise the one `storedRep`. An object's layout is
+-- `Turkey.Runtime.layout` of these for all its fields, concatenated, so an
+-- inlined field's slots are placed one by one among the object's, traced
+-- slots first, and the object's header still describes its traced words with
+-- one count.
+fun fieldReps(l : Layout) -> Array Rep = if inlined(l) { l.slots } else { [storedRep(l)] }
+
 -- The layout a value of `ty` is held at, or `None` if that is not known.
 --
 -- `layouts` is the binding's `layouts`, with the constants of any existential
@@ -197,9 +235,9 @@ fun flatOf(decls : DeclTable, ty : Ty.Type,
 -- any other type is a lookup, cheaper than remembering it.
 fun unfolds(decls : DeclTable, ty : Ty.Type) -> Bool = match Ty.prune(ty) {
     TTuple(_) -> True
-    TCon(c) -> unfoldsName(decls, c.name)
+    TCon(c) -> Decls.mayBeFlat(decls, c.name)
     TApp(fn, _, _) -> match headOf(fn) {
-        TCon(c) -> unfoldsName(decls, c.name)
+        TCon(c) -> Decls.mayBeFlat(decls, c.name)
         _ -> False
     }
     _ -> False
@@ -210,9 +248,6 @@ fun headOf(ty : Ty.Type) -> Ty.Type = match Ty.prune(ty) {
     TApp(fn, _, _) -> headOf(fn)
     other -> other
 }
-
-fun unfoldsName(decls : DeclTable, name : String) -> Bool =
-    Set.contains(Decls.newtypes(decls), name) || Option.isSome(Decls.flatDecl(decls, name))
 
 -- `f` of a quick unfolding, or of a careful one if the quick one gave up.
 --
@@ -1340,8 +1375,13 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
         -- Anywhere else, a type abstraction whose variables no key gave a
         -- layout is one nothing applies to a type -- `(/\a. f)(d)`, as
         -- instantiating a method leaves it -- so its variables are as free as
-        -- `defaultsInto`'s, and get the same layout.
-        CTyLam(vs, body) -> defaultAtoms(unknownBinders(vs, sc), body.ty, sc)
+        -- `defaultsInto`'s, and get the same layout. Only those of kind `*`:
+        -- an application of a higher-kinded one gets its layout from a key or
+        -- not at all, so a key that misses one is a compile-time error here
+        -- and never a copy compiled at `unit` that a call then reaches.
+        CTyLam(vs, body) -> defaultAtoms(Vec.filter(unknownBinders(vs, body.ty, sc),
+                                                    \isStar(_.kind)),
+                                         body.ty, sc)
         CLetRec(binds, body) -> {
             var any = False
             for b in binds {
@@ -1388,14 +1428,22 @@ fun requestAt(s : Sharer, sc : Scope, n : String, args : Array Ty.Type,
 fun ownVars(m : MethodInfo) -> Vec VarCell =
     Vec.filter(m.scheme.quantified, \_.id != m.classVar.id)
 
--- The atoms of a method's own variables, in key order: the variables of kind
--- `*`, then the applications over them alone in its declared type.
+-- Returns the atoms of a method's own variables, in key order: the variables
+-- of kind `*`, then the applications in its declared type that mention one of
+-- them and no variable but those and the class variable.
 fun methodAtoms(m : MethodInfo) -> Vec Ty.Type {
     let own = ownVars(m)
     let owned = Set.new()
     for v in own { Set.add(owned, v.id) }
+    -- An application may mention the class variable too, as `m s` does. Every
+    -- call and every dictionary knows it, as the dictionary's head, so the key
+    -- can cover it (`methodKeyAt`), and a key that left it out would leave
+    -- `m Packet` with no layout in the copy that needs one.
+    let visible = Set.new()
+    for v in own { Set.add(visible, v.id) }
+    Set.add(visible, m.classVar.id)
     let found = Vec.new(2)
-    atomsInto(m.scheme.body, owned, owned, found, Set.new())
+    atomsInto(m.scheme.body, owned, visible, found, Set.new())
     let out = Vec.new(len(own))
     for v in own {
         if isStar(v.kind) { Vec.push(out, TVar(v)) }
@@ -1411,6 +1459,21 @@ fun methodAtoms(m : MethodInfo) -> Vec Ty.Type {
         Vec.push(out, t)
     }
     out
+}
+
+-- Returns the layouts of `m`'s atoms (`methodAtoms`) at one call of it at
+-- `args`, through a dictionary whose head is `head`, under the caller's
+-- layouts; or the first atom whose layout the caller cannot know.
+fun methodKeyAt(s : Sharer, m : MethodInfo, head : Ty.Type, args : Array Ty.Type,
+                sc : Scope) -> Either Ty.Type (Vec Layout) {
+    let binders = Vec.append(ownVars(m), [m.classVar])
+    keyAt(s, methodAtoms(m), binders, Array.append(args, [head]), famsFor(s, sc),
+          current(sc))
+}
+
+-- Returns the type a dictionary of type `t` is for.
+fun dictHead(t : Ty.Type) -> Ty.Type = match Ty.spine(Ty.prune(t)) {
+    (_, args) -> if len(args) == 1 { args[0] } else { t }
 }
 
 -- The method slot `index` of a `cls` dictionary holds, if it holds one.
@@ -1449,8 +1512,7 @@ fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, index : Int,
         oopsAt("the method '" + method + "' applied to " + Int.toString(len(args))
                + " types, where it binds " + Int.toString(len(own)), e)
     }
-    let parts = match keyAt(s, methodAtoms(m), own, args, famsFor(s, sc),
-                            current(sc)) {
+    let parts = match methodKeyAt(s, m, dictHead(target.ty), args, sc) {
         Right(ps) -> ps
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a call to the "
                           + "method '" + method + "' from '" + sc.owner + "'", e)
@@ -1478,9 +1540,7 @@ fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, index : Int,
 -- whose method is not compiled per key holds the same value in each.
 fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
                     sc : Scope) -> Core {
-    let head = match Ty.spine(Ty.prune(e.ty)) {
-        (_, args) -> if len(args) == 1 { args[0] } else { e.ty }
-    }
+    let head = dictHead(e.ty)
     let out = Vec.new(len(slots))
     -- method -> key -> the copy compiled for it.
     let copies = Map.new()
@@ -1504,7 +1564,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
             Some(found) -> found
             None -> []
         }
-        if len(vs) == 0 || len(unknownBinders(vs, sc)) == 0 {
+        if len(vs) == 0 || len(unknownBinders(vs, inner.ty, sc)) == 0 {
             Vec.push(out, rewrite(s, value, sc))
             Map.put(shared, name, value)
             continue
@@ -1524,7 +1584,10 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
             let parts = asked[k]
             let fresh = Vec.map(vs, fun(v) = Ty.newVar(v.level, v.kind))
             let renaming = Map.new()
+            -- The atoms at this copy's variables and this dictionary's head,
+            -- as `methodKeyAt` read them at the call.
             let toFresh = Map.new()
+            Map.put(toFresh, m.classVar.id, head)
             for var j = 0; j < len(vs) && j < len(own); j = j + 1 {
                 Map.put(renaming, vs[j].id, TVar(fresh[j]))
                 Map.put(toFresh, own[j].id, TVar(fresh[j]))
@@ -1594,10 +1657,33 @@ fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Vec VarCe
     Some(out)
 }
 
--- The variables of kind `*` among `vs` that the scope has no layout for.
-fun unknownBinders(vs : Vec VarCell, sc : Scope) -> Vec VarCell =
+-- Returns the variables among `vs` the scope has no layout for: each of kind
+-- `*` with no layout of its own, and each higher-kinded one that an atom of
+-- `ty` with no layout mentions.
+fun unknownBinders(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Vec VarCell {
+    -- A higher-kinded variable has no layout of its own: `m` takes none, and
+    -- `m Int` and `m String` take one each. So whether the scope knows it
+    -- depends on which of its applications `ty` holds, and a test of the
+    -- variable alone would find every higher-kinded binder known.
+    let known = current(sc)
+    let higher = Set.new()
+    for v in vs {
+        if !isStar(v.kind) { Set.add(higher, v.id) }
+    }
+    let visible = Set.new()
+    for v in Ty.varsOf([ty]) { Set.add(visible, v.id) }
+    let atoms = Vec.new(2)
+    atomsInto(ty, higher, visible, atoms, Set.new())
+    let missing = Set.new()
+    for t in atoms {
+        if !Map.contains(known, Ty.typeKey(t)) {
+            for v in Ty.varsOf([t]) { Set.add(missing, v.id) }
+        }
+    }
     Vec.filter(vs, fun(v) =
-        isStar(v.kind) && !Map.contains(current(sc), Ty.typeKey(TVar(v))))
+        if isStar(v.kind) { !Map.contains(known, Ty.typeKey(TVar(v))) }
+        else { Set.contains(missing, v.id) })
+}
 
 -- `unit` for every atom of `ty` over `vs`, in every map on the chain.
 fun defaultAtoms(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Unit {

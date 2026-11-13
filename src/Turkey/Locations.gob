@@ -1,0 +1,674 @@
+export (locate)
+
+-- Where each variable of an allocated function is, for `-g`: the location
+-- lists of its debug information, and the labels in its code they run
+-- between.
+--
+-- Computed after allocation and frame layout, from what they decided, and
+-- nothing is added to the code but labels, which have no size. A value holds
+-- the variables it is labeled with (`Ssa.Func.holds`), and a reload or a
+-- recomputation holds what the value it stands in for holds
+-- (`Regalloc.Spills.reloadOf`). Each value's range starts at its definition
+-- and ends at its last use, or at the end of a block it is live out of: past
+-- its last use its register may hold something else.
+--
+-- A value is the variable's only where it is the variable's one reaching
+-- assignment: a value is assigned to a variable at its definition, or at the
+-- point an assignment to a `var` or a copy was (`Ssa.Func.anchors`), and it
+-- stops being the variable's at the next assignment on any path to a point.
+-- So a value shows neither before the statement that assigns it, nor after
+-- another has, nor where paths that assigned different values meet. An
+-- assignment to a variable also ends every other variable of the same name
+-- in the same function or inlined call: there are no lexical scopes in the
+-- debug information, and a variable a later one shadows would otherwise show
+-- beside it. Its location, where it is the variable's, is:
+--
+-- * a frame slot, from the store into it on, for a value the collector roots
+--   (`Turkey.Roots`) or the allocator spills: such a slot holds that one
+--   value until the frame ends, so the value is there for as long as any of
+--   its reloads is live, and between them too. Past its last use it is still
+--   there, to the end of its block and in every block its block dominates,
+--   since the store is behind each of those;
+-- * otherwise its register.
+--
+-- A variable held in several slots is in several values at once, one per
+-- slot: its location is each slot's in turn, each a piece of the slot's
+-- width, so that a debugger reads the slots as one structure
+-- (`Turkey.DebugTypes`). Such a variable is somewhere only where every one
+-- of its slots is: a debugger shows an empty piece as zero, which would be a
+-- value the program never had. A slot that only ever holds one constant is
+-- that constant everywhere, though no register may hold it: a sum's slots
+-- that its constructor does not use are zero.
+--
+-- A slot is addressed from the frame base, `x29`, which the prologue sets
+-- before any range starts, at its offset in `Turkey.Frame`'s layout less the
+-- frame record's: `sp` is fixed for the whole body, so the offset is too.
+--
+-- Not covered: the prologue, before the parameters are moved out of their
+-- argument registers; a terminator's own code, whose parallel copies may
+-- overwrite a register a value dying there was in; and a function's cold
+-- code, its allocations' slow paths, which lies outside every range.
+
+import Data.BitSet as BitSet
+import Data.Map as Map
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Bank(..), Mem(..), Reg(..), Arm(..))
+import Turkey.Asm as Asm
+import Turkey.Dwarf as Dwarf
+import Turkey.Emit as Emit
+import Turkey.Frame as Frame
+import Turkey.Position as Position
+import Turkey.Regalloc as Regalloc
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Func, BlockId(..), RepClass(..), Value(..))
+
+-- A range of code where a variable is in the location `expression`: from
+-- point `low` of block `lowBlock` to point `high` of block `highBlock`
+-- (`Emit.markKey`), with the keys that order the ends among the function's
+-- points.
+type Range = Range {
+    -- Whether the range only follows a slot past the value's last use.
+    weak          : Bool,
+    lowBlock      : Int,
+    low           : Int,
+    var highBlock : Int,
+    var high      : Int,
+    from          : Int,
+    var to        : Int,
+    expression    : Array Int,
+}
+
+-- The labels function `tag`'s code needs, by `Emit.markKey`; its variables
+-- with their location lists, in the order `f.variables` has them; and the
+-- label at the start of its first block, before every range, which is what
+-- the lists' offsets are from. `roots` is each rooted value's slot
+-- (`Turkey.Roots`).
+fun locate(d : Asm.Dialect, tag : Int, a : Regalloc.Allocation, l : Frame.Layout,
+           roots : Map Int Int) -> (Map Int Asm.Symbol, Vec Dwarf.Variable, Asm.Symbol) {
+    let f = a.func
+    let marks = Map.new()
+    let order = Emit.blockOrder(f)
+    let base = mark(d, tag, marks, order[0], 0)
+    if len(f.variables) == 0 { return (marks, [], base) }
+    let count = len(f.reps)
+    -- Each value's origin: itself, or the value a reload stands in for.
+    let origin = Array.init(count, fun(id) = id)
+    for (t, from) in Map.entries(a.spills.reloadOf) {
+        var o = from
+        while Map.contains(a.spills.reloadOf, o) { o = Map.getOr(a.spills.reloadOf, o, o) }
+        origin[t] = o
+    }
+    -- The slot of each value kept in one.
+    let slots : Array (Option Mem) = Array.filled(count, None)
+    for (id, n) in Map.entries(roots) { if id < count { slots[id] = Some(RootSlot(n)) } }
+    for (id, m) in Map.entries(a.spills.slots) { slots[id] = Some(m) }
+    -- What the ranges follow: a value in a slot together with its reloads,
+    -- under its own id, and every other value on its own.
+    let follow = fun(id) = if Option.isSome(slots[origin[id]]) { origin[id] } else { id }
+    let followed = followedFunc(f, follow)
+    let (liveIn, liveOut) = Ssa.livenessInOut(followed)
+    let edges = Emit.computedAtEdges(f)
+    let rank = Array.filled(len(f.blocks), -1)
+    for var k = 0; k < len(order); k = k + 1 { rank[order[k]] = k }
+    let idom = Ssa.dominators(followed)
+    -- The values first found in their slots in each block, which every block
+    -- it dominates has the store behind: blocks are placed in an order that
+    -- puts a block after its dominator, so a block's dominators have theirs
+    -- by the time it is reached.
+    let homes : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
+    let homed = Map.new()
+    let reach = reaching(f, followed, order)
+    -- Each variable's ranges, per slot: one list for a variable held as one
+    -- value.
+    let ranges : Array (Array (Vec Range)) = Array.map(f.variables, fun(v) =
+        Array.init(pieceCount(v), fun(_) = []))
+    let constants = slotConstants(f, a, ranges)
+    let labeled = fun(id) = len(Ssa.holding(f, origin[id])) > 0
+                            && f.reps[id].class_ != Unit
+    for b in order {
+        let block = followed.blocks[b]
+        let n = len(block.insts)
+        -- Where each followed value's range in this block starts and ends.
+        let starts = Map.new()
+        let ends = Map.new()
+        for id in BitSet.elements(liveIn[b]) {
+            if labeled(id) { Map.put(starts, id, 0) }
+        }
+        -- A parameter is defined at the start, and so is its range unless
+        -- it is stored into a slot; a value live in was stored before.
+        let defined = Map.new()
+        for p in block.params {
+            let id = Ssa.valueId(p)
+            if labeled(id) {
+                Map.put(starts, id, 0)
+                Map.put(defined, id, ())
+            }
+        }
+        for var k = 0; k < n; k = k + 1 {
+            let i = block.insts[k]
+            Ssa.eachUse(i, fun(v) {
+                if Map.contains(starts, Ssa.valueId(v)) { Map.put(ends, Ssa.valueId(v), k + 1) }
+            })
+            Ssa.eachDef(i, fun(v) {
+                let id = Ssa.valueId(v)
+                if labeled(id) && follow(id) == id && !edges[id]
+                   && !Map.contains(starts, id) {
+                    Map.put(starts, id, k + 1)
+                    Map.put(defined, id, ())
+                }
+            })
+        }
+        for v in Ssa.termUses(block.term) {
+            if Map.contains(starts, Ssa.valueId(v)) { Map.put(ends, Ssa.valueId(v), n) }
+        }
+        -- A value in a slot, in a block its own dominates, past its last use.
+        let weak = Map.new()
+        var above = b
+        while above != Ssa.blockId(f.entry) {
+            above = Option.unwrapOr(idom[above], Ssa.blockId(f.entry))
+            for id in homes[above] {
+                if !Map.contains(starts, id) {
+                    Map.put(starts, id, 0)
+                    Map.put(weak, id, ())
+                }
+            }
+        }
+        let timeline = timelineOf(reach, b)
+        for (id, start) in Map.entries(starts) {
+            -- Where the range starts, its location, and whether that is a slot.
+            let (low, expression, inSlot) = match slots[id] {
+                Some(m) -> if !Map.contains(defined, id) { (start, slotted(l, m), True) } else {
+                    let stored = storedAt(block.insts, id, start)
+                    if stored >= 0 { (stored, slotted(l, m), True) }
+                    else { (start, register(f, a, id), False) }
+                }
+                None -> (start, register(f, a, id), False)
+            }
+            if inSlot && !Map.contains(homed, id) {
+                Map.put(homed, id, ())
+                Vec.push(homes[b], id)
+            }
+            let end = if inSlot || BitSet.contains(liveOut[b], id) { n + 1 }
+                      else { Map.getOr(ends, id, start) }
+            let add = fun(from : Int, to : Int, at : Array Int) {
+                if from < to && len(at) > 0 {
+                    for (k, slot) in Ssa.holding(f, origin[id]) {
+                        let pieces = ranges[k]
+                        let j = if slot < 0 { 0 } else { slot }
+                        if (slot < 0) == (len(pieces) == 1) && j < len(pieces) {
+                            let piece = reach.base[k] + j
+                            for (low, high) in current(reach, timeline, piece, origin[id], from, to) {
+                                Vec.push(pieces[j], Range {
+                                    weak = Map.contains(weak, id),
+                                    lowBlock = b, low = low, highBlock = b, high = high,
+                                    from = rank[b] << 32 | low, to = rank[b] << 32 | high,
+                                    expression = at,
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+            -- Until the store, the value is only in its register.
+            if low > start { add(start, low, register(f, a, id)) }
+            add(low, end, expression)
+        }
+    }
+    let variables = []
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        let v = f.variables[k]
+        let locations = []
+        let whole = if len(ranges[k]) == 1 { clipped(ranges[k][0]) }
+                    else { pieced(Array.map(ranges[k], clipped),
+                                  Array.map(v.layout.slots, Rt.fieldWidth), constants[k]) }
+        for r in merged(whole, f) {
+            Vec.push(locations, Dwarf.Location {
+                low = mark(d, tag, marks, r.lowBlock, r.low),
+                high = mark(d, tag, marks, r.highBlock, r.high),
+                expression = r.expression,
+            })
+        }
+        Vec.push(variables, Dwarf.Variable {
+            name = v.name, declared = v.declared, parameter = v.parameter, ty = v.ty,
+            layout = v.layout, boxed = v.boxed, locations = locations,
+        })
+    }
+    (marks, variables, base)
+}
+
+-- Which value is each variable's at each point, as a forward analysis of
+-- assignments. `base` numbers each variable's pieces from `base[k]`, one for
+-- a variable held as one value. Only some pieces are tracked: a piece with
+-- one assignment, at its value's definition, and no other variable of its
+-- name to end it, is its value wherever that value is, which is most of
+-- them, since most variables are `let`s. `tracked` numbers the others, or
+-- is -1. Of those, `inState` is each one's state at the start of each block,
+-- by block; and `assigned` each block's assignments, as (point, tracked
+-- piece, value), in the order of their points. A piece's state is a value,
+-- `unassigned`, or `several`, where paths that assigned different values
+-- meet.
+type Reach = Reach {
+    base     : Array Int,
+    tracked  : Array Int,
+    inState  : Array (Array Int),
+    assigned : Array (Vec (Int, Int, Int)),
+    -- The tracked pieces each assignment to a tracked piece ends: every
+    -- piece of each other variable of its name in its function or inlined
+    -- call.
+    ends     : Array (Vec Int),
+}
+
+let unassigned = -1
+let several = -2
+
+-- Returns `f`'s variables' assignments and their states at the start of
+-- each block of `followed`, `f` with reloads read as their origins, whose
+-- blocks `order` lists with each block after its dominator.
+fun reaching(f : Func A.Inst, followed : Func A.Inst, order : Vec Int) -> Reach {
+    let base = Array.filled(len(f.variables), 0)
+    var total = 0
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        base[k] = total
+        total = total + pieceCount(f.variables[k])
+    }
+    let wanted = Array.filled(total, False)
+    -- The variables of each name in each scope.
+    let scopes = Map.new()
+    for var k = 0; k < len(f.variables); k = k + 1 {
+        let v = f.variables[k]
+        let key = v.name + " " + Int.toString(Position.site(v.declared))
+        match Map.get(scopes, key) {
+            Some(ks) -> Vec.push(ks, k)
+            None -> Map.put(scopes, key, [k])
+        }
+    }
+    let shadowing = Array.filter(Map.values(scopes), \len(_) > 1)
+    for ks in shadowing {
+        for k in ks {
+            for var j = 0; j < pieceCount(f.variables[k]); j = j + 1 { wanted[base[k] + j] = True }
+        }
+    }
+    -- Where each value is defined: its block, and the point after it.
+    let definedAt = Map.new()
+    for b in order {
+        let block = followed.blocks[b]
+        for p in block.params { Map.put(definedAt, Ssa.valueId(p), (b, 0)) }
+        for var k = 0; k < len(block.insts); k = k + 1 {
+            Ssa.eachDef(block.insts[k], fun(v) = Map.put(definedAt, Ssa.valueId(v), (b, k + 1)))
+        }
+    }
+    -- Each piece's assignments, as (block, point, value).
+    let assignments : Array (Vec (Int, Int, Int)) = Array.init(total, fun(_) = [])
+    for (id, held) in Map.entries(f.holds) {
+        for (k, slot) in held {
+            let j = if slot < 0 { 0 } else { slot }
+            if (slot < 0) != (pieceCount(f.variables[k]) == 1) || j >= pieceCount(f.variables[k]) {
+                continue
+            }
+            let piece = base[k] + j
+            let anchors = Ssa.anchorsOf(f, id, k, slot)
+            if len(anchors) > 0 { wanted[piece] = True }
+            let points = if len(anchors) == 0 { [Map.get(definedAt, id)] } else {
+                Vec.map(anchors, fun(a) = match a {
+                    Ssa.After(w) -> Map.get(definedAt, w)
+                    Ssa.Before(u) -> Option.map(Map.get(definedAt, u),
+                                                fun((b, p)) = (b, max(p - 1, 0)))
+                })
+            }
+            for point in points {
+                if let Some((b, p)) = point { Vec.push(assignments[piece], (b, p, id)) }
+            }
+            if len(assignments[piece]) > 1 { wanted[piece] = True }
+        }
+    }
+    let tracked = Array.filled(total, -1)
+    var count = 0
+    for var i = 0; i < total; i = i + 1 {
+        if wanted[i] {
+            tracked[i] = count
+            count = count + 1
+        }
+    }
+    let ends : Array (Vec Int) = Array.init(count, fun(_) = [])
+    for ks in shadowing {
+        for k in ks {
+            for other in ks {
+                if other != k {
+                    for var i = 0; i < pieceCount(f.variables[k]); i = i + 1 {
+                        for var j = 0; j < pieceCount(f.variables[other]); j = j + 1 {
+                            Vec.push(ends[tracked[base[k] + i]], tracked[base[other] + j])
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let assigned : Array (Vec (Int, Int, Int)) = Array.init(len(f.blocks), fun(_) = [])
+    for var i = 0; i < total; i = i + 1 {
+        if tracked[i] >= 0 {
+            for (b, p, id) in assignments[i] { Vec.push(assigned[b], (p, tracked[i], id)) }
+        }
+    }
+    for var b = 0; b < len(assigned); b = b + 1 {
+        if len(assigned[b]) > 1 {
+            assigned[b] = Vec.sortBy(assigned[b], fun((x, _, _), (y, _, _)) = Array.threeWay(x, y))
+        }
+    }
+    let inState = Array.init(len(f.blocks), fun(_) = Array.filled(count, unassigned))
+    if count > 0 {
+        let preds = Ssa.predecessors(followed)
+        let outState : Array (Option (Array Int)) = Array.filled(len(f.blocks), None)
+        var changed = True
+        while changed {
+            changed = False
+            for b in order {
+                let here = Array.filled(count, unassigned)
+                for p in preds[b] {
+                    if let Some(out) = outState[Ssa.blockId(p)] {
+                        for var i = 0; i < count; i = i + 1 { here[i] = join(here[i], out[i]) }
+                    }
+                }
+                inState[b] = here
+                let out = if len(assigned[b]) == 0 { here } else {
+                    let copy = Array.map(here, fun(x) = x)
+                    for (_, piece, id) in assigned[b] { assign(copy, ends, piece, id) }
+                    copy
+                }
+                let same = match outState[b] {
+                    Some(before) -> same(before, out)
+                    None -> False
+                }
+                if !same {
+                    outState[b] = Some(out)
+                    changed = True
+                }
+            }
+        }
+    }
+    Reach { base = base, tracked = tracked, inState = inState, assigned = assigned, ends = ends }
+}
+
+fun join(x : Int, y : Int) -> Int =
+    if x == unassigned { y } else if y == unassigned || x == y { x } else { several }
+
+fun assign(state : Array Int, ends : Array (Vec Int), piece : Int, id : Int) -> Unit {
+    state[piece] = id
+    for other in ends[piece] { state[other] = several }
+}
+
+-- Each tracked piece's states through block `b`: (point, state) from point
+-- 0, for the pieces an assignment in the block changes.
+fun timelineOf(reach : Reach, b : Int) -> (Array Int, Map Int (Vec (Int, Int))) {
+    let start = reach.inState[b]
+    let changes = Map.new()
+    if len(reach.assigned[b]) == 0 { return (start, changes) }
+    let state = Array.map(start, fun(x) = x)
+    let note = fun(piece : Int, p : Int) {
+        match Map.get(changes, piece) {
+            Some(cs) -> Vec.push(cs, (p, state[piece]))
+            None -> Map.put(changes, piece, [(0, start[piece]), (p, state[piece])])
+        }
+    }
+    for (p, piece, id) in reach.assigned[b] {
+        assign(state, reach.ends, piece, id)
+        note(piece, p)
+        for other in reach.ends[piece] { note(other, p) }
+    }
+    (start, changes)
+}
+
+-- The stretches of `from` to `to` where `id` is `piece`'s value: all of it
+-- for a piece that is not tracked.
+fun current(reach : Reach, timeline : (Array Int, Map Int (Vec (Int, Int))), piece : Int,
+            id : Int, from : Int, to : Int) -> Vec (Int, Int) {
+    let out = []
+    let at = reach.tracked[piece]
+    if at < 0 {
+        Vec.push(out, (from, to))
+        return out
+    }
+    let (start, changes) = timeline
+    match Map.get(changes, at) {
+        None -> if start[at] == id { Vec.push(out, (from, to)) }
+        Some(cs) -> for var i = 0; i < len(cs); i = i + 1 {
+            let (p, state) = cs[i]
+            let (next, _) = if i + 1 < len(cs) { cs[i + 1] } else { (to, 0) }
+            let (low, high) = (max(from, p), min(to, next))
+            if state == id && low < high { Vec.push(out, (low, high)) }
+        }
+    }
+    out
+}
+
+-- `f` with every read of a value renamed by `follow`, and nothing else
+-- changed: so a value in a slot is live, under its own id, wherever one of
+-- its reloads is, and from its definition to the last of them.
+fun followedFunc(f : Func A.Inst, follow : fun(Int) -> Int) -> Func A.Inst {
+    let g = Ssa.newFunc(f.name, f.results)
+    for r in f.reps { Vec.push(g.reps, r) }
+    for p in f.params { Vec.push(g.params, p) }
+    let rename = fun(v : Value) -> Value = Value(follow(Ssa.valueId(v)))
+    for block in f.blocks {
+        let made = Ssa.newBlock()
+        for p in block.params { Vec.push(made.params, p) }
+        for i in block.insts { Vec.push(made.insts, Ssa.renameUses(i, rename)) }
+        made.term = match block.term {
+            Ssa.Ret(vs) -> Ssa.Ret(Vec.map(vs, rename))
+            Ssa.Jump(target, args) -> Ssa.Jump(target, Vec.map(args, rename))
+            Ssa.Branch(c, yes, no) -> Ssa.Branch(rename(c), yes, no)
+            Ssa.Switch(v, cases, default) -> Ssa.Switch(rename(v), cases, default)
+            Ssa.Panic(v) -> Ssa.Panic(rename(v))
+            Ssa.Unreachable -> Ssa.Unreachable
+        }
+        Vec.push(g.blocks, made)
+    }
+    g.entry = f.entry
+    g
+}
+
+-- The point after the store of value `id` into its slot, at or after point
+-- `from` of a block with instructions `insts`, or -1 if none stores it.
+fun storedAt(insts : Vec A.Inst, id : Int, from : Int) -> Int {
+    for var k = from; k < len(insts); k = k + 1 {
+        if let Some((v, _)) = A.slotStore(insts[k].op) {
+            if v == id { return k + 1 }
+        }
+    }
+    -1
+}
+
+-- The ranges in code order, each cut short where the next one starts: the
+-- later value of a variable is the one a debugger should see. Of two that
+-- start together, a weak one comes first, so that the other wins. A range
+-- left empty is dropped. Each range is in one block, so one that the next
+-- starts inside is in the next one's block.
+fun clipped(ranges : Vec Range) -> Vec Range {
+    let sorted = Vec.sortBy(ranges, fun(x, y) = match Array.threeWay(x.from, y.from) {
+        EQ -> Array.threeWay(if x.weak { 0 } else { 1 }, if y.weak { 0 } else { 1 })
+        order -> order
+    })
+    let out = []
+    for var k = 0; k < len(sorted); k = k + 1 {
+        let r = sorted[k]
+        if k + 1 < len(sorted) && sorted[k + 1].from < r.to {
+            r.high = sorted[k + 1].low
+            r.to = sorted[k + 1].from
+        }
+        if r.from < r.to { Vec.push(out, r) }
+    }
+    out
+}
+
+-- For each variable held in slots apart, and each slot, the location of the
+-- one constant every value holding the slot is, if there is one: the
+-- constant as the value of the expression rather than where it is.
+fun slotConstants(f : Func A.Inst, a : Regalloc.Allocation,
+                  ranges : Array (Array (Vec Range))) -> Array (Array (Option Int)) {
+    let defined = Map.new()
+    for block in f.blocks {
+        for i in block.insts {
+            if let Some((d, n)) = constantOf(i.op) { Map.put(defined, d, n) }
+        }
+    }
+    for (id, op) in Map.entries(a.spills.remat) {
+        if let Some((_, n)) = constantOf(op) { Map.put(defined, id, n) }
+    }
+    -- `None` before any value is seen, `Some(Some(n))` while every one is
+    -- the constant `n`, and `Some(None)` once one is not.
+    let seen : Array (Array (Option (Option Int))) =
+        Array.map(ranges, fun(pieces) = Array.filled(len(pieces), None))
+    for (id, held) in Map.entries(f.holds) {
+        for (k, slot) in held {
+            if slot >= 0 && len(seen[k]) > 1 && slot < len(seen[k]) {
+                let here = Map.get(defined, id)
+                seen[k][slot] = match seen[k][slot] {
+                    None -> Some(here)
+                    Some(Some(n)) -> if here == Some(n) { Some(Some(n)) } else { Some(None) }
+                    Some(None) -> Some(None)
+                }
+            }
+        }
+    }
+    Array.map(seen, fun(slots) = Array.map(slots, fun(s) = match s {
+        Some(Some(n)) -> Some(n)
+        _ -> None
+    }))
+}
+
+-- The value an instruction defines and the constant it is, if it defines a
+-- constant: a `MovConst`, or a zero of either file.
+fun constantOf(op : A.Arm) -> Option (Int, Int) = match op {
+    MovConst(Virtual(d), n) -> Some((d, n))
+    Mov(Virtual(d), Physical(Gp, 31), _) -> Some((d, 0))
+    FMovIn(Virtual(d), Physical(Gp, 31)) -> Some((d, 0))
+    _ -> None
+}
+
+-- `DW_OP_consts n DW_OP_stack_value`: the constant `n` itself.
+fun constant(n : Int) -> Array Int =
+    Array.append(Array.append([Dwarf.opConsts], Dwarf.slebBytes(n)), [Dwarf.opStackValue])
+
+-- How many slots variable `v` is held in apart: one if it is held as one
+-- value, its box included.
+fun pieceCount(v : Ssa.Variable) -> Int =
+    if v.boxed || len(v.layout.slots) <= 1 { 1 } else { len(v.layout.slots) }
+
+-- The ranges of a variable held in several slots, from each slot's ranges,
+-- clipped, the slots' widths, and the constant each slot always holds, if it
+-- does: a range for each stretch between two ends of any slot's ranges where
+-- every slot is somewhere or a constant, whose location is each slot's
+-- location there, as a piece of its width.
+fun pieced(slots : Array (Vec Range), widths : Array Int,
+           constants : Array (Option Int)) -> Vec Range {
+    -- Every end, by its key, as its block and point.
+    let ends = Map.new()
+    for rs in slots {
+        for r in rs {
+            Map.put(ends, r.from, (r.lowBlock, r.low))
+            Map.put(ends, r.to, (r.highBlock, r.high))
+        }
+    }
+    let keys = Array.sort(Map.keys(ends))
+    let next = Array.filled(len(slots), 0)
+    let out = []
+    for var e = 0; e + 1 < len(keys); e = e + 1 {
+        let (from, to) = (keys[e], keys[e + 1])
+        -- A stretch lies in one block, as every range does.
+        if from >> 32 != to >> 32 { continue }
+        let expression = []
+        var everywhere = True
+        for var j = 0; j < len(slots) && everywhere; j = j + 1 {
+            -- Each slot's ranges are in order and apart, and the stretches
+            -- come in order, so a slot's next candidate is where the last
+            -- stretch left it.
+            while next[j] < len(slots[j]) && slots[j][next[j]].to <= from { next[j] = next[j] + 1 }
+            var found = False
+            if next[j] < len(slots[j]) {
+                let r = slots[j][next[j]]
+                if r.from <= from && to <= r.to {
+                    for byte in r.expression { Vec.push(expression, byte) }
+                    found = True
+                }
+            }
+            if !found {
+                if let Some(n) = constants[j] {
+                    for byte in constant(n) { Vec.push(expression, byte) }
+                    found = True
+                }
+            }
+            everywhere = found
+            Vec.push(expression, Dwarf.opPiece)
+            for byte in Dwarf.ulebBytes(widths[j]) { Vec.push(expression, byte) }
+        }
+        if everywhere {
+            let (lowBlock, low) = Map.getOr(ends, from, (0, 0))
+            let (highBlock, high) = Map.getOr(ends, to, (0, 0))
+            Vec.push(out, Range { weak = False, lowBlock = lowBlock, low = low, highBlock = highBlock,
+                                  high = high, from = from, to = to,
+                                  expression = Vec.toArray(expression) })
+        }
+    }
+    out
+}
+
+-- The ranges with each pair that meet in the same location made one: a range
+-- that ends where the next starts, or at the end of its block where the next
+-- starts the block placed after it.
+fun merged(ranges : Vec Range, f : Func A.Inst) -> Vec Range {
+    let out : Vec Range = []
+    for r in ranges {
+        if len(out) > 0 {
+            let last = out[len(out) - 1]
+            let meets = last.to == r.from
+                        || (last.high == len(f.blocks[last.highBlock].insts) + 1 && r.low == 0
+                            && r.from >> 32 == (last.to >> 32) + 1)
+            if meets && same(last.expression, r.expression) {
+                last.highBlock = r.highBlock
+                last.high = r.high
+                last.to = r.to
+                continue
+            }
+        }
+        Vec.push(out, r)
+    }
+    out
+}
+
+fun same(x : Array Int, y : Array Int) -> Bool {
+    if len(x) != len(y) { return False }
+    for var k = 0; k < len(x); k = k + 1 { if x[k] != y[k] { return False } }
+    True
+}
+
+-- The label at point `p` of `block`, made the first time it is asked for.
+fun mark(d : Asm.Dialect, tag : Int, marks : Map Int Asm.Symbol, block : Int,
+         p : Int) -> Asm.Symbol {
+    let key = Emit.markKey(block, p)
+    match Map.get(marks, key) {
+        Some(s) -> s
+        None -> {
+            let s = Asm.localLabel(d, "f" + Int.toString(tag) + "m" + Int.toString(block) + "_"
+                                      + Int.toString(p))
+            Map.put(marks, key, s)
+            s
+        }
+    }
+}
+
+-- `DW_OP_reg` of value `id`'s register, or nothing if it has none.
+fun register(f : Func A.Inst, a : Regalloc.Allocation, id : Int) -> Array Int {
+    let n = a.colouring.of_[id]
+    if n < 0 { return [] }
+    match A.bankOf(f.reps[id]) {
+        Gp -> [Dwarf.opReg0 + n]
+        -- The vector registers are DWARF's 64 to 95, past `DW_OP_reg31`.
+        Fp -> Array.append([Dwarf.opRegx], Dwarf.ulebBytes(64 + n))
+    }
+}
+
+-- `DW_OP_fbreg` of slot `m`: its offset from `x29`, the frame base.
+fun slotted(l : Frame.Layout, m : Mem) -> Array Int = match Frame.offsetOf(l, m) {
+    Some(offset) -> Array.append([Dwarf.opFbreg], Dwarf.slebBytes(offset - l.recordAt))
+    None -> []
+}

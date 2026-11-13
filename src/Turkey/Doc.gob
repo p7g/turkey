@@ -1,0 +1,578 @@
+export (Tables(..), document)
+
+-- What `boot doc` writes: for each module, what it exports, each entity with
+-- its type as the checker has it, where it is declared, and the comment
+-- attached to it. One JSON document, the same bytes for the same modules, so
+-- that it can be a golden.
+--
+-- Which comment documents what is `Turkey.DocComments`'s rule.
+
+import Data.Set as Set
+import System.File as File
+import Turkey.Ast (Type as _, Pred as _, ..)
+import Turkey.Classes as Classes
+import Turkey.Classes (ClassTable)
+import Turkey.Decls as Decls
+import Turkey.DocComments as DocComments
+import Turkey.Fixity as Fixity
+import Turkey.Modules as Modules
+import Turkey.Prelude as Prelude
+import Turkey.Source as Source
+import Turkey.Source (Span(..))
+import Turkey.Types as Ty
+import Turkey.Types (TVar, TFun, TTuple)
+import Turkey.Ast as Ast
+
+-- What the checked program provides beyond the modules: the class table,
+-- which holds the declaration table, and the scheme each top-level binding
+-- was given, by its internal name.
+type Tables = Tables {
+    classes : ClassTable,
+    scheme  : fun(String) -> Option Ty.Scheme,
+}
+
+-- Returns the JSON for `modules`, in order of module name.
+fun document(modules : Vec Modules.Module, t : Tables) -> String {
+    let sorted = Vec.sortByKey(modules, fun(m) = m.name)
+    let out = String.builder()
+    render(JObject([
+        ("version", JInt(1)),
+        ("modules", JArray(Vec.map(sorted, moduleJSON(_, t)))),
+    ]), 0, out)
+    String.push(out, "\n")
+    String.build(out)
+}
+
+-- -- JSON ---------------------------------------------------------------------------
+
+type JSON
+    = JNull
+    | JBool(Bool)
+    | JInt(Int)
+    | JString(String)
+    | JArray(Vec JSON)
+    | JObject(Vec (String, JSON))
+
+-- Writes `j` with two spaces of indentation per level, one element or member
+-- to a line, and an empty array or object on one line.
+fun render(j : JSON, depth : Int, out : String.Builder) -> Unit = match j {
+    JNull -> String.push(out, "null")
+    JBool(b) -> String.push(out, if b { "true" } else { "false" })
+    JInt(n) -> String.push(out, Int.toString(n))
+    JString(s) -> quote(s, out)
+    JArray(elements) -> {
+        if len(elements) == 0 { return String.push(out, "[]") }
+        String.push(out, "[")
+        for var i = 0; i < len(elements); i = i + 1 {
+            String.push(out, if i == 0 { "\n" } else { ",\n" })
+            indent(depth + 1, out)
+            render(elements[i], depth + 1, out)
+        }
+        String.push(out, "\n")
+        indent(depth, out)
+        String.push(out, "]")
+    }
+    JObject(members) -> {
+        if len(members) == 0 { return String.push(out, "{}") }
+        String.push(out, "{")
+        for var i = 0; i < len(members); i = i + 1 {
+            let (key, value) = members[i]
+            String.push(out, if i == 0 { "\n" } else { ",\n" })
+            indent(depth + 1, out)
+            quote(key, out)
+            String.push(out, ": ")
+            render(value, depth + 1, out)
+        }
+        String.push(out, "\n")
+        indent(depth, out)
+        String.push(out, "}")
+    }
+}
+
+fun indent(depth : Int, out : String.Builder) -> Unit =
+    String.push(out, String.repeat("  ", depth))
+
+-- Writes `s` as a JSON string. `<` is escaped too, so that the document can
+-- sit inside an HTML `<script>` element without a `</script>` in some
+-- comment closing it.
+fun quote(s : String, out : String.Builder) -> Unit {
+    String.push(out, "\"")
+    for c in String.codePoints(s) {
+        match c {
+            '"' -> String.push(out, "\\\"")
+            '\\' -> String.push(out, "\\\\")
+            '\n' -> String.push(out, "\\n")
+            '\t' -> String.push(out, "\\t")
+            '<' -> String.push(out, "\\u003c")
+            _ -> if Char.toInt(c) < 32 {
+                String.push(out, "\\u00" + hexDigit(Char.toInt(c) / 16)
+                                 + hexDigit(Char.toInt(c) % 16))
+            } else {
+                String.push(out, Char.toString(c))
+            }
+        }
+    }
+    String.push(out, "\"")
+}
+
+fun hexDigit(n : Int) -> String = hexDigits[n]
+
+let hexDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d",
+                 "e", "f"]
+
+fun optional(s : Option String) -> JSON = match s {
+    Some(text) -> JString(text)
+    None -> JNull
+}
+
+fun strings(xs : Vec String) -> JSON = JArray(Vec.map(xs, JString))
+
+-- -- comments -----------------------------------------------------------------------
+
+-- A module's doc comments: each run's text by the line after it ends, where
+-- what it documents begins, and the module's own.
+type Comments = Comments {
+    above  : Map Int String,
+    header : Option String,
+}
+
+fun commentsOf(m : Modules.Module) -> Comments {
+    let runs = DocComments.runs(m.program.comments, sourceText(m.file))
+    let above = Map.new()
+    for r in runs {
+        if r.trailing { continue }
+        if let Some(text) = DocComments.text(r) { Map.put(above, r.span.endLine + 1, text) }
+    }
+    let header = DocComments.moduleRun(runs, DocComments.targets(m.program),
+                                       DocComments.firstDeclLine(m.program))
+    let headerText = match header {
+        Some(r) -> DocComments.text(r)
+        None -> None
+    }
+    Comments { above = above, header = headerText }
+}
+
+-- Returns the text of the doc comment on what begins on `line`.
+fun attached(cs : Comments, line : Int) -> Option String = Map.get(cs.above, line)
+
+-- The module's text, which tells a doc comment that stands alone on its line
+-- from one that trails code. The loader has read the file already, so a
+-- failure here leaves every comment standing alone.
+fun sourceText(path : String) -> String = match File.readText(path) {
+    Right(text) -> text
+    Left(_) -> ""
+}
+
+-- -- modules ------------------------------------------------------------------------
+
+-- What a module exports, from internal name to the name it is exported
+-- under, one table per namespace.
+type Exported = Exported {
+    values    : Map String String,
+    types     : Map String String,
+    cons      : Map String String,
+    classes   : Map String String,
+    operators : Map String String,
+}
+
+fun exportedOf(m : Modules.Module) -> Exported = Exported {
+    values = inverse(m.exports.values),
+    types = inverse(m.exports.types),
+    cons = inverse(m.exports.cons),
+    classes = inverse(m.exports.classes),
+    operators = inverse(m.exports.operators),
+}
+
+-- `names` from target to name. Of two names for one target, the first in
+-- order of name wins, so that the result does not depend on how the table
+-- was filled.
+fun inverse(names : Map String String) -> Map String String {
+    let out = Map.new()
+    for name in Vec.sort(Vec.fromArray(Map.keys(names))) {
+        let target = Option.expect(Map.get(names, name), "a key of the map")
+        if !Map.contains(out, target) { Map.put(out, target, name) }
+    }
+    out
+}
+
+fun moduleJSON(m : Modules.Module, t : Tables) -> JSON {
+    let cs = commentsOf(m)
+    let ex = exportedOf(m)
+    let own = Set.new()
+    let items = []
+    for d in m.program.decls {
+        let where = declSpan(d)
+        if Source.isGenerated(where) || Source.isEmpty(where) { continue }
+        declItems(m, t, cs, ex, own, d, items)
+    }
+    for r in reexports(m, t, own) { Vec.push(items, r) }
+    JObject([
+        ("name", JString(m.name)),
+        ("file", JString(m.file)),
+        ("comment", optional(cs.header)),
+        ("items", JArray(items)),
+    ])
+}
+
+fun declSpan(d : Decl) -> Span = match d {
+    DStmt(s) -> s.span
+    DType(td) -> td.span
+    DClass(c) -> c.span
+    DInstance(i) -> i.span
+    DForeign(f) -> f.span
+    DInfix(op) -> op.span
+}
+
+-- Pushes onto `items` what `d` declares that the module exports, and adds
+-- the internal name of each to `own`.
+fun declItems(m : Modules.Module, t : Tables, cs : Comments, ex : Exported,
+              own : Set.Set String, d : Decl, items : Vec JSON) -> Unit {
+    let push = fun(internal, item) {
+        Set.add(own, internal)
+        Vec.push(items, item)
+    }
+    match d {
+        DStmt(s) -> match s.kind {
+            SFun(f) -> if let Some(name) = Map.get(ex.values, f.name) {
+                push(f.name, valueItem("function", name, f.name, s.span, cs, t, None, Some(f)))
+            }
+            SLet(pat, _) -> for v in Vec.sort(patternVars(pat)) {
+                if let Some(name) = Map.get(ex.values, v) {
+                    push(v, valueItem("value", name, v, s.span, cs, t, Some(False), None))
+                }
+            }
+            SVar(pat, _) -> for v in Vec.sort(patternVars(pat)) {
+                if let Some(name) = Map.get(ex.values, v) {
+                    push(v, valueItem("value", name, v, s.span, cs, t, Some(True), None))
+                }
+            }
+            _ -> {}
+        }
+        DForeign(f) -> if let Some(name) = Map.get(ex.values, f.name) {
+            push(f.name, valueItem("function", name, f.name, f.span, cs, t, None, None))
+        }
+        DType(td) -> if let Some(name) = Map.get(ex.types, td.name) {
+            push(td.name, typeItem(t, cs, ex, td, name))
+        }
+        DClass(c) -> if let Some(name) = Map.get(ex.classes, c.name) {
+            push(c.name, classItem(t, cs, ex, c, name))
+        }
+        DInstance(i) -> if let Some(inst) = instanceInfo(t.classes, i) {
+            Vec.push(items, instanceItem(cs, i, inst))
+        }
+        DInfix(op) -> {
+            let internal = Prelude.internal(m.name, op.op)
+            if let Some(name) = Map.get(ex.operators, internal) {
+                push(internal, operatorItem(cs, op, name))
+            }
+        }
+    }
+}
+
+-- The members every item begins with.
+fun heading(kind : String, name : String, where : Span, cs : Comments) -> Vec (String, JSON) = [
+    ("kind", JString(kind)),
+    ("name", JString(name)),
+    ("line", JInt(where.line)),
+    ("comment", optional(attached(cs, where.line))),
+]
+
+-- A comment for something declared inside another declaration that starts
+-- on `parent`. Nothing on the parent's own line gets one, since the comment
+-- above that line is the parent's.
+fun nestedComment(cs : Comments, line : Int, parent : Int) -> Option String =
+    if line == parent { None } else { attached(cs, line) }
+
+-- `decl` is the function's declaration, for its annotations' variable names.
+fun valueItem(kind : String, name : String, internal : String, where : Span, cs : Comments,
+              t : Tables, mutable : Option Bool, decl : Option FunDecl) -> JSON {
+    let members = heading(kind, name, where, cs)
+    let shown = Option.map(t.scheme(internal), fun(s) = match decl {
+        Some(d) -> showWritten(s, annotatedNames(t, d, s))
+        None -> showWritten(s, Map.new())
+    })
+    Vec.push(members, ("type", optional(shown)))
+    if let Some(b) = mutable { Vec.push(members, ("mutable", JBool(b))) }
+    JObject(members)
+}
+
+fun typeItem(t : Tables, cs : Comments, ex : Exported, td : TypeDecl, name : String) -> JSON {
+    if let Some(body) = td.alias {
+        let members = heading("alias", name, td.span, cs)
+        Vec.push(members, ("params", strings(td.params)))
+        Vec.push(members, ("type", JString(Classes.writtenType(t.classes, body, 0))))
+        return JObject(members)
+    }
+    let members = heading("type", name, td.span, cs)
+    Vec.push(members, ("params", strings(td.params)))
+    let derives = []
+    for d in td.derives {
+        if !d.refused { Vec.push(derives, Ty.shortName(d.cls)) }
+    }
+    Vec.push(members, ("derives", strings(derives)))
+    let variants = Option.unwrapOr(td.variants, [])
+    let cons = []
+    for var i = 0; i < len(variants); i = i + 1 {
+        let c = variants[i]
+        -- Of several constructors on one line, the comment above it is the
+        -- first's.
+        let shared = i > 0 && variants[i - 1].span.line == c.span.line
+        if let Some(cname) = Map.get(ex.cons, c.name) {
+            Vec.push(cons, conItem(t, cs, td, c, cname, shared))
+        }
+    }
+    Vec.push(members, ("opaque", JBool(len(cons) == 0 && len(variants) > 0)))
+    Vec.push(members, ("constructors", JArray(cons)))
+    JObject(members)
+}
+
+-- `shared` says an earlier constructor is on the same line, and has the
+-- comment above it.
+fun conItem(t : Tables, cs : Comments, td : TypeDecl, c : ConDecl, name : String,
+            shared : Bool) -> JSON {
+    let info = Decls.con(t.classes.decls, c.name)
+    let scheme = Option.map(info, fun(i) = showWritten(i.scheme, constructorNames(td, i)))
+    let comment = if shared { None } else { nestedComment(cs, c.span.line, td.span.line) }
+    let members = [
+        ("name", JString(name)),
+        ("line", JInt(c.span.line)),
+        ("comment", optional(comment)),
+        ("type", optional(scheme)),
+        -- Every variable the bracket binds, whether bare or in a predicate.
+        ("exists", strings(match info {
+            Some(i) -> i.existsNames
+            None -> c.binders
+        })),
+        ("context", strings(Vec.map(c.context, writtenPred(t, _)))),
+    ]
+    match c.fields {
+        Some(fields) -> {
+            let out = []
+            for var i = 0; i < len(fields); i = i + 1 {
+                let (field, written) = fields[i]
+                let line = if i < len(c.fieldSpans) { c.fieldSpans[i].line } else { c.span.line }
+                -- Of several fields on one line, the comment above it is the
+                -- first's.
+                let shared = i > 0 && i - 1 < len(c.fieldSpans) && c.fieldSpans[i - 1].line == line
+                Vec.push(out, JObject([
+                    ("name", JString(field)),
+                    ("line", JInt(line)),
+                    ("comment", optional(if shared { None }
+                                         else { nestedComment(cs, line, c.span.line) })),
+                    ("type", JString(Classes.writtenType(t.classes, written, 0))),
+                    ("mutable", JBool(Vec.contains(c.vars, field))),
+                ]))
+            }
+            Vec.push(members, ("fields", JArray(out)))
+        }
+        None -> Vec.push(members, ("args", JArray(Vec.map(c.args, fun(a) =
+            JString(Classes.writtenType(t.classes, a, 0))))))
+    }
+    JObject(members)
+}
+
+fun classItem(t : Tables, cs : Comments, ex : Exported, c : ClassDecl, name : String) -> JSON {
+    let info = Map.get(t.classes.classes, c.name)
+    let supers = match info {
+        Some(i) -> {
+            let named = Map.new()
+            Map.put(named, i.cvar.id, i.param)
+            let n = Classes.writtenNamer(named)
+            Vec.map(Vec.append(i.supers, i.equalities), fun(p) = Ty.showPredWith(p, n))
+        }
+        None -> []
+    }
+    let methods = []
+    for meth in c.methods {
+        if let Some(mname) = Map.get(ex.values, meth.name) {
+            let scheme = match info {
+                Some(i) -> Option.map(Map.get(i.methods, meth.name),
+                                      fun(mi) = showWritten(mi.scheme, mi.names))
+                None -> None
+            }
+            Vec.push(methods, JObject([
+                ("name", JString(mname)),
+                ("line", JInt(meth.span.line)),
+                ("comment", optional(nestedComment(cs, meth.span.line, c.span.line))),
+                ("type", optional(scheme)),
+                ("default", JBool(Option.isSome(meth.body))),
+            ]))
+        }
+    }
+    let members = heading("class", name, c.span, cs)
+    Vec.push(members, ("param", JString(c.param)))
+    Vec.push(members, ("supers", strings(supers)))
+    Vec.push(members, ("families", JArray(Vec.map(c.families, fun(f) = JObject([
+        ("name", JString(Ty.bareName(f.name))),
+        ("line", JInt(f.span.line)),
+        ("comment", optional(nestedComment(cs, f.span.line, c.span.line))),
+    ])))))
+    Vec.push(members, ("methods", JArray(methods)))
+    JObject(members)
+}
+
+-- `s` with each variable `names` holds called what the declaration called
+-- it, and the others named apart from those.
+fun showWritten(s : Ty.Scheme, names : Map Int String) -> String {
+    let n = Classes.writtenNamer(names)
+    for (_, name) in Map.entries(names) { Set.add(n.taken, name) }
+    let body = Ty.showAt(s.body, n, 0)
+    if len(s.preds) == 0 { return body }
+    "[" + String.join(Vec.map(s.preds, fun(p) = Ty.showPredWith(p, n)), ", ") + "] " + body
+}
+
+-- The class table's record of the instance `i` declares. A derived instance
+-- has no declaration of its own, and its type's `derives` lists it.
+fun instanceInfo(classes : ClassTable, i : InstanceDecl) -> Option Classes.InstInfo {
+    for (_, insts) in Map.entries(classes.instances) {
+        for inst in insts {
+            let s = inst.decl.span
+            if !inst.derived && s.file == i.span.file && s.line == i.span.line
+               && s.col == i.span.col {
+                return Some(inst)
+            }
+        }
+    }
+    None
+}
+
+fun instanceItem(cs : Comments, i : InstanceDecl, inst : Classes.InstInfo) -> JSON {
+    let n = Classes.writtenNamer(inst.names)
+    let name = Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2)
+    let context = Vec.map(Vec.append(inst.context, inst.equalities), fun(p) = Ty.showPredWith(p, n))
+    let members = heading("instance", name, i.span, cs)
+    Vec.push(members, ("context", strings(context)))
+    JObject(members)
+}
+
+fun operatorItem(cs : Comments, op : InfixDecl, name : String) -> JSON {
+    let members = heading("operator", name, op.span, cs)
+    Vec.push(members, ("group", JString(Fixity.groupName(op.group))))
+    Vec.push(members, ("associativity", JString(
+        if Fixity.rightAssociative(op.group) { "right" } else { "left" })))
+    Vec.push(members, ("function", JString(Ty.shortName(op.target))))
+    JObject(members)
+}
+
+-- What the module exports that another module declares, by namespace and then
+-- name. A constructor goes with its type and a method with its class, so
+-- neither namespace is listed on its own. A value carries its type, since
+-- the module that declares it may be one no program can import.
+fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec JSON {
+    let found = []
+    let spaces = [
+        (0, "value", m.exports.values),
+        (1, "type", m.exports.types),
+        (2, "class", m.exports.classes),
+        (3, "operator", m.exports.operators),
+    ]
+    for (order, space, names) in spaces {
+        for (name, target) in Map.entries(names) {
+            if Set.contains(own, target) || Set.contains(m.exports.methods, target) { continue }
+            let owner = Prelude.moduleOf(target)
+            if owner == Some(m.name) { continue }
+            let members = [
+                ("kind", JString("reexport")),
+                ("name", JString(name)),
+                ("namespace", JString(space)),
+                ("from", optional(owner)),
+                ("original", JString(match String.splitOnce(target, "#") {
+                    Some((_, after)) -> after
+                    None -> target
+                })),
+            ]
+            if order == 0 { Vec.push(members, ("type", optional(reexportedType(t, target)))) }
+            Vec.push(found, ((order, name), JObject(members)))
+        }
+    }
+    Vec.map(Vec.sortByKey(found, fun((key, _)) = key), fun((_, item)) = item)
+}
+
+-- -- written names --------------------------------------------------------------------
+
+-- Returns the names the annotations of `d` give the variables of `s`, its
+-- scheme, by variable id. A variable no annotation names gets none.
+fun annotatedNames(t : Tables, d : FunDecl, s : Ty.Scheme) -> Map Int String {
+    let names = Map.new()
+    if let TFun(params, ret) = Ty.prune(s.body) {
+        for var i = 0; i < len(d.params) && i < len(params); i = i + 1 {
+            if let PAnnot(_, written) = d.params[i].kind { nameVars(t, written, params[i], names) }
+        }
+        if let Some(written) = d.ret { nameVars(t, written, ret, names) }
+    }
+    names
+}
+
+-- Records in `names` the name `written`, a type as an annotation writes it,
+-- gives each variable of `ty` where the two have the same shape. An alias is
+-- skipped, since what it expands to need not have its shape.
+fun nameVars(t : Tables, written : Ast.Type, ty : Ty.Type, names : Map Int String) -> Unit {
+    let pairs = fun(ws : Vec Ast.Type, ts : Array Ty.Type) {
+        if len(ws) == len(ts) {
+            for var i = 0; i < len(ws); i = i + 1 { nameVars(t, ws[i], ts[i], names) }
+        }
+    }
+    match (written.kind, Ty.prune(ty)) {
+        (TEVar(name), TVar(cell)) -> if !Map.contains(names, cell.id) {
+            Map.put(names, cell.id, name)
+        }
+        (TECon(name, args), pruned) -> if !isAlias(t, name) {
+            let (_, targs) = Ty.spine(pruned)
+            pairs(args, targs)
+        }
+        (TEApp(head, args), pruned) -> {
+            let (h, targs) = Ty.spine(pruned)
+            nameVars(t, head, h, names)
+            pairs(args, targs)
+        }
+        (TETuple(ws), TTuple(ts)) -> pairs(ws, ts)
+        (TEFun(ws, w), TFun(ts, r)) -> {
+            pairs(ws, ts)
+            nameVars(t, w, r, names)
+        }
+        _ -> {}
+    }
+}
+
+fun isAlias(t : Tables, name : String) -> Bool = match Map.get(t.classes.decls.tycons, name) {
+    Some(info) -> info.isAlias
+    None -> False
+}
+
+-- Returns the names a type declaration gives the variables of `info`'s
+-- scheme: its parameters, read off the scheme's result, and the variables an
+-- existential constructor's bracket binds.
+fun constructorNames(td : TypeDecl, info : Decls.ConInfo) -> Map Int String {
+    let names = Map.new()
+    let result = match Ty.prune(info.scheme.body) {
+        TFun(_, ret) -> ret
+        other -> other
+    }
+    let (_, args) = Ty.spine(result)
+    for var i = 0; i < len(args) && i < len(td.params); i = i + 1 {
+        if let TVar(cell) = Ty.prune(args[i]) { Map.put(names, cell.id, td.params[i]) }
+    }
+    for var i = 0; i < len(info.exists) && i < len(info.existsNames); i = i + 1 {
+        Map.put(names, info.exists[i].id, info.existsNames[i])
+    }
+    names
+}
+
+-- `p`, a predicate as a declaration writes it.
+fun writtenPred(t : Tables, p : Ast.Pred) -> String = match p.kind {
+    PClass(cls, ty) -> Ty.shortName(cls) + " " + Classes.writtenType(t.classes, ty, 2)
+    PEq(a, b) -> Classes.writtenType(t.classes, a, 1) + " ~ " + Classes.writtenType(t.classes, b, 1)
+}
+
+-- The type of the value `target` names, with a method's variables named as
+-- its class declares them.
+fun reexportedType(t : Tables, target : String) -> Option String {
+    if let Some((cls, _)) = String.rsplitOnce(target, ".") {
+        if let Some(info) = Map.get(t.classes.classes, cls) {
+            if let Some(mi) = Map.get(info.methods, target) {
+                return Some(showWritten(mi.scheme, mi.names))
+            }
+        }
+    }
+    Option.map(t.scheme(target), showWritten(_, Map.new()))
+}

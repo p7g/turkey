@@ -97,17 +97,54 @@ cc -o client client.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
 The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
-Run the compiler from the repository root, where it finds `lib/`. It has two
-commands. `build` writes the program to `-o`, in the format the file's
-extension names -- a relocatable object for `.o`, assembly for `.s` -- or
-`-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. `check` compiles as far as the last stage that
-can reject a program and writes nothing. Either takes `--dump STAGE,...` to
-print what a stage produced: `build/stages/stage2 check --dump types
-rectangles.gob` shows the inferred types, and running the compiler with no
-arguments lists the stages. `build --timings` reports on standard error how
-long each phase took, how the backend's time is spread over functions, and how
-much of the optimizer's work could run in parallel.
+To run it from anywhere as `turkey`, link it onto your `PATH`:
+
+```sh
+sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/stage2
+sh scripts/install.sh ~/bin    # or a directory of your choosing
+```
+
+The checkout is the installation: the compiler finds its library by resolving
+its own path, symbolic links included, and taking the nearest `lib/` holding
+`Prelude.gob` in that directory or one above it. `$TURKEY_LIB`, if it is set,
+names the library instead. The working directory is never searched, so a
+`lib/` in your own project cannot stand in for it. Rebuilding updates what
+`turkey` runs; after moving the checkout, run `install.sh` again.
+
+Besides `doc` ("Library documentation" below), the compiler has two commands.
+`build` writes the program to `-o`, in the format the file's extension names
+-- a relocatable object for `.o`, assembly for `.s` -- or `-f obj` or `-f asm`
+says; `-o - -f asm` writes it to standard output. An object needs no
+assembler, only a linker. `-f exe` writes an executable that runs as it is,
+with no assembler and no linker: a signed Mach-O on a Mac, and on arm64 Linux
+an ELF that loads glibc 2.34 or later.
+
+```sh
+build/stages/stage2 build -f exe -o rectangles rectangles.gob
+./rectangles
+```
+
+It is written for either target from any host, with `--target`. It loads the
+C library -- libSystem on a Mac, glibc's `libc.so.6` and `libm.so.6` on
+Linux -- and the libraries the program calls into: a program that calls
+`Net.TLS` loads OpenSSL 3's `libssl` and `libcrypto`. On Linux they are
+`libssl.so.3` and `libcrypto.so.3`, and nothing is read to write them. On a
+Mac, `boot` reads each library's install name from `libssl.3.dylib` (and so
+on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
+then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
+`opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
+that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
+naming a directory that holds a copy of the library. Either executable
+carries the unwind information and, with `-g`, the debug information a linked
+one does (see "Debugging and profiling"). A file name without an extension
+does not choose an executable yet; name it with `-f exe`. `check` compiles as far
+as the last stage that can reject a program and writes nothing. Either takes
+`--dump STAGE,...` to print what a stage produced:
+`build/stages/stage2 check --dump types rectangles.gob` shows the inferred
+types, and running the compiler with no arguments lists the stages.
+`build --timings` reports on standard error how long each phase took, how the
+backend's time is spread over functions, and how much of the optimizer's work
+could run in parallel.
 
 A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
 per performance core -- every core on a Mac without performance levels; on
@@ -148,11 +185,27 @@ cc -o rectangles rectangles.o
 Assembly written with `-g` needs the assembler to build the line table, in
 DWARF 5 as the rest is: `cc -gdwarf-5 -c rectangles.s -o rectangles.o`.
 
+`-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
+functions and the calls inlined into them, which is all a profiler or a
+backtrace reads, and none of what a debugger needs to show a variable.
+
 On a Mac, keep `rectangles.o` where it is. The linker leaves the DWARF in the
 object and writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run
 `dsymutil rectangles`, which writes `rectangles.dSYM` beside it. On Linux the
 DWARF is linked into the executable.
+
+`build -g -f exe` on a Mac writes the DWARF into the executable itself, in a
+`__DWARF` segment that is never loaded, and lldb, `atos`, `sample`,
+Instruments and crash reports read it there. There is no object to keep and
+nothing to run afterwards. Do not run `dsymutil` on such an executable: it
+reads only a linker's map, so it writes a `.dSYM` with no DWARF in it, which
+lldb then prefers to the executable's own. `strip` leaves the DWARF in place;
+build without `-g` for an executable without it.
+
+`build -g -f exe` on Linux puts the DWARF in the ELF's debug sections, which
+are never loaded, as a linker does: gdb reads them there, `strip` removes
+them and `objcopy --only-keep-debug` copies them out.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:
@@ -186,8 +239,33 @@ included, is a regular expression: `breakpoint set --func-regex
 '^Main\.area\['`. gdb's `rbreak ^Main\.area\[` sets a breakpoint on each
 specialization it matches, but each one stops only in the copy that has the
 symbol, as a breakpoint by symbol does.
-There is no information about variables or types yet, so a debugger shows
-registers and memory rather than values.
+
+`frame variable` in lldb and `info locals` in gdb show a function's
+parameters and locals wherever the code still holds them: in a register until
+its last use, or in the frame slot the collector or the register allocator
+keeps it in.
+
+The debug information describes values as the compiled code holds them, so
+without help a debugger shows a `String` as a pointer and a `Vec` as its
+storage. The formatters in `debugger/` show them as the source writes them --
+a `String` as its text, an `Array`, a `Vec` or a `Map` as its elements, a sum
+such as `Option` or `Either` as the constructor it holds, a record as its
+fields:
+
+```sh
+scripts/turkey-lldb ./rectangles -o 'breakpoint set --file rectangles.gob --line 4' -o run -o 'frame variable'
+```
+
+`scripts/turkey-lldb` is lldb with `debugger/turkey_lldb.py` imported; in a
+session of your own, `command script import debugger/turkey_lldb.py` does the
+same. On Linux, a program built with `-g` names `turkey_gdb.py` for gdb to
+load. gdb looks for it along its source path, so it loads it once
+`~/.gdbinit` adds the directory there and to the safe path:
+
+```
+directory /path/to/turkey/debugger
+add-auto-load-safe-path /path/to/turkey/debugger
+```
 
 Profilers and backtraces need no `-g` to name functions. Every function keeps
 a frame pointer, so `sample PID` and Instruments on a Mac, and
@@ -252,6 +330,15 @@ With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 `bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
 any platform emit Linux objects and assembly.
 
+`--target arm64-linux -f exe` needs none of the cross toolchain: it writes a
+dynamically linked executable on any host, with no linker and no arm64 libc.
+That executable runs on glibc 2.34 or later -- RHEL 9 and its rebuilds,
+Ubuntu 22.04, Debian 12, and anything newer -- the first release with
+`pthread_create` in `libc.so.6`. On an older glibc it stops before `main`
+with `symbol lookup error: undefined symbol`. It names its loader
+`/lib/ld-linux-aarch64.so.1`, as every glibc distribution installs it; on
+NixOS or Guix, `patchelf` it as any prebuilt binary.
+
 The whole test suite runs and passes this way, `pytest -m bootstrap` and the
 fixed point included, and the goldens in `tests/programs/` are the same on
 both platforms. It is slow: qemu runs the compiler about fifteen times slower
@@ -262,10 +349,10 @@ minutes once `boot` is built and two hours from a cold cache; the few tests
 that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
-programs run directly. CI does this on GitHub's arm64 runners
-(`.github/workflows/linux.yml`), building from the bootstrap under gcc and
-running the suite and the fixed point split across jobs by
-`scripts/ci-shard.sh`.
+programs run directly, and `-f exe` needs no C compiler at all. CI does this on
+GitHub's arm64 runners (`.github/workflows/linux.yml`), building from the
+bootstrap under gcc and running the suite and the fixed point split across jobs
+by `scripts/ci-shard.sh`.
 
 `tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump`, and it
 and `tests/test_unwind.py` run lldb on macOS and gdb on Linux; each skips a
@@ -317,6 +404,21 @@ fixture parses when `TURKEY_BOOT` or `build/stages/stage2` is a compiler:
 ```sh
 sh vim/test/run.sh
 ```
+
+### Library documentation
+
+`boot doc FILE...` checks the modules in the files and writes JSON describing
+what each one exports. Every function, value, type, class, instance and
+operator gets its type as the checker has it, its line, and its doc comment:
+the `---` comments directly above it ([doc comments](docs/ref/lexical.md#doc-comments)).
+To build a page for the whole library that searches names, types and comments:
+
+```sh
+sh scripts/docs.sh
+```
+
+That writes `build/docs/index.html`, one self-contained file to open in a
+browser, along with the JSON it is built from.
 
 ## Project status
 

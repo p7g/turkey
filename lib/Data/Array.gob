@@ -21,6 +21,7 @@ export (
     threeWay,
     ofStorage,
     storage,
+    view,
 )
 
 import Prelude ()
@@ -31,10 +32,11 @@ import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Text.Show (Show(..))
+import Debug (Debug(..))
 import Data.Functor (Functor(..))
 import Control.Applicative (Applicative(..))
 import Control.Monad (Monad(..))
-import Control.Iterator (Iterator(..))
+import Iter (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Semigroup (Semigroup(..))
 import Data.Monoid (Monoid(..))
@@ -47,6 +49,8 @@ import Data.Ordering (Ordering(..))
 import Data.String as Str
 import Turkey.Array (outOfBounds, checkRun, sliceOutOfBounds, endedEarly, threeWay)
 import Turkey.Array as Storage
+import Data.Byte (Byte)
+import Turkey.Bytes (ByteView(..))
 
 -- A fixed-length array: its length is set when it is made and never changes,
 -- and its elements can be assigned. Its one field cannot be assigned, so at run
@@ -70,6 +74,14 @@ fun ofStorage(storage : Prim.Array a) -> Array a = Array(storage)
 -- The storage an `Array` is, for the rest of the library to hand to a bulk
 -- primitive: `ofStorage` the other way.
 fun storage(xs : Array a) -> Prim.Array a = raw(xs)
+
+-- Returns a read-only view of `xs`, without copying it. The view cannot write
+-- to `xs`, but whoever holds `xs` still can, and the view shows each write as
+-- it happens.
+fun view(xs : Array Byte) -> ByteView {
+    let b = raw(xs)
+    ByteView { storage = b, from = 0, length = len(b) }
+}
 
 fun filled(length : Int, value : a) -> Array a = Array(Storage.filled(length, value))
 
@@ -116,6 +128,8 @@ fun filter(xs : Array a, keep : fun(a) -> Bool) -> Array a {
     Array(Storage.copy(kept, count))
 }
 
+-- Returns the result of calling `step` on the accumulator and each element in
+-- turn. `Iter.fold` takes the same arguments and works on anything iterable.
 fun fold(xs : Array a, initial : b, step : fun(b, a) -> b) -> b {
     var acc = initial
     for x in xs { acc = step(acc, x) }
@@ -288,15 +302,36 @@ instance Monad Array {
     }
 }
 
-instance Show (Array a) : Show a {
-    fun show(xs) {
-        var out = "["
-        var rest = False
-        for x in xs {
-            if rest { out = Str.concat(out, ", ") }
-            out = Str.concat(out, show(x))
-            rest = True
+-- Equal when they have the same length and equal elements at each index.
+instance Eq (Array a) : Eq a {
+    fun eq(xs, ys) {
+        let left = raw(xs)
+        let right = raw(ys)
+        if len(left) != len(right) { return False }
+        for var i = 0; i < len(left); i = i + 1 {
+            if left[i] != right[i] { return False }
         }
-        Str.concat(out, "]")
+        True
     }
 }
+
+-- Compares element by element from the front: the first index where the two
+-- differ decides, and an array that is a proper prefix of the other is less.
+instance Ord (Array a) : Ord a {
+    fun lt(xs, ys) {
+        let left = raw(xs)
+        let right = raw(ys)
+        for var i = 0; i < len(left) && i < len(right); i = i + 1 {
+            if left[i] < right[i] { return True }
+            if right[i] < left[i] { return False }
+        }
+        len(left) < len(right)
+    }
+}
+
+-- Its elements, as the array literal that builds it.
+instance Debug (Array a) : Debug a { fun debug(xs) = debug(raw(xs)) }
+
+-- What its `Debug` prints: a container's text shows its elements' `Debug`,
+-- so that a string in it is quoted.
+instance Show (Array a) : Debug a { fun show(xs) = debug(xs) }

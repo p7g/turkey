@@ -130,6 +130,36 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
         assert _sha(stage2[path]) == _sha(stage3[path.name]), path.name
 
 
+@pytest.mark.bootstrap
+@pytest.mark.skipif(toolchain.target() not in ("arm64-darwin", "arm64-linux"),
+                    reason="runs the executable boot writes")
+def test_an_executable_boot_writes_itself_byte_for_byte(tmp_path):
+    """The fixed point through the executable writer, with nothing linked.
+
+    Stage2 writes `boot` as an executable, which writes itself again; the
+    two must be the same bytes. Both are named `boot`, since a Mach-O's
+    signature names the file. The written `boot` must also emit the same
+    assembly for the compiler as stage2, so that it is the compiler stage3
+    is and not merely one that reproduces itself.
+    """
+    first = tmp_path / "first" / "boot"
+    second = tmp_path / "second" / "boot"
+    for directory in (first.parent, second.parent):
+        directory.mkdir()
+    for compiler, output in ((bootc.binary(), first), (first, second)):
+        result = subprocess.run(
+            toolchain.command(compiler, "build", "-f", "exe", "-o", str(output),
+                              str(BOOT_MAIN)),
+            cwd=REPO_ROOT, capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr[:4000]
+    assert first.read_bytes() == second.read_bytes()
+    result = subprocess.run(toolchain.command(first, *bootc.argv("asm"), str(BOOT_MAIN)),
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+    written = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name]
+    assert _sha(written) == _sha(_stage3_assembly())
+
+
 STRESSED = REPO_ROOT / "tests" / "programs" / "adt.gob"
 
 

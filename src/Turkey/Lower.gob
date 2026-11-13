@@ -19,9 +19,12 @@ export (Lowerer(..), newLowerer, program)
 -- dictionary has a type to be wrong about.
 --
 -- **An instance becomes a top-level binding** of that type, named
--- `%inst.C.Con`, which is unique because instances are coherent. An instance
--- with a context becomes a *function* from dictionaries to a dictionary, which
--- is what `instance [Show a] Show (Array a)` always meant.
+-- `%inst.C.Con`, which is unique because instances are coherent. A derived
+-- `Typed` instance whose head is not of kind `*` adds its count of arguments,
+-- `%inst.Typed.Either/1`, since `Either a` and `Either a b` are both instances
+-- over `Either`. An instance with a context becomes a *function* from
+-- dictionaries to a dictionary, which is what `instance [Show a] Show
+-- (Array a)` always meant.
 --
 -- **Evidence becomes a term.** A dictionary in scope is a variable and a chain
 -- of superclass projections; an instance's is a variable applied to the evidence
@@ -62,7 +65,7 @@ import Turkey.Constraints (Env(..), Binding(..))
 import Turkey.Core (..)
 import Turkey.Core as Cr
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), ConInfo(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Inert as Inert
 import Turkey.Match as Match
@@ -70,21 +73,24 @@ import Turkey.Prelude as P
 import Turkey.Prims as Prims
 import Turkey.Build as Build
 import Turkey.Target as Target
-import Turkey.Solved (Scope(..), Abstraction(..), Use(..))
+import Turkey.Solved (Scope(..), Abstraction(..), Export(..), Use(..))
 import Turkey.Source (Span(..), span as sourceSpan)
 import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
+import Iter
 
 -- -- naming -------------------------------------------------------------------------
 
 -- An instance's dictionary, whose methods are named after it with `#`. A
 -- method's display form (`Turkey.Demangle`) is `Class(Type).method`, and a
 -- default's `Class.<default>.method`.
-fun instName(inst : InstInfo) -> String =
-    "%inst." + inst.cls + "." + Classes.instCon(inst)
+fun instName(inst : InstInfo) -> String {
+    let name = "%inst." + inst.cls + "." + Classes.instCon(inst)
+    if inst.cls == P.typedClass { name + Classes.typedSuffix(inst.head) } else { name }
+}
 
 fun defaultName(cls : String, method : String) -> String =
     "%default." + cls + "." + method
@@ -217,6 +223,11 @@ type Lowerer = Lowerer {
     -- What each pattern that opens an existential binds, by the pattern's
     -- node, from when `openPattern` mints it until `Turkey.Match` reads it.
     opened       : Map Int Opened,
+    -- By binder id, each binder whose scheme is a wrapper around its group's
+    -- (`Export`), and the spelling and id of the internal binding, once
+    -- minted (`internalOf`).
+    exports      : Map Int Export,
+    internals    : Map Int (String, Int),
 }
 
 fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
@@ -227,6 +238,36 @@ fun newLowerer(decls : DeclTable, classes : ClassTable, env : Env,
     rigid = Map.new(), placeholders = Map.new(), counter = 0,
     owner = 0, site = sourceSpan("", 0, 0),
     copies = Map.new(), dicts = Map.new(), opened = Map.new(),
+    exports = exportsIn(types), internals = Map.new(),
+}
+
+-- Returns every `Export` the solver recorded, by binder id.
+fun exportsIn(types : TypeTable) -> Map Int Export {
+    let out = Map.new()
+    for (_, a) in Map.entries(types.abstractions) {
+        for (id, x) in Map.entries(a.exports) { Map.put(out, id, x) }
+    }
+    out
+}
+
+-- Returns the spelling and id of the binding the binder `id`, spelled
+-- `name`, has its body lowered at, with its `Export`, if its scheme is a
+-- wrapper around its group's. Every reference to the binding is by these.
+fun internalOf(l : Lowerer, id : Int, name : String) -> Option (String, Int, Export) {
+    let x = match Map.get(l.exports, id) {
+        Some(found) -> found
+        None -> return None
+    }
+    match Map.get(l.internals, id) {
+        Some((n, i)) -> return Some((n, i, x))
+        None -> {}
+    }
+    let b = Binders.binderAt(l.binders, id)
+    let internalName = name + "%group"
+    let internalId = Binders.fresh(l.binders, Binders.ownerOf(id), internalName, b.kind,
+                                   Generated(b.span))
+    Map.put(l.internals, id, (internalName, internalId))
+    Some((internalName, internalId, x))
 }
 
 -- A binder this pass invents: its spelling, and its id.
@@ -328,8 +369,8 @@ fun under(l : Lowerer, copies : Map Int Int, lower : fun() -> a) -> a {
 -- -- dictionaries in scope ----------------------------------------------------------
 
 -- Inference names each dictionary a term takes or opens -- a function's
--- context, an instance's, a method's own, the instance's own dictionary
--- inside one of its methods, an existential's evidence -- and the evidence it
+-- context, an instance's, a method's own, a default's class dictionary, an
+-- existential's evidence -- and the evidence it
 -- records for a use refers to a dictionary by that name. No two places in the
 -- source share a name, but one name may still have several binders: this
 -- pass lowers some source more than once (see `copiesOf`), and every member
@@ -524,7 +565,7 @@ fun newBind(module_ : String, name : String, id : Int, ty : Ty.Type,
 -- One top-level statement. Only bindings occur here.
 fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
         -> Vec CBind = match stmt.kind {
-    SFun(decl) -> [funBind(l, decl, scope)]
+    SFun(decl) -> funBinds(l, decl, scope)
     SLet(pat, value) -> letBinds(l, stmt, pat, value, False, scope, owner)
     SVar(pat, value) -> letBinds(l, stmt, pat, value, True, scope, owner)
     -- A bare expression at the top level: evaluated for effect, so it is a
@@ -535,6 +576,75 @@ fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
         [newBind(owner, owner + "#" + name, id, value.ty, [], value, Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
+}
+
+-- The bindings a top-level `fun` lowers to: itself, or, if its scheme is a
+-- wrapper around its group's (`Export`), the internal binding its body is
+-- lowered at and the wrapper.
+fun funBinds(l : Lowerer, decl : FunDecl, scope : Scope) -> Vec CBind {
+    let id = binderOf(l, decl.id, decl.name, Some(decl.span))
+    let (internalName, internalId, x) = match internalOf(l, id, decl.name) {
+        Some(found) -> found
+        None -> return [funBind(l, decl, scope)]
+    }
+    let module_ = Binders.binderAt(l.binders, id).moduleName
+    let ty = x.internal.body
+    let inside = equalitiesOf(Some(x.internal))
+    let internal = newBind(module_, internalName, internalId,
+                           abstracted(l, ty, abstractionOf(l, decl.id), inside),
+                           x.internal.quantified,
+                           function(l, decl, ty, scope, None, None, inside),
+                           Some(decl.span))
+    let s = schemeOf(l, decl.name)
+    let equalities = equalitiesOf(s)
+    let binders = schemeBinders(s)
+    let wrapper = newBind(module_, decl.name, id, evidenced(l, ty, x.preds, equalities),
+                          binders,
+                          exportValue(l, x, binders, internalName, internalId, ty, equalities,
+                                      Some(decl.span)),
+                          Some(decl.span))
+    [internal, wrapper]
+}
+
+-- The value of a binder whose scheme is a wrapper around its group's: under
+-- a lambda over its own dictionaries and coercions, the internal binding
+-- applied at `x.use`. Its type is `ty`, the group's type for the binder.
+fun exportValue(l : Lowerer, x : Export, binders : Vec VarCell, internalName : String,
+                internalId : Int, ty : Ty.Type, equalities : Vec (Ty.Type, Ty.Type),
+                where : Option Span) -> Core =
+    exported(l, x, binders, equalities, where, fun(typeArgs, evidence) =
+        instantiated(l, CVar(refAt(l, internalName, internalId)), typeArgs, evidence, ty, where))
+
+-- The value of a binder whose scheme is a wrapper around its group's: under
+-- a lambda over its own dictionaries and coercions, what `apply` makes of the
+-- type arguments and the evidence `x.use` passes the internal binding.
+fun exported(l : Lowerer, x : Export, binders : Vec VarCell,
+             equalities : Vec (Ty.Type, Ty.Type), where : Option Span,
+             apply : fun(Array Ty.Type, Array Core) -> Core) -> Core {
+    let bound = dictBinders(l, x.params, x.preds)
+    -- The use names the scheme's variables, `binders`, by skolems.
+    let saved = l.rigid
+    let rigid = Map.new()
+    for (k, v) in Map.entries(saved) { Map.put(rigid, k, v) }
+    for v in binders {
+        if let Some(TCon(c)) = Map.get(x.skolems, v.id) { Map.put(rigid, c.name, v) }
+    }
+    l.rigid = rigid
+    let inner = withDicts(l, bound, fun() {
+        let givens = givensOf(l, x.use)
+        let dicts = Array.init(fewer(len(x.use.evidence), len(x.use.preds)), fun(i) =
+            evidence(l, x.use.evidence[i], predType(l, x.use.preds[i]), givens))
+        let coercions = Array.map(Vec.toArray(x.use.equalities), fun(p) =
+            coercion(resolved(l, p.args[0]), resolved(l, p.args[1]), where))
+        apply(Array.map(x.use.typeArgs, resolved(l, _)), Array.append(dicts, coercions))
+    })
+    l.rigid = saved
+    wrapDicts(l, inner, bound, x.preds, equalities, where)
+}
+
+fun schemeBinders(s : Option Scheme) -> Vec VarCell = match s {
+    Some(sc) -> sc.quantified
+    None -> []
 }
 
 fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
@@ -563,14 +673,18 @@ fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
 -- already built to match: a type application, and then an application to the
 -- dictionaries and the coercions.
 fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction,
-               equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type {
+               equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type = match dicts {
+    Some(a) -> if len(a.params) > 0 { evidenced(l, ty, a.preds, equalities) }
+               else { evidenced(l, ty, [], equalities) }
+    None -> evidenced(l, ty, [], equalities)
+}
+
+-- `ty` taking a dictionary for each of `preds`, then a coercion for each of
+-- `equalities`.
+fun evidenced(l : Lowerer, ty : Ty.Type, preds : Vec Pred,
+              equalities : Vec (Ty.Type, Ty.Type)) -> Ty.Type {
     let evidence = Vec.new(4)
-    match dicts {
-        None -> {}
-        Some(a) -> if len(a.params) > 0 {
-            for p in a.preds { Vec.push(evidence, predType(l, p)) }
-        }
-    }
+    for p in preds { Vec.push(evidence, predType(l, p)) }
     for (left, right) in equalities { Vec.push(evidence, coercionOf(left, right)) }
     if len(evidence) == 0 { ty } else { TFun(Vec.toArray(evidence), ty) }
 }
@@ -603,29 +717,180 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         }
         _ -> {}
     }
+    let at = Some(stmt.span)
+    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    if !mutable && exportsAll(l, vars) {
+        let (holderName, holderId) = freshName(l, "bound")
+        let holder = owner + "#" + holderName
+        let sel = selectors(l, stmt, pat, vars, value, BySpelling(holder), scope)
+        let out = [newBind(owner, holder, holderId, sel.value.ty, sel.binders, sel.value, at)]
+        for (name, id, binders, v) in sel.names {
+            Vec.push(out, newBind(owner, name, id, v.ty, binders, v, at))
+        }
+        return out
+    }
     let lowered = expr(l, value, scope)
     let (holderName, holderId) = freshName(l, "bound")
     let holder = owner + "#" + holderName
-    let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, Some(stmt.span))]
+    let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, at)]
     -- Each name is its own top-level binding, which projects it out of the
-    -- whole value with a one-armed match. The match binds a local copy of
-    -- every name, which shadows the top-level binder it is a copy of.
-    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    -- whole value.
     for v in vars {
         let name = varName(v)
-        let id = patternBinder(l, v)
-        let nty = nameType(l, name)
-        let copies = Map.new()
-        for other in vars {
-            Map.put(copies, other.id, copyOf(l, varName(other), patternBinder(l, other)))
-        }
-        let picked = matchedAs(l, fun(p) = Map.getOr(copies, p.id, noId),
-            node(lowered.ty, Some(stmt.span), CVar(BySpelling(holder))),
-            [(pat, node(nty, Some(stmt.span), CVar(refAt(l, name, Map.getOr(copies, v.id, noId)))))],
-            nty, Some(stmt.span))
-        Vec.push(out, newBind(owner, name, id, picked.ty, [], picked, Some(stmt.span)))
+        let picked = selected(l, pat, vars, v, node(lowered.ty, at, CVar(BySpelling(holder))),
+                              nameType(l, name), at)
+        Vec.push(out, newBind(owner, name, patternBinder(l, v), picked.ty, [], picked, at))
     }
     out
+}
+
+-- Returns the value of the name `v`, one of the names `vars` that `pat`
+-- binds, selected out of `scrutinee` by a one-armed match. Its type is `ty`.
+fun selected(l : Lowerer, pat : Pat, vars : Vec Pat, v : Pat, scrutinee : Core,
+             ty : Ty.Type, where : Option Span) -> Core =
+    matchedOnce(l, pat, vars, scrutinee, fun(copies) =
+        node(ty, where, CVar(refAt(l, varName(v), Map.getOr(copies, v.id, noId)))),
+        ty, where)
+
+-- Returns `scrutinee` matched by `pat`, whose names are `vars`, with the
+-- one arm `body(copies)`, of type `ty`. The arm binds a copy of every name,
+-- which shadows the binder it is a copy of; `copies` maps each name's
+-- pattern node to its copy's id.
+fun matchedOnce(l : Lowerer, pat : Pat, vars : Vec Pat, scrutinee : Core,
+                body : fun(Map Int Int) -> Core, ty : Ty.Type, where : Option Span) -> Core {
+    let copies = Map.new()
+    for other in vars {
+        Map.put(copies, other.id, copyOf(l, varName(other), patternBinder(l, other)))
+    }
+    matchedAs(l, fun(p) = Map.getOr(copies, p.id, noId), scrutinee, [(pat, body(copies))],
+              ty, where)
+}
+
+-- Returns whether matching `p` once per name costs no more than matching
+-- it once: whether it is a tuple, or a pattern of the only constructor of
+-- its type, and each of its parts is a name or `_`. Such a pattern cannot
+-- fail. GHC's `is_flat_prod_pat`, except that this also looks through type
+-- annotations, on the pattern and on its parts, since an annotation has no
+-- run-time content.
+fun flatProduct(l : Lowerer, p : Pat) -> Bool = match unannot(p).kind {
+    PTuple(elems) -> Iter.all(elems, trivialPattern)
+    PCon(name, args) -> onlyConstructor(l, name) && Iter.all(args, trivialPattern)
+    PRecord(name, fields, _) -> onlyConstructor(l, name)
+                                && Iter.all(fields, fun((_, sub)) = trivialPattern(sub))
+    _ -> False
+}
+
+fun trivialPattern(p : Pat) -> Bool = match unannot(p).kind {
+    PVar(_) | PWild -> True
+    _ -> False
+}
+
+-- Returns whether `name` is the only constructor of its type.
+fun onlyConstructor(l : Lowerer, name : String) -> Bool =
+    match Map.get(l.decls.constructors, name) {
+        Some(con) -> match Map.get(l.decls.tycons, con.tycon) {
+            Some(t) -> len(t.variants) == 1
+            None -> False
+        }
+        None -> False
+    }
+
+-- Returns whether the names `vars` of a pattern `let` are exports (`Export`).
+-- Inference makes every name of a pattern `let` one, or none of them.
+fun exportsAll(l : Lowerer, vars : Vec Pat) -> Bool =
+    len(vars) > 0 && Map.contains(l.exports, patternBinder(l, vars[0]))
+
+-- A pattern `let` whose names are exports, lowered: its value, its type
+-- abstraction, and each name with its type abstraction and value.
+type Selectors = Selectors {
+    value   : Core,
+    binders : Vec VarCell,
+    -- Each name's spelling, id, type abstraction and value, sorted by
+    -- spelling.
+    names   : Vec (String, Int, Vec VarCell, Core),
+}
+
+-- Returns the pattern `let` `stmt`, `let pat = source`, whose names `vars`
+-- are exports and whose value is bound to `holder`, lowered. The holder is
+-- under a type abstraction over every variable of the group and a lambda
+-- over the group's dictionaries and coercions. Each name is a wrapper
+-- (`exported`) that instantiates the holder as its `Export` says, then
+-- selects the name from it.
+fun selectors(l : Lowerer, stmt : Stmt, pat : Pat, vars : Vec Pat, source : Expr,
+              holder : Ref, scope : Scope) -> Selectors {
+    -- GHC's `dsAbsBinds` in its general case abstracts the group once, as
+    -- `poly_tup_rhs`, and each export selects from an instance of it. What
+    -- the holder holds, and how a name is selected, follow Note
+    -- [mkSelectorBinds]. For a flat product, case (B), the holder is the
+    -- value and each name matches `pat` against it. Otherwise, case (C),
+    -- the holder matches `pat` once and holds the tuple of the names, and
+    -- each name projects its element; a holder of one name holds it bare.
+    --
+    -- A name whose scheme takes dictionaries instantiates the holder at each
+    -- of its uses, so the value may be evaluated once per use, as in GHC
+    -- without the monomorphism restriction. The value restriction keeps the
+    -- value non-expansive, so no program can tell.
+    let at = Some(stmt.span)
+    let a = match abstractionOf(l, stmt.id) {
+        Some(found) -> found
+        None -> oops("a pattern 'let' with exports has no abstraction", at)
+    }
+    let exportOf = fun(v) = match Map.get(l.exports, patternBinder(l, v)) {
+        Some(x) -> x
+        None -> oops("'" + varName(v) + "' is not an export, but another name its 'let' "
+                     + "binds is", Some(v.span))
+    }
+    let schemeOfVar = fun(v) = match Map.get(a.schemes, varName(v)) {
+        Some(sc) -> sc
+        None -> oops("'" + varName(v) + "' has no scheme", Some(v.span))
+    }
+    let types = Vec.map(vars, fun(v) = resolved(l, schemeOfVar(v).body))
+    let internal = exportOf(vars[0]).internal
+    let flat = flatProduct(l, pat)
+    let bound = dictBinders(l, a.params, a.preds)
+    let inner = withDicts(l, bound, fun() {
+        let value = expr(l, source, scope)
+        if flat { return value }
+        if len(vars) == 1 { return selected(l, pat, vars, vars[0], value, types[0], at) }
+        let tuple = TTuple(Vec.toArray(types))
+        matchedOnce(l, pat, vars, value, fun(copies) =
+            node(tuple, at, CTuple(Array.init(len(vars), fun(i) =
+                node(types[i], at, CVar(refAt(l, varName(vars[i]),
+                                              Map.getOr(copies, vars[i].id, noId))))))),
+            tuple, at)
+    })
+    let value = wrapDicts(l, inner, bound, a.preds, resolvedEqualities(l, Some(internal)), at)
+    let names = Vec.new(len(vars))
+    for var k = 0; k < len(vars); k = k + 1 {
+        let v = vars[k]
+        let s = schemeOfVar(v)
+        let ty = types[k]
+        let x = exportOf(v)
+        let binders = s.quantified
+        let value = exported(l, x, binders, resolvedEqualities(l, Some(s)), at,
+                             fun(typeArgs, evidence) {
+            if len(typeArgs) != len(internal.quantified) {
+                oops("'" + varName(v) + "' instantiates its 'let' at "
+                     + Int.toString(len(typeArgs)) + " types for "
+                     + Int.toString(len(internal.quantified)) + " variables", Some(v.span))
+            }
+            let mapping = Map.new()
+            for var i = 0; i < len(typeArgs); i = i + 1 {
+                Map.put(mapping, internal.quantified[i].id, typeArgs[i])
+            }
+            let copy = instantiated(l, CVar(holder), typeArgs, evidence,
+                                    Decls.substitute(inner.ty, mapping), at)
+            if flat {
+                selected(l, pat, vars, v, copy, ty, at)
+            } else if len(vars) == 1 {
+                copy
+            } else {
+                node(ty, at, CProject(copy, k))
+            }
+        })
+        Vec.push(names, (varName(v), patternBinder(l, v), binders, value))
+    }
+    Selectors { value = value, binders = internal.quantified, names = names }
 }
 
 -- -- classes and instances ----------------------------------------------------------
@@ -658,27 +923,36 @@ fun instanceBindIn(l : Lowerer, inst : InstInfo) -> CBind {
     if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
     let bound = contextParams(l, inst, plan)
     if inst.cls == P.typedClass { return typeRepDict(l, inst, result, bound) }
+    if Classes.isFunctionDebug(inst) { return functionDebugDict(l, inst, result) }
     let givens = instanceGivens(l, inst, plan)
     let record = withDicts(l, bound, fun() = dictionary(l, inst.cls, result,
                                                       Some(inst.decl.span), fun(slot) =
         match slot {
+            -- What the solver found for the instance's own obligations
+            -- (`Infer.genInstance`), over the skolems it checked them with.
             SuperSlot(sup) -> match Map.get(plan.supers, sup) {
-                Some(ev) -> evidence(l, ev, dictType(l, sup, inst.head), givens)
+                Some(ev) -> underInstance(l, inst, plan, fun() =
+                    evidence(l, ev, dictType(l, sup, inst.head), givens))
                 None -> oops("no evidence for the superclass '" + sup + "'",
                              Some(inst.decl.span))
             }
-            -- Proved at the head when the instance was declared, and checked
-            -- again by Coretc under the context's dictionaries.
-            EqualitySlot(k) -> {
-                let info = classNamed(l, inst.cls)
-                let e = Classes.equalityAt(info, info.equalities[k], inst.head)
-                Cr.coercion(e.args[0], e.args[1], Some(inst.decl.span))
+            EqualitySlot(k) -> if k < len(plan.superEqualities) {
+                underInstance(l, inst, plan, fun() =
+                    evidence(l, plan.superEqualities[k], unknown(), givens))
+            } else {
+                oops("no evidence for an equality superclass", Some(inst.decl.span))
             }
-            MethodSlot(name) -> match Map.get(plan.methods, name) {
-                Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
-                              else { methodBody(l, inst, name, impl, plan.params) }
-                None -> oops("no body for the method '" + name + "'",
-                             Some(inst.decl.span))
+            MethodSlot(name) -> if Classes.isDerivedMethod(inst, name) {
+                derivedBody(l, inst, name, plan, givens)
+            } else {
+                match Map.get(plan.methods, name) {
+                    Some(impl) -> if refutedAt(l, inst, name) { unreachable(l, inst, name) }
+                                  else if guardsCycles(l, inst) {
+                                      guardedDebug(l, inst, methodBody(l, inst, name, impl))
+                                  } else { methodBody(l, inst, name, impl) }
+                    None -> oops("no body for the method '" + name + "'",
+                                 Some(inst.decl.span))
+                }
             }
             KeyedSlot(_, _) -> oops("a keyed slot before layouts are shared",
                                     Some(inst.decl.span))
@@ -769,8 +1043,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
     let elems = Array.init(len(bound), fun(i) {
         let pred = inst.context[i]
         let argument = pred.args[0]
-        let proxyTy = Ty.applyTo(Decls.head(l.decls, P.proxyCon),
-                                 [argument], span)
+        let proxyTy = proxyOf(l, argument)
         let dictTy = dictType(l, pred.name, argument)
         let method = node(TFun([proxyTy], repTy), span,
                           CSlot(node(dictTy, span, CVar(ById(bound[i].1))),
@@ -782,7 +1055,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
         node(TFun([Ty.tString(), arrayTy], repTy), span, CCon(P.typeRepCon)),
         [node(Ty.tString(), span, CLit(LString(name))),
          node(arrayTy, span, CArray(elems))]))
-    let ownProxy = Ty.applyTo(Decls.head(l.decls, P.proxyCon), [inst.head], span)
+    let ownProxy = proxyOf(l, inst.head)
     let body = node(TFun([ownProxy], repTy), span,
                     CLam([CParam { name = "%p", id = mint(l, "%p"), ty = ownProxy }], made,
                          instName(inst) + "#typeRep"))
@@ -792,6 +1065,488 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type,
                     value, span)
     b
 }
+
+-- Returns whether `inst` is a `Debug` instance written by hand for a type
+-- every value of which is an object (`Classes.alwaysObject`), whose `debug`
+-- the lowering puts through the cycle guard (`guardedDebug`).
+fun guardsCycles(l : Lowerer, inst : InstInfo) -> Bool {
+    if inst.cls != P.debugClass || inst.derived { return False }
+    match Ty.spine(inst.head).0 {
+        TCon(c) -> Classes.alwaysObject(l.classes, c.name)
+        _ -> False
+    }
+}
+
+-- `debug`, the hand-written method `body`, put through the object guard
+-- (`Turkey.DebugText.debugObject`) as a derived `debug` is, so that a cycle
+-- through a hand-written instance prints `<cycle>` with nothing the
+-- instance has to do. It is done here, not left to the instance, because
+-- an instance that did not do it would run until the stack overflowed.
+fun guardedDebug(l : Lowerer, inst : InstInfo, body : Core) -> Core {
+    let span = Some(inst.decl.span)
+    let head = inst.head
+    let x = freshParam(l, "x", head)
+    let thunk = TFun([], Ty.tString())
+    let called = node(Ty.tString(), span, CApp(body, [paramVar(x, span)]))
+    let guarded = wellKnownCall(P.debugObject, [head, Ty.tString(), thunk], [head],
+        [paramVar(x, span), text(instName(inst), span),
+         node(thunk, span, CLam([], called, "<anonymous>"))], span)
+    node(TFun([head], Ty.tString()), span, CLam([x], guarded, instName(inst) + "#debug"))
+}
+
+-- The dictionary of the `Debug` instance for functions of one arity
+-- (`Classes.deriveFunctionDebug`): `debug` is `<fun>` whatever the function.
+fun functionDebugDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
+    let span = Some(inst.decl.span)
+    let f = freshParam(l, "f", inst.head)
+    let body = node(TFun([inst.head], Ty.tString()), span,
+                    CLam([f], text("<fun>", span), instName(inst) + "#debug"))
+    let record = dictionary(l, inst.cls, result, span, fun(_) = body)
+    newBind(inst.module_, instName(inst), noId, record.ty, instanceBinders(inst), record, span)
+}
+
+fun text(s : String, span : Option Span) -> Core = node(Ty.tString(), span, CLit(LString(s)))
+
+-- -- derived methods ----------------------------------------------------------------
+
+-- What writing one derived method needs: the instance, its plan, the types
+-- of the dictionaries its context names, and each constructor with its
+-- fields' types at the head.
+type DerivedSite = DerivedSite {
+    inst   : InstInfo,
+    plan   : InstancePlan,
+    givens : Map String Ty.Type,
+    cons   : Vec (ConInfo, Array Ty.Type),
+    span   : Option Span,
+}
+
+-- The method `name` of a derived instance, as a slot of its dictionary.
+--
+-- Written in Core, as `typeRepDict` is, since it is a function of the
+-- type's constructors and fields rather than code a program wrote. The
+-- solver checks what it relies on (`Turkey.Infer.genDerived`), and each
+-- field's instance is the evidence the solver found for it under the
+-- instance's context (`Turkey.Infer.derivedFields`).
+fun derivedBody(l : Lowerer, inst : InstInfo, name : String, plan : InstancePlan,
+                givens : Map String Ty.Type) -> Core {
+    let span = Some(inst.decl.span)
+    let tycon = Classes.headTycon(inst.head)
+    let info = match Classes.derivableInfo(l.decls, tycon) {
+        Some(i) -> i
+        None -> oops("a derived instance for the unknown type '" + tycon + "'", span)
+    }
+    let cons = Vec.new(len(info.variants))
+    for c in info.variants {
+        match Classes.fieldTypes(l.decls, inst.head, c) {
+            Some(types) -> Vec.push(cons, (c, types))
+            None -> oops("no field types for '" + c.name + "'", span)
+        }
+    }
+    let d = DerivedSite { inst = inst, plan = plan, givens = givens, cons = cons, span = span }
+    let mi = methodOf(l, inst.cls, name, span)
+    let lam = if inst.cls == P.eqClass { derivedEq(l, d, mi) }
+              else if inst.cls == P.ordClass { derivedLt(l, d, mi) }
+              else if inst.cls == P.hashClass { derivedHash(l, d, mi) }
+              else if inst.cls == P.objectClass { derivedIdentical(l, d, mi) }
+              else if inst.cls == P.debugClass || inst.cls == P.showClass {
+                  derivedDebug(l, d, mi)
+              }
+              else { oops("no derived method for '" + inst.cls + "'", span) }
+    methodAbstraction(mi, lam, span)
+}
+
+-- `debug(x)`: the constructor as a program would build it, with each
+-- field's own `debug`, by `Turkey.DebugText`'s `debugConstructor` and
+-- `debugRecord`. A constructor with a `var` field builds an object, whose
+-- text goes through `debugObject`, which prints `<cycle>` for an object
+-- already being printed. A type that says `!Debug` prints as `<Name>`,
+-- reading nothing.
+fun derivedDebug(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    let tycon = derivedTycon(d)
+    let refused = match Map.get(l.decls.tycons, tycon) {
+        Some(info) -> Iter.any(info.derives, fun(e) = e.refused && e.cls == P.debugClass)
+        None -> False
+    }
+    let body = if refused { text("<" + Ty.shortName(tycon) + ">", d.span) } else {
+        let alts = Vec.new(len(d.cons))
+        for (c, types) in d.cons { Vec.push(alts, debugArm(l, d, c, types, x)) }
+        node(Ty.tString(), d.span, CMatch(paramVar(x, d.span), alts))
+    }
+    node(TFun([head], Ty.tString()), d.span, CLam([x], body, name))
+}
+
+-- The arm of a derived `debug` for the constructor `c`, whose fields have
+-- `types` at the instance's head, and which matched `x`.
+--
+-- An existential constructor's arm opens it, as a pattern in a program
+-- would, binding a dictionary for each class it carries. A field whose type
+-- is a hidden type the constructor carries `Debug` for prints with it, and
+-- any other field whose type mentions a hidden type prints as `<hidden>`.
+fun debugArm(l : Lowerer, d : DerivedSite, c : ConInfo, types : Array Ty.Type,
+             x : CParam) -> CAlt {
+    let span = d.span
+    -- The constants and dictionary names the solver checked the hidden
+    -- fields with (`Turkey.Infer.carriedFields`), so that its evidence for
+    -- them is about this arm's types. An arm with none to print opens the
+    -- constructor over constants of its own.
+    let carried = match Map.get(l.classes.carried, Classes.carriedKey(d.inst, c.name)) {
+        Some(found) -> found
+        None -> {
+            let sk = Classes.newSkolems()
+            for var i = 0; i < len(c.exists) && i < len(c.existsNames); i = i + 1 {
+                discard(Classes.skolemBind(sk, c.exists[i], c.existsNames[i]))
+            }
+            let preds = Array.map(c.scheme.preds, Classes.skolemApplyPred(sk, _))
+            Classes.Carried { skolems = sk.made, mapping = sk.mapping,
+                              givens = Array.map(preds, fun(p) = ("%carried", p)) }
+        }
+    }
+    let opened = Array.map(types, Decls.substitute(_, carried.mapping))
+    let dicts = Array.map(carried.givens, fun((name, _)) = (name, mint(l, name)))
+    let givens = Map.new()
+    for (name, ty) in Map.entries(d.givens) { Map.put(givens, name, ty) }
+    for (name, p) in carried.givens { Map.put(givens, name, dictType(l, p.name, p.args[0])) }
+    let xs = fieldBinders(l, opened)
+    let parts = Array.init(len(types), fun(i) {
+        let field = bound(l, xs[i], opened[i], span)
+        if !Classes.hides(c, types[i]) {
+            return fieldCall(l, d, P.debugClass, "debug", types[i], [field])
+        }
+        match Map.get(d.plan.fieldDicts, Classes.fieldKey(c.name, i)) {
+            Some(ev) -> {
+                let dict = withDicts(l, dicts, fun() = underInstance(l, d.inst, d.plan, fun() =
+                    evidence(l, ev, dictType(l, P.debugClass, opened[i]), givens)))
+                methodCall(l, dict, P.debugClass, "debug", opened[i], [field], span)
+            }
+            None -> text("<hidden>", span)
+        }
+    })
+    -- A tuple prints as its elements in parentheses, the constructor's text
+    -- with no name.
+    let isTuple = match Ty.prune(d.inst.head) {
+        TTuple(_) -> True
+        _ -> False
+    }
+    let shown = text(if isTuple { "" } else { Ty.shortName(c.name) }, span)
+    let strings = Ty.rawArrayOf(Ty.tString())
+    let made = if len(types) == 0 { shown } else {
+        let partsArray = node(strings, span, CArray(parts))
+        match c.fields {
+            Some(labels) -> wellKnownCall(P.debugRecord, [Ty.tString(), strings, strings], [],
+                [shown, node(strings, span, CArray(Array.map(labels, text(_, span)))), partsArray],
+                span)
+            None -> wellKnownCall(P.debugConstructor, [Ty.tString(), strings], [],
+                                  [shown, partsArray], span)
+        }
+    }
+    let body = if !Decls.hasMutable(c) { made } else {
+        let thunk = TFun([], Ty.tString())
+        wellKnownCall(P.debugObject, [x.ty, Ty.tString(), thunk], [x.ty],
+                      [paramVar(x, span), text(instName(d.inst), span),
+                       node(thunk, span, CLam([], made, "<anonymous>"))], span)
+    }
+    let opening = if len(c.exists) == 0 { None } else {
+        Some(Opened { evidence = dicts, skolems = carried.skolems, layouts = None })
+    }
+    CAlt { alt = conAlt(d, c, xs, opening), body = body }
+}
+
+-- A call of the library function `name`, whose parameters have `params`
+-- and which returns a `String`, at the type arguments `tyArgs`.
+fun wellKnownCall(name : String, params : Array Ty.Type, tyArgs : Array Ty.Type,
+                  args : Array Core, span : Option Span) -> Core {
+    let fnTy = TFun(params, Ty.tString())
+    let fn = if len(tyArgs) == 0 { node(fnTy, span, CVar(BySpelling(name))) } else {
+        node(fnTy, span, CTyApp(node(unknown(), span, CVar(BySpelling(name))), tyArgs))
+    }
+    node(Ty.tString(), span, CApp(fn, args))
+}
+
+-- `identical(x, y)`: the two words compared. A type with an `Object`
+-- instance is held as one word, a pointer to its object or a nullary
+-- constructor's own word, and a wrapper as its field's
+-- (`Classes.objectParts`).
+fun derivedIdentical(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let y = freshParam(l, "y", head)
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    let same = node(Ty.tBool(), d.span, CApp(
+        node(TFun([head, head], Ty.tBool()), d.span, CPrim(Prims.Identical)),
+        [paramVar(x, d.span), paramVar(y, d.span)]))
+    node(TFun([head, head], Ty.tBool()), d.span, CLam([x, y], same, name))
+}
+
+-- `eq(x, y)`: the same constructor, and each field equal to its counterpart.
+fun derivedEq(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let y = freshParam(l, "y", head)
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    if let Some(body) = enumCompare(l, d, Prims.IntEq, True, x, y) {
+        return node(TFun([head, head], Ty.tBool()), d.span, CLam([x, y], body, name))
+    }
+    let several = len(d.cons) > 1
+    let alts = Vec.new(len(d.cons))
+    for (c, types) in d.cons {
+        let xs = fieldBinders(l, types)
+        let ys = fieldBinders(l, types)
+        let same = allOf(Array.init(len(types), fun(i) =
+            fieldCall(l, d, P.eqClass, "eq", types[i], [bound(l, xs[i], types[i], d.span),
+                                                       bound(l, ys[i], types[i], d.span)])),
+            d.span)
+        let inner = [CAlt { alt = conAlt(d, c, ys, None), body = same }]
+        if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
+        Vec.push(alts, CAlt {
+            alt = conAlt(d, c, xs, None),
+            body = node(Ty.tBool(), d.span, CMatch(paramVar(y, d.span), inner)),
+        })
+    }
+    node(TFun([head, head], Ty.tBool()), d.span,
+         CLam([x, y], node(Ty.tBool(), d.span, CMatch(paramVar(x, d.span), alts)), name))
+}
+
+-- `x` and `y` compared by the `Int` comparison `prim` of their constructor
+-- indices, when the type is an enumeration (`Decls.enumSize`): the index is
+-- the whole of a value of one, so one comparison decides, and it folds when
+-- both are known. An enumeration of one constructor is `alike` to itself.
+-- Returns `None` for any other type.
+fun enumCompare(l : Lowerer, d : DerivedSite, prim : Prims.Prim, alike : Bool, x : CParam,
+                y : CParam) -> Option Core {
+    let size = Decls.enumSize(l.decls, derivedTycon(d))?
+    if size == 1 { return Some(boolean(alike, d.span)) }
+    Some(node(Ty.tBool(), d.span, CApp(
+        node(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()), d.span, CPrim(prim)),
+        [indexOf(l, d, paramVar(x, d.span)), indexOf(l, d, paramVar(y, d.span))])))
+}
+
+-- The type constructor a derived instance is for.
+fun derivedTycon(d : DerivedSite) -> String = Classes.headTycon(d.inst.head)
+
+-- The pattern that matches the constructor `c` of a derived instance's type,
+-- binding its fields to `xs`: the constructor, or for a tuple, which has no
+-- constructor to name, the tuple pattern.
+fun conAlt(d : DerivedSite, c : ConInfo, xs : Array (String, Int), opening : Option Opened)
+        -> Alt = match Ty.prune(d.inst.head) {
+    TTuple(_) -> ATuple(Array.map(xs, Some))
+    _ -> ACon(c.name, Array.map(xs, Some), opening)
+}
+
+-- `lt(x, y)`: a constructor declared earlier is less, and two values of one
+-- constructor compare their fields in order, the first that differs deciding.
+fun derivedLt(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let x = freshParam(l, "x", head)
+    let y = freshParam(l, "y", head)
+    -- A node is never shared between two places in a term, so each mention
+    -- is made anew.
+    let xv = fun() = paramVar(x, d.span)
+    let yv = fun() = paramVar(y, d.span)
+    let several = len(d.cons) > 1
+    let body = if let Some(compared) = enumCompare(l, d, Prims.IntLt, False, x, y) {
+        compared
+    } else {
+        let alts = Vec.new(len(d.cons))
+        for (c, types) in d.cons {
+            let xs = fieldBinders(l, types)
+            let ys = fieldBinders(l, types)
+            let inner = [CAlt { alt = conAlt(d, c, ys, None),
+                                body = lexically(l, d, types, xs, ys, 0) }]
+            if several { Vec.push(inner, CAlt { alt = AAny(None), body = boolean(False, d.span) }) }
+            Vec.push(alts, CAlt {
+                alt = conAlt(d, c, xs, None),
+                body = node(Ty.tBool(), d.span, CMatch(yv(), inner)),
+            })
+        }
+        let same = node(Ty.tBool(), d.span, CMatch(xv(), alts))
+        if several {
+            -- Two constructors are ordered by their tags, compared each way,
+            -- rather than by an arm for every pair of them.
+            let (xName, xId) = freshName(l, "tag")
+            let (yName, yId) = freshName(l, "tag")
+            let xTag = fun() = node(Ty.tInt(), d.span, CVar(refAt(l, xName, xId)))
+            let yTag = fun() = node(Ty.tInt(), d.span, CVar(refAt(l, yName, yId)))
+            let decided = node(Ty.tBool(), d.span, CIf(intLess(xTag(), yTag(), d.span),
+                boolean(True, d.span),
+                Some(node(Ty.tBool(), d.span, CIf(intLess(yTag(), xTag(), d.span),
+                    boolean(False, d.span), Some(same))))))
+            node(Ty.tBool(), d.span, CLet(xName, xId, Ty.tInt(), indexOf(l, d, xv()),
+                node(Ty.tBool(), d.span, CLet(yName, yId, Ty.tInt(), indexOf(l, d, yv()),
+                                              decided, [])), []))
+        } else { same }
+    }
+    node(TFun([head, head], Ty.tBool()), d.span,
+         CLam([x, y], body, instName(d.inst) + "#" + Classes.surfaceMember(mi.name)))
+}
+
+-- Whether the fields `xs` are less than the fields `ys`, from field `k` on:
+-- `x0 < y0 || (x0 == y0 && ...)`, and false when there are none left.
+fun lexically(l : Lowerer, d : DerivedSite, types : Array Ty.Type,
+              xs : Array (String, Int), ys : Array (String, Int), k : Int) -> Core {
+    if k >= len(types) { return boolean(False, d.span) }
+    let ty = types[k]
+    let a = bound(l, xs[k], ty, d.span)
+    let b = bound(l, ys[k], ty, d.span)
+    let less = fieldCall(l, d, P.ordClass, "lt", ty, [a, b])
+    if k == len(types) - 1 { return less }
+    -- The field's `Eq` is its `Ord`'s superclass, which is how a derived
+    -- `Ord` agrees with the `Eq` its field's `Ord` was declared with.
+    let ord = fieldDict(l, d, P.ordClass, ty)
+    let eqDict = node(dictType(l, P.eqClass, ty), d.span,
+        CSlot(ord, match Classes.superSlot(l.classes, P.ordClass, P.eqClass) {
+            Some(i) -> i
+            None -> oops("'Eq' is not a superclass of 'Ord'", d.span)
+        }))
+    let equal = methodCall(l, eqDict, P.eqClass, "eq", ty, [bound(l, xs[k], ty, d.span),
+                                                          bound(l, ys[k], ty, d.span)], d.span)
+    node(Ty.tBool(), d.span, CIf(less, boolean(True, d.span),
+        Some(node(Ty.tBool(), d.span, CIf(equal, lexically(l, d, types, xs, ys, k + 1),
+                                          Some(boolean(False, d.span)))))))
+}
+
+-- `hashInto(x, h)`: the constructor's tag, when there is more than one
+-- constructor, and then each field, in order.
+fun derivedHash(l : Lowerer, d : DerivedSite, mi : MethodInfo) -> Core {
+    let head = d.inst.head
+    let (evidenceTypes, inner) = match methodType(l, mi, head) {
+        TFun(e, r) -> (e, r)
+        _ -> oops("'hashInto' takes no 'Hasher'", d.span)
+    }
+    let stateTy = match inner {
+        TFun(_, r) -> r
+        _ -> oops("'hashInto' is not a function", d.span)
+    }
+    let hasher = freshParam(l, "hasher", evidenceTypes[0])
+    let x = freshParam(l, "x", head)
+    let state = freshParam(l, "state", stateTy)
+    let several = len(d.cons) > 1
+    let name = instName(d.inst) + "#" + Classes.surfaceMember(mi.name)
+    -- An enumeration's value is its index, absorbed with no match.
+    if Option.isSome(Decls.enumSize(l.decls, derivedTycon(d))) {
+        let absorbed = if !several { paramVar(state, d.span) } else {
+            methodCall(l, paramVar(hasher, d.span), P.hasherClass, "hashInt", stateTy,
+                       [paramVar(state, d.span), indexOf(l, d, paramVar(x, d.span))], d.span)
+        }
+        return node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
+            CLam([x, state], absorbed, name)), "<anonymous>"))
+    }
+    let alts = Vec.new(len(d.cons))
+    for var tag = 0; tag < len(d.cons); tag = tag + 1 {
+        let (c, types) = d.cons[tag]
+        let xs = fieldBinders(l, types)
+        var acc = paramVar(state, d.span)
+        if several {
+            acc = methodCall(l, paramVar(hasher, d.span), P.hasherClass, "hashInt", stateTy,
+                             [acc, node(Ty.tInt(), d.span, CLit(LInt(tag)))], d.span)
+        }
+        for var i = 0; i < len(types); i = i + 1 {
+            acc = hashField(l, d, mi, types[i], stateTy, paramVar(hasher, d.span),
+                            bound(l, xs[i], types[i], d.span), acc)
+        }
+        Vec.push(alts, CAlt { alt = conAlt(d, c, xs, None), body = acc })
+    }
+    let body = node(stateTy, d.span, CMatch(paramVar(x, d.span), alts))
+    node(TFun(evidenceTypes, inner), d.span, CLam([hasher], node(inner, d.span,
+        CLam([x, state], body, name)), "<anonymous>"))
+}
+
+-- `hashInto(field, state)` with the field's `Hash` and the hasher this
+-- `hashInto` was given, at the same state type.
+fun hashField(l : Lowerer, d : DerivedSite, mi : MethodInfo, ty : Ty.Type, stateTy : Ty.Type,
+              hasher : Core, field : Core, state : Core) -> Core {
+    let dict = fieldDict(l, d, P.hashClass, ty)
+    let (evidenceTypes, inner) = match methodType(l, mi, ty) {
+        TFun(e, r) -> (e, r)
+        _ -> oops("'hashInto' takes no 'Hasher'", d.span)
+    }
+    let own = Vec.filter(mi.scheme.quantified, fun(q) = q.id != mi.classVar.id)
+    let slot = node(unknown(), d.span, CSlot(dict, slotFor(l, P.hashClass, mi.name, d.span)))
+    let applied = node(TFun(evidenceTypes, inner), d.span,
+                       CTyApp(slot, Array.map(Vec.toArray(own), TVar)))
+    let withHasher = node(inner, d.span, CApp(applied, [hasher]))
+    node(stateTy, d.span, CApp(withHasher, [field, state]))
+}
+
+-- The dictionary of `cls` at `ty`, a field's type, as the solver found it
+-- under the instance's context (`Turkey.Infer.derivedFields`). `cls` is the
+-- instance's own class, the only one the solver was asked for.
+fun fieldDict(l : Lowerer, d : DerivedSite, cls : String, ty : Ty.Type) -> Core {
+    let found = if cls == Classes.derivedFieldClass(d.inst.cls, derivedTycon(d)) {
+        Map.get(d.plan.fieldDicts, Ty.typeKey(ty))
+    } else { None }
+    let ev = match found {
+        Some(ev) -> ev
+        None -> oops("no '" + cls + " " + Ty.show(ty) + "' for a field of '"
+                     + Classes.showDeclared(d.inst) + "'", d.span)
+    }
+    underInstance(l, d.inst, d.plan, fun() = evidence(l, ev, dictType(l, cls, ty), d.givens))
+}
+
+-- A call of the method of `cls` spelled `short`, at the field type `ty`, with
+-- the field's own dictionary.
+fun fieldCall(l : Lowerer, d : DerivedSite, cls : String, short : String, ty : Ty.Type,
+              args : Array Core) -> Core =
+    methodCall(l, fieldDict(l, d, cls, ty), cls, short, ty, args, d.span)
+
+-- A call of the method of `cls` spelled `short`, from `dict`, a dictionary at
+-- `ty`. The method takes no evidence of its own.
+fun methodCall(l : Lowerer, dict : Core, cls : String, short : String, ty : Ty.Type,
+               args : Array Core, span : Option Span) -> Core {
+    let name = match Classes.memberNamed(Map.keys(classNamed(l, cls).methods), short) {
+        Some(n) -> n
+        None -> oops("'" + cls + "' has no method '" + short + "'", span)
+    }
+    let fnTy = methodType(l, methodOf(l, cls, name, span), ty)
+    let result = match fnTy {
+        TFun(_, r) -> r
+        _ -> oops("the method '" + short + "' is not a function", span)
+    }
+    node(result, span, CApp(node(fnTy, span, CSlot(dict, slotFor(l, cls, name, span))), args))
+}
+
+-- A new binder for each of a constructor's fields.
+fun fieldBinders(l : Lowerer, types : Array Ty.Type) -> Array (String, Int) =
+    Array.map(types, fun(_) = freshName(l, "f"))
+
+fun bound(l : Lowerer, binder : (String, Int), ty : Ty.Type, span : Option Span) -> Core =
+    node(ty, span, CVar(refAt(l, binder.0, binder.1)))
+
+-- The constructor `value` was built with, as its position in the declaration.
+fun indexOf(l : Lowerer, d : DerivedSite, value : Core) -> Core =
+    node(Ty.tInt(), d.span, CApp(
+        node(TFun([d.inst.head], Ty.tInt()), d.span, CPrim(Prims.ConstructorIndex)), [value]))
+
+fun intLess(a : Core, b : Core, span : Option Span) -> Core =
+    node(Ty.tBool(), span, CApp(
+        node(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()), span, CPrim(Prims.IntLt)), [a, b]))
+
+fun boolean(b : Bool, span : Option Span) -> Core =
+    node(Ty.tBool(), span, CCon(if b { P.boolTrue } else { P.boolFalse }))
+
+-- Whether every one of `tests` holds, testing them in order and stopping at
+-- the first that does not: `true` when there are none.
+fun allOf(tests : Array Core, span : Option Span) -> Core {
+    if len(tests) == 0 { return boolean(True, span) }
+    var out = tests[len(tests) - 1]
+    for var i = len(tests) - 2; i >= 0; i = i - 1 {
+        out = node(Ty.tBool(), span, CIf(tests[i], out, Some(boolean(False, span))))
+    }
+    out
+}
+
+-- Returns `Proxy t`, for a `t` of any kind.
+--
+-- Built as a `TApp`, as `dictType` builds a dictionary's type, and not through
+-- `Ty.applyTo`: `Proxy` has kind `* -> *`, and a derived `Typed` instance's
+-- head or context argument may be a constructor of any kind, `Option` in
+-- `Typed (T Option)`. `Coretc` checks no kinds, and the layout of `Proxy t`
+-- does not depend on `t`, so the badly kinded `Proxy Option` is harmless past
+-- here.
+fun proxyOf(l : Lowerer, t : Ty.Type) -> Ty.Type =
+    TApp(Decls.head(l.decls, P.proxyCon), t, KStar)
 
 -- The binders of an instance's context, one for each dictionary it takes,
 -- under the names the plan gave them.
@@ -893,35 +1648,6 @@ fun typeRepMethod(l : Lowerer) -> String =
 -- definition and every reference so the two cannot disagree.
 fun instanceBinders(inst : InstInfo) -> Vec VarCell = Ty.varsOf([inst.head])
 
--- The instance's own dictionary, as seen from inside one of its methods: applied
--- to its own binders and to its own context, which is what makes the reference
--- well-typed rather than merely well-named.
-fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
-    let result = dictType(l, inst.cls, inst.head)
-    var fn = node(unknown(), Some(inst.decl.span), CVar(BySpelling(instName(inst))))
-    let binders = instanceBinders(inst)
-    if len(binders) > 0 {
-        fn = node(unknown(), Some(inst.decl.span),
-                  CTyApp(fn, Array.map(binders, TVar)))
-    }
-    if len(inst.context) == 0 && len(inst.equalities) == 0 {
-        fn.ty = result
-        return fn
-    }
-    let count = fewer(len(params), len(inst.context))
-    let dicts = Array.init(count, fun(i) {
-        node(predType(l, inst.context[i]), Some(inst.decl.span),
-             CVar(dictRef(l, params[i], Some(inst.decl.span))))
-    })
-    -- Fresh coercions rather than the instance's parameters, since nothing
-    -- refers to a coercion parameter.
-    let coercions = Array.map(Vec.toArray(instanceEqualities(inst)), fun((left, right)) =
-        coercion(left, right, Some(inst.decl.span)))
-    let args = Array.append(dicts, coercions)
-    fn.ty = TFun(Array.map(args, _.ty), result)
-    node(result, Some(inst.decl.span), CApp(fn, args))
-}
-
 -- A method's type as it sits in a dictionary, at one head.
 --
 -- A method with its own context takes those dictionaries and coercions per
@@ -984,14 +1710,11 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
             Some(impl.decl.span))
 }
 
--- One method body, as a lambda inside its dictionary.
---
--- The self name is the dictionary the body belongs to, bound so that a method
--- may call another of its own class without anything being passed -- which is
--- what makes a *default* method work at all. In Core it is a `let` around the
--- body rather than a name the evaluator arranges to have in scope.
-fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
-               params : Vec String) -> Core {
+-- One method body, as a lambda inside its dictionary, under a type
+-- abstraction over the method's own variables if it has any: the instance's
+-- own, or the class's default applied to the dictionary the solver found for
+-- it.
+fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl) -> Core {
     let info = classNamed(l, inst.cls)
     let mi = match Map.get(info.methods, name) {
         Some(m) -> m
@@ -1000,18 +1723,38 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let head = inst.head
     if isDefaultOf(info, name, impl) {
         -- Not this instance's body: the class's, shared. Applied at this head
-        -- and to this dictionary.
-        let own = selfDict(l, inst, params)
+        -- and to the dictionary the solver found for it there.
+        let plan = match inst.plan {
+            Some(p) -> p
+            None -> oops("instance has no plan", Some(inst.decl.span))
+        }
+        let own = match Map.get(plan.defaultDicts, name) {
+            Some(ev) -> underInstance(l, inst, plan, fun() =
+                evidence(l, ev, dictType(l, inst.cls, head), instanceGivens(l, inst, plan)))
+            None -> oops("no dictionary for the default of '" + name + "'",
+                         Some(impl.decl.span))
+        }
         let result = methodType(l, mi, head)
         let fn = node(TFun([own.ty], result), Some(impl.decl.span),
             CTyApp(node(unknown(), Some(impl.decl.span),
                         CVar(BySpelling(defaultName(inst.cls, name)))), [head]))
         let called = node(result, Some(impl.decl.span), CApp(fn, [own]))
-        -- Eta-expanded, for the same reason the self dictionary goes under the
-        -- lambda: the argument is the dictionary this field belongs to, so
-        -- evaluating the application while the record is being built would build
-        -- it again, for ever. Under a lambda it waits until the method is called.
-        return eta(l, called, result, Some(impl.decl.span))
+        -- Eta-expanded: the argument is the dictionary this field belongs to,
+        -- so evaluating the application while the record is being built would
+        -- build it again, for ever. Under a lambda it waits until the method
+        -- is called.
+        --
+        -- And under a type abstraction over the method's own variables, as
+        -- every other method slot is. Those variables are free in `result`,
+        -- and nothing else in the dictionary binds them. `Turkey.Layout` gives
+        -- every type variable that nothing in a binding binds the layout
+        -- `unit`.
+        -- So without the abstraction it would compile the slot once, at
+        -- `unit`, and a call through a dictionary it cannot see, as an
+        -- existential carries one, would run that copy whatever its own
+        -- variables are. `Turkey.Coretc` rejects such a slot.
+        return methodAbstraction(mi, eta(l, called, result, Some(impl.decl.span)),
+                                 Some(impl.decl.span))
     }
     let mapping = Map.new()
     Map.put(mapping, mi.classVar.id, head)
@@ -1019,15 +1762,10 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let owned = enter(l, impl.decl.id, inst.module_,
                       instName(inst) + "." + name, impl.decl.span)
     let saved = setSkolems(l, impl, mi, Ty.varsOf([inst.head]))
-    let self = if impl.selfName != "" { [(impl.selfName, mint(l, impl.selfName))] } else { [] }
-    var body = withDicts(l, self, fun() =
-        function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
-                 Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, head)))
+    let body = function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
+                        Some(Classes.methodDicts(mi)), methodEqualitiesAt(mi, head))
     l.rigid = saved
     leave(l, owned)
-    for (selfName, selfId) in self {
-        body = bindSelf(l, inst, params, selfName, selfId, body, Some(impl.decl.span))
-    }
     methodAbstraction(mi, body, Some(impl.decl.span))
 }
 
@@ -1219,12 +1957,13 @@ fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
     }
 }
 
+-- Returns `called`, whose type is `result`, as a lambda over `result`'s
+-- parameters that applies it, if `result` is a function.
 --
 -- Through a layer of coercions alone, it goes on to the function that layer
--- answers, as `bindSelf` places a method's own dictionary: a slot that is a
--- lambda over the method's own parameters is one that specialization and the
--- optimizer see a call through, where one that answers a function leaves a
--- closure called at each call.
+-- answers: a slot that is a lambda over the method's own parameters is one
+-- that specialization and the optimizer see a call through, where one that
+-- answers a function leaves a closure called at each call.
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
@@ -1240,36 +1979,7 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- Returns whether `ps` are parameters only of coercions, which a lambda over
 -- them is erased with.
 fun onlyCoercions(ps : Array CParam) -> Bool =
-    len(ps) > 0 && Iterator.all(ps, fun(p) = isCoercion(p.ty))
-
--- Bind the instance's own dictionary *inside* the method's lambda.
---
--- Inside, not around it, and that placement is the difference between a program
--- that runs and one that does not. `instance [Show a] Show (Array a)` names
--- itself, so a binding evaluated while the dictionary is being built would build
--- the dictionary again, for ever. Under the lambda it is evaluated when the
--- method is *called*, by which time the dictionary exists.
-fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String, id : Int,
-             body : Core, where : Option Span) -> Core {
-    -- Under the method's own parameters, not under a lambda over coercions
-    -- alone. Erasure would eta-expand that lambda through the method's, which
-    -- would build a closure, besides the dictionary, at every call.
-    match body.kind {
-        CLam(ps, inner, lamName) -> if onlyCoercions(ps) {
-            return node(body.ty, body.span, CLam(ps,
-                bindSelf(l, inst, params, name, id, inner, where), lamName))
-        }
-        _ -> {}
-    }
-    let own = selfDict(l, inst, params)
-    match body.kind {
-        CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,
-            node(inner.ty, where, CLet(name, id, own.ty, own, inner, [])),
-            lamName))
-        _ -> node(body.ty, where,
-                  CLet(name, id, own.ty, own, body, []))
-    }
-}
+    len(ps) > 0 && Iter.all(ps, fun(p) = isCoercion(p.ty))
 
 -- A method is polymorphic in its *own* variables, and the dictionary that holds
 -- it does not fix those -- only the class variable. `map` in a `Functor
@@ -1341,6 +2051,7 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
         out
     }
     FromInstance(inst, mapping, args) -> instanceRef(l, inst, mapping, args)
+    Coerced(left, right) -> coercion(resolved(l, left), resolved(l, right), None)
     -- The predicate's argument is bottom: there is no value here, so there is no
     -- dictionary to find. `error` diverges and so has whatever type its context
     -- wants.
@@ -1368,19 +2079,17 @@ fun instanceRef(l : Lowerer, inst : InstInfo, matched : Map Int Ty.Type,
         fn.ty = result
         return fn
     }
-    let count = fewer(len(args), len(inst.context))
-    let dicts = Array.init(count, fun(i) {
+    -- The context's dictionaries, then a coercion for each of its equalities,
+    -- as the solver's holes hold them. No givens: an instance's context
+    -- arrives as its own parameters, which `instanceGivens` supplies where
+    -- those are in scope.
+    let argTerms = Array.init(len(args), fun(i) = if i < len(inst.context) {
         let p = inst.context[i]
-        let want = Decls.substitute(p.args[0], mapping)
-        -- No givens: an instance's context arrives as its own parameters, which
-        -- `instanceGivens` supplies where those are in scope.
-        evidence(l, args[i], dictType(l, p.name, want), Map.new())
+        evidence(l, args[i], dictType(l, p.name, Decls.substitute(p.args[0], mapping)),
+                 Map.new())
+    } else {
+        evidence(l, args[i], unknown(), Map.new())
     })
-    -- The solver proved each equality at this match, and a coercion carries
-    -- nothing but its type.
-    let coercions = Array.map(Classes.equalitiesAt(inst, mapping), fun(q) =
-        coercion(q.args[0], q.args[1], None))
-    let argTerms = Array.append(dicts, coercions)
     fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
 }
@@ -1409,6 +2118,21 @@ fun instanceGivens(l : Lowerer, inst : InstInfo,
         let p = inst.context[i]
         Map.put(out, plan.params[i], dictType(l, p.name, p.args[0]))
     }
+    out
+}
+
+-- Returns `f()`, run with the skolems the solver checked `inst`'s own
+-- obligations over read as the instance's variables.
+fun underInstance(l : Lowerer, inst : InstInfo, plan : InstancePlan,
+                  f : fun() -> Core) -> Core {
+    let rigid = Map.new()
+    for v in instanceBinders(inst) {
+        if let Some(TCon(c)) = Map.get(plan.skolems, v.id) { Map.put(rigid, c.name, v) }
+    }
+    let saved = l.rigid
+    l.rigid = rigid
+    let out = f()
+    l.rigid = saved
     out
 }
 
@@ -1776,9 +2500,9 @@ fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Vec Expr,
     let element = if len(args) == 1 { args[0] } else { TBottom }
     let raw = node(Ty.rawArrayOf(element), where,
         CArray(Array.map(elems, expr(l, _, scope))))
-    -- Inference has chosen the container. An `Array` is the raw array under
-    -- its constructor; a `Vec` is the raw array as the storage of a
-    -- `VecStorage` record, with its length, under `Vec`.
+    -- Inference has chosen the container. An `Array` or a `FrozenArray` is
+    -- the raw array under its constructor; a `Vec` is the raw array as the
+    -- storage of a `VecStorage` record, with its length, under `Vec`.
     match Ty.headCon(public) {
         Some("Data.Vec#Vec") -> {
             let storageName = "Data.Vec#VecStorage"
@@ -1790,6 +2514,11 @@ fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Vec Expr,
             let constructor = node(TFun([storageTy], public), where,
                                    CCon("Data.Vec#Vec"))
             node(public, where, CApp(constructor, [storage]))
+        }
+        Some("FrozenArray#FrozenArray") -> {
+            let constructor = node(TFun([raw.ty], public), where,
+                                   CCon("FrozenArray#FrozenArray"))
+            node(public, where, CApp(constructor, [raw]))
         }
         _ -> {
             let constructor = node(TFun([raw.ty], public), where,
@@ -1865,12 +2594,13 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 CDeref(node(refOf(result), where, CVar(refAt(l, cell, cellId)))))
             None -> {}
         }
-        let binders = bindersOf(l, id, name, scope)
-        if len(binders) > 0 {
+        let own = bindersOf(l, id, name, scope)
+        if len(own) > 0 {
             -- A recursive occurrence: monomorphic to inference, still a type
             -- application here, at the binding's own variables, and applied to
             -- the coercions it takes at them.
-            let applied = CTyApp(node(unknown(), where, CVar(refAt(l, name, id))),
+            let (ref, binders) = recursiveRef(l, id, name, own)
+            let applied = CTyApp(node(unknown(), where, CVar(ref)),
                                  Array.map(binders, TVar))
             let own = ownCoercions(l, id, name, scope, where)
             if len(own) == 0 { return node(result, where, applied) }
@@ -1922,21 +2652,36 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- does carry dictionaries -- the solver patched those in -- which is
             -- why the test cannot be "no evidence either". Its coercions are
             -- the group's own too, at its own variables.
-            typeArgs = Array.map(bindersOf(l, id, name, scope), TVar)
+            let (ref, binders) = recursiveRef(l, id, name, bindersOf(l, id, name, scope))
+            base = node(unknown(), where, CVar(ref))
+            typeArgs = Array.map(binders, TVar)
             coercions = ownCoercions(l, id, name, scope, where)
         }
     }
-    dicts = Array.append(dicts, coercions)
-    let afterTypes = if len(dicts) > 0 {
-        TFun(Array.map(dicts, _.ty), result)
-    } else { result }
-    if len(typeArgs) > 0 {
-        base.ty = unknown()
-        base = node(afterTypes, where, CTyApp(base, typeArgs))
+    instantiated(l, base.kind, typeArgs, Array.append(dicts, coercions), result, where)
+}
+
+-- `fn` applied to `typeArgs`, then to `args`, giving a `result`.
+fun instantiated(l : Lowerer, fn : CoreKind, typeArgs : Array Ty.Type, args : Array Core,
+                 result : Ty.Type, where : Option Span) -> Core {
+    let afterArgs = if len(args) > 0 { TFun(Array.map(args, _.ty), result) } else { result }
+    let base = if len(typeArgs) > 0 {
+        node(afterArgs, where, CTyApp(node(unknown(), where, fn), typeArgs))
     } else {
-        base.ty = afterTypes
+        node(afterArgs, where, fn)
     }
-    if len(dicts) > 0 { node(result, where, CApp(base, dicts)) } else { base }
+    if len(args) > 0 { node(result, where, CApp(base, args)) } else { base }
+}
+
+-- Returns the reference an occurrence of the binder `id` inside its own
+-- group makes, and the variables it is applied at, given `binders`, those
+-- of the binder's scheme. The group's bodies call each other's internal
+-- bindings when a binder's scheme is a wrapper (`Export`).
+fun recursiveRef(l : Lowerer, id : Int, name : String,
+                 binders : Vec VarCell) -> (Ref, Vec VarCell) = match internalOf(l, id, name) {
+    Some((internalName, internalId, x)) -> (refAt(l, internalName, internalId),
+                                            x.internal.quantified)
+    None -> (refAt(l, name, id), binders)
 }
 
 -- The coercions an occurrence of the binder `id`, spelled `name`, inside its
@@ -1945,9 +2690,12 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
 -- occurrence demanded none.
 fun ownCoercions(l : Lowerer, id : Int, name : String, scope : Scope,
                  where : Option Span) -> Array Core {
-    let equalities = match localEqualities(scope, id) {
-        Some(found) -> found
-        None -> equalitiesOf(schemeOf(l, name))
+    let equalities = match internalOf(l, id, name) {
+        Some((_, _, x)) -> resolvedEqualities(l, Some(x.internal))
+        None -> match localEqualities(scope, id) {
+            Some(found) -> found
+            None -> equalitiesOf(schemeOf(l, name))
+        }
     }
     Array.map(Vec.toArray(equalities), fun((left, right)) = coercion(left, right, where))
 }
@@ -2697,7 +3445,11 @@ fun localFuns(l : Lowerer, group : Vec Stmt, scope : Scope,
         Map.put(scope.binders, id, funBinders(l, d))
         Map.put(scope.equalities, id, resolvedEqualities(l, localScheme(l, d)))
     }
-    Vec.map(decls, localFun(l, _, scope))
+    let out = Vec.new(len(decls))
+    for d in decls {
+        for b in localFun(l, d, scope) { Vec.push(out, b) }
+    }
+    out
 }
 
 fun funBinders(l : Lowerer, decl : FunDecl) -> Vec VarCell =
@@ -2712,7 +3464,10 @@ fun funBinders(l : Lowerer, decl : FunDecl) -> Vec VarCell =
 -- scope the solver pops -- so it comes from the group's own abstraction, which
 -- is where the solver recorded it, and failing that from the type the generator
 -- bound it at.
-fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
+--
+-- A binder whose scheme is a wrapper around its group's (`Export`) is two
+-- bindings, as at the top level (`funBinds`).
+fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> Vec CBind {
     let s = localScheme(l, decl)
     let (fnTy, binders) = match s {
         -- `resolved`, not a bare resolve: inside a signature-checked body the
@@ -2724,9 +3479,25 @@ fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
     let dicts = abstractionOf(l, decl.id)
     let equalities = resolvedEqualities(l, s)
     let id = binderOf(l, decl.id, decl.name, Some(decl.span))
-    newBind(Binders.binderAt(l.binders, id).moduleName, decl.name, id,
-            abstracted(l, fnTy, dicts, equalities), binders,
-            function(l, decl, fnTy, scope, None, None, equalities), Some(decl.span))
+    let module_ = Binders.binderAt(l.binders, id).moduleName
+    match internalOf(l, id, decl.name) {
+        None -> [newBind(module_, decl.name, id, abstracted(l, fnTy, dicts, equalities), binders,
+                         function(l, decl, fnTy, scope, None, None, equalities),
+                         Some(decl.span))]
+        Some((internalName, internalId, x)) -> {
+            let inside = resolvedEqualities(l, Some(x.internal))
+            let internal = newBind(module_, internalName, internalId,
+                                   abstracted(l, fnTy, dicts, inside), x.internal.quantified,
+                                   function(l, decl, fnTy, scope, None, None, inside),
+                                   Some(decl.span))
+            let wrapper = newBind(module_, decl.name, id, evidenced(l, fnTy, x.preds, equalities),
+                                  binders,
+                                  exportValue(l, x, binders, internalName, internalId, fnTy,
+                                              equalities, Some(decl.span)),
+                                  Some(decl.span))
+            [internal, wrapper]
+        }
+    }
 }
 
 fun localScheme(l : Lowerer, decl : FunDecl) -> Option Scheme =
@@ -2776,6 +3547,19 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
 fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
                 mutable : Bool, rest : fun() -> Core, scope : Scope) -> Core {
     let at = Some(stmt.span)
+    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    if !mutable && exportsAll(l, vars) {
+        let (holderName, holderId) = freshName(l, "bound")
+        let sel = selectors(l, stmt, pat, vars, source, refAt(l, holderName, holderId), scope)
+        for (_, id, binders, _) in sel.names { Map.put(scope.binders, id, binders) }
+        var body = rest()
+        for var i = len(sel.names) - 1; i >= 0; i = i - 1 {
+            let (name, id, binders, v) = sel.names[i]
+            body = node(body.ty, at, CLet(name, id, v.ty, v, body, binders))
+        }
+        return node(body.ty, at, CLet(holderName, holderId, sel.value.ty, sel.value, body,
+                                      sel.binders))
+    }
     let value = abstract(l, abstractionOf(l, stmt.id), resolvedEqualities(l, letScheme(l, stmt, pat)),
                          fun() = expr(l, source, scope))
     let bare = unannot(pat)

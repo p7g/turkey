@@ -78,6 +78,25 @@ fun run() -> Unit { print(sum(Prim.arrayNew(3, 5))) }
     assert accesses and all(map(_proven, accesses)), accesses
 
 
+def test_an_element_of_several_slots_is_checked_once(library_ssa):
+    """Each slot of an inline element is an access of its own at the same
+    index. The first one's check passing proves the index for the rest, which
+    is a fact about the array being accessed and nothing else."""
+    ssa, module = library_ssa("""
+fun at(xs : Prim.Array (Int, Float, Int), i : Int) -> Int {
+    if i == 77 { return at(xs, i) }
+    let (a, _, c) = Prim.arrayGet(xs, i)
+    Prim.arraySet(xs, i, (c, 0.5, a))
+    a + c
+}
+
+fun run() -> Unit { print(at(Prim.arrayNew(3, (1, 2.0, 3)), 1)) }
+""")
+    accesses = _accesses(ssa, f"{module}#at")
+    assert len(accesses) == 6, accesses
+    assert not _proven(accesses[0]) and all(map(_proven, accesses[1:])), accesses
+
+
 def test_a_length_read_once_before_the_loop_is_the_same_length(library_ssa):
     ssa, module = library_ssa("""
 fun copy(xs : Prim.Array Int) -> Prim.Array Int {

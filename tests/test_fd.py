@@ -60,7 +60,7 @@ fun main() {
     print(FD.read(f, back, 0, 32))
 }
 """, tmp_path)
-    assert out == ["12", "2", "14", "3", "Some(wor)", "5", "0"]
+    assert out == ["12", "2", "14", "3", 'Some("wor")', "5", "0"]
     assert (tmp_path / "made").read_bytes() == b"world, world!!"
 
 

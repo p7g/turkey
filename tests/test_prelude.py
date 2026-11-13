@@ -89,7 +89,7 @@ fun main() { print(Point { x = 1 }) }
 
 def test_the_container_instances_nest(capsys):
     src = 'fun main() { print([Some(1), None]) ; print([["a"]]) }'
-    assert output(src, capsys) == ["[Some(1), None]", "[[a]]"]
+    assert output(src, capsys) == ["[Some(1), None]", '[["a"]]']
 
 
 def test_a_primitive_is_not_in_the_surface_language():
@@ -139,7 +139,7 @@ fun main() {
 """
     assert output(src, capsys) == [
         "[2, 4, 6]", "[2, 4]", "6", "[3, 2, 1]", "[1, 2, 3]",
-        "a-b", "4", "5", "(1, x)", "True",
+        "a-b", "4", "5", '(1, "x")', "True",
     ]
 
 
@@ -231,9 +231,9 @@ def test_any_and_find_pull_nothing_past_the_deciding_element(capsys):
     src = NOISY + """
 fun main() {
     let xs = Noisy { stop = 10 }
-    print(Iterator.any(xs, _ == 2))
-    print(Iterator.find(xs, _ == 1))
-    print(Iterator.all(xs, _ < 1))
+    print(Iter.any(xs, _ == 2))
+    print(Iter.find(xs, _ == 1))
+    print(Iter.all(xs, _ < 1))
 }
 """
     assert output(src, capsys) == [
@@ -382,4 +382,4 @@ fun main() {
     print(Either.right(r))
 }
 """
-    assert output(src, capsys) == ["Some(no)", "None", "None", "Some(7)"]
+    assert output(src, capsys) == ['Some("no")', "None", "None", "Some(7)"]

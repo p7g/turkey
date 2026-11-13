@@ -1,4 +1,4 @@
-export (objectFile)
+export (objectFile, sectionNames)
 
 -- An assembled arm64 module as a Mach-O relocatable object (`MH_OBJECT`),
 -- which the system linker links as it would the assembler's.
@@ -48,6 +48,7 @@ import Turkey.Asm (Symbol, SymbolKind(..))
 import Turkey.Assembler as Assembler
 import Turkey.Assembler (Object(..), Relocation(..), Use(..), Definition(..), SectionData(..))
 import Turkey.Arm64.Encode (Fixup(..))
+import Iter
 
 let headerSize = 32
 let segmentSize = 72
@@ -63,7 +64,7 @@ let minimumOS = 0x000E0400
 -- Each section's segment and section names, and its flags: code is marked as
 -- instructions, and the panic messages as C string literals, which lets the
 -- linker merge identical ones.
-fun names(kind : Asm.Section) -> (String, String, Int) = match kind {
+fun sectionNames(kind : Asm.Section) -> (String, String, Int) = match kind {
     Asm.Text -> ("__TEXT", "__text", 0x80000400)
     Asm.CStrings -> ("__TEXT", "__cstring", 0x2)
     Asm.Constants -> ("__TEXT", "__const", 0)
@@ -77,6 +78,8 @@ fun names(kind : Asm.Section) -> (String, String, Int) = match kind {
     Asm.DebugLineStr -> ("__DWARF", "__debug_line_str", 0x02000000)
     Asm.DebugAddr -> ("__DWARF", "__debug_addr", 0x02000000)
     Asm.DebugRnglists -> ("__DWARF", "__debug_rnglists", 0x02000000)
+    Asm.DebugLoclists -> ("__DWARF", "__debug_loclists", 0x02000000)
+    Asm.DebugGdbScripts -> error("internal error: Mach-O has no gdb scripts section")
     -- The linker reads both and builds the image's `__unwind_info` from
     -- them: the compact entries as debug information it does not copy, and
     -- `__eh_frame` as coalesced, live support for the functions it
@@ -155,7 +158,7 @@ fun objectFile(obj : Object Fixup) -> Vec Byte {
     le(out, 4, 0)
     for var k = 0; k < count; k = k + 1 {
         let s = sections[k]
-        let (segment, section, flags) = names(s.kind)
+        let (segment, section, flags) = sectionNames(s.kind)
         name16(out, section)
         name16(out, segment)
         le(out, 8, addresses[k])
@@ -269,7 +272,7 @@ fun symbols(obj : Object Fixup, addresses : Array Int) -> (Vec Entry, Int, Int) 
     let locals = []
     let exported = []
     for var k = 0; k < len(obj.sections); k = k + 1 {
-        if Iterator.any(obj.sections[k].relocations, fun(r) = isRelative64(r.use)) {
+        if Iter.any(obj.sections[k].relocations, fun(r) = isRelative64(r.use)) {
             Vec.push(locals, Entry { name = sectionSymbol(k), kind = 0xE, section = k + 1,
                                      value = addresses[k] })
         }
@@ -331,7 +334,7 @@ fun sectionRelative(holder : Asm.Section, r : Relocation Fixup) -> Bool =
 
 fun debug(kind : Asm.Section) -> Bool = match kind {
     Asm.DebugAbbrev | Asm.DebugInfo | Asm.DebugStr | Asm.DebugLine | Asm.DebugLineStr
-        | Asm.DebugAddr | Asm.DebugRnglists -> True
+        | Asm.DebugAddr | Asm.DebugRnglists | Asm.DebugLoclists | Asm.DebugGdbScripts -> True
     Asm.Text | Asm.CStrings | Asm.Constants | Asm.Data | Asm.CompactUnwind
         | Asm.EhFrame -> False
 }

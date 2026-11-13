@@ -1,12 +1,14 @@
 -- The compiler, built from the committed assembly in `bootstrap/` by
 -- `scripts/build.sh`.
 --
--- Two commands. `check` compiles as far as the last stage that can reject a
+-- Three commands. `check` compiles as far as the last stage that can reject a
 -- program, and writes nothing. `build` compiles all the way and writes the
--- result to `-o`, in the format its extension names or `-f` overrides.
--- Either takes `--dump STAGE,...` to print what a stage produced, which is how
--- a pass is read while it is being written: `check` goes on as far as the
--- latest stage asked for and no further, and `build` prints them on its way.
+-- result to `-o`, in the format its extension names or `-f` overrides. `doc`
+-- checks the modules it is given and writes what each exports as JSON
+-- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print
+-- what a stage produced, which is how a pass is read while it is being
+-- written: `check` goes on as far as the latest stage asked for and no
+-- further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -59,10 +61,14 @@ import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Dwarf as Dwarf
+import Turkey.Locations as Locations
+import Turkey.DebugTypes as DebugTypes
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
 import Turkey.MachO as MachO
+import Turkey.ElfExecutable as ElfExecutable
+import Turkey.MachOExecutable as MachOExecutable
 import Turkey.Elf as Elf
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
@@ -84,16 +90,81 @@ import Turkey.Opt as Opt
 import Turkey.Build as Build
 import Turkey.Target as Target
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
-                   FunDecl(..), ClassDecl(..), patternVars)
+                   FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
+import Turkey.Libraries as Libraries
+import Turkey.Doc as Doc
 
--- Where the language's own library lives: `TURKEY_LIB` if it is set, and
--- otherwise `lib` relative to the working directory. A compiled binary has no
--- source tree of its own to look beside, so the default is to be run from the
--- repository root. Setting the variable is what lets a program be compiled from
--- its own directory, so that its diagnostics quote it by its bare name.
-fun libRoot() -> String = match Env.get("TURKEY_LIB") {
-    Some(root) -> root
-    None -> "lib"
+-- Where the language's own library lives: `TURKEY_LIB` if it is set and not
+-- empty, and otherwise the nearest `lib` holding `Prelude.gob` in the
+-- directory of the compiler's own executable, symbolic links resolved, or in
+-- a directory above it. That finds a checkout's `lib` from
+-- `build/stages/stage2`, and through a symbolic link to it on `PATH`. The
+-- working directory is not searched, because a `lib` in the program's own
+-- project would shadow the real one.
+--
+-- A root found under the working directory is named relative to it. A
+-- compiler run from the repository root then names library files `lib/...` in
+-- diagnostics and debug information, and its output does not depend on where
+-- the checkout is.
+fun libRoot() -> String {
+    let fix = "; set TURKEY_LIB to the 'lib' directory of a Turkey checkout"
+    let root = Option.unwrapOr(Env.get("TURKEY_LIB"), "")
+    if root != "" {
+        if !isLibrary(root) {
+            die("cannot find the standard library: TURKEY_LIB is '" + root
+                + "', which has no " + landmark + fix)
+        }
+        return root
+    }
+    let executable = match Env.executablePath() {
+        Some(path) -> path
+        None -> die("cannot find the standard library: the path of this "
+                    + "compiler's own executable is unknown" + fix)
+    }
+    let start = parentOf(executable)
+    match libraryAbove(start) {
+        Some(root) -> relativeToWorking(root)
+        None -> die("cannot find the standard library: no lib/" + landmark
+                    + " in '" + start + "' or a directory above it" + fix)
+    }
+}
+
+-- The file whose presence makes a directory the library.
+let landmark = "Prelude.gob"
+
+fun isLibrary(root : String) -> Bool = match File.metadata(root + "/" + landmark) {
+    Right(_) -> True
+    Left(_) -> False
+}
+
+-- The `lib` that is a library in the absolute directory `start` or the
+-- nearest directory above it.
+fun libraryAbove(start : String) -> Option String {
+    var directory = start
+    loop {
+        let candidate = if directory == "/" { "/lib" } else { directory + "/lib" }
+        if isLibrary(candidate) { return Some(candidate) }
+        if directory == "/" { return None }
+        directory = parentOf(directory)
+    }
+}
+
+-- Returns the directory holding the absolute path `path`: `/` for `/` and for
+-- every entry of the root.
+fun parentOf(path : String) -> String {
+    -- `directoryOf` returns `""` for an entry of the root and `"."` for `""`,
+    -- and a walk upward that followed them would search the working directory.
+    let parent = directoryOf(path)
+    if parent == "" || parent == "." { "/" } else { parent }
+}
+
+-- `path`, absolute, relative to the working directory if it lies under it.
+fun relativeToWorking(path : String) -> String = match Env.currentDirectory() {
+    Some(working) -> {
+        let prefix = if working == "/" { "/" } else { working + "/" }
+        Option.unwrapOr(String.stripPrefix(path, prefix), path)
+    }
+    None -> path
 }
 
 -- What `--target` chose, for every file of this run.
@@ -108,11 +179,35 @@ var build = Build.plain
 -- whether the work in them is even enough to split.
 var timings = False
 
--- `-g`: write a line table and the debug information a debugger and a
--- profiler need to find it. The code is the same either way; only the items
--- `Turkey.Emit` and `Turkey.Dwarf` add, none of which has a byte in the
--- code, tell the two builds apart.
-var debugInfo = False
+-- How much debug information `build` writes (`Debug`). The code is the
+-- same at every level; only the items `Turkey.Emit` and `Turkey.Dwarf` add,
+-- none of which has a byte in the code, tell the builds apart.
+var debug = NoDebug
+
+-- What `--debug` and `-g` ask for: nothing; the line table, each function's
+-- name and range, and the calls inlined into it (`--debug=lines`), which is
+-- what a profiler and a backtrace need; or that and each function's
+-- variables, with their locations and types (`-g`, `--debug=full`), which is
+-- what a debugger needs to show values.
+type Debug = NoDebug | Lines | Full
+
+-- Whether `build` writes any debug information.
+fun debugInfo() -> Bool = match debug {
+    NoDebug -> False
+    _ -> True
+}
+
+-- Whether it writes the variables, with their locations and types.
+fun debugVariables() -> Bool = match debug {
+    Full -> True
+    _ -> False
+}
+
+fun debugNamed(level : String) -> Debug = match level {
+    "lines" -> Lines
+    "full" -> Full
+    _ -> die("unknown debug level '" + level + "'; the levels are lines and full")
+}
 
 -- A stopwatch started now, after reporting `phase` as having run since
 -- `since` was started.
@@ -139,24 +234,28 @@ let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
 -- to move this.
 let checkedThrough = "core"
 
--- What `build` writes: assembly, or a relocatable object for the system
--- linker. An executable needs the linker's work done here as well.
+-- What `build` writes: assembly, a relocatable object for the system
+-- linker, or an executable, with the linker's work done here as well.
 type Format = Executable | Object | Assembly
 
--- Where the output goes.
-type Destination = ToStdout | ToFile(File.File File.WriteOnly)
+-- Where the output goes: standard output, a file open for it, or an
+-- executable's path, written whole once its bytes are complete
+-- (`writeExecutable`).
+type Destination = ToStdout | ToFile(File.File File.WriteOnly) | ToExecutable(String)
 
--- What `build` writes, and where.
-type Sink = Sink { to : Destination, format : Format }
+-- What `build` writes, and where. `name` is what the program is called: the
+-- entry file's name without its extension, whatever the output's.
+type Sink = Sink { to : Destination, format : Format, name : String }
 
 fun main() {
     let p = Args.parser(Env.args())
     let building = match Args.next(p) {
         Right(Some(Value("check"))) -> False
         Right(Some(Value("build"))) -> True
+        Right(Some(Value("doc"))) -> return doc(p)
         Right(Some(Value(other))) -> die("unknown command '" + other
-                                         + "'; the commands are 'check' and "
-                                         + "'build'")
+                                         + "'; the commands are 'check', "
+                                         + "'build' and 'doc'")
         _ -> usage()
     }
     var output = None
@@ -170,7 +269,8 @@ fun main() {
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
                 Short('f') -> { format = Some(formatNamed(valueOf(p))) }
-                Short('g') -> { debugInfo = True }
+                Short('g') -> { debug = Full }
+                Long("debug") -> { debug = debugNamed(valueOf(p)) }
                 Long("target") -> {
                     let name = valueOf(p)
                     target = match Target.named(name) {
@@ -262,10 +362,11 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
         (None, Some(path)) -> formatOf(path)
         (None, None) -> Executable
     }
-    match chosen {
-        Executable -> die("boot cannot write an executable yet; write assembly "
-                          + "with -o NAME.s and link it with a C compiler")
-        Object | Assembly -> {}
+    -- An executable only when asked for by name: it is not what a name
+    -- without an extension gets on any target.
+    if let (Executable, None) = (chosen, format) {
+        die("an executable is written only with -f exe; or write an object with "
+            + "-o NAME.o and link it with a C compiler")
     }
     let to = match output {
         None | Some("-") -> {
@@ -283,19 +384,196 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                     + Int.toString(len(paths)) + " were given; build each "
                     + "file separately, or write to standard output with -o -")
             }
-            match File.create(path, File.Truncate) {
-                Right(out) -> ToFile(out)
-                Left(e) -> die(message(e))
+            match chosen {
+                Executable -> ToExecutable(path)
+                Object | Assembly -> match File.create(path, File.Truncate) {
+                    Right(out) -> ToFile(out)
+                    Left(e) -> die(message(e))
+                }
             }
         }
     }
-    if let Object = chosen {
+    let one = match chosen {
+        Object -> Some("object")
+        Executable -> Some("executable")
+        Assembly -> None
+    }
+    if let Some(what) = one {
         if len(paths) > 1 {
             die(Int.toString(len(paths)) + " input files cannot be written as "
-                + "one object; build each file separately")
+                + "one " + what + "; build each file separately")
         }
     }
-    Sink { to = to, format = chosen }
+    let base = baseName(paths[0])
+    let name = match String.rsplitOnce(base, ".") {
+        Some((stem, _)) -> stem
+        None -> base
+    }
+    Sink { to = to, format = chosen, name = name }
+}
+
+-- The last component of `path`.
+fun baseName(path : String) -> String {
+    let parts = String.split(path, "/")
+    parts[len(parts) - 1]
+}
+
+-- `boot doc FILE...`: checks the modules the files hold, as one program, and
+-- writes what each exports as one JSON document.
+--
+-- A file under the library is the module its path from the library names,
+-- and any other file the module its name names beside it, so the files
+-- outside the library must share a directory. The program is an entry that
+-- imports each module and nothing else, so a library module, which cannot be
+-- an entry itself, is checked as it is when a program imports it.
+fun doc(p : Args.Parser) -> Unit {
+    let paths = []
+    loop {
+        match Args.next(p) {
+            Left(message) -> die(message)
+            Right(None) -> break
+            Right(Some(Value(path))) -> Vec.push(paths, path)
+            Right(Some(arg)) -> die(Args.unexpected(arg))
+        }
+    }
+    if len(paths) == 0 { usage() }
+    let library = realPath(libRoot())
+    -- The directory every file outside the library is in: as the first such
+    -- argument spells it, which is how the files' diagnostics will name it,
+    -- and as a real path, to compare the others with.
+    var directory = None
+    let names = []
+    for path in paths {
+        if let Left(e) = File.metadata(path) { die(message(e)) }
+        let (root, name) = moduleNamed(path, library)
+        if root != library {
+            match directory {
+                Some((spelled, d)) -> if d != root {
+                    die("'" + path + "' is not in '" + spelled + "', where the "
+                        + "other modules outside the library are; document "
+                        + "each directory separately")
+                }
+                None -> { directory = Some((directoryOf(path), root)) }
+            }
+        } else if String.startsWith(name, "Turkey.") {
+            die("'" + path + "' is part of the library's implementation, which "
+                + "no program can import, so it has no documentation")
+        }
+        Vec.push(names, name)
+    }
+    let imports = String.builder()
+    for name in names {
+        -- The entry has the Prelude already, and an empty import of it would
+        -- opt out of it instead.
+        if name != Prelude.preludeName { String.push(imports, "import " + name + " ()\n") }
+    }
+    -- The entry's directory is the first place an import is looked for, so
+    -- with no file outside the library it is one that does not exist, and
+    -- nothing in the working directory can stand in for a library module.
+    -- The entry cannot be in the library itself: a module is the library's
+    -- only when it is found in the last place looked.
+    let entry = match directory {
+        Some((spelled, _)) -> spelled + "/doc-entry.gob"
+        None -> libRoot() + "/.doc/doc-entry.gob"
+    }
+    Diag.compiling(entry)
+    let source = Source { name = entry, text = String.build(imports) }
+    let (checked, _, groups) = checkSource(source)
+    let modules = []
+    for group in groups {
+        for m in group {
+            if Vec.contains(names, m.name) { Vec.push(modules, m) }
+        }
+    }
+    let tables = Doc.Tables {
+        classes = checked.classes,
+        scheme = fun(name) = Option.map(Constraints.lookup_(checked.env, name),
+                                        fun(b) = reduced(checked.classes, b.scheme)),
+    }
+    write(Doc.document(modules, tables))
+}
+
+-- The search root `path` is under, as a real path, and the module it holds
+-- there. `library` is the library's root, as a real path. A file whose real
+-- path is under it is the library module its path below the root names; any
+-- other is a module named by its file. Refuses a path no import could name.
+fun moduleNamed(path : String, library : String) -> (String, String) {
+    let full = realPath(path)
+    let (root, relative) = match String.stripPrefix(full, library + "/") {
+        Some(rest) -> (library, rest)
+        None -> (directoryOf(full), baseName(full))
+    }
+    let stem = match String.stripSuffix(relative, ".gob") {
+        Some(s) -> s
+        None -> die("'" + path + "' is not a module; a module's file ends in .gob")
+    }
+    let parts = String.split(stem, "/")
+    for part in parts {
+        if !isModuleName(part) {
+            die("'" + path + "' cannot be imported: '" + part + "' is not a "
+                + "module name, which starts with a capital letter and holds "
+                + "only letters, digits, '_' and \"'\"")
+        }
+    }
+    (root, String.join(parts, "."))
+}
+
+fun isModuleName(part : String) -> Bool {
+    var first = True
+    for c in String.codePoints(part) {
+        let ok = if first { Char.isAsciiUpper(c) }
+                 else { Char.isAsciiAlphanumeric(c) || c == '_' || c == '\'' }
+        if !ok { return False }
+        first = False
+    }
+    !first
+}
+
+-- `path` as an absolute path with every symbolic link resolved, so that two
+-- spellings of one file compare equal.
+fun realPath(path : String) -> String = match Env.resolvedPath(path) {
+    Some(real) -> real
+    None -> die("cannot resolve '" + path + "' to a real path")
+}
+
+-- Writes `bytes` as an executable at `path`, through a new file beside it
+-- that is renamed over `path` once every byte is in. So `path` is never
+-- half written, a build that fails before this leaves it as it was, and the
+-- executable is a new file rather than the old one rewritten: macOS keeps
+-- the code signature of a file it has run, and kills a process started from
+-- that file once its bytes change in place.
+fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
+    let stem = match String.rsplitOnce(path, "/") {
+        Some((directory, base)) -> directory + "/." + base + ".partial"
+        None -> "." + path + ".partial"
+    }
+    let (partial, out) = createPartial(stem, 0)
+    let failed = fun(e) {
+        let _ = File.removeFile(partial)
+        die(message(e))
+    }
+    if let Left(e) = IO.writeFrom(out, bytes) {
+        let _ = File.close(out)
+        failed(e)
+    }
+    if let Left(e) = File.close(out) { failed(e) }
+    if let Left(e) = File.rename(partial, path) { failed(e) }
+}
+
+-- Returns the first of `stem` followed by `n`, `n + 1`, ... that names
+-- nothing yet, made exclusively, and the file open. The exclusive create is
+-- what gives each build of one output a file of its own: one never writes
+-- into, removes or renames another's. A build killed while writing leaves
+-- its file, which only moves the next build to a later number.
+fun createPartial(stem : String, n : Int) -> (String, File.File File.WriteOnly) {
+    let candidate = stem + Int.toString(n)
+    match File.createExecutable(candidate, File.Exclusive) {
+        Right(out) -> (candidate, out)
+        Left(e) -> match e.kind {
+            IO.AlreadyExists -> createPartial(stem, n + 1)
+            _ -> die(message(e))
+        }
+    }
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this
@@ -345,6 +623,14 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("select") { dumpSelect(b, path, module_) }
     write(String.drain(b))
     if through("select") { return }
+    -- With `-g`, the types of the variables, as they are named. Nothing
+    -- asks for a type without it, so the tags are not worked out.
+    let tags = if debugVariables() {
+        SsaLower.tagsOf(checked.decls, Map.keys(checked.classes.classes))
+    } else {
+        Map.new()
+    }
+    let types = DebugTypes.new(checked.decls, tags)
     -- The listing and the assembly come from one emission, each consumer
     -- with its own text, since the program's text is too large to emit twice.
     let outs = []
@@ -360,11 +646,16 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
                                } })
     }
     match sink {
-        Some(Sink { to, format = Object }) -> {
+        Some(Sink { to, format = Assembly, .. }) -> {
+            Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
+                                   render = Stream.print })
+            let _ = emitModule(path, entry, module_, files, types, outs)
+        }
+        Some(Sink { to, format, name }) -> {
             let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
-            let refused = emitModule(path, entry, module_, files, outs)
+            let refused = emitModule(path, entry, module_, files, types, outs)
             -- A function that is not there is a link error at best, and no
             -- error at all if its callers were refused too.
             if len(refused) > 0 {
@@ -373,18 +664,28 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             }
             let started = Stopwatch.start()
             let obj = Assembler.finish(assembler)
-            sendBytes(to, match Asm.dialectFor(target) {
-                Asm.MachO -> MachO.objectFile(obj)
-                Asm.Elf -> Elf.objectFile(obj)
-            })
-            let _ = lap("object", started)
+            match format {
+                Executable -> {
+                    let dialect = Asm.dialectFor(target)
+                    let imported = importedLibraries(checked.decls, obj.undefined, dialect)
+                    let main = Asm.runtimeFor(dialect, "main")
+                    sendBytes(to, match dialect {
+                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
+                                                                    installNames(imported, path))
+                        Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
+                    })
+                    let _ = lap("executable", started)
+                }
+                _ -> {
+                    sendBytes(to, Vec.toArray(match Asm.dialectFor(target) {
+                        Asm.MachO -> MachO.objectFile(obj)
+                        Asm.Elf -> Elf.objectFile(obj)
+                    }))
+                    let _ = lap("object", started)
+                }
+            }
         }
-        Some(Sink { to, .. }) -> {
-            Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
-                                   render = Stream.print })
-            let _ = emitModule(path, entry, module_, files, outs)
-        }
-        None -> { let _ = emitModule(path, entry, module_, files, outs) }
+        None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
     }
     if wants("positions") {
         showCoverage(coverage, b)
@@ -494,9 +795,14 @@ fun loadResolved(path : String) -> Vec Modules.Module {
 -- finishes after everything it imports, but saying so here beats relying on it
 -- at every call site.
 fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module,
+                                    Binders.Table) = loadSource(readOrDie(path))
+
+-- `loadProgram`, for an entry whose text is `source`, and whose modules are
+-- looked for beside `source.name` and in the library.
+fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
                                     Binders.Table) {
-    let loader = Modules.newLoader([directoryOf(path), libRoot()])
-    let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
+    let loader = Modules.newLoader([directoryOf(source.name), libRoot()])
+    let entry = Modules.loadEntry(loader, source, "Main")
     -- An import that failed leaves its names out of scope, and resolving
     -- against that scope would report every use of them again.
     Diag.stopOnErrors()
@@ -649,7 +955,7 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- with the callee's. The code is the same either way: no reduction reads a
 -- span.
 fun keepsCallSites() -> fun(String) -> Bool =
-    if debugInfo || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
+    if debugInfo() || Option.isSome(Env.get("TURKEY_ALLOC_SITES")) { fun(_) = True }
     else { Set.contains(Giblets.gibletModules(), _) }
 
 -- Everything between the elaboration and the backend, in one place.
@@ -769,7 +1075,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
                 classes : Classes.ClassTable, files : Position.Files, path : String)
         -> (SsaLower.Module, Vec SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes),
-                                                   files)
+                                                   files, debugVariables())
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
@@ -872,8 +1178,12 @@ type Made = Made {
     skipped    : String,
     complaints : Vec String,
     code       : Vec (Stream.Item Arm64.Inst),
-    -- With `-g`, the calls inlined into it, for its debug information.
+    -- With `-g`, the calls inlined into it and its own variables, for its
+    -- debug information, and the label its variables' locations are offsets
+    -- from.
     inlined    : Vec Dwarf.Inlined,
+    variables  : Vec Dwarf.Variable,
+    base       : Asm.Symbol,
     texts      : Array (Option String),
     cost       : Duration,
 }
@@ -893,23 +1203,28 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     let a = Regalloc.allocate(f, frame.slots)
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
-                            inlined = [], texts = [], cost = Stopwatch.elapsed(started) }
+                            inlined = [], variables = [], base = Emit.functionEnd(asm.dialect, i),
+                            texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
+            let (marks, located, base) = if debugVariables() {
+                Locations.locate(asm.dialect, i, a, l, frame.slots)
+            } else { (Map.new(), [], Emit.functionEnd(asm.dialect, i)) }
             let emitted = []
-            Emit.emitFunc(asm, a.func, a, l, i, debugInfo, emitted)
-            let (code, inlined) = if debugInfo {
-                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, emitted,
+            Emit.emitFunc(asm, a.func, a, l, i, debugInfo(), marks, emitted)
+            let (code, inlined, variables) = if debugInfo() {
+                Dwarf.inlinedCalls(asm.dialect, i, a.func.sites, located, emitted,
                                    Emit.functionEnd(asm.dialect, i))
-            } else { (emitted, []) }
+            } else { (emitted, [], []) }
             let texts = Array.map(outs, fun(o) = if o.apart {
                 let text = String.builder()
                 o.render(asm.dialect, Vec.slice(code, 0, len(code)), text)
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   inlined = inlined, texts = texts, cost = Stopwatch.elapsed(started) }
+                   inlined = inlined, variables = variables, base = base, texts = texts,
+                   cost = Stopwatch.elapsed(started) }
         }
     }
 }
@@ -948,7 +1263,7 @@ type Out = Out {
 --
 -- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
-              files : Position.Files, outs : Vec Out) -> Vec String {
+              files : Position.Files, types : DebugTypes.Types, outs : Vec Out) -> Vec String {
     let refused = []
     let note = fun(text) { for o in outs { String.push(o.text, text) } }
     -- Each consumer empties the array it is handed, so all but the last are
@@ -992,7 +1307,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- label at the start of the code, where the compile unit's range begins.
     let directory = Option.unwrapOr(Env.currentDirectory(), ".")
     let textStart = Asm.localLabel(asm.dialect, "text_start")
-    if debugInfo {
+    if debugInfo() {
         Dwarf.sourceFiles(directory, path, files, code)
         Vec.push(code, Stream.Label(textStart))
     }
@@ -1006,8 +1321,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- Each function's frame layout is kept: the frame table is one section
     -- after the code, and its entries are those layouts' safepoint maps.
     let layouts = []
-    -- With `-g`, each laid-out function's inlined calls, beside its layout.
+    -- With `-g`, each laid-out function's inlined calls and variables, beside
+    -- its layout.
     let inlinedCalls = []
+    let variables = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
@@ -1035,6 +1352,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 flush()
                 Vec.push(layouts, (i, l))
                 Vec.push(inlinedCalls, m.inlined)
+                Vec.push(variables, (m.variables, m.base))
             }
         }
         if timings { Vec.push(costs, (selected[i].name, m.cost)) }
@@ -1055,7 +1373,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- The entry and the stubs after it have no source position, so with `-g`
     -- one row with no line covers them all, rather than the last function's
     -- last row.
-    if debugInfo { Vec.push(code, Stream.Loc(0, False)) }
+    if debugInfo() { Vec.push(code, Stream.Loc(0, False)) }
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
     -- Each only in a program that needs it: the switch names the runtime's
@@ -1071,7 +1389,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
-    if debugInfo {
+    if debugInfo() {
         -- The end of the code, after everything the text section holds.
         let textEnd = Asm.localLabel(asm.dialect, "text_end")
         Vec.push(code, Stream.Section(Asm.Text))
@@ -1079,14 +1397,17 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         let functions = []
         for var k = 0; k < len(layouts); k = k + 1 {
             let (i, _) = layouts[k]
+            let (own, base) = variables[k]
             Vec.push(functions, Dwarf.Subprogram {
                 name = selected[i].name, low = Asm.symbolFor(asm.dialect, selected[i].name),
                 high = Emit.functionEnd(asm.dialect, i), inlined = inlinedCalls[k],
+                variables = own, base = base,
             })
         }
         Dwarf.emitUnit(asm.dialect, Dwarf.CompileUnit {
             producer = "boot", name = path, directory = directory, low = textStart,
-            high = textEnd, functions = functions,
+            high = textEnd, functions = functions, types = DebugTypes.entries(types),
+            typeOf = DebugTypes.typeOf(types, _),
         }, code)
     }
     consume(asm.dialect, code)
@@ -1121,23 +1442,111 @@ fun reportCosts(costs : Vec (String, Duration)) -> Unit {
 fun send(to : Destination, text : String) -> Unit = match to {
     ToStdout -> write(text)
     ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
+    ToExecutable(_) -> die("internal error: an executable is written as bytes, not text")
 }
 
-fun sendBytes(to : Destination, bytes : Vec Byte) -> Unit {
-    let array = Vec.toArray(bytes)
+fun sendBytes(to : Destination, array : Array Byte) -> Unit {
     let buffer = IO.buffer(len(array))
     IO.append(buffer, array, 0, len(array))
     match to {
         ToStdout -> {
             if let Left(_) = IO.writeFrom(IO.stdout(), buffer) {
-                die("cannot write the object to standard output")
+                die("cannot write the output to standard output")
             }
             if let Left(_) = IO.flush(IO.stdout()) {
-                die("cannot write the object to standard output")
+                die("cannot write the output to standard output")
             }
         }
         ToFile(out) -> if let Left(e) = IO.writeFrom(out, buffer) { die(message(e)) }
+        ToExecutable(path) -> writeExecutable(path, buffer)
     }
+}
+
+-- Returns the library each of `imports` comes from, with its C symbol, by
+-- the import's name, for each one declared inside a library's block. Every
+-- other import comes from the C library. `dialect` is the one the imports are
+-- named in.
+fun importedLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol,
+                      dialect : Asm.Dialect) -> Map String (String, ForeignLibrary) {
+    let declared = Map.new()
+    for (_, info) in Map.entries(decls.foreigns) {
+        Map.put(declared, Asm.symbolFor(dialect, info.symbol).name, info)
+    }
+    let out = Map.new()
+    for sym in imports {
+        let info = match Map.get(declared, sym.name) {
+            Some(info) -> info
+            None -> die("internal error: '" + sym.name + "' is called and never declared")
+        }
+        if let Some(library) = info.library { Map.put(out, sym.name, (info.symbol, library)) }
+    }
+    out
+}
+
+-- Returns the soname of each import's library, by the import's name.
+fun sonames(imported : Map String (String, ForeignLibrary)) -> Map String String {
+    let out = Map.new()
+    for (name, (_, library)) in Map.entries(imported) {
+        Map.put(out, name, Libraries.soname(library))
+    }
+    out
+}
+
+-- The directories searched for a Mach-O library before any other, separated
+-- by colons.
+let dylibPath = "TURKEY_DYLIB_PATH"
+
+-- Returns the install name of each import's library, by the import's name,
+-- read from the library's file where `Libraries.searchPath` finds it. Dies
+-- naming the file and the places searched if it is not found, and if the
+-- program is for another machine and `$TURKEY_DYLIB_PATH` names no directory.
+fun installNames(imported : Map String (String, ForeignLibrary), path : String)
+        -> Map String String {
+    let out = Map.new()
+    let given = Array.filter(Vec.toArray(String.split(Option.unwrapOr(Env.get(dylibPath), ""),
+                                                      ":")),
+                             fun(d) = d != "")
+    let native = target.spelling == Target.host().spelling
+    let directories = Libraries.searchPath(given, native)
+    let found = Map.new()
+    for (name, (symbol, library)) in Map.entries(imported) {
+        let leaf = Libraries.leaf(library)
+        let calls = "it calls '" + symbol + "' from library '" + library.name + "' "
+                    + Int.toString(library.major)
+        if !native && len(given) == 0 {
+            die("cannot write '" + path + "' for " + target.spelling + " on this machine: "
+                + calls + ", whose install name is read from '" + leaf + "' itself; set "
+                + dylibPath + " to a directory holding a copy of it")
+        }
+        let installName = match Map.get(found, leaf) {
+            Some(known) -> known
+            None -> match Libraries.find(leaf, directories) {
+                Right((file, known)) -> {
+                    if !String.startsWith(known, "/") {
+                        die("cannot write '" + path + "' as an executable: " + calls + ", and '"
+                            + file + "' is installed as '" + known + "', which is not an "
+                            + "absolute path; an executable boot writes can load a library "
+                            + "only by an absolute install name")
+                    }
+                    Map.put(found, leaf, known)
+                    known
+                }
+                Left(passed) -> {
+                    let others = if len(passed) == 0 { "" } else {
+                        " (" + String.join(Vec.map(passed, fun(p) = "'" + p + "'"), ", ")
+                        + (if len(passed) == 1 { " is not an arm64 library" }
+                           else { " are not arm64 libraries" }) + ")"
+                    }
+                    die("cannot write '" + path + "' as an executable: " + calls
+                        + ", and no '" + leaf + "' is in " + Libraries.searched(given, native)
+                        + others + "; install it, or set " + dylibPath
+                        + " to the directory that holds it")
+                }
+            }
+        }
+        Map.put(out, name, installName)
+    }
+    out
 }
 
 -- The machine IR, with what selection could not translate.
@@ -1449,8 +1858,15 @@ type Checked = Checked {
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
+    let (checked, entry, _) = checkSource(readOrDie(path))
+    (checked, entry)
+}
+
+-- `checkProgram`, for an entry whose text is `source`, and every module of
+-- the program, a component at a time.
+fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.Module)) {
     Solved.resetDictNames()
-    let (groups, entry, binders) = loadProgram(path)
+    let (groups, entry, binders) = loadSource(source)
     Diag.stopOnErrors()
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
@@ -1473,32 +1889,34 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         }
         let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
                                    checked.types, binders)
-        let (items, constraint) = Infer.generate(g, programs)
-        -- The generator goes on past an error with a placeholder in its place,
-        -- which a constraint built around it would only report against again.
-        Diag.stopOnErrors()
         -- A constraint with no span has no module to go by, and is held to the
-        -- group's first; a group of one module has no other.
+        -- group's first; a group of one module has no other. Made before
+        -- generation, which derives the instances derive lists ask for, and
+        -- a derivation's context is the solver's to simplify.
         let fallback = visibleConstructors(group[0])
         let solver = Constraints.newSolver(checked.decls, checked.env,
             checked.classes, fun(where) = match where {
                 Some(sp) -> Map.getOr(visibleByFile, sp.file, fallback)
                 None -> fallback
             })
-        Constraints.run(solver, constraint)
+        let (items, constraint) = Infer.generate(g, programs)
+        -- The generator goes on past an error with a placeholder in its place,
+        -- which a constraint built around it would only report against again.
+        Diag.stopOnErrors()
+        Infer.solve(g, solver, constraint)
         -- Exhaustiveness and evidence read the solved types, which an error
         -- has left with a harmless answer in place of the real one.
         Diag.stopOnErrors()
         Infer.checkExhaustiveness(g)
         Diag.stopOnErrors()
-        Evidence.run(checked.classes, solver.uses)
+        Evidence.run(checked.classes, solver.uses, g.instanceChecks)
         for item in items { Vec.push(checked.ordered, item) }
     }
-    if checkingBinders() { Binders.checkInferred(binders, path) }
+    if checkingBinders() { Binders.checkInferred(binders, source.name) }
     checkMain(entry, checked.env, checked.classes)
     Diag.stopOnErrors()
     Diag.stopCollecting()
-    (checked, entry)
+    (checked, entry, groups)
 }
 
 -- The value constructors a module's scope can name, ambiguous ones included.
@@ -1653,7 +2071,9 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
-        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] FILE...\n"
+        + "       boot doc FILE...\n"
+        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
+        + "                  FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))

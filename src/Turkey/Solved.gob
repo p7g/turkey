@@ -1,8 +1,9 @@
 export (
     Scope(..), newScope,
-    Abstraction(..), newAbstraction,
+    Abstraction(..), newAbstraction, Export(..),
     Use(..), newUse,
     Hole(..), Proof(..), newHole,
+    InstanceCheck(..),
     dictName, resetDictNames,
 )
 
@@ -55,11 +56,39 @@ type Abstraction = Abstraction {
     -- checked against skolems, so the body's recorded types name constants where
     -- the scheme names variables.
     skolems    : Map Int Ty.Type,
+    -- By binder id, each binder whose scheme is a wrapper around the scheme
+    -- the group's code is lowered at: a binder of a group of `fun`s whose
+    -- scheme takes fewer of the group's class predicates or equalities than
+    -- the group's bodies take, and every binder of a pattern `let` whose
+    -- value takes type arguments or evidence. Every other binder's code is
+    -- lowered at its own scheme.
+    exports    : Map Int Export,
 }
 
 fun newAbstraction() -> Abstraction = Abstraction {
     params = Vec.new(2), preds = Vec.new(2),
-    schemes = Map.new(), skolems = Map.new(),
+    schemes = Map.new(), skolems = Map.new(), exports = Map.new(),
+}
+
+-- A binder whose scheme is a wrapper around its group's: GHC's `ABExport`.
+-- Its code is lowered at `internal`, which takes every class predicate and
+-- equality of the group, and the binder's scheme takes the dictionaries in
+-- `params`, for `preds`, and the coercions for its own equalities, and
+-- applies the internal binding at `use`. A pattern `let`'s `internal`
+-- quantifies every variable of the group, and its body is the binder's type
+-- in the pattern.
+--
+-- `use` is a use of the internal binding at the scheme's type. Its type
+-- arguments are the scheme's own variables where the internal binding has
+-- them, and types solving decided for the rest, and its evidence proves
+-- the group's dictionaries from `params`. Its types name the scheme's
+-- variables by the skolems in `skolems`, by variable id.
+type Export = Export {
+    internal : Scheme,
+    params   : Vec String,
+    preds    : Vec Pred,
+    use      : Use,
+    skolems  : Map Int Ty.Type,
 }
 
 -- One occurrence of a name, and the evidence the solver found it needs.
@@ -141,6 +170,29 @@ type Proof
     -- The evidence of an identical wanted, which a binding group's context
     -- kept in place of this one.
     | Same(Hole)
+    -- An equality wanted, solved. Its coercion is zero-width and carries only
+    -- its type: the equality as the wanted posed it, before rewriting.
+    | ByCoercion(Pred)
+
+-- The obligations one instance declaration demands of its own context, each
+-- with the hole its evidence goes into: GHC's superclass bindings (`$cp<n>`,
+-- `tcSuperClasses`) and the bindings of the methods it takes from its class's
+-- defaults (`mkDefMethBind`). Over the skolems `skolems` maps the head's
+-- variables to.
+type InstanceCheck = InstanceCheck {
+    inst       : InstInfo,
+    -- Each class superclass at the head, by the superclass's name.
+    supers     : Vec (String, Hole),
+    -- Each equality superclass at the head, in the class's order.
+    equalities : Vec Hole,
+    -- The instance's own class at its head, once per method it takes from the
+    -- class's default, by the method's name.
+    defaults   : Vec (String, Hole),
+    -- A derived instance's class at each of its fields' types, at the head,
+    -- by `Ty.typeKey` of the type. Empty for a written instance.
+    fields     : Vec (String, Pred, Hole),
+    skolems    : Map Int Ty.Type,
+}
 
 -- -- generated dictionary names ----------------------------------------------------
 

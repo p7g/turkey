@@ -279,7 +279,7 @@ fun main() {
 """, workers)
     # In order of ending, not of starting.
     assert out[:4] == ["Exited(1)", "Exited(3)", "Exited(5)", "Exited(9)"]
-    assert out[4:] == ["[Exited(9), Exited(1), Exited(5), Exited(3)]", "True"]
+    assert out[4:] == ['["Exited(9)", "Exited(1)", "Exited(5)", "Exited(3)"]', "True"]
 
 
 @WORKERS

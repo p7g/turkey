@@ -101,7 +101,11 @@ cc -o hello hello.s
 ./hello
 ```
 
-On Linux, add `-lm` to the link.
+On Linux, add `-lm` to the link. `boot build -f exe -o hello hello.gob`
+writes the executable itself, with nothing to assemble or link: a signed
+executable on a Mac, and on Linux one that runs on glibc 2.34 or later. It
+loads the shared libraries the program calls into, as
+[Foreign functions](declarations.md#foreign-functions) describes.
 
 The project README says how to build `boot` itself.
 

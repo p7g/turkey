@@ -31,7 +31,8 @@ OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run,
 Keywords: `as break class continue do else export for foreign fun if import
 in instance let loop match module return type var while`.
 
-Comments: `--` to the end of the line, and `{- ... -}`, which nests.
+Comments: `--` to the end of the line, and `{- ... -}`, which nests. A line
+comment starting `---` is a [doc comment](lexical.md#doc-comments).
 
 ## Modules
 
@@ -73,7 +74,8 @@ In `atype atype*`, the head must be a type constructor or a type variable.
 ## Type declarations
 
 ```ebnf
-type-decl    ::= "type" CONID IDENT* "=" type-rhs
+type-decl    ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" type-rhs
+derive       ::= "!"? qualified-CONID
 type-rhs     ::= constructor ("|" constructor)*
                | type                                      -- alias
 constructor  ::= CONID existential? payload?
@@ -85,7 +87,7 @@ field        ::= "var"? IDENT ":" type
 ```
 
 Whether `type T = C args` is an alias or a data type is decided as described
-in [Type aliases](types.md#type-aliases).
+in [Type aliases](types.md#type-aliases). An alias cannot have a derive list.
 
 ## Classes and instances
 
@@ -219,7 +221,9 @@ field-pattern ::= IDENT "=" pattern
 ## Foreign functions
 
 ```ebnf
-foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")" "->" type body?
+foreign-decl ::= "foreign" foreign-sig body?
+               | "foreign" STRING INT "{" foreign-sig (separator foreign-sig)* "}"
+foreign-sig ::= STRING "fun" IDENT "(" foreign-params? ")" "->" type
 foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type
 body ::= "=" expression | block

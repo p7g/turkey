@@ -42,7 +42,10 @@ LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
 
-PATHS = ["asm", "obj"]
+# Assembly through the system assembler and an object `boot` writes, each
+# linked by the C compiler, and an executable `boot` writes with nothing
+# linked.
+PATHS = ["asm", "obj", "exe"]
 
 FACT = """\
 fun fact(n : Int) -> Int {
@@ -424,18 +427,20 @@ def test_the_elf_object_has_llvms_unwind_rows(name):
 
 @functools.lru_cache(maxsize=None)
 def _built(program: str, how: str) -> Path:
-    """A program of `SOURCES`, linked in a directory of its own beside its
-    object: through the assembler for `asm`, written by `boot` for `obj`. Not
-    position-independent on Linux, so that the addresses `nm` reads are the
-    ones gdb stops at."""
+    """A program of `SOURCES` as `prog`, in a directory of its own: linked
+    beside its object, through the assembler for `asm` or written by `boot`
+    for `obj`, and not position-independent on Linux, so that the addresses
+    `nm` reads are the ones gdb stops at; or written by `boot` for `exe`."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-unwind-"))
     (directory / "prog.gob").write_text(SOURCES[program], encoding="utf-8")
-    output = "prog.s" if how == "asm" else "prog.o"
+    output = {"asm": "prog.s", "obj": "prog.o", "exe": "prog"}[how]
     compiled = subprocess.run(
         toolchain.command(bootc.binary(), "build", "-f", how, "-o", output, "prog.gob"),
         cwd=directory, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
+    if how == "exe":
+        return directory
     if how == "asm":
         assembled = subprocess.run([*toolchain.cc(), "-c", "-o", "prog.o", "prog.s"],
                                    cwd=directory, capture_output=True, text=True)
@@ -468,13 +473,38 @@ def _functions(path: Path) -> dict[str, int]:
             if kind in "Tt" and not name.startswith(("ltmp", "$x", "$d"))}
 
 
+def _check_encodings(functions: dict[str, int], encoding_of) -> None:
+    """Frame mode for every function, but frameless for the C faces' Turkey
+    entries, which make no frame, and DWARF for `turkey_swap_stack`, whose
+    low 24 bits are 0 in an object and its FDE's offset in an image."""
+    for name, address in functions.items():
+        encoding = encoding_of(address)
+        if name == "turkey_swap_stack":
+            assert encoding & 0x0F000000 == 0x03000000, f"{name}: {encoding:#x}"
+        elif name.startswith("turkey."):
+            assert encoding == 0x02000000, name
+        else:
+            assert encoding & 0x0F000000 == 0x04000000, f"{name}: {encoding:#x}"
+
+
 @pytest.mark.parametrize("how", PATHS)
 def test_every_function_has_a_compact_unwind_entry(how):
-    """Frame mode for every function, but frameless for the C faces' Turkey
-    entries, which make no frame, and DWARF for `turkey_swap_stack`."""
     if not _darwin():
         pytest.skip("compact unwind is Mach-O's")
     directory = _built("task", how)
+    if how == "exe":
+        # An image's entry stands for every function up to the next entry,
+        # so each function's encoding is the last entry's at or below it.
+        out = subprocess.run(["objdump", "--macho", "--unwind-info", str(directory / "prog")],
+                             capture_output=True, text=True, check=True).stdout
+        entries = sorted((0x100000000 + int(start, 16), int(encoding, 16))
+                         for start, encoding in re.findall(
+                             r"function offset=(0x[0-9a-f]+), encoding=(0x[0-9a-f]+)", out))
+        functions = _functions(directory / "prog")
+        assert entries and entries[0][0] == min(functions.values()), out[:2000]
+        _check_encodings(functions, lambda address: next(
+            e for a, e in reversed(entries) if a <= address))
+        return
     out = subprocess.run(["objdump", "--macho", "--unwind-info", str(directory / "prog.o")],
                          capture_output=True, text=True, check=True).stdout
     entries = {int(start, 16): int(encoding, 16) for start, encoding in re.findall(
@@ -483,14 +513,8 @@ def test_every_function_has_a_compact_unwind_entry(how):
     assert sorted(entries) == sorted(set(functions.values())), (
         "functions with no entry: "
         + str(sorted(n for n, a in functions.items() if a not in entries)))
-    for name, address in functions.items():
-        encoding = entries[address]
-        if name == "turkey_swap_stack":
-            assert encoding == 0x03000000, name
-        elif name.startswith("turkey."):
-            assert encoding == 0x02000000, name
-        else:
-            assert encoding & 0x0F000000 == 0x04000000, f"{name}: {encoding:#x}"
+    assert entries[functions["turkey_swap_stack"]] == 0x03000000
+    _check_encodings(functions, entries.__getitem__)
     linked = subprocess.run(["objdump", "--macho", "--unwind-info", str(directory / "prog")],
                             capture_output=True, text=True, check=True).stdout
     assert "Contents of __unwind_info section" in linked
@@ -506,9 +530,14 @@ def test_every_function_has_an_fde(how):
     out = subprocess.run(["readelf", "--debug-dump=frames", str(directory / "prog")],
                          capture_output=True, text=True, check=True).stdout
     starts = {int(start, 16) for start in re.findall(r"FDE cie=\S+ pc=([0-9a-f]+)\.\.", out)}
-    ours = set(_functions(directory / "prog.o"))
-    functions = {name: address for name, address in _functions(directory / "prog").items()
-                 if name in ours}
+    linked = _functions(directory / "prog")
+    if how == "exe":
+        # Every function is the module's, but `_start`, which the writer
+        # adds and describes by no FDE.
+        functions = {name: address for name, address in linked.items() if name != "_start"}
+    else:
+        ours = set(_functions(directory / "prog.o"))
+        functions = {name: address for name, address in linked.items() if name in ours}
     missing = sorted(name for name, address in functions.items() if address not in starts)
     assert functions and not missing, f"functions with no FDE: {missing}"
 
@@ -544,6 +573,15 @@ def _stops(directory: Path, function: str) -> dict[str, int]:
             re.finditer(r"^\s*([0-9a-f]+):.*\bret\b", out, re.MULTILINE)]
     assert rets, out[-2000:]
     return {"first": start, "ret": rets[0]}
+
+
+def _gdb_break(directory: Path, function: str, where: str) -> str:
+    """gdb's command to stop at `where` in `function`, as `_stops` finds it,
+    named as a distance from the function's symbol. An executable `boot`
+    writes is position-independent, and gdb moves a breakpoint named by a
+    symbol to where the program is loaded, but not one named by an address."""
+    stops = _stops(directory, function)
+    return f"break *((char *) '{function}' + {stops[where] - stops['first']})"
 
 
 def _debugged(directory: Path, argv: list[str]) -> str:
@@ -585,8 +623,8 @@ def test_lldb_shows_the_whole_stack_on_entry_and_return(how, where):
 def test_gdb_shows_the_whole_stack_on_entry_and_return(how, where):
     gdb = _gdb()
     directory = _built("fact", how)
-    address = _stops(directory, "Main#fact")[where]
-    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", f"break *{address:#x}",
+    stop = _gdb_break(directory, "Main#fact", where)
+    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", stop,
                                 "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"])
     frames = _gdb_frames(out)
     assert frames[:1] == ["Main#fact"], out[-4000:]
@@ -612,8 +650,8 @@ def test_lldb_ends_a_coroutines_stack_at_its_base(how):
 def test_gdb_ends_a_coroutines_stack_at_its_base(how):
     gdb = _gdb()
     directory = _built("task", how)
-    address = _stops(directory, "Main#leaf")["first"]
-    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", f"break *{address:#x}",
+    stop = _gdb_break(directory, "Main#leaf", "first")
+    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", stop,
                                 "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"])
     frames = _gdb_frames(out)
     assert frames[:1] == ["Main#leaf"], out[-4000:]

@@ -7,10 +7,8 @@ export (run)
 -- the holes are read out into the immutable `Classes.Evidence` the lowering
 -- translates, as GHC zonks its mutable evidence bindings into immutable ones.
 -- Nothing here resolves a predicate, consults a given or reduces a family.
---
--- The one derivation left is an instance's superclass dictionaries, which no
--- use asks for: `Classes.prove` builds them from the instance's context, the
--- same entailment `Classes.checkInstance` accepted the instance with.
+-- An instance's own obligations, its superclasses and the dictionaries its
+-- defaults are applied to, are holes too (`Solved.InstanceCheck`).
 
 import Turkey.Ast (InstanceDecl(..))
 import Turkey.Classes as Classes
@@ -19,13 +17,14 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
 import Turkey.Decls as Decls
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
-import Turkey.Solved (Use(..), Hole(..), Proof(..), dictName)
+import Turkey.Solved (Use(..), Hole(..), Proof(..), InstanceCheck(..), dictName)
 import Turkey.Source (Span(..))
 import Turkey.Types as Ty
 import Turkey.Types (Pred(..), TBottom)
 
-fun run(classes : ClassTable, uses : Vec Use) -> Unit {
+fun run(classes : ClassTable, uses : Vec Use, checks : Vec InstanceCheck) -> Unit {
     completeInstances(classes)
+    for c in checks { readInstance(c) }
     for u in uses {
         u.method = Classes.method(classes, u.name)
         -- Never lowered: its override can never be called, and its errors
@@ -45,22 +44,29 @@ fun run(classes : ClassTable, uses : Vec Use) -> Unit {
 fun readOut(hole : Hole, wanted : fun() -> Pred, where : Option Span) -> Evidence =
     match hole.proof {
         Some(ByGiven(name, path, given)) -> FromDict(name, path, Some(given))
+        -- The context's dictionaries, then a coercion for each of its
+        -- equalities.
         Some(ByInstance(inst, mapping, holes)) -> FromInstance(inst, mapping,
-            Array.init(len(holes), fun(i) = readOut(holes[i],
-                fun() = Classes.contextAt(inst, mapping)[i], where)))
+            Array.init(len(holes), fun(i) = readOut(holes[i], fun() {
+                let context = Classes.contextAt(inst, mapping)
+                if i < len(context) { context[i] }
+                else { Classes.equalitiesAt(inst, mapping)[i - len(context)] }
+            }, where)))
         Some(ByNothing(cls)) -> Absent(cls)
         Some(Same(other)) -> readOut(other, wanted, where)
+        Some(ByCoercion(p)) -> Coerced(p.args[0], p.args[1])
         -- Solving finished without an error, so it discharged every wanted.
         None -> oops("no evidence for '" + Ty.showPred(wanted()) + "', which solving "
                      + "had already accepted", where)
     }
 
--- Fill in each instance's superclass dictionaries and default methods.
+-- Fill in each instance's default methods.
 --
 -- A default body is elaborated once, by the generator, and shared by every
--- instance that does not override it -- the class's own dictionary name is
--- rebound per instance when the dictionary is built, which is the whole of what
--- makes one body serve them all.
+-- instance that does not override it: it is a function of the class's
+-- dictionary, and each instance applies it to the dictionary the solver found
+-- at its head (`InstancePlan.defaultDicts`), which is the whole of what makes
+-- one body serve them all.
 fun completeInstances(classes : ClassTable) -> Unit {
     for (_, insts) in Map.entries(classes.instances) {
         for inst in insts {
@@ -73,7 +79,7 @@ fun completeInstances(classes : ClassTable) -> Unit {
                 continue
             }
             match inst.plan {
-                None -> if inst.cls == P.typedClass {
+                None -> if inst.cls == P.typedClass || Classes.isFunctionDebug(inst) {
                     -- A derived `Typed` instance never passed through the
                     -- generator, so nothing has given it a plan. Its context is
                     -- its head's parameters -- `Typed (Map k v)` wants `Typed k`
@@ -81,7 +87,9 @@ fun completeInstances(classes : ClassTable) -> Unit {
                     -- named the way the generator names them. There is no body
                     -- to complete either: the lowering writes `typeRep` out of
                     -- the head's own name, which is the one thing the surface
-                    -- language could not have said.
+                    -- language could not have said. The `Debug` instance for
+                    -- functions has no context and no body to complete
+                    -- either: the lowering writes its `<fun>`.
                     let params = Vec.new(len(inst.context))
                     for q in inst.context { Vec.push(params, dictName(q.name)) }
                     inst.plan = Some(Classes.newInstancePlan(params))
@@ -98,20 +106,6 @@ fun completeInstances(classes : ClassTable) -> Unit {
                 None -> oops("instance '" + inst.cls
                              + "' was never given a plan", Some(inst.decl.span))
             }
-            let givens = Vec.new(len(plan.params))
-            for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
-                Vec.push(givens, (plan.params[i], inst.context[i]))
-            }
-            for sup in info.supers {
-                let demand = Ty.pred(sup.name, [inst.head])
-                match Classes.prove(classes, givens, demand) {
-                    Some(ev) -> Map.put(plan.supers, sup.name, ev)
-                    -- `checkInstance` refused the instance, and with it the
-                    -- program, if its context does not imply this.
-                    None -> oops("no evidence for '" + Ty.showPred(demand) + "'",
-                                 Some(inst.decl.span))
-                }
-            }
             for (name, _) in Map.entries(info.methods) {
                 if !Map.contains(plan.methods, name) {
                     match Map.get(info.defaults, name) {
@@ -122,6 +116,28 @@ fun completeInstances(classes : ClassTable) -> Unit {
             }
         }
     }
+}
+
+-- Reads the evidence for `c`'s instance's own obligations into its plan.
+fun readInstance(c : InstanceCheck) -> Unit {
+    let plan = match c.inst.plan {
+        Some(p) -> p
+        None -> oops("instance '" + c.inst.cls + "' was never given a plan",
+                     Some(c.inst.decl.span))
+    }
+    let where = Some(c.inst.decl.span)
+    let head = Ty.pred(c.inst.cls, [c.inst.head])
+    for (sup, hole) in c.supers {
+        Map.put(plan.supers, sup, readOut(hole, fun() = Ty.pred(sup, [c.inst.head]), where))
+    }
+    plan.superEqualities = Vec.map(c.equalities, readOut(_, fun() = head, where))
+    for (name, hole) in c.defaults {
+        Map.put(plan.defaultDicts, name, readOut(hole, fun() = head, where))
+    }
+    for (key, p, hole) in c.fields {
+        Map.put(plan.fieldDicts, key, readOut(hole, fun() = p, where))
+    }
+    plan.skolems = c.skolems
 }
 
 -- Every check here is one that only a compiler bug can fail: solving has

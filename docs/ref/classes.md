@@ -106,6 +106,27 @@ instance Named Cat {
 }
 ```
 
+An instance's superclasses must hold at its head, under the instance's
+context. Each comes from a constraint the context writes, from a superclass
+of one, or from an instance, and what that instance requires in turn may use
+anything the context provides. Here the context's `Mon a` provides `Sem a`,
+which is about `a`, not about `W a`, so `Sem (W a)` needs an instance of its
+own:
+
+<!-- error: 'Sem (W a)' is required by 'Mon', but there is no such instance -->
+```kotlin
+class Sem a { fun op(a, a) -> a }
+class Mon a : Sem a { fun unit() -> a }
+
+type W a = W(a)
+
+instance Mon (W a) : Mon a {
+    fun unit() = W(unit())
+}
+
+fun main() { }
+```
+
 ## Instances
 
 **Syntax**
@@ -148,12 +169,50 @@ fun main() {
 
 ```text
 Box(3)
-Box([Some(a)])
+Box([Some("a")])
 ```
 
 `Show (Box a) : Show a` says: a `Box a` can be shown whenever an `a` can. The
 instance's methods may use those constraints. The context may also hold
 [equalities](#equality-constraints) about the head's variables.
+
+Each class constraint in an instance's context must be **smaller than the
+head** (the *Paterson conditions*):
+
+* it cannot apply an [associated type](#associated-types);
+* it must have fewer type constructors and type variables than the head,
+  counting each occurrence;
+* no type variable may occur in it more often than in the head.
+
+Equalities in the context are exempt from this rule, and so are
+[`Typed`](builtins.md#typed-and-cast) constraints. `Show a` for `Show (Box a)` is
+smaller, and so is `Eq (f a)` for `Eq (App f a)`. `Eq (W (a, a))` for
+`Eq (W a)` is not:
+
+<!-- error: 'Eq (W (a, a))' cannot be in an instance's context: it is no smaller than the instance head 'Eq (W a)' -->
+```kotlin
+type W a = W(a)
+
+instance Eq (W a) : Eq (W (a, a)) {
+    fun eq(_, _) = True
+}
+
+fun main() { print(W(1) == W(1)) }
+```
+
+The rule is what makes finding an instance terminate. Using an instance to
+satisfy a constraint replaces that constraint with the instance's context.
+Each constraint there is smaller, whatever types the head's variables stand
+for, and a size cannot shrink for ever. The instance above would turn
+`Eq (W Int)` into `Eq (W (Int, Int))`, then into
+`Eq (W ((Int, Int), (Int, Int)))`, without end.
+
+> **For readers new to this.** "Smaller" is about the types written, not
+> about values. A constraint that applies an associated type is refused
+> because the associated type may stand for a type of any size:
+> `Elem (Box a)` could be `Box (Box a)`. Such a constraint can still go in a
+> function's context, as `Show (Elem c)` does in `describeFirst` under
+> [Associated types](#associated-types).
 
 > **Coming from Haskell.** `instance Show (Box a) : Show a` is
 > `instance Show a => Show (Box a)`: the context comes after the head.
@@ -206,10 +265,366 @@ a data type of your own and write the instance for the wrapper.
 
 ### Derived instances
 
-The compiler provides the instances of the class `Typed` itself, for every
-type, and a program may not write one. See [`Typed` and
-`cast`](builtins.md#typed-and-cast). No other class has derived instances: a
-type gets `Show`, `Eq` and the rest only from instances someone writes.
+**Syntax**
+
+```ebnf
+type-decl ::= "type" CONID IDENT* (":" derive ("," derive)*)? "=" constructor ("|" constructor)*
+derive    ::= "!"? qualified-CONID
+```
+
+The compiler writes some instances of a type from its declaration. Every
+type declaration gets `Eq` and `Hash` without asking, where its fields have
+them, and a *derive list* after the parameters asks for more or refuses
+some. It follows a `:`, the same `:` that gives an instance its
+requirements: `type Card : Ord = ...` says that `Card` has `Ord`. The
+compiler writes each instance from the declaration's constructors. It can
+write instances of three classes that a list may ask for, and it writes two
+more without being asked: `Debug` for every type, and `Object` for every type
+whose values are objects ([`Object` and
+`identical`](builtins.md#object-and-identical)):
+
+* **`Eq`.** Two values are equal when they were built by the same
+  constructor and each field of one equals the same field of the other, by
+  the field type's own `Eq`.
+* **`Ord`.** A value built by a constructor declared earlier is less than one
+  built by a constructor declared later. Two values built by the same
+  constructor compare their fields from first to last, and the first pair of
+  fields that are not equal decides.
+* **`Hash`.** A value is hashed by its constructor and then its fields, in
+  order, so equal values hash alike.
+* **`Debug`.** A value prints as the constructor that built it with each
+  field's own `Debug`, as a program would write it: `Pair(1, "a")`,
+  `Point { x = 1, y = 2 }`. See [`Show` and
+  printing](builtins.md#show-and-printing).
+
+Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
+class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
+
+A tuple of any length gets the same instances, and `Ord` and `Show` too,
+without asking, wherever its elements have them. It behaves like a type with
+one positional constructor holding its elements: two tuples are equal when
+their elements are, the first unequal element decides their order, and a
+tuple prints as its elements in parentheses, each with its `Debug`, for both
+`Debug` and `Show`. So a tuple of any length can be a `Map` key:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let costs = Map.new()
+    costs[(1, 2, 'n', "east", True)] = 5
+    print(costs[(1, 2, 'n', "east", True)])
+    print((1, 2, 3, 4, 9) < (1, 2, 3, 5, 0))
+    print((1, "a", 'b', 2.5, False))
+}
+```
+
+```text
+5
+True
+(1, "a", 'b', 2.5, False)
+```
+
+<!-- run -->
+```kotlin
+type Point = Point { x : Int, y : Int }
+
+type Suit : Ord = Hearts | Diamonds | Clubs | Spades
+
+type Card : Ord = Card { rank : Int, suit : Suit }
+
+fun main() {
+    print(Point { x = 1, y = 2 } == Point { x = 1, y = 2 })
+    let names = Map.new()
+    Map.put(names, Point { x = 0, y = 0 }, "origin")
+    print(Map.get(names, Point { x = 0, y = 0 }))
+    print(Hearts < Spades)
+    print(Card { rank = 10, suit = Clubs } < Card { rank = 10, suit = Spades })
+}
+```
+
+```text
+True
+Some("origin")
+True
+True
+```
+
+`Point` has no derive list and is still compared and used as a key. `Ord` is
+never derived unasked, since a derived order follows the order the
+constructors are declared in: reordering them would quietly reorder every
+sort. A list naming `Ord` gets it, as `Suit` and `Card` do.
+
+`Ord` and `Hash` both have `Eq` as a superclass, and a derived `Ord` or
+`Hash` derives `Eq` along with it, even where the type would get no `Eq`
+without asking. A derived order must agree with the type's equality, so a
+type whose `Eq` is written by hand cannot ask for `Ord` or `Hash`; it writes
+those too.
+
+A field of type `Float` compares as a `Float` does, so a value holding a NaN
+is not equal to itself.
+
+Only a type's own declaration can derive its instances. A type declared
+elsewhere gets an instance written by hand, under the
+[orphan rule](#coherence).
+
+**Requirements.** A derived instance requires what its fields' instances
+require, stated over the type's parameters. The compiler finds this by
+asking for the class at each field's type and following the instances that
+provide it until only requirements on parameters are left. `type Pair a b =
+Pair(a, b)` gets the instance `Eq (Pair a b) : Eq a, Eq b`, and a field
+of type `Map k v`, whose `Eq` needs `Hash k` and `Eq v`, passes those on:
+
+<!-- run -->
+```kotlin
+type Index k v = Index { name : String, entries : Map k v }
+
+fun same[Eq v](a : Index String v, b : Index String v) -> Bool = a == b
+
+fun main() {
+    let a : Index String Int = Index { name = "a", entries = Map.new() }
+    print(same(a, Index { name = "a", entries = Map.new() }))
+}
+```
+
+```text
+True
+```
+
+`Index` has the instance `Eq (Index k v) : Hash k, Eq v`, so `same` can ask
+for `Eq v` alone, since `String` has `Hash`. A requirement that another
+requirement's superclass implies is left out: a derived `Ord` that needs
+`Ord a` does not also list `Eq a`, since `Eq` is a superclass of `Ord`.
+
+A parameter that no field mentions is a *phantom*, and the instance requires
+nothing of it:
+
+<!-- run -->
+```kotlin
+type Measure unit : Ord = Measure(Float)
+
+type Metres = Metres
+
+fun metres(x : Float) -> Measure Metres = Measure(x)
+
+fun main() {
+    print(metres(1.0) < metres(2.0))
+}
+```
+
+```text
+True
+```
+
+`Metres` has no `Ord`, and `Measure Metres` does. A type may refer to itself,
+or a group of types to each other, and each derived instance uses the others:
+`type List a = Nil | Cons(a, List a)` compares a list field by field
+down to its end. The requirements of such a group are found together, each
+type's from what the others' turn out to be.
+
+Each field uses its own type's instance, written by hand or derived, so a
+field whose `Eq` is written by hand is compared by that `Eq`.
+
+**An instance written by hand** replaces the one the compiler would derive
+without asking, and needs nothing in the derive list. Since a derived `Hash`
+must agree with the type's `Eq`, a type whose `Eq` is written by hand gets no
+derived `Hash` either, and writes its own if it needs one:
+
+<!-- run -->
+```kotlin
+-- An angle in degrees, the same after any number of whole turns.
+type Angle = Angle(Int)
+
+instance Eq Angle {
+    fun eq(Angle(a), Angle(b)) = Int.mod(a, 360) == Int.mod(b, 360)
+}
+
+instance Hash Angle {
+    fun hashInto(Angle(a), h) = hashInto(Int.mod(a, 360), h)
+}
+
+fun main() {
+    print(Angle(90) == Angle(450))
+    let headings = Map.new()
+    Map.put(headings, Angle(90), "east")
+    print(Map.get(headings, Angle(-270)))
+}
+```
+
+```text
+True
+Some("east")
+```
+
+**When there is no implicit instance.** A type whose fields do not all have
+the class, under the requirements above, simply has no implicit instance of
+it. The compiler writes an implicit instance only when the program first
+needs it, so nothing is reported until something does, and then the error
+says why, following fields through each type the compiler tried to derive
+the class for:
+
+<!-- error: 'Job' has no 'Eq': field 'callback' has type 'Callback', whose field 'run' has type 'fun() -> Int', which has no 'Eq' -->
+```kotlin
+type Callback = Callback { name : String, run : fun() -> Int }
+
+type Job = Job { id : Int, callback : Callback }
+
+fun main() {
+    let job = Job { id = 1, callback = Callback { name = "a", run = fun() = 1 } }
+    print(job == job)
+}
+```
+
+Two more rules hold back an implicit instance whose fields would allow it.
+Both are about values that can change after they are built, which only a
+`var` field or an array element can do: the *assignable* positions.
+
+**A type that can reach itself through an assignable position has no
+implicit `Eq` or `Hash`.** A value is built after its fields, so it cannot
+contain itself until an assignment makes it, and a derived `==` on such a
+cycle would compare forever. The compiler follows the fields' types, with
+each type's arguments put in, so a type that holds itself in a `var` field
+of another type, or in an array, counts. A field whose type applies a type
+parameter, as `f a` does, counts as holding `a` in an assignable position,
+since `f` may be `Array`. A node that links to the next is the plainest
+case:
+
+<!-- error: 'Node' has no 'Eq': it can reach itself through its 'var' field 'next'; write ': Eq' in its declaration to derive one anyway -->
+```kotlin
+type Node = Node { value : Int, var next : Option Node }
+
+fun main() {
+    let a = Node { value = 1, next = None }
+    print(a == a)
+}
+```
+
+The rule covers the cycles the declared types show. A type hidden in an
+[existential bracket](types.md#existential-types) shows none, and a derived
+instance never compares one. A hand-written instance that compares the
+hidden value can still loop on a cycle closed through it, as any
+hand-written instance can.
+
+**A type with a `var` field has no implicit `Hash`.** Its hash could change
+while it is a key in a map, which would then not find it. It still has `Eq`,
+which compares what its fields hold at the time:
+
+<!-- error: 'Counter' has no 'Hash': it has the 'var' field 'count'; write ': Hash' in its declaration to derive one anyway -->
+```kotlin
+type Counter = Counter { var count : Int }
+
+fun main() {
+    let seen = Map.new()
+    Map.put(seen, Counter { count = 0 }, True)
+}
+```
+
+A derive list that names the class overrides both rules: the type then has
+the instance whenever its fields do. A tree is a type that holds an array of
+itself, and a tree built only from new nodes cannot hold a cycle, so asking
+for `Eq` is safe there:
+
+<!-- run -->
+```kotlin
+type Tree : Eq = Tree { label : String, children : Array Tree }
+
+fun leaf(label : String) -> Tree = Tree { label = label, children = [] }
+
+fun main() {
+    print(Tree { label = "a", children = [leaf("b")] }
+          == Tree { label = "a", children = [leaf("b")] })
+}
+```
+
+```text
+True
+```
+
+**When an instance cannot be derived.** A class the derive list names is
+derived or reported. Every field's type must have the class, under the
+requirements above. A field that is a function, a type that has no
+instance, or a type `f a` built from a parameter `f`, has none. Nor does a
+constructor that hides a type in an [existential
+bracket](types.md#existential-types): two of its values may hide different
+types. The error is reported at the entry in the list, whether or not
+anything uses the instance, and says which field is to blame, as the error
+at a use does:
+
+<!-- error: 'File' cannot derive 'Eq': field 'fd' has type 'Fd', whose field 'state' has type 'fun() -> Int', which has no 'Eq' -->
+```kotlin
+type Fd : Eq = Fd { state : fun() -> Int }
+
+type File : Eq = File { fd : Fd }
+```
+
+A field whose type has an instance that needs the class for a part of it
+names that part: a field of type `Array (fun() -> Int)` *contains*
+`fun() -> Int`, which has no `Eq`.
+
+A derivation reads each field's type as the type checker reads any type:
+an [associated type](#associated-types) is worked out, and an
+[equality](#equality-constraints) a field's instance needs is checked. With
+`instance Eq (K c) : Key c ~ Int`, a field of type `K (Array Bool)` needs
+`Key (Array Bool) ~ Int`, which holds:
+
+<!-- run -->
+```kotlin
+type K c = K(Int)
+
+instance Eq (K c) : Key c ~ Int {
+    fun eq(K(a), K(b)) = a == b
+}
+
+type Tagged : Eq = Tagged(K (Array Bool))
+
+fun main() {
+    print(Tagged(K(1)) == Tagged(K(1)))
+}
+```
+
+```text
+True
+```
+
+What a derived instance can require of the type's parameters is only
+classes. A field whose instance needs the class at an associated type of a
+parameter, such as `Array (Key c)`, or needs an equality about one, such as
+`Key c ~ Int`, cannot derive it. Write the instance by hand instead:
+
+<!-- error: 'Keys' cannot derive 'Eq': field 0 of 'Keys' has type 'Array (Key c)', which contains 'Key c', an associated type that does not reduce; write 'instance Eq (Keys c)' by hand -->
+```kotlin
+type Keys c : Eq = Keys(Array (Key c))
+```
+
+**Opting out.** `!Eq`, `!Hash` or `!Object` in the list says that the type
+has none: no instance may be written for it, and a type that holds one cannot
+derive the class. A type whose fields would compare without meaning to opt out this
+way: a view of part of a buffer, whose contents are the buffer's, or a
+handle whose identity, not its contents, tells it apart. Refusing `Eq` refuses
+`Hash` too, which needs it. Comparing such a value says why it cannot be
+compared:
+
+<!-- error: 'Handle' has no 'Eq': its declaration says '!Eq' -->
+```kotlin
+type Handle : !Eq = Handle(Int)
+
+fun main() {
+    print(Handle(1) == Handle(1))
+}
+```
+
+**What a list may name.** Each class appears at most once. Only `Eq`, `Ord`
+and `Hash` can be asked for, and only `Eq`, `Hash`, `Object` and `Debug`
+refused. A type whose instance of a class is written by hand cannot also name
+that class, whether to derive it or to refuse it. `Debug` is never asked for,
+since every type whose fields allow it has it, and `!Debug` does not remove
+the instance: it makes
+the type print as `<Name>`, reading no field. `Object` is never asked for:
+the compiler provides its instances for every type whose values are objects,
+a program may not write one, and `!Object` refuses it. See [`Object` and
+`identical`](builtins.md#object-and-identical). `Typed` is never named: the
+compiler provides its instances for every type, and a program may not write
+one. See [`Typed` and `cast`](builtins.md#typed-and-cast). Every other class
+gets its instances only from instances someone writes.
 
 ## Using a class
 
@@ -325,7 +740,10 @@ to one of those variables, which guarantees that working out an associated
 type always terminates.
 
 An associated type is not *injective*: knowing `Elem c` says nothing about
-`c`, because different containers can have the same element type.
+`c`, because different containers can have the same element type. So a
+signature whose type mentions `c` only as `Elem c`, as in `fun f[Container
+c](x : Elem c) -> Int`, is [ambiguous](inference.md#ambiguity), and so is a
+context `[Container c, Elem c ~ Elem d]` whose type decides `c` and not `d`.
 
 > **For readers new to this.** An associated type is a *type family*: a
 > function from types to types, defined piece by piece by instances. It lets
@@ -409,6 +827,72 @@ written: `double("s")` is refused, because `Elem (Option String)` is not `Int`.
 The equalities also rewrite each other. `[F a ~ G a, G a ~ F a]` states one
 fact twice, and `[F a ~ F (G b), G b ~ a]` says only that `G b` is `a`, since
 the first equality follows from the second.
+
+Inside a function whose context has an equality, the body cannot decide a
+type from outside the function while the functions around it are inferred.
+Something outside has to decide it: an annotation, or a use. If nothing does
+and an inferred type generalizes over it, that is an error. Here only
+`inner`'s body says that `x` is an `Int`, and `outer` is inferred to take any
+type:
+
+<!-- error: cannot deduce 'a ~ Int' from the context of 'inner'; add a type annotation to 'outer' -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+fun outer(x) {
+    fun inner[Bag b, Elem b ~ Int](y : b) -> Int = x
+    0
+}
+
+fun main() { print(outer(1)) }
+```
+
+With `x` annotated, the same `inner` checks:
+
+<!-- run -->
+```kotlin
+class Bag b {
+    type Elem b
+}
+
+instance Bag (Option a) {
+    type Elem = a
+}
+
+fun outer(x : Int) -> Int {
+    fun inner[Bag b, Elem b ~ Int](y : b) -> Int = x
+    inner(Some(0))
+}
+
+fun main() { print(outer(1)) }
+```
+
+```text
+1
+```
+
+A type that no inferred type generalizes over is decided by the body after
+all, once the whole program has been checked, and before any numeric literal
+takes its default type. A `let log = Vec.new(4)` at the top level that only
+such a body pushes `Int`s into is a `Vec Int`.
+
+A class whose [superclasses include an equality](#equality-superclasses)
+counts as an equality here, in a function's context and in the class context
+an [existential](types.md#existential-types) opens. An equality that only says
+what one of the function's own type variables is does not count.
+`Elem (Option a) ~ Int` makes `a` be `Int` and says nothing else, so a body
+under it may decide a type from outside: in
+`fun inner[Elem (Option a) ~ Int](y : a) -> Int = x + y`, `x` is an `Int`.
+
+> **For readers new to this.** Under `Elem b ~ Int`, the types `Int` and
+> `Elem b` are the same inside `inner`, so what the body demands of a type
+> can often be met in more than one way. Inference never picks one answer of
+> several, which is what keeps every inferred type
+> [principal](inference.md#principal-types). So it leaves a type from
+> outside for the outside to decide. Such a type is called *untouchable*
+> inside `inner`.
 
 An equality that can never hold, whatever the caller picks, is an error at
 the signature:
@@ -547,8 +1031,8 @@ fun main() {
 
 ```text
 Right(3)
-Left(full)
-Left(closed)
+Left("full")
+Left("closed")
 ```
 
 Inside the instance's methods `Failure s` and `Trouble s` are
@@ -578,6 +1062,42 @@ fun main() { }
 Equalities also appear in inferred types. A function that iterates over its
 argument and treats the elements as `Op` values is inferred to have the
 constraint `Item a ~ Op`.
+
+The equalities a body needs rewrite each other as they are found, as a
+context's do. Two that cannot hold together are an error at the one that
+the other makes impossible, rather than an inferred context that no caller
+could satisfy:
+
+<!-- error: expected 'Char', found 'Int' in the annotation on 'i' -->
+```kotlin
+class Glue a {
+    type G a
+    fun glue(a) -> G a
+}
+
+class Fold a {
+    type F a
+    fun fold(a) -> F a
+}
+
+instance Fold Bool {
+    type F = Char
+    fun fold(b) = 'c'
+}
+
+fun weird(x) {
+    let g = glue(x)
+    let b : Bool = g
+    let i : Int = fold(g)
+    i
+}
+
+fun main() { }
+```
+
+`b`'s annotation makes `G a` be `Bool`, so `fold(g)` is an `F Bool`, which is
+a `Char`, and `i`'s annotation cannot hold. The error is at `i`'s annotation
+whichever of the two lines comes first.
 
 ### Equality superclasses
 
@@ -633,10 +1153,12 @@ fun main() { }
 Each instance has to prove the class's equalities at its head, using the
 equalities its own context grants. `instance Bytes (View s) : Bytes s`, for a
 `View s` whose `Value` is `Value s`, proves `Value (View s) ~ Byte` from the
-context's `Value s ~ Byte`. An instance where an equality is false, or where
-its context does not decide it, is refused:
+context's `Value s ~ Byte`, which its `Bytes s` grants. Every class
+constraint of the context grants its equality superclasses this way. An
+instance where an equality is false, or where its context does not decide
+it, is refused:
 
-<!-- error: 'Bytes Words' requires 'Value Words ~ Byte', which can never hold: 'String' is not 'Byte' -->
+<!-- error: expected 'Byte', found 'String' in the superclasses of 'Bytes Words' -->
 ```kotlin
 class Bytes s : Index s, Value s ~ Byte {}
 

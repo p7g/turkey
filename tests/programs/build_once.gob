@@ -1,0 +1,139 @@
+-- A constructor application passed to a parameter its body reads more than
+-- once, with each callee inlined into the case that calls it.
+--
+-- The `.opt` golden shows each heap object built once, bound to a name every
+-- read shares, with `%part` naming a `Node` inside another value, as in
+-- `nested` and `parted`. `branched` reads its parameter once in each arm, so
+-- each arm builds its own. In `regrow` and `weighed` a `match` on
+-- the parameter sits inside a constructor application, off the `let` chain,
+-- and still selects its arm. An arm that binds the whole value, in `rooted`
+-- and `weighed`, binds the name rather than a second `Node`. `opened`'s
+-- `match` opens an existential, which no build decides, so it stays a
+-- `match` on the name, and the build stays outside the loop.
+--
+-- `main` calls the cases through an array, so none is inlined into it.
+
+type Tree = Leaf | Node(Tree, Int, Tree)
+
+fun size(t : Tree) -> Int = match t {
+    Leaf -> 0
+    Node(left, _, right) -> size(left) + 1 + size(right)
+}
+
+fun label(t : Tree) -> Int = match t {
+    Node(_, n, _) -> n
+    Leaf -> 0
+}
+
+fun twin(t : Tree) -> Tree = Node(t, 0, t)
+
+fun grow(n : Int) -> Int = size(twin(Node(Leaf, n, Leaf)))
+
+fun labelled(t : Tree) -> Tree = Node(t, label(t), t)
+
+fun regrow(n : Int) -> Int = size(labelled(Node(Leaf, n, Leaf)))
+
+-- Read once, but under a lambda, which may run any number of times.
+fun later(t : Tree) -> fun() -> Tree = fun() = Node(t, 0, Leaf)
+
+fun kept(n : Int) -> Int {
+    let thunks = [later(Node(Leaf, n, Leaf))]
+    size(thunks[0]())
+}
+
+-- Read once, but in a loop.
+fun repeat(t : Tree, times : Int) -> Int {
+    var total = 0
+    for _ in Int.range(0, times) { total = total + size(t) }
+    total
+}
+
+fun looped(n : Int) -> Int = repeat(Node(Leaf, n, Leaf), 3)
+
+-- Read once in each arm.
+fun either(t : Tree, left : Bool) -> Tree = if left { Node(t, 1, Leaf) } else { Node(Leaf, 2, t) }
+
+fun branched(n : Int) -> Int = size(either(Node(Leaf, n, Leaf), n > 0))
+
+-- A heap object inside a flat one.
+fun both(o : Option Tree) -> (Option Tree, Option Tree) = (o, o)
+
+fun count(o : Option Tree) -> Int = match o {
+    Some(t) -> size(t)
+    None -> 0
+}
+
+fun nested(n : Int) -> Int {
+    let (a, b) = both(Some(Node(Leaf, n, Leaf)))
+    count(a) + count(b)
+}
+
+-- An arm that binds the whole value.
+fun rootTwice(t : Tree) -> Tree = match t {
+    Leaf -> Leaf
+    other -> Node(other, size(t), t)
+}
+
+fun rooted(n : Int) -> Int = size(rootTwice(Node(Leaf, n, Leaf)))
+
+-- An inlined call whose own argument was bound once, inlined again.
+class Grow a {
+    fun grown(a) -> a
+}
+
+instance Grow Tree {
+    fun grown(t) = Node(t, label(t), t)
+}
+
+fun growTwice[Grow a](x : a) -> a = grown(grown(x))
+
+fun classed(n : Int) -> Int = size(growTwice(Node(Leaf, n, Leaf)))
+
+-- Taken apart and read: the child an arm binds is the one inside the value.
+fun kidAndWhole(t : Tree) -> (Tree, Tree) = match t {
+    Node(kid, _, _) -> (kid, t)
+    Leaf -> (Leaf, t)
+}
+
+fun parted(n : Int) -> Int {
+    let (kid, whole) = kidAndWhole({
+        let m = n * 2
+        Node(Node(Leaf, m, Leaf), m, Leaf)
+    })
+    size(kid) + size(whole)
+}
+
+-- An arm that binds the whole value, in a `match` off the `let` chain.
+fun weight(t : Tree) -> Int = match t {
+    Leaf -> 0
+    whole -> size(whole) * 10
+}
+
+fun three(t : Tree) -> (Tree, Tree, Int) = (t, t, weight(t))
+
+fun weighed(n : Int) -> Int {
+    let (a, b, k) = three(Node(Leaf, n, Leaf))
+    size(a) + size(b) + k
+}
+
+-- A `match` that opens an existential, in a loop.
+type Shown = Shown[Show a](a)
+
+fun shownLength(Shown(v) : Shown) -> Int = String.byteLength(show(v))
+
+fun lengths(s : Shown, times : Int) -> Int {
+    var total = 0
+    for _ in Int.range(0, times) { total = total + shownLength(s) }
+    total
+}
+
+fun opened(n : Int) -> Int = lengths(Shown(n * 100), 2)
+
+let cases = [
+    grow, regrow, kept, looped, branched, nested, rooted, classed, parted, weighed,
+    opened,
+]
+
+fun main() {
+    for case in cases { print(case(2)) }
+}

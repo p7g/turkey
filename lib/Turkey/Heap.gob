@@ -42,7 +42,7 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
 import Data.Error (Error(..))
-import Control.Iterator (Iterator(..))
+import Iter (Iterator(..))
 import Data.Int ()
 import Data.Bool (Bool(..))
 import Turkey.HeapCheck as Check
@@ -69,9 +69,10 @@ import Turkey.Ptr as Ptr
 
 -- An object's header, the word its address points at: its generation (u8),
 -- its kind (u8), the count of the traced words its fields start with (u16),
--- and its tag (i32), which the collector does not read. In an array the
--- count is the element's layout code, and in a cell it is 1 if the value is
--- traced. `Turkey.Runtime.objectFields` says the same.
+-- and its tag (i32), which the collector does not read but in an array. In an
+-- array the count is the traced words each element starts with and the tag
+-- is the elements' stride in bytes, and in a cell the count is 1 if the value
+-- is traced. `Turkey.Runtime.objectFields` says the same.
 let headerGeneration : Int = 0
 
 -- The generation's values. An object is young from its allocation until the
@@ -138,8 +139,8 @@ let immediates : Int = 4096
 -- Where an object's fields are, and so its traced words: right after the
 -- header, since the compiler puts every traced field first
 -- (`Turkey.Runtime.layout`). A cell's value is there too. An array's length
--- is there instead, and its elements after it; they are traced words if the
--- element's layout code is 7.
+-- is there instead, and its elements after it, each starting with the traced
+-- words its header counts.
 let objectFields : Int = 8
 let arrayLength : Int = 8
 let arrayElements : Int = 16
@@ -1432,17 +1433,18 @@ fun remember(parent : Ptr) -> Unit {
 -- Trace everything reachable from the running worker's mark stack, emptying
 -- it. This is the one place the collector decodes an object's layout.
 --
--- An array's tag is its element's layout code: 7 is a traced pointer and 6
--- is a pointer-sized word the collector must not follow, a raw address. A
--- test of `>= 6` follows both, and collects through an address it has no
--- business reading. Any other object's descriptor counts the traced words its
--- fields start with, and the rest of it is not looked at.
+-- An object's descriptor counts the traced words its fields start with. An
+-- array's counts the traced words each element starts with, and its tag is
+-- the elements' stride: the collector follows that many words at every
+-- stride, and none in an array whose count is 0, though its elements may be
+-- pointer-sized words such as raw addresses.
 --
 -- An entry is an object, or the next chunk of one too large to scan at once:
 -- its address with the chunk's number, from 1, in the top bits, which no
 -- user-space address on arm64 has set; below `chunkLimit`, so that the entry
--- stays positive. Scanning `chunkSlots` slots at a time
--- lets another worker take the rest of a large array.
+-- stays positive. Scanning `chunkSlots` elements at a time, or words of an
+-- object that is not an array, lets another worker take the rest of a large
+-- one.
 --
 -- With other workers marking, every `shareEvery` entries this one gives a
 -- packet of its stack away if one of them is waiting for work.
@@ -1470,26 +1472,30 @@ fun drain() -> Unit {
         let entry = Ptr.toInt(Ptr.load(stack, times8(top)))
         let chunk = entry >> 48
         let object = Ptr.fromInt(if chunk == 0 { entry } else { entry & addressBits })
-        -- Where its pointers start and how many there are: every word from
-        -- `first` to `slots` is one. A cell's flag is the count of its one
-        -- word.
+        -- Where its pointers are: `runs` runs of `per` words, one every
+        -- `stride` bytes from `first`. Any object but an array is runs of
+        -- one word each, and a cell's flag is the count of its one word.
         let header = Ptr.load32(object, 0)
         let kind = header >> 8 & 255
         var first = objectFields
-        var slots = header >> 16
+        var runs = header >> 16
+        var per = 1
+        var stride = 8
         if kind == arrayKind {
             first = arrayElements
-            slots = if slots == 7 { Ptr.load(object, arrayLength) } else { 0 }
+            per = runs
+            stride = Ptr.load32(object, 4)
+            runs = if per > 0 { Ptr.load(object, arrayLength) } else { 0 }
         }
         var field = 0
-        var end = slots
-        if slots > chunkSlots {
+        var end = runs
+        if runs > chunkSlots {
             field = Int.mulWrapping(chunk, chunkSlots)
-            end = if Int.subWrapping(slots, field) > chunkSlots && chunk < chunkLimit {
+            end = if Int.subWrapping(runs, field) > chunkSlots && chunk < chunkLimit {
                 plus(field, chunkSlots)
-            } else { slots }
+            } else { runs }
         }
-        if end != slots {
+        if end != runs {
             if top == capacity {
                 Ptr.store(m, 8, top)
                 if !growMarkStack(m) {
@@ -1503,12 +1509,17 @@ fun drain() -> Unit {
             Ptr.store(stack, times8(top), Ptr.fromInt(next))
             top = plus(top, 1)
         }
-        while field < end {
-            let child : Ptr = Ptr.load(object, plus(first, times8(field)))
+        -- `at` is the run's offset and `k` the word's within it.
+        var at = plus(first, Int.mulWrapping(field, stride))
+        let stop = plus(first, Int.mulWrapping(end, stride))
+        var k = 0
+        while at < stop {
+            let child : Ptr = Ptr.load(object, plus(at, times8(k)))
             if immediate(child) {
             } else if below(Int.subWrapping(Ptr.toInt(child), staticFrom), staticSize) {
             } else if stress && Ptr.isNull(findObject(child)) {
-                notHeapPointer(child, fieldName(kind), field)
+                notHeapPointer(child, fieldName(kind),
+                               plus(Int.mulWrapping(Int.subWrapping(at, first) / stride, per), k))
             } else {
                 let childRegion = regionOf(child)
                 let childSlot = slotOf(childRegion, child)
@@ -1539,7 +1550,11 @@ fun drain() -> Unit {
                     }
                 }
             }
-            field = plus(field, 1)
+            k = plus(k, 1)
+            if k == per {
+                k = 0
+                at = plus(at, stride)
+            }
         }
     }
     Ptr.store(m, 8, 0)

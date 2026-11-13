@@ -1,10 +1,11 @@
 export (
     Value(..), valueId, BlockId(..), blockId,
-    RepClass(..), Rep(..), traced, untraced, Layout(..), layoutName, keyName,
+    RepClass(..), Rep(..), traced, untraced, Layout(..), layoutName, keyName, slotName,
     Effects(..), reads_, writes, allocates, traps, diverges,
     isSafepoint, deletable,
     Term(..), successors, switchTargets,
-    Block(..), newBlock, Func(..), newFunc,
+    Block(..), newBlock, Func(..), newFunc, Variable(..), Anchor(..), holding, hold, holdFrom,
+    anchorsOf, anchorAt, carryHolds,
     Inst(..), eachUse, eachDef,
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
@@ -47,12 +48,14 @@ export (
 -- promoting it a precondition for every optimization rather than one of them.
 
 -- No diagnostics: `verify` answers with complaints rather than failing, so
--- this module depends on nothing but the standard library.
+-- this module reports nothing itself.
 import Data.BitSet as BitSet
 import Data.BitSet (BitSet)
 import Data.Set as Set
 import Turkey.Position as Position
 import Turkey.Source (Span)
+import Turkey.Types as Ty
+import Iter
 
 -- -- values and representations ---------------------------------------------------
 
@@ -68,29 +71,12 @@ type BlockId = BlockId(Int)
 
 fun blockId(BlockId(n)) -> Int = n
 
-instance Eq Value { fun eq(Value(a), Value(b)) = a == b }
-
-instance Eq BlockId { fun eq(BlockId(a), BlockId(b)) = a == b }
-
 -- What a register has to hold. Instruction selection reads this.
 -- `Unit` is zero-width and occupies no register. Every instruction defines a
 -- value, so an effectful one defines a unit -- and without this that would
 -- burn a register per store, per call for effect, per assignment. LLVM's
 -- `void` and QBE's absent return type are the same choice.
 type RepClass = Unit | I1 | I8 | I32 | I64 | F64 | Ptr
-
-instance Eq RepClass {
-    fun eq(x, y) = match (x, y) {
-        (Unit, Unit) -> True
-        (I1, I1) -> True
-        (I8, I8) -> True
-        (I32, I32) -> True
-        (I64, I64) -> True
-        (F64, F64) -> True
-        (Ptr, Ptr) -> True
-        _ -> False
-    }
-}
 
 -- A representation is two facts, not one.
 --
@@ -119,10 +105,6 @@ fun traced(c : RepClass) -> Rep = Rep { class_ = c, traced = True }
 
 fun untraced(c : RepClass) -> Rep = Rep { class_ = c, traced = False }
 
-instance Eq Rep {
-    fun eq(a, b) = a.class_ == b.class_ && a.traced == b.traced
-}
-
 -- A traced pointer prints `ptr*`: the star is the collector's obligation, kept
 -- separate from the register class it is printed beside.
 instance Show Rep {
@@ -139,16 +121,6 @@ instance Show Rep {
 -- Declared here rather than in `Turkey.Layout`, which computes them, because
 -- `Turkey.Ast` and `Turkey.Core` hold layouts and `Turkey.Layout` imports both.
 type Layout = Layout { slots : Array Rep }
-
-instance Eq Layout {
-    fun eq(a, b) = {
-        if len(a.slots) != len(b.slots) { return False }
-        for var i = 0; i < len(a.slots); i = i + 1 {
-            if a.slots[i] != b.slots[i] { return False }
-        }
-        True
-    }
-}
 
 -- Returns the name of `l` as a copy's name spells it, `f@[i64,ptr]`, and as
 -- the dumps print it. Distinct layouts get distinct names, so a name can key a
@@ -337,6 +309,19 @@ type Func i = Func {
     -- The calls inlined into the function that its positions name, numbered
     -- from 1 by the site field of a position (`Turkey.Position`).
     var sites : Vec Position.Site,
+    -- With `-g`, the variables of the source the function binds, and the
+    -- ones each value holds, by value id: a value holds a variable, or one
+    -- slot of a variable held in several (`holding`). It holds it from its
+    -- definition on, or from an assignment to the variable at one of the
+    -- points `anchors` gives it there, by value id (`holdFrom`). Debug
+    -- information is the only reader, so a pass that loses a value's entry
+    -- loses only what a debugger shows.
+    var variables : Vec Variable,
+    var holds     : Map Int (Vec (Int, Int)),
+    var anchors   : Map Int (Vec (Int, Int, Anchor)),
+    -- The variable each slot of a `var` holds, by slot, which `Turkey.Promote`
+    -- gives the values it puts in the slot's place.
+    var slotHolds : Map Int Int,
     -- The module that declares the binding the function was lowered from,
     -- lambdas and instance methods included, and for a lambda lifted out of
     -- an initializer, the module of the global it initializes; empty for one
@@ -348,7 +333,107 @@ type Func i = Func {
 fun newFunc(name : String, results : Array Rep) -> Func i = Func {
     name = name, params = [], results = results,
     blocks = [], entry = BlockId(0), reps = [], origins = Map.new(),
-    reasons = Map.new(), at = 0, sites = [], module_ = "",
+    reasons = Map.new(), at = 0, sites = [], variables = [], holds = Map.new(),
+    anchors = Map.new(), slotHolds = Map.new(), module_ = "",
+}
+
+-- A local of the source, as a debugger shows it: its name, the position of
+-- its binding (`Turkey.Position`), whether it is one of the function's
+-- parameters, its type, and how it is held: at `layout`, in its slots, or in
+-- one pointer to an object of them if `boxed`.
+type Variable = Variable {
+    name      : String,
+    declared  : Int,
+    parameter : Bool,
+    ty        : Ty.Type,
+    layout    : Layout,
+    boxed     : Bool,
+}
+
+-- What value `id` holds: each variable, as an index into `Func.variables`,
+-- and which of its slots, or -1 for the whole of it.
+fun holding(f : Func i, id : Int) -> Vec (Int, Int) = Map.getOr(f.holds, id, [])
+
+-- A point in a block that a pass names by the values around it, which
+-- outlast the instructions between them: just after the definition of a
+-- value, its block's start for a block parameter, or just before the
+-- definition of a value.
+type Anchor = After(Int) | Before(Int)
+
+-- Records that value `id` holds slot `slot` of variable `k`, or the whole of
+-- it if `slot` is -1, from its definition on.
+fun hold(f : Func i, id : Int, k : Int, slot : Int) -> Unit {
+    addHolding(f, id, k, slot)
+    if let Some(anchored) = Map.get(f.anchors, id) {
+        Map.put(f.anchors, id, Vec.filter(anchored, fun((k2, s2, _)) = k2 != k || s2 != slot))
+    }
+}
+
+-- Records that value `id` holds slot `slot` of variable `k`, or the whole of
+-- it, from an assignment at `at` on, as well as from any point it already
+-- does. Records nothing if `at` is `None`: a pass that cannot name where an
+-- assignment is leaves the variable to the values that hold it elsewhere.
+fun holdFrom(f : Func i, id : Int, k : Int, slot : Int, at : Option Anchor) -> Unit {
+    let a = match at {
+        Some(a) -> a
+        None -> return
+    }
+    if let After(w) = a { if w == id { return hold(f, id, k, slot) } }
+    let held = Iter.any(holding(f, id), fun((k2, s2)) = k2 == k && s2 == slot)
+    if held && len(anchorsOf(f, id, k, slot)) == 0 { return }
+    addHolding(f, id, k, slot)
+    match Map.get(f.anchors, id) {
+        Some(anchored) -> Vec.push(anchored, (k, slot, a))
+        None -> Map.put(f.anchors, id, [(k, slot, a)])
+    }
+}
+
+fun addHolding(f : Func i, id : Int, k : Int, slot : Int) -> Unit = match Map.get(f.holds, id) {
+    Some(held) -> if !Iter.any(held, fun((k2, s2)) = k2 == k && s2 == slot) {
+        Vec.push(held, (k, slot))
+    }
+    None -> Map.put(f.holds, id, [(k, slot)])
+}
+
+-- Returns the points value `id` holds slot `slot` of variable `k` from, or
+-- nothing if it holds it from its definition.
+fun anchorsOf(f : Func i, id : Int, k : Int, slot : Int) -> Vec Anchor {
+    let out = []
+    for (k2, s2, a) in Map.getOr(f.anchors, id, []) {
+        if k2 == k && s2 == slot { Vec.push(out, a) }
+    }
+    out
+}
+
+-- Returns the anchor of the point before instruction `index` of `block`:
+-- just after the last value defined before it, or the block's start through
+-- a parameter, or just before the first value defined after it, of the
+-- values `kept` accepts, which are those that outlast the pass asking.
+-- Returns `None` if the block defines none of them.
+fun anchorAt[Inst i](block : Block i, index : Int, kept : fun(Value) -> Bool) -> Option Anchor {
+    for var k = index - 1; k >= 0; k = k - 1 {
+        let made = Vec.filter(defs(block.insts[k]), kept)
+        if len(made) > 0 { return Some(After(valueId(made[len(made) - 1]))) }
+    }
+    for p in block.params { if kept(p) { return Some(After(valueId(p))) } }
+    for var k = index; k < len(block.insts); k = k + 1 {
+        let made = Vec.filter(defs(block.insts[k]), kept)
+        if len(made) > 0 { return Some(Before(valueId(made[0]))) }
+    }
+    None
+}
+
+-- Gives value `to` what `from` holds: for a pass that replaces every read
+-- of `from` with `to`, where `at` is the point `from` was defined at. What
+-- `from` held from its definition, `to` holds from `at`, since `to` may be
+-- defined earlier, when the variable held something else.
+fun carryHolds(f : Func i, from : Int, to : Int, at : Option Anchor) -> Unit {
+    if from == to { return }
+    for (k, slot) in holding(f, from) {
+        let anchored = anchorsOf(f, from, k, slot)
+        if len(anchored) == 0 { holdFrom(f, to, k, slot, at) }
+        else { for a in anchored { holdFrom(f, to, k, slot, Some(a)) } }
+    }
 }
 
 -- A value of the given representation, appended to the function's table.
@@ -1123,6 +1208,10 @@ fun pruneUnreachable[Inst i](f : Func i) -> Func i {
     out.reasons = f.reasons
     out.at = f.at
     out.sites = f.sites
+    out.variables = f.variables
+    out.holds = f.holds
+    out.anchors = f.anchors
+    out.slotHolds = f.slotHolds
     for at in order {
         let block = f.blocks[blockId(at)]
         let made = newBlock()

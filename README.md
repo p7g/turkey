@@ -120,11 +120,13 @@ on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
 then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
 `opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
 that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
-naming a directory that holds a copy of the library. It carries no debug or
-unwind information yet, so it takes no `-g`, and a file name without an
-extension will not choose it until the executable has what lldb and a profiler
-read. `check` compiles as far as the last stage that can reject a program and
-writes nothing. Either takes `--dump STAGE,...` to print what a stage produced:
+naming a directory that holds a copy of the library. A Mac executable carries
+the unwind information and, with `-g`, the debug information a linked one
+does (see "Debugging and profiling"). An ELF carries neither yet, so it takes
+no `-g`, and a file name without an extension will not choose an executable
+until both have what a debugger and a profiler read. `check` compiles as far
+as the last stage that can reject a program and writes nothing. Either takes
+`--dump STAGE,...` to print what a stage produced:
 `build/stages/stage2 check --dump types rectangles.gob` shows the inferred
 types, and running the compiler with no arguments lists the stages.
 `build --timings` reports on standard error how long each phase took, how the
@@ -179,6 +181,14 @@ object and writes only a map to it into the executable, which is how lldb and
 Instruments find it. To make a copy that does not need the object, run
 `dsymutil rectangles`, which writes `rectangles.dSYM` beside it. On Linux the
 DWARF is linked into the executable.
+
+`build -g -f exe` on a Mac writes the DWARF into the executable itself, in a
+`__DWARF` segment that is never loaded, and lldb, `atos`, `sample`,
+Instruments and crash reports read it there. There is no object to keep and
+nothing to run afterwards. Do not run `dsymutil` on such an executable: it
+reads only a linker's map, so it writes a `.dSYM` with no DWARF in it, which
+lldb then prefers to the executable's own. `strip` leaves the DWARF in place;
+build without `-g` for an executable without it.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:

@@ -162,8 +162,9 @@ be closed. A variable is closed if it is
   variable it uses is closed and its type has no type variables.
 
 A parameter, a variable bound by the pattern of a `match` arm, an `if let`, a
-`while let` or a `for`, a `var` and a `do` binder are never closed. The value restriction applies as well: a closed `let` is
-generalized only if its right-hand side is a value.
+`while let` or a `for`, a `var` and a `do` binder are never closed. The value
+restriction applies as well: a closed `let` is generalized only if its
+right-hand side is a value.
 
 `show` is defined at the top level, so `describe` is closed and is generalized,
 and so is `both`, which uses only `describe`:

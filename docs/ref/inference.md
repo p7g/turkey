@@ -238,11 +238,21 @@ fun main() {
 > True
 ```
 
-A [partial annotation](declarations.md#partial-annotations) also keeps a local
-`fun` generalized, because each type variable new to its header must stay a
-type of its own. A name the function around it has written is that function's
-type variable instead ([Scope of type
-variables](declarations.md#scope-of-type-variables)).
+A [partial annotation](declarations.md#partial-annotations) that writes a type
+variable of its own also keeps a local `fun` generalized, because that
+variable must stay a type of its own. A name the function around it has
+written is that function's type variable instead ([Scope of type
+variables](declarations.md#scope-of-type-variables)), so a partial annotation
+whose names all come from around it is generalized only if the `fun` is
+closed. Here `g` uses `x`, so it has one type:
+
+<!-- error: 'g' is used here at a second type -->
+```kotlin
+fun outer[Show k](x : k) -> String {
+    fun g[Show k](m) -> String = show(x) + show(m)
+    g(1) + g("s")
+}
+```
 
 > **For readers new to this.** A binding that uses a parameter can have the
 > parameter's type in its own type, and that type belongs to the function

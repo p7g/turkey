@@ -119,9 +119,10 @@ type Generator = Generator {
     -- -1 for the bottom scope. A name new to the scope gets its variable there
     -- (`scopeCell`).
     tyvarFrames   : Vec Int,
-    -- The names that pattern annotations bound to types their arm opened,
-    -- innermost arm last. Each leaves the scope with its arm (`bindHidden`).
-    hiddenNames   : Vec String,
+    -- The names new to the scope that the patterns of `match` arms and
+    -- parameter lists wrote, innermost arm last. Each leaves the scope with
+    -- its arm (`patternAnnotation`).
+    patternNames  : Vec String,
     -- Exhaustiveness runs after solving, when scrutinee types are known. Each
     -- site keeps the scopes the solver had open there (`siteScopes`).
     matchSites  : Vec (Expr, Ty.Type, Use),
@@ -162,7 +163,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
         binders = binders, parameters = Set.new(), fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()], tyvarFrames = [-1],
-        hiddenNames = Vec.new(4),
+        patternNames = Vec.new(4),
         matchSites = Vec.new(8),
         binderSites = Vec.new(8), discardSites = Vec.new(8), letElses = [],
         blocks = Vec.new(64), bottoms = Set.new(),
@@ -1848,7 +1849,7 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     Vec.push(g.tyvarScopes, scope)
     push(g)
     Vec.push(g.tyvarFrames, len(g.frames) - 1)
-    let hidden = len(g.hiddenNames)
+    let named = len(g.patternNames)
 
     let (expectedParams, expectedRet) = match expected {
         Some((TFun(ps, r), why)) -> if len(ps) == len(params) {
@@ -1860,13 +1861,22 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     }
     let binds = Map.new()
     Vec.push(g.openings, Some(Vec.new(2)))
+    -- A name a parameter's pattern writes inside it, rather than in the
+    -- annotation on the whole parameter, is the pattern's, as in a `match`
+    -- arm, and not part of the header a partial annotation states.
+    let patternOnly = Set.new()
     let paramTypes = Array.init(len(params), fun(i) {
         let param = params[i]
         let tv = match expectedParams {
             Some(ps) -> ps[i]
             None -> fresh(g)
         }
+        let stated = annotationNames(g, param)
+        let named = len(g.patternNames)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
+        for var k = named; k < len(g.patternNames); k = k + 1 {
+            if !Set.contains(stated, g.patternNames[k]) { Set.add(patternOnly, g.patternNames[k]) }
+        }
         Vec.push(g.binderSites, (param, tv,
             "name the parameter and 'match' on it in the body", siteScopes(g)))
         tv
@@ -1912,7 +1922,7 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
             if key >= 0 {
                 let header = Vec.new(4)
                 for (n, t) in Map.entries(g.tyvarScopes[len(g.tyvarScopes) - 1]) {
-                    if Map.contains(inherited, n) { continue }
+                    if Map.contains(inherited, n) || Set.contains(patternOnly, n) { continue }
                     match t {
                         TVar(cell) -> {
                             Ty.markHeaderVar(cell)
@@ -1977,9 +1987,9 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     emit(g, pop(g))
     discard(Vec.pop(g.tyvarScopes))
     discard(Vec.pop(g.tyvarFrames))
-    -- What the parameters opened is in scope for the whole body, so the names
-    -- bound to it leave with the function's scope.
-    while len(g.hiddenNames) > hidden { discard(Vec.pop(g.hiddenNames)) }
+    -- The parameters' pattern names are in scope for the whole body, so they
+    -- leave with the function's scope.
+    while len(g.patternNames) > named { discard(Vec.pop(g.patternNames)) }
     TFun(paramTypes, ret)
 }
 
@@ -2021,8 +2031,7 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
                 PVar(name) -> "the annotation on '" + name + "'"
                 _ -> "a type annotation"
             }
-            bindHidden(g, te, t)
-            eq(g, t, typeOf(g, te), Some(pat.span), what)
+            eq(g, t, patternAnnotation(g, te), Some(pat.span), what)
             matchPattern(g, inner, t)
         }
         -- An alternative cannot open an existential: which constants it hides
@@ -2535,58 +2544,48 @@ fun openedCon(g : Generator, pat : Pat, name : String) -> Ty.Type {
     con
 }
 
--- Binds each name the annotation `te` writes that is new to the scope and
--- stands, in the pattern's type `t`, for a type the innermost arm or
--- parameter list opened. The name means that hidden type, and leaves the
--- scope with the arm (`hiddenNames`).
-fun bindHidden(g : Generator, te : Type, t : Ty.Type) -> Unit {
-    -- GHC brings a pattern signature's variable into scope for the
-    -- alternative, standing for the existentially bound type. Every other
-    -- name an annotation writes is the function's. A hidden type cannot be:
-    -- the name would outlive the rank that the arm's rigid constants live at.
-    let opened = Set.new()
-    if let Some(Some(pending)) = Vec.last(g.openings) {
-        for (_, made) in pending {
-            for c in made { Set.add(opened, c.uid) }
+-- Returns the names new to the scope that the annotation on the whole of
+-- `param` writes, if it has one.
+fun annotationNames(g : Generator, param : Pat) -> Set.Set String {
+    let out = Set.new()
+    if let PAnnot(_, te) = param.kind {
+        let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
+        -- Read it into a copy, with variables made in no frame, so that
+        -- nothing is bound or constrained.
+        let probe = Map.new()
+        for (n, t) in Map.entries(scope) { Map.put(probe, n, t) }
+        discard(Decls.star(g.decls, te, probe, fun() = Ty.freshVar(0)))
+        for (n, _) in Map.entries(probe) {
+            if !Map.contains(scope, n) { Set.add(out, n) }
         }
     }
-    if Set.isEmpty(opened) { return {} }
-    let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
-    -- Read the annotation with a variable for each new name, made in no
-    -- frame, so that matching it against `t` constrains nothing.
-    let probe = Map.new()
-    for (n, ty) in Map.entries(scope) { Map.put(probe, n, ty) }
-    let written = Decls.star(g.decls, te, probe, fun() = Ty.freshVar(0))
-    let found = Map.new()
-    alignHidden(written, t, opened, found)
-    for (name, v) in Map.entries(probe) {
-        if Map.contains(scope, name) { continue }
-        if let TVar(cell) = v {
-            if let Some(c) = Map.get(found, cell.id) {
-                Map.put(scope, name, TCon(c))
-                Vec.push(g.hiddenNames, name)
-            }
-        }
-    }
+    out
 }
 
--- Records in `found`, by variable id, each variable of `written` that sits
--- where `actual` has a rigid constant whose `uid` is in `opened`.
-fun alignHidden(written : Ty.Type, actual : Ty.Type, opened : Set.Set Int,
-                found : Map Int ConCell) -> Unit = match (Ty.prune(written), Ty.prune(actual)) {
-    (TVar(v), TCon(c)) -> if Set.contains(opened, c.uid) { Map.put(found, v.id, c) }
-    (TApp(f, a, _), TApp(f2, a2, _)) -> {
-        alignHidden(f, f2, opened, found)
-        alignHidden(a, a2, opened, found)
+-- Returns the type the annotation `te` on a pattern writes. In the pattern of
+-- a `match` arm or a parameter list, a name new to the scope gets a variable
+-- of the arm's own, and leaves the scope with the arm, or with the function
+-- whose parameter it is (`patternNames`).
+fun patternAnnotation(g : Generator, te : Type) -> Ty.Type {
+    -- GHC brings a pattern signature's new variable into scope for the
+    -- alternative, standing for whatever type is there, an existentially
+    -- bound one included, whether this arm or an enclosing one opened it.
+    -- Every other new name is the function's, at the function's rank
+    -- (`scopeCell`), where a hidden type cannot reach. A pattern binding
+    -- cannot bind a type variable, in GHC as here, so a `let` pattern's new
+    -- name is the function's too.
+    match Vec.last(g.openings) {
+        Some(Some(_)) -> {}
+        _ -> return typeOf(g, te)
     }
-    (TFun(ps, r), TFun(ps2, r2)) -> if len(ps) == len(ps2) {
-        for var i = 0; i < len(ps); i = i + 1 { alignHidden(ps[i], ps2[i], opened, found) }
-        alignHidden(r, r2, opened, found)
+    let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
+    let before = Set.new()
+    for (name, _) in Map.entries(scope) { Set.add(before, name) }
+    let ty = Decls.star(g.decls, te, scope, fun() = freshCell(g))
+    for (name, _) in Map.entries(scope) {
+        if !Set.contains(before, name) { Vec.push(g.patternNames, name) }
     }
-    (TTuple(es), TTuple(es2)) -> if len(es) == len(es2) {
-        for var i = 0; i < len(es); i = i + 1 { alignHidden(es[i], es2[i], opened, found) }
-    }
-    _ -> {}
+    ty
 }
 
 -- `inner`, under what its patterns opened: one rank for the rigid constants to
@@ -2812,7 +2811,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
     var result = TBottom
     for arm in arms {
         Vec.push(g.openings, Some(Vec.new(2)))
-        let hidden = len(g.hiddenNames)
+        let named = len(g.patternNames)
         let bindings = alternatives(g, arm.patterns, scrutineeType)
         let openings = popOpenings(g)
         if len(openings) > 0 && len(arm.patterns) > 1 {
@@ -2849,8 +2848,8 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
             emit(g, defined)
         }
         let scope = g.tyvarScopes[len(g.tyvarScopes) - 1]
-        while len(g.hiddenNames) > hidden {
-            if let Some(name) = Vec.pop(g.hiddenNames) { let _ = Map.delete(scope, name) }
+        while len(g.patternNames) > named {
+            if let Some(name) = Vec.pop(g.patternNames) { let _ = Map.delete(scope, name) }
         }
         result = join(g, result, body, Some(arm.span), "the arms of a 'match'")
     }

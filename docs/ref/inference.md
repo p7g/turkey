@@ -404,7 +404,7 @@ written in a program.
 
 An [array literal](expressions.md#array-literals) does not have a single type
 either. It is an `Array`, a `Vec` or a `FrozenArray` of its elements, decided
-by how its value is used, and an `Array` when nothing decides:
+by how its value is used, and **defaulted** when nothing decides:
 
 <!-- run -->
 ```kotlin
@@ -424,13 +424,57 @@ fun main() {
 ```
 
 `seen` is a `Vec` because `Vec.contains` and `Vec.push` take one. The words are
-an `Array`: `for` accepts either, and nothing else decides. An annotation
+an `Array`: `for` accepts any of them, and nothing else decides. An annotation
 decides too, as in `let names : Vec String = []`, and so does a function's
 declared parameter or result type.
 
+A literal that nothing decides takes the first of `Array`, `Vec` and
+`FrozenArray` that has an instance of every class its uses need of it. Most
+need nothing an `Array` lacks, so most are arrays. A literal used as a `Set`
+element or a `Map` key needs `Hash`, which only `FrozenArray` has, and one
+compared with `<` needs `Ord`, which only `FrozenArray` has too:
+
+<!-- run -->
+```kotlin
+import Data.Set as Set
+
+fun main() {
+    let seen = Set.new()
+    Set.add(seen, [0, 1])
+    Set.add(seen, [0, 1])
+    let costs = Map.new()
+    costs[[2, 3]] = 5
+    print((len(seen), costs[[2, 3]], [1, 2] < [1, 3]))
+}
+```
+
+```text
+(1, 5, True)
+```
+
+Only a class of the literal's own type counts: `Hash` in `Set.add(seen, [0,
+1])` is about the literal, but `Show` in `print(Some([1]))` is about the
+`Option`, and the literal is an `Array`. This is the Haskell 2010 Report's
+defaulting rule (section 4.3.4), which picks the first type in a default list
+that is an instance of all the ambiguous variable's classes. When no container
+has them all, the literal is rejected:
+
+<!-- error: no container this array literal could be has both 'SetIndex' and 'Hash': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
+```kotlin
+fun main() {
+    let costs = Map.new()
+    let key = [1, 2]
+    key[0] = 5
+    costs[key] = 1
+}
+```
+
+A key that changes cannot be found again, so build the key once it is final,
+with `FrozenArray.freeze(key)`.
+
 Unlike a numeric literal, an array literal is never generic in its container.
-A binding that is generalized, such as a function, still decides which of the
-two it builds, and defaults to `Array` when its own body does not say:
+A binding that is generalized, such as a function, still decides which one it
+builds, and takes the default when its own body does not say:
 
 <!-- error: expected 'Vec', found 'Array' in a function call -->
 ```kotlin

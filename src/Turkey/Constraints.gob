@@ -3630,8 +3630,9 @@ fun isArrayLiteralDemand(c : PredCell) -> Bool =
 --
 -- Haskell's defaulting, for the same reason: the variable is ambiguous -- it
 -- appears in no type being generalized, so no use site can pin it and no scheme
--- can carry it. The choice is the set's first member in `Ty.literalOrder`:
--- the head of the numeric tower for a numeral, `Array` for an array literal.
+-- can carry it. A numeral takes the set's first member in `Ty.literalOrder`,
+-- the head of the numeric tower. An array literal takes the first member that
+-- satisfies its class constraints (`defaultArrayLiteral`).
 --
 -- Only `OneOf` defaults. A stranded `HasField` is a genuine error: there is no
 -- preferred record type to guess.
@@ -3639,20 +3640,128 @@ fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
     var progress = False
     for c in stuck {
         if c.pred.name == oneOf && undecided(c) {
-            let names = setNames(c.pred.args[1], c.span)
-            var chosen = False
-            for n in Ty.literalOrder() {
-                if Array.contains(names, n) && !chosen {
-                    Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, n), c.span,
-                             c.context, families(s))
-                    chosen = True
-                    progress = True
+            if isArrayLiteralDemand(c) {
+                if defaultArrayLiteral(s, c, stuck) { progress = True }
+            } else {
+                let names = setNames(c.pred.args[1], c.span)
+                var chosen = False
+                for n in Ty.literalOrder() {
+                    if Array.contains(names, n) && !chosen {
+                        Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, n), c.span,
+                                 c.context, families(s))
+                        chosen = True
+                        progress = True
+                    }
                 }
             }
         }
     }
     progress
 }
+
+-- Decides the container of the array literal whose demand is `c`, and returns
+-- whether it did.
+--
+-- This is the Haskell 2010 Report's rule (section 4.3.4, "Ambiguous Types, and
+-- Defaults for Overloaded Numeric Operations"): "each defaultable variable is
+-- replaced by the first type in the default list that is an instance of all
+-- the ambiguous variable's classes", and it is a static error if there is
+-- none. GHC implements it in `GHC.Tc.Solver.Default`: `findDefaultableGroups`
+-- collects the unary constraints `C v` on each variable, and `tryDefaultGroup`
+-- tries each default type in order, keeping the first under which those
+-- constraints solve. Here the default list is the literal's set, in
+-- `Ty.literalOrder`: `Array`, `Vec`, `FrozenArray`.
+--
+-- The conditions under which a variable is defaultable at all are GHC's
+-- `ExtendedDefaultRules`, not the Report's, and for the reason GHC relaxes
+-- them in GHCi: the literal itself is what asks for a default, as a numeral
+-- does. So the variable may also appear in other constraints -- an equation
+-- `Index.Value t ~ a` from indexing the literal, which a container decides --
+-- and its classes need not be standard ones; those other constraints are not
+-- consulted in choosing. Requiring the Report's conditions instead would
+-- leave `let xs = [1, 2]` followed by `xs[0]` ambiguous.
+--
+-- One step deviates from GHC. `tryDefaultGroup` accepts a candidate only if
+-- solving the constraints leaves nothing, and the Report's defaults are nullary
+-- types whose instances have no context, for which the two coincide. A
+-- container is applied to the literal's element, so its instance can have a
+-- context about the element (`Hash (FrozenArray a) : Hash a`). That context
+-- constrains the element's own variable, which may not be decided yet -- it is
+-- often a numeral, defaulted in this same round. So a candidate is accepted
+-- when an instance of each class matches it, and the instance's context is left
+-- to the solver, which reports it at the use as it would without a default.
+--
+-- When no container has every class, nothing is chosen. The literal is
+-- reported once, and its demand is absorbed, so that neither a later round
+-- nor the classes left open report it again.
+fun defaultArrayLiteral(s : Solver, c : PredCell, stuck : Vec PredCell) -> Bool {
+    let t = Ty.prune(c.pred.args[0])
+    let names = setNames(c.pred.args[1], c.span)
+    let classes = literalClasses(s, t, stuck)
+    let missing = []
+    for n in Ty.literalOrder() {
+        if Array.contains(names, n) {
+            let candidate = memberType(c.pred, n)
+            match Iter.find(classes, fun(cls) = !hasInstance(s, cls, candidate)) {
+                None -> {
+                    Ty.unify(t, candidate, c.span, c.context, families(s))
+                    return True
+                }
+                Some(cls) -> Vec.push(missing, "'" + Ty.display(n) + "' has no '"
+                                               + Ty.shortName(cls) + "'")
+            }
+        }
+    }
+    let quoted = Array.map(classes, fun(cls) = "'" + Ty.shortName(cls) + "'")
+    let needed = match len(quoted) {
+        1 -> quoted[0]
+        2 -> "both " + quoted[0] + " and " + quoted[1]
+        _ -> "all of " + String.join(Array.slice(quoted, 0, len(quoted) - 1), ", ")
+             + " and " + quoted[len(quoted) - 1]
+    }
+    Ty.typeError("no container this array literal could be has " + needed + ": "
+                 + String.join(Vec.toArray(missing), ", "), c.span)
+    c.pred = Ty.pred(oneOf, [TBottom, c.pred.args[1], c.pred.args[2]])
+    False
+}
+
+-- The classes of the wanted constraints `C t` on the type `t` of an array
+-- literal, each once, in the order the constraints were first left open: the
+-- ambiguous variable's classes, in the Report's words.
+--
+-- Only a constraint whose one argument is `t` itself counts, as only `C v`
+-- counts in the Report: `Show (Option t)` constrains `t` only through an
+-- instance, and is not consulted.
+--
+-- The wanteds are the ones `stuck` holds and the inert ones that mention
+-- `t`'s variables. Both are needed: generalization takes the predicates it
+-- splits out of the inert sets before defaulting them (`split`), and the
+-- outermost boundary hands over every open cell (`defaultOnce`).
+fun literalClasses(s : Solver, t : Ty.Type, stuck : Vec PredCell) -> Array String {
+    let seen = Set.new()
+    let found = []
+    let consider = fun(w : PredCell) {
+        let name = w.pred.name
+        if len(w.pred.args) == 1 && Classes.isClass(s.classes, name)
+           && !Classes.isGenerated(name) && !Set.contains(seen, name)
+           && Ty.sameType(Ty.prune(w.pred.args[0]), t) {
+            Set.add(seen, name)
+            Vec.push(found, name)
+        }
+    }
+    for w in stuck { consider(w) }
+    for v in Ty.varsOf([t]) {
+        for w in Map.getOr(s.watchers, v.id, []) {
+            if resting(w) { consider(w) }
+        }
+    }
+    Vec.toArray(found)
+}
+
+-- Returns whether an instance of `cls` matches `t`, without solving its
+-- context.
+fun hasInstance(s : Solver, cls : String, t : Ty.Type) -> Bool =
+    Option.isSome(Classes.selectInstance(s.classes, Ty.pred(cls, [t])))
 
 -- Solves each equality of `open` that is stuck only because a variable on
 -- one side is untouchable where it is, by binding that variable, and returns

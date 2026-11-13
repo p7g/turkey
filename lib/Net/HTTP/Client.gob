@@ -6,109 +6,109 @@ export (
     redirect, expectStatus, hostField, contentLength, retryAllowed,
 )
 
--- An HTTP/1.1 client: requests sent over a pool of connections, each one
--- reaching only what a `ConnectPolicy` allows.
---
---     let c = Client.client(Client.defaultConfig)?
---     send(c, request(GET, "https://api.example.com/users/1"), Duration.seconds(10), fun(resp) {
---         expectStatus(resp, OK)?
---         receive(resp.body, 1048576)
---     })
---
--- **The response is the callback's.** `send` calls `use` with the response
--- once its head has arrived, and the body can be read only inside `use`.
--- When `use` returns, what it left unread is read and thrown away if that is
--- cheap (the limits' `drainBytes`), so the connection can carry the next request;
--- otherwise the connection is closed. A body read after `use` returned fails
--- with `Transport` of an `IOError` whose kind is `Closed`. `use`'s result,
--- and its error, are `send`'s.
---
--- **Every head, pulled.** `exchange` calls `use` with the exchange instead,
--- and `next` returns each head the server responds with: every interim (1xx)
--- response as `Informational`, then the final one as `Final`, whose body is
--- read as `send`'s is. A proxy relays a 103 that way. `send` is `exchange`
--- with the interim responses skipped. A 100 Continue is never returned: the
--- server sends it in response to the client's own `Expect`. A server may
--- send at most 16 interim responses before the final one; more, or a 101 to
--- a request that asked for no upgrade, is `BadResponse`.
---
--- **Errors** come back through `FromHTTP`, so `?` lifts them into the
--- caller's own error type. A request that got no response is `SendFailed`
--- of a `ClientError`, which records whether the server may have seen it:
--- `NotSent`, `MaybeSent` or `BadResponse`.
---
--- **Deadlines.** The timeout covers everything: resolving, connecting, the
--- TLS handshake, sending, the response's heads, every redirect `send`
--- follows, the one retry, and each read of the body inside `use`. The
--- `...Unbounded` calls have no total limit, for a transfer whose length
--- cannot be known ahead. Two limits hold for both: resolving, connecting and
--- the handshake together within the connect limit (30 s), and the limits'
--- `stall` (30 s), which closes a connection on which a read or write has waited
--- that long while no byte moved either way. A deadline that passes part-way
--- through a message closes the connection.
---
--- **Connections** are pooled per origin -- scheme, host and port -- and a
--- connection is reused only once both directions ended exactly: the request
--- was written whole, and its response was read to its exact end with
--- nothing after it. A byte past the end would be read as the next response,
--- so a connection that has one is closed. Up to 64 idle connections are kept
--- per origin and 100 in all, the oldest closed first past that, each for up
--- to the limits' `idleTimeout` (60 s). A `Client` is safe to share between
--- tasks.
---
--- **One retry.** A pooled connection may be stale: closed by the server
--- while it was idle, which the client learns only by using it, when it
--- ends before any byte of a response. Then the request is sent once more
--- on a new connection, if it is safe to: it was `NotSent`, or it was
--- `MaybeSent` and its method is idempotent or it has an `Idempotency-Key`;
--- and its body can be sent again. Nothing else is retried.
---
--- **Redirects** are responses like any other: a 3xx reaches `use` as it is.
--- `redirect(resp, req)` builds the request that follows one, under the rules
--- its comment gives, so a program that must see each hop loops itself.
--- A client built with `follow(n)` has `send` run that loop for up to `n` hops; the hop
--- past `n` is `NotSent(BadRedirect(TooManyRedirects))`, and one `redirect`
--- refuses for a reason other than `NotRedirect`, `NoLocation` or
--- `NotReplayable` is `NotSent(BadRedirect(...))`. Each hop goes through
--- `Net.resolve` and the policy again, as any request does. A response's
--- `url` is the URL it came from, and its `timings` how long each step of its
--- hop took.
---
--- **Upgrades.** `sendUpgrade` offers to switch the connection to another
--- protocol (WebSocket, for one), and on a 101 hands `use` the connection as a
--- `Duplex`: bytes the server sent after its 101 are read first, and
--- `shutdownWrite` ends this side's output while the server goes on. A 101
--- must name only protocols the request offered, or it is `BadResponse`. The
--- timeout ends with the 101; after it, the new protocol keeps its own time,
--- with the deadlines `use` sets, and the stall limit no longer applies. The
--- connection is closed when `use` returns, never pooled. A proxy calls the
--- server's `switch` inside `use`, so both connections close together.
---
--- **Bodies.** A request's method carries its body as a `Payload`, made by
--- `newPOST`, `newPUT`, `newPATCH` or `newExtension` from any `Body`
--- (`Net.HTTP.Body`), which holds its length and whether it can be sent
--- again. A `Stream` body sends the trailers its function returns, and a
--- relayed `Incoming` the trailers it came with. A body that fails, or does
--- not match the length it declared, fails the request, and the connection
--- is closed. A response's trailers are `trailers(resp.body)` once its body
--- has been read to the end.
---
--- **On the wire.** HTTP/1.1, one request at a time per connection, never
--- pipelined. The client writes `Host` (`hostField`), the framing
--- (`Content-Length` from the body's length, `contentLength`, or chunked when
--- it has none), `Expect: 100-continue`, and nothing else of its own. A
--- request body is written by a task of its own while the response is read,
--- so a response the server sends before reading the whole body (a 413) is
--- read.
--- TLS offers ALPN `http/1.1`.
---
--- **`Expect: 100-continue`** goes with a body of 1 MiB or more, and with a
--- relayed `Incoming` whose sender waits for a 100 itself. The body is sent
--- once the server's 100 arrives, or after 1 s without one; a final response
--- first means it is not sent, and the connection is closed. A relayed body
--- is read only when it is sent, and that first read is what sends its
--- sender's 100, so a server's refusal reaches the sender before it has sent
--- a byte.
+--- An HTTP/1.1 client: requests sent over a pool of connections, each one
+--- reaching only what a `ConnectPolicy` allows.
+---
+---     let c = Client.client(Client.defaultConfig)?
+---     send(c, request(GET, "https://api.example.com/users/1"), Duration.seconds(10), fun(resp) {
+---         expectStatus(resp, OK)?
+---         receive(resp.body, 1048576)
+---     })
+---
+--- **The response is the callback's.** `send` calls `use` with the response
+--- once its head has arrived, and the body can be read only inside `use`.
+--- When `use` returns, what it left unread is read and thrown away if that is
+--- cheap (the limits' `drainBytes`), so the connection can carry the next request;
+--- otherwise the connection is closed. A body read after `use` returned fails
+--- with `Transport` of an `IOError` whose kind is `Closed`. `use`'s result,
+--- and its error, are `send`'s.
+---
+--- **Every head, pulled.** `exchange` calls `use` with the exchange instead,
+--- and `next` returns each head the server responds with: every interim (1xx)
+--- response as `Informational`, then the final one as `Final`, whose body is
+--- read as `send`'s is. A proxy relays a 103 that way. `send` is `exchange`
+--- with the interim responses skipped. A 100 Continue is never returned: the
+--- server sends it in response to the client's own `Expect`. A server may
+--- send at most 16 interim responses before the final one; more, or a 101 to
+--- a request that asked for no upgrade, is `BadResponse`.
+---
+--- **Errors** come back through `FromHTTP`, so `?` lifts them into the
+--- caller's own error type. A request that got no response is `SendFailed`
+--- of a `ClientError`, which records whether the server may have seen it:
+--- `NotSent`, `MaybeSent` or `BadResponse`.
+---
+--- **Deadlines.** The timeout covers everything: resolving, connecting, the
+--- TLS handshake, sending, the response's heads, every redirect `send`
+--- follows, the one retry, and each read of the body inside `use`. The
+--- `...Unbounded` calls have no total limit, for a transfer whose length
+--- cannot be known ahead. Two limits hold for both: resolving, connecting and
+--- the handshake together within the connect limit (30 s), and the limits'
+--- `stall` (30 s), which closes a connection on which a read or write has waited
+--- that long while no byte moved either way. A deadline that passes part-way
+--- through a message closes the connection.
+---
+--- **Connections** are pooled per origin -- scheme, host and port -- and a
+--- connection is reused only once both directions ended exactly: the request
+--- was written whole, and its response was read to its exact end with
+--- nothing after it. A byte past the end would be read as the next response,
+--- so a connection that has one is closed. Up to 64 idle connections are kept
+--- per origin and 100 in all, the oldest closed first past that, each for up
+--- to the limits' `idleTimeout` (60 s). A `Client` is safe to share between
+--- tasks.
+---
+--- **One retry.** A pooled connection may be stale: closed by the server
+--- while it was idle, which the client learns only by using it, when it
+--- ends before any byte of a response. Then the request is sent once more
+--- on a new connection, if it is safe to: it was `NotSent`, or it was
+--- `MaybeSent` and its method is idempotent or it has an `Idempotency-Key`;
+--- and its body can be sent again. Nothing else is retried.
+---
+--- **Redirects** are responses like any other: a 3xx reaches `use` as it is.
+--- `redirect(resp, req)` builds the request that follows one, under the rules
+--- its comment gives, so a program that must see each hop loops itself.
+--- A client built with `follow(n)` has `send` run that loop for up to `n` hops; the hop
+--- past `n` is `NotSent(BadRedirect(TooManyRedirects))`, and one `redirect`
+--- refuses for a reason other than `NotRedirect`, `NoLocation` or
+--- `NotReplayable` is `NotSent(BadRedirect(...))`. Each hop goes through
+--- `Net.resolve` and the policy again, as any request does. A response's
+--- `url` is the URL it came from, and its `timings` how long each step of its
+--- hop took.
+---
+--- **Upgrades.** `sendUpgrade` offers to switch the connection to another
+--- protocol (WebSocket, for one), and on a 101 hands `use` the connection as a
+--- `Duplex`: bytes the server sent after its 101 are read first, and
+--- `shutdownWrite` ends this side's output while the server goes on. A 101
+--- must name only protocols the request offered, or it is `BadResponse`. The
+--- timeout ends with the 101; after it, the new protocol keeps its own time,
+--- with the deadlines `use` sets, and the stall limit no longer applies. The
+--- connection is closed when `use` returns, never pooled. A proxy calls the
+--- server's `switch` inside `use`, so both connections close together.
+---
+--- **Bodies.** A request's method carries its body as a `Payload`, made by
+--- `newPOST`, `newPUT`, `newPATCH` or `newExtension` from any `Body`
+--- (`Net.HTTP.Body`), which holds its length and whether it can be sent
+--- again. A `Stream` body sends the trailers its function returns, and a
+--- relayed `Incoming` the trailers it came with. A body that fails, or does
+--- not match the length it declared, fails the request, and the connection
+--- is closed. A response's trailers are `trailers(resp.body)` once its body
+--- has been read to the end.
+---
+--- **On the wire.** HTTP/1.1, one request at a time per connection, never
+--- pipelined. The client writes `Host` (`hostField`), the framing
+--- (`Content-Length` from the body's length, `contentLength`, or chunked when
+--- it has none), `Expect: 100-continue`, and nothing else of its own. A
+--- request body is written by a task of its own while the response is read,
+--- so a response the server sends before reading the whole body (a 413) is
+--- read.
+--- TLS offers ALPN `http/1.1`.
+---
+--- **`Expect: 100-continue`** goes with a body of 1 MiB or more, and with a
+--- relayed `Incoming` whose sender waits for a 100 itself. The body is sent
+--- once the server's 100 arrives, or after 1 s without one; a final response
+--- first means it is not sent, and the connection is closed. A relayed body
+--- is read only when it is sent, and that first read is what sends its
+--- sender's 100, so a server's refusal reaches the sender before it has sent
+--- a byte.
 
 import Data.Error as Error
 import Data.Error (promote)
@@ -163,13 +163,13 @@ import URL as URL
 
 -- -- configuration ----------------------------------------------------------------------
 
--- Overrides of a client's settings, each one `None` to keep the default. A
--- monoid: `defaultConfig` changes nothing, and `a <> b` takes each
--- setting from `b` where `b` sets it and from `a` where it does not, so
--- settings can be named, kept and combined in any grouping. Each function
--- below returns a `Config` that sets one thing, and has the name of the
--- field it sets. `limits` is itself a set of overrides, which combine the
--- same way.
+--- Overrides of a client's settings, each one `None` to keep the default. A
+--- monoid: `defaultConfig` changes nothing, and `a <> b` takes each
+--- setting from `b` where `b` sets it and from `a` where it does not, so
+--- settings can be named, kept and combined in any grouping. Each function
+--- below returns a `Config` that sets one thing, and has the name of the
+--- field it sets. `limits` is itself a set of overrides, which combine the
+--- same way.
 type Config = Config {
     policy        : Option ConnectPolicy
     limits        : Limits
@@ -180,7 +180,7 @@ type Config = Config {
     idleTotal     : Option Int
 }
 
--- The `Config` that sets nothing, so that every setting has its default.
+--- The `Config` that sets nothing, so that every setting has its default.
 let defaultConfig = Config {
     policy = None
     limits = Limits.empty
@@ -205,9 +205,9 @@ instance Semigroup Config {
 
 instance Monoid Config { fun empty() = defaultConfig }
 
--- Returns a `Config` that connects only where `p` allows. The default is
--- `Net.publicInternet`, so that a client reaches a loopback or private
--- address only where a program allows it.
+--- Returns a `Config` that connects only where `p` allows. The default is
+--- `Net.publicInternet`, so that a client reaches a loopback or private
+--- address only where a program allows it.
 fun policy(p : ConnectPolicy) -> Config = Config {
     policy = Some(p)
     limits = Limits.empty
@@ -218,11 +218,11 @@ fun policy(p : ConnectPolicy) -> Config = Config {
     idleTotal = None
 }
 
--- Returns a `Config` that reads responses under `l`'s overrides of the
--- limits. Of the limits, the client uses the head, line, chunk-line, trailer
--- and drain sizes; `stall`, for each read and write; and `idleTimeout`, for
--- how long a pooled connection is kept. Combining two such `Config`s
--- combines their limits.
+--- Returns a `Config` that reads responses under `l`'s overrides of the
+--- limits. Of the limits, the client uses the head, line, chunk-line, trailer
+--- and drain sizes; `stall`, for each read and write; and `idleTimeout`, for
+--- how long a pooled connection is kept. Combining two such `Config`s
+--- combines their limits.
 fun limits(l : Limits) -> Config = Config {
     policy = None
     limits = l
@@ -233,8 +233,8 @@ fun limits(l : Limits) -> Config = Config {
     idleTotal = None
 }
 
--- Returns a `Config` that trusts `r` rather than the system's roots: a
--- test's own CA, or a service's.
+--- Returns a `Config` that trusts `r` rather than the system's roots: a
+--- test's own CA, or a service's.
 fun roots(r : Roots) -> Config = Config {
     policy = None
     limits = Limits.empty
@@ -245,8 +245,8 @@ fun roots(r : Roots) -> Config = Config {
     idleTotal = None
 }
 
--- Returns a `Config` under which `send` follows up to `n` redirects per
--- request. The default is 0. Panics if `n` is negative.
+--- Returns a `Config` under which `send` follows up to `n` redirects per
+--- request. The default is 0. Panics if `n` is negative.
 fun follow(n : Int) -> Config {
     if n < 0 {
         error("Client.follow: redirect count " + Int.toString(n) + " cannot be negative")
@@ -262,8 +262,8 @@ fun follow(n : Int) -> Config {
     }
 }
 
--- Returns a `Config` that allows `d` for resolving, connecting and the TLS
--- handshake together. The default is 30 s. Panics if `d` is not positive.
+--- Returns a `Config` that allows `d` for resolving, connecting and the TLS
+--- handshake together. The default is 30 s. Panics if `d` is not positive.
 fun connectLimit(d : Duration) -> Config {
     if Duration.toNanos(d) <= 0 {
         error("Client.connectLimit: connect limit " + show(d) + " must be positive")
@@ -279,8 +279,8 @@ fun connectLimit(d : Duration) -> Config {
     }
 }
 
--- Returns a `Config` that keeps up to `n` idle connections per origin; 0
--- keeps none. The default is 64. Panics if `n` is negative.
+--- Returns a `Config` that keeps up to `n` idle connections per origin; 0
+--- keeps none. The default is 64. Panics if `n` is negative.
 fun idlePerOrigin(n : Int) -> Config {
     if n < 0 {
         error("Client.idlePerOrigin: idle connection count " + Int.toString(n) + " cannot be negative")
@@ -296,9 +296,9 @@ fun idlePerOrigin(n : Int) -> Config {
     }
 }
 
--- Returns a `Config` that keeps up to `n` idle connections in all, across
--- every origin, closing the oldest past it; 0 keeps none. The default is
--- 100. Panics if `n` is negative.
+--- Returns a `Config` that keeps up to `n` idle connections in all, across
+--- every origin, closing the oldest past it; 0 keeps none. The default is
+--- 100. Panics if `n` is negative.
 fun idleTotal(n : Int) -> Config {
     if n < 0 {
         error("Client.idleTotal: idle connection count " + Int.toString(n) + " cannot be negative")
@@ -361,9 +361,9 @@ type Client = Client {
 -- it.
 let keptBuffers = 64
 
--- Returns a client with `c`'s settings, and the defaults for those it does
--- not set, or why its TLS configuration cannot be made: a roots file that
--- does not load.
+--- Returns a client with `c`'s settings, and the defaults for those it does
+--- not set, or why its TLS configuration cannot be made: a roots file that
+--- does not load.
 fun client(c : Config) -> Either TLSError Client {
     let s = settings(c)
     let tls = TLS.clientConfig(s.roots, ["http/1.1"])?
@@ -375,26 +375,26 @@ fun client(c : Config) -> Either TLSError Client {
     })
 }
 
--- Closes the client's idle connections and frees its TLS configuration. A
--- request in flight finishes; one sent later fails.
+--- Closes the client's idle connections and frees its TLS configuration. A
+--- request in flight finishes; one sent later fails.
 fun close(c : Client) -> Unit {
     Pool.closeIdle(c.pool)
     TLS.releaseClient(c.tls)
 }
 
--- Returns `Right(())` if the response's status is `status`, and otherwise
--- `UnexpectedStatus` with the status it has.
+--- Returns `Right(())` if the response's status is `status`, and otherwise
+--- `UnexpectedStatus` with the status it has.
 fun expectStatus[FromHTTP e](r : Response b, status : Status) -> Either e Unit =
     if r.status == status { Right(()) } else { Left(fromHTTP(UnexpectedStatus(r.status))) }
 
--- Returns the `Host` value the client writes for a request to `u`, for a
--- program that signs the request's fields.
+--- Returns the `Host` value the client writes for a request to `u`, for a
+--- program that signs the request's fields.
 fun hostField(u : HTTPURL) -> String = Output.hostField(u)
 
--- Returns the `Content-Length` the client writes for `req`'s body, for a
--- program that signs the request's fields: `None` if its method has no body
--- or the body's length is not known before it is sent, and so it goes
--- chunked.
+--- Returns the `Content-Length` the client writes for `req`'s body, for a
+--- program that signs the request's fields: `None` if its method has no body
+--- or the body's length is not known before it is sent, and so it goes
+--- chunked.
 fun contentLength(req : ClientRequest Payload) -> Either HTTPError (Option Int) = match Method.body(req.method) {
     Some(p) -> match Stream.length(Payload.open(p)?) {
         LengthKnown(n) -> Right(Some(n))
@@ -405,51 +405,51 @@ fun contentLength(req : ClientRequest Payload) -> Either HTTPError (Option Int) 
 
 -- -- sending ----------------------------------------------------------------------------
 
--- A head the server sent in response to a request: an interim (1xx) one, of
--- which there may be several, or the final response.
+--- A head the server sent in response to a request: an interim (1xx) one, of
+--- which there may be several, or the final response.
 type Received = Informational(Status, Headers) | Final(Response Incoming)
 
--- Sends `req` and calls `use` with the exchange, from which `next` reads
--- each head the server responds with, everything within `timeout`. See the
--- module comment.
+--- Sends `req` and calls `use` with the exchange, from which `next` reads
+--- each head the server responds with, everything within `timeout`. See the
+--- module comment.
 fun exchange[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, timeout : d,
                                      use : fun(Exchange) -> Either e a) -> Either e a =
     exchangeWithin(c, req, Some(deadline(timeout)), use)
 
--- `exchange` with no total limit: only the connect limit and the stall
--- limit.
+--- `exchange` with no total limit: only the connect limit and the stall
+--- limit.
 fun exchangeUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload,
                                   use : fun(Exchange) -> Either e a) -> Either e a =
     exchangeWithin(c, req, None, use)
 
--- Sends `req` and calls `use` with its final response, everything within
--- `timeout`. Interim (1xx) responses are skipped, and redirects followed as
--- far as the client's `follow` allows. See the module comment.
+--- Sends `req` and calls `use` with its final response, everything within
+--- `timeout`. Interim (1xx) responses are skipped, and redirects followed as
+--- far as the client's `follow` allows. See the module comment.
 fun send[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, timeout : d,
                                  use : fun(Response Incoming) -> Either e a) -> Either e a =
     sendWithin(c, req, Some(deadline(timeout)), use)
 
--- `send` with no total limit: only the connect limit and the stall limit.
+--- `send` with no total limit: only the connect limit and the stall limit.
 fun sendUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload,
                               use : fun(Response Incoming) -> Either e a) -> Either e a =
     sendWithin(c, req, None, use)
 
--- Sends `req` offering to switch its connection to one of `protocols`, in
--- order of preference, and calls `use` with the final response and the
--- switched connection. A 101 is the switch: `use` reads and writes the new
--- protocol through the `Duplex`, and the connection is closed when `use`
--- returns. Any other final response reaches `use` as `send`'s would, with
--- a duplex whose every read and write fails with an `IOError` of kind
--- `Closed`.
--- `timeout` covers everything up to the final response's head; the duplex is
--- bounded only by the deadlines `use` sets on it. Panics if `protocols` is
--- empty.
+--- Sends `req` offering to switch its connection to one of `protocols`, in
+--- order of preference, and calls `use` with the final response and the
+--- switched connection. A 101 is the switch: `use` reads and writes the new
+--- protocol through the `Duplex`, and the connection is closed when `use`
+--- returns. Any other final response reaches `use` as `send`'s would, with
+--- a duplex whose every read and write fails with an `IOError` of kind
+--- `Closed`.
+--- `timeout` covers everything up to the final response's head; the duplex is
+--- bounded only by the deadlines `use` sets on it. Panics if `protocols` is
+--- empty.
 fun sendUpgrade[Timeout d, FromHTTP e](c : Client, req : ClientRequest Payload, protocols : Array Token, timeout : d,
                                         use : fun(Response Incoming, Duplex) -> Either e a) -> Either e a =
     upgradeWithin(c, req, offer(protocols, "sendUpgrade"), Some(deadline(timeout)), use)
 
--- `sendUpgrade` with no limit on reaching the final response but the
--- connect limit and the stall limit. Panics if `protocols` is empty.
+--- `sendUpgrade` with no limit on reaching the final response but the
+--- connect limit and the stall limit. Panics if `protocols` is empty.
 fun sendUpgradeUnbounded[FromHTTP e](c : Client, req : ClientRequest Payload, protocols : Array Token,
                                      use : fun(Response Incoming, Duplex) -> Either e a) -> Either e a =
     upgradeWithin(c, req, offer(protocols, "sendUpgradeUnbounded"), None, use)
@@ -628,10 +628,10 @@ fun sendHop[FromHTTP e](c : Client, h : Hop, total : Option Deadline,
         }
     }
 
--- Returns whether the client sends `req` again after it failed with `e` on a
--- stale connection: when sending it again cannot repeat an effect, because
--- none of it was sent, or its method is idempotent, or it has an
--- `Idempotency-Key`; and its body, if it has one, can be sent again.
+--- Returns whether the client sends `req` again after it failed with `e` on a
+--- stale connection: when sending it again cannot repeat an effect, because
+--- none of it was sent, or its method is idempotent, or it has an
+--- `Idempotency-Key`; and its body, if it has one, can be sent again.
 fun retryAllowed(e : ClientError, req : ClientRequest Payload) -> Bool = mayRetry(e, req.method, req.headers)
 
 fun mayRetry(e : ClientError, m : Method Payload, headers : Headers) -> Bool {
@@ -656,7 +656,7 @@ fun origin(u : HTTPURL) -> String =
     (if HTTPURL.isHTTPS(u) { "https://" } else { "http://" }) + HTTPURL.host(u) + ":"
         + Int.toString(HTTPURL.port(u))
 
--- One request on one connection, and the heads read in response to it.
+--- One request on one connection, and the heads read in response to it.
 type Exchange = Exchange {
     client      : Client
     hop         : Hop
@@ -990,10 +990,10 @@ fun failWith(ex : Exchange, e : ClientError) -> HTTPError {
     }
 }
 
--- Returns the next head the server sent in response to the exchange's
--- request: each interim (1xx) one, then the final response. After the final
--- one, and once the exchange's callback has returned, fails with `Transport`
--- of an `IOError` whose kind is `Closed`.
+--- Returns the next head the server sent in response to the exchange's
+--- request: each interim (1xx) one, then the final response. After the final
+--- one, and once the exchange's callback has returned, fails with `Transport`
+--- of an `IOError` whose kind is `Closed`.
 fun next[FromHTTP e](ex : Exchange) -> Either e Received {
     let Reading = ex.state else {
         return Left(fromHTTP(closed()))
@@ -1150,19 +1150,19 @@ instance Read Scoped {
 
 -- -- redirects --------------------------------------------------------------------------
 
--- Returns the request that follows the redirect `resp` to `from`, or why
--- there is none:
---
--- * a 301, 302 or 303 becomes a GET without a body, unless `from` is a GET
---   or a HEAD, which stays as it is; a 307 or 308 keeps the method and the
---   body, and is `NotReplayable` if the body cannot be sent again;
--- * the target is `Location` resolved against `resp.url`, and must be
---   `http` or `https`, and not `http` after `https`;
--- * `Authorization`, `Cookie` and `Proxy-Authorization` are dropped when the
---   scheme, host or port changes, and `Content-Type` with the body.
---
--- The request it returns is sent through the client's `ConnectPolicy` like
--- any other.
+--- Returns the request that follows the redirect `resp` to `from`, or why
+--- there is none:
+---
+--- * a 301, 302 or 303 becomes a GET without a body, unless `from` is a GET
+---   or a HEAD, which stays as it is; a 307 or 308 keeps the method and the
+---   body, and is `NotReplayable` if the body cannot be sent again;
+--- * the target is `Location` resolved against `resp.url`, and must be
+---   `http` or `https`, and not `http` after `https`;
+--- * `Authorization`, `Cookie` and `Proxy-Authorization` are dropped when the
+---   scheme, host or port changes, and `Content-Type` with the body.
+---
+--- The request it returns is sent through the client's `ConnectPolicy` like
+--- any other.
 fun redirect(resp : Response b, from : ClientRequest Payload) -> Either RedirectRefused (ClientRequest Payload) {
     let h = redirectHop(resp, Hop {
         method = from.method

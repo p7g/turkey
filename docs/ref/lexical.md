@@ -63,9 +63,10 @@ documented
 ```
 
 A doc comment anywhere else documents nothing, and is an ordinary comment: one
-cut off from its declaration by a blank line, a second run before the first
-declaration, one above a statement in a body, or one that follows code on its
-line.
+cut off from its declaration by a blank line, a run between the module's
+comment and its first declaration that is not directly above that declaration,
+one above a statement in a body, or one that follows code on its line. A run
+of bare `---` lines says nothing, and documents nothing either.
 
 ## Identifiers
 

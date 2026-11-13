@@ -123,6 +123,43 @@ fun main() {
 }
 ```
 
+`Int.floorDiv` is the quotient that pairs with `Int.mod`, rounding toward
+negative infinity, and `Int.divMod` returns both. `Int.gcd` and `Int.lcm` are
+never negative, `Int.pow` and `Int.powMod` raise to a power (a negative
+exponent panics, and `pow` panics on overflow like `*`; `powMod` never
+overflows), and `Int.isqrt` is the floor of the square root. `Int.countOnes`,
+`Int.leadingZeros` and `Int.trailingZeros` count the bits of the 64-bit
+representation. `Int.parseRadix` and `Int.toStringRadix` read and write a
+number in a base from 2 to 36, with letters for the digits above 9; a base
+outside that range panics.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Int.divMod(-7, 2))
+    print(Int.gcd(12, 18))
+    print(Int.lcm(4, 6))
+    print(Int.pow(2, 10))
+    print(Int.powMod(3, 200, 13))
+    print(Int.isqrt(99))
+    print(Int.countOnes(255))
+    print(Int.parseRadix("ff", 16))
+    print(Int.toStringRadix(255, 2))
+}
+```
+
+```text
+(-4, 1)
+6
+12
+1024
+9
+9
+8
+Some(255)
+11111111
+```
+
 ### Float
 
 A `Float` is an IEEE 754 binary64 number, and arithmetic on it follows IEEE
@@ -323,6 +360,24 @@ Some('B')
 None
 ```
 
+`Char.digitValue` reads a decimal digit, and `Char.digitValueRadix` a digit in a
+base from 2 to 36, where `a` to `z` in either case are 10 to 35:
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Char.digitValue('7'))
+    print(Char.digitValue('x'))
+    print(Char.digitValueRadix('f', 16))
+}
+```
+
+```text
+Some(7)
+None
+Some(15)
+```
+
 A `Char` is not always what a reader would call a character. `é` can be one
 scalar value, or two: `e` followed by a combining accent.
 
@@ -380,6 +435,32 @@ fun main() {
 Some("Hé")
 hé
 ```
+
+`String.toCodePoints` returns the scalar values of a string in a new
+`Array Char`, such as one row of a grid, and `String.fromCodePoints` builds a
+string from any iterator of `Char`. `String.padStart` and `String.padEnd`
+extend a string to a width, counted in scalar values, with a fill `Char`, and
+leave a string that is already wide enough as it is:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let row = String.toCodePoints("#.#")
+    row[1] = '@'
+    print(String.fromCodePoints(row))
+    print(String.padStart("42", 5, '0'))
+    print(String.padEnd("ab", 4, '.') + "|")
+}
+```
+
+```text
+#@#
+00042
+ab..|
+```
+
+Padding does not know about a sign: `String.padStart("-42", 6, '0')` is
+`000-42`.
 
 Comparing bytes is the same as comparing scalar values, one after another, and
 nothing more. `==` does not normalize, so two strings that display the same

@@ -237,7 +237,8 @@ def link(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
     `toolchain.openssl_libraries()` for a program that imports `Net.TLS`."""
     obj = output.with_name(output.name + ".o")
     compiled = subprocess.run(
-        toolchain.command(binary(), "build", "-o", str(obj), *flags, str(entry)),
+        toolchain.command(binary(), "build", "-f", "obj", "-o", str(obj), *flags,
+                          str(entry)),
         cwd=cwd, env=env, capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
     linked = subprocess.run([*toolchain.cc(), "-o", str(output), str(obj),

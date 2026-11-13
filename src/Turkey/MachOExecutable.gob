@@ -1,74 +1,74 @@
 export (executableFile)
 
--- An assembled arm64 module as a Mach-O executable (`MH_EXECUTE`), signed
--- and ready to run, linked against libSystem and the libraries its imports
--- come from.
---
--- **Layout.** Five segments, each a whole number of 16KB pages, the arm64
--- page size: `__PAGEZERO`, the unmapped first 4GB that catches a null
--- pointer; `__TEXT`, holding the header and load commands, then the code,
--- the import stubs, the C strings, the constants, `__unwind_info` and
--- `__eh_frame`; `__DATA_CONST`, holding the global offset table, one word
--- per import, which the loader fills in and then makes read-only; `__DATA`;
--- and `__LINKEDIT`, holding what the loader and the tools read: the bind
--- opcodes, the function starts, the symbol table, the indirect symbol table,
--- its strings, and last the code signature, which covers every byte before
--- it. Up to `__LINKEDIT` the file is laid out as the image is, so a
--- segment's file offset is its address less `__TEXT`'s.
---
--- **Debug information**, when the module has any, is a sixth segment,
--- `__DWARF`, whose sections are the module's debug sections as they are,
--- with their addresses filled in. Its bytes are in the file just before
--- `__LINKEDIT`'s, and it is never mapped: its address is `__LINKEDIT`'s, and
--- its size in memory and its protections are 0. lldb, `atos`, `sample`,
--- Instruments and crash reports read it there as they read the debug map a
--- linker leaves. It is not compressed, because none of them reads
--- compressed DWARF. `__LINKEDIT` stays last, because `strip` and
--- `codesign_allocate` refuse a file that does not end with it, and the
--- signature covers the debug information too. Nothing splits it out:
--- `dsymutil` follows only a linker's debug map, and run on this file writes
--- a dSYM with the same UUID and no DWARF, which the debuggers then prefer.
--- With the DWARF in the file, `__LINKEDIT`'s file offset is past it, and is
--- not its address less `__TEXT`'s.
---
--- **Every field is filled in here** (`Turkey.Image`), at the addresses this
--- layout gives. The image has no rebases: the loaded sections hold no
--- absolute address. A call to an imported function goes to a stub of three
--- instructions, `adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16`,
--- which jumps through that function's slot in the offset table, so that a
--- call needs one word per import bound and no code patched. The loader
--- fills the slots in from classic bind opcodes
--- (`LC_DYLD_INFO_ONLY`) rather than chained fixups: a handful of binds needs
--- no more, and every arm64 macOS reads them.
---
--- **Unwind information**, which every build carries: the compact encoding
--- of each function, from the module's `__compact_unwind` entries, in an
--- `__unwind_info` (`Turkey.UnwindInfo`), and `__eh_frame` for the functions
--- whose encoding is DWARF mode, which name their FDE by its offset in it.
--- `LC_FUNCTION_STARTS` holds the start of every function, from the named
--- symbols in the code, which is how lldb finds a function the symbol table
--- does not name; never a block or a safepoint label, which would split a
--- function in two.
---
--- **Symbols.** Every named symbol defined in the module is in the table, so
--- that `nm`, a profiler and a crash report name every function; the
--- module's exported ones as external, the rest as local. A temporary label
--- never is: with every field filled in, nothing refers to one by symbol.
--- Each import is an undefined symbol bound to the library it comes from, by
--- that library's ordinal: libSystem is the first library loaded, and the
--- others follow it by install name, one `LC_LOAD_DYLIB` each, and only if
--- something is imported from them. The order is locals, then exported, then
--- undefined, the last two by name, the undefined ones by library first, as
--- `LC_DYSYMTAB` describes it.
---
--- **Deterministic.** Nothing in the file depends on the time or the path it
--- is written to, and nothing on the host but the install names `dylibOf`
--- gives, which the caller reads from the host's libraries: the signature's
--- identifier is the caller's, from the program's own name. `LC_UUID`, which
--- the loader requires, is taken from a SHA-256 of the rest of the file, and
--- the signature is ad hoc, with no timestamp (`Turkey.CodeSignature`). So one module always writes
--- the same bytes, which is what lets the compiler's fixed point compare
--- executables.
+--- An assembled arm64 module as a Mach-O executable (`MH_EXECUTE`), signed
+--- and ready to run, linked against libSystem and the libraries its imports
+--- come from.
+---
+--- **Layout.** Five segments, each a whole number of 16KB pages, the arm64
+--- page size: `__PAGEZERO`, the unmapped first 4GB that catches a null
+--- pointer; `__TEXT`, holding the header and load commands, then the code,
+--- the import stubs, the C strings, the constants, `__unwind_info` and
+--- `__eh_frame`; `__DATA_CONST`, holding the global offset table, one word
+--- per import, which the loader fills in and then makes read-only; `__DATA`;
+--- and `__LINKEDIT`, holding what the loader and the tools read: the bind
+--- opcodes, the function starts, the symbol table, the indirect symbol table,
+--- its strings, and last the code signature, which covers every byte before
+--- it. Up to `__LINKEDIT` the file is laid out as the image is, so a
+--- segment's file offset is its address less `__TEXT`'s.
+---
+--- **Debug information**, when the module has any, is a sixth segment,
+--- `__DWARF`, whose sections are the module's debug sections as they are,
+--- with their addresses filled in. Its bytes are in the file just before
+--- `__LINKEDIT`'s, and it is never mapped: its address is `__LINKEDIT`'s, and
+--- its size in memory and its protections are 0. lldb, `atos`, `sample`,
+--- Instruments and crash reports read it there as they read the debug map a
+--- linker leaves. It is not compressed, because none of them reads
+--- compressed DWARF. `__LINKEDIT` stays last, because `strip` and
+--- `codesign_allocate` refuse a file that does not end with it, and the
+--- signature covers the debug information too. Nothing splits it out:
+--- `dsymutil` follows only a linker's debug map, and run on this file writes
+--- a dSYM with the same UUID and no DWARF, which the debuggers then prefer.
+--- With the DWARF in the file, `__LINKEDIT`'s file offset is past it, and is
+--- not its address less `__TEXT`'s.
+---
+--- **Every field is filled in here** (`Turkey.Image`), at the addresses this
+--- layout gives. The image has no rebases: the loaded sections hold no
+--- absolute address. A call to an imported function goes to a stub of three
+--- instructions, `adrp x16, slot@PAGE; ldr x16, [x16, slot@PAGEOFF]; br x16`,
+--- which jumps through that function's slot in the offset table, so that a
+--- call needs one word per import bound and no code patched. The loader
+--- fills the slots in from classic bind opcodes
+--- (`LC_DYLD_INFO_ONLY`) rather than chained fixups: a handful of binds needs
+--- no more, and every arm64 macOS reads them.
+---
+--- **Unwind information**, which every build carries: the compact encoding
+--- of each function, from the module's `__compact_unwind` entries, in an
+--- `__unwind_info` (`Turkey.UnwindInfo`), and `__eh_frame` for the functions
+--- whose encoding is DWARF mode, which name their FDE by its offset in it.
+--- `LC_FUNCTION_STARTS` holds the start of every function, from the named
+--- symbols in the code, which is how lldb finds a function the symbol table
+--- does not name; never a block or a safepoint label, which would split a
+--- function in two.
+---
+--- **Symbols.** Every named symbol defined in the module is in the table, so
+--- that `nm`, a profiler and a crash report name every function; the
+--- module's exported ones as external, the rest as local. A temporary label
+--- never is: with every field filled in, nothing refers to one by symbol.
+--- Each import is an undefined symbol bound to the library it comes from, by
+--- that library's ordinal: libSystem is the first library loaded, and the
+--- others follow it by install name, one `LC_LOAD_DYLIB` each, and only if
+--- something is imported from them. The order is locals, then exported, then
+--- undefined, the last two by name, the undefined ones by library first, as
+--- `LC_DYSYMTAB` describes it.
+---
+--- **Deterministic.** Nothing in the file depends on the time or the path it
+--- is written to, and nothing on the host but the install names `dylibOf`
+--- gives, which the caller reads from the host's libraries: the signature's
+--- identifier is the caller's, from the program's own name. `LC_UUID`, which
+--- the loader requires, is taken from a SHA-256 of the rest of the file, and
+--- the signature is ad hoc, with no timestamp (`Turkey.CodeSignature`). So one module always writes
+--- the same bytes, which is what lets the compiler's fixed point compare
+--- executables.
 
 import Hash.SHA256 as SHA256
 import Turkey.Asm as Asm
@@ -111,11 +111,11 @@ let offsetTableSegment = 2
 -- A symbol table entry before its name is placed.
 type Entry = Entry { name : String, kind : Int, section : Int, desc : Int, value : Int }
 
--- Returns `obj` as a signed executable whose code signature names it
--- `identifier`, with each of `obj.undefined` bound to the library `dylibOf`
--- maps its name to, by install name, and every other to libSystem. `entry` is
--- the symbol the program starts at, which `obj` defines. Fills in `obj`'s
--- sections in place, so `obj` is spent.
+--- Returns `obj` as a signed executable whose code signature names it
+--- `identifier`, with each of `obj.undefined` bound to the library `dylibOf`
+--- maps its name to, by install name, and every other to libSystem. `entry` is
+--- the symbol the program starts at, which `obj` defines. Fills in `obj`'s
+--- sections in place, so `obj` is spent.
 fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
                    dylibOf : Map String String) -> Array Byte {
     let sections = obj.sections

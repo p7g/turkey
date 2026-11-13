@@ -1,78 +1,78 @@
 export (program)
 
--- `?` and `do`, rewritten into `bind`.
---
--- Every other sugar in this language is a node the later stages interpret:
--- `a + b` carries the `add` it means, `for x in xs` carries its `iter` and
--- `next`. `?` cannot be one of those, because what it binds is *the rest of the
--- enclosing statement sequence*, and no node annotated in place can name that.
--- So this is a pass, and it runs early enough that nothing downstream ever sees
--- a `?`.
---
--- It runs *after* `Turkey.Resolve`, which buys two things. The code it moves
--- into lambdas has already been resolved, so moving it cannot change what a
--- name means; and the code it writes may name internal constructors directly
--- rather than going looking for surface names a module might not export.
---
--- ## What a `?` unwinds to
---
--- A **do-context** is the block a `?` unwinds to, and there are two: an
--- explicit `do { ... }`, and the body of a `fun` or lambda that contains a `?`.
--- Everything else -- `if`, `match`, a bare block -- is transparent, and a `?`
--- inside one lifts outward through it. A lambda is opaque, so a `?` in a
--- callback belongs to the callback.
---
--- A `do` with no `?` in it emits nothing whatsoever and means exactly the block
--- it wraps. That is the answer to "what monad is an empty `do`": it does not
--- have one, because it never asked for a `bind`.
---
--- ## The translation
---
--- `seq` translates a statement sequence, `expr` an expression; both take a
--- continuation from the value's tree to the rest of the program's. Straight-
--- line code comes out as exactly the chain someone would have written by hand:
---
---     do { let x = f(a?) + 1; g(x) }
---       =>  bind(a, fun(%k1) { let x = f(%k1) + 1; g(x) })
---
--- A control construct containing a `?` is *lifted* into the monad instead: each
--- branch is translated with `pure` as its continuation, and the construct as a
--- whole becomes the left argument of a `bind`. That `pure` is the one place the
--- lowering adds something the author did not write, and it is not the auto-
--- `pure` that was ruled out: the tail of a *do block* is still taken to be
--- already monadic, and a lifted branch is not a do block anyone wrote.
---
--- ## What crosses a bind
---
--- A `return`, `break` or `continue` after a `?` would land inside a generated
--- lambda, where `return` means "return from the lambda". It cannot escape
--- through the `bind` either -- escaping is not something a `bind` does, and for
--- `Array`, whose bind runs its continuation once per element, there is nothing
--- coherent for an escape to mean. So it travels as a value, in the Prelude's
--- `Flow`. A context that needs this runs in **flow mode**: every statement
--- answers with `m (Flow ...)`, the next runs only under `Fall`, and the
--- context's boundary is where `Ret` becomes a result again.
---
--- Loops are the same problem twice over: a loop's continuation is not known
--- until its body has run, so it cannot be a lambda written once. A lifted loop
--- becomes a recursive local `fun` answering with a `Flow`, where `Brk` becomes
--- the loop's own `Fall` -- which is why `let v = loop { ... break x }` still
--- works -- and `Ret` keeps travelling.
---
--- ## Two things to know before editing this pass
---
--- **One child enumerator, four scanners.** This pass asks four questions of a
--- subtree -- is it sugared, does it own a lifted loop, does control escape it,
--- does it contain one -- that differ only in where they stop, and all four walk
--- through `Turkey.Ast.children`. That makes it the file's maintenance hazard: a
--- node kind added to the tree and forgotten in the enumerator is missed by all
--- four at once, silently. Add the kind there first.
---
--- **A continuation is a variant, not a closure.** Whether a loop is in
--- statement position is decided by comparing its continuation against the
--- fall-through one, and there is no function identity to compare with. So the
--- three continuations this pass builds for itself are named constructors, which
--- also says what each one is where a closure would not.
+--- `?` and `do`, rewritten into `bind`.
+---
+--- Every other sugar in this language is a node the later stages interpret:
+--- `a + b` carries the `add` it means, `for x in xs` carries its `iter` and
+--- `next`. `?` cannot be one of those, because what it binds is *the rest of the
+--- enclosing statement sequence*, and no node annotated in place can name that.
+--- So this is a pass, and it runs early enough that nothing downstream ever sees
+--- a `?`.
+---
+--- It runs *after* `Turkey.Resolve`, which buys two things. The code it moves
+--- into lambdas has already been resolved, so moving it cannot change what a
+--- name means; and the code it writes may name internal constructors directly
+--- rather than going looking for surface names a module might not export.
+---
+--- ## What a `?` unwinds to
+---
+--- A **do-context** is the block a `?` unwinds to, and there are two: an
+--- explicit `do { ... }`, and the body of a `fun` or lambda that contains a `?`.
+--- Everything else -- `if`, `match`, a bare block -- is transparent, and a `?`
+--- inside one lifts outward through it. A lambda is opaque, so a `?` in a
+--- callback belongs to the callback.
+---
+--- A `do` with no `?` in it emits nothing whatsoever and means exactly the block
+--- it wraps. That is the answer to "what monad is an empty `do`": it does not
+--- have one, because it never asked for a `bind`.
+---
+--- ## The translation
+---
+--- `seq` translates a statement sequence, `expr` an expression; both take a
+--- continuation from the value's tree to the rest of the program's. Straight-
+--- line code comes out as exactly the chain someone would have written by hand:
+---
+---     do { let x = f(a?) + 1; g(x) }
+---       =>  bind(a, fun(%k1) { let x = f(%k1) + 1; g(x) })
+---
+--- A control construct containing a `?` is *lifted* into the monad instead: each
+--- branch is translated with `pure` as its continuation, and the construct as a
+--- whole becomes the left argument of a `bind`. That `pure` is the one place the
+--- lowering adds something the author did not write, and it is not the auto-
+--- `pure` that was ruled out: the tail of a *do block* is still taken to be
+--- already monadic, and a lifted branch is not a do block anyone wrote.
+---
+--- ## What crosses a bind
+---
+--- A `return`, `break` or `continue` after a `?` would land inside a generated
+--- lambda, where `return` means "return from the lambda". It cannot escape
+--- through the `bind` either -- escaping is not something a `bind` does, and for
+--- `Array`, whose bind runs its continuation once per element, there is nothing
+--- coherent for an escape to mean. So it travels as a value, in the Prelude's
+--- `Flow`. A context that needs this runs in **flow mode**: every statement
+--- answers with `m (Flow ...)`, the next runs only under `Fall`, and the
+--- context's boundary is where `Ret` becomes a result again.
+---
+--- Loops are the same problem twice over: a loop's continuation is not known
+--- until its body has run, so it cannot be a lambda written once. A lifted loop
+--- becomes a recursive local `fun` answering with a `Flow`, where `Brk` becomes
+--- the loop's own `Fall` -- which is why `let v = loop { ... break x }` still
+--- works -- and `Ret` keeps travelling.
+---
+--- ## Two things to know before editing this pass
+---
+--- **One child enumerator, four scanners.** This pass asks four questions of a
+--- subtree -- is it sugared, does it own a lifted loop, does control escape it,
+--- does it contain one -- that differ only in where they stop, and all four walk
+--- through `Turkey.Ast.children`. That makes it the file's maintenance hazard: a
+--- node kind added to the tree and forgotten in the enumerator is missed by all
+--- four at once, silently. Add the kind there first.
+---
+--- **A continuation is a variant, not a closure.** Whether a loop is in
+--- statement position is decided by comparing its continuation against the
+--- fall-through one, and there is no function identity to compare with. So the
+--- three continuations this pass builds for itself are named constructors, which
+--- also says what each one is where a closure would not.
 
 import Turkey.Ast (..)
 import Turkey.Binders as Binders
@@ -328,8 +328,8 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 
 -- -- the pass -----------------------------------------------------------------------
 
--- Rewrites `p` in place. Every binder it writes is minted in `binders`, and
--- every binding occurrence and reference it writes is recorded there.
+--- Rewrites `p` in place. Every binder it writes is minted in `binders`, and
+--- every binding occurrence and reference it writes is recorded there.
 fun program(p : Program, scope : Scope, binders : Binders.Table) -> Unit {
     let d = D { n = 0, scope = scope, binders = binders, owner = 0, depth = 0 }
     for decl in p.decls {

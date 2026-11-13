@@ -4,42 +4,42 @@ export (
     monomorphize, reduceTypes, checkLayouts, reachable, runtimeRoots,
 )
 
--- Monomorphization: one copy of a polymorphic binding per type it is used at.
---
--- The input is a typed Core in which every dictionary is an explicit argument
--- at a known type. A generalized binding carries its binders, and every use of
--- one is a type application at recorded arguments, so "which types is this used
--- at" is a question the IR already answers. This pass reads the answer and
--- writes a copy per answer.
---
--- What that buys: a dictionary is built once rather than rebuilt per request; a
--- dictionary at a call site is a *name*; a method selected from a ground
--- dictionary is then a projection out of a record whose definition is right
--- here, so it becomes a binding of its own; and what nothing reaches is dropped.
---
--- ## It is a *partial* pass, and that is a decision
---
--- Turkey admits polymorphic recursion, so the reachable set of specializations
--- can be infinite -- the standard reason monomorphization is undecidable. Two
--- things refuse a copy, and each refuses only what it has to:
---
--- * a binding on an *expanding cycle* (`expandingBindings`), decided from the
---   program before specializing, is never copied -- that is exactly the
---   polymorphic recursion that would never end, and nothing else;
--- * a program-wide *ceiling* on the specialized code (`ceilingFactor`) bounds
---   specialization that ends but grows exponentially without recursion.
---
--- A refused call site keeps its type application and goes on calling the
--- generic binding, which survives the pass unchanged and is copied per layout
--- by `Turkey.Layout`; a method of a known dictionary is still called
--- directly (see devirtualization). Turkey does not *promise* monomorphization.
---
--- ## It goes round twice, and the ceiling does not restart
---
--- Specializing and devirtualizing each *make* bindings the other would have
--- worked on. So the pipeline runs twice and reachability runs once at the end.
--- `State` is shared by the rounds: one account against the ceiling, and the
--- memo of what has already been built.
+--- Monomorphization: one copy of a polymorphic binding per type it is used at.
+---
+--- The input is a typed Core in which every dictionary is an explicit argument
+--- at a known type. A generalized binding carries its binders, and every use of
+--- one is a type application at recorded arguments, so "which types is this used
+--- at" is a question the IR already answers. This pass reads the answer and
+--- writes a copy per answer.
+---
+--- What that buys: a dictionary is built once rather than rebuilt per request; a
+--- dictionary at a call site is a *name*; a method selected from a ground
+--- dictionary is then a projection out of a record whose definition is right
+--- here, so it becomes a binding of its own; and what nothing reaches is dropped.
+---
+--- ## It is a *partial* pass, and that is a decision
+---
+--- Turkey admits polymorphic recursion, so the reachable set of specializations
+--- can be infinite -- the standard reason monomorphization is undecidable. Two
+--- things refuse a copy, and each refuses only what it has to:
+---
+--- * a binding on an *expanding cycle* (`expandingBindings`), decided from the
+---   program before specializing, is never copied -- that is exactly the
+---   polymorphic recursion that would never end, and nothing else;
+--- * a program-wide *ceiling* on the specialized code (`ceilingFactor`) bounds
+---   specialization that ends but grows exponentially without recursion.
+---
+--- A refused call site keeps its type application and goes on calling the
+--- generic binding, which survives the pass unchanged and is copied per layout
+--- by `Turkey.Layout`; a method of a known dictionary is still called
+--- directly (see devirtualization). Turkey does not *promise* monomorphization.
+---
+--- ## It goes round twice, and the ceiling does not restart
+---
+--- Specializing and devirtualizing each *make* bindings the other would have
+--- worked on. So the pipeline runs twice and reachability runs once at the end.
+--- `State` is shared by the rounds: one account against the ceiling, and the
+--- memo of what has already been built.
 
 import System.Parallel as Parallel
 import Data.Set as Set
@@ -65,33 +65,33 @@ import Turkey.Types (Kind(..), VarCell(..), TVar, TCon, TApp, TFam, TFun,
                      TTuple, TSet, TBottom)
 import Iter
 
--- How large a type argument may be. A cheap early refusal: a request this
--- large is almost certainly an unrolling that the tests below would refuse
--- anyway, and checking size is cheaper than checking anything else.
+--- How large a type argument may be. A cheap early refusal: a request this
+--- large is almost certainly an unrolling that the tests below would refuse
+--- anyway, and checking size is cheaper than checking anything else.
 let maxTypeNodes = 64
 
--- How much specialized code the whole program may gain, as a multiple of its
--- own size (both by `Opt.sizeOf_`). Specialization that terminates can still
--- grow exponentially with no recursion in it -- a chain of functions each
--- calling the next at two new types -- and this is what bounds that. It is a
--- ceiling rather than a budget: set well above what any real program reaches,
--- so a program that trips it is pathological, and what it trips on falls back
--- to generic code with its methods still called directly.
---
--- Measured: the largest ratio of specialized to original code in the corpus
--- is 0.57 (`regex_library.gob`), and the compiler's own is 0.48.
---
--- The charge is a copy's size before `Turkey.Opt`, which is all that exists
--- here. Inlining then grows each copy, by at most what the inliner's own limit
--- allows per function, so the finished program is still linear in the ceiling;
--- only the constant is larger for a program made of tiny copies, each calling
--- the next.
+--- How much specialized code the whole program may gain, as a multiple of its
+--- own size (both by `Opt.sizeOf_`). Specialization that terminates can still
+--- grow exponentially with no recursion in it -- a chain of functions each
+--- calling the next at two new types -- and this is what bounds that. It is a
+--- ceiling rather than a budget: set well above what any real program reaches,
+--- so a program that trips it is pathological, and what it trips on falls back
+--- to generic code with its methods still called directly.
+---
+--- Measured: the largest ratio of specialized to original code in the corpus
+--- is 0.57 (`regex_library.gob`), and the compiler's own is 0.48.
+---
+--- The charge is a copy's size before `Turkey.Opt`, which is all that exists
+--- here. Inlining then grows each copy, by at most what the inliner's own limit
+--- allows per function, so the finished program is still linear in the ceiling;
+--- only the constant is larger for a program made of tiny copies, each calling
+--- the next.
 let ceilingFactor = 2
 
--- How many times the whole pipeline runs. A fixed number rather than a fixed
--- point: specializing and devirtualizing each make work for the other, and two
--- rounds finish what the programs this compiles give them. The ceiling is
--- shared across rounds, so it bounds the whole pass however many there are.
+--- How many times the whole pipeline runs. A fixed number rather than a fixed
+--- point: specializing and devirtualizing each make work for the other, and two
+--- rounds finish what the programs this compiles give them. The ceiling is
+--- shared across rounds, so it bounds the whole pass however many there are.
 let rounds = 2
 
 -- -- small questions about types ----------------------------------------------------
@@ -166,26 +166,26 @@ fun takesDictionaries(b : CBind) -> Bool = match b.value.kind {
 
 -- -- what one round tells the next --------------------------------------------------
 
--- The budget and the memo, neither of which may restart with a round.
---
--- **The budget.** A per-round count is not a cap: refuse a binding its
--- thirty-third copy and the next round, counting from zero, grants it
--- thirty-two more. So the count is charged to the binding a copy *descends
--- from*, which is what `origin` records.
---
--- **The memo.** A second round that re-asked for a binding at the same types
--- would not find round one's answer, and would build a byte-identical second
--- copy -- specialization as a source of duplication, which is the opposite of
--- the point.
+--- The budget and the memo, neither of which may restart with a round.
+---
+--- **The budget.** A per-round count is not a cap: refuse a binding its
+--- thirty-third copy and the next round, counting from zero, grants it
+--- thirty-two more. So the count is charged to the binding a copy *descends
+--- from*, which is what `origin` records.
+---
+--- **The memo.** A second round that re-asked for a binding at the same types
+--- would not find round one's answer, and would build a byte-identical second
+--- copy -- specialization as a source of duplication, which is the opposite of
+--- the point.
 type State = State {
-    -- Request key -> the specialization's spelling and binder id.
+    --- Request key -> the specialization's spelling and binder id.
     done          : Map String (String, Int),
-    -- Spelling -> the request key it was made for; see `spelling`.
+    --- Spelling -> the request key it was made for; see `spelling`.
     spellings     : Map String String,
     origin        : Map String String,
-    -- Bindings on an expanding cycle (`expandingBindings`), never copied.
+    --- Bindings on an expanding cycle (`expandingBindings`), never copied.
     var expanding : Set.Set String,
-    -- The specialized code granted so far, and how much is allowed.
+    --- The specialized code granted so far, and how much is allowed.
     var spent   : Int,
     var ceiling : Int,
 }
@@ -1104,26 +1104,26 @@ fun promotedBinders(b : CBind, dicts : Option (Vec String)) -> Vec VarCell {
 
 -- -- what the backend is handed ---------------------------------------------------
 
--- Every type in the program, with its family applications reduced.
---
--- The backend reads a type *whole* and asks it for a representation, and an
--- unreduced family has none: nothing can answer `Index.Value (Array Bool)`,
--- while the body that produces the value knows it is the `Bool` the instance
--- says it is and hands over a bare `i1`. The reader then unboxes a raw value.
---
--- The rewriter reduces as it substitutes, so a *specialized* binding is already
--- reduced -- and says, correctly, that with no substitution there is nothing to
--- do. What that leaves is the binding nothing specialized, whose types are the
--- ones the lowering wrote: a dictionary's method still takes
--- `Index.Key (Array a)` there, because the lowering builds a field's type by
--- putting the instance head into the method's scheme and the scheme is written
--- in the class's families.
---
--- So it is done here, once, for the whole program, rather than at each of the
--- places a family can be introduced -- a layout is total on the types that
--- reach it only if *every* such place remembered, and one pass is a thing that
--- can be true rather than a rule five writers have to keep.
+--- Every type in the program, with its family applications reduced.
 fun reduceTypes(program : CProgram, classes : ClassTable) -> CProgram {
+    -- The backend reads a type *whole* and asks it for a representation, and
+    -- an unreduced family has none: nothing can answer
+    -- `Index.Value (Array Bool)`, while the body that produces the value knows
+    -- it is the `Bool` the instance says it is and hands over a bare `i1`. The
+    -- reader then unboxes a raw value.
+    --
+    -- The rewriter reduces as it substitutes, so a *specialized* binding is
+    -- already reduced -- and says, correctly, that with no substitution there
+    -- is nothing to do. What that leaves is the binding nothing specialized,
+    -- whose types are the ones the lowering wrote: a dictionary's method still
+    -- takes `Index.Key (Array a)` there, because the lowering builds a field's
+    -- type by putting the instance head into the method's scheme and the
+    -- scheme is written in the class's families.
+    --
+    -- So it is done here, once, for the whole program, rather than at each of
+    -- the places a family can be introduced -- a layout is total on the types
+    -- that reach it only if *every* such place remembered, and one pass is a
+    -- thing that can be true rather than a rule five writers have to keep.
     let instances = Inert.empty(classes)
     CProgram {
         dicts = Vec.map(program.dicts, reduceBind(_, instances)),
@@ -1197,14 +1197,15 @@ fun unsharedInto(e : Core, found : Vec Bool) -> Unit {
     }))
 }
 
--- Refuse to compile a program with an existential arm that no layout copy
--- was made for.
---
--- Refusing rather than warning because the alternative is silence: the backend
--- reads a field at the layout it computes, and if the arm disagreed with the
--- packing the result would be a wrong value rather than an error. Every other
--- type's layout is checked by `Turkey.Layout.unknownLayouts`.
+--- Refuse to compile a program with an existential arm that no layout copy
+--- was made for.
+---
+--- Every other type's layout is checked by `Turkey.Layout.unknownLayouts`.
 fun checkLayouts(program : CProgram) -> Unit {
+    -- Refusing rather than warning because the alternative is silence: the
+    -- backend reads a field at the layout it computes, and if the arm
+    -- disagreed with the packing the result would be a wrong value rather than
+    -- an error.
     let unopened = unsharedOpenings(program)
     if len(unopened) > 0 {
         oops("an existential pattern reached the backend with no layout for "
@@ -1519,27 +1520,26 @@ fun droppable(b : CBind, isDict : Bool) -> Bool {
     }
 }
 
--- Drop the bindings nothing reaches, where dropping one is unobservable.
---
--- This is what makes specialization a saving rather than an addition. A program
--- that used a class at two types carried the generic binding, the two copies, and
--- every dictionary the Prelude declares; after this it carries the two copies and
--- the dictionaries they name.
---
--- The guard the cap needs is not written here because it does not need to be: a
--- capped call site still holds a type application of the generic binding, so the
--- generic binding is named by whatever reaches that call site, and being named is
--- all this asks for.
---
--- Run once, at the end, and not between rounds: an intermediate round's output is
--- full of bindings nothing reaches *yet*, and dropping one would be answering a
--- question the next round was going to ask.
---
--- Only the bindings `prunable` accepts are dropped; the rest are kept as if
--- `main` named them.
+--- Drop the bindings nothing reaches, where dropping one is unobservable.
+---
+--- Run once, at the end, and not between rounds: an intermediate round's output is
+--- full of bindings nothing reaches *yet*, and dropping one would be answering a
+--- question the next round was going to ask.
+---
+--- Only the bindings `prunable` accepts are dropped; the rest are kept as if
+--- `main` named them.
 fun reachable(program : CProgram, main : String, roots : Vec String,
               definitions : Map String ForeignInfo,
               prunable : fun(CBind) -> Bool) -> CProgram {
+    -- This is what makes specialization a saving rather than an addition. A
+    -- program that used a class at two types carried the generic binding, the
+    -- two copies, and every dictionary the Prelude declares; after this it
+    -- carries the two copies and the dictionaries they name.
+    --
+    -- The guard the cap needs is not written here because it does not need to
+    -- be: a capped call site still holds a type application of the generic
+    -- binding, so the generic binding is named by whatever reaches that call
+    -- site, and being named is all this asks for.
     let byname = Map.new()
     for b in Vec.append(program.dicts, program.binds) {
         Map.put(byname, b.name, b)
@@ -1590,12 +1590,11 @@ fun reachable(program : CProgram, main : String, roots : Vec String,
     out
 }
 
--- Specialize, devirtualize, again, and then drop what nothing reaches.
---
--- The rounds share one state, which is what makes the ceiling one ceiling. Reachability
--- runs once, at the end, over the finished program.
+--- Specialize, devirtualize, again, and then drop what nothing reaches.
 fun monomorphize(program : CProgram, table : Binders.Table, decls : DeclTable,
                  classes : ClassTable, main : String, roots : Vec String) -> CProgram {
+    -- The rounds share one state, which is what makes the ceiling one ceiling.
+    -- Reachability runs once, at the end, over the finished program.
     let state = newState()
     state.expanding = expandingBindings(program)
     var size = 0
@@ -1611,12 +1610,12 @@ fun monomorphize(program : CProgram, table : Binders.Table, decls : DeclTable,
     reachable(out, main, roots, decls.definitions, fun(_) = True)
 }
 
--- The bindings reachability starts from besides `main`: the `foreign`
--- definitions C may call. A program's own are there for C, which this cannot
--- see, so every one is a root. The runtime's (`Turkey.*`) are there for the
--- code the backend writes, so only those it names by symbol are -- unless a
--- C caller drives the runtime without running the program, as the runtime's
--- own tests do, and then only C knows which it will call.
+--- The bindings reachability starts from besides `main`: the `foreign`
+--- definitions C may call. A program's own are there for C, which this cannot
+--- see, so every one is a root. The runtime's (`Turkey.*`) are there for the
+--- code the backend writes, so only those it names by symbol are -- unless a
+--- C caller drives the runtime without running the program, as the runtime's
+--- own tests do, and then only C knows which it will call.
 fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Vec String {
     let out = []
     for (name, info) in Map.entries(decls.definitions) {
@@ -1630,27 +1629,27 @@ fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Vec String {
 
 -- -- polymorphic recursion ------------------------------------------------------------
 
--- The bindings whose specializations would never end: those on a cycle that
--- instantiates a binding at a type strictly containing one of its own
--- parameters.
---
--- The test is the one ECMA-335 states for generic definitions (II.9.2): a
--- graph whose nodes are type parameters, with an edge from a parameter `a` of
--- the caller to the parameter `b` of the callee it instantiates, for every
--- call from one member of a recursive binding group to another. The edge is
--- *plain* when the argument is `a` itself and *expanding* when `a` occurs
--- strictly inside it (`depth` at `a` calling `depth` at `Pair a`). The
--- instantiations reachable from any ground call are finite exactly when no
--- cycle contains an expanding edge: a cycle of plain edges only permutes
--- parameters, and the memo already stops that. So this is decided before
--- specializing, from the program alone, and nothing that is not
--- polymorphically recursive is ever refused for being so.
---
--- Only a binding with a complete signature can be polymorphically recursive:
--- without one a recursive use is at the group's own parameters, which is a
--- plain edge. An instance's context only ever asks for dictionaries at smaller
--- types, so dictionary construction adds no expanding edge.
+--- The bindings whose specializations would never end: those on a cycle that
+--- instantiates a binding at a type strictly containing one of its own
+--- parameters.
 fun expandingBindings(program : CProgram) -> Set.Set String {
+    -- The test is the one ECMA-335 states for generic definitions (II.9.2): a
+    -- graph whose nodes are type parameters, with an edge from a parameter `a`
+    -- of the caller to the parameter `b` of the callee it instantiates, for
+    -- every call from one member of a recursive binding group to another. The
+    -- edge is *plain* when the argument is `a` itself and *expanding* when `a`
+    -- occurs strictly inside it (`depth` at `a` calling `depth` at `Pair a`).
+    -- The instantiations reachable from any ground call are finite exactly
+    -- when no cycle contains an expanding edge: a cycle of plain edges only
+    -- permutes parameters, and the memo already stops that. So this is decided
+    -- before specializing, from the program alone, and nothing that is not
+    -- polymorphically recursive is ever refused for being so.
+    --
+    -- Only a binding with a complete signature can be polymorphically
+    -- recursive: without one a recursive use is at the group's own parameters,
+    -- which is a plain edge. An instance's context only ever asks for
+    -- dictionaries at smaller types, so dictionary construction adds no
+    -- expanding edge.
     let generic = Map.new()
     for b in Vec.append(program.dicts, program.binds) {
         if len(b.binders) > 0 { Map.put(generic, b.name, b) }

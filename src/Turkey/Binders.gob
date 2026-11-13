@@ -6,110 +6,110 @@ export (
     checkReferences, checkInferred, methodRefs, boundIn, boundByPattern,
 )
 
--- Every term binder of the program, and which binder each occurrence means.
---
--- A binder id is an (owner, local index) pair packed into one `Int`. An owner
--- is a unit of the program -- a top-level declaration, an instance
--- dictionary, a specialization -- and each keeps its own counter. A pass that
--- copies a binder may mint the copy into the owner the original came from,
--- which need not be the binding it is rewriting.
---
--- An id depends only on the program and never on how workers are scheduled,
--- which the bootstrap fixed point relies on: an id that varied between runs
--- would vary every `Map Int` iteration order keyed by it. What makes that
--- true is that every owner is registered, and every binder minted, on one
--- thread, in an order the program decides. Owners are numbered from one
--- counter, so a pass that minted on workers would break it.
---
--- Ids are process-local. They are never printed, and nothing persisted may be
--- keyed by one; a binder's stable name is its `moduleName` and `name`.
---
--- An owner may instead number binders it keeps no record of
--- (`unrecordedOwner`, `unrecorded`). `Turkey.Opt` numbers every binder it
--- makes so: it makes millions, nothing after it reads their records, and the
--- table lives as long as the compile. An owner is one kind or the other, and
--- `fresh` and `unrecorded` each refuse the other kind, because both number
--- from 0 and would hand out one id twice.
---
--- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
--- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
--- the ids `Turkey.Ast.freshNodeId` hands out, which are unique across the
--- program.
+--- Every term binder of the program, and which binder each occurrence means.
+---
+--- A binder id is an (owner, local index) pair packed into one `Int`. An owner
+--- is a unit of the program -- a top-level declaration, an instance
+--- dictionary, a specialization -- and each keeps its own counter. A pass that
+--- copies a binder may mint the copy into the owner the original came from,
+--- which need not be the binding it is rewriting.
+---
+--- An id depends only on the program and never on how workers are scheduled,
+--- which the bootstrap fixed point relies on: an id that varied between runs
+--- would vary every `Map Int` iteration order keyed by it. What makes that
+--- true is that every owner is registered, and every binder minted, on one
+--- thread, in an order the program decides. Owners are numbered from one
+--- counter, so a pass that minted on workers would break it.
+---
+--- Ids are process-local. They are never printed, and nothing persisted may be
+--- keyed by one; a binder's stable name is its `moduleName` and `name`.
+---
+--- An owner may instead number binders it keeps no record of
+--- (`unrecordedOwner`, `unrecorded`). `Turkey.Opt` numbers every binder it
+--- makes so: it makes millions, nothing after it reads their records, and the
+--- table lives as long as the compile. An owner is one kind or the other, and
+--- `fresh` and `unrecorded` each refuse the other kind, because both number
+--- from 0 and would hand out one id twice.
+---
+--- `refs` maps the id of an AST node -- a `PVar`, a `FunDecl`, a
+--- `ForeignDecl`, an `EVar` -- to the binder it binds or means. It is keyed by
+--- the ids `Turkey.Ast.freshNodeId` hands out, which are unique across the
+--- program.
 
 import Turkey.Ast (..)
 import Turkey.Diag as Diag
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 
--- What a binder is to the program.
+--- What a binder is to the program.
 type Kind
-    -- A parameter, a pattern variable, a `let`, `var` or local `fun`, or a
-    -- temporary the compiler writes.
+    --- A parameter, a pattern variable, a `let`, `var` or local `fun`, or a
+    --- temporary the compiler writes.
     = Local
-    -- A top-level `fun`, `let`, `var` or `foreign` definition.
+    --- A top-level `fun`, `let`, `var` or `foreign` definition.
     | TopLevel
-    -- A class method.
+    --- A class method.
     | Method
-    -- A machine operation, which no source declares.
+    --- A machine operation, which no source declares.
     | Primitive
 
--- Where a binder comes from, as `fresh` is told it.
+--- Where a binder comes from, as `fresh` is told it.
 type Origin
-    -- Bound by the program text at the span. The flag is whether it is a
-    -- `var`, which is what gives it a cell.
+    --- Bound by the program text at the span. The flag is whether it is a
+    --- `var`, which is what gives it a cell.
     = Written(Span, Bool)
-    -- Made by the compiler for the construct at the span, if it has one, and
-    -- not a copy of a recorded binder. Never a `var`.
+    --- Made by the compiler for the construct at the span, if it has one, and
+    --- not a copy of a recorded binder. Never a `var`.
     | Generated(Option Span)
-    -- A primitive.
+    --- A primitive.
     | Builtin
-    -- A copy of the binder with this id, whose span and mutability it takes
-    -- when the table has a record of it.
+    --- A copy of the binder with this id, whose span and mutability it takes
+    --- when the table has a record of it.
     | CopyOf(Int)
-    -- A copy of a polymorphic binding at these ground type arguments, made by
-    -- `Turkey.Mono`. The binding is the one with the id, if it has one; the
-    -- span is the binding's. A copy keyed by something other than its type
-    -- arguments is a `CopyOf`.
+    --- A copy of a polymorphic binding at these ground type arguments, made by
+    --- `Turkey.Mono`. The binding is the one with the id, if it has one; the
+    --- span is the binding's. A copy keyed by something other than its type
+    --- arguments is a `CopyOf`.
     | Specialized(Option Int, Array Ty.Type, Option Span)
 
 type Binder = Binder {
-    -- The source spelling, unqualified, or a hint for one the compiler made.
+    --- The source spelling, unqualified, or a hint for one the compiler made.
     name       : String,
     kind       : Kind,
     moduleName : String,
     mutable    : Bool,
-    -- `None` for a primitive.
+    --- `None` for a primitive.
     span       : Option Span,
-    -- For a copy, the id it was copied from.
+    --- For a copy, the id it was copied from.
     origin     : Option Int,
-    -- For a specialization, the type arguments it was made at; empty for any
-    -- other binder.
+    --- For a specialization, the type arguments it was made at; empty for any
+    --- other binder.
     typeArguments : Array Ty.Type,
 }
 
 type Owner = Owner {
-    -- A hint for whoever is debugging; two owners may share one.
+    --- A hint for whoever is debugging; two owners may share one.
     name       : String,
     moduleName : String,
     binders    : Vec Binder,
-    -- Whether `fresh` records the owner's binders here. When it does not,
-    -- whoever numbers them keeps the count.
+    --- Whether `fresh` records the owner's binders here. When it does not,
+    --- whoever numbers them keeps the count.
     recorded   : Bool,
 }
 
 type Table = Table {
     owners            : Vec Owner,
     refs              : Map Int Int,
-    -- A top-level binder by its internal name, `Module#name`, `Module#C.m` or
-    -- a primitive's spelling, so that a reference resolved to that name can
-    -- find its id.
+    --- A top-level binder by its internal name, `Module#name`, `Module#C.m` or
+    --- a primitive's spelling, so that a reference resolved to that name can
+    --- find its id.
     byName            : Map String Int,
-    -- The owner of each top-level declaration, by the declaration's node id:
-    -- a top-level statement's, a class or instance method's, or a foreign
-    -- definition's.
+    --- The owner of each top-level declaration, by the declaration's node id:
+    --- a top-level statement's, a class or instance method's, or a foreign
+    --- definition's.
     declarationOwners : Map Int Int,
-    -- The `EVar` nodes no binder was found for when they were resolved or
-    -- written, with their spellings. Inference reports them.
+    --- The `EVar` nodes no binder was found for when they were resolved or
+    --- written, with their spellings. Inference reports them.
     unresolved        : Map Int String,
 }
 
@@ -122,7 +122,7 @@ fun newTable() -> Table = Table {
 let localBits = 32
 let localLimit = Int.shl(1, localBits)
 
--- Returns a new owner in the module `moduleName`, with no binders.
+--- Returns a new owner in the module `moduleName`, with no binders.
 fun owner(t : Table, moduleName : String, hint : String) -> Int {
     Vec.push(t.owners, Owner {
         name = hint, moduleName = moduleName, binders = [], recorded = True,
@@ -130,8 +130,8 @@ fun owner(t : Table, moduleName : String, hint : String) -> Int {
     len(t.owners) - 1
 }
 
--- Returns a new owner in the module `moduleName` whose binders are numbered
--- by `unrecorded`, with no record in the table.
+--- Returns a new owner in the module `moduleName` whose binders are numbered
+--- by `unrecorded`, with no record in the table.
 fun unrecordedOwner(t : Table, moduleName : String, hint : String) -> Int {
     Vec.push(t.owners, Owner {
         name = hint, moduleName = moduleName, binders = [], recorded = False,
@@ -139,9 +139,9 @@ fun unrecordedOwner(t : Table, moduleName : String, hint : String) -> Int {
     len(t.owners) - 1
 }
 
--- Returns the id of a new binder in `ownerId`, the next local index after
--- the ones it already has. Writes only that owner's table. Raises an internal
--- error if `ownerId` came from `unrecordedOwner`.
+--- Returns the id of a new binder in `ownerId`, the next local index after
+--- the ones it already has. Writes only that owner's table. Raises an internal
+--- error if `ownerId` came from `unrecordedOwner`.
 fun fresh(t : Table, ownerId : Int, hint : String, kind : Kind,
           origin : Origin) -> Int {
     let o = t.owners[ownerId]
@@ -178,9 +178,9 @@ fun localOf(id : Int) -> Int = id - Int.shl(ownerOf(id), localBits)
 
 fun binderAt(t : Table, id : Int) -> Binder = t.owners[ownerOf(id)].binders[localOf(id)]
 
--- Returns the id with the owner `ownerId` and the local index `local`, for a
--- binder the table keeps no record of. Raises an internal error unless
--- `ownerId` came from `unrecordedOwner`.
+--- Returns the id with the owner `ownerId` and the local index `local`, for a
+--- binder the table keeps no record of. Raises an internal error unless
+--- `ownerId` came from `unrecordedOwner`.
 fun unrecorded(t : Table, ownerId : Int, local : Int) -> Int {
     if t.owners[ownerId].recorded {
         error("Binders.unrecorded: owner '" + t.owners[ownerId].name
@@ -193,10 +193,10 @@ fun unrecorded(t : Table, ownerId : Int, local : Int) -> Int {
 fun recorded(t : Table, id : Int) -> Bool =
     id >= 0 && localOf(id) < len(t.owners[ownerOf(id)].binders)
 
--- Returns the id of a new binder in `ownerId`, which references resolved to
--- `internal` mean. A second declaration of `internal` still gets a binder of
--- its own, but references keep meaning the first; the duplicate is left for
--- the stage that reports one.
+--- Returns the id of a new binder in `ownerId`, which references resolved to
+--- `internal` mean. A second declaration of `internal` still gets a binder of
+--- its own, but references keep meaning the first; the duplicate is left for
+--- the stage that reports one.
 fun declare(t : Table, ownerId : Int, internal : String, short : String,
             kind : Kind, origin : Origin) -> Int {
     let id = fresh(t, ownerId, short, kind, origin)
@@ -204,38 +204,38 @@ fun declare(t : Table, ownerId : Int, internal : String, short : String,
     id
 }
 
--- Returns the id of the top-level binder named `internal`, if one was declared.
+--- Returns the id of the top-level binder named `internal`, if one was declared.
 fun named(t : Table, internal : String) -> Option Int = Map.get(t.byName, internal)
 
--- Records that the node `nodeId` binds or means the binder `id`.
+--- Records that the node `nodeId` binds or means the binder `id`.
 fun record(t : Table, nodeId : Int, id : Int) -> Unit = Map.put(t.refs, nodeId, id)
 
--- Records that the node `nodeId` means the top-level binder named `internal`.
--- Records nothing when no binder was declared under that name, which leaves
--- the node for `checkReferences` to report.
+--- Records that the node `nodeId` means the top-level binder named `internal`.
+--- Records nothing when no binder was declared under that name, which leaves
+--- the node for `checkReferences` to report.
 fun refer(t : Table, nodeId : Int, internal : String) -> Unit =
     match named(t, internal) {
         Some(id) -> record(t, nodeId, id)
         None -> {}
     }
 
--- Returns the source spelling of the binder the node `nodeId`, spanned by
--- `where`, binds or means. Raises an internal error if no binder was recorded
--- for the node, which only a compiler bug can cause once resolution has run.
+--- Returns the source spelling of the binder the node `nodeId`, spanned by
+--- `where`, binds or means. Raises an internal error if no binder was recorded
+--- for the node, which only a compiler bug can cause once resolution has run.
 fun nameAt(t : Table, nodeId : Int, where : Span) -> String = match Map.get(t.refs, nodeId) {
     Some(id) -> binderAt(t, id).name
     None -> Diag.fail(Diag.at("internal error", "no binder was recorded here", where),
                       where.file)
 }
 
--- Records `ownerId` as the owner of the top-level declaration `nodeId`.
+--- Records `ownerId` as the owner of the top-level declaration `nodeId`.
 fun ownDeclaration(t : Table, nodeId : Int, ownerId : Int) -> Unit =
     Map.put(t.declarationOwners, nodeId, ownerId)
 
--- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`,
--- which is spanned by `where`. Raises an internal error if none was recorded,
--- which only a compiler bug can cause: every stage that mints walks the
--- declarations `Turkey.Resolve.declare` registered.
+--- Returns the owner `ownDeclaration` recorded for the declaration `nodeId`,
+--- which is spanned by `where`. Raises an internal error if none was recorded,
+--- which only a compiler bug can cause: every stage that mints walks the
+--- declarations `Turkey.Resolve.declare` registered.
 fun declarationOwner(t : Table, nodeId : Int, where : Span) -> Int =
     match Map.get(t.declarationOwners, nodeId) {
         Some(o) -> o
@@ -244,19 +244,19 @@ fun declarationOwner(t : Table, nodeId : Int, where : Span) -> Int =
                           where.file)
     }
 
--- Records that the `EVar` node `nodeId`, spelled `name`, means no binder the
--- stage that resolved or wrote it could find, which leaves it for inference to
--- report.
+--- Records that the `EVar` node `nodeId`, spelled `name`, means no binder the
+--- stage that resolved or wrote it could find, which leaves it for inference to
+--- report.
 fun leaveUnresolved(t : Table, nodeId : Int, name : String) -> Unit =
     Map.put(t.unresolved, nodeId, name)
 
--- Raises an internal error unless every binding occurrence and every `EVar`
--- in `p` has an entry in `refs`, or the `EVar` was left for inference, and
--- unless the alternatives of each match arm bind each name to one binder.
--- Covers the method references resolution writes into `EIndex`, `EUnary`,
--- `EBinary`, `EForIn` and `EQuestion`, which are not among
--- `Turkey.Ast.children`, so it can run before `Turkey.Desugar` or after it.
--- Costs a walk of the whole program.
+--- Raises an internal error unless every binding occurrence and every `EVar`
+--- in `p` has an entry in `refs`, or the `EVar` was left for inference, and
+--- unless the alternatives of each match arm bind each name to one binder.
+--- Covers the method references resolution writes into `EIndex`, `EUnary`,
+--- `EBinary`, `EForIn` and `EQuestion`, which are not among
+--- `Turkey.Ast.children`, so it can run before `Turkey.Desugar` or after it.
+--- Costs a walk of the whole program.
 fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     let missing = []
     for decl in p.decls {
@@ -282,9 +282,9 @@ fun checkReferences(t : Table, p : Program, file : String) -> Unit {
     }
 }
 
--- Raises an internal error if any reference was left for inference to
--- report. Call it once inference has accepted the program: such a reference
--- is then one inference found a binder for and the table has none for.
+--- Raises an internal error if any reference was left for inference to
+--- report. Call it once inference has accepted the program: such a reference
+--- is then one inference found a binder for and the table has none for.
 fun checkInferred(t : Table, file : String) -> Unit {
     let names = Array.map(Array.sort(Map.values(t.unresolved)), fun(n) = "'" + n + "'")
     if len(names) > 0 {
@@ -363,9 +363,9 @@ fun expectSame(t : Table, alts : Vec Pat, missing : Vec String) -> Unit {
     }
 }
 
--- Adds to `out` the binder of every binding occurrence in `c` and below it:
--- every pattern variable, `fun` statement and parameter. The method
--- references `methodRefs` returns bind nothing, so they are not walked.
+--- Adds to `out` the binder of every binding occurrence in `c` and below it:
+--- every pattern variable, `fun` statement and parameter. The method
+--- references `methodRefs` returns bind nothing, so they are not walked.
 fun boundIn(t : Table, c : Child, out : Vec Int) -> Unit {
     match c {
         ChExpr(e) -> match e.kind {
@@ -391,7 +391,7 @@ fun boundIn(t : Table, c : Child, out : Vec Int) -> Unit {
     for child in children(c) { boundIn(t, child, out) }
 }
 
--- Adds to `out` the binder of every variable in `p`.
+--- Adds to `out` the binder of every variable in `p`.
 fun boundByPattern(t : Table, p : Pat, out : Vec Int) -> Unit {
     for v in varPatterns(p) { boundAt(t, v.id, out) }
 }
@@ -400,8 +400,8 @@ fun boundAt(t : Table, nodeId : Int, out : Vec Int) -> Unit {
     if let Some(id) = Map.get(t.refs, nodeId) { Vec.push(out, id) }
 }
 
--- Returns the method references resolution wrote into `e`, which are not
--- among `Turkey.Ast.children`.
+--- Returns the method references resolution wrote into `e`, which are not
+--- among `Turkey.Ast.children`.
 fun methodRefs(e : Expr) -> Vec Expr = match e.kind {
     EIndex(_, _, get, set) -> Vec.append(optional(get), optional(set))
     EUnary(_, _, fn) -> optional(fn)

@@ -1,55 +1,55 @@
 export (Lowerer(..), newLowerer, program)
 
--- Surface tree plus what solving decided, down to `Turkey.Core`.
---
--- This is the pass that makes the elaboration a *tree*. Everything it needs was
--- already computed and is currently scattered across three side tables and the
--- instance table: which dictionaries an occurrence needs and which types it
--- instantiated its scheme at; the leading dictionary parameters a binding group
--- gained; an instance's methods, superclass evidence and context; and every
--- expression's type. None of that is rediscovered here. What changes is that it
--- stops being an agreement between the elaborator and the evaluator, and becomes
--- syntax that `Turkey.Coretc` can reject.
---
--- ## The three translations that carry the milestone
---
--- **A class becomes a record type.** `class C a` with methods and superclasses
--- gives `%Dict.C a`, with a field per method and a `%super.S` per superclass. It
--- is opaque -- `%` is illegal in an identifier -- and it exists so that a
--- dictionary has a type to be wrong about.
---
--- **An instance becomes a top-level binding** of that type, named
--- `%inst.C.Con`, which is unique because instances are coherent. A derived
--- `Typed` instance whose head is not of kind `*` adds its count of arguments,
--- `%inst.Typed.Either/1`, since `Either a` and `Either a b` are both instances
--- over `Either`. An instance with a context becomes a *function* from
--- dictionaries to a dictionary, which is what `instance [Show a] Show
--- (Array a)` always meant.
---
--- **Evidence becomes a term.** A dictionary in scope is a variable and a chain
--- of superclass projections; an instance's is a variable applied to the evidence
--- for its own context. The evidence language does not survive this pass, which
--- is the point: it was a second, unchecked term language.
---
--- ## What a use site becomes
---
--- A use of a polymorphic name is a type application and then a value
--- application:
---
---     f : forall a. %Dict.Show a -> fun(a) -> String
---     f(x)  ==>  (f[Int])(%d.Show.Int)(x)
---
--- in that order, and the order is not a convention this pass invents -- it is
--- the order the two were abstracted in. A method use is the same with the
--- function reached by projection instead of by name.
---
--- ## Loops and transfers stop existing
---
--- `while`, `loop`, the C-style `for` and `for ... in` are four constructs in the
--- surface language and none in Core, and `return`, `break` and `continue`, which
--- named their target by where they sat, become jumps that name it. Core holds no
--- node for any of the seven, which is what makes a term that names its target by
--- position unrepresentable rather than merely absent.
+--- Surface tree plus what solving decided, down to `Turkey.Core`.
+---
+--- This is the pass that makes the elaboration a *tree*. Everything it needs was
+--- already computed and is currently scattered across three side tables and the
+--- instance table: which dictionaries an occurrence needs and which types it
+--- instantiated its scheme at; the leading dictionary parameters a binding group
+--- gained; an instance's methods, superclass evidence and context; and every
+--- expression's type. None of that is rediscovered here. What changes is that it
+--- stops being an agreement between the elaborator and the evaluator, and becomes
+--- syntax that `Turkey.Coretc` can reject.
+---
+--- ## The three translations that carry the milestone
+---
+--- **A class becomes a record type.** `class C a` with methods and superclasses
+--- gives `%Dict.C a`, with a field per method and a `%super.S` per superclass. It
+--- is opaque -- `%` is illegal in an identifier -- and it exists so that a
+--- dictionary has a type to be wrong about.
+---
+--- **An instance becomes a top-level binding** of that type, named
+--- `%inst.C.Con`, which is unique because instances are coherent. A derived
+--- `Typed` instance whose head is not of kind `*` adds its count of arguments,
+--- `%inst.Typed.Either/1`, since `Either a` and `Either a b` are both instances
+--- over `Either`. An instance with a context becomes a *function* from
+--- dictionaries to a dictionary, which is what `instance [Show a] Show
+--- (Array a)` always meant.
+---
+--- **Evidence becomes a term.** A dictionary in scope is a variable and a chain
+--- of superclass projections; an instance's is a variable applied to the evidence
+--- for its own context. The evidence language does not survive this pass, which
+--- is the point: it was a second, unchecked term language.
+---
+--- ## What a use site becomes
+---
+--- A use of a polymorphic name is a type application and then a value
+--- application:
+---
+---     f : forall a. %Dict.Show a -> fun(a) -> String
+---     f(x)  ==>  (f[Int])(%d.Show.Int)(x)
+---
+--- in that order, and the order is not a convention this pass invents -- it is
+--- the order the two were abstracted in. A method use is the same with the
+--- function reached by projection instead of by name.
+---
+--- ## Loops and transfers stop existing
+---
+--- `while`, `loop`, the C-style `for` and `for ... in` are four constructs in the
+--- surface language and none in Core, and `return`, `break` and `continue`, which
+--- named their target by where they sat, become jumps that name it. Core holds no
+--- node for any of the seven, which is what makes a term that names its target by
+--- position unrepresentable rather than merely absent.
 
 import Data.Set as Set
 import Turkey.Ast (Pred as _, ..)
@@ -193,39 +193,39 @@ type Lowerer = Lowerer {
     classes      : ClassTable,
     env          : Env,
     types        : TypeTable,
-    -- While a method body is being lowered: which rigid constant in it stands
-    -- for which quantified variable. Empty everywhere else, because nothing else
-    -- is checked against skolems.
+    --- While a method body is being lowered: which rigid constant in it stands
+    --- for which quantified variable. Empty everywhere else, because nothing else
+    --- is checked against skolems.
     var rigid    : Map String VarCell,
-    -- Surface expressions already lowered, and what they lowered to. Only
-    -- A-normalization puts anything here, and only for as long as it takes to
-    -- rebuild one node around its operands.
+    --- Surface expressions already lowered, and what they lowered to. Only
+    --- A-normalization puts anything here, and only for as long as it takes to
+    --- rebuild one node around its operands.
     placeholders : Map Int Core,
     var counter  : Int,
-    -- Which constructors `Prim.targetOs` and `Prim.targetArch` stand for.
+    --- Which constructors `Prim.targetOs` and `Prim.targetArch` stand for.
     target       : Target.Target,
-    -- And the build primitives (`Turkey.Build`).
+    --- And the build primitives (`Turkey.Build`).
     build        : Build.Build,
-    -- Which binder each binding occurrence and reference means, and where the
-    -- binders this pass invents are minted.
+    --- Which binder each binding occurrence and reference means, and where the
+    --- binders this pass invents are minted.
     binders      : Binders.Table,
-    -- The owner the binders this pass invents go to, and the span they are
-    -- recorded at: the top-level declaration being lowered.
+    --- The owner the binders this pass invents go to, and the span they are
+    --- recorded at: the top-level declaration being lowered.
     var owner    : Int,
     var site     : Span,
-    -- While source this pass has already lowered is lowered again: the copy
-    -- each binder bound in it gets, by the binder `binders` records. Empty
-    -- elsewhere. See `copiesOf`.
+    --- While source this pass has already lowered is lowered again: the copy
+    --- each binder bound in it gets, by the binder `binders` records. Empty
+    --- elsewhere. See `copiesOf`.
     var copies   : Map Int Int,
-    -- The dictionaries in scope, by the spelling inference gave each, and the
-    -- id of each one's binder. See `withDicts`.
+    --- The dictionaries in scope, by the spelling inference gave each, and the
+    --- id of each one's binder. See `withDicts`.
     dicts        : Map String Int,
-    -- What each pattern that opens an existential binds, by the pattern's
-    -- node, from when `openPattern` mints it until `Turkey.Match` reads it.
+    --- What each pattern that opens an existential binds, by the pattern's
+    --- node, from when `openPattern` mints it until `Turkey.Match` reads it.
     opened       : Map Int Opened,
-    -- By binder id, each binder whose scheme is a wrapper around its group's
-    -- (`Export`), and the spelling and id of the internal binding, once
-    -- minted (`internalOf`).
+    --- By binder id, each binder whose scheme is a wrapper around its group's
+    --- (`Export`), and the spelling and id of the internal binding, once
+    --- minted (`internalOf`).
     exports      : Map Int Export,
     internals    : Map Int (String, Int),
 }

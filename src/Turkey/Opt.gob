@@ -4,92 +4,92 @@ export (
     freshened, freshenedAlts,
 )
 
--- The local reductions, from inlining through loop-result fusion.
---
--- None of them knows what a monad is, and that is the point: a `bind` chain is
--- reached the way any other saturated call to a known small function is
--- reached.
---
--- Within either side of join discovery they are one traversal rather than a
--- pass per rule, because they feed each other and it would be dishonest to
--- pretend otherwise. Inlining `bind` puts a lambda in the function position of
--- an application, which is beta; beta binds a parameter to a constructor
--- application, which is case-of-known-constructor; and that selects a branch,
--- which exposes the next call. Splitting those rules into separate passes over
--- the whole program would mean running the sequence to a fixed point from
--- outside, which is the same computation with more traversals and a less
--- obvious bound.
---
--- ## Termination is structural, not budgeted
---
--- `Turkey.Mono`'s cap is a budget: monomorphization stops because it has spent enough,
--- not because it has finished. This pass does not work that way -- inlining
--- terminates when the call graph it walks is acyclic, and the standard way to
--- make it acyclic is to choose a **loop breaker** in each cycle and never
--- inline that one. The choice within a component is arbitrary but stable: the
--- lexicographically first, which is the first element because `Turkey.Deps`
--- sorts each component. Arbitrary because no criterion here is better than
--- another; stable because a `.opt` golden would otherwise move whenever a name
--- changed.
---
--- ## Arguments are bound, not substituted -- unless they are values
---
--- The evaluator is strict and left to right, so substituting an argument
--- expression into a body that mentions its parameter twice would evaluate it
--- twice, and into one that mentions it never would evaluate it never. So an
--- argument becomes a `CLet`, which is exactly a call-by-value binding. The
--- exception is an argument that is already a **value**: duplicating one
--- evaluates nothing, and substituting it is what lets the next reduction see
--- through it. A value that builds a heap object is the one whose copies cost
--- something, an object each, so it is substituted whole only where its
--- parameter is used at most once (`applyNames`).
---
--- ## Every binder is bound once
---
--- Every local binder has an id, and no id is bound twice in the program, in
--- the input or in the output: `Turkey.Coretc` checks it before
--- this pass and after it. Every rule that puts a second copy of a term in the
--- program makes it with `copyWith`, which gives each binder in the copy a
--- fresh id. So no rule has to ask whether moving a term under a binder
--- captures a variable: the binder and the variable have different ids. Each
--- rule keys a binder on its id, never on its spelling. A copy keeps its
--- original's spelling, so two binders of one binding may share a spelling,
--- and one may sit under the other: no pass after this one finds a binder by
--- its spelling, and a dump tells them apart by id.
---
--- The ids a reduction mints are deterministic however components are
--- scheduled; see `mint`.
---
--- ## One place that knows a node's shape
---
--- The shape of a node is read in one place -- `anyKid` -- and every walk that
--- only needs "the subterms" is written in terms of it. The walks that need
--- more than that (binders, free names, tail positions) say what more they need
--- beside their own recursion, which is where they differ from each other
--- anyway.
---
--- ## Constant folding: proven results only
---
--- A primitive applied to constants is replaced by the constant it computes
--- (`knownPrim`). The constants come from source a programmer wrote to read
--- well -- `Char.toInt(':')`, `-1`, a shift by a literal amount behind a range
--- check -- and from inlining, which substitutes them. A top-level binding
--- whose value folds becomes an atom, so `constant` puts it at every mention
--- and it is never a global the program loads.
---
--- **A trap never moves.** `Int` arithmetic panics on overflow, division at a
--- zero divisor, and `CharFromInt` is folded only for a scalar value. Such an
--- application is folded only when its constants are proven not to trap, by
--- `Turkey.Fold`, which `Turkey.Sccp` shares. Otherwise it stays as it is: not
--- a wrapped literal, and not an eager panic, because the application may sit
--- in a branch that never runs.
---
--- ## Not here: common subexpressions
---
--- A repeated pure expression occurs 32 times in 384,095 nodes of the Core
--- this pass leaves, over the test corpus and the compiler itself. And CSE
--- needs an effects analysis Core does not have: `isValue` is about cost, not
--- about whether two occurrences read the same mutable state.
+--- The local reductions, from inlining through loop-result fusion.
+---
+--- None of them knows what a monad is, and that is the point: a `bind` chain is
+--- reached the way any other saturated call to a known small function is
+--- reached.
+---
+--- Within either side of join discovery they are one traversal rather than a
+--- pass per rule, because they feed each other and it would be dishonest to
+--- pretend otherwise. Inlining `bind` puts a lambda in the function position of
+--- an application, which is beta; beta binds a parameter to a constructor
+--- application, which is case-of-known-constructor; and that selects a branch,
+--- which exposes the next call. Splitting those rules into separate passes over
+--- the whole program would mean running the sequence to a fixed point from
+--- outside, which is the same computation with more traversals and a less
+--- obvious bound.
+---
+--- ## Termination is structural, not budgeted
+---
+--- `Turkey.Mono`'s cap is a budget: monomorphization stops because it has spent enough,
+--- not because it has finished. This pass does not work that way -- inlining
+--- terminates when the call graph it walks is acyclic, and the standard way to
+--- make it acyclic is to choose a **loop breaker** in each cycle and never
+--- inline that one. The choice within a component is arbitrary but stable: the
+--- lexicographically first, which is the first element because `Turkey.Deps`
+--- sorts each component. Arbitrary because no criterion here is better than
+--- another; stable because a `.opt` golden would otherwise move whenever a name
+--- changed.
+---
+--- ## Arguments are bound, not substituted -- unless they are values
+---
+--- The evaluator is strict and left to right, so substituting an argument
+--- expression into a body that mentions its parameter twice would evaluate it
+--- twice, and into one that mentions it never would evaluate it never. So an
+--- argument becomes a `CLet`, which is exactly a call-by-value binding. The
+--- exception is an argument that is already a **value**: duplicating one
+--- evaluates nothing, and substituting it is what lets the next reduction see
+--- through it. A value that builds a heap object is the one whose copies cost
+--- something, an object each, so it is substituted whole only where its
+--- parameter is used at most once (`applyNames`).
+---
+--- ## Every binder is bound once
+---
+--- Every local binder has an id, and no id is bound twice in the program, in
+--- the input or in the output: `Turkey.Coretc` checks it before
+--- this pass and after it. Every rule that puts a second copy of a term in the
+--- program makes it with `copyWith`, which gives each binder in the copy a
+--- fresh id. So no rule has to ask whether moving a term under a binder
+--- captures a variable: the binder and the variable have different ids. Each
+--- rule keys a binder on its id, never on its spelling. A copy keeps its
+--- original's spelling, so two binders of one binding may share a spelling,
+--- and one may sit under the other: no pass after this one finds a binder by
+--- its spelling, and a dump tells them apart by id.
+---
+--- The ids a reduction mints are deterministic however components are
+--- scheduled; see `mint`.
+---
+--- ## One place that knows a node's shape
+---
+--- The shape of a node is read in one place -- `anyKid` -- and every walk that
+--- only needs "the subterms" is written in terms of it. The walks that need
+--- more than that (binders, free names, tail positions) say what more they need
+--- beside their own recursion, which is where they differ from each other
+--- anyway.
+---
+--- ## Constant folding: proven results only
+---
+--- A primitive applied to constants is replaced by the constant it computes
+--- (`knownPrim`). The constants come from source a programmer wrote to read
+--- well -- `Char.toInt(':')`, `-1`, a shift by a literal amount behind a range
+--- check -- and from inlining, which substitutes them. A top-level binding
+--- whose value folds becomes an atom, so `constant` puts it at every mention
+--- and it is never a global the program loads.
+---
+--- **A trap never moves.** `Int` arithmetic panics on overflow, division at a
+--- zero divisor, and `CharFromInt` is folded only for a scalar value. Such an
+--- application is folded only when its constants are proven not to trap, by
+--- `Turkey.Fold`, which `Turkey.Sccp` shares. Otherwise it stays as it is: not
+--- a wrapped literal, and not an eager panic, because the application may sit
+--- in a branch that never runs.
+---
+--- ## Not here: common subexpressions
+---
+--- A repeated pure expression occurs 32 times in 384,095 nodes of the Core
+--- this pass leaves, over the test corpus and the compiler itself. And CSE
+--- needs an effects analysis Core does not have: `isValue` is about cost, not
+--- about whether two occurrences read the same mutable state.
 
 import Data.Set as Set
 import Turkey.Ast (..)
@@ -116,21 +116,21 @@ import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Iter
 
--- How large a body may be and still be inlined, counted as `sizeOf_` counts.
--- Small enough that a call site does not become unreadable, large enough for
--- the things this exists to reach: a method's body, an instance's `bind`.
+--- How large a body may be and still be inlined, counted as `sizeOf_` counts.
+--- Small enough that a call site does not become unreadable, large enough for
+--- the things this exists to reach: a method's body, an instance's `bind`.
 let inlineLimit = 32
 
--- A shared join is copied only when specializing a known constructor makes the
--- copy small. Deliberately the same scale as ordinary inlining: both trade a
--- bounded amount of code for exposing a local reduction, and neither the
--- traffic through a join nor the number of callers gets to raise that bound.
+--- A shared join is copied only when specializing a known constructor makes the
+--- copy small. Deliberately the same scale as ordinary inlining: both trade a
+--- bounded amount of code for exposing a local reduction, and neither the
+--- traffic through a join nor the number of callers gets to raise that bound.
 let joinSpecializeLimit = inlineLimit
 
--- A larger body may be *examined* at a call site, but is admitted only if
--- applying the known arguments and reducing it brings the residual back under
--- `inlineLimit`. This bounds the work spent asking the question as well as the
--- code ultimately copied. It is deliberately not another emission limit.
+--- A larger body may be *examined* at a call site, but is admitted only if
+--- applying the known arguments and reducing it brings the residual back under
+--- `inlineLimit`. This bounds the work spent asking the question as well as the
+--- code ultimately copied. It is deliberately not another emission limit.
 let speculativeInlineLimit = inlineLimit * 4
 
 -- What a call may cost when its result is scrutinised right there. The
@@ -252,26 +252,26 @@ fun callGraph(binds : Vec CBind, walked : Array Walked) -> Map String (Set.Set S
     graph
 }
 
--- Enough bindings that every cycle contains one, never to be inlined.
---
--- One per component is not enough. Removing a component's breaker cuts the
--- cycles through it, and a component can hold others: `head` calling itself
--- beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
--- inlining the survivors then does not terminate. So what is left of a
--- component once its breaker is out is split into components again, until none
--- is cyclic.
---
--- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
--- the first is the lexicographically first name, and a golden that depends on
--- which binding was broken does not move when an unrelated one is added.
---
--- The breaker is the first member that is not in `dicts`, and a dictionary
--- only when every member is one. A method read out of a known dictionary
--- (`Methods.knownField`) is a step that never asks the breakers, so a cycle
--- broken only at a dictionary is still followed by inlining, round and round.
--- A directly recursive instance method is exactly such a cycle: it calls
--- itself through its own instance's dictionary, and the dictionary's name
--- sorts first because it is a prefix of the method's.
+--- Enough bindings that every cycle contains one, never to be inlined.
+---
+--- One per component is not enough. Removing a component's breaker cuts the
+--- cycles through it, and a component can hold others: `head` calling itself
+--- beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
+--- inlining the survivors then does not terminate. So what is left of a
+--- component once its breaker is out is split into components again, until none
+--- is cyclic.
+---
+--- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
+--- the first is the lexicographically first name, and a golden that depends on
+--- which binding was broken does not move when an unrelated one is added.
+---
+--- The breaker is the first member that is not in `dicts`, and a dictionary
+--- only when every member is one. A method read out of a known dictionary
+--- (`Methods.knownField`) is a step that never asks the breakers, so a cycle
+--- broken only at a dictionary is still followed by inlining, round and round.
+--- A directly recursive instance method is exactly such a cycle: it calls
+--- itself through its own instance's dictionary, and the dictionary's name
+--- sorts first because it is a prefix of the method's.
 fun loopBreakers(graph : Map String (Set.Set String), dicts : Methods.Dictionaries)
         -> Set.Set String {
     let out = Set.new()
@@ -619,32 +619,32 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
 -- How many times `reduceProgram` has been called, which numbers its runs from 1.
 var runs = 0
 
--- Every binding's body, reduced -- callees before their callers.
---
--- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
--- site asks for it, and if that call site is itself inside a body being
--- reduced, the callee's traversal runs *nested inside* the caller's. On a
--- program with a deep call graph that makes the traversal's stack depth the
--- product of call-graph depth and term depth, which is what made this pass
--- unable to compile the bootstrap compiler at all.
---
--- Reducing in dependency order -- `Deps.sccs` already emits it -- means the
--- memo is warm before anyone asks, so `bodyOf` is a lookup and every traversal
--- is one term deep. Within a cycle there is no such order and the nesting can
--- still happen, but it is then bounded by the size of the component rather than
--- by the height of the whole graph.
---
--- A component waits only for the components it mentions, so components that do
--- not depend on each other are reduced at once, one per worker
--- (`Parallel.graphWith`). What makes that safe and the output the same however
--- they are scheduled: a component writes only its own `Done`, which nothing
--- reads until it has finished; it reads only finished components' and its
--- own; the answers a worker keeps across components are about finished
--- components, and so the same whoever asked first but for the ids in a
--- reduced body, which reach the output only through a copy; and the binders
--- it makes are minted into an owner of its own (`mint`). One component is
--- reduced by one worker, in order, because within a cycle what is known
--- depends on that order.
+--- Every binding's body, reduced -- callees before their callers.
+---
+--- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
+--- site asks for it, and if that call site is itself inside a body being
+--- reduced, the callee's traversal runs *nested inside* the caller's. On a
+--- program with a deep call graph that makes the traversal's stack depth the
+--- product of call-graph depth and term depth, which is what made this pass
+--- unable to compile the bootstrap compiler at all.
+---
+--- Reducing in dependency order -- `Deps.sccs` already emits it -- means the
+--- memo is warm before anyone asks, so `bodyOf` is a lookup and every traversal
+--- is one term deep. Within a cycle there is no such order and the nesting can
+--- still happen, but it is then bounded by the size of the component rather than
+--- by the height of the whole graph.
+---
+--- A component waits only for the components it mentions, so components that do
+--- not depend on each other are reduced at once, one per worker
+--- (`Parallel.graphWith`). What makes that safe and the output the same however
+--- they are scheduled: a component writes only its own `Done`, which nothing
+--- reads until it has finished; it reads only finished components' and its
+--- own; the answers a worker keeps across components are about finished
+--- components, and so the same whoever asked first but for the ids in a
+--- reduced body, which reach the output only through a copy; and the binders
+--- it makes are minted into an owner of its own (`mint`). One component is
+--- reduced by one worker, in order, because within a cycle what is known
+--- depends on that order.
 fun reduceProgram(program : CProgram, decls : DeclTable, table : Binders.Table,
                   keepsCallSites : fun(String) -> Bool) -> CProgram {
     let binds = Vec.append(program.dicts, program.binds)
@@ -2448,17 +2448,17 @@ fun consumeTail(r : Reducer, e : Core, alts : Vec CAlt, ty : Ty.Type,
 
 -- -- copying a term ----------------------------------------------------------------------
 
--- `value` with free type variables replaced by a call's type arguments.
---
--- The erased-language equivalent of beta-reducing a `CTyApp`. Deliberately
--- happy with non-ground arguments: unlike monomorphization it makes no
--- top-level copy and cannot chase polymorphic recursion, and a phantom variable
--- such as a lifted loop's uninhabited `Brk` slot is exactly the case that
--- brought this rule here.
---
--- A binder introduces a type variable rather than using one, so `mapKind`
--- leaves those alone; the types under them may still mention an outer variable
--- and are therefore walked normally.
+--- `value` with free type variables replaced by a call's type arguments.
+---
+--- The erased-language equivalent of beta-reducing a `CTyApp`. Deliberately
+--- happy with non-ground arguments: unlike monomorphization it makes no
+--- top-level copy and cannot chase polymorphic recursion, and a phantom variable
+--- such as a lifted loop's uninhabited `Brk` slot is exactly the case that
+--- brought this rule here.
+---
+--- A binder introduces a type variable rather than using one, so `mapKind`
+--- leaves those alone; the types under them may still mention an outer variable
+--- and are therefore walked normally.
 fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
     mkCore(substitute(e.ty, mapping), e.span, mapKind(e.kind, Mapper {
         expr = fun(x) = instantiateTypes(x, mapping),
@@ -2475,13 +2475,13 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
 -- that puts them in more than one place.
 fun copyAlts(r : Reducer, alts : Vec CAlt) -> Vec CAlt = freshenedAlts(fun() = mint(r), alts)
 
--- Returns a copy of `e` in which every binder has a fresh id from `mint`, and
--- every opening a fresh rigid constant for each it makes, with the references
--- and types renamed to match. Free variables keep their ids.
+--- Returns a copy of `e` in which every binder has a fresh id from `mint`, and
+--- every opening a fresh rigid constant for each it makes, with the references
+--- and types renamed to match. Free variables keep their ids.
 fun freshened(mint : fun() -> Int, e : Core) -> Core =
     copyWith(mint, e, Map.new(), Map.new(), True, None)
 
--- Returns a copy of `alts` as `freshened` copies a term, patterns included.
+--- Returns a copy of `alts` as `freshened` copies a term, patterns included.
 fun freshenedAlts(mint : fun() -> Int, alts : Vec CAlt) -> Vec CAlt {
     let c = copier(mint, Map.new(), noScrutinees, Map.new(), True, None)
     Vec.map(alts, fun(a) = CAlt { alt = bindAlt(c, a.alt), body = copyTerm(c, a.body) })
@@ -2959,26 +2959,26 @@ fun atomic(e : Core) -> Bool = match e.kind {
     _ -> False
 }
 
--- Roughly the code `e` becomes, for the inliner to spend a budget of.
---
--- Counting every node as one is what this did, and it charges for a great deal
--- that is not code. `Main#inc` in the brainfuck benchmark -- one array element
--- read, incremented and written back -- measured 98 against a budget of 40 and
--- so stayed a call, while the loop that called it three times a cycle paid a
--- frame, a spill set and a panic-flag test for each. Most of those 98 nodes
--- were names: `match xs { Data.Vec#Vec(value) -> value }` appeared four
--- times, which is a single-constructor unpack and lowers to one load, and the
--- `let`s naming each intermediate lower to nothing at all, the backend being in
--- SSA already.
---
--- So: a variable, a primitive, a literal and a nullary constructor are
--- operands and cost nothing; a type application is erased; a `let` is a name for a value, and
--- costs what it names. A match with one alternative is a projection -- the
--- backend does not even test the tag -- while one with several costs a branch
--- each. This is GHC's `sizeExpr`, which is free for variables, literals, types
--- and coercions and charges per case alternative, and it is the same reasoning
--- as the discounts already here: the budget should track what a call site
--- actually grows by.
+--- Roughly the code `e` becomes, for the inliner to spend a budget of.
+---
+--- Counting every node as one is what this did, and it charges for a great deal
+--- that is not code. `Main#inc` in the brainfuck benchmark -- one array element
+--- read, incremented and written back -- measured 98 against a budget of 40 and
+--- so stayed a call, while the loop that called it three times a cycle paid a
+--- frame, a spill set and a panic-flag test for each. Most of those 98 nodes
+--- were names: `match xs { Data.Vec#Vec(value) -> value }` appeared four
+--- times, which is a single-constructor unpack and lowers to one load, and the
+--- `let`s naming each intermediate lower to nothing at all, the backend being in
+--- SSA already.
+---
+--- So: a variable, a primitive, a literal and a nullary constructor are
+--- operands and cost nothing; a type application is erased; a `let` is a name for a value, and
+--- costs what it names. A match with one alternative is a projection -- the
+--- backend does not even test the tag -- while one with several costs a branch
+--- each. This is GHC's `sizeExpr`, which is free for variables, literals, types
+--- and coercions and charges per case alternative, and it is the same reasoning
+--- as the discounts already here: the budget should track what a call site
+--- actually grows by.
 fun sizeOf_(e : Core) -> Int = match e.kind {
     CVar(_) -> 0
     CPrim(_) -> 0

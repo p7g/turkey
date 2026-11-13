@@ -13,39 +13,39 @@ export (
     liveness, livenessInOut, liveAfter, termUses, pruneUnreachable,
 )
 
--- The low IR: an SSA control-flow graph, parameterized over its instructions.
---
--- The parameter is the design. Instruction selection produces a *different*
--- instruction type rather than rewriting this one in place, so that after it a
--- virtual opcode is not representable and every `match` stays exhaustive --
--- and the analyses below, which are the subtle part, are written once for
--- both. QBE and Go put virtual and machine instructions in one enum and pay
--- nothing for it, because neither C nor Go checks a `switch` for
--- exhaustiveness; Hoopl's graph is parameterized over its node type for
--- exactly the reason this one is.
---
--- Three things follow from Turkey rather than from taste:
---
--- * **A value is a dense index**, because there is no object identity and so
---   nothing to point at. Everything known about a value lives in an array
---   indexed by it. That is also what Cranelift's entity
---   references and Go's `ssa.Value` ids are, so the constraint pushes toward
---   what a backend wants anyway. `Value` and `BlockId` are newtypes and are
---   therefore free -- a single-field immutable wrapper is its payload and is
---   not allocated -- so the two index spaces can be kept apart at no cost.
--- * **Blocks take parameters and jumps carry arguments**, rather than phi
---   nodes. A jump with arguments is a parallel copy at a named point, which is
---   what going out of SSA and allocating registers both need; a phi is a
---   pseudo-instruction that every pass has to special-case.
--- * **A block's terminator is not optional.** Hoopl indexes a block by its
---   shape at entry and exit so that one which must end in a terminator cannot
---   fall through, and needs GADTs to do it. A non-optional field says the same
---   thing, and `Unreachable` is what an unfinished block holds while it is
---   being built.
---
--- SSA here is *function-wide*: a definition dominates its uses. A block-local
--- rule would force everything crossing an edge through memory, which makes
--- promoting it a precondition for every optimization rather than one of them.
+--- The low IR: an SSA control-flow graph, parameterized over its instructions.
+---
+--- The parameter is the design. Instruction selection produces a *different*
+--- instruction type rather than rewriting this one in place, so that after it a
+--- virtual opcode is not representable and every `match` stays exhaustive --
+--- and the analyses below, which are the subtle part, are written once for
+--- both. QBE and Go put virtual and machine instructions in one enum and pay
+--- nothing for it, because neither C nor Go checks a `switch` for
+--- exhaustiveness; Hoopl's graph is parameterized over its node type for
+--- exactly the reason this one is.
+---
+--- Three things follow from Turkey rather than from taste:
+---
+--- * **A value is a dense index**, because there is no object identity and so
+---   nothing to point at. Everything known about a value lives in an array
+---   indexed by it. That is also what Cranelift's entity
+---   references and Go's `ssa.Value` ids are, so the constraint pushes toward
+---   what a backend wants anyway. `Value` and `BlockId` are newtypes and are
+---   therefore free -- a single-field immutable wrapper is its payload and is
+---   not allocated -- so the two index spaces can be kept apart at no cost.
+--- * **Blocks take parameters and jumps carry arguments**, rather than phi
+---   nodes. A jump with arguments is a parallel copy at a named point, which is
+---   what going out of SSA and allocating registers both need; a phi is a
+---   pseudo-instruction that every pass has to special-case.
+--- * **A block's terminator is not optional.** Hoopl indexes a block by its
+---   shape at entry and exit so that one which must end in a terminator cannot
+---   fall through, and needs GADTs to do it. A non-optional field says the same
+---   thing, and `Unreachable` is what an unfinished block holds while it is
+---   being built.
+---
+--- SSA here is *function-wide*: a definition dominates its uses. A block-local
+--- rule would force everything crossing an edge through memory, which makes
+--- promoting it a precondition for every optimization rather than one of them.
 
 -- No diagnostics: `verify` answers with complaints rather than failing, so
 -- this module reports nothing itself.
@@ -59,33 +59,33 @@ import Iter
 
 -- -- values and representations ---------------------------------------------------
 
--- A value, as an index into the function's side tables.
+--- A value, as an index into the function's side tables.
 type Value = Value(Int)
 
 fun valueId(Value(n)) -> Int = n
 
--- A block, as an index into `Func.blocks`. Distinct from `Value` so that the
--- two cannot be confused, which costs nothing: both erase to a machine
--- integer.
+--- A block, as an index into `Func.blocks`. Distinct from `Value` so that the
+--- two cannot be confused, which costs nothing: both erase to a machine
+--- integer.
 type BlockId = BlockId(Int)
 
 fun blockId(BlockId(n)) -> Int = n
 
--- What a register has to hold. Instruction selection reads this.
--- `Unit` is zero-width and occupies no register. Every instruction defines a
--- value, so an effectful one defines a unit -- and without this that would
--- burn a register per store, per call for effect, per assignment. LLVM's
--- `void` and QBE's absent return type are the same choice.
+--- What a register has to hold. Instruction selection reads this.
+--- `Unit` is zero-width and occupies no register. Every instruction defines a
+--- value, so an effectful one defines a unit -- and without this that would
+--- burn a register per store, per call for effect, per assignment. LLVM's
+--- `void` and QBE's absent return type are the same choice.
 type RepClass = Unit | I1 | I8 | I32 | I64 | F64 | Ptr
 
--- A representation is two facts, not one.
---
--- Spelling them as members of one enum -- `ptr` beside `boxed` -- works until
--- something asks a register class about a `boxed`. A register class and a
--- collector obligation are different questions and both get asked.
+--- A representation is two facts, not one.
+---
+--- Spelling them as members of one enum -- `ptr` beside `boxed` -- works until
+--- something asks a register class about a `boxed`. A register class and a
+--- collector obligation are different questions and both get asked.
 type Rep = Rep {
     class_ : RepClass,
-    -- Whether the collector must find this value at a safepoint.
+    --- Whether the collector must find this value at a safepoint.
     traced : Bool,
 }
 
@@ -105,39 +105,39 @@ fun traced(c : RepClass) -> Rep = Rep { class_ = c, traced = True }
 
 fun untraced(c : RepClass) -> Rep = Rep { class_ = c, traced = False }
 
--- A traced pointer prints `ptr*`: the star is the collector's obligation, kept
--- separate from the register class it is printed beside.
+--- A traced pointer prints `ptr*`: the star is the collector's obligation, kept
+--- separate from the register class it is printed beside.
 instance Show Rep {
     fun show(r) = if r.traced { show(r.class_) + "*" } else { show(r.class_) }
 }
 
 -- -- layouts ------------------------------------------------------------------------
 
--- How a value of some type is held: its slots, in order, one `Rep` each. A
--- value with no slots occupies nothing, and is held at `Unit` when it has to
--- be held at all. Each slot is one register, so a layout of n slots is n
--- values once lowered.
---
--- Declared here rather than in `Turkey.Layout`, which computes them, because
--- `Turkey.Ast` and `Turkey.Core` hold layouts and `Turkey.Layout` imports both.
+--- How a value of some type is held: its slots, in order, one `Rep` each. A
+--- value with no slots occupies nothing, and is held at `Unit` when it has to
+--- be held at all. Each slot is one register, so a layout of n slots is n
+--- values once lowered.
+---
+--- Declared here rather than in `Turkey.Layout`, which computes them, because
+--- `Turkey.Ast` and `Turkey.Core` hold layouts and `Turkey.Layout` imports both.
 type Layout = Layout { slots : Array Rep }
 
--- Returns the name of `l` as a copy's name spells it, `f@[i64,ptr]`, and as
--- the dumps print it. Distinct layouts get distinct names, so a name can key a
--- map in place of its layout. Nothing else spells a layout.
+--- Returns the name of `l` as a copy's name spells it, `f@[i64,ptr]`, and as
+--- the dumps print it. Distinct layouts get distinct names, so a name can key a
+--- map in place of its layout. Nothing else spells a layout.
 fun layoutName(l : Layout) -> String =
     -- Name no slots `unit`, and join several with `+`, which cannot be confused
     -- with the `,` that `keyName` puts between a key's layouts.
     if len(l.slots) == 0 { "unit" }
     else { String.join(Array.map(l.slots, slotName), "+") }
 
--- Returns the name of a key of several layouts, as a copy's name spells it
--- between `@[` and `]`: each layout's name, joined by `,`.
+--- Returns the name of a key of several layouts, as a copy's name spells it
+--- between `@[` and `]`: each layout's name, joined by `,`.
 fun keyName(parts : Vec Layout) -> String =
     String.join(Vec.map(parts, layoutName), ",")
 
--- Returns a slot's class, except that a pointer is `ptr` when the collector
--- traces it and `addr` when it does not.
+--- Returns a slot's class, except that a pointer is `ptr` when the collector
+--- traces it and `addr` when it does not.
 fun slotName(r : Rep) -> String = match (r.class_, r.traced) {
     (Ptr, True) -> "ptr"
     (Ptr, False) -> "addr"
@@ -149,20 +149,20 @@ fun slotName(r : Rep) -> String = match (r.class_, r.traced) {
 
 -- -- effects ------------------------------------------------------------------------
 
--- What an instruction may do, which is what reordering, elimination and
--- garbage collection all need to ask.
---
--- `allocates` is the load-bearing one: allocation is the only thing that can
--- trigger a collection, so an allocating instruction is a **safepoint**, and a
--- safepoint is where the register allocator has to record which registers hold
--- traced values. Without that bit a backend has no choice but to root every
--- pointer live anywhere in the function: one measured frame needed 481 slots
--- that way, against the handful a safepoint actually requires.
---
--- `traps` and `diverges` are different questions. `diverges` is "never
--- returns", as for a call to a bottoming function. `traps` is "may not return"
--- -- an `add` that overflows panics -- and a dead-code pass may not delete a
--- trapping instruction on the grounds that its result is unused.
+--- What an instruction may do, which is what reordering, elimination and
+--- garbage collection all need to ask.
+---
+--- `allocates` is the load-bearing one: allocation is the only thing that can
+--- trigger a collection, so an allocating instruction is a **safepoint**, and a
+--- safepoint is where the register allocator has to record which registers hold
+--- traced values. Without that bit a backend has no choice but to root every
+--- pointer live anywhere in the function: one measured frame needed 481 slots
+--- that way, against the handful a safepoint actually requires.
+---
+--- `traps` and `diverges` are different questions. `diverges` is "never
+--- returns", as for a call to a bottoming function. `traps` is "may not return"
+--- -- an `add` that overflows panics -- and a dead-code pass may not delete a
+--- trapping instruction on the grounds that its result is unused.
 type Effects = Effects {
     var reads     : Bool,
     var writes    : Bool,
@@ -171,10 +171,10 @@ type Effects = Effects {
     var diverges  : Bool,
 }
 
--- The union of two effects, and the effect of doing nothing. An instruction
--- that both reads and traps is `reads_() <> traps()`, and a fold over a
--- block's instructions is `Array.fold` with no special case for the empty one,
--- which is what a monoid is for.
+--- The union of two effects, and the effect of doing nothing. An instruction
+--- that both reads and traps is `reads_() <> traps()`, and a fold over a
+--- block's instructions is `Array.fold` with no special case for the empty one,
+--- which is what a monoid is for.
 instance Semigroup Effects {
     fun combine(a, b) = Effects {
         reads = a.reads || b.reads,
@@ -224,34 +224,34 @@ fun traps() -> Effects {
 
 fun isSafepoint(e : Effects) -> Bool = e.allocates
 
--- May an instruction whose result is unused be deleted?
---
--- Not the same as "pure". A read may be deleted -- reading has no effect on
--- anything else -- and so may an allocation, since a collection is not
--- observable. What may not be deleted is a write, a trap or a divergence,
--- because each is the whole reason the instruction is there.
+--- May an instruction whose result is unused be deleted?
+---
+--- Not the same as "pure". A read may be deleted -- reading has no effect on
+--- anything else -- and so may an allocation, since a collection is not
+--- observable. What may not be deleted is a write, a trap or a divergence,
+--- because each is the whole reason the instruction is there.
 fun deletable(e : Effects) -> Bool = !e.writes && !e.traps && !e.diverges
 
 -- -- the graph ----------------------------------------------------------------------
 
--- Terminators are shared by every instantiation, because they are what the
--- control-flow graph is made of: both a virtual and a machine instruction
--- sequence branches and jumps, and every analysis below reads only this.
+--- Terminators are shared by every instantiation, because they are what the
+--- control-flow graph is made of: both a virtual and a machine instruction
+--- sequence branches and jumps, and every analysis below reads only this.
 type Term
-    -- The function's results, one per register it answers in, in the order
-    -- `Func.results` gives their representations.
+    --- The function's results, one per register it answers in, in the order
+    --- `Func.results` gives their representations.
     = Ret(Vec Value)
-    -- The arguments are the target block's parameters, positionally.
+    --- The arguments are the target block's parameters, positionally.
     | Jump(BlockId, Vec Value)
     | Branch(Value, BlockId, BlockId)
-    -- A multi-way branch on an integer: to the case equal to the value, or
-    -- else to the default. Like `Branch`, it passes its targets nothing.
-    -- No default says the cases are every value the operand can hold, which
-    -- is what lets a lowering test fewer of them than there are.
+    --- A multi-way branch on an integer: to the case equal to the value, or
+    --- else to the default. Like `Branch`, it passes its targets nothing.
+    --- No default says the cases are every value the operand can hold, which
+    --- is what lets a lowering test fewer of them than there are.
     | Switch(Value, Vec (Int, BlockId), Option BlockId)
     | Panic(Value)
-    -- What an unfinished block holds while it is built, and what a block after
-    -- a diverging call legitimately ends with.
+    --- What an unfinished block holds while it is built, and what a block after
+    --- a diverging call legitimately ends with.
     | Unreachable
 
 fun successors(t : Term) -> Array BlockId = match t {
@@ -273,9 +273,9 @@ type Block i = Block {
     var params : Vec Value,
     var insts  : Vec i,
     var term   : Term,
-    -- The terminator's source position, packed (`Turkey.Position`), since a
-    -- terminator defines no value to carry one. Like an instruction's, it
-    -- never decides code: nothing compares or keys on it.
+    --- The terminator's source position, packed (`Turkey.Position`), since a
+    --- terminator defines no value to carry one. Like an instruction's, it
+    --- never decides code: nothing compares or keys on it.
     var termAt : Int,
 }
 
@@ -285,48 +285,48 @@ fun newBlock() -> Block i =
 type Func i = Func {
     name       : String,
     params     : Vec Value,
-    -- What the function answers in, one `Rep` per register: one for most
-    -- functions, and a flat value's slots for a function that returns one in
-    -- several registers. Each register's `Rep` is fixed, whatever value is
-    -- returned, so the collector never has to ask which constructor came
-    -- back to know whether a result register holds a pointer.
+    --- What the function answers in, one `Rep` per register: one for most
+    --- functions, and a flat value's slots for a function that returns one in
+    --- several registers. Each register's `Rep` is fixed, whatever value is
+    --- returned, so the collector never has to ask which constructor came
+    --- back to know whether a result register holds a pointer.
     results    : Array Rep,
     var blocks : Vec (Block i),
     var entry  : BlockId,
-    -- Indexed by `valueId`. The side table a dense index buys.
+    --- Indexed by `valueId`. The side table a dense index buys.
     reps   : Vec Rep,
-    -- Where in the source an instruction that may allocate, or a string
-    -- literal, came from, by the value it defines. Read by diagnostics only -- the giblets check prints
-    -- it -- so nothing is lost but a location when a pass does not carry it.
+    --- Where in the source an instruction that may allocate, or a string
+    --- literal, came from, by the value it defines. Read by diagnostics only -- the giblets check prints
+    --- it -- so nothing is lost but a location when a pass does not carry it.
     var origins : Map Int Span,
-    -- What source construct an allocating instruction was lowered from, where
-    -- the opcode alone does not say: an `ObjectNew` is a constructor, a record
-    -- or an existential package. Diagnostics only, like `origins`.
+    --- What source construct an allocating instruction was lowered from, where
+    --- the opcode alone does not say: an `ObjectNew` is a constructor, a record
+    --- or an existential package. Diagnostics only, like `origins`.
     var reasons : Map Int String,
-    -- Where the function is declared, packed (`Turkey.Position`), or 0 for one
-    -- the compiler made. Its entry's parameter moves and its prologue take it.
+    --- Where the function is declared, packed (`Turkey.Position`), or 0 for one
+    --- the compiler made. Its entry's parameter moves and its prologue take it.
     var at : Int,
-    -- The calls inlined into the function that its positions name, numbered
-    -- from 1 by the site field of a position (`Turkey.Position`).
+    --- The calls inlined into the function that its positions name, numbered
+    --- from 1 by the site field of a position (`Turkey.Position`).
     var sites : Vec Position.Site,
-    -- With `-g`, the variables of the source the function binds, and the
-    -- ones each value holds, by value id: a value holds a variable, or one
-    -- slot of a variable held in several (`holding`). It holds it from its
-    -- definition on, or from an assignment to the variable at one of the
-    -- points `anchors` gives it there, by value id (`holdFrom`). Debug
-    -- information is the only reader, so a pass that loses a value's entry
-    -- loses only what a debugger shows.
+    --- With `-g`, the variables of the source the function binds, and the
+    --- ones each value holds, by value id: a value holds a variable, or one
+    --- slot of a variable held in several (`holding`). It holds it from its
+    --- definition on, or from an assignment to the variable at one of the
+    --- points `anchors` gives it there, by value id (`holdFrom`). Debug
+    --- information is the only reader, so a pass that loses a value's entry
+    --- loses only what a debugger shows.
     var variables : Vec Variable,
     var holds     : Map Int (Vec (Int, Int)),
     var anchors   : Map Int (Vec (Int, Int, Anchor)),
-    -- The variable each slot of a `var` holds, by slot, which `Turkey.Promote`
-    -- gives the values it puts in the slot's place.
+    --- The variable each slot of a `var` holds, by slot, which `Turkey.Promote`
+    --- gives the values it puts in the slot's place.
     var slotHolds : Map Int Int,
-    -- The module that declares the binding the function was lowered from,
-    -- lambdas and instance methods included, and for a lambda lifted out of
-    -- an initializer, the module of the global it initializes; empty for one
-    -- the compiler made for the whole program, such as an initializer. The giblets check and
-    -- poll insertion decide by it.
+    --- The module that declares the binding the function was lowered from,
+    --- lambdas and instance methods included, and for a lambda lifted out of
+    --- an initializer, the module of the global it initializes; empty for one
+    --- the compiler made for the whole program, such as an initializer. The giblets check and
+    --- poll insertion decide by it.
     var module_ : String,
 }
 
@@ -337,10 +337,10 @@ fun newFunc(name : String, results : Array Rep) -> Func i = Func {
     anchors = Map.new(), slotHolds = Map.new(), module_ = "",
 }
 
--- A local of the source, as a debugger shows it: its name, the position of
--- its binding (`Turkey.Position`), whether it is one of the function's
--- parameters, its type, and how it is held: at `layout`, in its slots, or in
--- one pointer to an object of them if `boxed`.
+--- A local of the source, as a debugger shows it: its name, the position of
+--- its binding (`Turkey.Position`), whether it is one of the function's
+--- parameters, its type, and how it is held: at `layout`, in its slots, or in
+--- one pointer to an object of them if `boxed`.
 type Variable = Variable {
     name      : String,
     declared  : Int,
@@ -350,18 +350,18 @@ type Variable = Variable {
     boxed     : Bool,
 }
 
--- What value `id` holds: each variable, as an index into `Func.variables`,
--- and which of its slots, or -1 for the whole of it.
+--- What value `id` holds: each variable, as an index into `Func.variables`,
+--- and which of its slots, or -1 for the whole of it.
 fun holding(f : Func i, id : Int) -> Vec (Int, Int) = Map.getOr(f.holds, id, [])
 
--- A point in a block that a pass names by the values around it, which
--- outlast the instructions between them: just after the definition of a
--- value, its block's start for a block parameter, or just before the
--- definition of a value.
+--- A point in a block that a pass names by the values around it, which
+--- outlast the instructions between them: just after the definition of a
+--- value, its block's start for a block parameter, or just before the
+--- definition of a value.
 type Anchor = After(Int) | Before(Int)
 
--- Records that value `id` holds slot `slot` of variable `k`, or the whole of
--- it if `slot` is -1, from its definition on.
+--- Records that value `id` holds slot `slot` of variable `k`, or the whole of
+--- it if `slot` is -1, from its definition on.
 fun hold(f : Func i, id : Int, k : Int, slot : Int) -> Unit {
     addHolding(f, id, k, slot)
     if let Some(anchored) = Map.get(f.anchors, id) {
@@ -369,10 +369,10 @@ fun hold(f : Func i, id : Int, k : Int, slot : Int) -> Unit {
     }
 }
 
--- Records that value `id` holds slot `slot` of variable `k`, or the whole of
--- it, from an assignment at `at` on, as well as from any point it already
--- does. Records nothing if `at` is `None`: a pass that cannot name where an
--- assignment is leaves the variable to the values that hold it elsewhere.
+--- Records that value `id` holds slot `slot` of variable `k`, or the whole of
+--- it, from an assignment at `at` on, as well as from any point it already
+--- does. Records nothing if `at` is `None`: a pass that cannot name where an
+--- assignment is leaves the variable to the values that hold it elsewhere.
 fun holdFrom(f : Func i, id : Int, k : Int, slot : Int, at : Option Anchor) -> Unit {
     let a = match at {
         Some(a) -> a
@@ -395,8 +395,8 @@ fun addHolding(f : Func i, id : Int, k : Int, slot : Int) -> Unit = match Map.ge
     None -> Map.put(f.holds, id, [(k, slot)])
 }
 
--- Returns the points value `id` holds slot `slot` of variable `k` from, or
--- nothing if it holds it from its definition.
+--- Returns the points value `id` holds slot `slot` of variable `k` from, or
+--- nothing if it holds it from its definition.
 fun anchorsOf(f : Func i, id : Int, k : Int, slot : Int) -> Vec Anchor {
     let out = []
     for (k2, s2, a) in Map.getOr(f.anchors, id, []) {
@@ -405,11 +405,11 @@ fun anchorsOf(f : Func i, id : Int, k : Int, slot : Int) -> Vec Anchor {
     out
 }
 
--- Returns the anchor of the point before instruction `index` of `block`:
--- just after the last value defined before it, or the block's start through
--- a parameter, or just before the first value defined after it, of the
--- values `kept` accepts, which are those that outlast the pass asking.
--- Returns `None` if the block defines none of them.
+--- Returns the anchor of the point before instruction `index` of `block`:
+--- just after the last value defined before it, or the block's start through
+--- a parameter, or just before the first value defined after it, of the
+--- values `kept` accepts, which are those that outlast the pass asking.
+--- Returns `None` if the block defines none of them.
 fun anchorAt[Inst i](block : Block i, index : Int, kept : fun(Value) -> Bool) -> Option Anchor {
     for var k = index - 1; k >= 0; k = k - 1 {
         let made = Vec.filter(defs(block.insts[k]), kept)
@@ -423,10 +423,10 @@ fun anchorAt[Inst i](block : Block i, index : Int, kept : fun(Value) -> Bool) ->
     None
 }
 
--- Gives value `to` what `from` holds: for a pass that replaces every read
--- of `from` with `to`, where `at` is the point `from` was defined at. What
--- `from` held from its definition, `to` holds from `at`, since `to` may be
--- defined earlier, when the variable held something else.
+--- Gives value `to` what `from` holds: for a pass that replaces every read
+--- of `from` with `to`, where `at` is the point `from` was defined at. What
+--- `from` held from its definition, `to` holds from `at`, since `to` may be
+--- defined earlier, when the variable held something else.
 fun carryHolds(f : Func i, from : Int, to : Int, at : Option Anchor) -> Unit {
     if from == to { return }
     for (k, slot) in holding(f, from) {
@@ -436,7 +436,7 @@ fun carryHolds(f : Func i, from : Int, to : Int, at : Option Anchor) -> Unit {
     }
 }
 
--- A value of the given representation, appended to the function's table.
+--- A value of the given representation, appended to the function's table.
 fun freshValue(f : Func i, r : Rep) -> Value {
     let id = len(f.reps)
     Vec.push(f.reps, r)
@@ -447,37 +447,37 @@ fun repOf(f : Func i, v : Value) -> Rep = f.reps[valueId(v)]
 
 fun blockAt(f : Func i, b : BlockId) -> Block i = f.blocks[blockId(b)]
 
--- What every analysis and generic pass needs of an instruction, and nothing
--- more.
---
--- Anything opcode-specific -- what a particular opcode's operands must be,
--- what it computes -- belongs to the module that declares the instruction
--- type, not here, because the generic passes cannot use it and adding it would
--- make this class a place where target knowledge accumulates. `copyOf` is the
--- one question about an opcode's meaning, and it is here because the answer is
--- target-neutral: a copy is a copy on either side of selection.
--- `Show` is a superclass rather than a `render` method of its own: printing an
--- instruction is not a backend concept, and an instruction that could not be
--- shown would be one nothing could debug.
+--- What every analysis and generic pass needs of an instruction, and nothing
+--- more.
+---
+--- Anything opcode-specific -- what a particular opcode's operands must be,
+--- what it computes -- belongs to the module that declares the instruction
+--- type, not here, because the generic passes cannot use it and adding it would
+--- make this class a place where target knowledge accumulates. `copyOf` is the
+--- one question about an opcode's meaning, and it is here because the answer is
+--- target-neutral: a copy is a copy on either side of selection.
+--- `Show` is a superclass rather than a `render` method of its own: printing an
+--- instruction is not a backend concept, and an instruction that could not be
+--- shown would be one nothing could debug.
 class Inst i : Show i {
-    -- Whether the function holds of some value the instruction reads, or
-    -- defines, asked in operand order and stopping at the first that answers
-    -- true. Visitors rather than arrays, which would read better, as a
-    -- compromise for speed: every pass asks this of every instruction, and a
-    -- returned array escapes to its caller, so it is an allocation per
-    -- question that no analysis removes. `eachUse` and `eachDef` are the loops.
+    --- Whether the function holds of some value the instruction reads, or
+    --- defines, asked in operand order and stopping at the first that answers
+    --- true. Visitors rather than arrays, which would read better, as a
+    --- compromise for speed: every pass asks this of every instruction, and a
+    --- returned array escapes to its caller, so it is an allocation per
+    --- question that no analysis removes. `eachUse` and `eachDef` are the loops.
     fun anyUse(i, fun(Value) -> Bool) -> Bool
     fun anyDef(i, fun(Value) -> Bool) -> Bool
-    -- The same values as arrays, for a caller that keeps them.
+    --- The same values as arrays, for a caller that keeps them.
     fun uses(inst : i) -> Vec Value = collect(anyUse(inst, _))
     fun defs(inst : i) -> Vec Value = collect(anyDef(inst, _))
     fun effects(i) -> Effects
-    -- The same instruction with every value it reads passed through the
-    -- function. What it defines is unchanged.
+    --- The same instruction with every value it reads passed through the
+    --- function. What it defines is unchanged.
     fun renameUses(i, fun(Value) -> Value) -> i
-    -- A plain copy, as (destination, source): the destination may be replaced
-    -- by the source everywhere. An instantiation answers `None` for anything it
-    -- does not want renamed, including a copy between representations.
+    --- A plain copy, as (destination, source): the destination may be replaced
+    --- by the source everywhere. An instantiation answers `None` for anything it
+    --- does not want renamed, including a copy between representations.
     fun copyOf(i) -> Option (Value, Value)
 }
 
@@ -516,9 +516,9 @@ fun predecessors(f : Func i) -> Array (Vec BlockId) {
     out
 }
 
--- Blocks in reverse postorder, which is the order the dominance solver wants:
--- every block but the entry appears after at least one of its predecessors, so
--- one pass already computes most of the answer.
+--- Blocks in reverse postorder, which is the order the dominance solver wants:
+--- every block but the entry appears after at least one of its predecessors, so
+--- one pass already computes most of the answer.
 fun reversePostorder(f : Func i) -> Vec BlockId = Vec.reverse(postorder(f))
 
 -- The blocks the entry reaches, each after every block a depth-first search
@@ -560,20 +560,20 @@ fun postorder(f : Func i) -> Vec BlockId {
     order
 }
 
--- The immediate dominator of each block, or `None` for one the entry does not
--- reach. `None` rather than a sentinel index: an unreachable block and block
--- number -1 are different facts, and a language with `Option` should not need
--- to be told them apart by convention.
---
--- Cooper, Harvey and Kennedy's iterative algorithm ("A Simple, Fast Dominance
--- Algorithm", 2001), which is the one to write and not merely the one that is
--- easy. Its headline claim -- 2.5x faster than Lengauer-Tarjan -- does not
--- hold up; a more careful implementation of Lengauer-Tarjan later reversed it.
--- What holds up is that on the graphs a compiler actually meets, every
--- published algorithm lands within a small factor of a breadth-first search
--- and all of them are measured in microseconds, so the difference does not
--- matter and simplicity is the only axis left. This needs no spanning tree and
--- no union-find; LLVM's Semi-NCA and GCC's Lengauer-Tarjan need both.
+--- The immediate dominator of each block, or `None` for one the entry does not
+--- reach. `None` rather than a sentinel index: an unreachable block and block
+--- number -1 are different facts, and a language with `Option` should not need
+--- to be told them apart by convention.
+---
+--- Cooper, Harvey and Kennedy's iterative algorithm ("A Simple, Fast Dominance
+--- Algorithm", 2001), which is the one to write and not merely the one that is
+--- easy. Its headline claim -- 2.5x faster than Lengauer-Tarjan -- does not
+--- hold up; a more careful implementation of Lengauer-Tarjan later reversed it.
+--- What holds up is that on the graphs a compiler actually meets, every
+--- published algorithm lands within a small factor of a breadth-first search
+--- and all of them are measured in microseconds, so the difference does not
+--- matter and simplicity is the only axis left. This needs no spanning tree and
+--- no union-find; LLVM's Semi-NCA and GCC's Lengauer-Tarjan need both.
 fun dominators(f : Func i) -> Array (Option Int) {
     let order = reversePostorder(f)
     -- Position in reverse postorder, which is what `intersect` walks by. Only
@@ -640,9 +640,9 @@ fun up(idom : Array (Option Int), b : Int) -> Int = match idom[b] {
     None -> b
 }
 
--- Does `a` dominate `b`? Walks the dominator tree, which is the form the
--- verifier and the optimizations want and is fast enough at this size; a
--- depth-plus-interval numbering is the answer if it ever is not.
+--- Does `a` dominate `b`? Walks the dominator tree, which is the form the
+--- verifier and the optimizations want and is fast enough at this size; a
+--- depth-plus-interval numbering is the answer if it ever is not.
 fun dominates(idom : Array (Option Int), a : BlockId, b : BlockId) -> Bool {
     var here = blockId(b)
     let want = blockId(a)
@@ -663,13 +663,13 @@ fun dominates(idom : Array (Option Int), a : BlockId, b : BlockId) -> Bool {
 
 -- -- verification --------------------------------------------------------------------
 
--- Reject a malformed function, as a list of complaints.
---
--- Run after every pass. A miscompile then becomes a rejected program at the
--- pass that caused it rather than a wrong answer at the end, which is the
--- property that makes an optimizer safe to build incrementally. It matters
--- most here because what checks this level otherwise is running the compiled
--- program, which localizes a fault to a program rather than to a pass.
+--- Reject a malformed function, as a list of complaints.
+---
+--- Run after every pass. A miscompile then becomes a rejected program at the
+--- pass that caused it rather than a wrong answer at the end, which is the
+--- property that makes an optimizer safe to build incrementally. It matters
+--- most here because what checks this level otherwise is running the compiled
+--- program, which localizes a fault to a program rather than to a pass.
 fun verify[Inst i](f : Func i) -> Vec String {
     let out = []
     let count = len(f.blocks)
@@ -932,46 +932,46 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
 
 -- -- liveness -----------------------------------------------------------------------
 
--- Which values are live on the way out of each block.
---
--- Backward dataflow over the graph, solved as `livenessInOut` says. Written
--- here rather than in a pass because it is a fact about the *graph* -- the
--- same analysis serves the collector's root sets now and the register
--- allocator's interference later, and the parameter over instructions is what
--- lets one copy do both.
---
--- Block parameters are the reason this is simpler than it looks. A value
--- crossing an edge is an *argument on that edge*, used by the predecessor's
--- terminator, and the parameter it becomes is defined in the successor. So
--- there is no phi to special-case: `uses` and `defs` already say everything,
--- which is what block parameters buy over phi nodes.
+--- Which values are live on the way out of each block.
+---
+--- Backward dataflow over the graph, solved as `livenessInOut` says. Written
+--- here rather than in a pass because it is a fact about the *graph* -- the
+--- same analysis serves the collector's root sets now and the register
+--- allocator's interference later, and the parameter over instructions is what
+--- lets one copy do both.
+---
+--- Block parameters are the reason this is simpler than it looks. A value
+--- crossing an edge is an *argument on that edge*, used by the predecessor's
+--- terminator, and the parameter it becomes is defined in the successor. So
+--- there is no phi to special-case: `uses` and `defs` already say everything,
+--- which is what block parameters buy over phi nodes.
 fun liveness[Inst i](f : Func i) -> Array BitSet {
     let (_, out) = livenessInOut(f)
     out
 }
 
--- Both halves of the same analysis. `liveness` answers only live-*out* because
--- that is all the root analysis needed; the colourer needs live-*in* too, to
--- know what a block's parameters interfere with, and computing the analysis
--- twice to get a set it already had would be silly.
---
--- Every set is a bitset over the function's value ids, which are dense, and
--- each block's pair is built in place by unions. Two passes and no fixpoint,
--- after Brandner, Boissinot, Darte, Dupont de Dinechin and Rastello,
--- "Computing Liveness Sets for SSA-Form Programs" (INRIA RR-7503, 2011):
---
--- * A backward pass in postorder, over every edge except those that close a
---   cycle. Along the rest every successor comes first, so each block is
---   walked once, and without a cycle this is already the answer.
--- * A forward pass over the loop-nesting forest. A value live into a loop's
---   header and not one of its parameters is defined outside the loop, since
---   its definition dominates its uses; so it is live into and out of every
---   block of the loop, and that is all the first pass missed.
---
--- The second pass is exact only where every cycle has a header that dominates
--- it. A function with an irreducible cycle iterates to the fixpoint instead,
--- from where the first pass left it: every set is already below the answer,
--- which is all the iteration needs of its start.
+--- Both halves of the same analysis. `liveness` answers only live-*out* because
+--- that is all the root analysis needed; the colourer needs live-*in* too, to
+--- know what a block's parameters interfere with, and computing the analysis
+--- twice to get a set it already had would be silly.
+---
+--- Every set is a bitset over the function's value ids, which are dense, and
+--- each block's pair is built in place by unions. Two passes and no fixpoint,
+--- after Brandner, Boissinot, Darte, Dupont de Dinechin and Rastello,
+--- "Computing Liveness Sets for SSA-Form Programs" (INRIA RR-7503, 2011):
+---
+--- * A backward pass in postorder, over every edge except those that close a
+---   cycle. Along the rest every successor comes first, so each block is
+---   walked once, and without a cycle this is already the answer.
+--- * A forward pass over the loop-nesting forest. A value live into a loop's
+---   header and not one of its parameters is defined outside the loop, since
+---   its definition dominates its uses; so it is live into and out of every
+---   block of the loop, and that is all the first pass missed.
+---
+--- The second pass is exact only where every cycle has a header that dominates
+--- it. A function with an irreducible cycle iterates to the fixpoint instead,
+--- from where the first pass left it: every set is already below the answer,
+--- which is all the iteration needs of its start.
 fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
     let count = len(f.blocks)
     let values = len(f.reps)
@@ -1130,9 +1130,9 @@ fun loopForest(order : Vec BlockId, rank : Array Int,
     Some((innermost, parent))
 }
 
--- What a terminator reads. Not part of the `Inst` class, because a terminator
--- is not an instruction here -- it is a field of the block, which is what
--- keeps a block from ever being without one.
+--- What a terminator reads. Not part of the `Inst` class, because a terminator
+--- is not an instruction here -- it is a field of the block, which is what
+--- keeps a block from ever being without one.
 fun termUses(t : Term) -> Vec Value = match t {
     Ret(vs) -> vs
     Jump(_, args) -> args
@@ -1142,14 +1142,14 @@ fun termUses(t : Term) -> Vec Value = match t {
     Unreachable -> []
 }
 
--- The values live *after* each instruction of a block, given the block's
--- live-out set. Index `n` holds the values live immediately after instruction
--- `n`, which is what a safepoint needs: the callee may collect, and what must
--- survive is whatever is still wanted when it returns.
---
--- Each point is an array of distinct ids, ascending, rather than a set: every
--- reader only walks them, and a snapshot of the one set being updated is a
--- single array where a copy would be a bitset the size of the function.
+--- The values live *after* each instruction of a block, given the block's
+--- live-out set. Index `n` holds the values live immediately after instruction
+--- `n`, which is what a safepoint needs: the callee may collect, and what must
+--- survive is whatever is still wanted when it returns.
+---
+--- Each point is an array of distinct ids, ascending, rather than a set: every
+--- reader only walks them, and a snapshot of the one set being updated is a
+--- single array where a copy would be a bitset the size of the function.
 fun liveAfter[Inst i](f : Func i, at : BlockId,
                       out : BitSet) -> Array (Array Int) {
     let block = f.blocks[blockId(at)]
@@ -1167,22 +1167,22 @@ fun liveAfter[Inst i](f : Func i, at : BlockId,
     sets
 }
 
--- The same function with unreachable blocks removed, and the rest in reverse
--- postorder.
---
--- Lowering emits a fallthrough `panic "no match arm applied"` for every
--- `match`, and a non-exhaustive match is an error, so that block is
--- unreachable in every program that compiles. It is not the only such
--- block, which is the reason this prunes by *reachability* rather than by
--- knowing where that panic came from: dropping a block because nothing
--- branches to it is correct whatever made it unreachable, where dropping it
--- because the checker called the match exhaustive would make the output depend
--- on the checker being sound. A hole there would turn a clean panic into a
--- fall-through into whatever block came next.
---
--- Blocks are renumbered, so this must run before anything records a `BlockId`
--- elsewhere. It answers reverse postorder, which puts the entry first and each
--- block after a predecessor -- the order the allocator wants to walk anyway.
+--- The same function with unreachable blocks removed, and the rest in reverse
+--- postorder.
+---
+--- Lowering emits a fallthrough `panic "no match arm applied"` for every
+--- `match`, and a non-exhaustive match is an error, so that block is
+--- unreachable in every program that compiles. It is not the only such
+--- block, which is the reason this prunes by *reachability* rather than by
+--- knowing where that panic came from: dropping a block because nothing
+--- branches to it is correct whatever made it unreachable, where dropping it
+--- because the checker called the match exhaustive would make the output depend
+--- on the checker being sound. A hole there would turn a clean panic into a
+--- fall-through into whatever block came next.
+---
+--- Blocks are renumbered, so this must run before anything records a `BlockId`
+--- elsewhere. It answers reverse postorder, which puts the entry first and each
+--- block after a predecessor -- the order the allocator wants to walk anyway.
 fun pruneUnreachable[Inst i](f : Func i) -> Func i {
     let order = reversePostorder(f)
     if len(order) == len(f.blocks) && blockId(order[0]) == blockId(f.entry) {

@@ -78,7 +78,7 @@ export (executableFile)
 -- **Debug information**, when the module has any, is its debug sections as
 -- they are, with their addresses filled in, written after the last segment
 -- and loaded by none: section headers of their own with no flags and no
--- address, as a linker leaves them, so that `strip` removes them and
+-- address, so that `strip` removes them and
 -- `objcopy --only-keep-debug` keeps them. `.debug_gdb_scripts` is among
 -- them. They are not compressed.
 --
@@ -262,7 +262,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let strtabSection = symtabSection + 1
     let shstrtabSection = strtabSection + 1
     let sectionCount = shstrtabSection + 1
-    let frames = indexed(obj, ehFrame)
+    let frames = indexed(obj, text, ehFrame)
     let libraries = librariesOf(obj.undefined, needed)
     let imports = []
     for l in libraries { for sym in l.symbols { Vec.push(imports, sym) } }
@@ -329,7 +329,8 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     sectionOf[data] = dataSection
 
     -- Every field filled in, with each import standing for its stub, and
-    -- each debug section's addresses the code's.
+    -- the debug sections' fields filled in unmapped: an address is the
+    -- code's final address, an offset is within its section.
     let stubOf = Map.new()
     for var k = 0; k < n; k = k + 1 { Map.put(stubOf, Asm.spell(imports[k]), k) }
     let stubAddress = fun(k) = stubsAt + codeSlide + stubSize * k
@@ -588,11 +589,12 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     out
 }
 
--- Returns what `.eh_frame_hdr`'s table holds for section `ehFrame` of `obj`,
--- `.eh_frame`, or nothing if it is -1: each FDE's function's offset in the
--- code with the FDE's offset in the section, sorted, and for a function
--- with two FDEs the first one alone, since a binary search finds one.
-fun indexed(obj : Object Fixup, ehFrame : Int) -> Vec (Int, Int) {
+-- Returns `.eh_frame_hdr`'s table for `obj`'s `.eh_frame`, section
+-- `ehFrame`, or an empty one if it is -1: each function's offset in the
+-- code, section `text`, with its FDE's offset in `.eh_frame`. The table is
+-- sorted by function offset and has one entry per function, the one with
+-- the lowest FDE offset.
+fun indexed(obj : Object Fixup, text : Int, ehFrame : Int) -> Vec (Int, Int) {
     let found = []
     if ehFrame >= 0 {
         let defined = Map.new()
@@ -601,7 +603,7 @@ fun indexed(obj : Object Fixup, ehFrame : Int) -> Vec (Int, Int) {
         -- length and its CIE's offset, four bytes each.
         for r in obj.sections[ehFrame].relocations {
             let code = match Map.get(defined, Asm.spell(r.target)) {
-                Some(d) -> if d.section == 0 { d.offset } else {
+                Some(d) -> if d.section == text { d.offset } else {
                     error("internal error: an FDE describes " + Asm.spell(r.target)
                           + ", which is not code")
                 }
@@ -611,6 +613,8 @@ fun indexed(obj : Object Fixup, ehFrame : Int) -> Vec (Int, Int) {
             Vec.push(found, (code, r.offset - 8))
         }
     }
+    -- A binary search finds one FDE per address, so keep only the first of
+    -- a function's.
     let table = []
     var last = -1
     for (code, fde) in Vec.sort(found) {

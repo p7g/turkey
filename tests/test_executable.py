@@ -1127,6 +1127,10 @@ def test_pt_gnu_eh_frame_is_the_index(tmp_path):
     _, kind, section_flags, at, file_at, size, _, _ = image.section(".eh_frame_hdr")
     assert (kind, section_flags) == (SHT_PROGBITS, SHF_ALLOC)
     assert (flags, offset, address, filesz, memsz) == (4, file_at, at, size, size)
+    # A loader refuses `PT_GNU_EH_FRAME` outside every `PT_LOAD`.
+    first = next(s for s in image.segments if s[0] == PT_LOAD)
+    assert first[2] <= offset and offset + filesz <= first[2] + first[4]
+    assert first[3] <= address and address + memsz <= first[3] + first[5]
 
 
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])

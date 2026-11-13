@@ -293,13 +293,15 @@ The instances the library provides for built-in types:
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
 | `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | no | no | if the elements have it |
+| `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
+| `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |
 
 Tuples compare lexicographically, and strings compare byte by byte. Two
 arrays are equal when they have the same length and equal elements at each
-index, and so are two `Vec`s, whatever their capacity. Two maps are equal when
-they have the same keys with equal values, and two `Set`s when they have the
-same elements, whatever order the entries were added in.
+index, and so are two `Vec`s or two `Deque`s, whatever their capacity. Two
+maps are equal when they have the same keys with equal values, and two `Set`s
+when they have the same elements, whatever order the entries were added in.
 
 <!-- run -->
 ```kotlin
@@ -363,14 +365,18 @@ standard output holds, and returns `x`, so it can wrap any expression.
 * An array or a `Vec` prints as an array literal, a `Map` as
   `{key: value, ...}` and a `Set` as `{element, ...}`, in the order the
   entries were first added.
+* A `Deque` prints as the call that builds it, `Deque.fromArray([x, ...])`,
+  front to back, and a `PriorityQueue` as `PriorityQueue.fromArray([x, ...])`
+  with its elements in no particular order.
 * What has no syntax prints as a placeholder: a function as `<fun>`, and a
   field whose type mentions a type an [existential
   constructor](types.md#existential-types) hides as `<hidden>`, unless its
   `Debug` follows from the classes the constructor carries.
 
 A container's `Show` shows its elements' `Debug`. The `Show` of `Array`,
-`Vec`, `Map`, `Set`, `Option`, `Either` and the tuples is their `Debug`, so a
-string inside one is quoted and two lists of strings cannot print alike:
+`Vec`, `Map`, `Set`, `Deque`, `PriorityQueue`, `Option`, `Either` and the
+tuples is their `Debug`, so a string inside one is quoted and two lists of
+strings cannot print alike:
 
 <!-- run -->
 ```kotlin
@@ -662,8 +668,8 @@ fun main() {
 class Length c { fun len(c) -> Int }
 ```
 
-`len(xs)` is the number of elements in an `Array`, a `Vec`, a `Map` or a
-`Set`.
+`len(xs)` is the number of elements in an `Array`, a `Vec`, a `Map`, a
+`Set`, a `Deque` or a `PriorityQueue`.
 `String` has no `Length` instance ([String](types.md#string)).
 
 ## `hash`

@@ -1,0 +1,234 @@
+export (
+    Deque,
+    new,
+    fromArray,
+    toArray,
+    pushFront,
+    pushBack,
+    popFront,
+    popBack,
+    front,
+    back,
+    at,
+    isEmpty,
+    clear,
+    append,
+)
+
+-- A double-ended queue: elements are pushed and popped at either end in
+-- constant time, amortized over the growth of its storage, and read at any
+-- index in constant time. Index 0 is the front.
+--
+--     let queue = Deque.new(16)
+--     Deque.pushBack(queue, start)
+--     while let Some(here) = Deque.popFront(queue) { ... }
+
+import Turkey.Array (outOfBounds)
+import Turkey.Array as Storage
+
+-- A ring buffer. The elements are the `length` slots of `storage` from `head`
+-- on, wrapping past the end of `storage` to its start; the other slots are
+-- room to grow into and are never read, so `!Debug` keeps a derived `Debug`
+-- from reading them. `head` is inside `storage` whenever `storage` has a slot.
+--
+-- A popped element stays reachable from its slot until a push overwrites it,
+-- as a cleared `Vec`'s do: clearing the slot would cost a write per pop to
+-- save memory a collector would rarely see.
+type DequeState a : !Debug = DequeState {
+    var storage : Prim.Array a,
+    var head    : Int,
+    var length  : Int,
+}
+
+type Deque a = Deque(DequeState a)
+
+fun state(Deque(value)) = value
+
+-- An empty `Deque` with room for `capacity` elements before it must grow.
+fun new(capacity : Int) -> Deque a = Deque(DequeState {
+    storage = Storage.uninitialized(capacity),
+    head = 0,
+    length = 0,
+})
+
+-- Copies: a `Deque` and an `Array` never share their elements.
+fun fromArray(xs : Array a) -> Deque a {
+    let out = new(len(xs))
+    for x in xs { pushBack(out, x) }
+    out
+}
+
+-- The elements from front to back, copied.
+fun toArray(xs : Deque a) -> Array a {
+    let data = state(xs)
+    let storage = Storage.uninitialized(data.length)
+    copyOut(data, storage)
+    Array.ofStorage(storage)
+}
+
+-- The slot of `storage` that holds element `i`, for `i` from 0 to `length`
+-- inclusive: `length` is the slot the next `pushBack` writes.
+fun slot(data : DequeState a, i : Int) -> Int = (data.head + i) % len(data.storage)
+
+-- Copy the elements, front to back, to the first `length` slots of `target`.
+-- They are at most two runs of `storage`: from `head` to the end, and from
+-- the start for whatever wrapped.
+fun copyOut(data : DequeState a, target : Prim.Array a) -> Unit {
+    if data.length == 0 { return }
+    let firstRun = min(data.length, len(data.storage) - data.head)
+    Storage.move(target, 0, data.storage, data.head, firstRun)
+    Storage.move(target, firstRun, data.storage, 0, data.length - firstRun)
+}
+
+-- Make room for one more element, doubling the capacity when it is full.
+-- The elements move to the start of the new storage, unwrapped.
+fun grow(data : DequeState a) -> Unit {
+    let capacity = len(data.storage)
+    if data.length < capacity { return }
+    let storage = Storage.uninitialized(if capacity == 0 { 1 } else { capacity * 2 })
+    copyOut(data, storage)
+    data.storage = storage
+    data.head = 0
+}
+
+fun pushBack(xs : Deque a, x : a) -> Unit {
+    let data = state(xs)
+    grow(data)
+    data.storage[slot(data, data.length)] = x
+    data.length = data.length + 1
+}
+
+fun pushFront(xs : Deque a, x : a) -> Unit {
+    let data = state(xs)
+    grow(data)
+    -- Step back one slot, wrapping from the start to the end. `grow` has
+    -- left at least one slot free, so this one is not an element.
+    data.head = slot(data, len(data.storage) - 1)
+    data.storage[data.head] = x
+    data.length = data.length + 1
+}
+
+fun popFront(xs : Deque a) -> Option a {
+    let data = state(xs)
+    if data.length == 0 { return None }
+    let x = data.storage[data.head]
+    data.head = slot(data, 1)
+    data.length = data.length - 1
+    Some(x)
+}
+
+fun popBack(xs : Deque a) -> Option a {
+    let data = state(xs)
+    if data.length == 0 { return None }
+    data.length = data.length - 1
+    Some(data.storage[slot(data, data.length)])
+}
+
+-- The element `i` from the front, or `None` past either end. `xs[i]` is the
+-- one that panics.
+fun at(xs : Deque a, i : Int) -> Option a =
+    if i < 0 || i >= len(xs) { None } else { Some(xs[i]) }
+
+fun front(xs : Deque a) -> Option a = at(xs, 0)
+
+fun back(xs : Deque a) -> Option a = at(xs, len(xs) - 1)
+
+fun isEmpty(xs : Deque a) -> Bool = len(xs) == 0
+
+-- Drop every element, keeping the capacity.
+fun clear(xs : Deque a) -> Unit {
+    let data = state(xs)
+    data.head = 0
+    data.length = 0
+}
+
+fun bounds(xs : Deque a, i : Int, operation : String) {
+    let length = state(xs).length
+    if i < 0 || i >= length { outOfBounds(operation, i, length) }
+}
+
+-- A new `Deque`: the elements of `xs`, then those of `ys`.
+fun append(xs : Deque a, ys : Deque a) -> Deque a {
+    let out = new(len(xs) + len(ys))
+    for x in xs { pushBack(out, x) }
+    for y in ys { pushBack(out, y) }
+    out
+}
+
+instance Index (Deque a) {
+    type Key = Int
+    type Value = a
+    fun get(xs, i) {
+        bounds(xs, i, "read at")
+        let data = state(xs)
+        data.storage[slot(data, i)]
+    }
+}
+
+instance SetIndex (Deque a) {
+    fun set(xs, i, x) {
+        bounds(xs, i, "write at")
+        let data = state(xs)
+        data.storage[slot(data, i)] = x
+    }
+}
+
+instance Length (Deque a) { fun len(xs) = state(xs).length }
+
+type DequeCursor = DequeCursor { var at : Int }
+
+-- Front to back.
+instance Iterator (Deque a) {
+    type Item = a
+    type Cursor = DequeCursor
+    fun iter(xs) = DequeCursor { at = 0 }
+    fun next(xs, cur) {
+        if cur.at >= len(xs) { return None }
+        let x = xs[cur.at]
+        cur.at = cur.at + 1
+        Some(x)
+    }
+}
+
+instance Add (Deque a) { fun add(xs, ys) = append(xs, ys) }
+instance Semigroup (Deque a) { fun combine(xs, ys) = append(xs, ys) }
+instance Monoid (Deque a) { fun empty() = new(0) }
+
+instance Foldable Deque {
+    fun foldMap[Monoid m](xs, f) {
+        var acc : m = empty()
+        for x in xs { acc = combine(acc, f(x)) }
+        acc
+    }
+}
+
+instance Functor Deque {
+    fun map(xs, f) {
+        let out = new(len(xs))
+        for x in xs { pushBack(out, f(x)) }
+        out
+    }
+}
+
+-- Equal when they have the same length and equal elements from the front,
+-- whatever their capacity and wherever in their storage the front is.
+instance Eq (Deque a) : Eq a {
+    fun eq(xs, ys) {
+        if len(xs) != len(ys) { return False }
+        -- Test both lengths on every step, not once: an element's `eq` may
+        -- pop from either.
+        for var i = 0; i < len(xs) && i < len(ys); i = i + 1 {
+            if xs[i] != ys[i] { return False }
+        }
+        len(xs) == len(ys)
+    }
+}
+
+-- The call that builds it, `Deque.fromArray([x, ...])`, front to back.
+instance Debug (Deque a) : Debug a {
+    fun debug(xs) = "Deque.fromArray(" + debug(toArray(xs)) + ")"
+}
+
+-- What its `Debug` prints: a container's text shows its elements' `Debug`,
+-- so that a string in it is quoted.
+instance Show (Deque a) : Debug a { fun show(xs) = debug(xs) }

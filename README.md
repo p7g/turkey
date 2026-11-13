@@ -97,13 +97,26 @@ cc -o client client.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
 The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
-Run the compiler from the repository root, where it finds `lib/`. It has two
-commands. `build` writes the program to `-o`, in the format the file's
-extension names -- a relocatable object for `.o`, assembly for `.s` -- or
-`-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
-object needs no assembler, only a linker. `-f exe` writes an executable
-that runs as it is, with no assembler and no linker: a signed Mach-O on a
-Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
+To run it from anywhere as `turkey`, link it onto your `PATH`:
+
+```sh
+sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/stage2
+sh scripts/install.sh ~/bin    # or a directory of your choosing
+```
+
+The checkout is the installation: the compiler finds its library by resolving
+its own path, symbolic links included, and taking the nearest `lib/` holding
+`Prelude.gob` in that directory or one above it. `$TURKEY_LIB`, if it is set,
+names the library instead. The working directory is never searched, so a
+`lib/` in your own project cannot stand in for it. Rebuilding updates what
+`turkey` runs; after moving the checkout, run `install.sh` again.
+
+The compiler has two commands. `build` writes the program to `-o`, in the
+format the file's extension names -- a relocatable object for `.o`, assembly
+for `.s` -- or `-f obj` or `-f asm` says; `-o - -f asm` writes it to standard
+output. An object needs no assembler, only a linker. `-f exe` writes an
+executable that runs as it is, with no assembler and no linker: a signed
+Mach-O on a Mac, and on arm64 Linux an ELF that loads glibc 2.34 or later.
 
 ```sh
 build/stages/stage2 build -f exe -o rectangles rectangles.gob

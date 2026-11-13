@@ -127,12 +127,43 @@ def test_a_file_whose_name_is_no_module_name_is_refused(tmp_path) -> None:
     assert "'my module' is not a module name" in result.stderr
 
 
-def test_a_library_file_through_a_symbolic_link_is_refused(tmp_path) -> None:
+def _doc_with_lib(lib, *files: str, cwd=bootc.REPO_ROOT) -> subprocess.CompletedProcess[str]:
+    environment = dict(os.environ, TURKEY_LIB=str(lib))
+    return subprocess.run(toolchain.command(bootc.binary(), "doc", *files), cwd=cwd,
+                          env=environment, capture_output=True, text=True, timeout=120)
+
+
+@pytest.mark.parametrize("through", ["file", "library", "both"])
+def test_symbolic_links_name_the_same_library_module(tmp_path, through: str) -> None:
     link = tmp_path / "link"
     link.symlink_to(bootc.REPO_ROOT / "lib")
-    result = _doc(str(link / "Data" / "Option.gob"))
-    assert result.returncode == 2
-    assert "is in the library at" in result.stderr
+    real = bootc.REPO_ROOT / "lib"
+    lib = link if through in ("library", "both") else real
+    base = link if through in ("file", "both") else real
+    result = _doc_with_lib(lib, str(base / "Data" / "Option.gob"))
+    assert result.returncode == 0, result.stderr
+    [module] = json.loads(result.stdout)["modules"]
+    assert module["name"] == "Data.Option"
+
+
+def test_a_prelude_beside_a_users_module_makes_it_no_library_module(tmp_path) -> None:
+    (tmp_path / "Prelude.gob").write_text("export (..)\n")
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "Foo.gob").write_text("export (x)\nlet x = 1\n")
+    result = _doc(str(tmp_path / "sub" / "Foo.gob"))
+    assert result.returncode == 0, result.stderr
+    [module] = json.loads(result.stdout)["modules"]
+    assert module["name"] == "Foo"
+
+
+def test_a_compiler_module_is_not_refused_as_a_library_module() -> None:
+    # `src/Turkey/` holds a `Prelude.gob` of the compiler's own. Its directory
+    # is searched before the library, as `check` searches it, so its
+    # `Target.gob` stands in for the library's and the check fails; what this
+    # asserts is that the file is not refused before it is checked.
+    result = _doc("src/Turkey/Target.gob")
+    assert "is in the library" not in result.stderr
+    assert "src/Turkey/Target.gob" in result.stderr or result.returncode == 0
 
 
 def test_the_working_directory_cannot_stand_in_for_a_library_module(tmp_path) -> None:

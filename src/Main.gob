@@ -437,10 +437,10 @@ fun doc(p : Args.Parser) -> Unit {
         }
     }
     if len(paths) == 0 { usage() }
-    let library = canonical(libRoot())
+    let library = realPath(libRoot())
     -- The directory every file outside the library is in: as the first such
     -- argument spells it, which is how the files' diagnostics will name it,
-    -- and canonical, to compare the others with.
+    -- and as a real path, to compare the others with.
     var directory = None
     let names = []
     for path in paths {
@@ -493,25 +493,15 @@ fun doc(p : Args.Parser) -> Unit {
     write(Doc.document(modules, tables))
 }
 
--- The search root `path` is under, canonical, and the module it holds
--- there. `library` is the library's root, canonical. Refuses a path that no
--- import could name, and a file of some library other than `library`.
+-- The search root `path` is under, as a real path, and the module it holds
+-- there. `library` is the library's root, as a real path. A file whose real
+-- path is under it is the library module its path below the root names; any
+-- other is a module named by its file. Refuses a path no import could name.
 fun moduleNamed(path : String, library : String) -> (String, String) {
-    let full = canonical(path)
+    let full = realPath(path)
     let (root, relative) = match String.stripPrefix(full, library + "/") {
         Some(rest) -> (library, rest)
-        None -> {
-            -- A library file spelled through a symbolic link, which
-            -- `canonical` does not resolve, would otherwise be read as a
-            -- module named by its file alone.
-            if let Some(other) = libraryHolding(directoryOf(full)) {
-                die("'" + path + "' is in the library at '" + other + "', and "
-                    + "the library in use is '" + library + "'; if one is a "
-                    + "symbolic link to the other, name the file through '"
-                    + library + "'")
-            }
-            (directoryOf(full), baseName(full))
-        }
+        None -> (directoryOf(full), baseName(full))
     }
     let stem = match String.stripSuffix(relative, ".gob") {
         Some(s) -> s
@@ -528,18 +518,6 @@ fun moduleNamed(path : String, library : String) -> (String, String) {
     (root, String.join(parts, "."))
 }
 
--- Returns the nearest directory from the absolute directory `start` upward
--- that holds a library, by the `Prelude.gob` every library has.
-fun libraryHolding(start : String) -> Option String {
-    var directory = start
-    loop {
-        if let Right(_) = File.metadata(directory + "/Prelude.gob") { return Some(directory) }
-        if directory == "/" || directory == "" { return None }
-        let parent = directoryOf(directory)
-        directory = if parent == "" || parent == "." { "/" } else { parent }
-    }
-}
-
 fun isModuleName(part : String) -> Bool {
     var first = True
     for c in String.codePoints(part) {
@@ -551,25 +529,11 @@ fun isModuleName(part : String) -> Bool {
     !first
 }
 
--- `path` made absolute against the working directory, with each `.`, each
--- `..` and each empty component taken out. Symbolic links are not resolved,
--- so two spellings of one file through a link compare unequal.
-fun canonical(path : String) -> String {
-    let absolute = if String.startsWith(path, "/") { path } else {
-        match Env.currentDirectory() {
-            Some(working) -> working + "/" + path
-            None -> die("cannot read the working directory to resolve '" + path + "'")
-        }
-    }
-    let parts = []
-    for part in String.split(absolute, "/") {
-        match part {
-            "" | "." -> {}
-            ".." -> { let _ = Vec.pop(parts) }
-            _ -> Vec.push(parts, part)
-        }
-    }
-    "/" + String.join(parts, "/")
+-- `path` as an absolute path with every symbolic link resolved, so that two
+-- spellings of one file compare equal.
+fun realPath(path : String) -> String = match Env.resolvedPath(path) {
+    Some(real) -> real
+    None -> die("cannot resolve '" + path + "' to a real path")
 }
 
 -- Writes `bytes` as an executable at `path`, through a new file beside it

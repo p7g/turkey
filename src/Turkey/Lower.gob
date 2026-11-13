@@ -610,7 +610,16 @@ fun funBinds(l : Lowerer, decl : FunDecl, scope : Scope) -> Vec CBind {
 -- applied at `x.use`. Its type is `ty`, the group's type for the binder.
 fun exportValue(l : Lowerer, x : Export, binders : Vec VarCell, internalName : String,
                 internalId : Int, ty : Ty.Type, equalities : Vec (Ty.Type, Ty.Type),
-                where : Option Span) -> Core {
+                where : Option Span) -> Core =
+    exported(l, x, binders, equalities, where, fun(typeArgs, evidence) =
+        instantiated(l, CVar(refAt(l, internalName, internalId)), typeArgs, evidence, ty, where))
+
+-- The value of a binder whose scheme is a wrapper around its group's: under
+-- a lambda over its own dictionaries and coercions, what `apply` makes of the
+-- type arguments and the evidence `x.use` passes the internal binding.
+fun exported(l : Lowerer, x : Export, binders : Vec VarCell,
+             equalities : Vec (Ty.Type, Ty.Type), where : Option Span,
+             apply : fun(Array Ty.Type, Array Core) -> Core) -> Core {
     let bound = dictBinders(l, x.params, x.preds)
     -- The use names the scheme's variables, `binders`, by skolems.
     let saved = l.rigid
@@ -626,9 +635,7 @@ fun exportValue(l : Lowerer, x : Export, binders : Vec VarCell, internalName : S
             evidence(l, x.use.evidence[i], predType(l, x.use.preds[i]), givens))
         let coercions = Array.map(Vec.toArray(x.use.equalities), fun(p) =
             coercion(resolved(l, p.args[0]), resolved(l, p.args[1]), where))
-        instantiated(l, CVar(refAt(l, internalName, internalId)),
-                     Array.map(x.use.typeArgs, resolved(l, _)),
-                     Array.append(dicts, coercions), ty, where)
+        apply(Array.map(x.use.typeArgs, resolved(l, _)), Array.append(dicts, coercions))
     })
     l.rigid = saved
     wrapDicts(l, inner, bound, x.preds, equalities, where)
@@ -709,29 +716,113 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         }
         _ -> {}
     }
+    let at = Some(stmt.span)
+    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    if !mutable && exportsAll(l, vars) {
+        let (holderName, holderId) = freshName(l, "bound")
+        let holder = owner + "#" + holderName
+        let sel = selectors(l, stmt, pat, vars, value, BySpelling(holder), scope)
+        let out = [newBind(owner, holder, holderId, sel.value.ty, sel.binders, sel.value, at)]
+        for (name, id, binders, v) in sel.names {
+            Vec.push(out, newBind(owner, name, id, v.ty, binders, v, at))
+        }
+        return out
+    }
     let lowered = expr(l, value, scope)
     let (holderName, holderId) = freshName(l, "bound")
     let holder = owner + "#" + holderName
-    let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, Some(stmt.span))]
+    let out = [newBind(owner, holder, holderId, lowered.ty, [], lowered, at)]
     -- Each name is its own top-level binding, which projects it out of the
-    -- whole value with a one-armed match. The match binds a local copy of
-    -- every name, which shadows the top-level binder it is a copy of.
-    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    -- whole value.
     for v in vars {
         let name = varName(v)
-        let id = patternBinder(l, v)
-        let nty = nameType(l, name)
-        let copies = Map.new()
-        for other in vars {
-            Map.put(copies, other.id, copyOf(l, varName(other), patternBinder(l, other)))
-        }
-        let picked = matchedAs(l, fun(p) = Map.getOr(copies, p.id, noId),
-            node(lowered.ty, Some(stmt.span), CVar(BySpelling(holder))),
-            [(pat, node(nty, Some(stmt.span), CVar(refAt(l, name, Map.getOr(copies, v.id, noId)))))],
-            nty, Some(stmt.span))
-        Vec.push(out, newBind(owner, name, id, picked.ty, [], picked, Some(stmt.span)))
+        let picked = selected(l, pat, vars, v, node(lowered.ty, at, CVar(BySpelling(holder))),
+                              nameType(l, name), at)
+        Vec.push(out, newBind(owner, name, patternBinder(l, v), picked.ty, [], picked, at))
     }
     out
+}
+
+-- Returns the value of the name `v`, one of the names `vars` that `pat`
+-- binds, selected out of `scrutinee` by a one-armed match. Its type is `ty`.
+-- The match binds a copy of every name, which shadows the binder it is a
+-- copy of.
+fun selected(l : Lowerer, pat : Pat, vars : Vec Pat, v : Pat, scrutinee : Core,
+             ty : Ty.Type, where : Option Span) -> Core {
+    let copies = Map.new()
+    for other in vars {
+        Map.put(copies, other.id, copyOf(l, varName(other), patternBinder(l, other)))
+    }
+    matchedAs(l, fun(p) = Map.getOr(copies, p.id, noId), scrutinee,
+              [(pat, node(ty, where, CVar(refAt(l, varName(v), Map.getOr(copies, v.id, noId)))))],
+              ty, where)
+}
+
+-- Returns whether the names `vars` of a pattern `let` are exports (`Export`).
+-- Inference makes every name of a pattern `let` one, or none of them.
+fun exportsAll(l : Lowerer, vars : Vec Pat) -> Bool =
+    len(vars) > 0 && Map.contains(l.exports, patternBinder(l, vars[0]))
+
+-- A pattern `let` whose names are exports, lowered: its value, its type
+-- abstraction, and each name with its type abstraction and value.
+type Selectors = Selectors {
+    value   : Core,
+    binders : Vec VarCell,
+    -- Each name's spelling, id, type abstraction and value, sorted by
+    -- spelling.
+    names   : Vec (String, Int, Vec VarCell, Core),
+}
+
+-- Returns the pattern `let` `stmt`, `let pat = source`, whose names `vars`
+-- are exports and whose value is bound to `holder`, lowered. The value is
+-- under a type abstraction over every variable of the group and a lambda
+-- over the group's dictionaries and coercions. Each name is a wrapper
+-- (`exported`) that instantiates the value as its `Export` says, then
+-- selects the name from it.
+fun selectors(l : Lowerer, stmt : Stmt, pat : Pat, vars : Vec Pat, source : Expr,
+              holder : Ref, scope : Scope) -> Selectors {
+    -- GHC's `dsAbsBinds` in its general case: `poly_tup_rhs` abstracts the
+    -- group once, and each export applies `mkBigTupleSelector` to an
+    -- instance of it. A selector is the pattern itself, matched once per
+    -- name, as Note [mkSelectorBinds] desugars a pattern binding. The
+    -- value is non-expansive, so evaluating it once per name changes
+    -- nothing a program can see.
+    let at = Some(stmt.span)
+    let a = match abstractionOf(l, stmt.id) {
+        Some(found) -> found
+        None -> oops("a pattern 'let' with exports has no abstraction", at)
+    }
+    let exportOf = fun(v) = match Map.get(l.exports, patternBinder(l, v)) {
+        Some(x) -> x
+        None -> oops("'" + varName(v) + "' is not an export, but another name its 'let' "
+                     + "binds is", Some(v.span))
+    }
+    let internal = exportOf(vars[0]).internal
+    let bound = dictBinders(l, a.params, a.preds)
+    let inner = withDicts(l, bound, fun() = expr(l, source, scope))
+    let value = wrapDicts(l, inner, bound, a.preds, resolvedEqualities(l, Some(internal)), at)
+    let names = Vec.new(len(vars))
+    for v in vars {
+        let name = varName(v)
+        let s = Map.get(a.schemes, name)
+        let ty = match s {
+            Some(sc) -> resolved(l, sc.body)
+            None -> oops("'" + name + "' has no scheme", Some(v.span))
+        }
+        let binders = schemeBinders(s)
+        let value = exported(l, exportOf(v), binders, resolvedEqualities(l, s), at,
+                             fun(typeArgs, evidence) {
+            let mapping = Map.new()
+            for var i = 0; i < len(typeArgs) && i < len(internal.quantified); i = i + 1 {
+                Map.put(mapping, internal.quantified[i].id, typeArgs[i])
+            }
+            let copy = instantiated(l, CVar(holder), typeArgs, evidence,
+                                        Decls.substitute(inner.ty, mapping), at)
+            selected(l, pat, vars, v, copy, ty, at)
+        })
+        Vec.push(names, (name, patternBinder(l, v), binders, value))
+    }
+    Selectors { value = value, binders = internal.quantified, names = names }
 }
 
 -- -- classes and instances ----------------------------------------------------------
@@ -3371,6 +3462,19 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
 fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
                 mutable : Bool, rest : fun() -> Core, scope : Scope) -> Core {
     let at = Some(stmt.span)
+    let vars = Vec.sortByKey(varPatterns(pat), varName)
+    if !mutable && exportsAll(l, vars) {
+        let (holderName, holderId) = freshName(l, "bound")
+        let sel = selectors(l, stmt, pat, vars, source, refAt(l, holderName, holderId), scope)
+        for (_, id, binders, _) in sel.names { Map.put(scope.binders, id, binders) }
+        var body = rest()
+        for var i = len(sel.names) - 1; i >= 0; i = i - 1 {
+            let (name, id, binders, v) = sel.names[i]
+            body = node(body.ty, at, CLet(name, id, v.ty, v, body, binders))
+        }
+        return node(body.ty, at, CLet(holderName, holderId, sel.value.ty, sel.value, body,
+                                      sel.binders))
+    }
     let value = abstract(l, abstractionOf(l, stmt.id), resolvedEqualities(l, letScheme(l, stmt, pat)),
                          fun() = expr(l, source, scope))
     let bare = unannot(pat)

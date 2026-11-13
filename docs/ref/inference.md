@@ -161,8 +161,8 @@ be closed. A variable is closed if it is
 * a `let` that the value restriction keeps from being generalized, if every
   variable it uses is closed and its type has no type variables.
 
-A parameter, a variable bound by a pattern, a `var` and a `do` binder are
-never closed. The value restriction applies as well: a closed `let` is
+A parameter, a variable bound by the pattern of a `match` arm, an `if let`, a
+`while let` or a `for`, a `var` and a `do` binder are never closed. The value restriction applies as well: a closed `let` is
 generalized only if its right-hand side is a value.
 
 `show` is defined at the top level, so `describe` is closed and is generalized,
@@ -284,6 +284,45 @@ is compared with `0`, keeps its constraints: `[OneOf a {Int, Float}, Eq a]
 fun(a) -> String`. A call of `describe` runs the group with `countdown`'s
 parameter at a type nothing decides, so the default of the literal `0`,
 `Int`, decides it.
+
+**Pattern bindings.** A `let` whose pattern is more than a name is
+generalized or not as a whole, by the same rules as a `let` of a name. When
+it is, each name it binds gets a type of its own, as each function of a
+recursive group does: it quantifies only the type variables its own type
+reaches, with only the constraints on them. A constraint that the right-hand
+side puts on a type that only the other names mention is decided where the
+`let` is, by its default, or else it is an error.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let (inc, isZero) = (fun(x) = x + 1, fun(n) = n == 0)
+    print(inc(1))
+    print(inc(1.5))
+    print(isZero(0))
+}
+```
+
+```text
+2
+2.5
+True
+```
+
+`inc` has the type `[OneOf a {Int, Float}, Add a] fun(a) -> a`, and `isZero`
+has `[OneOf b {Int, Float}, Eq b] fun(b) -> Bool`. No use of `inc` decides
+the type of `n`, so the default of the literal `0`, `Int`, decides it.
+
+Here only `Show` constrains the type of the parameter of `describe`, and
+`Show` has no default, so the type `count` needs it at is undecided:
+
+<!-- error: cannot determine what type 'a' is in 'Show a', which 'count' needs from the 'let' that binds it; add a type annotation -->
+```kotlin
+fun main() {
+    let (describe, count) = (fun(x) = show(x), 0)
+    print(describe(count))
+}
+```
 
 > **For readers new to this.** The *value restriction* is the rule ML uses to
 > keep polymorphism and mutation apart. Without it, `let cell = []` could be

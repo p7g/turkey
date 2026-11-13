@@ -20,11 +20,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "src" / "UnwindInfoCases.gob"
 
 
-class _Bytes:
-    def __init__(self, data: bytes):
-        self.bytes = data
-
-
 @functools.lru_cache(maxsize=1)
 def _tables() -> dict[int, bytes]:
     tables = {}
@@ -37,7 +32,7 @@ def _tables() -> dict[int, bytes]:
 @pytest.mark.parametrize("n", [1, 511, 512, 1022, 1023])
 def test_each_page_holds_at_most_511_entries_and_the_index_names_each(n):
     table = _tables()[n]
-    entries, sentinel, kinds = _unwind_entries(_Bytes(table))
+    entries, sentinel, kinds = _unwind_entries(table)
     assert entries == [(0x1000 + 4 * k, 0x04000000 | k % 2) for k in range(n)]
     assert sentinel == 0x1000 + 4 * n
     assert kinds == [2] * -(-n // 511)

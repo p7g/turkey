@@ -636,10 +636,9 @@ def _written(tmp_path: Path, source: str, *flags: str) -> tuple[_MachO, _MachO]:
     return _MachO(tmp_path / "prog.o"), _MachO(tmp_path / "prog")
 
 
-def _unwind_entries(section: _Section) -> tuple[list[tuple[int, int]], int, list[int]]:
+def _unwind_entries(u: bytes) -> tuple[list[tuple[int, int]], int, list[int]]:
     """An `__unwind_info`'s entries, as each function offset and its
     encoding, its sentinel's function offset, and each page's kind."""
-    u = section.bytes
     version, common_at, common_n, _, personalities, index_at, index_n = struct.unpack_from(
         "<7I", u, 0)
     assert version == 1 and personalities == 0
@@ -764,7 +763,7 @@ def test_the_debug_sections_are_the_objects_with_final_addresses(tmp_path, level
 
 def test_the_unwind_info_holds_each_functions_encoding(tmp_path):
     obj, image = _written(tmp_path, TASKS)
-    entries, sentinel, kinds = _unwind_entries(image.by_name["__unwind_info"])
+    entries, sentinel, kinds = _unwind_entries(image.by_name["__unwind_info"].bytes)
     expected, end = _expected_unwind(obj, image)
     assert entries == expected
     assert sentinel == end
@@ -817,8 +816,8 @@ def test_the_linker_agrees_on_the_encodings_and_function_starts(tmp_path):
     ours_text, their_text = image.by_name["__text"].address, theirs.by_name["__text"].address
     their_starts = [a - their_text for a in _function_starts(theirs)]
     assert [a - ours_text for a in _function_starts(image)] == their_starts
-    ours_entries, _, _ = _unwind_entries(image.by_name["__unwind_info"])
-    their_entries, _, _ = _unwind_entries(theirs.by_name["__unwind_info"])
+    ours_entries, _, _ = _unwind_entries(image.by_name["__unwind_info"].bytes)
+    their_entries, _, _ = _unwind_entries(theirs.by_name["__unwind_info"].bytes)
     for start in their_starts:
         assert (_encoding_at(ours_entries, start + ours_text - 0x100000000)
                 == _encoding_at(their_entries, start + their_text - 0x100000000)), hex(start)

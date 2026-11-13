@@ -62,18 +62,9 @@ fun main() {
 documented
 ```
 
-A doc comment that documents nothing is an error: one cut off from its
-declaration by a blank line, one above an import or a statement in a body, or
-one that follows code on its line. Write `--` for an ordinary comment.
-
-<!-- error: this doc comment is not directly above anything it can document -->
-```kotlin
-fun main() {
-    --- A local is not documented.
-    let x = 1
-    print(x)
-}
-```
+A doc comment anywhere else documents nothing, and is an ordinary comment: one
+cut off from its declaration by a blank line, one above an import or a
+statement in a body, or one that follows code on its line.
 
 ## Identifiers
 

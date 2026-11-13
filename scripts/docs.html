@@ -85,6 +85,9 @@ const esc = s => String(s).replace(/[&<>"]/g, c => ({"&": "&amp;", "<": "&lt;", 
 const kw = s => `<span class="kw">${s}</span>`;
 const nm = s => `<span class="name">${esc(s)}</span>`;
 const anchor = (m, name) => `${m}:${name}`;
+// An href to the element whose id is `id`. Encoded, since an operator's id
+// can hold `%`, `#` or `?`.
+const link = id => `#${esc(encodeURIComponent(id))}`;
 
 // A comment as paragraphs. Lines indented four spaces are code, and `x` is code inline.
 function comment(text) {
@@ -101,12 +104,17 @@ function comment(text) {
   return `<div class="doc">${out.join("")}</div>`;
 }
 
+// A constructor as its declaration writes it, with an existential's bracket:
+// the variables no predicate mentions, then the predicates.
 function constructor(c) {
+  const mentioned = v => c.context.some(p => p.split(/[^A-Za-z0-9_']+/).includes(v));
+  const bracket = [...c.exists.filter(v => !mentioned(v)), ...c.context];
+  const name = nm(c.name) + (bracket.length ? `[${esc(bracket.join(", "))}]` : "");
   if (c.fields) {
     const fs = c.fields.map(f => `${f.mutable ? "var " : ""}${esc(f.name)} : ${esc(f.type)}`);
-    return `${nm(c.name)} { ${fs.join(", ")} }`;
+    return `${name} { ${fs.join(", ")} }`;
   }
-  return c.args.length ? `${nm(c.name)}(${c.args.map(esc).join(", ")})` : nm(c.name);
+  return c.args.length ? `${name}(${c.args.map(esc).join(", ")})` : name;
 }
 
 // The signature an item is shown under, in the syntax a program writes.
@@ -134,7 +142,7 @@ function signature(item) {
       return `${kw("infix")} ${esc(item.group)} (${nm(item.name)}) = ${esc(item.function)}  ${kw("-- " + item.associativity + "-associative")}`;
     case "reexport": {
       const from = item.from && modules.has(item.from)
-        ? `<a href="#${esc(anchor(item.from, item.original))}">${esc(item.from)}.${esc(item.original)}</a>`
+        ? `<a href="${link(anchor(item.from, item.original))}">${esc(item.from)}.${esc(item.original)}</a>`
         : esc((item.from ? item.from + "." : "") + item.original);
       const type = item.type ? ` : ${esc(item.type)}` : "";
       return `${nm(item.name)}${type}  ${kw("-- from")} ${from}`;
@@ -154,7 +162,7 @@ function itemHTML(m, item) {
       + (c.fields || []).filter(f => f.comment).map(f => `<div class="sig">.${esc(f.name)}</div>${comment(f.comment)}`).join("")).join("");
   } else if (item.kind === "class") {
     members = item.methods.map(meth => `<div class="sig" id="${esc(anchor(m.name, meth.name))}">${kw("fun")} ${nm(meth.name)} : ${esc(meth.type)}${meth.default ? "  " + kw("-- has a default") : ""}</div>${comment(meth.comment)}`).join("")
-      + item.families.map(f => `<div class="sig">${kw("type")} ${nm(f.name)} ${esc(item.param)}</div>${comment(f.comment)}`).join("");
+      + item.families.map(f => `<div class="sig" id="${esc(anchor(m.name, item.name + "." + f.name))}">${kw("type")} ${nm(f.name)} ${esc(item.param)}</div>${comment(f.comment)}`).join("");
   }
   return `<div class="item" id="${esc(itemId(m, item))}"><div class="sig">${signature(item)}</div>`
     + comment(item.comment) + (members ? `<div class="members">${members}</div>` : "") + "</div>";
@@ -177,7 +185,7 @@ function showModule(name) {
 
 function showIndex() {
   document.getElementById("main").innerHTML = "<h1>Turkey library</h1>"
-    + docs.modules.map(m => `<div class="result"><a href="#${esc(m.name)}">${esc(m.name)}</a>`
+    + docs.modules.map(m => `<div class="result"><a href="${link(m.name)}">${esc(m.name)}</a>`
       + `${m.comment ? `<div class="where">${esc(m.comment.split("\n\n")[0])}</div>` : ""}</div>`).join("");
 }
 
@@ -197,14 +205,17 @@ function search(query) {
   const q = query.trim().toLowerCase();
   if (!q) return route();
   const rank = e => e.name === q ? 0 : e.name.startsWith(q) ? 1 : e.name.includes(q) ? 2 : 3;
-  const hits = index.filter(e => e.text.includes(q)).sort((a, b) => rank(a) - rank(b)).slice(0, 200);
-  document.getElementById("main").innerHTML = `<h1>${hits.length === 200 ? "200+" : hits.length} results</h1>`
-    + hits.map(({m, item}) => `<div class="result"><div class="where"><a href="#${esc(itemId(m, item))}">${esc(m.name)}</a></div>`
+  const all = index.filter(e => e.text.includes(q)).sort((a, b) => rank(a) - rank(b));
+  const hits = all.slice(0, 200);
+  const shown = all.length > hits.length ? `, the first ${hits.length} shown` : "";
+  document.getElementById("main").innerHTML = `<h1>${all.length} results${shown}</h1>`
+    + hits.map(({m, item}) => `<div class="result"><div class="where"><a href="${link(itemId(m, item))}">${esc(m.name)}</a></div>`
       + `<div class="sig">${signature(item)}</div>${comment(item.comment)}</div>`).join("");
 }
 
 function route() {
-  const hash = decodeURIComponent(location.hash.slice(1));
+  let hash = location.hash.slice(1);
+  try { hash = decodeURIComponent(hash); } catch (e) { /* typed by hand, not encoded */ }
   const name = hash.split(":")[0];
   if (!name) return showIndex();
   showModule(name);
@@ -213,7 +224,7 @@ function route() {
 }
 
 document.getElementById("modules").innerHTML = docs.modules.map(m =>
-  `<li><a href="#${esc(m.name)}" data-module="${esc(m.name)}">${esc(m.name)}</a></li>`).join("");
+  `<li><a href="${link(m.name)}" data-module="${esc(m.name)}">${esc(m.name)}</a></li>`).join("");
 const box = document.getElementById("search");
 box.addEventListener("input", () => search(box.value));
 window.addEventListener("hashchange", () => { box.value = ""; route(); });

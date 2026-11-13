@@ -5,9 +5,10 @@
 -- program, and writes nothing. `build` compiles all the way and writes the
 -- result to `-o`, in the format its extension names or `-f` overrides. `doc`
 -- checks the modules it is given and writes what each exports as JSON
--- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print what a stage produced, which is how
--- a pass is read while it is being written: `check` goes on as far as the
--- latest stage asked for and no further, and `build` prints them on its way.
+-- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print
+-- what a stage produced, which is how a pass is read while it is being
+-- written: `check` goes on as far as the latest stage asked for and no
+-- further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -436,19 +437,27 @@ fun doc(p : Args.Parser) -> Unit {
         }
     }
     if len(paths) == 0 { usage() }
+    let library = canonical(libRoot())
+    -- The directory every file outside the library is in: as the first such
+    -- argument spells it, which is how the files' diagnostics will name it,
+    -- and canonical, to compare the others with.
     var directory = None
     let names = []
     for path in paths {
-        let (root, name) = moduleNamed(path)
-        if root != libRoot() {
+        if let Left(e) = File.metadata(path) { die(message(e)) }
+        let (root, name) = moduleNamed(path, library)
+        if root != library {
             match directory {
-                Some(d) -> if d != root {
-                    die("'" + path + "' is not in '" + d + "', where the other "
-                        + "modules outside the library are; document each "
-                        + "directory separately")
+                Some((spelled, d)) -> if d != root {
+                    die("'" + path + "' is not in '" + spelled + "', where the "
+                        + "other modules outside the library are; document "
+                        + "each directory separately")
                 }
-                None -> { directory = Some(root) }
+                None -> { directory = Some((directoryOf(path), root)) }
             }
+        } else if String.startsWith(name, "Turkey.") {
+            die("'" + path + "' is part of the library's implementation, which "
+                + "no program can import, so it has no documentation")
         }
         Vec.push(names, name)
     }
@@ -458,9 +467,13 @@ fun doc(p : Args.Parser) -> Unit {
         -- opt out of it instead.
         if name != Prelude.preludeName { String.push(imports, "import " + name + " ()\n") }
     }
-    let entry = Option.unwrapOr(directory, ".") + "/doc-entry.gob"
+    let entry = match directory {
+        Some((spelled, _)) -> spelled + "/doc-entry.gob"
+        None -> "./doc-entry.gob"
+    }
     Diag.compiling(entry)
-    let (checked, _, groups) = checkSource(Source { name = entry, text = String.build(imports) })
+    let source = Source { name = entry, text = String.build(imports) }
+    let (checked, _, groups) = checkSource(source)
     let modules = []
     for group in groups {
         for m in group {
@@ -475,17 +488,60 @@ fun doc(p : Args.Parser) -> Unit {
     write(Doc.document(modules, tables))
 }
 
--- The search root `path` is under, and the module it holds there.
-fun moduleNamed(path : String) -> (String, String) {
-    let (root, relative) = match String.stripPrefix(path, libRoot() + "/") {
-        Some(rest) -> (libRoot(), rest)
-        None -> (directoryOf(path), baseName(path))
+-- The search root `path` is under, canonical, and the module it holds
+-- there. `library` is the library's root, canonical. Refuses a path that no
+-- import could name.
+fun moduleNamed(path : String, library : String) -> (String, String) {
+    let full = canonical(path)
+    let (root, relative) = match String.stripPrefix(full, library + "/") {
+        Some(rest) -> (library, rest)
+        None -> (directoryOf(full), baseName(full))
     }
     let stem = match String.stripSuffix(relative, ".gob") {
         Some(s) -> s
         None -> die("'" + path + "' is not a module; a module's file ends in .gob")
     }
-    (root, String.replace(stem, "/", "."))
+    let parts = String.split(stem, "/")
+    for part in parts {
+        if !isModuleName(part) {
+            die("'" + path + "' cannot be imported: '" + part + "' is not a "
+                + "module name, which starts with a capital letter and holds "
+                + "only letters, digits and '_'")
+        }
+    }
+    (root, String.join(parts, "."))
+}
+
+fun isModuleName(part : String) -> Bool {
+    var first = True
+    for c in String.codePoints(part) {
+        let ok = if first { Char.isAsciiUpper(c) }
+                 else { Char.isAsciiAlphanumeric(c) || c == '_' || c == '\'' }
+        if !ok { return False }
+        first = False
+    }
+    !first
+}
+
+-- `path` made absolute against the working directory, with each `.`, each
+-- `..` and each empty component taken out. Symbolic links are not resolved,
+-- so two spellings of one file through a link compare unequal.
+fun canonical(path : String) -> String {
+    let absolute = if String.startsWith(path, "/") { path } else {
+        match Env.currentDirectory() {
+            Some(working) -> working + "/" + path
+            None -> die("cannot read the working directory to resolve '" + path + "'")
+        }
+    }
+    let parts = []
+    for part in String.split(absolute, "/") {
+        match part {
+            "" | "." -> {}
+            ".." -> { let _ = Vec.pop(parts) }
+            _ -> Vec.push(parts, part)
+        }
+    }
+    "/" + String.join(parts, "/")
 }
 
 -- Writes `bytes` as an executable at `path`, through a new file beside it

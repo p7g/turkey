@@ -20,6 +20,8 @@ import Turkey.Prelude as Prelude
 import Turkey.Source as Source
 import Turkey.Source (Span(..))
 import Turkey.Types as Ty
+import Turkey.Types (TVar, TFun, TTuple)
+import Turkey.Ast as Ast
 
 -- What the checked program provides beyond the modules: the class table,
 -- which holds the declaration table, and the scheme each top-level binding
@@ -227,22 +229,22 @@ fun declItems(m : Modules.Module, t : Tables, cs : Comments, ex : Exported,
     match d {
         DStmt(s) -> match s.kind {
             SFun(f) -> if let Some(name) = Map.get(ex.values, f.name) {
-                push(f.name, valueItem("function", name, f.name, s.span, cs, t, None))
+                push(f.name, valueItem("function", name, f.name, s.span, cs, t, None, Some(f)))
             }
             SLet(pat, _) -> for v in Vec.sort(patternVars(pat)) {
                 if let Some(name) = Map.get(ex.values, v) {
-                    push(v, valueItem("value", name, v, s.span, cs, t, Some(False)))
+                    push(v, valueItem("value", name, v, s.span, cs, t, Some(False), None))
                 }
             }
             SVar(pat, _) -> for v in Vec.sort(patternVars(pat)) {
                 if let Some(name) = Map.get(ex.values, v) {
-                    push(v, valueItem("value", name, v, s.span, cs, t, Some(True)))
+                    push(v, valueItem("value", name, v, s.span, cs, t, Some(True), None))
                 }
             }
             _ -> {}
         }
         DForeign(f) -> if let Some(name) = Map.get(ex.values, f.name) {
-            push(f.name, valueItem("function", name, f.name, f.span, cs, t, None))
+            push(f.name, valueItem("function", name, f.name, f.span, cs, t, None, None))
         }
         DType(td) -> if let Some(name) = Map.get(ex.types, td.name) {
             push(td.name, typeItem(t, cs, ex, td, name))
@@ -276,10 +278,15 @@ fun heading(kind : String, name : String, where : Span, cs : Comments) -> Vec (S
 fun nestedComment(cs : Comments, line : Int, parent : Int) -> Option String =
     if line == parent { None } else { attached(cs, line) }
 
+-- `decl` is the function's declaration, for its annotations' variable names.
 fun valueItem(kind : String, name : String, internal : String, where : Span, cs : Comments,
-              t : Tables, mutable : Option Bool) -> JSON {
+              t : Tables, mutable : Option Bool, decl : Option FunDecl) -> JSON {
     let members = heading(kind, name, where, cs)
-    Vec.push(members, ("type", optional(Option.map(t.scheme(internal), Ty.showScheme))))
+    let shown = Option.map(t.scheme(internal), fun(s) = match decl {
+        Some(d) -> showWritten(s, annotatedNames(t, d, s))
+        None -> showWritten(s, Map.new())
+    })
+    Vec.push(members, ("type", optional(shown)))
     if let Some(b) = mutable { Vec.push(members, ("mutable", JBool(b))) }
     JObject(members)
 }
@@ -302,7 +309,7 @@ fun typeItem(t : Tables, cs : Comments, ex : Exported, td : TypeDecl, name : Str
     let cons = []
     for c in variants {
         if let Some(cname) = Map.get(ex.cons, c.name) {
-            Vec.push(cons, conItem(t, cs, td.span.line, c, cname))
+            Vec.push(cons, conItem(t, cs, td, c, cname))
         }
     }
     Vec.push(members, ("opaque", JBool(len(cons) == 0 && len(variants) > 0)))
@@ -310,13 +317,16 @@ fun typeItem(t : Tables, cs : Comments, ex : Exported, td : TypeDecl, name : Str
     JObject(members)
 }
 
-fun conItem(t : Tables, cs : Comments, parent : Int, c : ConDecl, name : String) -> JSON {
-    let scheme = Option.map(Decls.con(t.classes.decls, c.name), fun(info) = Ty.showScheme(info.scheme))
+fun conItem(t : Tables, cs : Comments, td : TypeDecl, c : ConDecl, name : String) -> JSON {
+    let scheme = Option.map(Decls.con(t.classes.decls, c.name),
+                            fun(info) = showWritten(info.scheme, constructorNames(td, info)))
     let members = [
         ("name", JString(name)),
         ("line", JInt(c.span.line)),
-        ("comment", optional(nestedComment(cs, c.span.line, parent))),
+        ("comment", optional(nestedComment(cs, c.span.line, td.span.line))),
         ("type", optional(scheme)),
+        ("exists", strings(c.binders)),
+        ("context", strings(Vec.map(c.context, writtenPred(t, _)))),
     ]
     match c.fields {
         Some(fields) -> {
@@ -324,10 +334,14 @@ fun conItem(t : Tables, cs : Comments, parent : Int, c : ConDecl, name : String)
             for var i = 0; i < len(fields); i = i + 1 {
                 let (field, written) = fields[i]
                 let line = if i < len(c.fieldSpans) { c.fieldSpans[i].line } else { c.span.line }
+                -- Of several fields on one line, the comment above it is the
+                -- first's.
+                let shared = i > 0 && i - 1 < len(c.fieldSpans) && c.fieldSpans[i - 1].line == line
                 Vec.push(out, JObject([
                     ("name", JString(field)),
                     ("line", JInt(line)),
-                    ("comment", optional(nestedComment(cs, line, c.span.line))),
+                    ("comment", optional(if shared { None }
+                                         else { nestedComment(cs, line, c.span.line) })),
                     ("type", JString(Classes.writtenType(t.classes, written, 0))),
                     ("mutable", JBool(Vec.contains(c.vars, field))),
                 ]))
@@ -451,10 +465,87 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec JSON 
                 })),
             ]
             if order == 0 {
-                Vec.push(members, ("type", optional(Option.map(t.scheme(target), Ty.showScheme))))
+                Vec.push(members, ("type", optional(Option.map(t.scheme(target),
+                                                               showWritten(_, Map.new())))))
             }
             Vec.push(found, ((order, name), JObject(members)))
         }
     }
     Vec.map(Vec.sortByKey(found, fun((key, _)) = key), fun((_, item)) = item)
+}
+
+-- -- written names --------------------------------------------------------------------
+
+-- Returns the names the annotations of `d` give the variables of `s`, its
+-- scheme, by variable id. A variable no annotation names gets none.
+fun annotatedNames(t : Tables, d : FunDecl, s : Ty.Scheme) -> Map Int String {
+    let names = Map.new()
+    if let TFun(params, ret) = Ty.prune(s.body) {
+        for var i = 0; i < len(d.params) && i < len(params); i = i + 1 {
+            if let PAnnot(_, written) = d.params[i].kind { nameVars(t, written, params[i], names) }
+        }
+        if let Some(written) = d.ret { nameVars(t, written, ret, names) }
+    }
+    names
+}
+
+-- Records in `names` the name `written`, a type as an annotation writes it,
+-- gives each variable of `ty` where the two have the same shape. An alias is
+-- skipped, since what it expands to need not have its shape.
+fun nameVars(t : Tables, written : Ast.Type, ty : Ty.Type, names : Map Int String) -> Unit {
+    let pairs = fun(ws : Vec Ast.Type, ts : Array Ty.Type) {
+        if len(ws) == len(ts) {
+            for var i = 0; i < len(ws); i = i + 1 { nameVars(t, ws[i], ts[i], names) }
+        }
+    }
+    match (written.kind, Ty.prune(ty)) {
+        (TEVar(name), TVar(cell)) -> if !Map.contains(names, cell.id) {
+            Map.put(names, cell.id, name)
+        }
+        (TECon(name, args), pruned) -> if !isAlias(t, name) {
+            let (_, targs) = Ty.spine(pruned)
+            pairs(args, targs)
+        }
+        (TEApp(head, args), pruned) -> {
+            let (h, targs) = Ty.spine(pruned)
+            nameVars(t, head, h, names)
+            pairs(args, targs)
+        }
+        (TETuple(ws), TTuple(ts)) -> pairs(ws, ts)
+        (TEFun(ws, w), TFun(ts, r)) -> {
+            pairs(ws, ts)
+            nameVars(t, w, r, names)
+        }
+        _ -> {}
+    }
+}
+
+fun isAlias(t : Tables, name : String) -> Bool = match Map.get(t.classes.decls.tycons, name) {
+    Some(info) -> info.isAlias
+    None -> False
+}
+
+-- Returns the names a type declaration gives the variables of `info`'s
+-- scheme: its parameters, read off the scheme's result, and the variables an
+-- existential constructor's bracket binds.
+fun constructorNames(td : TypeDecl, info : Decls.ConInfo) -> Map Int String {
+    let names = Map.new()
+    let result = match Ty.prune(info.scheme.body) {
+        TFun(_, ret) -> ret
+        other -> other
+    }
+    let (_, args) = Ty.spine(result)
+    for var i = 0; i < len(args) && i < len(td.params); i = i + 1 {
+        if let TVar(cell) = Ty.prune(args[i]) { Map.put(names, cell.id, td.params[i]) }
+    }
+    for var i = 0; i < len(info.exists) && i < len(info.existsNames); i = i + 1 {
+        Map.put(names, info.exists[i].id, info.existsNames[i])
+    }
+    names
+}
+
+-- `p`, a predicate as a declaration writes it.
+fun writtenPred(t : Tables, p : Ast.Pred) -> String = match p.kind {
+    PClass(cls, ty) -> Ty.shortName(cls) + " " + Classes.writtenType(t.classes, ty, 2)
+    PEq(a, b) -> Classes.writtenType(t.classes, a, 1) + " ~ " + Classes.writtenType(t.classes, b, 1)
 }

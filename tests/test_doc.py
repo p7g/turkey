@@ -1,11 +1,11 @@
 """`boot doc` over a fixture, against the JSON recorded for it.
 
 `tests/doc/Fixture.gob` declares one of each kind of entity `boot doc`
-describes, re-exports from `tests/doc/Shapes.gob`, and places its comments
-on each edge of the attachment rule (`src/Turkey/Doc.gob`): a comment above a
-field, a constructor, a method and an instance; a block comment; a comment
-cut off by a blank line; a trailing comment above a declaration; and the
-module comment.
+describes, re-exports from `tests/doc/Shapes.gob`, and places `---` doc
+comments on each edge of the attachment rule (`src/Turkey/DocComments.gob`):
+above a field, a constructor, a method, an associated type and an instance;
+the module comment; and doc comments that document nothing, beside ordinary,
+rule and block comments that are never docs.
 
 To record new output, run with `TURKEY_BLESS_DOC=1`, and read the diff of
 `tests/doc/docs.json` before committing it.
@@ -58,44 +58,70 @@ def test_every_library_function_has_a_type() -> None:
     assert untyped == []
 
 
-def test_modules_outside_the_library_must_share_a_directory() -> None:
-    result = _doc("tests/doc/Fixture.gob", "tests/programs/adt.gob")
+def test_modules_outside_the_library_must_share_a_directory(tmp_path) -> None:
+    other = tmp_path / "Other.gob"
+    other.write_text("export (x)\nlet x = 1\n")
+    result = _doc("tests/doc/Fixture.gob", str(other))
     assert result.returncode == 2
     assert "document each directory separately" in result.stderr
 
 
-NOTHING = "this doc comment is not directly above anything it can document"
-TRAILING = "a doc comment cannot follow code on its line"
-
-
-@pytest.mark.parametrize("source, message", [
-    ("fun f() -> Int = 1\n\n--- Cut off by a blank line.\n\nfun main() {}\n", NOTHING),
-    ("fun main() {}\n---\n", NOTHING),
-    ("--- The module.\n\n--- Above an import.\nimport Data.Set as Set\n\nfun main() {}\n", NOTHING),
-    ("fun main() {\n    --- Inside a body.\n    let x = 1\n    print(x)\n}\n", NOTHING),
-    ("type T = T(Int)\n\ninstance Show T {\n    --- An instance's method.\n"
-     "    fun show(t : T) -> String = \"T\"\n}\n\nfun main() {}\n", NOTHING),
-    ("fun main() {} --- After code.\n", TRAILING),
-], ids=["blank line", "at the end", "import", "body", "instance method", "trailing"])
-def test_a_doc_comment_that_documents_nothing_is_an_error(tmp_path, source: str,
-                                                          message: str) -> None:
-    entry = tmp_path / "main.gob"
-    entry.write_text(source)
-    result = subprocess.run(toolchain.command(bootc.binary(), "check", str(entry)),
-                            cwd=bootc.REPO_ROOT, capture_output=True, text=True,
-                            timeout=120)
-    assert result.returncode != 0
-    assert message in result.stderr
-
-
 @pytest.mark.parametrize("source", [
-    "--- The module, above everything.\n\nfun main() {}\n",
-    "---- a rule\n-- -- a section header --\n{-- a block -}\nfun main() {}\n",
-], ids=["module comment", "not doc comments"])
-def test_these_are_not_errors(tmp_path, source: str) -> None:
+    "fun f() -> Int = 1\n\n--- Cut off by a blank line.\n\nfun main() {}\n",
+    "fun main() {}\n---\n",
+    "--- The module.\n\n--- Above an import.\nimport Data.Set as Set\n\nfun main() {}\n",
+    "fun main() {\n    --- Inside a body.\n    let x = 1\n    print(x)\n}\n",
+    "type T = T(Int)\n\ninstance Show T {\n    --- An instance's method.\n"
+    "    fun show(t : T) -> String = \"T\"\n}\n\nfun main() {}\n",
+    "fun main() {} --- After code.\n",
+], ids=["blank line", "at the end", "import", "body", "instance method", "trailing"])
+def test_a_doc_comment_that_documents_nothing_is_an_ordinary_comment(tmp_path,
+                                                                   source: str) -> None:
     entry = tmp_path / "main.gob"
     entry.write_text(source)
     result = subprocess.run(toolchain.command(bootc.binary(), "check", str(entry)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             timeout=120)
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("spelling", [
+    "lib/Data/Option.gob",
+    "./lib/Data/Option.gob",
+    "lib/../lib/Data/Option.gob",
+    str(bootc.REPO_ROOT / "lib" / "Data" / "Option.gob"),
+], ids=["plain", "dot", "dot-dot", "absolute"])
+def test_a_library_file_is_its_module_however_it_is_spelled(spelling: str) -> None:
+    result = _doc(spelling)
+    assert result.returncode == 0, result.stderr
+    [module] = json.loads(result.stdout)["modules"]
+    assert module["name"] == "Data.Option"
+
+
+def test_an_absolute_library_root_names_the_same_modules() -> None:
+    environment = dict(os.environ, TURKEY_LIB=str(bootc.REPO_ROOT / "lib"))
+    result = subprocess.run(toolchain.command(bootc.binary(), "doc", "lib/Data/Option.gob"),
+                            cwd=bootc.REPO_ROOT, env=environment, capture_output=True,
+                            text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["modules"][0]["name"] == "Data.Option"
+
+
+@pytest.mark.parametrize("path, message", [
+    ("tests/doc/Missing.gob", "Missing.gob"),
+    ("lib/Turkey/Heap.gob", "'lib/Turkey/Heap.gob' is part of the library's implementation"),
+    ("tests/doc/docs.json", "'tests/doc/docs.json' is not a module"),
+], ids=["missing", "implementation", "not a module"])
+def test_an_argument_that_names_no_module_is_refused_by_name(path: str, message: str) -> None:
+    result = _doc(path)
+    assert result.returncode == 2
+    assert message in result.stderr
+    assert "doc-entry" not in result.stderr
+
+
+def test_a_file_whose_name_is_no_module_name_is_refused(tmp_path) -> None:
+    module = tmp_path / "my module.gob"
+    module.write_text("export (x)\nlet x = 1\n")
+    result = _doc(str(module))
+    assert result.returncode == 2
+    assert "'my module' is not a module name" in result.stderr

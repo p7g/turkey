@@ -254,26 +254,20 @@ fun callGraph(binds : Vec CBind, walked : Array Walked) -> Map String (Set.Set S
 
 --- Enough bindings that every cycle contains one, never to be inlined.
 ---
---- One per component is not enough. Removing a component's breaker cuts the
---- cycles through it, and a component can hold others: `head` calling itself
---- beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
---- inlining the survivors then does not terminate. So what is left of a
---- component once its breaker is out is split into components again, until none
---- is cyclic.
----
 --- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
 --- the first is the lexicographically first name, and a golden that depends on
 --- which binding was broken does not move when an unrelated one is added.
 ---
 --- The breaker is the first member that is not in `dicts`, and a dictionary
---- only when every member is one. A method read out of a known dictionary
---- (`Methods.knownField`) is a step that never asks the breakers, so a cycle
---- broken only at a dictionary is still followed by inlining, round and round.
---- A directly recursive instance method is exactly such a cycle: it calls
---- itself through its own instance's dictionary, and the dictionary's name
---- sorts first because it is a prefix of the method's.
+--- only when every member is one.
 fun loopBreakers(graph : Map String (Set.Set String), dicts : Methods.Dictionaries)
         -> Set.Set String {
+    -- One per component is not enough. Removing a component's breaker cuts the
+    -- cycles through it, and a component can hold others: `head` calling itself
+    -- beside `expr -> inside -> head -> expr` survives the removal of `cell`,
+    -- and inlining the survivors then does not terminate. So what is left of a
+    -- component once its breaker is out is split into components again, until
+    -- none is cyclic.
     let out = Set.new()
     let pending = [graph]
     var k = 0
@@ -287,6 +281,13 @@ fun loopBreakers(graph : Map String (Set.Set String), dicts : Methods.Dictionari
                     Set.add(out, only)
                 }
             } else {
+                -- A method read out of a known dictionary
+                -- (`Methods.knownField`) is a step that never asks the
+                -- breakers, so a cycle broken only at a dictionary is still
+                -- followed by inlining, round and round. A directly recursive
+                -- instance method is exactly such a cycle: it calls itself
+                -- through its own instance's dictionary, and the dictionary's
+                -- name sorts first because it is a prefix of the method's.
                 var broken = 0
                 while broken < len(component) && Map.contains(dicts, component[broken]) {
                     broken = broken + 1
@@ -620,33 +621,32 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
 var runs = 0
 
 --- Every binding's body, reduced -- callees before their callers.
----
---- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
---- site asks for it, and if that call site is itself inside a body being
---- reduced, the callee's traversal runs *nested inside* the caller's. On a
---- program with a deep call graph that makes the traversal's stack depth the
---- product of call-graph depth and term depth, which is what made this pass
---- unable to compile the bootstrap compiler at all.
----
---- Reducing in dependency order -- `Deps.sccs` already emits it -- means the
---- memo is warm before anyone asks, so `bodyOf` is a lookup and every traversal
---- is one term deep. Within a cycle there is no such order and the nesting can
---- still happen, but it is then bounded by the size of the component rather than
---- by the height of the whole graph.
----
---- A component waits only for the components it mentions, so components that do
---- not depend on each other are reduced at once, one per worker
---- (`Parallel.graphWith`). What makes that safe and the output the same however
---- they are scheduled: a component writes only its own `Done`, which nothing
---- reads until it has finished; it reads only finished components' and its
---- own; the answers a worker keeps across components are about finished
---- components, and so the same whoever asked first but for the ids in a
---- reduced body, which reach the output only through a copy; and the binders
---- it makes are minted into an owner of its own (`mint`). One component is
---- reduced by one worker, in order, because within a cycle what is known
---- depends on that order.
 fun reduceProgram(program : CProgram, decls : DeclTable, table : Binders.Table,
                   keepsCallSites : fun(String) -> Bool) -> CProgram {
+    -- The order is not cosmetic. `bodyOf` reduces a callee the first time some
+    -- call site asks for it, and if that call site is itself inside a body
+    -- being reduced, the callee's traversal runs *nested inside* the caller's.
+    -- On a program with a deep call graph that makes the traversal's stack
+    -- depth the product of call-graph depth and term depth, which is what made
+    -- this pass unable to compile the bootstrap compiler at all.
+    --
+    -- Reducing in dependency order -- `Deps.sccs` already emits it -- means the
+    -- memo is warm before anyone asks, so `bodyOf` is a lookup and every
+    -- traversal is one term deep. Within a cycle there is no such order and the
+    -- nesting can still happen, but it is then bounded by the size of the
+    -- component rather than by the height of the whole graph.
+    --
+    -- A component waits only for the components it mentions, so components that
+    -- do not depend on each other are reduced at once, one per worker
+    -- (`Parallel.graphWith`). What makes that safe and the output the same
+    -- however they are scheduled: a component writes only its own `Done`, which
+    -- nothing reads until it has finished; it reads only finished components'
+    -- and its own; the answers a worker keeps across components are about
+    -- finished components, and so the same whoever asked first but for the ids
+    -- in a reduced body, which reach the output only through a copy; and the
+    -- binders it makes are minted into an owner of its own (`mint`). One
+    -- component is reduced by one worker, in order, because within a cycle what
+    -- is known depends on that order.
     let binds = Vec.append(program.dicts, program.binds)
     let walked = Parallel.map(binds, walk)
     let graph = callGraph(binds, walked)
@@ -2960,26 +2960,25 @@ fun atomic(e : Core) -> Bool = match e.kind {
 }
 
 --- Roughly the code `e` becomes, for the inliner to spend a budget of.
----
---- Counting every node as one is what this did, and it charges for a great deal
---- that is not code. `Main#inc` in the brainfuck benchmark -- one array element
---- read, incremented and written back -- measured 98 against a budget of 40 and
---- so stayed a call, while the loop that called it three times a cycle paid a
---- frame, a spill set and a panic-flag test for each. Most of those 98 nodes
---- were names: `match xs { Data.Vec#Vec(value) -> value }` appeared four
---- times, which is a single-constructor unpack and lowers to one load, and the
---- `let`s naming each intermediate lower to nothing at all, the backend being in
---- SSA already.
----
---- So: a variable, a primitive, a literal and a nullary constructor are
---- operands and cost nothing; a type application is erased; a `let` is a name for a value, and
---- costs what it names. A match with one alternative is a projection -- the
---- backend does not even test the tag -- while one with several costs a branch
---- each. This is GHC's `sizeExpr`, which is free for variables, literals, types
---- and coercions and charges per case alternative, and it is the same reasoning
---- as the discounts already here: the budget should track what a call site
---- actually grows by.
 fun sizeOf_(e : Core) -> Int = match e.kind {
+    -- Counting every node as one is what this did, and it charges for a great
+    -- deal that is not code. `Main#inc` in the brainfuck benchmark -- one array
+    -- element read, incremented and written back -- measured 98 against a
+    -- budget of 40 and so stayed a call, while the loop that called it three
+    -- times a cycle paid a frame, a spill set and a panic-flag test for each.
+    -- Most of those 98 nodes were names: `match xs { Data.Vec#Vec(value) ->
+    -- value }` appeared four times, which is a single-constructor unpack and
+    -- lowers to one load, and the `let`s naming each intermediate lower to
+    -- nothing at all, the backend being in SSA already.
+    --
+    -- So: a variable, a primitive, a literal and a nullary constructor are
+    -- operands and cost nothing; a type application is erased; a `let` is a
+    -- name for a value, and costs what it names. A match with one alternative
+    -- is a projection -- the backend does not even test the tag -- while one
+    -- with several costs a branch each. This is GHC's `sizeExpr`, which is free
+    -- for variables, literals, types and coercions and charges per case
+    -- alternative, and it is the same reasoning as the discounts already here:
+    -- the budget should track what a call site actually grows by.
     CVar(_) -> 0
     CPrim(_) -> 0
     CLit(_) -> 0

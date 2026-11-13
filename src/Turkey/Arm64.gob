@@ -195,28 +195,28 @@ type Convention = Standard | PreservesNone
 --- `n`, and 0 for an instruction that is not a call. Every register number in
 --- either file is below 32.
 ---
---- An allocation destroys none the allocator hands out. Its fast path writes
---- only its destination and `x16`/`x17`, which are outside the pool. Its slow
---- path calls the runtime under the standard convention, and so the stub saves
---- every caller-saved register holding a value live after the allocation, and
---- restores it after the call (`Turkey.Emit.stub`, `Turkey.Frame.stubAt`). The
---- collector does not need those saved registers described: a traced value
---- live across the allocation is also in its root slot (`Turkey.Roots`), and
---- the collector does not move objects, so a restored pointer is still valid.
---- An allocation is still a call to `isCall`, since the collector may run there.
----
---- Treating an allocation as a standard call instead would deny every
---- caller-saved register to every value live across one, though only the slow
---- path calls, once per refill of a size class's cursor. On the self-compile
---- that is more of those denials than every real call causes.
----
---- Masks rather than lists, and computed once: the allocator asks this of
---- every instruction it walks.
+--- An allocation destroys none the allocator hands out. An allocation is still
+--- a call to `isCall`, since the collector may run there.
 fun callClobbers(op : Arm, bank : Bank) -> Int = match op {
+    -- Masks rather than lists, and computed once: the allocator asks this of
+    -- every instruction it walks.
     Bl(_, c) -> clobbersUnder(c, bank)
     Blr(_, c) -> clobbersUnder(c, bank)
     TailB(_) -> clobbersUnder(Standard, bank)
     TailBr(_) -> clobbersUnder(Standard, bank)
+    -- An allocation's fast path writes only its destination and `x16`/`x17`,
+    -- which are outside the pool. Its slow path calls the runtime under the
+    -- standard convention, and so the stub saves every caller-saved register
+    -- holding a value live after the allocation, and restores it after the call
+    -- (`Turkey.Emit.stub`, `Turkey.Frame.stubAt`). The collector does not need
+    -- those saved registers described: a traced value live across the
+    -- allocation is also in its root slot (`Turkey.Roots`), and the collector
+    -- does not move objects, so a restored pointer is still valid.
+    --
+    -- Treating an allocation as a standard call instead would deny every
+    -- caller-saved register to every value live across one, though only the
+    -- slow path calls, once per refill of a size class's cursor. On the
+    -- self-compile that is more of those denials than every real call causes.
     _ -> 0
 }
 
@@ -590,21 +590,21 @@ fun computes(op : Arm) -> Bool = match op {
     _ -> False
 }
 
---- Whether this instruction is a call, which for the allocator means two
---- things at once: every caller-saved register is clobbered here, so a value
---- live across it needs a callee-saved one or a spill slot -- and it is a
---- safepoint, so the collector may run and every live traced value must be
---- somewhere the collector can see.
----
---- It lives here rather than in the allocator because which opcodes call is a
---- fact about the instruction set. `Ssa.effects` cannot answer it: every
---- machine instruction reports `writes`, deliberately, because the
---- optimizations run above this level and a conservative answer costs them
---- nothing.
---- Frame slots and the spill code that reads and writes them, asked by the
---- allocator's checker. Here rather than there because matching a constructor
---- needs it unqualified, and `Ret` names both a machine instruction and a
---- terminator in the allocator's scope.
+-- Whether this instruction is a call, which for the allocator means two
+-- things at once: every caller-saved register is clobbered here, so a value
+-- live across it needs a callee-saved one or a spill slot -- and it is a
+-- safepoint, so the collector may run and every live traced value must be
+-- somewhere the collector can see.
+--
+-- It lives here rather than in the allocator because which opcodes call is a
+-- fact about the instruction set. `Ssa.effects` cannot answer it: every
+-- machine instruction reports `writes`, deliberately, because the
+-- optimizations run above this level and a conservative answer costs them
+-- nothing.
+-- Frame slots and the spill code that reads and writes them, asked by the
+-- allocator's checker. Here rather than there because matching a constructor
+-- needs it unqualified, and `Ret` names both a machine instruction and a
+-- terminator in the allocator's scope.
 fun isSlot(m : Mem) -> Bool = match m {
     RootSlot(_) -> True
     SpillSlot(_) -> True
@@ -638,9 +638,10 @@ fun slotStore(op : Arm) -> Option (Int, Mem) = match op {
 --- either file, or the address of a frame slot. Each is one instruction that
 --- defines one virtual register, reads none, and neither reads nor writes the
 --- flags, so a copy of it computes the same value at any point in the
---- function. `MovZ` is not here because selection never emits one: a constant
---- is `MovConst` until the printer.
+--- function.
 fun rematerializable(op : Arm) -> Bool = match op {
+    -- `MovZ` is not here because selection never emits one: a constant is
+    -- `MovConst` until the printer.
     MovConst(Virtual(_), _) -> True
     Mov(Virtual(_), Physical(Gp, 31), _) -> True
     FMovIn(Virtual(_), Physical(Gp, 31)) -> True
@@ -811,23 +812,21 @@ fun virtual(r : Reg, p : fun(Value) -> Bool) -> Bool = match r {
 --- Whether `p` holds of some register an instruction *reads*, physical ones
 --- included, asked in operand order and stopping at the first that answers
 --- true.
----
---- This and `anyDest` are visitors rather than functions returning an array
---- of registers, which would read better; that is a compromise for speed.
---- Every pass from liveness to the allocator asks this of every instruction,
---- often more than once, and a returned array escapes to its caller, so it is
---- an allocation per question that no analysis removes. The closure passed
---- here goes to a parameter that is only called, so it is built in the
---- caller's frame.
----
---- The physical registers are the mirror of `anyDest`'s, and wanted for the
---- mirror reason. The allocator
---- knew what a `mov x0, %5` destroys but not that `x0` is then *live* until the
---- `bl` reads it -- so a value defined in between could have been given `x0`
---- and overwritten the argument. Selection never defines one there, which is
---- why nothing broke; a spiller's reload in front of `mov x1, %6` is exactly
---- such a value.
 fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
+    -- This and `anyDest` are visitors rather than functions returning an array
+    -- of registers, which would read better; that is a compromise for speed.
+    -- Every pass from liveness to the allocator asks this of every instruction,
+    -- often more than once, and a returned array escapes to its caller, so it
+    -- is an allocation per question that no analysis removes. The closure
+    -- passed here goes to a parameter that is only called, so it is built in
+    -- the caller's frame.
+    --
+    -- The physical registers are the mirror of `anyDest`'s, and wanted for the
+    -- mirror reason. The allocator knew what a `mov x0, %5` destroys but not
+    -- that `x0` is then *live* until the `bl` reads it -- so a value defined in
+    -- between could have been given `x0` and overwritten the argument.
+    -- Selection never defines one there, which is why nothing broke; a
+    -- spiller's reload in front of `mov x1, %6` is exactly such a value.
     Mov(_, a, _)        -> p(a)
     MovZ(_, _, _)       -> False
     MovK(d, _, _)       -> p(d)
@@ -918,13 +917,14 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
 --- The same instruction with every register it *reads* passed through `g`, and
 --- the registers it writes left alone.
 ---
---- The spiller's one rewrite: a reload is a fresh value, and the instruction
---- that used the spilled one reads the reload instead. Derived from `anySrc`
---- position by position so that the two cannot disagree about which operand is
---- a read. `MovK` is the exception and is left untouched -- it reads the
---- register it writes, so renaming the read would rename the write -- and
---- selection never emits one: a constant is `MovConst` until the printer.
+--- `MovK` is the exception and is left untouched -- it reads the register it
+--- writes, so renaming the read would rename the write -- and selection never
+--- emits one: a constant is `MovConst` until the printer.
 fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
+    -- The spiller's one rewrite: a reload is a fresh value, and the instruction
+    -- that used the spilled one reads the reload instead. Derived from `anySrc`
+    -- position by position so that the two cannot disagree about which operand
+    -- is a read.
     Mov(k0, a, k2)        -> Mov(k0, g(a), k2)
     MovZ(k0, k1, k2)      -> MovZ(k0, k1, k2)
     MovK(d, k1, k2)       -> MovK(d, k1, k2)
@@ -1027,13 +1027,14 @@ fun mapMem(m : Mem, g : fun(Reg) -> Reg) -> Mem = match m {
 --- The same instruction with every register through `g` and every memory
 --- operand through `m`.
 ---
---- What the emitter needs and `mapUses` is not: the allocator's colouring
---- replaces the registers an instruction *writes* as well as the ones it reads,
---- and the frame layout replaces a slot with an offset from `sp`. Generated
---- from the opcode declaration field by field, so a new instruction cannot be
---- half-covered. `m` runs before `g`, so a rewritten memory operand's own base
---- register is still coloured.
+--- `m` runs before `g`, so a rewritten memory operand's own base register is
+--- still coloured.
 fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match op {
+    -- What the emitter needs and `mapUses` is not: the allocator's colouring
+    -- replaces the registers an instruction *writes* as well as the ones it
+    -- reads, and the frame layout replaces a slot with an offset from `sp`.
+    -- Generated from the opcode declaration field by field, so a new
+    -- instruction cannot be half-covered.
     Mov(f0, f1, f2)          -> Mov(g(f0), g(f1), f2)
     MovZ(f0, f1, f2)         -> MovZ(g(f0), f1, f2)
     MovK(f0, f1, f2)         -> MovK(g(f0), f1, f2)
@@ -1125,14 +1126,14 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
 --- than a predicate so that a caller can accumulate -- a mask of what is
 --- written, say -- without capturing a `var`, which would cost a cell for
 --- every instruction it is asked of.
----
---- `anyDef` is this filtered to the virtual ones, which is what liveness and
---- the verifier want. The allocator wants the unfiltered answer: a `mov x0, %5`
---- before a call writes a real `x0`, and any value the allocator has put in
---- `x0` and needs after that instruction has just been destroyed. Deriving all
---- of these from one match is the point -- a second sixty-armed `match` listing
---- the same destinations is exactly the kind of duplication that drifts.
 fun foldDest(op : Arm, acc : a, f : fun(a, Reg) -> a) -> a = match op {
+    -- `anyDef` is this filtered to the virtual ones, which is what liveness and
+    -- the verifier want. The allocator wants the unfiltered answer: a `mov x0,
+    -- %5` before a call writes a real `x0`, and any value the allocator has put
+    -- in `x0` and needs after that instruction has just been destroyed.
+    -- Deriving all of these from one match is the point -- a second sixty-armed
+    -- `match` listing the same destinations is exactly the kind of duplication
+    -- that drifts.
     Mov(d, _, _)        -> f(acc, d)
     MovZ(d, _, _)       -> f(acc, d)
     MovK(d, _, _)       -> f(acc, d)
@@ -1264,10 +1265,10 @@ fun foldIn(rs : Array Reg, acc : a, f : fun(a, Reg) -> a) -> a {
 
 -- -- printing -----------------------------------------------------------------------
 
---- The assembly the system assembler accepts, which is the point: `as`
---- assembles what this prints, so it is the oracle for the encoder that comes
---- for an encoder that emits bytes directly. A printer that spelled something
---- `as` would reject would be a printer that could not check anything.
+-- The assembly the system assembler accepts, which is the point: `as`
+-- assembles what this prints, so it is the oracle for the encoder that comes
+-- for an encoder that emits bytes directly. A printer that spelled something
+-- `as` would reject would be a printer that could not check anything.
 fun showReg(r : Reg, w : Width) -> String {
     let prefix = match w {
         W32 -> "w"

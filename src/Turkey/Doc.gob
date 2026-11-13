@@ -307,9 +307,13 @@ fun typeItem(t : Tables, cs : Comments, ex : Exported, td : TypeDecl, name : Str
     Vec.push(members, ("derives", strings(derives)))
     let variants = Option.unwrapOr(td.variants, [])
     let cons = []
-    for c in variants {
+    for var i = 0; i < len(variants); i = i + 1 {
+        let c = variants[i]
+        -- Of several constructors on one line, the comment above it is the
+        -- first's.
+        let shared = i > 0 && variants[i - 1].span.line == c.span.line
         if let Some(cname) = Map.get(ex.cons, c.name) {
-            Vec.push(cons, conItem(t, cs, td, c, cname))
+            Vec.push(cons, conItem(t, cs, td, c, cname, shared))
         }
     }
     Vec.push(members, ("opaque", JBool(len(cons) == 0 && len(variants) > 0)))
@@ -317,15 +321,23 @@ fun typeItem(t : Tables, cs : Comments, ex : Exported, td : TypeDecl, name : Str
     JObject(members)
 }
 
-fun conItem(t : Tables, cs : Comments, td : TypeDecl, c : ConDecl, name : String) -> JSON {
-    let scheme = Option.map(Decls.con(t.classes.decls, c.name),
-                            fun(info) = showWritten(info.scheme, constructorNames(td, info)))
+-- `shared` says an earlier constructor is on the same line, and has the
+-- comment above it.
+fun conItem(t : Tables, cs : Comments, td : TypeDecl, c : ConDecl, name : String,
+            shared : Bool) -> JSON {
+    let info = Decls.con(t.classes.decls, c.name)
+    let scheme = Option.map(info, fun(i) = showWritten(i.scheme, constructorNames(td, i)))
+    let comment = if shared { None } else { nestedComment(cs, c.span.line, td.span.line) }
     let members = [
         ("name", JString(name)),
         ("line", JInt(c.span.line)),
-        ("comment", optional(nestedComment(cs, c.span.line, td.span.line))),
+        ("comment", optional(comment)),
         ("type", optional(scheme)),
-        ("exists", strings(c.binders)),
+        -- Every variable the bracket binds, whether bare or in a predicate.
+        ("exists", strings(match info {
+            Some(i) -> i.existsNames
+            None -> c.binders
+        })),
         ("context", strings(Vec.map(c.context, writtenPred(t, _)))),
     ]
     match c.fields {
@@ -464,10 +476,7 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec JSON 
                     None -> target
                 })),
             ]
-            if order == 0 {
-                Vec.push(members, ("type", optional(Option.map(t.scheme(target),
-                                                               showWritten(_, Map.new())))))
-            }
+            if order == 0 { Vec.push(members, ("type", optional(reexportedType(t, target)))) }
             Vec.push(found, ((order, name), JObject(members)))
         }
     }
@@ -548,4 +557,17 @@ fun constructorNames(td : TypeDecl, info : Decls.ConInfo) -> Map Int String {
 fun writtenPred(t : Tables, p : Ast.Pred) -> String = match p.kind {
     PClass(cls, ty) -> Ty.shortName(cls) + " " + Classes.writtenType(t.classes, ty, 2)
     PEq(a, b) -> Classes.writtenType(t.classes, a, 1) + " ~ " + Classes.writtenType(t.classes, b, 1)
+}
+
+-- The type of the value `target` names, with a method's variables named as
+-- its class declares them.
+fun reexportedType(t : Tables, target : String) -> Option String {
+    if let Some((cls, _)) = String.rsplitOnce(target, ".") {
+        if let Some(info) = Map.get(t.classes.classes, cls) {
+            if let Some(mi) = Map.get(info.methods, target) {
+                return Some(showWritten(mi.scheme, mi.names))
+            }
+        }
+    }
+    Option.map(t.scheme(target), showWritten(_, Map.new()))
 }

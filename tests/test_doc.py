@@ -125,3 +125,25 @@ def test_a_file_whose_name_is_no_module_name_is_refused(tmp_path) -> None:
     result = _doc(str(module))
     assert result.returncode == 2
     assert "'my module' is not a module name" in result.stderr
+
+
+def test_a_library_file_through_a_symbolic_link_is_refused(tmp_path) -> None:
+    link = tmp_path / "link"
+    link.symlink_to(bootc.REPO_ROOT / "lib")
+    result = _doc(str(link / "Data" / "Option.gob"))
+    assert result.returncode == 2
+    assert "is in the library at" in result.stderr
+
+
+def test_the_working_directory_cannot_stand_in_for_a_library_module(tmp_path) -> None:
+    (tmp_path / "Data").mkdir()
+    (tmp_path / "Data" / "Option.gob").write_text("export (impostor)\nlet impostor = 1\n")
+    lib = bootc.REPO_ROOT / "lib"
+    environment = dict(os.environ, TURKEY_LIB=str(lib))
+    result = subprocess.run(toolchain.command(bootc.binary(), "doc",
+                                              str(lib / "Data" / "Option.gob")),
+                            cwd=tmp_path, env=environment, capture_output=True,
+                            text=True, timeout=120)
+    assert result.returncode == 0, result.stderr
+    [module] = json.loads(result.stdout)["modules"]
+    assert module["file"] == str(lib / "Data" / "Option.gob")

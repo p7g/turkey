@@ -122,6 +122,7 @@ call s:Probe('', 0, 'turkeyLineComment')
 call s:Probe('\<do\>', 0, 'turkeyKeyword')
 call s:Probe(')?$', 1, 'turkeyOperator')       " the ? in Some(41)?
 call s:Probe('fun(x)', 0, 'turkeyKeyword')
+call s:Probe('--- after code', 0, 'turkeyLineComment')
 
 call writefile(s:out, $TURKEY_OUT . '/syntax.out')
 qa!

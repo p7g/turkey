@@ -467,9 +467,14 @@ fun doc(p : Args.Parser) -> Unit {
         -- opt out of it instead.
         if name != Prelude.preludeName { String.push(imports, "import " + name + " ()\n") }
     }
+    -- The entry's directory is the first place an import is looked for, so
+    -- with no file outside the library it is one that does not exist, and
+    -- nothing in the working directory can stand in for a library module.
+    -- The entry cannot be in the library itself: a module is the library's
+    -- only when it is found in the last place looked.
     let entry = match directory {
         Some((spelled, _)) -> spelled + "/doc-entry.gob"
-        None -> "./doc-entry.gob"
+        None -> libRoot() + "/.doc/doc-entry.gob"
     }
     Diag.compiling(entry)
     let source = Source { name = entry, text = String.build(imports) }
@@ -490,12 +495,23 @@ fun doc(p : Args.Parser) -> Unit {
 
 -- The search root `path` is under, canonical, and the module it holds
 -- there. `library` is the library's root, canonical. Refuses a path that no
--- import could name.
+-- import could name, and a file of some library other than `library`.
 fun moduleNamed(path : String, library : String) -> (String, String) {
     let full = canonical(path)
     let (root, relative) = match String.stripPrefix(full, library + "/") {
         Some(rest) -> (library, rest)
-        None -> (directoryOf(full), baseName(full))
+        None -> {
+            -- A library file spelled through a symbolic link, which
+            -- `canonical` does not resolve, would otherwise be read as a
+            -- module named by its file alone.
+            if let Some(other) = libraryHolding(directoryOf(full)) {
+                die("'" + path + "' is in the library at '" + other + "', and "
+                    + "the library in use is '" + library + "'; if one is a "
+                    + "symbolic link to the other, name the file through '"
+                    + library + "'")
+            }
+            (directoryOf(full), baseName(full))
+        }
     }
     let stem = match String.stripSuffix(relative, ".gob") {
         Some(s) -> s
@@ -506,10 +522,22 @@ fun moduleNamed(path : String, library : String) -> (String, String) {
         if !isModuleName(part) {
             die("'" + path + "' cannot be imported: '" + part + "' is not a "
                 + "module name, which starts with a capital letter and holds "
-                + "only letters, digits and '_'")
+                + "only letters, digits, '_' and \"'\"")
         }
     }
     (root, String.join(parts, "."))
+}
+
+-- Returns the nearest directory from the absolute directory `start` upward
+-- that holds a library, by the `Prelude.gob` every library has.
+fun libraryHolding(start : String) -> Option String {
+    var directory = start
+    loop {
+        if let Right(_) = File.metadata(directory + "/Prelude.gob") { return Some(directory) }
+        if directory == "/" || directory == "" { return None }
+        let parent = directoryOf(directory)
+        directory = if parent == "" || parent == "." { "/" } else { parent }
+    }
 }
 
 fun isModuleName(part : String) -> Bool {

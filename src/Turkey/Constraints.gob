@@ -861,7 +861,7 @@ fun solveRefusals(s : Solver) -> Unit {
 -- type an equality decides takes that type, not the default.
 fun defaultOnce(s : Solver) -> Bool {
     let open = everywhere(s.here)
-    if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open) {
+    if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open, open, Vec.new(1)) {
         solveWanteds(s)
         True
     } else {
@@ -2439,7 +2439,7 @@ fun split(s : Solver, c : LetCell, types : Array Ty.Type, after : Int) -> Vec Pr
         for p in unattributed(retainedPreds, types) {
             if !isArrayLiteralDemand(p) && !isOccursEquation(p) { Vec.push(stranded, p) }
         }
-        if len(stranded) == 0 || !applyDefaults(s, stranded) {
+        if len(stranded) == 0 || !applyDefaults(s, stranded, retainedPreds, Vec.new(1)) {
             -- An equality that can never be solved is what leaves the others
             -- undecided, most often, so it is reported first.
             if c.topLevel { rejectQuantified(s, c, after) }
@@ -3626,32 +3626,466 @@ fun intersect(a : Array String, b : Array String) -> Array String =
 fun isArrayLiteralDemand(c : PredCell) -> Bool =
     c.pred.name == oneOf && Ty.isArrayLiteralSet(c.pred.args[1])
 
--- Resolve `OneOf`s that nothing will ever narrow, by picking a member.
+-- Resolve `OneOf`s that nothing will ever narrow, by picking a member, one
+-- round at a time, and returns whether the round decided anything. The
+-- caller solves again after a round that did, and asks for another.
 --
 -- Haskell's defaulting, for the same reason: the variable is ambiguous -- it
--- appears in no type being generalized, so no use site can pin it and no scheme
--- can carry it. The choice is the set's first member in `Ty.literalOrder`:
--- the head of the numeric tower for a numeral, `Array` for an array literal.
+-- appears in no type being generalized, so no use site can pin it and no
+-- scheme can carry it. A numeral takes the set's first member in
+-- `Ty.literalOrder`, the head of the numeric tower. An array literal takes
+-- the container its class constraints allow (`decideLiteral`).
+--
+-- GHC makes one pass of `applyDefaultingRules` over every group, judged
+-- against one snapshot of the wanteds, and then solves again
+-- (`tryTypeClassDefaulting`). A round here judges against one snapshot too,
+-- and applies what it decided together, but it decides only the first kind
+-- of demand that it can, in this order. The order is a deviation from GHC,
+-- which defaults every group in its one pass:
+--
+-- 1. Numerals. A container's instance may need something of its elements,
+--    and once a numeral is `Int` that need is about a known type.
+-- 2. Array literals with classes. A literal nested in another undecided
+--    literal's elements waits for that one, which passes its needs down to
+--    it; one whose judgment waits on a numeral not decided yet waits too.
+-- 3. Only in a round where neither moved: the literals that waited, judged
+--    without waiting, and then the literals with no class at all, which take
+--    `Array`. Under GHC's `ExtendedDefaultRules` a variable with no class
+--    forms no defaultable group, so it is not defaulted while anything else
+--    can still give it one.
+--
+-- `numerals` are numeral demands that may be defaulted when a literal waits
+-- on them although they are not in `stuck`: at the top level, where a
+-- binding's literals are decided before its numerals (`decideTopLevelLiterals`).
 --
 -- Only `OneOf` defaults. A stranded `HasField` is a genuine error: there is no
 -- preferred record type to guess.
-fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
+fun applyDefaults(s : Solver, stuck : Vec PredCell, consulted : Vec PredCell,
+                  numerals : Vec PredCell) -> Bool {
+    let open = Vec.filter(stuck, fun(c) = c.pred.name == oneOf && undecided(c))
     var progress = False
-    for c in stuck {
-        if c.pred.name == oneOf && undecided(c) {
-            let names = setNames(c.pred.args[1], c.span)
-            var chosen = False
-            for n in Ty.literalOrder() {
-                if Array.contains(names, n) && !chosen {
-                    Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, n), c.span,
-                             c.context, families(s))
-                    chosen = True
-                    progress = True
+    for c in open {
+        if !isArrayLiteralDemand(c) && defaultNumeral(s, c) { progress = True }
+    }
+    if progress { return True }
+    let all = Vec.filter(open, isArrayLiteralDemand)
+    let literals = distinctLiterals(all)
+    if len(literals) == 0 { return False }
+    let round = roundOf(s, literals, consulted, all)
+    let classed = Vec.filter(literals, fun(c) = len(literalClasses(s, round, c)) > 0)
+    if applyRound(s, round, classed, True) { return True }
+    -- Nothing was decided while waiting was allowed. A numeral a literal waits
+    -- on that the caller lets this default goes first.
+    for c in numerals {
+        if undecided(c) && waitedOn(round, c) && defaultNumeral(s, c) { progress = True }
+    }
+    if progress { return True }
+    if applyRound(s, round, classed, False) { return True }
+    applyRound(s, round, literals, False)
+}
+
+-- Returns one demand of `cells` per type: literals whose types were unified,
+-- all the elements of one `Set`, say, are decided together, so each is
+-- judged once.
+fun distinctLiterals(cells : Vec PredCell) -> Vec PredCell {
+    let seen = Set.new()
+    let out = Vec.new(len(cells))
+    for c in cells {
+        let key = Ty.typeKey(c.pred.args[0])
+        if !Set.contains(seen, key) {
+            Set.add(seen, key)
+            Vec.push(out, c)
+        }
+    }
+    out
+}
+
+-- Gives the numeral whose demand is `c` the first member of its set, and
+-- returns whether it did.
+fun defaultNumeral(s : Solver, c : PredCell) -> Bool {
+    let names = setNames(c.pred.args[1], c.span)
+    match Iter.find(Ty.literalOrder(), Array.contains(names, _)) {
+        Some(n) -> {
+            Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, n), c.span,
+                     c.context, families(s))
+            True
+        }
+        None -> False
+    }
+}
+
+-- One round's view of the open demands, taken before any of its decisions,
+-- so that every literal of the round is judged against the same state.
+type Round = Round {
+    -- The classes of the unary wanteds in `consulted`, by `Ty.typeKey` of
+    -- their argument.
+    classes  : Map String (Vec String),
+    -- The variables of numerals still open.
+    numerals : Set.Set Int,
+    -- The variable heading each undecided literal's type, and the variables
+    -- of that literal's elements.
+    literals : Map Int (Set.Set Int),
+    -- The demand of each undecided literal, by the variable heading its type.
+    demands  : Map Int PredCell,
+    -- The variables heading literals that are among another literal's
+    -- elements.
+    nested   : Set.Set Int,
+    -- The variables literals waited on, while waiting was allowed.
+    waited   : Set.Set Int,
+    -- Every undecided literal's demand, by `Ty.typeKey` of its type: the
+    -- literals decided together with the one of them a round judges.
+    sharing  : Map String (Vec PredCell),
+}
+
+fun roundOf(s : Solver, literals : Vec PredCell, consulted : Vec PredCell,
+           all : Vec PredCell) -> Round {
+    let classes = Map.new()
+    let numerals = Set.new()
+    for w in consulted {
+        let name = w.pred.name
+        if name == oneOf && !isArrayLiteralDemand(w) && undecided(w) {
+            if let TVar(v) = Ty.prune(w.pred.args[0]) { Set.add(numerals, v.id) }
+        } else if len(w.pred.args) == 1 && Classes.isClass(s.classes, name)
+                  && !Classes.isGenerated(name) {
+            let key = Ty.typeKey(w.pred.args[0])
+            match Map.get(classes, key) {
+                Some(found) -> if !Vec.contains(found, name) { Vec.push(found, name) }
+                None -> Map.put(classes, key, Vec.fromArray([name]))
+            }
+        }
+    }
+    let heads = Map.new()
+    let demands = Map.new()
+    for c in literals {
+        if let Some(v) = literalVar(c) {
+            Map.put(heads, v.id, Ty.freeVars(c.pred.args[2]))
+            Map.put(demands, v.id, c)
+        }
+    }
+    let nested = Set.new()
+    for (_, inside) in Map.entries(heads) {
+        for id in inside {
+            if Map.contains(heads, id) { Set.add(nested, id) }
+        }
+    }
+    let sharing = Map.new()
+    for c in all {
+        let key = Ty.typeKey(c.pred.args[0])
+        match Map.get(sharing, key) {
+            Some(found) -> Vec.push(found, c)
+            None -> Map.put(sharing, key, Vec.fromArray([c]))
+        }
+    }
+    Round { classes = classes, numerals = numerals, literals = heads, demands = demands,
+            nested = nested,
+            waited = Set.new(), sharing = sharing }
+}
+
+-- The variable heading the type of the array literal whose demand is `c`,
+-- while its container is undecided.
+fun literalVar(c : PredCell) -> Option VarCell = match Ty.spine(Ty.prune(c.pred.args[0])).0 {
+    TVar(v) -> Some(v)
+    _ -> None
+}
+
+-- Returns whether a literal waited on the numeral whose demand is `c`.
+fun waitedOn(round : Round, c : PredCell) -> Bool = match Ty.prune(c.pred.args[0]) {
+    TVar(v) -> Set.contains(round.waited, v.id)
+    _ -> False
+}
+
+-- Decides each literal of `cells` against `round`, then applies the
+-- decisions together, and returns whether there were any. When `patient`, a
+-- literal that waits is left for a later round.
+fun applyRound(s : Solver, round : Round, cells : Vec PredCell, patient : Bool) -> Bool {
+    let chosen = []
+    for c in cells {
+        if !undecided(c) { continue }
+        if patient && nestedInAnother(round, c) { continue }
+        if let Some(ty) = decideLiteral(s, round, c, patient) { Vec.push(chosen, (c, ty)) }
+    }
+    for (c, ty) in chosen {
+        let key = Ty.typeKey(c.pred.args[0])
+        Ty.unify(Ty.prune(c.pred.args[0]), ty, c.span, c.context, families(s))
+        -- Every literal of this type now has this container, and `oneOfRule`
+        -- will unify each one's elements with it. Bind each element variable
+        -- to this literal's first, so that each binding wakes only what
+        -- watches that one variable. `oneOfRule` binds the other way, so
+        -- that a mismatch reads as the equation it stands for; done there,
+        -- each binding would rebind the class every earlier one built, and
+        -- wake all of its watchers: quadratic in the literals sharing a type.
+        let element = Ty.prune(c.pred.args[2])
+        if let TVar(_) = element {
+            for other in Map.getOr(round.sharing, key, []) {
+                let mine = Ty.prune(other.pred.args[2])
+                if let TVar(_) = mine {
+                    if !Ty.sameType(mine, element) {
+                        Ty.unify(mine, element, other.span, other.context, families(s))
+                    }
                 }
             }
         }
     }
-    progress
+    len(chosen) > 0
+}
+
+-- Returns whether the literal whose demand is `c` is among the elements of
+-- another undecided literal, which is decided first.
+fun nestedInAnother(round : Round, c : PredCell) -> Bool = match literalVar(c) {
+    Some(v) -> Set.contains(round.nested, v.id)
+    None -> False
+}
+
+-- What solving a candidate container's group left (`judge`).
+type Verdict
+    -- Nothing, or only what the givens entail: the candidate's instances hold.
+    = Holds
+    -- Only classes at literals nested in this one, each of which some
+    -- container of that literal has: this literal's needs passed down.
+    | Passes
+    -- Classes at variables that no defaulting decides, or at skolems the
+    -- givens say nothing of: what a scheme would have to carry.
+    | Carried(String)
+    -- A class at a numeral or another literal not decided yet: the
+    -- variable's id, and the class.
+    | Waits(Int, String)
+    -- Something no later decision can discharge.
+    | Fails(String)
+
+-- Returns the container of the array literal whose demand is `c`, or `None`
+-- when it waits for a later round or none can be chosen, which is reported.
+--
+-- This is the Haskell 2010 Report's defaulting rule (section 4.3.4,
+-- "Ambiguous Types, and Defaults for Overloaded Numeric Operations") with the
+-- relaxations of GHC's `ExtendedDefaultRules`. The Report: "each defaultable
+-- variable is replaced by the first type in the default list that is an
+-- instance of all the ambiguous variable's classes", and it is a static error
+-- if there is none. GHC implements it in `GHC.Tc.Solver.Default`:
+-- `findDefaultableGroups` collects the unary constraints `C v` on each
+-- variable, and `tryDefaultGroup` substitutes each default type in turn,
+-- solves the group, and takes the first whose residual is empty
+-- (`firstSuccess`); a candidate with any residual is rejected. Here the
+-- default list is the literal's set, in `Ty.literalOrder`: `Array`, `Vec`,
+-- `FrozenArray`.
+--
+-- The relaxations are those `ExtendedDefaultRules` makes, and for the reason
+-- GHC makes them in GHCi: the literal itself is what asks for a default, as a
+-- numeral does. So the variable may also appear in other constraints -- an
+-- equation `Index.Value t ~ a` from indexing the literal, which a container
+-- decides -- and its classes need not be standard ones; those other
+-- constraints are not consulted in choosing.
+--
+-- The first candidate that holds -- its residual empty once the givens are
+-- assumed -- is taken, as GHC takes it. GHC rejects every other candidate;
+-- the rules below are Turkey's own, and deviations from GHC. Its defaults
+-- are nullary types, so no residual of theirs can fall on an element, and
+-- none of these cases arises there.
+--
+-- * When none holds, the first candidate whose residual falls only on
+--   literals nested in this one is taken (`Passes`): those needs pass down,
+--   and each inner literal is judged by them in a later round. A candidate
+--   passing down a class that no container of the inner literal has fails.
+--   This is what lets `Set.add(seen, [[1, 2]])` freeze both literals.
+-- * When none passes, the one candidate whose residual sits only at
+--   variables no defaulting decides is taken (`Carried`), as in
+--   `fun add(seen, p) { Set.add(seen, [p, p]) }`, whose `FrozenArray` leaves
+--   `Hash a` for the scheme to carry.
+-- * When several candidates are left so with the same residual, as `Debug`
+--   of an element every container prints alike, the residual does not tell
+--   them apart, and the first is taken, as for a literal with no class.
+-- * When their residuals differ, the literal is reported as ambiguous: taking
+--   the first would put a constraint in the scheme that the program's types
+--   never asked for, which no caller may be able to meet.
+--
+-- When every candidate fails, the literal is reported, naming what each
+-- lacks. A reported literal's demand is absorbed, so that neither a later
+-- round nor the classes left open report it again.
+fun decideLiteral(s : Solver, round : Round, c : PredCell, patient : Bool) -> Option Ty.Type {
+    let names = setNames(c.pred.args[1], c.span)
+    let classes = literalClasses(s, round, c)
+    let candidates = Array.map(Array.filter(Ty.literalOrder(), Array.contains(names, _)),
+                               fun(n) = (n, memberType(c.pred, n)))
+    let givens = givensAt(c)
+    let verdicts = Array.map(candidates, fun((_, ty)) = judge(s, round, c, classes, ty, givens))
+    for var i = 0; i < len(verdicts); i = i + 1 {
+        if let Holds = verdicts[i] { return Some(candidates[i].1) }
+    }
+    for var i = 0; i < len(verdicts); i = i + 1 {
+        if let Passes = verdicts[i] { return Some(candidates[i].1) }
+    }
+    let waits = Iter.any(verdicts, fun(v) = match v {
+        Waits(_, _) -> True
+        _ -> False
+    })
+    if patient && waits {
+        for v in verdicts {
+            if let Waits(id, _) = v { Set.add(round.waited, id) }
+        }
+        return None
+    }
+    let open = []
+    for var i = 0; i < len(verdicts); i = i + 1 {
+        match verdicts[i] {
+            Carried(need) | Waits(_, need) -> Vec.push(open, (i, need))
+            _ -> {}
+        }
+    }
+    -- One candidate, or several leaving the same needs, which then say nothing
+    -- about which container it is: the first, as for a literal with no class.
+    if len(open) > 0 && Iter.all(open, fun((_, need)) = need == open[0].1) {
+        return Some(candidates[open[0].0].1)
+    }
+    let quote = fun(i : Int) = "'" + Ty.display(candidates[i].0) + "'"
+    if len(open) > 1 {
+        let options = Array.map(Vec.toArray(open), fun((i, need)) = quote(i) + " needs '" + need + "'")
+        reportLiteral(c, "the container of this array literal is ambiguous: "
+                         + String.join(options, ", ") + "; add an annotation")
+        return None
+    }
+    let rejections = []
+    for var i = 0; i < len(verdicts); i = i + 1 {
+        if let Fails(why) = verdicts[i] { Vec.push(rejections, quote(i) + " " + why) }
+    }
+    -- Sorted, so that the message does not depend on the order of the uses.
+    let quoted = Array.sort(Array.map(classes, fun(cls) = "'" + Ty.shortName(cls) + "'"))
+    let needed = match len(quoted) {
+        1 -> quoted[0]
+        2 -> "both " + quoted[0] + " and " + quoted[1]
+        _ -> "all of " + String.join(Array.slice(quoted, 0, len(quoted) - 1), ", ")
+             + " and " + quoted[len(quoted) - 1]
+    }
+    reportLiteral(c, "no container this array literal could be has " + needed + ": "
+                     + String.join(Vec.toArray(rejections), ", "))
+    None
+}
+
+-- Reports `message` at the literal whose demand is `c`, and absorbs the
+-- demand.
+fun reportLiteral(c : PredCell, message : String) -> Unit {
+    Ty.typeError(message, c.span)
+    c.pred = Ty.pred(oneOf, [TBottom, c.pred.args[1], c.pred.args[2]])
+}
+
+-- The class givens in scope where the demand `c` arose, innermost first.
+fun givensAt(c : PredCell) -> Vec Pred {
+    let out = Vec.new(2)
+    var at = c.at
+    while let Some(impl) = at {
+        for (name, p) in impl.assumptions {
+            if name != "" { Vec.push(out, p) }
+        }
+        at = impl.parent
+    }
+    out
+}
+
+-- The classes of the wanted constraints `C t` on the type `t` of the array
+-- literal whose demand is `c`, each once: the ambiguous variable's classes,
+-- in the Report's words.
+--
+-- Only a constraint whose one argument is `t` itself counts, as only `C v`
+-- counts in the Report: `Show (Option t)` constrains `t` only through an
+-- instance, and is not consulted.
+--
+-- The wanteds are those in the round's `consulted`, indexed by type, and the
+-- inert ones that mention `t`'s variables. Both are needed. Generalization
+-- takes every predicate it splits out of the inert sets, whether a scheme
+-- could carry it or not, and passes them all as `consulted` (`split`), so
+-- `Hash (c a)` in a function generic in `a` is found there and not among the
+-- inert. The outermost boundary passes every open cell (`defaultOnce`).
+fun literalClasses(s : Solver, round : Round, c : PredCell) -> Array String {
+    let t = Ty.prune(c.pred.args[0])
+    let found = match Map.get(round.classes, Ty.typeKey(t)) {
+        Some(names) -> Vec.fromArray(Vec.toArray(names))
+        None -> Vec.new(2)
+    }
+    for v in Ty.varsOf([t]) {
+        for w in Map.getOr(s.watchers, v.id, []) {
+            let name = w.pred.name
+            if resting(w) && len(w.pred.args) == 1 && Classes.isClass(s.classes, name)
+               && !Classes.isGenerated(name) && !Vec.contains(found, name)
+               && Ty.sameType(Ty.prune(w.pred.args[0]), t) {
+                Vec.push(found, name)
+            }
+        }
+    }
+    Vec.toArray(found)
+}
+
+-- Returns whether the residual `l` can never be discharged, whatever is
+-- decided later: an equality the solver found insoluble or a wanted that went
+-- too deep, or a class at a type whose head is a known constructor. Instances
+-- are chosen by the head, so a class wanted the solver left at such a type
+-- has no instance; `Hash (Array a)` stays unsolved whatever `a` becomes. One
+-- at a variable, a skolem or an associated type waits on what decides it.
+fun hopeless(s : Solver, l : Classes.Leftover) -> Bool {
+    if l.insoluble || l.diverged { return True }
+    if !Classes.isClass(s.classes, l.pred.name) || len(l.pred.args) == 0 { return False }
+    match Ty.spine(Ty.prune(l.pred.args[0])).0 {
+        TCon(con) -> con.uid == 0
+        TTuple(_) | TFun(_, _) -> True
+        _ -> False
+    }
+}
+
+-- Returns whether some container of the literal whose type the variable
+-- `id` heads has an instance of `cls`, whatever its context asks.
+fun nestedCanHave(s : Solver, round : Round, id : Int, cls : String) -> Bool {
+    let c = match Map.get(round.demands, id) {
+        Some(c) -> c
+        None -> return True
+    }
+    let names = setNames(c.pred.args[1], c.span)
+    Iter.any(names, fun(n) =
+        Option.isSome(Classes.selectInstance(s.classes, Ty.pred(cls, [memberType(c.pred, n)]))))
+}
+
+-- Returns what solving the group of `classes` leaves with `candidate` in
+-- place, for the literal whose demand is `c` (`Verdict`). The group is solved
+-- in an implication of its own under `givens`, and the solver is left as it
+-- was found, so nothing a rejected candidate implies reaches the program.
+fun judge(s : Solver, round : Round, c : PredCell, classes : Array String,
+          candidate : Ty.Type, givens : Vec Pred) -> Verdict {
+    let wanteds = Vec.fromArray(Array.map(classes, fun(cls) = Ty.pred(cls, [candidate])))
+    let inner = match literalVar(c) {
+        Some(v) -> Map.getOr(round.literals, v.id, Set.new())
+        None -> Set.new()
+    }
+    -- The worst of the residual's wanteds decides: one that fails at once,
+    -- else one that waits, else one carried.
+    var waits : Option (Int, String) = None
+    let carried = []
+    var passes = False
+    for l in simplifyDerived(s, givens, wanteds, Vec.new(1)) {
+        if hopeless(s, l) {
+            if l.asked { return Fails("has no '" + Ty.shortName(l.pred.name) + "'") }
+            return Fails("needs '" + Ty.showPred(l.pred) + "'")
+        }
+        let need = Ty.showPred(l.pred)
+        let at = if len(l.pred.args) == 1 { Ty.spine(Ty.prune(l.pred.args[0])).0 } else { TBottom }
+        let id = match at {
+            TVar(v) -> v.id
+            _ -> -1
+        }
+        if Set.contains(inner, id) && Map.contains(round.literals, id) {
+            -- Passed down to a literal nested in this one, which must have a
+            -- container with the class for the need to be met there.
+            if !nestedCanHave(s, round, id, l.pred.name) {
+                return Fails("needs '" + need + "', which no container of the literal inside has")
+            }
+            passes = True
+        } else if Set.contains(round.numerals, id) || Map.contains(round.literals, id) {
+            if Option.isNone(waits) { waits = Some((id, need)) }
+        } else if !Vec.contains(carried, need) {
+            Vec.push(carried, need)
+        }
+    }
+    match waits {
+        Some((id, need)) -> Waits(id, need)
+        None -> if len(carried) == 0 { if passes { Passes } else { Holds } } else {
+            Carried(String.join(Array.sort(Vec.toArray(carried)), "', '"))
+        }
+    }
 }
 
 -- Solves each equality of `open` that is stuck only because a variable on
@@ -3713,9 +4147,18 @@ fun defaultEqualities(s : Solver, open : Vec PredCell) -> Bool {
 -- in a module that imports it, which is checked afterwards and could never
 -- decide it.
 fun decideTopLevelLiterals(s : Solver) -> Unit {
-    solveWanteds(s)
-    let open = Vec.filter(everywhere(s.here), fun(c) = isArrayLiteralDemand(c) && undecided(c))
-    if applyDefaults(s, open) { solveWanteds(s) }
+    -- Round by round, as `applyDefaults` decides them, solving in between.
+    loop {
+        solveWanteds(s)
+        let cells = everywhere(s.here)
+        let open = Vec.filter(cells, fun(c) = isArrayLiteralDemand(c) && undecided(c))
+        -- The binding's numerals are left to the rest of the module, except
+        -- one a literal's choice waits on, so that a literal here is decided
+        -- as it would be in a function's body.
+        let numerals = Vec.filter(cells, fun(c) = c.pred.name == oneOf
+                                                  && !isArrayLiteralDemand(c) && undecided(c))
+        if len(open) == 0 || !applyDefaults(s, open, cells, numerals) { break }
+    }
 }
 
 -- Whether a `OneOf` demand's type is still open, which is when defaulting may

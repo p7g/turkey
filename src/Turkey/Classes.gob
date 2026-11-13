@@ -2894,11 +2894,40 @@ fun whyNot(t : ClassTable, cls : String, ty : Ty.Type) -> String {
 -- it cannot be derived.
 fun whyMissing(t : ClassTable, p : Pred) -> Option String {
     if p.name == P.objectClass { return notAnObject(t, p) }
-    let (h, _) = Ty.spine(Ty.prune(p.args[0]))
+    let (h, args) = Ty.spine(Ty.prune(p.args[0]))
     let c = match h {
         TCon(c) -> c
         _ -> return None
     }
+    let why = declaredReason(t, p, c)
+    -- An array without `Hash` is most often a literal that its binding's own
+    -- definition made an `Array`, or a `Vec` built by pushing, so the reason
+    -- is followed by the way to a value that can be hashed.
+    let array = c.name == "Data.Array#Array"
+    if p.name != P.hashClass || !(array || c.name == "Data.Vec#Vec") || len(args) != 1 {
+        return why
+    }
+    -- The element's type only when it is known: a numeral not defaulted yet
+    -- would print as a variable.
+    let frozen = if len(Ty.varsOf(args)) > 0 { "'FrozenArray'" } else {
+        "'FrozenArray " + Ty.showAt(args[0], Ty.namer("_"), 2) + "'"
+    }
+    let hint = if array {
+        "a hashed value must not change, and an 'Array' can; make it a " + frozen
+            + " with an annotation, or copy it into one with 'FrozenArray.freeze'"
+    } else {
+        "a hashed value must not change, and a 'Vec' can; copy it into a " + frozen
+            + " with 'FrozenArray.freeze'"
+    }
+    match why {
+        Some(reason) -> Some(reason + "; " + hint)
+        None -> Some("'" + Ty.shortName(c.name) + "' has no 'Hash': " + hint)
+    }
+}
+
+-- Returns why `p`, at the declared type `c`, has no instance, when the
+-- declaration says why.
+fun declaredReason(t : ClassTable, p : Pred, c : ConCell) -> Option String {
     let lead = "'" + Ty.shortName(c.name) + "' has no '" + Ty.shortName(p.name) + "': "
     if refuses(t, c.name, p.name) {
         return Some(lead + "its declaration says '!" + Ty.shortName(p.name) + "'")

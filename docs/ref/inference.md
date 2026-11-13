@@ -404,7 +404,7 @@ written in a program.
 
 An [array literal](expressions.md#array-literals) does not have a single type
 either. It is an `Array`, a `Vec` or a `FrozenArray` of its elements, decided
-by how its value is used, and an `Array` when nothing decides:
+by how its value is used, and **defaulted** when nothing decides:
 
 <!-- run -->
 ```kotlin
@@ -424,13 +424,95 @@ fun main() {
 ```
 
 `seen` is a `Vec` because `Vec.contains` and `Vec.push` take one. The words are
-an `Array`: `for` accepts either, and nothing else decides. An annotation
+an `Array`: `for` accepts any of them, and nothing else decides. An annotation
 decides too, as in `let names : Vec String = []`, and so does a function's
 declared parameter or result type.
 
+A literal that nothing decides takes the first of `Array`, `Vec` and
+`FrozenArray` that has an instance of every class its uses need of it. The
+order puts the plainest container first: an `Array` is fixed in length and a
+`Vec` adds growth, and a `FrozenArray` gives up writing, which only a use that
+needs `Hash` asks for. Most uses need nothing an `Array` lacks, so most
+literals are arrays. A literal used as a `Set` element or a `Map` key needs
+`Hash`, which only `FrozenArray` has:
+
+<!-- run -->
+```kotlin
+import Data.Set as Set
+
+fun main() {
+    let seen = Set.new()
+    Set.add(seen, [0, 1])
+    Set.add(seen, [0, 1])
+    let costs = Map.new()
+    costs[[2, 3]] = 5
+    print((len(seen), costs[[2, 3]]))
+}
+```
+
+```text
+(1, 5)
+```
+
+Only a class of the literal's own type counts: `Hash` in `Set.add(seen, [0,
+1])` is about the literal, but `Show` in `print(Some([1]))` is about the
+`Option`, and the literal is an `Array`. This is the Haskell 2010 Report's
+defaulting rule (section 4.3.4), which picks the first type in a default list
+that is an instance of all the ambiguous variable's classes, with the
+relaxations GHC's `ExtendedDefaultRules` makes: the classes need not be
+standard ones, and the literal may also be used in ways that are not a class,
+such as being indexed. A container whose instance needs something of the
+elements is taken only when the elements have it, counting what the
+enclosing function's context provides.
+
+Four rules go beyond Haskell's:
+
+* Numerals are defaulted before array literals, and array literals with a
+  class before those without one, a round at a time, so that a container is
+  judged once its elements' type is known.
+* A literal inside another is decided after the outer one. A container whose
+  needs are met outright is taken first; one whose needs fall only on the
+  inner literal is taken only when none is, and only if some container of the
+  inner literal could meet them. Those needs then become the inner literal's.
+* When no container's needs are met outright, but exactly one's fall only on
+  an element type that nothing will default, such as a function's type
+  parameter, that one is taken, and the function's context carries its needs.
+  When several could be taken so with the same needs, those needs do not tell
+  them apart, and the first is taken. When their needs differ, the literal is
+  ambiguous and must be annotated, since taking the first would ask callers
+  for something the program never did.
+* A top-level `let`'s literal is decided before the module's other uses of
+  the binding are seen, and so are the numerals its choice depends on.
+
+When no container fits, the literal is rejected:
+
+<!-- error: no container this array literal could be has both 'Hash' and 'SetIndex': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
+```kotlin
+fun main() {
+    let costs = Map.new()
+    let key = [1, 2]
+    key[0] = 5
+    costs[key] = 1
+}
+```
+
+Because a literal inside another is decided after it, in
+`Set.add(seen, [[1, 2]])` the outer literal is a `FrozenArray`, which needs
+`Hash` of its elements, and that makes the inner literal a `FrozenArray` too,
+even when the inner literal is also printed or compared on its own. A literal
+that no use asks anything of is an `Array`.
+
+A function or a top-level `let` decides its literals from its own
+definition, before any use of it elsewhere is seen: `let key =
+[1, 2]` at the top level is an `Array`, and using it as a key is an error that
+suggests an annotation, `let key : FrozenArray Int = [1, 2]`.
+
+A key that changes cannot be found again, so build the key once it is final,
+with `FrozenArray.freeze(key)`.
+
 Unlike a numeric literal, an array literal is never generic in its container.
-A binding that is generalized, such as a function, still decides which of the
-two it builds, and defaults to `Array` when its own body does not say:
+A binding that is generalized, such as a function, still decides which one it
+builds, and takes the default when its own body does not say:
 
 <!-- error: expected 'Vec', found 'Array' in a function call -->
 ```kotlin
@@ -474,8 +556,7 @@ let count : Int = [1, 2]
 ```
 
 > **Coming from Haskell.** This is `OverloadedLists`, with a closed set of three
-> containers instead of the class `IsList`, and with a default: a literal
-> nothing decides is an `Array` rather than ambiguous.
+> containers instead of the class `IsList`.
 
 > **Coming from Rust.** `[a, b]` covers both `[a, b]` and `vec![a, b]`, and the
 > program's use of it chooses. There is no fixed-size array type whose length

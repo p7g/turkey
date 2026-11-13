@@ -7,13 +7,13 @@ export (
     toCString, fromCString,
 )
 
--- Raw memory, for the library's own code that crosses into C: memory the
--- collector does not know about.
---
--- `Ptr` is `Prim.Ptr` under its own name, as `Int` is `Prim.Int`, so a
--- `foreign` declaration takes and returns one directly.
---
--- `alloc` and `free` are `malloc` and `free`, declared in `Turkey.Libc`.
+--- Raw memory, for the library's own code that crosses into C: memory the
+--- collector does not know about.
+---
+--- `Ptr` is `Prim.Ptr` under its own name, as `Int` is `Prim.Int`, so a
+--- `foreign` declaration takes and returns one directly.
+---
+--- `alloc` and `free` are `malloc` and `free`, declared in `Turkey.Libc`.
 
 import Prelude ()
 import Data.Byte (Byte)
@@ -36,65 +36,67 @@ import Turkey.Libc as Libc
 
 type Ptr = Prim.Ptr
 
--- `size` bytes of uninitialized memory, or a null pointer if the allocation
--- failed. The contents are undefined -- not zero -- and reading before writing
--- is undefined behaviour rather than a panic.
+--- `size` bytes of uninitialized memory, or a null pointer if the allocation
+--- failed. The contents are undefined -- not zero -- and reading before writing
+--- is undefined behaviour rather than a panic.
 fun alloc(size : Int) -> Ptr = Libc.malloc(size)
 
--- Freeing a pointer this module did not answer, or one already freed, is
--- undefined behaviour. Freeing a null pointer does nothing.
+--- Freeing a pointer this module did not answer, or one already freed, is
+--- undefined behaviour. Freeing a null pointer does nothing.
 fun free(p : Ptr) = Libc.free(p)
 
 -- -- arithmetic ------------------------------------------------------------------------
 
--- `p` advanced by `offset` *bytes*. Wrapping and unchecked: it is defined for
--- any offset, and dereferencing the result is what is undefined if the offset
--- left the block.
+--- `p` advanced by `offset` *bytes*. Wrapping and unchecked: it is defined for
+--- any offset, and dereferencing the result is what is undefined if the offset
+--- left the block.
 fun add(p : Ptr, offset : Int) -> Ptr = Prim.ptrAdd(p, offset)
 
--- The number of bytes from `b` to `a`. Meaningful only when both point into
--- the same block; across blocks the answer is a number and nothing more.
+--- The number of bytes from `b` to `a`. Meaningful only when both point into
+--- the same block; across blocks the answer is a number and nothing more.
 fun diff(a : Ptr, b : Ptr) -> Int = Prim.ptrDiff(a, b)
 
 fun null() -> Ptr = Prim.ptrNull()
 
 fun isNull(p : Ptr) -> Bool = Prim.ptrIsNull(p)
 
--- The address as an integer. The value is *unspecified* beyond round-tripping
--- through `fromInt`, so a program that prints one prints something neither
--- host promises. It is here for alignment tests and for hashing.
+--- The address as an integer. The value is *unspecified* beyond round-tripping
+--- through `fromInt`, so a program that prints one prints something neither
+--- host promises. It is here for alignment tests and for hashing.
 fun toInt(p : Ptr) -> Int = Prim.ptrToInt(p)
 
--- No provenance is carried and none is checked. Dereferencing an address that
--- did not come from `alloc` is undefined behaviour.
+--- No provenance is carried and none is checked. Dereferencing an address that
+--- did not come from `alloc` is undefined behaviour.
 fun fromInt(n : Int) -> Ptr = Prim.ptrFromInt(n)
 
 -- -- reading and writing ---------------------------------------------------------------
 
--- A load and a store at the representation the value's type erases to.
---
--- The floor under these is twelve names, `Prim.loadI64` and its siblings, and
--- it has to be: the low IR attaches a representation to every value when the
--- instruction is emitted, so a load whose width were known only at run time
--- would have nothing to tell the register allocator. A witness *value* cannot
--- reach down there. A witness *type* can, which is what these are.
---
--- So `load` is one name and `mono` erases the dictionary: a selection off a
--- ground dictionary becomes a top-level binding, and `opt` inlines the body,
--- which is one `Prim.` call. Nothing is built and nothing allocates, which is
--- what lets giblet code use these.
---
--- A call site past `mono`'s specialization cap, or in a caller that is itself
--- polymorphic, keeps a dictionary, and a call through one is a call to an
--- unknown function. The giblet check refuses that in a giblet module, so a
--- giblet that compiles has had every dictionary erased.
---
--- Dispatch is on the *result*, as `Monoid.empty` is, so a call site annotates:
--- `let n : Int = Ptr.load(p, 0)`.
---
--- Offsets are bytes. An access that leaves the block, or one at an alignment
--- the target does not allow, is undefined behaviour and is not checked.
-class Load a { fun load(Ptr, Int) -> a }
+--- A load and a store at the representation the value's type erases to.
+---
+--- Dispatch is on the *result*, as `Monoid.empty` is, so a call site annotates:
+--- `let n : Int = Ptr.load(p, 0)`.
+---
+--- Offsets are bytes. An access that leaves the block, or one at an alignment
+--- the target does not allow, is undefined behaviour and is not checked.
+class Load a {
+    -- The floor under these is twelve names, `Prim.loadI64` and its siblings,
+    -- and it has to be: the low IR attaches a representation to every value
+    -- when the instruction is emitted, so a load whose width were known only
+    -- at run time would have nothing to tell the register allocator. A witness
+    -- *value* cannot reach down there. A witness *type* can, which is what
+    -- these are.
+    --
+    -- So `load` is one name and `mono` erases the dictionary: a selection off
+    -- a ground dictionary becomes a top-level binding, and `opt` inlines the
+    -- body, which is one `Prim.` call. Nothing is built and nothing allocates,
+    -- which is what lets giblet code use these.
+    --
+    -- A call site past `mono`'s specialization cap, or in a caller that is
+    -- itself polymorphic, keeps a dictionary, and a call through one is a call
+    -- to an unknown function. The giblet check refuses that in a giblet
+    -- module, so a giblet that compiles has had every dictionary erased.
+    fun load(Ptr, Int) -> a
+}
 class Store a { fun store(Ptr, Int, a) -> Unit }
 
 instance Load Int { fun load(p, off) = Prim.loadI64(p, off) }
@@ -111,54 +113,53 @@ instance Store Float { fun store(p, off, v) = Prim.storeF64(p, off, v) }
 instance Store Bool { fun store(p, off, v) = Prim.storeI1(p, off, v) }
 instance Store Ptr { fun store(p, off, v) = Prim.storePtr(p, off, v) }
 
--- A 32-bit integer, for a C `int` or `uint32_t`: `load32` zero-extends it, and
--- `store32` writes `value`'s low 32 bits. `Char` is the 32-bit type the
--- loads and stores have, so these go through it.
+--- A 32-bit integer, for a C `int` or `uint32_t`: `load32` zero-extends it, and
+--- `store32` writes `value`'s low 32 bits. `Char` is the 32-bit type the
+--- loads and stores have, so these go through it.
 fun load32(p : Ptr, offset : Int) -> Int = Char.toInt(load(p, offset))
 fun store32(p : Ptr, offset : Int, value : Int) -> Unit = store(p, offset, Prim.charFromInt(value))
 
 -- -- atomics --------------------------------------------------------------------------
 
--- The word at `offset`, read, written or changed atomically. Each orders every
--- memory access around it, so these are also the program's fences.
+--- The word at `offset`, read, written or changed atomically. Each orders every
+--- memory access around it, so these are also the program's fences.
 fun atomicLoad(p : Ptr, offset : Int) -> Int = Prim.atomicLoad(p, offset)
 fun atomicStore(p : Ptr, offset : Int, value : Int) -> Unit = Prim.atomicStore(p, offset, value)
 
--- Add `n` to the word, and return the value before.
+--- Add `n` to the word, and return the value before.
 fun atomicAdd(p : Ptr, offset : Int, n : Int) -> Int = Prim.atomicAdd(p, offset, n)
 
--- Store `new` if the word holds `expected`, and return the value before:
--- `expected` exactly when the store happened.
+--- Store `new` if the word holds `expected`, and return the value before:
+--- `expected` exactly when the store happened.
 fun atomicCas(p : Ptr, offset : Int, expected : Int, new : Int) -> Int =
     Prim.atomicCas(p, offset, expected, new)
 
 -- -- managed memory -----------------------------------------------------------------
 
--- The address of element `index` of `storage`. The collector does not move
--- objects, so the address stays good for as long as `storage` is alive, and
--- a caller that reads through it keeps `storage` alive past the last read
--- with `keepAlive`.
+--- The address of element `index` of `storage`. The collector does not move
+--- objects, so the address stays good for as long as `storage` is alive, and
+--- a caller that reads through it keeps `storage` alive past the last read
+--- with `keepAlive`.
 fun elementAddress(storage : Prim.Array a, index : Int) -> Ptr =
     Prim.elementAddress(storage, index)
 
--- Keeps `value` alive up to this point, and does nothing else.
+--- Keeps `value` alive up to this point, and does nothing else.
 fun keepAlive(value : a) -> Unit = Prim.keepAlive(value)
 
 -- -- C strings ------------------------------------------------------------------------
 
--- A `String` copied into a NUL-terminated block the caller must `free`, or
--- null if the allocation failed.
---
--- **A copy, and deliberately.** The collector does not move, so a string could
--- instead be padded with a NUL and passed in place, as OCaml does. That is
--- declined: the only NUL-terminated arguments here are paths and environment
--- names, and paying a byte on every string in the program to save a copy at a
--- handful of call sites is the wrong trade.
---
--- A `String` containing a NUL byte is truncated on the C side, and that is not
--- checked here: the block holds the whole string, and it is C's reader that
--- stops early.
+--- A `String` copied into a NUL-terminated block the caller must `free`, or
+--- null if the allocation failed.
+---
+--- A `String` containing a NUL byte is truncated on the C side, and that is not
+--- checked here: the block holds the whole string, and it is C's reader that
+--- stops early.
 fun toCString(s : String) -> Ptr {
+    -- **A copy, and deliberately.** The collector does not move, so a string
+    -- could instead be padded with a NUL and passed in place, as OCaml does.
+    -- That is declined: the only NUL-terminated arguments here are paths and
+    -- environment names, and paying a byte on every string in the program to
+    -- save a copy at a handful of call sites is the wrong trade.
     let bs = String.toBytes(s)
     let p = alloc(len(bs) + 1)
     if isNull(p) { return p }
@@ -169,14 +170,14 @@ fun toCString(s : String) -> Ptr {
     p
 }
 
--- The bytes up to the first NUL, as a `String`, or `None` if they are not
--- well-formed UTF-8 -- the same validating boundary `String.fromBytes` is, and
--- for the same reason: a C string is bytes and a `String` is not.
---
--- Reading a pointer that is not NUL-terminated runs off the end of the block,
--- which is undefined. Reading null is not: it answers
--- `None`, because a C function that failed answers null and a caller should
--- not have to test twice.
+--- The bytes up to the first NUL, as a `String`, or `None` if they are not
+--- well-formed UTF-8 -- the same validating boundary `String.fromBytes` is, and
+--- for the same reason: a C string is bytes and a `String` is not.
+---
+--- Reading a pointer that is not NUL-terminated runs off the end of the block,
+--- which is undefined. Reading null is not: it answers
+--- `None`, because a C function that failed answers null and a caller should
+--- not have to test twice.
 fun fromCString(p : Ptr) -> Option String {
     if isNull(p) { return None }
     let bs = []

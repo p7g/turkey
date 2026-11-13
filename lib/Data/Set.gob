@@ -1,4 +1,20 @@
-export (Set, new, add, remove, contains, elements)
+export (
+    Set,
+    new,
+    fromIterator,
+    add,
+    remove,
+    contains,
+    isEmpty,
+    elements,
+    union,
+    unionInto,
+    intersection,
+    difference,
+    symmetricDifference,
+    isSubset,
+    isDisjoint,
+)
 
 import Prelude ()
 import Data.Tuple (Unit)
@@ -6,7 +22,7 @@ import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-),
 import Text.Show (Show(..))
 import Debug (Debug(..))
 import Data.Eq (Eq(..), (==), (!=))
-import Data.Hashable (Hash(..), Hasher(..))
+import Data.Hashable (Hash(..))
 import Data.Functor (Functor(..))
 import Control.Iterator (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
@@ -15,10 +31,21 @@ import Data.Bool (Bool(..))
 import Data.Option (Option(..))
 import Data.Map as Map
 import Data.Map (Map, MapCursor)
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Semigroup (Semigroup(..))
+import Data.Monoid (Monoid(..))
+import Bits (BitAnd(..), BitOr(..), BitXor(..))
 
 type Set a = Set(Map a Unit)
 
 fun new() -> Set a = Set(Map.new())
+
+-- Returns a set of the elements of `xs`, in the order they first appear.
+fun fromIterator[Iterator c, Item c ~ a, Hash a](xs : c) -> Set a {
+    let s = new()
+    for x in xs { add(s, x) }
+    s
+}
 
 fun add[Hash a](Set(table) : Set a, x : a) -> Unit = Map.put(table, x, ())
 
@@ -27,8 +54,80 @@ fun remove[Hash a](Set(table) : Set a, x : a) -> Bool = Map.delete(table, x)
 
 fun contains[Hash a](Set(table) : Set a, x : a) -> Bool = Map.contains(table, x)
 
+fun isEmpty(s : Set a) -> Bool = len(s) == 0
+
 -- Insertion-ordered.
 fun elements(Set(table) : Set a) -> Array a = Map.keys(table)
+
+-- The four functions below return a new set and leave their arguments as
+-- they were.
+
+-- Returns the elements in `a` or `b`: `a`'s in order, then those of `b` not
+-- in `a`.
+fun union[Hash a](a : Set a, b : Set a) -> Set a {
+    let s = new()
+    for x in a { add(s, x) }
+    for x in b { add(s, x) }
+    s
+}
+
+-- Returns the elements in both `a` and `b`, in the order of the smaller of
+-- the two, or of `a` when they are the same size. Costs a probe per element
+-- of the smaller set.
+fun intersection[Hash a](a : Set a, b : Set a) -> Set a {
+    let (small, large) = if len(a) <= len(b) { (a, b) } else { (b, a) }
+    keep(small, fun(x) = contains(large, x))
+}
+
+-- Returns the elements in `a` and not in `b`, in `a`'s order.
+fun difference[Hash a](a : Set a, b : Set a) -> Set a = keep(a, fun(x) = !contains(b, x))
+
+-- Returns the elements in exactly one of `a` and `b`: those of `a` in order,
+-- then those of `b`.
+fun symmetricDifference[Hash a](a : Set a, b : Set a) -> Set a {
+    let s = difference(a, b)
+    for x in b {
+        if !contains(a, x) { add(s, x) }
+    }
+    s
+}
+
+-- Adds every element of `from` to `into`, and returns True if that added any.
+-- Costs a probe per element of `from`, where `into = into | from` would copy
+-- both sets.
+fun unionInto[Hash a](into : Set a, from : Set a) -> Bool {
+    let before = len(into)
+    for x in from { add(into, x) }
+    len(into) != before
+}
+
+-- Returns True if every element of `a` is in `b`.
+fun isSubset[Hash a](a : Set a, b : Set a) -> Bool {
+    if len(a) > len(b) { return False }
+    for x in a {
+        if !contains(b, x) { return False }
+    }
+    True
+}
+
+-- Returns True if no element is in both `a` and `b`.
+fun isDisjoint[Hash a](a : Set a, b : Set a) -> Bool {
+    -- Probe the larger set with the smaller one's elements: the answer is the
+    -- same either way, and the loop is as long as the smaller set.
+    let (small, large) = if len(a) <= len(b) { (a, b) } else { (b, a) }
+    for x in small {
+        if contains(large, x) { return False }
+    }
+    True
+}
+
+fun keep[Hash a](from : Set a, wanted : fun(a) -> Bool) -> Set a {
+    let s = new()
+    for x in from {
+        if wanted(x) { add(s, x) }
+    }
+    s
+}
 
 -- Equal when they hold the same elements, whatever order they were added in.
 instance Eq (Set a) : Hash a {
@@ -40,6 +139,16 @@ instance Eq (Set a) : Hash a {
         True
     }
 }
+
+instance Semigroup (Set a) : Hash a { fun combine(a, b) = union(a, b) }
+instance Monoid (Set a) : Hash a { fun empty() = new() }
+
+-- The operators of set algebra: `|` union, `&` intersection, `^` symmetric
+-- difference and `-` difference, as for the bits of an `Int`.
+instance BitOr (Set a) : Hash a { fun or(a, b) = union(a, b) }
+instance BitAnd (Set a) : Hash a { fun and(a, b) = intersection(a, b) }
+instance BitXor (Set a) : Hash a { fun xor(a, b) = symmetricDifference(a, b) }
+instance Sub (Set a) : Hash a { fun sub(a, b) = difference(a, b) }
 
 instance Length (Set a) {
     fun len(Set(table)) = len(table)

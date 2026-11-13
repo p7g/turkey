@@ -218,6 +218,54 @@ literal it was made from is one ([Array literals](inference.md#array-literals)).
 `Map k v`, a hash map, also has `Index`, `Length` and `Iterator` instances,
 and iterates over `(key, value)` pairs in insertion order.
 
+## `Set`
+
+`Set a`, in the module `Data.Set`, is a mutable hash set of `a`, for any `a`
+with `Hash`. It is not in the Prelude, so a program imports it, usually as
+`import Data.Set as Set`. `Set.new()` or `empty()` makes an empty set, and
+`Set.fromIterator(xs)` a set of the elements of anything `for` can walk.
+`Set.add` and `Set.remove` change a set in place, `Set.contains` tests for an
+element, and `len`, `for` and `Set.elements` see the elements in the order
+they were first added.
+
+`Set.union`, `Set.intersection`, `Set.difference` and
+`Set.symmetricDifference` return a new set and leave their arguments as they
+were. So do the operators, which call them: `a | b` is the union, `a & b` the
+intersection, `a - b` the elements of `a` not in `b`, and `a ^ b` the elements
+in exactly one of them. `a <> b` is the union too, and `empty()` is its
+identity. `Set.isSubset(a, b)`, `Set.isDisjoint(a, b)` and `Set.isEmpty(a)`
+test sets.
+
+<!-- run -->
+```kotlin
+import Data.Set as Set
+import Data.Set (Set)
+
+fun main() {
+    let odd = Set.fromIterator([1, 3, 5, 7])
+    let prime = Set.fromIterator([2, 3, 5, 7])
+    print(odd & prime)
+    print(odd - prime)
+    print(odd ^ prime)
+    print(Set.isSubset(odd & prime, odd))
+
+    var seen = empty() : Set Int
+    for step in [[1, 2], [2, 3]] { seen = seen | Set.fromIterator(step) }
+    print(seen)
+}
+```
+
+```text
+{3, 5, 7}
+{1}
+{1, 2}
+True
+{1, 2, 3}
+```
+
+Equal sets hash equal whatever order their elements were added in, so a set
+can be a key of a `Map` or an element of another set.
+
 ## Operator classes
 
 Each arithmetic, comparison and bitwise operator calls a class method
@@ -254,7 +302,9 @@ class Shift a {
 ```
 
 `Int` and `Byte` have instances of the four bitwise classes
-([Bitwise operators](expressions.md#bitwise-operators)).
+([Bitwise operators](expressions.md#bitwise-operators)), and `Set` has
+`BitAnd`, `BitOr` and `BitXor` for intersection, union and symmetric
+difference ([`Set`](#set)).
 
 The Prelude's `min(x, y)` and `max(x, y)` answer the lesser and the greater
 of two values of any `Ord` type. When neither is less than the other, `min`
@@ -292,7 +342,7 @@ The instances the library provides for built-in types:
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
-| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | no | no | if the elements have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | if `a` has `Hash` | no | `Sub` only, difference | no | if the elements have it |
 | `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |
@@ -857,7 +907,8 @@ class Monoid a : Semigroup a { fun empty() -> a }
 `combine` joins two values associatively, and `empty()` is its identity on
 either side. The operator `a <> b` calls `combine(a, b)`
 ([The Prelude's other operators](expressions.md#the-preludes-other-operators)).
-`String`, `Array` and `Vec` have instances, which concatenate.
+`String`, `Array` and `Vec` have instances, which concatenate, and `Set`
+has one, which takes the union.
 
 ## `error`
 

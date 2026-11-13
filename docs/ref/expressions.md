@@ -203,7 +203,8 @@ not the others:
 | `a << n`, `a >> n` | `shl(a, n)`, `shr(a, n)` | `Shift` |
 
 The shift amount is an `Int` whatever is shifted. `Int` and `Byte` have all
-four classes ([Built-in types and classes](builtins.md#operator-classes)).
+four classes ([Built-in types and classes](builtins.md#operator-classes)),
+and a `Set` has the first three, for set algebra ([`Set`](builtins.md#set)).
 
 The bitwise groups bind tighter than the comparisons, so a mask test needs no
 parentheses, but they are unrelated to the arithmetic groups and to each other

@@ -1,4 +1,19 @@
-export (Set, new, add, remove, contains, elements)
+export (
+    Set,
+    new,
+    fromIterator,
+    add,
+    remove,
+    contains,
+    isEmpty,
+    elements,
+    union,
+    intersection,
+    difference,
+    symmetricDifference,
+    isSubset,
+    isDisjoint,
+)
 
 import Prelude ()
 import Data.Tuple (Unit)
@@ -15,10 +30,23 @@ import Data.Bool (Bool(..))
 import Data.Option (Option(..))
 import Data.Map as Map
 import Data.Map (Map, MapCursor)
+import Data.Int (Int)
+import Data.Int as Int
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Semigroup (Semigroup(..))
+import Data.Monoid (Monoid(..))
+import Bits (BitAnd(..), BitOr(..), BitXor(..), (&), (|), (^))
 
 type Set a = Set(Map a Unit)
 
 fun new() -> Set a = Set(Map.new())
+
+-- Returns a set of the elements of `xs`, in the order they first appear.
+fun fromIterator[Iterator c, Item c ~ a, Hash a](xs : c) -> Set a {
+    let s = new()
+    for x in xs { add(s, x) }
+    s
+}
 
 fun add[Hash a](Set(table) : Set a, x : a) -> Unit = Map.put(table, x, ())
 
@@ -27,8 +55,65 @@ fun remove[Hash a](Set(table) : Set a, x : a) -> Bool = Map.delete(table, x)
 
 fun contains[Hash a](Set(table) : Set a, x : a) -> Bool = Map.contains(table, x)
 
+fun isEmpty(s : Set a) -> Bool = len(s) == 0
+
 -- Insertion-ordered.
 fun elements(Set(table) : Set a) -> Array a = Map.keys(table)
+
+-- The functions below return a new set and leave their arguments as they
+-- were. Each keeps the order of `a`'s elements, then of `b`'s where `b`
+-- contributes any.
+
+-- Returns the elements in `a` or `b`.
+fun union[Hash a](a : Set a, b : Set a) -> Set a {
+    let s = new()
+    for x in a { add(s, x) }
+    for x in b { add(s, x) }
+    s
+}
+
+-- Returns the elements in both `a` and `b`.
+fun intersection[Hash a](a : Set a, b : Set a) -> Set a = keep(a, fun(x) = contains(b, x))
+
+-- Returns the elements in `a` and not in `b`.
+fun difference[Hash a](a : Set a, b : Set a) -> Set a = keep(a, fun(x) = !contains(b, x))
+
+-- Returns the elements in exactly one of `a` and `b`.
+fun symmetricDifference[Hash a](a : Set a, b : Set a) -> Set a {
+    let s = difference(a, b)
+    for x in b {
+        if !contains(a, x) { add(s, x) }
+    }
+    s
+}
+
+-- Returns True if every element of `a` is in `b`.
+fun isSubset[Hash a](a : Set a, b : Set a) -> Bool {
+    if len(a) > len(b) { return False }
+    for x in a {
+        if !contains(b, x) { return False }
+    }
+    True
+}
+
+-- Returns True if no element is in both `a` and `b`.
+fun isDisjoint[Hash a](a : Set a, b : Set a) -> Bool {
+    -- Probe the larger set with the smaller one's elements: the answer is the
+    -- same either way, and the loop is as long as the smaller set.
+    let (small, large) = if len(a) <= len(b) { (a, b) } else { (b, a) }
+    for x in small {
+        if contains(large, x) { return False }
+    }
+    True
+}
+
+fun keep[Hash a](from : Set a, wanted : fun(a) -> Bool) -> Set a {
+    let s = new()
+    for x in from {
+        if wanted(x) { add(s, x) }
+    }
+    s
+}
 
 -- Equal when they hold the same elements, whatever order they were added in.
 instance Eq (Set a) : Hash a {
@@ -40,6 +125,39 @@ instance Eq (Set a) : Hash a {
         True
     }
 }
+
+-- Equal sets hash equal whatever order their elements were added in, so a set
+-- can be a `Map` key or an element of another set.
+instance Hash (Set a) : Hash a {
+    fun hashInto(s, h) {
+        -- Hash each element on its own, from a fresh state of the same hasher,
+        -- and add the results: addition does not see the order. The fresh
+        -- states take seed 0 because a `Hasher` does not hand out its seed,
+        -- so the per-element hashes are the same for every table; the length
+        -- and the sum then go through `h`, which is seeded. Feeding the
+        -- elements to `h` in order would be cheaper and would make two equal
+        -- sets hash differently.
+        var sum = 0
+        for x in s { sum = Int.addWrapping(sum, hashAlone(x, h)) }
+        hashInt(hashInt(h, len(s)), sum)
+    }
+}
+
+-- Returns the hash of `x` from a fresh state of `like`'s hasher, seeded 0.
+-- `like` is not read; it names the hasher.
+fun hashAlone[Hash a, Hasher h](x : a, like : h) -> Int = finishHash(hashInto(x, sameHasher(startHash(0), like)))
+
+fun sameHasher(fresh : h, _like : h) -> h = fresh
+
+instance Semigroup (Set a) : Hash a { fun combine(a, b) = union(a, b) }
+instance Monoid (Set a) : Hash a { fun empty() = new() }
+
+-- The operators of set algebra: `|` union, `&` intersection, `^` symmetric
+-- difference and `-` difference, as for the bits of an `Int`.
+instance BitOr (Set a) : Hash a { fun or(a, b) = union(a, b) }
+instance BitAnd (Set a) : Hash a { fun and(a, b) = intersection(a, b) }
+instance BitXor (Set a) : Hash a { fun xor(a, b) = symmetricDifference(a, b) }
+instance Sub (Set a) : Hash a { fun sub(a, b) = difference(a, b) }
 
 instance Length (Set a) {
     fun len(Set(table)) = len(table)

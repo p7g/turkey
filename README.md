@@ -120,9 +120,10 @@ on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
 then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
 `opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
 that loads such a library on any other machine needs `$TURKEY_DYLIB_PATH`,
-naming a directory that holds a copy of the library. It carries no debug or unwind information yet, so it
-takes no `-g`, and a file name without an extension will not choose it until
-the executable has what lldb and a profiler read. `check` compiles as far as
+naming a directory that holds a copy of the library. It carries no debug or
+unwind information yet, and `-g` adds none to it, so a file name without an
+extension will not choose it until the executable has what lldb and a profiler
+read. `check` compiles as far as
 the last stage that can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no

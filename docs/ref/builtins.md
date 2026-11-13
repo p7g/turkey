@@ -218,10 +218,9 @@ literal it was made from is one ([Array literals](inference.md#array-literals)).
 ## `FrozenArray`
 
 `FrozenArray a` is a sequence of `a` that cannot be changed: its length and
-its elements are fixed when it is made. It has `Index`, `Length`,
-`Iterator`, `Eq`, `Ord`, `Hash`, `Functor`, `Foldable`, `+`, `Semigroup`,
-`Monoid` and `Show` instances, and no `SetIndex`, so `xs[i] = v` on it is
-rejected. Because it cannot change, a `FrozenArray` can be a `Map` key or a
+its elements are fixed when it is made. It has the instances `Array` has
+except `SetIndex`, so `xs[i] = v` on it is rejected, and `Ord` and `Hash`
+besides. Because it cannot change, a `FrozenArray` can be a `Map` key or a
 `Set` element, which an `Array` or a `Vec` cannot.
 
 Its constructor is hidden. A `FrozenArray` is made with an [array
@@ -241,7 +240,9 @@ fun main() {
     Set.add(seen, start)
     let next = FrozenArray.with(start, 1, 1)
     Set.add(seen, next)
-    Set.add(seen, FrozenArray.freeze([0, 1]))
+    let path : Vec Int = [0]
+    Vec.push(path, 1)
+    Set.add(seen, FrozenArray.freeze(path))
     print((start, next, len(seen)))
 }
 ```

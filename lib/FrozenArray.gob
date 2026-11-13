@@ -18,6 +18,7 @@ export (
     contains,
     sortBy,
     sort,
+    sortByKey,
 )
 
 import Prelude ()
@@ -27,8 +28,11 @@ import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
 import Text.Show (Show(..))
 import Debug (Debug(..))
+import Object (Object(..))
 import Data.Hashable (Hash(..), Hasher(..))
 import Data.Functor (Functor(..))
+import Control.Applicative (Applicative(..))
+import Control.Monad (Monad(..))
 import Iter (Iterator(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Semigroup (Semigroup(..))
@@ -46,7 +50,9 @@ import Turkey.Array as Storage
 
 -- An array that nobody can write: its length and its elements are fixed when
 -- it is made. Equal frozen arrays hash alike, so one can be a `Map` key or a
--- `Set` element, which a mutable `Array` cannot.
+-- `Set` element, which a mutable `Array` cannot. The freezing is shallow: which
+-- elements it holds is fixed, but an element that is itself mutable can still
+-- change, and a key holding one can be lost as a mutable key is.
 --
 -- Its one field is not exported, and no function here writes to storage it
 -- has wrapped, so module privacy is the whole guarantee. That holds only
@@ -56,7 +62,10 @@ import Turkey.Array as Storage
 -- An array literal the program uses as a `FrozenArray` is built as this
 -- constructor applied to the literal's fresh storage, by name; renaming it
 -- means changing how the compiler lowers a literal in the same commit.
-type FrozenArray a = FrozenArray(Prim.Array a)
+-- A frozen array is a value, as a string is: nothing can tell two with the same
+-- elements apart, so a literal could later be a shared constant. `!Object`
+-- keeps `identical` off it.
+type FrozenArray a : !Object = FrozenArray(Prim.Array a)
 
 fun raw(FrozenArray(storage)) = storage
 
@@ -140,8 +149,9 @@ fun map(xs : FrozenArray a, f : fun(a) -> b) -> FrozenArray b = init(len(xs), fu
 -- Returns the elements for which `keep` is true, in order. `keep` is called
 -- once per element, in order.
 fun filter(xs : FrozenArray a, keep : fun(a) -> Bool) -> FrozenArray a {
-    -- Count only at the end: the kept elements go into scratch storage as
-    -- long as `xs`, copied once to their number unless they are all of it.
+    -- How many are kept is known only at the end, so the kept elements go into
+    -- scratch storage as long as `xs`, copied once to their number unless they
+    -- are all of it.
     let kept = Storage.uninitialized(len(xs))
     var count = 0
     for x in xs {
@@ -191,6 +201,16 @@ fun sortBy(xs : FrozenArray a, compare : fun(a, a) -> Ordering) -> FrozenArray a
 -- Returns the elements in ascending order. The sort is stable.
 fun sort[Ord a](xs : FrozenArray a) -> FrozenArray a = sortBy(xs, threeWay)
 
+-- Returns the elements sorted by `key`. The sort is stable, and `key` is
+-- called exactly once per element.
+fun sortByKey[Ord k](xs : FrozenArray a, key : fun(a) -> k) -> FrozenArray a {
+    -- Pair each element with its key before sorting, because `key` may be
+    -- expensive. Comparing `key(a)` with `key(b)` directly would call it twice
+    -- per comparison; pairing costs two extra arrays instead.
+    let keyed = map(xs, \(key(_), _))
+    map(sortBy(keyed, fun((j, _), (k, _)) = threeWay(j, k)), _.1)
+}
+
 instance Index (FrozenArray a) {
     type Key = Int
     type Value = a
@@ -233,6 +253,25 @@ instance Foldable FrozenArray {
 }
 
 instance Functor FrozenArray { fun map(xs, f) = map(xs, f) }
+
+instance Applicative FrozenArray { fun pure(x) = filled(1, x) }
+
+-- Every `f(x)` is made first, so the result is allocated once, at their total
+-- length.
+instance Monad FrozenArray {
+    fun bind(xs, f) {
+        let parts = map(xs, f)
+        var total = 0
+        for part in parts { total = total + len(part) }
+        let out = Storage.uninitialized(total)
+        var at = 0
+        for part in parts {
+            Storage.move(out, at, raw(part), 0, len(part))
+            at = at + len(part)
+        }
+        FrozenArray(out)
+    }
+}
 
 -- Equal when they have the same length and equal elements at each index.
 instance Eq (FrozenArray a) : Eq a {

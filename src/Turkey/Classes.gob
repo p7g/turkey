@@ -2,9 +2,10 @@ export (
     Evidence(..), MethodImpl(..), InstancePlan(..), newInstancePlan,
     MethodInfo(..), hasDefault, methodDicts, methodEqualities, methodEvidence,
     ClassInfo(..), classKind,
-    InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer,
+    InstInfo(..), instCon, instHeadKey, typedSuffix, showDeclared, writtenNamer, writtenType,
     ClassTable(..), newClassTable, Leftover(..),
-    derivedMethod, derivedParts, hides, isFunctionDebug, alwaysObject,
+    derivedMethod, derivedMethodFor, derivedFieldClass, headTycon, derivableInfo, fieldTypes,
+    derivedParts, hides, isFunctionDebug, alwaysObject,
     Carried(..), carriedKey, fieldKey, entailed, Opening(..), openHidden, isDerivedMethod, checkDerives,
     whyMissing, superclassesOf,
     Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
@@ -1964,11 +1965,101 @@ fun derivedMethod(cls : String) -> Option String =
     else if cls == P.debugClass { Some("debug") }
     else { None }
 
+-- Returns the method a derived instance of `cls` for the type constructor
+-- `tycon` defines: `derivedMethod`'s, and for a tuple `show` besides, which a
+-- tuple derives as its `debug` (`derivedFieldClass`). A declared type cannot ask
+-- for `Show`, since its text is the program's to write.
+fun derivedMethodFor(cls : String, tycon : String) -> Option String =
+    if cls == P.showClass && Option.isSome(tupleLength(tycon)) { Some("show") }
+    else { derivedMethod(cls) }
+
+-- Returns the class a derived instance of `cls` for `tycon` needs at each
+-- field: `cls` itself, except that a tuple's `Show` shows each element's
+-- `Debug`, so that a string in a tuple prints quoted, as in any container.
+fun derivedFieldClass(cls : String, tycon : String) -> String =
+    if cls == P.showClass && Option.isSome(tupleLength(tycon)) { P.debugClass } else { cls }
+
 -- Returns whether the method `name` of `inst`'s class is the one `inst`, a
 -- derived instance, writes itself rather than taking from the class's
 -- default.
 fun isDerivedMethod(inst : InstInfo, name : String) -> Bool =
-    inst.derived && derivedMethod(inst.cls) == Some(surfaceMember(name))
+    inst.derived && derivedMethodFor(inst.cls, headTycon(inst.head)) == Some(surfaceMember(name))
+
+-- -- tuples ------------------------------------------------------------------------
+--
+-- A tuple derives `Eq`, `Ord`, `Hash`, `Debug` and `Show` for every length,
+-- as though it were declared with one positional constructor holding its
+-- elements: `type (a, b) = (a, b)`. So equality is element by element, the
+-- order is lexicographic, the hash absorbs each element in order with no tag
+-- (there is one constructor), and the text is `(1, "a")`. `Ord` needs no
+-- asking, unlike a declared type's, since a tuple's elements have no
+-- declaration order a reader could rearrange.
+--
+-- Derivation works on declarations, so a tuple is given one here, made
+-- afresh each time it is asked for: everything that reads it takes the field
+-- types from the instance's head, never from the declaration's variables,
+-- so two of these need not share them.
+
+-- The name derivation keys a tuple of `n` elements by: what `instCon` names
+-- its instances. No declared type has it, since every declared name is
+-- qualified with `#`.
+fun tupleTycon(n : Int) -> String = "Tuple" + Int.toString(n)
+
+-- Returns the length of the tuple `tycon` names, or `None` when it names
+-- something else.
+fun tupleLength(tycon : String) -> Option Int {
+    let digits = String.stripPrefix(tycon, "Tuple")?
+    let n = Int.parse(digits)?
+    if n >= 2 && tupleTycon(n) == tycon { Some(n) } else { None }
+}
+
+-- Returns the type constructor a derived instance's head is for: the
+-- declared type, or `tupleTycon` of a tuple's length. Empty for any other
+-- head.
+fun headTycon(head : Ty.Type) -> String = match Ty.spine(Ty.prune(head)).0 {
+    TCon(c) -> c.name
+    TTuple(elems) -> tupleTycon(len(elems))
+    _ -> ""
+}
+
+-- Returns the arguments of a derived instance's head, which stand for its
+-- type's parameters: `k` and `v` of `Map k v`, and a tuple's elements.
+fun headArgs(head : Ty.Type) -> Array Ty.Type = match Ty.prune(head) {
+    TTuple(elems) -> elems
+    _ -> Ty.spine(head).1
+}
+
+-- Returns the declaration derivation reads for `tycon`: the declared type,
+-- or for a tuple the one described above.
+fun derivableInfo(d : DeclTable, tycon : String) -> Option TyconInfo {
+    if let Some(info) = Map.get(d.tycons, tycon) { return Some(info) }
+    let n = tupleLength(tycon)?
+    let params = Vec.new(n)
+    let vars = Vec.new(n)
+    for var i = 0; i < n; i = i + 1 {
+        Vec.push(params, "a" + Int.toString(i + 1))
+        Vec.push(vars, Ty.newVar(1, KStar))
+    }
+    let elems = Array.map(Vec.toArray(vars), TVar)
+    let con = ConInfo {
+        name = tycon, tycon = tycon, fields = None, mutable = Array.filled(n, False),
+        fieldSpans = Vec.new(1), arity = n,
+        scheme = Scheme { quantified = vars, body = TFun(elems, TTuple(elems)), preds = Vec.new(1) },
+        exists = Vec.new(1), existsNames = Vec.new(1), written = Vec.new(1),
+    }
+    Some(TyconInfo {
+        name = tycon, params = params, variants = Vec.fromArray([con]), isAlias = False,
+        aliasBody = None, span = None, kind = KStar, derives = Vec.new(1),
+    })
+}
+
+-- Returns the types of the fields of `c` in a value of type `head`. A
+-- tuple's are its elements.
+fun fieldTypes(d : DeclTable, head : Ty.Type, c : ConInfo) -> Option (Array Ty.Type) =
+    match Ty.prune(head) {
+        TTuple(elems) -> Some(elems)
+        _ -> Decls.conFieldTypes(d, head, c.name)
+    }
 
 -- Whether `!` may refuse `cls`. `Ord` is derived only for a type that asks:
 -- a derived order follows the order the constructors are declared in, so a
@@ -2027,6 +2118,8 @@ fun listsFor(t : ClassTable, tycon : String, cls : String) -> Bool {
 -- one, and `implicitExclusion` gives the other reasons. Whether the derived
 -- instance then exists is up to its fields.
 fun asksFor(t : ClassTable, tycon : String, cls : String) -> Bool {
+    -- A tuple has every class it can derive, and nothing to refuse with.
+    if Option.isSome(tupleLength(tycon)) { return cls != P.objectClass }
     -- `!Debug` keeps the instance and makes it read no field
     -- (`derivedParts`).
     if refuses(t, tycon, cls) && cls != P.debugClass { return False }
@@ -2173,8 +2266,8 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
         Some(Underivable(_)) -> return None
         None -> {}
     }
-    if Option.isNone(derivedMethod(cls)) || !asksFor(t, tycon, cls) { return None }
-    let info = match Map.get(t.decls.tycons, tycon) {
+    if Option.isNone(derivedMethodFor(cls, tycon)) || !asksFor(t, tycon, cls) { return None }
+    let info = match derivableInfo(t.decls, tycon) {
         Some(i) -> i
         None -> return None
     }
@@ -2210,7 +2303,7 @@ fun derive(t : ClassTable, cls : String, tycon : String) -> Option InstInfo {
 fun begin(t : ClassTable, cls : String, info : TyconInfo, general : Ty.Type,
           key : String) -> InstInfo {
     let names = Map.new()
-    let (_, args) = Ty.spine(general)
+    let args = headArgs(general)
     for var i = 0; i < len(args) && i < len(info.params); i = i + 1 {
         if let TVar(cell) = Ty.prune(args[i]) { Map.put(names, cell.id, info.params[i]) }
     }
@@ -2289,7 +2382,7 @@ fun roundLimit(t : ClassTable) -> Int {
     var params = 0
     for key in t.provisional {
         if let Some(Deriving(inst)) = Map.get(t.derivations, key) {
-            params = params + len(Ty.spine(inst.head).1)
+            params = params + len(headArgs(inst.head))
         }
     }
     params * len(Map.keys(t.classes)) + len(t.provisional) + 1
@@ -2353,12 +2446,9 @@ fun declaredHead(info : TyconInfo) -> Option Ty.Type {
 -- ever wanted of it.
 fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
     let cls = inst.cls
-    let (h, args) = Ty.spine(inst.head)
-    let tycon = match h {
-        TCon(c) -> c.name
-        _ -> return Left("it is not a declared type")
-    }
-    let info = match Map.get(t.decls.tycons, tycon) {
+    let args = headArgs(inst.head)
+    let tycon = headTycon(inst.head)
+    let info = match derivableInfo(t.decls, tycon) {
         Some(i) -> i
         None -> return Left("it is not a declared type")
     }
@@ -2404,8 +2494,9 @@ fun inferContext(t : ClassTable, inst : InstInfo) -> Either String (Vec Pred) {
         Left(reason) -> return Left(reason)
         Right(found) -> found
     }
+    let atFields = derivedFieldClass(cls, tycon)
     for (c, i, ty) in parts {
-        ask(Ty.pred(cls, [skolemApply(sk, ty)]), AtField(c, i, ty))
+        ask(Ty.pred(atFields, [skolemApply(sk, ty)]), AtField(c, i, ty))
     }
     for sup in supers { ask(Ty.pred(sup.name, [skolemApply(sk, inst.head)]), AtHead(sup.name)) }
     -- GHC's `validDerivPred`, restricted to a class over a parameter: it
@@ -2514,7 +2605,7 @@ fun derivedParts(d : DeclTable, cls : String, info : TyconInfo,
             return Left("constructor '" + Ty.shortName(c.name) + "' hides the type '"
                         + c.existsNames[0] + "'")
         }
-        let types = match Decls.conFieldTypes(d, head, c.name) {
+        let types = match fieldTypes(d, head, c) {
             Some(ts) -> ts
             None -> return Left("it is not a declared type")
         }
@@ -3009,17 +3100,15 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     if p.name == P.debugClass { deriveFunctionDebug(t, p) }
     -- A derived instance is the only one for its type, so it is found by
     -- name rather than among every instance of the class.
-    let (receiver, _) = Ty.spine(Ty.prune(p.args[0]))
-    let derived = Option.isSome(derivedMethod(p.name))
-    if let TCon(c) = receiver {
-        if derived {
-            match Map.get(t.derivations, derivationKey(p.name, c.name)) {
-                Some(Derived(inst)) | Some(Deriving(inst)) ->
-                    if let Some(mapping) = match_(inst.head, p.args[0]) {
-                        return Some((inst, mapping))
-                    }
-                _ -> {}
-            }
+    let tycon = headTycon(p.args[0])
+    let derived = tycon != "" && Option.isSome(derivedMethodFor(p.name, tycon))
+    if derived {
+        match Map.get(t.derivations, derivationKey(p.name, tycon)) {
+            Some(Derived(inst)) | Some(Deriving(inst)) ->
+                if let Some(mapping) = match_(inst.head, p.args[0]) {
+                    return Some((inst, mapping))
+                }
+            _ -> {}
         }
     }
     for inst in instancesOf(t, p.name) {
@@ -3030,11 +3119,9 @@ fun selectInstance(t : ClassTable, p : Pred) -> Option (InstInfo, Map Int Ty.Typ
     -- After the table, so that an instance written by hand is the one found
     -- and nothing is derived beside it.
     if !derived { return None }
-    if let TCon(c) = receiver {
-        if let Some(inst) = derive(t, p.name, c.name) {
-            if let Some(mapping) = match_(inst.head, p.args[0]) {
-                return Some((inst, mapping))
-            }
+    if let Some(inst) = derive(t, p.name, tycon) {
+        if let Some(mapping) = match_(inst.head, p.args[0]) {
+            return Some((inst, mapping))
         }
     }
     None

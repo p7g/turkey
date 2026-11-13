@@ -11,8 +11,9 @@
 # compiler emitted. stage3 is today's source compiled by today's source, and the
 # fixed point is that stage3 emits exactly the object it was built from.
 #
-# The compiler reads lib/ relative to the working directory, so every stage runs
-# from the repository root.
+# Every stage runs from the repository root with TURKEY_LIB=lib, so each reads
+# this checkout's lib/ and names its files lib/... wherever --out puts the
+# stages: one under $TMPDIR has no lib/ above it to find on its own.
 #
 # bootstrap/ holds the committed compiler: the whole-program assembly for
 # src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so one
@@ -60,6 +61,8 @@ RUN=${TURKEY_RUN:-}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
+TURKEY_LIB=lib
+export TURKEY_LIB
 
 # The compiler's entry module. Relative, and always spelled the same way: it is
 # printed in the first line of the assembly, so the spelling is in the bytes.

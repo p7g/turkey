@@ -1755,7 +1755,18 @@ fun specializeOn(r : Reducer, e : Core, name : String, id : Int, params : Array 
     let jumps = joinJumps(rest, id)
 
     -- One jump: the body moves there, and nothing is copied.
+    --
+    -- Unless the body yields a value and the jump sits under a join typed `!`.
+    -- The body may replace the jump only where every term from `rest` down to
+    -- the jump has this join's type, `e.ty`, since the body's value becomes
+    -- theirs. Below a join typed `!` -- a loop, or code that leaves only by
+    -- jumping -- the enclosing joins and `if`s carry placeholder result types,
+    -- which the value would contradict. Declining under any join typed `!`
+    -- is a sound approximation of walking the tail positions and declining at
+    -- the first whose type is not `e.ty`. A function whose only `return` is
+    -- inside an endless loop is the case: its `%ret` join has one jump.
     if len(jumps) == 1 {
+        if fallsThrough(body) && jumpsFromBottomJoin(rest, id) { return None }
         let made = expr(r, atTheJump(r, params, jumpArgs(jumps[0]), body, e.ty))
         return Some(replaceJumps(rest, id, fun(_) = Some(made)))
     }
@@ -3256,6 +3267,15 @@ fun replaceJumps(e : Core, id : Int, chosen : fun(Core) -> Option Core) -> Core 
         type_ = fun(t) = t,
         bind = fun(b) = withValue(b, replaceJumps(b.value, id, chosen)),
     }))
+}
+
+-- Returns whether a jump to `id` sits, at any depth, in the body or the rest
+-- of a join of `e` typed `!`.
+fun jumpsFromBottomJoin(e : Core, id : Int) -> Bool = match e.kind {
+    CJoin(_, _, _, body, rest, _) ->
+        (Ty.isBottom(e.ty) && jumpsTo(e, id))
+            || jumpsFromBottomJoin(body, id) || jumpsFromBottomJoin(rest, id)
+    _ -> anyKid(e.kind, jumpsFromBottomJoin(_, id))
 }
 
 fun jumpsTo(e : Core, id : Int) -> Bool {

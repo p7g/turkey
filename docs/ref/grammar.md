@@ -31,7 +31,8 @@ OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run,
 Keywords: `as break class continue do else export for foreign fun if import
 in instance let loop match module return type var while`.
 
-Comments: `--` to the end of the line, and `{- ... -}`, which nests.
+Comments: `--` to the end of the line, and `{- ... -}`, which nests. A line
+comment starting `---` is a [doc comment](lexical.md#doc-comments).
 
 ## Modules
 

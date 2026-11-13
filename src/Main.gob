@@ -1,12 +1,14 @@
 -- The compiler, built from the committed assembly in `bootstrap/` by
 -- `scripts/build.sh`.
 --
--- Two commands. `check` compiles as far as the last stage that can reject a
+-- Three commands. `check` compiles as far as the last stage that can reject a
 -- program, and writes nothing. `build` compiles all the way and writes the
--- result to `-o`, in the format its extension names or `-f` overrides.
--- Either takes `--dump STAGE,...` to print what a stage produced, which is how
--- a pass is read while it is being written: `check` goes on as far as the
--- latest stage asked for and no further, and `build` prints them on its way.
+-- result to `-o`, in the format its extension names or `-f` overrides. `doc`
+-- checks the modules it is given and writes what each exports as JSON
+-- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print
+-- what a stage produced, which is how a pass is read while it is being
+-- written: `check` goes on as far as the latest stage asked for and no
+-- further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -90,6 +92,7 @@ import Turkey.Target as Target
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
                    FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
 import Turkey.Libraries as Libraries
+import Turkey.Doc as Doc
 
 -- Where the language's own library lives: `TURKEY_LIB` if it is set and not
 -- empty, and otherwise the nearest `lib` holding `Prelude.gob` in the
@@ -249,9 +252,10 @@ fun main() {
     let building = match Args.next(p) {
         Right(Some(Value("check"))) -> False
         Right(Some(Value("build"))) -> True
+        Right(Some(Value("doc"))) -> return doc(p)
         Right(Some(Value(other))) -> die("unknown command '" + other
-                                         + "'; the commands are 'check' and "
-                                         + "'build'")
+                                         + "'; the commands are 'check', "
+                                         + "'build' and 'doc'")
         _ -> usage()
     }
     var output = None
@@ -412,6 +416,124 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
 fun baseName(path : String) -> String {
     let parts = String.split(path, "/")
     parts[len(parts) - 1]
+}
+
+-- `boot doc FILE...`: checks the modules the files hold, as one program, and
+-- writes what each exports as one JSON document.
+--
+-- A file under the library is the module its path from the library names,
+-- and any other file the module its name names beside it, so the files
+-- outside the library must share a directory. The program is an entry that
+-- imports each module and nothing else, so a library module, which cannot be
+-- an entry itself, is checked as it is when a program imports it.
+fun doc(p : Args.Parser) -> Unit {
+    let paths = []
+    loop {
+        match Args.next(p) {
+            Left(message) -> die(message)
+            Right(None) -> break
+            Right(Some(Value(path))) -> Vec.push(paths, path)
+            Right(Some(arg)) -> die(Args.unexpected(arg))
+        }
+    }
+    if len(paths) == 0 { usage() }
+    let library = realPath(libRoot())
+    -- The directory every file outside the library is in: as the first such
+    -- argument spells it, which is how the files' diagnostics will name it,
+    -- and as a real path, to compare the others with.
+    var directory = None
+    let names = []
+    for path in paths {
+        if let Left(e) = File.metadata(path) { die(message(e)) }
+        let (root, name) = moduleNamed(path, library)
+        if root != library {
+            match directory {
+                Some((spelled, d)) -> if d != root {
+                    die("'" + path + "' is not in '" + spelled + "', where the "
+                        + "other modules outside the library are; document "
+                        + "each directory separately")
+                }
+                None -> { directory = Some((directoryOf(path), root)) }
+            }
+        } else if String.startsWith(name, "Turkey.") {
+            die("'" + path + "' is part of the library's implementation, which "
+                + "no program can import, so it has no documentation")
+        }
+        Vec.push(names, name)
+    }
+    let imports = String.builder()
+    for name in names {
+        -- The entry has the Prelude already, and an empty import of it would
+        -- opt out of it instead.
+        if name != Prelude.preludeName { String.push(imports, "import " + name + " ()\n") }
+    }
+    -- The entry's directory is the first place an import is looked for, so
+    -- with no file outside the library it is one that does not exist, and
+    -- nothing in the working directory can stand in for a library module.
+    -- The entry cannot be in the library itself: a module is the library's
+    -- only when it is found in the last place looked.
+    let entry = match directory {
+        Some((spelled, _)) -> spelled + "/doc-entry.gob"
+        None -> libRoot() + "/.doc/doc-entry.gob"
+    }
+    Diag.compiling(entry)
+    let source = Source { name = entry, text = String.build(imports) }
+    let (checked, _, groups) = checkSource(source)
+    let modules = []
+    for group in groups {
+        for m in group {
+            if Vec.contains(names, m.name) { Vec.push(modules, m) }
+        }
+    }
+    let tables = Doc.Tables {
+        classes = checked.classes,
+        scheme = fun(name) = Option.map(Constraints.lookup_(checked.env, name),
+                                        fun(b) = reduced(checked.classes, b.scheme)),
+    }
+    write(Doc.document(modules, tables))
+}
+
+-- The search root `path` is under, as a real path, and the module it holds
+-- there. `library` is the library's root, as a real path. A file whose real
+-- path is under it is the library module its path below the root names; any
+-- other is a module named by its file. Refuses a path no import could name.
+fun moduleNamed(path : String, library : String) -> (String, String) {
+    let full = realPath(path)
+    let (root, relative) = match String.stripPrefix(full, library + "/") {
+        Some(rest) -> (library, rest)
+        None -> (directoryOf(full), baseName(full))
+    }
+    let stem = match String.stripSuffix(relative, ".gob") {
+        Some(s) -> s
+        None -> die("'" + path + "' is not a module; a module's file ends in .gob")
+    }
+    let parts = String.split(stem, "/")
+    for part in parts {
+        if !isModuleName(part) {
+            die("'" + path + "' cannot be imported: '" + part + "' is not a "
+                + "module name, which starts with a capital letter and holds "
+                + "only letters, digits, '_' and \"'\"")
+        }
+    }
+    (root, String.join(parts, "."))
+}
+
+fun isModuleName(part : String) -> Bool {
+    var first = True
+    for c in String.codePoints(part) {
+        let ok = if first { Char.isAsciiUpper(c) }
+                 else { Char.isAsciiAlphanumeric(c) || c == '_' || c == '\'' }
+        if !ok { return False }
+        first = False
+    }
+    !first
+}
+
+-- `path` as an absolute path with every symbolic link resolved, so that two
+-- spellings of one file compare equal.
+fun realPath(path : String) -> String = match Env.resolvedPath(path) {
+    Some(real) -> real
+    None -> die("cannot resolve '" + path + "' to a real path")
 }
 
 -- Writes `bytes` as an executable at `path`, through a new file beside it
@@ -673,9 +795,14 @@ fun loadResolved(path : String) -> Vec Modules.Module {
 -- finishes after everything it imports, but saying so here beats relying on it
 -- at every call site.
 fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module,
+                                    Binders.Table) = loadSource(readOrDie(path))
+
+-- `loadProgram`, for an entry whose text is `source`, and whose modules are
+-- looked for beside `source.name` and in the library.
+fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
                                     Binders.Table) {
-    let loader = Modules.newLoader([directoryOf(path), libRoot()])
-    let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
+    let loader = Modules.newLoader([directoryOf(source.name), libRoot()])
+    let entry = Modules.loadEntry(loader, source, "Main")
     -- An import that failed leaves its names out of scope, and resolving
     -- against that scope would report every use of them again.
     Diag.stopOnErrors()
@@ -1731,8 +1858,15 @@ type Checked = Checked {
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
+    let (checked, entry, _) = checkSource(readOrDie(path))
+    (checked, entry)
+}
+
+-- `checkProgram`, for an entry whose text is `source`, and every module of
+-- the program, a component at a time.
+fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.Module)) {
     Solved.resetDictNames()
-    let (groups, entry, binders) = loadProgram(path)
+    let (groups, entry, binders) = loadSource(source)
     Diag.stopOnErrors()
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
@@ -1778,11 +1912,11 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         Evidence.run(checked.classes, solver.uses, g.instanceChecks)
         for item in items { Vec.push(checked.ordered, item) }
     }
-    if checkingBinders() { Binders.checkInferred(binders, path) }
+    if checkingBinders() { Binders.checkInferred(binders, source.name) }
     checkMain(entry, checked.env, checked.classes)
     Diag.stopOnErrors()
     Diag.stopCollecting()
-    (checked, entry)
+    (checked, entry, groups)
 }
 
 -- The value constructors a module's scope can name, ambiguous ones included.
@@ -1937,6 +2071,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
+        + "       boot doc FILE...\n"
         + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
         + "                  FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"

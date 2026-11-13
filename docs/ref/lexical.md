@@ -33,6 +33,48 @@ fun main() {
 comments are whitespace
 ```
 
+### Doc comments
+
+A line comment that starts with exactly `---`, followed by a space or the end
+of the line, is a *doc comment*. Doc comments on consecutive lines, each on a
+line of its own, form one run. A run documents what begins on the line directly
+after it:
+
+* a top-level declaration, including an instance;
+* a class's method or associated type;
+* a constructor or a record field.
+
+The first run before a module's first declaration that is not directly above
+that declaration documents the module itself. `boot doc` reads doc comments;
+ordinary comments, `----` rules and block comments are never documentation.
+
+<!-- run -->
+```kotlin
+--- Prints a greeting.
+---
+--- A bare `---` line separates paragraphs.
+fun main() {
+    print("documented")
+}
+```
+
+```text
+documented
+```
+
+A doc comment that documents nothing is an error: one cut off from its
+declaration by a blank line, one above an import or a statement in a body, or
+one that follows code on its line. Write `--` for an ordinary comment.
+
+<!-- error: this doc comment is not directly above anything it can document -->
+```kotlin
+fun main() {
+    --- A local is not documented.
+    let x = 1
+    print(x)
+}
+```
+
 ## Identifiers
 
 ```ebnf

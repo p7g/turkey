@@ -5,10 +5,7 @@ export (Tables(..), document)
 -- attached to it. One JSON document, the same bytes for the same modules, so
 -- that it can be a golden.
 --
--- There is no doc-comment syntax. A declaration's comment is the run of
--- comments ending on the line directly above it (`attached`), and a module's
--- is the first run before its first declaration that is no declaration's
--- (`moduleComment`).
+-- Which comment documents what is `Turkey.DocComments`'s rule.
 
 import Data.Set as Set
 import System.File as File
@@ -16,12 +13,12 @@ import Turkey.Ast (Type as _, Pred as _, ..)
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable)
 import Turkey.Decls as Decls
+import Turkey.DocComments as DocComments
 import Turkey.Fixity as Fixity
 import Turkey.Modules as Modules
 import Turkey.Prelude as Prelude
 import Turkey.Source as Source
 import Turkey.Source (Span(..))
-import Turkey.Token (Comment(..))
 import Turkey.Types as Ty
 
 -- What the checked program provides beyond the modules: the class table,
@@ -130,149 +127,33 @@ fun strings(xs : Vec String) -> JSON = JArray(Vec.map(xs, JString))
 
 -- -- comments -----------------------------------------------------------------------
 
--- A file's comments that stand on lines of their own, in order, and by the
--- lines each starts and ends on.
+-- A module's doc comments: each run's text by the line after it ends, where
+-- what it documents begins, and the module's own.
 type Comments = Comments {
-    all        : Vec Comment,
-    startingOn : Map Int Comment,
-    endingOn   : Map Int Comment,
+    above  : Map Int String,
+    header : Option String,
 }
 
-fun commentsOf(comments : Vec Comment, text : String) -> Comments {
-    let lines = String.lines(text)
-    let cs = Comments { all = [], startingOn = Map.new(), endingOn = Map.new() }
-    for c in comments {
-        if standsAlone(c, lines) {
-            Vec.push(cs.all, c)
-            Map.put(cs.startingOn, c.span.line, c)
-            Map.put(cs.endingOn, c.span.endLine, c)
-        }
+fun commentsOf(m : Modules.Module) -> Comments {
+    let runs = DocComments.runs(m.program.comments, sourceText(m.file))
+    let above = Map.new()
+    for r in runs {
+        if !r.trailing { Map.put(above, r.span.endLine + 1, DocComments.text(r)) }
     }
-    cs
+    let header = DocComments.moduleRun(runs, DocComments.targets(m.program),
+                                       DocComments.firstDeclLine(m.program))
+    Comments { above = above, header = Option.map(header, DocComments.text) }
 }
 
--- Whether only spaces come before `c` on its first line and nothing after it
--- on its last.
-fun standsAlone(c : Comment, lines : Vec String) -> Bool {
-    let first = lineAt(lines, c.span.line)
-    let last = lineAt(lines, c.span.endLine)
-    blank(codePointSlice(first, 0, c.span.col - 1))
-        && blank(codePointSlice(last, c.span.endCol - 1, -1))
-}
+-- Returns the text of the doc comment on what begins on `line`.
+fun attached(cs : Comments, line : Int) -> Option String = Map.get(cs.above, line)
 
-fun lineAt(lines : Vec String, line : Int) -> String =
-    if line >= 1 && line <= len(lines) { lines[line - 1] } else { "" }
-
--- The code points of `s` from index `from` up to `to`, or to the end when
--- `to` is negative.
-fun codePointSlice(s : String, from : Int, to : Int) -> String {
-    let out = String.builder()
-    var i = 0
-    for c in String.codePoints(s) {
-        if i >= from && (to < 0 || i < to) { String.push(out, Char.toString(c)) }
-        i = i + 1
-    }
-    String.build(out)
-}
-
-fun blank(s : String) -> Bool = String.isEmpty(String.trim(s))
-
--- Returns the text of the comment attached to what starts on `line`: the run
--- of comments standing alone on their lines whose last ends on the line
--- before, each starting on the line after the one before it ends.
-fun attached(cs : Comments, line : Int) -> Option String {
-    let run = runEnding(cs, line - 1)
-    if len(run) == 0 { None } else { Some(textOf(run)) }
-}
-
--- The run of comments ending on `line`, first to last.
-fun runEnding(cs : Comments, line : Int) -> Vec Comment {
-    let backwards = []
-    var at = line
-    loop {
-        match Map.get(cs.endingOn, at) {
-            Some(c) -> {
-                Vec.push(backwards, c)
-                at = c.span.line - 1
-            }
-            None -> break
-        }
-    }
-    Vec.reverse(backwards)
-}
-
--- Returns the module's comment: the first run of comments that ends before
--- `firstDecl`, the line of the module's first declaration, and is not that
--- declaration's own.
-fun moduleComment(cs : Comments, firstDecl : Option Int) -> Option String {
-    for c in cs.all {
-        let before = match firstDecl {
-            Some(line) -> c.span.endLine < line
-            None -> True
-        }
-        if !before { return None }
-        -- `c` begins a run unless a comment ends on the line above it.
-        if Map.contains(cs.endingOn, c.span.line - 1) { continue }
-        var end = c
-        while let Some(next) = Map.get(cs.startingOn, end.span.endLine + 1) { end = next }
-        if let Some(line) = firstDecl {
-            if end.span.endLine == line - 1 { return None }
-        }
-        return Some(textOf(runEnding(cs, end.span.endLine)))
-    }
-    None
-}
-
--- The run's text: each line comment without `--` and one space after it,
--- each block comment without its delimiters and its common indentation.
-fun textOf(run : Vec Comment) -> String {
-    let lines = []
-    for c in run {
-        if c.block {
-            for l in blockLines(c.text) { Vec.push(lines, l) }
-        } else {
-            let body = Option.unwrapOr(String.stripPrefix(c.text, "--"), c.text)
-            Vec.push(lines, String.trimEnd(Option.unwrapOr(String.stripPrefix(body, " "), body)))
-        }
-    }
-    String.join(lines, "\n")
-}
-
-fun blockLines(text : String) -> Vec String {
-    let opened = Option.unwrapOr(String.stripPrefix(text, "{-"), text)
-    let inner = Option.unwrapOr(String.stripSuffix(opened, "-}"), opened)
-    let raw = String.lines(inner)
-    if len(raw) == 0 { return [] }
-    let out = [String.trim(raw[0])]
-    var common = -1
-    for var i = 1; i < len(raw); i = i + 1 {
-        if !blank(raw[i]) {
-            let width = leadingSpaces(raw[i])
-            if common < 0 || width < common { common = width }
-        }
-    }
-    for var i = 1; i < len(raw); i = i + 1 {
-        Vec.push(out, String.trimEnd(codePointSlice(raw[i], if common < 0 { 0 } else { common }, -1)))
-    }
-    trimmed(out)
-}
-
--- `lines` without its blank lines at either end.
-fun trimmed(lines : Vec String) -> Vec String {
-    var from = 0
-    var to = len(lines)
-    while from < to && blank(lines[from]) { from = from + 1 }
-    while to > from && blank(lines[to - 1]) { to = to - 1 }
-    Vec.slice(lines, from, to)
-}
-
-fun leadingSpaces(s : String) -> Int {
-    var n = 0
-    for c in String.codePoints(s) {
-        if c != ' ' && c != '\t' { break }
-        n = n + 1
-    }
-    n
+-- The module's text, which tells a doc comment that stands alone on its line
+-- from one that trails code. The loader has read the file already, so a
+-- failure here leaves every comment standing alone.
+fun sourceText(path : String) -> String = match File.readText(path) {
+    Right(text) -> text
+    Left(_) -> ""
 }
 
 -- -- modules ------------------------------------------------------------------------
@@ -308,35 +189,22 @@ fun inverse(names : Map String String) -> Map String String {
 }
 
 fun moduleJSON(m : Modules.Module, t : Tables) -> JSON {
-    let cs = commentsOf(m.program.comments, sourceText(m.file))
+    let cs = commentsOf(m)
     let ex = exportedOf(m)
     let own = Set.new()
     let items = []
-    var first = None
     for d in m.program.decls {
         let where = declSpan(d)
         if Source.isGenerated(where) || Source.isEmpty(where) { continue }
-        first = match first {
-            Some(line) -> Some(if where.line < line { where.line } else { line })
-            None -> Some(where.line)
-        }
         declItems(m, t, cs, ex, own, d, items)
     }
     for r in reexports(m, t, own) { Vec.push(items, r) }
     JObject([
         ("name", JString(m.name)),
         ("file", JString(m.file)),
-        ("comment", optional(moduleComment(cs, first))),
+        ("comment", optional(cs.header)),
         ("items", JArray(items)),
     ])
-}
-
--- The module's text, which the comment rule reads to tell a comment that
--- stands alone from one that trails code. The loader has read the file
--- already, so a failure here leaves every comment standing alone.
-fun sourceText(path : String) -> String = match File.readText(path) {
-    Right(text) -> text
-    Left(_) -> ""
 }
 
 fun declSpan(d : Decl) -> Span = match d {
@@ -503,7 +371,11 @@ fun classItem(t : Tables, cs : Comments, ex : Exported, c : ClassDecl, name : St
     let members = heading("class", name, c.span, cs)
     Vec.push(members, ("param", JString(c.param)))
     Vec.push(members, ("supers", strings(supers)))
-    Vec.push(members, ("families", strings(Vec.map(c.families, fun(f) = Ty.bareName(f.name)))))
+    Vec.push(members, ("families", JArray(Vec.map(c.families, fun(f) = JObject([
+        ("name", JString(Ty.bareName(f.name))),
+        ("line", JInt(f.span.line)),
+        ("comment", optional(nestedComment(cs, f.span.line, c.span.line))),
+    ])))))
     Vec.push(members, ("methods", JArray(methods)))
     JObject(members)
 }

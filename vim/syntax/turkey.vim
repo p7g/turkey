@@ -28,6 +28,9 @@ syn match turkeyOperator "[:?\\]"
 " Comments: `--` to end of line, and `{- -}` block comments, which nest.
 syn keyword turkeyTodo contained TODO FIXME XXX NOTE
 syn match turkeyLineComment "--.*$" contains=turkeyTodo
+" A doc comment: exactly `---`, then a space or the end of the line. Defined
+" after the line comment so that it wins where both match.
+syn match turkeyDocComment "---\%( .*\)\=$" contains=turkeyTodo
 syn region turkeyBlockComment start="{-" end="-}" contains=turkeyBlockComment,turkeyTodo
 
 " Strings and characters. No interpolation, and a string
@@ -91,6 +94,7 @@ hi def link turkeyChar Character
 hi def link turkeyEscape SpecialChar
 hi def link turkeyEscapeError Error
 hi def link turkeyLineComment Comment
+hi def link turkeyDocComment SpecialComment
 hi def link turkeyBlockComment Comment
 hi def link turkeyTodo Todo
 

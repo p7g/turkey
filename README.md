@@ -381,11 +381,9 @@ sh vim/test/run.sh
 
 `boot doc FILE...` checks the modules in the files and writes JSON describing
 what each one exports. Every function, value, type, class, instance and
-operator gets its type as the checker has it, its line, and the comment
-directly above its declaration. A comment counts only when no blank line
-separates it from the declaration, and the module's own comment is the first
-comment before its first declaration. To build a page for the whole library
-that searches names, types and comments:
+operator gets its type as the checker has it, its line, and its doc comment:
+the `---` comments directly above it ([doc comments](docs/ref/lexical.md#doc-comments)).
+To build a page for the whole library that searches names, types and comments:
 
 ```sh
 sh scripts/docs.sh

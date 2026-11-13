@@ -42,6 +42,8 @@ call s:Probe('^-- A line', 0, 'turkeyLineComment')
 call s:Probe('True', 0, 'turkeyLineComment')   " keywords stay comments in comments
 call s:Probe('\<TODO\>', 0, 'turkeyTodo')
 call s:Probe('not a string', 0, 'turkeyLineComment')
+call s:Probe('^--- A doc', 0, 'turkeyDocComment')
+call s:Probe('^---- A rule', 0, 'turkeyLineComment')
 call s:Probe('^{-', 0, 'turkeyBlockComment')
 call s:Probe('nested', 0, 'turkeyBlockComment')
 call s:Probe('part$', 0, 'turkeyBlockComment') " after the inner -}, still comment

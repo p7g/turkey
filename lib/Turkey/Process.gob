@@ -2,7 +2,7 @@ export (
     argsSet, argCount, argBytes, argLength, environment,
     panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
-    workerRecord, traceCount, traceAddress, traceHand,
+    workerRecord, traceCount, traceAddress, traceInner, traceLeftOut, traceHand,
 )
 
 -- What the program was started with, and how it is ending: its arguments, and
@@ -152,7 +152,7 @@ fun record(bytes : Ptr, length : Int) -> Unit {
 -- unless one is already raised. `before` and `after` are NUL-terminated, and
 -- the message is truncated to the buffer. For the allocator, which cannot
 -- allocate a message to hand to `panic`.
-fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
+foreign "turkey_panic_int" fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
     capture(Prim.frameAddress())
     -- The magnitude of `minValue` is 2^63, which the unsigned reading of its
@@ -161,7 +161,7 @@ fun panicInt(before : Ptr, n : Int, after : Ptr) -> Unit {
 }
 
 -- `panicInt` with `n`'s bits read as an unsigned number, for a byte count.
-fun panicUnsigned(before : Ptr, n : Int, after : Ptr) -> Unit {
+foreign "turkey_panic_unsigned" fun panicUnsigned(before : Ptr, n : Int, after : Ptr) -> Unit {
     if pending() { return {} }
     capture(Prim.frameAddress())
     compose(before, False, n, after)
@@ -244,13 +244,20 @@ fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 -- reported. A buffer per worker would need room in the worker's record, whose
 -- size the compiler fixes.
 
+-- A stack deeper than the buffer keeps both ends: the innermost calls, where
+-- the panic was raised, and the outermost, which say how the program got
+-- there. The calls between are the ones a runaway recursion repeats.
+--
 -- Raw words: the worker record of the panic the trace is of, or 0 while there
--- is none; how many addresses it has; then the addresses.
+-- is none; how many calls were active; then `traceInner()` addresses, the
+-- innermost calls in order; then `traceOuter()` more, the calls after those
+-- written round and round, so that they end up holding the outermost.
 let traceWords : Ptr = traceState()
 
 -- Functions for the reason the offsets above are.
-fun traceLimit() -> Int = 64
-fun traceBytes() -> Int = 16 + 8 * traceLimit()
+fun traceInner() -> Int = 48
+fun traceOuter() -> Int = 16
+fun traceBytes() -> Int = 16 + 8 * (traceInner() + traceOuter())
 
 fun traceState() -> Ptr {
     let words = Libc.malloc(traceBytes())
@@ -282,9 +289,11 @@ fun capture(frame : Ptr) -> Unit {
         var here = Ptr.toInt(frame)
         -- The same conditions as the collector's walk: a record stays below
         -- the bound and aligned, and each is above the last.
-        while count < traceLimit() && here & 7 == 0 && here + 16 <= top {
+        while here & 7 == 0 && here + 16 <= top {
             let record = Ptr.fromInt(here)
-            Ptr.store(words, 16 + 8 * count, Ptr.load(record, 8) : Int)
+            let slot = if count < traceInner() { count }
+                       else { traceInner() + (count - traceInner()) % traceOuter() }
+            Ptr.store(words, 16 + 8 * slot, Ptr.load(record, 8) : Int)
             count = count + 1
             let next : Int = Ptr.load(record, 0)
             if next <= here { break }
@@ -299,13 +308,33 @@ fun traceMine() -> Bool =
     !Ptr.isNull(traceWords)
     && Ptr.atomicLoad(traceWords, 0) == Ptr.toInt(workerRecord())
 
--- How many return addresses the running worker's panic has a trace of; 0 if
--- the trace is another panic's or there is none.
-fun traceCount() -> Int = if traceMine() { Ptr.load(traceWords, 8) } else { 0 }
+-- How many calls were active when the running worker's panic was raised; 0
+-- if the trace is another panic's or there is none.
+fun traceActive() -> Int = if traceMine() { Ptr.load(traceWords, 8) } else { 0 }
+
+-- How many return addresses the running worker's panic has a trace of.
+fun traceCount() -> Int {
+    let active = traceActive()
+    let room = traceInner() + traceOuter()
+    if active < room { active } else { room }
+}
+
+-- How many calls the trace leaves out, between its first `traceInner()`
+-- addresses and the rest.
+fun traceLeftOut() -> Int = traceActive() - traceCount()
 
 -- Return address `index` of the trace, counting from the innermost call. An
 -- index outside `0..traceCount()` is undefined.
-fun traceAddress(index : Int) -> Ptr = Ptr.load(traceWords, 16 + 8 * index)
+fun traceAddress(index : Int) -> Ptr {
+    if index < traceInner() || traceLeftOut() == 0 {
+        return Ptr.load(traceWords, 16 + 8 * index)
+    }
+    -- The oldest of the addresses written round is where the next would
+    -- have gone.
+    let oldest = (traceActive() - traceInner()) % traceOuter()
+    let slot = traceInner() + (oldest + index - traceInner()) % traceOuter()
+    Ptr.load(traceWords, 16 + 8 * slot)
+}
 
 -- Make the trace of the panic of the worker whose record is `from` the trace
 -- of `to`'s, for a panic handed from one worker to another.

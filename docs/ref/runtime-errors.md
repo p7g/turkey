@@ -65,10 +65,15 @@ through its call on line 10.
 * **Library calls are listed too.** Most panics are raised inside the
   library, so a trace usually starts with a line or more of library
   functions, as this one starts with `error`.
-* **Tail calls leave no line.** A function that ends in a
+* **Not every call has a line.** A function that ends in a
   [tail call](declarations.md#functions) is no longer active once the call is
-  made, so it is not in the trace.
-* **At most 64 lines are printed**, the innermost 64 calls.
+  made, so it is not in the trace. A call the compiler has replaced with the
+  called function's body usually keeps its line, but a call to a function
+  that was passed as an argument can lose it: the lines of an anonymous
+  function's body are then listed under the function it is written in.
+* **A deep trace is shortened.** When more than 64 calls are active, the
+  trace has the innermost 48 and the outermost 16, with a line between them
+  such as `  ... 939 more calls`.
 
 ## What panics
 

@@ -463,8 +463,12 @@ that is an instance of all the ambiguous variable's classes, with the
 relaxations GHC's `ExtendedDefaultRules` makes: the classes need not be
 standard ones, and the literal may also be used in ways that are not a class,
 such as being indexed. A container whose instance needs something of the
-elements that they lack is passed over too. When no container has them all,
-the literal is rejected:
+elements is taken only once the elements' own type is decided and has it, so
+numerals are defaulted first. One rule goes beyond Haskell's: when no
+container's needs are met outright, the first whose needs fall only on an
+element type that nothing will default, such as a function's type parameter,
+is taken, and the function's own context carries them. When no container
+fits, the literal is rejected:
 
 <!-- error: no container this array literal could be has both 'SetIndex' and 'Hash': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
 ```kotlin
@@ -475,6 +479,12 @@ fun main() {
     costs[key] = 1
 }
 ```
+
+A literal inside another is decided after it: a literal with no class of its
+own waits until no other literal or numeral can still be decided, and then is
+an `Array`. So in `Set.add(seen, [[1, 2]])` the outer literal is a
+`FrozenArray`, which needs `Hash` of its elements, and that makes the inner
+literal a `FrozenArray` too.
 
 A function or a top-level `let` decides its literals from its own
 definition, before any use of it elsewhere is seen: `let key =
@@ -530,8 +540,7 @@ let count : Int = [1, 2]
 ```
 
 > **Coming from Haskell.** This is `OverloadedLists`, with a closed set of three
-> containers instead of the class `IsList`, and with a default: a literal
-> nothing decides is an `Array` rather than ambiguous.
+> containers instead of the class `IsList`.
 
 > **Coming from Rust.** `[a, b]` covers both `[a, b]` and `vec![a, b]`, and the
 > program's use of it chooses. There is no fixed-size array type whose length

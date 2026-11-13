@@ -7,13 +7,29 @@ export (executableFile)
 -- **Layout.** Five segments, each a whole number of 16KB pages, the arm64
 -- page size: `__PAGEZERO`, the unmapped first 4GB that catches a null
 -- pointer; `__TEXT`, holding the header and load commands, then the code,
--- the import stubs, the C strings and the constants; `__DATA_CONST`, holding
--- the global offset table, one word per import, which the loader fills in
--- and then makes read-only; `__DATA`; and `__LINKEDIT`, holding what the
--- loader and the tools read: the bind opcodes, the symbol table, the
--- indirect symbol table, its strings, and last the code signature, which
--- covers every byte before it. The file is laid out as the image is, so a
+-- the import stubs, the C strings, the constants, `__unwind_info` and
+-- `__eh_frame`; `__DATA_CONST`, holding the global offset table, one word
+-- per import, which the loader fills in and then makes read-only; `__DATA`;
+-- and `__LINKEDIT`, holding what the loader and the tools read: the bind
+-- opcodes, the function starts, the symbol table, the indirect symbol table,
+-- its strings, and last the code signature, which covers every byte before
+-- it. Up to `__LINKEDIT` the file is laid out as the image is, so a
 -- segment's file offset is its address less `__TEXT`'s.
+--
+-- **Debug information**, when the module has any, is a sixth segment,
+-- `__DWARF`, whose sections are the module's debug sections as they are,
+-- with their addresses filled in. Its bytes are in the file just before
+-- `__LINKEDIT`'s, and it is never mapped: its address is `__LINKEDIT`'s, and
+-- its size in memory and its protections are 0. lldb, `atos`, `sample`,
+-- Instruments and crash reports read it there as they read the debug map a
+-- linker leaves. It is not compressed, because none of them reads
+-- compressed DWARF. `__LINKEDIT` stays last, because `strip` and
+-- `codesign_allocate` refuse a file that does not end with it, and the
+-- signature covers the debug information too. Nothing splits it out:
+-- `dsymutil` follows only a linker's debug map, and run on this file writes
+-- a dSYM with the same UUID and no DWARF, which the debuggers then prefer.
+-- With the DWARF in the file, `__LINKEDIT`'s file offset is past it, and is
+-- not its address less `__TEXT`'s.
 --
 -- **Every field is filled in here** (`Turkey.Image`), at the addresses this
 -- layout gives. The image has no rebases: the loaded sections hold no
@@ -25,10 +41,14 @@ export (executableFile)
 -- (`LC_DYLD_INFO_ONLY`) rather than chained fixups: a handful of binds needs
 -- no more, and every arm64 macOS reads them.
 --
--- **What is left out.** The debug sections, and the unwind sections, which
--- an unwinder reads only through an `__unwind_info` this does not build.
--- The runtime finds frames by their frame pointers and the frame table, and
--- needs neither.
+-- **Unwind information**, which every build carries: the compact encoding
+-- of each function, from the module's `__compact_unwind` entries, in an
+-- `__unwind_info` (`Turkey.UnwindInfo`), and `__eh_frame` for the functions
+-- whose encoding is DWARF mode, which name their FDE by its offset in it.
+-- `LC_FUNCTION_STARTS` holds the start of every function, from the named
+-- symbols in the code, which is how lldb finds a function the symbol table
+-- does not name; never a block or a safepoint label, which would split a
+-- function in two.
 --
 -- **Symbols.** Every named symbol defined in the module is in the table, so
 -- that `nm`, a profiler and a crash report name every function; the
@@ -55,10 +75,13 @@ import Turkey.Asm as Asm
 import Turkey.Asm (Symbol, SymbolKind(..))
 import Turkey.Arm64.Encode as Encode
 import Turkey.Arm64.Encode (Fixup)
-import Turkey.Assembler (Object(..), SectionData(..))
+import Turkey.Assembler (Object(..), SectionData(..), Relocation(..), Definition(..))
 import Turkey.CodeSignature as CodeSignature
 import Turkey.Executable (stubSize, stubs, check, copy, alignUp)
 import Turkey.Image as Image
+import Turkey.Unwind as Unwind
+import Turkey.MachO (sectionNames)
+import Turkey.UnwindInfo (unwindInfo)
 import Iter
 
 let base = 0x100000000
@@ -67,16 +90,12 @@ let page = 0x4000
 let headerSize = 32
 let segmentSize = 72
 let sectionSize = 80
--- The load commands besides one `LC_LOAD_DYLIB` per library.
-let fixedCommands = 13
--- The sections in `__TEXT`: `__text`, `__stubs`, `__cstring`, `__const`.
-let textSections = 4
--- The segments, `__DATA_CONST` and `__DATA` with a section each; then
--- `LC_DYLD_INFO_ONLY`, `LC_SYMTAB`, `LC_DYSYMTAB`, `LC_LOAD_DYLINKER`,
--- `LC_UUID`, `LC_BUILD_VERSION`, `LC_MAIN` and `LC_CODE_SIGNATURE`.
-let fixedCommandsSize = segmentSize + segmentSize + textSections * sectionSize
-                        + 2 * (segmentSize + sectionSize) + segmentSize
-                        + 48 + 24 + 80 + 32 + 24 + 24 + 24 + 16
+-- The load commands besides the segments and one `LC_LOAD_DYLIB` per
+-- library: `LC_DYLD_INFO_ONLY`, `LC_SYMTAB`, `LC_DYSYMTAB`,
+-- `LC_LOAD_DYLINKER`, `LC_UUID`, `LC_BUILD_VERSION`, `LC_MAIN`,
+-- `LC_FUNCTION_STARTS` and `LC_CODE_SIGNATURE`.
+let otherCommands = 9
+let otherCommandsSize = 48 + 24 + 80 + 32 + 24 + 24 + 24 + 16 + 16
 
 -- The oldest macOS the runtime runs on, `os_sync_wait_on_address`'s, which
 -- is also the SDK recorded.
@@ -88,11 +107,6 @@ let libSystem = "/usr/lib/libSystem.B.dylib"
 -- `__DATA_CONST`'s index among the segments, from `__PAGEZERO`'s 0, by
 -- which the bind opcodes name it.
 let offsetTableSegment = 2
-
--- The section ordinals of the module's code, C strings, constants and
--- data: ordinals count from 1, across every segment, and `__stubs` and
--- `__got` are the second and the fifth.
-let ordinals = [1, 3, 4, 6]
 
 -- A symbol table entry before its name is placed.
 type Entry = Entry { name : String, kind : Int, section : Int, desc : Int, value : Int }
@@ -111,6 +125,18 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     let constants = 2
     let data = 3
     check(sections)
+    -- The rest: the debug sections, in the order the assembler made them,
+    -- and the unwind sections, -1 for one the module does not have.
+    let debug = []
+    var compact = -1
+    var ehFrame = -1
+    for var k = data + 1; k < len(sections); k = k + 1 {
+        match sections[k].kind {
+            Asm.CompactUnwind -> { compact = k }
+            Asm.EhFrame -> { ehFrame = k }
+            _ -> Vec.push(debug, k)
+        }
+    }
     let dylibs = [libSystem]
     for name in Array.sort(Map.values(dylibOf)) {
         if name != libSystem && dylibs[len(dylibs) - 1] != name { Vec.push(dylibs, name) }
@@ -125,10 +151,18 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     let byLibrary = fun(a : Symbol, b : Symbol) =
         Array.threeWay((ordinal(a), a.name), (ordinal(b), b.name))
     let imports = Vec.toArray(Vec.sortBy(obj.undefined, byLibrary))
-    let ordinals = Array.map(imports, ordinal)
+    let libraries = Array.map(imports, ordinal)
     let n = len(imports)
     let dylibSizes = Vec.map(dylibs, fun(name) = alignUp(24 + len(String.toBytes(name)) + 1, 8))
-    var commandsSize = fixedCommandsSize
+    -- `__TEXT` holds `__text`, `__stubs`, `__cstring` and `__const`, then
+    -- `__unwind_info` and `__eh_frame` if the module has unwind information.
+    -- `__DWARF` is there only if it has debug sections.
+    let textSections = 4 + (if compact >= 0 { 1 } else { 0 }) + (if ehFrame >= 0 { 1 } else { 0 })
+    let segments = if len(debug) > 0 { 6 } else { 5 }
+    -- Sections count from 1 across every segment, in order.
+    let sectionOrdinals = [1, 3, 4, textSections + 2]
+    var commandsSize = segmentSize * segments + sectionSize * (textSections + 2 + len(debug))
+                       + otherCommandsSize
     for size in dylibSizes { commandsSize = commandsSize + size }
 
     -- `__TEXT`, from the header.
@@ -137,21 +171,47 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     let cstringsAt = alignUp(stubsAt + stubSize * n, 1 << sections[cstrings].align)
     let constantsAt = alignUp(cstringsAt + len(sections[cstrings].bytes),
                               1 << sections[constants].align)
-    let textSegment = pages(constantsAt + len(sections[constants].bytes))
+    let unwind = if compact >= 0 {
+        let (entries, end) = compactEntries(obj, compact, ehFrame, textAt)
+        unwindInfo(entries, end)
+    } else {
+        []
+    }
+    let unwindAt = alignUp(constantsAt + len(sections[constants].bytes), 4)
+    let ehFrameAt = if ehFrame >= 0 {
+        alignUp(unwindAt + len(unwind), 1 << sections[ehFrame].align)
+    } else {
+        unwindAt + len(unwind)
+    }
+    let ehFrameSize = if ehFrame >= 0 { len(sections[ehFrame].bytes) } else { 0 }
+    let textSegment = pages(ehFrameAt + ehFrameSize)
     -- `__DATA_CONST` and `__DATA`, a section each.
     let offsetTableAt = textSegment
     let offsetTableSegmentSize = pages(8 * n)
     let dataAt = offsetTableAt + offsetTableSegmentSize
     let dataSegment = pages(len(sections[data].bytes))
-    -- `__LINKEDIT`.
-    let linkeditAt = dataAt + dataSegment
-    let binds = bindOpcodes(imports, ordinals)
+    -- `__LINKEDIT`'s address, and `__DWARF`'s, which is in the file there
+    -- and moves `__LINKEDIT`'s bytes past it.
+    let linkeditAddress = base + dataAt + dataSegment
+    let dwarfAt = dataAt + dataSegment
+    let debugAt = []
+    var dwarfEnd = dwarfAt
+    for k in debug {
+        dwarfEnd = alignUp(dwarfEnd, 1 << sections[k].align)
+        Vec.push(debugAt, dwarfEnd)
+        dwarfEnd = dwarfEnd + len(sections[k].bytes)
+    }
+    let linkeditAt = if len(debug) > 0 { alignUp(dwarfEnd, page) } else { dwarfAt }
+    let binds = bindOpcodes(imports, libraries)
+    let starts = functionStarts(obj, textAt)
     let addresses = Array.filled(len(sections), -1)
     addresses[text] = base + textAt
     addresses[cstrings] = base + cstringsAt
     addresses[constants] = base + constantsAt
     addresses[data] = base + dataAt
-    let (entries, locals, exported) = symbols(obj, imports, ordinals, addresses)
+    if ehFrame >= 0 { addresses[ehFrame] = base + ehFrameAt }
+    let (entries, locals, exported) = symbols(obj, imports, libraries, sectionOrdinals,
+                                              addresses)
     let strings = []
     Vec.push(strings, Byte.truncate(0))
     let nameAt = Vec.map(entries, fun(e) {
@@ -161,17 +221,20 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
         offset
     })
     while len(strings) % 8 != 0 { Vec.push(strings, Byte.truncate(0)) }
-    let symbolsAt = alignUp(linkeditAt + len(binds), 8)
+    let startsAt = alignUp(linkeditAt + len(binds), 8)
+    let symbolsAt = startsAt + len(starts)
     let indirectAt = symbolsAt + 16 * len(entries)
     let stringsAt = indirectAt + 4 * 2 * n
     let signatureAt = alignUp(stringsAt + len(strings), 16)
     let signatureSize = CodeSignature.size(identifier, signatureAt)
     let fileSize = signatureAt + signatureSize
 
-    -- Every field filled in, with each import standing for its stub.
+    -- Every field filled in, with each import standing for its stub, and
+    -- each debug section's addresses the code's.
     let stubOf = Map.new()
     for var k = 0; k < n; k = k + 1 { Map.put(stubOf, Asm.spell(imports[k]), k) }
-    Image.apply(Encode.isa(), obj, addresses, [], fun(sym) = match Map.get(stubOf, Asm.spell(sym)) {
+    Image.apply(Encode.isa(), obj, addresses, Vec.toArray(debug),
+                fun(sym) = match Map.get(stubOf, Asm.spell(sym)) {
         Some(k) -> base + stubsAt + stubSize * k
         None -> error("internal error: " + Asm.spell(sym) + " is neither defined nor imported")
     })
@@ -209,10 +272,11 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
         le(4, count)
         le(4, flags)
     }
-    let section = fun(segmentName, name, offset, size, align, flags, indirect, stride) {
+    let section = fun(segmentName, name, address, offset, size, align, flags, indirect,
+                      stride) {
         name16(name)
         name16(segmentName)
-        le(8, base + offset)
+        le(8, address)
         le(8, size)
         le(4, offset)
         le(4, align)
@@ -223,6 +287,10 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
         le(4, stride)
         le(4, 0)
     }
+    -- A section of `__TEXT`, `__DATA_CONST` or `__DATA`, at its address in
+    -- the file.
+    let mapped = fun(segmentName, name, offset, size, align, flags, indirect, stride) =
+        section(segmentName, name, base + offset, offset, size, align, flags, indirect, stride)
 
     -- mach_header_64: arm64, an executable, with every undefined symbol
     -- bound to a library (`MH_NOUNDEFS`), loaded by dyld (`MH_DYLDLINK`),
@@ -232,31 +300,48 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     le(4, 0x0100000C)
     le(4, 0)
     le(4, 2)
-    le(4, fixedCommands + len(dylibs))
+    le(4, segments + otherCommands + len(dylibs))
     le(4, commandsSize)
     le(4, 0x00200085)
     le(4, 0)
     segment("__PAGEZERO", 0, base, 0, 0, 0, 0, 0)
     segment("__TEXT", base, textSegment, 0, textSegment, 5, textSections, 0)
     -- Instructions, and only instructions.
-    section("__TEXT", "__text", textAt, len(sections[text].bytes), sections[text].align,
-            0x80000400, 0, 0)
+    mapped("__TEXT", "__text", textAt, len(sections[text].bytes), sections[text].align,
+           0x80000400, 0, 0)
     -- `S_SYMBOL_STUBS`, each `stubSize` bytes, whose imports are the first
     -- `n` entries of the indirect symbol table.
-    section("__TEXT", "__stubs", stubsAt, stubSize * n, 2, 0x80000408, 0, stubSize)
-    section("__TEXT", "__cstring", cstringsAt, len(sections[cstrings].bytes),
-            sections[cstrings].align, 0x2, 0, 0)
-    section("__TEXT", "__const", constantsAt, len(sections[constants].bytes),
-            sections[constants].align, 0, 0, 0)
+    mapped("__TEXT", "__stubs", stubsAt, stubSize * n, 2, 0x80000408, 0, stubSize)
+    mapped("__TEXT", "__cstring", cstringsAt, len(sections[cstrings].bytes),
+           sections[cstrings].align, 0x2, 0, 0)
+    mapped("__TEXT", "__const", constantsAt, len(sections[constants].bytes),
+           sections[constants].align, 0, 0, 0)
+    if compact >= 0 { mapped("__TEXT", "__unwind_info", unwindAt, len(unwind), 2, 0, 0, 0) }
+    if ehFrame >= 0 {
+        let (_, _, flags) = sectionNames(Asm.EhFrame)
+        mapped("__TEXT", "__eh_frame", ehFrameAt, ehFrameSize, sections[ehFrame].align, flags,
+               0, 0)
+    }
     -- `SG_READ_ONLY`: read-only once the loader has bound it.
     segment("__DATA_CONST", base + offsetTableAt, offsetTableSegmentSize, offsetTableAt,
             offsetTableSegmentSize, 3, 1, 0x10)
     -- `S_NON_LAZY_SYMBOL_POINTERS`, whose imports are the next `n` entries.
-    section("__DATA_CONST", "__got", offsetTableAt, 8 * n, 3, 0x6, n, 0)
+    mapped("__DATA_CONST", "__got", offsetTableAt, 8 * n, 3, 0x6, n, 0)
     segment("__DATA", base + dataAt, dataSegment, dataAt, dataSegment, 3, 1, 0)
-    section("__DATA", "__data", dataAt, len(sections[data].bytes), sections[data].align, 0,
-            0, 0)
-    segment("__LINKEDIT", base + linkeditAt, pages(fileSize - linkeditAt), linkeditAt,
+    mapped("__DATA", "__data", dataAt, len(sections[data].bytes), sections[data].align, 0,
+           0, 0)
+    -- Each debug section at its address in `__DWARF`, which takes no memory,
+    -- with the object's flags, `S_ATTR_DEBUG` among them.
+    if len(debug) > 0 {
+        segment("__DWARF", linkeditAddress, 0, dwarfAt, dwarfEnd - dwarfAt, 0, len(debug), 0)
+        for var j = 0; j < len(debug); j = j + 1 {
+            let s = sections[debug[j]]
+            let (segmentName, name, flags) = sectionNames(s.kind)
+            section(segmentName, name, linkeditAddress + debugAt[j] - dwarfAt, debugAt[j],
+                    len(s.bytes), s.align, flags, 0, 0)
+        }
+    }
+    segment("__LINKEDIT", linkeditAddress, pages(fileSize - linkeditAt), linkeditAt,
             fileSize - linkeditAt, 1, 0, 0)
     -- LC_DYLD_INFO_ONLY: binds, and no rebases, weak binds, lazy binds or
     -- exports.
@@ -324,6 +409,11 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
         string(out, at, dylibs[k])
         at = at + dylibSizes[k] - 24
     }
+    -- LC_FUNCTION_STARTS
+    le(4, 0x26)
+    le(4, 16)
+    le(4, startsAt)
+    le(4, len(starts))
     -- LC_CODE_SIGNATURE
     le(4, 0x1D)
     le(4, 16)
@@ -338,8 +428,12 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     copy(out, stubsAt, stubs(base + stubsAt, base + offsetTableAt, n))
     copy(out, cstringsAt, sections[cstrings].bytes)
     copy(out, constantsAt, sections[constants].bytes)
+    copy(out, unwindAt, unwind)
+    if ehFrame >= 0 { copy(out, ehFrameAt, sections[ehFrame].bytes) }
     copy(out, dataAt, sections[data].bytes)
+    for var j = 0; j < len(debug); j = j + 1 { copy(out, debugAt[j], sections[debug[j]].bytes) }
     for var k = 0; k < len(binds); k = k + 1 { out[linkeditAt + k] = binds[k] }
+    copy(out, startsAt, starts)
     for var k = 0; k < len(entries); k = k + 1 {
         let e = entries[k]
         let p = symbolsAt + 16 * k
@@ -357,7 +451,9 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
 
     -- The UUID is the first half of a SHA-256 of the file with the UUID
     -- and signature still zero, marked as RFC 9562's version 8, a UUID of
-    -- the maker's own construction, with the RFC 4122 variant.
+    -- the maker's own construction, with the RFC 4122 variant. It covers the
+    -- debug information, which the tools that cache what they read from it
+    -- find by the UUID.
     let h = SHA256.new()
     SHA256.update(h, out, 0, signatureAt)
     let digest = SHA256.finish(h)
@@ -368,11 +464,90 @@ fun executableFile(obj : Object Fixup, entry : Symbol, identifier : String,
     out
 }
 
+-- Each function's offset from the Mach-O header, ascending, with its compact
+-- unwind encoding, from section `compact`'s `__compact_unwind` entries; and
+-- the end of the last function. The code is at `textAt` in the file. An
+-- encoding in DWARF mode gets the offset of the function's FDE in section
+-- `ehFrame`'s `__eh_frame` in its low 24 bits, as a final image's must.
+fun compactEntries(obj : Object Fixup, compact : Int, ehFrame : Int, textAt : Int)
+        -> (Vec (Int, Int), Int) {
+    let defined = Map.new()
+    for d in obj.defined { Map.put(defined, Asm.spell(d.symbol), d) }
+    let codeOffset = fun(sym : Symbol) = match Map.get(defined, Asm.spell(sym)) {
+        Some(d) -> if d.section == 0 { d.offset } else {
+            error("internal error: unwind information describes " + Asm.spell(sym)
+                  + ", which is not code")
+        }
+        None -> error("internal error: unwind information describes " + Asm.spell(sym)
+                      + ", which is not defined")
+    }
+    -- Each FDE's offset, by its function's offset in the code. The FDE's
+    -- only relocated field is its function's address, after its length and
+    -- its CIE's offset, four bytes each.
+    let fdes = Map.new()
+    if ehFrame >= 0 {
+        for r in obj.sections[ehFrame].relocations {
+            Map.put(fdes, codeOffset(r.target), r.offset - 8)
+        }
+    }
+    -- An entry is 32 bytes: the function's address, which is the entry's
+    -- only relocated field, then its length and its encoding.
+    let s = obj.sections[compact]
+    let entries = []
+    var end = 0
+    for r in s.relocations {
+        let at = codeOffset(r.target)
+        let length = Byte.getLE(s.bytes, r.offset + 8, 4)
+        let encoding = Byte.getLE(s.bytes, r.offset + 12, 4)
+        let final = if Unwind.dwarfMode(encoding) {
+            let fde = match Map.get(fdes, at) {
+                Some(fde) -> fde
+                None -> error("internal error: " + Asm.spell(r.target)
+                              + " is in DWARF mode and has no FDE")
+            }
+            if fde >= 1 << 24 {
+                error("internal error: an FDE is past the 24 bits an encoding has for it")
+            }
+            encoding | fde
+        } else {
+            encoding
+        }
+        Vec.push(entries, (textAt + at, final))
+        end = max(end, textAt + at + length)
+    }
+    (Vec.sortBy(entries, fun(a : (Int, Int), b : (Int, Int)) = Array.threeWay(a, b)), end)
+}
+
+-- `LC_FUNCTION_STARTS`'s data: the start of every function in the code,
+-- which is at `textAt` in the file, as ULEB128 deltas, the first from
+-- `__TEXT`'s start; then a 0, and zeros to a multiple of eight bytes.
+fun functionStarts(obj : Object Fixup, textAt : Int) -> Vec Byte {
+    -- Every named symbol in the code starts a function, because a block or a
+    -- safepoint has a temporary label. The stream's `FunctionType` is not the
+    -- test: the C faces' entries do not carry it.
+    let starts = []
+    for d in obj.defined {
+        if let Temporary = d.symbol.kind { continue }
+        if d.section == 0 { Vec.push(starts, textAt + d.offset) }
+    }
+    let out = []
+    var last = 0
+    for at in Vec.sortBy(starts, fun(a : Int, b : Int) = Array.threeWay(a, b)) {
+        if at != last || len(out) == 0 {
+            uleb(out, at - last)
+            last = at
+        }
+    }
+    Vec.push(out, Byte.truncate(0))
+    while len(out) % 8 != 0 { Vec.push(out, Byte.truncate(0)) }
+    out
+}
+
 -- The bind opcodes that fill in the offset table: one slot per import, in
 -- order from its start, each bound to a pointer to the import in the library
--- of the same place in `ordinals`. Ends with `BIND_OPCODE_DONE` and padded to
--- eight bytes.
-fun bindOpcodes(imports : Array Symbol, ordinals : Array Int) -> Vec Byte {
+-- of the same place in `libraries`. Ends with `BIND_OPCODE_DONE` and padded
+-- to eight bytes.
+fun bindOpcodes(imports : Array Symbol, libraries : Array Int) -> Vec Byte {
     let out = []
     let op = fun(n) = Vec.push(out, Byte.truncate(n))
     -- BIND_OPCODE_SET_TYPE_IMM BIND_TYPE_POINTER, and
@@ -387,8 +562,8 @@ fun bindOpcodes(imports : Array Symbol, ordinals : Array Int) -> Vec Byte {
     var library = 0
     for var k = 0; k < len(imports); k = k + 1 {
         let sym = imports[k]
-        if ordinals[k] != library {
-            library = ordinals[k]
+        if libraries[k] != library {
+            library = libraries[k]
             if library < 16 {
                 op(0x10 | library)
             } else {
@@ -408,19 +583,21 @@ fun bindOpcodes(imports : Array Symbol, ordinals : Array Int) -> Vec Byte {
 
 -- The symbol table, and how many of its entries are local and how many
 -- exported. Each import is from the library of the same place in
--- `ordinals`. `addresses` holds each section's address, or -1 for one the
--- image leaves out.
-fun symbols(obj : Object Fixup, imports : Array Symbol, ordinals : Array Int,
-            addresses : Array Int) -> (Vec Entry, Int, Int) {
+-- `libraries`. `sectionOrdinals` holds the ordinals of the module's code, C
+-- strings, constants and data, and `addresses` each section's address, or
+-- -1 for one the image leaves out.
+fun symbols(obj : Object Fixup, imports : Array Symbol, libraries : Array Int,
+            sectionOrdinals : Array Int, addresses : Array Int) -> (Vec Entry, Int, Int) {
     let locals = []
     let exported = []
     for d in obj.defined {
         if let Temporary = d.symbol.kind { continue }
-        if addresses[d.section] < 0 {
-            error("internal error: " + d.symbol.name + " is in a section the image leaves out")
+        if d.section >= len(sectionOrdinals) || addresses[d.section] < 0 {
+            error("internal error: " + d.symbol.name + " is in a section the symbol table "
+                  + "has no entry for")
         }
         let e = Entry { name = d.symbol.name, kind = if d.exported { 0xF } else { 0xE },
-                        section = ordinals[d.section], desc = 0,
+                        section = sectionOrdinals[d.section], desc = 0,
                         value = addresses[d.section] + d.offset }
         Vec.push(if d.exported { exported } else { locals }, e)
     }
@@ -432,7 +609,7 @@ fun symbols(obj : Object Fixup, imports : Array Symbol, ordinals : Array Int,
     -- byte.
     for var k = 0; k < len(imports); k = k + 1 {
         Vec.push(entries, Entry { name = imports[k].name, kind = 0x1, section = 0,
-                                  desc = ordinals[k] << 8, value = 0 })
+                                  desc = libraries[k] << 8, value = 0 })
     }
     (entries, len(locals), len(exported))
 }

@@ -1,0 +1,166 @@
+export (
+    PriorityQueue,
+    new,
+    newBy,
+    fromArray,
+    fromArrayBy,
+    push,
+    pop,
+    peek,
+    isEmpty,
+    clear,
+    drain,
+    toArray,
+)
+
+-- A queue that pops its least element first: `push` and `pop` take
+-- O(log n) time, `peek` O(1), and `fromArray` builds a queue in O(n).
+--
+-- `new` orders the elements by their `Ord`. Tuples compare element by
+-- element, so a priority paired with a value is a tuple with the priority
+-- first, and Dijkstra's search pushes `(distance, node)`:
+--
+--     let frontier = PriorityQueue.new()
+--     PriorityQueue.push(frontier, (0, start))
+--     while let Some((d, here)) = PriorityQueue.pop(frontier) { ... }
+--
+-- `newBy` takes the order instead, as `Vec.sortBy` does; the greatest first
+-- is `newBy(fun(x, y) = Vec.threeWay(y, x))`. Elements the order calls equal
+-- pop in no particular order.
+--
+-- There is no way to lower an element's priority in place. Push it again
+-- with the new priority, and skip the stale entry when it pops.
+
+import Turkey.Array (threeWay)
+
+-- A binary heap in `items`: the element at `i` is ordered no later than
+-- those at `2i + 1` and `2i + 2`, so the first is the least.
+type QueueState a : !Debug = QueueState {
+    items   : Vec a,
+    compare : fun(a, a) -> Ordering,
+}
+
+type PriorityQueue a = PriorityQueue(QueueState a)
+
+fun state(PriorityQueue(value)) = value
+
+fun new[Ord a]() -> PriorityQueue a = newBy(threeWay)
+
+fun newBy(compare : fun(a, a) -> Ordering) -> PriorityQueue a =
+    PriorityQueue(QueueState { items = [], compare })
+
+-- Copies `xs`, which is left as it was.
+fun fromArray[Ord a](xs : Array a) -> PriorityQueue a = fromArrayBy(xs, threeWay)
+
+fun fromArrayBy(xs : Array a, compare : fun(a, a) -> Ordering) -> PriorityQueue a {
+    let data = QueueState { items = Vec.fromArray(xs), compare }
+    heapify(data)
+    PriorityQueue(data)
+}
+
+-- Restore the heap order over all of `items`. Sifting down from the last
+-- parent to the root costs O(n) in all, where pushing the elements one at a
+-- time would cost O(n log n).
+fun heapify(data : QueueState a) -> Unit {
+    for var i = len(data.items) / 2 - 1; i >= 0; i = i - 1 {
+        siftDown(data, i)
+    }
+}
+
+fun before(data : QueueState a, i : Int, j : Int) -> Bool {
+    let compare = data.compare
+    Ordering.isLess(compare(data.items[i], data.items[j]))
+}
+
+-- Move the element at `i` towards the root until its parent comes before it.
+fun siftUp(data : QueueState a, start : Int) -> Unit {
+    var i = start
+    while i > 0 {
+        let parent = (i - 1) / 2
+        if !before(data, i, parent) { return }
+        Vec.swap(data.items, i, parent)
+        i = parent
+    }
+}
+
+-- Move the element at `i` towards the leaves until it comes before both
+-- its children.
+fun siftDown(data : QueueState a, start : Int) -> Unit {
+    let n = len(data.items)
+    var i = start
+    loop {
+        let left = 2 * i + 1
+        if left >= n { return }
+        let right = left + 1
+        let child = if right < n && before(data, right, left) { right } else { left }
+        if !before(data, child, i) { return }
+        Vec.swap(data.items, i, child)
+        i = child
+    }
+}
+
+fun push(q : PriorityQueue a, x : a) -> Unit {
+    let data = state(q)
+    Vec.push(data.items, x)
+    siftUp(data, len(data.items) - 1)
+}
+
+-- Removes and returns the least element.
+fun pop(q : PriorityQueue a) -> Option a {
+    let data = state(q)
+    let n = len(data.items)
+    if n == 0 { return None }
+    -- Swap the least element to the end, where `Vec.pop` takes it, and sift
+    -- down the last leaf that took its place.
+    Vec.swap(data.items, 0, n - 1)
+    let least = Vec.pop(data.items)
+    siftDown(data, 0)
+    least
+}
+
+-- The least element, left in the queue.
+fun peek(q : PriorityQueue a) -> Option a = Vec.at(state(q).items, 0)
+
+fun isEmpty(q : PriorityQueue a) -> Bool = len(q) == 0
+
+fun clear(q : PriorityQueue a) -> Unit { Vec.clear(state(q).items) }
+
+-- Removes every element and returns them in the order `pop` would, least
+-- first, leaving the queue empty.
+fun drain(q : PriorityQueue a) -> Array a {
+    let out = Vec.new(len(q))
+    while let Some(x) = pop(q) { Vec.push(out, x) }
+    Vec.toArray(out)
+}
+
+-- The elements in no particular order, copied, leaving the queue as it was.
+fun toArray(q : PriorityQueue a) -> Array a = Vec.toArray(state(q).items)
+
+instance Length (PriorityQueue a) { fun len(q) = len(state(q).items) }
+
+-- A new queue holding the elements of both, ordered as `p` is; `q`'s order
+-- is dropped. There is no `Monoid`: an empty queue would have to choose an
+-- order, and as the left operand it would impose it on the right one, so it
+-- could not be an identity for a queue made by `newBy`.
+instance Semigroup (PriorityQueue a) {
+    fun combine(p, q) {
+        let data = QueueState {
+            items = Vec.append(state(p).items, state(q).items),
+            compare = state(p).compare,
+        }
+        heapify(data)
+        PriorityQueue(data)
+    }
+}
+
+-- The elements, in no particular order, as a call to `fromArray`:
+-- `PriorityQueue.fromArray([x, ...])`. That call orders by `Ord`, so for a
+-- queue made by `newBy` it builds a different queue; the order is a
+-- function and does not print.
+instance Debug (PriorityQueue a) : Debug a {
+    fun debug(q) = "PriorityQueue.fromArray(" + debug(toArray(q)) + ")"
+}
+
+-- What its `Debug` prints: a container's text shows its elements' `Debug`,
+-- so that a string in it is quoted.
+instance Show (PriorityQueue a) : Debug a { fun show(q) = debug(q) }

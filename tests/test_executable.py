@@ -41,13 +41,15 @@ darwin = pytest.mark.skipif(
     reason="runs the executable, and checks it with Apple's tools")
 
 
-def _boot(*args: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+def _boot(*args: str, env: dict[str, str] | None = None,
+          cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(toolchain.command(bootc.binary(), "build", *args),
-                          capture_output=True, text=True, env=env or ENV, timeout=600)
+                          capture_output=True, text=True, env=env or ENV, timeout=600, cwd=cwd)
 
 
-def _write(entry: Path, output: Path) -> None:
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(output), str(entry))
+def _write(entry: Path, output: Path, *flags: str) -> None:
+    result = _boot("-f", "exe", "--target", "arm64-darwin", *flags, "-o", str(output),
+                   str(entry))
     assert result.returncode == 0, result.stderr[-4000:]
 
 
@@ -428,8 +430,8 @@ def test_an_executable_is_written_only_when_asked_for(tmp_path):
     assert "only with -f exe" in result.stderr
 
 
-def test_an_executable_with_debug_information_is_refused(tmp_path):
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-g", "-o", str(tmp_path / "adt"),
+def test_an_elf_executable_with_debug_information_is_refused(tmp_path):
+    result = _boot("-f", "exe", "--target", "arm64-linux", "-g", "-o", str(tmp_path / "adt"),
                    str(PROGRAMS / "adt.gob"))
     assert result.returncode == 2
     assert "no debug information" in result.stderr
@@ -445,9 +447,10 @@ def _commands(data: bytes):
         at += length
 
 
-def test_the_signature_and_the_uuid_hash_the_file(tmp_path):
+@pytest.mark.parametrize("flags", [[], ["-g"]], ids=["plain", "debug"])
+def test_the_signature_and_the_uuid_hash_the_file(tmp_path, flags):
     executable = tmp_path / "adt"
-    _write(PROGRAMS / "adt.gob", executable)
+    _write(PROGRAMS / "adt.gob", executable, *flags)
     data = executable.read_bytes()
     assert struct.unpack_from("<III", data, 0) == (0xFEEDFACF, 0x0100000C, 0)
     commands = dict(_commands(data))
@@ -522,6 +525,302 @@ def test_the_layout_is_what_the_loader_needs(tmp_path):
     stubs, got = sections[b"__stubs"], sections[b"__got"]
     assert stubs[3] == 12 * nundef and stubs[7] == 12 and stubs[6] == 0
     assert got[3] == 8 * nundef and got[6] == nundef
+
+
+# Debug and unwind information in the Mach-O executable. Each check writes the
+# executable and the object of one program for arm64-darwin, wherever `boot`
+# runs, and compares the two in Python: the executable's debug sections and
+# `__eh_frame` are the object's with every address filled in, its
+# `__unwind_info` holds the object's compact unwind entries, and its function
+# starts are its functions. Where the system linker is there, its image of the
+# same object is the oracle for the encodings and the function starts too.
+
+TASKS = """\
+import System.Task as Task
+
+fun leaf(n : Int) -> Int {
+    if n <= 0 {
+        return 7
+    }
+    leaf(n - 1) + 1
+}
+
+fun main() {
+    let t = Task.runScope(do {
+        let a = Task.spawn(fun() = leaf(3))?
+        pure(a)
+    })
+    print(Task.join(t))
+}
+"""
+
+S_ATTR_DEBUG = 0x02000000
+DWARF_MODE = 0x03000000
+
+
+class _Section:
+    def __init__(self, data: bytes, at: int, ordinal: int):
+        (name, segment, self.address, self.size, self.offset, self.align, self.reloff,
+         self.nreloc, self.flags) = struct.unpack_from("<16s16s2Q5I", data, at)
+        self.name = name.rstrip(b"\0").decode()
+        self.segment = segment.rstrip(b"\0").decode()
+        self.ordinal = ordinal
+        self.bytes = data[self.offset:self.offset + self.size]
+
+    def relocations(self, data: bytes):
+        """Each relocation: its offset, the section ordinal or symbol it
+        names, whether that is a symbol, its size as a power of two, and its
+        type."""
+        for k in range(self.nreloc):
+            offset, info = struct.unpack_from("<iI", data, self.reloff + 8 * k)
+            yield offset, info & 0xFFFFFF, (info >> 27) & 1, (info >> 25) & 3, info >> 28
+
+
+class _MachO:
+    def __init__(self, path: Path):
+        self.data = data = path.read_bytes()
+        self.commands = list(_commands(data))
+        self.segments = list(_segments(data))
+        self.sections: list[_Section] = []
+        at = 32
+        for command, body in self.commands:
+            if command == 0x19:
+                (count,) = struct.unpack_from("<I", body, 64)
+                for k in range(count):
+                    self.sections.append(_Section(data, at + 72 + 80 * k,
+                                                  len(self.sections) + 1))
+            at += len(body)
+        self.by_name = {s.name: s for s in self.sections}
+
+    def command(self, number: int) -> bytes:
+        [body] = [b for c, b in self.commands if c == number]
+        return body
+
+    def text_symbols(self) -> dict[str, int]:
+        """Each named symbol in `__text`, by name, with its address."""
+        symoff, nsyms, stroff, _ = struct.unpack_from("<4I", self.command(0x2), 8)
+        text = self.by_name["__text"].ordinal
+        found = {}
+        for k in range(nsyms):
+            name, kind, section, _, value = struct.unpack_from("<IBBHQ", self.data,
+                                                                symoff + 16 * k)
+            if kind & 0x0E == 0x0E and section == text:
+                end = self.data.index(b"\0", stroff + name)
+                found[self.data[stroff + name:end].decode()] = value
+        return found
+
+    def relocated(self, name: str, image: "_MachO") -> bytes:
+        """This object's section `name` with each address in it moved to
+        where `image` puts the section it points into: each is an
+        `ARM64_RELOC_UNSIGNED` of eight bytes against a section, which holds
+        the address in the object."""
+        section = self.by_name[name]
+        out = bytearray(section.bytes)
+        for offset, target, extern, length, kind in section.relocations(self.data):
+            assert (extern, length, kind) == (0, 3, 0), (name, offset)
+            into = self.sections[target - 1]
+            stored = int.from_bytes(out[offset:offset + 8], "little")
+            moved = stored - into.address + image.by_name[into.name].address
+            out[offset:offset + 8] = moved.to_bytes(8, "little")
+        return bytes(out)
+
+
+def _written(tmp_path: Path, source: str, *flags: str) -> tuple[_MachO, _MachO]:
+    """`source` for arm64-darwin as an object and as an executable, each
+    written by `boot` with `flags`."""
+    (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
+    for output, form in (("prog.o", "obj"), ("prog", "exe")):
+        result = _boot("-f", form, "--target", "arm64-darwin", *flags, "-o", output,
+                       "prog.gob", cwd=tmp_path)
+        assert result.returncode == 0, result.stderr[-4000:]
+    return _MachO(tmp_path / "prog.o"), _MachO(tmp_path / "prog")
+
+
+def _unwind_entries(u: bytes) -> tuple[list[tuple[int, int]], int, list[int]]:
+    """An `__unwind_info`'s entries, as each function offset and its
+    encoding, its sentinel's function offset, and each page's kind."""
+    version, common_at, common_n, _, personalities, index_at, index_n = struct.unpack_from(
+        "<7I", u, 0)
+    assert version == 1 and personalities == 0
+    common = struct.unpack_from(f"<{common_n}I", u, common_at)
+    entries, kinds = [], []
+    for i in range(index_n):
+        first, page, _ = struct.unpack_from("<3I", u, index_at + 12 * i)
+        if i == index_n - 1:
+            assert page == 0
+            return entries, first, kinds
+        (kind,) = struct.unpack_from("<I", u, page)
+        kinds.append(kind)
+        if kind == 2:
+            entry_at, count = struct.unpack_from("<HH", u, page + 4)
+            entries += [struct.unpack_from("<II", u, page + entry_at + 8 * k)
+                        for k in range(count)]
+        else:
+            assert kind == 3, kind
+            entry_at, count, local_at, local_n = struct.unpack_from("<4H", u, page + 4)
+            local = struct.unpack_from(f"<{local_n}I", u, page + local_at)
+            for k in range(count):
+                (word,) = struct.unpack_from("<I", u, page + entry_at + 4 * k)
+                index = word >> 24
+                encoding = common[index] if index < common_n else local[index - common_n]
+                entries.append((first + (word & 0xFFFFFF), encoding))
+    raise AssertionError("no sentinel")
+
+
+def _encoding_at(entries: list[tuple[int, int]], offset: int) -> int:
+    """The encoding of the entry that covers `offset`: the last at or below
+    it."""
+    return next(e for at, e in reversed(entries) if at <= offset)
+
+
+def _fdes(image: _MachO) -> dict[int, int]:
+    """Each FDE in `image`'s `__eh_frame`, by the address of its function:
+    its offset in the section."""
+    section = image.by_name["__eh_frame"]
+    u = section.bytes
+    found = {}
+    at = 0
+    while at < len(u):
+        length, cie = struct.unpack_from("<II", u, at)
+        if cie != 0:
+            (begin,) = struct.unpack_from("<q", u, at + 8)
+            found[section.address + at + 8 + begin] = at
+        at += 4 + length
+    return found
+
+
+def _function_starts(image: _MachO) -> list[int]:
+    """`LC_FUNCTION_STARTS`, as addresses."""
+    offset, size = struct.unpack_from("<II", image.command(0x26), 8)
+    starts, address, at = [], 0x100000000, offset
+    while at < offset + size:
+        delta, at = _uleb(image.data, at)
+        if delta == 0:
+            break
+        address += delta
+        starts.append(address)
+    return starts
+
+
+def _expected_unwind(obj: _MachO, image: _MachO) -> tuple[list[tuple[int, int]], int]:
+    """The object's compact unwind entries as an image holds them: by offset
+    from the header, a DWARF-mode encoding naming its FDE, adjacent equal
+    encodings folded and DWARF mode never; and the end of the last
+    function."""
+    compact = obj.by_name["__compact_unwind"]
+    text, image_text = obj.by_name["__text"], image.by_name["__text"]
+    fdes = _fdes(image)
+    unfolded, end = [], 0
+    for at in range(0, compact.size, 32):
+        address, length, encoding = struct.unpack_from("<QII", compact.bytes, at)
+        moved = address - text.address + image_text.address
+        if encoding == DWARF_MODE:
+            encoding |= fdes[moved]
+        unfolded.append((moved - 0x100000000, encoding))
+        end = max(end, moved - 0x100000000 + length)
+    folded = []
+    for offset, encoding in sorted(unfolded):
+        if folded and folded[-1][1] == encoding and encoding & 0x0F000000 != DWARF_MODE:
+            continue
+        folded.append((offset, encoding))
+    return folded, end
+
+
+def test_the_debug_information_is_a_segment_no_one_maps(tmp_path):
+    _, image = _written(tmp_path, TASKS, "-g")
+    names = [s[0] for s in image.segments]
+    assert names == [b"__PAGEZERO", b"__TEXT", b"__DATA_CONST", b"__DATA", b"__DWARF",
+                     b"__LINKEDIT"]
+    data, dwarf, linkedit = image.segments[3], image.segments[4], image.segments[5]
+    _, address, size, offset, file_size, sections = dwarf
+    assert (address, size) == (linkedit[1], 0)
+    assert offset == data[3] + data[4] and offset % 0x4000 == 0
+    assert offset + file_size <= linkedit[3] and linkedit[3] % 0x4000 == 0
+    assert linkedit[3] + linkedit[4] == len(image.data)
+    body = next(b for c, b in image.commands if c == 0x19 and b[8:24].rstrip(b"\0") == b"__DWARF")
+    assert struct.unpack_from("<2I", body, 56) == (0, 0)
+    for segment, name, at, length, file_at, flags, _, _ in sections:
+        assert segment == b"__DWARF" and name.startswith(b"__debug_"), name
+        assert flags == S_ATTR_DEBUG, name
+        assert offset <= file_at and file_at + length <= offset + file_size, name
+        assert at - address == file_at - offset, name
+
+
+def test_without_debug_information_there_is_no_dwarf_segment(tmp_path):
+    _, image = _written(tmp_path, TASKS)
+    assert b"__DWARF" not in [s[0] for s in image.segments]
+    assert not [s for s in image.sections if s.name.startswith("__debug_")]
+
+
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_debug_sections_are_the_objects_with_final_addresses(tmp_path, level):
+    obj, image = _written(tmp_path, TASKS, level)
+    debug = [s.name for s in obj.sections if s.segment == "__DWARF"]
+    assert debug and debug == [s.name for s in image.sections if s.segment == "__DWARF"]
+    for name in debug:
+        assert image.by_name[name].bytes == obj.relocated(name, image), name
+
+
+def test_the_unwind_info_holds_each_functions_encoding(tmp_path):
+    obj, image = _written(tmp_path, TASKS)
+    entries, sentinel, kinds = _unwind_entries(image.by_name["__unwind_info"].bytes)
+    expected, end = _expected_unwind(obj, image)
+    assert entries == expected
+    assert sentinel == end
+    assert kinds and all(kind == 2 for kind in kinds)
+    swap = image.text_symbols()["_turkey_swap_stack"] - 0x100000000
+    assert _encoding_at(entries, swap) & 0xFF000000 == DWARF_MODE
+    assert _encoding_at(entries, swap) & 0xFFFFFF == _fdes(image)[swap + 0x100000000] > 0
+
+
+def test_eh_frame_is_the_objects_with_its_functions_addresses(tmp_path):
+    obj, image = _written(tmp_path, TASKS)
+    ours, theirs = image.by_name["__eh_frame"], obj.by_name["__eh_frame"]
+    assert ours.segment == "__TEXT" and ours.size == theirs.size
+    fdes = _fdes(image)
+    assert list(fdes) == [image.text_symbols()["_turkey_swap_stack"]]
+    masked = bytearray(ours.bytes)
+    expected = bytearray(theirs.bytes)
+    for at in fdes.values():
+        masked[at + 8:at + 16] = expected[at + 8:at + 16] = bytes(8)
+    assert masked == expected
+
+
+def test_the_function_starts_are_the_named_functions(tmp_path):
+    _, image = _written(tmp_path, TASKS)
+    starts = _function_starts(image)
+    assert starts == sorted(set(image.text_symbols().values()))
+    offset, size = struct.unpack_from("<II", image.command(0x26), 8)
+    assert size % 8 == 0 and offset % 8 == 0
+
+
+def test_each_variant_has_its_own_uuid(tmp_path):
+    uuids = set()
+    for level in ([], ["-g"], ["--debug=lines"]):
+        directory = tmp_path / (level[0].strip("-") if level else "plain")
+        directory.mkdir()
+        _, image = _written(directory, TASKS, *level)
+        uuids.add(image.command(0x1B)[8:24])
+    assert len(uuids) == 3
+
+
+@pytest.mark.skipif(toolchain.target() != "arm64-darwin" or toolchain.missing(),
+                    reason="links the object with the system linker")
+def test_the_linker_agrees_on_the_encodings_and_function_starts(tmp_path):
+    obj, image = _written(tmp_path, TASKS)
+    linked = subprocess.run([*toolchain.cc(), "-o", "prog_ld", "prog.o",
+                             *toolchain.libraries()],
+                            cwd=tmp_path, capture_output=True, text=True)
+    assert linked.returncode == 0, linked.stderr[-4000:]
+    theirs = _MachO(tmp_path / "prog_ld")
+    ours_text, their_text = image.by_name["__text"].address, theirs.by_name["__text"].address
+    their_starts = [a - their_text for a in _function_starts(theirs)]
+    assert [a - ours_text for a in _function_starts(image)] == their_starts
+    ours_entries, _, _ = _unwind_entries(image.by_name["__unwind_info"].bytes)
+    their_entries, _, _ = _unwind_entries(theirs.by_name["__unwind_info"].bytes)
+    for start in their_starts:
+        assert (_encoding_at(ours_entries, start + ours_text - 0x100000000)
+                == _encoding_at(their_entries, start + their_text - 0x100000000)), hex(start)
 
 
 # The ELF writer, for glibc on arm64 Linux.

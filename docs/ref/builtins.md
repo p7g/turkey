@@ -271,11 +271,6 @@ False
 {1, 2}
 ```
 
-Equal sets hash equal whatever order their elements were added in, so a set
-can be a key of a `Map` or an element of another set. Like any mutable value
-used as a key, it must not change while it is one: its hash changes with it,
-and the map or set holding it can no longer find it.
-
 ## Operator classes
 
 Each arithmetic, comparison and bitwise operator calls a class method
@@ -352,7 +347,7 @@ The instances the library provides for built-in types:
 | `Option a`, `Either l r` | if the contents have it | no | if the contents have it | no | no | no | if the contents have it |
 | `Array a`, `Vec a` | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `Map k v` | if `k` has `Hash` and `v` has `Eq` | no | no | no | no | no | if the keys and values have it |
-| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | if `a` has `Hash` | no | `Sub` only, difference | no | if the elements have it |
+| `Set a` (module `Data.Set`) | if `a` has `Hash` | no | no | no | `Sub` only, difference | no | if the elements have it |
 | `Deque a` (module `Deque`) | if the elements have it | no | no | concatenation | no | no | if the elements have it |
 | `PriorityQueue a` (module `PriorityQueue`) | no | no | no | no | no | no | if the elements have it |
 | `Unit` | yes | no | yes | no | no | no | no |

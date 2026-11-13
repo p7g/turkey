@@ -4,9 +4,22 @@ export (
     parse,
     minValue,
     maxValue,
+    parseRadix,
+    toStringRadix,
     compare,
     mod,
+    floorDiv,
+    divMod,
     abs,
+    sign,
+    gcd,
+    lcm,
+    pow,
+    powMod,
+    isqrt,
+    countOnes,
+    leadingZeros,
+    trailingZeros,
     addWrapping,
     subWrapping,
     mulWrapping,
@@ -153,7 +166,24 @@ fun negChecked(a : Int) -> Option Int =
 -- at the end cannot represent `minValue()`, whose magnitude is one past
 -- `maxValue()` -- so the sign that has the extra value is the one accumulated
 -- in, and it is the positive result that is checked on the way out.
-fun parse(s : String) -> Option Int {
+fun parse(s : String) -> Option Int = parseRadix(s, 10)
+
+-- Returns the value of the digit byte `b` (`0`-`9`, then `a`-`z` or `A`-`Z`
+-- for 10-35), or -1 when `b` is not an alphanumeric ASCII byte.
+fun digitOf(b : Int) -> Int {
+    if b >= 48 && b <= 57 { return b - 48 }
+    if b >= 97 && b <= 122 { return b - 87 }
+    if b >= 65 && b <= 90 { return b - 55 }
+    -1
+}
+
+-- Parses `s` in base `radix`, which must be in 2..36 (a panic otherwise).
+-- Accepts what `parse` accepts, with digits `0-9` and then letters of either
+-- case: an optional sign, then one or more digits, and nothing else -- no
+-- `0x` prefix, no `_`, no surrounding space. Returns `None` for a digit
+-- outside the radix or a value outside `Int`.
+fun parseRadix(s : String, radix : Int) -> Option Int {
+    checkRadix(radix)
     let n = len(bytesOf(s))
     var i = 0
     var negative = False
@@ -170,10 +200,10 @@ fun parse(s : String) -> Option Int {
     if i >= n { return None }
     var acc = 0
     while i < n {
-        let digit = Byte.toInt(bytesOf(s)[i]) - 48
-        if digit < 0 || digit > 9 { return None }
+        let digit = digitOf(Byte.toInt(bytesOf(s)[i]))
+        if digit < 0 || digit >= radix { return None }
         var scaled = 0
-        match mulChecked(acc, 10) {
+        match mulChecked(acc, radix) {
             None -> { return None }
             Some(v) -> { scaled = v }
         }
@@ -184,6 +214,183 @@ fun parse(s : String) -> Option Int {
         i = i + 1
     }
     if negative { Some(acc) } else { negChecked(acc) }
+}
+
+fun checkRadix(radix : Int) -> Unit {
+    if radix < 2 || radix > 36 { error("Int: radix must be in 2..36") }
+}
+
+-- Formats `n` in base `radix` (2..36, a panic otherwise) with lowercase
+-- letters for the digits above 9 and a leading `-` for a negative number. The
+-- digits come off a non-positive copy, as in `toString`.
+fun toStringRadix(n : Int, radix : Int) -> String {
+    checkRadix(radix)
+    -- 64 digits is the most any radix needs, which is base 2 for `minValue()`.
+    let digits = Storage.uninitialized(64)
+    var count = 0
+    var rest = if n < 0 { n } else { -n }
+    loop {
+        let d = -(rest % radix)
+        digits[count] = Byte.truncate(if d < 10 { 48 + d } else { 87 + d })
+        count = count + 1
+        rest = rest / radix
+        if rest == 0 { break }
+    }
+    let sign = if n < 0 { 1 } else { 0 }
+    let out = Storage.uninitialized(sign + count)
+    if n < 0 { out[0] = Byte.truncate(45) }
+    for var i = 0; i < count; i = i + 1 {
+        out[sign + i] = digits[count - 1 - i]
+    }
+    String(out)
+}
+
+-- -- number theory --------------------------------------------------------------
+
+-- Returns -1, 0 or 1 as `n` is negative, zero or positive.
+fun sign(n : Int) -> Int = if n < 0 { -1 } else if n > 0 { 1 } else { 0 }
+
+-- Returns the quotient of `a` and `b` rounded toward negative infinity, which
+-- pairs with `mod`: `floorDiv(a, b) * b + mod(a, b) == a`. Panics when `b` is
+-- zero, and on `floorDiv(minValue(), -1)`, as `/` does.
+fun floorDiv(a : Int, b : Int) -> Int {
+    let q = a / b
+    if a % b != 0 && (a < 0) != (b < 0) { q - 1 } else { q }
+}
+
+-- Returns `(floorDiv(a, b), mod(a, b))`.
+fun divMod(a : Int, b : Int) -> (Int, Int) = (floorDiv(a, b), mod(a, b))
+
+-- Returns the greatest common divisor, never negative; `gcd(0, 0)` is 0.
+-- Panics when an argument is `minValue()`, whose absolute value is not an `Int`.
+fun gcd(a : Int, b : Int) -> Int {
+    var x = abs(a)
+    var y = abs(b)
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    x
+}
+
+-- Returns the least common multiple, never negative; zero when either argument
+-- is zero. Panics on overflow, as `*` does.
+fun lcm(a : Int, b : Int) -> Int {
+    if a == 0 || b == 0 { return 0 }
+    abs(a / gcd(a, b) * b)
+}
+
+-- Returns `base` raised to `exp`. Panics when `exp` is negative, because the
+-- answer is not an `Int`, and on overflow, as `*` does; `pow(0, 0)` is 1.
+fun pow(base : Int, exp : Int) -> Int {
+    if exp < 0 { error("Int.pow: negative exponent") }
+    var result = 1
+    var b = base
+    var e = exp
+    while e > 0 {
+        if and(e, 1) == 1 { result = result * b }
+        e = shr(e, 1)
+        -- Square only when another bit remains: the last squaring would
+        -- overflow for a result that fits.
+        if e > 0 { b = b * b }
+    }
+    result
+}
+
+-- Returns `(a * b) mod m` for `0 <= a, b < m` without overflow, by adding `a`
+-- into the sum once per set bit of `b` when the plain product does not fit.
+fun mulMod(a : Int, b : Int, m : Int) -> Int {
+    match mulChecked(a, b) {
+        Some(p) -> { return p % m }
+        None -> {}
+    }
+    var result = 0
+    var x = a
+    var y = b
+    while y > 0 {
+        if and(y, 1) == 1 { result = addMod(result, x, m) }
+        x = addMod(x, x, m)
+        y = shr(y, 1)
+    }
+    result
+}
+
+-- Returns `(a + b) mod m` for `0 <= a, b < m`; `m - b` cannot overflow.
+fun addMod(a : Int, b : Int, m : Int) -> Int = if a >= m - b { a - (m - b) } else { a + b }
+
+-- Returns `base` raised to `exp`, modulo `modulus`, in `0..modulus - 1`.
+-- Panics when `exp` is negative or `modulus` is not positive. No intermediate
+-- value overflows, whatever the modulus.
+fun powMod(base : Int, exp : Int, modulus : Int) -> Int {
+    if exp < 0 { error("Int.powMod: negative exponent") }
+    if modulus <= 0 { error("Int.powMod: modulus must be positive") }
+    var result = 1 % modulus
+    var b = mod(base, modulus)
+    var e = exp
+    while e > 0 {
+        if and(e, 1) == 1 { result = mulMod(result, b, modulus) }
+        e = shr(e, 1)
+        if e > 0 { b = mulMod(b, b, modulus) }
+    }
+    result
+}
+
+-- Returns the floor of the square root of `n`. Panics when `n` is negative.
+fun isqrt(n : Int) -> Int {
+    if n < 0 { error("Int.isqrt: negative argument") }
+    -- Binary search for the largest `r` with `r * r <= n`. 3037000499 is the
+    -- largest `r` whose square is an `Int`, so `mid * mid` never overflows.
+    var lo = 0
+    var hi = 3037000499
+    while lo < hi {
+        let mid = lo + (hi - lo + 1) / 2
+        if mid * mid <= n { lo = mid } else { hi = mid - 1 }
+    }
+    lo
+}
+
+-- -- bit counts ---------------------------------------------------------------
+--
+-- All three read `n` as its 64 two's-complement bits, so a negative number has
+-- its sign bit set.
+
+-- Returns the number of set bits.
+fun countOnes(n : Int) -> Int {
+    var count = 0
+    var rest = n
+    while rest != 0 {
+        -- Clears the lowest set bit. The subtraction wraps because `rest` may be
+        -- `minValue()`. (`Bits` imports this module, so the bit operators are
+        -- spelled out.)
+        rest = and(rest, subWrapping(rest, 1))
+        count = count + 1
+    }
+    count
+}
+
+-- Returns the number of zero bits above the highest set bit: 64 for zero.
+fun leadingZeros(n : Int) -> Int {
+    if n < 0 { return 0 }
+    var count = 0
+    var rest = n
+    while rest != 0 {
+        rest = shr(rest, 1)
+        count = count + 1
+    }
+    64 - count
+}
+
+-- Returns the number of zero bits below the lowest set bit: 64 for zero.
+fun trailingZeros(n : Int) -> Int {
+    if n == 0 { return 64 }
+    var count = 0
+    var rest = n
+    while and(rest, 1) == 0 {
+        rest = shrUnsigned(rest, 1)
+        count = count + 1
+    }
+    count
 }
 
 fun and(a : Int, b : Int) -> Int = Prim.intAnd(a, b)

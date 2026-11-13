@@ -1,43 +1,43 @@
 export (new, acquire, tryAcquire, release, wait, waitFor, wake, wakeAll)
 
--- Mutual exclusion for the runtime's own shared state: the heap's region
--- lists and counters, the list of stacks, the scheduler's queue. Each is held
--- only across a few edits and never across a collection, a stack switch or a
--- call that could block.
---
--- A giblet module, because the collector and the allocator take these, and
--- may not allocate.
---
--- **A lock is three words**, in storage of its own that lives as long as the
--- process: whether it is held (0 or 1), how many threads sleep waiting for
--- it, and whether one has been woken and not yet run. Taking a free lock is
--- one compare-and-swap, 0 to 1; releasing it is a store of 0, and a system
--- call to wake a sleeper only if the count says there is one and none is
--- already awake on its way -- Go's `sync.Mutex` keeps the same flag. Without
--- it, a lock twelve workers hammered paid a wake-up on every release while
--- any slept, and ran 28 times slower than the C library's. A thread that finds the lock held reads it a hundred times,
--- in case it is about to be released, then yields its core a few times, and
--- only then counts itself and sleeps until the word is no longer 1.
---
--- The count is what keeps a release cheap after contention has passed: a
--- single state word that says "perhaps someone sleeps" -- one design, three
--- states -- cannot be cleared by the release that wakes the last sleeper, and
--- every release after pays for a wake-up nobody needs. Measured on a lock
--- four workers hammer, that was six times slower than the C library's.
---
--- A release stores, then reads the count; a sleeper counts itself, then tries
--- the lock once more before it sleeps. Each's second access is ordered after
--- its first (a release store and an acquire load are not reordered), so either
--- the release sees the count or the sleeper sees the lock free: a wake-up
--- cannot fall between them.
---
--- A thread may take a lock it was not first to ask for (barging): every
--- section a lock here guards is a few hundred instructions, so handing the
--- lock on in order would cost a sleeping thread's wake-up on every release to
--- save nothing measurable.
---
--- Offsets are literals rather than `let`s: other giblets' globals are made
--- with `new`, and a `let` is a global that may not be set yet.
+--- Mutual exclusion for the runtime's own shared state: the heap's region
+--- lists and counters, the list of stacks, the scheduler's queue. Each is held
+--- only across a few edits and never across a collection, a stack switch or a
+--- call that could block.
+---
+--- A giblet module, because the collector and the allocator take these, and
+--- may not allocate.
+---
+--- **A lock is three words**, in storage of its own that lives as long as the
+--- process: whether it is held (0 or 1), how many threads sleep waiting for
+--- it, and whether one has been woken and not yet run. Taking a free lock is
+--- one compare-and-swap, 0 to 1; releasing it is a store of 0, and a system
+--- call to wake a sleeper only if the count says there is one and none is
+--- already awake on its way -- Go's `sync.Mutex` keeps the same flag. Without
+--- it, a lock twelve workers hammered paid a wake-up on every release while
+--- any slept, and ran 28 times slower than the C library's. A thread that finds the lock held reads it a hundred times,
+--- in case it is about to be released, then yields its core a few times, and
+--- only then counts itself and sleeps until the word is no longer 1.
+---
+--- The count is what keeps a release cheap after contention has passed: a
+--- single state word that says "perhaps someone sleeps" -- one design, three
+--- states -- cannot be cleared by the release that wakes the last sleeper, and
+--- every release after pays for a wake-up nobody needs. Measured on a lock
+--- four workers hammer, that was six times slower than the C library's.
+---
+--- A release stores, then reads the count; a sleeper counts itself, then tries
+--- the lock once more before it sleeps. Each's second access is ordered after
+--- its first (a release store and an acquire load are not reordered), so either
+--- the release sees the count or the sleeper sees the lock free: a wake-up
+--- cannot fall between them.
+---
+--- A thread may take a lock it was not first to ask for (barging): every
+--- section a lock here guards is a few hundred instructions, so handing the
+--- lock on in order would cost a sleeping thread's wake-up on every release to
+--- save nothing measurable.
+---
+--- Offsets are literals rather than `let`s: other giblets' globals are made
+--- with `new`, and a `let` is a global that may not be set yet.
 
 import Prelude ()
 import Data.Int (Int)
@@ -56,7 +56,7 @@ import Data.Int as Int
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 
--- A fresh, unlocked lock; a panic if there is no memory for one.
+--- A fresh, unlocked lock; a panic if there is no memory for one.
 fun new() -> Ptr {
     let lock = Libc.malloc(24)
     if Ptr.isNull(lock) {
@@ -69,11 +69,11 @@ fun new() -> Ptr {
     lock
 }
 
--- Take `lock` if no thread holds it: True if this one now does.
+--- Take `lock` if no thread holds it: True if this one now does.
 fun tryAcquire(lock : Ptr) -> Bool = Ptr.atomicCas(lock, 0, 0, 1) == 0
 
--- Wait until no other thread holds `lock`, and hold it. Not recursive: a
--- thread that takes a lock it holds waits forever.
+--- Wait until no other thread holds `lock`, and hold it. Not recursive: a
+--- thread that takes a lock it holds waits forever.
 fun acquire(lock : Ptr) -> Unit {
     if !tryAcquire(lock) { contended(lock) }
 }
@@ -102,13 +102,13 @@ fun contended(lock : Ptr) -> Unit {
     }
 }
 
--- The flag is set only while a wake-up is on its way to a sleeper. A wake
--- that found nobody asleep -- a counted thread not yet in the kernel's wait
--- -- clears it again, and then looks once more: a release in between saw the
--- flag set and woke nobody, and the thread it skipped may have gone to sleep
--- since, behind a holder who has released too. So while the lock is free and
--- someone is counted, a release keeps trying until a wake finds a sleeper or
--- another release takes the job over.
+--- The flag is set only while a wake-up is on its way to a sleeper. A wake
+--- that found nobody asleep -- a counted thread not yet in the kernel's wait
+--- -- clears it again, and then looks once more: a release in between saw the
+--- flag set and woke nobody, and the thread it skipped may have gone to sleep
+--- since, behind a holder who has released too. So while the lock is free and
+--- someone is counted, a release keeps trying until a wake finds a sleeper or
+--- another release takes the job over.
 fun release(lock : Ptr) -> Unit {
     Ptr.atomicStore(lock, 0, 0)
     while Ptr.atomicLoad(lock, 8) != 0 && Ptr.atomicLoad(lock, 0) == 0
@@ -124,8 +124,8 @@ fun release(lock : Ptr) -> Unit {
 -- public from macOS 14.4, and Linux's `futex`. Each is named in its own arm of
 -- a match on the target, which a program built for the other drops.
 
--- Sleep while the word at `word` holds `value`. May return early -- a
--- signal, or a wake meant for another -- so the caller tests again.
+--- Sleep while the word at `word` holds `value`. May return early -- a
+--- signal, or a wake meant for another -- so the caller tests again.
 fun wait(word : Ptr, value : Int) -> Unit = match Target.os {
     Darwin -> { let _ = Libc.osSyncWaitOnAddress(word, value, 8, 0) }
     -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
@@ -133,8 +133,8 @@ fun wait(word : Ptr, value : Int) -> Unit = match Target.os {
     Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Ptr.null()) }
 }
 
--- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
--- time runs out, too, which the caller tells from a wake by the clock.
+--- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
+--- time runs out, too, which the caller tells from a wake by the clock.
 fun waitFor(word : Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.os {
     -- `OS_CLOCK_MACH_ABSOLUTE_TIME`, the one clock it takes.
     Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
@@ -149,9 +149,9 @@ fun waitFor(word : Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.o
     }
 }
 
--- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
--- answers 0 having woken one and -1 (`ENOENT`) having found none; Linux, how
--- many it woke.
+--- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
+--- answers 0 having woken one and -1 (`ENOENT`) having found none; Linux, how
+--- many it woke.
 fun wake(word : Ptr) -> Bool = match Target.os {
     Darwin -> Libc.osSyncWakeByAddressAny(word, 8, 0) & 0xFFFF_FFFF == 0
     Linux -> {
@@ -160,7 +160,7 @@ fun wake(word : Ptr) -> Bool = match Target.os {
     }
 }
 
--- Wake every thread sleeping on `word`.
+--- Wake every thread sleeping on `word`.
 fun wakeAll(word : Ptr) -> Unit = match Target.os {
     Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
     Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Ptr.null()) }

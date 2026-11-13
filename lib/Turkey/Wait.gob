@@ -5,41 +5,41 @@ export (
     cancel, forget, park, parkApart, sleeper, complete, finished, timedOut, cancelled,
 )
 
--- Waiting for time, a descriptor, a child or a file lock without holding a
--- worker: the caller parks as it does for a mutex
--- (`Turkey.Scheduler.waitUntil`), so from a task it suspends and its worker
--- runs others, and from the program's own stack it runs tasks and drives the
--- poller until the wait ends.
---
--- A separate module from the scheduler because the scheduler is in every
--- program and this is only for those that wait for the outside: it needs
--- `Turkey.Poll`, which the scheduler already has, and the scheduler's
--- `waitOn`.
---
--- A wait is made, checked and parked on under the poller's lock
--- (`Turkey.Poll.lock`), not the scheduler's, or, for a descriptor whose
--- source is known already (`onUnlessAsOf`), under that source's lock alone.
--- The tasks of the waits that end are woken after the lock is let go. Waits that another task ends
--- (`parkApart`) are made under the scheduler's lock too, which guards what
--- their owners keep beside them, a semaphore's queue, say; the poller's is
--- taken inside it, never the other way round.
---
--- The Prelude imports `Turkey.Stdout`, which parks on a full pipe through this
--- module, so this module names each library module it uses and does not import
--- the Prelude.
---
--- Time is nanoseconds on a monotonic clock (`now`), and a deadline is a point
--- on it, or -1 for none. A wait answers:
---
--- * descriptors: 0 when ready, hung up or failed -- the operation says which;
--- * children: the wait status `waitpid` stored, which is 0 or more;
--- * file locks: 0 once the lock is taken;
--- * for any, `timedOut` if the deadline came first, `cancelled` if the
---   descriptor was closed under the wait (`Turkey.Poll.cancel`), or the
---   negated error number if the wait could not be made.
---
--- A deadline that has passed already answers `timedOut` without waiting, even
--- if the event is ready.
+--- Waiting for time, a descriptor, a child or a file lock without holding a
+--- worker: the caller parks as it does for a mutex
+--- (`Turkey.Scheduler.waitUntil`), so from a task it suspends and its worker
+--- runs others, and from the program's own stack it runs tasks and drives the
+--- poller until the wait ends.
+---
+--- A separate module from the scheduler because the scheduler is in every
+--- program and this is only for those that wait for the outside: it needs
+--- `Turkey.Poll`, which the scheduler already has, and the scheduler's
+--- `waitOn`.
+---
+--- A wait is made, checked and parked on under the poller's lock
+--- (`Turkey.Poll.lock`), not the scheduler's, or, for a descriptor whose
+--- source is known already (`onUnlessAsOf`), under that source's lock alone.
+--- The tasks of the waits that end are woken after the lock is let go. Waits that another task ends
+--- (`parkApart`) are made under the scheduler's lock too, which guards what
+--- their owners keep beside them, a semaphore's queue, say; the poller's is
+--- taken inside it, never the other way round.
+---
+--- The Prelude imports `Turkey.Stdout`, which parks on a full pipe through this
+--- module, so this module names each library module it uses and does not import
+--- the Prelude.
+---
+--- Time is nanoseconds on a monotonic clock (`now`), and a deadline is a point
+--- on it, or -1 for none. A wait answers:
+---
+--- * descriptors: 0 when ready, hung up or failed -- the operation says which;
+--- * children: the wait status `waitpid` stored, which is 0 or more;
+--- * file locks: 0 once the lock is taken;
+--- * for any, `timedOut` if the deadline came first, `cancelled` if the
+---   descriptor was closed under the wait (`Turkey.Poll.cancel`), or the
+---   negated error number if the wait could not be made.
+---
+--- A deadline that has passed already answers `timedOut` without waiting, even
+--- if the event is ready.
 
 import Prelude ()
 import Data.Int (Int)
@@ -67,61 +67,61 @@ let cancelled : Int = Poll.cancelled
 
 fun now() -> Int = Poll.now()
 
--- Return at `deadline`.
+--- Return at `deadline`.
 fun sleepUntil(deadline : Int) -> Unit {
     if passed(deadline) { return {} }
     let _ = park(fun() = Poll.sleeper(deadline))
 }
 
--- Wait for `fd` to be readable.
+--- Wait for `fd` to be readable.
 fun readable(fd : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.readable(fd, deadline)) }
 
--- Wait for `fd` to be writable.
+--- Wait for `fd` to be writable.
 fun writable(fd : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.writable(fd, deadline)) }
 
--- `readable` and `writable` that answer `cancelled` without waiting if `stop()`
--- is true once the wait may be registered, which is under the poller's lock,
--- so that `stop` must only read. A closer that makes `stop` true and then calls
--- `cancel` ends this wait either way: `cancel` finds it registered, or `stop`
--- sees what the closer made true.
+--- `readable` and `writable` that answer `cancelled` without waiting if `stop()`
+--- is true once the wait may be registered, which is under the poller's lock,
+--- so that `stop` must only read. A closer that makes `stop` true and then calls
+--- `cancel` ends this wait either way: `cancel` finds it registered, or `stop`
+--- sees what the closer made true.
 fun readableUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
     if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.readable(fd, deadline), stop) }
 
 fun writableUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
     if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.writable(fd, deadline), stop) }
 
--- `readableUnless` and `writableUnless`, judging whether `deadline` has
--- passed by `now`, a reading of `now()` the caller has just taken, rather
--- than by a reading of their own.
+--- `readableUnless` and `writableUnless`, judging whether `deadline` has
+--- passed by `now`, a reading of `now()` the caller has just taken, rather
+--- than by a reading of their own.
 fun readableUnlessAsOf(fd : Int, deadline : Int, now : Int, stop : fun() -> Bool) -> Int =
     if passedAsOf(deadline, now) { timedOut } else { parkUnless(fun() = Poll.readable(fd, deadline), stop) }
 
 fun writableUnlessAsOf(fd : Int, deadline : Int, now : Int, stop : fun() -> Bool) -> Int =
     if passedAsOf(deadline, now) { timedOut } else { parkUnless(fun() = Poll.writable(fd, deadline), stop) }
 
--- `readableUnless` for a descriptor in blocking mode, before a `read` that
--- must not wait in the kernel: it ends only once the descriptor is readable
--- (`Turkey.Poll.readableBlocking`). The others are for after `EAGAIN`.
+--- `readableUnless` for a descriptor in blocking mode, before a `read` that
+--- must not wait in the kernel: it ends only once the descriptor is readable
+--- (`Turkey.Poll.readableBlocking`). The others are for after `EAGAIN`.
 fun readableBlockingUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
     if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.readableBlocking(fd, deadline), stop) }
 
--- Wait for the child `pid` to exit, and reap it. Only the one wait for a
--- child may exist at a time, and nothing else in the program may reap it
--- (`Turkey.Poll`).
+--- Wait for the child `pid` to exit, and reap it. Only the one wait for a
+--- child may exist at a time, and nothing else in the program may reap it
+--- (`Turkey.Poll`).
 fun childExit(pid : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.childExit(pid, deadline)) }
 
--- Take `operation`'s `flock` lock on `fd`'s file, `operation` being without
--- `LOCK_NB`, waiting while another holder has it, unless `stop()` (as for
--- `readableUnless`). A wait that ends other than with 0 has not taken the
--- lock. Darwin only: the poller learns of releases there and not on Linux
--- (`Turkey.Poll`).
+--- Take `operation`'s `flock` lock on `fd`'s file, `operation` being without
+--- `LOCK_NB`, waiting while another holder has it, unless `stop()` (as for
+--- `readableUnless`). A wait that ends other than with 0 has not taken the
+--- lock. Darwin only: the poller learns of releases there and not on Linux
+--- (`Turkey.Poll`).
 fun lockedUnless(fd : Int, operation : Int, deadline : Int, stop : fun() -> Bool) -> Int =
     if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.locked(fd, operation, deadline), stop) }
 
--- `fd` is about to be closed: end every wait on it with `cancelled`.
+--- `fd` is about to be closed: end every wait on it with `cancelled`.
 fun cancel(fd : Int) -> Unit {
     Poll.lock()
     let ended = Poll.cancel(fd)
@@ -130,9 +130,9 @@ fun cancel(fd : Int) -> Unit {
     wakeAll(ended, tasks)
 }
 
--- Drop the poller's interest in `fd`, before its number is closed, ending any
--- wait still on it as `cancel` does. Every number that was waited on is
--- forgotten before it is closed (`Turkey.Poll`).
+--- Drop the poller's interest in `fd`, before its number is closed, ending any
+--- wait still on it as `cancel` does. Every number that was waited on is
+--- forgotten before it is closed (`Turkey.Poll`).
 fun forget(fd : Int) -> Unit {
     Poll.lock()
     let ended = Poll.forget(fd)
@@ -154,14 +154,14 @@ fun passed(deadline : Int) -> Bool = deadline >= 0 && Poll.now() >= deadline
 
 fun passedAsOf(deadline : Int, now : Int) -> Bool = deadline >= 0 && now >= deadline
 
--- Make the wait `start` makes, and park until it ends.
---
--- The workers that may not be watching for it are told. A first wait wakes an
--- idle worker to poll for it (`Turkey.Poll`'s interest). A deadline earlier
--- than the others wakes the one that polls, which is waiting for a later one:
--- the signal moves the work epoch too, so that a worker that computed its
--- timeout before this wait was made and has not yet begun to wait does not
--- begin.
+--- Make the wait `start` makes, and park until it ends.
+---
+--- The workers that may not be watching for it are told. A first wait wakes an
+--- idle worker to poll for it (`Turkey.Poll`'s interest). A deadline earlier
+--- than the others wakes the one that polls, which is waiting for a later one:
+--- the signal moves the work epoch too, so that a worker that computed its
+--- timeout before this wait was made and has not yet begun to wait does not
+--- begin.
 fun park(start : fun() -> Poll.Waiter) -> Int = parkUnless(start, fun() = False)
 
 fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
@@ -185,9 +185,9 @@ fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     settleIn(w, parked)
 }
 
--- `readableUnlessAsOf` or, if `writing`, `writableUnlessAsOf`, for the
--- descriptor whose source `s` is (`sourceOf`), under the source's lock alone.
--- `now` is -1 to have the deadline judged by a reading of its own.
+--- `readableUnlessAsOf` or, if `writing`, `writableUnlessAsOf`, for the
+--- descriptor whose source `s` is (`sourceOf`), under the source's lock alone.
+--- `now` is -1 to have the deadline judged by a reading of its own.
 fun onUnlessAsOf(s : Poll.Source, writing : Bool, deadline : Int, now : Int, stop : fun() -> Bool) -> Int {
     if (if now < 0 { passed(deadline) } else { passedAsOf(deadline, now) }) { return timedOut }
     Poll.lockSource(s)
@@ -201,8 +201,8 @@ fun onUnlessAsOf(s : Poll.Source, writing : Bool, deadline : Int, now : Int, sto
     settleIn(w, parked)
 }
 
--- The source of `fd`, for `onUnlessAsOf`, once a wait on `fd` has been
--- made: it is `fd`'s until `forget`.
+--- The source of `fd`, for `onUnlessAsOf`, once a wait on `fd` has been
+--- made: it is `fd`'s until `forget`.
 fun sourceOf(fd : Int) -> Option Poll.Source {
     Poll.lock()
     let s = Poll.sourceOf(fd)
@@ -272,18 +272,18 @@ fun zeroedWord() -> Ptr {
     word
 }
 
--- `park`, except that the program's own stack runs no task while it waits.
--- A task parks as it does in `park`. The program's own stack sleeps as a
--- thread in a blocking call does (`Turkey.Workers.blockingSleepOn`), and the
--- monitor hands its permit to a thread that runs the tasks; so it starts the
--- workers and the monitor if nothing has (`Turkey.Scheduler.start`).
---
--- `start` makes the waiter with `sleeper` under the scheduler's lock, given
--- the deadline to put on the poller's heap: `deadline` from a task, and -1
--- from the program's own stack, which no worker could wake for it, and which
--- ends the wait itself (`Turkey.Poll.timeOut`) when its sleep runs out.
--- Whoever ends the waiter otherwise calls `complete`, under the scheduler's
--- lock.
+--- `park`, except that the program's own stack runs no task while it waits.
+--- A task parks as it does in `park`. The program's own stack sleeps as a
+--- thread in a blocking call does (`Turkey.Workers.blockingSleepOn`), and the
+--- monitor hands its permit to a thread that runs the tasks; so it starts the
+--- workers and the monitor if nothing has (`Turkey.Scheduler.start`).
+---
+--- `start` makes the waiter with `sleeper` under the scheduler's lock, given
+--- the deadline to put on the poller's heap: `deadline` from a task, and -1
+--- from the program's own stack, which no worker could wake for it, and which
+--- ends the wait itself (`Turkey.Poll.timeOut`) when its sleep runs out.
+--- Whoever ends the waiter otherwise calls `complete`, under the scheduler's
+--- lock.
 fun parkApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int = match Co.running() {
     Some(_) -> {
         Scheduler.lock()
@@ -317,8 +317,8 @@ fun sleepApart(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
     Poll.outcome(w)
 }
 
--- A waiter for `parkApart`'s `start` to make: one that only `complete` or
--- `deadline` ends. Takes the poller's lock, so the caller must not hold it.
+--- A waiter for `parkApart`'s `start` to make: one that only `complete` or
+--- `deadline` ends. Takes the poller's lock, so the caller must not hold it.
 fun sleeper(deadline : Int) -> Poll.Waiter {
     Poll.lock()
     let w = Poll.sleeper(deadline)
@@ -327,9 +327,9 @@ fun sleeper(deadline : Int) -> Poll.Waiter {
     w
 }
 
--- End `w`, a waiter `parkApart` made, `Ready` with 0, if it still waits:
--- whether it did. Wakes its task, or, when `program` says the program's own
--- stack made it, that stack. Under the scheduler's lock.
+--- End `w`, a waiter `parkApart` made, `Ready` with 0, if it still waits:
+--- whether it did. Wakes its task, or, when `program` says the program's own
+--- stack made it, that stack. Under the scheduler's lock.
 fun complete(w : Poll.Waiter, program : Bool) -> Bool {
     Poll.lock()
     let taken = Poll.complete(w, 0)
@@ -343,7 +343,7 @@ fun complete(w : Poll.Waiter, program : Bool) -> Bool {
     taken
 }
 
--- Whether `w` has ended. Takes the poller's lock.
+--- Whether `w` has ended. Takes the poller's lock.
 fun finished(w : Poll.Waiter) -> Bool {
     Poll.lock()
     let over = Poll.finished(w)

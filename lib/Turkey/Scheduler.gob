@@ -1,67 +1,67 @@
 export (lock, unlock, ready, wake, wakeAll, changed, waitUntil, waitOn, yield, afterCall, start)
 
--- Which task runs next, and on which worker.
---
--- A task is a coroutine (`Turkey.Coroutine`), resumed from a thread's own
--- stack: the program's, whenever code on the program's stack has to wait,
--- and each other thread's, in `workerLoop`, for as long as the program runs.
--- Code on a task's stack never resumes another task; when it has to wait it
--- suspends, which returns to the thread that resumed it. So the program's own
--- stack is never a task, and keeps its full size for deep recursion.
---
--- A thread takes tasks only while it holds a run permit (`Turkey.Workers`).
--- There is a permit per core (`Turkey.Cores`), unless `TURKEY_WORKERS` says
--- how many (`start`). With one, tasks interleave in a fixed order, unless one
--- blocks in a call long enough for the monitor to hand the permit to another
--- thread; with more, they run in parallel, and any order is possible.
---
--- Scheduling is cooperative: a task runs until it waits or yields, and one
--- that computes without doing either holds its worker until it finishes.
---
--- **The locks.** What tasks wait on inside the program -- a task's result, a
--- mutex, an event (`System.Task`, `System.Sync`) -- is read and written under
--- one lock (`lock`); what they wait for outside it, under the poller's
--- (`Turkey.Poll.lock`), which may be taken while this one is held and not the
--- other way round. The queue has a lock of its own, taken only to push or pop
--- a task and never while taking another: so any code, under either of the
--- others or neither, may wake a task. A worker waiting for any of them is
--- blocked (`Turkey.Workers.acquire`), so a holder may allocate, and collect,
--- without waiting for the worker waiting on it.
---
--- **Waking before parking.** A coroutine that is about to wait registers
--- itself under the lock of what it waits on and then suspends; whatever it
--- waits for may wake it in between, on another worker, while it is still
--- running. So a wake never resumes a coroutine itself. Its `waiting` word
--- says which of the two came first, and every change to it is a
--- compare-and-swap: a wake moves a parked coroutine to active and queues it,
--- or moves a running one to woken; the worker that resumed it, once it has
--- suspended and left its stack, moves it from active to parked, or, finding
--- it woken, queues it (`run`). So exactly one of the two queues it, and only
--- once it is off its stack.
---
--- **Waking workers.** Queuing a task wakes an idle worker only if no other
--- worker has been woken to look and not yet looked (`notify`): one woken
--- worker finds every task queued before it looks, and wakes the next if it
--- leaves any. Waking one for every task queued would cost a system call per
--- task; this costs one per worker that is needed.
---
--- **The poller and time.** What tasks wait for outside the program -- a
--- descriptor, a child, a time (`Turkey.Poll`, `Turkey.Wait`) -- is learned by
--- the workers, not by a thread of its own. A worker with nothing to run polls
--- instead of sleeping on the work epoch, if a wait is registered and no other
--- worker polls (`idle`): it waits in the operating system for the nearest
--- deadline, and `signalWork` breaks that wait when there is something to run.
--- A worker that is busy looks every `pollEvery` tasks (`poll`), without
--- waiting, for one atomic load when nothing is registered. Whoever learns of
--- an event or a passed deadline applies it under the poller's lock, then
--- wakes the tasks it ended. A task that is waiting for one is not stuck: the
--- deadlock check counts it.
---
--- The Prelude's `print` waits through here for the standard output's lock
--- (`Turkey.Stdout`), so this module names what it uses rather than importing
--- the Prelude, and every program compiles it. Starting the workers is
--- `start`, which `System.Task` calls: a program that makes no task has no
--- worker but its own, and nothing for another to run.
+--- Which task runs next, and on which worker.
+---
+--- A task is a coroutine (`Turkey.Coroutine`), resumed from a thread's own
+--- stack: the program's, whenever code on the program's stack has to wait,
+--- and each other thread's, in `workerLoop`, for as long as the program runs.
+--- Code on a task's stack never resumes another task; when it has to wait it
+--- suspends, which returns to the thread that resumed it. So the program's own
+--- stack is never a task, and keeps its full size for deep recursion.
+---
+--- A thread takes tasks only while it holds a run permit (`Turkey.Workers`).
+--- There is a permit per core (`Turkey.Cores`), unless `TURKEY_WORKERS` says
+--- how many (`start`). With one, tasks interleave in a fixed order, unless one
+--- blocks in a call long enough for the monitor to hand the permit to another
+--- thread; with more, they run in parallel, and any order is possible.
+---
+--- Scheduling is cooperative: a task runs until it waits or yields, and one
+--- that computes without doing either holds its worker until it finishes.
+---
+--- **The locks.** What tasks wait on inside the program -- a task's result, a
+--- mutex, an event (`System.Task`, `System.Sync`) -- is read and written under
+--- one lock (`lock`); what they wait for outside it, under the poller's
+--- (`Turkey.Poll.lock`), which may be taken while this one is held and not the
+--- other way round. The queue has a lock of its own, taken only to push or pop
+--- a task and never while taking another: so any code, under either of the
+--- others or neither, may wake a task. A worker waiting for any of them is
+--- blocked (`Turkey.Workers.acquire`), so a holder may allocate, and collect,
+--- without waiting for the worker waiting on it.
+---
+--- **Waking before parking.** A coroutine that is about to wait registers
+--- itself under the lock of what it waits on and then suspends; whatever it
+--- waits for may wake it in between, on another worker, while it is still
+--- running. So a wake never resumes a coroutine itself. Its `waiting` word
+--- says which of the two came first, and every change to it is a
+--- compare-and-swap: a wake moves a parked coroutine to active and queues it,
+--- or moves a running one to woken; the worker that resumed it, once it has
+--- suspended and left its stack, moves it from active to parked, or, finding
+--- it woken, queues it (`run`). So exactly one of the two queues it, and only
+--- once it is off its stack.
+---
+--- **Waking workers.** Queuing a task wakes an idle worker only if no other
+--- worker has been woken to look and not yet looked (`notify`): one woken
+--- worker finds every task queued before it looks, and wakes the next if it
+--- leaves any. Waking one for every task queued would cost a system call per
+--- task; this costs one per worker that is needed.
+---
+--- **The poller and time.** What tasks wait for outside the program -- a
+--- descriptor, a child, a time (`Turkey.Poll`, `Turkey.Wait`) -- is learned by
+--- the workers, not by a thread of its own. A worker with nothing to run polls
+--- instead of sleeping on the work epoch, if a wait is registered and no other
+--- worker polls (`idle`): it waits in the operating system for the nearest
+--- deadline, and `signalWork` breaks that wait when there is something to run.
+--- A worker that is busy looks every `pollEvery` tasks (`poll`), without
+--- waiting, for one atomic load when nothing is registered. Whoever learns of
+--- an event or a passed deadline applies it under the poller's lock, then
+--- wakes the tasks it ended. A task that is waiting for one is not stuck: the
+--- deadlock check counts it.
+---
+--- The Prelude's `print` waits through here for the standard output's lock
+--- (`Turkey.Stdout`), so this module names what it uses rather than importing
+--- the Prelude, and every program compiles it. Starting the workers is
+--- `start`, which `System.Task` calls: a program that makes no task has no
+--- worker but its own, and nothing for another to run.
 
 import Prelude ()
 import Data.Int (Int)
@@ -133,7 +133,7 @@ fun zeroedWord() -> Ptr {
     word
 }
 
--- Make `c` runnable: it will be resumed in its turn. Takes the queue's lock.
+--- Make `c` runnable: it will be resumed in its turn. Takes the queue's lock.
 fun ready(c : Co.Coroutine) -> Unit {
     Workers.acquire(queueLock)
     push(c)
@@ -158,15 +158,15 @@ fun notify() -> Unit {
     }
 }
 
--- Something the program's own code may be waiting for has changed -- a task
--- finished, a mutex was released, a value made: wake it, if it sleeps. Every
--- idle worker wakes with it, since nothing says which sleeper is the program.
--- Called after the change is made, under the lock it was made under or after.
+--- Something the program's own code may be waiting for has changed -- a task
+--- finished, a mutex was released, a value made: wake it, if it sleeps. Every
+--- idle worker wakes with it, since nothing says which sleeper is the program.
+--- Called after the change is made, under the lock it was made under or after.
 fun changed() -> Unit {
     if Ptr.atomicLoad(programWaits, 0) != 0 { Workers.signalWork(True) }
 }
 
--- Make `c`, which is waiting, runnable once it has suspended.
+--- Make `c`, which is waiting, runnable once it has suspended.
 fun wake(c : Co.Coroutine) -> Unit {
     if claim(c) { ready(c) }
 }
@@ -183,8 +183,8 @@ fun claim(c : Co.Coroutine) -> Bool {
     False
 }
 
--- Wakes each of `tasks`, queuing the ones that are parked under one taking of
--- the queue's lock. Overwrites the front of `tasks` with the ones it queues.
+--- Wakes each of `tasks`, queuing the ones that are parked under one taking of
+--- the queue's lock. Overwrites the front of `tasks` with the ones it queues.
 fun wakeAll(tasks : Vec Co.Coroutine) -> Unit {
     var n = 0
     for var i = 0; i < len(tasks); i = i + 1 {
@@ -246,16 +246,16 @@ fun run(c : Co.Coroutine) -> Unit {
     if Ptr.atomicAdd(running, 0, -1) == 1 { changed() }
 }
 
--- Return once `done` holds. A task gives `register` itself, so that whatever
--- makes `done` hold can wake it, and suspends until then; code on a worker's
--- own stack runs other tasks meanwhile. `done` and `register` run under the
--- lock.
+--- Return once `done` holds. A task gives `register` itself, so that whatever
+--- makes `done` hold can wake it, and suspends until then; code on a worker's
+--- own stack runs other tasks meanwhile. `done` and `register` run under the
+--- lock.
 fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit =
     waitOn(waitsLock, done, register)
 
--- `waitUntil`, with `done` and `register` run under `mutex` rather than the
--- scheduler's lock. Whatever makes `done` hold does it under `mutex`, wakes
--- the coroutines registered with it (`wake`), and calls `changed`.
+--- `waitUntil`, with `done` and `register` run under `mutex` rather than the
+--- scheduler's lock. Whatever makes `done` hold does it under `mutex`, wakes
+--- the coroutines registered with it (`wake`), and calls `changed`.
 fun waitOn(mutex : Ptr, done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
     match Co.running() {
         Some(c) -> while True {
@@ -446,19 +446,19 @@ fun wait(seen : Int) -> Unit {
     if Workers.interest() > 0 { Workers.signalWork(False) }
 }
 
--- Back from a blocking call (`Turkey.Workers.blockingRead` and the rest),
--- in which the monitor may have given the thread's permit to another
--- (`Turkey.Monitor`): if the thread came back without one, give the running
--- task back to be queued, as `yield` does, and go on in it on whichever
--- thread takes it. The thread, back in its own loop, parks as a spare
--- (`workerLoop`). One load when the permit is still there. The program's own
--- stack waits for a permit in the call instead (`Turkey.Workers.callExit`).
+--- Back from a blocking call (`Turkey.Workers.blockingRead` and the rest),
+--- in which the monitor may have given the thread's permit to another
+--- (`Turkey.Monitor`): if the thread came back without one, give the running
+--- task back to be queued, as `yield` does, and go on in it on whichever
+--- thread takes it. The thread, back in its own loop, parks as a spare
+--- (`workerLoop`). One load when the permit is still there. The program's own
+--- stack waits for a permit in the call instead (`Turkey.Workers.callExit`).
 fun afterCall() -> Unit {
     if !Workers.permitHeld() { yield() }
 }
 
--- Let the other runnable tasks run before going on. On a worker's own stack,
--- that is each task runnable now, once.
+--- Let the other runnable tasks run before going on. On a worker's own stack,
+--- that is each task runnable now, once.
 fun yield() -> Unit = match Co.running() {
     Some(c) -> {
         -- Running, so the only other change to its word is a wake's, to
@@ -479,14 +479,14 @@ fun yield() -> Unit = match Co.running() {
 
 -- -- workers ----------------------------------------------------------------------------
 
--- Start a thread holding a permit for each permit `TURKEY_WORKERS` asks for
--- beyond the program's own, and the monitor, and answer how many permits
--- there are. Each thread runs `workerLoop`, entered through
--- `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets its
--- record in `x28`. Called on the program's own thread, as `System.Task` is
--- initialized and by whatever needs the workers before a task exists
--- (`Turkey.Detach`); a call after the first starts nothing and answers the
--- same.
+--- Start a thread holding a permit for each permit `TURKEY_WORKERS` asks for
+--- beyond the program's own, and the monitor, and answer how many permits
+--- there are. Each thread runs `workerLoop`, entered through
+--- `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets its
+--- record in `x28`. Called on the program's own thread, as `System.Task` is
+--- initialized and by whatever needs the workers before a task exists
+--- (`Turkey.Detach`); a call after the first starts nothing and answers the
+--- same.
 fun start() -> Int {
     if Workers.started() { return Workers.permits() }
     let wanted = workersWanted()

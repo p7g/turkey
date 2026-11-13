@@ -53,9 +53,10 @@ LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
 
-# The two ways `build -g` makes an object: assembly through the system
-# assembler, and an object directly.
-PATHS = ["asm", "obj"]
+# The three ways `build -g` makes a program: assembly through the system
+# assembler, an object `boot` writes, each linked by the C compiler, and an
+# executable `boot` writes with nothing linked.
+PATHS = ["asm", "obj", "exe"]
 
 PROGRAM = """\
 fun fact(n : Int) -> Int {
@@ -216,20 +217,25 @@ def _needs_dwarfdump() -> str:
 
 @functools.lru_cache(maxsize=None)
 def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
-    """`program` built with `level`, `-g` or a `--debug`, and linked, in a
-    directory of its own: `prog.o` beside the executable as the macOS debug
-    map needs it, and `prog`. `how` is `asm`, through `prog.s` and the
-    assembler, or `obj`, with `boot` writing the object."""
+    """`program` built with `level`, `-g` or a `--debug`, as `prog` in a
+    directory of its own. `how` is `asm`, through `prog.s` and the assembler,
+    or `obj`, with `boot` writing the object, each linked with `prog.o`
+    beside it as the macOS debug map needs; or `exe`, with `boot` writing
+    `prog` itself."""
+    if how == "exe" and not _darwin():
+        pytest.skip("the ELF executable boot writes carries no debug sections yet")
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
     source.write_text(program, encoding="utf-8")
-    output = "prog.s" if how == "asm" else "prog.o"
+    output = {"asm": "prog.s", "obj": "prog.o", "exe": "prog"}[how]
     compiled = subprocess.run(
         toolchain.command(bootc.binary(), "build", level, "-f", how, "-o", output,
                           "prog.gob"),
         cwd=directory, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
+    if how == "exe":
+        return directory
     if how == "asm":
         assembled = subprocess.run(
             [*toolchain.cc(), *_assemble_flags(), "-c", "-o", "prog.o", "prog.s"],
@@ -240,6 +246,12 @@ def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
         cwd=directory, capture_output=True, text=True)
     assert linked.returncode == 0, linked.stderr[-4000:]
     return directory
+
+
+def _dwarf(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
+    """The file that holds `program`'s DWARF: the object, or the executable
+    `boot` wrote."""
+    return _built(how, program, level) / ("prog" if how == "exe" else "prog.o")
 
 
 def _rows(tool: str, obj: Path) -> dict[str, set[int]]:
@@ -263,7 +275,7 @@ def _rows(tool: str, obj: Path) -> dict[str, set[int]]:
 @pytest.mark.parametrize("how", PATHS)
 def test_the_line_table_has_a_row_for_each_statement(how):
     tool = _needs_dwarfdump()
-    lines = _rows(tool, _built(how) / "prog.o").get("prog.gob", set())
+    lines = _rows(tool, _dwarf(how)).get("prog.gob", set())
     assert FACT_LINES | MAIN_LINES <= lines, sorted(lines)
 
 
@@ -271,7 +283,7 @@ def test_the_line_table_has_a_row_for_each_statement(how):
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])
 def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level):
     tool = _needs_dwarfdump()
-    text = subprocess.run([tool, "--debug-info", str(_built(how, PROGRAM, level) / "prog.o")],
+    text = subprocess.run([tool, "--debug-info", str(_dwarf(how, PROGRAM, level))],
                           capture_output=True, text=True, check=True).stdout
     assert "DW_TAG_compile_unit" in text
     assert '("prog.gob")' in text
@@ -285,6 +297,8 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level)
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])
 def test_the_dwarf_verifies(how, which, program, level):
     tool = _needs_dwarfdump()
+    if how == "exe" and which == "prog.o":
+        pytest.skip("an executable boot writes has no object")
     result = subprocess.run([tool, "--verify", str(_built(how, program, level) / which)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
@@ -308,7 +322,7 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
     subprogram, naming the abstract subprogram `area` and the line of the
     call."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _built(how, RECTANGLES) / "prog.o")
+    entries = _entries(tool, _dwarf(how, RECTANGLES))
     main = next(k for k, (_, tag, attributes) in enumerate(entries)
                 if tag == "DW_TAG_subprogram" and '("Main.main")' in attributes)
     depth = entries[main][0]
@@ -330,7 +344,7 @@ def test_a_parameter_has_a_location_list(how):
     """`fact`'s `n`: a formal parameter whose location list starts in the
     register it arrives in."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _built(how) / "prog.o")
+    entries = _entries(tool, _dwarf(how))
     n = [attributes for _, tag, attributes in entries
          if tag == "DW_TAG_formal_parameter" and '("n")' in attributes]
     assert n, "no formal parameter 'n'"
@@ -346,7 +360,7 @@ def test_the_types_describe_how_values_are_held(how):
     whose constructors are a union; a compact `Option` is a union of its
     word as its nullaries and as its payload."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _built(how, VALUES) / "prog.o")
+    entries = _entries(tool, _dwarf(how, VALUES))
     def named(tag: str, name: str) -> list[str]:
         return [a for _, t, a in entries if t == tag and f'DW_AT_name\t("{name}")' in a]
     assert named("DW_TAG_typedef", "Int") and named("DW_TAG_base_type", "long")
@@ -645,7 +659,7 @@ def test_gdb_loads_the_formatters_the_program_names(how):
 @pytest.mark.parametrize("how", PATHS)
 def test_debug_lines_writes_no_variables(how):
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _built(how, PROGRAM, "--debug=lines") / "prog.o")
+    entries = _entries(tool, _dwarf(how, PROGRAM, "--debug=lines"))
     assert not [tag for _, tag, _ in entries
                 if tag in ("DW_TAG_variable", "DW_TAG_formal_parameter")]
     assert any(tag == "DW_TAG_subprogram" for _, tag, _ in entries)
@@ -657,6 +671,8 @@ def test_the_macos_linker_records_the_object_in_the_debug_map(how):
     in the object, only for an object with a compile unit."""
     if not _darwin():
         pytest.skip("the debug map is Mach-O's")
+    if how == "exe":
+        pytest.skip("an executable boot writes carries its DWARF and needs no debug map")
     result = subprocess.run(["nm", "-ap", str(_built(how) / "prog")],
                             capture_output=True, text=True, check=True)
     assert re.search(r" OSO .*prog\.o$", result.stdout, re.MULTILINE), result.stdout[-2000:]
@@ -770,7 +786,7 @@ def test_atos_names_the_inlined_frames(how):
         pytest.skip("atos is macOS's")
     tool = _needs_dwarfdump()
     directory = _built(how, LOOP)
-    entries = _entries(tool, directory / "prog.o")
+    entries = _entries(tool, _dwarf(how, LOOP))
     assert any("DW_AT_ranges" in attributes for _, _, attributes in entries)
     # The entries around the first inlined `step`, innermost first.
     around: list[tuple[int, str, str]] = []

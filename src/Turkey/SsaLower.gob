@@ -3,27 +3,27 @@ export (
     lowerBind, lowerProgram, tagsOf, wrapTag, signatures, signatureOf,
 )
 
--- Core to the low IR.
---
--- Two things follow from this IR being an SSA graph rather than a linear
--- sequence, and both make this
--- shorter than its ancestor.
---
--- **Destination passing, into a block parameter.** An expression is lowered
--- *towards* somewhere: the function's return, or a block that takes its value
--- as a parameter. An `if` then needs no machinery at all -- both arms are
--- lowered towards the same destination and the merge block's parameter is
--- where they meet, which is what a phi would have been.
---
--- **No slots for what merely crosses an edge.** A definition dominates its
--- uses, so a value outliving a branch needs no memory; a slot is only what a
--- `var` genuinely needs.
---
--- Incomplete by construction, and says so: an unhandled Core form raises
--- `Unsupported` and the caller counts it. That is what makes this buildable in
--- slices against a corpus of real programs rather than in one attempt --
--- The `ssa` dump reports how much of each program lowered, and the verifier
--- decides whether what did is well formed.
+--- Core to the low IR.
+---
+--- Two things follow from this IR being an SSA graph rather than a linear
+--- sequence, and both make this
+--- shorter than its ancestor.
+---
+--- **Destination passing, into a block parameter.** An expression is lowered
+--- *towards* somewhere: the function's return, or a block that takes its value
+--- as a parameter. An `if` then needs no machinery at all -- both arms are
+--- lowered towards the same destination and the merge block's parameter is
+--- where they meet, which is what a phi would have been.
+---
+--- **No slots for what merely crosses an edge.** A definition dominates its
+--- uses, so a value outliving a branch needs no memory; a slot is only what a
+--- `var` genuinely needs.
+---
+--- Incomplete by construction, and says so: an unhandled Core form raises
+--- `Unsupported` and the caller counts it. That is what makes this buildable in
+--- slices against a corpus of real programs rather than in one attempt --
+--- The `ssa` dump reports how much of each program lowered, and the verifier
+--- decides whether what did is well formed.
 
 import System.Parallel as Parallel
 import Data.Map as Map
@@ -56,14 +56,14 @@ import Turkey.Ast (Lit(..))
 import Turkey.Bulk as Bulk
 import Iter
 
--- What is not lowered yet: the binding, and the form that stopped it.
--- Carried rather than thrown so a driver can report coverage over a corpus --
--- and the *reason* rather than only the count, because a histogram of reasons
--- is what says which form to write next.
---
--- `overLimit` marks a program past one of the runtime's limits (`refuse`).
--- That is the program's fault and `what` says what to change, where every
--- other reason is a form only a compiler bug leaves unlowered.
+--- What is not lowered yet: the binding, and the form that stopped it.
+--- Carried rather than thrown so a driver can report coverage over a corpus --
+--- and the *reason* rather than only the count, because a histogram of reasons
+--- is what says which form to write next.
+---
+--- `overLimit` marks a program past one of the runtime's limits (`refuse`).
+--- That is the program's fault and `what` says what to change, where every
+--- other reason is a form only a compiler bug leaves unlowered.
 type Unsupported = Unsupported {
     name      : String,
     what      : String,
@@ -71,68 +71,68 @@ type Unsupported = Unsupported {
     span      : Option Span,
 }
 
--- What a *direct* call passes and receives.
---
--- The closure ABI's leading environment is deliberately absent: this is the
--- natural signature, and the uniform one is derived from it where it is
--- needed. `turkey/backend_lower.py` asks the same question with
--- `held_at(expected, callee, decls)` -- the *callee's* abstracted layouts and
--- not the caller's, which is the whole point. A layout-shared copy holds its
--- parameters at the layouts its key names, so a caller that read them off its
--- own scheme would pass a value at a layout the copy does not hold it at.
+--- What a *direct* call passes and receives.
+---
+--- The closure ABI's leading environment is deliberately absent: this is the
+--- natural signature, and the uniform one is derived from it where it is
+--- needed. `turkey/backend_lower.py` asks the same question with
+--- `held_at(expected, callee, decls)` -- the *callee's* abstracted layouts and
+--- not the caller's, which is the whole point. A layout-shared copy holds its
+--- parameters at the layouts its key names, so a caller that read them off its
+--- own scheme would pass a value at a layout the copy does not hold it at.
 type Signature = Signature {
-    -- Per parameter, the registers it is passed in: its slots (`passedIn`),
-    -- or one pointer where the body needs its box (`boxParameters`).
+    --- Per parameter, the registers it is passed in: its slots (`passedIn`),
+    --- or one pointer where the body needs its box (`boxParameters`).
     params : Array (Array Rep),
-    -- The registers the result is answered in: a value of several slots in
-    -- its slots, one register each (`Ssa.Func.results`), and any other value
-    -- in the one register it is held in. A closure answers a value of several
-    -- slots as its box, so a closure over a function that answers in several
-    -- registers goes through an adapter that boxes them (`adaptClosures`).
+    --- The registers the result is answered in: a value of several slots in
+    --- its slots, one register each (`Ssa.Func.results`), and any other value
+    --- in the one register it is held in. A closure answers a value of several
+    --- slots as its box, so a closure over a function that answers in several
+    --- registers goes through an adapter that boxes them (`adaptClosures`).
     results : Array Rep,
-    -- Whether a saturated call never comes back: the body always reaches
-    -- `Prim.error` or another such call. Set by `signatures` once every
-    -- binding has an entry, since it is a fact about the call graph.
+    --- Whether a saturated call never comes back: the body always reaches
+    --- `Prim.error` or another such call. Set by `signatures` once every
+    --- binding has an entry, since it is a fact about the call graph.
     var diverges : Bool,
 }
 
--- The state one binding's lowering shares across every function it makes.
---
--- Records have reference semantics, so one of these passed to a parent and to
--- the nested `Lower`s its lambdas make is one object, which is what keeps the
--- symbols unique. Copying one would silently restart the counter.
+--- The state one binding's lowering shares across every function it makes.
+---
+--- Records have reference semantics, so one of these passed to a parent and to
+--- the nested `Lower`s its lambdas make is one object, which is what keeps the
+--- symbols unique. Copying one would silently restart the counter.
 type Lifting = Lifting {
-    -- Names one lifted lambda apart from the next. One per binding: a
-    -- lambda's symbol begins with its parent's name, which no other binding
-    -- shares, so a count of the binding's own lambdas is enough to keep them
-    -- apart -- and it does not depend on the order the bindings are lowered
-    -- in, which is any order (`lowerProgram`).
+    --- Names one lifted lambda apart from the next. One per binding: a
+    --- lambda's symbol begins with its parent's name, which no other binding
+    --- shares, so a count of the binding's own lambdas is enough to keep them
+    --- apart -- and it does not depend on the order the bindings are lowered
+    --- in, which is any order (`lowerProgram`).
     var next : Int,
-    -- The program's source files, which every position is numbered against.
+    --- The program's source files, which every position is numbered against.
     files : Position.Files,
-    -- Whether each function records the variables it binds
-    -- (`Func.variables`), for `-g`.
+    --- Whether each function records the variables it binds
+    --- (`Func.variables`), for `-g`.
     variables : Bool,
 }
 
--- A whole program's low IR: the functions, the storage the module initializer
--- writes, and the initializer's own name.
---
--- Globals are here rather than implied, because a global's *representation* is
--- not derivable from its name at the use site and both the initializer's store
--- and every `GlobalLoad` need it. It is also what the collector's permanent
--- root array is built from -- a pointer global is rooted for the life of the
--- program, so storing to it and rooting it are the same store.
+--- A whole program's low IR: the functions, the storage the module initializer
+--- writes, and the initializer's own name.
+---
+--- Globals are here rather than implied, because a global's *representation* is
+--- not derivable from its name at the use site and both the initializer's store
+--- and every `GlobalLoad` need it. It is also what the collector's permanent
+--- root array is built from -- a pointer global is rooted for the life of the
+--- program, so storing to it and rooting it are the same store.
 type Module = Module {
     var functions : Array (Ssa.Func Low),
     globals       : Vec (String, Rep),
-    -- The function that computes every global, in the order the program
-    -- requires. Called once before `main`.
+    --- The function that computes every global, in the order the program
+    --- requires. Called once before `main`.
     initial   : String,
-    -- Runs before roots, literals, and any managed allocation.
+    --- Runs before roots, literals, and any managed allocation.
     early     : String,
-    -- Each `foreign` definition that lowered, as (C symbol, function name),
-    -- sorted by symbol: what an emitter exports under a C-callable thunk.
+    --- Each `foreign` definition that lowered, as (C symbol, function name),
+    --- sorted by symbol: what an emitter exports under a C-callable thunk.
     definitions : Vec (String, String),
 }
 
@@ -490,9 +490,9 @@ fun argsFor(l : Lower, target : BlockId, values : Array Value) -> Vec Value {
 
 -- -- lowering -----------------------------------------------------------------------
 
--- `classes` are the program's classes, whose dictionaries are numbered beside
--- its constructors (`tagsOf`). `files` numbers the program's source files for
--- the positions every instruction carries.
+--- `classes` are the program's classes, whose dictionaries are numbered beside
+--- its constructors (`tagsOf`). `files` numbers the program's source files for
+--- the positions every instruction carries.
 fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String,
                  files : Position.Files, variables : Bool)
         -> (Module, Vec Unsupported) {
@@ -741,14 +741,15 @@ fun storageOf(program : CProgram, decls : DeclTable) -> Vec (String, Rep) {
     out
 }
 
--- What every top-level function is called at.
---
--- A pre-pass, because a call site is lowered before the callee's body may have
--- been: `lowerProgram` walks the bindings in whatever order the program lists
--- them, and a mutually recursive pair is ordinary. A binding that is not a
--- function has no entry, and that absence is what tells a call site it is
--- reaching a global that holds a closure rather than a symbol.
+--- What every top-level function is called at.
+---
+--- A binding that is not a function has no entry, and that absence is what
+--- tells a call site it is reaching a global that holds a closure rather than a
+--- symbol.
 fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
+    -- A pre-pass, because a call site is lowered before the callee's body may
+    -- have been: `lowerProgram` walks the bindings in whatever order the
+    -- program lists them, and a mutually recursive pair is ordinary.
     let out = Map.new()
     for bind in Vec.append(program.dicts, program.binds) {
         match signatureOf(decls, bind) {
@@ -1033,7 +1034,7 @@ fun divergingCall(sigs : Map String Signature, e : Core, fn : Core, args : Array
     }
 }
 
--- One binding's signature, keyed on *that binding's* layouts.
+--- One binding's signature, keyed on *that binding's* layouts.
 fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
     let shape = spine(bind.value)
     match shape {
@@ -1058,20 +1059,22 @@ fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
     Some(Signature { params = reps, results = passedIn(result), diverges = False })
 }
 
--- Every constructor's runtime tag: the whole program's constructor names in
--- order, numbered from zero.
---
--- Sorted rather than in declaration order, because declaration order is the
--- order the modules happened to be read in and a tag is written into a heap
--- object that outlives the compilation that made it. Nothing reads a tag by
--- name at run time; what matters is that one compilation agrees with itself,
--- and that the numbering does not move when an unrelated module gains a type.
---
--- The dictionaries too, numbered after every constructor, one per class. Their
--- tag is never tested -- a dictionary type has one shape -- but it is written
--- into the object, and a numbering that omitted them would give two different
--- dictionaries the same `-1`.
+--- Every constructor's runtime tag: the whole program's constructor names in
+--- order, numbered from zero.
+---
+--- Sorted rather than in declaration order, because declaration order is the
+--- order the modules happened to be read in and a tag is written into a heap
+--- object that outlives the compilation that made it.
+---
+--- The dictionaries too, numbered after every constructor, one per class.
 fun tagsOf(decls : DeclTable, classes : Array String) -> Map String Int {
+    -- Nothing reads a tag by name at run time; what matters is that one
+    -- compilation agrees with itself, and that the numbering does not move
+    -- when an unrelated module gains a type.
+    --
+    -- The dictionaries' tag is never tested -- a dictionary type has one shape
+    -- -- but it is written into the object, and a numbering that omitted them
+    -- would give two different dictionaries the same `-1`.
     let names = Array.append(Array.sort(Map.keys(decls.constructors)),
                              Array.map(Array.sort(classes), Core.dictName))
     let out = Map.new()
@@ -1079,8 +1082,8 @@ fun tagsOf(decls : DeclTable, classes : Array String) -> Map String Int {
     out
 }
 
--- One top-level binding: the function it became, the functions lifted out of
--- it, and the form that stopped it.
+--- One top-level binding: the function it became, the functions lifted out of
+--- it, and the form that stopped it.
 fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
               globalRefs : Map String Rep,
               tags : Map String Int,
@@ -2936,8 +2939,8 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
 -- one headerless heap value is a `var`'s cell, whose type `%Ref t` is internal
 -- and never instantiates a variable.
 
--- The tag of a wrap object. Declared constructors are numbered from 0 by
--- `tagsOf`, and tuples and closures carry -1.
+--- The tag of a wrap object. Declared constructors are numbered from 0 by
+--- `tagsOf`, and tuples and closures carry -1.
 let wrapTag = -2
 
 -- A wrap holds the one nested value.

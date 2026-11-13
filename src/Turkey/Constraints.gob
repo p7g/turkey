@@ -11,123 +11,123 @@ export (
     refusedHere,
 )
 
--- The constraint language, and the solver that settles it.
---
--- Inference is split the way HM(X) splits it: the generator walks the tree and
--- *builds* a constraint, deciding nothing and never looking a name up. This
--- module solves that constraint, and owns the two things solving needs: the type
--- environment, and the stack of pools that decides what generalizes.
---
--- A constraint names a binder by its id from `Turkey.Binders`, and the
--- environment is keyed by id. Resolution has already decided which binder each
--- occurrence means, so the environment needs no scopes: an id names one binder
--- wherever it appears, and shadowing cannot reach it.
---
---     t1 ~ t2            CEq         equality
---     P t                CPred       a predicate of the domain X
---     C1 and C2          CAnd        conjunction
---     exists a. C        CExists     variables generation invented
---     def x : t in C     CDef        monomorphic binding
---     let x = C1 in C2   CLet        generalize C1, bind the schemes, solve C2
---     x <= t             CInstance   a use site
---     forall k. Q => C   CAssume     an implication: the obligations a signature
---                                    grants, over the skolems it makes
---     evidence for P     CUse        a site that needs a dictionary it did not ask for
---     sigma <= sigma     CAmbiguity  a scheme some use can instantiate
---
--- **Ranks live here, not in the generator.** A variable's rank is the depth of
--- the binder it was created under, and `CLet` is where that depth changes -- so
--- the solver assigns ranks as it descends, and the generator never mentions
--- them. The pools are Remy's: one list of variables per rank, so that leaving a
--- rank is a walk over the variables born there rather than a scan of the
--- environment. Leaving rank r partitions its pool -- variables still at r are
--- quantified, and variables unification has lowered are *adopted* by the parent
--- pool.
---
--- `HasField` is Gaster & Jones's `r \ l` with the rows removed; in that shape it
--- is GHC's `HasField x r a | x r -> a`. Records here are nominal, so entailment
--- is a declaration lookup. Without rows a third argument would carry the
--- field's type, and two demands for one field would need an improvement rule
--- to agree; here `r.f` has the type `Field.f r`, so two reads are one type
--- expression and unification equates them unasked.
---
--- A class predicate is the fourth form. It is discharged from the instance
--- table, or from the assumptions a `CAssume` has in scope: checking an instance
--- method against its class's signature is the one place a predicate is *granted*
--- rather than proved, because the signature said so.
---
--- **Evidence is fixed when a class predicate is solved.** Each wanted carries
--- a hole (`Solved.Hole`), and the rule that discharges it fills the hole with
--- the derivation it used, at the types and under the givens it used them:
--- `classRule`, for a given, an instance or bottom. A predicate a binding
--- group retains is no exception: it is solved again under the group's
--- quantified predicates, whose dictionaries are the group's parameters
--- (`solveUnderScheme`). Nothing after solving looks a predicate up again, so
--- no later pass can find a different dictionary from the one solving
--- accepted (Schrijvers et al.,
--- "Type checking with open type functions", ICFP 2008, §5; GHC's evidence
--- bindings).
---
--- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
--- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
--- carries the skolems, so the implication's level is that `CLet`'s rank.
--- Three rules hold of it:
---
--- * **Nothing floats out of it.** Its body is solved against its givens, and
---   what is still inert when the body has been solved is its *residual*,
---   which stays in it, with its givens. The implication then stays nested in
---   the enclosing one (`Implication.children`, GHC's `wc_impl`) until a
---   unification outside wakes a wanted of the residual, which is then solved
---   in the implication again (`solveNested`). The paper's rule solve (Fig.
---   14) solves each implication completely and floats nothing; §5.6.1
---   describes floating as an extension it does not formalize, and GHC
---   replaced it with unifying in place (Note [Unification preconditions]:
---   "It's much easier to unify in-place, with no floating").
--- * **A residual reaches a scheme only through `approximate`**, GHC's
---   `approximateWC`: a binding group may quantify over a residual wanted that
---   mentions no skolem of the implications it is in, unless it is an
---   equality under an equality given (`retained`). A residual over the
---   implication's own rank that no scheme carries is reported by the split,
---   and one over an outer variable that mentions a skolem by `confine`, so
---   no outer variable is ever bound to a type built from a skolem.
--- * **An equality given makes outer variables untouchable.** While one is
---   in scope, `Ty.unify` binds no variable born outside the implication, and
---   defers the equation instead, which stays in the residual. Under
---   `F Bool ~ Int`, the outer `a` in `(g ~ Bool) => a ~ Int`, for a `g` from
---   outside the implication too, has two incomparable solutions, `Int` and
---   `F g`, and choosing one would be a guess the enclosing scope never sees
---   (OutsideIn(X), Example 5.1). Were `g` a skolem of the implication, the
---   given would be let-bound, as below. A
---   let-bound given such as `a ~ Int`, for a skolem `a` of the implication
---   itself, rewrites `a` away and adds no such choice, and neither does a
---   class given, so those leave every variable touchable (`hasGivenEqs`).
---
--- **The wanteds are solved by OutsideIn(X)'s simplifier** (§7, and §8.2 for
--- its shape): each implication has a work list and an inert set of wanteds,
--- and `solveSimples` moves wanteds from one to the other until the work list
--- is empty. See there for the loop, its fixpoint and its termination, and
--- `solveWanteds` for the expansion of the wanteds' superclasses around it.
---
--- **Equalities are rewrites, in two sets.** The equality givens in scope are
--- `inert`, a canonical substitution `Turkey.Inert` maintains, and a given that
--- can never hold is refused at its context. The inert wanted equalities of an
--- implication that can be rewrite rules are the second set, layered over the
--- first (`rewriteW`, `Inert.rewriteOver`). A wanted is rewritten by both
--- before any rule looks at it: that is how two wanted equalities interact and
--- how a given simplifies a wanted (Fig. 22 and 23). A given is rewritten only
--- by givens, inside `Turkey.Inert`, which no wanted ever enters. So a wanted
--- never rewrites a given, as §7.4.3 requires: "allowing given constraints to
--- contain evidence from wanted constraints can easily make the algorithm
--- sensitive to the order in which the rewrite rules fire". `unify`, during
--- generation, asks only the givens, and defers what they do not decide to
--- the work list, where the wanteds are asked too.
---
--- An associated family makes an *equation* deferrable, and it comes back as the
--- equality predicate `~`, which is why there is one work list here rather
--- than two. `OneOf` is the last predicate: the closed set of
--- types a numeric literal could have, settled by three rules -- a singleton set
--- is an equation, two sets over one type intersect, and a set nothing can
--- narrow further is defaulted.
+--- The constraint language, and the solver that settles it.
+---
+--- Inference is split the way HM(X) splits it: the generator walks the tree and
+--- *builds* a constraint, deciding nothing and never looking a name up. This
+--- module solves that constraint, and owns the two things solving needs: the type
+--- environment, and the stack of pools that decides what generalizes.
+---
+--- A constraint names a binder by its id from `Turkey.Binders`, and the
+--- environment is keyed by id. Resolution has already decided which binder each
+--- occurrence means, so the environment needs no scopes: an id names one binder
+--- wherever it appears, and shadowing cannot reach it.
+---
+---     t1 ~ t2            CEq         equality
+---     P t                CPred       a predicate of the domain X
+---     C1 and C2          CAnd        conjunction
+---     exists a. C        CExists     variables generation invented
+---     def x : t in C     CDef        monomorphic binding
+---     let x = C1 in C2   CLet        generalize C1, bind the schemes, solve C2
+---     x <= t             CInstance   a use site
+---     forall k. Q => C   CAssume     an implication: the obligations a signature
+---                                    grants, over the skolems it makes
+---     evidence for P     CUse        a site that needs a dictionary it did not ask for
+---     sigma <= sigma     CAmbiguity  a scheme some use can instantiate
+---
+--- **Ranks live here, not in the generator.** A variable's rank is the depth of
+--- the binder it was created under, and `CLet` is where that depth changes -- so
+--- the solver assigns ranks as it descends, and the generator never mentions
+--- them. The pools are Remy's: one list of variables per rank, so that leaving a
+--- rank is a walk over the variables born there rather than a scan of the
+--- environment. Leaving rank r partitions its pool -- variables still at r are
+--- quantified, and variables unification has lowered are *adopted* by the parent
+--- pool.
+---
+--- `HasField` is Gaster & Jones's `r \ l` with the rows removed; in that shape it
+--- is GHC's `HasField x r a | x r -> a`. Records here are nominal, so entailment
+--- is a declaration lookup. Without rows a third argument would carry the
+--- field's type, and two demands for one field would need an improvement rule
+--- to agree; here `r.f` has the type `Field.f r`, so two reads are one type
+--- expression and unification equates them unasked.
+---
+--- A class predicate is the fourth form. It is discharged from the instance
+--- table, or from the assumptions a `CAssume` has in scope: checking an instance
+--- method against its class's signature is the one place a predicate is *granted*
+--- rather than proved, because the signature said so.
+---
+--- **Evidence is fixed when a class predicate is solved.** Each wanted carries
+--- a hole (`Solved.Hole`), and the rule that discharges it fills the hole with
+--- the derivation it used, at the types and under the givens it used them:
+--- `classRule`, for a given, an instance or bottom. A predicate a binding
+--- group retains is no exception: it is solved again under the group's
+--- quantified predicates, whose dictionaries are the group's parameters
+--- (`solveUnderScheme`). Nothing after solving looks a predicate up again, so
+--- no later pass can find a different dictionary from the one solving
+--- accepted (Schrijvers et al.,
+--- "Type checking with open type functions", ICFP 2008, §5; GHC's evidence
+--- bindings).
+---
+--- **A `CAssume` is an implication** in OutsideIn(X)'s sense (Vytiniotis, Peyton
+--- Jones, Schrijvers and Sulzmann, JFP 2011). Its body is always a `CLet` that
+--- carries the skolems, so the implication's level is that `CLet`'s rank.
+--- Three rules hold of it:
+---
+--- * **Nothing floats out of it.** Its body is solved against its givens, and
+---   what is still inert when the body has been solved is its *residual*,
+---   which stays in it, with its givens. The implication then stays nested in
+---   the enclosing one (`Implication.children`, GHC's `wc_impl`) until a
+---   unification outside wakes a wanted of the residual, which is then solved
+---   in the implication again (`solveNested`). The paper's rule solve (Fig.
+---   14) solves each implication completely and floats nothing; §5.6.1
+---   describes floating as an extension it does not formalize, and GHC
+---   replaced it with unifying in place (Note [Unification preconditions]:
+---   "It's much easier to unify in-place, with no floating").
+--- * **A residual reaches a scheme only through `approximate`**, GHC's
+---   `approximateWC`: a binding group may quantify over a residual wanted that
+---   mentions no skolem of the implications it is in, unless it is an
+---   equality under an equality given (`retained`). A residual over the
+---   implication's own rank that no scheme carries is reported by the split,
+---   and one over an outer variable that mentions a skolem by `confine`, so
+---   no outer variable is ever bound to a type built from a skolem.
+--- * **An equality given makes outer variables untouchable.** While one is
+---   in scope, `Ty.unify` binds no variable born outside the implication, and
+---   defers the equation instead, which stays in the residual. Under
+---   `F Bool ~ Int`, the outer `a` in `(g ~ Bool) => a ~ Int`, for a `g` from
+---   outside the implication too, has two incomparable solutions, `Int` and
+---   `F g`, and choosing one would be a guess the enclosing scope never sees
+---   (OutsideIn(X), Example 5.1). Were `g` a skolem of the implication, the
+---   given would be let-bound, as below. A
+---   let-bound given such as `a ~ Int`, for a skolem `a` of the implication
+---   itself, rewrites `a` away and adds no such choice, and neither does a
+---   class given, so those leave every variable touchable (`hasGivenEqs`).
+---
+--- **The wanteds are solved by OutsideIn(X)'s simplifier** (§7, and §8.2 for
+--- its shape): each implication has a work list and an inert set of wanteds,
+--- and `solveSimples` moves wanteds from one to the other until the work list
+--- is empty. See there for the loop, its fixpoint and its termination, and
+--- `solveWanteds` for the expansion of the wanteds' superclasses around it.
+---
+--- **Equalities are rewrites, in two sets.** The equality givens in scope are
+--- `inert`, a canonical substitution `Turkey.Inert` maintains, and a given that
+--- can never hold is refused at its context. The inert wanted equalities of an
+--- implication that can be rewrite rules are the second set, layered over the
+--- first (`rewriteW`, `Inert.rewriteOver`). A wanted is rewritten by both
+--- before any rule looks at it: that is how two wanted equalities interact and
+--- how a given simplifies a wanted (Fig. 22 and 23). A given is rewritten only
+--- by givens, inside `Turkey.Inert`, which no wanted ever enters. So a wanted
+--- never rewrites a given, as §7.4.3 requires: "allowing given constraints to
+--- contain evidence from wanted constraints can easily make the algorithm
+--- sensitive to the order in which the rewrite rules fire". `unify`, during
+--- generation, asks only the givens, and defers what they do not decide to
+--- the work list, where the wanteds are asked too.
+---
+--- An associated family makes an *equation* deferrable, and it comes back as the
+--- equality predicate `~`, which is why there is one work list here rather
+--- than two. `OneOf` is the last predicate: the closed set of
+--- types a numeric literal could have, settled by three rules -- a singleton set
+--- is an equation, two sets over one type intersect, and a set nothing can
+--- narrow further is defaulted.
 
 import Data.Set as Set
 import Turkey.Classes as Classes
@@ -152,170 +152,170 @@ let oneOf = "OneOf"
 -- -- the tree ----------------------------------------------------------------------
 
 type Constraint
-    -- `left ~ right`. The equality fragment of the domain.
+    --- `left ~ right`. The equality fragment of the domain.
     = CEq(Ty.Type, Ty.Type, Option Span, String)
-    -- A predicate that must hold. The `String` names where the demand came
-    -- from, for a diagnostic if it turns out unsatisfiable. A field access's
-    -- predicate carries the verb instead -- "read" or "assign to" -- which is
-    -- the one thing about a field access the predicate itself does not record;
-    -- any other phrase is spliced into "expected ..., found ... in <phrase>".
-    -- Mutable, because the solver rewrites a predicate's arguments in place.
+    --- A predicate that must hold. The `String` names where the demand came
+    --- from, for a diagnostic if it turns out unsatisfiable. A field access's
+    --- predicate carries the verb instead -- "read" or "assign to" -- which is
+    --- the one thing about a field access the predicate itself does not record;
+    --- any other phrase is spliced into "expected ..., found ... in <phrase>".
+    --- Mutable, because the solver rewrites a predicate's arguments in place.
     | CPred(PredCell)
     | CAnd(Vec Constraint)
-    -- `exists vars. body` -- the variables generation invented under a binder.
-    -- This is how the generator hands the solver a set of variables without
-    -- knowing what rank they belong to. The solver stamps them on the way in.
+    --- `exists vars. body` -- the variables generation invented under a binder.
+    --- This is how the generator hands the solver a set of variables without
+    --- knowing what rank they belong to. The solver stamps them on the way in.
     | CExists(Vec VarCell, Constraint)
-    -- Bind binders to *types* -- monomorphically -- while solving the body.
-    -- Function parameters, `match` arm binders, and the placeholders of a
-    -- recursive group. Nothing is generalized, so nothing changes rank. Each
-    -- binder comes with its id and its name as the tree spells it. The flag
-    -- says the binders are top-level.
+    --- Bind binders to *types* -- monomorphically -- while solving the body.
+    --- Function parameters, `match` arm binders, and the placeholders of a
+    --- recursive group. Nothing is generalized, so nothing changes rank. Each
+    --- binder comes with its id and its name as the tree spells it. The flag
+    --- says the binders are top-level.
     | CDef(Vec (Int, String, Ty.Type), Constraint, Bool)
-    -- `let x = C1 in C2` for a group that is not generalized: a `let` the
-    -- value restriction keeps monomorphic, or a `fun` declared monomorphic.
-    -- Solve the definition, then bind as `CDef` does. Unlike a `CDef`
-    -- binder, one bound here may be closed (`solveMonoLet`).
+    --- `let x = C1 in C2` for a group that is not generalized: a `let` the
+    --- value restriction keeps monomorphic, or a `fun` declared monomorphic.
+    --- Solve the definition, then bind as `CDef` does. Unlike a `CDef`
+    --- binder, one bound here may be closed (`solveMonoLet`).
     | CMonoLet(Constraint, Vec (Int, String, Ty.Type), Constraint, Bool)
-    -- Bind binders to *schemes* already built, each with its id and spelling
-    -- as in `CDef`. The one binder whose schemes
-    -- solving does not discover: a `fun` with a complete annotation states its
-    -- own type, so the scheme is in scope from the group's first line, which is
-    -- what lets a recursive occurrence *instantiate* it. That is polymorphic
-    -- recursion, admissible here because the type was stated rather than
-    -- guessed.
+    --- Bind binders to *schemes* already built, each with its id and spelling
+    --- as in `CDef`. The one binder whose schemes
+    --- solving does not discover: a `fun` with a complete annotation states its
+    --- own type, so the scheme is in scope from the group's first line, which is
+    --- what lets a recursive occurrence *instantiate* it. That is polymorphic
+    --- recursion, admissible here because the type was stated rather than
+    --- guessed.
     | CBind(Vec (Int, String, Scheme), Constraint, Bool)
-    -- Solve the definition one rank deeper, generalize, bind the schemes, solve
-    -- the body. The single place generalization happens.
+    --- Solve the definition one rank deeper, generalize, bind the schemes, solve
+    --- the body. The single place generalization happens.
     | CLet(LetCell)
-    -- Solve the body with `givens` taken as facts: the implication described
-    -- at the top of this module. The body is a `CLet` whose skolems are the
-    -- implication's. The sources of assumptions are a *declared* type a body
-    -- is being checked against, where the instance's context, the method's
-    -- context and, for a default, the class's own predicate are facts; an
-    -- instance declaration, whose context its superclasses are proved under;
-    -- and the class context an existential pattern opens. An *equality*
-    -- introduced by a pattern is what makes GADTs destroy principal types,
-    -- and none is introduced here.
-    -- Each given comes with where a context at this site wrote it, or `None`
-    -- where none did: a class's method signature grants its context to every
-    -- override, and an existential pattern grants the class context its
-    -- constructor declares.
-    -- The `Option Pred` is the head of the instance whose declaration the
-    -- implication checks, if it checks one: GHC's `InstSkol` origin, which a
-    -- diagnostic about the instance's superclasses names.
+    --- Solve the body with `givens` taken as facts: the implication described
+    --- at the top of this module. The body is a `CLet` whose skolems are the
+    --- implication's. The sources of assumptions are a *declared* type a body
+    --- is being checked against, where the instance's context, the method's
+    --- context and, for a default, the class's own predicate are facts; an
+    --- instance declaration, whose context its superclasses are proved under;
+    --- and the class context an existential pattern opens. An *equality*
+    --- introduced by a pattern is what makes GADTs destroy principal types,
+    --- and none is introduced here.
+    --- Each given comes with where a context at this site wrote it, or `None`
+    --- where none did: a class's method signature grants its context to every
+    --- override, and an existential pattern grants the class context its
+    --- constructor declares.
+    --- The `Option Pred` is the head of the instance whose declaration the
+    --- implication checks, if it checks one: GHC's `InstSkol` origin, which a
+    --- diagnostic about the instance's superclasses names.
     | CAssume(Vec (String, Pred, Option Span), Option Pred, Constraint)
-    -- `name <= t`: instantiate a scheme at `t`. The generator emits this
-    -- instead of looking the name up, which is what lets it run without a type
-    -- environment at all. The name is the occurrence's spelling, for
-    -- diagnostics.
+    --- `name <= t`: instantiate a scheme at `t`. The generator emits this
+    --- instead of looking the name up, which is what lets it run without a type
+    --- environment at all. The name is the occurrence's spelling, for
+    --- diagnostics.
     | CInstance(String, Ty.Type, Option Span, Option Use, Instantiates)
-    -- A site whose predicates were emitted on their own, as `CPred`s sharing
-    -- the `Use`'s holes, but whose lowering needs the dictionaries that prove
-    -- them. Solving it demands nothing; it records the use and the scopes open
-    -- here. A field access is one: its predicates carry the verb a diagnostic
-    -- needs, and a use emitted through `CInstance` would re-emit them as reads.
+    --- A site whose predicates were emitted on their own, as `CPred`s sharing
+    --- the `Use`'s holes, but whose lowering needs the dictionaries that prove
+    --- them. Solving it demands nothing; it records the use and the scopes open
+    --- here. A field access is one: its predicates carry the verb a diagnostic
+    --- needs, and a use emitted through `CInstance` would re-emit them as reads.
     | CUse(Use)
-    -- Solve the body as one unit of diagnostics (`Diag.beginUnit`): after its
-    -- first error, the rest of what it reports is dropped. The generator puts
-    -- one around each top-level binding group's definition.
+    --- Solve the body as one unit of diagnostics (`Diag.beginUnit`): after its
+    --- first error, the rest of what it reports is dropped. The generator puts
+    --- one around each top-level binding group's definition.
     | CUnit(Constraint)
-    -- Check that a use of a declared scheme can be solved, and report the
-    -- scheme as ambiguous otherwise (`checkAmbiguity`). Solving it binds
-    -- nothing and leaves nothing behind.
+    --- Check that a use of a declared scheme can be solved, and report the
+    --- scheme as ambiguous otherwise (`checkAmbiguity`). Solving it binds
+    --- nothing and leaves nothing behind.
     | CAmbiguity(Ambiguity)
 
--- A scheme to check for ambiguity, and how to report it.
+--- A scheme to check for ambiguity, and how to report it.
 type Ambiguity = Ambiguity {
-    -- The binder whose scheme it is, as the tree spells it.
+    --- The binder whose scheme it is, as the tree spells it.
     name     : String,
     scheme   : Scheme,
-    -- Where the scheme was declared or inferred.
+    --- Where the scheme was declared or inferred.
     span     : Option Span,
-    -- Where a context wrote each of the scheme's predicates, by index, or
-    -- `None` for one no context wrote.
+    --- Where a context wrote each of the scheme's predicates, by index, or
+    --- `None` for one no context wrote.
     written  : Vec (Option Span),
-    -- The name each quantified variable was written with, by variable id.
-    -- An inferred scheme has none, and its variables are named as it is
-    -- printed.
+    --- The name each quantified variable was written with, by variable id.
+    --- An inferred scheme has none, and its variables are named as it is
+    --- printed.
     names    : Map Int String,
     inferred : Bool,
 }
 
--- A wanted keeps its identity while it moves between its implication's work
--- list and inert set, and is rewritten where it stands, so it is a record
--- rather than a variant field.
+--- A wanted keeps its identity while it moves between its implication's work
+--- list and inert set, and is rewritten where it stands, so it is a record
+--- rather than a variant field.
 type PredCell = PredCell {
     var pred : Pred,
     span     : Option Span,
     context  : String,
-    -- Where the evidence for a class predicate goes once it is discharged.
-    -- Unused for any other predicate.
+    --- Where the evidence for a class predicate goes once it is discharged.
+    --- Unused for any other predicate.
     hole     : Hole,
-    -- The innermost implication enclosing where the predicate arose, whose
-    -- givens alone may discharge it. `None` until the solver first meets it.
+    --- The innermost implication enclosing where the predicate arose, whose
+    --- givens alone may discharge it. `None` until the solver first meets it.
     var at   : Option Implication,
     var stage : Stage,
-    -- Unique to the cell, so that a list holding a cell twice can tell.
+    --- Unique to the cell, so that a list holding a cell twice can tell.
     serial   : Int,
-    -- When the cell first became inert, counted across the run; 0 until
-    -- then. A scheme lists its predicates in this order.
+    --- When the cell first became inert, counted across the run; 0 until
+    --- then. A scheme lists its predicates in this order.
     var stuck : Int,
-    -- How many instances deep below a wanted the program demanded this one
-    -- arose, and that wanted: GHC's reduction depth (`subGoalDepthExceeded`).
+    --- How many instances deep below a wanted the program demanded this one
+    --- arose, and that wanted: GHC's reduction depth (`subGoalDepthExceeded`).
     depth    : Int,
     root     : Pred,
-    -- Whether this is an equality superclass of a class wanted, or a part of
-    -- one, emitted only so that it may rewrite other wanteds
-    -- (`expandSuperclasses`). Nothing reads its evidence, it is never
-    -- quantified over, and what it would report is held back
-    -- (`Solver.suppressed`).
+    --- Whether this is an equality superclass of a class wanted, or a part of
+    --- one, emitted only so that it may rewrite other wanteds
+    --- (`expandSuperclasses`). Nothing reads its evidence, it is never
+    --- quantified over, and what it would report is held back
+    --- (`Solver.suppressed`).
     superclass : Bool,
-    -- Whether the superclasses of this class wanted have been expanded.
+    --- Whether the superclasses of this class wanted have been expanded.
     var expanded : Bool,
-    -- Whether this is a superclass of an instance's head that the
-    -- instance's declaration must prove: GHC's `ScOrigin NakedSc`, which a
-    -- diagnostic names (`missingSuperclass`). What an instance it is solved
-    -- by demands is not naked.
-    --
-    -- A naked wanted may be solved through any given's superclasses. No
-    -- class given of an instance's declaration is the dictionary being
-    -- built, so a superclass is never proved by the dictionary it belongs to
-    -- (Note [Recursive superclasses] in `GHC.Tc.TyCl.Instance`). A written
-    -- instance's class givens are smaller than its head
-    -- (`Classes.checkTermination`), except a `Typed` one, which is exempt:
-    -- `Typed` has no superclasses and no written instances. A derived
-    -- instance's givens are classes over its parameters, smaller by
-    -- construction.
+    --- Whether this is a superclass of an instance's head that the
+    --- instance's declaration must prove: GHC's `ScOrigin NakedSc`, which a
+    --- diagnostic names (`missingSuperclass`). What an instance it is solved
+    --- by demands is not naked.
+    ---
+    --- A naked wanted may be solved through any given's superclasses. No
+    --- class given of an instance's declaration is the dictionary being
+    --- built, so a superclass is never proved by the dictionary it belongs to
+    --- (Note [Recursive superclasses] in `GHC.Tc.TyCl.Instance`). A written
+    --- instance's class givens are smaller than its head
+    --- (`Classes.checkTermination`), except a `Typed` one, which is exempt:
+    --- `Typed` has no superclasses and no written instances. A derived
+    --- instance's givens are classes over its parameters, smaller by
+    --- construction.
     naked    : Bool,
-    -- Whether this arose below a naked wanted, from the instance that solved
-    -- it: its root is that superclass, and a diagnostic says so
-    -- (`superclassOrigin`).
+    --- Whether this arose below a naked wanted, from the instance that solved
+    --- it: its root is that superclass, and a diagnostic says so
+    --- (`superclassOrigin`).
     belowSuper : Bool,
-    -- The predicate as the cell was created, before solving rewrote it. An
-    -- equality's coercion has this type (`ByCoercion`).
+    --- The predicate as the cell was created, before solving rewrote it. An
+    --- equality's coercion has this type (`ByCoercion`).
     posed    : Pred,
-    -- If this is a wanted of a wrapper around a group's scheme (`exportOf`)
-    -- or one it reduced to, what a diagnostic says needs it: "'f' needs
-    -- from its recursive group". Otherwise "".
+    --- If this is a wanted of a wrapper around a group's scheme (`exportOf`)
+    --- or one it reduced to, what a diagnostic says needs it: "'f' needs
+    --- from its recursive group". Otherwise "".
     var exported : String,
 }
 
--- Where a wanted is in the solver.
+--- Where a wanted is in the solver.
 type Stage
-    -- On its implication's work list, or being solved.
+    --- On its implication's work list, or being solved.
     = Queued
-    -- In its implication's inert set: no rule applies to it until something
-    -- it mentions changes.
+    --- In its implication's inert set: no rule applies to it until something
+    --- it mentions changes.
     | Resting
-    -- Discharged, reported, or taken into a scheme.
+    --- Discharged, reported, or taken into a scheme.
     | Finished
 
 type Serials = Serials { var next : Int, var stuck : Int }
 
 let serials = Serials { next = 0, stuck = 0 }
 
--- Returns a wanted that `p` holds, with its evidence to go into `hole`.
+--- Returns a wanted that `p` holds, with its evidence to go into `hole`.
 fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> PredCell {
     serials.next = serials.next + 1
     PredCell {
@@ -325,8 +325,8 @@ fun newCell(p : Pred, where : Option Span, context : String, hole : Hole) -> Pre
     }
 }
 
--- Returns a wanted that `p`, a superclass of an instance's head, holds, which
--- the instance's declaration demands: a naked one (`PredCell.naked`).
+--- Returns a wanted that `p`, a superclass of an instance's head, holds, which
+--- the instance's declaration demands: a naked one (`PredCell.naked`).
 fun nakedCell(p : Pred, where : Option Span, context : String, hole : Hole) -> PredCell {
     serials.next = serials.next + 1
     PredCell {
@@ -371,67 +371,67 @@ let reductionDepth = 200
 fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
     cpredInto(p, newHole(), where, context)
 
--- Returns the constraint that `p` holds, with its evidence to go into `hole`.
+--- Returns the constraint that `p` holds, with its evidence to go into `hole`.
 fun cpredInto(p : Pred, hole : Hole, where : Option Span, context : String) -> Constraint =
     CPred(newCell(p, where, context, hole))
 
--- The givens of one `CAssume` together with those of every `CAssume` around
--- it: what a wanted that arose inside it may be discharged with.
---
--- A wanted is solved only under the givens of the implications that enclose
--- it: `entail` enters the wanted's own implication first. An outer wanted
--- solved while an inner signature's givens are in force would otherwise be
--- discharged by them, and its evidence would name a dictionary that is out of
--- scope where it is used (OutsideIn(X) keeps each wanted in its
--- implication's tree for the same reason).
+--- The givens of one `CAssume` together with those of every `CAssume` around
+--- it: what a wanted that arose inside it may be discharged with.
+---
+--- A wanted is solved only under the givens of the implications that enclose
+--- it: `entail` enters the wanted's own implication first. An outer wanted
+--- solved while an inner signature's givens are in force would otherwise be
+--- discharged by them, and its evidence would name a dictionary that is out of
+--- scope where it is used (OutsideIn(X) keeps each wanted in its
+--- implication's tree for the same reason).
 type Implication = Implication {
-    -- Unique per `CAssume` solved, and 0 for the top level, which has none.
+    --- Unique per `CAssume` solved, and 0 for the top level, which has none.
     id          : Int,
-    -- The class givens, innermost last, each under the name of its
-    -- dictionary, and the literal sets a scheme's context grants
-    -- (`givenSet`), under "". Never changed once made.
+    --- The class givens, innermost last, each under the name of its
+    --- dictionary, and the literal sets a scheme's context grants
+    --- (`givenSet`), under "". Never changed once made.
     assumptions : Vec (String, Pred),
-    -- The head of the instance whose declaration this implication checks, if
-    -- it checks one: GHC's `InstSkol` skolem info.
+    --- The head of the instance whose declaration this implication checks, if
+    --- it checks one: GHC's `InstSkol` skolem info.
     checks      : Option Pred,
-    -- The class givens and all their superclasses, rewritten by the equality
-    -- givens: what a wanted might yet match (`classRule`).
+    --- The class givens and all their superclasses, rewritten by the equality
+    --- givens: what a wanted might yet match (`classRule`).
     matchable   : Vec Pred,
-    -- The equality givens, canonical.
+    --- The equality givens, canonical.
     inert       : Inert.Inert,
-    -- The highest rank whose variables are untouchable: the rank a `CAssume`
-    -- was entered at whose givens include an equality that is not let-bound
-    -- (`hasGivenEqs`) or one that was refused, or `Ty.noScope` when no such
-    -- given is in scope.
+    --- The highest rank whose variables are untouchable: the rank a `CAssume`
+    --- was entered at whose givens include an equality that is not let-bound
+    --- (`hasGivenEqs`) or one that was refused, or `Ty.noScope` when no such
+    --- given is in scope.
     untouchable : Int,
-    -- The skolems this implication binds: GHC's `ic_skols`.
+    --- The skolems this implication binds: GHC's `ic_skols`.
     skolems     : Vec ConCell,
-    -- Whether its own givens make outer variables untouchable: GHC's
-    -- `ic_given_eqs` being `MaybeGivenEqs`.
+    --- Whether its own givens make outer variables untouchable: GHC's
+    --- `ic_given_eqs` being `MaybeGivenEqs`.
     givenEqs    : Bool,
-    -- The inert set its own equality givens made, if they made one, which
-    -- only it may close (`Inert.close`) and reopen.
+    --- The inert set its own equality givens made, if they made one, which
+    --- only it may close (`Inert.close`) and reopen.
     made        : Option Inert.Inert,
-    -- Whether its givens can never hold, so that nothing solved in it is
-    -- reported.
+    --- Whether its givens can never hold, so that nothing solved in it is
+    --- reported.
     muted       : Bool,
-    -- Whether a wanted no rule can discharge is reported where a rule finds
-    -- it. In a derivation's implication none is: it stays in the residual
-    -- for the derivation to judge (`simplifyDerived`), as every unsolved
-    -- wanted stays in GHC's, whose solver reports nothing itself.
+    --- Whether a wanted no rule can discharge is reported where a rule finds
+    --- it. In a derivation's implication none is: it stays in the residual
+    --- for the derivation to judge (`simplifyDerived`), as every unsolved
+    --- wanted stays in GHC's, whose solver reports nothing itself.
     reports     : Bool,
-    -- The binder of the declaration it checks, as the tree spells it, for a
-    -- diagnostic: `%sig.f` for a signature, `%opened` for a pattern.
+    --- The binder of the declaration it checks, as the tree spells it, for a
+    --- diagnostic: `%sig.f` for a signature, `%opened` for a pattern.
     owner       : String,
-    -- The implication it is nested in, if it is a `CAssume`'s.
+    --- The implication it is nested in, if it is a `CAssume`'s.
     parent      : Option Implication,
-    -- The wanteds of this implication still to be solved.
+    --- The wanteds of this implication still to be solved.
     work        : WorkList,
-    -- The wanteds of this implication that no rule applies to.
+    --- The wanteds of this implication that no rule applies to.
     wanted      : Inerts,
-    -- The implications nested in this one that ended with wanteds left:
-    -- GHC's `wc_impl`. Each is solved again when a unification wakes one of
-    -- its wanteds (`solveNested`), and is dropped once nothing is left in it.
+    --- The implications nested in this one that ended with wanteds left:
+    --- GHC's `wc_impl`. Each is solved again when a unification wakes one of
+    --- its wanteds (`solveNested`), and is dropped once nothing is left in it.
     var children : Vec Implication,
 }
 
@@ -519,76 +519,76 @@ type Inerts = Inerts {
     irreducibles : Map String PredCell,
 }
 
--- What a `CInstance` instantiates.
+--- What a `CInstance` instantiates.
 type Instantiates
-    -- The scheme bound to the binder with this id.
+    --- The scheme bound to the binder with this id.
     = OfBinder(Int)
-    -- This scheme, which no binder holds: an existential constructor with a
-    -- context is used like a constrained function.
+    --- This scheme, which no binder holds: an existential constructor with a
+    --- context is used like a constrained function.
     | OfScheme(Scheme)
 
--- The id of a binder a `CLet` or `CDef` binds only for its rank, or of a
--- generated class's method: no occurrence names one, and the environment
--- never holds one by id.
+--- The id of a binder a `CLet` or `CDef` binds only for its rank, or of a
+--- generated class's method: no occurrence names one, and the environment
+--- never holds one by id.
 let noBinder = -1
 
 type LetCell = LetCell {
-    -- Each binder's id, its name as the tree spells it, and its type.
+    --- Each binder's id, its name as the tree spells it, and its type.
     binds    : Vec (Int, String, Ty.Type),
     defn     : Constraint,
     body     : Constraint,
     span     : Option Span,
     topLevel : Bool,
     dicts    : Option Abstraction,
-    -- Skolems that live exactly as long as the definition's rank -- the
-    -- constants a signature's variables became. Carried here for the same reason
-    -- ranks are the solver's business at all: this is the one place that knows
-    -- how deep the definition sits, so this is where they can be stamped.
+    --- Skolems that live exactly as long as the definition's rank -- the
+    --- constants a signature's variables became. Carried here for the same reason
+    --- ranks are the solver's business at all: this is the one place that knows
+    --- how deep the definition sits, so this is where they can be stamped.
     skolems  : Vec ConCell,
-    -- The partial annotations in the group: each member's source spelling,
-    -- span, the variables its header wrote, and the context it wrote with
-    -- the span of each predicate, checked for rigidity when the group
-    -- generalizes.
+    --- The partial annotations in the group: each member's source spelling,
+    --- span, the variables its header wrote, and the context it wrote with
+    --- the span of each predicate, checked for rigidity when the group
+    --- generalizes.
     rigid    : Vec (String, Span, Vec (String, Ty.Type), Vec Ty.Pred, Vec Span),
-    -- Which binders may have a scheme that is a wrapper around the group's
-    -- (`exportOf`), and where each one is bound.
+    --- Which binders may have a scheme that is a wrapper around the group's
+    --- (`exportOf`), and where each one is bound.
     exporting : Exporting,
 }
 
--- The binders of a group that may be exports, GHC's `ABExport`s, with where
--- each is bound, in the order of `LetCell.binds`.
+--- The binders of a group that may be exports, GHC's `ABExport`s, with where
+--- each is bound, in the order of `LetCell.binds`.
 type Exporting
-    -- None: the group binds one name, or no name a program wrote.
+    --- None: the group binds one name, or no name a program wrote.
     = NoExports
-    -- A group of `fun`s, with where each binder's `fun` is.
+    --- A group of `fun`s, with where each binder's `fun` is.
     | FunExports(Vec Span)
-    -- A `let` whose pattern is not a variable, with where each binder is in
-    -- the pattern.
+    --- A `let` whose pattern is not a variable, with where each binder is in
+    --- the pattern.
     | PatternExports(Vec Span)
 
 -- -- the environment ---------------------------------------------------------------
 
 type Binding = Binding {
     scheme  : Scheme,
-    -- Declared with `var`, so assignable.
+    --- Declared with `var`, so assignable.
     mutable : Bool,
 }
 
 type Env = Env {
-    -- The binding of every binder in scope at the constraint being solved,
-    -- by id. A local leaves once the constraint that binds it is solved, so a
-    -- reference that outlives its binder is reported rather than read.
+    --- The binding of every binder in scope at the constraint being solved,
+    --- by id. A local leaves once the constraint that binds it is solved, so a
+    --- reference that outlives its binder is reported rather than read.
     binders : Map Int Binding,
-    -- Every top-level binding, class method and primitive by its internal
-    -- name, which the stages after inference look one up by.
+    --- Every top-level binding, class method and primitive by its internal
+    --- name, which the stages after inference look one up by.
     names   : Map String Binding,
 }
 
 fun newEnv() -> Env = Env { binders = Map.new(), names = Map.new() }
 
--- Binds the top-level binder `id`, internally named `name`, for good. With
--- `noBinder` for `id` -- a generated class's method, which no source
--- declares -- binds it by name only.
+--- Binds the top-level binder `id`, internally named `name`, for good. With
+--- `noBinder` for `id` -- a generated class's method, which no source
+--- declares -- binds it by name only.
 fun define(e : Env, id : Int, name : String, b : Binding) -> Unit {
     if id != noBinder { Map.put(e.binders, id, b) }
     Map.put(e.names, name, b)
@@ -602,8 +602,8 @@ fun unbind(e : Env, id : Int) -> Unit { let _ = Map.delete(e.binders, id) }
 -- Returns what the binder `id` is bound to.
 fun binding(e : Env, id : Int) -> Option Binding = Map.get(e.binders, id)
 
--- Returns the top-level binding, class method or primitive internally named
--- `name`.
+--- Returns the top-level binding, class method or primitive internally named
+--- `name`.
 fun lookup_(e : Env, name : String) -> Option Binding = Map.get(e.names, name)
 
 -- -- the solver --------------------------------------------------------------------
@@ -612,57 +612,57 @@ type Solver = Solver {
     decls           : DeclTable,
     classes         : ClassTable,
     env             : Env,
-    -- The value constructors in scope where a span is, by the module it is
-    -- in: a component of modules is solved in one run, and each of its
-    -- modules sees its own.
+    --- The value constructors in scope where a span is, by the module it is
+    --- in: a component of modules is solved in one run, and each of its
+    --- modules sees its own.
     visibleCons     : fun(Option Span) -> Set.Set String,
-    -- The implication being solved in: the innermost `CAssume` around the
-    -- constraint being solved, or around the wanted `entail` is solving.
-    -- Restored on the way out of each `CAssume`, which is what keeps a given
-    -- inside its implication.
+    --- The implication being solved in: the innermost `CAssume` around the
+    --- constraint being solved, or around the wanted `entail` is solving.
+    --- Restored on the way out of each `CAssume`, which is what keeps a given
+    --- inside its implication.
     var here        : Implication,
-    -- The top level, which has no givens, and around which every other
-    -- implication is nested.
+    --- The top level, which has no givens, and around which every other
+    --- implication is nested.
     root            : Implication,
-    -- How many `CAssume`s have been entered, for `Implication.id`.
+    --- How many `CAssume`s have been entered, for `Implication.id`.
     var entered     : Int,
-    -- Whether `solveSimples` is running, so that a rule which emits a
-    -- constraint only queues it.
+    --- Whether `solveSimples` is running, so that a rule which emits a
+    --- constraint only queues it.
     var draining    : Bool,
-    -- The wanted a rule is being applied to, whose subgoals are one level
-    -- deeper than it.
+    --- The wanted a rule is being applied to, whose subgoals are one level
+    --- deeper than it.
     var current     : Option PredCell,
-    -- For each unification variable, by id, the inert wanteds that mentioned
-    -- it when they entered their inert set. A cell that has left its set since
-    -- may still be listed.
+    --- For each unification variable, by id, the inert wanteds that mentioned
+    --- it when they entered their inert set. A cell that has left its set since
+    --- may still be listed.
     watchers        : Map Int (Vec PredCell),
-    -- The dictionary scopes open at the point being solved, innermost last. A
-    -- `Use` keeps the records rather than their contents, because what a binder
-    -- makes available is only known once its definition is solved.
+    --- The dictionary scopes open at the point being solved, innermost last. A
+    --- `Use` keeps the records rather than their contents, because what a binder
+    --- makes available is only known once its definition is solved.
     scopes          : Vec Scope,
     uses            : Vec Use,
-    -- `pools[r]` holds the variables born at rank r.
+    --- `pools[r]` holds the variables born at rank r.
     pools           : Vec (Vec VarCell),
-    -- Every binder that is not *closed*, with its name as the tree spells
-    -- it. A binder missing from it is closed: it is top-level or imported,
-    -- or let-bound with a scheme that mentions no type from the scopes
-    -- around it. A recursive group's own binders are in it while the group
-    -- is solved. Only a closed local group generalizes (`solveLet`).
-    -- Never pruned: binder ids are unique, so an entry whose binder has left
-    -- scope is never looked up again.
+    --- Every binder that is not *closed*, with its name as the tree spells
+    --- it. A binder missing from it is closed: it is top-level or imported,
+    --- or let-bound with a scheme that mentions no type from the scopes
+    --- around it. A recursive group's own binders are in it while the group
+    --- is solved. Only a closed local group generalizes (`solveLet`).
+    --- Never pruned: binder ids are unique, so an entry whose binder has left
+    --- scope is never looked up again.
     open            : Map Int String,
-    -- The binders of local groups that were not generalized because they are
-    -- not closed, and whose types have variables generalization would have
-    -- quantified.
+    --- The binders of local groups that were not generalized because they are
+    --- not closed, and whose types have variables generalization would have
+    --- quantified.
     refusals        : Map Int Refusal,
-    -- The refusals whose later uses `checkRefusals` has yet to check.
+    --- The refusals whose later uses `checkRefusals` has yet to check.
     var unchecked   : Vec Refusal,
-    -- The binders of the top-level group being solved.
+    --- The binders of the top-level group being solved.
     var solving     : Set.Set Int,
-    -- What `superclass` wanteds would have reported, in order, each with the
-    -- wanted as it was when it was tried: GHC's suppressed errors (Note
-    -- [ei_suppress: suppressing confusing errors]), reported only where no
-    -- other error says the same (`unsuppress`, `blame`).
+    --- What `superclass` wanteds would have reported, in order, each with the
+    --- wanted as it was when it was tried: GHC's suppressed errors (Note
+    --- [ei_suppress: suppressing confusing errors]), reported only where no
+    --- other error says the same (`unsuppress`, `blame`).
     var suppressed  : Vec (Diag.Diag, Pred),
 }
 
@@ -698,8 +698,8 @@ type Refusal = Refusal {
     later        : Vec (Ty.Type, Option Span),
 }
 
--- Returns a solver, and makes it the one `classes` simplifies a
--- derivation's wanteds with (`ClassTable.simplify`).
+--- Returns a solver, and makes it the one `classes` simplifies a
+--- derivation's wanteds with (`ClassTable.simplify`).
 fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : fun(Option Span) -> Set.Set String) -> Solver {
     let top = implication(classes, 0, [], None, Inert.empty(classes), Ty.noScope)
@@ -716,9 +716,9 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
     s
 }
 
--- The two operations unification needs from the solver, as the record
--- `Turkey.Types` asks for. A record of closures rather than an interface, which
--- is what keeps the dependency pointing one way.
+--- The two operations unification needs from the solver, as the record
+--- `Turkey.Types` asks for. A record of closures rather than an interface, which
+--- is what keeps the dependency pointing one way.
 fun families(s : Solver) -> Option Ty.Families = Some(Ty.Families {
     reduce = fun(t) = reduceFam(s, t),
     defer = fun(a, b, sp, ctx) = defer(s, a, b, sp, ctx),
@@ -730,16 +730,16 @@ fun families(s : Solver) -> Option Ty.Families = Some(Ty.Families {
 
 fun rank(s : Solver) -> Int = len(s.pools) - 1
 
--- A variable at the current rank, recorded in the current pool.
+--- A variable at the current rank, recorded in the current pool.
 fun fresh(s : Solver) -> VarCell {
     let v = Ty.freshVar(rank(s))
     Vec.push(s.pools[len(s.pools) - 1], v)
     v
 }
 
--- Take responsibility for variables generation invented. They were created
--- without a rank -- generation has no idea what rank it is under -- so they are
--- stamped and pooled here.
+--- Take responsibility for variables generation invented. They were created
+--- without a rank -- generation has no idea what rank it is under -- so they are
+--- stamped and pooled here.
 fun adopt(s : Solver, vars : Vec VarCell) -> Unit {
     for v in vars {
         v.level = rank(s)
@@ -827,40 +827,39 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
 -- derived instance (`Classes.derive`) whose own constraint the generator
 -- has to build, and that constraint joins the run between those steps.
 
--- Solves `c` and every wanted it leaves, as far as they go before defaulting.
+--- Solves `c` and every wanted it leaves, as far as they go before defaulting.
 fun solveMore(s : Solver, c : Constraint) -> Unit {
     solve(s, c)
     solveWanteds(s)
 }
 
--- Checks the refusals made at the outermost rank, in a top-level `let` the
--- value restriction keeps monomorphic, which have no group of their own to
--- check them, and solves what that leaves.
+--- Checks the refusals made at the outermost rank, in a top-level `let` the
+--- value restriction keeps monomorphic, which have no group of their own to
+--- check them, and solves what that leaves.
 fun solveRefusals(s : Solver) -> Unit {
     if checkRefusals(s, 0) { solveWanteds(s) }
 }
 
--- Takes one round of defaults at the outermost boundary, and solves what it
--- leaves. Returns whether anything took a default.
---
--- Nothing further can narrow what is left at the outermost boundary, so
--- anything still open that has a default takes it, and the rest is an error
--- (`finish`).
---
--- A run is one component of modules that import each other -- most often a
--- single module. So a top-level binding the value restriction keeps
--- monomorphic has its literals and class constraints settled by the uses in
--- its own component, and a module that imports it from outside, checked in a
--- later run, is too late to decide them. Its plain type variables are another
--- matter: only an equality that an equality given left stuck decides one here
--- (`defaultEqualities`), so the rest stay open in the shared environment and
--- an importer's uses fix them.
---
--- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
--- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal whose
--- type an equality decides takes that type, not the default.
+--- Takes one round of defaults at the outermost boundary, and solves what it
+--- leaves. Returns whether anything took a default.
+---
+--- Nothing further can narrow what is left at the outermost boundary, so
+--- anything still open that has a default takes it, and the rest is an error
+--- (`finish`).
+---
+--- A run is one component of modules that import each other -- most often a
+--- single module. So a top-level binding the value restriction keeps
+--- monomorphic has its literals and class constraints settled by the uses in
+--- its own component, and a module that imports it from outside, checked in a
+--- later run, is too late to decide them. Its plain type variables are another
+--- matter: only an equality that an equality given left stuck decides one here
+--- (`defaultEqualities`), so the rest stay open in the shared environment and
+--- an importer's uses fix them.
 fun defaultOnce(s : Solver) -> Bool {
     let open = everywhere(s.here)
+    -- Equalities are defaulted before literals, as GHC's `tryDefaulting` runs
+    -- `tryConstraintDefaulting` before `tryTypeClassDefaulting`: a literal
+    -- whose type an equality decides takes that type, not the default.
     if defaultEqualities(s, open) || len(open) > 0 && applyDefaults(s, open, open, Vec.new(1)) {
         solveWanteds(s)
         True
@@ -869,8 +868,8 @@ fun defaultOnce(s : Solver) -> Bool {
     }
 }
 
--- Reports what is still open at the outermost boundary, once defaulting is
--- done, and releases the errors held back until then.
+--- Reports what is still open at the outermost boundary, once defaulting is
+--- done, and releases the errors held back until then.
 fun finish(s : Solver) -> Unit {
     rejectStranded(s, everywhere(s.here))
     if !Diag.hasErrors() { discard(unsuppress(s, 0)) }
@@ -1025,10 +1024,10 @@ fun assume(s : Solver, givens : Vec (String, Pred, Option Span), head : Option P
     if unsolved(inside) { Vec.push(outside.children, inside) }
 }
 
--- Reports the refusal `r` of an implication's given where its context wrote
--- it, and returns whether it instead makes the implication inaccessible: a
--- given that can never hold and that no context here wrote. The implication
--- checks the declaration at `where`.
+--- Reports the refusal `r` of an implication's given where its context wrote
+--- it, and returns whether it instead makes the implication inaccessible: a
+--- given that can never hold and that no context here wrote. The implication
+--- checks the declaration at `where`.
 fun refusedHere(r : Inert.Refusal, where : Option Span) -> Bool = match r {
     Never(g, why) -> match g.span {
         Some(_) -> {

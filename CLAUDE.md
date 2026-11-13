@@ -146,11 +146,13 @@ this file a year from now? If it is about the past, it belongs in a commit
 message. If it is about work not done, it belongs in a ticket.
 
 **Doc comments.** Use `---` for the comment a caller reads, directly above an
-exported declaration, field, constructor, method or instance, or as the
-module's first comment; `boot doc` publishes these and nothing else. Start it
-with a verb and state only guarantees. Keep the rationale for how the code
-works in `--` comments inside the body. A `---` comment anywhere else
-documents nothing (`docs/ref/lexical.md`, "Doc comments").
+exported declaration, field, constructor, method, associated type or instance;
+`boot doc` publishes these and nothing else. A module's own `---` comment goes
+before its first declaration with a blank line under it, since one directly
+above a declaration documents that declaration. Start it with a verb and state
+only guarantees. Keep the rationale for how the code works in `--` comments
+inside the body. A `---` comment anywhere else documents nothing
+(`docs/ref/lexical.md`, "Doc comments").
 
 ## Tickets
 

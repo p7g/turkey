@@ -393,7 +393,8 @@ sh scripts/docs.sh
 ```
 
 That writes `build/docs/index.html`, one self-contained file to open in a
-browser, along with the JSON it is built from.
+browser, along with the JSON it is built from. The same page is published to
+<https://p7g.github.io/turkey/> from `main` by `.github/workflows/docs.yml`.
 
 ## Project status
 

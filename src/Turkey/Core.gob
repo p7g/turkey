@@ -14,49 +14,49 @@ export (
     showExpr, showBind, showProgram,
 )
 
--- The typed Core IR.
---
--- This module holds the shape and a printer, and no construction logic at all:
--- `Turkey.Lower` builds it and `Turkey.Coretc` checks it, so what is written
--- here can be read as a specification rather than as the incidental output of a
--- pass.
---
--- ## What Core makes explicit, and what it leaves alone
---
--- Three things, and only three. **Types**: every node carries the one inference
--- gave it. **Dictionaries**: a class becomes a record type, an instance becomes a
--- top-level binding of that type, and evidence becomes ordinary term syntax -- a
--- variable, an application, a field projection. **Polymorphism**: a generalized
--- binding becomes a type abstraction and every use of it a type application.
---
--- Everything else keeps the shape it had, with one exception. `CIf` and `CMatch`
--- are the surface constructs they always were, but there is no node here for a
--- loop and none for a control transfer: `while`, `loop`, the C-style `for` and
--- `for ... in` are all `CJoin`, and `return`, `break` and `continue` are all
--- `CJump`. That is what "unrepresentable" means -- not that no pass emits one,
--- but that there is nothing to emit.
---
--- ## The one thing that is not a translation
---
--- Core has **no statements**. A block is nested `CLet`s, and the value of a
--- block is the body of the innermost one; sequencing is a `CLet` whose name
--- nothing reads. This is what lets the checker be a walk with one rule per node
--- instead of a walk plus a separate statement discipline, and a checker simple
--- enough to trust is the entire point of the milestone.
---
--- ## `var` is a reference cell
---
--- `let` is an immutable binding and is a plain `CLet`. `var` is mutable, and it
--- gets *capture by reference*: a lambda that writes a captured `var` writes
--- through to the original. So a `var` lowers to a cell -- `CRef` makes one,
--- `CDeref` reads it, `CAssign` writes it, and its type is `%Ref t`. Capture is
--- then by value of a reference, stated in the IR where a checker can see it
--- rather than left to the representation of a scope.
---
--- The node shape is `Turkey.Ast`'s: a record carrying the type and the span,
--- around an immutable variant carrying the form. Repeating the type and span in
--- thirty variants would be the alternative, and every walk would have to take
--- them apart thirty ways.
+--- The typed Core IR.
+---
+--- This module holds the shape and a printer, and no construction logic at all:
+--- `Turkey.Lower` builds it and `Turkey.Coretc` checks it, so what is written
+--- here can be read as a specification rather than as the incidental output of a
+--- pass.
+---
+--- ## What Core makes explicit, and what it leaves alone
+---
+--- Three things, and only three. **Types**: every node carries the one inference
+--- gave it. **Dictionaries**: a class becomes a record type, an instance becomes a
+--- top-level binding of that type, and evidence becomes ordinary term syntax -- a
+--- variable, an application, a field projection. **Polymorphism**: a generalized
+--- binding becomes a type abstraction and every use of it a type application.
+---
+--- Everything else keeps the shape it had, with one exception. `CIf` and `CMatch`
+--- are the surface constructs they always were, but there is no node here for a
+--- loop and none for a control transfer: `while`, `loop`, the C-style `for` and
+--- `for ... in` are all `CJoin`, and `return`, `break` and `continue` are all
+--- `CJump`. That is what "unrepresentable" means -- not that no pass emits one,
+--- but that there is nothing to emit.
+---
+--- ## The one thing that is not a translation
+---
+--- Core has **no statements**. A block is nested `CLet`s, and the value of a
+--- block is the body of the innermost one; sequencing is a `CLet` whose name
+--- nothing reads. This is what lets the checker be a walk with one rule per node
+--- instead of a walk plus a separate statement discipline, and a checker simple
+--- enough to trust is the entire point of the milestone.
+---
+--- ## `var` is a reference cell
+---
+--- `let` is an immutable binding and is a plain `CLet`. `var` is mutable, and it
+--- gets *capture by reference*: a lambda that writes a captured `var` writes
+--- through to the original. So a `var` lowers to a cell -- `CRef` makes one,
+--- `CDeref` reads it, `CAssign` writes it, and its type is `%Ref t`. Capture is
+--- then by value of a reference, stated in the IR where a checker can see it
+--- rather than left to the representation of a scope.
+---
+--- The node shape is `Turkey.Ast`'s: a record carrying the type and the span,
+--- around an immutable variant carrying the form. Repeating the type and span in
+--- thirty variants would be the alternative, and every walk would have to take
+--- them apart thirty ways.
 
 import Data.Set as Set
 import Turkey.Ast (..)
@@ -69,8 +69,8 @@ import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Namer(..), TVar, TCon, TApp)
 import Iter
 
--- The reference-cell constructor. `%` cannot start a source identifier, so this
--- can never collide with a declared type, and no program can write it.
+--- The reference-cell constructor. `%` cannot start a source identifier, so this
+--- can never collide with a declared type, and no program can write it.
 let refName = "%Ref"
 
 fun refCon() -> Ty.Type = Ty.tcon(refName, KFun(KStar, KStar), Ty.noScope)
@@ -92,94 +92,94 @@ fun refElem(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
 
 -- -- terms --------------------------------------------------------------------------
 
--- Every Core node carries its type. That is what "typed" means here.
+--- Every Core node carries its type. That is what "typed" means here.
 type Core = Core {
     var ty : Ty.Type,
     span   : Option Span,
     kind   : CoreKind,
-    -- The run of `Turkey.Opt` that left this node, and everything under it,
-    -- at a fixed point, so that the run does not reduce it again; 0 if none
-    -- has. Every node starts at 0, so a copy or a rebuilt node is reduced
-    -- again. No other pass reads it.
+    --- The run of `Turkey.Opt` that left this node, and everything under it,
+    --- at a fixed point, so that the run does not reduce it again; 0 if none
+    --- has. Every node starts at 0, so a copy or a rebuilt node is reduced
+    --- again. No other pass reads it.
     var settledIn : Int,
 }
 
 fun mkCore(ty : Ty.Type, span : Option Span, kind : CoreKind) -> Core =
     Core { ty = ty, span = span, kind = kind, settledIn = 0 }
 
--- A binder carries a spelling and an id. A binder with an id is found by the
--- id, and its spelling is only what a dump prints it as: two binders of one
--- binding may share one. The id may be one `Turkey.Binders` keeps no record
--- of, which is why the spelling stays on the binder. Every local binder has
--- an id, and `Turkey.Coretc` refuses one without. A binder with no id is a
--- top-level binding, found by its `Module#name`, which is unique and is its
--- symbol.
+--- A binder carries a spelling and an id. A binder with an id is found by the
+--- id, and its spelling is only what a dump prints it as: two binders of one
+--- binding may share one. The id may be one `Turkey.Binders` keeps no record
+--- of, which is why the spelling stays on the binder. Every local binder has
+--- an id, and `Turkey.Coretc` refuses one without. A binder with no id is a
+--- top-level binding, found by its `Module#name`, which is unique and is its
+--- symbol.
 type CParam = CParam {
     name : String,
     id   : Int,
     ty   : Ty.Type,
 }
 
--- The id a top-level binding carries when `Turkey.Binders` has no record of
--- it: an instance's dictionary, a default method, or a binding a pass after
--- `Turkey.Lower` made.
+--- The id a top-level binding carries when `Turkey.Binders` has no record of
+--- it: an instance's dictionary, a default method, or a binding a pass after
+--- `Turkey.Lower` made.
 let noId = -1
 
--- What a reference refers to: a local binder by its id, or a top-level
--- binding by its spelling, even where the binding has an id, because the
--- passes after the lowering find top-level bindings by name. A reference
--- carries no spelling of its own beside an id: a dump prints it as its
--- binder.
+--- What a reference refers to: a local binder by its id, or a top-level
+--- binding by its spelling, even where the binding has an id, because the
+--- passes after the lowering find top-level bindings by name. A reference
+--- carries no spelling of its own beside an id: a dump prints it as its
+--- binder.
 type Ref = ById(Int) | BySpelling(String)
 
--- Returns the reference that finds the binder spelled `name` with the id `id`.
+--- Returns the reference that finds the binder spelled `name` with the id `id`.
 fun refTo(name : String, id : Int) -> Ref = if id == noId { BySpelling(name) } else { ById(id) }
 
--- Returns the id `r` finds its binder by, or `noId` for one by spelling.
+--- Returns the id `r` finds its binder by, or `noId` for one by spelling.
 fun binderId(r : Ref) -> Int = match r {
     ById(id) -> id
     BySpelling(_) -> noId
 }
 
--- Returns the spelling `r` finds its binder by, or `None` for one by id.
+--- Returns the spelling `r` finds its binder by, or `None` for one by id.
 fun spellingOf(r : Ref) -> Option String = match r {
     BySpelling(name) -> Some(name)
     ById(_) -> None
 }
 
--- One arm. What its test *binds*, and at what types, is deliberately not
--- recorded: the checker derives it from the scrutinee's type and the
--- constructor's declaration, which makes it a check rather than a restatement.
+--- One arm. What its test *binds*, and at what types, is deliberately not
+--- recorded: the checker derives it from the scrutinee's type and the
+--- constructor's declaration, which makes it a check rather than a restatement.
 type CAlt = CAlt {
     alt  : Alt,
     body : Core,
 }
 
--- What one arm tests: a single level of a pattern, never a nested one.
---
--- Source patterns nest, and `Turkey.Match` compiles them into nested `match`es
--- over these as `Turkey.Lower` builds Core, so no pass from the checker on can
--- meet a nested pattern: there is no way to write one here. A part an arm
--- ignores is `None`.
+--- What one arm tests: a single level of a pattern, never a nested one.
+---
+--- Source patterns nest, and `Turkey.Match` compiles them into nested `match`es
+--- over these as `Turkey.Lower` builds Core, so no pass from the checker on can
+--- meet a nested pattern: there is no way to write one here. A part an arm
+--- ignores is `None`.
 type Alt
-    -- A constructor and a binder per field, in declaration order -- a record's
-    -- too -- and, for an existential, what it opens.
+    --- A constructor and a binder per field, in declaration order -- a record's
+    --- too -- and, for an existential, what it opens.
     = ACon(String, Array (Option (String, Int)), Option Opened)
     | ATuple(Array (Option (String, Int)))
     | ALit(Ast.Lit)
-    -- Anything at all, binding the whole scrutinee when named.
+    --- Anything at all, binding the whole scrutinee when named.
     | AAny(Option (String, Int))
 
--- What an arm opening an existential binds besides its fields: a binder for
--- each dictionary the constructor carries, the rigid constants that stand for
--- its hidden types, and, once `Turkey.Layout` has copied the arm, the layouts
--- this copy is for.
---
--- Its own record, not the `Turkey.Ast.Opening` inference left on the pattern,
--- because the binders belong to the arm and not to the pattern. Inference
--- names a pattern's dictionaries once, but the lowering may lower a pattern
--- more than once, and each lowering binds them under ids of its own, as it
--- does the fields'.
+--- What an arm opening an existential binds besides its fields: a binder for
+--- each dictionary the constructor carries, the rigid constants that stand for
+--- its hidden types, and, once `Turkey.Layout` has copied the arm, the layouts
+--- this copy is for.
+---
+--- Its own record, not the `Turkey.Ast.Opening` inference left on the pattern,
+--- because the binders belong to the arm and not to the pattern. Inference
+--- names a pattern's dictionaries once, but the lowering may lower a pattern
+--- more than once, and each lowering binds them under ids of its own, as it
+--- does the fields'.
 type Opened = Opened {
     evidence : Array (String, Int),
     skolems  : Vec ConCell,
@@ -189,127 +189,127 @@ type Opened = Opened {
 type CoreKind
     = CLit(Ast.Lit)
     | CUnit
-    -- A term variable: a local, a top-level binding, or a dictionary. A
-    -- dictionary is not a separate form -- that is the milestone's whole claim:
-    -- evidence became a value, so it is fetched the way any other value is.
+    --- A term variable: a local, a top-level binding, or a dictionary. A
+    --- dictionary is not a separate form -- that is the milestone's whole claim:
+    --- evidence became a value, so it is fetched the way any other value is.
     | CVar(Ref)
-    -- A data constructor, referred to but not yet applied.
+    --- A data constructor, referred to but not yet applied.
     | CCon(String)
-    -- A machine operation. The resolver's `Prim.` spelling becomes this once,
-    -- in lowering, and no pass after it compares a primitive's name.
+    --- A machine operation. The resolver's `Prim.` spelling becomes this once,
+    --- in lowering, and no pass after it compares a primitive's name.
     | CPrim(Prims.Prim)
     | CTuple(Array Core)
     | CArray(Array Core)
-    -- A dictionary of the named class: its slots, in the order
-    -- `Classes.dictSlots` gives them. Not a constructor application, because a
-    -- slot may hold a method polymorphic in its own variables, and no
-    -- constructor's field has a type with variables of its own.
+    --- A dictionary of the named class: its slots, in the order
+    --- `Classes.dictSlots` gives them. Not a constructor application, because a
+    --- slot may hold a method polymorphic in its own variables, and no
+    --- constructor's field has a type with variables of its own.
     | CDict(String, Array Core)
-    -- One slot of a dictionary, by position. A method selection and a
-    -- superclass selection are both this, which is the point: they were two
-    -- shapes of evidence and are one shape of term.
+    --- One slot of a dictionary, by position. A method selection and a
+    --- superclass selection are both this, which is the point: they were two
+    --- shapes of evidence and are one shape of term.
     | CSlot(Core, Int)
     | CProject(Core, Int)
     | CIndex(Core, Core)
     | CLam(Array CParam, Core, String)
     | CApp(Core, Array Core)
-    -- Type abstraction. The binders are the scheme's own quantified variables,
-    -- used as binders directly -- a variable is already a distinct identity, and
-    -- reusing the scheme's means the type arguments a use site recorded line up
-    -- with no separate agreement to keep.
+    --- Type abstraction. The binders are the scheme's own quantified variables,
+    --- used as binders directly -- a variable is already a distinct identity, and
+    --- reusing the scheme's means the type arguments a use site recorded line up
+    --- with no separate agreement to keep.
     | CTyLam(Vec VarCell, Core)
     | CTyApp(Core, Array Ty.Type)
-    -- `let name : ty = value in body`. The only sequencing form there is. The
-    -- name may be one nothing reads, which is how a statement whose value is
-    -- discarded is expressed. A `let` generalizes, so a local binding may be
-    -- polymorphic and its uses may be type applications.
+    --- `let name : ty = value in body`. The only sequencing form there is. The
+    --- name may be one nothing reads, which is how a statement whose value is
+    --- discarded is expressed. A `let` generalizes, so a local binding may be
+    --- polymorphic and its uses may be type applications.
     | CLet(String, Int, Ty.Type, Core, Core, Vec VarCell)
-    -- A binding group that may refer to itself and to its siblings. One form for
-    -- the whole group rather than one per name, because that is what a
-    -- strongly-connected component is and what the dictionary abstraction is
-    -- shared over.
+    --- A binding group that may refer to itself and to its siblings. One form for
+    --- the whole group rather than one per name, because that is what a
+    --- strongly-connected component is and what the dictionary abstraction is
+    --- shared over.
     | CLetRec(Vec CBind, Core)
-    -- `join j(params) = body in rest` -- a label, not a function.
-    --
-    -- A join point is a `let`-bound continuation that is only ever *jumped* to:
-    -- every mention is a saturated call in tail position, and none of them
-    -- escapes. That is what makes it compilable as a label rather than as a
-    -- closure. It is a distinct node rather than a flag, and a jump is a
-    -- distinct node rather than a call, because the restriction is the point: a
-    -- walker that has not been taught about these fails loudly, where one that
-    -- has not been taught about a flag is silently wrong.
-    --
-    -- The `Bool` says whether the body may jump to the join itself -- a loop
-    -- compiled as a label. A non-recursive join is the case-of-case
-    -- duplication: one continuation, several branches reaching it.
+    --- `join j(params) = body in rest` -- a label, not a function.
+    ---
+    --- A join point is a `let`-bound continuation that is only ever *jumped* to:
+    --- every mention is a saturated call in tail position, and none of them
+    --- escapes. That is what makes it compilable as a label rather than as a
+    --- closure. It is a distinct node rather than a flag, and a jump is a
+    --- distinct node rather than a call, because the restriction is the point: a
+    --- walker that has not been taught about these fails loudly, where one that
+    --- has not been taught about a flag is silently wrong.
+    ---
+    --- The `Bool` says whether the body may jump to the join itself -- a loop
+    --- compiled as a label. A non-recursive join is the case-of-case
+    --- duplication: one continuation, several branches reaching it.
     | CJoin(String, Int, Array CParam, Core, Core, Bool)
-    -- `jump j(args)`. Typed `!`: it never yields to its context, which is why it
-    -- needs no type of its own beyond bottom, and why a branch that jumps stays
-    -- compatible with a branch that does not.
+    --- `jump j(args)`. Typed `!`: it never yields to its context, which is why it
+    --- needs no type of its own beyond bottom, and why a branch that jumps stays
+    --- compatible with a branch that does not.
     | CJump(Ref, Vec Core)
-    -- Make a reference cell. What a `var` binding is.
+    --- Make a reference cell. What a `var` binding is.
     | CRef(Core)
-    -- Read a reference cell. What a mention of a `var` is.
+    --- Read a reference cell. What a mention of a `var` is.
     | CDeref(Core)
-    -- Write a reference cell, an array slot, or a `var` record field. All
-    -- three are assignment in the surface language and all three are reference
-    -- semantics, so they are one node with three shapes of target.
+    --- Write a reference cell, an array slot, or a `var` record field. All
+    --- three are assignment in the surface language and all three are reference
+    --- semantics, so they are one node with three shapes of target.
     | CAssign(Core, Core)
     | CIf(Core, Core, Option Core)
-    -- Pattern matching, one level at a time; see `Alt`. Exhaustiveness has
-    -- decided about the source patterns before this point.
+    --- Pattern matching, one level at a time; see `Alt`. Exhaustiveness has
+    --- decided about the source patterns before this point.
     | CMatch(Core, Vec CAlt)
 
--- One top-level binding, with the type variables it abstracts over.
---
--- The binders and the dictionary parameters are separate because they are
--- abstracted at different times and by different rules: the type variables come
--- from generalization, the dictionary parameters from the predicates the scheme
--- retained.
+--- One top-level binding, with the type variables it abstracts over.
+---
+--- The binders and the dictionary parameters are separate because they are
+--- abstracted at different times and by different rules: the type variables come
+--- from generalization, the dictionary parameters from the predicates the scheme
+--- retained.
 type CBind = CBind {
     var name      : String,
-    -- `noId` for a binding `Turkey.Binders` has no record of: an instance's
-    -- dictionary, a default method, or a binding a pass after `Turkey.Lower`
-    -- made.
+    --- `noId` for a binding `Turkey.Binders` has no record of: an instance's
+    --- dictionary, a default method, or a binding a pass after `Turkey.Lower`
+    --- made.
     var id        : Int,
     var ty        : Ty.Type,
     binders       : Vec VarCell,
     value         : Core,
     span          : Option Span,
     var mutable   : Bool,
-    -- Which module declared it, including generated top-level holders.
-    -- Giblet checking and early initialization rely on this ownership.
+    --- Which module declared it, including generated top-level holders.
+    --- Giblet checking and early initialization rely on this ownership.
     var module_   : String,
-    -- The layout of each type this binding is compiled under that its parts do
-    -- not decide -- an abstracted variable, `Item t`, `f a`, a local copy's
-    -- variables -- keyed by `Ty.typeKey`. `Turkey.Layout` fills it; see its
-    -- atoms. Empty for a ground binding, and every emitted generic binding is
-    -- one of that pass's copies, so a type missing from it has no layout
-    -- anywhere and `layoutOf` says so rather than guessing.
+    --- The layout of each type this binding is compiled under that its parts do
+    --- not decide -- an abstracted variable, `Item t`, `f a`, a local copy's
+    --- variables -- keyed by `Ty.typeKey`. `Turkey.Layout` fills it; see its
+    --- atoms. Empty for a ground binding, and every emitted generic binding is
+    --- one of that pass's copies, so a type missing from it has no layout
+    --- anywhere and `layoutOf` says so rather than guessing.
     var layouts   : Map String Ssa.Layout,
 }
 
--- A whole program: the dictionaries, then the bindings, in run order.
+--- A whole program: the dictionaries, then the bindings, in run order.
 type CProgram = CProgram {
     dicts : Vec CBind,
     binds : Vec CBind,
 }
 
--- Which subterms are **tail positions**: the places a jump may stand, because
--- the value of what stands there is the value of the whole enclosing term.
--- Stated once, here in the IR, because it is a fact about the IR -- the checker
--- reads it to decide what a join scope reaches, and join discovery reads it to
--- decide what a tail call is, and two statements of one fact is exactly the kind
--- of agreement item 5 exists to be rid of.
---
--- Everything absent is not a tail position, and the one absence that carries
--- weight is a lambda's body: a closure outlives the frame that binds the join,
--- so a label is not something it can jump to. There is no loop body to say the
--- same of any more -- a loop *is* a join here.
--- The same fact, by field name, for the checker: it asks "does this subterm
--- inherit the join scope" rather than "what are the tail subterms". One
--- statement, read two ways, because two statements is what item 5 exists to be
--- rid of.
+--- Which subterms are **tail positions**: the places a jump may stand, because
+--- the value of what stands there is the value of the whole enclosing term.
+--- Stated once, here in the IR, because it is a fact about the IR -- the checker
+--- reads it to decide what a join scope reaches, and join discovery reads it to
+--- decide what a tail call is, and two statements of one fact is exactly the kind
+--- of agreement item 5 exists to be rid of.
+---
+--- Everything absent is not a tail position, and the one absence that carries
+--- weight is a lambda's body: a closure outlives the frame that binds the join,
+--- so a label is not something it can jump to. There is no loop body to say the
+--- same of any more -- a loop *is* a join here.
+--- The same fact, by field name, for the checker: it asks "does this subterm
+--- inherit the join scope" rather than "what are the tail subterms". One
+--- statement, read two ways, because two statements is what item 5 exists to be
+--- rid of.
 fun tailFieldNames(k : CoreKind) -> Array String = match k {
     CIf(_, _, _) -> ["then", "otherwise"]
     CLet(_, _, _, _, _, _) -> ["body"]
@@ -333,21 +333,21 @@ fun tailParts(k : CoreKind) -> Array Core = match k {
 
 -- -- rebuilding ---------------------------------------------------------------------
 
--- How to rebuild a node from its parts.
---
--- There is one rule -- rewrite the children, substitute the types -- and thirty
--- node kinds to apply it to. Writing those thirty cases in each pass would be
--- thirty chances per pass to miss a field a node later gains, so they exist
--- once, here, and a pass that rebuilds a term supplies the three functions
--- rather than its own walk. `Turkey.Ast.children` is the same decision for the
--- surface tree.
---
--- A node kind added below and forgotten here is silently not rewritten by any
--- pass at all.
---
--- A `CTyLam`'s and a `CLet`'s `binders` are deliberately not mapped: a binder is
--- a variable being *bound*, not one being used, so a substitution must not reach
--- it.
+--- How to rebuild a node from its parts.
+---
+--- There is one rule -- rewrite the children, substitute the types -- and thirty
+--- node kinds to apply it to. Writing those thirty cases in each pass would be
+--- thirty chances per pass to miss a field a node later gains, so they exist
+--- once, here, and a pass that rebuilds a term supplies the three functions
+--- rather than its own walk. `Turkey.Ast.children` is the same decision for the
+--- surface tree.
+---
+--- A node kind added below and forgotten here is silently not rewritten by any
+--- pass at all.
+---
+--- A `CTyLam`'s and a `CLet`'s `binders` are deliberately not mapped: a binder is
+--- a variable being *bound*, not one being used, so a substitution must not reach
+--- it.
 type Mapper = Mapper {
     expr  : fun(Core) -> Core,
     type_ : fun(Ty.Type) -> Ty.Type,
@@ -394,9 +394,9 @@ fun mapParam(p : CParam, m : Mapper) -> CParam {
     CParam { name = name, id = id, ty = m.type_(ty) }
 }
 
--- The term a binding holds, and the term an arm holds, each taken apart with a
--- full pattern: a Core-valued field added to `CBind` or `CAlt` is then a compile
--- error in the one place every child enumerator asks.
+--- The term a binding holds, and the term an arm holds, each taken apart with a
+--- full pattern: a Core-valued field added to `CBind` or `CAlt` is then a compile
+--- error in the one place every child enumerator asks.
 fun bindValue(b : CBind) -> Core {
     let CBind {
         name = _, id = _, ty = _, binders = _, value, span = _, mutable = _,
@@ -423,21 +423,20 @@ let dictHead = "%Dict"
 
 fun dictName(cls : String) -> String = dictHead + "." + cls
 
--- The class a dictionary type is for, given its name, or `None`.
+--- The class a dictionary type is for, given its name, or `None`.
 fun classOfDict(name : String) -> Option String =
     match String.splitOnce(name, ".") {
         Some((before, after)) -> if before == dictHead { Some(after) } else { None }
         None -> None
     }
 
--- The class `ty` is the dictionary of, or `None` if it is not one.
---
--- Saturated: the dictionary constructor has kind `k -> *`, so an unapplied one
--- is not the type of any value. Every caller wanted that and two of the three
--- checked it separately.
+--- The class `ty` is the dictionary of, or `None` if it is not one.
 fun dictClass(ty : Ty.Type) -> Option String {
     let (h, args) = Ty.spine(Ty.prune(ty))
     match h {
+        -- Saturated: the dictionary constructor has kind `k -> *`, so an
+        -- unapplied one is not the type of any value. Every caller wanted that
+        -- and two of the three checked it separately.
         TCon(c) -> if len(args) == 1 { classOfDict(c.name) } else { None }
         _ -> None
     }
@@ -474,13 +473,13 @@ fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
 -- `%` cannot start a source identifier, so no program can name this type.
 let coercionName = "%Co"
 
--- Returns the type of the evidence that `l` and `r` are one type.
+--- Returns the type of the evidence that `l` and `r` are one type.
 fun coercionOf(l : Ty.Type, r : Ty.Type) -> Ty.Type {
     let con = Ty.tcon(coercionName, KFun(KStar, KFun(KStar, KStar)), Ty.noScope)
     TApp(TApp(con, l, KFun(KStar, KStar)), r, KStar)
 }
 
--- Returns the two sides of the coercion type `ty`, or `None` if it is not one.
+--- Returns the two sides of the coercion type `ty`, or `None` if it is not one.
 fun coercionSides(ty : Ty.Type) -> Option (Ty.Type, Ty.Type) {
     let (h, args) = Ty.spine(Ty.prune(ty))
     match h {
@@ -492,26 +491,26 @@ fun coercionSides(ty : Ty.Type) -> Option (Ty.Type, Ty.Type) {
 
 fun isCoercion(ty : Ty.Type) -> Bool = Option.isSome(coercionSides(ty))
 
--- Returns whether a parameter of type `ty` is evidence: a dictionary or a
--- coercion.
+--- Returns whether a parameter of type `ty` is evidence: a dictionary or a
+--- coercion.
 fun isEvidence(ty : Ty.Type) -> Bool = isDictionary(ty) || isCoercion(ty)
 
--- Returns the evidence that `l` and `r` are one type.
+--- Returns the evidence that `l` and `r` are one type.
 fun coercion(l : Ty.Type, r : Ty.Type, span : Option Span) -> Core =
     mkCore(coercionOf(l, r), span, CUnit)
 
--- Returns the parameter `p` as an argument: a reference to it, or, for a
--- coercion, the evidence of its type.
+--- Returns the parameter `p` as an argument: a reference to it, or, for a
+--- coercion, the evidence of its type.
 fun forwarded(p : CParam, span : Option Span) -> Core = match coercionSides(p.ty) {
     Some((l, r)) -> coercion(l, r, span)
     None -> mkCore(p.ty, span, CVar(refTo(p.name, p.id)))
 }
 
--- Returns what the evidence parameters among `params` stand for, in order: a
--- coercion's equality, and a dictionary's class predicate. The predicates are
--- what a term under the lambda may assume. A dictionary is one because of its
--- equality superclasses, which `Turkey.Inert.granted` reads off it, as it
--- reads them off a given class predicate while solving.
+--- Returns what the evidence parameters among `params` stand for, in order: a
+--- coercion's equality, and a dictionary's class predicate. The predicates are
+--- what a term under the lambda may assume. A dictionary is one because of its
+--- equality superclasses, which `Turkey.Inert.granted` reads off it, as it
+--- reads them off a given class predicate while solving.
 fun evidencePreds(params : Array CParam) -> Vec Ty.Pred {
     let out = Vec.new(0)
     for p in params {
@@ -525,11 +524,11 @@ fun evidencePreds(params : Array CParam) -> Vec Ty.Pred {
     out
 }
 
--- Returns what the evidence parameters at the top of `e` stand for
--- (`evidencePreds`): those of every lambda, under its type abstractions, whose
--- parameters are all evidence, and of the first lambda that takes other
--- parameters too, as a worker takes its evidence beside its parameters. These
--- are what a whole binding of `e` may assume, since every call supplies them.
+--- Returns what the evidence parameters at the top of `e` stand for
+--- (`evidencePreds`): those of every lambda, under its type abstractions, whose
+--- parameters are all evidence, and of the first lambda that takes other
+--- parameters too, as a worker takes its evidence beside its parameters. These
+--- are what a whole binding of `e` may assume, since every call supplies them.
 fun outerEvidence(e : Core) -> Vec Ty.Pred {
     let out = Vec.new(2)
     var value = e
@@ -549,18 +548,17 @@ fun outerEvidence(e : Core) -> Vec Ty.Pred {
     out
 }
 
--- Every type variable a binding abstracts, wherever it states them.
---
--- A binding says `forall` in two places. `binders` is the one the checker reads
--- at a use site, and it is the only one a *generic* binding has. A method
--- quantifies over its own variables as well as its class's, and the lowering
--- states those in a `CTyLam` under the dictionary lambda -- so `Turkey.Mono`,
--- which consumes that lambda, leaves a copy whose `binders` are empty and whose
--- body is still generic.
---
--- Both are `forall`, and the use site applies types to both the same way, so a
--- pass that asks what a binding abstracts over wants them together.
+--- Every type variable a binding abstracts, wherever it states them.
 fun abstractionBinders(b : CBind) -> Vec VarCell {
+    -- A binding says `forall` in two places. `binders` is the one the checker
+    -- reads at a use site, and it is the only one a *generic* binding has. A
+    -- method quantifies over its own variables as well as its class's, and the
+    -- lowering states those in a `CTyLam` under the dictionary lambda -- so
+    -- `Turkey.Mono`, which consumes that lambda, leaves a copy whose `binders`
+    -- are empty and whose body is still generic.
+    --
+    -- Both are `forall`, and the use site applies types to both the same way,
+    -- so a pass that asks what a binding abstracts over wants them together.
     let out = Vec.new(len(b.binders) + 2)
     for v in b.binders { Vec.push(out, v) }
     var value = b.value
@@ -580,9 +578,9 @@ fun abstractionBinders(b : CBind) -> Vec VarCell {
 
 fun discard(x : a) -> Unit = {}
 
--- Returns whether a variable in `e` refers to the binder `id`, stopping at the
--- first that does. A binder id is bound at most once in a program, so every
--- such variable is one the binder scopes over, and none is shadowed.
+--- Returns whether a variable in `e` refers to the binder `id`, stopping at the
+--- first that does. A binder id is bound at most once in a program, so every
+--- such variable is one the binder scopes over, and none is shadowed.
 fun mentions(e : Core, id : Int) -> Bool = match e.kind {
     CVar(r) -> r == ById(id)
     CLit(_) | CUnit | CCon(_) | CPrim(_) -> False
@@ -622,8 +620,8 @@ fun anyMentions[Iterator c, Item c ~ Core](xs : c, id : Int) -> Bool {
     False
 }
 
--- Returns each binder a `CVar` in `e` refers to, once, in the order of
--- first mention. Includes binders `e` binds itself and top-level bindings.
+--- Returns each binder a `CVar` in `e` refers to, once, in the order of
+--- first mention. Includes binders `e` binds itself and top-level bindings.
 fun references(e : Core) -> Vec Ref {
     let r = Refs { out = [], seen = Set.new() }
     referencesInto(e, r)
@@ -687,10 +685,10 @@ fun referencesInto(e : Core, r : Refs) -> Unit = match e.kind {
     }
 }
 
--- What `namesInto` reports a `Prim.codeAddress("symbol")` as. It uses the
--- `foreign` definition with that C symbol as surely as a call would, but
--- names the definition by its symbol rather than its binding, so it is
--- reported under a name no binding has: `%` cannot start a source name.
+--- What `namesInto` reports a `Prim.codeAddress("symbol")` as. It uses the
+--- `foreign` definition with that C symbol as surely as a call would, but
+--- names the definition by its symbol rather than its binding, so it is
+--- reported under a name no binding has: `%` cannot start a source name.
 fun codeAddressName(symbol : String) -> String = "%codeAddress " + symbol
 
 fun codeAddressOf(fn : Core, args : Array Core) -> Option String {
@@ -711,9 +709,9 @@ fun untyped(e : Core) -> Core = match e.kind {
     _ -> e
 }
 
--- Returns the spelling of every top-level binding a reference in `e` finds by
--- spelling, and the `codeAddressName` of each C symbol a `Prim.codeAddress`
--- names.
+--- Returns the spelling of every top-level binding a reference in `e` finds by
+--- spelling, and the `codeAddressName` of each C symbol a `Prim.codeAddress`
+--- names.
 fun namesOf(e : Core) -> Set.Set String {
     let out = Set.new()
     namesInto(e, out)
@@ -782,34 +780,34 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
 
 -- -- printing -----------------------------------------------------------------------
 
--- How a dump names binders.
---
--- A binder prints as its base name: its spelling, less the counter in a
--- spelling a pass generated (`%seq24` is `%seq`, `%d52.Show` is `%d.Show`).
--- Where two binders in one dump share a base name, each prints as `base%k`,
--- with `k` numbered per base name in order of first print. A binder is its
--- spelling and its id together, so two binders spelled alike are told apart
--- by their ids, and a binder a pass renamed is a new one. A reference prints
--- as the binder it finds.
---
--- The counters and the ids are global to a compilation, so printing either
--- would move every name after a binder added anywhere. Neither is printed.
---
--- Whether a base name is shared is known only once the whole dump has been
--- walked, so a dump is printed twice: once to collect the binders in order of
--- first print, and once, after `settle`, to print them.
+--- How a dump names binders.
+---
+--- A binder prints as its base name: its spelling, less the counter in a
+--- spelling a pass generated (`%seq24` is `%seq`, `%d52.Show` is `%d.Show`).
+--- Where two binders in one dump share a base name, each prints as `base%k`,
+--- with `k` numbered per base name in order of first print. A binder is its
+--- spelling and its id together, so two binders spelled alike are told apart
+--- by their ids, and a binder a pass renamed is a new one. A reference prints
+--- as the binder it finds.
+---
+--- The counters and the ids are global to a compilation, so printing either
+--- would move every name after a binder added anywhere. Neither is printed.
+---
+--- Whether a base name is shared is known only once the whole dump has been
+--- walked, so a dump is printed twice: once to collect the binders in order of
+--- first print, and once, after `settle`, to print them.
 type Aliases = Aliases {
-    -- What each binder prints as, by `identity`. Its base name until `settle`.
+    --- What each binder prints as, by `identity`. Its base name until `settle`.
     printed     : Map String String,
-    -- The binders under each base name, by `identity`, in order of first print.
+    --- The binders under each base name, by `identity`, in order of first print.
     byBase      : Map String (Vec String),
     var settled : Bool,
-    -- The spelling of each binder with an id, for a reference to it to print
-    -- as it does. A binder is printed before any reference to it, except a
-    -- `CLetRec` sibling, whose spelling is recorded when its group is met.
-    -- Either way it is numbered where it is first printed.
+    --- The spelling of each binder with an id, for a reference to it to print
+    --- as it does. A binder is printed before any reference to it, except a
+    --- `CLetRec` sibling, whose spelling is recorded when its group is met.
+    --- Either way it is numbered where it is first printed.
     spellings   : Map Int String,
-    -- What slot `i` of a class's dictionary holds, for a dump to print it by.
+    --- What slot `i` of a class's dictionary holds, for a dump to print it by.
     slotName    : fun(String, Int) -> String,
 }
 
@@ -817,8 +815,8 @@ fun newAliases(slotName : fun(String, Int) -> String) -> Aliases =
     Aliases { printed = Map.new(), byBase = Map.new(), settled = False,
               spellings = Map.new(), slotName = slotName }
 
--- Returns what the binder spelled `name` with the id `id` prints as. Before
--- `settle`, records it and returns its base name.
+--- Returns what the binder spelled `name` with the id `id` prints as. Before
+--- `settle`, records it and returns its base name.
 fun alias(a : Aliases, name : String, id : Int) -> String {
     if id != noId { Map.put(a.spellings, id, name) }
     let key = identity(name, id)
@@ -893,11 +891,11 @@ fun generatedParts(name : String) -> Option (String, String) {
 
 fun pad(indent : Int) -> String = String.repeat("  ", indent)
 
--- A readable rendering, for the `core` dump and for tests.
---
--- Types are shown where they are decided -- at a binder, at a type application
--- -- and not on every node, which would bury the term in its own annotations.
--- The checker reads the tree, not this.
+--- A readable rendering, for the `core` dump and for tests.
+---
+--- Types are shown where they are decided -- at a binder, at a type application
+--- -- and not on every node, which would bury the term in its own annotations.
+--- The checker reads the tree, not this.
 fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
     let p = pad(indent)
     match e.kind {
@@ -1118,16 +1116,16 @@ fun showOpening(opening : Option Opened, a : Aliases) -> String = match opening 
     }
 }
 
--- What an arm opens, if it opens an existential.
+--- What an arm opens, if it opens an existential.
 fun openingOf(alt : Alt) -> Option Opened = match alt {
     ACon(_, _, opening) -> opening
     _ -> None
 }
 
--- One binding. The namer starts here and is shared by every type printed under
--- it, so the `a` a binder introduces is the `a` its body mentions -- which is
--- the whole reason a reader can follow a type variable from a `forall` to the
--- parameter that uses it.
+--- One binding. The namer starts here and is shared by every type printed under
+--- it, so the `a` a binder introduces is the `a` its body mentions -- which is
+--- the whole reason a reader can follow a type variable from a `forall` to the
+--- parameter that uses it.
 fun showBind(b : CBind, slotName : fun(String, Int) -> String) -> String {
     let a = newAliases(slotName)
     discard(renderBind(b, a))
@@ -1145,10 +1143,10 @@ fun renderBind(b : CBind, a : Aliases) -> String {
       + showExpr(b.value, 1, n, a)
 }
 
--- The whole program, or just one module's part of it. A reader wants their own
--- file's elaboration, not the Prelude's four hundred lines of it.
---
--- `slotName` names a dictionary's slots, which the program holds by position.
+--- The whole program, or just one module's part of it. A reader wants their own
+--- file's elaboration, not the Prelude's four hundred lines of it.
+---
+--- `slotName` names a dictionary's slots, which the program holds by position.
 fun showProgram(program : CProgram, owner : Option String,
                 slotName : fun(String, Int) -> String) -> String {
     let out = Vec.new(32)

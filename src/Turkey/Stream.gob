@@ -1,123 +1,122 @@
 export (Item(..), Cfi(..), print, fits32)
 
--- What the emitter produces: a module as a sequence of values, in the order
--- they go into the object, over the target's instruction type `i`.
---
--- Nothing in it is text. The assembly printer below is one consumer, and an
--- encoder that writes the bytes directly is another; both read the same
--- items, so the bytes the encoder writes can be checked against what the
--- system assembler makes of the printed text. A name is a `Turkey.Asm.Symbol`,
--- which the printer spells and an object writer looks up.
---
--- Labels and data are items rather than fields of an instruction because the
--- assembler treats them so: a label names the position of whatever comes
--- next, and a data item's size is its own, not an instruction's four bytes.
+--- What the emitter produces: a module as a sequence of values, in the order
+--- they go into the object, over the target's instruction type `i`.
+---
+--- Nothing in it is text. The assembly printer below is one consumer, and an
+--- encoder that writes the bytes directly is another; both read the same
+--- items, so the bytes the encoder writes can be checked against what the
+--- system assembler makes of the printed text. A name is a `Turkey.Asm.Symbol`,
+--- which the printer spells and an object writer looks up.
+---
+--- Labels and data are items rather than fields of an instruction because the
+--- assembler treats them so: a label names the position of whatever comes
+--- next, and a data item's size is its own, not an instruction's four bytes.
 
 import Turkey.Asm as Asm
 import Turkey.Asm (Symbol)
 import Turkey.Position as Position
 
 type Item i
-    -- The instruction set the code needs, first in a module.
+    --- The instruction set the code needs, first in a module.
     = Architecture
-    -- Following items go into this section.
+    --- Following items go into this section.
     | Section(Asm.Section)
-    -- The symbol is visible outside the object.
+    --- The symbol is visible outside the object.
     | Global(Symbol)
-    -- The symbol names a function, where the format records that.
+    --- The symbol names a function, where the format records that.
     | FunctionType(Symbol)
-    -- Pad to a multiple of 2^n bytes.
+    --- Pad to a multiple of 2^n bytes.
     | Align(Int)
-    -- The position of the next item.
+    --- The position of the next item.
     | Label(Symbol)
     | Instruction(i)
-    -- An eight-byte word: a constant, or the address of a symbol.
+    --- An eight-byte word: a constant, or the address of a symbol.
     | Word(Int)
     | WordOf(Symbol)
-    -- A four-byte constant, which `fits32` must accept.
+    --- A four-byte constant, which `fits32` must accept.
     | Word32(Int)
-    -- `n` zero bytes.
+    --- `n` zero bytes.
     | Space(Int)
-    -- A string's bytes. `CString` adds the terminating zero.
+    --- A string's bytes. `CString` adds the terminating zero.
     | Bytes(String)
     | CString(String)
-    -- Text for the reader of the assembly, with no bytes behind it.
+    --- Text for the reader of the assembly, with no bytes behind it.
     | Comment(String)
-    -- A byte, and an unsigned integer in LEB128, the variable-length encoding
-    -- DWARF writes most of its numbers in.
+    --- A byte, and an unsigned integer in LEB128, the variable-length encoding
+    --- DWARF writes most of its numbers in.
     | Byte(Int)
     | Uleb(Int)
-    -- Four bytes holding the distance from the second label to the first,
-    -- both in the same section, signed: a length, a function's size, or a
-    -- return address's offset from the entry. `Turkey.Assembler` fixes it
-    -- in the field. The Mach-O system assembler does too, except where both
-    -- an alignment and a symbol that is not a temporary label lie between
-    -- the two: there it writes a `SUBTRACTOR` and `UNSIGNED` pair, wherever
-    -- the field is. The linker resolves the pair to the same distance in the
-    -- image.
+    --- Four bytes holding the distance from the second label to the first,
+    --- both in the same section, signed: a length, a function's size, or a
+    --- return address's offset from the entry. `Turkey.Assembler` fixes it
+    --- in the field. The Mach-O system assembler does too, except where both
+    --- an alignment and a symbol that is not a temporary label lie between
+    --- the two: there it writes a `SUBTRACTOR` and `UNSIGNED` pair, wherever
+    --- the field is. The linker resolves the pair to the same distance in the
+    --- image.
     | Difference(Symbol, Symbol)
-    -- The same distance in LEB128, for a range list. Its length depends on
-    -- its value, so both labels must be placed before it.
+    --- The same distance in LEB128, for a range list. Its length depends on
+    --- its value, so both labels must be placed before it.
     | UlebDifference(Symbol, Symbol)
-    -- Four bytes holding the first label's offset from the start of its
-    -- section, which the second label marks. Where the linker joins sections
-    -- of one name from several objects, as an ELF linker joins
-    -- `.debug_str`, the offset is relocated to the joined section's;
-    -- Mach-O's debug sections are never joined, so there it is the plain
-    -- distance.
+    --- Four bytes holding the first label's offset from the start of its
+    --- section, which the second label marks. Where the linker joins sections
+    --- of one name from several objects, as an ELF linker joins
+    --- `.debug_str`, the offset is relocated to the joined section's;
+    --- Mach-O's debug sections are never joined, so there it is the plain
+    --- distance.
     | SectionOffset(Symbol, Symbol)
-    -- Source file `n` of the line table, by its path, with the directory it
-    -- is relative to when that is not the compile directory. File 0 is the
-    -- program's main file and names the compile directory.
+    --- Source file `n` of the line table, by its path, with the directory it
+    --- is relative to when that is not the compile directory. File 0 is the
+    --- program's main file and names the compile directory.
     | SourceFile(Int, Option String, String)
-    -- A row of the line table at the next instruction: the position the row
-    -- starts (`Turkey.Position`), and whether it is where the function's
-    -- body begins, after its prologue. Takes no bytes. Position 0 is a row
-    -- with no source line, which ends the previous row where a function
-    -- with no position begins.
+    --- A row of the line table at the next instruction: the position the row
+    --- starts (`Turkey.Position`), and whether it is where the function's
+    --- body begins, after its prologue. Takes no bytes. Position 0 is a row
+    --- with no source line, which ends the previous row where a function
+    --- with no position begins.
     | Loc(Int, Bool)
-    -- A rule of the call frame information at this point in the code, which
-    -- an unwinder reads to find the caller's frame. Takes no bytes.
+    --- A rule of the call frame information at this point in the code, which
+    --- an unwinder reads to find the caller's frame. Takes no bytes.
     | Cfi(Cfi)
 
--- The call frame information's rules: where the canonical frame address
--- (CFA) is, the value `sp` had before the call, and where each register's
--- caller value is. A rule holds from the item it follows to the next rule,
--- and every function starts with the CFA at `sp` and every register its
--- caller's.
---
--- Registers are DWARF's numbers for arm64: `x0`-`x30` are 0-30, `sp` 31,
--- and `d0`-`d31` 64-95.
+--- The call frame information's rules: where the canonical frame address
+--- (CFA) is, the value `sp` had before the call, and where each register's
+--- caller value is. A rule holds from the item it follows to the next rule,
+--- and every function starts with the CFA at `sp` and every register its
+--- caller's.
+---
+--- Registers are DWARF's numbers for arm64: `x0`-`x30` are 0-30, `sp` 31,
+--- and `d0`-`d31` 64-95.
 type Cfi
-    -- The function the rules describe starts at the next item, and ends at
-    -- the item before `EndProc`.
+    --- The function the rules describe starts at the next item, and ends at
+    --- the item before `EndProc`.
     = StartProc
     | EndProc
-    -- The CFA is the register plus the offset.
+    --- The CFA is the register plus the offset.
     | DefCfa(Int, Int)
-    -- The CFA is its register plus this offset.
+    --- The CFA is its register plus this offset.
     | DefCfaOffset(Int)
-    -- The register's caller value is saved at the CFA plus the offset.
+    --- The register's caller value is saved at the CFA plus the offset.
     | SavedAt(Int, Int)
-    -- The register holds its caller's value again.
+    --- The register holds its caller's value again.
     | Restored(Int)
-    -- The register's caller value is lost. For the return address, the
-    -- frame is the outermost.
+    --- The register's caller value is lost. For the return address, the
+    --- frame is the outermost.
     | Undefined(Int)
-    -- The rules as they stand, kept, and then put back.
+    --- The rules as they stand, kept, and then put back.
     | RememberState
     | RestoreState
 
--- Whether `n` is a signed 32-bit integer, which is what a `Word32` and a
--- `Difference` hold.
+--- Whether `n` is a signed 32-bit integer, which is what a `Word32` and a
+--- `Difference` hold.
 fun fits32(n : Int) -> Bool = n >= -0x80000000 && n < 0x80000000
 
--- The items as assembly text, appended to `b`, and the array emptied.
---
--- Emptied because the caller prints a function at a time: held until the end,
--- `boot`'s own text is millions of items the collector keeps tracing.
+--- The items as assembly text, appended to `b`, and the array emptied.
 fun print[Show i](d : Asm.Dialect, items : Vec (Item i), b : String.Builder) -> Unit {
     for item in items { printItem(d, item, b) }
+    -- Emptied because the caller prints a function at a time: held until the
+    -- end, `boot`'s own text is millions of items the collector keeps tracing.
     Vec.clear(items)
 }
 

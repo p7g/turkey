@@ -7,26 +7,26 @@ export (
     untracedPressure, worstCall, moveHints, hintsTaken,
 )
 
--- Register allocation for arm64.
---
--- The design is spill, then colour, then coalesce -- the SSA decomposition
--- rather than linear scan or IRC. What makes it worth the three phases is one
--- theorem: the dominance relation of an SSA program induces a perfect
--- elimination order on its interference graph, so the graph never has to be
--- built, colouring is a walk of the dominator tree, and it *cannot fail* once
--- pressure fits. Chordal graphs have a clique number equal to their chromatic
--- number, which in this setting reads: the registers needed are exactly the
--- maximum number of values live at once.
---
--- That last sentence is why this file begins with a measurement instead of a
--- spiller. If maximum pressure never exceeds the registers arm64 has, then the
--- corpus needs no spilling at all, and the first working allocator is the
--- colourer alone. Spilling is the largest and least certain part of this pass
--- and the only part whose heuristic affects code quality, so knowing whether
--- the corpus needs it is worth more than starting it.
---
--- The precondition the theorem needs is one this project already checks on
--- every function: `Ssa.verify` enforces that a definition dominates its uses.
+--- Register allocation for arm64.
+---
+--- The design is spill, then colour, then coalesce -- the SSA decomposition
+--- rather than linear scan or IRC. What makes it worth the three phases is one
+--- theorem: the dominance relation of an SSA program induces a perfect
+--- elimination order on its interference graph, so the graph never has to be
+--- built, colouring is a walk of the dominator tree, and it *cannot fail* once
+--- pressure fits. Chordal graphs have a clique number equal to their chromatic
+--- number, which in this setting reads: the registers needed are exactly the
+--- maximum number of values live at once.
+---
+--- That last sentence is why this file begins with a measurement instead of a
+--- spiller. If maximum pressure never exceeds the registers arm64 has, then the
+--- corpus needs no spilling at all, and the first working allocator is the
+--- colourer alone. Spilling is the largest and least certain part of this pass
+--- and the only part whose heuristic affects code quality, so knowing whether
+--- the corpus needs it is worth more than starting it.
+---
+--- The precondition the theorem needs is one this project already checks on
+--- every function: `Ssa.verify` enforces that a definition dominates its uses.
 
 import Data.BitSet as BitSet
 import Data.BitSet (BitSet)
@@ -40,49 +40,48 @@ import Turkey.Position as Position
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Func, BlockId, Value, Term(..))
 
--- How many registers are live at once, at the worst point in a function, in
--- each file. The two are counted apart because they are allocated apart:
--- AAPCS64 numbers them separately and a double can never occupy an `x`.
+--- How many registers are live at once, at the worst point in a function, in
+--- each file. The two are counted apart because they are allocated apart:
+--- AAPCS64 numbers them separately and a double can never occupy an `x`.
 type Pressure = Pressure { gp : Int, fp : Int }
 
--- What is actually assignable, which is not the same as what exists.
---
--- The general file has 31 numbered registers. `x31` is `sp` or `xzr`
--- depending on the instruction and is never allocatable; `x29` is the frame
--- pointer and `x30` the link register, both of which the prologue owns; and
--- `x18` is reserved by the platform on Darwin, `x16`/`x17` are this
--- backend's scratch registers, and `x28` holds the running worker
--- (`A.worker`). That leaves x0-x15 and x19-x27.
+--- What is actually assignable, which is not the same as what exists.
+---
+--- The general file has 31 numbered registers. `x31` is `sp` or `xzr`
+--- depending on the instruction and is never allocatable; `x29` is the frame
+--- pointer and `x30` the link register, both of which the prologue owns; and
+--- `x18` is reserved by the platform on Darwin, `x16`/`x17` are this
+--- backend's scratch registers, and `x28` holds the running worker
+--- (`A.worker`). That leaves x0-x15 and x19-x27.
 let availableGp = 25
--- The vector file has 32, and `d31` is the scratch register that breaks a
--- cycle of doubles in a parallel copy, as `x16` does for the general file.
--- Breaking one through `x16` instead puts two cross-file `fmov`s on what is
--- usually a loop's critical path, and a 32nd live double is rarer than a
--- cycle.
+--- The vector file has 32, and `d31` is the scratch register that breaks a
+--- cycle of doubles in a parallel copy, as `x16` does for the general file.
+--- Breaking one through `x16` instead puts two cross-file `fmov`s on what is
+--- usually a loop's critical path, and a 32nd live double is rarer than a
+--- cycle.
 let availableFp = 31
 
--- What survives a call, which is a much smaller set than what exists. A value
--- live across a `bl` and held in a caller-saved register is destroyed by the
--- callee, so it needs one of these or a spill slot -- and there are nine,
--- `x28` being the worker's.
+--- What survives a call, which is a much smaller set than what exists. A value
+--- live across a `bl` and held in a caller-saved register is destroyed by the
+--- callee, so it needs one of these or a spill slot -- and there are nine,
+--- `x28` being the worker's.
 let calleeSavedGp = 9
 let calleeSavedFp = 8
 
--- The maximum number of values simultaneously live, per file.
---
--- Measured at two kinds of program point: after each instruction of a block,
--- which is where a definition has just added to the pressure, and at each
--- block's live-out, which is where a value crossing an edge does. Those are
--- the peaks; a point inside an instruction cannot exceed both of its
--- neighbours.
---
--- Only *virtual* registers are counted. The physical registers selection pins
--- around a call -- the arguments in `x0`-`x7`, the result out of `x0` -- are
--- not `Ssa.Value`s and so are not in any live set. They are a real constraint
--- on the colourer and they are not pressure in this sense: their live ranges
--- are the two instructions either side of the `bl`, and what this number is
--- for is deciding whether a spiller is needed.
+--- The maximum number of values simultaneously live, per file.
+---
+--- Only *virtual* registers are counted. The physical registers selection pins
+--- around a call -- the arguments in `x0`-`x7`, the result out of `x0` -- are
+--- not `Ssa.Value`s and so are not in any live set. They are a real constraint
+--- on the colourer and they are not pressure in this sense: their live ranges
+--- are the two instructions either side of the `bl`, and what this number is
+--- for is deciding whether a spiller is needed.
 fun pressureOf(f : Func A.Inst) -> Pressure {
+    -- Measured at two kinds of program point: after each instruction of a
+    -- block, which is where a definition has just added to the pressure, and
+    -- at each block's live-out, which is where a value crossing an edge does.
+    -- Those are the peaks; a point inside an instruction cannot exceed both of
+    -- its neighbours.
     var gp = 0
     var fp = 0
     let liveOut = Ssa.liveness(f)
@@ -116,22 +115,22 @@ fun countOf(f : Func A.Inst, live : Array Int) -> (Int, Int) {
 }
 
 
--- How many values are live *across* a call, which is the second number the
--- colourer's feasibility turns on and a tighter one than total pressure.
---
--- A call clobbers every caller-saved register, so a value live across one can
--- be held only in a callee-saved register -- of which the general file has ten
--- and the vector file eight -- or in memory. Total pressure can fit
--- comfortably in 28 registers and this can still not fit in 10. An allocation
--- is not counted: it clobbers nothing allocatable (`A.callClobbers`).
---
--- Traced and untraced are counted apart because they are not equally
--- expensive to spill. A traced value live across a safepoint is *already*
--- being written to the root array, because that is what rooting is; spilling
--- it costs the reload and not the store. An untraced one has no such slot and
--- pays for both. So the untraced count is the one that says whether a spiller
--- is needed, and the traced count says how much cheaper the spilling is than
--- it looks.
+--- How many values are live *across* a call, which is the second number the
+--- colourer's feasibility turns on and a tighter one than total pressure.
+---
+--- A call clobbers every caller-saved register, so a value live across one can
+--- be held only in a callee-saved register -- of which the general file has ten
+--- and the vector file eight -- or in memory. Total pressure can fit
+--- comfortably in 28 registers and this can still not fit in 10. An allocation
+--- is not counted: it clobbers nothing allocatable (`A.callClobbers`).
+---
+--- Traced and untraced are counted apart because they are not equally
+--- expensive to spill. A traced value live across a safepoint is *already*
+--- being written to the root array, because that is what rooting is; spilling
+--- it costs the reload and not the store. An untraced one has no such slot and
+--- pays for both. So the untraced count is the one that says whether a spiller
+--- is needed, and the traced count says how much cheaper the spilling is than
+--- it looks.
 type AcrossCalls = AcrossCalls {
     untracedGp : Int, tracedGp : Int, untracedFp : Int, tracedFp : Int,
     calls : Int,
@@ -180,28 +179,29 @@ fun clobbersOnCall(i : A.Inst) -> Bool =
     A.callClobbers(i.op, Gp) != 0 || A.callClobbers(i.op, Fp) != 0
 
 
--- Pressure once the root array is counted as the spill slot it already is.
---
--- `Turkey.Roots` gives a stack slot to every traced value live across a
--- safepoint, and the emitter *already* stores it there before the call --
--- that store is what rooting is. So such a value need not hold a register
--- across the call at all: it can be read back from its slot afterwards, at
--- the cost of a load and no store. Its live range is split at every call, and
--- between calls it is an ordinary value.
---
--- This is not a spiller. It is the observation that the spilling has already
--- happened, for a different reason, and that the allocator may as well use it.
--- The measurement it produces is the one the colourer's feasibility rests on:
--- if effective pressure fits in the register file, no spiller is needed.
---
--- Approximated deliberately, and in the safe direction. A value that is live
--- across *some* call is excluded from every live set here, not only from the
--- ones spanning a call, so this under-counts the registers such a value uses
--- between calls. What it cannot do is under-count a function that needs
--- spilling for some other reason, because every value not in that set is
--- counted in full. Read it as "is the colourer plausible", not as a
--- register count.
+--- Pressure once the root array is counted as the spill slot it already is.
+---
+--- The measurement it produces is the one the colourer's feasibility rests on:
+--- if effective pressure fits in the register file, no spiller is needed.
+---
+--- Approximated deliberately, and in the safe direction. A value that is live
+--- across *some* call is excluded from every live set here, not only from the
+--- ones spanning a call, so this under-counts the registers such a value uses
+--- between calls. What it cannot do is under-count a function that needs
+--- spilling for some other reason, because every value not in that set is
+--- counted in full. Read it as "is the colourer plausible", not as a
+--- register count.
 fun effectivePressure(f : Func A.Inst) -> Pressure {
+    -- `Turkey.Roots` gives a stack slot to every traced value live across a
+    -- safepoint, and the emitter *already* stores it there before the call --
+    -- that store is what rooting is. So such a value need not hold a register
+    -- across the call at all: it can be read back from its slot afterwards, at
+    -- the cost of a load and no store. Its live range is split at every call,
+    -- and between calls it is an ordinary value.
+    --
+    -- This is not a spiller. It is the observation that the spilling has
+    -- already happened, for a different reason, and that the allocator may as
+    -- well use it.
     let liveOut = Ssa.liveness(f)
     -- The traced values live across some call: exactly what `Turkey.Roots`
     -- gives a slot to, recomputed here on the machine graph because selection
@@ -252,44 +252,26 @@ fun countExcept(f : Func A.Inst, live : Array Int,
 
 -- -- the colourer ------------------------------------------------------------
 
--- What the allocator answers: a physical register per value, and nothing
--- rewritten.
---
--- The assignment is kept **on the side** rather than substituted into the
--- instructions. That is regalloc2's design, and the reason it gives is the one
--- that applies here: Cranelift's emitter became "almost completely immutable"
--- once allocation stopped editing the code, and a pass that does not mutate
--- its input is a pass whose input can still be printed, verified and re-run.
+--- What the allocator answers: a physical register per value, and nothing
+--- rewritten.
+---
+--- The assignment is kept **on the side** rather than substituted into the
+--- instructions. That is regalloc2's design, and the reason it gives is the one
+--- that applies here: Cranelift's emitter became "almost completely immutable"
+--- once allocation stopped editing the code, and a pass that does not mutate
+--- its input is a pass whose input can still be printed, verified and re-run.
 type Colouring = Colouring {
-    -- Value id -> register number within that value's own bank. `-1` for a
-    -- value that was never assigned one, which after a successful run means
-    -- only that it is dead.
+    --- Value id -> register number within that value's own bank. `-1` for a
+    --- value that was never assigned one, which after a successful run means
+    --- only that it is dead.
     of_ : Array Int,
-    -- Why it stopped, if it did. The discipline selection uses: a function
-    -- that cannot be coloured is reported rather than approximated, and the
-    -- histogram is the plan for the next slice.
+    --- Why it stopped, if it did. The discipline selection uses: a function
+    --- that cannot be coloured is reported rather than approximated, and the
+    --- histogram is the plan for the next slice.
     stopped : Option String,
 }
 
--- Colour one function by walking its blocks in a dominance-compatible order.
---
--- Reverse postorder is dominance-compatible, so a definition is always
--- coloured before any use, and the theorem does the rest: at the point a value
--- is defined, everything it can interfere with is live there, so a colour that
--- avoids the live ones avoids all of them. No interference graph, no worklist,
--- no second pass.
---
--- Two things the theorem does not cover, and both are real here:
---
--- * **Physical registers.** Selection pins arguments into `x0`-`x7` and reads
---   the result out of `x0`, and a `mov x0, %5` destroys whatever the allocator
---   put in `x0`. So a value's forbidden set collects every physical register
---   written at a point where that value is live, and a call forbids all of the
---   caller-saved ones at once.
--- * **The flag pair.** Nothing that sets flags may come between a
---   flag-setting instruction and the `cset` that reads it. Colouring inserts
---   nothing; spilling inserts `ldr` and `str`, which leave the flags alone --
---   and `verifyAllocation` checks that every `cset` still reaches its setter.
+--- Colour one function by walking its blocks in a dominance-compatible order.
 fun colour(f : Func A.Inst) -> Colouring {
     let w = walk(f, newSpills(), Map.new(), False)
     Colouring { of_ = w.of_, stopped = w.stopped }
@@ -326,6 +308,24 @@ type Walk = Walk {
 
 fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int,
          evict : Bool) -> Walk {
+    -- Reverse postorder is dominance-compatible, so a definition is always
+    -- coloured before any use, and the theorem does the rest: at the point a
+    -- value is defined, everything it can interfere with is live there, so a
+    -- colour that avoids the live ones avoids all of them. No interference
+    -- graph, no worklist, no second pass.
+    --
+    -- Two things the theorem does not cover, and both are real here:
+    --
+    -- * **Physical registers.** Selection pins arguments into `x0`-`x7` and
+    --   reads the result out of `x0`, and a `mov x0, %5` destroys whatever the
+    --   allocator put in `x0`. So a value's forbidden set collects every
+    --   physical register written at a point where that value is live, and a
+    --   call forbids all of the caller-saved ones at once.
+    -- * **The flag pair.** Nothing that sets flags may come between a
+    --   flag-setting instruction and the `cset` that reads it. Colouring
+    --   inserts nothing; spilling inserts `ldr` and `str`, which leave the
+    --   flags alone -- and `verifyAllocation` checks that every `cset` still
+    --   reaches its setter.
     let (liveIn, liveOut) = Ssa.livenessInOut(f)
     let forbidden = forbiddenSets(f, liveOut)
     let of_ = Array.filled(len(f.reps), -1)
@@ -1020,24 +1020,24 @@ fun clobbersOf(i : A.Inst, bank : Bank) -> Int =
     })
 
 
--- Whether a colouring is actually a colouring.
---
--- `Ssa.verify` checks the graph and knows nothing about registers, so this is
--- the allocator's half of the same idea: the pass that can silently produce
--- code which assembles, links, runs and computes the wrong answer gets a
--- checker rather than a hope. Two things are wrong and both are invisible
--- downstream:
---
--- * **Two values live at one point sharing a register.** The colouring is
---   worthless if this happens, and nothing later can tell -- the printer will
---   print it, `as` will assemble it, and the program will compute a wrong
---   number.
--- * **A value holding a register that is clobbered while it is live.** The
---   classic form is a value in `x0` across a call, which the callee destroys.
---
--- Both are quadratic in the live set at worst and the live sets are small,
--- which is what makes checking every program point affordable.
+--- Whether a colouring is actually a colouring.
+---
+--- Two things are wrong and both are invisible downstream:
+---
+--- * **Two values live at one point sharing a register.** The colouring is
+---   worthless if this happens, and nothing later can tell -- the printer will
+---   print it, `as` will assemble it, and the program will compute a wrong
+---   number.
+--- * **A value holding a register that is clobbered while it is live.** The
+---   classic form is a value in `x0` across a call, which the callee destroys.
+---
+--- Both are quadratic in the live set at worst and the live sets are small,
+--- which is what makes checking every program point affordable.
 fun verifyColouring(f : Func A.Inst, c : Colouring) -> Vec String {
+    -- `Ssa.verify` checks the graph and knows nothing about registers, so this
+    -- is the allocator's half of the same idea: the pass that can silently
+    -- produce code which assembles, links, runs and computes the wrong answer
+    -- gets a checker rather than a hope.
     let out : Vec String = []
     let (_, liveOut) = Ssa.livenessInOut(f)
     let forbidden = forbiddenSets(f, liveOut)
@@ -1123,14 +1123,14 @@ fun where_(b : Int, n : Int) -> String =
     else { "b" + Int.toString(b) + " instruction " + Int.toString(n) }
 
 
--- Pressure counting only the values that have nowhere free to go.
---
--- An untraced value has no root slot, so spilling one needs a real stack slot
--- and therefore a frame -- which does not exist yet. This number is the answer
--- to "what if there are too many untraced values": if it fits in the file, the
--- traced fallback is enough and nothing needs a frame; if it does not, a real
--- spiller does, and this says by how much.
+--- Pressure counting only the values that have nowhere free to go.
+---
+--- This number is the answer to "what if there are too many untraced values":
+--- if it fits in the file, the traced fallback is enough and nothing needs a
+--- frame; if it does not, a real spiller does, and this says by how much.
 fun untracedPressure(f : Func A.Inst) -> Pressure {
+    -- An untraced value has no root slot, so spilling one needs a real stack
+    -- slot and therefore a frame -- which does not exist yet.
     let liveOut = Ssa.liveness(f)
     let traced = BitSet.new(len(f.reps))
     for var id = 0; id < len(f.reps); id = id + 1 {
@@ -1152,12 +1152,12 @@ fun untracedPressure(f : Func A.Inst) -> Pressure {
     Pressure { gp = gp, fp = fp }
 }
 
--- The most values live across any single call, traced and untraced together,
--- counting the calls `acrossCalls` counts.
---
--- `acrossCalls` reports the two categories' maxima independently, which can be
--- at different call sites and so understates the worst one. This is the number
--- the callee-saved budget is actually spent against.
+--- The most values live across any single call, traced and untraced together,
+--- counting the calls `acrossCalls` counts.
+---
+--- `acrossCalls` reports the two categories' maxima independently, which can be
+--- at different call sites and so understates the worst one. This is the number
+--- the callee-saved budget is actually spent against.
 fun worstCall(f : Func A.Inst) -> Int {
     let liveOut = Ssa.liveness(f)
     var worst = 0
@@ -1181,19 +1181,20 @@ fun worstCall(f : Func A.Inst) -> Int {
 }
 
 
--- Which register each value would rather have, or `-1`.
---
--- A preference, never a pin: taking it makes a move redundant, and missing it
--- keeps the move and is still correct. A pin could contradict -- a parameter
--- fixed in `x0` and live across a call has had `x0` destroyed -- and a
--- preference cannot, which is the whole reason the calling convention is
--- written as moves (`Select.incoming`, `Select.call`) rather than as
--- constraints.
---
--- Read off those moves: a value moved out of a physical register, or into
--- one, would like that register. That covers the parameters, the arguments and
--- the results at once, where the hints used to cover the parameters alone.
+--- Which register each value would rather have, or `-1`.
+---
+--- A preference, never a pin: taking it makes a move redundant, and missing it
+--- keeps the move and is still correct.
 fun moveHints(f : Func A.Inst) -> Array Int {
+    -- A pin could contradict -- a parameter fixed in `x0` and live across a
+    -- call has had `x0` destroyed -- and a preference cannot, which is the
+    -- whole reason the calling convention is written as moves
+    -- (`Select.incoming`, `Select.call`) rather than as constraints.
+    --
+    -- Read off those moves: a value moved out of a physical register, or into
+    -- one, would like that register. That covers the parameters, the arguments
+    -- and the results at once, where the hints used to cover the parameters
+    -- alone.
     let out = Array.filled(len(f.reps), -1)
     for block in f.blocks {
         for i in block.insts {
@@ -1206,11 +1207,11 @@ fun moveHints(f : Func A.Inst) -> Array Int {
     out
 }
 
--- How many hinted values got the register their move wanted.
---
--- Every miss is one `mov` the emitter keeps. A miss is not a bug -- a value
--- live across a call *must* miss an argument register, which is caller-saved
--- -- so this is a code-quality number rather than a correctness one.
+--- How many hinted values got the register their move wanted.
+---
+--- Every miss is one `mov` the emitter keeps. A miss is not a bug -- a value
+--- live across a call *must* miss an argument register, which is caller-saved
+--- -- so this is a code-quality number rather than a correctness one.
 fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
     let hints = moveHints(f)
     var taken = 0
@@ -1227,19 +1228,19 @@ fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
 
 -- -- spilling ---------------------------------------------------------------
 
--- What has gone to memory, and where.
+--- What has gone to memory, and where.
 type Spills = Spills {
-    -- Spilled value id -> its slot: its root slot if `Turkey.Roots` gave it
-    -- one, a spill slot of its own otherwise.
+    --- Spilled value id -> its slot: its root slot if `Turkey.Roots` gave it
+    --- one, a spill slot of its own otherwise.
     slots          : Map Int A.Mem,
-    -- Rematerialized value id -> its defining instruction. Such a value has
-    -- no slot and no store: its definition is deleted, and each reload of it
-    -- repeats that instruction into the reload's value.
+    --- Rematerialized value id -> its defining instruction. Such a value has
+    --- no slot and no store: its definition is deleted, and each reload of it
+    --- repeats that instruction into the reload's value.
     remat          : Map Int A.Arm,
-    -- Reload value id -> the spilled or rematerialized value it reloads.
+    --- Reload value id -> the spilled or rematerialized value it reloads.
     reloadOf       : Map Int Int,
-    -- The reloads read more than once. Only these may be evicted: a later
-    -- round splits one back into a reload per read.
+    --- The reloads read more than once. Only these may be evicted: a later
+    --- round splits one back into a reload per read.
     shared         : Set.Set Int,
     var spillSlots : Int,
     var stores     : Int,
@@ -1250,39 +1251,41 @@ fun newSpills() -> Spills =
              spillSlots = 0, stores = 0 }
 
 type Allocation = Allocation {
-    -- The function as allocated: unreachable blocks gone, spill code in.
+    --- The function as allocated: unreachable blocks gone, spill code in.
     func        : Func A.Inst,
     colouring   : Colouring,
     spills      : Spills,
-    -- How many times spill code was inserted before the colouring finished.
+    --- How many times spill code was inserted before the colouring finished.
     rounds      : Int,
     var stopped : Option String,
-    -- Each block's live-out set in `func`, from the walk that coloured it:
-    -- what `Turkey.Frame` reads a poll's live registers from.
+    --- Each block's live-out set in `func`, from the walk that coloured it:
+    --- what `Turkey.Frame` reads a poll's live registers from.
     liveOut     : Array BitSet,
 }
 
 let maxRounds = 16
 
--- Spill, then colour, until the colouring finishes.
---
--- A spilled value is stored once, directly after its definition, and reloaded
--- into a fresh value before a read -- once for every read up to the next call,
--- in its block and in the blocks below it that have no other predecessor
--- (`spill`). Every reload dominates its reads, so the function stays in SSA
--- form with no reconstruction -- which here would also mean splitting edges,
--- since a `Branch` cannot carry the block argument a merge would need -- and
--- the chordal theorem still holds for the next walk.
---
--- The walk decides what to spill as it fails (`place`), so the loop is spill
--- what the last walk named, then walk again. It converges because a value is
--- spilled at most once, a store is never spilled, and a reload is spilled only
--- if it has more than one read, into reloads that have one; the cap is a
--- report, not a policy.
---
--- The input is not changed. Selection's output is still printed and measured
--- after this runs, and a pass that mutated it would make both lie.
+--- Spill, then colour, until the colouring finishes.
+---
+--- The input is not changed.
 fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
+    -- A spilled value is stored once, directly after its definition, and
+    -- reloaded into a fresh value before a read -- once for every read up to
+    -- the next call, in its block and in the blocks below it that have no
+    -- other predecessor (`spill`). Every reload dominates its reads, so the
+    -- function stays in SSA form with no reconstruction -- which here would
+    -- also mean splitting edges, since a `Branch` cannot carry the block
+    -- argument a merge would need -- and the chordal theorem still holds for
+    -- the next walk.
+    --
+    -- The walk decides what to spill as it fails (`place`), so the loop is
+    -- spill what the last walk named, then walk again. It converges because a
+    -- value is spilled at most once, a store is never spilled, and a reload is
+    -- spilled only if it has more than one read, into reloads that have one;
+    -- the cap is a report, not a policy.
+    --
+    -- Selection's output is still printed and measured after this runs, and a
+    -- pass that mutated it would make both lie.
     let g = copyFunc(Ssa.pruneUnreachable(f))
     let spills = newSpills()
     var rounds = 0
@@ -1601,13 +1604,13 @@ fun renamedTerm(t : Term, from : Int, to : Int) -> Term = match t {
     Unreachable -> Unreachable
 }
 
--- Whether spill code is what it claims to be.
---
--- `Ssa.verify` and `verifyColouring` still run on the allocated function and
--- still mean what they meant. This is the third check, and the one only
--- spilling needs: a register colouring can be perfect over code whose stores
--- and reloads are in the wrong places, and that is a wrong program which
--- neither of the other two can see.
+--- Whether spill code is what it claims to be.
+---
+--- `Ssa.verify` and `verifyColouring` still run on the allocated function and
+--- still mean what they meant. This is the third check, and the one only
+--- spilling needs: a register colouring can be perfect over code whose stores
+--- and reloads are in the wrong places, and that is a wrong program which
+--- neither of the other two can see.
 fun verifyAllocation(a : Allocation) -> Vec String {
     let out : Vec String = []
     let g = a.func

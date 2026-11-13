@@ -145,6 +145,13 @@ The test: would this comment still be true and useful to someone reading only
 this file a year from now? If it is about the past, it belongs in a commit
 message. If it is about work not done, it belongs in a ticket.
 
+**Doc comments.** Use `---` for the comment a caller reads, directly above an
+exported declaration, field, constructor, method or instance, or as the
+module's first comment; `boot doc` publishes these and nothing else. Start it
+with a verb and state only guarantees. Keep the rationale for how the code
+works in `--` comments inside the body. A `---` comment anywhere else
+documents nothing (`docs/ref/lexical.md`, "Doc comments").
+
 ## Tickets
 
 Work is tracked in tix. Bugs and disagreements found in passing become

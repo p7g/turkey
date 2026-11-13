@@ -3,8 +3,8 @@ export (
     workSeen, sleepForWork, signalWork, collectionSeen, sleepForCollection, signalCollection, stopTheWorld, startTheWorld, stopEnter, stopLeave,
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
-    permits, permitsSet, permitHeld, permitSlot, slotStalled, permitWanted, permitGive, permitAwait,
-    tasksAdd, queued, tasksNone, idlers, idleEnter, idleLeave,
+    permits, permitsSet, permitHeld, permitWanted, permitGive, permitAwait,
+    queuedSet, queued, idlers, idleEnter, idleLeave,
     monitorStart, monitoring, monitorState, monitorCalling, monitorWork, monitorHold, monitorTake,
     monitorHandOut, monitorSleep,
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
@@ -30,11 +30,8 @@ export (
 -- index. A thread keeps the record it starts with for life, so every table
 -- indexed by a thread's index (`Turkey.Coroutine`'s, the heap's) has one
 -- owner. What `TURKEY_WORKERS` counts is permits: a thread takes tasks from
--- the queue only while it holds one (`Turkey.Scheduler.workerLoop`). Each
--- permit has a slot, from 0 below `permits()`, which goes with it from thread
--- to thread, so that what the scheduler keeps per slot follows the permit.
--- Any free permit will do for a thread that wants one, so the count of free
--- ones decides who gets one, and the slot is found after.
+-- the queue only while it holds one (`Turkey.Scheduler.workerLoop`). Permits
+-- are interchangeable, so what is kept is how many no thread holds.
 --
 -- **Blocking calls.** A thread about to wait in a C call that may take as long
 -- as something outside the program does -- a file read, `flock` -- says so
@@ -134,28 +131,12 @@ let callStep : Int = 16
 -- there are.
 var control : Ptr = zeroed(16)
 
--- Which permit each thread holds, by index: the permit's slot plus 1, or 0
--- for none. The thread writes its own entry as it takes or drops a permit,
--- and the monitor writes the entry of a thread it holds (`monitorTake`).
-var slots : Ptr = zeroed(8 * threadLimit())
-
--- Which thread holds each permit, by slot: the thread's index plus 1, or 0
--- for none. Written with `slots`, which it inverts.
-var holders : Ptr = zeroed(8 * threadLimit())
-
--- The slots of the permits no thread holds, one bit each, 64 to a word. A slot
--- is marked free before the count of free permits goes up, and the count goes
--- down before a slot is marked taken, so at every moment at least as many
--- bits are set as the count says. A thread that took one off the count
--- therefore finds a set bit (`slotTake`).
-var freeSlots : Ptr = zeroed(threadLimit() / 8)
-
 -- The permits' words: how many there are; how many no thread holds; 1 while
 -- the program's own stack waits for one, and 2 once a holder has given it one
 -- (`permitAwait`); the epoch it sleeps on; the epoch spare threads sleep on,
 -- and how many do; how many spares the monitor has woken or started that
--- have not yet looked for a permit; the scheduler's counts of queued and
--- running tasks (`tasksAdd`); how many holders are idle, waiting for work; and 1 while the
+-- have not yet looked for a permit; the scheduler's count of runnable tasks
+-- (`queuedSet`); how many holders are idle, waiting for work; and 1 while the
 -- monitor sleeps because every holder is.
 var permitWords : Ptr = zeroed(80)
 
@@ -284,8 +265,6 @@ fun started() -> Bool = Ptr.atomicLoad(control, 8) != 0
 fun mainRegister() -> Unit {
     if Ptr.atomicLoad(control, 8) != 0 { return {} }
     Ptr.store(records, 0, Process.workerRecord())
-    Ptr.atomicStore(slots, 0, 1)
-    Ptr.atomicStore(holders, 0, 1)
     Ptr.atomicStore(control, 8, 1)
 }
 
@@ -334,13 +313,6 @@ fun register(permitted : Bool) -> Ptr {
     Ptr.store(record, 288, n)
     Ptr.store(records, 8 * n, record)
     Ptr.atomicStore(states, 8 * n, if permitted { waitingState } else { plus(waitingState, noPermit) })
-    -- Only `Turkey.Scheduler.start` registers threads that hold a permit, one
-    -- for each permit after the program's own thread's, so the thread's index
-    -- is its permit's slot.
-    if permitted {
-        Ptr.atomicStore(slots, 8 * n, plus(n, 1))
-        Ptr.atomicStore(holders, 8 * n, plus(n, 1))
-    }
     Ptr.atomicStore(control, 8, plus(n, 1))
     record
 }
@@ -563,11 +535,6 @@ fun permitsSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, permitCountAt, n)
 fun permitHeld() -> Bool =
     Ptr.atomicLoad(control, 8) == 0 || (Ptr.atomicLoad(states, mine()) & noPermit) == 0
 
--- Returns the slot of the permit the running thread holds, from 0 below
--- `permits()`, or -1 if it holds none. Returns 0 until the workers start.
-fun permitSlot() -> Int =
-    if Ptr.atomicLoad(control, 8) == 0 { 0 } else { plus(Ptr.atomicLoad(slots, mine()), -1) }
-
 -- Whether the program's own stack is waiting for a permit, which the next
 -- holder to look gives it (`permitGive`).
 fun permitWanted() -> Bool = Ptr.atomicLoad(permitWords, wantedAt) == 1
@@ -586,11 +553,7 @@ fun permitGive() -> Bool {
 -- Give up the running thread's permit: marked as not held, and then free.
 fun permitDrop() -> Unit {
     let at = mine()
-    let slot = permitSlot()
-    Ptr.atomicStore(slots, at, 0)
-    Ptr.atomicStore(holders, slot << 3, 0)
     Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), noPermit))
-    slotFree(slot)
     let _ = Ptr.atomicAdd(permitWords, permitFreeAt, 1)
 }
 
@@ -601,58 +564,11 @@ fun permitTake(program : Bool) -> Bool {
         let free = Ptr.atomicLoad(permitWords, permitFreeAt)
         if Ptr.atomicCas(permitWords, permitFreeAt, free, plus(free, -1)) == free {
             let at = mine()
-            let slot = slotTake()
-            Ptr.atomicStore(holders, slot << 3, plus(index(), 1))
-            Ptr.atomicStore(slots, at, plus(slot, 1))
             Ptr.atomicStore(states, at, Int.subWrapping(Ptr.atomicLoad(states, at), noPermit))
             return True
         }
     }
     False
-}
-
--- Returns whether no thread runs tasks with the permit of `slot`: no thread
--- holds it, or its holder is in a blocking call (`callEnter`). A hint: a
--- thread may take, drop or leave it at any moment.
-fun slotStalled(slot : Int) -> Bool {
-    let holder = plus(Ptr.atomicLoad(holders, slot << 3), -1)
-    if holder < 0 { return True }
-    -- A call, held by the monitor or not (`states`).
-    (Ptr.atomicLoad(states, holder << 3) & 6) == callingState
-}
-
--- Marks `slot` free, before the count of free permits goes up (`freeSlots`).
-fun slotFree(slot : Int) -> Unit {
-    let at = (slot >> 6) << 3
-    let bit = 1 << (slot & 63)
-    while True {
-        let word = Ptr.atomicLoad(freeSlots, at)
-        if Ptr.atomicCas(freeSlots, at, word, word | bit) == word { return {} }
-    }
-}
-
--- Returns a free slot, marked taken, for a thread that has just taken a
--- permit off the count of free ones, so that a set bit is there to find
--- (`freeSlots`).
-fun slotTake() -> Int {
-    let words = plus(permits() >> 6, 1)
-    while True {
-        for var i = 0; i < words; i = plus(i, 1) {
-            let word = Ptr.atomicLoad(freeSlots, i << 3)
-            for var b = 0; word != 0 && b < 64; b = plus(b, 1) {
-                let bit = 1 << b
-                if (word & bit) != 0 {
-                    if Ptr.atomicCas(freeSlots, i << 3, word, word & Int.not(bit)) == word {
-                        return plus(i << 6, b)
-                    }
-                    -- Another thread changed the word: go on to the next,
-                    -- and come back to this one on the next pass.
-                    b = 64
-                }
-            }
-        }
-    }
-    -1
 }
 
 fun permitFree(program : Bool) -> Bool =
@@ -714,21 +630,11 @@ fun spareWake() -> Unit {
     }
 }
 
--- The scheduler's counts of tasks: how many are queued, in the low 32 bits,
--- and how many a thread has taken to run and not yet seen suspend, in the
--- high 32. One word, so that one atomic add moves a task between the two and
--- a single load sees every task queued, running, or neither
--- (`Turkey.Scheduler.stuck`). Adds `queued` and `running` to them and
--- returns the word as it was.
-fun tasksAdd(queued : Int, running : Int) -> Int =
-    Ptr.atomicAdd(permitWords, queuedAt, plus(queued, running << 32))
+-- The scheduler's count of runnable tasks, which the monitor and idle workers
+-- read without its lock. Set under the queue's lock (`Turkey.Scheduler`).
+fun queuedSet(n : Int) -> Unit = Ptr.atomicStore(permitWords, queuedAt, n)
 
--- Returns how many tasks are queued, on any queue. Read by the monitor and by
--- idle workers without a lock.
-fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt) & 0xFFFF_FFFF
-
--- Returns whether no task is queued or running.
-fun tasksNone() -> Bool = Ptr.atomicLoad(permitWords, queuedAt) == 0
+fun queued() -> Int = Ptr.atomicLoad(permitWords, queuedAt)
 
 -- How many holders are idle, between `idleEnter` and `idleLeave`.
 fun idlers() -> Int = Ptr.atomicLoad(permitWords, idlersAt)
@@ -778,7 +684,7 @@ fun monitorCalling(state : Int) -> Bool = (state & 15) == callingState
 fun monitorWork() -> Bool {
     let free = Ptr.atomicLoad(permitWords, permitFreeAt)
     let supply = plus(Ptr.atomicLoad(permitWords, idlersAt), free)
-    queued() > supply
+    Ptr.atomicLoad(permitWords, queuedAt) > supply
         || (Ptr.atomicLoad(permitWords, wantedAt) == 1 && free <= 0)
 }
 
@@ -791,10 +697,6 @@ fun monitorHold(i : Int, state : Int) -> Bool =
 -- first so that the thread may take it back. A thread that returned from its
 -- call meanwhile sleeps on the collection epoch.
 fun monitorTake(i : Int, state : Int) -> Unit {
-    let slot = plus(Ptr.atomicLoad(slots, 8 * i), -1)
-    Ptr.atomicStore(slots, 8 * i, 0)
-    Ptr.atomicStore(holders, slot << 3, 0)
-    slotFree(slot)
     let _ = Ptr.atomicAdd(permitWords, permitFreeAt, 1)
     Ptr.atomicStore(states, 8 * i, plus(state, noPermit))
     signalCollection()

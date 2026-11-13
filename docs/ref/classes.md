@@ -301,7 +301,7 @@ Only `eq`, `lt`, `hashInto` and `debug` are written; the other methods are the
 class's defaults, so `<=` is `lt(x, y) || eq(x, y)`.
 
 A tuple of any length gets the same instances, and `Ord` and `Show` too,
-without asking, wherever its elements have them. It is treated as a type with
+without asking, wherever its elements have them. It behaves like a type with
 one positional constructor holding its elements: two tuples are equal when
 their elements are, the first unequal element decides their order, and a
 tuple prints as its elements in parentheses, each with its `Debug`, for both

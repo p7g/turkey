@@ -239,8 +239,10 @@ fun main() {
 ```
 
 A [partial annotation](declarations.md#partial-annotations) also keeps a local
-`fun` generalized, because each type variable its header writes must stay a
-type of its own.
+`fun` generalized, because each type variable new to its header must stay a
+type of its own. A name the function around it has written is that function's
+type variable instead ([Scope of type
+variables](declarations.md#scope-of-type-variables)).
 
 > **For readers new to this.** A binding that uses a parameter can have the
 > parameter's type in its own type, and that type belongs to the function

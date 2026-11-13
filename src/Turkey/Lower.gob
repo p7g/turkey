@@ -193,10 +193,10 @@ type Lowerer = Lowerer {
     classes      : ClassTable,
     env          : Env,
     types        : TypeTable,
-    -- While a method body is being lowered: which rigid constant in it stands
-    -- for which quantified variable. Empty everywhere else, because nothing else
-    -- is checked against skolems.
-    var rigid    : Map String VarCell,
+    -- While a body checked against skolems is being lowered (a method's, or a
+    -- signature's, with the signatures around it): which rigid constant in it,
+    -- by `uid`, stands for which quantified variable. Empty everywhere else.
+    var rigid    : Map Int VarCell,
     -- Surface expressions already lowered, and what they lowered to. Only
     -- A-normalization puts anything here, and only for as long as it takes to
     -- rebuild one node around its operands.
@@ -627,7 +627,7 @@ fun exported(l : Lowerer, x : Export, binders : Vec VarCell,
     let rigid = Map.new()
     for (k, v) in Map.entries(saved) { Map.put(rigid, k, v) }
     for v in binders {
-        if let Some(TCon(c)) = Map.get(x.skolems, v.id) { Map.put(rigid, c.name, v) }
+        if let Some(TCon(c)) = Map.get(x.skolems, v.id) { Map.put(rigid, c.uid, v) }
     }
     l.rigid = rigid
     let inner = withDicts(l, bound, fun() {
@@ -1996,14 +1996,14 @@ fun methodAbstraction(info : MethodInfo, body : Core, where : Option Span) -> Co
 
 -- Set the constant-to-variable map for one method body, and answer what it was.
 fun setSkolems(l : Lowerer, impl : MethodImpl, info : MethodInfo,
-               headVars : Vec VarCell) -> Map String VarCell {
+               headVars : Vec VarCell) -> Map Int VarCell {
     let byId = Map.new()
     for v in headVars { Map.put(byId, v.id, v) }
     for q in info.scheme.quantified { Map.put(byId, q.id, q) }
     let rigid = Map.new()
     for (varId, con) in Map.entries(impl.skolems) {
         match (Map.get(byId, varId), con) {
-            (Some(v), TCon(c)) -> Map.put(rigid, c.name, v)
+            (Some(v), TCon(c)) -> Map.put(rigid, c.uid, v)
             _ -> {}
         }
     }
@@ -2127,7 +2127,7 @@ fun underInstance(l : Lowerer, inst : InstInfo, plan : InstancePlan,
                   f : fun() -> Core) -> Core {
     let rigid = Map.new()
     for v in instanceBinders(inst) {
-        if let Some(TCon(c)) = Map.get(plan.skolems, v.id) { Map.put(rigid, c.name, v) }
+        if let Some(TCon(c)) = Map.get(plan.skolems, v.id) { Map.put(rigid, c.uid, v) }
     }
     let saved = l.rigid
     l.rigid = rigid
@@ -2196,8 +2196,11 @@ fun function(l : Lowerer, decl : FunDecl, ty : Ty.Type, scope : Scope,
 -- matters: a *method* declared inside an instance has no signature of its own,
 -- so this path finds nothing to say, and must not thereby erase what the
 -- instance said.
+-- The map extends the enclosing one rather than replacing it. A nested
+-- signature may name an enclosing function's type variable, so its body's
+-- recorded types can hold the enclosing signature's constants too.
 fun signatureSkolems(l : Lowerer, dicts : Option Abstraction,
-                     ty : Ty.Type) -> Map String VarCell {
+                     ty : Ty.Type) -> Map Int VarCell {
     let saved = l.rigid
     match dicts {
         None -> return saved
@@ -2206,9 +2209,10 @@ fun signatureSkolems(l : Lowerer, dicts : Option Abstraction,
             let byId = Map.new()
             for v in Ty.varsOf([ty]) { Map.put(byId, v.id, v) }
             let rigid = Map.new()
+            for (k, v) in Map.entries(saved) { Map.put(rigid, k, v) }
             for (varId, con) in Map.entries(a.skolems) {
                 match (Map.get(byId, varId), con) {
-                    (Some(v), TCon(c)) -> Map.put(rigid, c.name, v)
+                    (Some(v), TCon(c)) -> Map.put(rigid, c.uid, v)
                     _ -> {}
                 }
             }
@@ -2232,7 +2236,10 @@ fun wrapDicts(l : Lowerer, inner : Core, bound : Array (String, Int), preds : Ve
     if len(bound) == 0 && len(equalities) == 0 { return inner }
     let dicts = Array.init(len(bound), fun(i) {
         let (name, id) = bound[i]
-        CParam { name = name, id = id, ty = dictType(l, preds[i].name, preds[i].args[0]) }
+        -- Read through `l.rigid`: a nested signature's context may constrain
+        -- an enclosing signature's variable, which the predicate names by
+        -- its rigid constant.
+        CParam { name = name, id = id, ty = predType(l, preds[i]) }
     })
     let coercions = Array.map(Vec.toArray(equalities), fun((left, right)) =
         CParam { name = "%co", id = mint(l, "%co"), ty = coercionOf(left, right) })
@@ -2381,11 +2388,12 @@ fun rigidly(l : Lowerer, t : Ty.Type) -> Ty.Type {
 -- Replace the rigid constants of a method body with their variables.
 --
 -- Substitution cannot do this: it maps variables to types, and here it is
--- constants that have to go. A skolem is a constructor whose name is the one the
--- declaration wrote, which is what makes the map keyable by name.
-fun unskolem(t : Ty.Type, rigid : Map String VarCell) -> Ty.Type =
+-- constants that have to go. The map is keyed by the constant's `uid`, not its
+-- name. A name is unique only among one signature's constants, and a nested
+-- signature's body holds the enclosing signature's constants as well.
+fun unskolem(t : Ty.Type, rigid : Map Int VarCell) -> Ty.Type =
     match Ty.prune(t) {
-        TCon(c) -> match Map.get(rigid, c.name) {
+        TCon(c) -> match Map.get(rigid, c.uid) {
             Some(v) -> TVar(v)
             None -> Ty.prune(t)
         }

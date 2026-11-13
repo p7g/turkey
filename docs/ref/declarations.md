@@ -678,9 +678,57 @@ a x3
 Annotations on types that contain no type variables, such as `n : Int`, simply
 fix that type.
 
-Type variables are scoped to the whole function declaration: an `a` in a
+### Scope of type variables
+
+A type variable is scoped to the whole function declaration: an `a` in a
 parameter, the return type, and an annotation inside the body all refer to the
-same type.
+same type. That includes the annotations of a [local
+function](#local-functions) or a lambda in the body. A name the function around
+it has already written, in its header or in an annotation before it, is that
+function's type variable. A local signature quantifies only the type variables
+new to it.
+
+Here `pair` is polymorphic in `c` and is used at two types, but its `k` is
+`describe`'s `k`, the type of the `x` it captures:
+
+<!-- run -->
+```kotlin
+fun describe(x : k) -> String {
+    fun pair(y : c) -> (k, c) = (x, y)
+    let (_, n) = pair(3)
+    let (_, s) = pair("three")
+    show(n) + " " + s
+}
+
+fun main() {
+    print(describe(1.5))
+    print(describe(True))
+}
+```
+
+```text
+3 three
+3 three
+```
+
+So a local signature that reuses a name does not get a type variable of its
+own. Here `twice` takes `label`'s `a`, which a caller of `label` chooses, so it
+cannot be applied to a `String`:
+
+<!-- error: expected 'a', found 'String' in a function call -->
+```kotlin
+fun label(x : a) -> String {
+    fun twice(y : a) -> Array a = [y, y]
+    show(len(twice("s")))
+}
+```
+
+To give a local function a type variable of its own, use a name that the
+functions around it have not written.
+
+> **For readers new to this.** `pair`'s type is `fun(c) -> (k, c)` for every
+> `c`, but for one `k`: the type that the call of `describe` it was made in
+> chose. GHC calls such a variable a *scoped type variable*.
 
 ## Contexts
 

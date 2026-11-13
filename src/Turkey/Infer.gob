@@ -273,6 +273,25 @@ fun typeOf(g : Generator, te : Type) -> Ty.Type =
     Decls.star(g.decls, te, g.tyvarScopes[len(g.tyvarScopes) - 1],
                fun() = freshCell(g))
 
+-- Returns a new copy of the type variables in scope for a function that
+-- starts here: those of the enclosing function, or none at the top level.
+fun enclosingScope(g : Generator) -> Map String Ty.Type {
+    -- A nested function sees the names its enclosing function has written,
+    -- as GHC's renamer leaves an in-scope name out of a signature's implicit
+    -- quantification (`filterInScope`). So a nested signature quantifies only
+    -- the names new to it, and a name the enclosing function writes is one
+    -- type throughout that function.
+    -- The bottom scope belongs to no function. It collects the names of
+    -- top-level `let` annotations, and a function must not inherit those.
+    let scope = Map.new()
+    if len(g.tyvarScopes) > 1 {
+        for (n, t) in Map.entries(g.tyvarScopes[len(g.tyvarScopes) - 1]) {
+            Map.put(scope, n, t)
+        }
+    }
+    scope
+}
+
 fun freshCell(g : Generator) -> VarCell {
     let v = Ty.freshVar(0)
     Vec.push(g.frames[len(g.frames) - 1].vars, v)
@@ -1271,12 +1290,20 @@ fun declaredScheme(g : Generator,
             _ -> return None
         }
     }
-    let tyvars = Map.new()
+    let inherited = enclosingScope(g)
+    let scope = enclosingScope(g)
     let params = Array.map(annots, fun(a) =
-        Decls.star(g.decls, a, tyvars, fun() = freshCell(g)))
-    let retType = Decls.star(g.decls, ret, tyvars, fun() = freshCell(g))
-    let preds = Classes.resolveContext(g.classes, decl.context, tyvars,
+        Decls.star(g.decls, a, scope, fun() = freshCell(g)))
+    let retType = Decls.star(g.decls, ret, scope, fun() = freshCell(g))
+    let preds = Classes.resolveContext(g.classes, decl.context, scope,
                                        Some(fun() = freshCell(g)))
+    -- The signature's own variables are the names it added to the scope. An
+    -- inherited one is the enclosing function's, which its own implication
+    -- binds, so this scheme mentions it free.
+    let tyvars = Map.new()
+    for (name, v) in Map.entries(scope) {
+        if !Map.contains(inherited, name) { Map.put(tyvars, name, v) }
+    }
     let quantified = Vec.new(4)
     for (_, v) in Map.entries(tyvars) {
         match v {
@@ -1285,11 +1312,14 @@ fun declaredScheme(g : Generator,
         }
     }
     let body = TFun(params, retType)
-    -- A constraint is about the function's type variables: a class applied to
-    -- one or to a type built from one. Whether the type determines them is
-    -- the ambiguity check's business (`ambiguityOf`).
+    -- A constraint is about type variables in scope: a class applied to one or
+    -- to a type built from one. Whether the type determines them is the
+    -- ambiguity check's business (`ambiguityOf`). An enclosing function's
+    -- variable counts. In a checked enclosing function it is a rigid constant
+    -- here, not a variable.
     for var i = 0; i < len(preds) && i < len(decl.context); i = i + 1 {
-        if len(Ty.varsOf(preds[i].args)) == 0 {
+        let args = preds[i].args
+        if len(Ty.varsOf(args)) == 0 && len(Ty.skolemsOf(args)) == 0 {
             Ty.typeError("'" + Ty.showWritten(preds[i]) + "' constrains no type variable; "
                          + "remove it from the context", Some(decl.context[i].span))
         }
@@ -1767,7 +1797,9 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
 -- No rank is pushed: a lambda is not a generalization point, so its parameters
 -- live at whatever rank the enclosing binder established.
 --
--- `rigid` is the annotation scope to work in, and passing one is what
+-- The function's annotations see the type variables of the functions around
+-- it (`enclosingScope`), and add their own names to that.
+-- `rigid` is the signature's own scope, and passing one is what
 -- distinguishes checking from inferring. It maps each name the signature
 -- quantifies to a skolem constant, so every annotation in the body reads the
 -- *same* rigid type the signature promised -- and, since the context is then a
@@ -1783,7 +1815,8 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
                 bodyExpr : Option Expr, where : Span, context : Vec Ast.Pred,
                 rigid : Option (Map String Ty.Type), key : Int,
                 expected : Option (Ty.Type, String)) -> Ty.Type {
-    let scope = Map.new()
+    let inherited = enclosingScope(g)
+    let scope = enclosingScope(g)
     match rigid {
         Some(r) -> for (n, t) in Map.entries(r) { Map.put(scope, n, t) }
         None -> {}
@@ -1847,11 +1880,13 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
             for p in written {
                 emit(g, C.cpredOf(p, Some(where), "the context this function declares"))
             }
-            -- The header has been read and the body has not, so the scope holds
-            -- exactly the variables the header wrote.
+            -- The header has been read and the body has not, so the names the
+            -- scope holds and did not inherit are exactly the variables the
+            -- header wrote.
             if key >= 0 {
                 let header = Vec.new(4)
                 for (n, t) in Map.entries(g.tyvarScopes[len(g.tyvarScopes) - 1]) {
+                    if Map.contains(inherited, n) { continue }
                     match t {
                         TVar(_) -> Vec.push(header, (n, t))
                         _ -> {}

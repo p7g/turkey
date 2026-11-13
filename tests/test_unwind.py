@@ -431,8 +431,6 @@ def _built(program: str, how: str) -> Path:
     beside its object, through the assembler for `asm` or written by `boot`
     for `obj`, and not position-independent on Linux, so that the addresses
     `nm` reads are the ones gdb stops at; or written by `boot` for `exe`."""
-    if how == "exe" and not _darwin():
-        pytest.skip("the ELF executable boot writes carries no .eh_frame yet")
     directory = Path(tempfile.mkdtemp(prefix="turkey-unwind-"))
     (directory / "prog.gob").write_text(SOURCES[program], encoding="utf-8")
     output = {"asm": "prog.s", "obj": "prog.o", "exe": "prog"}[how]
@@ -532,9 +530,14 @@ def test_every_function_has_an_fde(how):
     out = subprocess.run(["readelf", "--debug-dump=frames", str(directory / "prog")],
                          capture_output=True, text=True, check=True).stdout
     starts = {int(start, 16) for start in re.findall(r"FDE cie=\S+ pc=([0-9a-f]+)\.\.", out)}
-    ours = set(_functions(directory / "prog.o"))
-    functions = {name: address for name, address in _functions(directory / "prog").items()
-                 if name in ours}
+    linked = _functions(directory / "prog")
+    if how == "exe":
+        # Every function is the module's, but `_start`, which the writer
+        # adds and describes by no FDE.
+        functions = {name: address for name, address in linked.items() if name != "_start"}
+    else:
+        ours = set(_functions(directory / "prog.o"))
+        functions = {name: address for name, address in linked.items() if name in ours}
     missing = sorted(name for name, address in functions.items() if address not in starts)
     assert functions and not missing, f"functions with no FDE: {missing}"
 
@@ -570,6 +573,15 @@ def _stops(directory: Path, function: str) -> dict[str, int]:
             re.finditer(r"^\s*([0-9a-f]+):.*\bret\b", out, re.MULTILINE)]
     assert rets, out[-2000:]
     return {"first": start, "ret": rets[0]}
+
+
+def _gdb_break(directory: Path, function: str, where: str) -> str:
+    """gdb's command to stop at `where` in `function`, as `_stops` finds it,
+    named as a distance from the function's symbol. An executable `boot`
+    writes is position-independent, and gdb moves a breakpoint named by a
+    symbol to where the program is loaded, but not one named by an address."""
+    stops = _stops(directory, function)
+    return f"break *((char *) '{function}' + {stops[where] - stops['first']})"
 
 
 def _debugged(directory: Path, argv: list[str]) -> str:
@@ -611,8 +623,8 @@ def test_lldb_shows_the_whole_stack_on_entry_and_return(how, where):
 def test_gdb_shows_the_whole_stack_on_entry_and_return(how, where):
     gdb = _gdb()
     directory = _built("fact", how)
-    address = _stops(directory, "Main#fact")[where]
-    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", f"break *{address:#x}",
+    stop = _gdb_break(directory, "Main#fact", where)
+    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", stop,
                                 "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"])
     frames = _gdb_frames(out)
     assert frames[:1] == ["Main#fact"], out[-4000:]
@@ -638,8 +650,8 @@ def test_lldb_ends_a_coroutines_stack_at_its_base(how):
 def test_gdb_ends_a_coroutines_stack_at_its_base(how):
     gdb = _gdb()
     directory = _built("task", how)
-    address = _stops(directory, "Main#leaf")["first"]
-    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", f"break *{address:#x}",
+    stop = _gdb_break(directory, "Main#leaf", "first")
+    out = _debugged(directory, [gdb, "-nx", "-batch", "-ex", stop,
                                 "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"])
     frames = _gdb_frames(out)
     assert frames[:1] == ["Main#leaf"], out[-4000:]

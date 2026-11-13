@@ -11,14 +11,15 @@ export (executableFile)
 --
 -- * Read-only: the ELF header and program headers, the interpreter's path,
 --   the build ID note, the dynamic symbols, their hash table and strings,
---   the dynamic relocations, then the C strings and the constants.
+--   the dynamic relocations, the C strings and the constants, then
+--   `.eh_frame` and `.eh_frame_hdr`.
 -- * Read and execute: the module's code, `_start`, and the import stubs.
 -- * Read and write, then read-only once relocated (`PT_GNU_RELRO`): the
 --   dynamic section and the global offset table.
 -- * Read and write: the data.
 --
--- After them, outside every segment, the symbol table, its strings, the
--- section names and the section headers.
+-- After them, outside every segment, the debug sections, the symbol table,
+-- its strings, the section names and the section headers.
 --
 -- **Imports.** Every field is filled in here (`Turkey.Image`); the image has
 -- no `R_AARCH64_RELATIVE`, since the loaded sections hold no absolute
@@ -61,8 +62,25 @@ export (executableFile)
 -- a section header for every loaded section, so that `nm`, `perf` and gdb
 -- name every function: locals first, then `_start` and the module's
 -- exported symbols, then the imports, undefined. A temporary label never
--- is. There are no unwind or debug sections; the runtime finds frames by
--- their frame pointers and the frame table, and needs neither.
+-- is.
+--
+-- **Unwind information**, which every build carries: the module's
+-- `.eh_frame`, ended by a zero length, which is how an unwinder that walks
+-- it finds its end. `.eh_frame_hdr` indexes it, and `PT_GNU_EH_FRAME` covers
+-- exactly the index, which is how libgcc's and LLVM's unwinders, and so
+-- glibc's `backtrace`, find a function's FDE: without the program header
+-- they find none. The index holds one FDE per function, sorted by the
+-- function's address, for a binary search. gdb and lldb read `.eh_frame`
+-- through its section header instead, and never read the index. The
+-- runtime finds frames by their frame pointers and the frame table, and
+-- reads neither.
+--
+-- **Debug information**, when the module has any, is its debug sections as
+-- they are, with their addresses filled in, written after the last segment
+-- and loaded by none: section headers of their own with no flags and no
+-- address, as a linker leaves them, so that `strip` removes them and
+-- `objcopy --only-keep-debug` keeps them. `.debug_gdb_scripts` is among
+-- them. They are not compressed.
 --
 -- **Deterministic.** Nothing in the file depends on the host, the time or
 -- the path it is written to. The build ID (`NT_GNU_BUILD_ID`), which
@@ -77,7 +95,8 @@ import Turkey.Arm64 as A
 import Turkey.Arm64 (Mem(..), Width(..))
 import Turkey.Arm64.Encode as Encode
 import Turkey.Arm64.Encode (Fixup(..))
-import Turkey.Assembler (Object(..), SectionData(..))
+import Turkey.Assembler (Object(..), SectionData(..), Relocation(..), Definition(..))
+import Turkey.Elf as Elf
 import Turkey.Executable (stubSize, stubs, check, copy, alignUp)
 import Turkey.Image as Image
 
@@ -92,8 +111,9 @@ let dynamicSize = 16
 let noteSize = 36
 let hashSize = 28
 
--- `PHDR INTERP LOAD LOAD LOAD LOAD DYNAMIC GNU_RELRO GNU_STACK NOTE`.
-let programHeaderCount = 10
+-- `PHDR INTERP LOAD LOAD LOAD LOAD DYNAMIC GNU_RELRO GNU_EH_FRAME GNU_STACK
+-- NOTE`.
+let programHeaderCount = 11
 
 -- The dynamic tags besides one `DT_NEEDED` per library, `DT_NULL` among them.
 let dynamicTags = 12
@@ -137,6 +157,7 @@ let ptDynamic = 2
 let ptInterp = 3
 let ptNote = 4
 let ptPhdr = 6
+let ptGnuEhFrame = 0x6474E550
 let ptGnuStack = 0x6474E551
 let ptGnuRelro = 0x6474E552
 
@@ -175,8 +196,18 @@ let sttFunc = 2
 -- The note type of a build ID, `NT_GNU_BUILD_ID`.
 let ntGnuBuildId = 3
 
--- The section headers, by index. `.rodata` covers the C strings and the
--- constants, which are adjacent.
+-- `.eh_frame_hdr`'s encodings: `.eh_frame`'s address as a distance from
+-- the field (`DW_EH_PE_pcrel | DW_EH_PE_sdata4`), the count in four bytes
+-- (`DW_EH_PE_udata4`), and the table's addresses as distances from the
+-- index's start (`DW_EH_PE_datarel | DW_EH_PE_sdata4`). libgcc searches the
+-- table only with the last; with any other it scans `.eh_frame` instead.
+let ehFramePointer = 0x1B
+let ehFrameCount = 0x03
+let ehFrameTable = 0x3B
+
+-- The loaded sections' headers, by index. `.rodata` covers the C strings
+-- and the constants, which are adjacent. The debug sections follow `.data`,
+-- then `.symtab`, `.strtab` and `.shstrtab`.
 let interpSection = 1
 let noteSection = 2
 let dynsymSection = 3
@@ -184,16 +215,14 @@ let hashSection = 4
 let dynstrSection = 5
 let relaSection = 6
 let rodataSection = 7
-let textSection = 8
-let stubsSection = 9
-let dynamicSection = 10
-let gotSection = 11
-let relroPaddingSection = 12
-let dataSection = 13
-let symtabSection = 14
-let strtabSection = 15
-let shstrtabSection = 16
-let sectionCount = 17
+let ehFrameSection = 8
+let ehFrameHdrSection = 9
+let textSection = 10
+let stubsSection = 11
+let dynamicSection = 12
+let gotSection = 13
+let relroPaddingSection = 14
+let dataSection = 15
 
 -- A shared library, by its soname, and the symbols imported from it.
 type Library = Library { soname : String, symbols : Array Symbol }
@@ -219,6 +248,21 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let constants = 2
     let data = 3
     check(sections)
+    -- The rest: `.eh_frame`, -1 if the module has none, and the debug
+    -- sections, in the order the assembler made them.
+    var ehFrame = -1
+    let debug = []
+    for var k = data + 1; k < len(sections); k = k + 1 {
+        match sections[k].kind {
+            Asm.EhFrame -> { ehFrame = k }
+            _ -> Vec.push(debug, k)
+        }
+    }
+    let symtabSection = dataSection + len(debug) + 1
+    let strtabSection = symtabSection + 1
+    let shstrtabSection = strtabSection + 1
+    let sectionCount = shstrtabSection + 1
+    let frames = indexed(obj, ehFrame)
     let libraries = librariesOf(obj.undefined, needed)
     let imports = []
     for l in libraries { for sym in l.symbols { Vec.push(imports, sym) } }
@@ -239,7 +283,14 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let cstringsAt = alignUp(relaAt + relocationSize * n, 1 << sections[cstrings].align)
     let constantsAt = alignUp(cstringsAt + len(sections[cstrings].bytes),
                               1 << sections[constants].align)
-    let readOnlyEnd = constantsAt + len(sections[constants].bytes)
+    let rodataEnd = constantsAt + len(sections[constants].bytes)
+    -- `.eh_frame` with its four-byte terminator, and its index.
+    let ehFrameAlign = if ehFrame >= 0 { 1 << max(sections[ehFrame].align, 2) } else { 4 }
+    let ehFrameAt = alignUp(rodataEnd, ehFrameAlign)
+    let ehFrameSize = (if ehFrame >= 0 { len(sections[ehFrame].bytes) } else { 0 }) + 4
+    let ehFrameHdrAt = alignUp(ehFrameAt + ehFrameSize, 4)
+    let ehFrameHdrSize = 12 + 8 * len(frames)
+    let readOnlyEnd = ehFrameHdrAt + ehFrameHdrSize
     -- The code segment.
     let textAt = alignUp(readOnlyEnd, 1 << sections[text].align)
     let startAt = alignUp(textAt + len(sections[text].bytes), 4)
@@ -256,23 +307,34 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let dataAt = alignUp(relroEnd, 1 << sections[data].align)
     let dataSlide = placed(dynamicAt + relroSlide + relroMemory, dataAt) - dataAt
     let dataEnd = dataAt + len(sections[data].bytes)
+    -- The debug sections, after every segment.
+    let debugAt = []
+    var debugEnd = dataEnd
+    for k in debug {
+        debugEnd = alignUp(debugEnd, 1 << sections[k].align)
+        Vec.push(debugAt, debugEnd)
+        debugEnd = debugEnd + len(sections[k].bytes)
+    }
 
     let addresses = Array.filled(len(sections), -1)
     addresses[text] = textAt + codeSlide
     addresses[cstrings] = cstringsAt
     addresses[constants] = constantsAt
     addresses[data] = dataAt + dataSlide
+    if ehFrame >= 0 { addresses[ehFrame] = ehFrameAt }
     let sectionOf = Array.filled(len(sections), 0)
     sectionOf[text] = textSection
     sectionOf[cstrings] = rodataSection
     sectionOf[constants] = rodataSection
     sectionOf[data] = dataSection
 
-    -- Every field filled in, with each import standing for its stub.
+    -- Every field filled in, with each import standing for its stub, and
+    -- each debug section's addresses the code's.
     let stubOf = Map.new()
     for var k = 0; k < n; k = k + 1 { Map.put(stubOf, Asm.spell(imports[k]), k) }
     let stubAddress = fun(k) = stubsAt + codeSlide + stubSize * k
-    Image.apply(Encode.isa(), obj, addresses, [], fun(sym) = match Map.get(stubOf, Asm.spell(sym)) {
+    Image.apply(Encode.isa(), obj, addresses, Vec.toArray(debug),
+                fun(sym) = match Map.get(stubOf, Asm.spell(sym)) {
         Some(k) -> stubAddress(k)
         None -> error("internal error: " + Asm.spell(sym) + " is neither defined nor imported")
     })
@@ -292,7 +354,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let strings = []
     Vec.push(strings, Byte.truncate(0))
     let nameAt = Vec.map(entries, fun(e) = intern(strings, e.name))
-    let symtabAt = alignUp(dataEnd, 8)
+    let symtabAt = alignUp(debugEnd, 8)
     let strtabAt = symtabAt + symbolSize * len(entries)
 
     let headers = [
@@ -311,8 +373,10 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
         Section { name = ".rela.dyn", kind = shtRela, flags = shfAlloc, address = relaAt,
                   offset = relaAt, size = relocationSize * n, link = dynsymSection, info = 0,
                   align = 8, entry = relocationSize },
-        loaded(".rodata", shtProgbits, shfAlloc, cstringsAt, 0, readOnlyEnd - cstringsAt,
+        loaded(".rodata", shtProgbits, shfAlloc, cstringsAt, 0, rodataEnd - cstringsAt,
                1 << max(sections[cstrings].align, sections[constants].align)),
+        loaded(".eh_frame", shtProgbits, shfAlloc, ehFrameAt, 0, ehFrameSize, ehFrameAlign),
+        loaded(".eh_frame_hdr", shtProgbits, shfAlloc, ehFrameHdrAt, 0, ehFrameHdrSize, 4),
         loaded(".text", shtProgbits, shfAlloc + shfExecInstr, textAt, codeSlide,
                stubsAt - textAt, 1 << max(sections[text].align, 2)),
         -- No procedure linkage table, which has a shape of its own that tools
@@ -333,13 +397,21 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
                   entry = 0 },
         loaded(".data", shtProgbits, shfAlloc + shfWrite, dataAt, dataSlide, dataEnd - dataAt,
                1 << sections[data].align),
-        Section { name = ".symtab", kind = shtSymtab, flags = 0, address = 0,
-                  offset = symtabAt, size = strtabAt - symtabAt, link = strtabSection,
-                  info = locals, align = 8, entry = symbolSize },
-        Section { name = ".strtab", kind = shtStrtab, flags = 0, address = 0,
-                  offset = strtabAt, size = len(strings), link = 0, info = 0, align = 1,
-                  entry = 0 },
     ]
+    for var j = 0; j < len(debug); j = j + 1 {
+        let s = sections[debug[j]]
+        let (name, flags) = Elf.names(s.kind)
+        Vec.push(headers, Section { name = name, kind = shtProgbits, flags = flags, address = 0,
+                                    offset = debugAt[j], size = len(s.bytes), link = 0,
+                                    info = 0, align = 1 << s.align, entry = 0 })
+    }
+    Vec.push(headers, Section { name = ".symtab", kind = shtSymtab, flags = 0, address = 0,
+                                offset = symtabAt, size = strtabAt - symtabAt,
+                                link = strtabSection, info = locals, align = 8,
+                                entry = symbolSize })
+    Vec.push(headers, Section { name = ".strtab", kind = shtStrtab, flags = 0, address = 0,
+                                offset = strtabAt, size = len(strings), link = 0, info = 0,
+                                align = 1, entry = 0 })
     let shstrtab = []
     Vec.push(shstrtab, Byte.truncate(0))
     let shstrtabAt = strtabAt + len(strings)
@@ -405,6 +477,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
             gotAt - dynamicAt, 8)
     segment(ptGnuRelro, pfR, dynamicAt, dynamicAt + relroSlide, relroEnd - dynamicAt,
             relroMemory, 1)
+    segment(ptGnuEhFrame, pfR, ehFrameHdrAt, ehFrameHdrAt, ehFrameHdrSize, ehFrameHdrSize, 4)
     -- Without `PT_GNU_STACK`, the loader makes the stack executable.
     segment(ptGnuStack, pfR + pfW, 0, 0, 0, 0, 16)
     segment(ptNote, pfR, noteAt, noteAt, noteSize, noteSize, 4)
@@ -444,6 +517,18 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     }
     copy(out, cstringsAt, sections[cstrings].bytes)
     copy(out, constantsAt, sections[constants].bytes)
+    -- `.eh_frame`, whose terminator is already zero, and `.eh_frame_hdr`:
+    -- version 1, the encodings, `.eh_frame`'s address, the count, and each
+    -- function's address with its FDE's.
+    if ehFrame >= 0 { copy(out, ehFrameAt, sections[ehFrame].bytes) }
+    at = ehFrameHdrAt
+    for b in [1, ehFramePointer, ehFrameCount, ehFrameTable] { le(1, b) }
+    le(4, ehFrameAt - at)
+    le(4, len(frames))
+    for (code, fde) in frames {
+        le(4, addresses[text] + code - ehFrameHdrAt)
+        le(4, ehFrameAt + fde - ehFrameHdrAt)
+    }
     copy(out, textAt, sections[text].bytes)
     copy(out, startAt, start(startAt + codeSlide, mainAt, startMainStub))
     copy(out, stubsAt, stubs(stubsAt + codeSlide, gotAt + relroSlide, n))
@@ -468,6 +553,7 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
               + Int.toString(gotAt))
     }
     copy(out, dataAt, sections[data].bytes)
+    for var j = 0; j < len(debug); j = j + 1 { copy(out, debugAt[j], sections[debug[j]].bytes) }
     for var k = 0; k < len(entries); k = k + 1 {
         let e = entries[k]
         let p = symtabAt + symbolSize * k
@@ -500,6 +586,38 @@ fun executableFile(obj : Object Fixup, entry : Symbol, needed : Map String Strin
     let digest = SHA256.finish(h)
     for var k = 0; k < 20; k = k + 1 { out[buildIdAt + k] = digest[k] }
     out
+}
+
+-- Returns what `.eh_frame_hdr`'s table holds for section `ehFrame` of `obj`,
+-- `.eh_frame`, or nothing if it is -1: each FDE's function's offset in the
+-- code with the FDE's offset in the section, sorted, and for a function
+-- with two FDEs the first one alone, since a binary search finds one.
+fun indexed(obj : Object Fixup, ehFrame : Int) -> Vec (Int, Int) {
+    let found = []
+    if ehFrame >= 0 {
+        let defined = Map.new()
+        for d in obj.defined { Map.put(defined, Asm.spell(d.symbol), d) }
+        -- An FDE's only relocated field is its function's address, after its
+        -- length and its CIE's offset, four bytes each.
+        for r in obj.sections[ehFrame].relocations {
+            let code = match Map.get(defined, Asm.spell(r.target)) {
+                Some(d) -> if d.section == 0 { d.offset } else {
+                    error("internal error: an FDE describes " + Asm.spell(r.target)
+                          + ", which is not code")
+                }
+                None -> error("internal error: an FDE describes " + Asm.spell(r.target)
+                              + ", which is not defined")
+            }
+            Vec.push(found, (code, r.offset - 8))
+        }
+    }
+    let table = []
+    var last = -1
+    for (code, fde) in Vec.sort(found) {
+        if code != last { Vec.push(table, (code, fde)) }
+        last = code
+    }
+    table
 }
 
 -- Returns the imports grouped by the library that defines them, one group

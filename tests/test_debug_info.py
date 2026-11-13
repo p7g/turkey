@@ -222,8 +222,6 @@ def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
     or `obj`, with `boot` writing the object, each linked with `prog.o`
     beside it as the macOS debug map needs; or `exe`, with `boot` writing
     `prog` itself."""
-    if how == "exe" and not _darwin():
-        pytest.skip("the ELF executable boot writes carries no debug sections yet")
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
     source.write_text(program, encoding="utf-8")

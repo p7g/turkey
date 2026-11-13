@@ -40,7 +40,7 @@ import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        Skolems(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Constraint(..), Instantiates(..), Binding(..), Env(..),
-                           PredCell(..), LetCell(..), Ambiguity(..))
+                           PredCell(..), LetCell(..), Exporting(..), Ambiguity(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
@@ -1032,7 +1032,7 @@ fun carriedFields(g : Generator, inst : InstInfo, info : Decls.TyconInfo, sk : S
         Vec.push(wanteds, CAssume(assumed, None, CLet(LetCell {
             binds = [(C.noBinder, "%carried", Ty.tUnit())], defn = CAnd(inner),
             body = CAnd([]), span = where, topLevel = False, dicts = None,
-            skolems = o.carried.skolems, rigid = [], members = [],
+            skolems = o.carried.skolems, rigid = [], exporting = NoExports,
         })))
     }
 }
@@ -1121,7 +1121,7 @@ fun instanceImplication(givens : Vec (String, Pred, Option Span), self : Pred, s
     CUnit(CAssume(givens, Some(self), CLet(LetCell {
         binds = [(C.noBinder, "%instance " + Ty.showPred(self), Ty.tUnit())],
         defn = wanteds, body = CAnd([]), span = where, topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [], members = [],
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
     })))
 
 -- Returns the `i`th of `spans`, if there is one.
@@ -1222,7 +1222,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     emit(g, CUnit(CAssume(Vec.map(givens, fun((n, p)) = (n, p, None)), None, CLet(LetCell {
         binds = [(C.noBinder, "%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [], members = [],
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
     }))))
     -- Only the constants this scope actually *made*. The mapping also holds the
     -- class variable, whose entry is the instance head rather than a skolem, and
@@ -1383,7 +1383,7 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     CAssume(written, None, CLet(LetCell {
         binds = [(C.noBinder, "%sig." + decl.name, expected)], defn = defn,
         body = CAnd([]), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made, rigid = [], members = [],
+        dicts = None, skolems = sk.made, rigid = [], exporting = NoExports,
     }))
 }
 
@@ -1604,19 +1604,10 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
                 _ -> {}
             }
         }
-        -- Where each binder's `fun` is, if the group is one of `fun`s.
-        let at = Map.new()
-        for item in group {
-            if let SFun(d) = item.kind { Map.put(at, boundAt(g, d.id, d.name, d.span), d.span) }
-        }
-        let members = Vec.new(len(binds))
-        for (id, _, _) in binds {
-            if let Some(where) = Map.get(at, id) { Vec.push(members, where) }
-        }
         node = CLet(LetCell {
             binds = binds, defn = defn, body = body, span = Some(group[0].span),
             topLevel = top, dicts = Some(dicts), skolems = [],
-            rigid = rigid, members = if len(members) == len(binds) { members } else { [] },
+            rigid = rigid, exporting = exportingOf(g, group, binds),
         })
     } else {
         -- No generalization means no new rank, so the definition is solved right
@@ -1632,6 +1623,41 @@ fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type)
     -- is what makes a recursive occurrence an instantiation.
     if len(sigs) > 0 { node = CBind(sigs, node, top) }
     node
+}
+
+-- Returns which binders of the generalizing group `group`, which binds
+-- `binds`, may be exports, and where each is bound.
+fun exportingOf(g : Generator, group : Vec Stmt, binds : Vec (Int, String, Ty.Type))
+        -> Exporting {
+    let at = Map.new()
+    for item in group {
+        match item.kind {
+            SFun(d) -> Map.put(at, boundAt(g, d.id, d.name, d.span), d.span)
+            SLet(pat, _) -> for v in varPatterns(pat) {
+                if let PVar(name) = v.kind { Map.put(at, boundAt(g, v.id, name, v.span), v.span) }
+            }
+            _ -> {}
+        }
+    }
+    let sites = Vec.new(len(binds))
+    for (id, _, _) in binds {
+        match Map.get(at, id) {
+            Some(where) -> Vec.push(sites, where)
+            None -> return NoExports
+        }
+    }
+    match group[0].kind {
+        SFun(_) -> FunExports(sites)
+        SLet(pat, _) -> if isVariable(pat) { NoExports } else { PatternExports(sites) }
+        _ -> NoExports
+    }
+}
+
+-- Returns whether `p` is a name, possibly annotated.
+fun isVariable(p : Pat) -> Bool = match p.kind {
+    PVar(_) -> True
+    PAnnot(inner, _) -> isVariable(inner)
+    _ -> False
 }
 
 -- The binders a group binds, the definition's constraint, whether it
@@ -2453,7 +2479,7 @@ fun openedConstraint(openings : Vec (Array (String, Pred), Vec ConCell),
     CAssume(givens, None, CLet(LetCell {
         binds = [(C.noBinder, "%opened", Ty.tUnit())], defn = inner,
         body = CAnd([]), span = where, topLevel = False,
-        dicts = None, skolems = skolems, rigid = [], members = [],
+        dicts = None, skolems = skolems, rigid = [], exporting = NoExports,
     }))
 }
 

@@ -1,6 +1,7 @@
 export (
     oneOf,
     Constraint(..), Instantiates(..), PredCell(..), Stage(..), Implication(..), LetCell(..),
+    Exporting(..),
     Ambiguity(..),
     cpredOf, cpredInto, newCell, nakedCell,
     noBinder,
@@ -294,9 +295,9 @@ type PredCell = PredCell {
     -- The predicate as the cell was created, before solving rewrote it. An
     -- equality's coercion has this type (`ByCoercion`).
     posed    : Pred,
-    -- The binder whose scheme is a wrapper around its group's (`exportOf`),
-    -- as the tree spells it, if this is a wanted of the wrapper or one it
-    -- reduced to, and "" otherwise.
+    -- If this is a wanted of a wrapper around a group's scheme (`exportOf`)
+    -- or one it reduced to, what a diagnostic says needs it: "'f' needs
+    -- from its recursive group". Otherwise "".
     var exported : String,
 }
 
@@ -549,11 +550,21 @@ type LetCell = LetCell {
     -- the span of each predicate, checked for rigidity when the group
     -- generalizes.
     rigid    : Vec (String, Span, Vec (String, Ty.Type), Vec Ty.Pred, Vec Span),
-    -- For a group of `fun`s, where each binder's `fun` is, in the order of
-    -- `binds`. Empty for any other group: only a `fun`'s scheme may be a
-    -- wrapper around its group's (`exportOf`).
-    members  : Vec Span,
+    -- Which binders may have a scheme that is a wrapper around the group's
+    -- (`exportOf`), and where each one is bound.
+    exporting : Exporting,
 }
+
+-- The binders of a group that may be exports, GHC's `ABExport`s, with where
+-- each is bound, in the order of `LetCell.binds`.
+type Exporting
+    -- None: the group binds one name, or no name a program wrote.
+    = NoExports
+    -- A group of `fun`s, with where each binder's `fun` is.
+    | FunExports(Vec Span)
+    -- A `let` whose pattern is not a variable, with where each binder is in
+    -- the pattern.
+    | PatternExports(Vec Span)
 
 -- -- the environment ---------------------------------------------------------------
 
@@ -1625,6 +1636,7 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         }
         None -> {}
     }
+    let whole = wholeScheme(s, c, theta, shared)
 
     for var i = 0; i < len(c.binds); i = i + 1 {
         let (id, name, ty) = c.binds[i]
@@ -1659,24 +1671,39 @@ fun letBody(s : Solver, c : LetCell, closed : Bool) -> Unit {
         -- unification and not for anything that reads a type whole, which a
         -- scheme is.
         let body = Inert.rewrite(s.here.inert, ty)
-        -- A `fun`'s body is lowered at a scheme that takes every class
-        -- predicate and equality of the group, and the binder's own scheme
-        -- takes only those it captures. It is a wrapper around the group's
-        -- when that is fewer (`exportOf`). A pattern `let`'s binders, which
-        -- have no lowering for a wrapper yet, each take every class
-        -- predicate of the group.
+        -- An export's own scheme takes only the class predicates it
+        -- captures, and is a wrapper around the scheme its group's code is
+        -- lowered at (`exportOf`). A `fun`'s body is lowered at a scheme that
+        -- takes every class predicate and equality of the group, so its
+        -- binder is an export when it captures fewer. A pattern `let`'s value
+        -- is lowered once for all of its binders, at `whole`, so each of them
+        -- is an export.
         let captured = Vec.filter(shared, captures)
         var scheme = Ty.generalize(body, rank(s),
                                    Classes.minimal(s.classes, Vec.append(own, shared)))
         if let Some(a) = c.dicts {
-            let fewer = len(captured) < len(shared) || len(own) < len(inside)
-            if len(c.members) == len(c.binds) && fewer && id != noBinder {
-                let internal = Ty.generalize(body, rank(s),
-                                             Classes.minimal(s.classes, Vec.append(inside, shared)))
-                scheme = Ty.generalize(body, rank(s),
-                                       Classes.minimal(s.classes, Vec.append(own, captured)))
-                Map.put(a.exports, id, exportOf(s, name, id, internal, scheme, theta,
-                                                Some(c.members[i])))
+            let ownScheme = fun() = Ty.generalize(body, rank(s),
+                                                  Classes.minimal(s.classes, Vec.append(own, captured)))
+            match c.exporting {
+                FunExports(sites) -> {
+                    let fewer = len(captured) < len(shared) || len(own) < len(inside)
+                    if fewer && id != noBinder {
+                        let internal = Ty.generalize(body, rank(s),
+                                                     Classes.minimal(s.classes, Vec.append(inside, shared)))
+                        scheme = ownScheme()
+                        Map.put(a.exports, id, exportOf(s, name, id, internal, scheme, theta,
+                                                        Some(sites[i]), "its recursive group"))
+                    }
+                }
+                PatternExports(sites) -> if let Some((qtvs, preds)) = whole {
+                    if id != noBinder {
+                        scheme = ownScheme()
+                        Map.put(a.exports, id, exportOf(s, name, id, Ty.scheme(qtvs, body, preds),
+                                                        scheme, theta, Some(sites[i]),
+                                                        "the 'let' that binds it"))
+                    }
+                }
+                NoExports -> {}
             }
         }
         let b = Binding { scheme = scheme, mutable = False }
@@ -1951,14 +1978,48 @@ fun inferredAmbiguity(c : LetCell, name : String, scheme : Scheme) -> Ambiguity 
     }
 }
 
+-- Returns the variables and the context of the scheme a pattern `let` `c`,
+-- whose context is `theta`, has its value lowered at, or `None` if the value
+-- takes neither type arguments nor evidence. The scheme quantifies every
+-- variable of the group's types and takes every predicate of `theta`; each
+-- binder's own scheme is a wrapper around it.
+fun wholeScheme(s : Solver, c : LetCell, theta : Vec Pred,
+                shared : Vec Pred) -> Option (Vec VarCell, Vec Pred) {
+    -- GHC's `tcPolyInfer` abstracts a pattern binding's group once, over its
+    -- `qtvs` and `theta`, and `mkExport` matches each binder's own type
+    -- against `forall qtvs. theta => mono_ty` (Note [Impedance matching]).
+    -- The desugarer binds the abstracted value once and selects each binder
+    -- from an instance of it (`dsAbsBinds`, Note [mkSelectorBinds]).
+    -- With no variable and no evidence it binds the pattern directly, which
+    -- is the lowering a `let` with no exports gets.
+    match c.exporting {
+        PatternExports(_) -> {}
+        _ -> return None
+    }
+    let preds = Vec.new(len(theta))
+    var evidence = len(shared) > 0
+    for p in theta {
+        if !Classes.isClass(s.classes, p.name) {
+            Vec.push(preds, Ty.pred(p.name, Array.map(p.args, Inert.rewrite(s.here.inert, _))))
+            if p.name == Ty.equals { evidence = True }
+        }
+    }
+    let all = Classes.minimal(s.classes, Vec.append(preds, shared))
+    let types = Array.map(Vec.toArray(c.binds), fun((_, _, t)) = Inert.rewrite(s.here.inert, t))
+    let qtvs = Ty.generalize(TTuple(types), rank(s), all).quantified
+    if len(qtvs) == 0 && !evidence { return None }
+    Some((qtvs, all))
+}
+
 -- Returns the export of the binder `name` (`id`) of a group whose context
--- is `theta`: its bodies are lowered at `internal`, which takes every class
--- predicate of `theta`, and its scheme is `exported`, which takes fewer.
+-- is `theta`: its code is lowered at `internal`, which takes every class
+-- predicate of `theta`, and its scheme is `exported`, which may take fewer.
 -- Emits the wanteds of the wrapper between the two into an implication
 -- nested in `s.here`, where they are solved, defaulted or reported like any
--- other wanted.
+-- other wanted. A wanted nothing decides is reported as one `name` needs
+-- from `group`.
 fun exportOf(s : Solver, name : String, id : Int, internal : Scheme, exported : Scheme,
-             theta : Vec Pred, where : Option Span) -> Export {
+             theta : Vec Pred, where : Option Span, group : String) -> Export {
     -- GHC's `mkExport`, whose wrapper is `tcSubTypeSigma` from the group's
     -- type, `forall qtvs. theta => mono_ty`, to the binder's. The binder's
     -- scheme is skolemised, its predicates becoming the givens of an
@@ -2025,7 +2086,7 @@ fun exportOf(s : Solver, name : String, id : Int, internal : Scheme, exported : 
                 Vec.push(u.holes, hole)
             }
             let cell = newCell(at, where, context, hole)
-            cell.exported = name
+            cell.exported = "'" + Ty.shortName(name) + "' needs from " + group
             solve(s, CPred(cell))
         }
         u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
@@ -3909,8 +3970,7 @@ fun rejectStranded(s : Solver, cells : Vec PredCell) -> Unit {
     -- A wanted of a wrapper is over a variable the binder's type does not
     -- mention, so the binder's context cannot state it: the variable itself
     -- is what nothing decides.
-    if c.exported != "" { return undetermined(s, c, ", which '" + Ty.shortName(c.exported)
-                                                     + "' needs from its recursive group") }
+    if c.exported != "" { return undetermined(s, c, ", which " + c.exported) }
     if c.pred.name == Ty.equals && !familyLike(c.pred.args[0]) && !familyLike(c.pred.args[1]) {
         -- Neither side is a family application, so the equality is stuck on
         -- a variable that an equality given makes untouchable where it is.

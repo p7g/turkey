@@ -432,10 +432,9 @@ A literal that nothing decides takes the first of `Array`, `Vec` and
 `FrozenArray` that has an instance of every class its uses need of it. The
 order puts the plainest container first: an `Array` is fixed in length and a
 `Vec` adds growth, and a `FrozenArray` gives up writing, which only a use that
-needs `Hash` or `Ord` asks for. Most uses need nothing an `Array` lacks, so
-most literals are arrays. A literal used as a `Set`
-element or a `Map` key needs `Hash`, which only `FrozenArray` has, and one
-compared with `<` needs `Ord`, which only `FrozenArray` has too:
+needs `Hash` asks for. Most uses need nothing an `Array` lacks, so most
+literals are arrays. A literal used as a `Set` element or a `Map` key needs
+`Hash`, which only `FrozenArray` has:
 
 <!-- run -->
 ```kotlin
@@ -447,12 +446,12 @@ fun main() {
     Set.add(seen, [0, 1])
     let costs = Map.new()
     costs[[2, 3]] = 5
-    print((len(seen), costs[[2, 3]], [1, 2] < [1, 3]))
+    print((len(seen), costs[[2, 3]]))
 }
 ```
 
 ```text
-(1, 5, True)
+(1, 5)
 ```
 
 Only a class of the literal's own type counts: `Hash` in `Set.add(seen, [0,
@@ -463,12 +462,26 @@ that is an instance of all the ambiguous variable's classes, with the
 relaxations GHC's `ExtendedDefaultRules` makes: the classes need not be
 standard ones, and the literal may also be used in ways that are not a class,
 such as being indexed. A container whose instance needs something of the
-elements is taken only once the elements' own type is decided and has it, so
-numerals are defaulted first. One rule goes beyond Haskell's: when no
-container's needs are met outright, the first whose needs fall only on an
-element type that nothing will default, such as a function's type parameter,
-is taken, and the function's own context carries them. When no container
-fits, the literal is rejected:
+elements is taken only when the elements have it, counting what the
+enclosing function's context provides.
+
+Four rules go beyond Haskell's:
+
+* Numerals are defaulted before array literals, and array literals with a
+  class before those without one, a round at a time, so that a container is
+  judged once its elements' type is known.
+* A literal inside another is decided after the outer one, and the outer
+  one's needs of its elements become the inner one's.
+* When no container's needs are met outright, but exactly one's fall only on
+  an element type that nothing will default, such as a function's type
+  parameter, that one is taken, and the function's context carries its needs.
+  When several could be taken so with the same needs, those needs do not tell
+  them apart, and the first is taken. When their needs differ, the literal is
+  ambiguous and must be annotated.
+* A top-level `let`'s literal is decided before the module's other uses of
+  the binding are seen, and so are the numerals its choice depends on.
+
+When no container fits, the literal is rejected:
 
 <!-- error: no container this array literal could be has both 'SetIndex' and 'Hash': 'Array' has no 'Hash', 'Vec' has no 'Hash', 'FrozenArray' has no 'SetIndex' -->
 ```kotlin
@@ -480,11 +493,11 @@ fun main() {
 }
 ```
 
-A literal inside another is decided after it: a literal with no class of its
-own waits until no other literal or numeral can still be decided, and then is
-an `Array`. So in `Set.add(seen, [[1, 2]])` the outer literal is a
-`FrozenArray`, which needs `Hash` of its elements, and that makes the inner
-literal a `FrozenArray` too.
+Because a literal inside another is decided after it, in
+`Set.add(seen, [[1, 2]])` the outer literal is a `FrozenArray`, which needs
+`Hash` of its elements, and that makes the inner literal a `FrozenArray` too,
+even when the inner literal is also printed or compared on its own. A literal
+that no use asks anything of is an `Array`.
 
 A function or a top-level `let` decides its literals from its own
 definition, before any use of it elsewhere is seen: `let key =

@@ -1288,6 +1288,19 @@ fun byIndex(table : Map.Map String Int) -> Vec String {
 
 --- `turkey_swap_stack(from, to)`, the code `Prim.swapStack` calls: park the
 --- running stack on the stack record in `x0` and resume the one in `x1`.
+---
+--- Its frame rules are exact at every instruction on both formats, and so on
+--- Mach-O they are a DWARF description rather than a compact encoding. The
+--- CFA is `sp + 16` from the record's stores to its loads, across the switch
+--- of `sp` as well: the record parked on the other stack has the same shape,
+--- so a stop just after the switch shows the stack being resumed.
+---
+--- It saves no register but the record: the call preserves none
+--- (`A.PreservesNone`), so the caller has already put everything it needs
+--- after the call in its frame. The worker's running stack changes here and
+--- nowhere else, between the two stacks, so nothing that can collect ever sees
+--- it name the wrong one. `x16` and `x17` are the scratch registers, which the
+--- allocator never hands out.
 fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
     -- Parking pushes a frame record, the caller's `x29` and the return address
     -- the `bl` left in `x30`, and stores its address in `from`'s parked word.
@@ -1296,20 +1309,6 @@ fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
     -- frame table entry of the return address, as at any call site; and
     -- resuming is the same steps the other way round, ending in a `ret` to the
     -- return address the other stack parked with.
-    --
-    -- `turkey_swap_stack`'s frame rules are exact at every instruction on both
-    -- formats, and so on Mach-O they are a DWARF description rather than a
-    -- compact encoding. The CFA is `sp + 16` from the record's stores to its
-    -- loads, across the switch of `sp` as well: the record parked on the other
-    -- stack has the same shape, so a stop just after the switch shows the stack
-    -- being resumed.
-    --
-    -- `turkey_swap_stack` saves no register but the record: the call preserves
-    -- none (`A.PreservesNone`), so the caller has already put everything it
-    -- needs after the call in its frame. The worker's running stack changes
-    -- here and nowhere else, between the two stacks, so nothing that can
-    -- collect ever sees it name the wrong one. `x16` and `x17` are the scratch
-    -- registers, which the allocator never hands out.
     let b = code(out, False, asm.dialect)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
@@ -1343,26 +1342,26 @@ fun emitSwapStack(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
 --- `Turkey.Stack.new` parks the stack with a return into here, `x29` at
 --- the stack's outermost frame record and `sp` at a word naming the stack's
 --- own record.
+---
+--- It calls `Turkey.Coroutine#start` as a direct call is made, with no
+--- environment, and when that returns -- the body finished, or a panic
+--- unwound to the bottom of the stack -- switches to the stack that resumed
+--- this one, for the last time: nothing resumes a stack whose body has
+--- returned, and the `brk` says so if something does. `sp` is where it was on
+--- the way in, since the callee restores it, so the word is still there.
+---
+--- It is the outermost frame of the coroutine's stack, and its frame rules say
+--- so: an unwinder stops here, at the coroutine's base, as the collector's walk
+--- does, and not at whatever resumed it. On ELF the return address is
+--- undefined, the convention for an outermost frame. On Mach-O frame mode
+--- describes the record `x29` already points at, whose return address is 0.
 fun emitStackStart(asm : Asm.Asm, out : Vec (Item Inst)) -> Unit {
-    -- `turkey_stack_start` calls `Turkey.Coroutine#start` as a direct call is
-    -- made, with no environment, and when that returns -- the body finished, or
-    -- a panic unwound to the bottom of the stack -- switches to the stack that
-    -- resumed this one, for the last time: nothing resumes a stack whose body
-    -- has returned, and the `brk` says so if something does. `sp` is where it
-    -- was on the way in, since the callee restores it, so the word is still
-    -- there.
     let b = code(out, False, asm.dialect)
     let d = asm.dialect
     let x1 = Physical(Gp, 1)
     emit(b, Section(Asm.Text))
     function(b, Asm.runtimeFor(d, Rt.stackStartSymbol))
     cfi(b, StartProc)
-    -- `turkey_stack_start` is the outermost frame of the coroutine's stack, and
-    -- its frame rules say so: an unwinder stops here, at the coroutine's base,
-    -- as the collector's walk does, and not at whatever resumed it. On ELF the
-    -- return address is undefined, the convention for an outermost frame. On
-    -- Mach-O frame mode describes the record `x29` already points at, whose
-    -- return address is 0.
     match d {
         Asm.Elf -> cfi(b, Undefined(lrColumn))
         Asm.MachO -> frameMode(b, [])

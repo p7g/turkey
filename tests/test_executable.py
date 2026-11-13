@@ -428,11 +428,11 @@ def test_an_executable_is_written_only_when_asked_for(tmp_path):
     assert "only with -f exe" in result.stderr
 
 
-@pytest.mark.parametrize("target", ["arm64-darwin", "arm64-linux"])
-def test_an_executable_takes_debug_information(tmp_path, target):
-    result = _boot("-f", "exe", "--target", target, "-g", "-o", str(tmp_path / "adt"),
+def test_an_executable_with_debug_information_is_refused(tmp_path):
+    result = _boot("-f", "exe", "--target", "arm64-darwin", "-g", "-o", str(tmp_path / "adt"),
                    str(PROGRAMS / "adt.gob"))
-    assert result.returncode == 0, result.stderr[-4000:]
+    assert result.returncode == 2
+    assert "no debug information" in result.stderr
 
 
 def _commands(data: bytes):

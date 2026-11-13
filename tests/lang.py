@@ -309,6 +309,7 @@ def panics(src: Source, modules: dict[str, str] | None = None) -> Result:
     result = run(src, modules)
     assert result.code != 0 and "panic: " in result.stderr, (
         f"expected a panic, exited {result.code}\n{result.stdout}\n{result.stderr}")
+    panic_trace(result)
     return result
 
 
@@ -328,11 +329,40 @@ def execute(src: Source, modules: dict[str, str] | None = None,
             f"exited {result.code}\n{result.stdout}\n{result.stderr}")
 
 
+_FRAME = re.compile(r"  at \S.* \(.+:[0-9]+:[0-9]+\)")
+_LEFT_OUT = re.compile(r"  \.\.\. [0-9]+ more frames?")
+
+
 def panic_message(result: Result) -> str:
-    """The message of the panic in `result`, without its trace."""
+    """The message of the panic in `result`, without its trace, which must
+    be there and well formed (`panic_trace`)."""
     for line in result.stderr.splitlines():
         if line.startswith("panic: "):
+            panic_trace(result)
             return line[len("panic: "):]
+    raise AssertionError(f"no panic in\n{result.stderr}")
+
+
+def panic_trace(result: Result) -> list[tuple[str, str]]:
+    """The trace of the panic in `result`: every line after `panic: `, as
+    (function, `FILE:LINE:COLUMN`), innermost call first.
+
+    A panic is the last thing a program writes, so each of those lines must be
+    `  at FUNCTION (FILE:LINE:COLUMN)`, and there must be at least one. The
+    line `  ... N more frames`, where a deep trace leaves its middle out, is
+    allowed among them and is not returned.
+    """
+    lines = result.stderr.splitlines()
+    for at, line in enumerate(lines):
+        if line.startswith("panic: "):
+            frames = [frame for frame in lines[at + 1:]
+                      if not _LEFT_OUT.fullmatch(frame)]
+            assert frames, f"a panic with no trace in\n{result.stderr}"
+            for frame in frames:
+                assert _FRAME.fullmatch(frame), (
+                    f"not a line of a trace: {frame!r} in\n{result.stderr}")
+            return [(frame[len("  at "):frame.rindex(" (")],
+                     frame[frame.rindex(" (") + 2:-1]) for frame in frames]
     raise AssertionError(f"no panic in\n{result.stderr}")
 
 

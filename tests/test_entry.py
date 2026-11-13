@@ -40,7 +40,9 @@ def test_a_boot_binary_reports_the_panic(name, tmp_path):
                          text=True)
     assert ran.returncode == 1
     expected = (PROGRAMS / f"{name}.expected").read_text(encoding="utf-8")
-    assert ran.stderr == expected.splitlines(keepends=True)[0]
+    # The message and the trace, which names the program's file by its path
+    # from its own directory, wherever it was built from.
+    assert ran.stdout + ran.stderr == expected
 
 
 ARGS_AND_EXIT = """\

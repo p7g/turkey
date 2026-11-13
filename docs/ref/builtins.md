@@ -219,8 +219,8 @@ literal it was made from is one ([Array literals](inference.md#array-literals)).
 
 `FrozenArray a` is a sequence of `a` that cannot be changed: its length and
 its elements are fixed when it is made. It has the instances `Array` has
-except `SetIndex`, so `xs[i] = v` on it is rejected, and `Ord` and `Hash`
-besides. Because it cannot change, a `FrozenArray` can be a `Map` key or a
+except `SetIndex` and `Object`, so `xs[i] = v` on it is rejected, and `Ord`
+and `Hash` besides. Because it cannot change, a `FrozenArray` can be a `Map` key or a
 `Set` element, which an `Array` or a `Vec` cannot.
 
 Its constructor is hidden. A `FrozenArray` is made with an [array
@@ -1131,8 +1131,10 @@ objects, and a program may not declare one. Those types are:
   `Set a` are objects, and `type Box a = Box(a)` has the instance
   `Object (Box a) : Object a`.
 
-Every other type is a value: the primitive types, strings, tuples,
-functions, and the types whose constructors have no `var` field. A value
+Every other type is a value: the primitive types, strings, frozen arrays,
+tuples, functions, and the types whose constructors have no `var` field.
+A frozen array holds storage, as a string does, but nothing can write to it,
+so a record wrapping one is a value too. A value
 can be copied, or rebuilt from its fields, without the program telling the
 difference, so it has no identity to ask about, and calling `identical` on
 one is an error:

@@ -76,31 +76,6 @@ A call to a function that never returns, such as `error`, also ends the run of
 a block, and the compiler warns about what follows it too, but the call does
 not change the block's type, which is still that of its last statement.
 
-A function never returns when its own signature lets its caller pick the result
-type: the result type is a variable that the function's parameters and
-constraints do not mention, as in `error`'s `fun(String) -> a`. A function
-passed as a parameter is not one of these, even when its result type is such a
-variable. The variable belongs to the enclosing function, whose caller picks it
-and passes a function that returns a value of it, so the statements after the
-call run:
-
-<!-- run -->
-```kotlin
-fun both(part1, part2) {
-    print(part1("input"))
-    print(part2("input"))
-}
-
-fun main() {
-    both(fun(s) = s + "!", fun(s) = s == "input")
-}
-```
-
-```text
-input!
-True
-```
-
 A declaration in a block is visible from the next statement to the end of the
 block. A block is a scope: its declarations are not visible after it.
 

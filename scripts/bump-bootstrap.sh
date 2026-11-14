@@ -23,8 +23,10 @@
 # Usage: scripts/bump-bootstrap.sh [--stage1 BINARY] [--target TARGET]
 #
 #   --stage1 BINARY  start from this compiler instead of the committed one
-#   --target TARGET  what to build the fixed point for (both are passed through
-#                    to build.sh; the artifacts are for every target regardless)
+#   --target TARGET  what to build the fixed point for (both go to the fixed
+#                    point's build, and the check of the committed compiler
+#                    gets only --target; the artifacts are for every target
+#                    regardless)
 
 set -eu
 
@@ -53,6 +55,10 @@ fi
 
 sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 
+# From here on bootstrap/ is being rewritten, so any failure says how to put
+# it back.
+trap 'echo "bump-bootstrap.sh: failed; restore bootstrap/ with git checkout -- bootstrap" >&2' EXIT
+
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)
@@ -77,8 +83,10 @@ done
 mv "$OUT/PROVENANCE" "$BOOTSTRAP/PROVENANCE"
 
 # The assembly is not what the fixed point compared: no stage after stage1 is
-# built from assembly. So build stage1 from what was just committed and check
-# that it writes stage3, byte for byte, as stage3 writes itself.
+# built from assembly. So link stage1 from the host's assembly just committed
+# and check that it writes stage3, byte for byte, as stage3 writes itself, and
+# that it writes every target's assembly as stage3 did. The other target's
+# assembly is assembled by nothing here, since `cc` assembles only the host's.
 # Only --target is passed on, so that this stage1 is the committed one.
 target=
 previous=
@@ -93,11 +101,23 @@ TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -o "$OUT/committed/written" -f
     ${target:+--target "$target"} src/Main.gob
 if ! cmp -s "$OUT/committed/written" "$OUT/stage3"; then
     echo "bump-bootstrap.sh: the committed assembly, linked, does not write the" \
-         "fixed point's compiler; restore bootstrap/ with git checkout -- bootstrap" >&2
+         "fixed point's compiler" >&2
     exit 1
 fi
+for other in $TARGETS; do
+    TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -f asm -o "$OUT/committed/$other.s" \
+        --target "$other" src/Main.gob
+    if ! cmp -s "$OUT/committed/$other.s" "$OUT/$other.s"; then
+        echo "bump-bootstrap.sh: the committed compiler writes $other's assembly" \
+             "differently from the fixed point's" >&2
+        exit 1
+    fi
+done
+trap - EXIT
 
 echo
-echo "bootstrap/ now holds $(git rev-parse --short HEAD)'s compiler. Commit it alone:"
+echo "bootstrap/ now holds $(git rev-parse --short HEAD)'s compiler. The host's assembly"
+echo "was linked and checked; every target's was written the same by it and by the"
+echo "fixed point, and no assembler read the others'. Commit it alone:"
 echo
 echo "    git add $BOOTSTRAP && git commit -m 'bootstrap: bump to $(git rev-parse --short HEAD)'"

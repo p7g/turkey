@@ -3,8 +3,13 @@ recorded beside each.
 
 `classes.gob` holds one of each token and comment group; `unicode.gob` puts
 multi-byte characters before tokens on the same line, where a column counted
-in bytes would land in the wrong place; each `broken-*.gob` stops lexing part
-way, and everything from there on must come out as plain escaped text.
+in bytes would land in the wrong place; `crlf.gob`, `tab.gob`,
+`no-newline.gob` and `empty.gob` are edge cases of the text between tokens;
+each `broken-*.gob` stops lexing part way, and everything from there on must
+come out as plain escaped text.
+
+Everything is compared as bytes, so a carriage return the highlighter drops or
+adds is a failure rather than something newline translation hides.
 
 The highlighter is a compiler module, so a driver beside a `Turkey` link to
 `src/Turkey/` imports it, as `boot` itself does.
@@ -45,7 +50,7 @@ fun main() {
 
 
 @pytest.fixture(scope="module")
-def highlighted(tmp_path_factory) -> dict[Path, str]:
+def highlighted(tmp_path_factory) -> dict[Path, bytes]:
     """Each fixture's HTML, from one build and one run of the driver."""
     work = tmp_path_factory.mktemp("highlight")
     (work / "Turkey").symlink_to(bootc.REPO_ROOT / "src" / "Turkey")
@@ -57,10 +62,10 @@ def highlighted(tmp_path_factory) -> dict[Path, str]:
         env=dict(os.environ, TURKEY_LIB=str(bootc.REPO_ROOT / "lib")))
     assert built.returncode == 0, built.stderr
     ran = subprocess.run([str(driver), *map(str, CASES)], capture_output=True,
-                         text=True, timeout=60)
-    assert ran.returncode == 0, ran.stderr
-    outputs = ran.stdout.split("\0")
-    assert outputs[-1] == ""
+                         timeout=60)
+    assert ran.returncode == 0, ran.stderr.decode(errors="replace")
+    outputs = ran.stdout.split(b"\0")
+    assert outputs[-1] == b""
     return dict(zip(CASES, outputs[:-1], strict=True))
 
 
@@ -68,12 +73,12 @@ def highlighted(tmp_path_factory) -> dict[Path, str]:
 def test_the_fixture_matches_its_golden(case: Path, highlighted) -> None:
     golden = case.with_suffix(".html")
     if os.environ.get("TURKEY_BLESS_HIGHLIGHT"):
-        golden.write_text(highlighted[case], encoding="utf-8")
-    assert highlighted[case] == golden.read_text(encoding="utf-8")
+        golden.write_bytes(highlighted[case])
+    assert highlighted[case] == golden.read_bytes()
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda p: p.stem)
 def test_the_text_is_reproduced_exactly(case: Path, highlighted) -> None:
-    text = html.unescape(re.sub(r"<[^>]*>", "", highlighted[case]))
-    assert text == case.read_text(encoding="utf-8")
+    text = html.unescape(re.sub(r"<[^>]*>", "", highlighted[case].decode("utf-8")))
+    assert text.encode("utf-8") == case.read_bytes()
 

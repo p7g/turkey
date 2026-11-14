@@ -18,14 +18,21 @@ export (site, pageOf, href)
 ---   and the name the module exports it under: `value.insert` for a function
 ---   or a `let` or `var`, `type.Map` for a type or an alias, `class.Show` for
 ---   a class and `op.<+>` for an operator.
---- * A re-export has the fragment the same name would have if the module
----   declared it, so `value.map` addresses `map` on every page that exports
----   it.
 --- * A constructor is `con.Name` and a field is `field.Con.name`, where `Con`
 ---   is the constructor that declares it. A method is `method.Class.name` and
 ---   an associated type `assoc.Class.Name`.
---- * An instance is `instance.` followed by its class and head as the page
----   shows them, with each space written as `_`: `instance.Show_(Box_a)`.
+--- * A re-export has the fragment the same name would have if the module
+---   declared it, so `value.map` addresses `map` on every page that exports
+---   it. A method the module exports with its class, which another module
+---   declares, is `method.Class.name` as well. A method exported without its
+---   class is a value.
+--- * An instance is `instance.`, its class, `:` and its head's type
+---   constructor, each qualified by the module that declares it:
+---   `instance.Data.Show.Show:Data.Option.Option`. A built-in type is its name
+---   alone, and a tuple of n elements is `(` and `)` around n - 1 commas. A
+---   class has at most one instance for each head constructor, and neither
+---   name holds a `:`, so no two instances share a fragment, and renaming the
+---   head's variables does not change it.
 ---
 --- A fragment is the element's `id` as written. A link percent-encodes it as
 --- JavaScript's `encodeURIComponent` does, since an operator's name can hold
@@ -36,7 +43,8 @@ import Turkey.Doc as Doc
 import Turkey.Doc (ModuleDoc, Item, ConDoc, ConShape(..), Body(..))
 
 --- Returns the site for `docs`: each file's path, relative to the site's
---- root, and its contents. The same `docs` give the same files.
+--- root, and its contents. The same `docs` give the same files. Among them
+--- is `docs.json`, what `Turkey.Doc.document` writes for `docs`.
 fun site(docs : Vec ModuleDoc) -> Vec (String, String) {
     let targets = targetsOf(docs)
     let files = [("index.html", index(docs))]
@@ -44,6 +52,7 @@ fun site(docs : Vec ModuleDoc) -> Vec (String, String) {
     Vec.push(files, ("search-index.js", searchIndex(targets, docs)))
     Vec.push(files, ("search.js", String.join(searchScript, "\n") + "\n"))
     Vec.push(files, ("style.css", String.join(styleSheet, "\n") + "\n"))
+    Vec.push(files, ("docs.json", Doc.document(docs)))
     files
 }
 
@@ -62,7 +71,7 @@ fun itemFragment(item : Item) -> String = match item.body {
     Function(_) | Value(_, _) -> "value." + item.name
     Alias(_, _) | Data(_) -> "type." + item.name
     Class(_) -> "class." + item.name
-    Instance(_) -> "instance." + String.replace(item.name, " ", "_")
+    Instance(inst) -> "instance." + inst.cls + ":" + inst.head
     Operator(_) -> "op." + item.name
     Reexport(r) -> namespacePrefix(r.namespace) + "." + item.name
 }
@@ -73,8 +82,8 @@ fun namespacePrefix(namespace : String) -> String = match namespace {
 }
 
 -- Where each module's names are on its page: by module, then by namespace
--- and name, the fragment. A class method is in the value namespace, as a
--- program sees it, at its member's fragment.
+-- and name, the fragment. A method is in the value namespace, as a program
+-- sees it, at its member's fragment.
 type Targets = Targets { byModule : Map String (Map String String) }
 
 fun targetsOf(docs : Vec ModuleDoc) -> Targets {
@@ -83,10 +92,14 @@ fun targetsOf(docs : Vec ModuleDoc) -> Targets {
         let names = Map.new()
         for item in m.items {
             if let Instance(_) = item.body { continue }
-            if let Class(c) = item.body {
-                for meth in c.methods {
+            match item.body {
+                Class(c) -> for meth in c.methods {
                     Map.put(names, "value." + meth.name, methodFragment(item.name, meth.name))
                 }
+                Reexport(r) -> for meth in r.methods {
+                    Map.put(names, "value." + meth.name, methodFragment(item.name, meth.name))
+                }
+                _ -> {}
             }
             Map.put(names, itemFragment(item), itemFragment(item))
         }
@@ -233,7 +246,8 @@ fun typed(shown : Option String) -> String = match shown {
 fun listed(prefix : String, xs : Vec String) -> String =
     if len(xs) == 0 { "" } else { prefix + escape(String.join(xs, ", ")) }
 
-fun params(ps : Vec String) -> String = if len(ps) == 0 { "" } else { " " + escape(String.join(ps, " ")) }
+fun params(ps : Vec String) -> String =
+    if len(ps) == 0 { "" } else { " " + escape(String.join(ps, " ")) }
 
 -- A constructor as its declaration writes it, with an existential's bracket:
 -- the variables no predicate mentions, then the predicates. With `ids` set,
@@ -288,7 +302,7 @@ fun signature(t : Targets, item : Item, ids : Bool) -> String = match item.body 
         kw("type") + " " + nm(item.name) + params(d.params) + listed(" : ", d.derives) + body
     }
     Class(c) -> kw("class") + " " + nm(item.name) + " " + escape(c.param) + listed(" : ", c.supers)
-    Instance(context) -> kw("instance") + " " + escape(item.name) + listed(" : ", context)
+    Instance(inst) -> kw("instance") + " " + escape(item.name) + listed(" : ", inst.context)
     Operator(op) -> kw("infix") + " " + escape(op.group) + " (" + nm(item.name) + ") = "
                     + escape(op.function) + "  "
                     + kw("-- " + (if op.rightAssociative { "right" } else { "left" })
@@ -302,12 +316,14 @@ fun signature(t : Targets, item : Item, ids : Bool) -> String = match item.body 
             Some(m) -> target(t, m, r.namespace, r.original)
             None -> None
         }
-        let from = match link {
-            Some(link) -> "<a href=\"" + escape(link) + "\">" + escape(written) + "</a>"
-            None -> escape(written)
-        }
-        nm(item.name) + typed(r.shown) + "  " + kw("-- from") + " " + from
+        nm(item.name) + typed(r.shown) + "  " + kw("-- from") + " " + linked(link, written)
     }
+}
+
+-- `text` as a link to `link`, if there is one.
+fun linked(link : Option String, text : String) -> String = match link {
+    Some(l) -> "<a href=\"" + escape(l) + "\">" + escape(text) + "</a>"
+    None -> escape(text)
 }
 
 -- -- pages ----------------------------------------------------------------------------
@@ -343,6 +359,20 @@ fun itemHTML(t : Targets, item : Item) -> String {
                                      + kw("type") + " " + nm(f.name) + " " + escape(c.param)
                                      + "</div>" + commentBlock(f.comment))
             }
+        }
+        Reexport(r) -> for meth in r.methods {
+            let link = match r.from {
+                Some(m) -> target(t, m, "value", meth.original)
+                None -> None
+            }
+            let written = match r.from {
+                Some(m) -> m + "." + meth.original
+                None -> meth.original
+            }
+            String.push(members, "<div class=\"sig\" id=\""
+                                 + escape(methodFragment(item.name, meth.name)) + "\">"
+                                 + kw("fun") + " " + nm(meth.name) + typed(meth.shown) + "  "
+                                 + kw("-- from") + " " + linked(link, written) + "</div>")
         }
         _ -> {}
     }
@@ -444,7 +474,12 @@ fun searchText(item : Item) -> String {
     match item.body {
         Function(shown) | Value(shown, _) -> add(shown)
         Alias(_, body) -> add(Some(body))
-        Reexport(r) -> add(r.shown)
+        Reexport(r) -> {
+            add(r.shown)
+            for meth in r.methods {
+                add(Some(meth.name + Option.unwrapOr(Option.map(meth.shown, fun(s) = " " + s), "")))
+            }
+        }
         Class(c) -> for meth in c.methods {
             add(Some(meth.name + Option.unwrapOr(Option.map(meth.shown, fun(s) = " " + s), "")))
         }
@@ -473,20 +508,33 @@ let searchScript = [
     "  function search(query) {",
     "    const q = query.trim().toLowerCase();",
     "    if (!q) { main.innerHTML = page; return; }",
-    "    const rank = e => e.name === q ? 0 : e.name.startsWith(q) ? 1 : e.name.includes(q) ? 2 : 3;",
-    "    const all = entries.filter(e => e.text.includes(q)).sort((a, b) => rank(a) - rank(b));",
+    "    const rank = e =>",
+    "      e.name === q ? 0 : e.name.startsWith(q) ? 1 : e.name.includes(q) ? 2 : 3;",
+    "    const all = entries.filter(e => e.text.includes(q))",
+    "      .sort((a, b) => rank(a) - rank(b));",
     "    const hits = all.slice(0, 200);",
     "    const shown = all.length > hits.length ? `, the first ${hits.length} shown` : '';",
-    "    main.innerHTML = `<h1>${all.length} results${shown}</h1>` + hits.map(e => e.html).join('');",
+    "    main.innerHTML = `<h1>${all.length} results${shown}</h1>`",
+    "      + hits.map(e => e.html).join('');",
     "  }",
-    "  box.addEventListener('input', () => search(box.value));",
-    "  window.addEventListener('hashchange', () => {",
+    "  // Brings back the page and scrolls to the element the address names.",
+    "  function reveal() {",
     "    box.value = '';",
     "    search('');",
     "    let id = location.hash.slice(1);",
     "    try { id = decodeURIComponent(id); } catch (e) { /* typed by hand, not encoded */ }",
     "    const target = document.getElementById(id);",
     "    if (target) target.scrollIntoView();",
+    "  }",
+    "  box.addEventListener('input', () => search(box.value));",
+    "  window.addEventListener('hashchange', reveal);",
+    "  // A result on this page whose address is the current one changes no hash.",
+    "  main.addEventListener('click', event => {",
+    "    const a = event.target.closest('a');",
+    "    if (a && box.value && a.href === location.href) {",
+    "      event.preventDefault();",
+    "      reveal();",
+    "    }",
     "  });",
     "})();",
 ]
@@ -520,7 +568,10 @@ let styleSheet = [
     "  background: var(--code-bg); border: 1px solid var(--line); border-radius: 6px;",
     "}",
     "nav ul { list-style: none; padding: 0; margin: .8rem 0 0; }",
-    "nav li a { display: block; padding: .1rem .3rem; border-radius: 4px; font-family: var(--mono); font-size: 13px; }",
+    "nav li a {",
+    "  display: block; padding: .1rem .3rem; border-radius: 4px;",
+    "  font-family: var(--mono); font-size: 13px;",
+    "}",
     "nav li a.current { background: var(--code-bg); }",
     "main { padding: 1.5rem 2.5rem 4rem; max-width: 62rem; min-width: 0; }",
     "a { color: var(--accent); text-decoration: none; }",
@@ -529,12 +580,18 @@ let styleSheet = [
     ".file { color: var(--muted); font-size: 13px; font-family: var(--mono); }",
     ".item { border-top: 1px solid var(--line); padding: .8rem 0; }",
     ".item:target, .sig:target, .sig span:target { background: var(--hit); }",
-    ".sig { font-family: var(--mono); font-size: 13.5px; white-space: pre-wrap; overflow-wrap: anywhere; }",
+    ".sig {",
+    "  font-family: var(--mono); font-size: 13.5px; white-space: pre-wrap;",
+    "  overflow-wrap: anywhere;",
+    "}",
     ".kw { color: var(--muted); }",
     ".name { font-weight: 600; }",
     ".doc { margin: .35rem 0 0 1.2rem; }",
     ".doc p { margin: .3rem 0; }",
-    ".doc pre, code { font-family: var(--mono); font-size: 13px; background: var(--code-bg); border-radius: 3px; }",
+    ".doc pre, code {",
+    "  font-family: var(--mono); font-size: 13px; background: var(--code-bg);",
+    "  border-radius: 3px;",
+    "}",
     "code { padding: 0 .2rem; }",
     ".doc pre { padding: .5rem .7rem; overflow-x: auto; }",
     ".members { margin: .4rem 0 0 1.2rem; }",
@@ -545,7 +602,10 @@ let styleSheet = [
     ".result .where p { margin: 0; }",
     "@media (max-width: 760px) {",
     "  body { display: block; }",
-    "  nav { position: static; height: auto; border-right: 0; border-bottom: 1px solid var(--line); }",
+    "  nav {",
+    "    position: static; height: auto; border-right: 0;",
+    "    border-bottom: 1px solid var(--line);",
+    "  }",
     "  nav ul { max-height: 12rem; overflow-y: auto; }",
     "  main { padding: 1rem; }",
     "}",

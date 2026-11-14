@@ -8,7 +8,7 @@ the module comment; and doc comments that document nothing, beside ordinary,
 rule and block comments that are never docs.
 
 `boot doc --html` writes the same description as a website, recorded file by
-file in `tests/doc/site/`.
+file in `tests/doc/site/`, with the JSON among its files.
 
 To record new output, run with `TURKEY_BLESS_DOC=1`, and read the diff of
 `tests/doc/docs.json` and `tests/doc/site/` before committing it.
@@ -55,6 +55,7 @@ def _site(out) -> dict[str, str]:
 
 def test_the_fixture_site_matches_its_golden(tmp_path) -> None:
     site = _site(tmp_path / "site")
+    assert site.pop("docs.json") == _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob").stdout
     if os.environ.get("TURKEY_BLESS_DOC"):
         SITE.mkdir(exist_ok=True)
         for stale in SITE.iterdir():
@@ -66,8 +67,10 @@ def test_the_fixture_site_matches_its_golden(tmp_path) -> None:
 
 def test_every_link_in_the_site_reaches_an_element(tmp_path) -> None:
     site = _site(tmp_path / "site")
-    ids = {name: {html.unescape(i) for i in re.findall(r'id="([^"]*)"', text)}
+    ids = {name: [html.unescape(i) for i in re.findall(r'id="([^"]*)"', text)]
            for name, text in site.items() if name.endswith(".html")}
+    for name, found in ids.items():
+        assert len(found) == len(set(found)), name
     # The search index holds its results' HTML as JavaScript strings.
     results = json.loads(site["search-index.js"].removeprefix("const searchIndex = ")
                          .rstrip().removesuffix(";").replace(",\n]", "\n]"))

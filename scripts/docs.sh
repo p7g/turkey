@@ -3,10 +3,11 @@
 #
 #   scripts/docs.sh [OUT]       (default OUT: build/docs in the repository)
 #
-# writes the site `boot doc --html` generates into OUT, with OUT/index.html
-# listing the modules, and OUT/docs.json, what `boot doc` says every library
-# module exports. Every link in the site is relative, so it can be opened as
-# files.
+# writes the site `boot doc --html` generates into OUT: OUT/index.html, which
+# lists the modules, a page per module, and OUT/docs.json, what `boot doc`
+# says every library module exports. Every link in the site is relative, so
+# it can be opened as files. What an earlier run generated in OUT is removed
+# first, so that a module since deleted leaves no page behind.
 #
 # lib/Turkey/ is the implementation, which no program may import, and is left
 # out. The compiler is $TURKEY_BOOT, or scripts/build.sh's stage2, built first
@@ -34,10 +35,8 @@ if [ ! -x "$boot" ]; then
 fi
 
 mkdir -p "$out"
-files=$(find lib -name '*.gob' -not -path 'lib/Turkey/*' | sort)
-# shellcheck disable=SC2086  # one argument per file; no library path has a space
-"$boot" doc --html "$out" $files
-# shellcheck disable=SC2086
-"$boot" doc $files > "$out/docs.json"
+rm -f "$out"/*.html "$out"/*.js "$out"/*.css "$out"/docs.json
+# shellcheck disable=SC2046  # one argument per file; no library path has a space
+"$boot" doc --html "$out" $(find lib -name '*.gob' -not -path 'lib/Turkey/*' | sort)
 
 echo "$out/index.html"

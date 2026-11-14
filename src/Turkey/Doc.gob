@@ -1,7 +1,7 @@
 export (
     Tables(..), ModuleDoc(..), Item(..), Body(..), DataDoc(..), ConDoc(..), ConShape(..),
-    FieldDoc(..), ClassDoc(..), FamilyDoc(..), MethodDoc(..), OperatorDoc(..),
-    ReexportDoc(..), describe, document, jsonString,
+    FieldDoc(..), ClassDoc(..), FamilyDoc(..), MethodDoc(..), InstanceDoc(..), OperatorDoc(..),
+    ReexportDoc(..), ReexportedMethod(..), describe, document, jsonString,
 )
 
 --- What `boot doc` describes: for each module, what it exports, each entity
@@ -70,8 +70,8 @@ type Body
     --- A type with constructors.
     | Data(DataDoc)
     | Class(ClassDoc)
-    --- An instance, whose name is its class and head, and its context.
-    | Instance(Vec String)
+    --- An instance, whose name is its class and head.
+    | Instance(InstanceDoc)
     --- An operator, whose name is its symbol.
     | Operator(OperatorDoc)
     --- A name the module exports that another module declares.
@@ -136,6 +136,19 @@ type MethodDoc = MethodDoc {
     hasDefault : Bool,
 }
 
+type InstanceDoc = InstanceDoc {
+    --- The context, as the declaration writes it.
+    context : Vec String,
+    --- The class, qualified by the module that declares it.
+    cls     : String,
+    --- The head's type constructor, qualified by the module that declares
+    --- it: `Data.Option.Option`, or for a built-in type its name alone, or
+    --- for a tuple of n elements `(` and `)` around n - 1 commas. A class has
+    --- at most one instance for each head constructor, so `cls` and `head`
+    --- together identify the instance.
+    head    : String,
+}
+
 type OperatorDoc = OperatorDoc {
     --- The precedence group's name.
     group            : String,
@@ -153,6 +166,18 @@ type ReexportDoc = ReexportDoc {
     original  : String,
     --- A value's type. Absent for every other namespace.
     shown     : Option String,
+    --- A class's methods that the module exports, in order of name. Empty for
+    --- every other namespace.
+    methods   : Vec ReexportedMethod,
+}
+
+--- A method a module exports with its class, which another module declares.
+type ReexportedMethod = ReexportedMethod {
+    --- The name the module exports it under.
+    name     : String,
+    --- The name it is declared under.
+    original : String,
+    shown    : Option String,
 }
 
 --- Returns the documentation of `modules`, in order of module name.
@@ -240,9 +265,9 @@ fun itemJSON(item : Item) -> JSON = match item.body {
         ])))))
         JObject(members)
     }
-    Instance(context) -> {
+    Instance(inst) -> {
         let members = heading("instance", item)
-        Vec.push(members, ("context", strings(context)))
+        Vec.push(members, ("context", strings(inst.context)))
         JObject(members)
     }
     Operator(op) -> {
@@ -262,6 +287,13 @@ fun itemJSON(item : Item) -> JSON = match item.body {
             ("original", JString(r.original)),
         ]
         if r.namespace == "value" { Vec.push(members, ("type", optional(r.shown))) }
+        if r.namespace == "class" {
+            Vec.push(members, ("methods", JArray(Vec.map(r.methods, fun(meth) = JObject([
+                ("name", JString(meth.name)),
+                ("original", JString(meth.original)),
+                ("type", optional(meth.shown)),
+            ])))))
+        }
         JObject(members)
     }
 }
@@ -664,14 +696,36 @@ fun instanceItem(cs : Comments, i : InstanceDecl, inst : Classes.InstInfo) -> It
     let n = Classes.writtenNamer(inst.names)
     let name = Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2)
     let context = Vec.map(Vec.append(inst.context, inst.equalities), fun(p) = Ty.showPredWith(p, n))
-    item(name, i.span, cs, Instance(context))
+    item(name, i.span, cs, Instance(InstanceDoc {
+        context = context,
+        cls = qualified(inst.cls),
+        head = headConstructor(inst.head),
+    }))
 }
 
+-- An internal name as a program qualifies it.
+fun qualified(name : String) -> String = String.replace(name, "#", ".")
+
+-- The type constructor at the head of `head`, an instance's head, as
+-- `InstanceDoc.head` writes it.
+fun headConstructor(head : Ty.Type) -> String = match Ty.spine(head) {
+    (Ty.TCon(c), _) -> qualified(c.name)
+    (TTuple(elements), _) -> "(" + commas(len(elements)) + ")"
+    (TFun(params, _), _) -> "fun(" + commas(len(params)) + ")"
+    _ -> Ty.showAt(head, Classes.writtenNamer(Map.new()), 0)
+}
+
+-- The commas that separate `n` elements.
+fun commas(n : Int) -> String = if n > 1 { String.repeat(",", n - 1) } else { "" }
+
 -- What the module exports that another module declares, by namespace and then
--- name. A constructor goes with its type and a method with its class, so
--- neither namespace is listed on its own. A value carries its type, since
--- the module that declares it may be one no program can import.
+-- name. A constructor goes with its type, so that namespace is not listed on
+-- its own. A method goes with its class when the module exports the class,
+-- and is a value otherwise. A value carries its type, since the module that
+-- declares it may be one no program can import.
 fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec Item {
+    let classes = Set.new()
+    for (_, target) in Map.entries(m.exports.classes) { Set.add(classes, target) }
     let found = []
     let spaces = [
         (0, "value", m.exports.values),
@@ -681,23 +735,54 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec Item 
     ]
     for (order, space, names) in spaces {
         for (name, target) in Map.entries(names) {
-            if Set.contains(own, target) || Set.contains(m.exports.methods, target) { continue }
+            if Set.contains(own, target) { continue }
+            let owningClass = Map.get(t.classes.owner, target)
+            let method = Option.isSome(owningClass)
+            if let Some(cls) = owningClass {
+                if Set.contains(classes, cls) { continue }
+            }
             let owner = Prelude.moduleOf(target)
             if owner == Some(m.name) { continue }
             let r = ReexportDoc {
                 namespace = space,
                 from = owner,
-                original = match String.splitOnce(target, "#") {
-                    Some((_, after)) -> after
-                    None -> target
-                },
+                original = if method { methodName(target) } else { declaredName(target) },
                 shown = if order == 0 { reexportedType(t, target) } else { None },
+                methods = if space == "class" { reexportedMethods(m, t, target) } else { [] },
             }
             let entry = Item { name = name, line = 0, comment = None, body = Reexport(r) }
             Vec.push(found, ((order, name), entry))
         }
     }
     Vec.map(Vec.sortByKey(found, fun((key, _)) = key), fun((_, entry)) = entry)
+}
+
+-- The name `target`, an internal name, is declared under in its module.
+fun declaredName(target : String) -> String = match String.splitOnce(target, "#") {
+    Some((_, after)) -> after
+    None -> target
+}
+
+-- The name `target`, a method's internal name, is declared under.
+fun methodName(target : String) -> String = match String.rsplitOnce(target, ".") {
+    Some((_, name)) -> name
+    None -> target
+}
+
+-- The methods of `cls`, a class's internal name, that `m` exports, in order
+-- of name.
+fun reexportedMethods(m : Modules.Module, t : Tables, cls : String) -> Vec ReexportedMethod {
+    let found = []
+    for (name, target) in Map.entries(m.exports.values) {
+        if Map.get(t.classes.owner, target) == Some(cls) {
+            Vec.push(found, ReexportedMethod {
+                name = name,
+                original = methodName(target),
+                shown = reexportedType(t, target),
+            })
+        }
+    }
+    Vec.sortByKey(found, fun(meth) = meth.name)
 }
 
 -- -- written names --------------------------------------------------------------------

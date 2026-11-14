@@ -7,15 +7,21 @@ above a field, a constructor, a method, an associated type and an instance;
 the module comment; and doc comments that document nothing, beside ordinary,
 rule and block comments that are never docs.
 
+`boot doc --html` writes the same description as a website, recorded file by
+file in `tests/doc/site/`.
+
 To record new output, run with `TURKEY_BLESS_DOC=1`, and read the diff of
-`tests/doc/docs.json` before committing it.
+`tests/doc/docs.json` and `tests/doc/site/` before committing it.
 """
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import subprocess
+import urllib.parse
 
 import pytest
 
@@ -23,6 +29,7 @@ from tests import bootc, toolchain
 
 FIXTURES = bootc.REPO_ROOT / "tests" / "doc"
 GOLDEN = FIXTURES / "docs.json"
+SITE = FIXTURES / "site"
 
 
 def _doc(*files: str) -> subprocess.CompletedProcess[str]:
@@ -37,6 +44,41 @@ def test_the_fixture_matches_its_golden() -> None:
     if os.environ.get("TURKEY_BLESS_DOC"):
         GOLDEN.write_text(result.stdout)
     assert result.stdout == GOLDEN.read_text()
+
+
+def _site(out) -> dict[str, str]:
+    result = _doc("--html", str(out), "tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    return {p.name: p.read_text() for p in sorted(out.iterdir())}
+
+
+def test_the_fixture_site_matches_its_golden(tmp_path) -> None:
+    site = _site(tmp_path / "site")
+    if os.environ.get("TURKEY_BLESS_DOC"):
+        SITE.mkdir(exist_ok=True)
+        for stale in SITE.iterdir():
+            stale.unlink()
+        for name, text in site.items():
+            (SITE / name).write_text(text)
+    assert site == {p.name: p.read_text() for p in sorted(SITE.iterdir())}
+
+
+def test_every_link_in_the_site_reaches_an_element(tmp_path) -> None:
+    site = _site(tmp_path / "site")
+    ids = {name: {html.unescape(i) for i in re.findall(r'id="([^"]*)"', text)}
+           for name, text in site.items() if name.endswith(".html")}
+    # The search index holds its results' HTML as JavaScript strings.
+    results = json.loads(site["search-index.js"].removeprefix("const searchIndex = ")
+                         .rstrip().removesuffix(";").replace(",\n]", "\n]"))
+    sources = [text for name, text in site.items() if name.endswith(".html")]
+    sources += [entry[2] for entry in results]
+    links = [html.unescape(h) for text in sources for h in re.findall(r'href="([^"]*)"', text)]
+    assert any("%" in link for link in links)
+    for link in links:
+        page, _, fragment = link.partition("#")
+        assert page in site, link
+        assert not fragment or urllib.parse.unquote(fragment) in ids[page], link
 
 
 def test_the_output_does_not_depend_on_the_order_of_the_files() -> None:

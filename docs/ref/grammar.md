@@ -38,14 +38,15 @@ comment starting `---` is a [doc comment](lexical.md#doc-comments).
 
 ```ebnf
 module      ::= export-decl? top-level*
-export-decl ::= "export" "(" ".." ")"
-              | "export" "(" (export ("," export)*)? ")"
+export-decl ::= "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT
               | CONID
               | CONID "(" ".." ")"
               | CONID "(" CONID ("," CONID)* ")"
               | "(" OPERATOR ")"
+              | "module" modname import-list?
+              | ".."
 top-level   ::= import | type-decl | class-decl | instance-decl
               | fun-decl | let-decl | var-decl | foreign-decl | infix-decl
 import      ::= "import" modname ("as" CONID)? import-list?
@@ -53,6 +54,7 @@ import-list ::= "(" (entry ("," entry)*)? ")"
 entry       ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item        ::= IDENT | CONID | CONID "(" ".." ")" | CONID "(" CONID ("," CONID)* ")"
               | "(" OPERATOR ")"
+              | "module" modname
 ```
 
 Top-level items are separated by `separator`s.

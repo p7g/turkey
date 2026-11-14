@@ -32,7 +32,7 @@ def _build(tmp_path, source, *flags):
     entry = tmp_path / "main.gob"
     entry.write_text(source)
     binary = tmp_path / "net"
-    bootc.link(entry, binary, *flags)
+    bootc.executable(entry, binary, *flags)
     return binary
 
 

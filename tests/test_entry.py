@@ -29,7 +29,7 @@ def _boot_binary(source: Path, tmp_path: Path) -> Path:
     """`boot build`, linked."""
     # From the repository, where `boot` finds `lib/`.
     output = tmp_path / source.stem
-    bootc.link(source, output)
+    bootc.executable(source, output)
     return output
 
 

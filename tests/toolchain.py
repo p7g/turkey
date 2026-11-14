@@ -1,24 +1,26 @@
-"""The C compiler that links a program, and how the linked program is run.
+"""The C compiler the tests use, and how a program `boot` wrote is run.
 
-Two settings, both split with shell-word rules:
+Three settings, split with shell-word rules:
 
-* `$TURKEY_CC` is the C compiler and linker, `cc` when unset. On an x86-64
-  machine checking arm64 output it is a cross compiler, and it links
-  statically: a dynamically linked arm64 binary under qemu-user needs an arm64
-  libc to load, and a static one needs nothing.
+* `$TURKEY_CC` is the C compiler, `cc` when unset. It compiles the C probes
+  some tests run beside a program, and assembles `boot`'s assembly where a
+  test checks it with the system assembler. On an x86-64 machine checking
+  arm64 output it is a cross compiler, and it links statically: a dynamically
+  linked arm64 binary under qemu-user needs an arm64 libc to load, and a
+  static one needs nothing.
 * `$TURKEY_OPENSSL` is where OpenSSL 3 is installed, for a program that
   imports `Net.TLS`: its `lib/`, `include/` and `bin/openssl`. Unset on macOS
   it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by
   the compiler and on `$PATH`.
-* `$TURKEY_RUN` is a prefix for executing anything the compiler linked -- a
-  test program or a built `boot`. Empty means run it directly, which is right
-  natively and also under qemu-user once binfmt_misc knows the format; the
-  prefix (`qemu-aarch64-static`) is for a machine where it cannot be registered.
+* `$TURKEY_RUN` is a prefix for executing a program `boot` wrote, a C probe,
+  or a built `boot`. Empty means run it directly, which is right natively and
+  also under qemu-user once binfmt_misc knows the format; the prefix
+  (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
-`scripts/build.sh` reads the same two variables. Every cached build output
-is keyed on `identity()` as well as its sources: the same source linked by two
-compilers is two different binaries, and the caches are shared by every session
-on the machine, so a key without it serves the wrong architecture.
+`scripts/build.sh` reads `$TURKEY_CC` and `$TURKEY_RUN` too. A cached `boot`
+is keyed on `identity()` as well as its sources, since the caches are shared
+by every session on the machine, and the target `build.sh` builds for is the
+one `$TURKEY_CC` links for.
 """
 
 from __future__ import annotations
@@ -69,15 +71,6 @@ def _openssl_prefix() -> Path | None:
     return Path("/opt/homebrew/opt/openssl@3")
 
 
-def openssl_libraries() -> list[str]:
-    """What a program that imports `Net.TLS` adds to its link, after the
-    runtime's `libraries()`. Only such a program gets these: one that does
-    not links exactly as it would without them."""
-    prefix = _openssl_prefix()
-    found = [f"-L{prefix / 'lib'}"] if prefix else []
-    return [*found, "-lssl", "-lcrypto"]
-
-
 def openssl_dylib_path() -> str | None:
     """The `$TURKEY_DYLIB_PATH` for an executable `boot` writes itself, for a
     program that imports `Net.TLS`: the `lib/` of the same installation the
@@ -100,27 +93,35 @@ def openssl_command() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def links_openssl() -> bool:
-    """Whether a C program that calls OpenSSL 3 compiles and links here."""
+def has_openssl() -> bool:
+    """Whether OpenSSL 3 is installed where the tests look for it: its headers,
+    which a C probe compiles against, and its `openssl` program, which makes
+    the tests' certificates. Its libraries come with them."""
     if missing():
         return False
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "probe.c"
         source.write_text("#include <openssl/ssl.h>\n"
+                          "#if OPENSSL_VERSION_MAJOR < 3\n#error not OpenSSL 3\n#endif\n"
                           "int main(void) { return SSL_CTX_new(TLS_method()) == 0; }\n")
-        result = subprocess.run(
-            [*cc(), *openssl_includes(), str(source), "-o", str(Path(directory) / "probe"),
-             *openssl_libraries()], capture_output=True)
-    return result.returncode == 0
+        compiled = subprocess.run([*cc(), *openssl_includes(), "-fsyntax-only", str(source)],
+                                  capture_output=True)
+    if compiled.returncode != 0:
+        return False
+    try:
+        version = subprocess.run([openssl_command(), "version"], capture_output=True, text=True)
+    except OSError:
+        return False
+    return version.returncode == 0 and version.stdout.startswith("OpenSSL 3")
 
 
 def needs_openssl() -> None:
-    """Skips the calling test unless OpenSSL 3 links, or fails it where
+    """Skips the calling test unless OpenSSL 3 is installed, or fails it where
     `$TURKEY_REQUIRE_OPENSSL` is set, as CI sets it, so that a runner without
     OpenSSL cannot pass by skipping."""
-    if links_openssl():
+    if has_openssl():
         return
-    message = "OpenSSL 3 does not link with $TURKEY_CC" + (
+    message = "OpenSSL 3 is not installed" + (
         f" from {_openssl_prefix()}" if _openssl_prefix() else "")
     if os.environ.get("TURKEY_REQUIRE_OPENSSL"):
         pytest.fail(message)
@@ -174,7 +175,7 @@ def local_label(name: str) -> str:
 
 
 def libraries() -> list[str]:
-    """What a link against the runtime needs after its objects.
+    """What a C probe linked against `boot`'s assembly needs after its objects.
 
     glibc keeps the maths library out of libc, and the runtime calls `log10`.
     Darwin's libSystem carries it, so a Mac link has nothing added.

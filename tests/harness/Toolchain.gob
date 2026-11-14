@@ -1,12 +1,13 @@
-export (Toolchain(..), detect, words, command, caseCommand, linkCommand, limit, satisfies, text)
+export (Toolchain(..), detect, words, command, caseCommand, limit, satisfies, text)
 
---- The programs a case is run with -- `boot`, the C compiler that links what it
---- emits, and the prefix that runs what was linked -- and how each is started.
+--- The programs a case is run with -- `boot`, the C compiler a case may
+--- require, and the prefix that runs what `boot` wrote -- and how each is
+--- started.
 ---
---- `$TURKEY_CC` is the C compiler and linker, `cc` when unset; `$TURKEY_RUN` is
---- a prefix for running anything it linked (`qemu-aarch64-static`), empty
---- when unset. `scripts/build.sh` reads the same two. Both are split into words
---- at spaces, with no quoting.
+--- `$TURKEY_CC` is the C compiler, `cc` when unset; `$TURKEY_RUN` is a prefix
+--- for running a program (`qemu-aarch64-static`), empty when unset.
+--- `scripts/build.sh` reads the same two. Both are split into words at
+--- spaces, with no quoting.
 
 import Process (Command, Output(..), Status(..))
 import Process as Process
@@ -21,26 +22,20 @@ type Toolchain = Toolchain {
     boot : String,
     cc : Array String,
     run : Array String,
-    --- What a link against the runtime needs after its objects: glibc keeps
-    --- the maths library out of libc, and the runtime calls `log10`.
-    libraries : Array String,
-    --- `$TURKEY_CC -dumpmachine`, which is also what `boot` emits for.
+    --- `$TURKEY_CC -dumpmachine`, which names the platform `boot` runs on.
     machine : String,
     --- The C compiler, its `--version`, and the run prefix: part of every
-    --- cache key, since the same source linked by two compilers is two
-    --- different binaries and the cache is shared by every session.
+    --- cache key, since the cache is shared by every session on the machine,
+    --- and a case that requires the C compiler may build with it.
     identity : String,
     hasCc : Bool,
     hasAs : Bool,
     timeoutScale : Float,
-    --- `--exe`: `boot` writes each program as an executable itself, and
-    --- nothing links it.
-    executables : Bool,
 }
 
 fun words(s : String) -> Array String = Vec.toArray(String.words(s))
 
-fun detect(root : String, boot : String, scale : Float, executables : Bool) -> Toolchain {
+fun detect(root : String, boot : String, scale : Float) -> Toolchain {
     let cc = words(Option.unwrapOr(Env.get("TURKEY_CC"), "cc"))
     let cc = if len(cc) == 0 { ["cc"] } else { cc }
     let run = words(Option.unwrapOr(Env.get("TURKEY_RUN"), ""))
@@ -52,14 +47,12 @@ fun detect(root : String, boot : String, scale : Float, executables : Bool) -> T
         boot = boot,
         cc = cc,
         run = run,
-        libraries = if String.contains(machine, "linux") { ["-lm"] } else { [] },
         machine = machine,
         identity = String.join(cc, " ") + "\n" + Option.unwrapOr(version, "") + "\n"
                    + String.join(run, " ") + "\n",
         hasCc = Option.isSome(version),
         hasAs = Option.isSome(answer(["as", "--version"])),
         timeoutScale = scale,
-        executables = executables,
     }
 }
 
@@ -98,10 +91,6 @@ fun caseCommand(t : Toolchain, c : Case, argv : Array String) -> Command {
     for (name, value) in c.environment { command = Process.withEnvironment(command, name, value) }
     command
 }
-
---- The C compiler linking `object` into `binary`.
-fun linkCommand(t : Toolchain, object : String, binary : String, directory : String) -> Command =
-    command(t, t.cc + ["-o", binary, object] + t.libraries, directory)
 
 --- `seconds`, scaled by `--timeout-scale`.
 fun limit(t : Toolchain, seconds : Int) -> Duration {

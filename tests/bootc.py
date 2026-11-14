@@ -1,14 +1,15 @@
 """`boot`, compiled once and shared by every test module that runs it.
 
-Compiling `boot` takes about two minutes, from the committed bootstrap by
-`scripts/build.sh`. *Running* the compiled binary over the whole corpus takes
-ten seconds. Every ratio in this file follows from those two numbers.
+Compiling `boot` takes about fifteen seconds on an arm64 Mac, from the
+committed bootstrap by `scripts/build.sh`. *Running* the compiled binary over
+the whole corpus takes ten seconds. Every ratio in this file follows from
+those two numbers.
 
 So the build happens here, in a module that is not itself a test, and the rule
 is: **a test that needs `boot` calls `boot(...)` or `binary()` below**, and
 never builds or starts one of its own. The build is paid once per change to
 its inputs, shared by every worker and every session, and a test module that
-arranged its own would pay minutes per worker for seconds of work. The same
+arranged its own would pay that again in every worker. The same
 holds one level down: a test that runs `boot` over the whole corpus goes
 through `boot_each`, so the corpus is compiled once, not once per worker.
 """
@@ -69,7 +70,8 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
                 continue
             h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
-    # `build.sh` links `boot` with `$TURKEY_CC`.
+    # `build.sh` links stage1 with `$TURKEY_CC`, and builds for the target
+    # `$TURKEY_CC` links for.
     h.update(toolchain.identity())
     return h.hexdigest()[:16]
 
@@ -89,12 +91,12 @@ def binary() -> Path:
     subprocess per invocation keeps a crash in `boot` from taking the test
     session with it.
 
-    The build takes about two minutes and the result depends on
+    The build takes about fifteen seconds and the result depends on
     nothing but the files `_fingerprint` hashes, so it is kept in a shared directory keyed
     by that hash rather than in a per-session temporary one. A session that
     changes nothing pays nothing. This matters outside the test suite too: a
-    one-off script that wants a compiled `boot` does not pay two minutes of
-    build to ask a question that takes ten seconds to answer.
+    one-off script that wants a compiled `boot` does not pay a build to ask a
+    question that takes ten seconds to answer.
 
     Sharing the directory between concurrent builds is safe because the key is
     a content hash -- two builders racing are producing the same bytes -- but
@@ -140,13 +142,11 @@ def _build(cached: Path, output: Path) -> Path:
 
 def argv(output: str) -> list[str]:
     """`boot`'s arguments for one output: `asm`, the program's assembly on
-    stdout; `obj`, its relocatable object on stdout; `check`; or the name of a
-    stage to dump (`core`, `ssa`, `select`, `listing`, ...)."""
+    stdout; `check`; or the name of a stage to dump (`core`, `ssa`,
+    `select`, `listing`, ...)."""
     match output:
         case "asm":
             return ["build", "-o", "-", "-f", "asm"]
-        case "obj":
-            return ["build", "-o", "-", "-f", "obj"]
         case "check":
             return ["check"]
         case _:
@@ -200,8 +200,6 @@ def build_key() -> str:
     if not os.environ.get(BOOT_OVERRIDE):
         return _fingerprint()
     h = hashlib.sha256(binary().read_bytes())
-    # Every output of `lang` is linked with `$TURKEY_CC`.
-    h.update(toolchain.identity())
     for path in sorted((REPO_ROOT / "lib").rglob("*.gob")):
         if path.name.startswith("Probe_"):
             continue
@@ -227,24 +225,20 @@ def digest(*parts: bytes) -> str:
     return h.hexdigest()[:24]
 
 
-def link(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
-         env: dict[str, str] | None = None,
-         libraries: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
-    """`boot build` of `entry` to an object beside `output`, linked into
-    `output` with the C compiler and the runtime's libraries. Answers `boot`'s
-    run, whose stderr a caller may read. `flags` go to `boot` before the
-    entry; `libraries` go to the linker after the runtime's, such as
-    `toolchain.openssl_libraries()` for a program that imports `Net.TLS`."""
-    obj = output.with_name(output.name + ".o")
+def executable(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
+               env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """Writes `entry` as an executable at `output` with `boot build`, and
+    returns `boot`'s run, whose stderr a caller may read. `flags` go to
+    `boot` before the entry. A program that imports `Net.TLS` loads the
+    OpenSSL the tests make their certificates with
+    (`toolchain.openssl_dylib_path()`), unless `env` names another."""
+    env = dict(os.environ if env is None else env)
+    if "TURKEY_DYLIB_PATH" not in env and (path := toolchain.openssl_dylib_path()):
+        env["TURKEY_DYLIB_PATH"] = path
     compiled = subprocess.run(
-        toolchain.command(binary(), "build", "-f", "obj", "-o", str(obj), *flags,
-                          str(entry)),
+        toolchain.command(binary(), "build", "-o", str(output), *flags, str(entry)),
         cwd=cwd, env=env, capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
-    linked = subprocess.run([*toolchain.cc(), "-o", str(output), str(obj),
-                             *toolchain.libraries(), *libraries],
-                            capture_output=True, text=True)
-    assert linked.returncode == 0, linked.stderr[-4000:]
     return compiled
 
 

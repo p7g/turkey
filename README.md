@@ -295,14 +295,17 @@ perf script | python3 scripts/demangle.py
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
 the tests alike. Each is split into words the way a shell would split it.
 
-- `TURKEY_CC` is the C compiler that links a program, and assembles the
-  bootstrap compiler. Unset, it is `cc`.
-- `TURKEY_RUN` is a prefix for running a program that compiler linked, or a
-  built compiler. Unset or empty, the program runs directly.
+- `TURKEY_CC` is the C compiler that assembles and links the bootstrap
+  compiler, and compiles the C files a few tests run beside a program.
+  Unset, it is `cc`.
+- `TURKEY_RUN` is a prefix for running a program `boot` wrote, or a built
+  compiler. Unset or empty, the program runs directly.
 
-On x86-64 Linux, the arm64 output runs under qemu-user. Link it statically,
-because a dynamically linked arm64 binary would need an arm64 libc to load.
-Set up the machine with:
+On x86-64 Linux, the arm64 output runs under qemu-user. The bootstrap
+compiler is linked statically, and every executable `boot` writes is
+dynamically linked against glibc, which qemu finds in the cross toolchain's
+`/usr/aarch64-linux-gnu` when `QEMU_LD_PREFIX` names it. Set up the machine
+with:
 
 ```bash
 apt-get update
@@ -319,8 +322,8 @@ if [ -w $B/register ]; then
 fi
 ```
 
-Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and leave `TURKEY_RUN`
-empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
+Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and
+`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`, and leave `TURKEY_RUN` empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
 so an arm64 binary runs as `./program`, with no prefix, mounting binfmt_misc
 first where the container has not. That registration is
 lost when a machine is restored from a snapshot, so the repository's

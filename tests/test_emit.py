@@ -1,4 +1,4 @@
-"""`turkey build -f asm`: the machine IR as assembly the system assembler accepts.
+"""`turkey build -S`: the machine IR as assembly the system assembler accepts.
 
 The oracle here is `as`, and it is a much sharper one than `test_select`'s.
 That test could only assemble the lines with no virtual register left in them --
@@ -16,6 +16,7 @@ What it does not check is behaviour: nothing here links or runs.
 from __future__ import annotations
 
 import functools
+import os
 import re
 import subprocess
 import tempfile
@@ -513,3 +514,44 @@ def test_a_loop_carried_value_keeps_its_register_round_the_loop():
         edges = _loop_edge_moves(body)
         assert edges, "no loop found"
         assert all(count <= 1 for count in edges.values()), edges
+
+
+# -- the command line -------------------------------------------------------------
+
+def _build(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(toolchain.command(bootc.binary(), "build", *args), cwd=cwd,
+                          capture_output=True, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
+                          timeout=600)
+
+
+# `-S` writes `./STEM.s`, as `cc -S` does; `-o PATH` names the file, and
+# `-o -` writes the same text to standard output.
+def test_dash_s_writes_the_assembly_into_the_working_directory(tmp_path):
+    (tmp_path / "sub").mkdir()
+    (tmp_path / "sub" / "adt.gob").write_bytes((PROGRAMS / "adt.gob").read_bytes())
+    assert _build(tmp_path, "-S", "sub/adt.gob").returncode == 0
+    written = (tmp_path / "adt.s").read_bytes()
+    assert written.startswith(b"// === ") and not (tmp_path / "sub" / "adt.s").exists()
+    assert _build(tmp_path, "-S", "-o", "named.s", "sub/adt.gob").returncode == 0
+    assert (tmp_path / "named.s").read_bytes() == written
+    printed = _build(tmp_path, "-S", "-o", "-", "sub/adt.gob")
+    assert printed.returncode == 0 and printed.stdout == written
+
+
+# The format comes from `-S` alone: `-o prog.s` without it is an executable
+# named `prog.s`, as it is for `cc`.
+def test_an_output_named_dot_s_without_dash_s_is_an_executable(tmp_path):
+    (tmp_path / "adt.gob").write_bytes((PROGRAMS / "adt.gob").read_bytes())
+    assert _build(tmp_path, "-o", "prog.s", "adt.gob").returncode == 0
+    assert (tmp_path / "prog.s").read_bytes()[:4] in (b"\xcf\xfa\xed\xfe", b"\x7fELF")
+
+
+@pytest.mark.parametrize("args, message", [
+    (["-f", "asm"], "unknown option -f"),
+    (["-S", "a.gob", "b.gob"], "2 input files cannot be written to one file"),
+])
+def test_what_build_refuses(tmp_path, args, message):
+    for name in ("a.gob", "b.gob"):
+        (tmp_path / name).write_bytes((PROGRAMS / "adt.gob").read_bytes())
+    result = _build(tmp_path, *args, *([] if "a.gob" in args else ["a.gob"]))
+    assert result.returncode == 2 and message in result.stderr.decode(), result.stderr

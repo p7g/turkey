@@ -123,14 +123,16 @@ stage2() {
 }
 
 # The arguments that make compiler $1 print its assembly on stdout. A tree
-# from before `build` spelled it `native`; run with no arguments, a compiler
-# prints a usage message naming the commands it has.
+# from before `-S` spelled it `-f asm`, and one from before `build` spelled it
+# `native`; run with no arguments, a compiler prints a usage message naming
+# the commands and options it has.
 emit_command() {
-    if $RUN "$1" 2>&1 | grep -qE '(turkey|boot) build'; then
-        echo "build -o - -f asm"
-    else
-        echo native
-    fi
+    usage=$($RUN "$1" 2>&1 || true)
+    case $usage in
+        *'[-S]'*) echo "build -S -o -" ;;
+        *'turkey build'*|*'boot build'*) echo "build -o - -f asm" ;;
+        *) echo native ;;
+    esac
 }
 
 # Wait for background jobs $@ (pids); if any failed, show the end of its log.

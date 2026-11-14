@@ -147,7 +147,7 @@ def argv(output: str) -> list[str]:
     `select`, `listing`, ...)."""
     match output:
         case "asm":
-            return ["build", "-o", "-", "-f", "asm"]
+            return ["build", "-S", "-o", "-"]
         case "check":
             return ["check"]
         case _:

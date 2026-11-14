@@ -1,17 +1,15 @@
--- The compiler, built from the committed assembly in `bootstrap/` by
+-- The compiler, built from the committed compiler in `bootstrap/` by
 -- `scripts/build.sh`.
 --
 -- Three commands. `check` compiles as far as the last stage that can reject a
--- program, and writes nothing. `build` compiles all the way and writes the
--- result to `-o`, in the format `-f` names, or else the one the extension of
--- `-o` names, or else an executable. Without `-o`, an executable goes to the
--- working directory, named after the entry file, and the other formats to
--- standard output (`openSink`). `doc` checks the modules it is given and
--- writes what each exports as JSON (`Turkey.Doc`), or with `--html DIR` as a
--- website (`Turkey.DocSite`). `check` and `build` each take `--dump
--- STAGE,...` to print what a stage produced, which is how a pass is read
--- while it is being written: `check` goes on as far as the latest stage asked
--- for and no further, and `build` prints them on its way.
+-- program, and writes nothing. `build` compiles all the way and writes an
+-- executable, or under `-S` assembly, to `-o`, or without it to the working
+-- directory, named after the entry file (`openSink`). `doc` checks the
+-- modules it is given and writes what each exports as JSON (`Turkey.Doc`), or
+-- with `--html DIR` as a website (`Turkey.DocSite`). `check` and `build` each
+-- take `--dump STAGE,...` to print what a stage produced, which is how a pass
+-- is read while it is being written: `check` goes on as far as the latest
+-- stage asked for and no further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -70,10 +68,8 @@ import Turkey.DebugTypes as DebugTypes
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
-import Turkey.MachO as MachO
 import Turkey.ElfExecutable as ElfExecutable
 import Turkey.MachOExecutable as MachOExecutable
-import Turkey.Elf as Elf
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
@@ -239,9 +235,9 @@ let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
 -- to move this.
 let checkedThrough = "core"
 
--- What `build` writes: assembly, a relocatable object for the system
--- linker, or an executable, with the linker's work done here as well.
-type Format = Executable | Object | Assembly
+-- What `build` writes: an executable, with the linker's work done here, or
+-- under `-S` assembly for the system assembler.
+type Format = Executable | Assembly
 
 -- Where the output goes: standard output, a file open for it, or an
 -- executable's path, written whole once its bytes are complete
@@ -264,7 +260,7 @@ fun main() {
         _ -> usage()
     }
     var output = None
-    var format = None
+    var format = Executable
     let dumps = Set.new()
     let paths = []
     loop {
@@ -273,7 +269,7 @@ fun main() {
             Right(None) -> break
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
-                Short('f') -> { format = Some(formatNamed(valueOf(p))) }
+                Short('S') -> { format = Assembly }
                 Short('g') -> { debug = Full }
                 Long("debug") -> { debug = debugNamed(valueOf(p)) }
                 Long("target") -> {
@@ -309,9 +305,9 @@ fun main() {
         Some(openSink(output, format, paths, len(Set.elements(dumps)) > 0))
     } else {
         match (output, format) {
-            (None, None) -> None
+            (None, Executable) -> None
             _ -> die("'turkey check' writes no output, so it takes no -o or "
-                     + "-f; use 'turkey build' to write one")
+                     + "-S; use 'turkey build' to write one")
         }
     }
     -- One builder for every file, which the dumps are pushed to line by line
@@ -333,96 +329,82 @@ fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
     Right(v) -> v
 }
 
-fun formatNamed(name : String) -> Format = match name {
-    "exe" -> Executable
-    "obj" -> Object
-    "asm" -> Assembly
-    _ -> die("unknown format '" + name + "'; the formats are exe, obj, asm")
-}
-
--- The format a file name asks for. An executable has no extension on the
--- systems this targets, so a name without one is an executable, and a name
--- with one this does not know is refused rather than taken for an executable:
--- `-o prog.S` silently writing a binary is the mistake this rule is for.
-fun formatOf(path : String) -> Format {
-    let parts = String.split(path, "/")
-    match String.rsplitOnce(parts[len(parts) - 1], ".") {
-        None -> Executable
-        Some((_, "s")) -> Assembly
-        Some((_, "o")) -> Object
-        Some((_, ext)) -> die("cannot tell what to write from the extension '."
-                              + ext + "'; name the file .s or .o, or say which "
-                              + "with -f")
-    }
-}
-
 -- Where `build` writes, refused here if it is something this cannot write,
--- before any compiling is spent on it. With no `-f`, the format is the one
--- `-o` names by its extension, or an executable. With no `-o`, an executable
--- goes to the working directory, named after the entry file without its
--- extension, and assembly or an object to standard output.
-fun openSink(output : Option String, format : Option Format, paths : Vec String,
+-- before any compiling is spent on it. With no `-o`, the output goes to the
+-- working directory, named after the entry file: without its extension for
+-- an executable, and with `.s` in place of it for assembly. `-o -` is
+-- standard output. The format is `format` whatever `-o` is called: `-o x.s`
+-- without `-S` is an executable named `x.s`, as it is for `cc`.
+fun openSink(output : Option String, format : Format, paths : Vec String,
              dumping : Bool) -> Sink {
-    let chosen = match (format, output) {
-        (Some(f), _) -> f
-        (None, None) | (None, Some("-")) -> Executable
-        (None, Some(path)) -> formatOf(path)
-    }
-    let one = match chosen {
-        Object -> Some("object")
-        Executable -> Some("executable")
-        Assembly -> None
-    }
-    if let Some(what) = one {
-        if len(paths) > 1 {
-            die(Int.toString(len(paths)) + " input files cannot be written as "
-                + "one " + what + "; build each file separately")
-        }
-    }
     let base = baseName(paths[0])
     let name = match String.rsplitOnce(base, ".") {
         Some((stem, _)) -> stem
         None -> base
     }
-    let to = match (output, chosen) {
-        (None, Executable) -> {
-            -- An entry file without an extension has the executable's name,
-            -- and in the working directory it is the executable's path.
-            if name == base {
-                die("cannot name the executable after '" + base + "', which "
-                    + "has no extension to drop; name it with -o PATH")
-            }
-            if name == "" {
-                die("cannot name the executable after '" + base + "', which "
-                    + "has nothing before its extension; name it with -o PATH")
-            }
-            ToExecutable(executablePath(name, "./" + name))
-        }
-        (None, _) | (Some("-"), _) -> {
+    let to = match output {
+        Some("-") -> {
             -- Dumps go to standard output too, and two things in one stream
             -- can be told apart only by parsing both.
             if dumping {
                 die("--dump and the build would both write to standard "
                     + "output; write the build to a file with -o PATH")
             }
+            if let Executable = format {
+                if len(paths) > 1 {
+                    die(Int.toString(len(paths)) + " input files cannot be written "
+                        + "as one executable; build each file separately")
+                }
+            }
             ToStdout
         }
-        (Some(path), _) -> {
+        Some(path) -> {
             if len(paths) > 1 {
                 die("-o '" + path + "' can take only one input file, and "
                     + Int.toString(len(paths)) + " were given; build each "
                     + "file separately, or write to standard output with -o -")
             }
-            match chosen {
-                Executable -> ToExecutable(executablePath(path, path))
-                Object | Assembly -> match File.create(path, File.Truncate) {
-                    Right(out) -> ToFile(out)
-                    Left(e) -> die(message(e))
+            opened(path, path, format)
+        }
+        None -> {
+            if len(paths) > 1 {
+                die(Int.toString(len(paths)) + " input files cannot be written "
+                    + "to one file; build each file separately, or write to "
+                    + "standard output with -o -")
+            }
+            if name == "" {
+                let what = match format {
+                    Executable -> "executable"
+                    Assembly -> "assembly"
                 }
+                die("cannot name the " + what + " after '" + base + "', which "
+                    + "has nothing before its extension; name it with -o PATH")
+            }
+            match format {
+                Executable -> {
+                    -- An entry file without an extension has the executable's
+                    -- name, and in the working directory it is the
+                    -- executable's path.
+                    if name == base {
+                        die("cannot name the executable after '" + base + "', which "
+                            + "has no extension to drop; name it with -o PATH")
+                    }
+                    opened(name, "./" + name, format)
+                }
+                Assembly -> opened(name + ".s", "./" + name + ".s", format)
             }
         }
     }
-    Sink { to = to, format = chosen, name = name }
+    Sink { to = to, format = format, name = name }
+}
+
+-- Where `format` is written at `path`, which a diagnostic names as `shown`.
+fun opened(path : String, shown : String, format : Format) -> Destination = match format {
+    Executable -> ToExecutable(executablePath(path, shown))
+    Assembly -> match File.create(path, File.Truncate) {
+        Right(out) -> ToFile(out)
+        Left(e) -> die(message(e))
+    }
 }
 
 -- Returns `path`, refusing it if it names a directory. `writeExecutable`
@@ -692,7 +674,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
                                    render = Stream.print })
             let _ = emitModule(path, entry, module_, files, types, outs)
         }
-        Some(Sink { to, format, name }) -> {
+        Some(Sink { to, format = Executable, name }) -> {
             let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
@@ -705,26 +687,15 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             }
             let started = Stopwatch.start()
             let obj = Assembler.finish(assembler)
-            match format {
-                Executable -> {
-                    let dialect = Asm.dialectFor(target)
-                    let imported = importedLibraries(checked.decls, obj.undefined, dialect)
-                    let main = Asm.runtimeFor(dialect, "main")
-                    sendBytes(to, match dialect {
-                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
-                                                                    installNames(imported, path))
-                        Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
-                    })
-                    let _ = lap("executable", started)
-                }
-                _ -> {
-                    sendBytes(to, Vec.toArray(match Asm.dialectFor(target) {
-                        Asm.MachO -> MachO.objectFile(obj)
-                        Asm.Elf -> Elf.objectFile(obj)
-                    }))
-                    let _ = lap("object", started)
-                }
-            }
+            let dialect = Asm.dialectFor(target)
+            let imported = importedLibraries(checked.decls, obj.undefined, dialect)
+            let main = Asm.runtimeFor(dialect, "main")
+            sendBytes(to, match dialect {
+                Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
+                                                            installNames(imported, path))
+                Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
+            })
+            let _ = lap("executable", started)
         }
         None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
     }
@@ -2153,7 +2124,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 fun usage() -> a =
     die("usage: turkey check [OPTIONS] FILE...\n"
         + "       turkey doc [--html DIR] FILE...\n"
-        + "       turkey build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
+        + "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
         + "                    FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"

@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc, toolchain
+from tests import bootc, dwarfdump, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -48,7 +48,7 @@ def _boot(*args: str, env: dict[str, str] | None = None,
 
 
 def _write(entry: Path, output: Path, *flags: str) -> None:
-    result = _boot("-f", "exe", "--target", "arm64-darwin", *flags, "-o", str(output),
+    result = _boot("--target", "arm64-darwin", *flags, "-o", str(output),
                    str(entry))
     assert result.returncode == 0, result.stderr[-4000:]
 
@@ -57,10 +57,30 @@ def _linked(entry: Path, output: Path) -> None:
     """`entry` as the system's assembler and linker build it from `turkey`'s
     assembly: the oracle the writer is compared with."""
     source = output.with_name(output.name + ".s")
-    result = _boot("-f", "asm", "-o", str(source), str(entry))
+    result = _boot("-S", "-o", str(source), str(entry))
     assert result.returncode == 0, result.stderr[-4000:]
     subprocess.run([*toolchain.cc(), "-o", str(output), str(source), *toolchain.libraries()],
                    check=True)
+
+
+def _assemble(directory: Path, entry: str, target: str, *flags: str) -> Path:
+    """`entry`, in `directory`, as `prog.o`: `turkey`'s assembly for `target`
+    with `flags`, through the system assembler. The object the executable's
+    sections are checked against, for the host's target only, since the
+    assembler is `$TURKEY_CC -c`. Each relocation in it says where the
+    executable must hold an address."""
+    if toolchain.target() != target:
+        pytest.skip(f"the system assembler writes for {toolchain.target() or 'no target'}, "
+                    f"not {target}")
+    result = _boot("-S", "--target", target, *flags, "-o", "prog.s", entry, cwd=directory)
+    assert result.returncode == 0, result.stderr[-4000:]
+    # DWARF 5 for the assembler's line table, as the compile unit is.
+    debug = ["-gdwarf-5"] if any(f in ("-g", "--debug=lines", "--debug=full")
+                                 for f in flags) else []
+    assembled = subprocess.run([*toolchain.cc(), *debug, "-c", "-o", "prog.o", "prog.s"],
+                               cwd=directory, capture_output=True, text=True)
+    assert assembled.returncode == 0, assembled.stderr[-4000:]
+    return directory / "prog.o"
 
 
 def _fixups(executable: Path) -> list[tuple[str, str, str]]:
@@ -109,6 +129,31 @@ def test_the_loader_is_asked_for_what_the_linker_asks_for(tmp_path):
     assert fixups and {kind for _, kind, _ in fixups} == {"bind"}, fixups[:10]
     assert fixups == _fixups(theirs)
     assert _entry(ours) == _entry(theirs) == "_main"
+
+
+# A loaded section that holds an absolute address costs the loader a rebase
+# per address at every start, and nothing else notices one coming back. So
+# the compiler, which uses every kind of address the backend makes, asks the
+# loader for binds alone.
+@darwin
+def test_the_compiler_needs_no_rebase(tmp_path):
+    written = tmp_path / "turkey"
+    _write(bootc.BOOT_MAIN, written)
+    fixups = _fixups(written)
+    assert fixups and {kind for _, kind, _ in fixups} == {"bind"}, \
+        sorted({kind for _, kind, _ in fixups})
+
+
+# The frame table holds no relocated field, so it is read-only: its pages are
+# shared and never written at load.
+@darwin
+def test_the_frame_table_is_read_only(tmp_path):
+    written = tmp_path / "adt"
+    _write(PROGRAMS / "adt.gob", written)
+    listed = subprocess.run(["nm", "-m", str(written)], capture_output=True, text=True,
+                            check=True).stdout
+    [line] = [line for line in listed.splitlines() if line.endswith(" _turkey_frame_table")]
+    assert "(__TEXT,__const)" in line, line
 
 
 # The fixed point compares executables, so nothing in one may depend on when
@@ -249,7 +294,7 @@ def _openssl_dylibs(directory: Path) -> Path:
 def test_each_library_is_loaded_once_and_bound_by_its_ordinal(tmp_path):
     executable = tmp_path / "tls"
     found = _openssl_dylibs(tmp_path / "dylibs")
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+    result = _boot("--target", "arm64-darwin", "-o", str(executable),
                    str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=f"{found}:"))
     assert result.returncode == 0, result.stderr[-4000:]
     data = executable.read_bytes()
@@ -271,7 +316,7 @@ def test_a_library_must_be_installed_at_an_absolute_path(tmp_path):
     found.mkdir()
     _dylib(found / "libssl.3.dylib", "@rpath/libssl.3.dylib")
     _dylib(found / "libcrypto.3.dylib", "@rpath/libcrypto.3.dylib")
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
+    result = _boot("--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
                    str(_tls(tmp_path)), env=dict(ENV, TURKEY_DYLIB_PATH=str(found)))
     assert result.returncode == 2
     assert re.search(r"and '\S+/dylibs/lib(ssl|crypto)\.3\.dylib' is installed as "
@@ -298,7 +343,7 @@ def test_a_malformed_library_is_passed_over(tmp_path):
     struct.pack_into("<I", outside, 32 + 8, 0x1000)
     (short / "libcrypto.3.dylib").write_bytes(outside)
     executable = tmp_path / "tls"
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+    result = _boot("--target", "arm64-darwin", "-o", str(executable),
                    str(_tls(tmp_path)),
                    env=dict(ENV, TURKEY_DYLIB_PATH=f"{short}:{corrupt}:{good}"))
     assert result.returncode == 0, result.stderr[-4000:]
@@ -318,7 +363,7 @@ def test_a_library_is_found_in_a_universal_file_past_one_for_intel(tmp_path):
                    [(CPU_X86_64, _dylib(tmp_path / "x", f"/x86/{leaf}", CPU_X86_64)),
                     (CPU_ARM64, _dylib(tmp_path / "a", f"/universal/{leaf}"))])
     executable = tmp_path / "tls"
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(executable),
+    result = _boot("--target", "arm64-darwin", "-o", str(executable),
                    str(_tls(tmp_path)),
                    env=dict(ENV, TURKEY_DYLIB_PATH=f"{intel}:{universal}"))
     assert result.returncode == 0, result.stderr[-4000:]
@@ -341,7 +386,7 @@ def test_a_program_that_never_calls_openssl_loads_neither_library(tmp_path):
     env = {k: v for k, v in ENV.items() if k != "TURKEY_DYLIB_PATH"}
     macho, elf = tmp_path / "macho", tmp_path / "elf"
     for target, output in (("arm64-darwin", macho), ("arm64-linux", elf)):
-        result = _boot("-f", "exe", "--target", target, "-o", str(output),
+        result = _boot("--target", target, "-o", str(output),
                        str(_never_calls(tmp_path)), env=env)
         assert result.returncode == 0, result.stderr[-4000:]
     assert [name for name, _, _ in _dylibs(macho.read_bytes())] == ["/usr/lib/libSystem.B.dylib"]
@@ -383,7 +428,7 @@ def test_a_library_not_found_is_an_error_naming_where_it_was_looked_for(tmp_path
                                                                         missing_library):
     empty = tmp_path / "empty"
     empty.mkdir()
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "out"),
+    result = _boot("--target", "arm64-darwin", "-o", str(tmp_path / "out"),
                    str(missing_library), env=dict(ENV, TURKEY_DYLIB_PATH=str(empty)))
     assert result.returncode == 2
     assert ("it calls 'turkey_nothing' from library 'turkeynothere' 7, and no "
@@ -397,7 +442,7 @@ def test_a_library_not_found_is_an_error_naming_where_it_was_looked_for(tmp_path
                     reason="writes for another machine than this one")
 def test_another_machines_library_needs_a_directory_to_read_it_from(tmp_path):
     env = {k: v for k, v in ENV.items() if k != "TURKEY_DYLIB_PATH"}
-    result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
+    result = _boot("--target", "arm64-darwin", "-o", str(tmp_path / "tls"),
                    str(_tls(tmp_path)), env=env)
     assert result.returncode == 2
     assert re.search(r"cannot write '\S+' for arm64-darwin on this machine: it calls '\w+' "
@@ -415,7 +460,7 @@ def test_a_refused_build_leaves_the_output_as_it_was(tmp_path, missing_library):
     existing.write_bytes(b"before")
     env = dict(ENV, TURKEY_DYLIB_PATH=str(builds))
     for output in (existing, builds / "absent"):
-        result = _boot("-f", "exe", "--target", "arm64-darwin", "-o", str(output),
+        result = _boot("--target", "arm64-darwin", "-o", str(output),
                        str(missing_library), env=env)
         assert result.returncode == 2, result.stderr
     assert existing.read_bytes() == b"before"
@@ -451,7 +496,7 @@ def test_a_build_writes_an_executable_named_after_its_entry(tmp_path):
 
 
 # A file name without an extension is an executable, written with the
-# executable bit, and runs as one built with `-f exe` does.
+# executable bit, and runs as one built with `-o` does.
 def test_an_output_without_an_extension_is_an_executable(tmp_path):
     (tmp_path / "named").mkdir()
     (tmp_path / "explicit").mkdir()
@@ -464,7 +509,7 @@ def test_an_output_without_an_extension_is_an_executable(tmp_path):
     assert named.read_bytes() == explicit.read_bytes()
 
 
-# `-o -` writes the executable to standard output, the same bytes `-f exe`
+# `-o -` writes the executable to standard output, the same bytes `-o PATH`
 # writes to a file.
 @pytest.mark.parametrize("target", ["arm64-darwin", "arm64-linux"])
 def test_dash_writes_the_executable_to_standard_output(tmp_path, target):
@@ -474,7 +519,7 @@ def test_dash_writes_the_executable_to_standard_output(tmp_path, target):
         capture_output=True, env=ENV, timeout=600)
     assert result.returncode == 0, result.stderr.decode()[-4000:]
     written = tmp_path / "adt"
-    built = _boot("-f", "exe", "--target", target, "-o", str(written),
+    built = _boot("--target", target, "-o", str(written),
                   str(PROGRAMS / "adt.gob"))
     assert built.returncode == 0, built.stderr[-4000:]
     assert result.stdout == written.read_bytes()
@@ -699,15 +744,19 @@ class _MachO:
         return bytes(out)
 
 
-def _written(tmp_path: Path, source: str, *flags: str) -> tuple[_MachO, _MachO]:
-    """`source` for arm64-darwin as an object and as an executable, each
-    written by `turkey` with `flags`."""
+def _image(tmp_path: Path, source: str, *flags: str) -> _MachO:
+    """`source` as an arm64-darwin executable `turkey` writes with `flags`."""
     (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
-    for output, form in (("prog.o", "obj"), ("prog", "exe")):
-        result = _boot("-f", form, "--target", "arm64-darwin", *flags, "-o", output,
-                       "prog.gob", cwd=tmp_path)
-        assert result.returncode == 0, result.stderr[-4000:]
-    return _MachO(tmp_path / "prog.o"), _MachO(tmp_path / "prog")
+    result = _boot("--target", "arm64-darwin", *flags, "-o", "prog", "prog.gob", cwd=tmp_path)
+    assert result.returncode == 0, result.stderr[-4000:]
+    return _MachO(tmp_path / "prog")
+
+
+def _written(tmp_path: Path, source: str, *flags: str) -> tuple[_MachO, _MachO]:
+    """`source` for arm64-darwin as the system assembler's object and as the
+    executable `turkey` writes, each with `flags`."""
+    image = _image(tmp_path, source, *flags)
+    return _MachO(_assemble(tmp_path, "prog.gob", "arm64-darwin", *flags)), image
 
 
 def _unwind_entries(u: bytes) -> tuple[list[tuple[int, int]], int, list[int]]:
@@ -801,7 +850,7 @@ def _expected_unwind(obj: _MachO, image: _MachO) -> tuple[list[tuple[int, int]],
 
 
 def test_the_debug_information_is_a_segment_no_one_maps(tmp_path):
-    _, image = _written(tmp_path, TASKS, "-g")
+    image = _image(tmp_path, TASKS, "-g")
     names = [s[0] for s in image.segments]
     assert names == [b"__PAGEZERO", b"__TEXT", b"__DATA_CONST", b"__DATA", b"__DWARF",
                      b"__LINKEDIT"]
@@ -821,47 +870,97 @@ def test_the_debug_information_is_a_segment_no_one_maps(tmp_path):
 
 
 def test_without_debug_information_there_is_no_dwarf_segment(tmp_path):
-    _, image = _written(tmp_path, TASKS)
+    image = _image(tmp_path, TASKS)
     assert b"__DWARF" not in [s[0] for s in image.segments]
     assert not [s for s in image.sections if s.name.startswith("__debug_")]
 
 
-@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
-def test_the_debug_sections_are_the_objects_with_final_addresses(tmp_path, level):
-    obj, image = _written(tmp_path, TASKS, level)
-    debug = [s.name for s in obj.sections if s.segment == "__DWARF"]
-    assert debug and debug == [s.name for s in image.sections if s.segment == "__DWARF"]
+def _debug_agrees(image: Path, obj: Path) -> None:
+    """The executable at `image` carries the debug sections of the system
+    assembler's object at `obj`, for the same program, with every address
+    the object relocates moved to where the executable puts its target.
+
+    On Mach-O that is every byte. GNU `as` encodes the line table its own
+    way -- other opcodes for the same advances, its own file and directory
+    tables -- so on ELF `debug_line` and `debug_line_str` are compared by the
+    rows they decode to, each row's file by its full path, and the object's
+    rows moved by where the executable puts `.text`."""
+    if image.read_bytes()[:4] != b"\x7fELF":
+        ours, theirs = _MachO(image), _MachO(obj)
+        debug = sorted(s.name for s in theirs.sections if s.segment == "__DWARF")
+        assert debug and debug == sorted(s.name for s in ours.sections
+                                         if s.segment == "__DWARF")
+        for name in debug:
+            assert ours.by_name[name].bytes == theirs.relocated(name, ours), name
+        return
+    ours, theirs = Elf(image.read_bytes()), Elf(obj.read_bytes())
+    debug = sorted(s[0] for s in theirs.sections if s[0].startswith(".debug_"))
+    assert debug and debug == sorted(s[0] for s in ours.sections
+                                     if s[0].startswith(".debug_"))
     for name in debug:
-        assert image.by_name[name].bytes == obj.relocated(name, image), name
+        if name not in (".debug_line", ".debug_line_str"):
+            assert _contents(ours, name) == _relocated(theirs, name, ours), name
+    tool = dwarfdump.needs()
+    text = ours.section(".text")[3]
+    written = dwarfdump.kept_by_gnu_as(dwarfdump.line_rows(tool, image))
+    assembled = [(row[0] + text, *row[1:])
+                 for row in dwarfdump.kept_by_gnu_as(dwarfdump.line_rows(tool, obj))]
+    for k, (a, b) in enumerate(zip(written, assembled)):
+        assert a == b, f"row {k}: written {a}, assembled {b}"
+    assert len(written) == len(assembled)
 
 
-def test_the_unwind_info_holds_each_functions_encoding(tmp_path):
-    obj, image = _written(tmp_path, TASKS)
-    entries, sentinel, kinds = _unwind_entries(image.by_name["__unwind_info"].bytes)
-    expected, end = _expected_unwind(obj, image)
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_debug_sections_are_the_assemblers_with_final_addresses(tmp_path, level):
+    _written(tmp_path, TASKS, level)
+    _debug_agrees(tmp_path / "prog", tmp_path / "prog.o")
+
+
+def _unwind_agrees(image: Path, obj: Path) -> None:
+    """The executable at `image` carries the unwind information of the
+    system assembler's object at `obj`, for the same program: on Mach-O, an
+    `__unwind_info` entry for each compact entry, and the same `__eh_frame`
+    but for the functions' addresses; on ELF, the same `.eh_frame`, with
+    every address the object relocates moved to where the executable puts
+    its target, and the terminator the writer adds."""
+    if image.read_bytes()[:4] == b"\x7fELF":
+        ours, theirs = Elf(image.read_bytes()), Elf(obj.read_bytes())
+        assert _contents(ours, ".eh_frame") == _relocated(theirs, ".eh_frame", ours) + bytes(4)
+        return
+    ours, theirs = _MachO(image), _MachO(obj)
+    entries, sentinel, kinds = _unwind_entries(ours.by_name["__unwind_info"].bytes)
+    expected, end = _expected_unwind(theirs, ours)
     assert entries == expected
     assert sentinel == end
     assert kinds and all(kind == 2 for kind in kinds)
+    if "__eh_frame" in theirs.by_name:
+        written, assembled = ours.by_name["__eh_frame"], theirs.by_name["__eh_frame"]
+        assert written.size == assembled.size
+        masked, expected_bytes = bytearray(written.bytes), bytearray(assembled.bytes)
+        for at in _fdes(ours).values():
+            masked[at + 8:at + 16] = expected_bytes[at + 8:at + 16] = bytes(8)
+        assert masked == expected_bytes
+    else:
+        assert "__eh_frame" not in ours.by_name
+
+
+def test_the_unwind_info_is_the_assemblers(tmp_path):
+    _, image = _written(tmp_path, TASKS)
+    _unwind_agrees(tmp_path / "prog", tmp_path / "prog.o")
+    entries, _, _ = _unwind_entries(image.by_name["__unwind_info"].bytes)
     swap = image.text_symbols()["_turkey_swap_stack"] - 0x100000000
     assert _encoding_at(entries, swap) & 0xFF000000 == DWARF_MODE
     assert _encoding_at(entries, swap) & 0xFFFFFF == _fdes(image)[swap + 0x100000000] > 0
 
 
-def test_eh_frame_is_the_objects_with_its_functions_addresses(tmp_path):
-    obj, image = _written(tmp_path, TASKS)
-    ours, theirs = image.by_name["__eh_frame"], obj.by_name["__eh_frame"]
-    assert ours.segment == "__TEXT" and ours.size == theirs.size
-    fdes = _fdes(image)
-    assert list(fdes) == [image.text_symbols()["_turkey_swap_stack"]]
-    masked = bytearray(ours.bytes)
-    expected = bytearray(theirs.bytes)
-    for at in fdes.values():
-        masked[at + 8:at + 16] = expected[at + 8:at + 16] = bytes(8)
-    assert masked == expected
+def test_the_eh_frame_describes_only_the_stack_switch(tmp_path):
+    image = _image(tmp_path, TASKS)
+    assert image.by_name["__eh_frame"].segment == "__TEXT"
+    assert list(_fdes(image)) == [image.text_symbols()["_turkey_swap_stack"]]
 
 
 def test_the_function_starts_are_the_named_functions(tmp_path):
-    _, image = _written(tmp_path, TASKS)
+    image = _image(tmp_path, TASKS)
     starts = _function_starts(image)
     assert starts == sorted(set(image.text_symbols().values()))
     offset, size = struct.unpack_from("<II", image.command(0x26), 8)
@@ -873,7 +972,7 @@ def test_each_variant_has_its_own_uuid(tmp_path):
     for level in ([], ["-g"], ["--debug=lines"]):
         directory = tmp_path / (level[0].strip("-") if level else "plain")
         directory.mkdir()
-        _, image = _written(directory, TASKS, *level)
+        image = _image(directory, TASKS, *level)
         uuids.add(image.command(0x1B)[8:24])
     assert len(uuids) == 3
 
@@ -915,7 +1014,7 @@ PAGE = 0x10000
 
 
 def _write_elf(entry: Path, output: Path) -> None:
-    result = _boot("-f", "exe", "--target", "arm64-linux", "-o", str(output), str(entry))
+    result = _boot("--target", "arm64-linux", "-o", str(output), str(entry))
     assert result.returncode == 0, result.stderr[-4000:]
 
 
@@ -1095,15 +1194,19 @@ def test_the_elf_is_what_the_loader_needs(tmp_path):
     assert not [n for n, *_ in symtab if n.startswith(".L")]
 
 
-def _written_elf(tmp_path: Path, source: str, *flags: str) -> tuple[Elf, Elf]:
-    """`source` for arm64-linux as an object and as an executable, each
-    written by `turkey` with `flags`."""
+def _image_elf(tmp_path: Path, source: str, *flags: str) -> Elf:
+    """`source` as an arm64-linux executable `turkey` writes with `flags`."""
     (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
-    for output, form in (("prog.o", "obj"), ("prog", "exe")):
-        result = _boot("-f", form, "--target", "arm64-linux", *flags, "-o", output,
-                       "prog.gob", cwd=tmp_path)
-        assert result.returncode == 0, result.stderr[-4000:]
-    return Elf((tmp_path / "prog.o").read_bytes()), Elf((tmp_path / "prog").read_bytes())
+    result = _boot("--target", "arm64-linux", *flags, "-o", "prog", "prog.gob", cwd=tmp_path)
+    assert result.returncode == 0, result.stderr[-4000:]
+    return Elf((tmp_path / "prog").read_bytes())
+
+
+def _written_elf(tmp_path: Path, source: str, *flags: str) -> tuple[Elf, Elf]:
+    """`source` for arm64-linux as the system assembler's object and as the
+    executable `turkey` writes, each with `flags`."""
+    image = _image_elf(tmp_path, source, *flags)
+    return Elf(_assemble(tmp_path, "prog.gob", "arm64-linux", *flags).read_bytes()), image
 
 
 def _contents(elf: Elf, name: str) -> bytes:
@@ -1177,10 +1280,9 @@ def _eh_frame_hdr(elf: Elf) -> tuple[int, list[tuple[int, int]]]:
     return address + 4 + pointer, [(address + pc, address + fde) for pc, fde in table]
 
 
-def test_eh_frame_is_the_objects_with_its_functions_addresses(tmp_path):
-    obj, image = _written_elf(tmp_path, TASKS)
-    ours = _contents(image, ".eh_frame")
-    assert ours == _relocated(obj, ".eh_frame", image) + bytes(4)
+def test_the_elf_eh_frame_is_the_assemblers(tmp_path):
+    _, image = _written_elf(tmp_path, TASKS)
+    _unwind_agrees(tmp_path / "prog", tmp_path / "prog.o")
     _, kind, flags, address, offset, size, _, _ = image.section(".eh_frame")
     assert (kind, flags) == (SHT_PROGBITS, SHF_ALLOC)
     [first] = [s for s in image.segments if s[0] == PT_LOAD][:1]
@@ -1188,7 +1290,7 @@ def test_eh_frame_is_the_objects_with_its_functions_addresses(tmp_path):
 
 
 def test_eh_frame_hdr_indexes_every_fde_by_its_function(tmp_path):
-    _, image = _written_elf(tmp_path, TASKS)
+    image = _image_elf(tmp_path, TASKS)
     eh_frame, table = _eh_frame_hdr(image)
     assert eh_frame == image.section(".eh_frame")[3]
     fdes = _eh_frame(image)
@@ -1203,7 +1305,7 @@ def test_eh_frame_hdr_indexes_every_fde_by_its_function(tmp_path):
 
 
 def test_pt_gnu_eh_frame_is_the_index(tmp_path):
-    _, image = _written_elf(tmp_path, TASKS)
+    image = _image_elf(tmp_path, TASKS)
     _, flags, offset, address, filesz, memsz, _ = image.segment(PT_GNU_EH_FRAME)
     _, kind, section_flags, at, file_at, size, _, _ = image.section(".eh_frame_hdr")
     assert (kind, section_flags) == (SHT_PROGBITS, SHF_ALLOC)
@@ -1215,21 +1317,25 @@ def test_pt_gnu_eh_frame_is_the_index(tmp_path):
 
 
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])
-def test_the_elf_debug_sections_are_the_objects_with_final_addresses(tmp_path, level):
-    obj, image = _written_elf(tmp_path, TASKS, level)
-    debug = [s[0] for s in obj.sections if s[0].startswith(".debug_")]
-    assert debug and debug == [s[0] for s in image.sections if s[0].startswith(".debug_")]
-    assert (".debug_gdb_scripts" in debug) == (level == "-g")
+def test_the_elf_debug_sections_are_unloaded(tmp_path, level):
+    image = _image_elf(tmp_path, TASKS, level)
+    debug = [s[0] for s in image.sections if s[0].startswith(".debug_")]
+    assert debug and (".debug_gdb_scripts" in debug) == (level == "-g")
     end = max(s[2] + s[4] for s in image.segments if s[0] == PT_LOAD)
     for name in debug:
         _, kind, flags, address, offset, _, _, _ = image.section(name)
         assert (kind, flags, address) == (SHT_PROGBITS, 0, 0), name
         assert offset >= end, name
-        assert _contents(image, name) == _relocated(obj, name, image), name
+
+
+@pytest.mark.parametrize("level", ["-g", "--debug=lines"])
+def test_the_elf_debug_sections_are_the_assemblers_with_final_addresses(tmp_path, level):
+    _written_elf(tmp_path, TASKS, level)
+    _debug_agrees(tmp_path / "prog", tmp_path / "prog.o")
 
 
 def test_without_debug_information_the_elf_has_no_debug_sections(tmp_path):
-    _, image = _written_elf(tmp_path, TASKS)
+    image = _image_elf(tmp_path, TASKS)
     assert not [s for s in image.sections if s[0].startswith(".debug_")]
     assert image.section(".eh_frame_hdr")
 
@@ -1264,7 +1370,7 @@ def test_the_linker_builds_the_same_eh_frame_hdr(tmp_path):
 @pytest.mark.skipif(not (shutil.which("strip") and shutil.which("objcopy")),
                     reason="no binutils")
 def test_strip_and_objcopy_take_the_debug_sections(tmp_path):
-    _, image = _written_elf(tmp_path, TASKS, "-g")
+    image = _image_elf(tmp_path, TASKS, "-g")
     for argv in (["strip", "-o", "stripped", "prog"],
                  ["objcopy", "--only-keep-debug", "prog", "prog.debug"]):
         subprocess.run(argv, cwd=tmp_path, check=True, capture_output=True)

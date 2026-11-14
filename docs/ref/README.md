@@ -104,10 +104,10 @@ turkey build hello.gob
 The executable is signed on a Mac, and on Linux it runs on glibc 2.34 or
 later. It loads the shared libraries the program calls into, as
 [Foreign functions](declarations.md#foreign-functions) describes. `-o PATH`
-names it, and `-o -` writes it to standard output. `-f asm` writes assembly
-instead and `-f obj` a relocatable object, either of which a C compiler links;
-without `-o`, either goes to standard output. On Linux, add `-lm` to the
-link.
+names it, and `-o -` writes it to standard output. `-S` writes the program's
+assembly instead, to `hello.s` or wherever `-o` names. The system assembler
+accepts it, but it is for reading the code the compiler made, not for
+building programs.
 
 The project README says how to build `turkey` itself.
 

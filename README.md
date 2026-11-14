@@ -129,9 +129,9 @@ the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
 `check` compiles as far as the last stage that can reject a program and
-writes nothing. Either command takes `--dump STAGE,...` to print what a stage produced:
-`build/stages/turkey check --dump types rectangles.gob` shows the inferred
-types, and running the compiler with no arguments lists the stages.
+writes nothing. Either command takes `--dump STAGE,...` to print what a stage
+produced: `build/stages/turkey check --dump types rectangles.gob` shows the
+inferred types, and running the compiler with no arguments lists the stages.
 `build --timings` reports on standard error how long each phase took, how the
 backend's time is spread over functions, and how much of the optimizer's work
 could run in parallel.
@@ -189,10 +189,6 @@ as a linker does: gdb reads them there, `strip` removes them and
 `-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
 functions and the calls inlined into them, which is all a profiler or a
 backtrace reads, and none of what a debugger needs to show a variable.
-
-`-S -g` writes the debug information into the assembly too, all but the line
-table, which it leaves to the assembler as `.loc` rows. Assemble it in
-DWARF 5, as the rest is: `cc -gdwarf-5 -c rectangles.s`.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:
@@ -273,6 +269,10 @@ in a crash report:
 sample rectangles 5 -file report.txt && python3 scripts/demangle.py report.txt
 perf script | python3 scripts/demangle.py
 ```
+
+`-S -g` writes the debug information into the assembly too, all but the line
+table, which it leaves to the assembler as `.loc` rows. Assemble it in
+DWARF 5, as the rest is: `cc -gdwarf-5 -c rectangles.s`.
 
 ### The C compiler, and running on another machine
 

@@ -547,11 +547,32 @@ def test_an_output_named_dot_s_without_dash_s_is_an_executable(tmp_path):
 
 
 @pytest.mark.parametrize("args, message", [
-    (["-f", "asm"], "unknown option -f"),
+    (["-f", "asm", "a.gob"], "there is no -f: 'turkey build' writes an executable"),
     (["-S", "a.gob", "b.gob"], "2 input files cannot be written to one file"),
+    (["-S", "-o", "d", "a.gob"], "cannot write the assembly to 'd', which is a directory"),
+    (["-S", "d.gob"], "cannot write the assembly to './d.s', which is a directory"),
+    (["-S", ".gob"], "cannot name the assembly after '.gob'"),
+    (["-S", "sub/"], "cannot name the assembly after 'sub/', which has no file name"),
+    (["-S", "-o", "-", "--dump", "core", "a.gob"], "--dump and the build would both write"),
 ])
 def test_what_build_refuses(tmp_path, args, message):
-    for name in ("a.gob", "b.gob"):
+    for name in ("a.gob", "b.gob", "d.gob", ".gob"):
         (tmp_path / name).write_bytes((PROGRAMS / "adt.gob").read_bytes())
-    result = _build(tmp_path, *args, *([] if "a.gob" in args else ["a.gob"]))
+    (tmp_path / "d").mkdir()
+    (tmp_path / "d.s").mkdir()
+    (tmp_path / "sub").mkdir()
+    result = _build(tmp_path, *args)
     assert result.returncode == 2 and message in result.stderr.decode(), result.stderr
+
+
+# A program refused before its code is emitted leaves no assembly behind, and
+# an existing file of that name as it was, as `cc -S` does.
+def test_a_refused_build_writes_no_assembly(tmp_path):
+    (tmp_path / "bad.gob").write_text('fun main() {\n    print(1 + "one")\n}\n', encoding="utf-8")
+    result = _build(tmp_path, "-S", "bad.gob")
+    assert result.returncode != 0
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.gob"]
+    (tmp_path / "bad.s").write_text("kept\n", encoding="utf-8")
+    assert _build(tmp_path, "-S", "bad.gob").returncode != 0
+    assert (tmp_path / "bad.s").read_text(encoding="utf-8") == "kept\n"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.gob", "bad.s"]

@@ -1,13 +1,13 @@
-"""`boot doc` over a fixture, against the JSON recorded for it.
+"""`turkey doc` over a fixture, against the JSON recorded for it.
 
-`tests/doc/Fixture.gob` declares one of each kind of entity `boot doc`
+`tests/doc/Fixture.gob` declares one of each kind of entity `turkey doc`
 describes, re-exports from `tests/doc/Shapes.gob`, and places `---` doc
 comments on each edge of the attachment rule (`src/Turkey/DocComments.gob`):
 above a field, a constructor, a method, an associated type and an instance;
 the module comment; and doc comments that document nothing, beside ordinary,
 rule and block comments that are never docs.
 
-`boot doc --html` writes the same description as a website, recorded file by
+`turkey doc --html` writes the same description as a website, recorded file by
 file in `tests/doc/site/`, with the JSON among its files.
 
 To record new output, run with `TURKEY_BLESS_DOC=1`, and read the diff of

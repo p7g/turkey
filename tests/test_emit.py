@@ -1,4 +1,4 @@
-"""`boot build -f asm`: the machine IR as assembly the system assembler accepts.
+"""`turkey build -f asm`: the machine IR as assembly the system assembler accepts.
 
 The oracle here is `as`, and it is a much sharper one than `test_select`'s.
 That test could only assemble the lines with no virtual register left in them --
@@ -330,7 +330,7 @@ def test_the_compilers_own_source_assembles():
     """The scale test: 3,073 functions, 16 KB frames, 45,097 safepoints.
 
     Every immediate range this backend can get wrong is a function of frame
-    size, and `boot`'s frames are two orders of magnitude bigger than the
+    size, and `turkey`'s frames are two orders of magnitude bigger than the
     corpus's.
     """
     main = REPO_ROOT / "src" / "Main.gob"

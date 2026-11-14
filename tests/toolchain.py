@@ -1,23 +1,23 @@
-"""The C compiler the tests use, and how a program `boot` wrote is run.
+"""The C compiler the tests use, and how a program `turkey` wrote is run.
 
 Three settings, split with shell-word rules:
 
 * `$TURKEY_CC` is the C compiler, `cc` when unset. It compiles the C probes
-  some tests run beside a program, and assembles `boot`'s assembly where a
+  some tests run beside a program, and assembles `turkey`'s assembly where a
   test checks it with the system assembler. On an x86-64 machine checking
   arm64 output it is a cross compiler, and links the bootstrap compiler
-  statically. Everything `boot` writes is dynamically linked against glibc,
+  statically. Everything `turkey` writes is dynamically linked against glibc,
   which qemu-user loads from where `$QEMU_LD_PREFIX` names.
 * `$TURKEY_OPENSSL` is where OpenSSL 3 is installed, for a program that
   imports `Net.TLS`: its `lib/`, `include/` and `bin/openssl`. Unset on macOS
   it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by
   the compiler and on `$PATH`.
-* `$TURKEY_RUN` is a prefix for executing a program `boot` wrote, a C probe,
-  or a built `boot`. Empty means run it directly, which is right natively and
+* `$TURKEY_RUN` is a prefix for executing a program `turkey` wrote, a C probe,
+  or a built `turkey`. Empty means run it directly, which is right natively and
   also under qemu-user once binfmt_misc knows the format; the prefix
   (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
-`scripts/build.sh` reads `$TURKEY_CC` and `$TURKEY_RUN` too. A cached `boot`
+`scripts/build.sh` reads `$TURKEY_CC` and `$TURKEY_RUN` too. A cached `turkey`
 is keyed on `identity()` as well as its sources, since the caches are shared
 by every session on the machine, and the target `build.sh` builds for is the
 one `$TURKEY_CC` links for.
@@ -72,9 +72,9 @@ def _openssl_prefix() -> Path | None:
 
 
 def openssl_dylib_path() -> str | None:
-    """The `$TURKEY_DYLIB_PATH` for an executable `boot` writes itself, for a
+    """The `$TURKEY_DYLIB_PATH` for an executable `turkey` writes itself, for a
     program that imports `Net.TLS`: the `lib/` of the same installation the
-    tests link with, or None for the places `boot` searches by default."""
+    tests link with, or None for the places `turkey` searches by default."""
     prefix = _openssl_prefix()
     return str(prefix / "lib") if prefix else None
 
@@ -138,7 +138,7 @@ def identity() -> bytes:
 def machine() -> str:
     """The triple `$TURKEY_CC -dumpmachine` reports, or "" if it cannot say.
 
-    `scripts/build.sh` chooses its target from the same triple, and `boot`
+    `scripts/build.sh` chooses its target from the same triple, and `turkey`
     emits for the target it was built for, so this is also what the tests'
     programs are compiled for.
     """
@@ -151,7 +151,7 @@ def machine() -> str:
 
 def target() -> str:
     """The `--target` spelling for what `$TURKEY_CC` links for, which is the
-    target `boot` was built for and so its default; "" for a triple that
+    target `turkey` was built for and so its default; "" for a triple that
     names neither. The same patterns as `scripts/build.sh`'s."""
     triple = machine()
     if triple.startswith(("arm64-apple-darwin", "arm64-apple-macos",
@@ -163,7 +163,7 @@ def target() -> str:
 
 
 def c_symbol(name: str) -> str:
-    """How `boot`'s assembly spells the C symbol `name` for the target it
+    """How `turkey`'s assembly spells the C symbol `name` for the target it
     was built for: Mach-O puts an underscore before it, and ELF does not."""
     return "_" + name if target() == "arm64-darwin" else name
 
@@ -175,7 +175,7 @@ def local_label(name: str) -> str:
 
 
 def libraries() -> list[str]:
-    """What a C probe linked against `boot`'s assembly needs after its objects.
+    """What a C probe linked against `turkey`'s assembly needs after its objects.
 
     glibc keeps the maths library out of libc, and the runtime calls `log10`.
     Darwin's libSystem carries it, so a Mac link has nothing added.

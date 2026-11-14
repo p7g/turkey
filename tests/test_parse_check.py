@@ -7,7 +7,7 @@ comment and blank-line tables account for all the text the tokens leave out.
 
 The suite sets it for everything it compiles, which reaches only the modules
 some program imports. Here each file under `lib/` and `src/` is the entry of
-its own `boot check`. The entry is parsed before anything else is asked of it,
+its own `turkey check`. The entry is parsed before anything else is asked of it,
 so a file that is no program, such as a library module the Prelude imports,
 which cannot also be the entry, is still checked before its compile fails.
 """

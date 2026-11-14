@@ -3,7 +3,7 @@
 A program outside the shipped `lib/` may not import one: their interfaces are
 raw pointers and C signatures nothing checks. Decided by where the imported
 file came from, so the compiler's own `Turkey.*` modules, beside its entry,
-are untouched -- which the whole suite checks by building `boot` at all.
+are untouched -- which the whole suite checks by building `turkey` at all.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from tests import bootc, toolchain
 
 
 def _check(entry: Path, **env: str) -> subprocess.CompletedProcess[str]:
-    """`boot check`, without the hook the suite sets for the corpus."""
+    """`turkey check`, without the hook the suite sets for the corpus."""
     environment = {k: v for k, v in os.environ.items()
                    if k != bootc.INTERNAL_IMPORTS}
     environment.update(env)

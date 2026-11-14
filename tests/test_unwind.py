@@ -7,15 +7,15 @@ from one instruction to the next and so are a DWARF description in
 `__eh_frame`. On ELF it is `.eh_frame`, exact at every instruction.
 
 **The object's oracle is the assembler**, as for the line table: the unwind
-sections `boot` writes into an object are the ones the system assembler makes
-of `boot`'s own assembly, whose `.cfi_*` directives say the same rules, for
-the test programs and for `boot` itself. Byte for byte, with the relocations
+sections `turkey` writes into an object are the ones the system assembler makes
+of `turkey`'s own assembly, whose `.cfi_*` directives say the same rules, for
+the test programs and for `turkey` itself. Byte for byte, with the relocations
 compared by what they resolve to, since the assembler names a section's
 start by a symbol of its own. Where the assembler is not the format's own --
 LLVM writing ELF, on macOS -- the two `.eh_frame`s are compared by the rows
 they decode to instead: LLVM lays the same rules out with other factors.
 
-Then the tools, on the executable `boot` writes: `objdump` and `readelf` show
+Then the tools, on the executable `turkey` writes: `objdump` and `readelf` show
 an entry for every function, and a debugger stopped on a function's first
 instruction or on its `ret` -- where frame mode does not hold, and lldb reads
 the code instead -- shows the whole stack, which inside a coroutine ends at
@@ -333,7 +333,7 @@ def _frames(data: bytes) -> dict[int, tuple]:
 # -- the object against the assembler ------------------------------------------
 
 def _agree(ours: bytes, theirs: bytes, exact: bool) -> None:
-    """`boot`'s object, `ours`, carries the unwind sections the assembler put
+    """`turkey`'s object, `ours`, carries the unwind sections the assembler put
     in `theirs`: the same bytes and relocations if `exact`, and on ELF the
     same rows either way."""
     mine, assembled = _Object(ours), _Object(theirs)
@@ -539,7 +539,7 @@ def _stops(directory: Path, function: str) -> dict[str, int]:
 
 def _gdb_break(directory: Path, function: str, where: str) -> str:
     """gdb's command to stop at `where` in `function`, as `_stops` finds it,
-    named as a distance from the function's symbol. An executable `boot`
+    named as a distance from the function's symbol. An executable `turkey`
     writes is position-independent, and gdb moves a breakpoint named by a
     symbol to where the program is loaded, but not one named by an address."""
     stops = _stops(directory, function)

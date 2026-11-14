@@ -3,8 +3,8 @@
 #
 #   scripts/docs.sh [OUT]       (default OUT: build/docs in the repository)
 #
-# writes the site `boot doc --html` generates into OUT: OUT/index.html, which
-# lists the modules, a page per module, and OUT/docs.json, what `boot doc`
+# writes the site `turkey doc --html` generates into OUT: OUT/index.html, which
+# lists the modules, a page per module, and OUT/docs.json, what `turkey doc`
 # says every library module exports. Every link in the site is relative, so
 # it can be opened as files.
 #
@@ -14,8 +14,8 @@
 # the script cannot tell which of its files are its own.
 #
 # lib/Turkey/ is the implementation, which no program may import, and is left
-# out. The compiler is $TURKEY_BOOT, or scripts/build.sh's stage2, built first
-# if it is not there.
+# out. The compiler is $TURKEY_BOOT, or scripts/build.sh's `turkey`, built
+# first if it is not there.
 
 set -eu
 
@@ -33,7 +33,7 @@ case $boot in
 esac
 cd "$(dirname "$0")/.."
 out=${out:-$(pwd)/build/docs}
-boot=${boot:-build/stages/stage2}
+boot=${boot:-build/stages/turkey}
 if [ ! -x "$boot" ]; then
     sh scripts/build.sh
 fi

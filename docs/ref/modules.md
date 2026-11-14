@@ -882,7 +882,7 @@ The compiler's `--target` option chooses among them. Its value is spelled
 compiler itself runs on:
 
 ```sh
-boot build --target arm64-linux main.gob
+turkey build --target arm64-linux main.gob
 ```
 
 Code that differs by platform is an ordinary `match`. The signal for a bus

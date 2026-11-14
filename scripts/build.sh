@@ -2,11 +2,13 @@
 # Build the compiler from the committed bootstrap, with no Python involved.
 #
 #   stage1  the committed assembly (bootstrap/), linked
-#   stage2  the executable stage1 writes for today's source -- the result
+#   stage2  the executable stage1 writes for today's source -- the result,
+#           written as `turkey`, the name the compiler is run by
 #   stage3  the executable stage2 writes for the same source  (--fixpoint only)
 #   stage4  the executable stage3 writes, which must be stage3 (--fixpoint only)
 #
-# Stage N is written by stage N-1. stage2 is today's source compiled by the
+# Stage N is written by stage N-1, as the file stageN in --out, except
+# stage2, which is the file `turkey`. stage2 is today's source compiled by the
 # committed compiler: correct if that one is, but its code is whatever an older
 # compiler emitted. stage3 is today's source compiled by today's source, and the
 # fixed point is that stage3 writes exactly the executable it is. The writer
@@ -201,14 +203,18 @@ if [ $only1 = 1 ]; then
     exit 0
 fi
 
-emit "$out/stage1" "$out/stage2"
+emit "$out/stage1" "$out/turkey"
+# Nothing here writes a file named stage2. Remove one found in --out, since it
+# is a compiler this build did not make and would be run in place of `turkey`
+# by anything that still names it.
+rm -f "$out/stage2"
 
 if [ $fixpoint = 1 ]; then
-    emit "$out/stage2" "$out/stage3"
+    emit "$out/turkey" "$out/stage3"
     emit "$out/stage3" "$out/stage4"
     step "compare stage3 stage4"
     if ! cmp -s "$out/stage3" "$out/stage4"; then
-        assembly "$out/stage2" > "$out/stage3.s"
+        assembly "$out/turkey" > "$out/stage3.s"
         assembly "$out/stage3" > "$out/stage4.s"
         difference=$(cmp "$out/stage3.s" "$out/stage4.s")
         echo "build.sh: no fixpoint: ${difference:-the executables differ, the assembly does not}" >&2
@@ -221,4 +227,4 @@ if [ $fixpoint = 1 ]; then
     fi
 fi
 
-step "done: $out/stage2"
+step "done: $out/turkey"

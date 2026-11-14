@@ -12,12 +12,12 @@
 # Builds two programs first, each cached by a fingerprint of its inputs under
 # $TMPDIR/turkey-test/ and reused while that fingerprint holds:
 #
-#   boot     the compiler under test, scripts/build.sh's stage2, or the binary
+#   boot     the compiler under test, scripts/build.sh's `turkey`, or the binary
 #            $TURKEY_BOOT names, used as it is with nothing built
 #   harness  tests/harness/Main.gob, compiled by stage1
 #
 # **The harness is compiled by stage1, the committed compiler in bootstrap/,
-# and not by the boot it tests.** A working tree whose compiler miscompiles
+# and not by the compiler it tests.** A working tree whose compiler miscompiles
 # would otherwise be reported on by a harness it miscompiled. The harness still
 # links the working tree's lib/, so a broken lib/ fails the harness's build
 # loudly rather than giving a wrong answer.
@@ -27,7 +27,7 @@
 # library change that compiles under stage2 but not under stage1 is that
 # case; it waits for scripts/bump-bootstrap.sh, or is written another way.
 #
-# Both programs, and every case's program, are executables a boot writes:
+# Both programs, and every case's program, are executables `turkey` writes:
 # nothing here is linked. $TURKEY_CC and $TURKEY_RUN are read as
 # scripts/build.sh reads them.
 
@@ -103,8 +103,8 @@ else
     boot_key=$({ bootstrap_files; library; find src -name '*.gob'; } | fingerprint)
     boot=$CACHE/boot/$boot_key/boot
     if [ ! -x "$boot" ]; then
-        echo "test.sh: building boot ($boot_key)" >&2
-        build stage2 "$boot"
+        echo "test.sh: building turkey ($boot_key)" >&2
+        build turkey "$boot"
     fi
     touch "$(dirname "$boot")"
 fi

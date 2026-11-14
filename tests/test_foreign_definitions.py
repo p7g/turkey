@@ -1,6 +1,6 @@
 """Foreign definitions export Turkey functions for C callers.
 
-Check the giblet gate and signatures through boot, then call the exported
+Check the giblet gate and signatures through turkey, then call the exported
 symbols from C, including before the program starts.
 """
 

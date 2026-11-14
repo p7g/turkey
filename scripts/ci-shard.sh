@@ -32,7 +32,7 @@
 # about 300 each, language 500, assembler 360, system 350, passes 220, and
 # bootstrap 150 plus the emission it waits on. A four-core runner takes nearly
 # twice as long per worker-second. `native`, `generational` and `bootstrap`
-# set the wall time: each holds a serial chain (one `boot` run over the
+# set the wall time: each holds a serial chain (one `turkey` run over the
 # corpus, then the slowest program under GC stress; stage2 compiling the
 # compiler, then stage3 over the corpus) that more cores do not shorten.
 

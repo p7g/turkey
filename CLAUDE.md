@@ -71,22 +71,23 @@ it was diffed against is gone, so there is no second answer to compare against,
 and a change is checked by what it *does*:
 
 * **Recorded behavior.** `tests/programs/` holds a program, its exact output
-  and its exit status. `tests/lang.py` compiles and runs through `boot`, and
+  and its exit status. `tests/lang.py` compiles and runs through `turkey`, and
   every behavioral test goes through it. Regenerate a golden with
   `sh scripts/test.sh --bless [PATH]` and **read the diff**: nothing else
   says whether a change is a fix or a regression.
 * **The reference.** The harness compiles and runs every example in
   `docs/ref/` (`sh scripts/test.sh docs/ref`), so the chapters are executable.
-* **The fixed point.** `boot` compiles itself, and `pytest -m bootstrap` checks
-  that the compiler it builds emits the same bytes it was built from. A
+* **The fixed point.** `turkey` compiles itself, and `pytest -m bootstrap`
+  checks that the compiler it builds emits the same bytes it was built from. A
   miscompile has to reproduce itself exactly to survive.
 
 Budget for the goldens: a change that moves output moves the recorded files
 too, and regenerating them without reading them is how a regression gets
 committed.
 
-`boot` itself is built from the arm64 assembly committed in `bootstrap/`, by
-`scripts/build.sh`, with a C compiler and no Python. `scripts/bump-bootstrap.sh`
+`scripts/build.sh` builds `turkey` with a C compiler and no Python: it links
+the arm64 assembly committed in `bootstrap/` into a compiler, and that compiler
+compiles today's `src/` into `turkey`. `scripts/bump-bootstrap.sh`
 replaces that committed compiler, which is a deliberate act and its own commit:
 both scripts say when and why at the top.
 
@@ -147,7 +148,7 @@ message. If it is about work not done, it belongs in a ticket.
 
 **Doc comments.** Use `---` for the comment a caller reads, directly above an
 exported declaration, field, constructor, method, associated type or instance;
-`boot doc` publishes these and nothing else. A module's own `---` comment goes
+`turkey doc` publishes these and nothing else. A module's own `---` comment goes
 before its first declaration with a blank line under it, since one directly
 above a declaration documents that declaration. Start it with a verb and state
 only guarantees. Keep the rationale for how the code works in `--` comments

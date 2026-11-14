@@ -1,4 +1,4 @@
-"""lldb formatters for programs `boot build -g` compiled.
+"""lldb formatters for programs `turkey build -g` compiled.
 
 Load with `command script import debugger/turkey_lldb.py`, or run
 `scripts/turkey-lldb`, which does.
@@ -249,7 +249,7 @@ _constants: dict[str, dict[str, int]] = {}
 
 def _runtime(value: lldb.SBValue) -> dict[str, int]:
     """The runtime constants of the program `value` is in, from the
-    `Turkey.Runtime` enumeration `boot build -g` writes."""
+    `Turkey.Runtime` enumeration `turkey build -g` writes."""
     target = value.GetTarget()
     key = target.GetModuleAtIndex(0).GetUUIDString() or str(target.GetExecutable())
     if key not in _constants:

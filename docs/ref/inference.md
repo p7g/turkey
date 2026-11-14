@@ -9,7 +9,7 @@ types.
 To see the types the compiler infers for a file, run:
 
 ```sh
-boot check --dump types program.gob
+turkey check --dump types program.gob
 ```
 
 ## Principal types

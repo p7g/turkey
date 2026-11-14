@@ -92,12 +92,12 @@ hello
 Examples that the compiler rejects say so in the surrounding text, and the
 test checks that the error message says what the text claims it says.
 
-Source files use the extension `.gob`. The compiler, `boot`, writes the
+Source files use the extension `.gob`. The compiler, `turkey`, writes the
 whole program as an executable, named after the file and placed in the working
 directory, with nothing to assemble or link:
 
 ```sh
-boot build hello.gob
+turkey build hello.gob
 ./hello
 ```
 
@@ -109,7 +109,7 @@ instead and `-f obj` a relocatable object, either of which a C compiler links;
 without `-o`, either goes to standard output. On Linux, add `-lm` to the
 link.
 
-The project README says how to build `boot` itself.
+The project README says how to build `turkey` itself.
 
 ## For maintainers
 
@@ -125,7 +125,7 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- stderr -->` | The next `text` fence is the exact standard error of the `panic` example before it: the panic and its trace. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
 
-Every example is compiled and run by `boot`, the way a reader who copies one
+Every example is compiled and run by `turkey`, the way a reader who copies one
 would. A `kotlin` fence with no directive fails the test. Grammar goes in `ebnf`
 fences and shell commands in `sh` fences; the test ignores both.
 

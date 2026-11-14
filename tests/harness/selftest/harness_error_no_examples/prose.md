@@ -3,5 +3,5 @@
 Prose, and a shell command, but nothing for the harness to run:
 
 ```sh
-boot build -o hello.s hello.gob
+turkey build -o hello.s hello.gob
 ```

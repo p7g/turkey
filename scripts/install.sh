@@ -1,6 +1,6 @@
 #!/bin/sh
 # Put the compiler on PATH as `turkey`: a symbolic link in BINDIR to this
-# checkout's build/stages/stage2, which scripts/build.sh writes.
+# checkout's build/stages/turkey, which scripts/build.sh writes.
 #
 # The compiler finds lib/ by resolving its own path through the link and
 # looking above it, so the checkout is the installation. A rebuild, or an edit
@@ -15,7 +15,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 bindir=${1:-$HOME/.local/bin}
-compiler=$ROOT/build/stages/stage2
+compiler=$ROOT/build/stages/turkey
 link=$bindir/turkey
 
 if [ ! -x "$compiler" ]; then
@@ -23,10 +23,11 @@ if [ ! -x "$compiler" ]; then
     exit 1
 fi
 # Replace an earlier link to a Turkey compiler, from this checkout or another,
-# but nothing else: not a file, and not a link to some other tool.
+# under either name scripts/build.sh has given its result, but nothing else:
+# not a file, and not a link to some other tool.
 if [ -L "$link" ]; then
     case $(readlink "$link") in
-        */build/stages/stage2) ;;
+        */build/stages/turkey|*/build/stages/stage2) ;;
         *)
             echo "install.sh: $link links to $(readlink "$link"), not a Turkey" \
                  "compiler; remove it first" >&2

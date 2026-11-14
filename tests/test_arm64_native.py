@@ -1,4 +1,4 @@
-"""`boot build`: the corpus compiled by the independent arm64 backend, and run.
+"""`turkey build`: the corpus compiled by the independent arm64 backend, and run.
 
 The check on this backend that sees *meaning*. `tests/test_emit.py` checks
 that `as` accepts what is printed, which catches an immediate out of range and
@@ -46,9 +46,9 @@ def _split(text: str, paths: list[Path]) -> list[str]:
 
 @functools.lru_cache(maxsize=None)
 def _all(flags: tuple[str, ...] = ()) -> dict[str, str]:
-    """Every corpus program's assembly, from one `boot` process.
+    """Every corpus program's assembly, from one `turkey` process.
 
-    Starting `boot` costs minutes and compiling a program costs a moment, so
+    Starting `turkey` costs minutes and compiling a program costs a moment, so
     one process per program turns the corpus into an hour.
     """
     paths = [PROGRAMS / name for name in CORPUS]

@@ -72,18 +72,18 @@ see below):
 sh scripts/build.sh
 ```
 
-That leaves a compiler in `build/stages/stage2`. Save the example as
+That leaves a compiler in `build/stages/turkey`. Save the example as
 `rectangles.gob`, then compile and run it:
 
 ```sh
-build/stages/stage2 build rectangles.gob
+build/stages/turkey build rectangles.gob
 ./rectangles
 ```
 
 To run it from anywhere as `turkey`, link it onto your `PATH`:
 
 ```sh
-sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/stage2
+sh scripts/install.sh          # ~/.local/bin/turkey -> build/stages/turkey
 sh scripts/install.sh ~/bin    # or a directory of your choosing
 ```
 
@@ -110,7 +110,7 @@ loads glibc 2.34 or later. It is written for either target from any host, with
 and `libm.so.6` on Linux -- and the libraries the program calls into: a program
 that calls `Net.TLS` loads OpenSSL 3's `libssl` and `libcrypto`. On Linux they
 are `libssl.so.3` and `libcrypto.so.3`, and nothing is read to write them. On a
-Mac, `boot` reads each library's install name from `libssl.3.dylib` (and so
+Mac, `turkey` reads each library's install name from `libssl.3.dylib` (and so
 on), found in the directories of `$TURKEY_DYLIB_PATH`, separated by colons,
 then `/opt/homebrew/lib` and `/usr/local/lib`, then each Homebrew package's
 `opt/*/lib`; so `brew install openssl@3` is enough. Writing a Mac executable
@@ -122,7 +122,7 @@ one does (see "Debugging and profiling").
 An object links with the C compiler:
 
 ```sh
-build/stages/stage2 build -o rectangles.o rectangles.gob
+build/stages/turkey build -o rectangles.o rectangles.gob
 cc -o rectangles rectangles.o
 ```
 
@@ -144,7 +144,7 @@ make their certificates with that installation's `openssl`.
 
 `check` compiles as far as the last stage that can reject a program and
 writes nothing. Either command takes `--dump STAGE,...` to print what a stage produced:
-`build/stages/stage2 check --dump types rectangles.gob` shows the inferred
+`build/stages/turkey check --dump types rectangles.gob` shows the inferred
 types, and running the compiler with no arguments lists the stages.
 `build --timings` reports on standard error how long each phase took, how the
 backend's time is spread over functions, and how much of the optimizer's work
@@ -182,7 +182,7 @@ code: a program built with `-g` runs the same instructions as one built
 without.
 
 ```sh
-build/stages/stage2 build -g rectangles.gob
+build/stages/turkey build -g rectangles.gob
 ```
 
 On a Mac, the executable carries the DWARF itself, in a `__DWARF` segment
@@ -298,11 +298,11 @@ the tests alike. Each is split into words the way a shell would split it.
 - `TURKEY_CC` is the C compiler that assembles and links the bootstrap
   compiler, and compiles the C files a few tests run beside a program.
   Unset, it is `cc`.
-- `TURKEY_RUN` is a prefix for running a program `boot` wrote, or a built
+- `TURKEY_RUN` is a prefix for running a program `turkey` wrote, or a built
   compiler. Unset or empty, the program runs directly.
 
 On x86-64 Linux, the arm64 output runs under qemu-user. The bootstrap
-compiler is linked statically, and every executable `boot` writes is
+compiler is linked statically, and every executable `turkey` writes is
 dynamically linked against glibc, which qemu finds in the cross toolchain's
 `/usr/aarch64-linux-gnu` when `QEMU_LD_PREFIX` names it. Set up the machine
 with:
@@ -338,7 +338,7 @@ With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 any platform emit Linux objects and assembly.
 
 An executable for `--target arm64-linux` needs none of the cross toolchain:
-`boot` writes it, dynamically linked, on any host, with no linker and no arm64
+`turkey` writes it, dynamically linked, on any host, with no linker and no arm64
 libc. It runs on glibc 2.34 or later -- RHEL 9 and its rebuilds,
 Ubuntu 22.04, Debian 12, and anything newer -- the first release with
 `pthread_create` in `libc.so.6`. On an older glibc it stops before `main`
@@ -374,7 +374,7 @@ ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
 syntax highlighting and indentation. Add the directory to `runtimepath`, or
 point a plugin manager at it (`Plug '~/path/to/turkey/vim'`). Its tests run
 headless in whichever of `vim` and `nvim` are installed, and check that the
-fixture parses when `TURKEY_BOOT` or `build/stages/stage2` is a compiler:
+fixture parses when `TURKEY_BOOT` or `build/stages/turkey` is a compiler:
 
 ```sh
 sh vim/test/run.sh
@@ -382,11 +382,11 @@ sh vim/test/run.sh
 
 ### Library documentation
 
-`boot doc FILE...` checks the modules in the files and writes JSON describing
+`turkey doc FILE...` checks the modules in the files and writes JSON describing
 what each one exports. Every function, value, type, class, instance and
 operator gets its type as the checker has it, its line, and its doc comment:
 the `---` comments directly above it ([doc comments](docs/ref/lexical.md#doc-comments)).
-`boot doc --html DIR FILE...` writes the same description as a static
+`turkey doc --html DIR FILE...` writes the same description as a static
 website in `DIR`: an index, one page per module, and a search over names,
 types and comments. To build it for the whole library:
 
@@ -424,9 +424,9 @@ Turkey, `tests/harness/`:
     sh scripts/test.sh --selftest         # the harness checked on its own cases
     sh scripts/test.sh --bless PATH       # PATH's goldens rewritten from its output
 
-It builds `boot` (or uses `TURKEY_BOOT`) and compiles itself with the committed
-bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are compiled
-programs. A program's expected outcome is a directive in it: `--@ error` (it
+It builds `turkey` (or uses `TURKEY_BOOT`) and compiles itself with the
+committed bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are
+compiled programs. A program's expected outcome is a directive in it: `--@ error` (it
 must not compile), `--@ panic`, `--@ exit: N`, and otherwise exit 0. A case
 that fails is shown with a diff, and every actual output is kept under
 `$TMPDIR/turkey-test/actual/`. A reference example is named by its chapter and
@@ -461,7 +461,7 @@ is what a broken compiler looks like. It never changes a directive.
 
 The rest of the tests are Python. Install their dependencies with
 `python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.
-The tests compile their programs with `boot`, which is built from the
+The tests compile their programs with `turkey`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built
 yourself instead.
 
@@ -472,16 +472,16 @@ The suite runs in parallel by default, and three commands cover it:
     python3 -m pytest tests -q -m ''      # both, in one run
 
 To run both, use the last one rather than the first two in turn. The fixed
-point is a chain nothing can parallelize -- `boot` compiling the compiler,
+point is a chain nothing can parallelize -- `turkey` compiling the compiler,
 linking the result, and that compiling it again, about two minutes a step --
 and in one run it overlaps the rest of the suite instead of starting after it.
-On a 16-core arm64 Mac, after a change to `src/` (so `boot` is rebuilt), the
-combined run takes about nine minutes. The build of `boot` and everything the tests
-compute from it are cached in `$TMPDIR` by content hash, so a second run
+On a 16-core arm64 Mac, after a change to `src/` (so `turkey` is rebuilt), the
+combined run takes about nine minutes. The build of `turkey` and everything the
+tests compute from it are cached in `$TMPDIR` by content hash, so a second run
 with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a program, compile it with
-`boot build --gc-verify`. Each collection independently checks object bounds,
+`turkey build --gc-verify`. Each collection independently checks object bounds,
 each object's size class against the size its allocation recorded (objects
 carry no size of their own, so such a build keeps a size table per region),
 traced references, shadow-stack and native roots, marking completeness,
@@ -504,7 +504,7 @@ at all, and says so on stderr if it is run with `TURKEY_GC_VERIFY` set. It
 checks the roots and layouts the compiler supplies, so behavioral stress tests
 are still needed to catch references omitted from those descriptions.
 
-`boot build --gc-stats` compiles in the collector's accounting: a line per
+`turkey build --gc-stats` compiles in the collector's accounting: a line per
 collection and a summary at exit, on stderr. Counting sends every allocation
 through the runtime rather than the code compiled in line for it, so a stats
 build's times are slower than a plain one's.

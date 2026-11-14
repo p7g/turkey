@@ -8,7 +8,7 @@
 #      no-op on it;
 #   2. probe syntax groups at a few dozen positions (test/syntax.vim).
 #
-# If a Turkey compiler is found ($TURKEY_BOOT, else build/stages/stage2),
+# If a Turkey compiler is found ($TURKEY_BOOT, else build/stages/turkey),
 # also checks that the fixture lexes and parses. It need not type-check: it
 # declares a `foreign` function, which only the standard library may.
 set -u
@@ -58,7 +58,7 @@ for editor in vim nvim; do
 done
 
 root=$(dirname "$plugin")
-boot=${TURKEY_BOOT:-$root/build/stages/stage2}
+boot=${TURKEY_BOOT:-$root/build/stages/turkey}
 if [ -x "$boot" ]; then
     # Run from the repository root, where the compiler finds lib/.
     (cd "$root" && "$boot" check "$TURKEY_FIXTURE") > "$tmp/check.out" 2>&1

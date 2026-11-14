@@ -5,7 +5,7 @@ fault in dominance, the verifiers or the effect lattice shows up here rather
 than as a miscompile. `src/SsaCheck.gob` is the driver; see its header for why
 it lives there.
 
-Compiled by `boot` itself and run: a test of the Turkey code, not of two
+Compiled by `turkey` itself and run: a test of the Turkey code, not of two
 implementations agreeing.
 """
 
@@ -21,7 +21,7 @@ DRIVER = REPO_ROOT / "src" / "SsaCheck.gob"
 @functools.lru_cache(maxsize=None)
 @functools.lru_cache(maxsize=1)
 def _dump() -> str:
-    """The driver's output: `src/SsaCheck.gob` compiled by `boot` and run.
+    """The driver's output: `src/SsaCheck.gob` compiled by `turkey` and run.
 
     It imports `src/Turkey/`, whose sources are part of the compile's cache
     key (`tests.lang`), so a change there recompiles it.

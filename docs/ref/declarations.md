@@ -923,7 +923,7 @@ fun main() { }
 
 A program loads a library only if it calls one of the library's functions, so
 importing a module with such a block costs nothing until a call to one is
-reached. The executable `boot` writes names the library on Linux as
+reached. The executable `turkey` writes names the library on Linux as
 `libssl.so.3`, the name and the major. On macOS it names the library by the
 install name of `libssl.3.dylib`, which must be an absolute path.
 Writing that executable reads it from the first such file in the directories

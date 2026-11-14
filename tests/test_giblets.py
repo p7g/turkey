@@ -1,7 +1,7 @@
 """Giblets: modules whose code does not allocate or hold a traced value across
 a call.
 
-Every rule is run through `boot`, and its verdict -- accepted, or the
+Every rule is run through `turkey`, and its verdict -- accepted, or the
 diagnostic -- is the test.
 
 A giblet module whose code is wrong on purpose cannot be in the compiler's
@@ -44,10 +44,10 @@ def _message(stderr: str) -> str:
 
 
 def verdict(entry: Path, giblets: str, command: str = "core") -> str:
-    """What `boot` says: `""` for a program it accepts, the diagnostic
+    """What `turkey` says: `""` for a program it accepts, the diagnostic
     otherwise. `core` stops before the giblets check; `ssa` runs it."""
     code, stderr = _run(entry, giblets, command)
-    assert code == 0 or stderr, "boot failed and said nothing"
+    assert code == 0 or stderr, "turkey failed and said nothing"
     return "" if code == 0 else _message(stderr)
 
 
@@ -76,7 +76,7 @@ def test_a_giblet_module_must_come_from_the_library(tmp_path):
 
 @pytest.fixture
 def lowered(request, tmp_path):
-    """A giblet probe and an ordinary one beside it, lowered by `boot`."""
+    """A giblet probe and an ordinary one beside it, lowered by `turkey`."""
     digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
     giblet = LIB / f"Probe_giblet_{digest}.gob"
     helper = LIB / f"Probe_helper_{digest}.gob"

@@ -38,7 +38,7 @@ SAMPLE = ["adt.gob", "loops.gob", "stack.gob", "generalization.gob",
 def _all() -> dict[str, str]:
     """The `ssa` dump of every sample program, in **one** invocation.
 
-    One process for every program, and a compiled `boot` rather than an
+    One process for every program, and a compiled `turkey` rather than an
     interpreted one -- both from `tests.bootc`, which explains why. The dump
     has no separator between programs, by design: every one ends with its own
     count line, so splitting on that line recovers them.

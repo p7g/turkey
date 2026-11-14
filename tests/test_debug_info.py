@@ -1,30 +1,30 @@
-"""`boot build -g`: a line table and the DWARF a debugger needs to find it.
+"""`turkey build -g`: a line table and the DWARF a debugger needs to find it.
 
 `Turkey.Dwarf` writes the compile unit, the subprograms, and an inlined
-subroutine for each call the optimizer inlined, and `boot` builds `debug_line`
-from the `.file`/`.loc` rows its assembly would carry. The executable `boot`
+subroutine for each call the optimizer inlined, and `turkey` builds `debug_line`
+from the `.file`/`.loc` rows its assembly would carry. The executable `turkey`
 writes holds them all, so the checks are the tools a user would reach for, on
 that executable: `llvm-dwarfdump` reads the rows and verifies the DWARF, a
 debugger stops at a line and names the frames, inlined calls among them, and
 on macOS `atos`, which reads DWARF the way `sample` and Instruments do, names
 the inlined frames too.
 
-**The object's oracle is the assembler.** The object `boot` writes with `-g`
-has to carry the debug sections the system assembler makes of `boot`'s own
-`-g` assembly, for the test programs and for `boot` itself. On macOS that is
+**The object's oracle is the assembler.** The object `turkey` writes with `-g`
+has to carry the debug sections the system assembler makes of `turkey`'s own
+`-g` assembly, for the test programs and for `turkey` itself. On macOS that is
 exact: every debug section has the same bytes, and the same relocations.
 GNU `as` encodes the line table its own way -- other opcodes for the same
 advances, its own file and directory tables -- so on Linux `debug_line` and
 `debug_line_str` are compared by the rows they decode to, each row's file by
 its full path. The other debug sections are compared byte for byte there too,
 and their relocations by what they resolve to: GNU `as` relocates against a
-local symbol's section where `boot` names the symbol.
+local symbol's section where `turkey` names the symbol.
 
 A tool that is missing skips its test and says which, rather than passing.
 
 The other half is that `-g` changes no code. Positions ride on every
 instruction through the backend, so a position that reached a decision would
-show up here first: `boot` built with and without `-g` has the same code
+show up here first: `turkey` built with and without `-g` has the same code
 section, byte for byte.
 """
 
@@ -810,10 +810,10 @@ def test_the_filter_names_each_function_as_the_dwarf_does(program):
 
 @pytest.mark.bootstrap
 def test_the_filter_names_each_function_of_the_compiler_as_the_dwarf_does():
-    """`boot` itself, whose namers make every kind of name: instances and
+    """`turkey` itself, whose namers make every kind of name: instances and
     their methods, defaults, specializations, layout copies and lambdas."""
     with tempfile.TemporaryDirectory() as directory:
-        written = Path(directory) / "boot"
+        written = Path(directory) / "turkey"
         bootc.executable(bootc.BOOT_MAIN, written, "-g")
         _check_display_names(written)
 
@@ -976,7 +976,7 @@ def _first_difference(ours: bytes, theirs: bytes) -> str:
 
 
 def _agree(ours: Path, theirs: Path) -> None:
-    """`boot`'s object, `ours`, carries the debug sections the assembler put
+    """`turkey`'s object, `ours`, carries the debug sections the assembler put
     in `theirs`, from the same program."""
     mine, assembled = _Object(ours.read_bytes()), _Object(theirs.read_bytes())
     exact = _darwin()
@@ -1030,7 +1030,7 @@ def test_the_object_has_the_assemblers_debug_sections(name):
 
 @pytest.mark.bootstrap
 def test_the_object_has_the_assemblers_debug_sections_on_the_compiler():
-    """`boot` itself: four hundred thousand rows, from every file of the
+    """`turkey` itself: four hundred thousand rows, from every file of the
     compiler and the library."""
     main = bootc.BOOT_MAIN
     _compare_with_assembler(main, bootc.boot_each("asm", [main], _split, flags=("-g",))[main])
@@ -1054,7 +1054,7 @@ def _assembled_code(text: str, flags: list[str]) -> bytes:
 
 @pytest.mark.bootstrap
 def test_debug_information_changes_no_code():
-    """`boot` itself, with and without `-g`: the same code section. Every
+    """`turkey` itself, with and without `-g`: the same code section. Every
     debug-information change keeps this test, since it is the one that sees a
     position reach code generation."""
     main = bootc.BOOT_MAIN

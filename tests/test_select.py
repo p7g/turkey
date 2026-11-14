@@ -76,7 +76,7 @@ def _split_asm(text: str, paths: list[Path]) -> list[str]:
 def _all() -> dict[str, str]:
     """The `select` dump of the whole corpus, cached on disk per program.
 
-    One `boot` run fills the cache and every worker of `pytest -n auto` reads
+    One `turkey` run fills the cache and every worker of `pytest -n auto` reads
     it; kept only in this process, it was one corpus run per worker.
     """
     paths = [PROGRAMS / name for name in CORPUS]
@@ -303,7 +303,7 @@ def _boot_asm() -> str:
 def test_boot_allocates_completely():
     """The compiler's own source, which is what the spiller is for.
 
-    `boot`'s peaks are far above the corpus's: 88 values live at once in
+    `turkey`'s peaks are far above the corpus's: 88 values live at once in
     `%module.initialize`, 35 of them untraced, and 84 live across one call
     against ten callee-saved registers. The corpus alone never needs a
     spiller, so this is the test that says it works on the compiler itself.

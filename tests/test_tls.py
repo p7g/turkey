@@ -7,7 +7,7 @@ committed, so that none can expire in the repository and none is mistaken for
 something to trust. The client trusts the test CA by naming it as its roots,
 never by turning verification off, which `Net.TLS` cannot do.
 
-Each program is an executable `boot` writes, which loads OpenSSL's `libssl`
+Each program is an executable `turkey` writes, which loads OpenSSL's `libssl`
 and `libcrypto` by the names its declarations give them; a machine without
 OpenSSL 3 skips these, unless `$TURKEY_REQUIRE_OPENSSL` says it must.
 """

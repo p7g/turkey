@@ -107,6 +107,10 @@ type Scope = Scope {
     --- module's exports the key is the qualifier as its importers get it, and
     --- names one module.
     qualifiers : Map String (Vec Module),
+    --- What each dotted name `lookupName` has read means, by namespace, in
+    --- the order of `spaces`. Filled on use, so it is meaningful only once
+    --- the modules `qualifiers` names have their exports.
+    resolved : Array (Map String (Vec String)),
     var conflicts : Array (Map String (Vec String)),
 }
 
@@ -114,6 +118,7 @@ fun newScope() -> Scope = Scope {
     values = Map.new(), types = Map.new(), cons = Map.new(),
     classes = Map.new(), operators = Map.new(), methods = Set.new(),
     qualifiers = Map.new(),
+    resolved = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
     conflicts = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
 }
 
@@ -140,33 +145,58 @@ fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
 --- declaration are one meaning, not two.
 fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
-    match Map.get(conflictsIn(s, space), name) {
-        Some(targets) -> return ambiguous(name, targets, where)
-        None -> {}
-    }
-    match Map.get(spaceAt(s, space), name) {
-        Some(target) -> Some(target)
-        None -> {
-            let targets = readings(s, space, name)
-            match len(targets) {
-                0 -> None
-                1 -> Some(targets[0])
-                _ -> ambiguous(name, targets, where)
-            }
+    if String.contains(name, ".") {
+        let targets = dotted(s, space, name)
+        return match len(targets) {
+            0 -> None
+            1 -> Some(targets[0])
+            _ -> ambiguous(name, targets, where)
         }
     }
+    match Map.get(conflictsIn(s, space), name) {
+        Some(targets) -> ambiguous(name, targets, where)
+        None -> Map.get(spaceAt(s, space), name)
+    }
+}
+
+-- Every declaration the dotted name `name` means in `space`, each once. Read
+-- once for each name: a module writes the same few qualified names many
+-- times, and reading one walks the qualifiers.
+fun dotted(s : Scope, space : Namespace, name : String) -> Vec String {
+    let memo = s.resolved[namespaceIndex(space)]
+    match Map.get(memo, name) {
+        Some(targets) -> return targets
+        None -> {}
+    }
+    -- A primitive's name has a dot and is in the namespace itself.
+    let targets = match Map.get(spaceAt(s, space), name) {
+        Some(target) -> [target]
+        None -> readings(s, space, name)
+    }
+    Map.put(memo, name, targets)
+    targets
 }
 
 fun ambiguous(name : String, targets : Vec String, where : Option Span) -> Option String {
     let sorted = Vec.sort(targets)
+    -- A name that is already qualified cannot be qualified further: what
+    -- tells its readings apart is a qualifier only one of the modules has.
+    let fix = if String.contains(name, ".") {
+        "; import the module you mean under an alias of its own"
+    } else {
+        "; write the qualified name of the one you mean"
+    }
     report("'" + name + "' is ambiguous: it is imported as "
-        + String.join(Vec.map(sorted, fun(t) = quoted(String.replace(t, "#", "."))),
-                      " and ")
-        + "; write the qualified name of the one you mean", where)
+        + String.join(Vec.map(sorted, fun(t) = quoted(declared(t))), " and ")
+        + fix, where)
     Some(sorted[0])
 }
 
--- Every declaration the dotted name `name` means in `space`, each once.
+-- An internal name as a diagnostic writes it: `Data.Set.union`.
+fun declared(target : String) -> String = String.replace(target, "#", ".")
+
+-- Every declaration the dotted name `name` means in `space` through a
+-- qualifier, each once.
 --
 -- Each prefix of the name that is a qualifier in scope is a way to read it:
 -- the components after the prefix step through the exported qualifiers of the
@@ -180,24 +210,6 @@ fun ambiguous(name : String, targets : Vec String, where : Option Span) -> Optio
 -- that is written is a finite walk.
 fun readings(s : Scope, space : Namespace, name : String) -> Vec String {
     let out = Vec.new(1)
-    let (qualifier, short) = match String.rsplitOnce(name, ".") {
-        Some(halves) -> halves
-        None -> return out
-    }
-    -- A name with one dot has one reading, and most dotted names have one
-    -- dot. Reading it here spares it the split into components below.
-    if !String.contains(qualifier, ".") {
-        match Map.get(s.qualifiers, qualifier) {
-            Some(modules) -> for m in modules {
-                match Map.get(spaceAt(m.exports, space), short) {
-                    Some(target) -> if !Vec.contains(out, target) { Vec.push(out, target) }
-                    None -> {}
-                }
-            }
-            None -> {}
-        }
-        return out
-    }
     let parts = String.split(name, ".")
     let last = len(parts) - 1
     var prefix = ""
@@ -890,7 +902,7 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
     let chosen = match bare {
         AllBare -> dep.exports
         NoBare -> newScope()
-        Listed(items, rest) -> listed(l, dep, items, rest, where, strict)
+        Listed(items, rest) -> listed(l, dep, items, rest, where, False, strict)
     }
     for space in namespaces {
         for (short, target) in Map.entries(spaceAt(chosen, space)) {
@@ -911,8 +923,11 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
 -- result's `methods` and `conflicts` are empty. With a `..`, every export
 -- comes except what an item names, and each item says what to bring instead:
 -- its names again under a new name, or nothing.
+--
+-- What is wrong with an entry is reported at the entry if `atEntry` is set,
+-- and at `where` otherwise.
 fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
-           where : Option Span, strict : Bool) -> Scope {
+           where : Option Span, atEntry : Bool, strict : Bool) -> Scope {
     let result = newScope()
     let chosen = spaces(result)
     if rest {
@@ -929,6 +944,7 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
             Some(to) -> to
             None -> entry.item.name
         }
+        let at = if atEntry { Some(entry.item.span) } else { where }
         if entry.item.qualifier {
             match Map.get(dep.exports.qualifiers, entry.item.name) {
                 Some(modules) -> {
@@ -937,12 +953,12 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
                 }
                 None -> if strict {
                     report("module '" + dep.name + "' does not export 'module "
-                           + entry.item.name + "'", where)
+                           + entry.item.name + "'", at)
                 }
             }
             continue
         }
-        let named = itemNames(l, dep, entry.item, where, strict)
+        let named = itemNames(l, dep, entry.item, at, strict)
         if rest {
             for (i, short, _, _) in named { discard(Map.delete(chosen[i], short)) }
         }
@@ -1096,13 +1112,18 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
 
 -- Export what the `module Q (...)` entries among `items` pass on: those whose
 -- lists have a `..` if `rest` is set, and those whose lists have none
--- otherwise. A name `out` already exports stays as it is. Two of these
--- entries passing on different declarations under one name is an error,
--- since no use of the name is there to report it at.
+-- otherwise.
+--
+-- A name `out` already exports as the same declaration is one export. As a
+-- different declaration it is an error when the list names the name, since
+-- two entries then ask for one name, and when another `..` passed it on,
+-- since neither says which is meant. A `..` that covers a name some entry
+-- names gives way silently. An export has no use to report a clash at, so
+-- it is reported here.
 fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
            out : Scope, strict : Bool) -> Unit {
-    -- The entry each name this call added came from, by namespace and name.
-    let from : Map String ExportItem = Map.new()
+    -- The names this call added, by namespace and name.
+    let added = Set.new()
     for item in items {
         let entries = match item.list {
             Some(entries) -> entries
@@ -1113,18 +1134,20 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
             Some(dep) -> dep
             None -> continue
         }
-        let chosen = listed(l, dep, entries, item.rest, Some(item.span), strict)
+        let chosen = listed(l, dep, entries, item.rest, None, True, strict)
         for space in namespaces {
             let into = spaceAt(out, space)
             for (short, target) in Map.entries(spaceAt(chosen, space)) {
                 let key = Int.toString(namespaceIndex(space)) + short
                 match Map.get(into, short) {
-                    Some(previous) -> if strict && previous != target {
-                        clash(quoted(short), Map.get(from, key), item)
+                    Some(previous) -> {
+                        if strict && previous != target && (!rest || Set.contains(added, key)) {
+                            clash(short, declared(previous), declared(target), item, entries)
+                        }
                     }
                     None -> {
                         Map.put(into, short, target)
-                        Map.put(from, key, item)
+                        Set.add(added, key)
                         if Set.contains(dep.exports.methods, target) {
                             Set.add(out.methods, target)
                         }
@@ -1135,26 +1158,40 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
         for (q, modules) in Map.entries(chosen.qualifiers) {
             let key = "module " + q
             match Map.get(out.qualifiers, q) {
-                Some(previous) -> if strict && moduleNames(previous) != moduleNames(modules) {
-                    clash(quoted(key), Map.get(from, key), item)
+                Some(previous) -> {
+                    if strict && moduleNames(previous) != moduleNames(modules)
+                       && (!rest || Set.contains(added, key)) {
+                        clash(key, String.join(moduleNames(previous), ", "),
+                              String.join(moduleNames(modules), ", "), item, entries)
+                    }
                 }
                 None -> {
                     Map.put(out.qualifiers, q, modules)
-                    Map.put(from, key, item)
+                    Set.add(added, key)
                 }
             }
         }
     }
 }
 
--- Report that `item` and `other` pass on different declarations as `name`.
--- With no `other`, the name was exported before either, and that one stands.
-fun clash(name : String, other : Option ExportItem, item : ExportItem) -> Unit {
-    if let Some(first) = other {
-        report(name + " is exported as two different declarations, by 'module "
-               + first.name + "' and 'module " + item.name
-               + "'; withhold it from one of them", Some(item.span))
+-- Report that the entry `item` exports `name` as `second` where the module
+-- already exports it as `first`. The error is at the entry of `item`'s list
+-- that names `name`, if one does.
+fun clash(name : String, first : String, second : String, item : ExportItem,
+          entries : Vec ImportItem) -> Unit {
+    var where = item.span
+    for entry in entries {
+        let written = if entry.item.qualifier { "module " + entry.item.name }
+                      else { entry.item.name }
+        if written == name && entry.rename != Some("_") { where = entry.item.span }
     }
+    let fix = if item.rest {
+        "withhold it from one 'module' entry with '" + name + " as _'"
+    } else {
+        "remove it from 'module " + item.name + "'"
+    }
+    report(quoted(name) + " is exported as two different declarations, "
+           + quoted(first) + " and " + quoted(second) + "; " + fix, Some(where))
 }
 
 fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
@@ -1206,7 +1243,7 @@ fun qualifierModule(m : Module, item : ExportItem, strict : Bool) -> Option Modu
             if strict {
                 report("'module " + item.name + "' names "
                        + String.join(Vec.map(moduleNames(modules), quoted), " and ")
-                       + "; an exported qualifier must name one module",
+                       + "; a 'module' entry must name one module",
                        Some(item.span))
             }
         }

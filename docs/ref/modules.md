@@ -353,8 +353,10 @@ fun main() {
 
 The rules:
 
-* **The module is imported first.** `module Q` names a qualifier, never a
-  file, so a module passes on only what it imports.
+* **The qualifier is in scope.** `module Q` names a qualifier, never a file,
+  so a module passes on only what it can already write: a qualifier from one
+  of its imports, or one the [Prelude](#the-prelude) gives every module, such
+  as `Vec`.
 * **It names one module.** If two imports share the qualifier, exporting it is
   an error. A qualifier that is not in scope is an error too.
 * **The whole module comes with it.** There is no way to export part of a
@@ -460,15 +462,25 @@ A passed-on name is the declaration it was where it was defined. Reaching it
 by two routes is not a conflict, and an error message names the module that
 declares it.
 
-**Which declaration a name means.** A declaration the module exports always
-wins: above, `Kit` declares `name` and exports it through `..`, so the `name`
-it exports is its own and not the one `Shapes` exports, and nothing has to be
-withheld to say so. A declaration the module does *not* export has no say:
-had `Kit` written `export (module Shapes (..))`, its importers would get the
-`name` that `Shapes` exports, while inside `Kit` the name would still mean
-`Kit`'s own. Otherwise an entry that names the name wins over a `..` that
-merely covers it. Two entries of equal standing that pass on different declarations under
-one name are an error:
+**Which declaration a name means.** One name is exported as one
+declaration, and the entries are read in this order:
+
+1. An entry that names a declaration, and `..` for the module's own.
+2. A `module Q (...)` entry whose list names the name.
+3. A `module Q (...)` entry whose `..` covers the name.
+
+A `..` in a `module` entry gives way silently to anything before it. Above,
+`Kit` declares `name` and exports it through the first `..`, so the `name`
+it exports is its own and not the one `Shapes` exports, and nothing has to
+be withheld to say so. Only what the module *exports* counts: had `Kit`
+written `export (module Shapes (..))`, its importers would get the `name`
+that `Shapes` exports, while inside `Kit` the name would still mean `Kit`'s
+own.
+
+Everywhere else, two entries that export different declarations under one
+name are an error. That covers a list that names a name the module already
+exports otherwise, as `export (.., module Shapes (name))` would above, and
+two `..` entries that both cover it:
 
 <!-- module: Shapes.gob -->
 ```kotlin
@@ -492,7 +504,7 @@ import Shapes
 import Rooms
 ```
 
-<!-- error: 'area' is exported as two different declarations, by 'module Shapes' and 'module Rooms' -->
+<!-- error: 'area' is exported as two different declarations, 'Shapes.area' and 'Rooms.area' -->
 ```kotlin
 import Kit
 

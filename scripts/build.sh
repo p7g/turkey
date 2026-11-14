@@ -112,13 +112,22 @@ fi
 case $target in
     arm64-darwin|arm64-linux) ;;
     '') echo "build.sh: this host, $(uname -s) on $(uname -m), is not a target;" \
-             "pass --target arm64-darwin or --target arm64-linux" >&2
+             "pass --target arm64-linux to run the arm64 Linux compiler under" \
+             "qemu-user, registered with binfmt_misc or named by TURKEY_RUN" >&2
         exit 1 ;;
     *) echo "build.sh: unknown target '$target';" \
             "supported: arm64-darwin, arm64-linux" >&2
        exit 2 ;;
 esac
 ARTIFACT=$BOOTSTRAP/$target.gz
+# The committed compiler for another target than the host's runs only under
+# an emulator, which TURKEY_RUN names. Refused here rather than when stage1
+# fails to start.
+if [ -n "$host" ] && [ "$target" != "$host" ] && [ -z "$RUN" ] && [ -z "$stage1" ]; then
+    echo "build.sh: the committed $target compiler cannot run on $host;" \
+         "build for $host, or set TURKEY_RUN to an emulator for $target" >&2
+    exit 1
+fi
 
 mkdir -p "$out"
 case $out in /*) ;; *) out=$ROOT/$out ;; esac

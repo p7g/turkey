@@ -85,8 +85,8 @@ Budget for the goldens: a change that moves output moves the recorded files
 too, and regenerating them without reading them is how a regression gets
 committed.
 
-`scripts/build.sh` builds `turkey` with a C compiler and no Python: it links
-the arm64 assembly committed in `bootstrap/` into a compiler, and that compiler
+`scripts/build.sh` builds `turkey` with no C compiler and no Python: it unpacks
+the compiler committed in `bootstrap/` as an executable, and that compiler
 compiles today's `src/` into `turkey`. `scripts/bump-bootstrap.sh`
 replaces that committed compiler, which is a deliberate act and its own commit:
 both scripts say when and why at the top.

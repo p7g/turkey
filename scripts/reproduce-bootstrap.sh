@@ -54,8 +54,37 @@ if [ -z "$commit" ] || [ -z "$command" ]; then
     exit 1
 fi
 
+# Every artifact has a record, and there is at least one, so that a
+# PROVENANCE without its hashes cannot pass by checking nothing.
+targets=$(sed -n 's/^\([^ ]*\) exe-sha256: .*/\1/p' bootstrap/PROVENANCE)
+if [ -z "$targets" ]; then
+    echo "reproduce-bootstrap.sh: PROVENANCE records no executable" >&2
+    exit 1
+fi
+for artifact in bootstrap/*.gz; do
+    case " $(echo $targets) " in
+        *" $(basename "$artifact" .gz) "*) ;;
+        *) echo "reproduce-bootstrap.sh: PROVENANCE has no record of $artifact" >&2
+           exit 1 ;;
+    esac
+done
+
+# The commit has to be in this checkout's history, not merely somewhere on a
+# server: a squash or rebase merge of the bump's branch rewrites the commit
+# PROVENANCE names, and its record then points at nothing on main.
+if ! git cat-file -e "$commit^{commit}" 2> /dev/null ||
+        ! git merge-base --is-ancestor "$commit" HEAD; then
+    echo "reproduce-bootstrap.sh: PROVENANCE's commit $commit is not in this" \
+         "branch's history; a squash or rebase merge of the bump is the" \
+         "likely cause, and the bump must be made again from the merged commit" >&2
+    exit 1
+fi
+
 tree=$out/tree
 mkdir -p "$out"
+# A tree removed by hand is still registered until pruned, and would refuse
+# the add below.
+git worktree prune
 if [ -e "$tree" ]; then
     git worktree remove --force "$tree"
 fi
@@ -66,11 +95,20 @@ echo "build $commit" >&2
 sh "$tree/scripts/build.sh" --out "$out/stages" --fixpoint
 
 status=0
-for target in $(sed -n 's/^\([^ ]*\) exe-sha256: .*/\1/p' bootstrap/PROVENANCE); do
+for target in $targets; do
     artifact=bootstrap/$target.gz
     written=$out/$target
-    # PROVENANCE's command, split into words as the bump ran it.
-    set -- $(echo "$command" | sed "s|OUTPUT|$written|; s|TARGET|$target|")
+    # PROVENANCE's command, split into words as the bump ran it, with the two
+    # placeholders filled in word by word, so that --out may hold any
+    # character.
+    set --
+    for word in $command; do
+        case $word in
+            OUTPUT) word=$written ;;
+            TARGET) word=$target ;;
+        esac
+        set -- "$@" "$word"
+    done
     (cd "$tree" && TURKEY_LIB=lib $RUN "$out/stages/stage3" "$@")
     if gunzip -c "$artifact" | cmp -s - "$written"; then
         echo "$target: reproduced, $(sha "$written")" >&2

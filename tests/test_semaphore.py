@@ -146,7 +146,7 @@ def binary(tmp_path_factory):
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv(bootc.INTERNAL_IMPORTS,
                      os.environ[bootc.INTERNAL_IMPORTS] + ",Turkey.Semaphore,Turkey.Wait")
-        bootc.link(entry, output)
+        bootc.executable(entry, output)
     return output
 
 

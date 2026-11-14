@@ -796,8 +796,28 @@ fun main() {
 9
 ```
 
-An exported qualifier with dots is one step: if `Kit` exports
-`module Net.HTTP`, the name is `Kit.Net.HTTP.get`.
+An exported qualifier with dots is one step. Here `Kit` exports the
+qualifier `Data.Int`, so the name is `Kit.Data.Int.gcd`:
+
+<!-- module: Kit.gob -->
+```kotlin
+export (module Data.Int)
+
+import Data.Int
+```
+
+<!-- run -->
+```kotlin
+import Kit
+
+fun main() {
+    print(Kit.Data.Int.gcd(12, 18))
+}
+```
+
+```text
+6
+```
 
 A name is only read this way where it is written, so two modules may export
 each other as qualifiers. If `A` exports `module B` and `B` exports

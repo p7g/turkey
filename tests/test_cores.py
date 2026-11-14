@@ -36,7 +36,7 @@ def program(tmp_path_factory):
     entry = directory / "main.gob"
     entry.write_text(PROGRAM)
     binary = directory / "workers"
-    bootc.link(entry, binary)
+    bootc.executable(entry, binary)
     return binary
 
 

@@ -65,7 +65,7 @@ def probe(tmp_path_factory):
     source = root / "main.gob"
     source.write_text(MAIN)
     binary = root / "probe"
-    bootc.link(source, binary, env=dict(os.environ, TURKEY_LIB=str(library)))
+    bootc.executable(source, binary, env=dict(os.environ, TURKEY_LIB=str(library)))
     return binary
 
 
@@ -117,7 +117,7 @@ def test_workers_contending_for_the_heap_lock_under_stress_all_finish(tmp_path):
     source = tmp_path / "main.gob"
     source.write_text(STRESSED)
     binary = tmp_path / "stressed"
-    bootc.link(source, binary)
+    bootc.executable(source, binary)
     env = dict(os.environ, TURKEY_WORKERS="4", TURKEY_GC_STRESS="1", TURKEY_GC_GENERATIONAL="0")
     for _ in range(5):
         result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,

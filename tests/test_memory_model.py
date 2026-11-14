@@ -171,7 +171,7 @@ def probe(request, tmp_path):
         entry.write_text(f"import {module} as P\nfun main() {{ P.run() }}\n",
                          encoding="utf-8")
         binary = tmp_path / "main"
-        bootc.link(entry, binary)
+        bootc.executable(entry, binary)
         return subprocess.run(toolchain.command(binary), capture_output=True,
                               text=True, timeout=60)
 

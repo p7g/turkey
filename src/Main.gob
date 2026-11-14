@@ -6,12 +6,12 @@
 -- result to `-o`, in the format `-f` names, or else the one the extension of
 -- `-o` names, or else an executable. Without `-o`, an executable goes to the
 -- working directory, named after the entry file, and the other formats to
--- standard output (`openSink`). `doc`
--- checks the modules it is given and writes what each exports as JSON
--- (`Turkey.Doc`). `check` and `build` each take `--dump STAGE,...` to print
--- what a stage produced, which is how a pass is read while it is being
--- written: `check` goes on as far as the latest stage asked for and no
--- further, and `build` prints them on its way.
+-- standard output (`openSink`). `doc` checks the modules it is given and
+-- writes what each exports as JSON (`Turkey.Doc`), or with `--html DIR` as a
+-- website (`Turkey.DocSite`). `check` and `build` each take `--dump
+-- STAGE,...` to print what a stage produced, which is how a pass is read
+-- while it is being written: `check` goes on as far as the latest stage asked
+-- for and no further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -97,6 +97,7 @@ import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
                    FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
 import Turkey.Libraries as Libraries
 import Turkey.Doc as Doc
+import Turkey.DocSite as DocSite
 
 -- Where the language's own library lives: `TURKEY_LIB` if it is set and not
 -- empty, and otherwise the nearest `lib` holding `Prelude.gob` in the
@@ -441,8 +442,10 @@ fun baseName(path : String) -> String {
     parts[len(parts) - 1]
 }
 
--- `boot doc FILE...`: checks the modules the files hold, as one program, and
--- writes what each exports as one JSON document.
+-- `boot doc [--html DIR] FILE...`: checks the modules the files hold, as one
+-- program, and writes what each exports: as one JSON document on standard
+-- output, or with `--html` as the files of a website in `DIR`, the JSON
+-- among them, creating `DIR` if it is not there.
 --
 -- A file under the library is the module its path from the library names,
 -- and any other file the module its name names beside it, so the files
@@ -451,10 +454,12 @@ fun baseName(path : String) -> String {
 -- an entry itself, is checked as it is when a program imports it.
 fun doc(p : Args.Parser) -> Unit {
     let paths = []
+    var site = None
     loop {
         match Args.next(p) {
             Left(message) -> die(message)
             Right(None) -> break
+            Right(Some(Long("html"))) -> { site = Some(valueOf(p)) }
             Right(Some(Value(path))) -> Vec.push(paths, path)
             Right(Some(arg)) -> die(Args.unexpected(arg))
         }
@@ -513,7 +518,20 @@ fun doc(p : Args.Parser) -> Unit {
         scheme = fun(name) = Option.map(Constraints.lookup_(checked.env, name),
                                         fun(b) = reduced(checked.classes, b.scheme)),
     }
-    write(Doc.document(modules, tables))
+    let docs = Doc.describe(modules, tables)
+    match site {
+        Some(dir) -> writeSite(dir, DocSite.site(docs))
+        None -> write(Doc.document(docs))
+    }
+}
+
+-- Writes each of `files`, a path relative to `dir` and its contents, under
+-- `dir`, creating `dir` first if it is not there.
+fun writeSite(dir : String, files : Vec (String, String)) -> Unit {
+    if let Left(e) = File.createDirAll(dir) { die(message(e)) }
+    for (path, text) in files {
+        if let Left(e) = File.writeText(dir + "/" + path, text) { die(message(e)) }
+    }
 }
 
 -- The search root `path` is under, as a real path, and the module it holds
@@ -2131,7 +2149,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
-        + "       boot doc FILE...\n"
+        + "       boot doc [--html DIR] FILE...\n"
         + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
         + "                  FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"

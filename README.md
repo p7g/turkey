@@ -386,14 +386,16 @@ sh vim/test/run.sh
 what each one exports. Every function, value, type, class, instance and
 operator gets its type as the checker has it, its line, and its doc comment:
 the `---` comments directly above it ([doc comments](docs/ref/lexical.md#doc-comments)).
-To build a page for the whole library that searches names, types and comments:
+`boot doc --html DIR FILE...` writes the same description as a static
+website in `DIR`: an index, one page per module, and a search over names,
+types and comments. To build it for the whole library:
 
 ```sh
 sh scripts/docs.sh
 ```
 
-That writes `build/docs/index.html`, one self-contained file to open in a
-browser, along with the JSON it is built from. The same page is published to
+That writes `build/docs/index.html`, which opens in a browser as a file,
+alongside one page per module and the JSON. The same site is published to
 <https://p7g.github.io/turkey/> from `main` by `.github/workflows/docs.yml`.
 
 ## Project status

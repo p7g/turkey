@@ -64,9 +64,9 @@ work together without type annotations on the functions.
 ## Try it
 
 The compiler is written in Turkey. On an arm64 Mac running macOS 14.4 or
-later (the runtime sleeps on `os_sync_wait_on_address`), with a C compiler
-installed, it builds from the assembly committed in `bootstrap/` (for Linux,
-see below):
+later (the runtime sleeps on `os_sync_wait_on_address`), it builds from the
+compiler committed in `bootstrap/`, with no C compiler, assembler or linker
+(for Linux, see below):
 
 ```sh
 sh scripts/build.sh
@@ -166,13 +166,16 @@ name resolution recorded a binder for every variable a program binds or reads;
 a gap is an internal error. It costs a walk of the program, so it is off
 otherwise.
 
-The compiler that builds it is `bootstrap/`, which holds its own arm64
-assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for
-whichever of the two the C compiler links for. `sh scripts/build.sh
---fixpoint` checks the fixed point: the compiler built from today's source
-writes exactly the executable it is. `scripts/bump-bootstrap.sh` replaces the
-committed compiler, which is rare and deliberate; both scripts explain
-themselves at the top.
+The compiler that builds it is `bootstrap/`, which holds an earlier commit's
+compiler as an executable for macOS and one for Linux, gzip'd, and the
+commit they came from. `scripts/build.sh` checks their hashes, unpacks the
+one for the host and builds with it. `sh scripts/build.sh --fixpoint` checks
+the fixed point: the compiler built from today's source writes exactly the
+executable it is. `scripts/reproduce-bootstrap.sh` checks the committed
+executables themselves: the commit they name, built from its own bootstrap,
+writes the same bytes. `scripts/bump-bootstrap.sh` replaces the committed
+compiler, which is rare and deliberate. Each script explains itself at the
+top.
 
 ### Debugging and profiling
 
@@ -295,15 +298,16 @@ perf script | python3 scripts/demangle.py
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
 the tests alike. Each is split into words the way a shell would split it.
 
-- `TURKEY_CC` is the C compiler that assembles and links the bootstrap
-  compiler, and compiles the C files a few tests run beside a program.
-  Unset, it is `cc`.
+- `TURKEY_CC` is the C compiler that compiles the C files a few tests run
+  beside a program, and assembles `turkey`'s assembly where a test checks it.
+  Unset, it is `cc`. Building `turkey` needs none, but on a host that is not
+  a target, `scripts/build.sh` builds for the target it links for.
 - `TURKEY_RUN` is a prefix for running a program `turkey` wrote, or a built
   compiler. Unset or empty, the program runs directly.
 
-On x86-64 Linux, the arm64 output runs under qemu-user. The bootstrap
-compiler is linked statically, and every executable `turkey` writes is
-dynamically linked against glibc, which qemu finds in the cross toolchain's
+On x86-64 Linux, the arm64 output runs under qemu-user. Every executable
+`turkey` writes, the committed compiler included, is dynamically linked
+against glibc, which qemu finds in the cross toolchain's
 `/usr/aarch64-linux-gnu` when `QEMU_LD_PREFIX` names it. Set up the machine
 with:
 
@@ -334,8 +338,8 @@ hook does nothing. Where binfmt_misc cannot be written, set
 24.04 refuses a system-wide `pip install`.
 
 With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
-`bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
-any platform emit Linux objects and assembly.
+`bootstrap/arm64-linux.gz`, and `--target arm64-linux` makes a compiler on
+any platform write Linux executables.
 
 An executable for `--target arm64-linux` needs none of the cross toolchain:
 `turkey` writes it, dynamically linked, on any host, with no linker and no arm64
@@ -351,11 +355,11 @@ the compiler runs many times slower than on an arm64 Mac, and the few tests
 that compile the compiler's own source take most of the suite's time. Nothing
 in CI runs this setup.
 
-On an arm64 Linux machine none of that is needed: `cc` links for it and the
-programs run directly, and an executable needs no C compiler at all. CI does
-this on GitHub's arm64 runners (`.github/workflows/linux.yml`), building from the
-bootstrap under gcc and running the suite and the fixed point split across jobs
-by `scripts/ci-shard.sh`.
+On an arm64 Linux machine none of that is needed: the compiler builds and
+the programs run directly, with no C compiler. CI does this on GitHub's arm64
+runners (`.github/workflows/linux.yml`), building from the bootstrap and
+running the suite and the fixed point split across jobs by
+`scripts/ci-shard.sh`.
 
 `tests/test_debug_info.py` reads `-g`'s DWARF with `llvm-dwarfdump`, and it
 and `tests/test_unwind.py` run lldb on macOS and gdb on Linux; each skips a

@@ -203,17 +203,18 @@ def test_the_bootstrap_is_what_its_provenance_says():
 
     `scripts/build.sh` checks the same hashes before it builds, so a mismatch
     here is a build that will refuse to start. The commit has to exist for
-    the chain to be walked back to source.
+    the chain to be walked back to source, which
+    `scripts/reproduce-bootstrap.sh` does.
     """
     fields = _provenance()
     artifacts = sorted(BOOTSTRAP.glob("*.gz"))
-    targets = [a.name.removesuffix(".gz").removesuffix(".s") for a in artifacts]
-    assert "arm64-darwin" in targets
-    for artifact, target in zip(artifacts, targets):
+    assert {a.name for a in artifacts} == {"arm64-darwin.gz", "arm64-linux.gz"}
+    for artifact in artifacts:
+        target = artifact.name.removesuffix(".gz")
         packed = artifact.read_bytes()
         assert hashlib.sha256(packed).hexdigest() == fields[f"{target} gz-sha256"]
-        unpacked = fields.get(f"{target} exe-sha256") or fields[f"{target} asm-sha256"]
-        assert hashlib.sha256(gzip.decompress(packed)).hexdigest() == unpacked
+        assert (hashlib.sha256(gzip.decompress(packed)).hexdigest()
+                == fields[f"{target} exe-sha256"])
     if (REPO_ROOT / ".git").exists() and shutil.which("git"):
         found = subprocess.run(
             ["git", "cat-file", "-e", f"{fields['commit']}^{{commit}}"],

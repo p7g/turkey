@@ -17,10 +17,10 @@ Three settings, split with shell-word rules:
   also under qemu-user once binfmt_misc knows the format; the prefix
   (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
-`scripts/build.sh` reads `$TURKEY_CC` and `$TURKEY_RUN` too. A cached `turkey`
-is keyed on `identity()` as well as its sources, since the caches are shared
-by every session on the machine, and the target `build.sh` builds for is the
-one `$TURKEY_CC` links for.
+`scripts/build.sh` reads `$TURKEY_RUN` too, and `$TURKEY_CC` to choose the
+target on a host that is not one. A cached `turkey` is keyed on `identity()`
+as well as its sources, since the caches are shared by every session on the
+machine.
 """
 
 from __future__ import annotations

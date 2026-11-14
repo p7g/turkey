@@ -22,10 +22,11 @@
 # for a target on any host, whatever the output is called. So anyone can check
 # a bump by checking out PROVENANCE's commit, building it from the bootstrap
 # that commit carries, and running PROVENANCE's command for each target.
+# scripts/reproduce-bootstrap.sh does that, and CI runs it.
 #
 # --stage1 is how to bump across a change the committed compiler cannot build:
-# start from a compiler built before the change. It must write executables
-# (`build -f exe`), which a compiler older than the executable writer cannot.
+# start from a compiler built before the change. Its `build -o PATH` must
+# write an executable, which a compiler older than that default does not.
 #
 # Usage: scripts/bump-bootstrap.sh [--stage1 BINARY] [--target TARGET]
 #

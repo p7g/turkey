@@ -1,0 +1,273 @@
+export (html)
+
+--- Turkey source as highlighted HTML.
+---
+--- A token or comment becomes a `<span>` whose class names its group: a
+--- keyword is `conditional`, `repeat`, `statement`, `keyword`, `structure` or
+--- `module`; `True` and `False` are `boolean`; any other uppercase name is
+--- `constructor`; then `operator`, `number`, `float`, `string`, `char`,
+--- `comment`, `doc-comment` and `block-comment`. Inside those spans, an escape
+--- sequence in a string or character is an `escape`, and `TODO`, `FIXME`,
+--- `XXX` or `NOTE` in a comment is a `todo`. A lowercase name and the
+--- brackets, `,` and `.` have no span.
+---
+--- These are the groups of the Vim syntax file in `vim/syntax/`, with the same
+--- rules: a doc comment is a `---` comment with only spaces and tabs before it
+--- on its line, and a `---` comment after code is a `comment`.
+
+import Turkey.DocComments as DocComments
+import Turkey.Lexer as Lexer
+import Turkey.Source (Source(..), Span)
+import Turkey.Token (Comment(..), Kind(..), Token(..), Value(..))
+
+-- A stretch of the source to wrap in a span of class `group`.
+type Mark = Mark { span : Span, group : String }
+
+-- Where the walk over the source has got to. `line` and `col` count as the
+-- lexer counts, in code points, so a span's ends can be found by stepping.
+type Cursor = Cursor {
+    src      : String,
+    var at   : String.Index,
+    var line : Int,
+    var col  : Int,
+    -- Whether only spaces and tabs come before `at` on its line.
+    var blank : Bool,
+}
+
+--- Returns `code` as an HTML fragment that reads exactly as `code` does, every
+--- character escaped and every token and comment wrapped in a span of its
+--- group. Where `code` stops lexing, the rest of it is escaped text with no
+--- spans. Never fails and never reports anything.
+fun html(code : String) -> String {
+    let lexed = Lexer.tokenizeLenient(Source { name = "", text = code }).0
+    let marks = Vec.sortByKey(marksOf(lexed.tokens, lexed.comments),
+                              fun(m) = (m.span.line, m.span.col))
+    let out = String.builder()
+    let cursor = Cursor { src = code, at = String.start(code), line = 1, col = 1,
+                          blank = True }
+    for m in marks {
+        String.push(out, escape(advance(cursor, m.span.line, m.span.col)))
+        let group = if m.group == "doc-comment" && !cursor.blank { "comment" }
+                    else { m.group }
+        let text = advance(cursor, m.span.endLine, m.span.endCol)
+        String.push(out, "<span class=\"" + group + "\">")
+        match group {
+            "string" | "char" -> String.push(out, literal(text))
+            "comment" | "doc-comment" | "block-comment" -> String.push(out, comment(text))
+            _ -> String.push(out, escape(text))
+        }
+        String.push(out, "</span>")
+    }
+    String.push(out, escape(String.slice(code, cursor.at, String.end(code))))
+    String.build(out)
+}
+
+fun marksOf(tokens : Vec Token, comments : Vec Comment) -> Vec Mark {
+    let out = []
+    for var i = 0; i < len(tokens); i = i + 1 {
+        if let Some(group) = classOf(tokens[i], Vec.at(tokens, i + 1)) {
+            Vec.push(out, Mark { span = tokens[i].span, group = group })
+        }
+    }
+    -- A doc comment after code on its line is an ordinary one, which `html`
+    -- decides, since only the walk over the source sees what precedes it.
+    -- `isDoc` also takes `---` followed only by trailing whitespace, such as
+    -- a tab, which Vim shows as a plain comment. We follow `isDoc`, because
+    -- it decides what `boot doc` publishes.
+    for c in comments {
+        let group = if c.block { "block-comment" }
+                    else if DocComments.isDoc(c) { "doc-comment" }
+                    else { "comment" }
+        Vec.push(out, Mark { span = c.span, group = group })
+    }
+    out
+}
+
+-- The group of `token`, given the token after it, or `None` for a token
+-- without one.
+fun classOf(token : Token, next : Option Token) -> Option String = match token.kind {
+    KWord(word) -> Some(keywordGroup(word))
+    KConid -> match token.value {
+        VText("True") | VText("False") -> Some("boolean")
+        _ -> Some("constructor")
+    }
+    KInt -> Some("number")
+    KFloat -> Some("float")
+    KString -> Some("string")
+    KChar -> Some("char")
+    KOp(op) -> match op {
+        "," | "." | "(" | ")" | "[" | "]" | "{" | "}" -> None
+        _ -> Some("operator")
+    }
+    -- `infix` is an ordinary name except where it begins an operator
+    -- declaration: first on its line, before a precedence group's name.
+    KIdent -> if token.span.col == 1 && isInfix(token) && isConid(next) {
+        Some("keyword")
+    } else {
+        None
+    }
+    KNewline | KEof -> None
+}
+
+fun isInfix(token : Token) -> Bool = match token.value {
+    VText(text) -> text == "infix"
+    _ -> False
+}
+
+fun isConid(token : Option Token) -> Bool = match token {
+    Some(t) -> match t.kind {
+        KConid -> True
+        _ -> False
+    }
+    None -> False
+}
+
+fun keywordGroup(word : String) -> String = match word {
+    "if" | "else" | "match" -> "conditional"
+    "while" | "for" | "in" | "loop" -> "repeat"
+    "return" | "break" | "continue" -> "statement"
+    "type" | "class" | "instance" -> "structure"
+    "module" | "import" | "export" | "as" -> "module"
+    _ -> "keyword"
+}
+
+-- Returns the text from the cursor up to `line:col`, and moves the cursor
+-- there. A position the cursor has passed returns "".
+fun advance(c : Cursor, line : Int, col : Int) -> String {
+    let from = c.at
+    while c.line < line || (c.line == line && c.col < col) {
+        match String.step(c.src, c.at) {
+            None -> { break }
+            Some(p) -> {
+                c.at = p.1
+                if p.0 == '\n' {
+                    c.line = c.line + 1
+                    c.col = 1
+                    c.blank = True
+                } else {
+                    c.col = c.col + 1
+                    c.blank = c.blank && (p.0 == ' ' || p.0 == '\t')
+                }
+            }
+        }
+    }
+    String.slice(c.src, from, c.at)
+}
+
+-- A string or character literal as the lexer accepted it, so every `\`
+-- begins a well-formed escape: `\u{...}` up to its `}`, or `\` and one more
+-- character.
+fun literal(text : String) -> String {
+    let out = String.builder()
+    var from = String.start(text)
+    var at = from
+    loop {
+        match String.step(text, at) {
+            None -> { break }
+            Some(p) -> {
+                if p.0 != '\\' {
+                    at = p.1
+                    continue
+                }
+                String.push(out, escape(String.slice(text, from, at)))
+                let end = escapeEnd(text, p.1)
+                String.push(out, "<span class=\"escape\">"
+                                 + escape(String.slice(text, at, end)) + "</span>")
+                from = end
+                at = end
+            }
+        }
+    }
+    String.push(out, escape(String.slice(text, from, at)))
+    String.build(out)
+}
+
+-- Where the escape whose `\` ends at `after` ends.
+fun escapeEnd(text : String, after : String.Index) -> String.Index =
+    match String.step(text, after) {
+        None -> after
+        Some(p) -> if p.0 != 'u' {
+            p.1
+        } else {
+            var at = p.1
+            loop {
+                match String.step(text, at) {
+                    None -> { break }
+                    Some(q) -> {
+                        at = q.1
+                        if q.0 == '}' { break }
+                    }
+                }
+            }
+            at
+        }
+    }
+
+let todos = ["TODO", "FIXME", "XXX", "NOTE"]
+
+-- A comment's text, with each of `todos` that stands as a whole word in a
+-- span. A word is what Vim's `iskeyword` makes one: letters, digits, `_`, `'`
+-- and any character from U+00C0 up.
+fun comment(text : String) -> String {
+    let out = String.builder()
+    var from = String.start(text)
+    var at = from
+    loop {
+        match String.step(text, at) {
+            None -> { break }
+            Some(p) -> {
+                if !isWordChar(p.0) {
+                    at = p.1
+                    continue
+                }
+                var end = p.1
+                while let Some(q) = String.step(text, end) {
+                    if !isWordChar(q.0) { break }
+                    end = q.1
+                }
+                let word = String.slice(text, at, end)
+                if Array.contains(todos, word) {
+                    String.push(out, escape(String.slice(text, from, at)))
+                    String.push(out, "<span class=\"todo\">" + word + "</span>")
+                    from = end
+                }
+                at = end
+            }
+        }
+    }
+    String.push(out, escape(String.slice(text, from, at)))
+    String.build(out)
+}
+
+fun isWordChar(c : Char) -> Bool =
+    Char.isAsciiAlphanumeric(c) || c == '_' || c == '\'' || Char.toInt(c) >= 0xC0
+
+-- `text` with `&`, `<`, `>` and `"` written as character references, which
+-- makes it safe both as element content and inside a quoted attribute.
+fun escape(text : String) -> String {
+    let out = String.builder()
+    var from = String.start(text)
+    var at = from
+    loop {
+        match String.step(text, at) {
+            None -> { break }
+            Some(p) -> {
+                let reference = match p.0 {
+                    '&' -> "&amp;"
+                    '<' -> "&lt;"
+                    '>' -> "&gt;"
+                    '"' -> "&quot;"
+                    _ -> ""
+                }
+                if reference != "" {
+                    String.push(out, String.slice(text, from, at))
+                    String.push(out, reference)
+                    from = p.1
+                }
+                at = p.1
+            }
+        }
+    }
+    String.push(out, String.slice(text, from, at))
+    String.build(out)
+}

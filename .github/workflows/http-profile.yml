@@ -1,0 +1,69 @@
+# Profiles the HTTP servers on an arm64 Linux runner with perf
+# (bench/http/profile.sh), on a pull request that changes the profiling
+# script, and puts the reports in the job summary and an artifact.
+name: http-profile
+
+on:
+  pull_request:
+    paths:
+      - bench/http/profile.sh
+      - .github/workflows/http-profile.yml
+
+env:
+  TURKEY_CC: gcc
+
+jobs:
+  profile:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: bench/http/go/go.mod
+      - uses: dtolnay/rust-toolchain@stable
+      # perf comes from the linux-tools package for the running kernel, or
+      # failing that the cloud kernel's meta-package, whose perf is then run
+      # directly: /usr/bin/perf refuses a kernel it was not built for.
+      - name: Install wrk, OpenSSL, perf
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wrk libssl-dev openssl linux-tools-common
+          sudo apt-get install -y "linux-tools-$(uname -r)" || sudo apt-get install -y linux-tools-azure
+          perf=$(ls /usr/lib/linux-tools/*/perf | tail -1)
+          mkdir -p "$HOME/bin"
+          ln -sf "$perf" "$HOME/bin/perf"
+          sudo ln -sf "$perf" /usr/local/bin/perf
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+          sudo sysctl -w kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+      - run: sh scripts/build.sh --fixpoint
+      - run: sh bench/http/run.sh build
+        env:
+          SERVERS: turkey go rust
+      - run: sh bench/http/profile.sh turkey go rust
+      - name: Summarize
+        if: ${{ !cancelled() }}
+        run: |
+          P=build/bench/http/profile
+          {
+            echo '## HTTP server profiles, 2 threads each, wrk -t2 -c64'
+            for impl in turkey go rust; do
+              echo "### $impl"
+              echo '```'
+              grep Requests/sec "$P/$impl.wrk-perf.txt" || true
+              cat "$P/$impl.syscalls-per-request.txt" || true
+              echo
+              grep -v '^#' "$P/$impl.perf-self.txt" | grep -v '^$' | head -45 || true
+              echo
+              grep -v '^#' "$P/$impl.perf-children.txt" | grep -v '^$' | head -45 || true
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: http-profile
+          path: |
+            build/bench/http/profile/*.txt
+            build/bench/http/profile/*.csv

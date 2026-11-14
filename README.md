@@ -368,6 +368,34 @@ cannot do what it needs: under
 statically needs compiler-rt built for aarch64, which Ubuntu's clang does not
 ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
 
+### Benchmarking the HTTP library
+
+`bench/http/` holds one HTTP server and one client per implementation --
+Turkey, Go `net/http`, Rust hyper and reqwest on tokio, Node `http` -- each
+doing the same work, servers in Python (ASGI and WSGI), Ruby and Java for
+context, an nginx configuration as the ceiling, and a runner that drives them
+with wrk on this machine, macOS or Linux:
+
+```sh
+sh scripts/build.sh --fixpoint     # the runner uses stage3
+sh bench/http/run.sh               # every scenario; or name some: keepalive tls
+python3 bench/http/summarize.py    # a table per scenario: median [range]
+```
+
+It needs Go, Cargo, Node, OpenSSL 3, and `wrk` and `nginx` on `PATH`; the
+comment at the top of `run.sh` lists the rest. Each server runs once per core
+count in `CORES` ("2 8" by default) and wrk gets `LOAD_THREADS` (4); each configuration
+runs `REPS` times (3) for `SECONDS_PER_RUN` seconds (10), each once the
+machine is quiet. The same comment lists the scenarios and how each number is
+taken. `.github/workflows/http-bench.yml` runs it on an arm64 Linux runner
+for a pull request that changes it, or on demand, and puts the tables in the
+job summary.
+
+On a Mac that has been up for weeks, new loopback connections can stall for a
+second at a time once a few thousand are open, and the scenarios that open
+many connections then measure the kernel rather than the server; a reboot
+clears it. Check `uptime` before trusting those numbers.
+
 ### Editor support
 
 `vim/` is a Vim and Neovim plugin for `.gob` files: filetype detection,

@@ -18,7 +18,7 @@ from tests.lang import binary, run
 LIB = bootc.REPO_ROOT / "lib"
 
 PROBE = """export (
-    pingPong, bulk, closeParked, heartbeat, gcParked, readDeadline,
+    pingPong, bulk, closeParked, closeThenBlock, heartbeat, gcParked, readDeadline,
 )
 
 import System.Sync as Sync
@@ -26,6 +26,8 @@ import System.Task as Task
 import Turkey.FD as FD
 import Turkey.IO as IO
 import Turkey.Libc as Libc
+import Turkey.Scheduler as Scheduler
+import Turkey.Workers as Workers
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
 
@@ -187,6 +189,51 @@ fun heartbeat() -> Unit {
     })
 }
 
+-- A reader parks on an empty pipe. Another task closes the pipe, which wakes
+-- the reader onto the closer's worker's queue, and then blocks that worker in
+-- a call that only the reader can end. The program's own thread waits in a
+-- blocking call too, so the reader runs at once only on a worker that is
+-- idle; otherwise it waits for the monitor to take the closer's permit for
+-- a spare, which it does only once a call has lasted 10 ms. Prints whether
+-- the reader ran within 8 ms of the close.
+fun closeThenBlock() -> Unit {
+    let (r, w) = makePipe()
+    -- Blocking pipes: from the reader to the closer, and from the closer to
+    -- the program.
+    let toCloser = Libc.malloc(8)
+    let _ = pipe(toCloser)
+    let toProgram = Libc.malloc(8)
+    let _ = pipe(toProgram)
+    let byte = Libc.malloc(1)
+    let closedAt = Sync.atomicInt(0)
+    let _ = Task.runScope(do {
+        let reader = Task.spawn(fun() {
+            let closed = one(r) == FD.closed
+            let delay = Wait.now() - Sync.load(closedAt)
+            let _ = Libc.write(word(toCloser, 4), byte, 1)
+            (closed, delay < 8 * millisecond)
+        })?
+        let closer = Task.spawn(fun() {
+            Wait.sleepUntil(Wait.now() + 100 * millisecond)
+            -- The worker that polled wakes another as it hands the poller
+            -- on; spin until that one has found nothing and sleeps again.
+            let until = Wait.now() + 50 * millisecond
+            while Wait.now() < until {}
+            Sync.store(closedAt, Wait.now())
+            let _ = FD.close(r)
+            let n = Workers.blockingRead(word(toCloser, 0), Libc.malloc(1), 1)
+            Scheduler.afterCall()
+            let _ = Libc.write(word(toProgram, 4), byte, 1)
+            n
+        })?
+        print(Workers.blockingRead(word(toProgram, 0), Libc.malloc(1), 1))
+        print(Task.join(reader))
+        print(Task.join(closer))
+        pure(0)
+    })
+    let _ = FD.close(w)
+}
+
 -- A parked reader's frame holds the only reference to an object.
 fun gcParked() -> Unit {
     let (r, w) = makePipe()
@@ -305,6 +352,13 @@ def test_more_than_a_pipe_buffer_goes_through_two_pipes_at_once(probe, workers):
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_closing_wakes_a_parked_reader_and_a_reused_number_is_clean(probe, workers):
     assert lines(probe, "P.closeParked()", workers) == ["True", "0", "True", "77"]
+
+
+def test_a_task_a_close_wakes_runs_at_once_while_the_closer_blocks(probe):
+    # Three permits: the program's thread and the closer's are blocked in
+    # calls, and the third is idle. The reader runs at once only if the close
+    # woke the idle worker.
+    assert lines(probe, "P.closeThenBlock()", "3") == ["1", "(True, True)", "1"]
 
 
 def test_a_read_of_an_inherited_pipe_does_not_hold_the_only_worker(probe):

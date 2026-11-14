@@ -79,3 +79,19 @@ fun main() {
 ```text
 hi
 ```
+
+A panic, with its exact standard error:
+
+<!-- panic: no -->
+```kotlin
+fun main() {
+    error("no")
+}
+```
+
+<!-- stderr -->
+```text
+panic: no
+  at error (Control/Panic.gob:8:36)
+  at main (Main.gob:2:5)
+```

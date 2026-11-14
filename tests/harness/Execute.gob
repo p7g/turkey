@@ -1,28 +1,28 @@
 export (execute, diffLimit)
 
--- One case, compiled, run and compared: its outcome, and what `--bless`
--- would do with it.
---
--- A case is compiled by `boot` from its own directory, so a diagnostic names
--- the file by its bare name, then linked by the C compiler, then run in that
--- directory under `$TURKEY_RUN` (`Cache.compile`, `Toolchain.command`). What
--- it printed -- stdout, then the compile's warnings and the program's stderr
--- -- must equal the golden exactly, and how it ended must be what its
--- directive says. Then each dump golden is checked against `boot check
--- --dump STAGE`, which is not cached, since the dump is what is tested.
---
--- A reference example is judged on what its chapter quotes instead
--- (`Reference`): its stdout exactly, and a part of its message. An archive
--- case is judged on its expectation sections (`Archive`), each exactly.
---
--- Running a case and judging it are separate: `observe` runs the processes
--- and gathers what they produced, and `verdict` and `Bless.decide` are pure
--- functions of that, the case and its goldens. Every dump is run whenever the
--- compile answered, even when the output already failed, since bless needs
--- them all.
---
--- Every actual result is written under `ACTUAL/NAME/` for inspection, whether
--- the case passed or not: `output`, and one file per dump.
+--- One case, compiled, run and compared: its outcome, and what `--bless`
+--- would do with it.
+---
+--- A case is compiled by `boot` from its own directory, so a diagnostic names
+--- the file by its bare name, then linked by the C compiler, then run in that
+--- directory under `$TURKEY_RUN` (`Cache.compile`, `Toolchain.command`). What
+--- it printed -- stdout, then the compile's warnings and the program's stderr
+--- -- must equal the golden exactly, and how it ended must be what its
+--- directive says. Then each dump golden is checked against `boot check
+--- --dump STAGE`, which is not cached, since the dump is what is tested.
+---
+--- A reference example is judged on what its chapter quotes instead
+--- (`Reference`): its stdout exactly, and a part of its message. An archive
+--- case is judged on its expectation sections (`Archive`), each exactly.
+---
+--- Running a case and judging it are separate: `observe` runs the processes
+--- and gathers what they produced, and `verdict` and `Bless.decide` are pure
+--- functions of that, the case and its goldens. Every dump is run whenever the
+--- compile answered, even when the output already failed, since bless needs
+--- them all.
+---
+--- Every actual result is written under `ACTUAL/NAME/` for inspection, whether
+--- the case passed or not: `output`, and one file per dump.
 
 import Process (Output(..), Status(..))
 import Process as Process
@@ -33,7 +33,7 @@ import Bless (Blessing(..), Guard(..))
 import Bless as Bless
 import Archive (Comparison(..))
 import Archive as Archive
-import Case (Case(..), Golden(..), Quote(..), Archived(..), Section(..), Outcome(..), Result(..), Finish(..),
+import Case (Case(..), Expected(..), Golden(..), Quote(..), Archived(..), Section(..), Outcome(..), Result(..), Finish(..),
              Ending(..), Observed(..), Recorded(..))
 import Case as Case
 import Cache (Cache, Compiled(..))
@@ -45,8 +45,8 @@ import Toolchain (Toolchain(..))
 import Toolchain as Toolchain
 import Iter
 
--- The longest diff shown for a case, in lines; the whole actual output is in
--- the actual results.
+--- The longest diff shown for a case, in lines; the whole actual output is in
+--- the actual results.
 let diffLimit : Int = 200
 
 -- How long a program may run without a `timeout` directive, and how long
@@ -56,8 +56,8 @@ let defaultTimeout : Int = 300
 -- What became of a case, before its time is added.
 type Verdict = Verdict { outcome : Outcome, why : String, diff : String }
 
--- Returns the outcome of case `c` and what bless would do with it. Writes the
--- actual results under `ACTUAL/NAME/`, and never writes a golden.
+--- Returns the outcome of case `c` and what bless would do with it. Writes the
+--- actual results under `ACTUAL/NAME/`, and never writes a golden.
 fun execute(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Result, Blessing) {
     let watch = Stopwatch.start()
     let (judged, blessing) = assess(t, cache, actual + "/" + c.name, c)
@@ -246,6 +246,7 @@ fun archiveVerdict(c : Case, a : Archived, observed : Observed) -> Verdict {
             if let Some(v) = dumpExited(dump, finished) { return v }
         }
     }
+    if let Some(v) = traceVerdict(c, observed) { return v }
     Verdict(Pass, "", "")
 }
 
@@ -267,7 +268,20 @@ fun quotedVerdict(c : Case, q : Quote, observed : Observed) -> Verdict {
         }
     }
     if diff != "" { return Verdict(Fail, "the output differs", diff) }
+    if let Some(text) = q.stderr {
+        let wrong = Diff.unified(text, observed.stderr, diffLimit)
+        if wrong != "" { return Verdict(Fail, "the standard error differs", wrong) }
+    }
+    if let Some(v) = traceVerdict(c, observed) { return v }
     Verdict(Pass, "", "")
+}
+
+-- The outcome of a case that expects a panic and got one whose trace is
+-- missing or malformed, showing the standard error. A case that quotes the
+-- panic's message alone still has its trace checked this far.
+fun traceVerdict(c : Case, observed : Observed) -> Option Verdict = match c.expected {
+    Panics -> Option.map(Reference.traceProblem(observed.stderr), \Verdict(Fail, _, observed.stderr))
+    Exits(_) | Rejected -> None
 }
 
 fun indented(text : String) -> String = String.unlines(Vec.map(String.lines(text), \"    " + _))

@@ -1,92 +1,92 @@
 export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, writeText, readAt, writeAt, using, flock,
         readingWith, writingWith, writeWith, writeWithin, close)
 
--- A descriptor that tasks share: the one place the I/O layer decides when a
--- descriptor number stops being this file's, and which of two tasks using it
--- goes first.
---
--- Nothing stops two tasks holding the same handle, so `close` can run while
--- another task is inside a `read`. Closing the number there and then would let
--- the next `open` anywhere in the process reuse it, and the read, or one about
--- to start, would then be reading someone else's file. So every operation
--- holds a reference for as long as it uses the number, `close` only marks the
--- descriptor closed, and `close(2)` runs when the last reference is dropped.
---
--- **The state word**, a `Sync.AtomicInt` of its own, so that every access to it
--- is atomic:
---
--- * bit 0, `closedBit`: `close` has been called. Nothing clears it, and an
---   operation that finds it set takes no reference and answers `closed`;
--- * bit 1, `readLock`, and bit 2, `writeLock`: held by the one sequential
---   read and the one sequential write in progress;
--- * bit 3, `readWaited`, and bit 4, `writeWaited`: a task may be waiting for
---   that lock, so the release must look for waiters;
--- * from bit 5 up, the reference count, in units of `reference`.
---
--- A reference is taken in the same compare-and-swap as a lock, and dropped in
--- the same one as its release, so a sequential operation costs two atomic
--- instructions however much it moves.
---
--- **The locks** make a sequential operation atomic with respect to others of
--- its direction: a `write` of a whole buffer goes out contiguously even when
--- the kernel takes it in pieces, and two reads never split one transfer
--- between them. A task waiting for a lock is suspended (`Scheduler.waitUntil`)
--- and its worker runs other tasks; nothing here blocks a worker but the system
--- call itself. A release wakes every task waiting for that lock, and the ones
--- that lose the race wait again, as `System.Sync`'s mutex does.
---
--- **Positional operations take a reference and no lock.** Each names its own
--- offset and leaves the descriptor's position alone, so it is independent of
--- every other operation, and any number of them run at once on one `FD`.
---
--- **The retry loop.** A call interrupted by a signal is made again at once.
--- `EAGAIN`, from a descriptor in non-blocking mode, parks the task until the
--- poller reports the descriptor ready for that direction
--- (`Turkey.Wait.readable`, `writable`) and then makes the call again. The
--- descriptor is registered with the poller at its first park and stays
--- registered until its number is closed, and the poller keeps readiness that
--- arrives while nobody waits, so readiness that arrived between the `EAGAIN`
--- and the park ends the park at once. The lock of the direction is held while
--- parked, so each direction has at most one parked task, which the poller
--- relies on (`Turkey.Poll`), and the parked operation holds a reference, so
--- the number is not closed under it; the registration is dropped before the
--- number is closed (`closeNumber`). After the first wait, the descriptor's
--- source is kept here (`source`), and a wait parks under that source's lock,
--- so waits on different descriptors share no lock but the deadline heap's,
--- and that only if they have deadlines. `close` ends a parked wait
--- (`Turkey.Wait.cancel`) and the operation answers `closed`; a wait the
--- poller cannot make (the kernel refuses the descriptor) answers its negated
--- `errno`.
--- Positional operations see `EAGAIN` from no descriptor that supports them, and
--- yield instead of parking.
---
--- **Inherited descriptors.** A descriptor the program did not open keeps the
--- mode its parent gave it, and this module never changes it. One in blocking
--- mode that is a FIFO, socket or character device (a terminal) can make a
--- `read` wait in the kernel for as long as nothing arrives, holding its
--- worker; so the first `read` looks at the descriptor once (`readMode`) and,
--- for one of those, every `read` waits for readable first and then makes the
--- call, which returns what is there; that wait is registered for itself and
--- ends only when the descriptor is readable (`Wait.readableBlockingUnless`).
--- Writes to it stay blocking. Regular files and directories are never looked
--- at again and never reach the poller. If the poller refuses such a
--- descriptor the `read` makes its call plainly from then on, as a blocking
--- read of any other descriptor. `polled` records that a wait was ever made on
--- the descriptor, so that only then is its poller registration dropped before
--- the number is closed.
---
--- **A deadline.** `readBy` takes one, a point on `Turkey.Wait.now`'s clock or
--- -1 for none, and gives up at it from either wait: the one before the call
--- and the one after `EAGAIN`. So do `readingWith`, `writingWith` and
--- `writeWith`, which make a call of the caller's in place of `read` or
--- `write` -- `accept`, `connect`, `send` -- under the same lock and the same
--- retry loop, for a descriptor the library made non-blocking itself.
--- `readWithin` and `writeWithin` also take a limit on the operation alone,
--- which starts at its first wait: an operation that never waits never reads
--- the clock, which is most reads and writes on a busy socket.
---
--- Every result is a count, never negative, or the negated `errno`, as
--- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
+--- A descriptor that tasks share: the one place the I/O layer decides when a
+--- descriptor number stops being this file's, and which of two tasks using it
+--- goes first.
+---
+--- Nothing stops two tasks holding the same handle, so `close` can run while
+--- another task is inside a `read`. Closing the number there and then would let
+--- the next `open` anywhere in the process reuse it, and the read, or one about
+--- to start, would then be reading someone else's file. So every operation
+--- holds a reference for as long as it uses the number, `close` only marks the
+--- descriptor closed, and `close(2)` runs when the last reference is dropped.
+---
+--- **The state word**, a `Sync.AtomicInt` of its own, so that every access to it
+--- is atomic:
+---
+--- * bit 0, `closedBit`: `close` has been called. Nothing clears it, and an
+---   operation that finds it set takes no reference and answers `closed`;
+--- * bit 1, `readLock`, and bit 2, `writeLock`: held by the one sequential
+---   read and the one sequential write in progress;
+--- * bit 3, `readWaited`, and bit 4, `writeWaited`: a task may be waiting for
+---   that lock, so the release must look for waiters;
+--- * from bit 5 up, the reference count, in units of `reference`.
+---
+--- A reference is taken in the same compare-and-swap as a lock, and dropped in
+--- the same one as its release, so a sequential operation costs two atomic
+--- instructions however much it moves.
+---
+--- **The locks** make a sequential operation atomic with respect to others of
+--- its direction: a `write` of a whole buffer goes out contiguously even when
+--- the kernel takes it in pieces, and two reads never split one transfer
+--- between them. A task waiting for a lock is suspended (`Scheduler.waitUntil`)
+--- and its worker runs other tasks; nothing here blocks a worker but the system
+--- call itself. A release wakes every task waiting for that lock, and the ones
+--- that lose the race wait again, as `System.Sync`'s mutex does.
+---
+--- **Positional operations take a reference and no lock.** Each names its own
+--- offset and leaves the descriptor's position alone, so it is independent of
+--- every other operation, and any number of them run at once on one `FD`.
+---
+--- **The retry loop.** A call interrupted by a signal is made again at once.
+--- `EAGAIN`, from a descriptor in non-blocking mode, parks the task until the
+--- poller reports the descriptor ready for that direction
+--- (`Turkey.Wait.readable`, `writable`) and then makes the call again. The
+--- descriptor is registered with the poller at its first park and stays
+--- registered until its number is closed, and the poller keeps readiness that
+--- arrives while nobody waits, so readiness that arrived between the `EAGAIN`
+--- and the park ends the park at once. The lock of the direction is held while
+--- parked, so each direction has at most one parked task, which the poller
+--- relies on (`Turkey.Poll`), and the parked operation holds a reference, so
+--- the number is not closed under it; the registration is dropped before the
+--- number is closed (`closeNumber`). After the first wait, the descriptor's
+--- source is kept here (`source`), and a wait parks under that source's lock,
+--- so waits on different descriptors share no lock but the deadline heap's,
+--- and that only if they have deadlines. `close` ends a parked wait
+--- (`Turkey.Wait.cancel`) and the operation answers `closed`; a wait the
+--- poller cannot make (the kernel refuses the descriptor) answers its negated
+--- `errno`.
+--- Positional operations see `EAGAIN` from no descriptor that supports them, and
+--- yield instead of parking.
+---
+--- **Inherited descriptors.** A descriptor the program did not open keeps the
+--- mode its parent gave it, and this module never changes it. One in blocking
+--- mode that is a FIFO, socket or character device (a terminal) can make a
+--- `read` wait in the kernel for as long as nothing arrives, holding its
+--- worker; so the first `read` looks at the descriptor once (`readMode`) and,
+--- for one of those, every `read` waits for readable first and then makes the
+--- call, which returns what is there; that wait is registered for itself and
+--- ends only when the descriptor is readable (`Wait.readableBlockingUnless`).
+--- Writes to it stay blocking. Regular files and directories are never looked
+--- at again and never reach the poller. If the poller refuses such a
+--- descriptor the `read` makes its call plainly from then on, as a blocking
+--- read of any other descriptor. `polled` records that a wait was ever made on
+--- the descriptor, so that only then is its poller registration dropped before
+--- the number is closed.
+---
+--- **A deadline.** `readBy` takes one, a point on `Turkey.Wait.now`'s clock or
+--- -1 for none, and gives up at it from either wait: the one before the call
+--- and the one after `EAGAIN`. So do `readingWith`, `writingWith` and
+--- `writeWith`, which make a call of the caller's in place of `read` or
+--- `write` -- `accept`, `connect`, `send` -- under the same lock and the same
+--- retry loop, for a descriptor the library made non-blocking itself.
+--- `readWithin` and `writeWithin` also take a limit on the operation alone,
+--- which starts at its first wait: an operation that never waits never reads
+--- the clock, which is most reads and writes on a busy socket.
+---
+--- Every result is a count, never negative, or the negated `errno`, as
+--- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
 
 import Turkey.Coroutine as Co
 import Turkey.Detach as Detach
@@ -108,18 +108,18 @@ let readWaited : Int = 8
 let writeWaited : Int = 16
 let reference : Int = 32
 
--- What an operation on an `FD` that has been closed answers: below every
--- negated `errno`, so that it cannot be mistaken for one.
+--- What an operation on an `FD` that has been closed answers: below every
+--- negated `errno`, so that it cannot be mistaken for one.
 let closed : Int = -0x1_0000_0000
 
--- What `readBy` answers when its deadline came first: `Turkey.Wait.timedOut`,
--- below every negated `errno` and distinct from `closed`.
+--- What `readBy` answers when its deadline came first: `Turkey.Wait.timedOut`,
+--- below every negated `errno` and distinct from `closed`.
 let timedOut : Int = Wait.timedOut
 
--- `readMode` is changed only by whoever holds the read lock, and `polled`
--- only from False to True, so neither needs an atomic instruction. The
--- rest is read under the locks and the publish protocol too, so `!Debug`
--- keeps a derived `Debug` from reading it.
+--- `readMode` is changed only by whoever holds the read lock, and `polled`
+--- only from False to True, so neither needs an atomic instruction. The
+--- rest is read under the locks and the publish protocol too, so `!Debug`
+--- keeps a derived `Debug` from reading it.
 type FD : !Debug = FD {
     state        : Sync.AtomicInt,
     number       : Int,
@@ -141,7 +141,7 @@ type FD : !Debug = FD {
     var flocking : Option Semaphore.Semaphore,
 }
 
--- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
+--- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
 fun fd(number : Int) -> FD = FD {
     state = Sync.atomicInt(0),
     number = number,
@@ -158,27 +158,27 @@ fun fd(number : Int) -> FD = FD {
 -- `WaitFirst`, wait for readable before each call.
 type ReadMode = Unknown | CallAtOnce | WaitFirst
 
--- The descriptor number, for a caller that only reports it. Using it for a
--- system call races `close` in exactly the way this module exists to prevent.
+--- The descriptor number, for a caller that only reports it. Using it for a
+--- system call races `close` in exactly the way this module exists to prevent.
 fun number(f : FD) -> Int = f.number
 
 -- -- sequential -----------------------------------------------------------------------
 
--- Up to `to - from` bytes into `bytes[from..to)`, from the descriptor's
--- position: how many, at least 1, or 0 at end of file. One read at a time per
--- `FD`.
+--- Up to `to - from` bytes into `bytes[from..to)`, from the descriptor's
+--- position: how many, at least 1, or 0 at end of file. One read at a time per
+--- `FD`.
 fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int =
     readBy(f, bytes, from, to, -1)
 
--- `read`, giving up at `deadline`, a monotonic time in nanoseconds
--- (`Turkey.Wait.now`) or -1 for none: `timedOut` if it came first. A read that
--- timed out has transferred nothing, and leaves the descriptor as it was, so
--- the caller may make it again as it would after `EAGAIN`.
+--- `read`, giving up at `deadline`, a monotonic time in nanoseconds
+--- (`Turkey.Wait.now`) or -1 for none: `timedOut` if it came first. A read that
+--- timed out has transferred nothing, and leaves the descriptor as it was, so
+--- the caller may make it again as it would after `EAGAIN`.
 fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> Int =
     readWithin(f, bytes, from, to, deadline, -1)
 
--- `readBy`, giving up also `within` nanoseconds after the read first waits,
--- unless `within` is -1.
+--- `readBy`, giving up also `within` nanoseconds after the read first waits,
+--- unless `within` is -1.
 fun readWithin(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int, within : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
     -- `at` is the deadline once `within` has started, which sets `pending`
@@ -230,9 +230,9 @@ fun readWithin(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int,
     n
 }
 
--- All of `bytes[from..to)`, at the descriptor's position: `to - from`, or the
--- negated `errno` of the call that failed, after whatever went before it. One
--- write at a time per `FD`, so the bytes go out contiguously.
+--- All of `bytes[from..to)`, at the descriptor's position: `to - from`, or the
+--- negated `errno` of the call that failed, after whatever went before it. One
+--- write at a time per `FD`, so the bytes go out contiguously.
 fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1, -1)
@@ -240,7 +240,7 @@ fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     n
 }
 
--- `write`, from a string's own bytes, counted in bytes.
+--- `write`, from a string's own bytes, counted in bytes.
 fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1, -1)
@@ -250,11 +250,11 @@ fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
 
 -- -- calls in place of a read or a write --------------------------------------------
 
--- What `call(number)` answers, made under the read lock as a `read` is, for a
--- call that takes what a read would, such as `accept`. Made again at once
--- after `EINTR`, and after `EAGAIN` once the descriptor is readable; or
--- `closed`, or `timedOut` if `deadline` came first. For a non-blocking
--- descriptor only: nothing here looks at an inherited one's mode.
+--- What `call(number)` answers, made under the read lock as a `read` is, for a
+--- call that takes what a read would, such as `accept`. Made again at once
+--- after `EINTR`, and after `EAGAIN` once the descriptor is readable; or
+--- `closed`, or `timedOut` if `deadline` came first. For a non-blocking
+--- descriptor only: nothing here looks at an inherited one's mode.
 fun readingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
     let n = retried(f, call, False, deadline)
@@ -262,8 +262,8 @@ fun readingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
     n
 }
 
--- `readingWith` under the write lock, waiting for writable: for a call that a
--- write would wait with, such as a `connect` in progress.
+--- `readingWith` under the write lock, waiting for writable: for a call that a
+--- write would wait with, such as a `connect` in progress.
 fun writingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = retried(f, call, True, deadline)
@@ -271,14 +271,14 @@ fun writingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
     n
 }
 
--- `write`, through `step(number, at)`, which writes from `at` up to `to` as
--- `write` would and answers what it did: `send` with flags, say. Gives up at
--- `deadline` with `timedOut`, after however much went out before it.
+--- `write`, through `step(number, at)`, which writes from `at` up to `to` as
+--- `write` would and answers what it did: `send` with flags, say. Gives up at
+--- `deadline` with `timedOut`, after however much went out before it.
 fun writeWith(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int) -> Int =
     writeWithin(f, step, from, to, deadline, -1)
 
--- `writeWith`, giving up also `within` nanoseconds after the write first
--- waits, unless `within` is -1.
+--- `writeWith`, giving up also `within` nanoseconds after the write first
+--- waits, unless `within` is -1.
 fun writeWithin(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int, within : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline, within)
@@ -299,9 +299,9 @@ fun retried(f : FD, call : fun(Int) -> Int, writing : Bool, deadline : Int) -> I
 
 -- -- positional -----------------------------------------------------------------------
 
--- `bytes[from..to)` filled from `offset` in the file, or as much of it as the
--- file holds: how many, fewer than asked for only at end of file. The
--- position is neither used nor moved, and no lock is taken.
+--- `bytes[from..to)` filled from `offset` in the file, or as much of it as the
+--- file holds: how many, fewer than asked for only at end of file. The
+--- position is neither used nor moved, and no lock is taken.
 fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     var at = from
@@ -324,9 +324,9 @@ fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> In
     if result < 0 { result } else { at - from }
 }
 
--- All of `bytes[from..to)` at `offset` in the file, the position neither used
--- nor moved, and no lock taken: `to - from`, or the negated `errno`. Two
--- overlapping `writeAt`s may interleave, as `pwrite`s do.
+--- All of `bytes[from..to)` at `offset` in the file, the position neither used
+--- nor moved, and no lock taken: `to - from`, or the negated `errno`. Two
+--- overlapping `writeAt`s may interleave, as `pwrite`s do.
 fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
@@ -337,10 +337,10 @@ fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> I
 
 -- -- any other call ---------------------------------------------------------------------
 
--- What `call` answers given the descriptor number, holding a reference while
--- it runs and taking no lock: for a call that is neither a read nor a write,
--- such as `flock`, `fstat` or an `openat` relative to a directory. `closed` if
--- `f` is.
+--- What `call` answers given the descriptor number, holding a reference while
+--- it runs and taking no lock: for a call that is neither a read nor a write,
+--- such as `flock`, `fstat` or an `openat` relative to a directory. `closed` if
+--- `f` is.
 fun using(f : FD, call : fun(Int) -> Int) -> Int {
     if !acquire(f) { return closed }
     let r = call(f.number)
@@ -348,19 +348,19 @@ fun using(f : FD, call : fun(Int) -> Int) -> Int {
     r
 }
 
--- Take `flock`'s `operation` lock (`Sys.lockExclusive`, without `LOCK_NB`)
--- on `f`'s file, waiting while another holder has it: 0, `closed` if `f` is or
--- is closed during the wait, `timedOut` if `deadline` came first, or the
--- negated `errno`. Only an answer of 0 leaves the lock taken.
---
--- The deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none. On
--- Darwin the wait parks the task (`Turkey.Wait.lockedUnless`). Linux reports
--- no release of a lock, so there the call waits in the kernel, and the
--- monitor hands its thread's permit on (`Turkey.Workers`); with a deadline,
--- the call runs on a helper task that the caller leaves at the deadline
--- (`flockLinux`).
+--- Take `flock`'s `operation` lock (`Sys.lockExclusive`, without `LOCK_NB`)
+--- on `f`'s file, waiting while another holder has it: 0, `closed` if `f` is or
+--- is closed during the wait, `timedOut` if `deadline` came first, or the
+--- negated `errno`. Only an answer of 0 leaves the lock taken.
+---
+--- The deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none.
 fun flock(f : FD, operation : Int, deadline : Int) -> Int {
     if !acquire(f) { return closed }
+    -- On Darwin the wait parks the task (`Turkey.Wait.lockedUnless`). Linux
+    -- reports no release of a lock, so there the call waits in the kernel,
+    -- and the monitor hands its thread's permit on (`Turkey.Workers`); with a
+    -- deadline, the call runs on a helper task that the caller leaves at the
+    -- deadline (`flockLinux`).
     let r = match Target.os {
         Darwin -> flockParked(f, operation, deadline)
         Linux -> flockLinux(f, operation, deadline)
@@ -438,14 +438,14 @@ fun flockCalls(f : FD) -> Semaphore.Semaphore {
 
 -- -- closing --------------------------------------------------------------------------
 
--- Mark `f` closed: every operation that starts afterwards answers `closed`,
--- and a task waiting for a lock is woken to answer it too. The descriptor
--- itself is closed when the last operation using it finishes, which is now
--- if none is.
---
--- 0, or the negated `errno` of `close(2)` if it ran here; a failure in a
--- `close(2)` that an operation finishing later runs is not reported to
--- anyone. 0 again for an `FD` already closed.
+--- Mark `f` closed: every operation that starts afterwards answers `closed`,
+--- and a task waiting for a lock is woken to answer it too. The descriptor
+--- itself is closed when the last operation using it finishes, which is now
+--- if none is.
+---
+--- 0, or the negated `errno` of `close(2)` if it ran here; a failure in a
+--- `close(2)` that an operation finishing later runs is not reported to
+--- anyone. 0 again for an `FD` already closed.
 fun close(f : FD) -> Int {
     let p = f.state
     while True {

@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc, toolchain
+from tests import bootc, lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "lib"
@@ -197,5 +197,5 @@ fun run() -> Unit {{
 }}
 """)
     assert result.returncode == 1
-    assert result.stderr == ("panic: array index out of bounds: another task resized the "
-                             "array during this access\n")
+    assert lang.panic_message(result) == ("array index out of bounds: another task "
+                                          "resized the array during this access")

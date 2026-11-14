@@ -1,5 +1,6 @@
 export (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
+    emitTraceTable, Traced(..),
     emitSwapStack, emitStackStart, emitWorkerStart, functionEnd,
     blockOrder, computedAtEdges, markKey,
 )
@@ -71,11 +72,17 @@ type Code = Code {
     -- its label placed. Labels, like rows, are items of no size.
     marks            : Map.Map Int Asm.Symbol,
     var markedTo     : Int,
+    -- The function's number, or -1 for code that is no function's, and the
+    -- calls emitted so far that have a position: each one's return address
+    -- and position, for the trace table (`emitTraceTable`). A function's
+    -- cold code shares the array, so a label's number is its index in it.
+    tag              : Int,
+    calls            : Vec (Asm.Symbol, Int),
 }
 
 fun code(items : Vec (Item Inst), rows : Bool, d : Asm.Dialect) -> Code =
     Code { items = items, at = 0, rows = rows, row = -1, prologueDone = False, dialect = d,
-           marks = Map.new(), markedTo = 0 }
+           marks = Map.new(), markedTo = 0, tag = -1, calls = [] }
 
 --- The key of point `p` of block `block`, for the labels `emitFunc` places.
 --- Point 0 is the block's start, point `n + 1` is after its instruction `n`,
@@ -124,6 +131,20 @@ fun instruction(b : Code, op : A.Arm) -> Unit {
         b.prologueDone = False
     }
     emit(b, Instruction(Inst { op = op, at = b.at }))
+    if b.tag >= 0 && b.at != 0 && isCall(op) {
+        let after = Asm.localLabel(b.dialect, "tr" + Int.toString(b.tag) + "n"
+                                              + Int.toString(len(b.calls)))
+        emit(b, Label(after))
+        Vec.push(b.calls, (after, b.at))
+    }
+}
+
+-- Whether `op` is a call that returns here, which leaves a return address
+-- in the frame record of whatever it calls.
+fun isCall(op : A.Arm) -> Bool = match op {
+    A.Bl(_, _) -> True
+    A.Blr(_, _) -> True
+    _ -> False
 }
 
 --- The label after function `tag`'s last instruction, with `rows`.
@@ -131,12 +152,14 @@ fun functionEnd(d : Asm.Dialect, tag : Int) -> Asm.Symbol =
     Asm.localLabel(d, "f" + Int.toString(tag) + "end")
 
 --- Function `tag`, with a line table row at each change of position if `rows`,
---- and the labels `marks` asks for (`markKey`).
+--- and the labels `marks` asks for (`markKey`). Each call that has a position
+--- gets a label at its return address, appended to `calls` with the position.
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
              l : Frame.Layout, tag : Int, rows : Bool, marks : Map.Map Int Asm.Symbol,
-             out : Vec (Item Inst)) -> Unit {
+             calls : Vec (Asm.Symbol, Int), out : Vec (Item Inst)) -> Unit {
     let b = Code { items = out, at = 0, rows = rows, row = -1, prologueDone = False,
-                   dialect = asm.dialect, marks = marks, markedTo = 0 }
+                   dialect = asm.dialect, marks = marks, markedTo = 0, tag = tag,
+                   calls = calls }
     let d = asm.dialect
     function(b, Asm.symbolFor(d, f.name))
     cfi(b, StartProc)
@@ -150,7 +173,12 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     let order = blockOrder(f)
     let reads = useCounts(f)
     let edges = atEdges(f, reads)
-    let cold = Cold { text = code([], rows, d), count = 0 }
+    let cold = Cold {
+        text = Code { items = [], at = 0, rows = rows, row = -1, prologueDone = False,
+                      dialect = d, marks = Map.new(), markedTo = 0, tag = tag,
+                      calls = calls },
+        count = 0,
+    }
     for var k = 0; k < len(order); k = k + 1 {
         let at = order[k]
         let next = if k + 1 < len(order) { order[k + 1] } else { -1 }
@@ -1452,6 +1480,11 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     symbolInto(b, Physical(Gp, 1), Asm.entrySymbol(d))
     call(b, d, "turkey_frame_table_set")
 
+    -- The trace table, which a panic's report reads.
+    symbolInto(b, A.x0, Asm.traceTableSymbol(d))
+    symbolInto(b, Physical(Gp, 1), Asm.entrySymbol(d))
+    call(b, d, "turkey_trace_table_set")
+
     -- The literals' static objects, before any code that can read one runs.
     -- After early initialization, which sets the collector's range to empty;
     -- giblet code uses no literal.
@@ -1700,12 +1733,174 @@ fun emitFrameTable(asm : Asm.Asm, layouts : Vec (Int, Frame.Layout),
     }
 }
 
--- A four-byte field of the frame table, refused if it does not fit rather
+-- -- the trace table ---------------------------------------------------------
+
+--- One emitted function, for the trace table: its name, its own position,
+--- the calls inlined into it (`Position.Site`), and each of its calls that
+--- has a position, as the label at the call's return address and the
+--- position.
+type Traced = Traced {
+    name  : String,
+    at    : Int,
+    sites : Vec Position.Site,
+    calls : Vec (Asm.Symbol, Int),
+}
+
+--- Appends the program's trace table to `out`: where each call of
+--- `functions` returns to, with the function it is in and its source
+--- position, which is what a panic's report prints a frame from
+--- (`Turkey.Entry`). `display` gives the name a function is printed by, and
+--- `fileNames` each file's, in `Position.Files` order.
+fun emitTraceTable(asm : Asm.Asm, fileNames : Array String, functions : Vec Traced,
+                   display : fun(String) -> String, out : Vec (Item Inst)) -> Unit {
+    -- A frame record holds a return address, so a call's return address is
+    -- the only code address a walk of the stack ever asks about, and only
+    -- calls have rows. The table is read when a panic is reported and never
+    -- otherwise, so it is laid out to be small and scanned, not searched:
+    -- nothing is sorted and nothing is built at startup.
+    --
+    -- Every field is four bytes, and none is an address, so the table is
+    -- read-only and the loader never writes it:
+    --
+    --     function count, file count, the strings' size in bytes
+    --     per file          its name's offset in the strings
+    --     the strings       each NUL-terminated, padded to four bytes
+    --     per function      its name's offset, its call count, its site count
+    --       per call        the return address's distance from the entry;
+    --                       the line, and the column from bit 20;
+    --                       the file's number, and the site's from bit 14
+    --       per site        the inlined function's name's offset, then the
+    --                       position of the call it was inlined at, as a
+    --                       call's
+    --
+    -- A file's number is its index among the files, from 1, and a site's is
+    -- its index among the function's sites, from 1; site 0 is the function
+    -- itself.
+    --
+    -- A lambda written in code that was inlined is a function of its own
+    -- whose every position is in the site of that inlined call: the site is
+    -- where the lambda's text is, not a call the lambda was reached through.
+    -- Such a function's own site is its site 0 in the table, the sites around
+    -- it are left out, and it is named after the function the site inlined
+    -- (`ownName`), which is the one its text is in.
+    let b = code(out, False, asm.dialect)
+    let d = asm.dialect
+    let strings = []
+    let offsets = Map.new()
+    var size = 0
+    let intern = fun(text : String) -> Int = match Map.get(offsets, text) {
+        Some(at) -> at
+        None -> {
+            let at = size
+            Map.put(offsets, text, at)
+            Vec.push(strings, text)
+            size = size + byteLength(text) + 1
+            at
+        }
+    }
+    let fileOffsets = []
+    for name in fileNames { Vec.push(fileOffsets, intern(name)) }
+    -- Each function that has a call, with its sites renumbered.
+    let kept = []
+    for f in functions {
+        if len(f.calls) > 0 {
+            let numbers = sitesUsed(f)
+            let _ = intern(ownName(f, display))
+            for var k = 0; k < len(f.sites); k = k + 1 {
+                if numbers[k + 1] != 0 { let _ = intern(display(f.sites[k].callee)) }
+            }
+            Vec.push(kept, (f, numbers))
+        }
+    }
+    let padding = (4 - size % 4) % 4
+    emit(b, Section(Asm.Constants))
+    emit(b, Align(2))
+    emit(b, Global(Asm.traceTableSymbol(d)))
+    emit(b, Label(Asm.traceTableSymbol(d)))
+    tableField(b, len(kept), "function count")
+    tableField(b, len(fileOffsets), "file count")
+    tableField(b, size + padding, "string size")
+    for at in fileOffsets { tableField(b, at, "file name") }
+    for text in strings { emit(b, CString(text)) }
+    if padding > 0 { emit(b, Space(padding)) }
+    for (f, numbers) in kept {
+        var sites = 0
+        for n in numbers { if n > sites { sites = n } }
+        tableField(b, intern(ownName(f, display)), "function name")
+        tableField(b, len(f.calls), "call count")
+        tableField(b, sites, "site count")
+        for (after, at) in f.calls {
+            emit(b, Difference(after, Asm.entrySymbol(d)))
+            tracePosition(b, at, numbers)
+        }
+        for var k = 0; k < len(f.sites); k = k + 1 {
+            if numbers[k + 1] != 0 {
+                tableField(b, intern(display(f.sites[k].callee)), "site name")
+                tracePosition(b, f.sites[k].call, numbers)
+            }
+        }
+    }
+}
+
+-- For each of `f`'s sites by its number, the number the trace table gives
+-- it, or 0 for one the table leaves out: a site no call is in, directly or
+-- through the sites inlined into it. Most are left out, since a function's
+-- sites are those of all its code and the table has only its calls. The
+-- sites kept are numbered from 1 in their own order, so a site's number
+-- stays above its parent's. Index 0 is the function itself, and stays 0;
+-- so does the site `f` itself is in, where it has one, which ends the walk
+-- outwards from each call.
+fun sitesUsed(f : Traced) -> Array Int {
+    let numbers = Array.filled(len(f.sites) + 1, 0)
+    let own = Position.site(f.at)
+    for (_, at) in f.calls {
+        var site = Position.site(at)
+        while site != 0 && site != own && numbers[site] == 0 {
+            numbers[site] = 1
+            site = Position.site(f.sites[site - 1].call)
+        }
+    }
+    var next = 0
+    for var k = 1; k < len(numbers); k = k + 1 {
+        if numbers[k] != 0 {
+            next = next + 1
+            numbers[k] = next
+        }
+    }
+    numbers
+}
+
+-- The name the table gives `f`: its own, or for a lambda written in inlined
+-- code, the name of the function that code is from and `.<lambda>`.
+fun ownName(f : Traced, display : fun(String) -> String) -> String {
+    let own = Position.site(f.at)
+    let name = display(f.name)
+    if own == 0 { return name }
+    match String.rsplitOnce(name, ".<") {
+        Some((_, made)) -> {
+            let kind = String.builder()
+            for c in String.codePoints(made) {
+                if !Char.isDigit(c) { String.push(kind, Char.toString(c)) }
+            }
+            display(f.sites[own - 1].callee) + ".<" + String.build(kind)
+        }
+        None -> name
+    }
+}
+
+-- A position as the trace table's two fields, with its site as `numbers`
+-- renumbers it.
+fun tracePosition(b : Code, at : Int, numbers : Array Int) -> Unit {
+    emit(b, Word32(Position.line(at) | Position.column(at) << 20))
+    emit(b, Word32(Position.file(at) | numbers[Position.site(at)] << 14))
+}
+
+-- A four-byte field of a table, refused if it does not fit rather
 -- than written truncated: a wrong offset is a root the collector reads from
 -- the wrong slot.
 fun tableField(b : Code, n : Int, what : String) -> Unit {
     if !fits32(n) {
-        error("internal error: the frame table's " + what + " " + Int.toString(n)
+        error("internal error: a table's " + what + " " + Int.toString(n)
               + " does not fit in four bytes")
     }
     emit(b, Word32(n))

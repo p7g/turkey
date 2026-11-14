@@ -107,7 +107,7 @@ fun main() {
 }
 """, env={"TURKEY_WORKERS": workers})
     assert result.code == 1
-    assert result.stderr == "panic: deadlock: every task is waiting\n"
+    assert lang.panic_message(result) == "deadlock: every task is waiting"
 
 
 @pytest.mark.parametrize("workers", ["1", "4"])

@@ -44,8 +44,11 @@ type Hooks = Hooks {
 --- are shortcut references, `[text][x]` is a full one, and `[x][]` is a
 --- collapsed one, which names `x` and shows it too.
 type Reference = Reference {
-    --- What names the target, with backslash escapes removed: `x` for each of
-    --- the four examples above. For `` [`x`] `` it is the code span's content.
+    --- What names the target, with backslash escapes removed, leading and
+    --- trailing whitespace dropped and each run of whitespace, newlines
+    --- included, as one space: `x` for each of the four examples above, and
+    --- for `[ x ]`. For `` [`x`] `` it is the code span's content. It is never
+    --- empty: a reference with a blank label is text.
     label : String,
     --- Whether the label was a single code span, as in `` [`x`] ``.
     code : Bool,
@@ -189,6 +192,21 @@ fun expandTabs(line : String) -> String {
     String.fromCodePoints(out) + text(cs, k, len(cs))
 }
 
+-- Writes each tab in `line` as the spaces up to the next multiple of four
+-- columns, so that the columns of a list marker's content are characters.
+fun expandAllTabs(line : String) -> String {
+    if !String.contains(line, "\t") { return line }
+    let out : Vec Char = []
+    for c in String.codePoints(line) {
+        if c == '\t' {
+            for _ in Int.range(0, 4 - len(out) % 4) { Vec.push(out, ' ') }
+        } else {
+            Vec.push(out, c)
+        }
+    }
+    String.fromCodePoints(out)
+}
+
 fun parse(lines : Vec String) -> Parsed {
     let out : Vec Block = []
     var gap = False
@@ -286,18 +304,18 @@ fun headingOf(line : String) -> Option Block {
     while k < n && cs[k] == '#' { k = k + 1 }
     let level = k - start
     if level < 1 || level > 6 { return None }
-    if k < n && cs[k] != ' ' { return None }
+    if k < n && cs[k] != ' ' && cs[k] != '\t' { return None }
     -- A closing run of `#`, after a space, is not part of the heading.
     var to = n
-    while to > k && cs[to - 1] == ' ' { to = to - 1 }
+    while to > k && (cs[to - 1] == ' ' || cs[to - 1] == '\t') { to = to - 1 }
     var hashes = to
     while hashes > k && cs[hashes - 1] == '#' { hashes = hashes - 1 }
-    if hashes < to && (hashes == k || cs[hashes - 1] == ' ') { to = hashes }
+    if hashes < to && (hashes == k || cs[hashes - 1] == ' ' || cs[hashes - 1] == '\t') { to = hashes }
     Some(Heading(level, String.trim(text(cs, k, to))))
 }
 
 fun markerOf(line : String) -> Option Marker {
-    let cs = chars(expandTabs(line))
+    let cs = chars(expandAllTabs(line))
     let n = len(cs)
     var k = 0
     while k < n && cs[k] == ' ' { k = k + 1 }
@@ -372,7 +390,7 @@ fun listing(lines : Vec String, i : Int, first : Marker, out : Vec Block) -> Int
     loop {
         let width = m.offset
         let body = []
-        let head = expandTabs(lines[at])
+        let head = expandAllTabs(lines[at])
         Vec.push(body, if m.empty { "" } else { text(chars(head), width, len(chars(head))) })
         var j = at + 1
         loop {
@@ -888,7 +906,8 @@ fun wholeCodeSpan(cs : Vec Char, from : Int, to : Int) -> Option String {
 fun referenceOf(cs : Vec Char, from : Int, to : Int, linkText : Option String) -> Reference =
     match wholeCodeSpan(cs, from, to) {
         Some(content) -> Reference { label = content, code = True, linkText = linkText }
-        None -> Reference { label = unescaped(cs, from, to), code = False, linkText = linkText }
+        None -> Reference { label = String.join(String.words(unescaped(cs, from, to)), " "),
+                            code = False, linkText = linkText }
     }
 
 -- Reads a link or a bracketed reference at `i`, or a `[` that starts neither,
@@ -923,10 +942,12 @@ fun bracket(hooks : Hooks, cs : Vec Char, i : Int, linkable : Bool, nodes : Vec 
                     } else {
                         referenceOf(cs, i + 1, close, None)
                     }
-                    if let Some(url) = resolve(r) {
-                        if safeURL(url) {
-                            render(url, None)
-                            return second + 1
+                    if !String.isEmpty(r.label) {
+                        if let Some(url) = resolve(r) {
+                            if safeURL(url) {
+                                render(url, None)
+                                return second + 1
+                            }
                         }
                     }
                     flushLiteral(nodes, lit)
@@ -935,8 +956,9 @@ fun bracket(hooks : Hooks, cs : Vec Char, i : Int, linkable : Bool, nodes : Vec 
                     return second + 1
                 }
             }
-            if !isBlank(text(cs, i + 1, close)) {
-                if let Some(url) = resolve(referenceOf(cs, i + 1, close, None)) {
+            let shortcut = referenceOf(cs, i + 1, close, None)
+            if !String.isEmpty(shortcut.label) {
+                if let Some(url) = resolve(shortcut) {
                     if safeURL(url) {
                         render(url, None)
                         return close + 1

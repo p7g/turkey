@@ -1,0 +1,873 @@
+export (Hooks(..), defaults, render, summary, escape)
+
+--- Doc-comment Markdown: a subset of CommonMark, rendered to an HTML fragment.
+---
+--- The input is the text of a doc comment, as `Turkey.DocComments.text`
+--- returns it. The subset is:
+---
+--- * paragraphs, separated by blank lines, with soft breaks kept as newlines
+---   and hard breaks written as a trailing backslash;
+--- * ATX headings, `#` to `######`;
+--- * emphasis `*x*` and `_x_`, strong `**x**` and `__x__`, and code spans;
+--- * bullet lists (`-`, `*`, `+`) and ordered lists (`1.` and `1)`), nested to
+---   any depth, tight or loose;
+--- * fenced code blocks, with `` ``` `` or `~~~` and an info string, and
+---   indented code blocks;
+--- * inline links `[text](url "title")`, autolinks `<https://...>`, and
+---   bracketed references, which `Hooks.reference` resolves;
+--- * backslash escapes of ASCII punctuation.
+---
+--- Everything else is text. A block quote, a thematic break, a setext heading,
+--- a link reference definition, an entity such as `&amp;` and a tag such as
+--- `<b>` are all written out as the characters they are, so **no raw HTML is
+--- ever passed through**: `&`, `<`, `>` and `"` in any text, URL or code are
+--- escaped. A link whose URL has a scheme other than `http`, `https`, `mailto`
+--- or `ftp` is not a link.
+
+--- What a caller plugs in to the renderer.
+type Hooks = Hooks {
+    --- Returns the HTML of a code block, given its info string (the empty
+    --- string for an indented block or an untagged fence) and its body, one
+    --- newline after each line. The result is used as it is, so it must be
+    --- safe HTML.
+    codeBlock : fun(String, String) -> String,
+    --- Returns the URL a bracketed reference names, given what the brackets
+    --- hold, as written: `x` for `[x]`, `` `x` `` for `` [`x`] `` and `x` for
+    --- `[text][x]`. Returns `None` when it is not a link, which leaves the
+    --- brackets as literal text.
+    reference : fun(String) -> Option String,
+}
+
+--- Returns the hooks that escape a code block into `<pre><code>`, with the
+--- first word of its info string as a `language-` class, and resolve no
+--- reference.
+fun defaults() -> Hooks = Hooks { codeBlock = plainCode, reference = noReference }
+
+fun plainCode(info : String, body : String) -> String {
+    let language = match Vec.at(String.words(info), 0) {
+        Some(w) -> " class=\"language-" + escape(w) + "\""
+        None -> ""
+    }
+    "<pre><code" + language + ">" + escape(body) + "</code></pre>\n"
+}
+
+fun noReference(label : String) -> Option String = None
+
+--- Returns `text` rendered as HTML blocks: each ends with a newline, and the
+--- empty string is the rendering of an empty document.
+fun render(hooks : Hooks, text : String) -> String {
+    let out = String.builder()
+    renderBlocks(hooks, parse(String.lines(text)).blocks, False, out)
+    String.build(out)
+}
+
+--- Returns the inline HTML of the first paragraph of `text`, without a
+--- `<p>`, or the empty string when there is none. A heading, a list or a code
+--- block before the paragraph is skipped.
+fun summary(hooks : Hooks, text : String) -> String {
+    for b in parse(String.lines(text)).blocks {
+        match b {
+            Paragraph(p) -> return inline(hooks, p, True)
+            _ -> {}
+        }
+    }
+    ""
+}
+
+--- Returns `s` with `&`, `<`, `>` and `"` written as entities.
+fun escape(s : String) -> String {
+    let out = String.builder()
+    for c in String.codePoints(s) { String.push(out, escapeChar(c)) }
+    String.build(out)
+}
+
+fun escapeChar(c : Char) -> String = match c {
+    '&' -> "&amp;"
+    '<' -> "&lt;"
+    '>' -> "&gt;"
+    '"' -> "&quot;"
+    _ -> Char.toString(c)
+}
+
+-- -- blocks -------------------------------------------------------------------------
+
+-- A paragraph holds its lines' text, joined by newlines. A list holds each
+-- item's blocks, and is tight when no item has a blank line between two of its
+-- blocks and no blank line separates two items.
+type Block =
+    Paragraph(String)
+    | Heading(Int, String)
+    | Code(String, String)
+    | Listing { ordered : Bool, start : Int, tight : Bool, items : Vec (Vec Block) }
+
+-- The blocks of some lines, and whether a blank line came between two of them.
+type Parsed = Parsed { blocks : Vec Block, gap : Bool }
+
+-- A list marker at the start of a line: where it stands, and where the item's
+-- content starts, in characters from the start of the line.
+type Marker = Marker {
+    ordered : Bool,
+    number  : Int,
+    delim   : Char,
+    indent  : Int,
+    offset  : Int,
+    empty   : Bool,
+}
+
+-- An opening code fence.
+type Fence = Fence { ch : Char, size : Int, indent : Int, info : String }
+
+fun chars(s : String) -> Vec Char {
+    let out = []
+    for c in String.codePoints(s) { Vec.push(out, c) }
+    out
+}
+
+fun text(cs : Vec Char, from : Int, to : Int) -> String =
+    String.fromCodePoints(Vec.slice(cs, from, to))
+
+fun isBlank(line : String) -> Bool = String.isEmpty(String.trim(line))
+
+-- The number of spaces a line starts with. A leading tab counts as four.
+fun indentOf(line : String) -> Int {
+    var n = 0
+    for c in String.codePoints(line) {
+        if c == ' ' {
+            n = n + 1
+        } else if c == '\t' {
+            n = n + 4
+        } else {
+            break
+        }
+    }
+    n
+}
+
+-- Returns `line` without up to `n` of its leading spaces, with a leading tab
+-- written as four spaces first.
+fun stripIndent(line : String, n : Int) -> String {
+    let cs = chars(expandTabs(line))
+    var k = 0
+    while k < n && k < len(cs) && cs[k] == ' ' { k = k + 1 }
+    text(cs, k, len(cs))
+}
+
+-- Writes each tab in the leading whitespace of `line` as four spaces.
+fun expandTabs(line : String) -> String {
+    if !String.contains(line, "\t") { return line }
+    let cs = chars(line)
+    var k = 0
+    while k < len(cs) && (cs[k] == ' ' || cs[k] == '\t') { k = k + 1 }
+    String.replace(text(cs, 0, k), "\t", "    ") + text(cs, k, len(cs))
+}
+
+fun parse(lines : Vec String) -> Parsed {
+    let out : Vec Block = []
+    var gap = False
+    var i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        if isBlank(line) {
+            i = i + 1
+            continue
+        }
+        if len(out) > 0 && isBlank(lines[i - 1]) { gap = True }
+        if indentOf(line) >= 4 {
+            i = indentedCode(lines, i, out)
+        } else if let Some(f) = fenceOf(line) {
+            i = fencedCode(lines, i, f, out)
+        } else if let Some(h) = headingOf(line) {
+            Vec.push(out, h)
+            i = i + 1
+        } else if let Some(m) = markerOf(line) {
+            i = listing(lines, i, m, out)
+        } else {
+            i = paragraph(lines, i, out)
+        }
+    }
+    Parsed { blocks = out, gap = gap }
+}
+
+-- Reads the indented code block that starts at line `i`, and returns the line
+-- after it. The block ends at the last indented line: blank lines inside it
+-- are kept, and blank lines after it are not.
+fun indentedCode(lines : Vec String, i : Int, out : Vec Block) -> Int {
+    var last = i
+    var j = i
+    while j < len(lines) && (isBlank(lines[j]) || indentOf(lines[j]) >= 4) {
+        if !isBlank(lines[j]) { last = j }
+        j = j + 1
+    }
+    let body = String.builder()
+    for k in Int.range(i, last + 1) {
+        String.push(body, stripIndent(lines[k], 4) + "\n")
+    }
+    Vec.push(out, Code("", String.build(body)))
+    last + 1
+}
+
+fun fenceOf(line : String) -> Option Fence {
+    let cs = chars(line)
+    let n = len(cs)
+    var k = 0
+    while k < n && cs[k] == ' ' { k = k + 1 }
+    if k >= 4 || k >= n { return None }
+    let ch = cs[k]
+    if ch != '`' && ch != '~' { return None }
+    let start = k
+    while k < n && cs[k] == ch { k = k + 1 }
+    if k - start < 3 { return None }
+    let info = String.trim(text(cs, k, n))
+    -- A backtick fence's info string cannot hold a backtick, which would make
+    -- the line a code span instead.
+    if ch == '`' && String.contains(info, "`") { return None }
+    Some(Fence { ch = ch, size = k - start, indent = start, info = info })
+}
+
+fun closesFence(line : String, f : Fence) -> Bool {
+    let cs = chars(line)
+    let n = len(cs)
+    var k = 0
+    while k < n && cs[k] == ' ' { k = k + 1 }
+    if k >= 4 { return False }
+    let start = k
+    while k < n && cs[k] == f.ch { k = k + 1 }
+    k - start >= f.size && isBlank(text(cs, k, n))
+}
+
+-- Reads the fenced code block that starts at line `i`, and returns the line
+-- after it. A fence that is never closed runs to the end of the lines.
+fun fencedCode(lines : Vec String, i : Int, f : Fence, out : Vec Block) -> Int {
+    let body = String.builder()
+    var j = i + 1
+    while j < len(lines) && !closesFence(lines[j], f) {
+        String.push(body, stripIndent(lines[j], f.indent) + "\n")
+        j = j + 1
+    }
+    Vec.push(out, Code(f.info, String.build(body)))
+    j + 1
+}
+
+fun headingOf(line : String) -> Option Block {
+    let cs = chars(line)
+    let n = len(cs)
+    var k = 0
+    while k < n && cs[k] == ' ' { k = k + 1 }
+    if k >= 4 { return None }
+    let start = k
+    while k < n && cs[k] == '#' { k = k + 1 }
+    let level = k - start
+    if level < 1 || level > 6 { return None }
+    if k < n && cs[k] != ' ' { return None }
+    -- A closing run of `#`, after a space, is not part of the heading.
+    var to = n
+    while to > k && cs[to - 1] == ' ' { to = to - 1 }
+    var hashes = to
+    while hashes > k && cs[hashes - 1] == '#' { hashes = hashes - 1 }
+    if hashes < to && (hashes == k || cs[hashes - 1] == ' ') { to = hashes }
+    Some(Heading(level, String.trim(text(cs, k, to))))
+}
+
+fun markerOf(line : String) -> Option Marker {
+    let cs = chars(expandTabs(line))
+    let n = len(cs)
+    var k = 0
+    while k < n && cs[k] == ' ' { k = k + 1 }
+    if k >= 4 || k >= n { return None }
+    let indent = k
+    var delim = cs[k]
+    var ordered = False
+    var number = 0
+    if delim == '-' || delim == '*' || delim == '+' {
+        k = k + 1
+    } else if Char.isDigit(delim) {
+        let start = k
+        while k < n && Char.isDigit(cs[k]) {
+            number = number * 10 + (Char.toInt(cs[k]) - 48)
+            k = k + 1
+        }
+        if k - start > 9 || k >= n || (cs[k] != '.' && cs[k] != ')') { return None }
+        ordered = True
+        delim = cs[k]
+        k = k + 1
+    } else {
+        return None
+    }
+    if k < n && cs[k] != ' ' { return None }
+    let markerEnd = k
+    while k < n && cs[k] == ' ' { k = k + 1 }
+    let empty = k >= n
+    -- Five or more spaces after the marker start an indented code block inside
+    -- the item, so the item's content starts one space after the marker.
+    let offset = if empty || k - markerEnd > 4 { markerEnd + 1 } else { k }
+    Some(Marker { ordered = ordered, number = number, delim = delim, indent = indent,
+                  offset = offset, empty = empty })
+}
+
+fun sameKind(a : Marker, b : Marker) -> Bool = a.ordered == b.ordered && a.delim == b.delim
+
+fun isMarker(line : String) -> Bool = match markerOf(line) {
+    Some(_) -> True
+    None -> False
+}
+
+-- Whether `line` ends a paragraph that it would otherwise continue.
+fun interrupts(line : String) -> Bool {
+    if indentOf(line) >= 4 { return False }
+    if let Some(_) = fenceOf(line) { return True }
+    if let Some(_) = headingOf(line) { return True }
+    match markerOf(line) {
+        Some(m) -> !m.empty && (!m.ordered || m.number == 1)
+        None -> False
+    }
+}
+
+fun paragraph(lines : Vec String, i : Int, out : Vec Block) -> Int {
+    let parts = []
+    var j = i
+    while j < len(lines) && !isBlank(lines[j]) && (j == i || !interrupts(lines[j])) {
+        Vec.push(parts, String.trimStart(lines[j]))
+        j = j + 1
+    }
+    Vec.push(out, Paragraph(String.join(parts, "\n")))
+    j
+}
+
+-- Reads the list that starts at line `i` with marker `first`, and returns the
+-- line after it. An item holds the lines indented to its content, the blank
+-- lines between them, and unindented lines that continue its paragraph.
+fun listing(lines : Vec String, i : Int, first : Marker, out : Vec Block) -> Int {
+    let items : Vec (Vec Block) = []
+    var tight = True
+    var m = first
+    var at = i
+    loop {
+        let width = m.offset
+        let body = []
+        let head = expandTabs(lines[at])
+        Vec.push(body, if m.empty { "" } else { text(chars(head), width, len(chars(head))) })
+        var j = at + 1
+        loop {
+            if j >= len(lines) { break }
+            let l = lines[j]
+            if isBlank(l) {
+                var p = j
+                while p < len(lines) && isBlank(lines[p]) { p = p + 1 }
+                if p < len(lines) && indentOf(lines[p]) >= width && !(m.empty && len(body) == 1 && p > j) {
+                    for _ in Int.range(j, p) { Vec.push(body, "") }
+                    j = p
+                } else {
+                    break
+                }
+            } else if indentOf(l) >= width {
+                Vec.push(body, stripIndent(l, width))
+                j = j + 1
+            } else if !isBlank(body[len(body) - 1]) && !interrupts(l) && !isMarker(l) && !isOpenFence(body) {
+                Vec.push(body, String.trimStart(l))
+                j = j + 1
+            } else {
+                break
+            }
+        }
+        let parsed = parse(body)
+        if parsed.gap { tight = False }
+        Vec.push(items, parsed.blocks)
+        -- Another item of the same kind follows, after any blank lines.
+        var p = j
+        while p < len(lines) && isBlank(lines[p]) { p = p + 1 }
+        let next = if p < len(lines) { markerOf(lines[p]) } else { None }
+        match next {
+            Some(n) -> {
+                if !sameKind(first, n) {
+                    at = j
+                    break
+                }
+                if p > j { tight = False }
+                m = n
+                at = p
+            }
+            None -> {
+                at = j
+                break
+            }
+        }
+    }
+    Vec.push(out, Listing { ordered = first.ordered, start = first.number, tight = tight,
+                            items = items })
+    at
+}
+
+-- Whether the item's lines so far leave a code fence open, which an unindented
+-- line cannot continue.
+fun isOpenFence(body : Vec String) -> Bool {
+    var open : Option Fence = None
+    for l in body {
+        match open {
+            Some(f) -> if closesFence(l, f) { open = None }
+            None -> { open = fenceOf(l) }
+        }
+    }
+    match open {
+        Some(_) -> True
+        None -> False
+    }
+}
+
+fun renderBlocks(hooks : Hooks, blocks : Vec Block, tight : Bool, out : String.Builder) -> Unit {
+    for k in Int.range(0, len(blocks)) {
+        match blocks[k] {
+            Paragraph(p) -> {
+                if tight {
+                    String.push(out, inline(hooks, p, True))
+                    if k + 1 < len(blocks) { String.push(out, "\n") }
+                } else {
+                    String.push(out, "<p>" + inline(hooks, p, True) + "</p>\n")
+                }
+            }
+            Heading(level, h) -> {
+                let tag = "h" + Int.toString(level)
+                String.push(out, "<" + tag + ">" + inline(hooks, h, True) + "</" + tag + ">\n")
+            }
+            Code(info, body) -> {
+                let render = hooks.codeBlock
+                String.push(out, render(info, body))
+            }
+            Listing { ordered, start, tight = listTight, items } -> {
+                let tag = if ordered { "ol" } else { "ul" }
+                let attr = if ordered && start != 1 { " start=\"" + Int.toString(start) + "\"" } else { "" }
+                String.push(out, "<" + tag + attr + ">\n")
+                for item in items {
+                    String.push(out, if listTight { "<li>" } else { "<li>\n" })
+                    renderBlocks(hooks, item, listTight, out)
+                    String.push(out, "</li>\n")
+                }
+                String.push(out, "</" + tag + ">\n")
+            }
+        }
+    }
+}
+
+-- -- inlines ------------------------------------------------------------------------
+
+-- A piece of inline output: HTML that is final, or a run of `*` or `_` that
+-- emphasis may still use. `count` is what is left of the run, and `opens` and
+-- `closes` are the tags written for the pairs it took part in.
+type Node = Raw(String) | Delim(Run)
+
+type Run = Run {
+    ch       : Char,
+    orig     : Int,
+    var count : Int,
+    canOpen  : Bool,
+    canClose : Bool,
+    var dead : Bool,
+    opens    : Vec String,
+    closes   : Vec String,
+}
+
+--- Returns `text` as inline HTML. A reference is resolved by `hooks` and a
+--- link made only when `linkable`.
+fun inline(hooks : Hooks, text : String, linkable : Bool) -> String =
+    inlineChars(hooks, chars(text), linkable)
+
+fun isPunct(c : Char) -> Bool {
+    let n = Char.toInt(c)
+    (n >= 33 && n <= 47) || (n >= 58 && n <= 64) || (n >= 91 && n <= 96) || (n >= 123 && n <= 126)
+}
+
+fun isSpace(c : Char) -> Bool = Char.isSpace(c) || c == '\n'
+
+fun countRun(cs : Vec Char, at : Int, ch : Char) -> Int {
+    var k = at
+    while k < len(cs) && cs[k] == ch { k = k + 1 }
+    k - at
+}
+
+fun flushLiteral(nodes : Vec Node, lit : Vec Char) -> Unit {
+    if len(lit) > 0 {
+        Vec.push(nodes, Raw(escape(String.fromCodePoints(lit))))
+        Vec.clear(lit)
+    }
+}
+
+fun inlineChars(hooks : Hooks, cs : Vec Char, linkable : Bool) -> String {
+    let n = len(cs)
+    let nodes : Vec Node = []
+    let lit : Vec Char = []
+    var i = 0
+    while i < n {
+        let c = cs[i]
+        match c {
+            '\\' -> {
+                if i + 1 < n && isPunct(cs[i + 1]) {
+                    Vec.push(lit, cs[i + 1])
+                    i = i + 2
+                } else if i + 1 < n && cs[i + 1] == '\n' {
+                    flushLiteral(nodes, lit)
+                    Vec.push(nodes, Raw("<br>\n"))
+                    i = i + 2
+                } else {
+                    Vec.push(lit, c)
+                    i = i + 1
+                }
+            }
+            '\n' -> {
+                -- Two spaces before a newline are a hard break; any spaces
+                -- before it are dropped.
+                var spaces = 0
+                while len(lit) > 0 && lit[len(lit) - 1] == ' ' {
+                    let _ = Vec.pop(lit)
+                    spaces = spaces + 1
+                }
+                if spaces >= 2 {
+                    flushLiteral(nodes, lit)
+                    Vec.push(nodes, Raw("<br>\n"))
+                } else {
+                    Vec.push(lit, c)
+                }
+                i = i + 1
+            }
+            '`' -> { i = codeSpan(cs, i, nodes, lit) }
+            '<' -> { i = autolink(cs, i, nodes, lit) }
+            '[' -> { i = bracket(hooks, cs, i, linkable, nodes, lit) }
+            '*' | '_' -> {
+                flushLiteral(nodes, lit)
+                let size = countRun(cs, i, c)
+                let before = if i > 0 { cs[i - 1] } else { ' ' }
+                let after = if i + size < n { cs[i + size] } else { ' ' }
+                let left = !isSpace(after) && (!isPunct(after) || isSpace(before) || isPunct(before))
+                let right = !isSpace(before) && (!isPunct(before) || isSpace(after) || isPunct(after))
+                let open = if c == '*' { left } else { left && (!right || isPunct(before)) }
+                let close = if c == '*' { right } else { right && (!left || isPunct(after)) }
+                Vec.push(nodes, Delim(Run { ch = c, orig = size, count = size, canOpen = open,
+                                            canClose = close, dead = False, opens = [], closes = [] }))
+                i = i + size
+            }
+            _ -> {
+                Vec.push(lit, c)
+                i = i + 1
+            }
+        }
+    }
+    flushLiteral(nodes, lit)
+    pairEmphasis(nodes)
+    let out = String.builder()
+    for node in nodes {
+        match node {
+            Raw(s) -> String.push(out, s)
+            Delim(r) -> {
+                for t in r.closes { String.push(out, t) }
+                String.push(out, String.repeat(Char.toString(r.ch), r.count))
+                for t in Vec.reverse(r.opens) { String.push(out, t) }
+            }
+        }
+    }
+    String.build(out)
+}
+
+-- Pairs each run that can close with the nearest earlier run that can open, as
+-- CommonMark's delimiter algorithm does: two characters from each make
+-- `<strong>`, one makes `<em>`, and the runs between a pair can no longer pair
+-- with anything outside it.
+fun pairEmphasis(nodes : Vec Node) -> Unit {
+    for ci in Int.range(0, len(nodes)) {
+        match nodes[ci] {
+            Delim(c) -> if c.canClose { closeRun(nodes, ci, c) }
+            Raw(_) -> {}
+        }
+    }
+}
+
+fun closeRun(nodes : Vec Node, ci : Int, c : Run) -> Unit {
+    while c.count > 0 && !c.dead {
+        var found : Option Run = None
+        var at = 0
+        var k = ci - 1
+        while k >= 0 {
+            match nodes[k] {
+                Delim(o) -> if canPair(o, c) {
+                    found = Some(o)
+                    at = k
+                }
+                Raw(_) -> {}
+            }
+            if Option.isSome(found) { break }
+            k = k - 1
+        }
+        match found {
+            None -> return
+            Some(o) -> {
+                let taken = if o.count >= 2 && c.count >= 2 { 2 } else { 1 }
+                Vec.push(o.opens, if taken == 2 { "<strong>" } else { "<em>" })
+                Vec.push(c.closes, if taken == 2 { "</strong>" } else { "</em>" })
+                o.count = o.count - taken
+                c.count = c.count - taken
+                for between in Int.range(at + 1, ci) {
+                    match nodes[between] {
+                        Delim(d) -> { d.dead = True }
+                        Raw(_) -> {}
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- Whether `o` can open what `c` closes. A run that can both open and close
+-- pairs with a run of the other kind only when their lengths do not add up to a
+-- multiple of three, unless both are multiples of three themselves.
+fun canPair(o : Run, c : Run) -> Bool {
+    if o.ch != c.ch || !o.canOpen || o.dead || o.count == 0 { return False }
+    let sum = o.orig + c.orig
+    !((o.canClose || c.canOpen) && sum % 3 == 0 && !(o.orig % 3 == 0 && c.orig % 3 == 0))
+}
+
+-- Reads a code span at `i`, or a run of backticks that opens none, and returns
+-- the index after it. The span ends at the next run of exactly as many
+-- backticks.
+fun codeSpan(cs : Vec Char, i : Int, nodes : Vec Node, lit : Vec Char) -> Int {
+    let size = countRun(cs, i, '`')
+    var k = i + size
+    while k < len(cs) {
+        if cs[k] == '`' {
+            let run = countRun(cs, k, '`')
+            if run == size {
+                flushLiteral(nodes, lit)
+                var body = String.replace(text(cs, i + size, k), "\n", " ")
+                -- One space on each side is padding, unless the span is only
+                -- spaces.
+                if String.startsWith(body, " ") && String.endsWith(body, " ") && !isBlank(body) {
+                    let inner = chars(body)
+                    body = text(inner, 1, len(inner) - 1)
+                }
+                Vec.push(nodes, Raw("<code>" + escape(body) + "</code>"))
+                return k + run
+            }
+            k = k + run
+        } else {
+            k = k + 1
+        }
+    }
+    for _ in Int.range(0, size) { Vec.push(lit, '`') }
+    i + size
+}
+
+-- Whether `url` has a scheme, and which. A scheme ends at the first `:`, and
+-- a `/`, `?` or `#` before it means the text is a path.
+fun schemeOf(url : String) -> Option String {
+    let cs = chars(url)
+    for k in Int.range(0, len(cs)) {
+        let c = cs[k]
+        if c == ':' { return if k > 0 { Some(lowerAscii(text(cs, 0, k))) } else { None } }
+        if c == '/' || c == '?' || c == '#' { return None }
+    }
+    None
+}
+
+fun lowerAscii(s : String) -> String {
+    let out = []
+    for c in String.codePoints(s) {
+        Vec.push(out, if Char.isAsciiUpper(c) { Option.unwrapOr(Char.fromInt(Char.toInt(c) + 32), c) } else { c })
+    }
+    String.fromCodePoints(out)
+}
+
+-- Whether a link may point at `url`: it is a path, or has a scheme that cannot
+-- run script.
+fun safeURL(url : String) -> Bool = match schemeOf(url) {
+    Some(s) -> s == "http" || s == "https" || s == "mailto" || s == "ftp"
+    None -> True
+}
+
+-- Whether `s` is an absolute URI: a scheme of 2 to 32 characters, a colon, and
+-- no spaces or angle brackets.
+fun isAbsoluteURI(s : String) -> Bool {
+    let cs = chars(s)
+    var k = 0
+    if len(cs) == 0 || !Char.isAsciiAlpha(cs[0]) { return False }
+    while k < len(cs) && (Char.isAsciiAlphanumeric(cs[k]) || cs[k] == '+' || cs[k] == '.' || cs[k] == '-') {
+        k = k + 1
+    }
+    if k < 2 || k > 32 || k >= len(cs) || cs[k] != ':' { return False }
+    for c in cs {
+        if isSpace(c) || c == '<' || c == '>' { return False }
+    }
+    True
+}
+
+fun link(url : String, title : Option String, label : String) -> String {
+    let attr = match title {
+        Some(t) -> " title=\"" + escape(t) + "\""
+        None -> ""
+    }
+    "<a href=\"" + escape(url) + "\"" + attr + ">" + label + "</a>"
+}
+
+-- Reads an autolink `<scheme:...>` at `i`, or a `<` that starts none, and
+-- returns the index after it.
+fun autolink(cs : Vec Char, i : Int, nodes : Vec Node, lit : Vec Char) -> Int {
+    var k = i + 1
+    while k < len(cs) && cs[k] != '>' && cs[k] != '<' && !isSpace(cs[k]) { k = k + 1 }
+    if k < len(cs) && cs[k] == '>' {
+        let url = text(cs, i + 1, k)
+        if isAbsoluteURI(url) && safeURL(url) {
+            flushLiteral(nodes, lit)
+            Vec.push(nodes, Raw(link(url, None, escape(url))))
+            return k + 1
+        }
+    }
+    Vec.push(lit, '<')
+    i + 1
+}
+
+-- Returns the index of the `]` that closes the `[` at `i`, skipping escaped
+-- brackets, code spans and balanced pairs.
+fun closingBracket(cs : Vec Char, i : Int) -> Option Int {
+    var depth = 0
+    var k = i
+    while k < len(cs) {
+        let c = cs[k]
+        if c == '\\' {
+            k = k + 2
+        } else if c == '`' {
+            let size = countRun(cs, k, '`')
+            var j = k + size
+            var end = -1
+            while j < len(cs) && end < 0 {
+                if cs[j] == '`' {
+                    let run = countRun(cs, j, '`')
+                    if run == size { end = j + run }
+                    j = j + run
+                } else {
+                    j = j + 1
+                }
+            }
+            k = if end >= 0 { end } else { k + size }
+        } else if c == '[' {
+            depth = depth + 1
+            k = k + 1
+        } else if c == ']' {
+            depth = depth - 1
+            if depth == 0 { return Some(k) }
+            k = k + 1
+        } else {
+            k = k + 1
+        }
+    }
+    None
+}
+
+-- Returns `cs[from..to]` with each backslash before punctuation removed.
+fun unescaped(cs : Vec Char, from : Int, to : Int) -> String {
+    let out = []
+    var k = from
+    while k < to {
+        if cs[k] == '\\' && k + 1 < to && isPunct(cs[k + 1]) { k = k + 1 }
+        Vec.push(out, cs[k])
+        k = k + 1
+    }
+    String.fromCodePoints(out)
+}
+
+fun skipSpaces(cs : Vec Char, at : Int) -> Int {
+    var k = at
+    while k < len(cs) && isSpace(cs[k]) { k = k + 1 }
+    k
+}
+
+-- Reads `(url "title")` with its `(` at `at`, and returns the URL, the title
+-- and the index after the `)`.
+fun destination(cs : Vec Char, at : Int) -> Option (String, Option String, Int) {
+    let n = len(cs)
+    var k = skipSpaces(cs, at + 1)
+    var url = ""
+    if k < n && cs[k] == '<' {
+        let start = k + 1
+        k = start
+        while k < n && cs[k] != '>' && cs[k] != '<' && cs[k] != '\n' { k = k + 1 }
+        if k >= n || cs[k] != '>' { return None }
+        url = unescaped(cs, start, k)
+        k = k + 1
+    } else {
+        let start = k
+        var depth = 0
+        loop {
+            if k >= n || isSpace(cs[k]) { break }
+            if cs[k] == '\\' && k + 1 < n && isPunct(cs[k + 1]) {
+                k = k + 2
+            } else if cs[k] == '(' {
+                depth = depth + 1
+                k = k + 1
+            } else if cs[k] == ')' {
+                if depth == 0 { break }
+                depth = depth - 1
+                k = k + 1
+            } else {
+                k = k + 1
+            }
+        }
+        if depth != 0 { return None }
+        url = unescaped(cs, start, k)
+    }
+    k = skipSpaces(cs, k)
+    var title : Option String = None
+    if k < n && (cs[k] == '"' || cs[k] == '\'' || cs[k] == '(') {
+        let close = if cs[k] == '(' { ')' } else { cs[k] }
+        let start = k + 1
+        k = start
+        while k < n && cs[k] != close {
+            k = if cs[k] == '\\' { k + 2 } else { k + 1 }
+        }
+        if k >= n { return None }
+        title = Some(unescaped(cs, start, k))
+        k = skipSpaces(cs, k + 1)
+    }
+    if k < n && cs[k] == ')' { Some((url, title, k + 1)) } else { None }
+}
+
+-- Reads a link or a bracketed reference at `i`, or a `[` that starts neither,
+-- and returns the index after it. The link text is rendered on its own, so
+-- emphasis cannot pair across the brackets, and a link inside it is not made.
+fun bracket(hooks : Hooks, cs : Vec Char, i : Int, linkable : Bool, nodes : Vec Node,
+            lit : Vec Char) -> Int {
+    if linkable {
+        if let Some(close) = closingBracket(cs, i) {
+            let n = len(cs)
+            let label = text(cs, i + 1, close)
+            let render = fun(url : String, title : Option String) {
+                flushLiteral(nodes, lit)
+                Vec.push(nodes, Raw(link(url, title, inlineChars(hooks, Vec.slice(cs, i + 1, close), False))))
+            }
+            let resolve = hooks.reference
+            if close + 1 < n && cs[close + 1] == '(' {
+                if let Some((url, title, end)) = destination(cs, close + 1) {
+                    if safeURL(url) {
+                        render(url, title)
+                        return end
+                    }
+                }
+            }
+            if close + 1 < n && cs[close + 1] == '[' {
+                if let Some(second) = closingBracket(cs, close + 1) {
+                    let name = text(cs, close + 2, second)
+                    if let Some(url) = resolve(if String.isEmpty(name) { label } else { name }) {
+                        if safeURL(url) {
+                            render(url, None)
+                            return second + 1
+                        }
+                    }
+                }
+            }
+            if !isBlank(label) {
+                if let Some(url) = resolve(label) {
+                    if safeURL(url) {
+                        render(url, None)
+                        return close + 1
+                    }
+                }
+            }
+        }
+    }
+    Vec.push(lit, '[')
+    i + 1
+}

@@ -95,14 +95,15 @@ names the library instead. The working directory is never searched, so a
 `turkey` runs; after moving the checkout, run `install.sh` again.
 
 Besides `doc` ("Library documentation" below), the compiler has two commands.
-`build` writes the program in the format `-f` names: `exe`, an executable that
-runs as it is, with no assembler and no linker; `obj`, a relocatable object,
-which needs only a linker; or `asm`, assembly. Without `-f`, the file `-o`
-names chooses: a relocatable object for `.o`, assembly for `.s`, and an
-executable for a name without an extension. Without either, `build` writes an
-executable. Without `-o`, the executable goes to the working directory, named
-after the entry file without its extension, and an object or assembly goes to
-standard output. `-o -` writes any of the three to standard output.
+`build` writes the program as an executable that runs as it is, with no
+assembler and no linker. Without `-o`, it goes to the working directory, named
+after the entry file without its extension; `-o PATH` names it, and `-o -`
+writes it to standard output. `build -S` writes the program's assembly
+instead, as `cc -S` does: to the entry file's name with `.s` in place of its
+extension, or wherever `-o` names. Only `-S` chooses assembly. `-o prog.s`
+without it writes an executable named `prog.s`. The system assembler accepts
+`-S`'s output, and the tests assemble it to check the compiler's own
+encoder, but it is for reading and checking, not for building programs.
 
 The executable is a signed Mach-O on a Mac, and on arm64 Linux an ELF that
 loads glibc 2.34 or later. It is written for either target from any host, with
@@ -119,33 +120,18 @@ naming a directory that holds a copy of the library. Either executable
 carries the unwind information and, with `-g`, the debug information a linked
 one does (see "Debugging and profiling").
 
-An object links with the C compiler:
-
-```sh
-build/stages/turkey build -o rectangles.o rectangles.gob
-cc -o rectangles rectangles.o
-```
-
-On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
-the maths functions the library calls out of libc.
-
-A program that imports `Net.TLS` also links OpenSSL 3: add `-lssl -lcrypto`.
-On Linux that is the system's (`apt-get install libssl-dev` on Debian and
-Ubuntu). On a Mac it is Homebrew's, since the system's own
-`/usr/lib/libcrypto.dylib` ends any process that loads it:
-
-```sh
-brew install openssl@3
-cc -o client client.o -L"$(brew --prefix openssl@3)/lib" -lssl -lcrypto
-```
-
-The tests find it the same way, or under `$TURKEY_OPENSSL` if it is set, and
+A program that imports `Net.TLS` needs OpenSSL 3 installed where it runs. On
+Linux that is the system's (`apt-get install libssl3` on Debian and Ubuntu,
+or `libssl-dev` for the headers the tests compile against). On a Mac it is
+Homebrew's (`brew install openssl@3`), since the system's own
+`/usr/lib/libcrypto.dylib` ends any process that loads it. The tests find it
+the same way, or under `$TURKEY_OPENSSL` if it is set, and
 make their certificates with that installation's `openssl`.
 
 `check` compiles as far as the last stage that can reject a program and
-writes nothing. Either command takes `--dump STAGE,...` to print what a stage produced:
-`build/stages/turkey check --dump types rectangles.gob` shows the inferred
-types, and running the compiler with no arguments lists the stages.
+writes nothing. Either command takes `--dump STAGE,...` to print what a stage
+produced: `build/stages/turkey check --dump types rectangles.gob` shows the
+inferred types, and running the compiler with no arguments lists the stages.
 `build --timings` reports on standard error how long each phase took, how the
 backend's time is spread over functions, and how much of the optimizer's work
 could run in parallel.
@@ -203,15 +189,6 @@ as a linker does: gdb reads them there, `strip` removes them and
 `-g` is `--debug=full`. `--debug=lines` writes less: the line table, the
 functions and the calls inlined into them, which is all a profiler or a
 backtrace reads, and none of what a debugger needs to show a variable.
-
-`-g` works for an object and for assembly alike. Assembly written with `-g`
-needs the assembler to build the line table, in DWARF 5 as the rest is:
-`cc -gdwarf-5 -c rectangles.s -o rectangles.o`. On a Mac, keep a linked
-program's object where it is. The linker leaves the DWARF in the object and
-writes only a map to it into the executable, which is how lldb and
-Instruments find it. To make a copy that does not need the object, run
-`dsymutil rectangles`, which writes `rectangles.dSYM` beside it. On Linux the
-DWARF is linked into the executable.
 
 Then a debugger stops at a line and names the frames by function, file and
 line:
@@ -292,6 +269,10 @@ in a crash report:
 sample rectangles 5 -file report.txt && python3 scripts/demangle.py report.txt
 perf script | python3 scripts/demangle.py
 ```
+
+`-S -g` writes the debug information into the assembly too, all but the line
+table, which it leaves to the assembler as `.loc` rows. Assemble it in
+DWARF 5, as the rest is: `cc -gdwarf-5 -c rectangles.s`.
 
 ### The C compiler, and running on another machine
 
@@ -476,12 +457,12 @@ The suite runs in parallel by default, and three commands cover it:
     python3 -m pytest tests -q -m ''      # both, in one run
 
 To run both, use the last one rather than the first two in turn. The fixed
-point is a chain nothing can parallelize -- `turkey` compiling the compiler,
-linking the result, and that compiling it again, about two minutes a step --
-and in one run it overlaps the rest of the suite instead of starting after it.
+point is a chain nothing can parallelize -- `turkey` writing the compiler, and
+that writing itself again -- and in one run it overlaps the rest of the suite
+instead of starting after it.
 On a 16-core arm64 Mac, after a change to `src/` (so `turkey` is rebuilt), the
-combined run takes about nine minutes. The build of `turkey` and everything the
-tests compute from it are cached in `$TMPDIR` by content hash, so a second run
+combined run takes about nine minutes. The build of `turkey` and everything the tests
+compute from it are cached in `$TMPDIR` by content hash, so a second run
 with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a program, compile it with

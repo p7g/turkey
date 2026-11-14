@@ -69,7 +69,7 @@ def test_symlink_on_path_from_another_directory(tree: Path, project: Path, tmp_p
     prefix = os.environ.get("TURKEY_RUN", "").strip()
     turkey = str(bin_ / "turkey") if prefix else "turkey"
     path = f"{bin_}{os.pathsep}{os.environ.get('PATH', '')}"
-    built = _run(toolchain.command(Path(turkey), "build", "-f", "exe", "-o", "01", "01.gob"),
+    built = _run(toolchain.command(Path(turkey), "build", "-o", "01", "01.gob"),
                  project, PATH=path)
     assert built.returncode == 0, built.stderr
     ran = _run(toolchain.command(project / "01"), project)
@@ -96,7 +96,7 @@ def test_turkey_lib_overrides(tree: Path, project: Path, tmp_path: Path):
     compiler = tree / "build" / "stages" / "turkey"
     without = _run(toolchain.command(compiler, "check", "probe.gob"), project)
     assert "cannot find module 'Probe_LibLookup'" in without.stderr, without.stderr
-    built = _run(toolchain.command(compiler, "build", "-f", "exe", "-o", "probe", "probe.gob"),
+    built = _run(toolchain.command(compiler, "build", "-o", "probe", "probe.gob"),
                  project, TURKEY_LIB=str(library))
     assert built.returncode == 0, built.stderr
     ran = _run(toolchain.command(project / "probe"), project)
@@ -137,7 +137,7 @@ def test_executable_path_is_absolute_and_resolved(tree: Path, tmp_path: Path):
     real = tmp_path / "real" / "where"
     real.parent.mkdir()
     built = _run(toolchain.command(tree / "build" / "stages" / "turkey",
-                                   "build", "-f", "exe", "-o", str(real), str(program)), tmp_path)
+                                   "build", "-o", str(real), str(program)), tmp_path)
     assert built.returncode == 0, built.stderr
     link = tmp_path / "link"
     link.symlink_to(real)

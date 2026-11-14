@@ -167,7 +167,7 @@ emit() {
 # The same, as assembly on standard output: for saying where two stages
 # differ, since an executable's first differing byte names no line.
 assembly() {
-    $RUN "$1" build -o - -f asm --target "$target" "$SOURCE"
+    $RUN "$1" build -S -o - --target "$target" "$SOURCE"
 }
 
 if [ -n "$stage1" ]; then

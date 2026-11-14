@@ -1,17 +1,15 @@
--- The compiler, built from the committed assembly in `bootstrap/` by
+-- The compiler, built from the committed compiler in `bootstrap/` by
 -- `scripts/build.sh`.
 --
 -- Three commands. `check` compiles as far as the last stage that can reject a
--- program, and writes nothing. `build` compiles all the way and writes the
--- result to `-o`, in the format `-f` names, or else the one the extension of
--- `-o` names, or else an executable. Without `-o`, an executable goes to the
--- working directory, named after the entry file, and the other formats to
--- standard output (`openSink`). `doc` checks the modules it is given and
--- writes what each exports as JSON (`Turkey.Doc`), or with `--html DIR` as a
--- website (`Turkey.DocSite`). `check` and `build` each take `--dump
--- STAGE,...` to print what a stage produced, which is how a pass is read
--- while it is being written: `check` goes on as far as the latest stage asked
--- for and no further, and `build` prints them on its way.
+-- program, and writes nothing. `build` compiles all the way and writes an
+-- executable, or under `-S` assembly, to `-o`, or without it to the working
+-- directory, named after the entry file (`openSink`). `doc` checks the
+-- modules it is given and writes what each exports as JSON (`Turkey.Doc`), or
+-- with `--html DIR` as a website (`Turkey.DocSite`). `check` and `build` each
+-- take `--dump STAGE,...` to print what a stage produced, which is how a pass
+-- is read while it is being written: `check` goes on as far as the latest
+-- stage asked for and no further, and `build` prints them on its way.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -70,10 +68,8 @@ import Turkey.DebugTypes as DebugTypes
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
 import Turkey.Assembler as Assembler
-import Turkey.MachO as MachO
 import Turkey.ElfExecutable as ElfExecutable
 import Turkey.MachOExecutable as MachOExecutable
-import Turkey.Elf as Elf
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
@@ -239,14 +235,20 @@ let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
 -- to move this.
 let checkedThrough = "core"
 
--- What `build` writes: assembly, a relocatable object for the system
--- linker, or an executable, with the linker's work done here as well.
-type Format = Executable | Object | Assembly
+-- What `build` writes: an executable, with the linker's work done here, or
+-- under `-S` assembly for the system assembler.
+type Format = Executable | Assembly
 
--- Where the output goes: standard output, a file open for it, or an
+-- Where the output goes: standard output, assembly's path, or an
 -- executable's path, written whole once its bytes are complete
 -- (`writeExecutable`).
-type Destination = ToStdout | ToFile(File.File File.WriteOnly) | ToExecutable(String)
+type Destination = ToStdout | ToAssembly(Pending) | ToExecutable(String)
+
+-- Assembly bound for `path`. It is written as it is emitted, to a partial file
+-- beside `path` made at the first write, and renamed over `path` once the
+-- build is done (`finishAssembly`). So a program refused before its code is
+-- emitted leaves no file, and an existing `path` is untouched.
+type Pending = Pending { path : String, var partial : Option (String, File.File File.WriteOnly) }
 
 -- What `build` writes, and where. `name` is what the program is called: the
 -- entry file's name without its extension, whatever the output's.
@@ -264,7 +266,7 @@ fun main() {
         _ -> usage()
     }
     var output = None
-    var format = None
+    var format = Executable
     let dumps = Set.new()
     let paths = []
     loop {
@@ -273,7 +275,9 @@ fun main() {
             Right(None) -> break
             Right(Some(arg)) -> match arg {
                 Short('o') -> { output = Some(valueOf(p)) }
-                Short('f') -> { format = Some(formatNamed(valueOf(p))) }
+                Short('S') -> { format = Assembly }
+                Short('f') -> die("there is no -f: 'turkey build' writes an executable, "
+                                  + "and 'turkey build -S' assembly")
                 Short('g') -> { debug = Full }
                 Long("debug") -> { debug = debugNamed(valueOf(p)) }
                 Long("target") -> {
@@ -309,9 +313,9 @@ fun main() {
         Some(openSink(output, format, paths, len(Set.elements(dumps)) > 0))
     } else {
         match (output, format) {
-            (None, None) -> None
+            (None, Executable) -> None
             _ -> die("'turkey check' writes no output, so it takes no -o or "
-                     + "-f; use 'turkey build' to write one")
+                     + "-S; use 'turkey build' to write one")
         }
     }
     -- One builder for every file, which the dumps are pushed to line by line
@@ -323,9 +327,7 @@ fun main() {
         compile(b, path, dumps, listing, sink)
     }
     write(String.build(b))
-    if let Some(Sink { to = ToFile(out), .. }) = sink {
-        if let Left(e) = File.close(out) { die(message(e)) }
-    }
+    if let Some(Sink { to = ToAssembly(pending), .. }) = sink { finishAssembly(pending) }
 }
 
 fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
@@ -333,107 +335,96 @@ fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
     Right(v) -> v
 }
 
-fun formatNamed(name : String) -> Format = match name {
-    "exe" -> Executable
-    "obj" -> Object
-    "asm" -> Assembly
-    _ -> die("unknown format '" + name + "'; the formats are exe, obj, asm")
-}
-
--- The format a file name asks for. An executable has no extension on the
--- systems this targets, so a name without one is an executable, and a name
--- with one this does not know is refused rather than taken for an executable:
--- `-o prog.S` silently writing a binary is the mistake this rule is for.
-fun formatOf(path : String) -> Format {
-    let parts = String.split(path, "/")
-    match String.rsplitOnce(parts[len(parts) - 1], ".") {
-        None -> Executable
-        Some((_, "s")) -> Assembly
-        Some((_, "o")) -> Object
-        Some((_, ext)) -> die("cannot tell what to write from the extension '."
-                              + ext + "'; name the file .s or .o, or say which "
-                              + "with -f")
-    }
-}
-
 -- Where `build` writes, refused here if it is something this cannot write,
--- before any compiling is spent on it. With no `-f`, the format is the one
--- `-o` names by its extension, or an executable. With no `-o`, an executable
--- goes to the working directory, named after the entry file without its
--- extension, and assembly or an object to standard output.
-fun openSink(output : Option String, format : Option Format, paths : Vec String,
+-- before any compiling is spent on it. With no `-o`, the output goes to the
+-- working directory, named after the entry file: without its extension for
+-- an executable, and with `.s` in place of it for assembly. `-o -` is
+-- standard output. The format is `format` whatever `-o` is called: `-o x.s`
+-- without `-S` is an executable named `x.s`, as it is for `cc`.
+fun openSink(output : Option String, format : Format, paths : Vec String,
              dumping : Bool) -> Sink {
-    let chosen = match (format, output) {
-        (Some(f), _) -> f
-        (None, None) | (None, Some("-")) -> Executable
-        (None, Some(path)) -> formatOf(path)
-    }
-    let one = match chosen {
-        Object -> Some("object")
-        Executable -> Some("executable")
-        Assembly -> None
-    }
-    if let Some(what) = one {
-        if len(paths) > 1 {
-            die(Int.toString(len(paths)) + " input files cannot be written as "
-                + "one " + what + "; build each file separately")
-        }
-    }
     let base = baseName(paths[0])
     let name = match String.rsplitOnce(base, ".") {
         Some((stem, _)) -> stem
         None -> base
     }
-    let to = match (output, chosen) {
-        (None, Executable) -> {
-            -- An entry file without an extension has the executable's name,
-            -- and in the working directory it is the executable's path.
-            if name == base {
-                die("cannot name the executable after '" + base + "', which "
-                    + "has no extension to drop; name it with -o PATH")
-            }
-            if name == "" {
-                die("cannot name the executable after '" + base + "', which "
-                    + "has nothing before its extension; name it with -o PATH")
-            }
-            ToExecutable(executablePath(name, "./" + name))
-        }
-        (None, _) | (Some("-"), _) -> {
+    let to = match output {
+        Some("-") -> {
             -- Dumps go to standard output too, and two things in one stream
             -- can be told apart only by parsing both.
             if dumping {
                 die("--dump and the build would both write to standard "
                     + "output; write the build to a file with -o PATH")
             }
+            if let Executable = format {
+                if len(paths) > 1 {
+                    die(Int.toString(len(paths)) + " input files cannot be written "
+                        + "as one executable; build each file separately")
+                }
+            }
             ToStdout
         }
-        (Some(path), _) -> {
+        Some(path) -> {
+            if path == "" || String.endsWith(path, "/") {
+                die("-o '" + path + "' has no file name; name a file with -o PATH")
+            }
             if len(paths) > 1 {
                 die("-o '" + path + "' can take only one input file, and "
                     + Int.toString(len(paths)) + " were given; build each "
                     + "file separately, or write to standard output with -o -")
             }
-            match chosen {
-                Executable -> ToExecutable(executablePath(path, path))
-                Object | Assembly -> match File.create(path, File.Truncate) {
-                    Right(out) -> ToFile(out)
-                    Left(e) -> die(message(e))
+            opened(path, path, format)
+        }
+        None -> {
+            if len(paths) > 1 {
+                die(Int.toString(len(paths)) + " input files cannot be written "
+                    + "to one file; build each file separately, or write to "
+                    + "standard output with -o -")
+            }
+            if base == "" {
+                die("cannot name the " + described(format) + " after '" + paths[0]
+                    + "', which has no file name; name it with -o PATH")
+            }
+            if name == "" {
+                die("cannot name the " + described(format) + " after '" + base
+                    + "', which has nothing before its extension; name it with -o PATH")
+            }
+            match format {
+                Executable -> {
+                    -- An entry file without an extension has the executable's
+                    -- name, and in the working directory it is the
+                    -- executable's path.
+                    if name == base {
+                        die("cannot name the executable after '" + base + "', which "
+                            + "has no extension to drop; name it with -o PATH")
+                    }
+                    opened(name, "./" + name, format)
                 }
+                Assembly -> opened(name + ".s", "./" + name + ".s", format)
             }
         }
     }
-    Sink { to = to, format = chosen, name = name }
+    Sink { to = to, format = format, name = name }
 }
 
--- Returns `path`, refusing it if it names a directory. `writeExecutable`
--- renames over `path` only once the program is compiled, so without this a
--- directory would be found only after all of that work. `shown` is `path` as
--- the diagnostic names it.
-fun executablePath(path : String, shown : String) -> String = match File.metadata(path) {
-    Right(File.Stat { kind = File.Directory, .. }) ->
-        die("cannot write the executable to '" + shown + "', which is a "
+-- Where `format` is written at `path`, which a diagnostic names as `shown`.
+-- Refuses a `path` that names a directory: either format is renamed over
+-- `path` only once the program is compiled, so without this a directory
+-- would be found only after all of that work.
+fun opened(path : String, shown : String, format : Format) -> Destination {
+    if let Right(File.Stat { kind = File.Directory, .. }) = File.metadata(path) {
+        die("cannot write the " + described(format) + " to '" + shown + "', which is a "
             + "directory; name a file with -o PATH")
-    _ -> path
+    }
+    match format {
+        Executable -> ToExecutable(path)
+        Assembly -> ToAssembly(Pending { path = path, partial = None })
+    }
+}
+
+fun described(format : Format) -> String = match format {
+    Executable -> "executable"
+    Assembly -> "assembly"
 }
 
 -- The last component of `path`.
@@ -584,21 +575,17 @@ fun realPath(path : String) -> String = match Env.resolvedPath(path) {
 -- the code signature of a file it has run, and kills a process started from
 -- that file once its bytes change in place.
 fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
-    let stem = match String.rsplitOnce(path, "/") {
-        Some((directory, base)) -> directory + "/." + base + ".partial"
-        None -> "." + path + ".partial"
-    }
-    let (partial, out) = createPartial(stem, 0)
-    let failed = fun(e) {
-        let _ = File.removeFile(partial)
-        die(message(e))
-    }
+    let (partial, out) = createPartial(partialStem(path), 0, True)
+    -- `die` removes the partial file, once: removing it here as well could
+    -- remove another build's, made under the same name in between.
+    Diag.removeOnExit(partial)
     if let Left(e) = IO.writeFrom(out, bytes) {
         let _ = File.close(out)
-        failed(e)
+        die(message(e))
     }
-    if let Left(e) = File.close(out) { failed(e) }
-    if let Left(e) = File.rename(partial, path) { failed(e) }
+    if let Left(e) = File.close(out) { die(message(e)) }
+    if let Left(e) = File.rename(partial, path) { die(message(e)) }
+    Diag.keepOnExit(partial)
 }
 
 -- Returns the first of `stem` followed by `n`, `n + 1`, ... that names
@@ -606,15 +593,57 @@ fun writeExecutable(path : String, bytes : IO.Buffer) -> Unit {
 -- what gives each build of one output a file of its own: one never writes
 -- into, removes or renames another's. A build killed while writing leaves
 -- its file, which only moves the next build to a later number.
-fun createPartial(stem : String, n : Int) -> (String, File.File File.WriteOnly) {
+fun createPartial(stem : String, n : Int,
+                 executable : Bool) -> (String, File.File File.WriteOnly) {
     let candidate = stem + Int.toString(n)
-    match File.createExecutable(candidate, File.Exclusive) {
+    let made = if executable { File.createExecutable(candidate, File.Exclusive) }
+               else { File.create(candidate, File.Exclusive) }
+    match made {
         Right(out) -> (candidate, out)
         Left(e) -> match e.kind {
-            IO.AlreadyExists -> createPartial(stem, n + 1)
+            IO.AlreadyExists -> createPartial(stem, n + 1, executable)
             _ -> die(message(e))
         }
     }
+}
+
+-- The hidden name beside `path` that its partial files are numbered after.
+fun partialStem(path : String) -> String = match String.rsplitOnce(path, "/") {
+    Some((directory, base)) -> directory + "/." + base + ".partial"
+    None -> "." + path + ".partial"
+}
+
+-- The partial file `pending`'s assembly is being written to, made now if
+-- nothing has been written yet.
+fun pendingFile(pending : Pending) -> File.File File.WriteOnly = match pending.partial {
+    Some((_, out)) -> out
+    None -> {
+        let (name, out) = createPartial(partialStem(pending.path), 0, False)
+        -- An exit through `Diag.exit` (`die`, `Diag.fail`, `stopOnErrors`)
+        -- before `finishAssembly` renames it removes it, a write that fails
+        -- among them. A panic or a signal leaves it.
+        Diag.removeOnExit(name)
+        pending.partial = Some((name, out))
+        out
+    }
+}
+
+-- `pending`'s partial file, closed and renamed over its path.
+fun finishAssembly(pending : Pending) -> Unit {
+    let out = pendingFile(pending)
+    let partial = match pending.partial {
+        Some((name, _)) -> name
+        None -> die("internal error: the assembly has no partial file")
+    }
+    -- `die` removes the partial file, once: removing it here as well could
+    -- remove another build's, made under the same name in between.
+    if let Left(e) = File.close(out) { die(message(e)) }
+    -- A rename, so the file at `path` is replaced, not written through: a
+    -- symbolic link there becomes a regular file, and the file's mode is the
+    -- partial's, whatever the replaced file's was. An executable written over
+    -- another is replaced the same way.
+    if let Left(e) = File.rename(partial, pending.path) { die(message(e)) }
+    Diag.keepOnExit(partial)
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this
@@ -692,7 +721,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
                                    render = Stream.print })
             let _ = emitModule(path, entry, module_, files, types, outs)
         }
-        Some(Sink { to, format, name }) -> {
+        Some(Sink { to, format = Executable, name }) -> {
             let assembler = Assembler.new(Encode.isa(), Asm.dialectFor(target))
             Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
                                    render = fun(d, code, t) { Assembler.feed(assembler, code) } })
@@ -705,26 +734,15 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
             }
             let started = Stopwatch.start()
             let obj = Assembler.finish(assembler)
-            match format {
-                Executable -> {
-                    let dialect = Asm.dialectFor(target)
-                    let imported = importedLibraries(checked.decls, obj.undefined, dialect)
-                    let main = Asm.runtimeFor(dialect, "main")
-                    sendBytes(to, match dialect {
-                        Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
-                                                                    installNames(imported, path))
-                        Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
-                    })
-                    let _ = lap("executable", started)
-                }
-                _ -> {
-                    sendBytes(to, Vec.toArray(match Asm.dialectFor(target) {
-                        Asm.MachO -> MachO.objectFile(obj)
-                        Asm.Elf -> Elf.objectFile(obj)
-                    }))
-                    let _ = lap("object", started)
-                }
-            }
+            let dialect = Asm.dialectFor(target)
+            let imported = importedLibraries(checked.decls, obj.undefined, dialect)
+            let main = Asm.runtimeFor(dialect, "main")
+            sendBytes(to, match dialect {
+                Asm.MachO -> MachOExecutable.executableFile(obj, main, name,
+                                                            installNames(imported, path))
+                Asm.Elf -> ElfExecutable.executableFile(obj, main, sonames(imported))
+            })
+            let _ = lap("executable", started)
         }
         None -> { let _ = emitModule(path, entry, module_, files, types, outs) }
     }
@@ -1519,7 +1537,9 @@ fun reportCosts(costs : Vec (String, Duration)) -> Unit {
 
 fun send(to : Destination, text : String) -> Unit = match to {
     ToStdout -> write(text)
-    ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
+    ToAssembly(pending) -> if let Left(e) = IO.writeText(pendingFile(pending), text) {
+        die(message(e))
+    }
     ToExecutable(_) -> die("internal error: an executable is written as bytes, not text")
 }
 
@@ -1535,7 +1555,9 @@ fun sendBytes(to : Destination, array : Array Byte) -> Unit {
                 die("cannot write the output to standard output")
             }
         }
-        ToFile(out) -> if let Left(e) = IO.writeFrom(out, buffer) { die(message(e)) }
+        ToAssembly(pending) -> if let Left(e) = IO.writeFrom(pendingFile(pending), buffer) {
+            die(message(e))
+        }
         ToExecutable(path) -> writeExecutable(path, buffer)
     }
 }
@@ -2153,7 +2175,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 fun usage() -> a =
     die("usage: turkey check [OPTIONS] FILE...\n"
         + "       turkey doc [--html DIR] FILE...\n"
-        + "       turkey build [OPTIONS] [-o PATH] [-f exe|obj|asm] [-g] [--debug=lines|full]\n"
+        + "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
         + "                    FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
@@ -2161,7 +2183,7 @@ fun usage() -> a =
 
 fun die(message : String) -> a {
     toStderr("turkey: " + message + "\n")
-    Env.exit(2)
+    Diag.exit(2)
 }
 
 fun toStderr(text : String) -> Unit { let _ = IO.writeText(IO.stderr(), text) }

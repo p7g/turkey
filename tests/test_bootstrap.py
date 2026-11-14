@@ -238,4 +238,4 @@ def test_build_sh_speaks_only_the_bootstraps_command_line():
     assert "native" not in script, (
         "the compiler in bootstrap/ now takes `build`, so scripts/build.sh no longer "
         "needs to fall back to `native`: remove `emit_command` and call "
-        "`build -o - -f asm` directly")
+        "`build -S -o -` directly")

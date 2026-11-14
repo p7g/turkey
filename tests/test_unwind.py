@@ -6,14 +6,11 @@ per function, frame mode for all but `turkey_swap_stack`, whose rules change
 from one instruction to the next and so are a DWARF description in
 `__eh_frame`. On ELF it is `.eh_frame`, exact at every instruction.
 
-**The object's oracle is the assembler**, as for the line table: the unwind
-sections `turkey` writes into an object are the ones the system assembler makes
-of `turkey`'s own assembly, whose `.cfi_*` directives say the same rules, for
-the test programs and for `turkey` itself. Byte for byte, with the relocations
-compared by what they resolve to, since the assembler names a section's
-start by a symbol of its own. Where the assembler is not the format's own --
-LLVM writing ELF, on macOS -- the two `.eh_frame`s are compared by the rows
-they decode to instead: LLVM lays the same rules out with other factors.
+**The executable's oracle is the assembler**, as for the line table: the
+unwind information in the executable `turkey` writes is what the system
+assembler makes of `turkey`'s own assembly, whose `.cfi_*` directives say the
+same rules, for the test programs and for `turkey` itself
+(`tests/test_executable.py`, `_unwind_agrees`).
 
 Then the tools, on the executable `turkey` writes: `objdump` and `readelf` show
 an entry for every function, and a debugger stopped on a function's first
@@ -28,7 +25,6 @@ import functools
 import os
 import re
 import shutil
-import struct
 import subprocess
 import tempfile
 from pathlib import Path
@@ -36,7 +32,8 @@ from pathlib import Path
 import pytest
 
 from tests import bootc, toolchain
-from tests.test_debug_info import _first_difference, _split
+from tests.test_debug_info import _split
+from tests.test_executable import _unwind_agrees
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LIB = REPO_ROOT / "lib"
@@ -86,337 +83,36 @@ def _darwin() -> bool:
     return toolchain.target() == "arm64-darwin"
 
 
-# -- reading an object's unwind sections ---------------------------------------
+# -- the executable against the assembler ---------------------------------------
 
-UNWIND_SECTIONS = ["compact_unwind", "eh_frame"]
-
-
-class _Object:
-    """A relocatable object's sections, by name without the format's prefix,
-    and the unwind sections' relocations, each as what it resolves to: its
-    offset, its type, its target -- a section, with the offset in it a
-    defined symbol names, or an undefined symbol by name -- and the value
-    stored in the field or carried as the addend."""
-
-    def __init__(self, data: bytes):
-        self.sections: dict[str, bytes] = {}
-        self.relocations: dict[str, list[tuple]] = {}
-        if data[:4] == b"\x7fELF":
-            self._elf(data)
-        else:
-            self._macho(data)
-
-    def _macho(self, data: bytes) -> None:
-        (ncmds,) = struct.unpack_from("<I", data, 16)
-        at = 32
-        found = []
-        symbols, strings = [], b""
-        for _ in range(ncmds):
-            cmd, size = struct.unpack_from("<II", data, at)
-            if cmd == 0x19:
-                (nsects,) = struct.unpack_from("<I", data, at + 64)
-                for k in range(nsects):
-                    s = at + 72 + 80 * k
-                    name = data[s:s + 16].rstrip(b"\0").decode().lstrip("_")
-                    address, length, offset, _, reloff, nreloc = struct.unpack_from(
-                        "<QQIIII", data, s + 32)
-                    found.append((name, address, data[offset:offset + length], reloff, nreloc))
-            elif cmd == 0x2:
-                symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", data, at + 8)
-                strings = data[stroff:stroff + strsize]
-                symbols = [struct.unpack_from("<IBBHQ", data, symoff + 16 * k)
-                           for k in range(nsyms)]
-            at += size
-        for name, _, contents, reloff, nreloc in found:
-            self.sections[name] = contents
-            if name not in UNWIND_SECTIONS:
-                continue
-            relocations = []
-            for k in range(nreloc):
-                address, info = struct.unpack_from("<II", data, reloff + 8 * k)
-                index, pcrel = info & 0xFFFFFF, (info >> 24) & 1
-                length, extern, kind = (info >> 25) & 3, (info >> 27) & 1, info >> 28
-                stored = int.from_bytes(contents[address:address + (1 << length)], "little")
-                if extern:
-                    n, _, section, _, value = symbols[index]
-                    if section == 0:
-                        target = "symbol " + strings[n:].split(b"\0", 1)[0].decode()
-                    else:
-                        owner, start = found[section - 1][0], found[section - 1][1]
-                        target = f"section {owner} + {value - start}"
-                else:
-                    target = "section " + found[index - 1][0]
-                relocations.append((address, kind, pcrel, length, target, stored))
-            self.relocations[name] = sorted(relocations)
-
-    def _elf(self, data: bytes) -> None:
-        (shoff,) = struct.unpack_from("<Q", data, 0x28)
-        shnum, shstrndx = struct.unpack_from("<HH", data, 0x3C)
-        headers = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + 64 * k)
-                   for k in range(shnum)]
-        names_at = headers[shstrndx][4]
-        names = [data[names_at + h[0]:].split(b"\0", 1)[0].decode() for h in headers]
-        symbols = []
-        for h in headers:
-            if h[1] == 2:
-                symbols = [struct.unpack_from("<IBBHQQ", data, h[4] + 24 * k)
-                           for k in range(h[5] // 24)]
-        for k, h in enumerate(headers):
-            if h[1] != 4:
-                self.sections.setdefault(names[k].lstrip("."),
-                                         data[h[4]:h[4] + h[5]] if h[1] != 8 else b"")
-                continue
-            if names[h[7]].lstrip(".") not in UNWIND_SECTIONS:
-                continue
-            relocations = []
-            for r in range(h[5] // 24):
-                offset, info, addend = struct.unpack_from("<QQq", data, h[4] + 24 * r)
-                _, _, _, section, value, _ = symbols[info >> 32]
-                relocations.append((offset, info & 0xFFFFFFFF,
-                                    "section " + names[section], value + addend))
-            self.relocations[names[h[7]].lstrip(".")] = sorted(relocations)
-
-
-def _uleb(data: bytes, at: int) -> tuple[int, int]:
-    value = shift = 0
-    while True:
-        byte = data[at]
-        at += 1
-        value |= (byte & 0x7F) << shift
-        shift += 7
-        if byte < 0x80:
-            return value, at
-
-
-def _sleb(data: bytes, at: int) -> tuple[int, int]:
-    value = shift = 0
-    while True:
-        byte = data[at]
-        at += 1
-        value |= (byte & 0x7F) << shift
-        shift += 7
-        if byte < 0x80:
-            if byte & 0x40:
-                value -= 1 << shift
-            return value, at
-
-
-def _rows(cie: dict, program: bytes, initial: tuple) -> list:
-    """The rows `program` describes from the state `initial`, each as its
-    offset in bytes from the function's start, the CFA rule and every
-    register's rule: the last row at each offset, and none that changes
-    nothing."""
-    cfa, regs = initial[0], dict(initial[1])
-    start_regs = cie["regs"]
-    stack: list = []
-    loc = 0
-    rows: list = [(0, cfa, tuple(sorted(regs.items())))]
-
-    def row() -> None:
-        state = (cfa, tuple(sorted(regs.items())))
-        if rows and rows[-1][0] == loc:
-            rows.pop()
-        if not rows or rows[-1][1:] != state:
-            rows.append((loc, *state))
-
-    at = 0
-    code, data = cie["code"], cie["data"]
-    while at < len(program):
-        op = program[at]
-        at += 1
-        high, low = op >> 6, op & 0x3F
-        if high == 1:
-            loc += low * code
-        elif high == 2:
-            n, at = _uleb(program, at)
-            regs[low] = ("at", n * data)
-        elif high == 3:
-            regs.pop(low, None)
-            if low in start_regs:
-                regs[low] = start_regs[low]
-        elif op == 0x00:
-            continue
-        elif op in (0x02, 0x03, 0x04):
-            width = {0x02: 1, 0x03: 2, 0x04: 4}[op]
-            loc += int.from_bytes(program[at:at + width], "little") * code
-            at += width
-        elif op == 0x05:
-            reg, at = _uleb(program, at)
-            n, at = _uleb(program, at)
-            regs[reg] = ("at", n * data)
-        elif op == 0x11:
-            reg, at = _uleb(program, at)
-            n, at = _sleb(program, at)
-            regs[reg] = ("at", n * data)
-        elif op == 0x06:
-            reg, at = _uleb(program, at)
-            regs.pop(reg, None)
-            if reg in start_regs:
-                regs[reg] = start_regs[reg]
-        elif op == 0x07:
-            reg, at = _uleb(program, at)
-            regs[reg] = ("undefined",)
-        elif op == 0x08:
-            reg, at = _uleb(program, at)
-            regs.pop(reg, None)
-        elif op == 0x0A:
-            stack.append((cfa, dict(regs)))
-        elif op == 0x0B:
-            cfa, regs = stack.pop()
-        elif op == 0x0C:
-            reg, at = _uleb(program, at)
-            n, at = _uleb(program, at)
-            cfa = (reg, n)
-        elif op == 0x0D:
-            reg, at = _uleb(program, at)
-            cfa = (reg, cfa[1])
-        elif op == 0x0E:
-            n, at = _uleb(program, at)
-            cfa = (cfa[0], n)
-        else:
-            raise AssertionError(f"call frame instruction {op:#x} is not decoded here")
-        row()
-    return rows
-
-
-def _frames(data: bytes) -> dict[int, tuple]:
-    """An ELF object's `.eh_frame`, decoded: for each function, by its
-    offset in `.text`, its length and its rows."""
-    obj = _Object(data)
-    eh = obj.sections["eh_frame"]
-    starts = {offset: value for offset, _, _, value in obj.relocations["eh_frame"]}
-    cies: dict[int, dict] = {}
-    frames: dict[int, tuple] = {}
-    at = 0
-    while at < len(eh):
-        (length,) = struct.unpack_from("<I", eh, at)
-        if length == 0:
-            break
-        body, end = at + 4, at + 4 + length
-        (pointer,) = struct.unpack_from("<I", eh, body)
-        if pointer == 0:
-            p = body + 4
-            version = eh[p]
-            p += 1
-            augmentation = eh[p:eh.index(b"\0", p)].decode()
-            p += len(augmentation) + 1
-            code, p = _uleb(eh, p)
-            data_align, p = _sleb(eh, p)
-            if version == 1:
-                p += 1
-            else:
-                _, p = _uleb(eh, p)
-            encoding = 0
-            if augmentation.startswith("z"):
-                size, p = _uleb(eh, p)
-                if "R" in augmentation:
-                    encoding = eh[p]
-                p += size
-            cie: dict = {"code": code, "data": data_align, "encoding": encoding, "regs": {}}
-            last = _rows(cie, eh[p:end], ((31, 0), ()))[-1]
-            cie["initial"] = (last[1], last[2])
-            cie["regs"] = dict(last[2])
-            cies[at] = cie
-        else:
-            cie = cies[body - pointer]
-            field = body + 4
-            size = 4 if cie["encoding"] & 0x0F == 0x0B else 8
-            span = int.from_bytes(eh[field + size:field + 2 * size], "little")
-            p = field + 2 * size
-            extra, p = _uleb(eh, p)
-            p += extra
-            frames[starts[field]] = (span, tuple(_rows(cie, eh[p:end], cie["initial"])))
-        at = end
-    return frames
-
-
-# -- the object against the assembler ------------------------------------------
-
-def _agree(ours: bytes, theirs: bytes, exact: bool) -> None:
-    """`turkey`'s object, `ours`, carries the unwind sections the assembler put
-    in `theirs`: the same bytes and relocations if `exact`, and on ELF the
-    same rows either way."""
-    mine, assembled = _Object(ours), _Object(theirs)
-    names = [n for n in UNWIND_SECTIONS if n in mine.sections or n in assembled.sections]
-    assert names, "no unwind section in either object"
-    if exact:
-        for name in names:
-            assert name in mine.sections, f"{name}: not written"
-            assert mine.sections[name] == assembled.sections.get(name), (
-                f"{name}: " + _first_difference(mine.sections[name],
-                                                assembled.sections.get(name, b"")))
-            assert mine.relocations.get(name, []) == assembled.relocations.get(name, []), name
-    if ours[:4] == b"\x7fELF":
-        written, expected = _frames(ours), _frames(theirs)
-        for start in sorted(set(written) | set(expected)):
-            assert written.get(start) == expected.get(start), (
-                f"the function at .text + {start:#x}: written {written.get(start)}, "
-                f"assembled {expected.get(start)}")
-
-
-def _object(path: Path, *flags: str) -> bytes:
-    result = subprocess.run(
-        toolchain.command(bootc.binary(), "build", *flags, "-f", "obj", "-o", "-", str(path)),
-        cwd=REPO_ROOT, capture_output=True)
-    assert result.returncode == 0, result.stderr.decode()[-4000:]
-    return result.stdout
-
-
-def _assembled(text: str, assembler: list[str]) -> bytes:
+def _compare_with_assembler(path: Path, text: str) -> None:
+    """`path` written as an executable, against the system assembler's object
+    of `text`, its assembly, both from the repository's root."""
     with tempfile.TemporaryDirectory() as directory:
-        source, obj = Path(directory) / "t.s", Path(directory) / "t.o"
+        source, theirs = Path(directory) / "t.s", Path(directory) / "theirs.o"
+        ours = Path(directory) / "ours"
         source.write_text(text, encoding="utf-8")
-        result = subprocess.run([*assembler, "-c", "-o", str(obj), str(source)],
+        result = subprocess.run([*toolchain.cc(), "-c", "-o", str(theirs), str(source)],
                                 capture_output=True, text=True)
         assert result.returncode == 0, result.stderr[:4000]
-        return obj.read_bytes()
+        written = subprocess.run(
+            toolchain.command(bootc.binary(), "build", "-o", str(ours), str(path)),
+            cwd=REPO_ROOT, capture_output=True, text=True)
+        assert written.returncode == 0, written.stderr[-4000:]
+        _unwind_agrees(ours, theirs)
 
 
 @pytest.mark.parametrize("name", CORPUS)
-def test_the_object_has_the_assemblers_unwind_sections(name):
+def test_the_executable_has_the_assemblers_unwind_information(name):
     paths = [PROGRAMS / n for n in CORPUS]
     texts = bootc.boot_each("asm", paths, _split)
-    path = PROGRAMS / name
-    _agree(_object(path), _assembled(texts[path], toolchain.cc()), exact=True)
+    _compare_with_assembler(PROGRAMS / name, texts[PROGRAMS / name])
 
 
 @pytest.mark.bootstrap
-def test_the_object_has_the_assemblers_unwind_sections_on_the_compiler():
+def test_the_executable_has_the_assemblers_unwind_information_on_the_compiler():
     main = bootc.BOOT_MAIN
-    text = bootc.boot_each("asm", [main], _split)[main]
-    _agree(_object(main), _assembled(text, toolchain.cc()), exact=True)
-
-
-@functools.lru_cache(maxsize=None)
-def _llvm_elf() -> list[str] | None:
-    """A clang that assembles for arm64 Linux, which is how ELF's unwind
-    sections are checked on a Mac."""
-    clang = shutil.which("clang")
-    if clang is None:
-        return None
-    command = [clang, "--target=aarch64-linux-gnu"]
-    with tempfile.TemporaryDirectory() as directory:
-        source = Path(directory) / "t.s"
-        source.write_text("    .text\nf:\n    .cfi_startproc\n    ret\n    .cfi_endproc\n")
-        result = subprocess.run([*command, "-c", "-o", str(Path(directory) / "t.o"),
-                                 str(source)], capture_output=True)
-    return command if result.returncode == 0 else None
-
-
-@pytest.mark.parametrize("name", CORPUS)
-def test_the_elf_object_has_llvms_unwind_rows(name):
-    """ELF from either platform, against LLVM's assembler: the same rows,
-    though not the same bytes."""
-    if toolchain.target() == "arm64-linux":
-        pytest.skip("GNU as is the oracle on Linux, byte for byte")
-    assembler = _llvm_elf()
-    if assembler is None:
-        pytest.skip("no clang that assembles for aarch64-linux-gnu")
-    paths = [PROGRAMS / n for n in CORPUS]
-    texts = bootc.boot_each("asm", paths, _split, flags=("--target", "arm64-linux"))
-    path = PROGRAMS / name
-    _agree(_object(path, "--target", "arm64-linux"), _assembled(texts[path], assembler),
-           exact=False)
+    _compare_with_assembler(main, bootc.boot_each("asm", [main], _split)[main])
 
 
 # -- the tools -----------------------------------------------------------------

@@ -5,9 +5,9 @@ Three settings, split with shell-word rules:
 * `$TURKEY_CC` is the C compiler, `cc` when unset. It compiles the C probes
   some tests run beside a program, and assembles `boot`'s assembly where a
   test checks it with the system assembler. On an x86-64 machine checking
-  arm64 output it is a cross compiler, and it links statically: a dynamically
-  linked arm64 binary under qemu-user needs an arm64 libc to load, and a
-  static one needs nothing.
+  arm64 output it is a cross compiler, and links the bootstrap compiler
+  statically. Everything `boot` writes is dynamically linked against glibc,
+  which qemu-user loads from where `$QEMU_LD_PREFIX` names.
 * `$TURKEY_OPENSSL` is where OpenSSL 3 is installed, for a program that
   imports `Net.TLS`: its `lib/`, `include/` and `bin/openssl`. Unset on macOS
   it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by

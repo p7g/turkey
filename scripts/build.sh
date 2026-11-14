@@ -45,10 +45,13 @@
 #
 #   --out DIR        where the stages go (default build/stages)
 #   --target TARGET  arm64-darwin or arm64-linux (default: what $CC links for)
-#   --fixpoint       also build stage3 and check stage3's output equals stage2's
+#   --fixpoint       also build stage3 and stage4, and check that stage4 is
+#                    stage3, byte for byte
 #   --stage1 BINARY  use an existing compiler as stage1 instead of the committed
-#                    assembly; how the first bump was made, and how to bump
-#                    across a change the committed compiler cannot build
+#                    assembly; how to bump across a change the committed
+#                    compiler cannot build. It must accept
+#                    `build -o PATH -f exe --target TARGET`, which a compiler
+#                    older than the executable writer does not
 #   --stage1-only    stop after stage1: what scripts/test.sh compiles the test
 #                    harness with
 

@@ -17,8 +17,8 @@
 # commit's compiler, and so that PROVENANCE names one commit, not two.
 #
 # --stage1 is how to bump across a change the committed compiler cannot build:
-# start from a compiler built before the change. The first bump was made that
-# way, from the last compiler the Python implementation built.
+# start from a compiler built before the change. It must write executables
+# (`build -f exe`), which a compiler older than the executable writer cannot.
 #
 # Usage: scripts/bump-bootstrap.sh [--stage1 BINARY] [--target TARGET]
 #
@@ -75,6 +75,27 @@ $target gz-sha256: $(sha "$BOOTSTRAP/$target.s.gz")
 EOF
 done
 mv "$OUT/PROVENANCE" "$BOOTSTRAP/PROVENANCE"
+
+# The assembly is not what the fixed point compared: no stage after stage1 is
+# built from assembly. So build stage1 from what was just committed and check
+# that it writes stage3, byte for byte, as stage3 writes itself.
+# Only --target is passed on, so that this stage1 is the committed one.
+target=
+previous=
+for argument in "$@"; do
+    if [ "$previous" = --target ]; then
+        target=$argument
+    fi
+    previous=$argument
+done
+sh scripts/build.sh --out "$OUT/committed" --stage1-only ${target:+--target "$target"}
+TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -o "$OUT/committed/written" -f exe \
+    ${target:+--target "$target"} src/Main.gob
+if ! cmp -s "$OUT/committed/written" "$OUT/stage3"; then
+    echo "bump-bootstrap.sh: the committed assembly, linked, does not write the" \
+         "fixed point's compiler; restore bootstrap/ with git checkout -- bootstrap" >&2
+    exit 1
+fi
 
 echo
 echo "bootstrap/ now holds $(git rev-parse --short HEAD)'s compiler. Commit it alone:"

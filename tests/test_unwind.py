@@ -523,7 +523,7 @@ def _gdb() -> str:
 
 
 def _stops(directory: Path, function: str) -> dict[str, int]:
-    """The addresses in the linked program to stop at in `function`: its
+    """The addresses in the executable to stop at in `function`: its
     first instruction, and its first `ret`."""
     symbols = [(a, n) for a, kind, n in _symbols(directory / "prog") if kind in "Tt"]
     start = next(a for a, n in symbols if n == function)

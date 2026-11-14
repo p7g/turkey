@@ -69,10 +69,18 @@ def _write_boot(compiler: Path, output: Path) -> None:
 def _stage3() -> Path:
     """The executable stage2 writes for the compiler's own source: a compiler
     built by today's source rather than by the committed one."""
-    output = CACHE / f"stage3-{bootc.build_key()}"
+    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
+    # `build_key` covers the binary and `lib/` alone, and stage3 is
+    # today's `src/` too.
+    h = hashlib.sha256(bootc.build_key().encode())
+    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
+        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
+        h.update(path.read_bytes())
+    key = h.hexdigest()[:16]
+    output = CACHE / f"stage3-{key}"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
-        staging = CACHE / f"stage3-{bootc.build_key()}-{os.getpid()}"
+        staging = CACHE / f"stage3-{key}-{os.getpid()}"
         try:
             _write_boot(bootc.binary(), staging)
             os.replace(staging, output)

@@ -30,8 +30,6 @@ What still needs importing:
 
 - `System.IO`, `System.Env`, `Data.Set` -- not among the Prelude's qualifiers.
 - other `Turkey.*` modules.
-- `Iter`, as `import Iter`: the compiler in `bootstrap/`, which builds `src/`,
-  does not qualify it.
 
 `import Turkey.Ast` gives `Turkey.Ast.Expr` and no bare names; a module that
 works on the tree writes `import Turkey.Ast (..)`, and one whose own `Pred`

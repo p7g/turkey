@@ -11,6 +11,7 @@ To record new output, run with `TURKEY_BLESS_MARKDOWN=1`, and read the diff of
 """
 
 import os
+import re
 from pathlib import Path
 
 from tests import lang
@@ -41,3 +42,12 @@ def test_no_raw_html_is_passed_through() -> None:
     for chunk in _rendered().split("<")[1:]:
         name = chunk.split(">")[0].split(" ")[0].lstrip("/")
         assert name in tags, chunk[:60]
+
+
+def test_every_href_has_an_allowed_scheme_or_none() -> None:
+    allowed = {"http", "https", "mailto", "ftp"}
+    hrefs = re.findall(r'href="([^"]*)"', _rendered())
+    assert hrefs
+    for href in hrefs:
+        scheme = re.match(r"([^:/?#]*):", href)
+        assert scheme is None or scheme.group(1).lower() in allowed, href

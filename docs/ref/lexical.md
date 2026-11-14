@@ -45,7 +45,7 @@ after it:
 * a constructor or a record field.
 
 The first run before a module's first declaration that is not directly above
-that declaration documents the module itself. `boot doc` reads doc comments;
+that declaration documents the module itself. `turkey doc` reads doc comments;
 ordinary comments, `----` rules and block comments are never documentation.
 
 <!-- run -->

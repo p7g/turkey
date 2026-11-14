@@ -2,11 +2,13 @@
 # Build the compiler from the committed bootstrap, with no Python involved.
 #
 #   stage1  the committed assembly (bootstrap/), linked
-#   stage2  stage1 compiling today's source to an object, linked -- the result
+#   stage2  stage1 compiling today's source to an object, linked -- the result,
+#           written as `turkey`, the name the compiler is run by
 #   stage3  stage2 compiling the same source             (--fixpoint only)
 #   stage4  stage3's object, which must equal stage3's   (--fixpoint only)
 #
-# Stage N is built by stage N-1. stage2 is today's source compiled by the
+# Stage N is built by stage N-1, and is the file stageN in --out, except
+# stage2, which is the file `turkey`. stage2 is today's source compiled by the
 # committed compiler: correct if that one is, but its code is whatever an older
 # compiler emitted. stage3 is today's source compiled by today's source, and the
 # fixed point is that stage3 emits exactly the object it was built from.
@@ -199,15 +201,15 @@ if [ $only1 = 1 ]; then
 fi
 
 emit "$out/stage1" "$out/stage2.o"
-link "$out/stage2.o" "$out/stage2"
+link "$out/stage2.o" "$out/turkey"
 
 if [ $fixpoint = 1 ]; then
-    emit "$out/stage2" "$out/stage3.o"
+    emit "$out/turkey" "$out/stage3.o"
     link "$out/stage3.o" "$out/stage3"
     emit "$out/stage3" "$out/stage4.o"
     step "compare stage3.o stage4.o"
     if ! cmp -s "$out/stage3.o" "$out/stage4.o"; then
-        assembly "$out/stage2" > "$out/stage3.s"
+        assembly "$out/turkey" > "$out/stage3.s"
         assembly "$out/stage3" > "$out/stage4.s"
         difference=$(cmp "$out/stage3.s" "$out/stage4.s")
         echo "build.sh: no fixpoint: ${difference:-the objects differ, the assembly does not}" >&2
@@ -220,4 +222,4 @@ if [ $fixpoint = 1 ]; then
     fi
 fi
 
-step "done: $out/stage2"
+step "done: $out/turkey"

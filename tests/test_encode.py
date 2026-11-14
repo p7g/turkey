@@ -1,7 +1,7 @@
 """The `listing` dump: the encoder's words, checked against the system
 assembler.
 
-The oracle is exact and needs no list of instructions to test. `boot build`
+The oracle is exact and needs no list of instructions to test. `turkey build`
 writes a program's code as assembly and the `listing` dump lists the words the
 encoder makes of the same instructions; the assembler turns the printed text into an object, and
 its code section has to equal the listing word for word. So every instruction
@@ -14,7 +14,7 @@ assembler either leaves it to the linker or resolves it against a layout of
 its own. Everything else in the word is compared.
 
 The assembler is `$TURKEY_CC -c`, so on Linux it is the GNU or LLVM one rather
-than Apple's, and the check is for whichever target `boot` was built for.
+than Apple's, and the check is for whichever target `turkey` was built for.
 """
 
 from __future__ import annotations
@@ -114,7 +114,7 @@ def test_the_encoder_agrees_with_the_assembler(name):
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_the_encoder_agrees_with_the_assembler_on_the_compiler():
-    """`boot` itself: two million words, and every instruction form the
+    """`turkey` itself: two million words, and every instruction form the
     corpus is too small to reach."""
     listings, natives = _both([bootc.BOOT_MAIN])
     _compare(listings[bootc.BOOT_MAIN], natives[bootc.BOOT_MAIN])

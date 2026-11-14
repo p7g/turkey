@@ -1,10 +1,10 @@
-"""The language as `boot` compiles it: check, run, and what either reports.
+"""The language as `turkey` compiles it: check, run, and what either reports.
 
 The behavioral tests -- a program's output, a diagnostic's text, a panic's
-message -- say what Turkey does, and every one of them asks the compiled `boot`
+message -- say what Turkey does, and every one of them asks the compiled `turkey`
 through this module.
 
-A program is compiled the way a user would compile it: `boot build` from the
+A program is compiled the way a user would compile it: `turkey build` from the
 program's own directory, so a diagnostic quotes the file by its bare name, to
 a relocatable object, then linked against the runtime with the C compiler,
 then run, both as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
@@ -15,9 +15,9 @@ sources, because a behavioral suite is hundreds of small programs and under
 `pytest -n auto` any of them may be asked for by any worker. Running is not
 cached: it is the thing being tested, and it takes milliseconds.
 
-A compile error ends a `boot` process -- a diagnostic is reported by exiting --
+A compile error ends a `turkey` process -- a diagnostic is reported by exiting --
 so each program is its own invocation. That is also what makes this cheap:
-the native `boot` checks a small program in a fraction of a second.
+the native `turkey` checks a small program in a fraction of a second.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ Source = str | Path
 
 
 class CompileError(AssertionError):
-    """`boot` rejected the program.
+    """`turkey` rejected the program.
 
     `rendered` is what it printed on stderr -- `file:line:col: stage: message`
     -- and `message` is the message alone, which is what a test usually means.
@@ -139,7 +139,7 @@ def _entry(src: Source, modules: dict[str, str] | None) -> Path:
 
 
 def _key(output: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
-    """The cache key for one output of `boot` (`bootc.argv`) on `entry`.
+    """The cache key for one output of `turkey` (`bootc.argv`) on `entry`.
 
     The entry's own bytes and every `.gob` beside and below it, which is what
     it can import -- except in `tests/programs`, whose single-file programs
@@ -248,7 +248,7 @@ def run(src: Source, modules: dict[str, str] | None = None,
         flags: tuple[str, ...] = ()) -> Result:
     """Compile and run. Raises `CompileError` if it does not compile.
 
-    `flags` are `boot`'s, for the compile: `--gc-verify`, `--gc-stats`.
+    `flags` are `turkey`'s, for the compile: `--gc-verify`, `--gc-stats`.
 
     The program runs in its own directory unless `cwd` says otherwise -- which
     a program that writes files should, since the directory a source string is
@@ -294,7 +294,7 @@ def output(src: Source, modules: dict[str, str] | None = None) -> str:
 def fails(src: Source, modules: dict[str, str] | None = None) -> str:
     """A program that is expected not to compile, and its message.
 
-    Checked with `boot check`, which reports what the front end and the
+    Checked with `turkey check`, which reports what the front end and the
     lowering to Core refuse -- the same thing `driver.check` raised on.
     """
     try:
@@ -368,7 +368,7 @@ def panic_trace(result: Result) -> list[tuple[str, str]]:
 
 def dump(stage: str, src: Source,
          modules: dict[str, str] | None = None) -> Result:
-    """`boot check --dump <stage>` on one program -- `types`, `core`, `mono`,
+    """`turkey check --dump <stage>` on one program -- `types`, `core`, `mono`,
     `opt` -- from the program's own directory. Not cached; a dump is what is
     tested."""
     result = _boot(stage, _entry(src, modules))

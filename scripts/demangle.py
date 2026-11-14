@@ -13,7 +13,7 @@ Everything else passes through unchanged.
 For a profiler or a crash report that reads no DWARF, or a build without
 `-g`. `display_name` is `Turkey.Demangle.displayName` written again, and
 `tests/test_debug_info.py` checks the two against each other on every
-function `boot -g` names; the rules are in `src/Turkey/Demangle.gob`.
+function `turkey -g` names; the rules are in `src/Turkey/Demangle.gob`.
 """
 import re
 import sys

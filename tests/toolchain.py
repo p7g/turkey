@@ -11,7 +11,7 @@ Two settings, both split with shell-word rules:
   it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by
   the compiler and on `$PATH`.
 * `$TURKEY_RUN` is a prefix for executing anything the compiler linked -- a
-  test program or a built `boot`. Empty means run it directly, which is right
+  test program or a built `turkey`. Empty means run it directly, which is right
   natively and also under qemu-user once binfmt_misc knows the format; the
   prefix (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
@@ -79,9 +79,9 @@ def openssl_libraries() -> list[str]:
 
 
 def openssl_dylib_path() -> str | None:
-    """The `$TURKEY_DYLIB_PATH` for an executable `boot` writes itself, for a
+    """The `$TURKEY_DYLIB_PATH` for an executable `turkey` writes itself, for a
     program that imports `Net.TLS`: the `lib/` of the same installation the
-    tests link with, or None for the places `boot` searches by default."""
+    tests link with, or None for the places `turkey` searches by default."""
     prefix = _openssl_prefix()
     return str(prefix / "lib") if prefix else None
 
@@ -137,7 +137,7 @@ def identity() -> bytes:
 def machine() -> str:
     """The triple `$TURKEY_CC -dumpmachine` reports, or "" if it cannot say.
 
-    `scripts/build.sh` chooses its target from the same triple, and `boot`
+    `scripts/build.sh` chooses its target from the same triple, and `turkey`
     emits for the target it was built for, so this is also what the tests'
     programs are compiled for.
     """
@@ -150,7 +150,7 @@ def machine() -> str:
 
 def target() -> str:
     """The `--target` spelling for what `$TURKEY_CC` links for, which is the
-    target `boot` was built for and so its default; "" for a triple that
+    target `turkey` was built for and so its default; "" for a triple that
     names neither. The same patterns as `scripts/build.sh`'s."""
     triple = machine()
     if triple.startswith(("arm64-apple-darwin", "arm64-apple-macos",
@@ -162,7 +162,7 @@ def target() -> str:
 
 
 def c_symbol(name: str) -> str:
-    """How `boot`'s assembly spells the C symbol `name` for the target it
+    """How `turkey`'s assembly spells the C symbol `name` for the target it
     was built for: Mach-O puts an underscore before it, and ELF does not."""
     return "_" + name if target() == "arm64-darwin" else name
 

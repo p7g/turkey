@@ -7,9 +7,9 @@ from one instruction to the next and so are a DWARF description in
 `__eh_frame`. On ELF it is `.eh_frame`, exact at every instruction.
 
 **The object's oracle is the assembler**, as for the line table: the unwind
-sections `boot` writes into an object are the ones the system assembler makes
-of `boot`'s own assembly, whose `.cfi_*` directives say the same rules, for
-the test programs and for `boot` itself. Byte for byte, with the relocations
+sections `turkey` writes into an object are the ones the system assembler makes
+of `turkey`'s own assembly, whose `.cfi_*` directives say the same rules, for
+the test programs and for `turkey` itself. Byte for byte, with the relocations
 compared by what they resolve to, since the assembler names a section's
 start by a symbol of its own. Where the assembler is not the format's own --
 LLVM writing ELF, on macOS -- the two `.eh_frame`s are compared by the rows
@@ -42,8 +42,8 @@ LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
 
-# Assembly through the system assembler and an object `boot` writes, each
-# linked by the C compiler, and an executable `boot` writes with nothing
+# Assembly through the system assembler and an object `turkey` writes, each
+# linked by the C compiler, and an executable `turkey` writes with nothing
 # linked.
 PATHS = ["asm", "obj", "exe"]
 
@@ -337,7 +337,7 @@ def _frames(data: bytes) -> dict[int, tuple]:
 # -- the object against the assembler ------------------------------------------
 
 def _agree(ours: bytes, theirs: bytes, exact: bool) -> None:
-    """`boot`'s object, `ours`, carries the unwind sections the assembler put
+    """`turkey`'s object, `ours`, carries the unwind sections the assembler put
     in `theirs`: the same bytes and relocations if `exact`, and on ELF the
     same rows either way."""
     mine, assembled = _Object(ours), _Object(theirs)
@@ -428,9 +428,9 @@ def test_the_elf_object_has_llvms_unwind_rows(name):
 @functools.lru_cache(maxsize=None)
 def _built(program: str, how: str) -> Path:
     """A program of `SOURCES` as `prog`, in a directory of its own: linked
-    beside its object, through the assembler for `asm` or written by `boot`
+    beside its object, through the assembler for `asm` or written by `turkey`
     for `obj`, and not position-independent on Linux, so that the addresses
-    `nm` reads are the ones gdb stops at; or written by `boot` for `exe`."""
+    `nm` reads are the ones gdb stops at; or written by `turkey` for `exe`."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-unwind-"))
     (directory / "prog.gob").write_text(SOURCES[program], encoding="utf-8")
     output = {"asm": "prog.s", "obj": "prog.o", "exe": "prog"}[how]
@@ -577,7 +577,7 @@ def _stops(directory: Path, function: str) -> dict[str, int]:
 
 def _gdb_break(directory: Path, function: str, where: str) -> str:
     """gdb's command to stop at `where` in `function`, as `_stops` finds it,
-    named as a distance from the function's symbol. An executable `boot`
+    named as a distance from the function's symbol. An executable `turkey`
     writes is position-independent, and gdb moves a breakpoint named by a
     symbol to where the program is loaded, but not one named by an address."""
     stops = _stops(directory, function)

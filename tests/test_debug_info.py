@@ -1,7 +1,7 @@
-"""`boot build -g`: a line table and the DWARF a debugger needs to find it.
+"""`turkey build -g`: a line table and the DWARF a debugger needs to find it.
 
 `-g` works on both of `build`'s paths. As assembly, the `.file`/`.loc` rows
-are what the system assembler turns into `debug_line`; as an object, `boot`
+are what the system assembler turns into `debug_line`; as an object, `turkey`
 builds `debug_line` itself from the same rows. On both, `Turkey.Dwarf` writes
 the compile unit, the subprograms, and an inlined subroutine for each call the
 optimizer inlined. So the checks are the tools a user would reach for, on a
@@ -11,22 +11,22 @@ line and names the frames, inlined calls among them, and on macOS `atos`, which
 reads DWARF the way `sample` and Instruments do, names the inlined frames
 too.
 
-**The object's oracle is the assembler.** The object `boot` writes with `-g`
-has to carry the debug sections the system assembler makes of `boot`'s own
-`-g` assembly, for the test programs and for `boot` itself. On macOS that is
+**The object's oracle is the assembler.** The object `turkey` writes with `-g`
+has to carry the debug sections the system assembler makes of `turkey`'s own
+`-g` assembly, for the test programs and for `turkey` itself. On macOS that is
 exact: every debug section has the same bytes, and the same relocations.
 GNU `as` encodes the line table its own way -- other opcodes for the same
 advances, its own file and directory tables -- so on Linux `debug_line` and
 `debug_line_str` are compared by the rows they decode to, each row's file by
 its full path. The other debug sections are compared byte for byte there too,
 and their relocations by what they resolve to: GNU `as` relocates against a
-local symbol's section where `boot` names the symbol.
+local symbol's section where `turkey` names the symbol.
 
 A tool that is missing skips its test and says which, rather than passing.
 
 The other half is that `-g` changes no code. Positions ride on every
 instruction through the backend, so a position that reached a decision would
-show up here first: `boot` built with and without `-g` has the same code
+show up here first: `turkey` built with and without `-g` has the same code
 section, byte for byte.
 """
 
@@ -54,8 +54,8 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
 
 # The three ways `build -g` makes a program: assembly through the system
-# assembler, an object `boot` writes, each linked by the C compiler, and an
-# executable `boot` writes with nothing linked.
+# assembler, an object `turkey` writes, each linked by the C compiler, and an
+# executable `turkey` writes with nothing linked.
 PATHS = ["asm", "obj", "exe"]
 
 PROGRAM = """\
@@ -219,8 +219,8 @@ def _needs_dwarfdump() -> str:
 def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
     """`program` built with `level`, `-g` or a `--debug`, as `prog` in a
     directory of its own. `how` is `asm`, through `prog.s` and the assembler,
-    or `obj`, with `boot` writing the object, each linked with `prog.o`
-    beside it as the macOS debug map needs; or `exe`, with `boot` writing
+    or `obj`, with `turkey` writing the object, each linked with `prog.o`
+    beside it as the macOS debug map needs; or `exe`, with `turkey` writing
     `prog` itself."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
@@ -248,7 +248,7 @@ def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
 
 def _dwarf(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
     """The file that holds `program`'s DWARF: the object, or the executable
-    `boot` wrote."""
+    `turkey` wrote."""
     return _built(how, program, level) / ("prog" if how == "exe" else "prog.o")
 
 
@@ -296,7 +296,7 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level)
 def test_the_dwarf_verifies(how, which, program, level):
     tool = _needs_dwarfdump()
     if how == "exe" and which == "prog.o":
-        pytest.skip("an executable boot writes has no object")
+        pytest.skip("an executable turkey writes has no object")
     result = subprocess.run([tool, "--verify", str(_built(how, program, level) / which)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
@@ -670,7 +670,7 @@ def test_the_macos_linker_records_the_object_in_the_debug_map(how):
     if not _darwin():
         pytest.skip("the debug map is Mach-O's")
     if how == "exe":
-        pytest.skip("an executable boot writes carries its DWARF and needs no debug map")
+        pytest.skip("an executable turkey writes carries its DWARF and needs no debug map")
     result = subprocess.run(["nm", "-ap", str(_built(how) / "prog")],
                             capture_output=True, text=True, check=True)
     assert re.search(r" OSO .*prog\.o$", result.stdout, re.MULTILINE), result.stdout[-2000:]
@@ -872,10 +872,10 @@ def test_the_filter_names_each_function_as_the_dwarf_does(program):
 
 @pytest.mark.bootstrap
 def test_the_filter_names_each_function_of_the_compiler_as_the_dwarf_does():
-    """`boot` itself, whose namers make every kind of name: instances and
+    """`turkey` itself, whose namers make every kind of name: instances and
     their methods, defaults, specializations, layout copies and lambdas."""
     with tempfile.TemporaryDirectory() as directory:
-        obj = Path(directory) / "boot.o"
+        obj = Path(directory) / "turkey.o"
         obj.write_bytes(_object(bootc.BOOT_MAIN))
         _check_display_names(obj)
 
@@ -1038,7 +1038,7 @@ def _first_difference(ours: bytes, theirs: bytes) -> str:
 
 
 def _agree(ours: Path, theirs: Path) -> None:
-    """`boot`'s object, `ours`, carries the debug sections the assembler put
+    """`turkey`'s object, `ours`, carries the debug sections the assembler put
     in `theirs`, from the same program."""
     mine, assembled = _Object(ours.read_bytes()), _Object(theirs.read_bytes())
     exact = _darwin()
@@ -1092,7 +1092,7 @@ def test_the_object_has_the_assemblers_debug_sections(name):
 
 @pytest.mark.bootstrap
 def test_the_object_has_the_assemblers_debug_sections_on_the_compiler():
-    """`boot` itself: four hundred thousand rows, from every file of the
+    """`turkey` itself: four hundred thousand rows, from every file of the
     compiler and the library."""
     main = bootc.BOOT_MAIN
     _compare_with_assembler(main, bootc.boot_each("asm", [main], _split, flags=("-g",))[main])
@@ -1116,7 +1116,7 @@ def _assembled_code(text: str, flags: list[str]) -> bytes:
 
 @pytest.mark.bootstrap
 def test_debug_information_changes_no_code():
-    """`boot` itself, with and without `-g`: the same code section. Every
+    """`turkey` itself, with and without `-g`: the same code section. Every
     debug-information change keeps this test, since it is the one that sees a
     position reach code generation."""
     main = bootc.BOOT_MAIN

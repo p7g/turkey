@@ -1,11 +1,11 @@
-"""The object writer: `boot`'s relocatable object means what the system
+"""The object writer: `turkey`'s relocatable object means what the system
 assembler's means for the same program.
 
 Not the same bytes. The two may spell a reference differently -- the assembler
 reaches a label in another section through a section-start symbol and an
-addend, `boot` through a symbol of the label's own for a page relocation and
+addend, `turkey` through a symbol of the label's own for a page relocation and
 through the label's section for an address word; the assembler leaves a call
-to a global function in the same section to the linker, `boot` fills it in --
+to a global function in the same section to the linker, `turkey` fills it in --
 and either is correct. What has to agree is what the linker makes of them.
 
 So each object is linked here, roughly: its sections gathered by name in file
@@ -15,9 +15,9 @@ relocation is applied, and the two objects must give the same bytes in every
 output section and define the same named symbols at the same addresses, with
 the same binding, and leave the same symbols undefined.
 
-Only for the target `boot` was built for, since the assembler is
+Only for the target `turkey` was built for, since the assembler is
 `$TURKEY_CC -c`. `tests/lang.py` links every behavioral test's program from
-`boot`'s object, which is the check that decides; this one says where a
+`turkey`'s object, which is the check that decides; this one says where a
 difference is when that check fails.
 """
 
@@ -321,7 +321,7 @@ def _link(obj: Obj) -> Linked:
 
 
 def _objects(entry: Path) -> tuple[bytes, bytes]:
-    """`boot`'s object for the program, and the assembler's from `boot`'s
+    """`turkey`'s object for the program, and the assembler's from `turkey`'s
     assembly."""
     with tempfile.TemporaryDirectory() as directory:
         ours = Path(directory) / "ours.o"
@@ -386,7 +386,7 @@ def test_no_label_in_the_code_has_a_symbol():
 
 
 def _ours(entry: Path) -> bytes:
-    """`boot`'s object for the program, alone."""
+    """`turkey`'s object for the program, alone."""
     with tempfile.TemporaryDirectory() as directory:
         ours = Path(directory) / "ours.o"
         env = dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib"))

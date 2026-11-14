@@ -11,7 +11,7 @@ program wrongly accepted rather than as a crash.
 The cases were generated once from seeded RNGs, with a naive substitution
 checker answering, and written to `tests/infer_corpus.json`. The generator and
 the naive checker are not kept; the frozen corpus is the
-oracle, and is what `boot` is held to. `expected` is `null` for a program the
+oracle, and is what `turkey` is held to. `expected` is `null` for a program the
 naive checker rejected, and for the three it accepted with an ambiguous type
 (seeds 299, 559 and 598): each reads a field of a numeric literal, so its type
 is `[OneOf c {Int, Float}, HasField "a" c] ... -> Field.a c`, and no use can
@@ -44,11 +44,11 @@ def test_levels_agree_with_scanning_the_environment(case: dict) -> None:
         actual = lang.types(src)
     except lang.CompileError as error:
         assert expected is None, (
-            f"boot rejected a program the naive checker accepted:\n\n{src}\n"
+            f"turkey rejected a program the naive checker accepted:\n\n{src}\n"
             f"{error.rendered}")
         return
     assert expected is not None, (
-        f"boot accepted a program the naive checker rejected:\n\n{src}\n{actual}")
+        f"turkey accepted a program the naive checker rejected:\n\n{src}\n{actual}")
     assert [(name, actual.get(name)) for name, _ in expected] == \
         [tuple(pair) for pair in expected], src
 

@@ -1,4 +1,4 @@
-"""`boot build --timings`: each phase's time, the backend's spread over
+"""`turkey build --timings`: each phase's time, the backend's spread over
 functions, and the optimizer's dependency structure, on stderr."""
 
 import re

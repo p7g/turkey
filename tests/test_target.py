@@ -40,7 +40,7 @@ fun main() {
 }
 """
 
-# What `MATCHES` prints compiled for each target: `boot`'s default is the
+# What `MATCHES` prints compiled for each target: `turkey`'s default is the
 # target it was built for, which is what `$TURKEY_CC` links for.
 MATCHED = {"arm64-darwin": "SIGBUS\nother\n8\n",
            "arm64-linux": "other\nSIGBUS\n8\n"}
@@ -64,14 +64,14 @@ def test_an_unknown_target_is_refused() -> None:
     result = _boot("check", "--target", "x86_64-linux", str(SOURCE))
     assert result.returncode == 2
     assert result.stderr.decode() == (
-        "boot: unknown target 'x86_64-linux'; supported: arm64-darwin, "
+        "turkey: unknown target 'x86_64-linux'; supported: arm64-darwin, "
         "arm64-linux\n")
 
 
 def test_target_without_a_value_is_refused() -> None:
     result = _boot("check", str(SOURCE), "--target")
     assert result.returncode == 2
-    assert result.stderr.decode() == "boot: --target needs a value\n"
+    assert result.stderr.decode() == "turkey: --target needs a value\n"
 
 
 def test_a_target_match_runs_the_chosen_arm() -> None:

@@ -7,7 +7,7 @@ writes, and how deep it may recurse before the host gives out.
 
 This is the floor roadmap item 9 is built on -- a compiler reads a file named
 on its command line and answers with a status -- so it is checked as a floor,
-end to end: compiled by `boot`, run as a native program (`tests.lang`), rather
+end to end: compiled by `turkey`, run as a native program (`tests.lang`), rather
 than by unit-testing the primitives underneath it.
 """
 

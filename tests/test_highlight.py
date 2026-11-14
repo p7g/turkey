@@ -12,7 +12,7 @@ Everything is compared as bytes, so a carriage return the highlighter drops or
 adds is a failure rather than something newline translation hides.
 
 The highlighter is a compiler module, so a driver beside a `Turkey` link to
-`src/Turkey/` imports it, as `boot` itself does.
+`src/Turkey/` imports it, as `turkey` itself does.
 
 To record new output, run with `TURKEY_BLESS_HIGHLIGHT=1`, and read the diff
 of `tests/highlight/*.html` before committing it.

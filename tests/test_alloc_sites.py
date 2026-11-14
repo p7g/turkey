@@ -1,6 +1,6 @@
 """`src/Turkey/Sites.gob`: counting allocations by the instruction that made them.
 
-`TURKEY_ALLOC_SITES=1 boot build` numbers every allocating instruction on
+`TURKEY_ALLOC_SITES=1 turkey build` numbers every allocating instruction on
 stderr and makes the program write one counter per site when `main` returns.
 These pin that the numbering and the counts line up, and that a site runs as
 often as the program says it does.

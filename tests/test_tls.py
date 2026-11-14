@@ -9,7 +9,7 @@ never by turning verification off, which `Net.TLS` cannot do.
 
 Each program links with OpenSSL (`toolchain.openssl_libraries()`); a machine
 where that does not link skips these, unless `$TURKEY_REQUIRE_OPENSSL` says
-it must. One is also written as an executable by `boot` itself, with no
+it must. One is also written as an executable by `turkey` itself, with no
 linker, which loads `libssl` and `libcrypto` by the names its declarations
 give them.
 """

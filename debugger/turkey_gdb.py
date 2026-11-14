@@ -1,4 +1,4 @@
-"""gdb pretty-printers for programs `boot build -g` compiled.
+"""gdb pretty-printers for programs `turkey build -g` compiled.
 
 A program built with `-g` for Linux names this file in its
 `.debug_gdb_scripts` section. gdb looks for a file named there in the
@@ -73,7 +73,7 @@ def _record(obj: gdb.Value) -> gdb.Value:
 
 def _runtime() -> dict[str, int]:
     """The program's runtime constants, from the `Turkey.Runtime`
-    enumeration `boot build -g` writes."""
+    enumeration `turkey build -g` writes."""
     constants = gdb.lookup_type("Turkey.Runtime").strip_typedefs()
     return {field.name: int(field.enumval) for field in constants.fields()}
 

@@ -1,6 +1,6 @@
 """Exercise Turkey.Entry's argument, exit, panic and crash handling.
 
-`boot build` produces standalone binaries. Panic reports contain the
+`turkey build` produces standalone binaries. Panic reports contain the
 message alone; a crash report names the functions on the root chain.
 """
 
@@ -26,8 +26,8 @@ pytestmark = pytest.mark.skipif(toolchain.missing(),
 
 
 def _boot_binary(source: Path, tmp_path: Path) -> Path:
-    """`boot build`, linked."""
-    # From the repository, where `boot` finds `lib/`.
+    """`turkey build`, linked."""
+    # From the repository, where `turkey` finds `lib/`.
     output = tmp_path / source.stem
     bootc.link(source, output)
     return output

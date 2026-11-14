@@ -132,18 +132,18 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
 
 @pytest.mark.bootstrap
 @pytest.mark.skipif(toolchain.target() not in ("arm64-darwin", "arm64-linux"),
-                    reason="runs the executable boot writes")
+                    reason="runs the executable turkey writes")
 def test_an_executable_boot_writes_itself_byte_for_byte(tmp_path):
     """The fixed point through the executable writer, with nothing linked.
 
-    Stage2 writes `boot` as an executable, which writes itself again; the
-    two must be the same bytes. Both are named `boot`, since a Mach-O's
-    signature names the file. The written `boot` must also emit the same
+    Stage2 writes `turkey` as an executable, which writes itself again; the
+    two must be the same bytes. Both are named `turkey`, since a Mach-O's
+    signature names the file. The written `turkey` must also emit the same
     assembly for the compiler as stage2, so that it is the compiler stage3
     is and not merely one that reproduces itself.
     """
-    first = tmp_path / "first" / "boot"
-    second = tmp_path / "second" / "boot"
+    first = tmp_path / "first" / "turkey"
+    second = tmp_path / "second" / "turkey"
     for directory in (first.parent, second.parent):
         directory.mkdir()
     for compiler, output in ((bootc.binary(), first), (first, second)):
@@ -179,9 +179,9 @@ def _stressed(boot: Path | None = None, **settings: str) -> str:
 @pytest.mark.bootstrap
 @pytest.mark.parametrize("seed", ["1", "2", "3"])
 def test_boot_compiles_the_same_under_sampled_gc_stress(seed):
-    """`boot` itself under GC stress, the one program whose roots are densest.
+    """`turkey` itself under GC stress, the one program whose roots are densest.
 
-    Stress at every allocation does not finish at this scale: `boot` makes
+    Stress at every allocation does not finish at this scale: `turkey` makes
     tens of millions of objects before it reaches the program. Sampled at
     one collection per 100,000 allocations on average it is about 800
     collections and a dozen seconds, and each seed puts them at different
@@ -192,10 +192,10 @@ def test_boot_compiles_the_same_under_sampled_gc_stress(seed):
 
 @pytest.fixture(scope="module")
 def verifying_boot(tmp_path_factory) -> Path:
-    """`boot` compiled by `boot` with the heap verifier in, which is only ever
+    """`turkey` compiled by `turkey` with the heap verifier in, which is only ever
     chosen when a program is compiled."""
-    directory = tmp_path_factory.mktemp("verifying-boot")
-    binary = directory / "boot"
+    directory = tmp_path_factory.mktemp("verifying-turkey")
+    binary = directory / "turkey"
     bootc.link(bootc.BOOT_MAIN, binary, "--gc-verify")
     return binary
 
@@ -254,7 +254,7 @@ def test_build_sh_speaks_only_the_bootstraps_command_line():
         return
     script = (REPO_ROOT / "scripts" / "build.sh").read_text()
     assert "native" not in script, (
-        "bootstrap/ now speaks `boot build`, so scripts/build.sh no longer "
+        "bootstrap/ now speaks `turkey build`, so scripts/build.sh no longer "
         "needs to fall back to `native`: remove `emit_command` and call "
         "`build -o - -f asm` directly")
 

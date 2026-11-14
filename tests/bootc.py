@@ -1,15 +1,15 @@
-"""`boot`, compiled once and shared by every test module that runs it.
+"""`turkey`, compiled once and shared by every test module that runs it.
 
-Compiling `boot` takes about two minutes, from the committed bootstrap by
+Compiling `turkey` takes about two minutes, from the committed bootstrap by
 `scripts/build.sh`. *Running* the compiled binary over the whole corpus takes
 ten seconds. Every ratio in this file follows from those two numbers.
 
 So the build happens here, in a module that is not itself a test, and the rule
-is: **a test that needs `boot` calls `boot(...)` or `binary()` below**, and
+is: **a test that needs `turkey` calls `boot(...)` or `binary()` below**, and
 never builds or starts one of its own. The build is paid once per change to
 its inputs, shared by every worker and every session, and a test module that
 arranged its own would pay minutes per worker for seconds of work. The same
-holds one level down: a test that runs `boot` over the whole corpus goes
+holds one level down: a test that runs `turkey` over the whole corpus goes
 through `boot_each`, so the corpus is compiled once, not once per worker.
 """
 
@@ -34,13 +34,13 @@ BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 # The implementation's modules the corpus imports from an ordinary program --
 # `ptr.gob` and `ptr_gc.gob` test raw memory, `foreign.gob` a C call and
 # `giblets_memory.gob` a giblet -- which the compiler refuses outside the
-# library unless named here. Set for every `boot` a test runs, since the corpus
+# library unless named here. Set for every `turkey` a test runs, since the corpus
 # is compiled from many places; a test of the refusal itself removes it.
 INTERNAL_IMPORTS = "TURKEY_TEST_INTERNAL_IMPORTS"
 os.environ[INTERNAL_IMPORTS] = "Turkey.Libc,Turkey.Memory,Turkey.Ptr"
 
 
-# Everything whose contents can change what `boot` compiles to: its own
+# Everything whose contents can change what `turkey` compiles to: its own
 # source, the library it links against, the committed compiler that builds it
 # and the script that does. Hashing these is what lets a build be reused;
 # missing one would mean serving a stale binary, which is worse than
@@ -69,31 +69,31 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
                 continue
             h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
-    # `build.sh` links `boot` with `$TURKEY_CC`.
+    # `build.sh` links `turkey` with `$TURKEY_CC`.
     h.update(toolchain.identity())
     return h.hexdigest()[:16]
 
 
-# A `boot` built elsewhere, used as it is, with nothing built.
+# A `turkey` built elsewhere, used as it is, with nothing built.
 BOOT_OVERRIDE = "TURKEY_BOOT"
 
 
 @functools.lru_cache(maxsize=1)
 def binary() -> Path:
-    """The compiled `boot`, built on first use and cached across sessions.
+    """The compiled `turkey`, built on first use and cached across sessions.
 
-    `$TURKEY_BOOT`, if set, names a `boot` to use instead, and nothing is built.
+    `$TURKEY_BOOT`, if set, names one to use instead, and nothing is built.
 
-    `scripts/build.sh`'s stage2: the committed bootstrap compiling today's
+    `scripts/build.sh`'s stage2, `turkey`: the committed bootstrap compiling today's
     source. A real executable rather than anything in-process, because a
-    subprocess per invocation keeps a crash in `boot` from taking the test
+    subprocess per invocation keeps a crash in `turkey` from taking the test
     session with it.
 
     The build takes about two minutes and the result depends on
     nothing but the files `_fingerprint` hashes, so it is kept in a shared directory keyed
     by that hash rather than in a per-session temporary one. A session that
     changes nothing pays nothing. This matters outside the test suite too: a
-    one-off script that wants a compiled `boot` does not pay two minutes of
+    one-off script that wants a compiled `turkey` does not pay two minutes of
     build to ask a question that takes ten seconds to answer.
 
     Sharing the directory between concurrent builds is safe because the key is
@@ -131,15 +131,15 @@ def _build(cached: Path, output: Path) -> Path:
         )
         if result.returncode != 0:
             raise AssertionError(
-                f"building boot failed\n{result.stdout}\n{result.stderr}")
-        os.replace(staging / "stage2", output)
+                f"building turkey failed\n{result.stdout}\n{result.stderr}")
+        os.replace(staging / "turkey", output)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return output
 
 
 def argv(output: str) -> list[str]:
-    """`boot`'s arguments for one output: `asm`, the program's assembly on
+    """`turkey`'s arguments for one output: `asm`, the program's assembly on
     stdout; `obj`, its relocatable object on stdout; `check`; or the name of a
     stage to dump (`core`, `ssa`, `select`, `listing`, ...)."""
     match output:
@@ -154,7 +154,7 @@ def argv(output: str) -> list[str]:
 
 
 def boot(*args: str) -> str:
-    """One `boot` invocation, answering its stdout.
+    """One `turkey` invocation, answering its stdout.
 
     Bytes, decoded here rather than by `text=True`. Universal-newline
     translation would rewrite a `\\r` inside a *string literal* in the output
@@ -167,11 +167,11 @@ def boot(*args: str) -> str:
 
 
 def boot_with_stderr(*args: str) -> tuple[str, str]:
-    """`boot`, answering stdout and stderr both.
+    """`turkey`, answering stdout and stderr both.
 
-    `boot` above throws stderr away, which is right for a test that wants
+    `turkey` above throws stderr away, which is right for a test that wants
     only the dump. A test that also wants the diagnostics uses this, rather
-    than running `boot` some other way.
+    than running `turkey` some other way.
     """
     result = subprocess.run(
         toolchain.command(binary(), *args),
@@ -181,7 +181,7 @@ def boot_with_stderr(*args: str) -> tuple[str, str]:
     out = result.stdout.decode("utf-8")
     err = result.stderr.decode("utf-8")
     assert result.returncode == 0, (
-        f"boot exited {result.returncode}\n{out}\n{err}")
+        f"turkey exited {result.returncode}\n{out}\n{err}")
     return out, err
 
 
@@ -191,9 +191,9 @@ def _build_key() -> str:
 
 
 def build_key() -> str:
-    """What a cached output of `boot` depends on, as a cache key.
+    """What a cached output of `turkey` depends on, as a cache key.
 
-    The build's fingerprint, or -- for a `boot` named by `$TURKEY_BOOT`, whose
+    The build's fingerprint, or -- for a `turkey` named by `$TURKEY_BOOT`, whose
     sources are nobody's business -- the binary itself plus the library it
     reads at run time.
     """
@@ -230,9 +230,9 @@ def digest(*parts: bytes) -> str:
 def link(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
          env: dict[str, str] | None = None,
          libraries: tuple[str, ...] = ()) -> subprocess.CompletedProcess[str]:
-    """`boot build` of `entry` to an object beside `output`, linked into
-    `output` with the C compiler and the runtime's libraries. Answers `boot`'s
-    run, whose stderr a caller may read. `flags` go to `boot` before the
+    """`turkey build` of `entry` to an object beside `output`, linked into
+    `output` with the C compiler and the runtime's libraries. Answers `turkey`'s
+    run, whose stderr a caller may read. `flags` go to `turkey` before the
     entry; `libraries` go to the linker after the runtime's, such as
     `toolchain.openssl_libraries()` for a program that imports `Net.TLS`."""
     obj = output.with_name(output.name + ".o")
@@ -259,8 +259,8 @@ def corpus() -> list[Path]:
     """The programs in `tests/programs/` that compile, sorted.
 
     Every program there but an error case (`err_*`, whose point is to fail)
-    and a known failure (marked `--@ xfail`, which may stop `boot` partway).
-    A corpus test compiles them all in one `boot` run (`boot_each`), so one
+    and a known failure (marked `--@ xfail`, which may stop `turkey` partway).
+    A corpus test compiles them all in one `turkey` run (`boot_each`), so one
     program that cannot compile fails every test that shares the run, and
     each of those tests then runs it again.
     """
@@ -274,7 +274,7 @@ def corpus() -> list[Path]:
 def boot_each(output: str, paths: list[Path],
               split: Callable[[str, list[Path]], list[str]],
               flags: tuple[str, ...] = ()) -> dict[Path, str]:
-    """`boot` over some programs for one output (`argv`), cached on disk per
+    """`turkey` over some programs for one output (`argv`), cached on disk per
     program.
 
     On disk rather than in an `lru_cache`: a cache per *process* means that
@@ -286,14 +286,14 @@ def boot_each(output: str, paths: list[Path],
     the library, which the fingerprint covers; a program that imported a
     sibling would need its directory hashed too, as `reference` does.
 
-    The missing programs are computed in one `boot` run, holding a lock per
+    The missing programs are computed in one `turkey` run, holding a lock per
     program, so a cold entry is filled once while any other worker that wants
     it waits. Per program rather than per output: the `select` dump of
     `src/Main.gob` takes minutes and the corpus's takes seconds, and one lock
     across both made every corpus test wait for the compiler. The locks are
     taken in path order, so two workers wanting overlapping sets cannot
     deadlock. `split` cuts the run's output into one text per path, in order.
-    `flags` go to `boot` before the paths (`--gc-verify`), and into the key.
+    `flags` go to `turkey` before the paths (`--gc-verify`), and into the key.
     """
     directory = (Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key()
                  / " ".join((output, *flags)))
@@ -340,7 +340,7 @@ def boot_each(output: str, paths: list[Path],
 def split_on(text: str, marker: str) -> list[str]:
     """A multi-program dump, cut into one chunk per program.
 
-    `boot` takes any number of files in one invocation -- which is the whole
+    `turkey` takes any number of files in one invocation -- which is the whole
     point of this module -- so every caller needs the same unpicking
     afterwards. Two shapes exist: a dump that *starts* each program with a
     marker line (`asm`, `select`), and one that *ends* each with a count line

@@ -1,8 +1,8 @@
-"""`tests/bootc.py`: the cache the test suite's `boot` comes from.
+"""`tests/bootc.py`: the cache the test suite's `turkey` comes from.
 
 It is content-addressed, and a content-addressed cache has exactly one way to
 be dangerous -- a key that does not cover everything the value depends on. It
-then serves a stale answer, silently: here, a `boot` built from source that no
+then serves a stale answer, silently: here, a `turkey` built from source that no
 longer exists, passing tests for code nobody is running. So the key is tested
 rather than reasoned about.
 

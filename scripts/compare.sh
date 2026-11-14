@@ -112,11 +112,21 @@ stats_flag() {
     fi
 }
 
+# The stage2 compiler scripts/build.sh left under $1: `turkey`, or `stage2`
+# in a tree whose build.sh names its result that.
+stage2() {
+    if [ -x "$1/stages/turkey" ]; then
+        echo "$1/stages/turkey"
+    else
+        echo "$1/stages/stage2"
+    fi
+}
+
 # The arguments that make compiler $1 print its assembly on stdout. A tree
 # from before `build` spelled it `native`; run with no arguments, a compiler
 # prints a usage message naming the commands it has.
 emit_command() {
-    if $RUN "$1" 2>&1 | grep -q 'boot build'; then
+    if $RUN "$1" 2>&1 | grep -qE '(turkey|boot) build'; then
         echo "build -o - -f asm"
     else
         echo native
@@ -169,12 +179,12 @@ pids=
 for side in base new; do
     eval "tree=\$$side"
     d=$out/$side
-    (cd "$tree" && TURKEY_ALLOC_SITES=1 $RUN "$d/stages/stage2" $(emit_command "$d/stages/stage2") \
+    (cd "$tree" && TURKEY_ALLOC_SITES=1 $RUN "$(stage2 "$d")" $(emit_command "$(stage2 "$d")") \
         $(stats_flag "$tree") "$SOURCE" > "$d/counted.s" 2> "$d/sites.txt" \
         && $CC -o "$d/counted" "$d/counted.s" $LIBS) > "$d/counted.log" 2>&1 &
     eval "log_$!=\"$d/counted.log\""
     pids="$pids $!"
-    (cd "$tree" && $RUN "$d/stages/stage2" $(emit_command "$d/stages/stage2") "$SOURCE" > "$d/stage3.s" \
+    (cd "$tree" && $RUN "$(stage2 "$d")" $(emit_command "$(stage2 "$d")") "$SOURCE" > "$d/stage3.s" \
         && $CC -o "$d/stage3" "$d/stage3.s" $LIBS) > "$d/stage3.log" 2>&1 &
     eval "log_$!=\"$d/stage3.log\""
     pids="$pids $!"

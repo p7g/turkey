@@ -1,4 +1,4 @@
-"""`boot` with several workers (`TURKEY_WORKERS`) compiles the parts of a
+"""`turkey` with several workers (`TURKEY_WORKERS`) compiles the parts of a
 program that are each function's own -- the passes after lowering, the
 checks, and the backend -- as tasks in parallel, and hands them on in order.
 What it emits must be what one worker emits, byte for byte.

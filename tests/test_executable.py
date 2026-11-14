@@ -1,4 +1,4 @@
-"""The executable writers: `boot build` writes a signed Mach-O, or an ELF
+"""The executable writers: `turkey build` writes a signed Mach-O, or an ELF
 for glibc, that the loader takes as it takes the linker's, with nothing
 linked.
 
@@ -11,7 +11,7 @@ bytes, and what is refused.
 
 The Mach-O tests that run the executable need arm64-darwin, with the
 system's `codesign` and `dyld_info` as the oracles. The rest run on any
-host: an executable is written for either target wherever `boot` runs, and
+host: an executable is written for either target wherever `turkey` runs, and
 its structure, signature and build ID are checked here in Python, against
 Python's own SHA-256, so each host checks that writing for the other needs
 nothing from it.
@@ -592,7 +592,7 @@ def test_the_layout_is_what_the_loader_needs(tmp_path):
 
 
 # Debug and unwind information in the Mach-O executable. Each check writes the
-# executable and the object of one program for arm64-darwin, wherever `boot`
+# executable and the object of one program for arm64-darwin, wherever `turkey`
 # runs, and compares the two in Python: the executable's debug sections and
 # `__eh_frame` are the object's with every address filled in, its
 # `__unwind_info` holds the object's compact unwind entries, and its function
@@ -691,7 +691,7 @@ class _MachO:
 
 def _written(tmp_path: Path, source: str, *flags: str) -> tuple[_MachO, _MachO]:
     """`source` for arm64-darwin as an object and as an executable, each
-    written by `boot` with `flags`."""
+    written by `turkey` with `flags`."""
     (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
     for output, form in (("prog.o", "obj"), ("prog", "exe")):
         result = _boot("-f", form, "--target", "arm64-darwin", *flags, "-o", output,
@@ -1087,7 +1087,7 @@ def test_the_elf_is_what_the_loader_needs(tmp_path):
 
 def _written_elf(tmp_path: Path, source: str, *flags: str) -> tuple[Elf, Elf]:
     """`source` for arm64-linux as an object and as an executable, each
-    written by `boot` with `flags`."""
+    written by `turkey` with `flags`."""
     (tmp_path / "prog.gob").write_text(source, encoding="utf-8")
     for output, form in (("prog.o", "obj"), ("prog", "exe")):
         result = _boot("-f", form, "--target", "arm64-linux", *flags, "-o", output,

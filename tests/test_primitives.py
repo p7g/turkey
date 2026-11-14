@@ -3,7 +3,7 @@
 These are written against what the language promises -- the "Primitive types"
 section of `docs/ref/types.md` -- rather than against whatever the current
 implementation happens to do, so that a backend that drifts from the promise
-fails here. Each program is compiled by `boot` and run natively (`tests.lang`).
+fails here. Each program is compiled by `turkey` and run natively (`tests.lang`).
 """
 
 from __future__ import annotations

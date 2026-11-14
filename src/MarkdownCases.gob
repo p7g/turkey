@@ -1,0 +1,73 @@
+-- An entry point in `src/`, beside `ImageCases.gob`: renders each case of the
+-- fixture it is given with `Turkey.Markdown` and prints the HTML and the
+-- summary.
+--
+-- The fixture holds cases that each start with a `=== NAME` line, followed by
+-- the doc-comment text. A case whose name starts with `default` is rendered
+-- with `Markdown.defaults()`. Any other case is rendered with a code-block
+-- hook that wraps the body in `<pre data-info>` and a reference hook that
+-- resolves a label starting with an upper-case letter to `#LABEL`, followed by
+-- `!code` when the label was a code span and `|TEXT` when the link text was
+-- written apart, so both hooks and every field are seen to run.
+--
+-- `tests/test_markdown.py` runs it and compares the output with its golden.
+
+import Turkey.Markdown as Markdown
+import Turkey.Markdown (Hooks(..), Reference(..))
+import System.Env as Env
+import System.File as File
+
+fun main() {
+    let path = match Vec.last(Vec.fromArray(Env.args())) {
+        Some(p) -> p
+        None -> error("usage: MarkdownCases FIXTURE")
+    }
+    let source = match File.readText(path) {
+        Right(t) -> t
+        Left(_) -> error("cannot read '" + path + "'")
+    }
+    let titles : Vec String = []
+    let bodies : Vec (Vec String) = []
+    for line in String.lines(source) {
+        if String.startsWith(line, "=== ") {
+            Vec.push(titles, text(line, 4))
+            Vec.push(bodies, [])
+        } else if len(bodies) > 0 {
+            Vec.push(bodies[len(bodies) - 1], line)
+        }
+    }
+    for k in Int.range(0, len(titles)) {
+        let hooks = if String.startsWith(titles[k], "default") { Markdown.defaults() } else { testHooks() }
+        let text = String.join(bodies[k], "\n")
+        print("=== " + titles[k])
+        write(Markdown.render(hooks, text))
+        print("--- summary")
+        print(Markdown.summary(hooks, text))
+    }
+}
+
+fun testHooks() -> Hooks = Hooks {
+    codeBlock = fun(info : String, body : String) =
+        "<pre data-info=\"" + Markdown.escape(info) + "\">" + Markdown.escape(body) + "</pre>\n",
+    reference = fun(r : Reference) {
+        match Vec.at(Vec.fromArray(String.toCodePoints(r.label)), 0) {
+            Some(c) -> if Char.isAsciiUpper(c) {
+                let kind = if r.code { "!code" } else { "" }
+                let shown = match r.linkText {
+                    Some(t) -> "|" + t
+                    None -> ""
+                }
+                Some("#" + r.label + kind + shown)
+            } else {
+                None
+            }
+            None -> None
+        }
+    },
+}
+
+-- Returns `line` without its first `n` characters.
+fun text(line : String, n : Int) -> String {
+    let cs = Vec.fromArray(String.toCodePoints(line))
+    String.fromCodePoints(Vec.slice(cs, n, len(cs)))
+}

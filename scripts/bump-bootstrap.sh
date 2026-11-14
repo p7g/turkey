@@ -4,7 +4,7 @@
 # A policy step, not a build step. Bump only when the source needs something the
 # committed compiler cannot build -- a new language feature, or a changed
 # runtime ABI. Land the feature, bump, and only then use the feature in the
-# compiler; a bump for any other reason is 7 MB of git history for nothing.
+# compiler; a bump for any other reason is 13 MB of git history for nothing.
 #
 # The bump is its own commit, containing only bootstrap/, so that a bad one is
 # fixed by reverting it. This runs the fixed point first and refuses a dirty
@@ -64,7 +64,7 @@ for target in $TARGETS; do
     $RUN "$OUT/stage3" build -f asm -o "$OUT/$target.s" --target "$target" src/Main.gob
     # -n makes one gzip compress the same text to the same bytes, but GNU
     # gzip and macOS's disagree. An artifact whose text is unchanged is kept,
-    # so a bump from the other platform does not rewrite 3.5 MB of it.
+    # so a bump from the other platform does not rewrite 6.5 MB of it.
     if [ ! -f "$BOOTSTRAP/$target.s.gz" ] ||
             ! gunzip -c "$BOOTSTRAP/$target.s.gz" | cmp -s - "$OUT/$target.s"; then
         gzip -9 -n -c "$OUT/$target.s" > "$BOOTSTRAP/$target.s.gz"

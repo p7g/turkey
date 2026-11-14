@@ -55,7 +55,7 @@ def module(request, tmp_path):
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_each_answers_and_stores_what_it_should(module, tmp_path):
     binary = tmp_path / "main"
-    bootc.link(module, binary)
+    bootc.executable(module, binary)
     ran = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                          timeout=60)
     assert ran.returncode == 0, ran.stderr

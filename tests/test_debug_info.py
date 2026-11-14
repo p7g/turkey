@@ -1,15 +1,13 @@
 """`turkey build -g`: a line table and the DWARF a debugger needs to find it.
 
-`-g` works on both of `build`'s paths. As assembly, the `.file`/`.loc` rows
-are what the system assembler turns into `debug_line`; as an object, `turkey`
-builds `debug_line` itself from the same rows. On both, `Turkey.Dwarf` writes
-the compile unit, the subprograms, and an inlined subroutine for each call the
-optimizer inlined. So the checks are the tools a user would reach for, on a
-program built each way: `llvm-dwarfdump` reads the rows and verifies the
-DWARF, `nm` shows the debug map the macOS linker writes, a debugger stops at a
-line and names the frames, inlined calls among them, and on macOS `atos`, which
-reads DWARF the way `sample` and Instruments do, names the inlined frames
-too.
+`Turkey.Dwarf` writes the compile unit, the subprograms, and an inlined
+subroutine for each call the optimizer inlined, and `turkey` builds `debug_line`
+from the `.file`/`.loc` rows its assembly would carry. The executable `turkey`
+writes holds them all, so the checks are the tools a user would reach for, on
+that executable: `llvm-dwarfdump` reads the rows and verifies the DWARF, a
+debugger stops at a line and names the frames, inlined calls among them, and
+on macOS `atos`, which reads DWARF the way `sample` and Instruments do, names
+the inlined frames too.
 
 **The object's oracle is the assembler.** The object `turkey` writes with `-g`
 has to carry the debug sections the system assembler makes of `turkey`'s own
@@ -52,11 +50,6 @@ FORMATTERS = REPO_ROOT / "debugger"
 LIB = REPO_ROOT / "lib"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 CORPUS = [path.name for path in bootc.corpus()]
-
-# The three ways `build -g` makes a program: assembly through the system
-# assembler, an object `turkey` writes, each linked by the C compiler, and an
-# executable `turkey` writes with nothing linked.
-PATHS = ["asm", "obj", "exe"]
 
 PROGRAM = """\
 fun fact(n : Int) -> Int {
@@ -216,40 +209,23 @@ def _needs_dwarfdump() -> str:
 
 
 @functools.lru_cache(maxsize=None)
-def _built(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
-    """`program` built with `level`, `-g` or a `--debug`, as `prog` in a
-    directory of its own. `how` is `asm`, through `prog.s` and the assembler,
-    or `obj`, with `turkey` writing the object, each linked with `prog.o`
-    beside it as the macOS debug map needs; or `exe`, with `turkey` writing
-    `prog` itself."""
+def _built(program: str = PROGRAM, level: str = "-g") -> Path:
+    """`program` built with `level`, `-g` or a `--debug`, as the executable
+    `prog` in a directory of its own."""
     directory = Path(tempfile.mkdtemp(prefix="turkey-debug-"))
     source = directory / "prog.gob"
     source.write_text(program, encoding="utf-8")
-    output = {"asm": "prog.s", "obj": "prog.o", "exe": "prog"}[how]
     compiled = subprocess.run(
-        toolchain.command(bootc.binary(), "build", level, "-f", how, "-o", output,
-                          "prog.gob"),
+        toolchain.command(bootc.binary(), "build", level, "-o", "prog", "prog.gob"),
         cwd=directory, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
     assert compiled.returncode == 0, compiled.stderr[-4000:]
-    if how == "exe":
-        return directory
-    if how == "asm":
-        assembled = subprocess.run(
-            [*toolchain.cc(), *_assemble_flags(), "-c", "-o", "prog.o", "prog.s"],
-            cwd=directory, capture_output=True, text=True)
-        assert assembled.returncode == 0, assembled.stderr[-4000:]
-    linked = subprocess.run(
-        [*toolchain.cc(), "-o", "prog", "prog.o", *toolchain.libraries()],
-        cwd=directory, capture_output=True, text=True)
-    assert linked.returncode == 0, linked.stderr[-4000:]
     return directory
 
 
-def _dwarf(how: str, program: str = PROGRAM, level: str = "-g") -> Path:
-    """The file that holds `program`'s DWARF: the object, or the executable
-    `turkey` wrote."""
-    return _built(how, program, level) / ("prog" if how == "exe" else "prog.o")
+def _dwarf(program: str = PROGRAM, level: str = "-g") -> Path:
+    """The executable that holds `program`'s DWARF."""
+    return _built(program, level) / "prog"
 
 
 def _rows(tool: str, obj: Path) -> dict[str, set[int]]:
@@ -270,18 +246,16 @@ def _rows(tool: str, obj: Path) -> dict[str, set[int]]:
     return rows
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_the_line_table_has_a_row_for_each_statement(how):
+def test_the_line_table_has_a_row_for_each_statement():
     tool = _needs_dwarfdump()
-    lines = _rows(tool, _dwarf(how)).get("prog.gob", set())
+    lines = _rows(tool, _dwarf()).get("prog.gob", set())
     assert FACT_LINES | MAIN_LINES <= lines, sorted(lines)
 
 
-@pytest.mark.parametrize("how", PATHS)
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])
-def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level):
+def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(level):
     tool = _needs_dwarfdump()
-    text = subprocess.run([tool, "--debug-info", str(_dwarf(how, PROGRAM, level))],
+    text = subprocess.run([tool, "--debug-info", str(_dwarf(PROGRAM, level))],
                           capture_output=True, text=True, check=True).stdout
     assert "DW_TAG_compile_unit" in text
     assert '("prog.gob")' in text
@@ -289,15 +263,11 @@ def test_the_object_has_a_compile_unit_and_a_subprogram_per_function(how, level)
     assert '("Main.main")' in text
 
 
-@pytest.mark.parametrize("how", PATHS)
-@pytest.mark.parametrize("which", ["prog.o", "prog"])
 @pytest.mark.parametrize("program", [PROGRAM, RECTANGLES, LOOP], ids=["fact", "rectangles", "loop"])
 @pytest.mark.parametrize("level", ["-g", "--debug=lines"])
-def test_the_dwarf_verifies(how, which, program, level):
+def test_the_dwarf_verifies(program, level):
     tool = _needs_dwarfdump()
-    if how == "exe" and which == "prog.o":
-        pytest.skip("an executable turkey writes has no object")
-    result = subprocess.run([tool, "--verify", str(_built(how, program, level) / which)],
+    result = subprocess.run([tool, "--verify", str(_dwarf(program, level))],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout[-4000:] + result.stderr[-4000:]
 
@@ -314,13 +284,12 @@ def _entries(tool: str, obj: Path) -> list[tuple[int, str, str]]:
     return entries
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
+def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller():
     """`area`'s body in `main`: an inlined subroutine inside `main`'s
     subprogram, naming the abstract subprogram `area` and the line of the
     call."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _dwarf(how, RECTANGLES))
+    entries = _entries(tool, _dwarf(RECTANGLES))
     main = next(k for k, (_, tag, attributes) in enumerate(entries)
                 if tag == "DW_TAG_subprogram" and '("Main.main")' in attributes)
     depth = entries[main][0]
@@ -337,12 +306,11 @@ def test_an_inlined_call_is_an_inlined_subroutine_of_its_caller(how):
                and "DW_INL_inlined" in attributes for _, tag, attributes in entries)
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_a_parameter_has_a_location_list(how):
+def test_a_parameter_has_a_location_list():
     """`fact`'s `n`: a formal parameter whose location list starts in the
     register it arrives in."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _dwarf(how))
+    entries = _entries(tool, _dwarf())
     n = [attributes for _, tag, attributes in entries
          if tag == "DW_TAG_formal_parameter" and '("n")' in attributes]
     assert n, "no formal parameter 'n'"
@@ -350,15 +318,14 @@ def test_a_parameter_has_a_location_list(how):
                for a in n), n
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_the_types_describe_how_values_are_held(how):
+def test_the_types_describe_how_values_are_held():
     """An `Int` is a name for a C `long`; an enumeration is an enumeration of
     its constructors; a record in its slots is a structure of its fields; a
     boxed sum is a pointer to its object, whose tag is an enumeration and
     whose constructors are a union; a compact `Option` is a union of its
     word as its nullaries and as its payload."""
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _dwarf(how, VALUES))
+    entries = _entries(tool, _dwarf(VALUES))
     def named(tag: str, name: str) -> list[str]:
         return [a for _, t, a in entries if t == tag and f'DW_AT_name\t("{name}")' in a]
     assert named("DW_TAG_typedef", "Int") and named("DW_TAG_base_type", "long")
@@ -392,10 +359,9 @@ def _stops(out: str, marker: str) -> list[str]:
     return re.split(f"^{re.escape(marker)}$", out, flags=re.MULTILINE)[1:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_shows_the_variables_at_each_stop(how):
+def test_lldb_shows_the_variables_at_each_stop():
     lldb = _lldb()
-    out = _debugged(how, [lldb, "--batch",
+    out = _debugged([lldb, "--batch",
                           "-o", f"breakpoint set --file prog.gob --line {FIRST_STOP}",
                           "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
                           "-o", "run", "-o", "script print('== stop')",
@@ -421,10 +387,9 @@ def test_lldb_shows_the_variables_at_each_stop(how):
     assert re.search(r"length = 3", stops[1]), stops[1]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_shows_the_variables_at_each_stop(how):
+def test_gdb_shows_the_variables_at_each_stop():
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch",
+    out = _debugged([gdb, "-nx", "-batch",
                           "-ex", f"break prog.gob:{FIRST_STOP}",
                           "-ex", f"break prog.gob:{SECOND_STOP}",
                           "-ex", "run", "-ex", "echo == stop\\n", "-ex", "info args",
@@ -445,13 +410,12 @@ def test_gdb_shows_the_variables_at_each_stop(how):
     assert re.search(r"length = 3", stops[1]), stops[1]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_formatters_show_values_as_the_source_writes_them(how):
+def test_lldb_formatters_show_values_as_the_source_writes_them():
     """`scripts/turkey-lldb`: a `String` as its text, a `Vec` as its
     elements, a compact `Option` and a boxed sum as the constructor they
     hold, a `Map` as its entries."""
     _lldb()
-    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+    out = _debugged([str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
                           "-o", f"breakpoint set --file prog.gob --line {SECOND_STOP}",
                           "-o", "run", "-o", "frame variable s o v t m", "-o", "kill", "./prog"],
                     VALUES)
@@ -478,12 +442,11 @@ fun main() {
 """
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_formatters_tell_a_programs_type_from_the_librarys(how):
+def test_lldb_formatters_tell_a_programs_type_from_the_librarys():
     """A type is named with its module, so the library's `Vec` formatter
     leaves a program's own `Vec` alone, and it shows as its fields."""
     _lldb()
-    out = _debugged(how, [str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
+    out = _debugged([str(REPO_ROOT / "scripts" / "turkey-lldb"), "--batch",
                           "-o", "breakpoint set --file prog.gob --line 5",
                           "-o", "run", "-o", "frame variable v", "-o", "kill", "./prog"],
                     OWN_VEC)
@@ -491,10 +454,9 @@ def test_lldb_formatters_tell_a_programs_type_from_the_librarys(how):
                      r'\{ x = 1, y = 2, z = 3, w = 4, label = "own" \}', out), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_formatters_tell_a_programs_type_from_the_librarys(how):
+def test_gdb_formatters_tell_a_programs_type_from_the_librarys():
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch",
+    out = _debugged([gdb, "-nx", "-batch",
                           "-iex", f"add-auto-load-safe-path {FORMATTERS}",
                           "-iex", f"directory {FORMATTERS}",
                           "-ex", "break prog.gob:5", "-ex", "run",
@@ -590,8 +552,7 @@ def _assigned_stops(out: str) -> list[str]:
     return stops
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_shows_each_variable_as_last_assigned(how):
+def test_lldb_shows_each_variable_as_last_assigned():
     """A `var` shows its old value until the statement that assigns it, not
     from where the new value is computed; one overwritten on the way to a
     point shows nothing there rather than what it held before; and a shadowed
@@ -604,7 +565,7 @@ def test_lldb_shows_each_variable_as_last_assigned(how):
     command += ["-o", "run"]
     for _ in ASSIGNED_STOPS:
         command += ["-o", "script print('== stop')", "-o", "frame variable", "-o", "continue"]
-    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    out = _debugged(command + ["./prog"], ASSIGNED)
     for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
         for name, value in expected.items():
             shown = re.findall(rf"^\([^)]*\) {name} = (.*)$", stop, re.MULTILINE)
@@ -615,8 +576,7 @@ def test_lldb_shows_each_variable_as_last_assigned(how):
                 assert len(available) == 1 and available[0].endswith(value), stop
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_shows_each_variable_as_last_assigned(how):
+def test_gdb_shows_each_variable_as_last_assigned():
     gdb = _gdb()
     lines = sorted({line for line, _ in ASSIGNED_STOPS})
     command = [gdb, "-nx", "-batch",
@@ -627,7 +587,7 @@ def test_gdb_shows_each_variable_as_last_assigned(how):
     for _ in ASSIGNED_STOPS:
         command += ["-ex", "echo == stop\\n", "-ex", "info args", "-ex", "info locals",
                     "-ex", "continue"]
-    out = _debugged(how, command + ["./prog"], ASSIGNED)
+    out = _debugged(command + ["./prog"], ASSIGNED)
     for stop, (_, expected) in zip(_assigned_stops(out), ASSIGNED_STOPS):
         for name, value in expected.items():
             shown = re.findall(rf"^{name} = (.*)$", stop, re.MULTILINE)
@@ -637,12 +597,11 @@ def test_gdb_shows_each_variable_as_last_assigned(how):
             else:
                 assert len(available) == 1 and available[0].endswith(value), stop
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_loads_the_formatters_the_program_names(how):
+def test_gdb_loads_the_formatters_the_program_names():
     """gdb finds `turkey_gdb.py` by the name `.debug_gdb_scripts` gives it,
     along the source path a user adds it to."""
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch",
+    out = _debugged([gdb, "-nx", "-batch",
                           "-iex", f"add-auto-load-safe-path {FORMATTERS}",
                           "-iex", f"directory {FORMATTERS}",
                           "-ex", f"break prog.gob:{SECOND_STOP}", "-ex", "run",
@@ -654,26 +613,12 @@ def test_gdb_loads_the_formatters_the_program_names(how):
     assert re.search(r'"one".*1', out) and re.search(r'"two".*2', out), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_debug_lines_writes_no_variables(how):
+def test_debug_lines_writes_no_variables():
     tool = _needs_dwarfdump()
-    entries = _entries(tool, _dwarf(how, PROGRAM, "--debug=lines"))
+    entries = _entries(tool, _dwarf(PROGRAM, "--debug=lines"))
     assert not [tag for _, tag, _ in entries
                 if tag in ("DW_TAG_variable", "DW_TAG_formal_parameter")]
     assert any(tag == "DW_TAG_subprogram" for _, tag, _ in entries)
-
-
-@pytest.mark.parametrize("how", PATHS)
-def test_the_macos_linker_records_the_object_in_the_debug_map(how):
-    """ld64 writes an `N_OSO` stab, which is how lldb finds the DWARF left
-    in the object, only for an object with a compile unit."""
-    if not _darwin():
-        pytest.skip("the debug map is Mach-O's")
-    if how == "exe":
-        pytest.skip("an executable turkey writes carries its DWARF and needs no debug map")
-    result = subprocess.run(["nm", "-ap", str(_built(how) / "prog")],
-                            capture_output=True, text=True, check=True)
-    assert re.search(r" OSO .*prog\.o$", result.stdout, re.MULTILINE), result.stdout[-2000:]
 
 
 def _lldb() -> str:
@@ -692,19 +637,18 @@ def _gdb() -> str:
     return "gdb"
 
 
-def _debugged(how: str, argv: list[str], program: str = PROGRAM) -> str:
+def _debugged(argv: list[str], program: str = PROGRAM) -> str:
     """A debugger's batch run of `program`, with what it printed. Bounded,
     since a breakpoint that never hits leaves the program to finish and the
     debugger to exit, and one that misbehaves must not hang the suite."""
-    result = subprocess.run(argv, cwd=_built(how, program), capture_output=True, text=True,
+    result = subprocess.run(argv, cwd=_built(program), capture_output=True, text=True,
                             timeout=120)
     return result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_stops_at_a_line_and_names_the_frames(how):
+def test_lldb_stops_at_a_line_and_names_the_frames():
     lldb = _lldb()
-    out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --file prog.gob --line 2",
+    out = _debugged([lldb, "--batch", "-o", "breakpoint set --file prog.gob --line 2",
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"])
     # With `-g`, a frame shows its function's parameters, and `fact`'s `n` is
     # in its register at the line.
@@ -712,10 +656,9 @@ def test_lldb_stops_at_a_line_and_names_the_frames(how):
     assert re.search(r"frame #1: .*`Main\.main at prog\.gob:9", out), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_stops_in_an_inlined_function_and_shows_its_frame(how):
+def test_lldb_stops_in_an_inlined_function_and_shows_its_frame():
     lldb = _lldb()
-    out = _debugged(how, [lldb, "--batch", "-o", "breakpoint set --name Main.area[Rectangle]",
+    out = _debugged([lldb, "--batch", "-o", "breakpoint set --name Main.area[Rectangle]",
                           "-o", "run", "-o", "bt", "-o", "kill", "./prog"], RECTANGLES)
     assert re.search(r"frame #\d+: .*`Main\.area\[Rectangle\] at prog\.gob:11:\d+ \[inlined\]",
                      out), out[-4000:]
@@ -723,10 +666,9 @@ def test_lldb_stops_in_an_inlined_function_and_shows_its_frame(how):
                      re.MULTILINE), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_stops_in_an_inlined_function_and_shows_its_frame(how):
+def test_gdb_stops_in_an_inlined_function_and_shows_its_frame():
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break 'Main.area[Rectangle]'",
+    out = _debugged([gdb, "-nx", "-batch", "-ex", "break 'Main.area[Rectangle]'",
                           "-ex", "run", "-ex", "bt", "-ex", "kill", "./prog"], RECTANGLES)
     assert re.search(r"#\d+ .*Main\.area\[Rectangle\].* at prog\.gob:11", out), out[-4000:]
     assert re.search(r"#\d+ .*Main\.main.* at prog\.gob:18", out), out[-4000:]
@@ -736,10 +678,9 @@ def test_gdb_stops_in_an_inlined_function_and_shows_its_frame(how):
 # both copies of `area` by its display form, and by a regular expression in
 # lldb; the out-of-line copy alone by its symbol, and by `rbreak` in gdb; and
 # an instance's method, which has parentheses in its display form.
-@pytest.mark.parametrize("how", PATHS)
-def test_lldb_takes_each_kind_of_breakpoint(how):
+def test_lldb_takes_each_kind_of_breakpoint():
     lldb = _lldb()
-    out = _debugged(how, [lldb, "--batch",
+    out = _debugged([lldb, "--batch",
                           "-o", "breakpoint set --name Main.area[Rectangle]",
                           "-o", "breakpoint set --func-regex '^Main\\.area\\['",
                           "-o", "breakpoint set --name Main#area@Rectangle",
@@ -753,10 +694,9 @@ def test_lldb_takes_each_kind_of_breakpoint(how):
                      re.MULTILINE), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_takes_each_kind_of_breakpoint(how):
+def test_gdb_takes_each_kind_of_breakpoint():
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch",
+    out = _debugged([gdb, "-nx", "-batch",
                           "-ex", "break 'Main.area[Rectangle]'",
                           "-ex", "rbreak ^Main\\.area\\[",
                           "-ex", "break 'Main#area@Rectangle'",
@@ -773,8 +713,7 @@ def test_gdb_takes_each_kind_of_breakpoint(how):
     assert re.search(r"^Breakpoint 4 at 0x[0-9a-f]+", out, re.MULTILINE), out[-4000:]
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_atos_names_the_inlined_frames(how):
+def test_atos_names_the_inlined_frames():
     """The system symbolizer, which `sample` and Instruments use, reads an
     inlined call's range list and names each call around an address: at the
     start of `step`'s code, `step`, then every call it is inside, then the
@@ -783,8 +722,8 @@ def test_atos_names_the_inlined_frames(how):
     if not _darwin():
         pytest.skip("atos is macOS's")
     tool = _needs_dwarfdump()
-    directory = _built(how, LOOP)
-    entries = _entries(tool, _dwarf(how, LOOP))
+    directory = _built(LOOP)
+    entries = _entries(tool, _dwarf(LOOP))
     assert any("DW_AT_ranges" in attributes for _, _, attributes in entries)
     # The entries around the first inlined `step`, innermost first.
     around: list[tuple[int, str, str]] = []
@@ -824,10 +763,9 @@ def test_atos_names_the_inlined_frames(how):
     assert frames[k][1:] == ("prog.gob", "1"), out
 
 
-@pytest.mark.parametrize("how", PATHS)
-def test_gdb_stops_at_a_line_and_names_the_frames(how):
+def test_gdb_stops_at_a_line_and_names_the_frames():
     gdb = _gdb()
-    out = _debugged(how, [gdb, "-nx", "-batch", "-ex", "break prog.gob:2", "-ex", "run",
+    out = _debugged([gdb, "-nx", "-batch", "-ex", "break prog.gob:2", "-ex", "run",
                           "-ex", "bt", "-ex", "kill", "./prog"])
     assert re.search(r"#0 .*Main\.fact.* at prog\.gob:2", out), out[-4000:]
     assert re.search(r"#1 .*Main\.main.* at prog\.gob:9", out), out[-4000:]
@@ -867,7 +805,7 @@ def test_the_filter_names_each_function_as_the_dwarf_does(program):
     names symbols in a profiler's output, by one set of rules written
     twice. So for every function with a symbol, the filter turns the symbol
     into the subprogram's name."""
-    _check_display_names(_built("obj", program) / "prog.o")
+    _check_display_names(_dwarf(program))
 
 
 @pytest.mark.bootstrap
@@ -875,9 +813,9 @@ def test_the_filter_names_each_function_of_the_compiler_as_the_dwarf_does():
     """`turkey` itself, whose namers make every kind of name: instances and
     their methods, defaults, specializations, layout copies and lambdas."""
     with tempfile.TemporaryDirectory() as directory:
-        obj = Path(directory) / "turkey.o"
-        obj.write_bytes(_object(bootc.BOOT_MAIN))
-        _check_display_names(obj)
+        written = Path(directory) / "turkey"
+        bootc.executable(bootc.BOOT_MAIN, written, "-g")
+        _check_display_names(written)
 
 
 def test_the_filter_rewrites_the_symbols_in_a_report():

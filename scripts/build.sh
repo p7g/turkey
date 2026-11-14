@@ -2,16 +2,18 @@
 # Build the compiler from the committed bootstrap, with no Python involved.
 #
 #   stage1  the committed assembly (bootstrap/), linked
-#   stage2  stage1 compiling today's source to an object, linked -- the result,
+#   stage2  the executable stage1 writes for today's source -- the result,
 #           written as `turkey`, the name the compiler is run by
-#   stage3  stage2 compiling the same source             (--fixpoint only)
-#   stage4  stage3's object, which must equal stage3's   (--fixpoint only)
+#   stage3  the executable stage2 writes for the same source  (--fixpoint only)
+#   stage4  the executable stage3 writes, which must be stage3 (--fixpoint only)
 #
-# Stage N is built by stage N-1, and is the file stageN in --out, except
+# Stage N is written by stage N-1, as the file stageN in --out, except
 # stage2, which is the file `turkey`. stage2 is today's source compiled by the
 # committed compiler: correct if that one is, but its code is whatever an older
 # compiler emitted. stage3 is today's source compiled by today's source, and the
-# fixed point is that stage3 emits exactly the object it was built from.
+# fixed point is that stage3 writes exactly the executable it is. The writer
+# puts nothing of the time or the output path in the bytes, so stage3 and
+# stage4 are compared byte for byte.
 #
 # Every stage runs from the repository root with TURKEY_LIB=lib, so each reads
 # this checkout's lib/ and names its files lib/... wherever --out puts the
@@ -27,28 +29,31 @@
 # build it with the bootstrap that commit itself carries.
 #
 # The target is the one the C compiler links for, read from `$CC -dumpmachine`,
-# unless --target names it; every stage is emitted for it and linked by $CC, so
-# the two must agree.
+# unless --target names it; every stage is written for it and stage1 is linked
+# by $CC, so the two must agree.
 # Nothing here asks what the host is: under qemu-user an x86-64 Linux machine
 # builds and runs the arm64 Linux compiler, with $TURKEY_CC a cross compiler.
 #
-# Each stage's object is the whole program, the runtime included -- the
-# collector, the allocator and the panic state are Turkey in lib/, compiled in
-# with everything else -- so a stage is linked from its object alone, against
-# nothing but the C library.
+# Each stage is the whole program, the runtime included -- the collector, the
+# allocator and the panic state are Turkey in lib/, compiled in with
+# everything else -- so stage1 is linked from its assembly alone, against
+# nothing but the C library, and every later stage loads only the C library.
 #
-# Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
-# --fixpoint, of which each self-compile is about 105 s and each link 10 s.
+# Measured on arm64 macOS, Apple clang 17: 9 s to link stage1, then about 5 s
+# for each later stage; 25 s with --fixpoint.
 #
 # Usage: scripts/build.sh [--out DIR] [--target TARGET] [--fixpoint]
 #                         [--stage1 BINARY] [--stage1-only]
 #
 #   --out DIR        where the stages go (default build/stages)
 #   --target TARGET  arm64-darwin or arm64-linux (default: what $CC links for)
-#   --fixpoint       also build stage3 and check stage3's output equals stage2's
+#   --fixpoint       also build stage3 and stage4, and check that stage4 is
+#                    stage3, byte for byte
 #   --stage1 BINARY  use an existing compiler as stage1 instead of the committed
-#                    assembly; how the first bump was made, and how to bump
-#                    across a change the committed compiler cannot build
+#                    assembly; how to bump across a change the committed
+#                    compiler cannot build. It must accept
+#                    `build -o PATH -f exe --target TARGET`, which a compiler
+#                    older than the executable writer does not
 #   --stage1-only    stop after stage1: what scripts/test.sh compiles the test
 #                    harness with
 
@@ -151,17 +156,15 @@ sha() {
     fi
 }
 
-# The compiler's own source, compiled by $1, into $2: an object file, which
-# every stage after the first is linked from, so that the C compiler's
-# assembler runs only on the committed assembly.
+# The compiler's own source, written by $1 as the executable $2.
 emit() {
     step "$(basename "$1") $SOURCE -> $(basename "$2")"
-    $RUN "$1" build -o "$2.tmp" -f obj --target "$target" "$SOURCE"
-    mv "$2.tmp" "$2"
+    $RUN "$1" build -o "$2-tmp" -f exe --target "$target" "$SOURCE"
+    mv "$2-tmp" "$2"
 }
 
 # The same, as assembly on standard output: for saying where two stages
-# differ, since an object's first differing byte names no line.
+# differ, since an executable's first differing byte names no line.
 assembly() {
     $RUN "$1" build -o - -f asm --target "$target" "$SOURCE"
 }
@@ -200,23 +203,21 @@ if [ $only1 = 1 ]; then
     exit 0
 fi
 
-emit "$out/stage1" "$out/stage2.o"
-link "$out/stage2.o" "$out/turkey"
+emit "$out/stage1" "$out/turkey"
 # Nothing here writes a file named stage2. Remove one found in --out, since it
 # is a compiler this build did not make and would be run in place of `turkey`
 # by anything that still names it.
 rm -f "$out/stage2"
 
 if [ $fixpoint = 1 ]; then
-    emit "$out/turkey" "$out/stage3.o"
-    link "$out/stage3.o" "$out/stage3"
-    emit "$out/stage3" "$out/stage4.o"
-    step "compare stage3.o stage4.o"
-    if ! cmp -s "$out/stage3.o" "$out/stage4.o"; then
+    emit "$out/turkey" "$out/stage3"
+    emit "$out/stage3" "$out/stage4"
+    step "compare stage3 stage4"
+    if ! cmp -s "$out/stage3" "$out/stage4"; then
         assembly "$out/turkey" > "$out/stage3.s"
         assembly "$out/stage3" > "$out/stage4.s"
         difference=$(cmp "$out/stage3.s" "$out/stage4.s")
-        echo "build.sh: no fixpoint: ${difference:-the objects differ, the assembly does not}" >&2
+        echo "build.sh: no fixpoint: ${difference:-the executables differ, the assembly does not}" >&2
         line=${difference##* line }
         case $line in *[!0-9]*|'') ;; *)
             echo "  stage3: $(sed -n "${line}p" "$out/stage3.s")" >&2

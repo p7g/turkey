@@ -92,7 +92,7 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
     binary = tmp_path / "broken"
-    bootc.link(source, binary, *VERIFY, env=dict(os.environ, TURKEY_LIB=str(library)))
+    bootc.executable(source, binary, *VERIFY, env=dict(os.environ, TURKEY_LIB=str(library)))
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                             timeout=60, env=dict(os.environ, **GENERATIONAL))
     assert result.returncode == 1, result.stderr

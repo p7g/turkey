@@ -497,7 +497,7 @@ fun main() {
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
     binary = tmp_path / "broken"
-    bootc.link(source, binary, "--gc-verify", env=dict(os.environ, TURKEY_LIB=str(library)))
+    bootc.executable(source, binary, "--gc-verify", env=dict(os.environ, TURKEY_LIB=str(library)))
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
                             env=dict(os.environ, TURKEY_GC_STRESS="1"))
     assert result.returncode == 1, result.stderr

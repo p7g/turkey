@@ -7,11 +7,9 @@ committed, so that none can expire in the repository and none is mistaken for
 something to trust. The client trusts the test CA by naming it as its roots,
 never by turning verification off, which `Net.TLS` cannot do.
 
-Each program links with OpenSSL (`toolchain.openssl_libraries()`); a machine
-where that does not link skips these, unless `$TURKEY_REQUIRE_OPENSSL` says
-it must. One is also written as an executable by `turkey` itself, with no
-linker, which loads `libssl` and `libcrypto` by the names its declarations
-give them.
+Each program is an executable `turkey` writes, which loads OpenSSL's `libssl`
+and `libcrypto` by the names its declarations give them; a machine without
+OpenSSL 3 skips these, unless `$TURKEY_REQUIRE_OPENSSL` says it must.
 """
 
 import os
@@ -57,8 +55,8 @@ commonName = supplied
 @pytest.fixture(scope="session")
 def certs(tmp_path_factory):
     """The certificates' directory: `NAME.pem` and `NAME.key` for each."""
-    if not toolchain.links_openssl():
-        pytest.skip("OpenSSL 3 does not link")
+    if not toolchain.has_openssl():
+        pytest.skip("OpenSSL 3 is not installed")
     d = tmp_path_factory.mktemp("certs")
 
     def key(name):
@@ -104,20 +102,11 @@ def certs(tmp_path_factory):
     return d
 
 
-def _build(tmp_path, source, executable=False):
+def _build(tmp_path, source):
     entry = tmp_path / "main.gob"
     entry.write_text(source)
     binary = tmp_path / "tls"
-    if not executable:
-        bootc.link(entry, binary, libraries=tuple(toolchain.openssl_libraries()))
-        return binary
-    env = dict(os.environ)
-    if (path := toolchain.openssl_dylib_path()):
-        env["TURKEY_DYLIB_PATH"] = path
-    written = subprocess.run(toolchain.command(bootc.binary(), "build", "-f", "exe", "-o",
-                                               str(binary), str(entry)),
-                             capture_output=True, text=True, env=env, timeout=600)
-    assert written.returncode == 0, written.stderr[-4000:]
+    bootc.executable(entry, binary)
     return binary
 
 
@@ -340,10 +329,6 @@ LOOPBACK_OUT = [
 @pytest.mark.parametrize("workers", ["1", "4"])
 def test_a_client_and_a_server_over_loopback(tmp_path, certs, workers):
     assert _run(_build(tmp_path, LOOPBACK), certs, workers=workers) == LOOPBACK_OUT
-
-
-def test_an_executable_boot_writes_runs_over_loopback(tmp_path, certs):
-    assert _run(_build(tmp_path, LOOPBACK, executable=True), certs) == LOOPBACK_OUT
 
 
 SNI = COMMON + """

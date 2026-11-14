@@ -1,15 +1,16 @@
 """The bootstrap: what is committed, and the fixed point it reaches.
 
 `bootc.binary()` is stage2 of `scripts/build.sh`: the committed compiler in
-`bootstrap/` compiling today's source. Here stage2 compiles the
-same source again, which links into stage3, and stage3 compiling it once more
-must emit stage2's output byte for byte.
+`bootstrap/` compiling today's source. Here stage2 writes the same source as
+an executable, stage3, and stage3 must write itself byte for byte.
 
 The two compilers compared are the committed one and the one built from
 today's source: the ordinary fixed point, which is what OCaml's `make compare`
 and Rust's stage3 check. It is weaker than comparing two independent compilers
 of the same source, since a miscompile that reproduces itself exactly survives
-it; what it does catch is any change in what the compiler emits for itself.
+it; what it does catch is any change in what the compiler writes for itself.
+It compares executables, so the encoder, the layout and the signature are
+inside it as well as the code.
 
 **The fixed point is opt in.** It costs a couple of minutes and re-pays on every
 change to `src/`, which is when it is least wanted, so it is marked
@@ -18,9 +19,8 @@ change to `src/`, which is when it is least wanted, so it is marked
     pytest -m bootstrap
 
 `tests/test_emit.py` already assembles stage2's emission of the compiler on
-every run, so what is opt-in here is the linking and the second compile, not
-the coverage of the emitter itself. The provenance check is cheap and always
-runs.
+every run, so what is opt-in here is the second compile, not the coverage of
+the emitter itself. The provenance check is cheap and always runs.
 """
 
 from __future__ import annotations
@@ -37,7 +37,6 @@ import pytest
 
 from tests import bootc, toolchain
 from tests.bootc import CACHE
-from tests.bootc import digest as _digest, replace_built as _replace_built
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
@@ -59,23 +58,34 @@ def _stage3_assembly() -> str:
     return bootc.boot_each("asm", [BOOT_MAIN], _split)[BOOT_MAIN]
 
 
+def _write_boot(compiler: Path, output: Path) -> None:
+    result = subprocess.run(
+        toolchain.command(compiler, "build", "-o", str(output), str(BOOT_MAIN)),
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+
+
 @functools.lru_cache(maxsize=None)
 def _stage3() -> Path:
-    """Stage2's output for itself, assembled and linked: a compiler built by
-    today's source rather than by the committed one."""
-    assembly = _stage3_assembly().encode("utf-8")
-    output = CACHE / f"stage3-arm64-{_digest(assembly, toolchain.identity())}.bin"
+    """The executable stage2 writes for the compiler's own source: a compiler
+    built by today's source rather than by the committed one."""
+    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
+    # `build_key` covers the binary and `lib/` alone, and stage3 is
+    # today's `src/` too.
+    h = hashlib.sha256(bootc.build_key().encode())
+    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
+        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
+        h.update(path.read_bytes())
+    key = h.hexdigest()[:16]
+    output = CACHE / f"stage3-{key}"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
-        stem = output.with_suffix(f".{os.getpid()}")
-        source = stem.with_suffix(stem.suffix + ".s")
-        source.write_bytes(assembly)
-        staging = stem.with_suffix(stem.suffix + ".bin")
+        staging = CACHE / f"stage3-{key}-{os.getpid()}"
         try:
-            _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            *toolchain.libraries()], output)
+            _write_boot(bootc.binary(), staging)
+            os.replace(staging, output)
         finally:
-            source.unlink(missing_ok=True)
+            staging.unlink(missing_ok=True)
     return output
 
 
@@ -84,34 +94,35 @@ def _sha(text: str) -> str:
 
 
 @pytest.mark.bootstrap
-@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
-def test_stage3_compiles_the_compiler_to_stage2s_bytes():
-    """The fixed point, as a byte comparison.
+def test_stage3_writes_itself_byte_for_byte(tmp_path):
+    """The fixed point: stage3 writes stage4, which must be stage3's bytes.
 
-    Hashed rather than compared directly: the two texts are about 54 MB each,
-    and holding both plus a diff is a great deal of memory to spend on an
-    assertion that is almost always true. On a mismatch the first differing
-    line is reported, which is what a failure actually needs.
+    The `-o` path is not in the bytes: the signature's identifier is the
+    entry file's stem, so stage4 is written under another directory and
+    name. On a mismatch the first line where stage3's assembly differs from
+    stage2's is reported, since an executable's first differing byte names
+    no line.
     """
-    stage3 = _stage3_assembly()
+    stage4 = tmp_path / "stage4"
+    _write_boot(_stage3(), stage4)
+    if _stage3().read_bytes() == stage4.read_bytes():
+        return
     result = subprocess.run(
         toolchain.command(_stage3(), *bootc.argv("asm"), str(BOOT_MAIN)),
         cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
-    stage4 = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name]
-
-    if _sha(stage3) == _sha(stage4):
-        return
-    one, two = stage3.splitlines(), stage4.splitlines()
+    one = _stage3_assembly().splitlines()
+    two = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name].splitlines()
     for number, (a, b) in enumerate(zip(one, two), start=1):
         if a != b:
-            pytest.fail(f"stage3's output differs from stage2's at line {number}:\n"
+            pytest.fail(f"stage3's assembly differs from stage2's at line {number}:\n"
                         f"  stage2: {a}\n  stage3: {b}")
-    pytest.fail(f"stage3 emitted {len(two)} lines, stage2 {len(one)}")
+    if len(one) != len(two):
+        pytest.fail(f"stage3 emitted {len(two)} lines, stage2 {len(one)}")
+    pytest.fail("stage3 and stage4 differ, and stage2's and stage3's assembly do not")
 
 
 @pytest.mark.bootstrap
-@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_stage3_agrees_with_stage2_over_the_corpus():
     """One program, two compilers, for every program in the corpus.
 
@@ -128,36 +139,6 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     stage3 = bootc.split_before(result.stdout, "; === ")
     for path in programs:
         assert _sha(stage2[path]) == _sha(stage3[path.name]), path.name
-
-
-@pytest.mark.bootstrap
-@pytest.mark.skipif(toolchain.target() not in ("arm64-darwin", "arm64-linux"),
-                    reason="runs the executable turkey writes")
-def test_an_executable_boot_writes_itself_byte_for_byte(tmp_path):
-    """The fixed point through the executable writer, with nothing linked.
-
-    Stage2 writes `turkey` as an executable, which writes itself again; the
-    two must be the same bytes. Both are named `turkey`, since a Mach-O's
-    signature names the file. The written `turkey` must also emit the same
-    assembly for the compiler as stage2, so that it is the compiler stage3
-    is and not merely one that reproduces itself.
-    """
-    first = tmp_path / "first" / "turkey"
-    second = tmp_path / "second" / "turkey"
-    for directory in (first.parent, second.parent):
-        directory.mkdir()
-    for compiler, output in ((bootc.binary(), first), (first, second)):
-        result = subprocess.run(
-            toolchain.command(compiler, "build", "-f", "exe", "-o", str(output),
-                              str(BOOT_MAIN)),
-            cwd=REPO_ROOT, capture_output=True, text=True)
-        assert result.returncode == 0, result.stderr[:4000]
-    assert first.read_bytes() == second.read_bytes()
-    result = subprocess.run(toolchain.command(first, *bootc.argv("asm"), str(BOOT_MAIN)),
-                            cwd=REPO_ROOT, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:4000]
-    written = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name]
-    assert _sha(written) == _sha(_stage3_assembly())
 
 
 STRESSED = REPO_ROOT / "tests" / "programs" / "adt.gob"
@@ -196,7 +177,7 @@ def verifying_boot(tmp_path_factory) -> Path:
     chosen when a program is compiled."""
     directory = tmp_path_factory.mktemp("verifying-turkey")
     binary = directory / "turkey"
-    bootc.link(bootc.BOOT_MAIN, binary, "--gc-verify")
+    bootc.executable(bootc.BOOT_MAIN, binary, "--gc-verify")
     return binary
 
 
@@ -257,31 +238,3 @@ def test_build_sh_speaks_only_the_bootstraps_command_line():
         "the compiler in bootstrap/ now takes `build`, so scripts/build.sh no longer "
         "needs to fall back to `native`: remove `emit_command` and call "
         "`build -o - -f asm` directly")
-
-
-def test_build_sh_links_objects_once_the_bootstrap_writes_them():
-    """A tripwire for the first bump whose compiler writes objects.
-
-    `scripts/build.sh` has the C compiler assemble every stage, because the
-    committed compiler cannot write an object. Once a bump records a commit
-    that has the object writer, every stage can: have `emit` write `-f obj`
-    and `link` link the object, so that the assembler runs only on the
-    committed assembly. Whether `--fixpoint` then compares objects or still
-    compares assembly is for that change to decide.
-
-    Read from the recorded commit's tree, since the committed assembly does
-    not say what it can do; without git there is nothing to read.
-    """
-    if not ((REPO_ROOT / ".git").exists() and shutil.which("git")):
-        return
-    writes_objects = subprocess.run(
-        ["git", "cat-file", "-e", f"{_provenance()['commit']}:src/Turkey/MachO.gob"],
-        cwd=REPO_ROOT, capture_output=True).returncode == 0
-    if not writes_objects:
-        return
-    script = (REPO_ROOT / "scripts" / "build.sh").read_text()
-    assert "-f obj" in script, (
-        "bootstrap/ was built from a compiler that writes objects, so "
-        "scripts/build.sh can link every stage from an object instead of "
-        "assembling it")
-

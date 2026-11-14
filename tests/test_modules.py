@@ -447,18 +447,17 @@ fun main() {
     assert output(src, {}, capsys) == ["False", "True", "5"]
 
 
-def test_an_export_list_cannot_re_export_a_module(tmp_path):
-    search = write(tmp_path, Nope="export (module Helper)\nimport Helper\nfun f() = 1",
-                   Helper=HELPER)
+def test_an_export_list_names_a_qualifier_as_it_is_in_scope(tmp_path):
+    search = write(tmp_path, Nope="export (module Set)\nimport Data.Set\nfun f() = 1")
     assert fails("import Nope", search) == (
-        "'module' cannot appear in an export list; an export list can name only "
-        "declarations")
+        "module 'Nope' exports 'module Set', but no qualifier 'Set' is in scope "
+        "here; import a module as 'Set'")
 
 
-def test_module_is_not_an_import_form(tmp_path):
+def test_an_import_list_cannot_pick_a_qualifier_the_module_does_not_export(tmp_path):
     search = write(tmp_path, Helper=HELPER)
     assert fails("import Helper (module Helper)", search) == \
-        "expected a name, found keyword 'module'"
+        "module 'Helper' does not export 'module Helper'"
 
 
 # -- a type and an instance know which module made them -----------------------

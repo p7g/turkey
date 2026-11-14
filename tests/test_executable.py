@@ -2,7 +2,7 @@
 for glibc, that the loader takes as it takes the linker's, with nothing
 linked.
 
-`scripts/test.sh --exe` runs every program through this path against the
+`scripts/test.sh` runs every program through this path against the
 same goldens, which is what decides whether the image is right. These tests
 check what a run cannot see: that the signature verifies, that the loader is
 asked for the binds the linker would ask for and for no rebase, that the
@@ -53,6 +53,16 @@ def _write(entry: Path, output: Path, *flags: str) -> None:
     assert result.returncode == 0, result.stderr[-4000:]
 
 
+def _linked(entry: Path, output: Path) -> None:
+    """`entry` as the system's assembler and linker build it from `turkey`'s
+    assembly: the oracle the writer is compared with."""
+    source = output.with_name(output.name + ".s")
+    result = _boot("-f", "asm", "-o", str(source), str(entry))
+    assert result.returncode == 0, result.stderr[-4000:]
+    subprocess.run([*toolchain.cc(), "-o", str(output), str(source), *toolchain.libraries()],
+                   check=True)
+
+
 def _fixups(executable: Path) -> list[tuple[str, str, str]]:
     """What `dyld_info -fixups` asks the loader for: each fixup's section,
     kind and target, in address order."""
@@ -94,7 +104,7 @@ def test_the_loader_is_asked_for_what_the_linker_asks_for(tmp_path):
     ours = tmp_path / "ours"
     theirs = tmp_path / "theirs"
     _write(PROGRAMS / "adt.gob", ours)
-    bootc.link(PROGRAMS / "adt.gob", theirs, env=ENV)
+    _linked(PROGRAMS / "adt.gob", theirs)
     fixups = _fixups(ours)
     assert fixups and {kind for _, kind, _ in fixups} == {"bind"}, fixups[:10]
     assert fixups == _fixups(theirs)

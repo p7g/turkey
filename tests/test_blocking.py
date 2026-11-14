@@ -55,7 +55,7 @@ def test_a_blocked_read_does_not_hold_up_a_collection(tmp_path, workers):
     source = tmp_path / "main.gob"
     source.write_text(PROGRAM)
     binary = tmp_path / "blocking"
-    bootc.link(source, binary)
+    bootc.executable(source, binary)
     process = subprocess.Popen(toolchain.command(binary), stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                env=dict(os.environ, TURKEY_WORKERS=workers))

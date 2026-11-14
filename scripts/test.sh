@@ -1,14 +1,9 @@
 #!/bin/sh
 # Run the test harness, tests/harness/, with the arguments given:
 #
-#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [--exe] [PATH[::CASE]...]
+#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [PATH[::CASE]...]
 #   scripts/test.sh --selftest
 #   scripts/test.sh --bless [PATH[::CASE]...]
-#
-# --exe has turkey write every program as an executable itself, with -f exe,
-# instead of linking its object with the C compiler: the same goldens, through
-# the other path. CI runs it on Linux; run it on a Mac after changing the
-# Mach-O writer or what it is fed.
 #
 # --bless writes the actual results of the cases selected over their goldens,
 # refusing any that look like a broken compiler; tests/harness/Bless.gob says
@@ -32,7 +27,9 @@
 # library change that compiles under stage2 but not under stage1 is that
 # case; it waits for scripts/bump-bootstrap.sh, or is written another way.
 #
-# $TURKEY_CC and $TURKEY_RUN are read as scripts/build.sh reads them.
+# Both programs, and every case's program, are executables `turkey` writes:
+# nothing here is linked. $TURKEY_CC and $TURKEY_RUN are read as
+# scripts/build.sh reads them.
 
 set -eu
 
@@ -113,12 +110,6 @@ else
 fi
 case $boot in /*) ;; *) boot=$ROOT/$boot ;; esac
 
-# glibc keeps the maths library out of libc, and lib/ calls fmod and floor.
-case $($CC -dumpmachine) in
-    *linux*) LIBS=-lm ;;
-    *) LIBS= ;;
-esac
-
 harness_key=$({ bootstrap_files; library; find tests/harness -maxdepth 1 -name '*.gob'; } | fingerprint)
 harness=$CACHE/harness/$harness_key/harness
 if [ ! -x "$harness" ]; then
@@ -126,8 +117,7 @@ if [ ! -x "$harness" ]; then
     staging=$CACHE/harness/$harness_key.$$
     mkdir -p "$staging"
     (cd tests/harness &&
-     TURKEY_LIB=$ROOT/lib $RUN "$stage1" build -o "$staging/harness.o" -f obj Main.gob)
-    $CC -o "$staging/harness" "$staging/harness.o" $LIBS
+     TURKEY_LIB=$ROOT/lib $RUN "$stage1" build -o "$staging/harness" -f exe Main.gob)
     mkdir -p "$(dirname "$harness")"
     mv "$staging/harness" "$harness"
     rm -rf "$staging"

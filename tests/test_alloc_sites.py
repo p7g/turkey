@@ -32,7 +32,7 @@ def _counted(tmp_path):
     entry.write_text(PROGRAM, encoding="utf-8")
     env = dict(os.environ, TURKEY_ALLOC_SITES="1", TURKEY_LIB=str(lang.LIB))
     binary = tmp_path / "main"
-    compiled = bootc.link(entry, binary, cwd=tmp_path, env=env)
+    compiled = bootc.executable(entry, binary, cwd=tmp_path, env=env)
     run = subprocess.run([str(binary)], cwd=tmp_path, capture_output=True,
                          text=True, check=True)
     table = [line.split("\t") for line in compiled.stderr.splitlines()

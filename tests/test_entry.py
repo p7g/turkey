@@ -26,10 +26,10 @@ pytestmark = pytest.mark.skipif(toolchain.missing(),
 
 
 def _boot_binary(source: Path, tmp_path: Path) -> Path:
-    """`turkey build`, linked."""
+    """The executable `turkey build` writes for `source`."""
     # From the repository, where `turkey` finds `lib/`.
     output = tmp_path / source.stem
-    bootc.link(source, output)
+    bootc.executable(source, output)
     return output
 
 

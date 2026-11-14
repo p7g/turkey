@@ -460,11 +460,14 @@ A passed-on name is the declaration it was where it was defined. Reaching it
 by two routes is not a conflict, and an error message names the module that
 declares it.
 
-**Which declaration a name means.** A name the module itself declares always
-wins: above, `Kit` declares `name`, so the `name` it exports is its own and
-not the one `Shapes` exports, and nothing has to be withheld to say so.
-Otherwise an entry that names the name wins over a `..` that merely covers
-it. Two entries of equal standing that pass on different declarations under
+**Which declaration a name means.** A declaration the module exports always
+wins: above, `Kit` declares `name` and exports it through `..`, so the `name`
+it exports is its own and not the one `Shapes` exports, and nothing has to be
+withheld to say so. A declaration the module does *not* export has no say:
+had `Kit` written `export (module Shapes (..))`, its importers would get the
+`name` that `Shapes` exports, while inside `Kit` the name would still mean
+`Kit`'s own. Otherwise an entry that names the name wins over a `..` that
+merely covers it. Two entries of equal standing that pass on different declarations under
 one name are an error:
 
 <!-- module: Shapes.gob -->

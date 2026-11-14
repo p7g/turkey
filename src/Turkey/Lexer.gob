@@ -1,4 +1,4 @@
-export (Lexed(..), tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
+export (Lexed(..), tokenize, tokenizeRaw, tokenizeLenient, applyNewlineRule, isOperatorChar)
 
 --- The tokenizer, in two passes.
 ---
@@ -9,6 +9,9 @@ export (Lexed(..), tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
 --- Comments and blank lines are not tokens. The first pass collects them into
 --- tables beside the tokens, so that the parser never has to skip them and a
 --- tool that reprints the source can still put them back.
+---
+--- A lex error ends the compile. `tokenizeLenient` stops at the first one
+--- instead, for a tool that shows text that need not lex.
 ---
 --- Identifiers and numerals are ASCII: `[a-z_]` starts a name and `[0-9]` a
 --- numeral, so a Greek letter or a Devanagari digit starts neither. The rules
@@ -29,6 +32,10 @@ type Lexer = Lexer {
     -- The last line on which a token or a comment ended, or 0 before the
     -- first. A line break on any later line ends a blank line.
     var lastContent : Int,
+    -- Whether a lex error ends the compile. When it does not, the first error
+    -- is kept in `failure` and the lexer stops at the token it was in.
+    fatal          : Bool,
+    var failure    : Option Diag.Diag,
 }
 
 --- A file's tokens, and what the tokens leave out: its comments in source
@@ -113,11 +120,29 @@ fun bumpBy(lx : Lexer, count : Int) -> Unit {
 
 fun here(lx : Lexer) -> Span = span(lx.file, lx.line, lx.col)
 
--- Ends the compile. The lexer cannot step over a malformed token and go on:
--- where the next token starts depends on where this one ends, and the
--- parser cannot recover from a token it was not given either.
-fun oops(lx : Lexer, message : String, where : Span) -> a =
-    Diag.fail(Diag.at("lex error", message, where), lx.file)
+-- Ends the compile, or, in a lenient lexer, keeps the first error and answers
+-- `fallback`. The lexer cannot step over a malformed token and go on: where
+-- the next token starts depends on where this one ends, and the parser cannot
+-- recover from a token it was not given either.
+--
+-- So a lenient lexer goes no further than the token or comment it was in.
+-- Every site returns as soon as `oops` answers, and every loop that called it
+-- breaks. `tokenizeRaw`'s loop checks `failure` after each token, so the
+-- fallback is never kept. A fallback must not lead its caller to `internal`.
+fun oops(lx : Lexer, message : String, where : Span, fallback : a) -> a {
+    let d = Diag.at("lex error", message, where)
+    if lx.fatal { return Diag.fail(d, lx.file) }
+    if let None = lx.failure { lx.failure = Some(d) }
+    fallback
+}
+
+fun failed(lx : Lexer) -> Bool = match lx.failure {
+    Some(_) -> True
+    None -> False
+}
+
+-- What a token site answers after a lenient `oops`. Never kept.
+fun broken(where : Span) -> Token = plain(KEof, VNone, where)
 
 -- A check that only a bug in this module can fail.
 fun internal(lx : Lexer, message : String, where : Span) -> a =
@@ -151,7 +176,17 @@ fun charIsSign(c : Option Char) -> Bool = match c {
 
 -- -- pass one ----------------------------------------------------------------------
 
-fun tokenizeRaw(source : Source) -> Lexed {
+fun tokenizeRaw(source : Source) -> Lexed = lex(source, True).0
+
+--- Returns the tokens and comments of `source` up to its first lex error, and
+--- that error; or all of them and `None`, as `tokenizeRaw` would. Never ends
+--- the compile and never reports anything.
+---
+--- After an error, the tokens and comments are those that ended before the
+--- token or comment the error is in, and the tokens end without an EOF.
+fun tokenizeLenient(source : Source) -> (Lexed, Option Diag.Diag) = lex(source, False)
+
+fun lex(source : Source, fatal : Bool) -> (Lexed, Option Diag.Diag) {
     let lx = Lexer {
         src = source.text,
         file = source.name,
@@ -161,17 +196,20 @@ fun tokenizeRaw(source : Source) -> Lexed {
         comments = [],
         blankLines = [],
         lastContent = 0,
+        fatal = fatal,
+        failure = None,
     }
     let tokens = Vec.new(64)
     loop {
         skipInlineTrivia(lx)
-        if atEnd(lx) { break }
+        if atEnd(lx) || failed(lx) { break }
         let start = here(lx)
         match peek(lx) {
             None -> { break }
             Some(c) -> {
                 if c == '\n' && lx.lastContent < lx.line { Vec.push(lx.blankLines, lx.line) }
                 let tok = lexOne(lx, start, c, tokens)
+                if failed(lx) { break }
                 -- A `;` is a NEWLINE, and it is also text on its line.
                 match tok.kind {
                     KNewline -> if tok.forced { lx.lastContent = lx.line }
@@ -186,8 +224,9 @@ fun tokenizeRaw(source : Source) -> Lexed {
             }
         }
     }
-    Vec.push(tokens, plain(KEof, VText(""), here(lx)))
-    Lexed { tokens = tokens, comments = lx.comments, blankLines = lx.blankLines }
+    if !failed(lx) { Vec.push(tokens, plain(KEof, VText(""), here(lx))) }
+    (Lexed { tokens = tokens, comments = lx.comments, blankLines = lx.blankLines },
+     lx.failure)
 }
 
 fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Vec Token) -> Token {
@@ -262,7 +301,7 @@ fun skipBlockComment(lx : Lexer) -> Unit {
     let from = lx.at
     var depth = 0
     loop {
-        if atEnd(lx) { oops(lx, "this block comment has no closing '-}'", start) }
+        if atEnd(lx) { return oops(lx, "this block comment has no closing '-}'", start, {}) }
         if charIs(peek(lx), '{') && charIs(peekAt(lx, 1), '-') {
             bumpBy(lx, 2)
             depth = depth + 1
@@ -308,12 +347,16 @@ fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
     let isFloat = (charIs(peek(lx), '.') && isDigitIn(peekAt(lx, 1), 10))
         || isExponentMark(peek(lx))
     if String.startsWith(text, "0") && text != "0" {
-        if isFloat { oops(lx, "'" + text + "' has a leading zero; remove it", start) }
-        oops(lx, "'" + text + "' has a leading zero; remove it, or write '0o"
-                 + withoutLeadingZeros(text) + "' for an octal number", start)
+        if isFloat {
+            return oops(lx, "'" + text + "' has a leading zero; remove it", start, broken(start))
+        }
+        return oops(lx, "'" + text + "' has a leading zero; remove it, or write '0o"
+                        + withoutLeadingZeros(text) + "' for an octal number", start,
+                    broken(start))
     }
     if isFloat { return lexFloat(lx, start, from) }
     endOfNumeral(lx, start, 10)
+    if failed(lx) { return broken(start) }
     intToken(lx, start, from, text, 10)
 }
 
@@ -322,10 +365,12 @@ fun lexRadix(lx : Lexer, start : Span, from : String.Index, radix : Int) -> Toke
     let digitsFrom = lx.at
     if !isDigitIn(peek(lx), radix) {
         let prefix = String.slice(lx.src, from, lx.at)
-        oops(lx, radixName(radix) + " literal needs a digit after '" + prefix + "'", start)
+        return oops(lx, radixName(radix) + " literal needs a digit after '" + prefix + "'",
+                    start, broken(start))
     }
     digitRun(lx, radix)
     endOfNumeral(lx, start, radix)
+    if failed(lx) { return broken(start) }
     intToken(lx, start, from, String.slice(lx.src, digitsFrom, lx.at), radix)
 }
 
@@ -337,13 +382,13 @@ fun lexSelector(lx : Lexer, start : Span) -> Token {
     while isDigitIn(peek(lx), 10) { bump(lx) }
     let text = String.slice(lx.src, from, lx.at)
     if String.startsWith(text, "0") && text != "0" {
-        oops(lx, "tuple index '." + text + "' has a leading zero; write '."
-                 + withoutLeadingZeros(text) + "'", start)
+        return oops(lx, "tuple index '." + text + "' has a leading zero; write '."
+                        + withoutLeadingZeros(text) + "'", start, broken(start))
     }
     if let Some(c) = peek(lx) {
         if gluedOn(Some(c)) {
-            oops(lx, "tuple index '." + text + "' cannot be followed directly by '"
-                     + Char.toString(c) + "'", start)
+            return oops(lx, "tuple index '." + text + "' cannot be followed directly by '"
+                            + Char.toString(c) + "'", start, broken(start))
         }
     }
     intToken(lx, start, from, text, 10)
@@ -374,7 +419,7 @@ fun intToken(lx : Lexer, start : Span, from : String.Index, digits : String,
     -- `Int` is 64-bit, so a literal past its range is a compile error
     -- rather than something that wraps or widens.
     None -> oops(lx, "integer literal '" + String.slice(lx.src, from, lx.at)
-                     + "' is too large for 'Int'", start)
+                     + "' is too large for 'Int'", start, broken(start))
 }
 
 -- Entered at the `.` of a fraction or at the `e` of an exponent. An exponent
@@ -388,12 +433,13 @@ fun lexFloat(lx : Lexer, start : Span, from : String.Index) -> Token {
         bump(lx)
         if charIsSign(peek(lx)) { bump(lx) }
         if !isDigitIn(peek(lx), 10) {
-            oops(lx, "the exponent in '" + String.slice(lx.src, from, lx.at)
-                     + "' has no digits", start)
+            return oops(lx, "the exponent in '" + String.slice(lx.src, from, lx.at)
+                            + "' has no digits", start, broken(start))
         }
         digitRun(lx, 10)
     }
     endOfNumeral(lx, start, 10)
+    if failed(lx) { return broken(start) }
     let text = String.slice(lx.src, from, lx.at)
     match Float.parse(String.replace(text, "_", "")) {
         Some(x) -> plain(KFloat, VFloat(x), start)
@@ -419,13 +465,13 @@ fun endOfNumeral(lx : Lexer, start : Span, radix : Int) -> Unit = match peek(lx)
     None -> {}
     Some(c) -> {
         if c == '_' {
-            oops(lx, "'_' in this number is not between two digits; remove it", start)
+            oops(lx, "'_' in this number is not between two digits; remove it", start, {})
         } else if Char.isDigit(c) {
             oops(lx, "invalid digit '" + Char.toString(c) + "' in "
-                     + radixName(radix) + " literal", start)
+                     + radixName(radix) + " literal", start, {})
         } else if gluedOn(peek(lx)) {
             oops(lx, "a number cannot be followed directly by '"
-                     + Char.toString(c) + "'", start)
+                     + Char.toString(c) + "'", start, {})
         }
     }
 }
@@ -496,18 +542,20 @@ fun lexString(lx : Lexer, start : Span) -> Token {
     let b = String.builder()
     loop {
         match peek(lx) {
-            None -> { oops(lx, "the file ends inside this string literal", start) }
+            None -> { return oops(lx, "the file ends inside this string literal", start, broken(start)) }
             Some(c) -> {
                 if c == '\n' {
-                    oops(lx, "this string literal has no closing '\"' on its line; "
-                             + "write '\\n' for a line break", start)
+                    return oops(lx, "this string literal has no closing '\"' on its line; "
+                                    + "write '\\n' for a line break", start, broken(start))
                 }
                 if c == '"' {
                     bump(lx)
                     break
                 }
                 if c == '\\' {
-                    String.push(b, Char.toString(lexEscape(lx)))
+                    let escaped = lexEscape(lx)
+                    if failed(lx) { return broken(start) }
+                    String.push(b, Char.toString(escaped))
                 } else {
                     String.push(b, Char.toString(c))
                     bump(lx)
@@ -523,10 +571,13 @@ fun lexChar(lx : Lexer, start : Span) -> Token {
     var value = '?'
     var empty = False
     match peek(lx) {
-        None -> { oops(lx, "the file ends inside this character literal", start) }
+        None -> {
+            return oops(lx, "the file ends inside this character literal", start, broken(start))
+        }
         Some(c) -> {
             if c == '\\' {
                 value = lexEscape(lx)
+                if failed(lx) { return broken(start) }
             } else {
                 empty = c == '\''
                 value = c
@@ -535,12 +586,12 @@ fun lexChar(lx : Lexer, start : Span) -> Token {
         }
     }
     if !charIs(peek(lx), '\'') {
-        if empty { oops(lx, "this character literal is empty", start) }
+        if empty { return oops(lx, "this character literal is empty", start, broken(start)) }
         if atEnd(lx) || charIs(peek(lx), '\n') {
-            oops(lx, "this character literal has no closing quote", start)
+            return oops(lx, "this character literal has no closing quote", start, broken(start))
         }
-        oops(lx, "this character literal holds more than one character; "
-                 + "write text in double quotes", start)
+        return oops(lx, "this character literal holds more than one character; "
+                        + "write text in double quotes", start, broken(start))
     }
     bump(lx)
     plain(KChar, VChar(value), start)
@@ -557,7 +608,7 @@ fun lexEscape(lx : Lexer) -> Char {
     bump(lx)
     var c = '?'
     match peek(lx) {
-        None -> { oops(lx, "the file ends inside this escape sequence", start) }
+        None -> { return oops(lx, "the file ends inside this escape sequence", start, '?') }
         Some(found) -> { c = found }
     }
     bump(lx)
@@ -570,7 +621,7 @@ fun lexEscape(lx : Lexer) -> Char {
         '\\' -> '\\'
         '"' -> '"'
         '\'' -> '\''
-        _ -> oops(lx, "unknown escape sequence '\\" + Char.toString(c) + "'", start)
+        _ -> oops(lx, "unknown escape sequence '\\" + Char.toString(c) + "'", start, '?')
     }
 }
 
@@ -578,7 +629,7 @@ let malformedUnicodeEscape =
     "malformed '\\u' escape; write one to six hex digits in braces, as in '\\u{1F600}'"
 
 fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
-    if !charIs(peek(lx), '{') { oops(lx, malformedUnicodeEscape, start) }
+    if !charIs(peek(lx), '{') { return oops(lx, malformedUnicodeEscape, start, '?') }
     bump(lx)
     let from = lx.at
     var count = 0
@@ -587,14 +638,14 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
         count = count + 1
     }
     if count < 1 || count > 6 || !charIs(peek(lx), '}') {
-        oops(lx, malformedUnicodeEscape, start)
+        return oops(lx, malformedUnicodeEscape, start, '?')
     }
     let digits = String.slice(lx.src, from, lx.at)
     bump(lx)
     let code = Option.expect(valueIn(digits, 16), "six hex digits fit an Int")
     match Char.fromInt(code) {
         Some(c) -> c
-        None -> oops(lx, notScalar("'\\u{" + digits + "}'", code), start)
+        None -> oops(lx, notScalar("'\\u{" + digits + "}'", code), start, '?')
     }
 }
 
@@ -677,7 +728,7 @@ fun lexOperator(lx : Lexer, start : Span, c : Char) -> Token {
             return plain(KOp(op), VText(op), start)
         }
     }
-    oops(lx, "unexpected character '" + Char.toString(c) + "'", start)
+    oops(lx, "unexpected character '" + Char.toString(c) + "'", start, broken(start))
 }
 
 -- -- pass two: the newline rule ----------------------------------------------------

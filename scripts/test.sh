@@ -28,12 +28,10 @@
 # case; it waits for scripts/bump-bootstrap.sh, or is written another way.
 #
 # Both programs, and every case's program, are executables `turkey` writes:
-# nothing here is linked. $TURKEY_CC and $TURKEY_RUN are read as
-# scripts/build.sh reads them.
+# nothing here is linked. $TURKEY_RUN is read as scripts/build.sh reads it.
 
 set -eu
 
-CC=${TURKEY_CC:-cc}
 RUN=${TURKEY_RUN:-}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -51,14 +49,14 @@ else
 fi
 
 # A digest of the files named on standard input, by name and contents, in a
-# stable order, with the C compiler's identity: the same source linked by two
-# compilers is two different binaries, and this cache is shared by every
+# stable order, with what scripts/build.sh chooses the target by: the host,
+# and $TURKEY_CC where the host is not a target. This cache is shared by every
 # session on the machine.
 fingerprint() {
     {
         LC_ALL=C sort | xargs $SHA
-        printf '%s\n' "$CC"
-        $CC --version 2>&1
+        uname -sm
+        printf '%s\n' "${TURKEY_CC:-}"
     } | $SHA | cut -c1-16
 }
 
@@ -117,7 +115,7 @@ if [ ! -x "$harness" ]; then
     staging=$CACHE/harness/$harness_key.$$
     mkdir -p "$staging"
     (cd tests/harness &&
-     TURKEY_LIB=$ROOT/lib $RUN "$stage1" build -o "$staging/harness" -f exe Main.gob)
+     TURKEY_LIB=$ROOT/lib $RUN "$stage1" build -o "$staging/harness" Main.gob)
     mkdir -p "$(dirname "$harness")"
     mv "$staging/harness" "$harness"
     rm -rf "$staging"

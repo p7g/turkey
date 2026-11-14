@@ -70,8 +70,9 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
                 continue
             h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
-    # `build.sh` links stage1 with `$TURKEY_CC`, and builds for the target
-    # `$TURKEY_CC` links for.
+    # `build.sh` builds for the host, or for the target `$TURKEY_CC` links for
+    # on a host that is not one.
+    h.update(os.uname().sysname.encode() + os.uname().machine.encode())
     h.update(toolchain.identity())
     return h.hexdigest()[:16]
 

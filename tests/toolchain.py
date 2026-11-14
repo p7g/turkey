@@ -5,9 +5,10 @@ Three settings, split with shell-word rules:
 * `$TURKEY_CC` is the C compiler, `cc` when unset. It compiles the C probes
   some tests run beside a program, and assembles `turkey`'s assembly where a
   test checks it with the system assembler. On an x86-64 machine checking
-  arm64 output it is a cross compiler, and links the bootstrap compiler
-  statically. Everything `turkey` writes is dynamically linked against glibc,
-  which qemu-user loads from where `$QEMU_LD_PREFIX` names.
+  arm64 output it is a cross compiler, and links those C files statically.
+  Everything `turkey` writes, the committed compiler included, is dynamically
+  linked against glibc, which qemu-user loads from where `$QEMU_LD_PREFIX`
+  names.
 * `$TURKEY_OPENSSL` is where OpenSSL 3 is installed, for a program that
   imports `Net.TLS`: its `lib/`, `include/` and `bin/openssl`. Unset on macOS
   it is Homebrew's `openssl@3`; unset elsewhere it is the system's, found by
@@ -17,10 +18,10 @@ Three settings, split with shell-word rules:
   also under qemu-user once binfmt_misc knows the format; the prefix
   (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
-`scripts/build.sh` reads `$TURKEY_CC` and `$TURKEY_RUN` too. A cached `turkey`
-is keyed on `identity()` as well as its sources, since the caches are shared
-by every session on the machine, and the target `build.sh` builds for is the
-one `$TURKEY_CC` links for.
+`scripts/build.sh` reads `$TURKEY_RUN` too, and `$TURKEY_CC` to choose the
+target on a host that is not one. A cached `turkey` is keyed on `identity()`
+as well as its sources, since the caches are shared by every session on the
+machine.
 """
 
 from __future__ import annotations
@@ -138,9 +139,10 @@ def identity() -> bytes:
 def machine() -> str:
     """The triple `$TURKEY_CC -dumpmachine` reports, or "" if it cannot say.
 
-    `scripts/build.sh` chooses its target from the same triple, and `turkey`
-    emits for the target it was built for, so this is also what the tests'
-    programs are compiled for.
+    `scripts/build.sh` builds for the host, or, on a host that is no target,
+    for this triple, and `turkey` emits for the target it was built for, so
+    this is also what the tests' programs are compiled for where `$TURKEY_CC`
+    is the host's compiler.
     """
     if missing():
         return ""

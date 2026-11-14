@@ -40,6 +40,9 @@ export (site, pageOf, href)
 
 import Turkey.Doc as Doc
 import Turkey.Doc (ModuleDoc, Item, ConDoc, ConShape(..), Body(..))
+import Turkey.Highlight as Highlight
+import Turkey.Markdown as Markdown
+import Turkey.Markdown (escape)
 
 --- Returns the site for `docs`: each file's path, relative to the site's
 --- root, and its contents. The same `docs` give the same files. Among them
@@ -139,97 +142,37 @@ let upperHex = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "A", "B", "C",
 
 -- -- comments and code ----------------------------------------------------------------
 
--- Returns `text`, a doc comment, as HTML. Paragraphs are separated by blank
--- lines, a paragraph whose every line is indented four spaces is code, and
--- `x` in backquotes is code inline. Every other character is text.
-fun markdown(text : String) -> String {
-    let out = String.builder()
-    for block in paragraphs(text) {
-        if Iter.all(block, fun(l) = String.startsWith(l, "    ")) {
-            let code = String.join(Vec.map(block, fun(l) =
-                Option.unwrapOr(String.stripPrefix(l, "    "), l)), "\n")
-            String.push(out, "<pre>" + highlight(code) + "</pre>")
-        } else {
-            String.push(out, "<p>" + inlineCode(String.join(block, "\n")) + "</p>")
-        }
+-- The Markdown renderer's hooks: a code block whose info string is empty or
+-- names Turkey is highlighted, and any other is escaped. A bracketed
+-- reference is not a link.
+let hooks = Markdown.Hooks { codeBlock = codeBlock, reference = Markdown.defaults().reference }
+
+fun codeBlock(info : String, body : String) -> String {
+    let words = String.words(info)
+    if len(words) == 0 || words[0] == "turkey" {
+        "<pre class=\"turkey\"><code>" + highlight(body) + "</code></pre>\n"
+    } else {
+        Markdown.defaults().codeBlock(info, body)
     }
-    String.build(out)
 }
 
--- Returns the first paragraph of `text`, a doc comment, as HTML.
-fun summary(text : String) -> String {
-    let blocks = paragraphs(text)
-    if len(blocks) == 0 { "" } else { markdown(String.join(blocks[0], "\n")) }
-}
-
--- Returns `code`, Turkey source, as HTML.
-fun highlight(code : String) -> String = escape(code)
-
--- The runs of lines of `text` that blank lines separate.
-fun paragraphs(text : String) -> Vec (Vec String) {
-    let blocks = []
-    var block = []
-    for line in String.lines(text) {
-        if String.trim(line) == "" {
-            if len(block) > 0 { Vec.push(blocks, block) }
-            block = []
-        } else {
-            Vec.push(block, line)
-        }
-    }
-    if len(block) > 0 { Vec.push(blocks, block) }
-    blocks
-}
-
--- `text` escaped, with each backquote that has text after it and then
--- another backquote made, with that text, a `<code>` element. Any other
--- backquote is text.
-fun inlineCode(text : String) -> String {
-    let cs = String.toCodePoints(text)
-    let out = String.builder()
-    var i = 0
-    while i < len(cs) {
-        if cs[i] == '`' {
-            var close = i + 1
-            while close < len(cs) && cs[close] != '`' { close = close + 1 }
-            if close < len(cs) && close > i + 1 {
-                let code = String.fromCodePoints(Array.slice(cs, i + 1, close))
-                String.push(out, "<code>" + escape(code) + "</code>")
-                i = close + 1
-                continue
-            }
-        }
-        String.push(out, escape(Char.toString(cs[i])))
-        i = i + 1
-    }
-    String.build(out)
-}
-
--- `s` with the characters HTML gives a meaning to in text and in a quoted
--- attribute written as references.
-fun escape(s : String) -> String {
-    let out = String.builder()
-    for c in String.codePoints(s) {
-        match c {
-            '&' -> String.push(out, "&amp;")
-            '<' -> String.push(out, "&lt;")
-            '>' -> String.push(out, "&gt;")
-            '"' -> String.push(out, "&quot;")
-            _ -> String.push(out, Char.toString(c))
-        }
-    }
-    String.build(out)
-}
+-- Returns `code`, Turkey source, as HTML whose spans `Turkey.Highlight` names.
+fun highlight(code : String) -> String = Highlight.html(code)
 
 -- The comment `text`, if there is one, as the block under a signature.
 fun commentBlock(text : Option String) -> String = match text {
-    Some(t) -> "<div class=\"doc\">" + markdown(t) + "</div>"
+    Some(t) -> "<div class=\"doc\">" + Markdown.render(hooks, t) + "</div>"
     None -> ""
 }
 
 -- -- signatures -----------------------------------------------------------------------
 
-fun kw(s : String) -> String = "<span class=\"kw\">" + escape(s) + "</span>"
+-- `s`, a keyword or a comment of a signature, coloured as code is.
+fun kw(s : String) -> String = highlight(s)
+
+-- Returns `t`, a type, a predicate or a list of them as a signature shows
+-- it, as HTML. Every type a signature shows goes through here.
+fun typeHTML(t : String) -> String = highlight(t)
 
 fun nm(s : String) -> String = "<span class=\"name\">" + escape(s) + "</span>"
 
@@ -238,12 +181,12 @@ fun marked(ids : Bool, fragment : String, html : String) -> String =
     if ids { "<span id=\"" + escape(fragment) + "\">" + html + "</span>" } else { html }
 
 fun typed(shown : Option String) -> String = match shown {
-    Some(t) -> " : " + escape(t)
+    Some(t) -> " : " + typeHTML(t)
     None -> ""
 }
 
 fun listed(prefix : String, xs : Vec String) -> String =
-    if len(xs) == 0 { "" } else { prefix + escape(String.join(xs, ", ")) }
+    if len(xs) == 0 { "" } else { prefix + typeHTML(String.join(xs, ", ")) }
 
 fun params(ps : Vec String) -> String =
     if len(ps) == 0 { "" } else { " " + escape(String.join(ps, " ")) }
@@ -259,14 +202,14 @@ fun constructor(c : ConDoc, ids : Bool) -> String {
     for p in c.context { Vec.push(bracket, p) }
     let shown = marked(ids, "con." + c.name, nm(c.name))
     let name = if len(bracket) == 0 { shown }
-               else { shown + "[" + escape(String.join(bracket, ", ")) + "]" }
+               else { shown + "[" + typeHTML(String.join(bracket, ", ")) + "]" }
     match c.shape {
         Fields(fields) -> name + " { " + String.join(Vec.map(fields, fun(f) =
             (if f.mutable { "var " } else { "" })
                 + marked(ids, "field." + c.name + "." + f.name, escape(f.name))
-                + " : " + escape(f.shown)), ", ") + " }"
+                + " : " + typeHTML(f.shown)), ", ") + " }"
         Positional(args) -> if len(args) == 0 { name }
-                            else { name + "(" + escape(String.join(args, ", ")) + ")" }
+                            else { name + "(" + typeHTML(String.join(args, ", ")) + ")" }
     }
 }
 
@@ -294,14 +237,15 @@ fun signature(t : Targets, item : Item, ids : Bool) -> String = match item.body 
     Function(shown) -> kw("fun") + " " + nm(item.name) + typed(shown)
     Value(shown, mutable) -> kw(if mutable { "var" } else { "let" }) + " " + nm(item.name)
                              + typed(shown)
-    Alias(ps, body) -> kw("type") + " " + nm(item.name) + params(ps) + " = " + escape(body)
+    Alias(ps, body) -> kw("type") + " " + nm(item.name) + params(ps) + " = " + typeHTML(body)
     Data(d) -> {
         let cons = Vec.map(d.constructors, constructor(_, ids))
         let body = if len(cons) == 0 { "" } else { "\n    = " + String.join(cons, "\n    | ") }
         kw("type") + " " + nm(item.name) + params(d.params) + listed(" : ", d.derives) + body
     }
     Class(c) -> kw("class") + " " + nm(item.name) + " " + escape(c.param) + listed(" : ", c.supers)
-    Instance(inst) -> kw("instance") + " " + escape(item.name) + listed(" : ", inst.context)
+    Instance(inst) -> kw("instance") + " " + typeHTML(item.name)
+                      + listed(" : ", inst.context)
     Operator(op) -> kw("infix") + " " + escape(op.group) + " (" + nm(item.name) + ") = "
                     + escape(op.function) + "  "
                     + kw("-- " + (if op.rightAssociative { "right" } else { "left" })
@@ -336,17 +280,17 @@ fun itemHTML(t : Targets, item : Item) -> String {
                 Positional(_) -> []
             }
             if Option.isNone(c.comment) && len(fields) == 0 { continue }
-            String.push(members, "<div class=\"sig\">" + constructor(c, False) + "</div>"
+            String.push(members, "<div class=\"sig turkey\">" + constructor(c, False) + "</div>"
                                  + commentBlock(c.comment))
             for f in fields {
-                String.push(members, "<div class=\"sig\">." + escape(f.name) + "</div>"
+                String.push(members, "<div class=\"sig turkey\">." + escape(f.name) + "</div>"
                                      + commentBlock(f.comment))
             }
         }
         Class(c) -> {
             for meth in c.methods {
                 let fragment = methodFragment(item.name, meth.name)
-                String.push(members, "<div class=\"sig\" id=\"" + escape(fragment) + "\">"
+                String.push(members, "<div class=\"sig turkey\" id=\"" + escape(fragment) + "\">"
                                      + kw("fun") + " " + nm(meth.name) + typed(meth.shown)
                                      + (if meth.hasDefault { "  " + kw("-- has a default") }
                                         else { "" })
@@ -354,7 +298,7 @@ fun itemHTML(t : Targets, item : Item) -> String {
             }
             for f in c.families {
                 let fragment = "assoc." + item.name + "." + f.name
-                String.push(members, "<div class=\"sig\" id=\"" + escape(fragment) + "\">"
+                String.push(members, "<div class=\"sig turkey\" id=\"" + escape(fragment) + "\">"
                                      + kw("type") + " " + nm(f.name) + " " + escape(c.param)
                                      + "</div>" + commentBlock(f.comment))
             }
@@ -368,7 +312,7 @@ fun itemHTML(t : Targets, item : Item) -> String {
                 Some(m) -> m + "." + meth.original
                 None -> meth.original
             }
-            String.push(members, "<div class=\"sig\" id=\""
+            String.push(members, "<div class=\"sig turkey\" id=\""
                                  + escape(methodFragment(item.name, meth.name)) + "\">"
                                  + kw("fun") + " " + nm(meth.name) + typed(meth.shown) + "  "
                                  + kw("-- from") + " " + linked(link, written) + "</div>")
@@ -377,7 +321,7 @@ fun itemHTML(t : Targets, item : Item) -> String {
     }
     let inside = String.build(members)
     "<div class=\"item\" id=\"" + escape(itemFragment(item)) + "\">"
-        + "<div class=\"sig\">" + signature(t, item, True) + "</div>"
+        + "<div class=\"sig turkey\">" + signature(t, item, True) + "</div>"
         + commentBlock(item.comment)
         + (if inside == "" { "" } else { "<div class=\"members\">" + inside + "</div>" })
         + "</div>\n"
@@ -410,7 +354,8 @@ fun index(docs : Vec ModuleDoc) -> String {
         String.push(body, "<div class=\"result\"><a href=\"" + escape(pageOf(m.name)) + "\">"
                           + escape(m.name) + "</a>")
         if let Some(text) = m.comment {
-            String.push(body, "<div class=\"where\">" + summary(text) + "</div>")
+            String.push(body, "<div class=\"where\">" + Markdown.summary(hooks, text)
+                              + "</div>")
         }
         String.push(body, "</div>\n")
     }
@@ -454,7 +399,7 @@ fun searchIndex(t : Targets, docs : Vec ModuleDoc) -> String {
         for item in m.items {
             let result = "<div class=\"result\"><div class=\"where\"><a href=\""
                          + escape(href(m.name, itemFragment(item))) + "\">" + escape(m.name)
-                         + "</a></div><div class=\"sig\">" + signature(t, item, False)
+                         + "</a></div><div class=\"sig turkey\">" + signature(t, item, False)
                          + "</div>" + commentBlock(item.comment) + "</div>"
             String.push(out, "[" + Doc.jsonString(item.name) + ", "
                              + Doc.jsonString(searchText(item)) + ", "
@@ -466,7 +411,7 @@ fun searchIndex(t : Targets, docs : Vec ModuleDoc) -> String {
 }
 
 -- What a search looks through for `item`: its name, its type, its methods'
--- and constructors' names and types, and its comment.
+-- and constructors' names and types, and the text of its comment.
 fun searchText(item : Item) -> String {
     let parts = [item.name]
     let add = fun(s : Option String) { if let Some(text) = s { Vec.push(parts, text) } }
@@ -487,8 +432,31 @@ fun searchText(item : Item) -> String {
         }
         Instance(_) | Operator(_) -> {}
     }
-    add(item.comment)
+    add(Option.map(item.comment, plainText))
     String.join(parts, "\n")
+}
+
+-- The text a reader sees of `comment`, Markdown: its rendering with every
+-- tag removed and every entity written as its character. A code block's info
+-- string is not part of it.
+fun plainText(comment : String) -> String {
+    let rendered = Markdown.render(Markdown.defaults(), comment)
+    let out = String.builder()
+    var inTag = False
+    for c in String.codePoints(rendered) {
+        if inTag {
+            if c == '>' { inTag = False }
+        } else if c == '<' {
+            inTag = True
+        } else {
+            String.push(out, Char.toString(c))
+        }
+    }
+    let text = String.build(out)
+    -- Escape writes these four and nothing else, and `&amp;` goes last so
+    -- that it cannot make a new entity of what follows it.
+    String.replace(String.replace(String.replace(String.replace(text, "&lt;", "<"), "&gt;", ">"),
+                                  "&quot;", "\""), "&amp;", "&")
 }
 
 -- `search.js`: filters `searchIndex` by what the search box holds, and shows
@@ -540,16 +508,23 @@ let searchScript = [
 
 -- -- style ----------------------------------------------------------------------------
 
+-- The style sheet. `Turkey.Highlight`'s groups are coloured roughly as Vim's
+-- default scheme colours the groups `vim/syntax/turkey.vim` links them to,
+-- in both light and dark.
 let styleSheet = [
     ":root {",
     "  --bg: #fdfcfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e4e2dd;",
     "  --code-bg: #f3f1ec; --accent: #9a3b12; --hit: #fff1c2;",
+    "  --statement: #a0522d; --type: #286e45; --preproc: #7b3fa0; --constant: #b0306f;",
+    "  --special: #5a4fc0; --comment: #3a64a8;",
     "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;",
     "}",
     "@media (prefers-color-scheme: dark) {",
     "  :root {",
     "    --bg: #18181a; --fg: #e6e4df; --muted: #9a9aa0; --line: #2e2e33;",
-    "    --code-bg: #232327; --accent: #f0915d; --hit: #4a3d12;",
+    "    --code-bg: #232327; --accent: #f0915d; --hit: #3a300e;",
+    "    --statement: #e0c060; --type: #7fcf8f; --preproc: #d08fe0; --constant: #f0a0a0;",
+    "    --special: #f0a050; --comment: #80a0ff;",
     "  }",
     "}",
     "* { box-sizing: border-box; }",
@@ -583,7 +558,6 @@ let styleSheet = [
     "  font-family: var(--mono); font-size: 13.5px; white-space: pre-wrap;",
     "  overflow-wrap: anywhere;",
     "}",
-    ".kw { color: var(--muted); }",
     ".name { font-weight: 600; }",
     ".doc { margin: .35rem 0 0 1.2rem; }",
     ".doc p { margin: .3rem 0; }",
@@ -593,6 +567,17 @@ let styleSheet = [
     "}",
     "code { padding: 0 .2rem; }",
     ".doc pre { padding: .5rem .7rem; overflow-x: auto; }",
+    "pre code { padding: 0; background: none; }",
+    ".turkey .conditional, .turkey .repeat, .turkey .statement, .turkey .keyword,",
+    ".turkey .operator { color: var(--statement); }",
+    ".turkey .structure, .turkey .constructor { color: var(--type); }",
+    ".turkey .module { color: var(--preproc); }",
+    ".turkey .boolean, .turkey .number, .turkey .float, .turkey .string,",
+    ".turkey .char { color: var(--constant); }",
+    ".turkey .escape, .turkey .doc-comment { color: var(--special); }",
+    ".turkey .comment, .turkey .block-comment { color: var(--comment); }",
+    ".turkey .todo { background: var(--hit); }",
+    ".turkey a, .turkey a [class] { color: var(--accent); }",
     ".members { margin: .4rem 0 0 1.2rem; }",
     ".members .sig { margin-top: .3rem; }",
     ".none { color: var(--muted); font-style: italic; }",

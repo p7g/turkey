@@ -46,6 +46,7 @@ export      ::= IDENT
               | CONID "(" ".." ")"
               | CONID "(" CONID ("," CONID)* ")"
               | "(" OPERATOR ")"
+              | "module" CONID
 top-level   ::= import | type-decl | class-decl | instance-decl
               | fun-decl | let-decl | var-decl | foreign-decl | infix-decl
 import      ::= "import" modname ("as" CONID)? import-list?
@@ -53,6 +54,7 @@ import-list ::= "(" (entry ("," entry)*)? ")"
 entry       ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item        ::= IDENT | CONID | CONID "(" ".." ")" | CONID "(" CONID ("," CONID)* ")"
               | "(" OPERATOR ")"
+              | "module" CONID
 ```
 
 Top-level items are separated by `separator`s.

@@ -357,10 +357,6 @@ fun parseExportDecl(p : P) -> ExportDecl {
     }
     let items = Vec.new(8)
     while !at(p, ")") {
-        if at(p, "module") {
-            oops(p, "'module' cannot appear in an export list; an export list "
-                    + "can name only declarations", cur(p).span)
-        }
         Vec.push(items, parseExportItem(p))
         if !eat(p, ",") { break }
     }
@@ -368,14 +364,34 @@ fun parseExportDecl(p : P) -> ExportDecl {
     ExportDecl { span = close(p, s), items = Some(items) }
 }
 
--- `f`, `T`, `T(..)`, `T(A, B)`, or an operator in parentheses, `(<>)`, which
--- is the item `<>`.
+-- `f`, `T`, `T(..)`, `T(A, B)`, a qualifier, `module Q`, or an operator in
+-- parentheses, `(<>)`, which is the item `<>`.
 fun parseExportItem(p : P) -> ExportItem {
     if at(p, "(") && isOperatorRun(peek(p, 1)) {
         step(p)
         let opTok = advance(p)
         skipWhat(p, ")", "')' after the operator")
-        return ExportItem { span = opTok.span, name = text(opTok), subs = None }
+        return ExportItem {
+            span = opTok.span, name = text(opTok), subs = None, qualifier = False,
+        }
+    }
+    if at(p, "module") {
+        let s = advance(p).span
+        let tok = expectWhat(p, "CONID", "a qualifier")
+        if at(p, ".") {
+            let path = dottedFrom(p, tok)
+            let last = match String.rsplitOnce(path, ".") {
+                Some((_, x)) -> x
+                None -> path
+            }
+            oops(p, "'module " + path + "' names a module by its path; an "
+                    + "export list can name only a qualifier of one "
+                    + "component; write 'import " + path + " as " + last
+                    + "' and 'module " + last + "'", tok.span)
+        }
+        return ExportItem {
+            span = close(p, s), name = text(tok), subs = None, qualifier = True,
+        }
     }
     let tok = advance(p)
     if !isNameToken(tok) {
@@ -392,7 +408,9 @@ fun parseExportItem(p : P) -> ExportItem {
         skipToken(p, ")")
         subs = Some(names)
     }
-    ExportItem { span = close(p, tok.span), name = text(tok), subs = subs }
+    ExportItem {
+        span = close(p, tok.span), name = text(tok), subs = subs, qualifier = False,
+    }
 }
 
 fun isNameToken(tok : Token) -> Bool = match Token.kindName(tok.kind) {
@@ -463,7 +481,8 @@ fun parseImportList(p : P) -> (Vec ImportItem, Bool) {
     if Option.isSome(dots) {
         for entry in items {
             if Option.isNone(entry.rename) {
-                let name = entry.item.name
+                let name = if entry.item.qualifier { "module " + entry.item.name }
+                           else { entry.item.name }
                 oops(p, "'" + name + "' is already imported by '..'; remove it, "
                         + "or write '" + name + " as _' to withhold it",
                      entry.item.span)
@@ -493,7 +512,9 @@ fun parseImportItem(p : P) -> ImportItem {
     }
     let to = text(tok)
     if to != "_" && isConid(tok) != startsUpper(item.name) {
-        let rule = if startsUpper(item.name) {
+        let rule = if item.qualifier {
+            "a qualifier must start with a capital"
+        } else if startsUpper(item.name) {
             "the name of a type, class or constructor must start with a capital"
         } else {
             "a value's name must start with a lowercase letter"

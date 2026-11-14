@@ -1,5 +1,5 @@
 export (
-    Namespace(..), Scope(..), newScope, spaces, lookupName, conflictsIn,
+    Namespace(..), Scope(..), newScope, spaces, lookupName, conflictsIn, reachable,
     isOperatorName,
     Module(..),
     Loader(..), newLoader, loadEntry,
@@ -50,21 +50,20 @@ import Turkey.Giblets as Giblets
 
 -- -- scopes -------------------------------------------------------------------------
 
---- One module's view of the world, in five namespaces, and the class methods
---- it can see.
+--- One module's view of the world: five namespaces of bare names, the
+--- qualifiers a dotted name may begin with, and the class methods it can see.
 ---
---- They have to be at least three. A value is lowercase while a type and a
---- constructor are both uppercase, so `type Point = Point(Int, Int)` puts the
---- same spelling in two of them. Each maps a name the module may *write* --
---- bare, or qualified by an import's alias -- to the internal name it means.
+--- The namespaces have to be at least three. A value is lowercase while a type
+--- and a constructor are both uppercase, so `type Point = Point(Int, Int)` puts
+--- the same spelling in two of them. Each maps a bare name the module may
+--- *write* to the internal name it means. A dotted name is not in them:
+--- `lookupName` reads it through `qualifiers`, a step at a time.
 ---
 --- Class identity is scoped even though the resulting instance table is global:
 --- two modules may define different classes with the same short name. The fifth
 --- is declared operators, from a symbol to the `infix` declaration it means,
 --- named `M#<>` after the module that declares it. An operator has no
---- qualified spelling, and a use reads only the bare entries. The qualified
---- ones, `Pipe.|>`, are there so that a diagnostic about an operator out of
---- scope can name the import that would bring it.
+--- qualified spelling, and a use reads only the bare entries.
 type Namespace
     = ValueSpace
     | TypeSpace
@@ -101,12 +100,19 @@ type Scope = Scope {
     --- class with the same spelling is not a candidate. A method also appears
     --- in `values`, by its spelling, for ordinary calls.
     methods : Set.Set String,
+    --- What each qualifier names. In a module's scope the key is a qualifier
+    --- as a name begins with it -- an import's alias, the imported module's
+    --- whole dotted name when it has none, or a qualifier an import's list
+    --- brings -- and the value is every module under it, each once. In a
+    --- module's exports the key is one component and names one module.
+    qualifiers : Map String (Vec Module),
     var conflicts : Array (Map String (Vec String)),
 }
 
 fun newScope() -> Scope = Scope {
     values = Map.new(), types = Map.new(), cons = Map.new(),
     classes = Map.new(), operators = Map.new(), methods = Set.new(),
+    qualifiers = Map.new(),
     conflicts = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
 }
 
@@ -124,24 +130,115 @@ fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
     OperatorSpace -> s.operators
 }
 
---- Conflicts retain declaration identities, not import spellings: two routes
---- to the same re-export are still one declaration.
+--- Returns the internal name `name` means in `space`, or `None` when it means
+--- nothing. `name` is as the module writes it, bare or dotted.
 ---
---- An ambiguous name is reported, and the first of its declarations in order of
---- internal name is returned, so that the caller does not report the name again
---- as undefined.
+--- A name that means more than one declaration is reported as ambiguous, and
+--- the first of its declarations in order of internal name is returned, so that
+--- the caller does not report the name again as undefined. Two routes to one
+--- declaration are one meaning, not two.
 fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
     match Map.get(conflictsIn(s, space), name) {
-        Some(targets) -> {
-            report("'" + name + "' is ambiguous: it is imported as "
-                + String.join(Vec.map(Vec.sort(targets), fun(t) =
-                    quoted(String.replace(t, "#", "."))), " and ")
-                + "; write the qualified name of the one you mean", where)
-            Some(Vec.sort(targets)[0])
-        }
-        None -> Map.get(spaceAt(s, space), name)
+        Some(targets) -> return ambiguous(name, targets, where)
+        None -> {}
     }
+    match Map.get(spaceAt(s, space), name) {
+        Some(target) -> Some(target)
+        None -> {
+            let targets = readings(s, space, name)
+            match len(targets) {
+                0 -> None
+                1 -> Some(targets[0])
+                _ -> ambiguous(name, targets, where)
+            }
+        }
+    }
+}
+
+fun ambiguous(name : String, targets : Vec String, where : Option Span) -> Option String {
+    let sorted = Vec.sort(targets)
+    report("'" + name + "' is ambiguous: it is imported as "
+        + String.join(Vec.map(sorted, fun(t) = quoted(String.replace(t, "#", "."))),
+                      " and ")
+        + "; write the qualified name of the one you mean", where)
+    Some(sorted[0])
+}
+
+-- Every declaration the dotted name `name` means in `space`, each once.
+--
+-- Each prefix of the name that is a qualifier in scope is a way to read it:
+-- the components after the prefix step through the exported qualifiers of the
+-- modules reached so far, and the last component is looked up in the exports
+-- of the modules the steps end at. `AOC.Set.union` is read from the qualifier
+-- `AOC` through the `Set` that module exports, and from a qualifier `AOC.Set`
+-- if an import gives one.
+--
+-- Walking on use is what lets modules export each other's qualifiers in a
+-- cycle: the names such a cycle makes reachable are unbounded, and a name
+-- that is written is a finite walk.
+fun readings(s : Scope, space : Namespace, name : String) -> Vec String {
+    let out = Vec.new(1)
+    if !String.contains(name, ".") { return out }
+    let parts = String.split(name, ".")
+    let last = len(parts) - 1
+    var prefix = ""
+    for var k = 0; k < last; k = k + 1 {
+        prefix = if k == 0 { parts[0] } else { prefix + "." + parts[k] }
+        match Map.get(s.qualifiers, prefix) {
+            Some(modules) -> for m in modules { stepThrough(m, parts, k + 1, space, out) }
+            None -> {}
+        }
+    }
+    out
+}
+
+-- Read `parts` from index `at` on, starting in `m`'s exports, and add what
+-- the last component means there to `out`.
+fun stepThrough(m : Module, parts : Vec String, at : Int, space : Namespace,
+                out : Vec String) -> Unit {
+    if at == len(parts) - 1 {
+        return match Map.get(spaceAt(m.exports, space), parts[at]) {
+            Some(target) -> if !Vec.contains(out, target) { Vec.push(out, target) }
+            None -> {}
+        }
+    }
+    match Map.get(m.exports.qualifiers, parts[at]) {
+        Some(modules) -> for next in modules { stepThrough(next, parts, at + 1, space, out) }
+        None -> {}
+    }
+}
+
+-- Add `m` to the modules the qualifier `q` names in `s`, unless it is one.
+fun mergeQualifier(s : Scope, q : String, m : Module) -> Unit {
+    match Map.get(s.qualifiers, q) {
+        Some(modules) -> if !Iter.any(modules, fun(x : Module) = x.name == m.name) {
+            Vec.push(modules, m)
+        }
+        None -> Map.put(s.qualifiers, q, [m])
+    }
+}
+
+--- Returns every module a dotted name written in `s` can reach: the modules
+--- its qualifiers name, and the modules those export as qualifiers, and so on.
+--- Each module appears once.
+fun reachable(s : Scope) -> Vec Module {
+    let seen = Set.new()
+    let out = Vec.new(16)
+    let pending = Vec.new(16)
+    for modules in Map.values(s.qualifiers) {
+        for m in modules { Vec.push(pending, m) }
+    }
+    while let Some(m) = Vec.pop(pending) {
+        if !Set.contains(seen, m.name) {
+            Set.add(seen, m.name)
+            Vec.push(out, m)
+            for modules in Map.values(m.exports.qualifiers) {
+                for next in modules { Vec.push(pending, next) }
+            }
+        }
+    }
+    out
 }
 
 fun mergeName(s : Scope, space : Namespace, name : String, target : String) -> Unit {
@@ -579,10 +676,20 @@ fun sameNames(a : Scope, b : Scope) -> Bool {
             if Map.get(ys[i], k) != Some(v) { return False }
         }
     }
+    if len(a.qualifiers) != len(b.qualifiers) { return False }
+    for (q, modules) in Map.entries(a.qualifiers) {
+        match Map.get(b.qualifiers, q) {
+            Some(others) -> if moduleNames(modules) != moduleNames(others) { return False }
+            None -> return False
+        }
+    }
     let ms = Set.elements(a.methods)
     if len(ms) != len(Set.elements(b.methods)) { return False }
     Iter.all(ms, Set.contains(b.methods, _))
 }
+
+fun moduleNames(modules : Vec Module) -> Vec String =
+    Vec.sort(Vec.map(modules, fun(m : Module) = m.name))
 
 fun addAll(into : Set.Set String, from : Set.Set String) -> Unit {
     for x in Set.elements(from) { Set.add(into, x) }
@@ -674,6 +781,9 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
             for (k, v) in Map.entries(from[i]) { Map.put(into[i], k, v) }
         }
         addAll(scope.methods, implicit.methods)
+        for (q, modules) in Map.entries(implicit.qualifiers) {
+            Map.put(scope.qualifiers, q, modules)
+        }
     }
     let imports = newScope()
     for imp in m.program.imports {
@@ -696,6 +806,13 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
     }
     addAll(scope.methods, imports.methods)
     scope.conflicts = imports.conflicts
+    -- A qualifier the imports give replaces the Prelude's of the same name
+    -- whole, where two imports under one qualifier merge. Merging here would
+    -- leave a `Vec.` that is the imported module for the names it exports and
+    -- `Data.Vec` for the rest.
+    for (q, modules) in Map.entries(imports.qualifiers) {
+        Map.put(scope.qualifiers, q, modules)
+    }
 
     -- Last, so a module's own declarations shadow everything imported.
     let own = ownScope(m.name, m.program)
@@ -716,8 +833,8 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
     None -> bug("module '" + name + "' was not loaded")
 }
 
--- Which bare names an import brings. Its qualified names are every export,
--- under its alias, whatever this says.
+-- Which bare names and unprefixed qualifiers an import brings. Its alias
+-- reaches every export, whatever this says.
 type Bare
     = AllBare
     | NoBare
@@ -741,43 +858,65 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                       + "declaration; begin it with 'export (...)' listing its "
                       + "exports, or 'export (..)' for everything it declares", where)
     }
-    let available = spaces(dep.exports)
+    mergeQualifier(scope, alias, dep)
     let chosen = match bare {
-        AllBare -> available
-        NoBare -> spaces(newScope())
+        AllBare -> dep.exports
+        NoBare -> newScope()
         Listed(items, rest) -> listed(l, dep, items, rest, where, strict)
     }
     for space in namespaces {
-        let i = namespaceIndex(space)
-        for (short, target) in Map.entries(available[i]) {
-            mergeName(scope, space, alias + "." + short, target)
-        }
-        for (short, target) in Map.entries(chosen[i]) {
+        for (short, target) in Map.entries(spaceAt(chosen, space)) {
             mergeName(scope, space, short, target)
         }
     }
+    for (q, modules) in Map.entries(chosen.qualifiers) {
+        for m in modules { mergeQualifier(scope, q, m) }
+    }
     -- A method is a candidate for a compiler-written reference only when it is
     -- brought bare, as a call of it written by hand would need.
-    for target in Map.values(chosen[namespaceIndex(ValueSpace)]) {
+    for target in Map.values(chosen.values) {
         if Set.contains(dep.exports.methods, target) { Set.add(scope.methods, target) }
     }
 }
 
--- The bare names an import's list brings. With a `..`, every export comes
--- except what an item names, and each item says what to bring instead: its
--- names again under a new name, or nothing.
+-- The bare names and unprefixed qualifiers an import's list brings; the
+-- result's `methods` and `conflicts` are empty. With a `..`, every export
+-- comes except what an item names, and each item says what to bring instead:
+-- its names again under a new name, or nothing.
 fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
-           where : Option Span, strict : Bool) -> Array (Map String String) {
-    let chosen = if rest { Array.map(spaces(dep.exports), copyMap) }
-                 else { spaces(newScope()) }
-    for entry in items {
-        let named = itemNames(l, dep, entry.item, where, strict)
-        if rest {
-            for (i, short, _, _) in named { discard(Map.delete(chosen[i], short)) }
+           where : Option Span, strict : Bool) -> Scope {
+    let result = newScope()
+    let chosen = spaces(result)
+    if rest {
+        let available = spaces(dep.exports)
+        for var i = 0; i < len(chosen); i = i + 1 {
+            for (k, v) in Map.entries(available[i]) { Map.put(chosen[i], k, v) }
         }
+        for (q, modules) in Map.entries(dep.exports.qualifiers) {
+            Map.put(result.qualifiers, q, modules)
+        }
+    }
+    for entry in items {
         let under = match entry.rename {
             Some(to) -> to
             None -> entry.item.name
+        }
+        if entry.item.qualifier {
+            match Map.get(dep.exports.qualifiers, entry.item.name) {
+                Some(modules) -> {
+                    discard(Map.delete(result.qualifiers, entry.item.name))
+                    if under != "_" { Map.put(result.qualifiers, under, modules) }
+                }
+                None -> if strict {
+                    report("module '" + dep.name + "' does not export 'module "
+                           + entry.item.name + "'", where)
+                }
+            }
+            continue
+        }
+        let named = itemNames(l, dep, entry.item, where, strict)
+        if rest {
+            for (i, short, _, _) in named { discard(Map.delete(chosen[i], short)) }
         }
         if under != "_" {
             -- A rename is of the item's own name; the members it lists keep
@@ -787,7 +926,7 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
             }
         }
     }
-    chosen
+    result
 }
 
 -- Everything one list item names in `dep`'s exports: the namespace, the name,
@@ -868,12 +1007,6 @@ fun constructorMember(l : Loader, parent : Option String, name : String,
 
 fun quoted(name : String) -> String = "'" + name + "'"
 
-fun copyMap(m : Map String String) -> Map String String {
-    let out = Map.new()
-    for (k, v) in Map.entries(m) { Map.put(out, k, v) }
-    out
-}
-
 fun namedAnywhere(s : Scope, name : String) -> Bool {
     for space in spaces(s) {
         if Map.contains(space, name) { return True }
@@ -927,6 +1060,7 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
 
 fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
               out : Scope, strict : Bool) -> Unit {
+    if item.qualifier { return exportQualifier(m, item, out, strict) }
     if isOperatorName(item.name) {
         return match exported(m, mine.operators, OperatorSpace, item, strict) {
             Some(target) -> Map.put(out.operators, item.name, target)
@@ -951,6 +1085,27 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
         exportClass(l, m, mine, item, out, strict)
     } else {
         exportType(l, m, mine, item, out, strict)
+    }
+}
+
+-- `module Q` exports the one module the qualifier `Q` names here. It is the
+-- module itself that is exported, so its importers reach all of it and two
+-- routes to it are the same module.
+fun exportQualifier(m : Module, item : ExportItem, out : Scope, strict : Bool) -> Unit {
+    match Map.get(m.scope.qualifiers, item.name) {
+        Some(modules) -> if len(modules) == 1 {
+            Map.put(out.qualifiers, item.name, modules)
+        } else if strict {
+            report("'module " + item.name + "' names "
+                   + String.join(Vec.map(moduleNames(modules), quoted), " and ")
+                   + "; an exported qualifier must name one module",
+                   Some(item.span))
+        }
+        None -> if strict {
+            report("module '" + m.name + "' exports 'module " + item.name
+                   + "', but no qualifier '" + item.name + "' is in scope here; "
+                   + "import a module as '" + item.name + "'", Some(item.span))
+        }
     }
 }
 

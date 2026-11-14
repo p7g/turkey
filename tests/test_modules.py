@@ -447,12 +447,11 @@ fun main() {
     assert output(src, {}, capsys) == ["False", "True", "5"]
 
 
-def test_an_export_list_names_a_qualifier_not_a_module_path(tmp_path):
-    search = write(tmp_path, Nope="export (module Data.Set)\nimport Data.Set\nfun f() = 1")
+def test_an_export_list_names_a_qualifier_as_it_is_in_scope(tmp_path):
+    search = write(tmp_path, Nope="export (module Set)\nimport Data.Set\nfun f() = 1")
     assert fails("import Nope", search) == (
-        "'module Data.Set' names a module by its path; an export list can name "
-        "only a qualifier of one component; write 'import Data.Set as Set' and "
-        "'module Set'")
+        "module 'Nope' exports 'module Set', but no qualifier 'Set' is in scope "
+        "here; import a module as 'Set'")
 
 
 def test_an_import_list_cannot_pick_a_qualifier_the_module_does_not_export(tmp_path):

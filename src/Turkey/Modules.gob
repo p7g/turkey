@@ -104,7 +104,8 @@ type Scope = Scope {
     --- as a name begins with it -- an import's alias, the imported module's
     --- whole dotted name when it has none, or a qualifier an import's list
     --- brings -- and the value is every module under it, each once. In a
-    --- module's exports the key is one component and names one module.
+    --- module's exports the key is the qualifier as its importers get it, and
+    --- names one module.
     qualifiers : Map String (Vec Module),
     var conflicts : Array (Map String (Vec String)),
 }
@@ -220,9 +221,17 @@ fun stepThrough(m : Module, parts : Vec String, at : Int, space : Namespace,
             None -> {}
         }
     }
-    match Map.get(m.exports.qualifiers, parts[at]) {
-        Some(modules) -> for next in modules { stepThrough(next, parts, at + 1, space, out) }
-        None -> {}
+    -- An exported qualifier may itself have dots, so every run of components
+    -- from here is tried as one.
+    var q = ""
+    for var end = at; end < len(parts) - 1; end = end + 1 {
+        q = if end == at { parts[at] } else { q + "." + parts[end] }
+        match Map.get(m.exports.qualifiers, q) {
+            Some(modules) -> for next in modules {
+                stepThrough(next, parts, end + 1, space, out)
+            }
+            None -> {}
+        }
     }
 }
 
@@ -1062,18 +1071,88 @@ fun isDotDot(subs : Vec String) -> Bool =
 
 -- A module with no export declaration exports nothing: it is the entry, which
 -- no module imports.
+--
+-- What a module exports under a name is decided by where the name comes
+-- from, in this order: the module's own declaration; an entry naming it; a
+-- `module Q (...)` entry whose list names it; a `module Q (...)` entry whose
+-- `..` covers it. So a module replaces a name it passes on by declaring it,
+-- and nothing has to be withheld.
 fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
+    let d = match m.program.exportDecl {
+        Some(d) -> d
+        None -> return newScope()
+    }
     let mine = ownScope(m.name, m.program)
-    match m.program.exportDecl {
-        None -> newScope()
-        Some(d) -> match d.items {
-            None -> mine
-            Some(listed) -> {
-                let out = newScope()
-                for item in listed { exportOne(l, m, mine, item, out, strict) }
-                out
+    let out = if d.rest { ownScope(m.name, m.program) } else { newScope() }
+    for item in d.items {
+        if Option.isNone(item.list) { exportOne(l, m, mine, item, out, strict) }
+    }
+    passOn(l, m, mine, d.items, False, out, strict)
+    passOn(l, m, mine, d.items, True, out, strict)
+    out
+}
+
+-- Export what the `module Q (...)` entries among `items` pass on: those whose
+-- lists have a `..` if `rest` is set, and those whose lists have none
+-- otherwise. A name `mine` declares, or one `out` already exports, stays as
+-- it is. Two of these entries passing on different declarations under one
+-- name is an error, since no use of the name is there to report it at.
+fun passOn(l : Loader, m : Module, mine : Scope, items : Vec ExportItem, rest : Bool,
+           out : Scope, strict : Bool) -> Unit {
+    -- The entry each name this call added came from, by namespace and name.
+    let from : Map String ExportItem = Map.new()
+    for item in items {
+        let entries = match item.list {
+            Some(entries) -> entries
+            None -> continue
+        }
+        if item.rest != rest { continue }
+        let dep = match qualifierModule(m, item, strict) {
+            Some(dep) -> dep
+            None -> continue
+        }
+        let chosen = listed(l, dep, entries, item.rest, Some(item.span), strict)
+        for space in namespaces {
+            let into = spaceAt(out, space)
+            for (short, target) in Map.entries(spaceAt(chosen, space)) {
+                if Map.contains(spaceAt(mine, space), short) { continue }
+                let key = Int.toString(namespaceIndex(space)) + short
+                match Map.get(into, short) {
+                    Some(previous) -> if strict && previous != target {
+                        clash(quoted(short), Map.get(from, key), item)
+                    }
+                    None -> {
+                        Map.put(into, short, target)
+                        Map.put(from, key, item)
+                        if Set.contains(dep.exports.methods, target) {
+                            Set.add(out.methods, target)
+                        }
+                    }
+                }
             }
         }
+        for (q, modules) in Map.entries(chosen.qualifiers) {
+            let key = "module " + q
+            match Map.get(out.qualifiers, q) {
+                Some(previous) -> if strict && moduleNames(previous) != moduleNames(modules) {
+                    clash(quoted(key), Map.get(from, key), item)
+                }
+                None -> {
+                    Map.put(out.qualifiers, q, modules)
+                    Map.put(from, key, item)
+                }
+            }
+        }
+    }
+}
+
+-- Report that `item` and `other` pass on different declarations as `name`.
+-- With no `other`, the name was exported before either, and that one stands.
+fun clash(name : String, other : Option ExportItem, item : ExportItem) -> Unit {
+    if let Some(first) = other {
+        report(name + " is exported as two different declarations, by 'module "
+               + first.name + "' and 'module " + item.name
+               + "'; withhold it from one of them", Some(item.span))
     }
 }
 
@@ -1107,18 +1186,28 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
     }
 }
 
--- `module Q` exports the one module the qualifier `Q` names here. It is the
--- module itself that is exported, so its importers reach all of it and two
--- routes to it are the same module.
+-- `module Q` exports the qualifier `Q`, under the spelling it has here, as
+-- the one module it names. It is the module itself that is exported, so its
+-- importers reach all of it and two routes to it are the same module.
 fun exportQualifier(m : Module, item : ExportItem, out : Scope, strict : Bool) -> Unit {
+    match qualifierModule(m, item, strict) {
+        Some(dep) -> Map.put(out.qualifiers, item.name, [dep])
+        None -> {}
+    }
+}
+
+-- The one module the qualifier a `module` entry names means in `m`. `None`
+-- when it names none or several, which is reported in a round that reports.
+fun qualifierModule(m : Module, item : ExportItem, strict : Bool) -> Option Module {
     match Map.get(m.scope.qualifiers, item.name) {
-        Some(modules) -> if len(modules) == 1 {
-            Map.put(out.qualifiers, item.name, modules)
-        } else if strict {
-            report("'module " + item.name + "' names "
-                   + String.join(Vec.map(moduleNames(modules), quoted), " and ")
-                   + "; an exported qualifier must name one module",
-                   Some(item.span))
+        Some(modules) -> {
+            if len(modules) == 1 { return Some(modules[0]) }
+            if strict {
+                report("'module " + item.name + "' names "
+                       + String.join(Vec.map(moduleNames(modules), quoted), " and ")
+                       + "; an exported qualifier must name one module",
+                       Some(item.span))
+            }
         }
         None -> if strict {
             report("module '" + m.name + "' exports 'module " + item.name
@@ -1126,6 +1215,7 @@ fun exportQualifier(m : Module, item : ExportItem, out : Scope, strict : Bool) -
                    + "import a module as '" + item.name + "'", Some(item.span))
         }
     }
+    None
 }
 
 fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,

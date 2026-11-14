@@ -150,22 +150,24 @@ name.
 **Syntax**
 
 ```ebnf
-export-decl ::= "export" "(" ".." ")"
-              | "export" "(" (export ("," export)*)? ")"
+export-decl ::= "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
               | CONID "(" ".." ")"             -- a type with all its constructors
               | CONID "(" CONID ("," CONID)* ")"
               | "(" OPERATOR ")"                -- a declared operator
-              | "module" CONID                 -- a qualifier, and the module it names
+              | "module" modname               -- a qualifier, and the module it names
+              | "module" modname import-list   -- names from the module behind a qualifier
+              | ".."                           -- everything the module declares
 ```
 
 A module that other modules import starts with an export declaration, which
 lists what it **exports**. Only exported names can be used from other modules,
-whether bare or [qualified](#qualified-names). `export (..)` exports everything
-the module itself declares, though not what it imports, and `export ()` exports
-nothing.
+whether bare or [qualified](#qualified-names). `..` stands for everything
+the module itself declares, though not what it imports, so `export (..)`
+exports all of that, and `export ()` exports nothing. `..` may stand beside
+other entries, which then add what the module passes on from its imports.
 
 The declaration comes first in the file, before any import, and it does not
 name the module: its [path](#modules-and-files) does.
@@ -310,9 +312,10 @@ constraints but cannot call its methods.
 `module Q` in an export list exports the [qualifier](#qualified-names) `Q`,
 and with it the whole module `Q` names. `Q` is a qualifier in scope in the
 exporting module, spelled as that module would write it in front of a name:
-after `import Data.Set as Set` it is `module Set`, and after `import Deque` it
-is `module Deque`. A module's importers can then write `Set.union` without
-importing `Data.Set` themselves.
+after `import Data.Set as Set` it is `module Set`, after `import Deque` it
+is `module Deque`, and after `import Net.HTTP` it is `module Net.HTTP`. A
+module's importers can then write `Set.union` without importing `Data.Set`
+themselves.
 
 This is how a program gives its files one module to import for everything
 they share. Here `Kit` hands out a helper of its own and two library modules:
@@ -350,15 +353,16 @@ fun main() {
 
 The rules:
 
-* **The qualifier is one name.** A module imported under a dotted name is
-  given an alias first: `import Net.HTTP as HTTP`, then `module HTTP`.
+* **The module is imported first.** `module Q` names a qualifier, never a
+  file, so a module passes on only what it imports.
 * **It names one module.** If two imports share the qualifier, exporting it is
   an error. A qualifier that is not in scope is an error too.
 * **The whole module comes with it.** There is no way to export part of a
-  module under its qualifier. To pass on only some of its names, export them
-  bare, as `Shape(..)` and `area` are exported by a module that imports them.
-* **`export (..)` exports no qualifiers**, since it covers only what the module
-  itself declares.
+  module under its qualifier. To pass on only some of its names, pass them on
+  unqualified, as [the next section](#passing-on-a-modules-contents)
+  describes.
+* **`..` exports no qualifiers**, since it covers only what the module itself
+  declares.
 * **The module stays what it is.** `Set.union` reached through `Kit` is
   the same function as `Data.Set.union`, and an error message about it names
   `Data.Set`. Reaching one declaration by two routes is never a conflict.
@@ -385,6 +389,118 @@ fun main() {
 }
 ```
 
+### Passing on a module's contents
+
+With a list after it, `module Q (...)` exports names from the module behind
+the qualifier `Q`, unqualified, as if the importer had imported that module
+with the same list. `module Q (..)` passes on everything the module exports,
+and `module Q (a, T(..))` the names listed. The exporting module does not
+have to import those names bare: the qualifier is enough.
+
+<!-- module: Shapes.gob -->
+```kotlin
+export (Shape(..), area, name)
+
+type Shape = Circle(Int) | Square(Int)
+
+fun area(s : Shape) -> Int = match s {
+    Circle(r) -> 3 * r * r
+    Square(side) -> side * side
+}
+
+fun name(s : Shape) -> String = match s {
+    Circle(_) -> "circle"
+    Square(_) -> "square"
+}
+```
+
+<!-- module: Kit.gob -->
+```kotlin
+export (.., module Set, module Shapes (..), module Data.Int (gcd))
+
+import Data.Set as Set
+import Shapes
+import Data.Int
+
+fun name(s : Shapes.Shape) -> String = "a " + Shapes.name(s)
+```
+
+<!-- run -->
+```kotlin
+import Kit (..)
+
+fun main() {
+    let sizes : Set.Set Int = Set.new()
+    Set.add(sizes, gcd(area(Square(4)), area(Circle(2))))
+    print(Set.elements(sizes))
+    print(name(Circle(1)))
+}
+```
+
+```text
+[4]
+a circle
+```
+
+`Kit` exports its own `name` through `..`, the qualifier `Set`, everything
+`Shapes` exports, and `gcd` from `Data.Int`.
+
+The list is written as an [import's list](#imports) is, except that an entry
+cannot rename:
+
+* `..` stands for every export of the module, **its exported qualifiers
+  included**, so passing on a module's contents passes on the qualifiers it
+  hands out.
+* Beside `..`, `x as _` withholds a name: `module Shapes (name as _, ..)`.
+* `T` passes on a type alone, `T(..)` its constructors too, and `C(..)` a
+  class with its methods.
+* `module X` in the list passes on a qualifier the module exports.
+
+A passed-on name is the declaration it was where it was defined. Reaching it
+by two routes is not a conflict, and an error message names the module that
+declares it.
+
+**Which declaration a name means.** A name the module itself declares always
+wins: above, `Kit` declares `name`, so the `name` it exports is its own and
+not the one `Shapes` exports, and nothing has to be withheld to say so.
+Otherwise an entry that names the name wins over a `..` that merely covers
+it. Two entries of equal standing that pass on different declarations under
+one name are an error:
+
+<!-- module: Shapes.gob -->
+```kotlin
+export (area)
+
+fun area(side : Int) -> Int = side * side
+```
+
+<!-- module: Rooms.gob -->
+```kotlin
+export (area)
+
+fun area(width : Int, depth : Int) -> Int = width * depth
+```
+
+<!-- module: Kit.gob -->
+```kotlin
+export (module Shapes (..), module Rooms (..))
+
+import Shapes
+import Rooms
+```
+
+<!-- error: 'area' is exported as two different declarations, by 'module Shapes' and 'module Rooms' -->
+```kotlin
+import Kit
+
+fun main() {
+    print(1)
+}
+```
+
+Here `module Rooms (area as _, ..)` settles it for `Shapes`, and
+`module Rooms (area)` beside `module Shapes (..)` settles it for `Rooms`.
+
 ## Imports
 
 **Syntax**
@@ -396,7 +512,7 @@ entry  ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item   ::= IDENT | CONID | CONID "(" ".." ")"
          | CONID "(" CONID ("," CONID)* ")"
          | "(" OPERATOR ")"
-         | "module" CONID
+         | "module" modname
 ```
 
 | Import | Brings into scope |
@@ -664,6 +780,9 @@ fun main() {
 ```text
 9
 ```
+
+An exported qualifier with dots is one step: if `Kit` exports
+`module Net.HTTP`, the name is `Kit.Net.HTTP.get`.
 
 A name is only read this way where it is written, so two modules may export
 each other as qualifiers. If `A` exports `module B` and `B` exports

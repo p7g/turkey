@@ -3156,7 +3156,9 @@ fun matchableGiven(s : Solver, p : Pred) -> Bool {
 -- variables in either were bound, under the bindings `binds` already
 -- assumed. Note [What might equal later?] in GHC's `GHC.Tc.Utils.Unify`:
 --
--- * any unification variable may be bound, touchable or not;
+-- * any unification variable may be bound, touchable or not, except that a
+--   partial annotation's header variable (GHC's `TyVarTv`) may be bound only
+--   to a variable or a rigid constant (`headerMightEqual`);
 -- * a skolem is rigid;
 -- * a family application that mentions a unification variable might equal
 --   anything, and one that mentions none matches only itself: if a given
@@ -3172,9 +3174,11 @@ fun mightEqual(a : Ty.Type, b : Ty.Type, binds : Map Int Ty.Type) -> Bool {
         (TBottom, _) | (_, TBottom) -> True
         (TVar(v), other) | (other, TVar(v)) -> if Ty.occursIn(TVar(v), substituted(other, binds)) {
             False
-        } else {
+        } else if !Ty.isHeaderVar(v) {
             Map.put(binds, v.id, other)
             True
+        } else {
+            headerMightEqual(v, other, binds)
         }
         (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> mentionsMeta(x) || mentionsMeta(y)
         (TCon(c1), TCon(c2)) -> c1.name == c2.name && c1.level == c2.level && c1.uid == c2.uid
@@ -3184,6 +3188,30 @@ fun mightEqual(a : Ty.Type, b : Ty.Type, binds : Map Int Ty.Type) -> Bool {
         _ -> False
     }
 }
+
+-- Returns whether the header variable `v` might become `other`, which is
+-- resolved and does not contain it, under the bindings `binds`. GHC's
+-- `ok_shape` for a `TyVarTv`: it may be bound only to a variable or a rigid
+-- constant, and a family application over a unification variable might
+-- reduce to one.
+fun headerMightEqual(v : VarCell, other : Ty.Type, binds : Map Int Ty.Type) -> Bool =
+    match other {
+        -- Bind the plain variable rather than `v`, so that what `binds`
+        -- assumes still has the header variable, and its restriction, in it.
+        TVar(o) -> {
+            if Ty.isHeaderVar(o) { Map.put(binds, v.id, other) }
+            else { Map.put(binds, o.id, TVar(v)) }
+            True
+        }
+        TCon(c) -> if c.uid != 0 {
+            Map.put(binds, v.id, other)
+            True
+        } else {
+            False
+        }
+        TFam(_, _, _) -> mentionsMeta(other)
+        _ -> False
+    }
 
 fun mightEqualAll(a : Array Ty.Type, b : Array Ty.Type, binds : Map Int Ty.Type) -> Bool {
     if len(a) != len(b) { return False }

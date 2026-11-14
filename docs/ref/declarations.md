@@ -592,11 +592,13 @@ fun main() {
 Without the annotation on `n`, the recursive call would force `a` and
 `Array a` to be the same type, which is an error.
 
-A signature's type variable belongs to its function. The body cannot make it
-equal to a type from outside the function, because each caller picks its own
-`a` and a value outside has only one type. This holds however the two meet,
-including through a field or an associated type whose value is decided only
-later in the program:
+A type variable that a signature quantifies belongs to its function. That is
+a name the signature writes for the first time, not one it takes from a
+function around it ([Scope of type variables](#scope-of-type-variables)). The
+body cannot make it equal to a type from outside the function, because each
+caller picks its own `a` and a value outside has only one type. This holds
+however the two meet, including through a field or an associated type whose
+value is decided only later in the program:
 
 <!-- error: the type variable 'a' from a signature cannot be equal to a type from outside its function -->
 ```kotlin
@@ -619,10 +621,11 @@ fun main() {
 ### Partial annotations
 
 When only some of the header is annotated, the rest is inferred. What *was*
-written still holds: each type variable written in the header must remain an
+written still holds: each type variable new to the header must remain an
 independent type that the body does not pin down, and the context must cover
-every constraint the body places on those variables. Each of these is an
-error:
+every constraint the body places on those variables. A name the header takes
+from a function around it is that function's type variable instead. Each of
+these is an error:
 
 <!-- error: the annotation on 'count' says 'a' is any type, but its body makes it 'String' -->
 ```kotlin
@@ -678,9 +681,119 @@ a x3
 Annotations on types that contain no type variables, such as `n : Int`, simply
 fix that type.
 
-Type variables are scoped to the whole function declaration: an `a` in a
+### Scope of type variables
+
+A type variable is scoped to the whole function declaration: an `a` in a
 parameter, the return type, and an annotation inside the body all refer to the
-same type.
+same type. That includes the annotations of a [local
+function](#local-functions) or a lambda in the body. A name the function around
+it has already written, in its header or in an annotation before it, is that
+function's type variable. A local signature quantifies only the type variables
+new to it.
+
+Here `pair` is polymorphic in `c` and is used at two types, but its `k` is
+`describe`'s `k`, the type of the `x` it captures:
+
+<!-- run -->
+```kotlin
+fun describe(x : k) -> String {
+    fun pair(y : c) -> (k, c) = (x, y)
+    let (_, n) = pair(3)
+    let (_, s) = pair("three")
+    show(n) + " " + s
+}
+
+fun main() {
+    print(describe(1.5))
+    print(describe(True))
+}
+```
+
+```text
+3 three
+3 three
+```
+
+So a local signature that reuses a name does not get a type variable of its
+own. Here `twice` takes `label`'s `a`, which a caller of `label` chooses, so it
+cannot be applied to a `String`:
+
+<!-- error: expected 'a', found 'String' in a function call -->
+```kotlin
+fun label(x : a) -> String {
+    fun twice(y : a) -> Array a = [y, y]
+    show(len(twice("s")))
+}
+```
+
+To give a local function a type variable of its own, use a name that the
+functions around it have not written.
+
+> **For readers new to this.** `pair`'s type is `fun(c) -> (k, c)` for every
+> `c`, but for one `k`: the type that the call of `describe` it was made in
+> chose. GHC calls such a variable a *scoped type variable*.
+
+A name is one type wherever its function writes it, so two annotations cannot
+make it two different types:
+
+<!-- error: a numeric literal cannot have type 'String' -->
+```kotlin
+fun pick(n : Int) -> String {
+    let count : j = 3
+    let label : j = "three"
+    label
+}
+```
+
+The exception is a name new to the pattern of a `match` arm. It stands for
+whatever type is in its place, and only in that arm. After the arm, the name
+is free again. A name new to a pattern inside a parameter is the same, for the
+function's body, unless the header also writes it in an annotation on a whole
+parameter, the return type or the context. Then it is the header's type
+variable, wherever it is written first. This is how to name the type an
+[existential](types.md#existential-types) constructor hides, whether the arm
+opened it or an enclosing one did:
+
+<!-- run -->
+```kotlin
+type Shown = Shown[Show a](a)
+
+fun describe(s : Shown) -> String {
+    let shown = match s {
+        Shown(v : a) -> {
+            let copy : a = v
+            show(copy)
+        }
+    }
+    fun same(y : a) -> a = y
+    shown + " " + show(same(3))
+}
+
+fun main() {
+    print(describe(Shown(True)))
+}
+```
+
+```text
+True 3
+```
+
+Only such a pattern can name a hidden type. The name a `let` annotation writes
+is the function's, so it cannot stand for a type that only one arm can see:
+
+<!-- error: the type 'a' hidden by 'Shown' cannot leave the 'match' arm or function that opened it -->
+```kotlin
+type Shown = Shown[Show a](a)
+
+fun describe(s : Shown) -> String {
+    match s {
+        Shown(v) -> {
+            let copy : a = v
+            show(copy)
+        }
+    }
+}
+```
 
 ## Contexts
 
@@ -692,8 +805,10 @@ constraint ::= qualified-CONID atype          -- a class constraint
              | type "~" type                  -- an equality
 ```
 
-A context lists the constraints a function's type variables must satisfy. It
-goes between the function's name and its parameters:
+A context lists the constraints a function's type variables must satisfy,
+including, in a local function, those it takes from the functions around it
+([Scope of type variables](#scope-of-type-variables)). It goes between the
+function's name and its parameters:
 
 <!-- run -->
 ```kotlin

@@ -19,6 +19,7 @@ export (
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
     skolemsOf, markOpened, openedBy, clearOpened, markBreaker, breakerFor,
+    markHeaderVar, isHeaderVar,
     isFam, occursRigidly, occursIn, untouchable,
     unify, join, generalize, instantiate, instantiateQual, typeError, mismatch,
     typeKey, sameType, subterms, varsOf, freeVars,
@@ -293,6 +294,7 @@ fun openedBy(c : ConCell) -> Option String = Map.get(opened.names, c.uid)
 fun clearOpened() -> Unit {
     opened.names = Map.new()
     breakers.standsFor = Map.new()
+    headerVars.ids = Set.new()
 }
 
 -- The cycle breakers the solver has made, by variable id, and the family
@@ -309,6 +311,20 @@ fun markBreaker(cell : VarCell, fam : Type) -> Unit =
 --- Returns the family application the cycle breaker `cell` stands for, or
 --- `None` if `cell` is no breaker.
 fun breakerFor(cell : VarCell) -> Option Type = Map.get(breakers.standsFor, cell.id)
+
+-- The variables that a partial annotation's header names, by id. Each must
+-- stay a type of its own, which the solver checks once the group's body is
+-- solved (`checkRigid`). Until then, we assume it can only ever equal a
+-- variable or a rigid constant, as GHC's `TyVarTv` can.
+type HeaderVars = HeaderVars { var ids : Set.Set Int }
+
+let headerVars = HeaderVars { ids = Set.new() }
+
+--- Records `cell` as a variable a partial annotation's header names.
+fun markHeaderVar(cell : VarCell) -> Unit = Set.add(headerVars.ids, cell.id)
+
+--- Returns whether a partial annotation's header names `cell`.
+fun isHeaderVar(cell : VarCell) -> Bool = Set.contains(headerVars.ids, cell.id)
 
 fun newVar(level : Int, kind : Kind) -> VarCell {
     counters.tyvar = counters.tyvar + 1
@@ -1081,6 +1097,11 @@ fun unifyIn(a : Type, b : Type, where : Option Span, context : String,
                 }
             }
             cell.ref = Some(y)
+            -- A header variable bound to another variable is that variable
+            -- from now on, and pruning forgets the first. So the mark moves.
+            if isHeaderVar(cell) {
+                if let TVar(other) = prune(y) { markHeaderVar(other) }
+            }
             return match fams {
                 Some(f) -> f.bound(cell)
                 None -> {}

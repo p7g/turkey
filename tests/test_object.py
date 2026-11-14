@@ -16,9 +16,7 @@ output section and define the same named symbols at the same addresses, with
 the same binding, and leave the same symbols undefined.
 
 Only for the target `boot` was built for, since the assembler is
-`$TURKEY_CC -c`. `tests/lang.py` links every behavioral test's program from
-`boot`'s object, which is the check that decides; this one says where a
-difference is when that check fails.
+`$TURKEY_CC -c`.
 """
 
 from __future__ import annotations
@@ -424,9 +422,10 @@ def test_the_frame_table_is_read_only():
 @pytest.mark.skipif(toolchain.target() != "arm64-darwin" or not shutil.which("dyld_info"),
                     reason="dyld_info reads Mach-O executables")
 def test_the_loader_applies_binds_only(tmp_path):
+    obj = tmp_path / "adt.o"
+    obj.write_bytes(_ours(PROGRAMS / "adt.gob"))
     executable = tmp_path / "adt"
-    bootc.link(PROGRAMS / "adt.gob", executable,
-               env=dict(os.environ, TURKEY_LIB=str(REPO_ROOT / "lib")))
+    subprocess.run([*toolchain.cc(), "-o", str(executable), str(obj)], check=True)
     result = subprocess.run(["dyld_info", "-fixups", str(executable)],
                             capture_output=True, text=True, check=True)
     kinds = [line.split()[3] for line in result.stdout.splitlines()

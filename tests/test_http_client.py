@@ -31,7 +31,7 @@ PROGRAM = bootc.REPO_ROOT / "tests" / "http_client" / "Main.gob"
 def binary(tmp_path_factory):
     toolchain.needs_openssl()
     out = tmp_path_factory.mktemp("http_client") / "client"
-    bootc.link(PROGRAM, out, libraries=tuple(toolchain.openssl_libraries()))
+    bootc.executable(PROGRAM, out)
     return out
 
 

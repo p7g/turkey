@@ -167,12 +167,12 @@ a gap is an internal error. It costs a walk of the program, so it is off
 otherwise.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
-assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler
-links for. `sh scripts/build.sh
+assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for
+whichever of the two the C compiler links for. `sh scripts/build.sh
 --fixpoint` checks the fixed point: the compiler built from today's source
-emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
-replaces the committed compiler, which is rare and deliberate; both scripts
-explain themselves at the top.
+writes exactly the executable it is. `scripts/bump-bootstrap.sh` replaces the
+committed compiler, which is rare and deliberate; both scripts explain
+themselves at the top.
 
 ### Debugging and profiling
 
@@ -295,14 +295,17 @@ perf script | python3 scripts/demangle.py
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
 the tests alike. Each is split into words the way a shell would split it.
 
-- `TURKEY_CC` is the C compiler that links a program, and assembles the
-  bootstrap compiler. Unset, it is `cc`.
-- `TURKEY_RUN` is a prefix for running a program that compiler linked, or a
-  built compiler. Unset or empty, the program runs directly.
+- `TURKEY_CC` is the C compiler that assembles and links the bootstrap
+  compiler, and compiles the C files a few tests run beside a program.
+  Unset, it is `cc`.
+- `TURKEY_RUN` is a prefix for running a program `boot` wrote, or a built
+  compiler. Unset or empty, the program runs directly.
 
-On x86-64 Linux, the arm64 output runs under qemu-user. Link it statically,
-because a dynamically linked arm64 binary would need an arm64 libc to load.
-Set up the machine with:
+On x86-64 Linux, the arm64 output runs under qemu-user. The bootstrap
+compiler is linked statically, and every executable `boot` writes is
+dynamically linked against glibc, which qemu finds in the cross toolchain's
+`/usr/aarch64-linux-gnu` when `QEMU_LD_PREFIX` names it. Set up the machine
+with:
 
 ```bash
 apt-get update
@@ -319,10 +322,11 @@ if [ -w $B/register ]; then
 fi
 ```
 
-Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and leave `TURKEY_RUN`
-empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
-so an arm64 binary runs as `./program`, with no prefix, mounting binfmt_misc
-first where the container has not. That registration is
+Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and
+`QEMU_LD_PREFIX=/usr/aarch64-linux-gnu`, and leave `TURKEY_RUN` empty. The
+last step of the setup registers qemu with the kernel's binfmt_misc, so an
+arm64 binary runs as `./program`, with no prefix, mounting binfmt_misc first
+where the container has not. That registration is
 lost when a machine is restored from a snapshot, so the repository's
 `.claude/settings.json` runs the same line as a SessionStart hook. On macOS the
 hook does nothing. Where binfmt_misc cannot be written, set
@@ -342,14 +346,10 @@ with `symbol lookup error: undefined symbol`. It names its loader
 `/lib/ld-linux-aarch64.so.1`, as every glibc distribution installs it; on
 NixOS or Guix, `patchelf` it as any prebuilt binary.
 
-The whole test suite runs and passes this way, `pytest -m bootstrap` and the
-fixed point included, and the goldens in `tests/programs/` are the same on
-both platforms. It is slow: qemu runs the compiler about fifteen times slower
-than an arm64 Mac, so one self-compile takes about 26 minutes rather than
-105 seconds. On a 4-core x86-64 machine `sh scripts/build.sh` takes about
-27 minutes and `--fixpoint` about 80. `python3 -m pytest` takes about 75
-minutes once `boot` is built and two hours from a cold cache; the few tests
-that compile the compiler's own source are most of that.
+The goldens in `tests/programs/` are the same on both platforms. Under qemu
+the compiler runs many times slower than on an arm64 Mac, and the few tests
+that compile the compiler's own source take most of the suite's time. Nothing
+in CI runs this setup.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
 programs run directly, and an executable needs no C compiler at all. CI does

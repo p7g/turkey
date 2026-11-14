@@ -94,7 +94,7 @@ def _start(tmp_path, source, workers, *flags, **env):
     entry = tmp_path / "main.gob"
     entry.write_text(source)
     binary = tmp_path / "handoff"
-    bootc.link(entry, binary, *flags)
+    bootc.executable(entry, binary, *flags)
     return subprocess.Popen(toolchain.command(binary), stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             env=dict(os.environ, TURKEY_WORKERS=workers, **env))
@@ -309,7 +309,7 @@ def test_the_report_at_exit_stops_for_another_workers_collection(tmp_path):
     entry = tmp_path / "main.gob"
     entry.write_text(ENDING)
     binary = tmp_path / "ending"
-    bootc.link(entry, binary, "--gc-stats")
+    bootc.executable(entry, binary, "--gc-stats")
     env = dict(os.environ, TURKEY_WORKERS="8", TURKEY_GC_STRESS="1")
     for _ in range(100):
         result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,

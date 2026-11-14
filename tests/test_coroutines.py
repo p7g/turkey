@@ -47,7 +47,7 @@ def coroutines(request, tmp_path):
                          encoding="utf-8")
         name = "verified" if flags else "plain"
         binary = tmp_path / name
-        bootc.link(entry, binary, *flags)
+        bootc.executable(entry, binary, *flags)
         return binary
 
     def run(body: str, verified: bool = False,

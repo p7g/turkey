@@ -6,11 +6,11 @@ through this module.
 
 A program is compiled the way a user would compile it: `boot build` from the
 program's own directory, so a diagnostic quotes the file by its bare name, to
-a relocatable object, then linked against the runtime with the C compiler,
-then run, both as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
-the directory the program is compiled from is not the repository root.
+an executable, then run as `tests.toolchain` says. The library is found
+through `$TURKEY_LIB`, since the directory the program is compiled from is not
+the repository root.
 
-Both steps are cached on disk, keyed by `bootc.build_key()` and the program's
+Compiling is cached on disk, keyed by `bootc.build_key()` and the program's
 sources, because a behavioral suite is hundreds of small programs and under
 `pytest -n auto` any of them may be asked for by any worker. Running is not
 cached: it is the thing being tested, and it takes milliseconds.
@@ -166,10 +166,10 @@ def _key(output: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
     return h.hexdigest()[:24]
 
 
-def _boot(output: str, entry: Path,
+def _boot(argv: list[str], entry: Path,
           flags: tuple[str, ...] = ()) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        toolchain.command(bootc.binary(), *bootc.argv(output), *flags, entry.name),
+        toolchain.command(bootc.binary(), *argv, *flags, entry.name),
         cwd=entry.parent,
         env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True,
@@ -210,26 +210,19 @@ def _cached(output: str, entry: Path, build,
 
 def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
     def build(directory: Path) -> tuple[int, str]:
-        result = _boot("obj", entry, flags)
-        stderr = result.stderr.decode("utf-8")
-        if result.returncode != 0:
-            return result.returncode, stderr
-        obj = directory / f"main.{os.getpid()}.o"
-        obj.write_bytes(result.stdout)
-        try:
-            bootc.replace_built(
-                [*toolchain.cc(), "-o", str(directory / f"bin.{os.getpid()}"),
-                 str(obj), *toolchain.libraries()],
-                directory / "bin")
-        finally:
-            obj.unlink(missing_ok=True)
-        return 0, stderr
-    return _cached("obj", entry, build, flags)
+        staging = directory / f"bin-{os.getpid()}"
+        result = _boot(["build", "-o", str(staging)], entry, flags)
+        if result.returncode == 0:
+            os.replace(staging, directory / "bin")
+        else:
+            staging.unlink(missing_ok=True)
+        return result.returncode, result.stderr.decode("utf-8")
+    return _cached("exe", entry, build, flags)
 
 
 def _checked(entry: Path) -> _Compiled:
     def build(_: Path) -> tuple[int, str]:
-        result = _boot("check", entry)
+        result = _boot(bootc.argv("check"), entry)
         return result.returncode, result.stderr.decode("utf-8")
     return _cached("check", entry, build)
 
@@ -371,7 +364,7 @@ def dump(stage: str, src: Source,
     """`boot check --dump <stage>` on one program -- `types`, `core`, `mono`,
     `opt` -- from the program's own directory. Not cached; a dump is what is
     tested."""
-    result = _boot(stage, _entry(src, modules))
+    result = _boot(bootc.argv(stage), _entry(src, modules))
     return Result(result.stdout.decode("utf-8"), result.stderr.decode("utf-8"),
                   result.returncode)
 
@@ -379,7 +372,7 @@ def dump(stage: str, src: Source,
 def types(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
     """The entry module's signatures, as the `types` dump prints them."""
     entry = _entry(src, modules)
-    result = _boot("types", entry)
+    result = _boot(bootc.argv("types"), entry)
     stderr = result.stderr.decode("utf-8")
     if result.returncode != 0:
         raise CompileError(stderr, result.returncode)

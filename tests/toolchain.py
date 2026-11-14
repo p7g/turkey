@@ -139,7 +139,7 @@ def identity() -> bytes:
 def machine() -> str:
     """The triple `$TURKEY_CC -dumpmachine` reports, or "" if it cannot say.
 
-    `scripts/build.sh` builds for the host, or on a host that is no target
+    `scripts/build.sh` builds for the host, or, on a host that is no target,
     for this triple, and `turkey` emits for the target it was built for, so
     this is also what the tests' programs are compiled for where `$TURKEY_CC`
     is the host's compiler.

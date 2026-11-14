@@ -121,8 +121,13 @@ case $target in
 esac
 ARTIFACT=$BOOTSTRAP/$target.gz
 # The committed compiler for another target than the host's runs only under
-# an emulator, which TURKEY_RUN names. Refused here rather than when stage1
-# fails to start.
+# an emulator, which TURKEY_RUN names, and the Mac's under none: qemu-user
+# runs no Mach-O. Refused here rather than when stage1 fails to start.
+if [ -z "$stage1" ] && [ "$target" = arm64-darwin ] && [ "$host" != arm64-darwin ]; then
+    echo "build.sh: the committed arm64-darwin compiler runs only on an arm64 Mac;" \
+         "build for arm64-linux, or pass --stage1" >&2
+    exit 1
+fi
 if [ -n "$host" ] && [ "$target" != "$host" ] && [ -z "$RUN" ] && [ -z "$stage1" ]; then
     echo "build.sh: the committed $target compiler cannot run on $host;" \
          "build for $host, or set TURKEY_RUN to an emulator for $target" >&2

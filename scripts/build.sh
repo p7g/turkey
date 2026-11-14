@@ -202,6 +202,10 @@ fi
 
 emit "$out/stage1" "$out/stage2.o"
 link "$out/stage2.o" "$out/turkey"
+# Nothing here writes a file named stage2. Remove one found in --out, since it
+# is a compiler this build did not make and would be run in place of `turkey`
+# by anything that still names it.
+rm -f "$out/stage2"
 
 if [ $fixpoint = 1 ]; then
     emit "$out/turkey" "$out/stage3.o"

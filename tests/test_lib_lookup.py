@@ -182,6 +182,13 @@ def test_install_replaces_only_a_turkey_link(tmp_path: Path):
     assert replaced.returncode == 0, replaced.stderr
     assert os.readlink(bindir / "turkey") == str(REPO_ROOT / "build" / "stages" / "turkey")
 
+    # A checkout whose `build.sh` names its result `stage2` leaves such a link.
+    (bindir / "turkey").unlink()
+    (bindir / "turkey").symlink_to("/elsewhere/build/stages/stage2")
+    replaced = _install(bindir)
+    assert replaced.returncode == 0, replaced.stderr
+    assert os.readlink(bindir / "turkey") == str(REPO_ROOT / "build" / "stages" / "turkey")
+
     (bindir / "turkey").unlink()
     (bindir / "turkey").symlink_to("/usr/bin/true")
     refused = _install(bindir)

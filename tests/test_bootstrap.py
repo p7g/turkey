@@ -254,7 +254,7 @@ def test_build_sh_speaks_only_the_bootstraps_command_line():
         return
     script = (REPO_ROOT / "scripts" / "build.sh").read_text()
     assert "native" not in script, (
-        "bootstrap/ now speaks `turkey build`, so scripts/build.sh no longer "
+        "the compiler in bootstrap/ now takes `build`, so scripts/build.sh no longer "
         "needs to fall back to `native`: remove `emit_command` and call "
         "`build -o - -f asm` directly")
 

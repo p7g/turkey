@@ -554,6 +554,8 @@ def test_an_output_named_dot_s_without_dash_s_is_an_executable(tmp_path):
     (["-S", ".gob"], "cannot name the assembly after '.gob'"),
     (["-S", "sub/"], "cannot name the assembly after 'sub/', which has no file name"),
     (["-S", "-o", "-", "--dump", "core", "a.gob"], "--dump and the build would both write"),
+    (["-S", "-o", "", "a.gob"], "-o '' has no file name"),
+    (["-o", "missing/", "a.gob"], "-o 'missing/' has no file name"),
 ])
 def test_what_build_refuses(tmp_path, args, message):
     for name in ("a.gob", "b.gob", "d.gob", ".gob"):
@@ -576,3 +578,21 @@ def test_a_refused_build_writes_no_assembly(tmp_path):
     assert _build(tmp_path, "-S", "bad.gob").returncode != 0
     assert (tmp_path / "bad.s").read_text(encoding="utf-8") == "kept\n"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["bad.gob", "bad.s"]
+
+
+# A write that fails part way, here at a file-size limit, removes the partial
+# file it was writing, as any exit before the rename does.
+def test_a_failed_write_leaves_no_partial_file(tmp_path):
+    import resource
+    import signal
+
+    def limited():
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (100_000, 100_000))
+
+    (tmp_path / "adt.gob").write_bytes((PROGRAMS / "adt.gob").read_bytes())
+    result = subprocess.run(toolchain.command(bootc.binary(), "build", "-S", "adt.gob"),
+                            cwd=tmp_path, capture_output=True, preexec_fn=limited,
+                            env=dict(os.environ, TURKEY_LIB=str(lang.LIB)), timeout=600)
+    assert result.returncode == 2, result.stderr
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["adt.gob"]

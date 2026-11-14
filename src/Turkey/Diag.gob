@@ -1,7 +1,7 @@
 export (
     Diag(..), Severity(..), at, whole, warningAt, render, fail, short, compiling,
     report, beginUnit, endUnit, beginMuted, endMuted, beginHeld, endHeld, hasErrors, errorCount, stopOnErrors,
-    stopCollecting,
+    stopCollecting, removeOnExit, keepOnExit, exit,
 )
 
 --- A diagnostic is a value.
@@ -16,6 +16,7 @@ export (
 --- One rendering, `file:line:col: stage: message`, and every diagnostic uses it.
 
 import System.Env as Env
+import System.File as File
 import System.IO as IO
 import Turkey.Source (Span(..), generated, isGenerated, outermost, showSpan)
 
@@ -107,6 +108,27 @@ var held : Option (Vec Diag) = None
 var unitDepth = 0
 var unitFailed = False
 
+-- Files a compile is part way through writing, removed by `exit` so that a
+-- refused or failed build leaves none of them behind. A panic or a signal
+-- does not go through `exit`, and leaves them.
+var leftovers : Vec String = []
+
+--- Removes the file at `path` when the compile exits through `exit` (which
+--- `fail` and `stopOnErrors` call), unless `keepOnExit(path)` comes first. A
+--- panic or a signal leaves it.
+fun removeOnExit(path : String) -> Unit = Vec.push(leftovers, path)
+
+--- Undoes `removeOnExit(path)`.
+fun keepOnExit(path : String) -> Unit {
+    leftovers = Vec.filter(leftovers, fun(p) = p != path)
+}
+
+--- Removes what `removeOnExit` named, and exits with `status`.
+fun exit(status : Int) -> a {
+    for path in leftovers { let _ = File.removeFile(path) }
+    Env.exit(status)
+}
+
 --- Records `d`, to be printed by the next `stopOnErrors` or `fail`. After
 --- `stopCollecting`, an error ends the compile at once instead.
 ---
@@ -187,7 +209,7 @@ fun stopCollecting() -> Unit {
 --- 1 if any of it was an error, and returns otherwise.
 fun stopOnErrors() -> Unit {
     printCollected()
-    if errorSeen { Env.exit(1) }
+    if errorSeen { exit(1) }
 }
 
 fun printCollected() -> Unit {
@@ -217,7 +239,7 @@ fun fail(d : Diag, filename : String) -> a {
                    else { filename }
         let _ = IO.writeText(IO.stderr(), render(d, name) + "\n")
     }
-    Env.exit(1)
+    exit(1)
 }
 
 --- A message with every internal name written the way the author wrote it.

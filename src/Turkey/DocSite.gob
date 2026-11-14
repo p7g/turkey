@@ -168,7 +168,12 @@ fun commentBlock(text : Option String) -> String = match text {
 
 -- -- signatures -----------------------------------------------------------------------
 
-fun kw(s : String) -> String = "<span class=\"kw\">" + escape(s) + "</span>"
+-- `s`, a keyword or a comment of a signature, coloured as code is.
+fun kw(s : String) -> String = highlight(s)
+
+-- Returns `t`, a type, a predicate or a list of them as a signature shows
+-- it, as HTML. Every type a signature shows goes through here.
+fun typeHTML(t : String) -> String = highlight(t)
 
 fun nm(s : String) -> String = "<span class=\"name\">" + escape(s) + "</span>"
 
@@ -177,12 +182,12 @@ fun marked(ids : Bool, fragment : String, html : String) -> String =
     if ids { "<span id=\"" + escape(fragment) + "\">" + html + "</span>" } else { html }
 
 fun typed(shown : Option String) -> String = match shown {
-    Some(t) -> " : " + highlight(t)
+    Some(t) -> " : " + typeHTML(t)
     None -> ""
 }
 
 fun listed(prefix : String, xs : Vec String) -> String =
-    if len(xs) == 0 { "" } else { prefix + highlight(String.join(xs, ", ")) }
+    if len(xs) == 0 { "" } else { prefix + typeHTML(String.join(xs, ", ")) }
 
 fun params(ps : Vec String) -> String =
     if len(ps) == 0 { "" } else { " " + escape(String.join(ps, " ")) }
@@ -198,14 +203,14 @@ fun constructor(c : ConDoc, ids : Bool) -> String {
     for p in c.context { Vec.push(bracket, p) }
     let shown = marked(ids, "con." + c.name, nm(c.name))
     let name = if len(bracket) == 0 { shown }
-               else { shown + "[" + highlight(String.join(bracket, ", ")) + "]" }
+               else { shown + "[" + typeHTML(String.join(bracket, ", ")) + "]" }
     match c.shape {
         Fields(fields) -> name + " { " + String.join(Vec.map(fields, fun(f) =
             (if f.mutable { "var " } else { "" })
                 + marked(ids, "field." + c.name + "." + f.name, escape(f.name))
-                + " : " + highlight(f.shown)), ", ") + " }"
+                + " : " + typeHTML(f.shown)), ", ") + " }"
         Positional(args) -> if len(args) == 0 { name }
-                            else { name + "(" + highlight(String.join(args, ", ")) + ")" }
+                            else { name + "(" + typeHTML(String.join(args, ", ")) + ")" }
     }
 }
 
@@ -233,14 +238,14 @@ fun signature(t : Targets, item : Item, ids : Bool) -> String = match item.body 
     Function(shown) -> kw("fun") + " " + nm(item.name) + typed(shown)
     Value(shown, mutable) -> kw(if mutable { "var" } else { "let" }) + " " + nm(item.name)
                              + typed(shown)
-    Alias(ps, body) -> kw("type") + " " + nm(item.name) + params(ps) + " = " + highlight(body)
+    Alias(ps, body) -> kw("type") + " " + nm(item.name) + params(ps) + " = " + typeHTML(body)
     Data(d) -> {
         let cons = Vec.map(d.constructors, constructor(_, ids))
         let body = if len(cons) == 0 { "" } else { "\n    = " + String.join(cons, "\n    | ") }
         kw("type") + " " + nm(item.name) + params(d.params) + listed(" : ", d.derives) + body
     }
     Class(c) -> kw("class") + " " + nm(item.name) + " " + escape(c.param) + listed(" : ", c.supers)
-    Instance(inst) -> kw("instance") + " " + highlight(item.name)
+    Instance(inst) -> kw("instance") + " " + typeHTML(item.name)
                       + listed(" : ", inst.context)
     Operator(op) -> kw("infix") + " " + escape(op.group) + " (" + nm(item.name) + ") = "
                     + escape(op.function) + "  "
@@ -407,7 +412,7 @@ fun searchIndex(t : Targets, docs : Vec ModuleDoc) -> String {
 }
 
 -- What a search looks through for `item`: its name, its type, its methods'
--- and constructors' names and types, and its comment.
+-- and constructors' names and types, and the text of its comment.
 fun searchText(item : Item) -> String {
     let parts = [item.name]
     let add = fun(s : Option String) { if let Some(text) = s { Vec.push(parts, text) } }
@@ -428,8 +433,31 @@ fun searchText(item : Item) -> String {
         }
         Instance(_) | Operator(_) -> {}
     }
-    add(item.comment)
+    add(Option.map(item.comment, plainText))
     String.join(parts, "\n")
+}
+
+-- The text a reader sees of `comment`, Markdown: its rendering with every
+-- tag removed and every entity written as its character. A code block's info
+-- string is not part of it.
+fun plainText(comment : String) -> String {
+    let rendered = Markdown.render(Markdown.defaults(), comment)
+    let out = String.builder()
+    var inTag = False
+    for c in String.codePoints(rendered) {
+        if inTag {
+            if c == '>' { inTag = False }
+        } else if c == '<' {
+            inTag = True
+        } else {
+            String.push(out, Char.toString(c))
+        }
+    }
+    let text = String.build(out)
+    -- Escape writes these four and nothing else, and `&amp;` goes last so
+    -- that it cannot make a new entity of what follows it.
+    String.replace(String.replace(String.replace(String.replace(text, "&lt;", "<"), "&gt;", ">"),
+                                  "&quot;", "\""), "&amp;", "&")
 }
 
 -- `search.js`: filters `searchIndex` by what the search box holds, and shows
@@ -488,14 +516,14 @@ let styleSheet = [
     ":root {",
     "  --bg: #fdfcfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e4e2dd;",
     "  --code-bg: #f3f1ec; --accent: #9a3b12; --hit: #fff1c2;",
-    "  --statement: #a0522d; --type: #2e7d4f; --preproc: #7b3fa0; --constant: #b0306f;",
+    "  --statement: #a0522d; --type: #286e45; --preproc: #7b3fa0; --constant: #b0306f;",
     "  --special: #5a4fc0; --comment: #3a64a8;",
     "  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;",
     "}",
     "@media (prefers-color-scheme: dark) {",
     "  :root {",
     "    --bg: #18181a; --fg: #e6e4df; --muted: #9a9aa0; --line: #2e2e33;",
-    "    --code-bg: #232327; --accent: #f0915d; --hit: #4a3d12;",
+    "    --code-bg: #232327; --accent: #f0915d; --hit: #3a300e;",
     "    --statement: #e0c060; --type: #7fcf8f; --preproc: #d08fe0; --constant: #f0a0a0;",
     "    --special: #f0a050; --comment: #80a0ff;",
     "  }",
@@ -531,7 +559,6 @@ let styleSheet = [
     "  font-family: var(--mono); font-size: 13.5px; white-space: pre-wrap;",
     "  overflow-wrap: anywhere;",
     "}",
-    ".kw { color: var(--muted); }",
     ".name { font-weight: 600; }",
     ".doc { margin: .35rem 0 0 1.2rem; }",
     ".doc p { margin: .3rem 0; }",
@@ -551,6 +578,7 @@ let styleSheet = [
     ".turkey .escape, .turkey .doc-comment { color: var(--special); }",
     ".turkey .comment, .turkey .block-comment { color: var(--comment); }",
     ".turkey .todo { background: var(--hit); }",
+    ".turkey a, .turkey a [class] { color: var(--accent); }",
     ".members { margin: .4rem 0 0 1.2rem; }",
     ".members .sig { margin-top: .3rem; }",
     ".none { color: var(--muted); font-style: italic; }",

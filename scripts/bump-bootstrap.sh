@@ -4,17 +4,24 @@
 # A policy step, not a build step. Bump only when the source needs something the
 # committed compiler cannot build -- a new language feature, or a changed
 # runtime ABI. Land the feature, bump, and only then use the feature in the
-# compiler; a bump for any other reason is 13 MB of git history for nothing.
+# compiler; a bump for any other reason is 7 MB of git history for nothing.
 #
 # The bump is its own commit, containing only bootstrap/, so that a bad one is
 # fixed by reverting it. This runs the fixed point first and refuses a dirty
-# tree, because PROVENANCE has to name the commit the assembly was built from.
+# tree, because PROVENANCE has to name the commit the compiler was built from.
 #
-# There is one artifact per target, arm64-darwin.s.gz and arm64-linux.s.gz, and
-# a bump writes both from the fixed-point compiler, whichever target that was
-# built for: the compiler emits either platform's assembly from any host. They
-# move together so that a build on either platform starts from the same
-# commit's compiler, and so that PROVENANCE names one commit, not two.
+# There is one artifact per target, arm64-darwin.gz and arm64-linux.gz: the
+# executable the fixed-point compiler writes for that target, under
+# gzip -9 -n (3.6 MB each). A bump writes both, whichever target the fixed
+# point was built for, since the compiler writes either platform's executable
+# from any host. They move together so that a build on either platform starts
+# from the same commit's compiler, and so that PROVENANCE names one commit,
+# not two.
+#
+# The executables are deterministic: the same compiler writes the same bytes
+# for a target on any host, whatever the output is called. So anyone can check
+# a bump by checking out PROVENANCE's commit, building it from the bootstrap
+# that commit carries, and running PROVENANCE's command for each target.
 #
 # --stage1 is how to bump across a change the committed compiler cannot build:
 # start from a compiler built before the change. It must write executables
@@ -62,32 +69,29 @@ trap 'echo "bump-bootstrap.sh: failed; restore bootstrap/ with git checkout -- b
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)
-command: build -o - -f asm --target TARGET src/Main.gob
-cc: $(${TURKEY_CC:-cc} --version | head -n 1)
+command: build -o OUTPUT --target TARGET src/Main.gob
 EOF
 for target in $TARGETS; do
-    echo "emit $target" >&2
-    $RUN "$OUT/stage3" build -f asm -o "$OUT/$target.s" --target "$target" src/Main.gob
-    # -n makes one gzip compress the same text to the same bytes, but GNU
-    # gzip and macOS's disagree. An artifact whose text is unchanged is kept,
-    # so a bump from the other platform does not rewrite 6.5 MB of it.
-    if [ ! -f "$BOOTSTRAP/$target.s.gz" ] ||
-            ! gunzip -c "$BOOTSTRAP/$target.s.gz" | cmp -s - "$OUT/$target.s"; then
-        gzip -9 -n -c "$OUT/$target.s" > "$BOOTSTRAP/$target.s.gz"
+    echo "write $target" >&2
+    TURKEY_LIB=lib $RUN "$OUT/stage3" build -o "$OUT/$target" --target "$target" src/Main.gob
+    # -n makes one gzip compress the same bytes to the same bytes, but GNU
+    # gzip and macOS's disagree. An artifact whose executable is unchanged is
+    # kept, so a bump from the other platform does not rewrite 3.6 MB of it.
+    if [ ! -f "$BOOTSTRAP/$target.gz" ] ||
+            ! gunzip -c "$BOOTSTRAP/$target.gz" | cmp -s - "$OUT/$target"; then
+        gzip -9 -n -c "$OUT/$target" > "$BOOTSTRAP/$target.gz"
     fi
     cat >> "$OUT/PROVENANCE" <<EOF
-$target asm-sha256: $(sha "$OUT/$target.s")
-$target gz-sha256: $(sha "$BOOTSTRAP/$target.s.gz")
+$target exe-sha256: $(sha "$OUT/$target")
+$target gz-sha256: $(sha "$BOOTSTRAP/$target.gz")
 EOF
 done
 mv "$OUT/PROVENANCE" "$BOOTSTRAP/PROVENANCE"
 
-# The assembly is not what the fixed point compared: no stage after stage1 is
-# built from assembly. So link stage1 from the host's assembly just committed
-# and check that it writes stage3, byte for byte, as stage3 writes itself, and
-# that it writes every target's assembly as stage3 did. The other target's
-# assembly is assembled by nothing here, since `cc` assembles only the host's.
-# Only --target is passed on, so that this stage1 is the committed one.
+# Unpack stage1 from the host's executable just committed, as build.sh will,
+# and check that it writes every target's executable as the fixed point did:
+# its own, which is stage3's bytes, and the other target's, which nothing here
+# runs. Only --target is passed on, so that this stage1 is the committed one.
 target=
 previous=
 for argument in "$@"; do
@@ -97,27 +101,20 @@ for argument in "$@"; do
     previous=$argument
 done
 sh scripts/build.sh --out "$OUT/committed" --stage1-only ${target:+--target "$target"}
-TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -o "$OUT/committed/written" -f exe \
-    ${target:+--target "$target"} src/Main.gob
-if ! cmp -s "$OUT/committed/written" "$OUT/stage3"; then
-    echo "bump-bootstrap.sh: the committed assembly, linked, does not write the" \
-         "fixed point's compiler" >&2
-    exit 1
-fi
 for other in $TARGETS; do
-    TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -f asm -o "$OUT/committed/$other.s" \
+    TURKEY_LIB=lib $RUN "$OUT/committed/stage1" build -o "$OUT/committed/$other" \
         --target "$other" src/Main.gob
-    if ! cmp -s "$OUT/committed/$other.s" "$OUT/$other.s"; then
-        echo "bump-bootstrap.sh: the committed compiler writes $other's assembly" \
-             "differently from the fixed point's" >&2
+    if ! cmp -s "$OUT/committed/$other" "$OUT/$other"; then
+        echo "bump-bootstrap.sh: the committed compiler writes $other's executable" \
+             "differently from the fixed point" >&2
         exit 1
     fi
 done
 trap - EXIT
 
 echo
-echo "bootstrap/ now holds $(git rev-parse --short HEAD)'s compiler. The host's assembly"
-echo "was linked and checked; every target's was written the same by it and by the"
-echo "fixed point, and no assembler read the others'. Commit it alone:"
+echo "bootstrap/ now holds $(git rev-parse --short HEAD)'s compiler. The host's executable"
+echo "ran and writes every target's as the fixed point did; nothing here ran the"
+echo "other's. Commit it alone:"
 echo
 echo "    git add $BOOTSTRAP && git commit -m 'bootstrap: bump to $(git rev-parse --short HEAD)'"

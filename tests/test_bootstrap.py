@@ -206,14 +206,14 @@ def test_the_bootstrap_is_what_its_provenance_says():
     the chain to be walked back to source.
     """
     fields = _provenance()
-    artifacts = sorted(BOOTSTRAP.glob("*.s.gz"))
-    assert BOOTSTRAP / "arm64-darwin.s.gz" in artifacts
-    for artifact in artifacts:
-        target = artifact.name.removesuffix(".s.gz")
+    artifacts = sorted(BOOTSTRAP.glob("*.gz"))
+    targets = [a.name.removesuffix(".gz").removesuffix(".s") for a in artifacts]
+    assert "arm64-darwin" in targets
+    for artifact, target in zip(artifacts, targets):
         packed = artifact.read_bytes()
         assert hashlib.sha256(packed).hexdigest() == fields[f"{target} gz-sha256"]
-        assert (hashlib.sha256(gzip.decompress(packed)).hexdigest()
-                == fields[f"{target} asm-sha256"])
+        unpacked = fields.get(f"{target} exe-sha256") or fields[f"{target} asm-sha256"]
+        assert hashlib.sha256(gzip.decompress(packed)).hexdigest() == unpacked
     if (REPO_ROOT / ".git").exists() and shutil.which("git"):
         found = subprocess.run(
             ["git", "cat-file", "-e", f"{fields['commit']}^{{commit}}"],

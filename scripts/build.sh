@@ -178,6 +178,23 @@ link() {
 if [ -n "$stage1" ]; then
     step "stage1 is $stage1"
     cp "$stage1" "$out/stage1"
+elif [ -f "$BOOTSTRAP/$target.gz" ]; then
+    # The committed compiler as an executable, which runs as it is.
+    executable=$BOOTSTRAP/$target.gz
+    expected=$(provenance "$target gz-sha256")
+    if [ -z "$expected" ] || [ "$(sha "$executable")" != "$expected" ]; then
+        echo "build.sh: $executable does not match PROVENANCE's" \
+             "$target gz-sha256" >&2
+        exit 1
+    fi
+    step "gunzip stage1"
+    gunzip -c "$executable" > "$out/stage1-tmp"
+    if [ "$(sha "$out/stage1-tmp")" != "$(provenance "$target exe-sha256")" ]; then
+        echo "build.sh: $executable decompresses to the wrong bytes" >&2
+        exit 1
+    fi
+    chmod +x "$out/stage1-tmp"
+    mv "$out/stage1-tmp" "$out/stage1"
 else
     if [ ! -f "$ARTIFACT" ]; then
         echo "build.sh: there is no committed compiler for $target" >&2

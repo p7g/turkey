@@ -371,6 +371,9 @@ sh vim/test/run.sh
 what each one exports. Every function, value, type, class, instance and
 operator gets its type as the checker has it, its line, and its doc comment:
 the `---` comments directly above it ([doc comments](docs/ref/lexical.md#doc-comments)).
+A module that re-exports something it imported directly from an undocumented
+module -- the library's implementation, or a module not among the files --
+shows it in full. A re-export of a documented module's copy stays a link to it.
 `turkey doc --html DIR FILE...` writes the same description as a static
 website in `DIR`: an index, one page per module, and a search over names,
 types and comments. To build it for the whole library:

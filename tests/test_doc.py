@@ -7,6 +7,16 @@ above a field, a constructor, a method, an associated type and an instance;
 the module comment; and doc comments that document nothing, beside ordinary,
 rule and block comments that are never docs.
 
+`tests/doc/Hidden.gob` is imported but never documented, so the modules that
+import from it show what they re-export of it in full: `Fixture` its type,
+class and function, and `tests/doc/Board.gob` the same type and the class's
+method alone. `Board` also re-exports `Fixture`'s copy of the function, which
+stays a link. `Hidden`'s instances go to the pages of their head types --
+`Board`, the first by name of the two that show `Tile`, and `Shapes` -- and the
+one on `Int`, which has no page, to its class's, `Fixture`. Its instance of a
+class no module exports is left out. `tests/doc/Yard.gob` re-exports `Tile`
+from `Fixture`, and links to `Fixture`'s copy rather than `Board`'s.
+
 `turkey doc --html` writes the same description as a website, recorded file by
 file in `tests/doc/site/`, with the JSON among its files.
 
@@ -30,6 +40,8 @@ from tests import bootc, toolchain
 FIXTURES = bootc.REPO_ROOT / "tests" / "doc"
 GOLDEN = FIXTURES / "docs.json"
 SITE = FIXTURES / "site"
+FILES = ("tests/doc/Board.gob", "tests/doc/Fixture.gob", "tests/doc/Shapes.gob",
+         "tests/doc/Yard.gob")
 
 
 def _doc(*files: str) -> subprocess.CompletedProcess[str]:
@@ -39,7 +51,7 @@ def _doc(*files: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_the_fixture_matches_its_golden() -> None:
-    result = _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+    result = _doc(*FILES)
     assert result.returncode == 0, result.stderr
     if os.environ.get("TURKEY_BLESS_DOC"):
         GOLDEN.write_text(result.stdout)
@@ -47,7 +59,7 @@ def test_the_fixture_matches_its_golden() -> None:
 
 
 def _site(out) -> dict[str, str]:
-    result = _doc("--html", str(out), "tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+    result = _doc("--html", str(out), *FILES)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     return {p.name: p.read_text() for p in sorted(out.iterdir())}
@@ -55,7 +67,7 @@ def _site(out) -> dict[str, str]:
 
 def test_the_fixture_site_matches_its_golden(tmp_path) -> None:
     site = _site(tmp_path / "site")
-    assert site.pop("docs.json") == _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob").stdout
+    assert site.pop("docs.json") == _doc(*FILES).stdout
     if os.environ.get("TURKEY_BLESS_DOC"):
         SITE.mkdir(exist_ok=True)
         for stale in SITE.iterdir():
@@ -85,8 +97,8 @@ def test_every_link_in_the_site_reaches_an_element(tmp_path) -> None:
 
 
 def test_the_output_does_not_depend_on_the_order_of_the_files() -> None:
-    forwards = _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
-    backwards = _doc("tests/doc/Shapes.gob", "tests/doc/Fixture.gob")
+    forwards = _doc(*FILES)
+    backwards = _doc(*reversed(FILES))
     assert forwards.stdout == backwards.stdout
 
 
@@ -101,6 +113,88 @@ def test_every_library_function_has_a_type() -> None:
     untyped = [(m["name"], item["name"]) for m in modules for item in m["items"]
                if item["kind"] in ("function", "value") and item["type"] is None]
     assert untyped == []
+
+
+def _items(tmp_path, sources: dict[str, str], documented: list[str],
+           library: tuple[str, ...] = ()) -> dict[str, dict[str, dict]]:
+    """Writes `sources` into `tmp_path` and documents the modules `documented`
+    names there, with the library files `library`. Returns each module's items
+    by name."""
+    for name, text in sources.items():
+        (tmp_path / f"{name}.gob").write_text(text)
+    result = _doc(*library, *(str(tmp_path / f"{name}.gob") for name in documented))
+    assert result.returncode == 0, result.stderr
+    return {m["name"]: {item["name"]: item for item in m["items"]}
+            for m in json.loads(result.stdout)["modules"]}
+
+
+def test_an_explicit_import_shadows_the_implicit_prelude(tmp_path) -> None:
+    # The Prelude, undocumented here, gives `Option` too.
+    items = _items(tmp_path, {"M": "export (Option(..))\nimport Data.Option (Option(..))\n"},
+                   ["M"], ("lib/Data/Option.gob",))
+    assert items["M"]["Option"]["kind"] == "reexport"
+    assert items["M"]["Option"]["home"] == "Data.Option"
+
+
+def test_a_name_an_import_hides_is_not_shown_from_it(tmp_path) -> None:
+    items = _items(tmp_path, {
+        "H": "export (T(..))\n\ntype T = T(Int)\n",
+        "D": "export (T(..))\n\nimport H (T(..))\n",
+        "W": "export (T(..))\n\nimport H (T as _, ..)\nimport D (T(..))\n",
+    }, ["D", "W"])
+    assert items["D"]["T"]["from"] == "H"
+    assert items["W"]["T"]["kind"] == "reexport"
+    assert items["W"]["T"]["home"] == "D"
+
+
+def test_a_name_a_qualifier_passes_on_links_to_that_module(tmp_path) -> None:
+    # `Data.Array` shows `threeWay` too, and comes first by name.
+    items = _items(tmp_path, {"Q": "export (module Vec (threeWay))\n"}, ["Q"],
+                   ("lib/Data/Array.gob", "lib/Data/Vec.gob"))
+    assert items["Q"]["threeWay"]["kind"] == "reexport"
+    assert items["Q"]["threeWay"]["home"] == "Data.Vec"
+
+
+def test_a_module_that_sees_no_copy_links_to_the_first_by_name(tmp_path) -> None:
+    # `A` and `B` have `x` from each other, so following their imports finds
+    # no copy, only the cycle. `C` and `D` each show `x`.
+    items = _items(tmp_path, {
+        "U": "export (x)\n\nlet x = 1\n",
+        "A": "export (module Uq (x))\n\nimport U as Uq\nimport B (x)\n",
+        "B": "export (x)\n\nimport A (x)\n",
+        "C": "export (x)\n\nimport U (x)\n",
+        "D": "export (x)\n\nimport U (x)\n",
+    }, ["A", "B", "C", "D"])
+    assert items["C"]["x"]["from"] == "U"
+    assert items["D"]["x"]["from"] == "U"
+    assert items["A"]["x"]["home"] == "C"
+    assert items["B"]["x"]["home"] == "C"
+
+
+def test_a_method_without_its_class_links_along_its_own_imports(tmp_path) -> None:
+    # `D1` and `D2` each show `C`. `M` has `meth` from `D2`; its unrelated
+    # qualifier for `D1` must not count.
+    items = _items(tmp_path, {
+        "U": "export (C(..))\n\nclass C a {\n    fun meth(a) -> Int\n}\n",
+        "D1": "export (C(..))\n\nimport U (C(..))\n",
+        "D2": "export (C(..))\n\nimport U (C(..))\n",
+        "M": "export (meth)\n\nimport D2 (meth)\nimport D1 as Q\n",
+    }, ["D1", "D2", "M"])
+    assert items["M"]["meth"]["home"] == "D2"
+
+
+def test_an_associated_type_links_where_its_class_is_renamed(tmp_path) -> None:
+    files = {
+        "U": "export (C(..))\n\nclass C a {\n    type Item a\n    fun first(a) -> Item a\n}\n",
+        "D": "export (K(..))\n\nimport U (C(..) as K)\n",
+        "M": "export (Item)\n\nimport D (K(..))\n",
+    }
+    items = _items(tmp_path, files, ["D", "M"])
+    assert items["M"]["Item"]["home"] == "D"
+    out = tmp_path / "site"
+    result = _doc("--html", str(out), str(tmp_path / "D.gob"), str(tmp_path / "M.gob"))
+    assert result.returncode == 0, result.stderr
+    assert 'href="D.html#assoc.K.Item">D.K.Item</a>' in (out / "M.html").read_text()
 
 
 def test_modules_outside_the_library_must_share_a_directory(tmp_path) -> None:

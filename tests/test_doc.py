@@ -13,7 +13,9 @@ class and function, and `tests/doc/Board.gob` the same type and the class's
 method alone. `Board` also re-exports `Fixture`'s copy of the function, which
 stays a link. `Hidden`'s instances go to the pages of their head types --
 `Board`, the first by name of the two that show `Tile`, and `Shapes` -- and the
-one on `Int`, which has no page, to its class's, `Fixture`.
+one on `Int`, which has no page, to its class's, `Fixture`. Its instance of a
+class no module exports is left out. `tests/doc/Yard.gob` re-exports `Tile`
+from `Fixture`, and links to `Fixture`'s copy rather than `Board`'s.
 
 `turkey doc --html` writes the same description as a website, recorded file by
 file in `tests/doc/site/`, with the JSON among its files.
@@ -38,7 +40,8 @@ from tests import bootc, toolchain
 FIXTURES = bootc.REPO_ROOT / "tests" / "doc"
 GOLDEN = FIXTURES / "docs.json"
 SITE = FIXTURES / "site"
-FILES = ("tests/doc/Board.gob", "tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+FILES = ("tests/doc/Board.gob", "tests/doc/Fixture.gob", "tests/doc/Shapes.gob",
+         "tests/doc/Yard.gob")
 
 
 def _doc(*files: str) -> subprocess.CompletedProcess[str]:

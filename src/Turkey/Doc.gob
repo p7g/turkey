@@ -227,7 +227,7 @@ fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc {
     -- What every page shows in full comes first, since where a re-export
     -- links and where an undocumented module's instance goes depend on it.
     let shown = Vec.map(sorted, shownInFull(_, t, documented, instances))
-    let h = homesFrom(Vec.map(shown, fun(s) = (s.source.name, s.items)))
+    let h = homesFrom(Vec.map(shown, fun(s) = (s.source.name, s.items)), t)
     let placed = placedInstances(t, documented, instances, h)
     Vec.map(shown, fun(s) {
         let items = []
@@ -1082,8 +1082,7 @@ fun namespace(s : Modules.Scope, space : String) -> Map String String = match sp
 
 -- The instances undocumented modules declare, by the module whose
 -- documentation shows them: the home of the head's type constructor, or
--- when that has none, the home of the class. An instance with neither is
--- not shown.
+-- when that has none, the home of the class.
 fun placedInstances(t : Tables, documented : Set.Set String,
                     instances : Map String Classes.InstInfo, h : Homes) -> Map String (Vec Item) {
     let placed = Map.new()
@@ -1101,11 +1100,12 @@ fun placedInstances(t : Tables, documented : Set.Set String,
                 (Ty.TCon(c), _) -> home(h, Entity { namespace = "type", internal = c.name }, None)
                 _ -> None
             }
-            let page = match headHome {
-                Some(p) -> Some(p)
-                None -> home(h, Entity { namespace = "class", internal = inst.cls }, None)
-            }
-            let Some(p) = page else { continue }
+            -- An instance of a class with no page is left out, wherever its
+            -- head is: no program can name the class, so none can use the
+            -- instance.
+            let Some(classHome) = home(h, Entity { namespace = "class", internal = inst.cls },
+                                       None) else { continue }
+            let p = Option.unwrapOr(headHome, classHome)
             if Option.isNone(cs) { cs = Some(commentsOf(source)) }
             let item = instanceItem(Option.expect(cs, "read above"), i, inst, Some(name))
             match Map.get(placed, p) {
@@ -1119,15 +1119,21 @@ fun placedInstances(t : Tables, documented : Set.Set String,
 
 -- -- homes --------------------------------------------------------------------------
 
---- Where each entity is shown in full: the modules whose documentation
---- holds a copy of it.
-type Homes = Homes { copies : Map String (Vec String) }
+--- Where each entity is shown in full, and how each module can see it.
+type Homes = Homes {
+    -- By `entityKey`, the modules whose documentation holds a copy, in
+    -- order of name.
+    copies : Map String (Vec String),
+    -- For the imports a link follows.
+    tables : Tables,
+}
 
---- Returns where `docs` show each entity in full.
-fun homesOf(docs : Vec ModuleDoc) -> Homes =
-    homesFrom(Vec.map(docs, fun(m) = (m.name, m.items)))
+--- Returns where `docs`, which `describe` gave for a program with tables
+--- `t`, show each entity in full.
+fun homesOf(docs : Vec ModuleDoc, t : Tables) -> Homes =
+    homesFrom(Vec.map(docs, fun(m) = (m.name, m.items)), t)
 
-fun homesFrom(pages : Vec (String, Vec Item)) -> Homes {
+fun homesFrom(pages : Vec (String, Vec Item), t : Tables) -> Homes {
     let copies = Map.new()
     for (name, items) in pages {
         for item in items {
@@ -1145,25 +1151,52 @@ fun homesFrom(pages : Vec (String, Vec Item)) -> Homes {
     }
     let sorted = Map.new()
     for (key, modules) in Map.entries(copies) { Map.put(sorted, key, Vec.sort(modules)) }
-    Homes { copies = sorted }
+    Homes { copies = sorted, tables = t }
 }
 
 --- Returns the module whose page a link to `e` from the documentation of
---- `linking` reaches, or `None` when no page shows `e` in full. With no
---- `linking`, returns the same module for every link that has no page of
---- its own to stay on. A member -- a constructor, a field, a method or an
---- associated type -- is found on the home of its type or class.
+--- the module `linking` reaches, or `None` when no page shows `e` in full.
+--- With no `linking`, returns the first such module by name. A member -- a
+--- constructor, a field, a method or an associated type -- is found on the
+--- home of its type or class.
 fun home(h : Homes, e : Entity, linking : Option String) -> Option String {
     let copies = Map.get(h.copies, entityKey(e))?
     -- One page shows `e` when a documented module declares it, or when one
     -- documented module imports it directly from undocumented ones. Several
-    -- can each import it so. Then a link from one of them stays on its own
-    -- page, and a link from anywhere else goes to the first by name, so that
-    -- the choice does not depend on the order of the files.
+    -- can each import it so. Then a link goes to the copy the linking module
+    -- sees: its own, or else the nearest along the imports it has `e` from,
+    -- the implicit Prelude's included. Only a module that sees none, such as
+    -- one that has `e` from an undocumented module without exporting it,
+    -- links to the first by name, so that the choice does not depend on the
+    -- order of the files.
     if let Some(m) = linking {
-        if Vec.contains(copies, m) { return Some(m) }
+        if let Some(seen) = nearestCopy(h, copies, e, m) { return Some(seen) }
     }
     if len(copies) == 0 { None } else { Some(copies[0]) }
+}
+
+-- The module among `copies` nearest to `start` along the imports that give
+-- `e`, a step at a time, and the first by name of those equally near.
+fun nearestCopy(h : Homes, copies : Vec String, e : Entity, start : String) -> Option String {
+    let seen = Set.new()
+    Set.add(seen, start)
+    var frontier = [start]
+    while len(frontier) > 0 {
+        let here = Vec.sort(Vec.filter(frontier, Vec.contains(copies, _)))
+        if len(here) > 0 { return Some(here[0]) }
+        let next = []
+        for name in frontier {
+            let Some(m) = Map.get(h.tables.modules, name) else { continue }
+            for p in providers(h.tables, m, e.namespace, e.internal) {
+                if !Set.contains(seen, p.name) {
+                    Set.add(seen, p.name)
+                    Vec.push(next, p.name)
+                }
+            }
+        }
+        frontier = next
+    }
+    None
 }
 
 --- Returns a key that is the same for two entities exactly when they are

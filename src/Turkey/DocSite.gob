@@ -25,7 +25,10 @@ export (site, pageOf, href)
 ---   declared it, so `value.map` addresses `map` on every page that exports
 ---   it. A method the module exports with its class, which another module
 ---   declares, is `method.Class.name` as well. A method exported without its
----   class is a value.
+---   class is a value. So does a re-export a page shows in full because it
+---   comes from a module with no page, and its constructors, fields, methods
+---   and associated types. A link to such an item goes to its home, which
+---   `Turkey.Doc.home` chooses.
 --- * An instance is `instance.`, its class, `:` and its head's type
 ---   constructor, each qualified by the module that declares it:
 ---   `instance.Data.Show.Show:Data.Option.Option`. A built-in type is its name
@@ -86,14 +89,27 @@ fun namespacePrefix(namespace : String) -> String = match namespace {
 
 -- Where each module's names are on its page: by module, then by namespace
 -- and name, the fragment. A method is in the value namespace, as a program
--- sees it, at its member's fragment.
-type Targets = Targets { byModule : Map String (Map String String) }
+-- sees it, at its member's fragment. `byEntity` holds, by module and then by
+-- `Doc.entityKey`, the fragment and name of each item the page shows in
+-- full, and `homes` which page that is for each entity.
+type Targets = Targets {
+    byModule : Map String (Map String String),
+    byEntity : Map String (Map String (String, String)),
+    homes    : Doc.Homes,
+}
 
 fun targetsOf(docs : Vec ModuleDoc) -> Targets {
     let byModule = Map.new()
+    let byEntity = Map.new()
     for m in docs {
         let names = Map.new()
+        let entities = Map.new()
         for item in m.items {
+            match (item.body, item.entity) {
+                (Reexport(_), _) | (Qualifier(_), _) -> {}
+                (_, Some(e)) -> Map.put(entities, Doc.entityKey(e), (itemFragment(item), item.name))
+                _ -> {}
+            }
             if let Instance(_) = item.body { continue }
             match item.body {
                 Class(c) -> for meth in c.methods {
@@ -107,8 +123,9 @@ fun targetsOf(docs : Vec ModuleDoc) -> Targets {
             Map.put(names, itemFragment(item), itemFragment(item))
         }
         Map.put(byModule, m.name, names)
+        Map.put(byEntity, m.name, entities)
     }
-    Targets { byModule = byModule }
+    Targets { byModule = byModule, byEntity = byEntity, homes = Doc.homesOf(docs) }
 }
 
 fun methodFragment(cls : String, name : String) -> String = "method." + cls + "." + name
@@ -119,6 +136,13 @@ fun target(t : Targets, owner : String, namespace : String, name : String) -> Op
     let names = Map.get(t.byModule, owner)?
     let fragment = Map.get(names, namespacePrefix(namespace) + "." + name)?
     Some(href(owner, fragment))
+}
+
+-- The fragment and name of `e` on the page of `owner`, a module, if that
+-- page shows it in full.
+fun entityTarget(t : Targets, owner : String, e : Doc.Entity) -> Option (String, String) {
+    let entities = Map.get(t.byEntity, owner)?
+    Map.get(entities, Doc.entityKey(e))
 }
 
 -- `s` with every byte but the ones `encodeURIComponent` leaves alone written
@@ -251,16 +275,25 @@ fun signature(t : Targets, item : Item, ids : Bool) -> String = match item.body 
                     + escape(op.function) + "  "
                     + kw("-- " + (if op.rightAssociative { "right" } else { "left" })
                          + "-associative")
+    -- The re-exported item as its home shows it, or else as the module
+    -- that declares it names it.
     Reexport(r) -> {
-        let written = match r.from {
-            Some(m) -> m + "." + r.original
-            None -> r.original
+        let atHome = match (r.home, item.entity) {
+            (Some(h), Some(e)) -> match entityTarget(t, h, e) {
+                Some((fragment, name)) -> Some((href(h, fragment), h + "." + name))
+                None -> Option.map(target(t, h, r.namespace, r.original),
+                                   fun(link) = (link, h + "." + r.original))
+            }
+            _ -> None
         }
-        let link = match r.from {
-            Some(m) -> target(t, m, r.namespace, r.original)
-            None -> None
+        let shown = match atHome {
+            Some((link, written)) -> linked(Some(link), written)
+            None -> escape(match r.from {
+                Some(m) -> m + "." + r.original
+                None -> r.original
+            })
         }
-        nm(item.name) + typed(r.shown) + "  " + kw("-- from") + " " + linked(link, written)
+        nm(item.name) + typed(r.shown) + "  " + kw("-- from") + " " + shown
     }
     -- The module's page, when it is among the pages written.
     Qualifier(m) -> {
@@ -310,11 +343,11 @@ fun itemHTML(t : Targets, item : Item) -> String {
             }
         }
         Reexport(r) -> for meth in r.methods {
-            let link = match r.from {
-                Some(m) -> target(t, m, "value", meth.original)
+            let link = match r.home {
+                Some(h) -> target(t, h, "value", meth.original)
                 None -> None
             }
-            let written = match r.from {
+            let written = match Option.or(r.home, r.from) {
                 Some(m) -> m + "." + meth.original
                 None -> meth.original
             }

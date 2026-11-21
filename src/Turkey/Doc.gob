@@ -1,7 +1,8 @@
 export (
     Tables(..), ModuleDoc(..), Item(..), Body(..), DataDoc(..), ConDoc(..), ConShape(..),
     FieldDoc(..), ClassDoc(..), FamilyDoc(..), MethodDoc(..), InstanceDoc(..), OperatorDoc(..),
-    ReexportDoc(..), ReexportedMethod(..), describe, document, jsonString,
+    ReexportDoc(..), ReexportedMethod(..), Entity(..), Homes, describe, document, jsonString,
+    homesOf, home, entityKey,
 )
 
 --- What `turkey doc` describes: for each module, what it exports, each entity
@@ -10,6 +11,13 @@ export (
 --- for the same modules, so that it can be a golden.
 ---
 --- Which comment documents what is `Turkey.DocComments`'s rule.
+---
+--- A module with no documentation of its own -- one of the library's
+--- implementation, or one outside the files named -- is described where it
+--- is used. A documented module that imports a declaration directly from
+--- such a module shows it in full, as if the module declared it. An instance
+--- such a module declares is shown with its head type, or with its class
+--- when its head type has no page.
 
 import Data.Set as Set
 import System.File as File
@@ -28,11 +36,13 @@ import Turkey.Types (TVar, TFun, TTuple)
 import Turkey.Ast as Ast
 
 --- What the checked program provides beyond the modules: the class table,
---- which holds the declaration table, and the scheme each top-level binding
---- was given, by its internal name.
+--- which holds the declaration table, the scheme each top-level binding was
+--- given, by its internal name, and every module the program loaded,
+--- documented or not, by name.
 type Tables = Tables {
     classes : ClassTable,
     scheme  : fun(String) -> Option Ty.Scheme,
+    modules : Map String Modules.Module,
 }
 
 --- One module's documentation. Every type is shown as a program writes it.
@@ -43,19 +53,41 @@ type ModuleDoc = ModuleDoc {
     file    : String,
     --- The module's own doc comment.
     comment : Option String,
-    --- What the module exports: what it declares, in the order it declares
-    --- it, then what it re-exports, by namespace and then by name.
+    --- What the module's documentation holds: what it declares, in the order
+    --- it declares it; then what it shows in full of what it imports from
+    --- modules with no documentation, by module and then in the order that
+    --- module declares it; then the instances such modules declare that are
+    --- shown here, in the same order; then the rest of what it re-exports, by
+    --- namespace and then by name.
     items   : Vec Item,
 }
 
---- One thing a module exports, under the name it is exported as.
+--- One thing a module exports, under the name it is exported as, or an
+--- instance.
 type Item = Item {
     name    : String,
-    --- The line its declaration starts on, or 0 for a re-export, which has
-    --- no declaration in the module.
+    --- What it is a copy or a re-export of. Absent for an instance and for a
+    --- qualifier, which are not declarations a name can mean.
+    entity  : Option Entity,
+    --- The module that declares it, when that is another module: something
+    --- shown in full that the module imports from one with no documentation,
+    --- or an instance such a module declares.
+    from    : Option String,
+    --- The line its declaration starts on, in the module that declares it,
+    --- or 0 for a re-export, whose declaration is described elsewhere.
     line    : Int,
     comment : Option String,
     body    : Body,
+}
+
+--- A declaration, as the checker names it. Every page that shows or
+--- re-exports one declaration gives it the same `Entity`.
+type Entity = Entity {
+    --- One of "value", "type", "class" and "operator".
+    namespace : String,
+    --- The internal name: the declaring module's name, `#`, and the name the
+    --- declaration has there.
+    internal  : String,
 }
 
 --- What kind of thing an item is, and what is shown of it beyond its name.
@@ -165,6 +197,9 @@ type ReexportDoc = ReexportDoc {
     namespace : String,
     --- The module that declares it, if it is one that has a name.
     from      : Option String,
+    --- The module whose page shows it in full, as `home` chooses it for a
+    --- link from this module, if any page does.
+    home      : Option String,
     --- The name it is declared under there.
     original  : String,
     --- A value's type. Absent for every other namespace.
@@ -184,8 +219,25 @@ type ReexportedMethod = ReexportedMethod {
 }
 
 --- Returns the documentation of `modules`, in order of module name.
-fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc =
-    Vec.map(Vec.sortByKey(modules, fun(m) = m.name), moduleDoc(_, t))
+fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc {
+    let sorted = Vec.sortByKey(modules, fun(m) = m.name)
+    let documented = Set.new()
+    for m in sorted { Set.add(documented, m.name) }
+    let instances = instanceIndex(t.classes)
+    -- What every page shows in full comes first, since where a re-export
+    -- links and where an undocumented module's instance goes depend on it.
+    let shown = Vec.map(sorted, shownInFull(_, t, documented, instances))
+    let h = homesFrom(Vec.map(shown, fun(s) = (s.source.name, s.items)))
+    let placed = placedInstances(t, documented, instances, h)
+    Vec.map(shown, fun(s) {
+        let items = []
+        for i in s.items { Vec.push(items, i) }
+        for i in Map.getOr(placed, s.source.name, []) { Vec.push(items, i) }
+        for r in reexports(s.source, t, s.own, h) { Vec.push(items, r) }
+        ModuleDoc { name = s.source.name, file = s.source.file, comment = s.cs.header,
+                    items = items }
+    })
+}
 
 --- Returns the JSON for `docs`, in the order given.
 fun document(docs : Vec ModuleDoc) -> String {
@@ -220,6 +272,7 @@ fun moduleJSON(m : ModuleDoc) -> JSON = JObject([
 fun heading(kind : String, item : Item) -> Vec (String, JSON) = [
     ("kind", JString(kind)),
     ("name", JString(item.name)),
+    ("from", optional(item.from)),
     ("line", JInt(item.line)),
     ("comment", optional(item.comment)),
 ]
@@ -287,6 +340,7 @@ fun itemJSON(item : Item) -> JSON = match item.body {
             ("name", JString(item.name)),
             ("namespace", JString(r.namespace)),
             ("from", optional(r.from)),
+            ("home", optional(r.home)),
             ("original", JString(r.original)),
         ]
         if r.namespace == "value" { Vec.push(members, ("type", optional(r.shown))) }
@@ -478,7 +532,19 @@ fun inverse(names : Map String String) -> Map String String {
     out
 }
 
-fun moduleDoc(m : Modules.Module, t : Tables) -> ModuleDoc {
+-- What one module's documentation shows in full: its comments, the internal
+-- names of what it shows, and the items.
+type Shown = Shown {
+    source : Modules.Module,
+    cs     : Comments,
+    own    : Set.Set String,
+    items  : Vec Item,
+}
+
+-- What a module shows in full: what it declares, then what it imports from
+-- modules with no documentation, each declaration as that module declares it.
+fun shownInFull(m : Modules.Module, t : Tables, documented : Set.Set String,
+                instances : Map String Classes.InstInfo) -> Shown {
     let cs = commentsOf(m)
     let ex = exportedOf(m)
     let own = Set.new()
@@ -486,10 +552,21 @@ fun moduleDoc(m : Modules.Module, t : Tables) -> ModuleDoc {
     for d in m.program.decls {
         let where = declSpan(d)
         if Source.isGenerated(where) || Source.isEmpty(where) { continue }
-        declItems(m, t, cs, ex, own, d, items)
+        declItems(m, t, instances, cs, ex, own, None, d, items)
     }
-    for r in reexports(m, t, own) { Vec.push(items, r) }
-    ModuleDoc { name = m.name, file = m.file, comment = cs.header, items = items }
+    for (origin, wanted) in inlined(m, t, documented, own) {
+        let source = Option.expect(Map.get(t.modules, origin), "a loaded module")
+        let sourceComments = commentsOf(source)
+        for d in source.program.decls {
+            let where = declSpan(d)
+            if Source.isGenerated(where) || Source.isEmpty(where) { continue }
+            -- An instance goes with its head type or its class, wherever
+            -- those are, and not with each importer.
+            if let DInstance(_) = d { continue }
+            declItems(source, t, instances, sourceComments, wanted, own, Some(origin), d, items)
+        }
+    }
+    Shown { source = m, cs = cs, own = own, items = items }
 }
 
 fun declSpan(d : Decl) -> Span = match d {
@@ -501,58 +578,83 @@ fun declSpan(d : Decl) -> Span = match d {
     DInfix(op) -> op.span
 }
 
--- Pushes onto `items` what `d` declares that the module exports, and adds
--- the internal name of each to `own`.
-fun declItems(m : Modules.Module, t : Tables, cs : Comments, ex : Exported,
-              own : Set.Set String, d : Decl, items : Vec Item) -> Unit {
-    let push = fun(internal, item) {
+-- Pushes onto `items` what `d`, a declaration of `m`, declares that `ex`
+-- holds, and adds the internal name of each to `own`. `from` is `m`'s name
+-- when the items go in another module's documentation.
+fun declItems(m : Modules.Module, t : Tables, instances : Map String Classes.InstInfo,
+              cs : Comments, ex : Exported, own : Set.Set String, from : Option String,
+              d : Decl, items : Vec Item) -> Unit {
+    let push = fun(space, internal, name, where : Span, body) {
         Set.add(own, internal)
-        Vec.push(items, item)
+        Vec.push(items, Item {
+            name = name,
+            entity = Some(Entity { namespace = space, internal = internal }),
+            from = from,
+            line = where.line,
+            comment = attached(cs, where.line),
+            body = body,
+        })
     }
     match d {
         DStmt(s) -> match s.kind {
             SFun(f) -> if let Some(name) = Map.get(ex.values, f.name) {
-                push(f.name, item(name, s.span, cs, Function(valueType(t, f.name, Some(f)))))
+                push("value", f.name, name, s.span, Function(valueType(t, f.name, Some(f))))
             }
             SLet(pat, _) -> for v in Vec.sort(patternVars(pat)) {
                 if let Some(name) = Map.get(ex.values, v) {
-                    push(v, item(name, s.span, cs, Value(valueType(t, v, None), False)))
+                    push("value", v, name, s.span, Value(valueType(t, v, None), False))
                 }
             }
             SVar(pat, _) -> for v in Vec.sort(patternVars(pat)) {
                 if let Some(name) = Map.get(ex.values, v) {
-                    push(v, item(name, s.span, cs, Value(valueType(t, v, None), True)))
+                    push("value", v, name, s.span, Value(valueType(t, v, None), True))
                 }
             }
             _ -> {}
         }
         DForeign(f) -> if let Some(name) = Map.get(ex.values, f.name) {
-            push(f.name, item(name, f.span, cs, Function(valueType(t, f.name, None))))
+            push("value", f.name, name, f.span, Function(valueType(t, f.name, None)))
         }
         DType(td) -> if let Some(name) = Map.get(ex.types, td.name) {
-            push(td.name, item(name, td.span, cs, typeBody(t, cs, ex, td)))
+            push("type", td.name, name, td.span, typeBody(t, cs, ex, td))
         }
-        DClass(c) -> if let Some(name) = Map.get(ex.classes, c.name) {
-            push(c.name, item(name, c.span, cs, Class(classDoc(t, cs, ex, c))))
+        DClass(c) -> match Map.get(ex.classes, c.name) {
+            Some(name) -> {
+                push("class", c.name, name, c.span, Class(classDoc(t, cs, ex, c)))
+                -- An associated type is shown with its class, and is not
+                -- re-exported on its own.
+                for f in c.families { Set.add(own, f.name) }
+            }
+            -- A method exported without its class is a function.
+            None -> for meth in c.methods {
+                if let Some(name) = Map.get(ex.values, meth.name) {
+                    Set.add(own, meth.name)
+                    Vec.push(items, Item {
+                        name = name,
+                        entity = Some(Entity { namespace = "value", internal = meth.name }),
+                        from = from,
+                        line = meth.span.line,
+                        comment = nestedComment(cs, meth.span.line, c.span.line),
+                        body = Function(reexportedType(t, meth.name)),
+                    })
+                }
+            }
         }
-        DInstance(i) -> if let Some(inst) = instanceInfo(t.classes, i) {
-            Vec.push(items, instanceItem(cs, i, inst))
+        DInstance(i) -> if let Some(inst) = Map.get(instances, spanKey(i.span)) {
+            Vec.push(items, instanceItem(cs, i, inst, from))
         }
         DInfix(op) -> {
             let internal = Prelude.internal(m.name, op.op)
             if let Some(name) = Map.get(ex.operators, internal) {
-                push(internal, item(name, op.span, cs, Operator(OperatorDoc {
+                push("operator", internal, name, op.span, Operator(OperatorDoc {
                     group = Fixity.groupName(op.group),
                     rightAssociative = Fixity.rightAssociative(op.group),
                     function = Ty.shortName(op.target),
-                })))
+                }))
             }
         }
     }
 }
-
-fun item(name : String, where : Span, cs : Comments, body : Body) -> Item =
-    Item { name = name, line = where.line, comment = attached(cs, where.line), body = body }
 
 -- A comment for something declared inside another declaration that starts
 -- on `parent`. Nothing on the parent's own line gets one, since the comment
@@ -685,30 +787,38 @@ fun showWritten(s : Ty.Scheme, names : Map Int String) -> String {
     "[" + String.join(Vec.map(s.preds, fun(p) = Ty.showPredWith(p, n)), ", ") + "] " + body
 }
 
--- The class table's record of the instance `i` declares. A derived instance
--- has no declaration of its own, and its type's `derives` lists it.
-fun instanceInfo(classes : ClassTable, i : InstanceDecl) -> Option Classes.InstInfo {
+-- The class table's record of each instance a declaration writes, by
+-- `spanKey` of the declaration. A derived instance has no declaration of its
+-- own, and its type's `derives` lists it.
+fun instanceIndex(classes : ClassTable) -> Map String Classes.InstInfo {
+    let out = Map.new()
     for (_, insts) in Map.entries(classes.instances) {
         for inst in insts {
-            let s = inst.decl.span
-            if !inst.derived && s.file == i.span.file && s.line == i.span.line
-               && s.col == i.span.col {
-                return Some(inst)
-            }
+            if !inst.derived { Map.put(out, spanKey(inst.decl.span), inst) }
         }
     }
-    None
+    out
 }
 
-fun instanceItem(cs : Comments, i : InstanceDecl, inst : Classes.InstInfo) -> Item {
+fun spanKey(s : Span) -> String =
+    s.file + ":" + Int.toString(s.line) + ":" + Int.toString(s.col)
+
+fun instanceItem(cs : Comments, i : InstanceDecl, inst : Classes.InstInfo,
+                 from : Option String) -> Item {
     let n = Classes.writtenNamer(inst.names)
-    let name = Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2)
     let context = Vec.map(Vec.append(inst.context, inst.equalities), fun(p) = Ty.showPredWith(p, n))
-    item(name, i.span, cs, Instance(InstanceDoc {
-        context = context,
-        cls = qualified(inst.cls),
-        head = headConstructor(inst.head),
-    }))
+    Item {
+        name = Ty.shortName(inst.cls) + " " + Ty.showAt(inst.head, n, 2),
+        entity = None,
+        from = from,
+        line = i.span.line,
+        comment = attached(cs, i.span.line),
+        body = Instance(InstanceDoc {
+            context = context,
+            cls = qualified(inst.cls),
+            head = headConstructor(inst.head),
+        }),
+    }
 }
 
 -- An internal name as a program qualifies it.
@@ -730,10 +840,11 @@ fun commas(n : Int) -> String = if n > 1 { String.repeat(",", n - 1) } else { ""
 -- name. A constructor goes with its type, so that namespace is not listed on
 -- its own. A method goes with its class when the module exports the class,
 -- and is a value otherwise. A value carries its type, since the module that
--- declares it may be one no program can import. An exported qualifier comes
--- last, as the name of the module it means: that module's own description is
--- where its contents are.
-fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec Item {
+-- declares it may be one no program can import. Each links to its home in
+-- `h`, and a method with no home of its own to its class's. An exported
+-- qualifier comes last, as the name of the module it means: that module's
+-- own description is where its contents are.
+fun reexports(m : Modules.Module, t : Tables, own : Set.Set String, h : Homes) -> Vec Item {
     let classes = Set.new()
     for (_, target) in Map.entries(m.exports.classes) { Set.add(classes, target) }
     let found = []
@@ -753,20 +864,32 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String) -> Vec Item 
             }
             let owner = Prelude.moduleOf(target)
             if owner == Some(m.name) { continue }
+            let entity = Entity { namespace = space, internal = target }
             let r = ReexportDoc {
                 namespace = space,
                 from = owner,
+                home = match (home(h, entity, Some(m.name)), owningClass) {
+                    (None, Some(cls)) ->
+                        home(h, Entity { namespace = "class", internal = cls }, Some(m.name))
+                    (found, _) -> found
+                },
                 original = if method { methodName(target) } else { declaredName(target) },
                 shown = if order == 0 { reexportedType(t, target) } else { None },
                 methods = if space == "class" { reexportedMethods(m, t, target) } else { [] },
             }
-            let entry = Item { name = name, line = 0, comment = None, body = Reexport(r) }
+            let entry = Item {
+                name = name, entity = Some(entity), from = None, line = 0, comment = None,
+                body = Reexport(r),
+            }
             Vec.push(found, ((order, name), entry))
         }
     }
     for (name, modules) in Map.entries(m.exports.qualifiers) {
         for target in modules {
-            let entry = Item { name = name, line = 0, comment = None, body = Qualifier(target.name) }
+            let entry = Item {
+                name = name, entity = None, from = None, line = 0, comment = None,
+                body = Qualifier(target.name),
+            }
             Vec.push(found, ((4, name), entry))
         }
     }
@@ -800,6 +923,252 @@ fun reexportedMethods(m : Modules.Module, t : Tables, cls : String) -> Vec Reexp
     }
     Vec.sortByKey(found, fun(meth) = meth.name)
 }
+
+-- -- what is shown where --------------------------------------------------------------
+
+-- What `m` shows in full of what it exports and does not declare, by the
+-- module that declares it, in order of that module's name: from each, the
+-- part of `m`'s exports to show. Constructors go with their type and
+-- methods with their class, so the part holds every constructor `m` exports
+-- and the methods of each class in it.
+fun inlined(m : Modules.Module, t : Tables, documented : Set.Set String,
+            own : Set.Set String) -> Vec (String, Exported) {
+    let ex = exportedOf(m)
+    let parts = Map.new()
+    let part = fun(origin) = match Map.get(parts, origin) {
+        Some(p) -> p
+        None -> {
+            let p = Exported {
+                values = Map.new(), types = Map.new(), cons = ex.cons, classes = Map.new(),
+                operators = Map.new(),
+            }
+            Map.put(parts, origin, p)
+            p
+        }
+    }
+    let exportedClasses = Set.new()
+    for (_, target) in Map.entries(m.exports.classes) { Set.add(exportedClasses, target) }
+    let spaces = [
+        ("value", ex.values, fun(p : Exported) = p.values),
+        ("type", ex.types, fun(p : Exported) = p.types),
+        ("class", ex.classes, fun(p : Exported) = p.classes),
+        ("operator", ex.operators, fun(p : Exported) = p.operators),
+    ]
+    for (space, names, into) in spaces {
+        for (target, name) in Map.entries(names) {
+            if Set.contains(own, target) { continue }
+            let Some(origin) = Prelude.moduleOf(target) else { continue }
+            if origin == m.name { continue }
+            if let Some(cls) = Map.get(t.classes.owner, target) {
+                if Set.contains(exportedClasses, cls) { continue }
+            }
+            if shownHere(t, documented, m, space, target) {
+                Map.put(into(part(origin)), target, name)
+            }
+        }
+    }
+    for p in Map.values(parts) {
+        for (target, name) in Map.entries(ex.values) {
+            if let Some(cls) = Map.get(t.classes.owner, target) {
+                if Map.contains(p.classes, cls) { Map.put(p.values, target, name) }
+            }
+        }
+    }
+    Vec.sortByKey(Vec.fromArray(Map.entries(parts)), fun((origin, _)) = origin)
+}
+
+-- Whether `m` shows `target`, which it exports in `space` and another
+-- module declares, in full. It does when it imports it directly from a
+-- module with no documentation, as long as that module did not get it from
+-- one with documentation, whose page shows it already.
+fun shownHere(t : Tables, documented : Set.Set String, m : Modules.Module, space : String,
+              target : String) -> Bool {
+    let Some(origin) = Prelude.moduleOf(target) else { return False }
+    if !Map.contains(t.modules, origin) || Set.contains(documented, origin) { return False }
+    let sources = providers(t, m, space, target)
+    -- A name that only a qualifier's contents pass on, from a qualifier the
+    -- Prelude gives, has no import to follow.
+    if len(sources) == 0 { return True }
+    Iter.any(sources, fun(s) = !documentedVia(t, documented, s, space, target, Set.new()))
+}
+
+-- Whether `s`, a module that gives `target` to an importer, has it from a
+-- module with documentation, or is one. `seen` holds the modules already
+-- asked, since imports can form a cycle.
+fun documentedVia(t : Tables, documented : Set.Set String, s : Modules.Module, space : String,
+                  target : String, seen : Set.Set String) -> Bool {
+    if Set.contains(seen, s.name) { return False }
+    Set.add(seen, s.name)
+    if Set.contains(documented, s.name) { return True }
+    if Prelude.moduleOf(target) == Some(s.name) { return False }
+    Iter.any(providers(t, s, space, target),
+             fun(p) = documentedVia(t, documented, p, space, target, seen))
+}
+
+-- The modules `m` has `target` from, in `space`: the imports whose lists
+-- bring it, or else the Prelude, when `m` has it implicitly and it brings
+-- it, since an explicit import shadows the implicit Prelude. A module that
+-- brings it under a qualifier, which `m` can pass on as `module Q`, counts
+-- only when nothing brings it bare. An import with `..` counts even when
+-- another of its items hides the name; we assume no module imports a name
+-- that way and then exports it.
+fun providers(t : Tables, m : Modules.Module, space : String,
+              target : String) -> Vec Modules.Module {
+    let bare = []
+    let qualified = []
+    var prelude = m.name != Prelude.preludeName
+    for imp in m.program.imports {
+        if imp.name == Prelude.preludeName { prelude = False }
+        let Some(dep) = Map.get(t.modules, imp.name) else { continue }
+        if !Iter.any(Map.values(namespace(dep.exports, space)), fun(v) = v == target) { continue }
+        if brings(t, dep, imp, space, target) {
+            Vec.push(bare, dep)
+        } else if !optsOut(imp) {
+            Vec.push(qualified, dep)
+        }
+    }
+    if len(bare) > 0 { return bare }
+    if prelude {
+        if let Some(p) = Map.get(t.modules, Prelude.preludeName) {
+            if Iter.any(Map.values(namespace(p.exports, space)), fun(v) = v == target) {
+                return [p]
+            }
+        }
+    }
+    qualified
+}
+
+-- Whether `imp` is `import Prelude ()`, which brings nothing, not even a
+-- qualifier.
+fun optsOut(imp : ImportDecl) -> Bool = imp.name == Prelude.preludeName && !imp.rest
+    && (match imp.items {
+        Some(entries) -> len(entries) == 0
+        None -> False
+    })
+
+-- Whether the import `imp` of `dep`, which exports `target` in `space`,
+-- brings it bare: its list has a `..`, or an item that names it or lists it
+-- as a member of its class.
+fun brings(t : Tables, dep : Modules.Module, imp : ImportDecl, space : String,
+           target : String) -> Bool {
+    let Some(entries) = imp.items else { return False }
+    if imp.rest { return True }
+    for entry in entries {
+        if entry.rename == Some("_") || entry.item.qualifier { continue }
+        if Map.get(namespace(dep.exports, space), entry.item.name) == Some(target) { return True }
+        if let Some(cls) = Map.get(dep.exports.classes, entry.item.name) {
+            let member = Map.get(t.classes.owner, target) == Some(cls)
+                         || String.startsWith(target, cls + ".")
+            if member && listsMember(entry.item.subs, methodName(target)) { return True }
+        }
+    }
+    False
+}
+
+-- Whether `subs`, an item's member list, holds `name`: `(..)` holds every
+-- member.
+fun listsMember(subs : Option (Vec String), name : String) -> Bool = match subs {
+    Some(names) -> Vec.contains(names, name) || Vec.contains(names, "..")
+                   || (len(names) == 2 && names[0] == "." && names[1] == ".")
+    None -> False
+}
+
+fun namespace(s : Modules.Scope, space : String) -> Map String String = match space {
+    "value" -> s.values
+    "type" -> s.types
+    "class" -> s.classes
+    _ -> s.operators
+}
+
+-- The instances undocumented modules declare, by the module whose
+-- documentation shows them: the home of the head's type constructor, or
+-- when that has none, the home of the class. An instance with neither is
+-- not shown.
+fun placedInstances(t : Tables, documented : Set.Set String,
+                    instances : Map String Classes.InstInfo, h : Homes) -> Map String (Vec Item) {
+    let placed = Map.new()
+    for name in Vec.sort(Vec.fromArray(Map.keys(t.modules))) {
+        if Set.contains(documented, name) { continue }
+        let source = Option.expect(Map.get(t.modules, name), "a key of the map")
+        -- Read only when an instance is shown, since most such modules have
+        -- none that are.
+        var cs = None
+        for d in source.program.decls {
+            let DInstance(i) = d else { continue }
+            if Source.isGenerated(i.span) || Source.isEmpty(i.span) { continue }
+            let Some(inst) = Map.get(instances, spanKey(i.span)) else { continue }
+            let headHome = match Ty.spine(inst.head) {
+                (Ty.TCon(c), _) -> home(h, Entity { namespace = "type", internal = c.name }, None)
+                _ -> None
+            }
+            let page = match headHome {
+                Some(p) -> Some(p)
+                None -> home(h, Entity { namespace = "class", internal = inst.cls }, None)
+            }
+            let Some(p) = page else { continue }
+            if Option.isNone(cs) { cs = Some(commentsOf(source)) }
+            let item = instanceItem(Option.expect(cs, "read above"), i, inst, Some(name))
+            match Map.get(placed, p) {
+                Some(xs) -> Vec.push(xs, item)
+                None -> Map.put(placed, p, [item])
+            }
+        }
+    }
+    placed
+}
+
+-- -- homes --------------------------------------------------------------------------
+
+--- Where each entity is shown in full: the modules whose documentation
+--- holds a copy of it.
+type Homes = Homes { copies : Map String (Vec String) }
+
+--- Returns where `docs` show each entity in full.
+fun homesOf(docs : Vec ModuleDoc) -> Homes =
+    homesFrom(Vec.map(docs, fun(m) = (m.name, m.items)))
+
+fun homesFrom(pages : Vec (String, Vec Item)) -> Homes {
+    let copies = Map.new()
+    for (name, items) in pages {
+        for item in items {
+            match item.body {
+                Reexport(_) | Qualifier(_) | Instance(_) -> continue
+                _ -> {}
+            }
+            let Some(e) = item.entity else { continue }
+            let key = entityKey(e)
+            match Map.get(copies, key) {
+                Some(modules) -> if !Vec.contains(modules, name) { Vec.push(modules, name) }
+                None -> Map.put(copies, key, [name])
+            }
+        }
+    }
+    let sorted = Map.new()
+    for (key, modules) in Map.entries(copies) { Map.put(sorted, key, Vec.sort(modules)) }
+    Homes { copies = sorted }
+}
+
+--- Returns the module whose page a link to `e` from the documentation of
+--- `linking` reaches, or `None` when no page shows `e` in full. With no
+--- `linking`, returns the same module for every link that has no page of
+--- its own to stay on. A member -- a constructor, a field, a method or an
+--- associated type -- is found on the home of its type or class.
+fun home(h : Homes, e : Entity, linking : Option String) -> Option String {
+    let copies = Map.get(h.copies, entityKey(e))?
+    -- One page shows `e` when a documented module declares it, or when one
+    -- documented module imports it directly from undocumented ones. Several
+    -- can each import it so. Then a link from one of them stays on its own
+    -- page, and a link from anywhere else goes to the first by name, so that
+    -- the choice does not depend on the order of the files.
+    if let Some(m) = linking {
+        if Vec.contains(copies, m) { return Some(m) }
+    }
+    if len(copies) == 0 { None } else { Some(copies[0]) }
+}
+
+--- Returns a key that is the same for two entities exactly when they are
+--- the same declaration.
+fun entityKey(e : Entity) -> String = e.namespace + " " + e.internal
 
 -- -- written names --------------------------------------------------------------------
 

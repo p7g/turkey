@@ -7,6 +7,14 @@ above a field, a constructor, a method, an associated type and an instance;
 the module comment; and doc comments that document nothing, beside ordinary,
 rule and block comments that are never docs.
 
+`tests/doc/Hidden.gob` is imported but never documented, so the modules that
+import from it show what they re-export of it in full: `Fixture` its type,
+class and function, and `tests/doc/Board.gob` the same type and the class's
+method alone. `Board` also re-exports `Fixture`'s copy of the function, which
+stays a link. `Hidden`'s instances go to the pages of their head types --
+`Board`, the first by name of the two that show `Tile`, and `Shapes` -- and the
+one on `Int`, which has no page, to its class's, `Fixture`.
+
 `turkey doc --html` writes the same description as a website, recorded file by
 file in `tests/doc/site/`, with the JSON among its files.
 
@@ -30,6 +38,7 @@ from tests import bootc, toolchain
 FIXTURES = bootc.REPO_ROOT / "tests" / "doc"
 GOLDEN = FIXTURES / "docs.json"
 SITE = FIXTURES / "site"
+FILES = ("tests/doc/Board.gob", "tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
 
 
 def _doc(*files: str) -> subprocess.CompletedProcess[str]:
@@ -39,7 +48,7 @@ def _doc(*files: str) -> subprocess.CompletedProcess[str]:
 
 
 def test_the_fixture_matches_its_golden() -> None:
-    result = _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+    result = _doc(*FILES)
     assert result.returncode == 0, result.stderr
     if os.environ.get("TURKEY_BLESS_DOC"):
         GOLDEN.write_text(result.stdout)
@@ -47,7 +56,7 @@ def test_the_fixture_matches_its_golden() -> None:
 
 
 def _site(out) -> dict[str, str]:
-    result = _doc("--html", str(out), "tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
+    result = _doc("--html", str(out), *FILES)
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     return {p.name: p.read_text() for p in sorted(out.iterdir())}
@@ -55,7 +64,7 @@ def _site(out) -> dict[str, str]:
 
 def test_the_fixture_site_matches_its_golden(tmp_path) -> None:
     site = _site(tmp_path / "site")
-    assert site.pop("docs.json") == _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob").stdout
+    assert site.pop("docs.json") == _doc(*FILES).stdout
     if os.environ.get("TURKEY_BLESS_DOC"):
         SITE.mkdir(exist_ok=True)
         for stale in SITE.iterdir():
@@ -85,8 +94,8 @@ def test_every_link_in_the_site_reaches_an_element(tmp_path) -> None:
 
 
 def test_the_output_does_not_depend_on_the_order_of_the_files() -> None:
-    forwards = _doc("tests/doc/Fixture.gob", "tests/doc/Shapes.gob")
-    backwards = _doc("tests/doc/Shapes.gob", "tests/doc/Fixture.gob")
+    forwards = _doc(*FILES)
+    backwards = _doc(*reversed(FILES))
     assert forwards.stdout == backwards.stdout
 
 

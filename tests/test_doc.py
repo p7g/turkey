@@ -171,6 +171,32 @@ def test_a_module_that_sees_no_copy_links_to_the_first_by_name(tmp_path) -> None
     assert items["B"]["x"]["home"] == "C"
 
 
+def test_a_method_without_its_class_links_along_its_own_imports(tmp_path) -> None:
+    # `D1` and `D2` each show `C`. `M` has `meth` from `D2`; its unrelated
+    # qualifier for `D1` must not count.
+    items = _items(tmp_path, {
+        "U": "export (C(..))\n\nclass C a {\n    fun meth(a) -> Int\n}\n",
+        "D1": "export (C(..))\n\nimport U (C(..))\n",
+        "D2": "export (C(..))\n\nimport U (C(..))\n",
+        "M": "export (meth)\n\nimport D2 (meth)\nimport D1 as Q\n",
+    }, ["D1", "D2", "M"])
+    assert items["M"]["meth"]["home"] == "D2"
+
+
+def test_an_associated_type_links_where_its_class_is_renamed(tmp_path) -> None:
+    files = {
+        "U": "export (C(..))\n\nclass C a {\n    type Item a\n    fun first(a) -> Item a\n}\n",
+        "D": "export (K(..))\n\nimport U (C(..) as K)\n",
+        "M": "export (Item)\n\nimport D (K(..))\n",
+    }
+    items = _items(tmp_path, files, ["D", "M"])
+    assert items["M"]["Item"]["home"] == "D"
+    out = tmp_path / "site"
+    result = _doc("--html", str(out), str(tmp_path / "D.gob"), str(tmp_path / "M.gob"))
+    assert result.returncode == 0, result.stderr
+    assert 'href="D.html#assoc.K.Item">D.K.Item</a>' in (out / "M.html").read_text()
+
+
 def test_modules_outside_the_library_must_share_a_directory(tmp_path) -> None:
     other = tmp_path / "Other.gob"
     other.write_text("export (x)\nlet x = 1\n")

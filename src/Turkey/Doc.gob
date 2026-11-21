@@ -2,7 +2,7 @@ export (
     Tables(..), ModuleDoc(..), Item(..), Body(..), DataDoc(..), ConDoc(..), ConShape(..),
     FieldDoc(..), ClassDoc(..), FamilyDoc(..), MethodDoc(..), InstanceDoc(..), OperatorDoc(..),
     ReexportDoc(..), ReexportedMethod(..), Entity(..), Homes, describe, document, jsonString,
-    home, entityKey,
+    home, memberHome, entityKey,
 )
 
 --- What `turkey doc` describes: for each module, what it exports, each entity
@@ -161,7 +161,13 @@ type ClassDoc = ClassDoc {
     methods  : Vec MethodDoc,
 }
 
-type FamilyDoc = FamilyDoc { name : String, line : Int, comment : Option String }
+type FamilyDoc = FamilyDoc {
+    name     : String,
+    --- The internal name, as an `Entity` in the type namespace has it.
+    internal : String,
+    line     : Int,
+    comment  : Option String,
+}
 
 type MethodDoc = MethodDoc {
     name       : String,
@@ -772,6 +778,7 @@ fun classDoc(t : Tables, cs : Comments, ex : Exported, c : ClassDecl) -> ClassDo
         supers = supers,
         families = Vec.map(c.families, fun(f) = FamilyDoc {
             name = Ty.bareName(f.name),
+            internal = f.name,
             line = f.span.line,
             comment = nestedComment(cs, f.span.line, c.span.line),
         }),
@@ -844,9 +851,8 @@ fun commas(n : Int) -> String = if n > 1 { String.repeat(",", n - 1) } else { ""
 -- and is a value otherwise. A value carries its type, since the module that
 -- declares it may be one no program can import. Each links to its home in
 -- `h`, and a method or an associated type with no home of its own to its
--- class's. An exported
--- qualifier comes last, as the name of the module it means: that module's
--- own description is where its contents are.
+-- class's. An exported qualifier comes last, as the name of the module it
+-- means: that module's own description is where its contents are.
 fun reexports(m : Modules.Module, t : Tables, own : Set.Set String, h : Homes) -> Vec Item {
     let classes = Set.new()
     for (_, target) in Map.entries(m.exports.classes) { Set.add(classes, target) }
@@ -872,8 +878,9 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String, h : Homes) -
                 namespace = space,
                 from = owner,
                 home = match (home(h, entity, Some(m.name)), memberClass(t, target)) {
-                    (None, Some(cls)) ->
-                        home(h, Entity { namespace = "class", internal = cls }, Some(m.name))
+                    (None, Some(cls)) -> memberHome(h, entity,
+                                                    Entity { namespace = "class", internal = cls },
+                                                    Some(m.name))
                     (found, _) -> found
                 },
                 original = if method { methodName(target) } else { declaredName(target) },
@@ -1013,8 +1020,7 @@ fun documentedVia(t : Tables, documented : Set.Set String, s : Modules.Module, s
 -- The modules `m` has `target` from, in `space`. An explicit import whose
 -- list brings it bare shadows the implicit Prelude, which shadows the rest.
 -- Failing both, `m` has it from a qualifier's contents, which it passes on
--- as `module Q (...)`: from the modules under each such `Q`, or failing
--- those, from any module a qualifier in its scope reaches.
+-- as `module Q (...)`: from the modules under each such `Q`.
 fun providers(t : Tables, m : Modules.Module, space : String,
               target : String) -> Vec Modules.Module {
     let gives = fun(dep : Modules.Module) =
@@ -1043,8 +1049,7 @@ fun providers(t : Tables, m : Modules.Module, space : String,
             }
         }
     }
-    if len(passed) > 0 { return passed }
-    Vec.filter(Modules.reachable(m.scope), gives)
+    passed
 }
 
 -- Whether the import `imp` of `dep`, which exports `target` in `space`,
@@ -1169,10 +1174,22 @@ fun homesFrom(pages : Vec (String, Vec Item), t : Tables) -> Homes {
 --- Returns the module whose page a link to `e` from the documentation of
 --- the module `linking` reaches, or `None` when no page shows `e` in full.
 --- With no `linking`, returns the first such module by name. A member -- a
---- constructor, a field, a method or an associated type -- is found on the
---- home of its type or class.
-fun home(h : Homes, e : Entity, linking : Option String) -> Option String {
-    let copies = Map.get(h.copies, entityKey(e))?
+--- constructor, a field, a method or an associated type -- with no copy of
+--- its own is found with `memberHome`.
+fun home(h : Homes, e : Entity, linking : Option String) -> Option String =
+    homeAmong(h, Map.get(h.copies, entityKey(e))?, e, linking)
+
+--- Returns the module whose page a link to `member`, a member of `owner`,
+--- from the documentation of the module `linking` reaches: one that shows
+--- `owner` in full, chosen as `home` chooses for `owner`, but along the
+--- imports that give `member`. Returns `None` when no page shows `owner`.
+fun memberHome(h : Homes, member : Entity, owner : Entity,
+               linking : Option String) -> Option String =
+    homeAmong(h, Map.get(h.copies, entityKey(owner))?, member, linking)
+
+-- The module among `copies` that a link to `e` from `linking` reaches.
+fun homeAmong(h : Homes, copies : Vec String, e : Entity,
+              linking : Option String) -> Option String {
     -- One page shows `e` when a documented module declares it, or when one
     -- documented module imports it directly from undocumented ones. Several
     -- can each import it so. Then a link goes to the copy the linking module

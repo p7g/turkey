@@ -2,7 +2,7 @@ export (
     Tables(..), ModuleDoc(..), Item(..), Body(..), DataDoc(..), ConDoc(..), ConShape(..),
     FieldDoc(..), ClassDoc(..), FamilyDoc(..), MethodDoc(..), InstanceDoc(..), OperatorDoc(..),
     ReexportDoc(..), ReexportedMethod(..), Entity(..), Homes, describe, document, jsonString,
-    homesOf, home, entityKey,
+    home, entityKey,
 )
 
 --- What `turkey doc` describes: for each module, what it exports, each entity
@@ -218,8 +218,9 @@ type ReexportedMethod = ReexportedMethod {
     shown    : Option String,
 }
 
---- Returns the documentation of `modules`, in order of module name.
-fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc {
+--- Returns the documentation of `modules`, in order of module name, and
+--- where it shows each entity in full.
+fun describe(modules : Vec Modules.Module, t : Tables) -> (Vec ModuleDoc, Homes) {
     let sorted = Vec.sortByKey(modules, fun(m) = m.name)
     let documented = Set.new()
     for m in sorted { Set.add(documented, m.name) }
@@ -229,7 +230,7 @@ fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc {
     let shown = Vec.map(sorted, shownInFull(_, t, documented, instances))
     let h = homesFrom(Vec.map(shown, fun(s) = (s.source.name, s.items)), t)
     let placed = placedInstances(t, documented, instances, h)
-    Vec.map(shown, fun(s) {
+    let docs = Vec.map(shown, fun(s) {
         let items = []
         for i in s.items { Vec.push(items, i) }
         for i in Map.getOr(placed, s.source.name, []) { Vec.push(items, i) }
@@ -237,6 +238,7 @@ fun describe(modules : Vec Modules.Module, t : Tables) -> Vec ModuleDoc {
         ModuleDoc { name = s.source.name, file = s.source.file, comment = s.cs.header,
                     items = items }
     })
+    (docs, h)
 }
 
 --- Returns the JSON for `docs`, in the order given.
@@ -841,7 +843,8 @@ fun commas(n : Int) -> String = if n > 1 { String.repeat(",", n - 1) } else { ""
 -- its own. A method goes with its class when the module exports the class,
 -- and is a value otherwise. A value carries its type, since the module that
 -- declares it may be one no program can import. Each links to its home in
--- `h`, and a method with no home of its own to its class's. An exported
+-- `h`, and a method or an associated type with no home of its own to its
+-- class's. An exported
 -- qualifier comes last, as the name of the module it means: that module's
 -- own description is where its contents are.
 fun reexports(m : Modules.Module, t : Tables, own : Set.Set String, h : Homes) -> Vec Item {
@@ -868,7 +871,7 @@ fun reexports(m : Modules.Module, t : Tables, own : Set.Set String, h : Homes) -
             let r = ReexportDoc {
                 namespace = space,
                 from = owner,
-                home = match (home(h, entity, Some(m.name)), owningClass) {
+                home = match (home(h, entity, Some(m.name)), memberClass(t, target)) {
                     (None, Some(cls)) ->
                         home(h, Entity { namespace = "class", internal = cls }, Some(m.name))
                     (found, _) -> found
@@ -986,8 +989,10 @@ fun shownHere(t : Tables, documented : Set.Set String, m : Modules.Module, space
     let Some(origin) = Prelude.moduleOf(target) else { return False }
     if !Map.contains(t.modules, origin) || Set.contains(documented, origin) { return False }
     let sources = providers(t, m, space, target)
-    -- A name that only a qualifier's contents pass on, from a qualifier the
-    -- Prelude gives, has no import to follow.
+    -- Every name a module passes on comes from an import, the Prelude or a
+    -- qualifier, so `sources` is empty only if `providers` misses a route.
+    -- Then the declaring module, which has no page, is all there is to
+    -- follow.
     if len(sources) == 0 { return True }
     Iter.any(sources, fun(s) = !documentedVia(t, documented, s, space, target, Set.new()))
 }
@@ -1005,73 +1010,85 @@ fun documentedVia(t : Tables, documented : Set.Set String, s : Modules.Module, s
              fun(p) = documentedVia(t, documented, p, space, target, seen))
 }
 
--- The modules `m` has `target` from, in `space`: the imports whose lists
--- bring it, or else the Prelude, when `m` has it implicitly and it brings
--- it, since an explicit import shadows the implicit Prelude. A module that
--- brings it under a qualifier, which `m` can pass on as `module Q`, counts
--- only when nothing brings it bare. An import with `..` counts even when
--- another of its items hides the name; we assume no module imports a name
--- that way and then exports it.
+-- The modules `m` has `target` from, in `space`. An explicit import whose
+-- list brings it bare shadows the implicit Prelude, which shadows the rest.
+-- Failing both, `m` has it from a qualifier's contents, which it passes on
+-- as `module Q (...)`: from the modules under each such `Q`, or failing
+-- those, from any module a qualifier in its scope reaches.
 fun providers(t : Tables, m : Modules.Module, space : String,
               target : String) -> Vec Modules.Module {
+    let gives = fun(dep : Modules.Module) =
+        Iter.any(Map.values(namespace(dep.exports, space)), fun(v) = v == target)
     let bare = []
-    let qualified = []
     var prelude = m.name != Prelude.preludeName
     for imp in m.program.imports {
         if imp.name == Prelude.preludeName { prelude = False }
         let Some(dep) = Map.get(t.modules, imp.name) else { continue }
-        if !Iter.any(Map.values(namespace(dep.exports, space)), fun(v) = v == target) { continue }
-        if brings(t, dep, imp, space, target) {
-            Vec.push(bare, dep)
-        } else if !optsOut(imp) {
-            Vec.push(qualified, dep)
-        }
+        if gives(dep) && brings(t, dep, imp, space, target) { Vec.push(bare, dep) }
     }
     if len(bare) > 0 { return bare }
     if prelude {
         if let Some(p) = Map.get(t.modules, Prelude.preludeName) {
-            if Iter.any(Map.values(namespace(p.exports, space)), fun(v) = v == target) {
-                return [p]
+            if gives(p) { return [p] }
+        }
+    }
+    let passed = []
+    if let Some(d) = m.program.exportDecl {
+        for entry in d.items {
+            if !entry.qualifier || Option.isNone(entry.list) { continue }
+            for dep in Map.getOr(m.scope.qualifiers, entry.name, []) {
+                if gives(dep) && !Vec.contains(Vec.map(passed, fun(p) = p.name), dep.name) {
+                    Vec.push(passed, dep)
+                }
             }
         }
     }
-    qualified
+    if len(passed) > 0 { return passed }
+    Vec.filter(Modules.reachable(m.scope), gives)
 }
 
--- Whether `imp` is `import Prelude ()`, which brings nothing, not even a
--- qualifier.
-fun optsOut(imp : ImportDecl) -> Bool = imp.name == Prelude.preludeName && !imp.rest
-    && (match imp.items {
-        Some(entries) -> len(entries) == 0
-        None -> False
-    })
-
 -- Whether the import `imp` of `dep`, which exports `target` in `space`,
--- brings it bare: its list has a `..`, or an item that names it or lists it
--- as a member of its class.
+-- brings it bare. An item of its list that names it, or lists it as a
+-- member of its class, decides: `as _` hides it, even from a `..`, and any
+-- other spelling brings it. Failing such an item, a `..` brings it.
 fun brings(t : Tables, dep : Modules.Module, imp : ImportDecl, space : String,
            target : String) -> Bool {
     let Some(entries) = imp.items else { return False }
-    if imp.rest { return True }
+    var hidden = False
     for entry in entries {
-        if entry.rename == Some("_") || entry.item.qualifier { continue }
-        if Map.get(namespace(dep.exports, space), entry.item.name) == Some(target) { return True }
-        if let Some(cls) = Map.get(dep.exports.classes, entry.item.name) {
-            let member = Map.get(t.classes.owner, target) == Some(cls)
-                         || String.startsWith(target, cls + ".")
-            if member && listsMember(entry.item.subs, methodName(target)) { return True }
-        }
+        if entry.item.qualifier || !names(t, dep, entry.item, space, target) { continue }
+        if entry.rename != Some("_") { return True }
+        hidden = True
     }
-    False
+    imp.rest && !hidden
+}
+
+-- Whether `item`, an entry of a list importing from `dep`, names `target`
+-- in `space`, itself or as a member it lists.
+fun names(t : Tables, dep : Modules.Module, item : ExportItem, space : String,
+          target : String) -> Bool {
+    if Map.get(namespace(dep.exports, space), item.name) == Some(target) { return True }
+    let Some(cls) = Map.get(dep.exports.classes, item.name) else { return False }
+    memberClass(t, target) == Some(cls) && listsMember(item.subs, memberName(t, target))
 }
 
 -- Whether `subs`, an item's member list, holds `name`: `(..)` holds every
 -- member.
 fun listsMember(subs : Option (Vec String), name : String) -> Bool = match subs {
-    Some(names) -> Vec.contains(names, name) || Vec.contains(names, "..")
-                   || (len(names) == 2 && names[0] == "." && names[1] == ".")
+    Some(names) -> Modules.isDotDot(names) || Vec.contains(names, name)
     None -> False
 }
+
+-- The class `target` is a method or an associated type of, if it is one.
+fun memberClass(t : Tables, target : String) -> Option String =
+    match Map.get(t.classes.owner, target) {
+        Some(cls) -> Some(cls)
+        None -> Option.map(Map.get(t.classes.decls.families, target), fun(f) = f.cls)
+    }
+
+-- The name `target`, a method or an associated type, has in its class.
+fun memberName(t : Tables, target : String) -> String =
+    if Map.contains(t.classes.owner, target) { methodName(target) } else { Ty.bareName(target) }
 
 fun namespace(s : Modules.Scope, space : String) -> Map String String = match space {
     "value" -> s.values
@@ -1127,11 +1144,6 @@ type Homes = Homes {
     -- For the imports a link follows.
     tables : Tables,
 }
-
---- Returns where `docs`, which `describe` gave for a program with tables
---- `t`, show each entity in full.
-fun homesOf(docs : Vec ModuleDoc, t : Tables) -> Homes =
-    homesFrom(Vec.map(docs, fun(m) = (m.name, m.items)), t)
 
 fun homesFrom(pages : Vec (String, Vec Item), t : Tables) -> Homes {
     let copies = Map.new()

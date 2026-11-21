@@ -115,6 +115,62 @@ def test_every_library_function_has_a_type() -> None:
     assert untyped == []
 
 
+def _items(tmp_path, sources: dict[str, str], documented: list[str],
+           library: tuple[str, ...] = ()) -> dict[str, dict[str, dict]]:
+    """Writes `sources` into `tmp_path` and documents the modules `documented`
+    names there, with the library files `library`. Returns each module's items
+    by name."""
+    for name, text in sources.items():
+        (tmp_path / f"{name}.gob").write_text(text)
+    result = _doc(*library, *(str(tmp_path / f"{name}.gob") for name in documented))
+    assert result.returncode == 0, result.stderr
+    return {m["name"]: {item["name"]: item for item in m["items"]}
+            for m in json.loads(result.stdout)["modules"]}
+
+
+def test_an_explicit_import_shadows_the_implicit_prelude(tmp_path) -> None:
+    # The Prelude, undocumented here, gives `Option` too.
+    items = _items(tmp_path, {"M": "export (Option(..))\nimport Data.Option (Option(..))\n"},
+                   ["M"], ("lib/Data/Option.gob",))
+    assert items["M"]["Option"]["kind"] == "reexport"
+    assert items["M"]["Option"]["home"] == "Data.Option"
+
+
+def test_a_name_an_import_hides_is_not_shown_from_it(tmp_path) -> None:
+    items = _items(tmp_path, {
+        "H": "export (T(..))\n\ntype T = T(Int)\n",
+        "D": "export (T(..))\n\nimport H (T(..))\n",
+        "W": "export (T(..))\n\nimport H (T as _, ..)\nimport D (T(..))\n",
+    }, ["D", "W"])
+    assert items["D"]["T"]["from"] == "H"
+    assert items["W"]["T"]["kind"] == "reexport"
+    assert items["W"]["T"]["home"] == "D"
+
+
+def test_a_name_a_qualifier_passes_on_links_to_that_module(tmp_path) -> None:
+    # `Data.Array` shows `threeWay` too, and comes first by name.
+    items = _items(tmp_path, {"Q": "export (module Vec (threeWay))\n"}, ["Q"],
+                   ("lib/Data/Array.gob", "lib/Data/Vec.gob"))
+    assert items["Q"]["threeWay"]["kind"] == "reexport"
+    assert items["Q"]["threeWay"]["home"] == "Data.Vec"
+
+
+def test_a_module_that_sees_no_copy_links_to_the_first_by_name(tmp_path) -> None:
+    # `A` and `B` have `x` from each other, so following their imports finds
+    # no copy, only the cycle. `C` and `D` each show `x`.
+    items = _items(tmp_path, {
+        "U": "export (x)\n\nlet x = 1\n",
+        "A": "export (module Uq (x))\n\nimport U as Uq\nimport B (x)\n",
+        "B": "export (x)\n\nimport A (x)\n",
+        "C": "export (x)\n\nimport U (x)\n",
+        "D": "export (x)\n\nimport U (x)\n",
+    }, ["A", "B", "C", "D"])
+    assert items["C"]["x"]["from"] == "U"
+    assert items["D"]["x"]["from"] == "U"
+    assert items["A"]["x"]["home"] == "C"
+    assert items["B"]["x"]["home"] == "C"
+
+
 def test_modules_outside_the_library_must_share_a_directory(tmp_path) -> None:
     other = tmp_path / "Other.gob"
     other.write_text("export (x)\nlet x = 1\n")

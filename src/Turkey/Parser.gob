@@ -1660,11 +1660,12 @@ fun parseAtom(p : P) -> Expr {
         "if" -> parseIf(p)
         "while" -> {
             step(p)
-            var lead : Vec Expr = []
+            var lead : Vec Condition = []
             if !at(p, "let") && !at(p, "var") {
+                let where = cur(p).span
                 let cond = parseScrutinee(p, "the condition of 'while'")
                 if !at(p, ",") { return mkExpr(p, tok.span, EWhile(cond, parseBlock(p))) }
-                lead = [cond]
+                lead = [CondTest(close(p, where), cond)]
             }
             let conditions = parseConditions(p, "'while'", lead)
             mkExpr(p, tok.span, EWhileLet(conditions, parseBlock(p)))
@@ -1783,8 +1784,9 @@ fun parseScrutinee(p : P, what : String) -> Expr {
 fun parseIf(p : P) -> Expr {
     let s = expect(p, "if").span
     if at(p, "let") || at(p, "var") { return parseIfLet(p, s, []) }
+    let where = cur(p).span
     let cond = parseScrutinee(p, "the condition of 'if'")
-    if at(p, ",") { return parseIfLet(p, s, [cond]) }
+    if at(p, ",") { return parseIfLet(p, s, [CondTest(close(p, where), cond)]) }
     let then = parseBlock(p)
     var otherwise : Option Expr = None
     if eat(p, "else") {
@@ -1796,7 +1798,7 @@ fun parseIf(p : P) -> Expr {
 
 -- Parses the rest of an `if` whose head is a condition list. `lead` holds the
 -- test the head began with, if the caller has read it.
-fun parseIfLet(p : P, s : Span, lead : Vec Expr) -> Expr {
+fun parseIfLet(p : P, s : Span, lead : Vec Condition) -> Expr {
     let conditions = parseConditions(p, "'if'", lead)
     let then = parseBlock(p)
     var otherwise : Option Expr = None
@@ -1810,8 +1812,8 @@ fun parseIfLet(p : P, s : Span, lead : Vec Expr) -> Expr {
 -- Parses the conditions of an `if` or `while` head, up to the block after
 -- them, after the tests in `lead`. Raises a parse error for two tests in a
 -- row, which `a && b` already says.
-fun parseConditions(p : P, construct : String, lead : Vec Expr) -> Vec Condition {
-    let conditions : Vec Condition = Vec.map(lead, CondTest)
+fun parseConditions(p : P, construct : String, lead : Vec Condition) -> Vec Condition {
+    let conditions = lead
     var afterTest = len(lead) > 0
     var more = len(lead) == 0 || eat(p, ",")
     while more {
@@ -1820,6 +1822,7 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr) -> Vec Condition
             oops(p, "expected a condition after ','", cur(p).span)
         }
         if at(p, "let") || at(p, "var") {
+            let start = cur(p).span
             let mutable = at(p, "var")
             step(p)
             let saved = setNoRecord(p, False)
@@ -1827,7 +1830,7 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr) -> Vec Condition
             skipToken(p, "=")
             p.noRecord = saved
             let value = parseScrutinee(p, "the value a 'let' condition matches")
-            Vec.push(conditions, CondLet(mutable, patterns, value))
+            Vec.push(conditions, CondLet(close(p, start), mutable, patterns, value))
             afterTest = False
         } else {
             let where = cur(p).span
@@ -1836,7 +1839,7 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr) -> Vec Condition
                 oops(p, "two tests in a row cannot be separated by ','; join them "
                         + "with '&&'", where)
             }
-            Vec.push(conditions, CondTest(test))
+            Vec.push(conditions, CondTest(close(p, where), test))
             afterTest = True
         }
         more = eat(p, ",")

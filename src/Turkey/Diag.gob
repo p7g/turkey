@@ -1,7 +1,8 @@
 export (
     Diag(..), Severity(..), at, whole, warningAt, render, fail, short, compiling,
     report, beginUnit, endUnit, beginMuted, endMuted, beginHeld, endHeld, hasErrors, errorCount, stopOnErrors,
-    stopCollecting, removeOnExit, keepOnExit, exit,
+    stopCollecting, resumeCollecting, removeOnExit, keepOnExit, restoreOnExit, keepRewrites,
+    exit,
 )
 
 --- A diagnostic is a value.
@@ -123,9 +124,33 @@ fun keepOnExit(path : String) -> Unit {
     leftovers = Vec.filter(leftovers, fun(p) = p != path)
 }
 
---- Removes what `removeOnExit` named, and exits with `status`.
+-- Files a compile has rewritten in place, each with the text it held before,
+-- which `exit` writes back, and what `exit` prints when it does.
+var rewrites : Vec (String, String) = []
+var rewriteNote = ""
+
+--- Writes `before` back to the file at `path` when the compile exits through
+--- `exit`, and prints `note` to stderr first, unless `keepRewrites` comes
+--- first. The last `note` given is the one printed. A panic or a signal
+--- leaves the file as it is.
+fun restoreOnExit(path : String, before : String, note : String) -> Unit {
+    Vec.push(rewrites, (path, before))
+    rewriteNote = note
+}
+
+--- Undoes every `restoreOnExit` so far.
+fun keepRewrites() -> Unit {
+    Vec.clear(rewrites)
+}
+
+--- Removes what `removeOnExit` named, writes back what `restoreOnExit` named,
+--- and exits with `status`.
 fun exit(status : Int) -> a {
     for path in leftovers { let _ = File.removeFile(path) }
+    if len(rewrites) > 0 {
+        let _ = IO.writeText(IO.stderr(), rewriteNote + "\n")
+        for (path, before) in rewrites { let _ = File.writeText(path, before) }
+    }
     Env.exit(status)
 }
 
@@ -203,6 +228,12 @@ fun errorCount() -> Int = errorsKept
 --- Makes `report` end the compile on an error from now on, as `fail` does.
 fun stopCollecting() -> Unit {
     collecting = False
+}
+
+--- Makes `report` collect again, as it does before `stopCollecting`: for a
+--- driver that checks a program more than once in one process.
+fun resumeCollecting() -> Unit {
+    collecting = True
 }
 
 --- Prints what has been reported, in source order, to stderr. Exits with status

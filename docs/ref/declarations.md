@@ -399,6 +399,13 @@ argument `_.name` would be the function. A `\` inside another `\` makes its
 own function of the `_`s inside it, as the last line shows. A `\` with no `_`
 in it is an error.
 
+A `_` in a parameter list is a pattern, not a placeholder. In
+`fun(_) = lookup(_, table)` the parameter binds nothing, and `lookup(_, table)`
+is a function of its own, so the lambda returns a function. The compiler warns
+about a `fun` whose parameter is `_` and whose body makes a function with `_`
+([`ambiguous-underscore`](README.md#warnings)), unless that function starts
+with `\`.
+
 The rest of the expression is evaluated each time the function is called,
 exactly as it would be in the lambda it stands for.
 

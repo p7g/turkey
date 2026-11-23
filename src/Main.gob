@@ -2,14 +2,21 @@
 -- `scripts/build.sh`.
 --
 -- Three commands. `check` compiles as far as the last stage that can reject a
--- program, and writes nothing. `build` compiles all the way and writes an
--- executable, or under `-S` assembly, to `-o`, or without it to the working
--- directory, named after the entry file (`openSink`). `doc` checks the
+-- program, and writes nothing, or under `--fix` writes the program's own
+-- modules back with their checks' mechanical fixes applied (`fix`). `build`
+-- compiles all the way and writes an executable, or under `-S` assembly, to
+-- `-o`, or without it to the working directory, named after the entry file
+-- (`openSink`). `doc` checks the
 -- modules it is given and writes what each exports as JSON (`Turkey.Doc`), or
 -- with `--html DIR` as a website (`Turkey.DocSite`). `check` and `build` each
 -- take `--dump STAGE,...` to print what a stage produced, which is how a pass
 -- is read while it is being written: `check` goes on as far as the latest
 -- stage asked for and no further, and `build` prints them on its way.
+--
+-- `check` and `build` run the checks of `Turkey.Checks` on the program's own
+-- modules, and print what they find after the last stage that can reject
+-- the program. `--allow`, `--warn` and `--deny` set a check's level for the
+-- run, and `--deny-warnings` makes every finding left at warn an error.
 --
 -- Several files may be named, and each is answered in turn with no separator
 -- between them: every dump marks its own beginning or end, so the
@@ -92,6 +99,9 @@ import Turkey.Target as Target
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
                    FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
 import Turkey.Libraries as Libraries
+import Turkey.Lint as Lint
+import Turkey.Lint (Level(..))
+import Turkey.Checks as Checks
 import Turkey.Doc as Doc
 import Turkey.DocSite as DocSite
 
@@ -224,6 +234,15 @@ fun millis(d : Duration) -> String {
     Int.toString(tenths / 10) + "." + Int.toString(tenths % 10) + "ms"
 }
 
+-- Whether this compile runs the checks: `check` and `build` do, and `doc`
+-- does not.
+var linting = False
+
+-- At most this many passes of `--fix`. Two checks whose fixes undo each other
+-- would otherwise rewrite a file for ever; past this many, they are reported
+-- as an internal error instead.
+let fixPasses = 10
+
 -- What `--dump` can name, in the order the stages run. Its position is how far
 -- a compile has to go to print it.
 let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
@@ -265,8 +284,10 @@ fun main() {
                                          + "'build' and 'doc'")
         _ -> usage()
     }
+    linting = True
     var output = None
     var format = Executable
+    var fixing = False
     let dumps = Set.new()
     let paths = []
     loop {
@@ -292,6 +313,11 @@ fun main() {
                     timings = True
                     Opt.measure(True)
                 }
+                Long("allow") -> setLevels(valueOf(p), Allow)
+                Long("warn") -> setLevels(valueOf(p), Warn)
+                Long("deny") -> setLevels(valueOf(p), Deny)
+                Long("deny-warnings") -> Lint.denyWarnings()
+                Long("fix") -> { fixing = True }
                 Long("dump") -> for stage in String.split(valueOf(p), ",") {
                     if !Array.contains(stages, stage) {
                         die("cannot dump '" + stage + "'; the stages are "
@@ -309,6 +335,12 @@ fun main() {
         }
     }
     if len(paths) == 0 { usage() }
+    if fixing && building {
+        die("'turkey build' does not fix; use 'turkey check --fix'")
+    }
+    if fixing && len(Set.elements(dumps)) > 0 {
+        die("'turkey check --fix' takes no --dump")
+    }
     let sink = if building {
         Some(openSink(output, format, paths, len(Set.elements(dumps)) > 0))
     } else {
@@ -324,7 +356,7 @@ fun main() {
     let listing = Encode.newListing()
     for path in paths {
         Diag.compiling(path)
-        compile(b, path, dumps, listing, sink)
+        if fixing { fix(path) } else { compile(b, path, dumps, listing, sink) }
     }
     write(String.build(b))
     if let Some(Sink { to = ToAssembly(pending), .. }) = sink { finishAssembly(pending) }
@@ -333,6 +365,17 @@ fun main() {
 fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
     Left(message) -> die(message)
     Right(v) -> v
+}
+
+-- Sets the level of each check `names`, a comma-separated list, names.
+fun setLevels(names : String, level : Level) -> Unit {
+    for name in String.split(names, ",") {
+        if Option.isNone(Lint.named(Checks.registry, name)) {
+            let known = Array.map(Checks.registry, _.name)
+            die("unknown check '" + name + "'; the checks are " + String.join(known, ", "))
+        }
+        Lint.setLevel(name, level)
+    }
 }
 
 -- Where `build` writes, refused here if it is something this cannot write,
@@ -672,6 +715,8 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("types") { dumpTypes(b, checked, entry) }
     let program = lowered(checked)
     at = lap("lower", at)
+    Lint.report(lint(checked))
+    at = lap("lint", at)
     if wants("core") { String.push(b, Core.showProgram(program, Some(entry.name), slotNames(checked))) }
     write(String.drain(b))
     if through("core") { return }
@@ -835,6 +880,66 @@ fun showCounts(counts : Map String Int, most : Int, b : String.Builder) -> Unit 
     }
 }
 
+-- Every finding of the checks on `checked`, the syntactic checks' among them.
+-- Run after lowering, the last stage that can reject a program, since a
+-- program that is rejected reports its errors and nothing else.
+fun lint(checked : Checked) -> Vec Lint.Reported {
+    let found = Lint.runTyped(Checks.registry, checked.types)
+    if Lint.checkingFixes() { Lint.checkOverlaps(found) }
+    found
+}
+
+-- `check --fix`: checks `path`, applies the mechanical fixes of what the
+-- checks found to the program's own modules, and checks again, until a pass
+-- finds nothing to fix. Then prints what is left, as `check` would.
+--
+-- Each pass is checked by the next. If a pass's fixes leave a program the
+-- front end rejects, its errors are printed, and every file the pass wrote is
+-- written back as it was before the pass, with an internal error naming the
+-- checks whose fixes broke it (`Diag.restoreOnExit`).
+fun fix(path : String) -> Unit {
+    var applied = 0
+    var pass = 0
+    loop {
+        Diag.resumeCollecting()
+        let (checked, _) = checkProgram(path)
+        let _ = lowered(checked)
+        let found = lint(checked)
+        -- The pass that just checked clean keeps what the one before it wrote.
+        Diag.keepRewrites()
+        let fixes = Lint.chosen(found)
+        if len(fixes) == 0 {
+            if applied > 0 {
+                toStderr("fixed " + Int.toString(applied) + " finding"
+                         + (if applied == 1 { "" } else { "s" }) + "\n")
+            }
+            Lint.report(found)
+            return
+        }
+        let names = fixNames(fixes)
+        if pass == fixPasses {
+            Diag.fail(Diag.whole("internal error", "the fixes of " + names + " still apply after "
+                                 + Int.toString(fixPasses) + " passes, so one undoes another"),
+                      path)
+        }
+        let note = Diag.render(Diag.whole("internal error", "the fixes of " + names
+                                          + " made a program that does not compile; the files "
+                                          + "they changed are restored"), path)
+        if let Left(why) = Lint.rewrite(fixes, note) { die(why) }
+        applied = applied + len(fixes)
+        pass = pass + 1
+    }
+}
+
+-- The checks with fixes among `fixes`, each once, quoted: `'a' and 'b'`.
+fun fixNames(fixes : Vec (String, Lint.Fix)) -> String {
+    let names = Set.new()
+    for (name, _) in fixes { Set.add(names, name) }
+    let quoted = Array.map(Array.sort(Set.elements(names)), fun(n) = "'" + n + "'")
+    if len(quoted) == 1 { return quoted[0] }
+    String.join(Array.slice(quoted, 0, len(quoted) - 1), ", ") + " and " + quoted[len(quoted) - 1]
+}
+
 fun position(stage : String) -> Int = match Array.indexOf(stages, stage) {
     Some(i) -> i
     None -> error("not a stage: " + stage)
@@ -863,11 +968,14 @@ fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module,
 -- looked for beside `source.name` and in the library.
 fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
                                     Binders.Table) {
-    let loader = Modules.newLoader([directoryOf(source.name), libRoot()])
+    let library = libRoot()
+    let loader = Modules.newLoader([directoryOf(source.name), library])
     let entry = Modules.loadEntry(loader, source, "Main")
     -- An import that failed leaves its names out of scope, and resolving
     -- against that scope would report every use of them again.
     Diag.stopOnErrors()
+    Lint.begin()
+    let libraryOwn = linting && buildsLibrary(source.name, library)
     let operators = Resolve.operators(loader.order, Resolve.arities(loader.order))
     let binders = Binders.newTable()
     Resolve.declare(loader.order, binders)
@@ -878,12 +986,35 @@ fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
         -- them report. Desugaring does not: it reads what resolution
         -- recorded, and a reported error left a gap there.
         if !Diag.hasErrors() {
+            -- The syntactic checks see the module as written, which
+            -- desugaring rewrites in place.
+            if linting && (!m.library || libraryOwn) {
+                let f = Lint.File { path = m.file, text = m.text, program = m.program }
+                Lint.claim(f)
+                Lint.runSyntactic(Checks.registry, f)
+            }
             Desugar.program(m.program, m.scope, binders)
             if checking { Binders.checkReferences(binders, m.program, m.file) }
         }
     }
     Diag.stopOnErrors()
     (loader.groups, entry, binders)
+}
+
+-- Whether the library at `library` is own code for a compile of `entry`,
+-- with its checks run and its findings reported, rather than a dependency.
+--
+-- Own code is what was resolved from the root being built, which is the
+-- entry's directory. The library is a root of its own, and so is someone
+-- else's code, except where the library is what is being built: when the
+-- entry is inside it, or when the entry's directory sits beside it, as
+-- `src/` sits beside `lib/` in a Turkey checkout. The test programs under
+-- `tests/` are not beside it, so the library's findings never reach their
+-- output.
+fun buildsLibrary(entry : String, library : String) -> Bool {
+    let root = realPath(library)
+    String.startsWith(realPath(entry), root + "/")
+        || parentOf(realPath(directoryOf(entry))) == parentOf(root)
 }
 
 -- Whether to check that resolution and desugaring recorded a binder for every
@@ -2182,6 +2313,8 @@ fun usage() -> a =
         + "                    FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
+        + "         --allow CHECK,...  --warn CHECK,...  --deny CHECK,...  --deny-warnings\n"
+        + "         --fix (check only)\n"
         + "stages: " + String.join(stages, ", "))
 
 fun die(message : String) -> a {

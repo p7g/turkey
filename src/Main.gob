@@ -6,9 +6,9 @@
 -- modules back with their checks' mechanical fixes applied (`fix`). `build`
 -- compiles all the way and writes an executable, or under `-S` assembly, to
 -- `-o`, or without it to the working directory, named after the entry file
--- (`openSink`). `doc` checks the
--- modules it is given and writes what each exports as JSON (`Turkey.Doc`), or
--- with `--html DIR` as a website (`Turkey.DocSite`). `check` and `build` each
+-- (`openSink`). `doc` checks the modules it is given and writes what each
+-- exports as JSON (`Turkey.Doc`), or with `--html DIR` as a website
+-- (`Turkey.DocSite`). `check` and `build` each
 -- take `--dump STAGE,...` to print what a stage produced, which is how a pass
 -- is read while it is being written: `check` goes on as far as the latest
 -- stage asked for and no further, and `build` prints them on its way.
@@ -367,7 +367,7 @@ fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
     Right(v) -> v
 }
 
--- Sets the level of each check `names`, a comma-separated list, names.
+-- Sets the level of every check named in `names`, a comma-separated list.
 fun setLevels(names : String, level : Level) -> Unit {
     for name in String.split(names, ",") {
         if Option.isNone(Lint.named(Checks.registry, name)) {
@@ -917,15 +917,20 @@ fun fix(path : String) -> Unit {
             return
         }
         let names = fixNames(fixes)
+        -- Every pass so far checked clean, so the files are left as the last
+        -- one wrote them.
         if pass == fixPasses {
             Diag.fail(Diag.whole("internal error", "the fixes of " + names + " still apply after "
                                  + Int.toString(fixPasses) + " passes, so one undoes another"),
                       path)
         }
-        let note = Diag.render(Diag.whole("internal error", "the fixes of " + names
-                                          + " made a program that does not compile; the files "
-                                          + "they changed are restored"), path)
-        if let Left(why) = Lint.rewrite(fixes, note) { die(why) }
+        Diag.restoreNote(Diag.render(Diag.whole("internal error", "the fixes of " + names
+                                                + " made a program that does not compile; "
+                                                + "the files they changed are restored"), path))
+        if let Left(why) = Lint.rewrite(fixes) {
+            Diag.restoreNote("turkey: the files this pass wrote before that are restored")
+            die(why)
+        }
         applied = applied + len(fixes)
         pass = pass + 1
     }
@@ -989,7 +994,7 @@ fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
             -- The syntactic checks see the module as written, which
             -- desugaring rewrites in place.
             if linting && (!m.library || libraryOwn) {
-                let f = Lint.File { path = m.file, text = m.text, program = m.program }
+                let f = Lint.file(m.file, m.text, m.program)
                 Lint.claim(f)
                 Lint.runSyntactic(Checks.registry, f)
             }
@@ -1007,14 +1012,14 @@ fun loadSource(source : Source) -> (Vec (Vec Modules.Module), Modules.Module,
 -- Own code is what was resolved from the root being built, which is the
 -- entry's directory. The library is a root of its own, and so is someone
 -- else's code, except where the library is what is being built: when the
--- entry is inside it, or when the entry's directory sits beside it, as
--- `src/` sits beside `lib/` in a Turkey checkout. The test programs under
--- `tests/` are not beside it, so the library's findings never reach their
--- output.
+-- entry is inside it, or inside the compiler's own source, the `src/` beside
+-- it in a Turkey checkout. Any other program in the checkout, such as the
+-- tests under `tests/`, has the library as a dependency, so nothing is
+-- reported inside it.
 fun buildsLibrary(entry : String, library : String) -> Bool {
     let root = realPath(library)
-    String.startsWith(realPath(entry), root + "/")
-        || parentOf(realPath(directoryOf(entry))) == parentOf(root)
+    let real = realPath(entry)
+    String.startsWith(real, root + "/") || String.startsWith(real, parentOf(root) + "/src/")
 }
 
 -- Whether to check that resolution and desugaring recorded a binder for every

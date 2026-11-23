@@ -55,21 +55,34 @@ fun emptyValue(f : File, e : Expr, keyword : String, value : Expr, out : Vec Fin
     if Source.isEmpty(start) || Source.isEmpty(value.span) { return }
     let keywordEnd = start.col + String.codePointCount(keyword)
     if Lint.textOf(f, Source.endingAt(start, start.line, keywordEnd)) != keyword { return }
-    let gap = Span { line = start.line, col = keywordEnd, endLine = value.span.endLine,
-                     endCol = value.span.endCol, file = start.file, inlined = None }
-    -- The fix deletes the value and the space before it. Grouping
-    -- parentheses around the value and a comment inside it are not in the
-    -- tree, so the fix is mechanical only when the text it deletes holds
-    -- nothing else.
+    -- The node's own span ends at its last token, so it covers grouping
+    -- parentheses around the value, which the value's span does not.
+    let gap = Span { line = start.line, col = keywordEnd, endLine = start.endLine,
+                     endCol = start.endCol, file = start.file, inlined = None }
+    -- The fix deletes the value and the space before it. A comment inside
+    -- the value is not in the tree, so the fix is mechanical only when the
+    -- text it deletes is the value, perhaps in parentheses, and whitespace.
     let deleted = Lint.textOf(f, gap)
+    let shown = if String.contains(deleted, "\n") {
+        if written == "{}" { "the empty block" } else { "the value" }
+    } else {
+        "'" + String.trim(deleted) + "'"
+    }
     let fix = Fix { edits = [Edit { span = gap, text = "" }],
-                    mechanical = squeezed(deleted) == written }
+                    mechanical = unwrapped(squeezed(deleted)) == written }
     Vec.push(out, Finding {
         span = value.span,
-        message = "a bare '" + keyword + "' already means '" + keyword + " ()'; remove '"
-                  + written + "'",
+        message = "a bare '" + keyword + "' already means '" + keyword + " ()'; remove " + shown,
         fix = Some(fix),
     })
+}
+
+-- `text` without grouping parentheses around the whole of it.
+fun unwrapped(text : String) -> String {
+    if text == "()" { return text }
+    let Some(opened) = String.stripPrefix(text, "(") else { return text }
+    let Some(inner) = String.stripSuffix(opened, ")") else { return text }
+    unwrapped(inner)
 }
 
 -- `text` without its whitespace.

@@ -1,6 +1,6 @@
 export (
-    Level(..), File(..), Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
-    finding, named, setLevel, denyWarnings, levelOf,
+    Level(..), File(..), Lines, Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
+    file, finding, named, setLevel, denyWarnings, levelOf,
     begin, claim, owned, isOwn, runSyntactic, runTyped,
     report, countLine, chosen, rewrite, checkingFixes, checkOverlaps,
     textOf, charAt, nodes,
@@ -34,8 +34,13 @@ import Turkey.Typed (TypeTable)
 type Level = Allow | Warn | Deny
 
 --- One module as a check sees it: the path its spans name, the text it was
---- parsed from, and its tree.
-type File = File { path : String, text : String, program : Program }
+--- parsed from, and its tree. `lines` is that text split for `textOf` and
+--- `charAt`, made the first time one of them asks.
+type File = File { path : String, text : String, program : Program, var lines : Option Lines }
+
+--- Returns the module at `path`, parsed from `text` into `program`.
+fun file(path : String, text : String, program : Program) -> File =
+    File { path = path, text = text, program = program, lines = None }
 
 --- When a check runs, and what it is given.
 ---
@@ -301,9 +306,10 @@ fun overlaps(a : Span, b : Span) -> Bool {
 --- Applies `fixes` to the own modules they edit, and writes each module back.
 --- A file is edited from the text it was parsed from, which is what the
 --- spans count in. Each file written is written back as it was if the
---- compile then exits through `Diag.exit`, which prints `note` first
---- (`Diag.restoreOnExit`). Returns why a file could not be written.
-fun rewrite(fixes : Vec (String, Fix), note : String) -> Either String Unit {
+--- compile then exits through `Diag.exit` (`Diag.restoreOnExit`). Returns
+--- why a file could not be written; the files written before it stay
+--- registered.
+fun rewrite(fixes : Vec (String, Fix)) -> Either String Unit {
     let byFile : Map String (Vec Edit) = Map.new()
     for (_, fix) in fixes {
         for e in fix.edits {
@@ -318,15 +324,26 @@ fun rewrite(fixes : Vec (String, Fix), note : String) -> Either String Unit {
             Some(edits) -> edits
             None -> continue
         }
-        Diag.restoreOnExit(f.path, f.text, note)
-        if let Left(e) = File.writeText(f.path, edited(f.text, edits)) { return Left(message(e)) }
+        let made = Vec.map(edits, testing(f, _))
+        if let Left(e) = File.writeText(f.path, edited(linesIn(f), made)) { return Left(message(e)) }
+        Diag.restoreOnExit(f.path, f.text)
     }
     Right(())
 }
 
--- `text` with `edits` applied. No two of them overlap.
-fun edited(text : String, edits : Vec Edit) -> String {
-    let lines = linesOf(text)
+-- `e`, or under `TURKEY_TEST_FIX` an edit that tests `--fix` itself: with
+-- `break`, one that leaves text no parser accepts, and with `repeat`, one
+-- that writes back the text it replaces, so its finding is found again on
+-- every pass. Checks are meant never to make either, so the driver's
+-- answer to them cannot be tested any other way.
+fun testing(f : File, e : Edit) -> Edit = match Env.get("TURKEY_TEST_FIX") {
+    Some("break") -> Edit { span = e.span, text = e.text + " @" }
+    Some("repeat") -> Edit { span = e.span, text = textOf(f, e.span) }
+    _ -> e
+}
+
+-- The text of `lines` with `edits` applied. No two of them overlap.
+fun edited(lines : Lines, edits : Vec Edit) -> String {
     let ordered = Vec.sortByKey(edits, fun(e) = (e.span.line, e.span.col))
     let out = []
     var at = 0
@@ -382,9 +399,19 @@ fun checkOverlaps(found : Vec Reported) -> Unit {
 
 -- -- text ---------------------------------------------------------------------------
 
--- A text's code points, and where each line starts among them. Spans count
--- lines and columns from 1, in code points.
+--- A text's code points, and where each line starts among them. Spans count
+--- lines and columns from 1, in code points.
 type Lines = Lines { codes : Array Char, starts : Vec Int }
+
+-- `f`'s text split into lines, made once.
+fun linesIn(f : File) -> Lines = match f.lines {
+    Some(lines) -> lines
+    None -> {
+        let lines = linesOf(f.text)
+        f.lines = Some(lines)
+        lines
+    }
+}
 
 fun linesOf(text : String) -> Lines {
     let codes = String.toCodePoints(text)
@@ -405,7 +432,7 @@ fun offset(lines : Lines, line : Int, col : Int) -> Int {
 
 --- Returns the text `span` covers in `f`.
 fun textOf(f : File, span : Span) -> String {
-    let lines = linesOf(f.text)
+    let lines = linesIn(f)
     let from = offset(lines, span.line, span.col)
     let to = offset(lines, span.endLine, span.endCol)
     String.fromCodePoints(Array.slice(lines.codes, from, if to < from { from } else { to }))
@@ -413,7 +440,7 @@ fun textOf(f : File, span : Span) -> String {
 
 --- Returns the character at the start of `span` in `f`, if there is one.
 fun charAt(f : File, span : Span) -> Option Char {
-    let lines = linesOf(f.text)
+    let lines = linesIn(f)
     let at = offset(lines, span.line, span.col)
     if at < len(lines.codes) { Some(lines.codes[at]) } else { None }
 }

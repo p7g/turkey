@@ -50,10 +50,11 @@ fun main() {
 """
 
 
-def turkey(directory: Path, *argv: str, lib: Path = bootc.REPO_ROOT / "lib") -> subprocess.CompletedProcess:
+def turkey(directory: Path, *argv: str, lib: Path = bootc.REPO_ROOT / "lib",
+           **variables: str) -> subprocess.CompletedProcess:
     # The suite names the library relative to the repository root, and these
     # run elsewhere.
-    environment = dict(os.environ, TURKEY_LIB=str(lib))
+    environment = dict(os.environ, TURKEY_LIB=str(lib), **variables)
     return subprocess.run(toolchain.command(bootc.binary(), *argv), cwd=directory,
                           env=environment, capture_output=True, text=True, timeout=120)
 
@@ -133,6 +134,37 @@ def test_fix_rewrites_the_file_and_reports_what_is_left(program: Path) -> None:
     assert result.stderr.endswith("[unreachable-code]\n1 warning\n")
 
 
+def test_a_fix_that_breaks_the_program_is_undone(program: Path) -> None:
+    # `TURKEY_TEST_FIX=break` makes every fix leave text that does not parse.
+    result = turkey(program, "check", "--fix", "main.gob", TURKEY_TEST_FIX="break")
+    assert result.returncode == 1
+    assert "parse error" in result.stderr
+    assert result.stderr.endswith(
+        "main.gob: internal error: the fixes of 'empty-return-value' made a program that"
+        " does not compile; the files they changed are restored\n")
+    assert (program / "main.gob").read_text() == TWO_FINDINGS
+
+
+def test_fixes_that_never_settle_stop_at_the_cap(program: Path) -> None:
+    # `TURKEY_TEST_FIX=repeat` makes every fix write back what it replaces.
+    result = turkey(program, "check", "--fix", "main.gob", TURKEY_TEST_FIX="repeat")
+    assert result.returncode == 1
+    assert result.stderr == ("main.gob: internal error: the fixes of 'empty-return-value'"
+                             " still apply after 10 passes, so one undoes another\n")
+    assert (program / "main.gob").read_text() == TWO_FINDINGS
+
+
+def test_a_file_that_cannot_be_written_is_reported_as_such(program: Path) -> None:
+    (program / "main.gob").chmod(0o444)
+    try:
+        result = turkey(program, "check", "--fix", "main.gob")
+    finally:
+        (program / "main.gob").chmod(0o644)
+    assert result.returncode == 2
+    assert "restored" not in result.stderr
+    assert (program / "main.gob").read_text() == TWO_FINDINGS
+
+
 def test_fix_leaves_an_allowed_check_alone(program: Path) -> None:
     result = turkey(program, "check", "--fix", "--allow", "empty-return-value", "main.gob")
     assert result.returncode == 0, result.stderr
@@ -164,7 +196,18 @@ def test_a_module_beside_the_entry_is(tmp_path: Path) -> None:
     assert result.stderr.startswith("Extra.gob:4:22: warning: a bare 'return'")
 
 
-def test_the_library_is_linted_from_beside_it(tmp_path: Path, library: Path) -> None:
+def test_a_program_beside_the_library_does_not_lint_it(tmp_path: Path, library: Path) -> None:
+    examples = tmp_path / "examples"
+    examples.mkdir()
+    (examples / "main.gob").write_text(USES_EXTRA)
+    result = turkey(examples, "check", "--deny-warnings", "main.gob", lib=library)
+    assert (result.returncode, result.stderr) == (0, "")
+    result = turkey(examples, "check", "--fix", "main.gob", lib=library)
+    assert (result.returncode, result.stderr) == (0, "")
+    assert (library / "Extra.gob").read_text() == EXTRA
+
+
+def test_the_library_is_linted_from_the_compiler_source(tmp_path: Path, library: Path) -> None:
     # `src/` beside `lib/`, as the compiler's own source is: the library is
     # what is being built.
     source = tmp_path / "src"

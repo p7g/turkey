@@ -4,7 +4,7 @@ export (
     Expr(..), ExprKind(..),
     Stmt(..), StmtKind(..),
     Lit(..), litKind, literalText,
-    Arm(..), Guard(..), guardExpr,
+    Arm(..), Guard(..), guardExpr, Condition(..), conditionExpr, conditionSpan,
     Pred(..), PredKind(..),
     FunDecl(..),
     ForeignDecl(..),
@@ -218,6 +218,15 @@ type ExprKind
     | EForC(Option Stmt, Expr, Option Stmt, Expr)
     | ELoop(Expr)
     | EMatch(Expr, Vec Arm)
+    --- An `if` whose head is a condition list: `if let p = e { A }`, or
+    --- `if c1, let p = e, c2 { A } else { B }`. The list holds at least one
+    --- `let` or `var`, and never two tests in a row. The `else` may be another
+    --- `if`. `Turkey.Desugar` rewrites it into a guarded `match`, and no stage
+    --- after that sees one.
+    | EIfLet(Vec Condition, Expr, Option Expr)
+    --- A `while` whose head is a condition list: `while let p = e { B }`, or
+    --- `while c, let p = e { B }`. Rewritten as `EIfLet` is.
+    | EWhileLet(Vec Condition, Expr)
     | EReturn(Option Expr)
     | EBreak(Option Expr)
     | EContinue
@@ -250,6 +259,29 @@ fun guardExpr(g : Guard) -> Expr = match g {
     GLet(_, e) -> e
 }
 
+--- One condition of an `if` or `while` head. Its bindings are visible in the
+--- conditions after it and in the body, and not in the `else`. Each carries
+--- the span of the whole condition, from its `let` or `var` if it has one.
+type Condition
+    --- Holds when the expression, a `Bool`, is `True`.
+    = CondTest(Span, Expr)
+    --- `let p | q = e`: holds when one of the patterns matches the value, and
+    --- binds what that pattern binds. The flag is `var` in place of `let`,
+    --- which makes the variables assignable in the body.
+    | CondLet(Span, Bool, Vec Pat, Expr)
+
+--- Returns the expression a condition evaluates.
+fun conditionExpr(c : Condition) -> Expr = match c {
+    CondTest(_, e) -> e
+    CondLet(_, _, _, e) -> e
+}
+
+--- Returns the span of the whole condition.
+fun conditionSpan(c : Condition) -> Span = match c {
+    CondTest(s, _) -> s
+    CondLet(s, _, _, _) -> s
+}
+
 -- -- statements -------------------------------------------------------------------
 
 type Stmt = Stmt {
@@ -264,6 +296,12 @@ type StmtKind
     | SFun(FunDecl)
     | SAssign(Expr, Expr)
     | SExpr(Expr)
+    --- `let p = e else { B }`, or with the flag set, `var p = e else { B }`:
+    --- the pattern, the value and the `else` block, which must not complete.
+    --- The pattern's variables are bound for the rest of the block, as a
+    --- `let`'s are. `Turkey.Desugar` rewrites it into a `let` of a `match`,
+    --- and no stage after that sees one.
+    | SLetElse(Bool, Pat, Expr, Expr)
 
 -- -- declarations -----------------------------------------------------------------
 
@@ -624,6 +662,11 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
     ELoop(body) -> [ChExpr(body)]
     EMatch(scrutinee, arms) ->
         Vec.append([ChExpr(scrutinee)], Vec.map(arms, ChArm))
+    EIfLet(conditions, then, otherwise) ->
+        Vec.append(Vec.append(conditionChildren(conditions), [ChExpr(then)]),
+                   optExpr(otherwise))
+    EWhileLet(conditions, body) ->
+        Vec.append(conditionChildren(conditions), [ChExpr(body)])
     EReturn(value) -> optExpr(value)
     EBreak(value) -> optExpr(value)
     EBlock(stmts) -> Vec.map(stmts, ChStmt)
@@ -637,7 +680,11 @@ fun stmtChildren(s : Stmt) -> Vec Child = match s.kind {
     SFun(d) -> [ChFun(d)]
     SAssign(target, value) -> [ChExpr(target), ChExpr(value)]
     SExpr(e) -> [ChExpr(e)]
+    SLetElse(_, _, value, otherwise) -> [ChExpr(value), ChExpr(otherwise)]
 }
+
+fun conditionChildren(conditions : Vec Condition) -> Vec Child =
+    Vec.map(conditions, fun(c) = ChExpr(conditionExpr(c)))
 
 --- The expression an arm holds, and the body a declaration holds. Named because
 --- several places ask -- `children` and `reach` below, `Desugar`'s rewrite --
@@ -822,6 +869,21 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
         }
         branch(reach(scrutinee), ends, breaks)
     }
+    -- As the guarded `match` it means: one arm through the conditions and
+    -- `then`, and one through `otherwise`.
+    EIfLet(conditions, then, otherwise) -> {
+        let (test, (armEnds, armBreaks)) = headReach(conditions, then)
+        let (elseEnds, elseBreaks) = optReach(otherwise)
+        branch(test, orElse(armEnds, elseEnds), orElse(armBreaks, elseBreaks))
+    }
+    -- As the `loop` around a `match` it means, whose other arm is a `break`:
+    -- the loop completes when a condition fails, and breaks in its head and
+    -- body leave this loop and no other.
+    EWhileLet(conditions, body) -> {
+        let (test, (armEnds, armBreaks)) = headReach(conditions, body)
+        let (_, breaks) = branch(test, armEnds, orElse(armBreaks, Completes))
+        (breaks, Stops)
+    }
     EReturn(value) -> {
         let (_, breaks) = optReach(value)
         (Stops, breaks)
@@ -846,6 +908,32 @@ fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
     SFun(_) -> (Completes, Stops)
     SAssign(target, value) -> inOrder([reach(value), reach(target)])
     SExpr(e) -> reach(e)
+    -- The value, and then either the pattern matches and the statement
+    -- completes, or the `else` block runs.
+    SLetElse(_, _, value, otherwise) -> {
+        let (_, elseBreaks) = reach(otherwise)
+        branch(reach(value), Completes, elseBreaks)
+    }
+}
+
+-- A condition list as the one arm it means. Returns the formulas of the value
+-- the arm's patterns match, which is evaluated before any of them is tried,
+-- and those of the arm: every later condition in order, and then `body`. When
+-- the list begins with a test, the arm matches `()` and every condition is a
+-- step of it.
+fun headReach(conditions : Vec Condition, body : Expr)
+        -> ((Completion, Completion), (Completion, Completion)) {
+    var test = (Completes, Stops)
+    let steps = Vec.new(len(conditions) + 1)
+    for var i = 0; i < len(conditions); i = i + 1 {
+        match conditions[i] {
+            CondLet(_, _, _, value) -> if i == 0 { test = reach(value) }
+                                       else { Vec.push(steps, reach(value)) }
+            CondTest(_, cond) -> Vec.push(steps, reach(cond))
+        }
+    }
+    Vec.push(steps, reach(body))
+    (test, inOrder(steps))
 }
 
 fun optReach(e : Option Expr) -> (Completion, Completion) = match e {

@@ -1,5 +1,5 @@
 export (
-    Level(..), File(..), Lines, Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
+    Level(..), File, Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
     file, finding, named, setLevel, denyWarnings, levelOf,
     begin, claim, owned, isOwn, runSyntactic, runTyped,
     report, countLine, chosen, rewrite, checkingFixes, checkOverlaps,
@@ -34,9 +34,10 @@ import Turkey.Typed (TypeTable)
 type Level = Allow | Warn | Deny
 
 --- One module as a check sees it: the path its spans name, the text it was
---- parsed from, and its tree. `lines` is that text split for `textOf` and
---- `charAt`, made the first time one of them asks.
+--- parsed from, and its tree (`file`).
 type File = File { path : String, text : String, program : Program, var lines : Option Lines }
+-- `lines` is `text` split for `textOf` and `charAt`, made the first time one
+-- of them asks; `file` is the only constructor, so it always matches `text`.
 
 --- Returns the module at `path`, parsed from `text` into `program`.
 fun file(path : String, text : String, program : Program) -> File =
@@ -305,10 +306,9 @@ fun overlaps(a : Span, b : Span) -> Bool {
 
 --- Applies `fixes` to the own modules they edit, and writes each module back.
 --- A file is edited from the text it was parsed from, which is what the
---- spans count in. Each file written is written back as it was if the
---- compile then exits through `Diag.exit` (`Diag.restoreOnExit`). Returns
---- why a file could not be written; the files written before it stay
---- registered.
+--- spans count in. Each file it writes, or tries to, is written back as it
+--- was if the compile then exits through `Diag.exit` (`Diag.restoreOnExit`).
+--- Returns why a file could not be written.
 fun rewrite(fixes : Vec (String, Fix)) -> Either String Unit {
     let byFile : Map String (Vec Edit) = Map.new()
     for (_, fix) in fixes {
@@ -325,20 +325,23 @@ fun rewrite(fixes : Vec (String, Fix)) -> Either String Unit {
             None -> continue
         }
         let made = Vec.map(edits, testing(f, _))
-        if let Left(e) = File.writeText(f.path, edited(linesIn(f), made)) { return Left(message(e)) }
+        -- Registered before the write, which truncates the file first, so a
+        -- write that fails part way is written back too.
         Diag.restoreOnExit(f.path, f.text)
+        if let Left(e) = File.writeText(f.path, edited(linesIn(f), made)) { return Left(message(e)) }
     }
     Right(())
 }
 
 -- `e`, or under `TURKEY_TEST_FIX` an edit that tests `--fix` itself: with
 -- `break`, one that leaves text no parser accepts, and with `repeat`, one
--- that writes back the text it replaces, so its finding is found again on
--- every pass. Checks are meant never to make either, so the driver's
--- answer to them cannot be tested any other way.
+-- that writes back the text it replaces with a space before it, so its
+-- finding is found again on every pass and each pass leaves different text.
+-- Checks are meant never to make either, so the driver's answer to them
+-- cannot be tested any other way.
 fun testing(f : File, e : Edit) -> Edit = match Env.get("TURKEY_TEST_FIX") {
     Some("break") -> Edit { span = e.span, text = e.text + " @" }
-    Some("repeat") -> Edit { span = e.span, text = textOf(f, e.span) }
+    Some("repeat") -> Edit { span = e.span, text = " " + textOf(f, e.span) }
     _ -> e
 }
 
@@ -399,8 +402,8 @@ fun checkOverlaps(found : Vec Reported) -> Unit {
 
 -- -- text ---------------------------------------------------------------------------
 
---- A text's code points, and where each line starts among them. Spans count
---- lines and columns from 1, in code points.
+-- A text's code points, and where each line starts among them. Spans count
+-- lines and columns from 1, in code points.
 type Lines = Lines { codes : Array Char, starts : Vec Int }
 
 -- `f`'s text split into lines, made once.

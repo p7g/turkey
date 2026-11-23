@@ -141,17 +141,20 @@ def test_a_fix_that_breaks_the_program_is_undone(program: Path) -> None:
     assert "parse error" in result.stderr
     assert result.stderr.endswith(
         "main.gob: internal error: the fixes of 'empty-return-value' made a program that"
-        " does not compile; the files they changed are restored\n")
+        " does not compile; writing back the files they changed\n")
     assert (program / "main.gob").read_text() == TWO_FINDINGS
 
 
 def test_fixes_that_never_settle_stop_at_the_cap(program: Path) -> None:
-    # `TURKEY_TEST_FIX=repeat` makes every fix write back what it replaces.
+    # `TURKEY_TEST_FIX=repeat` makes every fix write back what it replaces
+    # with a space before it, so each pass leaves a space more.
     result = turkey(program, "check", "--fix", "main.gob", TURKEY_TEST_FIX="repeat")
     assert result.returncode == 1
     assert result.stderr == ("main.gob: internal error: the fixes of 'empty-return-value'"
                              " still apply after 10 passes, so one undoes another\n")
-    assert (program / "main.gob").read_text() == TWO_FINDINGS
+    # The files are left as the tenth pass wrote them.
+    assert (program / "main.gob").read_text() == TWO_FINDINGS.replace(
+        "return {}", "return" + " " * 11 + "{}")
 
 
 def test_a_file_that_cannot_be_written_is_reported_as_such(program: Path) -> None:
@@ -161,7 +164,7 @@ def test_a_file_that_cannot_be_written_is_reported_as_such(program: Path) -> Non
     finally:
         (program / "main.gob").chmod(0o644)
     assert result.returncode == 2
-    assert "restored" not in result.stderr
+    assert "permission denied" in result.stderr.lower(), result.stderr
     assert (program / "main.gob").read_text() == TWO_FINDINGS
 
 

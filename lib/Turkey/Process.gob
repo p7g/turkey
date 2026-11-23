@@ -1,5 +1,5 @@
 export (
-    argsSet, argCount, argBytes, argLength, environment,
+    argsSet, argCount, argBytes, argLength, programBytes, environment,
     panic, panicString, panicInt, panicUnsigned, pending, panicked, panicMessage, panicClear,
     entryReturned, exit, exiting, exitStatus,
     workerRecord, traceCount, traceAddress, traceInner, traceLeftOut, traceHand,
@@ -25,8 +25,8 @@ export (
 --- initial value. The message is the panic's, and goes with its flag. Only
 --- what is set once the program runs is a global.
 ---
---- The layout, in bytes: the flag at 0, the argument count at 8, the argument
---- vector at 16, and the message from 24 to 272, NUL-terminated. Then the
+--- The layout, in bytes: the flag at 0, `main`'s `argc` at 8, its `argv` at
+--- 16, and the message from 24 to 272, NUL-terminated. Then the
 --- worker's own: the word its loops poll (`Turkey.Heap.poll`) at 272, the
 --- stack it is running (`Turkey.Stack`) at 280, its index
 --- among the workers (`Turkey.Coroutine`) at 288, the write barrier's
@@ -69,41 +69,58 @@ fun messageBytes() -> Int = 248
 
 -- -- the arguments --------------------------------------------------------------------
 
---- Record `main`'s arguments, dropping `argv[0]`, the program's own name.
+--- Records `main`'s `argc` and `argv`, or no arguments and no name if `argc` is
+--- below 1.
 fun argsSet(argc : Int, argv : Ptr) -> Unit {
     -- Not copied: `argv` belongs to the process and lives as long as it does,
     -- so what is kept is the pointer, and each argument's length is counted
     -- when it is asked for.
     let state = workerRecord()
     if argc >= 1 {
-        Ptr.store(state, argCountAt(), argc - 1)
-        Ptr.store(state, argVectorAt(), Ptr.add(argv, 8))
+        Ptr.store(state, argCountAt(), argc)
+        Ptr.store(state, argVectorAt(), argv)
     } else {
         Ptr.store(state, argCountAt(), 0)
         Ptr.store(state, argVectorAt(), Ptr.null())
     }
 }
 
---- How many arguments the program was given, its own name not among them.
-fun argCount() -> Int = Ptr.load(workerRecord(), argCountAt())
+-- `argv`, or null if `argc` was below 1.
+fun vector() -> Ptr = Ptr.load(workerRecord(), argVectorAt())
 
---- Argument `index`'s bytes, NUL-terminated. An index outside `0..argCount()`
---- is undefined, as any raw read is.
-fun argBytes(index : Int) -> Ptr =
-    Ptr.load(Ptr.load(workerRecord(), argVectorAt()), 8 * index)
+--- Returns how many arguments the program was given, its own name not among
+--- them.
+fun argCount() -> Int {
+    let argc : Int = Ptr.load(workerRecord(), argCountAt())
+    if argc == 0 { 0 } else { argc - 1 }
+}
+
+--- Returns argument `index`'s bytes, NUL-terminated, counting from the first
+--- argument after the program's name. An index outside `0..argCount()` is
+--- undefined, as any raw read is.
+fun argBytes(index : Int) -> Ptr = Ptr.load(vector(), 8 * (index + 1))
 
 fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
+
+--- Returns `argv[0]`'s bytes, NUL-terminated: the name the program was started
+--- by, whatever text its parent chose. Null if `main` was given an `argc` below
+--- 1.
+fun programBytes() -> Ptr {
+    let v = vector()
+    if Ptr.isNull(v) { return v }
+    Ptr.load(v, 0)
+}
 
 --- The environment the program started with: a NULL-terminated array of
 --- NUL-terminated `NAME=value` strings, or null if `main` was given an `argc`
 --- below 1, since it is found from the argument vector. Nothing in the program
 --- changes the environment, so the strings stay as they were.
 fun environment() -> Ptr {
-    let vector : Ptr = Ptr.load(workerRecord(), argVectorAt())
-    if Ptr.isNull(vector) { return vector }
-    -- The system lays it out right after `argv`'s own terminating null, so it
-    -- is found from the argument vector kept above, which points at `argv[1]`.
-    Ptr.add(vector, 8 * (argCount() + 1))
+    let v = vector()
+    if Ptr.isNull(v) { return v }
+    -- The system lays it out right after `argv`'s own terminating null.
+    let argc : Int = Ptr.load(workerRecord(), argCountAt())
+    Ptr.add(v, 8 * (argc + 1))
 }
 
 -- -- panicking --------------------------------------------------------------------------

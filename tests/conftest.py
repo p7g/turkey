@@ -4,10 +4,12 @@ import os
 # included, unless a test asks for more: the suite already runs a process per
 # core, and each spawning a worker per core as well would be that squared.
 os.environ.setdefault("TURKEY_WORKERS", "1")
-# The compiler checks its own name resolution, and the spans and comments of
-# every file it parses, on everything the suite compiles, the bootstrap included.
+# The compiler checks its own name resolution, the spans and comments of
+# every file it parses, and that no two of its checks' fixes overlap, on
+# everything the suite compiles, the bootstrap included.
 os.environ.setdefault("TURKEY_CHECK_BINDERS", "1")
 os.environ.setdefault("TURKEY_CHECK_SPANS", "1")
+os.environ.setdefault("TURKEY_CHECK_FIXES", "1")
 # The compiler under test is cached under the temporary directory, where no
 # `lib/` lies above it, so the suite names the library: `lib` relative to each
 # process's working directory, which is the repository root unless a test

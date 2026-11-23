@@ -26,6 +26,7 @@ export (execute, diffLimit)
 
 import Process (Output(..), Status(..))
 import Process as Process
+import System.File as File
 import System.IO (IOError)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
@@ -151,23 +152,57 @@ fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
     Right((Ran(finish(status, err)), Toolchain.text(stdout), warnings + err))
 }
 
--- Each of the case's dump stages, as `turkey check --dump STAGE` ended, its
--- stdout and its stderr.
+-- Each of the case's dump stages, as it ended, its stdout and its stderr:
+-- `turkey check --dump STAGE`, or for `fixed`, `turkey check --fix` (`runFix`).
 fun runDumps(t : Toolchain, actual : String, c : Case) -> Either String (Array (Finish, String, String)) {
     let out = []
     for (stage, _) in c.dumps {
-        let argv = t.run + [t.boot, "check", "--dump", stage, c.entry]
-        let limit = Toolchain.limit(t, defaultTimeout)
-        let ran = match Process.run(Toolchain.caseCommand(t, c, argv), Some(limit)) {
-            Right(ran) -> ran
-            Left(e) -> return Left("turkey did not start: " + Error.message(e))
+        let (finished, stdout, stderr) = match stage {
+            "fixed" -> runFix(t, actual, c)?
+            _ -> {
+                let argv = t.run + [t.boot, "check", "--dump", stage, c.entry]
+                let ran = runIn(t, c, argv, c.directory)?
+                let stderr = Toolchain.text(ran.stderr)
+                (finish(ran.status, stderr), Toolchain.text(ran.stdout), stderr)
+            }
         }
-        let stdout = Toolchain.text(ran.stdout)
-        let stderr = Toolchain.text(ran.stderr)
         record(actual, stage, stdout + stderr)
-        Vec.push(out, (finish(ran.status, stderr), stdout, stderr))
+        Vec.push(out, (finished, stdout, stderr))
     }
     Right(Vec.toArray(out))
+}
+
+-- `turkey check --fix` run on a copy of the case's sources under
+-- `ACTUAL/fixing/`: how it ended, and the entry as it left it, which is what
+-- the `fixed` golden holds. What it printed is kept as the actual result
+-- `fix-output` and compared with nothing: the fixed file is a case of its
+-- own, whose golden shows what is left in it.
+fun runFix(t : Toolchain, actual : String, c : Case) -> Either String (Finish, String, String) {
+    let work = actual + "/fixing"
+    let _ = File.removeTree(work)
+    for source in c.sources {
+        if let Left(e) = copy(c.directory + "/" + source, work + "/" + source) { return Left("cannot copy the case to fix it: " + Error.describe(e)) }
+    }
+    let ran = runIn(t, c, t.run + [t.boot, "check", "--fix", c.entry], work)?
+    let stderr = Toolchain.text(ran.stderr)
+    record(actual, "fix-output", Toolchain.text(ran.stdout) + stderr)
+    let fixed = match Files.readText(work + "/" + c.entry) {
+        Right(text) -> text
+        Left(e) -> return Left("cannot read the fixed case: " + Error.describe(e))
+    }
+    Right((finish(ran.status, stderr), fixed, ""))
+}
+
+fun copy(from : String, to : String) -> Either SomeError Unit = Files.writeText(to, Files.readText(from)?)
+
+-- `argv` run for case `c` in `directory`, with the case's environment.
+fun runIn(t : Toolchain, c : Case, argv : Array String, directory : String) -> Either String Output {
+    var command = Toolchain.command(t, argv, directory)
+    for (name, value) in c.environment { command = Process.withEnvironment(command, name, value) }
+    match Process.run(command, Some(Toolchain.limit(t, defaultTimeout))) {
+        Right(ran) -> Right(ran)
+        Left(e) -> Left("turkey did not start: " + Error.message(e))
+    }
 }
 
 -- How a process ended, given its stderr, where a panic is looked for.

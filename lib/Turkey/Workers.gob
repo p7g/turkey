@@ -263,7 +263,7 @@ fun started() -> Bool = Ptr.atomicLoad(control, 8) != 0
 --- here on its waits and calls are counted. Called once, before any other
 --- thread starts.
 fun mainRegister() -> Unit {
-    if Ptr.atomicLoad(control, 8) != 0 { return {} }
+    if Ptr.atomicLoad(control, 8) != 0 { return }
     Ptr.store(records, 0, Process.workerRecord())
     Ptr.atomicStore(control, 8, 1)
 }
@@ -377,7 +377,7 @@ fun stoppedOrHeld(i : Int) -> Bool {
 --- Let the other threads go again, and wait until every one that stopped is
 --- running before another collection may stop them.
 fun startTheWorld() -> Unit {
-    if Ptr.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return }
     let n = count()
     let me = index()
     for var i = 0; i < n; i = plus(i, 1) {
@@ -429,7 +429,7 @@ fun stopped(i : Int) -> Bool = (Ptr.atomicLoad(states, 8 * i) & 7) == stoppedSta
 --- frames and the caller's frame record at `frame`: from here a collection may
 --- run without this thread stopping.
 fun blockEnter(frame : Ptr) -> Unit {
-    if Ptr.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return }
     parkAt(frame)
     let at = mine()
     Ptr.atomicStore(states, at, plus(Ptr.atomicLoad(states, at), waitingState))
@@ -439,7 +439,7 @@ fun blockEnter(frame : Ptr) -> Unit {
 fun blockExit() -> Unit {
     while True {
         let epoch = collectionSeen()
-        if unblock() { return {} }
+        if unblock() { return }
         -- Held by a collection or the monitor, which bump the epoch when they
         -- let go.
         sleepForCollection(epoch)
@@ -464,7 +464,7 @@ fun unblock() -> Bool {
 -- of a file; the constants are literals here and in `callExit` so that
 -- neither loads them from a global (`states` lays them out).
 fun callEnter(frame : Ptr) -> Unit {
-    if Ptr.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return }
     parkAt(frame)
     let at = mine()
     -- `callStep` plus `callingState`.
@@ -475,13 +475,13 @@ fun callEnter(frame : Ptr) -> Unit {
 -- holding a permit if it can (`permitRegain`). A call back before the monitor
 -- took its permit costs one compare-and-swap.
 fun callExit() -> Unit {
-    if Ptr.atomicLoad(control, 8) == 0 { return {} }
+    if Ptr.atomicLoad(control, 8) == 0 { return }
     let at = mine()
     let s = Ptr.atomicLoad(states, at)
     -- Still calling, with the permit (the low four bits are `callingState`).
     if (s & 15) == 4 && Ptr.atomicCas(states, at, s, Int.subWrapping(s, 4)) == s {
         parkAt(Ptr.null())
-        return {}
+        return
     }
     blockExit()
     if !permitHeld() { permitRegain() }
@@ -513,7 +513,7 @@ fun parkAt(frame : Ptr) -> Unit {
 -- holds it, so that a holder that allocates -- and so may collect -- never
 -- waits on a thread that is waiting on it.
 foreign "turkey_lock_acquire" fun acquire(mutex : Ptr) -> Unit {
-    if Lock.tryAcquire(mutex) { return {} }
+    if Lock.tryAcquire(mutex) { return }
     blockEnter(Prim.frameAddress())
     Lock.acquire(mutex)
     blockExit()
@@ -586,9 +586,9 @@ fun permitFree(program : Bool) -> Bool =
 -- does so before bumping the epoch, so the sleeper either sees the permit or
 -- sleeps on an epoch that has moved.
 foreign "turkey_permit_await" fun permitAwait(program : Bool) -> Unit {
-    if permitHeld() { return {} }
+    if permitHeld() { return }
     if !program { handingDone() }
-    if permitTake(program) { return {} }
+    if permitTake(program) { return }
     let epoch = if program { wantEpochAt } else { spareEpochAt }
     if program {
         Ptr.atomicStore(permitWords, wantedAt, 1)
@@ -1128,7 +1128,7 @@ fun watchPid(pid : Int, token : Int) -> Int {
 --- Drop interest in `fd`, both directions, ignoring that there may be none.
 --- Before it is closed, on Linux (see above).
 fun pollForget(fd : Int) -> Unit {
-    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return }
     match Target.os {
         Darwin -> {
             let _ = change(Sys.filterRead(), fd, Sys.evDelete, 0, 0)
@@ -1143,7 +1143,7 @@ fun pollForget(fd : Int) -> Unit {
 --- watched it, ignoring that it may have fired or never been registered:
 --- the caller does this once the child's result has been delivered, too.
 fun pollForgetChild(pid : Int, token : Int) -> Unit {
-    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return }
     match Target.os {
         Darwin -> { let _ = change(Sys.filterProc(), pid, Sys.evDelete, 0, 0) }
         Linux -> {
@@ -1238,10 +1238,10 @@ fun interest() -> Int = Ptr.atomicLoad(signals, interestAt)
 --- event that a wait takes whenever it comes, so one sent a moment after the
 --- wait ended wakes the next wait early, which is harmless.
 fun wakePoller() -> Unit {
-    if Ptr.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Ptr.atomicLoad(poller, stateAt) != 2 { return }
     -- Only the signaller that sets word 48 sends the break, and a send that
     -- fails clears the word again so that the next signaller tries.
-    if Ptr.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return {} }
+    if Ptr.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return }
     let failed = match Target.os {
         Darwin -> change(Sys.filterUser(), 0, 0, Sys.noteTrigger, 0) < 0
         -- `EAGAIN` is a counter that cannot take another 1: a break is
@@ -1739,13 +1739,13 @@ foreign "turkey_blocking_sleep_on" fun blockingSleepOn(word : Ptr, value : Int,
 -- flag is word 0 of a record, and the message bytes 24 to 272.
 foreign "turkey_worker_ended" fun ended() -> Unit {
     let mine = Process.workerRecord()
-    if Ptr.load(mine, 0) == 0 { return {} }
+    if Ptr.load(mine, 0) == 0 { return }
     -- Down first: every call below returns to a test of it.
     Ptr.store(mine, 0, 0)
     let first = recordOf(0)
     -- The message before the flag, which the main worker may act on at once.
     -- One that is unwinding already keeps its own.
-    if Ptr.atomicLoad(first, 0) != 0 { return {} }
+    if Ptr.atomicLoad(first, 0) != 0 { return }
     for var at = 24; at < 272; at = plus(at, 8) {
         Ptr.store(first, at, Ptr.load(mine, at) : Int)
     }

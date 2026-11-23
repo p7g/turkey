@@ -1,0 +1,200 @@
+export (registry)
+
+--- The checks a compile runs (`Turkey.Lint`), each with its default level.
+---
+--- Keep the set that is on by default small. A check most code would turn off
+--- should not be a check, and there is no project file to turn one off in.
+
+import Turkey.Ast (Expr(..), ExprKind(..), Pat(..), PatKind(..), Stmt(..), Child(..),
+                   FunDecl(..), children, exprChildren, completes, stmtCompletion,
+                   isShorthand, sketch)
+import Turkey.Lint (Check(..), Tier(..), Level(..), File, Finding(..), Fix(..), Edit(..), finding)
+import Turkey.Lint as Lint
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Typed (TypeTable)
+import Turkey.Typed as Typed
+
+--- Every check, in the order findings at one place are printed.
+let registry : Array Check = [
+    Check { name = "empty-return-value", level = Warn, tier = BeforeDesugar(emptyReturnValue) },
+    Check { name = "ambiguous-underscore", level = Warn, tier = BeforeDesugar(ambiguousUnderscore) },
+    Check { name = "unreachable-code", level = Warn, tier = AfterChecking(unreachableCode) },
+]
+
+-- -- empty-return-value -------------------------------------------------------------
+--
+-- `return {}` and `return ()` are a bare `return` with a token more, and the
+-- same goes for `break`. The parser gives the three spellings three trees, so
+-- the formatter, which may change only what leaves the tree as it is, cannot
+-- make this rewrite.
+
+fun emptyReturnValue(f : File) -> Vec Finding {
+    let out = []
+    Lint.nodes(f, fun(c) {
+        if let ChExpr(e) = c {
+            match e.kind {
+                EReturn(Some(value)) -> emptyValue(f, e, "return", value, out)
+                EBreak(Some(value)) -> emptyValue(f, e, "break", value, out)
+                _ -> {}
+            }
+        }
+        True
+    })
+    out
+}
+
+fun emptyValue(f : File, e : Expr, keyword : String, value : Expr, out : Vec Finding) -> Unit {
+    let written = match value.kind {
+        EUnit -> "()"
+        EBlock(stmts) -> if len(stmts) == 0 { "{}" } else { return }
+        _ -> return
+    }
+    let start = e.span
+    -- A node the parser wrote has an empty span and no text to edit.
+    if Source.isEmpty(start) || Source.isEmpty(value.span) { return }
+    let keywordEnd = start.col + String.codePointCount(keyword)
+    if Lint.textOf(f, Source.endingAt(start, start.line, keywordEnd)) != keyword { return }
+    -- The node's own span ends at its last token, so it covers grouping
+    -- parentheses around the value, which the value's span does not.
+    let gap = Span { line = start.line, col = keywordEnd, endLine = start.endLine,
+                     endCol = start.endCol, file = start.file, inlined = None }
+    -- The fix deletes the value and the space before it. A comment inside
+    -- the value is not in the tree, so the fix is mechanical only when the
+    -- text it deletes is the value, perhaps in parentheses, and whitespace.
+    let deleted = Lint.textOf(f, gap)
+    let shown = if String.contains(deleted, "\n") {
+        if written == "{}" { "the empty block" } else { "the value" }
+    } else {
+        "'" + String.trim(deleted) + "'"
+    }
+    let fix = Fix { edits = [Edit { span = gap, text = "" }],
+                    mechanical = unwrapped(squeezed(deleted)) == written }
+    Vec.push(out, Finding {
+        span = value.span,
+        message = "a bare '" + keyword + "' already means '" + keyword + " ()'; remove " + shown,
+        fix = Some(fix),
+    })
+}
+
+-- `text` without grouping parentheses around the whole of it.
+fun unwrapped(text : String) -> String {
+    if text == "()" { return text }
+    let Some(opened) = String.stripPrefix(text, "(") else { return text }
+    let Some(inner) = String.stripSuffix(opened, ")") else { return text }
+    unwrapped(inner)
+}
+
+-- `text` without its whitespace.
+fun squeezed(text : String) -> String {
+    let kept = []
+    for c in String.codePoints(text) {
+        if !Char.isSpace(c) { Vec.push(kept, c) }
+    }
+    String.fromCodePoints(kept)
+}
+
+-- -- ambiguous-underscore -----------------------------------------------------------
+--
+-- In `fun(_) = lookup(_, table)` the parameter `_` binds nothing, and the
+-- body's `_` makes `lookup(_, table)` a function of its own, so the element
+-- is dropped and the result is a function. A reader, and most often the
+-- author, takes the second `_` for the first.
+--
+-- A `\` says outright which function a `_` belongs to, so a `_` it owns is
+-- not reported. Neither is one inside a nested `fun`: that function has
+-- parameters of its own, and is checked by itself. Only a parameter that is
+-- `_` as a whole counts. A `_` inside a parameter's pattern, as in
+-- `fun((k, _)) = ...`, or in a `match` arm or a `let` in the body, reads as a
+-- part ignored, not as a name the body could mean.
+
+fun ambiguousUnderscore(f : File) -> Vec Finding {
+    let out = []
+    Lint.nodes(f, fun(c) {
+        match c {
+            ChExpr(e) -> if let ELambda(params, _, body) = e.kind {
+                if Iter.any(params, isWildcard) { placeholdersIn(f, body, out) }
+            }
+            ChFun(d) -> if let Some(body) = d.body {
+                if Iter.any(d.params, isWildcard) { placeholdersIn(f, body, out) }
+            }
+            _ -> {}
+        }
+        True
+    })
+    out
+}
+
+fun isWildcard(p : Pat) -> Bool = match p.kind {
+    PWild -> True
+    PAnnot(inner, _) -> isWildcard(inner)
+    _ -> False
+}
+
+-- Reports the `_` of every function `_` made in `body`, outside a nested
+-- `fun` and outside a `\`.
+fun placeholdersIn(f : File, body : Expr, out : Vec Finding) -> Unit {
+    walkBody(f, ChExpr(body), out)
+}
+
+fun walkBody(f : File, c : Child, out : Vec Finding) -> Unit {
+    match c {
+        ChFun(_) -> return
+        ChExpr(e) -> if let ELambda(params, _, inner) = e.kind {
+            if !isShorthand(e) || Lint.charAt(f, e.span) == Some('\\') { return }
+            if let PVar(name) = params[0].kind {
+                if let Some(placeholder) = reference(inner, name) {
+                    Vec.push(out, finding(placeholder.span,
+                        "this '_' makes '" + sketch(e) + "', and is not the parameter '_', "
+                        + "which binds nothing; name the parameter to use it, or write '\\' "
+                        + "where the function starts if the function is meant"))
+                }
+            }
+        }
+        _ -> {}
+    }
+    for child in children(c) { walkBody(f, child, out) }
+}
+
+-- The reference to `name` in `e`, found outermost first.
+fun reference(e : Expr, name : String) -> Option Expr {
+    if let EVar(n, _) = e.kind {
+        if n == name { return Some(e) }
+    }
+    for child in exprChildren(e) {
+        let found = match child {
+            ChExpr(x) -> reference(x, name)
+            _ -> None
+        }
+        if let Some(x) = found { return Some(x) }
+    }
+    None
+}
+
+-- -- unreachable-code ---------------------------------------------------------------
+--
+-- A statement after one that cannot complete never runs. One finding for each
+-- run of such statements, at its first. Whether a call returns is a question
+-- about its callee's type, which is why this check waits for types.
+
+fun unreachableCode(f : File, types : TypeTable) -> Vec Finding {
+    let out = []
+    Lint.nodes(f, fun(c) {
+        if let ChExpr(e) = c {
+            if let EBlock(stmts) = e.kind { unreachableIn(stmts, types, out) }
+        }
+        True
+    })
+    out
+}
+
+fun unreachableIn(stmts : Vec Stmt, types : TypeTable, out : Vec Finding) -> Unit {
+    for var i = 0; i + 1 < len(stmts); i = i + 1 {
+        if !completes(stmtCompletion(stmts[i]), Typed.canReturn(types, _)) {
+            Vec.push(out, finding(stmts[i + 1].span,
+                "this statement is unreachable, since the one before it cannot "
+                + "complete; remove it"))
+            return
+        }
+    }
+}

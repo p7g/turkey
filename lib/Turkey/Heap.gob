@@ -927,7 +927,7 @@ fun stopAsked() -> Bool = Ptr.atomicLoad(Process.workerRecord(), 272) & 1 != 0
 -- Not while the worker is blocked or stopped: the loop is then one of
 -- `Turkey.Workers`' own, waiting on the protocol a stop would re-enter.
 foreign "turkey_poll" fun poll() -> Unit {
-    if !Workers.running() { return {} }
+    if !Workers.running() { return }
     if stopAsked() { stopAt(Prim.frameAddress()) }
     if stress {
         -- A loop can poll once per byte it copies, so only one poll in
@@ -990,7 +990,7 @@ foreign "turkey_root_enter" fun rootEnter(pointer : Ptr, values : Ptr,
                                           count : Int, functionName : Ptr) -> Unit {
     if Ptr.isNull(pointer) || Ptr.isNull(values) || count < 0 {
         Process.panic(Prim.cString("invalid root frame size"))
-        return {}
+        return
     }
     Ptr.store(pointer, 0, roots)
     Ptr.store(pointer, 8, functionName)
@@ -1003,7 +1003,7 @@ foreign "turkey_root_enter" fun rootEnter(pointer : Ptr, values : Ptr,
 foreign "turkey_root_leave" fun rootLeave(pointer : Ptr) -> Unit {
     if Ptr.isNull(pointer) || roots != pointer {
         Process.panic(Prim.cString("unbalanced root frame"))
-        return {}
+        return
     }
     roots = Ptr.load(pointer, 0)
 }
@@ -1064,13 +1064,13 @@ fun isStatic(value : Ptr) -> Bool = below(Int.subWrapping(Ptr.toInt(value), stat
 -- loader never writes it. Adding `base` back and sorting once here is what
 -- makes the lookup a binary search on the address itself.
 foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> Unit {
-    if Ptr.isNull(table) { return {} }
+    if Ptr.isNull(table) { return }
     let count = Ptr.load32(table, 0)
-    if count <= 0 { return {} }
+    if count <= 0 { return }
     let entries = Libc.malloc(entryBytes * count)
     if Ptr.isNull(entries) {
         Process.panic(Prim.cString("out of memory"))
-        return {}
+        return
     }
     var p = Ptr.add(table, 4)
     for var i = 0; i < count; i = i + 1 {
@@ -1126,7 +1126,7 @@ fun siftDown(entries : Ptr, first : Int, count : Int) -> Unit {
         if child + 1 < count && below(entryKey(entries, child), entryKey(entries, child + 1)) {
             child = child + 1
         }
-        if !below(entryKey(entries, root), entryKey(entries, child)) { return {} }
+        if !below(entryKey(entries, root), entryKey(entries, child)) { return }
         swapEntries(entries, root, child)
         root = child
     }
@@ -1163,7 +1163,7 @@ fun frameEntryFor(retaddr : Int) -> Ptr {
 -- a use after free, and a fault where the C library has returned the region
 -- to the system.
 fun stackTasks(frame : Ptr) -> Unit {
-    if frameEntryCount == 0 { return {} }
+    if frameEntryCount == 0 { return }
     -- Skipped below even with a null `frame`: the running stack's record may
     -- describe a stack that is gone. The thread that ran the program's own
     -- code exits when that code returns, and the main thread then collects
@@ -1176,7 +1176,7 @@ fun stackTasks(frame : Ptr) -> Unit {
             -- walk runs off the end; not scanning drops live roots silently,
             -- which is worse. So say so instead of doing either.
             Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
-            return {}
+            return
         }
         addTask(taskStack, frame, Stack.high(running))
     }
@@ -1209,7 +1209,7 @@ fun scanStack(frame : Ptr, high : Ptr) -> Unit {
         let record = Ptr.fromInt(here)
         let next : Int = Ptr.load(record, 0)
         if !below(here, next) || below(top, next + 16) || next & 7 != 0 {
-            return {}
+            return
         }
         let entry = frameEntryFor(Ptr.load(record, 8))
         if !Ptr.isNull(entry) {
@@ -1264,7 +1264,7 @@ fun immediate(value : Ptr) -> Bool = below(Ptr.toInt(value), immediates)
 -- yet marked, and push it on the running worker's stack. `what` null means a
 -- root the caller cannot name.
 fun markGrey(value : Ptr, what : Ptr, index : Int) -> Unit {
-    if immediate(value) || isStatic(value) { return {} }
+    if immediate(value) || isStatic(value) { return }
     -- Exact roots and object descriptors make the header O(1) to find in normal
     -- execution. GC stress checks membership, and it earns the cost: a pointer
     -- that is not in the heap means a root was missed or a descriptor is
@@ -1272,15 +1272,15 @@ fun markGrey(value : Ptr, what : Ptr, index : Int) -> Unit {
     -- first collection.
     if stress && Ptr.isNull(findObject(value)) {
         notHeapPointer(value, what, index)
-        return {}
+        return
     }
     let region = regionOf(value)
     let slot = slotOf(region, value)
     let at = plus(regionMarked, times8(slot >> 6))
     -- Most roots are marked already, by the time a collection's later tasks
     -- reach them.
-    if Ptr.load(region, at) & bit(slot) != 0 { return {} }
-    if !claim(region, at, bit(slot), value, sharing) { return {} }
+    if Ptr.load(region, at) & bit(slot) != 0 { return }
+    if !claim(region, at, bit(slot), value, sharing) { return }
     push(value)
 }
 
@@ -1320,7 +1320,7 @@ fun promote(object : Ptr) -> Unit =
 fun push(entry : Ptr) -> Unit {
     let m = marker()
     let count : Int = Ptr.load(m, 8)
-    if count == Ptr.load(m, 16) && !growMarkStack(m) { return {} }
+    if count == Ptr.load(m, 16) && !growMarkStack(m) { return }
     Ptr.store(Ptr.load(m, 0), times8(count), entry)
     Ptr.store(m, 8, plus(count, 1))
 }
@@ -1366,9 +1366,9 @@ foreign "turkey_write_barrier" fun writeBarrier(parent : Ptr) -> Unit {
     -- the whole header, whose other bytes nothing changes once the object is
     -- built, and it writes them back as they were.
     let header : Int = Ptr.load(parent, 0)
-    if header & 255 != old { return {} }
+    if header & 255 != old { return }
     let remembered = header & complement(255) | rememberedOld
-    if Ptr.atomicCas(parent, 0, header, remembered) != header { return {} }
+    if Ptr.atomicCas(parent, 0, header, remembered) != header { return }
     remember(parent)
     let _ = Ptr.atomicAdd(statsCounts, statsRememberedAt, 1)
 }
@@ -1381,7 +1381,7 @@ fun remember(parent : Ptr) -> Unit {
         let grown = Libc.realloc(remembered(), 8 * capacity)
         if Ptr.isNull(grown) {
             Process.panic(Prim.cString("out of memory"))
-            return {}
+            return
         }
         rememberedSet(grown)
         rememberedCapacitySet(capacity)
@@ -1460,7 +1460,7 @@ fun drain() -> Unit {
                 Ptr.store(m, 8, top)
                 if !growMarkStack(m) {
                     Ptr.store(m, 8, 0)
-                    return {}
+                    return
                 }
                 stack = Ptr.load(m, 0)
                 capacity = Ptr.load(m, 16)
@@ -1500,7 +1500,7 @@ fun drain() -> Unit {
                             Ptr.store(m, 8, top)
                             if !growMarkStack(m) {
                                 Ptr.store(m, 8, 0)
-                                return {}
+                                return
                             }
                             stack = Ptr.load(m, 0)
                             capacity = Ptr.load(m, 16)
@@ -1678,7 +1678,7 @@ fun addTask(kind : Int, a : Ptr, b : Ptr) -> Unit {
         let grown = Libc.realloc(tasks, 24 * capacity)
         if Ptr.isNull(grown) {
             markFailed(Prim.cString("out of memory"))
-            return {}
+            return
         }
         tasks = grown
         taskCapacity = capacity
@@ -1699,7 +1699,7 @@ fun mark() -> Unit {
         run(i)
         drain()
     }
-    if !sharing { return {} }
+    if !sharing { return }
     while take() || waitForWork() { drain() }
 }
 
@@ -1906,7 +1906,7 @@ fun fieldName(kind : Int) -> Ptr =
 -- a compiler emitting roots for the first time needs to know which.
 fun notHeapPointer(value : Ptr, what : Ptr, index : Int) -> Unit {
     -- The first marker to find one reports it, in the one text buffer.
-    if Ptr.atomicCas(marking, failedAt, 0, 1) != 0 { return {} }
+    if Ptr.atomicCas(marking, failedAt, 0, 1) != 0 { return }
     textLength = 0
     if Ptr.isNull(what) {
         put(Prim.cString("GC root or field"))
@@ -1937,7 +1937,7 @@ type Asked = Due | Full | Minor
 -- A collection, with every other worker stopped. If another worker is
 -- stopping them already, it collects and this one does not.
 fun collectFrom(frame : Ptr, asked : Asked) -> Unit {
-    if !Workers.stopTheWorld() { return {} }
+    if !Workers.stopTheWorld() { return }
     collectStopped(frame, asked)
     Workers.startTheWorld()
 }
@@ -1963,7 +1963,7 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
         rememberedCountSet(0)
     }
     markFrom(frame)
-    if Process.pending() { return {} }
+    if Process.pending() { return }
     let marked = if wanted { nanoseconds() } else { 0 }
     if verify { verifyAt(Check.BeforeSweeping, frame) }
     sweep()
@@ -2131,7 +2131,7 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 
 -- The run's totals, when TURKEY_GC_STATS asked for them.
 foreign "turkey_gc_report" fun report() -> Unit {
-    if !statsWanted { return {} }
+    if !statsWanted { return }
     -- With the world stopped, as a collection retires: other workers may
     -- still be allocating, and the monitor retiring a blocked one's cursors.
     -- When another worker is collecting, it waits for this one to stop, and

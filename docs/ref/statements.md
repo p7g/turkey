@@ -44,8 +44,8 @@ A statement **cannot complete** when no way of running it reaches its end: a
 `break`s; an `if` with an `else`, or a `match`, none of whose branches can
 complete; or any statement that evaluates one of these on every way through
 it. The statements after it are unreachable and never run, and the compiler
-warns about them. The block never produces a value, so it has any type, as
-`return` does:
+warns about them ([`unreachable-code`](README.md#warnings)). The block never
+produces a value, so it has any type, as `return` does:
 
 <!-- run -->
 ```kotlin

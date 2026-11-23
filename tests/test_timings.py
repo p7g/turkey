@@ -5,7 +5,7 @@ import re
 
 from tests import bootc
 
-PHASES = ["check", "lower", "mono", "opt", "ssa", "select", "backend", "tables"]
+PHASES = ["check", "lower", "lint", "mono", "opt", "ssa", "select", "backend", "tables"]
 
 
 def test_timings_name_every_phase_in_order():

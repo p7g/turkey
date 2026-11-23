@@ -1,0 +1,471 @@
+export (
+    Level(..), File, Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
+    file, finding, named, setLevel, denyWarnings, levelOf,
+    begin, claim, owned, isOwn, runSyntactic, runTyped,
+    report, countLine, chosen, rewrite, checkingFixes, checkOverlaps,
+    textOf, charAt, nodes,
+)
+
+--- Checks: advice about a program that compiles, which a compile prints and
+--- does not stop for unless a level says to.
+---
+--- A check is a value -- a name, a default level and a function -- and the
+--- runners here run every check of a registry they are handed, so a check is
+--- written once and run by whatever drives it. A check sees one module at one
+--- of two points (`Tier`), and returns what it found, each finding with the
+--- text edits that would resolve it if the check knows them.
+---
+--- Checks run on *own code* only: the modules the driver `claim`s, which are
+--- the ones resolved from the root being built. Nothing is reported at a
+--- place in any other module.
+
+import Data.Set as Set
+import System.Env as Env
+import System.File as File
+import System.IO as IO
+import Turkey.Ast (Program(..), Decl(..), Child(..), children)
+import Turkey.Diag as Diag
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Typed (TypeTable)
+
+--- `Allow` drops a check's findings, `Warn` prints them, and `Deny` prints
+--- them as errors, which fail the compile.
+type Level = Allow | Warn | Deny
+
+--- One module as a check sees it: the path its spans name, the text it was
+--- parsed from, and its tree (`file`).
+type File = File { path : String, text : String, program : Program, var lines : Option Lines }
+-- `lines` is `text` split for `textOf` and `charAt`, made the first time one
+-- of them asks; `file` is the only constructor, so it always matches `text`.
+
+--- Returns the module at `path`, parsed from `text` into `program`.
+fun file(path : String, text : String, program : Program) -> File =
+    File { path = path, text = text, program = program, lines = None }
+
+--- When a check runs, and what it is given.
+---
+--- `BeforeDesugar` runs after resolution and before desugaring, on the tree
+--- as it was written, with every name resolved. Before desugaring, the binder
+--- of a `var` condition looks mutable, and so does a later `let` condition
+--- that shadows its name, and references from later conditions point at that
+--- binder; a check about mutability or captures has to allow for that.
+---
+--- `AfterChecking` runs once the whole program has passed every stage that
+--- can reject it, on the desugared tree, with the type of each node. Spans
+--- survive desugaring, so a finding still points at what the author wrote.
+type Tier
+    = BeforeDesugar(fun(File) -> Vec Finding)
+    | AfterChecking(fun(File, TypeTable) -> Vec Finding)
+
+--- A check: its name, in kebab-case, which is what the level flags take and
+--- what a finding is printed with; its level unless a flag says otherwise;
+--- and what it runs.
+type Check = Check { name : String, level : Level, tier : Tier }
+
+--- What a check found: where, what it says, and how to resolve it, if the
+--- check knows.
+type Finding = Finding { span : Span, message : String, fix : Option Fix }
+
+--- Text edits that resolve a finding, every one in the finding's file. A
+--- `mechanical` fix leaves what the program does unchanged and needs no
+--- judgment, and only such a fix is ever applied.
+type Fix = Fix { edits : Vec Edit, mechanical : Bool }
+
+--- Replaces the text `span` covers with `text`.
+type Edit = Edit { span : Span, text : String }
+
+--- A finding with the name of the check that found it and the level it is
+--- reported at.
+type Reported = Reported { check : String, level : Level, finding : Finding }
+
+--- Returns a finding with no fix.
+fun finding(span : Span, message : String) -> Finding =
+    Finding { span = span, message = message, fix = None }
+
+--- Returns the check in `registry` named `name`.
+fun named(registry : Array Check, name : String) -> Option Check {
+    for c in registry {
+        if c.name == name { return Some(c) }
+    }
+    None
+}
+
+-- -- levels -------------------------------------------------------------------------
+
+-- What the level flags set, by check name. The last flag for a name wins.
+var overrides : Map String Level = Map.new()
+
+-- Whether `--deny-warnings` was given.
+var warningsDenied = False
+
+--- Makes `level` the level of the check named `name` from now on.
+fun setLevel(name : String, level : Level) -> Unit = Map.put(overrides, name, level)
+
+--- Makes every check whose level is `Warn` report at `Deny` from now on.
+fun denyWarnings() -> Unit {
+    warningsDenied = True
+}
+
+--- Returns the level `c`'s findings in own code are reported at.
+fun levelOf(c : Check) -> Level = match Map.getOr(overrides, c.name, c.level) {
+    Warn -> if warningsDenied { Deny } else { Warn }
+    other -> other
+}
+
+-- -- running ------------------------------------------------------------------------
+--
+-- One run for the process, as `Turkey.Diag`'s collector is: a compile loads
+-- its modules a long way below the driver, and the front end runs on one
+-- thread.
+
+-- The modules claimed as own code since `begin`, in the order claimed.
+var own : Vec File = []
+
+-- Their paths.
+var ownPaths : Set.Set String = Set.new()
+
+-- What the syntactic checks found, held for `runTyped` to hand on with its
+-- own findings, since a program the front end then rejects reports none.
+var held : Vec Reported = []
+
+--- Starts a run: forgets every module claimed and every finding held.
+fun begin() -> Unit {
+    own = []
+    ownPaths = Set.new()
+    held = []
+}
+
+--- Makes `f` own code for this run.
+fun claim(f : File) -> Unit {
+    Vec.push(own, f)
+    Set.add(ownPaths, f.path)
+}
+
+--- Returns every module claimed since `begin`.
+fun owned() -> Vec File = own
+
+--- Returns whether the module at `path` has been claimed since `begin`.
+fun isOwn(path : String) -> Bool = Set.contains(ownPaths, path)
+
+--- Runs every `BeforeDesugar` check of `registry` on `f`, and holds what
+--- they find.
+fun runSyntactic(registry : Array Check, f : File) -> Unit {
+    for c in registry {
+        if let BeforeDesugar(run) = c.tier {
+            if runs(c) { collect(c, run(f), held) }
+        }
+    }
+}
+
+--- Runs every `AfterChecking` check of `registry` on every module claimed,
+--- and returns what they found with what the syntactic checks held.
+fun runTyped(registry : Array Check, types : TypeTable) -> Vec Reported {
+    let out = held
+    held = []
+    for f in own {
+        for c in registry {
+            if let AfterChecking(run) = c.tier {
+                if runs(c) { collect(c, run(f, types), out) }
+            }
+        }
+    }
+    out
+}
+
+-- Whether `c` is run at all. A check at `Allow` is not, except when the
+-- suite checks fixes, so that its fixes are checked too; its findings are
+-- then kept at `Allow`, which reports and fixes nothing.
+fun runs(c : Check) -> Bool = match levelOf(c) {
+    Allow -> checkingFixes()
+    _ -> True
+}
+
+-- Keeps the findings of `c` that are in own code.
+fun collect(c : Check, found : Vec Finding, into : Vec Reported) -> Unit {
+    let level = levelOf(c)
+    for f in found {
+        if isOwn(f.span.file) { Vec.push(into, Reported { check = c.name, level = level, finding = f }) }
+    }
+}
+
+-- -- reporting ----------------------------------------------------------------------
+
+--- Prints every finding of `found` not at `Allow` to stderr, in source order,
+--- then `countLine`'s line if there were any. Exits with status 1 if any was
+--- at `Deny`, and returns otherwise.
+fun report(found : Vec Reported) -> Unit {
+    let shown = Vec.filter(found, fun(r) = match r.level {
+        Allow -> False
+        _ -> True
+    })
+    if len(shown) == 0 { return }
+    -- Sorted by place, and stably, so two findings at one place keep the
+    -- order of the registry.
+    let ordered = Vec.sortByKey(shown, fun(r) = {
+        let s = r.finding.span
+        (s.file, (s.line, s.col))
+    })
+    var warnings = 0
+    var errors = 0
+    let out = String.builder()
+    for r in ordered {
+        let message = r.finding.message + " [" + r.check + "]"
+        let d = match r.level {
+            Deny -> {
+                errors = errors + 1
+                Diag.at("error", message, r.finding.span)
+            }
+            _ -> {
+                warnings = warnings + 1
+                Diag.warningAt(message, r.finding.span)
+            }
+        }
+        String.push(out, Diag.render(d, r.finding.span.file) + "\n")
+    }
+    String.push(out, countLine(errors, warnings) + "\n")
+    let _ = IO.writeText(IO.stderr(), String.build(out))
+    if errors > 0 { Diag.exit(1) }
+}
+
+--- Returns the line that ends a compile's findings: `2 warnings`, `1 error`,
+--- or `1 error, 2 warnings`.
+fun countLine(errors : Int, warnings : Int) -> String {
+    let parts = []
+    if errors > 0 { Vec.push(parts, counted(errors, "error")) }
+    if warnings > 0 { Vec.push(parts, counted(warnings, "warning")) }
+    String.join(parts, ", ")
+}
+
+fun counted(n : Int, noun : String) -> String =
+    Int.toString(n) + " " + noun + if n == 1 { "" } else { "s" }
+
+-- -- fixing -------------------------------------------------------------------------
+
+--- Returns the mechanical fixes among `found` that one pass of `--fix`
+--- applies, each with the name of its check.
+---
+--- They are taken in one total order: by where the fix starts, then the one
+--- covering more first, then by check name. A fix any of whose edits overlaps
+--- an edit already taken is skipped; the next pass finds it again, if it
+--- still applies to the text the taken fixes leave. Findings at `Allow` are
+--- not fixed.
+fun chosen(found : Vec Reported) -> Vec (String, Fix) {
+    let candidates = []
+    for r in found {
+        let fix = match (r.level, r.finding.fix) {
+            (Allow, _) -> continue
+            (_, Some(fix)) -> fix
+            (_, None) -> continue
+        }
+        if fix.mechanical && len(fix.edits) > 0 { Vec.push(candidates, (r.check, fix)) }
+    }
+    -- Ordering a containing fix ahead of what it contains lets the outer
+    -- rewrite win and the inner one be found again against the new text.
+    -- There are no exceptions for particular pairs of checks: a comparator
+    -- with one breaks the transitivity a sort needs.
+    let ordered = Vec.sortByKey(candidates, fun((name, fix)) = {
+        let s = hull(fix)
+        ((s.file, (s.line, s.col)), ((-s.endLine, -s.endCol), name))
+    })
+    let taken = []
+    let edits = []
+    for (name, fix) in ordered {
+        let clashes = Iter.any(fix.edits, fun(e) = Iter.any(edits, fun(t) = overlaps(e.span, t.span)))
+        if !clashes {
+            Vec.push(taken, (name, fix))
+            for e in fix.edits { Vec.push(edits, e) }
+        }
+    }
+    taken
+}
+
+-- The range from the earliest start of a fix's edits to the latest end.
+fun hull(fix : Fix) -> Span {
+    var s = fix.edits[0].span
+    for e in fix.edits {
+        if Source.before(e.span.line, e.span.col, s.line, s.col) {
+            s = Source.endingAt(e.span, s.endLine, s.endCol)
+        }
+        if Source.before(s.endLine, s.endCol, e.span.endLine, e.span.endCol) {
+            s = Source.endingAt(s, e.span.endLine, e.span.endCol)
+        }
+    }
+    s
+}
+
+-- Whether two edits touch the same text. Two that start at one place
+-- overlap even when either is empty, since which goes first would decide the
+-- result of two insertions there.
+fun overlaps(a : Span, b : Span) -> Bool {
+    if a.file != b.file { return False }
+    if a.line == b.line && a.col == b.col { return True }
+    Source.before(a.line, a.col, b.endLine, b.endCol)
+        && Source.before(b.line, b.col, a.endLine, a.endCol)
+}
+
+--- Applies `fixes` to the own modules they edit, and writes each module back.
+--- A file is edited from the text it was parsed from, which is what the
+--- spans count in. Each file it writes, or tries to, is written back as it
+--- was if the compile then exits through `Diag.exit` (`Diag.restoreOnExit`).
+--- Returns why a file could not be written.
+fun rewrite(fixes : Vec (String, Fix)) -> Either String Unit {
+    let byFile : Map String (Vec Edit) = Map.new()
+    for (_, fix) in fixes {
+        for e in fix.edits {
+            match Map.get(byFile, e.span.file) {
+                Some(edits) -> Vec.push(edits, e)
+                None -> Map.put(byFile, e.span.file, [e])
+            }
+        }
+    }
+    for f in own {
+        let edits = match Map.get(byFile, f.path) {
+            Some(edits) -> edits
+            None -> continue
+        }
+        let made = Vec.map(edits, testing(f, _))
+        -- Registered before the write, which truncates the file first, so a
+        -- write that fails part way is written back too.
+        Diag.restoreOnExit(f.path, f.text)
+        if let Left(e) = File.writeText(f.path, edited(linesIn(f), made)) { return Left(message(e)) }
+    }
+    Right(())
+}
+
+-- `e`, or under `TURKEY_TEST_FIX` an edit that tests `--fix` itself: with
+-- `break`, one that leaves text no parser accepts, and with `repeat`, one
+-- that writes back the text it replaces with a space before it, so its
+-- finding is found again on every pass and each pass leaves different text.
+-- Checks are meant never to make either, so the driver's answer to them
+-- cannot be tested any other way.
+fun testing(f : File, e : Edit) -> Edit = match Env.get("TURKEY_TEST_FIX") {
+    Some("break") -> Edit { span = e.span, text = e.text + " @" }
+    Some("repeat") -> Edit { span = e.span, text = " " + textOf(f, e.span) }
+    _ -> e
+}
+
+-- The text of `lines` with `edits` applied. No two of them overlap.
+fun edited(lines : Lines, edits : Vec Edit) -> String {
+    let ordered = Vec.sortByKey(edits, fun(e) = (e.span.line, e.span.col))
+    let out = []
+    var at = 0
+    for e in ordered {
+        let from = offset(lines, e.span.line, e.span.col)
+        for i in Int.range(at, from) { Vec.push(out, lines.codes[i]) }
+        for c in String.codePoints(e.text) { Vec.push(out, c) }
+        at = offset(lines, e.span.endLine, e.span.endCol)
+    }
+    for i in Int.range(at, len(lines.codes)) { Vec.push(out, lines.codes[i]) }
+    String.fromCodePoints(out)
+}
+
+-- -- the overlap check --------------------------------------------------------------
+
+--- Returns whether the test suite asked for every compile to check that no
+--- two fixes overlap (`TURKEY_CHECK_FIXES`). Off otherwise, since a clash is
+--- an internal error and only the checks' authors can do anything about it.
+fun checkingFixes() -> Bool = Option.isSome(Env.get("TURKEY_CHECK_FIXES"))
+
+--- Raises an internal error if two mechanical fixes among `found` have edits
+--- that overlap with neither containing the other.
+---
+--- Checks are scoped so that they never want the same text: where one's sites
+--- include another's, the more specific owns them and the general one skips
+--- them. A fix may contain another, which `chosen` orders. A partial overlap
+--- has no order that is right, so it is a bug in one of the two checks'
+--- scopes, fixed by narrowing one.
+fun checkOverlaps(found : Vec Reported) -> Unit {
+    let fixes = []
+    for r in found {
+        if let Some(fix) = r.finding.fix {
+            if fix.mechanical { Vec.push(fixes, (r.check, fix)) }
+        }
+    }
+    for i in Int.range(0, len(fixes)) {
+        for j in Int.range(i + 1, len(fixes)) {
+            let (nameA, a) = fixes[i]
+            let (nameB, b) = fixes[j]
+            for x in a.edits {
+                for y in b.edits {
+                    if overlaps(x.span, y.span) && !Source.contains(x.span, y.span)
+                       && !Source.contains(y.span, x.span) {
+                        Diag.fail(Diag.at("internal error", "the fixes of '" + nameA + "' and '"
+                                          + nameB + "' overlap here, and neither contains "
+                                          + "the other", y.span), y.span.file)
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- -- text ---------------------------------------------------------------------------
+
+-- A text's code points, and where each line starts among them. Spans count
+-- lines and columns from 1, in code points.
+type Lines = Lines { codes : Array Char, starts : Vec Int }
+
+-- `f`'s text split into lines, made once.
+fun linesIn(f : File) -> Lines = match f.lines {
+    Some(lines) -> lines
+    None -> {
+        let lines = linesOf(f.text)
+        f.lines = Some(lines)
+        lines
+    }
+}
+
+fun linesOf(text : String) -> Lines {
+    let codes = String.toCodePoints(text)
+    let starts = [0]
+    for i in Int.range(0, len(codes)) {
+        if codes[i] == '\n' { Vec.push(starts, i + 1) }
+    }
+    Lines { codes = codes, starts = starts }
+}
+
+-- Where `line:col` is among the code points, or the end of the text for a
+-- place past it.
+fun offset(lines : Lines, line : Int, col : Int) -> Int {
+    if line > len(lines.starts) { return len(lines.codes) }
+    let at = lines.starts[line - 1] + col - 1
+    if at > len(lines.codes) { len(lines.codes) } else { at }
+}
+
+--- Returns the text `span` covers in `f`.
+fun textOf(f : File, span : Span) -> String {
+    let lines = linesIn(f)
+    let from = offset(lines, span.line, span.col)
+    let to = offset(lines, span.endLine, span.endCol)
+    String.fromCodePoints(Array.slice(lines.codes, from, if to < from { from } else { to }))
+}
+
+--- Returns the character at the start of `span` in `f`, if there is one.
+fun charAt(f : File, span : Span) -> Option Char {
+    let lines = linesIn(f)
+    let at = offset(lines, span.line, span.col)
+    if at < len(lines.codes) { Some(lines.codes[at]) } else { None }
+}
+
+-- -- walking ------------------------------------------------------------------------
+
+--- Calls `visit` on every expression, statement, arm and function of `f`'s
+--- declarations, a node before what it contains, and goes into a node only if
+--- `visit` returns `True` for it.
+fun nodes(f : File, visit : fun(Child) -> Bool) -> Unit {
+    for d in f.program.decls {
+        match d {
+            DStmt(s) -> walk(ChStmt(s), visit)
+            DClass(c) -> for m in c.methods { walk(ChFun(m), visit) }
+            DInstance(i) -> for m in i.methods { walk(ChFun(m), visit) }
+            DType(_) | DForeign(_) | DInfix(_) -> {}
+        }
+    }
+}
+
+fun walk(c : Child, visit : fun(Child) -> Bool) -> Unit {
+    if visit(c) {
+        for child in children(c) { walk(child, visit) }
+    }
+}

@@ -111,6 +111,59 @@ building programs.
 
 The project README says how to build `turkey` itself.
 
+## Warnings
+
+`turkey build` and `turkey check` run *checks* on the program: advice about
+code that compiles but probably does not say what its author meant. Each
+finding is a warning, printed with the name of its check at the end, and the
+compile ends with a count of them:
+
+<!-- run -->
+```kotlin
+fun greet(name : String) -> Unit {
+    if name == "" { return {} }
+    print("hello, " + name)
+}
+
+fun main() {
+    greet("world")
+}
+```
+
+```text
+hello, world
+```
+
+<!-- stderr -->
+```text
+Main.gob:2:28: warning: a bare 'return' already means 'return ()'; remove '{}' [empty-return-value]
+1 warning
+```
+
+Every check has a *level*. At `allow` it is off, at `warn` its findings are
+printed, and at `deny` they are printed as errors, which fail the compile.
+Each check has a level of its own unless a flag sets one for the run:
+
+* `--allow NAME`, `--warn NAME` and `--deny NAME` set the level of the check
+  `NAME`. Each takes one name or a comma-separated list, and each may be given
+  more than once. When several flags name one check, the last one wins.
+* `--deny-warnings` makes every finding still at `warn` an error, which suits
+  a build that must stay clean.
+
+The checks run on the program's own modules only: the entry file and the
+modules found beside it. Nothing is reported inside the standard library.
+
+`turkey check --fix` writes the fixes that some checks know into the
+program's own files, where the fix cannot change what the program does. It
+checks the program again after each round of fixes, and then prints what is
+left.
+
+| Check | Level | What it finds |
+|---|---|---|
+| `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
+| `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
+| `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+
 ## For maintainers
 
 **Keeping it true.** Examples are checked mechanically. Each `kotlin` fence
@@ -122,7 +175,7 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- check -->` | Must compile. |
 | `<!-- error: TEXT -->` | Must be rejected, and the error message must contain `TEXT`. |
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
-| `<!-- stderr -->` | The next `text` fence is the exact standard error of the `panic` example before it: the panic and its trace. |
+| `<!-- stderr -->` | The next `text` fence is the exact standard error of the `run` or `panic` example before it: the compile's warnings, then the panic and its trace. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
 
 Every example is compiled and run by `turkey`, the way a reader who copies one

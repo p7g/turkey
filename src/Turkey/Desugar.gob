@@ -1,13 +1,18 @@
 export (program)
 
---- `?` and `do`, rewritten into `bind`.
+--- `?` and `do`, rewritten into `bind`, and the forms that mean a `match`.
 ---
---- Every other sugar in this language is a node the later stages interpret:
+--- Most sugar in this language is a node the later stages interpret:
 --- `a + b` carries the `add` it means, `for x in xs` carries its `iter` and
 --- `next`. `?` cannot be one of those, because what it binds is *the rest of the
 --- enclosing statement sequence*, and no node annotated in place can name that.
 --- So this is a pass, and it runs early enough that nothing downstream ever sees
 --- a `?`.
+---
+--- An `if` or `while` whose head is a condition list, and `let ... else`, are
+--- rewritten here too, into the `match` each one means, in a walk of their own
+--- that runs first. The `?` walk then sees only that `match`, so a `?` in one of
+--- them is lowered exactly as in a `match` written out.
 ---
 --- It runs *after* `Turkey.Resolve`, which buys two things. The code it moves
 --- into lambdas has already been resolved, so moving it cannot change what a
@@ -81,6 +86,7 @@ import Turkey.Diag as Diag
 import Turkey.Modules (Scope)
 import Turkey.Prelude as P
 import Turkey.Resolve as Resolve
+import Turkey.Source as Source
 import Turkey.Source (Span(..))
 
 -- -- state --------------------------------------------------------------------------
@@ -336,14 +342,17 @@ fun program(p : Program, scope : Scope, binders : Binders.Table) -> Unit {
         match decl {
             DClass(c) -> for m in c.methods {
                 enter(d, m.id, m.span)
+                matches(d, ChFun(m))
                 funBody(d, m)
             }
             DInstance(i) -> for m in i.methods {
                 enter(d, m.id, m.span)
+                matches(d, ChFun(m))
                 funBody(d, m)
             }
             DStmt(s) -> {
                 enter(d, s.id, s.span)
+                matches(d, ChStmt(s))
                 discard(walkStmt(d, s))
             }
             -- Nothing to desugar: a foreign declaration has no body, and its
@@ -469,6 +478,7 @@ fun split(d : D, stmts : Vec Stmt, i : Int, k : Cont, span : Span,
         }
         SFun(_) -> bug("'?' is not supported in this kind of statement yet",
                        s.span)
+        SLetElse(_, _, _, _) -> rewritten(s.span)
     }
 }
 
@@ -1144,6 +1154,7 @@ fun walkExpr(d : D, e : Expr) -> Expr {
         EBlock(stmts) -> for var i = 0; i < len(stmts); i = i + 1 {
             stmts[i] = walkStmt(d, stmts[i])
         }
+        EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
     }
     e
 }
@@ -1158,6 +1169,7 @@ fun walkStmt(d : D, s : Stmt) -> Stmt {
             s.kind = SAssign(walkExpr(d, target), walkExpr(d, value))
         }
         SExpr(e) -> { s.kind = SExpr(walkExpr(d, e)) }
+        SLetElse(_, _, _, _) -> rewritten(s.span)
     }
     s
 }
@@ -1179,6 +1191,231 @@ fun walkFields(d : D, fields : Vec (String, Expr)) -> Vec (String, Expr) {
     let out = Vec.new(len(fields))
     for (name, value) in fields { Vec.push(out, (name, walkExpr(d, value))) }
     out
+}
+
+-- -- the forms that mean a `match` ------------------------------------------------------
+
+-- Rewrite every condition list and `let ... else` under `c` into the `match`
+-- it means, in place. The node keeps its id and span. The nodes it is rewritten
+-- into are new, with empty spans, except the parts the author wrote, which are
+-- moved into them.
+fun matches(d : D, c : Child) -> Unit {
+    match c {
+        ChExpr(e) -> match e.kind {
+            -- `if c1, ..., cn { A } else { B }` is
+            --
+            --     match v { p if c2, ..., cn -> A, _ -> B }
+            --
+            -- when `c1` is `let p = v`, and `match () { _ if c1, ..., cn -> A,
+            -- _ -> B }` when it is a test. Without an `else`, `B` is `()`.
+            EIfLet(conditions, then, otherwise) -> {
+                let at = Source.emptyAt(e.span)
+                let (value, arm) = conditionArm(d, conditions, then, at)
+                let rest = match otherwise {
+                    Some(o) -> o
+                    None -> mkExpr(d, at, EUnit)
+                }
+                e.kind = EMatch(value, [arm, otherArm(d, at, rest)])
+            }
+            -- `while c1, ..., cn { B }` is `loop { match ... { A -> B, _ -> break } }`,
+            -- where `A` is the arm the conditions make, as for `if`. A condition
+            -- failing is what ends the loop.
+            EWhileLet(conditions, body) -> {
+                let at = Source.emptyAt(e.span)
+                let (value, arm) = conditionArm(d, conditions, body, at)
+                let m = mkExpr(d, at, EMatch(value, [
+                    arm, otherArm(d, at, mkExpr(d, at, EBreak(None))),
+                ]))
+                e.kind = ELoop(mkExpr(d, at, EBlock([mkStmt(d, at, SExpr(m))])))
+            }
+            _ -> {}
+        }
+        ChStmt(s) -> if let SLetElse(mutable, pat, value, otherwise) = s.kind {
+            s.kind = letElse(d, s, mutable, pat, value, otherwise)
+        }
+        _ -> {}
+    }
+    for child in children(c) { matches(d, child) }
+}
+
+-- `_ -> body`.
+fun otherArm(d : D, at : Span, body : Expr) -> Arm =
+    Arm { span = at, patterns = [mkPat(d, at, PWild)], guards = [], body = body }
+
+-- Returns the value a condition list's `match` inspects, and the one arm that
+-- runs `body` when every condition holds.
+--
+-- A variable a `var` condition binds is assignable in `body` and nowhere else.
+-- So the arm's pattern binds it immutably, and `body` begins with `var x = x`
+-- for each such name, in the order the conditions first bind them.
+-- `Turkey.Resolve` minted the assignable binder that `body` refers to, and the
+-- later conditions refer to it too. They run before the `var` is declared, so
+-- they and the pattern are given a new, immutable binder in its place.
+fun conditionArm(d : D, conditions : Vec Condition, body : Expr, at : Span)
+        -> (Expr, Arm) {
+    -- Each assignable binder, and the immutable one its pattern binds instead.
+    let copies : Map Int Int = Map.new()
+    -- Each name the conditions bind, and the binder the last of them gives it:
+    -- the one `body` sees.
+    let seen : Map String Int = Map.new()
+    let names : Vec String = []
+    for c in conditions {
+        if len(copies) > 0 { retarget(d, ChExpr(conditionExpr(c)), copies) }
+        if let CondLet(isVar, alts, _) = c {
+            for alt in alts {
+                for v in Vec.append(varPatterns(alt), laterOccurrences(alt)) {
+                    copyBinder(d, v, copies, seen)
+                }
+                if isVar {
+                    for name in patternVars(alt) {
+                        if !Vec.contains(names, name) { Vec.push(names, name) }
+                    }
+                }
+            }
+        }
+    }
+    var arm = body
+    if len(names) > 0 {
+        let stmts = []
+        for name in names {
+            let assignable = found(Map.get(seen, name), at)
+            let target = mkPat(d, at, PVar(name))
+            Binders.record(d.binders, target.id, assignable)
+            let source = mkExpr(d, at, EVar(name, False))
+            Binders.record(d.binders, source.id, found(Map.get(copies, assignable), at))
+            Vec.push(stmts, mkStmt(d, at, SVar(target, source)))
+        }
+        if let EBlock(inner) = body.kind {
+            for st in inner { Vec.push(stmts, st) }
+        }
+        arm = mkExpr(d, Source.emptyAt(body.span), EBlock(stmts))
+    }
+    let guards = Vec.map(conditions, fun(c) = match c {
+        CondTest(test) -> GTest(test)
+        CondLet(_, alts, value) -> GLet(alts, value)
+    })
+    match conditions[0] {
+        CondLet(_, alts, value) -> (value, Arm {
+            span = at, patterns = alts, guards = Vec.slice(guards, 1, len(guards)),
+            body = arm,
+        })
+        CondTest(_) -> (mkExpr(d, at, EUnit), Arm {
+            span = at, patterns = [mkPat(d, at, PWild)], guards = guards, body = arm,
+        })
+    }
+}
+
+-- Records in `seen` the binder the variable `v` binds, under its name. When
+-- that binder is assignable, rebinds `v` to the immutable binder `copies`
+-- holds for it, minting that binder if it is the first occurrence.
+fun copyBinder(d : D, v : Pat, copies : Map Int Int, seen : Map String Int) -> Unit {
+    let id = found(Map.get(d.binders.refs, v.id), v.span)
+    let b = Binders.binderAt(d.binders, id)
+    Map.put(seen, b.name, id)
+    if !b.mutable { return {} }
+    let copy = match Map.get(copies, id) {
+        Some(found) -> found
+        None -> {
+            let made = Binders.fresh(d.binders, d.owner, b.name, Local,
+                                     Written(v.span, False))
+            Map.put(copies, id, made)
+            made
+        }
+    }
+    Binders.record(d.binders, v.id, copy)
+}
+
+-- Records every reference under `c` to a binder in `copies` as a reference to
+-- the binder it maps to.
+fun retarget(d : D, c : Child, copies : Map Int Int) -> Unit {
+    if let ChExpr(e) = c {
+        if let EVar(_, _) = e.kind {
+            if let Some(id) = Map.get(d.binders.refs, e.id) {
+                if let Some(copy) = Map.get(copies, id) { Binders.record(d.binders, e.id, copy) }
+            }
+        }
+    }
+    for child in children(c) { retarget(d, child, copies) }
+}
+
+-- `let p = e else { B }` is
+--
+--     let (x, y) = match e { p -> (x, y), _ -> B }
+--
+-- for the names `p` binds, with a lone name in place of the tuple, or `_` for
+-- none, and `var` in place of `let` for `var p = e else { B }`.
+--
+-- The names are bound by a `let` of the block rather than by putting the rest
+-- of the block in the first arm. Desugaring `?` treats a statement of the block
+-- differently from one inside a branch, so nesting would change how every `?`
+-- after this statement is lowered.
+--
+-- `Turkey.Resolve` bound `p`'s variables for the rest of the block, so those
+-- binders go to the `let`'s pattern, and `p` is given new ones for the arm. At
+-- the top level the `let`'s are top-level binders, spelled by their internal
+-- names, and the arm's are local.
+fun letElse(d : D, s : Stmt, mutable : Bool, pat : Pat, value : Expr,
+            otherwise : Expr) -> StmtKind {
+    let at = Source.emptyAt(pat.span)
+    -- Each binder of the block, and the one the arm binds in its place.
+    let inner : Map Int Int = Map.new()
+    let bound = Vec.new(4)
+    let refs = Vec.new(4)
+    for v in varPatterns(pat) {
+        let outer = Binders.nameAt(d.binders, v.id, v.span)
+        let id = found(Map.get(d.binders.refs, v.id), v.span)
+        let spelled = match v.kind {
+            PVar(name) -> name
+            _ -> bug("Ast.varPatterns returned a pattern that is not a variable", v.span)
+        }
+        let target = mkPat(d, at, PVar(spelled))
+        Binders.record(d.binders, target.id, id)
+        Vec.push(bound, target)
+        let copy = armBinder(d, v, id, outer, inner)
+        let source = mkExpr(d, at, EVar(outer, False))
+        Binders.record(d.binders, source.id, copy)
+        Vec.push(refs, source)
+    }
+    for v in laterOccurrences(pat) {
+        let id = found(Map.get(d.binders.refs, v.id), v.span)
+        discard(armBinder(d, v, id, Binders.nameAt(d.binders, v.id, v.span), inner))
+    }
+    let (made, out) = match len(bound) {
+        0 -> (mkPat(d, at, PWild), mkExpr(d, at, EUnit))
+        1 -> (bound[0], refs[0])
+        _ -> (mkPat(d, at, PTuple(bound)), mkExpr(d, at, ETuple(refs)))
+    }
+    let elseAt = Source.emptyAt(otherwise.span)
+    let m = mkExpr(d, Source.emptyAt(s.span), EMatch(value, [
+        Arm { span = at, patterns = [pat], guards = [], body = out },
+        Arm { span = elseAt, patterns = [mkPat(d, elseAt, PWild)], guards = [],
+              body = otherwise },
+    ]))
+    if mutable { SVar(made, m) } else { SLet(made, m) }
+}
+
+-- Returns the binder `Turkey.Resolve` recorded, which only a compiler bug can
+-- have left out.
+fun found(id : Option Int, where : Span) -> Int = match id {
+    Some(x) -> x
+    None -> bug("no binder was recorded here", where)
+}
+
+-- Rebinds the variable `v` of a `let ... else` pattern, which binds `id`
+-- spelled `name` for the block, to the binder the arm binds in its place,
+-- minting that binder at its first occurrence. Returns it.
+fun armBinder(d : D, v : Pat, id : Int, name : String, inner : Map Int Int) -> Int {
+    let copy = match Map.get(inner, id) {
+        Some(found) -> found
+        None -> {
+            let made = Binders.fresh(d.binders, d.owner, name, Local, Written(v.span, False))
+            Map.put(inner, id, made)
+            made
+        }
+    }
+    v.kind = PVar(name)
+    Binders.record(d.binders, v.id, copy)
+    copy
 }
 
 -- -- brackets -----------------------------------------------------------------------
@@ -1231,6 +1468,7 @@ fun indexStmt(d : D, s : Stmt) -> Unit = match s.kind {
     SVar(_, value) -> indexExpr(d, value)
     SFun(f) -> indexFun(d, f)
     SExpr(e) -> indexExpr(d, e)
+    SLetElse(_, _, _, _) -> rewritten(s.span)
 }
 
 fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
@@ -1296,6 +1534,7 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
     EBlock(stmts) -> for s in stmts { indexStmt(d, s) }
     EQuestion(inner, _) -> indexExpr(d, inner)
     EDo(body) -> indexExpr(d, body)
+    EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
 }
 
 fun indexAll(d : D, xs : Vec Expr) -> Unit {
@@ -1323,5 +1562,10 @@ fun oops(message : String, where : Span) -> a =
 -- Raises a check that only a compiler bug can fail.
 fun bug(message : String, where : Span) -> a =
     Diag.fail(Diag.at("internal error", message, where), where.file)
+
+-- Raises the internal error for a node `matches` rewrites, found by a walk
+-- that runs after it.
+fun rewritten(where : Span) -> a =
+    bug("this form should have been rewritten into a 'match' already", where)
 
 fun discard(x : a) -> Unit = {}

@@ -217,8 +217,8 @@ fun setNoRecord(p : P, flag : Bool) -> Bool {
 -- A node the source writes spans from the start it is given to the end of the
 -- last token read. So `mkExpr` and the others below build a node only once its
 -- last token has been read, and a node built any earlier would be cut short.
--- A node the parser writes itself, such as the wildcard arm of an `if let`
--- or the method a `-` means, covers no text: the `made` forms give it an
+-- A node the parser writes itself, such as the method a `-` means or the
+-- wildcard parameter of a signature, covers no text: the `made` forms give it an
 -- empty span at the start it is given, which is where its diagnostics point.
 
 fun freshId(p : P) -> Int = freshNodeId()
@@ -256,14 +256,8 @@ fun exprNode(p : P, s : Span, k : ExprKind) -> Expr =
 
 fun mkStmt(p : P, s : Span, k : StmtKind) -> Stmt = stmtNode(p, close(p, s), k)
 
-fun madeStmt(p : P, s : Span, k : StmtKind) -> Stmt = stmtNode(p, Source.emptyAt(s), k)
-
 fun stmtNode(p : P, s : Span, k : StmtKind) -> Stmt =
     Stmt { id = freshId(p), span = s, kind = k }
-
--- An arm the parser writes itself, as the `match` an `if let` means has.
-fun madeArm(s : Span, patterns : Vec Pat, guards : Vec Guard, body : Expr) -> Arm =
-    Arm { span = Source.emptyAt(s), patterns = patterns, guards = guards, body = body }
 
 -- A marked method reference: the `neg` a `-` means. Marked, so that a module
 -- defining its own `neg` does not quietly capture every `-` in the file.
@@ -1316,17 +1310,8 @@ fun parseBindingStmt(p : P) -> Stmt {
     mkStmt(p, tok.span, if mutable { SVar(pattern, value) } else { SLet(pattern, value) })
 }
 
--- `let p = e else { B }` is
---
---     let (x, y) = match e { p -> (x, y), _ -> B }
---
--- for the names `p` binds, with a lone name in place of the tuple, or `_` for
--- none, and `var` in place of `let` for `var p = e else { B }`.
---
--- The names are bound by a `let` of the block rather than by putting the rest
--- of the block in the first arm. Desugaring `?` treats a statement of the block
--- differently from one inside a branch, so nesting would change how every `?`
--- after this statement is lowered.
+-- Parses the `else { B }` of `let p = e else { B }`, and records the block in
+-- `letElses`.
 fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> Stmt {
     -- `let x = if c { a } else { b } else { ... }` would read either way, so a
     -- value ending in a block cannot take an `else`.
@@ -1341,19 +1326,7 @@ fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> St
     Vec.push(p.letElses, LetElse {
         block = otherwise, completion = completion(otherwise), tailCalls = tails,
     })
-    let names = patternVars(pat)
-    let vars = Vec.map(names, fun(n) = madePat(p, pat.span, PVar(n)))
-    let refs = Vec.map(names, fun(n) = madeExpr(p, pat.span, EVar(n, False)))
-    let (bound, out) = match len(names) {
-        0 -> (madePat(p, pat.span, PWild), madeExpr(p, pat.span, EUnit))
-        1 -> (vars[0], refs[0])
-        _ -> (madePat(p, pat.span, PTuple(vars)), madeExpr(p, pat.span, ETuple(refs)))
-    }
-    let m = madeExpr(p, s, EMatch(value, [
-        madeArm(pat.span, [pat], [], out),
-        madeArm(otherwise.span, [madePat(p, otherwise.span, PWild)], [], otherwise),
-    ]))
-    mkStmt(p, s, if mutable { SVar(bound, m) } else { SLet(bound, m) })
+    mkStmt(p, s, SLetElse(mutable, pat, value, otherwise))
 }
 
 -- Collect into `out` the calls in `e`'s tail positions: its value, through
@@ -1369,6 +1342,10 @@ fun tailCalls(e : Expr, out : Vec Expr) -> Unit = match e.kind {
         if let Some(o) = otherwise { tailCalls(o, out) }
     }
     EMatch(_, arms) -> for arm in arms { tailCalls(arm.body, out) }
+    EIfLet(_, then, otherwise) -> {
+        tailCalls(then, out)
+        if let Some(o) = otherwise { tailCalls(o, out) }
+    }
     _ -> {}
 }
 
@@ -1689,16 +1666,8 @@ fun parseAtom(p : P) -> Expr {
                 if !at(p, ",") { return mkExpr(p, tok.span, EWhile(cond, parseBlock(p))) }
                 lead = [cond]
             }
-            -- `while c1, c2, ... { B }` is `loop { match ... { A -> B, _ -> break } }`,
-            -- where `A` is the guarded arm the conditions become, as for `if`.
-            -- A condition failing is what ends the loop.
-            let s = tok.span
-            let (value, patterns, guards, body) = parseConditions(p, "'while'", lead)
-            let m = madeExpr(p, s, EMatch(value, [
-                madeArm(s, patterns, guards, body),
-                madeArm(s, [madePat(p, s, PWild)], [], madeExpr(p, s, EBreak(None))),
-            ]))
-            return mkExpr(p, s, ELoop(madeExpr(p, s, EBlock([madeStmt(p, s, SExpr(m))]))))
+            let conditions = parseConditions(p, "'while'", lead)
+            mkExpr(p, tok.span, EWhileLet(conditions, parseBlock(p)))
         }
         "for" -> parseFor(p)
         "loop" -> {
@@ -1825,40 +1794,24 @@ fun parseIf(p : P) -> Expr {
     mkExpr(p, s, EIf(cond, then, otherwise))
 }
 
--- Parses the rest of an `if` whose head is a condition list, and returns the
--- `match` it means: one arm that runs the then-block, guarded by the later
--- conditions, and `_ -> B`. When the first condition is `let p = e`, the
--- `match` is on `e` and the arm's pattern is `p`; when it is a test, the
--- `match` is on `()` and every condition is a guard. Without an `else`, `B`
--- is `()`. `lead` holds the test the head began with, if the caller has read it.
---
--- Build it here rather than in a later pass: nothing downstream needs to know
--- the form existed, and a guarded `match` is what every stage already handles.
+-- Parses the rest of an `if` whose head is a condition list. `lead` holds the
+-- test the head began with, if the caller has read it.
 fun parseIfLet(p : P, s : Span, lead : Vec Expr) -> Expr {
-    let (value, patterns, guards, then) = parseConditions(p, "'if'", lead)
-    var otherwise = madeExpr(p, s, EUnit)
+    let conditions = parseConditions(p, "'if'", lead)
+    let then = parseBlock(p)
+    var otherwise : Option Expr = None
     if eat(p, "else") {
-        if at(p, "if") { otherwise = parseIf(p) }
-        else { otherwise = parseBlock(p) }
+        if at(p, "if") { otherwise = Some(parseIf(p)) }
+        else { otherwise = Some(parseBlock(p)) }
     }
-    mkExpr(p, s, EMatch(value, [
-        madeArm(s, patterns, guards, then),
-        madeArm(s, [madePat(p, s, PWild)], [], otherwise),
-    ]))
+    mkExpr(p, s, EIfLet(conditions, then, otherwise))
 }
 
--- Parses the conditions of an `if` or `while` head and the block after them,
--- and returns the one guarded arm they become: the value it matches, its
--- patterns, its guards, and its body. Raises a parse error for two tests in a
+-- Parses the conditions of an `if` or `while` head, up to the block after
+-- them, after the tests in `lead`. Raises a parse error for two tests in a
 -- row, which `a && b` already says.
---
--- A `var` condition prefixes the block with `var x = x` for each binder, in
--- pattern order, so that only the block can assign them.
-fun parseConditions(p : P, construct : String, lead : Vec Expr)
-        -> (Expr, Vec Pat, Vec Guard, Expr) {
-    let s = cur(p).span
-    let guards : Vec Guard = Vec.map(lead, GTest)
-    let assignable : Vec Pat = []
+fun parseConditions(p : P, construct : String, lead : Vec Expr) -> Vec Condition {
+    let conditions : Vec Condition = Vec.map(lead, CondTest)
     var afterTest = len(lead) > 0
     var more = len(lead) == 0 || eat(p, ",")
     while more {
@@ -1874,8 +1827,7 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr)
             skipToken(p, "=")
             p.noRecord = saved
             let value = parseScrutinee(p, "the value a 'let' condition matches")
-            if mutable { for pat in patterns { Vec.push(assignable, pat) } }
-            Vec.push(guards, GLet(patterns, value))
+            Vec.push(conditions, CondLet(mutable, patterns, value))
             afterTest = False
         } else {
             let where = cur(p).span
@@ -1884,35 +1836,12 @@ fun parseConditions(p : P, construct : String, lead : Vec Expr)
                 oops(p, "two tests in a row cannot be separated by ','; join them "
                         + "with '&&'", where)
             }
-            Vec.push(guards, GTest(test))
+            Vec.push(conditions, CondTest(test))
             afterTest = True
         }
         more = eat(p, ",")
     }
-    var body = parseBlock(p)
-    if len(assignable) > 0 {
-        let stmts = []
-        let seen : Vec String = []
-        for pat in assignable {
-            for name in patternVars(pat) {
-                if !Vec.contains(seen, name) {
-                    Vec.push(seen, name)
-                    Vec.push(stmts, madeStmt(p, s, SVar(madePat(p, s, PVar(name)),
-                                                        madeExpr(p, s, EVar(name, False)))))
-                }
-            }
-        }
-        match body.kind {
-            EBlock(inner) -> for st in inner { Vec.push(stmts, st) }
-            _ -> {}
-        }
-        body = madeExpr(p, body.span, EBlock(stmts))
-    }
-    match guards[0] {
-        GLet(patterns, value) ->
-            (value, patterns, Vec.slice(guards, 1, len(guards)), body)
-        GTest(_) -> (madeExpr(p, s, EUnit), [madePat(p, s, PWild)], guards, body)
-    }
+    conditions
 }
 
 -- Parses `p1 | p2 | ...`, the patterns of a `match` arm or a `let` condition,

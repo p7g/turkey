@@ -153,6 +153,8 @@ fun declare(modules : Vec Module, binders : Binders.Table) -> Unit {
                     }
                     SLet(pat, _) -> declarePattern(binders, m.name, s.id, pat, False)
                     SVar(pat, _) -> declarePattern(binders, m.name, s.id, pat, True)
+                    SLetElse(mutable, pat, _, _) ->
+                        declarePattern(binders, m.name, s.id, pat, mutable)
                     SAssign(_, _) | SExpr(_) ->
                         discard(ownerFor(binders, m.name, s.id, "%top"))
                 }
@@ -347,6 +349,12 @@ fun topLevel(r : R, s : Stmt) -> Unit = match s.kind {
     }
     SLet(pat, value) -> topLevelBinding(r, s, pat, value)
     SVar(pat, value) -> topLevelBinding(r, s, pat, value)
+    -- The `else` block is resolved where the value is, outside the pattern's
+    -- scope.
+    SLetElse(_, pat, value, otherwise) -> {
+        topLevelBinding(r, s, pat, value)
+        expr(r, otherwise)
+    }
     _ -> {
         -- An assignment or a bare expression at the top level binds nothing, so
         -- there is nothing to rename -- only to resolve.
@@ -470,10 +478,15 @@ fun bindLater(r : R, p : Pat) -> Unit {
 -- bind one set of names between them, so the first mints each binder and the
 -- rest record their occurrences against it. A name the first does not bind
 -- gets a binder of its own, which keeps the side table complete for a
--- program that inference then rejects.
-fun bindAlternatives(r : R, alts : Vec Pat) -> Unit {
+-- program that inference then rejects. The first's binder for a name in
+-- `assignable` is assignable.
+fun bindAlternatives(r : R, alts : Vec Pat, assignable : Set.Set String) -> Unit {
     if len(alts) == 0 { return {} }
-    bindPattern(r, alts[0], False)
+    for v in varPatterns(alts[0]) {
+        let name = varName(v)
+        bindLocal(r, v.id, name, v.span, Set.contains(assignable, name))
+    }
+    bindLater(r, alts[0])
     let frame = r.locals[len(r.locals) - 1]
     for var i = 1; i < len(alts); i = i + 1 {
         for v in varPatterns(alts[i]) {
@@ -607,7 +620,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         for arm in arms {
             for p in arm.patterns { pattern(r, p) }
             push(r)
-            bindAlternatives(r, arm.patterns)
+            bindAlternatives(r, arm.patterns, Set.new())
             -- Each `let` guard binds in a frame of its own, so a name it binds
             -- shadows the arm's and the guards' before it.
             var frames = 1
@@ -619,7 +632,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
                         for p in alts { pattern(r, p) }
                         push(r)
                         frames = frames + 1
-                        bindAlternatives(r, alts)
+                        bindAlternatives(r, alts, Set.new())
                     }
                 }
             }
@@ -627,6 +640,14 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
             for var i = 0; i < frames; i = i + 1 { pop(r) }
         }
     }
+    EIfLet(conditions, then, otherwise) -> {
+        conditionList(r, conditions, then)
+        match otherwise {
+            Some(o) -> expr(r, o)
+            None -> {}
+        }
+    }
+    EWhileLet(conditions, body) -> conditionList(r, conditions, body)
     EForIn(pat, iterable, body, iterFn, nextFn) -> {
         resolveMethod(r, iterFn)
         resolveMethod(r, nextFn)
@@ -668,6 +689,14 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
     SLet(pat, value) -> localBinding(r, pat, value, False)
     SVar(pat, value) -> localBinding(r, pat, value, True)
+    -- The `else` block sees what the value sees, and the pattern's variables
+    -- are bound for the rest of the block.
+    SLetElse(mutable, pat, value, otherwise) -> {
+        expr(r, value)
+        expr(r, otherwise)
+        pattern(r, pat)
+        bindPattern(r, pat, mutable)
+    }
     SFun(d) -> {
         -- In scope for its own body, so it may recurse.
         bindLocal(r, d.id, d.name, d.span, False)
@@ -678,6 +707,39 @@ fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
         expr(r, value)
     }
     SExpr(e) -> expr(r, e)
+}
+
+-- Resolves the conditions of an `if` or `while` head and then `body`, which
+-- every condition's bindings are visible in. Each `let` binds in a frame of
+-- its own, so a name it binds shadows the ones the conditions before it bind,
+-- and its value sees only those.
+--
+-- A variable that a `var` condition binds is assignable in `body`, and so is a
+-- variable of a later condition that shadows one of them: `body` sees a name
+-- as assignable when any `var` condition binds it. `Turkey.Desugar` gives each
+-- such name in `body` a cell of its own.
+fun conditionList(r : R, conditions : Vec Condition, body : Expr) -> Unit {
+    let assignable : Set.Set String = Set.new()
+    var frames = 0
+    for c in conditions {
+        match c {
+            CondTest(test) -> expr(r, test)
+            CondLet(isVar, alts, value) -> {
+                expr(r, value)
+                for p in alts { pattern(r, p) }
+                push(r)
+                frames = frames + 1
+                if isVar {
+                    for p in alts {
+                        for name in patternVars(p) { Set.add(assignable, name) }
+                    }
+                }
+                bindAlternatives(r, alts, assignable)
+            }
+        }
+    }
+    expr(r, body)
+    for var i = 0; i < frames; i = i + 1 { pop(r) }
 }
 
 fun localBinding(r : R, pat : Pat, value : Expr, mutable : Bool) -> Unit {

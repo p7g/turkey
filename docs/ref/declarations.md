@@ -860,7 +860,7 @@ type, and the inferred type shows them in the same bracket form.
 
 ```ebnf
 foreign-decl ::= "foreign" foreign-sig body?
-               | "foreign" STRING INT "{" foreign-sig (separator foreign-sig)* "}"
+               | "foreign" STRING INT? "{" foreign-sig (separator foreign-sig)* "}"
 foreign-sig ::= STRING "fun" IDENT "(" foreign-params? ")" "->" type
 foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type
@@ -881,10 +881,13 @@ Ordinary application modules cannot declare or define foreign functions.
 
 Every parameter and the result must state its type. A definition also needs
 a name for every parameter. The boundary types are `Int`, `Float`, `Byte`,
-`Char`, `Bool`, `Unit` and `Prim.Ptr`; traced values such as `String` cannot
-cross it. A declaration accepts at most eight general-register arguments
-(`Int`, `Byte`, `Char`, `Bool`, `Prim.Ptr`) and eight `Float` arguments, and a
-definition at most seven and eight. A C symbol may be defined only once, but
+`Char`, `Bool`, `Unit`, `Prim.Ptr` and `Prim.Int32`; traced values such as
+`String` cannot cross it. `Prim.Int32` is a 32-bit integer, for a signature
+that takes or returns one, and only converts: `Prim.int32FromInt` keeps an
+`Int`'s low 32 bits, and `Prim.int32ToInt` reads them back as an `Int` from 0
+to 2^32 - 1. A declaration accepts at most eight general-register arguments
+(`Int`, `Byte`, `Char`, `Bool`, `Prim.Ptr`, `Prim.Int32`) and eight `Float`
+arguments, and a definition at most seven and eight. A C symbol may be defined only once, but
 several declarations may name it.
 
 A C function that takes a variable number of arguments, such as `open` or
@@ -939,11 +942,30 @@ of `$TURKEY_DYLIB_PATH`, separated by colons, then in Homebrew's
 `opt/*/lib` under those two. Writing a macOS executable on another machine
 searches `$TURKEY_DYLIB_PATH` alone, and is refused without it.
 
+A block with no version names a WebAssembly module, whose functions a
+program compiled for `wasm32-wasi` imports from its host under that module's
+name. Only that target can call one: a call reached in a program compiled for
+another target stops the build. An import takes any number of arguments, since wasm passes them on its
+operand stack, and none variadic. Across the boundary a `Prim.Ptr` is a
+32-bit address, `Int` a 64-bit integer, `Prim.Int32`, `Byte`, `Char` and
+`Bool` 32-bit ones, and `Float` a 64-bit float:
+
+<!-- error: a 'foreign' function without a body can appear only in -->
+```kotlin
+foreign "wasi_snapshot_preview1" {
+    "clock_time_get" fun clockTimeGet(id : Prim.Int32, precision : Int,
+                                      time : Prim.Ptr) -> Prim.Int32
+    "proc_exit" fun procExit(status : Prim.Int32) -> Unit
+}
+
+fun main() { }
+```
+
 Every block and declaration of every module the program loads, called or not,
 must agree on two things, and a program in which they do not is refused at
 the later of the two sites, naming the earlier one:
 
-- every block that names a library gives it the same major version;
+- every block that names a library gives it the same major version, or none;
 - every declaration of a C symbol takes it from the same library, the C
   library counting as one, so declaring `free` inside a `"crypto"` block is
   refused, because the C library's `free` is declared too.

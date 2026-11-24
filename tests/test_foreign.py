@@ -114,7 +114,7 @@ def test_a_declaration_binds_the_name_at_the_type_it_states(probe):
 
 @pytest.mark.parametrize(
     "written", ["String", "Array Int", "a", "fun(Int) -> Int", "Option Int"])
-def test_only_the_seven_representable_types_cross(probe, written):
+def test_only_the_representable_types_cross(probe, written):
     """`String` is the one worth naming: it is a heap array of bytes with no
     terminator, and every C function that wants a string wants a
     `char *`. The copy is the caller's (`Turkey.Ptr.toCString`)."""
@@ -471,3 +471,70 @@ def test_a_block_declares_something():
     appears or the version it gives its library."""
     message = fails('foreign "ssl" 1 {\n}\nfun main() { }\n')
     assert "the block for library 'ssl' declares nothing" in message
+
+
+# -- wasm imports --------------------------------------------------------------
+#
+# A block with no version names a WebAssembly module the host provides. Its
+# declarations are what a wasm program imports, so the arm64 register limit
+# does not bind them, and only a wasm target may call one.
+
+
+def _build(entry: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        toolchain.command(bootc.binary(), "build", *args, "-o", os.devnull, entry.name),
+        cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(LIB)),
+        capture_output=True, text=True)
+
+
+def test_a_wasm_block_declares_imports_past_the_register_limit(probe):
+    """WASI's `path_open` takes nine arguments, two of them 64-bit and the rest
+    32-bit, which is what `Prim.Int32` is for."""
+    entry = probe((
+        "export (pathOpen)\n"
+        'foreign "probe_module" {\n'
+        '    "probe_open" fun pathOpen(dir : Prim.Int32, lookup : Prim.Int32, path : Prim.Ptr,\n'
+        "                             length : Prim.Int32, oflags : Prim.Int32, base : Int,\n"
+        "                             inheriting : Int, fdflags : Prim.Int32,\n"
+        "                             opened : Prim.Ptr) -> Prim.Int32\n"
+        "}\n"))
+    check(entry)
+
+
+def test_a_wasm_import_cannot_be_variadic(probe):
+    entry = probe((
+        "export (f)\n"
+        'foreign "probe_module" {\n'
+        '    "probe_f" fun f(x : Int, ... y : Int) -> Int\n'
+        "}\n"))
+    assert "'f' is a wasm import and cannot be variadic" in fails(entry)
+
+
+def test_a_library_is_a_wasm_module_or_a_versioned_one_not_both(probe):
+    entry = probe((
+        "export (f, g)\n"
+        'foreign "probe" {\n'
+        '    "probe_f" fun f() -> Int\n'
+        "}\n"
+        'foreign "probe" 2 {\n'
+        '    "probe_g" fun g() -> Int\n'
+        "}\n"))
+    assert re.search(r":5:1: type error: library 'probe' is declared here with version 2, "
+                     r"and as a wasm module at \S*Probe_\w+\.gob:2:1;", fails(entry))
+
+
+WASM_CALL = """\
+export (now)
+foreign "probe_module" {
+    "probe_now" fun clock() -> Prim.Int32
+}
+fun now() -> Int = Prim.int32ToInt(clock())
+"""
+
+
+def test_an_arm64_program_cannot_call_a_wasm_import(probe):
+    entry = program(probe(WASM_CALL).replace("fun main() { }", "fun main() { print(P.now()) }"))
+    result = _build(entry)
+    assert result.returncode != 0
+    assert ("'probe_now' is imported from the wasm module 'probe_module', which only a "
+            "wasm target can call") in result.stderr, result.stderr

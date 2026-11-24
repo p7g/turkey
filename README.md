@@ -374,15 +374,17 @@ directory to `runtimepath`, or point a plugin manager at it
   file, as one undoable change. A buffer that does not parse is left alone
   and the error is shown.
 * `gq` on lines that hold code formats the whole buffer, since a few lines of
-  a program cannot be formatted alone. `gq` on comment lines wraps them at
-  100 columns, as Vim does by itself.
+  a program cannot be formatted alone. `gq` on lines that hold only comments
+  wraps them at 100 columns, as Vim does by itself. The formatter never
+  rewraps a comment, so `gggqG` leaves a long comment long.
 * `let g:turkey_format_on_save = 1` (or `b:turkey_format_on_save`) formats
   each buffer before it is written.
 * `:compiler turkey`, then `:make`, runs `turkey check` on the file and fills
   the quickfix list with its errors and lint warnings. Arguments to `:make`
   go after the file: `:make --deny-warnings`.
 * Both run `turkey` from `PATH`; set `g:turkey_command` (or
-  `b:turkey_command`) to use another, such as `build/stages/turkey`.
+  `b:turkey_command`) to use another, such as `build/stages/turkey`. It is a
+  path alone, with no arguments.
   `:compiler turkey` reads it when it runs, so set it first.
 
 Its tests run headless in whichever of `vim` and `nvim` are installed. They
@@ -406,6 +408,7 @@ require("conform").setup({
       command = "turkey",
       -- `$FILENAME` must be an argument of its own for conform to fill in.
       args = { "format", "--stdin-name", "$FILENAME", "-" },
+      stdin = true,
     },
   },
 })

@@ -115,6 +115,29 @@ call s:Check('gq on a comment wraps it with its leader',
       \ && len(s:lines[1]) <= 100 && s:lines[3] ==# '    print(1)', string(s:lines))
 bwipeout!
 
+" So does `gq` on a block comment, and a `{- -}` before code is code.
+let s:path = s:dir . '/gq-block.gob'
+call writefile(['fun main() {', '    {- ' . s:words . '-}', '    {- c -} print(1)', '}'], s:path)
+execute 'edit! ' . fnameescape(s:path)
+normal! 2Ggqq
+let s:lines = getline(1, '$')
+call s:Check('gq on a block comment wraps it',
+      \ len(s:lines) > 4 && s:lines[1] =~# '^\t{- word' && s:lines[-2] ==# '    {- c -} print(1)',
+      \ string(s:lines))
+normal! Gkgqq
+call s:Check('gq on a line with code after a block comment formats the buffer',
+      \ getline(1, '$')[-2] ==# "\t{- c -} print(1)", string(getline(1, '$')))
+bwipeout!
+
+" Formatting the whole buffer leaves a long comment as it is.
+let s:path = s:dir . '/gq-long.gob'
+call writefile(['fun main() {', "\t-- " . trim(s:words), "\tprint(1)", '}'], s:path)
+execute 'edit! ' . fnameescape(s:path)
+normal! gggqG
+call s:Check('gggqG leaves a long comment long', getline(1, '$') ==# readfile(s:path),
+      \ string(getline(1, '$')))
+bwipeout!
+
 " A command that cannot run is reported and leaves the buffer alone.
 let s:path = s:Copy('blocks', 'nocommand.gob')
 execute 'edit! ' . fnameescape(s:path)

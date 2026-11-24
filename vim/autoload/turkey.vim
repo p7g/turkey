@@ -6,7 +6,8 @@ let s:save_cpo = &cpo
 set cpo&vim
 
 " Returns the command that runs the compiler: `b:turkey_command`, else
-" `g:turkey_command`, else `turkey` on 'PATH'.
+" `g:turkey_command`, else `turkey` on 'PATH'. It is the executable's name or
+" path alone, with no arguments: callers quote it as one word.
 function! turkey#Command() abort
   return get(b:, "turkey_command", get(g:, "turkey_command", "turkey"))
 endfunction
@@ -86,19 +87,40 @@ endfunction
 
 " Formats for `gq` and the other users of 'formatexpr'. Formats the whole
 " buffer when the lines to format hold any code: a range of a program is not
-" a program, so the formatter cannot read it alone. Leaves comment and blank
-" lines, and text typed past 'textwidth', to Vim's own formatting, which
-" wraps them; the formatter never rewraps a comment.
+" a program, so the formatter cannot read it alone. Leaves lines that hold
+" only comments, and text typed past 'textwidth', to Vim's own formatting,
+" which wraps them. The formatter never rewraps a comment, so formatting the
+" whole buffer, as `gggqG` does, leaves a long comment long. Without syntax
+" highlighting, the interior lines of a `{- -}` comment read as code.
 function! turkey#FormatExpr() abort
   if v:char !=# "" || mode() =~# '^[iR]'
     return 1
   endif
-  let lines = getline(v:lnum, v:lnum + v:count - 1)
-  if empty(filter(lines, {_, l -> l !~# '^\s*\%(--.*\)\=$'}))
+  for l in range(v:lnum, v:lnum + v:count - 1)
+    if !s:CommentOnly(l)
+      call turkey#Format()
+      return 0
+    endif
+  endfor
+  return 1
+endfunction
+
+" Returns whether line a:lnum is blank or holds only comments.
+function! s:CommentOnly(lnum) abort
+  let line = getline(a:lnum)
+  if line =~# '^\s*\%(--.*\)\=$'
     return 1
   endif
-  call turkey#Format()
-  return 0
+  if get(b:, "current_syntax", "") ==# "turkey"
+    " A line whose first and last characters are both in a comment, unless
+    " code sits between two comments: `{- a -} x {- b -}`.
+    let names = map([match(line, '\S') + 1, match(line, '\s*$')],
+          \ {_, c -> synIDattr(synID(a:lnum, c, 1), "name")})
+    return names[0] =~? 'comment' && names[1] =~? 'comment'
+          \ && line !~# '-}.*\S.*{-'
+  endif
+  " A line that starts a block comment and has no code after its end.
+  return line =~# '^\s*{-' && line !~# '-}\s*\S'
 endfunction
 
 " Formats the buffer before it is written when `b:turkey_format_on_save` or

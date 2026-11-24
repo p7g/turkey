@@ -533,9 +533,12 @@ fun now() -> Int = Prim.int32ToInt(clock())
 """
 
 
-def test_an_arm64_program_cannot_call_a_wasm_import(probe):
+@pytest.mark.parametrize("flags", [(), ("-S",)])
+def test_an_arm64_program_cannot_call_a_wasm_import(probe, flags):
+    """Refused from the low IR, so assembly output is refused as well as an
+    executable."""
     entry = program(probe(WASM_CALL).replace("fun main() { }", "fun main() { print(P.now()) }"))
-    result = _build(entry)
+    result = _build(entry, *flags)
     assert result.returncode != 0
     assert ("'probe_now' is imported from the wasm module 'probe_module', which only a "
             "wasm target can call") in result.stderr, result.stderr

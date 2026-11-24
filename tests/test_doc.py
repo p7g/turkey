@@ -180,11 +180,34 @@ def test_a_name_a_qualifier_passes_on_links_to_that_module(tmp_path) -> None:
 
 def _shadowing(tmp_path) -> tuple[str, str]:
     """A program `Prelude` that exports its own `Deque` as a qualifier: two
-    modules the library has namesakes of. Returns their paths."""
-    (tmp_path / "Deque.gob").write_text("export (T(..), one)\n\ntype T = T\n\nlet one = T\n")
+    modules the library has namesakes of. `Deque` declares a type, a class
+    and an instance, and `Other` a type of the same name, so that `Deque`'s
+    is printed qualified. Returns the paths of `Prelude` and `Deque`."""
+    (tmp_path / "Other.gob").write_text("export (T(..))\n\ntype T = O\n")
+    (tmp_path / "Deque.gob").write_text(
+        "export (T(..), Named(..), one, same)\n\ntype T = T\n\n"
+        "class Named a { fun named(a) -> a }\n\n"
+        "instance Named T { fun named(t) = t }\n\n"
+        "let one = T\n\nfun same(t : T) -> T = t\n")
     (tmp_path / "Prelude.gob").write_text(
-        "export (one, module Deque)\n\nimport Deque\nimport Deque (one)\n")
+        "export (one, module Deque)\n\nimport Deque\nimport Deque (one)\nimport Other ()\n")
     return str(tmp_path / "Prelude.gob"), str(tmp_path / "Deque.gob")
+
+
+def test_no_page_shows_a_program_modules_mark(tmp_path) -> None:
+    """Types, instances, ids and links: everything a site or the JSON writes
+    about a program module that the library has a namesake of."""
+    prelude, deque = _shadowing(tmp_path)
+    out = tmp_path / "site"
+    result = _doc("--html", str(out), deque, prelude)
+    assert result.returncode == 0, result.stderr
+    written = json.loads((out / "docs.json").read_text())
+    [module] = [m for m in written["modules"] if m["name"] == "Deque"]
+    items = {item["name"]: item for item in module["items"]}
+    assert items["same"]["type"] == "fun(Deque.T) -> Deque.T"
+    for page in out.iterdir():
+        text = page.read_text()
+        assert "Deque:" not in text and "Prelude:" not in text, page.name
 
 
 def test_a_program_module_is_named_as_it_is_written(tmp_path) -> None:

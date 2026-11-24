@@ -163,6 +163,8 @@ left.
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `discarded-value` | warn | a statement that computes a value other than `()` and drops it ([Discarded values](statements.md#discarded-values)), except those `discarded-monadic-value` reports |
+| `discarded-monadic-value` | warn | a statement that drops an `Option`, an `Either`, or a value of the monad of the `?` block it is in, which is most often a missing `?` ([Discarded values](statements.md#discarded-values)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

@@ -104,6 +104,8 @@ type D = D {
 	-- becomes a `Brk` inside one; outside, it is left alone so that the checker
 	-- still reports it as a `break` with no loop, which is what it is.
 	var depth : Int
+	-- The program's `doStatements`, which this pass fills.
+	doStatements : Vec Int
 }
 
 fun freshId(d : D) -> Int = freshNodeId()
@@ -339,7 +341,14 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 --- Rewrites `p` in place. Every binder it writes is minted in `binders`, and
 --- every binding occurrence and reference it writes is recorded there.
 fun program(p : Program, scope : Scope, binders : Binders.Table) -> Unit {
-	let d = D { n = 0, scope = scope, binders = binders, owner = 0, depth = 0 }
+	let d = D {
+		n            = 0
+		scope        = scope
+		binders      = binders
+		owner        = 0
+		depth        = 0
+		doStatements = p.doStatements
+	}
 	-- First, so that every walk after this one, and every stage after this
 	-- pass, sees no grouping parentheses.
 	for decl in p.decls { bareDecl(decl) }
@@ -423,11 +432,9 @@ fun seq(d : D, stmts : Vec Stmt, from : Int, k : Cont, span : Span, flow : Bool)
 
 		if !owns(ChStmt(s)) && !(flow && Option.isSome(escapes(ChStmt(s), False))) {
 			discard(walkStmt(d, s))
-			if last {
-				match s.kind {
-					SExpr(e) -> return wrap(d, prefix, apply(d, k, e), span)
-					_        -> {}
-				}
+			if let SExpr(e) = s.kind {
+				if last { return wrap(d, prefix, apply(d, k, e), span) }
+				Vec.push(d.doStatements, e.id)
 			}
 			Vec.push(prefix, s)
 		} else {
@@ -464,16 +471,17 @@ fun split(
 	-- A bare statement's value tree is the statement itself with each `?`
 	-- replaced, as in `print(%k1)`, so it has to stay a statement. Passing it
 	-- straight to `after` would drop the call along with its result.
-	let discarded = KFn(
-		fun(v) = mkExpr(
+	let discarded = KFn(fun(v) {
+		Vec.push(d.doStatements, v.id)
+		mkExpr(
 			d,
 			s.span,
 			EBlock([
 				mkStmt(d, s.span, SExpr(v)),
 				mkStmt(d, s.span, SExpr(apply(d, after, mkExpr(d, s.span, EUnit)))),
 			]),
-		),
-	)
+		)
+	})
 	match s.kind {
 		SLet(pat, value) -> binding(d, s, pat, value, False, after, flow)
 		SVar(pat, value) -> binding(d, s, pat, value, True, after, flow)

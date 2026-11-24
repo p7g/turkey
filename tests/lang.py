@@ -217,13 +217,12 @@ def _cached(output: str, entry: Path, build,
 TARGETS = ("host", "wasm32-wasi")
 
 # The warning `turkey build --target wasm32-wasi` gives every program that
-# reaches the scheduler, whose four coroutine switches (`Coroutine#resume`,
-# `Scheduler#waitOn`, `Wait#settleIn`, `Scheduler#yield`) are built as traps;
-# the reference says the target gives it, so it is not compared with the host.
-# Only the whole line with that count is removed, as
-# `tests/harness/Toolchain.gob` removes it: a fifth refused function stays
-# visible.
-_TRAP_COUNT = ("{}: warning: 4 functions use operations the wasm32 backend "
+# reaches the scheduler, whose two coroutine switches (`Coroutine#resume`,
+# `Wait#settleIn`) are built as traps; the reference says the target gives it,
+# so it is not compared with the host. Only the whole line with that count is
+# removed, as `tests/harness/Toolchain.gob` removes it: a third refused
+# function stays visible.
+_TRAP_COUNT = ("{}: warning: 2 functions use operations the wasm32 backend "
                "does not compile yet, and trap if they are called; "
                "'--dump select' lists them\n")
 

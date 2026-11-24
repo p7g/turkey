@@ -114,6 +114,9 @@ fun mkExpr(d : D, s : Span, k : ExprKind) -> Expr =
 fun mkStmt(d : D, s : Span, k : StmtKind) -> Stmt =
     Stmt { id = freshId(d), span = s, kind = k }
 
+-- A literal this pass writes, with the text the language would spell it in.
+fun literal(l : Lit) -> ExprKind = ELit(l, literalText(l))
+
 fun mkPat(d : D, s : Span, k : PatKind) -> Pat =
     Pat { id = freshId(d), span = s, kind = k, opening = None }
 
@@ -214,7 +217,7 @@ fun owns(c : Child) -> Bool {
         ChExpr(e) -> match e.kind {
             EQuestion(_, _) -> return True
             EDo(_) -> return False
-            ELambda(_, _, _) -> return False
+            ELambda(_, _, _, _) -> return False
             _ -> {}
         }
         ChStmt(s) -> match s.kind {
@@ -241,7 +244,7 @@ fun escapes(c : Child, inLoop : Bool) -> Option Expr {
             EReturn(_) -> return Some(e)
             EBreak(_) -> if !inLoop { return Some(e) }
             EContinue -> if !inLoop { return Some(e) }
-            ELambda(_, _, _) -> return None
+            ELambda(_, _, _, _) -> return None
             EWhile(_, _) -> { inner = True }
             EForIn(_, _, _, _, _) -> { inner = True }
             EForC(_, _, _, _) -> { inner = True }
@@ -272,7 +275,7 @@ fun hasLiftedLoop(c : Child) -> Bool {
             EForC(_, _, _, _) -> if owns(c) { return True }
             ELoop(_) -> if owns(c) { return True }
             EDo(_) -> return False
-            ELambda(_, _, _) -> return False
+            ELambda(_, _, _, _) -> return False
             _ -> {}
         }
         ChStmt(s) -> match s.kind {
@@ -772,7 +775,7 @@ fun bindWith(d : D, m : Expr, k : Cont, span : Span, fn : Option Expr) -> Expr {
     let k1 = fresh(d, "%k", span)
     let param = bindTemp(d, k1, span)
     let read = varOf(d, k1, span)
-    let lam = mkExpr(d, span, ELambda([param], None, apply(d, k, read)))
+    let lam = mkExpr(d, span, ELambda([param], None, apply(d, k, read), False))
     let f = match fn {
         Some(x) -> x
         None -> methodRef(d, span, P.monadBind)
@@ -903,8 +906,7 @@ fun armOf(d : D, con : String, bind : Payload, span : Span,
 fun unflow(d : D, body : Expr, span : Span) -> Expr {
     let unreachable = mkExpr(d, span, ECall(
         globalOf(d, P.error, span),
-        [mkExpr(d, span, ELit(LString(
-            "internal error: a loop transfer escaped its loop")))]))
+        [mkExpr(d, span, literal(LString("internal error: a loop transfer escaped its loop")))]))
     bindWith(d, body, KFn(fun(f) = {
         let v = temp(d, "%v", span)
         let r = temp(d, "%r", span)
@@ -1099,8 +1101,8 @@ fun walkExpr(d : D, e : Expr) -> Expr {
     if !sugared(ChExpr(e)) { return e }
     match e.kind {
         EDo(body) -> return context(d, body)
-        ELambda(params, ret, body) -> {
-            e.kind = ELambda(params, ret, context(d, body))
+        ELambda(params, ret, body, backslash) -> {
+            e.kind = ELambda(params, ret, context(d, body), backslash)
             return e
         }
         -- Reported and left as written: `loadProgram` stops once every module
@@ -1110,7 +1112,7 @@ fun walkExpr(d : D, e : Expr) -> Expr {
                 "this '?' is not inside a function body or a 'do' block", e.span))
             return e
         }
-        ELit(_) -> {}
+        ELit(_, _) -> {}
         EUnit -> {}
         EVar(_, _) -> {}
         ECon(_) -> {}
@@ -1225,11 +1227,11 @@ fun bare(e : Expr) -> Expr {
 }
 
 fun bareKind(e : Expr) -> ExprKind = match e.kind {
-    ELit(_) | EUnit | EVar(_, _) | ECon(_) | EContinue -> e.kind
+    ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | EContinue -> e.kind
     ETuple(xs) -> ETuple(bareAll(xs))
     EArray(xs) -> EArray(bareAll(xs))
     ERecord(name, fields) -> ERecord(name, Vec.map(fields, fun((field, value)) = (field, bare(value))))
-    ELambda(params, ret, body) -> ELambda(params, ret, bare(body))
+    ELambda(params, ret, body, backslash) -> ELambda(params, ret, bare(body), backslash)
     ECall(fn, args) -> ECall(bare(fn), bareAll(args))
     EIndex(arr, index, getFn, setFn) -> EIndex(bare(arr), bare(index), getFn, setFn)
     EField(obj, name) -> EField(bare(obj), name)
@@ -1589,7 +1591,7 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
             e.kind = ECall(get, [arr, index])
         }
     }
-    ELit(_) -> {}
+    ELit(_, _) -> {}
     EUnit -> {}
     EVar(_, _) -> {}
     ECon(_) -> {}
@@ -1597,7 +1599,7 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
     ETuple(xs) -> indexAll(d, xs)
     EArray(xs) -> indexAll(d, xs)
     ERecord(_, fields) -> for (_, value) in fields { indexExpr(d, value) }
-    ELambda(_, _, body) -> indexExpr(d, body)
+    ELambda(_, _, body, _) -> indexExpr(d, body)
     ECall(fn, args) -> {
         indexExpr(d, fn)
         indexAll(d, args)

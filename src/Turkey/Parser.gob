@@ -43,6 +43,8 @@ type P = P {
     letElses     : Vec LetElse,
     comments     : Vec Comment,
     blankLines   : Vec Int,
+    -- The source's lines, which a literal's text is read from.
+    lines        : Vec String,
 }
 
 fun parse(source : Source, known : Vec String) -> Program {
@@ -59,6 +61,7 @@ fun parse(source : Source, known : Vec String) -> Program {
         letElses = [],
         comments = lexed.comments,
         blankLines = lexed.blankLines,
+        lines = String.lines(source.text),
     }
     parseProgram(p)
 }
@@ -720,7 +723,7 @@ fun parseConContext(p : P) -> (Vec String, Vec Pred) {
             oops(p, "'~' cannot appear in an existential bracket; write type "
                     + "variables such as 's' and constraints such as 'Error e'", s)
         }
-        match written.kind {
+        match bareType(written).kind {
             TEVar(name) -> Vec.push(binders, name)
             TECon(name, args) -> {
                 if len(args) != 1 { oops(p, conContextShape, s) }
@@ -823,7 +826,7 @@ fun parseTypeExpr(p : P) -> Type {
         Vec.push(args, parseAtype(p))
     }
     if len(args) == 0 { return head }
-    match head.kind {
+    match bareType(head).kind {
         TECon(name, existing) -> {
             if len(existing) == 0 {
                 return mkType(p, head.span, TECon(name, args))
@@ -870,6 +873,12 @@ fun parseAtype(p : P) -> Type {
     }
 }
 
+-- Returns `t` without the parentheses around it.
+fun bareType(t : Type) -> Type = match t.kind {
+    TEParen(inner) -> bareType(inner)
+    _ -> t
+}
+
 -- The rest of a dotted name whose first CONID has already been consumed.
 fun dottedFrom(p : P, first : Token) -> String {
     let parts = Vec.new(2)
@@ -898,7 +907,7 @@ fun parseParenType(p : P, tok : Token) -> Type {
         Vec.push(elems, parseTypeExpr(p))
     }
     skipToken(p, ")")
-    if len(elems) == 1 { return elems[0] }
+    if len(elems) == 1 { return mkType(p, tok.span, TEParen(elems[0])) }
     mkType(p, tok.span, TETuple(elems))
 }
 
@@ -1162,7 +1171,7 @@ fun parsePredEntry(p : P) -> Pred {
         let other = parseTypeExpr(p)
         return Pred { span = close(p, s), kind = PEq(written, other) }
     }
-    match written.kind {
+    match bareType(written).kind {
         TECon(name, args) -> {
             if len(args) == 1 {
                 return Pred { span = close(p, s), kind = PClass(name, args[0]) }
@@ -1440,7 +1449,7 @@ fun parsePatternAtom(p : P) -> Pat {
         "CONID" -> parseConPattern(p)
         "INT" | "FLOAT" | "STRING" | "CHAR" -> {
             step(p)
-            mkPat(p, tok.span, PLit(literalOf(tok)))
+            mkPat(p, tok.span, PLit(literalOf(tok), written(p, tok.span)))
         }
         "(" -> parseParenPattern(p, tok)
         _ -> oops(p, "expected a pattern, found " + describe(tok), tok.span)
@@ -1462,8 +1471,20 @@ fun parseParenPattern(p : P, tok : Token) -> Pat {
         Vec.push(elems, parsePattern(p))
     }
     skipToken(p, ")")
-    if len(elems) == 1 { return elems[0] }
+    if len(elems) == 1 { return mkPat(p, tok.span, PParen(elems[0])) }
     mkPat(p, tok.span, PTuple(elems))
+}
+
+-- The text `s` covers, as written.
+fun written(p : P, s : Span) -> String {
+    let out = []
+    for var l = s.line; l <= s.endLine && l <= len(p.lines); l = l + 1 {
+        let cs = String.toCodePoints(p.lines[l - 1])
+        let from = if l == s.line { s.col - 1 } else { 0 }
+        let to = if l == s.endLine { s.endCol - 1 } else { len(cs) }
+        Vec.push(out, String.fromCodePoints(Array.slice(cs, from, to)))
+    }
+    String.join(out, "\n")
 }
 
 fun literalOf(tok : Token) -> Lit = match tok.value {
@@ -1635,7 +1656,7 @@ fun parseAtom(p : P) -> Expr {
     match kindOf(p) {
         "INT" | "FLOAT" | "STRING" | "CHAR" -> {
             step(p)
-            mkExpr(p, tok.span, ELit(literalOf(tok)))
+            mkExpr(p, tok.span, ELit(literalOf(tok), written(p, tok.span)))
         }
         "IDENT" -> {
             step(p)
@@ -1656,7 +1677,7 @@ fun parseAtom(p : P) -> Expr {
             let params = parseParamList(p)
             var ret : Option Type = None
             if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
-            mkExpr(p, tok.span, ELambda(params, ret, parseFunBody(p)))
+            mkExpr(p, tok.span, ELambda(params, ret, parseFunBody(p), False))
         }
         "if" -> parseIf(p)
         "while" -> {
@@ -1991,7 +2012,7 @@ fun parseMatchArm(p : P) -> Arm {
 -- bare part has been closed by the node around it -- and walking the whole
 -- expression finds exactly the `_`s this boundary owns.
 
--- Grouping parentheses are transparent here too: `f((_))` is `f(_)`.
+-- Whether `e` is a `_`, in parentheses or not.
 fun isPlaceholder(e : Expr) -> Bool = isUnderscore(unparen(e))
 
 -- Whether `e` is the `_` itself, the node a function's parameter replaces.
@@ -1999,7 +2020,6 @@ fun isUnderscore(e : Expr) -> Bool = match e.kind {
     EVar(name, _) -> name == "_"
     _ -> False
 }
-
 
 fun placeholders(e : Expr) -> Vec Expr {
     let out = Vec.new(2)
@@ -2049,7 +2069,7 @@ fun closeImplicit(p : P, e : Expr) -> Expr {
                 + "to make every '_' the same parameter, or write 'fun(a, b) = ...'",
              found[1].span)
     }
-    shorthandLambda(p, e, found, e.span)
+    shorthandLambda(p, e, found, e.span, False)
 }
 
 fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
@@ -2058,7 +2078,7 @@ fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
     -- so `if Array.contains(_, 2)` leaves no `_` pending: the function is here.
     let bare = unparen(e)
     match bare.kind {
-        ELambda(params, _, _) -> if isShorthand(bare) { oops(p, message, params[0].span) }
+        ELambda(params, _, _, _) -> if isShorthand(bare) { oops(p, message, params[0].span) }
         _ -> {}
     }
     if p.pending == 0 || p.explicit > 0 { return }
@@ -2081,14 +2101,14 @@ fun parseExplicit(p : P, tok : Token) -> Expr {
         oops(p, "'\\' has no '_' after it; remove the '\\', or use '_' for "
                 + "the parameter", tok.span)
     }
-    shorthandLambda(p, body, found, close(p, tok.span))
+    shorthandLambda(p, body, found, close(p, tok.span), True)
 }
 
 -- `s` is the whole span of the function: of the `\` and its body, or of the
--- expression a `_` made into a function.
-fun shorthandLambda(p : P, body : Expr, found : Vec Expr, s : Span) -> Expr {
+-- expression a `_` made into a function. `backslash` is whether a `\` made it.
+fun shorthandLambda(p : P, body : Expr, found : Vec Expr, s : Span, backslash : Bool) -> Expr {
     let name = shorthandPrefix + Int.toString(freshId(p))
     for placeholder in found { placeholder.kind = EVar(name, False) }
     p.pending = p.pending - len(found)
-    exprNode(p, s, ELambda([madePat(p, found[0].span, PVar(name))], None, body))
+    exprNode(p, s, ELambda([madePat(p, found[0].span, PVar(name))], None, body, backslash))
 }

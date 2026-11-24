@@ -2,13 +2,13 @@ export (firstDifference)
 
 --- Structural comparison of two parse trees.
 ---
---- Two trees are the same when they hold the same syntax. Where it is written
---- is not part of that: spans, node ids, comments and blank lines are left
---- out. So is what later stages fill in, which a fresh parse has not got: the
---- method a `+` or a `for` loop means, and what opening a pattern binds. The
---- name the parser gives the parameter of a function made by `_` carries a
---- fresh number, so two such names are the same when each tree uses them in
---- the same places.
+--- Two trees are the same when they hold the same syntax, a literal's text as
+--- written and a function's `\` included. Where it is written is not part of
+--- that: spans, node ids, comments and blank lines are left out. So is what
+--- later stages fill in, which a fresh parse has not got: the method a `+` or a
+--- `for` loop means, and what opening a pattern binds. The name the parser
+--- gives the parameter of a function made by `_` carries a fresh number, so two
+--- such names are the same when each tree uses them in the same places.
 
 import Turkey.Ast (..)
 import Turkey.Fixity as Fixity
@@ -22,8 +22,8 @@ fun firstDifference(a : Program, b : Program) -> Option Span {
     let Program {
         span, exportDecl = exported, imports, decls, letElses = _, comments = _, blankLines = _,
     } = a
-    let same = optional(exported, b.exportDecl, exportDecl)
-        && pairwise(imports, b.imports, importDecl)
+    let same = optional(exported, b.exportDecl, fun(x, y) = exportDecl(c, x, y))
+        && pairwise(imports, b.imports, fun(x, y) = importDecl(c, x, y))
         && pairwise(decls, b.decls, fun(x, y) = decl(c, x, y))
     if !same { mark(c, span) }
     c.at
@@ -57,7 +57,7 @@ fun pairwise(xs : Vec a, ys : Vec a, same : fun(a, a) -> Bool) -> Bool {
 fun optional(x : Option a, y : Option a, same : fun(a, a) -> Bool) -> Bool = match (x, y) {
     (Some(p), Some(q)) -> same(p, q)
     (None, None) -> True
-    _ -> False
+    (Some(_), None) | (None, Some(_)) -> False
 }
 
 fun strings(xs : Vec String, ys : Vec String) -> Bool = pairwise(xs, ys, fun(x, y) = x == y)
@@ -76,17 +76,13 @@ fun sameVar(c : C, x : String, y : String) -> Bool {
             True
         }
         (Some(paired), Some(back)) -> paired == y && back == x
-        _ -> False
+        (Some(_), None) | (None, Some(_)) -> False
     }
 }
 
-fun lit(x : Lit, y : Lit) -> Bool = match (x, y) {
-    (LInt(m), LInt(n)) -> m == n
-    (LFloat(m), LFloat(n)) -> m == n
-    (LString(m), LString(n)) -> m == n
-    (LChar(m), LChar(n)) -> m == n
-    _ -> False
-}
+-- Two literals are the same when they are written the same, which `0x10` and
+-- `16` are not. The text decides the value.
+fun lit(x : Lit, t : String, y : Lit, u : String) -> Bool = litKind(x) == litKind(y) && t == u
 
 -- -- types and patterns -------------------------------------------------------------
 
@@ -98,7 +94,9 @@ fun typeExpr(c : C, x : Type, y : Type) -> Bool {
         (TEApp(f, xs), TEApp(g, ys)) -> typeExpr(c, f, g) && types(c, xs, ys)
         (TETuple(xs), TETuple(ys)) -> types(c, xs, ys)
         (TEFun(xs, r), TEFun(ys, s)) -> types(c, xs, ys) && typeExpr(c, r, s)
-        _ -> False
+        (TEParen(t), TEParen(u)) -> typeExpr(c, t, u)
+        (TEVar(_), _) | (TECon(_, _), _) | (TEApp(_, _), _) | (TETuple(_), _) | (TEFun(_, _), _)
+            | (TEParen(_), _) -> False
     }
     if !same { mark(c, span) }
     same
@@ -117,11 +115,13 @@ fun pattern(c : C, x : Pat, y : Pat) -> Bool {
         (PRecord(m, xs, r), PRecord(n, ys, s)) ->
             m == n && r == s
                 && pairwise(xs, ys, fun((f, p), (g, q)) = f == g && pattern(c, p, q))
-        (PLit(l), PLit(m)) -> lit(l, m)
+        (PLit(l, t), PLit(m, u)) -> lit(l, t, m, u)
         (PTuple(xs), PTuple(ys)) -> patterns(c, xs, ys)
         (PAnnot(p, t), PAnnot(q, u)) -> pattern(c, p, q) && typeExpr(c, t, u)
         (POr(xs), POr(ys)) -> patterns(c, xs, ys)
-        _ -> False
+        (PParen(p), PParen(q)) -> pattern(c, p, q)
+        (PVar(_), _) | (PWild, _) | (PCon(_, _), _) | (PRecord(_, _, _), _) | (PLit(_, _), _)
+            | (PTuple(_), _) | (PAnnot(_, _), _) | (POr(_), _) | (PParen(_), _) -> False
     }
     if !same { mark(c, span) }
     same
@@ -146,7 +146,7 @@ fun optExpr(c : C, x : Option Expr, y : Option Expr) -> Bool = optional(x, y, fu
 -- `EQuestion` carry are left out: the parser writes the same ones for the same
 -- syntax, and resolution is what fills them in.
 fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
-    (ELit(l), ELit(m)) -> lit(l, m)
+    (ELit(l, t), ELit(m, u)) -> lit(l, t, m, u)
     (EUnit, EUnit) -> True
     (EVar(m, mk), EVar(n, nk)) -> sameVar(c, m, n) && mk == nk
     (ECon(m), ECon(n)) -> m == n
@@ -154,8 +154,8 @@ fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
     (EArray(xs), EArray(ys)) -> exprs(c, xs, ys)
     (ERecord(m, xs), ERecord(n, ys)) ->
         m == n && pairwise(xs, ys, fun((f, v), (g, w)) = f == g && expr(c, v, w))
-    (ELambda(ps, r, e), ELambda(qs, s, f)) ->
-        patterns(c, ps, qs) && optType(c, r, s) && expr(c, e, f)
+    (ELambda(ps, r, e, m), ELambda(qs, s, f, n)) ->
+        m == n && patterns(c, ps, qs) && optType(c, r, s) && expr(c, e, f)
     (ECall(f, xs), ECall(g, ys)) -> expr(c, f, g) && exprs(c, xs, ys)
     (EIndex(a, i, _, _), EIndex(b, j, _, _)) -> expr(c, a, b) && expr(c, i, j)
     (EField(a, m), EField(b, n)) -> m == n && expr(c, a, b)
@@ -183,7 +183,14 @@ fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
     (EQuestion(e, _), EQuestion(f, _)) -> expr(c, e, f)
     (EDo(e), EDo(f)) -> expr(c, e, f)
     (EParen(e), EParen(f)) -> expr(c, e, f)
-    _ -> False
+    (ELit(_, _), _) | (EUnit, _) | (EVar(_, _), _) | (ECon(_), _) | (ETuple(_), _) | (EArray(_), _)
+        | (ERecord(_, _), _) | (ELambda(_, _, _, _), _) | (ECall(_, _), _)
+        | (EIndex(_, _, _, _), _) | (EField(_, _), _) | (EProject(_, _), _) | (EUnary(_, _, _), _)
+        | (EBinary(_, _, _, _), _) | (EChain(_, _), _) | (EAnnot(_, _), _) | (EIf(_, _, _), _)
+        | (EWhile(_, _), _) | (EForIn(_, _, _, _, _), _) | (EForC(_, _, _, _), _) | (ELoop(_), _)
+        | (EMatch(_, _), _) | (EIfLet(_, _, _), _) | (EWhileLet(_, _), _) | (EReturn(_), _)
+        | (EBreak(_), _) | (EContinue, _) | (EBlock(_), _) | (EQuestion(_, _), _) | (EDo(_), _)
+        | (EParen(_), _) -> False
 }
 
 fun arm(c : C, x : Arm, y : Arm) -> Bool {
@@ -197,7 +204,7 @@ fun arm(c : C, x : Arm, y : Arm) -> Bool {
 fun guard(c : C, x : Guard, y : Guard) -> Bool = match (x, y) {
     (GTest(e), GTest(f)) -> expr(c, e, f)
     (GLet(ps, e), GLet(qs, f)) -> patterns(c, ps, qs) && expr(c, e, f)
-    _ -> False
+    (GTest(_), _) | (GLet(_, _), _) -> False
 }
 
 fun conditions(c : C, xs : Vec Condition, ys : Vec Condition) -> Bool =
@@ -208,7 +215,7 @@ fun condition(c : C, x : Condition, y : Condition) -> Bool {
         (CondTest(_, e), CondTest(_, f)) -> expr(c, e, f)
         (CondLet(_, m, ps, e), CondLet(_, n, qs, f)) ->
             m == n && patterns(c, ps, qs) && expr(c, e, f)
-        _ -> False
+        (CondTest(_, _), _) | (CondLet(_, _, _, _), _) -> False
     }
     if !same { mark(c, conditionSpan(x)) }
     same
@@ -224,7 +231,8 @@ fun stmt(c : C, x : Stmt, y : Stmt) -> Bool {
         (SExpr(e), SExpr(f)) -> expr(c, e, f)
         (SLetElse(m, p, e, o), SLetElse(n, q, f, r)) ->
             m == n && pattern(c, p, q) && expr(c, e, f) && expr(c, o, r)
-        _ -> False
+        (SLet(_, _), _) | (SVar(_, _), _) | (SFun(_), _) | (SAssign(_, _), _) | (SExpr(_), _)
+            | (SLetElse(_, _, _, _), _) -> False
     }
     if !same { mark(c, span) }
     same
@@ -239,7 +247,7 @@ fun pred(c : C, x : Pred, y : Pred) -> Bool {
     let same = match (kind, y.kind) {
         (PClass(m, t), PClass(n, u)) -> m == n && typeExpr(c, t, u)
         (PEq(a, t), PEq(b, u)) -> typeExpr(c, a, b) && typeExpr(c, t, u)
-        _ -> False
+        (PClass(_, _), _) | (PEq(_, _), _) -> False
     }
     if !same { mark(c, span) }
     same
@@ -339,31 +347,40 @@ fun decl(c : C, x : Decl, y : Decl) -> Bool = match (x, y) {
     (DInstance(s), DInstance(t)) -> instanceDecl(c, s, t)
     (DForeign(s), DForeign(t)) -> foreignDecl(c, s, t)
     (DInfix(s), DInfix(t)) -> infixDecl(c, s, t)
-    _ -> False
+    (DStmt(_), _) | (DType(_), _) | (DClass(_), _) | (DInstance(_), _) | (DForeign(_), _)
+        | (DInfix(_), _) -> False
 }
 
 -- -- imports and exports ------------------------------------------------------------
 
-fun exportItem(x : ExportItem, y : ExportItem) -> Bool {
-    let ExportItem { span = _, name, subs, qualifier, list, rest } = x
-    name == y.name && optional(subs, y.subs, strings) && qualifier == y.qualifier
-        && optional(list, y.list, fun(xs, ys) = pairwise(xs, ys, importItem))
+fun exportItem(c : C, x : ExportItem, y : ExportItem) -> Bool {
+    let ExportItem { span, name, subs, qualifier, list, rest } = x
+    let same = name == y.name && optional(subs, y.subs, strings) && qualifier == y.qualifier
+        && optional(list, y.list, fun(xs, ys) = pairwise(xs, ys, fun(p, q) = importItem(c, p, q)))
         && rest == y.rest
+    if !same { mark(c, span) }
+    same
 }
 
-fun exportDecl(x : ExportDecl, y : ExportDecl) -> Bool {
-    let ExportDecl { span = _, items, rest } = x
-    pairwise(items, y.items, exportItem) && rest == y.rest
+fun exportDecl(c : C, x : ExportDecl, y : ExportDecl) -> Bool {
+    let ExportDecl { span, items, rest } = x
+    let same = pairwise(items, y.items, fun(p, q) = exportItem(c, p, q)) && rest == y.rest
+    if !same { mark(c, span) }
+    same
 }
 
-fun importItem(x : ImportItem, y : ImportItem) -> Bool {
+fun importItem(c : C, x : ImportItem, y : ImportItem) -> Bool {
     let ImportItem { item, rename } = x
-    exportItem(item, y.item) && optional(rename, y.rename, fun(m, n) = m == n)
+    let same = exportItem(c, item, y.item) && optional(rename, y.rename, fun(m, n) = m == n)
+    if !same { mark(c, item.span) }
+    same
 }
 
-fun importDecl(x : ImportDecl, y : ImportDecl) -> Bool {
-    let ImportDecl { span = _, name, alias, items, rest } = x
-    name == y.name && optional(alias, y.alias, fun(m, n) = m == n)
-        && optional(items, y.items, fun(xs, ys) = pairwise(xs, ys, importItem))
+fun importDecl(c : C, x : ImportDecl, y : ImportDecl) -> Bool {
+    let ImportDecl { span, name, alias, items, rest } = x
+    let same = name == y.name && optional(alias, y.alias, fun(m, n) = m == n)
+        && optional(items, y.items, fun(xs, ys) = pairwise(xs, ys, fun(p, q) = importItem(c, p, q)))
         && rest == y.rest
+    if !same { mark(c, span) }
+    same
 }

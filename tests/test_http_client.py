@@ -152,6 +152,17 @@ SCENARIOS = {
         "200 landed, authorization False",
         "error NotSent(Transport(Forbidden))",
     ],
+    "cookies": [
+        # No pair, no field.
+        "200 typed none, wire none, set-cookie False",
+        "200 typed session=abc123, wire session=abc123, set-cookie False",
+        # Pairs go on one line, a quoted value with its quotes.
+        '200 typed a=1; b="two", wire a=1; b="two", set-cookie False',
+        # A second field replaces the first, so there is still one.
+        "200 typed b=2, wire b=2, set-cookie False",
+        # A name that is not a token and a value with `;` make no pair.
+        "None None",
+    ],
     "policy": [
         "error NotSent(Transport(Forbidden))",
         "error NotSent(Transport(Forbidden))",

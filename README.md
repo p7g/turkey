@@ -370,8 +370,12 @@ directory to `runtimepath`, or point a plugin manager at it
 * It sets the formatter's layout: tabs, a tab counting as 4 columns, and
   comments wrapped at 100. Set `g:turkey_recommended_style = 0` to keep your
   own settings.
-* `:TurkeyFormat` formats the buffer with `turkey format`, as one undoable
-  change. A buffer that does not parse is left alone and the error is shown.
+* `:TurkeyFormat` formats the buffer, saved or not, and with or without a
+  file, as one undoable change. A buffer that does not parse is left alone
+  and the error is shown.
+* `gq` on lines that hold code formats the whole buffer, since a few lines of
+  a program cannot be formatted alone. `gq` on comment lines wraps them at
+  100 columns, as Vim does by itself.
 * `let g:turkey_format_on_save = 1` (or `b:turkey_format_on_save`) formats
   each buffer before it is written.
 * `:compiler turkey`, then `:make`, runs `turkey check` on the file and fills
@@ -388,6 +392,23 @@ reindent and retype the formatter's goldens, and with a compiler
 
 ```sh
 sh vim/test/run.sh
+```
+
+In Neovim with [conform.nvim](https://github.com/stevearc/conform.nvim), the
+formatter can run through conform instead, which reads standard output
+unless the command fails:
+
+```lua
+require("conform").setup({
+  formatters_by_ft = { turkey = { "turkey" } },
+  formatters = {
+    turkey = {
+      command = "turkey",
+      -- `$FILENAME` must be an argument of its own for conform to fill in.
+      args = { "format", "--stdin-name", "$FILENAME", "-" },
+    },
+  },
+})
 ```
 
 ### Library documentation

@@ -19,11 +19,13 @@ function! s:Error(lines) abort
   echohl None
 endfunction
 
-" Formats the current buffer with `turkey format`. Leaves the buffer as it was
-" and reports the compiler's message if the buffer does not parse or the
-" formatter refuses it. Otherwise changes only the lines that differ, as one
-" undoable change, and keeps the view. Returns 1 if the buffer is formatted
-" now and 0 if it could not be formatted. Does not write the file.
+" Formats the current buffer with `turkey format`, which reads it on standard
+" input, so a buffer with no file and unsaved changes are formatted alike.
+" Leaves the buffer as it was and reports the compiler's message if the
+" buffer does not parse or the formatter refuses it. Otherwise changes only
+" the lines that differ, as one undoable change, and keeps the view. Returns
+" 1 if the buffer is formatted now and 0 if it could not be formatted. Does
+" not write the file.
 function! turkey#Format() abort
   let command = turkey#Command()
   if !executable(command)
@@ -31,27 +33,24 @@ function! turkey#Format() abort
     return 0
   endif
 
-  " `turkey format` rewrites files in place and does not read standard input,
-  " so format a copy of the buffer in a directory of its own. The copy keeps
-  " the buffer's file name, so that the compiler's messages name it.
-  let dir = tempname()
-  call mkdir(dir, "p")
-  let name = expand("%:t")
-  let copy = dir . "/" . (name ==# "" ? "buffer.gob" : name)
+  " Name the buffer's file, so that messages name it as `turkey check`
+  " would. A buffer with none is `<stdin>`.
+  let cmdline = shellescape(command) . " format"
+  if expand("%") !=# ""
+    let cmdline .= " --stdin-name " . shellescape(expand("%"))
+  endif
   let before = getline(1, "$")
-  call writefile(before, copy)
-  let output = system(shellescape(command) . " format " . shellescape(copy) . " 2>&1")
+  " system() gives standard output and standard error together. That is
+  " safe because `turkey format -` writes to only one of them: the program
+  " on success, and the reason otherwise.
+  let output = system(cmdline . " -", join(before, "\n") . "\n")
   let status = v:shell_error
-  let after = status == 0 ? readfile(copy) : []
-  call delete(dir, "rf")
-
   if status != 0
-    " Name the buffer's file in the messages, not the copy.
-    let shown = expand("%") ==# "" ? "[No Name]" : expand("%")
-    let lines = map(split(output, "\n"), {_, l -> substitute(l, '\V' . escape(copy, '\'), escape(shown, '\&~'), 'g')})
-    call s:Error(["TurkeyFormat: '" . command . " format' exited with status " . status] + lines)
+    call s:Error(["TurkeyFormat: '" . command . " format' exited with status " . status]
+          \ + split(output, "\n"))
     return 0
   endif
+  let after = split(output, "\n", 1)[: -2]
   if after ==# before
     return 1
   endif
@@ -83,6 +82,23 @@ function! turkey#Format() abort
   endif
   call winrestview(view)
   return 1
+endfunction
+
+" Formats for `gq` and the other users of 'formatexpr'. Formats the whole
+" buffer when the lines to format hold any code: a range of a program is not
+" a program, so the formatter cannot read it alone. Leaves comment and blank
+" lines, and text typed past 'textwidth', to Vim's own formatting, which
+" wraps them; the formatter never rewraps a comment.
+function! turkey#FormatExpr() abort
+  if v:char !=# "" || mode() =~# '^[iR]'
+    return 1
+  endif
+  let lines = getline(v:lnum, v:lnum + v:count - 1)
+  if empty(filter(lines, {_, l -> l !~# '^\s*\%(--.*\)\=$'}))
+    return 1
+  endif
+  call turkey#Format()
+  return 0
 endfunction
 
 " Formats the buffer before it is written when `b:turkey_format_on_save` or

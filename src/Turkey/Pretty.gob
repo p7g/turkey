@@ -592,16 +592,17 @@ fun chosen(p : P, indent : Int, alternatives : Vec Doc, stack : Vec Cmd) -> Cmd 
 -- argument's first line ends.
 fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool = fitsIn(p.width - p.pos, next, stack)
 
--- Whether the head of `d`, the text before its first `Tail`, fits in `room`
--- columns laid out flat. A `d` with no `Tail` is measured flat, and what
--- follows it on the stack as `fits` measures it.
+-- Whether the head of `d` fits in `room` columns: the text before its first
+-- `Tail` laid out flat, and then the tail's first line, up to where the tail
+-- itself breaks. A `d` with no `Tail` is measured flat, and what follows it
+-- on the stack as `fits` measures it.
 fun headFits(room : Int, d : Doc, stack : Vec Cmd) -> Bool {
     var remaining = room
     let todo = [d]
     while let Some(doc) = Vec.pop(todo) {
         if remaining < 0 { return False }
         match doc {
-            Tail(_) -> return True
+            Tail(inner) -> return tailFits(remaining, inner)
             Empty | Suffix(_, _) -> {}
             Text(_, w) -> { remaining = remaining - w }
             Raw(s) | Shifted(s, _) -> {
@@ -625,6 +626,45 @@ fun headFits(room : Int, d : Doc, stack : Vec Cmd) -> Bool {
         }
     }
     remaining >= 0 && fitsIn(remaining, Cmd { indent = 0, mode = Flattening, doc = Empty }, stack)
+}
+
+-- Whether the first line of the tail `d` fits in `room` columns. The tail
+-- breaks at its own line breaks, and a group inside it after its first text
+-- is laid out flat, so the first line of `if a + b {` is all of it and that
+-- of `{` is the brace. A group before any text is the tail's own broken form,
+-- such as a record's braces, and breaks with it.
+fun tailFits(room : Int, d : Doc) -> Bool {
+    var remaining = room
+    var started = False
+    let todo = [d]
+    while let Some(doc) = Vec.pop(todo) {
+        if remaining < 0 { return False }
+        match doc {
+            Line(_) | Hard | Rows(_) | Below(_, _) -> return True
+            Empty | Suffix(_, _) -> {}
+            Text(_, w) -> {
+                remaining = remaining - w
+                started = True
+            }
+            Group(_, inner) -> if started { remaining = remaining - columns(renderFlat(doc)) } else {
+                Vec.push(todo, inner)
+            }
+            Raw(s) | Shifted(s, _) -> {
+                remaining = remaining - columns(Option.unwrapOr(Vec.at(String.lines(s), 0), ""))
+                if String.contains(s, "\n") { return remaining >= 0 }
+                started = True
+            }
+            Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 { Vec.push(todo, parts[i]) }
+            Nest(_, inner) | Headed(inner) | Tail(inner) -> Vec.push(todo, inner)
+            IfBreak(broken, _) -> Vec.push(todo, broken)
+            Flat(_) | Choice(_) -> { remaining = remaining - columns(renderFlat(doc)) }
+            Fill(items) -> {
+                if len(items) > 0 { remaining = remaining - columns(renderFlat(items[0])) }
+                return remaining >= 0
+            }
+        }
+    }
+    remaining >= 0
 }
 
 -- `fits`, with `room` columns left on the line.

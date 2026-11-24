@@ -149,6 +149,49 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
     assert "internal error" not in result.stderr, result.stderr
 
 
+def _columns(line: str) -> int:
+    return sum(4 if c == "\t" else 1 for c in line)
+
+
+def _may_run_long(line: str) -> bool:
+    """Whether a formatted line longer than the width is long for a reason the
+    layout cannot break: comments, which do not count toward the width; a
+    string literal; alignment, which pads a row after it is laid out, so the
+    padding can carry a row past the width; or a function's constraints in
+    brackets, which the printer does not break."""
+    code = re.sub(r"\{-.*?-\}", "", line)
+    if code.lstrip().startswith("--"):
+        return True
+    code = re.sub(r"\s--.*$", "", code).rstrip()
+    if _columns(code) <= 100:
+        return True
+    if _columns(re.sub(r'"(\\.|[^"\\])*"', '""', code)) <= 100:
+        return True
+    if _columns(re.sub(r"(\S)  +(->|=|:) ", r"\1 \2 ", code)) <= 100:
+        return True
+    return re.match(r"\s*fun [^(]*\[", code) is not None
+
+
+def test_the_corpus_fits_the_width(tmp_path: Path) -> None:
+    # A line over the width that could have broken is a layout that measured
+    # wrongly, such as a head whose `{` went uncounted.
+    copies = []
+    for top in ("lib", "src", "examples"):
+        for p in (ROOT / top).rglob("*.gob"):
+            target = tmp_path / p.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(p, target)
+            copies.append(str(target))
+    result = fmt(*copies)
+    assert result.returncode == 0, result.stderr
+    long = []
+    for name in copies:
+        for n, line in enumerate(Path(name).read_text().split("\n"), 1):
+            if _columns(line) > 100 and not _may_run_long(line):
+                long.append(f"{Path(name).relative_to(tmp_path)}:{n}: {line.strip()}")
+    assert long == []
+
+
 def _with_block_comments(text: str) -> str:
     """`text` with a block comment in every space between two tokens of each
     code line. A line with a quote or a comment on it is left alone, so no

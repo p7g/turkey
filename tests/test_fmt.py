@@ -282,6 +282,7 @@ AWKWARD = {
     "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
     "foreign_blocks": "foreign \"env\" {\n    \"log\" fun log(x : Int) -> Unit\n}\nforeign \"ssl\" 3 { \"f\" fun g(x : Int) -> Int }\n",
     "comments_before_aligned_trailing_comments": "fun main() {\n    let a = f(1) {- c -} -- one\n    let bb = 2 -- two\n    let c = 3 {- x -} {- y -} -- three\n}\n",
+    "no_hug_after_same_shape": "fun build(obj : Object) {\n    let byLibrary = fun(a : Symbol, b : Symbol) =\n        Array.threeWay((ordinal(a), a.name), (ordinal(b), b.name))\n    send(socket, [headerLength, payloadLength, checksumOfThePayload], [sequenceNumber, flagsOfThePacket])\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -406,6 +407,19 @@ AWKWARD_OUTPUT = {
         "\tlet a = f(1) {- c -}         -- one\n"
         "\tlet bb = 2                   -- two\n"
         "\tlet c = 3    {- x -} {- y -} -- three\n"
+        "}\n"
+    ),
+    "no_hug_after_same_shape": (
+        "fun build(obj : Object) {\n"
+        "\tlet byLibrary = fun(a : Symbol, b : Symbol) = Array.threeWay(\n"
+        "\t\t(ordinal(a), a.name),\n"
+        "\t\t(ordinal(b), b.name),\n"
+        "\t)\n"
+        "\tsend(\n"
+        "\t\tsocket,\n"
+        "\t\t[headerLength, payloadLength, checksumOfThePayload],\n"
+        "\t\t[sequenceNumber, flagsOfThePacket],\n"
+        "\t)\n"
         "}\n"
     ),
 }

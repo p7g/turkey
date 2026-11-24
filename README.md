@@ -150,7 +150,9 @@ unless a test asks for more, since it runs a process per core already.
 `TURKEY_SINGLE_THREAD`, set to anything, goes further: the program starts no
 thread at all, so `main` and every task run on the thread the process started
 on, with that thread's stack, and a call that blocks blocks the whole program.
-It overrides `TURKEY_WORKERS`.
+A lookup's timeout (`Net.lookup`) does not hold in this mode: no other thread
+can finish the lookup's call, so the lookup waits for the resolver. The mode
+overrides `TURKEY_WORKERS`.
 The suite also sets `TURKEY_CHECK_BINDERS`, which has the compiler check that
 name resolution recorded a binder for every variable a program binds or reads;
 a gap is an internal error. It costs a walk of the program, so it is off

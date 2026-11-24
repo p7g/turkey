@@ -124,3 +124,97 @@ def test_without_the_mode_the_same_program_starts_threads(program):
     seen, out = counted(program, TURKEY_WORKERS="4")
     assert all(n > 1 for n in seen)
     assert out == OUTPUT
+
+
+# Waits from `main`'s own stack that a task ends: a semaphore's permit, given
+# back by a task while `main` waits, and a detached call, which the one thread
+# runs to its end however early its deadline when the call does not wait. The tasks allocate, so that a
+# collection under `TURKEY_GC_STRESS` finds them parked and running.
+WAITS = """
+import System.Sync as Sync
+import System.Task as Task
+import Time.Deadline as Deadline
+import Time.Duration as Duration
+import Time.Sleep as Sleep
+import Turkey.Detach as Detach
+
+fun squares(n : Int) -> Vec String {
+    let out : Vec String = []
+    for var i = 0; i < n; i = i + 1 {
+        Vec.push(out, Int.toString(i * i))
+        Task.yield()
+    }
+    out
+}
+
+fun squaresAtOnce(n : Int) -> Vec String {
+    let out : Vec String = []
+    for var i = 0; i < n; i = i + 1 { Vec.push(out, Int.toString(i * i)) }
+    out
+}
+
+fun main() {
+    let s = Sync.semaphore(0)
+    let (got, a, b) = Task.runScope(do {
+        let a = Task.spawn(fun() = squares(20))?
+        let b = Task.spawn(fun() = squares(30))?
+        let _ = Task.spawn(fun() {
+            Sleep.sleep(Duration.millis(10))
+            Sync.release(s)
+        })?
+        pure((Sync.acquire(s, Some(Deadline.after(Duration.seconds(5)))), a, b))
+    })
+    print(got)
+    print(Sync.acquire(s, Some(Deadline.after(Duration.millis(10)))))
+    print(len(Task.join(a)) + len(Task.join(b)))
+    print(Task.join(b)[29])
+    -- A deadline on `Turkey.Wait.now`'s clock that passed long ago, for a
+    -- call that never waits, as a C call does not.
+    print(Detach.run(fun() = Int.toString(len(squaresAtOnce(3))), fun(_) = {}, 1))
+}
+"""
+
+WAITS_OUTPUT = 'True\nFalse\n50\n841\nRight("3")\n'
+
+
+def built(directory: Path, source: str, *flags: str) -> Path:
+    entry = directory / "main.gob"
+    entry.write_text(source)
+    binary = directory / "program"
+    imports = os.environ[bootc.INTERNAL_IMPORTS] + ",Turkey.Detach"
+    bootc.executable(entry, binary, *flags,
+                     env=dict(os.environ, **{bootc.INTERNAL_IMPORTS: imports}))
+    return binary
+
+
+def single(binary: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(toolchain.command(binary), capture_output=True,
+                          text=True, timeout=120,
+                          env=dict(os.environ, TURKEY_SINGLE_THREAD="1", **env))
+
+
+def test_main_waits_for_a_task_and_a_detached_call_on_the_one_thread(tmp_path):
+    ran = single(built(tmp_path, WAITS))
+    assert ran.returncode == 0, ran.stderr
+    assert ran.stdout == WAITS_OUTPUT
+
+
+def test_collections_with_tasks_on_the_one_thread(tmp_path):
+    # Tasks with no registered thread are a state only this mode has:
+    # collect, and verify the heap, at every allocation.
+    ran = single(built(tmp_path, WAITS, "--gc-verify"), TURKEY_GC_STRESS="1")
+    assert ran.returncode == 0, ran.stderr
+    assert ran.stdout == WAITS_OUTPUT
+
+
+def test_a_wait_nothing_can_end_is_a_deadlock(tmp_path):
+    # Without the mode, `main` would sleep apart from the tasks for ever.
+    ran = single(built(tmp_path, """
+import System.Sync as Sync
+
+fun main() {
+    Sync.waitEventUnbounded(Sync.event())
+}
+"""))
+    assert ran.returncode == 1
+    assert ran.stderr.startswith("panic: deadlock: every task is waiting\n")

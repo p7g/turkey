@@ -190,10 +190,18 @@ def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
     ) == "'print' is not defined"
 
 
-def test_the_prelude_qualifiers_go_with_the_prelude(tmp_path):
-    """`Vec.`, `String.` and the rest come with any Prelude import but the
-    empty one."""
-    check("import Prelude (Int)\nfun f() -> Int = String.byteLength(\"ab\")", {})
+def test_the_prelude_qualifiers_are_names_its_import_lists(tmp_path):
+    """`Vec.`, `String.` and the rest are exports of the Prelude: the implicit
+    import brings them all, and an explicit one those its list names. Each
+    stays reachable through the qualifier `Prelude`."""
+    check("fun f() -> Int = String.byteLength(\"ab\")", {})
+    check("import Prelude (Int, module String)\n"
+          "fun f() -> Int = String.byteLength(\"ab\")", {})
+    check("import Prelude (Int)\n"
+          "fun f() -> Int = Prelude.String.byteLength(\"ab\")", {})
+    assert fails("import Prelude (Int)\n"
+                 "fun f() -> Int = String.byteLength(\"ab\")", {}) == \
+        "'String.byteLength' is not defined"
     assert fails("import Prelude ()\nimport Data.Int (Int)\n"
                  "fun f() -> Int = String.byteLength(\"ab\")", {}) == \
         "'String.byteLength' is not defined"

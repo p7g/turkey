@@ -8,9 +8,9 @@ available. It does not document the rest of the library.
 
 ## The Prelude
 
-Every module implicitly imports the module `Prelude`. A module that imports
-`Prelude` explicitly gets that import instead of the implicit one, so
-`import Prelude (print)` brings in only `print`.
+Every module implicitly imports the module `Prelude`, as `import Prelude (..)`
+would. A module that imports `Prelude` explicitly gets that import instead of
+the implicit one, so `import Prelude (print)` brings in only `print`.
 
 The Prelude provides these names unqualified:
 
@@ -21,14 +21,20 @@ The Prelude provides these names unqualified:
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
-With the Prelude, a module also imports the library modules `Data.Array`,
-`Data.Bool`, `Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`,
-`Data.Float`, `Data.Int`, `Iter`, `Data.Map`, `Data.Option`,
-`Data.Ordering`, `Data.String`, `Data.Vec` and `FrozenArray` under the last
-part of their names, as `import Data.Vec as Vec` would. That is why `Vec.push` and
-`Int.parse` need no import, while the bare names `push` and `parse` stay free
-for a program to use. An explicit Prelude import keeps these, and only
-`import Prelude ()` leaves them out.
+The Prelude also exports the library modules `Data.Array`, `Data.Bool`,
+`Data.Byte`, `Data.Char`, `Data.Either`, `Data.Error`, `Data.Float`,
+`Data.Int`, `Iter`, `Data.Map`, `Data.Option`, `Data.Ordering`,
+`Data.String`, `Data.Vec` and `FrozenArray` as qualifiers, each under the
+last part of its name
+([Exporting a qualifier](modules.md#exporting-a-qualifier)). That is why
+`Vec.push` and `Int.parse` need no import, while the bare names `push` and
+`parse` stay free for a program to use. An explicit Prelude import brings the
+qualifiers its list names, as it does any other name:
+`import Prelude (print, module Vec)`.
+
+The Prelude declares none of this itself. It passes on the library module
+`Turkey`, which a program's own Prelude starts from
+([The Prelude](modules.md#the-prelude)).
 
 No module a program can import exports the constructor of `String`. A
 program reads a string's bytes with `String.toBytes`, which copies them,

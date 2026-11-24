@@ -663,9 +663,14 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
         Map.put(imported, wanted, module_)
         Vec.push(edges, module_)
     }
-    -- The startup module, the Prelude's qualifiers and the well-known names
-    -- are the library's whatever the program holds: the compiler adds them
-    -- and names what they declare.
+    -- The startup module, the module of `Flow` and the well-known names are
+    -- the library's whatever the program holds: the compiler adds them and
+    -- names what they declare.
+    --
+    -- `Flow` is a dependency of every module, because desugaring may write
+    -- its constructors into any of them and no import says so. It imports
+    -- nothing, so the edge closes no cycle.
+    if name != Prelude.flowModule { Vec.push(edges, Prelude.flowModule) }
     if entry && declaresMain(program) { Vec.push(edges, startupModule) }
     if written != Prelude.preludeName && !hasPreludeImport(program) {
         edge(Prelude.preludeName)
@@ -677,11 +682,6 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
             continue
         }
         if importsModule(imp) { edge(imp.name) }
-    }
-    -- After the Prelude, which imports each of these itself, so that they
-    -- change nothing about the order modules load in.
-    if getsPrelude(written, program) {
-        for q in Prelude.preludeQualifiers { Vec.push(edges, q) }
     }
     -- Last, so that it changes nothing about the order the program's own
     -- modules load in: what it re-exports is usually loaded by then.
@@ -696,23 +696,6 @@ fun importsModule(imp : ImportDecl) -> Bool = !optsOut(imp)
 -- `import Prelude ()`, the one import that brings nothing.
 fun optsOut(imp : ImportDecl) -> Bool =
     imp.name == Prelude.preludeName && !imp.rest && isEmptyList(imp.items)
-
--- Whether the module written `name` has the Prelude, implicitly or by an
--- import that names something from it.
-fun getsPrelude(name : String, program : Program) -> Bool {
-    if name == Prelude.preludeName { return False }
-    for imp in program.imports {
-        if optsOut(imp) { return False }
-    }
-    True
-}
-
--- The qualifier the Prelude gives the module `m`: the last component of its
--- name.
-fun preludeQualifier(m : String) -> String = match String.rsplitOnce(m, ".") {
-    Some((_, last)) -> last
-    None -> m
-}
 
 -- Register a finished component's declarations and make its modules' tables.
 fun finish(l : Loader, names : Vec String) -> Unit {
@@ -916,15 +899,12 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         }
     }
 
-    if getsPrelude(written(m), m.program) {
+    -- The implicit import, `import Prelude (..)`, of a module that is not
+    -- the Prelude and writes no import of it.
+    if written(m) != Prelude.preludeName && !hasPreludeImport(m.program) {
         let implicit = newScope()
-        if !hasPreludeImport(m.program) {
-            bring(l, implicit, importedBy(l, m, Prelude.preludeName), Prelude.preludeName,
-                  None, AllBare, strict)
-        }
-        for q in Prelude.preludeQualifiers {
-            bring(l, implicit, moduleNamed(l, q), preludeQualifier(q), None, NoBare, strict)
-        }
+        bring(l, implicit, importedBy(l, m, Prelude.preludeName), Prelude.preludeName,
+              None, AllBare, strict)
         let from = spaces(implicit)
         let into = spaces(scope)
         for var i = 0; i < len(into); i = i + 1 {

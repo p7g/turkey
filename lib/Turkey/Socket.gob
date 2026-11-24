@@ -29,6 +29,9 @@ export (
 --- `Turkey.IO` lends its buffers, with the port and the address in network
 --- order. Darwin starts a `sockaddr` with its length and family in a byte
 --- each, where Linux has a two-byte family.
+---
+--- **No sockets on wasm32-wasi.** WASI preview 1 has none, so each function
+--- that would make a system call panics there instead, saying so.
 
 import Turkey.IO as IO
 import Turkey.Libc as Libc
@@ -70,6 +73,7 @@ fun prepared(fd : Int) -> Int {
 --- `-EINPROGRESS` if it goes on in the background, when `connected` says how
 --- it ended.
 fun connect(fd : Int, ip : IP, port : Int) -> Int {
+    if let Wasi = Target.os { return Process.unsupported(0) }
     let address = sockaddr(ip, port)
     let r = Sys.cResult(Libc.connect(fd, IO.addressOf(address, 0), len(address)))
     Ptr.keepAlive(address)
@@ -81,6 +85,7 @@ fun connect(fd : Int, ip : IP, port : Int) -> Int {
 --- negated `errno` it failed with. `SO_ERROR` gives the failure and clears it;
 --- a socket with none that has no peer has not finished.
 fun connected(fd : Int) -> Int {
+    if let Wasi = Target.os { return Process.unsupported(0) }
     let value = Array.filled(4, Byte.truncate(0))
     let length = socklen(4)
     let r = Sys.cResult(Libc.getsockopt(fd, Sys.solSocket(), Sys.soError(),
@@ -101,6 +106,7 @@ fun connected(fd : Int) -> Int {
 --- still hold in `TIME_WAIT`. `backlog` bounds the connections the kernel
 --- holds that `accept` has not taken; it caps it at its own limit.
 fun listen(ip : IP, port : Int, backlog : Int) -> Int {
+    if let Wasi = Target.os { return Process.unsupported(0) }
     let fd = open(ip)
     if fd < 0 { return fd }
     var r = setOption(fd, Sys.solSocket(), Sys.soReuseAddress(), 1)
@@ -141,12 +147,16 @@ fun accept(fd : Int) -> Int {
 fun setNoDelay(fd : Int) -> Int = setOption(fd, Sys.ipprotoTCP, Sys.tcpNoDelay, 1)
 
 --- Send a FIN: the peer reads the end of input, and can still write.
-fun shutdownWrite(fd : Int) -> Int = Sys.cResult(Libc.shutdown(fd, Sys.shutWrite))
+fun shutdownWrite(fd : Int) -> Int {
+    if let Wasi = Target.os { return Process.unsupported(0) }
+    Sys.cResult(Libc.shutdown(fd, Sys.shutWrite))
+}
 
 --- Up to `to - from` bytes of `bytes[from..to)`: how many went, or the negated
 --- `errno`, `-EPIPE` where `write` would raise `SIGPIPE`.
 fun send(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if from < 0 || to < from || to > len(bytes) { error("send: a window outside the array") }
+    if let Wasi = Target.os { return Process.unsupported(0) }
     let n = Sys.result(Libc.send(fd, IO.addressOf(bytes, from), to - from, Sys.msgNoSignal()))
     Ptr.keepAlive(bytes)
     n
@@ -197,6 +207,7 @@ fun sockaddr(ip : IP, port : Int) -> Array Byte {
 
 -- What `call(address, length)` stores, read as an address and a port.
 fun named(call : fun(Ptr, Ptr) -> Int) -> Either Int (IP, Int) {
+    if let Wasi = Target.os { return Process.unsupported(Left(0)) }
     let a = Array.filled(Sys.sockaddrIn6Bytes, Byte.truncate(0))
     let length = socklen(Sys.sockaddrIn6Bytes)
     let r = Sys.cResult(call(IO.addressOf(a, 0), IO.addressOf(length, 0)))
@@ -226,6 +237,7 @@ fun socklen(n : Int) -> Array Byte {
 
 -- Set an `int` socket option.
 fun setOption(fd : Int, level : Int, name : Int, value : Int) -> Int {
+    if let Wasi = Target.os { return Process.unsupported(0) }
     let v = Array.filled(4, Byte.truncate(0))
     Byte.putLE(v, 0, 4, value)
     let r = Sys.cResult(Libc.setsockopt(fd, level, name, IO.addressOf(v, 0), 4))

@@ -477,7 +477,8 @@ def test_a_block_declares_something():
 #
 # A block with no version names a WebAssembly module the host provides. Its
 # declarations are what a wasm program imports, so the arm64 register limit
-# does not bind them, and only a wasm target may call one.
+# does not bind them, and only a wasm target may call one. A wasm program has
+# no C library, so the converse holds there.
 
 
 def _build(entry: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -538,3 +539,26 @@ def test_an_arm64_program_cannot_call_a_wasm_import(probe):
     assert result.returncode != 0
     assert ("'probe_now' is imported from the wasm module 'probe_module', which only a "
             "wasm target can call") in result.stderr, result.stderr
+
+
+def test_a_wasm_program_cannot_call_the_c_library(probe):
+    """The low IR is checked before the backend: a C symbol on wasm is the
+    library's mistake, a `match Target.os` without its `Wasi` arm."""
+    entry = program(probe((
+        "export (home)\n"
+        'foreign "getenv" fun getenv(name : Prim.Ptr) -> Prim.Ptr\n'
+        "fun home() -> Bool = Prim.ptrIsNull(getenv(Prim.cString(\"HOME\")))\n"
+    )).replace("fun main() { }", "fun main() { print(P.home()) }"))
+    result = _build(entry, "--target", "wasm32-wasi")
+    assert result.returncode != 0
+    assert "internal error: 'wasm32-wasi' has no C library, and the program calls it:" \
+        in result.stderr, result.stderr
+    assert "'getenv', called by" in result.stderr, result.stderr
+
+
+def test_a_wasm_program_may_call_a_wasm_import(probe):
+    entry = program(probe(WASM_CALL).replace("fun main() { }", "fun main() { print(P.now()) }"))
+    result = _build(entry, "--target", "wasm32-wasi")
+    assert result.stderr.endswith(
+        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
+        "compiles as far as the low IR\n"), result.stderr

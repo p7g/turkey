@@ -51,6 +51,7 @@ import Data.Bool (Bool(..))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
+import Turkey.Os as Os
 import Turkey.Process as Process
 import Data.Int as Int
 import Turkey.Ptr (Ptr)
@@ -58,7 +59,7 @@ import Turkey.Ptr as Ptr
 
 --- A fresh, unlocked lock; a panic if there is no memory for one.
 fun new() -> Ptr {
-    let lock = Libc.malloc(24)
+    let lock = Os.malloc(24)
     if Ptr.isNull(lock) {
         Process.panic(Prim.cString("could not make a lock"))
         return lock
@@ -85,7 +86,7 @@ fun contended(lock : Ptr) -> Unit {
         if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
     }
     for var i = 0; i < 4; i = Int.addWrapping(i, 1) {
-        let _ = Libc.schedYield()
+        let _ = Os.schedYield()
         if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
     }
     while True {
@@ -131,7 +132,9 @@ fun wait(word : Ptr, value : Int) -> Unit = match Target.os {
     -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
     -- value waited on here fits in them, and the high ones stay zero.
     Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Ptr.null()) }
-    Wasi -> Process.unsupported(())
+    -- One thread, so nothing else could change the word: return, and the
+    -- caller tests again.
+    Wasi -> {}
 }
 
 --- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
@@ -141,14 +144,14 @@ fun waitFor(word : Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.o
     Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
     -- A relative `struct timespec`, in storage of its own: threads wait at once.
     Linux -> {
-        let timespec = Libc.malloc(16)
+        let timespec = Os.malloc(16)
         if Ptr.isNull(timespec) { return wait(word, value) }
         Ptr.store(timespec, 0, nanoseconds / 1000000000)
         Ptr.store(timespec, 8, nanoseconds % 1000000000)
         let _ = Libc.syscall(futex(), word, 128, value, timespec)
-        Libc.free(timespec)
+        Os.free(timespec)
     }
-    Wasi -> Process.unsupported(())
+    Wasi -> {}
 }
 
 --- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
@@ -160,14 +163,15 @@ fun wake(word : Ptr) -> Bool = match Target.os {
         let woken = Libc.syscall(futex(), word, 129, 1, Ptr.null()) & 0xFFFF_FFFF
         woken > 0 && woken < 0x8000_0000
     }
-    Wasi -> Process.unsupported(False)
+    -- No other thread to be sleeping.
+    Wasi -> False
 }
 
 --- Wake every thread sleeping on `word`.
 fun wakeAll(word : Ptr) -> Unit = match Target.os {
     Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
     Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Ptr.null()) }
-    Wasi -> Process.unsupported(())
+    Wasi -> {}
 }
 
 -- `SYS_futex` on arm64 Linux.

@@ -50,6 +50,7 @@ import Turkey.Errors (IOError)
 import Turkey.Errors as Errors
 import Turkey.IO as IO
 import Turkey.Libc as Libc
+import Turkey.Os as Os
 import Turkey.Process as Process
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
@@ -123,7 +124,7 @@ let registry : Mutex Registry = Sync.mutex(Registry {
 })
 
 -- Where the pipe is read to, with the registry's mutex held.
-let drainBuffer : Ptr = Libc.malloc(64)
+let drainBuffer : Ptr = Os.malloc(64)
 let drainBytes : Int = 64
 
 --- Returns a listener for `signals`, which from now on keeps every one of them
@@ -157,9 +158,17 @@ fun catch(r : Registry, s : Signal) -> Unit {
     let i = index(s)
     if r.listening[i] == 0 {
         let _ = Entry.signalTake(number(s))
-        r.previous[i] = Ptr.toInt(Libc.signal(number(s), Entry.signalHandler()))
+        r.previous[i] = Ptr.toInt(handlerSet(number(s), Entry.signalHandler()))
     }
     r.listening[i] = r.listening[i] + 1
+}
+
+-- Install `handler` for signal `n`, answering the one it replaces. WASI
+-- preview 1 has no signals, so on wasm32-wasi a program that listens for one
+-- panics here.
+fun handlerSet(n : Int, handler : Ptr) -> Ptr = match Target.os {
+    Wasi -> Process.unsupported(Ptr.null())
+    _ -> Libc.signal(n, handler)
 }
 
 -- A pipe for the handler: the read end, which this module keeps, or the
@@ -167,7 +176,7 @@ fun catch(r : Registry, s : Signal) -> Unit {
 -- handler must never wait, the read end because a wait reads it empty -- and
 -- close-on-exec.
 fun makePipe() -> Either Int Int {
-    let fds = Libc.malloc(8)
+    let fds = Os.malloc(8)
     if Ptr.isNull(fds) { return Left(-Sys.enomem) }
     let made = match Target.os {
         Darwin -> Sys.cResult(Libc.pipe(fds))
@@ -176,7 +185,7 @@ fun makePipe() -> Either Int Int {
     }
     let read = Ptr.load32(fds, 0)
     let write = Ptr.load32(fds, 4)
-    Libc.free(fds)
+    Os.free(fds)
     if made < 0 { return Left(made) }
     var failure = 0
     match Target.os {
@@ -268,7 +277,7 @@ fun take(l : Listener) -> Take = Sync.withLock(registry, fun(r) {
 -- after its count was taken wrote its byte after the pipe was emptied, so
 -- the byte is there for the next wait.
 fun deliver(r : Registry) -> Unit {
-    while Libc.read(r.readEnd, drainBuffer, drainBytes) > 0 {}
+    while Os.read(r.readEnd, drainBuffer, drainBytes) > 0 {}
     for s in kinds {
         if Entry.signalTake(number(s)) > 0 {
             for l in r.listeners {
@@ -301,7 +310,7 @@ fun release(r : Registry, s : Signal) -> Unit {
     let i = index(s)
     r.listening[i] = r.listening[i] - 1
     if r.listening[i] == 0 {
-        let _ = Libc.signal(number(s), Ptr.fromInt(r.previous[i]))
+        let _ = handlerSet(number(s), Ptr.fromInt(r.previous[i]))
         let _ = Entry.signalTake(number(s))
     }
 }

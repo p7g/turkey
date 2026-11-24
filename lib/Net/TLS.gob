@@ -93,6 +93,8 @@ export (
 
 import Net (Connection(..), HasConnectionInfo(..), ConnectionInfo(..), TLSInfo(..), accept, closeListener)
 import Net as Net
+import Target (OS(..))
+import Target as Target
 import Net.TCP (Listener)
 import Net.TCP as TCP
 import System.Sync as Sync
@@ -107,6 +109,7 @@ import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.Errors as Errors
 import Turkey.IO as IO
 import Turkey.OpenSSL as SSL
+import Turkey.Process as Runtime
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Turkey.ReadWrite (Read(..), Write(..), needsRoom)
@@ -198,6 +201,9 @@ type ServerConfig = ServerConfig {
 
 --- A client configuration trusting `roots` and offering `protocols` by ALPN.
 fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError ClientConfig {
+    -- WASI preview 1 has no OpenSSL to load, so on wasm32-wasi each entry
+    -- that would call it panics.
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     let wire = alpnWire(protocols)?
     SSL.errClearError()
     let ctx = SSL.ctxNew(SSL.tlsClientMethod())
@@ -231,6 +237,7 @@ fun configureClient(ctx : Ptr, roots : Roots) -> Either TLSError Unit {
 --- accepting `protocols` by ALPN.
 fun serverConfig(certificates : Array Certificate, protocols : Array String)
         -> Either TLSError ServerConfig {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     if len(certificates) == 0 {
         return Left(Configuration("a server needs at least one certificate"))
     }
@@ -290,17 +297,23 @@ fun configureCommon(ctx : Ptr) -> Either TLSError Unit {
 
 --- Free `c`'s context. Connections made from it keep working; a `client` after
 --- it fails with `Configuration`. Releasing it again does nothing.
-fun releaseClient(c : ClientConfig) -> Unit = Sync.update(c.ctx, fun(ctx) {
-    if !Ptr.isNull(ctx) { SSL.ctxFree(ctx) }
-    Ptr.null()
-})
+fun releaseClient(c : ClientConfig) -> Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(()) }
+    Sync.update(c.ctx, fun(ctx) {
+        if !Ptr.isNull(ctx) { SSL.ctxFree(ctx) }
+        Ptr.null()
+    })
+}
 
 --- Free `c`'s contexts. Connections made from it keep working; a `server` or
 --- `accept` after it fails. Releasing it again does nothing.
-fun releaseServer(c : ServerConfig) -> Unit = Sync.update(c.contexts, fun(contexts) {
-    for ctx in contexts { SSL.ctxFree(ctx) }
-    []
-})
+fun releaseServer(c : ServerConfig) -> Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(()) }
+    Sync.update(c.contexts, fun(contexts) {
+        for ctx in contexts { SSL.ctxFree(ctx) }
+        []
+    })
+}
 
 -- `protocols` in ALPN's wire form: each name after a byte of its length.
 fun alpnWire(protocols : Array String) -> Either TLSError (Array Byte) {
@@ -526,6 +539,7 @@ fun newTLS(stream : Under, ssl : Ptr, rbio : Ptr, wbio : Ptr, block : Ptr,
 --- handshake replaces any deadline `conn` had, and leaves it with none.
 fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
         conn : c, to : Destination, config : ClientConfig, timeout : t) -> Either TLSError TLS {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     let name = checkedName(to.host)?
     SSL.errClearError()
     let ssl = Sync.withLock(config.ctx, fun(ctx) =
@@ -567,6 +581,7 @@ fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
 -- `server`, whose `connectionInfo` reports `local` and `peer`.
 fun serverAt[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
         conn : c, config : ServerConfig, local : Option (IP, Int), peer : Option (IP, Int)) -> Either TLSError TLS {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     SSL.errClearError()
     let made = Sync.withLock(config.contexts, fun(contexts) =
         if len(contexts) == 0 { None } else { Some(SSL.sslNew(contexts[0])) })
@@ -684,6 +699,7 @@ fun using(t : TLS, op : String, f : fun() -> Either TLSError a) -> Either TLSErr
 -- With `engine` held: free the OpenSSL connection once it is closed and
 -- nothing is using it, then the block its callbacks read.
 fun retire(engine : Engine) -> Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(()) }
     if !engine.closed || engine.users > 0 || Ptr.isNull(engine.ssl) { return }
     SSL.sslFree(engine.ssl)
     engine.ssl = Ptr.null()
@@ -736,6 +752,7 @@ fun settled(t : TLS) -> Either TLSError Unit {
 -- With `reading` held: the handshake, to its end. Another task may have
 -- finished it while this one waited for `reading`, which the first step finds.
 fun shake(t : TLS, incoming : Buffer) -> Either TLSError Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     loop {
         let step = withEngine(t, fun(engine) {
             if let Some(e) = engine.failed { return Failed(e) }
@@ -839,6 +856,7 @@ fun requestedName(ssl : Ptr) -> Option String {
 -- With `reading` held: decrypted bytes into `into`, reading the peer's
 -- bytes until OpenSSL has some.
 fun receive(t : TLS, incoming : Buffer, into : Buffer) -> Either TLSError Int {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     loop {
         var pending = False
         let step = withEngine(t, fun(engine) {
@@ -877,6 +895,7 @@ fun receive(t : TLS, incoming : Buffer, into : Buffer) -> Either TLSError Int {
 -- With `sending` held: encrypt `from`'s window a record at a time, and send
 -- each.
 fun transmit(t : TLS, outgoing : Buffer, from : Buffer) -> Either TLSError Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     var at = from.start
     while at < from.end {
         let chunk = if from.end - at < recordBytes { from.end - at } else { recordBytes }
@@ -922,6 +941,7 @@ fun fill(t : TLS, incoming : Buffer) -> Either TLSError Unit {
 -- sends it instead, since every write looks at `wbio` again after releasing
 -- `sending`; so the bytes go out either way.
 fun send(t : TLS) -> Either TLSError Unit {
+    if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
     -- Never wait for `sending` here. A read calls this, and the holder may be
     -- a write waiting for the peer to read, while the peer waits for this
     -- task to read.

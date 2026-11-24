@@ -945,7 +945,9 @@ searches `$TURKEY_DYLIB_PATH` alone, and is refused without it.
 A block with no version names a WebAssembly module, whose functions a
 program compiled for `wasm32-wasi` imports from its host under that module's
 name. Only that target can call one: a call reached in a program compiled for
-another target stops the build. An import takes any number of arguments, since wasm passes them on its
+another target stops the build. A wasm program has no C library, so there the
+converse holds, and the build stops at a call to a declaration outside every
+block. An import takes any number of arguments, since wasm passes them on its
 operand stack, and none variadic. Across the boundary a `Prim.Ptr` is a
 32-bit address, `Int` a 64-bit integer, `Prim.Int32`, `Byte`, `Char` and
 `Bool` 32-bit ones, and `Float` a 64-bit float:

@@ -492,9 +492,8 @@ fun rewrite(r : Rewriter, e : Core) -> Core = match e.kind {
 fun rewriteDict(r : Rewriter, e : Core, cls : String, slots : Array Core) -> Core {
 	if len(Map.keys(r.subst)) == 0 { return generic(r, e) }
 	let ty = rTy(r, e.ty)
-	let head = match Ty.spine(Ty.prune(ty)) {
-		(_, args) -> if len(args) == 1 { Some(args[0]) } else { None }
-	}
+	let (_, args) = Ty.spine(Ty.prune(ty))
+	let head = if len(args) == 1 { Some(args[0]) } else { None }
 	let info = Map.get(r.owner.classes.classes, cls)
 	let out = Array.init(len(slots), fun(i) {
 		let method = match (Classes.slotAt(r.owner.classes, cls, i), info) {
@@ -502,11 +501,10 @@ fun rewriteDict(r : Rewriter, e : Core, cls : String, slots : Array Core) -> Cor
 			(Some(KeyedSlot(name, _)), Some(c)) -> Map.get(c.methods, name)
 			_                                   -> None
 		}
-		match (method, head) {
-			(Some(m), Some(h)) -> if refutedAt(r.owner.classes, m, h) {
+		if let (Some(m), Some(h)) = (method, head) {
+			if refutedAt(r.owner.classes, m, h) {
 				if let Some(stub) = vacant(r, slots[i], m, h) { return stub }
 			}
-			_ -> {}
 		}
 		rewrite(r, slots[i])
 	})
@@ -627,12 +625,10 @@ fun generic(r : Rewriter, e : Core) -> Core =
 -- record field and stays.
 fun rewriteTyApp(r : Rewriter, e : Core, fn : Core, args : Array Ty.Type) -> Core {
 	let resolved = Array.map(args, rTy(r, _))
-	match fn.kind {
-		CVar(ref) -> match instantiate(r, ref, resolved, e) {
-			Some(made) -> return made
-			None       -> {}
+	if let CVar(ref) = fn.kind {
+		if let Some(made) = instantiate(r, ref, resolved, e) {
+			return made
 		}
-		_ -> {}
 	}
 	mkCore(rTy(r, e.ty), e.span, CTyApp(rewrite(r, fn), resolved))
 }
@@ -684,12 +680,9 @@ fun collapse(r : Rewriter, e : Core) -> Option Core = match e.kind {
 fun collapseApp(r : Rewriter, e : Core, fn : Core, args : Array Core) -> Option Core {
 	var head = fn
 	var targs = []
-	match fn.kind {
-		CTyApp(inner, ta) -> {
-			targs = Array.map(ta, rTy(r, _))
-			head = inner
-		}
-		_ -> {}
+	if let CTyApp(inner, ta) = fn.kind {
+		targs = Array.map(ta, rTy(r, _))
+		head = inner
 	}
 	let name = match head.kind {
 		CVar(ref) -> match topLevelName(r, ref) {
@@ -833,9 +826,8 @@ fun rewriteLet(
 		let read = refTo(name, out)
 		let had = Map.contains(r.aliases, read)
 		let saved = Map.getOr(r.aliases, read, "")
-		match globalDict(r, v) {
-			Some(named) -> Map.put(r.aliases, read, named)
-			None        -> {}
+		if let Some(named) = globalDict(r, v) {
+			Map.put(r.aliases, read, named)
 		}
 		let b = rewrite(r, body)
 		if had { Map.put(r.aliases, read, saved) } else { discard(Map.delete(r.aliases, read)) }
@@ -1089,9 +1081,8 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type, dicts : Option (Vec Stri
 			Some(ds) -> String.join(ds, ",")
 			None     -> "*"
 		}
-	match Map.get(m.state.done, key) {
-		Some(found) -> return Some(found)
-		None        -> {}
+	if let Some(found) = Map.get(m.state.done, key) {
+		return Some(found)
 	}
 	-- Size first, then the budget, so a request refused for its type does not
 	-- also spend a copy the program never received.
@@ -1116,9 +1107,8 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type, dicts : Option (Vec Stri
 		Specialized(origin, targs, b.span),
 	)
 	derive(m.state, name, b.name)
-	match dicts {
-		Some(_) -> if Set.contains(m.dictGroup, b.name) { Set.add(m.topDicts, name) }
-		None    -> {}
+	if let Some(_) = dicts {
+		if Set.contains(m.dictGroup, b.name) { Set.add(m.topDicts, name) }
 	}
 	-- Recorded *before* the body is built, which is what makes a recursive
 	-- binding terminate: the copy's own call to itself, at its own arguments,
@@ -1163,30 +1153,27 @@ fun build(
 	let r = topRewriter(m, subst, Some(Binders.ownerOf(id)))
 	var ty = rTy(r, b.ty)
 	var value = b.value
-	match dicts {
-		None -> {}
-		Some(ds) -> {
-			-- The evidence, supplied. The lambda goes away and its parameters
-			-- are renamed to the dictionaries they were handed -- a rename and
-			-- not a `let`, because the argument is a top-level name, so
-			-- substituting it is capture-free and leaves what the body projects
-			-- out of something devirtualization can see through. A coercion
-			-- is supplied nothing: nothing refers to it, and at ground types
-			-- the instances alone decide what it granted.
-			let (params, body, _) = match value.kind {
-				CLam(ps, bd, n) -> (ps, bd, n)
-				_               -> oops("a collapsed binding is not a lambda", b.span)
-			}
-			var k = 0
-			for p in params {
-				if !isCoercion(p.ty) && k < len(ds) {
-					Map.put(r.rename, refTo(p.name, p.id), ds[k])
-					k = k + 1
-				}
-			}
-			value = body
-			ty = rTy(r, body.ty)
+	if let Some(ds) = dicts {
+		-- The evidence, supplied. The lambda goes away and its parameters
+		-- are renamed to the dictionaries they were handed -- a rename and
+		-- not a `let`, because the argument is a top-level name, so
+		-- substituting it is capture-free and leaves what the body projects
+		-- out of something devirtualization can see through. A coercion
+		-- is supplied nothing: nothing refers to it, and at ground types
+		-- the instances alone decide what it granted.
+		let (params, body, _) = match value.kind {
+			CLam(ps, bd, n) -> (ps, bd, n)
+			_               -> oops("a collapsed binding is not a lambda", b.span)
 		}
+		var k = 0
+		for p in params {
+			if !isCoercion(p.ty) && k < len(ds) {
+				Map.put(r.rename, refTo(p.name, p.id), ds[k])
+				k = k + 1
+			}
+		}
+		value = body
+		ty = rTy(r, body.ty)
 	}
 	-- A method is polymorphic in its *own* variables as well as the class
 	-- variable, and the lowering states those in a `CTyLam` under the
@@ -1225,9 +1212,8 @@ fun build(
 -- `build` above lifts out once the dictionary lambda is consumed.
 fun promotedBinders(b : CBind, dicts : Option (Vec String)) -> Vec VarCell {
 	let out = Vec.new(2)
-	match dicts {
-		None    -> return out
-		Some(_) -> {}
+	if let None = dicts {
+		return out
 	}
 	var value = match b.value.kind {
 		CLam(_, body, _) -> body
@@ -1326,17 +1312,14 @@ fun unsharedOpenings(program : CProgram) -> Vec String {
 
 fun unsharedInto(e : Core, found : Vec Bool) -> Unit {
 	if len(found) > 0 { return }
-	match e.kind {
-		CMatch(_, alts) -> for alt in alts {
-			match openingOf(alt.alt) {
-				Some(o) -> match o.layouts {
-					None    -> Vec.push(found, True)
-					Some(_) -> {}
+	if let CMatch(_, alts) = e.kind {
+		for alt in alts {
+			if let Some(o) = openingOf(alt.alt) {
+				if let None = o.layouts {
+					Vec.push(found, True)
 				}
-				None -> {}
 			}
 		}
-		_ -> {}
 	}
 	discard(
 		mapKind(e.kind, Mapper {
@@ -1650,9 +1633,8 @@ fun abstraction(d : Devirt, dictTy : Ty.Type, method : String, value : Core) -> 
 	Vec VarCell,
 	Core,
 ) {
-	match value.kind {
-		CTyLam(binders, body) -> return (binders, body)
-		_                     -> {}
+	if let CTyLam(binders, body) = value.kind {
+		return (binders, body)
 	}
 	let cls = match dictClass(dictTy) {
 		Some(c) -> c
@@ -1789,9 +1771,8 @@ fun reachable(
 			Some(n) -> n
 			None    -> ""
 		}
-		match Map.get(byname, name) {
-			None -> {}
-			Some(b) -> for used in Set.elements(namesOf(b.value)) {
+		if let Some(b) = Map.get(byname, name) {
+			for used in Set.elements(namesOf(b.value)) {
 				let n = Map.getOr(bySymbol, used, used)
 				if !Set.contains(reach, n) {
 					Set.add(reach, n)
@@ -1898,8 +1879,8 @@ fun expandingBindings(program : CProgram) -> Set.Set String {
 	for (name, b) in Map.entries(generic) {
 		let group = Map.getOr(groupOf, name, name)
 		for (callee, types) in typeApplications(b.value) {
-			match Map.get(generic, callee) {
-				Some(target) -> if Map.getOr(groupOf, callee, callee) == group {
+			if let Some(target) = Map.get(generic, callee) {
+				if Map.getOr(groupOf, callee, callee) == group {
 					for var j = 0; j < len(types) && j < len(target.binders); j = j + 1 {
 						let t = Ty.prune(types[j])
 						for var i = 0; i < len(b.binders); i = i + 1 {
@@ -1928,7 +1909,6 @@ fun expandingBindings(program : CProgram) -> Set.Set String {
 						}
 					}
 				}
-				None -> {}
 			}
 		}
 	}
@@ -1939,11 +1919,10 @@ fun expandingBindings(program : CProgram) -> Set.Set String {
 	}
 	let out = Set.new()
 	for (from, to) in expanding {
-		match (Map.get(componentOf, from), Map.get(componentOf, to)) {
-			(Some(a), Some(b)) -> if a == b {
+		if let (Some(a), Some(b)) = (Map.get(componentOf, from), Map.get(componentOf, to)) {
+			if a == b {
 				for n in components[a] { Set.add(out, bindingOfNode(n)) }
 			}
-			_ -> {}
 		}
 	}
 	out
@@ -1962,12 +1941,10 @@ fun typeApplications(e : Core) -> Vec (String, Array Ty.Type) {
 }
 
 fun collectTypeApplications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
-	match e.kind {
-		CTyApp(fn, types) -> match fn.kind {
-			CVar(BySpelling(name)) -> Vec.push(out, (name, types))
-			_                      -> {}
+	if let CTyApp(fn, types) = e.kind {
+		if let CVar(BySpelling(name)) = fn.kind {
+			Vec.push(out, (name, types))
 		}
-		_ -> {}
 	}
 	let _ = mapKind(e.kind, Mapper {
 		expr = fun(x) {

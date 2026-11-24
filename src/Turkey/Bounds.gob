@@ -209,9 +209,8 @@ fun solveFloors(p : Prover) -> Unit {
 	let incoming : Array (Vec (Vec Value)) = Array.filled(len(f.blocks), [])
 	for var b = 0; b < len(f.blocks); b = b + 1 { incoming[b] = [] }
 	for b in order {
-		match Ssa.blockAt(f, b).term {
-			Jump(target, args) -> Vec.push(incoming[Ssa.blockId(target)], args)
-			_                  -> {}
+		if let Jump(target, args) = Ssa.blockAt(f, b).term {
+			Vec.push(incoming[Ssa.blockId(target)], args)
 		}
 	}
 	let lowered = Array.filled(len(f.reps), 0)
@@ -326,9 +325,8 @@ fun walk(p : Prover) -> Bool {
 	let entry = Ssa.blockId(f.entry)
 	let children : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
 	for var b = 0; b < len(f.blocks); b = b + 1 {
-		match idom[b] {
-			Some(d) -> if b != entry { Vec.push(children[d], b) }
-			None    -> {}
+		if let Some(d) = idom[b] {
+			if b != entry { Vec.push(children[d], b) }
 		}
 	}
 	-- The facts added, as their two nodes, and where each block's began.
@@ -366,36 +364,32 @@ fun walk(p : Prover) -> Bool {
 -- The facts that hold in `to` because the only edge into it is one arm of
 -- the branch ending `from`.
 fun enterFrom(p : Prover, added : Vec (Int, Int), from : Int, to : Int) -> Unit {
-	match p.func.blocks[from].term {
-		Branch(c, yes, no) -> {
-			if Ssa.blockId(yes) == Ssa.blockId(no) { return }
-			-- `x >= n` is `not (x < n)`, so a branch on a negated comparison
-			-- is the commonest way to test one: its arms are the comparison's
-			-- the other way round.
-			let (tested, held) = match p.defs[Ssa.valueId(c)] {
-				Some(Not(inner)) -> (inner, Ssa.blockId(no) == to)
-				_                -> (c, Ssa.blockId(yes) == to)
-			}
-			match p.defs[Ssa.valueId(tested)] {
-				Some(Cmp(op, x, y)) -> if Ssa.repOf(p.func, x).class_ == I64 {
-					let taken = if held { op } else { negate(op) }
-					let (a, b) = (valueOf(p, x), valueOf(p, y))
-					match taken {
-						Lt -> assume(p, added, a, b, 1)
-						Le -> assume(p, added, a, b, 0)
-						Gt -> assume(p, added, b, a, 1)
-						Ge -> assume(p, added, b, a, 0)
-						Eq -> {
-							assume(p, added, a, b, 0)
-							assume(p, added, b, a, 0)
-						}
-						Ne -> {}
+	if let Branch(c, yes, no) = p.func.blocks[from].term {
+		if Ssa.blockId(yes) == Ssa.blockId(no) { return }
+		-- `x >= n` is `not (x < n)`, so a branch on a negated comparison
+		-- is the commonest way to test one: its arms are the comparison's
+		-- the other way round.
+		let (tested, held) = match p.defs[Ssa.valueId(c)] {
+			Some(Not(inner)) -> (inner, Ssa.blockId(no) == to)
+			_                -> (c, Ssa.blockId(yes) == to)
+		}
+		if let Some(Cmp(op, x, y)) = p.defs[Ssa.valueId(tested)] {
+			if Ssa.repOf(p.func, x).class_ == I64 {
+				let taken = if held { op } else { negate(op) }
+				let (a, b) = (valueOf(p, x), valueOf(p, y))
+				match taken {
+					Lt -> assume(p, added, a, b, 1)
+					Le -> assume(p, added, a, b, 0)
+					Gt -> assume(p, added, b, a, 1)
+					Ge -> assume(p, added, b, a, 0)
+					Eq -> {
+						assume(p, added, a, b, 0)
+						assume(p, added, b, a, 0)
 					}
+					Ne -> {}
 				}
-				_ -> {}
 			}
 		}
-		_ -> {}
 	}
 }
 
@@ -428,14 +422,11 @@ fun prove(p : Prover, i : Low) -> Bool {
 		ArraySet(array, index, at, x, Checked) ->
 			if within(p, array, index) { i.op = ArraySet(array, index, at, x, Proven) }
 		Cmp(op, x, y) -> if Ssa.repOf(p.func, x).class_ == I64 {
-			match decide(p, op, valueOf(p, x), valueOf(p, y)) {
+			if let Some(outcome) = decide(p, op, valueOf(p, x), valueOf(p, y)) {
 				-- The constant an `i1` holds, as constant propagation
 				-- writes a comparison it has folded.
-				Some(outcome) -> {
-					i.op = ConstInt(if outcome { 1 } else { 0 })
-					return True
-				}
-				None -> {}
+				i.op = ConstInt(if outcome { 1 } else { 0 })
+				return True
 			}
 		}
 		_ -> {}
@@ -494,15 +485,12 @@ fun lowest(p : Prover, a : Affine) -> Floor {
 	for (m, d) in reach(p.below, a.node) {
 		-- `m <= a.node + d`, so `a >= floor(m) - d + a.offset`.
 		let f = if m == p.zero { AtLeast(0) } else { p.floors[m] }
-		match f {
-			AtLeast(k) -> {
-				let at = k - d + a.offset
-				best = match best {
-					AtLeast(sofar) -> if at > sofar { AtLeast(at) } else { best }
-					_              -> AtLeast(at)
-				}
+		if let AtLeast(k) = f {
+			let at = k - d + a.offset
+			best = match best {
+				AtLeast(sofar) -> if at > sofar { AtLeast(at) } else { best }
+				_              -> AtLeast(at)
 			}
-			_ -> {}
 		}
 	}
 	best
@@ -517,9 +505,8 @@ fun atMost(p : Prover, a : Affine, b : Affine, gap : Int) -> Bool {
 		-- `a.node <= m + d`.
 		if m == b.node && d <= want { return True }
 		if m == p.zero {
-			match lowest(p, b) {
-				AtLeast(k) -> if a.offset + d <= k - gap { return True }
-				_          -> {}
+			if let AtLeast(k) = lowest(p, b) {
+				if a.offset + d <= k - gap { return True }
 			}
 		}
 	}

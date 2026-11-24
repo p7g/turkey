@@ -1,7 +1,7 @@
 export (
     Case(..), Expected(..), Golden(..), Quote(..), Archived(..), Section(..), Expectation(..),
     Requirement(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..), Recorded(..),
-    directives, requirementName, outcomeName, failsRun, passed, disagreement, printed,
+    directives, withoutDumps, requirementName, outcomeName, failsRun, passed, disagreement, printed,
     expectationName,
 )
 
@@ -113,6 +113,9 @@ type Case = Case {
     requires : Array Requirement,
     --- The reason the case is expected to fail its comparison.
     xfail : Option String,
+    --- The targets the case is skipped on, as `--target` names them, each
+    --- with the reason: what the program needs that the target lacks.
+    skips : Array (String, String),
     problem : Option String,
     --- Whether `turkey check` is run on the case in place of a build, so that
     --- nothing is written or run.
@@ -228,6 +231,24 @@ fun disagreement(expected : Expected, ending : Ending) -> Option String = match 
 fun withoutPanic(code : Int) -> Option String =
     Some("exited " + Int.toString(code) + " without the panic the case expects")
 
+--- Returns `c` with no dump goldens.
+fun withoutDumps(c : Case) -> Case = Case {
+    name = c.name,
+    directory = c.directory,
+    entry = c.entry,
+    sources = c.sources,
+    golden = c.golden,
+    dumps = [],
+    expected = c.expected,
+    timeout = c.timeout,
+    requires = c.requires,
+    xfail = c.xfail,
+    skips = c.skips,
+    problem = c.problem,
+    checkOnly = c.checkOnly,
+    environment = c.environment,
+}
+
 -- -- directives -----------------------------------------------------------------------
 
 --- What a case's `--%` lines say, applied to `base`. A directive is a line
@@ -244,6 +265,7 @@ fun directives(base : Case, text : String) -> Case {
     var timeout = None
     let requires = []
     var xfail = None
+    let skips = []
     var problem = None
     for line in String.lines(text) {
         let rest = match String.stripPrefix(line, "--%") {
@@ -265,6 +287,7 @@ fun directives(base : Case, text : String) -> Case {
             Right(TimesOut(n)) -> { timeout = Some(n) }
             Right(Requires(r)) -> Vec.push(requires, r)
             Right(Fails(reason)) -> { xfail = Some(reason) }
+            Right(SkipsOn(target, reason)) -> Vec.push(skips, (target, reason))
         }
     }
     Case {
@@ -278,6 +301,7 @@ fun directives(base : Case, text : String) -> Case {
         timeout = timeout,
         requires = Vec.toArray(requires),
         xfail = xfail,
+        skips = Vec.toArray(skips),
         problem = Option.or(problem, base.problem),
         checkOnly = base.checkOnly,
         environment = base.environment,
@@ -286,6 +310,11 @@ fun directives(base : Case, text : String) -> Case {
 
 -- One `--%` line.
 type Directive = Ends(Expected) | TimesOut(Int) | Requires(Requirement) | Fails(String)
+               | SkipsOn(String, String)
+
+-- The targets a `skip` directive may name: every one but the host, whose
+-- goldens these are.
+let skippable = ["wasm32-wasi"]
 
 fun directive(name : String, value : Option String) -> Either String Directive = match (name, value) {
     ("exit", Some(v)) -> match Int.parse(v) {
@@ -305,7 +334,21 @@ fun directive(name : String, value : Option String) -> Either String Directive =
     }
     ("xfail", Some("")) -> Left("'xfail' needs a reason")
     ("xfail", Some(v)) -> Right(Fails(v))
-    ("exit", None) | ("timeout", None) | ("requires", None) | ("xfail", None) ->
+    ("skip", Some(v)) -> match String.splitOnce(v, ":") {
+        Some((target, reason)) -> {
+            let target = String.trim(target)
+            let reason = String.trim(reason)
+            if !Iter.any(skippable, _ == target) {
+                Left("'skip' takes a target of " + String.join(skippable, ", ") + ", not '" + target + "'")
+            } else if String.isEmpty(reason) {
+                Left("'skip' needs a reason")
+            } else {
+                Right(SkipsOn(target, reason))
+            }
+        }
+        None -> Left("'skip' takes TARGET: REASON, not '" + v + "'")
+    }
+    ("exit", None) | ("timeout", None) | ("requires", None) | ("xfail", None) | ("skip", None) ->
         Left("'" + name + "' needs a value")
     ("panic", Some(_)) | ("error", Some(_)) -> Left("'" + name + "' takes no value")
     _ -> Left("unknown directive '" + name + "'")

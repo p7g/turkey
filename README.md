@@ -427,11 +427,14 @@ Turkey, `tests/harness/`:
     sh scripts/test.sh -v --shard 2/4     # a quarter of them, passes listed
     sh scripts/test.sh --selftest         # the harness checked on its own cases
     sh scripts/test.sh --bless PATH       # PATH's goldens rewritten from its output
+    sh scripts/test.sh --target wasm32-wasi  # tests/programs/ built for wasm, under wasmtime
 
 It builds `turkey` (or uses `TURKEY_BOOT`) and compiles itself with the
 committed bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are
 compiled programs. A program's expected outcome is a directive in it: `--% error` (it
-must not compile), `--% panic`, `--% exit: N`, and otherwise exit 0. A case
+must not compile), `--% panic`, `--% exit: N`, and otherwise exit 0;
+`--% skip: wasm32-wasi: REASON` leaves it out of that target's run, which
+compares every other program with the same golden. A case
 that fails is shown with a diff, and every actual output is kept under
 `$TMPDIR/turkey-test/actual/`. A reference example is named by its chapter and
 the line of its fence, `docs/ref/types.md:40`, and checked against what the

@@ -129,6 +129,19 @@ def needs_openssl() -> None:
     pytest.skip(message)
 
 
+def needs_wasmtime() -> str:
+    """Returns the path of `wasmtime`, which runs the WebAssembly `turkey`
+    writes. Skips the calling test where it is not installed, or fails it
+    where `$TURKEY_REQUIRE_WASMTIME` is set, as CI sets it, so that a runner
+    without it cannot pass by skipping."""
+    path = shutil.which("wasmtime")
+    if path is not None:
+        return path
+    if os.environ.get("TURKEY_REQUIRE_WASMTIME"):
+        pytest.fail("wasmtime is not installed")
+    pytest.skip("wasmtime is not installed")
+
+
 def identity() -> bytes:
     """The compiler, as part of a cache key. How a binary is run is not: it
     does not change what was built."""

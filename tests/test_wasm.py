@@ -7,23 +7,21 @@ section and one instruction at a time, and not read back from the writer.
 
 An engine, where there is one, checks what the bytes mean: `wasmtime` compiles
 each module, which validates it, and runs the WASI program that prints
-"hello". Those tests skip when `wasmtime` is not installed.
+"hello". Those tests skip when `wasmtime` is not installed, unless
+`$TURKEY_REQUIRE_WASMTIME` says it must be.
 """
 
 import functools
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import lang
+from tests import lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "src" / "WasmCases.gob"
 
-WASMTIME = shutil.which("wasmtime") or "wasmtime"
-needs_wasmtime = pytest.mark.skipif(shutil.which("wasmtime") is None, reason="needs wasmtime")
 
 MAGIC = "0061736d01000000"
 
@@ -326,38 +324,26 @@ def _write(tmp_path: Path, name: str) -> Path:
 
 
 def _compile(tmp_path: Path, name: str, *flags: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run([WASMTIME, "compile", *flags, "-o", str(tmp_path / "out.cwasm"),
-                           str(_write(tmp_path, name))], capture_output=True, text=True)
+    return subprocess.run([toolchain.needs_wasmtime(), "compile", *flags,
+                           "-o", str(tmp_path / "out.cwasm"), str(_write(tmp_path, name))],
+                          capture_output=True, text=True)
 
 
-@needs_wasmtime
 @pytest.mark.parametrize("name", ["empty", "add", "sections", "imports", "control", "tail",
-                                  "declared", "hello", "ops"])
+                                  "declared", "refs", "hello", "ops"])
 def test_wasmtime_validates_each_module(tmp_path, name):
     result = _compile(tmp_path, name)
     assert result.returncode == 0, result.stderr
 
 
-@needs_wasmtime
-def test_wasmtime_validates_typed_function_references(tmp_path):
-    # Typed function references are on by default only in newer wasmtime, so
-    # an older one is asked for them.
-    result = _compile(tmp_path, "refs")
-    if result.returncode != 0:
-        result = _compile(tmp_path, "refs", "-W", "function-references=y,gc=y")
-    assert result.returncode == 0, result.stderr
-
-
-@needs_wasmtime
 def test_wasmtime_runs_the_wasi_program_that_prints_hello(tmp_path):
-    result = subprocess.run([WASMTIME, "run", str(_write(tmp_path, "hello"))],
+    result = subprocess.run([toolchain.needs_wasmtime(), "run", str(_write(tmp_path, "hello"))],
                             capture_output=True, text=True)
     assert (result.returncode, result.stdout) == (0, "hello\n"), result.stderr
 
 
-@needs_wasmtime
 def test_wasmtime_runs_the_exported_add(tmp_path):
-    result = subprocess.run([WASMTIME, "run", "--invoke", "add",
+    result = subprocess.run([toolchain.needs_wasmtime(), "run", "--invoke", "add",
                              str(_write(tmp_path, "add")), "2", "40"],
                             capture_output=True, text=True)
     assert result.stdout.strip() == "42", result.stderr

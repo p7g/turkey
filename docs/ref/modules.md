@@ -949,8 +949,8 @@ fun main() {
 
 A program's Prelude that passes on less leaves the program's modules without
 what it omits. That includes what syntax is written in: an operator is a name
-a module has to be given, and `for` and negation call class methods that
-have to be in scope.
+a module has to be given, and `for`, indexing and negation call the class
+methods `iter`, `get` and `neg`, which have to be in scope.
 
 <!-- module: Prelude.gob -->
 ```kotlin

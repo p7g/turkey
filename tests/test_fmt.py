@@ -228,6 +228,15 @@ AWKWARD = {
     "block_comment_on_moved_rest": "import N (g as _, {- c -} .., h as _)\nimport Q (.. {- c -}, g as _)\n",
     "block_comment_before_dropped_comma": "fun f() -> P = P {\n    x = 1 {- c -}, y = 2\n    z = 3\n}\n",
     "block_comment_in_aligned_rows": "fun f(x : Int) -> Int = match x {\n    1 -> 0\n    {- c -} 22 -> 1\n    3 {- d -} | 4 -> 2\n    _ -> 3\n}\ntype F = F {\n    {- c -} lines : Vec String\n    tokens : Int\n}\n",
+    "comment_before_aligned_arrow": "fun f(x : Int) -> Int = match x {\n    1 {- c -} -> 0\n    22 -> {- d -} 1\n    333 {- e -} -> 2\n    _ -> 3\n}\n",
+    "comment_in_aligned_nested_alternatives": "fun f(x : Option Int) -> Int = match x {\n    Some(1 | 2) -> 0\n    Some(5 | 6 | 7) -> 2\n    Some(1 {- f -} | 2) -> 3\n    _ -> 5\n}\n",
+    "comment_before_aligned_close": "fun f(x : Option Int) -> Int = match x {\n    Some(0) -> 0\n    Some({- f -} 1) -> 3\n    Some(2 {- f -}) -> 3\n    _ -> 5\n}\n",
+    "comment_before_aligned_equals": "type R = R { x : Int, yyyy : Int, z : Int }\nfun k() -> R = R {\n    x {- a -} = 1, yyyy = {- b -} 2\n    z {- c -} = 3\n}\n",
+    "comment_before_aligned_colon": "type R = R {\n    x {- a -} : Int\n    yyyy : Int, z : Int\n}\n",
+    "comment_before_aligned_trailing_comment": "fun f(x : Int) -> Int = x\nfun main() {\n    let a = f(1 {- c -}) -- one\n    let bb = 2 -- two\n}\n",
+    "comment_before_instance_class": "class C a { fun s(a) -> Int }\ninstance -- c\nC Int {\n    fun s(x) = x\n}\n",
+    "comment_before_block_brace": "fun f(second : Int) -> Int = 1\n    + (if second == 60 -- z\n{ 59 } else { second })\n",
+    "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
 }
 
 # What some of them must format to, exactly.
@@ -269,6 +278,76 @@ AWKWARD_OUTPUT = {
         "fun f(x : Int) -> Int = match x {\n\t1             -> 0\n\t{- c -} 22    -> 1\n"
         "\t3 {- d -} | 4 -> 2\n\t_             -> 3\n}\n"
         "type F = F {\n\t{- c -} lines : Vec String\n\ttokens        : Int\n}\n"),
+    "comment_before_aligned_arrow": (
+        "fun f(x : Int) -> Int = match x {\n"
+        "\t1 {- c -}   -> 0\n"
+        "\t22          -> {- d -} 1\n"
+        "\t333 {- e -} -> 2\n"
+        "\t_           -> 3\n"
+        "}\n"
+    ),
+    "comment_in_aligned_nested_alternatives": (
+        "fun f(x : Option Int) -> Int = match x {\n"
+        "\tSome(1 | 2)         -> 0\n"
+        "\tSome(5 | 6 | 7)     -> 2\n"
+        "\tSome(1 {- f -} | 2) -> 3\n"
+        "\t_                   -> 5\n"
+        "}\n"
+    ),
+    "comment_before_aligned_close": (
+        "fun f(x : Option Int) -> Int = match x {\n"
+        "\tSome(0)         -> 0\n"
+        "\tSome({- f -} 1) -> 3\n"
+        "\tSome(2 {- f -}) -> 3\n"
+        "\t_               -> 5\n"
+        "}\n"
+    ),
+    "comment_before_aligned_equals": (
+        "type R = R { x : Int, yyyy : Int, z : Int }\n"
+        "fun k() -> R = R {\n"
+        "\tx {- a -} = 1\n"
+        "\tyyyy      = {- b -} 2\n"
+        "\tz {- c -} = 3\n"
+        "}\n"
+    ),
+    "comment_before_aligned_colon": (
+        "type R = R {\n"
+        "\tx {- a -} : Int\n"
+        "\tyyyy      : Int\n"
+        "\tz         : Int\n"
+        "}\n"
+    ),
+    "comment_before_aligned_trailing_comment": (
+        "fun f(x : Int) -> Int = x\n"
+        "fun main() {\n"
+        "\tlet a = f(1 {- c -}) -- one\n"
+        "\tlet bb = 2           -- two\n"
+        "}\n"
+    ),
+    "comment_before_instance_class": (
+        "class C a { fun s(a) -> Int }\n"
+        "instance -- c\n"
+        "\tC Int {\n"
+        "\tfun s(x) = x\n"
+        "}\n"
+    ),
+    "comment_before_block_brace": (
+        "fun f(second : Int) -> Int =\n"
+        "\t1\n"
+        "\t\t+ (if second == 60 { -- z\n"
+        "\t\t\t59\n"
+        "\t\t} else {\n"
+        "\t\t\tsecond\n"
+        "\t\t})\n"
+    ),
+    "comment_after_variant_bar": (
+        "type T\n"
+        "\t= A\n"
+        "\t--- Doc.\n"
+        "\t| -- z\n"
+        "\t\tB(Int)\n"
+        "\t| C\n"
+    ),
 }
 
 

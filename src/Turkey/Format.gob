@@ -56,7 +56,10 @@ let unparsedStatus = 12
 --- parse is reported as a parse error, as compiling it would be.
 fun format(source : Source) -> Outcome {
     let original = Parser.parse(source, [])
-    let once = testing(printed(source, original))
+    let once = match printed(source, original) {
+        Right(text) -> testing(text)
+        Left(why) -> return Refused(why)
+    }
     if Env.get("TURKEY_TEST_FMT") == Some("refuse") { return Refused("refused for a test") }
     let again = Source { name = source.name + " (as formatted)", text = once }
     Diag.failWith(unparsedStatus)
@@ -76,7 +79,10 @@ fun format(source : Source) -> Outcome {
         return Refused("the directive at the end of line " + Int.toString(line)
                        + " no longer ends a line holding the same code")
     }
-    let twice = printed(again, reparsed)
+    let twice = match printed(again, reparsed) {
+        Right(text) -> text
+        Left(why) -> return Refused(why)
+    }
     if twice != once { return Refused("formatting the formatted text changes it again") }
     Formatted(once)
 }
@@ -90,10 +96,172 @@ fun testing(text : String) -> String = match Env.get("TURKEY_TEST_FMT") {
     _ -> text
 }
 
-fun printed(source : Source, program : Program) -> String {
+-- `program`, the tree of `source`, laid out, or why it cannot be.
+--
+-- A block comment with code after it on its line is left out of the layout
+-- and put back afterwards, before the token it came before. The layout does
+-- not depend on where such a comment is, so the comment lands before the same
+-- token whatever the layout, and formatting the output again puts it back in
+-- the same place. A block comment over several lines is laid out with the
+-- others, since the lines it moves code onto would change the layout.
+fun printed(source : Source, program : Program) -> Either String String {
     let f = state(source, program)
+    let laid = []
+    for c in program.comments {
+        if c.block && c.span.line == c.span.endLine && codeFollows(f, c) { Vec.push(f.inline, c) }
+        else { Vec.push(laid, c) }
+    }
+    f.comments = laid
     let text = P.render(programDoc(f, program), width)
-    if text == "" { "" } else { text + "\n" }
+    let out = if text == "" { "" } else { text + "\n" }
+    if len(f.inline) == 0 { return Right(out) }
+    reinsert(f, program.comments, out)
+}
+
+-- `out` with the inline comments of `f` put back, each before the token of
+-- `out` that matches the one it came before in the source.
+fun reinsert(f : F, all : Vec Comment, out : String) -> Either String String {
+    let (lexed, problem) = Lexer.tokenizeLenient(Source { name = "", text = out })
+    if Option.isSome(problem) { return Left("the formatted text does not lex") }
+    let outLines = String.lines(out)
+    let laidTokens = significant(lexed.tokens)
+    let from = Vec.map(f.tokens, fun(t) = slice(f.lines, t.span))
+    let to = Vec.map(laidTokens, fun(t) = slice(outLines, t.span))
+    let place = match aligned(from, to) {
+        Some(p) -> p
+        None -> return Left("the formatted text does not match the source token for token")
+    }
+    -- The inline comments to put back, by where they start; those inside source
+    -- kept as written are in the output already.
+    let moved = []
+    for c in f.inline {
+        if !Iter.any(f.keptSpans, fun(s) = inside(c.span, s)) {
+            Vec.push(moved, positionKey(c.span))
+        }
+    }
+    let stay = Vec.filter(all, fun(c) = !Vec.contains(moved, positionKey(c.span)))
+    if len(stay) != len(lexed.comments) {
+        return Left("the formatted text does not hold the comments it was given")
+    }
+    -- Each line's insertions, as (column, order, text).
+    let at : Map Int (Vec (Int, Int, String)) = Map.new()
+    var order = 0
+    for c in f.inline {
+        if !Vec.contains(moved, positionKey(c.span)) { continue }
+        -- The comment must land between the comments that were around it.
+        var a = 0
+        while a < len(stay) && lt(startOf(stay[a].span), startOf(c.span)) { a = a + 1 }
+        let after = if a > 0 { Some(endOf(lexed.comments[a - 1].span)) } else { None }
+        let until = if a < len(lexed.comments) { Some(startOf(lexed.comments[a].span)) } else { None }
+        let fits = fun(p : Pos) = Option.fold(after, True, fun(x) = !lt(p, x))
+            && Option.fold(until, True, fun(x) = lt(p, x))
+        -- Before the token that followed it, spaced as the source spaced it,
+        -- with no space added where the output has one or the line starts.
+        var k = tokenFrom(f, endOf(c.span))
+        while k < len(place) && place[k] < 0 { k = k + 1 }
+        var placed = False
+        if k < len(place) {
+            let target = laidTokens[place[k]].span
+            if fits(startOf(target)) {
+                let line = String.toCodePoints(outLines[target.line - 1])
+                let bare = target.col < 2 || line[target.col - 2] == ' ' || line[target.col - 2] == '\t'
+                let text = (if spaced(f, c.span.line, c.span.col - 1) && !bare { " " } else { "" })
+                    + commentText(c) + (if spaced(f, c.span.line, c.span.endCol) { " " } else { "" })
+                insert(at, target.line, target.col, order, text)
+                placed = True
+            }
+        }
+        -- Or else after the token before it, where the formatter moved a
+        -- comment of a line of its own between the two.
+        if !placed {
+            var b = tokenFrom(f, startOf(c.span)) - 1
+            while b >= 0 && place[b] < 0 { b = b - 1 }
+            if b >= 0 {
+                let previous = laidTokens[place[b]].span
+                if fits(endOf(previous)) {
+                    let line = String.toCodePoints(outLines[previous.endLine - 1])
+                    let open = previous.endCol <= len(line) && line[previous.endCol - 1] != ' '
+                    insert(at, previous.endLine, previous.endCol, order,
+                           " " + commentText(c) + if open { " " } else { "" })
+                    placed = True
+                }
+            }
+        }
+        if !placed { return Left("a block comment has no place in the formatted text") }
+        order = order + 1
+    }
+    for (number, unsorted) in Map.entries(at) {
+        let insertions = Vec.sortBy(unsorted, fun((x, m, _), (y, n, _)) =
+            if x < y || (x == y && m < n) { LT } else { GT })
+        let cs = String.toCodePoints(outLines[number - 1])
+        let pieces = []
+        var done = 0
+        for (col, _, text) in insertions {
+            Vec.push(pieces, String.fromCodePoints(Array.slice(cs, done, col - 1)))
+            Vec.push(pieces, text)
+            done = col - 1
+        }
+        Vec.push(pieces, String.fromCodePoints(Array.slice(cs, done, len(cs))))
+        outLines[number - 1] = String.join(pieces, "")
+    }
+    let joined = String.join(outLines, "\n")
+    Right(if String.endsWith(out, "\n") && !String.endsWith(joined, "\n") { joined + "\n" } else { joined })
+}
+
+-- One number for where `s` starts, for a list of comments to look things up in.
+fun positionKey(s : Span) -> Int = s.line * 1000000 + s.col
+
+fun insert(at : Map Int (Vec (Int, Int, String)), line : Int, col : Int, order : Int,
+           text : String) -> Unit {
+    let here = Map.getOr(at, line, [])
+    Vec.push(here, (col, order, text))
+    Map.put(at, line, here)
+}
+
+-- Whether the source has a space or tab at column `col` of line `line`, or
+-- the line ends or starts there.
+fun spaced(f : F, line : Int, col : Int) -> Bool {
+    let cs = String.toCodePoints(f.lines[line - 1])
+    col < 1 || col > len(cs) || cs[col - 1] == ' ' || cs[col - 1] == '\t'
+}
+
+fun inside(inner : Span, outer : Span) -> Bool =
+    !lt(startOf(inner), startOf(outer)) && !lt(endOf(outer), endOf(inner))
+
+-- For each of the source's tokens `from`, the index of the token of `to` that
+-- is the same token in the formatted text, or -1 for a token the formatter
+-- dropped: a comma, or the `=` before a block body. The formatter adds and
+-- drops only commas and that `=`, and otherwise keeps the tokens in order, so
+-- one walk matches them; a short look ahead covers the few places it moves a
+-- token, such as the `..` of an import list. `None` when no match is found.
+fun aligned(from : Vec String, to : Vec String) -> Option (Vec Int) {
+    let place = Vec.map(from, fun(_) = -1)
+    var i = 0
+    var j = 0
+    while i < len(from) && j < len(to) {
+        if from[i] == to[j] {
+            place[i] = j
+            i = i + 1
+            j = j + 1
+        } else if from[i] == "," || (from[i] == "=" && to[j] == "{") {
+            i = i + 1
+        } else if to[j] == "," {
+            j = j + 1
+        } else {
+            var skipped = False
+            for var d = 1; d <= 16 && !skipped; d = d + 1 {
+                if j + d < len(to) && from[i] == to[j + d] {
+                    j = j + d
+                    skipped = True
+                } else if i + d < len(from) && from[i + d] == to[j] {
+                    i = i + d
+                    skipped = True
+                }
+            }
+            if !skipped { return None }
+        }
+    }
+    Some(place)
 }
 
 fun sameComments(xs : Vec Comment, ys : Vec Comment) -> Bool {
@@ -192,10 +360,12 @@ fun lineTokens(tokens : Vec Token, lines : Vec String, c : Comment) -> String {
 -- `next` is the first comment not yet printed. The printer takes comments in
 -- source order, as it reaches them.
 type F = F {
-    lines    : Vec String,
-    tokens   : Vec Token,
-    comments : Vec Comment,
-    var next : Int,
+    lines        : Vec String,
+    tokens       : Vec Token,
+    -- The comments the layout places: all but `inline`, which `reinsert` puts
+    -- back after it.
+    var comments : Vec Comment,
+    var next     : Int,
     blank    : Map Int Bool,
     -- The rank of each operator the file declares with `infix`.
     declared : Map String Int,
@@ -205,6 +375,11 @@ type F = F {
     -- The line of a `{` whose directive the code before it has been kept for,
     -- which is not stray, or 0.
     var guarded : Int,
+    -- The block comments that have code after them on their own one line,
+    -- which the layout leaves out.
+    var inline : Vec Comment,
+    -- The source kept as written, whose comments the output holds already.
+    keptSpans : Vec Span,
 }
 
 fun state(source : Source, program : Program) -> F {
@@ -223,6 +398,8 @@ fun state(source : Source, program : Program) -> F {
         declared = declared,
         stray = False,
         guarded = 0,
+        inline = [],
+        keptSpans = [],
     }
 }
 
@@ -264,6 +441,7 @@ fun written(f : F, s : Span) -> String = slice(f.lines, s)
 -- The source `s` covers, kept as written but moved with its first line: the
 -- lines after it keep their places relative to it.
 fun kept(f : F, s : Span) -> Doc {
+    Vec.push(f.keptSpans, s)
     let line = if s.line <= len(f.lines) { f.lines[s.line - 1] } else { "" }
     let cs = String.toCodePoints(line)
     var n = 0
@@ -368,21 +546,41 @@ fun commentBefore(f : F, to : Pos) -> Bool = match pending(f) {
 -- with `dangling` instead, before the break the item starts after, so the
 -- comment does not cost a line break of its own.
 fun leading(f : F, to : Pos) -> Doc {
-    if !commentBefore(f, to) { return P.empty() }
+    let (before, broken) = leadingParts(f, to)
+    if broken { P.cat([before, P.nest(1, P.hard)]) } else { before }
+}
+
+-- The comments `leading` takes, and whether the code at `to` must start a
+-- line after them: after a comment on a line of its own, or at the end of
+-- one. That code continues the line before the comments, so it goes one tab
+-- in, as the comments on lines of their own do.
+fun leadingParts(f : F, to : Pos) -> (Doc, Bool) {
+    if !commentBefore(f, to) { return (P.empty(), False) }
     let parts = []
+    var broken = False
     while let Some(c) = pending(f) {
         if !lt(startOf(c.span), to) { break }
         take(f)
-        if ownLine(f, c) { Vec.push(parts, P.cat([P.hard, commentDoc(c), P.hard])) }
-        else if c.block && codeFollows(f, c) { Vec.push(parts, P.cat([commentDoc(c), P.text(" ")])) }
-        else {
+        if ownLine(f, c) {
+            Vec.push(parts, P.nest(1, P.cat([P.hard, commentDoc(c)])))
+            broken = True
+        } else if c.block && codeFollows(f, c) {
+            Vec.push(parts, P.cat([commentDoc(c), P.text(" ")]))
+            broken = False
+        } else {
             loose(f, c)
-            -- The code after the break continues the line the comment ends.
-            Vec.push(parts, P.cat([P.suffix(commentText(c)), P.nest(1, P.hard)]))
+            Vec.push(parts, P.suffix(commentText(c)))
+            broken = True
         }
     }
-    P.cat(parts)
+    (P.cat(parts), broken)
 }
+
+-- `code` after the comments `leadingParts` took before it, on the next line
+-- and one tab in when they end a line, all of it, so a value that breaks
+-- breaks as a continuation.
+fun continued(before : Doc, broken : Bool, code : Doc) -> Doc =
+    if broken { P.cat([before, P.nest(1, P.cat([P.hard, code]))]) } else { P.cat([before, code]) }
 
 fun codeFollows(f : F, c : Comment) -> Bool {
     let i = tokenFrom(f, endOf(c.span))
@@ -404,19 +602,6 @@ fun dangling(f : F, to : Pos) -> Doc {
             loose(f, c)
             Vec.push(parts, P.suffix(commentText(c)))
         }
-    }
-    P.cat(parts)
-}
-
--- The block comments before `to` that have code after them on their line,
--- each after a space, for a place where they go before that code on the same
--- line.
-fun inline(f : F, to : Pos) -> Doc {
-    let parts = []
-    while let Some(c) = pending(f) {
-        if !lt(startOf(c.span), to) || !c.block || !codeFollows(f, c) { break }
-        take(f)
-        Vec.push(parts, P.cat([P.text(" "), commentDoc(c)]))
     }
     P.cat(parts)
 }
@@ -531,8 +716,14 @@ fun comments(f : F, to : Pos, table : Vec Row, above : Int) -> (Doc, Int) {
             }
             else {
                 let r = table[len(table) - 1]
-                table[len(table) - 1] = Row { kind = r.kind, left = r.left,
-                                              right = P.cat([r.right, P.suffix(commentText(c))]) }
+                -- After a comment's own row, a suffix would join that comment's
+                -- text, so this one follows it on its line instead.
+                table[len(table) - 1] = match r.kind {
+                    Note -> Row { kind = Note, left = P.cat([r.left, P.text(" "), commentDoc(c)]),
+                                  right = r.right }
+                    _ -> Row { kind = r.kind, left = r.left,
+                               right = P.cat([r.right, P.suffix(commentText(c))]) }
+                }
             }
             continue
         }
@@ -829,7 +1020,7 @@ fun importDoc(f : F, i : ImportDecl) -> Doc {
 -- -- types --------------------------------------------------------------------------
 
 fun typeDoc(f : F, t : Type) -> Doc {
-    let lead = if Source.isEmpty(t.span) { P.empty() } else { leading(f, startOf(t.span)) }
+    let (lead, broken) = if Source.isEmpty(t.span) { (P.empty(), False) } else { leadingParts(f, startOf(t.span)) }
     let d = match t.kind {
         TEVar(name) -> P.text(name)
         TECon(name, args) -> P.cat([P.text(name), arguments(f, args)])
@@ -842,7 +1033,7 @@ fun typeDoc(f : F, t : Type) -> Doc {
         }
         TEParen(inner) -> P.cat([P.text("("), typeDoc(f, inner), P.text(")")])
     }
-    P.cat([lead, d])
+    continued(lead, broken, d)
 }
 
 fun arguments(f : F, ts : Vec Type) -> Doc =
@@ -856,12 +1047,12 @@ fun typeEntries(f : F, ts : Vec Type) -> Vec Entry =
 fun arrow(f : F, at : Int) -> Doc = P.cat([leading(f, tokenPos(f, at)), P.text(" -> ")])
 
 fun predDoc(f : F, p : Pred) -> Doc {
-    let lead = leading(f, startOf(p.span))
+    let (lead, broken) = leadingParts(f, startOf(p.span))
     let d = match p.kind {
         PClass(name, t) -> P.cat([P.text(name + " "), typeDoc(f, t)])
         PEq(a, b) -> P.cat([typeDoc(f, a), P.text(" ~ "), typeDoc(f, b)])
     }
-    P.cat([lead, d])
+    continued(lead, broken, d)
 }
 
 fun predsDoc(f : F, ps : Vec Pred) -> Doc = joined(Vec.map(ps, predDoc(f, _)), P.text(", "))
@@ -1120,7 +1311,7 @@ fun endsInBraces(e : Expr) -> Bool = match e.kind {
 -- -- statements ---------------------------------------------------------------------
 
 fun stmtDoc(f : F, s : Stmt) -> Doc {
-    let lead = leading(f, startOf(s.span))
+    let (lead, broken) = leadingParts(f, startOf(s.span))
     let d = match s.kind {
         SLet(p, value) -> P.cat([P.text("let "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
         SVar(p, value) -> P.cat([P.text("var "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
@@ -1133,18 +1324,25 @@ fun stmtDoc(f : F, s : Stmt) -> Doc {
             exprDoc(f, value), P.text(" else "), exprDoc(f, otherwise),
         ])
     }
-    P.cat([lead, d])
+    continued(lead, broken, d)
 }
 
--- ` = ` after what `before` covers, with the block comments between them and
--- the `=` kept before it.
+-- ` = ` after what `before` covers, the comments between them kept before
+-- the `=`.
 fun equals(f : F, before : Span) -> Doc =
-    P.cat([inline(f, tokenPos(f, findToken(f, endOf(before), "="))), P.text(" = ")])
+    equalsAt(f, findToken(f, endOf(before), "="))
+
+-- ` = `, for the `=` at token `at`, after the comments before it. A comment
+-- that ends the line before the `=` keeps the `=` at the start of the next.
+fun equalsAt(f : F, at : Int) -> Doc {
+    let (before, broken) = leadingParts(f, tokenPos(f, at))
+    if broken { P.cat([before, P.nest(1, P.hard), P.text("= ")]) } else { P.cat([before, P.text(" = ")]) }
+}
 
 -- -- patterns -----------------------------------------------------------------------
 
 fun patDoc(f : F, p : Pat) -> Doc {
-    let lead = if isMade(p) { P.empty() } else { leading(f, startOf(p.span)) }
+    let (lead, broken) = if isMade(p) { (P.empty(), False) } else { leadingParts(f, startOf(p.span)) }
     let d = match p.kind {
         PVar(name) -> P.text(name)
         PWild -> P.text("_")
@@ -1168,7 +1366,7 @@ fun patDoc(f : F, p : Pat) -> Doc {
         POr(alts) -> joined(Vec.map(alts, patDoc(f, _)), P.text(" | "))
         PParen(inner) -> P.cat([P.text("("), patDoc(f, inner), P.text(")")])
     }
-    P.cat([lead, d])
+    continued(lead, broken, d)
 }
 
 fun patEntries(f : F, ps : Vec Pat) -> Vec Entry =
@@ -1203,8 +1401,8 @@ fun exprDoc(f : F, e : Expr) -> Doc = exprAt(f, e, 1)
 -- `e`, an operator chain at its top breaking `depth` tabs deeper than the
 -- line it starts on.
 fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
-    let lead = if Source.isEmpty(e.span) { P.empty() } else { leading(f, startOf(e.span)) }
-    P.cat([lead, exprKind(f, e, depth)])
+    let (lead, broken) = if Source.isEmpty(e.span) { (P.empty(), False) } else { leadingParts(f, startOf(e.span)) }
+    continued(lead, broken, exprKind(f, e, depth))
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
@@ -1341,7 +1539,6 @@ fun ifChain(f : F, e : Expr) -> Doc {
         if Option.isNone(otherwise) { break }
         let next = Option.expect(otherwise, "the chain goes on")
         let elseAt = tokenPos(f, findToken(f, endOf(then.span), "else"))
-        Vec.push(parts, inline(f, elseAt))
         if commentBefore(f, elseAt) {
             -- A comment between `}` and `else` stays there, on its own line.
             Vec.push(parts, dangling(f, elseAt))
@@ -1409,8 +1606,7 @@ fun matchDoc(f : F, e : Expr, scrutinee : Expr, arms : Vec Arm) -> Doc {
 
 fun callDoc(f : F, e : Expr, fn : Expr, args : Vec Expr) -> Doc {
     let open = tokenFrom(f, endOf(fn.span))
-    -- A block comment between the callee and its `(` stays between them.
-    let callee = P.cat([exprDoc(f, fn), inline(f, tokenPos(f, open))])
+    let callee = exprDoc(f, fn)
     let close = closerOf(e.span)
     let l = listed(f, exprEntries(f, args), tokenPos(f, open), close)
     let quiet = Iter.all(l.above, P.isEmpty) && P.isEmpty(l.rest)
@@ -1501,14 +1697,12 @@ fun chainDoc(f : F, t : Tree, depth : Int) -> Doc = match t {
         let rest = []
         for var i = 0; i < len(ops); i = i + 1 {
             let (op, at) = ops[i]
-            let kept = inline(f, startOf(at))
             let above = dangling(f, startOf(at))
+            let operand = chainDoc(f, operands[i + 1], 1)
             if op == "-" {
-                let operand = chainDoc(f, operands[i + 1], 1)
-                Vec.push(rest, P.cat([kept, above, P.text(" -"), P.line, operand]))
+                Vec.push(rest, P.cat([above, P.text(" -"), P.line, operand]))
             } else {
-                let operand = chainDoc(f, operands[i + 1], 1)
-                Vec.push(rest, P.cat([kept, above, P.line, P.text(op + " "), operand]))
+                Vec.push(rest, P.cat([above, P.line, P.text(op + " "), operand]))
             }
         }
         P.group(P.cat([first, P.nest(depth, P.cat(rest))]))

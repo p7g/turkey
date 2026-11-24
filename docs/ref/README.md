@@ -270,7 +270,11 @@ status 2, and a command line `turkey fmt` cannot read exits with status 4.
 ```sh
 turkey fmt hello.gob
 turkey fmt --check *.gob
+turkey fmt -- -odd-name.gob
 ```
+
+As for the other commands, `--` ends the options, so every argument after it
+is a file, even one whose name starts with `-`.
 
 The formatter changes only what leaves the program as it is: line breaks,
 indentation, spaces, blank lines, the commas of a list, `;`, and the `=` before

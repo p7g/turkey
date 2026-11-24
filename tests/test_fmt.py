@@ -144,11 +144,40 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
     # `--check` writes nothing; it exits 1 because the corpus is not formatted.
     result = fmt("--check", *files, *accepted)
     assert result.returncode in (0, 1) and result.stderr == "", result.stderr
-    # An example the compiler rejects may not even parse, which ends a run, so
-    # each is formatted alone.
-    for path in rejected:
-        result = fmt("--check", path)
-        assert "internal error" not in result.stderr, (path, result.stderr)
+    # A file that does not parse is reported, and the run goes on.
+    result = fmt("--check", *rejected)
+    assert "internal error" not in result.stderr, result.stderr
+
+
+def _with_block_comments(text: str) -> str:
+    """`text` with a block comment on each code line, in the space nearest the
+    middle of the line. A line with a quote or a comment on it is left alone,
+    so the comment is never put inside a literal or another comment."""
+    lines = text.split("\n")
+    for n, line in enumerate(lines):
+        if any(t in line for t in ('"', "'", "--", "{-", "-}")):
+            continue
+        start = len(line) - len(line.lstrip())
+        spaces = [i for i, ch in enumerate(line) if ch == " " and i > start]
+        if spaces:
+            mid = min(spaces, key=lambda i: abs(i - len(line) // 2))
+            lines[n] = line[:mid] + f" {{- z{n} -}} " + line[mid + 1:]
+    return "\n".join(lines)
+
+
+def test_block_comments_all_over_the_corpus_format_safely(tmp_path: Path) -> None:
+    # A block comment can go between any two tokens, so one per line reaches
+    # nearly every place the layout puts code. None may make the formatter
+    # refuse a file.
+    paths = []
+    for top in ("lib", "src", "examples"):
+        for source in sorted((ROOT / top).rglob("*.gob")):
+            target = tmp_path / source.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(_with_block_comments(source.read_text()))
+            paths.append(str(target))
+    result = fmt("--check", *paths)
+    assert result.returncode in (0, 1) and result.stderr == "", result.stderr
 
 
 # Comments and directives in the places that are hardest to keep: between two
@@ -177,6 +206,19 @@ AWKWARD = {
     "block_comment_before_equals": "fun f() {\n  let x {- c -} = 1\n}\n",
     "block_comment_under_directive": "fun f() {\n  foo(1, {- c -} 2) --@expect(unreachable-code)\n}\n",
     "directive_after_if": "fun main() {\n    if c { --@expect(unreachable-code)\n        a()\n    }\n}\n",
+    "broken_value_after_end_comment": "fun main() {\n    let s = -- a\n        f(aaaaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccccc, dddddddddddddddddd)\n    let t = -- b\n        {print(1); 2}\n}\n",
+    "broken_arm_after_end_comment": "fun g(t : Option Int) -> Int = match t {\n    Some(x) -> -- a\n        f(aaaaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccccc, dddddddddddddddddd)\n    None -> 0\n}\n",
+    "block_comment_in_broken_list": "fun main() {\n    h(\n        a, {- z -} b,\n        c,\n    )\n}\n",
+    "block_comment_in_sub_list": "import M (T({- c -} A, B), g)\n",
+    "block_comment_in_export_sub_list": "export (Status(A, {- c -} B, C), f)\n",
+    "block_comment_in_class": "class C a { {- c -} fun m(a) -> Int }\n",
+    "block_comment_in_record": "fun f() -> P = P { {- c -} x = 1, y = 2 }\nfun g() -> P = P { x = 1, {- c -} y = 2 }\ntype R = R { {- c -} x : Int, y : Int }\n",
+    "block_comment_around_body_equals": "fun f(x : Int) -> Int {- z -} = x\nfun g(x : Int) -> Int = {- z -} x\n",
+    "block_comment_in_infix": "--- Doc.\ninfix {- z -} Sequence (|>>) = bind\n",
+    "block_comment_in_one_line_if": "fun at(xs : Array Int, i : Int) -> Option Int =\n\tif i < 0 { {- z -} None } else { Some(xs[i]) }\n",
+    "block_comment_in_empty_block": "fun f() { {- c -} }\n",
+    "block_comment_before_equals_type": "type Section {- a -} =\n    --- Code.\n    Text\n    | {- b -} Data\n",
+    "end_comment_before_equals": "fun g() {\n    let x -- c\n        = 1\n    x\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -192,6 +234,24 @@ AWKWARD_OUTPUT = {
     "block_comment_before_equals": "fun f() {\n\tlet x {- c -} = 1\n}\n",
     "block_comment_under_directive": "fun f() {\n\tfoo(1, {- c -} 2) --@expect(unreachable-code)\n}\n",
     "directive_after_if": "fun main() {\n\tif c { --@expect(unreachable-code)\n\t    a()\n\t}\n}\n",
+    "broken_value_after_end_comment": (
+        "fun main() {\n\tlet s = -- a\n\t\tf(\n"
+        + "".join(f"\t\t\t{x},\n" for x in "aaaaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccccc, dddddddddddddddddd".split(", "))
+        + "\t\t)\n\tlet t = -- b\n\t\t{\n\t\t\tprint(1)\n\t\t\t2\n\t\t}\n}\n"),
+    "broken_arm_after_end_comment": (
+        "fun g(t : Option Int) -> Int = match t {\n\tSome(x) -> -- a\n\t\tf(\n"
+        + "".join(f"\t\t\t{x},\n" for x in "aaaaaaaaaaaaaaaaaaaaaa, bbbbbbbbbbbbbbbbbbbbbbbbbbbb, cccccccccccccccccccccccc, dddddddddddddddddd".split(", "))
+        + "\t\t)\n\tNone -> 0\n}\n"),
+    "block_comment_in_broken_list": "fun main() {\n\th(\n\t\ta,\n\t\t{- z -} b,\n\t\tc,\n\t)\n}\n",
+    "block_comment_in_sub_list": "import M (T({- c -} A, B), g)\n",
+    "block_comment_in_export_sub_list": "export (Status(A, {- c -} B, C), f)\n",
+    "block_comment_in_class": "class C a { {- c -} fun m(a) -> Int }\n",
+    "block_comment_in_record": "fun f() -> P = P { {- c -} x = 1, y = 2 }\nfun g() -> P = P { x = 1, {- c -} y = 2 }\ntype R = R { {- c -} x : Int, y : Int }\n",
+    "block_comment_around_body_equals": "fun f(x : Int) -> Int {- z -} = x\nfun g(x : Int) -> Int = {- z -} x\n",
+    "block_comment_in_infix": "--- Doc.\ninfix {- z -} Sequence (|>>) = bind\n",
+    "block_comment_in_empty_block": "fun f() { {- c -} }\n",
+    "block_comment_before_equals_type": "type Section {- a -}\n\t--- Code.\n\t= Text\n\t| {- b -} Data\n",
+    "end_comment_before_equals": "fun g() {\n\tlet x -- c\n\t\t= 1\n\tx\n}\n",
 }
 
 

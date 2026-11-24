@@ -193,7 +193,7 @@ fun ambiguous(name : String, targets : Vec String, where : Option Span) -> Optio
 }
 
 -- An internal name as a diagnostic writes it: `Data.Set.union`.
-fun declared(target : String) -> String = String.replace(target, "#", ".")
+fun declared(target : String) -> String = Prelude.display(target)
 
 -- Every declaration the dotted name `name` means in `space` through a
 -- qualifier, each once.
@@ -292,7 +292,15 @@ fun mergeName(s : Scope, space : Namespace, name : String, target : String) -> U
 }
 
 type Module = Module {
+    --- The name it is loaded under, which starts the internal name of each
+    --- of its declarations and is no other loaded module's. It is the name
+    --- the module is imported by, except for a program's module that shares
+    --- that name with a library module (`Turkey.Prelude.programModule`).
     name        : String,
+    --- The module each import means, by the name the import writes:
+    --- `name` of the module it brings. An implicit Prelude import is here as
+    --- one written out would be.
+    imported    : Map String String,
     --- The path it was read from, as a span names it.
     file        : String,
     --- The text `program` was parsed from.
@@ -310,8 +318,10 @@ type Loader = Loader {
     --- The entry file's own directory first, then the shipped library, which is
     --- always last and is what marks a module as one the language ships.
     search       : Array String,
-    --- Every finished module.
+    --- Every finished module, by the name it is loaded under.
     modules      : Map String Module,
+    --- What each name means when a module of the program imports it.
+    targets      : Map String String,
     --- Every module, in the order they finished loading, which is dependency
     --- order: a module finishes with its component, after everything outside
     --- the component that it imports. Members of one component are in the
@@ -342,6 +352,7 @@ type Opened = Opened {
     name        : String,
     source      : Source,
     library     : Bool,
+    imported    : Map String String,
     var program : Program,
     -- How many type names were known when `program` was parsed.
     parsedWith  : Int,
@@ -350,6 +361,7 @@ type Opened = Opened {
 fun newLoader(search : Array String) -> Loader = Loader {
     search = search,
     modules = Map.new(),
+    targets = Map.new(),
     order = Vec.new(8),
     groups = Vec.new(8),
     open = Map.new(),
@@ -411,6 +423,56 @@ fun declaresMain(program : Program) -> Bool {
 -- a library module -- which is the whole of what `library` means and the only
 -- thing that decides whether `Prim.*` is spellable.
 --
+-- Which root an import is looked for in depends on the module that writes
+-- it. A library module's imports are the library's modules and no others, so
+-- that nothing a program is made of can stand in for a module the library
+-- was written against. A program's module finds the program's own modules
+-- first and the library's after. A program may therefore have a module that
+-- is written as a library module is. The two are different modules, both
+-- loaded if both are imported, and `target` gives the program's a name of
+-- its own to be loaded under.
+
+-- The root the shipped library is under.
+fun libraryRoot(l : Loader) -> String = l.search[len(l.search) - 1]
+
+-- Whether `root` is one of the program's own. An entry inside the library
+-- has the library's root as its directory, and its imports are then the
+-- library's modules, loaded once.
+fun programRoot(l : Loader, root : String) -> Bool = root != libraryRoot(l)
+
+fun pathParts(name : String) -> Array String = Vec.toArray(String.split(name, "."))
+
+-- Returns the name of the module that `name` means when a module imports it,
+-- as the module is loaded under: the importer is a library module if
+-- `library` is set, and one of the program's otherwise.
+fun target(l : Loader, library : Bool, name : String) -> String {
+    if library { return name }
+    match Map.get(l.targets, name) {
+        Some(known) -> return known
+        None -> {}
+    }
+    let parts = pathParts(name)
+    var own = False
+    for var i = 0; i < len(l.search) - 1; i = i + 1 {
+        if programRoot(l, l.search[i]) && spelledExactly(l, l.search[i], parts) { own = True }
+    }
+    let known = if own && spelledExactly(l, libraryRoot(l), parts) {
+        Prelude.programModule(name)
+    } else {
+        name
+    }
+    Map.put(l.targets, name, known)
+    known
+}
+
+-- Finds the file of the module loaded under `module_`, and returns its path,
+-- whether it is the library's, and its text.
+--
+-- A name `target` marked as the program's is looked for in the program's
+-- roots alone. Any other is the library's module if the library has one, and
+-- only then a module of the program: a program's module the library has too
+-- would have been marked.
+--
 -- The path is spelled exactly as the name is. Each component is looked up in
 -- its directory's listing rather than trusted to `open`, because on a
 -- filesystem that ignores case, as macOS's does by default, `open` would find
@@ -424,14 +486,19 @@ fun declaresMain(program : Program) -> Bool {
 -- between finding the file and compiling it. A file that reads but is not
 -- UTF-8 is still the module, with no text, so "not there" and "not UTF-8"
 -- stay two different failures.
-fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
-    let parts = Vec.toArray(String.split(name, "."))
+fun resolvePath(l : Loader, module_ : String) -> (String, Bool, Option String) {
+    let name = Prelude.writtenName(module_)
+    let parts = pathParts(name)
     let relative = String.join(parts, "/") + ".gob"
-    for var i = 0; i < len(l.search); i = i + 1 {
-        let root = l.search[i]
+    let roots : Vec String = []
+    if module_ == name { Vec.push(roots, libraryRoot(l)) }
+    for var i = 0; i < len(l.search) - 1; i = i + 1 {
+        if programRoot(l, l.search[i]) { Vec.push(roots, l.search[i]) }
+    }
+    for root in roots {
         let candidate = within(root, relative)
-        let library = i == len(l.search) - 1
         if spelledExactly(l, root, parts) {
+            let library = !programRoot(l, root)
             match File.readText(candidate) {
                 Right(text) -> return (candidate, library, Some(text))
                 Left(Left(IO.InvalidUTF8)) -> return (candidate, library, None)
@@ -439,7 +506,13 @@ fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
             }
         }
     }
-    for root in l.search {
+    missing(l, name, l.search)
+}
+
+-- Ends the compile for the module `name`, which is in none of `roots`.
+fun missing(l : Loader, name : String, roots : Array String) -> a {
+    let parts = pathParts(name)
+    for root in roots {
         match spelledLoosely(l, root, parts) {
             Some(actual) -> oops("cannot find module '" + name + "': "
                                  + quoted(within(root, actual)) + " differs from "
@@ -449,7 +522,7 @@ fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
         }
     }
     oops("cannot find module '" + name + "' (searched "
-         + String.join(l.search, ", ") + ")")
+         + String.join(roots, ", ") + ")")
 }
 
 -- A module beside an entry named without a directory is `Wrong.gob`, as the
@@ -543,6 +616,7 @@ fun withoutDot(path : String) -> String = Option.unwrapOr(String.stripPrefix(pat
 -- far, and again when its component is finished if more are known by then.
 fun read(l : Loader, name : String, source : Option Source) -> Array String {
     let entry = Option.isSome(source)
+    let written = Prelude.writtenName(name)
     let (found, library) = match source {
         Some(given) -> (given, False)
         None -> {
@@ -550,26 +624,39 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
             match text {
                 Some(text) -> {
                     if isEntryFile(l, file) {
-                        oops("cannot import '" + name + "': " + quoted(file)
+                        oops("cannot import '" + written + "': " + quoted(file)
                              + " is the entry module, '" + Prelude.entryName
                              + "', and the entry cannot be imported")
                     }
                     (Source { name = file, text = text }, library)
                 }
-                None -> oops("module '" + name + "' at " + quoted(file)
+                None -> oops("module '" + written + "' at " + quoted(file)
                              + " is not valid UTF-8")
             }
         }
     }
     let program = parse(found, l.tycons)
+    let imported = Map.new()
     Map.put(l.open, name, Opened {
-        name = name, source = found, library = library, program = program,
-        parsedWith = len(l.tycons),
+        name = name, source = found, library = library, imported = imported,
+        program = program, parsedWith = len(l.tycons),
     })
     let edges = Vec.new(4)
+    -- An import a module writes, or has without writing it, as an edge.
+    let edge = fun(wanted : String) -> Unit {
+        if library && !spelledExactly(l, libraryRoot(l), pathParts(wanted)) {
+            missing(l, wanted, [libraryRoot(l)])
+        }
+        let module_ = target(l, library, wanted)
+        Map.put(imported, wanted, module_)
+        Vec.push(edges, module_)
+    }
+    -- The startup module, the Prelude's qualifiers and the well-known names
+    -- are the library's whatever the program holds: the compiler adds them
+    -- and names what they declare.
     if entry && declaresMain(program) { Vec.push(edges, startupModule) }
-    if name != Prelude.preludeName && !hasPreludeImport(program) {
-        Vec.push(edges, Prelude.preludeName)
+    if written != Prelude.preludeName && !hasPreludeImport(program) {
+        edge(Prelude.preludeName)
     }
     for imp in program.imports {
         if imp.name == Prelude.entryName {
@@ -577,11 +664,11 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
                    + "entry cannot be imported", Some(imp.span))
             continue
         }
-        if importsModule(imp) { Vec.push(edges, imp.name) }
+        if importsModule(imp) { edge(imp.name) }
     }
     -- After the Prelude, which imports each of these itself, so that they
     -- change nothing about the order modules load in.
-    if getsPrelude(name, program) {
+    if getsPrelude(written, program) {
         for q in Prelude.preludeQualifiers { Vec.push(edges, q) }
     }
     -- Last, so that it changes nothing about the order the program's own
@@ -598,8 +685,8 @@ fun importsModule(imp : ImportDecl) -> Bool = !optsOut(imp)
 fun optsOut(imp : ImportDecl) -> Bool =
     imp.name == Prelude.preludeName && !imp.rest && isEmptyList(imp.items)
 
--- Whether a module has the Prelude, implicitly or by an import that names
--- something from it.
+-- Whether the module written `name` has the Prelude, implicitly or by an
+-- import that names something from it.
 fun getsPrelude(name : String, program : Program) -> Bool {
     if name == Prelude.preludeName { return False }
     for imp in program.imports {
@@ -628,7 +715,7 @@ fun finish(l : Loader, names : Vec String) -> Unit {
     for o in members {
         if !o.library {
             for imp in o.program.imports {
-                if importsModule(imp) { checkInternalImport(l, imp) }
+                if importsModule(imp) { checkInternalImport(l, o, imp) }
             }
         }
     }
@@ -653,10 +740,11 @@ fun finish(l : Loader, names : Vec String) -> Unit {
 
     let modules = Vec.new(len(members))
     for o in members {
-        checkForeignPlacement(o.name, o.program, o.library)
+        checkForeignPlacement(Prelude.writtenName(o.name), o.program, o.library)
         Giblets.checkPlacement(o.name, o.library, Source.span(o.source.name, 1, 1))
         let m = Module {
-            name = o.name, file = o.source.name, text = o.source.text, program = o.program,
+            name = o.name, imported = o.imported, file = o.source.name,
+            text = o.source.text, program = o.program,
             library = o.library, scope = newScope(), exports = newScope(),
         }
         Map.put(l.modules, o.name, m)
@@ -730,6 +818,13 @@ fun sameNames(a : Scope, b : Scope) -> Bool {
 
 fun moduleNames(modules : Vec Module) -> Vec String =
     Vec.sort(Vec.map(modules, fun(m : Module) = m.name))
+
+-- The modules' names as a diagnostic writes them.
+fun writtenNames(modules : Vec Module) -> Vec String =
+    Vec.map(moduleNames(modules), Prelude.writtenName)
+
+-- A module's name as its importers write it, for a diagnostic.
+fun written(m : Module) -> String = Prelude.writtenName(m.name)
 
 fun addAll(into : Set.Set String, from : Set.Set String) -> Unit {
     for x in Set.elements(from) { Set.add(into, x) }
@@ -806,10 +901,10 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         }
     }
 
-    if getsPrelude(m.name, m.program) {
+    if getsPrelude(written(m), m.program) {
         let implicit = newScope()
         if !hasPreludeImport(m.program) {
-            bring(l, implicit, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
+            bring(l, implicit, importedBy(l, m, Prelude.preludeName), Prelude.preludeName,
                   None, AllBare, strict)
         }
         for q in Prelude.preludeQualifiers {
@@ -830,7 +925,7 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         -- An import of the entry was reported when the module was read, and
         -- the entry is not loaded yet.
         if !optsOut(imp) && imp.name != Prelude.entryName {
-            let dep = moduleNamed(l, imp.name)
+            let dep = importedBy(l, m, imp.name)
             let alias = match imp.alias {
                 Some(a) -> a
                 None -> imp.name
@@ -873,6 +968,13 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
     None -> bug("module '" + name + "' was not loaded")
 }
 
+-- The module `m`'s import of `name` brings.
+fun importedBy(l : Loader, m : Module, name : String) -> Module =
+    match Map.get(m.imported, name) {
+        Some(module_) -> moduleNamed(l, module_)
+        None -> bug("module '" + m.name + "' has no import of '" + name + "'")
+    }
+
 -- Which bare names and unprefixed qualifiers an import brings. Its alias
 -- reaches every export, whatever this says.
 type Bare
@@ -894,7 +996,7 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
     if strict && Option.isNone(dep.program.exportDecl) {
         -- And nothing is brought: every item of the list would be reported
         -- as missing from the exports the module does not declare.
-        return report("module '" + dep.name + "' is imported but has no export "
+        return report("module '" + written(dep) + "' is imported but has no export "
                       + "declaration; begin it with 'export (...)' listing its "
                       + "exports, or 'export (..)' for everything it declares", where)
     }
@@ -954,7 +1056,7 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
                     if under != "_" { Map.put(result.qualifiers, under, modules) }
                 }
                 None -> if strict {
-                    report("module '" + dep.name + "' does not export 'module "
+                    report("module '" + written(dep) + "' does not export 'module "
                            + entry.item.name + "'", at)
                 }
             }
@@ -981,7 +1083,7 @@ fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
 fun itemNames(l : Loader, dep : Module, item : ExportItem, where : Option Span,
               strict : Bool) -> Vec (Int, String, String, Bool) {
     if strict && !namedAnywhere(dep.exports, item.name) {
-        report("module '" + dep.name + "' does not export "
+        report("module '" + written(dep) + "' does not export "
                + quoted(item.name), where)
         return []
     }
@@ -1025,14 +1127,14 @@ fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,
             if !Vec.contains(membersOf(l, cls), sub)
                 || !(Set.contains(dep.exports.methods, cls + "." + sub)
                      || Map.contains(dep.exports.types, sub)) {
-                report("module '" + dep.name + "' does not export member '"
+                report("module '" + written(dep) + "' does not export member '"
                        + sub + "' of class '" + item.name + "'", where)
             }
         }
         None -> {
             if !constructorMember(l, Map.get(dep.exports.types, item.name),
                                   sub, Map.get(dep.exports.cons, sub)) {
-                report("module '" + dep.name + "' does not export constructor '"
+                report("module '" + written(dep) + "' does not export constructor '"
                        + sub + "' of type '" + item.name + "'", where)
             }
         }
@@ -1165,8 +1267,8 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
                 Some(previous) -> {
                     if strict && moduleNames(previous) != moduleNames(modules)
                        && (!rest || Set.contains(added, key)) {
-                        clash(key, String.join(moduleNames(previous), ", "),
-                              String.join(moduleNames(modules), ", "), item, entries)
+                        clash(key, String.join(writtenNames(previous), ", "),
+                              String.join(writtenNames(modules), ", "), item, entries)
                     }
                 }
                 None -> {
@@ -1246,13 +1348,13 @@ fun qualifierModule(m : Module, item : ExportItem, strict : Bool) -> Option Modu
             if len(modules) == 1 { return Some(modules[0]) }
             if strict {
                 report("'module " + item.name + "' names "
-                       + String.join(Vec.map(moduleNames(modules), quoted), " and ")
+                       + String.join(Vec.map(writtenNames(modules), quoted), " and ")
                        + "; a 'module' entry must name one module",
                        Some(item.span))
             }
         }
         None -> if strict {
-            report("module '" + m.name + "' exports 'module " + item.name
+            report("module '" + written(m) + "' exports 'module " + item.name
                    + "', but no qualifier '" + item.name + "' is in scope here; "
                    + "import a module as '" + item.name + "'", Some(item.span))
         }
@@ -1324,7 +1426,7 @@ fun exported(m : Module, own : Map String String, space : Namespace,
     let found = firstOf(Map.get(own, item.name),
                         findName(m.scope, space, item.name, item, strict))
     if strict && Option.isNone(found) {
-        report("module '" + m.name + "' exports '" + item.name
+        report("module '" + written(m) + "' exports '" + item.name
                + "', which is not defined or imported here", Some(item.span))
     }
     found
@@ -1382,10 +1484,11 @@ fun parse(source : Source, tycons : Vec String) -> Program {
     program
 }
 
-fun checkInternalImport(l : Loader, imp : ImportDecl) -> Unit {
-    let library = match Map.get(l.modules, imp.name) {
+fun checkInternalImport(l : Loader, importer : Opened, imp : ImportDecl) -> Unit {
+    let module_ = Map.getOr(importer.imported, imp.name, imp.name)
+    let library = match Map.get(l.modules, module_) {
         Some(m) -> m.library
-        None -> match Map.get(l.open, imp.name) {
+        None -> match Map.get(l.open, module_) {
             Some(o) -> o.library
             None -> False
         }

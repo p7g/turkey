@@ -13,6 +13,7 @@ with the entry file's own directory.
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -320,6 +321,32 @@ def test_modules_may_import_each_other(tmp_path):
 
 def test_a_missing_module_is_reported(tmp_path):
     assert "cannot find module 'Nowhere'" in fails("import Nowhere", {})
+
+
+def test_a_library_module_imports_only_library_modules(tmp_path):
+    """A module of the library finds its imports in the library, whatever is
+    beside the entry: `Mine` is the program's, so the library's module cannot
+    find it."""
+    digest = hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
+    probe = lang.LIB / f"Probe_scoped_{digest}.gob"
+    probe.write_text("export ()\nimport Mine\n", encoding="utf-8")
+    try:
+        message = fails(f"import Mine\nimport Probe_scoped_{digest}\n"
+                        "fun main() { }\n", {"Mine.gob": "export ()\n"})
+    finally:
+        probe.unlink(missing_ok=True)
+    assert f"cannot find module 'Mine' (searched {lang.LIB})" in message
+
+
+def test_a_program_prelude_does_not_reach_the_library(tmp_path):
+    """The implicit Prelude of a program's modules is the program's own, if
+    it has one, and every library module still has the library's."""
+    search = write(tmp_path, Prelude="export (hello)\n"
+                                     "import Prelude ()\n"
+                                     "import System.IO (print)\n"
+                                     "fun hello() { print(\"mine\") }")
+    assert lang.output("fun main() { hello() }", search) == "mine\n"
+    assert fails("fun main() { print(\"x\") }", search) == "'print' is not defined"
 
 
 def test_a_type_declared_in_another_module_is_usable(tmp_path):

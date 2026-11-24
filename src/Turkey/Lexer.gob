@@ -148,7 +148,7 @@ fun broken(where : Span) -> Token = plain(KEof, VNone, where)
 fun internal(lx : Lexer, message : String, where : Span) -> a =
     Diag.fail(Diag.at("internal error", message, where), lx.file)
 
--- Does the source read `needle` at `start`? The needles are one and two
+-- Does the source read `needle` at `start`? The needles are at most three
 -- characters long, so this is a comparison and not a search.
 fun matchesAt(src : String, start : String.Index, needle : String) -> Bool {
     var here = start
@@ -540,6 +540,7 @@ fun digitValue(c : Char) -> Option Int {
 -- -- strings and characters ----------------------------------------------------------
 
 fun lexString(lx : Lexer, start : Span) -> Token {
+    if matchesAt(lx.src, lx.at, "\"\"\"") { return lexMultiLineString(lx, start) }
     bump(lx)
     let b = String.builder()
     loop {
@@ -566,6 +567,155 @@ fun lexString(lx : Lexer, start : Span) -> Token {
         }
     }
     plain(KString, VText(String.build(b)), start)
+}
+
+-- A multi-line string: `"""` at the end of its line, lines of text, and a
+-- closing `"""` that starts its own line. The spaces and tabs before the
+-- closing `"""` are the string's indentation. Every line of text must start
+-- with exactly that indentation, which is left out of the value; a line of
+-- only spaces and tabs may have less, and is then empty. The lines are joined
+-- by line feeds, so the line break before the closing line is not part of the
+-- value. Escapes are those of a one-line string, and a `\` at the end of a
+-- line leaves out its line break.
+--
+-- The indentation is known only at the closing line, and every line before it
+-- is read relative to it. So read the literal twice: once to find the closing
+-- line, and again from the top to build the value.
+--
+-- A carriage return just before a line break counts as part of the break, so
+-- a file's line endings never change a string's value.
+fun lexMultiLineString(lx : Lexer, start : Span) -> Token {
+    bumpBy(lx, 3)
+    if !endsLine(lx) {
+        let after = here(lx)
+        -- Spaces after the opening `"""` are not ignored, because the
+        -- formatter strips them, and the text of a literal must survive it.
+        let _ = spacesAndTabs(lx)
+        if endsLine(lx) {
+            return oops(lx, "the opening '\"\"\"' of a multi-line string must end its line; "
+                            + "remove the spaces after it", after, broken(start))
+        }
+        return oops(lx, "this multi-line string has text on the line of its opening '\"\"\"'; "
+                        + "start the text on the next line", after, broken(start))
+    }
+    skipLineBreak(lx)
+    let at = lx.at
+    let line = lx.line
+    let col = lx.col
+    let indent = match closingIndent(lx, start) {
+        Some(found) -> found
+        None -> { return broken(start) }
+    }
+    lx.at = at
+    lx.line = line
+    lx.col = col
+    let b = String.builder()
+    -- Whether a line break ended the last line of text. Its line feed is
+    -- pushed only once another line of text follows.
+    var broke = False
+    loop {
+        let lineStart = here(lx)
+        let leading = spacesAndTabs(lx)
+        if matchesAt(lx.src, lx.at, "\"\"\"") {
+            bumpBy(lx, 3)
+            break
+        }
+        if broke { String.push(b, "\n") }
+        broke = False
+        if endsLine(lx) {
+            if let Some(rest) = String.stripPrefix(leading, indent) { String.push(b, rest) }
+            skipLineBreak(lx)
+            broke = True
+            continue
+        }
+        match String.stripPrefix(leading, indent) {
+            Some(rest) -> String.push(b, rest)
+            None -> {
+                return oops(lx, "this line of a multi-line string does not start with the "
+                                + "indentation of its closing '\"\"\"'", lineStart, broken(start))
+            }
+        }
+        loop {
+            if endsLine(lx) {
+                skipLineBreak(lx)
+                broke = True
+                break
+            }
+            match peek(lx) {
+                -- `closingIndent` found the closing line, so the source
+                -- cannot end first.
+                None -> { return internal(lx, "a multi-line string lost its closing line", start) }
+                Some(c) -> {
+                    if c == '\\' && continuesLine(lx) {
+                        bump(lx)
+                        skipLineBreak(lx)
+                        break
+                    }
+                    if c == '\\' {
+                        let escaped = lexEscape(lx)
+                        if failed(lx) { return broken(start) }
+                        String.push(b, Char.toString(escaped))
+                    } else {
+                        String.push(b, Char.toString(c))
+                        bump(lx)
+                    }
+                }
+            }
+        }
+    }
+    plain(KString, VText(String.build(b)), start)
+}
+
+-- Returns the indentation of the closing line of the multi-line string whose
+-- text starts here, leaving the lexer somewhere inside the string. Skips each
+-- escape whole, so `\"""` does not close the string. Returns `None` after an
+-- `oops`.
+fun closingIndent(lx : Lexer, start : Span) -> Option String {
+    loop {
+        let indent = spacesAndTabs(lx)
+        if matchesAt(lx.src, lx.at, "\"\"\"") { return Some(indent) }
+        loop {
+            match peek(lx) {
+                None -> {
+                    return oops(lx, "this multi-line string has no closing '\"\"\"'", start, None)
+                }
+                Some(c) -> {
+                    bump(lx)
+                    if c == '\n' { break }
+                    if c == '\\' && !charIs(peek(lx), '\n') {
+                        bump(lx)
+                    } else if c == '"' && matchesAt(lx.src, lx.at, "\"\"") {
+                        return oops(lx, "the closing '\"\"\"' of a multi-line string must start "
+                                        + "its own line", spanBefore(lx), None)
+                    }
+                }
+            }
+        }
+    }
+}
+
+-- The span of the code point the lexer just stepped over, on the same line.
+fun spanBefore(lx : Lexer) -> Span = span(lx.file, lx.line, lx.col - 1)
+
+-- Steps over the spaces and tabs here and returns them.
+fun spacesAndTabs(lx : Lexer) -> String {
+    let from = lx.at
+    while charIs(peek(lx), ' ') || charIs(peek(lx), '\t') { bump(lx) }
+    String.slice(lx.src, from, lx.at)
+}
+
+-- Is the lexer at a line break, `\n` or `\r\n`?
+fun endsLine(lx : Lexer) -> Bool =
+    charIs(peek(lx), '\n') || (charIs(peek(lx), '\r') && charIs(peekAt(lx, 1), '\n'))
+
+-- Is the lexer at a `\` that ends its line?
+fun continuesLine(lx : Lexer) -> Bool =
+    charIs(peekAt(lx, 1), '\n') || (charIs(peekAt(lx, 1), '\r') && charIs(peekAt(lx, 2), '\n'))
+
+-- Steps over the line break `endsLine` found.
+fun skipLineBreak(lx : Lexer) -> Unit {
+    if charIs(peek(lx), '\r') { bump(lx) }
+    bump(lx)
 }
 
 fun lexChar(lx : Lexer, start : Span) -> Token {

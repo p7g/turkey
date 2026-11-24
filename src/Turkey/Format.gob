@@ -535,11 +535,30 @@ fun written(f : F, s : Span) -> String = slice(f.lines, s)
 -- lines after it keep their places relative to it.
 fun kept(f : F, s : Span) -> Doc {
     Vec.push(f.keptSpans, s)
-    let line = if s.line <= len(f.lines) { f.lines[s.line - 1] } else { "" }
-    let cs = String.toCodePoints(line)
+    P.shifted(String.trimEnd(written(f, s)), indentOf(f, s.line))
+}
+
+-- The spaces and tabs that start source line `line`.
+fun indentOf(f : F, line : Int) -> String {
+    let text = if line <= len(f.lines) { f.lines[line - 1] } else { "" }
+    let cs = String.toCodePoints(text)
     var n = 0
     while n < len(cs) && (cs[n] == ' ' || cs[n] == '\t') { n = n + 1 }
-    P.shifted(String.trimEnd(written(f, s)), String.fromCodePoints(Array.slice(cs, 0, n)))
+    String.fromCodePoints(Array.slice(cs, 0, n))
+}
+
+-- A literal at `s`, as written.
+--
+-- A multi-line string's later lines move with the line it starts on when that
+-- keeps its value, which is when its closing line starts with that line's
+-- indentation. Every line of its text then starts with that indentation too,
+-- since it starts with the closing line's, and the string's indentation and
+-- its text move together. Otherwise its later lines stay where they are, and
+-- the string keeps its value but not its place relative to the code around it.
+fun literalDoc(f : F, s : Span, spelled : String) -> Doc {
+    if s.line == s.endLine { return P.text(spelled) }
+    let first = indentOf(f, s.line)
+    if String.startsWith(indentOf(f, s.endLine), first) { P.shifted(spelled, first) } else { P.raw(spelled) }
 }
 
 -- -- tokens -------------------------------------------------------------------------
@@ -1515,7 +1534,7 @@ fun patDoc(f : F, p : Pat) -> Doc {
             })
             P.cat([P.text(name + " "), record(f, open, closerOf(p.span), items, rest)])
         }
-        PLit(_, spelled) -> P.raw(spelled)
+        PLit(_, spelled) -> literalDoc(f, p.span, spelled)
         PTuple(xs) -> list(f, tokenFrom(f, startOf(p.span)), "(", ")", patEntries(f, xs))
         PAnnot(inner, t) -> P.cat([patDoc(f, inner), P.text(" : "), typeDoc(f, t)])
         POr(alts) -> joined(Vec.map(alts, patDoc(f, _)), P.text(" | "))
@@ -1565,7 +1584,7 @@ fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
-    ELit(_, spelled) -> P.raw(spelled)
+    ELit(_, spelled) -> literalDoc(f, e.span, spelled)
     EUnit -> P.text("()")
     EVar(name, _) -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
     ECon(name) -> P.text(name)

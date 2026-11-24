@@ -103,6 +103,12 @@ call s:Probe('escapes', -1, 'turkeyString')
 call s:Probe('u{1F600}', 0, 'turkeyEscape')    " the string's escape this time
 call s:Probe('}{', 0, 'turkeyString')          " braces inside a string
 call s:Probe('not a comment', -6, 'turkeyString')
+call s:Probe('usage: greet', 0, 'turkeyMultiString')
+call s:Probe('not a comment', 0, 'turkeyMultiString')
+call s:Probe('"quoted"', 0, 'turkeyMultiString') " a quote does not close it
+call s:Probe('u{1F600} at', 0, 'turkeyEscape')
+call s:Probe('length \\$', 7, 'turkeyMultiString') " a trailing \ is no error
+call s:Probe('^\s*"""', 8, 'turkeyMultiString')
 call s:Probe('\\_', 0, 'turkeyOperator')       " a placeholder function
 call s:Probe('\<for\>', 0, 'turkeyRepeat')
 call s:Probe('\<in\>', 0, 'turkeyRepeat')

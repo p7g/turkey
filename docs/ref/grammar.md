@@ -23,6 +23,7 @@ digits  ::= [0-9] ( "_"? [0-9] )*
 hex     ::= [0-9a-fA-F]
 INDEX   ::= "0" | [1-9] [0-9]*
 STRING  ::= '"' ( character | escape )* '"'
+          | '"""' newline ( indent text-line? newline )* indent '"""'   -- see lexical.md
 CHAR    ::= "'" ( character | escape ) "'"
 escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex? hex? hex? hex? "}"
 OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"

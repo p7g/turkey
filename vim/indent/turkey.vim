@@ -256,6 +256,12 @@ function! GetTurkeyIndent() abort
   let cline = getline(lnum)
   let sw = shiftwidth()
 
+  " A line of a multi-line string keeps its indentation, which is part of the
+  " string. So does its closing line, whose indentation sets the string's.
+  if synIDattr(synID(lnum, 1, 1), "name") ==# 'turkeyMultiString'
+    return -1
+  endif
+
   " A line that opens with a closer aligns with the line of its opener
   " (`}` of a match block, `})` ending a call that took a fun literal). A
   " `{` opener's line is taken from its statement start, as above.

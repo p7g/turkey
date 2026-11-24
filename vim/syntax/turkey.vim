@@ -34,12 +34,17 @@ syn match turkeyLineComment "--.*$" contains=turkeyTodo
 syn match turkeyDocComment "^\s*\zs---\%( .*\)\=$" contains=turkeyTodo
 syn region turkeyBlockComment start="{-" end="-}" contains=turkeyBlockComment,turkeyTodo
 
-" Strings and characters. No interpolation, and a string
+" Strings and characters. No interpolation, and a one-line string
 " cannot span lines. Escapes are exactly \n \t \r \0 \\ \" \' and
-" \u{H...H}; anything else after a backslash is an error.
+" \u{H...H}; anything else after a backslash is an error, except that a
+" multi-line string may end a line in a backslash. A multi-line string opens
+" with `"""` at the end of a line and closes with a `"""` that starts its own
+" line. It is defined after the one-line string so that it wins where both
+" match.
 syn match turkeyEscapeError contained "\\."
 syn match turkeyEscape contained "\\\(u{\x\{1,6}}\|[ntr0\\"']\)"
 syn region turkeyString start=+"+ skip=+\\"+ end=+"+ oneline contains=turkeyEscape,turkeyEscapeError
+syn region turkeyMultiString start=+"""\r\=$+ end=+^\s*\zs"""+ contains=turkeyEscape,turkeyEscapeError
 syn region turkeyChar start=+'+ skip=+\\'+ end=+'+ oneline contains=turkeyEscape,turkeyEscapeError
 
 " Numbers: decimal, `0x`, `0o` and `0b` integers, and floats with a
@@ -91,6 +96,7 @@ hi def link turkeyOperator Operator
 hi def link turkeyNumber Number
 hi def link turkeyFloat Float
 hi def link turkeyString String
+hi def link turkeyMultiString String
 hi def link turkeyChar Character
 hi def link turkeyEscape SpecialChar
 hi def link turkeyEscapeError Error

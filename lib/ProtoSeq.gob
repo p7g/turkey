@@ -1,0 +1,91 @@
+--- Prototype of a pull protocol whose cursor is a value: `step` returns the
+--- next state with the element, and mutates nothing. Measurement only.
+
+export (Steps(..), Step(..), SMap, smap, SFilter, sfilter, SZip, szip, ZipState(..), ssum)
+
+import Prelude ()
+import Data.Bool (Bool(..))
+import Data.Int (Int)
+import Data.Num (Add(..), Zero(..), (+))
+
+type Step a s
+	= Done
+	| Yield(a, s)
+
+class Steps c {
+	type SItem c
+	type State c
+
+	fun start(c) -> State c
+	fun step(c, State c) -> Step (SItem c) (State c)
+}
+
+type SMap c a b = SMap { source : c, f : fun(a) -> b }
+
+instance Steps (SMap c a b) : Steps c, SItem c ~ a {
+	type SItem = b
+	type State = State c
+	fun start(m) = start(m.source)
+	fun step(m, s) = match step(m.source, s) {
+		Done         -> Done
+		Yield(x, s2) -> Yield(m.f(x), s2)
+	}
+}
+
+fun smap[Steps c, SItem c ~ a](xs : c, f : fun(a) -> b) -> SMap c a b = SMap { source = xs, f = f }
+
+type SFilter c a = SFilter { source : c, keep : fun(a) -> Bool }
+
+instance Steps (SFilter c a) : Steps c, SItem c ~ a {
+	type SItem = a
+	type State = State c
+	fun start(m) = start(m.source)
+	fun step(m, s) {
+		var at = s
+		loop {
+			match step(m.source, at) {
+				Done -> return Done
+				Yield(x, s2) -> {
+					if m.keep(x) { return Yield(x, s2) }
+					at = s2
+				}
+			}
+		}
+	}
+}
+
+fun sfilter[Steps c, SItem c ~ a](xs : c, keep : fun(a) -> Bool) -> SFilter c a =
+	SFilter { source = xs, keep = keep }
+
+type SZip a b = SZip { left : a, right : b }
+type ZipState j k = ZipState(j, k)
+
+instance Steps (SZip a b) : Steps a, Steps b {
+	type SItem = (SItem a, SItem b)
+	type State = ZipState (State a) (State b)
+	fun start(z) = ZipState(start(z.left), start(z.right))
+	fun step(z, ZipState(l, r)) = match step(z.left, l) {
+		Done -> Done
+		Yield(x, l2) -> match step(z.right, r) {
+			Done         -> Done
+			Yield(y, r2) -> Yield((x, y), ZipState(l2, r2))
+		}
+	}
+}
+
+fun szip[Steps a, Steps b](xs : a, ys : b) -> SZip a b = SZip { left = xs, right = ys }
+
+--- Returns the sum of the elements, by a loop whose state is a value.
+fun ssum[Steps c, Add (SItem c), Zero (SItem c)](xs : c) -> SItem c {
+	var total = zero()
+	var s = start(xs)
+	loop {
+		match step(xs, s) {
+			Done -> return total
+			Yield(x, s2) -> {
+				total = total + x
+				s = s2
+			}
+		}
+	}
+}

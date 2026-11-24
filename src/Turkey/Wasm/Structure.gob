@@ -77,7 +77,8 @@ fun structure(f : Func i) -> Either String (Vec Control) {
     let out : Vec Control = []
     let g = analyse(f, innermost)
     let outermost = Context { enclosing = Outermost, fallthrough = None }
-    finish(g, Some(Tree(Ssa.blockId(f.entry), outermost)), out)
+    var next = Some(Tree(Ssa.blockId(f.entry), outermost))
+    while let Some(Tree(x, context)) = next { next = doTree(g, x, context, out) }
     Right(out)
 }
 
@@ -191,20 +192,22 @@ fun matchesFrame(label : Int, frame : Frame) -> Bool = match frame {
 -- `doBranch` placing a successor in line. Along those two calls the dominator
 -- tree is as deep as a run of sequential `if`s or a chain of jumps is long,
 -- while the output stays flat. So each function below returns such a call as
--- a `Tree` rather than making it, and `finish` makes them in a loop. What
--- still recurses is the body of a `block`, `loop` or `if`, so the stack grows
--- with the nesting of the output and not with the length of the function.
+-- a `Tree` rather than making it, and whoever builds a body places the trees
+-- returned to it in a loop.
+--
+-- What still recurses is the body of a `block`, `loop` or `if`, so the stack
+-- grows with the nesting of the output: about 700 bytes per level on arm64,
+-- where a 1 MB stack holds some 1400 levels. That nesting can grow with the
+-- function too. Each
+-- loop's exit is placed inside its `loop`, so a run of sequential loops nests
+-- twice as deep as it is long, and each `else if` nests inside the `if`
+-- before it. The loop that places the returned trees is written out in each
+-- body rather than shared, because a shared one would add its own frame to
+-- every level.
 
 -- A dominator subtree still to be placed: its root and the context it goes
 -- in.
 type Tree = Tree(Int, Context)
-
--- Appends to `out` the translation of `pending`, if any, and of every subtree
--- placing it returns.
-fun finish(g : Graph, pending : Option Tree, out : Vec Control) -> Unit {
-    var next = pending
-    while let Some(Tree(x, context)) = next { next = doTree(g, x, context, out) }
-}
 
 -- Appends to `out` the translation of block `x` and of every block it
 -- dominates, except for one subtree it may return, whose translation goes
@@ -220,7 +223,8 @@ fun doTree(g : Graph, x : Int, context : Context, out : Vec Control) -> Option T
     }
     if !g.header[x] { return nodeWithin(g, x, selected, 0, None, context, out) }
     let body : Vec Control = []
-    finish(g, nodeWithin(g, x, selected, 0, None, inside(LoopHeadedBy(x), context), body), body)
+    var next = nodeWithin(g, x, selected, 0, None, inside(LoopHeadedBy(x), context), body)
+    while let Some(Tree(y, c)) = next { next = doTree(g, y, c, body) }
     Vec.push(out, Loop(body))
     None
 }
@@ -240,16 +244,18 @@ fun nodeWithin(g : Graph, x : Int, ys : Vec Int, k : Int, follows : Option Int,
     if let Some(z) = follows {
         if k < len(ys) || !generatesIf(g, x) {
             let body : Vec Control = []
-            finish(g, nodeWithin(g, x, ys, k, None, inside(BlockFollowedBy(z), context), body),
-                   body)
+            var next = nodeWithin(g, x, ys, k, None, inside(BlockFollowedBy(z), context), body)
+            while let Some(Tree(y, c)) = next { next = doTree(g, y, c, body) }
             Vec.push(out, Block(body))
             return None
         }
     }
     if k < len(ys) {
-        -- `follows` is `None` here.
+        -- `follows` is `None` here. Given `Some(y)`, `nodeWithin` places
+        -- everything inside the `block` or `if` that `y` follows, and returns
+        -- nothing.
         let y = ys[k]
-        finish(g, nodeWithin(g, x, ys, k + 1, Some(y), withFallthrough(context, y), out), out)
+        let _ = nodeWithin(g, x, ys, k + 1, Some(y), withFallthrough(context, y), out)
         return Some(Tree(y, context))
     }
     translate(g, x, follows, context, out)
@@ -272,8 +278,10 @@ fun translate(g : Graph, x : Int, follows : Option Int, context : Context,
             let arms = inside(IfThenElse(follows), context)
             let taken : Vec Control = []
             let otherwise : Vec Control = []
-            finish(g, doBranch(g, x, Ssa.blockId(yes), arms, taken), taken)
-            finish(g, doBranch(g, x, Ssa.blockId(no), arms, otherwise), otherwise)
+            var next = doBranch(g, x, Ssa.blockId(yes), arms, taken)
+            while let Some(Tree(y, c)) = next { next = doTree(g, y, c, taken) }
+            next = doBranch(g, x, Ssa.blockId(no), arms, otherwise)
+            while let Some(Tree(y, c)) = next { next = doTree(g, y, c, otherwise) }
             Vec.push(out, If(test, taken, otherwise))
         }
         Ssa.Switch(scrutinee, cases, default) ->
@@ -323,10 +331,9 @@ fun multiway(scrutinee : Value, cases : Vec (Int, BlockId), default : Option Blo
     if len(tested) == 0 { return Br(otherwise) }
     let low = tested[0].0
     let high = tested[len(tested) - 1].0
-    -- Ramsey's translation, like GHC's, emits every switch as one
-    -- `br_table`, which is too big for keys far apart. The threshold is a
-    -- guess, not a measurement: an entry costs a byte or so and a test about
-    -- seven, so at four entries per key the table is no larger than the
+    -- One table for keys far apart is as large as their span. The threshold
+    -- is a guess, not a measurement: an entry costs a byte or so and a test
+    -- about seven, so at four entries per key the table is no larger than the
     -- tests, and below three keys its range check outweighs what it saves.
     let dense = len(tested) >= 3 && match Int.subChecked(high, low) {
         Some(span) -> span < 4 * len(tested)
@@ -383,7 +390,8 @@ fun showBody(body : Vec Control, indent : String, out : Vec String) -> Unit {
                               + "] " + Int.toString(default))
             Code(b) -> Vec.push(out, indent + "b" + Int.toString(Ssa.blockId(b)))
             Return(values) ->
-                Vec.push(out, indent + String.join(Vec.append(["return"], Vec.map(values, showValue)), " "))
+                Vec.push(out, indent + String.join(Vec.append(["return"], Vec.map(values, showValue)),
+                                                   " "))
             Panic(message) -> Vec.push(out, indent + "panic " + showValue(message))
             Unreachable -> Vec.push(out, indent + "unreachable")
         }

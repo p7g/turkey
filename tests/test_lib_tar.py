@@ -31,7 +31,8 @@ def archive(tmp_path_factory: pytest.TempPathFactory) -> bytes:
 
 def _expected() -> dict[str, bytes]:
     return {path.relative_to(REPO_ROOT).as_posix(): path.read_bytes()
-            for path in LIB.rglob("*.gob")}
+            for path in LIB.rglob("*.gob")
+            if path.is_file() and not path.is_symlink()}
 
 
 def test_lists_exactly_the_gob_files(archive: bytes) -> None:
@@ -70,6 +71,22 @@ def test_two_runs_write_the_same_bytes(archive: bytes, tmp_path: Path) -> None:
     assert _write(tmp_path / "again.tar.gz") == archive
 
 
+def test_the_tar_is_what_pythons_ustar_writer_writes(archive: bytes) -> None:
+    # An independent writer over the same sorted files: the tar is the same on
+    # any host, whatever tar the host has.
+    expected = io.BytesIO()
+    for name, data in sorted(_expected().items()):
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.mode = 0o644
+        info.type = tarfile.REGTYPE
+        expected.write(info.tobuf(tarfile.USTAR_FORMAT, "utf-8", "strict"))
+        expected.write(data)
+        expected.write(bytes(-len(data) % 512))
+    expected.write(bytes(1024))
+    assert gzip.decompress(archive) == expected.getvalue()
+
+
 def test_the_tar_ends_in_two_zero_blocks(archive: bytes) -> None:
     tar = gzip.decompress(archive)
     assert len(tar) % 512 == 0
@@ -90,5 +107,5 @@ def test_the_hosts_tar_reads_it(archive: bytes, tmp_path: Path) -> None:
     path = tmp_path / "lib.tar.gz"
     path.write_bytes(archive)
     listing = subprocess.run(["tar", "-tzf", str(path)], check=True,
-                             capture_output=True, text=True).stdout.split()
+                             capture_output=True, text=True).stdout.splitlines()
     assert listing == sorted(_expected())

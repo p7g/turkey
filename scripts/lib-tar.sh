@@ -6,7 +6,8 @@
 # The compiler reads lib/*.gob at run time through TURKEY_LIB, and a page has
 # no file system, so the page unpacks this archive into an in-memory directory
 # and points the compiler at it. OUT holds exactly the .gob files under lib/,
-# and nothing else the compiler does not read. A member's path is its path in
+# and nothing else: every .gob file under lib/ on disk, tracked or not, because
+# the compiler reads that tree. A member's path is its path in
 # the repository, `lib/Data/Map.gob`, so unpacking into a directory D makes
 # D/lib the tree to name in TURKEY_LIB. There are no directory members: the
 # unpacker makes each member's parents.
@@ -67,8 +68,7 @@ header() {
         printf 'ustar\00000'        # magic and version
         zeros 32        # uname
         zeros 32        # gname
-        printf '0000000\0'          # device major
-        printf '0000000\0'          # device minor
+        zeros 16                    # device major and minor
         zeros 155       # path prefix
         zeros 12        # padding to 512
     }

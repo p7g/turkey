@@ -136,6 +136,29 @@ def test_an_explicit_import_shadows_the_implicit_prelude(tmp_path) -> None:
     assert items["M"]["Option"]["home"] == "Data.Option"
 
 
+def test_a_directive_between_a_doc_comment_and_its_declaration_keeps_it(tmp_path) -> None:
+    items = _items(tmp_path, {"M": (
+        "--- The module.\n\nexport (f, g)\n\n"
+        "--- Returns one.\n--@expect(unreachable-code) a return after a return\n"
+        "fun f() -> Int {\n    return 1\n    return 2\n}\n\n"
+        "--- Returns two.\n    --@expect(empty-return-value)\n--@expect(unreachable-code)\n"
+        "fun g() -> Int {\n    return 2\n    return 3\n}\n")}, ["M"])
+    assert items["M"]["f"]["comment"] == "Returns one."
+    assert items["M"]["g"]["comment"] == "Returns two."
+
+
+def test_a_directive_between_two_doc_comments_joins_neither_to_the_other(tmp_path) -> None:
+    (tmp_path / "M.gob").write_text(
+        "--- The module.\n\nexport (f)\n\n"
+        "--- Cut off.\n--@expect(unreachable-code)\n--- Returns one.\n"
+        "fun f() -> Int {\n    return 1\n    return 2\n}\n")
+    result = _doc(str(tmp_path / "M.gob"))
+    assert result.returncode == 0, result.stderr
+    module = json.loads(result.stdout)["modules"][0]
+    assert module["comment"] == "The module."
+    assert {item["name"]: item["comment"] for item in module["items"]} == {"f": "Returns one."}
+
+
 def test_a_name_an_import_hides_is_not_shown_from_it(tmp_path) -> None:
     items = _items(tmp_path, {
         "H": "export (T(..))\n\ntype T = T(Int)\n",

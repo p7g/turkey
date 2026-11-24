@@ -14,11 +14,13 @@ with the entry file's own directory.
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import lang
+from tests import bootc, lang, toolchain
 from tests.lang import check, execute as run, types
 from tests.lang import CompileError
 
@@ -336,6 +338,23 @@ def test_a_library_module_imports_only_library_modules(tmp_path):
     finally:
         probe.unlink(missing_ok=True)
     assert f"cannot find module 'Mine' (searched {lang.LIB})" in message
+
+
+def test_an_entry_in_the_library_directory_loads_the_library_once(tmp_path):
+    """The entry's directory is the library's, spelled another way than
+    `$TURKEY_LIB` spells it. Its imports are the library's modules, not a
+    second copy of them loaded as the program's."""
+    digest = hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
+    entry = lang.LIB / f"Probe_root_{digest}.gob"
+    entry.write_text("fun main() { print(String.join([\"a\", \"b\"], \"-\")) }\n",
+                     encoding="utf-8")
+    try:
+        result = subprocess.run(
+            toolchain.command(bootc.binary(), "check", entry.name), cwd=lang.LIB,
+            env=dict(os.environ, TURKEY_LIB=str(lang.LIB)), capture_output=True, text=True)
+    finally:
+        entry.unlink(missing_ok=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_a_program_prelude_does_not_reach_the_library(tmp_path):

@@ -318,6 +318,9 @@ type Loader = Loader {
     --- The entry file's own directory first, then the shipped library, which is
     --- always last and is what marks a module as one the language ships.
     search       : Array String,
+    --- The roots of `search` that are the program's own: every one but the
+    --- library's and any that is the library's directory by another path.
+    own          : Vec String,
     --- Every finished module, by the name it is loaded under.
     modules      : Map String Module,
     --- What each name means when a module of the program imports it.
@@ -360,6 +363,7 @@ type Opened = Opened {
 
 fun newLoader(search : Array String) -> Loader = Loader {
     search = search,
+    own = programRoots(search),
     modules = Map.new(),
     targets = Map.new(),
     order = Vec.new(8),
@@ -435,10 +439,21 @@ fun declaresMain(program : Program) -> Bool {
 -- The root the shipped library is under.
 fun libraryRoot(l : Loader) -> String = l.search[len(l.search) - 1]
 
--- Whether `root` is one of the program's own. An entry inside the library
--- has the library's root as its directory, and its imports are then the
--- library's modules, loaded once.
-fun programRoot(l : Loader, root : String) -> Bool = root != libraryRoot(l)
+-- The roots of `search` before the last that are not the library's
+-- directory. An entry inside the library has the library's root as its
+-- directory, however the two paths are spelled, and its imports are then the
+-- library's modules, loaded once. Roots are compared as real paths; one with
+-- no real path, such as a directory that does not exist, is the program's.
+fun programRoots(search : Array String) -> Vec String {
+    let library = Env.resolvedPath(search[len(search) - 1])
+    let out = []
+    for var i = 0; i < len(search) - 1; i = i + 1 {
+        let same = search[i] == search[len(search) - 1]
+                   || (Option.isSome(library) && Env.resolvedPath(search[i]) == library)
+        if !same { Vec.push(out, search[i]) }
+    }
+    out
+}
 
 fun pathParts(name : String) -> Array String = Vec.toArray(String.split(name, "."))
 
@@ -452,10 +467,7 @@ fun target(l : Loader, library : Bool, name : String) -> String {
         None -> {}
     }
     let parts = pathParts(name)
-    var own = False
-    for var i = 0; i < len(l.search) - 1; i = i + 1 {
-        if programRoot(l, l.search[i]) && spelledExactly(l, l.search[i], parts) { own = True }
-    }
+    let own = Iter.any(l.own, fun(root : String) = spelledExactly(l, root, parts))
     let known = if own && spelledExactly(l, libraryRoot(l), parts) {
         Prelude.programModule(name)
     } else {
@@ -492,13 +504,13 @@ fun resolvePath(l : Loader, module_ : String) -> (String, Bool, Option String) {
     let relative = String.join(parts, "/") + ".gob"
     let roots : Vec String = []
     if module_ == name { Vec.push(roots, libraryRoot(l)) }
-    for var i = 0; i < len(l.search) - 1; i = i + 1 {
-        if programRoot(l, l.search[i]) { Vec.push(roots, l.search[i]) }
-    }
-    for root in roots {
+    let fromProgram = len(roots)
+    for root in l.own { Vec.push(roots, root) }
+    for var i = 0; i < len(roots); i = i + 1 {
+        let root = roots[i]
         let candidate = within(root, relative)
         if spelledExactly(l, root, parts) {
-            let library = !programRoot(l, root)
+            let library = i < fromProgram
             match File.readText(candidate) {
                 Right(text) -> return (candidate, library, Some(text))
                 Left(Left(IO.InvalidUTF8)) -> return (candidate, library, None)
@@ -741,7 +753,7 @@ fun finish(l : Loader, names : Vec String) -> Unit {
     let modules = Vec.new(len(members))
     for o in members {
         checkForeignPlacement(Prelude.writtenName(o.name), o.program, o.library)
-        Giblets.checkPlacement(o.name, o.library, Source.span(o.source.name, 1, 1))
+        Giblets.checkPlacement(Prelude.writtenName(o.name), o.library, Source.span(o.source.name, 1, 1))
         let m = Module {
             name = o.name, imported = o.imported, file = o.source.name,
             text = o.source.text, program = o.program,

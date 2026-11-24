@@ -178,6 +178,53 @@ def test_a_name_a_qualifier_passes_on_links_to_that_module(tmp_path) -> None:
     assert items["Q"]["threeWay"]["home"] == "Data.Vec"
 
 
+def _shadowing(tmp_path) -> tuple[str, str]:
+    """A program `Prelude` that exports its own `Deque` as a qualifier: two
+    modules the library has namesakes of. Returns their paths."""
+    (tmp_path / "Deque.gob").write_text("export (T(..), one)\n\ntype T = T\n\nlet one = T\n")
+    (tmp_path / "Prelude.gob").write_text(
+        "export (one, module Deque)\n\nimport Deque\nimport Deque (one)\n")
+    return str(tmp_path / "Prelude.gob"), str(tmp_path / "Deque.gob")
+
+
+def test_a_program_module_is_named_as_it_is_written(tmp_path) -> None:
+    prelude, _ = _shadowing(tmp_path)
+    result = _doc(prelude)
+    assert result.returncode == 0, result.stderr
+    assert "Deque:" not in result.stdout and "Prelude:" not in result.stdout
+    [module] = json.loads(result.stdout)["modules"]
+    items = {item["name"]: item for item in module["items"]}
+    assert module["name"] == "Prelude"
+    assert items["Deque"] == {"kind": "qualifier", "name": "Deque", "module": "Deque"}
+    assert items["one"]["from"] == "Deque"
+
+
+def test_a_link_goes_to_the_module_meant_not_its_namesake(tmp_path) -> None:
+    """The program's `Deque` and the library's are written alike. A qualifier
+    that means the program's links to no page when only the library's is
+    documented, and to the program's page when that is."""
+    prelude, deque = _shadowing(tmp_path)
+    out = tmp_path / "site"
+    result = _doc("--html", str(out), "lib/Deque.gob", prelude)
+    assert result.returncode == 0, result.stderr
+    page = (out / "Prelude.html").read_text().split("<main")[1]
+    assert "Deque:" not in page and 'href="Deque.html' not in page
+    out = tmp_path / "own"
+    result = _doc("--html", str(out), deque, prelude)
+    assert result.returncode == 0, result.stderr
+    page = (out / "Prelude.html").read_text().split("<main")[1]
+    assert '<a href="Deque.html">Deque</a>' in page
+    assert "type</span>" in (out / "Deque.html").read_text()
+
+
+def test_two_modules_written_alike_are_not_documented_together(tmp_path) -> None:
+    _, deque = _shadowing(tmp_path)
+    result = _doc("lib/Deque.gob", deque)
+    assert result.returncode != 0
+    assert "and a library module are both written 'Deque'; document them separately" \
+        in result.stderr
+
+
 def test_a_module_that_sees_no_copy_links_to_the_first_by_name(tmp_path) -> None:
     # `A` and `B` have `x` from each other, so following their imports finds
     # no copy, only the cycle. `C` and `D` each show `x`.

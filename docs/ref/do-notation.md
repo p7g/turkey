@@ -134,10 +134,10 @@ Left("division by zero")
 
 Because `?` never converts, every `Left` in one block needs the same type. When
 failures come from different sources, that type is the Prelude's `SomeError`,
-which holds a value of any type with an `Error` instance. `throw(e)` returns a
-`Left` holding `e` packed as a `SomeError`; after that, `?` passes it along like
-any other `Left`, and no function in between needs to know what kind of error it
-holds. `throw(e)` is `Left(fail(e))`, and `fail(e)` alone packs `e` without
+which holds a value of any type with an `Error` instance. `throw(e)`, which is
+`Left(fail(e))`, returns a `Left` holding `e` packed as a `SomeError`; after
+that, `?` passes it along like any other `Left`, and no function in between
+needs to know what kind of error it holds. `fail(e)` alone packs `e` without
 making a result of it.
 
 `Error.context(err, e)` wraps an error in a new one without discarding it, and

@@ -917,9 +917,11 @@ The implicit import is an import of the module `Prelude`, and that module is
 found as any other is. A program with a `Prelude.gob` beside its entry file
 gives its own modules that module in place of the standard library's, and the
 standard library's modules keep theirs. A module named `Prelude` has no
-implicit import itself, so a program's Prelude imports `Turkey`: once
-without a list, for the qualifier `Turkey` that `module Turkey (..)` names,
-and once with `(..)`, for the names its own declarations use.
+implicit import itself, so a program's Prelude imports `Turkey`.
+`import Turkey (..)` alone brings both the names its own declarations use and
+the qualifier `Turkey` that `module Turkey (..)` names. Write the import
+without a list as well, as below, so that the qualifier does not depend on
+the list.
 
 <!-- module: Prelude.gob -->
 ```kotlin
@@ -949,8 +951,9 @@ fun main() {
 
 A program's Prelude that passes on less leaves the program's modules without
 what it omits. That includes what syntax is written in: an operator is a name
-a module has to be given, and `for`, indexing and negation call the class
-methods `iter`, `get` and `neg`, which have to be in scope.
+a module has to be given, and `for`, indexing, indexed assignment and
+negation call the class methods `iter`, `get`, `set` and `neg`, which have to
+be in scope.
 
 <!-- module: Prelude.gob -->
 ```kotlin

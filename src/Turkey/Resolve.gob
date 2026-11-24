@@ -550,19 +550,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         expr(r, fn)
         for a in args { expr(r, a) }
     }
-    EIndex(arr, index, _, _) -> {
-        expr(r, arr)
-        expr(r, index)
-        -- `xs[i]` and `xs[i] = v` are `Index`'s `get` and `set`. Desugaring
-        -- turns them into those calls; resolution is where the two references
-        -- are settled, since only it knows the module's method scope.
-        let get = methodRef(r, "get", e.span)
-        -- A module that cannot see `get` has nothing to index with. Reported
-        -- here, as any missing name is, because nothing after resolution
-        -- can lower a bracket that has no method.
-        if Option.isNone(get) { report("'get' is not defined", e.span) }
-        e.kind = EIndex(arr, index, get, methodRef(r, "set", e.span))
-    }
+    EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
     EField(obj, _) -> expr(r, obj)
     EProject(obj, _) -> expr(r, obj)
     EUnary(_, operand, fn) -> {
@@ -707,10 +695,55 @@ fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
         funDecl(r, d)
     }
     SAssign(target, value) -> {
-        expr(r, target)
+        match target.kind {
+            EIndex(arr, index, _, _) -> bracket(r, target, arr, index, True)
+            _ -> expr(r, target)
+        }
         expr(r, value)
     }
     SExpr(e) -> expr(r, e)
+}
+
+-- Resolves the bracket `e`, `arr[index]`, which is the target of an
+-- assignment if `assigned` is set and is read otherwise.
+--
+-- `xs[i]` and `xs[i] = v` are `Index`'s `get` and `SetIndex`'s `set`.
+-- Desugaring turns them into those calls; resolution is where the two
+-- references are settled, since only it knows the module's method scope.
+--
+-- A module that cannot see the method its bracket calls has nothing to index
+-- with. Reported here because nothing after resolution can lower a bracket
+-- that has no method, and by the syntax and the class, since the module may
+-- have a `get` or `set` of its own that has nothing to do with either.
+fun bracket(r : R, e : Expr, arr : Expr, index : Expr, assigned : Bool) -> Unit {
+    expr(r, arr)
+    expr(r, index)
+    let get = methodRef(r, "get", e.span)
+    let set = methodRef(r, "set", e.span)
+    if assigned {
+        if Option.isNone(set) { noMethod("an indexed assignment", "set", e.span) }
+    } else if Option.isNone(get) {
+        noMethod("indexing", "get", e.span)
+    }
+    e.kind = EIndex(arr, index, get, set)
+}
+
+-- Reports that `syntax` calls the class method a compiler-written reference
+-- marked `spelling` means, and the module cannot see it.
+fun noMethod(syntax : String, spelling : String, where : Span) -> Unit {
+    -- A method's internal name is its class's, a `.`, and its own.
+    let cls = match Prelude.protocolMethod(spelling) {
+        Some(target) -> match String.rsplitOnce(Prelude.display(target), ".") {
+            Some((owner, _)) -> match String.rsplitOnce(owner, ".") {
+                Some((_, short)) -> short
+                None -> owner
+            }
+            None -> target
+        }
+        None -> spelling
+    }
+    report(syntax + " calls '" + spelling + "' of the class '" + cls
+           + "', which is not in scope here; import '" + cls + "(..)'", where)
 }
 
 -- Resolves the conditions of an `if` or `while` head and then `body`, which

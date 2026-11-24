@@ -1109,37 +1109,55 @@ fun removeTypeAndPatternParens(p : Program) -> Unit {
     -- inside: a `FunDecl`'s return type or a `TypeDecl`'s alias is an
     -- immutable field. So the node inside is dropped instead, which is safe
     -- only while no table holds its id.
-    for d in p.decls {
+    let Program {
+        span = _, exportDecl = _, imports = _, decls, letElses = _, comments = _, blankLines = _,
+    } = p
+    for d in decls {
         match d {
             DStmt(s) -> plainStmt(s)
-            DType(t) -> {
-                if let Some(alias) = t.alias { plainType(alias) }
-                for v in Option.unwrapOr(t.variants, []) {
-                    for a in v.args { plainType(a) }
-                    for (_, ft) in Option.unwrapOr(v.fields, []) { plainType(ft) }
-                    for pr in v.context { plainPred(pr) }
-                }
-            }
+            DType(t) -> plainTypeDecl(t)
             DClass(c) -> {
-                for pr in c.supers { plainPred(pr) }
-                for m in c.methods { plainFun(m) }
+                let ClassDecl { span = _, name = _, param = _, supers, methods, families = _ } = c
+                for pr in supers { plainPred(pr) }
+                for m in methods { plainFun(m) }
             }
             DInstance(i) -> {
-                plainType(i.head)
-                for pr in i.context { plainPred(pr) }
-                for m in i.methods { plainFun(m) }
-                for fam in i.families { plainType(fam.body) }
+                let InstanceDecl { span = _, cls = _, head, context, methods, families } = i
+                plainType(head)
+                for pr in context { plainPred(pr) }
+                for m in methods { plainFun(m) }
+                for fam in families {
+                    let FamBind { span = _, name = _, body } = fam
+                    plainType(body)
+                }
             }
             DForeign(f) -> {
-                for q in f.params { plainPat(q) }
-                plainType(f.ret)
+                let ForeignDecl {
+                    id = _, span = _, name = _, symbol = _, params, fixed = _, ret, library = _,
+                } = f
+                for q in params { plainPat(q) }
+                plainType(ret)
             }
             DInfix(_) -> {}
         }
     }
 }
 
+fun plainTypeDecl(t : TypeDecl) -> Unit {
+    let TypeDecl { span = _, name = _, params = _, derives = _, variants, alias } = t
+    if let Some(a) = alias { plainType(a) }
+    for v in Option.unwrapOr(variants, []) {
+        let ConDecl {
+            span = _, name = _, args, fields, vars = _, fieldSpans = _, binders = _, context,
+        } = v
+        for a in args { plainType(a) }
+        for (_, ft) in Option.unwrapOr(fields, []) { plainType(ft) }
+        for pr in context { plainPred(pr) }
+    }
+}
+
 fun plainType(t : Type) -> Unit {
+    let Type { id = _, span = _, kind = _ } = t
     while let TEParen(inner) = t.kind { t.kind = inner.kind }
     match t.kind {
         TEVar(_) -> {}
@@ -1157,15 +1175,19 @@ fun plainType(t : Type) -> Unit {
     }
 }
 
-fun plainPred(pr : Pred) -> Unit = match pr.kind {
-    PClass(_, t) -> plainType(t)
-    PEq(a, b) -> {
-        plainType(a)
-        plainType(b)
+fun plainPred(pr : Pred) -> Unit {
+    let Pred { span = _, kind } = pr
+    match kind {
+        PClass(_, t) -> plainType(t)
+        PEq(a, b) -> {
+            plainType(a)
+            plainType(b)
+        }
     }
 }
 
 fun plainPat(p : Pat) -> Unit {
+    let Pat { id = _, span = _, kind = _, opening = _ } = p
     while let PParen(inner) = p.kind { p.kind = inner.kind }
     match p.kind {
         PVar(_) | PWild | PLit(_, _) -> {}
@@ -1182,10 +1204,13 @@ fun plainPat(p : Pat) -> Unit {
 }
 
 fun plainFun(f : FunDecl) -> Unit {
-    for q in f.params { plainPat(q) }
-    if let Some(t) = f.ret { plainType(t) }
-    for pr in f.context { plainPred(pr) }
-    if let Some(b) = f.body { plainExpr(b) }
+    let FunDecl {
+        id = _, span = _, name = _, params, ret, body, context, monomorphic = _, symbol = _,
+    } = f
+    for q in params { plainPat(q) }
+    if let Some(t) = ret { plainType(t) }
+    for pr in context { plainPred(pr) }
+    if let Some(b) = body { plainExpr(b) }
 }
 
 fun plainStmt(s : Stmt) -> Unit {
@@ -1212,7 +1237,12 @@ fun plainExpr(e : Expr) -> Unit {
         EIfLet(conditions, _, _) | EWhileLet(conditions, _) -> for c in conditions {
             if let CondLet(_, _, alts, _) = c { for q in alts { plainPat(q) } }
         }
-        _ -> {}
+        -- Every other form holds no type or pattern of its own.
+        ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | ETuple(_) | EArray(_) | ERecord(_, _)
+            | ECall(_, _) | EIndex(_, _, _, _) | EField(_, _) | EProject(_, _) | EUnary(_, _, _)
+            | EBinary(_, _, _, _) | EChain(_, _) | EIf(_, _, _) | EWhile(_, _) | EForC(_, _, _, _)
+            | ELoop(_) | EMatch(_, _) | EReturn(_) | EBreak(_) | EContinue | EBlock(_)
+            | EQuestion(_, _) | EDo(_) | EParen(_) -> {}
     }
     for c in exprChildren(e) { plainChild(c) }
 }
@@ -1221,8 +1251,9 @@ fun plainChild(c : Child) -> Unit = match c {
     ChExpr(e) -> plainExpr(e)
     ChStmt(s) -> plainStmt(s)
     ChArm(a) -> {
-        for q in a.patterns { plainPat(q) }
-        for g in a.guards {
+        let Arm { span = _, patterns, guards, body = _ } = a
+        for q in patterns { plainPat(q) }
+        for g in guards {
             if let GLet(alts, _) = g { for q in alts { plainPat(q) } }
         }
         for child in children(c) { plainChild(child) }

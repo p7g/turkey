@@ -17,7 +17,7 @@ The Prelude provides these names unqualified:
 | Kind | Names |
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec`, `FrozenArray` and `Map` without their constructors |
-| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
+| Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Mod`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
 | Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
@@ -323,7 +323,7 @@ class Add a { fun add(a, a) -> a }
 class Sub a { fun sub(a, a) -> a }
 class Mul a { fun mul(a, a) -> a }
 class Div a { fun div(a, a) -> a }
-class Rem a { fun rem(a, a) -> a }
+class Mod a { fun mod(a, a) -> a }
 class Neg a { fun neg(a) -> a }
 class Zero a { fun zero() -> a }
 class One a { fun one() -> a }
@@ -349,6 +349,9 @@ class Shift a {
     fun shr(a, Int) -> a
 }
 ```
+
+For `Int`, `div` rounds toward negative infinity and `mod` takes the sign of
+the divisor, so `div(a, b) * b + mod(a, b) == a` ([Int](types.md#int)).
 
 `Int` and `Byte` have instances of the four bitwise classes
 ([Bitwise operators](expressions.md#bitwise-operators)), and `Set` has
@@ -381,7 +384,7 @@ Ada Bo
 
 The instances the library provides for built-in types:
 
-| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Rem` | `Zero` `One` | `Show` |
+| Type | `Eq` | `Ord` | `Hash` | `Add` | `Sub` `Mul` `Div` `Neg` | `Mod` | `Zero` `One` | `Show` |
 |---|---|---|---|---|---|---|---|---|
 | `Int` | yes | yes | yes | yes | yes | yes | yes | yes |
 | `Float` | yes | yes | no | yes | yes | no | yes | yes |

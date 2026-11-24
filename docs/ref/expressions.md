@@ -122,7 +122,7 @@ Prelude [declares](#declared-operators) each one as a call to a method of a
 | `a - b` | `sub(a, b)` | `Sub` |
 | `a * b` | `mul(a, b)` | `Mul` |
 | `a / b` | `div(a, b)` | `Div` |
-| `a % b` | `rem(a, b)` | `Rem` |
+| `a % b` | `mod(a, b)` | `Mod` |
 | `-a` | `neg(a)` | `Neg` |
 | `a == b`, `a != b` | `eq(a, b)`, `ne(a, b)` | `Eq` |
 | `a < b`, `a <= b`, `a > b`, `a >= b` | `lt`, `lte`, `gt`, `gte` | `Ord` |

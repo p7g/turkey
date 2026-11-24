@@ -147,6 +147,13 @@ long enough in a call that cannot be polled, such as a file read or `flock`:
 then another thread runs the rest meanwhile, as one does beside each worker
 blocked in such a call. The test suite sets it to 1 for everything it runs
 unless a test asks for more, since it runs a process per core already.
+`TURKEY_SINGLE_THREAD`, set to anything, goes further: the program starts no
+thread at all, so `main` and every task run on the thread the process started
+on, with that thread's stack, and a call that blocks blocks the whole program.
+A lookup's timeout (`Net.lookup`) does not hold in this mode: while the one
+thread is inside the resolver's call, no other thread can return the caller at
+the deadline, so the lookup waits for the resolver. The mode overrides
+`TURKEY_WORKERS`.
 The suite also sets `TURKEY_CHECK_BINDERS`, which has the compiler check that
 name resolution recorded a binder for every variable a program binds or reads;
 a gap is an internal error. It costs a walk of the program, so it is off

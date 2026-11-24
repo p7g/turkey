@@ -1,0 +1,151 @@
+export (Directive(..), Kind(..), Arg(..), isDirective, parse)
+
+--- Directives: comments that begin `--@`, which the language reserves for
+--- instructions to its tools, so that no such comment is ever prose.
+---
+--- A directive is `--@`, its name, and its arguments in parentheses, with no
+--- space anywhere in `--@NAME(`. Each directive reads its own arguments, and
+--- everything after the closing `)` and a space is free text: the reason for
+--- it. A comment that begins `--@` and is not a well-formed directive is a
+--- compile error.
+---
+--- The one directive is `expect`, whose arguments are the names of checks
+--- (`Turkey.Lint`), separated by commas.
+
+import Turkey.Diag as Diag
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Token (Comment(..), standsAlone)
+
+--- A directive that parsed: its comment's span, whether code comes before it
+--- on its line, and what it says.
+type Directive = Directive { span : Span, trailing : Bool, kind : Kind }
+
+--- What a directive says. `Expect` is `--@expect(...)`, with the checks it
+--- names in the order written.
+type Kind = Expect(Vec Arg)
+
+--- One argument of a directive, without the whitespace around it, and where
+--- it is.
+type Arg = Arg { text : String, span : Span }
+
+-- Every directive's name, for the message about one that is not.
+let names = ["expect"]
+
+--- Returns whether `c` begins `--@`, so is meant as a directive, whether or
+--- not it is well formed.
+fun isDirective(c : Comment) -> Bool = !c.block && String.startsWith(c.text, "--@")
+
+--- Returns the directives among `comments`, the comments of the file whose
+--- text is `source`, in source order. Reports each comment that begins `--@`
+--- and is not a well-formed directive as a parse error, and leaves it out.
+--- `unexpected(name)` returns why `expect` cannot name `name`, if it cannot.
+--- Reads `source` only when there is a directive.
+fun parse(comments : Vec Comment, source : String,
+          unexpected : fun(String) -> Option String) -> Vec Directive {
+    if !Iter.any(comments, isDirective) { return [] }
+    let lines = String.lines(source)
+    let out = []
+    for c in comments {
+        if !isDirective(c) { continue }
+        match directive(c, unexpected) {
+            Left((message, where)) -> Diag.report(Diag.at("parse error", message, where))
+            Right(kind) -> Vec.push(out, Directive { span = c.span, trailing = !standsAlone(c, lines),
+                                                     kind = kind })
+        }
+    }
+    out
+}
+
+-- The directive `c` writes, or what is wrong with it and where.
+fun directive(c : Comment, unexpected : fun(String) -> Option String) -> Either (String, Span) Kind {
+    let cs = String.toCodePoints(c.text)
+    let nameEnd = wordEnd(cs, 3)
+    let name = slice(cs, 3, nameEnd)
+    if name == "" {
+        let after = wordEnd(cs, spacesEnd(cs, 3))
+        let word = slice(cs, spacesEnd(cs, 3), after)
+        let fix = if word != "" && spacesEnd(cs, 3) > 3 { "; write '--@" + word + "'" } else { "; " + known() }
+        return Left(("a directive's name must follow '--@' directly" + fix, spanIn(c, 0, 3)))
+    }
+    if !Iter.any(names, _ == name) {
+        return Left(("unknown directive '" + name + "'; " + known(), spanIn(c, 3, nameEnd - 3)))
+    }
+    let open = spacesEnd(cs, nameEnd)
+    if open >= len(cs) || cs[open] != '(' {
+        return Left(("'--@" + name + "' must be followed directly by '(' and its arguments",
+                     spanIn(c, 3, nameEnd - 3)))
+    }
+    if open > nameEnd {
+        return Left(("'--@" + name + "' must be followed directly by '('; remove the space before it",
+                     spanIn(c, nameEnd, open - nameEnd)))
+    }
+    var close = open + 1
+    while close < len(cs) && cs[close] != ')' { close = close + 1 }
+    if close == len(cs) { return Left(("this '(' has no closing ')'", spanIn(c, open, 1))) }
+    if close + 1 < len(cs) && cs[close + 1] != ' ' && cs[close + 1] != '\t' {
+        return Left(("a space must separate the reason from ')'", spanIn(c, close + 1, 1)))
+    }
+    match name {
+        "expect" -> expect(c, cs, open, close, unexpected)
+        _ -> error("no reader for the directive " + name)
+    }
+}
+
+-- `--@expect(...)`'s arguments, which are between `open` and `close`: one or
+-- more names of checks, separated by commas, each once.
+fun expect(c : Comment, cs : Array Char, open : Int, close : Int,
+           unexpected : fun(String) -> Option String) -> Either (String, Span) Kind {
+    if String.isEmpty(String.trim(slice(cs, open + 1, close))) {
+        return Left(("'--@expect()' names no check; name the checks it expects", spanIn(c, open, 1)))
+    }
+    let args = []
+    var from = open + 1
+    while from <= close {
+        var to = from
+        while to < close && cs[to] != ',' { to = to + 1 }
+        -- The argument without the whitespace around it.
+        let first = spacesEnd(cs, from)
+        var last = to
+        while last > first && Char.isSpace(cs[last - 1]) { last = last - 1 }
+        if first == last {
+            return Left(("this list of checks has an empty entry; remove the extra ','", spanIn(c, from, 0)))
+        }
+        let arg = Arg { text = slice(cs, first, last), span = spanIn(c, first, last - first) }
+        if let Some(why) = unexpected(arg.text) { return Left((why, arg.span)) }
+        if Iter.any(args, _.text == arg.text) {
+            return Left(("'" + arg.text + "' is named twice in this directive; remove one", arg.span))
+        }
+        Vec.push(args, arg)
+        from = to + 1
+    }
+    Right(Expect(args))
+}
+
+-- Where a directive's name or argument ends, from `i`: the first code point
+-- that is not a letter, a digit, '-' or '_'.
+fun wordEnd(cs : Array Char, i : Int) -> Int {
+    var j = i
+    while j < len(cs) && (Char.isAsciiAlphanumeric(cs[j]) || cs[j] == '-' || cs[j] == '_') { j = j + 1 }
+    j
+}
+
+-- The first code point from `i` that is not a space or a tab.
+fun spacesEnd(cs : Array Char, i : Int) -> Int {
+    var j = i
+    while j < len(cs) && (cs[j] == ' ' || cs[j] == '\t') { j = j + 1 }
+    j
+}
+
+fun slice(cs : Array Char, from : Int, to : Int) -> String = String.fromCodePoints(Array.slice(cs, from, to))
+
+-- The span of the `n` code points of `c` from its `i`th. A line comment is
+-- on one line.
+fun spanIn(c : Comment, i : Int, n : Int) -> Span {
+    let col = c.span.col + i
+    Source.endingAt(Source.span(c.span.file, c.span.line, col), c.span.line, col + n)
+}
+
+fun known() -> String =
+    if len(names) == 1 { "the only directive is '" + names[0] + "'" }
+    else { "the directives are " + String.join(Array.map(names, fun(n) = "'" + n + "'"), ", ") }

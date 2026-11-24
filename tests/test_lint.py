@@ -219,3 +219,50 @@ def test_the_library_is_linted_from_the_compiler_source(tmp_path: Path, library:
     result = turkey(source, "check", "main.gob", lib=library)
     assert result.returncode == 0, result.stderr
     assert "Extra.gob:4:22: warning: a bare 'return'" in result.stderr
+
+
+# `TWO_FINDINGS` with its unreachable statement expected.
+EXPECTED = TWO_FINDINGS.replace("fun main() {", "--@expect(unreachable-code)\nfun main() {")
+
+
+def test_an_expect_is_met_by_a_check_at_allow(tmp_path: Path) -> None:
+    (tmp_path / "main.gob").write_text(EXPECTED)
+    result = turkey(tmp_path, "check", "--allow", "unreachable-code", "main.gob")
+    assert result.returncode == 0, result.stderr
+    assert "[unfulfilled-expect]" not in result.stderr
+    assert result.stderr.endswith("[empty-return-value]\n1 warning\n")
+
+
+def test_an_unfulfilled_expect_takes_the_level_flags(tmp_path: Path) -> None:
+    (tmp_path / "main.gob").write_text(EXPECTED.replace("    return\n", ""))
+    warned = turkey(tmp_path, "check", "--allow", "empty-return-value", "main.gob")
+    assert warned.returncode == 0, warned.stderr
+    assert warned.stderr.endswith("[unfulfilled-expect]\n1 warning\n")
+    allowed = turkey(tmp_path, "check", "--allow", "empty-return-value,unfulfilled-expect", "main.gob")
+    assert (allowed.returncode, allowed.stderr) == (0, "")
+    denied = turkey(tmp_path, "check", "--allow", "empty-return-value", "--deny-warnings", "main.gob")
+    assert denied.returncode == 1
+    assert denied.stderr.endswith("[unfulfilled-expect]\n1 error\n")
+
+
+def test_an_expect_in_the_library_is_not_reported(tmp_path: Path) -> None:
+    lib = tmp_path / "lib"
+    shutil.copytree(bootc.REPO_ROOT / "lib", lib)
+    (lib / "Extra.gob").write_text(EXTRA.replace("fun stop", "--@expect(unreachable-code)\nfun stop"))
+    project = tmp_path / "project" / "app"
+    project.mkdir(parents=True)
+    (project / "main.gob").write_text(USES_EXTRA)
+    result = turkey(project, "check", "--deny-warnings", "main.gob", lib=lib)
+    assert (result.returncode, result.stderr) == (0, "")
+
+
+def test_a_malformed_directive_in_the_library_is_an_error(tmp_path: Path) -> None:
+    lib = tmp_path / "lib"
+    shutil.copytree(bootc.REPO_ROOT / "lib", lib)
+    (lib / "Extra.gob").write_text(EXTRA.replace("fun stop", "--@expect unreachable-code\nfun stop"))
+    project = tmp_path / "project" / "app"
+    project.mkdir(parents=True)
+    (project / "main.gob").write_text(USES_EXTRA)
+    result = turkey(project, "check", "main.gob", lib=lib)
+    assert result.returncode == 1
+    assert "Extra.gob:3:4: parse error: '--@expect' must be followed directly by '('" in result.stderr

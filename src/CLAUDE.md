@@ -58,11 +58,11 @@ a chain, so a three-way test is three lines and not three nesting levels:
 
 ```
 if n == 0 {
-    "zero"
+	"zero"
 } else if n == 1 {
-    "one"
+	"one"
 } else {
-    "many"
+	"many"
 }
 ```
 
@@ -71,9 +71,9 @@ if n == 0 {
 
 ```
 fun binaryMethod(op : String) -> Option String = match op {
-    "+" -> Some("add")
-    "-" -> Some("sub")
-    _ -> None
+	"+" -> Some("add")
+	"-" -> Some("sub")
+	_   -> None
 }
 ```
 

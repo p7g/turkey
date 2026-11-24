@@ -1,0 +1,365 @@
+export (Control(..), structure, showControl)
+
+--- WebAssembly's structured control flow, made from a control-flow graph.
+---
+--- A wasm function cannot jump to a label. It nests `block`, `loop` and `if`,
+--- and a `br` names one of the forms around it by depth: out of a `block` or
+--- an `if`, or back to the top of a `loop`. `structure` translates the graph
+--- of any function whose loops each have one entry into that form, with no
+--- block's code duplicated and no test added: every path through the result
+--- runs the blocks the same path through the graph runs, in the same order.
+---
+--- The translation is Ramsey's ("Beyond Relooper: Recursive Translation of
+--- Unstructured Control Flow to Structured Control Flow", ICFP 2022), with the
+--- three enhancements of its section 7: no `br` where control falls through to
+--- the target anyway, no `block` wrapped directly around an `if`, and a
+--- multiway branch as a single `br_table` where its keys are dense.
+---
+--- The result is generic over what a block holds. `Code` names a block of the
+--- graph, which instruction selection replaces with the block's instructions.
+
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value, BlockId(..), Func)
+
+--- One step of a structured function body. A body is a `Vec Control`, run in
+--- order.
+---
+--- Every `Block`, `Loop` and `If` takes no operands and leaves no results.
+--- Values cross from one block of the graph to another in locals, so a `Br`
+--- carries none.
+type Control
+    --- `block ... end`. A `Br` to it continues after the `end`.
+    = Block(Vec Control)
+    --- `loop ... end`. A `Br` to it runs the body again from the top; falling
+    --- off the end continues after the `end`.
+    | Loop(Vec Control)
+    --- `if ... else ... end` on an `i1`: the first arm when it is true. A
+    --- `Br` to it continues after the `end`.
+    | If(Value, Vec Control, Vec Control)
+    --- Branches to the form this many levels out, 0 being the innermost
+    --- `Block`, `Loop` or `If` around it.
+    | Br(Int)
+    --- `br_table` on an integer, by depths as `Br` counts them: to the
+    --- target at the value minus the base, when that is an index of the
+    --- targets, and to the default when it is not.
+    | BrTable(Value, Int, Array Int, Int)
+    --- A multiway branch on an integer too sparse for a table: to the depth
+    --- paired with the first key the value equals, or else to the default.
+    | BrCases(Value, Vec (Int, Int), Int)
+    --- The code of the graph's block: its instructions, then, if it ends in a
+    --- jump, the moves of the jump's arguments into the target's parameters.
+    --- What follows it is the rest of its terminator.
+    | Code(BlockId)
+    --- Returns these values from the function.
+    | Return(Vec Value)
+    --- Panics with this message.
+    | Panic(Value)
+    --- Marks a point control never reaches.
+    | Unreachable
+
+--- Returns the body of `f`, or an internal error naming `f` if one of its
+--- loops has more than one entry. Every block the entry reaches is the
+--- `Code` of exactly one step of the body, and no other block is.
+fun structure(f : Func i) -> Either String (Vec Control) {
+    -- Ramsey's translation needs every loop to have one entry, its header,
+    -- since it nests a loop's blocks inside the `loop` of the header. We
+    -- assume the graphs the compiler builds are reducible, and nothing checks
+    -- it before here: a `break`, a `continue` and an early return are forward
+    -- edges to a join, and jump threading never gives a loop a second entry.
+    -- So an irreducible graph is a compiler bug, and it is rejected rather
+    -- than node-split.
+    let Some((innermost, _)) = Ssa.loops(f) else {
+        return Left("internal error: '" + f.name + "' has a loop with more than one entry, "
+                    + "which wasm's structured control flow cannot express")
+    }
+    let out : Vec Control = []
+    let g = analyse(f, innermost)
+    doTree(g, Ssa.blockId(f.entry), Context { enclosing = Outermost, fallthrough = None }, out)
+    Right(out)
+}
+
+-- -- the graph -------------------------------------------------------------------------
+
+-- What the translation asks of the graph, by block number.
+type Graph = Graph {
+    terms    : Array Ssa.Term,
+    -- Position in reverse postorder, or -1 for a block the entry does not
+    -- reach.
+    rpnum    : Array Int,
+    -- The blocks each block immediately dominates, highest `rpnum` first.
+    children : Array (Vec Int),
+    -- Whether two or more forward edges enter the block. Each edge counts,
+    -- so a branch whose two arms go to one block makes that block a merge
+    -- node, and its code is placed once, after the branch, rather than in
+    -- both arms.
+    merge    : Array Bool,
+    -- Whether some back edge enters the block.
+    header   : Array Bool,
+}
+
+fun analyse(f : Func i, innermost : Array Int) -> Graph {
+    let count = len(f.blocks)
+    let terms = Array.init(count, fun(b) = f.blocks[b].term)
+    let order = Ssa.reversePostorder(f)
+    let rpnum = Array.filled(count, -1)
+    for var k = 0; k < len(order); k = k + 1 { rpnum[Ssa.blockId(order[k])] = k }
+
+    -- In reverse postorder each list fills in increasing `rpnum`, so
+    -- reversing it puts the highest first, which is the order `nodeWithin`
+    -- nests merge nodes in.
+    let idom = Ssa.dominators(f)
+    let ascending : Array (Vec Int) = Array.init(count, fun(_) = [])
+    for at in order {
+        let b = Ssa.blockId(at)
+        if b == Ssa.blockId(f.entry) { continue }
+        if let Some(d) = idom[b] { Vec.push(ascending[d], b) }
+    }
+    let children = Array.map(ascending, Vec.reverse)
+
+    let forward = Array.filled(count, 0)
+    for at in order {
+        let b = Ssa.blockId(at)
+        for s in Ssa.successors(terms[b]) {
+            let t = Ssa.blockId(s)
+            if rpnum[t] > rpnum[b] { forward[t] = forward[t] + 1 }
+        }
+    }
+    let merge = Array.map(forward, fun(n) = n >= 2)
+    let header = Array.init(count, fun(b) = innermost[b] == b)
+    Graph { terms, rpnum, children, merge, header }
+}
+
+fun isBackward(g : Graph, from : Int, to : Int) -> Bool = g.rpnum[to] <= g.rpnum[from]
+
+-- -- evaluation contexts -------------------------------------------------------------
+
+-- A form around the code being placed that a `Br` can name: what it reaches
+-- is the block it labels.
+type Frame
+    -- A `block` whose `end` the block's code follows.
+    = BlockFollowedBy(Int)
+    -- A `loop` whose body starts with the block's code.
+    | LoopHeadedBy(Int)
+    -- An `if`, which the block's code follows when the `if` stands in for a
+    -- `block` around it.
+    | IfThenElse(Option Int)
+
+-- The forms around the code being placed, innermost first.
+type Frames = Outermost | Within(Frame, Frames)
+
+type Context = Context {
+    enclosing   : Frames,
+    -- The block control reaches by running off the end of the code being
+    -- placed, when that is the start of a block's code.
+    fallthrough : Option Int,
+}
+
+fun inside(frame : Frame, c : Context) -> Context =
+    Context { enclosing = Within(frame, c.enclosing), fallthrough = c.fallthrough }
+
+fun withFallthrough(c : Context, label : Int) -> Context =
+    Context { enclosing = c.enclosing, fallthrough = Some(label) }
+
+-- The depth of the form that a `Br` to `label` names.
+fun index(label : Int, frames : Frames) -> Int {
+    var depth = 0
+    var rest = frames
+    while let Within(frame, outer) = rest {
+        if matchesFrame(label, frame) { return depth }
+        depth = depth + 1
+        rest = outer
+    }
+    error("internal error: no form around a branch to b" + Int.toString(label)
+          + " is followed or headed by it")
+}
+
+fun matchesFrame(label : Int, frame : Frame) -> Bool = match frame {
+    BlockFollowedBy(l) -> l == label
+    LoopHeadedBy(l) -> l == label
+    IfThenElse(Some(l)) -> l == label
+    IfThenElse(None) -> False
+}
+
+-- -- translation ---------------------------------------------------------------------
+
+-- Appends to `out` the translation of block `x` and of every block it
+-- dominates.
+fun doTree(g : Graph, x : Int, context : Context, out : Vec Control) -> Unit {
+    -- A child that is not a merge node has `x` as its only forward
+    -- predecessor, so it is one of `x`'s successors and `doBranch` places it
+    -- in line. A `br_table` holds only depths and cannot hold code, so every
+    -- child of a switch is placed after a `block` instead.
+    let selected = match g.terms[x] {
+        Ssa.Switch(_, _, _) -> g.children[x]
+        _ -> Vec.filter(g.children[x], fun(y) = g.merge[y])
+    }
+    if g.header[x] {
+        let body : Vec Control = []
+        nodeWithin(g, x, selected, 0, None, inside(LoopHeadedBy(x), context), body)
+        Vec.push(out, Loop(body))
+    } else {
+        nodeWithin(g, x, selected, 0, None, context, out)
+    }
+}
+
+-- Appends to `out` the translation of `x` and its children, inside one
+-- `block` for each merge child from `ys[k]` on, with the child that has the
+-- highest `rpnum` outermost. Its translation follows the `block`, and every
+-- block with a forward branch to it is placed earlier, inside that `block`.
+--
+-- With `follows` set, the translation must also be a form that a `Br` can
+-- exit to reach that block, which follows it: a `block` around the rest, or,
+-- if `x` ends in a branch and nothing else is left to place, the `if` it
+-- translates to.
+fun nodeWithin(g : Graph, x : Int, ys : Vec Int, k : Int, follows : Option Int,
+               context : Context, out : Vec Control) -> Unit {
+    if let Some(z) = follows {
+        if k < len(ys) || !generatesIf(g, x) {
+            let body : Vec Control = []
+            nodeWithin(g, x, ys, k, None, inside(BlockFollowedBy(z), context), body)
+            Vec.push(out, Block(body))
+            return
+        }
+    }
+    if k < len(ys) {
+        -- `follows` is `None` here.
+        let y = ys[k]
+        nodeWithin(g, x, ys, k + 1, Some(y), withFallthrough(context, y), out)
+        doTree(g, y, context, out)
+        return
+    }
+    translate(g, x, follows, context, out)
+}
+
+fun generatesIf(g : Graph, x : Int) -> Bool = match g.terms[x] {
+    Ssa.Branch(_, _, _) -> True
+    _ -> False
+}
+
+-- Appends to `out` the code of `x` and the control flow leaving it, where
+-- `follows` is the block that follows the `if` of a branch, if any.
+fun translate(g : Graph, x : Int, follows : Option Int, context : Context,
+              out : Vec Control) -> Unit {
+    Vec.push(out, Code(BlockId(x)))
+    match g.terms[x] {
+        Ssa.Ret(values) -> Vec.push(out, Return(values))
+        Ssa.Jump(target, _) -> doBranch(g, x, Ssa.blockId(target), context, out)
+        Ssa.Branch(test, yes, no) -> {
+            let arms = inside(IfThenElse(follows), context)
+            let taken : Vec Control = []
+            let otherwise : Vec Control = []
+            doBranch(g, x, Ssa.blockId(yes), arms, taken)
+            doBranch(g, x, Ssa.blockId(no), arms, otherwise)
+            Vec.push(out, If(test, taken, otherwise))
+        }
+        Ssa.Switch(scrutinee, cases, default) ->
+            Vec.push(out, multiway(scrutinee, cases, default, context.enclosing))
+        Ssa.Panic(message) -> Vec.push(out, Panic(message))
+        Ssa.Unreachable -> Vec.push(out, Unreachable)
+    }
+}
+
+-- Appends to `out` the code that, placed after the code of `from`, transfers
+-- control to `to`.
+fun doBranch(g : Graph, from : Int, to : Int, context : Context, out : Vec Control) -> Unit {
+    -- Leaving out a `br` to the block that follows anyway is sound only
+    -- because no form leaves a result on the stack: a `br` would drop one,
+    -- and falling through would not.
+    if context.fallthrough == Some(to) { return }
+    -- A backward branch continues a loop, and the reducibility check made
+    -- `to` the header of one around `from`. A forward branch to a merge node
+    -- exits a `block` or an `if` that the merge node follows. Anything else is
+    -- a child of `from` with no other forward predecessor, placed here.
+    if isBackward(g, from, to) || g.merge[to] {
+        Vec.push(out, Br(index(to, context.enclosing)))
+    } else {
+        doTree(g, to, context, out)
+    }
+}
+
+-- A switch as a `br_table` where its keys are dense, and as a sequence of
+-- tests where they are not.
+fun multiway(scrutinee : Value, cases : Vec (Int, BlockId), default : Option BlockId,
+             frames : Frames) -> Control {
+    let depths = Vec.sortBy(Vec.map(cases, fun((key, target)) =
+                                (key, index(Ssa.blockId(target), frames))),
+                            fun(a, b) = Int.compare(a.0, b.0))
+    -- A switch with no default holds one of its keys, so the last key needs no
+    -- test and stands in for the default.
+    let (tested, otherwise) = match default {
+        Some(d) -> (depths, index(Ssa.blockId(d), frames))
+        None -> {
+            if len(depths) == 0 { return Unreachable }
+            (Vec.slice(depths, 0, len(depths) - 1), depths[len(depths) - 1].1)
+        }
+    }
+    if len(tested) == 0 { return Br(otherwise) }
+    let low = tested[0].0
+    let high = tested[len(tested) - 1].0
+    -- A table costs a byte or so per entry and a fixed range check; a test
+    -- costs about seven bytes per key. Four entries per key keeps the table no
+    -- larger than the tests, and it takes one branch rather than one per key.
+    -- Below three keys the range check costs more than the tests save.
+    let dense = len(tested) >= 3 && match Int.subChecked(high, low) {
+        Some(span) -> span < 4 * len(tested)
+        None -> False
+    }
+    if !dense { return BrCases(scrutinee, tested, otherwise) }
+    let table = Array.filled(high - low + 1, otherwise)
+    for (key, depth) in tested { table[key - low] = depth }
+    BrTable(scrutinee, low, table, otherwise)
+}
+
+-- -- printing ------------------------------------------------------------------------
+
+--- Returns `body` in the shape of wasm's text format, one step to a line and
+--- each nested body indented two spaces, for tests and debugging.
+fun showControl(body : Vec Control) -> String {
+    let out = []
+    showBody(body, "", out)
+    String.join(out, "\n")
+}
+
+fun showBody(body : Vec Control, indent : String, out : Vec String) -> Unit {
+    for step in body {
+        match step {
+            Block(inner) -> {
+                Vec.push(out, indent + "block")
+                showBody(inner, indent + "  ", out)
+                Vec.push(out, indent + "end")
+            }
+            Loop(inner) -> {
+                Vec.push(out, indent + "loop")
+                showBody(inner, indent + "  ", out)
+                Vec.push(out, indent + "end")
+            }
+            If(test, taken, otherwise) -> {
+                Vec.push(out, indent + "if " + showValue(test))
+                showBody(taken, indent + "  ", out)
+                if len(otherwise) > 0 {
+                    Vec.push(out, indent + "else")
+                    showBody(otherwise, indent + "  ", out)
+                }
+                Vec.push(out, indent + "end")
+            }
+            Br(depth) -> Vec.push(out, indent + "br " + Int.toString(depth))
+            BrTable(v, base, targets, default) ->
+                Vec.push(out, indent + "br_table " + showValue(v) + " - " + Int.toString(base)
+                              + " [" + String.join(Array.map(targets, Int.toString), " ")
+                              + "] " + Int.toString(default))
+            BrCases(v, cases, default) ->
+                Vec.push(out, indent + "br_cases " + showValue(v) + " ["
+                              + String.join(Vec.map(cases, fun((key, depth)) =
+                                                Int.toString(key) + " -> " + Int.toString(depth)),
+                                            ", ")
+                              + "] " + Int.toString(default))
+            Code(b) -> Vec.push(out, indent + "b" + Int.toString(Ssa.blockId(b)))
+            Return(values) ->
+                Vec.push(out, indent + String.join(Vec.append(["return"], Vec.map(values, showValue)), " "))
+            Panic(message) -> Vec.push(out, indent + "panic " + showValue(message))
+            Unreachable -> Vec.push(out, indent + "unreachable")
+        }
+    }
+}
+
+fun showValue(v : Value) -> String = "%" + Int.toString(Ssa.valueId(v))

@@ -13,7 +13,11 @@ than by unit-testing the primitives underneath it.
 
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
+
+import pytest
 
 from tests import lang
 
@@ -34,9 +38,9 @@ fun main() {
 
 
 def test_arguments_reach_the_program(tmp_path: Path) -> None:
-    # Element zero is the program's first argument, not its own name: the
-    # entry hands over `argv + 1`. Were it otherwise, a self-compiled compiler
-    # would read its command line shifted by one.
+    # Element zero is the program's first argument, not its own name, which is
+    # `Env.programName`'s. Were it otherwise, a self-compiled compiler would
+    # read its command line shifted by one.
     result = _run(ARGS, tmp_path, "input.gob", "-o", "out.c")
     assert result.code == 0, result.stderr
     assert result.stdout == "3\ninput.gob\n-o\nout.c\n"
@@ -54,6 +58,38 @@ def test_an_option_shaped_argument_reaches_the_program(tmp_path: Path) -> None:
     result = _run(ARGS, tmp_path, "-o")
     assert result.code == 0, result.stderr
     assert result.stdout == "1\n-o\n"
+
+
+PROGRAM_NAME = """
+import System.Env as Env
+
+fun main() {
+    match Env.programName() {
+        Some(name) -> print(name)
+        None -> print("no name")
+    }
+    print(Int.toString(len(Env.args())))
+}
+"""
+
+
+def test_program_name_is_the_path_it_was_run_by(tmp_path: Path) -> None:
+    binary = lang.binary(PROGRAM_NAME)
+    result = _run(PROGRAM_NAME, tmp_path, "a")
+    assert result.code == 0, result.stderr
+    assert result.stdout == f"{binary}\n1\n"
+
+
+@pytest.mark.skipif(bool(os.environ.get("TURKEY_RUN")),
+                    reason="an emulator chooses the guest's argv[0] itself")
+def test_program_name_is_whatever_the_parent_chose(tmp_path: Path) -> None:
+    # `argv[0]` is the parent's choice, not the file's name: a login shell
+    # is started as `-sh`, and a multi-call binary by each of its links.
+    binary = lang.binary(PROGRAM_NAME)
+    result = subprocess.run(["-chosen", "a", "b"], executable=binary,
+                            cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "-chosen\n2\n"
 
 
 EXIT = """

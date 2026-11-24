@@ -20,14 +20,23 @@ import System.File as File
 import System.IO as IO
 import System.Task as Task
 
-fun report(r : Either IO.IOError a) -> String = match r {
+-- `System.File` fails with a `SomeError` and a stream's own operations with
+-- its `IOError`; `report` reads the `IOError` out of either.
+class AsIO e { fun asIO(e) -> IO.IOError }
+instance AsIO IO.IOError { fun asIO(e) = e }
+instance AsIO SomeError { fun asIO(e) = Option.expect(Error.find(e), "an IOError") }
+
+fun report[AsIO e](r : Either e a) -> String = match r {
     Right(_) -> "ok"
-    Left(e) -> debug(e.kind) + ": " + message(e)
+    Left(e) -> {
+        let io = asIO(e)
+        debug(io.kind) + ": " + message(io)
+    }
 }
 
-fun must(r : Either IO.IOError a) -> a = match r {
+fun must[Show e](r : Either e a) -> a = match r {
     Right(x) -> x
-    Left(e) -> error(message(e))
+    Left(e) -> error(show(e))
 }
 """
 
@@ -185,25 +194,22 @@ fun main() {
     print(File.readText("made"))
     match File.readAll("made") {
         Right(b) -> print(IO.filled(b))
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
     print(File.readText("bad"))
     -- The message, which names the failure, rather than the error's fields.
-    match File.readText("missing") {
-        Left(Right(e)) -> print("Left(Right(" + message(e) + "))")
-        other -> print(other)
-    }
+    print(File.readText("missing"))
     print(report(File.writeAll("copy", IO.bytesOf("bytes"))))
     print(File.readText("copy"))
     -- A device that fstat gives no size for, read until it ends.
     match File.readAll("/dev/null") {
         Right(b) -> print(IO.filled(b))
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
 }
 """, tmp_path)
-    assert out == ["ok", 'Right("héllo\\n")', "7", "Left(Left(InvalidUTF8))",
-                   "Left(Right(open missing: no such file or directory))",
+    assert out == ["ok", 'Right("héllo\\n")', "7", "Left(SomeError(\"the input is not well-formed UTF-8\"))",
+                   "Left(SomeError(\"open missing: no such file or directory\"))",
                    "ok", 'Right("bytes")', "0"]
 
 
@@ -216,7 +222,7 @@ fun main() {
     for path in ["bad", "missing"] {
         match File.readText(path) {
             Right(_) -> print("text")
-            Left(e) -> print(message(e))
+            Left(e) -> print(e)
         }
     }
     match IO.readExact(must(File.openRead("short")), IO.buffer(4), 4) {
@@ -256,15 +262,15 @@ fun main() {
     print(File.readText("./inner/../book"))
     match File.metadata("book") {
         Right(s) -> print(debug(s.kind) + " " + show(s.size))
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
     match File.listPath(".") {
         Right(names) -> print(String.join(names, " "))
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
     match File.listPath("inner") {
         Right(names) -> print(String.join(names, " "))
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
     print(report(File.openAppend("book")))
     print(report(File.create("new", File.Exclusive)))

@@ -25,19 +25,28 @@ import System.File as File
 import System.IO as IO
 import Time.Instant as Instant
 
-fun report(r : Either IO.IOError a) -> String = match r {
+-- `System.File` fails with a `SomeError` and a stream's own operations with
+-- its `IOError`; `report` reads the `IOError` out of either.
+class AsIO e { fun asIO(e) -> IO.IOError }
+instance AsIO IO.IOError { fun asIO(e) = e }
+instance AsIO SomeError { fun asIO(e) = Option.expect(Error.find(e), "an IOError") }
+
+fun report[AsIO e](r : Either e a) -> String = match r {
     Right(_) -> "ok"
-    Left(e) -> debug(e.kind) + ": " + message(e)
+    Left(e) -> {
+        let io = asIO(e)
+        debug(io.kind) + ": " + message(io)
+    }
 }
 
-fun must(r : Either IO.IOError a) -> a = match r {
+fun must[Show e](r : Either e a) -> a = match r {
     Right(x) -> x
-    Left(e) -> error(message(e))
+    Left(e) -> error(show(e))
 }
 
-fun names(r : Either IO.IOError (Array String)) -> String = match r {
+fun names(r : Either SomeError (Array String)) -> String = match r {
     Right(xs) -> String.join(xs, " ")
-    Left(e) -> debug(e.kind) + ": " + message(e)
+    Left(e) -> report(Left(e) : Either SomeError Unit)
 }
 """
 
@@ -60,15 +69,15 @@ def test_a_stat_is_a_value(tmp_path, target):
     os.symlink("plain", tmp_path / "link")
     os.mkfifo(tmp_path / "fifo")
     out = lines("""
-fun describe(r : Either IO.IOError File.Stat) -> String = match r {
+fun describe(r : Either SomeError File.Stat) -> String = match r {
     Right(s) -> debug(s.kind) + " " + show(s.size) + " " + show(s.permissions) + " "
                 + show(Instant.unixNanos(s.modified))
-    Left(e) -> debug(e.kind) + ": " + message(e)
+    Left(e) -> report(Left(e) : Either SomeError Unit)
 }
 
-fun kindOf(r : Either IO.IOError File.Stat) -> String = match r {
+fun kindOf(r : Either SomeError File.Stat) -> String = match r {
     Right(s) -> debug(s.kind)
-    Left(e) -> message(e)
+    Left(e) -> show(e)
 }
 
 fun main() {
@@ -292,7 +301,7 @@ fun main() {
     print(report(File.close(r)))
     match File.metadataIn(d, "made") {
         Right(s) -> print(s.size)
-        Left(e) -> print(message(e))
+        Left(e) -> print(e)
     }
     print(report(File.renameIn(d, "made", File.workingDir(), "out")))
     let sub = must(File.openDirIn(d, "sub"))
@@ -532,7 +541,7 @@ fun main() {
     match File.metadata("cache/entry") {
         Right(_) -> print("found")
         Left(e) -> {
-            if e.kind != IO.NotFound { error(message(e)) }
+            if asIO(e).kind != IO.NotFound { error(show(e)) }
             must(File.createDirAll("cache/staging"))
             let w = must(File.create("cache/staging/entry", File.Exclusive))
             for var i = 0; i < 2000; i = i + 1 {
@@ -578,9 +587,9 @@ def test_readLink_answers_the_target_as_written(tmp_path):
     os.symlink("../plain", tmp_path / "dir" / "up")
     (tmp_path / "plain").write_bytes(b"x")
     out = lines("""
-fun target(r : Either IO.IOError String) -> String = match r {
+fun target(r : Either SomeError String) -> String = match r {
     Right(t) -> t
-    Left(e) -> debug(e.kind) + ": " + message(e)
+    Left(e) -> report(Left(e) : Either SomeError Unit)
 }
 
 fun main() {

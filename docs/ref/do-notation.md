@@ -419,7 +419,7 @@ unwrap ::= postfix "!"
 ```
 
 `e!` is the value inside `e`, or a [panic](runtime-errors.md) when there is
-none. It is for a value the program's own logic says is present: a line of
+none. It is for a value the program's own logic guarantees is present: a line of
 input known to be a number, a key known to be in a map. A failure the caller
 should handle is a `?` instead.
 
@@ -440,8 +440,8 @@ match tryUnwrap(e) {
 }
 ```
 
-where `tryUnwrap` is the method of `Unwrap`, which says what is inside `e` or
-why nothing is:
+where `tryUnwrap` is the method of `Unwrap`, which returns what is inside `e`
+or why nothing is:
 
 ```text
 class Unwrap f {

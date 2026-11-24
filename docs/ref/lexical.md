@@ -392,7 +392,8 @@ statement, so it can put several statements on one line.
 Precisely, a line break is a separator when all three of these hold:
 
 1. **The token before it can end a statement**: an identifier, a constructor
-   name, a literal, `)`, `]`, `}`, `return`, `break`, `continue`, or `?`.
+   name, a literal, `)`, `]`, `}`, `return`, `break`, `continue`, `?`, or
+   `!`.
 2. **The token after it can start a statement**: an identifier, a constructor
    name, a literal, `(`, `[`, `{`, `-`, `!`, `..`, `\`, or one of the keywords
    `class`, `continue`, `break`, `do`, `for`, `foreign`, `fun`, `if`,
@@ -445,6 +446,17 @@ break changes the meaning of a program:
   included, continues the line before it.
 * A line that starts with `(` or `[` begins a new statement. It is not a call
   or an index applied to the line before.
+* A line that ends in `!` ends the statement there, because a postfix
+  [`!`](do-notation.md#unwrapping-with-) can end one. So a prefix `!` must
+  be on the same line as its operand:
+
+<!-- error: expected an expression -->
+```kotlin
+fun main() {
+    let ready = !
+        True
+}
+```
 
 In a record literal, record pattern or record declaration, a line break that
 separates is a field separator, so commas between fields are optional when

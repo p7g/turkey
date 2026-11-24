@@ -68,7 +68,7 @@ type Bool : Ord = False | True
 ```
 
 An ordinary data type. `if`, `while`, the test of a C-style `for`, `&&`,
-`||` and `!` all require this type. `==` and the other comparisons return it.
+`||` and prefix `!` all require this type. `==` and the other comparisons return it.
 Its `Eq`, `Ord` and `Hash` are derived ([Derived instances](classes.md#derived-instances)),
 so `False < True`.
 

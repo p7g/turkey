@@ -27,7 +27,7 @@ export (
     Child(..), children, exprChildren, stmtChildren,
     Completion(..), completion, stmtCompletion, completes, stmtStops, breaksOut,
     LetElse(..),
-    shorthandPrefix, isShorthand, sketch,
+    shorthandPrefix, isShorthand, sketch, unparen,
 )
 
 import Turkey.Types (ConCell)
@@ -233,6 +233,12 @@ type ExprKind
     | EBlock(Vec Stmt)
     | EQuestion(Expr, Option Expr)
     | EDo(Expr)
+    --- Parentheses around a single expression, which group it and do nothing
+    --- else. They are kept so the tree records what the author wrote, which a
+    --- tool that prints source back needs. They are transparent to the `_`
+    --- placeholder rule: `(_ + 1) * 2` is one function. `Turkey.Desugar`
+    --- removes them, and no stage after it sees one.
+    | EParen(Expr)
 
 --- An arm is taken when one of its patterns matches and then every guard holds,
 --- in order. A failing guard goes on to the next arm, with the bindings its arm
@@ -280,6 +286,12 @@ fun conditionExpr(c : Condition) -> Expr = match c {
 fun conditionSpan(c : Condition) -> Span = match c {
     CondTest(s, _) -> s
     CondLet(s, _, _, _) -> s
+}
+
+--- Returns `e` without the grouping parentheses around it, however many.
+fun unparen(e : Expr) -> Expr = match e.kind {
+    EParen(inner) -> unparen(inner)
+    _ -> e
 }
 
 -- -- statements -------------------------------------------------------------------
@@ -672,6 +684,7 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
     EBlock(stmts) -> Vec.map(stmts, ChStmt)
     EQuestion(inner, _) -> [ChExpr(inner)]
     EDo(body) -> [ChExpr(body)]
+    EParen(inner) -> [ChExpr(inner)]
 }
 
 fun stmtChildren(s : Stmt) -> Vec Child = match s.kind {
@@ -900,6 +913,7 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
     -- A `do` block is evaluated as a value of its monad, and a `break` cannot
     -- cross into one.
     EDo(_) -> (Completes, Stops)
+    EParen(inner) -> reach(inner)
 }
 
 fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
@@ -1067,5 +1081,6 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
         (String.build(b), 0)
     }
     EAnnot(inner, _) -> sketchLevel(inner)
+    EParen(inner) -> ("(" + sketchAt(inner, 0) + ")", 8)
     _ -> ("...", 8)
 }

@@ -338,6 +338,9 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 --- every binding occurrence and reference it writes is recorded there.
 fun program(p : Program, scope : Scope, binders : Binders.Table) -> Unit {
     let d = D { n = 0, scope = scope, binders = binders, owner = 0, depth = 0 }
+    -- First, so that every walk after this one, and every stage after this
+    -- pass, sees no grouping parentheses.
+    for decl in p.decls { bareDecl(decl) }
     for decl in p.decls {
         match decl {
             DClass(c) -> for m in c.methods {
@@ -1155,6 +1158,7 @@ fun walkExpr(d : D, e : Expr) -> Expr {
             stmts[i] = walkStmt(d, stmts[i])
         }
         EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
+        EParen(_) -> unbared(e.span)
     }
     e
 }
@@ -1191,6 +1195,107 @@ fun walkFields(d : D, fields : Vec (String, Expr)) -> Vec (String, Expr) {
     let out = Vec.new(len(fields))
     for (name, value) in fields { Vec.push(out, (name, walkExpr(d, value))) }
     out
+}
+
+-- -- grouping parentheses --------------------------------------------------------------
+--
+-- Every `EParen` is replaced by the expression inside it. That expression is the
+-- node `Turkey.Resolve` recorded binders and methods against, so its parent is
+-- rebuilt around it. Copying its `kind` into the parenthesis node instead would
+-- leave those records keyed by an id no node in the tree has.
+
+fun bareDecl(decl : Decl) -> Unit = match decl {
+    DStmt(s) -> bareStmt(s)
+    DClass(c) -> for m in c.methods { bareFun(m) }
+    DInstance(i) -> for m in i.methods { bareFun(m) }
+    DType(_) -> {}
+    DForeign(_) -> {}
+    DInfix(_) -> {}
+}
+
+fun bareFun(f : FunDecl) -> Unit {
+    if let Some(body) = f.body { f.body = Some(bare(body)) }
+}
+
+-- Returns `e` with no parentheses around it or anywhere inside it.
+fun bare(e : Expr) -> Expr {
+    if let EParen(inner) = e.kind { return bare(inner) }
+    e.kind = bareKind(e)
+    e
+}
+
+fun bareKind(e : Expr) -> ExprKind = match e.kind {
+    ELit(_) | EUnit | EVar(_, _) | ECon(_) | EContinue -> e.kind
+    ETuple(xs) -> ETuple(bareAll(xs))
+    EArray(xs) -> EArray(bareAll(xs))
+    ERecord(name, fields) -> ERecord(name, Vec.map(fields, fun((field, value)) = (field, bare(value))))
+    ELambda(params, ret, body) -> ELambda(params, ret, bare(body))
+    ECall(fn, args) -> ECall(bare(fn), bareAll(args))
+    EIndex(arr, index, getFn, setFn) -> EIndex(bare(arr), bare(index), getFn, setFn)
+    EField(obj, name) -> EField(bare(obj), name)
+    EProject(obj, index) -> EProject(bare(obj), index)
+    EUnary(op, operand, fn) -> EUnary(op, bare(operand), fn)
+    EBinary(op, left, right, fn) -> EBinary(op, bare(left), bare(right), fn)
+    EChain(operands, ops) -> EChain(bareAll(operands), ops)
+    EAnnot(inner, t) -> EAnnot(bare(inner), t)
+    EIf(cond, then, otherwise) -> EIf(bare(cond), bare(then), bareOpt(otherwise))
+    EWhile(cond, body) -> EWhile(bare(cond), bare(body))
+    EForIn(pat, iterable, body, iterFn, nextFn) ->
+        EForIn(pat, bare(iterable), bare(body), iterFn, nextFn)
+    EForC(init, cond, step, body) -> {
+        if let Some(s) = init { bareStmt(s) }
+        if let Some(s) = step { bareStmt(s) }
+        EForC(init, bare(cond), step, bare(body))
+    }
+    ELoop(body) -> ELoop(bare(body))
+    EMatch(scrutinee, arms) -> {
+        for a in arms {
+            a.guards = Vec.map(a.guards, bareGuard)
+            a.body = bare(a.body)
+        }
+        EMatch(bare(scrutinee), arms)
+    }
+    EIfLet(conditions, then, otherwise) ->
+        EIfLet(Vec.map(conditions, bareCondition), bare(then), bareOpt(otherwise))
+    EWhileLet(conditions, body) -> EWhileLet(Vec.map(conditions, bareCondition), bare(body))
+    EReturn(value) -> EReturn(bareOpt(value))
+    EBreak(value) -> EBreak(bareOpt(value))
+    EBlock(stmts) -> {
+        for s in stmts { bareStmt(s) }
+        e.kind
+    }
+    EQuestion(inner, bindFn) -> EQuestion(bare(inner), bindFn)
+    EDo(body) -> EDo(bare(body))
+    EParen(_) -> unbared(e.span)
+}
+
+fun bareAll(xs : Vec Expr) -> Vec Expr = Vec.map(xs, bare)
+
+fun bareOpt(e : Option Expr) -> Option Expr = Option.map(e, bare)
+
+fun bareGuard(g : Guard) -> Guard = match g {
+    GTest(test) -> GTest(bare(test))
+    GLet(alts, value) -> GLet(alts, bare(value))
+}
+
+fun bareCondition(c : Condition) -> Condition = match c {
+    CondTest(span, test) -> CondTest(span, bare(test))
+    CondLet(span, mutable, alts, value) -> CondLet(span, mutable, alts, bare(value))
+}
+
+fun bareStmt(s : Stmt) -> Unit {
+    s.kind = match s.kind {
+        SLet(pat, value) -> SLet(pat, bare(value))
+        SVar(pat, value) -> SVar(pat, bare(value))
+        SFun(f) -> {
+            bareFun(f)
+            s.kind
+        }
+        SAssign(target, value) -> SAssign(bare(target), bare(value))
+        SExpr(e) -> SExpr(bare(e))
+        SLetElse(mutable, pat, value, otherwise) ->
+            SLetElse(mutable, pat, bare(value), bare(otherwise))
+    }
 }
 
 -- -- the forms that mean a `match` ------------------------------------------------------
@@ -1539,6 +1644,7 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
     EQuestion(inner, _) -> indexExpr(d, inner)
     EDo(body) -> indexExpr(d, body)
     EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
+    EParen(_) -> unbared(e.span)
 }
 
 fun indexAll(d : D, xs : Vec Expr) -> Unit {
@@ -1571,5 +1677,10 @@ fun bug(message : String, where : Span) -> a =
 -- that runs after it.
 fun rewritten(where : Span) -> a =
     bug("this form should have been rewritten into a 'match' already", where)
+
+-- Raises the internal error for grouping parentheses, which `bare` removes
+-- before every other walk.
+fun unbared(where : Span) -> a =
+    bug("these parentheses should have been removed already", where)
 
 fun discard(x : a) -> Unit = {}

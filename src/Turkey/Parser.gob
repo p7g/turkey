@@ -1334,6 +1334,7 @@ fun parseLetElse(p : P, s : Span, mutable : Bool, pat : Pat, value : Expr) -> St
 -- `match`.
 fun tailCalls(e : Expr, out : Vec Expr) -> Unit = match e.kind {
     ECall(_, _) -> Vec.push(out, e)
+    EParen(inner) -> tailCalls(inner, out)
     EBlock(stmts) -> if len(stmts) > 0 {
         if let SExpr(last) = stmts[len(stmts) - 1].kind { tailCalls(last, out) }
     }
@@ -1372,7 +1373,7 @@ fun parseStmt(p : P) -> Stmt {
     mkStmt(p, s, SExpr(closeWhole(p, e)))
 }
 
-fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match e.kind {
+fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match unparen(e).kind {
     EProject(_, index) ->
         oops(p, "cannot assign to the tuple component '." + Int.toString(index)
                 + "'; build a new tuple instead", s)
@@ -1716,7 +1717,7 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     p.noRecord = saved
     -- Grouping parentheses are not a boundary: they exist for precedence, so
     -- `(_ + 1) * 2` is one function. A tuple's components are.
-    if len(elems) == 1 { return elems[0] }
+    if len(elems) == 1 { return mkExpr(p, tok.span, EParen(elems[0])) }
     let parts = Vec.map(elems, closePart(p, _))
     closeAround(p, mkExpr(p, tok.span, ETuple(parts)), parts)
 }
@@ -1978,7 +1979,9 @@ fun parseMatchArm(p : P) -> Arm {
 -- outright: the function one would make there could never be used.
 --
 -- Everything else is transparent: operators, field access, projection, `?`,
--- `:`, a callee, and grouping parentheses, which never become a node.
+-- `:`, a callee, and grouping parentheses. A parenthesized `_` counts as a
+-- bare one, so `f((_))` is `f(_)`; the `EParen` node stays in the tree around
+-- the use of the parameter the `_` becomes.
 --
 -- Inside `\` none of that applies. Every `_` belongs to the nearest enclosing
 -- `\`, through any `fun` in between, and they are all the one parameter.
@@ -1988,10 +1991,15 @@ fun parseMatchArm(p : P) -> Arm {
 -- bare part has been closed by the node around it -- and walking the whole
 -- expression finds exactly the `_`s this boundary owns.
 
-fun isPlaceholder(e : Expr) -> Bool = match e.kind {
+-- Grouping parentheses are transparent here too: `f((_))` is `f(_)`.
+fun isPlaceholder(e : Expr) -> Bool = isUnderscore(unparen(e))
+
+-- Whether `e` is the `_` itself, the node a function's parameter replaces.
+fun isUnderscore(e : Expr) -> Bool = match e.kind {
     EVar(name, _) -> name == "_"
     _ -> False
 }
+
 
 fun placeholders(e : Expr) -> Vec Expr {
     let out = Vec.new(2)
@@ -2002,7 +2010,7 @@ fun placeholders(e : Expr) -> Vec Expr {
 fun collectPlaceholders(c : Child, out : Vec Expr) -> Unit {
     match c {
         ChExpr(e) -> {
-            if isPlaceholder(e) {
+            if isUnderscore(e) {
                 Vec.push(out, e)
                 return
             }
@@ -2048,8 +2056,9 @@ fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
     let message = "'_' cannot be used in " + what
     -- A bare part has made its node a function before the condition is read,
     -- so `if Array.contains(_, 2)` leaves no `_` pending: the function is here.
-    match e.kind {
-        ELambda(params, _, _) -> if isShorthand(e) { oops(p, message, params[0].span) }
+    let bare = unparen(e)
+    match bare.kind {
+        ELambda(params, _, _) -> if isShorthand(bare) { oops(p, message, params[0].span) }
         _ -> {}
     }
     if p.pending == 0 || p.explicit > 0 { return }

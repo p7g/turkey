@@ -31,149 +31,149 @@ import Turkey.Token (Comment(..), standsAlone)
 --- the first line after it that is not a directive alone on its line, unless
 --- that line is another run's.
 type Run = Run {
-    span      : Span,
-    comments  : Vec Comment,
-    trailing  : Bool,
-    documents : Int,
+	span      : Span
+	comments  : Vec Comment
+	trailing  : Bool
+	documents : Int
 }
 
 --- Returns whether `c` is a doc comment.
 fun isDoc(c : Comment) -> Bool {
-    if c.block { return False }
-    match String.stripPrefix(c.text, "---") {
-        Some(rest) -> String.isEmpty(String.trimEnd(rest)) || String.startsWith(rest, " ")
-        None -> False
-    }
+	if c.block { return False }
+	match String.stripPrefix(c.text, "---") {
+		Some(rest) -> String.isEmpty(String.trimEnd(rest)) || String.startsWith(rest, " ")
+		None       -> False
+	}
 }
 
 --- Returns the doc comments among `comments`, the comments of the file whose
 --- text is `source`, grouped into runs in source order. Reads `source` only
 --- when there is a doc comment.
 fun runs(comments : Vec Comment, source : String) -> Vec Run {
-    let docs = Vec.filter(comments, isDoc)
-    if len(docs) == 0 { return [] }
-    let lines = String.lines(source)
-    let directives = Set.new()
-    for c in comments {
-        if Directives.isDirective(c) && standsAlone(c, lines) { Set.add(directives, c.span.line) }
-    }
-    let docLines = Set.new()
-    for c in docs {
-        if standsAlone(c, lines) { Set.add(docLines, c.span.line) }
-    }
-    let out = []
-    for c in docs {
-        let alone = standsAlone(c, lines)
-        let extends = match Vec.last(out) {
-            Some(r) -> alone && !r.trailing && r.span.endLine == c.span.line - 1
-            None -> False
-        }
-        let (span, kept) = if extends {
-            let r = out[len(out) - 1]
-            Vec.push(r.comments, c)
-            let _ = Vec.pop(out)
-            (Source.through(r.span, c.span), r.comments)
-        } else {
-            (c.span, [c])
-        }
-        var next = span.endLine + 1
-        while Set.contains(directives, next) { next = next + 1 }
-        -- Directives are passed over only on the way to a declaration. A run
-        -- after them is a run of its own, so this one documents nothing.
-        if Set.contains(docLines, next) { next = span.endLine + 1 }
-        Vec.push(out, Run { span = span, comments = kept, trailing = !alone, documents = next })
-    }
-    out
+	let docs = Vec.filter(comments, isDoc)
+	if len(docs) == 0 { return [] }
+	let lines = String.lines(source)
+	let directives = Set.new()
+	for c in comments {
+		if Directives.isDirective(c) && standsAlone(c, lines) { Set.add(directives, c.span.line) }
+	}
+	let docLines = Set.new()
+	for c in docs {
+		if standsAlone(c, lines) { Set.add(docLines, c.span.line) }
+	}
+	let out = []
+	for c in docs {
+		let alone = standsAlone(c, lines)
+		let extends = match Vec.last(out) {
+			Some(r) -> alone && !r.trailing && r.span.endLine == c.span.line - 1
+			None    -> False
+		}
+		let (span, kept) = if extends {
+			let r = out[len(out) - 1]
+			Vec.push(r.comments, c)
+			let _ = Vec.pop(out)
+			(Source.through(r.span, c.span), r.comments)
+		} else {
+			(c.span, [c])
+		}
+		var next = span.endLine + 1
+		while Set.contains(directives, next) { next = next + 1 }
+		-- Directives are passed over only on the way to a declaration. A run
+		-- after them is a run of its own, so this one documents nothing.
+		if Set.contains(docLines, next) { next = span.endLine + 1 }
+		Vec.push(out, Run { span = span, comments = kept, trailing = !alone, documents = next })
+	}
+	out
 }
 
 --- Returns the run's text: each comment without `---` and one space after it,
 --- and no empty line first or last. Returns `None` for a run of bare `---`
 --- lines, which says nothing.
 fun text(r : Run) -> Option String {
-    let lines = []
-    for c in r.comments {
-        let body = Option.unwrapOr(String.stripPrefix(c.text, "---"), c.text)
-        Vec.push(lines, String.trimEnd(Option.unwrapOr(String.stripPrefix(body, " "), body)))
-    }
-    var from = 0
-    var to = len(lines)
-    while from < to && lines[from] == "" { from = from + 1 }
-    while to > from && lines[to - 1] == "" { to = to - 1 }
-    if from == to { None } else { Some(String.join(Vec.slice(lines, from, to), "\n")) }
+	let lines = []
+	for c in r.comments {
+		let body = Option.unwrapOr(String.stripPrefix(c.text, "---"), c.text)
+		Vec.push(lines, String.trimEnd(Option.unwrapOr(String.stripPrefix(body, " "), body)))
+	}
+	var from = 0
+	var to = len(lines)
+	while from < to && lines[from] == "" { from = from + 1 }
+	while to > from && lines[to - 1] == "" { to = to - 1 }
+	if from == to { None } else { Some(String.join(Vec.slice(lines, from, to), "\n")) }
 }
 
 --- Returns the lines a run may end directly above: where each top-level
 --- declaration, class method and associated type, constructor and record
 --- field the program writes begins.
 fun targets(program : Program) -> Set.Set Int {
-    let out = Set.new()
-    for s in targetSpans(program) { Set.add(out, s.line) }
-    out
+	let out = Set.new()
+	for s in targetSpans(program) { Set.add(out, s.line) }
+	out
 }
 
 --- Returns the spans of the nodes a run may document, as `targets` finds them,
 --- in the same order for any two programs with the same tree.
 fun targetSpans(program : Program) -> Vec Span {
-    let out = []
-    let add = fun(s : Span) {
-        if !Source.isGenerated(s) && !Source.isEmpty(s) { Vec.push(out, s) }
-    }
-    for d in program.decls {
-        match d {
-            DStmt(s) -> add(s.span)
-            DType(td) -> {
-                add(td.span)
-                for c in Option.unwrapOr(td.variants, []) {
-                    add(c.span)
-                    for f in c.fieldSpans { add(f) }
-                }
-            }
-            DClass(c) -> {
-                add(c.span)
-                for m in c.methods { add(m.span) }
-                for f in c.families { add(f.span) }
-            }
-            DInstance(i) -> add(i.span)
-            DForeign(f) -> add(f.span)
-            DInfix(op) -> add(op.span)
-        }
-    }
-    out
+	let out = []
+	let add = fun(s : Span) {
+		if !Source.isGenerated(s) && !Source.isEmpty(s) { Vec.push(out, s) }
+	}
+	for d in program.decls {
+		match d {
+			DStmt(s) -> add(s.span)
+			DType(td) -> {
+				add(td.span)
+				for c in Option.unwrapOr(td.variants, []) {
+					add(c.span)
+					for f in c.fieldSpans { add(f) }
+				}
+			}
+			DClass(c) -> {
+				add(c.span)
+				for m in c.methods { add(m.span) }
+				for f in c.families { add(f.span) }
+			}
+			DInstance(i) -> add(i.span)
+			DForeign(f)  -> add(f.span)
+			DInfix(op)   -> add(op.span)
+		}
+	}
+	out
 }
 
 --- Returns the line the program's first declaration begins on, leaving out
 --- any the compiler wrote.
 fun firstDeclLine(program : Program) -> Option Int {
-    var first = None
-    for d in program.decls {
-        let s = match d {
-            DStmt(st) -> st.span
-            DType(td) -> td.span
-            DClass(c) -> c.span
-            DInstance(i) -> i.span
-            DForeign(f) -> f.span
-            DInfix(op) -> op.span
-        }
-        if Source.isGenerated(s) || Source.isEmpty(s) { continue }
-        first = match first {
-            Some(line) -> Some(if s.line < line { s.line } else { line })
-            None -> Some(s.line)
-        }
-    }
-    first
+	var first = None
+	for d in program.decls {
+		let s = match d {
+			DStmt(st)    -> st.span
+			DType(td)    -> td.span
+			DClass(c)    -> c.span
+			DInstance(i) -> i.span
+			DForeign(f)  -> f.span
+			DInfix(op)   -> op.span
+		}
+		if Source.isGenerated(s) || Source.isEmpty(s) { continue }
+		first = match first {
+			Some(line) -> Some(if s.line < line { s.line } else { line })
+			None       -> Some(s.line)
+		}
+	}
+	first
 }
 
 --- Returns the module's comment: the first run that ends before `first`, the
 --- line of the first declaration, and does not document it or any other of
 --- `targets`.
 fun moduleRun(all : Vec Run, targets : Set.Set Int, first : Option Int) -> Option Run {
-    for r in all {
-        if r.trailing || Set.contains(targets, r.documents) { continue }
-        let before = match first {
-            Some(line) -> r.span.endLine < line
-            None -> True
-        }
-        return if before { Some(r) } else { None }
-    }
-    None
+	for r in all {
+		if r.trailing || Set.contains(targets, r.documents) { continue }
+		let before = match first {
+			Some(line) -> r.span.endLine < line
+			None       -> True
+		}
+		return if before { Some(r) } else { None }
+	}
+	None
 }

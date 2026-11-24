@@ -1,8 +1,25 @@
 export (
-    Conn(..), close, halfClose, isTimeout, isStale,
-    Paced, paced, conn, firstRead, progressed, carry,
-    Link, link, pace, input,
-    Pool, Pooled(..), pool, take, give, closeIdle,
+	Conn(..),
+	close,
+	halfClose,
+	isTimeout,
+	isStale,
+	Paced,
+	paced,
+	conn,
+	firstRead,
+	progressed,
+	carry,
+	Link,
+	link,
+	pace,
+	input,
+	Pool,
+	Pooled(..),
+	pool,
+	take,
+	give,
+	closeIdle,
 )
 
 --- A client's connections: plain or TLS, read and written under its limits,
@@ -72,125 +89,125 @@ import Turkey.ReadWrite (Read(..), Write(..))
 type Conn = Plain(Socket) | Secure(TLS)
 
 instance Read Conn {
-    type ReadError = SomeError
-    fun readInto(c, into) = match c {
-        Plain(s) -> promote(readInto(s, into))
-        Secure(t) -> promote(readInto(t, into))
-    }
+	type ReadError = SomeError
+	fun readInto(c, into) = match c {
+		Plain(s)  -> promote(readInto(s, into))
+		Secure(t) -> promote(readInto(t, into))
+	}
 }
 
 instance Write Conn {
-    type WriteError = SomeError
-    fun writeFrom(c, from) = match c {
-        Plain(s) -> promote(writeFrom(s, from))
-        Secure(t) -> promote(writeFrom(t, from))
-    }
-    fun flush(c) = Right(())
+	type WriteError = SomeError
+	fun writeFrom(c, from) = match c {
+		Plain(s)  -> promote(writeFrom(s, from))
+		Secure(t) -> promote(writeFrom(t, from))
+	}
+	fun flush(c) = Right(())
 }
 
 --- Closes `c`, ending every read and write parked on it. A failure to close
 --- is dropped: the connection is not used again either way.
 fun close(c : Conn) -> Unit {
-    let _ = match c {
-        Plain(s) -> promote(TCP.close(s))
-        Secure(t) -> promote(TLS.close(t))
-    }
+	let _ = match c {
+		Plain(s)  -> promote(TCP.close(s))
+		Secure(t) -> promote(TLS.close(t))
+	}
 }
 
 --- Ends `c`'s output; the server can go on sending.
 fun halfClose(c : Conn) -> Either SomeError Unit = match c {
-    Plain(s) -> promote(shutdownWrite(s))
-    Secure(t) -> promote(shutdownWrite(t))
+	Plain(s)  -> promote(shutdownWrite(s))
+	Secure(t) -> promote(shutdownWrite(t))
 }
 
 fun bound(c : Conn, at : Option Deadline) -> Unit = match (c, at) {
-    (Plain(s), Some(d)) -> TCP.setDeadline(s, d)
-    (Plain(s), None) -> TCP.clearDeadline(s)
-    (Secure(t), Some(d)) -> TLS.setDeadline(t, d)
-    (Secure(t), None) -> TLS.clearDeadline(t)
+	(Plain(s), Some(d))  -> TCP.setDeadline(s, d)
+	(Plain(s), None)     -> TCP.clearDeadline(s)
+	(Secure(t), Some(d)) -> TLS.setDeadline(t, d)
+	(Secure(t), None)    -> TLS.clearDeadline(t)
 }
 
 -- Returns the `IOError` a connection's error is or holds, for either kind of
 -- connection.
 fun ioError(e : SomeError) -> Option IOError {
-    if let Some(io) = Error.cast(e) : Option IOError {
-        return Some(io)
-    }
-    match Error.cast(e) : Option TLSError {
-        Some(Stream(io)) -> Some(io)
-        _ -> None
-    }
+	if let Some(io) = Error.cast(e) : Option IOError {
+		return Some(io)
+	}
+	match Error.cast(e) : Option TLSError {
+		Some(Stream(io)) -> Some(io)
+		_                -> None
+	}
 }
 
 --- Whether `e` is a read or write that timed out.
 fun isTimeout(e : SomeError) -> Bool = match ioError(e) {
-    Some(io) -> io.kind == TimedOut
-    None -> False
+	Some(io) -> io.kind == TimedOut
+	None     -> False
 }
 
 --- Whether `e` is what a stale connection, one the server had already
 --- closed, fails with: a reset, a broken pipe, or TLS ending without its
 --- close_notify. A timeout is not: the server may be slow rather than gone.
 fun isStale(e : SomeError) -> Bool {
-    if let Some(Truncated) = Error.cast(e) : Option TLSError {
-        return True
-    }
-    match ioError(e) {
-        Some(io) -> io.kind == ConnectionReset || io.kind == BrokenPipe
-        None -> False
-    }
+	if let Some(Truncated) = Error.cast(e) : Option TLSError {
+		return True
+	}
+	match ioError(e) {
+		Some(io) -> io.kind == ConnectionReset || io.kind == BrokenPipe
+		None     -> False
+	}
 }
 
 -- -- pacing -----------------------------------------------------------------------------
 
 type Paced = Paced {
-    conn          : Conn
-    var total     : Option Deadline
-    stall         : Duration
-    -- When a byte last moved either way, in `Clock.monotonic` nanoseconds.
-    -- Written by the task reading and the one writing.
-    moved         : Sync.AtomicInt
-    -- When the first byte was read, if one has been.
-    var firstRead : Option Clock.Reading
-    var pacing    : Pacing
+	conn      : Conn
+	var total : Option Deadline
+	stall     : Duration
+	-- When a byte last moved either way, in `Clock.monotonic` nanoseconds.
+	-- Written by the task reading and the one writing.
+	moved : Sync.AtomicInt
+	-- When the first byte was read, if one has been.
+	var firstRead : Option Clock.Reading
+	var pacing    : Pacing
 }
 
 -- Under the two limits, or carrying another protocol until a deadline.
 type Pacing = Limited | Carrying(Option Deadline)
 
 fun paced(c : Conn, total : Option Deadline, stall : Duration) -> Paced =
-    Paced {
-        conn = c
-        total
-        stall
-        moved = Sync.atomicInt(now())
-        firstRead = None
-        pacing = Limited
-    }
+	Paced {
+		conn = c
+		total
+		stall
+		moved     = Sync.atomicInt(now())
+		firstRead = None
+		pacing    = Limited
+	}
 
 -- -- links ------------------------------------------------------------------------------
 
 type Link = Link {
-    paced : Paced
-    input : Input Paced
+	paced : Paced
+	input : Input Paced
 }
 
 --- Returns a link over `c`, whose reads and writes stall out after `stall`,
 --- reading heads within `limits`.
 fun link(c : Conn, stall : Duration, limits : Limits) -> Link {
-    let p = paced(c, None, stall)
-    Link { paced = p, input = Input.input(p, limits) }
+	let p = paced(c, None, stall)
+	Link { paced = p, input = Input.input(p, limits) }
 }
 
 --- Returns `l`'s pacing, reset for a new exchange bounded by `total`: no
 --- byte read yet, and the stall measured from now.
 fun pace(l : Link, total : Option Deadline) -> Paced {
-    let p = l.paced
-    p.total = total
-    Sync.store(p.moved, now())
-    p.firstRead = None
-    p.pacing = Limited
-    p
+	let p = l.paced
+	p.total = total
+	Sync.store(p.moved, now())
+	p.firstRead = None
+	p.pacing = Limited
+	p
 }
 
 fun input(l : Link) -> Input Paced = l.input
@@ -217,142 +234,143 @@ fun since(p : Paced, a : Int) -> Int = max(Sync.load(p.moved), a)
 -- movement, whichever is later. Returns whether the stall limit is the
 -- nearer.
 fun limit(p : Paced, started : Int) -> Bool {
-    if let Carrying(d) = p.pacing {
-        bound(p.conn, d)
-        return False
-    }
-    let stalled = since(p, started) + Duration.toNanos(p.stall) - now()
-    let stallAt = Deadline.after(Duration.nanos(max(stalled, 0)))
-    if let Some(t) = p.total, t < stallAt {
-        bound(p.conn, Some(t))
-        return False
-    }
-    bound(p.conn, Some(stallAt))
-    True
+	if let Carrying(d) = p.pacing {
+		bound(p.conn, d)
+		return False
+	}
+	let stalled = since(p, started) + Duration.toNanos(p.stall) - now()
+	let stallAt = Deadline.after(Duration.nanos(max(stalled, 0)))
+	if let Some(t) = p.total, t < stallAt {
+		bound(p.conn, Some(t))
+		return False
+	}
+	bound(p.conn, Some(stallAt))
+	True
 }
 
 -- Whether an operation begun at `started` has stalled out: nothing moved
 -- either way for `stall` since it began.
-fun stalledOut(p : Paced, started : Int) -> Bool = now() - since(p, started) >= Duration.toNanos(p.stall)
+fun stalledOut(p : Paced, started : Int) -> Bool =
+	now() - since(p, started) >= Duration.toNanos(p.stall)
 
 instance Read Paced {
-    type ReadError = SomeError
-    fun readInto(p, into) {
-        let started = now()
-        loop {
-            let byStall = limit(p, started)
-            match readInto(p.conn, into) {
-                Right(n) -> {
-                    if n > 0 {
-                        progressed(p)
-                        if Option.isNone(p.firstRead) {
-                            p.firstRead = Some(Clock.monotonic())
-                        }
-                    }
-                    return Right(n)
-                }
-                Left(e) -> {
-                    -- Timed out by the stall limit, while the other direction
-                    -- moved: wait again.
-                    if !(byStall && isTimeout(e) && !stalledOut(p, started)) {
-                        return Left(e)
-                    }
-                }
-            }
-        }
-    }
+	type ReadError = SomeError
+	fun readInto(p, into) {
+		let started = now()
+		loop {
+			let byStall = limit(p, started)
+			match readInto(p.conn, into) {
+				Right(n) -> {
+					if n > 0 {
+						progressed(p)
+						if Option.isNone(p.firstRead) {
+							p.firstRead = Some(Clock.monotonic())
+						}
+					}
+					return Right(n)
+				}
+				Left(e) -> {
+					-- Timed out by the stall limit, while the other direction
+					-- moved: wait again.
+					if !(byStall && isTimeout(e) && !stalledOut(p, started)) {
+						return Left(e)
+					}
+				}
+			}
+		}
+	}
 }
 
 instance Write Paced {
-    type WriteError = SomeError
-    fun writeFrom(p, from) {
-        let _ = limit(p, now())
-        writeFrom(p.conn, from)?
-        if from.end > from.start {
-            progressed(p)
-        }
-        Right(())
-    }
-    fun flush(p) = Right(())
+	type WriteError = SomeError
+	fun writeFrom(p, from) {
+		let _ = limit(p, now())
+		writeFrom(p.conn, from)?
+		if from.end > from.start {
+			progressed(p)
+		}
+		Right(())
+	}
+	fun flush(p) = Right(())
 }
 
 -- -- the pool ---------------------------------------------------------------------------
 
 type Pool = Pool {
-    perOrigin   : Int
-    total       : Int
-    idle        : Duration
-    connections : Sync.Mutex Idle
+	perOrigin   : Int
+	total       : Int
+	idle        : Duration
+	connections : Sync.Mutex Idle
 }
 
 -- The idle connections of each origin that has any, oldest first, and how
 -- many there are in all.
 type Idle = Idle {
-    var origins : Map String (Vec Pooled)
-    var count   : Int
+	var origins : Map String (Vec Pooled)
+	var count   : Int
 }
 
 --- An idle connection, and when it was given back.
 type Pooled = Pooled {
-    link  : Link
-    since : Clock.Reading
+	link  : Link
+	since : Clock.Reading
 }
 
 fun pool(perOrigin : Int, total : Int, idle : Duration) -> Pool =
-    Pool {
-        perOrigin
-        total
-        idle
-        connections = Sync.mutex(Idle { origins = Map.new(), count = 0 })
-    }
+	Pool {
+		perOrigin
+		total
+		idle
+		connections = Sync.mutex(Idle { origins = Map.new(), count = 0 })
+	}
 
 -- Removes from `idle` every connection kept for `p.idle` or longer, and
 -- every origin left with none, and adds those connections to `closing`.
 fun sweep(p : Pool, idle : Idle, closing : Vec Link) -> Unit {
-    let now = Clock.monotonic()
-    for (origin, kept) in Map.entries(idle.origins) {
-        var expired = 0
-        while expired < len(kept) && Clock.between(kept[expired].since, now) >= p.idle {
-            Vec.push(closing, kept[expired].link)
-            expired = expired + 1
-        }
-        if expired > 0 {
-            dropOldest(idle, origin, kept, expired)
-        }
-    }
+	let now = Clock.monotonic()
+	for (origin, kept) in Map.entries(idle.origins) {
+		var expired = 0
+		while expired < len(kept) && Clock.between(kept[expired].since, now) >= p.idle {
+			Vec.push(closing, kept[expired].link)
+			expired = expired + 1
+		}
+		if expired > 0 {
+			dropOldest(idle, origin, kept, expired)
+		}
+	}
 }
 
 -- Removes the `n` oldest of `kept`, `origin`'s connections, from `idle`,
 -- and the origin itself if that leaves it none.
 fun dropOldest(idle : Idle, origin : String, kept : Vec Pooled, n : Int) -> Unit {
-    idle.count = idle.count - n
-    if n == len(kept) {
-        let _ = Map.delete(idle.origins, origin)
-    } else {
-        Map.put(idle.origins, origin, Vec.slice(kept, n, len(kept)))
-    }
+	idle.count = idle.count - n
+	if n == len(kept) {
+		let _ = Map.delete(idle.origins, origin)
+	} else {
+		Map.put(idle.origins, origin, Vec.slice(kept, n, len(kept)))
+	}
 }
 
 --- Returns an idle connection to `origin`, the most recently given back,
 --- after closing every connection idle too long.
 fun take(p : Pool, origin : String) -> Option Link {
-    let closing = []
-    let found = Sync.withLock(p.connections, fun(idle) {
-        sweep(p, idle, closing)
-        let kept = Map.get(idle.origins, origin)?
-        let Pooled { link = l, since = _ } = Vec.pop(kept)?
-        idle.count = idle.count - 1
-        if len(kept) == 0 {
-            let _ = Map.delete(idle.origins, origin)
-        }
-        Some(l)
-    })
-    closeAll(closing)
-    found
+	let closing = []
+	let found = Sync.withLock(p.connections, fun(idle) {
+		sweep(p, idle, closing)
+		let kept = Map.get(idle.origins, origin)?
+		let Pooled { link = l, since = _ } = Vec.pop(kept)?
+		idle.count = idle.count - 1
+		if len(kept) == 0 {
+			let _ = Map.delete(idle.origins, origin)
+		}
+		Some(l)
+	})
+	closeAll(closing)
+	found
 }
 
 fun closeAll(links : Vec Link) -> Unit {
-    for l in links { close(l.paced.conn) }
+	for l in links { close(l.paced.conn) }
 }
 
 --- Keeps `l` for the next request to `origin`, after closing every
@@ -360,55 +378,55 @@ fun closeAll(links : Vec Link) -> Unit {
 --- idle connections as it may, and the pool's oldest if the pool then has
 --- more than `total`. `l`'s input must hold no byte.
 fun give(p : Pool, origin : String, l : Link) -> Unit {
-    let closing = []
-    Sync.withLock(p.connections, fun(idle) {
-        sweep(p, idle, closing)
-        let kept = Option.unwrapOr(Map.get(idle.origins, origin), [])
-        if len(kept) >= p.perOrigin || p.total == 0 {
-            Vec.push(closing, l)
-        } else {
-            Vec.push(kept, Pooled { link = l, since = Clock.monotonic() })
-            if len(kept) == 1 {
-                Map.put(idle.origins, origin, kept)
-            }
-            idle.count = idle.count + 1
-            if idle.count > p.total {
-                evictOldest(idle, closing)
-            }
-        }
-    })
-    closeAll(closing)
+	let closing = []
+	Sync.withLock(p.connections, fun(idle) {
+		sweep(p, idle, closing)
+		let kept = Option.unwrapOr(Map.get(idle.origins, origin), [])
+		if len(kept) >= p.perOrigin || p.total == 0 {
+			Vec.push(closing, l)
+		} else {
+			Vec.push(kept, Pooled { link = l, since = Clock.monotonic() })
+			if len(kept) == 1 {
+				Map.put(idle.origins, origin, kept)
+			}
+			idle.count = idle.count + 1
+			if idle.count > p.total {
+				evictOldest(idle, closing)
+			}
+		}
+	})
+	closeAll(closing)
 }
 
 -- Removes the pool's oldest connection, of whichever origin, and adds it to
 -- `closing`. Each origin's oldest is its first, so only those are compared.
 fun evictOldest(idle : Idle, closing : Vec Link) -> Unit {
-    var oldest = None
-    for (origin, kept) in Map.entries(idle.origins) {
-        let older = match oldest {
-            Some((_, o)) -> kept[0].since < o[0].since
-            None -> True
-        }
-        if older {
-            oldest = Some((origin, kept))
-        }
-    }
-    if let Some((origin, kept)) = oldest {
-        Vec.push(closing, kept[0].link)
-        dropOldest(idle, origin, kept, 1)
-    }
+	var oldest = None
+	for (origin, kept) in Map.entries(idle.origins) {
+		let older = match oldest {
+			Some((_, o)) -> kept[0].since < o[0].since
+			None         -> True
+		}
+		if older {
+			oldest = Some((origin, kept))
+		}
+	}
+	if let Some((origin, kept)) = oldest {
+		Vec.push(closing, kept[0].link)
+		dropOldest(idle, origin, kept, 1)
+	}
 }
 
 --- Closes every idle connection.
 fun closeIdle(p : Pool) -> Unit {
-    let all = Sync.withLock(p.connections, fun(idle) {
-        let all = []
-        for kept in Map.values(idle.origins) {
-            for Pooled { link = l, since = _ } in kept { Vec.push(all, l) }
-        }
-        idle.origins = Map.new()
-        idle.count = 0
-        all
-    })
-    closeAll(all)
+	let all = Sync.withLock(p.connections, fun(idle) {
+		let all = []
+		for kept in Map.values(idle.origins) {
+			for Pooled { link = l, since = _ } in kept { Vec.push(all, l) }
+		}
+		idle.origins = Map.new()
+		idle.count = 0
+		all
+	})
+	closeAll(all)
 }

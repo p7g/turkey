@@ -33,76 +33,89 @@ let counterFile = "turkey-alloc-sites.bin"
 --- and for a call through a closure, where the closure came from --
 --- tab-separated.
 fun instrument(functions : Array (Ssa.Func Low)) -> Vec String {
-    let sites = []
-    let giblets = Giblets.gibletModules()
-    for f in functions {
-        if Giblets.isGiblet(giblets, f) {
-            continue
-        }
-        let defs = Map.new()
-        for block in f.blocks {
-            for i in block.insts { Map.put(defs, Ssa.valueId(i.result), i.op) }
-        }
-        for block in f.blocks {
-            let out = []
-            for i in block.insts {
-                match L.allocatingOp(i.op) {
-                    Some(what) -> {
-                        let id = len(sites)
-                        let reason = Map.getOr(f.reasons, Ssa.valueId(i.result), what)
-                        let origin = match Map.get(f.origins, Ssa.valueId(i.result)) {
-                            Some(s) -> s.file + ":" + showSpan(s)
-                            None -> "?"
-                        }
-                        let callee = match i.op {
-                            Call(Indirect(c), _) -> describe(defs, c, 3)
-                            _ -> ""
-                        }
-                        Vec.push(sites, f.name + "\t" + L.showOpName(i.op) + "\t"
-                                          + reason + "\t" + origin + "\t" + callee)
-                        count(f, out, id, i.at)
-                    }
-                    None -> {}
-                }
-                Vec.push(out, i)
-            }
-            block.insts = out
-        }
-    }
-    sites
+	let sites = []
+	let giblets = Giblets.gibletModules()
+	for f in functions {
+		if Giblets.isGiblet(giblets, f) {
+			continue
+		}
+		let defs = Map.new()
+		for block in f.blocks {
+			for i in block.insts { Map.put(defs, Ssa.valueId(i.result), i.op) }
+		}
+		for block in f.blocks {
+			let out = []
+			for i in block.insts {
+				match L.allocatingOp(i.op) {
+					Some(what) -> {
+						let id = len(sites)
+						let reason = Map.getOr(f.reasons, Ssa.valueId(i.result), what)
+						let origin = match Map.get(f.origins, Ssa.valueId(i.result)) {
+							Some(s) -> s.file + ":" + showSpan(s)
+							None    -> "?"
+						}
+						let callee = match i.op {
+							Call(Indirect(c), _) -> describe(defs, c, 3)
+							_                    -> ""
+						}
+						Vec.push(
+							sites,
+							f.name
+								+ "\t"
+								+ L.showOpName(i.op)
+								+ "\t"
+								+ reason
+								+ "\t"
+								+ origin
+								+ "\t"
+								+ callee,
+						)
+						count(f, out, id, i.at)
+					}
+					None -> {}
+				}
+				Vec.push(out, i)
+			}
+			block.insts = out
+		}
+	}
+	sites
 }
 
 -- `counters[id + 1] += 1`, wrapping, as plain loads and stores: nothing here
 -- is a safepoint or a call, so the roots and frames are what they would be
 -- without it. Every instruction takes `at`, the counted allocation's position.
 fun count(f : Ssa.Func Low, out : Vec Low, id : Int, at : Int) -> Unit {
-    let word = Ssa.untraced(I64)
-    let base = Ssa.freshValue(f, Ssa.untraced(Ptr))
-    Vec.push(out, L.low(base, Address(AllocSites), at))
-    let offset = Ssa.freshValue(f, word)
-    Vec.push(out, L.low(offset, ConstInt(8 * (id + 1)), at))
-    let old = Ssa.freshValue(f, word)
-    Vec.push(out, L.low(old, PtrLoad(base, offset, I64), at))
-    let one = Ssa.freshValue(f, word)
-    Vec.push(out, L.low(one, ConstInt(1), at))
-    let new = Ssa.freshValue(f, word)
-    Vec.push(out, L.low(new, Bin(AddWrap, old, one), at))
-    let done = Ssa.freshValue(f, Ssa.untraced(Unit))
-    Vec.push(out, L.low(done, PtrStore(base, offset, new, I64), at))
+	let word = Ssa.untraced(I64)
+	let base = Ssa.freshValue(f, Ssa.untraced(Ptr))
+	Vec.push(out, L.low(base, Address(AllocSites), at))
+	let offset = Ssa.freshValue(f, word)
+	Vec.push(out, L.low(offset, ConstInt(8 * (id + 1)), at))
+	let old = Ssa.freshValue(f, word)
+	Vec.push(out, L.low(old, PtrLoad(base, offset, I64), at))
+	let one = Ssa.freshValue(f, word)
+	Vec.push(out, L.low(one, ConstInt(1), at))
+	let new = Ssa.freshValue(f, word)
+	Vec.push(out, L.low(new, Bin(AddWrap, old, one), at))
+	let done = Ssa.freshValue(f, Ssa.untraced(Unit))
+	Vec.push(out, L.low(done, PtrStore(base, offset, new, I64), at))
 }
 
 -- Where a value came from, a few definitions deep: enough to tell a method
 -- read out of a global dictionary from a closure passed in or built here.
 fun describe(defs : Map Int Op, v : Ssa.Value, depth : Int) -> String =
-    match Map.get(defs, Ssa.valueId(v)) {
-        None -> "a parameter"
-        Some(op) -> match op {
-            GlobalLoad(name) -> "global " + name
-            ObjectGet(inner, k) ->
-                if depth == 0 { "field " + Int.toString(k.index) + " of ..." }
-                else { "field " + Int.toString(k.index) + " of " + describe(defs, inner, depth - 1) }
-            ClosureNew(code, _) -> "closure of " + code
-            Call(_, _) -> "a call result"
-            other -> L.showOpName(other)
-        }
-    }
+	match Map.get(defs, Ssa.valueId(v)) {
+		None -> "a parameter"
+		Some(op) -> match op {
+			GlobalLoad(name) -> "global " + name
+			ObjectGet(inner, k) ->
+				if depth == 0 {
+					"field " + Int.toString(k.index) + " of ..."
+				} else {
+					"field " + Int.toString(k.index) + " of " + describe(defs, inner, depth - 1)
+				}
+			ClosureNew(code, _) -> "closure of " + code
+			Call(_, _)          -> "a call result"
+			other               -> L.showOpName(other)
+		}
+	}

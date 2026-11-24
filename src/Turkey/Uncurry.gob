@@ -35,55 +35,65 @@ type Worker = Worker { name : String, layers : Array Int }
 type Minter = Minter { table : Binders.Table, owner : Int, var count : Int }
 
 fun mint(m : Minter) -> Int {
-    m.count = m.count + 1
-    Binders.unrecorded(m.table, m.owner, m.count - 1)
+	m.count = m.count + 1
+	Binders.unrecorded(m.table, m.owner, m.count - 1)
 }
 
 fun program(p : CProgram, table : Binders.Table) -> CProgram {
-    let workers = Map.new()
-    let used = Set.new()
-    for b in Vec.append(p.dicts, p.binds) { Set.add(used, b.name) }
-    let made = Map.new()
-    let m = Minter {
-        table = table, owner = Binders.unrecordedOwner(table, "", "Turkey.Uncurry's wrappers"),
-        count = 0,
-    }
-    for b in Vec.append(p.dicts, p.binds) {
-        match split(b, used, m) {
-            Some((worker, wrapper, w)) -> {
-                Map.put(workers, b.name, w)
-                Map.put(made, b.name, (worker, wrapper))
-            }
-            None -> {}
-        }
-    }
-    if len(made) == 0 { return p }
-    CProgram {
-        dicts = rewriteAll(p.dicts, workers, made),
-        binds = rewriteAll(p.binds, workers, made),
-    }
+	let workers = Map.new()
+	let used = Set.new()
+	for b in Vec.append(p.dicts, p.binds) { Set.add(used, b.name) }
+	let made = Map.new()
+	let m = Minter {
+		table = table
+		owner = Binders.unrecordedOwner(table, "", "Turkey.Uncurry's wrappers")
+		count = 0
+	}
+	for b in Vec.append(p.dicts, p.binds) {
+		match split(b, used, m) {
+			Some((worker, wrapper, w)) -> {
+				Map.put(workers, b.name, w)
+				Map.put(made, b.name, (worker, wrapper))
+			}
+			None -> {}
+		}
+	}
+	if len(made) == 0 { return p }
+	CProgram {
+		dicts = rewriteAll(p.dicts, workers, made)
+		binds = rewriteAll(p.binds, workers, made)
+	}
 }
 
 -- The bindings in order, each split one preceded by its worker.
-fun rewriteAll(binds : Vec CBind, workers : Map String Worker,
-               made : Map String (CBind, CBind)) -> Vec CBind {
-    let out = []
-    for b in binds {
-        match Map.get(made, b.name) {
-            Some((worker, wrapper)) -> {
-                Vec.push(out, withValue(worker, rewrite(workers, worker.value)))
-                Vec.push(out, withValue(wrapper, rewrite(workers, wrapper.value)))
-            }
-            None -> Vec.push(out, withValue(b, rewrite(workers, b.value)))
-        }
-    }
-    out
+fun rewriteAll(
+	binds : Vec CBind,
+	workers : Map String Worker,
+	made : Map String (CBind, CBind),
+) -> Vec CBind {
+	let out = []
+	for b in binds {
+		match Map.get(made, b.name) {
+			Some((worker, wrapper)) -> {
+				Vec.push(out, withValue(worker, rewrite(workers, worker.value)))
+				Vec.push(out, withValue(wrapper, rewrite(workers, wrapper.value)))
+			}
+			None -> Vec.push(out, withValue(b, rewrite(workers, b.value)))
+		}
+	}
+	out
 }
 
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
-    name = b.name, id = b.id, ty = b.ty, binders = b.binders, value = value,
-    span = b.span, mutable = b.mutable, module_ = b.module_,
-    layouts = b.layouts,
+	name    = b.name
+	id      = b.id
+	ty      = b.ty
+	binders = b.binders
+	value   = value
+	span    = b.span
+	mutable = b.mutable
+	module_ = b.module_
+	layouts = b.layouts
 }
 
 -- A binding `fun(dicts) = fun(cos) = fun(params) = body`, as its worker and its
@@ -94,158 +104,182 @@ fun withValue(b : CBind, value : Core) -> CBind = CBind {
 -- are erased with their layers after the last check, which leaves no closure
 -- to remove.
 fun split(b : CBind, used : Set.Set String, m : Minter) -> Option (CBind, CBind, Worker) {
-    if b.mutable { return None }
-    let layers = Vec.new(2)
-    var value = b.value
-    loop {
-        match value.kind {
-            CLam(ps, body, name) -> {
-                let evidence = len(ps) > 0 && Iter.all(ps, fun(p) = isEvidence(p.ty))
-                let more = match body.kind {
-                    CLam(_, _, _) -> True
-                    _ -> False
-                }
-                if !evidence || !more { break }
-                Vec.push(layers, (ps, name, value.ty))
-                value = body
-            }
-            _ -> return None
-        }
-    }
-    if len(layers) == 0 { return None }
-    if !Iter.any(layers, fun((ps, _, _)) = Iter.any(ps, fun(p) = isDictionary(p.ty))) {
-        return None
-    }
-    match value.kind {
-        CLam(params, body, innerName) ->
-            splitAt(b, used, m, Vec.toArray(layers), value, params, body, innerName)
-        _ -> None
-    }
+	if b.mutable { return None }
+	let layers = Vec.new(2)
+	var value = b.value
+	loop {
+		match value.kind {
+			CLam(ps, body, name) -> {
+				let evidence = len(ps) > 0 && Iter.all(ps, fun(p) = isEvidence(p.ty))
+				let more = match body.kind {
+					CLam(_, _, _) -> True
+					_             -> False
+				}
+				if !evidence || !more { break }
+				Vec.push(layers, (ps, name, value.ty))
+				value = body
+			}
+			_ -> return None
+		}
+	}
+	if len(layers) == 0 { return None }
+	if !Iter.any(layers, fun((ps, _, _)) = Iter.any(ps, fun(p) = isDictionary(p.ty))) {
+		return None
+	}
+	match value.kind {
+		CLam(params, body, innerName) ->
+			splitAt(b, used, m, Vec.toArray(layers), value, params, body, innerName)
+		_ -> None
+	}
 }
 
-fun splitAt(b : CBind, used : Set.Set String, m : Minter,
-            layers : Array (Array CParam, String, Ty.Type), inner : Core,
-            params : Array CParam, body : Core,
-            innerName : String) -> Option (CBind, CBind, Worker) {
-    -- The evidence and the parameters become one list, which binds no id
-    -- twice, because no id is bound twice in the program.
-    let flatTy = match flatten(b.ty, len(layers)) {
-        Some(t) -> t
-        None -> return None
-    }
-    var name = b.name + "%worker"
-    while Set.contains(used, name) { name = name + "~" }
-    Set.add(used, name)
-    var all = []
-    for (ps, _, _) in layers { all = Array.append(all, ps) }
-    let worker = CBind {
-        name = name, id = noId, ty = flatTy, binders = b.binders,
-        value = mkCore(flatTy, b.value.span, CLam(Array.append(all, params), body, innerName)),
-        span = b.span, mutable = False, module_ = b.module_,
-        layouts = b.layouts,
-    }
-    let head = mkCore(flatTy, b.value.span, CVar(BySpelling(name)))
-    let applied = if len(b.binders) == 0 { head } else {
-        mkCore(flatTy, b.value.span, CTyApp(head, Array.map(b.binders, TVar)))
-    }
-    -- The worker keeps the original's parameters, and the wrapper binds fresh
-    -- ones, so that no id is bound in both.
-    let own = Array.map(layers, fun((ps, _, _)) = Array.map(ps, renewed(m, _)))
-    let ownParams = Array.map(params, renewed(m, _))
-    var ownAll = []
-    for ps in own { ownAll = Array.append(ownAll, ps) }
-    let args = Array.map(Array.append(ownAll, ownParams), forwarded(_, b.value.span))
-    let call = mkCore(body.ty, b.value.span, CApp(applied, args))
-    var wrapped = mkCore(inner.ty, inner.span, CLam(ownParams, call, innerName))
-    for var k = len(layers) - 1; k >= 0; k = k - 1 {
-        let (_, layerName, layerTy) = layers[k]
-        wrapped = mkCore(layerTy, b.value.span, CLam(own[k], wrapped, layerName))
-    }
-    let wrapper = withValue(b, wrapped)
-    let counts = Array.append(Array.map(layers, fun((ps, _, _)) = len(ps)), [len(params)])
-    Some((worker, wrapper, Worker { name = name, layers = counts }))
+fun splitAt(
+	b : CBind,
+	used : Set.Set String,
+	m : Minter,
+	layers : Array (Array CParam, String, Ty.Type),
+	inner : Core,
+	params : Array CParam,
+	body : Core,
+	innerName : String,
+) -> Option (CBind, CBind, Worker) {
+	-- The evidence and the parameters become one list, which binds no id
+	-- twice, because no id is bound twice in the program.
+	let flatTy = match flatten(b.ty, len(layers)) {
+		Some(t) -> t
+		None    -> return None
+	}
+	var name = b.name + "%worker"
+	while Set.contains(used, name) { name = name + "~" }
+	Set.add(used, name)
+	var all = []
+	for (ps, _, _) in layers { all = Array.append(all, ps) }
+	let worker = CBind {
+		name    = name
+		id      = noId
+		ty      = flatTy
+		binders = b.binders
+		value   = mkCore(flatTy, b.value.span, CLam(Array.append(all, params), body, innerName))
+		span    = b.span
+		mutable = False
+		module_ = b.module_
+		layouts = b.layouts
+	}
+	let head = mkCore(flatTy, b.value.span, CVar(BySpelling(name)))
+	let applied = if len(b.binders) == 0 {
+		head
+	} else {
+		mkCore(flatTy, b.value.span, CTyApp(head, Array.map(b.binders, TVar)))
+	}
+	-- The worker keeps the original's parameters, and the wrapper binds fresh
+	-- ones, so that no id is bound in both.
+	let own = Array.map(layers, fun((ps, _, _)) = Array.map(ps, renewed(m, _)))
+	let ownParams = Array.map(params, renewed(m, _))
+	var ownAll = []
+	for ps in own { ownAll = Array.append(ownAll, ps) }
+	let args = Array.map(Array.append(ownAll, ownParams), forwarded(_, b.value.span))
+	let call = mkCore(body.ty, b.value.span, CApp(applied, args))
+	var wrapped = mkCore(inner.ty, inner.span, CLam(ownParams, call, innerName))
+	for var k = len(layers) - 1; k >= 0; k = k - 1 {
+		let (_, layerName, layerTy) = layers[k]
+		wrapped = mkCore(layerTy, b.value.span, CLam(own[k], wrapped, layerName))
+	}
+	let wrapper = withValue(b, wrapped)
+	let counts = Array.append(Array.map(layers, fun((ps, _, _)) = len(ps)), [len(params)])
+	Some((worker, wrapper, Worker { name = name, layers = counts }))
 }
 
 -- `p` with a fresh id.
 fun renewed(m : Minter, p : CParam) -> CParam {
-    let CParam { name, id = _, ty } = p
-    CParam { name = name, id = mint(m), ty = ty }
+	let CParam { name, id = _, ty } = p
+	CParam { name = name, id = mint(m), ty = ty }
 }
 
 -- `fun(ds) -> fun(cs) -> fun(xs) -> r`, with `layers` layers of evidence, as
 -- `fun(ds ++ cs ++ xs) -> r`.
 fun flatten(t : Ty.Type, layers : Int) -> Option Ty.Type = match Ty.prune(t) {
-    TFun(ds, inner) -> if layers == 0 { Some(TFun(ds, inner)) } else {
-        match flatten(inner, layers - 1)? {
-            TFun(xs, r) -> Some(TFun(Array.append(ds, xs), r))
-            _ -> None
-        }
-    }
-    _ -> None
+	TFun(ds, inner) -> if layers == 0 {
+		Some(TFun(ds, inner))
+	} else {
+		match flatten(inner, layers - 1)? {
+			TFun(xs, r) -> Some(TFun(Array.append(ds, xs), r))
+			_           -> None
+		}
+	}
+	_ -> None
 }
 
 -- Every call that supplies a split binding's evidence and parameters, as one
 -- call to its worker.
 fun rewrite(workers : Map String Worker, e : Core) -> Core {
-    match e.kind {
-        CApp(_, _) -> {
-            -- The argument lists from the head out, and the head.
-            let groups = Vec.new(3)
-            var head = e
-            loop {
-                match head.kind {
-                    CApp(fn, args) -> {
-                        Vec.push(groups, args)
-                        head = fn
-                    }
-                    _ -> break
-                }
-            }
-            let outward = Vec.toArray(Vec.reverse(groups))
-            if let Some(worker) = direct(workers, head, outward) {
-                var all = []
-                for g in outward { all = Array.append(all, g) }
-                return mkCore(e.ty, e.span, CApp(worker, Array.map(all, rewrite(workers, _))))
-            }
-        }
-        _ -> {}
-    }
-    mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
-        expr = fun(x) = rewrite(workers, x),
-        type_ = fun(t) = t,
-        bind = fun(b) = withValue(b, rewrite(workers, b.value)),
-    }))
+	match e.kind {
+		CApp(_, _) -> {
+			-- The argument lists from the head out, and the head.
+			let groups = Vec.new(3)
+			var head = e
+			loop {
+				match head.kind {
+					CApp(fn, args) -> {
+						Vec.push(groups, args)
+						head = fn
+					}
+					_ -> break
+				}
+			}
+			let outward = Vec.toArray(Vec.reverse(groups))
+			if let Some(worker) = direct(workers, head, outward) {
+				var all = []
+				for g in outward { all = Array.append(all, g) }
+				return mkCore(e.ty, e.span, CApp(worker, Array.map(all, rewrite(workers, _))))
+			}
+		}
+		_ -> {}
+	}
+	mkCore(
+		e.ty,
+		e.span,
+		mapKind(e.kind, Mapper {
+			expr  = fun(x) = rewrite(workers, x)
+			type_ = fun(t) = t
+			bind  = fun(b) = withValue(b, rewrite(workers, b.value))
+		}),
+	)
 }
 
 -- The worker a head reaches, applied to the same types, when the call supplies
 -- exactly what the worker takes, layer by layer.
-fun direct(workers : Map String Worker, head : Core,
-           groups : Array (Array Core)) -> Option Core = match head.kind {
-    CVar(BySpelling(n)) -> directTo(workers, head, n, None, groups)
-    CTyApp(inner, ts) -> match inner.kind {
-        CVar(BySpelling(n)) -> directTo(workers, head, n, Some(ts), groups)
-        _ -> None
-    }
-    _ -> None
-}
+fun direct(workers : Map String Worker, head : Core, groups : Array (Array Core)) -> Option Core =
+	match head.kind {
+		CVar(BySpelling(n)) -> directTo(workers, head, n, None, groups)
+		CTyApp(inner, ts) -> match inner.kind {
+			CVar(BySpelling(n)) -> directTo(workers, head, n, Some(ts), groups)
+			_                   -> None
+		}
+		_ -> None
+	}
 
-fun directTo(workers : Map String Worker, head : Core, name : String,
-             types : Option (Array Ty.Type), groups : Array (Array Core)) -> Option Core {
-    let w = match Map.get(workers, name) {
-        Some(found) -> found
-        None -> return None
-    }
-    if len(w.layers) != len(groups) { return None }
-    for var i = 0; i < len(groups); i = i + 1 {
-        if len(groups[i]) != w.layers[i] { return None }
-    }
-    let flatTy = match flatten(head.ty, len(groups) - 1) {
-        Some(t) -> t
-        None -> return None
-    }
-    let target = mkCore(flatTy, head.span, CVar(BySpelling(w.name)))
-    match types {
-        Some(ts) -> Some(mkCore(flatTy, head.span, CTyApp(target, ts)))
-        None -> Some(target)
-    }
+fun directTo(
+	workers : Map String Worker,
+	head : Core,
+	name : String,
+	types : Option (Array Ty.Type),
+	groups : Array (Array Core),
+) -> Option Core {
+	let w = match Map.get(workers, name) {
+		Some(found) -> found
+		None        -> return None
+	}
+	if len(w.layers) != len(groups) { return None }
+	for var i = 0; i < len(groups); i = i + 1 {
+		if len(groups[i]) != w.layers[i] { return None }
+	}
+	let flatTy = match flatten(head.ty, len(groups) - 1) {
+		Some(t) -> t
+		None    -> return None
+	}
+	let target = mkCore(flatTy, head.span, CVar(BySpelling(w.name)))
+	match types {
+		Some(ts) -> Some(mkCore(flatTy, head.span, CTyApp(target, ts)))
+		None     -> Some(target)
+	}
 }

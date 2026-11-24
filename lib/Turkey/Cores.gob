@@ -30,13 +30,13 @@ import Turkey.Ptr as Ptr
 
 --- The cores worth a worker each, and at least one.
 fun count() -> Int {
-    let n = match Target.os {
-        Darwin -> darwinCores()
-        Linux -> linuxCores()
-        -- A wasm program has one thread, whatever the machine has.
-        Wasi -> 1
-    }
-    if n < 1 { 1 } else { n }
+	let n = match Target.os {
+		Darwin -> darwinCores()
+		Linux  -> linuxCores()
+		-- A wasm program has one thread, whatever the machine has.
+		Wasi -> 1
+	}
+	if n < 1 { 1 } else { n }
 }
 
 -- -- Darwin -------------------------------------------------------------------------------
@@ -46,22 +46,24 @@ fun count() -> Int {
 -- collection's mark. A Mac without performance levels says so by having no
 -- `hw.perflevel0`, and has its physical cores counted instead.
 fun darwinCores() -> Int {
-    let perf = sysctlInt(Prim.cString("hw.perflevel0.physicalcpu"))
-    if perf > 0 { perf } else { sysctlInt(Prim.cString("hw.physicalcpu")) }
+	let perf = sysctlInt(Prim.cString("hw.perflevel0.physicalcpu"))
+	if perf > 0 { perf } else { sysctlInt(Prim.cString("hw.physicalcpu")) }
 }
 
 -- A 32-bit `sysctl` value, or 0 if there is none.
 fun sysctlInt(name : Ptr) -> Int {
-    let buffer = Os.malloc(16)
-    if Ptr.isNull(buffer) { return 0 }
-    Ptr.store(buffer, 0, 0)
-    Ptr.store(buffer, 8, 4)
-    let status = Libc.sysctlbyname(name, buffer, Ptr.add(buffer, 8), Ptr.null(), 0)
-    let value = if status & 0xFFFF_FFFF == 0 {
-        Ptr.load32(buffer, 0)
-    } else { 0 }
-    Os.free(buffer)
-    value
+	let buffer = Os.malloc(16)
+	if Ptr.isNull(buffer) { return 0 }
+	Ptr.store(buffer, 0, 0)
+	Ptr.store(buffer, 8, 4)
+	let status = Libc.sysctlbyname(name, buffer, Ptr.add(buffer, 8), Ptr.null(), 0)
+	let value = if status & 0xFFFF_FFFF == 0 {
+		Ptr.load32(buffer, 0)
+	} else {
+		0
+	}
+	Os.free(buffer)
+	value
 }
 
 -- -- Linux --------------------------------------------------------------------------------
@@ -85,11 +87,11 @@ fun sysctlInt(name : Ptr) -> Int {
 -- limit on a parent is not seen; a container usually cannot see its parents.
 -- Cgroup v1's `cpu.cfs_quota_us` is not read either.
 fun linuxCores() -> Int {
-    let cpus = affinityCount()
-    let limit = cgroupLimit()
-    if limit == 0 { return cpus }
-    let floored = if limit < 2 { 2 } else { limit }
-    if floored < cpus { floored } else { cpus }
+	let cpus = affinityCount()
+	let limit = cgroupLimit()
+	if limit == 0 { return cpus }
+	let floored = if limit < 2 { 2 } else { limit }
+	if floored < cpus { floored } else { cpus }
 }
 
 -- Bytes in the affinity mask asked for: room for 8192 CPUs. The kernel
@@ -102,23 +104,23 @@ let maskBytes : Int = 1024
 -- The workers inherit the mask from the program's thread, so its count is
 -- theirs.
 fun affinityCount() -> Int {
-    let mask = Os.malloc(maskBytes)
-    if Ptr.isNull(mask) { return onlineCpus() }
-    Memory.fill(mask, maskBytes, 0)
-    var n = 0
-    if Libc.schedGetaffinity(0, maskBytes, mask) & 0xFFFF_FFFF == 0 {
-        var at = 0
-        while at < maskBytes {
-            var bits = Byte.toInt(Ptr.load(mask, at))
-            while bits != 0 {
-                bits = bits & (bits - 1)
-                n = n + 1
-            }
-            at = at + 1
-        }
-    }
-    Os.free(mask)
-    if n > 0 { n } else { onlineCpus() }
+	let mask = Os.malloc(maskBytes)
+	if Ptr.isNull(mask) { return onlineCpus() }
+	Memory.fill(mask, maskBytes, 0)
+	var n = 0
+	if Libc.schedGetaffinity(0, maskBytes, mask) & 0xFFFF_FFFF == 0 {
+		var at = 0
+		while at < maskBytes {
+			var bits = Byte.toInt(Ptr.load(mask, at))
+			while bits != 0 {
+				bits = bits & (bits - 1)
+				n = n + 1
+			}
+			at = at + 1
+		}
+	}
+	Os.free(mask)
+	if n > 0 { n } else { onlineCpus() }
 }
 
 -- `_SC_NPROCESSORS_ONLN`.
@@ -137,62 +139,62 @@ fun onlineCpus() -> Int = Libc.sysconf(84)
 -- namespace the path is `/` and so is the root; without one, the container's
 -- cgroup is mounted as the root, and the path names it too.
 fun cgroupLimit() -> Int {
-    let given = Os.getenv(Prim.cString("TURKEY_TEST_CGROUP_ROOT"))
-    let root = if Ptr.isNull(given) { Prim.cString("") } else { given }
-    let membership = slurpUnder(root, Prim.cString("/proc/self/cgroup"))
-    if Ptr.isNull(membership) { return 0 }
-    let mounts = slurpUnder(root, Prim.cString("/proc/self/mountinfo"))
-    if Ptr.isNull(mounts) {
-        Os.free(membership)
-        return 0
-    }
-    -- A v2 membership is the line with hierarchy 0 and no controllers.
-    let path = lineAfter(membership, Prim.cString("0::"))
-    let mountRoot = cgroup2Mount(mounts)
-    var limit = 0
-    if !Ptr.isNull(path) && !Ptr.isNull(mountRoot) {
-        let mount = Ptr.add(mountRoot, Os.strlen(mountRoot) + 1)
-        let file = join4(root, mount, below(path, mountRoot), Prim.cString("/cpu.max"))
-        if !Ptr.isNull(file) {
-            let text = slurp(file)
-            if !Ptr.isNull(text) {
-                limit = cpuMaxCpus(text)
-                Os.free(text)
-            }
-            Os.free(file)
-        }
-    }
-    Os.free(mounts)
-    Os.free(membership)
-    limit
+	let given = Os.getenv(Prim.cString("TURKEY_TEST_CGROUP_ROOT"))
+	let root = if Ptr.isNull(given) { Prim.cString("") } else { given }
+	let membership = slurpUnder(root, Prim.cString("/proc/self/cgroup"))
+	if Ptr.isNull(membership) { return 0 }
+	let mounts = slurpUnder(root, Prim.cString("/proc/self/mountinfo"))
+	if Ptr.isNull(mounts) {
+		Os.free(membership)
+		return 0
+	}
+	-- A v2 membership is the line with hierarchy 0 and no controllers.
+	let path = lineAfter(membership, Prim.cString("0::"))
+	let mountRoot = cgroup2Mount(mounts)
+	var limit = 0
+	if !Ptr.isNull(path) && !Ptr.isNull(mountRoot) {
+		let mount = Ptr.add(mountRoot, Os.strlen(mountRoot) + 1)
+		let file = join4(root, mount, below(path, mountRoot), Prim.cString("/cpu.max"))
+		if !Ptr.isNull(file) {
+			let text = slurp(file)
+			if !Ptr.isNull(text) {
+				limit = cpuMaxCpus(text)
+				Os.free(text)
+			}
+			Os.free(file)
+		}
+	}
+	Os.free(mounts)
+	Os.free(membership)
+	limit
 }
 
 -- `cpu.max`'s quota over its period, rounded up, or 0 for no limit. The file
 -- is the quota and the period in microseconds, or `max` for the quota when
 -- there is no limit: `max 100000`, `150000 100000`.
 fun cpuMaxCpus(text : Ptr) -> Int {
-    let quota = decimal(text)
-    if quota <= 0 { return 0 }
-    let space = Os.memchr(text, 32, Os.strlen(text))
-    if Ptr.isNull(space) { return 0 }
-    let period = decimal(Ptr.add(space, 1))
-    if period <= 0 { return 0 }
-    (quota + period - 1) / period
+	let quota = decimal(text)
+	if quota <= 0 { return 0 }
+	let space = Os.memchr(text, 32, Os.strlen(text))
+	if Ptr.isNull(space) { return 0 }
+	let period = decimal(Ptr.add(space, 1))
+	if period <= 0 { return 0 }
+	(quota + period - 1) / period
 }
 
 -- The decimal number `text` begins with, or -1 if it begins with no digit or
 -- with more than 18, which would not be a limit the kernel sets.
 fun decimal(text : Ptr) -> Int {
-    var n = 0
-    var at = 0
-    while True {
-        let digit = byteAt(text, at) - 48
-        if digit < 0 || digit > 9 { break }
-        if at == 18 { return -1 }
-        n = n * 10 + digit
-        at = at + 1
-    }
-    if at == 0 { -1 } else { n }
+	var n = 0
+	var at = 0
+	while True {
+		let digit = byteAt(text, at) - 48
+		if digit < 0 || digit > 9 { break }
+		if at == 18 { return -1 }
+		n = n * 10 + digit
+		at = at + 1
+	}
+	if at == 0 { -1 } else { n }
 }
 
 -- The root of the first cgroup2 mount in `mounts`, the text of
@@ -204,40 +206,39 @@ fun decimal(text : Ptr) -> Int {
 -- file system's type. Paths have their spaces escaped, so ` - ` is the
 -- separator wherever it appears.
 fun cgroup2Mount(mounts : Ptr) -> Ptr {
-    var line = mounts
-    while byteAt(line, 0) != 0 {
-        let next = cutLine(line)
-        let separator = find(line, Prim.cString(" - "))
-        if !Ptr.isNull(separator) && startsWith(Ptr.add(separator, 3),
-                                                    Prim.cString("cgroup2 ")) {
-            let mountRoot = cutField(cutField(cutField(line)))
-            let _ = cutField(cutField(mountRoot))
-            return mountRoot
-        }
-        line = next
-    }
-    Ptr.null()
+	var line = mounts
+	while byteAt(line, 0) != 0 {
+		let next = cutLine(line)
+		let separator = find(line, Prim.cString(" - "))
+		if !Ptr.isNull(separator) && startsWith(Ptr.add(separator, 3), Prim.cString("cgroup2 ")) {
+			let mountRoot = cutField(cutField(cutField(line)))
+			let _ = cutField(cutField(mountRoot))
+			return mountRoot
+		}
+		line = next
+	}
+	Ptr.null()
 }
 
 -- `path` with `mountRoot` taken off its front, if it is there as a whole
 -- number of components; else `path`.
 fun below(path : Ptr, mountRoot : Ptr) -> Ptr {
-    let n = Os.strlen(mountRoot)
-    if n <= 1 || !startsWith(path, mountRoot) { return path }
-    let after = byteAt(path, n)
-    if after == 0 || after == 47 { Ptr.add(path, n) } else { path }
+	let n = Os.strlen(mountRoot)
+	if n <= 1 || !startsWith(path, mountRoot) { return path }
+	let after = byteAt(path, n)
+	if after == 0 || after == 47 { Ptr.add(path, n) } else { path }
 }
 
 -- The rest of the first line of `text` that begins with `prefix`, cut off at
 -- its end; or null. Cuts `text` into lines to look.
 fun lineAfter(text : Ptr, prefix : Ptr) -> Ptr {
-    var line = text
-    while byteAt(line, 0) != 0 {
-        let next = cutLine(line)
-        if startsWith(line, prefix) { return Ptr.add(line, Os.strlen(prefix)) }
-        line = next
-    }
-    Ptr.null()
+	var line = text
+	while byteAt(line, 0) != 0 {
+		let next = cutLine(line)
+		if startsWith(line, prefix) { return Ptr.add(line, Os.strlen(prefix)) }
+		line = next
+	}
+	Ptr.null()
 }
 
 -- End the line `line` begins with a NUL in place of its newline, and return
@@ -249,85 +250,85 @@ fun cutLine(line : Ptr) -> Ptr = cutAt(line, 10)
 fun cutField(field : Ptr) -> Ptr = cutAt(field, 32)
 
 fun cutAt(text : Ptr, byte : Int) -> Ptr {
-    let length = Os.strlen(text)
-    let at = Os.memchr(text, byte, length)
-    if Ptr.isNull(at) { return Ptr.add(text, length) }
-    Ptr.store(at, 0, Byte.truncate(0))
-    Ptr.add(at, 1)
+	let length = Os.strlen(text)
+	let at = Os.memchr(text, byte, length)
+	if Ptr.isNull(at) { return Ptr.add(text, length) }
+	Ptr.store(at, 0, Byte.truncate(0))
+	Ptr.add(at, 1)
 }
 
 -- Where `needle` first appears in `text`, or null.
 fun find(text : Ptr, needle : Ptr) -> Ptr {
-    var at = text
-    while byteAt(at, 0) != 0 {
-        if startsWith(at, needle) { return at }
-        at = Ptr.add(at, 1)
-    }
-    Ptr.null()
+	var at = text
+	while byteAt(at, 0) != 0 {
+		if startsWith(at, needle) { return at }
+		at = Ptr.add(at, 1)
+	}
+	Ptr.null()
 }
 
 fun startsWith(text : Ptr, prefix : Ptr) -> Bool {
-    var at = 0
-    while byteAt(prefix, at) != 0 {
-        if byteAt(text, at) != byteAt(prefix, at) { return False }
-        at = at + 1
-    }
-    True
+	var at = 0
+	while byteAt(prefix, at) != 0 {
+		if byteAt(text, at) != byteAt(prefix, at) { return False }
+		at = at + 1
+	}
+	True
 }
 
 fun byteAt(text : Ptr, at : Int) -> Int = Byte.toInt(Ptr.load(text, at))
 
 -- `a`, `b`, `c` and `d` one after another, as a string from `malloc`; or null.
 fun join4(a : Ptr, b : Ptr, c : Ptr, d : Ptr) -> Ptr {
-    let la = Os.strlen(a)
-    let lb = Os.strlen(b)
-    let lc = Os.strlen(c)
-    let ld = Os.strlen(d)
-    let joined = Os.malloc(la + lb + lc + ld + 1)
-    if Ptr.isNull(joined) { return joined }
-    Memory.copy(joined, a, la)
-    Memory.copy(Ptr.add(joined, la), b, lb)
-    Memory.copy(Ptr.add(joined, la + lb), c, lc)
-    Memory.copy(Ptr.add(joined, la + lb + lc), d, ld + 1)
-    joined
+	let la = Os.strlen(a)
+	let lb = Os.strlen(b)
+	let lc = Os.strlen(c)
+	let ld = Os.strlen(d)
+	let joined = Os.malloc(la + lb + lc + ld + 1)
+	if Ptr.isNull(joined) { return joined }
+	Memory.copy(joined, a, la)
+	Memory.copy(Ptr.add(joined, la), b, lb)
+	Memory.copy(Ptr.add(joined, la + lb), c, lc)
+	Memory.copy(Ptr.add(joined, la + lb + lc), d, ld + 1)
+	joined
 }
 
 -- `slurp` of `root` and `path` joined.
 fun slurpUnder(root : Ptr, path : Ptr) -> Ptr {
-    let file = join4(root, path, Prim.cString(""), Prim.cString(""))
-    if Ptr.isNull(file) { return file }
-    let text = slurp(file)
-    Os.free(file)
-    text
+	let file = join4(root, path, Prim.cString(""), Prim.cString(""))
+	if Ptr.isNull(file) { return file }
+	let text = slurp(file)
+	Os.free(file)
+	text
 }
 
 -- The whole of the file at `path`, as a string from `malloc`; or null if it
 -- cannot be read. The files read here are generated by the kernel, and have no
 -- NUL in them.
 fun slurp(path : Ptr) -> Ptr {
-    let fd = Sys.cInt(Os.open(path, Sys.readOnly | Sys.closeOnExec(), 0))
-    if fd < 0 { return Ptr.null() }
-    var size = 4096
-    var text = Os.malloc(size)
-    var length = 0
-    while !Ptr.isNull(text) {
-        if length + 1 == size {
-            size = 2 * size
-            let grown = Os.realloc(text, size)
-            if Ptr.isNull(grown) { Os.free(text) }
-            text = grown
-        } else {
-            let n = Os.read(fd, Ptr.add(text, length), size - 1 - length)
-            if n == 0 { break }
-            if n < 0 {
-                Os.free(text)
-                text = Ptr.null()
-            } else {
-                length = length + n
-            }
-        }
-    }
-    let _ = Os.close(fd)
-    if !Ptr.isNull(text) { Ptr.store(text, length, Byte.truncate(0)) }
-    text
+	let fd = Sys.cInt(Os.open(path, Sys.readOnly | Sys.closeOnExec(), 0))
+	if fd < 0 { return Ptr.null() }
+	var size = 4096
+	var text = Os.malloc(size)
+	var length = 0
+	while !Ptr.isNull(text) {
+		if length + 1 == size {
+			size = 2 * size
+			let grown = Os.realloc(text, size)
+			if Ptr.isNull(grown) { Os.free(text) }
+			text = grown
+		} else {
+			let n = Os.read(fd, Ptr.add(text, length), size - 1 - length)
+			if n == 0 { break }
+			if n < 0 {
+				Os.free(text)
+				text = Ptr.null()
+			} else {
+				length = length + n
+			}
+		}
+	}
+	let _ = Os.close(fd)
+	if !Ptr.isNull(text) { Ptr.store(text, length, Byte.truncate(0)) }
+	text
 }

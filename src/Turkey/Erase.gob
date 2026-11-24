@@ -58,40 +58,43 @@ import Turkey.Types (TApp, TFun, TTuple)
 -- this pass reads a local's record. One thread erases the bindings in program
 -- order, so the ids are deterministic.
 type Eraser = Eraser {
-    table     : Binders.Table,
-    owner     : Int,
-    var count : Int,
-    classes   : ClassTable,
-    var inert : Inert.Inert,
+	table     : Binders.Table
+	owner     : Int
+	var count : Int
+	classes   : ClassTable
+	var inert : Inert.Inert
 }
 
 fun mint(x : Eraser) -> Int {
-    x.count = x.count + 1
-    Binders.unrecorded(x.table, x.owner, x.count - 1)
+	x.count = x.count + 1
+	Binders.unrecorded(x.table, x.owner, x.count - 1)
 }
 
 --- Returns `p` with every coercion erased, and every type rewritten by the
 --- equalities the coercions around it granted.
 fun program(p : CProgram, table : Binders.Table, classes : ClassTable) -> CProgram {
-    let x = Eraser {
-        table = table, owner = Binders.unrecordedOwner(table, "", "Turkey.Erase's parameters"),
-        count = 0, classes = classes, inert = Inert.empty(classes),
-    }
-    let out = CProgram {
-        dicts = Vec.map(p.dicts, eraseBind(x, _)),
-        binds = Vec.map(p.binds, eraseBind(x, _)),
-    }
-    classes.erased = True
-    out
+	let x = Eraser {
+		table   = table
+		owner   = Binders.unrecordedOwner(table, "", "Turkey.Erase's parameters")
+		count   = 0
+		classes = classes
+		inert   = Inert.empty(classes)
+	}
+	let out = CProgram {
+		dicts = Vec.map(p.dicts, eraseBind(x, _))
+		binds = Vec.map(p.binds, eraseBind(x, _))
+	}
+	classes.erased = True
+	out
 }
 
 -- Returns `x`'s equalities with those `evidence` grants added. One that can
 -- never hold is dropped: nothing can apply the lambda that binds it.
 fun granting(x : Eraser, evidence : Vec Ty.Pred) -> Inert.Inert {
-    let givens = Inert.granted(x.classes, Vec.toArray(Vec.map(evidence, Inert.given)))
-    if len(givens) == 0 { return x.inert }
-    let (out, _) = Inert.extend(x.inert, givens)
-    out
+	let givens = Inert.granted(x.classes, Vec.toArray(Vec.map(evidence, Inert.given)))
+	if len(givens) == 0 { return x.inert }
+	let (out, _) = Inert.extend(x.inert, givens)
+	out
 }
 
 -- `t` erased and rewritten by the equalities in scope.
@@ -100,118 +103,159 @@ fun typeIn(x : Eraser, t : Ty.Type) -> Ty.Type = Inert.rewrite(x.inert, eraseTyp
 -- The type of a binder whose value is `value`, under the coercions at the
 -- value's top too.
 fun binderType(x : Eraser, t : Ty.Type, value : Core) -> Ty.Type {
-    let outside = x.inert
-    x.inert = granting(x, outerEvidence(value))
-    let out = typeIn(x, t)
-    x.inert = outside
-    out
+	let outside = x.inert
+	x.inert = granting(x, outerEvidence(value))
+	let out = typeIn(x, t)
+	x.inert = outside
+	out
 }
 
 fun eraseBind(x : Eraser, b : CBind) -> CBind {
-    let CBind { name, id, ty, binders, value, span, mutable, module_, layouts } = b
-    CBind {
-        name = name, id = id, ty = binderType(x, ty, value), binders = binders,
-        value = erase(x, value), span = span, mutable = mutable, module_ = module_,
-        layouts = layouts,
-    }
+	let CBind { name, id, ty, binders, value, span, mutable, module_, layouts } = b
+	CBind {
+		name    = name
+		id      = id
+		ty      = binderType(x, ty, value)
+		binders = binders
+		value   = erase(x, value)
+		span    = span
+		mutable = mutable
+		module_ = module_
+		layouts = layouts
+	}
 }
 
 --- Returns `t` with every coercion parameter removed from the function types
 --- in it, and every function type whose parameters were all coercions replaced
 --- by its result.
 fun eraseType(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
-    TFun(params, ret) -> {
-        let kept = Array.filter(params, fun(p) = !isCoercion(p))
-        if len(params) > 0 && len(kept) == 0 { eraseType(ret) }
-        else { TFun(Array.map(kept, eraseType), eraseType(ret)) }
-    }
-    TApp(fn, arg, k) -> TApp(eraseType(fn), eraseType(arg), k)
-    TTuple(elems) -> TTuple(Array.map(elems, eraseType))
-    other -> other
+	TFun(params, ret) -> {
+		let kept = Array.filter(params, fun(p) = !isCoercion(p))
+		if len(params) > 0 && len(kept) == 0 {
+			eraseType(ret)
+		} else {
+			TFun(Array.map(kept, eraseType), eraseType(ret))
+		}
+	}
+	TApp(fn, arg, k) -> TApp(eraseType(fn), eraseType(arg), k)
+	TTuple(elems)    -> TTuple(Array.map(elems, eraseType))
+	other            -> other
 }
 
 fun erase(x : Eraser, e : Core) -> Core = match e.kind {
-    CLam(params, body, name) -> {
-        let outside = x.inert
-        x.inert = granting(x, evidencePreds(params))
-        let kept = Array.filter(params, fun(p) = !isCoercion(p.ty))
-        let out = if len(params) > 0 && len(kept) == 0 { delayed(x, erase(x, body)) } else {
-            mkCore(typeIn(x, e.ty), e.span,
-                   CLam(Array.map(kept, eraseParam(x, _)), erase(x, body), name))
-        }
-        x.inert = outside
-        out
-    }
-    CApp(fn, args) -> {
-        let kept = Array.filter(args, fun(a) = !isCoercion(a.ty))
-        if len(args) > 0 && len(kept) == 0 { return erase(x, fn) }
-        mkCore(typeIn(x, e.ty), e.span, CApp(erase(x, fn), Array.map(kept, erase(x, _))))
-    }
-    -- An existential arm's dictionaries grant their equality superclasses to
-    -- its body, as a lambda's do.
-    CMatch(scrutinee, alts) -> mkCore(typeIn(x, e.ty), e.span, CMatch(erase(x, scrutinee),
-        Vec.map(alts, fun(a) {
-            let outside = x.inert
-            x.inert = granting(x, match a.alt {
-                ACon(name, _, Some(o)) -> Classes.openedPreds(x.classes, name, o.skolems)
-                _ -> []
-            })
-            let body = erase(x, a.body)
-            x.inert = outside
-            CAlt { alt = a.alt, body = body }
-        })))
-    -- A dictionary loses its equality slots, which hold coercions, and a read
-    -- of a slot after them moves down.
-    CDict(cls, slots) -> mkCore(typeIn(x, e.ty), e.span, CDict(cls,
-        Array.map(Array.filter(slots, fun(v) = !isCoercion(v.ty)), erase(x, _))))
-    CSlot(target, index) -> mkCore(typeIn(x, e.ty), e.span,
-        CSlot(erase(x, target), erasedSlot(x, target.ty, index)))
-    CLet(name, id, bound, value, body, binders) -> mkCore(typeIn(x, e.ty), e.span,
-        CLet(name, id, binderType(x, bound, value), erase(x, value), erase(x, body), binders))
-    _ -> mkCore(typeIn(x, e.ty), e.span, mapKind(e.kind, Mapper {
-        expr = erase(x, _), type_ = typeIn(x, _), bind = eraseBind(x, _),
-    }))
+	CLam(params, body, name) -> {
+		let outside = x.inert
+		x.inert = granting(x, evidencePreds(params))
+		let kept = Array.filter(params, fun(p) = !isCoercion(p.ty))
+		let out = if len(params) > 0 && len(kept) == 0 {
+			delayed(x, erase(x, body))
+		} else {
+			mkCore(
+				typeIn(x, e.ty),
+				e.span,
+				CLam(Array.map(kept, eraseParam(x, _)), erase(x, body), name),
+			)
+		}
+		x.inert = outside
+		out
+	}
+	CApp(fn, args) -> {
+		let kept = Array.filter(args, fun(a) = !isCoercion(a.ty))
+		if len(args) > 0 && len(kept) == 0 { return erase(x, fn) }
+		mkCore(typeIn(x, e.ty), e.span, CApp(erase(x, fn), Array.map(kept, erase(x, _))))
+	}
+	-- An existential arm's dictionaries grant their equality superclasses to
+	-- its body, as a lambda's do.
+	CMatch(scrutinee, alts) -> mkCore(
+		typeIn(x, e.ty),
+		e.span,
+		CMatch(
+			erase(x, scrutinee),
+			Vec.map(alts, fun(a) {
+				let outside = x.inert
+				x.inert = granting(
+					x,
+					match a.alt {
+						ACon(name, _, Some(o)) -> Classes.openedPreds(x.classes, name, o.skolems)
+						_                      -> []
+					},
+				)
+				let body = erase(x, a.body)
+				x.inert = outside
+				CAlt { alt = a.alt, body = body }
+			}),
+		),
+	)
+	-- A dictionary loses its equality slots, which hold coercions, and a read
+	-- of a slot after them moves down.
+	CDict(cls, slots) -> mkCore(
+		typeIn(x, e.ty),
+		e.span,
+		CDict(cls, Array.map(Array.filter(slots, fun(v) = !isCoercion(v.ty)), erase(x, _))),
+	)
+	CSlot(target, index) -> mkCore(
+		typeIn(x, e.ty),
+		e.span,
+		CSlot(erase(x, target), erasedSlot(x, target.ty, index)),
+	)
+	CLet(name, id, bound, value, body, binders) -> mkCore(
+		typeIn(x, e.ty),
+		e.span,
+		CLet(name, id, binderType(x, bound, value), erase(x, value), erase(x, body), binders),
+	)
+	_ -> mkCore(
+		typeIn(x, e.ty),
+		e.span,
+		mapKind(e.kind, Mapper {
+			expr  = erase(x, _)
+			type_ = typeIn(x, _)
+			bind  = eraseBind(x, _)
+		}),
+	)
 }
 
 -- Returns where slot `index` of a dictionary of type `dictTy` is once its
 -- equality slots are gone.
 fun erasedSlot(x : Eraser, dictTy : Ty.Type, index : Int) -> Int {
-    let cls = match dictClass(dictTy) {
-        Some(c) -> c
-        None -> return index
-    }
-    let slots = Classes.dictSlots(x.classes, cls)
-    var out = index
-    for var i = 0; i < index && i < len(slots); i = i + 1 {
-        if let EqualitySlot(_) = slots[i] { out = out - 1 }
-    }
-    out
+	let cls = match dictClass(dictTy) {
+		Some(c) -> c
+		None    -> return index
+	}
+	let slots = Classes.dictSlots(x.classes, cls)
+	var out = index
+	for var i = 0; i < index && i < len(slots); i = i + 1 {
+		if let EqualitySlot(_) = slots[i] { out = out - 1 }
+	}
+	out
 }
 
 -- The erased body of a lambda over coercions alone, delayed as the lambda
 -- delayed it: itself if it is a lambda, a name or not a function, and
 -- otherwise eta-expanded.
 fun delayed(x : Eraser, body : Core) -> Core {
-    match body.kind {
-        CLam(_, _, _) | CVar(_) -> return body
-        CTyApp(fn, _) -> match fn.kind {
-            CVar(_) -> return body
-            _ -> {}
-        }
-        _ -> {}
-    }
-    match Ty.prune(body.ty) {
-        TFun(params, ret) -> {
-            let ps = Array.map(params, fun(t) = CParam { name = "%x", id = mint(x), ty = t })
-            let args = Array.map(ps, fun(p) = mkCore(p.ty, body.span, CVar(refTo(p.name, p.id))))
-            mkCore(body.ty, body.span, CLam(ps, mkCore(ret, body.span, CApp(body, args)),
-                                             "<anonymous>"))
-        }
-        _ -> body
-    }
+	match body.kind {
+		CLam(_, _, _) | CVar(_) -> return body
+		CTyApp(fn, _) -> match fn.kind {
+			CVar(_) -> return body
+			_       -> {}
+		}
+		_ -> {}
+	}
+	match Ty.prune(body.ty) {
+		TFun(params, ret) -> {
+			let ps = Array.map(params, fun(t) = CParam { name = "%x", id = mint(x), ty = t })
+			let args = Array.map(ps, fun(p) = mkCore(p.ty, body.span, CVar(refTo(p.name, p.id))))
+			mkCore(
+				body.ty,
+				body.span,
+				CLam(ps, mkCore(ret, body.span, CApp(body, args)), "<anonymous>"),
+			)
+		}
+		_ -> body
+	}
 }
 
 fun eraseParam(x : Eraser, p : CParam) -> CParam {
-    let CParam { name, id, ty } = p
-    CParam { name = name, id = id, ty = typeIn(x, ty) }
+	let CParam { name, id, ty } = p
+	CParam { name = name, id = id, ty = typeIn(x, ty) }
 }

@@ -12,8 +12,7 @@ export (run)
 
 import Turkey.Ast (InstanceDecl(..))
 import Turkey.Classes as Classes
-import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
-                       InstancePlan(..), Evidence(..))
+import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..), InstancePlan(..), Evidence(..))
 import Turkey.Decls as Decls
 import Turkey.Diag as Diag
 import Turkey.Prelude as P
@@ -23,42 +22,60 @@ import Turkey.Types as Ty
 import Turkey.Types (Pred(..), TBottom)
 
 fun run(classes : ClassTable, uses : Vec Use, checks : Vec InstanceCheck) -> Unit {
-    completeInstances(classes)
-    for c in checks { readInstance(c) }
-    for u in uses {
-        u.method = Classes.method(classes, u.name)
-        -- Never lowered: its override can never be called, and its errors
-        -- were muted, so a hole may be empty.
-        if u.inaccessible { continue }
-        let evidence = Vec.new(len(u.holes))
-        for var i = 0; i < len(u.holes); i = i + 1 {
-            Vec.push(evidence, readOut(u.holes[i], fun() = u.preds[i], u.span))
-        }
-        u.evidence = evidence
-    }
+	completeInstances(classes)
+	for c in checks { readInstance(c) }
+	for u in uses {
+		u.method = Classes.method(classes, u.name)
+		-- Never lowered: its override can never be called, and its errors
+		-- were muted, so a hole may be empty.
+		if u.inaccessible { continue }
+		let evidence = Vec.new(len(u.holes))
+		for var i = 0; i < len(u.holes); i = i + 1 {
+			Vec.push(evidence, readOut(u.holes[i], fun() = u.preds[i], u.span))
+		}
+		u.evidence = evidence
+	}
 }
 
 -- Returns the evidence in `hole`, with every hole below it read out too.
 -- `wanted` returns the predicate the hole is for, for the internal error an
 -- empty hole is.
 fun readOut(hole : Hole, wanted : fun() -> Pred, where : Option Span) -> Evidence =
-    match hole.proof {
-        Some(ByGiven(name, path, given)) -> FromDict(name, path, Some(given))
-        -- The context's dictionaries, then a coercion for each of its
-        -- equalities.
-        Some(ByInstance(inst, mapping, holes)) -> FromInstance(inst, mapping,
-            Array.init(len(holes), fun(i) = readOut(holes[i], fun() {
-                let context = Classes.contextAt(inst, mapping)
-                if i < len(context) { context[i] }
-                else { Classes.equalitiesAt(inst, mapping)[i - len(context)] }
-            }, where)))
-        Some(ByNothing(cls)) -> Absent(cls)
-        Some(Same(other)) -> readOut(other, wanted, where)
-        Some(ByCoercion(p)) -> Coerced(p.args[0], p.args[1])
-        -- Solving finished without an error, so it discharged every wanted.
-        None -> oops("no evidence for '" + Ty.showPred(wanted()) + "', which solving "
-                     + "had already accepted", where)
-    }
+	match hole.proof {
+		Some(ByGiven(name, path, given)) -> FromDict(name, path, Some(given))
+		-- The context's dictionaries, then a coercion for each of its
+		-- equalities.
+		Some(ByInstance(inst, mapping, holes)) -> FromInstance(
+			inst,
+			mapping,
+			Array.init(
+				len(holes),
+				fun(i) = readOut(
+					holes[i],
+					fun() {
+						let context = Classes.contextAt(inst, mapping)
+						if i < len(context) {
+							context[i]
+						} else {
+							Classes.equalitiesAt(inst, mapping)[i - len(context)]
+						}
+					},
+					where,
+				),
+			),
+		)
+		Some(ByNothing(cls)) -> Absent(cls)
+		Some(Same(other))    -> readOut(other, wanted, where)
+		Some(ByCoercion(p))  -> Coerced(p.args[0], p.args[1])
+		-- Solving finished without an error, so it discharged every wanted.
+		None -> oops(
+			"no evidence for '"
+				+ Ty.showPred(wanted())
+				+ "', which solving "
+				+ "had already accepted",
+			where,
+		)
+	}
 
 -- Fill in each instance's default methods.
 --
@@ -68,81 +85,82 @@ fun readOut(hole : Hole, wanted : fun() -> Pred, where : Option Span) -> Evidenc
 -- at its head (`InstancePlan.defaultDicts`), which is the whole of what makes
 -- one body serve them all.
 fun completeInstances(classes : ClassTable) -> Unit {
-    for (_, insts) in Map.entries(classes.instances) {
-        for inst in insts {
-            if Classes.isGenerated(inst.cls) {
-                -- A generated field accessor has no superclasses and no
-                -- written body: the lowering builds `get` and `set` out of the
-                -- primitive `CProject` the class is the interface to. There is
-                -- nothing here to complete.
-                inst.plan = Some(Classes.newInstancePlan(Vec.new(1)))
-                continue
-            }
-            match inst.plan {
-                None -> if inst.cls == P.typedClass || Classes.isFunctionDebug(inst) {
-                    -- A derived `Typed` instance never passed through the
-                    -- generator, so nothing has given it a plan. Its context is
-                    -- its head's parameters -- `Typed (Map k v)` wants `Typed k`
-                    -- and `Typed v` -- so the dictionary is a function of those,
-                    -- named the way the generator names them. There is no body
-                    -- to complete either: the lowering writes `typeRep` out of
-                    -- the head's own name, which is the one thing the surface
-                    -- language could not have said. The `Debug` instance for
-                    -- functions has no context and no body to complete
-                    -- either: the lowering writes its `<fun>`.
-                    let params = Vec.new(len(inst.context))
-                    for q in inst.context { Vec.push(params, dictName(q.name)) }
-                    inst.plan = Some(Classes.newInstancePlan(params))
-                    continue
-                }
-                Some(_) -> {}
-            }
-            let info = match Map.get(classes.classes, inst.cls) {
-                Some(i) -> i
-                None -> oops("unknown class '" + inst.cls + "'", None)
-            }
-            let plan = match inst.plan {
-                Some(p) -> p
-                None -> oops("instance '" + inst.cls
-                             + "' was never given a plan", Some(inst.decl.span))
-            }
-            for (name, _) in Map.entries(info.methods) {
-                if !Map.contains(plan.methods, name) {
-                    match Map.get(info.defaults, name) {
-                        Some(impl) -> Map.put(plan.methods, name, impl)
-                        None -> {}
-                    }
-                }
-            }
-        }
-    }
+	for (_, insts) in Map.entries(classes.instances) {
+		for inst in insts {
+			if Classes.isGenerated(inst.cls) {
+				-- A generated field accessor has no superclasses and no
+				-- written body: the lowering builds `get` and `set` out of the
+				-- primitive `CProject` the class is the interface to. There is
+				-- nothing here to complete.
+				inst.plan = Some(Classes.newInstancePlan(Vec.new(1)))
+				continue
+			}
+			match inst.plan {
+				None -> if inst.cls == P.typedClass || Classes.isFunctionDebug(inst) {
+					-- A derived `Typed` instance never passed through the
+					-- generator, so nothing has given it a plan. Its context is
+					-- its head's parameters -- `Typed (Map k v)` wants `Typed k`
+					-- and `Typed v` -- so the dictionary is a function of those,
+					-- named the way the generator names them. There is no body
+					-- to complete either: the lowering writes `typeRep` out of
+					-- the head's own name, which is the one thing the surface
+					-- language could not have said. The `Debug` instance for
+					-- functions has no context and no body to complete
+					-- either: the lowering writes its `<fun>`.
+					let params = Vec.new(len(inst.context))
+					for q in inst.context { Vec.push(params, dictName(q.name)) }
+					inst.plan = Some(Classes.newInstancePlan(params))
+					continue
+				}
+				Some(_) -> {}
+			}
+			let info = match Map.get(classes.classes, inst.cls) {
+				Some(i) -> i
+				None    -> oops("unknown class '" + inst.cls + "'", None)
+			}
+			let plan = match inst.plan {
+				Some(p) -> p
+				None -> oops(
+					"instance '" + inst.cls + "' was never given a plan",
+					Some(inst.decl.span),
+				)
+			}
+			for (name, _) in Map.entries(info.methods) {
+				if !Map.contains(plan.methods, name) {
+					match Map.get(info.defaults, name) {
+						Some(impl) -> Map.put(plan.methods, name, impl)
+						None       -> {}
+					}
+				}
+			}
+		}
+	}
 }
 
 -- Reads the evidence for `c`'s instance's own obligations into its plan.
 fun readInstance(c : InstanceCheck) -> Unit {
-    let plan = match c.inst.plan {
-        Some(p) -> p
-        None -> oops("instance '" + c.inst.cls + "' was never given a plan",
-                     Some(c.inst.decl.span))
-    }
-    let where = Some(c.inst.decl.span)
-    let head = Ty.pred(c.inst.cls, [c.inst.head])
-    for (sup, hole) in c.supers {
-        Map.put(plan.supers, sup, readOut(hole, fun() = Ty.pred(sup, [c.inst.head]), where))
-    }
-    plan.superEqualities = Vec.map(c.equalities, readOut(_, fun() = head, where))
-    for (name, hole) in c.defaults {
-        Map.put(plan.defaultDicts, name, readOut(hole, fun() = head, where))
-    }
-    for (key, p, hole) in c.fields {
-        Map.put(plan.fieldDicts, key, readOut(hole, fun() = p, where))
-    }
-    plan.skolems = c.skolems
+	let plan = match c.inst.plan {
+		Some(p) -> p
+		None -> oops("instance '" + c.inst.cls + "' was never given a plan", Some(c.inst.decl.span))
+	}
+	let where = Some(c.inst.decl.span)
+	let head = Ty.pred(c.inst.cls, [c.inst.head])
+	for (sup, hole) in c.supers {
+		Map.put(plan.supers, sup, readOut(hole, fun() = Ty.pred(sup, [c.inst.head]), where))
+	}
+	plan.superEqualities = Vec.map(c.equalities, readOut(_, fun() = head, where))
+	for (name, hole) in c.defaults {
+		Map.put(plan.defaultDicts, name, readOut(hole, fun() = head, where))
+	}
+	for (key, p, hole) in c.fields {
+		Map.put(plan.fieldDicts, key, readOut(hole, fun() = p, where))
+	}
+	plan.skolems = c.skolems
 }
 
 -- Every check here is one that only a compiler bug can fail: solving has
 -- already accepted the program.
 fun oops(message : String, where : Option Span) -> a = match where {
-    None -> Diag.fail(Diag.whole("internal error", message), "")
-    Some(s) -> Diag.fail(Diag.at("internal error", message, s), s.file)
+	None    -> Diag.fail(Diag.whole("internal error", message), "")
+	Some(s) -> Diag.fail(Diag.at("internal error", message, s), s.file)
 }

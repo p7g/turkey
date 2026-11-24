@@ -30,38 +30,48 @@ import Turkey.Ptr as Ptr
 -- A cell: its header, whose count is 1 if the value is a pointer the
 -- collector follows, and the value.
 foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Ptr {
-    let cell = Heap.allocate(16, 5, Prim.frameAddress())
-    if !Ptr.isNull(cell) {
-        header(cell, 5, if pointerValue != 0 { 1 } else { 0 }, 0)
-        Ptr.store(cell, 8, value)
-    }
-    cell
+	let cell = Heap.allocate(16, 5, Prim.frameAddress())
+	if !Ptr.isNull(cell) {
+		header(cell, 5, if pointerValue != 0 { 1 } else { 0 }, 0)
+		Ptr.store(cell, 8, value)
+	}
+	cell
 }
 
 -- An object of `bytes` bytes of fields, the first `pointers` words of them
 -- traced. Where each field is within them is the compiler's
 -- (`Turkey.Runtime.layout`); all the runtime keeps is the count, which is the
 -- collector's whole description of the object.
-foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
-                                         pointers : Int) -> Ptr {
-    -- The bound on `bytes` is far past any object a program builds, and keeps
-    -- the size from overflowing. The header counts the pointers in 16 bits.
-    if kind < 0 || kind == 2 || kind > 4 || bytes < 0 || bytes > 0x1_0000_0000
-            || bytes & 7 != 0 || pointers < 0 || pointers > bytes >> 3
-            || pointers > 0xFFFF {
-        Process.panic(Prim.cString("invalid object size"))
-        return Ptr.null()
-    }
-    let size = Int.addWrapping(8, bytes)
-    let object = Heap.allocate(size, kind, Prim.frameAddress())
-    if Ptr.isNull(object) { return object }
-    header(object, kind, pointers, tag)
-    -- In line, a word at a time: most objects have a few fields, and are
-    -- zeroed in fewer instructions than a call takes.
-    for var at = 8; at < size; at = Int.addWrapping(at, 8) {
-        Ptr.store(object, at, 0)
-    }
-    object
+foreign "turkey_object_new" fun objectNew(
+	kind : Int,
+	tag : Int,
+	bytes : Int,
+	pointers : Int,
+) -> Ptr {
+	-- The bound on `bytes` is far past any object a program builds, and keeps
+	-- the size from overflowing. The header counts the pointers in 16 bits.
+	if kind < 0
+			|| kind == 2
+			|| kind > 4
+			|| bytes < 0
+			|| bytes > 0x1_0000_0000
+			|| bytes & 7 != 0
+			|| pointers < 0
+			|| pointers > bytes >> 3
+			|| pointers > 0xFFFF {
+		Process.panic(Prim.cString("invalid object size"))
+		return Ptr.null()
+	}
+	let size = Int.addWrapping(8, bytes)
+	let object = Heap.allocate(size, kind, Prim.frameAddress())
+	if Ptr.isNull(object) { return object }
+	header(object, kind, pointers, tag)
+	-- In line, a word at a time: most objects have a few fields, and are
+	-- zeroed in fewer instructions than a call takes.
+	for var at = 8; at < size; at = Int.addWrapping(at, 8) {
+		Ptr.store(object, at, 0)
+	}
+	object
 }
 
 -- An object's header, young, as the collector and generated code read it
@@ -69,7 +79,7 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
 -- kind, the count in the next two and the tag in the last four. One store,
 -- so that no field of it is ever seen half written.
 fun header(object : Ptr, kind : Int, count : Int, tag : Int) -> Unit =
-    Ptr.store(object, 0, kind << 8 | count << 16 | (tag & 0xFFFF_FFFF) << 32)
+	Ptr.store(object, 0, kind << 8 | count << 16 | (tag & 0xFFFF_FFFF) << 32)
 
 -- An array of `length` elements, `stride` bytes apart, each starting with
 -- `pointers` traced words (`Turkey.Runtime.Element`), which is what the
@@ -77,55 +87,59 @@ fun header(object : Ptr, kind : Int, count : Int, tag : Int) -> Unit =
 -- of words. Every element is `initial` at the stride's width, or at a word's
 -- for a stride of several: an element of several words is filled with one
 -- word repeated, which generated code passes as 0.
-foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
-                                        stride : Int, pointers : Int)
-        -> Ptr {
-    if length < 0 {
-        Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is negative"))
-        return Ptr.null()
-    }
-    if !(stride == 1 || stride == 4 || (stride >= 8 && stride % 8 == 0 && stride < 0x8000_0000))
-            || pointers < 0 || pointers * 8 > stride {
-        Process.panic(Prim.cString("invalid array element layout"))
-        return Ptr.null()
-    }
-    -- floor((SIZE_MAX - 16) / stride). Every nonnegative Int fits at stride
-    -- 1. Any other stride is even, and for an even `s`, (2^64 - 17) / s and
-    -- (2^63 - 9) / (s / 2) have the same floor, which fits in an Int. After
-    -- this check the size is an unsigned word, passed bit-for-bit to the heap
-    -- allocator.
-    if stride > 1 && length > (9223372036854775807 - 8) / (stride / 2) {
-        Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is too large"))
-        return Ptr.null()
-    }
-    let size = Int.addWrapping(16, Int.mulWrapping(length, stride))
-    let array = Heap.allocate(size, 2, Prim.frameAddress())
-    if Ptr.isNull(array) { return array }
-    header(array, 2, pointers, stride)
-    Ptr.store(array, 8, length)
-    let bytes = Ptr.add(array, 16)
-    if stride == 1 {
-        Memory.fill(bytes, length, initial)
-    } else if length > 0 {
-        -- One element, then the elements filled so far copied after
-        -- themselves, doubling them each time: `Memory.copy` moves 32 bytes
-        -- at a time, where a loop over the elements would store one element
-        -- at a time. The two runs of each copy never overlap.
-        let width = if stride == 4 { 4 } else { 8 }
-        if width == 4 {
-            Ptr.store32(bytes, 0, initial)
-        } else {
-            Ptr.store(bytes, 0, initial)
-        }
-        let total = Int.mulWrapping(length, stride)
-        var filled = width
-        while filled < total {
-            let count = if filled < total - filled { filled } else { total - filled }
-            Memory.copy(Ptr.add(bytes, filled), bytes, count)
-            filled = filled + count
-        }
-    }
-    array
+foreign "turkey_array_new" fun arrayNew(
+	length : Int,
+	initial : Int,
+	stride : Int,
+	pointers : Int,
+) -> Ptr {
+	if length < 0 {
+		Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is negative"))
+		return Ptr.null()
+	}
+	if !(stride == 1 || stride == 4 || (stride >= 8 && stride % 8 == 0 && stride < 0x8000_0000))
+			|| pointers < 0
+			|| pointers * 8 > stride {
+		Process.panic(Prim.cString("invalid array element layout"))
+		return Ptr.null()
+	}
+	-- floor((SIZE_MAX - 16) / stride). Every nonnegative Int fits at stride
+	-- 1. Any other stride is even, and for an even `s`, (2^64 - 17) / s and
+	-- (2^63 - 9) / (s / 2) have the same floor, which fits in an Int. After
+	-- this check the size is an unsigned word, passed bit-for-bit to the heap
+	-- allocator.
+	if stride > 1 && length > (9223372036854775807 - 8) / (stride / 2) {
+		Process.panicInt(Prim.cString("array length "), length, Prim.cString(" is too large"))
+		return Ptr.null()
+	}
+	let size = Int.addWrapping(16, Int.mulWrapping(length, stride))
+	let array = Heap.allocate(size, 2, Prim.frameAddress())
+	if Ptr.isNull(array) { return array }
+	header(array, 2, pointers, stride)
+	Ptr.store(array, 8, length)
+	let bytes = Ptr.add(array, 16)
+	if stride == 1 {
+		Memory.fill(bytes, length, initial)
+	} else if length > 0 {
+		-- One element, then the elements filled so far copied after
+		-- themselves, doubling them each time: `Memory.copy` moves 32 bytes
+		-- at a time, where a loop over the elements would store one element
+		-- at a time. The two runs of each copy never overlap.
+		let width = if stride == 4 { 4 } else { 8 }
+		if width == 4 {
+			Ptr.store32(bytes, 0, initial)
+		} else {
+			Ptr.store(bytes, 0, initial)
+		}
+		let total = Int.mulWrapping(length, stride)
+		var filled = width
+		while filled < total {
+			let count = if filled < total - filled { filled } else { total - filled }
+			Memory.copy(Ptr.add(bytes, filled), bytes, count)
+			filled = filled + count
+		}
+	}
+	array
 }
 
 -- The environment is independently allocated and rooted by the caller. Zero
@@ -133,15 +147,15 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
 -- Laid out as `Turkey.Runtime.closureShell` says: the environment, traced,
 -- then the code's address.
 foreign "turkey_closure_shell" fun closureShell(code : Int) -> Ptr {
-    let closure = objectNew(3, -1, 16, 1)
-    if !Ptr.isNull(closure) { Ptr.store(closure, 16, code) }
-    closure
+	let closure = objectNew(3, -1, 16, 1)
+	if !Ptr.isNull(closure) { Ptr.store(closure, 16, code) }
+	closure
 }
 
 foreign "turkey_string_new" fun stringNew(bytes : Ptr, length : Int) -> Ptr {
-    let array = arrayNew(length, 0, 1, 0)
-    if !Ptr.isNull(array) && length > 0 {
-        Memory.copy(Ptr.add(array, 16), bytes, length)
-    }
-    array
+	let array = arrayNew(length, 0, 1, 0)
+	if !Ptr.isNull(array) && length > 0 {
+		Memory.copy(Ptr.add(array, 16), bytes, length)
+	}
+	array
 }

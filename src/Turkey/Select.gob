@@ -2005,29 +2005,78 @@ fun trapping(s : Sel, i : Low, d : Reg, r : Rep, o : BinOp, a : Reg, b : Reg, w 
 			}
 			emit(s, A.SDiv(d, a, b, w))
 		}
-		-- The remainder is the division's, backwards: `msub` computes
-		-- `a - (a / b) * b`, which is what arm64 has instead of an `srem`.
-		-- A constant divisor other than 0 and -1 needs neither check.
-		Rem -> match divisorOf(s, i) {
-			Some(k) -> if k != 0 && k != -1 {
-				let quotient = temp(s, Ssa.untraced(I64))
-				emit(s, A.SDiv(quotient, a, b, w))
-				emit(s, A.MSub(d, quotient, b, a, w))
-			} else {
-				remainder(s, i, d, a, b, w)
+		Rem -> truncatedRemainder(s, i, i.result, a, b, w)
+		-- The floored forms are the truncated ones adjusted by `floorMask`:
+		-- branch-free, and with the checks and panics of the truncated forms.
+		FloorDiv -> {
+			let k = divisorOf(s, i)
+			if k == None || k == Some(0) { divisorGuard(s, b, "division by zero") }
+			if k == None || k == Some(-1) {
+				mostNegative(s, a, b, "integer overflow in /")
 			}
-			None -> remainder(s, i, d, a, b, w)
+			let quotient = temp(s, Ssa.untraced(I64))
+			let rest = temp(s, Ssa.untraced(I64))
+			emit(s, A.SDiv(quotient, a, b, w))
+			emit(s, A.MSub(rest, quotient, b, a, w))
+			emit(s, A.Add(d, quotient, floorMask(s, rest, b), w))
+		}
+		Mod -> {
+			let rest = tempValue(s, Ssa.untraced(I64))
+			truncatedRemainder(s, i, rest, a, b, w)
+			let adjust = temp(s, Ssa.untraced(I64))
+			emit(s, A.And(adjust, b, floorMask(s, A.reg(rest), b), w))
+			emit(s, A.Add(d, A.reg(rest), adjust, w))
 		}
 		_ -> stop(s, "the binary operation " + show(o))
 	}
 }
 
--- The remainder by a divisor that may be 0 or -1.
+-- The truncated remainder of `a` by `b`, into `result`.
+--
+-- The remainder is the division's, backwards: `msub` computes
+-- `a - (a / b) * b`, which is what arm64 has instead of an `srem`.
+-- A constant divisor other than 0 and -1 needs neither check.
+fun truncatedRemainder(s : Sel, i : Low, result : Value, a : Reg, b : Reg, w : A.Width) -> Unit =
+	match divisorOf(s, i) {
+		Some(k) -> if k != 0 && k != -1 {
+			let quotient = temp(s, Ssa.untraced(I64))
+			emit(s, A.SDiv(quotient, a, b, w))
+			emit(s, A.MSub(A.reg(result), quotient, b, a, w))
+		} else {
+			remainder(s, result, a, b, w)
+		}
+		None -> remainder(s, result, a, b, w)
+	}
+
+-- Returns a register holding -1 where the truncated remainder `rest` of a
+-- division by `b` is nonzero and of the other sign than `b`, and 0 elsewhere.
+-- Those are exactly the divisions where the floored quotient is one less than
+-- the truncated one and the floored remainder is `rest + b`.
+--
+-- `rest | -rest` has its sign bit set exactly when `rest` is nonzero, the
+-- most negative integer included, and `rest ^ b` exactly when the signs
+-- differ, so an arithmetic shift of their `and` spreads the answer to every
+-- bit.
+fun floorMask(s : Sel, rest : Reg, b : Reg) -> Reg {
+	let negated = temp(s, Ssa.untraced(I64))
+	let nonzero = temp(s, Ssa.untraced(I64))
+	let differ = temp(s, Ssa.untraced(I64))
+	let both = temp(s, Ssa.untraced(I64))
+	let mask = temp(s, Ssa.untraced(I64))
+	emit(s, A.Sub(negated, A.xzr, rest, A.W64))
+	emit(s, A.Orr(nonzero, rest, negated, A.W64))
+	emit(s, A.Eor(differ, rest, b, A.W64))
+	emit(s, A.And(both, nonzero, differ, A.W64))
+	emit(s, A.AsrImm(mask, both, 63, A.W64))
+	mask
+}
+
+-- The remainder by a divisor that may be 0 or -1, into `result`.
 --
 -- The most negative integer divided by -1 is taken out rather than computed.
 -- Its mathematical remainder is zero, but the quotient it goes through does
 -- not exist, and `sdiv` answers it with the dividend rather than trapping.
-fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit {
+fun remainder(s : Sel, result : Value, a : Reg, b : Reg, w : A.Width) -> Unit {
 	divisorGuard(s, b, "remainder by zero")
 	let low = temp(s, Ssa.untraced(I64))
 	constant(s, low, 1 << 63)
@@ -2044,7 +2093,7 @@ fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit 
 	let after = block(s)
 	-- The result is the merge block's parameter, which is what a
 	-- select is in a graph with block parameters rather than phis.
-	Vec.push(s.out.blocks[after].params, i.result)
+	Vec.push(s.out.blocks[after].params, result)
 	s.out.blocks[s.at].termAt = s.pos
 	s.out.blocks[s.at].term = Branch(special, BlockId(zero), BlockId(ordinary))
 	s.at = zero
@@ -2187,6 +2236,22 @@ fun immediateRight(
 		True
 	} else {
 		False
+	}
+	-- In two's complement, the floored quotient by `1 << k` is an arithmetic
+	-- shift by `k`, and the floored modulus is the low `k` bits, whatever the
+	-- dividend's sign. Neither can panic.
+	FloorDiv -> match powerOfTwo(n) {
+		Some(k) -> r.class_ == I64 && k >= 1 && shiftImmediate(s, A.AsrImm(d, x, k, w), k, bits)
+		None    -> False
+	}
+	Mod -> match powerOfTwo(n) {
+		Some(k) -> if r.class_ == I64 && k >= 1 && lowMask(n - 1, bits) {
+			emit(s, A.AndImm(d, x, n - 1, w))
+			True
+		} else {
+			False
+		}
+		None -> False
 	}
 	_ -> False
 }

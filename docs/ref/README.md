@@ -257,6 +257,35 @@ fun main() {
 }
 ```
 
+## Formatting
+
+`turkey fmt` rewrites each file it is given in the one style Turkey has, which
+takes no options. `turkey fmt --check` writes nothing: it prints the name of
+each file it would change, and exits with status 1 if there is one.
+
+```sh
+turkey fmt hello.gob
+turkey fmt --check *.gob
+```
+
+The formatter changes only what leaves the program as it is: line breaks,
+indentation, spaces, blank lines, the commas of a list, `;`, and the `=` before
+a block body, so `fun f() = { ... }` becomes `fun f() { ... }`. It never adds
+or removes parentheses, and it never changes a comment's text, except to drop
+trailing spaces. A file that does not parse is an error, as it is for the
+other commands.
+
+A few choices are left to the author, because the source shows them:
+
+* A line break right after a `(`, `[` or `{` keeps that list, record or block
+  on one line per item, even when it would fit on one. Delete the line break
+  to let it join up again.
+* A line break before a data type's `=` keeps its constructors on one line
+  each.
+* A directive at the end of a line, such as `--@expect(...)`, covers that
+  line, so the formatter keeps the code on that line together: it joins
+  nothing onto the line and moves nothing off it.
+
 ## For maintainers
 
 **Keeping it true.** Examples are checked mechanically. Each `kotlin` fence

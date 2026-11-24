@@ -1,14 +1,16 @@
 -- The compiler, built from the committed compiler in `bootstrap/` by
 -- `scripts/build.sh`.
 --
--- Three commands. `check` compiles as far as the last stage that can reject a
+-- Four commands. `check` compiles as far as the last stage that can reject a
 -- program, and writes nothing, or under `--fix` writes the program's own
 -- modules back with their checks' mechanical fixes applied (`fix`). `build`
 -- compiles all the way and writes an executable, or under `-S` assembly, to
 -- `-o`, or without it to the working directory, named after the entry file
 -- (`openSink`). `doc` checks the modules it is given and writes what each
 -- exports as JSON (`Turkey.Doc`), or with `--html DIR` as a website
--- (`Turkey.DocSite`). `check` and `build` each
+-- (`Turkey.DocSite`). `fmt` rewrites the files it is given in the one style
+-- (`Turkey.Format`), or under `--check` names the files it would change and
+-- writes nothing. `check` and `build` each
 -- take `--dump STAGE,...` to print what a stage produced, which is how a pass
 -- is read while it is being written: `check` goes on as far as the latest
 -- stage asked for and no further, and `build` prints them on its way.
@@ -34,6 +36,8 @@ import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
+import Turkey.Format as Format
+import Turkey.Format (Outcome(..))
 import Turkey.Directives as Directives
 import Turkey.Source as Source
 import Turkey.Source (Source(..))
@@ -280,9 +284,10 @@ fun main() {
         Right(Some(Value("check"))) -> False
         Right(Some(Value("build"))) -> True
         Right(Some(Value("doc"))) -> return doc(p)
+        Right(Some(Value("fmt"))) -> return fmt(p)
         Right(Some(Value(other))) -> die("unknown command '" + other
                                          + "'; the commands are 'check', "
-                                         + "'build' and 'doc'")
+                                         + "'build', 'doc' and 'fmt'")
         _ -> usage()
     }
     linting = True
@@ -487,6 +492,45 @@ fun baseName(path : String) -> String {
 -- outside the library must share a directory. The program is an entry that
 -- imports each module and nothing else, so a library module, which cannot be
 -- an entry itself, is checked as it is when a program imports it.
+-- `fmt`: formats each file in place, writing only the files it changes. Under
+-- `--check` it writes nothing, prints the name of each file it would change,
+-- and exits 1 if there is one. A file the formatter refuses is reported as an
+-- internal error, and the exit status is then 2, after every other file is
+-- done. A file that does not parse ends the run, as it would a compile.
+fun fmt(p : Args.Parser) -> Unit {
+    var checking = False
+    let paths = []
+    loop {
+        match Args.next(p) {
+            Left(message) -> die(message)
+            Right(None) -> break
+            Right(Some(Long("check"))) -> { checking = True }
+            Right(Some(Value(path))) -> Vec.push(paths, path)
+            Right(Some(arg)) -> die(Args.unexpected(arg))
+        }
+    }
+    if len(paths) == 0 { usage() }
+    var changed = False
+    var refused = False
+    for path in paths {
+        Diag.compiling(path)
+        let source = readOrDie(path)
+        match Format.format(source) {
+            Refused(why) -> {
+                toStderr(path + ": internal error: the formatter refuses this file: " + why + "\n")
+                refused = True
+            }
+            Formatted(text) -> if text != source.text {
+                changed = True
+                if checking { print(path) }
+                else if let Left(e) = File.writeText(path, text) { die(message(e)) }
+            }
+        }
+    }
+    if refused { Diag.exit(2) }
+    if checking && changed { Diag.exit(1) }
+}
+
 fun doc(p : Args.Parser) -> Unit {
     let paths = []
     var site = None
@@ -2345,6 +2389,7 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 fun usage() -> a =
     die("usage: turkey check [OPTIONS] FILE...\n"
         + "       turkey doc [--html DIR] FILE...\n"
+        + "       turkey fmt [--check] FILE...\n"
         + "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
         + "                    FILE...\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"

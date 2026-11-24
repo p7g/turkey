@@ -1,0 +1,333 @@
+-- A sixth entry point in `src/`, beside `ImageCases.gob`: small WebAssembly
+-- modules built with `Turkey.Wasm.Module` and the encodings of single
+-- instructions and LEB128 integers from `Turkey.Wasm.Encode`, each printed as
+-- one line, `name: bytes in hex`.
+--
+-- `tests/test_wasm.py` runs it, compares the bytes with ones written out from
+-- the binary format, and gives the modules to an engine where there is one.
+
+import Turkey.Wasm (..)
+import Turkey.Wasm.Encode as Encode
+import Turkey.Wasm.Module as M
+
+fun main() {
+    leb128()
+    modules()
+    instructions()
+}
+
+fun hex(bytes : Vec Byte) -> String {
+    let digits = []
+    for b in bytes {
+        Vec.push(digits, String.padStart(Int.toStringRadix(Byte.toInt(b), 16), 2, '0'))
+    }
+    String.join(digits, "")
+}
+
+fun show_(label : String, bytes : Vec Byte) -> Unit = print(label + ": " + hex(bytes))
+
+-- -- LEB128 ---------------------------------------------------------------------
+
+fun leb128() {
+    for n in [0, 1, 127, 128, 255, 300, 16384, 624485, 0xFFFF_FFFF] {
+        let out = []
+        Encode.unsignedLEB(out, n)
+        show_("unsigned " + Int.toString(n), out)
+    }
+    let lowest = -9223372036854775807 - 1
+    for n in [0, 1, -1, 63, 64, -64, -65, 127, -128, -123456, 9223372036854775807, lowest] {
+        let out = []
+        Encode.signedLEB(out, n)
+        show_("signed " + Int.toString(n), out)
+    }
+}
+
+-- -- modules --------------------------------------------------------------------
+
+fun modules() {
+    show_("empty", M.write(M.newModule()))
+    show_("add", add())
+    show_("sections", sections())
+    show_("imports", imports())
+    show_("control", control())
+    show_("tail", tail())
+    show_("refs", refs())
+    show_("hello", hello())
+    show_("ops", ops())
+}
+
+fun function(m : M.Module, name : String, params : Array ValType, results : Array ValType,
+             locals : Array ValType, body : Array Op) -> Int {
+    let t = M.addType(m, FuncType { params = params, results = results })
+    let f = M.declareFunc(m, name, t)
+    M.defineFunc(m, f, locals, body)
+    f
+}
+
+-- One exported function, which is the smallest module with a type, a function,
+-- an export, a body and a name.
+fun add() -> Vec Byte {
+    let m = M.newModule()
+    let f = function(m, "add", [I32, I32], [I32], [],
+                     [LocalGet(0), LocalGet(1), IntBin(W32, Add)])
+    M.addExport(m, "add", M.ExportFunc, f)
+    M.write(m)
+}
+
+-- Every section but the imports: two functions of one type, so that the type is
+-- shared, a table filled from an element segment, a memory with a maximum, a
+-- mutable global, and data in two places.
+fun sections() -> Vec Byte {
+    let m = M.newModule()
+    let one = function(m, "one", [], [I32], [], [ConstI32(1)])
+    let two = function(m, "two", [], [I32], [], [ConstI32(2)])
+    let table = M.addTable(m, M.TableType { elem = funcref,
+                                            limits = M.Limits { min = 2, max = Some(2) } })
+    let memory = M.addMemory(m, M.Limits { min = 1, max = Some(2) })
+    let counter = M.addGlobal(m, M.GlobalType { type_ = I64, mutable = True },
+                              [ConstI64(-1)])
+    M.addElem(m, table, 0, [one, two])
+    M.addData(m, memory, 16, [Byte.truncate(7), Byte.truncate(8)])
+    M.addData(m, memory, 300, [Byte.truncate(9)])
+    M.addExport(m, "table", M.ExportTable, table)
+    M.addExport(m, "memory", M.ExportMemory, memory)
+    M.addExport(m, "counter", M.ExportGlobal, counter)
+    M.addExport(m, "two", M.ExportFunc, two)
+    M.write(m)
+}
+
+-- One import of each kind, and the index each leaves for what the module
+-- defines.
+fun imports() -> Vec Byte {
+    let m = M.newModule()
+    let t = M.addType(m, FuncType { params = [I32], results = [] })
+    let log = M.importFunc(m, "env", "log", t)
+    let _ = M.importTable(m, "env", "table", M.TableType { elem = funcref,
+                                                   limits = M.Limits { min = 1, max = None } })
+    let _ = M.importMemory(m, "env", "memory", M.Limits { min = 1, max = None })
+    let base = M.importGlobal(m, "env", "base", M.GlobalType { type_ = I32, mutable = False })
+    -- The imported function is index 0, so the first one defined is index 1, and
+    -- the global the module defines follows the imported one.
+    let main = function(m, "main", [], [], [], [GlobalGet(base), Call(log)])
+    let local = M.addGlobal(m, M.GlobalType { type_ = I32, mutable = False }, [GlobalGet(base)])
+    M.addExport(m, "main", M.ExportFunc, main)
+    M.addExport(m, "local", M.ExportGlobal, local)
+    M.write(m)
+}
+
+-- Structured control, multi-value block types, branch tables and locals that
+-- the code section writes as runs.
+fun control() -> Vec Byte {
+    let m = M.newModule()
+    let pair = M.addType(m, FuncType { params = [I32], results = [I32, I32] })
+    let f = function(m, "control", [I32], [I32], [I32, I32, I64, I32, I32], [
+        -- A block that takes the parameter and leaves two results.
+        LocalGet(0),
+        Block(Typed(pair)),
+        LocalGet(0),
+        End,
+        IntBin(W32, Add),
+        Drop,
+        -- A loop that branches back to its start.
+        Loop(Empty),
+        LocalGet(0),
+        BrIf(0),
+        End,
+        -- A branch table out of two nested blocks.
+        Block(Empty),
+        Block(Empty),
+        LocalGet(0),
+        BrTable([0, 1], 1),
+        End,
+        End,
+        LocalGet(0),
+        If(Value(I32)),
+        ConstI32(1),
+        Else,
+        ConstI32(2),
+        End,
+    ])
+    M.addExport(m, "control", M.ExportFunc, f)
+    M.write(m)
+}
+
+-- The tail calls: one by index, and one through a table.
+fun tail() -> Vec Byte {
+    let m = M.newModule()
+    let t = M.addType(m, FuncType { params = [I32], results = [I32] })
+    let go = M.declareFunc(m, "go", t)
+    let table = M.addTable(m, M.TableType { elem = funcref,
+                                            limits = M.Limits { min = 1, max = None } })
+    M.addElem(m, table, 0, [go])
+    M.defineFunc(m, go, [], [LocalGet(0), ReturnCall(go)])
+    let _ = function(m, "indirect", [I32], [I32], [],
+             [LocalGet(0), ConstI32(0), ReturnCallIndirect(t, table)])
+    M.write(m)
+}
+
+-- Typed function references: a reference of a function type and the calls
+-- through one.
+fun refs() -> Vec Byte {
+    let m = M.newModule()
+    let t = M.addType(m, FuncType { params = [I32], results = [I32] })
+    let go = M.declareFunc(m, "go", t)
+    M.addExport(m, "go", M.ExportFunc, go)
+    M.defineFunc(m, go, [], [LocalGet(0), RefFunc(go), ReturnCallRef(t)])
+    let _ = function(m, "call", [I32, RefOrNull(HType(t))], [I32], [Ref(HType(t))],
+             [LocalGet(0), LocalGet(1), CallRef(t)])
+    M.write(m)
+}
+
+-- A WASI program that writes "hello" and a newline to standard output.
+fun hello() -> Vec Byte {
+    let m = M.newModule()
+    let write = M.addType(m, FuncType { params = [I32, I32, I32, I32], results = [I32] })
+    let fdWrite = M.importFunc(m, "wasi_snapshot_preview1", "fd_write", write)
+    let memory = M.addMemory(m, M.Limits { min = 1, max = None })
+    -- The one `iovec` is at 0: the address and the length of the text at 8.
+    let bytes = []
+    for b in [8, 0, 0, 0, 6, 0, 0, 0] { Vec.push(bytes, Byte.truncate(b)) }
+    for c in String.toBytes("hello\n") { Vec.push(bytes, c) }
+    M.addData(m, memory, 0, Vec.toArray(bytes))
+    let start = function(m, "_start", [], [], [], [
+        -- fd_write(stdout, iovecs, 1, nwritten), whose result we drop.
+        ConstI32(1), ConstI32(0), ConstI32(1), ConstI32(20), Call(fdWrite), Drop,
+    ])
+    M.addExport(m, "memory", M.ExportMemory, memory)
+    M.addExport(m, "_start", M.ExportFunc, start)
+    M.write(m)
+}
+
+-- -- single instructions ----------------------------------------------------------
+
+let widths = [(W32, I32), (W64, I64)]
+let floatWidths = [(S32, F32), (S64, F64)]
+let intRels = [Eq, Ne, LtS, LtU, GtS, GtU, LeS, LeU, GeS, GeU]
+let intUns = [Clz, Ctz, Popcnt]
+let intBins = [Add, Sub, Mul, DivS, DivU, RemS, RemU, And, Or, Xor, Shl, ShrS, ShrU, Rotl, Rotr]
+let floatRels = [FEq, FNe, FLt, FGt, FLe, FGe]
+let floatUns = [Abs, Neg, Ceil, Floor, Trunc, Nearest, Sqrt]
+let floatBins = [FAdd, FSub, FMul, FDiv, FMin, FMax, Copysign]
+
+-- Every conversion, with the type it takes and the type it leaves.
+let conversions = [
+    (I32WrapI64, I64, I32),
+    (I32TruncF32S, F32, I32), (I32TruncF32U, F32, I32),
+    (I32TruncF64S, F64, I32), (I32TruncF64U, F64, I32),
+    (I64ExtendI32S, I32, I64), (I64ExtendI32U, I32, I64),
+    (I64TruncF32S, F32, I64), (I64TruncF32U, F32, I64),
+    (I64TruncF64S, F64, I64), (I64TruncF64U, F64, I64),
+    (F32ConvertI32S, I32, F32), (F32ConvertI32U, I32, F32),
+    (F32ConvertI64S, I64, F32), (F32ConvertI64U, I64, F32),
+    (F32DemoteF64, F64, F32),
+    (F64ConvertI32S, I32, F64), (F64ConvertI32U, I32, F64),
+    (F64ConvertI64S, I64, F64), (F64ConvertI64U, I64, F64),
+    (F64PromoteF32, F32, F64),
+    (I32ReinterpretF32, F32, I32), (I64ReinterpretF64, F64, I64),
+    (F32ReinterpretI32, I32, F32), (F64ReinterpretI64, I64, F64),
+    (I32Extend8S, I32, I32), (I32Extend16S, I32, I32),
+    (I64Extend8S, I64, I64), (I64Extend16S, I64, I64), (I64Extend32S, I64, I64),
+    (I32TruncSatF32S, F32, I32), (I32TruncSatF32U, F32, I32),
+    (I32TruncSatF64S, F64, I32), (I32TruncSatF64U, F64, I32),
+    (I64TruncSatF32S, F32, I64), (I64TruncSatF32U, F32, I64),
+    (I64TruncSatF64S, F64, I64), (I64TruncSatF64U, F64, I64),
+]
+
+let loads = [
+    (I32Load, I32), (I64Load, I64), (F32Load, F32), (F64Load, F64),
+    (I32Load8S, I32), (I32Load8U, I32), (I32Load16S, I32), (I32Load16U, I32),
+    (I64Load8S, I64), (I64Load8U, I64), (I64Load16S, I64), (I64Load16U, I64),
+    (I64Load32S, I64), (I64Load32U, I64),
+]
+
+let stores = [
+    (I32Store, I32), (I64Store, I64), (F32Store, F32), (F64Store, F64),
+    (I32Store8, I32), (I32Store16, I32), (I64Store8, I64), (I64Store16, I64),
+    (I64Store32, I64),
+]
+
+-- An instruction with the operand types it pops and the result types it
+-- leaves, which is what a function holding it alone needs.
+type Case = Case { op : Op, params : Array ValType, results : Array ValType }
+
+-- Returns every instruction that has no immediate beyond what its constructor
+-- carries and whose operands a function can take as parameters, in the order
+-- the specification numbers them.
+fun everyOp() -> Vec Case {
+    let cases = []
+    let add = fun(op, params, results) {
+        Vec.push(cases, Case { op = op, params = params, results = results })
+    }
+    add(Unreachable, [], [])
+    add(Nop, [], [])
+    add(Drop, [I32], [])
+    add(Select, [I32, I32, I32], [I32])
+    for (kind, t) in loads { add(Load(kind, 4), [I32], [t]) }
+    for (kind, t) in stores { add(Store(kind, 4), [I32, t], []) }
+    add(MemorySize, [], [I32])
+    add(MemoryGrow, [I32], [I32])
+    add(ConstI32(5), [], [I32])
+    add(ConstI64(5), [], [I64])
+    add(ConstF32(0x3FC00000), [], [F32])
+    add(ConstF64(1.5), [], [F64])
+    for (w, t) in widths { add(IntEqz(w), [t], [I32]) }
+    for (w, t) in widths { for r in intRels { add(IntRel(w, r), [t, t], [I32]) } }
+    for (w, t) in floatWidths { for r in floatRels { add(FloatRel(w, r), [t, t], [I32]) } }
+    for (w, t) in widths { for u in intUns { add(IntUn(w, u), [t], [t]) } }
+    for (w, t) in widths { for b in intBins { add(IntBin(w, b), [t, t], [t]) } }
+    for (w, t) in floatWidths { for u in floatUns { add(FloatUn(w, u), [t], [t]) } }
+    for (w, t) in floatWidths { for b in floatBins { add(FloatBin(w, b), [t, t], [t]) } }
+    for (c, from, to) in conversions { add(Convert(c), [from], [to]) }
+    add(MemoryCopy, [I32, I32, I32], [])
+    add(MemoryFill, [I32, I32, I32], [])
+    add(RefNull(HFunc), [], [funcref])
+    add(RefIsNull, [funcref], [I32])
+    add(RefFunc(0), [], [funcref])
+    cases
+}
+
+-- One function per instruction in `everyOp`, in one module an engine can
+-- validate, and nothing else but the memory and table they need.
+fun ops() -> Vec Byte {
+    let m = M.newModule()
+    let _ = M.addMemory(m, M.Limits { min = 1, max = None })
+    let table = M.addTable(m, M.TableType { elem = funcref,
+                                            limits = M.Limits { min = 1, max = None } })
+    for c in everyOp() {
+        let body = []
+        for var k = 0; k < len(c.params); k = k + 1 { Vec.push(body, LocalGet(k)) }
+        Vec.push(body, c.op)
+        let _ = function(m, "op", c.params, c.results, [], Vec.toArray(body))
+    }
+    -- `ref.func` needs its function, the first, to appear in an element segment.
+    M.addElem(m, table, 0, [0])
+    M.write(m)
+}
+
+fun instructions() {
+    for c in everyOp() { alone(c.op) }
+    for op in [
+        Block(Empty), Block(Value(I32)), Block(Typed(3)), Loop(Empty), If(Empty), Else, End,
+        Br(1), BrIf(2), BrTable([0, 1], 2), BrTable([], 0), Return,
+        Call(5), CallIndirect(3, 0), CallRef(4),
+        ReturnCall(200), ReturnCallIndirect(3, 1), ReturnCallRef(4),
+        RefNull(HType(2)), LocalGet(0), LocalSet(1), LocalTee(200), GlobalGet(2), GlobalSet(300),
+        Load(I32Load, 0), Load(I64Load, 300), Load(I32Load8U, 1), Load(I64Load16S, 1),
+        Load(I64Load32U, 1), Store(I32Store, 8), Store(F64Store, 8), Store(I32Store8, 8),
+        Store(I64Store16, 8), Store(I64Store32, 8),
+        ConstI32(0), ConstI32(-1), ConstI32(63), ConstI32(64), ConstI32(-64), ConstI32(-65),
+        ConstI32(0x7FFF_FFFF), ConstI32(-0x8000_0000), ConstI32(0xFFFF_FFFF),
+        ConstI32(0x8000_0000),
+        ConstI64(0), ConstI64(-1), ConstI64(9223372036854775807),
+        ConstI64(-9223372036854775807 - 1),
+        ConstF32(0), ConstF32(0xFFFF_FFFF), ConstF64(0.0), ConstF64(-2.5),
+    ] {
+        alone(op)
+    }
+}
+
+fun alone(op : Op) -> Unit {
+    let out = []
+    Encode.encode(op, out)
+    show_("op", out)
+}

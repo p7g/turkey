@@ -363,17 +363,17 @@ ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
 ### Editor support
 
 `vim/` is a Vim and Neovim plugin for `.gob` files: filetype detection,
-syntax highlighting, and indentation that follows `turkey fmt`. Add the
+syntax highlighting, and indentation that follows `turkey format`. Add the
 directory to `runtimepath`, or point a plugin manager at it
 (`Plug '~/path/to/turkey/vim'`).
 
 * It sets the formatter's layout: tabs, a tab counting as 4 columns, and
   comments wrapped at 100. Set `g:turkey_recommended_style = 0` to keep your
   own settings.
-* `:TurkeyFmt` formats the buffer with `turkey fmt`, as one undoable change.
-  A buffer that does not parse is left alone and the error is shown.
-* `let g:turkey_fmt_on_save = 1` (or `b:turkey_fmt_on_save`) formats each
-  buffer before it is written.
+* `:TurkeyFormat` formats the buffer with `turkey format`, as one undoable
+  change. A buffer that does not parse is left alone and the error is shown.
+* `let g:turkey_format_on_save = 1` (or `b:turkey_format_on_save`) formats
+  each buffer before it is written.
 * `:compiler turkey`, then `:make`, runs `turkey check` on the file and fills
   the quickfix list with its errors and lint warnings. Arguments to `:make`
   go after the file: `:make --deny-warnings`.
@@ -383,7 +383,7 @@ directory to `runtimepath`, or point a plugin manager at it
 Its tests run headless in whichever of `vim` and `nvim` are installed. They
 reindent and retype the formatter's goldens, and with a compiler
 (`TURKEY_BOOT`, else `build/stages/turkey`, else `turkey`) they test
-`:TurkeyFmt` and `:make` too:
+`:TurkeyFormat` and `:make` too:
 
 ```sh
 sh vim/test/run.sh

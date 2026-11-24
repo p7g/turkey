@@ -13,7 +13,7 @@ setlocal commentstring=--\ %s
 setlocal comments=:---,:--,s1:{-,mb:-,ex:-}
 setlocal formatoptions-=t formatoptions+=croql
 
-" The layout `turkey fmt` writes: a tab per level, and lines that fit in 100
+" The layout `turkey format` writes: a tab per level, and lines that fit in 100
 " columns counting a tab as 4. 'textwidth' wraps comments only ('formatoptions'
 " has no `t`), since the formatter breaks code. Set
 " `g:turkey_recommended_style = 0` to keep your own settings.
@@ -34,10 +34,10 @@ if exists("loaded_matchit")
   let b:match_words = '\<if\>:\<else\>'
 endif
 
-" `:TurkeyFmt` formats the buffer with `turkey fmt`; see autoload/turkey.vim.
-command! -buffer -bar TurkeyFmt call turkey#Format()
+" `:TurkeyFormat` formats the buffer with `turkey format`; see autoload/turkey.vim.
+command! -buffer -bar TurkeyFormat call turkey#Format()
 
-augroup turkey_fmt_on_save
+augroup turkey_format_on_save
   autocmd! * <buffer>
   autocmd BufWritePre <buffer> call turkey#FormatOnSave()
 augroup END
@@ -46,5 +46,5 @@ let b:undo_ftplugin = "setlocal commentstring< comments< formatoptions<"
       \ . " iskeyword< include< includeexpr< suffixesadd<"
       \ . " expandtab< tabstop< shiftwidth< softtabstop< textwidth<"
       \ . " | unlet! b:match_words"
-      \ . " | silent! delcommand -buffer TurkeyFmt"
-      \ . " | execute 'autocmd! turkey_fmt_on_save * <buffer>'"
+      \ . " | silent! delcommand -buffer TurkeyFormat"
+      \ . " | execute 'autocmd! turkey_format_on_save * <buffer>'"

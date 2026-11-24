@@ -3,7 +3,7 @@
 " Maintainer:   p7g
 "
 " Newlines in Turkey are significant by a token rule, not by layout, so
-" indentation is cosmetic. The rules below follow `turkey fmt`, so that a
+" indentation is cosmetic. The rules below follow `turkey format`, so that a
 " line typed in Vim starts where the formatter would put it, and `gg=G` on a
 " formatted file changes nothing:
 "
@@ -28,7 +28,7 @@
 "
 " Alignment padding (a match's `->`, a record's `:` and `=`, trailing
 " comments), hugging and the choice of where to break are not indentation;
-" `:TurkeyFmt` does those.
+" `:TurkeyFormat` does those.
 
 if exists("b:did_indent")
   finish

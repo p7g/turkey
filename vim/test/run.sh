@@ -2,8 +2,8 @@
 # Headless tests for the Turkey Vim plugin. Usage: sh vim/test/run.sh
 #
 # For each editor found on PATH (vim, then nvim):
-#   1. reindent (gg=G) every formatter golden, tests/fmt/*.expected.gob, and
-#      diff against the original: they are `turkey fmt` output, so an
+#   1. reindent (gg=G) every formatter golden, tests/format/*.expected.gob, and
+#      diff against the original: they are `turkey format` output, so an
 #      indentexpr that agrees with the formatter changes nothing. Once lib/
 #      is formatted (its files indent with tabs), a sample of it too
 #      (test/indent.vim);
@@ -13,7 +13,7 @@
 #      (test/syntax.vim);
 #   4. check `:compiler turkey`'s errorformat on recorded output
 #      (test/compiler.vim);
-#   5. with a compiler, check :TurkeyFmt and format-on-save (test/fmt.vim)
+#   5. with a compiler, check :TurkeyFormat and format-on-save (test/format.vim)
 #      and run `:make` on a file with lint warnings.
 #
 # Lines that steps 1 and 2 may get wrong are listed in test/indent.skip,
@@ -37,14 +37,14 @@ fi
 
 export TURKEY_VIM_DIR="$plugin"
 export TURKEY_FIXTURE="$here/fixture.gob"
-export TURKEY_FMT_DIR="$root/tests/fmt"
+export TURKEY_FORMAT_DIR="$root/tests/format"
 export TURKEY_CMD="$boot"
 export TURKEY_LINT_FILE="$root/tests/lint/empty_return_value.gob"
 
 # The files to type, and the files to reindent: those and the lib/ sample,
 # once lib/ is in the formatter's layout.
 typing="$tmp/typing.list"
-ls "$root"/tests/fmt/*.expected.gob > "$typing"
+ls "$root"/tests/format/*.expected.gob > "$typing"
 list="$tmp/indent.list"
 cp "$typing" "$list"
 sample="lib/Data/Option.gob lib/Data/Map.gob lib/Iter.gob lib/Regex.gob lib/Turkey/Scan.gob"
@@ -128,7 +128,7 @@ for editor in vim nvim; do
     run_vim "$here/syntax.vim"
     run_vim "$here/compiler.vim"
     if [ -n "$boot" ]; then
-        run_vim "$here/fmt.vim"
+        run_vim "$here/format.vim"
     fi
 
     if [ -s "$out/indent.fail" ]; then
@@ -141,7 +141,7 @@ for editor in vim nvim; do
     check_out syntax "$out/syntax.out"
     check_out compiler "$out/compiler.out"
     if [ -n "$boot" ]; then
-        check_out TurkeyFmt "$out/fmt.out"
+        check_out TurkeyFormat "$out/format.out"
     fi
 
     if [ "$failed" -eq 0 ]; then
@@ -169,7 +169,7 @@ if [ -n "$boot" ]; then
         echo "ok [fixture parses]"
     fi
 else
-    echo "note: no compiler; set TURKEY_BOOT to test :TurkeyFmt and that the fixture parses"
+    echo "note: no compiler; set TURKEY_BOOT to test :TurkeyFormat and that the fixture parses"
 fi
 
 exit "$fail"

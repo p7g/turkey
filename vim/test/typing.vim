@@ -3,7 +3,7 @@
 " where the indentexpr puts it as the line is typed: after <CR>, and again
 " when a closer or another key in 'indentkeys' starts it. Writes the result to
 " $TURKEY_OUT/typing/N.gob, where N is the file's number in the list. The
-" files are `turkey fmt` output; run.sh diffs each pair.
+" files are `turkey format` output; run.sh diffs each pair.
 execute 'set rtp+=' . fnameescape($TURKEY_VIM_DIR)
 filetype plugin indent on
 syntax on

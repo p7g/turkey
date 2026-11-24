@@ -1,6 +1,6 @@
 " Reindents each file listed in $TURKEY_INDENT_LIST, one path per line, and
 " writes the result to $TURKEY_OUT/indent/N.gob, where N is the file's
-" number in the list, counting from 1. The files are `turkey fmt` output, so
+" number in the list, counting from 1. The files are `turkey format` output, so
 " an indentexpr that agrees with the formatter leaves them unchanged; run.sh
 " diffs each pair.
 execute 'set rtp+=' . fnameescape($TURKEY_VIM_DIR)

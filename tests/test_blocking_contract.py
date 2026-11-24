@@ -23,6 +23,7 @@ from tests import bootc
 
 LIB = bootc.REPO_ROOT / "lib"
 LIBC = LIB / "Turkey" / "Libc.gob"
+OS = LIB / "Turkey" / "Os.gob"
 WORKERS = LIB / "Turkey" / "Workers.gob"
 
 NEVER_WAIT = "**Calls that never wait**"
@@ -33,7 +34,7 @@ _LEADING_NAMES = re.compile(r"^((?:`[^`]+`(?:, | and )?)+):\s")
 _FOREIGN = re.compile(r'^foreign\s+"[^"]+"\s+fun\s+(\w+)', re.MULTILINE)
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
 _IMPORT = re.compile(r"^import\s+Turkey\.(Libc|Os)\b(.*)$")
-_CALL = re.compile(r"\b(?:Libc|Os)\.(\w+)\(")
+_CALL = re.compile(r"\b(?:Libc|Os)\.(\w+)")
 
 
 def _bullets(heading: str) -> list[str]:
@@ -150,6 +151,20 @@ def test_every_call_that_can_wait_is_carried_or_excused():
         "these C calls can wait on something outside the program; make each "
         "through a `Turkey.Workers.blocking*` entry, or list it, with its "
         "reason, in the contract in Turkey.Workers:\n" + "\n".join(waiting))
+
+
+def test_os_makes_only_the_libc_call_it_is_named_for():
+    """What lets `_calls` count `Os.f` as `Libc.f`: each function of
+    `Turkey.Os` calls `Turkey.Libc`'s function of its own name and no other."""
+    source = OS.read_text(encoding="utf-8")
+    functions = re.split(r"^(?=fun )", source, flags=re.MULTILINE)[1:]
+    assert functions, f"no functions in {OS}"
+    for body in functions:
+        name = re.match(r"fun (\w+)", body).group(1)
+        code = "\n".join(_STRING.sub('""', line).split("--", 1)[0]
+                         for line in body.splitlines())
+        called = re.findall(r"\bLibc\.(\w+)", code)
+        assert called == [name], f"Turkey.Os.{name} calls {called}, not Libc.{name} alone"
 
 
 def test_no_excuse_outlives_its_call():

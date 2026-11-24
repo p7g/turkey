@@ -95,7 +95,19 @@ fun valType(out : Vec Byte, t : ValType) -> Unit = match t {
 -- LEB128, which keeps the two apart: an index is never negative.
 fun heapType(out : Vec Byte, h : HeapType) -> Unit = match h {
     HFunc -> Vec.push(out, Byte.truncate(0x70))
-    HType(index) -> signedLEB(out, index)
+    HType(index) -> {
+        checkIndex("type", index)
+        signedLEB(out, index)
+    }
+}
+
+-- Raises an internal error for a negative index, which signed encodings would
+-- otherwise write as a different thing: `HType(-16)` as the byte for `func`.
+fun checkIndex(what : String, index : Int) -> Unit {
+    if index < 0 {
+        error("internal error: the " + what + " index " + Int.toString(index)
+              + " is negative")
+    }
 }
 
 --- Appends a function type: the `0x60` that marks it, then the parameters and
@@ -109,7 +121,10 @@ fun funcType(out : Vec Byte, t : FuncType) -> Unit {
 fun blockType(out : Vec Byte, t : BlockType) -> Unit = match t {
     Empty -> Vec.push(out, Byte.truncate(0x40))
     Value(v) -> valType(out, v)
-    Typed(index) -> signedLEB(out, index)
+    Typed(index) -> {
+        checkIndex("type", index)
+        signedLEB(out, index)
+    }
 }
 
 --- Appends `ops` as a function body's code or a constant expression: each
@@ -210,17 +225,23 @@ fun encode(op : Op, out : Vec Byte) -> Unit = match op {
     RefFunc(f) -> indexed(out, 0xD2, f)
     Drop -> byte(out, 0x1A)
     Select -> byte(out, 0x1B)
+    SelectT(t) -> {
+        byte(out, 0x1C)
+        vector(out, [t], valType)
+    }
     LocalGet(n) -> indexed(out, 0x20, n)
     LocalSet(n) -> indexed(out, 0x21, n)
     LocalTee(n) -> indexed(out, 0x22, n)
     GlobalGet(n) -> indexed(out, 0x23, n)
     GlobalSet(n) -> indexed(out, 0x24, n)
     Load(kind, offset) -> {
+        checkOffset(offset)
         byte(out, loadOpcode(kind))
         unsignedLEB(out, W.naturalAlignment(kind))
         unsignedLEB(out, offset)
     }
     Store(kind, offset) -> {
+        checkOffset(offset)
         byte(out, storeOpcode(kind))
         unsignedLEB(out, storeAlignment(kind))
         unsignedLEB(out, offset)
@@ -285,6 +306,14 @@ fun encode(op : Op, out : Vec Byte) -> Unit = match op {
         } else {
             byte(out, code)
         }
+    }
+}
+
+-- A memory operand's offset is an unsigned 32-bit immediate.
+fun checkOffset(offset : Int) -> Unit {
+    if offset < 0 || offset > 0xFFFF_FFFF {
+        error("internal error: the memory offset " + Int.toString(offset)
+              + " does not fit in 32 bits")
     }
 }
 

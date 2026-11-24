@@ -197,6 +197,19 @@ def test_typed_function_references():
     )
 
 
+def test_a_function_reference_nothing_declares_gets_a_declarative_segment():
+    # Flag 3 is a declarative segment: `03`, the element kind `00`, the functions.
+    assert _module("declared") == hx(
+        MAGIC,
+        section(1, "02", "60 00 00", "60 00 01", FUNCREF),
+        section(3, "02", "00", "01"),
+        section(7, "01", name_of("wants"), "00", "01"),
+        section(9, "01", "03 00", "01 00"),
+        section(10, "02", body("00", "0b"), body("00", "d2 00", "0b")),
+        names("kept", "wants"),
+    )
+
+
 def test_a_wasi_program_that_writes_hello():
     text = "hello\n".encode().hex()
     wasi = "wasi_snapshot_preview1"
@@ -242,7 +255,7 @@ def test_signed_leb128(n, expected):
 
 def _every_op() -> list[str]:
     """The instruction table of the binary format, in the order `everyOp` lists."""
-    ops = ["00", "01", "1a", "1b"]
+    ops = ["00", "01", "1a", "1b", "1c017c", "1c0170"]
     loads = [0x28 + k for k in range(14)]
     load_align = [2, 3, 2, 3, 0, 0, 1, 1, 0, 0, 1, 1, 2, 2]
     ops += [f"{o:02x}{a:02x}04" for o, a in zip(loads, load_align)]
@@ -297,12 +310,26 @@ def _write(tmp_path: Path, name: str) -> Path:
     return path
 
 
+def _compile(tmp_path: Path, name: str, *flags: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([WASMTIME, "compile", *flags, "-o", str(tmp_path / "out.cwasm"),
+                           str(_write(tmp_path, name))], capture_output=True, text=True)
+
+
 @needs_wasmtime
 @pytest.mark.parametrize("name", ["empty", "add", "sections", "imports", "control", "tail",
-                                  "hello", "ops"])
+                                  "declared", "hello", "ops"])
 def test_wasmtime_validates_each_module(tmp_path, name):
-    result = subprocess.run([WASMTIME, "compile", "-o", str(tmp_path / "out.cwasm"),
-                             str(_write(tmp_path, name))], capture_output=True, text=True)
+    result = _compile(tmp_path, name)
+    assert result.returncode == 0, result.stderr
+
+
+@needs_wasmtime
+def test_wasmtime_validates_typed_function_references(tmp_path):
+    # Typed function references are on by default only in newer wasmtime, so
+    # an older one is asked for them.
+    result = _compile(tmp_path, "refs")
+    if result.returncode != 0:
+        result = _compile(tmp_path, "refs", "-W", "function-references=y,gc=y")
     assert result.returncode == 0, result.stderr
 
 

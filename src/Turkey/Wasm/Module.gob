@@ -20,9 +20,14 @@ export (
 --- index would change underneath whoever holds it.
 ---
 --- **Functions are declared, then defined.** A call names a function that may
---- not have its body yet -- a recursive one, or one selected later -- so
---- `declareFunc` fixes the index and the type and `defineFunc` supplies the
---- code. Writing a module with a function never defined is an internal error.
+--- not have its body yet -- a recursive one -- so `declareFunc` fixes the index
+--- and the type and `defineFunc` supplies the code. Writing a module with a
+--- function never defined is an internal error.
+---
+--- **References to functions are declared for the caller.** The engine rejects
+--- a `ref.func` of a function that is not exported, not in an element segment
+--- and not named by a global's initial value. `write` adds one declarative
+--- element segment holding every such function that a body names.
 ---
 --- **Sizes are not known until the contents are written.** Each section, and
 --- each function body, is written into a buffer of its own and copied after its
@@ -36,8 +41,9 @@ export (
 --- export, element, code and data sections, and a `name` custom section naming
 --- each function so a trace shows `fd_write` and not `wasm-function[3]`. No
 --- start section: a module is entered through an export. No data count
---- section, since nothing selects an instruction that needs one.
+--- section, since `Op` has no instruction that needs one.
 
+import Data.Set as Set
 import Turkey.Wasm (ValType(..), FuncType(..), Op(..))
 import Turkey.Wasm.Encode as Encode
 
@@ -224,7 +230,7 @@ fun write(m : Module) -> Vec Byte {
     section(out, 5, m.memories, limits)
     section(out, 6, m.globals, global)
     section(out, 7, m.exports, exportEntry)
-    section(out, 9, m.elems, elem)
+    elemSection(out, m)
     section(out, 10, m.funcs, code)
     section(out, 11, m.datas, data)
     nameSection(out, m)
@@ -327,6 +333,57 @@ fun elem(out : Vec Byte, e : Elem) -> Unit {
     Encode.expression(out, [ConstI32(e.offset)])
     if e.table != 0 { Vec.push(out, Byte.truncate(0x00)) }
     Encode.vector(out, e.funcs, Encode.unsignedLEB)
+}
+
+-- The element section: the module's segments, then one declarative segment
+-- (flag 3, then the element kind `funcref` and the functions) for the
+-- functions `undeclared` finds.
+fun elemSection(out : Vec Byte, m : Module) -> Unit {
+    let declared = undeclared(m)
+    let count = len(m.elems) + (if len(declared) > 0 { 1 } else { 0 })
+    if count == 0 { return }
+    let body : Vec Byte = []
+    Encode.unsignedLEB(body, count)
+    for e in m.elems { elem(body, e) }
+    if len(declared) > 0 {
+        Vec.push(body, Byte.truncate(0x03))
+        Vec.push(body, Byte.truncate(0x00))
+        Encode.vector(body, declared, Encode.unsignedLEB)
+    }
+    framed(out, 9, body)
+}
+
+-- Returns, ascending, the functions some body takes a reference to with
+-- `RefFunc` that nothing else declares: not exported, not in an element
+-- segment and not named by a global's initial value, each of which the engine
+-- counts as a declaration.
+fun undeclared(m : Module) -> Array Int {
+    let declared : Set.Set Int = Set.new()
+    for e in m.exports {
+        if e.kind == ExportFunc { Set.add(declared, e.index) }
+    }
+    for e in m.elems {
+        for f in e.funcs { Set.add(declared, f) }
+    }
+    for g in m.globals {
+        for op in g.init {
+            if let RefFunc(f) = op { Set.add(declared, f) }
+        }
+    }
+    let missing : Vec Int = []
+    for f in m.funcs {
+        if let Some((_, ops)) = f.body {
+            for op in ops {
+                if let RefFunc(target) = op {
+                    if !Set.contains(declared, target) {
+                        Set.add(declared, target)
+                        Vec.push(missing, target)
+                    }
+                }
+            }
+        }
+    }
+    Vec.toArray(Vec.sort(missing))
 }
 
 -- The same two forms for memory 0 and for another memory.

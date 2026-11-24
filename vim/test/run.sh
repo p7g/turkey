@@ -8,7 +8,9 @@
 #      is formatted (its files indent with tabs), a sample of it too
 #      (test/indent.vim);
 #   2. type each golden afresh, line by line without its indentation, and
-#      require the same file (test/typing.vim);
+#      require the same file (test/typing.vim). Steps 1 and 2 also run on
+#      test/brackets.gob, whose literals and comments hold brackets, and run
+#      again with syntax highlighting off;
 #   3. probe syntax groups at a few dozen positions in test/fixture.gob
 #      (test/syntax.vim);
 #   4. check `:compiler turkey`'s errorformat on recorded output
@@ -45,6 +47,7 @@ export TURKEY_LINT_FILE="$root/tests/lint/empty_return_value.gob"
 # once lib/ is in the formatter's layout.
 typing="$tmp/typing.list"
 ls "$root"/tests/format/*.expected.gob > "$typing"
+echo "$here/brackets.gob" >> "$typing"
 list="$tmp/indent.list"
 cp "$typing" "$list"
 sample="lib/Data/Option.gob lib/Data/Map.gob lib/Iter.gob lib/Regex.gob lib/Turkey/Scan.gob"
@@ -106,7 +109,7 @@ compare() { # WHAT LIST DIR: diff each file in LIST with DIR/N.gob.
 }
 
 run_vim() { # SCRIPT: run it, keeping what the editor prints in a log.
-    log="$out/$(basename "$1" .vim).log"
+    log="$out/$(basename "$1" .vim)${TURKEY_SYNTAX:+-nosyntax}.log"
     if [ "$editor" = nvim ]; then
         nvim --headless -u NONE -i NONE -n -S "$1" </dev/null >"$log" 2>&1
     else
@@ -125,6 +128,13 @@ for editor in vim nvim; do
 
     run_vim "$here/indent.vim"
     run_vim "$here/typing.vim"
+    # Not as `TURKEY_SYNTAX=off run_vim ...`: a POSIX shell may keep an
+    # assignment before a function call after it returns.
+    TURKEY_SYNTAX=off
+    export TURKEY_SYNTAX
+    run_vim "$here/indent.vim"
+    run_vim "$here/typing.vim"
+    unset TURKEY_SYNTAX
     run_vim "$here/syntax.vim"
     run_vim "$here/compiler.vim"
     if [ -n "$boot" ]; then
@@ -138,6 +148,8 @@ for editor in vim nvim; do
     fi
     compare reindenting "$list" "$out/indent"
     compare typing "$typing" "$out/typing"
+    compare "reindenting without syntax" "$list" "$out/indent-nosyntax"
+    compare "typing without syntax" "$typing" "$out/typing-nosyntax"
     check_out syntax "$out/syntax.out"
     check_out compiler "$out/compiler.out"
     if [ -n "$boot" ]; then

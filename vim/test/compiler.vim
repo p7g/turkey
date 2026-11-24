@@ -24,8 +24,8 @@ endfunction
 
 enew
 compiler turkey
-call s:Check('makeprg runs turkey check on the file',
-      \ &l:makeprg ==# get(g:, 'turkey_command', 'turkey') . ' check %', &l:makeprg)
+call s:Check('makeprg runs turkey check on the file, quoted',
+      \ &l:makeprg ==# shellescape(get(g:, 'turkey_command', 'turkey')) . ' check %:S', &l:makeprg)
 
 " `:cgetexpr` reads with the global 'errorformat'; `:make` with the local one.
 let &g:errorformat = &l:errorformat
@@ -47,14 +47,21 @@ call s:Check('errorformat reads warnings, errors and phase errors, and drops the
       \ s:Entries() ==# s:want, string(s:Entries()))
 
 if $TURKEY_CMD !=# '' && $TURKEY_LINT_FILE !=# ''
-  execute 'edit! ' . fnameescape($TURKEY_LINT_FILE)
+  " A copy under a path with spaces, which the shell must see as one word.
+  let s:dir = $TURKEY_OUT . '/sp ace'
+  call mkdir(s:dir, 'p')
+  let s:file = s:dir . '/lint file.gob'
+  call writefile(readfile($TURKEY_LINT_FILE), s:file)
+  execute 'edit! ' . fnameescape(s:file)
   compiler turkey
   silent make!
   let s:entries = s:Entries()
+  let s:wrong = filter(copy(s:entries), {_, e -> e[0] !=# 'w' || e[1] <= 0 || e[2] <= 0
+        \ || e[3] !~# ' \[empty-return-value\]$' || e[4] !=# 'lint file.gob'})
   call s:Check(':make fills the quickfix list from turkey check',
-        \ len(s:entries) > 0 && empty(filter(copy(s:entries),
-        \   {_, e -> e[0] !=# 'w' || e[1] == 0 || e[3] !~# '\[[a-z-]\+\]$'})),
-        \ string(getqflist()))
+        \ len(s:entries) == 9 && empty(s:wrong), string(s:entries))
+  call s:Check(':make reads the first warning''s position',
+        \ !empty(s:entries) && s:entries[0][1:2] == [6, 22], string(s:entries[:0]))
 endif
 
 call writefile(s:out, $TURKEY_OUT . '/compiler.out')

@@ -49,9 +49,6 @@ endif
 let s:save_cpo = &cpo
 set cpo&vim
 
-" Skip over strings, characters and comments when matching brackets.
-let s:skip_expr = 'synIDattr(synID(line("."), col("."), 1), "name") =~? "comment\\|directive\\|string\\|char"'
-
 " How many lines a bracket scan may walk back before giving up. Beyond that
 " the line reads as top level, which only degrades indentation inside a
 " bracket that is thousands of lines long.
@@ -77,29 +74,83 @@ let s:prec = {
       \ '<<': 9, '>>': 9,
       \ }
 
-function! s:CodePart(lnum) abort
-  " Returns the line with literals padded over and comments cut, so that
-  " its first and last characters can be tested without lookalikes inside
-  " `-- ...`, strings or characters getting in the way. Pad with `x` rather
-  " than truncate, so that columns still line up with the real line and a
-  " line that ends in a literal does not look like it ends in whatever came
-  " before the literal.
-  let line = getline(a:lnum)
-  let line = substitute(line, '''\([^''\\]\|\\.\|\\u{\x\+}\)''', {m -> repeat('x', len(m[0]))}, 'g')
-  let line = substitute(line, '"\([^"\\]\|\\.\)*"', {m -> repeat('x', len(m[0]))}, 'g')
+" A line's text with its literals and comments masked, by text. Masking is a
+" function of the text alone, and each line is masked many times over as the
+" lines below it are indented.
+let s:masked = {}
+
+function! s:Pad(m) abort
+  return repeat('x', len(a:m[0]))
+endfunction
+
+function! s:PadLiterals(line) abort
+  " Returns a:line with its characters, strings and one-line block comments
+  " padded over with `x`.
+  let line = substitute(a:line, '''\([^''\\]\|\\.\|\\u{\x\+}\)''', function('s:Pad'), 'g')
+  let line = substitute(line, '"\([^"\\]\|\\.\)*"', function('s:Pad'), 'g')
+  " Block comments nest, so pad the innermost pairs first.
+  while 1
+    let padded = substitute(line, '{-\%(\%({-\|-}\)\@!.\)*-}', function('s:Pad'), 'g')
+    if padded ==# line
+      return line
+    endif
+    let line = padded
+  endwhile
+endfunction
+
+function! s:CommentEnd(line) abort
+  " Returns the column just past a `-}` on a:line that ends a block comment
+  " begun on a line above, or -1. Only a comment can hold an unpaired `-}`,
+  " so everything before it is comment too.
+  return matchend(s:PadLiterals(a:line), '.*-}')
+endfunction
+
+function! s:Mask(line) abort
+  " Returns a:line with its literals and comments padded over with `x`, and
+  " its line comment cut. Pad rather than cut the rest, so that columns
+  " still line up with the real line, and with a letter, so that a line that
+  " ends in a literal does not look like it ends in whatever came before it.
+  let line = s:PadLiterals(a:line)
+  let close = matchend(line, '.*-}')
+  if close >= 0
+    let line = repeat('x', close) . strpart(line, close)
+  endif
   let line = substitute(line, '--.*$', '', '')
-  let line = substitute(line, '{-.*$', '', '')
-  return line
+  return substitute(line, '{-.*$', '', '')
+endfunction
+
+function! s:CodePart(lnum) abort
+  " Returns the line with literals and comments masked (see s:Mask), so
+  " that its first and last characters, and its brackets, can be tested
+  " without lookalikes inside them getting in the way.
+  let line = getline(a:lnum)
+  if !has_key(s:masked, line)
+    if len(s:masked) > 20000
+      let s:masked = {}
+    endif
+    let s:masked[line] = s:Mask(line)
+  endif
+  return s:masked[line]
+endfunction
+
+function! s:HasSyntax() abort
+  return get(b:, "current_syntax", "") ==# "turkey"
 endfunction
 
 function! s:InBlockComment(lnum) abort
   " Returns whether the line starts inside a `{- -}` comment that began on
   " an earlier line. A line that starts with `{-` at column 1 begins one.
+  " Without syntax highlighting, only a line that ends the comment is known
+  " to be inside it: telling an interior line from code would mean reading
+  " the file from its start.
   let line = getline(a:lnum)
   if line =~# '^{-'
     return 0
   endif
-  return synIDattr(synID(a:lnum, 1, 1), "name") ==# 'turkeyBlockComment'
+  if s:HasSyntax()
+    return synIDattr(synID(a:lnum, 1, 1), "name") ==# 'turkeyBlockComment'
+  endif
+  return s:CommentEnd(line) >= 0
 endfunction
 
 function! s:IsComment(lnum) abort
@@ -108,7 +159,19 @@ function! s:IsComment(lnum) abort
   if line !~# '\S'
     return 0
   endif
-  return synIDattr(synID(a:lnum, match(line, '\S') + 1, 1), "name") =~? 'comment\|directive'
+  if s:HasSyntax()
+    return synIDattr(synID(a:lnum, match(line, '\S') + 1, 1), "name") =~? 'comment\|directive'
+  endif
+  return line =~# '^\s*\%(--\|{-\)' || s:InBlockComment(a:lnum)
+endfunction
+
+function! s:ScanCode(lnum) abort
+  " Returns the line as the bracket scan reads it: masked, and empty when
+  " it lies wholly inside a block comment.
+  if getline(a:lnum) !~# '-}' && s:InBlockComment(a:lnum)
+    return ''
+  endif
+  return s:CodePart(a:lnum)
 endfunction
 
 function! s:PrevCode(lnum) abort
@@ -132,30 +195,33 @@ endfunction
 function! s:ScanBack(lnum, col) abort
   " Returns [lnum, col, char] of the innermost bracket left open before
   " (a:lnum, a:col), or [0, 0, ''] when everything before it is balanced.
-  " Walk backward over all three kinds with one stack: one combined pass is
-  " much cheaper than a searchpair() per kind.
-  let save = winsaveview()
-  call cursor(a:lnum, a:col)
-  let stopline = a:lnum > s:maxback ? a:lnum - s:maxback : 0
-  let stack = []
-  let result = [0, 0, '']
+  " Brackets inside literals and comments are masked (see s:ScanCode), so
+  " this needs no syntax highlighting. One count serves all three kinds:
+  " the formatter's input parses, so its brackets pair up.
+  let stop = a:lnum > s:maxback ? a:lnum - s:maxback : 1
+  let depth = 0
+  let l = a:lnum
+  let code = strpart(s:ScanCode(l), 0, a:col - 1)
   while 1
-    let pos = searchpos('[](){}[]', 'bW', stopline, 0, s:skip_expr)
-    if pos[0] == 0
-      break
+    let brackets = substitute(code, '[^][(){}]', '', 'g')
+    let i = len(brackets) - 1
+    while i >= 0
+      if brackets[i] =~# '[])}]'
+        let depth += 1
+      elseif depth > 0
+        let depth -= 1
+      else
+        " The opener is the line's (i + 1)th bracket.
+        return [l, match(code, '[][(){}]', 0, i + 1) + 1, brackets[i]]
+      endif
+      let i -= 1
+    endwhile
+    let l -= 1
+    if l < stop
+      return [0, 0, '']
     endif
-    let ch = getline(pos[0])[pos[1] - 1]
-    if ch =~# '[])}]'
-      call add(stack, ch)
-    elseif empty(stack)
-      let result = [pos[0], pos[1], ch]
-      break
-    else
-      call remove(stack, -1)
-    endif
+    let code = s:ScanCode(l)
   endwhile
-  call winrestview(save)
-  return result
 endfunction
 
 function! s:LeavesOpen(code) abort

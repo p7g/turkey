@@ -5,8 +5,13 @@
 " diffs each pair.
 execute 'set rtp+=' . fnameescape($TURKEY_VIM_DIR)
 filetype plugin indent on
-syntax on
-call mkdir($TURKEY_OUT . '/indent', 'p')
+" With TURKEY_SYNTAX=off, indent without syntax highlighting, into
+" $TURKEY_OUT/indent-nosyntax instead.
+let s:dir = $TURKEY_OUT . '/indent' . ($TURKEY_SYNTAX ==# 'off' ? '-nosyntax' : '')
+if $TURKEY_SYNTAX !=# 'off'
+  syntax on
+endif
+call mkdir(s:dir, 'p')
 let s:n = 0
 for s:path in readfile($TURKEY_INDENT_LIST)
   let s:n += 1
@@ -16,7 +21,7 @@ for s:path in readfile($TURKEY_INDENT_LIST)
           \ $TURKEY_OUT . '/indent.fail', 'a')
   endif
   normal! gg=G
-  execute 'write! ' . fnameescape($TURKEY_OUT . '/indent/' . s:n . '.gob')
+  execute 'write! ' . fnameescape(s:dir . '/' . s:n . '.gob')
   bwipeout!
 endfor
 qa!

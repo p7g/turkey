@@ -379,6 +379,7 @@ directory to `runtimepath`, or point a plugin manager at it
   go after the file: `:make --deny-warnings`.
 * Both run `turkey` from `PATH`; set `g:turkey_command` (or
   `b:turkey_command`) to use another, such as `build/stages/turkey`.
+  `:compiler turkey` reads it when it runs, so set it first.
 
 Its tests run headless in whichever of `vim` and `nvim` are installed. They
 reindent and retype the formatter's goldens, and with a compiler

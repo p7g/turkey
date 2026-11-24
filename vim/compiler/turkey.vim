@@ -5,7 +5,9 @@
 " `:compiler turkey` then `:make` runs `turkey check` on the current file and
 " fills the quickfix list with its errors and lint warnings. Arguments to
 " `:make` go after the file: `:make --deny-warnings`. The command is
-" `b:turkey_command`, else `g:turkey_command`, else `turkey` on 'PATH'.
+" `b:turkey_command`, else `g:turkey_command`, else `turkey` on 'PATH', as
+" set when `:compiler turkey` runs; set it before then, or run `:compiler
+" turkey` again after changing it.
 
 if exists("current_compiler")
   finish
@@ -19,7 +21,8 @@ endif
 let s:save_cpo = &cpo
 set cpo&vim
 
-execute "CompilerSet makeprg=" . escape(turkey#Command() . " check %", ' \|"')
+" `%:S` quotes the file name for the shell, so a path with spaces is one word.
+execute "CompilerSet makeprg=" . escape(shellescape(turkey#Command()) . " check %:S", ' \|"')
 
 " A diagnostic is `FILE:LINE:COL: KIND: MESSAGE`, where KIND is `warning`,
 " `error`, or a phase's error (`parse error`, `type error`), and a lint's

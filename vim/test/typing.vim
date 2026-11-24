@@ -6,8 +6,13 @@
 " files are `turkey format` output; run.sh diffs each pair.
 execute 'set rtp+=' . fnameescape($TURKEY_VIM_DIR)
 filetype plugin indent on
-syntax on
-call mkdir($TURKEY_OUT . '/typing', 'p')
+" With TURKEY_SYNTAX=off, indent without syntax highlighting, into
+" $TURKEY_OUT/typing-nosyntax instead.
+let s:dir = $TURKEY_OUT . '/typing' . ($TURKEY_SYNTAX ==# 'off' ? '-nosyntax' : '')
+if $TURKEY_SYNTAX !=# 'off'
+  syntax on
+endif
+call mkdir(s:dir, 'p')
 let s:n = 0
 for s:path in readfile($TURKEY_TYPING_LIST)
   let s:n += 1
@@ -25,6 +30,6 @@ for s:path in readfile($TURKEY_TYPING_LIST)
       execute "normal! o" . s:lines[s:i] . "\<Esc>"
     endif
   endfor
-  execute 'write! ' . fnameescape($TURKEY_OUT . '/typing/' . s:n . '.gob')
+  execute 'write! ' . fnameescape(s:dir . '/' . s:n . '.gob')
 endfor
 qa!

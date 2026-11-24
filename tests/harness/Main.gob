@@ -11,6 +11,11 @@
 --   -v                 list the passes too, with their times
 --   --shard I/N        run only shard I of N, counting from 1
 --   --timeout-scale F  multiply every time limit by F
+--   --target T         compile for T, `host` (the default) or `wasm32-wasi`;
+--                      a target but the host runs only the programs of
+--                      `tests/programs/`, against the host's goldens, under
+--                      `wasmtime`, and skips them all where it is not
+--                      installed, unless `$TURKEY_REQUIRE_WASMTIME` is set
 --   --selftest         run the harness's own cases instead of the programs,
 --                      the archives and the reference
 --   --bless            write each selected case's actual results over its
@@ -42,6 +47,7 @@ import Reference as Reference
 import Report as Report
 import Schedule as Schedule
 import Selftest as Selftest
+import Toolchain (Target(..))
 import Toolchain as Toolchain
 
 type Options = Options {
@@ -54,6 +60,7 @@ type Options = Options {
     var scale : Float,
     var selftest : Bool,
     var bless : Bool,
+    var target : Target,
     selections : Vec String,
 }
 
@@ -62,13 +69,21 @@ fun main() {
     -- available to a task running on another worker.
     let o = options(Env.args())
     let watch = Stopwatch.start()
-    let t = Toolchain.detect(o.root, o.boot, o.scale)
+    let t = Toolchain.detect(o.root, o.boot, o.scale, o.target)
+    if !Toolchain.isHost(t.target) && Option.isNone(t.wasmtime) && Option.isSome(Env.get("TURKEY_REQUIRE_WASMTIME")) {
+        die("wasmtime is not installed, and TURKEY_REQUIRE_WASMTIME is set")
+    }
     Cache.evict(o.cache)
     let cache = match Cache.open(o.cache, t) {
         Right(c) -> c
         Left(e) -> die("cannot read what the cache key is made of: " + Error.describe(e))
     }
     let found = if o.selftest { Selftest.cases(o.root, o.cache) }
+                -- The goldens are the host's, and a program's is the one
+                -- every target must match; an archive's dumps and a
+                -- reference example's diagnostics are the same for every
+                -- target, and are the host run's to check.
+                else if !Toolchain.isHost(o.target) { Programs.discover(o.root + "/tests/programs", "tests/programs") }
                 else {
                     Programs.discover(o.root + "/tests/programs", "tests/programs")
                     + Programs.discover(o.root + "/tests/lint", "tests/lint")
@@ -77,10 +92,16 @@ fun main() {
                     + Reference.cases(o.root + "/docs/ref", "docs/ref", o.cache + "/reference")
                 }
     let selected = Array.filter(found, \chosen(o, _.name))
-    let timingsFile = o.cache + "/timings"
+    -- Per target, since a case's time under wasmtime is not its time on the
+    -- host, and a host run's actual results are not overwritten by another.
+    let suffix = match o.target {
+        Host -> ""
+        _ -> "-" + Toolchain.targetName(o.target)
+    }
+    let timingsFile = o.cache + "/timings" + suffix
     let timings = Schedule.readTimings(timingsFile)
     let cases = Schedule.ordered(selected, timings)
-    let actual = o.cache + "/actual"
+    let actual = o.cache + "/actual" + suffix
     let ran = Schedule.runAll(cases, o.jobs, Execute.execute(t, cache, actual, _))
     -- Reported in name order, whatever order they ran in.
     let byName = Array.sortByKey(ran, _.0.name)
@@ -134,7 +155,7 @@ fun selector(s : String) -> (String, String) = Option.unwrapOr(String.splitOnce(
 fun options(args : Array String) -> Options {
     let o = Options {
         root = ".", boot = "boot", cache = "", jobs = Parallel.workers(), verbose = False,
-        shard = None, scale = 1.0, selftest = False, bless = False,
+        shard = None, scale = 1.0, selftest = False, bless = False, target = Host,
         selections = [],
     }
     let p = Args.parser(args)
@@ -156,6 +177,13 @@ fun options(args : Array String) -> Options {
                         None -> die("--timeout-scale takes a number, not '" + v + "'")
                     }
                 }
+                Long("target") -> {
+                    let v = valueOf(p)
+                    o.target = match Toolchain.target(v) {
+                        Some(t) -> t
+                        None -> die("--target takes host or wasm32-wasi, not '" + v + "'")
+                    }
+                }
                 Long("selftest") -> { o.selftest = True }
                 Long("bless") -> { o.bless = True }
                 Value(path) -> Vec.push(o.selections, path)
@@ -167,6 +195,10 @@ fun options(args : Array String) -> Options {
     -- The selftest checks what bless decides without writing; blessing its
     -- cases would overwrite the goldens that make them what they are.
     if o.selftest && o.bless { die("--bless and --selftest cannot be given together") }
+    -- Every target is compared with the host's goldens, so only a host run
+    -- may write them.
+    if !Toolchain.isHost(o.target) && o.bless { die("--bless writes the host's goldens; it takes no --target") }
+    if !Toolchain.isHost(o.target) && o.selftest { die("--selftest runs on the host; it takes no --target") }
     o
 }
 

@@ -1,4 +1,5 @@
-export (Toolchain(..), detect, words, command, caseCommand, limit, satisfies, text)
+export (Toolchain(..), Target(..), detect, target, targetName, isHost, words, command, caseCommand, buildFlags,
+        programCommand, comparable, limit, satisfies, text)
 
 --- The programs a case is run with -- `turkey`, the C compiler a case may
 --- require, and the prefix that runs what `turkey` wrote -- and how each is
@@ -8,6 +9,9 @@ export (Toolchain(..), detect, words, command, caseCommand, limit, satisfies, te
 --- for running a program (`qemu-aarch64-static`), empty when unset.
 --- `scripts/build.sh` reads the same two. Both are split into words at
 --- spaces, with no quoting.
+---
+--- The target is what each case is compiled for: the host, or `wasm32-wasi`,
+--- whose modules `wasmtime` runs. `$TURKEY_RUN` is not used for a module.
 
 import Process (Command, Output(..), Status(..))
 import Process as Process
@@ -15,6 +19,29 @@ import System.Env as Env
 import Time.Duration (Duration)
 import Time.Duration as Duration
 import Case (Case(..), Requirement(..))
+
+--- What a case is compiled for: the platform `turkey` runs on, or WASI
+--- preview 1, as `turkey build --target wasm32-wasi` writes it.
+type Target = Host | Wasm32Wasi
+
+--- Returns the target `name` names, as `--target` takes it.
+fun target(name : String) -> Option Target = match name {
+    "host" -> Some(Host)
+    "wasm32-wasi" -> Some(Wasm32Wasi)
+    _ -> None
+}
+
+--- Returns whether `t` is the host.
+fun isHost(t : Target) -> Bool = match t {
+    Host -> True
+    Wasm32Wasi -> False
+}
+
+--- Returns the name `--target` takes for `t`.
+fun targetName(t : Target) -> String = match t {
+    Host -> "host"
+    Wasm32Wasi -> "wasm32-wasi"
+}
 
 type Toolchain = Toolchain {
     root : String,
@@ -31,11 +58,14 @@ type Toolchain = Toolchain {
     hasCc : Bool,
     hasAs : Bool,
     timeoutScale : Float,
+    target : Target,
+    --- `wasmtime`'s path, where it answered `--version`.
+    wasmtime : Option String,
 }
 
 fun words(s : String) -> Array String = Vec.toArray(String.words(s))
 
-fun detect(root : String, boot : String, scale : Float) -> Toolchain {
+fun detect(root : String, boot : String, scale : Float, target : Target) -> Toolchain {
     let cc = words(Option.unwrapOr(Env.get("TURKEY_CC"), "cc"))
     let cc = if len(cc) == 0 { ["cc"] } else { cc }
     let run = words(Option.unwrapOr(Env.get("TURKEY_RUN"), ""))
@@ -53,6 +83,11 @@ fun detect(root : String, boot : String, scale : Float) -> Toolchain {
         hasCc = Option.isSome(version),
         hasAs = Option.isSome(answer(["as", "--version"])),
         timeoutScale = scale,
+        target = target,
+        wasmtime = match target {
+            Host -> None
+            Wasm32Wasi -> Option.map(answer(["wasmtime", "--version"]), fun(_) = "wasmtime")
+        },
     }
 }
 
@@ -94,18 +129,63 @@ fun caseCommand(t : Toolchain, c : Case, argv : Array String) -> Command {
     command
 }
 
+--- Returns what `turkey build` is given besides the output and the entry.
+fun buildFlags(t : Toolchain) -> Array String = match t.target {
+    Host -> []
+    Wasm32Wasi -> ["--target", "wasm32-wasi"]
+}
+
+--- Returns the command that runs `binary`, case `c`'s compiled program: under
+--- `$TURKEY_RUN` on the host; under `wasmtime run` for `wasm32-wasi`, with the
+--- case's directory preopened as `.` and its environment passed to the
+--- module.
+fun programCommand(t : Toolchain, c : Case, binary : String) -> Array String = match t.target {
+    Host -> t.run + [binary]
+    Wasm32Wasi -> {
+        -- On wasmtime's own engine stack, 512 KiB, which every golden fits in.
+        let argv = [Option.unwrapOr(t.wasmtime, "wasmtime"), "run", "--dir", "."]
+        for (name, value) in c.environment { Vec.push(argv, "--env"); Vec.push(argv, name + "=" + value) }
+        Vec.push(argv, binary)
+        Vec.toArray(argv)
+    }
+}
+
+--- Returns `warnings`, what `turkey build` printed for case `c`, without
+--- the warning that only the target gives and the reference says it gives.
+--- For `wasm32-wasi` that is the count of functions built as traps, removed
+--- only where it is the whole of its line and the count is the one every
+--- program reaching the scheduler gets. The rest is left byte for byte, to be
+--- compared with the host's golden.
+fun comparable(t : Toolchain, c : Case, warnings : String) -> String = match t.target {
+    Host -> warnings
+    Wasm32Wasi -> {
+        let line = c.entry + ": warning: " + trapCount + "\n"
+        let kept = String.replace("\n" + warnings, "\n" + line, "\n")
+        Option.unwrapOr(String.stripPrefix(kept, "\n"), kept)
+    }
+}
+
+-- The four are `Turkey.Coroutine#resume`, `Turkey.Scheduler#waitOn`,
+-- `Turkey.Wait#settleIn` and `Turkey.Scheduler#yield`, each a coroutine
+-- switch, which wasm32-wasi refuses. A fifth refused function changes the
+-- count, so the warning stays in the output and the case fails.
+let trapCount = ("4 functions use operations the wasm32 backend does not compile yet, "
+                 + "and trap if they are called; '--dump select' lists them")
+
 --- `seconds`, scaled by `--timeout-scale`.
 fun limit(t : Toolchain, seconds : Int) -> Duration {
     let nanos = Float.fromInt(seconds) * t.timeoutScale * 1000000000.0
     Duration.nanos(Option.unwrapOr(Float.truncate(nanos), seconds * 1000000000))
 }
 
---- Whether the requirement `r` holds here.
-fun satisfies(t : Toolchain, r : Requirement) -> Bool = match r {
-    Cc -> t.hasCc
-    As -> t.hasAs
-    Darwin -> String.contains(t.machine, "darwin")
-    Linux -> String.contains(t.machine, "linux")
+--- Whether the requirement `r` holds here. A system is the one the program
+--- runs on, which for `wasm32-wasi` is neither.
+fun satisfies(t : Toolchain, r : Requirement) -> Bool = match (r, t.target) {
+    (Cc, _) -> t.hasCc
+    (As, _) -> t.hasAs
+    (Darwin, Host) -> String.contains(t.machine, "darwin")
+    (Linux, Host) -> String.contains(t.machine, "linux")
+    (Darwin, Wasm32Wasi) | (Linux, Wasm32Wasi) -> False
 }
 
 --- Bytes as text, for comparing against a golden. Output that is not UTF-8

@@ -42,7 +42,7 @@ import Cache as Cache
 import Diff as Diff
 import Files as Files
 import Reference as Reference
-import Toolchain (Toolchain(..))
+import Toolchain (Toolchain(..), Target(..))
 import Toolchain as Toolchain
 
 --- The longest diff shown for a case, in lines; the whole actual output is in
@@ -78,9 +78,20 @@ fun expected(c : Case, judged : Verdict) -> Verdict = match (c.xfail, judged.out
 fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict, Blessing) {
     if let Some(problem) = c.problem { return unrunnable(problem) }
     for r in c.requires {
-        if !Toolchain.satisfies(t, r) {
-            let why = "requires " + Case.requirementName(r)
-            return (Verdict(Skip, why, ""), Keep(why))
+        if !Toolchain.satisfies(t, r) { return skipped("requires " + Case.requirementName(r)) }
+    }
+    let target = Toolchain.targetName(t.target)
+    for (on, reason) in c.skips {
+        if on == target { return skipped(reason) }
+    }
+    let c = match t.target {
+        Host -> c
+        -- A dump is of what `turkey check` makes of the program, which is
+        -- the same for every target, so the host's run is the one that
+        -- compares it.
+        Wasm32Wasi -> {
+            if Option.isNone(t.wasmtime) { return skipped("requires wasmtime") }
+            Case.withoutDumps(c)
         }
     }
     let recorded = match goldens(c) {
@@ -95,6 +106,8 @@ fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict,
 }
 
 fun unrunnable(why : String) -> (Verdict, Blessing) = (Verdict(HarnessError, why, ""), Refuse(Unrunnable, why))
+
+fun skipped(why : String) -> (Verdict, Blessing) = (Verdict(Skip, why, ""), Keep(why))
 
 -- The case's goldens as they are on disk. A missing `.expected` is not an
 -- error here: the verdict reports it, and bless creates it. A quoted golden
@@ -145,11 +158,11 @@ fun observe(t : Toolchain, cache : Cache, actual : String, c : Case) -> Either S
 -- stdout, and the compile's warnings then its stderr.
 fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
     -> Either IOError (Ending, String, String) {
-    let argv = t.run + [binary]
+    let argv = Toolchain.programCommand(t, c, binary)
     let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
     let Output { stdout, stderr, status } = Process.run(Toolchain.caseCommand(t, c, argv), Some(limit))?
     let err = Toolchain.text(stderr)
-    Right((Ran(finish(status, err)), Toolchain.text(stdout), warnings + err))
+    Right((Ran(finish(status, err)), Toolchain.text(stdout), Toolchain.comparable(t, c, warnings) + err))
 }
 
 -- Each of the case's dump stages, as it ended, its stdout and its stderr:

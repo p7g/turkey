@@ -1,0 +1,375 @@
+export (Program(..), Unsupported(..), build)
+
+--- A whole program's low IR as a WebAssembly module: what every function is
+--- numbered, what it imports, where its data is, and the entry the host
+--- calls.
+---
+--- **Linear memory, from address 0 up:**
+---
+---   0                    the first page of `Turkey.Runtime.immediates`
+---                        bytes, which no object is ever at
+---   immediates           the shadow stack, `stackBytes` long, which frame
+---                        objects are allocated in from the top down
+---   immediates + stack   the program's data: the literals' static objects,
+---                        the globals, the root array and its frame, the
+---                        process state, then every C string the code names
+---   past the data        the heap, which the C library grows the memory
+---                        for
+---
+--- The stack is below the data so that its limit is known before any
+--- function is selected; the data grows as selection interns C strings.
+---
+--- **Functions.** Every function of the low IR is a wasm function of the same
+--- name, numbered after the imports in the order the module lists them, and
+--- each is declared before any is selected, so a call names its callee
+--- whatever the order. A function selection stops in still has a function, a
+--- trap, so the module is whole; `refused` names each one and what stopped
+--- it.
+---
+--- **Imports.** A symbol a program calls and does not define is an import
+--- from the module its `foreign "module" { ... }` block names: WASI's are
+--- `wasi_snapshot_preview1`. The driver has refused any other foreign call
+--- before this runs. The module defines its memory and exports it as
+--- `memory`, which WASI reads.
+---
+--- **The table.** A closure's code and a `Prim.codeAddress` are an index into
+--- the module's one table, which holds every function that one names, from
+--- slot 1: a null code address is slot 0, which is empty and traps.
+---
+--- **The entry.** `_start`, which WASI calls, runs `turkey_main` --
+--- `Turkey.Entry`'s, which runs the program -- and exits with its status.
+--- `turkey_entry`, which `Turkey.Entry` calls in turn, is written here: it
+--- does what the arm64 entry does, except register frame and trace tables,
+--- which wasm does not have yet.
+
+import Data.Map as Map
+import Turkey.LowIr (Op(..), Low(..), AddressOf(..), Callee(..))
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Rep(..), RepClass(..), Func(..), Block(..))
+import Turkey.SsaLower (Module(..))
+import Turkey.Wasm as W
+import Turkey.Wasm.Module as M
+import Turkey.Wasm.Select as S
+
+--- A function selection stopped in, and what stopped it.
+type Unsupported = Unsupported { name : String, what : String }
+
+--- The module's bytes, how many functions were selected, and the rest.
+type Program = Program { bytes : Vec Byte, selected : Int, refused : Vec Unsupported }
+
+--- The bytes of the shadow stack.
+let stackBytes = 1 << 20
+
+let pageBytes = 65536
+
+let wasi = "wasi_snapshot_preview1"
+
+--- Returns `m` as a wasm module whose `main` is the Turkey function `main`.
+--- `libraries` names the wasm module each import comes from, by symbol.
+fun build(m : Module, main : String, libraries : Map String String) -> Program {
+    let wasm = M.newModule()
+    let defined = Map.new()
+    for (symbol, name) in m.definitions { Map.put(defined, symbol, name) }
+    let wanted = wants(m, defined)
+
+    -- Imports come first, since they are numbered first.
+    let imports = Map.new()
+    for (symbol, t) in wanted.imports {
+        let library = match Map.get(libraries, symbol) {
+            Some(name) -> name
+            None -> error("internal error: '" + symbol + "' is called and imported from nowhere")
+        }
+        Map.put(imports, symbol, M.importFunc(wasm, library, symbol, M.addType(wasm, t)))
+    }
+    -- `_start`'s exit, which the library may import already.
+    let exit = if Map.contains(imports, "proc_exit") && Map.get(libraries, "proc_exit") == Some(wasi) {
+        Map.getOr(imports, "proc_exit", -1)
+    } else {
+        M.importFunc(wasm, wasi, "proc_exit",
+                     M.addType(wasm, W.FuncType { params = [W.I32], results = [] }))
+    }
+
+    let functions = Map.new()
+    let results = Map.new()
+    for f in m.functions {
+        let t = M.addType(wasm, W.FuncType {
+            params = Vec.toArray(Vec.map(f.params, fun(p) = S.valType(Ssa.repOf(f, p)))),
+            results = Array.map(f.results, S.valType),
+        })
+        Map.put(functions, f.name, M.declareFunc(wasm, f.name, t))
+        Map.put(results, f.name, f.results)
+    }
+    let nothing = M.addType(wasm, W.FuncType { params = [], results = [] })
+    let entry = M.declareFunc(wasm, Rt.programEntrySymbol, nothing)
+    let start = M.declareFunc(wasm, "_start", nothing)
+
+    let slots = Map.new()
+    let slotted = []
+    for name in wanted.slotted {
+        if let Some(f) = Map.get(functions, name) {
+            Vec.push(slotted, f)
+            Map.put(slots, name, len(slotted))
+        }
+    }
+    let table = M.addTable(wasm, M.TableType {
+        elem = W.funcref, limits = M.Limits { min = len(slotted) + 1, max = Some(len(slotted) + 1) },
+    })
+    M.addElem(wasm, table, 1, Vec.toArray(slotted))
+
+    let data = layout(m, wanted.literals)
+    let worker = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
+                             [W.ConstI64(data.processState)])
+    let stackPointer = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
+                                   [W.ConstI64(data.start)])
+    let builtins = Map.new()
+    Map.put(builtins, Rt.programEntrySymbol, entry)
+    let cx = S.Context {
+        functions = functions, results = results, defined = defined, imports = imports,
+        builtins = builtins, slots = slots,
+        literals = data.literals, globals = data.globals, module_ = wasm,
+        strings = S.Strings { start = data.start + len(data.image), bytes = [],
+                              addresses = Map.new() },
+        worker = worker, stackPointer = stackPointer, stackLimit = Rt.immediates,
+    }
+
+    let refused = []
+    var selected = 0
+    for f in m.functions {
+        let index = Map.getOr(functions, f.name, -1)
+        let chosen = S.selectFunction(cx, f)
+        match chosen.stopped {
+            Some(why) -> {
+                M.defineFunc(wasm, index, [], [W.Unreachable])
+                Vec.push(refused, Unsupported { name = f.name, what = why })
+            }
+            None -> {
+                M.defineFunc(wasm, index, chosen.locals, chosen.body)
+                selected = selected + 1
+            }
+        }
+    }
+    M.defineFunc(wasm, entry, [], entryBody(cx, m, main, data))
+    M.defineFunc(wasm, start, [], [
+        -- `turkey_main`'s environment, `argc` and `argv`.
+        W.ConstI64(0), W.ConstI64(0), W.ConstI64(0),
+        W.Call(definition(cx, "turkey_main")),
+        W.Convert(W.I32WrapI64),
+        W.Call(exit),
+    ])
+
+    let strings = cx.strings
+    let end = strings.start + len(strings.bytes)
+    let limits = M.Limits { min = (end + pageBytes - 1) / pageBytes, max = None }
+    let memory = M.addMemory(wasm, limits)
+    if len(data.image) > 0 { M.addData(wasm, memory, data.start, Vec.toArray(data.image)) }
+    if len(strings.bytes) > 0 {
+        M.addData(wasm, memory, strings.start, Vec.toArray(strings.bytes))
+    }
+    M.addExport(wasm, "memory", M.ExportMemory, memory)
+    M.addExport(wasm, "_start", M.ExportFunc, start)
+    Program { bytes = M.write(wasm), selected = selected, refused = refused }
+}
+
+-- What the module needs that only its instructions say: each C symbol called
+-- and not defined, with the type of its first call; each function a closure
+-- or a code address names, which the table holds; and each string literal,
+-- in the order of first mention.
+type Wanted = Wanted {
+    imports  : Vec (String, W.FuncType),
+    slotted  : Vec String,
+    literals : Vec String,
+}
+
+fun wants(m : Module, defined : Map String String) -> Wanted {
+    let imports = []
+    let imported = Map.new()
+    let slotted = []
+    let slottedSeen = Map.new()
+    let literals = []
+    let literalSeen = Map.new()
+    let slot = fun(name : String) {
+        if !Map.contains(slottedSeen, name) {
+            Map.put(slottedSeen, name, ())
+            Vec.push(slotted, name)
+        }
+    }
+    let wantImport = fun(symbol : String, t : W.FuncType) {
+        if !Map.contains(imported, symbol) {
+            Map.put(imported, symbol, ())
+            Vec.push(imports, (symbol, t))
+        }
+    }
+    for f in m.functions {
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Foreign(symbol, _), args) ->
+                        if !Map.contains(defined, symbol) && symbol != Rt.programEntrySymbol {
+                            wantImport(symbol, W.FuncType {
+                                params = Array.map(args, fun(a) = S.importParam(Ssa.repOf(f, a))),
+                                results = S.importResult(Ssa.repOf(f, i.result)),
+                            })
+                        }
+                    ClosureNew(code, _) -> slot(code)
+                    StackClosure(code, _) -> slot(code)
+                    Address(CodeOf(symbol)) -> if let Some(name) = Map.get(defined, symbol) { slot(name) }
+                    ConstString(text) -> if !Map.contains(literalSeen, text) {
+                        Map.put(literalSeen, text, ())
+                        Vec.push(literals, text)
+                    }
+                    _ -> {}
+                }
+            }
+        }
+    }
+    Wanted { imports = imports, slotted = slotted, literals = literals }
+}
+
+-- -- data ----------------------------------------------------------------------------
+
+-- The data before the C strings, and where each part of it is: `image` holds
+-- its bytes from `start`.
+type Data = Data {
+    start        : Int,
+    image        : Vec Byte,
+    literals     : Map String Int,
+    staticStart  : Int,
+    staticEnd    : Int,
+    globals      : Map String Int,
+    roots        : Int,
+    rootCount    : Int,
+    globalsFrame : Int,
+    processState : Int,
+}
+
+-- Each literal as a static object, laid out as `turkey_string_new` lays one
+-- out -- header, length, bytes -- so that a `String` a literal reads as is
+-- the same as one built at run time; they are contiguous, the range the entry
+-- registers with the collector. Then a word of storage for each untraced
+-- global, the root array holding the traced ones, the `RootFrame` covering
+-- it, and the process state, all zero.
+fun layout(m : Module, texts : Vec String) -> Data {
+    let start = Rt.immediates + stackBytes
+    let image : Vec Byte = []
+    let at = fun() -> Int = start + len(image)
+    let bytes = Rt.element([Ssa.untraced(I8)])
+    let header = Rt.staticHeaderWord(Rt.arrayKind, bytes.layout.pointers, bytes.stride)
+    let literals = Map.new()
+    align(image, 8)
+    let staticStart = at()
+    for text in texts {
+        align(image, 8)
+        Map.put(literals, text, at())
+        word(image, header)
+        let content = String.toBytes(text)
+        word(image, len(content))
+        for b in content { Vec.push(image, b) }
+    }
+    align(image, 8)
+    let staticEnd = at()
+
+    let globals = Map.new()
+    let traced = []
+    for (name, r) in m.globals {
+        if r.traced {
+            Vec.push(traced, name)
+        } else {
+            Map.put(globals, name, at())
+            word(image, 0)
+        }
+    }
+    -- At least one word even when the module roots nothing: the entry hands
+    -- this address to `turkey_root_enter`, which refuses a null one.
+    let roots = at()
+    for name in traced {
+        Map.put(globals, name, at())
+        word(image, 0)
+    }
+    if len(traced) == 0 { word(image, 0) }
+    -- Five words -- previous, function_name, count, values, live -- in the
+    -- layout `lib/Turkey/Heap.gob` reads.
+    let globalsFrame = at()
+    for _ in [0, 1, 2, 3, 4] { word(image, 0) }
+    let processState = at()
+    for var k = 0; k < Rt.processStateBytes; k = k + 1 { Vec.push(image, Byte.truncate(0)) }
+    align(image, 8)
+    Data { start = start, image = image, literals = literals, staticStart = staticStart,
+           staticEnd = staticEnd, globals = globals, roots = roots, rootCount = len(traced),
+           globalsFrame = globalsFrame, processState = processState }
+}
+
+fun align(out : Vec Byte, to : Int) -> Unit {
+    while len(out) % to != 0 { Vec.push(out, Byte.truncate(0)) }
+}
+
+-- `n` as 8 bytes, little-endian.
+fun word(out : Vec Byte, n : Int) -> Unit {
+    for var k = 0; k < 8; k = k + 1 { Vec.push(out, Byte.truncate((n >> (8 * k)) & 0xFF)) }
+}
+
+-- -- the entry -----------------------------------------------------------------------
+
+-- `turkey_entry`: early initialization, which runs before roots and
+-- literals exist; then, unless that panicked, the stack's outer bound, the
+-- permanent root frame over the root array, the literals' range, the
+-- globals, and `main`; and `turkey_entry_returned` last.
+fun entryBody(cx : S.Context, m : Module, main : String, data : Data) -> Array W.Op {
+    let out = []
+    let run = fun(name : String) {
+        match Map.get(cx.functions, name) {
+            Some(f) -> Vec.push(out, W.Call(f))
+            None -> error("internal error: the entry calls " + name + ", which did not lower")
+        }
+        for _ in Map.getOr(cx.results, name, []) { Vec.push(out, W.Drop) }
+    }
+    let runtime = fun(symbol : String, args : Array Int) {
+        Vec.push(out, W.ConstI64(0))
+        for a in args { Vec.push(out, W.ConstI64(a)) }
+        Vec.push(out, W.Call(definition(cx, symbol)))
+        Vec.push(out, W.Drop)
+    }
+    Vec.push(out, W.Block(W.Empty))
+    run(m.early)
+    Vec.push(out, W.GlobalGet(cx.worker))
+    Vec.push(out, W.Convert(W.I32WrapI64))
+    Vec.push(out, W.Load(W.I32Load, 0))
+    Vec.push(out, W.BrIf(0))
+    -- Every frame the program makes is below the shadow stack's top.
+    Vec.push(out, W.ConstI64(0))
+    Vec.push(out, W.GlobalGet(cx.stackPointer))
+    Vec.push(out, W.Call(definition(cx, "turkey_entry_stack_set")))
+    Vec.push(out, W.Drop)
+    -- The permanent frame. Every traced global is live for the whole run, so
+    -- its mask is all ones.
+    runtime("turkey_root_enter", [data.globalsFrame, data.roots, data.rootCount,
+                                  S.cString(cx.strings, "<globals>")])
+    Vec.push(out, W.ConstI32(data.globalsFrame))
+    Vec.push(out, W.ConstI64(-1))
+    Vec.push(out, W.Store(W.I64Store, 32))
+    if data.staticEnd > data.staticStart {
+        runtime("turkey_static_register", [data.staticStart, data.staticEnd])
+    }
+    run(m.initial)
+    -- `main` takes the closure environment every Turkey function takes, and
+    -- has none.
+    Vec.push(out, W.ConstI64(0))
+    run(main)
+    Vec.push(out, W.End)
+    runtime("turkey_entry_returned", [])
+    Vec.toArray(out)
+}
+
+-- The function index of the `foreign` definition of `symbol`, which every
+-- program has: `Turkey.Runtime.referencedSymbols` keeps each one the entry
+-- calls.
+fun definition(cx : S.Context, symbol : String) -> Int {
+    let found = match Map.get(cx.defined, symbol) {
+        Some(name) -> Map.get(cx.functions, name)
+        None -> None
+    }
+    match found {
+        Some(f) -> f
+        None -> error("internal error: the program does not define " + symbol)
+    }
+}

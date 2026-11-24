@@ -70,18 +70,18 @@ def test_an_unknown_target_is_refused() -> None:
         "arm64-linux, wasm32-wasi\n")
 
 
-def test_wasm_is_checked_and_lowered_then_refused() -> None:
-    """`wasm32-wasi` has no backend yet: the front end and the lowering to the
-    low IR run, and any request for code stops with a diagnostic."""
+def test_wasm_is_checked_lowered_and_written(tmp_path: Path) -> None:
+    """`wasm32-wasi` runs the front end, the lowering to the low IR and the
+    wasm backend, and writes a module (`tests/test_wasm_programs.py` runs
+    them)."""
     checked = _boot("check", "--target", "wasm32-wasi", str(SOURCE))
     assert checked.returncode == 0, checked.stderr
-    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa", "-S",
-                    "-o", os.devnull, str(SOURCE))
-    assert lowered.returncode != 0
+    out = tmp_path / "out.wasm"
+    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa", "-o", str(out),
+                    str(SOURCE))
+    assert lowered.returncode == 0, lowered.stderr
     assert b"global $" in lowered.stdout
-    assert lowered.stderr.decode().endswith(
-        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
-        "compiles as far as the low IR\n")
+    assert out.read_bytes()[:8] == bytes.fromhex("0061736d01000000")
 
 
 # What a wasm program does through the runtime's WASI layer (`Turkey.Wasi`):
@@ -109,7 +109,7 @@ fun main() {
 @pytest.mark.parametrize("source", ["program", "compiler"])
 def test_wasm_reaches_no_unsupported_call(tmp_path: Path, source: str) -> None:
     """Every call a wasm program makes into the system is a WASI import, which
-    the compile checks before it stops, and nothing it can reach panics as
+    the compile checks before the backend runs, and nothing it can reach panics as
     unsupported on the target: no `Process.unsupported` is left in its low IR.
     The compiler itself is such a program."""
     if source == "program":
@@ -117,11 +117,9 @@ def test_wasm_reaches_no_unsupported_call(tmp_path: Path, source: str) -> None:
         path.write_text(WASI_PROGRAM, encoding="utf-8")
     else:
         path = bootc.REPO_ROOT / "src" / "Main.gob"
-    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa", "-S",
-                    "-o", os.devnull, str(path))
-    assert lowered.stderr.decode().endswith(
-        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
-        "compiles as far as the low IR\n"), lowered.stderr.decode()
+    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa",
+                    "-o", str(tmp_path / "out.wasm"), str(path))
+    assert lowered.returncode == 0, lowered.stderr.decode()
     assert b"call &fd_write" in lowered.stdout
     assert b"unsupported on wasm32-wasi" not in lowered.stdout
 

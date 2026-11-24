@@ -909,7 +909,7 @@ fun main() {
 only print is in scope
 ```
 
-The standard library's Prelude declares nothing. It is
+The standard library's Prelude exports nothing of its own. It is
 `export (module Turkey (..))`, and the library module `Turkey` holds every
 name and qualifier it passes on.
 
@@ -917,8 +917,9 @@ The implicit import is an import of the module `Prelude`, and that module is
 found as any other is. A program with a `Prelude.gob` beside its entry file
 gives its own modules that module in place of the standard library's, and the
 standard library's modules keep theirs. A module named `Prelude` has no
-implicit import itself, so a program's Prelude imports `Turkey`: without a
-list to pass it on, and with one for the names its own declarations use.
+implicit import itself, so a program's Prelude imports `Turkey`: once
+without a list, for the qualifier `Turkey` that `module Turkey (..)` names,
+and once with `(..)`, for the names its own declarations use.
 
 <!-- module: Prelude.gob -->
 ```kotlin

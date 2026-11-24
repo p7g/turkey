@@ -1402,7 +1402,7 @@ fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = matc
         None -> stop(s, "a call of @" + name + ", which did not lower")
     }
     Runtime(r) -> match r {
-        Rt.Exit -> definedCall(s, d, Rt.entryPoint(r).symbol, args)
+        Rt.Exit -> definedCall(s, d, Rt.entryPoint(r).symbol, args, True)
         Rt.SwapStack -> stop(s, "Prim.swapStack, which is not supported on wasm yet")
     }
     Foreign(symbol, fixed) -> foreignCall(s, d, symbol, fixed, args)
@@ -1449,7 +1449,7 @@ fun results(s : Sel, d : Value, name : String) -> Unit {
 -- writes, or an import.
 fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array Value) -> Unit {
     if fixed < len(args) { return stop(s, "a call of the variadic C function " + symbol) }
-    if Map.contains(s.cx.defined, symbol) { return definedCall(s, d, symbol, args) }
+    if Map.contains(s.cx.defined, symbol) { return definedCall(s, d, symbol, args, False) }
     if let Some(f) = Map.get(s.cx.builtins, symbol) {
         for a in args { get(s, a) }
         op(s, W.Call(f))
@@ -1478,29 +1478,34 @@ fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array V
 }
 
 -- A call of the `foreign` definition of `symbol`, whose Turkey function
--- takes the environment every Turkey function takes, here null.
---
--- The call's result need not be held as the definition's is. `Prim.exit` is
--- `-> a` and `turkey_exit` returns a unit, so an exit where a `String` is
--- wanted calls an `i32` function for an `i64`. Such a call never returns a
--- value anyone reads, so its results are dropped and `d` keeps its zero.
-fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value) -> Unit {
+-- takes the environment every Turkey function takes, here null. `exiting`
+-- says the call is `Prim.exit`'s.
+fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value,
+                exiting : Bool) -> Unit {
     let name = Map.getOr(s.cx.defined, symbol, "")
-    match Map.get(s.cx.functions, name) {
-        Some(f) -> {
-            op(s, W.ConstI64(0))
-            for a in args { get(s, a) }
-            op(s, W.Call(f))
-            let returned = Array.map(Map.getOr(s.cx.results, name, []), valType)
-            if returned == [valType(Ssa.repOf(s.source, d))] {
-                set(s, d)
-            } else {
-                for _ in returned { op(s, W.Drop) }
-            }
-            propagate(s)
-        }
-        None -> stop(s, "a call of " + symbol + ", which did not lower")
+    let f = match Map.get(s.cx.functions, name) {
+        Some(f) -> f
+        None -> return stop(s, "a call of " + symbol + ", which did not lower")
     }
+    let returned = Array.map(Map.getOr(s.cx.results, name, []), valType)
+    let held = returned == [valType(Ssa.repOf(s.source, d))]
+    -- `Prim.exit` is `-> a` and `turkey_exit` returns a unit, so an exit
+    -- where a `String` is wanted calls an `i32` function for an `i64`. An
+    -- exit never returns a value anyone reads, so its results are dropped and
+    -- `d` keeps its zero. Any other call whose declaration disagrees with its
+    -- definition would compute a wrong value that way.
+    if !held && !exiting {
+        return stop(s, "a call of " + symbol + " whose declared result is not its definition's")
+    }
+    op(s, W.ConstI64(0))
+    for a in args { get(s, a) }
+    op(s, W.Call(f))
+    if held {
+        set(s, d)
+    } else {
+        for _ in returned { op(s, W.Drop) }
+    }
+    propagate(s)
 }
 
 -- The function index of the Turkey function defining `symbol`.

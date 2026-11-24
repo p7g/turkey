@@ -399,7 +399,7 @@ def test_an_index_out_of_bounds_panics():
         "panic: array index out of bounds: read at index 5, length 3")
 
 
-# The panic is raised three calls down, and every caller leaves.
+# The panic is raised in a callee, and every caller leaves.
 CALLEE_PANIC = """\
 fun check(n : Int) -> Int {
     if n > 2 { error("too big: " + Int.toString(n)) }
@@ -445,6 +445,7 @@ def test_exit_where_a_value_is_wanted():
 def test_the_compiler_is_a_valid_module(tmp_path):
     """`src/Main.gob` built for wasm passes the engine's validation, which
     checks every function's types, including the ones no test runs."""
+    wasmtime = toolchain.needs_wasmtime()
     out = tmp_path / "turkey.wasm"
     built = subprocess.run(
         toolchain.command(bootc.binary(), "build", "--target", "wasm32-wasi", "-o", str(out),
@@ -452,7 +453,7 @@ def test_the_compiler_is_a_valid_module(tmp_path):
         cwd=bootc.REPO_ROOT, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
         capture_output=True, text=True, timeout=600)
     assert built.returncode == 0, built.stderr
-    validated = subprocess.run([toolchain.needs_wasmtime(), "compile", "-o",
+    validated = subprocess.run([wasmtime, "compile", "-o",
                                 str(tmp_path / "turkey.cwasm"), str(out)],
                                capture_output=True, text=True, timeout=600)
     assert validated.returncode == 0, validated.stderr

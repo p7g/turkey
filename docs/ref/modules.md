@@ -1000,10 +1000,10 @@ itself runs on. The two arm64 targets produce an executable. `wasm32-wasi`
 produces a WebAssembly module, `main.wasm` for `main.gob`, which a WASI host
 such as `wasmtime run main.wasm` runs. The wasm backend does not compile every
 operation yet: a function that uses one it cannot, such as a coroutine's
-switch, is built as a trap, and the build warns how many there are. The
-collector cannot yet find the values a wasm program's calls hold, so a program
-that allocates enough to start a collection can compute wrong results or trap.
-A panic's report has no `at` lines on this target.
+switch, is built as a trap, and the build warns how many there are. A
+`wasm32-wasi` program that allocates enough memory to need garbage collection
+can compute wrong results or trap, and a panic's report on this target has no
+`at` lines.
 
 ```sh
 turkey build --target arm64-linux main.gob

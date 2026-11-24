@@ -238,6 +238,7 @@ AWKWARD = {
     "comment_before_block_brace": "fun f(second : Int) -> Int = 1\n    + (if second == 60 -- z\n{ 59 } else { second })\n",
     "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
     "foreign_blocks": "foreign \"env\" {\n    \"log\" fun log(x : Int) -> Unit\n}\nforeign \"ssl\" 3 { \"f\" fun g(x : Int) -> Int }\n",
+    "comments_before_aligned_trailing_comments": "fun main() {\n    let a = f(1) {- c -} -- one\n    let bb = 2 -- two\n    let c = 3 {- x -} {- y -} -- three\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -281,7 +282,7 @@ AWKWARD_OUTPUT = {
         "type F = F {\n\t{- c -} lines : Vec String\n\ttokens        : Int\n}\n"),
     "comment_before_aligned_arrow": (
         "fun f(x : Int) -> Int = match x {\n"
-        "\t1 {- c -}   -> 0\n"
+        "\t1   {- c -} -> 0\n"
         "\t22          -> {- d -} 1\n"
         "\t333 {- e -} -> 2\n"
         "\t_           -> 3\n"
@@ -306,16 +307,16 @@ AWKWARD_OUTPUT = {
     "comment_before_aligned_equals": (
         "type R = R { x : Int, yyyy : Int, z : Int }\n"
         "fun k() -> R = R {\n"
-        "\tx {- a -} = 1\n"
-        "\tyyyy      = {- b -} 2\n"
-        "\tz {- c -} = 3\n"
+        "\tx    {- a -} = 1\n"
+        "\tyyyy         = {- b -} 2\n"
+        "\tz    {- c -} = 3\n"
         "}\n"
     ),
     "comment_before_aligned_colon": (
         "type R = R {\n"
-        "\tx {- a -} : Int\n"
-        "\tyyyy      : Int\n"
-        "\tz         : Int\n"
+        "\tx    {- a -} : Int\n"
+        "\tyyyy         : Int\n"
+        "\tz            : Int\n"
         "}\n"
     ),
     "comment_before_aligned_trailing_comment": (
@@ -355,6 +356,13 @@ AWKWARD_OUTPUT = {
         "}\n"
         "foreign \"ssl\" 3 {\n"
         "\t\"f\" fun g(x : Int) -> Int\n"
+        "}\n"
+    ),
+    "comments_before_aligned_trailing_comments": (
+        "fun main() {\n"
+        "\tlet a = f(1) {- c -}         -- one\n"
+        "\tlet bb = 2                   -- two\n"
+        "\tlet c = 3    {- x -} {- y -} -- three\n"
         "}\n"
     ),
 }

@@ -105,8 +105,10 @@ fun testing(text : String) -> String = match Env.get("TURKEY_TEST_FMT") {
 -- not depend on where such a comment is, so the comment lands before the same
 -- token whatever the layout, and formatting the output again puts it back in
 -- the same place. The rows the layout aligned are then padded again, so a
--- comment put back counts toward the width of the column it lands in. A
--- block comment over several lines is laid out with the others, since the
+-- comment put back inside the code of an aligned row counts toward the
+-- code's width, and one directly before the aligned token goes in a column
+-- of its own between the code and that token. A block comment over several
+-- lines is laid out with the others, since the
 -- lines it moves code onto would change the layout.
 fun printed(source : Source, program : Program) -> Either String String {
     let f = state(source, program)
@@ -205,9 +207,9 @@ fun reinsert(f : F, all : Vec Comment, out : String, pads : Vec P.Pad) -> Either
     -- bracket or before a closing one, a comma or the end of the line, and
     -- none twice.
     --
-    -- A comment that lands after a pad, with only space between, goes before
-    -- the pad instead. It then counts toward the width of what the pad aligns,
-    -- as the comment before an aligned `->` or `=` must.
+    -- A comment that lands at a pad, with only space between, is not put into
+    -- the line: it becomes one of the pad's notes, which `P.realigned` lays
+    -- out as a column of their own between the code and what the pad aligns.
     let padsOn : Map Int (Vec P.Pad) = Map.new()
     for pad in pads {
         let here = Map.getOr(padsOn, pad.line, [])
@@ -217,9 +219,21 @@ fun reinsert(f : F, all : Vec Comment, out : String, pads : Vec P.Pad) -> Either
     for (number, unpadded) in Map.entries(at) {
         let cs = String.toCodePoints(outLines[number - 1])
         let linePads = Map.getOr(padsOn, number, [])
-        let unsorted = Vec.map(unpadded, fun((col, m, text)) = (padded(cs, linePads, col), m, text))
-        let insertions = Vec.sortBy(unsorted, fun((x, m, _), (y, n, _)) =
+        let sorted = Vec.sortBy(unpadded, fun((x, m, _), (y, n, _)) =
             if x < y || (x == y && m < n) { LT } else { GT })
+        let insertions = []
+        -- The comments put back at each pad, which come before the notes the
+        -- layout put there.
+        let added = Vec.map(linePads, fun(_) = [])
+        for (col, m, text) in sorted {
+            match padAt(cs, linePads, col) {
+                Some(k) -> Vec.push(added[k], text)
+                None -> Vec.push(insertions, (col, m, text))
+            }
+        }
+        for var k = 0; k < len(linePads); k = k + 1 {
+            linePads[k].notes = Vec.append(added[k], linePads[k].notes)
+        }
         let shifts = []
         let pieces = []
         var done = 0
@@ -259,15 +273,16 @@ fun reinsert(f : F, all : Vec Comment, out : String, pads : Vec P.Pad) -> Either
     Right(if String.endsWith(out, "\n") && !String.endsWith(joined, "\n") { joined + "\n" } else { joined })
 }
 
--- `col`, a column of the line `cs` counting from 1, or where the pad before it
--- starts when only space lies between them.
-fun padded(cs : Array Char, pads : Vec P.Pad, col : Int) -> Int {
-    for pad in pads {
-        if pad.col < col - 1 && Iter.all(Array.slice(cs, pad.col, col - 1), \_ == ' ') {
-            return pad.col + 1
+-- Which pad of `pads` is at `col`, a column of the line `cs` counting from 1: the
+-- pad that starts there, or one before it with only space between.
+fun padAt(cs : Array Char, pads : Vec P.Pad, col : Int) -> Option Int {
+    for var k = 0; k < len(pads); k = k + 1 {
+        let pad = pads[k]
+        if pad.col <= col - 1 && Iter.all(Array.slice(cs, pad.col, col - 1), \_ == ' ') {
+            return Some(k)
         }
     }
-    col
+    None
 }
 
 -- One number for where `s` starts, for a list of comments to look things up in.
@@ -663,7 +678,7 @@ fun leadingParts(f : F, to : Pos) -> (Doc, Bool) {
             broken = False
         } else {
             loose(f, c)
-            Vec.push(parts, P.suffix(commentText(c)))
+            Vec.push(parts, suffixOf(c))
             broken = True
         }
     }
@@ -694,7 +709,7 @@ fun dangling(f : F, to : Pos) -> Doc {
         if ownLine(f, c) { Vec.push(parts, P.cat([P.hard, commentDoc(c)])) }
         else {
             loose(f, c)
-            Vec.push(parts, P.suffix(commentText(c)))
+            Vec.push(parts, suffixOf(c))
         }
     }
     P.cat(parts)
@@ -719,7 +734,11 @@ fun trailing(f : F, from : Pos) -> Vec Comment {
     out
 }
 
-fun suffixes(cs : Vec Comment) -> Doc = P.cat(Vec.map(cs, fun(c) = P.suffix(commentText(c))))
+fun suffixes(cs : Vec Comment) -> Doc = P.cat(Vec.map(cs, suffixOf))
+
+-- `c` at the end of its line. A line comment ends the line, so it is the
+-- suffix the others before it are aligned ahead of.
+fun suffixOf(c : Comment) -> Doc = if c.block { P.suffix(commentText(c)) } else { P.lastSuffix(commentText(c)) }
 
 -- The comments `trailing` finds, for the end of an item inside a row.
 fun inner(f : F, cs : Vec Comment) -> Doc {
@@ -806,7 +825,7 @@ fun comments(f : F, to : Pos, table : Vec Row, above : Int) -> (Doc, Int) {
                 -- code was printed before this sequence, so only the row around
                 -- it can keep that line as it was.
                 if c.span.line != f.guarded { loose(f, c) }
-                opening = P.cat([opening, P.suffix(commentText(c))])
+                opening = P.cat([opening, suffixOf(c)])
             }
             else {
                 let r = table[len(table) - 1]
@@ -816,7 +835,7 @@ fun comments(f : F, to : Pos, table : Vec Row, above : Int) -> (Doc, Int) {
                     Note -> Row { kind = Note, left = P.cat([r.left, P.text(" "), commentDoc(c)]),
                                   right = r.right }
                     _ -> Row { kind = r.kind, left = r.left,
-                               right = P.cat([r.right, P.suffix(commentText(c))]) }
+                               right = P.cat([r.right, suffixOf(c)]) }
                 }
             }
             continue
@@ -1660,7 +1679,7 @@ fun blockInside(f : F, e : Expr) -> (Doc, Bool) {
     while let Some(c) = pending(f) {
         if !lt(startOf(c.span), startOf(e.span)) { break }
         take(f)
-        Vec.push(before, P.suffix(commentText(c)))
+        Vec.push(before, suffixOf(c))
     }
     let commented = len(before) > 0 || lineCommentIn(f, startOf(e.span), close)
     if len(stmts) == 0 && !commented && !hasCommentIn(f, startOf(e.span), close) { return (P.empty(), False) }

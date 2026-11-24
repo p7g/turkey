@@ -1,7 +1,7 @@
 export (
     Doc, Row(..), RowKind(..),
     empty, text, raw, line, softline, hard, cat, nest, group, forced, ifBreak, suffix,
-    choice, fill, rows, flat, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
+    lastSuffix, choice, fill, rows, flat, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
     shifted, Pad(..), PadKind(..), renderPadded, realigned,
 )
 
@@ -43,7 +43,8 @@ type Doc
     | Group(Bool, Doc)
     -- What to print in a broken group, and what in a flat one.
     | IfBreak(Doc, Doc)
-    | Suffix(String)
+    -- Text deferred to the end of the line, and whether it ends the line.
+    | Suffix(String, Bool)
     | Choice(Vec Doc)
     | Fill(Vec Doc)
     | Rows(Vec Row)
@@ -115,7 +116,13 @@ fun ifBreak(broken : Doc, flat : Doc) -> Doc = IfBreak(broken, flat)
 --- Returns `s` deferred to the end of the line it would be printed on, after a
 --- space. A suffix needs the line to end after it, so it breaks every group
 --- around it.
-fun suffix(s : String) -> Doc = Suffix(s)
+fun suffix(s : String) -> Doc = Suffix(s, False)
+
+--- Returns `s` deferred to the end of the line, as `suffix` does, as the
+--- suffix that ends its line. In a run of rows whose suffixes are aligned,
+--- the suffixes before it on its line form a column of their own, and it
+--- starts at the column after the widest of them.
+fun lastSuffix(s : String) -> Doc = Suffix(s, True)
 
 --- Returns the first of `alternatives` that suits: the first laid out flat if
 --- it fits on the line, else the first of the others whose own first line fits,
@@ -144,7 +151,7 @@ fun isEmpty(d : Doc) -> Bool = match d {
 fun isHard(d : Doc) -> Bool = match d {
     Empty | Text(_, _) | Line(_) -> False
     Raw(s) | Shifted(s, _) -> String.contains(s, "\n")
-    Hard | Suffix(_) | Rows(_) -> True
+    Hard | Suffix(_, _) | Rows(_) -> True
     Cat(_, h) -> h
     Nest(_, inner) | Flat(inner) -> isHard(inner)
     Group(breaks, _) -> breaks
@@ -157,7 +164,7 @@ fun isHard(d : Doc) -> Bool = match d {
 
 --- Returns whether `d` has a place it can break.
 fun breakable(d : Doc) -> Bool = match d {
-    Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_) | Flat(_) -> False
+    Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_, _) | Flat(_) -> False
     Line(_) | Hard | Group(_, _) | IfBreak(_, _) | Choice(_) | Fill(_) | Rows(_) -> True
     Cat(parts, _) -> Iter.any(parts, breakable)
     Nest(_, inner) -> breakable(inner)
@@ -200,6 +207,8 @@ type P = P {
     var parts   : Vec String,
     var pos     : Int,
     var pending : Vec String,
+    -- Whether the last of `pending` ends its line.
+    var ends    : Bool,
     marks       : Marks,
 }
 
@@ -211,7 +220,16 @@ type Marks = Marks { on : Bool, var runs : Int }
 --- Where `renderPadded` padded a line to align it with others: `width`
 --- spaces from code point `col` of line `line`, where `line` counts from 1
 --- and `col` from 0. The pads of one run of aligned lines share `run`.
-type Pad = Pad { line : Int, var col : Int, var width : Int, run : Int, kind : PadKind }
+--- `notes` holds the text the pad holds besides its spaces, as `realigned`
+--- lays it out.
+type Pad = Pad {
+    line      : Int,
+    var col   : Int,
+    var width : Int,
+    run       : Int,
+    kind      : PadKind,
+    var notes : Vec String,
+}
 
 --- What a pad aligns. `Tokens` pads the `left` of an aligned row so that
 --- every `right` of its run starts at one column. `Suffixes` pads a line
@@ -239,9 +257,11 @@ fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
             let n = Char.toInt(c)
             if n == markBase {
                 if let Some((id, col)) = open {
+                    let inside = String.trim(String.fromCodePoints(Vec.slice(kept, col, len(kept))))
                     Vec.push(pads, Pad {
                         line = i + 1, col = col, width = len(kept) - col, run = id / 2,
                         kind = if id % 2 == 0 { Tokens } else { Suffixes },
+                        notes = if inside == "" { [] } else { [inside] },
                     })
                 }
                 open = None
@@ -258,8 +278,12 @@ fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
 
 --- Returns `lines` with the pads `pads` describes set again, so that each run
 --- aligns as `renderPadded` aligned it, measured from the text now before
---- each pad. A pad is kept at its least, none or a space, on the line whose
---- text before it is the widest of its run. `Tokens` pads are set before
+--- each pad, and with each pad's notes in it. The notes of a run form a
+--- column of their own: the text before each pad is padded to the widest of
+--- the run, then come the pad's notes, a space before them and between them,
+--- then what the pad aligns, at one column after the widest text and notes.
+--- Between the widest of those and what it aligns is the pad's least, none
+--- for `Tokens` and a space for `Suffixes`. `Tokens` pads are set before
 --- `Suffixes` pads, which they move. Updates `pads` to match.
 fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
     let out = Vec.slice(lines, 0, len(lines))
@@ -281,15 +305,21 @@ fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
         for (_, run) in Map.entries(runs) {
             let before = fun(pad : Pad) = columns(String.fromCodePoints(
                 Array.slice(String.toCodePoints(out[pad.line - 1]), 0, pad.col)))
+            let noted = fun(pad : Pad) =
+                if len(pad.notes) == 0 { "" } else { " " + String.join(pad.notes, " ") }
             var widest = 0
             for pad in run { widest = larger(widest, before(pad)) }
+            var widestNoted = widest
+            for pad in run { widestNoted = larger(widestNoted, widest + columns(noted(pad))) }
             for pad in run {
                 let least = if suffixes { 1 } else { 0 }
-                let wanted = widest - before(pad) + least
+                let notes = noted(pad)
+                let filled = String.repeat(" ", widest - before(pad)) + notes
+                    + String.repeat(" ", widestNoted - widest - columns(notes) + least)
                 let cs = String.toCodePoints(out[pad.line - 1])
-                out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col))
-                    + String.repeat(" ", wanted)
+                out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col)) + filled
                     + String.fromCodePoints(Array.slice(cs, pad.col + pad.width, len(cs)))
+                let wanted = String.codePointCount(filled)
                 let moved = wanted - pad.width
                 for other in Map.getOr(onLine, pad.line, []) {
                     if other.col > pad.col { other.col = other.col + moved }
@@ -325,14 +355,14 @@ fun mark(code : Int) -> String = Char.toString(Option.expect(Char.fromInt(code),
 -- The highest number a mark can carry.
 let marksAvailable = 0x10FFFD - markBase - 1
 
--- `pad` spaces after the mark that starts a pad of `kind` in the run `run`,
--- and the mark that ends it, or the spaces alone when marks are off or run
--- out. Numbers a pad's kind with its run, since a line can hold one of each.
-fun padding(p : P, run : Int, kind : PadKind, pad : Int) -> String {
-    let spaces = String.repeat(" ", pad)
+-- `filled`, the spaces and notes of a pad of `kind` in the run `run`, after
+-- the mark that starts the pad and before the mark that ends it, or alone
+-- when marks are off or run out. Numbers a pad's kind with its run, since a
+-- line can hold one of each.
+fun padding(p : P, run : Int, kind : PadKind, filled : String) -> String {
     let id = run * 2 + if isSuffixes(kind) { 1 } else { 0 }
-    if !p.marks.on || run < 0 || id >= marksAvailable { return spaces }
-    mark(markBase + 1 + id) + spaces + closeMark
+    if !p.marks.on || run < 0 || id >= marksAvailable { return filled }
+    mark(markBase + 1 + id) + filled + closeMark
 }
 
 -- A new run of aligned lines, or -1 when marks are off.
@@ -361,7 +391,7 @@ fun renderFlat(d : Doc) -> String {
 }
 
 fun printer(width : Int, pos : Int, marks : Marks) -> P =
-    P { width = width, done = [], parts = [], pos = pos, pending = [], marks = marks }
+    P { width = width, done = [], parts = [], pos = pos, pending = [], ends = False, marks = marks }
 
 -- The lines written, the last ended where the printer stopped.
 fun finish(p : P) -> Vec String {
@@ -381,6 +411,7 @@ fun flushPending(p : P) -> Unit {
         let text = String.trimEnd(String.join(p.parts, ""))
         p.parts = [text + " " + String.join(p.pending, " ")]
         p.pending = []
+        p.ends = False
     }
 }
 
@@ -454,7 +485,10 @@ fun layout(p : P, start : Cmd) -> Unit {
                 Breaking -> push(stack, indent, mode, broken)
                 _ -> push(stack, indent, mode, whenFlat)
             }
-            Suffix(s) -> Vec.push(p.pending, s)
+            Suffix(s, ends) -> {
+                Vec.push(p.pending, s)
+                p.ends = ends
+            }
             Choice(alternatives) -> match mode {
                 Breaking -> Vec.push(stack, chosen(p, indent, alternatives, stack))
                 _ -> push(stack, indent, mode, alternatives[0])
@@ -524,7 +558,7 @@ fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
         match doc {
             -- A suffix ends its line, so breaking the code before it would
             -- not make the line any shorter: it counts for nothing.
-            Empty | Suffix(_) -> {}
+            Empty | Suffix(_, _) -> {}
             Text(_, w) -> { remaining = remaining - w }
             Raw(s) | Shifted(s, _) -> {
                 let first = Option.unwrapOr(Vec.at(String.lines(s), 0), "")
@@ -585,7 +619,13 @@ fun fillLine(p : P, indent : Int, items : Vec Doc) -> Unit {
 
 -- A row laid out on its own: its text, the width of its `left` when the row
 -- is one line, and the suffixes waiting at its end.
-type Laid = Laid { body : Vec String, leftText : String, single : Bool, pending : Vec String }
+type Laid = Laid {
+    body     : Vec String,
+    leftText : String,
+    single   : Bool,
+    pending  : Vec String,
+    ends     : Bool,
+}
 
 fun printRows(p : P, indent : Int, table : Vec Row) -> Unit {
     let laid = Vec.map(table, laidOut(p, indent, _))
@@ -599,7 +639,7 @@ fun printRows(p : P, indent : Int, table : Vec Row) -> Unit {
 
 fun laidOut(p : P, indent : Int, r : Row) -> Laid {
     match r.kind {
-        Blank -> return Laid { body = [""], leftText = "", single = True, pending = [] }
+        Blank -> return Laid { body = [""], leftText = "", single = True, pending = [], ends = False }
         _ -> {}
     }
     let q = printer(p.width, indent * tabWidth, p.marks)
@@ -610,7 +650,7 @@ fun laidOut(p : P, indent : Int, r : Row) -> Laid {
         Aligned -> if single { renderFlat(r.left) } else { "" }
         _ -> ""
     }
-    Laid { body = body, leftText = leftText, single = single, pending = q.pending }
+    Laid { body = body, leftText = leftText, single = single, pending = q.pending, ends = q.ends }
 }
 
 -- Pads each run of one-line `Aligned` rows so that their `right` parts start
@@ -634,7 +674,7 @@ fun alignTokens(p : P, table : Vec Row, laid : Vec Laid) -> Unit {
             let cs = String.toCodePoints(l.body[0])
             let leftLength = String.codePointCount(l.leftText)
             let after = String.fromCodePoints(Array.slice(cs, leftLength, len(cs)))
-            l.body[0] = l.leftText + padding(p, run, Tokens, widest - columns(l.leftText)) + after
+            l.body[0] = l.leftText + padding(p, run, Tokens, String.repeat(" ", widest - columns(l.leftText))) + after
         }
         i = j
     }
@@ -646,7 +686,10 @@ fun inTokenRun(r : Row, l : Laid) -> Bool = match r.kind {
 }
 
 -- Writes each row's suffixes after it. A run of one-line rows that each have
--- some puts them at one column, a space after the run's longest row.
+-- some puts them at one column, a space after the run's longest row. There
+-- the suffixes before one that ends its line are notes, in a column of their
+-- own a space after the longest row, and the suffix that ends the line goes
+-- a space after the longest row and notes.
 fun alignSuffixes(p : P, table : Vec Row, laid : Vec Laid) -> Unit {
     var i = 0
     while i < len(table) {
@@ -666,13 +709,26 @@ fun alignSuffixes(p : P, table : Vec Row, laid : Vec Laid) -> Unit {
             widest = larger(widest, measured(p, laid[j].body[0]))
             j = j + 1
         }
+        var widestNoted = widest
+        for var k = i; k < j; k = k + 1 {
+            widestNoted = larger(widestNoted, widest + columns(notesOf(laid[k])))
+        }
         for var k = i; k < j; k = k + 1 {
             let l = laid[k]
-            l.body[0] = l.body[0] + padding(p, run, Suffixes, widest - measured(p, l.body[0]) + 1)
-                + String.join(l.pending, " ")
+            let notes = notesOf(l)
+            let filled = String.repeat(" ", widest - measured(p, l.body[0])) + notes
+                + String.repeat(" ", widestNoted - widest - columns(notes) + 1)
+            let rest = if l.ends { [l.pending[len(l.pending) - 1]] } else { l.pending }
+            l.body[0] = l.body[0] + padding(p, run, Suffixes, filled) + String.join(rest, " ")
         }
         i = j
     }
+}
+
+-- The suffixes of `l` before the one that ends its line, a space before each.
+fun notesOf(l : Laid) -> String {
+    if !l.ends { return "" }
+    String.join(Vec.map(Vec.slice(l.pending, 0, len(l.pending) - 1), \" " + _), "")
 }
 
 fun inSuffixRun(r : Row, l : Laid) -> Bool = match r.kind {

@@ -274,7 +274,8 @@ turkey format -- -odd-name.gob
 ```
 
 As for the other commands, `--` ends the options, so every argument after it
-is a file, even one whose name starts with `-`.
+is a file, even one whose name starts with `-`. The exception is `-` itself,
+which means standard input there too, as below.
 
 `turkey format -` formats the text on standard input instead and writes it to
 standard output, for an editor to run on a buffer. It checks the text as it

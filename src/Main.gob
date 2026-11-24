@@ -593,6 +593,9 @@ fun format(p : Args.Parser) -> Unit {
 			Right(Some(arg))         -> formatUsage(Args.unexpected(arg))
 		}
 	}
+	if Option.isSome(named) && !Vec.contains(paths, "-") {
+		formatUsage("--stdin-name names standard input, so it needs '-'")
+	}
 	if len(paths) == 0 { formatUsage(formatSynopsis) }
 	if Vec.contains(paths, "-") {
 		if len(paths) > 1 {
@@ -600,12 +603,13 @@ fun format(p : Args.Parser) -> Unit {
 		}
 		return formatInput(Option.unwrapOr(named, "<stdin>"), checking)
 	}
-	if Option.isSome(named) { formatUsage("--stdin-name names standard input, so it needs '-'") }
-	if one { Diag.exit(formatFile(paths[0], checking)) }
+	if one { Diag.exit(formatFile(paths[0], checking, 11)) }
 	-- Each file's status, as `formatFile` gives it, and what it wrote to standard
 	-- error that is still to be written.
 	let outcomes = match Platform.os {
-		Wasi -> Vec.map(paths, fun(path) = (formatFile(path, checking), ""))
+		-- No parent turns a refusal into status 2 here, so formatted text that
+		-- does not parse, which ends the process, ends it with 2 itself.
+		Wasi -> Vec.map(paths, fun(path) = (formatFile(path, checking, 2), ""))
 		Darwin | Linux -> {
 			-- `--` before the path, so a file whose name starts with `-` is a file.
 			let flags = if checking {
@@ -658,12 +662,12 @@ fun formatUsage(message : String) -> a {
 -- Formats `path`, and returns 0 if it was formatted already, 10 if it changed
 -- or would change, 11 if the formatter refused it and 13 if it could not be
 -- written, having said why on standard error. Ends the program with status 1
--- if it does not parse, 2 if it cannot be read, and 11 if the formatted text
--- does not parse. `format --one` exits with the status.
-fun formatFile(path : String, checking : Bool) -> Int {
+-- if it does not parse, 2 if it cannot be read, and `unparsed` if the
+-- formatted text does not parse. `format --one` exits with the status.
+fun formatFile(path : String, checking : Bool, unparsed : Int) -> Int {
 	Diag.compiling(path)
 	let source = readOrDie(path)
-	match Format.format(source, 11) {
+	match Format.format(source, unparsed) {
 		Refused(why) -> {
 			toStderr(path + ": internal error: the formatter refuses this file: " + why + "\n")
 			11
@@ -699,7 +703,7 @@ fun formatInput(name : String, checking : Bool) -> Unit {
 	let text = match String.fromBytes(bytes) {
 		Some(t) -> t
 		None -> {
-			toStderr("turkey: " + name + " is not valid UTF-8\n")
+			toStderr("turkey: '" + name + "' is not valid UTF-8\n")
 			Diag.exit(3)
 		}
 	}

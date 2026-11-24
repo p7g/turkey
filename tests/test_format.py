@@ -492,7 +492,7 @@ def test_standard_input_that_is_not_utf8_writes_nothing() -> None:
     result = subprocess.run(toolchain.command(bootc.binary(), "format", "-"), input=b"\xff\n",
                             capture_output=True, timeout=600)
     assert (result.returncode, result.stdout) == (3, b"")
-    assert result.stderr == b"turkey: <stdin> is not valid UTF-8\n"
+    assert result.stderr == b"turkey: '<stdin>' is not valid UTF-8\n"
 
 
 @pytest.mark.parametrize("hook", ["refuse", "garble"])
@@ -509,8 +509,10 @@ def test_standard_input_is_its_own_command_line(tmp_path: Path) -> None:
     mixed = run_format("-", "a.gob", cwd=tmp_path, stdin="")
     assert (mixed.returncode, mixed.stdout) == (4, "")
     assert mixed.stderr == "turkey: '-' reads standard input, and cannot be given with files\n"
-    named = run_format("--stdin-name", "x.gob", "a.gob", cwd=tmp_path)
-    assert (named.returncode, named.stderr) == (4, "turkey: --stdin-name names standard input, so it needs '-'\n")
+    needs = "turkey: --stdin-name names standard input, so it needs '-'\n"
+    for argv in (["--stdin-name", "x.gob", "a.gob"], ["--stdin-name", "x.gob"]):
+        named = run_format(*argv, cwd=tmp_path)
+        assert (named.returncode, named.stderr) == (4, needs)
 
 
 def test_a_directive_line_keeps_its_code(tmp_path: Path) -> None:

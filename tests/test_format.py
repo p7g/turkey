@@ -131,9 +131,16 @@ def _fences() -> list[tuple[str, str, bool]]:
     return out
 
 
+def _corpus() -> list[Path]:
+    """The `.gob` files of `lib/`, `src/` and `examples/`, sorted, without a
+    test's throwaway `Probe_*` module, which another test may write into
+    `lib/` and delete while this one runs."""
+    return sorted(p for top in ("lib", "src", "examples") for p in (ROOT / top).rglob("*.gob")
+                  if not p.name.startswith("Probe_"))
+
+
 def test_the_corpus_formats_safely(tmp_path: Path) -> None:
-    files = sorted(str(p.relative_to(ROOT)) for top in ("lib", "src", "examples")
-                   for p in (ROOT / top).rglob("*.gob"))
+    files = [str(p.relative_to(ROOT)) for p in _corpus()]
     accepted = []
     rejected = []
     for name, source, error in _fences():
@@ -170,12 +177,11 @@ def test_the_corpus_fits_the_width(tmp_path: Path) -> None:
     # A line over the width that could have broken is a layout that measured
     # wrongly, such as a head whose `{` went uncounted.
     copies = []
-    for top in ("lib", "src", "examples"):
-        for p in (ROOT / top).rglob("*.gob"):
-            target = tmp_path / p.relative_to(ROOT)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(p, target)
-            copies.append(str(target))
+    for p in _corpus():
+        target = tmp_path / p.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(p, target)
+        copies.append(str(target))
     result = run_format(*copies)
     assert result.returncode == 0, result.stderr
     long = []
@@ -212,12 +218,11 @@ def test_block_comments_all_over_the_corpus_format_safely(tmp_path: Path) -> Non
     # reaches nearly every place the layout puts code, over a quarter of a
     # million of them. None may make the formatter refuse a file.
     paths = []
-    for top in ("lib", "src", "examples"):
-        for source in sorted((ROOT / top).rglob("*.gob")):
-            target = tmp_path / source.relative_to(ROOT)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(_with_block_comments(source.read_text()))
-            paths.append(str(target))
+    for source in _corpus():
+        target = tmp_path / source.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_with_block_comments(source.read_text()))
+        paths.append(str(target))
     result = run_format("--check", *paths)
     assert result.returncode in (0, 1) and result.stderr == "", result.stderr
 

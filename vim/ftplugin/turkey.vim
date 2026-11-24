@@ -7,10 +7,19 @@ if exists("b:did_ftplugin")
 endif
 let b:did_ftplugin = 1
 
-" Comments: `--` line comments, `{- -}` block comments.
+" Comments: `--` line comments, `---` doc comments, `{- -}` block comments.
+" `---` comes first so that a doc comment continues as one.
 setlocal commentstring=--\ %s
-setlocal comments=:--,s1:{-,mb:-,ex:-}
-setlocal formatoptions+=ro
+setlocal comments=:---,:--,s1:{-,mb:-,ex:-}
+setlocal formatoptions-=t formatoptions+=croql
+
+" The layout `turkey format` writes: a tab per level, and lines that fit in 100
+" columns counting a tab as 4. 'textwidth' wraps comments only ('formatoptions'
+" has no `t`), since the formatter breaks code. Set
+" `g:turkey_recommended_style = 0` to keep your own settings.
+if get(g:, "turkey_recommended_style", 1)
+  setlocal noexpandtab tabstop=4 shiftwidth=0 softtabstop=0 textwidth=100
+endif
 
 " Identifiers may end in primes (`x'`).
 setlocal iskeyword+='
@@ -25,6 +34,17 @@ if exists("loaded_matchit")
   let b:match_words = '\<if\>:\<else\>'
 endif
 
+" `:TurkeyFormat` formats the buffer with `turkey format`; see autoload/turkey.vim.
+command! -buffer -bar TurkeyFormat call turkey#Format()
+
+augroup turkey_format_on_save
+  autocmd! * <buffer>
+  autocmd BufWritePre <buffer> call turkey#FormatOnSave()
+augroup END
+
 let b:undo_ftplugin = "setlocal commentstring< comments< formatoptions<"
       \ . " iskeyword< include< includeexpr< suffixesadd<"
+      \ . " expandtab< tabstop< shiftwidth< softtabstop< textwidth<"
       \ . " | unlet! b:match_words"
+      \ . " | silent! delcommand -buffer TurkeyFormat"
+      \ . " | execute 'autocmd! turkey_format_on_save * <buffer>'"

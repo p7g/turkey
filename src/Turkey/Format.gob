@@ -1164,11 +1164,64 @@ fun arrow(f : F, at : Int) -> Doc = spacedToken(f, at, "->")
 -- comments before it. A comment that ends the line before it keeps the
 -- token at the start of the next.
 fun spacedToken(f : F, at : Int, token : String) -> Doc {
+    let (lead, _) = tokenLead(f, at, token)
+    P.cat([lead, P.text(" ")])
+}
+
+-- The token `token`, at token `at`, with a space before it, after the
+-- comments before it, and whether a comment ending the line before it put the
+-- token at the start of the next.
+fun tokenLead(f : F, at : Int, token : String) -> (Doc, Bool) {
     let (before, broken) = leadingParts(f, tokenPos(f, at))
     let here = inlineAt(f, tokenPos(f, at))
-    if broken { P.cat([before, P.nest(1, P.hard), here, P.text(token + " ")]) }
-    else if P.isEmpty(here) { P.cat([before, P.text(" " + token + " ")]) }
-    else { P.cat([before, P.text(" "), here, P.text(token + " ")]) }
+    if broken { (P.cat([before, P.nest(1, P.hard), here, P.text(token)]), True) }
+    else if P.isEmpty(here) { (P.cat([before, P.text(" " + token)]), False) }
+    else { (P.cat([before, P.text(" "), here, P.text(token)]), False) }
+}
+
+-- `lead`, which ends in the `=` or `->` at token `at`, and `value` after it.
+--
+-- When `kept` says so, the line breaks after the token when the source breaks
+-- it there with no comment between, as a line break after an opening bracket
+-- keeps a list expanded. Callers pass it for a function's `=` and an arm's
+-- `->`, and not for the `=` of a `let`, a `var` or an assignment.
+--
+-- Otherwise a value with a head that can stay on the token's line goes all on
+-- the line if it fits, or with its head on the line and the rest broken under
+-- it if the head fits, or else on the next line, one tab in, where its head
+-- breaks only if it still does not fit. Such a value ends in braces, is a
+-- bracketed literal, or is a call hugging its last argument. Breaking after
+-- the token first keeps a head such as `match (a, b) {` whole. Any other
+-- value goes on the next line when it does not fit and `loose` says it may,
+-- and after the token on its line when not.
+fun valueAfter(f : F, at : Int, lead : Doc, value : Expr, kept : Bool, loose : Bool) -> Doc {
+    if commentBefore(f, startOf(value.span)) { return P.cat([lead, P.text(" "), exprDoc(f, value)]) }
+    let d = exprDoc(f, value)
+    let next = P.nest(1, P.cat([P.hard, d]))
+    if kept && breaksAfter(f, at) { return P.cat([lead, next]) }
+    if keepsHead(value) {
+        let same = P.cat([P.text(" "), d])
+        let onLine = P.headed(P.cat([P.text(" "), P.forceTail(d)]))
+        -- Where the break is not kept, a head too long for a line of its own
+        -- breaks on the token's line: broken there, it would hold a bracket
+        -- expanded by a line break, which keeps the head on the token's line
+        -- the next time.
+        if kept { return P.cat([lead, P.choice([same, onLine, next])]) }
+        return P.cat([lead, P.choice([same, onLine, P.below(1, P.headed(P.forceTail(d))), same])])
+    }
+    if loose { P.cat([lead, P.group(P.nest(1, P.cat([P.line, d])))]) } else { P.cat([lead, P.text(" "), d]) }
+}
+
+-- Whether the source has a line break right after token `at`.
+fun breaksAfter(f : F, at : Int) -> Bool =
+    at + 1 < len(f.tokens) && f.tokens[at + 1].span.line > f.tokens[at].span.endLine
+
+-- Whether `e` has a head that may stay on the line of the `=` or `->` before
+-- it while the rest of `e` breaks under it.
+fun keepsHead(e : Expr) -> Bool = match e.kind {
+    ETuple(xs) | EArray(xs) -> len(xs) > 0
+    ECall(_, args) -> hugs(args)
+    _ -> endsInBraces(e)
 }
 
 fun predDoc(f : F, p : Pred) -> Doc {
@@ -1405,11 +1458,13 @@ fun funDoc(f : F, d : FunDecl) -> Doc {
             return P.cat([kept(f, header), P.text(" "), exprDoc(f, b)])
         }
     }
-    let context = if len(d.context) == 0 { P.empty() } else {
-        P.cat([P.text("["), predsDoc(f, d.context), P.text("]")])
-    }
     let funToken = findToken(f, startOf(d.span), "fun")
     var open = funToken + 2
+    -- The constraints break like the parameters: one to a line, with a
+    -- trailing comma, when `fun f[...](` does not fit.
+    let context = if len(d.context) == 0 { P.empty() } else {
+        list(f, open, "[", "]", Vec.map(d.context, fun(p) = Entry { span = p.span, build = fun() = predDoc(f, p) }))
+    }
     if kindAt(f, open) == "[" { open = matching(f, open) + 1 }
     let params = list(f, open, "(", ")",
                       Vec.map(d.params, fun(p) = Entry { span = p.span, build = fun() = paramDoc(f, p) }))
@@ -1437,17 +1492,16 @@ fun directiveAfter(f : F, open : Pos) -> Bool {
     False
 }
 
--- A function's body after its signature: a block as a block, `= value` on the
--- line when the value ends in braces, and otherwise `=` and the value on the
--- next line unless the whole declaration fits on one.
+-- A function's body after its signature: a block as a block, a body after a
+-- comment on the lines below the `=`, and any other body after the `=` as
+-- `valueAfter` lays it out, with the source's line break after the `=` kept.
 fun bodyDoc(f : F, b : Expr) -> Doc {
     if let EBlock(_) = b.kind { return P.cat([P.text(" "), droppedEquals(f, b), exprDoc(f, b)]) }
     if commentBefore(f, startOf(b.span)) {
         let above = dangling(f, startOf(b.span))
         return P.cat([P.text(" ="), P.nest(1, P.cat([above, P.hard, exprDoc(f, b)]))])
     }
-    if endsInBraces(b) { return P.cat([P.text(" = "), exprDoc(f, b)]) }
-    P.group(P.cat([P.text(" ="), P.nest(1, P.cat([P.line, exprDoc(f, b)]))]))
+    valueAfter(f, tokenFrom(f, startOf(b.span)) - 1, P.text(" ="), b, True, True)
 }
 
 -- The comments before the `=` the formatter drops ahead of the block body
@@ -1471,11 +1525,10 @@ fun endsInBraces(e : Expr) -> Bool = match e.kind {
 fun stmtDoc(f : F, s : Stmt) -> Doc {
     let (lead, broken) = leadingParts(f, startOf(s.span))
     let d = match s.kind {
-        SLet(p, value) -> P.cat([P.text("let "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
-        SVar(p, value) -> P.cat([P.text("var "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
+        SLet(p, value) -> P.cat([P.text("let "), patDoc(f, p), assigned(f, p.span, value)])
+        SVar(p, value) -> P.cat([P.text("var "), patDoc(f, p), assigned(f, p.span, value)])
         SFun(d) -> funDoc(f, d)
-        SAssign(target, value) ->
-            P.cat([exprDoc(f, target), equals(f, target.span), exprDoc(f, value)])
+        SAssign(target, value) -> P.cat([exprDoc(f, target), assigned(f, target.span, value)])
         SExpr(e) -> exprDoc(f, e)
         SLetElse(mutable, p, value, otherwise) -> P.cat([
             P.text(if mutable { "var " } else { "let " }), patDoc(f, p), equals(f, p.span),
@@ -1483,6 +1536,14 @@ fun stmtDoc(f : F, s : Stmt) -> Doc {
         ])
     }
     continued(lead, broken, P.cat([inlineAt(f, startOf(s.span)), d]))
+}
+
+-- The `=` after what `before` covers, the comments between them kept before
+-- it, and `value` after it, laid out by `valueAfter`.
+fun assigned(f : F, before : Span, value : Expr) -> Doc {
+    let at = findToken(f, endOf(before), "=")
+    let (lead, broken) = tokenLead(f, at, "=")
+    if broken { P.cat([lead, P.text(" "), exprDoc(f, value)]) } else { valueAfter(f, at, lead, value, False, False) }
 }
 
 -- ` = ` after what `before` covers, the comments between them kept before
@@ -1767,7 +1828,9 @@ fun matchDoc(f : F, e : Expr, scrutinee : Expr, arms : Vec Arm) -> Doc {
         build = fun() = Row {
             kind = Aligned,
             left = alternatives(f, a.patterns),
-            right = P.cat([P.text(" -> "), exprDoc(f, a.body)]),
+            -- The comments before the `->` are put back after the layout, so
+            -- that one directly before it is aligned as a note.
+            right = valueAfter(f, tokenFrom(f, startOf(a.body.span)) - 1, P.text(" ->"), a.body, True, False),
         },
     })
     let s = sequence(f, items, closerOf(e.span))
@@ -1789,16 +1852,38 @@ fun callDoc(f : F, e : Expr, fn : Expr, args : Vec Expr) -> Doc {
         return P.cat([callee, P.text("("), l.items[0], l.ends[0], P.text(")")])
     }
     let broken = bracketed("(", ")", l, expand)
-    if expand || n == 0 || !huggable(args[n - 1]) || Iter.any(l.ends, P.isHard) {
+    if expand || !hugs(args) || Iter.any(l.ends, P.isHard) {
         return P.cat([callee, broken])
     }
     P.cat([callee, P.choice([flatList("(", ")", l), huggedList("(", ")", l), broken])])
 }
 
--- Whether a last argument may hug its call: a block, a record, or a function
--- whose body ends in braces.
+-- Whether the last of `args` may hug its call: it may, as `huggable` says,
+-- unless the argument before it has the same shape, as two tuples do. Two
+-- arguments alike read as a pair, which a hug would split across lines.
+fun hugs(args : Vec Expr) -> Bool {
+    let n = len(args)
+    if n == 0 || !huggable(args[n - 1]) { return False }
+    n == 1 || shape(args[n - 2]) != shape(args[n - 1])
+}
+
+-- What kind of bracketed literal `e` is, for `hugs` to compare, or "" for
+-- anything else.
+fun shape(e : Expr) -> String = match e.kind {
+    ETuple(_) -> "tuple"
+    EArray(_) -> "array"
+    ERecord(_, _) -> "record"
+    EBlock(_) | EDo(_) -> "block"
+    ELambda(_, _, _, _) -> "lambda"
+    _ -> ""
+}
+
+-- Whether a last argument may hug its call: a bracketed literal (a block, a
+-- record, a tuple or a non-empty array) or a function whose body ends in
+-- braces.
 fun huggable(e : Expr) -> Bool = match e.kind {
     EBlock(_) | ERecord(_, _) | EDo(_) -> True
+    ETuple(xs) | EArray(xs) -> len(xs) > 0
     ELambda(_, _, body, _) -> !isShorthand(e) && endsInBraces(body)
     _ -> False
 }

@@ -149,6 +149,43 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
     assert "internal error" not in result.stderr, result.stderr
 
 
+def _columns(line: str) -> int:
+    return sum(4 if c == "\t" else 1 for c in line)
+
+
+def _may_run_long(line: str) -> bool:
+    """Whether a formatted line longer than the width is long for a reason the
+    layout cannot break: comments, which do not count toward the width, or a
+    string literal."""
+    code = re.sub(r"\{-.*?-\}", "", line)
+    if code.lstrip().startswith("--"):
+        return True
+    code = re.sub(r"\s--.*$", "", code).rstrip()
+    if _columns(code) <= 100:
+        return True
+    return _columns(re.sub(r'"(\\.|[^"\\])*"', '""', code)) <= 100
+
+
+def test_the_corpus_fits_the_width(tmp_path: Path) -> None:
+    # A line over the width that could have broken is a layout that measured
+    # wrongly, such as a head whose `{` went uncounted.
+    copies = []
+    for top in ("lib", "src", "examples"):
+        for p in (ROOT / top).rglob("*.gob"):
+            target = tmp_path / p.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(p, target)
+            copies.append(str(target))
+    result = fmt(*copies)
+    assert result.returncode == 0, result.stderr
+    long = []
+    for name in copies:
+        for n, line in enumerate(Path(name).read_text().split("\n"), 1):
+            if _columns(line) > 100 and not _may_run_long(line):
+                long.append(f"{Path(name).relative_to(tmp_path)}:{n}: {line.strip()}")
+    assert long == []
+
+
 def _with_block_comments(text: str) -> str:
     """`text` with a block comment in every space between two tokens of each
     code line. A line with a quote or a comment on it is left alone, so no
@@ -239,6 +276,8 @@ AWKWARD = {
     "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
     "foreign_blocks": "foreign \"env\" {\n    \"log\" fun log(x : Int) -> Unit\n}\nforeign \"ssl\" 3 { \"f\" fun g(x : Int) -> Int }\n",
     "comments_before_aligned_trailing_comments": "fun main() {\n    let a = f(1) {- c -} -- one\n    let bb = 2 -- two\n    let c = 3 {- x -} {- y -} -- three\n}\n",
+    "no_hug_after_same_shape": "fun build(obj : Object) {\n    let byLibrary = fun(a : Symbol, b : Symbol) =\n        Array.threeWay((ordinal(a), a.name), (ordinal(b), b.name))\n    send(socket, [headerLength, payloadLength, checksumOfThePayload], [sequenceNumber, flagsOfThePacket])\n}\n",
+    "row_too_wide_to_align": "fun clashing(s : Solver, a : Ty.Type, b : Ty.Type, open : Set.Set Int) -> Bool {\n    if opened(a, open) || opened(b, open) { return False }\n    match (Ty.prune(a), Ty.prune(b)) {\n        (TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)\n        (TVar(_), _) | (_, TVar(_)) -> False\n        (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> False\n        (TBottom, _) | (_, TBottom) -> False\n        (TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid\n        (TApp(f1, a1, _), TApp(f2, a2, _)) -> clashing(s, f1, f2, open) || clashing(s, a1, a2, open)\n        (TFun(p1, r1), TFun(p2, r2)) -> clashingAll(s, p1, p2, open) || clashing(s, r1, r2, open)\n        (TTuple(e1), TTuple(e2)) -> clashingAll(s, e1, e2, open)\n        (x, y) -> !Ty.sameType(x, y)\n    }\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -363,6 +402,35 @@ AWKWARD_OUTPUT = {
         "\tlet a = f(1) {- c -}         -- one\n"
         "\tlet bb = 2                   -- two\n"
         "\tlet c = 3    {- x -} {- y -} -- three\n"
+        "}\n"
+    ),
+    "no_hug_after_same_shape": (
+        "fun build(obj : Object) {\n"
+        "\tlet byLibrary = fun(a : Symbol, b : Symbol) = Array.threeWay(\n"
+        "\t\t(ordinal(a), a.name),\n"
+        "\t\t(ordinal(b), b.name),\n"
+        "\t)\n"
+        "\tsend(\n"
+        "\t\tsocket,\n"
+        "\t\t[headerLength, payloadLength, checksumOfThePayload],\n"
+        "\t\t[sequenceNumber, flagsOfThePacket],\n"
+        "\t)\n"
+        "}\n"
+    ),
+    "row_too_wide_to_align": (
+        "fun clashing(s : Solver, a : Ty.Type, b : Ty.Type, open : Set.Set Int) -> Bool {\n"
+        "\tif opened(a, open) || opened(b, open) { return False }\n"
+        "\tmatch (Ty.prune(a), Ty.prune(b)) {\n"
+        "\t\t(TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)\n"
+        "\t\t(TVar(_), _) | (_, TVar(_))                 -> False\n"
+        "\t\t(TFam(_, _, _), _) | (_, TFam(_, _, _))     -> False\n"
+        "\t\t(TBottom, _) | (_, TBottom)                 -> False\n"
+        "\t\t(TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid\n"
+        "\t\t(TApp(f1, a1, _), TApp(f2, a2, _)) -> clashing(s, f1, f2, open) || clashing(s, a1, a2, open)\n"
+        "\t\t(TFun(p1, r1), TFun(p2, r2)) -> clashingAll(s, p1, p2, open) || clashing(s, r1, r2, open)\n"
+        "\t\t(TTuple(e1), TTuple(e2))                    -> clashingAll(s, e1, e2, open)\n"
+        "\t\t(x, y)                                      -> !Ty.sameType(x, y)\n"
+        "\t}\n"
         "}\n"
     ),
 }

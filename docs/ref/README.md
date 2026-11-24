@@ -163,6 +163,7 @@ left.
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

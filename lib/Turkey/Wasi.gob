@@ -659,10 +659,24 @@ fun oneBuffer(buf : Ptr, count : Int) -> Ptr {
 fun moved(code : Prim.Int32) -> Int =
     if checked(code) != 0 { -1 } else { load32(scratch(), doneAt()) }
 
+-- `moved` for a read from `fd`. WASI answers `badf` for a read from a
+-- directory, where Linux answers `EISDIR`, so a directory's `badf` is
+-- reported as Linux's.
+fun readMoved(fd : Int, code : Prim.Int32) -> Int {
+    if int(code) == 8 && isDirectory(fd) { return refused(21) }
+    moved(code)
+}
+
+-- Whether `fd` is open on a directory.
+fun isDirectory(fd : Int) -> Bool {
+    let stat = at(scratch(), statAt())
+    int(fdFdstatGet(i32(fd), stat)) == 0 && load8(stat, 0) == 3
+}
+
 --- Returns how many bytes it read, 0 at the end, or -1.
 fun read(fd : Int, buf : Ptr, count : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdRead(i32(fd), oneBuffer(buf, count), i32(1), at(scratch(), doneAt())))
+    readMoved(fd, fdRead(i32(fd), oneBuffer(buf, count), i32(1), at(scratch(), doneAt())))
 }
 
 --- Returns how many bytes it wrote, or -1.
@@ -675,7 +689,7 @@ fun write(fd : Int, buf : Ptr, count : Int) -> Int {
 --- the file's position.
 fun pread(fd : Int, buf : Ptr, count : Int, offset : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdPread(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch(), doneAt())))
+    readMoved(fd, fdPread(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch(), doneAt())))
 }
 
 fun pwrite(fd : Int, buf : Ptr, count : Int, offset : Int) -> Int {
@@ -922,6 +936,11 @@ fun statFill(stat : Ptr, buf : Ptr) -> Unit {
     store64(buf, 8, load64(stat, 8))
     -- The file type's `S_IF*` bits; WASI keeps no permissions, so every file
     -- reads as its owner's to read and write, and a directory to search.
+    --
+    -- WASI names six of the seven kinds of file Linux and Darwin have, and
+    -- not a FIFO, which a host reports as `unknown`, 0, as wasmtime does. So
+    -- `unknown` reads as a FIFO: without a kind, `System.File` refuses the
+    -- stat, and `removeTree` a tree that holds one.
     let mode = match load8(stat, 16) {
         1 -> 0o060600
         2 -> 0o020600
@@ -930,7 +949,7 @@ fun statFill(stat : Ptr, buf : Ptr) -> Unit {
         5 -> 0o140600
         6 -> 0o140600
         7 -> 0o120600
-        _ -> 0o600
+        _ -> 0o010600
     }
     store32(buf, 16, mode)
     store32(buf, 20, load64(stat, 24))

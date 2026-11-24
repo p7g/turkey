@@ -259,18 +259,18 @@ fun main() {
 
 ## Formatting
 
-`turkey fmt` rewrites each file it is given in the one style Turkey has, which
-takes no options. `turkey fmt --check` writes nothing: it prints the name of
-each file it would change, and exits with status 1 if there is one. A file
-that cannot be read, parsed or written is reported, the other files are done
-anyway, and the exit status is 3. A file the formatter refuses, because its
+`turkey format` rewrites each file it is given in the one style Turkey has,
+which takes no options. `turkey format --check` writes nothing: it prints the
+name of each file it would change, and exits with status 1 if there is one. A
+file that cannot be read, parsed or written is reported, the other files are
+done anyway, and the exit status is 3. A file the formatter refuses, because its
 output would not be the same program, is reported as an internal error, with
-status 2, and a command line `turkey fmt` cannot read exits with status 4.
+status 2, and a command line `turkey format` cannot read exits with status 4.
 
 ```sh
-turkey fmt hello.gob
-turkey fmt --check *.gob
-turkey fmt -- -odd-name.gob
+turkey format hello.gob
+turkey format --check *.gob
+turkey format -- -odd-name.gob
 ```
 
 As for the other commands, `--` ends the options, so every argument after it

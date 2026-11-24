@@ -1,0 +1,160 @@
+export (unitSpelling)
+
+--- Checks on how code is spelled where two spellings mean one thing, and the
+--- one written says something its author did not mean.
+
+import Turkey.Ast (Expr(..), ExprKind(..), Stmt(..), StmtKind(..), Arm(..), Child(..), FunDecl(..))
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
+import Turkey.Lint as Lint
+import Turkey.Source as Source
+
+-- -- unit-spelling ------------------------------------------------------------------
+--
+-- `{}` and `()` are one value, and the spelling says which the author means:
+-- `{}` is a body that does nothing, `()` is the unit value. So an empty block
+-- whose value is used is spelled `()`. A `match` arm that does nothing is
+-- spelled `{}` when the `match` is a statement and `()` when its value is used.
+--
+-- Whether a value is used is decided by where it is written, never by types or
+-- by the other arms: a rule that read the other arms would flip the spelling
+-- of an arm nobody touched whenever one of them is edited. Where the grammar
+-- asks for a block -- a function body, an `if` branch, a loop body -- `{}` is
+-- always a body, and nothing is reported. The value of a `return` or `break`
+-- is left to `empty-return-value`, so the two never fix the same text.
+
+-- Where an expression is written, as far as its value goes.
+type Place
+	-- A statement, or the last expression of a block: its value is not used.
+	= Statement
+	-- A function's body, written after `=` or as a block.
+	| Body
+	-- A `let`, `var` or assignment's value, an argument, an element of a
+	-- tuple, array or record, or an operand: its value is used.
+	| Used
+	-- The value of a `return` or `break`, which is used, and which
+	-- `empty-return-value` owns when it is `{}` or `()`.
+	| Returned
+
+--- Returns a finding for each empty block whose value is used, and for each
+--- `match` arm whose body is `{}` or `()` and is not spelled as the `match`'s
+--- place asks. Each has a mechanical fix.
+fun unitSpelling(f : File) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		match c {
+			ChStmt(s) -> match s.kind {
+				SLet(_, value)           -> placed(f, value, Used, out)
+				SVar(_, value)           -> placed(f, value, Used, out)
+				SAssign(_, value)        -> placed(f, value, Used, out)
+				SLetElse(_, _, value, _) -> placed(f, value, Used, out)
+				SExpr(e)                 -> placed(f, e, Statement, out)
+				SFun(_)                  -> {}
+			}
+			ChFun(d) -> if let Some(body) = d.body { placed(f, body, Body, out) }
+			ChExpr(e) -> match e.kind {
+				ECall(_, args)     -> for a in args { placed(f, a, Used, out) }
+				ETuple(items)      -> for x in items { placed(f, x, Used, out) }
+				EArray(items)      -> for x in items { placed(f, x, Used, out) }
+				ERecord(_, fields) -> for (_, x) in fields { placed(f, x, Used, out) }
+				EUnary(_, x, _)    -> placed(f, x, Used, out)
+				EBinary(_, a, b, _) -> {
+					placed(f, a, Used, out)
+					placed(f, b, Used, out)
+				}
+				EReturn(Some(x))       -> placed(f, x, Returned, out)
+				EBreak(Some(x))        -> placed(f, x, Returned, out)
+				ELambda(_, _, body, _) -> placed(f, body, Body, out)
+				_                      -> {}
+			}
+			ChArm(_) -> {}
+		}
+		True
+	})
+	out
+}
+
+-- Reports `e`, written at `place`, if it is an empty block whose value is
+-- used, or the arms of `e` if it is a `match`.
+fun placed(f : File, e : Expr, place : Place, out : Vec Finding) -> Unit {
+	match e.kind {
+		EParen(inner) -> placed(f, inner, place, out)
+		EBlock(stmts) -> if len(stmts) == 0 {
+			if let Used = place {
+				respell(
+					f,
+					e,
+					"{}",
+					"()",
+					"this empty block is used as a value, which is the unit value",
+					out,
+				)
+			}
+		}
+		EMatch(_, arms) -> for arm in arms { armPlaced(f, arm, place, out) }
+		_               -> {}
+	}
+}
+
+-- Reports `arm`'s body if it is `{}` or `()` and not as `place`, the place of
+-- its `match`, asks. Any other body is the arm's value, and has the place of
+-- the `match`.
+fun armPlaced(f : File, arm : Arm, place : Place, out : Vec Finding) -> Unit {
+	let body = arm.body
+	let written = match body.kind {
+		EUnit         -> "()"
+		EBlock(stmts) -> if len(stmts) == 0 { "{}" } else { "" }
+		_             -> ""
+	}
+	if written == "" {
+		placed(f, body, if let Body = place { Statement } else { place }, out)
+		return
+	}
+	match place {
+		Statement | Body -> respell(
+			f,
+			body,
+			"()",
+			"{}",
+			"this 'match' is a statement, so an arm that does nothing is an empty body",
+			out,
+		)
+		Used | Returned -> respell(
+			f,
+			body,
+			"{}",
+			"()",
+			"this 'match' is used as a value, so an arm that answers nothing is the unit value",
+			out,
+		)
+	}
+}
+
+-- Reports `e`, if its text is `from` and whitespace, with a fix that writes
+-- `to` in its place. A block holding a comment is empty in the tree but not in
+-- the text, and the comment says why nothing happens, so it is not reported.
+fun respell(
+	f : File,
+	e : Expr,
+	from : String,
+	to : String,
+	why : String,
+	out : Vec Finding,
+) -> Unit {
+	-- A node the parser wrote has an empty span and no text to edit.
+	if Source.isEmpty(e.span) || Source.isGenerated(e.span) { return }
+	if squeezed(Lint.textOf(f, e.span)) != from { return }
+	Vec.push(out, Finding {
+		span    = e.span
+		message = why + "; write '" + to + "'"
+		fix     = Some(Fix { edits = [Edit { span = e.span, text = to }], mechanical = True })
+	})
+}
+
+-- `text` without its whitespace.
+fun squeezed(text : String) -> String {
+	let kept = []
+	for c in String.codePoints(text) {
+		if !Char.isSpace(c) { Vec.push(kept, c) }
+	}
+	String.fromCodePoints(kept)
+}

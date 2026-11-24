@@ -165,6 +165,7 @@ left.
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
 | `discarded-value` | warn | a statement that computes a value other than `()` and drops it ([Discarded values](statements.md#discarded-values)), except those `discarded-monadic-value` reports |
 | `discarded-monadic-value` | warn | a statement that drops an `Option`, an `Either`, or a value of the monad of the `?` block it is in, which is most often a missing `?` ([Discarded values](statements.md#discarded-values)) |
+| `unit-spelling` | warn | `{}` written where its value is used, as in `let done = {}`, and a `match` arm that does nothing spelled `()` in a statement or `{}` in a `match` whose value is used. `{}` is a body that does nothing and `()` the unit value. `--fix` writes the other spelling. |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

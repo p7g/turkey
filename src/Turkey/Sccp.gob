@@ -38,92 +38,98 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), RepClass(..))
 type Lattice = Top | Known(Int) | Bottom
 
 type Solver = Solver {
-    func      : Ssa.Func Low,
-    values    : Array Lattice,
-    reachable : Array Bool,
-    -- Where each value is read, as (block, position). The position of a
-    -- block's terminator is its instruction count.
-    users     : Array (Vec (Int, Int)),
-    blocks    : Vec Int,
-    fallen    : Vec Int,
+	func      : Ssa.Func Low
+	values    : Array Lattice
+	reachable : Array Bool
+	-- Where each value is read, as (block, position). The position of a
+	-- block's terminator is its instruction count.
+	users  : Array (Vec (Int, Int))
+	blocks : Vec Int
+	fallen : Vec Int
 }
 
 --- The function with every value SCCP proves constant replaced by that
 --- constant, every branch on one replaced by a jump, and the blocks that
 --- leaves unreachable removed.
 fun run(f : Ssa.Func Low) -> Ssa.Func Low {
-    let s = solve(f)
-    rewrite(s)
-    Ssa.pruneUnreachable(f)
+	let s = solve(f)
+	rewrite(s)
+	Ssa.pruneUnreachable(f)
 }
 
 fun solve(f : Ssa.Func Low) -> Solver {
-    let users : Array (Vec (Int, Int)) = Array.init(len(f.reps), fun(_) = [])
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let block = f.blocks[b]
-        for var n = 0; n < len(block.insts); n = n + 1 {
-            for v in L.opUses(block.insts[n].op) {
-                Vec.push(users[Ssa.valueId(v)], (b, n))
-            }
-        }
-        for v in Ssa.termUses(block.term) {
-            Vec.push(users[Ssa.valueId(v)], (b, len(block.insts)))
-        }
-    }
-    let s = Solver {
-        func = f, values = Array.filled(len(f.reps), Top),
-        reachable = Array.filled(len(f.blocks), False), users = users,
-        blocks = [Ssa.blockId(f.entry)], fallen = [],
-    }
-    -- A function's parameters are whatever the caller passed.
-    for p in f.params { s.values[Ssa.valueId(p)] = Bottom }
-    while len(s.blocks) > 0 || len(s.fallen) > 0 {
-        while len(s.blocks) > 0 {
-            let b = s.blocks[len(s.blocks) - 1]
-            let _ = Vec.pop(s.blocks)
-            if s.reachable[b] { continue }
-            s.reachable[b] = True
-            let block = f.blocks[b]
-            for i in block.insts { visit(s, i) }
-            visitTerm(s, b, block.term)
-        }
-        while len(s.fallen) > 0 {
-            let v = s.fallen[len(s.fallen) - 1]
-            let _ = Vec.pop(s.fallen)
-            for (b, n) in s.users[v] {
-                if !s.reachable[b] { continue }
-                let block = f.blocks[b]
-                if n == len(block.insts) { visitTerm(s, b, block.term) }
-                else { visit(s, block.insts[n]) }
-            }
-        }
-    }
-    s
+	let users : Array (Vec (Int, Int)) = Array.init(len(f.reps), fun(_) = [])
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let block = f.blocks[b]
+		for var n = 0; n < len(block.insts); n = n + 1 {
+			for v in L.opUses(block.insts[n].op) {
+				Vec.push(users[Ssa.valueId(v)], (b, n))
+			}
+		}
+		for v in Ssa.termUses(block.term) {
+			Vec.push(users[Ssa.valueId(v)], (b, len(block.insts)))
+		}
+	}
+	let s = Solver {
+		func      = f
+		values    = Array.filled(len(f.reps), Top)
+		reachable = Array.filled(len(f.blocks), False)
+		users     = users
+		blocks    = [Ssa.blockId(f.entry)]
+		fallen    = []
+	}
+	-- A function's parameters are whatever the caller passed.
+	for p in f.params { s.values[Ssa.valueId(p)] = Bottom }
+	while len(s.blocks) > 0 || len(s.fallen) > 0 {
+		while len(s.blocks) > 0 {
+			let b = s.blocks[len(s.blocks) - 1]
+			let _ = Vec.pop(s.blocks)
+			if s.reachable[b] { continue }
+			s.reachable[b] = True
+			let block = f.blocks[b]
+			for i in block.insts { visit(s, i) }
+			visitTerm(s, b, block.term)
+		}
+		while len(s.fallen) > 0 {
+			let v = s.fallen[len(s.fallen) - 1]
+			let _ = Vec.pop(s.fallen)
+			for (b, n) in s.users[v] {
+				if !s.reachable[b] { continue }
+				let block = f.blocks[b]
+				if n == len(block.insts) {
+					visitTerm(s, b, block.term)
+				} else {
+					visit(s, block.insts[n])
+				}
+			}
+		}
+	}
+	s
 }
 
 -- Lower a value to its meet with `next`, and queue its users if it fell.
 fun lower(s : Solver, v : Value, next : Lattice) -> Unit {
-    let id = Ssa.valueId(v)
-    let old = s.values[id]
-    let met = meet(old, next)
-    if !same(old, met) {
-        s.values[id] = met
-        Vec.push(s.fallen, id)
-    }
+	let id = Ssa.valueId(v)
+	let old = s.values[id]
+	let met = meet(old, next)
+	if !same(old, met) {
+		s.values[id] = met
+		Vec.push(s.fallen, id)
+	}
 }
 
 fun meet(a : Lattice, b : Lattice) -> Lattice = match (a, b) {
-    (Top, x) -> x
-    (x, Top) -> x
-    (Known(x), Known(y)) -> if x == y { Known(x) } else { Bottom }
-    _ -> Bottom
+	(Top, x)             -> x
+	(x, Top)             -> x
+	(Known(x), Known(y)) -> if x == y { Known(x) } else { Bottom }
+	_                    -> Bottom
 }
 
 fun same(a : Lattice, b : Lattice) -> Bool = match (a, b) {
-    (Top, Top) -> True
-    (Bottom, Bottom) -> True
-    (Known(x), Known(y)) -> x == y
-    _ -> False
+	(Top, Top)           -> True
+	(Bottom, Bottom)     -> True
+	(Known(x), Known(y)) -> x == y
+	_                    -> False
 }
 
 fun visit(s : Solver, i : Low) -> Unit = lower(s, i.result, evaluate(s, i))
@@ -133,159 +139,169 @@ fun visit(s : Solver, i : Low) -> Unit = lower(s, i.result, evaluate(s, i))
 -- revisiting the jump. A branch or a switch carries no arguments, so its
 -- edges only make blocks reachable.
 fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
-    Jump(target, args) -> {
-        let params = s.func.blocks[Ssa.blockId(target)].params
-        for var k = 0; k < len(args); k = k + 1 {
-            lower(s, params[k], s.values[Ssa.valueId(args[k])])
-        }
-        Vec.push(s.blocks, Ssa.blockId(target))
-    }
-    Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
-        Top -> {}
-        Known(k) -> Vec.push(s.blocks, Ssa.blockId(if k != 0 { yes } else { no }))
-        Bottom -> {
-            Vec.push(s.blocks, Ssa.blockId(yes))
-            Vec.push(s.blocks, Ssa.blockId(no))
-        }
-    }
-    Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
-        Top -> {}
-        Known(k) -> match switchTarget(cases, default, k) {
-            Some(target) -> Vec.push(s.blocks, Ssa.blockId(target))
-            None -> {}
-        }
-        Bottom -> for target in Ssa.switchTargets(cases, default) {
-            Vec.push(s.blocks, Ssa.blockId(target))
-        }
-    }
-    Ret(_) -> {}
-    Panic(_) -> {}
-    Unreachable -> {}
+	Jump(target, args) -> {
+		let params = s.func.blocks[Ssa.blockId(target)].params
+		for var k = 0; k < len(args); k = k + 1 {
+			lower(s, params[k], s.values[Ssa.valueId(args[k])])
+		}
+		Vec.push(s.blocks, Ssa.blockId(target))
+	}
+	Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
+		Top      -> {}
+		Known(k) -> Vec.push(s.blocks, Ssa.blockId(if k != 0 { yes } else { no }))
+		Bottom -> {
+			Vec.push(s.blocks, Ssa.blockId(yes))
+			Vec.push(s.blocks, Ssa.blockId(no))
+		}
+	}
+	Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
+		Top -> {}
+		Known(k) -> match switchTarget(cases, default, k) {
+			Some(target) -> Vec.push(s.blocks, Ssa.blockId(target))
+			None         -> {}
+		}
+		Bottom -> for target in Ssa.switchTargets(cases, default) {
+			Vec.push(s.blocks, Ssa.blockId(target))
+		}
+	}
+	Ret(_)      -> {}
+	Panic(_)    -> {}
+	Unreachable -> {}
 }
 
 -- Where a switch on a known value goes: its case, or else its default. `None`
 -- when there is neither, which the switch says cannot happen.
-fun switchTarget(cases : Vec (Int, BlockId), default : Option BlockId,
-                 k : Int) -> Option BlockId {
-    for (key, target) in cases {
-        if key == k { return Some(target) }
-    }
-    default
+fun switchTarget(cases : Vec (Int, BlockId), default : Option BlockId, k : Int) -> Option BlockId {
+	for (key, target) in cases {
+		if key == k { return Some(target) }
+	}
+	default
 }
 
 -- -- evaluation ---------------------------------------------------------------------
 
 fun evaluate(s : Solver, i : Low) -> Lattice {
-    let class_ = Ssa.repOf(s.func, i.result).class_
-    if class_ != I64 && class_ != I1 { return Bottom }
-    match i.op {
-        ConstInt(n) -> Known(n)
-        Bin(o, a, b) -> both(s, a, b, if class_ == I1 { fun(x, y) = logical(o, x, y) }
-                                      else { fun(x, y) = checked(Fold.binary(o, x, y)) })
-        Cmp(o, a, b) ->
-            if Ssa.repOf(s.func, a).class_ != I64 { Bottom }
-            else { both(s, a, b, fun(x, y) = Known(if Fold.compare(o, x, y) { 1 } else { 0 })) }
-        Neg(a) -> one(s, a, fun(x) = checked(Fold.binary(Sub, 0, x)))
-        Not(a) -> one(s, a, fun(x) = Known(if x == 0 { 1 } else { 0 }))
-        -- The one intrinsic from integer to integer; the rest take or answer
-        -- a float, which this lattice does not track.
-        Intrinsic(L.CharIsScalar, a) ->
-            one(s, a, fun(x) = Known(if Fold.isScalar(x) { 1 } else { 0 }))
-        _ -> Bottom
-    }
+	let class_ = Ssa.repOf(s.func, i.result).class_
+	if class_ != I64 && class_ != I1 { return Bottom }
+	match i.op {
+		ConstInt(n) -> Known(n)
+		Bin(o, a, b) -> both(
+			s,
+			a,
+			b,
+			if class_ == I1 {
+				fun(x, y) = logical(o, x, y)
+			} else {
+				fun(x, y) = checked(Fold.binary(o, x, y))
+			},
+		)
+		Cmp(o, a, b) ->
+			if Ssa.repOf(s.func, a).class_ != I64 {
+				Bottom
+			} else {
+				both(s, a, b, fun(x, y) = Known(if Fold.compare(o, x, y) { 1 } else { 0 }))
+			}
+		Neg(a) -> one(s, a, fun(x) = checked(Fold.binary(Sub, 0, x)))
+		Not(a) -> one(s, a, fun(x) = Known(if x == 0 { 1 } else { 0 }))
+		-- The one intrinsic from integer to integer; the rest take or answer
+		-- a float, which this lattice does not track.
+		Intrinsic(L.CharIsScalar, a) ->
+			one(s, a, fun(x) = Known(if Fold.isScalar(x) { 1 } else { 0 }))
+		_ -> Bottom
+	}
 }
 
 -- An operation of one operand: `Top` until the operand is known to be
 -- something, and `Bottom` once it is known to be anything.
 fun one(s : Solver, a : Value, fold : fun(Int) -> Lattice) -> Lattice =
-    match s.values[Ssa.valueId(a)] {
-        Known(x) -> fold(x)
-        other -> other
-    }
+	match s.values[Ssa.valueId(a)] {
+		Known(x) -> fold(x)
+		other    -> other
+	}
 
-fun both(s : Solver, a : Value, b : Value, fold : fun(Int, Int) -> Lattice)
-        -> Lattice = match (s.values[Ssa.valueId(a)], s.values[Ssa.valueId(b)]) {
-    (Known(x), Known(y)) -> fold(x, y)
-    (Bottom, _) -> Bottom
-    (_, Bottom) -> Bottom
-    _ -> Top
-}
+fun both(s : Solver, a : Value, b : Value, fold : fun(Int, Int) -> Lattice) -> Lattice =
+	match (s.values[Ssa.valueId(a)], s.values[Ssa.valueId(b)]) {
+		(Known(x), Known(y)) -> fold(x, y)
+		(Bottom, _)          -> Bottom
+		(_, Bottom)          -> Bottom
+		_                    -> Top
+	}
 
 fun checked(r : Option Int) -> Lattice = match r {
-    Some(n) -> Known(n)
-    None -> Bottom
+	Some(n) -> Known(n)
+	None    -> Bottom
 }
 
 -- `i1` operands are 0 or 1, so the bitwise operations are the logical ones.
 fun logical(o : BinOp, x : Int, y : Int) -> Lattice = match o {
-    And -> Known(x & y)
-    Or -> Known(x | y)
-    Xor -> Known(x ^ y)
-    _ -> Bottom
+	And -> Known(x & y)
+	Or  -> Known(x | y)
+	Xor -> Known(x ^ y)
+	_   -> Bottom
 }
 
 -- -- rewriting ----------------------------------------------------------------------
 
 fun rewrite(s : Solver) -> Unit {
-    let f = s.func
-    -- Which parameters of each block survive: a known one is removed, and
-    -- every jump into the block drops its argument.
-    let keep : Vec (Vec Bool) = []
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let block = f.blocks[b]
-        let kept = []
-        let flags = []
-        let defined = []
-        for p in block.params {
-            match s.values[Ssa.valueId(p)] {
-                Known(n) -> {
-                    Vec.push(flags, False)
-                    -- A constant standing for a parameter comes from every
-                    -- jump into the block at once, so it has no one position.
-                    Vec.push(defined, L.low(p, ConstInt(n), 0))
-                }
-                _ -> {
-                    Vec.push(flags, True)
-                    Vec.push(kept, p)
-                }
-            }
-        }
-        Vec.push(keep, flags)
-        if len(defined) > 0 {
-            block.params = kept
-            for i in block.insts { Vec.push(defined, i) }
-            block.insts = defined
-        }
-    }
-    for block in f.blocks {
-        for i in block.insts {
-            match (s.values[Ssa.valueId(i.result)], i.op) {
-                (_, ConstInt(_)) -> {}
-                (Known(n), _) -> { i.op = ConstInt(n) }
-                _ -> {}
-            }
-        }
-        block.term = match block.term {
-            Jump(target, args) -> {
-                let flags = keep[Ssa.blockId(target)]
-                let passed = []
-                for var k = 0; k < len(args); k = k + 1 {
-                    if flags[k] { Vec.push(passed, args[k]) }
-                }
-                Jump(target, passed)
-            }
-            Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
-                Known(k) -> Jump(if k != 0 { yes } else { no }, [])
-                _ -> Branch(c, yes, no)
-            }
-            Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
-                Known(k) -> match switchTarget(cases, default, k) {
-                    Some(target) -> Jump(target, [])
-                    None -> Unreachable
-                }
-                _ -> Switch(v, cases, default)
-            }
-            other -> other
-        }
-    }
+	let f = s.func
+	-- Which parameters of each block survive: a known one is removed, and
+	-- every jump into the block drops its argument.
+	let keep : Vec (Vec Bool) = []
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let block = f.blocks[b]
+		let kept = []
+		let flags = []
+		let defined = []
+		for p in block.params {
+			match s.values[Ssa.valueId(p)] {
+				Known(n) -> {
+					Vec.push(flags, False)
+					-- A constant standing for a parameter comes from every
+					-- jump into the block at once, so it has no one position.
+					Vec.push(defined, L.low(p, ConstInt(n), 0))
+				}
+				_ -> {
+					Vec.push(flags, True)
+					Vec.push(kept, p)
+				}
+			}
+		}
+		Vec.push(keep, flags)
+		if len(defined) > 0 {
+			block.params = kept
+			for i in block.insts { Vec.push(defined, i) }
+			block.insts = defined
+		}
+	}
+	for block in f.blocks {
+		for i in block.insts {
+			match (s.values[Ssa.valueId(i.result)], i.op) {
+				(_, ConstInt(_)) -> {}
+				(Known(n), _)    -> { i.op = ConstInt(n) }
+				_                -> {}
+			}
+		}
+		block.term = match block.term {
+			Jump(target, args) -> {
+				let flags = keep[Ssa.blockId(target)]
+				let passed = []
+				for var k = 0; k < len(args); k = k + 1 {
+					if flags[k] { Vec.push(passed, args[k]) }
+				}
+				Jump(target, passed)
+			}
+			Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
+				Known(k) -> Jump(if k != 0 { yes } else { no }, [])
+				_        -> Branch(c, yes, no)
+			}
+			Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
+				Known(k) -> match switchTarget(cases, default, k) {
+					Some(target) -> Jump(target, [])
+					None         -> Unreachable
+				}
+				_ -> Switch(v, cases, default)
+			}
+			other -> other
+		}
+	}
 }

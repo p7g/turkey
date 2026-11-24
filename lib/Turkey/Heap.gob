@@ -1,5 +1,10 @@
 export (
-    allocate, collect, report, rootsHead, pause, retireHeld,
+	allocate,
+	collect,
+	report,
+	rootsHead,
+	pause,
+	retireHeld,
 )
 
 --- The heap and its collector: regions of fixed-size slots, allocation into
@@ -58,6 +63,8 @@ import Data.Byte as Byte
 import Data.Float as Float
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
+import Target (OS(..))
+import Target as Target
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -145,9 +152,10 @@ let objectFields : Int = 8
 let arrayLength : Int = 8
 let arrayElements : Int = 16
 
--- One frame-table entry, three words: a return address, how many roots are
--- live across the call, and the address of their `x29` offsets, which are in
--- the emitted table and are four bytes each, signed.
+-- One frame-table entry, three words: a return address, or a site on wasm;
+-- how many roots are live across the call; and the address of their offsets
+-- from the frame, which are in the emitted table and are four bytes each,
+-- signed: from `x29` on arm64, and from the shadow frame on wasm.
 let entryBytes : Int = 24
 
 -- -- state ------------------------------------------------------------------------------
@@ -221,22 +229,22 @@ var bytesSince : Int = 0
 -- Kept per worker so that a refill from a region the cursor owns touches
 -- nothing shared and takes no lock.
 fun localAdd(objects : Int, bytes : Int) -> Unit {
-    let w = Process.workerRecord()
-    Ptr.store(w, 1984, plus(Ptr.load(w, 1984), objects))
-    Ptr.store(w, 1992, plus(Ptr.load(w, 1992), objects))
-    Ptr.store(w, 2000, plus(Ptr.load(w, 2000), bytes))
+	let w = Process.workerRecord()
+	Ptr.store(w, 1984, plus(Ptr.load(w, 1984), objects))
+	Ptr.store(w, 1992, plus(Ptr.load(w, 1992), objects))
+	Ptr.store(w, 2000, plus(Ptr.load(w, 2000), bytes))
 }
 
 fun localBytes() -> Int = Ptr.load(Process.workerRecord(), 2000)
 
 -- Fold worker `w`'s counts into the heap's and zero them.
 fun localFold(w : Ptr) -> Unit {
-    heapCount = plus(heapCount, Ptr.load(w, 1984))
-    allocationsSince = plus(allocationsSince, Ptr.load(w, 1992))
-    bytesSince = plus(bytesSince, Ptr.load(w, 2000))
-    Ptr.store(w, 1984, 0)
-    Ptr.store(w, 1992, 0)
-    Ptr.store(w, 2000, 0)
+	heapCount = plus(heapCount, Ptr.load(w, 1984))
+	allocationsSince = plus(allocationsSince, Ptr.load(w, 1992))
+	bytesSince = plus(bytesSince, Ptr.load(w, 2000))
+	Ptr.store(w, 1984, 0)
+	Ptr.store(w, 1992, 0)
+	Ptr.store(w, 2000, 0)
 }
 -- The bytes of the slots the last sweep kept: a large object's whole region.
 var liveBytes : Int = 0
@@ -266,7 +274,7 @@ fun rememberedCountSet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 304,
 fun rememberedCapacity() -> Int = Ptr.load(Process.workerRecord(), 312)
 fun rememberedCapacitySet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 312, n)
 
--- The arm64 backend's frame table, sorted by return address.
+-- The backend's frame table, sorted by return address, or by site on wasm.
 var frameEntries : Ptr = Ptr.null()
 var frameEntryCount : Int = 0
 
@@ -293,8 +301,11 @@ var stressCountdown : Int = 1
 -- runtime turns it on and off with `turkey_gc_set_verify`, in a build that
 -- exports that, which is what keeps it a variable there.
 var verify : Bool = Prim.gcVerify
-var verifyIgnored : Bool = notCompiledIn(verify, Prim.cString("TURKEY_GC_VERIFY"),
-                                         Prim.cString("--gc-verify"))
+var verifyIgnored : Bool = notCompiledIn(
+	verify,
+	Prim.cString("TURKEY_GC_VERIFY"),
+	Prim.cString("--gc-verify"),
+)
 
 -- Whether every region keeps a size table: a word per eight bytes of its
 -- first 64KB, holding the size of the object at that offset, written by every
@@ -326,8 +337,11 @@ var liveBytesAfterFull : Int = 0
 -- drives it, from one run rather than from a profiler. Counting sends every
 -- allocation down the slow path (`refill`), so a run's times include that.
 var statsWanted : Bool = Prim.gcStats
-var statsIgnored : Bool = notCompiledIn(statsWanted, Prim.cString("TURKEY_GC_STATS"),
-                                        Prim.cString("--gc-stats"))
+var statsIgnored : Bool = notCompiledIn(
+	statsWanted,
+	Prim.cString("TURKEY_GC_STATS"),
+	Prim.cString("--gc-stats"),
+)
 
 -- The collector runs again once this many times the live set's bytes have
 -- been allocated, or 64KB times it while the live set is smaller than that.
@@ -348,8 +362,7 @@ var statsIgnored : Bool = notCompiledIn(statsWanted, Prim.cString("TURKEY_GC_STA
 -- 3.1GB of regions at 2, 1.24G at 4.1GB at 3, 0.93G at 5.2GB at 4. The test
 -- suite runs several of those compiles at once, which is what holds it at 2.
 -- TURKEY_GC_THRESHOLD_SCALE overrides it for experiments.
-var thresholdScale : Float =
-    scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
+var thresholdScale : Float = scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
 
 -- The counts every worker adds to as it allocates, by atomic adds: objects
 -- and bytes allocated, and objects the write barrier remembered.
@@ -379,13 +392,13 @@ var textLength : Int = 0
 var clock : Ptr = zeroed(16)
 
 fun zeroed(bytes : Int) -> Ptr {
-    let p = Os.malloc(bytes)
-    if Ptr.isNull(p) {
-        Process.panic(Prim.cString("out of memory"))
-        return p
-    }
-    Memory.fill(p, bytes, 0)
-    p
+	let p = Os.malloc(bytes)
+	if Ptr.isNull(p) {
+		Process.panic(Prim.cString("out of memory"))
+		return p
+	}
+	Memory.fill(p, bytes, 0)
+	p
 }
 
 fun present(name : Ptr) -> Bool = !Ptr.isNull(Os.getenv(name))
@@ -394,19 +407,19 @@ fun present(name : Ptr) -> Bool = !Ptr.isNull(Os.getenv(name))
 -- compiled without, which is said on stderr rather than ignored: the variable
 -- names the aid, and a run is where it is easiest to expect it to work.
 fun notCompiledIn(built : Bool, name : Ptr, flag : Ptr) -> Bool {
-    if built || !present(name) { return False }
-    say(Prim.cString("turkey: "))
-    say(name)
-    say(Prim.cString(" is ignored, because this program was compiled without "))
-    say(flag)
-    say(Prim.cString("; compile with "))
-    say(flag)
-    say(Prim.cString(" to use it\n"))
-    True
+	if built || !present(name) { return False }
+	say(Prim.cString("turkey: "))
+	say(name)
+	say(Prim.cString(" is ignored, because this program was compiled without "))
+	say(flag)
+	say(Prim.cString("; compile with "))
+	say(flag)
+	say(Prim.cString(" to use it\n"))
+	True
 }
 
 fun say(text : Ptr) -> Unit {
-    let _ = Os.write(2, text, Os.strlen(text))
+	let _ = Os.write(2, text, Os.strlen(text))
 }
 
 -- -- raw words --------------------------------------------------------------------------
@@ -416,7 +429,7 @@ fun say(text : Ptr) -> Unit {
 -- claimed to be a pointer need not, and a stress run exists to be handed one.
 -- Unsigned `a < b`: when the sign bits differ, the one with it set is larger.
 fun below(a : Int, b : Int) -> Bool =
-    if a ^ b < 0 { b < 0 } else { a < b }
+	if a ^ b < 0 { b < 0 } else { a < b }
 
 -- The arithmetic on the paths every allocation and every traced object take
 -- is wrapping: a checked `+` or `*` is a branch each, and what is computed
@@ -427,7 +440,7 @@ fun times8(multiplicand : Int) -> Int = multiplicand << 3
 
 -- `n` in 1..63, so that `64 - n` is a shift amount too.
 fun shiftRight(x : Int, n : Int) -> Int =
-    x >> n & Int.subWrapping(1 << (64 - n), 1)
+	x >> n & Int.subWrapping(1 << (64 - n), 1)
 
 -- Every bit of `x` flipped.
 fun complement(x : Int) -> Int = Int.not(x)
@@ -438,11 +451,11 @@ fun bit(index : Int) -> Int = 1 << (index & 63)
 fun bitWord(offset : Int, index : Int) -> Int = plus(offset, times8(index >> 6))
 
 fun testBit(p : Ptr, offset : Int, index : Int) -> Bool =
-    Ptr.load(p, bitWord(offset, index)) & bit(index) != 0
+	Ptr.load(p, bitWord(offset, index)) & bit(index) != 0
 
 fun setBit(p : Ptr, offset : Int, index : Int) -> Unit {
-    let word = bitWord(offset, index)
-    Ptr.store(p, word, Ptr.load(p, word) | bit(index))
+	let word = bitWord(offset, index)
+	Ptr.store(p, word, Ptr.load(p, word) | bit(index))
 }
 
 fun maxInt() -> Int = 0x7FFF_FFFF_FFFF_FFFF
@@ -450,74 +463,74 @@ fun maxInt() -> Int = 0x7FFF_FFFF_FFFF_FFFF
 -- -- regions ----------------------------------------------------------------------------
 
 fun regionOf(header : Ptr) -> Ptr =
-    Ptr.fromInt(Ptr.toInt(header) & regionMask)
+	Ptr.fromInt(Ptr.toInt(header) & regionMask)
 
 -- Fibonacci hashing of the region's number. The verifier recomputes this to
 -- check that every entry is reachable by probing, so the two must agree.
 fun regionHash(region : Ptr) -> Int {
-    let h = Int.mulWrapping(Ptr.toInt(region) / regionBytes, -7046029254386353131)
-    (h ^ shiftRight(h, 32)) & (regionTableCapacity - 1)
+	let h = Int.mulWrapping(Ptr.toInt(region) / regionBytes, -7046029254386353131)
+	(h ^ shiftRight(h, 32)) & (regionTableCapacity - 1)
 }
 
 fun tableAt(position : Int) -> Ptr = Ptr.load(regionTable, 8 * position)
 
 fun tableInsert(added : Ptr) -> Bool {
-    if (regionTableCount + 1) * 2 > regionTableCapacity {
-        let oldCapacity = regionTableCapacity
-        let old = regionTable
-        let capacity = if oldCapacity == 0 { 64 } else { oldCapacity * 2 }
-        let grown = Os.malloc(8 * capacity)
-        if Ptr.isNull(grown) { return False }
-        Memory.fill(grown, 8 * capacity, 0)
-        regionTable = grown
-        regionTableCapacity = capacity
-        for var i = 0; i < oldCapacity; i = i + 1 {
-            let entry : Ptr = Ptr.load(old, 8 * i)
-            if !Ptr.isNull(entry) {
-                var at = regionHash(entry)
-                while !Ptr.isNull(tableAt(at)) { at = (at + 1) & (capacity - 1) }
-                Ptr.store(regionTable, 8 * at, entry)
-            }
-        }
-        Os.free(old)
-    }
-    var at = regionHash(added)
-    while !Ptr.isNull(tableAt(at)) {
-        at = (at + 1) & (regionTableCapacity - 1)
-    }
-    Ptr.store(regionTable, 8 * at, added)
-    regionTableCount = regionTableCount + 1
-    True
+	if (regionTableCount + 1) * 2 > regionTableCapacity {
+		let oldCapacity = regionTableCapacity
+		let old = regionTable
+		let capacity = if oldCapacity == 0 { 64 } else { oldCapacity * 2 }
+		let grown = Os.malloc(8 * capacity)
+		if Ptr.isNull(grown) { return False }
+		Memory.fill(grown, 8 * capacity, 0)
+		regionTable = grown
+		regionTableCapacity = capacity
+		for var i = 0; i < oldCapacity; i = i + 1 {
+			let entry : Ptr = Ptr.load(old, 8 * i)
+			if !Ptr.isNull(entry) {
+				var at = regionHash(entry)
+				while !Ptr.isNull(tableAt(at)) { at = (at + 1) & (capacity - 1) }
+				Ptr.store(regionTable, 8 * at, entry)
+			}
+		}
+		Os.free(old)
+	}
+	var at = regionHash(added)
+	while !Ptr.isNull(tableAt(at)) {
+		at = (at + 1) & (regionTableCapacity - 1)
+	}
+	Ptr.store(regionTable, 8 * at, added)
+	regionTableCount = regionTableCount + 1
+	True
 }
 
 fun tableContains(region : Ptr) -> Bool {
-    if regionTableCapacity == 0 { return False }
-    var at = regionHash(region)
-    while !Ptr.isNull(tableAt(at)) {
-        if tableAt(at) == region { return True }
-        at = (at + 1) & (regionTableCapacity - 1)
-    }
-    False
+	if regionTableCapacity == 0 { return False }
+	var at = regionHash(region)
+	while !Ptr.isNull(tableAt(at)) {
+		if tableAt(at) == region { return True }
+		at = (at + 1) & (regionTableCapacity - 1)
+	}
+	False
 }
 
 fun tableRemove(region : Ptr) -> Unit {
-    let mask = regionTableCapacity - 1
-    var at = regionHash(region)
-    while tableAt(at) != region { at = (at + 1) & mask }
-    Ptr.store(regionTable, 8 * at, Ptr.null())
-    regionTableCount = regionTableCount - 1
-    -- Pull back each entry after the hole that probing would no longer reach:
-    -- one whose home is not cyclically within (hole, here].
-    var here = (at + 1) & mask
-    while !Ptr.isNull(tableAt(here)) {
-        let home = regionHash(tableAt(here))
-        if (here - home) & mask >= (here - at) & mask {
-            Ptr.store(regionTable, 8 * at, tableAt(here))
-            Ptr.store(regionTable, 8 * here, Ptr.null())
-            at = here
-        }
-        here = (here + 1) & mask
-    }
+	let mask = regionTableCapacity - 1
+	var at = regionHash(region)
+	while tableAt(at) != region { at = (at + 1) & mask }
+	Ptr.store(regionTable, 8 * at, Ptr.null())
+	regionTableCount = regionTableCount - 1
+	-- Pull back each entry after the hole that probing would no longer reach:
+	-- one whose home is not cyclically within (hole, here].
+	var here = (at + 1) & mask
+	while !Ptr.isNull(tableAt(here)) {
+		let home = regionHash(tableAt(here))
+		if (here - home) & mask >= (here - at) & mask {
+			Ptr.store(regionTable, 8 * at, tableAt(here))
+			Ptr.store(regionTable, 8 * here, Ptr.null())
+			at = here
+		}
+		here = (here + 1) & mask
+	}
 }
 
 -- -- size classes and cursors -----------------------------------------------------------
@@ -569,34 +582,38 @@ let smallBytes : Int = 32768
 var classes : Ptr = classTable()
 
 fun classTable() -> Ptr {
-    let table = zeroed(4097)
-    for var step = 1; step <= 4096; step = step + 1 {
-        Ptr.store(table, step, Byte.truncate(classFor(8 * step)))
-    }
-    table
+	let table = zeroed(4097)
+	for var step = 1; step <= 4096; step = step + 1 {
+		Ptr.store(table, step, Byte.truncate(classFor(8 * step)))
+	}
+	table
 }
 
 fun classFor(bytes : Int) -> Int {
-    if bytes <= 16 { return 0 }
-    if bytes <= 64 { return ((bytes + 7) >> 3) - 2 }
-    if bytes <= 256 { return ((bytes + 15) >> 4) + 2 }
-    var classSize = 256
-    var sizeClass = 18
-    while classSize < bytes {
-        classSize = classSize * 2
-        sizeClass = sizeClass + 1
-    }
-    sizeClass
+	if bytes <= 16 { return 0 }
+	if bytes <= 64 { return ((bytes + 7) >> 3) - 2 }
+	if bytes <= 256 { return ((bytes + 15) >> 4) + 2 }
+	var classSize = 256
+	var sizeClass = 18
+	while classSize < bytes {
+		classSize = classSize * 2
+		sizeClass = sizeClass + 1
+	}
+	sizeClass
 }
 
 fun classSlot(sizeClass : Int) -> Int =
-    if sizeClass < 7 { 16 + 8 * sizeClass }
-    else if sizeClass < 19 { 64 + 16 * (sizeClass - 6) }
-    else { 256 << (sizeClass - 18) }
+	if sizeClass < 7 {
+		16 + 8 * sizeClass
+	} else if sizeClass < 19 {
+		64 + 16 * (sizeClass - 6)
+	} else {
+		256 << (sizeClass - 18)
+	}
 
 -- The class of an object of at most `smallBytes` bytes.
 fun classOf(size : Int) -> Int =
-    Byte.toInt(Ptr.load(classes, plus(size, 7) >> 3))
+	Byte.toInt(Ptr.load(classes, plus(size, 7) >> 3))
 
 -- Whether `size`, unsigned, is small enough for the fast path: a class-table
 -- step below 4096. The few sizes just under `smallBytes` it turns away are
@@ -606,14 +623,16 @@ fun fastSize(size : Int) -> Bool = plus(size, 7) >> 15 == 0
 fun cursorOf(sizeClass : Int) -> Ptr = cursorIn(Process.workerRecord(), sizeClass)
 
 fun cursorIn(w : Ptr, sizeClass : Int) -> Ptr =
-    Ptr.add(w, plus(320, sizeClass << 6))
+	Ptr.add(w, plus(320, sizeClass << 6))
 
 -- The lowest of the cursor's free slots, `free`, which is not zero.
 fun takeSlot(cursor : Ptr, free : Int) -> Ptr {
-    let lowest = free & Int.negWrapping(free)
-    Ptr.store(cursor, cursorFree, free ^ lowest)
-    Ptr.add(Ptr.load(cursor, cursorBase),
-                Int.mulWrapping(bitIndex(lowest), Ptr.load(cursor, cursorSlot)))
+	let lowest = free & Int.negWrapping(free)
+	Ptr.store(cursor, cursorFree, free ^ lowest)
+	Ptr.add(
+		Ptr.load(cursor, cursorBase),
+		Int.mulWrapping(bitIndex(lowest), Ptr.load(cursor, cursorSlot)),
+	)
 }
 
 -- The position of the one set bit in `lowest`: `Memory.trailingZeros`'s de
@@ -621,9 +640,9 @@ fun takeSlot(cursor : Ptr, free : Int) -> Ptr {
 -- its checked subtraction, none of which a bit already isolated needs. This
 -- runs at every allocation.
 fun bitIndex(lowest : Int) -> Int {
-    let pattern = Int.mulWrapping(lowest, 0x03F7_9D71_B4CB_0A89) >> 58 & 63
-    let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
-    Int.subWrapping(Byte.toInt(Ptr.load(positions, pattern)), 48)
+	let pattern = Int.mulWrapping(lowest, 0x03F7_9D71_B4CB_0A89) >> 58 & 63
+	let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
+	Int.subWrapping(Byte.toInt(Ptr.load(positions, pattern)), 48)
 }
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
@@ -638,60 +657,66 @@ fun bitIndex(lowest : Int) -> Int {
 -- itself (`Turkey.Select.allocateInline`) and tests nothing else, so an empty
 -- cursor is the only way to make an allocation collect or be counted.
 fun refill(cursor : Ptr, sizeClass : Int) -> Bool {
-    var region : Ptr = Ptr.load(cursor, cursorRegion)
-    if Ptr.isNull(region) || Ptr.load32(region, regionUsed) == Ptr.load32(region, regionCapacity) {
-        Lock.acquire(heapLock)
-        region = takeRegion(sizeClass)
-        -- While the lock is held anyway: so that what triggers a collection
-        -- counts every worker's allocation to within a region's worth each,
-        -- and not only the worker that asks.
-        localFold(Process.workerRecord())
-        Lock.release(heapLock)
-        if Ptr.isNull(region) { return False }
-        Ptr.store(cursor, cursorRegion, region)
-    }
-    let capacity = Ptr.load32(region, regionCapacity)
-    -- The region has a free slot below its capacity, so this finds one.
-    var w = Ptr.load32(region, regionSearchWord)
-    var taken : Int = Ptr.load(region, plus(regionAllocated, times8(w)))
-    while plus(taken, 1) == 0 {
-        w = plus(w, 1)
-        taken = Ptr.load(region, plus(regionAllocated, times8(w)))
-    }
-    -- The last word's bits past the capacity are clear, and are not slots.
-    var claim = complement(taken)
-    let beyond = Int.subWrapping(capacity, w << 6)
-    if beyond < 64 { claim = claim & Int.subWrapping(1 << beyond, 1) }
-    if stress || statsWanted { claim = claim & Int.negWrapping(claim) }
-    let now = taken | claim
-    Ptr.store(region, plus(regionAllocated, times8(w)), now)
-    let n = population(claim)
-    let used = plus(Ptr.load32(region, regionUsed), n)
-    Ptr.store32(region, regionUsed, used)
-    Ptr.store32(region, regionSearchWord,
-            if plus(now, 1) == 0 && w < regionWords - 1 { plus(w, 1) } else { w })
-    let slotSize : Int = Ptr.load(region, regionSlotSize)
-    localAdd(n, Int.mulWrapping(n, slotSize))
-    Ptr.store(cursor, cursorFree, claim)
-    Ptr.store(cursor, cursorBase,
-                  Ptr.add(region, plus(regionData, Int.mulWrapping(w << 6, slotSize))))
-    Ptr.store(cursor, cursorSlot, slotSize)
-    Ptr.store(cursor, cursorWord, w)
-    True
+	var region : Ptr = Ptr.load(cursor, cursorRegion)
+	if Ptr.isNull(region) || Ptr.load32(region, regionUsed) == Ptr.load32(region, regionCapacity) {
+		Lock.acquire(heapLock)
+		region = takeRegion(sizeClass)
+		-- While the lock is held anyway: so that what triggers a collection
+		-- counts every worker's allocation to within a region's worth each,
+		-- and not only the worker that asks.
+		localFold(Process.workerRecord())
+		Lock.release(heapLock)
+		if Ptr.isNull(region) { return False }
+		Ptr.store(cursor, cursorRegion, region)
+	}
+	let capacity = Ptr.load32(region, regionCapacity)
+	-- The region has a free slot below its capacity, so this finds one.
+	var w = Ptr.load32(region, regionSearchWord)
+	var taken : Int = Ptr.load(region, plus(regionAllocated, times8(w)))
+	while plus(taken, 1) == 0 {
+		w = plus(w, 1)
+		taken = Ptr.load(region, plus(regionAllocated, times8(w)))
+	}
+	-- The last word's bits past the capacity are clear, and are not slots.
+	var claim = complement(taken)
+	let beyond = Int.subWrapping(capacity, w << 6)
+	if beyond < 64 { claim = claim & Int.subWrapping(1 << beyond, 1) }
+	if stress || statsWanted { claim = claim & Int.negWrapping(claim) }
+	let now = taken | claim
+	Ptr.store(region, plus(regionAllocated, times8(w)), now)
+	let n = population(claim)
+	let used = plus(Ptr.load32(region, regionUsed), n)
+	Ptr.store32(region, regionUsed, used)
+	Ptr.store32(
+		region,
+		regionSearchWord,
+		if plus(now, 1) == 0 && w < regionWords - 1 { plus(w, 1) } else { w },
+	)
+	let slotSize : Int = Ptr.load(region, regionSlotSize)
+	localAdd(n, Int.mulWrapping(n, slotSize))
+	Ptr.store(cursor, cursorFree, claim)
+	Ptr.store(
+		cursor,
+		cursorBase,
+		Ptr.add(region, plus(regionData, Int.mulWrapping(w << 6, slotSize))),
+	)
+	Ptr.store(cursor, cursorSlot, slotSize)
+	Ptr.store(cursor, cursorWord, w)
+	True
 }
 
 -- A region of class `sizeClass` with a free slot, off the available list, or
 -- a new one; null if there is no memory for one. Under `heapLock`.
 fun takeRegion(sizeClass : Int) -> Ptr {
-    var region : Ptr = Ptr.load(available, times8(sizeClass))
-    if Ptr.isNull(region) {
-        -- A new region goes on the list, and so comes off it here too.
-        let slotBytes = classSlot(sizeClass)
-        region = newRegion(slotBytes, slotBytes, sizeClass, False)
-        if Ptr.isNull(region) { return region }
-    }
-    Ptr.store(available, times8(sizeClass), Ptr.load(region, regionAvailableNext) : Ptr)
-    region
+	var region : Ptr = Ptr.load(available, times8(sizeClass))
+	if Ptr.isNull(region) {
+		-- A new region goes on the list, and so comes off it here too.
+		let slotBytes = classSlot(sizeClass)
+		region = newRegion(slotBytes, slotBytes, sizeClass, False)
+		if Ptr.isNull(region) { return region }
+	}
+	Ptr.store(available, times8(sizeClass), Ptr.load(region, regionAvailableNext) : Ptr)
+	region
 }
 
 -- Give every cursor's unused slots back to its region -- clear them from the
@@ -702,127 +727,132 @@ fun takeRegion(sizeClass : Int) -> Ptr {
 -- shared lists without the lock: it runs only where no other worker can be
 -- allocating, in a collection or with one worker.
 fun retire() -> Unit {
-    let me = Process.workerRecord()
-    for var i = 0; i < Workers.count(); i = plus(i, 1) {
-        let w = Workers.recordOf(i)
-        retireWorker(w)
-        if w != me { adoptRemembered(w) }
-    }
+	let me = Process.workerRecord()
+	for var i = 0; i < Workers.count(); i = plus(i, 1) {
+		let w = Workers.recordOf(i)
+		retireWorker(w)
+		if w != me { adoptRemembered(w) }
+	}
 }
 
 fun retireWorker(w : Ptr) -> Unit {
-    for var rc = 0; rc < regionClasses; rc = rc + 1 {
-        let cursor = cursorIn(w, rc)
-        let r : Ptr = Ptr.load(cursor, cursorRegion)
-        if !Ptr.isNull(r) {
-            let left : Int = Ptr.load(cursor, cursorFree)
-            if left != 0 {
-                let lw : Int = Ptr.load(cursor, cursorWord)
-                let at = plus(regionAllocated, times8(lw))
-                Ptr.store(r, at, Ptr.load(r, at) & complement(left))
-                let n = population(left)
-                Ptr.store32(r, regionUsed, Ptr.load32(r, regionUsed) - n)
-                if lw < Ptr.load32(r, regionSearchWord) { Ptr.store32(r, regionSearchWord, lw) }
-                heapCount = heapCount - n
-                allocationsSince = allocationsSince - n
-                bytesSince = bytesSince - n * Ptr.load(r, regionSlotSize)
-                Ptr.store(cursor, cursorFree, 0)
-            }
-            if Ptr.load32(r, regionUsed) < Ptr.load32(r, regionCapacity) {
-                Ptr.store(r, regionAvailableNext, Ptr.load(available, times8(rc)) : Ptr)
-                Ptr.store(available, times8(rc), r)
-            }
-            Ptr.store(cursor, cursorRegion, Ptr.null())
-        }
-    }
-    localFold(w)
+	for var rc = 0; rc < regionClasses; rc = rc + 1 {
+		let cursor = cursorIn(w, rc)
+		let r : Ptr = Ptr.load(cursor, cursorRegion)
+		if !Ptr.isNull(r) {
+			let left : Int = Ptr.load(cursor, cursorFree)
+			if left != 0 {
+				let lw : Int = Ptr.load(cursor, cursorWord)
+				let at = plus(regionAllocated, times8(lw))
+				Ptr.store(r, at, Ptr.load(r, at) & complement(left))
+				let n = population(left)
+				Ptr.store32(r, regionUsed, Ptr.load32(r, regionUsed) - n)
+				if lw < Ptr.load32(r, regionSearchWord) { Ptr.store32(r, regionSearchWord, lw) }
+				heapCount = heapCount - n
+				allocationsSince = allocationsSince - n
+				bytesSince = bytesSince - n * Ptr.load(r, regionSlotSize)
+				Ptr.store(cursor, cursorFree, 0)
+			}
+			if Ptr.load32(r, regionUsed) < Ptr.load32(r, regionCapacity) {
+				Ptr.store(r, regionAvailableNext, Ptr.load(available, times8(rc)) : Ptr)
+				Ptr.store(available, times8(rc), r)
+			}
+			Ptr.store(cursor, cursorRegion, Ptr.null())
+		}
+	}
+	localFold(w)
 }
 
 --- Give a blocked worker's cursors back, as `retire` does, for the monitor
 --- (`Turkey.Monitor`), which holds the worker so that it cannot allocate:
 --- under the lock, since every other worker may be allocating.
 fun retireHeld(w : Ptr) -> Unit {
-    -- The monitor waits for the lock while it holds a worker that a
-    -- collection may be waiting for. That is safe only because the lock is
-    -- never held at a safepoint: nothing under it allocates, and no loop in
-    -- this module polls, so its holder never stops for that collection.
-    Lock.acquire(heapLock)
-    retireWorker(w)
-    Lock.release(heapLock)
+	-- The monitor waits for the lock while it holds a worker that a
+	-- collection may be waiting for. That is safe only because the lock is
+	-- never held at a safepoint: nothing under it allocates, and no loop in
+	-- this module polls, so its holder never stops for that collection.
+	Lock.acquire(heapLock)
+	retireWorker(w)
+	Lock.release(heapLock)
 }
 
 -- Append worker `w`'s remembered objects to the running worker's set, which
 -- is the one a collection reads, and empty `w`'s.
 fun adoptRemembered(w : Ptr) -> Unit {
-    let theirs : Ptr = Ptr.load(w, 296)
-    let n : Int = Ptr.load(w, 304)
-    for var i = 0; i < n; i = plus(i, 1) { remember(Ptr.load(theirs, times8(i))) }
-    Ptr.store(w, 304, 0)
+	let theirs : Ptr = Ptr.load(w, 296)
+	let n : Int = Ptr.load(w, 304)
+	for var i = 0; i < n; i = plus(i, 1) { remember(Ptr.load(theirs, times8(i))) }
+	Ptr.store(w, 304, 0)
 }
 
 -- The number of set bits.
 fun population(x : Int) -> Int {
-    let pairs = Int.subWrapping(x, shiftRight(x, 1) & 0x5555_5555_5555_5555)
-    let nibbles = plus(pairs & 0x3333_3333_3333_3333,
-                       shiftRight(pairs, 2) & 0x3333_3333_3333_3333)
-    let bytes = plus(nibbles, shiftRight(nibbles, 4)) & 0x0F0F_0F0F_0F0F_0F0F
-    shiftRight(Int.mulWrapping(bytes, 0x0101_0101_0101_0101), 56)
+	let pairs = Int.subWrapping(x, shiftRight(x, 1) & 0x5555_5555_5555_5555)
+	let nibbles = plus(pairs & 0x3333_3333_3333_3333, shiftRight(pairs, 2) & 0x3333_3333_3333_3333)
+	let bytes = plus(nibbles, shiftRight(nibbles, 4)) & 0x0F0F_0F0F_0F0F_0F0F
+	shiftRight(Int.mulWrapping(bytes, 0x0101_0101_0101_0101), 56)
 }
 
 -- A region of its own for an object of `bytes`, with its one slot allocated;
 -- null if there is no memory for it. Under `heapLock`.
 fun largeAllocate(bytes : Int) -> Ptr {
-    let made = newRegion(bytes, bytes, regionClasses, True)
-    if Ptr.isNull(made) { return made }
-    Ptr.store(made, regionAllocated, 1)
-    Ptr.store32(made, regionUsed, 1)
-    heapCount = plus(heapCount, 1)
-    allocationsSince = plus(allocationsSince, 1)
-    bytesSince = plus(bytesSince, Ptr.load(made, regionReserved))
-    Ptr.add(made, regionData)
+	let made = newRegion(bytes, bytes, regionClasses, True)
+	if Ptr.isNull(made) { return made }
+	Ptr.store(made, regionAllocated, 1)
+	Ptr.store32(made, regionUsed, 1)
+	heapCount = plus(heapCount, 1)
+	allocationsSince = plus(allocationsSince, 1)
+	bytesSince = plus(bytesSince, Ptr.load(made, regionReserved))
+	Ptr.add(made, regionData)
 }
 
 -- An empty region with slots of `slotSize`, on the region list and, if it is
 -- small, its class's available list; null if there is no memory for it. A
 -- 64KB one is a spare if there is one. Under `heapLock`.
 fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr {
-    let reserved = if large {
-        (regionData + bytes + regionBytes - 1) & regionMask
-    } else { regionBytes }
-    let reused = reserved == regionBytes && !Ptr.isNull(spare)
-    let made = if reused { spare } else { Os.alignedAlloc(regionBytes, reserved) }
-    if Ptr.isNull(made) { return made }
-    -- A freed slot in a live region is reused as it was left, so no allocation
-    -- reads a slot before writing it, and a spare's old slots need no
-    -- clearing either. Only the header is cleared, below.
-    if reused {
-        spare = Ptr.load(made, regionNext)
-        spareCount = spareCount - 1
-    }
-    let sizes = if !sizesKept { Ptr.null() }
-                else if reused { Ptr.load(made, regionSizes) }
-                else { Os.malloc(regionBytes) }
-    if (sizesKept && Ptr.isNull(sizes)) || !tableInsert(made) {
-        Os.free(sizes)
-        Os.free(made)
-        return Ptr.null()
-    }
-    Memory.fill(made, regionData, 0)
-    Ptr.store(made, regionSizes, sizes)
-    Ptr.store(made, regionSlotSize, slotSize)
-    Ptr.store(made, regionReserved, reserved)
-    Ptr.store32(made, regionCapacity, if large { 1 } else { (regionBytes - regionData) / slotSize })
-    Ptr.store32(made, regionSizeClass, if large { regionClasses } else { sizeClass })
-    Ptr.store(made, regionNext, regions)
-    regions = made
-    if !large {
-        Ptr.store(available, times8(sizeClass), made)
-        Ptr.store(reciprocals, times8(sizeClass), (0x1_0000_0000 + slotSize - 1) / slotSize)
-    }
-    regionBytesInUse = regionBytesInUse + reserved
-    if regionBytesInUse > regionBytesPeak { regionBytesPeak = regionBytesInUse }
-    if regionBytesInUse > peakSinceFull { peakSinceFull = regionBytesInUse }
-    made
+	let reserved = if large {
+		(regionData + bytes + regionBytes - 1) & regionMask
+	} else {
+		regionBytes
+	}
+	let reused = reserved == regionBytes && !Ptr.isNull(spare)
+	let made = if reused { spare } else { Os.alignedAlloc(regionBytes, reserved) }
+	if Ptr.isNull(made) { return made }
+	-- A freed slot in a live region is reused as it was left, so no allocation
+	-- reads a slot before writing it, and a spare's old slots need no
+	-- clearing either. Only the header is cleared, below.
+	if reused {
+		spare = Ptr.load(made, regionNext)
+		spareCount = spareCount - 1
+	}
+	let sizes = if !sizesKept {
+		Ptr.null()
+	} else if reused {
+		Ptr.load(made, regionSizes)
+	} else {
+		Os.malloc(regionBytes)
+	}
+	if (sizesKept && Ptr.isNull(sizes)) || !tableInsert(made) {
+		Os.free(sizes)
+		Os.free(made)
+		return Ptr.null()
+	}
+	Memory.fill(made, regionData, 0)
+	Ptr.store(made, regionSizes, sizes)
+	Ptr.store(made, regionSlotSize, slotSize)
+	Ptr.store(made, regionReserved, reserved)
+	Ptr.store32(made, regionCapacity, if large { 1 } else { (regionBytes - regionData) / slotSize })
+	Ptr.store32(made, regionSizeClass, if large { regionClasses } else { sizeClass })
+	Ptr.store(made, regionNext, regions)
+	regions = made
+	if !large {
+		Ptr.store(available, times8(sizeClass), made)
+		Ptr.store(reciprocals, times8(sizeClass), (0x1_0000_0000 + slotSize - 1) / slotSize)
+	}
+	regionBytesInUse = regionBytesInUse + reserved
+	if regionBytesInUse > regionBytesPeak { regionBytesPeak = regionBytesInUse }
+	if regionBytesInUse > peakSinceFull { peakSinceFull = regionBytesInUse }
+	made
 }
 
 -- The largest object a region can be made for: an `Int` that the region's
@@ -833,19 +863,19 @@ let largest : Int = 9223372036854709184
 -- `value` if it is a live object, or null if it is not: not into a region,
 -- not at a slot, or at a free slot.
 fun findObject(value : Ptr) -> Ptr {
-    let address = Ptr.toInt(value)
-    let region = regionOf(value)
-    if !tableContains(region) { return Ptr.null() }
-    let first = plus(Ptr.toInt(region), regionData)
-    if below(address, first) { return Ptr.null() }
-    let offset = Int.subWrapping(address, first)
-    let slot : Int = Ptr.load(region, regionSlotSize)
-    if offset % slot != 0 { return Ptr.null() }
-    let index = offset / slot
-    if index < Ptr.load32(region, regionCapacity) && testBit(region, regionAllocated, index) {
-        return value
-    }
-    Ptr.null()
+	let address = Ptr.toInt(value)
+	let region = regionOf(value)
+	if !tableContains(region) { return Ptr.null() }
+	let first = plus(Ptr.toInt(region), regionData)
+	if below(address, first) { return Ptr.null() }
+	let offset = Int.subWrapping(address, first)
+	let slot : Int = Ptr.load(region, regionSlotSize)
+	if offset % slot != 0 { return Ptr.null() }
+	let index = offset / slot
+	if index < Ptr.load32(region, regionCapacity) && testBit(region, regionAllocated, index) {
+		return value
+	}
+	Ptr.null()
 }
 
 -- -- allocation -------------------------------------------------------------------------
@@ -860,50 +890,53 @@ fun findObject(value : Ptr) -> Ptr {
 --- the caller must be the Turkey function the allocation is made for, since a
 --- frame passed along from further out would skip the frames between.
 fun allocate(size : Int, kind : Int, frame : Ptr) -> Ptr {
-    -- The path taken by nearly every allocation is a slot from the class's
-    -- cursor; everything else -- a collection, an empty cursor, a large
-    -- object, GC stress -- is `allocateSlow`, which is also what keeps this
-    -- one small.
-    if !fastSize(size) { return allocateSlow(size, kind, frame) }
-    let cursor = cursorOf(classOf(size))
-    let free : Int = Ptr.load(cursor, cursorFree)
-    if free == 0 { return allocateSlow(size, kind, frame) }
-    taken(takeSlot(cursor, free), size, kind)
+	-- The path taken by nearly every allocation is a slot from the class's
+	-- cursor; everything else -- a collection, an empty cursor, a large
+	-- object, GC stress -- is `allocateSlow`, which is also what keeps this
+	-- one small.
+	if !fastSize(size) { return allocateSlow(size, kind, frame) }
+	let cursor = cursorOf(classOf(size))
+	let free : Int = Ptr.load(cursor, cursorFree)
+	if free == 0 { return allocateSlow(size, kind, frame) }
+	taken(takeSlot(cursor, free), size, kind)
 }
 
 fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
-    if stopAsked() { stopAt(frame) }
-    if stress { pollWordSet(True) }
-    if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
-        collectFrom(frame, Due)
-        -- A collection is the only thing here that can raise one, and an
-        -- allocation after a failed collection would be into a heap nobody
-        -- has finished tracing.
-        if Process.pending() { return Ptr.null() }
-    }
-    if below(largest, size) {
-        Process.panicUnsigned(Prim.cString("allocation of "), size,
-                              Prim.cString(" bytes is too large"))
-        return Ptr.null()
-    }
-    if below(smallBytes, size) {
-        Lock.acquire(heapLock)
-        let object = largeAllocate(size)
-        Lock.release(heapLock)
-        if Ptr.isNull(object) { return outOfMemory() }
-        return taken(object, size, kind)
-    }
-    let sizeClass = classOf(size)
-    let cursor = cursorOf(sizeClass)
-    if Ptr.load(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
-        return outOfMemory()
-    }
-    taken(takeSlot(cursor, Ptr.load(cursor, cursorFree)), size, kind)
+	if stopAsked() { stopAt(frame) }
+	if stress { pollWordSet(True) }
+	if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
+		collectFrom(frame, Due)
+		-- A collection is the only thing here that can raise one, and an
+		-- allocation after a failed collection would be into a heap nobody
+		-- has finished tracing.
+		if Process.pending() { return Ptr.null() }
+	}
+	if below(largest, size) {
+		Process.panicUnsigned(
+			Prim.cString("allocation of "),
+			size,
+			Prim.cString(" bytes is too large"),
+		)
+		return Ptr.null()
+	}
+	if below(smallBytes, size) {
+		Lock.acquire(heapLock)
+		let object = largeAllocate(size)
+		Lock.release(heapLock)
+		if Ptr.isNull(object) { return outOfMemory() }
+		return taken(object, size, kind)
+	}
+	let sizeClass = classOf(size)
+	let cursor = cursorOf(sizeClass)
+	if Ptr.load(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
+		return outOfMemory()
+	}
+	taken(takeSlot(cursor, Ptr.load(cursor, cursorFree)), size, kind)
 }
 
 fun outOfMemory() -> Ptr {
-    Process.panic(Prim.cString("out of memory"))
-    Ptr.null()
+	Process.panic(Prim.cString("out of memory"))
+	Ptr.null()
 }
 
 -- -- polls ------------------------------------------------------------------------------
@@ -915,10 +948,10 @@ fun outOfMemory() -> Ptr {
 -- that stress collects at polls as at allocations, and is the running
 -- worker's own.
 fun pollWordSet(up : Bool) -> Unit {
-    let w = Process.workerRecord()
-    let raised = Ptr.atomicLoad(w, 272) & 2 != 0
-    if up && !raised { let _ = Ptr.atomicAdd(w, 272, 2) }
-    if !up && raised { let _ = Ptr.atomicAdd(w, 272, -2) }
+	let w = Process.workerRecord()
+	let raised = Ptr.atomicLoad(w, 272) & 2 != 0
+	if up && !raised { let _ = Ptr.atomicAdd(w, 272, 2) }
+	if !up && raised { let _ = Ptr.atomicAdd(w, 272, -2) }
 }
 
 fun stopAsked() -> Bool = Ptr.atomicLoad(Process.workerRecord(), 272) & 1 != 0
@@ -927,18 +960,18 @@ fun stopAsked() -> Bool = Ptr.atomicLoad(Process.workerRecord(), 272) & 1 != 0
 -- Not while the worker is blocked or stopped: the loop is then one of
 -- `Turkey.Workers`' own, waiting on the protocol a stop would re-enter.
 foreign "turkey_poll" fun poll() -> Unit {
-    if !Workers.running() { return }
-    if stopAsked() { stopAt(Prim.frameAddress()) }
-    if stress {
-        -- A loop can poll once per byte it copies, so only one poll in
-        -- `pollStressEvery` counts as an allocation does towards stress's
-        -- next collection.
-        pollCountdown = pollCountdown - 1
-        if pollCountdown <= 0 {
-            pollCountdown = pollStressEvery
-            if stressDue() { collectFrom(Prim.frameAddress(), Due) }
-        }
-    }
+	if !Workers.running() { return }
+	if stopAsked() { stopAt(Prim.frameAddress()) }
+	if stress {
+		-- A loop can poll once per byte it copies, so only one poll in
+		-- `pollStressEvery` counts as an allocation does towards stress's
+		-- next collection.
+		pollCountdown = pollCountdown - 1
+		if pollCountdown <= 0 {
+			pollCountdown = pollStressEvery
+			if stressDue() { collectFrom(Prim.frameAddress(), Due) }
+		}
+	}
 }
 
 let pollStressEvery : Int = 257
@@ -946,36 +979,38 @@ var pollCountdown : Int = 1
 
 -- Whether GC stress collects at this allocation.
 fun stressDue() -> Bool {
-    stressCountdown = stressCountdown - 1
-    if stressCountdown > 0 { return False }
-    stressCountdown = if stressInterval == 1 { 1 } else {
-        -- xorshift64*: a full period over the nonzero words, which is all a
-        -- sampling interval needs of it.
-        var mixed = stressRandom
-        mixed = mixed ^ shiftRight(mixed, 12)
-        mixed = mixed ^ mixed << 25
-        mixed = mixed ^ shiftRight(mixed, 27)
-        stressRandom = mixed
-        let drawn = shiftRight(Int.mulWrapping(mixed, 0x2545_F491_4F6C_DD1D), 1)
-        1 + drawn % (2 * stressInterval - 1)
-    }
-    True
+	stressCountdown = stressCountdown - 1
+	if stressCountdown > 0 { return False }
+	stressCountdown = if stressInterval == 1 {
+		1
+	} else {
+		-- xorshift64*: a full period over the nonzero words, which is all a
+		-- sampling interval needs of it.
+		var mixed = stressRandom
+		mixed = mixed ^ shiftRight(mixed, 12)
+		mixed = mixed ^ mixed << 25
+		mixed = mixed ^ shiftRight(mixed, 27)
+		stressRandom = mixed
+		let drawn = shiftRight(Int.mulWrapping(mixed, 0x2545_F491_4F6C_DD1D), 1)
+		1 + drawn % (2 * stressInterval - 1)
+	}
+	True
 }
 
 -- A fresh slot for an object of `size` bytes and of `kind`, recorded in the
 -- size table and the statistics where they are kept.
 fun taken(object : Ptr, size : Int, kind : Int) -> Ptr {
-    if sizesKept {
-        let region = regionOf(object)
-        Ptr.store(Ptr.load(region, regionSizes), Ptr.diff(object, region), size)
-    }
-    if statsWanted {
-        let _ = Ptr.atomicAdd(statsCounts, statsAllocationsAt, 1)
-        let _ = Ptr.atomicAdd(statsCounts, statsBytesAt, size)
-        let at = if kind >= 0 && kind < 8 { times8(kind) } else { 0 }
-        let _ = Ptr.atomicAdd(statsByKind, at, 1)
-    }
-    object
+	if sizesKept {
+		let region = regionOf(object)
+		Ptr.store(Ptr.load(region, regionSizes), Ptr.diff(object, region), size)
+	}
+	if statsWanted {
+		let _ = Ptr.atomicAdd(statsCounts, statsAllocationsAt, 1)
+		let _ = Ptr.atomicAdd(statsCounts, statsBytesAt, size)
+		let at = if kind >= 0 && kind < 8 { times8(kind) } else { 0 }
+		let _ = Ptr.atomicAdd(statsByKind, at, 1)
+	}
+	object
 }
 
 -- -- roots ------------------------------------------------------------------------------
@@ -986,26 +1021,30 @@ fun taken(object : Ptr, size : Int, kind : Int) -> Ptr {
 -- region that contains the safepoints, and each safepoint stores its own live
 -- set. A caller with roots that outlive the call stores the mask itself right
 -- after this returns.
-foreign "turkey_root_enter" fun rootEnter(pointer : Ptr, values : Ptr,
-                                          count : Int, functionName : Ptr) -> Unit {
-    if Ptr.isNull(pointer) || Ptr.isNull(values) || count < 0 {
-        Process.panic(Prim.cString("invalid root frame size"))
-        return
-    }
-    Ptr.store(pointer, 0, roots)
-    Ptr.store(pointer, 8, functionName)
-    Ptr.store(pointer, frameCount, count)
-    Ptr.store(pointer, frameValues, values)
-    Ptr.store(pointer, frameLive, 0)
-    roots = pointer
+foreign "turkey_root_enter" fun rootEnter(
+	pointer : Ptr,
+	values : Ptr,
+	count : Int,
+	functionName : Ptr,
+) -> Unit {
+	if Ptr.isNull(pointer) || Ptr.isNull(values) || count < 0 {
+		Process.panic(Prim.cString("invalid root frame size"))
+		return
+	}
+	Ptr.store(pointer, 0, roots)
+	Ptr.store(pointer, 8, functionName)
+	Ptr.store(pointer, frameCount, count)
+	Ptr.store(pointer, frameValues, values)
+	Ptr.store(pointer, frameLive, 0)
+	roots = pointer
 }
 
 foreign "turkey_root_leave" fun rootLeave(pointer : Ptr) -> Unit {
-    if Ptr.isNull(pointer) || roots != pointer {
-        Process.panic(Prim.cString("unbalanced root frame"))
-        return
-    }
-    roots = Ptr.load(pointer, 0)
+	if Ptr.isNull(pointer) || roots != pointer {
+		Process.panic(Prim.cString("unbalanced root frame"))
+		return
+	}
+	roots = Ptr.load(pointer, 0)
 }
 
 -- The innermost root frame, for the crash report in `Turkey.Entry`, which
@@ -1032,6 +1071,9 @@ foreign "turkey_roots_head" fun rootsHead() -> Ptr = roots
 --
 -- A frame whose return address is in no table has no roots, and is skipped. A
 -- binary that registers no table walks no frames.
+--
+-- Wasm keys the same table on a site's number instead of a return address,
+-- and the walk is of shadow frames (`scanShadow`).
 
 -- -- static objects -----------------------------------------------------------------
 --
@@ -1049,13 +1091,14 @@ foreign "turkey_roots_head" fun rootsHead() -> Ptr = roots
 -- The entry sequence registers before any code that can hold a static object
 -- runs.
 foreign "turkey_static_register" fun staticRegister(start : Ptr, end : Ptr) -> Unit {
-    staticStart = Ptr.toInt(start)
-    staticBytes = Int.subWrapping(Ptr.toInt(end), staticStart)
+	staticStart = Ptr.toInt(start)
+	staticBytes = Int.subWrapping(Ptr.toInt(end), staticStart)
 }
 
 -- Whether `value` is a static object. One unsigned comparison, which touches
 -- no memory but this module's two words.
-fun isStatic(value : Ptr) -> Bool = below(Int.subWrapping(Ptr.toInt(value), staticStart), staticBytes)
+fun isStatic(value : Ptr) -> Bool =
+	below(Int.subWrapping(Ptr.toInt(value), staticStart), staticBytes)
 
 -- The emitter writes a flat array of four-byte fields -- count, then per
 -- entry its return address's distance from `base`, n, and n offsets --
@@ -1064,86 +1107,91 @@ fun isStatic(value : Ptr) -> Bool = below(Int.subWrapping(Ptr.toInt(value), stat
 -- loader never writes it. Adding `base` back and sorting once here is what
 -- makes the lookup a binary search on the address itself.
 foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> Unit {
-    if Ptr.isNull(table) { return }
-    let count = Ptr.load32(table, 0)
-    if count <= 0 { return }
-    let entries = Os.malloc(entryBytes * count)
-    if Ptr.isNull(entries) {
-        Process.panic(Prim.cString("out of memory"))
-        return
-    }
-    var p = Ptr.add(table, 4)
-    for var i = 0; i < count; i = i + 1 {
-        let n = Ptr.load32(p, 4)
-        Ptr.store(entries, entryBytes * i, plus(Ptr.toInt(base), signed32(Ptr.load32(p, 0))))
-        Ptr.store(entries, entryBytes * i + 8, n)
-        Ptr.store(entries, entryBytes * i + 16, Ptr.add(p, 8))
-        p = Ptr.add(p, 8 + 4 * n)
-    }
-    sortEntries(entries, count)
-    Os.free(frameEntries)
-    frameEntries = entries
-    frameEntryCount = count
+	if Ptr.isNull(table) { return }
+	let count = Ptr.load32(table, 0)
+	if count <= 0 { return }
+	let entries = Os.malloc(entryBytes * count)
+	if Ptr.isNull(entries) {
+		Process.panic(Prim.cString("out of memory"))
+		return
+	}
+	var p = Ptr.add(table, 4)
+	for var i = 0; i < count; i = i + 1 {
+		let n = Ptr.load32(p, 4)
+		Ptr.store(entries, entryBytes * i, plus(Ptr.toInt(base), signed32(Ptr.load32(p, 0))))
+		Ptr.store(entries, entryBytes * i + 8, n)
+		Ptr.store(entries, entryBytes * i + 16, Ptr.add(p, 8))
+		p = Ptr.add(p, 8 + 4 * n)
+	}
+	sortEntries(entries, count)
+	Os.free(frameEntries)
+	frameEntries = entries
+	frameEntryCount = count
 }
 
--- The `x29` offset of root `i` of an entry, whose offsets are at `offsets`.
+-- The offset from its frame of root `i` of an entry, whose offsets are at
+-- `offsets`.
 fun rootOffset(offsets : Ptr, i : Int) -> Int = signed32(Ptr.load32(offsets, i << 2))
 
 -- The low 32 bits of `n`, as a signed integer.
 fun signed32(n : Int) -> Int = (n << 32) >> 32
 
 fun entryKey(entries : Ptr, i : Int) -> Int =
-    Ptr.load(entries, Int.mulWrapping(entryBytes, i))
+	Ptr.load(entries, Int.mulWrapping(entryBytes, i))
 
 fun swapEntries(entries : Ptr, i : Int, j : Int) -> Unit {
-    for var w = 0; w < entryBytes; w = w + 8 {
-        let a : Int = Ptr.load(entries, entryBytes * i + w)
-        Ptr.store(entries, entryBytes * i + w, Ptr.load(entries, entryBytes * j + w) : Int)
-        Ptr.store(entries, entryBytes * j + w, a)
-    }
+	for var w = 0; w < entryBytes; w = w + 8 {
+		let a : Int = Ptr.load(entries, entryBytes * i + w)
+		Ptr.store(entries, entryBytes * i + w, Ptr.load(entries, entryBytes * j + w) : Int)
+		Ptr.store(entries, entryBytes * j + w, a)
+	}
 }
 
 -- Heapsort, by return address: in place, without recursion, and n log n at
 -- worst, which is everything a sort here needs to be.
 fun sortEntries(entries : Ptr, count : Int) -> Unit {
-    var start = count / 2
-    while start > 0 {
-        start = start - 1
-        siftDown(entries, start, count)
-    }
-    var end = count
-    while end > 1 {
-        end = end - 1
-        swapEntries(entries, 0, end)
-        siftDown(entries, 0, end)
-    }
+	var start = count / 2
+	while start > 0 {
+		start = start - 1
+		siftDown(entries, start, count)
+	}
+	var end = count
+	while end > 1 {
+		end = end - 1
+		swapEntries(entries, 0, end)
+		siftDown(entries, 0, end)
+	}
 }
 
 fun siftDown(entries : Ptr, first : Int, count : Int) -> Unit {
-    var root = first
-    while 2 * root + 1 < count {
-        var child = 2 * root + 1
-        if child + 1 < count && below(entryKey(entries, child), entryKey(entries, child + 1)) {
-            child = child + 1
-        }
-        if !below(entryKey(entries, root), entryKey(entries, child)) { return }
-        swapEntries(entries, root, child)
-        root = child
-    }
+	var root = first
+	while 2 * root + 1 < count {
+		var child = 2 * root + 1
+		if child + 1 < count && below(entryKey(entries, child), entryKey(entries, child + 1)) {
+			child = child + 1
+		}
+		if !below(entryKey(entries, root), entryKey(entries, child)) { return }
+		swapEntries(entries, root, child)
+		root = child
+	}
 }
 
 fun frameEntryFor(retaddr : Int) -> Ptr {
-    var low = 0
-    var high = frameEntryCount - 1
-    while low <= high {
-        let middle = plus(low, high) >> 1
-        let found = entryKey(frameEntries, middle)
-        if found == retaddr {
-            return Ptr.add(frameEntries, Int.mulWrapping(entryBytes, middle))
-        }
-        if below(found, retaddr) { low = plus(middle, 1) } else { high = Int.subWrapping(middle, 1) }
-    }
-    Ptr.null()
+	var low = 0
+	var high = frameEntryCount - 1
+	while low <= high {
+		let middle = plus(low, high) >> 1
+		let found = entryKey(frameEntries, middle)
+		if found == retaddr {
+			return Ptr.add(frameEntries, Int.mulWrapping(entryBytes, middle))
+		}
+		if below(found, retaddr) {
+			low = plus(middle, 1)
+		} else {
+			high = Int.subWrapping(middle, 1)
+		}
+	}
+	Ptr.null()
 }
 
 -- Every Turkey frame of every stack, as a marking task per stack
@@ -1163,31 +1211,31 @@ fun frameEntryFor(retaddr : Int) -> Ptr {
 -- a use after free, and a fault where the C library has returned the region
 -- to the system.
 fun stackTasks(frame : Ptr) -> Unit {
-    if frameEntryCount == 0 { return }
-    -- Skipped below even with a null `frame`: the running stack's record may
-    -- describe a stack that is gone. The thread that ran the program's own
-    -- code exits when that code returns, and the main thread then collects
-    -- with the same worker record.
-    let running = Stack.running()
-    if !Ptr.isNull(frame) {
-        if Ptr.isNull(running) {
-            -- Reachable only if something ran the program's code without the
-            -- generated entry. Scanning from an unknown outer bound is how a
-            -- walk runs off the end; not scanning drops live roots silently,
-            -- which is worse. So say so instead of doing either.
-            Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
-            return
-        }
-        addTask(taskStack, frame, Stack.high(running))
-    }
-    var stack = Stack.first()
-    while !Ptr.isNull(stack) {
-        let parked = Stack.parked(stack)
-        if stack != running && !Ptr.isNull(parked) {
-            addTask(taskStack, parked, Stack.high(stack))
-        }
-        stack = Stack.next(stack)
-    }
+	if frameEntryCount == 0 { return }
+	-- Skipped below even with a null `frame`: the running stack's record may
+	-- describe a stack that is gone. The thread that ran the program's own
+	-- code exits when that code returns, and the main thread then collects
+	-- with the same worker record.
+	let running = Stack.running()
+	if !Ptr.isNull(frame) {
+		if Ptr.isNull(running) {
+			-- Reachable only if something ran the program's code without the
+			-- generated entry. Scanning from an unknown outer bound is how a
+			-- walk runs off the end; not scanning drops live roots silently,
+			-- which is worse. So say so instead of doing either.
+			Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
+			return
+		}
+		addTask(taskStack, frame, Stack.high(running))
+	}
+	var stack = Stack.first()
+	while !Ptr.isNull(stack) {
+		let parked = Stack.parked(stack)
+		if stack != running && !Ptr.isNull(parked) {
+			addTask(taskStack, parked, Stack.high(stack))
+		}
+		stack = Stack.next(stack)
+	}
 }
 
 -- One stack's frames, from the record at `frame` out to `high`.
@@ -1199,41 +1247,77 @@ fun stackTasks(frame : Ptr) -> Unit {
 -- aligned, and strictly increase. There is no low bound to check: the walk
 -- starts at a live frame and only ever moves outwards.
 fun scanStack(frame : Ptr, high : Ptr) -> Unit {
-    let top = Ptr.toInt(high)
-    var here = Ptr.toInt(frame)
-    while !below(top, here + 16) && here & 7 == 0 {
-        -- The return address in *this* record is an address in the *caller*,
-        -- so the entry it finds describes the caller's frame -- whose `x29` is
-        -- this record's saved one. Applying the offsets to this frame instead
-        -- reads whatever the callee happens to have at those offsets.
-        let record = Ptr.fromInt(here)
-        let next : Int = Ptr.load(record, 0)
-        if !below(here, next) || below(top, next + 16) || next & 7 != 0 {
-            return
-        }
-        let entry = frameEntryFor(Ptr.load(record, 8))
-        if !Ptr.isNull(entry) {
-            let count : Int = Ptr.load(entry, 8)
-            let offsets : Ptr = Ptr.load(entry, 16)
-            let caller = Ptr.fromInt(next)
-            for var i = 0; i < count; i = plus(i, 1) {
-                let value : Ptr = Ptr.load(caller, rootOffset(offsets, i))
-                -- An object the compiler placed in a frame (`Turkey.Escape`):
-                -- a callee's rooted parameter, or one such object's field
-                -- naming another. It is not a heap object and has no mark bit;
-                -- its own frame lists its fields, which is how what it holds
-                -- is traced. Such an object never leaves the function that
-                -- placed it, so it is in this stack's own range: only a frame
-                -- slot can hold one, since nothing in the heap ever points
-                -- into a stack, and a stack never points into another's.
-                let at = Ptr.toInt(value)
-                if below(at, Ptr.toInt(frame)) || !below(at, top) {
-                    markGrey(value, Prim.cString("arm64 frame"), i)
-                }
-            }
-        }
-        here = next
-    }
+	if let Wasi = Target.os { return scanShadow(frame, high) }
+	let top = Ptr.toInt(high)
+	var here = Ptr.toInt(frame)
+	while !below(top, here + 16) && here & 7 == 0 {
+		-- The return address in *this* record is an address in the *caller*,
+		-- so the entry it finds describes the caller's frame -- whose `x29` is
+		-- this record's saved one. Applying the offsets to this frame instead
+		-- reads whatever the callee happens to have at those offsets.
+		let record = Ptr.fromInt(here)
+		let next : Int = Ptr.load(record, 0)
+		if !below(here, next) || below(top, next + 16) || next & 7 != 0 {
+			return
+		}
+		let entry = frameEntryFor(Ptr.load(record, 8))
+		if !Ptr.isNull(entry) {
+			let count : Int = Ptr.load(entry, 8)
+			let offsets : Ptr = Ptr.load(entry, 16)
+			let caller = Ptr.fromInt(next)
+			for var i = 0; i < count; i = plus(i, 1) {
+				let value : Ptr = Ptr.load(caller, rootOffset(offsets, i))
+				-- An object the compiler placed in a frame (`Turkey.Escape`):
+				-- a callee's rooted parameter, or one such object's field
+				-- naming another. It is not a heap object and has no mark bit;
+				-- its own frame lists its fields, which is how what it holds
+				-- is traced. Such an object never leaves the function that
+				-- placed it, so it is in this stack's own range: only a frame
+				-- slot can hold one, since nothing in the heap ever points
+				-- into a stack, and a stack never points into another's.
+				let at = Ptr.toInt(value)
+				if below(at, Ptr.toInt(frame)) || !below(at, top) {
+					markGrey(value, Prim.cString("arm64 frame"), i)
+				}
+			}
+		}
+		here = next
+	}
+}
+
+-- One stack's shadow frames, on wasm, from the frame at `frame` out to
+-- `high`.
+--
+-- Wasm code cannot read its own stack, so a function that holds roots keeps
+-- them in a frame in linear memory (`Turkey.Wasm.Select`), and `frame` is the
+-- shadow stack pointer, the innermost one. A frame's first word is the address
+-- past it, the next frame out or the stack's top, and its second the site it
+-- is stopped at. Unlike a frame record, a frame names its own site, and the
+-- entry for the site gives the frame's own roots, as offsets from the frame.
+-- The bounds are the native walk's: below `high`, 8-byte aligned, and
+-- strictly increasing.
+fun scanShadow(frame : Ptr, high : Ptr) -> Unit {
+	let top = Ptr.toInt(high)
+	var here = Ptr.toInt(frame)
+	while !below(top, here + 16) && here & 7 == 0 {
+		let record = Ptr.fromInt(here)
+		let entry = frameEntryFor(Ptr.load(record, 8))
+		if !Ptr.isNull(entry) {
+			let count : Int = Ptr.load(entry, 8)
+			let offsets : Ptr = Ptr.load(entry, 16)
+			for var i = 0; i < count; i = plus(i, 1) {
+				let value : Ptr = Ptr.load(record, rootOffset(offsets, i))
+				-- A frame object of a frame further out, as on arm64.
+				let at = Ptr.toInt(value)
+				if below(at, Ptr.toInt(frame)) || !below(at, top) {
+					markGrey(value, Prim.cString("wasm frame"), i)
+				}
+			}
+		}
+		let next : Int = Ptr.load(record, 0)
+		if !below(here, next) { return }
+		here = next
+	}
 }
 
 -- -- marking ----------------------------------------------------------------------------
@@ -1264,24 +1348,24 @@ fun immediate(value : Ptr) -> Bool = below(Ptr.toInt(value), immediates)
 -- yet marked, and push it on the running worker's stack. `what` null means a
 -- root the caller cannot name.
 fun markGrey(value : Ptr, what : Ptr, index : Int) -> Unit {
-    if immediate(value) || isStatic(value) { return }
-    -- Exact roots and object descriptors make the header O(1) to find in normal
-    -- execution. GC stress checks membership, and it earns the cost: a pointer
-    -- that is not in the heap means a root was missed or a descriptor is
-    -- wrong, and this turns that from a rare corruption into a panic on the
-    -- first collection.
-    if stress && Ptr.isNull(findObject(value)) {
-        notHeapPointer(value, what, index)
-        return
-    }
-    let region = regionOf(value)
-    let slot = slotOf(region, value)
-    let at = plus(regionMarked, times8(slot >> 6))
-    -- Most roots are marked already, by the time a collection's later tasks
-    -- reach them.
-    if Ptr.load(region, at) & bit(slot) != 0 { return }
-    if !claim(region, at, bit(slot), value, sharing) { return }
-    push(value)
+	if immediate(value) || isStatic(value) { return }
+	-- Exact roots and object descriptors make the header O(1) to find in normal
+	-- execution. GC stress checks membership, and it earns the cost: a pointer
+	-- that is not in the heap means a root was missed or a descriptor is
+	-- wrong, and this turns that from a rare corruption into a panic on the
+	-- first collection.
+	if stress && Ptr.isNull(findObject(value)) {
+		notHeapPointer(value, what, index)
+		return
+	}
+	let region = regionOf(value)
+	let slot = slotOf(region, value)
+	let at = plus(regionMarked, times8(slot >> 6))
+	-- Most roots are marked already, by the time a collection's later tasks
+	-- reach them.
+	if Ptr.load(region, at) & bit(slot) != 0 { return }
+	if !claim(region, at, bit(slot), value, sharing) { return }
+	push(value)
 }
 
 -- Set `mask` in the mark word at `at` of `region`, and with it the
@@ -1291,38 +1375,38 @@ fun markGrey(value : Ptr, what : Ptr, index : Int) -> Unit {
 -- 64 objects' marks and another worker may be setting one of the others; the
 -- header is the winner's alone.
 fun claim(region : Ptr, at : Int, mask : Int, object : Ptr, shared : Bool) -> Bool {
-    while True {
-        let marks : Int = Ptr.load(region, at)
-        if marks & mask != 0 { return False }
-        if !shared {
-            Ptr.store(region, at, marks | mask)
-            Ptr.store32(region, regionLive, plus(Ptr.load32(region, regionLive), 1))
-            break
-        }
-        if Ptr.atomicCas(region, at, marks, marks | mask) == marks {
-            -- The count is the low half of the word at `regionLive`, and
-            -- never carries into the high half: a region has at most 4096
-            -- slots.
-            let _ = Ptr.atomicAdd(region, regionLive, 1)
-            break
-        }
-    }
-    promote(object)
-    True
+	while True {
+		let marks : Int = Ptr.load(region, at)
+		if marks & mask != 0 { return False }
+		if !shared {
+			Ptr.store(region, at, marks | mask)
+			Ptr.store32(region, regionLive, plus(Ptr.load32(region, regionLive), 1))
+			break
+		}
+		if Ptr.atomicCas(region, at, marks, marks | mask) == marks {
+			-- The count is the low half of the word at `regionLive`, and
+			-- never carries into the high half: a region has at most 4096
+			-- slots.
+			let _ = Ptr.atomicAdd(region, regionLive, 1)
+			break
+		}
+	}
+	promote(object)
+	True
 }
 
 -- Make `object` old. A byte store, so that the rest of the header, which
 -- nothing else writes once the object is built, is not written at all.
 fun promote(object : Ptr) -> Unit =
-    Ptr.store(object, headerGeneration, Byte.truncate(old))
+	Ptr.store(object, headerGeneration, Byte.truncate(old))
 
 -- Push `entry` on the running worker's mark stack.
 fun push(entry : Ptr) -> Unit {
-    let m = marker()
-    let count : Int = Ptr.load(m, 8)
-    if count == Ptr.load(m, 16) && !growMarkStack(m) { return }
-    Ptr.store(Ptr.load(m, 0), times8(count), entry)
-    Ptr.store(m, 8, plus(count, 1))
+	let m = marker()
+	let count : Int = Ptr.load(m, 8)
+	if count == Ptr.load(m, 16) && !growMarkStack(m) { return }
+	Ptr.store(Ptr.load(m, 0), times8(count), entry)
+	Ptr.store(m, 8, plus(count, 1))
 }
 
 -- The running worker's mark stack.
@@ -1330,24 +1414,24 @@ fun marker() -> Ptr = Ptr.add(markers, markerBytes * Workers.index())
 
 -- The index of the slot of `object`, in `region`.
 fun slotOf(region : Ptr, object : Ptr) -> Int {
-    let offset = Int.subWrapping(Ptr.diff(object, region), regionData)
-    let multiplier : Int = Ptr.load(reciprocals, times8(Ptr.load32(region, regionSizeClass)))
-    Int.mulWrapping(offset, multiplier) >> 32
+	let offset = Int.subWrapping(Ptr.diff(object, region), regionData)
+	let multiplier : Int = Ptr.load(reciprocals, times8(Ptr.load32(region, regionSizeClass)))
+	Int.mulWrapping(offset, multiplier) >> 32
 }
 
 -- Double the mark stack `m`; False, with the mark failed, if there is no
 -- memory.
 fun growMarkStack(m : Ptr) -> Bool {
-    let capacity : Int = Ptr.load(m, 16)
-    let grown = if capacity < 64 { 64 } else { capacity * 2 }
-    let stack = Os.realloc(Ptr.load(m, 0), 8 * grown)
-    if Ptr.isNull(stack) {
-        markFailed(Prim.cString("out of memory"))
-        return False
-    }
-    Ptr.store(m, 0, stack)
-    Ptr.store(m, 16, grown)
-    True
+	let capacity : Int = Ptr.load(m, 16)
+	let grown = if capacity < 64 { 64 } else { capacity * 2 }
+	let stack = Os.realloc(Ptr.load(m, 0), 8 * grown)
+	if Ptr.isNull(stack) {
+		markFailed(Prim.cString("out of memory"))
+		return False
+	}
+	Ptr.store(m, 0, stack)
+	Ptr.store(m, 16, grown)
+	True
 }
 
 -- The write barrier's slow path: `parent` has just been given a young object,
@@ -1361,33 +1445,33 @@ fun growMarkStack(m : Ptr) -> Bool {
 -- managed object, from Turkey or C -- must call it too, unless the object was
 -- allocated after the value they store.
 foreign "turkey_write_barrier" fun writeBarrier(parent : Ptr) -> Unit {
-    -- Claimed by changing the generation, atomically: two workers storing
-    -- into one old object at once must not both remember it. The swap is of
-    -- the whole header, whose other bytes nothing changes once the object is
-    -- built, and it writes them back as they were.
-    let header : Int = Ptr.load(parent, 0)
-    if header & 255 != old { return }
-    let remembered = header & complement(255) | rememberedOld
-    if Ptr.atomicCas(parent, 0, header, remembered) != header { return }
-    remember(parent)
-    let _ = Ptr.atomicAdd(statsCounts, statsRememberedAt, 1)
+	-- Claimed by changing the generation, atomically: two workers storing
+	-- into one old object at once must not both remember it. The swap is of
+	-- the whole header, whose other bytes nothing changes once the object is
+	-- built, and it writes them back as they were.
+	let header : Int = Ptr.load(parent, 0)
+	if header & 255 != old { return }
+	let remembered = header & complement(255) | rememberedOld
+	if Ptr.atomicCas(parent, 0, header, remembered) != header { return }
+	remember(parent)
+	let _ = Ptr.atomicAdd(statsCounts, statsRememberedAt, 1)
 }
 
 -- Add `parent` to the running worker's remembered set.
 fun remember(parent : Ptr) -> Unit {
-    let count = rememberedCount()
-    if count == rememberedCapacity() {
-        let capacity = if count < 64 { 64 } else { count * 2 }
-        let grown = Os.realloc(remembered(), 8 * capacity)
-        if Ptr.isNull(grown) {
-            Process.panic(Prim.cString("out of memory"))
-            return
-        }
-        rememberedSet(grown)
-        rememberedCapacitySet(capacity)
-    }
-    Ptr.store(remembered(), times8(count), parent)
-    rememberedCountSet(plus(count, 1))
+	let count = rememberedCount()
+	if count == rememberedCapacity() {
+		let capacity = if count < 64 { 64 } else { count * 2 }
+		let grown = Os.realloc(remembered(), 8 * capacity)
+		if Ptr.isNull(grown) {
+			Process.panic(Prim.cString("out of memory"))
+			return
+		}
+		rememberedSet(grown)
+		rememberedCapacitySet(capacity)
+	}
+	Ptr.store(remembered(), times8(count), parent)
+	rememberedCountSet(plus(count, 1))
 }
 
 -- Trace everything reachable from the running worker's mark stack, emptying
@@ -1409,115 +1493,127 @@ fun remember(parent : Ptr) -> Unit {
 -- With other workers marking, every `shareEvery` entries this one gives a
 -- packet of its stack away if one of them is waiting for work.
 fun drain() -> Unit {
-    let m = marker()
-    var stack : Ptr = Ptr.load(m, 0)
-    var capacity : Int = Ptr.load(m, 16)
-    var top : Int = Ptr.load(m, 8)
-    let shared = sharing
-    -- `isStatic`'s range, read once rather than once per field.
-    let staticFrom = staticStart
-    let staticSize = staticBytes
-    var countdown = shareEvery
-    while top > 0 {
-        if shared {
-            countdown = Int.subWrapping(countdown, 1)
-            if countdown == 0 {
-                countdown = shareEvery
-                if top > packetEntries && Ptr.atomicLoad(marking, idleAt) > 0 {
-                    top = share(stack, top)
-                }
-            }
-        }
-        top = Int.subWrapping(top, 1)
-        let entry = Ptr.toInt(Ptr.load(stack, times8(top)))
-        let chunk = entry >> 48
-        let object = Ptr.fromInt(if chunk == 0 { entry } else { entry & addressBits })
-        -- Where its pointers are: `runs` runs of `per` words, one every
-        -- `stride` bytes from `first`. Any object but an array is runs of
-        -- one word each, and a cell's flag is the count of its one word.
-        let header = Ptr.load32(object, 0)
-        let kind = header >> 8 & 255
-        var first = objectFields
-        var runs = header >> 16
-        var per = 1
-        var stride = 8
-        if kind == arrayKind {
-            first = arrayElements
-            per = runs
-            stride = Ptr.load32(object, 4)
-            runs = if per > 0 { Ptr.load(object, arrayLength) } else { 0 }
-        }
-        var field = 0
-        var end = runs
-        if runs > chunkSlots {
-            field = Int.mulWrapping(chunk, chunkSlots)
-            end = if Int.subWrapping(runs, field) > chunkSlots && chunk < chunkLimit {
-                plus(field, chunkSlots)
-            } else { runs }
-        }
-        if end != runs {
-            if top == capacity {
-                Ptr.store(m, 8, top)
-                if !growMarkStack(m) {
-                    Ptr.store(m, 8, 0)
-                    return
-                }
-                stack = Ptr.load(m, 0)
-                capacity = Ptr.load(m, 16)
-            }
-            let next = Ptr.toInt(object) | plus(chunk, 1) << 48
-            Ptr.store(stack, times8(top), Ptr.fromInt(next))
-            top = plus(top, 1)
-        }
-        -- `at` is the run's offset and `k` the word's within it.
-        var at = plus(first, Int.mulWrapping(field, stride))
-        let stop = plus(first, Int.mulWrapping(end, stride))
-        var k = 0
-        while at < stop {
-            let child : Ptr = Ptr.load(object, plus(at, times8(k)))
-            if immediate(child) {
-            } else if below(Int.subWrapping(Ptr.toInt(child), staticFrom), staticSize) {
-            } else if stress && Ptr.isNull(findObject(child)) {
-                notHeapPointer(child, fieldName(kind),
-                               plus(Int.mulWrapping(Int.subWrapping(at, first) / stride, per), k))
-            } else {
-                let childRegion = regionOf(child)
-                let childSlot = slotOf(childRegion, child)
-                let at = plus(regionMarked, times8(childSlot >> 6))
-                let marks : Int = Ptr.load(childRegion, at)
-                let mask = bit(childSlot)
-                -- In line when this worker marks alone: a call per object
-                -- marked is a large share of what marking costs.
-                if marks & mask == 0 {
-                    let won = if shared { claim(childRegion, at, mask, child, True) } else {
-                        Ptr.store(childRegion, at, marks | mask)
-                        Ptr.store32(childRegion, regionLive, plus(Ptr.load32(childRegion, regionLive), 1))
-                        promote(child)
-                        True
-                    }
-                    if won {
-                        if top == capacity {
-                            Ptr.store(m, 8, top)
-                            if !growMarkStack(m) {
-                                Ptr.store(m, 8, 0)
-                                return
-                            }
-                            stack = Ptr.load(m, 0)
-                            capacity = Ptr.load(m, 16)
-                        }
-                        Ptr.store(stack, times8(top), child)
-                        top = plus(top, 1)
-                    }
-                }
-            }
-            k = plus(k, 1)
-            if k == per {
-                k = 0
-                at = plus(at, stride)
-            }
-        }
-    }
-    Ptr.store(m, 8, 0)
+	let m = marker()
+	var stack : Ptr = Ptr.load(m, 0)
+	var capacity : Int = Ptr.load(m, 16)
+	var top : Int = Ptr.load(m, 8)
+	let shared = sharing
+	-- `isStatic`'s range, read once rather than once per field.
+	let staticFrom = staticStart
+	let staticSize = staticBytes
+	var countdown = shareEvery
+	while top > 0 {
+		if shared {
+			countdown = Int.subWrapping(countdown, 1)
+			if countdown == 0 {
+				countdown = shareEvery
+				if top > packetEntries && Ptr.atomicLoad(marking, idleAt) > 0 {
+					top = share(stack, top)
+				}
+			}
+		}
+		top = Int.subWrapping(top, 1)
+		let entry = Ptr.toInt(Ptr.load(stack, times8(top)))
+		let chunk = entry >> 48
+		let object = Ptr.fromInt(if chunk == 0 { entry } else { entry & addressBits })
+		-- Where its pointers are: `runs` runs of `per` words, one every
+		-- `stride` bytes from `first`. Any object but an array is runs of
+		-- one word each, and a cell's flag is the count of its one word.
+		let header = Ptr.load32(object, 0)
+		let kind = header >> 8 & 255
+		var first = objectFields
+		var runs = header >> 16
+		var per = 1
+		var stride = 8
+		if kind == arrayKind {
+			first = arrayElements
+			per = runs
+			stride = Ptr.load32(object, 4)
+			runs = if per > 0 { Ptr.load(object, arrayLength) } else { 0 }
+		}
+		var field = 0
+		var end = runs
+		if runs > chunkSlots {
+			field = Int.mulWrapping(chunk, chunkSlots)
+			end = if Int.subWrapping(runs, field) > chunkSlots && chunk < chunkLimit {
+				plus(field, chunkSlots)
+			} else {
+				runs
+			}
+		}
+		if end != runs {
+			if top == capacity {
+				Ptr.store(m, 8, top)
+				if !growMarkStack(m) {
+					Ptr.store(m, 8, 0)
+					return
+				}
+				stack = Ptr.load(m, 0)
+				capacity = Ptr.load(m, 16)
+			}
+			let next = Ptr.toInt(object) | plus(chunk, 1) << 48
+			Ptr.store(stack, times8(top), Ptr.fromInt(next))
+			top = plus(top, 1)
+		}
+		-- `at` is the run's offset and `k` the word's within it.
+		var at = plus(first, Int.mulWrapping(field, stride))
+		let stop = plus(first, Int.mulWrapping(end, stride))
+		var k = 0
+		while at < stop {
+			let child : Ptr = Ptr.load(object, plus(at, times8(k)))
+			if immediate(child) {} else if below(
+				Int.subWrapping(Ptr.toInt(child), staticFrom),
+				staticSize,
+			) {} else if stress && Ptr.isNull(findObject(child)) {
+				notHeapPointer(
+					child,
+					fieldName(kind),
+					plus(Int.mulWrapping(Int.subWrapping(at, first) / stride, per), k),
+				)
+			} else {
+				let childRegion = regionOf(child)
+				let childSlot = slotOf(childRegion, child)
+				let at = plus(regionMarked, times8(childSlot >> 6))
+				let marks : Int = Ptr.load(childRegion, at)
+				let mask = bit(childSlot)
+				-- In line when this worker marks alone: a call per object
+				-- marked is a large share of what marking costs.
+				if marks & mask == 0 {
+					let won = if shared {
+						claim(childRegion, at, mask, child, True)
+					} else {
+						Ptr.store(childRegion, at, marks | mask)
+						Ptr.store32(
+							childRegion,
+							regionLive,
+							plus(Ptr.load32(childRegion, regionLive), 1),
+						)
+						promote(child)
+						True
+					}
+					if won {
+						if top == capacity {
+							Ptr.store(m, 8, top)
+							if !growMarkStack(m) {
+								Ptr.store(m, 8, 0)
+								return
+							}
+							stack = Ptr.load(m, 0)
+							capacity = Ptr.load(m, 16)
+						}
+						Ptr.store(stack, times8(top), child)
+						top = plus(top, 1)
+					}
+				}
+			}
+			k = plus(k, 1)
+			if k == per {
+				k = 0
+				at = plus(at, stride)
+			}
+		}
+	}
+	Ptr.store(m, 8, 0)
 }
 
 -- The bits of an entry that are an address (`drain`).
@@ -1615,228 +1711,234 @@ let rememberedRun : Int = 1024
 -- Mark everything reachable, with the running worker's stack walked from
 -- `frame`: by this worker and every other stopped at a safepoint.
 fun markFrom(frame : Ptr) -> Unit {
-    Ptr.atomicStore(marking, failedAt, 0)
-    taskCount = 0
-    var root = roots
-    while !Ptr.isNull(root) {
-        addTask(taskChain, root, Ptr.null())
-        root = Ptr.load(root, 0)
-    }
-    -- By address: the set is the collecting worker's (`retire`), and the
-    -- record a marker reaches through `remembered` is its own.
-    if minor {
-        let count = rememberedCount()
-        for var i = 0; i < count; i = plus(i, rememberedRun) {
-            let end = if count - i < rememberedRun { count } else { plus(i, rememberedRun) }
-            addTask(taskRemembered, Ptr.add(remembered(), times8(i)),
-                    Ptr.add(remembered(), times8(end)))
-        }
-    }
-    stackTasks(frame)
-    Ptr.atomicStore(marking, nextTaskAt, 0)
-    let me = Workers.index()
-    let n = Workers.count()
-    -- Under GC stress every collection asks, so that the stressed runs, whose
-    -- heaps are small, still mark with the paused workers.
-    let traced = if minor { bytesSince } else { plus(liveBytes, bytesSince) }
-    let paused = stress || traced >= pausedHelpFloor
-    participants = 1
-    for var i = 0; i < n; i = plus(i, 1) {
-        if i != me && canHelp(i, paused) { participants = plus(participants, 1) }
-    }
-    sharing = participants > 1
-    if sharing {
-        Ptr.atomicStore(marking, idleAt, 0)
-        Ptr.atomicStore(marking, doneAt, 0)
-        for var i = 0; i < n; i = plus(i, 1) {
-            if i != me && canHelp(i, paused) { Ptr.atomicStore(helping, times8(i), 1) }
-        }
-        -- The stopped ones sleep on the collection epoch, and the paused ones
-        -- may still be asleep on the work epoch.
-        Workers.signalCollection()
-        if paused { Workers.signalWork(True) }
-    }
-    mark()
-    if sharing {
-        for var i = 0; i < n; i = plus(i, 1) {
-            while Ptr.atomicLoad(helping, times8(i)) != 0 { let _ = Os.schedYield() }
-        }
-        sharing = False
-    }
-    if minor { rememberedCountSet(0) }
-    if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
+	Ptr.atomicStore(marking, failedAt, 0)
+	taskCount = 0
+	var root = roots
+	while !Ptr.isNull(root) {
+		addTask(taskChain, root, Ptr.null())
+		root = Ptr.load(root, 0)
+	}
+	-- By address: the set is the collecting worker's (`retire`), and the
+	-- record a marker reaches through `remembered` is its own.
+	if minor {
+		let count = rememberedCount()
+		for var i = 0; i < count; i = plus(i, rememberedRun) {
+			let end = if count - i < rememberedRun { count } else { plus(i, rememberedRun) }
+			addTask(
+				taskRemembered,
+				Ptr.add(remembered(), times8(i)),
+				Ptr.add(remembered(), times8(end)),
+			)
+		}
+	}
+	stackTasks(frame)
+	Ptr.atomicStore(marking, nextTaskAt, 0)
+	let me = Workers.index()
+	let n = Workers.count()
+	-- Under GC stress every collection asks, so that the stressed runs, whose
+	-- heaps are small, still mark with the paused workers.
+	let traced = if minor { bytesSince } else { plus(liveBytes, bytesSince) }
+	let paused = stress || traced >= pausedHelpFloor
+	participants = 1
+	for var i = 0; i < n; i = plus(i, 1) {
+		if i != me && canHelp(i, paused) { participants = plus(participants, 1) }
+	}
+	sharing = participants > 1
+	if sharing {
+		Ptr.atomicStore(marking, idleAt, 0)
+		Ptr.atomicStore(marking, doneAt, 0)
+		for var i = 0; i < n; i = plus(i, 1) {
+			if i != me && canHelp(i, paused) { Ptr.atomicStore(helping, times8(i), 1) }
+		}
+		-- The stopped ones sleep on the collection epoch, and the paused ones
+		-- may still be asleep on the work epoch.
+		Workers.signalCollection()
+		if paused { Workers.signalWork(True) }
+	}
+	mark()
+	if sharing {
+		for var i = 0; i < n; i = plus(i, 1) {
+			while Ptr.atomicLoad(helping, times8(i)) != 0 { let _ = Os.schedYield() }
+		}
+		sharing = False
+	}
+	if minor { rememberedCountSet(0) }
+	if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
 }
 
 -- Whether worker `i`, with the world stopped, is to be asked to mark: it is
 -- stopped at a safepoint, or, if `paused`, held in `pause`.
 fun canHelp(i : Int, paused : Bool) -> Bool =
-    Workers.stopped(i) || (paused && Ptr.atomicLoad(pausing, times8(i)) != 0)
+	Workers.stopped(i) || (paused && Ptr.atomicLoad(pausing, times8(i)) != 0)
 
 fun addTask(kind : Int, a : Ptr, b : Ptr) -> Unit {
-    if taskCount == taskCapacity {
-        let capacity = if taskCapacity < 64 { 64 } else { taskCapacity * 2 }
-        let grown = Os.realloc(tasks, 24 * capacity)
-        if Ptr.isNull(grown) {
-            markFailed(Prim.cString("out of memory"))
-            return
-        }
-        tasks = grown
-        taskCapacity = capacity
-    }
-    let at = 24 * taskCount
-    Ptr.store(tasks, at, kind)
-    Ptr.store(tasks, plus(at, 8), a)
-    Ptr.store(tasks, plus(at, 16), b)
-    taskCount = plus(taskCount, 1)
+	if taskCount == taskCapacity {
+		let capacity = if taskCapacity < 64 { 64 } else { taskCapacity * 2 }
+		let grown = Os.realloc(tasks, 24 * capacity)
+		if Ptr.isNull(grown) {
+			markFailed(Prim.cString("out of memory"))
+			return
+		}
+		tasks = grown
+		taskCapacity = capacity
+	}
+	let at = 24 * taskCount
+	Ptr.store(tasks, at, kind)
+	Ptr.store(tasks, plus(at, 8), a)
+	Ptr.store(tasks, plus(at, 16), b)
+	taskCount = plus(taskCount, 1)
 }
 
 -- A marker's part: tasks until there are none to claim, then what they reach,
 -- until the mark is over.
 fun mark() -> Unit {
-    while True {
-        let i = Ptr.atomicAdd(marking, nextTaskAt, 1)
-        if i >= taskCount { break }
-        run(i)
-        drain()
-    }
-    if !sharing { return }
-    while take() || waitForWork() { drain() }
+	while True {
+		let i = Ptr.atomicAdd(marking, nextTaskAt, 1)
+		if i >= taskCount { break }
+		run(i)
+		drain()
+	}
+	if !sharing { return }
+	while take() || waitForWork() { drain() }
 }
 
 fun run(task : Int) -> Unit {
-    let at = 24 * task
-    let kind : Int = Ptr.load(tasks, at)
-    let a : Ptr = Ptr.load(tasks, plus(at, 8))
-    let b : Ptr = Ptr.load(tasks, plus(at, 16))
-    if kind == taskChain {
-        let count : Int = Ptr.load(a, frameCount)
-        let live : Int = Ptr.load(a, frameLive)
-        let values : Ptr = Ptr.load(a, frameValues)
-        let name : Ptr = Ptr.load(a, 8)
-        for var i = 0; i < count; i = plus(i, 1) {
-            if i >= 64 || live >> i & 1 != 0 {
-                markGrey(Ptr.load(values, times8(i)), name, i)
-            }
-        }
-    } else if kind == taskStack {
-        scanStack(a, b)
-    } else {
-        -- A minor collection's other roots: the fields of each remembered
-        -- object, which is marked already, being old. Each is old and not
-        -- remembered after.
-        for var at = Ptr.toInt(a); at < Ptr.toInt(b); at = plus(at, 8) {
-            let parent : Ptr = Ptr.load(Ptr.fromInt(at), 0)
-            promote(parent)
-            push(parent)
-        }
-    }
+	let at = 24 * task
+	let kind : Int = Ptr.load(tasks, at)
+	let a : Ptr = Ptr.load(tasks, plus(at, 8))
+	let b : Ptr = Ptr.load(tasks, plus(at, 16))
+	if kind == taskChain {
+		let count : Int = Ptr.load(a, frameCount)
+		let live : Int = Ptr.load(a, frameLive)
+		let values : Ptr = Ptr.load(a, frameValues)
+		let name : Ptr = Ptr.load(a, 8)
+		for var i = 0; i < count; i = plus(i, 1) {
+			if i >= 64 || live >> i & 1 != 0 {
+				markGrey(Ptr.load(values, times8(i)), name, i)
+			}
+		}
+	} else if kind == taskStack {
+		scanStack(a, b)
+	} else {
+		-- A minor collection's other roots: the fields of each remembered
+		-- object, which is marked already, being old. Each is old and not
+		-- remembered after.
+		for var at = Ptr.toInt(a); at < Ptr.toInt(b); at = plus(at, 8) {
+			let parent : Ptr = Ptr.load(Ptr.fromInt(at), 0)
+			promote(parent)
+			push(parent)
+		}
+	}
 }
 
 -- Give the top `packetEntries` of `stack`, which holds `top`, to the pool,
 -- and answer what it holds after: `top` itself if there is no memory for a
 -- packet, which only means this worker keeps the work.
 fun share(stack : Ptr, top : Int) -> Int {
-    Lock.acquire(poolLock)
-    var packet = poolEmpty
-    if Ptr.isNull(packet) {
-        packet = Os.malloc(16 + 8 * packetEntries)
-        if Ptr.isNull(packet) {
-            Lock.release(poolLock)
-            return top
-        }
-    } else {
-        poolEmpty = Ptr.load(packet, 0)
-    }
-    let rest = top - packetEntries
-    Memory.copy(Ptr.add(packet, 16), Ptr.add(stack, times8(rest)), 8 * packetEntries)
-    Ptr.store(packet, 8, packetEntries)
-    Ptr.store(packet, 0, poolFull)
-    poolFull = packet
-    let _ = Ptr.atomicAdd(marking, packetsAt, 1)
-    markSignal(False)
-    Lock.release(poolLock)
-    rest
+	Lock.acquire(poolLock)
+	var packet = poolEmpty
+	if Ptr.isNull(packet) {
+		packet = Os.malloc(16 + 8 * packetEntries)
+		if Ptr.isNull(packet) {
+			Lock.release(poolLock)
+			return top
+		}
+	} else {
+		poolEmpty = Ptr.load(packet, 0)
+	}
+	let rest = top - packetEntries
+	Memory.copy(Ptr.add(packet, 16), Ptr.add(stack, times8(rest)), 8 * packetEntries)
+	Ptr.store(packet, 8, packetEntries)
+	Ptr.store(packet, 0, poolFull)
+	poolFull = packet
+	let _ = Ptr.atomicAdd(marking, packetsAt, 1)
+	markSignal(False)
+	Lock.release(poolLock)
+	rest
 }
 
 -- Move a packet from the pool to the running worker's stack, if there is one.
 fun take() -> Bool {
-    if Ptr.atomicLoad(marking, packetsAt) == 0 { return False }
-    Lock.acquire(poolLock)
-    let packet = poolFull
-    if Ptr.isNull(packet) {
-        Lock.release(poolLock)
-        return False
-    }
-    poolFull = Ptr.load(packet, 0)
-    let _ = Ptr.atomicAdd(marking, packetsAt, -1)
-    let m = marker()
-    let count : Int = Ptr.load(packet, 8)
-    while Ptr.load(m, 16) < plus(Ptr.load(m, 8), count) {
-        if !growMarkStack(m) {
-            Lock.release(poolLock)
-            return False
-        }
-    }
-    let top : Int = Ptr.load(m, 8)
-    Memory.copy(Ptr.add(Ptr.load(m, 0), times8(top)), Ptr.add(packet, 16), 8 * count)
-    Ptr.store(m, 8, plus(top, count))
-    Ptr.store(packet, 0, poolEmpty)
-    poolEmpty = packet
-    Lock.release(poolLock)
-    True
+	if Ptr.atomicLoad(marking, packetsAt) == 0 { return False }
+	Lock.acquire(poolLock)
+	let packet = poolFull
+	if Ptr.isNull(packet) {
+		Lock.release(poolLock)
+		return False
+	}
+	poolFull = Ptr.load(packet, 0)
+	let _ = Ptr.atomicAdd(marking, packetsAt, -1)
+	let m = marker()
+	let count : Int = Ptr.load(packet, 8)
+	while Ptr.load(m, 16) < plus(Ptr.load(m, 8), count) {
+		if !growMarkStack(m) {
+			Lock.release(poolLock)
+			return False
+		}
+	}
+	let top : Int = Ptr.load(m, 8)
+	Memory.copy(Ptr.add(Ptr.load(m, 0), times8(top)), Ptr.add(packet, 16), 8 * count)
+	Ptr.store(m, 8, plus(top, count))
+	Ptr.store(packet, 0, poolEmpty)
+	poolEmpty = packet
+	Lock.release(poolLock)
+	True
 }
 
 -- With nothing to mark: idle until a packet is put in the pool, True, or
 -- every marker is idle and the mark is over, False.
 fun waitForWork() -> Bool {
-    Lock.acquire(poolLock)
-    if !Ptr.isNull(poolFull) {
-        Lock.release(poolLock)
-        return True
-    }
-    let idle = plus(Ptr.atomicLoad(marking, idleAt), 1)
-    Ptr.atomicStore(marking, idleAt, idle)
-    let over = idle == participants
-    if over { Ptr.atomicStore(marking, doneAt, 1) }
-    Lock.release(poolLock)
-    if over {
-        markSignal(True)
-        return False
-    }
-    while True {
-        let epoch = Ptr.atomicLoad(marking, epochAt)
-        if Ptr.atomicLoad(marking, doneAt) != 0 { return False }
-        if Ptr.atomicLoad(marking, packetsAt) > 0 {
-            Lock.acquire(poolLock)
-            let done = Ptr.atomicLoad(marking, doneAt) != 0
-            if !done { Ptr.atomicStore(marking, idleAt, Ptr.atomicLoad(marking, idleAt) - 1) }
-            Lock.release(poolLock)
-            return !done
-        }
-        -- Asleep until a packet or the end, rather than spinning: the last
-        -- marker with work may be some while about it.
-        let _ = Ptr.atomicAdd(marking, sleepersAt, 1)
-        if Ptr.atomicLoad(marking, epochAt) == epoch { Lock.wait(Ptr.add(marking, epochAt), epoch) }
-        let _ = Ptr.atomicAdd(marking, sleepersAt, -1)
-    }
-    False
+	Lock.acquire(poolLock)
+	if !Ptr.isNull(poolFull) {
+		Lock.release(poolLock)
+		return True
+	}
+	let idle = plus(Ptr.atomicLoad(marking, idleAt), 1)
+	Ptr.atomicStore(marking, idleAt, idle)
+	let over = idle == participants
+	if over { Ptr.atomicStore(marking, doneAt, 1) }
+	Lock.release(poolLock)
+	if over {
+		markSignal(True)
+		return False
+	}
+	while True {
+		let epoch = Ptr.atomicLoad(marking, epochAt)
+		if Ptr.atomicLoad(marking, doneAt) != 0 { return False }
+		if Ptr.atomicLoad(marking, packetsAt) > 0 {
+			Lock.acquire(poolLock)
+			let done = Ptr.atomicLoad(marking, doneAt) != 0
+			if !done { Ptr.atomicStore(marking, idleAt, Ptr.atomicLoad(marking, idleAt) - 1) }
+			Lock.release(poolLock)
+			return !done
+		}
+		-- Asleep until a packet or the end, rather than spinning: the last
+		-- marker with work may be some while about it.
+		let _ = Ptr.atomicAdd(marking, sleepersAt, 1)
+		if Ptr.atomicLoad(marking, epochAt) == epoch { Lock.wait(Ptr.add(marking, epochAt), epoch) }
+		let _ = Ptr.atomicAdd(marking, sleepersAt, -1)
+	}
+	False
 }
 
 -- A packet for an idle marker, or, `all`, the end of the mark: wake one, or
 -- every one, if any sleeps (`waitForWork`).
 fun markSignal(all : Bool) -> Unit {
-    let _ = Ptr.atomicAdd(marking, epochAt, 1)
-    if Ptr.atomicLoad(marking, sleepersAt) != 0 {
-        if all { Lock.wakeAll(Ptr.add(marking, epochAt)) }
-        else { let _ = Lock.wake(Ptr.add(marking, epochAt)) }
-    }
+	let _ = Ptr.atomicAdd(marking, epochAt, 1)
+	if Ptr.atomicLoad(marking, sleepersAt) != 0 {
+		if all {
+			Lock.wakeAll(Ptr.add(marking, epochAt))
+		} else {
+			let _ = Lock.wake(Ptr.add(marking, epochAt))
+		}
+	}
 }
 
 -- Record that the mark cannot finish, saying `message`: the collecting worker
 -- panics with it once every marker has stopped. The first failure is the
 -- one reported.
 fun markFailed(message : Ptr) -> Unit {
-    if Ptr.atomicCas(marking, failedAt, 0, 1) == 0 { failure = message }
+	if Ptr.atomicCas(marking, failedAt, 0, 1) == 0 { failure = message }
 }
 
 -- Sleep until there may be work, blocked, so that a collection need not wait
@@ -1854,23 +1956,27 @@ fun markFailed(message : Ptr) -> Unit {
 -- for the collection to let it go either way. A worker blocked on a lock is
 -- not asked, since the lock may be the collecting worker's.
 foreign "turkey_worker_pause" fun pause(seen : Int, timeout : Int) -> Int {
-    let me = times8(Workers.index())
-    Ptr.atomicStore(pausing, me, 1)
-    Workers.blockEnter(Prim.frameAddress())
-    var results = 0
-    if timeout == -1 { Workers.sleepForWork(seen) } else { results = Workers.pollWait(seen, timeout) }
-    while True {
-        let epoch = Workers.collectionSeen()
-        if Workers.unblock() { break }
-        if Ptr.atomicLoad(helping, me) != 0 {
-            mark()
-            Ptr.atomicStore(helping, me, 0)
-        } else {
-            Workers.sleepForCollection(epoch)
-        }
-    }
-    Ptr.atomicStore(pausing, me, 0)
-    results
+	let me = times8(Workers.index())
+	Ptr.atomicStore(pausing, me, 1)
+	Workers.blockEnter(Prim.frameAddress())
+	var results = 0
+	if timeout == -1 {
+		Workers.sleepForWork(seen)
+	} else {
+		results = Workers.pollWait(seen, timeout)
+	}
+	while True {
+		let epoch = Workers.collectionSeen()
+		if Workers.unblock() { break }
+		if Ptr.atomicLoad(helping, me) != 0 {
+			mark()
+			Ptr.atomicStore(helping, me, 0)
+		} else {
+			Workers.sleepForCollection(epoch)
+		}
+	}
+	Ptr.atomicStore(pausing, me, 0)
+	results
 }
 
 -- At a safepoint with the running worker's stop word raised: stopped until
@@ -1878,48 +1984,53 @@ foreign "turkey_worker_pause" fun pause(seen : Int, timeout : Int) -> Int {
 -- It sleeps meanwhile, woken when the collection asks it to mark and when
 -- the collection ends (`Turkey.Workers.signalCollection`).
 fun stopAt(frame : Ptr) -> Unit {
-    Workers.stopEnter(frame)
-    let me = times8(Workers.index())
-    while True {
-        let epoch = Workers.collectionSeen()
-        if !Workers.stopWanted() { break }
-        if Ptr.atomicLoad(helping, me) != 0 {
-            mark()
-            Ptr.atomicStore(helping, me, 0)
-        } else {
-            Workers.sleepForCollection(epoch)
-        }
-    }
-    Workers.stopLeave()
+	Workers.stopEnter(frame)
+	let me = times8(Workers.index())
+	while True {
+		let epoch = Workers.collectionSeen()
+		if !Workers.stopWanted() { break }
+		if Ptr.atomicLoad(helping, me) != 0 {
+			mark()
+			Ptr.atomicStore(helping, me, 0)
+		} else {
+			Workers.sleepForCollection(epoch)
+		}
+	}
+	Workers.stopLeave()
 }
 
 -- What `notHeapPointer` calls a field, by the kind of object it is in.
 fun fieldName(kind : Int) -> Ptr =
-    if kind == cellKind { Ptr.null() }
-    else if kind == arrayKind { Prim.cString("array pointer field") }
-    else if kind == 0 || kind == 1 { Prim.cString("object pointer field") }
-    else { Prim.cString("capture") }
+	if kind == cellKind {
+		Ptr.null()
+	} else if kind == arrayKind {
+		Prim.cString("array pointer field")
+	} else if kind == 0 || kind == 1 {
+		Prim.cString("object pointer field")
+	} else {
+		Prim.cString("capture")
+	}
 
 -- "<what> <index> is not a heap pointer (0x...)", or "GC root or field is not
 -- a heap pointer (0x...)" when the caller cannot name where it looked. Named,
 -- because "a root is not a heap pointer" is true of one slot of one frame, and
 -- a compiler emitting roots for the first time needs to know which.
 fun notHeapPointer(value : Ptr, what : Ptr, index : Int) -> Unit {
-    -- The first marker to find one reports it, in the one text buffer.
-    if Ptr.atomicCas(marking, failedAt, 0, 1) != 0 { return }
-    textLength = 0
-    if Ptr.isNull(what) {
-        put(Prim.cString("GC root or field"))
-    } else {
-        put(what)
-        put(Prim.cString(" "))
-        putInt(index)
-    }
-    put(Prim.cString(" is not a heap pointer (0x"))
-    putHex(Ptr.toInt(value))
-    put(Prim.cString(")"))
-    Ptr.store(text, textLength, Byte.truncate(0))
-    failure = text
+	-- The first marker to find one reports it, in the one text buffer.
+	if Ptr.atomicCas(marking, failedAt, 0, 1) != 0 { return }
+	textLength = 0
+	if Ptr.isNull(what) {
+		put(Prim.cString("GC root or field"))
+	} else {
+		put(what)
+		put(Prim.cString(" "))
+		putInt(index)
+	}
+	put(Prim.cString(" is not a heap pointer (0x"))
+	putHex(Ptr.toInt(value))
+	put(Prim.cString(")"))
+	Ptr.store(text, textLength, Byte.truncate(0))
+	failure = text
 }
 
 -- -- collecting -------------------------------------------------------------------------
@@ -1937,53 +2048,54 @@ type Asked = Due | Full | Minor
 -- A collection, with every other worker stopped. If another worker is
 -- stopping them already, it collects and this one does not.
 fun collectFrom(frame : Ptr, asked : Asked) -> Unit {
-    if !Workers.stopTheWorld() { return }
-    collectStopped(frame, asked)
-    Workers.startTheWorld()
+	if !Workers.stopTheWorld() { return }
+	collectStopped(frame, asked)
+	Workers.startTheWorld()
 }
 
 fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
-    retire()
-    minor = generational && match asked {
-        Due -> !fullDue()
-        Full -> False
-        Minor -> True
-    }
-    if verify { verifyAt(Check.BeforeMarking, frame) }
-    let liveBefore = heapCount
-    -- Read before the sweep clears it: the allocation pressure this
-    -- collection is responding to.
-    let allocsSince = allocationsSince
-    let wanted = statsWanted
-    let started = if wanted { nanoseconds() } else { 0 }
-    if !minor {
-        -- Everything is traced again, and every live object marked again,
-        -- which makes it old and forgets that it was remembered.
-        clearMarks()
-        rememberedCountSet(0)
-    }
-    markFrom(frame)
-    if Process.pending() { return }
-    let marked = if wanted { nanoseconds() } else { 0 }
-    if verify { verifyAt(Check.BeforeSweeping, frame) }
-    sweep()
-    if verify { verifyAt(Check.AfterSweeping, frame) }
-    allocationsSince = 0
-    bytesSince = 0
-    if !minor { liveBytesAfterFull = liveBytes }
-    let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-    let next = Float.fromInt(floor) * thresholdScale
-    -- Saturate where the product no longer fits.
-    threshold = match Float.truncate(next) {
-        Some(n) -> n
-        None -> maxInt()
-    }
-    if minor { statsMinor = statsMinor + 1 }
-    collections = collections + 1
-    if wanted {
-        statsMarkClock = statsMarkClock + (marked - started)
-        logCollection(started, liveBefore, allocsSince)
-    }
+	retire()
+	minor = generational
+		&& match asked {
+			Due   -> !fullDue()
+			Full  -> False
+			Minor -> True
+		}
+	if verify { verifyAt(Check.BeforeMarking, frame) }
+	let liveBefore = heapCount
+	-- Read before the sweep clears it: the allocation pressure this
+	-- collection is responding to.
+	let allocsSince = allocationsSince
+	let wanted = statsWanted
+	let started = if wanted { nanoseconds() } else { 0 }
+	if !minor {
+		-- Everything is traced again, and every live object marked again,
+		-- which makes it old and forgets that it was remembered.
+		clearMarks()
+		rememberedCountSet(0)
+	}
+	markFrom(frame)
+	if Process.pending() { return }
+	let marked = if wanted { nanoseconds() } else { 0 }
+	if verify { verifyAt(Check.BeforeSweeping, frame) }
+	sweep()
+	if verify { verifyAt(Check.AfterSweeping, frame) }
+	allocationsSince = 0
+	bytesSince = 0
+	if !minor { liveBytesAfterFull = liveBytes }
+	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
+	let next = Float.fromInt(floor) * thresholdScale
+	-- Saturate where the product no longer fits.
+	threshold = match Float.truncate(next) {
+		Some(n) -> n
+		None    -> maxInt()
+	}
+	if minor { statsMinor = statsMinor + 1 }
+	collections = collections + 1
+	if wanted {
+		statsMarkClock = statsMarkClock + (marked - started)
+		logCollection(started, liveBefore, allocsSince)
+	}
 }
 
 -- Whether this collection must be full: when the live bytes, old objects
@@ -1996,19 +2108,19 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 -- instead was 14.3 s at 2.86 GB, and with the young generation also sized
 -- from them, 13.5 s at 3.67 GB.
 fun fullDue() -> Bool {
-    if stress { return collections % 8 == 0 }
-    let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-    Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
+	if stress { return collections % 8 == 0 }
+	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
+	Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
 }
 
 -- Before a full collection's marking: no object is marked.
 fun clearMarks() -> Unit {
-    var region = regions
-    while !Ptr.isNull(region) {
-        Memory.fill(Ptr.add(region, regionMarked), 8 * regionWords, 0)
-        Ptr.store32(region, regionLive, 0)
-        region = Ptr.load(region, regionNext)
-    }
+	var region = regions
+	while !Ptr.isNull(region) {
+		Memory.fill(Ptr.add(region, regionMarked), 8 * regionWords, 0)
+		Ptr.store32(region, regionLive, 0)
+		region = Ptr.load(region, regionNext)
+	}
 }
 
 -- An empty region is set aside whole, as a spare or freed, however many
@@ -2019,45 +2131,56 @@ fun clearMarks() -> Unit {
 -- marked until a full collection clears the marks to trace everything again.
 -- A minor collection's marking starts from them, and stops at them.
 fun sweep() -> Unit {
-    Memory.fill(available, 8 * regionClasses, 0)
-    liveBytes = 0
-    var previous = Ptr.null()
-    var region = regions
-    while !Ptr.isNull(region) {
-        let next : Ptr = Ptr.load(region, regionNext)
-        let live = Ptr.load32(region, regionLive)
-        let dead = Ptr.load32(region, regionUsed) - live
-        heapCount = heapCount - dead
-        statsFreedTotal = statsFreedTotal + dead
-        if live == 0 {
-            if Ptr.isNull(previous) { regions = next }
-            else { Ptr.store(previous, regionNext, next) }
-            let reserved : Int = Ptr.load(region, regionReserved)
-            regionBytesInUse = regionBytesInUse - reserved
-            tableRemove(region)
-            if reserved == regionBytes {
-                Ptr.store(region, regionNext, spare)
-                spare = region
-                spareCount = spareCount + 1
-            } else { release(region) }
-        } else {
-            Memory.copy(Ptr.add(region, regionAllocated),
-                        Ptr.add(region, regionMarked), 8 * regionWords)
-            Ptr.store32(region, regionUsed, live)
-            Ptr.store32(region, regionSearchWord, 0)
-            let cls = Ptr.load32(region, regionSizeClass)
-            liveBytes = liveBytes + (if cls < regionClasses {
-                live * Ptr.load(region, regionSlotSize)
-            } else { Ptr.load(region, regionReserved) })
-            if live < Ptr.load32(region, regionCapacity) && cls < regionClasses {
-                Ptr.store(region, regionAvailableNext, Ptr.load(available, 8 * cls) : Ptr)
-                Ptr.store(available, 8 * cls, region)
-            }
-            previous = region
-        }
-        region = next
-    }
-    trimSpares()
+	Memory.fill(available, 8 * regionClasses, 0)
+	liveBytes = 0
+	var previous = Ptr.null()
+	var region = regions
+	while !Ptr.isNull(region) {
+		let next : Ptr = Ptr.load(region, regionNext)
+		let live = Ptr.load32(region, regionLive)
+		let dead = Ptr.load32(region, regionUsed) - live
+		heapCount = heapCount - dead
+		statsFreedTotal = statsFreedTotal + dead
+		if live == 0 {
+			if Ptr.isNull(previous) {
+				regions = next
+			} else {
+				Ptr.store(previous, regionNext, next)
+			}
+			let reserved : Int = Ptr.load(region, regionReserved)
+			regionBytesInUse = regionBytesInUse - reserved
+			tableRemove(region)
+			if reserved == regionBytes {
+				Ptr.store(region, regionNext, spare)
+				spare = region
+				spareCount = spareCount + 1
+			} else {
+				release(region)
+			}
+		} else {
+			Memory.copy(
+				Ptr.add(region, regionAllocated),
+				Ptr.add(region, regionMarked),
+				8 * regionWords,
+			)
+			Ptr.store32(region, regionUsed, live)
+			Ptr.store32(region, regionSearchWord, 0)
+			let cls = Ptr.load32(region, regionSizeClass)
+			liveBytes = liveBytes
+				+ (if cls < regionClasses {
+					live * Ptr.load(region, regionSlotSize)
+				} else {
+					Ptr.load(region, regionReserved)
+				})
+			if live < Ptr.load32(region, regionCapacity) && cls < regionClasses {
+				Ptr.store(region, regionAvailableNext, Ptr.load(available, 8 * cls) : Ptr)
+				Ptr.store(available, 8 * cls, region)
+			}
+			previous = region
+		}
+		region = next
+	}
+	trimSpares()
 }
 
 -- Free the spares beyond what the heap's recent peak leaves room for: the
@@ -2069,143 +2192,143 @@ fun sweep() -> Unit {
 -- in use, so what the heap holds from libc never exceeds what its regions in
 -- use reserved at their most in that window.
 fun trimSpares() -> Unit {
-    let peak = if peakSinceFull > peakBeforeFull { peakSinceFull } else { peakBeforeFull }
-    let room = (peak - regionBytesInUse) / regionBytes
-    let kept = if room > 0 { room } else { 0 }
-    while spareCount > kept {
-        let freed = spare
-        spare = Ptr.load(freed, regionNext)
-        spareCount = spareCount - 1
-        release(freed)
-    }
-    if !minor {
-        peakBeforeFull = peakSinceFull
-        peakSinceFull = regionBytesInUse
-    }
+	let peak = if peakSinceFull > peakBeforeFull { peakSinceFull } else { peakBeforeFull }
+	let room = (peak - regionBytesInUse) / regionBytes
+	let kept = if room > 0 { room } else { 0 }
+	while spareCount > kept {
+		let freed = spare
+		spare = Ptr.load(freed, regionNext)
+		spareCount = spareCount - 1
+		release(freed)
+	}
+	if !minor {
+		peakBeforeFull = peakSinceFull
+		peakSinceFull = regionBytesInUse
+	}
 }
 
 -- Give a region and its size table back to libc.
 fun release(region : Ptr) -> Unit {
-    Os.free(Ptr.load(region, regionSizes))
-    Os.free(region)
+	Os.free(Ptr.load(region, regionSizes))
+	Os.free(region)
 }
 
 -- -- statistics -------------------------------------------------------------------------
 
 fun nanoseconds() -> Int {
-    let _ = Os.clockGettime(Sys.clockMonotonic(), clock)
-    Ptr.load(clock, 0) * 1000000000 + Ptr.load(clock, 8)
+	let _ = Os.clockGettime(Sys.clockMonotonic(), clock)
+	Ptr.load(clock, 0) * 1000000000 + Ptr.load(clock, 8)
 }
 
 fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
-    let nanos = nanoseconds() - started
-    let freedNow = statsFreedTotal - statsFreedPrevious
-    let survived = liveBefore - freedNow
-    statsFreedPrevious = statsFreedTotal
-    statsClock = statsClock + nanos
-    -- A minor collection marks only the young survivors; the old objects were
-    -- marked already, and are not traced again.
-    let traced = if minor { survived - (liveBefore - allocsSince) } else { survived }
-    if traced > 0 { statsTraced = statsTraced + traced }
-    statsLiveTotal = statsLiveTotal + heapCount
-    if heapCount > statsLivePeak { statsLivePeak = heapCount }
-    textLength = 0
-    put(Prim.cString("[gc "))
-    putInt(collections)
-    put(if minor { Prim.cString(" minor") } else { Prim.cString(" full") })
-    put(Prim.cString("] allocs-since "))
-    putInt(allocsSince)
-    put(Prim.cString(", live-before "))
-    putInt(liveBefore)
-    put(Prim.cString(", survived "))
-    putInt(survived)
-    put(Prim.cString(", freed "))
-    putInt(freedNow)
-    put(Prim.cString(", next threshold "))
-    putInt(threshold)
-    put(Prim.cString(", "))
-    putFixed(nanos, 1000000, 3)
-    put(Prim.cString(" ms\n"))
-    writeLine()
+	let nanos = nanoseconds() - started
+	let freedNow = statsFreedTotal - statsFreedPrevious
+	let survived = liveBefore - freedNow
+	statsFreedPrevious = statsFreedTotal
+	statsClock = statsClock + nanos
+	-- A minor collection marks only the young survivors; the old objects were
+	-- marked already, and are not traced again.
+	let traced = if minor { survived - (liveBefore - allocsSince) } else { survived }
+	if traced > 0 { statsTraced = statsTraced + traced }
+	statsLiveTotal = statsLiveTotal + heapCount
+	if heapCount > statsLivePeak { statsLivePeak = heapCount }
+	textLength = 0
+	put(Prim.cString("[gc "))
+	putInt(collections)
+	put(if minor { Prim.cString(" minor") } else { Prim.cString(" full") })
+	put(Prim.cString("] allocs-since "))
+	putInt(allocsSince)
+	put(Prim.cString(", live-before "))
+	putInt(liveBefore)
+	put(Prim.cString(", survived "))
+	putInt(survived)
+	put(Prim.cString(", freed "))
+	putInt(freedNow)
+	put(Prim.cString(", next threshold "))
+	putInt(threshold)
+	put(Prim.cString(", "))
+	putFixed(nanos, 1000000, 3)
+	put(Prim.cString(" ms\n"))
+	writeLine()
 }
 
 -- The run's totals, when TURKEY_GC_STATS asked for them.
 foreign "turkey_gc_report" fun report() -> Unit {
-    if !statsWanted { return }
-    -- With the world stopped, as a collection retires: other workers may
-    -- still be allocating, and the monitor retiring a blocked one's cursors.
-    -- When another worker is collecting, it waits for this one to stop, and
-    -- this loop must stop for it by hand: no loop in this module polls
-    -- (`Turkey.Polls`).
-    while !Workers.stopTheWorld() {
-        if stopAsked() { stopAt(Prim.frameAddress()) }
-    }
-    retire()
-    Workers.startTheWorld()
-    textLength = 0
-    put(Prim.cString("[gc] region bytes "))
-    putInt(regionBytesInUse)
-    put(Prim.cString(", peak "))
-    putInt(regionBytesPeak)
-    put(Prim.cString(", spare "))
-    putInt(spareCount * regionBytes)
-    put(Prim.cString("\n"))
-    writeLine()
-    put(Prim.cString("[gc] collections "))
-    putInt(collections)
-    put(Prim.cString(", allocations "))
-    putInt(Ptr.atomicLoad(statsCounts, statsAllocationsAt))
-    put(Prim.cString(", bytes "))
-    putInt(Ptr.atomicLoad(statsCounts, statsBytesAt))
-    put(Prim.cString(" ("))
-    putFixed(Ptr.atomicLoad(statsCounts, statsBytesAt), 1048576, 1)
-    put(Prim.cString(" MB)\n"))
-    writeLine()
-    put(Prim.cString("[gc] by kind: constr "))
-    putKind(0)
-    put(Prim.cString(", record "))
-    putKind(1)
-    put(Prim.cString(", array "))
-    putKind(2)
-    put(Prim.cString(", closure "))
-    putKind(3)
-    put(Prim.cString(", closure-env "))
-    putKind(4)
-    put(Prim.cString(", cell "))
-    putKind(cellKind)
-    put(Prim.cString("\n"))
-    writeLine()
-    put(Prim.cString("[gc] final live "))
-    putInt(heapCount)
-    put(Prim.cString(", peak live "))
-    putInt(statsLivePeak)
-    put(Prim.cString(", objects traced "))
-    putInt(statsTraced)
-    put(Prim.cString(", freed "))
-    putInt(statsFreedTotal)
-    put(Prim.cString(", collect time "))
-    putFixed(statsClock, 1000000000, 3)
-    put(Prim.cString(" s (mark "))
-    putFixed(statsMarkClock, 1000000000, 3)
-    put(Prim.cString(" s)\n"))
-    writeLine()
-    put(Prim.cString("[gc] minor "))
-    putInt(statsMinor)
-    put(Prim.cString(", full "))
-    putInt(collections - statsMinor)
-    put(Prim.cString(", remembered "))
-    putInt(Ptr.atomicLoad(statsCounts, statsRememberedAt))
-    put(Prim.cString("\n"))
-    writeLine()
-    -- Every collection's stop visits every thread.
-    put(Prim.cString("[gc] threads "))
-    putInt(Workers.count())
-    put(Prim.cString(" of at most "))
-    putInt(Workers.threadLimit())
-    put(Prim.cString(", permits "))
-    putInt(Workers.permits())
-    put(Prim.cString("\n"))
-    writeLine()
+	if !statsWanted { return }
+	-- With the world stopped, as a collection retires: other workers may
+	-- still be allocating, and the monitor retiring a blocked one's cursors.
+	-- When another worker is collecting, it waits for this one to stop, and
+	-- this loop must stop for it by hand: no loop in this module polls
+	-- (`Turkey.Polls`).
+	while !Workers.stopTheWorld() {
+		if stopAsked() { stopAt(Prim.frameAddress()) }
+	}
+	retire()
+	Workers.startTheWorld()
+	textLength = 0
+	put(Prim.cString("[gc] region bytes "))
+	putInt(regionBytesInUse)
+	put(Prim.cString(", peak "))
+	putInt(regionBytesPeak)
+	put(Prim.cString(", spare "))
+	putInt(spareCount * regionBytes)
+	put(Prim.cString("\n"))
+	writeLine()
+	put(Prim.cString("[gc] collections "))
+	putInt(collections)
+	put(Prim.cString(", allocations "))
+	putInt(Ptr.atomicLoad(statsCounts, statsAllocationsAt))
+	put(Prim.cString(", bytes "))
+	putInt(Ptr.atomicLoad(statsCounts, statsBytesAt))
+	put(Prim.cString(" ("))
+	putFixed(Ptr.atomicLoad(statsCounts, statsBytesAt), 1048576, 1)
+	put(Prim.cString(" MB)\n"))
+	writeLine()
+	put(Prim.cString("[gc] by kind: constr "))
+	putKind(0)
+	put(Prim.cString(", record "))
+	putKind(1)
+	put(Prim.cString(", array "))
+	putKind(2)
+	put(Prim.cString(", closure "))
+	putKind(3)
+	put(Prim.cString(", closure-env "))
+	putKind(4)
+	put(Prim.cString(", cell "))
+	putKind(cellKind)
+	put(Prim.cString("\n"))
+	writeLine()
+	put(Prim.cString("[gc] final live "))
+	putInt(heapCount)
+	put(Prim.cString(", peak live "))
+	putInt(statsLivePeak)
+	put(Prim.cString(", objects traced "))
+	putInt(statsTraced)
+	put(Prim.cString(", freed "))
+	putInt(statsFreedTotal)
+	put(Prim.cString(", collect time "))
+	putFixed(statsClock, 1000000000, 3)
+	put(Prim.cString(" s (mark "))
+	putFixed(statsMarkClock, 1000000000, 3)
+	put(Prim.cString(" s)\n"))
+	writeLine()
+	put(Prim.cString("[gc] minor "))
+	putInt(statsMinor)
+	put(Prim.cString(", full "))
+	putInt(collections - statsMinor)
+	put(Prim.cString(", remembered "))
+	putInt(Ptr.atomicLoad(statsCounts, statsRememberedAt))
+	put(Prim.cString("\n"))
+	writeLine()
+	-- Every collection's stop visits every thread.
+	put(Prim.cString("[gc] threads "))
+	putInt(Workers.count())
+	put(Prim.cString(" of at most "))
+	putInt(Workers.threadLimit())
+	put(Prim.cString(", permits "))
+	putInt(Workers.permits())
+	put(Prim.cString("\n"))
+	writeLine()
 }
 
 fun putKind(kind : Int) -> Unit = putInt(Ptr.atomicLoad(statsByKind, 8 * kind))
@@ -2216,68 +2339,68 @@ fun putKind(kind : Int) -> Unit = putInt(Ptr.atomicLoad(statsByKind, 8 * kind))
 -- from two sources do not interleave. What does not fit is dropped.
 
 fun putByte(byte : Int) -> Unit {
-    if textLength < textBytes - 1 {
-        Ptr.store(text, textLength, Byte.truncate(byte))
-        textLength = textLength + 1
-    }
+	if textLength < textBytes - 1 {
+		Ptr.store(text, textLength, Byte.truncate(byte))
+		textLength = textLength + 1
+	}
 }
 
 -- A NUL-terminated string.
 fun put(s : Ptr) -> Unit {
-    var i = 0
-    while Byte.toInt(Ptr.load(s, i)) != 0 {
-        putByte(Byte.toInt(Ptr.load(s, i)))
-        i = i + 1
-    }
+	var i = 0
+	while Byte.toInt(Ptr.load(s, i)) != 0 {
+		putByte(Byte.toInt(Ptr.load(s, i)))
+		i = i + 1
+	}
 }
 
 fun putInt(n : Int) -> Unit {
-    if n < 0 {
-        putByte(45)
-        putMagnitude(n)
-    } else {
-        putMagnitude(-n)
-    }
+	if n < 0 {
+		putByte(45)
+		putMagnitude(n)
+	} else {
+		putMagnitude(-n)
+	}
 }
 
 -- The digits of `-n`, for `n <= 0`: the most negative `Int` has no positive
 -- twin, and division truncates toward zero, so each remainder is in `-9..0`.
 fun putMagnitude(n : Int) -> Unit {
-    if n <= -10 { putMagnitude(n / 10) }
-    putByte(48 - n % 10)
+	if n <= -10 { putMagnitude(n / 10) }
+	putByte(48 - n % 10)
 }
 
 -- `n / unit` rounded to `places` decimal places, for `n` and `unit`
 -- positive: what `%.Nf` prints of the quotient, without a `Float`.
 fun putFixed(n : Int, unit : Int, places : Int) -> Unit {
-    var scale = 1
-    for var i = 0; i < places; i = i + 1 { scale = scale * 10 }
-    let rounded = (n * scale + unit / 2) / unit
-    putInt(rounded / scale)
-    putByte(46)
-    let fraction = rounded % scale
-    var digit = scale / 10
-    while digit > 0 {
-        putByte(48 + fraction / digit % 10)
-        digit = digit / 10
-    }
+	var scale = 1
+	for var i = 0; i < places; i = i + 1 { scale = scale * 10 }
+	let rounded = (n * scale + unit / 2) / unit
+	putInt(rounded / scale)
+	putByte(46)
+	let fraction = rounded % scale
+	var digit = scale / 10
+	while digit > 0 {
+		putByte(48 + fraction / digit % 10)
+		digit = digit / 10
+	}
 }
 
 -- Lowercase hexadecimal with no leading zeros, as `%p` prints an address.
 fun putHex(n : Int) -> Unit {
-    var shift = 60
-    while shift > 0 && shiftRight(n, shift) & 15 == 0 { shift = shift - 4 }
-    while shift >= 0 {
-        let digit = (if shift == 0 { n } else { shiftRight(n, shift) }) & 15
-        putByte(if digit < 10 { 48 + digit } else { 87 + digit })
-        shift = shift - 4
-    }
+	var shift = 60
+	while shift > 0 && shiftRight(n, shift) & 15 == 0 { shift = shift - 4 }
+	while shift >= 0 {
+		let digit = (if shift == 0 { n } else { shiftRight(n, shift) }) & 15
+		putByte(if digit < 10 { 48 + digit } else { 87 + digit })
+		shift = shift - 4
+	}
 }
 
 -- There is nowhere to report a failed write to.
 fun writeLine() -> Unit {
-    let _ = Os.write(2, text, textLength)
-    textLength = 0
+	let _ = Os.write(2, text, textLength)
+	textLength = 0
 }
 
 -- -- the threshold scale ----------------------------------------------------------------
@@ -2290,110 +2413,110 @@ fun writeLine() -> Unit {
 -- value is the mantissa scaled by powers of ten. That is not correctly
 -- rounded, which a scale factor for a threshold has no use for.
 fun scaleFrom(s : Ptr) -> Float {
-    let fallback = 2.0
-    if Ptr.isNull(s) { return fallback }
-    var i = skipSpace(s, 0)
-    var negative = False
-    if isSign(byteAt(s, i)) {
-        negative = byteAt(s, i) == 45
-        i = i + 1
-    }
-    var mantissa = 0
-    var digits = 0
-    var exponent = 0
-    var seen = False
-    while isDigit(byteAt(s, i)) {
-        seen = True
-        if digits < 18 {
-            mantissa = mantissa * 10 + byteAt(s, i) - 48
-            if mantissa != 0 { digits = digits + 1 }
-        } else {
-            exponent = exponent + 1
-        }
-        i = i + 1
-    }
-    if byteAt(s, i) == 46 {
-        i = i + 1
-        while isDigit(byteAt(s, i)) {
-            seen = True
-            if digits < 18 {
-                mantissa = mantissa * 10 + byteAt(s, i) - 48
-                if mantissa != 0 { digits = digits + 1 }
-                exponent = exponent - 1
-            }
-            i = i + 1
-        }
-    }
-    if !seen { return fallback }
-    if isExponentMark(byteAt(s, i)) {
-        var j = i + 1
-        var negativeExponent = False
-        if isSign(byteAt(s, j)) {
-            negativeExponent = byteAt(s, j) == 45
-            j = j + 1
-        }
-        if isDigit(byteAt(s, j)) {
-            var e = 0
-            while isDigit(byteAt(s, j)) {
-                if e < 100000 { e = e * 10 + byteAt(s, j) - 48 }
-                j = j + 1
-            }
-            exponent = if negativeExponent { exponent - e } else { exponent + e }
-            i = j
-        }
-    }
-    if byteAt(s, skipSpace(s, i)) != 0 { return fallback }
-    var value = Float.fromInt(mantissa)
-    -- A bounded exponent, but still no more steps than it takes to leave the
-    -- range a `Float` holds.
-    while exponent > 0 {
-        if !Float.isFinite(value) { break }
-        value = value * 10.0
-        exponent = exponent - 1
-    }
-    while exponent < 0 {
-        if value == 0.0 { break }
-        value = value / 10.0
-        exponent = exponent + 1
-    }
-    if negative { value = -value }
-    if Float.isFinite(value) && value >= 1.0 { value } else { fallback }
+	let fallback = 2.0
+	if Ptr.isNull(s) { return fallback }
+	var i = skipSpace(s, 0)
+	var negative = False
+	if isSign(byteAt(s, i)) {
+		negative = byteAt(s, i) == 45
+		i = i + 1
+	}
+	var mantissa = 0
+	var digits = 0
+	var exponent = 0
+	var seen = False
+	while isDigit(byteAt(s, i)) {
+		seen = True
+		if digits < 18 {
+			mantissa = mantissa * 10 + byteAt(s, i) - 48
+			if mantissa != 0 { digits = digits + 1 }
+		} else {
+			exponent = exponent + 1
+		}
+		i = i + 1
+	}
+	if byteAt(s, i) == 46 {
+		i = i + 1
+		while isDigit(byteAt(s, i)) {
+			seen = True
+			if digits < 18 {
+				mantissa = mantissa * 10 + byteAt(s, i) - 48
+				if mantissa != 0 { digits = digits + 1 }
+				exponent = exponent - 1
+			}
+			i = i + 1
+		}
+	}
+	if !seen { return fallback }
+	if isExponentMark(byteAt(s, i)) {
+		var j = i + 1
+		var negativeExponent = False
+		if isSign(byteAt(s, j)) {
+			negativeExponent = byteAt(s, j) == 45
+			j = j + 1
+		}
+		if isDigit(byteAt(s, j)) {
+			var e = 0
+			while isDigit(byteAt(s, j)) {
+				if e < 100000 { e = e * 10 + byteAt(s, j) - 48 }
+				j = j + 1
+			}
+			exponent = if negativeExponent { exponent - e } else { exponent + e }
+			i = j
+		}
+	}
+	if byteAt(s, skipSpace(s, i)) != 0 { return fallback }
+	var value = Float.fromInt(mantissa)
+	-- A bounded exponent, but still no more steps than it takes to leave the
+	-- range a `Float` holds.
+	while exponent > 0 {
+		if !Float.isFinite(value) { break }
+		value = value * 10.0
+		exponent = exponent - 1
+	}
+	while exponent < 0 {
+		if value == 0.0 { break }
+		value = value / 10.0
+		exponent = exponent + 1
+	}
+	if negative { value = -value }
+	if Float.isFinite(value) && value >= 1.0 { value } else { fallback }
 }
 
 -- TURKEY_GC_GENERATIONAL: on unless it is set to 0.
 fun generationalFrom(s : Ptr) -> Bool =
-    Ptr.isNull(s) || decimalFrom(s) != 0
+	Ptr.isNull(s) || decimalFrom(s) != 0
 
 -- TURKEY_GC_STRESS: 0 if it is unset, N if it is a decimal N of at least 1
 -- with optional surrounding whitespace, and 1 if it is anything else, which
 -- is how a flag set to "yes" still collects at every allocation. At most
 -- 2^60, far past any interval a run could reach.
 fun intervalFrom(s : Ptr) -> Int {
-    if Ptr.isNull(s) { return 0 }
-    let n = decimalFrom(s)
-    if n < 1 { 1 } else { n }
+	if Ptr.isNull(s) { return 0 }
+	let n = decimalFrom(s)
+	if n < 1 { 1 } else { n }
 }
 
 -- TURKEY_GC_STRESS_SEED, or 1 if it is unset or not a decimal number; never 0,
 -- which xorshift cannot leave.
 fun seedFrom(s : Ptr) -> Int {
-    if Ptr.isNull(s) { return 1 }
-    let n = decimalFrom(s)
-    if n < 1 { 1 } else { n }
+	if Ptr.isNull(s) { return 1 }
+	let n = decimalFrom(s)
+	if n < 1 { 1 } else { n }
 }
 
 -- The decimal number `s` holds, with optional surrounding whitespace, capped
 -- at 2^60; -1 if it holds anything else.
 fun decimalFrom(s : Ptr) -> Int {
-    var at = skipSpace(s, 0)
-    if !isDigit(byteAt(s, at)) { return -1 }
-    var total = 0
-    while isDigit(byteAt(s, at)) {
-        if total < 0x1000_0000_0000_0000 { total = total * 10 + byteAt(s, at) - 48 }
-        at = at + 1
-    }
-    if byteAt(s, skipSpace(s, at)) != 0 { return -1 }
-    if total > 0x1000_0000_0000_0000 { 0x1000_0000_0000_0000 } else { total }
+	var at = skipSpace(s, 0)
+	if !isDigit(byteAt(s, at)) { return -1 }
+	var total = 0
+	while isDigit(byteAt(s, at)) {
+		if total < 0x1000_0000_0000_0000 { total = total * 10 + byteAt(s, at) - 48 }
+		at = at + 1
+	}
+	if byteAt(s, skipSpace(s, at)) != 0 { return -1 }
+	if total > 0x1000_0000_0000_0000 { 0x1000_0000_0000_0000 } else { total }
 }
 
 fun byteAt(text : Ptr, offset : Int) -> Int = Byte.toInt(Ptr.load(text, offset))
@@ -2405,9 +2528,9 @@ fun isSign(c : Int) -> Bool = c == 43 || c == 45
 fun isExponentMark(c : Int) -> Bool = c == 101 || c == 69
 
 fun skipSpace(s : Ptr, from : Int) -> Int {
-    var i = from
-    while isSpace(byteAt(s, i)) { i = i + 1 }
-    i
+	var i = from
+	while isSpace(byteAt(s, i)) { i = i + 1 }
+	i
 }
 
 -- C's `isspace`: space, and tab through carriage return.
@@ -2421,29 +2544,29 @@ fun isSpace(c : Int) -> Bool = c == 32 || (c >= 9 && c <= 13)
 var state : Ptr = Os.malloc(Check.stateBytes)
 
 fun snapshot() -> Ptr {
-    retire()
-    if Ptr.isNull(state) { return state }
-    Ptr.store(state, Check.stateRegions, regions)
-    Ptr.store(state, Check.stateAvailable, available)
-    Ptr.store(state, Check.stateRegionTable, regionTable)
-    Ptr.store(state, Check.stateRegionTableCapacity, regionTableCapacity)
-    Ptr.store(state, Check.stateRegionTableCount, regionTableCount)
-    Ptr.store(state, Check.stateRegionBytes, regionBytesInUse)
-    Ptr.store(state, Check.stateSpare, spare)
-    Ptr.store(state, Check.stateSpareCount, spareCount)
-    Ptr.store(state, Check.stateObjects, heapCount)
-    Ptr.store(state, Check.stateSizesKept, if sizesKept { 1 } else { 0 })
-    Ptr.store(state, Check.stateFrameEntries, frameEntries)
-    Ptr.store(state, Check.stateFrameEntryCount, frameEntryCount)
-    Ptr.store(state, Check.stateStacks, Stack.first())
-    Ptr.store(state, Check.stateRunning, Stack.running())
-    Ptr.store(state, Check.stateRoots, roots)
-    Ptr.store(state, Check.stateGenerational, if generational { 1 } else { 0 })
-    Ptr.store(state, Check.stateRemembered, remembered())
-    Ptr.store(state, Check.stateRememberedCount, rememberedCount())
-    Ptr.store(state, Check.stateStaticStart, staticStart)
-    Ptr.store(state, Check.stateStaticBytes, staticBytes)
-    state
+	retire()
+	if Ptr.isNull(state) { return state }
+	Ptr.store(state, Check.stateRegions, regions)
+	Ptr.store(state, Check.stateAvailable, available)
+	Ptr.store(state, Check.stateRegionTable, regionTable)
+	Ptr.store(state, Check.stateRegionTableCapacity, regionTableCapacity)
+	Ptr.store(state, Check.stateRegionTableCount, regionTableCount)
+	Ptr.store(state, Check.stateRegionBytes, regionBytesInUse)
+	Ptr.store(state, Check.stateSpare, spare)
+	Ptr.store(state, Check.stateSpareCount, spareCount)
+	Ptr.store(state, Check.stateObjects, heapCount)
+	Ptr.store(state, Check.stateSizesKept, if sizesKept { 1 } else { 0 })
+	Ptr.store(state, Check.stateFrameEntries, frameEntries)
+	Ptr.store(state, Check.stateFrameEntryCount, frameEntryCount)
+	Ptr.store(state, Check.stateStacks, Stack.first())
+	Ptr.store(state, Check.stateRunning, Stack.running())
+	Ptr.store(state, Check.stateRoots, roots)
+	Ptr.store(state, Check.stateGenerational, if generational { 1 } else { 0 })
+	Ptr.store(state, Check.stateRemembered, remembered())
+	Ptr.store(state, Check.stateRememberedCount, rememberedCount())
+	Ptr.store(state, Check.stateStaticStart, staticStart)
+	Ptr.store(state, Check.stateStaticBytes, staticBytes)
+	state
 }
 
 fun verifyAt(phase : Check.Phase, frame : Ptr) -> Unit = Check.verify(phase, frame, snapshot())
@@ -2458,32 +2581,32 @@ fun verifyAt(phase : Check.Phase, frame : Ptr) -> Unit = Check.verify(phase, fra
 foreign "turkey_heap_state" fun heapState() -> Ptr = snapshot()
 
 foreign "turkey_heap_objects" fun heapObjects() -> Int {
-    retire()
-    heapCount
+	retire()
+	heapCount
 }
 
 foreign "turkey_collection_count" fun collectionCount() -> Int = collections
 
 -- `enabled` is a C `int`: only its low half is defined.
 foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
-    retire()
-    stress = enabled & 0xFFFF_FFFF != 0
-    stressInterval = if stress { 1 } else { 0 }
-    stressCountdown = 1
-    pollWordSet(stress)
+	retire()
+	stress = enabled & 0xFFFF_FFFF != 0
+	stressInterval = if stress { 1 } else { 0 }
+	stressCountdown = 1
+	pollWordSet(stress)
 }
 
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {
-    verify = enabled & 0xFFFF_FFFF != 0
+	verify = enabled & 0xFFFF_FFFF != 0
 }
 
 -- A minor collection, if minor collections are on, for the tests of what one
 -- keeps; `turkey_collect` is always full.
 foreign "turkey_collect_minor" fun collectMinor() -> Unit =
-    collectFrom(Ptr.null(), Minor)
+	collectFrom(Ptr.null(), Minor)
 
 foreign "turkey_gc_set_generational" fun setGenerational(enabled : Int) -> Unit {
-    generational = enabled & 0xFFFF_FFFF != 0
+	generational = enabled & 0xFFFF_FFFF != 0
 }
 
 foreign "turkey_heap_regions" fun heapRegions() -> Ptr = regions
@@ -2497,21 +2620,21 @@ foreign "turkey_heap_spare_bytes" fun heapSpareBytes() -> Int = spareCount * reg
 foreign "turkey_heap_region_table" fun heapRegionTable() -> Ptr = regionTable
 
 foreign "turkey_heap_region_table_capacity" fun heapRegionTableCapacity() -> Int =
-    regionTableCapacity
+	regionTableCapacity
 
 -- Whether `value` is a live object, for the tests' questions about reuse and
 -- reclamation.
 foreign "turkey_heap_contains" fun heapContains(value : Ptr) -> Int {
-    retire()
-    if Ptr.isNull(findObject(value)) { 0 } else { 1 }
+	retire()
+	if Ptr.isNull(findObject(value)) { 0 } else { 1 }
 }
 
 -- For the tests that corrupt the heap on purpose, to see the verifier notice.
 foreign "turkey_heap_set_objects" fun setHeapObjects(count : Int) -> Unit {
-    retire()
-    heapCount = count
+	retire()
+	heapCount = count
 }
 
 foreign "turkey_heap_set_region_bytes" fun setRegionBytes(bytes : Int) -> Unit {
-    regionBytesInUse = bytes
+	regionBytesInUse = bytes
 }

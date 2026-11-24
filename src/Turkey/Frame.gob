@@ -1,6 +1,12 @@
 export (
-    Layout(..), SafepointMap(..), CallSave(..), layout, offsetOf, verifyFrame, pollAt,
-    stubAt,
+	Layout(..),
+	SafepointMap(..),
+	CallSave(..),
+	layout,
+	offsetOf,
+	verifyFrame,
+	pollAt,
+	stubAt,
 )
 
 --- A function's frame, laid out after register allocation.
@@ -60,30 +66,30 @@ type SafepointMap = SafepointMap { block : Int, index : Int, offsets : Vec Int }
 type CallSave = CallSave { kept : Vec Reg }
 
 type Layout = Layout {
-    size     : Int,
-    recordAt : Int,
-    savesAt  : Int,
-    savedGp  : Vec Int,
-    savedFp  : Vec Int,
-    --- The pairs the saves area holds, from the top down: each pair's bank
-    --- and lower register number (`savedPairs`).
-    pairs    : Vec (Bank, Int),
-    rootsAt  : Int,
-    roots    : Int,
-    spillsAt : Int,
-    spills   : Int,
-    objectsAt : Int,
-    --- Each frame object's first byte, from `objectsAt`, and the region's size.
-    objectStarts : Vec Int,
-    objectBytes : Int,
-    --- Bytes, not slots.
-    outgoing : Int,
-    maps     : Vec SafepointMap,
-    --- Each poll's, by `positionKey` of its low IR position.
-    polls    : Map.Map Int CallSave,
-    --- Each allocation's, by `positionKey` of its block and index in the
-    --- allocated code.
-    stubs    : Map.Map Int CallSave,
+	size     : Int
+	recordAt : Int
+	savesAt  : Int
+	savedGp  : Vec Int
+	savedFp  : Vec Int
+	--- The pairs the saves area holds, from the top down: each pair's bank
+	--- and lower register number (`savedPairs`).
+	pairs     : Vec (Bank, Int)
+	rootsAt   : Int
+	roots     : Int
+	spillsAt  : Int
+	spills    : Int
+	objectsAt : Int
+	--- Each frame object's first byte, from `objectsAt`, and the region's size.
+	objectStarts : Vec Int
+	objectBytes  : Int
+	--- Bytes, not slots.
+	outgoing : Int
+	maps     : Vec SafepointMap
+	--- Each poll's, by `positionKey` of its low IR position.
+	polls : Map.Map Int CallSave
+	--- Each allocation's, by `positionKey` of its block and index in the
+	--- allocated code.
+	stubs : Map.Map Int CallSave
 }
 
 fun positionKey(b : Int, n : Int) -> Int = b << 32 | n
@@ -95,142 +101,152 @@ fun pollAt(l : Layout, b : Int, n : Int) -> CallSave = savedAt(l.polls, position
 fun stubAt(l : Layout, b : Int, n : Int) -> CallSave = savedAt(l.stubs, positionKey(b, n))
 
 fun savedAt(saves : Map.Map Int CallSave, key : Int) -> CallSave = match Map.get(saves, key) {
-    Some(s) -> s
-    None -> CallSave { kept = [] }
+	Some(s) -> s
+	None    -> CallSave { kept = [] }
 }
 
 fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
-    let f = a.func
-    let (savedGp, savedFp) = calleeSaved(a)
-    var outgoing = 0
-    for block in f.blocks {
-        for i in block.insts {
-            match A.memOf(i.op) {
-                Some(m) -> match m {
-                    OutgoingArg(k) -> if 8 * (k + 1) > outgoing {
-                        outgoing = 8 * (k + 1)
-                    }
-                    _ -> {}
-                }
-                None -> {}
-            }
-        }
-    }
-    let roots = Roots.slotCount(frame)
-    let spills = a.spills.spillSlots
-    -- Each object is laid out as it would be in the heap, header included.
-    -- Selection writes the header young: the write barrier reads the
-    -- generation of a store's target before it knows whether the target is
-    -- in the heap or in a frame, since a callee storing through a parameter
-    -- is compiled once for both, and a young target needs nothing
-    -- remembered. The collector never reads it: frame objects are roots.
-    let objectStarts = []
-    var objectBytes = 0
-    for o in frame.objects {
-        Vec.push(objectStarts, objectBytes)
-        objectBytes = objectBytes + o.bytes
-    }
-    let pairs = savedPairs(savedGp, savedFp)
-    let saves = 16 * len(pairs)
-    let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
-    let size = (raw + 15) / 16 * 16
-    let objectsAt = outgoing + (size - raw)
-    let spillsAt = objectsAt + objectBytes
-    let rootsAt = spillsAt + 8 * spills
-    let savesAt = rootsAt + 8 * roots
-    let recordAt = savesAt + saves
-    let l = Layout {
-        size = size, recordAt = recordAt, savesAt = savesAt,
-        savedGp = savedGp, savedFp = savedFp, pairs = pairs, rootsAt = rootsAt,
-        roots = roots,
-        spillsAt = spillsAt, spills = spills, objectsAt = objectsAt,
-        objectStarts = objectStarts, objectBytes = objectBytes,
-        outgoing = outgoing, maps = [], polls = Map.new(), stubs = Map.new(),
-    }
-    for block in f.blocks {
-        for i in block.insts {
-            let mark = match A.safepointOf(i.op) {
-                Some(at) -> Some(at)
-                None -> A.pollOf(i.op)
-            }
-            match mark {
-                Some((b, n)) -> {
-                    let offsets = []
-                    for (slot, _) in Roots.liveAt(frame, b, n) {
-                        Vec.push(offsets, rootsAt + 8 * slot - recordAt)
-                    }
-                    for k in Roots.objectsAt(frame, b, n) {
-                        for field in frame.objects[k].traced {
-                            Vec.push(offsets, objectsAt + objectStarts[k] + field - recordAt)
-                        }
-                    }
-                    Vec.push(l.maps, SafepointMap { block = b, index = n,
-                                                      offsets = offsets })
-                }
-                None -> {}
-            }
-        }
-    }
-    placeSaves(l, a)
-    l
+	let f = a.func
+	let (savedGp, savedFp) = calleeSaved(a)
+	var outgoing = 0
+	for block in f.blocks {
+		for i in block.insts {
+			match A.memOf(i.op) {
+				Some(m) -> match m {
+					OutgoingArg(k) -> if 8 * (k + 1) > outgoing {
+						outgoing = 8 * (k + 1)
+					}
+					_ -> {}
+				}
+				None -> {}
+			}
+		}
+	}
+	let roots = Roots.slotCount(frame)
+	let spills = a.spills.spillSlots
+	-- Each object is laid out as it would be in the heap, header included.
+	-- Selection writes the header young: the write barrier reads the
+	-- generation of a store's target before it knows whether the target is
+	-- in the heap or in a frame, since a callee storing through a parameter
+	-- is compiled once for both, and a young target needs nothing
+	-- remembered. The collector never reads it: frame objects are roots.
+	let objectStarts = []
+	var objectBytes = 0
+	for o in frame.objects {
+		Vec.push(objectStarts, objectBytes)
+		objectBytes = objectBytes + o.bytes
+	}
+	let pairs = savedPairs(savedGp, savedFp)
+	let saves = 16 * len(pairs)
+	let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
+	let size = (raw + 15) / 16 * 16
+	let objectsAt = outgoing + (size - raw)
+	let spillsAt = objectsAt + objectBytes
+	let rootsAt = spillsAt + 8 * spills
+	let savesAt = rootsAt + 8 * roots
+	let recordAt = savesAt + saves
+	let l = Layout {
+		size         = size
+		recordAt     = recordAt
+		savesAt      = savesAt
+		savedGp      = savedGp
+		savedFp      = savedFp
+		pairs        = pairs
+		rootsAt      = rootsAt
+		roots        = roots
+		spillsAt     = spillsAt
+		spills       = spills
+		objectsAt    = objectsAt
+		objectStarts = objectStarts
+		objectBytes  = objectBytes
+		outgoing     = outgoing
+		maps         = []
+		polls        = Map.new()
+		stubs        = Map.new()
+	}
+	for block in f.blocks {
+		for i in block.insts {
+			let mark = match A.safepointOf(i.op) {
+				Some(at) -> Some(at)
+				None     -> A.pollOf(i.op)
+			}
+			match mark {
+				Some((b, n)) -> {
+					let offsets = []
+					for (slot, _) in Roots.liveAt(frame, b, n) {
+						Vec.push(offsets, rootsAt + 8 * slot - recordAt)
+					}
+					for k in Roots.objectsAt(frame, b, n) {
+						for field in frame.objects[k].traced {
+							Vec.push(offsets, objectsAt + objectStarts[k] + field - recordAt)
+						}
+					}
+					Vec.push(l.maps, SafepointMap { block = b, index = n, offsets = offsets })
+				}
+				None -> {}
+			}
+		}
+	}
+	placeSaves(l, a)
+	l
 }
 
 -- What each poll and each allocation keeps, from the liveness of the
 -- allocated code: the values live after it are the ones its call must not
 -- lose.
 fun placeSaves(l : Layout, a : Regalloc.Allocation) -> Unit {
-    let f = a.func
-    for var bi = 0; bi < len(f.blocks); bi = bi + 1 {
-        let insts = f.blocks[bi].insts
-        var after : Array (Array Int) = []
-        for var k = 0; k < len(insts); k = k + 1 {
-            let i = insts[k]
-            let key = match A.pollOf(i.op) {
-                Some((b, n)) -> Some((l.polls, positionKey(b, n)))
-                None -> if Option.isSome(A.allocationOf(i.op))
-                           || Option.isSome(A.arrayAllocationOf(i.op)) {
-                    Some((l.stubs, positionKey(bi, k)))
-                } else {
-                    None
-                }
-            }
-            match key {
-                Some((saves, at)) -> {
-                    if len(after) == 0 {
-                        after = Ssa.liveAfter(f, BlockId(bi), a.liveOut[bi])
-                    }
-                    Map.put(saves, at, callSave(a, i, after[k]))
-                }
-                None -> {}
-            }
-        }
-    }
+	let f = a.func
+	for var bi = 0; bi < len(f.blocks); bi = bi + 1 {
+		let insts = f.blocks[bi].insts
+		var after : Array (Array Int) = []
+		for var k = 0; k < len(insts); k = k + 1 {
+			let i = insts[k]
+			let key = match A.pollOf(i.op) {
+				Some((b, n)) -> Some((l.polls, positionKey(b, n)))
+				None ->
+					if Option.isSome(A.allocationOf(i.op))
+							|| Option.isSome(A.arrayAllocationOf(i.op)) {
+						Some((l.stubs, positionKey(bi, k)))
+					} else {
+						None
+					}
+			}
+			match key {
+				Some((saves, at)) -> {
+					if len(after) == 0 {
+						after = Ssa.liveAfter(f, BlockId(bi), a.liveOut[bi])
+					}
+					Map.put(saves, at, callSave(a, i, after[k]))
+				}
+				None -> {}
+			}
+		}
+	}
 }
 
 -- The caller-saved registers holding a value in `live` that `i` does not
 -- define. An allocation's stub writes its own result after the call, so that
 -- one needs no keeping, and restoring it would overwrite the result.
 fun callSave(a : Regalloc.Allocation, i : A.Inst, live : Array Int) -> CallSave {
-    let kept = []
-    for id in live {
-        if Ssa.anyDef(i, fun(d) = Ssa.valueId(d) == id) { continue }
-        match inRegister(a, id) {
-            Some(Physical(bank, number)) ->
-                if A.calleeSavedMask(bank) & (1 << number) == 0 {
-
-                    Vec.push(kept, Physical(bank, number))
-                }
-            _ -> {}
-        }
-    }
-    CallSave { kept = kept }
+	let kept = []
+	for id in live {
+		if Ssa.anyDef(i, fun(d) = Ssa.valueId(d) == id) { continue }
+		match inRegister(a, id) {
+			Some(Physical(bank, number)) ->
+				if A.calleeSavedMask(bank) & (1 << number) == 0 {
+					Vec.push(kept, Physical(bank, number))
+				}
+			_ -> {}
+		}
+	}
+	CallSave { kept = kept }
 }
 
 -- The register value `id` was coloured into, if it lives in one.
 fun inRegister(a : Regalloc.Allocation, id : Int) -> Option Reg {
-    let colour = a.colouring.of_[id]
-    if colour < 0 || Map.contains(a.spills.slots, id) { return None }
-    Some(Physical(A.bankOf(a.func.reps[id]), colour))
+	let colour = a.colouring.of_[id]
+	if colour < 0 || Map.contains(a.spills.slots, id) { return None }
+	Some(Physical(A.bankOf(a.func.reps[id]), colour))
 }
 
 -- The callee-saved pairs a function with these saved registers stores:
@@ -245,14 +261,14 @@ fun inRegister(a : Regalloc.Allocation, id : Int) -> Option Reg {
 -- partner as well, which costs no instruction, since a lone register would
 -- take a `str` of its own.
 fun savedPairs(gp : Vec Int, fp : Vec Int) -> Vec (Bank, Int) {
-    let out = []
-    for var r = 19; r < 29; r = r + 2 {
-        if Vec.contains(gp, r) || Vec.contains(gp, r + 1) { Vec.push(out, (Gp, r)) }
-    }
-    for var r = 8; r < 16; r = r + 2 {
-        if Vec.contains(fp, r) || Vec.contains(fp, r + 1) { Vec.push(out, (Fp, r)) }
-    }
-    out
+	let out = []
+	for var r = 19; r < 29; r = r + 2 {
+		if Vec.contains(gp, r) || Vec.contains(gp, r + 1) { Vec.push(out, (Gp, r)) }
+	}
+	for var r = 8; r < 16; r = r + 2 {
+		if Vec.contains(fp, r) || Vec.contains(fp, r + 1) { Vec.push(out, (Fp, r)) }
+	}
+	out
 }
 
 -- The callee-saved registers this function must save, in each file,
@@ -265,136 +281,148 @@ fun savedPairs(gp : Vec Int, fp : Vec Int) -> Vec (Bank, Int) {
 -- there in a function that may never have coloured anything into `x19` --
 -- and that function's own caller expects its `x19` back.
 fun calleeSaved(a : Regalloc.Allocation) -> (Vec Int, Vec Int) {
-    var gp = 0
-    var fp = 0
-    let of_ = a.colouring.of_
-    for var id = 0; id < len(of_); id = id + 1 {
-        let r = of_[id]
-        if r >= 0 {
-            match A.bankOf(a.func.reps[id]) {
-                Gp -> { gp = gp | 1 << r }
-                Fp -> { fp = fp | 1 << r }
-            }
-        }
-    }
-    for block in a.func.blocks {
-        for i in block.insts {
-            gp = gp | A.callClobbers(i.op, Gp)
-            fp = fp | A.callClobbers(i.op, Fp)
-        }
-    }
-    (registersIn(gp & A.calleeSavedMask(Gp)), registersIn(fp & A.calleeSavedMask(Fp)))
+	var gp = 0
+	var fp = 0
+	let of_ = a.colouring.of_
+	for var id = 0; id < len(of_); id = id + 1 {
+		let r = of_[id]
+		if r >= 0 {
+			match A.bankOf(a.func.reps[id]) {
+				Gp -> { gp = gp | 1 << r }
+				Fp -> { fp = fp | 1 << r }
+			}
+		}
+	}
+	for block in a.func.blocks {
+		for i in block.insts {
+			gp = gp | A.callClobbers(i.op, Gp)
+			fp = fp | A.callClobbers(i.op, Fp)
+		}
+	}
+	(registersIn(gp & A.calleeSavedMask(Gp)), registersIn(fp & A.calleeSavedMask(Fp)))
 }
 
 -- The register numbers in `mask`, ascending.
 fun registersIn(mask : Int) -> Vec Int {
-    let out = []
-    for var r = 0; r < 32; r = r + 1 {
-        if mask >> r & 1 != 0 { Vec.push(out, r) }
-    }
-    out
+	let out = []
+	for var r = 0; r < 32; r = r + 1 {
+		if mask >> r & 1 != 0 { Vec.push(out, r) }
+	}
+	out
 }
 
 --- Where a frame slot is, from `sp`. `None` for memory that is not a frame slot.
 fun offsetOf(l : Layout, m : Mem) -> Option Int = match m {
-    -- Every constructor is named, and a wildcard would be wrong here rather
-    -- than merely loose. `Mem` holds the symbolic slots and the real
-    -- addressing modes in one type, so the only thing that says a symbolic
-    -- slot has been resolved is that this function resolved it. Under
-    -- `_ -> None` a slot kind added later compiles clean, answers `None`, and
-    -- is emitted as though it were already an address -- which assembles,
-    -- links, and reads the wrong word. `verifyFrame` would not catch it
-    -- either: it range-checks the kinds it knows.
-    RootSlot(i) -> Some(l.rootsAt + 8 * i)
-    SpillSlot(i) -> Some(l.spillsAt + 8 * i)
-    ObjectSlot(n, k) -> Some(l.objectsAt + l.objectStarts[n] + k)
-    OutgoingArg(k) -> Some(8 * k)
-    IncomingArg(k) -> Some(l.size + 8 * k)
-    Offset(_, _) -> None
-    Indexed(_, _) -> None
-    Scaled(_, _, _) -> None
-    PageOffset(_, _) -> None
+	-- Every constructor is named, and a wildcard would be wrong here rather
+	-- than merely loose. `Mem` holds the symbolic slots and the real
+	-- addressing modes in one type, so the only thing that says a symbolic
+	-- slot has been resolved is that this function resolved it. Under
+	-- `_ -> None` a slot kind added later compiles clean, answers `None`, and
+	-- is emitted as though it were already an address -- which assembles,
+	-- links, and reads the wrong word. `verifyFrame` would not catch it
+	-- either: it range-checks the kinds it knows.
+	RootSlot(i)      -> Some(l.rootsAt + 8 * i)
+	SpillSlot(i)     -> Some(l.spillsAt + 8 * i)
+	ObjectSlot(n, k) -> Some(l.objectsAt + l.objectStarts[n] + k)
+	OutgoingArg(k)   -> Some(8 * k)
+	IncomingArg(k)   -> Some(l.size + 8 * k)
+	Offset(_, _)     -> None
+	Indexed(_, _)    -> None
+	Scaled(_, _, _)  -> None
+	PageOffset(_, _) -> None
 }
 
 --- Whether the layout is a frame, and the frame tables tell the truth.
-fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
-                l : Layout) -> Vec String {
-    -- A wrong offset here assembles, links and runs, and reads or writes some
-    -- other slot -- and a wrong frame-table entry is worse: the collector
-    -- frees something live, or reads a stale slot as a pointer, and only a
-    -- collection at that exact call finds out. So both are checked where they
-    -- are made.
-    let out : Vec String = []
-    let f = a.func
-    if l.size % 16 != 0 {
-        Vec.push(out, "the frame is " + Int.toString(l.size)
-                        + " bytes, not a multiple of 16")
-    }
-    if l.recordAt + 16 != l.size {
-        Vec.push(out, "the frame record is not at the top of the frame")
-    }
-    if l.savesAt + 16 * len(l.pairs) != l.recordAt {
-        Vec.push(out, "the callee-saved registers are not directly below the frame record")
-    }
-    if l.outgoing > l.objectsAt || l.objectsAt + l.objectBytes != l.spillsAt
-       || l.spillsAt + 8 * l.spills != l.rootsAt
-       || l.rootsAt + 8 * l.roots != l.savesAt {
-        Vec.push(out, "the frame's regions overlap or leave a gap")
-    }
-    -- Reserved registers: the scratch pair, the platform register, the frame
-    -- record's two. The colourer's pool excludes them; this is the check that
-    -- it still does.
-    let of_ = a.colouring.of_
-    for var id = 0; id < len(of_); id = id + 1 {
-        let r = of_[id]
-        match A.bankOf(f.reps[id]) {
-            Gp -> if r == 16 || r == 17 || r == 18 || r == 29 || r == 30 {
-                Vec.push(out, "value %" + Int.toString(id)
-                                + " is coloured into reserved x" + Int.toString(r))
-            }
-            Fp -> {}
-        }
-    }
-    let idom = Ssa.dominators(f)
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let insts = f.blocks[b].insts
-        for var n = 0; n < len(insts); n = n + 1 {
-            match A.memOf(insts[n].op) {
-                Some(m) -> checkSlot(out, l, m, b, n)
-                None -> {}
-            }
-            match A.safepointOf(insts[n].op) {
-                Some((lb, ln)) -> checkMap(out, a, frame, idom, b, n, lb, ln)
-                None -> {}
-            }
-        }
-    }
-    out
+fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame, l : Layout) -> Vec String {
+	-- A wrong offset here assembles, links and runs, and reads or writes some
+	-- other slot -- and a wrong frame-table entry is worse: the collector
+	-- frees something live, or reads a stale slot as a pointer, and only a
+	-- collection at that exact call finds out. So both are checked where they
+	-- are made.
+	let out : Vec String = []
+	let f = a.func
+	if l.size % 16 != 0 {
+		Vec.push(out, "the frame is " + Int.toString(l.size) + " bytes, not a multiple of 16")
+	}
+	if l.recordAt + 16 != l.size {
+		Vec.push(out, "the frame record is not at the top of the frame")
+	}
+	if l.savesAt + 16 * len(l.pairs) != l.recordAt {
+		Vec.push(out, "the callee-saved registers are not directly below the frame record")
+	}
+	if l.outgoing > l.objectsAt
+			|| l.objectsAt + l.objectBytes != l.spillsAt
+			|| l.spillsAt + 8 * l.spills != l.rootsAt
+			|| l.rootsAt + 8 * l.roots != l.savesAt {
+		Vec.push(out, "the frame's regions overlap or leave a gap")
+	}
+	-- Reserved registers: the scratch pair, the platform register, the frame
+	-- record's two. The colourer's pool excludes them; this is the check that
+	-- it still does.
+	let of_ = a.colouring.of_
+	for var id = 0; id < len(of_); id = id + 1 {
+		let r = of_[id]
+		match A.bankOf(f.reps[id]) {
+			Gp -> if r == 16 || r == 17 || r == 18 || r == 29 || r == 30 {
+				Vec.push(
+					out,
+					"value %" + Int.toString(id) + " is coloured into reserved x" + Int.toString(r),
+				)
+			}
+			Fp -> {}
+		}
+	}
+	let idom = Ssa.dominators(f)
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let insts = f.blocks[b].insts
+		for var n = 0; n < len(insts); n = n + 1 {
+			match A.memOf(insts[n].op) {
+				Some(m) -> checkSlot(out, l, m, b, n)
+				None    -> {}
+			}
+			match A.safepointOf(insts[n].op) {
+				Some((lb, ln)) -> checkMap(out, a, frame, idom, b, n, lb, ln)
+				None           -> {}
+			}
+		}
+	}
+	out
 }
 
 fun checkSlot(out : Vec String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
-    let within = match m {
-        RootSlot(i) -> i >= 0 && i < l.roots
-        SpillSlot(i) -> i >= 0 && i < l.spills
-        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts) && k >= 0
-                            && l.objectStarts[n] + k
-                               < (if n + 1 < len(l.objectStarts) {
-                                      l.objectStarts[n + 1]
-                                  } else { l.objectBytes })
-        OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
-        IncomingArg(k) -> k >= 0
-        -- Named rather than a wildcard, for the reason `offsetOf` gives: a
-        -- slot kind added later would default to "inside the frame", which is
-        -- the answer that keeps this verifier quiet about it.
-        Offset(_, _) -> True
-        Indexed(_, _) -> True
-        Scaled(_, _, _) -> True
-        PageOffset(_, _) -> True
-    }
-    if !within {
-        Vec.push(out, show(m) + " at b" + Int.toString(b) + " instruction "
-                        + Int.toString(n) + " is outside the frame")
-    }
+	let within = match m {
+		RootSlot(i)  -> i >= 0 && i < l.roots
+		SpillSlot(i) -> i >= 0 && i < l.spills
+		ObjectSlot(n, k) -> n >= 0
+			&& n < len(l.objectStarts)
+			&& k >= 0
+			&& l.objectStarts[n] + k
+				< (if n + 1 < len(l.objectStarts) {
+					l.objectStarts[n + 1]
+				} else {
+					l.objectBytes
+				})
+		OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
+		IncomingArg(k) -> k >= 0
+		-- Named rather than a wildcard, for the reason `offsetOf` gives: a
+		-- slot kind added later would default to "inside the frame", which is
+		-- the answer that keeps this verifier quiet about it.
+		Offset(_, _)     -> True
+		Indexed(_, _)    -> True
+		Scaled(_, _, _)  -> True
+		PageOffset(_, _) -> True
+	}
+	if !within {
+		Vec.push(
+			out,
+			show(m)
+				+ " at b"
+				+ Int.toString(b)
+				+ " instruction "
+				+ Int.toString(n)
+				+ " is outside the frame",
+		)
+	}
 }
 
 -- A frame-table entry is true if the call before it is a call, and every root
@@ -402,46 +430,63 @@ fun checkSlot(out : Vec String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
 -- block or in a block that dominates it, or spilled into that slot at its
 -- definition. Each slot belongs to one value, so a store into it is a store of
 -- that value.
-fun checkMap(out : Vec String, a : Regalloc.Allocation, frame : Roots.Frame,
-             idom : Array (Option Int), b : Int, n : Int, lb : Int, ln : Int) -> Unit {
-    let at = "b" + Int.toString(b) + " instruction " + Int.toString(n)
-    let blocks = a.func.blocks
-    if n == 0 || !A.isCall(blocks[b].insts[n - 1]) {
-        Vec.push(out, "the safepoint map at " + at + " does not follow a call")
-    }
-    for (slot, id) in Roots.liveAt(frame, lb, ln) {
-        let want = show(RootSlot(slot))
-        let spilled = match Map.get(a.spills.slots, id) {
-            Some(m) -> show(m) == want
-            None -> False
-        }
-        var stored = spilled || storesInto(blocks[b].insts, want, n)
-        var here = b
-        while !stored {
-            match idom[here] {
-                Some(up) -> if up == here { break } else {
-                    here = up
-                    stored = storesInto(blocks[up].insts, want, len(blocks[up].insts))
-                }
-                None -> break
-            }
-        }
-        if !stored {
-            Vec.push(out, "root slot " + Int.toString(slot) + " (%"
-                            + Int.toString(id) + ") is in the map at " + at
-                            + " but no store into it dominates the call")
-        }
-    }
+fun checkMap(
+	out : Vec String,
+	a : Regalloc.Allocation,
+	frame : Roots.Frame,
+	idom : Array (Option Int),
+	b : Int,
+	n : Int,
+	lb : Int,
+	ln : Int,
+) -> Unit {
+	let at = "b" + Int.toString(b) + " instruction " + Int.toString(n)
+	let blocks = a.func.blocks
+	if n == 0 || !A.isCall(blocks[b].insts[n - 1]) {
+		Vec.push(out, "the safepoint map at " + at + " does not follow a call")
+	}
+	for (slot, id) in Roots.liveAt(frame, lb, ln) {
+		let want = show(RootSlot(slot))
+		let spilled = match Map.get(a.spills.slots, id) {
+			Some(m) -> show(m) == want
+			None    -> False
+		}
+		var stored = spilled || storesInto(blocks[b].insts, want, n)
+		var here = b
+		while !stored {
+			match idom[here] {
+				Some(up) -> if up == here {
+					break
+				} else {
+					here = up
+					stored = storesInto(blocks[up].insts, want, len(blocks[up].insts))
+				}
+				None -> break
+			}
+		}
+		if !stored {
+			Vec.push(
+				out,
+				"root slot "
+					+ Int.toString(slot)
+					+ " (%"
+					+ Int.toString(id)
+					+ ") is in the map at "
+					+ at
+					+ " but no store into it dominates the call",
+			)
+		}
+	}
 }
 
 -- Whether one of the first `before` instructions stores into the slot `want`
 -- names.
 fun storesInto(insts : Vec A.Inst, want : String, before : Int) -> Bool {
-    for var k = 0; k < before; k = k + 1 {
-        match A.slotStore(insts[k].op) {
-            Some((_, m)) -> if show(m) == want { return True }
-            None -> {}
-        }
-    }
-    False
+	for var k = 0; k < before; k = k + 1 {
+		match A.slotStore(insts[k].op) {
+			Some((_, m)) -> if show(m) == want { return True }
+			None         -> {}
+		}
+	}
+	False
 }

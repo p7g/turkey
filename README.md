@@ -395,12 +395,30 @@ alongside one page per module and the JSON. The same site is published to
 
 ### Formatting
 
-`turkey fmt FILE...` rewrites each file in the one style, and
-`turkey fmt --check FILE...` only names the files it would change, exiting 1 if
-there is one. There are no options. The style is specified by the pairs in
-`tests/fmt/`: each `NAME.gob` and the `NAME.expected.gob` it formats to. The
+`turkey format FILE...` rewrites each file in the one style, and
+`turkey format --check FILE...` only names the files it would change, exiting 1
+if there is one. There are no options. The style is specified by the pairs in
+`tests/format/`: each `NAME.gob` and the `NAME.expected.gob` it formats to. The
 formatter refuses a file, with an internal error naming it, unless its output
 parses to the same tree, holds the same comments, and formats to itself.
+
+Every `.gob` file under `lib/`, `src/` and `examples/` is formatted, and CI
+fails on one that is not. Run `turkey format` on the files you change before
+committing:
+
+```bash
+build/stages/turkey format $(git ls-files 'lib/*.gob' 'src/*.gob' 'examples/*.gob')
+```
+
+`tests/` is left as written, since its goldens record positions and source
+lines of its own files.
+
+CI also fails on a lint warning in `src/` or `lib/`, which checking the
+compiler lints as its own code:
+
+```bash
+build/stages/turkey check --deny-warnings src/Main.gob
+```
 
 ## Project status
 

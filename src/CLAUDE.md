@@ -6,6 +6,13 @@ fix once and expensive to fix in ten thousand lines.
 
 Where a rule is about the *language* rather than about taste, it says so.
 
+## Layout
+
+Layout is whatever `turkey format` prints, and CI checks it: indentation, line
+breaks, spacing, alignment and commas are not decided here. Run `turkey format`
+on a file after editing it rather than laying it out by hand. The rules below
+are about which constructs to write, not how to lay them out.
+
 ## Imports
 
 **Rely on the automatic Prelude.** Every module that does not say otherwise

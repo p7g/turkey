@@ -1,8 +1,38 @@
 export (
-    Doc, Row(..), RowKind(..),
-    empty, text, raw, line, softline, hard, cat, nest, group, forced, ifBreak, suffix,
-    lastSuffix, choice, fill, rows, flat, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
-    shifted, Pad(..), PadKind(..), renderPadded, realigned,
+	Doc,
+	Row(..),
+	RowKind(..),
+	empty,
+	text,
+	raw,
+	line,
+	softline,
+	hard,
+	cat,
+	nest,
+	group,
+	forced,
+	ifBreak,
+	suffix,
+	lastSuffix,
+	choice,
+	fill,
+	rows,
+	flat,
+	below,
+	headed,
+	isEmpty,
+	isHard,
+	breakable,
+	forceTail,
+	render,
+	renderFlat,
+	columns,
+	shifted,
+	Pad(..),
+	PadKind(..),
+	renderPadded,
+	realigned,
 )
 
 --- Documents to lay out, and the layout: a Wadler–Leijen printer.
@@ -24,31 +54,38 @@ export (
 
 --- A document.
 type Doc
-    = Empty
-    -- Text and its width, which holds no newline and no tab.
-    | Text(String, Int)
-    -- Text whose lines after the first are printed as they are, without the
-    -- indent: the inside of a block comment.
-    | Raw(String)
-    -- Text whose lines after the first begin with the indent of its first line
-    -- in the source, which is replaced with the indent it is printed at.
-    | Shifted(String, String)
-    -- A break: a newline in a broken group, and this text in a flat one.
-    | Line(String)
-    | Hard
-    -- The parts, and whether any of them is hard.
-    | Cat(Vec Doc, Bool)
-    | Nest(Int, Doc)
-    -- Whether the group breaks whatever the width, and its contents.
-    | Group(Bool, Doc)
-    -- What to print in a broken group, and what in a flat one.
-    | IfBreak(Doc, Doc)
-    -- Text deferred to the end of the line, and whether it ends the line.
-    | Suffix(String, Bool)
-    | Choice(Vec Doc)
-    | Fill(Vec Doc)
-    | Rows(Vec Row)
-    | Flat(Doc)
+	= Empty
+	-- Text and its width, which holds no newline and no tab.
+	| Text(String, Int)
+	-- Text whose lines after the first are printed as they are, without the
+	-- indent: the inside of a block comment.
+	| Raw(String)
+	-- Text whose lines after the first begin with the indent of its first line
+	-- in the source, which is replaced with the indent it is printed at.
+	| Shifted(String, String)
+	-- A break: a newline in a broken group, and this text in a flat one.
+	| Line(String)
+	| Hard
+	-- The parts, and whether any of them is hard.
+	| Cat(Vec Doc, Bool)
+	| Nest(Int, Doc)
+	-- Whether the group breaks whatever the width, and its contents.
+	| Group(Bool, Doc)
+	-- What to print in a broken group, and what in a flat one.
+	| IfBreak(Doc, Doc)
+	-- Text deferred to the end of the line, and whether it ends the line.
+	| Suffix(String, Bool)
+	| Choice(Vec Doc)
+	| Fill(Vec Doc)
+	| Rows(Vec Row)
+	| Flat(Doc)
+	-- A line break, this many tabs deeper, then the document.
+	| Below(Int, Doc)
+	-- A group that always breaks, which `forceTail` made of the last group of
+	-- a spine: where the head before it ends, for `headed`.
+	| Tail(Doc)
+	-- An alternative of a choice measured by its head.
+	| Headed(Doc)
 
 --- One line of `rows`, or several when a row breaks. A row is `left` and then
 --- `right`; an `Aligned` row's `right` starts at the same column as the other
@@ -78,7 +115,7 @@ fun raw(s : String) -> Doc = if String.contains(s, "\n") { Raw(s) } else { text(
 --- the first line is printed at in its place, and the rest of the line as it
 --- is. So the lines keep their places relative to the first.
 fun shifted(s : String, indent : String) -> Doc =
-    if String.contains(s, "\n") { Shifted(s, indent) } else { text(s) }
+	if String.contains(s, "\n") { Shifted(s, indent) } else { text(s) }
 
 --- A break that is a space when flat.
 let line = Line(" ")
@@ -92,13 +129,13 @@ let hard = Hard
 
 --- Returns `parts` one after another.
 fun cat(parts : Vec Doc) -> Doc {
-    let kept = Vec.filter(parts, fun(d) = match d {
-        Empty -> False
-        _ -> True
-    })
-    if len(kept) == 0 { return Empty }
-    if len(kept) == 1 { return kept[0] }
-    Cat(kept, Iter.any(kept, isHard))
+	let kept = Vec.filter(parts, fun(d) = match d {
+		Empty -> False
+		_     -> True
+	})
+	if len(kept) == 0 { return Empty }
+	if len(kept) == 1 { return kept[0] }
+	Cat(kept, Iter.any(kept, isHard))
 }
 
 --- Returns `d` with every line break inside it indented `n` tabs further.
@@ -141,53 +178,83 @@ fun rows(table : Vec Row) -> Doc = Rows(table)
 --- hold no suffix but at its end.
 fun flat(d : Doc) -> Doc = Flat(d)
 
+--- Returns a line break `n` tabs deeper and then `d`. As an alternative of a
+--- choice other than the last, it is taken when the first line of `d` fits on
+--- the new line, or its head when `d` is `headed`, where any other
+--- alternative is taken when it fits on the line it starts on.
+fun below(n : Int, d : Doc) -> Doc = Below(n, d)
+
+--- Returns `d`, which ends in what `forceTail` made to break. As an
+--- alternative of a choice other than the last, it is taken when its head
+--- fits: the text before that part, laid out flat whatever its groups say.
+--- The head is measured flat because a group in it that breaks may have been
+--- broken by an earlier layout that did not take this alternative.
+fun headed(d : Doc) -> Doc = Headed(d)
+
 --- Returns whether `d` is the empty document.
 fun isEmpty(d : Doc) -> Bool = match d {
-    Empty -> True
-    _ -> False
+	Empty -> True
+	_     -> False
 }
 
 --- Returns whether `d` cannot be laid out on one line.
 fun isHard(d : Doc) -> Bool = match d {
-    Empty | Text(_, _) | Line(_) -> False
-    Raw(s) | Shifted(s, _) -> String.contains(s, "\n")
-    Hard | Suffix(_, _) | Rows(_) -> True
-    Cat(_, h) -> h
-    Nest(_, inner) | Flat(inner) -> isHard(inner)
-    Group(breaks, _) -> breaks
-    -- A broken group does what its broken text says, so only the flat text
-    -- decides whether the group can be flat.
-    IfBreak(_, whenFlat) -> isHard(whenFlat)
-    Choice(alternatives) -> isHard(alternatives[0])
-    Fill(items) -> Iter.any(items, isHard)
+	Empty | Text(_, _) | Line(_)                          -> False
+	Raw(s) | Shifted(s, _)                                -> String.contains(s, "\n")
+	Hard | Suffix(_, _) | Rows(_) | Below(_, _) | Tail(_) -> True
+	Cat(_, h)                                             -> h
+	Nest(_, inner) | Flat(inner) | Headed(inner)          -> isHard(inner)
+	Group(breaks, _)                                      -> breaks
+	-- A broken group does what its broken text says, so only the flat text
+	-- decides whether the group can be flat.
+	IfBreak(_, whenFlat) -> isHard(whenFlat)
+	Choice(alternatives) -> isHard(alternatives[0])
+	Fill(items)          -> Iter.any(items, isHard)
 }
 
 --- Returns whether `d` has a place it can break.
 fun breakable(d : Doc) -> Bool = match d {
-    Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_, _) | Flat(_) -> False
-    Line(_) | Hard | Group(_, _) | IfBreak(_, _) | Choice(_) | Fill(_) | Rows(_) -> True
-    Cat(parts, _) -> Iter.any(parts, breakable)
-    Nest(_, inner) -> breakable(inner)
+	Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_, _) | Flat(_) -> False
+	Line(_)
+	| Hard
+	| Group(_, _)
+	| IfBreak(_, _)
+	| Choice(_)
+	| Fill(_)
+	| Rows(_)
+	| Below(_, _)
+	| Tail(_) -> True
+	Cat(parts, _)                  -> Iter.any(parts, breakable)
+	Nest(_, inner) | Headed(inner) -> breakable(inner)
 }
 
 --- Returns `d` with the last group of its spine made to break: the group that
---- a call hugging `d` as its last argument wants broken.
+--- a call hugging `d` as its last argument wants broken. A choice at the end
+--- of the spine loses its first alternative, the one laid out flat.
 fun forceTail(d : Doc) -> Doc = match d {
-    Group(_, inner) -> Group(True, inner)
-    Cat(parts, _) -> {
-        let copy = Vec.slice(parts, 0, len(parts))
-        copy[len(copy) - 1] = forceTail(copy[len(copy) - 1])
-        Cat(copy, True)
-    }
-    Nest(n, inner) -> Nest(n, forceTail(inner))
-    _ -> d
+	Group(_, inner) -> Tail(inner)
+	Tail(_)         -> d
+	Headed(inner)   -> Headed(forceTail(inner))
+	Choice(alternatives) -> if len(alternatives) > 1 {
+		Choice(Vec.slice(alternatives, 1, len(alternatives)))
+	} else {
+		d
+	}
+	Cat(parts, _) -> {
+		let copy = Vec.slice(parts, 0, len(parts))
+		copy[len(copy) - 1] = forceTail(copy[len(copy) - 1])
+		Cat(copy, True)
+	}
+	Nest(n, inner)  -> Nest(n, forceTail(inner))
+	Below(n, inner) -> Below(n, forceTail(inner))
+	_               -> d
 }
 
 --- Returns how many columns `s` takes, a tab counting for `tabWidth`.
 fun columns(s : String) -> Int {
-    var n = 0
-    for c in String.codePoints(s) { n = n + if c == '\t' { tabWidth } else { 1 } }
-    n
+	var n = 0
+	for c in String.codePoints(s) { n = n + if c == '\t' { tabWidth } else { 1 } }
+	n
 }
 
 -- -- layout -------------------------------------------------------------------------
@@ -202,14 +269,14 @@ type Cmd = Cmd { indent : Int, mode : Mode, doc : Doc }
 -- being written, which is trimmed of trailing space when it ends; `pending`
 -- holds the suffixes waiting for it to end.
 type P = P {
-    width       : Int,
-    done        : Vec String,
-    var parts   : Vec String,
-    var pos     : Int,
-    var pending : Vec String,
-    -- Whether the last of `pending` ends its line.
-    var ends    : Bool,
-    marks       : Marks,
+	width       : Int
+	done        : Vec String
+	var parts   : Vec String
+	var pos     : Int
+	var pending : Vec String
+	-- Whether the last of `pending` ends its line.
+	var ends : Bool
+	marks    : Marks
 }
 
 -- Whether the printer marks the padding it aligns lines with, and the number
@@ -223,12 +290,12 @@ type Marks = Marks { on : Bool, var runs : Int }
 --- `notes` holds the text the pad holds besides its spaces, as `realigned`
 --- lays it out.
 type Pad = Pad {
-    line      : Int,
-    var col   : Int,
-    var width : Int,
-    run       : Int,
-    kind      : PadKind,
-    var notes : Vec String,
+	line      : Int
+	var col   : Int
+	var width : Int
+	run       : Int
+	kind      : PadKind
+	var notes : Vec String
 }
 
 --- What a pad aligns. `Tokens` pads the `left` of an aligned row so that
@@ -246,34 +313,37 @@ fun render(d : Doc, width : Int) -> String = String.join(laidLines(d, width, Fal
 --- that the text of `d` holds no code point from U+F0000 on, which mark the
 --- padding while the layout runs.
 fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
-    let lines = laidLines(d, width, True)
-    let pads = []
-    for var i = 0; i < len(lines); i = i + 1 {
-        if !String.contains(lines[i], closeMark) { continue }
-        let cs = String.toCodePoints(lines[i])
-        let kept = []
-        var open = None
-        for c in cs {
-            let n = Char.toInt(c)
-            if n == markBase {
-                if let Some((id, col)) = open {
-                    let inside = String.trim(String.fromCodePoints(Vec.slice(kept, col, len(kept))))
-                    Vec.push(pads, Pad {
-                        line = i + 1, col = col, width = len(kept) - col, run = id / 2,
-                        kind = if id % 2 == 0 { Tokens } else { Suffixes },
-                        notes = if inside == "" { [] } else { [inside] },
-                    })
-                }
-                open = None
-            } else if n > markBase {
-                open = Some((n - markBase - 1, len(kept)))
-            } else {
-                Vec.push(kept, c)
-            }
-        }
-        lines[i] = String.fromCodePoints(kept)
-    }
-    (lines, pads)
+	let lines = laidLines(d, width, True)
+	let pads = []
+	for var i = 0; i < len(lines); i = i + 1 {
+		if !String.contains(lines[i], closeMark) { continue }
+		let cs = String.toCodePoints(lines[i])
+		let kept = []
+		var open = None
+		for c in cs {
+			let n = Char.toInt(c)
+			if n == markBase {
+				if let Some((id, col)) = open {
+					let inside = String.trim(String.fromCodePoints(Vec.slice(kept, col, len(kept))))
+					Vec.push(pads, Pad {
+						line  = i + 1
+						col   = col
+						width = len(kept) - col
+						run   = id / 2
+						kind  = if id % 2 == 0 { Tokens } else { Suffixes }
+						notes = if inside == "" { [] } else { [inside] }
+					})
+				}
+				open = None
+			} else if n > markBase {
+				open = Some((n - markBase - 1, len(kept)))
+			} else {
+				Vec.push(kept, c)
+			}
+		}
+		lines[i] = String.fromCodePoints(kept)
+	}
+	(lines, pads)
 }
 
 --- Returns `lines` with the pads `pads` describes set again, so that each run
@@ -286,61 +356,69 @@ fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
 --- for `Tokens` and a space for `Suffixes`. `Tokens` pads are set before
 --- `Suffixes` pads, which they move. Updates `pads` to match.
 fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
-    let out = Vec.slice(lines, 0, len(lines))
-    let onLine : Map Int (Vec Pad) = Map.new()
-    for pad in pads {
-        let here = Map.getOr(onLine, pad.line, [])
-        Vec.push(here, pad)
-        Map.put(onLine, pad.line, here)
-    }
-    for suffixes in [False, True] {
-        let runs : Map Int (Vec Pad) = Map.new()
-        for pad in pads {
-            if isSuffixes(pad.kind) == suffixes {
-                let run = Map.getOr(runs, pad.run, [])
-                Vec.push(run, pad)
-                Map.put(runs, pad.run, run)
-            }
-        }
-        for (_, run) in Map.entries(runs) {
-            let before = fun(pad : Pad) = columns(String.fromCodePoints(
-                Array.slice(String.toCodePoints(out[pad.line - 1]), 0, pad.col)))
-            let noted = fun(pad : Pad) =
-                if len(pad.notes) == 0 { "" } else { " " + String.join(pad.notes, " ") }
-            var widest = 0
-            for pad in run { widest = larger(widest, before(pad)) }
-            var widestNoted = widest
-            for pad in run { widestNoted = larger(widestNoted, widest + columns(noted(pad))) }
-            for pad in run {
-                let least = if suffixes { 1 } else { 0 }
-                let notes = noted(pad)
-                let filled = String.repeat(" ", widest - before(pad)) + notes
-                    + String.repeat(" ", widestNoted - widest - columns(notes) + least)
-                let cs = String.toCodePoints(out[pad.line - 1])
-                out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col)) + filled
-                    + String.fromCodePoints(Array.slice(cs, pad.col + pad.width, len(cs)))
-                let wanted = String.codePointCount(filled)
-                let moved = wanted - pad.width
-                for other in Map.getOr(onLine, pad.line, []) {
-                    if other.col > pad.col { other.col = other.col + moved }
-                }
-                pad.width = wanted
-            }
-        }
-    }
-    out
+	let out = Vec.slice(lines, 0, len(lines))
+	let onLine : Map Int (Vec Pad) = Map.new()
+	for pad in pads {
+		let here = Map.getOr(onLine, pad.line, [])
+		Vec.push(here, pad)
+		Map.put(onLine, pad.line, here)
+	}
+	for suffixes in [False, True] {
+		let runs : Map Int (Vec Pad) = Map.new()
+		for pad in pads {
+			if isSuffixes(pad.kind) == suffixes {
+				let run = Map.getOr(runs, pad.run, [])
+				Vec.push(run, pad)
+				Map.put(runs, pad.run, run)
+			}
+		}
+		for (_, run) in Map.entries(runs) {
+			let before = fun(pad : Pad) = columns(
+				String.fromCodePoints(
+					Array.slice(String.toCodePoints(out[pad.line - 1]), 0, pad.col),
+				),
+			)
+			let noted = fun(pad : Pad) = if len(pad.notes) == 0 {
+				""
+			} else {
+				" " + String.join(pad.notes, " ")
+			}
+			var widest = 0
+			for pad in run { widest = larger(widest, before(pad)) }
+			var widestNoted = widest
+			for pad in run { widestNoted = larger(widestNoted, widest + columns(noted(pad))) }
+			for pad in run {
+				let least = if suffixes { 1 } else { 0 }
+				let notes = noted(pad)
+				let filled = String.repeat(" ", widest - before(pad))
+					+ notes
+					+ String.repeat(" ", widestNoted - widest - columns(notes) + least)
+				let cs = String.toCodePoints(out[pad.line - 1])
+				out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col))
+					+ filled
+					+ String.fromCodePoints(Array.slice(cs, pad.col + pad.width, len(cs)))
+				let wanted = String.codePointCount(filled)
+				let moved = wanted - pad.width
+				for other in Map.getOr(onLine, pad.line, []) {
+					if other.col > pad.col { other.col = other.col + moved }
+				}
+				pad.width = wanted
+			}
+		}
+	}
+	out
 }
 
 fun isSuffixes(k : PadKind) -> Bool = match k {
-    Tokens -> False
-    Suffixes -> True
+	Tokens   -> False
+	Suffixes -> True
 }
 
 fun laidLines(d : Doc, width : Int, marking : Bool) -> Vec String {
-    let p = printer(width, 0, Marks { on = marking, runs = 0 })
-    layout(p, Cmd { indent = 0, mode = Breaking, doc = d })
-    flushPending(p)
-    finish(p)
+	let p = printer(width, 0, Marks { on = marking, runs = 0 })
+	layout(p, Cmd { indent = 0, mode = Breaking, doc = d })
+	flushPending(p)
+	finish(p)
 }
 
 -- The code point that ends a pad's mark, and after which the code points that
@@ -350,7 +428,8 @@ let markBase = 0xF0000
 
 let closeMark = mark(markBase)
 
-fun mark(code : Int) -> String = Char.toString(Option.expect(Char.fromInt(code), "a mark is a scalar value"))
+fun mark(code : Int) -> String =
+	Char.toString(Option.expect(Char.fromInt(code), "a mark is a scalar value"))
 
 -- The highest number a mark can carry.
 let marksAvailable = 0x10FFFD - markBase - 1
@@ -360,180 +439,205 @@ let marksAvailable = 0x10FFFD - markBase - 1
 -- when marks are off or run out. Numbers a pad's kind with its run, since a
 -- line can hold one of each.
 fun padding(p : P, run : Int, kind : PadKind, filled : String) -> String {
-    let id = run * 2 + if isSuffixes(kind) { 1 } else { 0 }
-    if !p.marks.on || run < 0 || id >= marksAvailable { return filled }
-    mark(markBase + 1 + id) + filled + closeMark
+	let id = run * 2 + if isSuffixes(kind) { 1 } else { 0 }
+	if !p.marks.on || run < 0 || id >= marksAvailable { return filled }
+	mark(markBase + 1 + id) + filled + closeMark
 }
 
 -- A new run of aligned lines, or -1 when marks are off.
 fun newRun(p : P) -> Int {
-    if !p.marks.on { return -1 }
-    let run = p.marks.runs
-    p.marks.runs = run + 1
-    run
+	if !p.marks.on { return -1 }
+	let run = p.marks.runs
+	p.marks.runs = run + 1
+	run
 }
 
 -- How many columns `s` takes, leaving out the marks of pads.
 fun measured(p : P, s : String) -> Int {
-    if !p.marks.on { return columns(s) }
-    var n = 0
-    for c in String.codePoints(s) {
-        if Char.toInt(c) < markBase { n = n + if c == '\t' { tabWidth } else { 1 } }
-    }
-    n
+	if !p.marks.on { return columns(s) }
+	var n = 0
+	for c in String.codePoints(s) {
+		if Char.toInt(c) < markBase { n = n + if c == '\t' { tabWidth } else { 1 } }
+	}
+	n
 }
 
 --- Returns `d` laid out on one line, without the suffixes it defers.
 fun renderFlat(d : Doc) -> String {
-    let p = printer(1000000, 0, Marks { on = False, runs = 0 })
-    layout(p, Cmd { indent = 0, mode = Squashing, doc = d })
-    String.join(finish(p), "\n")
+	let p = printer(1000000, 0, Marks { on = False, runs = 0 })
+	layout(p, Cmd { indent = 0, mode = Squashing, doc = d })
+	String.join(finish(p), "\n")
 }
 
 fun printer(width : Int, pos : Int, marks : Marks) -> P =
-    P { width = width, done = [], parts = [], pos = pos, pending = [], ends = False, marks = marks }
+	P { width = width, done = [], parts = [], pos = pos, pending = [], ends = False, marks = marks }
 
 -- The lines written, the last ended where the printer stopped.
 fun finish(p : P) -> Vec String {
-    Vec.push(p.done, String.trimEnd(String.join(p.parts, "")))
-    p.done
+	Vec.push(p.done, String.trimEnd(String.join(p.parts, "")))
+	p.done
 }
 
 fun emit(p : P, s : String, w : Int) -> Unit {
-    Vec.push(p.parts, s)
-    p.pos = p.pos + w
+	Vec.push(p.parts, s)
+	p.pos = p.pos + w
 }
 
 -- Ends the line being written with the suffixes waiting for it, one space
 -- after its last text.
 fun flushPending(p : P) -> Unit {
-    if len(p.pending) > 0 {
-        let text = String.trimEnd(String.join(p.parts, ""))
-        p.parts = [text + " " + String.join(p.pending, " ")]
-        p.pending = []
-        p.ends = False
-    }
+	if len(p.pending) > 0 {
+		let text = String.trimEnd(String.join(p.parts, ""))
+		p.parts = [text + " " + String.join(p.pending, " ")]
+		p.pending = []
+		p.ends = False
+	}
 }
 
 -- Ends the line and starts the next at `indent`.
 fun endLine(p : P) -> Unit {
-    flushPending(p)
-    Vec.push(p.done, String.trimEnd(String.join(p.parts, "")))
-    p.parts = []
-    p.pos = 0
+	flushPending(p)
+	Vec.push(p.done, String.trimEnd(String.join(p.parts, "")))
+	p.parts = []
+	p.pos = 0
 }
 
 fun newline(p : P, indent : Int) -> Unit {
-    endLine(p)
-    emit(p, String.repeat("\t", indent), indent * tabWidth)
+	endLine(p)
+	emit(p, String.repeat("\t", indent), indent * tabWidth)
 }
 
 -- Writes `ls`, whose lines after the first are complete with their indent and
 -- trimmed. Each of those but the last is kept as it is rather than copied, so
 -- rows inside rows cost no more than rows.
 fun emitLines(p : P, ls : Vec String) -> Unit {
-    if len(ls) == 0 { return }
-    emit(p, ls[0], measured(p, ls[0]))
-    if len(ls) == 1 { return }
-    endLine(p)
-    for var i = 1; i + 1 < len(ls); i = i + 1 { Vec.push(p.done, ls[i]) }
-    let last = ls[len(ls) - 1]
-    emit(p, last, measured(p, last))
+	if len(ls) == 0 { return }
+	emit(p, ls[0], measured(p, ls[0]))
+	if len(ls) == 1 { return }
+	endLine(p)
+	for var i = 1; i + 1 < len(ls); i = i + 1 { Vec.push(p.done, ls[i]) }
+	let last = ls[len(ls) - 1]
+	emit(p, last, measured(p, last))
 }
 
 fun push(stack : Vec Cmd, indent : Int, mode : Mode, d : Doc) -> Unit =
-    Vec.push(stack, Cmd { indent = indent, mode = mode, doc = d })
+	Vec.push(stack, Cmd { indent = indent, mode = mode, doc = d })
 
 fun layout(p : P, start : Cmd) -> Unit {
-    let stack = [start]
-    while let Some(c) = Vec.pop(stack) {
-        let Cmd { indent, mode, doc } = c
-        match doc {
-            Empty -> {}
-            Text(s, w) -> emit(p, s, w)
-            Raw(s) -> emitLines(p, String.lines(s))
-            Shifted(s, from) -> {
-                let ls = String.lines(s)
-                let to = String.repeat("\t", indent)
-                for var i = 1; i < len(ls); i = i + 1 {
-                    if let Some(rest) = String.stripPrefix(ls[i], from) { ls[i] = to + rest }
-                }
-                emitLines(p, ls)
-            }
-            Line(whenFlat) -> match mode {
-                Breaking -> newline(p, indent)
-                _ -> emit(p, whenFlat, String.codePointCount(whenFlat))
-            }
-            Hard -> match mode {
-                Squashing -> emit(p, " ", 1)
-                _ -> newline(p, indent)
-            }
-            Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
-                push(stack, indent, mode, parts[i])
-            }
-            Nest(n, inner) -> push(stack, indent + n, mode, inner)
-            Group(breaks, inner) -> match mode {
-                Squashing -> push(stack, indent, Squashing, inner)
-                Flattening -> push(stack, indent, if breaks { Breaking } else { Flattening }, inner)
-                Breaking -> {
-                    let next = Cmd { indent = indent, mode = Flattening, doc = inner }
-                    if !breaks && fits(p, next, stack) { Vec.push(stack, next) }
-                    else { push(stack, indent, Breaking, inner) }
-                }
-            }
-            IfBreak(broken, whenFlat) -> match mode {
-                Breaking -> push(stack, indent, mode, broken)
-                _ -> push(stack, indent, mode, whenFlat)
-            }
-            Suffix(s, ends) -> {
-                Vec.push(p.pending, s)
-                p.ends = ends
-            }
-            Choice(alternatives) -> match mode {
-                Breaking -> Vec.push(stack, chosen(p, indent, alternatives, stack))
-                _ -> push(stack, indent, mode, alternatives[0])
-            }
-            Fill(items) -> match mode {
-                Breaking -> fillLine(p, indent, items)
-                _ -> for var i = len(items) - 1; i >= 0; i = i - 1 {
-                    push(stack, indent, mode, items[i])
-                    if i > 0 { push(stack, indent, mode, Text(" ", 1)) }
-                }
-            }
-            Rows(table) -> match mode {
-                Squashing -> push(stack, indent, Squashing, squashed(table))
-                _ -> printRows(p, indent, table)
-            }
-            Flat(inner) -> push(stack, indent, Squashing, inner)
-        }
-    }
+	let stack = [start]
+	while let Some(c) = Vec.pop(stack) {
+		let Cmd { indent, mode, doc } = c
+		match doc {
+			Empty      -> {}
+			Text(s, w) -> emit(p, s, w)
+			Raw(s)     -> emitLines(p, String.lines(s))
+			Shifted(s, from) -> {
+				let ls = String.lines(s)
+				let to = String.repeat("\t", indent)
+				for var i = 1; i < len(ls); i = i + 1 {
+					if let Some(rest) = String.stripPrefix(ls[i], from) { ls[i] = to + rest }
+				}
+				emitLines(p, ls)
+			}
+			Line(whenFlat) -> match mode {
+				Breaking -> newline(p, indent)
+				_        -> emit(p, whenFlat, String.codePointCount(whenFlat))
+			}
+			Hard -> match mode {
+				Squashing -> emit(p, " ", 1)
+				_         -> newline(p, indent)
+			}
+			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
+				push(stack, indent, mode, parts[i])
+			}
+			Nest(n, inner) -> push(stack, indent + n, mode, inner)
+			Tail(inner) -> match mode {
+				Squashing -> push(stack, indent, Squashing, inner)
+				_         -> push(stack, indent, Breaking, inner)
+			}
+			Headed(inner) -> push(stack, indent, mode, inner)
+			Group(breaks, inner) -> match mode {
+				Squashing  -> push(stack, indent, Squashing, inner)
+				Flattening -> push(stack, indent, if breaks { Breaking } else { Flattening }, inner)
+				Breaking -> {
+					let next = Cmd { indent = indent, mode = Flattening, doc = inner }
+					if !breaks && fits(p, next, stack) {
+						Vec.push(stack, next)
+					} else {
+						push(stack, indent, Breaking, inner)
+					}
+				}
+			}
+			IfBreak(broken, whenFlat) -> match mode {
+				Breaking -> push(stack, indent, mode, broken)
+				_        -> push(stack, indent, mode, whenFlat)
+			}
+			Suffix(s, ends) -> {
+				Vec.push(p.pending, s)
+				p.ends = ends
+			}
+			Choice(alternatives) -> match mode {
+				Breaking -> Vec.push(stack, chosen(p, indent, alternatives, stack))
+				_        -> push(stack, indent, mode, alternatives[0])
+			}
+			Fill(items) -> match mode {
+				Breaking -> fillLine(p, indent, items)
+				_ -> for var i = len(items) - 1; i >= 0; i = i - 1 {
+					push(stack, indent, mode, items[i])
+					if i > 0 { push(stack, indent, mode, Text(" ", 1)) }
+				}
+			}
+			Rows(table) -> match mode {
+				Squashing -> push(stack, indent, Squashing, squashed(table))
+				_         -> printRows(p, indent, table)
+			}
+			Flat(inner) -> push(stack, indent, Squashing, inner)
+			Below(n, inner) -> {
+				match mode {
+					Squashing -> emit(p, " ", 1)
+					_         -> newline(p, indent + n)
+				}
+				push(stack, indent + n, mode, inner)
+			}
+		}
+	}
 }
 
 -- `table` on one line, a `; ` between its rows.
 fun squashed(table : Vec Row) -> Doc {
-    let parts = []
-    for r in table {
-        match r.kind {
-            Plain | Aligned -> {
-                if len(parts) > 0 { Vec.push(parts, Text("; ", 2)) }
-                Vec.push(parts, cat([r.left, r.right]))
-            }
-            Note | Blank -> {}
-        }
-    }
-    cat(parts)
+	let parts = []
+	for r in table {
+		match r.kind {
+			Plain | Aligned -> {
+				if len(parts) > 0 { Vec.push(parts, Text("; ", 2)) }
+				Vec.push(parts, cat([r.left, r.right]))
+			}
+			Note | Blank -> {}
+		}
+	}
+	cat(parts)
 }
 
 -- The alternative of a choice to lay out, and how.
 fun chosen(p : P, indent : Int, alternatives : Vec Doc, stack : Vec Cmd) -> Cmd {
-    let first = Cmd { indent = indent, mode = Flattening, doc = alternatives[0] }
-    if !isHard(alternatives[0]) && fits(p, first, stack) { return first }
-    let last = len(alternatives) - 1
-    for var i = 1; i < last; i = i + 1 {
-        let next = Cmd { indent = indent, mode = Flattening, doc = alternatives[i] }
-        if fits(p, next, stack) { return next }
-    }
-    Cmd { indent = indent, mode = Breaking, doc = alternatives[last] }
+	let first = Cmd { indent = indent, mode = Flattening, doc = alternatives[0] }
+	if !isHard(alternatives[0]) && fits(p, first, stack) { return first }
+	let last = len(alternatives) - 1
+	for var i = 1; i < last; i = i + 1 {
+		let next = Cmd { indent = indent, mode = Flattening, doc = alternatives[i] }
+		let fitting = match alternatives[i] {
+			Below(n, Headed(inner)) -> headFits(p.width - (indent + n) * tabWidth, inner, stack)
+			Below(n, inner) -> fitsIn(
+				p.width - (indent + n) * tabWidth,
+				Cmd { indent = indent + n, mode = Flattening, doc = inner },
+				stack,
+			)
+			Headed(inner) -> headFits(p.width - p.pos, inner, stack)
+			_             -> fits(p, next, stack)
+		}
+		if fitting { return next }
+	}
+	Cmd { indent = indent, mode = Breaking, doc = alternatives[last] }
 }
 
 -- Whether `next`, and what follows it on the stack, fit on the rest of the
@@ -541,78 +645,174 @@ fun chosen(p : P, indent : Int, alternatives : Vec Doc, stack : Vec Cmd) -> Cmd 
 -- the mode it would be laid out in. A group that must break is measured
 -- broken even inside a flat one, which is what lets a choice see how a hugged
 -- argument's first line ends.
-fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
-    var remaining = p.width - p.pos
-    let todo = [next]
-    var rest = len(stack)
-    while remaining >= 0 {
-        let c = match Vec.pop(todo) {
-            Some(c) -> c
-            None -> {
-                if rest == 0 { return True }
-                rest = rest - 1
-                stack[rest]
-            }
-        }
-        let Cmd { indent, mode, doc } = c
-        match doc {
-            -- A suffix ends its line, so breaking the code before it would
-            -- not make the line any shorter: it counts for nothing.
-            Empty | Suffix(_, _) -> {}
-            Text(_, w) -> { remaining = remaining - w }
-            Raw(s) | Shifted(s, _) -> {
-                let first = Option.unwrapOr(Vec.at(String.lines(s), 0), "")
-                remaining = remaining - columns(first)
-                if String.contains(s, "\n") { return remaining >= 0 }
-            }
-            Line(whenFlat) -> match mode {
-                Breaking -> return True
-                _ -> { remaining = remaining - String.codePointCount(whenFlat) }
-            }
-            Hard | Rows(_) -> return True
-            Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
-                push(todo, indent, mode, parts[i])
-            }
-            Nest(_, inner) -> push(todo, indent, mode, inner)
-            Group(breaks, inner) -> match mode {
-                Squashing -> push(todo, indent, mode, inner)
-                _ -> push(todo, indent, if breaks { Breaking } else { mode }, inner)
-            }
-            IfBreak(broken, whenFlat) -> match mode {
-                Breaking -> push(todo, indent, mode, broken)
-                _ -> push(todo, indent, mode, whenFlat)
-            }
-            Choice(alternatives) -> match mode {
-                Breaking -> push(todo, indent, mode, alternatives[len(alternatives) - 1])
-                _ -> push(todo, indent, mode, alternatives[0])
-            }
-            Fill(items) -> match mode {
-                -- A broken fill ends its first line somewhere after its first
-                -- item.
-                Breaking -> {
-                    push(todo, indent, mode, Hard)
-                    if len(items) > 0 { push(todo, indent, Squashing, items[0]) }
-                }
-                _ -> for var i = len(items) - 1; i >= 0; i = i - 1 {
-                    push(todo, indent, mode, items[i])
-                    if i > 0 { push(todo, indent, mode, Text(" ", 1)) }
-                }
-            }
-            Flat(inner) -> push(todo, indent, Squashing, inner)
-        }
-    }
-    False
+fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool = fitsIn(p.width - p.pos, next, stack)
+
+-- Whether the head of `d` fits in `room` columns: the text before its first
+-- `Tail` laid out flat, and then the tail's first line, up to where the tail
+-- itself breaks. A `d` with no `Tail` is measured flat, and what follows it
+-- on the stack as `fits` measures it.
+fun headFits(room : Int, d : Doc, stack : Vec Cmd) -> Bool {
+	var remaining = room
+	let todo = [d]
+	while let Some(doc) = Vec.pop(todo) {
+		if remaining < 0 { return False }
+		match doc {
+			Tail(inner)          -> return tailFits(remaining, inner)
+			Empty | Suffix(_, _) -> {}
+			Text(_, w)           -> { remaining = remaining - w }
+			Raw(s) | Shifted(s, _) -> {
+				remaining = remaining - columns(Option.unwrapOr(Vec.at(String.lines(s), 0), ""))
+			}
+			Line(whenFlat) -> { remaining = remaining - String.codePointCount(whenFlat) }
+			Hard           -> { remaining = remaining - 1 }
+			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
+				Vec.push(todo, parts[i])
+			}
+			Nest(_, inner) | Group(_, inner) | Flat(inner) | Headed(inner) -> Vec.push(todo, inner)
+			IfBreak(_, whenFlat) -> Vec.push(todo, whenFlat)
+			Choice(alternatives) -> Vec.push(todo, alternatives[0])
+			Fill(items) -> for var i = len(items) - 1; i >= 0; i = i - 1 {
+				Vec.push(todo, items[i])
+				if i > 0 { Vec.push(todo, Text(" ", 1)) }
+			}
+			Rows(table) -> Vec.push(todo, squashed(table))
+			Below(_, inner) -> {
+				remaining = remaining - 1
+				Vec.push(todo, inner)
+			}
+		}
+	}
+	remaining >= 0 && fitsIn(remaining, Cmd { indent = 0, mode = Flattening, doc = Empty }, stack)
+}
+
+-- Whether the first line of the tail `d` fits in `room` columns. The tail
+-- breaks at its own line breaks, and a group inside it after its first text
+-- is laid out flat, so the first line of `if a + b {` is all of it and that
+-- of `{` is the brace. A group before any text is the tail's own broken form,
+-- such as a record's braces, and breaks with it.
+fun tailFits(room : Int, d : Doc) -> Bool {
+	var remaining = room
+	var started = False
+	let todo = [d]
+	while let Some(doc) = Vec.pop(todo) {
+		if remaining < 0 { return False }
+		match doc {
+			Line(_) | Hard | Rows(_) | Below(_, _) -> return True
+			Empty | Suffix(_, _)                   -> {}
+			Text(_, w) -> {
+				remaining = remaining - w
+				started = True
+			}
+			Group(_, inner) -> if started {
+				remaining = remaining - columns(renderFlat(doc))
+			} else {
+				Vec.push(todo, inner)
+			}
+			Raw(s) | Shifted(s, _) -> {
+				remaining = remaining - columns(Option.unwrapOr(Vec.at(String.lines(s), 0), ""))
+				if String.contains(s, "\n") { return remaining >= 0 }
+				started = True
+			}
+			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
+				Vec.push(todo, parts[i])
+			}
+			Nest(_, inner) | Headed(inner) | Tail(inner) -> Vec.push(todo, inner)
+			IfBreak(broken, _)                           -> Vec.push(todo, broken)
+			Flat(_) | Choice(_) -> { remaining = remaining - columns(renderFlat(doc)) }
+			Fill(items) -> {
+				if len(items) > 0 { remaining = remaining - columns(renderFlat(items[0])) }
+				return remaining >= 0
+			}
+		}
+	}
+	remaining >= 0
+}
+
+-- `fits`, with `room` columns left on the line.
+fun fitsIn(room : Int, next : Cmd, stack : Vec Cmd) -> Bool {
+	var remaining = room
+	let todo = [next]
+	var rest = len(stack)
+	while remaining >= 0 {
+		let c = match Vec.pop(todo) {
+			Some(c) -> c
+			None -> {
+				if rest == 0 { return True }
+				rest = rest - 1
+				stack[rest]
+			}
+		}
+		let Cmd { indent, mode, doc } = c
+		match doc {
+			-- A suffix ends its line, so breaking the code before it would
+			-- not make the line any shorter: it counts for nothing.
+			Empty | Suffix(_, _) -> {}
+			Text(_, w)           -> { remaining = remaining - w }
+			Raw(s) | Shifted(s, _) -> {
+				let first = Option.unwrapOr(Vec.at(String.lines(s), 0), "")
+				remaining = remaining - columns(first)
+				if String.contains(s, "\n") { return remaining >= 0 }
+			}
+			Line(whenFlat) -> match mode {
+				Breaking -> return True
+				_        -> { remaining = remaining - String.codePointCount(whenFlat) }
+			}
+			Hard | Rows(_) -> return True
+			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
+				push(todo, indent, mode, parts[i])
+			}
+			Nest(_, inner) -> push(todo, indent, mode, inner)
+			Group(breaks, inner) -> match mode {
+				Squashing -> push(todo, indent, mode, inner)
+				_         -> push(todo, indent, if breaks { Breaking } else { mode }, inner)
+			}
+			Tail(inner) -> match mode {
+				Squashing -> push(todo, indent, mode, inner)
+				_         -> push(todo, indent, Breaking, inner)
+			}
+			Headed(inner) -> push(todo, indent, mode, inner)
+			IfBreak(broken, whenFlat) -> match mode {
+				Breaking -> push(todo, indent, mode, broken)
+				_        -> push(todo, indent, mode, whenFlat)
+			}
+			Choice(alternatives) -> match mode {
+				Breaking -> push(todo, indent, mode, alternatives[len(alternatives) - 1])
+				_        -> push(todo, indent, mode, alternatives[0])
+			}
+			Fill(items) -> match mode {
+				-- A broken fill ends its first line somewhere after its first
+				-- item.
+				Breaking -> {
+					push(todo, indent, mode, Hard)
+					if len(items) > 0 { push(todo, indent, Squashing, items[0]) }
+				}
+				_ -> for var i = len(items) - 1; i >= 0; i = i - 1 {
+					push(todo, indent, mode, items[i])
+					if i > 0 { push(todo, indent, mode, Text(" ", 1)) }
+				}
+			}
+			Flat(inner) -> push(todo, indent, Squashing, inner)
+			Below(_, inner) -> match mode {
+				Squashing -> {
+					remaining = remaining - 1
+					push(todo, indent, mode, inner)
+				}
+				_ -> return True
+			}
+		}
+	}
+	False
 }
 
 fun fillLine(p : P, indent : Int, items : Vec Doc) -> Unit {
-    for var i = 0; i < len(items); i = i + 1 {
-        let s = renderFlat(items[i])
-        let w = columns(s)
-        if i > 0 {
-            if p.pos + 1 + w <= p.width { emit(p, " ", 1) } else { newline(p, indent) }
-        }
-        emit(p, s, w)
-    }
+	for var i = 0; i < len(items); i = i + 1 {
+		let s = renderFlat(items[i])
+		let w = columns(s)
+		if i > 0 {
+			if p.pos + 1 + w <= p.width { emit(p, " ", 1) } else { newline(p, indent) }
+		}
+		emit(p, s, w)
+	}
 }
 
 -- -- tables -------------------------------------------------------------------------
@@ -620,69 +820,98 @@ fun fillLine(p : P, indent : Int, items : Vec Doc) -> Unit {
 -- A row laid out on its own: its text, the width of its `left` when the row
 -- is one line, and the suffixes waiting at its end.
 type Laid = Laid {
-    body     : Vec String,
-    leftText : String,
-    single   : Bool,
-    pending  : Vec String,
-    ends     : Bool,
+	body     : Vec String
+	leftText : String
+	single   : Bool
+	pending  : Vec String
+	ends     : Bool
 }
 
 fun printRows(p : P, indent : Int, table : Vec Row) -> Unit {
-    let laid = Vec.map(table, laidOut(p, indent, _))
-    alignTokens(p, table, laid)
-    alignSuffixes(p, table, laid)
-    for var k = 0; k < len(table); k = k + 1 {
-        if k > 0 { newline(p, indent) }
-        emitLines(p, laid[k].body)
-    }
+	let laid = Vec.map(table, laidOut(p, indent, _))
+	alignTokens(p, indent, table, laid)
+	alignSuffixes(p, table, laid)
+	for var k = 0; k < len(table); k = k + 1 {
+		if k > 0 { newline(p, indent) }
+		emitLines(p, laid[k].body)
+	}
 }
 
 fun laidOut(p : P, indent : Int, r : Row) -> Laid {
-    match r.kind {
-        Blank -> return Laid { body = [""], leftText = "", single = True, pending = [], ends = False }
-        _ -> {}
-    }
-    let q = printer(p.width, indent * tabWidth, p.marks)
-    layout(q, Cmd { indent = indent, mode = Breaking, doc = cat([r.left, r.right]) })
-    let body = finish(q)
-    let single = len(body) == 1
-    let leftText = match r.kind {
-        Aligned -> if single { renderFlat(r.left) } else { "" }
-        _ -> ""
-    }
-    Laid { body = body, leftText = leftText, single = single, pending = q.pending, ends = q.ends }
+	match r.kind {
+		Blank -> return Laid {
+			body     = [""]
+			leftText = ""
+			single   = True
+			pending  = []
+			ends     = False
+		}
+		_ -> {}
+	}
+	let q = printer(p.width, indent * tabWidth, p.marks)
+	layout(q, Cmd { indent = indent, mode = Breaking, doc = cat([r.left, r.right]) })
+	let body = finish(q)
+	let single = len(body) == 1
+	let leftText = match r.kind {
+		Aligned -> if single { renderFlat(r.left) } else { "" }
+		_       -> ""
+	}
+	Laid { body = body, leftText = leftText, single = single, pending = q.pending, ends = q.ends }
 }
 
 -- Pads each run of one-line `Aligned` rows so that their `right` parts start
--- at one column.
-fun alignTokens(p : P, table : Vec Row, laid : Vec Laid) -> Unit {
-    var i = 0
-    while i < len(table) {
-        if !inTokenRun(table[i], laid[i]) {
-            i = i + 1
-            continue
-        }
-        var j = i
-        var widest = 0
-        let run = newRun(p)
-        while j < len(table) && inTokenRun(table[j], laid[j]) {
-            widest = larger(widest, columns(laid[j].leftText))
-            j = j + 1
-        }
-        for var k = i; k < j; k = k + 1 {
-            let l = laid[k]
-            let cs = String.toCodePoints(l.body[0])
-            let leftLength = String.codePointCount(l.leftText)
-            let after = String.fromCodePoints(Array.slice(cs, leftLength, len(cs)))
-            l.body[0] = l.leftText + padding(p, run, Tokens, String.repeat(" ", widest - columns(l.leftText))) + after
-        }
-        i = j
-    }
+-- at one column, but for a row that the padding would carry past the width.
+fun alignTokens(p : P, indent : Int, table : Vec Row, laid : Vec Laid) -> Unit {
+	var i = 0
+	while i < len(table) {
+		if !inTokenRun(table[i], laid[i]) {
+			i = i + 1
+			continue
+		}
+		var j = i
+		while j < len(table) && inTokenRun(table[j], laid[j]) { j = j + 1 }
+		-- A row that the padding would carry past the width leaves the run and
+		-- is printed as laid out, and the others align without it. Dropping a
+		-- row can only narrow the run, so this ends.
+		let aligned = Vec.filled(j - i, True)
+		var widest = 0
+		var dropped = True
+		while dropped {
+			dropped = False
+			widest = 0
+			for var k = i; k < j; k = k + 1 {
+				if aligned[k - i] { widest = larger(widest, columns(laid[k].leftText)) }
+			}
+			for var k = i; k < j; k = k + 1 {
+				let l = laid[k]
+				let padded = indent * tabWidth
+					+ measured(p, l.body[0])
+					+ widest -
+					columns(l.leftText)
+				if aligned[k - i] && padded > p.width {
+					aligned[k - i] = False
+					dropped = True
+				}
+			}
+		}
+		let run = newRun(p)
+		for var k = i; k < j; k = k + 1 {
+			if !aligned[k - i] { continue }
+			let l = laid[k]
+			let cs = String.toCodePoints(l.body[0])
+			let leftLength = String.codePointCount(l.leftText)
+			let after = String.fromCodePoints(Array.slice(cs, leftLength, len(cs)))
+			l.body[0] = l.leftText
+				+ padding(p, run, Tokens, String.repeat(" ", widest - columns(l.leftText)))
+				+ after
+		}
+		i = j
+	}
 }
 
 fun inTokenRun(r : Row, l : Laid) -> Bool = match r.kind {
-    Aligned -> l.single
-    _ -> False
+	Aligned -> l.single
+	_       -> False
 }
 
 -- Writes each row's suffixes after it. A run of one-line rows that each have
@@ -691,49 +920,50 @@ fun inTokenRun(r : Row, l : Laid) -> Bool = match r.kind {
 -- own a space after the longest row, and the suffix that ends the line goes
 -- a space after the longest row and notes.
 fun alignSuffixes(p : P, table : Vec Row, laid : Vec Laid) -> Unit {
-    var i = 0
-    while i < len(table) {
-        if !inSuffixRun(table[i], laid[i]) {
-            let l = laid[i]
-            if len(l.pending) > 0 {
-                let last = len(l.body) - 1
-                l.body[last] = l.body[last] + " " + String.join(l.pending, " ")
-            }
-            i = i + 1
-            continue
-        }
-        var j = i
-        var widest = 0
-        let run = newRun(p)
-        while j < len(table) && inSuffixRun(table[j], laid[j]) {
-            widest = larger(widest, measured(p, laid[j].body[0]))
-            j = j + 1
-        }
-        var widestNoted = widest
-        for var k = i; k < j; k = k + 1 {
-            widestNoted = larger(widestNoted, widest + columns(notesOf(laid[k])))
-        }
-        for var k = i; k < j; k = k + 1 {
-            let l = laid[k]
-            let notes = notesOf(l)
-            let filled = String.repeat(" ", widest - measured(p, l.body[0])) + notes
-                + String.repeat(" ", widestNoted - widest - columns(notes) + 1)
-            let rest = if l.ends { [l.pending[len(l.pending) - 1]] } else { l.pending }
-            l.body[0] = l.body[0] + padding(p, run, Suffixes, filled) + String.join(rest, " ")
-        }
-        i = j
-    }
+	var i = 0
+	while i < len(table) {
+		if !inSuffixRun(table[i], laid[i]) {
+			let l = laid[i]
+			if len(l.pending) > 0 {
+				let last = len(l.body) - 1
+				l.body[last] = l.body[last] + " " + String.join(l.pending, " ")
+			}
+			i = i + 1
+			continue
+		}
+		var j = i
+		var widest = 0
+		let run = newRun(p)
+		while j < len(table) && inSuffixRun(table[j], laid[j]) {
+			widest = larger(widest, measured(p, laid[j].body[0]))
+			j = j + 1
+		}
+		var widestNoted = widest
+		for var k = i; k < j; k = k + 1 {
+			widestNoted = larger(widestNoted, widest + columns(notesOf(laid[k])))
+		}
+		for var k = i; k < j; k = k + 1 {
+			let l = laid[k]
+			let notes = notesOf(l)
+			let filled = String.repeat(" ", widest - measured(p, l.body[0]))
+				+ notes
+				+ String.repeat(" ", widestNoted - widest - columns(notes) + 1)
+			let rest = if l.ends { [l.pending[len(l.pending) - 1]] } else { l.pending }
+			l.body[0] = l.body[0] + padding(p, run, Suffixes, filled) + String.join(rest, " ")
+		}
+		i = j
+	}
 }
 
 -- The suffixes of `l` before the one that ends its line, a space before each.
 fun notesOf(l : Laid) -> String {
-    if !l.ends { return "" }
-    String.join(Vec.map(Vec.slice(l.pending, 0, len(l.pending) - 1), \" " + _), "")
+	if !l.ends { return "" }
+	String.join(Vec.map(Vec.slice(l.pending, 0, len(l.pending) - 1), \" " + _), "")
 }
 
 fun inSuffixRun(r : Row, l : Laid) -> Bool = match r.kind {
-    Plain | Aligned -> l.single && len(l.pending) > 0
-    _ -> False
+	Plain | Aligned -> l.single && len(l.pending) > 0
+	_               -> False
 }
 
 fun larger(a : Int, b : Int) -> Int = if a > b { a } else { b }

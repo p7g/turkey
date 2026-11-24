@@ -134,23 +134,23 @@ let programWaits : Ptr = zeroedWord()
 let looking : Ptr = zeroedWord()
 
 fun zeroedWord() -> Ptr {
-    let word = Os.malloc(8)
-    Ptr.atomicStore(word, 0, 0)
-    word
+	let word = Os.malloc(8)
+	Ptr.atomicStore(word, 0, 0)
+	word
 }
 
 --- Make `c` runnable: it will be resumed in its turn. Takes the queue's lock.
 fun ready(c : Co.Coroutine) -> Unit {
-    Workers.acquire(queueLock)
-    push(c)
-    Lock.release(queueLock)
-    notify()
+	Workers.acquire(queueLock)
+	push(c)
+	Lock.release(queueLock)
+	notify()
 }
 
 -- Under the queue's lock.
 fun push(c : Co.Coroutine) -> Unit {
-    Vec.push(runnable, c)
-    Workers.queuedSet(len(runnable) - head)
+	Vec.push(runnable, c)
+	Workers.queuedSet(len(runnable) - head)
 }
 
 -- Tasks were just queued: wake an idle worker to run them, unless one has
@@ -158,10 +158,11 @@ fun push(c : Co.Coroutine) -> Unit {
 -- first, so a task queued before that is in what it sees, and one queued after
 -- wakes another.
 fun notify() -> Unit {
-    if Workers.idlers() > 0 && Ptr.atomicLoad(looking, 0) == 0
-            && Ptr.atomicCas(looking, 0, 0, 1) == 0 {
-        Workers.signalWork(False)
-    }
+	if Workers.idlers() > 0
+			&& Ptr.atomicLoad(looking, 0) == 0
+			&& Ptr.atomicCas(looking, 0, 0, 1) == 0 {
+		Workers.signalWork(False)
+	}
 }
 
 --- Something the program's own code may be waiting for has changed -- a task
@@ -169,87 +170,87 @@ fun notify() -> Unit {
 --- idle worker wakes with it, since nothing says which sleeper is the program.
 --- Called after the change is made, under the lock it was made under or after.
 fun changed() -> Unit {
-    if Ptr.atomicLoad(programWaits, 0) != 0 { Workers.signalWork(True) }
+	if Ptr.atomicLoad(programWaits, 0) != 0 { Workers.signalWork(True) }
 }
 
 --- Make `c`, which is waiting, runnable once it has suspended.
 fun wake(c : Co.Coroutine) -> Unit {
-    if claim(c) { ready(c) }
+	if claim(c) { ready(c) }
 }
 
 -- Returns whether the caller is to queue `c`, which is waiting: True if it was
 -- parked, and is now active; False if it is still running, and is now marked
 -- woken.
 fun claim(c : Co.Coroutine) -> Bool {
-    while True {
-        if Co.waitingSwap(c, parked, active) { return True }
-        if Co.waitingSwap(c, active, woken) { return False }
-        if Co.waiting(c) == woken { return False }
-    }
-    False
+	while True {
+		if Co.waitingSwap(c, parked, active) { return True }
+		if Co.waitingSwap(c, active, woken) { return False }
+		if Co.waiting(c) == woken { return False }
+	}
+	False
 }
 
 --- Wakes each of `tasks`, queuing the ones that are parked under one taking of
 --- the queue's lock. Overwrites the front of `tasks` with the ones it queues.
 fun wakeAll(tasks : Vec Co.Coroutine) -> Unit {
-    var n = 0
-    for var i = 0; i < len(tasks); i = i + 1 {
-        if claim(tasks[i]) {
-            tasks[n] = tasks[i]
-            n = n + 1
-        }
-    }
-    if n == 0 { return }
-    Workers.acquire(queueLock)
-    for var i = 0; i < n; i = i + 1 { push(tasks[i]) }
-    Lock.release(queueLock)
-    notify()
+	var n = 0
+	for var i = 0; i < len(tasks); i = i + 1 {
+		if claim(tasks[i]) {
+			tasks[n] = tasks[i]
+			n = n + 1
+		}
+	}
+	if n == 0 { return }
+	Workers.acquire(queueLock)
+	for var i = 0; i < n; i = i + 1 { push(tasks[i]) }
+	Lock.release(queueLock)
+	notify()
 }
 
 -- The next runnable coroutine, counted as running until `run` has seen it
 -- suspend. Under the queue's lock.
 fun next() -> Option Co.Coroutine {
-    if head == len(runnable) { return None }
-    let c = runnable[head]
-    head = head + 1
-    let _ = Ptr.atomicAdd(running, 0, 1)
-    -- Drop the taken slots as tasks are taken, not when a look finds the
-    -- queue empty: nothing may ever look while it is. The program's own stack
-    -- stops looking once what it waits for is done, a busy worker finds a task
-    -- every time, and with one worker there is no idle one. Copying only when
-    -- the taken slots are at least as many as the queued tasks copies no more
-    -- tasks, over a run, than are taken: a constant per task.
-    let queued = len(runnable) - head
-    if head >= queued {
-        runnable = Vec.slice(runnable, head, len(runnable))
-        head = 0
-    }
-    Workers.queuedSet(queued)
-    Some(c)
+	if head == len(runnable) { return None }
+	let c = runnable[head]
+	head = head + 1
+	let _ = Ptr.atomicAdd(running, 0, 1)
+	-- Drop the taken slots as tasks are taken, not when a look finds the
+	-- queue empty: nothing may ever look while it is. The program's own stack
+	-- stops looking once what it waits for is done, a busy worker finds a task
+	-- every time, and with one worker there is no idle one. Copying only when
+	-- the taken slots are at least as many as the queued tasks copies no more
+	-- tasks, over a run, than are taken: a constant per task.
+	let queued = len(runnable) - head
+	if head >= queued {
+		runnable = Vec.slice(runnable, head, len(runnable))
+		head = 0
+	}
+	Workers.queuedSet(queued)
+	Some(c)
 }
 
 -- The next runnable coroutine, if any. One left behind it wakes another
 -- worker, as one more queued would.
 fun take() -> Option Co.Coroutine {
-    Workers.acquire(queueLock)
-    let c = next()
-    let more = head < len(runnable)
-    Lock.release(queueLock)
-    if more { notify() }
-    c
+	Workers.acquire(queueLock)
+	let c = next()
+	let more = head < len(runnable)
+	Lock.release(queueLock)
+	if more { notify() }
+	c
 }
 
 -- Resume `c` until it suspends, then queue it if it was woken meanwhile, or
 -- park it. The last task to stop running wakes the program's own code if it
 -- waits, which may now be waiting on nothing that can happen (`waitOn`).
 fun run(c : Co.Coroutine) -> Unit {
-    Co.resume(c)
-    if !Co.finished(c) && !Co.waitingSwap(c, active, parked) {
-        Co.waitingSet(c, active)
-        ready(c)
-    }
-    -- After queuing `c`, so that the deadlock check sees it queued or running.
-    if Ptr.atomicAdd(running, 0, -1) == 1 { changed() }
+	Co.resume(c)
+	if !Co.finished(c) && !Co.waitingSwap(c, active, parked) {
+		Co.waitingSet(c, active)
+		ready(c)
+	}
+	-- After queuing `c`, so that the deadlock check sees it queued or running.
+	if Ptr.atomicAdd(running, 0, -1) == 1 { changed() }
 }
 
 --- Return once `done` holds. A task gives `register` itself, so that whatever
@@ -257,90 +258,90 @@ fun run(c : Co.Coroutine) -> Unit {
 --- own stack runs other tasks meanwhile. `done` and `register` run under the
 --- lock.
 fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit =
-    waitOn(waitsLock, done, register)
+	waitOn(waitsLock, done, register)
 
 --- `waitUntil`, with `done` and `register` run under `mutex` rather than the
 --- scheduler's lock. Whatever makes `done` hold does it under `mutex`, wakes
 --- the coroutines registered with it (`wake`), and calls `changed`.
 fun waitOn(mutex : Ptr, done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
-    match Co.running() {
-        Some(c) -> while True {
-            Workers.acquire(mutex)
-            if done() {
-                Lock.release(mutex)
-                return
-            }
-            register(c)
-            Lock.release(mutex)
-            Co.suspend()
-        }
-        None -> while True {
-            -- The task this stack ran last may have lost its permit (`afterCall`).
-            if !Workers.permitHeld() { Workers.permitAwait(True) }
-            if holds(mutex, done) {
-                passOn()
-                return
-            }
-            let seen = Workers.workSeen()
-            match take() {
-                Some(c) -> {
-                    run(c)
-                    poll()
-                }
-                None -> {
-                    Ptr.atomicStore(programWaits, 0, 1)
-                    -- Look again, now that `changed` will signal: whatever made
-                    -- `done` hold since the look above called it before
-                    -- `programWaits` was set, and anything after moves the
-                    -- epoch past `seen`.
-                    var over = holds(mutex, done)
-                    -- Nothing to run here or anywhere, and nothing done: only a
-                    -- task could make it so, and every task is waiting, for
-                    -- nothing the poller could deliver either. A task that
-                    -- ended after the look at `done` and before `stuck`'s may
-                    -- have made it hold, so look once more; with nothing
-                    -- running, nothing can change it after.
-                    if !over && stuck() {
-                        over = holds(mutex, done)
-                        if !over { return error("deadlock: every task is waiting") }
-                    }
-                    if !over { idle(seen) }
-                    Ptr.atomicStore(programWaits, 0, 0)
-                    if over { return }
-                }
-            }
-        }
-    }
+	match Co.running() {
+		Some(c) -> while True {
+			Workers.acquire(mutex)
+			if done() {
+				Lock.release(mutex)
+				return
+			}
+			register(c)
+			Lock.release(mutex)
+			Co.suspend()
+		}
+		None -> while True {
+			-- The task this stack ran last may have lost its permit (`afterCall`).
+			if !Workers.permitHeld() { Workers.permitAwait(True) }
+			if holds(mutex, done) {
+				passOn()
+				return
+			}
+			let seen = Workers.workSeen()
+			match take() {
+				Some(c) -> {
+					run(c)
+					poll()
+				}
+				None -> {
+					Ptr.atomicStore(programWaits, 0, 1)
+					-- Look again, now that `changed` will signal: whatever made
+					-- `done` hold since the look above called it before
+					-- `programWaits` was set, and anything after moves the
+					-- epoch past `seen`.
+					var over = holds(mutex, done)
+					-- Nothing to run here or anywhere, and nothing done: only a
+					-- task could make it so, and every task is waiting, for
+					-- nothing the poller could deliver either. A task that
+					-- ended after the look at `done` and before `stuck`'s may
+					-- have made it hold, so look once more; with nothing
+					-- running, nothing can change it after.
+					if !over && stuck() {
+						over = holds(mutex, done)
+						if !over { return error("deadlock: every task is waiting") }
+					}
+					if !over { idle(seen) }
+					Ptr.atomicStore(programWaits, 0, 0)
+					if over { return }
+				}
+			}
+		}
+	}
 }
 
 fun holds(mutex : Ptr, done : fun() -> Bool) -> Bool {
-    Workers.acquire(mutex)
-    let over = done()
-    Lock.release(mutex)
-    over
+	Workers.acquire(mutex)
+	let over = done()
+	Lock.release(mutex)
+	over
 }
 
 -- Returns whether nothing is queued or running and nothing is registered
 -- with the poller, so that no task can ever run again.
 fun stuck() -> Bool {
-    -- A `settle` delivers events under the poller's lock and then queues their
-    -- tasks under the queue's lock, and between the two neither shows them. It
-    -- moves `settling` to odd before and back to even after, so take an
-    -- answer only from a look that no `settle` overlapped. Waits end otherwise
-    -- only by what a running task does.
-    while True {
-        let before = Ptr.atomicLoad(settling, 0)
-        if before % 2 == 0 {
-            Workers.acquire(queueLock)
-            let empty = head == len(runnable) && Ptr.atomicLoad(running, 0) == 0
-            Lock.release(queueLock)
-            if !empty || Workers.interest() > 0 { return False }
-            if Ptr.atomicLoad(settling, 0) == before { return True }
-        } else {
-            let _ = Os.schedYield()
-        }
-    }
-    False
+	-- A `settle` delivers events under the poller's lock and then queues their
+	-- tasks under the queue's lock, and between the two neither shows them. It
+	-- moves `settling` to odd before and back to even after, so take an
+	-- answer only from a look that no `settle` overlapped. Waits end otherwise
+	-- only by what a running task does.
+	while True {
+		let before = Ptr.atomicLoad(settling, 0)
+		if before % 2 == 0 {
+			Workers.acquire(queueLock)
+			let empty = head == len(runnable) && Ptr.atomicLoad(running, 0) == 0
+			Lock.release(queueLock)
+			if !empty || Workers.interest() > 0 { return False }
+			if Ptr.atomicLoad(settling, 0) == before { return True }
+		} else {
+			let _ = Os.schedYield()
+		}
+	}
+	False
 }
 
 -- -- the poller ------------------------------------------------------------------------
@@ -352,40 +353,40 @@ let settling : Ptr = zeroedWord()
 -- `n` results, and then the deadlines that have passed. Each wait that ends
 -- wakes its task, and the program's own code if it waits.
 fun settle(n : Int) -> Unit {
-    let _ = Ptr.atomicAdd(settling, 0, 1)
-    Poll.lock()
-    -- Read the clock under the lock, so that waiting for the lock does not
-    -- make the reading stale.
-    let now = Poll.now()
-    var ended = 0
-    for var i = 0; i < n; i = i + 1 {
-        ended = ended + Poll.deliver(Workers.resultToken(i), Workers.resultValue(i))
-    }
-    ended = ended + Poll.expire(now)
-    let tasks = Poll.takeWoken()
-    Poll.unlock()
-    if ended > 0 {
-        wakeAll(tasks)
-        changed()
-    }
-    let _ = Ptr.atomicAdd(settling, 0, 1)
+	let _ = Ptr.atomicAdd(settling, 0, 1)
+	Poll.lock()
+	-- Read the clock under the lock, so that waiting for the lock does not
+	-- make the reading stale.
+	let now = Poll.now()
+	var ended = 0
+	for var i = 0; i < n; i = i + 1 {
+		ended = ended + Poll.deliver(Workers.resultToken(i), Workers.resultValue(i))
+	}
+	ended = ended + Poll.expire(now)
+	let tasks = Poll.takeWoken()
+	Poll.unlock()
+	if ended > 0 {
+		wakeAll(tasks)
+		changed()
+	}
+	let _ = Ptr.atomicAdd(settling, 0, 1)
 }
 
 -- Look for events and deadlines without waiting, between tasks: the worker
 -- that gets the claim does it, any other has nothing to add. With nothing
 -- registered it is one load.
 fun poll() -> Unit {
-    if Workers.interest() > 0 && Workers.claim() {
-        let n = Workers.pollNow()
-        settle(if n > 0 { n } else { 0 })
-        Workers.release()
-        -- While this worker held the claim none other could poll, and the idle
-        -- ones that found it taken are asleep on the work epoch. Wake one, so
-        -- that a deadline is not left to a poller that does not exist: it
-        -- takes the claim in `idle` and blocks in it. Once one is blocked the
-        -- claims here fail, and this signals nothing.
-        if Workers.interest() > 0 { Workers.signalWork(False) }
-    }
+	if Workers.interest() > 0 && Workers.claim() {
+		let n = Workers.pollNow()
+		settle(if n > 0 { n } else { 0 })
+		Workers.release()
+		-- While this worker held the claim none other could poll, and the idle
+		-- ones that found it taken are asleep on the work epoch. Wake one, so
+		-- that a deadline is not left to a poller that does not exist: it
+		-- takes the claim in `idle` and blocks in it. Once one is blocked the
+		-- claims here fail, and this signals nothing.
+		if Workers.interest() > 0 { Workers.signalWork(False) }
+	}
 }
 
 -- Wait for something to do, which `seen`, the work epoch read before looking
@@ -404,52 +405,52 @@ fun poll() -> Unit {
 -- caller, which either takes from the queue or, if it leaves without taking,
 -- calls `passOn`.
 fun idle(seen : Int) -> Unit {
-    Workers.idleEnter()
-    stopLooking()
-    if Workers.queued() == 0 { wait(seen) }
-    Workers.idleLeave()
-    stopLooking()
+	Workers.idleEnter()
+	stopLooking()
+	if Workers.queued() == 0 { wait(seen) }
+	Workers.idleLeave()
+	stopLooking()
 }
 
 -- Wakes an idle worker if tasks are queued, as `notify` does. Called by a
 -- worker that leaves without taking from the queue, which may be the one
 -- `notify` woke for them (`idle`).
 fun passOn() -> Unit {
-    if Workers.queued() > 0 { notify() }
+	if Workers.queued() > 0 { notify() }
 }
 
 fun stopLooking() -> Unit {
-    if Ptr.atomicLoad(looking, 0) != 0 { Ptr.atomicStore(looking, 0, 0) }
+	if Ptr.atomicLoad(looking, 0) != 0 { Ptr.atomicStore(looking, 0, 0) }
 }
 
 fun wait(seen : Int) -> Unit {
-    if Workers.interest() == 0 || !Workers.claim() {
-        let _ = Heap.pause(seen, -1)
-        return
-    }
-    -- Watch from before the look at the deadlines, so that one made during
-    -- the look is either in it or noted, which breaks the wait
-    -- (`Turkey.Poll.timerAdd`, `Turkey.Wait.tell`).
-    Poll.watch(Poll.noDeadline)
-    let now = Poll.now()
-    let timeout = Poll.timeout(now)
-    if timeout == -1 {
-        Poll.watch(-1)
-        Workers.release()
-        let _ = Heap.pause(seen, -1)
-        return
-    }
-    if timeout >= 0 { Poll.watch(now + timeout) }
-    let n = Heap.pause(seen, timeout)
-    Poll.watch(-1)
-    if n < 0 {
-        Workers.release()
-        let _ = Heap.pause(seen, -1)
-        return
-    }
-    settle(n)
-    Workers.release()
-    if Workers.interest() > 0 { Workers.signalWork(False) }
+	if Workers.interest() == 0 || !Workers.claim() {
+		let _ = Heap.pause(seen, -1)
+		return
+	}
+	-- Watch from before the look at the deadlines, so that one made during
+	-- the look is either in it or noted, which breaks the wait
+	-- (`Turkey.Poll.timerAdd`, `Turkey.Wait.tell`).
+	Poll.watch(Poll.noDeadline)
+	let now = Poll.now()
+	let timeout = Poll.timeout(now)
+	if timeout == -1 {
+		Poll.watch(-1)
+		Workers.release()
+		let _ = Heap.pause(seen, -1)
+		return
+	}
+	if timeout >= 0 { Poll.watch(now + timeout) }
+	let n = Heap.pause(seen, timeout)
+	Poll.watch(-1)
+	if n < 0 {
+		Workers.release()
+		let _ = Heap.pause(seen, -1)
+		return
+	}
+	settle(n)
+	Workers.release()
+	if Workers.interest() > 0 { Workers.signalWork(False) }
 }
 
 --- Back from a blocking call (`Turkey.Workers.blockingRead` and the rest),
@@ -460,27 +461,27 @@ fun wait(seen : Int) -> Unit {
 --- (`workerLoop`). One load when the permit is still there. The program's own
 --- stack waits for a permit in the call instead (`Turkey.Workers.callExit`).
 fun afterCall() -> Unit {
-    if !Workers.permitHeld() { yield() }
+	if !Workers.permitHeld() { yield() }
 }
 
 --- Let the other runnable tasks run before going on. On a worker's own stack,
 --- that is each task runnable now, once.
 fun yield() -> Unit = match Co.running() {
-    Some(c) -> {
-        -- Running, so the only other change to its word is a wake's, to
-        -- woken too.
-        Co.waitingSet(c, woken)
-        Co.suspend()
-    }
-    None -> {
-        let count = Workers.queued()
-        for var i = 0; i < count; i = i + 1 {
-            match take() {
-                Some(c) -> run(c)
-                None -> {}
-            }
-        }
-    }
+	Some(c) -> {
+		-- Running, so the only other change to its word is a wake's, to
+		-- woken too.
+		Co.waitingSet(c, woken)
+		Co.suspend()
+	}
+	None -> {
+		let count = Workers.queued()
+		for var i = 0; i < count; i = i + 1 {
+			match take() {
+				Some(c) -> run(c)
+				None    -> {}
+			}
+		}
+	}
 }
 
 -- -- workers ----------------------------------------------------------------------------
@@ -492,43 +493,47 @@ fun yield() -> Unit = match Co.running() {
 --- (`Turkey.Detach`); a call after the first starts nothing and answers the
 --- same. In single-thread mode it starts nothing and answers 1.
 fun start() -> Int {
-    -- Leave the program's own thread unregistered, so that its waits and
-    -- calls, and every collection, take the paths of a program with no
-    -- workers (`Turkey.Workers`).
-    if Workers.singleThreaded() { return 1 }
-    if Workers.started() { return Workers.permits() }
-    let wanted = workersWanted()
-    Workers.mainRegister()
-    var started = 1
-    while started < wanted {
-        let record = Workers.new()
-        if Ptr.isNull(record) { break }
-        let thread = Os.malloc(8)
-        -- Each thread runs `workerLoop`, entered through `turkey_worker_start`
-        -- (`Turkey.Emit.emitWorkerStart`), which sets its record in `x28`.
-        let _ = Libc.pthreadCreate(thread, Ptr.null(),
-                                   Prim.codeAddress("turkey_worker_start"), record)
-        started = started + 1
-    }
-    Workers.permitsSet(started)
-    let _ = Workers.monitorStart()
-    started
+	-- Leave the program's own thread unregistered, so that its waits and
+	-- calls, and every collection, take the paths of a program with no
+	-- workers (`Turkey.Workers`).
+	if Workers.singleThreaded() { return 1 }
+	if Workers.started() { return Workers.permits() }
+	let wanted = workersWanted()
+	Workers.mainRegister()
+	var started = 1
+	while started < wanted {
+		let record = Workers.new()
+		if Ptr.isNull(record) { break }
+		let thread = Os.malloc(8)
+		-- Each thread runs `workerLoop`, entered through `turkey_worker_start`
+		-- (`Turkey.Emit.emitWorkerStart`), which sets its record in `x28`.
+		let _ = Libc.pthreadCreate(
+			thread,
+			Ptr.null(),
+			Prim.codeAddress("turkey_worker_start"),
+			record,
+		)
+		started = started + 1
+	}
+	Workers.permitsSet(started)
+	let _ = Workers.monitorStart()
+	started
 }
 
 -- `TURKEY_WORKERS`, a decimal count, or else one per core that runs at full
 -- speed (`Turkey.Cores`).
 fun workersWanted() -> Int {
-    let text = Os.getenv(Prim.cString("TURKEY_WORKERS"))
-    if Ptr.isNull(text) { return Cores.count() }
-    var n = 0
-    var at = 0
-    while True {
-        let digit = Byte.toInt(Ptr.load(text, at)) - 48
-        if digit < 0 || digit > 9 { break }
-        n = n * 10 + digit
-        at = at + 1
-    }
-    if n < 1 { 1 } else { n }
+	let text = Os.getenv(Prim.cString("TURKEY_WORKERS"))
+	if Ptr.isNull(text) { return Cores.count() }
+	var n = 0
+	var at = 0
+	while True {
+		let digit = Byte.toInt(Ptr.load(text, at)) - 48
+		if digit < 0 || digit > 9 { break }
+		n = n * 10 + digit
+		at = at + 1
+	}
+	if n < 1 { 1 } else { n }
 }
 
 -- A thread's Turkey code, other than the program's own: the monitor's
@@ -538,46 +543,46 @@ fun workersWanted() -> Int {
 -- `turkey_worker_start` hands the panic to the program's own thread
 -- (`Turkey.Workers.ended`).
 fun workerLoop() -> Unit {
-    if Workers.monitoring() { return Monitor.run() }
-    Workers.blockExit()
-    -- The bound is the record above this function's, `turkey_worker_start`'s:
-    -- a walk scans each frame through the record below it, and stops at the
-    -- bound, so this function's own frame is scanned only if it is below it.
-    if !Stack.threadStackSet(Ptr.load(Prim.frameAddress(), 0)) {
-        return error("no memory for a worker's stack record")
-    }
-    while True {
-        Workers.permitAwait(False)
-        serve()
-    }
+	if Workers.monitoring() { return Monitor.run() }
+	Workers.blockExit()
+	-- The bound is the record above this function's, `turkey_worker_start`'s:
+	-- a walk scans each frame through the record below it, and stops at the
+	-- bound, so this function's own frame is scanned only if it is below it.
+	if !Stack.threadStackSet(Ptr.load(Prim.frameAddress(), 0)) {
+		return error("no memory for a worker's stack record")
+	}
+	while True {
+		Workers.permitAwait(False)
+		serve()
+	}
 }
 
 -- Run tasks while the running thread holds its permit: until the task it ran
 -- last lost it in a call, or the thread gives it to the program's own stack,
 -- which waits for one.
 fun serve() -> Unit {
-    var ran = 0
-    while Workers.permitHeld() {
-        if Workers.permitWanted() && Workers.permitGive() {
-            passOn()
-            return
-        }
-        -- Before looking, so that a signal after the look ends its sleep
-        -- (`Turkey.Workers.sleepForWork`).
-        let seen = Workers.workSeen()
-        match take() {
-            Some(c) -> {
-                run(c)
-                ran = ran + 1
-                if ran == pollEvery {
-                    ran = 0
-                    poll()
-                }
-            }
-            None -> idle(seen)
-        }
-    }
-    passOn()
+	var ran = 0
+	while Workers.permitHeld() {
+		if Workers.permitWanted() && Workers.permitGive() {
+			passOn()
+			return
+		}
+		-- Before looking, so that a signal after the look ends its sleep
+		-- (`Turkey.Workers.sleepForWork`).
+		let seen = Workers.workSeen()
+		match take() {
+			Some(c) -> {
+				run(c)
+				ran = ran + 1
+				if ran == pollEvery {
+					ran = 0
+					poll()
+				}
+			}
+			None -> idle(seen)
+		}
+	}
+	passOn()
 }
 
 -- How many tasks a busy worker runs between looks for events (`poll`). A

@@ -1,6 +1,12 @@
 export (
-    Context(..), Strings(..), Selected(..), selectFunction, valType, importParam, importResult,
-    cString,
+	Context(..),
+	Strings(..),
+	Selected(..),
+	selectFunction,
+	valType,
+	importParam,
+	importResult,
+	cString,
 )
 
 --- The low IR to WebAssembly: one function's body as `Turkey.Wasm` instructions.
@@ -32,13 +38,36 @@ export (
 --- the flag in the worker's record, and a function that finds it set returns
 --- zeros of its result types, as on arm64. There is no exception handling.
 ---
+--- **Roots are in a shadow frame.** Wasm code cannot read its own stack, so
+--- a function with values the collector must find (`Turkey.Roots`) keeps
+--- them in a frame on the shadow stack, in linear memory. Each root is
+--- stored into its slot where it is defined, and before each call that may
+--- collect the frame records the site it is stopped at, which the frame
+--- table maps to the slots live there. The collector walks the frames from
+--- the shadow stack pointer (`Turkey.Heap`).
+---
+--- **A panic's trace is built as it returns.** Each site a panic can return
+--- through has a number, and the trace table maps it to its function and
+--- position. On the path that leaves because the flag is set, a function
+--- adds its site to the trace (`Turkey.Process`), so the trace costs nothing
+--- until a panic is raised.
+---
 --- Incomplete by design, as arm64's selection is: an operation with no rule
 --- stops its function, and `stopped` names it.
 
 import Data.Map as Map
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
-                     AtomicOp(..), Callee(..), IndexCheck(..))
+import Turkey.LowIr (
+	Op(..),
+	Low(..),
+	AddressOf(..),
+	BinOp(..),
+	CmpOp(..),
+	Conv(..),
+	AtomicOp(..),
+	Callee(..),
+	IndexCheck(..),
+)
 import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
@@ -50,37 +79,44 @@ import Turkey.Wasm.Structure as St
 --- What every function's selection reads about the module, decided before
 --- any function is selected.
 type Context = Context {
-    --- The function index of each Turkey function, by name.
-    functions : Map String Int,
-    --- What each Turkey function returns, by name (`Ssa.Func.results`).
-    results   : Map String (Array Rep),
-    --- The Turkey function of each `foreign` definition, by its C symbol.
-    defined   : Map String String,
-    --- The function index of each import, by the symbol a program calls it
-    --- by.
-    imports   : Map String Int,
-    --- The function index of each function the backend writes that a program
-    --- calls by C symbol: `turkey_entry`.
-    builtins  : Map String Int,
-    --- The table slot of each function a closure or a code address names, by
-    --- name. Slot 0 is empty, so a null code address traps when called.
-    slots     : Map String Int,
-    --- The address of each string literal's static object, by its text.
-    literals  : Map String Int,
-    --- The address of each global's 8-byte storage, by name.
-    globals   : Map String Int,
-    --- The module, which indirect calls add their types to.
-    module_   : M.Module,
-    --- The C strings interned so far: panic messages and `Prim.cString`s.
-    strings   : Strings,
-    --- The global holding the running worker's record, which is the process
-    --- state with one worker.
-    worker    : Int,
-    --- The global holding the shadow stack's pointer, which frame objects
-    --- are allocated below.
-    stackPointer : Int,
-    --- The lowest address the shadow stack may reach.
-    stackLimit : Int,
+	--- The function index of each Turkey function, by name.
+	functions : Map String Int
+	--- What each Turkey function returns, by name (`Ssa.Func.results`).
+	results : Map String (Array Rep)
+	--- The Turkey function of each `foreign` definition, by its C symbol.
+	defined : Map String String
+	--- The function index of each import, by the symbol a program calls it
+	--- by.
+	imports : Map String Int
+	--- The function index of each function the backend writes that a program
+	--- calls by C symbol: `turkey_entry`.
+	builtins : Map String Int
+	--- The table slot of each function a closure or a code address names, by
+	--- name. Slot 0 is empty, so a null code address traps when called.
+	slots : Map String Int
+	--- The address of each string literal's static object, by its text.
+	literals : Map String Int
+	--- The address of each global's 8-byte storage, by name.
+	globals : Map String Int
+	--- The module, which indirect calls add their types to.
+	module_ : M.Module
+	--- The C strings interned so far: panic messages and `Prim.cString`s.
+	strings : Strings
+	--- The global holding the running worker's record, which is the process
+	--- state with one worker.
+	worker : Int
+	--- The global holding the shadow stack's pointer: the innermost shadow
+	--- frame, which each function that has one pushes below it.
+	stackPointer : Int
+	--- The global holding the lowest address a frame may be pushed at: the
+	--- stack's bottom and a reserve above it, which the panic that running
+	--- out raises takes by lowering this to the bottom.
+	stackLimit : Int
+	--- The shadow stack's bottom.
+	stackBottom : Int
+	--- The sites numbered so far, in every function: a site's number is
+	--- above every number before it, and 0 is no site.
+	var siteCount : Int
 }
 
 --- NUL-terminated strings in data at `start`, each at the address
@@ -90,79 +126,114 @@ type Strings = Strings { start : Int, bytes : Vec Byte, addresses : Map String I
 --- Returns the address of `text`'s bytes and a NUL, interning it if this is
 --- its first mention.
 fun cString(strings : Strings, text : String) -> Int {
-    if let Some(at) = Map.get(strings.addresses, text) { return at }
-    let at = strings.start + len(strings.bytes)
-    for b in String.toBytes(text) { Vec.push(strings.bytes, b) }
-    Vec.push(strings.bytes, Byte.truncate(0))
-    Map.put(strings.addresses, text, at)
-    at
+	if let Some(at) = Map.get(strings.addresses, text) { return at }
+	let at = strings.start + len(strings.bytes)
+	for b in String.toBytes(text) { Vec.push(strings.bytes, b) }
+	Vec.push(strings.bytes, Byte.truncate(0))
+	Map.put(strings.addresses, text, at)
+	at
 }
 
 --- A function's selection: the locals it declares beyond its parameters and
 --- its instructions, or the operation that stopped it.
 type Selected = Selected {
-    locals  : Array W.ValType,
-    body    : Array W.Op,
-    stopped : Option String,
+	locals  : Array W.ValType
+	body    : Array W.Op
+	stopped : Option String
+	--- The frame table's entries for the function's sites: each site's
+	--- number and the offsets, from its shadow frame, of the roots live
+	--- there. A site whose frame holds no live root has none.
+	entries : Vec (Int, Array Int)
+	--- The trace table's calls: each site a panic can return through that has
+	--- a source position, as its number and the position.
+	calls : Vec (Int, Int)
 }
 
 --- Returns the wasm type a value of `r` is held in. A narrow integer is an
 --- `i32`, zero-extended from its width, and a unit is an `i32` holding 0.
 fun valType(r : Rep) -> W.ValType = match r.class_ {
-    I64 | Ptr -> W.I64
-    F64 -> W.F64
-    _ -> W.I32
+	I64 | Ptr -> W.I64
+	F64       -> W.F64
+	_         -> W.I32
 }
 
 --- Returns the type an import takes an argument of `r` at. A pointer is the
 --- memory's own 32-bit address, which is what the host reads; everything
 --- else is held as `valType` holds it.
 fun importParam(r : Rep) -> W.ValType = match r.class_ {
-    Ptr -> W.I32
-    _ -> valType(r)
+	Ptr -> W.I32
+	_   -> valType(r)
 }
 
 --- Returns the types an import returns a result of `r` in: none for a unit,
 --- which a C function declared `void` writes, and otherwise as `importParam`.
 fun importResult(r : Rep) -> Array W.ValType = match r.class_ {
-    Unit -> []
-    _ -> [importParam(r)]
+	Unit -> []
+	_    -> [importParam(r)]
 }
 
 --- Returns the instruction that pushes a zero of type `t`.
 fun zeroOf(t : W.ValType) -> W.Op = match t {
-    W.I64 -> W.ConstI64(0)
-    W.F64 -> W.ConstF64(0.0)
-    W.F32 -> W.ConstF32(0)
-    _ -> W.ConstI32(0)
+	W.I64 -> W.ConstI64(0)
+	W.F64 -> W.ConstF64(0.0)
+	W.F32 -> W.ConstF32(0)
+	_     -> W.ConstI32(0)
 }
 
 type Sel = Sel {
-    source  : Func Low,
-    cx      : Context,
-    out     : Vec W.Op,
-    -- The locals beyond the parameters, in index order.
-    locals  : Vec W.ValType,
-    -- Value id -> its local.
-    local   : Array Int,
-    params  : Int,
-    var stopped : Option String,
-    frame   : Roots.Frame,
-    -- Frame object index -> its offset from the shadow stack pointer.
-    offsets : Array Int,
-    frameBytes : Int,
-    -- The wasm types of the function's results.
-    answers : Array W.ValType,
-    -- The integer constants the low IR defines, by value id.
-    known   : Map Int Int,
-    -- The low IR instruction being selected, as its block and index.
-    var place : (Int, Int),
+	source : Func Low
+	cx     : Context
+	out    : Vec W.Op
+	-- The locals beyond the parameters, in index order.
+	locals : Vec W.ValType
+	-- Value id -> its local.
+	local       : Array Int
+	params      : Int
+	var stopped : Option String
+	frame       : Roots.Frame
+	-- Frame object index -> its offset from the shadow frame.
+	offsets : Array Int
+	-- The shadow frame's bytes, 0 when the function has none.
+	frameBytes : Int
+	-- The `i32` local holding the shadow frame's address, set by the
+	-- prologue; -1 when there is no frame.
+	framePointer : Int
+	-- Whether any site of the function has a root live in its frame, which
+	-- is when the frame's site word must be kept current.
+	publishes : Bool
+	-- The wasm types of the function's results.
+	answers : Array W.ValType
+	-- The integer constants the low IR defines, by value id.
+	known : Map Int Int
+	-- The low IR instruction being selected, as its block and index; the
+	-- index is the block's length for its terminator.
+	var place : (Int, Int)
+	-- The number of each site numbered in this function, by `place`.
+	sites : Map Int Int
+	-- The blocks open where the next instruction goes, the function's own
+	-- included.
+	var depth : Int
+	-- The `i64` local holding the site a panic leaves from (`bail`).
+	leaving : Int
+	-- What goes into `Selected`, and which sites are in it already.
+	entries : Vec (Int, Array Int)
+	calls   : Vec (Int, Int)
+	entered : Map Int Unit
+	called  : Map Int Unit
 }
 
-fun op(s : Sel, o : W.Op) -> Unit = Vec.push(s.out, o)
+-- Appends `o`, keeping count of the blocks it opens and closes.
+fun op(s : Sel, o : W.Op) -> Unit {
+	match o {
+		W.Block(_) | W.Loop(_) | W.If(_) -> { s.depth = s.depth + 1 }
+		W.End                            -> { s.depth = s.depth - 1 }
+		_                                -> {}
+	}
+	Vec.push(s.out, o)
+}
 
 fun stop(s : Sel, what : String) -> Unit {
-    if Option.isNone(s.stopped) { s.stopped = Some(what) }
+	if Option.isNone(s.stopped) { s.stopped = Some(what) }
 }
 
 fun localOf(s : Sel, v : Value) -> Int = s.local[Ssa.valueId(v)]
@@ -173,16 +244,16 @@ fun set(s : Sel, v : Value) -> Unit = op(s, W.LocalSet(localOf(s, v)))
 
 -- A local for a temporary of type `t`, which no low IR value names.
 fun temp(s : Sel, t : W.ValType) -> Int {
-    Vec.push(s.locals, t)
-    s.params + len(s.locals) - 1
+	Vec.push(s.locals, t)
+	s.params + len(s.locals) - 1
 }
 
 fun classOf(s : Sel, v : Value) -> RepClass = Ssa.repOf(s.source, v).class_
 
 -- Whether a value of class `c` is held in an `i64`.
 fun wide(c : RepClass) -> Bool = match c {
-    I64 | Ptr -> True
-    _ -> False
+	I64 | Ptr -> True
+	_         -> False
 }
 
 fun widthOf(c : RepClass) -> W.IntWidth = if wide(c) { W.W64 } else { W.W32 }
@@ -192,8 +263,8 @@ fun constant(c : RepClass, n : Int) -> W.Op = if wide(c) { W.ConstI64(n) } else 
 
 -- `v` as the address a memory access takes.
 fun address(s : Sel, v : Value) -> Unit {
-    get(s, v)
-    op(s, W.Convert(W.I32WrapI64))
+	get(s, v)
+	op(s, W.Convert(W.I32WrapI64))
 }
 
 fun known(s : Sel, v : Value) -> Option Int = Map.get(s.known, Ssa.valueId(v))
@@ -204,172 +275,362 @@ fun known(s : Sel, v : Value) -> Option Int = Map.get(s.known, Ssa.valueId(v))
 --- still returns what was selected before it stopped, which nothing should
 --- write into a module.
 fun selectFunction(cx : Context, f : Func Low) -> Selected {
-    let s = start(cx, f)
-    match St.structure(f) {
-        Left(why) -> stop(s, why)
-        Right(body) -> {
-            prologue(s)
-            control(s, body)
-            -- Every path through the body has returned by here. The engine
-            -- cannot always see that -- an `if` whose arms both return leaves
-            -- nothing on the stack -- so the end says it.
-            op(s, W.Unreachable)
-        }
-    }
-    Selected { locals = Vec.toArray(s.locals), body = Vec.toArray(s.out), stopped = s.stopped }
+	let s = start(cx, f)
+	match St.structure(f) {
+		Left(why) -> stop(s, why)
+		Right(body) -> {
+			prologue(s)
+			-- The body is in a block whose end is the way out of a function a
+			-- panic is leaving (`bail`), so that each site that leaves is a
+			-- branch, and the code that adds to the trace, releases the frame
+			-- and returns zeros is there once.
+			op(s, W.Block(W.Empty))
+			control(s, body)
+			-- Every path through the body has left by here. The engine cannot
+			-- always see that -- an `if` whose arms both return leaves nothing
+			-- on the stack -- so the end says it.
+			op(s, W.Unreachable)
+			op(s, W.End)
+			if let Some(push) = definedIndex(s, "turkey_trace_push") {
+				op(s, W.ConstI64(0))
+				op(s, W.LocalGet(s.leaving))
+				op(s, W.Call(push))
+				op(s, W.Drop)
+			}
+			for t in s.answers { op(s, zeroOf(t)) }
+			leave(s)
+		}
+	}
+	Selected {
+		locals  = Vec.toArray(s.locals)
+		body    = Vec.toArray(s.out)
+		stopped = s.stopped
+		entries = s.entries
+		calls   = s.calls
+	}
 }
 
 fun start(cx : Context, f : Func Low) -> Sel {
-    let local = Array.filled(len(f.reps), -1)
-    var next = 0
-    for p in f.params {
-        local[Ssa.valueId(p)] = next
-        next = next + 1
-    }
-    let params = next
-    let locals = []
-    for var id = 0; id < len(f.reps); id = id + 1 {
-        if local[id] < 0 {
-            local[id] = next
-            next = next + 1
-            Vec.push(locals, valType(f.reps[id]))
-        }
-    }
-    let frame = Roots.analyze(f)
-    let offsets = Array.filled(len(frame.objects), 0)
-    var bytes = 0
-    for var k = 0; k < len(frame.objects); k = k + 1 {
-        offsets[k] = bytes
-        bytes = bytes + frame.objects[k].bytes
-    }
-    -- The shadow stack pointer stays 16-byte aligned, as a machine stack's is.
-    let frameBytes = (bytes + 15) & -16
-    Sel { source = f, cx = cx, out = [], locals = locals, local = local, params = params,
-          stopped = None, frame = frame, offsets = offsets, frameBytes = frameBytes,
-          answers = Array.map(f.results, valType), known = constantsOf(f), place = (0, 0) }
+	let local = Array.filled(len(f.reps), -1)
+	var next = 0
+	for p in f.params {
+		local[Ssa.valueId(p)] = next
+		next = next + 1
+	}
+	let params = next
+	let locals = []
+	for var id = 0; id < len(f.reps); id = id + 1 {
+		if local[id] < 0 {
+			local[id] = next
+			next = next + 1
+			Vec.push(locals, valType(f.reps[id]))
+		}
+	}
+	let frame = Roots.analyze(f)
+	-- Every shadow frame has the header, so that a walk can step over one
+	-- whatever it holds; a function with neither roots nor objects has no
+	-- frame.
+	let header = if Roots.slotCount(frame) > 0 || len(frame.objects) > 0 { headerBytes } else { 0 }
+	let offsets = Array.filled(len(frame.objects), 0)
+	var bytes = header + 8 * Roots.slotCount(frame)
+	for var k = 0; k < len(frame.objects); k = k + 1 {
+		offsets[k] = bytes
+		bytes = bytes + frame.objects[k].bytes
+	}
+	-- The shadow stack pointer stays 16-byte aligned, as a machine stack's is.
+	let frameBytes = (bytes + 15) & -16
+	let framePointer = if frameBytes > 0 {
+		Vec.push(locals, W.I32)
+		next
+	} else {
+		-1
+	}
+	Vec.push(locals, W.I64)
+	let leaving = params + len(locals) - 1
+	Sel {
+		source       = f
+		cx           = cx
+		out          = []
+		locals       = locals
+		local        = local
+		params       = params
+		stopped      = None
+		frame        = frame
+		offsets      = offsets
+		frameBytes   = frameBytes
+		framePointer = framePointer
+		publishes    = publishing(f, frame)
+		answers      = Array.map(f.results, valType)
+		known        = constantsOf(f)
+		place        = (0, 0)
+		depth        = 0
+		leaving      = leaving
+		sites        = Map.new()
+		entries      = []
+		calls        = []
+		entered      = Map.new()
+		called       = Map.new()
+	}
+}
+
+-- Whether some site of `f` has a root live in its frame: a slot, or a traced
+-- field of one of its objects.
+fun publishing(f : Func Low, frame : Roots.Frame) -> Bool {
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		for var n = 0; n < len(f.blocks[b].insts); n = n + 1 {
+			if len(Roots.liveAt(frame, b, n)) > 0 { return True }
+			for k in Roots.objectsAt(frame, b, n) {
+				if len(frame.objects[k].traced) > 0 { return True }
+			}
+		}
+	}
+	False
 }
 
 fun constantsOf(f : Func Low) -> Map Int Int {
-    let out = Map.new()
-    for block in f.blocks {
-        for i in block.insts {
-            if let ConstInt(n) = i.op {
-                if Ssa.repOf(f, i.result).class_ != F64 { Map.put(out, Ssa.valueId(i.result), n) }
-            }
-        }
-    }
-    out
+	let out = Map.new()
+	for block in f.blocks {
+		for i in block.insts {
+			if let ConstInt(n) = i.op {
+				if Ssa.repOf(f, i.result).class_ != F64 { Map.put(out, Ssa.valueId(i.result), n) }
+			}
+		}
+	}
+	out
 }
 
--- The frame, when the function has objects in it: the shadow stack pointer
--- moved down past them, a trap if that passes the stack's limit, and the
--- traced fields cleared of each object some path reads before building it
--- (`Turkey.Roots.FrameObject`).
+-- -- the shadow frame --------------------------------------------------------------
+--
+-- A function's shadow frame, when it has one, is at the shadow stack pointer,
+-- 16-byte aligned:
+--
+--   0    the address past the frame, which is the next frame out or the top
+--        of the stack: what a walk follows outwards
+--   8    the site the function is stopped at, or 0 for none; the frame
+--        table's entry for it lists the roots live there
+--   16   a word for each root slot (`Turkey.Roots.slotOf`)
+--   then the frame objects, in `Turkey.Roots.Frame.objects` order
+--
+-- The walks read it in `Turkey.Heap` and `Turkey.HeapCheck`.
+
+let headerBytes = 16
+
+-- The frame, when the function has one: the shadow stack pointer moved down
+-- past it, a panic if that passes the stack's limit, the header, each
+-- parameter that is a root in its slot, and the traced fields cleared of
+-- each object some path reads before building it (`Turkey.Roots.FrameObject`).
 fun prologue(s : Sel) -> Unit {
-    if s.frameBytes == 0 { return }
-    op(s, W.GlobalGet(s.cx.stackPointer))
-    op(s, W.ConstI64(s.frameBytes))
-    op(s, W.IntBin(W.W64, W.Sub))
-    op(s, W.GlobalSet(s.cx.stackPointer))
-    -- Nothing guards the memory below the stack, so running out is a trap
-    -- here rather than a write over whatever is there.
-    op(s, W.GlobalGet(s.cx.stackPointer))
-    op(s, W.ConstI64(s.cx.stackLimit))
-    op(s, W.IntRel(W.W64, W.LtU))
-    op(s, W.If(W.Empty))
-    op(s, W.Unreachable)
-    op(s, W.End)
-    for var k = 0; k < len(s.frame.objects); k = k + 1 {
-        if s.frame.objects[k].zeroed {
-            for field in s.frame.objects[k].traced {
-                op(s, W.GlobalGet(s.cx.stackPointer))
-                op(s, W.Convert(W.I32WrapI64))
-                op(s, W.ConstI64(0))
-                op(s, W.Store(W.I64Store, s.offsets[k] + field))
-            }
-        }
-    }
+	if s.frameBytes == 0 { return }
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.ConstI64(s.frameBytes))
+	op(s, W.IntBin(W.W64, W.Sub))
+	op(s, W.GlobalSet(s.cx.stackPointer))
+	-- Nothing guards the memory below the stack, so running out is tested
+	-- here rather than a write over whatever is there. It panics, from the
+	-- caller's frame and with the reserve below the limit for the panic's own
+	-- frames, and returns before this function's body: no frame of it is on
+	-- the trace, as none of the function that overflowed is on arm64's.
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.GlobalGet(s.cx.stackLimit))
+	op(s, W.IntRel(W.W64, W.LtU))
+	op(s, W.If(W.Empty))
+	op(s, W.ConstI64(s.cx.stackBottom))
+	op(s, W.GlobalSet(s.cx.stackLimit))
+	release(s)
+	match definedIndex(s, "turkey_panic") {
+		Some(raise) -> {
+			op(s, W.ConstI64(0))
+			op(s, W.ConstI64(cString(s.cx.strings, "stack overflow")))
+			op(s, W.Call(raise))
+			op(s, W.Drop)
+		}
+		None -> op(s, W.Unreachable)
+	}
+	for t in s.answers { op(s, zeroOf(t)) }
+	op(s, W.Return)
+	op(s, W.End)
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.LocalTee(s.framePointer))
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.ConstI64(s.frameBytes))
+	op(s, W.IntBin(W.W64, W.Add))
+	op(s, W.Store(W.I64Store, 0))
+	-- No site until the first call that may collect names one. The memory
+	-- holds whatever a frame there held before, which may be a site whose
+	-- entry lists slots this frame has not written.
+	op(s, W.LocalGet(s.framePointer))
+	op(s, W.ConstI64(0))
+	op(s, W.Store(W.I64Store, 8))
+	for p in s.source.params { keep(s, p) }
+	for var k = 0; k < len(s.frame.objects); k = k + 1 {
+		if s.frame.objects[k].zeroed {
+			for field in s.frame.objects[k].traced {
+				op(s, W.LocalGet(s.framePointer))
+				op(s, W.ConstI64(0))
+				op(s, W.Store(W.I64Store, s.offsets[k] + field))
+			}
+		}
+	}
+}
+
+-- `v` stored into its slot, if it has one. A slot holds one value from its
+-- definition to the end of the frame (`Turkey.Roots.Frame.slots`), so the
+-- store at the definition is the only one.
+fun keep(s : Sel, v : Value) -> Unit {
+	if let Some(slot) = Roots.slotOf(s.frame, Ssa.valueId(v)) {
+		if !wide(classOf(s, v)) { return stop(s, "a root that is not held in a word") }
+		op(s, W.LocalGet(s.framePointer))
+		get(s, v)
+		op(s, W.Store(W.I64Store, headerBytes + 8 * slot))
+	}
+}
+
+-- Before a call that may collect: the frame's site word set to this site,
+-- and the frame table given the site's roots, the slots and the frame
+-- objects' traced fields live across it. A site with none sets the word to 0,
+-- since the site before it may name slots that hold dead values by now, and
+-- a dead value's object may already be freed.
+fun publish(s : Sel) -> Unit {
+	if !s.publishes { return }
+	let (b, n) = s.place
+	let offsets = []
+	for (slot, _) in Roots.liveAt(s.frame, b, n) { Vec.push(offsets, headerBytes + 8 * slot) }
+	for k in Roots.objectsAt(s.frame, b, n) {
+		for field in s.frame.objects[k].traced { Vec.push(offsets, s.offsets[k] + field) }
+	}
+	let id = if len(offsets) == 0 { 0 } else { site(s) }
+	if id != 0 && !Map.contains(s.entered, id) {
+		Map.put(s.entered, id, ())
+		Vec.push(s.entries, (id, Vec.toArray(offsets)))
+	}
+	op(s, W.LocalGet(s.framePointer))
+	op(s, W.ConstI64(id))
+	op(s, W.Store(W.I64Store, 8))
+}
+
+-- The number of the site being selected, numbering it if this is its first
+-- mention.
+fun site(s : Sel) -> Int {
+	let (b, n) = s.place
+	let key = b << 32 | n
+	if let Some(id) = Map.get(s.sites, key) { return id }
+	s.cx.siteCount = s.cx.siteCount + 1
+	Map.put(s.sites, key, s.cx.siteCount)
+	s.cx.siteCount
+}
+
+-- The number a panic leaving from the site being selected adds to its trace
+-- (`Turkey.Process.tracePush`), with the site added to the trace table; 0,
+-- which counts a frame and prints nothing, for a site with no source
+-- position or none at all (an index of -1).
+fun traceSite(s : Sel) -> Int {
+	let (b, n) = s.place
+	if n < 0 { return 0 }
+	let block = s.source.blocks[b]
+	let at = if n < len(block.insts) { block.insts[n].at } else { block.termAt }
+	if at == 0 { return 0 }
+	let id = site(s)
+	if !Map.contains(s.called, id) {
+		Map.put(s.called, id, ())
+		Vec.push(s.calls, (id, at))
+	}
+	id
 }
 
 -- The shadow stack pointer moved back up past this function's frame, which
 -- every way out of the function does first.
 fun release(s : Sel) -> Unit {
-    if s.frameBytes == 0 { return }
-    op(s, W.GlobalGet(s.cx.stackPointer))
-    op(s, W.ConstI64(s.frameBytes))
-    op(s, W.IntBin(W.W64, W.Add))
-    op(s, W.GlobalSet(s.cx.stackPointer))
+	if s.frameBytes == 0 { return }
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.ConstI64(s.frameBytes))
+	op(s, W.IntBin(W.W64, W.Add))
+	op(s, W.GlobalSet(s.cx.stackPointer))
 }
 
 -- Return what is on the stack.
 fun leave(s : Sel) -> Unit {
-    release(s)
-    op(s, W.Return)
+	release(s)
+	op(s, W.Return)
 }
 
--- Return zeros, which is how a panic leaves every function it passes through.
-fun leaveWithZeros(s : Sel) -> Unit {
-    for t in s.answers { op(s, zeroOf(t)) }
-    leave(s)
+-- Leave as a panic leaves every function it passes through: by the way out
+-- at the end of the body, which adds the site being selected to the trace and
+-- returns zeros.
+fun bail(s : Sel) -> Unit {
+	op(s, W.ConstI64(traceSite(s)))
+	op(s, W.LocalSet(s.leaving))
+	op(s, W.Br(s.depth - 1))
 }
 
 -- -- control flow ------------------------------------------------------------------
 
 fun control(s : Sel, body : Vec St.Control) -> Unit {
-    for step in body {
-        match step {
-            St.Block(inner) -> {
-                op(s, W.Block(W.Empty))
-                control(s, inner)
-                op(s, W.End)
-            }
-            St.Loop(inner) -> {
-                op(s, W.Loop(W.Empty))
-                control(s, inner)
-                op(s, W.End)
-            }
-            St.If(test, taken, otherwise) -> {
-                get(s, test)
-                op(s, W.If(W.Empty))
-                control(s, taken)
-                if len(otherwise) > 0 {
-                    op(s, W.Else)
-                    control(s, otherwise)
-                }
-                op(s, W.End)
-            }
-            St.Br(depth) -> op(s, W.Br(depth))
-            St.BrTable(v, base, targets, default) -> table(s, v, base, targets, default)
-            St.BrCases(v, cases, default) -> {
-                let c = classOf(s, v)
-                for (key, depth) in cases {
-                    get(s, v)
-                    op(s, constant(c, key))
-                    op(s, W.IntRel(widthOf(c), W.Eq))
-                    op(s, W.BrIf(depth))
-                }
-                op(s, W.Br(default))
-            }
-            St.Code(b) -> code(s, Ssa.blockId(b))
-            St.Return(values) -> {
-                for v in values { get(s, v) }
-                leave(s)
-            }
-            -- No test of the flag after the call: it would find the flag the
-            -- call just set, and the path leaves anyway.
-            St.Panic(message) -> match definedIndex(s, "turkey_panic_string") {
-                Some(f) -> {
-                    op(s, W.ConstI64(0))
-                    get(s, message)
-                    op(s, W.Call(f))
-                    op(s, W.Drop)
-                    leaveWithZeros(s)
-                }
-                None -> stop(s, "a panic with no turkey_panic_string")
-            }
-            St.Unreachable -> leaveWithZeros(s)
-        }
-    }
+	for step in body {
+		match step {
+			St.Block(inner) -> {
+				op(s, W.Block(W.Empty))
+				control(s, inner)
+				op(s, W.End)
+			}
+			St.Loop(inner) -> {
+				op(s, W.Loop(W.Empty))
+				control(s, inner)
+				op(s, W.End)
+			}
+			St.If(test, taken, otherwise) -> {
+				get(s, test)
+				op(s, W.If(W.Empty))
+				control(s, taken)
+				if len(otherwise) > 0 {
+					op(s, W.Else)
+					control(s, otherwise)
+				}
+				op(s, W.End)
+			}
+			St.Br(depth)                          -> op(s, W.Br(depth))
+			St.BrTable(v, base, targets, default) -> table(s, v, base, targets, default)
+			St.BrCases(v, cases, default) -> {
+				let c = classOf(s, v)
+				for (key, depth) in cases {
+					get(s, v)
+					op(s, constant(c, key))
+					op(s, W.IntRel(widthOf(c), W.Eq))
+					op(s, W.BrIf(depth))
+				}
+				op(s, W.Br(default))
+			}
+			St.Code(b) -> code(s, Ssa.blockId(b))
+			St.Return(values) -> {
+				for v in values { get(s, v) }
+				leave(s)
+			}
+			-- No test of the flag after the call: it would find the flag the
+			-- call just set, and the path leaves anyway.
+			St.Panic(message) -> match definedIndex(s, "turkey_panic_string") {
+				Some(f) -> {
+					op(s, W.ConstI64(0))
+					get(s, message)
+					op(s, W.Call(f))
+					op(s, W.Drop)
+					bail(s)
+				}
+				None -> stop(s, "a panic with no turkey_panic_string")
+			}
+			-- After a call that never returns, which returns only to leave,
+			-- the site is the call's; otherwise there is none to trace.
+			St.Unreachable -> {
+				let (b, n) = s.place
+				let insts = s.source.blocks[b].insts
+				if n > 0 && isCallOp(insts[n - 1].op) {
+					s.place = (b, n - 1)
+				} else {
+					s.place = (b, -1)
+				}
+				bail(s)
+			}
+		}
+	}
 }
 
 -- A `br_table` on `v` less `base`. An `i32` key subtracts as it is, since
@@ -378,46 +639,50 @@ fun control(s : Sel, body : Vec St.Control) -> Unit {
 -- wrapping it to the 32 bits `br_table` takes could land a key far outside
 -- the range inside it.
 fun table(s : Sel, v : Value, base : Int, targets : Array Int, default : Int) -> Unit {
-    if wide(classOf(s, v)) {
-        let offset = temp(s, W.I64)
-        get(s, v)
-        op(s, W.ConstI64(base))
-        op(s, W.IntBin(W.W64, W.Sub))
-        op(s, W.LocalTee(offset))
-        op(s, W.ConstI64(len(targets)))
-        op(s, W.IntRel(W.W64, W.GeU))
-        op(s, W.BrIf(default))
-        op(s, W.LocalGet(offset))
-        op(s, W.Convert(W.I32WrapI64))
-    } else {
-        get(s, v)
-        if base != 0 {
-            op(s, W.ConstI32(base))
-            op(s, W.IntBin(W.W32, W.Sub))
-        }
-    }
-    op(s, W.BrTable(targets, default))
+	if wide(classOf(s, v)) {
+		let offset = temp(s, W.I64)
+		get(s, v)
+		op(s, W.ConstI64(base))
+		op(s, W.IntBin(W.W64, W.Sub))
+		op(s, W.LocalTee(offset))
+		op(s, W.ConstI64(len(targets)))
+		op(s, W.IntRel(W.W64, W.GeU))
+		op(s, W.BrIf(default))
+		op(s, W.LocalGet(offset))
+		op(s, W.Convert(W.I32WrapI64))
+	} else {
+		get(s, v)
+		if base != 0 {
+			op(s, W.ConstI32(base))
+			op(s, W.IntBin(W.W32, W.Sub))
+		}
+	}
+	op(s, W.BrTable(targets, default))
 }
 
 -- Block `b`'s instructions, then the moves of its jump's arguments into the
 -- target's parameters.
 fun code(s : Sel, b : Int) -> Unit {
-    let block = s.source.blocks[b]
-    for var n = 0; n < len(block.insts); n = n + 1 {
-        s.place = (b, n)
-        -- What follows a tail call is its results, which the call returns
-        -- itself, and nothing runs after it.
-        if isTailCall(s, b, n) {
-            tailCall(s, block.insts[n])
-            return
-        }
-        selectInst(s, block.insts[n])
-    }
-    if let Ssa.Jump(target, args) = block.term {
-        let params = Ssa.blockAt(s.source, target).params
-        for a in args { get(s, a) }
-        for var k = len(params) - 1; k >= 0; k = k - 1 { set(s, params[k]) }
-    }
+	let block = s.source.blocks[b]
+	for p in block.params { keep(s, p) }
+	for var n = 0; n < len(block.insts); n = n + 1 {
+		s.place = (b, n)
+		-- What follows a tail call is its results, which the call returns
+		-- itself, and nothing runs after it.
+		if isTailCall(s, b, n) {
+			tailCall(s, block.insts[n])
+			return
+		}
+		selectInst(s, block.insts[n])
+		keep(s, block.insts[n].result)
+	}
+	-- The terminator, which `control` selects next.
+	s.place = (b, len(block.insts))
+	if let Ssa.Jump(target, args) = block.term {
+		let params = Ssa.blockAt(s.source, target).params
+		for a in args { get(s, a) }
+		for var k = len(params) - 1; k >= 0; k = k - 1 { set(s, params[k]) }
+	}
 }
 
 -- -- tail calls ------------------------------------------------------------------------
@@ -431,489 +696,496 @@ fun code(s : Sel, b : Int) -> Unit {
 -- argument the same way. A call whose operands may reach one of this frame's
 -- objects stays a call, since the frame is gone when the callee runs.
 fun isTailCall(s : Sel, b : Int, n : Int) -> Bool {
-    let f = s.source
-    if !L.inTailPosition(f, b, n) { return False }
-    let block = f.blocks[b]
-    let i = block.insts[n]
-    let answers = match i.op {
-        Call(Direct(name), _) -> match Map.get(s.cx.results, name) {
-            Some(reps) -> reps
-            None -> return False
-        }
-        Call(Indirect(_), _) -> [Ssa.repOf(f, i.result)]
-        _ -> return False
-    }
-    if Array.map(answers, valType) != s.answers { return False }
-    let vs = match L.returned(f, b) {
-        Some(vs) -> vs
-        None -> return False
-    }
-    if len(vs) != len(answers) || vs[0] != i.result { return False }
-    if len(block.insts) - n - 1 != len(vs) - 1 { return False }
-    for var at = n + 1; at < len(block.insts); at = at + 1 {
-        match block.insts[at].op {
-            Result(of, k) -> if of != i.result || k < 1 || k >= len(vs)
-                                || vs[k] != block.insts[at].result {
-                return False
-            }
-            _ -> return False
-        }
-    }
-    len(Roots.objectsAt(s.frame, b, n)) == 0
+	let f = s.source
+	if !L.inTailPosition(f, b, n) { return False }
+	let block = f.blocks[b]
+	let i = block.insts[n]
+	let answers = match i.op {
+		Call(Direct(name), _) -> match Map.get(s.cx.results, name) {
+			Some(reps) -> reps
+			None       -> return False
+		}
+		Call(Indirect(_), _) -> [Ssa.repOf(f, i.result)]
+		_                    -> return False
+	}
+	if Array.map(answers, valType) != s.answers { return False }
+	let vs = match L.returned(f, b) {
+		Some(vs) -> vs
+		None     -> return False
+	}
+	if len(vs) != len(answers) || vs[0] != i.result { return False }
+	if len(block.insts) - n - 1 != len(vs) - 1 { return False }
+	for var at = n + 1; at < len(block.insts); at = at + 1 {
+		match block.insts[at].op {
+			Result(of, k) ->
+				if of != i.result || k < 1 || k >= len(vs) || vs[k] != block.insts[at].result {
+					return False
+				}
+			_ -> return False
+		}
+	}
+	len(Roots.objectsAt(s.frame, b, n)) == 0
 }
 
 -- A call `isTailCall` accepted. No panic test follows: a callee that panics
 -- returns zeros, and returns them to this function's caller.
 fun tailCall(s : Sel, i : Low) -> Unit = match i.op {
-    Call(Direct(name), args) -> match Map.get(s.cx.functions, name) {
-        Some(f) -> {
-            for a in args { get(s, a) }
-            release(s)
-            op(s, W.ReturnCall(f))
-        }
-        None -> stop(s, "a call of @" + name + ", which did not lower")
-    }
-    Call(Indirect(closure), args) -> {
-        let t = closureType(s, args, i.result)
-        closureEnvironment(s, closure)
-        for a in args { get(s, a) }
-        closureCode(s, closure)
-        release(s)
-        op(s, W.ReturnCallIndirect(t, 0))
-    }
-    _ -> stop(s, "a tail call that is not a call of a Turkey function")
+	Call(Direct(name), args) -> match Map.get(s.cx.functions, name) {
+		Some(f) -> {
+			for a in args { get(s, a) }
+			release(s)
+			op(s, W.ReturnCall(f))
+		}
+		None -> stop(s, "a call of @" + name + ", which did not lower")
+	}
+	Call(Indirect(closure), args) -> {
+		let t = closureType(s, args, i.result)
+		closureEnvironment(s, closure)
+		for a in args { get(s, a) }
+		closureCode(s, closure)
+		release(s)
+		op(s, W.ReturnCallIndirect(t, 0))
+	}
+	_ -> stop(s, "a tail call that is not a call of a Turkey function")
 }
 
 -- -- instructions ----------------------------------------------------------------------
 
 fun selectInst(s : Sel, i : Low) -> Unit {
-    let d = i.result
-    let c = classOf(s, d)
-    match i.op {
-        ConstInt(n) -> match c {
-            Unit -> {}
-            _ -> {
-                op(s, constant(c, n))
-                set(s, d)
-            }
-        }
-        ConstFloat(x) -> {
-            op(s, W.ConstF64(x))
-            set(s, d)
-        }
-        -- A unit's local is never written, and so always holds 0.
-        ConstUnit -> {}
-        -- A literal is a static object in data, so reading one is its address.
-        ConstString(text) -> {
-            op(s, W.ConstI64(Map.getOr(s.cx.literals, text, 0)))
-            set(s, d)
-        }
-        Address(a) -> addressOf(s, d, a)
-        Bin(o, a, b) -> if c == F64 { floatBin(s, d, o, a, b) } else { intBin(s, i, d, c, o, a, b) }
-        Cmp(o, a, b) -> {
-            let operand = classOf(s, a)
-            if operand == F64 {
-                floatCmp(s, o, a, b)
-            } else {
-                get(s, a)
-                get(s, b)
-                op(s, W.IntRel(widthOf(operand), relOf(o)))
-            }
-            set(s, d)
-        }
-        Neg(a) -> match c {
-            F64 -> {
-                get(s, a)
-                op(s, W.FloatUn(W.S64, W.Neg))
-                set(s, d)
-            }
-            -- `-minValue()` does not exist, so negating it panics.
-            I64 -> {
-                get(s, a)
-                op(s, W.ConstI64(Int.minValue()))
-                op(s, W.IntRel(W.W64, W.Eq))
-                guard(s, "integer overflow in unary -")
-                op(s, W.ConstI64(0))
-                get(s, a)
-                op(s, W.IntBin(W.W64, W.Sub))
-                set(s, d)
-            }
-            _ -> {
-                op(s, W.ConstI32(0))
-                get(s, a)
-                op(s, W.IntBin(W.W32, W.Sub))
-                set(s, d)
-            }
-        }
-        Not(a) -> {
-            get(s, a)
-            op(s, W.IntEqz(W.W32))
-            set(s, d)
-        }
-        Convert(conversion, a) -> {
-            get(s, a)
-            convert(s, conversion, classOf(s, a), c)
-            set(s, d)
-        }
-        Intrinsic(k, a) -> {
-            intrinsic(s, k, a)
-            set(s, d)
-        }
-        ObjectGet(target, field) -> {
-            address(s, target)
-            load(s, c, field.offset)
-            set(s, d)
-        }
-        ObjectSet(target, field, v) -> {
-            address(s, target)
-            store(s, v, field.offset)
-            barrier(s, target, v)
-        }
-        ObjectTag(target) -> {
-            address(s, target)
-            op(s, W.Load(W.I32Load, 4))
-            set(s, d)
-        }
-        ArrayLength(target) -> {
-            address(s, target)
-            op(s, W.Load(W.I64Load, 8))
-            set(s, d)
-        }
-        -- A cell's value is a whole word, whatever its representation.
-        CellLoad(target) -> {
-            address(s, target)
-            loadWord(s, c, Rt.cellValue)
-            set(s, d)
-        }
-        CellStore(target, v) -> {
-            address(s, target)
-            storeWord(s, v, Rt.cellValue)
-            barrier(s, target, v)
-        }
-        ArrayGet(target, index, slot, check) -> {
-            withinStorage(s, check, target, index)
-            if Rt.fieldWidth(Ssa.repOf(s.source, d)) > 0 {
-                element(s, target, index, slot)
-                load(s, c, Rt.arrayElements + slot.offset)
-                set(s, d)
-            }
-        }
-        ArraySet(target, index, slot, v, check) -> {
-            withinStorage(s, check, target, index)
-            if Rt.fieldWidth(Ssa.repOf(s.source, v)) > 0 {
-                element(s, target, index, slot)
-                store(s, v, Rt.arrayElements + slot.offset)
-            }
-            barrier(s, target, v)
-        }
-        PtrLoad(base, off, rc) -> {
-            let offset = raw(s, base, off)
-            load(s, rc, offset)
-            set(s, d)
-        }
-        PtrStore(base, off, v, _) -> {
-            let offset = raw(s, base, off)
-            store(s, v, offset)
-        }
-        -- With one worker nothing else runs between a load and a store, so
-        -- each atomic access is the plain accesses it is made of.
-        Atomic(o, operands) -> atomic(s, d, o, operands)
-        Move(width, target, at, source, from) -> {
-            if width == 32 {
-                runAddress(s, target, at)
-                runAddress(s, source, from)
-                op(s, W.ConstI32(32))
-                op(s, W.MemoryCopy)
-            } else {
-                let rc = L.fillClass(width)
-                runAddress(s, target, at)
-                runAddress(s, source, from)
-                load(s, rc, 0)
-                op(s, storeKind(rc))
-            }
-        }
-        Fill(width, target, at, v) -> {
-            if width == 32 {
-                let to = temp(s, W.I32)
-                runAddress(s, target, at)
-                op(s, W.LocalSet(to))
-                for offset in [0, 8, 16, 24] {
-                    op(s, W.LocalGet(to))
-                    get(s, v)
-                    op(s, W.Store(W.I64Store, offset))
-                }
-            } else {
-                runAddress(s, target, at)
-                store(s, v, 0)
-            }
-        }
-        -- Fences and polls exist for other workers, and there is none.
-        Ordered(_) -> {}
-        Poll -> {}
-        -- A use for `Turkey.Roots`, which emits nothing.
-        KeepAlive(_) -> {}
-        MemoryGrow(pages) -> {
-            get(s, pages)
-            op(s, W.Convert(W.I32WrapI64))
-            op(s, W.MemoryGrow)
-            op(s, W.Convert(W.I64ExtendI32S))
-            set(s, d)
-        }
-        CellNew(v) -> {
-            let traced = Rt.traceBit(Ssa.repOf(s.source, v))
-            allocate(s, d, Rt.cellBytes, "turkey_cell_new", [0, traced])
-            header(s, d, Rt.headerWord(Rt.cellKind, traced, 0))
-            address(s, d)
-            storeWord(s, v, Rt.cellValue)
-        }
-        ObjectNew(kind, tag, layout, fields, _) -> {
-            let bytes = Rt.objectBytes(layout)
-            allocate(s, d, bytes, "turkey_object_new",
-                     [kind, tag, bytes - Rt.objectFields, layout.pointers])
-            header(s, d, Rt.headerWord(kind, layout.pointers, tag))
-            for var k = 0; k < len(fields); k = k + 1 {
-                address(s, d)
-                store(s, fields[k], Rt.fieldOffset(layout, k))
-            }
-        }
-        -- An array's size is known only at run time, and the runtime places
-        -- it, filled: the fill crosses as a word of the value's bits, of
-        -- which the runtime reads the element's low bytes.
-        ArrayNew(length, fill, element) -> match definedIndex(s, "turkey_array_new") {
-            Some(f) -> {
-                op(s, W.ConstI64(0))
-                get(s, length)
-                get(s, fill)
-                match classOf(s, fill) {
-                    I64 | Ptr -> {}
-                    F64 -> op(s, W.Convert(W.I64ReinterpretF64))
-                    _ -> op(s, W.Convert(W.I64ExtendI32U))
-                }
-                op(s, W.ConstI64(element.stride))
-                op(s, W.ConstI64(element.layout.pointers))
-                op(s, W.Call(f))
-                set(s, d)
-                propagate(s)
-            }
-            None -> stop(s, "an array with no turkey_array_new")
-        }
-        -- The code is a slot in the table, which is what an indirect call
-        -- loads back out of the shell and calls through.
-        ClosureNew(code, environment) -> match Map.get(s.cx.slots, code) {
-            Some(slot) -> {
-                allocate(s, d, Rt.objectBytes(Rt.closureShell), "turkey_closure_shell", [slot])
-                header(s, d, Rt.headerWord(Rt.closureKind, Rt.closureShell.pointers, -1))
-                shell(s, d, slot, environment)
-            }
-            None -> stop(s, "a closure over @" + code + ", which has no table slot")
-        }
-        -- An object in this function's frame: the header a heap object of its
-        -- layout would have, then its fields.
-        StackObject(kind, tag, layout, fields) -> {
-            frameObject(s, d)
-            header(s, d, Rt.headerWord(kind, layout.pointers, tag))
-            for var k = 0; k < len(fields); k = k + 1 {
-                address(s, d)
-                store(s, fields[k], Rt.fieldOffset(layout, k))
-            }
-        }
-        StackClosure(code, environment) -> match Map.get(s.cx.slots, code) {
-            Some(slot) -> {
-                frameObject(s, d)
-                header(s, d, Rt.headerWord(Rt.closureKind, Rt.closureShell.pointers, -1))
-                shell(s, d, slot, environment)
-            }
-            None -> stop(s, "a closure over @" + code + ", which has no table slot")
-        }
-        ClosureCapture(closure, field, v) -> {
-            let environment = temp(s, W.I64)
-            address(s, closure)
-            op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
-            op(s, W.LocalSet(environment))
-            op(s, W.LocalGet(environment))
-            op(s, W.Convert(W.I32WrapI64))
-            store(s, v, field.offset)
-            if storesObject(s, v) { barrierAt(s, environment, localOf(s, v)) }
-        }
-        Call(callee, args) -> call(s, d, callee, args)
-        -- Set by the call it follows (`results`).
-        Result(_, _) -> {}
-        GlobalLoad(name) -> match Map.get(s.cx.globals, name) {
-            Some(at) -> {
-                op(s, W.ConstI32(at))
-                loadWord(s, c, 0)
-                set(s, d)
-            }
-            None -> stop(s, "a load of the global " + name + ", which has no storage")
-        }
-        GlobalStore(name, v) -> match Map.get(s.cx.globals, name) {
-            Some(at) -> {
-                op(s, W.ConstI32(at))
-                storeWord(s, v, 0)
-            }
-            None -> stop(s, "a store to the global " + name + ", which has no storage")
-        }
-        _ -> stop(s, L.showOpName(i.op))
-    }
+	let d = i.result
+	let c = classOf(s, d)
+	match i.op {
+		ConstInt(n) -> match c {
+			Unit -> {}
+			_ -> {
+				op(s, constant(c, n))
+				set(s, d)
+			}
+		}
+		ConstFloat(x) -> {
+			op(s, W.ConstF64(x))
+			set(s, d)
+		}
+		-- A unit's local is never written, and so always holds 0.
+		ConstUnit -> {}
+		-- A literal is a static object in data, so reading one is its address.
+		ConstString(text) -> {
+			op(s, W.ConstI64(Map.getOr(s.cx.literals, text, 0)))
+			set(s, d)
+		}
+		Address(a)   -> addressOf(s, d, a)
+		Bin(o, a, b) -> if c == F64 { floatBin(s, d, o, a, b) } else { intBin(s, i, d, c, o, a, b) }
+		Cmp(o, a, b) -> {
+			let operand = classOf(s, a)
+			if operand == F64 {
+				floatCmp(s, o, a, b)
+			} else {
+				get(s, a)
+				get(s, b)
+				op(s, W.IntRel(widthOf(operand), relOf(o)))
+			}
+			set(s, d)
+		}
+		Neg(a) -> match c {
+			F64 -> {
+				get(s, a)
+				op(s, W.FloatUn(W.S64, W.Neg))
+				set(s, d)
+			}
+			-- `-minValue()` does not exist, so negating it panics.
+			I64 -> {
+				get(s, a)
+				op(s, W.ConstI64(Int.minValue()))
+				op(s, W.IntRel(W.W64, W.Eq))
+				guard(s, "integer overflow in unary -")
+				op(s, W.ConstI64(0))
+				get(s, a)
+				op(s, W.IntBin(W.W64, W.Sub))
+				set(s, d)
+			}
+			_ -> {
+				op(s, W.ConstI32(0))
+				get(s, a)
+				op(s, W.IntBin(W.W32, W.Sub))
+				set(s, d)
+			}
+		}
+		Not(a) -> {
+			get(s, a)
+			op(s, W.IntEqz(W.W32))
+			set(s, d)
+		}
+		Convert(conversion, a) -> {
+			get(s, a)
+			convert(s, conversion, classOf(s, a), c)
+			set(s, d)
+		}
+		Intrinsic(k, a) -> {
+			intrinsic(s, k, a)
+			set(s, d)
+		}
+		ObjectGet(target, field) -> {
+			address(s, target)
+			load(s, c, field.offset)
+			set(s, d)
+		}
+		ObjectSet(target, field, v) -> {
+			address(s, target)
+			store(s, v, field.offset)
+			barrier(s, target, v)
+		}
+		ObjectTag(target) -> {
+			address(s, target)
+			op(s, W.Load(W.I32Load, 4))
+			set(s, d)
+		}
+		ArrayLength(target) -> {
+			address(s, target)
+			op(s, W.Load(W.I64Load, 8))
+			set(s, d)
+		}
+		-- A cell's value is a whole word, whatever its representation.
+		CellLoad(target) -> {
+			address(s, target)
+			loadWord(s, c, Rt.cellValue)
+			set(s, d)
+		}
+		CellStore(target, v) -> {
+			address(s, target)
+			storeWord(s, v, Rt.cellValue)
+			barrier(s, target, v)
+		}
+		ArrayGet(target, index, slot, check) -> {
+			withinStorage(s, check, target, index)
+			if Rt.fieldWidth(Ssa.repOf(s.source, d)) > 0 {
+				element(s, target, index, slot)
+				load(s, c, Rt.arrayElements + slot.offset)
+				set(s, d)
+			}
+		}
+		ArraySet(target, index, slot, v, check) -> {
+			withinStorage(s, check, target, index)
+			if Rt.fieldWidth(Ssa.repOf(s.source, v)) > 0 {
+				element(s, target, index, slot)
+				store(s, v, Rt.arrayElements + slot.offset)
+			}
+			barrier(s, target, v)
+		}
+		PtrLoad(base, off, rc) -> {
+			let offset = raw(s, base, off)
+			load(s, rc, offset)
+			set(s, d)
+		}
+		PtrStore(base, off, v, _) -> {
+			let offset = raw(s, base, off)
+			store(s, v, offset)
+		}
+		-- With one worker nothing else runs between a load and a store, so
+		-- each atomic access is the plain accesses it is made of.
+		Atomic(o, operands) -> atomic(s, d, o, operands)
+		Move(width, target, at, source, from) -> {
+			if width == 32 {
+				runAddress(s, target, at)
+				runAddress(s, source, from)
+				op(s, W.ConstI32(32))
+				op(s, W.MemoryCopy)
+			} else {
+				let rc = L.fillClass(width)
+				runAddress(s, target, at)
+				runAddress(s, source, from)
+				load(s, rc, 0)
+				op(s, storeKind(rc))
+			}
+		}
+		Fill(width, target, at, v) -> {
+			if width == 32 {
+				let to = temp(s, W.I32)
+				runAddress(s, target, at)
+				op(s, W.LocalSet(to))
+				for offset in [0, 8, 16, 24] {
+					op(s, W.LocalGet(to))
+					get(s, v)
+					op(s, W.Store(W.I64Store, offset))
+				}
+			} else {
+				runAddress(s, target, at)
+				store(s, v, 0)
+			}
+		}
+		-- Fences and polls exist for other workers, and there is none.
+		Ordered(_) -> {}
+		Poll       -> {}
+		-- A use for `Turkey.Roots`, which emits nothing.
+		KeepAlive(_) -> {}
+		MemoryGrow(pages) -> {
+			get(s, pages)
+			op(s, W.Convert(W.I32WrapI64))
+			op(s, W.MemoryGrow)
+			op(s, W.Convert(W.I64ExtendI32S))
+			set(s, d)
+		}
+		CellNew(v) -> {
+			let traced = Rt.traceBit(Ssa.repOf(s.source, v))
+			allocate(s, d, Rt.cellBytes, "turkey_cell_new", [0, traced])
+			header(s, d, Rt.headerWord(Rt.cellKind, traced, 0))
+			address(s, d)
+			storeWord(s, v, Rt.cellValue)
+		}
+		ObjectNew(kind, tag, layout, fields, _) -> {
+			let bytes = Rt.objectBytes(layout)
+			allocate(s, d, bytes, "turkey_object_new", [
+				kind,
+				tag,
+				bytes - Rt.objectFields,
+				layout.pointers,
+			])
+			header(s, d, Rt.headerWord(kind, layout.pointers, tag))
+			for var k = 0; k < len(fields); k = k + 1 {
+				address(s, d)
+				store(s, fields[k], Rt.fieldOffset(layout, k))
+			}
+		}
+		-- An array's size is known only at run time, and the runtime places
+		-- it, filled: the fill crosses as a word of the value's bits, of
+		-- which the runtime reads the element's low bytes.
+		ArrayNew(length, fill, element) -> match definedIndex(s, "turkey_array_new") {
+			Some(f) -> {
+				publish(s)
+				op(s, W.ConstI64(0))
+				get(s, length)
+				get(s, fill)
+				match classOf(s, fill) {
+					I64 | Ptr -> {}
+					F64       -> op(s, W.Convert(W.I64ReinterpretF64))
+					_         -> op(s, W.Convert(W.I64ExtendI32U))
+				}
+				op(s, W.ConstI64(element.stride))
+				op(s, W.ConstI64(element.layout.pointers))
+				op(s, W.Call(f))
+				set(s, d)
+				propagate(s)
+			}
+			None -> stop(s, "an array with no turkey_array_new")
+		}
+		-- The code is a slot in the table, which is what an indirect call
+		-- loads back out of the shell and calls through.
+		ClosureNew(code, environment) -> match Map.get(s.cx.slots, code) {
+			Some(slot) -> {
+				allocate(s, d, Rt.objectBytes(Rt.closureShell), "turkey_closure_shell", [slot])
+				header(s, d, Rt.headerWord(Rt.closureKind, Rt.closureShell.pointers, -1))
+				shell(s, d, slot, environment)
+			}
+			None -> stop(s, "a closure over @" + code + ", which has no table slot")
+		}
+		-- An object in this function's frame: the header a heap object of its
+		-- layout would have, then its fields.
+		StackObject(kind, tag, layout, fields) -> {
+			frameObject(s, d)
+			header(s, d, Rt.headerWord(kind, layout.pointers, tag))
+			for var k = 0; k < len(fields); k = k + 1 {
+				address(s, d)
+				store(s, fields[k], Rt.fieldOffset(layout, k))
+			}
+		}
+		StackClosure(code, environment) -> match Map.get(s.cx.slots, code) {
+			Some(slot) -> {
+				frameObject(s, d)
+				header(s, d, Rt.headerWord(Rt.closureKind, Rt.closureShell.pointers, -1))
+				shell(s, d, slot, environment)
+			}
+			None -> stop(s, "a closure over @" + code + ", which has no table slot")
+		}
+		ClosureCapture(closure, field, v) -> {
+			let environment = temp(s, W.I64)
+			address(s, closure)
+			op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
+			op(s, W.LocalSet(environment))
+			op(s, W.LocalGet(environment))
+			op(s, W.Convert(W.I32WrapI64))
+			store(s, v, field.offset)
+			if storesObject(s, v) { barrierAt(s, environment, localOf(s, v)) }
+		}
+		Call(callee, args) -> call(s, d, callee, args)
+		-- Set by the call it follows (`results`).
+		Result(_, _) -> {}
+		GlobalLoad(name) -> match Map.get(s.cx.globals, name) {
+			Some(at) -> {
+				op(s, W.ConstI32(at))
+				loadWord(s, c, 0)
+				set(s, d)
+			}
+			None -> stop(s, "a load of the global " + name + ", which has no storage")
+		}
+		GlobalStore(name, v) -> match Map.get(s.cx.globals, name) {
+			Some(at) -> {
+				op(s, W.ConstI32(at))
+				storeWord(s, v, 0)
+			}
+			None -> stop(s, "a store to the global " + name + ", which has no storage")
+		}
+		_ -> stop(s, L.showOpName(i.op))
+	}
 }
 
 fun addressOf(s : Sel, d : Value, a : AddressOf) -> Unit {
-    match a {
-        CBytes(text) -> op(s, W.ConstI64(cString(s.cx.strings, text)))
-        -- A code address is the definition's slot in the table.
-        CodeOf(symbol) -> match Map.get(s.cx.defined, symbol) {
-            Some(name) -> match Map.get(s.cx.slots, name) {
-                Some(slot) -> op(s, W.ConstI64(slot))
-                None -> return stop(s, "address.code")
-            }
-            None -> return stop(s, "the code address of " + symbol + ", which wasm does not define")
-        }
-        -- The frame this function's objects are in, which is the shadow
-        -- stack pointer once the prologue has moved it.
-        ThisFrame -> op(s, W.GlobalGet(s.cx.stackPointer))
-        ProcessState -> op(s, W.GlobalGet(s.cx.worker))
-        AllocSites -> return stop(s, "address.sites")
-    }
-    set(s, d)
+	match a {
+		CBytes(text) -> op(s, W.ConstI64(cString(s.cx.strings, text)))
+		-- A code address is the definition's slot in the table.
+		CodeOf(symbol) -> match Map.get(s.cx.defined, symbol) {
+			Some(name) -> match Map.get(s.cx.slots, name) {
+				Some(slot) -> op(s, W.ConstI64(slot))
+				None       -> return stop(s, "address.code")
+			}
+			None -> return stop(s, "the code address of " + symbol + ", which wasm does not define")
+		}
+		-- `Prim.frameAddress`: the innermost shadow frame, which is where a
+		-- walk of the shadow stack starts and what this function's objects
+		-- are in. It is this function's own once the prologue has pushed
+		-- one, and otherwise the nearest caller's that has one.
+		ThisFrame    -> op(s, W.GlobalGet(s.cx.stackPointer))
+		ProcessState -> op(s, W.GlobalGet(s.cx.worker))
+		AllocSites   -> return stop(s, "address.sites")
+	}
+	set(s, d)
 }
 
 -- -- arithmetic --------------------------------------------------------------------
 
 fun intBin(s : Sel, i : Low, d : Value, c : RepClass, o : BinOp, a : Value, b : Value) -> Unit {
-    let w = widthOf(c)
-    let plain = fun(x : W.IntBinOp) {
-        get(s, a)
-        get(s, b)
-        op(s, W.IntBin(w, x))
-        set(s, d)
-    }
-    match o {
-        AddWrap -> plain(W.Add)
-        SubWrap -> plain(W.Sub)
-        MulWrap -> plain(W.Mul)
-        And -> plain(W.And)
-        Or -> plain(W.Or)
-        Xor -> plain(W.Xor)
-        Shl -> plain(W.Shl)
-        Shr -> plain(W.ShrS)
-        ShrU -> plain(W.ShrU)
-        MulHighU -> {
-            highUnsigned(s, localOf(s, a), localOf(s, b))
-            set(s, d)
-        }
-        -- `Byte` and `Char` arithmetic widens to `Int` first, so a checked
-        -- operation reaches here only at `i64`.
-        _ -> if c != I64 {
-            stop(s, "the binary operation " + show(o) + " at a narrow width")
-        } else {
-            checked(s, i, d, o, a, b)
-        }
-    }
+	let w = widthOf(c)
+	let plain = fun(x : W.IntBinOp) {
+		get(s, a)
+		get(s, b)
+		op(s, W.IntBin(w, x))
+		set(s, d)
+	}
+	match o {
+		AddWrap -> plain(W.Add)
+		SubWrap -> plain(W.Sub)
+		MulWrap -> plain(W.Mul)
+		And     -> plain(W.And)
+		Or      -> plain(W.Or)
+		Xor     -> plain(W.Xor)
+		Shl     -> plain(W.Shl)
+		Shr     -> plain(W.ShrS)
+		ShrU    -> plain(W.ShrU)
+		MulHighU -> {
+			highUnsigned(s, localOf(s, a), localOf(s, b))
+			set(s, d)
+		}
+		-- `Byte` and `Char` arithmetic widens to `Int` first, so a checked
+		-- operation reaches here only at `i64`.
+		_ -> if c != I64 {
+			stop(s, "the binary operation " + show(o) + " at a narrow width")
+		} else {
+			checked(s, i, d, o, a, b)
+		}
+	}
 }
 
 -- The operations that panic rather than wrap: overflow in `+`, `-` and `*`,
 -- and a zero divisor or the one quotient that does not fit in `/` and `%`.
 fun checked(s : Sel, i : Low, d : Value, o : BinOp, a : Value, b : Value) -> Unit {
-    match o {
-        -- The sum overflowed exactly when adding `b` moved it the wrong way:
-        -- below `a` for a `b` that is not negative, or not below for one that
-        -- is.
-        Add -> {
-            get(s, a)
-            get(s, b)
-            op(s, W.IntBin(W.W64, W.Add))
-            set(s, d)
-            get(s, b)
-            op(s, W.ConstI64(0))
-            op(s, W.IntRel(W.W64, W.LtS))
-            get(s, d)
-            get(s, a)
-            op(s, W.IntRel(W.W64, W.LtS))
-            op(s, W.IntBin(W.W32, W.Xor))
-            guard(s, "integer overflow in +")
-        }
-        Sub -> {
-            get(s, a)
-            get(s, b)
-            op(s, W.IntBin(W.W64, W.Sub))
-            set(s, d)
-            get(s, b)
-            op(s, W.ConstI64(0))
-            op(s, W.IntRel(W.W64, W.LtS))
-            get(s, a)
-            get(s, d)
-            op(s, W.IntRel(W.W64, W.LtS))
-            op(s, W.IntBin(W.W32, W.Xor))
-            guard(s, "integer overflow in -")
-        }
-        -- The product overflows exactly when the high word of the full
-        -- 128-bit product is not the sign extension of the low word. Wasm has
-        -- no high multiply in every engine, so the signed high word is the
-        -- unsigned one corrected for each negative operand: less `b` if `a`
-        -- is negative, and less `a` if `b` is.
-        Mul -> {
-            get(s, a)
-            get(s, b)
-            op(s, W.IntBin(W.W64, W.Mul))
-            set(s, d)
-            highUnsigned(s, localOf(s, a), localOf(s, b))
-            get(s, b)
-            get(s, a)
-            op(s, W.ConstI64(63))
-            op(s, W.IntBin(W.W64, W.ShrS))
-            op(s, W.IntBin(W.W64, W.And))
-            op(s, W.IntBin(W.W64, W.Sub))
-            get(s, a)
-            get(s, b)
-            op(s, W.ConstI64(63))
-            op(s, W.IntBin(W.W64, W.ShrS))
-            op(s, W.IntBin(W.W64, W.And))
-            op(s, W.IntBin(W.W64, W.Sub))
-            get(s, d)
-            op(s, W.ConstI64(63))
-            op(s, W.IntBin(W.W64, W.ShrS))
-            op(s, W.IntRel(W.W64, W.Ne))
-            guard(s, "integer overflow in *")
-        }
-        -- `i64.div_s` traps on both cases the language panics on, so both
-        -- are tested first. A constant divisor other than 0 cannot raise the
-        -- first, and one other than -1 cannot raise the second.
-        Div -> {
-            let k = known(s, b)
-            if k == None || k == Some(0) { nonzero(s, b, "division by zero") }
-            if k == None || k == Some(-1) {
-                get(s, a)
-                op(s, W.ConstI64(Int.minValue()))
-                op(s, W.IntRel(W.W64, W.Eq))
-                get(s, b)
-                op(s, W.ConstI64(-1))
-                op(s, W.IntRel(W.W64, W.Eq))
-                op(s, W.IntBin(W.W32, W.And))
-                guard(s, "integer overflow in /")
-            }
-            get(s, a)
-            get(s, b)
-            op(s, W.IntBin(W.W64, W.DivS))
-            set(s, d)
-        }
-        -- `i64.rem_s` traps only on a zero divisor. The most negative integer
-        -- by -1 is 0, its mathematical remainder, as the language says.
-        Rem -> {
-            let k = known(s, b)
-            if k == None || k == Some(0) { nonzero(s, b, "remainder by zero") }
-            get(s, a)
-            get(s, b)
-            op(s, W.IntBin(W.W64, W.RemS))
-            set(s, d)
-        }
-        _ -> stop(s, "the binary operation " + show(o))
-    }
+	match o {
+		-- The sum overflowed exactly when adding `b` moved it the wrong way:
+		-- below `a` for a `b` that is not negative, or not below for one that
+		-- is.
+		Add -> {
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.Add))
+			set(s, d)
+			get(s, b)
+			op(s, W.ConstI64(0))
+			op(s, W.IntRel(W.W64, W.LtS))
+			get(s, d)
+			get(s, a)
+			op(s, W.IntRel(W.W64, W.LtS))
+			op(s, W.IntBin(W.W32, W.Xor))
+			guard(s, "integer overflow in +")
+		}
+		Sub -> {
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.Sub))
+			set(s, d)
+			get(s, b)
+			op(s, W.ConstI64(0))
+			op(s, W.IntRel(W.W64, W.LtS))
+			get(s, a)
+			get(s, d)
+			op(s, W.IntRel(W.W64, W.LtS))
+			op(s, W.IntBin(W.W32, W.Xor))
+			guard(s, "integer overflow in -")
+		}
+		-- The product overflows exactly when the high word of the full
+		-- 128-bit product is not the sign extension of the low word. Wasm has
+		-- no high multiply in every engine, so the signed high word is the
+		-- unsigned one corrected for each negative operand: less `b` if `a`
+		-- is negative, and less `a` if `b` is.
+		Mul -> {
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.Mul))
+			set(s, d)
+			highUnsigned(s, localOf(s, a), localOf(s, b))
+			get(s, b)
+			get(s, a)
+			op(s, W.ConstI64(63))
+			op(s, W.IntBin(W.W64, W.ShrS))
+			op(s, W.IntBin(W.W64, W.And))
+			op(s, W.IntBin(W.W64, W.Sub))
+			get(s, a)
+			get(s, b)
+			op(s, W.ConstI64(63))
+			op(s, W.IntBin(W.W64, W.ShrS))
+			op(s, W.IntBin(W.W64, W.And))
+			op(s, W.IntBin(W.W64, W.Sub))
+			get(s, d)
+			op(s, W.ConstI64(63))
+			op(s, W.IntBin(W.W64, W.ShrS))
+			op(s, W.IntRel(W.W64, W.Ne))
+			guard(s, "integer overflow in *")
+		}
+		-- `i64.div_s` traps on both cases the language panics on, so both
+		-- are tested first. A constant divisor other than 0 cannot raise the
+		-- first, and one other than -1 cannot raise the second.
+		Div -> {
+			let k = known(s, b)
+			if k == None || k == Some(0) { nonzero(s, b, "division by zero") }
+			if k == None || k == Some(-1) {
+				get(s, a)
+				op(s, W.ConstI64(Int.minValue()))
+				op(s, W.IntRel(W.W64, W.Eq))
+				get(s, b)
+				op(s, W.ConstI64(-1))
+				op(s, W.IntRel(W.W64, W.Eq))
+				op(s, W.IntBin(W.W32, W.And))
+				guard(s, "integer overflow in /")
+			}
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.DivS))
+			set(s, d)
+		}
+		-- `i64.rem_s` traps only on a zero divisor. The most negative integer
+		-- by -1 is 0, its mathematical remainder, as the language says.
+		Rem -> {
+			let k = known(s, b)
+			if k == None || k == Some(0) { nonzero(s, b, "remainder by zero") }
+			get(s, a)
+			get(s, b)
+			op(s, W.IntBin(W.W64, W.RemS))
+			set(s, d)
+		}
+		_ -> stop(s, "the binary operation " + show(o))
+	}
 }
 
 fun nonzero(s : Sel, b : Value, message : String) -> Unit {
-    get(s, b)
-    op(s, W.IntEqz(W.W64))
-    guard(s, message)
+	get(s, b)
+	op(s, W.IntEqz(W.W64))
+	guard(s, message)
 }
 
 -- Pushes the high 64 bits of the unsigned 128-bit product of the `i64`
@@ -921,181 +1193,181 @@ fun nonzero(s : Sel, b : Value, message : String) -> Unit {
 -- fits in 64 bits, and the sum of the middle terms with the carry out of the
 -- low one fits in 34.
 fun highUnsigned(s : Sel, x : Int, y : Int) -> Unit {
-    let low = 0xFFFF_FFFF
-    let half = fun(from : Int, high : Bool) -> Int {
-        let t = temp(s, W.I64)
-        op(s, W.LocalGet(from))
-        if high {
-            op(s, W.ConstI64(32))
-            op(s, W.IntBin(W.W64, W.ShrU))
-        } else {
-            op(s, W.ConstI64(low))
-            op(s, W.IntBin(W.W64, W.And))
-        }
-        op(s, W.LocalSet(t))
-        t
-    }
-    let product = fun(p : Int, q : Int) -> Int {
-        let t = temp(s, W.I64)
-        op(s, W.LocalGet(p))
-        op(s, W.LocalGet(q))
-        op(s, W.IntBin(W.W64, W.Mul))
-        op(s, W.LocalSet(t))
-        t
-    }
-    let xLow = half(x, False)
-    let xHigh = half(x, True)
-    let yLow = half(y, False)
-    let yHigh = half(y, True)
-    let lowHigh = product(xLow, yHigh)
-    let highLow = product(xHigh, yLow)
-    -- The middle: the low product's carry and the low halves of the cross
-    -- terms. Its own carry is what reaches the high word.
-    op(s, W.LocalGet(xLow))
-    op(s, W.LocalGet(yLow))
-    op(s, W.IntBin(W.W64, W.Mul))
-    op(s, W.ConstI64(32))
-    op(s, W.IntBin(W.W64, W.ShrU))
-    for t in [lowHigh, highLow] {
-        op(s, W.LocalGet(t))
-        op(s, W.ConstI64(low))
-        op(s, W.IntBin(W.W64, W.And))
-        op(s, W.IntBin(W.W64, W.Add))
-    }
-    op(s, W.ConstI64(32))
-    op(s, W.IntBin(W.W64, W.ShrU))
-    op(s, W.LocalGet(xHigh))
-    op(s, W.LocalGet(yHigh))
-    op(s, W.IntBin(W.W64, W.Mul))
-    op(s, W.IntBin(W.W64, W.Add))
-    for t in [lowHigh, highLow] {
-        op(s, W.LocalGet(t))
-        op(s, W.ConstI64(32))
-        op(s, W.IntBin(W.W64, W.ShrU))
-        op(s, W.IntBin(W.W64, W.Add))
-    }
+	let low = 0xFFFF_FFFF
+	let half = fun(from : Int, high : Bool) -> Int {
+		let t = temp(s, W.I64)
+		op(s, W.LocalGet(from))
+		if high {
+			op(s, W.ConstI64(32))
+			op(s, W.IntBin(W.W64, W.ShrU))
+		} else {
+			op(s, W.ConstI64(low))
+			op(s, W.IntBin(W.W64, W.And))
+		}
+		op(s, W.LocalSet(t))
+		t
+	}
+	let product = fun(p : Int, q : Int) -> Int {
+		let t = temp(s, W.I64)
+		op(s, W.LocalGet(p))
+		op(s, W.LocalGet(q))
+		op(s, W.IntBin(W.W64, W.Mul))
+		op(s, W.LocalSet(t))
+		t
+	}
+	let xLow = half(x, False)
+	let xHigh = half(x, True)
+	let yLow = half(y, False)
+	let yHigh = half(y, True)
+	let lowHigh = product(xLow, yHigh)
+	let highLow = product(xHigh, yLow)
+	-- The middle: the low product's carry and the low halves of the cross
+	-- terms. Its own carry is what reaches the high word.
+	op(s, W.LocalGet(xLow))
+	op(s, W.LocalGet(yLow))
+	op(s, W.IntBin(W.W64, W.Mul))
+	op(s, W.ConstI64(32))
+	op(s, W.IntBin(W.W64, W.ShrU))
+	for t in [lowHigh, highLow] {
+		op(s, W.LocalGet(t))
+		op(s, W.ConstI64(low))
+		op(s, W.IntBin(W.W64, W.And))
+		op(s, W.IntBin(W.W64, W.Add))
+	}
+	op(s, W.ConstI64(32))
+	op(s, W.IntBin(W.W64, W.ShrU))
+	op(s, W.LocalGet(xHigh))
+	op(s, W.LocalGet(yHigh))
+	op(s, W.IntBin(W.W64, W.Mul))
+	op(s, W.IntBin(W.W64, W.Add))
+	for t in [lowHigh, highLow] {
+		op(s, W.LocalGet(t))
+		op(s, W.ConstI64(32))
+		op(s, W.IntBin(W.W64, W.ShrU))
+		op(s, W.IntBin(W.W64, W.Add))
+	}
 }
 
 -- Floating point does not trap: IEEE 754 makes an overflow an
 -- infinity, which is a value.
 fun floatBin(s : Sel, d : Value, o : BinOp, a : Value, b : Value) -> Unit {
-    let arithmetic = fun(x : W.FloatBinOp) {
-        get(s, a)
-        get(s, b)
-        op(s, W.FloatBin(W.S64, x))
-        set(s, d)
-    }
-    match o {
-        Add -> arithmetic(W.FAdd)
-        Sub -> arithmetic(W.FSub)
-        Mul -> arithmetic(W.FMul)
-        Div -> arithmetic(W.FDiv)
-        -- The language's `%` on `Float` is C's `fmod`, which wasm has no
-        -- instruction for and a wasm program no C library to call.
-        Rem -> stop(s, "a Float remainder, which needs C's fmod")
-        _ -> stop(s, "the binary operation " + show(o) + " on a double")
-    }
+	let arithmetic = fun(x : W.FloatBinOp) {
+		get(s, a)
+		get(s, b)
+		op(s, W.FloatBin(W.S64, x))
+		set(s, d)
+	}
+	match o {
+		Add -> arithmetic(W.FAdd)
+		Sub -> arithmetic(W.FSub)
+		Mul -> arithmetic(W.FMul)
+		Div -> arithmetic(W.FDiv)
+		-- The language's `%` on `Float` is C's `fmod`, which wasm has no
+		-- instruction for and a wasm program no C library to call.
+		Rem -> stop(s, "a Float remainder, which needs C's fmod")
+		_   -> stop(s, "the binary operation " + show(o) + " on a double")
+	}
 }
 
 -- Every comparison of doubles is ordered: false when either side is NaN, `!=`
 -- included, which `f64.ne` is not. So `!=` is less or greater.
 fun floatCmp(s : Sel, o : CmpOp, a : Value, b : Value) -> Unit {
-    let compare = fun(x : W.FloatRel) {
-        get(s, a)
-        get(s, b)
-        op(s, W.FloatRel(W.S64, x))
-    }
-    match o {
-        Eq -> compare(W.FEq)
-        Lt -> compare(W.FLt)
-        Le -> compare(W.FLe)
-        Gt -> compare(W.FGt)
-        Ge -> compare(W.FGe)
-        Ne -> {
-            compare(W.FLt)
-            compare(W.FGt)
-            op(s, W.IntBin(W.W32, W.Or))
-        }
-    }
+	let compare = fun(x : W.FloatRel) {
+		get(s, a)
+		get(s, b)
+		op(s, W.FloatRel(W.S64, x))
+	}
+	match o {
+		Eq -> compare(W.FEq)
+		Lt -> compare(W.FLt)
+		Le -> compare(W.FLe)
+		Gt -> compare(W.FGt)
+		Ge -> compare(W.FGe)
+		Ne -> {
+			compare(W.FLt)
+			compare(W.FGt)
+			op(s, W.IntBin(W.W32, W.Or))
+		}
+	}
 }
 
 fun relOf(o : CmpOp) -> W.IntRel = match o {
-    Eq -> W.Eq
-    Ne -> W.Ne
-    Lt -> W.LtS
-    Le -> W.LeS
-    Gt -> W.GtS
-    Ge -> W.GeS
+	Eq -> W.Eq
+	Ne -> W.Ne
+	Lt -> W.LtS
+	Le -> W.LeS
+	Gt -> W.GtS
+	Ge -> W.GeS
 }
 
 -- The value on the stack, of class `from`, converted to class `to`.
 fun convert(s : Sel, conversion : Conv, from : RepClass, to : RepClass) -> Unit = match conversion {
-    IntToFloat -> op(s, W.Convert(W.F64ConvertI64S))
-    -- Saturating, as arm64's `fcvtzs` is: a NaN is 0, and a double out of
-    -- range is the nearest end of it.
-    FloatToInt -> op(s, W.Convert(W.I64TruncSatF64S))
-    -- A narrow value is held zero-extended, so widening one to another
-    -- narrow width changes nothing, and to a word is a zero extension.
-    Widen -> if !wide(from) && wide(to) { op(s, W.Convert(W.I64ExtendI32U)) }
-    Narrow -> {
-        if wide(from) && !wide(to) { op(s, W.Convert(W.I32WrapI64)) }
-        match to {
-            I8 -> {
-                op(s, W.ConstI32(0xFF))
-                op(s, W.IntBin(W.W32, W.And))
-            }
-            I1 -> {
-                op(s, W.ConstI32(1))
-                op(s, W.IntBin(W.W32, W.And))
-            }
-            _ -> {}
-        }
-    }
-    -- The same bits, at a different obligation on the collector or the
-    -- verifier.
-    Retag | PtrToInt | IntToPtr -> {}
+	IntToFloat -> op(s, W.Convert(W.F64ConvertI64S))
+	-- Saturating, as arm64's `fcvtzs` is: a NaN is 0, and a double out of
+	-- range is the nearest end of it.
+	FloatToInt -> op(s, W.Convert(W.I64TruncSatF64S))
+	-- A narrow value is held zero-extended, so widening one to another
+	-- narrow width changes nothing, and to a word is a zero extension.
+	Widen -> if !wide(from) && wide(to) { op(s, W.Convert(W.I64ExtendI32U)) }
+	Narrow -> {
+		if wide(from) && !wide(to) { op(s, W.Convert(W.I32WrapI64)) }
+		match to {
+			I8 -> {
+				op(s, W.ConstI32(0xFF))
+				op(s, W.IntBin(W.W32, W.And))
+			}
+			I1 -> {
+				op(s, W.ConstI32(1))
+				op(s, W.IntBin(W.W32, W.And))
+			}
+			_ -> {}
+		}
+	}
+	-- The same bits, at a different obligation on the collector or the
+	-- verifier.
+	Retag | PtrToInt | IntToPtr -> {}
 }
 
 fun intrinsic(s : Sel, k : L.Intrinsic, x : Value) -> Unit = match k {
-    -- A code point no greater than U+10FFFF and outside U+D800..U+DFFF, the
-    -- second tested as `x - 0xD800` at least 0x800 unsigned.
-    L.CharIsScalar -> {
-        get(s, x)
-        op(s, W.ConstI64(0x10FFFF))
-        op(s, W.IntRel(W.W64, W.LeU))
-        get(s, x)
-        op(s, W.ConstI64(0xD800))
-        op(s, W.IntBin(W.W64, W.Sub))
-        op(s, W.ConstI64(0x800))
-        op(s, W.IntRel(W.W64, W.GeU))
-        op(s, W.IntBin(W.W32, W.And))
-    }
-    -- Bits for bits, so the sign of a zero and a NaN's payload survive.
-    L.FloatBits -> {
-        get(s, x)
-        op(s, W.Convert(W.I64ReinterpretF64))
-    }
-    L.FloatFromBits -> {
-        get(s, x)
-        op(s, W.Convert(W.F64ReinterpretI64))
-    }
-    -- Only a NaN is unequal to itself.
-    L.FloatIsNaN -> {
-        get(s, x)
-        get(s, x)
-        op(s, W.FloatRel(W.S64, W.FNe))
-    }
-    -- In `[-2^63, 2^63)`. Both comparisons are false for a NaN.
-    L.FloatFitsInt -> {
-        let bound = -Float.fromInt(Int.minValue())
-        get(s, x)
-        op(s, W.ConstF64(-bound))
-        op(s, W.FloatRel(W.S64, W.FGe))
-        get(s, x)
-        op(s, W.ConstF64(bound))
-        op(s, W.FloatRel(W.S64, W.FLt))
-        op(s, W.IntBin(W.W32, W.And))
-    }
+	-- A code point no greater than U+10FFFF and outside U+D800..U+DFFF, the
+	-- second tested as `x - 0xD800` at least 0x800 unsigned.
+	L.CharIsScalar -> {
+		get(s, x)
+		op(s, W.ConstI64(0x10FFFF))
+		op(s, W.IntRel(W.W64, W.LeU))
+		get(s, x)
+		op(s, W.ConstI64(0xD800))
+		op(s, W.IntBin(W.W64, W.Sub))
+		op(s, W.ConstI64(0x800))
+		op(s, W.IntRel(W.W64, W.GeU))
+		op(s, W.IntBin(W.W32, W.And))
+	}
+	-- Bits for bits, so the sign of a zero and a NaN's payload survive.
+	L.FloatBits -> {
+		get(s, x)
+		op(s, W.Convert(W.I64ReinterpretF64))
+	}
+	L.FloatFromBits -> {
+		get(s, x)
+		op(s, W.Convert(W.F64ReinterpretI64))
+	}
+	-- Only a NaN is unequal to itself.
+	L.FloatIsNaN -> {
+		get(s, x)
+		get(s, x)
+		op(s, W.FloatRel(W.S64, W.FNe))
+	}
+	-- In `[-2^63, 2^63)`. Both comparisons are false for a NaN.
+	L.FloatFitsInt -> {
+		let bound = -Float.fromInt(Int.minValue())
+		get(s, x)
+		op(s, W.ConstF64(-bound))
+		op(s, W.FloatRel(W.S64, W.FGe))
+		get(s, x)
+		op(s, W.ConstF64(bound))
+		op(s, W.FloatRel(W.S64, W.FLt))
+		op(s, W.IntBin(W.W32, W.And))
+	}
 }
 
 -- -- memory --------------------------------------------------------------------------
@@ -1105,32 +1377,32 @@ fun intrinsic(s : Sel, k : L.Intrinsic, x : Value) -> Unit = match k {
 -- value is read zero-extended, which is how its local holds it. A unit has
 -- no bytes, and leaves a 0.
 fun load(s : Sel, c : RepClass, offset : Int) -> Unit = match c {
-    Unit -> {
-        op(s, W.Drop)
-        op(s, W.ConstI32(0))
-    }
-    I1 | I8 -> op(s, W.Load(W.I32Load8U, offset))
-    I32 -> op(s, W.Load(W.I32Load, offset))
-    I64 | Ptr -> op(s, W.Load(W.I64Load, offset))
-    F64 -> op(s, W.Load(W.F64Load, offset))
+	Unit -> {
+		op(s, W.Drop)
+		op(s, W.ConstI32(0))
+	}
+	I1 | I8   -> op(s, W.Load(W.I32Load8U, offset))
+	I32       -> op(s, W.Load(W.I32Load, offset))
+	I64 | Ptr -> op(s, W.Load(W.I64Load, offset))
+	F64       -> op(s, W.Load(W.F64Load, offset))
 }
 
 -- The store of `v` at the address on the stack plus `offset`, at its width.
 fun store(s : Sel, v : Value, offset : Int) -> Unit = match classOf(s, v) {
-    Unit -> op(s, W.Drop)
-    rc -> {
-        get(s, v)
-        op(s, storeKindAt(rc, offset))
-    }
+	Unit -> op(s, W.Drop)
+	rc -> {
+		get(s, v)
+		op(s, storeKindAt(rc, offset))
+	}
 }
 
 fun storeKind(c : RepClass) -> W.Op = storeKindAt(c, 0)
 
 fun storeKindAt(c : RepClass, offset : Int) -> W.Op = match c {
-    I64 | Ptr -> W.Store(W.I64Store, offset)
-    F64 -> W.Store(W.F64Store, offset)
-    I32 -> W.Store(W.I32Store, offset)
-    _ -> W.Store(W.I32Store8, offset)
+	I64 | Ptr -> W.Store(W.I64Store, offset)
+	F64       -> W.Store(W.F64Store, offset)
+	I32       -> W.Store(W.I32Store, offset)
+	_         -> W.Store(W.I32Store8, offset)
 }
 
 -- A word of storage that holds a value of any class -- a cell's value or a
@@ -1138,142 +1410,144 @@ fun storeKindAt(c : RepClass, offset : Int) -> W.Op = match c {
 -- value is stored zero-extended to the word, so its low four bytes are the
 -- whole of it.
 fun loadWord(s : Sel, c : RepClass, offset : Int) -> Unit = match c {
-    I64 | Ptr -> op(s, W.Load(W.I64Load, offset))
-    F64 -> op(s, W.Load(W.F64Load, offset))
-    _ -> op(s, W.Load(W.I32Load, offset))
+	I64 | Ptr -> op(s, W.Load(W.I64Load, offset))
+	F64       -> op(s, W.Load(W.F64Load, offset))
+	_         -> op(s, W.Load(W.I32Load, offset))
 }
 
 fun storeWord(s : Sel, v : Value, offset : Int) -> Unit {
-    get(s, v)
-    match classOf(s, v) {
-        I64 | Ptr -> op(s, W.Store(W.I64Store, offset))
-        F64 -> op(s, W.Store(W.F64Store, offset))
-        _ -> {
-            op(s, W.Convert(W.I64ExtendI32U))
-            op(s, W.Store(W.I64Store, offset))
-        }
-    }
+	get(s, v)
+	match classOf(s, v) {
+		I64 | Ptr -> op(s, W.Store(W.I64Store, offset))
+		F64       -> op(s, W.Store(W.F64Store, offset))
+		_ -> {
+			op(s, W.Convert(W.I64ExtendI32U))
+			op(s, W.Store(W.I64Store, offset))
+		}
+	}
 }
 
 -- Pushes the address of a raw access at `base` plus `off`, and returns the
 -- constant offset the access itself adds: a known offset that fits goes in
 -- the instruction.
 fun raw(s : Sel, base : Value, off : Value) -> Int {
-    if let Some(n) = known(s, off) {
-        if n >= 0 && n < 0x1_0000_0000 {
-            address(s, base)
-            return n
-        }
-    }
-    runAddress(s, base, off)
-    0
+	if let Some(n) = known(s, off) {
+		if n >= 0 && n < 0x1_0000_0000 {
+			address(s, base)
+			return n
+		}
+	}
+	runAddress(s, base, off)
+	0
 }
 
 -- Pushes the address `base` plus `off`.
 fun runAddress(s : Sel, base : Value, off : Value) -> Unit {
-    get(s, base)
-    get(s, off)
-    op(s, W.IntBin(W.W64, W.Add))
-    op(s, W.Convert(W.I32WrapI64))
+	get(s, base)
+	get(s, off)
+	op(s, W.IntBin(W.W64, W.Add))
+	op(s, W.Convert(W.I32WrapI64))
 }
 
 -- Pushes the address of element `index` of the array `target`, less the
 -- offset of its slot after the header, which the access adds.
 fun element(s : Sel, target : Value, index : Value, slot : L.ElementRef) -> Unit {
-    get(s, target)
-    get(s, index)
-    if slot.stride != 1 {
-        op(s, W.ConstI64(slot.stride))
-        op(s, W.IntBin(W.W64, W.Mul))
-    }
-    op(s, W.IntBin(W.W64, W.Add))
-    op(s, W.Convert(W.I32WrapI64))
+	get(s, target)
+	get(s, index)
+	if slot.stride != 1 {
+		op(s, W.ConstI64(slot.stride))
+		op(s, W.IntBin(W.W64, W.Mul))
+	}
+	op(s, W.IntBin(W.W64, W.Add))
+	op(s, W.Convert(W.I32WrapI64))
 }
 
 -- Panic unless `index` is within the array's own length, unsigned, so that a
 -- negative index fails too. None for an index `Turkey.Bounds` proved.
-fun withinStorage(s : Sel, check : IndexCheck, target : Value, index : Value) -> Unit = match check {
-    Proven -> {}
-    Checked -> {
-        get(s, index)
-        address(s, target)
-        op(s, W.Load(W.I64Load, 8))
-        op(s, W.IntRel(W.W64, W.GeU))
-        guard(s, "array index out of bounds: another task resized the array during this access")
-    }
-}
+fun withinStorage(s : Sel, check : IndexCheck, target : Value, index : Value) -> Unit =
+	match check {
+		Proven -> {}
+		Checked -> {
+			get(s, index)
+			address(s, target)
+			op(s, W.Load(W.I64Load, 8))
+			op(s, W.IntRel(W.W64, W.GeU))
+			guard(s, "array index out of bounds: another task resized the array during this access")
+		}
+	}
 
 fun atomic(s : Sel, d : Value, o : AtomicOp, operands : Array Value) -> Unit {
-    let at = temp(s, W.I32)
-    runAddress(s, operands[0], operands[1])
-    op(s, W.LocalSet(at))
-    match o {
-        LoadAcquire -> {
-            op(s, W.LocalGet(at))
-            op(s, W.Load(W.I64Load, 0))
-            set(s, d)
-        }
-        StoreRelease -> {
-            op(s, W.LocalGet(at))
-            get(s, operands[2])
-            op(s, W.Store(W.I64Store, 0))
-        }
-        FetchAdd -> {
-            op(s, W.LocalGet(at))
-            op(s, W.LocalGet(at))
-            op(s, W.Load(W.I64Load, 0))
-            op(s, W.LocalTee(localOf(s, d)))
-            get(s, operands[2])
-            op(s, W.IntBin(W.W64, W.Add))
-            op(s, W.Store(W.I64Store, 0))
-        }
-        -- Answers the value found, and stores only if it was the expected one.
-        Cas -> {
-            op(s, W.LocalGet(at))
-            op(s, W.Load(W.I64Load, 0))
-            set(s, d)
-            get(s, d)
-            get(s, operands[2])
-            op(s, W.IntRel(W.W64, W.Eq))
-            op(s, W.If(W.Empty))
-            op(s, W.LocalGet(at))
-            get(s, operands[3])
-            op(s, W.Store(W.I64Store, 0))
-            op(s, W.End)
-        }
-    }
+	let at = temp(s, W.I32)
+	runAddress(s, operands[0], operands[1])
+	op(s, W.LocalSet(at))
+	match o {
+		LoadAcquire -> {
+			op(s, W.LocalGet(at))
+			op(s, W.Load(W.I64Load, 0))
+			set(s, d)
+		}
+		StoreRelease -> {
+			op(s, W.LocalGet(at))
+			get(s, operands[2])
+			op(s, W.Store(W.I64Store, 0))
+		}
+		FetchAdd -> {
+			op(s, W.LocalGet(at))
+			op(s, W.LocalGet(at))
+			op(s, W.Load(W.I64Load, 0))
+			op(s, W.LocalTee(localOf(s, d)))
+			get(s, operands[2])
+			op(s, W.IntBin(W.W64, W.Add))
+			op(s, W.Store(W.I64Store, 0))
+		}
+		-- Answers the value found, and stores only if it was the expected one.
+		Cas -> {
+			op(s, W.LocalGet(at))
+			op(s, W.Load(W.I64Load, 0))
+			set(s, d)
+			get(s, d)
+			get(s, operands[2])
+			op(s, W.IntRel(W.W64, W.Eq))
+			op(s, W.If(W.Empty))
+			op(s, W.LocalGet(at))
+			get(s, operands[3])
+			op(s, W.Store(W.I64Store, 0))
+			op(s, W.End)
+		}
+	}
 }
 
 -- The header word of the object `d` addresses.
 fun header(s : Sel, d : Value, word : Int) -> Unit {
-    address(s, d)
-    op(s, W.ConstI64(word))
-    op(s, W.Store(W.I64Store, 0))
+	address(s, d)
+	op(s, W.ConstI64(word))
+	op(s, W.Store(W.I64Store, 0))
 }
 
 -- A closure shell's code slot and environment, as `turkey_closure_shell`
 -- lays them out; the environment is null when there is none.
 fun shell(s : Sel, d : Value, slot : Int, environment : Option Value) -> Unit {
-    address(s, d)
-    op(s, W.ConstI64(slot))
-    op(s, W.Store(W.I64Store, Rt.fieldOffset(Rt.closureShell, Rt.closureCode)))
-    address(s, d)
-    match environment {
-        Some(e) -> get(s, e)
-        None -> op(s, W.ConstI64(0))
-    }
-    op(s, W.Store(W.I64Store, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
+	address(s, d)
+	op(s, W.ConstI64(slot))
+	op(s, W.Store(W.I64Store, Rt.fieldOffset(Rt.closureShell, Rt.closureCode)))
+	address(s, d)
+	match environment {
+		Some(e) -> get(s, e)
+		None    -> op(s, W.ConstI64(0))
+	}
+	op(s, W.Store(W.I64Store, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
 }
 
 -- `d` set to the address of its object in this function's frame.
 fun frameObject(s : Sel, d : Value) -> Unit = match Roots.objectOf(s.frame, Ssa.valueId(d)) {
-    Some(k) -> {
-        op(s, W.GlobalGet(s.cx.stackPointer))
-        op(s, W.ConstI64(s.offsets[k]))
-        op(s, W.IntBin(W.W64, W.Add))
-        set(s, d)
-    }
-    None -> stop(s, "a frame object with no place in the frame")
+	Some(k) -> {
+		op(s, W.LocalGet(s.framePointer))
+		op(s, W.Convert(W.I64ExtendI32U))
+		op(s, W.ConstI64(s.offsets[k]))
+		op(s, W.IntBin(W.W64, W.Add))
+		set(s, d)
+	}
+	None -> stop(s, "a frame object with no place in the frame")
 }
 
 -- -- allocation ----------------------------------------------------------------------
@@ -1288,69 +1562,70 @@ fun frameObject(s : Sel, d : Value) -> Unit = match Roots.objectOf(s.frame, Ssa.
 -- the slot before the caller has written every word of it, which is why
 -- nothing zeroes it.
 fun allocate(s : Sel, d : Value, size : Int, slow : String, args : Array Int) -> Unit {
-    let entry = match definedIndex(s, slow) {
-        Some(f) -> f
-        None -> return stop(s, "an allocation with no " + slow)
-    }
-    let slowPath = fun() {
-        op(s, W.ConstI64(0))
-        for a in args { op(s, W.ConstI64(a)) }
-        op(s, W.Call(entry))
-        propagate(s)
-    }
-    -- Past `Rt.fastBytes` there is no cursor, and the runtime places the
-    -- object.
-    if size > Rt.fastBytes {
-        slowPath()
-        set(s, d)
-        return
-    }
-    let cursor = Rt.workerCursors + Rt.cursorBytes * Rt.sizeClass(size)
-    let word = temp(s, W.I64)
-    op(s, W.GlobalGet(s.cx.worker))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.Load(W.I64Load, cursor + Rt.cursorFree))
-    op(s, W.LocalTee(word))
-    op(s, W.IntEqz(W.W64))
-    op(s, W.If(W.Value(W.I64)))
-    slowPath()
-    op(s, W.Else)
-    -- The word with its lowest set bit cleared goes back, and the bit's
-    -- position is the slot's index from the cursor's base.
-    op(s, W.GlobalGet(s.cx.worker))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.LocalGet(word))
-    op(s, W.LocalGet(word))
-    op(s, W.ConstI64(0))
-    op(s, W.LocalGet(word))
-    op(s, W.IntBin(W.W64, W.Sub))
-    op(s, W.IntBin(W.W64, W.And))
-    op(s, W.IntBin(W.W64, W.Xor))
-    op(s, W.Store(W.I64Store, cursor + Rt.cursorFree))
-    op(s, W.LocalGet(word))
-    op(s, W.IntUn(W.W64, W.Ctz))
-    op(s, W.ConstI64(Rt.classSlot(Rt.sizeClass(size))))
-    op(s, W.IntBin(W.W64, W.Mul))
-    op(s, W.GlobalGet(s.cx.worker))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.Load(W.I64Load, cursor + Rt.cursorBase))
-    op(s, W.IntBin(W.W64, W.Add))
-    op(s, W.End)
-    set(s, d)
+	let entry = match definedIndex(s, slow) {
+		Some(f) -> f
+		None    -> return stop(s, "an allocation with no " + slow)
+	}
+	let slowPath = fun() {
+		publish(s)
+		op(s, W.ConstI64(0))
+		for a in args { op(s, W.ConstI64(a)) }
+		op(s, W.Call(entry))
+		propagate(s)
+	}
+	-- Past `Rt.fastBytes` there is no cursor, and the runtime places the
+	-- object.
+	if size > Rt.fastBytes {
+		slowPath()
+		set(s, d)
+		return
+	}
+	let cursor = Rt.workerCursors + Rt.cursorBytes * Rt.sizeClass(size)
+	let word = temp(s, W.I64)
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I64Load, cursor + Rt.cursorFree))
+	op(s, W.LocalTee(word))
+	op(s, W.IntEqz(W.W64))
+	op(s, W.If(W.Value(W.I64)))
+	slowPath()
+	op(s, W.Else)
+	-- The word with its lowest set bit cleared goes back, and the bit's
+	-- position is the slot's index from the cursor's base.
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.LocalGet(word))
+	op(s, W.LocalGet(word))
+	op(s, W.ConstI64(0))
+	op(s, W.LocalGet(word))
+	op(s, W.IntBin(W.W64, W.Sub))
+	op(s, W.IntBin(W.W64, W.And))
+	op(s, W.IntBin(W.W64, W.Xor))
+	op(s, W.Store(W.I64Store, cursor + Rt.cursorFree))
+	op(s, W.LocalGet(word))
+	op(s, W.IntUn(W.W64, W.Ctz))
+	op(s, W.ConstI64(Rt.classSlot(Rt.sizeClass(size))))
+	op(s, W.IntBin(W.W64, W.Mul))
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I64Load, cursor + Rt.cursorBase))
+	op(s, W.IntBin(W.W64, W.Add))
+	op(s, W.End)
+	set(s, d)
 }
 
 -- Whether `value` may be a heap object: traced, and not a constant, which is
 -- null or a nullary constructor's immediate.
 fun storesObject(s : Sel, value : Value) -> Bool =
-    Ssa.repOf(s.source, value).traced && !Map.contains(s.known, Ssa.valueId(value))
+	Ssa.repOf(s.source, value).traced && !Map.contains(s.known, Ssa.valueId(value))
 
 -- The write barrier after a store of `value` into `target`, unless the value
 -- cannot be a heap object or the target is one of this frame's objects, which
 -- the collector reads as roots every time.
 fun barrier(s : Sel, target : Value, value : Value) -> Unit {
-    if !storesObject(s, value) { return }
-    if let Some(_) = Roots.objectOf(s.frame, Ssa.valueId(target)) { return }
-    barrierAt(s, localOf(s, target), localOf(s, value))
+	if !storesObject(s, value) { return }
+	if let Some(_) = Roots.objectOf(s.frame, Ssa.valueId(target)) { return }
+	barrierAt(s, localOf(s, target), localOf(s, value))
 }
 
 -- A minor collection traces from the roots and from the old objects
@@ -1361,177 +1636,183 @@ fun barrier(s : Sel, target : Value, value : Value) -> Unit {
 -- not an immediate, and young. The call never allocates, collects or panics,
 -- so no panic test follows it.
 fun barrierAt(s : Sel, target : Int, value : Int) -> Unit {
-    let remember = match definedIndex(s, "turkey_write_barrier") {
-        Some(f) -> f
-        None -> return stop(s, "a store with no write barrier")
-    }
-    op(s, W.LocalGet(target))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.Load(W.I32Load8U, 0))
-    op(s, W.ConstI32(1))
-    op(s, W.IntRel(W.W32, W.Eq))
-    op(s, W.If(W.Empty))
-    op(s, W.LocalGet(value))
-    op(s, W.ConstI64(Rt.immediates))
-    op(s, W.IntRel(W.W64, W.GeU))
-    op(s, W.If(W.Empty))
-    op(s, W.LocalGet(value))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.Load(W.I32Load8U, 0))
-    op(s, W.IntEqz(W.W32))
-    op(s, W.If(W.Empty))
-    op(s, W.ConstI64(0))
-    op(s, W.LocalGet(target))
-    op(s, W.Call(remember))
-    op(s, W.Drop)
-    op(s, W.End)
-    op(s, W.End)
-    op(s, W.End)
+	let remember = match definedIndex(s, "turkey_write_barrier") {
+		Some(f) -> f
+		None    -> return stop(s, "a store with no write barrier")
+	}
+	op(s, W.LocalGet(target))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load8U, 0))
+	op(s, W.ConstI32(1))
+	op(s, W.IntRel(W.W32, W.Eq))
+	op(s, W.If(W.Empty))
+	op(s, W.LocalGet(value))
+	op(s, W.ConstI64(Rt.immediates))
+	op(s, W.IntRel(W.W64, W.GeU))
+	op(s, W.If(W.Empty))
+	op(s, W.LocalGet(value))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load8U, 0))
+	op(s, W.IntEqz(W.W32))
+	op(s, W.If(W.Empty))
+	op(s, W.ConstI64(0))
+	op(s, W.LocalGet(target))
+	op(s, W.Call(remember))
+	op(s, W.Drop)
+	op(s, W.End)
+	op(s, W.End)
+	op(s, W.End)
 }
 
 -- -- calls ----------------------------------------------------------------------------
 
 fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = match callee {
-    Direct(name) -> match Map.get(s.cx.functions, name) {
-        Some(f) -> {
-            for a in args { get(s, a) }
-            op(s, W.Call(f))
-            results(s, d, name)
-            propagate(s)
-        }
-        None -> stop(s, "a call of @" + name + ", which did not lower")
-    }
-    Runtime(r) -> match r {
-        Rt.Exit -> definedCall(s, d, Rt.entryPoint(r).symbol, args, True)
-        Rt.SwapStack -> stop(s, "Prim.swapStack, which is not supported on wasm yet")
-    }
-    Foreign(symbol, fixed) -> foreignCall(s, d, symbol, fixed, args)
-    -- A closure: its environment first, the uniform convention
-    -- `Turkey.SsaLower.closureCall` establishes, then the arguments, then its
-    -- code's table slot.
-    Indirect(closure) -> {
-        let t = closureType(s, args, d)
-        closureEnvironment(s, closure)
-        for a in args { get(s, a) }
-        closureCode(s, closure)
-        op(s, W.CallIndirect(t, 0))
-        set(s, d)
-        propagate(s)
-    }
+	Direct(name) -> match Map.get(s.cx.functions, name) {
+		Some(f) -> {
+			publish(s)
+			for a in args { get(s, a) }
+			op(s, W.Call(f))
+			results(s, d, name)
+			propagate(s)
+		}
+		None -> stop(s, "a call of @" + name + ", which did not lower")
+	}
+	Runtime(r) -> match r {
+		Rt.Exit      -> definedCall(s, d, Rt.entryPoint(r).symbol, args, True)
+		Rt.SwapStack -> stop(s, "Prim.swapStack, which is not supported on wasm yet")
+	}
+	Foreign(symbol, fixed) -> foreignCall(s, d, symbol, fixed, args)
+	-- A closure: its environment first, the uniform convention
+	-- `Turkey.SsaLower.closureCall` establishes, then the arguments, then its
+	-- code's table slot.
+	Indirect(closure) -> {
+		let t = closureType(s, args, d)
+		publish(s)
+		closureEnvironment(s, closure)
+		for a in args { get(s, a) }
+		closureCode(s, closure)
+		op(s, W.CallIndirect(t, 0))
+		set(s, d)
+		propagate(s)
+	}
 }
 
 -- The results of the direct call to `name` just emitted, off the stack: the
 -- last first, each into the `Result` that reads it or dropped, and the first
 -- into `d`. The `Result`s follow the call (`L.checkResults`).
 fun results(s : Sel, d : Value, name : String) -> Unit {
-    let reps = Map.getOr(s.cx.results, name, [])
-    if len(reps) > 1 {
-        let (b, n) = s.place
-        let insts = s.source.blocks[b].insts
-        let into : Array (Option Value) = Array.filled(len(reps), None)
-        for var at = n + 1; at < len(insts); at = at + 1 {
-            match insts[at].op {
-                Result(of, k) -> if of == d { into[k] = Some(insts[at].result) }
-                _ -> break
-            }
-        }
-        for var k = len(reps) - 1; k >= 1; k = k - 1 {
-            match into[k] {
-                Some(v) -> set(s, v)
-                None -> op(s, W.Drop)
-            }
-        }
-    }
-    set(s, d)
+	let reps = Map.getOr(s.cx.results, name, [])
+	if len(reps) > 1 {
+		let (b, n) = s.place
+		let insts = s.source.blocks[b].insts
+		let into : Array (Option Value) = Array.filled(len(reps), None)
+		for var at = n + 1; at < len(insts); at = at + 1 {
+			match insts[at].op {
+				Result(of, k) -> if of == d { into[k] = Some(insts[at].result) }
+				_             -> break
+			}
+		}
+		for var k = len(reps) - 1; k >= 1; k = k - 1 {
+			match into[k] {
+				Some(v) -> set(s, v)
+				None    -> op(s, W.Drop)
+			}
+		}
+	}
+	set(s, d)
 }
 
 -- A C symbol: a `foreign` definition's Turkey function, the code the backend
 -- writes, or an import.
 fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array Value) -> Unit {
-    if fixed < len(args) { return stop(s, "a call of the variadic C function " + symbol) }
-    if Map.contains(s.cx.defined, symbol) { return definedCall(s, d, symbol, args, False) }
-    if let Some(f) = Map.get(s.cx.builtins, symbol) {
-        for a in args { get(s, a) }
-        op(s, W.Call(f))
-        propagate(s)
-        return
-    }
-    let f = match Map.get(s.cx.imports, symbol) {
-        Some(f) -> f
-        None -> return stop(s, "a call of " + symbol + ", which is not imported")
-    }
-    for a in args {
-        get(s, a)
-        if classOf(s, a) == Ptr { op(s, W.Convert(W.I32WrapI64)) }
-    }
-    op(s, W.Call(f))
-    -- The host cannot call back into Turkey code, so it cannot have raised a
-    -- panic, and no test follows.
-    match classOf(s, d) {
-        Unit -> {}
-        Ptr -> {
-            op(s, W.Convert(W.I64ExtendI32U))
-            set(s, d)
-        }
-        _ -> set(s, d)
-    }
+	if fixed < len(args) { return stop(s, "a call of the variadic C function " + symbol) }
+	if Map.contains(s.cx.defined, symbol) { return definedCall(s, d, symbol, args, False) }
+	if let Some(f) = Map.get(s.cx.builtins, symbol) {
+		publish(s)
+		for a in args { get(s, a) }
+		op(s, W.Call(f))
+		propagate(s)
+		return
+	}
+	let f = match Map.get(s.cx.imports, symbol) {
+		Some(f) -> f
+		None    -> return stop(s, "a call of " + symbol + ", which is not imported")
+	}
+	-- The host cannot call back into Turkey code, so it can neither collect,
+	-- which is why the frame names no site for it, nor raise a panic, which
+	-- is why no test follows.
+	for a in args {
+		get(s, a)
+		if classOf(s, a) == Ptr { op(s, W.Convert(W.I32WrapI64)) }
+	}
+	op(s, W.Call(f))
+	match classOf(s, d) {
+		Unit -> {}
+		Ptr -> {
+			op(s, W.Convert(W.I64ExtendI32U))
+			set(s, d)
+		}
+		_ -> set(s, d)
+	}
 }
 
 -- A call of the `foreign` definition of `symbol`, whose Turkey function
 -- takes the environment every Turkey function takes, here null. `exiting`
 -- says the call is `Prim.exit`'s.
-fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value,
-                exiting : Bool) -> Unit {
-    let name = Map.getOr(s.cx.defined, symbol, "")
-    let f = match Map.get(s.cx.functions, name) {
-        Some(f) -> f
-        None -> return stop(s, "a call of " + symbol + ", which did not lower")
-    }
-    let returned = Array.map(Map.getOr(s.cx.results, name, []), valType)
-    let held = returned == [valType(Ssa.repOf(s.source, d))]
-    -- `Prim.exit` is `-> a` and `turkey_exit` returns a unit, so an exit
-    -- where a `String` is wanted calls an `i32` function for an `i64`. An
-    -- exit never returns a value anyone reads, so its results are dropped and
-    -- `d` keeps its zero. Any other call whose declaration disagrees with its
-    -- definition would compute a wrong value that way.
-    if !held && !exiting {
-        return stop(s, "a call of " + symbol + " whose declared result is not its definition's")
-    }
-    op(s, W.ConstI64(0))
-    for a in args { get(s, a) }
-    op(s, W.Call(f))
-    if held {
-        set(s, d)
-    } else {
-        for _ in returned { op(s, W.Drop) }
-    }
-    propagate(s)
+fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value, exiting : Bool) -> Unit {
+	let name = Map.getOr(s.cx.defined, symbol, "")
+	let f = match Map.get(s.cx.functions, name) {
+		Some(f) -> f
+		None    -> return stop(s, "a call of " + symbol + ", which did not lower")
+	}
+	let returned = Array.map(Map.getOr(s.cx.results, name, []), valType)
+	let held = returned == [valType(Ssa.repOf(s.source, d))]
+	-- `Prim.exit` is `-> a` and `turkey_exit` returns a unit, so an exit
+	-- where a `String` is wanted calls an `i32` function for an `i64`. An
+	-- exit never returns a value anyone reads, so its results are dropped and
+	-- `d` keeps its zero. Any other call whose declaration disagrees with its
+	-- definition would compute a wrong value that way.
+	if !held && !exiting {
+		return stop(s, "a call of " + symbol + " whose declared result is not its definition's")
+	}
+	publish(s)
+	op(s, W.ConstI64(0))
+	for a in args { get(s, a) }
+	op(s, W.Call(f))
+	if held {
+		set(s, d)
+	} else {
+		for _ in returned { op(s, W.Drop) }
+	}
+	propagate(s)
 }
 
 -- The function index of the Turkey function defining `symbol`.
 fun definedIndex(s : Sel, symbol : String) -> Option Int = match Map.get(s.cx.defined, symbol) {
-    Some(name) -> Map.get(s.cx.functions, name)
-    None -> None
+	Some(name) -> Map.get(s.cx.functions, name)
+	None       -> None
 }
 
 -- The type of a closure's code called with `args`: the environment, then
 -- the arguments, returning `d`'s representation.
 fun closureType(s : Sel, args : Array Value, d : Value) -> Int {
-    let params = [W.I64]
-    for a in args { Vec.push(params, valType(Ssa.repOf(s.source, a))) }
-    M.addType(s.cx.module_, W.FuncType { params = Vec.toArray(params),
-                                         results = [valType(Ssa.repOf(s.source, d))] })
+	let params = [W.I64]
+	for a in args { Vec.push(params, valType(Ssa.repOf(s.source, a))) }
+	M.addType(s.cx.module_, W.FuncType {
+		params  = Vec.toArray(params)
+		results = [valType(Ssa.repOf(s.source, d))]
+	})
 }
 
 fun closureEnvironment(s : Sel, closure : Value) -> Unit {
-    address(s, closure)
-    op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
+	address(s, closure)
+	op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)))
 }
 
 fun closureCode(s : Sel, closure : Value) -> Unit {
-    address(s, closure)
-    op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureCode)))
-    op(s, W.Convert(W.I32WrapI64))
+	address(s, closure)
+	op(s, W.Load(W.I64Load, Rt.fieldOffset(Rt.closureShell, Rt.closureCode)))
+	op(s, W.Convert(W.I32WrapI64))
 }
 
 -- After a call: if the callee panicked, leave with zeros.
@@ -1545,23 +1826,29 @@ fun closureCode(s : Sel, closure : Value) -> Unit {
 -- the lowering leaves a call that never returns: that terminator leaves with
 -- zeros either way.
 fun propagate(s : Sel) -> Unit {
-    if endsUnreachable(s) { return }
-    op(s, W.GlobalGet(s.cx.worker))
-    op(s, W.Convert(W.I32WrapI64))
-    op(s, W.Load(W.I32Load, 0))
-    op(s, W.If(W.Empty))
-    leaveWithZeros(s)
-    op(s, W.End)
+	-- The `Unreachable` after it leaves, with this site on the trace.
+	if endsUnreachable(s) { return }
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load, 0))
+	op(s, W.If(W.Empty))
+	bail(s)
+	op(s, W.End)
 }
 
 fun endsUnreachable(s : Sel) -> Bool {
-    let (b, n) = s.place
-    let block = s.source.blocks[b]
-    if n != len(block.insts) - 1 { return False }
-    match (block.insts[n].op, block.term) {
-        (Call(_, _), Ssa.Unreachable) -> True
-        _ -> False
-    }
+	let (b, n) = s.place
+	let block = s.source.blocks[b]
+	if n != len(block.insts) - 1 { return False }
+	match block.term {
+		Ssa.Unreachable -> isCallOp(block.insts[n].op)
+		_               -> False
+	}
+}
+
+fun isCallOp(o : Op) -> Bool = match o {
+	Call(_, _) -> True
+	_          -> False
 }
 
 -- Panic with `message` and leave if the `i32` on the stack is not zero.
@@ -1569,15 +1856,15 @@ fun endsUnreachable(s : Sel) -> Bool {
 -- The call of `turkey_panic` gets no test of the flag after it: it would find
 -- the flag it just set, and the path leaves anyway.
 fun guard(s : Sel, message : String) -> Unit {
-    let raise = match definedIndex(s, "turkey_panic") {
-        Some(f) -> f
-        None -> return stop(s, "a check with no turkey_panic")
-    }
-    op(s, W.If(W.Empty))
-    op(s, W.ConstI64(0))
-    op(s, W.ConstI64(cString(s.cx.strings, message)))
-    op(s, W.Call(raise))
-    op(s, W.Drop)
-    leaveWithZeros(s)
-    op(s, W.End)
+	let raise = match definedIndex(s, "turkey_panic") {
+		Some(f) -> f
+		None    -> return stop(s, "a check with no turkey_panic")
+	}
+	op(s, W.If(W.Empty))
+	op(s, W.ConstI64(0))
+	op(s, W.ConstI64(cString(s.cx.strings, message)))
+	op(s, W.Call(raise))
+	op(s, W.Drop)
+	bail(s)
+	op(s, W.End)
 }

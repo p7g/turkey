@@ -1,5 +1,11 @@
 export (
-    Stdout, stdout, print, write, putBytes, flush, flushPending,
+	Stdout,
+	stdout,
+	print,
+	write,
+	putBytes,
+	flush,
+	flushPending,
 )
 
 --- The standard output: one buffer for the whole process, behind a lock, which
@@ -88,115 +94,115 @@ let out : Stdout = opened()
 fun stdout() -> Stdout = out
 
 fun opened() -> Stdout {
-    let terminal = IO.isatty(1) == 1
-    if !Output.start(if terminal { 8192 } else { 65536 }, terminal) {
-        error("no memory for the standard output's buffer")
-    }
-    Stdout { waiters = [] }
+	let terminal = IO.isatty(1) == 1
+	if !Output.start(if terminal { 8192 } else { 65536 }, terminal) {
+		error("no memory for the standard output's buffer")
+	}
+	Stdout { waiters = [] }
 }
 
 fun print(x) {
-    let text = bytesOf(show(x))
-    lock()
-    put(Array.ofStorage(text), 0, len(text))
-    if Output.room() == 0 { makeRoom() }
-    Output.appendByte(10)
-    if Output.terminal() { drain(Output.held()) }
-    unlock()
+	let text = bytesOf(show(x))
+	lock()
+	put(Array.ofStorage(text), 0, len(text))
+	if Output.room() == 0 { makeRoom() }
+	Output.appendByte(10)
+	if Output.terminal() { drain(Output.held()) }
+	unlock()
 }
 
 fun write(x) {
-    let text = bytesOf(show(x))
-    putBytes(Array.ofStorage(text), 0, len(text))
+	let text = bytesOf(show(x))
+	putBytes(Array.ofStorage(text), 0, len(text))
 }
 
 --- `bytes[from..to)`, written out at once on a terminal if they hold a
 --- newline.
 fun putBytes(bytes : Array Byte, from : Int, to : Int) -> Unit {
-    lock()
-    put(bytes, from, to)
-    if Output.terminal() && Scan.newline(bytes, from, to) >= 0 { drain(Output.held()) }
-    unlock()
+	lock()
+	put(bytes, from, to)
+	if Output.terminal() && Scan.newline(bytes, from, to) >= 0 { drain(Output.held()) }
+	unlock()
 }
 
 --- Write out everything held: 0, or the negated `errno` of the first write
 --- that failed since the last `flush`, which it then forgets.
 fun flush() -> Int {
-    lock()
-    drain(Output.held())
-    let failure = Output.takeFailure()
-    unlock()
-    failure
+	lock()
+	drain(Output.held())
+	let failure = Output.takeFailure()
+	unlock()
+	failure
 }
 
 --- Write out anything held, before something that must come after it.
 fun flushPending() -> Unit {
-    -- The test without the lock costs nothing when the buffer is empty, which
-    -- is the usual case; a print racing it from another task is ordered by the
-    -- lock, before or after, as it would be without the test.
-    if Output.held() > 0 {
-        lock()
-        drain(Output.held())
-        unlock()
-    }
+	-- The test without the lock costs nothing when the buffer is empty, which
+	-- is the usual case; a print racing it from another task is ordered by the
+	-- lock, before or after, as it would be without the test.
+	if Output.held() > 0 {
+		lock()
+		drain(Output.held())
+		unlock()
+	}
 }
 
 -- -- underneath -----------------------------------------------------------------------
 
 -- Append `bytes[from..to)`, under the lock.
 fun put(bytes : Array Byte, from : Int, to : Int) -> Unit {
-    var at = from
-    while at < to {
-        let room = Output.room()
-        if to - at <= room {
-            appendFrom(bytes, at, to)
-            return
-        }
-        if to - at >= room + Output.held() {
-            drain(Output.held())
-            writeOut(bytes, at, to)
-            return
-        }
-        if room == 0 {
-            makeRoom()
-        } else {
-            appendFrom(bytes, at, at + room)
-            at = at + room
-        }
-    }
+	var at = from
+	while at < to {
+		let room = Output.room()
+		if to - at <= room {
+			appendFrom(bytes, at, to)
+			return
+		}
+		if to - at >= room + Output.held() {
+			drain(Output.held())
+			writeOut(bytes, at, to)
+			return
+		}
+		if room == 0 {
+			makeRoom()
+		} else {
+			appendFrom(bytes, at, at + room)
+			at = at + room
+		}
+	}
 }
 
 -- `bytes[from..to)` into the block, which has room for them: copied from the
 -- array's own storage, which the collector does not move.
 fun appendFrom(bytes : Array Byte, from : Int, to : Int) -> Unit {
-    Output.append(IO.addressOf(bytes, from), to - from)
-    Ptr.keepAlive(bytes)
+	Output.append(IO.addressOf(bytes, from), to - from)
+	Ptr.keepAlive(bytes)
 }
 
 -- Make room in a full buffer: write it out up to and including its last
 -- newline, or all of it if one line fills it.
 fun makeRoom() -> Unit {
-    let end = Output.lastLineEnd()
-    drain(if end > 0 { end } else { Output.held() })
+	let end = Output.lastLineEnd()
+	drain(if end > 0 { end } else { Output.held() })
 }
 
 -- Write out the first `n` bytes held. A descriptor that answers `EAGAIN` is
 -- waited for without holding a worker (`Turkey.Wait`) before it is asked
 -- again.
 fun drain(n : Int) -> Unit {
-    var left = Output.drain(n)
-    Scheduler.afterCall()
-    while left > 0 {
-        waitWritable()
-        left = Output.drain(left)
-        Scheduler.afterCall()
-    }
+	var left = Output.drain(n)
+	Scheduler.afterCall()
+	while left > 0 {
+		waitWritable()
+		left = Output.drain(left)
+		Scheduler.afterCall()
+	}
 }
 
 -- Descriptor 1 answered `EAGAIN`: park until it is writable. If the poller
 -- cannot watch it, let other tasks run and try again.
 fun waitWritable() -> Unit {
-    if Wait.writable(1, -1) != 0 { Scheduler.yield() }
+	if Wait.writable(1, -1) != 0 { Scheduler.yield() }
 }
 
 -- `bytes[from..to)` straight to descriptor 1, past the buffer, for text at
@@ -204,33 +210,33 @@ fun waitWritable() -> Unit {
 -- write, a signal or `EAGAIN`; a failure is kept for `flush`, as one
 -- writing the buffer out is.
 fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Unit {
-    var at = from
-    while at < to {
-        let n = IO.write(1, bytes, at, to)
-        if n == -Sys.eagain() {
-            waitWritable()
-        } else if n != -Sys.eintr {
-            if n <= 0 {
-                Output.noteFailure(if n == 0 { -Sys.eio } else { n })
-                return
-            }
-            at = at + n
-        }
-    }
+	var at = from
+	while at < to {
+		let n = IO.write(1, bytes, at, to)
+		if n == -Sys.eagain() {
+			waitWritable()
+		} else if n != -Sys.eintr {
+			if n <= 0 {
+				Output.noteFailure(if n == 0 { -Sys.eio } else { n })
+				return
+			}
+			at = at + n
+		}
+	}
 }
 
 -- -- the lock -------------------------------------------------------------------------
 
 fun lock() -> Unit {
-    if Output.tryLock() { return }
-    Scheduler.waitUntil(fun() = Output.claim(), fun(c) = Vec.push(out.waiters, c))
+	if Output.tryLock() { return }
+	Scheduler.waitUntil(fun() = Output.claim(), fun(c) = Vec.push(out.waiters, c))
 }
 
 fun unlock() -> Unit {
-    if !Output.unlock() { return }
-    Scheduler.lock()
-    for c in out.waiters { Scheduler.wake(c) }
-    out.waiters = []
-    Scheduler.changed()
-    Scheduler.unlock()
+	if !Output.unlock() { return }
+	Scheduler.lock()
+	for c in out.waiters { Scheduler.wake(c) }
+	out.waiters = []
+	Scheduler.changed()
+	Scheduler.unlock()
 }

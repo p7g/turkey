@@ -34,33 +34,42 @@ let initializerName = "%giblet.initialize"
 
 -- The giblet modules. A list rather than a convention or a declaration form:
 -- joining it is a deliberate edit to the compiler.
-let giblets = ["Turkey.Entry", "Turkey.Memory", "Turkey.Alloc", "Turkey.Heap",
-               "Turkey.HeapCheck", "Turkey.Lock", "Turkey.Monitor", "Turkey.Output",
-               "Turkey.Process", "Turkey.Stack", "Turkey.TLSCallbacks", "Turkey.Wasi",
-               "Turkey.Workers"]
+let giblets = [
+	"Turkey.Entry", "Turkey.Memory", "Turkey.Alloc", "Turkey.Heap", "Turkey.HeapCheck",
+	"Turkey.Lock", "Turkey.Monitor", "Turkey.Output", "Turkey.Process", "Turkey.Stack",
+	"Turkey.TLSCallbacks", "Turkey.Wasi", "Turkey.Workers",
+]
 
 -- Extra names for the tests, which need a giblet module whose code is wrong on
 -- purpose.
 let testHook = "TURKEY_TEST_GIBLETS"
 
 fun gibletModules() -> Set.Set String {
-    let out = Set.new()
-    for name in giblets { Set.add(out, name) }
-    match Env.get(testHook) {
-        Some(extra) -> for name in String.split(extra, ",") {
-            if name != "" { Set.add(out, name) }
-        }
-        None -> {}
-    }
-    out
+	let out = Set.new()
+	for name in giblets { Set.add(out, name) }
+	match Env.get(testHook) {
+		Some(extra) -> for name in String.split(extra, ",") {
+			if name != "" { Set.add(out, name) }
+		}
+		None -> {}
+	}
+	out
 }
 
 --- A giblet module comes from the shipped library, as `foreign` does.
 fun checkPlacement(name : String, library : Bool, where : Span) -> Unit {
-    if !library && Set.contains(gibletModules(), name) {
-        Diag.report(Diag.at("type error", "module '" + name + "' has the name of a "
-                            + "giblet module of the standard library; rename it", where))
-    }
+	if !library && Set.contains(gibletModules(), name) {
+		Diag.report(
+			Diag.at(
+				"type error",
+				"module '"
+					+ name
+					+ "' has the name of a "
+					+ "giblet module of the standard library; rename it",
+				where,
+			),
+		)
+	}
 }
 
 -- -- the check ------------------------------------------------------------------
@@ -69,35 +78,46 @@ fun checkPlacement(name : String, library : Bool, where : Span) -> Unit {
 --- a string literal; and does giblet initialization stay clear of the heap and
 --- later globals.
 --- Every compile that lowers runs this, whichever backend it is for.
-fun checkLowered(functions : Array (Ssa.Func Low),
-                 definitions : Vec (String, String), path : String) -> Unit {
-    let modules = gibletModules()
-    let summary = LowIr.summarize(functions)
-    let byName = Map.new()
-    for f in functions { Map.put(byName, f.name, f) }
-    for f in functions {
-        if isGiblet(modules, f) {
-            match Map.get(summary, f.name) {
-                Some(_) -> refuse(chain(byName, summary, f.name, named(f.name))
-                                  + ", and giblet code cannot allocate", path)
-                None -> {}
-            }
-            -- What nothing allocates can still hold a traced value across a
-            -- call; the collector would then have to find it, and a giblet
-            -- has no root frame for it to be found in.
-            if len(Map.keys(Roots.analyze(f).slots)) > 0 {
-                refuse(named(f.name) + " holds a traced value across a call, "
-                       + "and giblet code cannot", path)
-            }
-            match turkeyString(f) {
-                Some((what, rule, site)) -> refuse(named(f.name) + " " + what
-                                                   + where(byName, f.name, site)
-                                                   + ", and " + rule, path)
-                None -> {}
-            }
-        }
-    }
-    checkEarly(byName, summary, definitions, modules, path)
+fun checkLowered(
+	functions : Array (Ssa.Func Low),
+	definitions : Vec (String, String),
+	path : String,
+) -> Unit {
+	let modules = gibletModules()
+	let summary = LowIr.summarize(functions)
+	let byName = Map.new()
+	for f in functions { Map.put(byName, f.name, f) }
+	for f in functions {
+		if isGiblet(modules, f) {
+			match Map.get(summary, f.name) {
+				Some(_) -> refuse(
+					chain(byName, summary, f.name, named(f.name))
+						+ ", and giblet code cannot allocate",
+					path,
+				)
+				None -> {}
+			}
+			-- What nothing allocates can still hold a traced value across a
+			-- call; the collector would then have to find it, and a giblet
+			-- has no root frame for it to be found in.
+			if len(Map.keys(Roots.analyze(f).slots)) > 0 {
+				refuse(
+					named(f.name)
+						+ " holds a traced value across a call, "
+						+ "and giblet code cannot",
+					path,
+				)
+			}
+			match turkeyString(f) {
+				Some((what, rule, site)) -> refuse(
+					named(f.name) + " " + what + where(byName, f.name, site) + ", and " + rule,
+					path,
+				)
+				None -> {}
+			}
+		}
+	}
+	checkEarly(byName, summary, definitions, modules, path)
 }
 
 -- Where the heap is entered. Its state is itself set up by early
@@ -107,61 +127,77 @@ fun checkLowered(functions : Array (Ssa.Func Low),
 -- `allocateSlow` is here beside `allocate` because the optimizer may inline
 -- `allocate`'s fast path into its caller, which then calls the slow path
 -- directly.
-let collectorEntries = ["Turkey.Heap#allocate", "Turkey.Heap#allocateSlow",
-                        "Turkey.Heap#collectFrom"]
+let collectorEntries = [
+	"Turkey.Heap#allocate", "Turkey.Heap#allocateSlow", "Turkey.Heap#collectFrom",
+]
 
 -- Early initialization must not depend on the heap or on the later globals.
 -- Follow helpers as well as the entry itself: their scalar signatures alone
 -- cannot reveal an interned panic message or a read of an ordinary global.
-fun checkEarly(functions : Map String (Ssa.Func Low),
-               summary : Map String Allocation, definitions : Vec (String, String),
-               modules : Set.Set String, path : String) -> Unit {
-    let exports = Map.new()
-    for (symbol, name) in definitions { Map.put(exports, symbol, name) }
-    let seen = Set.new()
-    let work = [initializerName]
-    for var k = 0; k < len(work); k = k + 1 {
-        let name = work[k]
-        if Set.contains(seen, name) { continue }
-        Set.add(seen, name)
-        let f = match Map.get(functions, name) {
-            Some(found) -> found
-            None -> { bug("giblet initialization calls unknown function " + name, path) }
-        }
-        if Map.contains(summary, name) {
-            refuse(chain(functions, summary, name, reaching(name))
-                   + ", and giblet initialization cannot allocate", path)
-        }
-        for block in f.blocks {
-            for i in block.insts {
-                match i.op {
-                    ConstString(_) -> refuse(reaching(name) + " uses a string "
-                        + "literal, and giblet initialization cannot", path)
-                    GlobalLoad(global) | GlobalStore(global, _) -> {
-                        if !Set.contains(modules, Option.unwrapOr(Prelude.moduleOf(global), "")) {
-                            refuse(reaching(name) + " " + globalUse(global),
-                                   path)
-                        }
-                    }
-                    Call(Direct(callee), _) -> {
-                        if Array.contains(collectorEntries, callee) {
-                            refuse(reaching(name) + " calls '" + callee
-                                   + "', and giblet initialization cannot call "
-                                   + "the collector", path)
-                        }
-                        Vec.push(work, callee)
-                    }
-                    Call(Foreign(symbol, _), _) -> {
-                        match Map.get(exports, symbol) {
-                            Some(callee) -> Vec.push(work, callee)
-                            None -> {}
-                        }
-                    }
-                    _ -> {}
-                }
-            }
-        }
-    }
+fun checkEarly(
+	functions : Map String (Ssa.Func Low),
+	summary : Map String Allocation,
+	definitions : Vec (String, String),
+	modules : Set.Set String,
+	path : String,
+) -> Unit {
+	let exports = Map.new()
+	for (symbol, name) in definitions { Map.put(exports, symbol, name) }
+	let seen = Set.new()
+	let work = [initializerName]
+	for var k = 0; k < len(work); k = k + 1 {
+		let name = work[k]
+		if Set.contains(seen, name) { continue }
+		Set.add(seen, name)
+		let f = match Map.get(functions, name) {
+			Some(found) -> found
+			None        -> { bug("giblet initialization calls unknown function " + name, path) }
+		}
+		if Map.contains(summary, name) {
+			refuse(
+				chain(functions, summary, name, reaching(name))
+					+ ", and giblet initialization cannot allocate",
+				path,
+			)
+		}
+		for block in f.blocks {
+			for i in block.insts {
+				match i.op {
+					ConstString(_) -> refuse(
+						reaching(name)
+							+ " uses a string "
+							+ "literal, and giblet initialization cannot",
+						path,
+					)
+					GlobalLoad(global) | GlobalStore(global, _) -> {
+						if !Set.contains(modules, Option.unwrapOr(Prelude.moduleOf(global), "")) {
+							refuse(reaching(name) + " " + globalUse(global), path)
+						}
+					}
+					Call(Direct(callee), _) -> {
+						if Array.contains(collectorEntries, callee) {
+							refuse(
+								reaching(name)
+									+ " calls '"
+									+ callee
+									+ "', and giblet initialization cannot call "
+									+ "the collector",
+								path,
+							)
+						}
+						Vec.push(work, callee)
+					}
+					Call(Foreign(symbol, _), _) -> {
+						match Map.get(exports, symbol) {
+							Some(callee) -> Vec.push(work, callee)
+							None         -> {}
+						}
+					}
+					_ -> {}
+				}
+			}
+		}
+	}
 }
 
 -- Does a function use a Turkey `String` it did not build: a literal, or a
@@ -178,29 +214,33 @@ fun checkEarly(functions : Map String (Ssa.Func Low),
 -- Returns what the function does, the rule and fix that follow it in a
 -- message, and the value whose origin locates it.
 fun turkeyString(f : Ssa.Func Low) -> Option (String, String, Int) {
-    for block in f.blocks {
-        match block.term {
-            Panic(message) ->
-                return Some(("panics with a 'String'",
-                             "giblet code cannot; panic with "
-                             + "'Process.panic(Prim.cString(...))'",
-                             Ssa.valueId(message)))
-            _ -> {}
-        }
-    }
-    for block in f.blocks {
-        for i in block.insts {
-            match i.op {
-                ConstString(text) -> return Some(
-                    ("uses the string literal \"" + text + "\"",
-                     "giblet code cannot use one; write a C string with "
-                     + "'Prim.cString(...)'",
-                     Ssa.valueId(i.result)))
-                _ -> {}
-            }
-        }
-    }
-    None
+	for block in f.blocks {
+		match block.term {
+			Panic(message) ->
+				return Some((
+					"panics with a 'String'",
+					"giblet code cannot; panic with " + "'Process.panic(Prim.cString(...))'",
+					Ssa.valueId(message),
+				))
+			_ -> {}
+		}
+	}
+	for block in f.blocks {
+		for i in block.insts {
+			match i.op {
+				ConstString(text) -> return Some(
+					(
+						"uses the string literal \"" + text + "\"",
+						"giblet code cannot use one; write a C string with "
+							+ "'Prim.cString(...)'",
+						Ssa.valueId(i.result),
+					),
+				)
+				_ -> {}
+			}
+		}
+	}
+	None
 }
 
 -- The path the summary recorded from `start`, which is a shortest one, each
@@ -208,74 +248,88 @@ fun turkeyString(f : Ssa.Func Low) -> Option (String, String, Int) {
 --
 --     'f' in a giblet module calls 'g' (Turkey/A.gob:3:5), which builds an
 --     array (Turkey/B.gob:9:12)
-fun chain(functions : Map String (Ssa.Func Low), summary : Map String Allocation,
-          start : String, subject : String) -> String {
-    let out = String.builder()
-    var name = start
-    var going = True
-    String.push(out, subject)
-    while going {
-        match Map.get(summary, name) {
-            Some(CallsAllocating(callee, site)) -> {
-                String.push(out, " calls '" + callee + "'"
-                                 + where(functions, name, site) + ", which")
-                name = callee
-            }
-            Some(Allocates(what, site)) -> {
-                String.push(out, " " + what + where(functions, name, site))
-                going = False
-            }
-            None -> { going = False }
-        }
-    }
-    String.build(out)
+fun chain(
+	functions : Map String (Ssa.Func Low),
+	summary : Map String Allocation,
+	start : String,
+	subject : String,
+) -> String {
+	let out = String.builder()
+	var name = start
+	var going = True
+	String.push(out, subject)
+	while going {
+		match Map.get(summary, name) {
+			Some(CallsAllocating(callee, site)) -> {
+				String.push(
+					out,
+					" calls '" + callee + "'" + where(functions, name, site) + ", which",
+				)
+				name = callee
+			}
+			Some(Allocates(what, site)) -> {
+				String.push(out, " " + what + where(functions, name, site))
+				going = False
+			}
+			None -> { going = False }
+		}
+	}
+	String.build(out)
 }
 
-fun where(functions : Map String (Ssa.Func Low), name : String, site : Int)
-        -> String = match Map.get(functions, name) {
-    Some(f) -> match Map.get(f.origins, site) {
-        Some(s) -> " (" + s.file + ":" + showSpan(s) + ")"
-        None -> ""
-    }
-    None -> ""
-}
+fun where(functions : Map String (Ssa.Func Low), name : String, site : Int) -> String =
+	match Map.get(functions, name) {
+		Some(f) -> match Map.get(f.origins, site) {
+			Some(s) -> " (" + s.file + ":" + showSpan(s) + ")"
+			None    -> ""
+		}
+		None -> ""
+	}
 
 --- Returns whether `f` is giblet code: giblet initialization, or a function
 --- lowered from a binding of one of `modules`, which `gibletModules` gives.
 fun isGiblet(modules : Set.Set String, f : Ssa.Func i) -> Bool =
-    f.name == initializerName || Set.contains(modules, f.module_)
+	f.name == initializerName || Set.contains(modules, f.module_)
 
 -- Returns how a message names the giblet function `symbol`, as the subject of
 -- a sentence.
 fun named(symbol : String) -> String =
-    if symbol == initializerName { "giblet initialization" }
-    else { "'" + symbol + "' in a giblet module" }
+	if symbol == initializerName {
+		"giblet initialization"
+	} else {
+		"'" + symbol + "' in a giblet module"
+	}
 
 -- Returns the subject of a sentence about `symbol`, which giblet
 -- initialization runs: the initialization itself, or a call it makes.
 fun reaching(symbol : String) -> String =
-    if symbol == initializerName { "giblet initialization" }
-    else { "giblet initialization calls '" + symbol + "', which" }
+	if symbol == initializerName {
+		"giblet initialization"
+	} else {
+		"giblet initialization calls '" + symbol + "', which"
+	}
 
 -- Returns the predicate of a message about giblet initialization reading or
 -- writing `global`, a global outside the giblet modules. A `%nullary.` global
 -- is the shared object of a constructor with no fields, which the program
 -- never names, so the message describes it instead.
 fun globalUse(global : String) -> String =
-    if String.startsWith(global, "%nullary.") {
-        "uses a constructor with no fields, such as 'None', whose value is on "
-            + "the heap, and giblet initialization cannot use the heap"
-    } else {
-        "uses the global '" + global + "', and giblet initialization can use "
-            + "only the globals of giblet modules"
-    }
+	if String.startsWith(global, "%nullary.") {
+		"uses a constructor with no fields, such as 'None', whose value is on "
+			+ "the heap, and giblet initialization cannot use the heap"
+	} else {
+		"uses the global '"
+			+ global
+			+ "', and giblet initialization can use "
+			+ "only the globals of giblet modules"
+	}
 
 -- Ends the compile. The check runs on the lowered program, after the front
 -- end, and nothing past the front end collects diagnostics: the program has
 -- already been accepted, so one refusal is the whole report.
 fun refuse(message : String, path : String) -> a =
-    Diag.fail(Diag.whole("giblets", message), path)
+	Diag.fail(Diag.whole("giblets", message), path)
 
 -- Raises a check that only a compiler bug can fail.
 fun bug(message : String, path : String) -> a =
-    Diag.fail(Diag.whole("internal error", message), path)
+	Diag.fail(Diag.whole("internal error", message), path)

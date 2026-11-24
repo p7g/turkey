@@ -58,6 +58,8 @@ import Data.Byte as Byte
 import Data.Float as Float
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
+import Target (OS(..))
+import Target as Target
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -266,7 +268,7 @@ fun rememberedCountSet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 304,
 fun rememberedCapacity() -> Int = Ptr.load(Process.workerRecord(), 312)
 fun rememberedCapacitySet(n : Int) -> Unit = Ptr.store(Process.workerRecord(), 312, n)
 
--- The arm64 backend's frame table, sorted by return address.
+-- The backend's frame table, sorted by return address, or by site on wasm.
 var frameEntries : Ptr = Ptr.null()
 var frameEntryCount : Int = 0
 
@@ -1032,6 +1034,9 @@ foreign "turkey_roots_head" fun rootsHead() -> Ptr = roots
 --
 -- A frame whose return address is in no table has no roots, and is skipped. A
 -- binary that registers no table walks no frames.
+--
+-- Wasm keys the same table on a site's number instead of a return address,
+-- and the walk is of shadow frames (`scanShadow`).
 
 -- -- static objects -----------------------------------------------------------------
 --
@@ -1199,6 +1204,7 @@ fun stackTasks(frame : Ptr) -> Unit {
 -- aligned, and strictly increase. There is no low bound to check: the walk
 -- starts at a live frame and only ever moves outwards.
 fun scanStack(frame : Ptr, high : Ptr) -> Unit {
+    if let Wasi = Target.os { return scanShadow(frame, high) }
     let top = Ptr.toInt(high)
     var here = Ptr.toInt(frame)
     while !below(top, here + 16) && here & 7 == 0 {
@@ -1232,6 +1238,41 @@ fun scanStack(frame : Ptr, high : Ptr) -> Unit {
                 }
             }
         }
+        here = next
+    }
+}
+
+-- One stack's shadow frames, on wasm, from the frame at `frame` out to
+-- `high`.
+--
+-- Wasm code cannot read its own stack, so a function that holds roots keeps
+-- them in a frame in linear memory (`Turkey.Wasm.Select`), and `frame` is the
+-- shadow stack pointer, the innermost one. A frame's first word is the address
+-- past it, the next frame out or the stack's top, and its second the site it
+-- is stopped at. Unlike a frame record, a frame names its own site, and the
+-- entry for the site gives the frame's own roots, as offsets from the frame.
+-- The bounds are the native walk's: below `high`, 8-byte aligned, and
+-- strictly increasing.
+fun scanShadow(frame : Ptr, high : Ptr) -> Unit {
+    let top = Ptr.toInt(high)
+    var here = Ptr.toInt(frame)
+    while !below(top, here + 16) && here & 7 == 0 {
+        let record = Ptr.fromInt(here)
+        let entry = frameEntryFor(Ptr.load(record, 8))
+        if !Ptr.isNull(entry) {
+            let count : Int = Ptr.load(entry, 8)
+            let offsets : Ptr = Ptr.load(entry, 16)
+            for var i = 0; i < count; i = plus(i, 1) {
+                let value : Ptr = Ptr.load(record, rootOffset(offsets, i))
+                -- A frame object of a frame further out, as on arm64.
+                let at = Ptr.toInt(value)
+                if below(at, Ptr.toInt(frame)) || !below(at, top) {
+                    markGrey(value, Prim.cString("wasm frame"), i)
+                }
+            }
+        }
+        let next : Int = Ptr.load(record, 0)
+        if !below(here, next) { return }
         here = next
     }
 }

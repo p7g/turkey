@@ -71,6 +71,8 @@ import Data.Int as Int
 import Data.Byte as Byte
 import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
+import Target (OS(..))
+import Target as Target
 
 -- -- what the collector hands over --------------------------------------------------
 --
@@ -984,6 +986,7 @@ fun checkFrames(current : Int) -> Bool {
 -- towards `high`; the walk stops at the first that does not.
 fun checkStack(current : Int, high : Int) -> Bool {
     if high == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
+    if let Wasi = Target.os { return checkShadow(current, high) }
     var walked = current
     while !below(high, walked) && !below(high - walked, 16) && walked & 7 == 0 {
         let caller = word(walked, 0)
@@ -1010,6 +1013,34 @@ fun checkStack(current : Int, high : Int) -> Bool {
             }
         }
         walked = caller
+    }
+    True
+}
+
+-- One stack's shadow frames, on wasm, from the frame at `current` out to
+-- `high`, as the collector walks them (`Turkey.Heap.scanShadow`): a frame is
+-- the address past it and the site it is stopped at, and the entry for the
+-- site gives the frame's own roots as offsets from it, each within the frame.
+fun checkShadow(current : Int, high : Int) -> Bool {
+    var walked = current
+    while !below(high, walked) && !below(high - walked, 16) && walked & 7 == 0 {
+        let next = word(walked, 0)
+        let e = entryFor(word(walked, 8))
+        if e >= 0 {
+            let offsets = entryWord(e, 16)
+            for var fi = 0; fi < entryWord(e, 8); fi = fi + 1 {
+                let slot = Int.addWrapping(walked, rootOffset(offsets, fi))
+                if slot & 7 != 0 || below(slot, walked + 16) || !below(slot, next) {
+                    return fail(Prim.cString("invalid wasm root offset"),
+                                Ptr.toInt(entries) + entryBytes * e, fi)
+                }
+                let value = word(slot, 0)
+                let onStack = !below(value, current) && below(value, high)
+                if !onStack && !checkPointer(value, afterMarking(), walked, fi) { return False }
+            }
+        }
+        if !below(walked, next) || below(high, next) { return True }
+        walked = next
     }
     True
 }

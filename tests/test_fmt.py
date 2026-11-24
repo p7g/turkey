@@ -124,3 +124,20 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
     for path in rejected:
         result = fmt("--check", path)
         assert "internal error" not in result.stderr, (path, result.stderr)
+
+
+def test_parentheses_and_literals_stay_as_written(tmp_path: Path) -> None:
+    source = (
+        "fun f(x : (Int)) -> Option (Vec Int) = None\n"
+        "fun g(pair : (Int, Int)) -> Int {\n"
+        "\tlet (a, _) = pair\n"
+        "\tlet (b) = a\n"
+        "\tif let ((x, _) | (_, x)) = pair { x } else { 0x10 + 1_000 + b }\n"
+        "}\n"
+        "let s = \"\\u{41}\"\n"
+        "let h = \\Iter.map(_, g)\n"
+    )
+    target = tmp_path / "written.gob"
+    target.write_text(source)
+    result = fmt("--check", str(target))
+    assert (result.returncode, result.stdout, result.stderr) == (0, "", "")

@@ -150,25 +150,30 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
 
 
 def _with_block_comments(text: str) -> str:
-    """`text` with a block comment on each code line, in the space nearest the
-    middle of the line. A line with a quote or a comment on it is left alone,
-    so the comment is never put inside a literal or another comment."""
+    """`text` with a block comment in every space between two tokens of each
+    code line. A line with a quote or a comment on it is left alone, so no
+    comment is put inside a literal or another comment."""
     lines = text.split("\n")
-    for n, line in enumerate(lines):
+    n = 0
+    for i, line in enumerate(lines):
         if any(t in line for t in ('"', "'", "--", "{-", "-}")):
             continue
         start = len(line) - len(line.lstrip())
-        spaces = [i for i, ch in enumerate(line) if ch == " " and i > start]
-        if spaces:
-            mid = min(spaces, key=lambda i: abs(i - len(line) // 2))
-            lines[n] = line[:mid] + f" {{- z{n} -}} " + line[mid + 1:]
+        pieces = [line[:start]]
+        for ch in line[start:]:
+            if ch == " ":
+                n += 1
+                pieces.append(f" {{- z{n} -}} ")
+            else:
+                pieces.append(ch)
+        lines[i] = "".join(pieces)
     return "\n".join(lines)
 
 
 def test_block_comments_all_over_the_corpus_format_safely(tmp_path: Path) -> None:
-    # A block comment can go between any two tokens, so one per line reaches
-    # nearly every place the layout puts code. None may make the formatter
-    # refuse a file.
+    # A block comment can go between any two tokens, so one in every space
+    # reaches nearly every place the layout puts code, over a quarter of a
+    # million of them. None may make the formatter refuse a file.
     paths = []
     for top in ("lib", "src", "examples"):
         for source in sorted((ROOT / top).rglob("*.gob")):
@@ -219,6 +224,10 @@ AWKWARD = {
     "block_comment_in_empty_block": "fun f() { {- c -} }\n",
     "block_comment_before_equals_type": "type Section {- a -} =\n    --- Code.\n    Text\n    | {- b -} Data\n",
     "end_comment_before_equals": "fun g() {\n    let x -- c\n        = 1\n    x\n}\n",
+    "two_block_comments_one_token": "fun main() {\n    f(a, b {- c1 -}, {- c2 -})\n    let xs = [1, 2 {- a -}, {- b -}]\n    g({- a -} {- b -})\n}\n",
+    "block_comment_on_moved_rest": "import N (g as _, {- c -} .., h as _)\nimport Q (.. {- c -}, g as _)\n",
+    "block_comment_before_dropped_comma": "fun f() -> P = P {\n    x = 1 {- c -}, y = 2\n    z = 3\n}\n",
+    "block_comment_in_aligned_rows": "fun f(x : Int) -> Int = match x {\n    1 -> 0\n    {- c -} 22 -> 1\n    3 {- d -} | 4 -> 2\n    _ -> 3\n}\ntype F = F {\n    {- c -} lines : Vec String\n    tokens : Int\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -252,6 +261,14 @@ AWKWARD_OUTPUT = {
     "block_comment_in_empty_block": "fun f() { {- c -} }\n",
     "block_comment_before_equals_type": "type Section {- a -}\n\t--- Code.\n\t= Text\n\t| {- b -} Data\n",
     "end_comment_before_equals": "fun g() {\n\tlet x -- c\n\t\t= 1\n\tx\n}\n",
+    "two_block_comments_one_token":
+        "fun main() {\n\tf(a, b {- c1 -} {- c2 -})\n\tlet xs = [1, 2 {- a -} {- b -}]\n\tg({- a -} {- b -})\n}\n",
+    "block_comment_on_moved_rest": "import N (g as _, h as _, {- c -} ..)\nimport Q (g as _, .. {- c -})\n",
+    "block_comment_before_dropped_comma": "fun f() -> P = P {\n\tx = 1 {- c -}\n\ty = 2\n\tz = 3\n}\n",
+    "block_comment_in_aligned_rows": (
+        "fun f(x : Int) -> Int = match x {\n\t1             -> 0\n\t{- c -} 22    -> 1\n"
+        "\t3 {- d -} | 4 -> 2\n\t_             -> 3\n}\n"
+        "type F = F {\n\t{- c -} lines : Vec String\n\ttokens        : Int\n}\n"),
 }
 
 

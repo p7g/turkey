@@ -283,7 +283,9 @@ or removes parentheses, never spells a literal another way, and never changes
 a comment's text, except to drop trailing spaces. Comments keep their order:
 one on a line of its own stays on one, one at the end of a line stays at the
 end of one, and a block comment inside a line stays inside it. A doc comment
-documents what it documented before.
+documents what it documented before. Comments do not count toward the width:
+a line holding one may run past it, since moving code to the next line would
+not make the comment fit.
 
 A few choices are left to the author, because the source shows them:
 

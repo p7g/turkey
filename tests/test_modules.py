@@ -13,7 +13,6 @@ with the entry file's own directory.
 
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -325,35 +324,48 @@ def test_a_missing_module_is_reported(tmp_path):
     assert "cannot find module 'Nowhere'" in fails("import Nowhere", {})
 
 
+def library_with(tmp_path: Path, **modules: str) -> Path:
+    """A library that is the shipped one and `modules` besides: a directory
+    of links to everything in `lib/`, so that a test's own library module is
+    never in the `lib/` other tests are reading."""
+    root = tmp_path / "lib"
+    root.mkdir()
+    for entry in lang.LIB.iterdir():
+        (root / entry.name).symlink_to(entry)
+    for name, source in modules.items():
+        (root / f"{name}.gob").write_text(source, encoding="utf-8")
+    return root
+
+
+def checked_in(library: Path, cwd: Path, entry: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        toolchain.command(bootc.binary(), "check", entry), cwd=cwd,
+        env=dict(os.environ, TURKEY_LIB=str(library)), capture_output=True, text=True)
+
+
 def test_a_library_module_imports_only_library_modules(tmp_path):
     """A module of the library finds its imports in the library, whatever is
     beside the entry: `Mine` is the program's, so the library's module cannot
     find it."""
-    digest = hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
-    probe = lang.LIB / f"Probe_scoped_{digest}.gob"
-    probe.write_text("export ()\nimport Mine\n", encoding="utf-8")
-    try:
-        message = fails(f"import Mine\nimport Probe_scoped_{digest}\n"
-                        "fun main() { }\n", {"Mine.gob": "export ()\n"})
-    finally:
-        probe.unlink(missing_ok=True)
-    assert f"cannot find module 'Mine' (searched {lang.LIB})" in message
+    library = library_with(tmp_path, Probe="export ()\nimport Mine\n")
+    program = tmp_path / "program"
+    program.mkdir()
+    (program / "Mine.gob").write_text("export ()\n", encoding="utf-8")
+    (program / "main.gob").write_text("import Mine\nimport Probe\nfun main() { }\n",
+                                      encoding="utf-8")
+    result = checked_in(library, program, "main.gob")
+    assert result.returncode != 0
+    assert f"cannot find module 'Mine' (searched {library})" in result.stderr
 
 
 def test_an_entry_in_the_library_directory_loads_the_library_once(tmp_path):
     """The entry's directory is the library's, spelled another way than
     `$TURKEY_LIB` spells it. Its imports are the library's modules, not a
     second copy of them loaded as the program's."""
-    digest = hashlib.sha1(str(tmp_path).encode()).hexdigest()[:10]
-    entry = lang.LIB / f"Probe_root_{digest}.gob"
-    entry.write_text("fun main() { print(String.join([\"a\", \"b\"], \"-\")) }\n",
-                     encoding="utf-8")
-    try:
-        result = subprocess.run(
-            toolchain.command(bootc.binary(), "check", entry.name), cwd=lang.LIB,
-            env=dict(os.environ, TURKEY_LIB=str(lang.LIB)), capture_output=True, text=True)
-    finally:
-        entry.unlink(missing_ok=True)
+    library = library_with(tmp_path)
+    (library / "Entry.gob").write_text(
+        "fun main() { print(String.join([\"a\", \"b\"], \"-\")) }\n", encoding="utf-8")
+    result = checked_in(library, library, "Entry.gob")
     assert result.returncode == 0, result.stderr
 
 

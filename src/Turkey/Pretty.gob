@@ -1,7 +1,7 @@
 export (
     Doc, Row(..), RowKind(..),
     empty, text, raw, line, softline, hard, cat, nest, group, forced, ifBreak, suffix,
-    lastSuffix, choice, fill, rows, flat, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
+    lastSuffix, choice, fill, rows, flat, below, headed, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
     shifted, Pad(..), PadKind(..), renderPadded, realigned,
 )
 
@@ -49,6 +49,13 @@ type Doc
     | Fill(Vec Doc)
     | Rows(Vec Row)
     | Flat(Doc)
+    -- A line break, this many tabs deeper, then the document.
+    | Below(Int, Doc)
+    -- A group that always breaks, which `forceTail` made of the last group of
+    -- a spine: where the head before it ends, for `headed`.
+    | Tail(Doc)
+    -- An alternative of a choice measured by its head.
+    | Headed(Doc)
 
 --- One line of `rows`, or several when a row breaks. A row is `left` and then
 --- `right`; an `Aligned` row's `right` starts at the same column as the other
@@ -141,6 +148,19 @@ fun rows(table : Vec Row) -> Doc = Rows(table)
 --- hold no suffix but at its end.
 fun flat(d : Doc) -> Doc = Flat(d)
 
+--- Returns a line break `n` tabs deeper and then `d`. As an alternative of a
+--- choice other than the last, it is taken when the first line of `d` fits on
+--- the new line, or its head when `d` is `headed`, where any other
+--- alternative is taken when it fits on the line it starts on.
+fun below(n : Int, d : Doc) -> Doc = Below(n, d)
+
+--- Returns `d`, which ends in what `forceTail` made to break. As an
+--- alternative of a choice other than the last, it is taken when its head
+--- fits: the text before that part, laid out flat whatever its groups say.
+--- The head is measured flat because a group in it that breaks may have been
+--- broken by an earlier layout that did not take this alternative.
+fun headed(d : Doc) -> Doc = Headed(d)
+
 --- Returns whether `d` is the empty document.
 fun isEmpty(d : Doc) -> Bool = match d {
     Empty -> True
@@ -151,9 +171,9 @@ fun isEmpty(d : Doc) -> Bool = match d {
 fun isHard(d : Doc) -> Bool = match d {
     Empty | Text(_, _) | Line(_) -> False
     Raw(s) | Shifted(s, _) -> String.contains(s, "\n")
-    Hard | Suffix(_, _) | Rows(_) -> True
+    Hard | Suffix(_, _) | Rows(_) | Below(_, _) | Tail(_) -> True
     Cat(_, h) -> h
-    Nest(_, inner) | Flat(inner) -> isHard(inner)
+    Nest(_, inner) | Flat(inner) | Headed(inner) -> isHard(inner)
     Group(breaks, _) -> breaks
     -- A broken group does what its broken text says, so only the flat text
     -- decides whether the group can be flat.
@@ -165,21 +185,31 @@ fun isHard(d : Doc) -> Bool = match d {
 --- Returns whether `d` has a place it can break.
 fun breakable(d : Doc) -> Bool = match d {
     Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_, _) | Flat(_) -> False
-    Line(_) | Hard | Group(_, _) | IfBreak(_, _) | Choice(_) | Fill(_) | Rows(_) -> True
+    Line(_) | Hard | Group(_, _) | IfBreak(_, _) | Choice(_) | Fill(_) | Rows(_) | Below(_, _)
+        | Tail(_) -> True
     Cat(parts, _) -> Iter.any(parts, breakable)
-    Nest(_, inner) -> breakable(inner)
+    Nest(_, inner) | Headed(inner) -> breakable(inner)
 }
 
 --- Returns `d` with the last group of its spine made to break: the group that
---- a call hugging `d` as its last argument wants broken.
+--- a call hugging `d` as its last argument wants broken. A choice at the end
+--- of the spine loses its first alternative, the one laid out flat.
 fun forceTail(d : Doc) -> Doc = match d {
-    Group(_, inner) -> Group(True, inner)
+    Group(_, inner) -> Tail(inner)
+    Tail(_) -> d
+    Headed(inner) -> Headed(forceTail(inner))
+    Choice(alternatives) -> if len(alternatives) > 1 {
+        Choice(Vec.slice(alternatives, 1, len(alternatives)))
+    } else {
+        d
+    }
     Cat(parts, _) -> {
         let copy = Vec.slice(parts, 0, len(parts))
         copy[len(copy) - 1] = forceTail(copy[len(copy) - 1])
         Cat(copy, True)
     }
     Nest(n, inner) -> Nest(n, forceTail(inner))
+    Below(n, inner) -> Below(n, forceTail(inner))
     _ -> d
 }
 
@@ -472,6 +502,11 @@ fun layout(p : P, start : Cmd) -> Unit {
                 push(stack, indent, mode, parts[i])
             }
             Nest(n, inner) -> push(stack, indent + n, mode, inner)
+            Tail(inner) -> match mode {
+                Squashing -> push(stack, indent, Squashing, inner)
+                _ -> push(stack, indent, Breaking, inner)
+            }
+            Headed(inner) -> push(stack, indent, mode, inner)
             Group(breaks, inner) -> match mode {
                 Squashing -> push(stack, indent, Squashing, inner)
                 Flattening -> push(stack, indent, if breaks { Breaking } else { Flattening }, inner)
@@ -505,6 +540,13 @@ fun layout(p : P, start : Cmd) -> Unit {
                 _ -> printRows(p, indent, table)
             }
             Flat(inner) -> push(stack, indent, Squashing, inner)
+            Below(n, inner) -> {
+                match mode {
+                    Squashing -> emit(p, " ", 1)
+                    _ -> newline(p, indent + n)
+                }
+                push(stack, indent + n, mode, inner)
+            }
         }
     }
 }
@@ -531,7 +573,14 @@ fun chosen(p : P, indent : Int, alternatives : Vec Doc, stack : Vec Cmd) -> Cmd 
     let last = len(alternatives) - 1
     for var i = 1; i < last; i = i + 1 {
         let next = Cmd { indent = indent, mode = Flattening, doc = alternatives[i] }
-        if fits(p, next, stack) { return next }
+        let fitting = match alternatives[i] {
+            Below(n, Headed(inner)) -> headFits(p.width - (indent + n) * tabWidth, inner, stack)
+            Below(n, inner) -> fitsIn(p.width - (indent + n) * tabWidth,
+                                      Cmd { indent = indent + n, mode = Flattening, doc = inner }, stack)
+            Headed(inner) -> headFits(p.width - p.pos, inner, stack)
+            _ -> fits(p, next, stack)
+        }
+        if fitting { return next }
     }
     Cmd { indent = indent, mode = Breaking, doc = alternatives[last] }
 }
@@ -541,8 +590,46 @@ fun chosen(p : P, indent : Int, alternatives : Vec Doc, stack : Vec Cmd) -> Cmd 
 -- the mode it would be laid out in. A group that must break is measured
 -- broken even inside a flat one, which is what lets a choice see how a hugged
 -- argument's first line ends.
-fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
-    var remaining = p.width - p.pos
+fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool = fitsIn(p.width - p.pos, next, stack)
+
+-- Whether the head of `d`, the text before its first `Tail`, fits in `room`
+-- columns laid out flat. A `d` with no `Tail` is measured flat, and what
+-- follows it on the stack as `fits` measures it.
+fun headFits(room : Int, d : Doc, stack : Vec Cmd) -> Bool {
+    var remaining = room
+    let todo = [d]
+    while let Some(doc) = Vec.pop(todo) {
+        if remaining < 0 { return False }
+        match doc {
+            Tail(_) -> return True
+            Empty | Suffix(_, _) -> {}
+            Text(_, w) -> { remaining = remaining - w }
+            Raw(s) | Shifted(s, _) -> {
+                remaining = remaining - columns(Option.unwrapOr(Vec.at(String.lines(s), 0), ""))
+            }
+            Line(whenFlat) -> { remaining = remaining - String.codePointCount(whenFlat) }
+            Hard -> { remaining = remaining - 1 }
+            Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 { Vec.push(todo, parts[i]) }
+            Nest(_, inner) | Group(_, inner) | Flat(inner) | Headed(inner) -> Vec.push(todo, inner)
+            IfBreak(_, whenFlat) -> Vec.push(todo, whenFlat)
+            Choice(alternatives) -> Vec.push(todo, alternatives[0])
+            Fill(items) -> for var i = len(items) - 1; i >= 0; i = i - 1 {
+                Vec.push(todo, items[i])
+                if i > 0 { Vec.push(todo, Text(" ", 1)) }
+            }
+            Rows(table) -> Vec.push(todo, squashed(table))
+            Below(_, inner) -> {
+                remaining = remaining - 1
+                Vec.push(todo, inner)
+            }
+        }
+    }
+    remaining >= 0 && fitsIn(remaining, Cmd { indent = 0, mode = Flattening, doc = Empty }, stack)
+}
+
+-- `fits`, with `room` columns left on the line.
+fun fitsIn(room : Int, next : Cmd, stack : Vec Cmd) -> Bool {
+    var remaining = room
     let todo = [next]
     var rest = len(stack)
     while remaining >= 0 {
@@ -578,6 +665,11 @@ fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
                 Squashing -> push(todo, indent, mode, inner)
                 _ -> push(todo, indent, if breaks { Breaking } else { mode }, inner)
             }
+            Tail(inner) -> match mode {
+                Squashing -> push(todo, indent, mode, inner)
+                _ -> push(todo, indent, Breaking, inner)
+            }
+            Headed(inner) -> push(todo, indent, mode, inner)
             IfBreak(broken, whenFlat) -> match mode {
                 Breaking -> push(todo, indent, mode, broken)
                 _ -> push(todo, indent, mode, whenFlat)
@@ -599,6 +691,13 @@ fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
                 }
             }
             Flat(inner) -> push(todo, indent, Squashing, inner)
+            Below(_, inner) -> match mode {
+                Squashing -> {
+                    remaining = remaining - 1
+                    push(todo, indent, mode, inner)
+                }
+                _ -> return True
+            }
         }
     }
     False

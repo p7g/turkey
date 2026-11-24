@@ -24,10 +24,11 @@ export (
     Decl(..),
     Program(..),
     patternVars, varPatterns, laterOccurrences, orPatterns, freshNodeId, armBody, declBody,
+    removeTypeAndPatternParens,
     Child(..), children, exprChildren, stmtChildren,
     Completion(..), completion, stmtCompletion, completes, stmtStops, breaksOut,
     LetElse(..),
-    shorthandPrefix, isShorthand, sketch,
+    shorthandPrefix, isShorthand, sketch, unparen,
 )
 
 import Turkey.Types (ConCell)
@@ -124,6 +125,9 @@ type TypeKind
     | TEApp(Type, Vec Type)
     | TETuple(Vec Type)
     | TEFun(Vec Type, Type)
+    --- Parentheses around a single type, as written. `Turkey.Modules` removes
+    --- them, with `removeTypeAndPatternParens`, before any stage reads the tree.
+    | TEParen(Type)
 
 -- -- patterns ---------------------------------------------------------------------
 
@@ -153,7 +157,8 @@ type PatKind
     --- purpose. Without it every field must be named, so that adding a field to
     --- a declaration is an error in the patterns that claim to cover all of it.
     | PRecord(String, Vec (String, Pat), Bool)
-    | PLit(Lit)
+    --- A literal, and its text as written.
+    | PLit(Lit, String)
     | PTuple(Vec Pat)
     | PAnnot(Pat, Type)
     --- `p1 | p2 | ...`, nested inside another pattern or written where a
@@ -164,6 +169,10 @@ type PatKind
     --- alternatives at the top of a `match` arm or a `let` guard are not one of
     --- these; they are the arm's or the guard's list of patterns.
     | POr(Vec Pat)
+    --- Parentheses around a single pattern, as written. `Turkey.Modules`
+    --- removes them, with `removeTypeAndPatternParens`, before any stage reads
+    --- the tree.
+    | PParen(Pat)
 
 -- -- expressions ------------------------------------------------------------------
 
@@ -178,7 +187,8 @@ type Expr = Expr {
 }
 
 type ExprKind
-    = ELit(Lit)
+    --- A literal, and its text as written.
+    = ELit(Lit, String)
     | EUnit
     --- The `Bool` is set when the compiler wrote this node itself to mean a
     --- *class method* -- the `add` a `+` means. Resolution looks such a node up
@@ -190,7 +200,8 @@ type ExprKind
     | ETuple(Vec Expr)
     | EArray(Vec Expr)
     | ERecord(String, Vec (String, Expr))
-    | ELambda(Vec Pat, Option Type, Expr)
+    --- The flag is set on a function written with `\`.
+    | ELambda(Vec Pat, Option Type, Expr, Bool)
     | ECall(Expr, Vec Expr)
     --- The two trailing references are `Index`'s `get` and `set`, filled in by
     --- resolution and consumed by desugaring, which turns every bracket into
@@ -233,6 +244,13 @@ type ExprKind
     | EBlock(Vec Stmt)
     | EQuestion(Expr, Option Expr)
     | EDo(Expr)
+    -- Grouping is already in the tree's shape. The node is kept so the tree
+    -- records what the author wrote, which the formatter prints back and
+    -- checks it printed.
+    --- Parentheses around a single expression, as written. They are
+    --- transparent to the `_` placeholder rule: `(_ + 1) * 2` is one function.
+    --- `Turkey.Desugar` removes them, and no stage after it sees one.
+    | EParen(Expr)
 
 --- An arm is taken when one of its patterns matches and then every guard holds,
 --- in order. A failing guard goes on to the next arm, with the bindings its arm
@@ -280,6 +298,12 @@ fun conditionExpr(c : Condition) -> Expr = match c {
 fun conditionSpan(c : Condition) -> Span = match c {
     CondTest(s, _) -> s
     CondLet(s, _, _, _) -> s
+}
+
+--- Returns `e` without the grouping parentheses around it, however many.
+fun unparen(e : Expr) -> Expr = match e.kind {
+    EParen(inner) -> unparen(inner)
+    _ -> e
 }
 
 -- -- statements -------------------------------------------------------------------
@@ -566,12 +590,13 @@ fun varPatterns(p : Pat) -> Vec Pat {
 fun collectVarPatterns(p : Pat, out : Vec Pat) -> Unit = match p.kind {
     PVar(_) -> Vec.push(out, p)
     PWild -> {}
-    PLit(_) -> {}
+    PLit(_, _) -> {}
     PCon(_, args) -> for a in args { collectVarPatterns(a, out) }
     PRecord(_, fields, _) -> for (_, sub) in fields { collectVarPatterns(sub, out) }
     PTuple(elems) -> for e in elems { collectVarPatterns(e, out) }
     PAnnot(inner, _) -> collectVarPatterns(inner, out)
     POr(alts) -> collectVarPatterns(alts[0], out)
+    PParen(inner) -> collectVarPatterns(inner, out)
 }
 
 --- Every `PVar` node that `varPatterns` leaves out: the variables of each
@@ -598,7 +623,7 @@ fun orPatterns(p : Pat) -> Vec Pat {
 fun collectOrPatterns(p : Pat, out : Vec Pat) -> Unit = match p.kind {
     PVar(_) -> {}
     PWild -> {}
-    PLit(_) -> {}
+    PLit(_, _) -> {}
     PCon(_, args) -> for a in args { collectOrPatterns(a, out) }
     PRecord(_, fields, _) -> for (_, sub) in fields { collectOrPatterns(sub, out) }
     PTuple(elems) -> for e in elems { collectOrPatterns(e, out) }
@@ -607,6 +632,7 @@ fun collectOrPatterns(p : Pat, out : Vec Pat) -> Unit = match p.kind {
         Vec.push(out, p)
         for a in alts { collectOrPatterns(a, out) }
     }
+    PParen(inner) -> collectOrPatterns(inner, out)
 }
 
 -- -- the child enumerator -----------------------------------------------------------
@@ -635,7 +661,7 @@ fun children(c : Child) -> Vec Child = match c {
 }
 
 fun exprChildren(e : Expr) -> Vec Child = match e.kind {
-    ELit(_) -> []
+    ELit(_, _) -> []
     EUnit -> []
     EVar(_, _) -> []
     ECon(_) -> []
@@ -643,7 +669,7 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
     ETuple(xs) -> Vec.map(xs, ChExpr)
     EArray(xs) -> Vec.map(xs, ChExpr)
     ERecord(_, fields) -> fieldChildren(fields)
-    ELambda(_, _, body) -> [ChExpr(body)]
+    ELambda(_, _, body, _) -> [ChExpr(body)]
     ECall(fn, args) -> Vec.append([ChExpr(fn)], Vec.map(args, ChExpr))
     EIndex(arr, index, _, _) -> [ChExpr(arr), ChExpr(index)]
     EField(obj, _) -> [ChExpr(obj)]
@@ -672,6 +698,7 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
     EBlock(stmts) -> Vec.map(stmts, ChStmt)
     EQuestion(inner, _) -> [ChExpr(inner)]
     EDo(body) -> [ChExpr(body)]
+    EParen(inner) -> [ChExpr(inner)]
 }
 
 fun stmtChildren(s : Stmt) -> Vec Child = match s.kind {
@@ -794,7 +821,7 @@ fun orElse(a : Completion, b : Completion) -> Completion = match a {
 -- into both branches of every `if`, and a run of `if`s would double it each
 -- time.
 fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
-    ELit(_) -> (Completes, Stops)
+    ELit(_, _) -> (Completes, Stops)
     EUnit -> (Completes, Stops)
     EVar(_, _) -> (Completes, Stops)
     ECon(_) -> (Completes, Stops)
@@ -803,7 +830,7 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
     ERecord(_, fields) -> inOrder(Vec.map(fields, fun((_, value)) = reach(value)))
     -- Making a function runs none of it, and its `return`s and `break`s are
     -- its own.
-    ELambda(_, _, _) -> (Completes, Stops)
+    ELambda(_, _, _, _) -> (Completes, Stops)
     ECall(fn, args) -> {
         let (ends, breaks) = inOrder(Vec.append([reach(fn)], Vec.map(args, reach)))
         (andThen(ends, IfReturns(e)), breaks)
@@ -900,6 +927,7 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
     -- A `do` block is evaluated as a value of its monad, and a `break` cannot
     -- cross into one.
     EDo(_) -> (Completes, Stops)
+    EParen(inner) -> reach(inner)
 }
 
 fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
@@ -993,7 +1021,7 @@ type LetElse = LetElse {
 let shorthandPrefix = "%it"
 
 fun isShorthand(e : Expr) -> Bool = match e.kind {
-    ELambda(params, _, _) -> len(params) == 1 && match params[0].kind {
+    ELambda(params, _, _, _) -> len(params) == 1 && match params[0].kind {
         PVar(name) -> String.startsWith(name, shorthandPrefix)
         _ -> False
     }
@@ -1030,7 +1058,7 @@ fun sketchName(name : String) -> String =
     if String.startsWith(name, shorthandPrefix) { "$x" } else { name }
 
 fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
-    ELit(l) -> (literalText(l), 8)
+    ELit(l, _) -> (literalText(l), 8)
     EUnit -> ("()", 8)
     EVar(name, _) -> (sketchName(name), 8)
     ECon(name) -> (name, 8)
@@ -1040,7 +1068,7 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
         let shown = Vec.map(fields, fun((f, v)) = f + " = " + sketchAt(v, 0))
         (name + " { " + String.join(shown, ", ") + " }", 8)
     }
-    ELambda(params, _, body) -> {
+    ELambda(params, _, body, _) -> {
         let names = Vec.map(params, fun(p) = match p.kind {
             PVar(name) -> sketchName(name)
             _ -> "..."
@@ -1067,5 +1095,168 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
         (String.build(b), 0)
     }
     EAnnot(inner, _) -> sketchLevel(inner)
+    EParen(inner) -> ("(" + sketchAt(inner, 0) + ")", 8)
     _ -> ("...", 8)
+}
+
+-- -- type and pattern parentheses -----------------------------------------------------
+
+--- Removes every `TEParen` and `PParen` in `p`. The node of the parentheses
+--- takes the kind of the node inside them, and keeps its own id and span. Must
+--- run before anything records a type or pattern node's id.
+fun removeTypeAndPatternParens(p : Program) -> Unit {
+    -- A parenthesis node's parent cannot always be rebuilt around the node
+    -- inside: a `FunDecl`'s return type or a `TypeDecl`'s alias is an
+    -- immutable field. So the node inside is dropped instead, which is safe
+    -- only while no table holds its id.
+    let Program {
+        span = _, exportDecl = _, imports = _, decls, letElses = _, comments = _, blankLines = _,
+    } = p
+    for d in decls {
+        match d {
+            DStmt(s) -> plainStmt(s)
+            DType(t) -> plainTypeDecl(t)
+            DClass(c) -> {
+                let ClassDecl { span = _, name = _, param = _, supers, methods, families = _ } = c
+                for pr in supers { plainPred(pr) }
+                for m in methods { plainFun(m) }
+            }
+            DInstance(i) -> {
+                let InstanceDecl { span = _, cls = _, head, context, methods, families } = i
+                plainType(head)
+                for pr in context { plainPred(pr) }
+                for m in methods { plainFun(m) }
+                for fam in families {
+                    let FamBind { span = _, name = _, body } = fam
+                    plainType(body)
+                }
+            }
+            DForeign(f) -> {
+                let ForeignDecl {
+                    id = _, span = _, name = _, symbol = _, params, fixed = _, ret, library = _,
+                } = f
+                for q in params { plainPat(q) }
+                plainType(ret)
+            }
+            DInfix(_) -> {}
+        }
+    }
+}
+
+fun plainTypeDecl(t : TypeDecl) -> Unit {
+    let TypeDecl { span = _, name = _, params = _, derives = _, variants, alias } = t
+    if let Some(a) = alias { plainType(a) }
+    for v in Option.unwrapOr(variants, []) {
+        let ConDecl {
+            span = _, name = _, args, fields, vars = _, fieldSpans = _, binders = _, context,
+        } = v
+        for a in args { plainType(a) }
+        for (_, ft) in Option.unwrapOr(fields, []) { plainType(ft) }
+        for pr in context { plainPred(pr) }
+    }
+}
+
+fun plainType(t : Type) -> Unit {
+    let Type { id = _, span = _, kind = _ } = t
+    while let TEParen(inner) = t.kind { t.kind = inner.kind }
+    match t.kind {
+        TEVar(_) -> {}
+        TECon(_, args) -> for a in args { plainType(a) }
+        TEApp(head, args) -> {
+            plainType(head)
+            for a in args { plainType(a) }
+        }
+        TETuple(xs) -> for x in xs { plainType(x) }
+        TEFun(params, ret) -> {
+            for x in params { plainType(x) }
+            plainType(ret)
+        }
+        TEParen(_) -> {}
+    }
+}
+
+fun plainPred(pr : Pred) -> Unit {
+    let Pred { span = _, kind } = pr
+    match kind {
+        PClass(_, t) -> plainType(t)
+        PEq(a, b) -> {
+            plainType(a)
+            plainType(b)
+        }
+    }
+}
+
+fun plainPat(p : Pat) -> Unit {
+    let Pat { id = _, span = _, kind = _, opening = _ } = p
+    while let PParen(inner) = p.kind { p.kind = inner.kind }
+    match p.kind {
+        PVar(_) | PWild | PLit(_, _) -> {}
+        PCon(_, args) -> for a in args { plainPat(a) }
+        PRecord(_, fields, _) -> for (_, sub) in fields { plainPat(sub) }
+        PTuple(xs) -> for x in xs { plainPat(x) }
+        PAnnot(inner, t) -> {
+            plainPat(inner)
+            plainType(t)
+        }
+        POr(alts) -> for a in alts { plainPat(a) }
+        PParen(_) -> {}
+    }
+}
+
+fun plainFun(f : FunDecl) -> Unit {
+    let FunDecl {
+        id = _, span = _, name = _, params, ret, body, context, monomorphic = _, symbol = _,
+    } = f
+    for q in params { plainPat(q) }
+    if let Some(t) = ret { plainType(t) }
+    for pr in context { plainPred(pr) }
+    if let Some(b) = body { plainExpr(b) }
+}
+
+fun plainStmt(s : Stmt) -> Unit {
+    match s.kind {
+        SLet(q, _) | SVar(q, _) -> plainPat(q)
+        SLetElse(_, q, _, _) -> plainPat(q)
+        SFun(f) -> {
+            plainFun(f)
+            return
+        }
+        SAssign(_, _) | SExpr(_) -> {}
+    }
+    for c in stmtChildren(s) { plainChild(c) }
+}
+
+fun plainExpr(e : Expr) -> Unit {
+    match e.kind {
+        ELambda(params, ret, _, _) -> {
+            for q in params { plainPat(q) }
+            if let Some(t) = ret { plainType(t) }
+        }
+        EAnnot(_, t) -> plainType(t)
+        EForIn(q, _, _, _, _) -> plainPat(q)
+        EIfLet(conditions, _, _) | EWhileLet(conditions, _) -> for c in conditions {
+            if let CondLet(_, _, alts, _) = c { for q in alts { plainPat(q) } }
+        }
+        -- Every other form holds no type or pattern of its own.
+        ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | ETuple(_) | EArray(_) | ERecord(_, _)
+            | ECall(_, _) | EIndex(_, _, _, _) | EField(_, _) | EProject(_, _) | EUnary(_, _, _)
+            | EBinary(_, _, _, _) | EChain(_, _) | EIf(_, _, _) | EWhile(_, _) | EForC(_, _, _, _)
+            | ELoop(_) | EMatch(_, _) | EReturn(_) | EBreak(_) | EContinue | EBlock(_)
+            | EQuestion(_, _) | EDo(_) | EParen(_) -> {}
+    }
+    for c in exprChildren(e) { plainChild(c) }
+}
+
+fun plainChild(c : Child) -> Unit = match c {
+    ChExpr(e) -> plainExpr(e)
+    ChStmt(s) -> plainStmt(s)
+    ChArm(a) -> {
+        let Arm { span = _, patterns, guards, body = _ } = a
+        for q in patterns { plainPat(q) }
+        for g in guards {
+            if let GLet(alts, _) = g { for q in alts { plainPat(q) } }
+        }
+        for child in children(c) { plainChild(child) }
+    }
+    ChFun(f) -> plainFun(f)
 }

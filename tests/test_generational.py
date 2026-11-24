@@ -86,9 +86,8 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     shutil.copytree(bootc.REPO_ROOT / "lib", library)
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
-    before = "    let header : Int = Ptr.load(parent, 0)\n"
-    assert text.count(before) == 1
-    heap.write_text(text.replace(before, before + "    return {}\n"))
+    before = "let header : Int = Ptr.load(parent, 0)"
+    heap.write_text(bootc.edit_line(text, before, [before, "return {}"]))
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
     binary = tmp_path / "broken"

@@ -370,3 +370,17 @@ def split_before(text: str, marker: str) -> dict[str, str]:
     if name is not None:
         modules[name] = "".join(current)
     return modules
+
+
+def edit_line(text: str, line: str, replacement: list[str]) -> str:
+    """Returns `text` with its one line whose content, stripped, is `line`
+    replaced by the lines `replacement`, each given that line's indentation.
+    Matching on stripped content keeps an edit to a copy of the library
+    working however the library is indented. Raises AssertionError unless
+    exactly one line matches."""
+    lines = text.split("\n")
+    hits = [i for i, l in enumerate(lines) if l.strip() == line]
+    assert len(hits) == 1, (line, len(hits))
+    at = hits[0]
+    indent = lines[at][: len(lines[at]) - len(lines[at].lstrip())]
+    return "\n".join(lines[:at] + [indent + r for r in replacement] + lines[at + 1:])

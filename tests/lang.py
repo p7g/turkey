@@ -217,11 +217,15 @@ def _cached(output: str, entry: Path, build,
 TARGETS = ("host", "wasm32-wasi")
 
 # The warning `turkey build --target wasm32-wasi` gives every program that
-# reaches the scheduler, whose coroutine switches are built as traps; the
-# reference says the target gives it, so it is not compared with the host.
-_TRAP_COUNT = re.compile(
-    r"^\S+: warning: [0-9]+ functions use operations the wasm32 backend does not "
-    r"compile yet, and trap if they are called; .*\n", re.M)
+# reaches the scheduler, whose four coroutine switches (`Coroutine#resume`,
+# `Scheduler#waitOn`, `Wait#settleIn`, `Scheduler#yield`) are built as traps;
+# the reference says the target gives it, so it is not compared with the host.
+# Only the whole line with that count is removed, as
+# `tests/harness/Toolchain.gob` removes it: a fifth refused function stays
+# visible. Once wasm has coroutines the count shrinks.
+_TRAP_COUNT = ("{}: warning: 4 functions use operations the wasm32 backend "
+               "does not compile yet, and trap if they are called; "
+               "'--dump select' lists them\n")
 
 
 def _built(entry: Path, flags: tuple[str, ...] = (),
@@ -284,7 +288,8 @@ def run(src: Source, modules: dict[str, str] | None = None,
     if target == "host":
         command = toolchain.command(compiled.binary, *args)
     else:
-        warnings = _TRAP_COUNT.sub("", warnings)
+        line = _TRAP_COUNT.format(entry.name)
+        warnings = ("\n" + warnings).replace("\n" + line, "\n")[1:]
         command = [toolchain.needs_wasmtime(), "run", "--dir", "."]
         for name, value in (env or {}).items():
             command += ["--env", f"{name}={value}"]

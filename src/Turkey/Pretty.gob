@@ -2,6 +2,7 @@ export (
     Doc, Row(..), RowKind(..),
     empty, text, raw, line, softline, hard, cat, nest, group, forced, ifBreak, suffix,
     choice, fill, rows, flat, isEmpty, isHard, breakable, forceTail, render, renderFlat, columns,
+    shifted,
 )
 
 --- Documents to lay out, and the layout: a Wadler–Leijen printer.
@@ -29,6 +30,9 @@ type Doc
     -- Text whose lines after the first are printed as they are, without the
     -- indent: the inside of a block comment.
     | Raw(String)
+    -- Text whose lines after the first begin with the indent of its first line
+    -- in the source, which is replaced with the indent it is printed at.
+    | Shifted(String, String)
     -- A break: a newline in a broken group, and this text in a flat one.
     | Line(String)
     | Hard
@@ -67,6 +71,13 @@ fun text(s : String) -> Doc = Text(s, String.codePointCount(s))
 --- Returns `s` with its first line placed like text and every later line
 --- printed exactly as it is, indent and all.
 fun raw(s : String) -> Doc = if String.contains(s, "\n") { Raw(s) } else { text(s) }
+
+--- Returns `s`, lines of source whose first line was indented with `indent`,
+--- with each later line that begins with `indent` printed with the indent
+--- the first line is printed at in its place, and the rest of the line as it
+--- is. So the lines keep their places relative to the first.
+fun shifted(s : String, indent : String) -> Doc =
+    if String.contains(s, "\n") { Shifted(s, indent) } else { text(s) }
 
 --- A break that is a space when flat.
 let line = Line(" ")
@@ -132,7 +143,7 @@ fun isEmpty(d : Doc) -> Bool = match d {
 --- Returns whether `d` cannot be laid out on one line.
 fun isHard(d : Doc) -> Bool = match d {
     Empty | Text(_, _) | Line(_) -> False
-    Raw(s) -> String.contains(s, "\n")
+    Raw(s) | Shifted(s, _) -> String.contains(s, "\n")
     Hard | Suffix(_) | Rows(_) -> True
     Cat(_, h) -> h
     Nest(_, inner) | Flat(inner) -> isHard(inner)
@@ -146,7 +157,7 @@ fun isHard(d : Doc) -> Bool = match d {
 
 --- Returns whether `d` has a place it can break.
 fun breakable(d : Doc) -> Bool = match d {
-    Empty | Text(_, _) | Raw(_) | Suffix(_) | Flat(_) -> False
+    Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_) | Flat(_) -> False
     Line(_) | Hard | Group(_, _) | IfBreak(_, _) | Choice(_) | Fill(_) | Rows(_) -> True
     Cat(parts, _) -> Iter.any(parts, breakable)
     Nest(_, inner) -> breakable(inner)
@@ -221,9 +232,12 @@ fun emit(p : P, s : String, w : Int) -> Unit {
     p.pos = p.pos + w
 }
 
+-- Ends the line being written with the suffixes waiting for it, one space
+-- after its last text.
 fun flushPending(p : P) -> Unit {
     if len(p.pending) > 0 {
-        emit(p, " " + String.join(p.pending, " "), 0)
+        let text = String.trimEnd(String.join(p.parts, ""))
+        p.parts = [text + " " + String.join(p.pending, " ")]
         p.pending = []
     }
 }
@@ -265,6 +279,14 @@ fun layout(p : P, start : Cmd) -> Unit {
             Empty -> {}
             Text(s, w) -> emit(p, s, w)
             Raw(s) -> emitLines(p, String.lines(s))
+            Shifted(s, from) -> {
+                let ls = String.lines(s)
+                let to = String.repeat("\t", indent)
+                for var i = 1; i < len(ls); i = i + 1 {
+                    if let Some(rest) = String.stripPrefix(ls[i], from) { ls[i] = to + rest }
+                }
+                emitLines(p, ls)
+            }
             Line(whenFlat) -> match mode {
                 Breaking -> newline(p, indent)
                 _ -> emit(p, whenFlat, String.codePointCount(whenFlat))
@@ -362,7 +384,7 @@ fun fits(p : P, next : Cmd, stack : Vec Cmd) -> Bool {
             -- not make the line any shorter: it counts for nothing.
             Empty | Suffix(_) -> {}
             Text(_, w) -> { remaining = remaining - w }
-            Raw(s) -> {
+            Raw(s) | Shifted(s, _) -> {
                 let first = Option.unwrapOr(Vec.at(String.lines(s), 0), "")
                 remaining = remaining - columns(first)
                 if String.contains(s, "\n") { return remaining >= 0 }

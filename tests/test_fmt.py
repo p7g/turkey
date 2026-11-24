@@ -106,7 +106,7 @@ def test_a_line_ending_in_a_directive_keeps_its_code(tmp_path: Path) -> None:
         "fun main() {\n"
         "\treport(diagnostics, \"unexpected token while parsing the arms of a match\", span, Severity.Error, hint) --@expect(unreachable-code)\n"
         "\tlet x = add(1,\n"
-        "        2) --@expect(unreachable-code)\n"
+        "\t    2) --@expect(unreachable-code)\n"
         "}\n"
     )
 
@@ -151,8 +151,10 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
         assert "internal error" not in result.stderr, (path, result.stderr)
 
 
-# Inputs the formatter once refused or could not format twice the same way.
-# Each must format, and its output must be formatted already.
+# Comments and directives in the places that are hardest to keep: between two
+# end-of-line comments, inside types and argument lists, around `else`, and on
+# lines a directive covers. Each must format without a refusal, and its output
+# must be formatted already.
 AWKWARD = {
     "comment_in_type": "fun f() -> (Int,\n    -- c\n    Int) {\n    (1, 2)\n}\n",
     "comment_after_rest": "import Data.Vec (..) -- c\n",
@@ -168,6 +170,28 @@ AWKWARD = {
     "directive_after_long_signature": "fun f(aaaaaaaaaaaaaaaaaaaa : Int, bbbbbbbbbbbbbbbbbbbbbbbbbb : Int, cccccccccccccccccccc : Int) -> Int { --@expect(unreachable-code)\n    1\n}\n",
     "directive_after_statements": "fun main() {\n    let a = 1; let b = 2 --@expect(unreachable-code)\n    print(a + b)\n}\n",
     "directive_after_block": "fun main() {\n    let a = { print(1); 2 } --@expect(unreachable-code)\n    print(a)\n}\n",
+    "end_comment_after_equals": "fun main() {\n    let s = -- a\n        f(x)\n}\n",
+    "end_comment_after_arrow": "fun g(t : Option Int) -> Int = match t {\n    Some(x) -> -- a\n        f(x)\n    None -> 0\n}\n",
+    "block_comment_first_argument": "fun f() {\n  h({- first -} x)\n}\n",
+    "block_comment_in_array": "let xs = [1, {- c -} 2]\n",
+    "block_comment_before_equals": "fun f() {\n  let x {- c -} = 1\n}\n",
+    "block_comment_under_directive": "fun f() {\n  foo(1, {- c -} 2) --@expect(unreachable-code)\n}\n",
+    "directive_after_if": "fun main() {\n    if c { --@expect(unreachable-code)\n        a()\n    }\n}\n",
+}
+
+# What some of them must format to, exactly.
+AWKWARD_OUTPUT = {
+    "end_comment_after_equals": "fun main() {\n\tlet s = -- a\n\t\tf(x)\n}\n",
+    "end_comment_after_arrow":
+        "fun g(t : Option Int) -> Int = match t {\n\tSome(x) -> -- a\n\t\tf(x)\n\tNone -> 0\n}\n",
+    "two_end_comments_let": "fun main() {\n\tlet s = -- a\n\t\t\"x\" -- b\n}\n",
+    "block_comment_first_argument": "fun f() {\n\th({- first -} x)\n}\n",
+    "block_comment_in_arguments": "fun main() { foo(1, {- c -} 2) }\n",
+    "block_comment_in_array": "let xs = [1, {- c -} 2]\n",
+    "block_comment_in_chain": "fun main() { let x = 1 {- c -} + 2 }\n",
+    "block_comment_before_equals": "fun f() {\n\tlet x {- c -} = 1\n}\n",
+    "block_comment_under_directive": "fun f() {\n\tfoo(1, {- c -} 2) --@expect(unreachable-code)\n}\n",
+    "directive_after_if": "fun main() {\n\tif c { --@expect(unreachable-code)\n\t    a()\n\t}\n}\n",
 }
 
 
@@ -177,8 +201,22 @@ def test_awkward_input_formats(tmp_path: Path, name: str) -> None:
     target.write_text(AWKWARD[name])
     result = fmt(str(target))
     assert (result.returncode, result.stderr) == (0, "")
+    if name in AWKWARD_OUTPUT:
+        assert target.read_bytes() == AWKWARD_OUTPUT[name].encode()
     result = fmt("--check", str(target))
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+def test_a_file_whose_name_starts_with_a_dash(tmp_path: Path) -> None:
+    (tmp_path / "-x.gob").write_text("fun main() {print(1)}\n")
+    result = fmt("--", "-x.gob", cwd=tmp_path)
+    assert (result.returncode, result.stderr) == (0, "")
+    assert (tmp_path / "-x.gob").read_bytes() == b"fun main() { print(1) }\n"
+
+
+def test_a_command_line_it_cannot_read_has_its_own_status(tmp_path: Path) -> None:
+    result = fmt("--bogus", "a.gob", cwd=tmp_path)
+    assert (result.returncode, result.stderr) == (4, "turkey: unknown option --bogus\n")
 
 
 def test_a_directive_line_keeps_its_code(tmp_path: Path) -> None:

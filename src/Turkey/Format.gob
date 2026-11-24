@@ -261,6 +261,16 @@ fun clamp(i : Int, n : Int) -> Int = if i < 0 { 0 } else if i > n { n } else { i
 
 fun written(f : F, s : Span) -> String = slice(f.lines, s)
 
+-- The source `s` covers, kept as written but moved with its first line: the
+-- lines after it keep their places relative to it.
+fun kept(f : F, s : Span) -> Doc {
+    let line = if s.line <= len(f.lines) { f.lines[s.line - 1] } else { "" }
+    let cs = String.toCodePoints(line)
+    var n = 0
+    while n < len(cs) && (cs[n] == ' ' || cs[n] == '\t') { n = n + 1 }
+    P.shifted(String.trimEnd(written(f, s)), String.fromCodePoints(Array.slice(cs, 0, n)))
+}
+
 -- -- tokens -------------------------------------------------------------------------
 
 -- The index of the first token that starts at or after `at`.
@@ -367,7 +377,8 @@ fun leading(f : F, to : Pos) -> Doc {
         else if c.block && codeFollows(f, c) { Vec.push(parts, P.cat([commentDoc(c), P.text(" ")])) }
         else {
             loose(f, c)
-            Vec.push(parts, P.cat([P.suffix(commentText(c)), P.hard]))
+            -- The code after the break continues the line the comment ends.
+            Vec.push(parts, P.cat([P.suffix(commentText(c)), P.nest(1, P.hard)]))
         }
     }
     P.cat(parts)
@@ -421,6 +432,8 @@ fun trailing(f : F, from : Pos) -> Vec Comment {
     while let Some(c) = pending(f) {
         let at = startOf(c.span)
         if c.span.line != from.line || lt(at, from) || !lt(at, limit) { break }
+        -- A block comment with code after it belongs before that code.
+        if c.block && codeFollows(f, c) { break }
         take(f)
         Vec.push(out, c)
     }
@@ -487,7 +500,7 @@ fun sequence(f : F, items : Vec Item, close : Pos) -> Sequenced {
         } else if item.span.line == item.span.endLine {
             Vec.push(table, Row { kind = row.kind, left = P.flat(row.left), right = P.flat(P.cat([row.right, end])) })
         } else {
-            Vec.push(table, plain(P.cat([P.raw(written(f, item.span)), end])))
+            Vec.push(table, plain(P.cat([kept(f, item.span), end])))
         }
         previous = len(table) - 1
         above = item.span.endLine
@@ -573,14 +586,30 @@ fun listed(f : F, entries : Vec Entry, open : Pos, close : Pos) -> Listed {
 
 -- Whether a comment not yet printed is between `open` and `close` and outside
 -- every one of `entries`: one the list itself holds, which keeps it on several
--- lines, rather than one inside an item, which is the item's to lay out.
+-- lines, rather than one inside an item, which is the item's to lay out. A
+-- block comment with code after it on its line stays inside that line, so it
+-- keeps nothing on several.
 fun commentAmong(f : F, entries : Vec Entry, open : Pos, close : Pos) -> Bool {
     for var i = f.next; i < len(f.comments); i = i + 1 {
-        let at = startOf(f.comments[i].span)
+        let c = f.comments[i]
+        let at = startOf(c.span)
         if !lt(at, close) { return False }
-        if lt(at, open) { continue }
+        if lt(at, open) || (c.block && codeFollows(f, c)) { continue }
         let within = Iter.any(entries, fun(e) = !lt(at, startOf(e.span)) && lt(at, endOf(e.span)))
         if !within { return True }
+    }
+    False
+}
+
+-- Whether a comment not yet printed starts between `from` and `to` and needs a
+-- line of its own, or ends one: any comment but a block comment with code after
+-- it on its line, which stays inside that line.
+fun lineCommentIn(f : F, from : Pos, to : Pos) -> Bool {
+    for var i = f.next; i < len(f.comments); i = i + 1 {
+        let c = f.comments[i]
+        let at = startOf(c.span)
+        if !lt(at, to) { return False }
+        if !lt(at, from) && !(c.block && codeFollows(f, c)) { return True }
     }
     False
 }
@@ -753,10 +782,21 @@ fun exportItemDoc(f : F, item : ExportItem) -> Doc {
     }
     let name = if isOperatorName(item.name) { "(" + item.name + ")" } else { item.name }
     let subs = match item.subs {
-        Some(names) -> "(" + String.join(names, ", ") + ")"
-        None -> ""
+        Some(_) -> {
+            -- The names hold no spans, so their tokens stand in for them.
+            let open = findToken(f, startOf(item.span), "(")
+            let close = matching(f, open)
+            let entries = []
+            for var i = open + 1; i < close; i = i + 1 {
+                if kindAt(f, i) == "," { continue }
+                let at = f.tokens[i].span
+                Vec.push(entries, Entry { span = at, build = fun() = P.text(written(f, at)) })
+            }
+            list(f, open, "(", ")", entries)
+        }
+        None -> P.empty()
     }
-    P.cat([lead, P.text(name + subs)])
+    P.cat([lead, P.text(name), subs])
 }
 
 fun isOperatorName(name : String) -> Bool = match String.decode(name, String.start(name)) {
@@ -899,8 +939,8 @@ type Field = Field { span : Span, build : fun() -> Row }
 -- a line, without commas and with the fields' `:` or `=` aligned. `rest` is a
 -- pattern's trailing `..`.
 fun record(f : F, open : Int, close : Pos, fields : Vec Field, rest : Bool) -> Doc {
-    let commented = hasCommentIn(f, tokenPos(f, open), close)
-    if len(fields) == 0 && !rest && !commented { return P.text("{}") }
+    let commented = lineCommentIn(f, tokenPos(f, open), close)
+    if len(fields) == 0 && !rest && !hasCommentIn(f, tokenPos(f, open), close) { return P.text("{}") }
     let items = Vec.map(fields, fun(field) = Item { span = field.span, build = field.build })
     let s = sequence(f, items, close)
     let table = s.table
@@ -951,8 +991,8 @@ fun body(f : F, whole : Span, items : Vec Item) -> Doc {
     let ordered = Vec.sortBy(items, fun(a, b) = if lt(startOf(a.span), startOf(b.span)) { LT } else { GT })
     let open = findToken(f, startOf(whole), "{")
     let close = closerOf(whole)
-    let commented = hasCommentIn(f, tokenPos(f, open), close)
-    if len(ordered) == 0 && !commented { return P.text("{}") }
+    let commented = lineCommentIn(f, tokenPos(f, open), close)
+    if len(ordered) == 0 && !hasCommentIn(f, tokenPos(f, open), close) { return P.text("{}") }
     if len(ordered) == 1 && !commented && !opensLine(f, open) {
         let row = ordered[0].build()
         let member = P.cat([row.left, row.right])
@@ -1022,8 +1062,7 @@ fun funDoc(f : F, d : FunDecl) -> Doc {
                 file = d.span.file, inlined = None,
             }
             while commentBefore(f, startOf(b.span)) { take(f) }
-            let text = String.trimEnd(written(f, header))
-            return P.cat([P.raw(text), P.text(" "), exprDoc(f, b)])
+            return P.cat([kept(f, header), P.text(" "), exprDoc(f, b)])
         }
     }
     let context = if len(d.context) == 0 { P.empty() } else {
@@ -1083,18 +1122,24 @@ fun endsInBraces(e : Expr) -> Bool = match e.kind {
 fun stmtDoc(f : F, s : Stmt) -> Doc {
     let lead = leading(f, startOf(s.span))
     let d = match s.kind {
-        SLet(p, value) -> P.cat([P.text("let "), patDoc(f, p), P.text(" = "), exprDoc(f, value)])
-        SVar(p, value) -> P.cat([P.text("var "), patDoc(f, p), P.text(" = "), exprDoc(f, value)])
+        SLet(p, value) -> P.cat([P.text("let "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
+        SVar(p, value) -> P.cat([P.text("var "), patDoc(f, p), equals(f, p.span), exprDoc(f, value)])
         SFun(d) -> funDoc(f, d)
-        SAssign(target, value) -> P.cat([exprDoc(f, target), P.text(" = "), exprDoc(f, value)])
+        SAssign(target, value) ->
+            P.cat([exprDoc(f, target), equals(f, target.span), exprDoc(f, value)])
         SExpr(e) -> exprDoc(f, e)
         SLetElse(mutable, p, value, otherwise) -> P.cat([
-            P.text(if mutable { "var " } else { "let " }), patDoc(f, p), P.text(" = "), exprDoc(f, value),
-            P.text(" else "), exprDoc(f, otherwise),
+            P.text(if mutable { "var " } else { "let " }), patDoc(f, p), equals(f, p.span),
+            exprDoc(f, value), P.text(" else "), exprDoc(f, otherwise),
         ])
     }
     P.cat([lead, d])
 }
+
+-- ` = ` after what `before` covers, with the block comments between them and
+-- the `=` kept before it.
+fun equals(f : F, before : Span) -> Doc =
+    P.cat([inline(f, tokenPos(f, findToken(f, endOf(before), "="))), P.text(" = ")])
 
 -- -- patterns -----------------------------------------------------------------------
 
@@ -1267,9 +1312,9 @@ fun blockInside(f : F, e : Expr) -> (Doc, Bool) {
     }
     let open = tokenFrom(f, startOf(e.span))
     let close = closerOf(e.span)
-    let commented = hasCommentIn(f, startOf(e.span), close)
-    if len(stmts) == 0 && !commented { return (P.empty(), False) }
-    if len(stmts) >= 2 || commented || opensLine(f, open) {
+    let commented = lineCommentIn(f, startOf(e.span), close)
+    if len(stmts) == 0 && !hasCommentIn(f, startOf(e.span), close) { return (P.empty(), False) }
+    if len(stmts) != 1 || commented || opensLine(f, open) {
         let items = Vec.map(stmts, fun(s) = Item { span = s.span, build = fun() = plain(stmtDoc(f, s)) })
         let s = sequence(f, items, close)
         if len(s.table) == 0 { return (P.cat([s.head, P.hard]), True) }

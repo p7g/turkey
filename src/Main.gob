@@ -485,10 +485,11 @@ fun baseName(path : String) -> String {
 
 -- `turkey fmt [--check] FILE...`: formats each file in place, writing only the
 -- files it changes. Under `--check` it writes nothing and prints the name of
--- each file it would change. The exit status is 2 if the formatter refused a
--- file, which is an internal error, or else 3 if a file could not be read,
--- parsed or written, or else 1 under `--check` if a file would change, or
--- else 0. Every file is done whatever happened to the ones before it.
+-- each file it would change. The exit status is 4 for a command line it cannot
+-- read, and otherwise 2 if the formatter refused a file, which is an internal
+-- error, or else 3 if a file could not be read, parsed or written, or else 1
+-- under `--check` if a file would change, or else 0. Every file is done
+-- whatever happened to the ones before it.
 --
 -- The parser ends the process at the first error, so each file is formatted
 -- in a process of its own, this program run as `fmt --one`, which says by its
@@ -499,21 +500,22 @@ fun fmt(p : Args.Parser) -> Unit {
     let paths = []
     loop {
         match Args.next(p) {
-            Left(message) -> die(message)
+            Left(message) -> fmtUsage(message)
             Right(None) -> break
             Right(Some(Long("check"))) -> { checking = True }
             Right(Some(Long("one"))) -> { one = True }
             Right(Some(Value(path))) -> Vec.push(paths, path)
-            Right(Some(arg)) -> die(Args.unexpected(arg))
+            Right(Some(arg)) -> fmtUsage(Args.unexpected(arg))
         }
     }
-    if len(paths) == 0 { usage() }
+    if len(paths) == 0 { fmtUsage("usage: turkey fmt [--check] FILE...") }
     if one { return fmtOne(paths[0], checking) }
     let self = match Env.executablePath() {
         Some(path) -> path
         None -> die("cannot find this program's own executable to format each file with")
     }
-    let flags = if checking { ["fmt", "--one", "--check"] } else { ["fmt", "--one"] }
+    -- `--` before the path, so a file whose name starts with `-` is a file.
+    let flags = if checking { ["fmt", "--one", "--check", "--"] } else { ["fmt", "--one", "--"] }
     -- The files are formatted at once, and reported in the order given.
     let runs = Parallel.map(paths, fun(path) =
         Process.run(Process.command(Array.append(Array.append([self], flags), [path])), None))
@@ -551,6 +553,13 @@ fun fmt(p : Args.Parser) -> Unit {
     if refused { Diag.exit(2) }
     if failed { Diag.exit(3) }
     if checking && changed { Diag.exit(1) }
+}
+
+-- Ends `fmt` for a command line it cannot read, with a status of its own: 2
+-- means the formatter refused a file.
+fun fmtUsage(message : String) -> a {
+    toStderr("turkey: " + message + "\n")
+    Diag.exit(4)
 }
 
 -- `fmt --one`: formats `path`, and exits 10 if it changed or would change, 11

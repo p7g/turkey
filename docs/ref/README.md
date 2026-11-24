@@ -263,7 +263,9 @@ fun main() {
 takes no options. `turkey fmt --check` writes nothing: it prints the name of
 each file it would change, and exits with status 1 if there is one. A file
 that cannot be read, parsed or written is reported, the other files are done
-anyway, and the exit status is 3.
+anyway, and the exit status is 3. A file the formatter refuses, because its
+output would not be the same program, is reported as an internal error, with
+status 2, and a command line `turkey fmt` cannot read exits with status 4.
 
 ```sh
 turkey fmt hello.gob
@@ -287,8 +289,12 @@ A few choices are left to the author, because the source shows them:
 * A line break before a data type's `=` keeps its constructors on one line
   each.
 * A directive at the end of a line, such as `--@expect(...)`, covers that
-  line, so the formatter keeps the code on that line together: it joins
-  nothing onto the line and moves nothing off it.
+  line, so the formatter keeps the code on that line exactly as it is. A
+  statement written on one line stays on one line, however long. A statement
+  written over several lines with such a directive on any of them, after a
+  `{` or anywhere else, is kept as written, moved only by the change in its
+  first line's indent. A function whose body opens with one keeps its
+  signature as written, and its body is formatted.
 
 ## For maintainers
 

@@ -13,7 +13,9 @@
 #
 #   bootstrap  the fixed point, and the emitter over the compiler's source,
 #              which test_emit, test_bootstrap, test_debug_info and
-#              test_unwind share
+#              test_unwind share; also the compiler built for wasm32-wasi
+#              compiling itself under wasmtime, which writes the compiler for
+#              each target the way the fixed point does
 #   native     the corpus built by the arm64 backend, run under GC stress
 #              with every collection full
 #   generational

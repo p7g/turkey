@@ -144,12 +144,12 @@ SCENARIOS = {
         # Another port of the same host: credentials dropped. The same
         # origin: kept.
         "200 other got GET /landed, authorization False, cookie False",
-        "200 landed, authorization True",
+        "200 landed, authorization True, cookie True",
         "error NotSent(BadRedirect(BadTarget(unsupported URL scheme 'file')))",
         # No Location: not followed.
         "302 ",
         # Each hop goes through the policy again.
-        "200 landed, authorization False",
+        "200 landed, authorization False, cookie False",
         "error NotSent(Transport(Forbidden))",
     ],
     "cookies": [

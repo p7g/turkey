@@ -13,7 +13,7 @@ export (
 --- wasm32-wasi, which has none.
 ---
 --- Each function here takes the arguments its namesake in `Turkey.Libc` takes
---- and answers as that one does: -1 or null on failure, with the error in
+--- and returns what that one does: -1 or null on failure, with the error in
 --- `errno`, which is this module's own word. And each speaks arm64 Linux's
 --- numbers and layouts -- its `O_*` flags, `AT_*` values and clock ids, its
 --- error numbers, and its `struct stat` and `struct dirent` -- so that
@@ -52,7 +52,7 @@ type Ptr = Prim.Ptr
 
 -- -- the imports -----------------------------------------------------------------------
 --
--- WASI preview 1, as the host provides it to a core module. Each answers
+-- WASI preview 1, as the host provides it to a core module. Each returns
 -- WASI's error number as an `i32`, 0 for success, and writes what it
 -- returns through the pointer it is given. Every pointer is an address in
 -- this program's linear memory and crosses as an `i32`; an integer crosses as
@@ -137,7 +137,7 @@ fun loadAddress(p : Ptr, offset : Int) -> Ptr = Prim.ptrFromInt(load32(p, offset
 -- would carry and initialize every global it declared. The block is the
 -- first `stateBytes()` of the one `startVector` grows, before the argument
 -- vector, which `Turkey.Entry` hands `Turkey.Process.argsSet` as `argv`. So
--- the state is found from the `argv` word of the process state (word 16),
+-- the state is found from the `argv` word of the process state, the word at 16,
 -- with one thread the only worker record there is. `startVector` runs before
 -- anything else here, and grown memory is zeroed, so each field starts as 0,
 -- null or False.
@@ -145,7 +145,7 @@ fun loadAddress(p : Ptr, offset : Int) -> Ptr = Prim.ptrFromInt(load32(p, offset
 -- The fields: `errno` at 0; the allocator's block at 8; the environment and
 -- how many variables it has at 16 and 24, and whether it has been read at 32;
 -- the scratch block at 40; the preopens, how many there are and whether they
--- have been read at 48, 56 and 64; and what `resolve` answers, a path and its
+-- have been read at 48, 56 and 64; and what `resolve` leaves, a path and its
 -- length, at 72 and 80.
 
 fun stateBytes() -> Int = 88
@@ -187,7 +187,7 @@ fun errno() -> Int = lastError()
 --- Sets `errno`.
 fun errnoSet(n : Int) -> Unit = lastErrorSet(n)
 
--- Record WASI's error `code` as `errno`, and answer -1.
+-- Record WASI's error `code` as `errno`, and return -1.
 fun failed(code : Int) -> Int {
     lastErrorSet(linuxErrno(code))
     -1
@@ -199,7 +199,7 @@ fun checked(code : Prim.Int32) -> Int {
     if n == 0 { 0 } else { failed(n) }
 }
 
--- Record Linux's error number `n` and answer -1, for a failure found here.
+-- Record Linux's error number `n` and return -1, for a failure found here.
 fun refused(n : Int) -> Int {
     lastErrorSet(n)
     -1
@@ -298,7 +298,7 @@ fun linuxErrno(code : Int) -> Int = match code {
 -- `malloc` over `memory.grow`, which hands out 64 KiB pages and takes none
 -- back. A block of at most `smallLimit()` bytes comes from a page carved into
 -- blocks of one power of two, from 16 bytes up; a larger block is a run of
--- whole pages, which is also what `alignedAlloc` answers, since a page is
+-- whole pages, which is also what `alignedAlloc` returns, since a page is
 -- aligned to its own size. A freed small block goes on its size's list and a
 -- freed run on the list of runs, first fit, and neither goes back to the
 -- engine.
@@ -420,7 +420,7 @@ fun pages(n : Int) -> Ptr {
     made
 }
 
---- Gives back a block `malloc`, `realloc` or `alignedAlloc` answered. Does
+--- Gives back a block `malloc`, `realloc` or `alignedAlloc` returned. Does
 --- nothing with null.
 fun free(p : Ptr) -> Unit {
     if isNull(p) || isNull(allocator()) { return }
@@ -521,7 +521,7 @@ fun startVector() -> Ptr {
     -- own 4-byte vector, and the strings. The two sizes are read into the
     -- first page before the layout is known; the pages grown after it follow
     -- it, so the block is one run. It reads and writes no state, since the
-    -- state is found from what it answers.
+    -- state is found from what it returns.
     let first = grow(1)
     if isNull(first) { return first }
     let vector = at(first, stateBytes())
@@ -655,7 +655,7 @@ fun oneBuffer(buf : Ptr, count : Int) -> Ptr {
     scratch()
 }
 
--- What a transfer answers: the count WASI stored, or -1.
+-- What a transfer returns: the count WASI stored, or -1.
 fun moved(code : Prim.Int32) -> Int =
     if checked(code) != 0 { -1 } else { load32(scratch(), doneAt()) }
 
@@ -708,7 +708,7 @@ fun setStatusFlags() -> Int = 4
 fun linuxAppend() -> Int = 0x400
 fun linuxNonBlocking() -> Int = 0x800
 
---- Answers `F_GETFD`, `F_SETFD` and `F_GETFL`, with no argument. There is no
+--- Handles `F_GETFD`, `F_SETFD` and `F_GETFL`, with no argument. There is no
 --- `exec`, so a descriptor's only flag, close-on-exec, reads as clear.
 fun fcntl(fd : Int, command : Int) -> Int {
     if command != getStatusFlags() { return 0 }
@@ -722,7 +722,7 @@ fun fcntl(fd : Int, command : Int) -> Int {
     out
 }
 
---- Answers `F_SETFD` and `F_SETFL`, with one argument: `O_APPEND` and
+--- Handles `F_SETFD` and `F_SETFL`, with one argument: `O_APPEND` and
 --- `O_NONBLOCK` are what WASI can set.
 fun fcntlWith(fd : Int, command : Int, argument : Int) -> Int {
     if command != setStatusFlags() { return 0 }
@@ -1019,7 +1019,7 @@ fun mkdtemp(template : Ptr) -> Ptr {
 -- the next entry to ask WASI for at 8, the buffer `fd_readdir` fills at 16,
 -- its size at 24, how much of it holds entries at 32 and how far they have
 -- been read at 40, and whether the last fill reached the directory's end at
--- 48. Then the Linux `struct dirent` `readdir` answers, from `direntAt()`:
+-- 48. Then the Linux `struct dirent` `readdir` returns, from `direntAt()`:
 -- its type at 18 and its name, NUL-terminated, from 19.
 
 fun streamBytes() -> Int = 56

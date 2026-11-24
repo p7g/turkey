@@ -1,7 +1,7 @@
-"""`turkey fmt`, the formatter in `src/Turkey/Format.gob`.
+"""`turkey format`, the formatter in `src/Turkey/Format.gob`.
 
-The style is the pairs in `tests/fmt/`: each `NAME.gob` and `NAME.expected.gob`,
-which is exactly what `turkey fmt` must make of it. The corpus -- `lib/`,
+The style is the pairs in `tests/format/`: each `NAME.gob` and `NAME.expected.gob`,
+which is exactly what `turkey format` must make of it. The corpus -- `lib/`,
 `src/`, `examples/` and every example in `docs/ref/` -- checks the formatter's
 safety net instead: each file's output must parse to the same tree, hold the
 same comments and format to itself, or the formatter refuses it with an
@@ -21,12 +21,12 @@ import pytest
 from tests import bootc, toolchain
 
 ROOT = bootc.REPO_ROOT
-GOLDENS = ROOT / "tests" / "fmt"
+GOLDENS = ROOT / "tests" / "format"
 PAIRS = sorted(p.name[: -len(".expected.gob")] for p in GOLDENS.glob("*.expected.gob"))
 
 
-def fmt(*argv: str, cwd: Path = ROOT, **variables: str) -> subprocess.CompletedProcess:
-    return subprocess.run(toolchain.command(bootc.binary(), "fmt", *argv), cwd=cwd,
+def run_format(*argv: str, cwd: Path = ROOT, **variables: str) -> subprocess.CompletedProcess:
+    return subprocess.run(toolchain.command(bootc.binary(), "format", *argv), cwd=cwd,
                           env=dict(os.environ, **variables), capture_output=True, text=True,
                           timeout=600)
 
@@ -35,14 +35,14 @@ def fmt(*argv: str, cwd: Path = ROOT, **variables: str) -> subprocess.CompletedP
 def test_golden(tmp_path: Path, name: str) -> None:
     target = tmp_path / f"{name}.gob"
     shutil.copy(GOLDENS / f"{name}.gob", target)
-    result = fmt(str(target))
+    result = run_format(str(target))
     assert result.returncode == 0, result.stderr
     assert target.read_bytes() == (GOLDENS / f"{name}.expected.gob").read_bytes()
 
 
 def test_every_expected_output_is_already_formatted() -> None:
     expected = [str(GOLDENS / f"{name}.expected.gob") for name in PAIRS]
-    result = fmt("--check", *expected)
+    result = run_format("--check", *expected)
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
 
 
@@ -51,7 +51,7 @@ def test_check_names_the_files_it_would_change_and_writes_nothing(tmp_path: Path
     tidy = tmp_path / "tidy.gob"
     messy.write_text("fun main() { print(1) ; print(2) }\n")
     tidy.write_text("fun main() {\n\tprint(1)\n}\n")
-    result = fmt("--check", "messy.gob", "tidy.gob", cwd=tmp_path)
+    result = run_format("--check", "messy.gob", "tidy.gob", cwd=tmp_path)
     assert (result.returncode, result.stdout) == (1, "messy.gob\n"), result.stderr
     assert messy.read_bytes() == b"fun main() { print(1) ; print(2) }\n"
 
@@ -60,7 +60,7 @@ def test_a_file_that_does_not_parse_is_reported_and_the_rest_are_done(tmp_path: 
     (tmp_path / "a.gob").write_text("fun main() { print(1) ; print(2) }\n")
     (tmp_path / "broken.gob").write_text("fun main( {\n")
     (tmp_path / "b.gob").write_text("fun main() {print(3)}\n")
-    result = fmt("a.gob", "broken.gob", "b.gob", cwd=tmp_path)
+    result = run_format("a.gob", "broken.gob", "b.gob", cwd=tmp_path)
     assert result.returncode == 3
     assert result.stderr.startswith("broken.gob:1:11: parse error: ")
     assert (tmp_path / "a.gob").read_bytes() == b"fun main() {\n\tprint(1)\n\tprint(2)\n}\n"
@@ -68,21 +68,21 @@ def test_a_file_that_does_not_parse_is_reported_and_the_rest_are_done(tmp_path: 
     assert (tmp_path / "b.gob").read_bytes() == b"fun main() { print(3) }\n"
     # Under `--check` the status says the file is broken, not that it would
     # change.
-    result = fmt("--check", "broken.gob", cwd=tmp_path)
+    result = run_format("--check", "broken.gob", cwd=tmp_path)
     assert result.returncode == 3
 
 
 def test_a_refused_file_is_an_internal_error_and_the_rest_are_done(tmp_path: Path) -> None:
     (tmp_path / "a.gob").write_text("fun main() {print(1)}\n")
     (tmp_path / "b.gob").write_text("fun main() {print(2)}\n")
-    result = fmt("a.gob", "b.gob", cwd=tmp_path, TURKEY_TEST_FMT="refuse")
+    result = run_format("a.gob", "b.gob", cwd=tmp_path, TURKEY_TEST_FORMAT="refuse")
     assert result.returncode == 2
     assert result.stderr == (
         "a.gob: internal error: the formatter refuses this file: refused for a test\n"
         "b.gob: internal error: the formatter refuses this file: refused for a test\n")
     assert (tmp_path / "a.gob").read_bytes() == b"fun main() {print(1)}\n"
     # Formatted text that does not parse is the formatter's fault too.
-    result = fmt("--check", "a.gob", cwd=tmp_path, TURKEY_TEST_FMT="garble")
+    result = run_format("--check", "a.gob", cwd=tmp_path, TURKEY_TEST_FORMAT="garble")
     assert result.returncode == 2
     assert result.stderr.startswith(
         "a.gob: internal error: the formatter refuses this file: the formatted text does not parse: ")
@@ -100,7 +100,7 @@ def test_a_line_ending_in_a_directive_keeps_its_code(tmp_path: Path) -> None:
     )
     target = tmp_path / "directives.gob"
     target.write_text(source)
-    result = fmt(str(target))
+    result = run_format(str(target))
     assert result.returncode == 0, result.stderr
     assert target.read_text() == (
         "fun main() {\n"
@@ -131,9 +131,16 @@ def _fences() -> list[tuple[str, str, bool]]:
     return out
 
 
+def _corpus() -> list[Path]:
+    """The `.gob` files of `lib/`, `src/` and `examples/`, sorted, without a
+    test's throwaway `Probe_*` module, which another test may write into
+    `lib/` and delete while this one runs."""
+    return sorted(p for top in ("lib", "src", "examples") for p in (ROOT / top).rglob("*.gob")
+                  if not p.name.startswith("Probe_"))
+
+
 def test_the_corpus_formats_safely(tmp_path: Path) -> None:
-    files = sorted(str(p.relative_to(ROOT)) for top in ("lib", "src", "examples")
-                   for p in (ROOT / top).rglob("*.gob"))
+    files = [str(p.relative_to(ROOT)) for p in _corpus()]
     accepted = []
     rejected = []
     for name, source, error in _fences():
@@ -142,11 +149,47 @@ def test_the_corpus_formats_safely(tmp_path: Path) -> None:
         (rejected if error else accepted).append(str(path))
     assert len(files) > 100 and len(accepted) > 100
     # `--check` writes nothing; it exits 1 because the corpus is not formatted.
-    result = fmt("--check", *files, *accepted)
+    result = run_format("--check", *files, *accepted)
     assert result.returncode in (0, 1) and result.stderr == "", result.stderr
     # A file that does not parse is reported, and the run goes on.
-    result = fmt("--check", *rejected)
+    result = run_format("--check", *rejected)
     assert "internal error" not in result.stderr, result.stderr
+
+
+def _columns(line: str) -> int:
+    return sum(4 if c == "\t" else 1 for c in line)
+
+
+def _may_run_long(line: str) -> bool:
+    """Whether a formatted line longer than the width is long for a reason the
+    layout cannot break: comments, which do not count toward the width, or a
+    string literal."""
+    code = re.sub(r"\{-.*?-\}", "", line)
+    if code.lstrip().startswith("--"):
+        return True
+    code = re.sub(r"\s--.*$", "", code).rstrip()
+    if _columns(code) <= 100:
+        return True
+    return _columns(re.sub(r'"(\\.|[^"\\])*"', '""', code)) <= 100
+
+
+def test_the_corpus_fits_the_width(tmp_path: Path) -> None:
+    # A line over the width that could have broken is a layout that measured
+    # wrongly, such as a head whose `{` went uncounted.
+    copies = []
+    for p in _corpus():
+        target = tmp_path / p.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(p, target)
+        copies.append(str(target))
+    result = run_format(*copies)
+    assert result.returncode == 0, result.stderr
+    long = []
+    for name in copies:
+        for n, line in enumerate(Path(name).read_text().split("\n"), 1):
+            if _columns(line) > 100 and not _may_run_long(line):
+                long.append(f"{Path(name).relative_to(tmp_path)}:{n}: {line.strip()}")
+    assert long == []
 
 
 def _with_block_comments(text: str) -> str:
@@ -175,13 +218,12 @@ def test_block_comments_all_over_the_corpus_format_safely(tmp_path: Path) -> Non
     # reaches nearly every place the layout puts code, over a quarter of a
     # million of them. None may make the formatter refuse a file.
     paths = []
-    for top in ("lib", "src", "examples"):
-        for source in sorted((ROOT / top).rglob("*.gob")):
-            target = tmp_path / source.relative_to(ROOT)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(_with_block_comments(source.read_text()))
-            paths.append(str(target))
-    result = fmt("--check", *paths)
+    for source in _corpus():
+        target = tmp_path / source.relative_to(ROOT)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_with_block_comments(source.read_text()))
+        paths.append(str(target))
+    result = run_format("--check", *paths)
     assert result.returncode in (0, 1) and result.stderr == "", result.stderr
 
 
@@ -239,6 +281,8 @@ AWKWARD = {
     "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
     "foreign_blocks": "foreign \"env\" {\n    \"log\" fun log(x : Int) -> Unit\n}\nforeign \"ssl\" 3 { \"f\" fun g(x : Int) -> Int }\n",
     "comments_before_aligned_trailing_comments": "fun main() {\n    let a = f(1) {- c -} -- one\n    let bb = 2 -- two\n    let c = 3 {- x -} {- y -} -- three\n}\n",
+    "no_hug_after_same_shape": "fun build(obj : Object) {\n    let byLibrary = fun(a : Symbol, b : Symbol) =\n        Array.threeWay((ordinal(a), a.name), (ordinal(b), b.name))\n    send(socket, [headerLength, payloadLength, checksumOfThePayload], [sequenceNumber, flagsOfThePacket])\n}\n",
+    "row_too_wide_to_align": "fun clashing(s : Solver, a : Ty.Type, b : Ty.Type, open : Set.Set Int) -> Bool {\n    if opened(a, open) || opened(b, open) { return False }\n    match (Ty.prune(a), Ty.prune(b)) {\n        (TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)\n        (TVar(_), _) | (_, TVar(_)) -> False\n        (TFam(_, _, _), _) | (_, TFam(_, _, _)) -> False\n        (TBottom, _) | (_, TBottom) -> False\n        (TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid\n        (TApp(f1, a1, _), TApp(f2, a2, _)) -> clashing(s, f1, f2, open) || clashing(s, a1, a2, open)\n        (TFun(p1, r1), TFun(p2, r2)) -> clashingAll(s, p1, p2, open) || clashing(s, r1, r2, open)\n        (TTuple(e1), TTuple(e2)) -> clashingAll(s, e1, e2, open)\n        (x, y) -> !Ty.sameType(x, y)\n    }\n}\n",
 }
 
 # What some of them must format to, exactly.
@@ -365,6 +409,35 @@ AWKWARD_OUTPUT = {
         "\tlet c = 3    {- x -} {- y -} -- three\n"
         "}\n"
     ),
+    "no_hug_after_same_shape": (
+        "fun build(obj : Object) {\n"
+        "\tlet byLibrary = fun(a : Symbol, b : Symbol) = Array.threeWay(\n"
+        "\t\t(ordinal(a), a.name),\n"
+        "\t\t(ordinal(b), b.name),\n"
+        "\t)\n"
+        "\tsend(\n"
+        "\t\tsocket,\n"
+        "\t\t[headerLength, payloadLength, checksumOfThePayload],\n"
+        "\t\t[sequenceNumber, flagsOfThePacket],\n"
+        "\t)\n"
+        "}\n"
+    ),
+    "row_too_wide_to_align": (
+        "fun clashing(s : Solver, a : Ty.Type, b : Ty.Type, open : Set.Set Int) -> Bool {\n"
+        "\tif opened(a, open) || opened(b, open) { return False }\n"
+        "\tmatch (Ty.prune(a), Ty.prune(b)) {\n"
+        "\t\t(TVar(v), TCon(con)) | (TCon(con), TVar(v)) -> !numeralAdmits(s, v, con)\n"
+        "\t\t(TVar(_), _) | (_, TVar(_))                 -> False\n"
+        "\t\t(TFam(_, _, _), _) | (_, TFam(_, _, _))     -> False\n"
+        "\t\t(TBottom, _) | (_, TBottom)                 -> False\n"
+        "\t\t(TCon(c1), TCon(c2)) -> c1.name != c2.name || c1.level != c2.level || c1.uid != c2.uid\n"
+        "\t\t(TApp(f1, a1, _), TApp(f2, a2, _)) -> clashing(s, f1, f2, open) || clashing(s, a1, a2, open)\n"
+        "\t\t(TFun(p1, r1), TFun(p2, r2)) -> clashingAll(s, p1, p2, open) || clashing(s, r1, r2, open)\n"
+        "\t\t(TTuple(e1), TTuple(e2))                    -> clashingAll(s, e1, e2, open)\n"
+        "\t\t(x, y)                                      -> !Ty.sameType(x, y)\n"
+        "\t}\n"
+        "}\n"
+    ),
 }
 
 
@@ -372,30 +445,30 @@ AWKWARD_OUTPUT = {
 def test_awkward_input_formats(tmp_path: Path, name: str) -> None:
     target = tmp_path / f"{name}.gob"
     target.write_text(AWKWARD[name])
-    result = fmt(str(target))
+    result = run_format(str(target))
     assert (result.returncode, result.stderr) == (0, "")
     if name in AWKWARD_OUTPUT:
         assert target.read_bytes() == AWKWARD_OUTPUT[name].encode()
-    result = fmt("--check", str(target))
+    result = run_format("--check", str(target))
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
 
 
 def test_a_file_whose_name_starts_with_a_dash(tmp_path: Path) -> None:
     (tmp_path / "-x.gob").write_text("fun main() {print(1)}\n")
-    result = fmt("--", "-x.gob", cwd=tmp_path)
+    result = run_format("--", "-x.gob", cwd=tmp_path)
     assert (result.returncode, result.stderr) == (0, "")
     assert (tmp_path / "-x.gob").read_bytes() == b"fun main() { print(1) }\n"
 
 
 def test_a_command_line_it_cannot_read_has_its_own_status(tmp_path: Path) -> None:
-    result = fmt("--bogus", "a.gob", cwd=tmp_path)
+    result = run_format("--bogus", "a.gob", cwd=tmp_path)
     assert (result.returncode, result.stderr) == (4, "turkey: unknown option --bogus\n")
 
 
 def test_a_directive_line_keeps_its_code(tmp_path: Path) -> None:
     target = tmp_path / "directives.gob"
     target.write_text(AWKWARD["directive_after_statements"] + AWKWARD["directive_after_broken_signature"])
-    assert fmt(str(target)).returncode == 0
+    assert run_format(str(target)).returncode == 0
     lines = target.read_text().split("\n")
     assert "\tlet a = 1; let b = 2 --@expect(unreachable-code)" in lines
     assert "      b : Int) -> Int { --@expect(unreachable-code)" in lines
@@ -414,5 +487,5 @@ def test_parentheses_and_literals_stay_as_written(tmp_path: Path) -> None:
     )
     target = tmp_path / "written.gob"
     target.write_text(source)
-    result = fmt("--check", str(target))
+    result = run_format("--check", str(target))
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")

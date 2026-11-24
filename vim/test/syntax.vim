@@ -5,7 +5,6 @@
 execute 'set rtp+=' . fnameescape($TURKEY_VIM_DIR)
 filetype plugin indent on
 syntax on
-set shiftwidth=4 expandtab
 execute 'edit! ' . fnameescape($TURKEY_FIXTURE)
 
 let s:out = []
@@ -123,6 +122,16 @@ call s:Probe('\<do\>', 0, 'turkeyKeyword')
 call s:Probe(')?$', 1, 'turkeyOperator')       " the ? in Some(41)?
 call s:Probe('fun(x)', 0, 'turkeyKeyword')
 call s:Probe('--- after code', 0, 'turkeyLineComment')
+
+call s:Probe('^    --@expect', 4, 'turkeyDirective')
+call s:Probe('(empty', 0, 'turkeyDirective')    " the arguments are the directive's
+call s:Probe('spelled out', 0, 'turkeyDirectiveReason')
+call s:Probe('} --@expect', 2, 'turkeyDirective') " after code
+call s:Probe('TODO trailing', 0, 'turkeyTodo')
+call s:Probe('mentions --@', 9, 'turkeyLineComment') " not at the comment's start
+call s:Probe('0x10', 0, 'turkeyNumber')
+call s:Probe('1_000)', 4, 'turkeyNumber')
+call s:Probe('\\u{41}', 0, 'turkeyEscape')
 
 call writefile(s:out, $TURKEY_OUT . '/syntax.out')
 qa!

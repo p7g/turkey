@@ -15,264 +15,277 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Term(..), Rep(..))
 
 fun run(input : Ssa.Func Low) -> Ssa.Func Low {
-    let f = Ssa.pruneUnreachable(input)
-    -- Slots are numbered densely per function, so the sets below are bitsets
-    -- of the highest one. Most functions have none, and pay only this scan.
-    var slotCount = 0
-    for block in f.blocks {
-        for inst in block.insts {
-            match inst.op {
-                SlotLoad(slot) | SlotStore(slot, _) ->
-                    if slot >= slotCount { slotCount = slot + 1 }
-                _ -> {}
-            }
-        }
-    }
-    if slotCount == 0 { return f }
-    let reps = Map.new()
-    -- Each block's needed slots twice: as a list, whose order is the order of
-    -- the parameters the block gains and of the arguments every edge into it
-    -- passes, and as a bitset, to ask whether one is there already.
-    let needed : Vec (Vec Int) = []
-    let neededSet : Vec BitSet = []
-    let written : Vec BitSet = []
-    for block in f.blocks {
-        let use = []
-        let useSet = BitSet.new(slotCount)
-        let defs = BitSet.new(slotCount)
-        for inst in block.insts {
-            match inst.op {
-                SlotLoad(slot) -> {
-                    if !BitSet.contains(defs, slot) && !BitSet.contains(useSet, slot) {
-                        BitSet.add(useSet, slot)
-                        Vec.push(use, slot)
-                    }
-                    Map.put(reps, slot, Ssa.repOf(f, inst.result))
-                }
-                SlotStore(slot, v) -> {
-                    BitSet.add(defs, slot)
-                    Map.put(reps, slot, Ssa.repOf(f, v))
-                }
-                _ -> {}
-            }
-        }
-        Vec.push(needed, use)
-        Vec.push(neededSet, useSet)
-        Vec.push(written, defs)
-    }
-    var changed = True
-    while changed {
-        changed = False
-        for var b = len(f.blocks) - 1; b >= 0; b = b - 1 {
-            for target in Ssa.successors(f.blocks[b].term) {
-                for slot in needed[Ssa.blockId(target)] {
-                    if !BitSet.contains(written[b], slot)
-                       && !BitSet.contains(neededSet[b], slot) {
-                        BitSet.add(neededSet[b], slot)
-                        Vec.push(needed[b], slot)
-                        changed = True
-                    }
-                }
-            }
-        }
-    }
-    if len(needed[Ssa.blockId(f.entry)]) > 0 {
-        panic("slot promotion: uninitialized local in " + f.name)
-    }
-    let slots = needed
-    -- The values that outlast this pass, for naming where an assignment is
-    -- (`Ssa.anchorAt`): not a load's, which an alias replaces, nor the
-    -- parameters made below, which may be removed.
-    let made = len(f.reps)
-    let loaded = BitSet.new(made)
-    if len(f.variables) > 0 {
-        for block in f.blocks {
-            for inst in block.insts {
-                if let SlotLoad(_) = inst.op { BitSet.add(loaded, Ssa.valueId(inst.result)) }
-            }
-        }
-    }
-    let kept = fun(v : Value) = Ssa.valueId(v) < made && !BitSet.contains(loaded, Ssa.valueId(v))
-    let incoming : Vec (Map Int Value) = []
-    let original : Vec Int = []
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let values = Map.new()
-        Vec.push(original, len(f.blocks[b].params))
-        for slot in slots[b] {
-            let r = match Map.get(reps, slot) {
-                Some(r) -> r
-                None -> panic("slot promotion: missing representation")
-            }
-            let v = Ssa.freshValue(f, r)
-            Vec.push(f.blocks[b].params, v)
-            Map.put(values, slot, v)
-            holdsSlot(f, slot, v)
-        }
-        Vec.push(incoming, values)
-    }
-    let aliases = Map.new()
-    -- Where each alias's value was defined, for what it held.
-    let aliasedAt : Map Int (Option Ssa.Anchor) = Map.new()
-    let outgoing : Vec (Map Int Value) = []
-    let count = len(f.blocks)
-    for var b = 0; b < count; b = b + 1 {
-        let values = incoming[b]
-        let remaining = []
-        let block = f.blocks[b]
-        for var i = 0; i < len(block.insts); i = i + 1 {
-            let inst = block.insts[i]
-            match inst.op {
-                SlotLoad(slot) -> {
-                    let id = Ssa.valueId(inst.result)
-                    Map.put(aliases, id, get(values, slot))
-                    if Map.contains(f.holds, id) {
-                        Map.put(aliasedAt, id, Ssa.anchorAt(block, i, kept))
-                    }
-                }
-                SlotStore(slot, v) -> {
-                    Map.put(values, slot, v)
-                    if let Some(k) = Map.get(f.slotHolds, slot) {
-                        Ssa.holdFrom(f, Ssa.valueId(v), k, -1, Ssa.anchorAt(block, i, kept))
-                    }
-                }
-                _ -> Vec.push(remaining, inst)
-            }
-        }
-        block.insts = remaining
-        Vec.push(outgoing, values)
-    }
-    for var b = 0; b < count; b = b + 1 {
-        let block = f.blocks[b]
-        block.term = match block.term {
-            Jump(target, args) -> Jump(target, Vec.append(args,
-                edgeArgs(slots, outgoing[b], target)))
-            Branch(c, yes, no) -> Branch(c,
-                edge(f, yes, edgeArgs(slots, outgoing[b], yes), block.termAt),
-                edge(f, no, edgeArgs(slots, outgoing[b], no), block.termAt))
-            Switch(v, cases, default) -> Switch(v,
-                Vec.map(cases, fun((key, target)) =
-                    (key, edge(f, target, edgeArgs(slots, outgoing[b], target),
-                               block.termAt))),
-                match default {
-                    Some(d) -> Some(edge(f, d, edgeArgs(slots, outgoing[b], d), block.termAt))
-                    None -> None
-                })
-            other -> other
-        }
-    }
-    -- Most live-in parameters simply carry one dominating value across an
-    -- edge. Remove those, including loop parameters whose only other input
-    -- is themselves, so native selection need not pay for redundant copies.
-    let preds = Ssa.predecessors(f)
-    changed = True
-    while changed {
-        changed = False
-        for var b = 0; b < count; b = b + 1 {
-            for var i = original[b]; i < len(f.blocks[b].params); i = i + 1 {
-                let p = f.blocks[b].params[i]
-                if Map.contains(aliases, Ssa.valueId(p)) { continue }
-                var unique : Option Value = None
-                var multiple = False
-                for pred in preds[b] {
-                    match Ssa.blockAt(f, pred).term {
-                        Jump(_, args) -> {
-                            let v = resolve(aliases, args[i])
-                            if Ssa.valueId(v) == Ssa.valueId(p) { continue }
-                            match unique {
-                                None -> { unique = Some(v) }
-                                Some(other) -> if Ssa.valueId(v) != Ssa.valueId(other) {
-                                    multiple = True
-                                }
-                            }
-                        }
-                        _ -> panic("slot promotion: unsplit parameter edge")
-                    }
-                }
-                match unique {
-                    Some(v) -> if !multiple {
-                        Map.put(aliases, Ssa.valueId(p), v)
-                        if Map.contains(f.holds, Ssa.valueId(p)) {
-                            Map.put(aliasedAt, Ssa.valueId(p), Ssa.anchorAt(f.blocks[b], 0, kept))
-                        }
-                        changed = True
-                    }
-                    None -> {}
-                }
-            }
-        }
-    }
-    -- A load's value, and a parameter that only carries another value,
-    -- give what they held to the value that replaces them.
-    for id in Map.keys(f.holds) {
-        if Map.contains(aliases, id) {
-            Ssa.carryHolds(f, id, Ssa.valueId(resolve(aliases, Value(id))),
-                           Map.getOr(aliasedAt, id, None))
-        }
-    }
-    let keep = Array.map(f.blocks, fun(block) = Array.map(block.params,
-        \!Map.contains(aliases, Ssa.valueId(_))))
-    for block in f.blocks {
-        block.params = Vec.filter(block.params,
-            \!Map.contains(aliases, Ssa.valueId(_)))
-        for inst in block.insts {
-            inst.op = L.mapUses(inst.op, resolve(aliases, _))
-        }
-        block.term = match block.term {
-            Ret(vs) -> Ret(Vec.map(vs, resolve(aliases, _)))
-            Panic(v) -> Panic(resolve(aliases, v))
-            Branch(c, yes, no) -> Branch(resolve(aliases, c), yes, no)
-            Switch(v, cases, default) -> Switch(resolve(aliases, v), cases, default)
-            Jump(target, args) -> {
-                let kept = []
-                for var i = 0; i < len(args); i = i + 1 {
-                    if keep[Ssa.blockId(target)][i] {
-                        Vec.push(kept, resolve(aliases, args[i]))
-                    }
-                }
-                Jump(target, kept)
-            }
-            Unreachable -> Unreachable
-        }
-    }
-    Ssa.pruneUnreachable(f)
+	let f = Ssa.pruneUnreachable(input)
+	-- Slots are numbered densely per function, so the sets below are bitsets
+	-- of the highest one. Most functions have none, and pay only this scan.
+	var slotCount = 0
+	for block in f.blocks {
+		for inst in block.insts {
+			match inst.op {
+				SlotLoad(slot) | SlotStore(slot, _) ->
+					if slot >= slotCount { slotCount = slot + 1 }
+				_ -> {}
+			}
+		}
+	}
+	if slotCount == 0 { return f }
+	let reps = Map.new()
+	-- Each block's needed slots twice: as a list, whose order is the order of
+	-- the parameters the block gains and of the arguments every edge into it
+	-- passes, and as a bitset, to ask whether one is there already.
+	let needed : Vec (Vec Int) = []
+	let neededSet : Vec BitSet = []
+	let written : Vec BitSet = []
+	for block in f.blocks {
+		let use = []
+		let useSet = BitSet.new(slotCount)
+		let defs = BitSet.new(slotCount)
+		for inst in block.insts {
+			match inst.op {
+				SlotLoad(slot) -> {
+					if !BitSet.contains(defs, slot) && !BitSet.contains(useSet, slot) {
+						BitSet.add(useSet, slot)
+						Vec.push(use, slot)
+					}
+					Map.put(reps, slot, Ssa.repOf(f, inst.result))
+				}
+				SlotStore(slot, v) -> {
+					BitSet.add(defs, slot)
+					Map.put(reps, slot, Ssa.repOf(f, v))
+				}
+				_ -> {}
+			}
+		}
+		Vec.push(needed, use)
+		Vec.push(neededSet, useSet)
+		Vec.push(written, defs)
+	}
+	var changed = True
+	while changed {
+		changed = False
+		for var b = len(f.blocks) - 1; b >= 0; b = b - 1 {
+			for target in Ssa.successors(f.blocks[b].term) {
+				for slot in needed[Ssa.blockId(target)] {
+					if !BitSet.contains(written[b], slot) && !BitSet.contains(neededSet[b], slot) {
+						BitSet.add(neededSet[b], slot)
+						Vec.push(needed[b], slot)
+						changed = True
+					}
+				}
+			}
+		}
+	}
+	if len(needed[Ssa.blockId(f.entry)]) > 0 {
+		panic("slot promotion: uninitialized local in " + f.name)
+	}
+	let slots = needed
+	-- The values that outlast this pass, for naming where an assignment is
+	-- (`Ssa.anchorAt`): not a load's, which an alias replaces, nor the
+	-- parameters made below, which may be removed.
+	let made = len(f.reps)
+	let loaded = BitSet.new(made)
+	if len(f.variables) > 0 {
+		for block in f.blocks {
+			for inst in block.insts {
+				if let SlotLoad(_) = inst.op { BitSet.add(loaded, Ssa.valueId(inst.result)) }
+			}
+		}
+	}
+	let kept = fun(v : Value) = Ssa.valueId(v) < made && !BitSet.contains(loaded, Ssa.valueId(v))
+	let incoming : Vec (Map Int Value) = []
+	let original : Vec Int = []
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let values = Map.new()
+		Vec.push(original, len(f.blocks[b].params))
+		for slot in slots[b] {
+			let r = match Map.get(reps, slot) {
+				Some(r) -> r
+				None    -> panic("slot promotion: missing representation")
+			}
+			let v = Ssa.freshValue(f, r)
+			Vec.push(f.blocks[b].params, v)
+			Map.put(values, slot, v)
+			holdsSlot(f, slot, v)
+		}
+		Vec.push(incoming, values)
+	}
+	let aliases = Map.new()
+	-- Where each alias's value was defined, for what it held.
+	let aliasedAt : Map Int (Option Ssa.Anchor) = Map.new()
+	let outgoing : Vec (Map Int Value) = []
+	let count = len(f.blocks)
+	for var b = 0; b < count; b = b + 1 {
+		let values = incoming[b]
+		let remaining = []
+		let block = f.blocks[b]
+		for var i = 0; i < len(block.insts); i = i + 1 {
+			let inst = block.insts[i]
+			match inst.op {
+				SlotLoad(slot) -> {
+					let id = Ssa.valueId(inst.result)
+					Map.put(aliases, id, get(values, slot))
+					if Map.contains(f.holds, id) {
+						Map.put(aliasedAt, id, Ssa.anchorAt(block, i, kept))
+					}
+				}
+				SlotStore(slot, v) -> {
+					Map.put(values, slot, v)
+					if let Some(k) = Map.get(f.slotHolds, slot) {
+						Ssa.holdFrom(f, Ssa.valueId(v), k, -1, Ssa.anchorAt(block, i, kept))
+					}
+				}
+				_ -> Vec.push(remaining, inst)
+			}
+		}
+		block.insts = remaining
+		Vec.push(outgoing, values)
+	}
+	for var b = 0; b < count; b = b + 1 {
+		let block = f.blocks[b]
+		block.term = match block.term {
+			Jump(target, args) -> Jump(
+				target,
+				Vec.append(args, edgeArgs(slots, outgoing[b], target)),
+			)
+			Branch(c, yes, no) -> Branch(
+				c,
+				edge(f, yes, edgeArgs(slots, outgoing[b], yes), block.termAt),
+				edge(f, no, edgeArgs(slots, outgoing[b], no), block.termAt),
+			)
+			Switch(v, cases, default) -> Switch(
+				v,
+				Vec.map(
+					cases,
+					fun((key, target)) = (
+						key,
+						edge(f, target, edgeArgs(slots, outgoing[b], target), block.termAt),
+					),
+				),
+				match default {
+					Some(d) -> Some(edge(f, d, edgeArgs(slots, outgoing[b], d), block.termAt))
+					None    -> None
+				},
+			)
+			other -> other
+		}
+	}
+	-- Most live-in parameters simply carry one dominating value across an
+	-- edge. Remove those, including loop parameters whose only other input
+	-- is themselves, so native selection need not pay for redundant copies.
+	let preds = Ssa.predecessors(f)
+	changed = True
+	while changed {
+		changed = False
+		for var b = 0; b < count; b = b + 1 {
+			for var i = original[b]; i < len(f.blocks[b].params); i = i + 1 {
+				let p = f.blocks[b].params[i]
+				if Map.contains(aliases, Ssa.valueId(p)) { continue }
+				var unique : Option Value = None
+				var multiple = False
+				for pred in preds[b] {
+					match Ssa.blockAt(f, pred).term {
+						Jump(_, args) -> {
+							let v = resolve(aliases, args[i])
+							if Ssa.valueId(v) == Ssa.valueId(p) { continue }
+							match unique {
+								None -> { unique = Some(v) }
+								Some(other) -> if Ssa.valueId(v) != Ssa.valueId(other) {
+									multiple = True
+								}
+							}
+						}
+						_ -> panic("slot promotion: unsplit parameter edge")
+					}
+				}
+				match unique {
+					Some(v) -> if !multiple {
+						Map.put(aliases, Ssa.valueId(p), v)
+						if Map.contains(f.holds, Ssa.valueId(p)) {
+							Map.put(aliasedAt, Ssa.valueId(p), Ssa.anchorAt(f.blocks[b], 0, kept))
+						}
+						changed = True
+					}
+					None -> {}
+				}
+			}
+		}
+	}
+	-- A load's value, and a parameter that only carries another value,
+	-- give what they held to the value that replaces them.
+	for id in Map.keys(f.holds) {
+		if Map.contains(aliases, id) {
+			Ssa.carryHolds(
+				f,
+				id,
+				Ssa.valueId(resolve(aliases, Value(id))),
+				Map.getOr(aliasedAt, id, None),
+			)
+		}
+	}
+	let keep = Array.map(
+		f.blocks,
+		fun(block) = Array.map(block.params, \!Map.contains(aliases, Ssa.valueId(_))),
+	)
+	for block in f.blocks {
+		block.params = Vec.filter(block.params, \!Map.contains(aliases, Ssa.valueId(_)))
+		for inst in block.insts {
+			inst.op = L.mapUses(inst.op, resolve(aliases, _))
+		}
+		block.term = match block.term {
+			Ret(vs)                   -> Ret(Vec.map(vs, resolve(aliases, _)))
+			Panic(v)                  -> Panic(resolve(aliases, v))
+			Branch(c, yes, no)        -> Branch(resolve(aliases, c), yes, no)
+			Switch(v, cases, default) -> Switch(resolve(aliases, v), cases, default)
+			Jump(target, args) -> {
+				let kept = []
+				for var i = 0; i < len(args); i = i + 1 {
+					if keep[Ssa.blockId(target)][i] {
+						Vec.push(kept, resolve(aliases, args[i]))
+					}
+				}
+				Jump(target, kept)
+			}
+			Unreachable -> Unreachable
+		}
+	}
+	Ssa.pruneUnreachable(f)
 }
 
 -- Records that `v` holds the variable whose slot is `slot`, if it is one.
 fun holdsSlot(f : Ssa.Func Low, slot : Int, v : Value) -> Unit {
-    if let Some(k) = Map.get(f.slotHolds, slot) { Ssa.hold(f, Ssa.valueId(v), k, -1) }
+	if let Some(k) = Map.get(f.slotHolds, slot) { Ssa.hold(f, Ssa.valueId(v), k, -1) }
 }
 
 fun get(values : Map Int Value, slot : Int) -> Value = match Map.get(values, slot) {
-    Some(v) -> v
-    None -> panic("slot promotion: missing incoming value")
+	Some(v) -> v
+	None    -> panic("slot promotion: missing incoming value")
 }
 
 fun resolve(aliases : Map Int Value, value : Value) -> Value {
-    var v = value
-    while True {
-        match Map.get(aliases, Ssa.valueId(v)) {
-            Some(next) -> { v = next }
-            None -> return v
-        }
-    }
-    v
+	var v = value
+	while True {
+		match Map.get(aliases, Ssa.valueId(v)) {
+			Some(next) -> { v = next }
+			None       -> return v
+		}
+	}
+	v
 }
 
-fun edgeArgs(slots : Vec (Vec Int), values : Map Int Value,
-             target : BlockId) -> Vec Value =
-    Vec.map(slots[Ssa.blockId(target)], get(values, _))
+fun edgeArgs(slots : Vec (Vec Int), values : Map Int Value, target : BlockId) -> Vec Value =
+	Vec.map(slots[Ssa.blockId(target)], get(values, _))
 
 -- The block made for an edge jumps with the position of the branch it is an
 -- arm of, `at`, as no stepping target: it is that branch's copy of the slots.
 fun edge(f : Ssa.Func Low, target : BlockId, args : Vec Value, at : Int) -> BlockId {
-    if len(args) == 0 { return target }
-    let b : Ssa.Block Low = Ssa.newBlock()
-    b.term = Jump(target, args)
-    b.termAt = Position.notStmt(at)
-    let id = BlockId(len(f.blocks))
-    Vec.push(f.blocks, b)
-    id
+	if len(args) == 0 { return target }
+	let b : Ssa.Block Low = Ssa.newBlock()
+	b.term = Jump(target, args)
+	b.termAt = Position.notStmt(at)
+	let id = BlockId(len(f.blocks))
+	Vec.push(f.blocks, b)
+	id
 }
 
 fun panic(message : String) -> a =
-    Diag.fail(Diag.whole("internal error", message), "")
+	Diag.fail(Diag.whole("internal error", message), "")

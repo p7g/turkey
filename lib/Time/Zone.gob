@@ -1,6 +1,16 @@
 export (
-    Zone, ZoneError(..), utc, fixed, posix, fromTzif, named, system, id, offsetAt,
-    offsetAtSecond, transitions,
+	Zone,
+	ZoneError(..),
+	utc,
+	fixed,
+	posix,
+	fromTzif,
+	named,
+	system,
+	id,
+	offsetAt,
+	offsetAtSecond,
+	transitions,
 )
 
 --- A time zone: the rules that say what the clocks read at each instant in a
@@ -31,20 +41,21 @@ type Rules = Fixed(Offset) | Posix(Posix.Rule) | Table(Tzif.Table)
 --- Why a zone could not be had: an id with characters or components no zone
 --- name has; no file for it; a file that could not be read, or is not a TZif
 --- file; or, for the system's zone, nothing that says what it is.
-type ZoneError = InvalidName(String)
-               | UnknownZone(String)
-               | Unreadable(String, String)
-               | Malformed(String)
-               | NoSystemZone
+type ZoneError
+	= InvalidName(String)
+	| UnknownZone(String)
+	| Unreadable(String, String)
+	| Malformed(String)
+	| NoSystemZone
 
 instance Error ZoneError {
-    fun message(e) = match e {
-        InvalidName(id) -> "'" + id + "' is not a time zone name"
-        UnknownZone(id) -> "no time zone named '" + id + "'"
-        Unreadable(path, why) -> "cannot read the time zone file " + path + ": " + why
-        Malformed(path) -> path + " is not a valid time zone file"
-        NoSystemZone -> "the system's time zone is not set"
-    }
+	fun message(e) = match e {
+		InvalidName(id)       -> "'" + id + "' is not a time zone name"
+		UnknownZone(id)       -> "no time zone named '" + id + "'"
+		Unreadable(path, why) -> "cannot read the time zone file " + path + ": " + why
+		Malformed(path)       -> path + " is not a valid time zone file"
+		NoSystemZone          -> "the system's time zone is not set"
+	}
 }
 
 instance Show ZoneError { fun show(e) = message(e) }
@@ -60,11 +71,11 @@ fun fixed(offset : Offset) -> Zone = Zone { id = show(offset), rules = Fixed(off
 --- rules that come from outside, and for tests that must not depend on the
 --- system's files.
 fun posix(rule : String) -> Option Zone =
-    Option.map(Posix.parse(rule), fun(r) = Zone { id = rule, rules = Posix(r) })
+	Option.map(Posix.parse(rule), fun(r) = Zone { id = rule, rules = Posix(r) })
 
 --- The zone in the TZif file `bytes`, named `id`.
 fun fromTzif(id : String, bytes : Array Byte) -> Option Zone =
-    Option.map(Tzif.parse(bytes), fun(t) = Zone { id, rules = Table(t) })
+	Option.map(Tzif.parse(bytes), fun(t) = Zone { id, rules = Table(t) })
 
 fun id(z : Zone) -> String = z.id
 
@@ -79,45 +90,50 @@ fun offsetAt(z : Zone, i : Instant) -> Offset = offsetAtSecond(z, Frame.fromInst
 --- The offset in force at `t`, which need not be a second an `Instant` can
 --- hold.
 fun offsetAtSecond(z : Zone, t : UnixSeconds) -> Offset = match z.rules {
-    Fixed(o) -> o
-    Posix(r) -> Posix.offsetAt(r, t)
-    Table(table) -> Tzif.offsetAt(table, t)
+	Fixed(o)     -> o
+	Posix(r)     -> Posix.offsetAt(r, t)
+	Table(table) -> Tzif.offsetAt(table, t)
 }
 
 --- The transitions from `from` to `to`, both included, in order.
-fun transitions(z : Zone, from : UnixSeconds, to : UnixSeconds) -> Array Transition = match z.rules {
-    Fixed(_) -> []
-    Posix(r) -> {
-        let out = Vec.new(4)
-        for var y = Frame.year(from) - 1; y <= Frame.year(to) + 1; y = y + 1 {
-            for transition in Posix.transitions(r, y) {
-                if transition.at >= from && transition.at <= to { Vec.push(out, transition) }
-            }
-        }
-        Vec.toArray(out)
-    }
-    Table(table) -> Tzif.transitions(table, from, to)
-}
+fun transitions(z : Zone, from : UnixSeconds, to : UnixSeconds) -> Array Transition =
+	match z.rules {
+		Fixed(_) -> []
+		Posix(r) -> {
+			let out = Vec.new(4)
+			for var y = Frame.year(from) - 1; y <= Frame.year(to) + 1; y = y + 1 {
+				for transition in Posix.transitions(r, y) {
+					if transition.at >= from && transition.at <= to { Vec.push(out, transition) }
+				}
+			}
+			Vec.toArray(out)
+		}
+		Table(table) -> Tzif.transitions(table, from, to)
+	}
 
 -- -- named zones ------------------------------------------------------------------
 
 --- The zone the system's time zone files call `id`, `America/Toronto`: read
 --- from `$TZDIR`, or `/usr/share/zoneinfo` if that is unset, once per process.
 fun named(id : String) -> Either ZoneError Zone {
-    if !validName(id) { return Left(InvalidName(id)) }
-    if let Some(z) = Sync.withLock(cache, fun(m) = Map.get(m, id)) { return Right(z) }
-    let path = directory() + "/" + id
-    let z = match File.readAll(path) {
-        Right(buffer) -> match fromTzif(id, Buf.bytes(buffer)) {
-            Some(z) -> z
-            None -> return Left(Malformed(path))
-        }
-        Left(e) -> return Left(if e.kind == IO.NotFound { UnknownZone(id) } else {
-            Unreadable(path, message(e))
-        })
-    }
-    Sync.withLock(cache, fun(m) = Map.put(m, id, z))
-    Right(z)
+	if !validName(id) { return Left(InvalidName(id)) }
+	if let Some(z) = Sync.withLock(cache, fun(m) = Map.get(m, id)) { return Right(z) }
+	let path = directory() + "/" + id
+	let z = match File.readAll(path) {
+		Right(buffer) -> match fromTzif(id, Buf.bytes(buffer)) {
+			Some(z) -> z
+			None    -> return Left(Malformed(path))
+		}
+		Left(e) -> return Left(
+			if e.kind == IO.NotFound {
+				UnknownZone(id)
+			} else {
+				Unreadable(path, message(e))
+			},
+		)
+	}
+	Sync.withLock(cache, fun(m) = Map.put(m, id, z))
+	Right(z)
 }
 
 let cache : Sync.Mutex (Map String Zone) = Sync.mutex(Map.new())
@@ -128,16 +144,16 @@ fun directory() -> String = Option.unwrapOr(Env.get("TZDIR"), "/usr/share/zonein
 -- may not climb out of it: no empty, `.` or `..` component, no leading `/`,
 -- and only the characters zone names use.
 fun validName(id : String) -> Bool {
-    if String.isEmpty(id) { return False }
-    for part in String.split(id, "/") {
-        if String.isEmpty(part) || part == "." || part == ".." { return False }
-    }
-    for c in String.codePoints(id) {
-        if !(Char.isAsciiAlphanumeric(c) || c == '_' || c == '+' || c == '-' || c == '/') {
-            return False
-        }
-    }
-    True
+	if String.isEmpty(id) { return False }
+	for part in String.split(id, "/") {
+		if String.isEmpty(part) || part == "." || part == ".." { return False }
+	}
+	for c in String.codePoints(id) {
+		if !(Char.isAsciiAlphanumeric(c) || c == '_' || c == '+' || c == '-' || c == '/') {
+			return False
+		}
+	}
+	True
 }
 
 -- -- the system's zone -------------------------------------------------------------
@@ -152,43 +168,47 @@ fun system() -> Either ZoneError Zone = Sync.force(systemZone)
 let systemZone : Sync.Once (Either ZoneError Zone) = Sync.once(findSystem)
 
 fun findSystem() -> Either ZoneError Zone = match Env.get("TZ") {
-    Some(tz) -> fromTz(Option.unwrapOr(String.stripPrefix(tz, ":"), tz))
-    None -> fromLocaltime()
+	Some(tz) -> fromTz(Option.unwrapOr(String.stripPrefix(tz, ":"), tz))
+	None     -> fromLocaltime()
 }
 
 fun fromTz(tz : String) -> Either ZoneError Zone {
-    if String.isEmpty(tz) { return Left(NoSystemZone) }
-    if String.startsWith(tz, "/") { return fromFile(tz) }
-    match named(tz) {
-        Right(z) -> Right(z)
-        Left(e) -> match posix(tz) {
-            Some(z) -> Right(z)
-            None -> Left(e)
-        }
-    }
+	if String.isEmpty(tz) { return Left(NoSystemZone) }
+	if String.startsWith(tz, "/") { return fromFile(tz) }
+	match named(tz) {
+		Right(z) -> Right(z)
+		Left(e) -> match posix(tz) {
+			Some(z) -> Right(z)
+			None    -> Left(e)
+		}
+	}
 }
 
 fun fromLocaltime() -> Either ZoneError Zone {
-    let localtime = "/etc/localtime"
-    if let Right(target) = File.readLink(localtime) {
-        if let Some((_, name)) = String.rsplitOnce(target, "zoneinfo/") {
-            if let Right(z) = named(name) { return Right(z) }
-        }
-    }
-    match fromFile(localtime) {
-        Right(z) -> Right(z)
-        Left(UnknownZone(_)) -> Left(NoSystemZone)
-        Left(e) -> Left(e)
-    }
+	let localtime = "/etc/localtime"
+	if let Right(target) = File.readLink(localtime) {
+		if let Some((_, name)) = String.rsplitOnce(target, "zoneinfo/") {
+			if let Right(z) = named(name) { return Right(z) }
+		}
+	}
+	match fromFile(localtime) {
+		Right(z)             -> Right(z)
+		Left(UnknownZone(_)) -> Left(NoSystemZone)
+		Left(e)              -> Left(e)
+	}
 }
 
 -- The zone in the TZif file at `path`, whose id is the path.
 fun fromFile(path : String) -> Either ZoneError Zone = match File.readAll(path) {
-    Right(buffer) -> match fromTzif(path, Buf.bytes(buffer)) {
-        Some(z) -> Right(z)
-        None -> Left(Malformed(path))
-    }
-    Left(e) -> Left(if e.kind == IO.NotFound { UnknownZone(path) } else {
-        Unreadable(path, message(e))
-    })
+	Right(buffer) -> match fromTzif(path, Buf.bytes(buffer)) {
+		Some(z) -> Right(z)
+		None    -> Left(Malformed(path))
+	}
+	Left(e) -> Left(
+		if e.kind == IO.NotFound {
+			UnknownZone(path)
+		} else {
+			Unreadable(path, message(e))
+		},
+	)
 }

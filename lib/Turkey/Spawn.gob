@@ -65,91 +65,99 @@ let opaqueBytes : Int = 512
 --- The child, or the negated `errno` of whatever stopped it from starting: a
 --- missing program or directory, `EMFILE`, `EACCES`. Nothing is left open on
 --- failure.
-fun start(argv : Array String, directory : Option String, environment : Array (String, String))
-        -> Either Int Started {
-    if len(argv) == 0 { return Left(-Sys.einval) }
-    let outPipe = match pipePair() {
-        Left(e) -> return Left(e)
-        Right(p) -> p
-    }
-    let errPipe = match pipePair() {
-        Left(e) -> {
-            let (r, w) = outPipe
-            let _ = IO.close(r)
-            let _ = IO.close(w)
-            return Left(e)
-        }
-        Right(p) -> p
-    }
-    let (outRead, outWrite) = outPipe
-    let (errRead, errWrite) = errPipe
-    let blocks = []
-    let pid = Os.malloc(8)
-    let actions = Os.malloc(opaqueBytes)
-    let attributes = Os.malloc(opaqueBytes)
-    Vec.push(blocks, pid)
-    Vec.push(blocks, actions)
-    Vec.push(blocks, attributes)
-    let program = cString(argv[0], blocks)
-    let argvBlock = pointers(Array.map(argv, fun(a) = cString(a, blocks)), blocks)
-    let envBlock = pointers(environmentWith(environment, blocks), blocks)
-    let dir = match directory {
-        Some(d) -> cString(d, blocks)
-        None -> Ptr.null()
-    }
-    let devNull = cString("/dev/null", blocks)
-    var failure = 0
-    if Ptr.isNull(pid) || Ptr.isNull(actions) || Ptr.isNull(attributes)
-            || Ptr.isNull(program) || Ptr.isNull(argvBlock) || Ptr.isNull(envBlock)
-            || Ptr.isNull(devNull) || (Option.isSome(directory) && Ptr.isNull(dir)) {
-        failure = Sys.enomem
-    }
-    var actionsMade = False
-    var attributesMade = False
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnActionsInit(actions))
-        actionsMade = failure == 0
-    }
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnAttrInit(attributes))
-        attributesMade = failure == 0
-    }
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnActionsAddOpen(actions, 0, devNull, Sys.readOnly, 0))
-    }
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, outWrite, 1))
-    }
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, errWrite, 2))
-    }
-    if failure == 0 && Option.isSome(directory) {
-        failure = Sys.cInt(Libc.spawnActionsAddChdir(actions, dir))
-    }
-    if failure == 0 {
-        let flags = Sys.spawnSetProcessGroup | Sys.spawnCloexecDefault()
-        failure = Sys.cInt(Libc.spawnAttrSetFlags(attributes, flags))
-    }
-    if failure == 0 {
-        failure = Sys.cInt(Libc.spawnAttrSetPGroup(attributes, 0))
-    }
-    if failure == 0 {
-        failure = Workers.blockingSpawnp(pid, program, actions, attributes, argvBlock, envBlock)
-        Scheduler.afterCall()
-    }
-    let child = if failure == 0 { Ptr.load32(pid, 0) } else { 0 }
-    if actionsMade { let _ = Libc.spawnActionsDestroy(actions) }
-    if attributesMade { let _ = Libc.spawnAttrDestroy(attributes) }
-    for block in blocks { Os.free(block) }
-    -- The child has its own copies of its ends, or never existed.
-    let _ = IO.close(outWrite)
-    let _ = IO.close(errWrite)
-    if failure != 0 {
-        let _ = IO.close(outRead)
-        let _ = IO.close(errRead)
-        return Left(-failure)
-    }
-    Right(Started { pid = child, stdout = outRead, stderr = errRead })
+fun start(
+	argv : Array String,
+	directory : Option String,
+	environment : Array (String, String),
+) -> Either Int Started {
+	if len(argv) == 0 { return Left(-Sys.einval) }
+	let outPipe = match pipePair() {
+		Left(e)  -> return Left(e)
+		Right(p) -> p
+	}
+	let errPipe = match pipePair() {
+		Left(e) -> {
+			let (r, w) = outPipe
+			let _ = IO.close(r)
+			let _ = IO.close(w)
+			return Left(e)
+		}
+		Right(p) -> p
+	}
+	let (outRead, outWrite) = outPipe
+	let (errRead, errWrite) = errPipe
+	let blocks = []
+	let pid = Os.malloc(8)
+	let actions = Os.malloc(opaqueBytes)
+	let attributes = Os.malloc(opaqueBytes)
+	Vec.push(blocks, pid)
+	Vec.push(blocks, actions)
+	Vec.push(blocks, attributes)
+	let program = cString(argv[0], blocks)
+	let argvBlock = pointers(Array.map(argv, fun(a) = cString(a, blocks)), blocks)
+	let envBlock = pointers(environmentWith(environment, blocks), blocks)
+	let dir = match directory {
+		Some(d) -> cString(d, blocks)
+		None    -> Ptr.null()
+	}
+	let devNull = cString("/dev/null", blocks)
+	var failure = 0
+	if Ptr.isNull(pid)
+			|| Ptr.isNull(actions)
+			|| Ptr.isNull(attributes)
+			|| Ptr.isNull(program)
+			|| Ptr.isNull(argvBlock)
+			|| Ptr.isNull(envBlock)
+			|| Ptr.isNull(devNull)
+			|| (Option.isSome(directory) && Ptr.isNull(dir)) {
+		failure = Sys.enomem
+	}
+	var actionsMade = False
+	var attributesMade = False
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnActionsInit(actions))
+		actionsMade = failure == 0
+	}
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnAttrInit(attributes))
+		attributesMade = failure == 0
+	}
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnActionsAddOpen(actions, 0, devNull, Sys.readOnly, 0))
+	}
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, outWrite, 1))
+	}
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, errWrite, 2))
+	}
+	if failure == 0 && Option.isSome(directory) {
+		failure = Sys.cInt(Libc.spawnActionsAddChdir(actions, dir))
+	}
+	if failure == 0 {
+		let flags = Sys.spawnSetProcessGroup | Sys.spawnCloexecDefault()
+		failure = Sys.cInt(Libc.spawnAttrSetFlags(attributes, flags))
+	}
+	if failure == 0 {
+		failure = Sys.cInt(Libc.spawnAttrSetPGroup(attributes, 0))
+	}
+	if failure == 0 {
+		failure = Workers.blockingSpawnp(pid, program, actions, attributes, argvBlock, envBlock)
+		Scheduler.afterCall()
+	}
+	let child = if failure == 0 { Ptr.load32(pid, 0) } else { 0 }
+	if actionsMade { let _ = Libc.spawnActionsDestroy(actions) }
+	if attributesMade { let _ = Libc.spawnAttrDestroy(attributes) }
+	for block in blocks { Os.free(block) }
+	-- The child has its own copies of its ends, or never existed.
+	let _ = IO.close(outWrite)
+	let _ = IO.close(errWrite)
+	if failure != 0 {
+		let _ = IO.close(outRead)
+		let _ = IO.close(errRead)
+		return Left(-failure)
+	}
+	Right(Started { pid = child, stdout = outRead, stderr = errRead })
 }
 
 --- Kill the process group `pid` leads, which is every process the child
@@ -167,89 +175,89 @@ fun killGroup(pid : Int) -> Int = Sys.cResult(Libc.kill(-pid, Sys.sigKill))
 -- A pipe's read end, made non-blocking, and its write end: the negated
 -- `errno` if it could not be made. Both ends are close-on-exec.
 fun pipePair() -> Either Int (Int, Int) {
-    let fds = Os.malloc(8)
-    if Ptr.isNull(fds) { return Left(-Sys.enomem) }
-    let made = match Target.os {
-        Darwin -> Sys.cResult(Libc.pipe(fds))
-        Linux -> Sys.cResult(Libc.pipe2(fds, Sys.closeOnExec()))
-        Wasi -> Process.unsupported(0)
-    }
-    let read = Ptr.load32(fds, 0)
-    let write = Ptr.load32(fds, 4)
-    Os.free(fds)
-    if made < 0 { return Left(made) }
-    var failure = IO.fcntl(read, Sys.getStatusFlags)
-    if failure >= 0 {
-        failure = IO.fcntlWith(read, Sys.setStatusFlags, failure | Sys.nonBlocking())
-    }
-    if failure >= 0 && darwin() {
-        failure = IO.fcntlWith(read, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
-    }
-    if failure >= 0 && darwin() {
-        failure = IO.fcntlWith(write, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
-    }
-    if failure < 0 {
-        let _ = IO.close(read)
-        let _ = IO.close(write)
-        return Left(failure)
-    }
-    Right((read, write))
+	let fds = Os.malloc(8)
+	if Ptr.isNull(fds) { return Left(-Sys.enomem) }
+	let made = match Target.os {
+		Darwin -> Sys.cResult(Libc.pipe(fds))
+		Linux  -> Sys.cResult(Libc.pipe2(fds, Sys.closeOnExec()))
+		Wasi   -> Process.unsupported(0)
+	}
+	let read = Ptr.load32(fds, 0)
+	let write = Ptr.load32(fds, 4)
+	Os.free(fds)
+	if made < 0 { return Left(made) }
+	var failure = IO.fcntl(read, Sys.getStatusFlags)
+	if failure >= 0 {
+		failure = IO.fcntlWith(read, Sys.setStatusFlags, failure | Sys.nonBlocking())
+	}
+	if failure >= 0 && darwin() {
+		failure = IO.fcntlWith(read, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+	}
+	if failure >= 0 && darwin() {
+		failure = IO.fcntlWith(write, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+	}
+	if failure < 0 {
+		let _ = IO.close(read)
+		let _ = IO.close(write)
+		return Left(failure)
+	}
+	Right((read, write))
 }
 
 fun darwin() -> Bool = match Target.os {
-    Darwin -> True
-    Linux -> False
-    Wasi -> Process.unsupported(False)
+	Darwin -> True
+	Linux  -> False
+	Wasi   -> Process.unsupported(False)
 }
 
 -- `s` and a NUL in a block of its own, added to `blocks` to be freed after
 -- the call; null if the allocation failed. A NUL inside `s` ends the string
 -- early, for the system.
 fun cString(s : String, blocks : Vec Ptr) -> Ptr {
-    let p = Ptr.toCString(s)
-    Vec.push(blocks, p)
-    p
+	let p = Ptr.toCString(s)
+	Vec.push(blocks, p)
+	p
 }
 
 -- A NULL-terminated array of the pointers in `items`, in a block added to
 -- `blocks`; null if the allocation failed or an item is null.
 fun pointers(items : Array Ptr, blocks : Vec Ptr) -> Ptr {
-    let p = Os.malloc(8 * (len(items) + 1))
-    Vec.push(blocks, p)
-    if Ptr.isNull(p) { return p }
-    for var i = 0; i < len(items); i = i + 1 {
-        if Ptr.isNull(items[i]) { return Ptr.null() }
-        Ptr.store(p, 8 * i, items[i])
-    }
-    Ptr.store(p, 8 * len(items), Ptr.null())
-    p
+	let p = Os.malloc(8 * (len(items) + 1))
+	Vec.push(blocks, p)
+	if Ptr.isNull(p) { return p }
+	for var i = 0; i < len(items); i = i + 1 {
+		if Ptr.isNull(items[i]) { return Ptr.null() }
+		Ptr.store(p, 8 * i, items[i])
+	}
+	Ptr.store(p, 8 * len(items), Ptr.null())
+	p
 }
 
 -- The inherited environment's strings, less any whose name is one of
 -- `overrides`, then a `NAME=value` for each override.
 fun environmentWith(overrides : Array (String, String), blocks : Vec Ptr) -> Array Ptr {
-    let entries = []
-    let names = Array.map(overrides, fun((name, _)) = String.toBytes(name))
-    var at = 0
-    while !Ptr.isNull(inherited) && !Ptr.isNull(Ptr.load(inherited, 8 * at)) {
-        let entry : Ptr = Ptr.load(inherited, 8 * at)
-        at = at + 1
-        if !named(entry, names) { Vec.push(entries, entry) }
-    }
-    for (name, value) in overrides {
-        Vec.push(entries, cString(name + "=" + value, blocks))
-    }
-    Vec.toArray(entries)
+	let entries = []
+	let names = Array.map(overrides, fun((name, _)) = String.toBytes(name))
+	var at = 0
+	while !Ptr.isNull(inherited) && !Ptr.isNull(Ptr.load(inherited, 8 * at)) {
+		let entry : Ptr = Ptr.load(inherited, 8 * at)
+		at = at + 1
+		if !named(entry, names) { Vec.push(entries, entry) }
+	}
+	for (name, value) in overrides {
+		Vec.push(entries, cString(name + "=" + value, blocks))
+	}
+	Vec.toArray(entries)
 }
 
 -- Whether the `NAME=value` string at `entry` has one of `names` as its name.
 fun named(entry : Ptr, names : Array (Array Byte)) -> Bool {
-    for name in names {
-        var same = True
-        for var i = 0; i < len(name) && same; i = i + 1 {
-            same = Byte.toInt(Ptr.load(entry, i)) == Byte.toInt(name[i])
-        }
-        if same && Byte.toInt(Ptr.load(entry, len(name))) == 61 { return True }
-    }
-    False
+	for name in names {
+		var same = True
+		for var i = 0; i < len(name) && same; i = i + 1 {
+			same = Byte.toInt(Ptr.load(entry, i)) == Byte.toInt(name[i])
+		}
+		if same && Byte.toInt(Ptr.load(entry, len(name))) == 61 { return True }
+	}
+	False
 }

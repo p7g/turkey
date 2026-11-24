@@ -1,6 +1,18 @@
 export (
-    OutgoingRequest(..), OutgoingResponse(..), BodyWriter, Buffers, Outbox,
-    buffers, outbox, release, requestHead, responseHead, hostField, bodyWriter, finish, finishWith,
+	OutgoingRequest(..),
+	OutgoingResponse(..),
+	BodyWriter,
+	Buffers,
+	Outbox,
+	buffers,
+	outbox,
+	release,
+	requestHead,
+	responseHead,
+	hostField,
+	bodyWriter,
+	finish,
+	finishWith,
 )
 
 --- The writing side of HTTP/1: heads written from the HTTP values, and a body
@@ -85,13 +97,13 @@ import Turkey.String (bytesOf)
 --- `upgrade`, when it is not empty, is written as `Upgrade`, in order, with
 --- `Connection: upgrade`.
 type OutgoingRequest b = OutgoingRequest {
-    method : Method b,
-    url : HTTPURL,
-    headers : Headers,
-    framing : Framing,
-    persistence : Persistence,
-    expectContinue : Bool,
-    upgrade : Array Token,
+	method         : Method b
+	url            : HTTPURL
+	headers        : Headers
+	framing        : Framing
+	persistence    : Persistence
+	expectContinue : Bool
+	upgrade        : Array Token
 }
 
 --- A response head to write. A 1xx or 204 response must be `NoBody`, and a
@@ -100,11 +112,11 @@ type OutgoingRequest b = OutgoingRequest {
 ---
 --- `upgrade`, for a 101, is written as `Upgrade` with `Connection: upgrade`.
 type OutgoingResponse = OutgoingResponse {
-    status : Status,
-    headers : Headers,
-    framing : Framing,
-    persistence : Persistence,
-    upgrade : Option HeaderValue,
+	status      : Status
+	headers     : Headers
+	framing     : Framing
+	persistence : Persistence
+	upgrade     : Option HeaderValue
 }
 
 -- -- buffers -------------------------------------------------------------------------
@@ -124,15 +136,15 @@ type Buffers = Buffers { free : Array (Option (Vec Buffer)), keep : Int }
 
 --- Returns an empty pool that keeps about `keep` buffers (`Buffers`).
 fun buffers(keep : Int) -> Buffers =
-    Buffers { free = Array.filled(Workers.threadLimit(), None), keep }
+	Buffers { free = Array.filled(Workers.threadLimit(), None), keep }
 
 -- The running thread's list of `p`'s free buffers.
 fun mine(p : Buffers) -> Vec Buffer {
-    let i = Workers.index()
-    if let Some(free) = p.free[i] { return free }
-    let free = []
-    p.free[i] = Some(free)
-    free
+	let i = Workers.index()
+	if let Some(free) = p.free[i] { return free }
+	let free = []
+	p.free[i] = Some(free)
+	free
 }
 
 -- How large a pooled buffer is: room for a head of a few dozen fields and
@@ -144,13 +156,13 @@ let size = 4096
 --- It holds a message's raw bytes, which may carry credentials, so `!Debug`
 --- keeps them out of a derived `Debug`.
 type Outbox : !Debug = Outbox {
-    pool : Buffers,
-    var lent : Option Buffer,
-    -- Twice the number of the exchange the outbox serves, plus 1 while a
-    -- writer is using the buffer. A writer enters by moving it from even to
-    -- odd and leaves by moving it back; `release` moves it to the next even
-    -- number, so a writer of an earlier turn can never enter again.
-    turn : AtomicInt,
+	pool     : Buffers
+	var lent : Option Buffer
+	-- Twice the number of the exchange the outbox serves, plus 1 while a
+	-- writer is using the buffer. A writer enters by moving it from even to
+	-- odd and leaves by moving it back; `release` moves it to the next even
+	-- number, so a writer of an earlier turn can never enter again.
+	turn : AtomicInt
 }
 
 --- Returns an outbox holding no buffer, which takes one from `pool` when it
@@ -161,45 +173,45 @@ fun outbox(pool : Buffers) -> Outbox = Outbox { pool, lent = None, turn = Sync.a
 --- from now on, and gives its buffer back to the pool. Bytes a writer held
 --- back are dropped.
 fun release(o : Outbox) -> Unit {
-    loop {
-        let t = Sync.load(o.turn)
-        let inside = t % 2 == 1
-        if Sync.compareAndSet(o.turn, t, t - t % 2 + 2) {
-            let Some(b) = o.lent else { return }
-            o.lent = None
-            -- A writer inside a write still holds the buffer, so it is not
-            -- given back; a grown one is not the pool's size.
-            if !inside && len(b.storage) == size {
-                Buf.clear(b)
-                giveBack(o.pool, b)
-            }
-            return
-        }
-    }
+	loop {
+		let t = Sync.load(o.turn)
+		let inside = t % 2 == 1
+		if Sync.compareAndSet(o.turn, t, t - t % 2 + 2) {
+			let Some(b) = o.lent else { return }
+			o.lent = None
+			-- A writer inside a write still holds the buffer, so it is not
+			-- given back; a grown one is not the pool's size.
+			if !inside && len(b.storage) == size {
+				Buf.clear(b)
+				giveBack(o.pool, b)
+			}
+			return
+		}
+	}
 }
 
 fun giveBack(p : Buffers, b : Buffer) -> Unit {
-    let free = mine(p)
-    let most = p.keep / Workers.permits()
-    if len(free) < (if most < 1 { 1 } else { most }) { Vec.push(free, b) }
+	let free = mine(p)
+	let most = p.keep / Workers.permits()
+	if len(free) < (if most < 1 { 1 } else { most }) { Vec.push(free, b) }
 }
 
 -- Returns the outbox's buffer, emptied, taking one from the pool first if
 -- it holds none.
 fun lent(o : Outbox) -> Buffer {
-    let b = match o.lent {
-        Some(b) -> b
-        None -> {
-            let b = match Vec.pop(mine(o.pool)) {
-                Some(b) -> b
-                None -> Buf.buffer(size)
-            }
-            o.lent = Some(b)
-            b
-        }
-    }
-    Buf.clear(b)
-    b
+	let b = match o.lent {
+		Some(b) -> b
+		None -> {
+			let b = match Vec.pop(mine(o.pool)) {
+				Some(b) -> b
+				None    -> Buf.buffer(size)
+			}
+			o.lent = Some(b)
+			b
+		}
+	}
+	Buf.clear(b)
+	b
 }
 
 -- Makes `out`'s buffer the outbox's, if writing a head grew it.
@@ -216,97 +228,97 @@ fun hostField(u : HTTPURL) -> String = HTTPURL.authority(u)
 --- holds a byte a request line cannot. Discards what the buffer held, so a
 --- writer of this exchange must not have bytes held back.
 fun requestHead(o : Outbox, r : OutgoingRequest b) -> Either HTTPError Unit {
-    let target = HTTPURL.target(r.url)
-    let authority = hostField(r.url)
-    if !allIn(targetChar, target) { return Left(BadURL(BadPath)) }
-    if !allIn(targetChar, authority) { return Left(BadURL(BadHost)) }
-    let out = Writer { buffer = lent(o), grown = False }
-    text(out, Method.name(r.method))
-    text(out, " ")
-    text(out, target)
-    text(out, " HTTP/1.1\r\nhost: ")
-    text(out, authority)
-    text(out, "\r\n")
-    fields(out, r.headers)
-    match r.framing {
-        UntilClose -> error("requestHead: a request cannot be framed until the connection closes")
-        framing -> framingFields(out, framing)
-    }
-    if let Close = r.persistence { text(out, "connection: close\r\n") }
-    if len(r.upgrade) > 0 {
-        text(out, "connection: upgrade\r\nupgrade: ")
-        text(out, String.join(Array.map(r.upgrade, Token.toString), ", "))
-        text(out, "\r\n")
-    }
-    if r.expectContinue { text(out, "expect: 100-continue\r\n") }
-    text(out, "\r\n")
-    finished(o, out)
-    Right(())
+	let target = HTTPURL.target(r.url)
+	let authority = hostField(r.url)
+	if !allIn(targetChar, target) { return Left(BadURL(BadPath)) }
+	if !allIn(targetChar, authority) { return Left(BadURL(BadHost)) }
+	let out = Writer { buffer = lent(o), grown = False }
+	text(out, Method.name(r.method))
+	text(out, " ")
+	text(out, target)
+	text(out, " HTTP/1.1\r\nhost: ")
+	text(out, authority)
+	text(out, "\r\n")
+	fields(out, r.headers)
+	match r.framing {
+		UntilClose -> error("requestHead: a request cannot be framed until the connection closes")
+		framing    -> framingFields(out, framing)
+	}
+	if let Close = r.persistence { text(out, "connection: close\r\n") }
+	if len(r.upgrade) > 0 {
+		text(out, "connection: upgrade\r\nupgrade: ")
+		text(out, String.join(Array.map(r.upgrade, Token.toString), ", "))
+		text(out, "\r\n")
+	}
+	if r.expectContinue { text(out, "expect: 100-continue\r\n") }
+	text(out, "\r\n")
+	finished(o, out)
+	Right(())
 }
 
 --- Writes the response head into `o`'s buffer, for `bodyWriter` to send.
 --- Panics if the framing is one the status cannot have. Discards what the
 --- buffer held, so a writer of this exchange must not have bytes held back.
 fun responseHead(o : Outbox, r : OutgoingResponse) -> Unit {
-    let code = Status.code(r.status)
-    let bodiless = code / 100 == 1 || code == 204
-    match r.framing {
-        NoBody -> {}
-        Chunked -> if bodiless || code == 304 { badFraming(code, r.framing) }
-        _ -> if bodiless { badFraming(code, r.framing) }
-    }
-    let out = Writer { buffer = lent(o), grown = False }
-    text(out, "HTTP/1.1 ")
-    text(out, Int.toString(code))
-    text(out, " ")
-    text(out, Status.reason(r.status))
-    text(out, "\r\n")
-    fields(out, r.headers)
-    framingFields(out, r.framing)
-    if let Some(v) = r.upgrade {
-        text(out, "connection: upgrade\r\nupgrade: ")
-        value(out, v)
-        text(out, "\r\n")
-    } else {
-        match (r.persistence, r.framing) {
-            (Close, _) | (_, UntilClose) -> text(out, "connection: close\r\n")
-            _ -> {}
-        }
-    }
-    text(out, "\r\n")
-    finished(o, out)
+	let code = Status.code(r.status)
+	let bodiless = code / 100 == 1 || code == 204
+	match r.framing {
+		NoBody  -> {}
+		Chunked -> if bodiless || code == 304 { badFraming(code, r.framing) }
+		_       -> if bodiless { badFraming(code, r.framing) }
+	}
+	let out = Writer { buffer = lent(o), grown = False }
+	text(out, "HTTP/1.1 ")
+	text(out, Int.toString(code))
+	text(out, " ")
+	text(out, Status.reason(r.status))
+	text(out, "\r\n")
+	fields(out, r.headers)
+	framingFields(out, r.framing)
+	if let Some(v) = r.upgrade {
+		text(out, "connection: upgrade\r\nupgrade: ")
+		value(out, v)
+		text(out, "\r\n")
+	} else {
+		match (r.persistence, r.framing) {
+			(Close, _) | (_, UntilClose) -> text(out, "connection: close\r\n")
+			_                            -> {}
+		}
+	}
+	text(out, "\r\n")
+	finished(o, out)
 }
 
 fun badFraming(code : Int, f : Framing) -> Unit =
-    error("responseHead: a " + Int.toString(code) + " response cannot be framed as " + debug(f))
+	error("responseHead: a " + Int.toString(code) + " response cannot be framed as " + debug(f))
 
 -- The fields a framing declares: Content-Length or Transfer-Encoding, or
 -- none.
 fun framingFields(out : Writer, f : Framing) -> Unit = match f {
-    ContentLength(n) -> {
-        text(out, "content-length: ")
-        text(out, Int.toString(n))
-        text(out, "\r\n")
-    }
-    Chunked -> text(out, "transfer-encoding: chunked\r\n")
-    UntilClose | NoBody -> {}
+	ContentLength(n) -> {
+		text(out, "content-length: ")
+		text(out, Int.toString(n))
+		text(out, "\r\n")
+	}
+	Chunked             -> text(out, "transfer-encoding: chunked\r\n")
+	UntilClose | NoBody -> {}
 }
 
 fun fields(out : Writer, hs : Headers) -> Unit {
-    for (HeaderName(n), v) in Headers.fields(hs) {
-        text(out, n)
-        text(out, ": ")
-        value(out, v)
-        text(out, "\r\n")
-    }
+	for (HeaderName(n), v) in Headers.fields(hs) {
+		text(out, n)
+		text(out, ": ")
+		value(out, v)
+		text(out, "\r\n")
+	}
 }
 
 fun allIn(table : Array Bool, s : String) -> Bool {
-    let bytes : Prim.Array Byte = bytesOf(s)
-    for var i = 0; i < len(bytes); i = i + 1 {
-        if !table[Byte.toInt(bytes[i])] { return False }
-    }
-    len(bytes) > 0
+	let bytes : Prim.Array Byte = bytesOf(s)
+	for var i = 0; i < len(bytes); i = i + 1 {
+		if !table[Byte.toInt(bytes[i])] { return False }
+	}
+	len(bytes) > 0
 }
 
 -- A buffer that grows as a head is written into it, and whether it has.
@@ -315,22 +327,22 @@ fun allIn(table : Array Bool, s : String) -> Bool {
 type Writer : !Debug = Writer { var buffer : Buffer, var grown : Bool }
 
 fun room(out : Writer, n : Int) -> Buffer {
-    let b = out.buffer
-    if b.limit - b.end >= n { return b }
-    let grown = Buf.buffer(2 * (b.end + n))
-    Buf.append(grown, b.storage, b.start, b.end)
-    out.buffer = grown
-    out.grown = True
-    grown
+	let b = out.buffer
+	if b.limit - b.end >= n { return b }
+	let grown = Buf.buffer(2 * (b.end + n))
+	Buf.append(grown, b.storage, b.start, b.end)
+	out.buffer = grown
+	out.grown = True
+	grown
 }
 
 fun text(out : Writer, s : String) -> Unit {
-    let n = String.byteLength(s)
-    Buf.appendText(room(out, n), s, 0, n)
+	let n = String.byteLength(s)
+	Buf.appendText(room(out, n), s, 0, n)
 }
 
 fun value(out : Writer, v : HeaderValue) -> Unit =
-    Buf.append(room(out, v.to - v.from), v.bytes, v.from, v.to)
+	Buf.append(room(out, v.to - v.from), v.bytes, v.from, v.to)
 
 -- The room a head leaves after it: what a chunk's size line takes, 16 hex
 -- digits and a CRLF, which the body writer appends without checking.
@@ -339,8 +351,8 @@ let chunkLine = 18
 -- Leaves the head in `o`'s buffer with at least `chunkLine` bytes of room
 -- after it.
 fun finished(o : Outbox, out : Writer) -> Unit {
-    let _ = room(out, chunkLine)
-    keep(o, out)
+	let _ = room(out, chunkLine)
+	keep(o, out)
 }
 
 -- -- bodies ----------------------------------------------------------------------------
@@ -348,41 +360,41 @@ fun finished(o : Outbox, out : Writer) -> Unit {
 -- It holds a message's raw bytes, which may carry credentials, so `!Debug`
 -- keeps them out of a derived `Debug`.
 type BodyWriter w : !Debug = BodyWriter {
-    sink : w,
-    outbox : Outbox,
-    -- The outbox's turn when the writer was made: even, and the writer's
-    -- own until `release` ends it.
-    ticket : Int,
-    -- Bytes not yet written, in the outbox's buffer: the head, until the
-    -- first write, and then a chunk's closing CRLF.
-    pending : Buffer,
-    var state : State,
+	sink   : w
+	outbox : Outbox
+	-- The outbox's turn when the writer was made: even, and the writer's
+	-- own until `release` ends it.
+	ticket : Int
+	-- Bytes not yet written, in the outbox's buffer: the head, until the
+	-- first write, and then a chunk's closing CRLF.
+	pending   : Buffer
+	var state : State
 }
 
-type State =
-    Sending(Int)     -- bytes of a declared length still to come
-    | Chunking
-    | Streaming      -- until the connection closes
-    | Bodiless
-    | Done
-    | Broken(HTTPError)
+type State
+	= Sending(Int) -- bytes of a declared length still to come
+	| Chunking
+	| Streaming -- until the connection closes
+	| Bodiless
+	| Done
+	| Broken(HTTPError)
 
 --- Returns a writer of a body framed by `framing`, which sends the head that
 --- `requestHead` or `responseHead` wrote into `o` before it. The writer is
 --- valid until `release(o)`.
 fun bodyWriter(sink : w, o : Outbox, framing : Framing) -> BodyWriter w {
-    let state = match framing {
-        ContentLength(n) -> Sending(n)
-        Chunked -> Chunking
-        UntilClose -> Streaming
-        NoBody -> Bodiless
-    }
-    let t = Sync.load(o.turn)
-    let pending = match o.lent {
-        Some(b) -> b
-        None -> error("Output.bodyWriter: no head was written")
-    }
-    BodyWriter { sink, outbox = o, ticket = t - t % 2, pending, state }
+	let state = match framing {
+		ContentLength(n) -> Sending(n)
+		Chunked          -> Chunking
+		UntilClose       -> Streaming
+		NoBody           -> Bodiless
+	}
+	let t = Sync.load(o.turn)
+	let pending = match o.lent {
+		Some(b) -> b
+		None    -> error("Output.bodyWriter: no head was written")
+	}
+	BodyWriter { sink, outbox = o, ticket = t - t % 2, pending, state }
 }
 
 -- Takes the writer's turn, if its exchange has not ended and no other
@@ -391,106 +403,106 @@ fun enter(bw : BodyWriter w) -> Bool = Sync.compareAndSet(bw.outbox.turn, bw.tic
 
 -- Gives the turn back, unless `release` ended it meanwhile.
 fun leave(bw : BodyWriter w) -> Unit {
-    let _ = Sync.compareAndSet(bw.outbox.turn, bw.ticket + 1, bw.ticket)
+	let _ = Sync.compareAndSet(bw.outbox.turn, bw.ticket + 1, bw.ticket)
 }
 
 -- What a writer whose exchange has ended fails with.
 fun ended(op : String) -> CodecError x =
-    Left(Transport(fail(IOError { kind = Closed, op, path = None })))
+	Left(Transport(fail(IOError { kind = Closed, op, path = None })))
 
 instance Write (BodyWriter w) : Write w {
-    type WriteError = CodecError (WriteError w)
-    fun writeFrom(bw, from) {
-        if !enter(bw) { return Left(ended("BodyWriter.write")) }
-        let r = writeIn(bw, from)
-        leave(bw)
-        r
-    }
-    fun flush(bw) {
-        if !enter(bw) { return Left(ended("BodyWriter.flush")) }
-        let r = flushIn(bw)
-        leave(bw)
-        r
-    }
+	type WriteError = CodecError (WriteError w)
+	fun writeFrom(bw, from) {
+		if !enter(bw) { return Left(ended("BodyWriter.write")) }
+		let r = writeIn(bw, from)
+		leave(bw)
+		r
+	}
+	fun flush(bw) {
+		if !enter(bw) { return Left(ended("BodyWriter.flush")) }
+		let r = flushIn(bw)
+		leave(bw)
+		r
+	}
 }
 
 fun writeIn[Write w](bw : BodyWriter w, from : Buffer) -> Either (CodecError (WriteError w)) Unit {
-    let n = from.end - from.start
-    if n == 0 { return Right(()) }
-    match bw.state {
-        Sending(left) -> {
-            if n > left { return broken(bw, Overrun) }
-            bw.state = Sending(left - n)
-            emit(bw, from)
-        }
-        Chunking -> {
-            hex(bw.pending, n)
-            Buf.appendText(bw.pending, "\r\n", 0, 2)
-            emit(bw, from)?
-            -- The CRLF that closes the chunk waits for the next write.
-            Buf.appendText(bw.pending, "\r\n", 0, 2)
-            Right(())
-        }
-        Streaming -> emit(bw, from)
-        Bodiless | Done -> broken(bw, Overrun)
-        Broken(e) -> Left(Left(e))
-    }
+	let n = from.end - from.start
+	if n == 0 { return Right(()) }
+	match bw.state {
+		Sending(left) -> {
+			if n > left { return broken(bw, Overrun) }
+			bw.state = Sending(left - n)
+			emit(bw, from)
+		}
+		Chunking -> {
+			hex(bw.pending, n)
+			Buf.appendText(bw.pending, "\r\n", 0, 2)
+			emit(bw, from)?
+			-- The CRLF that closes the chunk waits for the next write.
+			Buf.appendText(bw.pending, "\r\n", 0, 2)
+			Right(())
+		}
+		Streaming       -> emit(bw, from)
+		Bodiless | Done -> broken(bw, Overrun)
+		Broken(e)       -> Left(Left(e))
+	}
 }
 
 fun flushIn[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit {
-    sendPending(bw)?
-    match flush(bw.sink) {
-        Left(e) -> Left(Right(e))
-        Right(_) -> Right(())
-    }
+	sendPending(bw)?
+	match flush(bw.sink) {
+		Left(e)  -> Left(Right(e))
+		Right(_) -> Right(())
+	}
 }
 
 -- Sends what is pending with as much of `from` as fits beside it, in one
 -- write, and then the rest of `from`. With nothing pending, sends `from`
 -- as it is: copying it would only split it.
 fun emit[Write w](bw : BodyWriter w, from : Buffer) -> Either (CodecError (WriteError w)) Unit {
-    let p = bw.pending
-    if p.end == p.start { return send(bw, from) }
-    let fits = p.limit - p.end
-    let n = from.end - from.start
-    let first = if n < fits { n } else { fits }
-    Buf.append(p, from.storage, from.start, from.start + first)
-    sendPending(bw)?
-    if first < n { send(bw, Buf.view(from, from.start + first, from.end))? }
-    Right(())
+	let p = bw.pending
+	if p.end == p.start { return send(bw, from) }
+	let fits = p.limit - p.end
+	let n = from.end - from.start
+	let first = if n < fits { n } else { fits }
+	Buf.append(p, from.storage, from.start, from.start + first)
+	sendPending(bw)?
+	if first < n { send(bw, Buf.view(from, from.start + first, from.end))? }
+	Right(())
 }
 
 fun sendPending[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit {
-    let p = bw.pending
-    if p.end == p.start { return Right(()) }
-    send(bw, p)?
-    Buf.clear(p)
-    Right(())
+	let p = bw.pending
+	if p.end == p.start { return Right(()) }
+	send(bw, p)?
+	Buf.clear(p)
+	Right(())
 }
 
 fun send[Write w](bw : BodyWriter w, b : Buffer) -> Either (CodecError (WriteError w)) Unit =
-    match writeFrom(bw.sink, b) {
-        Left(e) -> {
-            -- Part of the message may be on the wire: it cannot be finished.
-            bw.state = Broken(Truncated)
-            Left(Right(e))
-        }
-        Right(_) -> Right(())
-    }
+	match writeFrom(bw.sink, b) {
+		Left(e) -> {
+			-- Part of the message may be on the wire: it cannot be finished.
+			bw.state = Broken(Truncated)
+			Left(Right(e))
+		}
+		Right(_) -> Right(())
+	}
 
 fun broken(bw : BodyWriter w, e : HTTPError) -> Either (CodecError x) Unit {
-    bw.state = Broken(e)
-    Left(Left(e))
+	bw.state = Broken(e)
+	Left(Left(e))
 }
 
 -- Appends `n` in lowercase hex.
 fun hex(b : Buffer, n : Int) -> Unit {
-    var shift = 60
-    while shift > 0 && Int.shr(n, shift) == 0 { shift = shift - 4 }
-    while shift >= 0 {
-        Buf.push(b, hexDigits[Int.and(Int.shr(n, shift), 15)])
-        shift = shift - 4
-    }
+	var shift = 60
+	while shift > 0 && Int.shr(n, shift) == 0 { shift = shift - 4 }
+	while shift >= 0 {
+		Buf.push(b, hexDigits[Int.and(Int.shr(n, shift), 15)])
+		shift = shift - 4
+	}
 }
 
 let hexDigits = String.toBytes("0123456789abcdef")
@@ -499,44 +511,50 @@ let hexDigits = String.toBytes("0123456789abcdef")
 --- one, and whatever else is pending, then flushes the sink. `Truncated` if a
 --- declared length was not reached. Finishing twice does nothing more.
 fun finish[Write w](bw : BodyWriter w) -> Either (CodecError (WriteError w)) Unit =
-    finishWith(bw, Headers.empty)
+	finishWith(bw, Headers.empty)
 
 --- Ends a chunked body with `trailers` after its last chunk, as `finish`
 --- does. `UnframedTrailers` if the body is not chunked and `trailers` holds
 --- any field: only a chunked body has anywhere to put them. The message is
 --- then left unfinished, as after any other refusal.
-fun finishWith[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecError (WriteError w)) Unit {
-    if !enter(bw) { return Left(ended("BodyWriter.finish")) }
-    let r = finishIn(bw, trailers)
-    leave(bw)
-    r
+fun finishWith[Write w](
+	bw : BodyWriter w,
+	trailers : Headers,
+) -> Either (CodecError (WriteError w)) Unit {
+	if !enter(bw) { return Left(ended("BodyWriter.finish")) }
+	let r = finishIn(bw, trailers)
+	leave(bw)
+	r
 }
 
-fun finishIn[Write w](bw : BodyWriter w, trailers : Headers) -> Either (CodecError (WriteError w)) Unit {
-    match bw.state {
-        Sending(_) | Streaming | Bodiless -> if Headers.size(trailers) > 0 {
-            return broken(bw, UnframedTrailers)
-        }
-        _ -> {}
-    }
-    match bw.state {
-        Sending(left) -> if left > 0 { return broken(bw, Truncated) }
-        Chunking -> {
-            let out = Writer { buffer = bw.pending, grown = False }
-            text(out, "0\r\n")
-            fields(out, trailers)
-            text(out, "\r\n")
-            send(bw, out.buffer)?
-            Buf.clear(bw.pending)
-        }
-        Done -> return Right(())
-        Broken(e) -> return Left(Left(e))
-        Streaming | Bodiless -> {}
-    }
-    sendPending(bw)?
-    bw.state = Done
-    match flush(bw.sink) {
-        Left(e) -> Left(Right(e))
-        Right(_) -> Right(())
-    }
+fun finishIn[Write w](
+	bw : BodyWriter w,
+	trailers : Headers,
+) -> Either (CodecError (WriteError w)) Unit {
+	match bw.state {
+		Sending(_) | Streaming | Bodiless -> if Headers.size(trailers) > 0 {
+			return broken(bw, UnframedTrailers)
+		}
+		_ -> {}
+	}
+	match bw.state {
+		Sending(left) -> if left > 0 { return broken(bw, Truncated) }
+		Chunking -> {
+			let out = Writer { buffer = bw.pending, grown = False }
+			text(out, "0\r\n")
+			fields(out, trailers)
+			text(out, "\r\n")
+			send(bw, out.buffer)?
+			Buf.clear(bw.pending)
+		}
+		Done                 -> return Right(())
+		Broken(e)            -> return Left(Left(e))
+		Streaming | Bodiless -> {}
+	}
+	sendPending(bw)?
+	bw.state = Done
+	match flush(bw.sink) {
+		Left(e)  -> Left(Right(e))
+		Right(_) -> Right(())
+	}
 }

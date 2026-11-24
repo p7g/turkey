@@ -45,117 +45,120 @@ let highs : Int = -0x7F7F_7F7F_7F7F_7F80
 
 --- Where the first newline is in `bytes[from..to)`, or -1 if there is none.
 fun newline(bytes : Array Byte, from : Int, to : Int) -> Int {
-    within(len(bytes), from, to)
-    let base = Ptr.elementAddress(Array.storage(bytes), 0)
-    -- C's `memchr`, whose vector loop is several times what a word at a time
-    -- in Turkey reaches (`Turkey.Libc.memchr`). It runs in a moment and cannot
-    -- block, so it is called directly rather than as a blocking call.
-    let p = Os.memchr(Ptr.add(base, from), 10, to - from)
-    let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
-    Ptr.keepAlive(bytes)
-    found
+	within(len(bytes), from, to)
+	let base = Ptr.elementAddress(Array.storage(bytes), 0)
+	-- C's `memchr`, whose vector loop is several times what a word at a time
+	-- in Turkey reaches (`Turkey.Libc.memchr`). It runs in a moment and cannot
+	-- block, so it is called directly rather than as a blocking call.
+	let p = Os.memchr(Ptr.add(base, from), 10, to - from)
+	let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
+	Ptr.keepAlive(bytes)
+	found
 }
 
 --- Whether `a[from..from + count)` holds the bytes of `b[0..count)`. C's
 --- `memcmp`, for the same reason as `newline`.
 fun equalAt(a : Prim.Array Byte, from : Int, b : Prim.Array Byte, count : Int) -> Bool {
-    within(len(a), from, from + count)
-    within(len(b), 0, count)
-    let r = Os.memcmp(Ptr.add(Ptr.elementAddress(a, 0), from), Ptr.elementAddress(b, 0), count)
-    Ptr.keepAlive(a)
-    Ptr.keepAlive(b)
-    r & 0xFFFF_FFFF == 0
+	within(len(a), from, from + count)
+	within(len(b), 0, count)
+	let r = Os.memcmp(Ptr.add(Ptr.elementAddress(a, 0), from), Ptr.elementAddress(b, 0), count)
+	Ptr.keepAlive(a)
+	Ptr.keepAlive(b)
+	r & 0xFFFF_FFFF == 0
 }
 
 --- Negative, zero or positive as `a` orders below, the same as or above `b`:
 --- by the first byte that differs, as unsigned, and otherwise by length, so
 --- that a proper prefix orders below.
 fun compare(a : Prim.Array Byte, b : Prim.Array Byte) -> Int {
-    let n = len(a)
-    let m = len(b)
-    let r = Os.memcmp(Ptr.elementAddress(a, 0), Ptr.elementAddress(b, 0), if n < m { n } else { m })
-    Ptr.keepAlive(a)
-    Ptr.keepAlive(b)
-    -- `memcmp` answers a C `int`, whose sign is bit 31: the high half of the
-    -- register is undefined.
-    let low = r & 0xFFFF_FFFF
-    if low == 0 { n - m } else if low >= 0x8000_0000 { -1 } else { 1 }
+	let n = len(a)
+	let m = len(b)
+	let r = Os.memcmp(Ptr.elementAddress(a, 0), Ptr.elementAddress(b, 0), if n < m { n } else { m })
+	Ptr.keepAlive(a)
+	Ptr.keepAlive(b)
+	-- `memcmp` answers a C `int`, whose sign is bit 31: the high half of the
+	-- register is undefined.
+	let low = r & 0xFFFF_FFFF
+	if low == 0 { n - m } else if low >= 0x8000_0000 { -1 } else { 1 }
 }
 
 --- Where `needle` first occurs in `haystack[from..)`, as an offset into
 --- `haystack`, or -1. An empty needle occurs at `from`. C's `memmem`.
 fun search(haystack : Prim.Array Byte, needle : Prim.Array Byte, from : Int) -> Int {
-    let n = len(haystack)
-    within(n, from, n)
-    if len(needle) == 0 { return from }
-    let base = Ptr.elementAddress(haystack, 0)
-    let p = Os.memmem(Ptr.add(base, from), n - from, Ptr.elementAddress(needle, 0), len(needle))
-    let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
-    Ptr.keepAlive(haystack)
-    Ptr.keepAlive(needle)
-    found
+	let n = len(haystack)
+	within(n, from, n)
+	if len(needle) == 0 { return from }
+	let base = Ptr.elementAddress(haystack, 0)
+	let p = Os.memmem(Ptr.add(base, from), n - from, Ptr.elementAddress(needle, 0), len(needle))
+	let found = if Ptr.isNull(p) { -1 } else { Ptr.diff(p, base) }
+	Ptr.keepAlive(haystack)
+	Ptr.keepAlive(needle)
+	found
 }
 
 -- Where the first byte of `base[from..to)` that is not ASCII is, or `to` if
 -- they all are: 32 bytes per step, with their high bits tested together, then
 -- a word at a time, then a byte.
 fun asciiFrom(base : Ptr, from : Int, to : Int) -> Int {
-    var i = from
-    while i + 32 <= to {
-        let any : Int = Ptr.load(base, i) | Ptr.load(base, i + 8) | Ptr.load(base, i + 16) | Ptr.load(base, i + 24)
-        if any & highs != 0 { break }
-        i = i + 32
-    }
-    while i + 8 <= to {
-        let high : Int = Ptr.load(base, i) & highs
-        if high != 0 { return i + firstFlagged(high) }
-        i = i + 8
-    }
-    while i < to {
-        if Byte.toInt(Ptr.load(base, i)) >= 0x80 { return i }
-        i = i + 1
-    }
-    to
+	var i = from
+	while i + 32 <= to {
+		let any : Int = Ptr.load(base, i)
+			| Ptr.load(base, i + 8)
+			| Ptr.load(base, i + 16)
+			| Ptr.load(base, i + 24)
+		if any & highs != 0 { break }
+		i = i + 32
+	}
+	while i + 8 <= to {
+		let high : Int = Ptr.load(base, i) & highs
+		if high != 0 { return i + firstFlagged(high) }
+		i = i + 8
+	}
+	while i < to {
+		if Byte.toInt(Ptr.load(base, i)) >= 0x80 { return i }
+		i = i + 1
+	}
+	to
 }
 
 --- Whether `bytes[from..to)` is well-formed UTF-8: the shortest encoding of a
 --- scalar value, each time, to the end. Overlong forms, surrogates, code points
 --- past 10FFFF and truncated sequences all fail.
 fun wellFormed(bytes : Prim.Array Byte, from : Int, to : Int) -> Bool {
-    within(len(bytes), from, to)
-    let base = Ptr.elementAddress(bytes, 0)
-    var i = from
-    var good = True
-    -- A run of ASCII is passed over by `asciiFrom`, and `sequence` runs only
-    -- from a byte that is not ASCII, until the next ASCII byte.
-    while i < to {
-        let lead = Byte.toInt(Ptr.load(base, i))
-        if lead < 0x80 {
-            i = asciiFrom(base, i, to)
-            continue
-        }
-        let width = sequence(base, i, to, lead)
-        if width < 0 {
-            good = False
-            break
-        }
-        i = i + width
-    }
-    Ptr.keepAlive(bytes)
-    good
+	within(len(bytes), from, to)
+	let base = Ptr.elementAddress(bytes, 0)
+	var i = from
+	var good = True
+	-- A run of ASCII is passed over by `asciiFrom`, and `sequence` runs only
+	-- from a byte that is not ASCII, until the next ASCII byte.
+	while i < to {
+		let lead = Byte.toInt(Ptr.load(base, i))
+		if lead < 0x80 {
+			i = asciiFrom(base, i, to)
+			continue
+		}
+		let width = sequence(base, i, to, lead)
+		if width < 0 {
+			good = False
+			break
+		}
+		i = i + width
+	}
+	Ptr.keepAlive(bytes)
+	good
 }
 
 --- What the bytes of `bytes[i..to)` begin with, for a lossy decoder: the width
 --- of the well-formed sequence at `i`, or the negated length of the ill-formed
 --- run there that one U+FFFD stands for. An ASCII byte is a sequence of width 1.
 fun sequenceAt(bytes : Prim.Array Byte, i : Int, to : Int) -> Int {
-    within(len(bytes), i, to)
-    if i >= to { error("Turkey.Scan: no sequence at the end of a window") }
-    let base = Ptr.elementAddress(bytes, 0)
-    let lead = Byte.toInt(Ptr.load(base, i))
-    let width = if lead < 0x80 { 1 } else { sequence(base, i, to, lead) }
-    Ptr.keepAlive(bytes)
-    width
+	within(len(bytes), i, to)
+	if i >= to { error("Turkey.Scan: no sequence at the end of a window") }
+	let base = Ptr.elementAddress(bytes, 0)
+	let lead = Byte.toInt(Ptr.load(base, i))
+	let width = if lead < 0x80 { 1 } else { sequence(base, i, to, lead) }
+	Ptr.keepAlive(bytes)
+	width
 }
 
 -- The sequence led by `lead`, a byte that is not ASCII, at `i`: its width if
@@ -183,29 +186,29 @@ fun sequenceAt(bytes : Prim.Array Byte, i : Int, to : Int) -> Int {
 -- `F1 80 80 41` is one, `F1 80 80`, followed by `41`. Each maximal subpart is
 -- one U+FFFD to a lossy decoder.
 fun sequence(base : Ptr, i : Int, to : Int, lead : Int) -> Int {
-    var width = 0
-    var low = 0x80
-    var high = 0xBF
-    if lead >= 0xC2 && lead <= 0xDF {
-        width = 2
-    } else if lead >= 0xE0 && lead <= 0xEF {
-        width = 3
-        if lead == 0xE0 { low = 0xA0 } else if lead == 0xED { high = 0x9F }
-    } else if lead >= 0xF0 && lead <= 0xF4 {
-        width = 4
-        if lead == 0xF0 { low = 0x90 } else if lead == 0xF4 { high = 0x8F }
-    } else {
-        return -1
-    }
-    if i + 1 >= to { return -1 }
-    let second = Byte.toInt(Ptr.load(base, i + 1))
-    if second < low || second > high { return -1 }
-    for var k = 2; k < width; k = k + 1 {
-        if i + k >= to { return -k }
-        let b = Byte.toInt(Ptr.load(base, i + k))
-        if b & 0xC0 != 0x80 { return -k }
-    }
-    width
+	var width = 0
+	var low = 0x80
+	var high = 0xBF
+	if lead >= 0xC2 && lead <= 0xDF {
+		width = 2
+	} else if lead >= 0xE0 && lead <= 0xEF {
+		width = 3
+		if lead == 0xE0 { low = 0xA0 } else if lead == 0xED { high = 0x9F }
+	} else if lead >= 0xF0 && lead <= 0xF4 {
+		width = 4
+		if lead == 0xF0 { low = 0x90 } else if lead == 0xF4 { high = 0x8F }
+	} else {
+		return -1
+	}
+	if i + 1 >= to { return -1 }
+	let second = Byte.toInt(Ptr.load(base, i + 1))
+	if second < low || second > high { return -1 }
+	for var k = 2; k < width; k = k + 1 {
+		if i + k >= to { return -k }
+		let b = Byte.toInt(Ptr.load(base, i + k))
+		if b & 0xC0 != 0x80 { return -k }
+	}
+	width
 }
 
 -- The index of the lowest byte whose high bit is set in `flags`, which has
@@ -215,15 +218,15 @@ fun sequence(base : Ptr, i : Int, to : Int, lead : Int) -> Int {
 -- k. The shift is arithmetic, so for k = 7 the mask clears the copies of the
 -- sign bit it brings in.
 fun firstFlagged(flags : Int) -> Int {
-    let lowest = flags & Int.negWrapping(flags)
-    let down = lowest >> 7 & 0x01FF_FFFF_FFFF_FFFF
-    let spread = Int.mulWrapping(down, 0x0001_0203_0405_0607)
-    spread >> 56 & 0xff
+	let lowest = flags & Int.negWrapping(flags)
+	let down = lowest >> 7 & 0x01FF_FFFF_FFFF_FFFF
+	let spread = Int.mulWrapping(down, 0x0001_0203_0405_0607)
+	spread >> 56 & 0xff
 }
 
 -- Panic unless `from..to` is a window of something `length` long.
 fun within(length : Int, from : Int, to : Int) -> Unit {
-    if from < 0 || to < from || to > length {
-        error("Turkey.Scan: a window outside its array")
-    }
+	if from < 0 || to < from || to > length {
+		error("Turkey.Scan: a window outside its array")
+	}
 }

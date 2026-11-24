@@ -52,45 +52,44 @@ import Turkey.Ssa (BlockId(..), RepClass(..), Term(..))
 --- Add a poll to every back edge of `f` -- an edge to a block that dominates
 --- the block it leaves -- whose loop can go around without allocating.
 fun insert(f : Ssa.Func Low, recursive : Bool) -> Unit {
-    if recursive {
-        let entry = Ssa.blockAt(f, f.entry)
-        -- Part of entering the function, like the prologue: the declaration,
-        -- and no stepping target of its own.
-        let insts = [L.low(Ssa.freshValue(f, Ssa.untraced(Unit)), Poll,
-                           Position.notStmt(f.at))]
-        for i in entry.insts { Vec.push(insts, i) }
-        entry.insts = insts
-    }
-    let idom = Ssa.dominators(f)
-    let edges = []
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        -- An unreachable block has no dominator, and its edges are not loops.
-        match idom[b] {
-            None -> {}
-            Some(_) -> for target in Ssa.successors(f.blocks[b].term) {
-                if Ssa.dominates(idom, target, BlockId(b)) {
-                    Vec.push(edges, (b, Ssa.blockId(target)))
-                }
-            }
-        }
-    }
-    let allocating = Array.map(f.blocks, fun(block) = allocates(block))
-    for (from, header) in edges {
-        if !always(f, allocating, header) { poll(f, from, header) }
-    }
+	if recursive {
+		let entry = Ssa.blockAt(f, f.entry)
+		-- Part of entering the function, like the prologue: the declaration,
+		-- and no stepping target of its own.
+		let insts = [L.low(Ssa.freshValue(f, Ssa.untraced(Unit)), Poll, Position.notStmt(f.at))]
+		for i in entry.insts { Vec.push(insts, i) }
+		entry.insts = insts
+	}
+	let idom = Ssa.dominators(f)
+	let edges = []
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		-- An unreachable block has no dominator, and its edges are not loops.
+		match idom[b] {
+			None -> {}
+			Some(_) -> for target in Ssa.successors(f.blocks[b].term) {
+				if Ssa.dominates(idom, target, BlockId(b)) {
+					Vec.push(edges, (b, Ssa.blockId(target)))
+				}
+			}
+		}
+	}
+	let allocating = Array.map(f.blocks, fun(block) = allocates(block))
+	for (from, header) in edges {
+		if !always(f, allocating, header) { poll(f, from, header) }
+	}
 }
 
 fun allocates(block : Ssa.Block Low) -> Bool {
-    for i in block.insts {
-        match i.op {
-            ObjectNew(_, _, _, _, _) -> return True
-            ArrayNew(_, _, _) -> return True
-            CellNew(_) -> return True
-            ClosureNew(_, _) -> return True
-            _ -> {}
-        }
-    }
-    False
+	for i in block.insts {
+		match i.op {
+			ObjectNew(_, _, _, _, _) -> return True
+			ArrayNew(_, _, _)        -> return True
+			CellNew(_)               -> return True
+			ClosureNew(_, _)         -> return True
+			_                        -> {}
+		}
+	}
+	False
 }
 
 -- Whether every path from `header` back to it goes through a block that
@@ -98,24 +97,24 @@ fun allocates(block : Ssa.Block Low) -> Bool {
 -- a block passes every allocation in it; a path that leaves the function
 -- never comes back.
 fun always(f : Ssa.Func Low, allocating : Array Bool, header : Int) -> Bool {
-    if allocating[header] { return True }
-    let seen = Array.filled(len(f.blocks), False)
-    let work = [header]
-    while True {
-        let b = match Vec.pop(work) {
-            Some(b) -> b
-            None -> break
-        }
-        for target in Ssa.successors(f.blocks[b].term) {
-            let t = Ssa.blockId(target)
-            if t == header { return False }
-            if !seen[t] && !allocating[t] {
-                seen[t] = True
-                Vec.push(work, t)
-            }
-        }
-    }
-    True
+	if allocating[header] { return True }
+	let seen = Array.filled(len(f.blocks), False)
+	let work = [header]
+	while True {
+		let b = match Vec.pop(work) {
+			Some(b) -> b
+			None    -> break
+		}
+		for target in Ssa.successors(f.blocks[b].term) {
+			let t = Ssa.blockId(target)
+			if t == header { return False }
+			if !seen[t] && !allocating[t] {
+				seen[t] = True
+				Vec.push(work, t)
+			}
+		}
+	}
+	True
 }
 
 -- Put a poll on the edge from `from` to `header`: at the end of `from` when it
@@ -125,75 +124,81 @@ fun always(f : Ssa.Func Low, allocating : Array Bool, header : Int) -> Bool {
 -- The poll takes the position of the terminator the edge leaves by, and a
 -- block made for it jumps on with that position too, as no stepping target.
 fun poll(f : Ssa.Func Low, from : Int, header : Int) -> Unit {
-    let at = f.blocks[from].termAt
-    let edge = match f.blocks[from].term {
-        Jump(_, _) -> from
-        Branch(c, yes, no) -> {
-            Vec.push(f.blocks, Ssa.newBlock())
-            let made = len(f.blocks) - 1
-            f.blocks[made].term = Jump(BlockId(header), [])
-            f.blocks[made].termAt = Position.notStmt(at)
-            f.blocks[from].term = if Ssa.blockId(yes) == header {
-                Branch(c, BlockId(made), no)
-            } else {
-                Branch(c, yes, BlockId(made))
-            }
-            made
-        }
-        Switch(v, cases, default) -> {
-            Vec.push(f.blocks, Ssa.newBlock())
-            let made = len(f.blocks) - 1
-            f.blocks[made].term = Jump(BlockId(header), [])
-            f.blocks[made].termAt = Position.notStmt(at)
-            let redirect = fun(t : BlockId) -> BlockId =
-                if Ssa.blockId(t) == header { BlockId(made) } else { t }
-            f.blocks[from].term = Switch(v,
-                Vec.map(cases, fun((key, t)) = (key, redirect(t))),
-                match default {
-                    Some(d) -> Some(redirect(d))
-                    None -> None
-                })
-            made
-        }
-        _ -> return
-    }
-    let done = Ssa.freshValue(f, Ssa.untraced(Unit))
-    Vec.push(f.blocks[edge].insts, L.low(done, Poll, at))
+	let at = f.blocks[from].termAt
+	let edge = match f.blocks[from].term {
+		Jump(_, _) -> from
+		Branch(c, yes, no) -> {
+			Vec.push(f.blocks, Ssa.newBlock())
+			let made = len(f.blocks) - 1
+			f.blocks[made].term = Jump(BlockId(header), [])
+			f.blocks[made].termAt = Position.notStmt(at)
+			f.blocks[from].term = if Ssa.blockId(yes) == header {
+				Branch(c, BlockId(made), no)
+			} else {
+				Branch(c, yes, BlockId(made))
+			}
+			made
+		}
+		Switch(v, cases, default) -> {
+			Vec.push(f.blocks, Ssa.newBlock())
+			let made = len(f.blocks) - 1
+			f.blocks[made].term = Jump(BlockId(header), [])
+			f.blocks[made].termAt = Position.notStmt(at)
+			let redirect = fun(t : BlockId) -> BlockId = if Ssa.blockId(t) == header {
+				BlockId(made)
+			} else {
+				t
+			}
+			f.blocks[from].term = Switch(
+				v,
+				Vec.map(cases, fun((key, t)) = (key, redirect(t))),
+				match default {
+					Some(d) -> Some(redirect(d))
+					None    -> None
+				},
+			)
+			made
+		}
+		_ -> return
+	}
+	let done = Ssa.freshValue(f, Ssa.untraced(Unit))
+	Vec.push(f.blocks[edge].insts, L.low(done, Poll, at))
 }
 
 --- The functions of `functions` in a cycle of the call graph, leaving out
 --- those `skip` names. An indirect call is an edge to every function a closure
 --- is made of, through one node standing for all of them.
 fun recursive(functions : Array (Ssa.Func Low), skip : fun(String) -> Bool) -> Set.Set String {
-    let anywhere = "%indirect"
-    let graph = Map.new()
-    let closures = Set.new()
-    for f in functions {
-        if skip(f.name) { continue }
-        let callees = Set.new()
-        for block in f.blocks {
-            for i in block.insts {
-                match i.op {
-                    Call(Direct(name), _) -> Set.add(callees, name)
-                    Call(Indirect(_), _) -> Set.add(callees, anywhere)
-                    ClosureNew(name, _) -> Set.add(closures, name)
-                    StackClosure(name, _) -> Set.add(closures, name)
-                    _ -> {}
-                }
-            }
-        }
-        Map.put(graph, f.name, callees)
-    }
-    Map.put(graph, anywhere, closures)
-    let out = Set.new()
-    for component in Deps.sccs(graph) {
-        let looped = len(component) > 1 || match Map.get(graph, component[0]) {
-            Some(callees) -> Set.contains(callees, component[0])
-            None -> False
-        }
-        if looped {
-            for name in component { if name != anywhere { Set.add(out, name) } }
-        }
-    }
-    out
+	let anywhere = "%indirect"
+	let graph = Map.new()
+	let closures = Set.new()
+	for f in functions {
+		if skip(f.name) { continue }
+		let callees = Set.new()
+		for block in f.blocks {
+			for i in block.insts {
+				match i.op {
+					Call(Direct(name), _) -> Set.add(callees, name)
+					Call(Indirect(_), _)  -> Set.add(callees, anywhere)
+					ClosureNew(name, _)   -> Set.add(closures, name)
+					StackClosure(name, _) -> Set.add(closures, name)
+					_                     -> {}
+				}
+			}
+		}
+		Map.put(graph, f.name, callees)
+	}
+	Map.put(graph, anywhere, closures)
+	let out = Set.new()
+	for component in Deps.sccs(graph) {
+		let looped = len(component) > 1
+			|| match Map.get(graph, component[0]) {
+				Some(callees) -> Set.contains(callees, component[0])
+				None          -> False
+			}
+		if looped {
+			for name in component { if name != anywhere { Set.add(out, name) } }
+		}
+	}
+	out
 }

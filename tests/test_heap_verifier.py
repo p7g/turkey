@@ -489,13 +489,11 @@ fun main() {
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
     if defect == "native-roots":
-        before, after = ("    stackTasks(frame)\n", "")
+        before, after = "stackTasks(frame)", []
     else:
-        before = ("        let object = Ptr.fromInt(if chunk == 0 { entry } "
-                  "else { entry & addressBits })\n")
-        after = before + "        if !Ptr.isNull(object) { continue }\n"
-    assert text.count(before) == 1, before
-    heap.write_text(text.replace(before, after))
+        before = "let object = Ptr.fromInt(if chunk == 0 { entry } else { entry & addressBits })"
+        after = [before, "if !Ptr.isNull(object) { continue }"]
+    heap.write_text(bootc.edit_line(text, before, after))
     binary = tmp_path / "broken"
     bootc.executable(source, binary, "--gc-verify", env=dict(os.environ, TURKEY_LIB=str(library)))
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,

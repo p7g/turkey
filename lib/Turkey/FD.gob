@@ -1,5 +1,24 @@
-export (FD, fd, number, closed, timedOut, read, readBy, readWithin, write, writeText, readAt, writeAt, using, flock,
-        readingWith, writingWith, writeWith, writeWithin, close)
+export (
+	FD,
+	fd,
+	number,
+	closed,
+	timedOut,
+	read,
+	readBy,
+	readWithin,
+	write,
+	writeText,
+	readAt,
+	writeAt,
+	using,
+	flock,
+	readingWith,
+	writingWith,
+	writeWith,
+	writeWithin,
+	close,
+)
 
 --- A descriptor that tasks share: the one place the I/O layer decides when a
 --- descriptor number stops being this file's, and which of two tasks using it
@@ -122,37 +141,37 @@ let timedOut : Int = Wait.timedOut
 --- rest is read under the locks and the publish protocol too, so `!Debug`
 --- keeps a derived `Debug` from reading it.
 type FD : !Debug = FD {
-    state        : Sync.AtomicInt,
-    number       : Int,
-    var readMode : ReadMode,
-    var polled   : Bool,
-    -- The poller's source for the descriptor, once a wait has been made on
-    -- it (`Turkey.Wait.sourceOf`), so that a wait parks under the source's
-    -- lock rather than the poller's (`Turkey.Wait.onUnlessAsOf`). It is
-    -- published through `sourced`: 0 while there is none, 1 while one
-    -- operation fetches it, 2 once it is in `source`, which is read only
-    -- after `sourced` is seen at 2. The two directions' operations run at
-    -- once, and that read is what orders the store of `source` before it.
-    var source   : Option Poll.Source,
-    sourced      : Sync.AtomicInt,
-    var readers  : Vec Co.Coroutine,
-    var writers  : Vec Co.Coroutine,
-    -- Linux's `flock` calls on the descriptor, one at a time (`flockLinux`).
-    -- Made by the first, under the scheduler's lock.
-    var flocking : Option Semaphore.Semaphore,
+	state        : Sync.AtomicInt
+	number       : Int
+	var readMode : ReadMode
+	var polled   : Bool
+	-- The poller's source for the descriptor, once a wait has been made on
+	-- it (`Turkey.Wait.sourceOf`), so that a wait parks under the source's
+	-- lock rather than the poller's (`Turkey.Wait.onUnlessAsOf`). It is
+	-- published through `sourced`: 0 while there is none, 1 while one
+	-- operation fetches it, 2 once it is in `source`, which is read only
+	-- after `sourced` is seen at 2. The two directions' operations run at
+	-- once, and that read is what orders the store of `source` before it.
+	var source  : Option Poll.Source
+	sourced     : Sync.AtomicInt
+	var readers : Vec Co.Coroutine
+	var writers : Vec Co.Coroutine
+	-- Linux's `flock` calls on the descriptor, one at a time (`flockLinux`).
+	-- Made by the first, under the scheduler's lock.
+	var flocking : Option Semaphore.Semaphore
 }
 
 --- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
 fun fd(number : Int) -> FD = FD {
-    state = Sync.atomicInt(0),
-    number = number,
-    readMode = Unknown,
-    polled = False,
-    source = None,
-    sourced = Sync.atomicInt(0),
-    readers = [],
-    writers = [],
-    flocking = None,
+	state    = Sync.atomicInt(0)
+	number   = number
+	readMode = Unknown
+	polled   = False
+	source   = None
+	sourced  = Sync.atomicInt(0)
+	readers  = []
+	writers  = []
+	flocking = None
 }
 
 -- What `readMode` holds: `Unknown`, not yet looked at; `CallAtOnce`; or
@@ -169,84 +188,91 @@ fun number(f : FD) -> Int = f.number
 --- position: how many, at least 1, or 0 at end of file. One read at a time per
 --- `FD`.
 fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int =
-    readBy(f, bytes, from, to, -1)
+	readBy(f, bytes, from, to, -1)
 
 --- `read`, giving up at `deadline`, a monotonic time in nanoseconds
 --- (`Turkey.Wait.now`) or -1 for none: `timedOut` if it came first. A read that
 --- timed out has transferred nothing, and leaves the descriptor as it was, so
 --- the caller may make it again as it would after `EAGAIN`.
 fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> Int =
-    readWithin(f, bytes, from, to, deadline, -1)
+	readWithin(f, bytes, from, to, deadline, -1)
 
 --- `readBy`, giving up also `within` nanoseconds after the read first waits,
 --- unless `within` is -1.
-fun readWithin(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int, within : Int) -> Int {
-    if !lock(f, readLock, readWaited) { return closed }
-    -- `at` is the deadline once `within` has started, which sets `pending`
-    -- to -1; `now` is the reading that started it, until a wait uses it.
-    var at = deadline
-    var pending = within
-    var now = -1
-    var n = 0
-    match f.readMode {
-        Unknown -> { f.readMode = inherited(f.number) }
-        CallAtOnce -> {}
-        WaitFirst -> {}
-    }
-    while True {
-        match f.readMode {
-            WaitFirst -> {
-                if pending >= 0 {
-                    now = Wait.now()
-                    at = sooner(at, now + pending)
-                    pending = -1
-                }
-                let w = park(f, False, at, now)
-                now = -1
-                if w == closed || w == timedOut {
-                    n = w
-                    break
-                }
-                if w != 0 { f.readMode = CallAtOnce }
-            }
-            Unknown -> {}
-            CallAtOnce -> {}
-        }
-        n = IO.read(f.number, bytes, from, to)
-        if n == -Sys.eintr { continue }
-        if n == -Sys.eagain() {
-            if pending >= 0 {
-                now = Wait.now()
-                at = sooner(at, now + pending)
-                pending = -1
-            }
-            let w = park(f, False, at, now)
-            now = -1
-            if w == 0 { continue }
-            n = w
-        }
-        break
-    }
-    unlock(f, readLock, readWaited)
-    n
+fun readWithin(
+	f : FD,
+	bytes : Array Byte,
+	from : Int,
+	to : Int,
+	deadline : Int,
+	within : Int,
+) -> Int {
+	if !lock(f, readLock, readWaited) { return closed }
+	-- `at` is the deadline once `within` has started, which sets `pending`
+	-- to -1; `now` is the reading that started it, until a wait uses it.
+	var at = deadline
+	var pending = within
+	var now = -1
+	var n = 0
+	match f.readMode {
+		Unknown    -> { f.readMode = inherited(f.number) }
+		CallAtOnce -> {}
+		WaitFirst  -> {}
+	}
+	while True {
+		match f.readMode {
+			WaitFirst -> {
+				if pending >= 0 {
+					now = Wait.now()
+					at = sooner(at, now + pending)
+					pending = -1
+				}
+				let w = park(f, False, at, now)
+				now = -1
+				if w == closed || w == timedOut {
+					n = w
+					break
+				}
+				if w != 0 { f.readMode = CallAtOnce }
+			}
+			Unknown    -> {}
+			CallAtOnce -> {}
+		}
+		n = IO.read(f.number, bytes, from, to)
+		if n == -Sys.eintr { continue }
+		if n == -Sys.eagain() {
+			if pending >= 0 {
+				now = Wait.now()
+				at = sooner(at, now + pending)
+				pending = -1
+			}
+			let w = park(f, False, at, now)
+			now = -1
+			if w == 0 { continue }
+			n = w
+		}
+		break
+	}
+	unlock(f, readLock, readWaited)
+	n
 }
 
 --- All of `bytes[from..to)`, at the descriptor's position: `to - from`, or the
 --- negated `errno` of the call that failed, after whatever went before it. One
 --- write at a time per `FD`, so the bytes go out contiguously.
 fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
-    if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1, -1)
-    unlock(f, writeLock, writeWaited)
-    n
+	if !lock(f, writeLock, writeWaited) { return closed }
+	let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to, True, -1, -1)
+	unlock(f, writeLock, writeWaited)
+	n
 }
 
 --- `write`, from a string's own bytes, counted in bytes.
 fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
-    if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1, -1)
-    unlock(f, writeLock, writeWaited)
-    n
+	if !lock(f, writeLock, writeWaited) { return closed }
+	let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to, True, -1, -1)
+	unlock(f, writeLock, writeWaited)
+	n
 }
 
 -- -- calls in place of a read or a write --------------------------------------------
@@ -257,45 +283,52 @@ fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
 --- `closed`, or `timedOut` if `deadline` came first. For a non-blocking
 --- descriptor only: nothing here looks at an inherited one's mode.
 fun readingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
-    if !lock(f, readLock, readWaited) { return closed }
-    let n = retried(f, call, False, deadline)
-    unlock(f, readLock, readWaited)
-    n
+	if !lock(f, readLock, readWaited) { return closed }
+	let n = retried(f, call, False, deadline)
+	unlock(f, readLock, readWaited)
+	n
 }
 
 --- `readingWith` under the write lock, waiting for writable: for a call that a
 --- write would wait with, such as a `connect` in progress.
 fun writingWith(f : FD, call : fun(Int) -> Int, deadline : Int) -> Int {
-    if !lock(f, writeLock, writeWaited) { return closed }
-    let n = retried(f, call, True, deadline)
-    unlock(f, writeLock, writeWaited)
-    n
+	if !lock(f, writeLock, writeWaited) { return closed }
+	let n = retried(f, call, True, deadline)
+	unlock(f, writeLock, writeWaited)
+	n
 }
 
 --- `write`, through `step(number, at)`, which writes from `at` up to `to` as
 --- `write` would and answers what it did: `send` with flags, say. Gives up at
 --- `deadline` with `timedOut`, after however much went out before it.
 fun writeWith(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int) -> Int =
-    writeWithin(f, step, from, to, deadline, -1)
+	writeWithin(f, step, from, to, deadline, -1)
 
 --- `writeWith`, giving up also `within` nanoseconds after the write first
 --- waits, unless `within` is -1.
-fun writeWithin(f : FD, step : fun(Int, Int) -> Int, from : Int, to : Int, deadline : Int, within : Int) -> Int {
-    if !lock(f, writeLock, writeWaited) { return closed }
-    let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline, within)
-    unlock(f, writeLock, writeWaited)
-    n
+fun writeWithin(
+	f : FD,
+	step : fun(Int, Int) -> Int,
+	from : Int,
+	to : Int,
+	deadline : Int,
+	within : Int,
+) -> Int {
+	if !lock(f, writeLock, writeWaited) { return closed }
+	let n = writeAll(f, fun(at) = step(f.number, at), from, to, True, deadline, within)
+	unlock(f, writeLock, writeWaited)
+	n
 }
 
 fun retried(f : FD, call : fun(Int) -> Int, writing : Bool, deadline : Int) -> Int {
-    while True {
-        let n = call(f.number)
-        if n == -Sys.eintr { continue }
-        if n != -Sys.eagain() { return n }
-        let w = park(f, writing, deadline, -1)
-        if w != 0 { return w }
-    }
-    0
+	while True {
+		let n = call(f.number)
+		if n == -Sys.eintr { continue }
+		if n != -Sys.eagain() { return n }
+		let w = park(f, writing, deadline, -1)
+		if w != 0 { return w }
+	}
+	0
 }
 
 -- -- positional -----------------------------------------------------------------------
@@ -304,36 +337,43 @@ fun retried(f : FD, call : fun(Int) -> Int, writing : Bool, deadline : Int) -> I
 --- file holds: how many, fewer than asked for only at end of file. The
 --- position is neither used nor moved, and no lock is taken.
 fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
-    if !acquire(f) { return closed }
-    var at = from
-    var result = 0
-    while at < to {
-        let n = IO.readAt(f.number, offset + (at - from), bytes, at, to)
-        if n == -Sys.eintr { continue }
-        if n == -Sys.eagain() {
-            Scheduler.yield()
-            continue
-        }
-        if n < 0 {
-            result = n
-            break
-        }
-        if n == 0 { break }
-        at = at + n
-    }
-    let _ = release(f)
-    if result < 0 { result } else { at - from }
+	if !acquire(f) { return closed }
+	var at = from
+	var result = 0
+	while at < to {
+		let n = IO.readAt(f.number, offset + (at - from), bytes, at, to)
+		if n == -Sys.eintr { continue }
+		if n == -Sys.eagain() {
+			Scheduler.yield()
+			continue
+		}
+		if n < 0 {
+			result = n
+			break
+		}
+		if n == 0 { break }
+		at = at + n
+	}
+	let _ = release(f)
+	if result < 0 { result } else { at - from }
 }
 
 --- All of `bytes[from..to)` at `offset` in the file, the position neither used
 --- nor moved, and no lock taken: `to - from`, or the negated `errno`. Two
 --- overlapping `writeAt`s may interleave, as `pwrite`s do.
 fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
-    if !acquire(f) { return closed }
-    let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
-                     from, to, False, -1, -1)
-    let _ = release(f)
-    n
+	if !acquire(f) { return closed }
+	let n = writeAll(
+		f,
+		fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
+		from,
+		to,
+		False,
+		-1,
+		-1,
+	)
+	let _ = release(f)
+	n
 }
 
 -- -- any other call ---------------------------------------------------------------------
@@ -343,10 +383,10 @@ fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> I
 --- such as `flock`, `fstat` or an `openat` relative to a directory. `closed` if
 --- `f` is.
 fun using(f : FD, call : fun(Int) -> Int) -> Int {
-    if !acquire(f) { return closed }
-    let r = call(f.number)
-    let _ = release(f)
-    r
+	if !acquire(f) { return closed }
+	let r = call(f.number)
+	let _ = release(f)
+	r
 }
 
 --- Take `flock`'s `operation` lock (`Sys.lockExclusive`, without `LOCK_NB`)
@@ -356,29 +396,29 @@ fun using(f : FD, call : fun(Int) -> Int) -> Int {
 ---
 --- The deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none.
 fun flock(f : FD, operation : Int, deadline : Int) -> Int {
-    if !acquire(f) { return closed }
-    -- On Darwin the wait parks the task (`Turkey.Wait.lockedUnless`). Linux
-    -- reports no release of a lock, so there the call waits in the kernel,
-    -- and the monitor hands its thread's permit on (`Turkey.Workers`); with a
-    -- deadline, the call runs on a helper task that the caller leaves at the
-    -- deadline (`flockLinux`).
-    let r = match Target.os {
-        Darwin -> flockParked(f, operation, deadline)
-        Linux -> flockLinux(f, operation, deadline)
-        Wasi -> Process.unsupported(0)
-    }
-    let _ = release(f)
-    r
+	if !acquire(f) { return closed }
+	-- On Darwin the wait parks the task (`Turkey.Wait.lockedUnless`). Linux
+	-- reports no release of a lock, so there the call waits in the kernel,
+	-- and the monitor hands its thread's permit on (`Turkey.Workers`); with a
+	-- deadline, the call runs on a helper task that the caller leaves at the
+	-- deadline (`flockLinux`).
+	let r = match Target.os {
+		Darwin -> flockParked(f, operation, deadline)
+		Linux  -> flockLinux(f, operation, deadline)
+		Wasi   -> Process.unsupported(0)
+	}
+	let _ = release(f)
+	r
 }
 
 -- Try the lock first, so that one nobody holds costs a single call and no
 -- trip through the scheduler's lock.
 fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
-    let r = IO.flock(f.number, operation | Sys.lockNonBlocking)
-    if r != -Sys.eagain() { return r }
-    let stop = fun() = Sync.load(f.state) & closedBit != 0
-    let w = Wait.lockedUnless(f.number, operation, deadline, stop)
-    if w == Wait.cancelled { closed } else { w }
+	let r = IO.flock(f.number, operation | Sys.lockNonBlocking)
+	if r != -Sys.eagain() { return r }
+	let stop = fun() = Sync.load(f.state) & closedBit != 0
+	let w = Wait.lockedUnless(f.number, operation, deadline, stop)
+	if w == Wait.cancelled { closed } else { w }
 }
 
 -- A call with a deadline waits on a helper task (`Turkey.Detach`), which
@@ -391,51 +431,51 @@ fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
 -- helper holds a reference of its own meanwhile, so that the number is not
 -- closed and reused under it.
 fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
-    let calls = flockCalls(f)
-    if !Semaphore.acquire(calls, deadline) { return timedOut }
-    if deadline < 0 {
-        let r = IO.flock(f.number, operation)
-        Semaphore.release(calls)
-        return r
-    }
-    -- Try first, so that a lock nobody holds costs no helper.
-    let tried = IO.flock(f.number, operation | Sys.lockNonBlocking)
-    if tried != -Sys.eagain() {
-        Semaphore.release(calls)
-        return tried
-    }
-    -- The helper's reference.
-    if !acquire(f) {
-        Semaphore.release(calls)
-        return closed
-    }
-    let n = f.number
-    -- Run by whichever side ends up with the result: the caller, or the
-    -- helper's cleanup.
-    let done = fun() {
-        let _ = release(f)
-        Semaphore.release(calls)
-    }
-    let late = fun(r) {
-        if r == 0 { let _ = IO.flock(n, Sys.lockUnlock) }
-        done()
-    }
-    match Detach.run(fun() = IO.flock(n, operation), late, deadline) {
-        Left(_) -> timedOut
-        Right(r) -> {
-            done()
-            -- Closed meanwhile: the lock goes when the descriptor does.
-            if r == 0 && Sync.load(f.state) & closedBit != 0 { closed } else { r }
-        }
-    }
+	let calls = flockCalls(f)
+	if !Semaphore.acquire(calls, deadline) { return timedOut }
+	if deadline < 0 {
+		let r = IO.flock(f.number, operation)
+		Semaphore.release(calls)
+		return r
+	}
+	-- Try first, so that a lock nobody holds costs no helper.
+	let tried = IO.flock(f.number, operation | Sys.lockNonBlocking)
+	if tried != -Sys.eagain() {
+		Semaphore.release(calls)
+		return tried
+	}
+	-- The helper's reference.
+	if !acquire(f) {
+		Semaphore.release(calls)
+		return closed
+	}
+	let n = f.number
+	-- Run by whichever side ends up with the result: the caller, or the
+	-- helper's cleanup.
+	let done = fun() {
+		let _ = release(f)
+		Semaphore.release(calls)
+	}
+	let late = fun(r) {
+		if r == 0 { let _ = IO.flock(n, Sys.lockUnlock) }
+		done()
+	}
+	match Detach.run(fun() = IO.flock(n, operation), late, deadline) {
+		Left(_) -> timedOut
+		Right(r) -> {
+			done()
+			-- Closed meanwhile: the lock goes when the descriptor does.
+			if r == 0 && Sync.load(f.state) & closedBit != 0 { closed } else { r }
+		}
+	}
 }
 
 fun flockCalls(f : FD) -> Semaphore.Semaphore {
-    Scheduler.lock()
-    let calls = if let Some(calls) = f.flocking { calls } else { Semaphore.new(1) }
-    f.flocking = Some(calls)
-    Scheduler.unlock()
-    calls
+	Scheduler.lock()
+	let calls = if let Some(calls) = f.flocking { calls } else { Semaphore.new(1) }
+	f.flocking = Some(calls)
+	Scheduler.unlock()
+	calls
 }
 
 -- -- closing --------------------------------------------------------------------------
@@ -449,41 +489,41 @@ fun flockCalls(f : FD) -> Semaphore.Semaphore {
 --- `close(2)` that an operation finishing later runs is not reported to
 --- anyone. 0 again for an `FD` already closed.
 fun close(f : FD) -> Int {
-    let p = f.state
-    while True {
-        let state = Sync.load(p)
-        if state & closedBit != 0 { return 0 }
-        let marked = (state | closedBit) + reference
-        if Sync.compareAndSet(p, state, marked) { break }
-    }
-    -- A waiter registers under the scheduler's lock after seeing the bit
-    -- clear, so one that registered before this takes the lock is in a list,
-    -- and one after sees the bit.
-    Scheduler.lock()
-    for c in f.readers { Scheduler.wake(c) }
-    for c in f.writers { Scheduler.wake(c) }
-    f.readers = []
-    f.writers = []
-    Scheduler.changed()
-    Scheduler.unlock()
-    -- A task parking on the descriptor either made its wait before
-    -- `Wait.cancel` takes the poller's lock, and is cancelled, or finds the
-    -- bit set under that lock (the `stop` of `Turkey.Wait.parkUnless`).
-    Wait.cancel(f.number)
-    release(f)
+	let p = f.state
+	while True {
+		let state = Sync.load(p)
+		if state & closedBit != 0 { return 0 }
+		let marked = (state | closedBit) + reference
+		if Sync.compareAndSet(p, state, marked) { break }
+	}
+	-- A waiter registers under the scheduler's lock after seeing the bit
+	-- clear, so one that registered before this takes the lock is in a list,
+	-- and one after sees the bit.
+	Scheduler.lock()
+	for c in f.readers { Scheduler.wake(c) }
+	for c in f.writers { Scheduler.wake(c) }
+	f.readers = []
+	f.writers = []
+	Scheduler.changed()
+	Scheduler.unlock()
+	-- A task parking on the descriptor either made its wait before
+	-- `Wait.cancel` takes the poller's lock, and is cancelled, or finds the
+	-- bit set under that lock (the `stop` of `Turkey.Wait.parkUnless`).
+	Wait.cancel(f.number)
+	release(f)
 }
 
 -- -- underneath -----------------------------------------------------------------------
 
 -- Take a reference, unless `f` is closed. Whether it was taken.
 fun acquire(f : FD) -> Bool {
-    let p = f.state
-    while True {
-        let state = Sync.load(p)
-        if state & closedBit != 0 { return False }
-        if Sync.compareAndSet(p, state, state + reference) { return True }
-    }
-    False
+	let p = f.state
+	while True {
+		let state = Sync.load(p)
+		if state & closedBit != 0 { return False }
+		if Sync.compareAndSet(p, state, state + reference) { return True }
+	}
+	False
 }
 
 -- Drop a reference, closing the descriptor if it was the last and `f` is
@@ -491,27 +531,28 @@ fun acquire(f : FD) -> Bool {
 -- sees the count reach 0 with the bit set, since no reference is taken once
 -- it is set and `close` holds one of its own while it sets it.
 fun release(f : FD) -> Int {
-    if Sync.addAndGet(f.state, -reference) == closedBit { closeNumber(f) } else { 0 }
+	if Sync.addAndGet(f.state, -reference) == closedBit { closeNumber(f) } else { 0 }
 }
 
 -- Take `bit`'s lock and a reference with it, waiting for the lock if it is
 -- held, unless `f` is or becomes closed. Whether it was taken.
 fun lock(f : FD, bit : Int, waited : Int) -> Bool {
-    let p = f.state
-    let state = Sync.load(p)
-    if state & (closedBit + bit) == 0 {
-        if Sync.compareAndSet(p, state, state + bit + reference) { return True }
-    }
-    -- Closed is final, so there is nothing to wait for. `tryLock` would
-    -- decide the same at once, but only after the wait has begun, and a
-    -- wasm32-wasi program, which has no coroutines to switch, traps at any
-    -- wait.
-    if state & closedBit != 0 { return False }
-    let claim = Claim { got = False }
-    Scheduler.waitUntil(fun() = tryLock(f, bit, waited, claim),
-                        fun(c) = if bit == readLock { Vec.push(f.readers, c) }
-                                 else { Vec.push(f.writers, c) })
-    claim.got
+	let p = f.state
+	let state = Sync.load(p)
+	if state & (closedBit + bit) == 0 {
+		if Sync.compareAndSet(p, state, state + bit + reference) { return True }
+	}
+	-- Closed is final, so there is nothing to wait for. `tryLock` would
+	-- decide the same at once, but only after the wait has begun, and a
+	-- wasm32-wasi program, which has no coroutines to switch, traps at any
+	-- wait.
+	if state & closedBit != 0 { return False }
+	let claim = Claim { got = False }
+	Scheduler.waitUntil(
+		fun() = tryLock(f, bit, waited, claim),
+		fun(c) = if bit == readLock { Vec.push(f.readers, c) } else { Vec.push(f.writers, c) },
+	)
+	claim.got
 }
 
 -- Whether a task that waited got the lock, or stopped waiting because `f` was
@@ -521,58 +562,58 @@ type Claim = Claim { var got : Bool }
 -- Under the scheduler's lock: take the lock if it is free, or mark it waited
 -- for. Whether to stop waiting -- because the lock was taken, or `f` closed.
 fun tryLock(f : FD, bit : Int, waited : Int, claim : Claim) -> Bool {
-    let p = f.state
-    while True {
-        let state = Sync.load(p)
-        if state & closedBit != 0 { return True }
-        if state & bit == 0 {
-            if Sync.compareAndSet(p, state, state + bit + reference) {
-                claim.got = True
-                return True
-            }
-        } else if state & waited != 0 {
-            return False
-        } else if Sync.compareAndSet(p, state, state + waited) {
-            return False
-        }
-    }
-    False
+	let p = f.state
+	while True {
+		let state = Sync.load(p)
+		if state & closedBit != 0 { return True }
+		if state & bit == 0 {
+			if Sync.compareAndSet(p, state, state + bit + reference) {
+				claim.got = True
+				return True
+			}
+		} else if state & waited != 0 {
+			return False
+		} else if Sync.compareAndSet(p, state, state + waited) {
+			return False
+		}
+	}
+	False
 }
 
 -- Release `bit`'s lock and its reference, waking the tasks waiting for the
 -- lock if any may be, and closing the descriptor if this was the last
 -- reference to a closed `f`.
 fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
-    let p = f.state
-    var before = 0
-    while True {
-        before = Sync.load(p)
-        let after = (before & Int.not(bit + waited)) - reference
-        if Sync.compareAndSet(p, before, after) { break }
-    }
-    if before & waited != 0 {
-        Scheduler.lock()
-        if bit == readLock {
-            for c in f.readers { Scheduler.wake(c) }
-            f.readers = []
-        } else {
-            for c in f.writers { Scheduler.wake(c) }
-            f.writers = []
-        }
-        Scheduler.changed()
-        Scheduler.unlock()
-    }
-    if (before & Int.not(bit + waited)) - reference == closedBit {
-        let _ = closeNumber(f)
-    }
+	let p = f.state
+	var before = 0
+	while True {
+		before = Sync.load(p)
+		let after = (before & Int.not(bit + waited)) - reference
+		if Sync.compareAndSet(p, before, after) { break }
+	}
+	if before & waited != 0 {
+		Scheduler.lock()
+		if bit == readLock {
+			for c in f.readers { Scheduler.wake(c) }
+			f.readers = []
+		} else {
+			for c in f.writers { Scheduler.wake(c) }
+			f.writers = []
+		}
+		Scheduler.changed()
+		Scheduler.unlock()
+	}
+	if (before & Int.not(bit + waited)) - reference == closedBit {
+		let _ = closeNumber(f)
+	}
 }
 
 -- Close the number, for the one that dropped the last reference: after the
 -- poller has dropped what it holds for it, since no wait can start now and
 -- none is parked, a parked task holding a reference.
 fun closeNumber(f : FD) -> Int {
-    if f.polled { Wait.forget(f.number) }
-    IO.close(f.number)
+	if f.polled { Wait.forget(f.number) }
+	IO.close(f.number)
 }
 
 -- `write` until all of `from..to` is taken: `step(at)` writes from `at` and
@@ -581,36 +622,43 @@ fun closeNumber(f : FD) -> Int {
 -- `within` from the first wait (as for `writeWithin`), if `sequential`, and
 -- yields otherwise; 0 from a non-empty write, which would otherwise loop, is
 -- reported as `EIO`.
-fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : Bool,
-             deadline : Int, within : Int) -> Int {
-    var at = from
-    -- As in `readWithin`.
-    var by = deadline
-    var pending = within
-    var now = -1
-    while at < to {
-        let n = step(at)
-        if n == -Sys.eintr { continue }
-        if n == -Sys.eagain() {
-            if !sequential {
-                Scheduler.yield()
-                continue
-            }
-            if pending >= 0 {
-                now = Wait.now()
-                by = sooner(by, now + pending)
-                pending = -1
-            }
-            let w = park(f, True, by, now)
-            now = -1
-            if w == 0 { continue }
-            return w
-        }
-        if n < 0 { return n }
-        if n == 0 { return -Sys.eio }
-        at = at + n
-    }
-    to - from
+fun writeAll(
+	f : FD,
+	step : fun(Int) -> Int,
+	from : Int,
+	to : Int,
+	sequential : Bool,
+	deadline : Int,
+	within : Int,
+) -> Int {
+	var at = from
+	-- As in `readWithin`.
+	var by = deadline
+	var pending = within
+	var now = -1
+	while at < to {
+		let n = step(at)
+		if n == -Sys.eintr { continue }
+		if n == -Sys.eagain() {
+			if !sequential {
+				Scheduler.yield()
+				continue
+			}
+			if pending >= 0 {
+				now = Wait.now()
+				by = sooner(by, now + pending)
+				pending = -1
+			}
+			let w = park(f, True, by, now)
+			now = -1
+			if w == 0 { continue }
+			return w
+		}
+		if n < 0 { return n }
+		if n == 0 { return -Sys.eio }
+		at = at + n
+	}
+	to - from
 }
 
 -- The sooner of two deadlines, either -1 for none.
@@ -622,57 +670,60 @@ fun sooner(a : Int, b : Int) -> Int = if a < 0 || (b >= 0 && b < a) { b } else {
 -- wait the poller could not make. `now` is a reading of `Turkey.Wait.now`
 -- taken just before, to judge the deadline by, or -1 to take one.
 fun park(f : FD, writing : Bool, deadline : Int, now : Int) -> Int {
-    f.polled = True
-    let stop = fun() = Sync.load(f.state) & closedBit != 0
-    let blocking = match f.readMode {
-        WaitFirst -> !writing
-        Unknown -> False
-        CallAtOnce -> False
-    }
-    let w = if blocking {
-        Wait.readableBlockingUnless(f.number, deadline, stop)
-    } else if let Some(s) = source(f) {
-        Wait.onUnlessAsOf(s, writing, deadline, now, stop)
-    } else {
-        let w = if now < 0 {
-            if writing { Wait.writableUnless(f.number, deadline, stop) }
-            else { Wait.readableUnless(f.number, deadline, stop) }
-        } else if writing {
-            Wait.writableUnlessAsOf(f.number, deadline, now, stop)
-        } else {
-            Wait.readableUnlessAsOf(f.number, deadline, now, stop)
-        }
-        learnSource(f)
-        w
-    }
-    if w == Wait.cancelled { closed } else { w }
+	f.polled = True
+	let stop = fun() = Sync.load(f.state) & closedBit != 0
+	let blocking = match f.readMode {
+		WaitFirst  -> !writing
+		Unknown    -> False
+		CallAtOnce -> False
+	}
+	let w = if blocking {
+		Wait.readableBlockingUnless(f.number, deadline, stop)
+	} else if let Some(s) = source(f) {
+		Wait.onUnlessAsOf(s, writing, deadline, now, stop)
+	} else {
+		let w = if now < 0 {
+			if writing {
+				Wait.writableUnless(f.number, deadline, stop)
+			} else {
+				Wait.readableUnless(f.number, deadline, stop)
+			}
+		} else if writing {
+			Wait.writableUnlessAsOf(f.number, deadline, now, stop)
+		} else {
+			Wait.readableUnlessAsOf(f.number, deadline, now, stop)
+		}
+		learnSource(f)
+		w
+	}
+	if w == Wait.cancelled { closed } else { w }
 }
 
 -- `f`'s source, if it has been published (`sourced`).
 fun source(f : FD) -> Option Poll.Source =
-    if Sync.load(f.sourced) == 2 { f.source } else { None }
+	if Sync.load(f.sourced) == 2 { f.source } else { None }
 
 -- After a wait the poller made, publish `f`'s source, unless another
 -- operation is publishing it. A wait it could not make leaves none.
 fun learnSource(f : FD) -> Unit {
-    if !Sync.compareAndSet(f.sourced, 0, 1) { return }
-    let s = Wait.sourceOf(f.number)
-    f.source = s
-    Sync.store(f.sourced, if Option.isSome(s) { 2 } else { 0 })
+	if !Sync.compareAndSet(f.sourced, 0, 1) { return }
+	let s = Wait.sourceOf(f.number)
+	f.source = s
+	Sync.store(f.sourced, if Option.isSome(s) { 2 } else { 0 })
 }
 
 -- How `read` treats a descriptor it has not looked at: `WaitFirst` for one in
 -- blocking mode that is a FIFO, socket or character device, `CallAtOnce`
 -- otherwise, including when it cannot tell.
 fun inherited(number : Int) -> ReadMode {
-    let flags = IO.fcntl(number, Sys.getStatusFlags)
-    if flags < 0 || flags & Sys.nonBlocking() != 0 { return CallAtOnce }
-    let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
-    if IO.fstat(number, stat) < 0 { return CallAtOnce }
-    let kind = Sys.fileType(IO.statMode(stat))
-    if kind == Sys.fifo || kind == Sys.socket || kind == Sys.characterDevice {
-        WaitFirst
-    } else {
-        CallAtOnce
-    }
+	let flags = IO.fcntl(number, Sys.getStatusFlags)
+	if flags < 0 || flags & Sys.nonBlocking() != 0 { return CallAtOnce }
+	let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
+	if IO.fstat(number, stat) < 0 { return CallAtOnce }
+	let kind = Sys.fileType(IO.statMode(stat))
+	if kind == Sys.fifo || kind == Sys.socket || kind == Sys.characterDevice {
+		WaitFirst
+	} else {
+		CallAtOnce
+	}
 }

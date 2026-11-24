@@ -1036,9 +1036,14 @@ compiler knows: `OS` has the constructors `Darwin`, `Linux` and `Wasi`, and
 `Arch` the constructors `Arm64` and `Wasm32`. The compiler's `--target` option
 chooses among them. Its value is spelled `arch-os`: `arm64-darwin`,
 `arm64-linux` or `wasm32-wasi`, and the default is the platform the compiler
-itself runs on. The two arm64 targets produce code; for `wasm32-wasi` the
-compiler checks the program and stops with an error saying the backend is not
-implemented yet.
+itself runs on. The two arm64 targets produce an executable. `wasm32-wasi`
+produces a WebAssembly module, `main.wasm` for `main.gob`, which a WASI host
+such as `wasmtime run main.wasm` runs. The wasm backend does not compile every
+operation yet: a function that uses one it cannot, such as a coroutine's
+switch, is built as a trap, and the build warns how many there are. A
+`wasm32-wasi` program that allocates enough memory to need garbage collection
+can compute wrong results or trap, and a panic's report on this target has no
+`at` lines.
 
 ```sh
 turkey build --target arm64-linux main.gob

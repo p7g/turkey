@@ -481,9 +481,9 @@ def test_a_block_declares_something():
 # no C library, so the converse holds there.
 
 
-def _build(entry: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def _build(entry: Path, *args: str, out: str = os.devnull) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        toolchain.command(bootc.binary(), "build", *args, "-o", os.devnull, entry.name),
+        toolchain.command(bootc.binary(), "build", *args, "-o", out, entry.name),
         cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True, text=True)
 
@@ -559,9 +559,10 @@ def test_a_wasm_program_cannot_call_the_c_library(probe):
     assert "'getenv', called by" in result.stderr, result.stderr
 
 
-def test_a_wasm_program_may_call_a_wasm_import(probe):
+def test_a_wasm_program_may_call_a_wasm_import(probe, tmp_path):
+    """The import is named in the module, with the module it comes from."""
     entry = program(probe(WASM_CALL).replace("fun main() { }", "fun main() { print(P.now()) }"))
-    result = _build(entry, "--target", "wasm32-wasi")
-    assert result.stderr.endswith(
-        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
-        "compiles as far as the low IR\n"), result.stderr
+    out = tmp_path / "out.wasm"
+    result = _build(entry, "--target", "wasm32-wasi", out=str(out))
+    assert result.returncode == 0, result.stderr
+    assert b"\x0cprobe_module\x09probe_now" in out.read_bytes()

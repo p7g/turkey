@@ -83,6 +83,7 @@ import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
 import Turkey.Position as Position
+import Turkey.Wasm.Program as WasmProgram
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Polls as Polls
@@ -444,7 +445,10 @@ fun openSink(output : Option String, format : Format, paths : Vec String,
                         die("cannot name the executable after '" + base + "', which "
                             + "has no extension to drop; name it with -o PATH")
                     }
-                    opened(name, "./" + name, format)
+                    -- A wasm module is not run by name, and takes the
+                    -- extension engines and tools look for.
+                    let file = if target.arch == "Wasm32" { name + ".wasm" } else { name }
+                    opened(file, "./" + file, format)
                 }
                 Assembly -> opened(name + ".s", "./" + name + ".s", format)
             }
@@ -778,11 +782,52 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     match target.arch {
         "Arm64" -> compileArm64(b, path, wants, through, listing, sink, checked, entry,
                                 module_, files)
-        "Wasm32" -> Diag.fail(Diag.whole("error", "the wasm32 backend is not implemented yet; "
-                                         + "'" + target.spelling + "' compiles as far as the low IR"),
-                              path)
+        "Wasm32" -> compileWasm(b, path, wants, through, sink, checked, main, module_)
         _ -> die("internal error: no backend for the architecture '" + target.arch + "'")
     }
+}
+
+-- Selection and the module writer for a wasm target, from the low IR
+-- `module_` that `compile` lowered the program to, whose `main` is the
+-- function `main`. `wants` and `through` are `compileArm64`'s.
+fun compileWasm(b : String.Builder, path : String, wants : fun(String) -> Bool,
+                through : fun(String) -> Bool, sink : Option Sink, checked : Checked,
+                main : String, module_ : SsaLower.Module) -> Unit {
+    if let Some(Sink { format = Assembly, .. }) = sink {
+        die("'" + target.spelling + "' has no assembly to write; build without -S")
+    }
+    let started = Stopwatch.start()
+    let program = WasmProgram.build(module_, main, foreignLibraries(checked.decls))
+    let _ = lap("wasm", started)
+    if wants("select") {
+        String.push(b, "; === " + path + "\n")
+        for u in program.refused { String.push(b, "-- refused " + u.name + ": " + u.what + "\n") }
+        String.push(b, "-- selected " + Int.toString(program.selected) + " of "
+                       + Int.toString(len(module_.functions)) + " functions\n")
+        write(String.drain(b))
+    }
+    if through("select") { return }
+    -- The functions selection stopped in trap if they are called, and the
+    -- runtime has many no small program reaches, so they are counted rather
+    -- than refused.
+    if len(program.refused) > 0 {
+        toStderr(path + ": warning: " + Int.toString(len(program.refused))
+                 + " functions use operations the wasm32 backend does not compile yet, "
+                 + "and trap if they are called; '--dump select' lists them\n")
+    }
+    if let Some(Sink { to, .. }) = sink { sendBytes(to, Vec.toArray(program.bytes)) }
+}
+
+-- The wasm module each import a `foreign "module" { ... }` block declares
+-- comes from, by symbol.
+fun foreignLibraries(decls : Decls.DeclTable) -> Map String String {
+    let out = Map.new()
+    for (_, info) in Map.entries(decls.foreigns) {
+        if let Some(ForeignLibrary { name, kind = WasmImports, .. }) = info.library {
+            Map.put(out, info.symbol, name)
+        }
+    }
+    out
 }
 
 -- Selection, register allocation, emission and the executable writer for an

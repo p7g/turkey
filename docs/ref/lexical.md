@@ -18,6 +18,10 @@ A line comment starts with `--` and runs to the end of the line. A block
 comment starts with `{-` and ends with `-}`, and block comments nest, so one
 can comment out code that already contains one.
 
+A line comment that starts with `--@` is a directive to `turkey`, never prose,
+and one that is malformed is an error
+([Expecting a finding](README.md#expecting-a-finding)).
+
 <!-- run -->
 ```kotlin
 -- A line comment.
@@ -44,6 +48,8 @@ after it:
 * a class's method or associated type;
 * a constructor or a record field.
 
+Directives (`--@`) on lines of their own between a run and that line are
+passed over, so a run above a directive documents the declaration below it.
 The first run before a module's first declaration that is not directly above
 that declaration documents the module itself. `turkey doc` reads doc comments;
 ordinary comments, `----` rules and block comments are never documentation.

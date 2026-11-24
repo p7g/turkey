@@ -163,6 +163,94 @@ left.
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
+
+### Expecting a finding
+
+```ebnf
+DIRECTIVE ::= "--@" NAME "(" ARGUMENTS ")" TEXT
+EXPECT    ::= "--@expect(" CHECK ("," CHECK)* ")" TEXT
+```
+
+A line comment that begins `--@` is a *directive*: an instruction to `turkey`,
+not prose. The directive's name follows `--@` directly, and `(` follows the
+name directly. The arguments run to the first `)`, and the rest of the line is
+free text, the reason for the directive. A comment that begins `--@` and is
+not a well-formed directive is an error, in any module, and so is a name that
+is not a directive's. The one directive is `expect`.
+
+`--@expect(NAME, ...)` names one or more checks, separated by commas, with
+spaces allowed around each. It says that each check reports a finding in the
+code the directive covers, and those findings are neither printed nor fixed
+by `--fix`:
+
+* On a line of its own, a directive covers the whole of the statement,
+  declaration or `match` arm that begins next, every line of it included. A
+  doc comment can be directly above the directive and still document the
+  declaration below it ([Doc comments](lexical.md#doc-comments)).
+* After code, a directive covers the findings that begin on its line.
+
+Each name must be a check's, and may be named once. A check that the level
+flags set to `allow` still runs where an `expect` names it.
+
+<!-- run -->
+```kotlin
+fun lookup(key : Int, table : Map Int String) -> String = Map.getOr(table, key, "?")
+
+--@expect(ambiguous-underscore) each key becomes a function of the key to look up
+fun lookups(keys : Vec Int, table : Map Int String) -> Vec (fun(Int) -> String) =
+    Vec.map(keys, fun(_) = lookup(_, table))
+
+fun visit(done : Bool) -> Unit {
+    if done { return () } --@expect(empty-return-value) the value matches the signature
+    print("visiting")
+}
+
+fun main() {
+    let table = Map.new()
+    Map.put(table, 1, "one")
+    for f in lookups([7], table) { print(f(1)) }
+    visit(False)
+}
+```
+
+```text
+one
+visiting
+```
+
+An expectation that does not hold is a finding too. For each name that has no
+finding of its check in what the directive covers, the check
+`unfulfilled-expect` warns at the name, so a directive does not outlive the
+code it excused. Where two directives cover one finding and both name its
+check, only the inner one is met by it. An `expect` cannot name
+`unfulfilled-expect`.
+
+<!-- run -->
+```kotlin
+--@expect(unreachable-code) the early return for debugging was here
+fun main() {
+    print("all reachable")
+}
+```
+
+```text
+all reachable
+```
+
+<!-- stderr -->
+```text
+Main.gob:1:11: warning: 'unreachable-code' finds nothing in what this expect covers; remove it from the expect [unfulfilled-expect]
+1 warning
+```
+
+<!-- error: a directive's name must follow '--@' directly; write '--@expect' -->
+```kotlin
+--@ expect(unreachable-code)
+fun main() {
+    print("never compiled")
+}
+```
 
 ## For maintainers
 

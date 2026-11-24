@@ -1,7 +1,7 @@
 export (
     Level(..), File, Tier(..), Check(..), Finding(..), Fix(..), Edit(..), Reported(..),
     file, finding, named, setLevel, denyWarnings, levelOf,
-    begin, claim, owned, isOwn, runSyntactic, runTyped,
+    begin, claim, owned, isOwn, runSyntactic, runTyped, unexpected,
     report, countLine, chosen, rewrite, checkingFixes, checkOverlaps,
     textOf, charAt, nodes,
 )
@@ -18,13 +18,21 @@ export (
 --- Checks run on *own code* only: the modules the driver `claim`s, which are
 --- the ones resolved from the root being built. Nothing is reported at a
 --- place in any other module.
+---
+--- An `--@expect(NAME, ...)` directive (`Turkey.Directives`) in own code
+--- removes the findings of the checks it names from what it covers, and is
+--- itself reported, by the check whose tier is `Expectations`, for each name
+--- that removed nothing. On a line of its own it covers the whole of the
+--- statement, declaration or `match` arm that begins next; after code, it
+--- covers the findings that begin on its line.
 
 import Data.Set as Set
 import System.Env as Env
 import System.File as File
 import System.IO as IO
-import Turkey.Ast (Program(..), Decl(..), Child(..), children)
+import Turkey.Ast (Program(..), Decl(..), Child(..), Stmt(..), FunDecl(..), Arm(..), children)
 import Turkey.Diag as Diag
+import Turkey.Directives (Directive(..), Kind(..), Arg(..))
 import Turkey.Source (Span(..))
 import Turkey.Source as Source
 import Turkey.Typed (TypeTable)
@@ -54,9 +62,14 @@ fun file(path : String, text : String, program : Program) -> File =
 --- `AfterChecking` runs once the whole program has passed every stage that
 --- can reject it, on the desugared tree, with the type of each node. Spans
 --- survive desugaring, so a finding still points at what the author wrote.
+---
+--- `Expectations` runs last, in `runTyped`, on every other check's findings,
+--- and reports each name of an `expect` directive that removed none of them.
+--- An `expect` cannot name a check of this tier.
 type Tier
     = BeforeDesugar(fun(File) -> Vec Finding)
     | AfterChecking(fun(File, TypeTable) -> Vec Finding)
+    | Expectations
 
 --- A check: its name, in kebab-case, which is what the level flags take and
 --- what a finding is printed with; its level unless a flag says otherwise;
@@ -129,17 +142,99 @@ var ownPaths : Set.Set String = Set.new()
 -- own findings, since a program the front end then rejects reports none.
 var held : Vec Reported = []
 
+-- The `expect` directives of the modules claimed, in the order claimed.
+var expectations : Vec Expectation = []
+
+-- One `expect` directive: the checks it names, the text whose findings of
+-- theirs it removes, and the names that have removed one.
+type Expectation = Expectation { names : Vec Arg, scope : Span, met : Set.Set String }
+
 --- Starts a run: forgets every module claimed and every finding held.
 fun begin() -> Unit {
     own = []
     ownPaths = Set.new()
     held = []
+    expectations = []
 }
 
---- Makes `f` own code for this run.
-fun claim(f : File) -> Unit {
+--- Makes `f` own code for this run, with `directives`, the directives in it.
+--- Call it before anything rewrites `f.program`, since what an `expect`
+--- covers is found in the tree as written.
+fun claim(f : File, directives : Vec Directive) -> Unit {
     Vec.push(own, f)
     Set.add(ownPaths, f.path)
+    if len(directives) == 0 { return }
+    let spans = nodeSpans(f)
+    for d in directives {
+        let Expect(names) = d.kind
+        Vec.push(expectations, Expectation { names = names, scope = scopeOf(d, spans), met = Set.new() })
+    }
+}
+
+-- What `d` covers. After code, that is its line. On a line of its own, it is
+-- the first statement, declaration or arm in `spans` that begins on a later
+-- line, the outermost of those that begin there, or nothing if none does.
+fun scopeOf(d : Directive, spans : Vec Span) -> Span {
+    let at = d.span
+    if d.trailing {
+        return Span { line = at.line, col = 1, endLine = at.line + 1, endCol = 1, file = at.file,
+                      inlined = None }
+    }
+    var next = None
+    for s in spans {
+        if s.line <= at.line { continue }
+        next = match next {
+            Some(n) -> if inside(n, s) { Some(s) } else { Some(n) }
+            None -> Some(s)
+        }
+    }
+    Option.unwrapOr(next, Source.emptyAt(at))
+}
+
+-- The span of every declaration, statement, method and `match` arm the
+-- author wrote in `f`.
+fun nodeSpans(f : File) -> Vec Span {
+    let out = []
+    let add = fun(s : Span) {
+        if !Source.isGenerated(s) && !Source.isEmpty(s) { Vec.push(out, s) }
+    }
+    for d in f.program.decls {
+        match d {
+            DStmt(s) -> add(s.span)
+            DType(t) -> add(t.span)
+            DClass(c) -> add(c.span)
+            DInstance(i) -> add(i.span)
+            DForeign(x) -> add(x.span)
+            DInfix(op) -> add(op.span)
+        }
+    }
+    nodes(f, fun(c) {
+        match c {
+            ChStmt(s) -> add(s.span)
+            ChFun(m) -> add(m.span)
+            ChArm(a) -> add(a.span)
+            ChExpr(_) -> {}
+        }
+        True
+    })
+    out
+}
+
+--- Returns why an `expect` directive cannot name `name`, given the checks of
+--- `registry`, or `None` if it can.
+fun unexpected(registry : Array Check, name : String) -> Option String = match named(registry, name) {
+    Some(Check { tier = Expectations, .. }) -> Some("an expect cannot name '" + name + "'; remove it")
+    Some(_) -> None
+    None -> {
+        let known = []
+        for c in registry {
+            match c.tier {
+                Expectations -> {}
+                _ -> Vec.push(known, "'" + c.name + "'")
+            }
+        }
+        Some("unknown check '" + name + "'; the checks are " + String.join(known, ", "))
+    }
 }
 
 --- Returns every module claimed since `begin`.
@@ -159,25 +254,77 @@ fun runSyntactic(registry : Array Check, f : File) -> Unit {
 }
 
 --- Runs every `AfterChecking` check of `registry` on every module claimed,
---- and returns what they found with what the syntactic checks held.
+--- and returns what they found with what the syntactic checks held, less
+--- what `expect` directives remove, and with the `Expectations` check's
+--- findings.
 fun runTyped(registry : Array Check, types : TypeTable) -> Vec Reported {
-    let out = held
+    let found = held
     held = []
     for f in own {
         for c in registry {
             if let AfterChecking(run) = c.tier {
-                if runs(c) { collect(c, run(f, types), out) }
+                if runs(c) { collect(c, run(f, types), found) }
             }
         }
+    }
+    let out = Vec.filter(found, fun(r) = !removed(r))
+    for c in registry {
+        if let Expectations = c.tier { unmet(c, out) }
     }
     out
 }
 
+-- Whether an `expect` removes `r`, and if one does, marks its name met. Of
+-- the `expect`s that cover `r` and name its check, the innermost removes it:
+-- the one whose text begins last, and of those, ends first.
+fun removed(r : Reported) -> Bool {
+    let at = r.finding.span
+    var by = None
+    for e in expectations {
+        if e.scope.file != at.file || !Iter.any(e.names, _.text == r.check) { continue }
+        if Source.before(at.line, at.col, e.scope.line, e.scope.col)
+           || !Source.before(at.line, at.col, e.scope.endLine, e.scope.endCol) { continue }
+        by = match by {
+            None -> Some(e)
+            Some(b) -> if inside(e.scope, b.scope) { Some(e) } else { Some(b) }
+        }
+    }
+    match by {
+        Some(e) -> {
+            Set.add(e.met, r.check)
+            True
+        }
+        None -> False
+    }
+}
+
+-- Whether `a` begins after `b`, or where `b` does and ends first: of two
+-- spans that cover one place, whether `a` is the inner.
+fun inside(a : Span, b : Span) -> Bool =
+    Source.before(b.line, b.col, a.line, a.col)
+        || (a.line == b.line && a.col == b.col && Source.before(a.endLine, a.endCol, b.endLine, b.endCol))
+
+-- Adds a finding of `c`, the `Expectations` check, to `out` for each name
+-- of each `expect` that removed nothing.
+fun unmet(c : Check, out : Vec Reported) -> Unit {
+    let level = levelOf(c)
+    if let Allow = level { return }
+    for e in expectations {
+        for name in e.names {
+            if Set.contains(e.met, name.text) { continue }
+            Vec.push(out, Reported { check = c.name, level = level, finding = finding(name.span,
+                "'" + name.text + "' finds nothing in what this expect covers; remove it from "
+                + "the expect") })
+        }
+    }
+}
+
 -- Whether `c` is run at all. A check at `Allow` is not, except when the
--- suite checks fixes, so that its fixes are checked too; its findings are
--- then kept at `Allow`, which reports and fixes nothing.
+-- suite checks fixes, so that its fixes are checked too, or when an `expect`
+-- names it, so that the `expect` is met. Its findings are then kept at
+-- `Allow`, which reports and fixes nothing.
 fun runs(c : Check) -> Bool = match levelOf(c) {
-    Allow -> checkingFixes()
+    Allow -> checkingFixes() || Iter.any(expectations, fun(e) = Iter.any(e.names, _.text == c.name))
     _ -> True
 }
 

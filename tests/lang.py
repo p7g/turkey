@@ -222,7 +222,7 @@ TARGETS = ("host", "wasm32-wasi")
 # the reference says the target gives it, so it is not compared with the host.
 # Only the whole line with that count is removed, as
 # `tests/harness/Toolchain.gob` removes it: a fifth refused function stays
-# visible. Once wasm has coroutines the count shrinks.
+# visible.
 _TRAP_COUNT = ("{}: warning: 4 functions use operations the wasm32 backend "
                "does not compile yet, and trap if they are called; "
                "'--dump select' lists them\n")

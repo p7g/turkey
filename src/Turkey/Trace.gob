@@ -1,0 +1,183 @@
+export (Traced(..), Writer(..), layout)
+
+--- The trace table a panic's report is printed from (`Turkey.Entry`), as the
+--- fields a backend writes. Each backend says what names a call: on arm64 the
+--- label at its return address, which only the assembler places; on wasm a
+--- number the selection gives it.
+
+import Turkey.Position as Position
+import Turkey.Stream (fits32)
+
+--- One function, for the trace table: its name, its own position, the calls
+--- inlined into it (`Position.Site`), and each of its calls that has a
+--- position, as the key that names the call and the position.
+type Traced k = Traced {
+    name  : String,
+    at    : Int,
+    sites : Vec Position.Site,
+    calls : Vec (k, Int),
+}
+
+--- Where the table's fields go: a four-byte field, the four-byte field that
+--- names a call, a string and its NUL, and `n` bytes of zeros.
+type Writer k = Writer {
+    word : fun(Int) -> Unit,
+    call : fun(k) -> Unit,
+    text : fun(String) -> Unit,
+    pad  : fun(Int) -> Unit,
+}
+
+--- Writes the program's trace table to `out`: for each call of `functions`,
+--- the key that names it, with the function it is in and its source position.
+--- `display` gives the name a function is printed by, and `fileNames` each
+--- file's, in `Position.Files` order. Raises an internal error for a count or
+--- an offset that does not fit in four bytes.
+fun layout(fileNames : Array String, functions : Vec (Traced k),
+           display : fun(String) -> String, out : Writer k) -> Unit {
+    -- A walk of the stack only ever asks about a call, so only calls have
+    -- rows. The table is read when a panic is reported and never otherwise,
+    -- so it is laid out to be small and scanned, not searched: nothing is
+    -- sorted and nothing is built at startup.
+    --
+    -- Every field is four bytes, and none is an address, so the table is
+    -- read-only and the loader never writes it:
+    --
+    --     function count, file count, the strings' size in bytes
+    --     per file          its name's offset in the strings
+    --     the strings       each NUL-terminated, padded to four bytes
+    --     per function      its name's offset, its call count, its site count
+    --       per call        the key that names the call;
+    --                       the line, and the column from bit 20;
+    --                       the file's number, and the site's from bit 14
+    --       per site        the inlined function's name's offset, then the
+    --                       position of the call it was inlined at, as a
+    --                       call's
+    --
+    -- A file's number is its index among the files, from 1, and a site's is
+    -- its index among the function's sites, from 1; site 0 is the function
+    -- itself.
+    --
+    -- A lambda written in code that was inlined is a function of its own
+    -- whose every position is in the site of that inlined call: the site is
+    -- where the lambda's text is, not a call the lambda was reached through.
+    -- Such a function's own site is its site 0 in the table, the sites around
+    -- it are left out, and it is named after the function the site inlined
+    -- (`ownName`), which is the one its text is in.
+    let strings = []
+    let offsets = Map.new()
+    var size = 0
+    let intern = fun(text : String) -> Int = match Map.get(offsets, text) {
+        Some(at) -> at
+        None -> {
+            let at = size
+            Map.put(offsets, text, at)
+            Vec.push(strings, text)
+            size = size + byteLength(text) + 1
+            at
+        }
+    }
+    let field = fun(n : Int, what : String) {
+        if !fits32(n) {
+            error("internal error: a table's " + what + " " + Int.toString(n)
+                  + " does not fit in four bytes")
+        }
+        out.word(n)
+    }
+    let fileOffsets = []
+    for name in fileNames { Vec.push(fileOffsets, intern(name)) }
+    -- Each function that has a call, with its sites renumbered.
+    let kept = []
+    for f in functions {
+        if len(f.calls) > 0 {
+            let numbers = sitesUsed(f)
+            let _ = intern(ownName(f, display))
+            for var k = 0; k < len(f.sites); k = k + 1 {
+                if numbers[k + 1] != 0 { let _ = intern(display(f.sites[k].callee)) }
+            }
+            Vec.push(kept, (f, numbers))
+        }
+    }
+    let padding = (4 - size % 4) % 4
+    field(len(kept), "function count")
+    field(len(fileOffsets), "file count")
+    field(size + padding, "string size")
+    for at in fileOffsets { field(at, "file name") }
+    for text in strings { out.text(text) }
+    if padding > 0 { out.pad(padding) }
+    for (f, numbers) in kept {
+        var sites = 0
+        for n in numbers { if n > sites { sites = n } }
+        field(intern(ownName(f, display)), "function name")
+        field(len(f.calls), "call count")
+        field(sites, "site count")
+        for (key, at) in f.calls {
+            out.call(key)
+            position(out, at, numbers)
+        }
+        for var k = 0; k < len(f.sites); k = k + 1 {
+            if numbers[k + 1] != 0 {
+                field(intern(display(f.sites[k].callee)), "site name")
+                position(out, f.sites[k].call, numbers)
+            }
+        }
+    }
+}
+
+fun byteLength(text : String) -> Int {
+    var n = 0
+    for _ in String.bytes(text) { n = n + 1 }
+    n
+}
+
+-- For each of `f`'s sites by its number, the number the trace table gives
+-- it, or 0 for one the table leaves out: a site no call is in, directly or
+-- through the sites inlined into it. Most are left out, since a function's
+-- sites are those of all its code and the table has only its calls. The
+-- sites kept are numbered from 1 in their own order, so a site's number
+-- stays above its parent's. Index 0 is the function itself, and stays 0;
+-- so does the site `f` itself is in, where it has one, which ends the walk
+-- outwards from each call.
+fun sitesUsed(f : Traced k) -> Array Int {
+    let numbers = Array.filled(len(f.sites) + 1, 0)
+    let own = Position.site(f.at)
+    for (_, at) in f.calls {
+        var site = Position.site(at)
+        while site != 0 && site != own && numbers[site] == 0 {
+            numbers[site] = 1
+            site = Position.site(f.sites[site - 1].call)
+        }
+    }
+    var next = 0
+    for var k = 1; k < len(numbers); k = k + 1 {
+        if numbers[k] != 0 {
+            next = next + 1
+            numbers[k] = next
+        }
+    }
+    numbers
+}
+
+-- The name the table gives `f`: its own, or for a lambda written in inlined
+-- code, the name of the function that code is from and `.<lambda>`.
+fun ownName(f : Traced k, display : fun(String) -> String) -> String {
+    let own = Position.site(f.at)
+    let name = display(f.name)
+    if own == 0 { return name }
+    match String.rsplitOnce(name, ".<") {
+        Some((_, made)) -> {
+            let kind = String.builder()
+            for c in String.codePoints(made) {
+                if !Char.isDigit(c) { String.push(kind, Char.toString(c)) }
+            }
+            display(f.sites[own - 1].callee) + ".<" + String.build(kind)
+        }
+        None -> name
+    }
+}
+
+-- A position as the trace table's two fields, with its site as `numbers`
+-- renumbers it.
+fun position(out : Writer k, at : Int, numbers : Array Int) -> Unit {
+    out.word(Position.line(at) | Position.column(at) << 20)
+    out.word(Position.file(at) | numbers[Position.site(at)] << 14)
+}

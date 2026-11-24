@@ -1,12 +1,17 @@
-export (unitSpelling)
+export (unitSpelling, detachedDocComment)
 
 --- Checks on how code is spelled where two spellings mean one thing, and the
 --- one written says something its author did not mean.
 
+import Data.Set as Set
 import Turkey.Ast (Expr(..), ExprKind(..), Stmt(..), StmtKind(..), Arm(..), Child(..), FunDecl(..))
 import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
 import Turkey.Lint as Lint
+import Turkey.DocComments as DocComments
+import Turkey.DocComments (Run(..))
 import Turkey.Source as Source
+import Turkey.Source (Span(..))
+import Turkey.Token (Comment(..))
 
 -- -- unit-spelling ------------------------------------------------------------------
 --
@@ -148,6 +153,73 @@ fun respell(
 		message = why + "; write '" + to + "'"
 		fix     = Some(Fix { edits = [Edit { span = e.span, text = to }], mechanical = True })
 	})
+}
+
+-- -- detached-doc-comment ---------------------------------------------------------
+--
+-- A `---` comment documents what begins on the line directly after it, and
+-- `turkey doc` drops one that documents nothing without a word, since such a
+-- comment is never an error. Directive lines between a doc comment and its
+-- declaration are passed over (`Turkey.DocComments`), so a doc comment above
+-- `--@expect(...)` above a declaration still documents it.
+
+--- Returns a finding for each run of doc comments that documents nothing:
+--- one not directly above a declaration, constructor, field, class method or
+--- associated type, that is not the module's comment, or that follows code on
+--- its line. Where one blank line is all that parts a run from a declaration,
+--- the fix deletes it, and is mechanical. Elsewhere the fix writes `--` for
+--- `---`, which is not mechanical, since the comment may be meant for the
+--- declaration it missed.
+fun detachedDocComment(f : File) -> Vec Finding {
+	let program = Lint.programOf(f)
+	let all = DocComments.runs(program.comments, Lint.sourceOf(f))
+	if len(all) == 0 { return [] }
+	let targets = DocComments.targets(program)
+	let header = DocComments.moduleRun(all, targets, DocComments.firstDeclLine(program))
+	let blank = Set.fromIterator(program.blankLines)
+	let out = []
+	for r in all {
+		if !r.trailing && Set.contains(targets, r.documents) { continue }
+		if let Some(h) = header {
+			if h.span.line == r.span.line { continue }
+		}
+		let gap = r.span.endLine + 1
+		let joins = !r.trailing
+			&& r.documents == gap
+			&& Set.contains(blank, gap)
+			&& Set.contains(targets, gap + 1)
+		let finding = if joins {
+			Finding {
+				span = r.span
+				message = "this doc comment documents nothing, since a blank line parts it from "
+					+ "the declaration below; remove the blank line"
+				fix = Some(Fix {
+					edits      = [Edit { span = lineSpan(r.span, gap), text = "" }]
+					mechanical = True
+				})
+			}
+		} else {
+			Finding {
+				span = r.span
+				message = "this doc comment documents nothing; move it directly above a "
+					+ "declaration, constructor, field or class method, or write '--' for a "
+					+ "comment"
+				fix = Some(Fix { edits = Vec.map(r.comments, ordinary), mechanical = False })
+			}
+		}
+		Vec.push(out, finding)
+	}
+	out
+}
+
+-- The whole of line `line` of the file `at` is in, with its line break.
+fun lineSpan(at : Span, line : Int) -> Span =
+	Span { line = line, col = 1, endLine = line + 1, endCol = 1, file = at.file, inlined = None }
+
+-- An edit that writes `--` for the `---` that begins `c`.
+fun ordinary(c : Comment) -> Edit {
+	let s = c.span
+	Edit { span = Source.endingAt(s, s.line, s.col + 3), text = "--" }
 }
 
 -- `text` without its whitespace.

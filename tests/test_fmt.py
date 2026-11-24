@@ -237,6 +237,7 @@ AWKWARD = {
     "comment_before_instance_class": "class C a { fun s(a) -> Int }\ninstance -- c\nC Int {\n    fun s(x) = x\n}\n",
     "comment_before_block_brace": "fun f(second : Int) -> Int = 1\n    + (if second == 60 -- z\n{ 59 } else { second })\n",
     "comment_after_variant_bar": "type T\n    = A\n    --- Doc.\n    | -- z\nB(Int)\n    | C\n",
+    "foreign_blocks": "foreign \"env\" {\n    \"log\" fun log(x : Int) -> Unit\n}\nforeign \"ssl\" 3 { \"f\" fun g(x : Int) -> Int }\n",
 }
 
 # What some of them must format to, exactly.
@@ -347,6 +348,14 @@ AWKWARD_OUTPUT = {
         "\t| -- z\n"
         "\t\tB(Int)\n"
         "\t| C\n"
+    ),
+    "foreign_blocks": (
+        "foreign \"env\" {\n"
+        "\t\"log\" fun log(x : Int) -> Unit\n"
+        "}\n"
+        "foreign \"ssl\" 3 {\n"
+        "\t\"f\" fun g(x : Int) -> Int\n"
+        "}\n"
     ),
 }
 

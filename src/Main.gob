@@ -571,9 +571,13 @@ fun baseName(path : String) -> String {
 -- its exit status what became of the file. WASI has no processes to start, so
 -- there the files are formatted in this one, in order, and the first that
 -- cannot be read or parsed ends the program.
+--
+-- `turkey format [--check] [--stdin-name NAME] -` formats the text on standard
+-- input instead, as `formatInput` says.
 fun format(p : Args.Parser) -> Unit {
 	var checking = False
 	var one = False
+	var named = None
 	let paths = []
 	loop {
 		match Args.next(p) {
@@ -581,16 +585,31 @@ fun format(p : Args.Parser) -> Unit {
 			Right(None)                -> break
 			Right(Some(Long("check"))) -> { checking = True }
 			Right(Some(Long("one")))   -> { one = True }
-			Right(Some(Value(path)))   -> Vec.push(paths, path)
-			Right(Some(arg))           -> formatUsage(Args.unexpected(arg))
+			Right(Some(Long("stdin-name"))) -> match Args.value(p) {
+				Left(message) -> formatUsage(message)
+				Right(name)   -> { named = Some(name) }
+			}
+			Right(Some(Value(path))) -> Vec.push(paths, path)
+			Right(Some(arg))         -> formatUsage(Args.unexpected(arg))
 		}
 	}
-	if len(paths) == 0 { formatUsage("usage: turkey format [--check] FILE...") }
-	if one { Diag.exit(formatFile(paths[0], checking)) }
+	if Option.isSome(named) && !Vec.contains(paths, "-") {
+		formatUsage("--stdin-name names standard input, so it needs '-'")
+	}
+	if len(paths) == 0 { formatUsage(formatSynopsis) }
+	if Vec.contains(paths, "-") {
+		if len(paths) > 1 {
+			formatUsage("'-' reads standard input, and cannot be given with files")
+		}
+		return formatInput(Option.unwrapOr(named, "<stdin>"), checking)
+	}
+	if one { Diag.exit(formatFile(paths[0], checking, 11)) }
 	-- Each file's status, as `formatFile` gives it, and what it wrote to standard
 	-- error that is still to be written.
 	let outcomes = match Platform.os {
-		Wasi -> Vec.map(paths, fun(path) = (formatFile(path, checking), ""))
+		-- No parent turns a refusal into status 2 here, so formatted text that
+		-- does not parse, which ends the process, ends it with 2 itself.
+		Wasi -> Vec.map(paths, fun(path) = (formatFile(path, checking, 2), ""))
 		Darwin | Linux -> {
 			-- `--` before the path, so a file whose name starts with `-` is a file.
 			let flags = if checking {
@@ -620,15 +639,6 @@ fun format(p : Args.Parser) -> Unit {
 				toStderr(said)
 				refused = True
 			}
-			12 -> {
-				toStderr(
-					path
-						+ ": internal error: the formatter refuses this file: the formatted "
-						+ "text does not parse: "
-						+ said,
-				)
-				refused = True
-			}
 			_ -> {
 				toStderr(said)
 				failed = True
@@ -640,6 +650,8 @@ fun format(p : Args.Parser) -> Unit {
 	if checking && changed { Diag.exit(1) }
 }
 
+let formatSynopsis = "usage: turkey format [--check] FILE...\n       turkey format [--check] [--stdin-name NAME] -"
+
 -- Ends `format` for a command line it cannot read, with a status of its own: 2
 -- means the formatter refused a file.
 fun formatUsage(message : String) -> a {
@@ -650,12 +662,12 @@ fun formatUsage(message : String) -> a {
 -- Formats `path`, and returns 0 if it was formatted already, 10 if it changed
 -- or would change, 11 if the formatter refused it and 13 if it could not be
 -- written, having said why on standard error. Ends the program with status 1
--- if it does not parse, 2 if it cannot be read, and `Format.unparsedStatus` if
--- the formatted text does not parse. `format --one` exits with the status.
-fun formatFile(path : String, checking : Bool) -> Int {
+-- if it does not parse, 2 if it cannot be read, and `unparsed` if the
+-- formatted text does not parse. `format --one` exits with the status.
+fun formatFile(path : String, checking : Bool, unparsed : Int) -> Int {
 	Diag.compiling(path)
 	let source = readOrDie(path)
-	match Format.format(source) {
+	match Format.format(source, unparsed) {
 		Refused(why) -> {
 			toStderr(path + ": internal error: the formatter refuses this file: " + why + "\n")
 			11
@@ -669,6 +681,51 @@ fun formatFile(path : String, checking : Bool) -> Int {
 				}
 			}
 			10
+		}
+	}
+}
+
+-- `format -`: formats the one text on standard input, named `name` in what it
+-- reports, and writes it to standard output, or under `checking` writes
+-- nothing and exits 1 if it would change. The exit status is 2 if the
+-- formatter refuses it and 3 if it cannot be read or does not parse, and then
+-- nothing goes to standard output. One input needs no process of its own: a
+-- parse error ends this one with the status the caller wants.
+fun formatInput(name : String, checking : Bool) -> Unit {
+	Diag.compiling(name)
+	let bytes = match IO.readAll(IO.stdin()) {
+		Right(b) -> b
+		Left(e) -> {
+			toStderr("turkey: cannot read standard input: " + message(e) + "\n")
+			Diag.exit(3)
+		}
+	}
+	let text = match String.fromBytes(bytes) {
+		Some(t) -> t
+		None -> {
+			toStderr("turkey: '" + name + "' is not valid UTF-8\n")
+			Diag.exit(3)
+		}
+	}
+	let _ = Diag.failWith(3, "")
+	match Format.format(Source { name = name, text = text }, 2) {
+		Refused(why) -> {
+			toStderr(name + ": internal error: the formatter refuses this file: " + why + "\n")
+			Diag.exit(2)
+		}
+		Formatted(done) -> {
+			if checking {
+				if done != text { Diag.exit(1) }
+				return
+			}
+			if let Left(e) = IO.writeText(IO.stdout(), done) {
+				toStderr("turkey: cannot write standard output: " + message(e) + "\n")
+				Diag.exit(3)
+			}
+			if let Left(e) = IO.flush(IO.stdout()) {
+				toStderr("turkey: cannot write standard output: " + message(e) + "\n")
+				Diag.exit(3)
+			}
 		}
 	}
 }
@@ -3187,6 +3244,7 @@ fun usage() -> a =
 		"usage: turkey check [OPTIONS] FILE...\n"
 			+ "       turkey doc [--html DIR] FILE...\n"
 			+ "       turkey format [--check] FILE...\n"
+			+ "       turkey format [--check] [--stdin-name NAME] -\n"
 			+ "       turkey build [OPTIONS] [-o PATH] [-S] [-g] [--debug=lines|full]\n"
 			+ "                    FILE...\n"
 			+ "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"

@@ -1,5 +1,10 @@
 """`System.File`: open files with their mode in the type, positional reads and
-writes beside sequential ones, and whole-file reads and writes by path."""
+writes beside sequential ones, and whole-file reads and writes by path.
+
+The tests marked `targets` run for every target in `lang.TARGETS`, against the
+same expectations: for `wasm32-wasi`, through `Turkey.Wasi`'s port of the C
+library to WASI under `wasmtime`, which preopens the directory the test runs
+in."""
 
 from __future__ import annotations
 
@@ -8,7 +13,7 @@ import re
 
 import pytest
 
-from tests.lang import fails, run
+from tests.lang import TARGETS, fails, run
 
 HEADER = """\
 import System.File as File
@@ -27,14 +32,18 @@ fun must(r : Either IO.IOError a) -> a = match r {
 """
 
 
+targets = pytest.mark.parametrize("target", TARGETS)
+
+
 def lines(src: str, cwd, env: dict[str, str] | None = None,
-          flags: tuple[str, ...] = ()) -> list[str]:
-    result = run(HEADER + src, cwd=cwd, env=env, flags=flags)
+          flags: tuple[str, ...] = (), target: str = "host") -> list[str]:
+    result = run(HEADER + src, cwd=cwd, env=env, flags=flags, target=target)
     assert result.code == 0, result.stderr
     return result.stdout.split("\n")[:-1]
 
 
-def test_open_failures_say_what_and_where(tmp_path):
+@targets
+def test_open_failures_say_what_and_where(tmp_path, target):
     (tmp_path / "plain").write_bytes(b"x")
     os.mkdir(tmp_path / "dir")
     out = lines("""
@@ -45,7 +54,7 @@ fun main() {
     print(report(File.create("dir", File.Truncate)))
     print(report(File.openRead("plain")))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == [
         "NotFound: open missing: no such file or directory",
         "NotDirectory: open plain/below: not a directory",
@@ -55,7 +64,8 @@ fun main() {
     ]
 
 
-def test_write_read_append_and_close(tmp_path):
+@targets
+def test_write_read_append_and_close(tmp_path, target):
     out = lines("""
 fun main() {
     let w = must(File.create("made", File.Truncate))
@@ -75,13 +85,14 @@ fun main() {
     print(IO.readInto(r, into))
     print(report(File.close(r)))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["made", "ok", "ok", "ok",
                    "Closed: write made: file already closed", "ok", "ok",
                    "Right(13)", 'Some("first\\nsecond\\n")', "Right(0)", "ok"]
 
 
-def test_positional_reads_and_writes_leave_the_position_alone(tmp_path):
+@targets
+def test_positional_reads_and_writes_leave_the_position_alone(tmp_path, target):
     (tmp_path / "data").write_bytes(b"0123456789")
     out = lines("""
 fun main() {
@@ -98,7 +109,7 @@ fun main() {
     print(IO.readInto(f, into))
     print(String.fromBytes(into))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["Right(4)", 'Some("3456")', "Right(2)", 'Some("89")', "ok",
                    "Right(4)", 'Some("01ab")']
     assert (tmp_path / "data").read_bytes() == b"01ab456789"
@@ -142,7 +153,8 @@ fun main() { let _ = IO.readInto(must(File.create("x", File.Truncate)), IO.buffe
     assert message == "no instance for 'CanRead WriteOnly'"
 
 
-def test_use_closes_the_file_when_its_body_returns(tmp_path):
+@targets
+def test_use_closes_the_file_when_its_body_returns(tmp_path, target):
     (tmp_path / "data").write_bytes(b"a\nb\nc\n")
     out = lines("""
 fun main() {
@@ -160,7 +172,7 @@ fun main() {
     }
     print(report(File.use(File.openRead("missing"), fun(f) = Right(1))))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["Right(3)", "Closed: read data: file already closed",
                    "NotFound: open missing: no such file or directory"]
 
@@ -195,7 +207,8 @@ fun main() {
                    "ok", 'Right("bytes")', "0"]
 
 
-def test_a_layers_error_reads_as_whichever_side_failed(tmp_path):
+@targets
+def test_a_layers_error_reads_as_whichever_side_failed(tmp_path, target):
     (tmp_path / "bad").write_bytes(b"ok\xff")
     (tmp_path / "short").write_bytes(b"ab")
     out = lines("""
@@ -215,12 +228,68 @@ fun main() {
         Left(e) -> print(message(e))
     }
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["the input is not well-formed UTF-8", "open missing: no such file or directory",
                    "the input ended early", "read .: is a directory"]
 
 
-def test_readAll_reads_a_large_file_whole(tmp_path):
+@targets
+def test_a_read_only_file_in_a_read_only_directory(tmp_path, target):
+    """A file the mode lets no one write, in a directory the mode lets no one
+    change, is opened, read, listed and stat'ed; only writing is refused."""
+    shelf = tmp_path / "shelf"
+    os.mkdir(shelf)
+    (shelf / "book").write_bytes(b"read me\n")
+    os.mkdir(shelf / "inner")
+    (shelf / "inner" / "page").write_bytes(b"page\n")
+    os.chmod(shelf / "book", 0o444)
+    os.chmod(shelf / "inner" / "page", 0o444)
+    os.chmod(shelf / "inner", 0o555)
+    os.chmod(shelf, 0o555)
+    try:
+        out = lines("""
+fun main() {
+    let f = must(File.openRead("book"))
+    print(String.fromBytes(must(IO.readAll(f))))
+    print(report(File.close(f)))
+    print(File.readText("inner/page"))
+    print(File.readText("./inner/../book"))
+    match File.metadata("book") {
+        Right(s) -> print(debug(s.kind) + " " + show(s.size))
+        Left(e) -> print(message(e))
+    }
+    match File.listPath(".") {
+        Right(names) -> print(String.join(names, " "))
+        Left(e) -> print(message(e))
+    }
+    match File.listPath("inner") {
+        Right(names) -> print(String.join(names, " "))
+        Left(e) -> print(message(e))
+    }
+    print(report(File.openAppend("book")))
+    print(report(File.create("new", File.Exclusive)))
+    print(report(File.createDir("inner/sub")))
+}
+""", shelf, target=target)
+    finally:
+        os.chmod(shelf, 0o755)
+        os.chmod(shelf / "inner", 0o755)
+    assert out == [
+        'Some("read me\\n")',
+        "ok",
+        'Right("page\\n")',
+        'Right("read me\\n")',
+        "Regular 8",
+        "book inner",
+        "page",
+        "PermissionDenied: open book: permission denied",
+        "PermissionDenied: open new: permission denied",
+        "PermissionDenied: createDir inner/sub: permission denied",
+    ]
+
+
+@targets
+def test_readAll_reads_a_large_file_whole(tmp_path, target):
     data = bytes(range(256)) * 5000
     (tmp_path / "big").write_bytes(data)
     out = lines("""
@@ -232,7 +301,7 @@ fun main() {
     let g = must(IO.readAll(must(File.openRead("big"))))
     print(IO.filled(g))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == [f"({len(data)}, {sum(data)})", str(len(data))]
 
 

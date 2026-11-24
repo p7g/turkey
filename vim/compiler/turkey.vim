@@ -5,8 +5,8 @@
 " `:compiler turkey` then `:make` runs `turkey check` on the current file and
 " fills the quickfix list with its errors and lint warnings. Arguments to
 " `:make` go after the file: `:make --deny-warnings`. The command is
-" `b:turkey_command`, else `g:turkey_command`, else `turkey` on 'PATH', as
-" set when `:compiler turkey` runs; set it before then, or run `:compiler
+" `b:turkey_command`, else `g:turkey_command`, else `turkey` on 'PATH', a
+" path with no arguments, as set when `:compiler turkey` runs; set it before then, or run `:compiler
 " turkey` again after changing it.
 
 if exists("current_compiler")

@@ -372,15 +372,21 @@ directory to `runtimepath`, or point a plugin manager at it
   own settings.
 * It sets `preserveindent`, so that reindenting a multi-line string's lines
   leaves their spaces as they are rather than turning them into tabs.
-* `:TurkeyFormat` formats the buffer with `turkey format`, as one undoable
-  change. A buffer that does not parse is left alone and the error is shown.
+* `:TurkeyFormat` formats the buffer, saved or not, and with or without a
+  file, as one undoable change. A buffer that does not parse is left alone
+  and the error is shown.
+* `gq` on lines that hold code formats the whole buffer, since a few lines of
+  a program cannot be formatted alone. `gq` on lines that hold only comments
+  wraps them at 100 columns, as Vim does by itself. The formatter never
+  rewraps a comment, so `gggqG` leaves a long comment long.
 * `let g:turkey_format_on_save = 1` (or `b:turkey_format_on_save`) formats
   each buffer before it is written.
 * `:compiler turkey`, then `:make`, runs `turkey check` on the file and fills
   the quickfix list with its errors and lint warnings. Arguments to `:make`
   go after the file: `:make --deny-warnings`.
 * Both run `turkey` from `PATH`; set `g:turkey_command` (or
-  `b:turkey_command`) to use another, such as `build/stages/turkey`.
+  `b:turkey_command`) to use another, such as `build/stages/turkey`. It is a
+  path alone, with no arguments.
   `:compiler turkey` reads it when it runs, so set it first.
 
 Its tests run headless in whichever of `vim` and `nvim` are installed. They
@@ -390,6 +396,24 @@ reindent and retype the formatter's goldens, and with a compiler
 
 ```sh
 sh vim/test/run.sh
+```
+
+In Neovim with [conform.nvim](https://github.com/stevearc/conform.nvim), the
+formatter can run through conform instead, which reads standard output
+unless the command fails:
+
+```lua
+require("conform").setup({
+  formatters_by_ft = { turkey = { "turkey" } },
+  formatters = {
+    turkey = {
+      command = "turkey",
+      -- `$FILENAME` must be an argument of its own for conform to fill in.
+      args = { "format", "--stdin-name", "$FILENAME", "-" },
+      stdin = true,
+    },
+  },
+})
 ```
 
 ### Library documentation
@@ -417,7 +441,10 @@ alongside one page per module and the JSON. The same site is published to
 
 `turkey format FILE...` rewrites each file in the one style, and
 `turkey format --check FILE...` only names the files it would change, exiting 1
-if there is one. There are no options. The style is specified by the pairs in
+if there is one. `turkey format -` reads one text from standard input and
+writes it formatted to standard output, which is how an editor formats a
+buffer; `--stdin-name NAME` gives the name its diagnostics use. There are no
+options for the style. The style is specified by the pairs in
 `tests/format/`: each `NAME.gob` and the `NAME.expected.gob` it formats to. The
 formatter refuses a file, with an internal error naming it, unless its output
 parses to the same tree, holds the same comments, and formats to itself.
@@ -432,6 +459,14 @@ build/stages/turkey format $(git ls-files 'lib/*.gob' 'src/*.gob' 'examples/*.go
 
 `tests/` is left as written, since its goldens record positions and source
 lines of its own files.
+
+The commit that formatted the repository is listed in `.git-blame-ignore-revs`,
+so that `git blame` shows who wrote a line rather than the reformat. Tell git
+to skip it once per clone:
+
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
 
 CI also fails on a lint warning in `src/` or `lib/`, which checking the
 compiler lints as its own code:
@@ -465,11 +500,14 @@ Turkey, `tests/harness/`:
     sh scripts/test.sh -v --shard 2/4     # a quarter of them, passes listed
     sh scripts/test.sh --selftest         # the harness checked on its own cases
     sh scripts/test.sh --bless PATH       # PATH's goldens rewritten from its output
+    sh scripts/test.sh --target wasm32-wasi  # tests/programs/ built for wasm, under wasmtime
 
 It builds `turkey` (or uses `TURKEY_BOOT`) and compiles itself with the
 committed bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are
 compiled programs. A program's expected outcome is a directive in it: `--% error` (it
-must not compile), `--% panic`, `--% exit: N`, and otherwise exit 0. A case
+must not compile), `--% panic`, `--% exit: N`, and otherwise exit 0;
+`--% skip: wasm32-wasi: REASON` leaves it out of that target's run, which
+compares every other program with the same golden. A case
 that fails is shown with a diff, and every actual output is kept under
 `$TMPDIR/turkey-test/actual/`. A reference example is named by its chapter and
 the line of its fence, `docs/ref/types.md:40`, and checked against what the

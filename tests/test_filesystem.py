@@ -1,6 +1,9 @@
 """`System.File`'s file system operations: what a path names (`Stat`),
 directories as handles and the operations relative to one, listing, making
-and removing trees, atomic rename, locks and temporary directories."""
+and removing trees, atomic rename, locks and temporary directories.
+
+The tests marked `targets` run for every target in `lang.TARGETS`, as
+`tests/test_file.py`'s do."""
 
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ import time
 import pytest
 
 from tests import toolchain
-from tests.lang import binary, run
+from tests.lang import TARGETS, binary, run
 
 HEADER = """\
 import System.File as File
@@ -39,13 +42,18 @@ fun names(r : Either IO.IOError (Array String)) -> String = match r {
 """
 
 
-def lines(src: str, cwd, env: dict[str, str] | None = None) -> list[str]:
-    result = run(HEADER + src, cwd=cwd, env=env)
+targets = pytest.mark.parametrize("target", TARGETS)
+
+
+def lines(src: str, cwd, env: dict[str, str] | None = None,
+          target: str = "host") -> list[str]:
+    result = run(HEADER + src, cwd=cwd, env=env, target=target)
     assert result.code == 0, result.stderr
     return result.stdout.split("\n")[:-1]
 
 
-def test_a_stat_is_a_value(tmp_path):
+@targets
+def test_a_stat_is_a_value(tmp_path, target):
     (tmp_path / "plain").write_bytes(b"x" * 1234)
     os.chmod(tmp_path / "plain", 0o640)
     os.mkdir(tmp_path / "dir")
@@ -78,9 +86,12 @@ fun main() {
     let s = must(File.metadata("plain"))
     print(Instant.now() >= s.modified)
 }
-""", tmp_path)
+""", tmp_path, target=target)
     plain = os.stat(tmp_path / "plain")
-    expect = f"Regular 1234 {0o640} {plain.st_mtime_ns}"
+    # WASI has no permission bits to report, and the port reports a file as
+    # its owner's to read and write (`System.File.Stat`).
+    permissions = 0o640 if target == "host" else 0o600
+    expect = f"Regular 1234 {permissions} {plain.st_mtime_ns}"
     assert out == [
         expect,
         expect,
@@ -106,7 +117,8 @@ fun main() {
     assert out == ["True", "False", "BlockDevice"]
 
 
-def test_list_is_sorted_and_leaves_out_the_dots(tmp_path):
+@targets
+def test_list_is_sorted_and_leaves_out_the_dots(tmp_path, target):
     os.mkdir(tmp_path / "d")
     for name in ["b", "a", "C", "é", "a.txt", "aa"]:
         (tmp_path / "d" / name).write_bytes(b"")
@@ -126,7 +138,7 @@ fun main() {
     print(report(File.closeDir(d)))
     print(names(File.list(d)))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     everything = "C a a.txt aa b sub é"
     assert out == [
         everything,
@@ -156,7 +168,8 @@ fun main() { print(names(File.listPath("d"))) }
     assert out == [f"Other({errno.EILSEQ}): list d: illegal byte sequence"]
 
 
-def test_createDirAll_makes_the_missing_parents(tmp_path):
+@targets
+def test_createDirAll_makes_the_missing_parents(tmp_path, target):
     (tmp_path / "plain").write_bytes(b"")
     out = lines("""
 fun main() {
@@ -169,7 +182,7 @@ fun main() {
     print(report(File.createDir("x/y")))
     print(report(File.createDir("a")))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == [
         "ok", "ok", "ok",
         "NotDirectory: createDir plain/below: not a directory",
@@ -187,7 +200,8 @@ def _umask() -> int:
     return mask
 
 
-def test_rename_replaces_in_one_step(tmp_path):
+@targets
+def test_rename_replaces_in_one_step(tmp_path, target):
     (tmp_path / "old").write_bytes(b"old")
     (tmp_path / "staged").write_bytes(b"new")
     os.mkdir(tmp_path / "dir")
@@ -197,13 +211,14 @@ fun main() {
     print(report(File.rename("staged", "old")))
     print(report(File.rename("old", "dir/moved")))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["ok", "NotFound: rename staged: no such file or directory", "ok"]
     assert sorted(os.listdir(tmp_path)) == ["dir"]
     assert (tmp_path / "dir" / "moved").read_bytes() == b"new"
 
 
-def test_remove_a_file_a_directory_and_a_tree(tmp_path):
+@targets
+def test_remove_a_file_a_directory_and_a_tree(tmp_path, target):
     (tmp_path / "plain").write_bytes(b"")
     os.makedirs(tmp_path / "tree" / "a" / "b")
     os.mkdir(tmp_path / "empty")
@@ -220,7 +235,7 @@ fun main() {
     print(report(File.removeTree("tree")))
     print(report(File.removeTree("tree")))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == [
         "ok",
         "NotFound: remove plain: no such file or directory",
@@ -232,7 +247,8 @@ fun main() {
     assert os.listdir(tmp_path) == []
 
 
-def test_removeTree_does_not_follow_a_symlink_out_of_the_tree(tmp_path):
+@targets
+def test_removeTree_does_not_follow_a_symlink_out_of_the_tree(tmp_path, target):
     outside = tmp_path / "outside"
     os.makedirs(outside / "inner")
     (outside / "keep").write_bytes(b"keep")
@@ -247,14 +263,15 @@ fun main() {
     print(report(File.removeTree("tree")))
     print(report(File.removeTree("toplink")))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == ["ok", "ok"]
     assert sorted(os.listdir(tmp_path)) == ["outside"]
     assert (outside / "keep").read_bytes() == b"keep"
     assert (outside / "inner" / "keep").read_bytes() == b"keep"
 
 
-def test_operations_relative_to_a_dir(tmp_path):
+@targets
+def test_operations_relative_to_a_dir(tmp_path, target):
     os.mkdir(tmp_path / "base")
     out = lines("""
 fun main() {
@@ -291,7 +308,7 @@ fun main() {
     print(report(File.closeDir(File.workingDir())))
     print(names(File.list(File.workingDir())))
 }
-""", tmp_path)
+""", tmp_path, target=target)
     assert out == [
         "base",
         "base/made",

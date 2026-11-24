@@ -1,14 +1,21 @@
 -- Calls in tail position run in constant stack: direct, mutual, through a
 -- closure, and through a monad's `bind`, which is how a loop holding a `?`
--- reaches its next iteration.
+-- reaches its next iteration. `tail_calls_task.gob` is the loop in a task's
+-- own monad.
 --
 -- Each runs in a task, whose stack is a megabyte. A frame per call takes at
 -- least 16 bytes, for the frame pointer and the link register, so a hundred
 -- thousand calls would need 1.6 MB. Keep the count near that: the GC stress
 -- test collects at every allocation, and at a million calls this program takes
 -- over twelve minutes there.
+--
+-- On wasm32-wasi, where tasks do not run, each runs on the main stack
+-- instead. wasmtime gives that 512 KiB, and a hundred thousand calls at 16
+-- bytes or more a frame need at least 1.6 MB, so they fail there too.
 
 import System.Task as Task
+import Target (OS(..))
+import Target as Target
 
 let deep = 100000
 
@@ -23,17 +30,6 @@ fun bounce(n : Int, k : fun(Int, Int) -> Int) -> Int =
     if n == 0 { 0 } else { k(n - 1, n) }
 
 fun step(n : Int, last : Int) -> Int = if n == 0 { last } else { bounce(n, step) }
-
--- The loop's next iteration is the closure `bind` calls last.
-fun count(n : Int) -> Task.Spawn Int = do {
-    var i = 0
-    loop {
-        if i == n { break }
-        let _ = pure(i)?
-        i = i + 1
-    }
-    pure(i)
-}
 
 -- A reader, a state and a continuation monad, as a program would write them.
 type Reader a = Reader(fun(Int) -> a)
@@ -126,14 +122,15 @@ fun drain(c : Counter, n : Int) -> Int {
     drain(Counter { count = c.count + 1 }, n - 1)
 }
 
-fun inTask(f : fun() -> a) -> a =
-    Task.join(Task.runScope(Task.spawn(f)))
+fun inTask(f : fun() -> a) -> a = match Target.os {
+    Wasi -> f()
+    Darwin | Linux -> Task.join(Task.runScope(Task.spawn(f)))
+}
 
 fun main() {
     print(inTask(fun() = countDown(deep, 0)))
     print(inTask(fun() = isEven(deep)))
     print(inTask(fun() = step(deep, 0)))
-    print(inTask(fun() = Task.runScope(count(deep))))
     print(inTask(fun() = runReader(sumAsks(deep), 2)))
     print(inTask(fun() = runReader(asks(deep, 0), 3)))
     print(inTask(fun() = runState(ticks(deep), 0)))

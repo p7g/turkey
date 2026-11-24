@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run the test harness, tests/harness/, with the arguments given:
 #
-#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [PATH[::CASE]...]
+#   scripts/test.sh [-j N] [-v] [--shard I/N] [--timeout-scale F] [--target T] [PATH[::CASE]...]
 #   scripts/test.sh --selftest
 #   scripts/test.sh --bless [PATH[::CASE]...]
 #

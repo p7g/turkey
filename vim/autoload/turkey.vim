@@ -6,7 +6,8 @@ let s:save_cpo = &cpo
 set cpo&vim
 
 " Returns the command that runs the compiler: `b:turkey_command`, else
-" `g:turkey_command`, else `turkey` on 'PATH'.
+" `g:turkey_command`, else `turkey` on 'PATH'. It is the executable's name or
+" path alone, with no arguments: callers quote it as one word.
 function! turkey#Command() abort
   return get(b:, "turkey_command", get(g:, "turkey_command", "turkey"))
 endfunction
@@ -19,11 +20,13 @@ function! s:Error(lines) abort
   echohl None
 endfunction
 
-" Formats the current buffer with `turkey format`. Leaves the buffer as it was
-" and reports the compiler's message if the buffer does not parse or the
-" formatter refuses it. Otherwise changes only the lines that differ, as one
-" undoable change, and keeps the view. Returns 1 if the buffer is formatted
-" now and 0 if it could not be formatted. Does not write the file.
+" Formats the current buffer with `turkey format`, which reads it on standard
+" input, so a buffer with no file and unsaved changes are formatted alike.
+" Leaves the buffer as it was and reports the compiler's message if the
+" buffer does not parse or the formatter refuses it. Otherwise changes only
+" the lines that differ, as one undoable change, and keeps the view. Returns
+" 1 if the buffer is formatted now and 0 if it could not be formatted. Does
+" not write the file.
 function! turkey#Format() abort
   let command = turkey#Command()
   if !executable(command)
@@ -31,27 +34,24 @@ function! turkey#Format() abort
     return 0
   endif
 
-  " `turkey format` rewrites files in place and does not read standard input,
-  " so format a copy of the buffer in a directory of its own. The copy keeps
-  " the buffer's file name, so that the compiler's messages name it.
-  let dir = tempname()
-  call mkdir(dir, "p")
-  let name = expand("%:t")
-  let copy = dir . "/" . (name ==# "" ? "buffer.gob" : name)
+  " Name the buffer's file, so that messages name it as `turkey check`
+  " would. A buffer with none is `<stdin>`.
+  let cmdline = shellescape(command) . " format"
+  if expand("%") !=# ""
+    let cmdline .= " --stdin-name " . shellescape(expand("%"))
+  endif
   let before = getline(1, "$")
-  call writefile(before, copy)
-  let output = system(shellescape(command) . " format " . shellescape(copy) . " 2>&1")
+  " system() gives standard output and standard error together. That is
+  " safe because `turkey format -` writes to only one of them: the program
+  " on success, and the reason otherwise.
+  let output = system(cmdline . " -", join(before, "\n") . "\n")
   let status = v:shell_error
-  let after = status == 0 ? readfile(copy) : []
-  call delete(dir, "rf")
-
   if status != 0
-    " Name the buffer's file in the messages, not the copy.
-    let shown = expand("%") ==# "" ? "[No Name]" : expand("%")
-    let lines = map(split(output, "\n"), {_, l -> substitute(l, '\V' . escape(copy, '\'), escape(shown, '\&~'), 'g')})
-    call s:Error(["TurkeyFormat: '" . command . " format' exited with status " . status] + lines)
+    call s:Error(["TurkeyFormat: '" . command . " format' exited with status " . status]
+          \ + split(output, "\n"))
     return 0
   endif
+  let after = split(output, "\n", 1)[: -2]
   if after ==# before
     return 1
   endif
@@ -83,6 +83,44 @@ function! turkey#Format() abort
   endif
   call winrestview(view)
   return 1
+endfunction
+
+" Formats for `gq` and the other users of 'formatexpr'. Formats the whole
+" buffer when the lines to format hold any code: a range of a program is not
+" a program, so the formatter cannot read it alone. Leaves lines that hold
+" only comments, and text typed past 'textwidth', to Vim's own formatting,
+" which wraps them. The formatter never rewraps a comment, so formatting the
+" whole buffer, as `gggqG` does, leaves a long comment long. Without syntax
+" highlighting, the interior lines of a `{- -}` comment read as code.
+function! turkey#FormatExpr() abort
+  if v:char !=# "" || mode() =~# '^[iR]'
+    return 1
+  endif
+  for l in range(v:lnum, v:lnum + v:count - 1)
+    if !s:CommentOnly(l)
+      call turkey#Format()
+      return 0
+    endif
+  endfor
+  return 1
+endfunction
+
+" Returns whether line a:lnum is blank or holds only comments.
+function! s:CommentOnly(lnum) abort
+  let line = getline(a:lnum)
+  if line =~# '^\s*\%(--.*\)\=$'
+    return 1
+  endif
+  if get(b:, "current_syntax", "") ==# "turkey"
+    " A line whose first and last characters are both in a comment, unless
+    " code sits between two comments: `{- a -} x {- b -}`.
+    let names = map([match(line, '\S') + 1, match(line, '\s*$')],
+          \ {_, c -> synIDattr(synID(a:lnum, c, 1), "name")})
+    return names[0] =~? 'comment' && names[1] =~? 'comment'
+          \ && line !~# '-}.*\S.*{-'
+  endif
+  " A line that starts a block comment and has no code after its end.
+  return line =~# '^\s*{-' && line !~# '-}\s*\S'
 endfunction
 
 " Formats the buffer before it is written when `b:turkey_format_on_save` or

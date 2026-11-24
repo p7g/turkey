@@ -15,6 +15,10 @@ sources, because a behavioral suite is hundreds of small programs and under
 `pytest -n auto` any of them may be asked for by any worker. Running is not
 cached: it is the thing being tested, and it takes milliseconds.
 
+A program may be compiled for another target than the host: `wasm32-wasi`
+writes a module that `wasmtime run` runs, with the program's directory
+preopened, and which must print what the host's build prints.
+
 A compile error ends a `turkey` process -- a diagnostic is reported by exiting --
 so each program is its own invocation. That is also what makes this cheap:
 the native `turkey` checks a small program in a fraction of a second.
@@ -208,7 +212,27 @@ def _cached(output: str, entry: Path, build,
     return found
 
 
-def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
+#: The targets a program may be compiled for, as `turkey build --target`
+#: names them; `host` is the platform the suite runs on.
+TARGETS = ("host", "wasm32-wasi")
+
+# The warning `turkey build --target wasm32-wasi` gives every program that
+# reaches the scheduler, whose four coroutine switches (`Coroutine#resume`,
+# `Scheduler#waitOn`, `Wait#settleIn`, `Scheduler#yield`) are built as traps;
+# the reference says the target gives it, so it is not compared with the host.
+# Only the whole line with that count is removed, as
+# `tests/harness/Toolchain.gob` removes it: a fifth refused function stays
+# visible.
+_TRAP_COUNT = ("{}: warning: 4 functions use operations the wasm32 backend "
+               "does not compile yet, and trap if they are called; "
+               "'--dump select' lists them\n")
+
+
+def _built(entry: Path, flags: tuple[str, ...] = (),
+           target: str = "host") -> _Compiled:
+    if target != "host":
+        flags = ("--target", target, *flags)
+
     def build(directory: Path) -> tuple[int, str]:
         staging = directory / f"bin-{os.getpid()}"
         result = _boot(["build", "-o", str(staging)], entry, flags)
@@ -238,10 +262,15 @@ def check(src: Source, modules: dict[str, str] | None = None) -> str:
 def run(src: Source, modules: dict[str, str] | None = None,
         args: tuple[str, ...] = (), stdin: str | None = None,
         env: dict[str, str] | None = None, cwd: Path | None = None,
-        flags: tuple[str, ...] = ()) -> Result:
+        flags: tuple[str, ...] = (), target: str = "host") -> Result:
     """Compile and run. Raises `CompileError` if it does not compile.
 
     `flags` are `turkey`'s, for the compile: `--gc-verify`, `--gc-stats`.
+
+    `target` is one of `TARGETS`. For `wasm32-wasi` the module runs under
+    `wasmtime`, which skips the test where it is not installed
+    (`toolchain.needs_wasmtime`), with the directory it runs in preopened as
+    `.` and `env` passed to the module.
 
     The program runs in its own directory unless `cwd` says otherwise -- which
     a program that writes files should, since the directory a source string is
@@ -250,12 +279,23 @@ def run(src: Source, modules: dict[str, str] | None = None,
     Bytes, decoded here rather than by `text=True`, so a `\\r` the program
     prints is not rewritten as a newline on the way.
     """
+    assert target in TARGETS, target
     entry = _entry(src, modules)
-    compiled = _native(entry, flags)
+    compiled = _built(entry, flags, target)
     if compiled.code != 0 or compiled.binary is None:
         raise CompileError(compiled.stderr, compiled.code)
+    warnings = compiled.stderr
+    if target == "host":
+        command = toolchain.command(compiled.binary, *args)
+    else:
+        line = _TRAP_COUNT.format(entry.name)
+        warnings = ("\n" + warnings).replace("\n" + line, "\n")[1:]
+        command = [toolchain.needs_wasmtime(), "run", "--dir", "."]
+        for name, value in (env or {}).items():
+            command += ["--env", f"{name}={value}"]
+        command += [str(compiled.binary), *args]
     result = subprocess.run(
-        toolchain.command(compiled.binary, *args),
+        command,
         cwd=cwd or entry.parent,
         input=None if stdin is None else stdin.encode("utf-8"),
         env=None if env is None else dict(os.environ, **env),
@@ -263,14 +303,14 @@ def run(src: Source, modules: dict[str, str] | None = None,
         timeout=600,
     )
     return Result(result.stdout.decode("utf-8"),
-                  compiled.stderr + result.stderr.decode("utf-8"),
+                  warnings + result.stderr.decode("utf-8"),
                   result.returncode)
 
 
 def binary(src: Source, modules: dict[str, str] | None = None) -> Path:
     """The compiled program, for a test that runs it with its own pipes,
     terminal or timing. Raises `CompileError` if it does not compile."""
-    compiled = _native(_entry(src, modules))
+    compiled = _built(_entry(src, modules))
     if compiled.code != 0 or compiled.binary is None:
         raise CompileError(compiled.stderr, compiled.code)
     return compiled.binary

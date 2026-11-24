@@ -36,6 +36,17 @@ type Lexer = Lexer {
 	-- is kept in `failure` and the lexer stops at the token it was in.
 	fatal       : Bool
 	var failure : Option Diag.Diag
+	-- The holes of string literals the lexer is inside, innermost last. A hole
+	-- holds ordinary tokens, and it ends at the first `}` that closes no `{`
+	-- opened inside it.
+	holes : Vec Hole
+}
+
+-- A hole being lexed: how many of its own `{` are still open, and where its
+-- string literal begins, which is what an unclosed hole's error points at.
+type Hole = Hole {
+	var depth : Int
+	literal   : Span
 }
 
 --- A file's tokens, and what the tokens leave out: its comments in source
@@ -194,6 +205,7 @@ fun lex(source : Source, fatal : Bool) -> (Lexed, Option Diag.Diag) {
 		lastContent = 0
 		fatal       = fatal
 		failure     = None
+		holes       = []
 	}
 	let tokens = Vec.new(64)
 	loop {
@@ -222,11 +234,30 @@ fun lex(source : Source, fatal : Bool) -> (Lexed, Option Diag.Diag) {
 			}
 		}
 	}
-	if !failed(lx) { Vec.push(tokens, plain(KEof, VText(""), here(lx))) }
+	if !failed(lx) {
+		if let Some(hole) = Vec.last(lx.holes) {
+			let _ = oops(lx, unclosedHole, hole.literal, broken(hole.literal))
+		} else {
+			Vec.push(tokens, plain(KEof, VText(""), here(lx)))
+		}
+	}
 	(Lexed { tokens = tokens, comments = lx.comments, blankLines = lx.blankLines }, lx.failure)
 }
 
 fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Vec Token) -> Token {
+	if let Some(hole) = Vec.last(lx.holes) {
+		if c == '\n' { return oops(lx, unclosedHole, hole.literal, broken(hole.literal)) }
+		if c == '{' {
+			hole.depth = hole.depth + 1
+		} else if c == '}' {
+			if hole.depth == 0 {
+				let _ = Vec.pop(lx.holes)
+				bump(lx)
+				return lexPiece(lx, start, False)
+			}
+			hole.depth = hole.depth - 1
+		}
+	}
 	if c == '\n' {
 		bump(lx)
 		plain(KNewline, VText("\n"), start)
@@ -577,8 +608,20 @@ fun digitValue(c : Char) -> Option Int {
 
 -- -- strings and characters ----------------------------------------------------------
 
+-- `\u{24}` is `$`. `\$` would mean the same, but the compiler in `bootstrap/`
+-- that builds this file does not know that escape.
+let unclosedHole = "this string literal has a '\u{24}{' with no closing '}' on its line"
+
 fun lexString(lx : Lexer, start : Span) -> Token {
 	bump(lx)
+	lexPiece(lx, start, True)
+}
+
+-- Lexes the text of a string literal up to its closing `"` or its next `${`,
+-- whichever comes first, from just after its opening `"` (when `first`) or
+-- just after the `}` that closed a hole. At a `${` it opens a hole, whose
+-- tokens the main loop goes on to lex.
+fun lexPiece(lx : Lexer, start : Span, first : Bool) -> Token {
 	let b = String.builder()
 	loop {
 		match peek(lx) {
@@ -599,6 +642,12 @@ fun lexString(lx : Lexer, start : Span) -> Token {
 					bump(lx)
 					break
 				}
+				if c == '$' && charIs(peekAt(lx, 1), '{') {
+					bumpBy(lx, 2)
+					Vec.push(lx.holes, Hole { depth = 0, literal = start })
+					let kind = if first { KStringStart } else { KStringMid }
+					return plain(kind, VText(String.build(b)), start)
+				}
 				if c == '\\' {
 					let escaped = lexEscape(lx)
 					if failed(lx) { return broken(start) }
@@ -610,7 +659,7 @@ fun lexString(lx : Lexer, start : Span) -> Token {
 			}
 		}
 	}
-	plain(KString, VText(String.build(b)), start)
+	plain(if first { KString } else { KStringEnd }, VText(String.build(b)), start)
 }
 
 fun lexChar(lx : Lexer, start : Span) -> Token {
@@ -673,6 +722,7 @@ fun lexEscape(lx : Lexer) -> Char {
 		'\\' -> '\\'
 		'"'  -> '"'
 		'\'' -> '\''
+		'$'  -> '$'
 		_    -> oops(lx, "unknown escape sequence '\\" + Char.toString(c) + "'", start, '?')
 	}
 }
@@ -907,6 +957,8 @@ fun isLiteral(k : Kind) -> Bool = match k {
 -- whose last token is the `?`.
 fun canEnd(k : Kind) -> Bool {
 	if isLiteral(k) { return True }
+	-- A literal with holes ends in this token. No line can break inside one.
+	if let KStringEnd = k { return True }
 	match k {
 		KIdent -> True
 		KConid -> True
@@ -928,6 +980,8 @@ fun canEnd(k : Kind) -> Bool {
 -- patterns be split across lines -- the newline before the `|` disappears.
 fun canStart(k : Kind) -> Bool {
 	if isLiteral(k) { return True }
+	-- A literal with holes starts with this token.
+	if let KStringStart = k { return True }
 	match k {
 		KIdent      -> True
 		KConid      -> True

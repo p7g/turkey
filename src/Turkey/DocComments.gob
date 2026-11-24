@@ -8,7 +8,10 @@ export (Run(..), isDoc, runs, targets, firstDeclLine, moduleRun, text)
 --- anything. Doc comments on consecutive lines, each standing alone on its
 --- line, are one run, and a run documents what starts on the line directly
 --- after it: a top-level declaration, an instance, a class's method or
---- associated type, or a constructor or record field. The module's own
+--- associated type, or a constructor or record field. Directives
+--- (`Turkey.Directives`) on lines of their own between a run and that line
+--- are passed over, so `--@expect(...)` can sit between a declaration's
+--- documentation and the declaration. The module's own
 --- comment is the first run before its first declaration that is not directly
 --- above that declaration.
 ---
@@ -19,14 +22,19 @@ import Data.Set as Set
 import Turkey.Ast (Type as _, Pred as _, ..)
 import Turkey.Source as Source
 import Turkey.Source (Span(..))
-import Turkey.Token (Comment(..))
+import Turkey.Directives as Directives
+import Turkey.Token (Comment(..), standsAlone)
 
 --- Doc comments on consecutive lines, each alone on its line; or a single doc
---- comment that follows code on its line, which is `trailing`.
+--- comment that follows code on its line, which is `trailing`. `documents`
+--- is the line the run documents what begins on, if anything begins there:
+--- the first line after it that is not a directive alone on its line, unless
+--- that line is another run's.
 type Run = Run {
-    span     : Span,
-    comments : Vec Comment,
-    trailing : Bool,
+    span      : Span,
+    comments  : Vec Comment,
+    trailing  : Bool,
+    documents : Int,
 }
 
 --- Returns whether `c` is a doc comment.
@@ -45,6 +53,14 @@ fun runs(comments : Vec Comment, source : String) -> Vec Run {
     let docs = Vec.filter(comments, isDoc)
     if len(docs) == 0 { return [] }
     let lines = String.lines(source)
+    let directives = Set.new()
+    for c in comments {
+        if Directives.isDirective(c) && standsAlone(c, lines) { Set.add(directives, c.span.line) }
+    }
+    let docLines = Set.new()
+    for c in docs {
+        if standsAlone(c, lines) { Set.add(docLines, c.span.line) }
+    }
     let out = []
     for c in docs {
         let alone = standsAlone(c, lines)
@@ -52,29 +68,22 @@ fun runs(comments : Vec Comment, source : String) -> Vec Run {
             Some(r) -> alone && !r.trailing && r.span.endLine == c.span.line - 1
             None -> False
         }
-        if extends {
+        let (span, kept) = if extends {
             let r = out[len(out) - 1]
             Vec.push(r.comments, c)
-            out[len(out) - 1] = Run { span = Source.through(r.span, c.span),
-                                      comments = r.comments, trailing = False }
+            let _ = Vec.pop(out)
+            (Source.through(r.span, c.span), r.comments)
         } else {
-            Vec.push(out, Run { span = c.span, comments = [c], trailing = !alone })
+            (c.span, [c])
         }
+        var next = span.endLine + 1
+        while Set.contains(directives, next) { next = next + 1 }
+        -- Directives are passed over only on the way to a declaration. A run
+        -- after them is a run of its own, so this one documents nothing.
+        if Set.contains(docLines, next) { next = span.endLine + 1 }
+        Vec.push(out, Run { span = span, comments = kept, trailing = !alone, documents = next })
     }
     out
-}
-
--- Whether only spaces come before `c` on its line. A line comment runs to
--- the end of its line, so nothing comes after it.
-fun standsAlone(c : Comment, lines : Vec String) -> Bool {
-    let line = if c.span.line <= len(lines) { lines[c.span.line - 1] } else { "" }
-    var i = 1
-    for ch in String.codePoints(line) {
-        if i >= c.span.col { break }
-        if ch != ' ' && ch != '\t' { return False }
-        i = i + 1
-    }
-    True
 }
 
 --- Returns the run's text: each comment without `---` and one space after it,
@@ -147,11 +156,11 @@ fun firstDeclLine(program : Program) -> Option Int {
 }
 
 --- Returns the module's comment: the first run that ends before `first`, the
---- line of the first declaration, and is not directly above it or any other
---- of `targets`.
+--- line of the first declaration, and does not document it or any other of
+--- `targets`.
 fun moduleRun(all : Vec Run, targets : Set.Set Int, first : Option Int) -> Option Run {
     for r in all {
-        if r.trailing || Set.contains(targets, r.span.endLine + 1) { continue }
+        if r.trailing || Set.contains(targets, r.documents) { continue }
         let before = match first {
             Some(line) -> r.span.endLine < line
             None -> True

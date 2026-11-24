@@ -421,8 +421,8 @@ Turkey, `tests/harness/`:
 
 It builds `turkey` (or uses `TURKEY_BOOT`) and compiles itself with the
 committed bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are
-compiled programs. A program's expected outcome is a directive in it: `--@ error` (it
-must not compile), `--@ panic`, `--@ exit: N`, and otherwise exit 0. A case
+compiled programs. A program's expected outcome is a directive in it: `--% error` (it
+must not compile), `--% panic`, `--% exit: N`, and otherwise exit 0. A case
 that fails is shown with a diff, and every actual output is kept under
 `$TMPDIR/turkey-test/actual/`. A reference example is named by its chapter and
 the line of its fence, `docs/ref/types.md:40`, and checked against what the
@@ -432,15 +432,15 @@ A case archive holds many small cases in one text file, cut into sections by
 header lines:
 
     -- shared Shapes.gob --     a module written beside every case (before the first case only)
-    -- case area_of_a_square -- starts a case; `--` comments and `--@` directives follow
-    --@ error                   as in a program, plus `check` and `matrix: VAR=1,4`
+    -- case area_of_a_square -- starts a case; `--` comments and `--%` directives follow
+    --% error                   as in a program, plus `check` and `matrix: VAR=1,4`
     -- Main.gob --              the case's entry module; other `NAME.gob` sections sit beside it
     -- stdout --                its exact stdout; also `stderr`, `error`, `panic`,
                                 `types`, `kinds` and `classes`
 
 A case with no `stdout` or `stderr` section must print nothing there. `error`
 is the diagnostic without its place, `panic` the panic's message, and a dump
-section holds only the case's own declarations. `--@ matrix` runs the case once
+section holds only the case's own declarations. `--% matrix` runs the case once
 per value, with the variable set in its environment, as `NAME[VAR=4]`. Any
 other header or directive is an error, so a line reading `-- X --` inside a
 module has to be reworded. `tests/harness/Archive.gob` gives the whole format.

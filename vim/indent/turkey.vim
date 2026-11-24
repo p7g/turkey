@@ -40,7 +40,12 @@ setlocal indentexpr=GetTurkeyIndent()
 " or `=`, which move it to a continuation or alternative's indent.
 setlocal indentkeys=0{,0},0),0],!^F,o,O,0=\|,0=\|\|,0=\|>,0=&&,0==
 
-let b:undo_indent = "setlocal indentexpr< indentkeys<"
+" The buffer's own 'preserveindent', which GetTurkeyIndent switches on for a
+" multi-line string's lines only.
+let b:turkey_preserveindent = &l:preserveindent
+
+let b:undo_indent = "setlocal indentexpr< indentkeys< preserveindent<"
+      \ . " | unlet! b:turkey_preserveindent"
 
 if exists("*GetTurkeyIndent")
   finish
@@ -551,14 +556,21 @@ endfunction
 function! GetTurkeyIndent() abort
   let lnum = v:lnum
 
+  let &l:preserveindent = get(b:, "turkey_preserveindent", 0)
+
   " Keep a block comment's interior as written.
   if s:InBlockComment(lnum)
     return -1
   endif
 
   " Keep a multi-line string's lines as written: their indentation is part of
-  " the string. So is its closing line's, which sets the string's.
+  " the string. So is its closing line's, which sets the string's. Vim
+  " rewrites a kept indent as tabs, which would turn four spaces of the string
+  " into a tab, unless 'preserveindent' is on. So switch it on for these lines
+  " only. It stays on until the next line is indented, since nothing runs
+  " after Vim sets this line's indent to switch it back.
   if s:InMultiString(lnum)
+    let &l:preserveindent = 1
     return -1
   endif
 

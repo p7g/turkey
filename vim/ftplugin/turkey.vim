@@ -21,11 +21,6 @@ if get(g:, "turkey_recommended_style", 1)
   setlocal noexpandtab tabstop=4 shiftwidth=0 softtabstop=0 textwidth=100
 endif
 
-" Reindenting keeps a line's tabs and spaces where its indent does not change.
-" A multi-line string's lines keep their indent, which is part of the string,
-" and without this Vim would rewrite four spaces of it as a tab.
-setlocal preserveindent
-
 " Identifiers may end in primes (`x'`).
 setlocal iskeyword+='
 
@@ -50,7 +45,7 @@ augroup turkey_format_on_save
 augroup END
 
 let b:undo_ftplugin = "setlocal commentstring< comments< formatoptions<"
-      \ . " preserveindent< iskeyword< include< includeexpr< suffixesadd<"
+      \ . " iskeyword< include< includeexpr< suffixesadd<"
       \ . " expandtab< tabstop< shiftwidth< softtabstop< textwidth< formatexpr<"
       \ . " | unlet! b:match_words"
       \ . " | silent! delcommand -buffer TurkeyFormat"

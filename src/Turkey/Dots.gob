@@ -1,0 +1,151 @@
+export (
+	Site(..),
+	Meaning(..),
+	register,
+	siteOf,
+	isDot,
+	predName,
+	learnBinders,
+	binderNamed,
+	refer,
+	count,
+	summary,
+	calleeFirst,
+)
+
+--- Method calls: `x.f(args)` means `M.f(x, args)`, where `M` is the home of
+--- the head of `x`'s type, unless that type is a record with a field `f`.
+---
+--- The generator records each call it finds as a `Site` and demands a wanted
+--- the solver discharges once the receiver's head is known. The solver
+--- decides what the site means and rewrites the call in place, so that the
+--- stages after inference see an ordinary call of `M.f` or of the field.
+
+import Data.Set as Set
+import System.Env as Env
+import Turkey.Ast (Pred as _, ..)
+import Turkey.Binders as Binders
+import Turkey.Solved (Use, Scope)
+import Turkey.Types as Ty
+import Turkey.Source (Span(..))
+
+--- What a method call turned out to call.
+type Meaning = Undecided | Method(String) | FieldCall
+
+--- One `x.f(args)`.
+type Site = Site {
+	label : String
+	--- The call, rewritten in place once the site is decided.
+	call : Expr
+	--- The `x.f` node: its id keys the site's `Use`, and its recorded type
+	--- is `callee`.
+	member   : Expr
+	receiver : Ty.Type
+	args     : Array Ty.Type
+	result   : Ty.Type
+	--- The type of what is called: `M.f`'s instantiation, or the field's.
+	callee      : Ty.Type
+	use         : Use
+	var meaning : Meaning
+	--- How many times the solver has looked at the site.
+	var tries : Int
+	--- The dictionary scopes open where the site was first met, which a
+	--- site decided later has to keep rather than the solver's.
+	var scopes : Option (Vec Scope)
+}
+
+let sites : Map Int Site = Map.new()
+
+--- How the sites of each file were decided, as a measurement: on the
+--- solver's first look, which is when the walk reaches the site ("first");
+--- later, once something further on decided the receiver ("later"); or never.
+let tallies : Map String (Map String Int) = Map.new()
+
+fun count(where : Option Span, how : String, detail : String) -> Unit {
+	let file = match where {
+		Some(sp) -> sp.file
+		None     -> "?"
+	}
+	let row = match Map.get(tallies, file) {
+		Some(r) -> r
+		None -> {
+			let r = Map.new()
+			Map.put(tallies, file, r)
+			r
+		}
+	}
+	Map.put(row, how, Map.getOr(row, how, 0) + 1)
+	if Env.get("TURKEY_DOT_STATS") == Some("2") && how != "sites" {
+		let line = match where {
+			Some(sp) -> sp.file + ":" + Int.toString(sp.line) + ":" + Int.toString(sp.col)
+			None     -> "?"
+		}
+		print(line + " " + how + " " + detail)
+	}
+}
+
+--- Returns one line per file that has a site: its counts.
+fun summary() -> String {
+	var out = ""
+	for (file, row) in Map.entries(tallies) {
+		out = out
+			+ file
+			+ ": sites "
+			+ Int.toString(Map.getOr(row, "sites", 0))
+			+ ", first "
+			+ Int.toString(Map.getOr(row, "first", 0))
+			+ ", later "
+			+ Int.toString(Map.getOr(row, "later", 0))
+			+ ", never "
+			+ Int.toString(
+				Map.getOr(row, "sites", 0) -
+					Map.getOr(row, "first", 0) -
+					Map.getOr(row, "later", 0),
+			)
+			+ "\n"
+	}
+	out
+}
+
+let prefix = "%Dot#"
+
+--- Returns the name of the wanted for the site keyed by `member`'s id.
+fun predName(member : Expr) -> String = prefix + Int.toString(member.id)
+
+--- Returns whether `name` names a site's wanted.
+fun isDot(name : String) -> Bool = String.startsWith(name, prefix)
+
+fun register(s : Site) -> Unit {
+	Map.put(sites, s.member.id, s)
+	count(s.use.span, "sites", "")
+}
+
+--- Returns the site whose wanted is named `name`.
+fun siteOf(name : String) -> Option Site = match String.stripPrefix(name, prefix) {
+	Some(digits) -> match Int.parse(digits) {
+		Some(id) -> Map.get(sites, id)
+		None     -> None
+	}
+	None -> None
+}
+
+type Lookup = Lookup { var table : Option Binders.Table }
+
+let lookup = Lookup { table = None }
+
+fun learnBinders(t : Binders.Table) -> Unit { lookup.table = Some(t) }
+
+fun binderNamed(internal : String) -> Option Int = match lookup.table {
+	Some(t) -> Binders.named(t, internal)
+	None    -> None
+}
+
+--- Whether a call's callee is unified with the call's shape before its
+--- arguments are walked, as a measurement: `TURKEY_DOT_ORDER=callee`.
+fun calleeFirst() -> Bool = Env.get("TURKEY_DOT_ORDER") == Some("callee")
+
+--- Records that the node `nodeId` means the binder `id`.
+fun refer(nodeId : Int, id : Int) -> Unit = match lookup.table {
+	Some(t) -> Binders.record(t, nodeId, id)
+	None    -> {}
+}

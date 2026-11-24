@@ -63,6 +63,7 @@ import Turkey.Constraints (
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
+import Turkey.Dots as Dots
 import Turkey.Inert as Inert
 import Turkey.Inert (Refusal(..), Given(..))
 import Turkey.Diag as Diag
@@ -498,6 +499,19 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
 		}
 	}
 
+	-- A method call `x.f(args)` may mean any top-level `f` of the group, so it
+	-- depends on all of them: which one is decided only by solving.
+	let byLabel : Map String (Vec String) = Map.new()
+	for (name, key) in Map.entries(owner) {
+		let label = match String.splitOnce(name, "#") {
+			Some((_, after)) -> after
+			None             -> name
+		}
+		match Map.get(byLabel, label) {
+			Some(keys) -> Vec.push(keys, key)
+			None       -> Map.put(byLabel, label, [key])
+		}
+	}
 	let graph = Map.new()
 	for var i = 0; i < len(items); i = i + 1 {
 		let edges = Set.new()
@@ -506,6 +520,9 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
 				Some(key) -> Set.add(edges, key)
 				None      -> {}
 			}
+		}
+		for label in Set.elements(Deps.methodLabels(items[i])) {
+			for key in Map.getOr(byLabel, label, []) { Set.add(edges, key) }
 		}
 		Map.put(graph, "item" + Int.toString(i), edges)
 	}
@@ -2755,12 +2772,30 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
 	ERecord(conName, fields) -> genRecord(g, e, conName, fields)
 	ELambda(params, ret, body, _) ->
 		genFunction(g, params, ret, Some(body), e.span, [], None, -1, None)
-	ECall(fn, args) -> {
-		let fnType = genExpr(g, fn)
-		let argTypes = Array.map(args, genExpr(g, _))
-		let result = fresh(g)
-		eq(g, fnType, TFun(argTypes, result), Some(e.span), callContext(args))
-		result
+	ECall(fn, args) -> match fn.kind {
+		EField(obj, label) -> genMethodCall(g, e, fn, obj, label, args)
+		_ -> if Dots.calleeFirst() {
+			let fnType = genExpr(g, fn)
+			let params = Array.map(args, fun(_) = fresh(g))
+			let result = fresh(g)
+			eq(g, fnType, TFun(params, result), Some(e.span), callContext(args))
+			for var i = 0; i < len(args); i = i + 1 {
+				eq(
+					g,
+					params[i],
+					genArgument(g, params[i], args[i]),
+					Some(args[i].span),
+					callContext(args),
+				)
+			}
+			result
+		} else {
+			let fnType = genExpr(g, fn)
+			let argTypes = Array.map(args, genExpr(g, _))
+			let result = fresh(g)
+			eq(g, fnType, TFun(argTypes, result), Some(e.span), callContext(args))
+			result
+		}
 	}
 	EIndex(arr, index, _, _) -> {
 		let element = fresh(g)
@@ -3252,6 +3287,73 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
 		}
 		_ -> bug("not a field access", Some(e.span))
 	}
+
+-- An argument of a call whose callee was unified with the call's shape first:
+-- a lambda is given its parameter's expected type before its body is walked.
+fun genArgument(g : Generator, param : Ty.Type, arg : Expr) -> Ty.Type = match arg.kind {
+	ELambda(lps, ret, body, _) -> {
+		let ps = Array.map(lps, fun(_) = fresh(g))
+		let r = fresh(g)
+		eq(g, param, TFun(ps, r), Some(arg.span), "the argument")
+		let t = genFunction(
+			g,
+			lps,
+			ret,
+			Some(body),
+			arg.span,
+			[],
+			None,
+			-1,
+			Some((TFun(ps, r), "the argument")),
+		)
+		Typed.record(g.types, arg, t)
+		t
+	}
+	_ -> genExpr(g, arg)
+}
+
+-- `x.f(args)`: a call of `M.f(x, args)` or of the field `f`, which the solver
+-- decides once the receiver's head is known (`Turkey.Dots`). The `x.f` node is
+-- given the callee's type and keyed to a `Use`, which whichever meaning the
+-- solver picks fills in.
+fun genMethodCall(
+	g : Generator,
+	call : Expr,
+	member : Expr,
+	obj : Expr,
+	label : String,
+	args : Vec Expr,
+) -> Ty.Type {
+	let receiver = genExpr(g, obj)
+	let argTypes = Array.map(args, genExpr(g, _))
+	let result = fresh(g)
+	let callee = fresh(g)
+	Typed.record(g.types, member, callee)
+	let u = newUse(label, None, Some(member.span), None)
+	Map.put(g.types.uses, member.id, u)
+	Dots.register(Dots.Site {
+		label    = label
+		call     = call
+		member   = member
+		receiver = receiver
+		args     = argTypes
+		result   = result
+		callee   = callee
+		use      = u
+		meaning  = Dots.Undecided
+		tries    = 0
+		scopes   = None
+	})
+	emit(
+		g,
+		C.cpredOf(
+			Ty.pred(Dots.predName(member), [receiver]),
+			Some(member.span),
+			"the call of '." + label + "'",
+		),
+	)
+	result
+}
 
 -- An operator is a call to the method it desugars to.
 --

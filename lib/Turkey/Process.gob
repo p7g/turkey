@@ -274,7 +274,9 @@ fun raise() -> Unit = Ptr.store(workerRecord(), flagAt(), 1)
 -- The frames that were on the stack when a panic was raised, each as the
 -- address it returns to, innermost first. A frame is one function's, and
 -- the calls inlined into it are told apart only when it is reported. They are taken when the panic is raised because by the
--- time it is reported every one of those calls has returned.
+-- time it is reported every one of those calls has returned. On wasm, which
+-- cannot read its stack, each is added as the panic returns through it
+-- (`tracePush`).
 --
 -- One panic's, for the whole process: the first to be raised since the last
 -- `panicClear`, which in a program that ends by panicking is the one
@@ -323,6 +325,12 @@ fun capture(frame : Ptr) -> Unit {
     let words = traceWords
     if Ptr.isNull(words) { return }
     if Ptr.atomicCas(words, 0, 0, Ptr.toInt(workerRecord())) != 0 { return }
+    -- Wasm code cannot read its stack, and its trace is built as the panic
+    -- returns, by `tracePush`, so it starts empty.
+    if let Wasi = Target.os {
+        Ptr.store(words, 8, 0)
+        return
+    }
     let stack : Ptr = Ptr.load(workerRecord(), 280)
     var count = 0
     if !Ptr.isNull(stack) {
@@ -342,6 +350,34 @@ fun capture(frame : Ptr) -> Unit {
         }
     }
     Ptr.store(words, 8, count)
+}
+
+-- On wasm, `site` added to the running worker's panic's trace, as the next
+-- frame out. Generated code calls it on the way out of each function the
+-- panic returns through, before it leaves, with the number of the site the
+-- function was stopped at; the trace table maps the number to the function
+-- and the position, as it maps a return address on arm64
+-- (`Turkey.Wasm.Select`).
+--
+-- It runs with the flag up, and generated code returns at once from any call
+-- that finds the flag up, so it calls nothing: every word it reads and writes
+-- is a load or a store here, and the worker's record is `Prim.processState`
+-- rather than `workerRecord()`. A call left in it would return to the way
+-- out, which calls this again. For the same reason the trace starts at the
+-- primitive's caller: the flag goes up in the primitive's last store, with no
+-- call left in it to return through.
+foreign "turkey_trace_push" fun tracePush(site : Int) -> Unit {
+    -- Site 0 has no source position. It is counted and prints nothing, as a
+    -- frame record whose return address has no row is on arm64.
+    let words = traceWords
+    if Ptr.toInt(words) == 0 { return }
+    let owner : Int = Ptr.load(words, 0)
+    if owner != Ptr.toInt(Prim.processState()) { return }
+    let count : Int = Ptr.load(words, 8)
+    -- `traceInner()` and `traceOuter()`, written out, since each is a call.
+    let slot = if count < 48 { count } else { 48 + (count - 48) % 16 }
+    Ptr.store(words, 16 + 8 * slot, site)
+    Ptr.store(words, 8, Prim.intAddWrapping(count, 1))
 }
 
 -- Whether the trace is of the running worker's panic.

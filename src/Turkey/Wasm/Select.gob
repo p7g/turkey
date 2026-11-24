@@ -32,6 +32,20 @@ export (
 --- the flag in the worker's record, and a function that finds it set returns
 --- zeros of its result types, as on arm64. There is no exception handling.
 ---
+--- **Roots are in a shadow frame.** Wasm code cannot read its own stack, so
+--- a function with values the collector must find (`Turkey.Roots`) keeps
+--- them in a frame on the shadow stack, in linear memory. Each root is
+--- stored into its slot where it is defined, and before each call that may
+--- collect the frame records the site it is stopped at, which the frame
+--- table maps to the slots live there. The collector walks the frames from
+--- the shadow stack pointer (`Turkey.Heap`).
+---
+--- **A panic's trace is built as it returns.** Each site a panic can return
+--- through has a number, and the trace table maps it to its function and
+--- position. On the path that leaves because the flag is set, a function
+--- adds its site to the trace (`Turkey.Process`), so the trace costs nothing
+--- until a panic is raised.
+---
 --- Incomplete by design, as arm64's selection is: an operation with no rule
 --- stops its function, and `stopped` names it.
 
@@ -76,11 +90,18 @@ type Context = Context {
     --- The global holding the running worker's record, which is the process
     --- state with one worker.
     worker    : Int,
-    --- The global holding the shadow stack's pointer, which frame objects
-    --- are allocated below.
+    --- The global holding the shadow stack's pointer: the innermost shadow
+    --- frame, which each function that has one pushes below it.
     stackPointer : Int,
-    --- The lowest address the shadow stack may reach.
+    --- The global holding the lowest address a frame may be pushed at: the
+    --- stack's bottom and a reserve above it, which the panic that running
+    --- out raises takes by lowering this to the bottom.
     stackLimit : Int,
+    --- The shadow stack's bottom.
+    stackBottom : Int,
+    --- The sites numbered so far, in every function: a site's number is
+    --- above every number before it, and 0 is no site.
+    var siteCount : Int,
 }
 
 --- NUL-terminated strings in data at `start`, each at the address
@@ -104,6 +125,13 @@ type Selected = Selected {
     locals  : Array W.ValType,
     body    : Array W.Op,
     stopped : Option String,
+    --- The frame table's entries for the function's sites: each site's
+    --- number and the offsets, from its shadow frame, of the roots live
+    --- there. A site whose frame holds no live root has none.
+    entries : Vec (Int, Array Int),
+    --- The trace table's calls: each site a panic can return through that has
+    --- a source position, as its number and the position.
+    calls   : Vec (Int, Int),
 }
 
 --- Returns the wasm type a value of `r` is held in. A narrow integer is an
@@ -148,18 +176,46 @@ type Sel = Sel {
     params  : Int,
     var stopped : Option String,
     frame   : Roots.Frame,
-    -- Frame object index -> its offset from the shadow stack pointer.
+    -- Frame object index -> its offset from the shadow frame.
     offsets : Array Int,
+    -- The shadow frame's bytes, 0 when the function has none.
     frameBytes : Int,
+    -- The `i32` local holding the shadow frame's address, set by the
+    -- prologue; -1 when there is no frame.
+    framePointer : Int,
+    -- Whether any site of the function has a root live in its frame, which
+    -- is when the frame's site word must be kept current.
+    publishes : Bool,
     -- The wasm types of the function's results.
     answers : Array W.ValType,
     -- The integer constants the low IR defines, by value id.
     known   : Map Int Int,
-    -- The low IR instruction being selected, as its block and index.
+    -- The low IR instruction being selected, as its block and index; the
+    -- index is the block's length for its terminator.
     var place : (Int, Int),
+    -- The number of each site numbered in this function, by `place`.
+    sites   : Map Int Int,
+    -- The blocks open where the next instruction goes, the function's own
+    -- included.
+    var depth : Int,
+    -- The `i64` local holding the site a panic leaves from (`bail`).
+    leaving : Int,
+    -- What goes into `Selected`, and which sites are in it already.
+    entries : Vec (Int, Array Int),
+    calls   : Vec (Int, Int),
+    entered : Map Int Unit,
+    called  : Map Int Unit,
 }
 
-fun op(s : Sel, o : W.Op) -> Unit = Vec.push(s.out, o)
+-- Appends `o`, keeping count of the blocks it opens and closes.
+fun op(s : Sel, o : W.Op) -> Unit {
+    match o {
+        W.Block(_) | W.Loop(_) | W.If(_) -> { s.depth = s.depth + 1 }
+        W.End -> { s.depth = s.depth - 1 }
+        _ -> {}
+    }
+    Vec.push(s.out, o)
+}
 
 fun stop(s : Sel, what : String) -> Unit {
     if Option.isNone(s.stopped) { s.stopped = Some(what) }
@@ -209,14 +265,29 @@ fun selectFunction(cx : Context, f : Func Low) -> Selected {
         Left(why) -> stop(s, why)
         Right(body) -> {
             prologue(s)
+            -- The body is in a block whose end is the way out of a function a
+            -- panic is leaving (`bail`), so that each site that leaves is a
+            -- branch, and the code that adds to the trace, releases the frame
+            -- and returns zeros is there once.
+            op(s, W.Block(W.Empty))
             control(s, body)
-            -- Every path through the body has returned by here. The engine
-            -- cannot always see that -- an `if` whose arms both return leaves
-            -- nothing on the stack -- so the end says it.
+            -- Every path through the body has left by here. The engine cannot
+            -- always see that -- an `if` whose arms both return leaves nothing
+            -- on the stack -- so the end says it.
             op(s, W.Unreachable)
+            op(s, W.End)
+            if let Some(push) = definedIndex(s, "turkey_trace_push") {
+                op(s, W.ConstI64(0))
+                op(s, W.LocalGet(s.leaving))
+                op(s, W.Call(push))
+                op(s, W.Drop)
+            }
+            for t in s.answers { op(s, zeroOf(t)) }
+            leave(s)
         }
     }
-    Selected { locals = Vec.toArray(s.locals), body = Vec.toArray(s.out), stopped = s.stopped }
+    Selected { locals = Vec.toArray(s.locals), body = Vec.toArray(s.out), stopped = s.stopped,
+               entries = s.entries, calls = s.calls }
 }
 
 fun start(cx : Context, f : Func Low) -> Sel {
@@ -236,17 +307,45 @@ fun start(cx : Context, f : Func Low) -> Sel {
         }
     }
     let frame = Roots.analyze(f)
+    -- Every shadow frame has the header, so that a walk can step over one
+    -- whatever it holds; a function with neither roots nor objects has no
+    -- frame.
+    let header = if Roots.slotCount(frame) > 0 || len(frame.objects) > 0 { headerBytes }
+                 else { 0 }
     let offsets = Array.filled(len(frame.objects), 0)
-    var bytes = 0
+    var bytes = header + 8 * Roots.slotCount(frame)
     for var k = 0; k < len(frame.objects); k = k + 1 {
         offsets[k] = bytes
         bytes = bytes + frame.objects[k].bytes
     }
     -- The shadow stack pointer stays 16-byte aligned, as a machine stack's is.
     let frameBytes = (bytes + 15) & -16
+    let framePointer = if frameBytes > 0 {
+        Vec.push(locals, W.I32)
+        next
+    } else { -1 }
+    Vec.push(locals, W.I64)
+    let leaving = params + len(locals) - 1
     Sel { source = f, cx = cx, out = [], locals = locals, local = local, params = params,
           stopped = None, frame = frame, offsets = offsets, frameBytes = frameBytes,
-          answers = Array.map(f.results, valType), known = constantsOf(f), place = (0, 0) }
+          framePointer = framePointer, publishes = publishing(f, frame),
+          answers = Array.map(f.results, valType), known = constantsOf(f), place = (0, 0),
+          depth = 0, leaving = leaving, sites = Map.new(), entries = [], calls = [],
+          entered = Map.new(), called = Map.new() }
+}
+
+-- Whether some site of `f` has a root live in its frame: a slot, or a traced
+-- field of one of its objects.
+fun publishing(f : Func Low, frame : Roots.Frame) -> Bool {
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        for var n = 0; n < len(f.blocks[b].insts); n = n + 1 {
+            if len(Roots.liveAt(frame, b, n)) > 0 { return True }
+            for k in Roots.objectsAt(frame, b, n) {
+                if len(frame.objects[k].traced) > 0 { return True }
+            }
+        }
+    }
+    False
 }
 
 fun constantsOf(f : Func Low) -> Map Int Int {
@@ -261,34 +360,143 @@ fun constantsOf(f : Func Low) -> Map Int Int {
     out
 }
 
--- The frame, when the function has objects in it: the shadow stack pointer
--- moved down past them, a trap if that passes the stack's limit, and the
--- traced fields cleared of each object some path reads before building it
--- (`Turkey.Roots.FrameObject`).
+-- -- the shadow frame --------------------------------------------------------------
+--
+-- A function's shadow frame, when it has one, is at the shadow stack pointer,
+-- 16-byte aligned:
+--
+--   0    the address past the frame, which is the next frame out or the top
+--        of the stack: what a walk follows outwards
+--   8    the site the function is stopped at, or 0 for none; the frame
+--        table's entry for it lists the roots live there
+--   16   a word for each root slot (`Turkey.Roots.slotOf`)
+--   then the frame objects, in `Turkey.Roots.Frame.objects` order
+--
+-- The walks read it in `Turkey.Heap` and `Turkey.HeapCheck`.
+
+let headerBytes = 16
+
+-- The frame, when the function has one: the shadow stack pointer moved down
+-- past it, a panic if that passes the stack's limit, the header, each
+-- parameter that is a root in its slot, and the traced fields cleared of
+-- each object some path reads before building it (`Turkey.Roots.FrameObject`).
 fun prologue(s : Sel) -> Unit {
     if s.frameBytes == 0 { return }
     op(s, W.GlobalGet(s.cx.stackPointer))
     op(s, W.ConstI64(s.frameBytes))
     op(s, W.IntBin(W.W64, W.Sub))
     op(s, W.GlobalSet(s.cx.stackPointer))
-    -- Nothing guards the memory below the stack, so running out is a trap
-    -- here rather than a write over whatever is there.
+    -- Nothing guards the memory below the stack, so running out is tested
+    -- here rather than a write over whatever is there. It panics, from the
+    -- caller's frame and with the reserve below the limit for the panic's own
+    -- frames, and returns before this function's body: no frame of it is on
+    -- the trace, as none of the function that overflowed is on arm64's.
     op(s, W.GlobalGet(s.cx.stackPointer))
-    op(s, W.ConstI64(s.cx.stackLimit))
+    op(s, W.GlobalGet(s.cx.stackLimit))
     op(s, W.IntRel(W.W64, W.LtU))
     op(s, W.If(W.Empty))
-    op(s, W.Unreachable)
+    op(s, W.ConstI64(s.cx.stackBottom))
+    op(s, W.GlobalSet(s.cx.stackLimit))
+    release(s)
+    match definedIndex(s, "turkey_panic") {
+        Some(raise) -> {
+            op(s, W.ConstI64(0))
+            op(s, W.ConstI64(cString(s.cx.strings, "stack overflow")))
+            op(s, W.Call(raise))
+            op(s, W.Drop)
+        }
+        None -> op(s, W.Unreachable)
+    }
+    for t in s.answers { op(s, zeroOf(t)) }
+    op(s, W.Return)
     op(s, W.End)
+    op(s, W.GlobalGet(s.cx.stackPointer))
+    op(s, W.Convert(W.I32WrapI64))
+    op(s, W.LocalTee(s.framePointer))
+    op(s, W.GlobalGet(s.cx.stackPointer))
+    op(s, W.ConstI64(s.frameBytes))
+    op(s, W.IntBin(W.W64, W.Add))
+    op(s, W.Store(W.I64Store, 0))
+    -- No site until the first call that may collect names one. The memory
+    -- holds whatever a frame there held before, which may be a site whose
+    -- entry lists slots this frame has not written.
+    op(s, W.LocalGet(s.framePointer))
+    op(s, W.ConstI64(0))
+    op(s, W.Store(W.I64Store, 8))
+    for p in s.source.params { keep(s, p) }
     for var k = 0; k < len(s.frame.objects); k = k + 1 {
         if s.frame.objects[k].zeroed {
             for field in s.frame.objects[k].traced {
-                op(s, W.GlobalGet(s.cx.stackPointer))
-                op(s, W.Convert(W.I32WrapI64))
+                op(s, W.LocalGet(s.framePointer))
                 op(s, W.ConstI64(0))
                 op(s, W.Store(W.I64Store, s.offsets[k] + field))
             }
         }
     }
+}
+
+-- `v` stored into its slot, if it has one. A slot holds one value from its
+-- definition to the end of the frame (`Turkey.Roots.Frame.slots`), so the
+-- store at the definition is the only one.
+fun keep(s : Sel, v : Value) -> Unit {
+    if let Some(slot) = Roots.slotOf(s.frame, Ssa.valueId(v)) {
+        if !wide(classOf(s, v)) { return stop(s, "a root that is not held in a word") }
+        op(s, W.LocalGet(s.framePointer))
+        get(s, v)
+        op(s, W.Store(W.I64Store, headerBytes + 8 * slot))
+    }
+}
+
+-- Before a call that may collect: the frame's site word set to this site,
+-- and the frame table given the site's roots, the slots and the frame
+-- objects' traced fields live across it. A site with none sets the word to 0,
+-- since the site before it may name slots that hold dead values by now, and
+-- a dead value's object may already be freed.
+fun publish(s : Sel) -> Unit {
+    if !s.publishes { return }
+    let (b, n) = s.place
+    let offsets = []
+    for (slot, _) in Roots.liveAt(s.frame, b, n) { Vec.push(offsets, headerBytes + 8 * slot) }
+    for k in Roots.objectsAt(s.frame, b, n) {
+        for field in s.frame.objects[k].traced { Vec.push(offsets, s.offsets[k] + field) }
+    }
+    let id = if len(offsets) == 0 { 0 } else { site(s) }
+    if id != 0 && !Map.contains(s.entered, id) {
+        Map.put(s.entered, id, ())
+        Vec.push(s.entries, (id, Vec.toArray(offsets)))
+    }
+    op(s, W.LocalGet(s.framePointer))
+    op(s, W.ConstI64(id))
+    op(s, W.Store(W.I64Store, 8))
+}
+
+-- The number of the site being selected, numbering it if this is its first
+-- mention.
+fun site(s : Sel) -> Int {
+    let (b, n) = s.place
+    let key = b << 32 | n
+    if let Some(id) = Map.get(s.sites, key) { return id }
+    s.cx.siteCount = s.cx.siteCount + 1
+    Map.put(s.sites, key, s.cx.siteCount)
+    s.cx.siteCount
+}
+
+-- The number a panic leaving from the site being selected adds to its trace
+-- (`Turkey.Process.tracePush`), with the site added to the trace table; 0,
+-- which counts a frame and prints nothing, for a site with no source
+-- position or none at all (an index of -1).
+fun traceSite(s : Sel) -> Int {
+    let (b, n) = s.place
+    if n < 0 { return 0 }
+    let block = s.source.blocks[b]
+    let at = if n < len(block.insts) { block.insts[n].at } else { block.termAt }
+    if at == 0 { return 0 }
+    let id = site(s)
+    if !Map.contains(s.called, id) {
+        Map.put(s.called, id, ())
+        Vec.push(s.calls, (id, at))
+    }
+    id
 }
 
 -- The shadow stack pointer moved back up past this function's frame, which
@@ -307,10 +515,13 @@ fun leave(s : Sel) -> Unit {
     op(s, W.Return)
 }
 
--- Return zeros, which is how a panic leaves every function it passes through.
-fun leaveWithZeros(s : Sel) -> Unit {
-    for t in s.answers { op(s, zeroOf(t)) }
-    leave(s)
+-- Leave as a panic leaves every function it passes through: by the way out
+-- at the end of the body, which adds the site being selected to the trace and
+-- returns zeros.
+fun bail(s : Sel) -> Unit {
+    op(s, W.ConstI64(traceSite(s)))
+    op(s, W.LocalSet(s.leaving))
+    op(s, W.Br(s.depth - 1))
 }
 
 -- -- control flow ------------------------------------------------------------------
@@ -363,11 +574,19 @@ fun control(s : Sel, body : Vec St.Control) -> Unit {
                     get(s, message)
                     op(s, W.Call(f))
                     op(s, W.Drop)
-                    leaveWithZeros(s)
+                    bail(s)
                 }
                 None -> stop(s, "a panic with no turkey_panic_string")
             }
-            St.Unreachable -> leaveWithZeros(s)
+            -- After a call that never returns, which returns only to leave,
+            -- the site is the call's; otherwise there is none to trace.
+            St.Unreachable -> {
+                let (b, n) = s.place
+                let insts = s.source.blocks[b].insts
+                if n > 0 && isCallOp(insts[n - 1].op) { s.place = (b, n - 1) }
+                else { s.place = (b, -1) }
+                bail(s)
+            }
         }
     }
 }
@@ -403,6 +622,7 @@ fun table(s : Sel, v : Value, base : Int, targets : Array Int, default : Int) ->
 -- target's parameters.
 fun code(s : Sel, b : Int) -> Unit {
     let block = s.source.blocks[b]
+    for p in block.params { keep(s, p) }
     for var n = 0; n < len(block.insts); n = n + 1 {
         s.place = (b, n)
         -- What follows a tail call is its results, which the call returns
@@ -412,7 +632,10 @@ fun code(s : Sel, b : Int) -> Unit {
             return
         }
         selectInst(s, block.insts[n])
+        keep(s, block.insts[n].result)
     }
+    -- The terminator, which `control` selects next.
+    s.place = (b, len(block.insts))
     if let Ssa.Jump(target, args) = block.term {
         let params = Ssa.blockAt(s.source, target).params
         for a in args { get(s, a) }
@@ -681,6 +904,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- which the runtime reads the element's low bytes.
         ArrayNew(length, fill, element) -> match definedIndex(s, "turkey_array_new") {
             Some(f) -> {
+                publish(s)
                 op(s, W.ConstI64(0))
                 get(s, length)
                 get(s, fill)
@@ -768,8 +992,10 @@ fun addressOf(s : Sel, d : Value, a : AddressOf) -> Unit {
             }
             None -> return stop(s, "the code address of " + symbol + ", which wasm does not define")
         }
-        -- The frame this function's objects are in, which is the shadow
-        -- stack pointer once the prologue has moved it.
+        -- `Prim.frameAddress`: the innermost shadow frame, which is where a
+        -- walk of the shadow stack starts and what this function's objects
+        -- are in. It is this function's own once the prologue has pushed
+        -- one, and otherwise the nearest caller's that has one.
         ThisFrame -> op(s, W.GlobalGet(s.cx.stackPointer))
         ProcessState -> op(s, W.GlobalGet(s.cx.worker))
         AllocSites -> return stop(s, "address.sites")
@@ -1268,7 +1494,8 @@ fun shell(s : Sel, d : Value, slot : Int, environment : Option Value) -> Unit {
 -- `d` set to the address of its object in this function's frame.
 fun frameObject(s : Sel, d : Value) -> Unit = match Roots.objectOf(s.frame, Ssa.valueId(d)) {
     Some(k) -> {
-        op(s, W.GlobalGet(s.cx.stackPointer))
+        op(s, W.LocalGet(s.framePointer))
+        op(s, W.Convert(W.I64ExtendI32U))
         op(s, W.ConstI64(s.offsets[k]))
         op(s, W.IntBin(W.W64, W.Add))
         set(s, d)
@@ -1293,6 +1520,7 @@ fun allocate(s : Sel, d : Value, size : Int, slow : String, args : Array Int) ->
         None -> return stop(s, "an allocation with no " + slow)
     }
     let slowPath = fun() {
+        publish(s)
         op(s, W.ConstI64(0))
         for a in args { op(s, W.ConstI64(a)) }
         op(s, W.Call(entry))
@@ -1394,6 +1622,7 @@ fun barrierAt(s : Sel, target : Int, value : Int) -> Unit {
 fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = match callee {
     Direct(name) -> match Map.get(s.cx.functions, name) {
         Some(f) -> {
+            publish(s)
             for a in args { get(s, a) }
             op(s, W.Call(f))
             results(s, d, name)
@@ -1411,6 +1640,7 @@ fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = matc
     -- code's table slot.
     Indirect(closure) -> {
         let t = closureType(s, args, d)
+        publish(s)
         closureEnvironment(s, closure)
         for a in args { get(s, a) }
         closureCode(s, closure)
@@ -1451,6 +1681,7 @@ fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array V
     if fixed < len(args) { return stop(s, "a call of the variadic C function " + symbol) }
     if Map.contains(s.cx.defined, symbol) { return definedCall(s, d, symbol, args, False) }
     if let Some(f) = Map.get(s.cx.builtins, symbol) {
+        publish(s)
         for a in args { get(s, a) }
         op(s, W.Call(f))
         propagate(s)
@@ -1460,13 +1691,14 @@ fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array V
         Some(f) -> f
         None -> return stop(s, "a call of " + symbol + ", which is not imported")
     }
+    -- The host cannot call back into Turkey code, so it can neither collect,
+    -- which is why the frame names no site for it, nor raise a panic, which
+    -- is why no test follows.
     for a in args {
         get(s, a)
         if classOf(s, a) == Ptr { op(s, W.Convert(W.I32WrapI64)) }
     }
     op(s, W.Call(f))
-    -- The host cannot call back into Turkey code, so it cannot have raised a
-    -- panic, and no test follows.
     match classOf(s, d) {
         Unit -> {}
         Ptr -> {
@@ -1497,6 +1729,7 @@ fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value,
     if !held && !exiting {
         return stop(s, "a call of " + symbol + " whose declared result is not its definition's")
     }
+    publish(s)
     op(s, W.ConstI64(0))
     for a in args { get(s, a) }
     op(s, W.Call(f))
@@ -1545,12 +1778,13 @@ fun closureCode(s : Sel, closure : Value) -> Unit {
 -- the lowering leaves a call that never returns: that terminator leaves with
 -- zeros either way.
 fun propagate(s : Sel) -> Unit {
+    -- The `Unreachable` after it leaves, with this site on the trace.
     if endsUnreachable(s) { return }
     op(s, W.GlobalGet(s.cx.worker))
     op(s, W.Convert(W.I32WrapI64))
     op(s, W.Load(W.I32Load, 0))
     op(s, W.If(W.Empty))
-    leaveWithZeros(s)
+    bail(s)
     op(s, W.End)
 }
 
@@ -1558,10 +1792,15 @@ fun endsUnreachable(s : Sel) -> Bool {
     let (b, n) = s.place
     let block = s.source.blocks[b]
     if n != len(block.insts) - 1 { return False }
-    match (block.insts[n].op, block.term) {
-        (Call(_, _), Ssa.Unreachable) -> True
+    match block.term {
+        Ssa.Unreachable -> isCallOp(block.insts[n].op)
         _ -> False
     }
+}
+
+fun isCallOp(o : Op) -> Bool = match o {
+    Call(_, _) -> True
+    _ -> False
 }
 
 -- Panic with `message` and leave if the `i32` on the stack is not zero.
@@ -1578,6 +1817,6 @@ fun guard(s : Sel, message : String) -> Unit {
     op(s, W.ConstI64(cString(s.cx.strings, message)))
     op(s, W.Call(raise))
     op(s, W.Drop)
-    leaveWithZeros(s)
+    bail(s)
     op(s, W.End)
 }

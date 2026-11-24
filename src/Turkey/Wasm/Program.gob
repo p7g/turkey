@@ -8,11 +8,13 @@ export (Program(..), Unsupported(..), build)
 ---
 ---   0                    the first page of `Turkey.Runtime.immediates`
 ---                        bytes, which no object is ever at
----   immediates           the shadow stack, `stackBytes` long, which frame
----                        objects are allocated in from the top down
+---   immediates           the shadow stack, `stackBytes` long, which shadow
+---                        frames are pushed on from the top down
 ---   immediates + stack   the program's data: the literals' static objects,
 ---                        the globals, the root array and its frame, the
----                        process state, then every C string the code names
+---                        process state, and every C string the code names,
+---                        with the frame table and the trace table after the
+---                        functions' strings
 ---   past the data        the heap, which the C library grows the memory
 ---                        for
 ---
@@ -39,8 +41,12 @@ export (Program(..), Unsupported(..), build)
 --- **The entry.** `_start`, which WASI calls, runs `turkey_main` --
 --- `Turkey.Entry`'s, which runs the program -- and exits with its status.
 --- `turkey_entry`, which `Turkey.Entry` calls in turn, is written here: it
---- does what the arm64 entry does, except register frame and trace tables,
---- which wasm does not have yet.
+--- does what the arm64 entry does.
+---
+--- **The tables.** A site is named by the number selection gives it
+--- (`Turkey.Wasm.Select`) where arm64 names it by its return address, so the
+--- frame table and the trace table are arm64's with each key a site's
+--- number, from a base of 0.
 
 import Data.Map as Map
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), Callee(..))
@@ -48,6 +54,7 @@ import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), RepClass(..), Func(..), Block(..))
 import Turkey.SsaLower (Module(..))
+import Turkey.Trace as Trace
 import Turkey.Wasm as W
 import Turkey.Wasm.Module as M
 import Turkey.Wasm.Select as S
@@ -58,16 +65,31 @@ type Unsupported = Unsupported { name : String, what : String }
 --- The module's bytes, how many functions were selected, and the rest.
 type Program = Program { bytes : Vec Byte, selected : Int, refused : Vec Unsupported }
 
---- The bytes of the shadow stack.
-let stackBytes = 1 << 20
+-- The bytes of the shadow stack, sized to expect the engine's own stack to
+-- run out first. We expect a frame to take more of the engine's stack than of
+-- the shadow stack, since a function's roots are locals there too: a non-tail
+-- recursion holding two roots takes about 80 bytes of wasmtime's stack per
+-- call and 48 of this, so 8 MiB lasts until the engine's stack is past 13 MiB,
+-- against its default of 512 KiB. Nothing enforces it: a frame with large
+-- frame objects can take more of this than of the engine's.
+let stackBytes = 8 << 20
+
+-- The bytes at the bottom of the shadow stack that only the panic raised by
+-- running out may use (`Turkey.Wasm.Select.prologue`). The panic's own
+-- functions push frames too; without room for them, each would run out again
+-- and panic in turn, recursing until the engine's stack ran out.
+let stackReserve = 16384
 
 let pageBytes = 65536
 
 let wasi = "wasi_snapshot_preview1"
 
 --- Returns `m` as a wasm module whose `main` is the Turkey function `main`.
---- `libraries` names the wasm module each import comes from, by symbol.
-fun build(m : Module, main : String, libraries : Map String String) -> Program {
+--- `libraries` names the wasm module each import comes from, by symbol. A
+--- panic's trace names each file as `fileNames` does, in `Position.Files`
+--- order, and each function as `display` does.
+fun build(m : Module, main : String, libraries : Map String String,
+          fileNames : Array String, display : fun(String) -> String) -> Program {
     let wasm = M.newModule()
     let defined = Map.new()
     for (symbol, name) in m.definitions { Map.put(defined, symbol, name) }
@@ -122,6 +144,8 @@ fun build(m : Module, main : String, libraries : Map String String) -> Program {
                              [W.ConstI64(data.processState)])
     let stackPointer = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
                                    [W.ConstI64(data.start)])
+    let stackLimit = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
+                                 [W.ConstI64(Rt.immediates + stackReserve)])
     let builtins = Map.new()
     Map.put(builtins, Rt.programEntrySymbol, entry)
     let cx = S.Context {
@@ -130,11 +154,15 @@ fun build(m : Module, main : String, libraries : Map String String) -> Program {
         literals = data.literals, globals = data.globals, module_ = wasm,
         strings = S.Strings { start = data.start + len(data.image), bytes = [],
                               addresses = Map.new() },
-        worker = worker, stackPointer = stackPointer, stackLimit = Rt.immediates,
+        worker = worker, stackPointer = stackPointer, stackLimit = stackLimit,
+        stackBottom = Rt.immediates,
+        siteCount = 0,
     }
 
     let refused = []
     var selected = 0
+    let entries = []
+    let traced : Vec (Trace.Traced Int) = []
     for f in m.functions {
         let index = Map.getOr(functions, f.name, -1)
         let chosen = S.selectFunction(cx, f)
@@ -146,10 +174,31 @@ fun build(m : Module, main : String, libraries : Map String String) -> Program {
             None -> {
                 M.defineFunc(wasm, index, chosen.locals, chosen.body)
                 selected = selected + 1
+                for e in chosen.entries { Vec.push(entries, e) }
+                Vec.push(traced, Trace.Traced { name = f.name, at = f.at, sites = f.sites,
+                                                calls = chosen.calls })
             }
         }
     }
-    M.defineFunc(wasm, entry, [], entryBody(cx, m, main, data))
+    -- The tables go after the C strings interned so far. A string interned
+    -- later, as the entry's is, goes after them.
+    let strings = cx.strings
+    let tables = strings.bytes
+    align(tables, 8)
+    let frameTable = strings.start + len(tables)
+    frameTableBytes(entries, tables)
+    align(tables, 8)
+    let traceTable = strings.start + len(tables)
+    Trace.layout(fileNames, traced, display, Trace.Writer {
+        word = fun(n) = word32(tables, n),
+        call = fun(id) = word32(tables, id),
+        text = fun(text) = {
+            for b in String.toBytes(text) { Vec.push(tables, b) }
+            Vec.push(tables, Byte.truncate(0))
+        },
+        pad = fun(n) = for _ in Array.filled(n, 0) { Vec.push(tables, Byte.truncate(0)) },
+    })
+    M.defineFunc(wasm, entry, [], entryBody(cx, m, main, data, frameTable, traceTable))
     M.defineFunc(wasm, start, [], [
         -- `turkey_main`'s environment, `argc` and `argv`.
         W.ConstI64(0), W.ConstI64(0), W.ConstI64(0),
@@ -158,14 +207,11 @@ fun build(m : Module, main : String, libraries : Map String String) -> Program {
         W.Call(exit),
     ])
 
-    let strings = cx.strings
     let end = strings.start + len(strings.bytes)
     let limits = M.Limits { min = (end + pageBytes - 1) / pageBytes, max = None }
     let memory = M.addMemory(wasm, limits)
     if len(data.image) > 0 { M.addData(wasm, memory, data.start, Vec.toArray(data.image)) }
-    if len(strings.bytes) > 0 {
-        M.addData(wasm, memory, strings.start, Vec.toArray(strings.bytes))
-    }
+    M.addData(wasm, memory, strings.start, Vec.toArray(strings.bytes))
     M.addExport(wasm, "memory", M.ExportMemory, memory)
     M.addExport(wasm, "_start", M.ExportFunc, start)
     Program { bytes = M.write(wasm), selected = selected, refused = refused }
@@ -308,13 +354,31 @@ fun word(out : Vec Byte, n : Int) -> Unit {
     for var k = 0; k < 8; k = k + 1 { Vec.push(out, Byte.truncate((n >> (8 * k)) & 0xFF)) }
 }
 
+-- The low 32 bits of `n` as 4 bytes, little-endian.
+fun word32(out : Vec Byte, n : Int) -> Unit {
+    for var k = 0; k < 4; k = k + 1 { Vec.push(out, Byte.truncate((n >> (8 * k)) & 0xFF)) }
+}
+
+-- The frame table, as `Turkey.Heap.frameTableSet` reads it: the count, then
+-- per entry its site's number, its number of roots, and each root's offset
+-- from the shadow frame, every field four bytes.
+fun frameTableBytes(entries : Vec (Int, Array Int), out : Vec Byte) -> Unit {
+    word32(out, len(entries))
+    for (id, offsets) in entries {
+        word32(out, id)
+        word32(out, len(offsets))
+        for o in offsets { word32(out, o) }
+    }
+}
+
 -- -- the entry -----------------------------------------------------------------------
 
 -- `turkey_entry`: early initialization, which runs before roots and
 -- literals exist; then, unless that panicked, the stack's outer bound, the
 -- permanent root frame over the root array, the literals' range, the
 -- globals, and `main`; and `turkey_entry_returned` last.
-fun entryBody(cx : S.Context, m : Module, main : String, data : Data) -> Array W.Op {
+fun entryBody(cx : S.Context, m : Module, main : String, data : Data, frameTable : Int,
+              traceTable : Int) -> Array W.Op {
     let out = []
     let run = fun(name : String) {
         match Map.get(cx.functions, name) {
@@ -347,6 +411,11 @@ fun entryBody(cx : S.Context, m : Module, main : String, data : Data) -> Array W
     Vec.push(out, W.ConstI32(data.globalsFrame))
     Vec.push(out, W.ConstI64(-1))
     Vec.push(out, W.Store(W.I64Store, 32))
+    -- The frame table, before anything allocates: a collection that cannot
+    -- read it sees no frame's roots at all. Then the trace table, which a
+    -- panic's report reads.
+    runtime("turkey_frame_table_set", [frameTable, 0])
+    runtime("turkey_trace_table_set", [traceTable, 0])
     if data.staticEnd > data.staticStart {
         runtime("turkey_static_register", [data.staticStart, data.staticEnd])
     }
@@ -355,6 +424,21 @@ fun entryBody(cx : S.Context, m : Module, main : String, data : Data) -> Array W
     -- has none.
     Vec.push(out, W.ConstI64(0))
     run(main)
+    -- A panic's trace counts this call as arm64's counts the frame record
+    -- `main` returns to the entry through, which prints nothing.
+    if let Some(name) = Map.get(cx.defined, "turkey_trace_push") {
+        if let Some(push) = Map.get(cx.functions, name) {
+            Vec.push(out, W.GlobalGet(cx.worker))
+            Vec.push(out, W.Convert(W.I32WrapI64))
+            Vec.push(out, W.Load(W.I32Load, 0))
+            Vec.push(out, W.If(W.Empty))
+            Vec.push(out, W.ConstI64(0))
+            Vec.push(out, W.ConstI64(0))
+            Vec.push(out, W.Call(push))
+            Vec.push(out, W.Drop)
+            Vec.push(out, W.End)
+        }
+    }
     Vec.push(out, W.End)
     runtime("turkey_entry_returned", [])
     Vec.toArray(out)

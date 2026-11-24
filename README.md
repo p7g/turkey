@@ -397,7 +397,10 @@ alongside one page per module and the JSON. The same site is published to
 
 `turkey format FILE...` rewrites each file in the one style, and
 `turkey format --check FILE...` only names the files it would change, exiting 1
-if there is one. There are no options. The style is specified by the pairs in
+if there is one. `turkey format -` reads one text from standard input and
+writes it formatted to standard output, which is how an editor formats a
+buffer; `--stdin-name NAME` gives the name its diagnostics use. There are no
+options for the style. The style is specified by the pairs in
 `tests/format/`: each `NAME.gob` and the `NAME.expected.gob` it formats to. The
 formatter refuses a file, with an internal error naming it, unless its output
 parses to the same tree, holds the same comments, and formats to itself.

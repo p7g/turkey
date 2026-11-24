@@ -1,0 +1,469 @@
+-- An entry point in `src/`, beside `SsaCheck.gob`: hand-built control-flow
+-- graphs put to `Turkey.Wasm.Structure`, and each result checked against its
+-- graph.
+--
+-- Two checks per graph:
+--
+-- * **Statically**, every block the entry reaches is the code of exactly one
+--   step of the structured body, and no other block is: nothing duplicated,
+--   nothing dropped.
+-- * **Dynamically**, the graph and the body are run side by side by two small
+--   interpreters that take every decision from the same pseudo-random stream.
+--   Each run records the blocks it enters and how it ends, and the two
+--   records must agree, run for run.
+--
+-- `tests/test_structure.py` runs it and reads what it prints.
+
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low, CmpOp(..))
+import Turkey.Position as Position
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (BlockId(..), RepClass(..), Func)
+import Turkey.Wasm.Structure as S
+import Turkey.Wasm.Structure (Control(..))
+import System.Task as Task
+
+-- How a hand-built block ends, by block number.
+type Exit
+    = Goto(Int)
+    | Fork(Int, Int)
+    | Cases(Vec (Int, Int), Option Int)
+    | Done
+    | Fail
+    | Stop
+
+fun main() {
+    case("straight line", [Goto(1), Goto(2), Done])
+
+    --   b0
+    --  /  \
+    -- b1  b2
+    --  \  /
+    --   b3
+    case("diamond", [Fork(1, 2), Goto(3), Goto(3), Done])
+
+    -- An `if` with no join: one arm returns and the other panics.
+    case("diamond without a join", [Fork(1, 2), Done, Fail])
+
+    -- Both arms of the branch go to one block, which is placed once, after
+    -- the `if`.
+    case("both arms to one block", [Fork(1, 1), Done])
+
+    -- Two merge nodes immediately dominated by one block, b4 branching to b5,
+    -- so b4's `block` must go inside b5's.
+    case("two merge nodes", [Fork(1, 2), Fork(3, 4), Fork(4, 5), Goto(5), Goto(5), Done])
+
+    case("self loop", [Goto(1), Fork(1, 2), Done])
+
+    -- A `while`: b1 tests, b2 is the body, b3 follows the loop.
+    case("while loop", [Goto(1), Fork(2, 3), Goto(1), Done])
+
+    -- An outer loop at b1 and an inner one at b3. b4 breaks out of the inner
+    -- loop to b6; b5 continues the outer loop or goes round the inner one.
+    case("nested loops with break and continue",
+         [Goto(1), Fork(2, 7), Goto(3), Fork(4, 6), Fork(5, 6), Fork(1, 3), Goto(1), Done])
+
+    -- A loop whose body returns from the middle, at b5.
+    case("early return from a loop", [Goto(1), Fork(2, 4), Fork(3, 5), Goto(1), Done, Done])
+
+    -- A loop header that is also a merge node, so its `loop` follows a
+    -- `block`.
+    case("loop after a join", [Fork(1, 2), Goto(3), Goto(3), Fork(4, 5), Goto(3), Done])
+
+    case("dense switch",
+         [Cases([(0, 1), (1, 2), (2, 3), (3, 2), (5, 1)], Some(4)), Goto(4), Goto(4), Goto(4), Done])
+
+    case("sparse switch",
+         [Cases([(1, 1), (100, 2), (10000, 3)], Some(4)), Goto(4), Goto(4), Done, Done])
+
+    case("switch with no default",
+         [Cases([(7, 1), (8, 2), (9, 3), (10, 1)], None), Goto(3), Goto(3), Done])
+
+    -- A switch inside a loop: one case continues the loop, one breaks out of
+    -- it, one returns, and the default goes round through b4.
+    case("switch in a loop",
+         [Goto(1), Cases([(0, 1), (1, 2), (2, 3)], Some(4)), Done, Done, Goto(1)])
+
+    -- b1's `if` stands in for the `block` b3 follows, and b0's for the one
+    -- b4 follows, so b2's branch to b4 is a `br` out of an `if`.
+    case("br to an if", [Fork(1, 4), Fork(2, 3), Fork(3, 4), Goto(4), Done])
+
+    -- Key 2 goes to b4, a merge node b0 dominates rather than the switch: the
+    -- table reaches it through b0's `if`.
+    case("switch to an outer merge node",
+         [Fork(1, 4), Cases([(0, 2), (1, 3), (2, 4)], Some(3)), Goto(4), Goto(4), Done])
+
+    -- b3 is unreachable and must not appear.
+    case("an unreachable block", [Fork(1, 2), Done, Stop, Goto(1)])
+
+    -- The cycle b1-b2 can be entered at either block, so neither dominates
+    -- the other and it has no header.
+    case("irreducible", [Fork(1, 2), Fork(2, 3), Goto(1), Done])
+
+    -- A dominator tree as deep as the function is long, over an output that
+    -- stays flat, structured inside a task: on its 1 MB stack, about what an
+    -- engine gives wasm, recursion once per block would run out.
+    Task.runScope(do {
+        let deep = Task.spawn(fun() {
+            long("sequential diamonds", diamonds(longRun))
+            long("a chain of jumps", jumps(longRun))
+        })?
+        pure(Task.join(deep))
+    })
+}
+
+-- How many diamonds or jumps the long cases chain.
+let longRun = 20000
+
+fun diamonds(n : Int) -> Array Exit {
+    let shape : Vec Exit = []
+    for var k = 0; k < n; k = k + 1 {
+        let top = 3 * k
+        Vec.push(shape, Fork(top + 1, top + 2))
+        Vec.push(shape, Goto(top + 3))
+        Vec.push(shape, Goto(top + 3))
+    }
+    Vec.push(shape, Done)
+    Vec.toArray(shape)
+}
+
+fun jumps(n : Int) -> Array Exit {
+    let shape : Vec Exit = []
+    for var k = 0; k < n; k = k + 1 { Vec.push(shape, Goto(k + 1)) }
+    Vec.push(shape, Done)
+    Vec.toArray(shape)
+}
+
+fun case(name : String, shape : Array Exit) -> Unit = check(name, shape, 40, True)
+
+-- A case too long to print: its body's size and nesting stand in for it, and
+-- each run may enter every block.
+fun long(name : String, shape : Array Exit) -> Unit = check(name, shape, len(shape) + 1, False)
+
+fun check(name : String, shape : Array Exit, steps : Int, printed : Bool) -> Unit {
+    let f = graph(name, shape)
+    print("-- case " + name)
+    let complaints = Ssa.verify(f)
+    for c in complaints { print("malformed graph: " + c) }
+    match S.structure(f) {
+        Left(message) -> print(message)
+        Right(body) -> {
+            if printed {
+                print(S.showControl(body))
+            } else {
+                print("steps: " + Int.toString(len(body)) + ", nested "
+                      + Int.toString(nesting(body)) + " deep")
+            }
+            print("static: " + statically(f, body))
+            print("runs: " + dynamically(f, body, steps))
+        }
+    }
+}
+
+-- How deep the body's forms nest.
+fun nesting(body : Vec Control) -> Int {
+    var deepest = 0
+    for step in body {
+        let inner = match step {
+            Block(b) | Loop(b) -> 1 + nesting(b)
+            If(_, taken, otherwise) -> 1 + max(nesting(taken), nesting(otherwise))
+            _ -> 0
+        }
+        deepest = max(deepest, inner)
+    }
+    deepest
+}
+
+fun graph(name : String, shape : Array Exit) -> Func Low {
+    let i64 = Ssa.untraced(I64)
+    let i1 = Ssa.untraced(I1)
+    let f : Func Low = Ssa.newFunc(name, [i64])
+    let b = L.builder(f, BlockId(0), Position.files([]))
+    let ids : Vec BlockId = []
+    for _ in shape { Vec.push(ids, L.block(b)) }
+    for var k = 0; k < len(shape); k = k + 1 {
+        L.into(b, ids[k])
+        match shape[k] {
+            Goto(t) -> L.terminate(b, Ssa.Jump(ids[t], []))
+            Fork(yes, no) -> {
+                let x = L.emit(b, ConstInt(k), i64)
+                let test = L.emit(b, Cmp(Eq, x, x), i1)
+                L.terminate(b, Ssa.Branch(test, ids[yes], ids[no]))
+            }
+            Cases(cases, default) -> {
+                let x = L.emit(b, ConstInt(k), i64)
+                L.terminate(b, Ssa.Switch(x, Vec.map(cases, fun((key, t)) = (key, ids[t])),
+                                          Option.map(default, fun(t) = ids[t])))
+            }
+            Done -> L.terminate(b, Ssa.Ret([L.emit(b, ConstInt(k), i64)]))
+            Fail -> L.terminate(b, Ssa.Panic(L.emit(b, ConstString("failed"), Ssa.traced(Ptr))))
+            Stop -> L.terminate(b, Ssa.Unreachable)
+        }
+    }
+    f
+}
+
+-- -- the static check ----------------------------------------------------------------
+
+fun statically(f : Func Low, body : Vec Control) -> String {
+    let placed = Array.filled(len(f.blocks), 0)
+    count(body, placed)
+    let idom = Ssa.dominators(f)
+    let wrong : Vec String = []
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let wanted = if Option.isSome(idom[b]) { 1 } else { 0 }
+        if placed[b] != wanted {
+            Vec.push(wrong, "b" + Int.toString(b) + " placed " + Int.toString(placed[b])
+                            + " times")
+        }
+    }
+    if len(wrong) == 0 { "ok" } else { String.join(wrong, ", ") }
+}
+
+fun count(body : Vec Control, placed : Array Int) -> Unit {
+    for step in body {
+        match step {
+            Block(inner) | Loop(inner) -> count(inner, placed)
+            If(_, taken, otherwise) -> {
+                count(taken, placed)
+                count(otherwise, placed)
+            }
+            Code(b) -> {
+                placed[Ssa.blockId(b)] = placed[Ssa.blockId(b)] + 1
+            }
+            _ -> {}
+        }
+    }
+}
+
+-- -- the dynamic check ---------------------------------------------------------------
+
+-- How many runs each case makes.
+let runs = 64
+
+-- Also checks that the runs between them take every edge out of every block
+-- the entry reaches, so that agreeing says something about each of them.
+fun dynamically(f : Func Low, body : Vec Control, steps : Int) -> String {
+    let taken : Map String Bool = Map.new()
+    for var seed = 1; seed <= runs; seed = seed + 1 {
+        let trace = runGraph(f, seed, steps)
+        let expected = String.join(trace, " ")
+        let got = String.join(runBody(f, body, seed, steps), " ")
+        if expected != got {
+            return "seed " + Int.toString(seed) + " disagrees\n  graph: " + expected
+                   + "\n  body:  " + got
+        }
+        for var k = 1; k < len(trace); k = k + 1 {
+            Map.put(taken, trace[k - 1] + "->" + trace[k], True)
+        }
+    }
+    let idom = Ssa.dominators(f)
+    let missed : Vec String = []
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        if Option.isNone(idom[b]) { continue }
+        for s in Ssa.successors(f.blocks[b].term) {
+            let edge = "b" + Int.toString(b) + "->b" + Int.toString(Ssa.blockId(s))
+            if !Map.contains(taken, edge) { Vec.push(missed, edge) }
+        }
+    }
+    if len(missed) > 0 {
+        return Int.toString(runs) + " agree, but none takes " + String.join(missed, " ")
+    }
+    Int.toString(runs) + " agree, every edge taken"
+}
+
+-- A pseudo-random stream of decisions, from SplitMix64 (Steele, Lea and
+-- Flood, "Fast Splittable Pseudorandom Number Generators", OOPSLA 2014). Its
+-- output is well mixed from the first draw even for consecutive seeds, which
+-- a plain linear congruential generator's is not.
+type Oracle = Oracle { var state : Int }
+
+-- Returns a number below `n`, consuming one draw only when there is a choice
+-- to make, so that a switch folded to a single branch does not put the two
+-- interpreters out of step.
+fun choose(o : Oracle, n : Int) -> Int {
+    if n == 1 { return 0 }
+    o.state = Int.addWrapping(o.state, -7046029254386353131)
+    var z = o.state
+    z = Int.mulWrapping(Int.xor(z, Int.shrUnsigned(z, 30)), -4658895280553007687)
+    z = Int.mulWrapping(Int.xor(z, Int.shrUnsigned(z, 27)), -7723592293110705685)
+    z = Int.xor(z, Int.shrUnsigned(z, 31))
+    Int.shrUnsigned(z, 1) % n
+}
+
+-- The value a switch is run on: one of its keys, or, if it has a default, one
+-- just outside them or in a gap between them.
+fun pick(o : Oracle, cases : Vec (Int, BlockId), default : Option BlockId) -> Int {
+    let keys = Vec.sort(Vec.map(cases, fun((key, _)) = key))
+    let options = Vec.append(keys, [])
+    if Option.isSome(default) {
+        Vec.push(options, keys[0] - 1)
+        Vec.push(options, keys[len(keys) - 1] + 1)
+        for var k = 1; k < len(keys); k = k + 1 {
+            if keys[k] - keys[k - 1] > 1 {
+                Vec.push(options, keys[k - 1] + 1)
+                break
+            }
+        }
+    }
+    options[choose(o, len(options))]
+}
+
+-- Runs `f` until it ends or has entered `steps` blocks.
+fun runGraph(f : Func Low, seed : Int, steps : Int) -> Vec String {
+    let trace : Vec String = []
+    let o = Oracle { state = seed }
+    var at = Ssa.blockId(f.entry)
+    while True {
+        if len(trace) == steps {
+            Vec.push(trace, "...")
+            return trace
+        }
+        Vec.push(trace, "b" + Int.toString(at))
+        match f.blocks[at].term {
+            Ssa.Jump(target, _) -> {
+                at = Ssa.blockId(target)
+            }
+            Ssa.Branch(_, yes, no) -> {
+                at = Ssa.blockId(if choose(o, 2) == 0 { yes } else { no })
+            }
+            Ssa.Switch(_, cases, default) -> {
+                let v = pick(o, cases, default)
+                at = Ssa.blockId(caseFor(cases, default, v))
+            }
+            Ssa.Ret(_) -> {
+                Vec.push(trace, "return")
+                return trace
+            }
+            Ssa.Panic(_) -> {
+                Vec.push(trace, "panic")
+                return trace
+            }
+            Ssa.Unreachable -> {
+                Vec.push(trace, "unreachable")
+                return trace
+            }
+        }
+    }
+    trace
+}
+
+fun caseFor(cases : Vec (Int, BlockId), default : Option BlockId, v : Int) -> BlockId {
+    for (key, target) in cases {
+        if key == v { return target }
+    }
+    match default {
+        Some(d) -> d
+        None -> error("no case for " + Int.toString(v))
+    }
+}
+
+-- How running a body ended: by falling off its end, by a branch this many
+-- levels out, by leaving the function, or by being cut off.
+type Outcome = Normal | Out(Int) | Exited(String) | Cut
+
+type Walk = Walk {
+    f       : Func Low,
+    oracle  : Oracle,
+    trace   : Vec String,
+    steps   : Int,
+    -- The block whose code ran last, whose terminator the step after it
+    -- implements.
+    var current : Int,
+}
+
+-- Runs `body` until it ends or has entered `steps` blocks.
+fun runBody(f : Func Low, body : Vec Control, seed : Int, steps : Int) -> Vec String {
+    let w = Walk { f, oracle = Oracle { state = seed }, trace = [], steps, current = -1 }
+    match exec(w, body) {
+        Exited(how) -> Vec.push(w.trace, how)
+        Cut -> {}
+        Normal -> Vec.push(w.trace, "fell off the end")
+        Out(n) -> Vec.push(w.trace, "branched " + Int.toString(n) + " levels past the body")
+    }
+    w.trace
+}
+
+fun exec(w : Walk, body : Vec Control) -> Outcome {
+    for step in body {
+        let outcome = match step {
+            Code(b) -> {
+                if len(w.trace) == w.steps {
+                    Vec.push(w.trace, "...")
+                    Cut
+                } else {
+                    Vec.push(w.trace, "b" + Int.toString(Ssa.blockId(b)))
+                    w.current = Ssa.blockId(b)
+                    Normal
+                }
+            }
+            Block(inner) -> leave(exec(w, inner))
+            Loop(inner) -> {
+                var again = exec(w, inner)
+                while isOut(again, 0) { again = exec(w, inner) }
+                leave(again)
+            }
+            If(test, taken, otherwise) -> match w.f.blocks[w.current].term {
+                Ssa.Branch(wanted, _, _) ->
+                    if Ssa.valueId(wanted) == Ssa.valueId(test) {
+                        leave(exec(w, if choose(w.oracle, 2) == 0 { taken } else { otherwise }))
+                    } else {
+                        Exited("an if on another value than b" + Int.toString(w.current) + "'s branch")
+                    }
+                _ -> Exited("an if after b" + Int.toString(w.current) + ", which does not branch")
+            }
+            Br(n) -> Out(n)
+            BrTable(v, base, targets, default) -> match switchOf(w, v) {
+                Some(value) -> {
+                    let k = value - base
+                    Out(if k >= 0 && k < len(targets) { targets[k] } else { default })
+                }
+                None -> Exited("a br_table that is not b" + Int.toString(w.current) + "'s switch")
+            }
+            BrCases(v, cases, default) -> match switchOf(w, v) {
+                Some(value) -> {
+                    var depth = default
+                    for (key, d) in cases {
+                        if key == value {
+                            depth = d
+                            break
+                        }
+                    }
+                    Out(depth)
+                }
+                None -> Exited("a br_cases that is not b" + Int.toString(w.current) + "'s switch")
+            }
+            Return(_) -> Exited("return")
+            Panic(_) -> Exited("panic")
+            Unreachable -> Exited("unreachable")
+        }
+        if !isNormal(outcome) { return outcome }
+    }
+    Normal
+}
+
+-- A branch out of a form that does not name it names a form one level
+-- further out once it has left this one.
+fun leave(o : Outcome) -> Outcome = match o {
+    Out(0) -> Normal
+    Out(n) -> Out(n - 1)
+    _ -> o
+}
+
+-- The value the current block's switch runs on, drawn as `runGraph` draws
+-- it, if the current block ends in a switch on `v`.
+fun switchOf(w : Walk, v : Ssa.Value) -> Option Int = match w.f.blocks[w.current].term {
+    Ssa.Switch(scrutinee, cases, default) ->
+        if Ssa.valueId(scrutinee) == Ssa.valueId(v) { Some(pick(w.oracle, cases, default)) } else { None }
+    _ -> None
+}
+
+fun isNormal(o : Outcome) -> Bool = match o {
+    Normal -> True
+    _ -> False
+}
+
+fun isOut(o : Outcome, depth : Int) -> Bool = match o {
+    Out(n) -> n == depth
+    _ -> False
+}

@@ -93,7 +93,8 @@ The standard library's `Turkey.*` modules are the implementation itself -- the
 collector, the allocator, the program's startup -- and a program may not import
 them. Only other standard library modules can. A program's own modules are
 its own, whatever they are called: `Turkey/Shapes.gob` beside the entry file is
-an ordinary module.
+an ordinary module. The library module `Turkey` itself is not one of them, and
+a program may import it ([The Prelude](#the-prelude)).
 
 <!-- error: 'Turkey.Heap' is part of the implementation, and only the standard library may import it -->
 ```kotlin
@@ -865,41 +866,109 @@ module.
 
 ### The Prelude
 
-Every module imports the Prelude implicitly, with its bare names and the
-library modules it brings qualified, such as `Vec` and `String`. An explicit
-`import Prelude ...` replaces the implicit import of its bare names, and
-`import Prelude ()` imports nothing from it at all, the qualified modules
-included, where `()` after any other module still brings its qualifier. See [The Prelude](builtins.md#the-prelude) for what it provides.
+Every module that writes no import of `Prelude` imports it implicitly, as
+`import Prelude (..)` would: it gets the Prelude's bare names and the
+qualifiers the Prelude exports, such as `Vec` and `String`. See
+[The Prelude](builtins.md#the-prelude) for what it provides.
+
+An explicit import of `Prelude` replaces the implicit one and brings what
+any import with that list brings. `import Prelude (print)` brings `print` and
+none of the Prelude's qualifiers, and a list names the qualifiers it wants.
+Every one stays reachable through the qualifier `Prelude`:
+
+<!-- run -->
+```kotlin
+import Prelude (print, module String)
+
+fun main() {
+    print(String.join(["a", "b"], "-"))
+    print(Prelude.Int.toString(2))
+}
+```
+
+```text
+a-b
+2
+```
+
+`import Prelude ()` is the one exception: it imports nothing from the Prelude
+at all, the qualifier `Prelude` included, where `()` after any other module
+still brings its qualifier.
+
+<!-- run -->
+```kotlin
+import Prelude ()
+import System.IO (print)
+
+fun main() {
+    print("only print is in scope")
+}
+```
+
+```text
+only print is in scope
+```
+
+The standard library's Prelude exports nothing of its own. It is
+`export (module Turkey (..))`, and the library module `Turkey` holds every
+name and qualifier it passes on.
 
 The implicit import is an import of the module `Prelude`, and that module is
 found as any other is. A program with a `Prelude.gob` beside its entry file
-gives its own modules that module's bare names in place of the standard
-library's, and the standard library's modules keep theirs. The qualified
-library modules come either way. A module named `Prelude` has no implicit
-import itself.
+gives its own modules that module in place of the standard library's, and the
+standard library's modules keep theirs. A module named `Prelude` has no
+implicit import itself, so a program's Prelude imports `Turkey`.
+`import Turkey (..)` alone brings both the names its own declarations use and
+the qualifier `Turkey` that `module Turkey (..)` names. Write the import
+without a list as well, as below, so that the qualifier does not depend on
+the list.
 
 <!-- module: Prelude.gob -->
 ```kotlin
-export (print, greet)
+export (.., module Turkey (..), module Set)
 
-import System.IO (print)
+import Turkey
+import Turkey (..)
+import Data.Set as Set
 
-fun greet() {
-    print("hello from the program's Prelude")
-}
+fun lines(text : String) -> Vec String = String.split(text, "\n")
 ```
 
 <!-- run -->
 ```kotlin
 fun main() {
-    greet()
-    print(Int.toString(2))
+    let seen = Set.new()
+    for line in lines("b\na\nb") {
+        Set.add(seen, line)
+    }
+    print(len(Set.elements(seen)))
 }
 ```
 
 ```text
-hello from the program's Prelude
 2
+```
+
+A program's Prelude that passes on less leaves the program's modules without
+what it omits. That includes what syntax is written in: an operator is a name
+a module has to be given, and `for`, indexing, indexed assignment and
+negation call the class methods `iter`, `get`, `set` and `neg`, which have to
+be in scope.
+
+<!-- module: Prelude.gob -->
+```kotlin
+export (print)
+
+import Turkey (print)
+```
+
+<!-- error: 'iter' is not defined -->
+```kotlin
+fun main() {
+    for word in ["a", "b"] {
+        print(word)
+    }
+}
 ```
 
 A qualifier that an import gives, by its name, by its alias, or from its
@@ -916,20 +985,6 @@ fun main() {
     Vec.pushBack(queue, 0)
     print(Vec.sort(queue))
 }
-```
-
-<!-- run -->
-```kotlin
-import Prelude ()
-import System.IO (print)
-
-fun main() {
-    print("only print is in scope")
-}
-```
-
-```text
-only print is in scope
 ```
 
 ### The Target module

@@ -550,15 +550,7 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         expr(r, fn)
         for a in args { expr(r, a) }
     }
-    EIndex(arr, index, _, _) -> {
-        expr(r, arr)
-        expr(r, index)
-        -- `xs[i]` and `xs[i] = v` are `Index`'s `get` and `set`. Desugaring
-        -- turns them into those calls; resolution is where the two references
-        -- are settled, since only it knows the module's method scope.
-        e.kind = EIndex(arr, index, methodRef(r, "get", e.span),
-                        methodRef(r, "set", e.span))
-    }
+    EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
     EField(obj, _) -> expr(r, obj)
     EProject(obj, _) -> expr(r, obj)
     EUnary(_, operand, fn) -> {
@@ -703,10 +695,56 @@ fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
         funDecl(r, d)
     }
     SAssign(target, value) -> {
-        expr(r, target)
+        match target.kind {
+            EIndex(arr, index, _, _) -> bracket(r, target, arr, index, True)
+            _ -> expr(r, target)
+        }
         expr(r, value)
     }
     SExpr(e) -> expr(r, e)
+}
+
+-- Resolves the bracket `e`, `arr[index]`, which is the target of an
+-- assignment if `assigned` is set and is read otherwise.
+--
+-- `xs[i]` and `xs[i] = v` are `Index`'s `get` and `SetIndex`'s `set`.
+-- Desugaring turns them into those calls; resolution is where the two
+-- references are settled, since only it knows the module's method scope.
+--
+-- A module that cannot see the method its bracket calls has nothing to index
+-- with. Reported here because nothing after resolution can lower a bracket
+-- that has no method, and by the syntax and the class, since the module may
+-- have a `get` or `set` of its own that has nothing to do with either.
+fun bracket(r : R, e : Expr, arr : Expr, index : Expr, assigned : Bool) -> Unit {
+    expr(r, arr)
+    expr(r, index)
+    let get = methodRef(r, "get", e.span)
+    let set = methodRef(r, "set", e.span)
+    if assigned {
+        if Option.isNone(set) { noMethod("an indexed assignment", "set", e.span) }
+    } else if Option.isNone(get) {
+        noMethod("indexing", "get", e.span)
+    }
+    e.kind = EIndex(arr, index, get, set)
+}
+
+-- Reports that `syntax` calls the class method a compiler-written reference
+-- marked `spelling` means, and the module cannot see it.
+fun noMethod(syntax : String, spelling : String, where : Span) -> Unit {
+    -- A method's internal name is its module's, a `#`, its class's, a `.`,
+    -- and its own.
+    let target = Option.unwrapOr(Prelude.protocolMethod(spelling), spelling)
+    let owner = Option.unwrapOr(Prelude.moduleOf(target), "")
+    let cls = match String.splitOnce(target, Prelude.sep) {
+        Some((_, member)) -> match String.rsplitOnce(member, ".") {
+            Some((cls, _)) -> cls
+            None -> member
+        }
+        None -> target
+    }
+    report(syntax + " calls '" + spelling + "' of the class '" + cls
+           + "', which is not in scope here; write 'import " + Prelude.display(owner)
+           + " (" + cls + "(..))'", where)
 }
 
 -- Resolves the conditions of an `if` or `while` head and then `body`, which
@@ -811,8 +849,7 @@ fun visibleMethod(scope : Scope, name : String, where : Span) -> Option String =
     }
 
 -- A method reference *this* stage writes, for a node the parser left bare.
--- `None` when the module cannot see the method at all, which leaves the
--- bracket unlowered for inference to complain about.
+-- `None` when the module cannot see the method at all.
 fun methodRef(r : R, name : String, where : Span) -> Option Expr =
     match visibleMethod(r.scope, name, where) {
         None -> None

@@ -33,6 +33,12 @@ syn match turkeyLineComment "--.*$" contains=turkeyTodo
 " both match.
 syn match turkeyDocComment "^\s*\zs---\%( .*\)\=$" contains=turkeyTodo
 syn region turkeyBlockComment start="{-" end="-}" contains=turkeyBlockComment,turkeyTodo
+" A tool directive: a line comment that begins `--@`, then its name and its
+" arguments in parentheses (`--@expect(empty-return-value)`), then a reason,
+" which reads as a comment. Defined after the line comment so that it wins
+" where both start; a `--@` later in a comment is part of that comment.
+syn match turkeyDirective "--@[^( \t]*\%(([^)]*)\)\=" nextgroup=turkeyDirectiveReason
+syn match turkeyDirectiveReason contained ".*$" contains=turkeyTodo
 
 " Strings and characters. No interpolation, and a one-line string
 " cannot span lines. Escapes are exactly \n \t \r \0 \\ \" \' and
@@ -104,5 +110,7 @@ hi def link turkeyLineComment Comment
 hi def link turkeyDocComment SpecialComment
 hi def link turkeyBlockComment Comment
 hi def link turkeyTodo Todo
+hi def link turkeyDirective PreProc
+hi def link turkeyDirectiveReason Comment
 
 let b:current_syntax = "turkey"

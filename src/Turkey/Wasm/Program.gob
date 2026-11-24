@@ -66,7 +66,19 @@ type Unsupported = Unsupported { name : String, what : String }
 type Program = Program { bytes : Vec Byte, selected : Int, refused : Vec Unsupported }
 
 --- The bytes of the shadow stack.
-let stackBytes = 1 << 20
+---
+--- Sized so that the engine's own stack runs out first. A frame takes more of
+--- the engine's stack than of the shadow stack, since a function's roots are
+--- locals there too: a non-tail recursion holding two roots takes about 80
+--- bytes of wasmtime's stack per call and 48 of this, so 8 MB lasts until
+--- the engine's stack is past 13 MB, against its default of 512 KB.
+let stackBytes = 8 << 20
+
+-- The bytes at the bottom of the shadow stack that only the panic raised by
+-- running out may use (`Turkey.Wasm.Select.prologue`): the panic's own
+-- functions push frames too, and without room for them a panic would be
+-- raised for every frame it pushed.
+let stackReserve = 16384
 
 let pageBytes = 65536
 
@@ -132,6 +144,8 @@ fun build(m : Module, main : String, libraries : Map String String,
                              [W.ConstI64(data.processState)])
     let stackPointer = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
                                    [W.ConstI64(data.start)])
+    let stackLimit = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True },
+                                 [W.ConstI64(Rt.immediates + stackReserve)])
     let builtins = Map.new()
     Map.put(builtins, Rt.programEntrySymbol, entry)
     let cx = S.Context {
@@ -140,7 +154,8 @@ fun build(m : Module, main : String, libraries : Map String String,
         literals = data.literals, globals = data.globals, module_ = wasm,
         strings = S.Strings { start = data.start + len(data.image), bytes = [],
                               addresses = Map.new() },
-        worker = worker, stackPointer = stackPointer, stackLimit = Rt.immediates,
+        worker = worker, stackPointer = stackPointer, stackLimit = stackLimit,
+        stackBottom = Rt.immediates,
         siteCount = 0,
     }
 
@@ -409,6 +424,21 @@ fun entryBody(cx : S.Context, m : Module, main : String, data : Data, frameTable
     -- has none.
     Vec.push(out, W.ConstI64(0))
     run(main)
+    -- A panic's trace counts this call as arm64's counts the frame record
+    -- `main` returns to the entry through, which prints nothing.
+    if let Some(name) = Map.get(cx.defined, "turkey_trace_push") {
+        if let Some(push) = Map.get(cx.functions, name) {
+            Vec.push(out, W.GlobalGet(cx.worker))
+            Vec.push(out, W.Convert(W.I32WrapI64))
+            Vec.push(out, W.Load(W.I32Load, 0))
+            Vec.push(out, W.If(W.Empty))
+            Vec.push(out, W.ConstI64(0))
+            Vec.push(out, W.ConstI64(0))
+            Vec.push(out, W.Call(push))
+            Vec.push(out, W.Drop)
+            Vec.push(out, W.End)
+        }
+    }
     Vec.push(out, W.End)
     runtime("turkey_entry_returned", [])
     Vec.toArray(out)

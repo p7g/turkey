@@ -93,8 +93,12 @@ type Context = Context {
     --- The global holding the shadow stack's pointer: the innermost shadow
     --- frame, which each function that has one pushes below it.
     stackPointer : Int,
-    --- The lowest address the shadow stack may reach.
+    --- The global holding the lowest address a frame may be pushed at: the
+    --- stack's bottom and a reserve above it, which the panic that running
+    --- out raises takes by lowering this to the bottom.
     stackLimit : Int,
+    --- The shadow stack's bottom.
+    stackBottom : Int,
     --- The sites numbered so far, in every function: a site's number is
     --- above every number before it, and 0 is no site.
     var siteCount : Int,
@@ -373,7 +377,7 @@ fun constantsOf(f : Func Low) -> Map Int Int {
 let headerBytes = 16
 
 -- The frame, when the function has one: the shadow stack pointer moved down
--- past it, a trap if that passes the stack's limit, the header, each
+-- past it, a panic if that passes the stack's limit, the header, each
 -- parameter that is a root in its slot, and the traced fields cleared of
 -- each object some path reads before building it (`Turkey.Roots.FrameObject`).
 fun prologue(s : Sel) -> Unit {
@@ -382,13 +386,29 @@ fun prologue(s : Sel) -> Unit {
     op(s, W.ConstI64(s.frameBytes))
     op(s, W.IntBin(W.W64, W.Sub))
     op(s, W.GlobalSet(s.cx.stackPointer))
-    -- Nothing guards the memory below the stack, so running out is a trap
-    -- here rather than a write over whatever is there.
+    -- Nothing guards the memory below the stack, so running out is tested
+    -- here rather than a write over whatever is there. It panics, from the
+    -- caller's frame and with the reserve below the limit for the panic's own
+    -- frames, and returns before this function's body: no frame of it is on
+    -- the trace, as none of the function that overflowed is on arm64's.
     op(s, W.GlobalGet(s.cx.stackPointer))
-    op(s, W.ConstI64(s.cx.stackLimit))
+    op(s, W.GlobalGet(s.cx.stackLimit))
     op(s, W.IntRel(W.W64, W.LtU))
     op(s, W.If(W.Empty))
-    op(s, W.Unreachable)
+    op(s, W.ConstI64(s.cx.stackBottom))
+    op(s, W.GlobalSet(s.cx.stackLimit))
+    release(s)
+    match definedIndex(s, "turkey_panic") {
+        Some(raise) -> {
+            op(s, W.ConstI64(0))
+            op(s, W.ConstI64(cString(s.cx.strings, "stack overflow")))
+            op(s, W.Call(raise))
+            op(s, W.Drop)
+        }
+        None -> op(s, W.Unreachable)
+    }
+    for t in s.answers { op(s, zeroOf(t)) }
+    op(s, W.Return)
     op(s, W.End)
     op(s, W.GlobalGet(s.cx.stackPointer))
     op(s, W.Convert(W.I32WrapI64))
@@ -463,8 +483,8 @@ fun site(s : Sel) -> Int {
 
 -- The number a panic leaving from the site being selected adds to its trace
 -- (`Turkey.Process.tracePush`), with the site added to the trace table; 0,
--- which adds nothing, for a site with no source position or none at all
--- (an index of -1).
+-- which counts a frame and prints nothing, for a site with no source
+-- position or none at all (an index of -1).
 fun traceSite(s : Sel) -> Int {
     let (b, n) = s.place
     if n < 0 { return 0 }
@@ -1474,7 +1494,8 @@ fun shell(s : Sel, d : Value, slot : Int, environment : Option Value) -> Unit {
 -- `d` set to the address of its object in this function's frame.
 fun frameObject(s : Sel, d : Value) -> Unit = match Roots.objectOf(s.frame, Ssa.valueId(d)) {
     Some(k) -> {
-        op(s, W.GlobalGet(s.cx.stackPointer))
+        op(s, W.LocalGet(s.framePointer))
+        op(s, W.Convert(W.I64ExtendI32U))
         op(s, W.ConstI64(s.offsets[k]))
         op(s, W.IntBin(W.W64, W.Add))
         set(s, d)

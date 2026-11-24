@@ -18,6 +18,7 @@ import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-),
 import Bits (BitAnd(..), BitOr(..), (&), (|))
 import Data.Bool (Bool(..))
 import Turkey.Libc as Libc
+import Turkey.Os as Os
 import Turkey.Memory as Memory
 import Turkey.Process as Process
 import Turkey.Sys as Sys
@@ -32,7 +33,8 @@ fun count() -> Int {
     let n = match Target.os {
         Darwin -> darwinCores()
         Linux -> linuxCores()
-        Wasi -> Process.unsupported(0)
+        -- A wasm program has one thread, whatever the machine has.
+        Wasi -> 1
     }
     if n < 1 { 1 } else { n }
 }
@@ -50,7 +52,7 @@ fun darwinCores() -> Int {
 
 -- A 32-bit `sysctl` value, or 0 if there is none.
 fun sysctlInt(name : Ptr) -> Int {
-    let buffer = Libc.malloc(16)
+    let buffer = Os.malloc(16)
     if Ptr.isNull(buffer) { return 0 }
     Ptr.store(buffer, 0, 0)
     Ptr.store(buffer, 8, 4)
@@ -58,7 +60,7 @@ fun sysctlInt(name : Ptr) -> Int {
     let value = if status & 0xFFFF_FFFF == 0 {
         Ptr.load32(buffer, 0)
     } else { 0 }
-    Libc.free(buffer)
+    Os.free(buffer)
     value
 }
 
@@ -100,7 +102,7 @@ let maskBytes : Int = 1024
 -- The workers inherit the mask from the program's thread, so its count is
 -- theirs.
 fun affinityCount() -> Int {
-    let mask = Libc.malloc(maskBytes)
+    let mask = Os.malloc(maskBytes)
     if Ptr.isNull(mask) { return onlineCpus() }
     Memory.fill(mask, maskBytes, 0)
     var n = 0
@@ -115,7 +117,7 @@ fun affinityCount() -> Int {
             at = at + 1
         }
     }
-    Libc.free(mask)
+    Os.free(mask)
     if n > 0 { n } else { onlineCpus() }
 }
 
@@ -135,13 +137,13 @@ fun onlineCpus() -> Int = Libc.sysconf(84)
 -- namespace the path is `/` and so is the root; without one, the container's
 -- cgroup is mounted as the root, and the path names it too.
 fun cgroupLimit() -> Int {
-    let given = Libc.getenv(Prim.cString("TURKEY_TEST_CGROUP_ROOT"))
+    let given = Os.getenv(Prim.cString("TURKEY_TEST_CGROUP_ROOT"))
     let root = if Ptr.isNull(given) { Prim.cString("") } else { given }
     let membership = slurpUnder(root, Prim.cString("/proc/self/cgroup"))
     if Ptr.isNull(membership) { return 0 }
     let mounts = slurpUnder(root, Prim.cString("/proc/self/mountinfo"))
     if Ptr.isNull(mounts) {
-        Libc.free(membership)
+        Os.free(membership)
         return 0
     }
     -- A v2 membership is the line with hierarchy 0 and no controllers.
@@ -149,19 +151,19 @@ fun cgroupLimit() -> Int {
     let mountRoot = cgroup2Mount(mounts)
     var limit = 0
     if !Ptr.isNull(path) && !Ptr.isNull(mountRoot) {
-        let mount = Ptr.add(mountRoot, Libc.strlen(mountRoot) + 1)
+        let mount = Ptr.add(mountRoot, Os.strlen(mountRoot) + 1)
         let file = join4(root, mount, below(path, mountRoot), Prim.cString("/cpu.max"))
         if !Ptr.isNull(file) {
             let text = slurp(file)
             if !Ptr.isNull(text) {
                 limit = cpuMaxCpus(text)
-                Libc.free(text)
+                Os.free(text)
             }
-            Libc.free(file)
+            Os.free(file)
         }
     }
-    Libc.free(mounts)
-    Libc.free(membership)
+    Os.free(mounts)
+    Os.free(membership)
     limit
 }
 
@@ -171,7 +173,7 @@ fun cgroupLimit() -> Int {
 fun cpuMaxCpus(text : Ptr) -> Int {
     let quota = decimal(text)
     if quota <= 0 { return 0 }
-    let space = Libc.memchr(text, 32, Libc.strlen(text))
+    let space = Os.memchr(text, 32, Os.strlen(text))
     if Ptr.isNull(space) { return 0 }
     let period = decimal(Ptr.add(space, 1))
     if period <= 0 { return 0 }
@@ -220,7 +222,7 @@ fun cgroup2Mount(mounts : Ptr) -> Ptr {
 -- `path` with `mountRoot` taken off its front, if it is there as a whole
 -- number of components; else `path`.
 fun below(path : Ptr, mountRoot : Ptr) -> Ptr {
-    let n = Libc.strlen(mountRoot)
+    let n = Os.strlen(mountRoot)
     if n <= 1 || !startsWith(path, mountRoot) { return path }
     let after = byteAt(path, n)
     if after == 0 || after == 47 { Ptr.add(path, n) } else { path }
@@ -232,7 +234,7 @@ fun lineAfter(text : Ptr, prefix : Ptr) -> Ptr {
     var line = text
     while byteAt(line, 0) != 0 {
         let next = cutLine(line)
-        if startsWith(line, prefix) { return Ptr.add(line, Libc.strlen(prefix)) }
+        if startsWith(line, prefix) { return Ptr.add(line, Os.strlen(prefix)) }
         line = next
     }
     Ptr.null()
@@ -247,8 +249,8 @@ fun cutLine(line : Ptr) -> Ptr = cutAt(line, 10)
 fun cutField(field : Ptr) -> Ptr = cutAt(field, 32)
 
 fun cutAt(text : Ptr, byte : Int) -> Ptr {
-    let length = Libc.strlen(text)
-    let at = Libc.memchr(text, byte, length)
+    let length = Os.strlen(text)
+    let at = Os.memchr(text, byte, length)
     if Ptr.isNull(at) { return Ptr.add(text, length) }
     Ptr.store(at, 0, Byte.truncate(0))
     Ptr.add(at, 1)
@@ -277,11 +279,11 @@ fun byteAt(text : Ptr, at : Int) -> Int = Byte.toInt(Ptr.load(text, at))
 
 -- `a`, `b`, `c` and `d` one after another, as a string from `malloc`; or null.
 fun join4(a : Ptr, b : Ptr, c : Ptr, d : Ptr) -> Ptr {
-    let la = Libc.strlen(a)
-    let lb = Libc.strlen(b)
-    let lc = Libc.strlen(c)
-    let ld = Libc.strlen(d)
-    let joined = Libc.malloc(la + lb + lc + ld + 1)
+    let la = Os.strlen(a)
+    let lb = Os.strlen(b)
+    let lc = Os.strlen(c)
+    let ld = Os.strlen(d)
+    let joined = Os.malloc(la + lb + lc + ld + 1)
     if Ptr.isNull(joined) { return joined }
     Memory.copy(joined, a, la)
     Memory.copy(Ptr.add(joined, la), b, lb)
@@ -295,7 +297,7 @@ fun slurpUnder(root : Ptr, path : Ptr) -> Ptr {
     let file = join4(root, path, Prim.cString(""), Prim.cString(""))
     if Ptr.isNull(file) { return file }
     let text = slurp(file)
-    Libc.free(file)
+    Os.free(file)
     text
 }
 
@@ -303,29 +305,29 @@ fun slurpUnder(root : Ptr, path : Ptr) -> Ptr {
 -- cannot be read. The files read here are generated by the kernel, and have no
 -- NUL in them.
 fun slurp(path : Ptr) -> Ptr {
-    let fd = Sys.cInt(Libc.open(path, Sys.readOnly | Sys.closeOnExec(), 0))
+    let fd = Sys.cInt(Os.open(path, Sys.readOnly | Sys.closeOnExec(), 0))
     if fd < 0 { return Ptr.null() }
     var size = 4096
-    var text = Libc.malloc(size)
+    var text = Os.malloc(size)
     var length = 0
     while !Ptr.isNull(text) {
         if length + 1 == size {
             size = 2 * size
-            let grown = Libc.realloc(text, size)
-            if Ptr.isNull(grown) { Libc.free(text) }
+            let grown = Os.realloc(text, size)
+            if Ptr.isNull(grown) { Os.free(text) }
             text = grown
         } else {
-            let n = Libc.read(fd, Ptr.add(text, length), size - 1 - length)
+            let n = Os.read(fd, Ptr.add(text, length), size - 1 - length)
             if n == 0 { break }
             if n < 0 {
-                Libc.free(text)
+                Os.free(text)
                 text = Ptr.null()
             } else {
                 length = length + n
             }
         }
     }
-    let _ = Libc.close(fd)
+    let _ = Os.close(fd)
     if !Ptr.isNull(text) { Ptr.store(text, length, Byte.truncate(0)) }
     text
 }

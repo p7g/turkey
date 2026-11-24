@@ -25,6 +25,8 @@ import Target (OS(..))
 import Target as Target
 import Turkey.Process as Process
 import Turkey.Libc as Libc
+import Turkey.Os as Os
+import Turkey.Wasi as Wasi
 import Turkey.Lock as Lock
 import Data.Int as Int
 import Turkey.Ptr (Ptr)
@@ -56,7 +58,7 @@ let stackBytes : Int = 40
 -- allocate runs on it, and must have its parked frame recorded before it stops
 -- running.
 var stacks : Ptr = Ptr.null()
-var entryStack : Ptr = Libc.malloc(stackBytes)
+var entryStack : Ptr = Os.malloc(stackBytes)
 
 -- Held while a worker edits the list. A collection reads it with every other
 -- worker stopped, and takes no lock.
@@ -107,7 +109,7 @@ fun parkedSet(stack : Ptr, frame : Ptr) -> Unit =
 --- for the program's: `frame` is its outermost Turkey frame record. False if
 --- there was no memory for the record.
 fun threadStackSet(frame : Ptr) -> Bool {
-    let record = Libc.malloc(stackBytes)
+    let record = Os.malloc(stackBytes)
     if Ptr.isNull(record) { return False }
     Ptr.store(record, stackHigh, frame)
     Ptr.store(record, stackParked, Ptr.null())
@@ -137,19 +139,12 @@ let stackGuardBytes = 65536
 --- A stack of `bytes` for a coroutine, registered and parked, ready for its
 --- first switch; null if there was no memory for it.
 fun new(bytes : Int) -> Ptr {
-    -- Mapped rather than allocated, so a page costs memory only once it is
-    -- touched.
-    let total = Int.addWrapping(stackGuardBytes, bytes)
-    let base = Libc.mmap(Ptr.null(), total, protReadWrite, mapPrivateAnonymous(),
-                         -1, 0)
-    if Ptr.toInt(base) == -1 { return Ptr.null() }
-    if Libc.mprotect(base, stackGuardBytes, protNone) & 0xFFFF_FFFF != 0 {
-        let _ = Libc.munmap(base, total)
-        return Ptr.null()
-    }
-    let record = Libc.malloc(stackBytes)
+    let total = Int.addWrapping(guardBytes(), bytes)
+    let base = mapped(total)
+    if Ptr.isNull(base) { return base }
+    let record = Os.malloc(stackBytes)
     if Ptr.isNull(record) {
-        let _ = Libc.munmap(base, total)
+        unmapped(base, total)
         return Ptr.null()
     }
     -- Laid out from the top, all of it written here because nothing runs on
@@ -201,8 +196,38 @@ fun free(stack : Ptr) -> Unit {
         return
     }
     let low : Ptr = Ptr.load(stack, stackLow)
-    let _ = Libc.munmap(low, Ptr.diff(Ptr.load(stack, stackHigh), low))
-    Libc.free(stack)
+    unmapped(low, Ptr.diff(Ptr.load(stack, stackHigh), low))
+    Os.free(stack)
+}
+
+-- `total` bytes for a stack, its first `guardBytes()` a guard, or null.
+--
+-- Mapped rather than allocated, so a page costs memory only once it is
+-- touched. Wasm has neither: its memory is one block that only grows, so a
+-- stack there is pages from the allocator, with no guard. Running off the
+-- end of one writes over whatever is below it.
+fun mapped(total : Int) -> Ptr = match Target.os {
+    Wasi -> Wasi.alignedAlloc(65536, total)
+    _ -> {
+        let base = Libc.mmap(Ptr.null(), total, protReadWrite, mapPrivateAnonymous(), -1, 0)
+        if Ptr.toInt(base) == -1 { return Ptr.null() }
+        if Libc.mprotect(base, stackGuardBytes, protNone) & 0xFFFF_FFFF != 0 {
+            let _ = Libc.munmap(base, total)
+            return Ptr.null()
+        }
+        base
+    }
+}
+
+-- Give back the `total` bytes `mapped` answered at `base`.
+fun unmapped(base : Ptr, total : Int) -> Unit = match Target.os {
+    Wasi -> Wasi.free(base)
+    _ -> { let _ = Libc.munmap(base, total) }
+}
+
+fun guardBytes() -> Int = match Target.os {
+    Wasi -> 0
+    _ -> stackGuardBytes
 }
 
 -- Take `stack` off the list; False if it is not on it. Under `stacksLock`, so

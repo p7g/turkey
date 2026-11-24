@@ -138,6 +138,8 @@ import Data.Vec as Vec
 import Turkey.Coroutine as Co
 import Turkey.Array as Storage
 import Turkey.Libc as Libc
+import Turkey.Os as Os
+import Turkey.Wasi as Wasi
 import Turkey.Lock as Lock
 import Turkey.Process as Process
 import Turkey.Sys as Sys
@@ -272,7 +274,7 @@ fun newHeaps() -> Prim.Array Heap {
 }
 
 fun newHeap() -> Heap {
-    let earliest = Libc.malloc(8)
+    let earliest = Os.malloc(8)
     Ptr.atomicStore(earliest, 0, noDeadline)
     Heap { lock = Lock.new(), items = [], earliest }
 }
@@ -296,7 +298,7 @@ let watchedAt : Int = 24
 let exitingAt : Int = 32
 
 fun zeroedWords(n : Int) -> Ptr {
-    let p = Libc.malloc(8 * n)
+    let p = Os.malloc(8 * n)
     for var i = 0; i < n; i = i + 1 { Ptr.atomicStore(p, 8 * i, 0) }
     p
 }
@@ -310,7 +312,7 @@ fun interestAdd(n : Int) -> Unit {
 fun countedSources() -> Int = Ptr.atomicLoad(words, countedAt)
 
 -- Where `waitpid` stores a status; only used under the lock.
-var statusBuffer : Ptr = Libc.malloc(8)
+var statusBuffer : Ptr = Os.malloc(8)
 
 --- The poller's lock. A thread waiting for it is blocked
 --- (`Turkey.Workers.acquire`), so its holder may allocate and collect. A
@@ -325,10 +327,10 @@ fun unlock() -> Unit = Lock.release(mutex)
 --- Nanoseconds on a clock that only moves forward, which every deadline is
 --- on. Each call has its own `struct timespec`, since workers read it at once.
 fun now() -> Int {
-    let timespec = Libc.malloc(16)
-    let _ = Libc.clockGettime(Sys.clockMonotonic(), timespec)
+    let timespec = Os.malloc(16)
+    let _ = Os.clockGettime(Sys.clockMonotonic(), timespec)
     let nanoseconds : Int = Ptr.load(timespec, 0) * 1000000000 + Ptr.load(timespec, 8)
-    Libc.free(timespec)
+    Os.free(timespec)
     nanoseconds
 }
 
@@ -602,7 +604,7 @@ fun freeSource(slot : Int) -> Unit {
             match Target.os {
                 Darwin -> {}
                 Linux -> if s.added { Workers.pollForget(s.number) }
-                Wasi -> Process.unsupported(())
+                Wasi -> {}
             }
             byFd[s.number] = 0
         }
@@ -610,7 +612,9 @@ fun freeSource(slot : Int) -> Unit {
             let registered = match Target.os {
                 Darwin -> s.armed != 0
                 Linux -> s.added
-                Wasi -> Process.unsupported(False)
+                -- Wasm has no poller (`Turkey.Workers.make`), so nothing is
+                -- ever registered.
+                Wasi -> False
             }
             if registered { Workers.pollForget(s.number) }
             byFd[s.number] = 0
@@ -669,7 +673,7 @@ fun arm(slot : Int, s : Source) -> Int {
             }
             r
         }
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -802,7 +806,7 @@ fun childExit(pid : Int, deadline : Int) -> Waiter {
         freeSource(slot)
         return done(w, r)
     }
-    let reaped = Sys.cResult(Libc.waitpid(pid, statusBuffer, Sys.waitNoHang))
+    let reaped = reap(pid)
     if reaped != 0 {
         freeSource(slot)
         return done(w, if reaped > 0 { status() } else { reaped })
@@ -866,8 +870,8 @@ fun tryLocks(slot : Int, s : Source) -> Unit {
             _ -> error("a lock source with a waiter that is not a lock")
         }
         let nonBlocking = operation | Sys.lockNonBlocking
-        var r = Sys.cResult(Libc.flock(s.number, nonBlocking))
-        while r == -Sys.eintr { r = Sys.cResult(Libc.flock(s.number, nonBlocking)) }
+        var r = tryLock(s.number, nonBlocking)
+        while r == -Sys.eintr { r = tryLock(s.number, nonBlocking) }
         if r == -Sys.eagain() {
             i = i + 1
         } else {
@@ -1019,7 +1023,7 @@ fun deliverFd(slot : Int, s : Source, value : Int) -> Unit {
             if value & Workers.pollReadable != 0 { s.armed = s.armed & 2 }
             if value & Workers.pollWritable != 0 { s.armed = s.armed & 1 }
         }
-        Wasi -> Process.unsupported(())
+        Wasi -> { s.armed = 0 }
     }
     if value & readMask != 0 { endAll(s.readers, Ready(0)) }
     if value & writeMask != 0 { endAll(s.writers, Ready(0)) }
@@ -1061,7 +1065,7 @@ fun deliverChild(slot : Int, s : Source, value : Int) -> Unit {
 -- error number -- on Darwin the status the poller reported, since someone
 -- else reaped it -- and if it is not waitable yet it is `exiting`.
 fun reapChild(slot : Int, s : Source) -> Unit {
-    let r = Sys.cResult(Libc.waitpid(s.number, statusBuffer, Sys.waitNoHang))
+    let r = reap(s.number)
     if r == 0 {
         markExiting(slot, s, s.event)
         return
@@ -1072,11 +1076,25 @@ fun reapChild(slot : Int, s : Source) -> Unit {
         match Target.os {
             Darwin -> s.event
             Linux -> r
-            Wasi -> Process.unsupported(0)
+            Wasi -> r
         }
     }
     endAll(s.readers, Ready(answer))
     freeSource(slot)
+}
+
+-- `waitpid` for `pid` with `WNOHANG`, its status in `statusBuffer`: the pid
+-- it reaped, 0 if the child still runs, or the negated `errno`. Wasm has no
+-- child processes (`Turkey.Spawn`), so there it is always `-ECHILD`.
+fun reap(pid : Int) -> Int = match Target.os {
+    Wasi -> -Sys.echild
+    _ -> Sys.cResult(Libc.waitpid(pid, statusBuffer, Sys.waitNoHang))
+}
+
+-- `flock` with `operation`, which has `LOCK_NB`: 0, or the negated `errno`.
+fun tryLock(fd : Int, operation : Int) -> Int = match Target.os {
+    Wasi -> Sys.cResult(Wasi.flock(fd, operation))
+    _ -> Sys.cResult(Libc.flock(fd, operation))
 }
 
 fun markExiting(slot : Int, s : Source, event : Int) -> Unit {

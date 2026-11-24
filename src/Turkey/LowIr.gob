@@ -305,6 +305,18 @@ type Op
     --- `Turkey.Roots` roots it at every safepoint before, and an object whose
     --- address was handed to C is not freed while C may still use it.
     | KeepAlive(Value)
+    --- `Prim.memoryGrow(pages)`: grow the program's linear memory by `pages`
+    --- pages of 65536 bytes each, zeroed, and answer the size in pages it had
+    --- before, as an `i64`. So the first new page starts at the answer times
+    --- 65536, and a grow of 0 pages answers the current size. -1 if the
+    --- engine refuses, with the memory as it was. `pages` is an `i64` that
+    --- must be in 0..65536, the most pages a 32-bit memory has.
+    ---
+    --- Wasm's `memory.grow` on memory 0: the operand wrapped to an `i32`
+    --- (`i32.wrap_i64`) and the answer sign-extended (`i64.extend_i32_s`), so
+    --- that -1 stays -1. Only a wasm target has linear memory to grow, and no
+    --- other backend selects it.
+    | MemoryGrow(Value)
     --- A `var`'s cell.
     | CellNew(Value)
     | CellLoad(Value)
@@ -559,6 +571,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- The same, for the same reason: deleted, or moved above the call it
     -- follows, it would stop keeping anything alive across that call.
     KeepAlive(_) -> Ssa.reads_() <> Ssa.writes()
+    -- Writes, since what it answers depends on every grow before it, and
+    -- two grows are two allocations however alike they look.
+    MemoryGrow(_) -> Ssa.reads_() <> Ssa.writes()
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
@@ -614,6 +629,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Ordered(a) -> [a]
     Poll -> []
     KeepAlive(a) -> [a]
+    MemoryGrow(a) -> [a]
     ArrayGet(a, b, _, _) -> [a, b]
     ArraySet(a, b, _, c, _) -> [a, b, c]
     ArrayLength(a) -> [a]
@@ -667,6 +683,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Ordered(a) -> Ordered(f(a))
     Poll -> Poll
     KeepAlive(a) -> KeepAlive(f(a))
+    MemoryGrow(a) -> MemoryGrow(f(a))
     ArrayGet(a, b, e, c) -> ArrayGet(f(a), f(b), e, c)
     ArraySet(a, b, e, c, d) -> ArraySet(f(a), f(b), e, f(c), d)
     ArrayLength(a) -> ArrayLength(f(a))
@@ -732,6 +749,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     Ordered(_) -> Some(Ssa.untraced(Unit))
     KeepAlive(_) -> Some(Ssa.untraced(Unit))
     Atomic(_, _) -> Some(Ssa.untraced(I64))
+    MemoryGrow(_) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     Intrinsic(k, _) -> Some(Ssa.untraced(intrinsicResult(k)))
     CellNew(_) -> Some(Ssa.traced(Ptr))
@@ -768,6 +786,7 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
         Bin(_, a, b) -> sameRep(f, out, a, b, "the operands of a binary operation")
         Cmp(_, a, b) -> sameRep(f, out, a, b, "the operands of a comparison")
         Not(a) -> wantClass(f, out, a, I1, "the operand of a logical not")
+        MemoryGrow(a) -> wantClass(f, out, a, I64, "the pages of a memory grow")
         Intrinsic(k, a) ->
             wantClass(f, out, a, intrinsicOperand(k), "the operand of " + intrinsicName(k))
         ArrayGet(_, index, at, _) -> {
@@ -1279,6 +1298,7 @@ fun showOpName(op : Op) -> String = match op {
     Ordered(_) -> "ordered"
     Poll -> "poll"
     KeepAlive(_) -> "keep.alive"
+    MemoryGrow(_) -> "memory.grow"
     ArrayGet(_, _, _, _) -> "array.get"
     ArraySet(_, _, _, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
@@ -1356,6 +1376,7 @@ instance Show Op {
     Ordered(target) -> "ordered " + v(target)
     Poll -> "poll"
     KeepAlive(a) -> "keep.alive " + v(a)
+    MemoryGrow(a) -> "memory.grow " + v(a)
     ArrayGet(a, i, e, c) -> "array.get " + v(a) + ", " + v(i) + "@" + showElement(e) + showCheck(c)
     ArraySet(a, i, e, x, c) ->
         "array.set " + v(a) + ", " + v(i) + "@" + showElement(e) + ", " + v(x) + showCheck(c)

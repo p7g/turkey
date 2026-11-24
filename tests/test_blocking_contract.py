@@ -8,6 +8,10 @@ calls that other modules may make inline. This reads both lists from that
 comment and checks every call to `Turkey.Libc` in `lib/` against them, so a
 new inline call to a function that waits fails here, rather than stopping a
 program that runs with one permit.
+
+A call through `Turkey.Os` counts as the `Turkey.Libc` call of the same name,
+made by the module that calls `Os`: `Turkey.Os` only chooses, by target,
+between that call and `Turkey.Wasi`'s.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from tests import bootc
 
 LIB = bootc.REPO_ROOT / "lib"
 LIBC = LIB / "Turkey" / "Libc.gob"
+OS = LIB / "Turkey" / "Os.gob"
 WORKERS = LIB / "Turkey" / "Workers.gob"
 
 NEVER_WAIT = "**Calls that never wait**"
@@ -28,8 +33,8 @@ INLINE = "**Calls that can wait, made inline**"
 _LEADING_NAMES = re.compile(r"^((?:`[^`]+`(?:, | and )?)+):\s")
 _FOREIGN = re.compile(r'^foreign\s+"[^"]+"\s+fun\s+(\w+)', re.MULTILINE)
 _STRING = re.compile(r'"(?:[^"\\]|\\.)*"')
-_IMPORT = re.compile(r"^import\s+Turkey\.Libc\b(.*)$")
-_CALL = re.compile(r"\bLibc\.(\w+)")
+_IMPORT = re.compile(r"^import\s+Turkey\.(Libc|Os)\b(.*)$")
+_CALL = re.compile(r"\b(?:Libc|Os)\.(\w+)")
 
 
 def _bullets(heading: str) -> list[str]:
@@ -87,8 +92,9 @@ def _module(path: Path) -> str:
 
 
 def _calls() -> list[tuple[str, str, str]]:
-    """Every call to `Turkey.Libc` in `lib/` outside `Turkey.Libc` and
-    `Turkey.Workers`: (module, function, where)."""
+    """Every call to `Turkey.Libc` in `lib/` outside `Turkey.Libc`,
+    `Turkey.Os` and `Turkey.Workers`, directly or through `Turkey.Os`:
+    (module, function, where)."""
     calls = []
     for path in sorted(LIB.rglob("*.gob")):
         # Skip a test's throwaway `Probe_*` module (`test_giblets`,
@@ -97,15 +103,16 @@ def _calls() -> list[tuple[str, str, str]]:
         if path.name.startswith("Probe_"):
             continue
         module = _module(path)
-        if module in ("Turkey.Libc", "Turkey.Workers"):
+        if module in ("Turkey.Libc", "Turkey.Os", "Turkey.Workers"):
             continue
         lines = path.read_text(encoding="utf-8").splitlines()
         imported = False
         for number, line in enumerate(lines, 1):
             code = _STRING.sub('""', line).split("--", 1)[0]
             if (found := _IMPORT.match(code)):
-                assert found.group(1).strip() == "as Libc", (
-                    f"{path}:{number}: import `Turkey.Libc` as `Libc`, so that "
+                name = found.group(1)
+                assert found.group(2).strip() == f"as {name}", (
+                    f"{path}:{number}: import `Turkey.{name}` as `{name}`, so that "
                     "this test can find the module's calls to it")
                 imported = True
         if not imported:
@@ -144,6 +151,20 @@ def test_every_call_that_can_wait_is_carried_or_excused():
         "these C calls can wait on something outside the program; make each "
         "through a `Turkey.Workers.blocking*` entry, or list it, with its "
         "reason, in the contract in Turkey.Workers:\n" + "\n".join(waiting))
+
+
+def test_os_makes_only_the_libc_call_it_is_named_for():
+    """What lets `_calls` count `Os.f` as `Libc.f`: each function of
+    `Turkey.Os` calls `Turkey.Libc`'s function of its own name and no other."""
+    source = OS.read_text(encoding="utf-8")
+    functions = re.split(r"^(?=fun )", source, flags=re.MULTILINE)[1:]
+    assert functions, f"no functions in {OS}"
+    for body in functions:
+        name = re.match(r"fun (\w+)", body).group(1)
+        code = "\n".join(_STRING.sub('""', line).split("--", 1)[0]
+                         for line in body.splitlines())
+        called = re.findall(r"\bLibc\.(\w+)", code)
+        assert called == [name], f"Turkey.Os.{name} calls {called}, not Libc.{name} alone"
 
 
 def test_no_excuse_outlives_its_call():

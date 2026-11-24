@@ -84,6 +84,48 @@ def test_wasm_is_checked_and_lowered_then_refused() -> None:
         "compiles as far as the low IR\n")
 
 
+# What a wasm program does through the runtime's WASI layer (`Turkey.Wasi`):
+# print, read and write files, list a directory, read its arguments and its
+# environment, and time itself.
+WASI_PROGRAM = """\
+import System.Env as Env
+import System.File as File
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
+
+fun main() {
+    let watch = Stopwatch.start()
+    for a in Env.args() { print(a) }
+    print(Env.get("HOME"))
+    if let Left(e) = File.writeText("out.txt", "written") { print(show(e)) }
+    print(File.readText("out.txt"))
+    print(File.listPath("."))
+    let _ = File.removeFile("out.txt")
+    print(Duration.toNanos(Stopwatch.elapsed(watch)) >= 0)
+}
+"""
+
+
+@pytest.mark.parametrize("source", ["program", "compiler"])
+def test_wasm_reaches_no_unsupported_call(tmp_path: Path, source: str) -> None:
+    """Every call a wasm program makes into the system is a WASI import, which
+    the compile checks before it stops, and nothing it can reach panics as
+    unsupported on the target: no `Process.unsupported` is left in its low IR.
+    The compiler itself is such a program."""
+    if source == "program":
+        path = tmp_path / "Main.gob"
+        path.write_text(WASI_PROGRAM, encoding="utf-8")
+    else:
+        path = bootc.REPO_ROOT / "src" / "Main.gob"
+    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa", "-S",
+                    "-o", os.devnull, str(path))
+    assert lowered.stderr.decode().endswith(
+        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
+        "compiles as far as the low IR\n"), lowered.stderr.decode()
+    assert b"call &fd_write" in lowered.stdout
+    assert b"unsupported on wasm32-wasi" not in lowered.stdout
+
+
 def test_target_without_a_value_is_refused() -> None:
     result = _boot("check", str(SOURCE), "--target")
     assert result.returncode == 2

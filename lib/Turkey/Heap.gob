@@ -48,7 +48,7 @@ import Data.Bool (Bool(..))
 import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
 import Turkey.Process as Process
-import Turkey.Libc as Libc
+import Turkey.Os as Os
 import Turkey.Lock as Lock
 import Turkey.Stack as Stack
 import Turkey.Sys as Sys
@@ -281,9 +281,9 @@ var staticBytes : Int = 0
 -- sequence is TURKEY_GC_STRESS_SEED's, 1 by default, so that a failing run can
 -- be repeated and several seeds can cover different phases. Every allocation
 -- takes the slow path while it is on, which is where it counts down.
-var stressInterval : Int = intervalFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS")))
+var stressInterval : Int = intervalFrom(Os.getenv(Prim.cString("TURKEY_GC_STRESS")))
 var stress : Bool = stressInterval > 0
-var stressRandom : Int = seedFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS_SEED")))
+var stressRandom : Int = seedFrom(Os.getenv(Prim.cString("TURKEY_GC_STRESS_SEED")))
 var stressCountdown : Int = 1
 
 -- Heap verification at every collection, by `Turkey.HeapCheck`. Fixed when the
@@ -313,7 +313,7 @@ let sizesKept : Bool = Prim.gcVerify
 -- old objects without calling `turkey_write_barrier` must turn it off with
 -- `turkey_gc_set_generational`. TURKEY_GC_GENERATIONAL=0 makes every
 -- collection full, for comparison.
-var generational : Bool = generationalFrom(Libc.getenv(Prim.cString("TURKEY_GC_GENERATIONAL")))
+var generational : Bool = generationalFrom(Os.getenv(Prim.cString("TURKEY_GC_GENERATIONAL")))
 -- Whether the collection in progress, or the last one, is minor.
 var minor : Bool = False
 -- The bytes the last full collection kept: the live set, as best it is known.
@@ -349,7 +349,7 @@ var statsIgnored : Bool = notCompiledIn(statsWanted, Prim.cString("TURKEY_GC_STA
 -- suite runs several of those compiles at once, which is what holds it at 2.
 -- TURKEY_GC_THRESHOLD_SCALE overrides it for experiments.
 var thresholdScale : Float =
-    scaleFrom(Libc.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
+    scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
 
 -- The counts every worker adds to as it allocates, by atomic adds: objects
 -- and bytes allocated, and objects the write barrier remembered.
@@ -379,7 +379,7 @@ var textLength : Int = 0
 var clock : Ptr = zeroed(16)
 
 fun zeroed(bytes : Int) -> Ptr {
-    let p = Libc.malloc(bytes)
+    let p = Os.malloc(bytes)
     if Ptr.isNull(p) {
         Process.panic(Prim.cString("out of memory"))
         return p
@@ -388,7 +388,7 @@ fun zeroed(bytes : Int) -> Ptr {
     p
 }
 
-fun present(name : Ptr) -> Bool = !Ptr.isNull(Libc.getenv(name))
+fun present(name : Ptr) -> Bool = !Ptr.isNull(Os.getenv(name))
 
 -- Whether the environment asks this run for a debugging aid the program was
 -- compiled without, which is said on stderr rather than ignored: the variable
@@ -406,7 +406,7 @@ fun notCompiledIn(built : Bool, name : Ptr, flag : Ptr) -> Bool {
 }
 
 fun say(text : Ptr) -> Unit {
-    let _ = Libc.write(2, text, Libc.strlen(text))
+    let _ = Os.write(2, text, Os.strlen(text))
 }
 
 -- -- raw words --------------------------------------------------------------------------
@@ -466,7 +466,7 @@ fun tableInsert(added : Ptr) -> Bool {
         let oldCapacity = regionTableCapacity
         let old = regionTable
         let capacity = if oldCapacity == 0 { 64 } else { oldCapacity * 2 }
-        let grown = Libc.malloc(8 * capacity)
+        let grown = Os.malloc(8 * capacity)
         if Ptr.isNull(grown) { return False }
         Memory.fill(grown, 8 * capacity, 0)
         regionTable = grown
@@ -479,7 +479,7 @@ fun tableInsert(added : Ptr) -> Bool {
                 Ptr.store(regionTable, 8 * at, entry)
             }
         }
-        Libc.free(old)
+        Os.free(old)
     }
     var at = regionHash(added)
     while !Ptr.isNull(tableAt(at)) {
@@ -790,7 +790,7 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
         (regionData + bytes + regionBytes - 1) & regionMask
     } else { regionBytes }
     let reused = reserved == regionBytes && !Ptr.isNull(spare)
-    let made = if reused { spare } else { Libc.alignedAlloc(regionBytes, reserved) }
+    let made = if reused { spare } else { Os.alignedAlloc(regionBytes, reserved) }
     if Ptr.isNull(made) { return made }
     -- A freed slot in a live region is reused as it was left, so no allocation
     -- reads a slot before writing it, and a spare's old slots need no
@@ -801,10 +801,10 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
     }
     let sizes = if !sizesKept { Ptr.null() }
                 else if reused { Ptr.load(made, regionSizes) }
-                else { Libc.malloc(regionBytes) }
+                else { Os.malloc(regionBytes) }
     if (sizesKept && Ptr.isNull(sizes)) || !tableInsert(made) {
-        Libc.free(sizes)
-        Libc.free(made)
+        Os.free(sizes)
+        Os.free(made)
         return Ptr.null()
     }
     Memory.fill(made, regionData, 0)
@@ -1067,7 +1067,7 @@ foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> U
     if Ptr.isNull(table) { return }
     let count = Ptr.load32(table, 0)
     if count <= 0 { return }
-    let entries = Libc.malloc(entryBytes * count)
+    let entries = Os.malloc(entryBytes * count)
     if Ptr.isNull(entries) {
         Process.panic(Prim.cString("out of memory"))
         return
@@ -1081,7 +1081,7 @@ foreign "turkey_frame_table_set" fun frameTableSet(table : Ptr, base : Ptr) -> U
         p = Ptr.add(p, 8 + 4 * n)
     }
     sortEntries(entries, count)
-    Libc.free(frameEntries)
+    Os.free(frameEntries)
     frameEntries = entries
     frameEntryCount = count
 }
@@ -1340,7 +1340,7 @@ fun slotOf(region : Ptr, object : Ptr) -> Int {
 fun growMarkStack(m : Ptr) -> Bool {
     let capacity : Int = Ptr.load(m, 16)
     let grown = if capacity < 64 { 64 } else { capacity * 2 }
-    let stack = Libc.realloc(Ptr.load(m, 0), 8 * grown)
+    let stack = Os.realloc(Ptr.load(m, 0), 8 * grown)
     if Ptr.isNull(stack) {
         markFailed(Prim.cString("out of memory"))
         return False
@@ -1378,7 +1378,7 @@ fun remember(parent : Ptr) -> Unit {
     let count = rememberedCount()
     if count == rememberedCapacity() {
         let capacity = if count < 64 { 64 } else { count * 2 }
-        let grown = Libc.realloc(remembered(), 8 * capacity)
+        let grown = Os.realloc(remembered(), 8 * capacity)
         if Ptr.isNull(grown) {
             Process.panic(Prim.cString("out of memory"))
             return
@@ -1659,7 +1659,7 @@ fun markFrom(frame : Ptr) -> Unit {
     mark()
     if sharing {
         for var i = 0; i < n; i = plus(i, 1) {
-            while Ptr.atomicLoad(helping, times8(i)) != 0 { let _ = Libc.schedYield() }
+            while Ptr.atomicLoad(helping, times8(i)) != 0 { let _ = Os.schedYield() }
         }
         sharing = False
     }
@@ -1675,7 +1675,7 @@ fun canHelp(i : Int, paused : Bool) -> Bool =
 fun addTask(kind : Int, a : Ptr, b : Ptr) -> Unit {
     if taskCount == taskCapacity {
         let capacity = if taskCapacity < 64 { 64 } else { taskCapacity * 2 }
-        let grown = Libc.realloc(tasks, 24 * capacity)
+        let grown = Os.realloc(tasks, 24 * capacity)
         if Ptr.isNull(grown) {
             markFailed(Prim.cString("out of memory"))
             return
@@ -1739,7 +1739,7 @@ fun share(stack : Ptr, top : Int) -> Int {
     Lock.acquire(poolLock)
     var packet = poolEmpty
     if Ptr.isNull(packet) {
-        packet = Libc.malloc(16 + 8 * packetEntries)
+        packet = Os.malloc(16 + 8 * packetEntries)
         if Ptr.isNull(packet) {
             Lock.release(poolLock)
             return top
@@ -2086,14 +2086,14 @@ fun trimSpares() -> Unit {
 
 -- Give a region and its size table back to libc.
 fun release(region : Ptr) -> Unit {
-    Libc.free(Ptr.load(region, regionSizes))
-    Libc.free(region)
+    Os.free(Ptr.load(region, regionSizes))
+    Os.free(region)
 }
 
 -- -- statistics -------------------------------------------------------------------------
 
 fun nanoseconds() -> Int {
-    let _ = Libc.clockGettime(Sys.clockMonotonic(), clock)
+    let _ = Os.clockGettime(Sys.clockMonotonic(), clock)
     Ptr.load(clock, 0) * 1000000000 + Ptr.load(clock, 8)
 }
 
@@ -2276,7 +2276,7 @@ fun putHex(n : Int) -> Unit {
 
 -- There is nowhere to report a failed write to.
 fun writeLine() -> Unit {
-    let _ = Libc.write(2, text, textLength)
+    let _ = Os.write(2, text, textLength)
     textLength = 0
 }
 
@@ -2418,7 +2418,7 @@ fun isSpace(c : Int) -> Bool = c == 32 || (c >= 9 && c <= 13)
 -- The state `Turkey.HeapCheck` is handed, at the offsets it names. Rewritten
 -- before each check, so it is never stale. Null if there was no memory for it,
 -- which the verifier reports.
-var state : Ptr = Libc.malloc(Check.stateBytes)
+var state : Ptr = Os.malloc(Check.stateBytes)
 
 fun snapshot() -> Ptr {
     retire()

@@ -263,8 +263,9 @@ function! s:BitwiseOr(prev) abort
   " Returns whether a `| B` line after a:prev continues a bitwise or rather
   " than an or-pattern. Its first operand's line is a body when a `let`,
   " `var`, `return`, `=` or `->` comes before it, on that line outside
-  " brackets or at the end of the line above. An or-pattern's first line
-  " has none of these: its `->` comes after the last pattern.
+  " brackets or at the end of the line above, or when it is in a block that
+  " is not a `match`'s, where no pattern can start a line. An or-pattern's
+  " first line has none of these: its `->` comes after the last pattern.
   let k = s:LogicalStart(a:prev)
   let n = 0
   while n < s:maxback && s:CodePart(k) =~# '^\s*|\%([^|>]\|$\)'
@@ -280,7 +281,11 @@ function! s:BitwiseOr(prev) abort
     return 1
   endif
   let p = s:PrevCode(k)
-  return p > 0 && s:TrailingOp(s:CodePart(p)) =~# '^\%(=\|->\)$'
+  if p > 0 && s:TrailingOp(s:CodePart(p)) =~# '^\%(=\|->\)$'
+    return 1
+  endif
+  let o = s:ScanBack(k, 1)
+  return o[2] ==# '{' && strpart(s:CodePart(o[0]), 0, o[1] - 1) !~# '\<match\>'
 endfunction
 
 function! s:Prec(op) abort

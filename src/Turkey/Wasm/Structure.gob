@@ -13,7 +13,8 @@ export (Control(..), structure, showControl)
 --- Unstructured Control Flow to Structured Control Flow", ICFP 2022), with the
 --- three enhancements of its section 7: no `br` where control falls through to
 --- the target anyway, no `block` wrapped directly around an `if`, and a
---- multiway branch as a single `br_table` where its keys are dense.
+--- multiway branch as a single `br_table`, which here is kept for a switch
+--- whose keys are dense.
 ---
 --- The result is generic over what a block holds. `Code` names a block of the
 --- graph, which instruction selection replaces with the block's instructions.
@@ -64,8 +65,9 @@ fun structure(f : Func i) -> Either String (Vec Control) {
     -- Ramsey's translation needs every loop to have one entry, its header,
     -- since it nests a loop's blocks inside the `loop` of the header. We
     -- assume the graphs the compiler builds are reducible, and nothing checks
-    -- it before here: a `break`, a `continue` and an early return are forward
-    -- edges to a join, and jump threading never gives a loop a second entry.
+    -- it before here: a `break` and an early return are forward edges, a
+    -- `continue` goes to the loop's own header or step block, and jump
+    -- threading never gives a loop a second entry.
     -- So an irreducible graph is a compiler bug, and it is rejected rather
     -- than node-split.
     let Some((innermost, _)) = Ssa.loops(f) else {
@@ -74,7 +76,8 @@ fun structure(f : Func i) -> Either String (Vec Control) {
     }
     let out : Vec Control = []
     let g = analyse(f, innermost)
-    doTree(g, Ssa.blockId(f.entry), Context { enclosing = Outermost, fallthrough = None }, out)
+    let outermost = Context { enclosing = Outermost, fallthrough = None }
+    finish(g, Some(Tree(Ssa.blockId(f.entry), outermost)), out)
     Right(out)
 }
 
@@ -181,10 +184,32 @@ fun matchesFrame(label : Int, frame : Frame) -> Bool = match frame {
 }
 
 -- -- translation ---------------------------------------------------------------------
+--
+-- Ramsey writes `doTree`, `nodeWithin` and `doBranch` as mutually recursive
+-- functions. Two of their calls are the last thing their caller does:
+-- `nodeWithin` placing the merge child that follows its `block`, and
+-- `doBranch` placing a successor in line. Along those two calls the dominator
+-- tree is as deep as a run of sequential `if`s or a chain of jumps is long,
+-- while the output stays flat. So each function below returns such a call as
+-- a `Tree` rather than making it, and `finish` makes them in a loop. What
+-- still recurses is the body of a `block`, `loop` or `if`, so the stack grows
+-- with the nesting of the output and not with the length of the function.
+
+-- A dominator subtree still to be placed: its root and the context it goes
+-- in.
+type Tree = Tree(Int, Context)
+
+-- Appends to `out` the translation of `pending`, if any, and of every subtree
+-- placing it returns.
+fun finish(g : Graph, pending : Option Tree, out : Vec Control) -> Unit {
+    var next = pending
+    while let Some(Tree(x, context)) = next { next = doTree(g, x, context, out) }
+}
 
 -- Appends to `out` the translation of block `x` and of every block it
--- dominates.
-fun doTree(g : Graph, x : Int, context : Context, out : Vec Control) -> Unit {
+-- dominates, except for one subtree it may return, whose translation goes
+-- next in `out`.
+fun doTree(g : Graph, x : Int, context : Context, out : Vec Control) -> Option Tree {
     -- A child that is not a merge node has `x` as its only forward
     -- predecessor, so it is one of `x`'s successors and `doBranch` places it
     -- in line. A `br_table` holds only depths and cannot hold code, so every
@@ -193,40 +218,39 @@ fun doTree(g : Graph, x : Int, context : Context, out : Vec Control) -> Unit {
         Ssa.Switch(_, _, _) -> g.children[x]
         _ -> Vec.filter(g.children[x], fun(y) = g.merge[y])
     }
-    if g.header[x] {
-        let body : Vec Control = []
-        nodeWithin(g, x, selected, 0, None, inside(LoopHeadedBy(x), context), body)
-        Vec.push(out, Loop(body))
-    } else {
-        nodeWithin(g, x, selected, 0, None, context, out)
-    }
+    if !g.header[x] { return nodeWithin(g, x, selected, 0, None, context, out) }
+    let body : Vec Control = []
+    finish(g, nodeWithin(g, x, selected, 0, None, inside(LoopHeadedBy(x), context), body), body)
+    Vec.push(out, Loop(body))
+    None
 }
 
 -- Appends to `out` the translation of `x` and its children, inside one
 -- `block` for each merge child from `ys[k]` on, with the child that has the
 -- highest `rpnum` outermost. Its translation follows the `block`, and every
 -- block with a forward branch to it is placed earlier, inside that `block`.
+-- Like `doTree`, it may return a subtree to place next.
 --
 -- With `follows` set, the translation must also be a form that a `Br` can
 -- exit to reach that block, which follows it: a `block` around the rest, or,
 -- if `x` ends in a branch and nothing else is left to place, the `if` it
 -- translates to.
 fun nodeWithin(g : Graph, x : Int, ys : Vec Int, k : Int, follows : Option Int,
-               context : Context, out : Vec Control) -> Unit {
+               context : Context, out : Vec Control) -> Option Tree {
     if let Some(z) = follows {
         if k < len(ys) || !generatesIf(g, x) {
             let body : Vec Control = []
-            nodeWithin(g, x, ys, k, None, inside(BlockFollowedBy(z), context), body)
+            finish(g, nodeWithin(g, x, ys, k, None, inside(BlockFollowedBy(z), context), body),
+                   body)
             Vec.push(out, Block(body))
-            return
+            return None
         }
     }
     if k < len(ys) {
         -- `follows` is `None` here.
         let y = ys[k]
-        nodeWithin(g, x, ys, k + 1, Some(y), withFallthrough(context, y), out)
-        doTree(g, y, context, out)
-        return
+        finish(g, nodeWithin(g, x, ys, k + 1, Some(y), withFallthrough(context, y), out), out)
+        return Some(Tree(y, context))
     }
     translate(g, x, follows, context, out)
 }
@@ -237,44 +261,47 @@ fun generatesIf(g : Graph, x : Int) -> Bool = match g.terms[x] {
 }
 
 -- Appends to `out` the code of `x` and the control flow leaving it, where
--- `follows` is the block that follows the `if` of a branch, if any.
+-- `follows` is the block that follows the `if` of a branch, if any. Like
+-- `doTree`, it may return a subtree to place next.
 fun translate(g : Graph, x : Int, follows : Option Int, context : Context,
-              out : Vec Control) -> Unit {
+              out : Vec Control) -> Option Tree {
     Vec.push(out, Code(BlockId(x)))
     match g.terms[x] {
-        Ssa.Ret(values) -> Vec.push(out, Return(values))
-        Ssa.Jump(target, _) -> doBranch(g, x, Ssa.blockId(target), context, out)
+        Ssa.Jump(target, _) -> return doBranch(g, x, Ssa.blockId(target), context, out)
         Ssa.Branch(test, yes, no) -> {
             let arms = inside(IfThenElse(follows), context)
             let taken : Vec Control = []
             let otherwise : Vec Control = []
-            doBranch(g, x, Ssa.blockId(yes), arms, taken)
-            doBranch(g, x, Ssa.blockId(no), arms, otherwise)
+            finish(g, doBranch(g, x, Ssa.blockId(yes), arms, taken), taken)
+            finish(g, doBranch(g, x, Ssa.blockId(no), arms, otherwise), otherwise)
             Vec.push(out, If(test, taken, otherwise))
         }
         Ssa.Switch(scrutinee, cases, default) ->
             Vec.push(out, multiway(scrutinee, cases, default, context.enclosing))
+        Ssa.Ret(values) -> Vec.push(out, Return(values))
         Ssa.Panic(message) -> Vec.push(out, Panic(message))
         Ssa.Unreachable -> Vec.push(out, Unreachable)
     }
+    None
 }
 
 -- Appends to `out` the code that, placed after the code of `from`, transfers
--- control to `to`.
-fun doBranch(g : Graph, from : Int, to : Int, context : Context, out : Vec Control) -> Unit {
+-- control to `to`, or returns the subtree of `to` to place next.
+fun doBranch(g : Graph, from : Int, to : Int, context : Context,
+             out : Vec Control) -> Option Tree {
     -- Leaving out a `br` to the block that follows anyway is sound only
     -- because no form leaves a result on the stack: a `br` would drop one,
     -- and falling through would not.
-    if context.fallthrough == Some(to) { return }
+    if context.fallthrough == Some(to) { return None }
     -- A backward branch continues a loop, and the reducibility check made
     -- `to` the header of one around `from`. A forward branch to a merge node
     -- exits a `block` or an `if` that the merge node follows. Anything else is
     -- a child of `from` with no other forward predecessor, placed here.
     if isBackward(g, from, to) || g.merge[to] {
         Vec.push(out, Br(index(to, context.enclosing)))
-    } else {
-        doTree(g, to, context, out)
+        return None
     }
+    Some(Tree(to, context))
 }
 
 -- A switch as a `br_table` where its keys are dense, and as a sequence of
@@ -296,10 +323,11 @@ fun multiway(scrutinee : Value, cases : Vec (Int, BlockId), default : Option Blo
     if len(tested) == 0 { return Br(otherwise) }
     let low = tested[0].0
     let high = tested[len(tested) - 1].0
-    -- A table costs a byte or so per entry and a fixed range check; a test
-    -- costs about seven bytes per key. Four entries per key keeps the table no
-    -- larger than the tests, and it takes one branch rather than one per key.
-    -- Below three keys the range check costs more than the tests save.
+    -- Ramsey's translation, like GHC's, emits every switch as one
+    -- `br_table`, which is too big for keys far apart. The threshold is a
+    -- guess, not a measurement: an entry costs a byte or so and a test about
+    -- seven, so at four entries per key the table is no larger than the
+    -- tests, and below three keys its range check outweighs what it saves.
     let dense = len(tested) >= 3 && match Int.subChecked(high, low) {
         Some(span) -> span < 4 * len(tested)
         None -> False

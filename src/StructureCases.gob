@@ -21,6 +21,7 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (BlockId(..), RepClass(..), Func)
 import Turkey.Wasm.Structure as S
 import Turkey.Wasm.Structure (Control(..))
+import System.Task as Task
 
 -- How a hand-built block ends, by block number.
 type Exit
@@ -83,15 +84,63 @@ fun main() {
     case("switch in a loop",
          [Goto(1), Cases([(0, 1), (1, 2), (2, 3)], Some(4)), Done, Done, Goto(1)])
 
+    -- b1's `if` stands in for the `block` b3 follows, and b0's for the one
+    -- b4 follows, so b2's branch to b4 is a `br` out of an `if`.
+    case("br to an if", [Fork(1, 4), Fork(2, 3), Fork(3, 4), Goto(4), Done])
+
+    -- Key 2 goes to b4, a merge node b0 dominates rather than the switch: the
+    -- table reaches it through b0's `if`.
+    case("switch to an outer merge node",
+         [Fork(1, 4), Cases([(0, 2), (1, 3), (2, 4)], Some(3)), Goto(4), Goto(4), Done])
+
     -- b3 is unreachable and must not appear.
     case("an unreachable block", [Fork(1, 2), Done, Stop, Goto(1)])
 
     -- The cycle b1-b2 can be entered at either block, so neither dominates
     -- the other and it has no header.
     case("irreducible", [Fork(1, 2), Fork(2, 3), Goto(1), Done])
+
+    -- A dominator tree as deep as the function is long, over an output that
+    -- stays flat, structured inside a task: on its 1 MB stack, about what an
+    -- engine gives wasm, recursion once per block would run out.
+    Task.runScope(do {
+        let deep = Task.spawn(fun() {
+            long("sequential diamonds", diamonds(longRun))
+            long("a chain of jumps", jumps(longRun))
+        })?
+        pure(Task.join(deep))
+    })
 }
 
-fun case(name : String, shape : Array Exit) -> Unit {
+-- How many diamonds or jumps the long cases chain.
+let longRun = 20000
+
+fun diamonds(n : Int) -> Array Exit {
+    let shape : Vec Exit = []
+    for var k = 0; k < n; k = k + 1 {
+        let top = 3 * k
+        Vec.push(shape, Fork(top + 1, top + 2))
+        Vec.push(shape, Goto(top + 3))
+        Vec.push(shape, Goto(top + 3))
+    }
+    Vec.push(shape, Done)
+    Vec.toArray(shape)
+}
+
+fun jumps(n : Int) -> Array Exit {
+    let shape : Vec Exit = []
+    for var k = 0; k < n; k = k + 1 { Vec.push(shape, Goto(k + 1)) }
+    Vec.push(shape, Done)
+    Vec.toArray(shape)
+}
+
+fun case(name : String, shape : Array Exit) -> Unit = check(name, shape, 40, True)
+
+-- A case too long to print: its body's size and nesting stand in for it, and
+-- each run may enter every block.
+fun long(name : String, shape : Array Exit) -> Unit = check(name, shape, len(shape) + 1, False)
+
+fun check(name : String, shape : Array Exit, steps : Int, printed : Bool) -> Unit {
     let f = graph(name, shape)
     print("-- case " + name)
     let complaints = Ssa.verify(f)
@@ -99,11 +148,30 @@ fun case(name : String, shape : Array Exit) -> Unit {
     match S.structure(f) {
         Left(message) -> print(message)
         Right(body) -> {
-            print(S.showControl(body))
+            if printed {
+                print(S.showControl(body))
+            } else {
+                print("steps: " + Int.toString(len(body)) + ", nested "
+                      + Int.toString(nesting(body)) + " deep")
+            }
             print("static: " + statically(f, body))
-            print("runs: " + dynamically(f, body))
+            print("runs: " + dynamically(f, body, steps))
         }
     }
+}
+
+-- How deep the body's forms nest.
+fun nesting(body : Vec Control) -> Int {
+    var deepest = 0
+    for step in body {
+        let inner = match step {
+            Block(b) | Loop(b) -> 1 + nesting(b)
+            If(_, taken, otherwise) -> 1 + max(nesting(taken), nesting(otherwise))
+            _ -> 0
+        }
+        deepest = max(deepest, inner)
+    }
+    deepest
 }
 
 fun graph(name : String, shape : Array Exit) -> Func Low {
@@ -170,18 +238,17 @@ fun count(body : Vec Control, placed : Array Int) -> Unit {
 
 -- -- the dynamic check ---------------------------------------------------------------
 
--- How many runs, and how many blocks each may enter before it is cut off.
+-- How many runs each case makes.
 let runs = 64
-let steps = 40
 
 -- Also checks that the runs between them take every edge out of every block
 -- the entry reaches, so that agreeing says something about each of them.
-fun dynamically(f : Func Low, body : Vec Control) -> String {
+fun dynamically(f : Func Low, body : Vec Control, steps : Int) -> String {
     let taken : Map String Bool = Map.new()
     for var seed = 1; seed <= runs; seed = seed + 1 {
-        let trace = runGraph(f, seed)
+        let trace = runGraph(f, seed, steps)
         let expected = String.join(trace, " ")
-        let got = String.join(runBody(f, body, seed), " ")
+        let got = String.join(runBody(f, body, seed, steps), " ")
         if expected != got {
             return "seed " + Int.toString(seed) + " disagrees\n  graph: " + expected
                    + "\n  body:  " + got
@@ -242,7 +309,8 @@ fun pick(o : Oracle, cases : Vec (Int, BlockId), default : Option BlockId) -> In
     options[choose(o, len(options))]
 }
 
-fun runGraph(f : Func Low, seed : Int) -> Vec String {
+-- Runs `f` until it ends or has entered `steps` blocks.
+fun runGraph(f : Func Low, seed : Int, steps : Int) -> Vec String {
     let trace : Vec String = []
     let o = Oracle { state = seed }
     var at = Ssa.blockId(f.entry)
@@ -298,13 +366,15 @@ type Walk = Walk {
     f       : Func Low,
     oracle  : Oracle,
     trace   : Vec String,
+    steps   : Int,
     -- The block whose code ran last, whose terminator the step after it
     -- implements.
     var current : Int,
 }
 
-fun runBody(f : Func Low, body : Vec Control, seed : Int) -> Vec String {
-    let w = Walk { f, oracle = Oracle { state = seed }, trace = [], current = -1 }
+-- Runs `body` until it ends or has entered `steps` blocks.
+fun runBody(f : Func Low, body : Vec Control, seed : Int, steps : Int) -> Vec String {
+    let w = Walk { f, oracle = Oracle { state = seed }, trace = [], steps, current = -1 }
     match exec(w, body) {
         Exited(how) -> Vec.push(w.trace, how)
         Cut -> {}
@@ -318,7 +388,7 @@ fun exec(w : Walk, body : Vec Control) -> Outcome {
     for step in body {
         let outcome = match step {
             Code(b) -> {
-                if len(w.trace) == steps {
+                if len(w.trace) == w.steps {
                     Vec.push(w.trace, "...")
                     Cut
                 } else {

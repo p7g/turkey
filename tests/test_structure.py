@@ -34,7 +34,11 @@ STRUCTURED = [
     "sparse switch",
     "switch with no default",
     "switch in a loop",
+    "br to an if",
+    "switch to an outer merge node",
     "an unreachable block",
+    "sequential diamonds",
+    "a chain of jumps",
 ]
 
 
@@ -56,7 +60,7 @@ def _cases() -> dict[str, list[str]]:
 def _body(name: str) -> str:
     """The structured body a case printed, without its check lines."""
     return "\n".join(line for line in _cases()[name]
-                     if not line.startswith(("static: ", "runs: ")))
+                     if not line.startswith(("static: ", "runs: ", "steps: ")))
 
 
 def test_every_case_is_printed():
@@ -170,6 +174,42 @@ def test_a_switch_with_no_default_lets_its_last_key_stand_in_for_one():
 def test_a_switch_can_continue_its_loop():
     """Key 0 goes back to the loop's header: depth 3 is the `loop`."""
     assert "br_table %0 - 0 [3 2 1] 0" in _body("switch in a loop")
+
+
+def test_a_br_can_exit_an_if_that_stands_in_for_a_block():
+    """b0's `if` takes the place of the `block` that b4 follows, so b2's
+    branch to b4 leaves through it: past b2's own `if` and b1's."""
+    assert _body("br to an if") == "\n".join([
+        "b0",
+        "if %1",
+        "  b1",
+        "  if %3",
+        "    b2",
+        "    if %5",
+        "    else",
+        "      br 2",
+        "    end",
+        "  end",
+        "  b3",
+        "end",
+        "b4",
+        "return %6",
+    ])
+
+
+def test_a_switch_reaches_a_merge_node_it_does_not_dominate():
+    """Key 2 goes to b4, which follows b0's `if`, two forms out."""
+    assert "br_table %2 - 0 [1 0 2] 0" in _body("switch to an outer merge node")
+
+
+@pytest.mark.parametrize("name, nesting", [
+    ("sequential diamonds", "steps: 40002, nested 1 deep"),
+    ("a chain of jumps", "steps: 20002, nested 0 deep"),
+])
+def test_a_deep_dominator_tree_over_a_flat_body_fits_a_task_stack(name, nesting):
+    """Structured inside a task, on its 1 MB stack. Recursing once per block
+    of the dominator tree runs out of it long before the end."""
+    assert nesting in _cases()[name]
 
 
 def test_an_unreachable_block_is_not_placed():

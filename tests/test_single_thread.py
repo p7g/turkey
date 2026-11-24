@@ -128,8 +128,9 @@ def test_without_the_mode_the_same_program_starts_threads(program):
 
 # Waits from `main`'s own stack that a task ends: a semaphore's permit, given
 # back by a task while `main` waits, and a detached call, which the one thread
-# runs to its end however early its deadline when the call does not wait. The tasks allocate, so that a
-# collection under `TURKEY_GC_STRESS` finds them parked and running.
+# runs to its end however early its deadline when the call does not wait. The
+# tasks allocate, so that a collection under `TURKEY_GC_STRESS` finds them
+# parked and running.
 WAITS = """
 import System.Sync as Sync
 import System.Task as Task
@@ -169,7 +170,7 @@ fun main() {
     print(len(Task.join(a)) + len(Task.join(b)))
     print(Task.join(b)[29])
     -- A deadline on `Turkey.Wait.now`'s clock that passed long ago, for a
-    -- call that never waits, as a C call does not.
+    -- call that returns without waiting on a task, as a C call does.
     print(Detach.run(fun() = Int.toString(len(squaresAtOnce(3))), fun(_) = {}, 1))
 }
 """

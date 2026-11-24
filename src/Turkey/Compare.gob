@@ -1,0 +1,369 @@
+export (firstDifference)
+
+--- Structural comparison of two parse trees.
+---
+--- Two trees are the same when they hold the same syntax. Where it is written
+--- is not part of that: spans, node ids, comments and blank lines are left
+--- out. So is what later stages fill in, which a fresh parse has not got: the
+--- method a `+` or a `for` loop means, and what opening a pattern binds. The
+--- name the parser gives the parameter of a function made by `_` carries a
+--- fresh number, so two such names are the same when each tree uses them in
+--- the same places.
+
+import Turkey.Ast (..)
+import Turkey.Fixity as Fixity
+import Turkey.Source (Span)
+
+--- Returns the span, in `a`, of the innermost node at which `a` first differs
+--- from `b`, or `None` when the two are the same program. Never modifies
+--- either tree.
+fun firstDifference(a : Program, b : Program) -> Option Span {
+    let c = C { forward = Map.new(), backward = Map.new(), at = None }
+    let Program {
+        span, exportDecl = exported, imports, decls, letElses = _, comments = _, blankLines = _,
+    } = a
+    let same = optional(exported, b.exportDecl, exportDecl)
+        && pairwise(imports, b.imports, importDecl)
+        && pairwise(decls, b.decls, fun(x, y) = decl(c, x, y))
+    if !same { mark(c, span) }
+    c.at
+}
+
+-- The comparison's state: the pairing of `_` parameter names found so far,
+-- each way, and the span the first difference was found at.
+type C = C {
+    forward  : Map String String,
+    backward : Map String String,
+    var at   : Option Span,
+}
+
+-- Records `s` as where the trees differ, unless a node inside it already has
+-- been. A node is compared after its children, so the first span recorded is
+-- the innermost.
+fun mark(c : C, s : Span) -> Unit {
+    if Option.isNone(c.at) { c.at = Some(s) }
+}
+
+-- -- helpers ------------------------------------------------------------------------
+
+fun pairwise(xs : Vec a, ys : Vec a, same : fun(a, a) -> Bool) -> Bool {
+    if len(xs) != len(ys) { return False }
+    for var i = 0; i < len(xs); i = i + 1 {
+        if !same(xs[i], ys[i]) { return False }
+    }
+    True
+}
+
+fun optional(x : Option a, y : Option a, same : fun(a, a) -> Bool) -> Bool = match (x, y) {
+    (Some(p), Some(q)) -> same(p, q)
+    (None, None) -> True
+    _ -> False
+}
+
+fun strings(xs : Vec String, ys : Vec String) -> Bool = pairwise(xs, ys, fun(x, y) = x == y)
+
+-- Whether `x` in one tree and `y` in the other name the same variable. A name
+-- the parser made for a `_` parameter matches the one name it was first
+-- paired with, both ways round; every other name matches only itself.
+fun sameVar(c : C, x : String, y : String) -> Bool {
+    if !String.startsWith(x, shorthandPrefix) || !String.startsWith(y, shorthandPrefix) {
+        return x == y
+    }
+    match (Map.get(c.forward, x), Map.get(c.backward, y)) {
+        (None, None) -> {
+            Map.put(c.forward, x, y)
+            Map.put(c.backward, y, x)
+            True
+        }
+        (Some(paired), Some(back)) -> paired == y && back == x
+        _ -> False
+    }
+}
+
+fun lit(x : Lit, y : Lit) -> Bool = match (x, y) {
+    (LInt(m), LInt(n)) -> m == n
+    (LFloat(m), LFloat(n)) -> m == n
+    (LString(m), LString(n)) -> m == n
+    (LChar(m), LChar(n)) -> m == n
+    _ -> False
+}
+
+-- -- types and patterns -------------------------------------------------------------
+
+fun typeExpr(c : C, x : Type, y : Type) -> Bool {
+    let Type { id = _, span, kind } = x
+    let same = match (kind, y.kind) {
+        (TEVar(m), TEVar(n)) -> m == n
+        (TECon(m, xs), TECon(n, ys)) -> m == n && types(c, xs, ys)
+        (TEApp(f, xs), TEApp(g, ys)) -> typeExpr(c, f, g) && types(c, xs, ys)
+        (TETuple(xs), TETuple(ys)) -> types(c, xs, ys)
+        (TEFun(xs, r), TEFun(ys, s)) -> types(c, xs, ys) && typeExpr(c, r, s)
+        _ -> False
+    }
+    if !same { mark(c, span) }
+    same
+}
+
+fun types(c : C, xs : Vec Type, ys : Vec Type) -> Bool = pairwise(xs, ys, fun(x, y) = typeExpr(c, x, y))
+
+fun optType(c : C, x : Option Type, y : Option Type) -> Bool = optional(x, y, fun(x, y) = typeExpr(c, x, y))
+
+fun pattern(c : C, x : Pat, y : Pat) -> Bool {
+    let Pat { id = _, span, kind, opening = _ } = x
+    let same = match (kind, y.kind) {
+        (PVar(m), PVar(n)) -> sameVar(c, m, n)
+        (PWild, PWild) -> True
+        (PCon(m, xs), PCon(n, ys)) -> m == n && patterns(c, xs, ys)
+        (PRecord(m, xs, r), PRecord(n, ys, s)) ->
+            m == n && r == s
+                && pairwise(xs, ys, fun((f, p), (g, q)) = f == g && pattern(c, p, q))
+        (PLit(l), PLit(m)) -> lit(l, m)
+        (PTuple(xs), PTuple(ys)) -> patterns(c, xs, ys)
+        (PAnnot(p, t), PAnnot(q, u)) -> pattern(c, p, q) && typeExpr(c, t, u)
+        (POr(xs), POr(ys)) -> patterns(c, xs, ys)
+        _ -> False
+    }
+    if !same { mark(c, span) }
+    same
+}
+
+fun patterns(c : C, xs : Vec Pat, ys : Vec Pat) -> Bool = pairwise(xs, ys, fun(x, y) = pattern(c, x, y))
+
+-- -- expressions and statements -----------------------------------------------------
+
+fun expr(c : C, x : Expr, y : Expr) -> Bool {
+    let Expr { id = _, span, kind } = x
+    let same = exprKind(c, kind, y.kind)
+    if !same { mark(c, span) }
+    same
+}
+
+fun exprs(c : C, xs : Vec Expr, ys : Vec Expr) -> Bool = pairwise(xs, ys, fun(x, y) = expr(c, x, y))
+
+fun optExpr(c : C, x : Option Expr, y : Option Expr) -> Bool = optional(x, y, fun(x, y) = expr(c, x, y))
+
+-- The method references that `EIndex`, `EUnary`, `EBinary`, `EForIn` and
+-- `EQuestion` carry are left out: the parser writes the same ones for the same
+-- syntax, and resolution is what fills them in.
+fun exprKind(c : C, x : ExprKind, y : ExprKind) -> Bool = match (x, y) {
+    (ELit(l), ELit(m)) -> lit(l, m)
+    (EUnit, EUnit) -> True
+    (EVar(m, mk), EVar(n, nk)) -> sameVar(c, m, n) && mk == nk
+    (ECon(m), ECon(n)) -> m == n
+    (ETuple(xs), ETuple(ys)) -> exprs(c, xs, ys)
+    (EArray(xs), EArray(ys)) -> exprs(c, xs, ys)
+    (ERecord(m, xs), ERecord(n, ys)) ->
+        m == n && pairwise(xs, ys, fun((f, v), (g, w)) = f == g && expr(c, v, w))
+    (ELambda(ps, r, e), ELambda(qs, s, f)) ->
+        patterns(c, ps, qs) && optType(c, r, s) && expr(c, e, f)
+    (ECall(f, xs), ECall(g, ys)) -> expr(c, f, g) && exprs(c, xs, ys)
+    (EIndex(a, i, _, _), EIndex(b, j, _, _)) -> expr(c, a, b) && expr(c, i, j)
+    (EField(a, m), EField(b, n)) -> m == n && expr(c, a, b)
+    (EProject(a, m), EProject(b, n)) -> m == n && expr(c, a, b)
+    (EUnary(m, a, _), EUnary(n, b, _)) -> m == n && expr(c, a, b)
+    (EBinary(m, a, e, _), EBinary(n, b, f, _)) -> m == n && expr(c, a, b) && expr(c, e, f)
+    (EChain(xs, ms), EChain(ys, ns)) ->
+        exprs(c, xs, ys) && pairwise(ms, ns, fun((m, _), (n, _)) = m == n)
+    (EAnnot(a, t), EAnnot(b, u)) -> expr(c, a, b) && typeExpr(c, t, u)
+    (EIf(a, e, o), EIf(b, f, p)) -> expr(c, a, b) && expr(c, e, f) && optExpr(c, o, p)
+    (EWhile(a, e), EWhile(b, f)) -> expr(c, a, b) && expr(c, e, f)
+    (EForIn(p, a, e, _, _), EForIn(q, b, f, _, _)) ->
+        pattern(c, p, q) && expr(c, a, b) && expr(c, e, f)
+    (EForC(i, a, s, e), EForC(j, b, t, f)) ->
+        optStmt(c, i, j) && expr(c, a, b) && optStmt(c, s, t) && expr(c, e, f)
+    (ELoop(e), ELoop(f)) -> expr(c, e, f)
+    (EMatch(a, xs), EMatch(b, ys)) -> expr(c, a, b) && pairwise(xs, ys, fun(x, y) = arm(c, x, y))
+    (EIfLet(xs, e, o), EIfLet(ys, f, p)) ->
+        conditions(c, xs, ys) && expr(c, e, f) && optExpr(c, o, p)
+    (EWhileLet(xs, e), EWhileLet(ys, f)) -> conditions(c, xs, ys) && expr(c, e, f)
+    (EReturn(o), EReturn(p)) -> optExpr(c, o, p)
+    (EBreak(o), EBreak(p)) -> optExpr(c, o, p)
+    (EContinue, EContinue) -> True
+    (EBlock(xs), EBlock(ys)) -> pairwise(xs, ys, fun(x, y) = stmt(c, x, y))
+    (EQuestion(e, _), EQuestion(f, _)) -> expr(c, e, f)
+    (EDo(e), EDo(f)) -> expr(c, e, f)
+    (EParen(e), EParen(f)) -> expr(c, e, f)
+    _ -> False
+}
+
+fun arm(c : C, x : Arm, y : Arm) -> Bool {
+    let Arm { span, patterns = ps, guards, body } = x
+    let same = patterns(c, ps, y.patterns) && pairwise(guards, y.guards, fun(x, y) = guard(c, x, y))
+        && expr(c, body, y.body)
+    if !same { mark(c, span) }
+    same
+}
+
+fun guard(c : C, x : Guard, y : Guard) -> Bool = match (x, y) {
+    (GTest(e), GTest(f)) -> expr(c, e, f)
+    (GLet(ps, e), GLet(qs, f)) -> patterns(c, ps, qs) && expr(c, e, f)
+    _ -> False
+}
+
+fun conditions(c : C, xs : Vec Condition, ys : Vec Condition) -> Bool =
+    pairwise(xs, ys, fun(x, y) = condition(c, x, y))
+
+fun condition(c : C, x : Condition, y : Condition) -> Bool {
+    let same = match (x, y) {
+        (CondTest(_, e), CondTest(_, f)) -> expr(c, e, f)
+        (CondLet(_, m, ps, e), CondLet(_, n, qs, f)) ->
+            m == n && patterns(c, ps, qs) && expr(c, e, f)
+        _ -> False
+    }
+    if !same { mark(c, conditionSpan(x)) }
+    same
+}
+
+fun stmt(c : C, x : Stmt, y : Stmt) -> Bool {
+    let Stmt { id = _, span, kind } = x
+    let same = match (kind, y.kind) {
+        (SLet(p, e), SLet(q, f)) -> pattern(c, p, q) && expr(c, e, f)
+        (SVar(p, e), SVar(q, f)) -> pattern(c, p, q) && expr(c, e, f)
+        (SFun(d), SFun(e)) -> funDecl(c, d, e)
+        (SAssign(a, e), SAssign(b, f)) -> expr(c, a, b) && expr(c, e, f)
+        (SExpr(e), SExpr(f)) -> expr(c, e, f)
+        (SLetElse(m, p, e, o), SLetElse(n, q, f, r)) ->
+            m == n && pattern(c, p, q) && expr(c, e, f) && expr(c, o, r)
+        _ -> False
+    }
+    if !same { mark(c, span) }
+    same
+}
+
+fun optStmt(c : C, x : Option Stmt, y : Option Stmt) -> Bool = optional(x, y, fun(x, y) = stmt(c, x, y))
+
+-- -- declarations -------------------------------------------------------------------
+
+fun pred(c : C, x : Pred, y : Pred) -> Bool {
+    let Pred { span, kind } = x
+    let same = match (kind, y.kind) {
+        (PClass(m, t), PClass(n, u)) -> m == n && typeExpr(c, t, u)
+        (PEq(a, t), PEq(b, u)) -> typeExpr(c, a, b) && typeExpr(c, t, u)
+        _ -> False
+    }
+    if !same { mark(c, span) }
+    same
+}
+
+fun preds(c : C, xs : Vec Pred, ys : Vec Pred) -> Bool = pairwise(xs, ys, fun(x, y) = pred(c, x, y))
+
+fun funDecl(c : C, x : FunDecl, y : FunDecl) -> Bool {
+    let FunDecl { id = _, span, name, params, ret, body, context, monomorphic, symbol } = x
+    let same = name == y.name && patterns(c, params, y.params) && optType(c, ret, y.ret)
+        && optExpr(c, body, y.body) && preds(c, context, y.context)
+        && monomorphic == y.monomorphic && optional(symbol, y.symbol, fun(m, n) = m == n)
+    if !same { mark(c, span) }
+    same
+}
+
+fun foreignDecl(c : C, x : ForeignDecl, y : ForeignDecl) -> Bool {
+    let ForeignDecl { id = _, span, name, symbol, params, fixed, ret, library } = x
+    let same = name == y.name && symbol == y.symbol && patterns(c, params, y.params)
+        && fixed == y.fixed && typeExpr(c, ret, y.ret)
+        && optional(library, y.library, foreignLibrary)
+    if !same { mark(c, span) }
+    same
+}
+
+fun foreignLibrary(x : ForeignLibrary, y : ForeignLibrary) -> Bool {
+    let ForeignLibrary { name, major, span = _ } = x
+    name == y.name && major == y.major
+}
+
+fun conDecl(c : C, x : ConDecl, y : ConDecl) -> Bool {
+    let ConDecl { span, name, args, fields, vars, fieldSpans = _, binders, context } = x
+    let same = name == y.name && types(c, args, y.args)
+        && optional(fields, y.fields, fun(xs, ys) = pairwise(xs, ys,
+            fun((f, t), (g, u)) = f == g && typeExpr(c, t, u)))
+        && strings(vars, y.vars) && strings(binders, y.binders)
+        && preds(c, context, y.context)
+    if !same { mark(c, span) }
+    same
+}
+
+fun typeDecl(c : C, x : TypeDecl, y : TypeDecl) -> Bool {
+    let TypeDecl { span, name, params, derives, variants, alias } = x
+    let same = name == y.name && strings(params, y.params)
+        && pairwise(derives, y.derives, derive)
+        && optional(variants, y.variants, fun(xs, ys) = pairwise(xs, ys, fun(x, y) = conDecl(c, x, y)))
+        && optType(c, alias, y.alias)
+    if !same { mark(c, span) }
+    same
+}
+
+fun derive(x : Derive, y : Derive) -> Bool {
+    let Derive { span = _, cls, refused } = x
+    cls == y.cls && refused == y.refused
+}
+
+fun famDecl(x : FamDecl, y : FamDecl) -> Bool {
+    let FamDecl { span = _, name, param } = x
+    name == y.name && param == y.param
+}
+
+fun famBind(c : C, x : FamBind, y : FamBind) -> Bool {
+    let FamBind { span = _, name, body } = x
+    name == y.name && typeExpr(c, body, y.body)
+}
+
+fun classDecl(c : C, x : ClassDecl, y : ClassDecl) -> Bool {
+    let ClassDecl { span, name, param, supers, methods, families } = x
+    let same = name == y.name && param == y.param && preds(c, supers, y.supers)
+        && pairwise(methods, y.methods, fun(x, y) = funDecl(c, x, y))
+        && pairwise(families, y.families, famDecl)
+    if !same { mark(c, span) }
+    same
+}
+
+fun instanceDecl(c : C, x : InstanceDecl, y : InstanceDecl) -> Bool {
+    let InstanceDecl { span, cls, head, context, methods, families } = x
+    let same = cls == y.cls && typeExpr(c, head, y.head) && preds(c, context, y.context)
+        && pairwise(methods, y.methods, fun(x, y) = funDecl(c, x, y))
+        && pairwise(families, y.families, fun(x, y) = famBind(c, x, y))
+    if !same { mark(c, span) }
+    same
+}
+
+fun infixDecl(c : C, x : InfixDecl, y : InfixDecl) -> Bool {
+    let InfixDecl { span, group, op, target, targetSpan = _ } = x
+    let same = Fixity.groupName(group) == Fixity.groupName(y.group) && op == y.op
+        && target == y.target
+    if !same { mark(c, span) }
+    same
+}
+
+fun decl(c : C, x : Decl, y : Decl) -> Bool = match (x, y) {
+    (DStmt(s), DStmt(t)) -> stmt(c, s, t)
+    (DType(s), DType(t)) -> typeDecl(c, s, t)
+    (DClass(s), DClass(t)) -> classDecl(c, s, t)
+    (DInstance(s), DInstance(t)) -> instanceDecl(c, s, t)
+    (DForeign(s), DForeign(t)) -> foreignDecl(c, s, t)
+    (DInfix(s), DInfix(t)) -> infixDecl(c, s, t)
+    _ -> False
+}
+
+-- -- imports and exports ------------------------------------------------------------
+
+fun exportItem(x : ExportItem, y : ExportItem) -> Bool {
+    let ExportItem { span = _, name, subs, qualifier, list, rest } = x
+    name == y.name && optional(subs, y.subs, strings) && qualifier == y.qualifier
+        && optional(list, y.list, fun(xs, ys) = pairwise(xs, ys, importItem))
+        && rest == y.rest
+}
+
+fun exportDecl(x : ExportDecl, y : ExportDecl) -> Bool {
+    let ExportDecl { span = _, items, rest } = x
+    pairwise(items, y.items, exportItem) && rest == y.rest
+}
+
+fun importItem(x : ImportItem, y : ImportItem) -> Bool {
+    let ImportItem { item, rename } = x
+    exportItem(item, y.item) && optional(rename, y.rename, fun(m, n) = m == n)
+}
+
+fun importDecl(x : ImportDecl, y : ImportDecl) -> Bool {
+    let ImportDecl { span = _, name, alias, items, rest } = x
+    name == y.name && optional(alias, y.alias, fun(m, n) = m == n)
+        && optional(items, y.items, fun(xs, ys) = pairwise(xs, ys, importItem))
+        && rest == y.rest
+}

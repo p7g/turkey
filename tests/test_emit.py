@@ -524,6 +524,24 @@ def _build(cwd: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
                           timeout=600)
 
 
+# A program's module the library has a namesake of is loaded under its name
+# and a `:`, and its symbols carry the mark in both object formats.
+@pytest.mark.parametrize("target, label", [
+    ("arm64-darwin", b'"_Prelude:#hello":'),
+    ("arm64-linux", b'"Prelude:#hello":'),
+])
+def test_a_marked_module_is_a_symbol_in_each_format(tmp_path, target, label):
+    (tmp_path / "Prelude.gob").write_text(
+        "export (hello)\nimport System.IO (print)\nfun hello() { print(\"mine\") }\n")
+    (tmp_path / "main.gob").write_text("fun main() { hello() }\n")
+    listing = _build(tmp_path, "-S", "-o", "-", "--target", target, "main.gob")
+    assert listing.returncode == 0, listing.stderr
+    assert label in listing.stdout
+    assert _build(tmp_path, "--target", target, "-o", "out", "main.gob").returncode == 0
+    # The symbol's name, in the executable's string table.
+    assert label[1:-2] + b"\0" in (tmp_path / "out").read_bytes()
+
+
 # `-S` writes `./STEM.s`, as `cc -S` does; `-o PATH` names the file, and
 # `-o -` writes the same text to standard output.
 def test_dash_s_writes_the_assembly_into_the_working_directory(tmp_path):

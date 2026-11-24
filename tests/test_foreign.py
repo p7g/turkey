@@ -78,12 +78,10 @@ def test_a_program_may_not_declare_a_foreign_symbol():
 def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path):
     """Checked against where the file came from, not against what it says it
     is called. A program that could opt in by what its own source says would
-    have no gate at all. `import Prelude ()`, because a module beside the
-    entry shadows the library's own `Turkey.Libc`, which the Prelude
-    reaches."""
+    have no gate at all. The library's own `Turkey.Libc`, which the Prelude
+    reaches, is loaded beside the program's."""
     message = fails("import Turkey.Libc as E\nfun main() { }\n", {
         "Turkey/Libc.gob": "export (f)\n"
-                           "import Prelude ()\n"
                            'foreign "system" fun f(Prim.Ptr) -> Int\n'})
     assert "a 'foreign' function without a body can appear only in" in message
 
@@ -95,7 +93,6 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
     (root / "Turkey").mkdir(parents=True)
     (root / "Turkey" / "Libc.gob").write_text(
         "export (f)\n"
-        "import Prelude ()\n"
         'foreign "strlen" fun f(Prim.Ptr) -> Int\n',
         encoding="utf-8")
     (root / "Main.gob").write_text("import Turkey.Libc as P\nfun main() { }\n",

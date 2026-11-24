@@ -24,8 +24,8 @@ import sys
 # `sample` output and in a crash report.
 SYMBOL = re.compile(
     r"(?<![\w.#%@~'])_?"
-    r"(?:%[A-Za-z]|[A-Z][\w']*(?:\.[A-Z][\w']*)*#)"
-    r"[\w'.#%@~(),\[\]{}<>!=*/|&^$-]*")
+    r"(?:%[A-Za-z]|[A-Z][\w']*(?:\.[A-Z][\w']*)*:?#)"
+    r"[\w'.#%@~(),\[\]{}<>!=*/|&^$:-]*")
 
 OPERATOR = set("!#$%&*+-/<=>@^|~")
 SEPARATORS = set("#%~@")
@@ -161,6 +161,8 @@ class _Scan:
 def display_name(name: str) -> str:
     """Returns the display form of the internal name `name`, which is a
     symbol without a Mach-O symbol's leading `_`."""
+    # The mark of a program's module the library has a namesake of.
+    name = name.replace(":#", "#")
     s = _Scan(name)
     if name.startswith("%inst."):
         s.at = len("%inst.")

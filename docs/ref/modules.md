@@ -38,6 +38,37 @@ fun main() {
 }
 ```
 
+That order is for the imports a program's own modules write. An import
+written in a standard library module is looked for in the standard library
+alone, so nothing beside the entry file can take the place of a module the
+library uses. A program's module may therefore have the name of a standard
+library module. The program's modules then import the program's file, the
+library's modules import the library's, and the two are different modules:
+
+<!-- module: Data/Int.gob -->
+```kotlin
+export (double)
+
+fun double(n : Int) -> Int = n + n
+```
+
+<!-- run -->
+```kotlin
+import Data.Int
+
+fun main() {
+    print(Int.toString(Data.Int.double(21)))
+}
+```
+
+```text
+42
+```
+
+`Data.Int` is the program's module there, and it has no `toString`.
+`Int.toString` is the standard library's: the qualifier `Int` comes with
+[the Prelude](#the-prelude), which is a standard library module.
+
 The file the compiler is given is the **entry module**, and
 it must define [`main`](#the-entry-point). The entry module is called `Main`,
 whatever its file is called, and no module may import it: neither as `Main`
@@ -839,6 +870,37 @@ library modules it brings qualified, such as `Vec` and `String`. An explicit
 `import Prelude ...` replaces the implicit import of its bare names, and
 `import Prelude ()` imports nothing from it at all, the qualified modules
 included, where `()` after any other module still brings its qualifier. See [The Prelude](builtins.md#the-prelude) for what it provides.
+
+The implicit import is an import of the module `Prelude`, and that module is
+found as any other is. A program with a `Prelude.gob` beside its entry file
+gives its own modules that module's bare names in place of the standard
+library's, and the standard library's modules keep theirs. The qualified
+library modules come either way. A module named `Prelude` has no implicit
+import itself.
+
+<!-- module: Prelude.gob -->
+```kotlin
+export (print, greet)
+
+import System.IO (print)
+
+fun greet() {
+    print("hello from the program's Prelude")
+}
+```
+
+<!-- run -->
+```kotlin
+fun main() {
+    greet()
+    print(Int.toString(2))
+}
+```
+
+```text
+hello from the program's Prelude
+2
+```
 
 A qualifier that an import gives, by its name, by its alias, or from its
 list, replaces the Prelude's qualifier of the same name entirely. After

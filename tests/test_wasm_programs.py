@@ -202,8 +202,8 @@ def test_loops_calls_and_switches():
     assert result.stdout == "111\n6765\n1650\nzero\none\ntwo\nthree\nzero\n"
 
 
-# Ten million calls deep, which only a tail call runs in constant stack:
-# `docs/ref/declarations.md` promises it, mutual recursion included.
+# Ten million calls deep, which runs only if a call in tail position, mutual
+# recursion and a closure's included, takes no stack.
 TAIL_CALLS = """\
 import System.Env as Env
 
@@ -259,7 +259,203 @@ def test_closures():
     assert result.stdout == "18\n6\n21\n2\n"
 
 
+# A closure that calls itself through a variable, so each call is through the
+# closure's code, ten million deep.
+INDIRECT_TAIL_CALLS = """\
+import System.Env as Env
+
+fun main() {
+    let n = (len(Env.args()) + 1) * 10_000_000
+    var go : fun(Int) -> Int = fun(k) = k
+    go = fun(k) = if k == 0 { 0 } else { go(k - 1) }
+    print(go(n))
+}
+"""
+
+
+def test_indirect_tail_calls_run_in_constant_stack():
+    result = _run(INDIRECT_TAIL_CALLS)
+    assert (result.returncode, result.stdout) == (0, "0\n"), result.stderr
+
+
+# A closure in the frame of a function that tail-calls itself a million
+# times: the frame is released before each tail call, or the shadow stack
+# runs out.
+FRAME_TAIL_CALLS = """\
+import System.Env as Env
+
+fun applyTo(f : fun(Int) -> Int, x : Int, k : Int) -> Int =
+    if k == 0 { f(x) } else { applyTo(f, x, k - 1) }
+
+fun spin(n : Int, acc : Int, k : Int) -> Int =
+    if n == 0 { acc } else { spin(n - 1, applyTo(fun(x) = x + 3, acc, k), k) }
+
+fun main() {
+    let k = len(Env.args())
+    print(spin((k + 1) * 1_000_000, 0, k))
+}
+"""
+
+
+def test_a_frame_is_released_before_a_tail_call():
+    result = _run(FRAME_TAIL_CALLS)
+    assert (result.returncode, result.stdout) == (0, "3000000\n"), result.stderr
+
+
+# A function that returns a pair returns it in two results, here through a
+# tail call too.
+MULTIPLE_RESULTS = """\
+import System.Env as Env
+
+fun bounds(xs : Array Int, i : Int, low : Int, high : Int) -> (Int, Int) =
+    if i == len(xs) { (low, high) }
+    else { bounds(xs, i + 1, if xs[i] < low { xs[i] } else { low },
+                  if xs[i] > high { xs[i] } else { high }) }
+
+fun main() {
+    let k = len(Env.args())
+    let xs = [3 + k, -7, 12, 0, 5 * k]
+    let (low, high) = bounds(xs, 0, xs[0], xs[0])
+    print(low)
+    print(high)
+}
+"""
+
+
+def test_multiple_results():
+    result = _run(MULTIPLE_RESULTS)
+    assert (result.returncode, result.stdout) == (0, "-7\n12\n"), result.stderr
+
+
+FLOATS = """\
+import System.Env as Env
+
+fun main() {
+    let k = Float.fromInt(len(Env.args()) + 2)
+    let nan = Float.nan()
+    print(k * 2.5 > 4.9)
+    print(k / 4.0 == 0.5)
+    print(k - 3.0 < 0.0)
+    print(nan != nan)
+    print(nan == nan)
+    print(nan < 1.0 || nan >= 1.0)
+    print(Float.isNaN(nan))
+    print(Float.bits(-0.0))
+    print(Float.truncate(k * 1000.75))
+    print(Float.truncate(nan))
+    print(Float.truncate(k * 1.0e300))
+    print(-k)
+}
+"""
+
+
+def test_floats():
+    result = _run(FLOATS)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ("True\nTrue\nTrue\nTrue\nFalse\nFalse\nTrue\n"
+                             "-9223372036854775808\nSome(2001)\nNone\nNone\n-2.0\n")
+
+
+# Bytes and code points, which are narrower than a word in memory.
+NARROW = """\
+import System.Env as Env
+
+fun main() {
+    let text = "héllo, wörld" + Int.toString(len(Env.args()))
+    let bytes = String.toBytes(text)
+    var sum = 0
+    for b in bytes { sum = sum + Byte.toInt(b) }
+    print(len(bytes))
+    print(sum)
+    print(Byte.toInt(bytes[1]))
+    var codes = 0
+    for c in String.codePoints(text) { codes = codes + Char.toInt(c) }
+    print(codes)
+}
+"""
+
+
+def test_narrow_values():
+    result = _run(NARROW)
+    assert (result.returncode, result.stdout) == (0, "15\n1737\n195\n1475\n"), result.stderr
+
+
+BOUNDS = """\
+import System.Env as Env
+
+fun main() {
+    let xs = [1, 2, 3]
+    print(xs[len(Env.args())])
+    print(xs[len(Env.args()) + 5])
+    print("unreached")
+}
+"""
+
+
+def test_an_index_out_of_bounds_panics():
+    result = _run(BOUNDS)
+    assert (result.returncode, result.stdout) == (1, "1\n")
+    assert result.stderr.splitlines()[0] == (
+        "panic: array index out of bounds: read at index 5, length 3")
+
+
+# The panic is raised three calls down, and every caller leaves.
+CALLEE_PANIC = """\
+fun check(n : Int) -> Int {
+    if n > 2 { error("too big: " + Int.toString(n)) }
+    n * 10
+}
+
+fun main() {
+    for var i = 0; i < 5; i = i + 1 { print(check(i)) }
+    print("unreached")
+}
+"""
+
+
+def test_a_panic_in_a_callee_leaves_every_caller():
+    result = _run(CALLEE_PANIC)
+    assert (result.returncode, result.stdout) == (1, "0\n10\n20\n")
+    assert result.stderr.splitlines()[0] == "panic: too big: 3"
+
+
+# `exit` returns any type, and here one the runtime's own `exit` does not:
+# its result is never read.
+EXIT = """\
+import System.Env as Env
+
+fun pick(k : Int) -> String = if k > 0 { "yes" } else { Env.exit(3) }
+
+fun main() {
+    print(pick(len(Env.args())))
+    print(pick(0))
+    print("unreached")
+}
+"""
+
+
+def test_exit_where_a_value_is_wanted():
+    result = _run(EXIT, "x")
+    assert (result.returncode, result.stdout) == (3, "yes\n"), result.stderr
+
+
 # -- the build ------------------------------------------------------------------------
+
+
+def test_the_compiler_is_a_valid_module(tmp_path):
+    """`src/Main.gob` built for wasm passes the engine's validation, which
+    checks every function's types, including the ones no test runs."""
+    out = tmp_path / "turkey.wasm"
+    built = subprocess.run(
+        toolchain.command(bootc.binary(), "build", "--target", "wasm32-wasi", "-o", str(out),
+                          str(bootc.REPO_ROOT / "src" / "Main.gob")),
+        cwd=bootc.REPO_ROOT, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
+        capture_output=True, text=True, timeout=600)
+    assert built.returncode == 0, built.stderr
+    validated = subprocess.run([toolchain.needs_wasmtime(), "compile", "-o",
+                                str(tmp_path / "turkey.cwasm"), str(out)],
+                               capture_output=True, text=True, timeout=600)
+    assert validated.returncode == 0, validated.stderr
 
 
 def test_the_module_is_named_for_the_entry(tmp_path):

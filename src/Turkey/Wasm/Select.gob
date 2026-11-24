@@ -52,7 +52,7 @@ import Turkey.Wasm.Structure as St
 type Context = Context {
     --- The function index of each Turkey function, by name.
     functions : Map String Int,
-    --- What each Turkey function answers in, by name (`Ssa.Func.results`).
+    --- What each Turkey function returns, by name (`Ssa.Func.results`).
     results   : Map String (Array Rep),
     --- The Turkey function of each `foreign` definition, by its C symbol.
     defined   : Map String String,
@@ -122,7 +122,7 @@ fun importParam(r : Rep) -> W.ValType = match r.class_ {
     _ -> valType(r)
 }
 
---- Returns the types an import answers a result of `r` in: none for a unit,
+--- Returns the types an import returns a result of `r` in: none for a unit,
 --- which a C function declared `void` writes, and otherwise as `importParam`.
 fun importResult(r : Rep) -> Array W.ValType = match r.class_ {
     Unit -> []
@@ -201,7 +201,7 @@ fun known(s : Sel, v : Value) -> Option Int = Map.get(s.known, Ssa.valueId(v))
 -- -- the function ---------------------------------------------------------------------
 
 --- Returns `f`'s selection in the module `cx` describes. A function that stops
---- still answers what was selected before it stopped, which nothing should
+--- still returns what was selected before it stopped, which nothing should
 --- write into a module.
 fun selectFunction(cx : Context, f : Func Low) -> Selected {
     let s = start(cx, f)
@@ -463,7 +463,7 @@ fun isTailCall(s : Sel, b : Int, n : Int) -> Bool {
 }
 
 -- A call `isTailCall` accepted. No panic test follows: a callee that panics
--- answers zeros, and answers them to this function's caller.
+-- returns zeros, and returns them to this function's caller.
 fun tailCall(s : Sel, i : Low) -> Unit = match i.op {
     Call(Direct(name), args) -> match Map.get(s.cx.functions, name) {
         Some(f) -> {
@@ -647,7 +647,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 store(s, v, 0)
             }
         }
-        -- Fences and polls answer to other workers, and there is one.
+        -- Fences and polls exist for other workers, and there is none.
         Ordered(_) -> {}
         Poll -> {}
         -- A use for `Turkey.Roots`, which emits nothing.
@@ -897,7 +897,7 @@ fun checked(s : Sel, i : Low, d : Value, o : BinOp, a : Value, b : Value) -> Uni
             set(s, d)
         }
         -- `i64.rem_s` traps only on a zero divisor. The most negative integer
-        -- by -1 answers 0, its mathematical remainder, as the language does.
+        -- by -1 is 0, its mathematical remainder, as the language says.
         Rem -> {
             let k = known(s, b)
             if k == None || k == Some(0) { nonzero(s, b, "remainder by zero") }
@@ -976,7 +976,7 @@ fun highUnsigned(s : Sel, x : Int, y : Int) -> Unit {
     }
 }
 
--- Floating point does not trap: IEEE 754 answers an overflow with an
+-- Floating point does not trap: IEEE 754 makes an overflow an
 -- infinity, which is a value.
 fun floatBin(s : Sel, d : Value, o : BinOp, a : Value, b : Value) -> Unit {
     let arithmetic = fun(x : W.FloatBinOp) {
@@ -1155,7 +1155,7 @@ fun storeWord(s : Sel, v : Value, offset : Int) -> Unit {
     }
 }
 
--- Pushes the address of a raw access at `base` plus `off`, and answers the
+-- Pushes the address of a raw access at `base` plus `off`, and returns the
 -- constant offset the access itself adds: a known offset that fits goes in
 -- the instruction.
 fun raw(s : Sel, base : Value, off : Value) -> Int {
@@ -1479,13 +1479,24 @@ fun foreignCall(s : Sel, d : Value, symbol : String, fixed : Int, args : Array V
 
 -- A call of the `foreign` definition of `symbol`, whose Turkey function
 -- takes the environment every Turkey function takes, here null.
+--
+-- The call's result need not be held as the definition's is. `Prim.exit` is
+-- `-> a` and `turkey_exit` returns a unit, so an exit where a `String` is
+-- wanted calls an `i32` function for an `i64`. Such a call never returns a
+-- value anyone reads, so its results are dropped and `d` keeps its zero.
 fun definedCall(s : Sel, d : Value, symbol : String, args : Array Value) -> Unit {
-    match definedIndex(s, symbol) {
+    let name = Map.getOr(s.cx.defined, symbol, "")
+    match Map.get(s.cx.functions, name) {
         Some(f) -> {
             op(s, W.ConstI64(0))
             for a in args { get(s, a) }
             op(s, W.Call(f))
-            set(s, d)
+            let returned = Array.map(Map.getOr(s.cx.results, name, []), valType)
+            if returned == [valType(Ssa.repOf(s.source, d))] {
+                set(s, d)
+            } else {
+                for _ in returned { op(s, W.Drop) }
+            }
             propagate(s)
         }
         None -> stop(s, "a call of " + symbol + ", which did not lower")
@@ -1499,7 +1510,7 @@ fun definedIndex(s : Sel, symbol : String) -> Option Int = match Map.get(s.cx.de
 }
 
 -- The type of a closure's code called with `args`: the environment, then
--- the arguments, answering `d`'s representation.
+-- the arguments, returning `d`'s representation.
 fun closureType(s : Sel, args : Array Value, d : Value) -> Int {
     let params = [W.I64]
     for a in args { Vec.push(params, valType(Ssa.repOf(s.source, a))) }

@@ -25,10 +25,11 @@ GOLDENS = ROOT / "tests" / "format"
 PAIRS = sorted(p.name[: -len(".expected.gob")] for p in GOLDENS.glob("*.expected.gob"))
 
 
-def run_format(*argv: str, cwd: Path = ROOT, **variables: str) -> subprocess.CompletedProcess:
+def run_format(*argv: str, cwd: Path = ROOT, stdin: str | None = None,
+               **variables: str) -> subprocess.CompletedProcess:
     return subprocess.run(toolchain.command(bootc.binary(), "format", *argv), cwd=cwd,
                           env=dict(os.environ, **variables), capture_output=True, text=True,
-                          timeout=600)
+                          input=stdin, timeout=600)
 
 
 @pytest.mark.parametrize("name", PAIRS)
@@ -463,6 +464,55 @@ def test_a_file_whose_name_starts_with_a_dash(tmp_path: Path) -> None:
 def test_a_command_line_it_cannot_read_has_its_own_status(tmp_path: Path) -> None:
     result = run_format("--bogus", "a.gob", cwd=tmp_path)
     assert (result.returncode, result.stderr) == (4, "turkey: unknown option --bogus\n")
+
+
+@pytest.mark.parametrize("name", PAIRS)
+def test_a_golden_formats_the_same_through_standard_input(name: str) -> None:
+    result = run_format("-", stdin=(GOLDENS / f"{name}.gob").read_text())
+    assert (result.returncode, result.stderr) == (0, "")
+    assert result.stdout == (GOLDENS / f"{name}.expected.gob").read_text()
+
+
+def test_check_on_standard_input_exits_1_when_it_would_change() -> None:
+    messy = run_format("--check", "-", stdin="fun main() {print(1)}\n")
+    assert (messy.returncode, messy.stdout, messy.stderr) == (1, "", "")
+    tidy = run_format("--check", "-", stdin="fun main() {\n\tprint(1)\n}\n")
+    assert (tidy.returncode, tidy.stdout, tidy.stderr) == (0, "", "")
+
+
+def test_standard_input_that_does_not_parse_writes_nothing() -> None:
+    result = run_format("-", stdin="fun main( {\n")
+    assert (result.returncode, result.stdout) == (3, "")
+    assert result.stderr.startswith("<stdin>:1:11: parse error:"), result.stderr
+    named = run_format("--stdin-name", "src/Main.gob", "-", stdin="fun main( {\n")
+    assert named.stderr.startswith("src/Main.gob:1:11: parse error:"), named.stderr
+
+
+def test_standard_input_that_is_not_utf8_writes_nothing() -> None:
+    result = subprocess.run(toolchain.command(bootc.binary(), "format", "-"), input=b"\xff\n",
+                            capture_output=True, timeout=600)
+    assert (result.returncode, result.stdout) == (3, b"")
+    assert result.stderr == b"turkey: '<stdin>' is not valid UTF-8\n"
+
+
+@pytest.mark.parametrize("hook", ["refuse", "garble"])
+def test_refused_standard_input_writes_nothing(hook: str) -> None:
+    # `garble` makes the formatted text fail to parse, which the parser
+    # reports by ending the process, so it reaches a different exit than
+    # `refuse`. Both are the formatter refusing the input.
+    result = run_format("-", stdin="fun main() {}\n", TURKEY_TEST_FORMAT=hook)
+    assert (result.returncode, result.stdout) == (2, "")
+    assert result.stderr.startswith("<stdin>: internal error: the formatter refuses this file: ")
+
+
+def test_standard_input_is_its_own_command_line(tmp_path: Path) -> None:
+    mixed = run_format("-", "a.gob", cwd=tmp_path, stdin="")
+    assert (mixed.returncode, mixed.stdout) == (4, "")
+    assert mixed.stderr == "turkey: '-' reads standard input, and cannot be given with files\n"
+    needs = "turkey: --stdin-name names standard input, so it needs '-'\n"
+    for argv in (["--stdin-name", "x.gob", "a.gob"], ["--stdin-name", "x.gob"]):
+        named = run_format(*argv, cwd=tmp_path)
+        assert (named.returncode, named.stderr) == (4, needs)
 
 
 def test_a_directive_line_keeps_its_code(tmp_path: Path) -> None:

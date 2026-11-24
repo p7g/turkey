@@ -102,8 +102,10 @@ import Turkey.Uncurry as Uncurry
 import Turkey.Opt as Opt
 import Turkey.Build as Build
 import Turkey.Target as Target
+import Target (OS(..))
+import Target as Platform
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
-                   FunDecl(..), ClassDecl(..), ForeignLibrary(..), patternVars)
+                   FunDecl(..), ClassDecl(..), ForeignLibrary(..), LibraryKind(..), patternVars)
 import Turkey.Libraries as Libraries
 import Turkey.Lint as Lint
 import Turkey.Lint (Level(..))
@@ -728,9 +730,33 @@ fun isModuleName(part : String) -> Bool {
 
 -- `path` as an absolute path with every symbolic link resolved, so that two
 -- spellings of one file compare equal.
+--
+-- WASI cannot resolve a path, so a compiler running on wasm32-wasi resolves
+-- it as written instead: made absolute and with `.` and `..` taken out. Two
+-- spellings of a file through a symbolic link then name two files, which a
+-- module reached both ways would be loaded twice as.
 fun realPath(path : String) -> String = match Env.resolvedPath(path) {
     Some(real) -> real
-    None -> die("cannot resolve '" + path + "' to a real path")
+    None -> match Platform.os {
+        Wasi -> lexicalPath(path)
+        _ -> die("cannot resolve '" + path + "' to a real path")
+    }
+}
+
+-- `path` made absolute from the working directory, with each `.` and empty
+-- component dropped and each `..` taking the component before it away.
+fun lexicalPath(path : String) -> String {
+    let from = if String.startsWith(path, "/") { path }
+               else { Option.unwrapOr(Env.currentDirectory(), "/") + "/" + path }
+    let parts : Vec String = []
+    for part in String.split(from, "/") {
+        match part {
+            "" | "." -> {}
+            ".." -> { let _ = Vec.pop(parts) }
+            _ -> Vec.push(parts, part)
+        }
+    }
+    "/" + String.join(Vec.toArray(parts), "/")
 }
 
 -- Writes `bytes` as an executable at `path`, through a new file beside it
@@ -857,6 +883,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     write(String.drain(b))
     if through("ssa") { return }
     refuseSkipped(skipped, path)
+    refuseForeignCalls(module_, checked.decls, path)
     match target.arch {
         "Arm64" -> compileArm64(b, path, wants, through, listing, sink, checked, entry,
                                 module_, files)
@@ -1375,9 +1402,26 @@ fun switchesStacks(m : SsaLower.Module) -> Bool {
 
 -- Besides the `foreign` definitions: a coroutine's start and a worker
 -- thread's, which only the code `Turkey.Emit` writes calls.
-fun roots(checked : Checked) -> Vec String =
-    Vec.append(Mono.runtimeRoots(checked.decls, build.exportRuntime),
-                 [Rt.coroutineStart, Rt.workerRun])
+fun roots(checked : Checked) -> Vec String = match target.arch {
+    -- A wasm program has one thread, so no worker thread is ever started and
+    -- nothing enters `workerRun` or ends a worker. Rooting them would keep
+    -- every path a worker takes, and the threads and system calls it makes,
+    -- in a module that cannot import them.
+    "Wasm32" -> {
+        let out = []
+        for name in Mono.runtimeRoots(checked.decls, build.exportRuntime) {
+            let symbol = match Map.get(checked.decls.definitions, name) {
+                Some(info) -> info.symbol
+                None -> ""
+            }
+            if symbol != "turkey_worker_ended" { Vec.push(out, name) }
+        }
+        Vec.push(out, Rt.coroutineStart)
+        out
+    }
+    _ -> Vec.append(Mono.runtimeRoots(checked.decls, build.exportRuntime),
+                    [Rt.coroutineStart, Rt.workerRun])
+}
 
 -- The Low IR, and the checks on it. Every path that lowers comes through here,
 -- so what they refuse stops the compile whichever backend was asked for.
@@ -1491,6 +1535,54 @@ fun refuseSkipped(skipped : Vec SsaLower.Unsupported, path : String) -> Unit {
         let lines = Array.map(skipped, fun(u) = u.name + ": " + u.what)
         Diag.fail(Diag.whole("internal error", "bindings did not lower:\n  "
                              + String.join(lines, "\n  ")), path)
+    }
+}
+
+-- Stops the compile at a call to a `foreign` declaration that the target
+-- cannot link. A wasm program links against nothing but the modules the host
+-- provides, so a C library's symbol could never be resolved there: each such
+-- symbol is named with a function that calls it. Only the library declares
+-- foreign functions, so such a call is the library's bug, a `Wasi` arm missing
+-- from a `match` on `Target.os`. The other way round, an arm64 program has no
+-- wasm host to import from.
+fun refuseForeignCalls(module_ : SsaLower.Module, decls : Decls.DeclTable,
+                       path : String) -> Unit {
+    let wasm = target.arch == "Wasm32"
+    -- Each wasm import's symbol and its module.
+    let imports = Map.new()
+    for (_, info) in Map.entries(decls.foreigns) {
+        if let Some(ForeignLibrary { name, kind = WasmImports, .. }) = info.library {
+            Map.put(imports, info.symbol, name)
+        }
+    }
+    let callers = Map.new()
+    for f in module_.functions {
+        for block in f.blocks {
+            for i in block.insts {
+                let LowIr.Call(LowIr.Foreign(symbol, _), _) = i.op else { continue }
+                match Map.get(imports, symbol) {
+                    Some(owner) -> if !wasm {
+                        Diag.fail(Diag.whole("error", "'" + symbol + "' is imported from the wasm "
+                                             + "module '" + owner + "', which only a wasm target "
+                                             + "can call; '" + target.spelling + "' cannot"),
+                                  path)
+                    }
+                    -- The program's entry is declared as a C function and
+                    -- written by the backend, on wasm as on arm64.
+                    None -> if wasm && symbol != Rt.programEntrySymbol
+                                && !Map.contains(callers, symbol) {
+                        Map.put(callers, symbol, f.name)
+                    }
+                }
+            }
+        }
+    }
+    if len(callers) > 0 {
+        let lines = Array.map(Map.entries(callers), fun((symbol, caller)) =
+            "'" + symbol + "', called by '" + caller + "'")
+        Diag.fail(Diag.whole("internal error", "'" + target.spelling + "' has no C library, "
+                             + "and the program calls it:\n  " + String.join(lines, "\n  ")),
+                  path)
     }
 }
 
@@ -1857,6 +1949,8 @@ fun importedLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol,
             Some(info) -> info
             None -> die("internal error: '" + sym.name + "' is called and never declared")
         }
+        -- A wasm import never gets here: `refuseForeignCalls` stopped the
+        -- compile at its call.
         if let Some(library) = info.library { Map.put(out, sym.name, (info.symbol, library)) }
     }
     out
@@ -1891,7 +1985,7 @@ fun installNames(imported : Map String (String, ForeignLibrary), path : String)
     for (name, (symbol, library)) in Map.entries(imported) {
         let leaf = Libraries.leaf(library)
         let calls = "it calls '" + symbol + "' from library '" + library.name + "' "
-                    + Int.toString(library.major)
+                    + Int.toString(Libraries.major(library))
         if !native && len(given) == 0 {
             die("cannot write '" + path + "' for " + target.spelling + " on this machine: "
                 + calls + ", whose install name is read from '" + leaf + "' itself; set "

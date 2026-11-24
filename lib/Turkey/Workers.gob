@@ -83,6 +83,8 @@ import Bits (BitAnd(..), BitOr(..), Shift(..), (&), (|), (<<), (>>))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
+import Turkey.Os as Os
+import Turkey.Wasi as Wasi
 import Turkey.Lock as Lock
 import Turkey.Memory as Memory
 import Turkey.Process as Process
@@ -235,7 +237,7 @@ fun signalCollection() -> Unit {
 }
 
 fun zeroed(bytes : Int) -> Ptr {
-    let p = Libc.malloc(bytes)
+    let p = Os.malloc(bytes)
     if !Ptr.isNull(p) { Memory.fill(p, bytes, 0) }
     p
 }
@@ -261,20 +263,36 @@ fun recordOf(i : Int) -> Ptr =
     if i == 0 && Ptr.atomicLoad(control, 8) == 0 { Process.workerRecord() }
     else { Ptr.load(records, 8 * i) }
 
---- Returns whether the environment chooses single-thread mode:
---- `TURKEY_SINGLE_THREAD` is set, to anything. In that mode the program runs on
---- the thread the process started on, its own stack included, and starts no
---- other thread: no worker and no monitor. Reads nothing but the environment,
---- so `Turkey.Entry` may call it before any global is initialized.
-fun singleThreadChosen() -> Bool =
-    !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_SINGLE_THREAD")))
+--- Returns whether the program runs in single-thread mode: always on
+--- wasm32-wasi, and elsewhere when `TURKEY_SINGLE_THREAD` is set, to anything.
+--- In that mode the program runs on the thread the process started on, its own
+--- stack included, and starts no other thread: no worker and no monitor. Reads
+--- nothing but the environment, so `Turkey.Entry` may call it before any global
+--- is initialized.
+fun singleThreadChosen() -> Bool = match Target.os {
+    -- A constant on wasm, so the optimizer removes every path that would
+    -- start a thread, and the program imports nothing that makes one.
+    Wasi -> True
+    _ -> !Ptr.isNull(Os.getenv(Prim.cString("TURKEY_SINGLE_THREAD")))
+}
 
---- `singleThreadChosen`, read once as the program starts.
-let singleThreaded : Bool = singleThreadChosen()
+-- `singleThreadChosen`, read once as the program starts.
+let singleThreadMode : Bool = singleThreadChosen()
+
+--- Returns `singleThreadChosen`'s answer as the program started.
+fun singleThreaded() -> Bool = match Target.os {
+    -- A constant on wasm, where reading the global would keep alive every
+    -- branch it guards.
+    Wasi -> True
+    _ -> singleThreadMode
+}
 
 --- Whether the program's own thread is registered (`mainRegister`), which it is
---- once the workers have started.
-fun started() -> Bool = Ptr.atomicLoad(control, 8) != 0
+--- once the workers have started. Never on wasm32-wasi, which starts none.
+fun started() -> Bool = match Target.os {
+    Wasi -> False
+    _ -> Ptr.atomicLoad(control, 8) != 0
+}
 
 --- Register the program's own thread, as the first, holding a permit: from
 --- here on its waits and calls are counted. Called once, before any other
@@ -301,7 +319,7 @@ fun mainRegister() -> Unit {
 foreign "turkey_worker_new" fun new() -> Ptr {
     mainRegister()
     blockEnter(Prim.frameAddress())
-    while Ptr.atomicCas(control, 0, 0, 2) != 0 { let _ = Libc.schedYield() }
+    while Ptr.atomicCas(control, 0, 0, 2) != 0 { let _ = Os.schedYield() }
     let record = register(True)
     Ptr.atomicStore(control, 0, 0)
     blockExit()
@@ -348,11 +366,11 @@ fun die() -> Unit {
     say(Prim.cString("turkey: "))
     say(Process.panicMessage())
     say(Prim.cString("\n"))
-    Libc.exitNow(2)
+    Os.exitNow(2)
 }
 
 fun say(text : Ptr) -> Unit {
-    let _ = Libc.write(2, text, Libc.strlen(text))
+    let _ = Os.write(2, text, Os.strlen(text))
 }
 
 --- Stop every other thread, for a collection. False if another thread is
@@ -365,7 +383,7 @@ fun stopTheWorld() -> Bool {
         let claimed = Ptr.atomicCas(control, 0, 0, 1)
         if claimed == 0 { break }
         if claimed == 1 { return False }
-        let _ = Libc.schedYield()
+        let _ = Os.schedYield()
     }
     let n = count()
     let me = index()
@@ -374,7 +392,7 @@ fun stopTheWorld() -> Bool {
     }
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
-            while !stoppedOrHeld(i) { let _ = Libc.schedYield() }
+            while !stoppedOrHeld(i) { let _ = Os.schedYield() }
         }
     }
     True
@@ -412,7 +430,7 @@ fun startTheWorld() -> Unit {
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
             while (Ptr.atomicLoad(states, 8 * i) & 7) == stoppedState {
-                let _ = Libc.schedYield()
+                let _ = Os.schedYield()
             }
         }
     }
@@ -678,7 +696,7 @@ fun idleLeave() -> Unit {
 --- not be started.
 fun monitorStart() -> Bool {
     let record = zeroed(1752)
-    let thread = Libc.malloc(8)
+    let thread = Os.malloc(8)
     if Ptr.isNull(record) || Ptr.isNull(thread) { return False }
     Ptr.store(record, 288, -1)
     monitorRecord = record
@@ -735,9 +753,9 @@ fun monitorHandOut() -> Bool {
         return True
     }
     let record = spareNew()
-    let thread = Libc.malloc(8)
+    let thread = Os.malloc(8)
     if Ptr.isNull(record) || Ptr.isNull(thread) {
-        Libc.free(thread)
+        Os.free(thread)
         let _ = Ptr.atomicAdd(permitWords, handingAt, -1)
         return False
     }
@@ -877,7 +895,7 @@ fun pollerReady() -> Int {
                 Ptr.atomicStore(poller, stateAt, 3)
             }
         } else {
-            let _ = Libc.schedYield()
+            let _ = Os.schedYield()
         }
     }
     0
@@ -885,12 +903,12 @@ fun pollerReady() -> Int {
 
 fun make() -> Int {
     let scratch = zeroed(scratchBytes)
-    let results = Libc.malloc(Int.mulWrapping(batch, 16))
+    let results = Os.malloc(Int.mulWrapping(batch, 16))
     let changes = zeroed(changesBytes)
     if Ptr.isNull(scratch) || Ptr.isNull(results) || Ptr.isNull(changes) {
-        Libc.free(scratch)
-        Libc.free(results)
-        Libc.free(changes)
+        Os.free(scratch)
+        Os.free(results)
+        Os.free(changes)
         return -Sys.enomem
     }
     Ptr.store(scratch, oneAt, 1)
@@ -900,15 +918,17 @@ fun make() -> Int {
     let r = match Target.os {
         Darwin -> makeKqueue()
         Linux -> makeEpoll()
-        Wasi -> Process.unsupported(0)
+        -- No poller on wasm: WASI preview 1 waits with `poll_oneoff`, which
+        -- this module does not use, so every registration fails here.
+        Wasi -> -Sys.enosys()
     }
     if r != 0 {
         Ptr.store(poller, scratchAt, Ptr.null())
         Ptr.store(poller, resultsAt, Ptr.null())
         Ptr.store(poller, changesAt, Ptr.null())
-        Libc.free(scratch)
-        Libc.free(results)
-        Libc.free(changes)
+        Os.free(scratch)
+        Os.free(results)
+        Os.free(changes)
     }
     r
 }
@@ -921,7 +941,7 @@ fun makeKqueue() -> Int {
     let _ = Libc.fcntlWith(kq, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
     Ptr.atomicStore(poller, descriptorAt, kq)
     let r = change(Sys.filterUser(), 0, Sys.evAdd | Sys.evClear, 0, 0)
-    if r < 0 { let _ = Libc.close(kq) }
+    if r < 0 { let _ = Os.close(kq) }
     r
 }
 
@@ -933,13 +953,13 @@ fun makeEpoll() -> Int {
     let wake = Sys.cInt(Libc.eventfd(0, Sys.nonBlocking() | Sys.closeOnExec()))
     if wake < 0 {
         let failure = -Sys.errno()
-        let _ = Libc.close(ep)
+        let _ = Os.close(ep)
         return failure
     }
     let r = epollControl(ep, Sys.epollCtlAdd, wake, Sys.epollIn, 0)
     if r < 0 {
-        let _ = Libc.close(ep)
-        let _ = Libc.close(wake)
+        let _ = Os.close(ep)
+        let _ = Os.close(wake)
         return r
     }
     Ptr.atomicStore(poller, descriptorAt, ep)
@@ -985,7 +1005,7 @@ fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) ->
             break
         }
     }
-    Libc.free(buf)
+    Os.free(buf)
     answer
 }
 
@@ -1025,7 +1045,7 @@ fun pollRegister(fd : Int, token : Int) -> Int {
             let events = Sys.epollIn | Sys.epollOut | Sys.epollRdHup | Sys.epollEdgeTriggered
             epollControl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlAdd, fd, events, token)
         }
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1066,7 +1086,7 @@ fun pollRead(fd : Int, token : Int) -> Int {
     match Target.os {
         Darwin -> change(Sys.filterRead(), fd, Sys.evAdd | Sys.evOneShot, 0, token)
         Linux -> epollArm(fd, Sys.epollIn, token)
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1077,7 +1097,7 @@ fun pollWrite(fd : Int, token : Int) -> Int {
     match Target.os {
         Darwin -> change(Sys.filterWrite(), fd, Sys.evAdd | Sys.evOneShot, 0, token)
         Linux -> epollArm(fd, Sys.epollOut, token)
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1095,7 +1115,7 @@ fun pollReadWrite(fd : Int, token : Int) -> Int {
             if r < 0 { r } else { change(Sys.filterWrite(), fd, flags, 0, token) }
         }
         Linux -> epollArm(fd, Sys.epollIn | Sys.epollOut, token)
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1117,7 +1137,7 @@ fun pollChild(pid : Int, token : Int) -> Int {
             if r == -Sys.esrch { 1 } else { r }
         }
         Linux -> watchPid(pid, token)
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1130,7 +1150,7 @@ fun pollUnlock(fd : Int, token : Int) -> Int {
     match Target.os {
         Darwin -> change(Sys.filterVnode(), fd, Sys.evAdd | Sys.evOneShot, Sys.noteFunlock, token)
         Linux -> -Sys.einval
-        Wasi -> Process.unsupported(0)
+        Wasi -> -Sys.enosys()
     }
 }
 
@@ -1139,11 +1159,11 @@ fun watchPid(pid : Int, token : Int) -> Int {
     if fd < 0 { return fd }
     let r = epollArm(fd, Sys.epollIn, token)
     if r < 0 {
-        let _ = Libc.close(fd)
+        let _ = Os.close(fd)
         return r
     }
     if !childAdd(token, fd) {
-        let _ = Libc.close(fd)
+        let _ = Os.close(fd)
         return -Sys.enomem
     }
     0
@@ -1160,7 +1180,7 @@ fun pollForget(fd : Int) -> Unit {
         }
         -- `EPOLL_CTL_DEL` reads no event.
         Linux -> { let _ = Libc.epollCtl(Ptr.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, Ptr.null()) }
-        Wasi -> Process.unsupported(())
+        Wasi -> {}
     }
 }
 
@@ -1175,9 +1195,9 @@ fun pollForgetChild(pid : Int, token : Int) -> Unit {
             let fd = childTake(token)
             -- Closing the descriptor removes it from the epoll instance: no
             -- other descriptor refers to the pidfd.
-            if fd >= 0 { let _ = Libc.close(fd) }
+            if fd >= 0 { let _ = Os.close(fd) }
         }
-        Wasi -> Process.unsupported(())
+        Wasi -> {}
     }
 }
 
@@ -1188,7 +1208,7 @@ fun pollForgetUnlock(fd : Int) -> Unit {
     match Target.os {
         Darwin -> { let _ = change(Sys.filterVnode(), fd, Sys.evDelete, 0, 0) }
         Linux -> {}
-        Wasi -> Process.unsupported(())
+        Wasi -> {}
     }
 }
 
@@ -1208,7 +1228,7 @@ fun childAdd(token : Int, fd : Int) -> Bool {
     var ok = True
     if n == Ptr.load(children, 16) {
         let room = if n == 0 { 8 } else { Int.mulWrapping(n, 2) }
-        let grown = Libc.realloc(table, Int.mulWrapping(room, 16))
+        let grown = Os.realloc(table, Int.mulWrapping(room, 16))
         if Ptr.isNull(grown) {
             ok = False
         } else {
@@ -1276,10 +1296,10 @@ fun wakePoller() -> Unit {
         Linux -> {
             let wake = Ptr.atomicLoad(poller, wakeDescriptorAt)
             let one = Ptr.add(Ptr.load(poller, scratchAt), oneAt)
-            let r = Sys.result(Libc.write(wake, one, 8))
+            let r = Sys.result(Os.write(wake, one, 8))
             r < 0 && r != -Sys.eagain()
         }
-        Wasi -> Process.unsupported(False)
+        Wasi -> False
     }
     if failed { Ptr.atomicStore(signals, wakePendingAt, 0) }
 }
@@ -1335,7 +1355,7 @@ fun waitFor(timeout : Int) -> Int {
     let n = match Target.os {
         Darwin -> kqueueWait(scratch, timeout)
         Linux -> epollWaitFor(scratch, timeout)
-        Wasi -> Process.unsupported(0)
+        Wasi -> 0
     }
     if n <= 0 { return n }
     var count = 0
@@ -1343,7 +1363,7 @@ fun waitFor(timeout : Int) -> Int {
         count = match Target.os {
             Darwin -> decodeKevent(scratch, i, count)
             Linux -> decodeEpoll(scratch, i, count)
-            Wasi -> Process.unsupported(0)
+            Wasi -> count
         }
     }
     Ptr.atomicStore(poller, countAt, count)
@@ -1427,7 +1447,7 @@ fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
     let events : Int = Ptr.load(event, 0) & 0xFFFF_FFFF
     let token : Int = Ptr.load(event, 8)
     if token == 0 {
-        let _ = Libc.read(Ptr.atomicLoad(poller, wakeDescriptorAt), Ptr.add(scratch, drainAt), 8)
+        let _ = Os.read(Ptr.atomicLoad(poller, wakeDescriptorAt), Ptr.add(scratch, drainAt), 8)
         Ptr.atomicStore(signals, wakePendingAt, 0)
         return count
     }
@@ -1459,9 +1479,10 @@ fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
 --   caller may leave (`Turkey.Detach`): name lookups, and `flock` on Linux.
 --
 -- A test reads the two lists below from this comment and checks every call to
--- `Turkey.Libc` outside this module against them. A `Turkey.Libc` function
--- neither list names can wait, and outside this module only the calls the
--- second list names make one.
+-- `Turkey.Libc` outside this module against them. A call through `Turkey.Os`
+-- is the `Turkey.Libc` call of the same name, made by the module that calls
+-- `Os`. A `Turkey.Libc` function neither list names can wait, and outside
+-- this module only the calls the second list names make one.
 --
 -- **Calls that never wait** on anything outside the program, which any module
 -- may make:
@@ -1519,6 +1540,8 @@ fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
 --   task runs;
 -- * `Turkey.HeapCheck.write`: the heap verifier's report, just before it ends
 --   the process;
+-- * `Turkey.Lock.write`: the deadlock a lock reports on wasm32-wasi, just
+--   before it ends the process;
 -- * `Turkey.Lock.osSyncWaitOnAddress`, `Turkey.Lock.osSyncWaitOnAddressWithTimeout`
 --   and `Turkey.Lock.syscall`: the sleeps under the runtime's locks, its idle
 --   threads and `blockingSleepOn`, each waiting for another thread of this
@@ -1549,7 +1572,8 @@ fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
 -- for it and the monitor may give its permit to another; every root its
 -- caller holds is in a frame, since the call to these is a safepoint.
 -- `foreign`, as `acquire` is, so that the frame they record is their own.
--- `Turkey.IO` calls these rather than `Turkey.Libc`'s.
+-- `Turkey.IO` calls these rather than `Turkey.Libc`'s. On wasm32-wasi each
+-- makes `Turkey.Wasi`'s call where it would make libc's.
 --
 -- Each answers in `Turkey.Sys.result`'s convention, and reads `errno` before
 -- `callExit`: a thread held by a collection, or waiting for a permit, sleeps
@@ -1559,14 +1583,14 @@ fun decodeEpoll(scratch : Ptr, i : Int, count : Int) -> Int {
 
 foreign "turkey_blocking_read" fun blockingRead(fd : Int, buf : Ptr, count : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let n = Sys.result(Libc.read(fd, buf, count))
+    let n = Sys.result(Os.read(fd, buf, count))
     callExit()
     n
 }
 
 foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Ptr, count : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let n = Sys.result(Libc.write(fd, buf, count))
+    let n = Sys.result(Os.write(fd, buf, count))
     callExit()
     n
 }
@@ -1574,7 +1598,10 @@ foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Ptr, count : I
 foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Ptr, count : Int,
                                                   offset : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let n = Sys.result(Libc.pread(fd, buf, count, offset))
+    let n = Sys.result(match Target.os {
+        Wasi -> Wasi.pread(fd, buf, count, offset)
+        _ -> Libc.pread(fd, buf, count, offset)
+    })
     callExit()
     n
 }
@@ -1582,28 +1609,34 @@ foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Ptr, count : I
 foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Ptr, count : Int,
                                                     offset : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let n = Sys.result(Libc.pwrite(fd, buf, count, offset))
+    let n = Sys.result(match Target.os {
+        Wasi -> Wasi.pwrite(fd, buf, count, offset)
+        _ -> Libc.pwrite(fd, buf, count, offset)
+    })
     callExit()
     n
 }
 
 foreign "turkey_blocking_open" fun blockingOpen(path : Ptr, flags : Int, mode : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let fd = Sys.cResult(Libc.open(path, flags, mode))
+    let fd = Sys.cResult(Os.open(path, flags, mode))
     callExit()
     fd
 }
 
 foreign "turkey_blocking_close" fun blockingClose(fd : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.close(fd))
+    let r = Sys.cResult(Os.close(fd))
     callExit()
     r
 }
 
 foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Ptr) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.fstat(fd, buf))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.fstat(fd, buf)
+        _ -> Libc.fstat(fd, buf)
+    })
     callExit()
     r
 }
@@ -1615,7 +1648,10 @@ foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Ptr) -> Int {
 foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Ptr, flags : Int,
                                                     mode : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let fd = Sys.cResult(Libc.openat(dir, path, flags, mode))
+    let fd = Sys.cResult(match Target.os {
+        Wasi -> Wasi.openat(dir, path, flags, mode)
+        _ -> Libc.openat(dir, path, flags, mode)
+    })
     callExit()
     fd
 }
@@ -1623,7 +1659,10 @@ foreign "turkey_blocking_openat" fun blockingOpenat(dir : Int, path : Ptr, flags
 foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Ptr, buf : Ptr,
                                                       flags : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.fstatat(dir, path, buf, flags))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.fstatat(dir, path, buf, flags)
+        _ -> Libc.fstatat(dir, path, buf, flags)
+    })
     callExit()
     r
 }
@@ -1631,7 +1670,10 @@ foreign "turkey_blocking_fstatat" fun blockingFstatat(dir : Int, path : Ptr, buf
 foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Ptr,
                                                         flags : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.unlinkat(dir, path, flags))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.unlinkat(dir, path, flags)
+        _ -> Libc.unlinkat(dir, path, flags)
+    })
     callExit()
     r
 }
@@ -1639,7 +1681,10 @@ foreign "turkey_blocking_unlinkat" fun blockingUnlinkat(dir : Int, path : Ptr,
 foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Ptr,
                                                       mode : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.mkdirat(dir, path, mode))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.mkdirat(dir, path, mode)
+        _ -> Libc.mkdirat(dir, path, mode)
+    })
     callExit()
     r
 }
@@ -1647,7 +1692,10 @@ foreign "turkey_blocking_mkdirat" fun blockingMkdirat(dir : Int, path : Ptr,
 foreign "turkey_blocking_renameat" fun blockingRenameat(fromDir : Int, from : Ptr,
                                                         toDir : Int, to : Ptr) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.renameat(fromDir, from, toDir, to))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.renameat(fromDir, from, toDir, to)
+        _ -> Libc.renameat(fromDir, from, toDir, to)
+    })
     callExit()
     r
 }
@@ -1655,14 +1703,20 @@ foreign "turkey_blocking_renameat" fun blockingRenameat(fromDir : Int, from : Pt
 foreign "turkey_blocking_readlinkat" fun blockingReadlinkat(dir : Int, path : Ptr,
                                                             buf : Ptr, size : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let n = Sys.result(Libc.readlinkat(dir, path, buf, size))
+    let n = Sys.result(match Target.os {
+        Wasi -> Wasi.readlinkat(dir, path, buf, size)
+        _ -> Libc.readlinkat(dir, path, buf, size)
+    })
     callExit()
     n
 }
 
 foreign "turkey_blocking_flock" fun blockingFlock(fd : Int, operation : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let r = Sys.cResult(Libc.flock(fd, operation))
+    let r = Sys.cResult(match Target.os {
+        Wasi -> Wasi.flock(fd, operation)
+        _ -> Libc.flock(fd, operation)
+    })
     callExit()
     r
 }
@@ -1671,7 +1725,10 @@ foreign "turkey_blocking_flock" fun blockingFlock(fd : Int, operation : Int) -> 
 -- `errno`.
 foreign "turkey_blocking_mkdtemp" fun blockingMkdtemp(template : Ptr) -> Int {
     callEnter(Prim.frameAddress())
-    let made = Libc.mkdtemp(template)
+    let made = match Target.os {
+        Wasi -> Wasi.mkdtemp(template)
+        _ -> Libc.mkdtemp(template)
+    }
     let r = if Ptr.isNull(made) { -Sys.errno() } else { 0 }
     callExit()
     r
@@ -1682,7 +1739,10 @@ foreign "turkey_blocking_mkdtemp" fun blockingMkdtemp(template : Ptr) -> Int {
 -- `getcwd` may ask the file system for the path.
 foreign "turkey_blocking_getcwd" fun blockingGetcwd() -> Int {
     callEnter(Prim.frameAddress())
-    let path = Libc.getcwd(Ptr.null(), 0)
+    let path = match Target.os {
+        Wasi -> Wasi.getcwd(Ptr.null(), 0)
+        _ -> Libc.getcwd(Ptr.null(), 0)
+    }
     let r = if Ptr.isNull(path) { -Sys.errno() } else { Ptr.toInt(path) }
     callExit()
     r
@@ -1697,7 +1757,7 @@ foreign "turkey_blocking_realpath" fun blockingRealpath(path : Ptr) -> Int {
     let resolved = match Target.os {
         Darwin -> Libc.realpathDarwin(path, Ptr.null())
         Linux -> Libc.realpathLinux(path, Ptr.null())
-        Wasi -> Process.unsupported(Ptr.null())
+        Wasi -> Wasi.realpath(path, Ptr.null())
     }
     let r = if Ptr.isNull(resolved) { -Sys.errno() } else { Ptr.toInt(resolved) }
     callExit()
@@ -1709,7 +1769,10 @@ foreign "turkey_blocking_realpath" fun blockingRealpath(path : Ptr) -> Int {
 -- (`fstat`, and on Darwin `fstatfs`), as `blockingFstat` does.
 foreign "turkey_blocking_fdopendir" fun blockingFdopendir(fd : Int) -> Int {
     callEnter(Prim.frameAddress())
-    let stream = Libc.fdopendir(fd)
+    let stream = match Target.os {
+        Wasi -> Wasi.fdopendir(fd)
+        _ -> Libc.fdopendir(fd)
+    }
     let r = if Ptr.isNull(stream) { -Sys.errno() } else { Ptr.toInt(stream) }
     callExit()
     r
@@ -1720,7 +1783,10 @@ foreign "turkey_blocking_fdopendir" fun blockingFdopendir(fd : Int) -> Int {
 foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Ptr) -> Int {
     callEnter(Prim.frameAddress())
     Sys.clearErrno()
-    let entry = Libc.readdir(stream)
+    let entry = match Target.os {
+        Wasi -> Wasi.readdir(stream)
+        _ -> Libc.readdir(stream)
+    }
     let r = if Ptr.isNull(entry) { -Sys.errno() } else { Ptr.toInt(entry) }
     callExit()
     r

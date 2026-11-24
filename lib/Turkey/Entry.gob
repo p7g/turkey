@@ -28,6 +28,8 @@ import Data.Bool (Bool(..))
 import Target (OS(..))
 import Target as Target
 import Turkey.Libc as Libc
+import Turkey.Os as Os
+import Turkey.Wasi as Wasi
 import Turkey.Process as Process
 import Turkey.Alloc ()
 import Turkey.Heap as Heap
@@ -45,13 +47,30 @@ foreign "turkey_entry" fun programEntry() -> Unit
 -- Hand the arguments over, run the program on a thread of its own, and turn
 -- how it ended into a status: an exit's own, `1` and a report for a panic, and
 -- `0` after a final collection otherwise.
+--
+-- On wasm32-wasi the backend's `_start` calls this with an `argc` of 0, and
+-- the arguments come from WASI instead. A WASI program's status is what it
+-- passes `proc_exit`, so a status other than 0 ends the program here, and
+-- `_start` returns, which ends it with 0, only when this answers 0.
 foreign "turkey_main" fun main(argc : Int, argv : Ptr) -> Int {
-    -- Opt-in, as `TURKEY_GC_STRESS` is: taking `SIGSEGV` over for a process
-    -- is a debugging choice rather than a default.
-    if !Ptr.isNull(Libc.getenv(Prim.cString("TURKEY_SEGV_FRAMES"))) {
-        installCrashHandler()
+    match Target.os {
+        Wasi -> {
+            -- With no page of memory to be had, nothing can run, not even a
+            -- message.
+            let vector = Wasi.startVector()
+            if Ptr.isNull(vector) { Wasi.exit(1) }
+            Process.argsSet(Ptr.load(vector, 0), Ptr.add(vector, 8))
+        }
+        _ -> {
+            -- Opt-in, as `TURKEY_GC_STRESS` is: taking `SIGSEGV` over for a
+            -- process is a debugging choice rather than a default. Wasm has
+            -- no signals.
+            if !Ptr.isNull(Os.getenv(Prim.cString("TURKEY_SEGV_FRAMES"))) {
+                installCrashHandler()
+            }
+            Process.argsSet(cInt(argc), argv)
+        }
     }
-    Process.argsSet(cInt(argc), argv)
     runEntry()
     -- What the standard output still holds, however the program ended, and
     -- before a panic's message. Here, and not in the generated entry before
@@ -63,14 +82,23 @@ foreign "turkey_main" fun main(argc : Int, argv : Ptr) -> Int {
     -- compiler older than it, the compiler built from the committed bootstrap
     -- among them.
     Output.final()
-    if Process.exiting() { return Process.exitStatus() & 255 }
+    if Process.exiting() { return finished(Process.exitStatus() & 255) }
     if Process.panicked() {
         reportPanic()
-        return 1
+        return finished(1)
     }
     Heap.collect()
     Heap.report()
     0
+}
+
+-- `status`, which on wasm32-wasi is 0: any other leaves through `proc_exit`.
+fun finished(status : Int) -> Int = match Target.os {
+    Wasi -> {
+        if status != 0 { Wasi.exit(status) }
+        0
+    }
+    _ -> status
 }
 
 -- The entry runs on a thread of its own, for its stack.
@@ -102,12 +130,12 @@ fun runEntry() -> Unit {
     }
     -- Storage for the opaque `pthread_attr_t` and `pthread_t`: 64 and 8 bytes
     -- on Darwin, 56 and 8 on Linux, and never read here, so generously sized.
-    let attributes = Libc.malloc(128)
-    let thread = Libc.malloc(16)
+    let attributes = Os.malloc(128)
+    let thread = Os.malloc(16)
     if Ptr.isNull(attributes) || Ptr.isNull(thread)
             || cInt(Libc.pthreadAttrInit(attributes)) != 0 {
-        Libc.free(attributes)
-        Libc.free(thread)
+        Os.free(attributes)
+        Os.free(thread)
         let _ = entryThread(Ptr.null())
         return
     }
@@ -117,13 +145,13 @@ fun runEntry() -> Unit {
                                    Prim.codeAddress("turkey_entry_thread"),
                                    Ptr.null())) == 0
     let _ = Libc.pthreadAttrDestroy(attributes)
-    Libc.free(attributes)
+    Os.free(attributes)
     if started {
         let _ = Libc.pthreadJoin(Ptr.load(thread, 0), Ptr.null())
     } else {
         let _ = entryThread(Ptr.null())
     }
-    Libc.free(thread)
+    Os.free(thread)
 }
 
 -- The thread's start routine, `void *(*)(void *)`.
@@ -316,7 +344,7 @@ foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
         roots = Ptr.load(roots, 0)
         shown = shown + 1
     }
-    Libc.exitNow(139)
+    Os.exitNow(139)
 }
 
 -- -- a signal the program waits for -----------------------------------------------
@@ -340,7 +368,7 @@ let signalByteAt : Int = 256
 let signalWords : Ptr = signalState()
 
 fun signalState() -> Ptr {
-    let words = Libc.malloc(264)
+    let words = Os.malloc(264)
     for var at = 0; at < 264; at = at + 8 { Ptr.store(words, at, 0) }
     Ptr.store(words, 0, -1)
     words
@@ -362,7 +390,7 @@ foreign "turkey_signal_note" fun signalNote(signal : Int) -> Unit {
     if fd < 0 { return }
     let errno = errnoLocation()
     let saved = Ptr.load32(errno, 0)
-    let _ = Libc.write(fd, Ptr.add(signalWords, signalByteAt), 1)
+    let _ = Os.write(fd, Ptr.add(signalWords, signalByteAt), 1)
     Ptr.store32(errno, 0, saved)
 }
 
@@ -395,13 +423,13 @@ fun errnoLocation() -> Ptr = match Target.os {
 -- A NUL-terminated string to a descriptor. What is written is not checked:
 -- there is nowhere left to report a failure to.
 fun writeText(fd : Int, text : Ptr) -> Unit {
-    let _ = Libc.write(fd, text, Libc.strlen(text))
+    let _ = Os.write(fd, text, Os.strlen(text))
 }
 
 -- A number that is not negative, in decimal, to a descriptor.
 fun writeNumber(fd : Int, n : Int) -> Unit {
     if n >= 10 { writeNumber(fd, n / 10) }
-    let _ = Libc.write(fd, Ptr.add(Prim.cString("0123456789"), n % 10), 1)
+    let _ = Os.write(fd, Ptr.add(Prim.cString("0123456789"), n % 10), 1)
 }
 
 fun orQuery(text : Ptr) -> Ptr =

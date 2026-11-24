@@ -892,6 +892,7 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         }
         Map.put(scope.types, "Prim.Array", "Prim.Array")
         Map.put(scope.types, "Prim.Ptr", "Prim.Ptr")
+        Map.put(scope.types, "Prim.Int32", "Prim.Int32")
         Map.put(scope.types, "Prim.Atomic", "Prim.Atomic")
         -- The primitive types, for the library to give them their names.
         for name in ["Int", "Float", "Char", "Byte"] {
@@ -1211,9 +1212,9 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
     out
 }
 
--- Export what the `module Q (...)` entries among `items` pass on: those whose
--- lists have a `..` if `rest` is set, and those whose lists have none
--- otherwise.
+-- Export what the `module Q (...)` entries among `items` pass on: what their
+-- `..` covers if `rest` is set, and what their lists name otherwise. A list
+-- beside a `..` names what it renames, so `module Q (x as y, ..)` names `y`.
 --
 -- A name `out` already exports as the same declaration is one export. As a
 -- different declaration it is an error when the list names the name, since
@@ -1230,12 +1231,19 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
             Some(entries) -> entries
             None -> continue
         }
-        if item.rest != rest { continue }
-        let dep = match qualifierModule(m, item, strict) {
+        if rest && !item.rest { continue }
+        -- An entry is wrong once, however many times its list is read: what
+        -- is wrong with a list that has a `..` is reported when `rest` is set.
+        let reporting = strict && rest == item.rest
+        let dep = match qualifierModule(m, item, reporting) {
             Some(dep) -> dep
             None -> continue
         }
-        let chosen = listed(l, dep, entries, item.rest, None, True, strict)
+        let chosen = if rest == item.rest {
+            listed(l, dep, entries, item.rest, None, True, reporting)
+        } else {
+            listed(l, dep, Vec.filter(entries, renames), False, None, True, reporting)
+        }
         for space in namespaces {
             let into = spaceAt(out, space)
             for (short, target) in Map.entries(spaceAt(chosen, space)) {
@@ -1275,18 +1283,28 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
     }
 }
 
+-- Whether a list entry brings its name under another.
+fun renames(entry : ImportItem) -> Bool = match entry.rename {
+    Some(to) -> to != "_"
+    None -> False
+}
+
 -- Report that the entry `item` exports `name` as `second` where the module
 -- already exports it as `first`. The error is at the entry of `item`'s list
 -- that names `name`, if one does.
 fun clash(name : String, first : String, second : String, item : ExportItem,
           entries : Vec ImportItem) -> Unit {
     var where = item.span
+    var named = False
     for entry in entries {
-        let written = if entry.item.qualifier { "module " + entry.item.name }
-                      else { entry.item.name }
-        if written == name && entry.rename != Some("_") { where = entry.item.span }
+        let under = Option.unwrapOr(entry.rename, entry.item.name)
+        let written = if entry.item.qualifier { "module " + under } else { under }
+        if written == name && under != "_" {
+            where = entry.item.span
+            named = True
+        }
     }
-    let fix = if item.rest {
+    let fix = if item.rest && !named {
         "withhold it from one 'module' entry with '" + name + " as _'"
     } else {
         "remove it from 'module " + item.name + "'"
@@ -1519,7 +1537,7 @@ fun checkInternalImport(l : Loader, importer : Opened, imp : ImportDecl) -> Unit
 --
 -- A declaration inside a library's block is one too, so this list is also
 -- what keeps every library a program loads named in the shipped library.
-let foreignModules = ["Turkey.Libc", "Turkey.Entry", "Turkey.OpenSSL"]
+let foreignModules = ["Turkey.Libc", "Turkey.Entry", "Turkey.OpenSSL", "Turkey.Wasi"]
 
 -- Extra names for the tests, which declare symbols in throwaway modules.
 let foreignTestHook = "TURKEY_TEST_FOREIGN"

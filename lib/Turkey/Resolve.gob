@@ -24,7 +24,11 @@ import Turkey.Detach as Detach
 import Turkey.Errors (IOError(..), ErrorKind)
 import Turkey.Errors as Errors
 import Turkey.IO as IO
+import Target (OS(..))
+import Target as Target
 import Turkey.Libc as Libc
+import Turkey.Process as Process
+import Turkey.Os as Os
 import Turkey.Memory as Memory
 import Turkey.Scheduler as Scheduler
 import Turkey.Semaphore as Semaphore
@@ -259,8 +263,15 @@ type Resolver = Resolver {
 }
 
 let system : Resolver = Resolver {
-    getaddrinfo = fun(node, hints, out) = Workers.blockingGetaddrinfo(node, hints, out),
-    freeaddrinfo = fun(list) = Libc.freeaddrinfo(list),
+    -- WASI preview 1 has no resolver, so on wasm32-wasi a lookup panics.
+    getaddrinfo = fun(node, hints, out) = match Target.os {
+        Wasi -> Process.unsupported(0)
+        _ -> Workers.blockingGetaddrinfo(node, hints, out)
+    },
+    freeaddrinfo = fun(list) = match Target.os {
+        Wasi -> {}
+        _ -> Libc.freeaddrinfo(list)
+    },
 }
 
 --- At most this many lookups are in `getaddrinfo` at once; more wait for one
@@ -310,11 +321,11 @@ fun lookup(resolver : Resolver, host : String, deadline : Int) -> Either IOError
 -- `getaddrinfo` for the NUL-terminated `name`, which this frame keeps alive
 -- until the call has returned.
 fun call(resolver : Resolver, name : Array Byte) -> Addrinfo {
-    let hints = Libc.malloc(Sys.addrinfoBytes)
-    let out = Libc.malloc(16)
+    let hints = Os.malloc(Sys.addrinfoBytes)
+    let out = Os.malloc(16)
     if Ptr.isNull(hints) || Ptr.isNull(out) {
-        Libc.free(hints)
-        Libc.free(out)
+        Os.free(hints)
+        Os.free(out)
         return Failed(Sys.eaiMemory(), 0)
     }
     -- Either family, and no flags, so that what is returned depends on the
@@ -327,8 +338,8 @@ fun call(resolver : Resolver, name : Array Byte) -> Addrinfo {
     Scheduler.afterCall()
     Ptr.keepAlive(name)
     let returned = if code == 0 { Listed(Ptr.load(out, 0)) } else { Failed(code, Ptr.load(out, 8)) }
-    Libc.free(hints)
-    Libc.free(out)
+    Os.free(hints)
+    Os.free(out)
     returned
 }
 

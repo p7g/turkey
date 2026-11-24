@@ -261,7 +261,9 @@ fun main() {
 
 `turkey fmt` rewrites each file it is given in the one style Turkey has, which
 takes no options. `turkey fmt --check` writes nothing: it prints the name of
-each file it would change, and exits with status 1 if there is one.
+each file it would change, and exits with status 1 if there is one. A file
+that cannot be read, parsed or written is reported, the other files are done
+anyway, and the exit status is 3.
 
 ```sh
 turkey fmt hello.gob
@@ -271,9 +273,11 @@ turkey fmt --check *.gob
 The formatter changes only what leaves the program as it is: line breaks,
 indentation, spaces, blank lines, the commas of a list, `;`, and the `=` before
 a block body, so `fun f() = { ... }` becomes `fun f() { ... }`. It never adds
-or removes parentheses, and it never changes a comment's text, except to drop
-trailing spaces. A file that does not parse is an error, as it is for the
-other commands.
+or removes parentheses, never spells a literal another way, and never changes
+a comment's text, except to drop trailing spaces. Comments keep their order:
+one on a line of its own stays on one, one at the end of a line stays at the
+end of one, and a block comment inside a line stays inside it. A doc comment
+documents what it documented before.
 
 A few choices are left to the author, because the source shows them:
 

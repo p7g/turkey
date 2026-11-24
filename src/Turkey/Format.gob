@@ -1,4 +1,4 @@
-export (format, Outcome(..))
+export (format, Outcome(..), unparsedStatus)
 
 --- The source formatter: one style, no options.
 ---
@@ -21,7 +21,9 @@ export (format, Outcome(..))
 --- refused.
 
 import Turkey.Ast (..)
+import System.Env as Env
 import Turkey.Compare as Compare
+import Turkey.Diag as Diag
 import Turkey.Directives as Directives
 import Turkey.Directives (Directive(..), Kind(..))
 import Turkey.DocComments as DocComments
@@ -41,16 +43,25 @@ import Turkey.Token (Comment(..), Kind(..), Token(..))
 --- refuses it, which is a fault in the formatter and not in the file.
 type Outcome = Formatted(String) | Refused(String)
 
---- The width the printer fills, counting a tab as four columns.
+-- The width the printer fills, counting a tab as four columns.
 let width = 100
+
+--- The status the process exits with when the formatted text does not
+--- parse, which is a fault in the formatter. The parser ends the process on
+--- an error, so this is how a caller tells that apart from a file of its own
+--- that does not parse, which exits 1.
+let unparsedStatus = 12
 
 --- Returns `source` formatted, after the checks above. A file that does not
 --- parse is reported as a parse error, as compiling it would be.
 fun format(source : Source) -> Outcome {
     let original = Parser.parse(source, [])
-    let once = printed(source, original)
+    let once = testing(printed(source, original))
+    if Env.get("TURKEY_TEST_FMT") == Some("refuse") { return Refused("refused for a test") }
     let again = Source { name = source.name + " (as formatted)", text = once }
+    Diag.failWith(unparsedStatus)
     let reparsed = Parser.parse(again, [])
+    Diag.failWith(1)
     if let Some(at) = Compare.firstDifference(original, reparsed) {
         return Refused("the formatted text parses to a different tree, first at "
                        + Source.showSpan(at))
@@ -68,6 +79,15 @@ fun format(source : Source) -> Outcome {
     let twice = printed(again, reparsed)
     if twice != once { return Refused("formatting the formatted text changes it again") }
     Formatted(once)
+}
+
+-- `text`, or under `TURKEY_TEST_FMT=garble` text no parser accepts. The
+-- formatter is meant never to refuse a file or to print what does not parse,
+-- so the answer to either cannot be tested any other way; `refuse` makes it
+-- refuse every file.
+fun testing(text : String) -> String = match Env.get("TURKEY_TEST_FMT") {
+    Some("garble") -> text + "}\n"
+    _ -> text
 }
 
 fun printed(source : Source, program : Program) -> String {
@@ -182,6 +202,9 @@ type F = F {
     -- Whether a directive that ends a line has been printed somewhere other
     -- than at the end of a row, since the row being built began.
     var stray : Bool,
+    -- The line of a `{` whose directive the code before it has been kept for,
+    -- which is not stray, or 0.
+    var guarded : Int,
 }
 
 fun state(source : Source, program : Program) -> F {
@@ -199,6 +222,7 @@ fun state(source : Source, program : Program) -> F {
         blank = blank,
         declared = declared,
         stray = False,
+        guarded = 0,
     }
 }
 
@@ -326,7 +350,9 @@ fun commentBefore(f : F, to : Pos) -> Bool = match pending(f) {
 -- The comments before `to`, as they go in front of the code at `to`: a
 -- comment on a line of its own stays on one, with the code on the next, a
 -- block comment with code after it stays before that code, and one that ends
--- a line is deferred to the end of the line the code is on.
+-- a line still ends one, with the code at `to` on the next. The source had a
+-- line break between that comment and the code, so the break is one the
+-- grammar allows there.
 --
 -- A list, a sequence or a chain takes the comments before each of its items
 -- with `dangling` instead, before the break the item starts after, so the
@@ -341,7 +367,7 @@ fun leading(f : F, to : Pos) -> Doc {
         else if c.block && codeFollows(f, c) { Vec.push(parts, P.cat([commentDoc(c), P.text(" ")])) }
         else {
             loose(f, c)
-            Vec.push(parts, P.suffix(commentText(c)))
+            Vec.push(parts, P.cat([P.suffix(commentText(c)), P.hard]))
         }
     }
     P.cat(parts)
@@ -354,16 +380,32 @@ fun codeFollows(f : F, c : Comment) -> Bool {
 
 -- The comments before `to` that are left at the end of a list, each on a
 -- line of its own unless it ends the line of the code before it.
+--
+-- A block comment with code after it on its line is left for the code's own
+-- `leading`, which keeps it where it is.
 fun dangling(f : F, to : Pos) -> Doc {
     let parts = []
     while let Some(c) = pending(f) {
-        if !lt(startOf(c.span), to) { break }
+        if !lt(startOf(c.span), to) || (c.block && codeFollows(f, c)) { break }
         take(f)
         if ownLine(f, c) { Vec.push(parts, P.cat([P.hard, commentDoc(c)])) }
         else {
             loose(f, c)
             Vec.push(parts, P.suffix(commentText(c)))
         }
+    }
+    P.cat(parts)
+}
+
+-- The block comments before `to` that have code after them on their line,
+-- each after a space, for a place where they go before that code on the same
+-- line.
+fun inline(f : F, to : Pos) -> Doc {
+    let parts = []
+    while let Some(c) = pending(f) {
+        if !lt(startOf(c.span), to) || !c.block || !codeFollows(f, c) { break }
+        take(f)
+        Vec.push(parts, P.cat([P.text(" "), commentDoc(c)]))
     }
     P.cat(parts)
 }
@@ -416,10 +458,13 @@ fun sequence(f : F, items : Vec Item, close : Pos) -> Sequenced {
     var head = P.empty()
     let table = []
     var above = -1
+    -- The row of the item before, while it is the last row of `table`.
+    var previous = -1
     for item in items {
         let (opening, last) = comments(f, startOf(item.span), table, above)
         head = P.cat([head, opening])
         if last >= 0 { above = last }
+        if previous != len(table) - 1 { previous = -1 }
         if above >= 0 && blankBetween(f, above, item.span.line) { Vec.push(table, blankRow()) }
         let outer = f.stray
         f.stray = False
@@ -432,13 +477,19 @@ fun sequence(f : F, items : Vec Item, close : Pos) -> Sequenced {
         -- hold the same code after formatting. A one-line item carrying one
         -- stays on one line, whatever the width, and an item of several lines
         -- keeps the lines it was written on.
+        -- Items that share the directive's line in the source, `a; b --@...`,
+        -- share it in the output too, as one row.
         if !directed {
             Vec.push(table, Row { kind = row.kind, left = row.left, right = P.cat([row.right, end]) })
+        } else if previous >= 0 && above == item.span.line && item.span.line == item.span.endLine {
+            let r = table[previous]
+            table[previous] = plain(P.flat(P.cat([r.left, r.right, P.text("; "), row.left, row.right, end])))
         } else if item.span.line == item.span.endLine {
             Vec.push(table, Row { kind = row.kind, left = P.flat(row.left), right = P.flat(P.cat([row.right, end])) })
         } else {
             Vec.push(table, plain(P.cat([P.raw(written(f, item.span)), end])))
         }
+        previous = len(table) - 1
         above = item.span.endLine
     }
     let (opening, _) = comments(f, close, table, above)
@@ -458,7 +509,13 @@ fun comments(f : F, to : Pos, table : Vec Row, above : Int) -> (Doc, Int) {
         if !lt(startOf(c.span), to) { break }
         take(f)
         if !ownLine(f, c) {
-            if len(table) == 0 { opening = P.cat([opening, P.suffix(commentText(c))]) }
+            if len(table) == 0 {
+                -- A directive here covers the line of the opening bracket, whose
+                -- code was printed before this sequence, so only the row around
+                -- it can keep that line as it was.
+                if c.span.line != f.guarded { loose(f, c) }
+                opening = P.cat([opening, P.suffix(commentText(c))])
+            }
             else {
                 let r = table[len(table) - 1]
                 table[len(table) - 1] = Row { kind = r.kind, left = r.left,
@@ -502,7 +559,7 @@ type Listed = Listed {
 }
 
 fun listed(f : F, entries : Vec Entry, open : Pos, close : Pos) -> Listed {
-    let commented = hasCommentIn(f, open, close)
+    let commented = commentAmong(f, entries, open, close)
     let above = []
     let items = []
     let ends = []
@@ -512,6 +569,20 @@ fun listed(f : F, entries : Vec Entry, open : Pos, close : Pos) -> Listed {
         Vec.push(ends, inner(f, trailing(f, endOf(e.span))))
     }
     Listed { above = above, items = items, ends = ends, rest = dangling(f, close), commented = commented }
+}
+
+-- Whether a comment not yet printed is between `open` and `close` and outside
+-- every one of `entries`: one the list itself holds, which keeps it on several
+-- lines, rather than one inside an item, which is the item's to lay out.
+fun commentAmong(f : F, entries : Vec Entry, open : Pos, close : Pos) -> Bool {
+    for var i = f.next; i < len(f.comments); i = i + 1 {
+        let at = startOf(f.comments[i].span)
+        if !lt(at, close) { return False }
+        if lt(at, open) { continue }
+        let within = Iter.any(entries, fun(e) = !lt(at, startOf(e.span)) && lt(at, endOf(e.span)))
+        if !within { return True }
+    }
+    False
 }
 
 fun hasCommentIn(f : F, from : Pos, to : Pos) -> Bool = match pending(f) {
@@ -656,7 +727,12 @@ fun listWithRest(f : F, open : Int, entries : Vec Entry, rest : Bool) -> Doc {
     if rest {
         let close = matching(f, open)
         let closeAt = tokenPos(f, close)
-        Vec.push(entries, Entry { span = f.tokens[close].span, build = fun() = P.text("..") })
+        var dots = open + 1
+        while dots < close && kindAt(f, dots) != ".." {
+            if kindAt(f, dots) == "(" { dots = matching(f, dots) }
+            dots = dots + 1
+        }
+        Vec.push(entries, Entry { span = f.tokens[dots].span, build = fun() = P.text("..") })
         let l = listed(f, entries, tokenPos(f, open), closeAt)
         return bracketed("(", ")", l, opensLine(f, open) || l.commented)
     }
@@ -712,25 +788,43 @@ fun importDoc(f : F, i : ImportDecl) -> Doc {
 
 -- -- types --------------------------------------------------------------------------
 
-fun typeDoc(f : F, t : Type) -> Doc = P.cat([leading(f, startOf(t.span)), P.text(typeText(t))])
-
-fun typeText(t : Type) -> String = match t.kind {
-    TEVar(name) -> name
-    TECon(name, args) -> if len(args) == 0 { name } else { name + " " + arguments(args) }
-    TEApp(head, args) -> typeText(head) + " " + arguments(args)
-    TETuple(xs) -> "(" + String.join(Vec.map(xs, typeText), ", ") + ")"
-    TEFun(params, ret) -> "fun(" + String.join(Vec.map(params, typeText), ", ") + ") -> " + typeText(ret)
-    TEParen(inner) -> "(" + typeText(inner) + ")"
+fun typeDoc(f : F, t : Type) -> Doc {
+    let lead = if Source.isEmpty(t.span) { P.empty() } else { leading(f, startOf(t.span)) }
+    let d = match t.kind {
+        TEVar(name) -> P.text(name)
+        TECon(name, args) -> P.cat([P.text(name), arguments(f, args)])
+        TEApp(head, args) -> P.cat([typeDoc(f, head), arguments(f, args)])
+        TETuple(xs) -> list(f, tokenFrom(f, startOf(t.span)), "(", ")", typeEntries(f, xs))
+        TEFun(params, ret) -> {
+            let open = tokenFrom(f, startOf(t.span)) + 1
+            let shown = list(f, open, "(", ")", typeEntries(f, params))
+            P.cat([P.text("fun"), shown, arrow(f, matching(f, open) + 1), typeDoc(f, ret)])
+        }
+        TEParen(inner) -> P.cat([P.text("("), typeDoc(f, inner), P.text(")")])
+    }
+    P.cat([lead, d])
 }
 
-fun arguments(ts : Vec Type) -> String = String.join(Vec.map(ts, typeText), " ")
+fun arguments(f : F, ts : Vec Type) -> Doc =
+    P.cat(Vec.map(ts, fun(a) = P.cat([P.text(" "), typeDoc(f, a)])))
 
-fun predText(p : Pred) -> String = match p.kind {
-    PClass(name, t) -> name + " " + typeText(t)
-    PEq(a, b) -> typeText(a) + " ~ " + typeText(b)
+fun typeEntries(f : F, ts : Vec Type) -> Vec Entry =
+    Vec.map(ts, fun(t) = Entry { span = t.span, build = fun() = typeDoc(f, t) })
+
+-- ` -> `, after the comments before the `->` at token `at`, which stay before
+-- it.
+fun arrow(f : F, at : Int) -> Doc = P.cat([leading(f, tokenPos(f, at)), P.text(" -> ")])
+
+fun predDoc(f : F, p : Pred) -> Doc {
+    let lead = leading(f, startOf(p.span))
+    let d = match p.kind {
+        PClass(name, t) -> P.cat([P.text(name + " "), typeDoc(f, t)])
+        PEq(a, b) -> P.cat([typeDoc(f, a), P.text(" ~ "), typeDoc(f, b)])
+    }
+    P.cat([lead, d])
 }
 
-fun predsText(ps : Vec Pred) -> String = String.join(Vec.map(ps, predText), ", ")
+fun predsDoc(f : F, ps : Vec Pred) -> Doc = joined(Vec.map(ps, predDoc(f, _)), P.text(", "))
 
 fun typeDeclDoc(f : F, t : TypeDecl) -> Doc {
     let params = String.join(Vec.map(t.params, fun(x) = " " + x), "")
@@ -764,11 +858,11 @@ fun typeDeclDoc(f : F, t : TypeDecl) -> Doc {
 
 fun conDoc(f : F, c : ConDecl) -> Doc {
     let lead = leading(f, startOf(c.span))
-    let bracket = if len(c.binders) + len(c.context) == 0 { "" } else {
-        let parts = Vec.append(c.binders, Vec.map(c.context, predText))
-        "[" + String.join(parts, ", ") + "]"
+    let bracket = if len(c.binders) + len(c.context) == 0 { P.empty() } else {
+        let parts = Vec.append(Vec.map(c.binders, P.text), Vec.map(c.context, predDoc(f, _)))
+        P.cat([P.text("["), joined(parts, P.text(", ")), P.text("]")])
     }
-    let head = P.text(c.name + bracket)
+    let head = P.cat([P.text(c.name), bracket])
     match c.fields {
         Some(fields) -> {
             let open = findToken(f, startOf(c.span), "{")
@@ -827,17 +921,18 @@ fun record(f : F, open : Int, close : Pos, fields : Vec Field, rest : Bool) -> D
 -- -- declarations -------------------------------------------------------------------
 
 fun classDoc(f : F, c : ClassDecl) -> Doc {
-    let supers = if len(c.supers) == 0 { "" } else { " : " + predsText(c.supers) }
+    let supers = if len(c.supers) == 0 { P.empty() } else { P.cat([P.text(" : "), predsDoc(f, c.supers)]) }
     let items = []
     for m in c.methods { Vec.push(items, Item { span = m.span, build = fun() = plain(funDoc(f, m)) }) }
     for fam in c.families {
         Vec.push(items, Item { span = fam.span, build = fun() = plain(P.text("type " + fam.name + " " + fam.param)) })
     }
-    P.cat([P.text("class " + c.name + " " + c.param + supers + " "), body(f, c.span, items)])
+    P.cat([P.text("class " + c.name + " " + c.param), supers, P.text(" "), body(f, c.span, items)])
 }
 
 fun instanceDoc(f : F, i : InstanceDecl) -> Doc {
-    let context = if len(i.context) == 0 { "" } else { " : " + predsText(i.context) }
+    let head = typeDoc(f, i.head)
+    let context = if len(i.context) == 0 { P.empty() } else { P.cat([P.text(" : "), predsDoc(f, i.context)]) }
     let items = []
     for m in i.methods { Vec.push(items, Item { span = m.span, build = fun() = plain(funDoc(f, m)) }) }
     for fam in i.families {
@@ -846,7 +941,7 @@ fun instanceDoc(f : F, i : InstanceDecl) -> Doc {
             build = fun() = plain(P.cat([P.text("type " + fam.name + " = "), typeDoc(f, fam.body)])),
         })
     }
-    P.cat([P.text("instance " + i.cls + " " + typeText(i.head) + context + " "), body(f, i.span, items)])
+    P.cat([P.text("instance " + i.cls + " "), head, context, P.text(" "), body(f, i.span, items)])
 }
 
 -- The braces of a class or instance, its members in source order. One member
@@ -911,21 +1006,56 @@ fun funDoc(f : F, d : FunDecl) -> Doc {
         Some(symbol) -> "foreign " + Token.quote(symbol) + " "
         None -> ""
     }
-    let context = if len(d.context) == 0 { "" } else { "[" + predsText(d.context) + "]" }
+    -- A directive after the body's `{` covers the line the `{` is on, so
+    -- that line must keep its code: a one-line signature stays on one line,
+    -- and one written across lines keeps the lines it was written on.
+    let guarded = match d.body {
+        Some(b) -> if let EBlock(_) = b.kind { directiveAfter(f, startOf(b.span)) } else { False }
+        None -> False
+    }
+    if guarded {
+        let b = Option.expect(d.body, "a guarded function has a body")
+        f.guarded = b.span.line
+        if d.span.line != b.span.line {
+            let header = Span {
+                line = d.span.line, col = d.span.col, endLine = b.span.line, endCol = b.span.col,
+                file = d.span.file, inlined = None,
+            }
+            while commentBefore(f, startOf(b.span)) { take(f) }
+            let text = String.trimEnd(written(f, header))
+            return P.cat([P.raw(text), P.text(" "), exprDoc(f, b)])
+        }
+    }
+    let context = if len(d.context) == 0 { P.empty() } else {
+        P.cat([P.text("["), predsDoc(f, d.context), P.text("]")])
+    }
     let funToken = findToken(f, startOf(d.span), "fun")
     var open = funToken + 2
     if kindAt(f, open) == "[" { open = matching(f, open) + 1 }
     let params = list(f, open, "(", ")",
                       Vec.map(d.params, fun(p) = Entry { span = p.span, build = fun() = paramDoc(f, p) }))
     let ret = match d.ret {
-        Some(t) -> P.cat([P.text(" -> "), typeDoc(f, t)])
+        Some(t) -> P.cat([arrow(f, matching(f, open) + 1), typeDoc(f, t)])
         None -> P.empty()
     }
-    let head = P.cat([P.text(prefix + "fun " + d.name + context), params, ret])
+    let named = leading(f, tokenPos(f, funToken + 1))
+    let head = P.cat([P.text(prefix + "fun "), named, P.text(d.name), context, params, ret])
     match d.body {
-        Some(b) -> P.cat([head, bodyDoc(f, b)])
+        Some(b) -> if guarded { P.cat([P.flat(head), bodyDoc(f, b)]) } else { P.cat([head, bodyDoc(f, b)]) }
         None -> head
     }
+}
+
+-- Whether a directive ends the line of the `{` at `open`, with no code between
+-- them.
+fun directiveAfter(f : F, open : Pos) -> Bool {
+    let next = tokenPos(f, tokenFrom(f, Pos { line = open.line, col = open.col + 1 }))
+    for var i = f.next; i < len(f.comments); i = i + 1 {
+        let c = f.comments[i]
+        if c.span.line > open.line || !lt(startOf(c.span), next) { return False }
+        if lt(open, startOf(c.span)) && Directives.isDirective(c) { return True }
+    }
+    False
 }
 
 -- A function's body after its signature: a block as a block, `= value` on the
@@ -1166,6 +1296,7 @@ fun ifChain(f : F, e : Expr) -> Doc {
         if Option.isNone(otherwise) { break }
         let next = Option.expect(otherwise, "the chain goes on")
         let elseAt = tokenPos(f, findToken(f, endOf(then.span), "else"))
+        Vec.push(parts, inline(f, elseAt))
         if commentBefore(f, elseAt) {
             -- A comment between `}` and `else` stays there, on its own line.
             Vec.push(parts, dangling(f, elseAt))
@@ -1232,14 +1363,16 @@ fun matchDoc(f : F, e : Expr, scrutinee : Expr, arms : Vec Arm) -> Doc {
 -- -- calls and arrays ---------------------------------------------------------------
 
 fun callDoc(f : F, e : Expr, fn : Expr, args : Vec Expr) -> Doc {
-    let callee = exprDoc(f, fn)
     let open = tokenFrom(f, endOf(fn.span))
+    -- A block comment between the callee and its `(` stays between them.
+    let callee = P.cat([exprDoc(f, fn), inline(f, tokenPos(f, open))])
     let close = closerOf(e.span)
     let l = listed(f, exprEntries(f, args), tokenPos(f, open), close)
-    let expand = opensLine(f, open) || l.commented
+    let quiet = Iter.all(l.above, P.isEmpty) && P.isEmpty(l.rest)
+    let expand = opensLine(f, open) || l.commented || !quiet
     let n = len(l.items)
     -- A call whose one argument cannot break gains nothing from breaking.
-    if n == 1 && !expand && !P.breakable(l.items[0]) && !P.isHard(l.rest) {
+    if n == 1 && !expand && !P.breakable(l.items[0]) {
         return P.cat([callee, P.text("("), l.items[0], l.ends[0], P.text(")")])
     }
     let broken = bracketed("(", ")", l, expand)
@@ -1323,12 +1456,14 @@ fun chainDoc(f : F, t : Tree, depth : Int) -> Doc = match t {
         let rest = []
         for var i = 0; i < len(ops); i = i + 1 {
             let (op, at) = ops[i]
+            let kept = inline(f, startOf(at))
             let above = dangling(f, startOf(at))
             if op == "-" {
                 let operand = chainDoc(f, operands[i + 1], 1)
-                Vec.push(rest, P.cat([above, P.text(" -"), P.line, operand]))
+                Vec.push(rest, P.cat([kept, above, P.text(" -"), P.line, operand]))
             } else {
-                Vec.push(rest, P.cat([above, P.line, P.text(op + " "), chainDoc(f, operands[i + 1], 1)]))
+                let operand = chainDoc(f, operands[i + 1], 1)
+                Vec.push(rest, P.cat([kept, above, P.line, P.text(op + " "), operand]))
             }
         }
         P.group(P.cat([first, P.nest(depth, P.cat(rest))]))

@@ -14,21 +14,21 @@ import Turkey.Types as Ty
 import Turkey.Types (Kind(..), Scheme(..), Type, TVar, TApp, TFun)
 
 fun spellingScheme(b : Builtin) -> Scheme = match b {
-    Machine(p) -> scheme(p)
-    Fixed(c) -> choiceScheme(c)
+	Machine(p) -> scheme(p)
+	Fixed(c)   -> choiceScheme(c)
 }
 
 -- A scheme over one fresh variable, or two. Fresh on every call, so no two
 -- schemes share a variable.
 fun forall1(body : fun(Type) -> Type) -> Scheme {
-    let a = Ty.newVar(1, Ty.kvar())
-    Ty.scheme([a], body(TVar(a)), [])
+	let a = Ty.newVar(1, Ty.kvar())
+	Ty.scheme([a], body(TVar(a)), [])
 }
 
 fun forall2(body : fun(Type, Type) -> Type) -> Scheme {
-    let a = Ty.newVar(1, Ty.kvar())
-    let b = Ty.newVar(1, Ty.kvar())
-    Ty.scheme([a, b], body(TVar(a), TVar(b)), [])
+	let a = Ty.newVar(1, Ty.kvar())
+	let b = Ty.newVar(1, Ty.kvar())
+	Ty.scheme([a, b], body(TVar(a), TVar(b)), [])
 }
 
 fun rawArray(element : Type) -> Type = TApp(Ty.tRawArray(), element, KStar)
@@ -36,194 +36,195 @@ fun rawArray(element : Type) -> Type = TApp(Ty.tRawArray(), element, KStar)
 --- The target, as the constructor of `lib/Target.gob`'s own type that names it,
 --- and what the compile fixed of the runtime's debugging aids (`Turkey.Build`).
 fun choiceScheme(c : Choice) -> Scheme = match c {
-    TargetOs -> Ty.mono(Ty.tcon("Target#OS", KStar, Ty.noScope))
-    TargetArch -> Ty.mono(Ty.tcon("Target#Arch", KStar, Ty.noScope))
-    GcVerify -> Ty.mono(Ty.tBool())
-    GcStats -> Ty.mono(Ty.tBool())
+	TargetOs   -> Ty.mono(Ty.tcon("Target#OS", KStar, Ty.noScope))
+	TargetArch -> Ty.mono(Ty.tcon("Target#Arch", KStar, Ty.noScope))
+	GcVerify   -> Ty.mono(Ty.tBool())
+	GcStats    -> Ty.mono(Ty.tBool())
 }
 
 fun scheme(p : Prim) -> Scheme = match p {
-    Error -> forall1(fun(a) = TFun([Ty.tString()], a))
-    Exit -> forall1(fun(a) = TFun([Ty.tInt()], a))
-    -- Raw memory. `malloc` and `free` are not here: they are declared as
-    -- ordinary foreign functions in `lib/Turkey/Libc.gob`.
-    PtrAdd -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tRawPtr()))
-    PtrDiff -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tInt()))
-    PtrNull -> Ty.mono(TFun([], Ty.tRawPtr()))
-    PtrIsNull -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tBool()))
-    PtrEq -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tBool()))
-    PtrToInt -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tInt()))
-    PtrFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tRawPtr()))
-    -- The address of element `i` of an array, or of the byte past its last
-    -- element when `i` is its length, for handing a run of elements to C.
-    -- Unchecked, as every raw access is. Good while the array is live; the
-    -- collector does not move objects, but the address does not keep one
-    -- alive, which is what `keepAlive` is for.
-    ElementAddress -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt()], Ty.tRawPtr()))
-    -- A use of a value that does nothing, so that it is live, and so a root,
-    -- up to this point: what keeps an object whose address was taken alive
-    -- for as long as something outside Turkey code may be using the address.
-    KeepAlive -> forall1(fun(a) = TFun([a], Ty.tUnit()))
-    -- Addresses fixed when the program is linked, for giblet code that cannot
-    -- hold what the address stands in for:
-    --
-    --   cString("text")        the literal's UTF-8 bytes and a NUL, in
-    --                          read-only data
-    --   codeAddress("symbol")  a `foreign` definition's C entry point
-    --   frameAddress()         the calling function's frame pointer; on
-    --                          wasm, the innermost shadow frame
-    --
-    -- The argument of the first two must be a string literal, which lowering
-    -- checks: it is data the compiler lays out, not a value computed at run
-    -- time, and `codeAddress` accepts only a symbol defined in the program.
-    -- Writing through a `cString` is undefined, as writing a string constant
-    -- is in C, and so is reading through a `codeAddress`; Turkey has no call
-    -- through a raw pointer. `frameAddress` is defined only as a bound -- the
-    -- frames of everything the function calls are below it -- which is what
-    -- the collector's stack walk needs.
-    CString -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
-    CodeAddress -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
-    FrameAddress -> Ty.mono(TFun([], Ty.tRawPtr()))
-    ProcessState -> Ty.mono(TFun([], Ty.tRawPtr()))
-    -- Park the running stack on the stack record `from` and resume the one
-    -- `to` was parked on; this call returns when something resumes `from`.
-    -- Both are `Turkey.Stack`'s raw stack records. Nothing crosses the switch
-    -- but control: a value passed between stacks goes through the heap, where
-    -- its type is checked.
-    SwapStack -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tUnit()))
-    -- Raw load and store, one name per representation, at a byte offset from
-    -- the address. One language type per class: `i1` is `Bool`, `i8` is
-    -- `Byte`, `i32` is `Char`, `i64` is `Int`, `f64` is `Float` and `ptr` is
-    -- another raw address. `i1` touches one byte, and memory is
-    -- little-endian because arm64 is. Loading an `i32` that is not a scalar
-    -- value is undefined, and nothing checks it.
-    LoadI1 -> load(Ty.tBool())
-    LoadI8 -> load(Ty.tByte())
-    LoadI32 -> load(Ty.tChar())
-    LoadI64 -> load(Ty.tInt())
-    LoadF64 -> load(Ty.tFloat())
-    LoadPtr -> load(Ty.tRawPtr())
-    StoreI1 -> store(Ty.tBool())
-    StoreI8 -> store(Ty.tByte())
-    StoreI32 -> store(Ty.tChar())
-    StoreI64 -> store(Ty.tInt())
-    StoreF64 -> store(Ty.tFloat())
-    StorePtr -> store(Ty.tRawPtr())
-    -- `copyBytes(target, source, count)` is C's `memmove`: the two ranges
-    -- may overlap. `fillBytes(target, count, value)` sets every byte to
-    -- `value`'s low byte. Unchecked, as every raw access is.
-    CopyBytes ->
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr(), Ty.tInt()], Ty.tUnit()))
-    FillBytes -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tUnit()))
-    -- Atomic accesses to an `Int` at a byte offset into raw memory:
-    -- `atomicCas(p, off, expected, new)` answers the value it found, and
-    -- stored `new` exactly when that is `expected`; `atomicAdd(p, off, n)`
-    -- answers the value before. Each orders every access around it.
-    AtomicCas ->
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
-    AtomicAdd -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
-    AtomicLoad -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tInt()))
-    AtomicStore -> store(Ty.tInt())
-    -- An `Int` in a cell of its own, shared by every copy of the reference,
-    -- whose every access is atomic and orders every access around it:
-    -- `atomicAddTo(a, n)` answers the value before, and
-    -- `atomicSwapIf(a, expected, new)` the value it found, having stored `new`
-    -- exactly when that is `expected`.
-    AtomicNew -> Ty.mono(TFun([Ty.tInt()], Ty.tAtomic()))
-    AtomicGet -> Ty.mono(TFun([Ty.tAtomic()], Ty.tInt()))
-    AtomicSet -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt()], Ty.tUnit()))
-    AtomicAddTo -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt()], Ty.tInt()))
-    AtomicSwapIf -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
-    ArrayNew -> forall1(fun(a) = TFun([Ty.tInt(), a], rawArray(a)))
-    ArrayNewUninit -> forall1(fun(a) = TFun([Ty.tInt()], rawArray(a)))
-    ArrayGet -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt()], a))
-    ArraySet -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt(), a], Ty.tUnit()))
-    ArrayLength -> forall1(fun(a) = TFun([rawArray(a)], Ty.tInt()))
-    -- Runs of elements, checked against each array's own length:
-    --
-    --   arrayCopy(target, at, source, from, count)  `count` elements from
-    --                          `source[from]` to `target[at]`, the two runs
-    --                          free to overlap in one array
-    --   arrayCopyIn(target, at, source, count)      `count` elements laid out
-    --                          as the array lays them out, from raw memory
-    --   arrayFill(target, at, count, value)         `count` copies of `value`
-    ArrayCopy -> forall1(fun(a) =
-        TFun([rawArray(a), Ty.tInt(), rawArray(a), Ty.tInt(), Ty.tInt()], Ty.tUnit()))
-    ArrayCopyIn -> forall1(fun(a) =
-        TFun([rawArray(a), Ty.tInt(), Ty.tRawPtr(), Ty.tInt()], Ty.tUnit()))
-    ArrayFill -> forall1(fun(a) =
-        TFun([rawArray(a), Ty.tInt(), Ty.tInt(), a], Ty.tUnit()))
-    -- The conversion half of a checked cast. Two independent variables: it is
-    -- handed a value of one type and answers one of another, which is only
-    -- sound because `Data.Error.cast` compares the two type reps before
-    -- calling it.
-    CastAs -> forall2(fun(a, b) = TFun([a], b))
-    CharFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tChar()))
-    CharIsScalar -> Ty.mono(TFun([Ty.tInt()], Ty.tBool()))
-    CharToInt -> Ty.mono(TFun([Ty.tChar()], Ty.tInt()))
-    CharEq -> relation(Ty.tChar())
-    CharLt -> relation(Ty.tChar())
-    ByteFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tByte()))
-    ByteToInt -> Ty.mono(TFun([Ty.tByte()], Ty.tInt()))
-    ByteEq -> relation(Ty.tByte())
-    ByteLt -> relation(Ty.tByte())
-    -- The low 32 bits of the `Int`, and those 32 bits as an `Int` from 0 to
-    -- 2^32 - 1: zero-extended, since every 32-bit integer WASI passes is
-    -- unsigned.
-    Int32FromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tInt32()))
-    Int32ToInt -> Ty.mono(TFun([Ty.tInt32()], Ty.tInt()))
-    -- Grow linear memory by a count of 64 KiB pages, answering its size in
-    -- pages before, or -1 (`LowIr.MemoryGrow`).
-    MemoryGrow -> Ty.mono(TFun([Ty.tInt()], Ty.tInt()))
-    IntAdd -> binary(Ty.tInt())
-    IntSub -> binary(Ty.tInt())
-    IntMul -> binary(Ty.tInt())
-    IntDiv -> binary(Ty.tInt())
-    IntRem -> binary(Ty.tInt())
-    IntNeg -> unary(Ty.tInt())
-    IntAddWrapping -> binary(Ty.tInt())
-    IntSubWrapping -> binary(Ty.tInt())
-    IntMulWrapping -> binary(Ty.tInt())
-    IntNegWrapping -> unary(Ty.tInt())
-    IntAnd -> binary(Ty.tInt())
-    IntOr -> binary(Ty.tInt())
-    IntXor -> binary(Ty.tInt())
-    IntNot -> unary(Ty.tInt())
-    IntShl -> binary(Ty.tInt())
-    IntShr -> binary(Ty.tInt())
-    IntShrUnsigned -> binary(Ty.tInt())
-    IntMulHighUnsigned -> binary(Ty.tInt())
-    IntEq -> relation(Ty.tInt())
-    IntLt -> relation(Ty.tInt())
-    IntToFloat -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
-    FloatAdd -> binary(Ty.tFloat())
-    FloatSub -> binary(Ty.tFloat())
-    FloatMul -> binary(Ty.tFloat())
-    FloatDiv -> binary(Ty.tFloat())
-    FloatNeg -> unary(Ty.tFloat())
-    FloatTruncate -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
-    FloatFitsInt -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
-    FloatBits -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
-    FloatFromBits -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
-    FloatIsNaN -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
-    FloatEq -> relation(Ty.tFloat())
-    FloatLt -> relation(Ty.tFloat())
-    FloatLte -> relation(Ty.tFloat())
-    FloatGt -> relation(Ty.tFloat())
-    FloatGte -> relation(Ty.tFloat())
-    Not -> unary(Ty.tBool())
-    -- Over any type, though only a data type has constructors, so only a
-    -- value of one may be passed.
-    ConstructorIndex -> forall1(fun(a) = TFun([a], Ty.tInt()))
-    -- Over any type, though only a value held as one word may be passed:
-    -- the instances of `Object` are for exactly those.
-    Identical -> forall1(fun(a) = TFun([a, a], Ty.tBool()))
+	Error -> forall1(fun(a) = TFun([Ty.tString()], a))
+	Exit  -> forall1(fun(a) = TFun([Ty.tInt()], a))
+	-- Raw memory. `malloc` and `free` are not here: they are declared as
+	-- ordinary foreign functions in `lib/Turkey/Libc.gob`.
+	PtrAdd     -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tRawPtr()))
+	PtrDiff    -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tInt()))
+	PtrNull    -> Ty.mono(TFun([], Ty.tRawPtr()))
+	PtrIsNull  -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tBool()))
+	PtrEq      -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tBool()))
+	PtrToInt   -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tInt()))
+	PtrFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tRawPtr()))
+	-- The address of element `i` of an array, or of the byte past its last
+	-- element when `i` is its length, for handing a run of elements to C.
+	-- Unchecked, as every raw access is. Good while the array is live; the
+	-- collector does not move objects, but the address does not keep one
+	-- alive, which is what `keepAlive` is for.
+	ElementAddress -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt()], Ty.tRawPtr()))
+	-- A use of a value that does nothing, so that it is live, and so a root,
+	-- up to this point: what keeps an object whose address was taken alive
+	-- for as long as something outside Turkey code may be using the address.
+	KeepAlive -> forall1(fun(a) = TFun([a], Ty.tUnit()))
+	-- Addresses fixed when the program is linked, for giblet code that cannot
+	-- hold what the address stands in for:
+	--
+	--   cString("text")        the literal's UTF-8 bytes and a NUL, in
+	--                          read-only data
+	--   codeAddress("symbol")  a `foreign` definition's C entry point
+	--   frameAddress()         the calling function's frame pointer; on
+	--                          wasm, the innermost shadow frame
+	--
+	-- The argument of the first two must be a string literal, which lowering
+	-- checks: it is data the compiler lays out, not a value computed at run
+	-- time, and `codeAddress` accepts only a symbol defined in the program.
+	-- Writing through a `cString` is undefined, as writing a string constant
+	-- is in C, and so is reading through a `codeAddress`; Turkey has no call
+	-- through a raw pointer. `frameAddress` is defined only as a bound -- the
+	-- frames of everything the function calls are below it -- which is what
+	-- the collector's stack walk needs.
+	CString      -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
+	CodeAddress  -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
+	FrameAddress -> Ty.mono(TFun([], Ty.tRawPtr()))
+	ProcessState -> Ty.mono(TFun([], Ty.tRawPtr()))
+	-- Park the running stack on the stack record `from` and resume the one
+	-- `to` was parked on; this call returns when something resumes `from`.
+	-- Both are `Turkey.Stack`'s raw stack records. Nothing crosses the switch
+	-- but control: a value passed between stacks goes through the heap, where
+	-- its type is checked.
+	SwapStack -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tUnit()))
+	-- Raw load and store, one name per representation, at a byte offset from
+	-- the address. One language type per class: `i1` is `Bool`, `i8` is
+	-- `Byte`, `i32` is `Char`, `i64` is `Int`, `f64` is `Float` and `ptr` is
+	-- another raw address. `i1` touches one byte, and memory is
+	-- little-endian because arm64 is. Loading an `i32` that is not a scalar
+	-- value is undefined, and nothing checks it.
+	LoadI1   -> load(Ty.tBool())
+	LoadI8   -> load(Ty.tByte())
+	LoadI32  -> load(Ty.tChar())
+	LoadI64  -> load(Ty.tInt())
+	LoadF64  -> load(Ty.tFloat())
+	LoadPtr  -> load(Ty.tRawPtr())
+	StoreI1  -> store(Ty.tBool())
+	StoreI8  -> store(Ty.tByte())
+	StoreI32 -> store(Ty.tChar())
+	StoreI64 -> store(Ty.tInt())
+	StoreF64 -> store(Ty.tFloat())
+	StorePtr -> store(Ty.tRawPtr())
+	-- `copyBytes(target, source, count)` is C's `memmove`: the two ranges
+	-- may overlap. `fillBytes(target, count, value)` sets every byte to
+	-- `value`'s low byte. Unchecked, as every raw access is.
+	CopyBytes ->
+		Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr(), Ty.tInt()], Ty.tUnit()))
+	FillBytes -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tUnit()))
+	-- Atomic accesses to an `Int` at a byte offset into raw memory:
+	-- `atomicCas(p, off, expected, new)` answers the value it found, and
+	-- stored `new` exactly when that is `expected`; `atomicAdd(p, off, n)`
+	-- answers the value before. Each orders every access around it.
+	AtomicCas ->
+		Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
+	AtomicAdd   -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
+	AtomicLoad  -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tInt()))
+	AtomicStore -> store(Ty.tInt())
+	-- An `Int` in a cell of its own, shared by every copy of the reference,
+	-- whose every access is atomic and orders every access around it:
+	-- `atomicAddTo(a, n)` answers the value before, and
+	-- `atomicSwapIf(a, expected, new)` the value it found, having stored `new`
+	-- exactly when that is `expected`.
+	AtomicNew      -> Ty.mono(TFun([Ty.tInt()], Ty.tAtomic()))
+	AtomicGet      -> Ty.mono(TFun([Ty.tAtomic()], Ty.tInt()))
+	AtomicSet      -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt()], Ty.tUnit()))
+	AtomicAddTo    -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt()], Ty.tInt()))
+	AtomicSwapIf   -> Ty.mono(TFun([Ty.tAtomic(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
+	ArrayNew       -> forall1(fun(a) = TFun([Ty.tInt(), a], rawArray(a)))
+	ArrayNewUninit -> forall1(fun(a) = TFun([Ty.tInt()], rawArray(a)))
+	ArrayGet       -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt()], a))
+	ArraySet       -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt(), a], Ty.tUnit()))
+	ArrayLength    -> forall1(fun(a) = TFun([rawArray(a)], Ty.tInt()))
+	-- Runs of elements, checked against each array's own length:
+	--
+	--   arrayCopy(target, at, source, from, count)  `count` elements from
+	--                          `source[from]` to `target[at]`, the two runs
+	--                          free to overlap in one array
+	--   arrayCopyIn(target, at, source, count)      `count` elements laid out
+	--                          as the array lays them out, from raw memory
+	--   arrayFill(target, at, count, value)         `count` copies of `value`
+	ArrayCopy -> forall1(
+		fun(a) = TFun([rawArray(a), Ty.tInt(), rawArray(a), Ty.tInt(), Ty.tInt()], Ty.tUnit()),
+	)
+	ArrayCopyIn -> forall1(
+		fun(a) = TFun([rawArray(a), Ty.tInt(), Ty.tRawPtr(), Ty.tInt()], Ty.tUnit()),
+	)
+	ArrayFill -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt(), Ty.tInt(), a], Ty.tUnit()))
+	-- The conversion half of a checked cast. Two independent variables: it is
+	-- handed a value of one type and answers one of another, which is only
+	-- sound because `Data.Error.cast` compares the two type reps before
+	-- calling it.
+	CastAs       -> forall2(fun(a, b) = TFun([a], b))
+	CharFromInt  -> Ty.mono(TFun([Ty.tInt()], Ty.tChar()))
+	CharIsScalar -> Ty.mono(TFun([Ty.tInt()], Ty.tBool()))
+	CharToInt    -> Ty.mono(TFun([Ty.tChar()], Ty.tInt()))
+	CharEq       -> relation(Ty.tChar())
+	CharLt       -> relation(Ty.tChar())
+	ByteFromInt  -> Ty.mono(TFun([Ty.tInt()], Ty.tByte()))
+	ByteToInt    -> Ty.mono(TFun([Ty.tByte()], Ty.tInt()))
+	ByteEq       -> relation(Ty.tByte())
+	ByteLt       -> relation(Ty.tByte())
+	-- The low 32 bits of the `Int`, and those 32 bits as an `Int` from 0 to
+	-- 2^32 - 1: zero-extended, since every 32-bit integer WASI passes is
+	-- unsigned.
+	Int32FromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tInt32()))
+	Int32ToInt   -> Ty.mono(TFun([Ty.tInt32()], Ty.tInt()))
+	-- Grow linear memory by a count of 64 KiB pages, answering its size in
+	-- pages before, or -1 (`LowIr.MemoryGrow`).
+	MemoryGrow         -> Ty.mono(TFun([Ty.tInt()], Ty.tInt()))
+	IntAdd             -> binary(Ty.tInt())
+	IntSub             -> binary(Ty.tInt())
+	IntMul             -> binary(Ty.tInt())
+	IntDiv             -> binary(Ty.tInt())
+	IntRem             -> binary(Ty.tInt())
+	IntNeg             -> unary(Ty.tInt())
+	IntAddWrapping     -> binary(Ty.tInt())
+	IntSubWrapping     -> binary(Ty.tInt())
+	IntMulWrapping     -> binary(Ty.tInt())
+	IntNegWrapping     -> unary(Ty.tInt())
+	IntAnd             -> binary(Ty.tInt())
+	IntOr              -> binary(Ty.tInt())
+	IntXor             -> binary(Ty.tInt())
+	IntNot             -> unary(Ty.tInt())
+	IntShl             -> binary(Ty.tInt())
+	IntShr             -> binary(Ty.tInt())
+	IntShrUnsigned     -> binary(Ty.tInt())
+	IntMulHighUnsigned -> binary(Ty.tInt())
+	IntEq              -> relation(Ty.tInt())
+	IntLt              -> relation(Ty.tInt())
+	IntToFloat         -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
+	FloatAdd           -> binary(Ty.tFloat())
+	FloatSub           -> binary(Ty.tFloat())
+	FloatMul           -> binary(Ty.tFloat())
+	FloatDiv           -> binary(Ty.tFloat())
+	FloatNeg           -> unary(Ty.tFloat())
+	FloatTruncate      -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
+	FloatFitsInt       -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
+	FloatBits          -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
+	FloatFromBits      -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
+	FloatIsNaN         -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
+	FloatEq            -> relation(Ty.tFloat())
+	FloatLt            -> relation(Ty.tFloat())
+	FloatLte           -> relation(Ty.tFloat())
+	FloatGt            -> relation(Ty.tFloat())
+	FloatGte           -> relation(Ty.tFloat())
+	Not                -> unary(Ty.tBool())
+	-- Over any type, though only a data type has constructors, so only a
+	-- value of one may be passed.
+	ConstructorIndex -> forall1(fun(a) = TFun([a], Ty.tInt()))
+	-- Over any type, though only a value held as one word may be passed:
+	-- the instances of `Object` are for exactly those.
+	Identical -> forall1(fun(a) = TFun([a, a], Ty.tBool()))
 }
 
 fun load(t : Type) -> Scheme = Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], t))
 
 fun store(t : Type) -> Scheme =
-    Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), t], Ty.tUnit()))
+	Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), t], Ty.tUnit()))
 
 fun unary(t : Type) -> Scheme = Ty.mono(TFun([t], t))
 

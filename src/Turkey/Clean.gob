@@ -38,136 +38,139 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Inst(..), Func(..))
 --- traced value after that would leave a map naming a value no instruction
 --- stores. Before the analysis there is nothing to disagree with.
 fun eliminateCopies[Inst i](f : Func i, traced : Bool) -> Unit {
-    let aliases = Array.filled(len(f.reps), -1)
-    var found = False
-    for block in f.blocks {
-        for inst in block.insts {
-            match copyOf(inst) {
-                Some((d, s)) -> {
-                    let r = Ssa.repOf(f, d)
-                    if r == Ssa.repOf(f, s) && (traced || !r.traced) {
-                        aliases[Ssa.valueId(d)] = Ssa.valueId(s)
-                        found = True
-                    }
-                }
-                None -> {}
-            }
-        }
-    }
-    -- The block parameter rule is the one Braun et al. use to remove a
-    -- trivial phi, and it is sound for the same reason: the one value passed
-    -- reaches the block along every edge, so it dominates the block, so it
-    -- dominates every use of the parameter.
-    let jumps = jumpsInto(f)
-    var changed = True
-    while changed {
-        changed = False
-        for var b = 0; b < len(f.blocks); b = b + 1 {
-            let params = f.blocks[b].params
-            for var k = 0; k < len(params); k = k + 1 {
-                let p = Ssa.valueId(params[k])
-                if aliases[p] >= 0 { continue }
-                if !traced && Ssa.repOf(f, params[k]).traced { continue }
-                var unique = -1
-                var multiple = False
-                for pred in jumps[b] {
-                    match f.blocks[pred].term {
-                        Jump(_, args) -> {
-                            let v = resolve(aliases, Ssa.valueId(args[k]))
-                            if v != p {
-                                if unique < 0 { unique = v }
-                                else if unique != v { multiple = True }
-                            }
-                        }
-                        _ -> {}
-                    }
-                }
-                if unique >= 0 && !multiple {
-                    aliases[p] = unique
-                    changed = True
-                    found = True
-                }
-            }
-        }
-    }
-    if !found { return }
-    -- A copy's source holds what the copy held, from where the copy was.
-    if len(f.holds) > 0 {
-        let kept = fun(v : Value) = aliases[Ssa.valueId(v)] < 0
-        let at = Map.new()
-        for block in f.blocks {
-            for p in block.params {
-                if aliases[Ssa.valueId(p)] >= 0 { Map.put(at, Ssa.valueId(p), Ssa.anchorAt(block, 0, kept)) }
-            }
-            for var i = 0; i < len(block.insts); i = i + 1 {
-                if let Some((d, _)) = copyOf(block.insts[i]) {
-                    if aliases[Ssa.valueId(d)] >= 0 {
-                        Map.put(at, Ssa.valueId(d), Ssa.anchorAt(block, i, kept))
-                    }
-                }
-            }
-        }
-        for id in Map.keys(f.holds) {
-            if aliases[id] >= 0 {
-                Ssa.carryHolds(f, id, resolve(aliases, id), Map.getOr(at, id, None))
-            }
-        }
-    }
-    let rename = fun(v : Value) -> Value = Value(resolve(aliases, Ssa.valueId(v)))
-    let keep = Array.map(f.blocks, fun(block) =
-        Array.map(block.params, \aliases[Ssa.valueId(_)] < 0))
-    for block in f.blocks {
-        block.params = Vec.filter(block.params, \aliases[Ssa.valueId(_)] < 0)
-        let kept = []
-        for inst in block.insts {
-            let renamed = match copyOf(inst) {
-                Some((d, _)) -> aliases[Ssa.valueId(d)] >= 0
-                None -> False
-            }
-            if !renamed { Vec.push(kept, renameUses(inst, rename)) }
-        }
-        block.insts = kept
-        block.term = renameTerm(block.term, rename, keep)
-    }
+	let aliases = Array.filled(len(f.reps), -1)
+	var found = False
+	for block in f.blocks {
+		for inst in block.insts {
+			match copyOf(inst) {
+				Some((d, s)) -> {
+					let r = Ssa.repOf(f, d)
+					if r == Ssa.repOf(f, s) && (traced || !r.traced) {
+						aliases[Ssa.valueId(d)] = Ssa.valueId(s)
+						found = True
+					}
+				}
+				None -> {}
+			}
+		}
+	}
+	-- The block parameter rule is the one Braun et al. use to remove a
+	-- trivial phi, and it is sound for the same reason: the one value passed
+	-- reaches the block along every edge, so it dominates the block, so it
+	-- dominates every use of the parameter.
+	let jumps = jumpsInto(f)
+	var changed = True
+	while changed {
+		changed = False
+		for var b = 0; b < len(f.blocks); b = b + 1 {
+			let params = f.blocks[b].params
+			for var k = 0; k < len(params); k = k + 1 {
+				let p = Ssa.valueId(params[k])
+				if aliases[p] >= 0 { continue }
+				if !traced && Ssa.repOf(f, params[k]).traced { continue }
+				var unique = -1
+				var multiple = False
+				for pred in jumps[b] {
+					match f.blocks[pred].term {
+						Jump(_, args) -> {
+							let v = resolve(aliases, Ssa.valueId(args[k]))
+							if v != p {
+								if unique < 0 { unique = v } else if unique != v { multiple = True }
+							}
+						}
+						_ -> {}
+					}
+				}
+				if unique >= 0 && !multiple {
+					aliases[p] = unique
+					changed = True
+					found = True
+				}
+			}
+		}
+	}
+	if !found { return }
+	-- A copy's source holds what the copy held, from where the copy was.
+	if len(f.holds) > 0 {
+		let kept = fun(v : Value) = aliases[Ssa.valueId(v)] < 0
+		let at = Map.new()
+		for block in f.blocks {
+			for p in block.params {
+				if aliases[Ssa.valueId(p)] >= 0 {
+					Map.put(at, Ssa.valueId(p), Ssa.anchorAt(block, 0, kept))
+				}
+			}
+			for var i = 0; i < len(block.insts); i = i + 1 {
+				if let Some((d, _)) = copyOf(block.insts[i]) {
+					if aliases[Ssa.valueId(d)] >= 0 {
+						Map.put(at, Ssa.valueId(d), Ssa.anchorAt(block, i, kept))
+					}
+				}
+			}
+		}
+		for id in Map.keys(f.holds) {
+			if aliases[id] >= 0 {
+				Ssa.carryHolds(f, id, resolve(aliases, id), Map.getOr(at, id, None))
+			}
+		}
+	}
+	let rename = fun(v : Value) -> Value = Value(resolve(aliases, Ssa.valueId(v)))
+	let keep = Array.map(
+		f.blocks,
+		fun(block) = Array.map(block.params, \aliases[Ssa.valueId(_)] < 0),
+	)
+	for block in f.blocks {
+		block.params = Vec.filter(block.params, \aliases[Ssa.valueId(_)] < 0)
+		let kept = []
+		for inst in block.insts {
+			let renamed = match copyOf(inst) {
+				Some((d, _)) -> aliases[Ssa.valueId(d)] >= 0
+				None         -> False
+			}
+			if !renamed { Vec.push(kept, renameUses(inst, rename)) }
+		}
+		block.insts = kept
+		block.term = renameTerm(block.term, rename, keep)
+	}
 }
 
 fun resolve(aliases : Array Int, id : Int) -> Int {
-    var v = id
-    while aliases[v] >= 0 { v = aliases[v] }
-    v
+	var v = id
+	while aliases[v] >= 0 { v = aliases[v] }
+	v
 }
 
 -- For each block, the blocks that jump to it. A branch carries no arguments,
 -- so it is never a source of a parameter's value.
 fun jumpsInto(f : Func i) -> Array (Vec Int) {
-    let out : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        match f.blocks[b].term {
-            Jump(target, _) -> Vec.push(out[Ssa.blockId(target)], b)
-            _ -> {}
-        }
-    }
-    out
+	let out : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		match f.blocks[b].term {
+			Jump(target, _) -> Vec.push(out[Ssa.blockId(target)], b)
+			_               -> {}
+		}
+	}
+	out
 }
 
 -- A terminator reading renamed values, and passing only the arguments whose
 -- parameters `keep` says survive.
-fun renameTerm(t : Term, rename : fun(Value) -> Value,
-               keep : Array (Array Bool)) -> Term = match t {
-    Ret(vs) -> Ret(Vec.map(vs, rename))
-    Jump(target, args) -> {
-        let flags = keep[Ssa.blockId(target)]
-        let passed = []
-        for var k = 0; k < len(args); k = k + 1 {
-            if flags[k] { Vec.push(passed, rename(args[k])) }
-        }
-        Jump(target, passed)
-    }
-    Branch(c, yes, no) -> Branch(rename(c), yes, no)
-    Switch(v, cases, default) -> Switch(rename(v), cases, default)
-    Panic(v) -> Panic(rename(v))
-    Unreachable -> Unreachable
-}
+fun renameTerm(t : Term, rename : fun(Value) -> Value, keep : Array (Array Bool)) -> Term =
+	match t {
+		Ret(vs) -> Ret(Vec.map(vs, rename))
+		Jump(target, args) -> {
+			let flags = keep[Ssa.blockId(target)]
+			let passed = []
+			for var k = 0; k < len(args); k = k + 1 {
+				if flags[k] { Vec.push(passed, rename(args[k])) }
+			}
+			Jump(target, passed)
+		}
+		Branch(c, yes, no)        -> Branch(rename(c), yes, no)
+		Switch(v, cases, default) -> Switch(rename(v), cases, default)
+		Panic(v)                  -> Panic(rename(v))
+		Unreachable               -> Unreachable
+	}
 
 -- -- dead code -----------------------------------------------------------------------
 
@@ -186,74 +189,73 @@ fun renameTerm(t : Term, rename : fun(Value) -> Value,
 --- a root that is not there. After selection a call is not deletable, so no
 --- safepoint is ever removed there.
 fun eliminateDead[Inst i](f : Func i) -> Unit {
-    let count = len(f.reps)
-    -- Where each value is defined: a block and an instruction index, or a
-    -- block and -1 - k for its parameter k. A function parameter is -1.
-    let defBlock = Array.filled(count, -1)
-    let defAt = Array.filled(count, 0)
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let block = f.blocks[b]
-        for var k = 0; k < len(block.params); k = k + 1 {
-            defBlock[Ssa.valueId(block.params[k])] = b
-            defAt[Ssa.valueId(block.params[k])] = -1 - k
-        }
-        for var n = 0; n < len(block.insts); n = n + 1 {
-            Ssa.eachDef(block.insts[n], fun(v) {
-                defBlock[Ssa.valueId(v)] = b
-                defAt[Ssa.valueId(v)] = n
-            })
-        }
-    }
-    let live = Array.filled(count, False)
-    let work = []
-    let mark = fun(v : Value) -> Unit {
-        let id = Ssa.valueId(v)
-        if !live[id] {
-            live[id] = True
-            Vec.push(work, id)
-        }
-    }
-    for block in f.blocks {
-        for inst in block.insts {
-            if !Ssa.deletable(effects(inst)) { Ssa.eachUse(inst, mark) }
-        }
-        match block.term {
-            Jump(_, _) -> {}
-            t -> for v in Ssa.termUses(t) { mark(v) }
-        }
-    }
-    let jumps = jumpsInto(f)
-    while len(work) > 0 {
-        let id = work[len(work) - 1]
-        let _ = Vec.pop(work)
-        let b = defBlock[id]
-        if b < 0 { continue }
-        let at = defAt[id]
-        if at >= 0 {
-            Ssa.eachUse(f.blocks[b].insts[at], mark)
-        } else {
-            let k = -1 - at
-            for pred in jumps[b] {
-                match f.blocks[pred].term {
-                    Jump(_, args) -> mark(args[k])
-                    _ -> {}
-                }
-            }
-        }
-    }
-    let keep = Array.map(f.blocks, fun(block) =
-        Array.map(block.params, \live[Ssa.valueId(_)]))
-    let same = fun(v : Value) -> Value = v
-    for block in f.blocks {
-        block.params = Vec.filter(block.params, \live[Ssa.valueId(_)])
-        block.insts = Vec.filter(block.insts, \needed(live, _))
-        block.term = renameTerm(block.term, same, keep)
-    }
+	let count = len(f.reps)
+	-- Where each value is defined: a block and an instruction index, or a
+	-- block and -1 - k for its parameter k. A function parameter is -1.
+	let defBlock = Array.filled(count, -1)
+	let defAt = Array.filled(count, 0)
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let block = f.blocks[b]
+		for var k = 0; k < len(block.params); k = k + 1 {
+			defBlock[Ssa.valueId(block.params[k])] = b
+			defAt[Ssa.valueId(block.params[k])] = -1 - k
+		}
+		for var n = 0; n < len(block.insts); n = n + 1 {
+			Ssa.eachDef(block.insts[n], fun(v) {
+				defBlock[Ssa.valueId(v)] = b
+				defAt[Ssa.valueId(v)] = n
+			})
+		}
+	}
+	let live = Array.filled(count, False)
+	let work = []
+	let mark = fun(v : Value) -> Unit {
+		let id = Ssa.valueId(v)
+		if !live[id] {
+			live[id] = True
+			Vec.push(work, id)
+		}
+	}
+	for block in f.blocks {
+		for inst in block.insts {
+			if !Ssa.deletable(effects(inst)) { Ssa.eachUse(inst, mark) }
+		}
+		match block.term {
+			Jump(_, _) -> {}
+			t          -> for v in Ssa.termUses(t) { mark(v) }
+		}
+	}
+	let jumps = jumpsInto(f)
+	while len(work) > 0 {
+		let id = work[len(work) - 1]
+		let _ = Vec.pop(work)
+		let b = defBlock[id]
+		if b < 0 { continue }
+		let at = defAt[id]
+		if at >= 0 {
+			Ssa.eachUse(f.blocks[b].insts[at], mark)
+		} else {
+			let k = -1 - at
+			for pred in jumps[b] {
+				match f.blocks[pred].term {
+					Jump(_, args) -> mark(args[k])
+					_             -> {}
+				}
+			}
+		}
+	}
+	let keep = Array.map(f.blocks, fun(block) = Array.map(block.params, \live[Ssa.valueId(_)]))
+	let same = fun(v : Value) -> Value = v
+	for block in f.blocks {
+		block.params = Vec.filter(block.params, \live[Ssa.valueId(_)])
+		block.insts = Vec.filter(block.insts, \needed(live, _))
+		block.term = renameTerm(block.term, same, keep)
+	}
 }
 
 fun needed[Inst i](live : Array Bool, inst : i) -> Bool {
-    if !Ssa.deletable(effects(inst)) { return True }
-    anyDef(inst, fun(v) = live[Ssa.valueId(v)])
+	if !Ssa.deletable(effects(inst)) { return True }
+	anyDef(inst, fun(v) = live[Ssa.valueId(v)])
 }
 
 -- -- blocks --------------------------------------------------------------------------
@@ -267,46 +269,51 @@ fun needed[Inst i](live : Array Bool, inst : i) -> Bool {
 --- Blocks are renumbered, like `Ssa.pruneUnreachable`, so this runs before
 --- anything records a `BlockId`.
 fun mergeBlocks[Inst i](f : Func i) -> Func i {
-    -- Lowering makes these chains -- a block per statement, a block for each
-    -- value a `match` or an `if` delivers -- and a chain of fallthroughs costs
-    -- no instructions, but it keeps apart what a later pass reads as one: a
-    -- comparison in one block and the branch on it in the next cannot become
-    -- one conditional branch.
-    let preds = Ssa.predecessors(f)
-    var merged = False
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        var going = True
-        while going {
-            going = False
-            match f.blocks[b].term {
-                Jump(target, args) -> {
-                    let t = Ssa.blockId(target)
-                    if t != b && t != Ssa.blockId(f.entry) && len(args) == 0
-                            && len(preds[t]) == 1
-                            && len(f.blocks[t].params) == 0 {
-                        let into = f.blocks[b]
-                        let from = f.blocks[t]
-                        for inst in from.insts { Vec.push(into.insts, inst) }
-                        into.term = from.term
-                        into.termAt = from.termAt
-                        from.insts = []
-                        from.term = Unreachable
-                        from.termAt = 0
-                        -- The merged block's successors are now reached from
-                        -- `b`, so a later merge through one of them still sees
-                        -- exactly one predecessor.
-                        for s in Ssa.successors(into.term) {
-                            let at = Ssa.blockId(s)
-                            preds[at] = Vec.map(preds[at], fun(p) =
-                                if Ssa.blockId(p) == t { BlockId(b) } else { p })
-                        }
-                        merged = True
-                        going = True
-                    }
-                }
-                _ -> {}
-            }
-        }
-    }
-    if merged { Ssa.pruneUnreachable(f) } else { f }
+	-- Lowering makes these chains -- a block per statement, a block for each
+	-- value a `match` or an `if` delivers -- and a chain of fallthroughs costs
+	-- no instructions, but it keeps apart what a later pass reads as one: a
+	-- comparison in one block and the branch on it in the next cannot become
+	-- one conditional branch.
+	let preds = Ssa.predecessors(f)
+	var merged = False
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		var going = True
+		while going {
+			going = False
+			match f.blocks[b].term {
+				Jump(target, args) -> {
+					let t = Ssa.blockId(target)
+					if t != b
+							&& t != Ssa.blockId(f.entry)
+							&& len(args) == 0
+							&& len(preds[t]) == 1
+							&& len(f.blocks[t].params) == 0 {
+						let into = f.blocks[b]
+						let from = f.blocks[t]
+						for inst in from.insts { Vec.push(into.insts, inst) }
+						into.term = from.term
+						into.termAt = from.termAt
+						from.insts = []
+						from.term = Unreachable
+						from.termAt = 0
+						-- The merged block's successors are now reached from
+						-- `b`, so a later merge through one of them still sees
+						-- exactly one predecessor.
+						for s in Ssa.successors(into.term) {
+							let at = Ssa.blockId(s)
+							preds[at] = Vec.map(preds[at], fun(p) = if Ssa.blockId(p) == t {
+								BlockId(b)
+							} else {
+								p
+							})
+						}
+						merged = True
+						going = True
+					}
+				}
+				_ -> {}
+			}
+		}
+	}
+	if merged { Ssa.pruneUnreachable(f) } else { f }
 }

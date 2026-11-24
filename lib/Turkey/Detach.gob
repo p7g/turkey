@@ -55,42 +55,45 @@ type Pending a : !Debug = Pending { var waiter : Option Poll.Waiter, var value :
 --- so that the helper's thread may lose its permit while it waits. `cleanup`
 --- runs on the helper, and may make such calls too.
 fun run(call : fun() -> a, cleanup : fun(a) -> Unit, deadline : Int) -> Either Int a {
-    let pending = Pending { waiter = None, value = None }
-    let program = Option.isNone(Co.running())
-    -- Made here rather than under the lock, since a stack is mapped for it.
-    let helper = Co.new(fun() = help(pending, call, cleanup, program))
-    let outcome = Wait.parkApart(fun(timer) {
-        let w = Wait.sleeper(timer)
-        pending.waiter = Some(w)
-        Scheduler.ready(helper)
-        w
-    }, deadline)
-    if outcome != 0 { return Left(outcome) }
-    if let Some(value) = pending.value {
-        Right(value)
-    } else {
-        error("a detached call ended its wait without a result")
-    }
+	let pending = Pending { waiter = None, value = None }
+	let program = Option.isNone(Co.running())
+	-- Made here rather than under the lock, since a stack is mapped for it.
+	let helper = Co.new(fun() = help(pending, call, cleanup, program))
+	let outcome = Wait.parkApart(
+		fun(timer) {
+			let w = Wait.sleeper(timer)
+			pending.waiter = Some(w)
+			Scheduler.ready(helper)
+			w
+		},
+		deadline,
+	)
+	if outcome != 0 { return Left(outcome) }
+	if let Some(value) = pending.value {
+		Right(value)
+	} else {
+		error("a detached call ended its wait without a result")
+	}
 }
 
 fun help(pending : Pending a, call : fun() -> a, cleanup : fun(a) -> Unit, program : Bool) -> Unit {
-    let value = call()
-    -- The race between the call's return and the caller's leaving is
-    -- decided here. The waiter leaves `Waiting` once, under the poller's
-    -- lock: by this `complete`, or at the deadline (`Turkey.Poll.expire` for
-    -- a task, `timeOut` in `Turkey.Wait.sleepApart`). The value is stored
-    -- before, and the caller reads it only once it has seen `Ready` under
-    -- that lock, so if this moved the waiter the caller takes it. If the
-    -- deadline moved it, the caller has left or is leaving without reading
-    -- `value`, so the cleanup here is the only one.
-    pending.value = Some(value)
-    Scheduler.lock()
-    let w = if let Some(w) = pending.waiter {
-        w
-    } else {
-        error("a helper ran before it was queued")
-    }
-    let taken = Wait.complete(w, program)
-    Scheduler.unlock()
-    if !taken { cleanup(value) }
+	let value = call()
+	-- The race between the call's return and the caller's leaving is
+	-- decided here. The waiter leaves `Waiting` once, under the poller's
+	-- lock: by this `complete`, or at the deadline (`Turkey.Poll.expire` for
+	-- a task, `timeOut` in `Turkey.Wait.sleepApart`). The value is stored
+	-- before, and the caller reads it only once it has seen `Ready` under
+	-- that lock, so if this moved the waiter the caller takes it. If the
+	-- deadline moved it, the caller has left or is leaving without reading
+	-- `value`, so the cleanup here is the only one.
+	pending.value = Some(value)
+	Scheduler.lock()
+	let w = if let Some(w) = pending.waiter {
+		w
+	} else {
+		error("a helper ran before it was queued")
+	}
+	let taken = Wait.complete(w, program)
+	Scheduler.unlock()
+	if !taken { cleanup(value) }
 }

@@ -59,15 +59,15 @@ import Turkey.Ptr as Ptr
 
 --- A fresh, unlocked lock; a panic if there is no memory for one.
 fun new() -> Ptr {
-    let lock = Os.malloc(24)
-    if Ptr.isNull(lock) {
-        Process.panic(Prim.cString("could not make a lock"))
-        return lock
-    }
-    Ptr.atomicStore(lock, 16, 0)
-    Ptr.atomicStore(lock, 8, 0)
-    Ptr.atomicStore(lock, 0, 0)
-    lock
+	let lock = Os.malloc(24)
+	if Ptr.isNull(lock) {
+		Process.panic(Prim.cString("could not make a lock"))
+		return lock
+	}
+	Ptr.atomicStore(lock, 16, 0)
+	Ptr.atomicStore(lock, 8, 0)
+	Ptr.atomicStore(lock, 0, 0)
+	lock
 }
 
 --- Take `lock` if no thread holds it: True if this one now does.
@@ -77,56 +77,57 @@ fun tryAcquire(lock : Ptr) -> Bool = Ptr.atomicCas(lock, 0, 0, 1) == 0
 --- thread that takes a lock it holds waits forever, and on wasm32-wasi, where
 --- that thread is the only one, ends the program instead.
 fun acquire(lock : Ptr) -> Unit {
-    if !tryAcquire(lock) { contended(lock) }
+	if !tryAcquire(lock) { contended(lock) }
 }
 
 fun contended(lock : Ptr) -> Unit {
-    -- With one thread, the holder is the thread asking, which no wait could
-    -- ever release. Fatal rather than a panic: a panic would return without
-    -- the lock, into a critical section an outer frame is partway through.
-    if let Wasi = Target.os {
-        let message = Prim.cString("turkey: deadlock: a lock is taken again by the thread that holds it\n")
-        let _ = Os.write(2, message, Os.strlen(message))
-        Os.exitNow(2)
-        return
-    }
-    -- Reading rather than swapping, so that waiting threads do not take the
-    -- cache line from the one that holds it.
-    for var i = 0; i < 100; i = Int.addWrapping(i, 1) {
-        if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
-    }
-    for var i = 0; i < 4; i = Int.addWrapping(i, 1) {
-        let _ = Os.schedYield()
-        if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
-    }
-    while True {
-        let _ = Ptr.atomicAdd(lock, 8, 1)
-        if tryAcquire(lock) {
-            let _ = Ptr.atomicAdd(lock, 8, -1)
-            return
-        }
-        wait(lock, 1)
-        -- Awake, so a release may wake another.
-        Ptr.atomicStore(lock, 16, 0)
-        let _ = Ptr.atomicAdd(lock, 8, -1)
-        if tryAcquire(lock) { return }
-    }
+	-- With one thread, the holder is the thread asking, which no wait could
+	-- ever release. Fatal rather than a panic: a panic would return without
+	-- the lock, into a critical section an outer frame is partway through.
+	if let Wasi = Target.os {
+		let message = Prim.cString("turkey: deadlock: a lock is taken again by the thread that holds it\n")
+		let _ = Os.write(2, message, Os.strlen(message))
+		Os.exitNow(2)
+		return
+	}
+	-- Reading rather than swapping, so that waiting threads do not take the
+	-- cache line from the one that holds it.
+	for var i = 0; i < 100; i = Int.addWrapping(i, 1) {
+		if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
+	}
+	for var i = 0; i < 4; i = Int.addWrapping(i, 1) {
+		let _ = Os.schedYield()
+		if Ptr.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return }
+	}
+	while True {
+		let _ = Ptr.atomicAdd(lock, 8, 1)
+		if tryAcquire(lock) {
+			let _ = Ptr.atomicAdd(lock, 8, -1)
+			return
+		}
+		wait(lock, 1)
+		-- Awake, so a release may wake another.
+		Ptr.atomicStore(lock, 16, 0)
+		let _ = Ptr.atomicAdd(lock, 8, -1)
+		if tryAcquire(lock) { return }
+	}
 }
 
 fun release(lock : Ptr) -> Unit {
-    Ptr.atomicStore(lock, 0, 0)
-    -- The flag is set only while a wake-up is on its way to a sleeper. A wake
-    -- that found nobody asleep -- a counted thread not yet in the kernel's
-    -- wait -- clears it again, and then looks once more: a release in between
-    -- saw the flag set and woke nobody, and the thread it skipped may have
-    -- gone to sleep since, behind a holder who has released too. So while the
-    -- lock is free and someone is counted, a release keeps trying until a
-    -- wake finds a sleeper or another release takes the job over.
-    while Ptr.atomicLoad(lock, 8) != 0 && Ptr.atomicLoad(lock, 0) == 0
-            && Ptr.atomicCas(lock, 16, 0, 1) == 0 {
-        if wake(lock) { return }
-        Ptr.atomicStore(lock, 16, 0)
-    }
+	Ptr.atomicStore(lock, 0, 0)
+	-- The flag is set only while a wake-up is on its way to a sleeper. A wake
+	-- that found nobody asleep -- a counted thread not yet in the kernel's
+	-- wait -- clears it again, and then looks once more: a release in between
+	-- saw the flag set and woke nobody, and the thread it skipped may have
+	-- gone to sleep since, behind a holder who has released too. So while the
+	-- lock is free and someone is counted, a release keeps trying until a
+	-- wake finds a sleeper or another release takes the job over.
+	while Ptr.atomicLoad(lock, 8) != 0
+			&& Ptr.atomicLoad(lock, 0) == 0
+			&& Ptr.atomicCas(lock, 16, 0, 1) == 0 {
+		if wake(lock) { return }
+		Ptr.atomicStore(lock, 16, 0)
+	}
 }
 
 -- -- sleeping on a word ----------------------------------------------------------------
@@ -138,50 +139,50 @@ fun release(lock : Ptr) -> Unit {
 --- Sleep while the word at `word` holds `value`. May return early -- a
 --- signal, or a wake meant for another -- so the caller tests again.
 fun wait(word : Ptr, value : Int) -> Unit = match Target.os {
-    Darwin -> { let _ = Libc.osSyncWaitOnAddress(word, value, 8, 0) }
-    -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
-    -- value waited on here fits in them, and the high ones stay zero.
-    Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Ptr.null()) }
-    -- One thread, so nothing else could change the word: return, and the
-    -- caller tests again.
-    Wasi -> {}
+	Darwin -> { let _ = Libc.osSyncWaitOnAddress(word, value, 8, 0) }
+	-- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
+	-- value waited on here fits in them, and the high ones stay zero.
+	Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Ptr.null()) }
+	-- One thread, so nothing else could change the word: return, and the
+	-- caller tests again.
+	Wasi -> {}
 }
 
 --- `wait`, for at most `nanoseconds`, which is more than 0. Returns when the
 --- time runs out, too, which the caller tells from a wake by the clock.
 fun waitFor(word : Ptr, value : Int, nanoseconds : Int) -> Unit = match Target.os {
-    -- `OS_CLOCK_MACH_ABSOLUTE_TIME`, the one clock it takes.
-    Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
-    -- A relative `struct timespec`, in storage of its own: threads wait at once.
-    Linux -> {
-        let timespec = Os.malloc(16)
-        if Ptr.isNull(timespec) { return wait(word, value) }
-        Ptr.store(timespec, 0, nanoseconds / 1000000000)
-        Ptr.store(timespec, 8, nanoseconds % 1000000000)
-        let _ = Libc.syscall(futex(), word, 128, value, timespec)
-        Os.free(timespec)
-    }
-    Wasi -> {}
+	-- `OS_CLOCK_MACH_ABSOLUTE_TIME`, the one clock it takes.
+	Darwin -> { let _ = Libc.osSyncWaitOnAddressWithTimeout(word, value, 8, 0, 32, nanoseconds) }
+	-- A relative `struct timespec`, in storage of its own: threads wait at once.
+	Linux -> {
+		let timespec = Os.malloc(16)
+		if Ptr.isNull(timespec) { return wait(word, value) }
+		Ptr.store(timespec, 0, nanoseconds / 1000000000)
+		Ptr.store(timespec, 8, nanoseconds % 1000000000)
+		let _ = Libc.syscall(futex(), word, 128, value, timespec)
+		Os.free(timespec)
+	}
+	Wasi -> {}
 }
 
 --- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
 --- answers 0 having woken one and -1 (`ENOENT`) having found none; Linux, how
 --- many it woke.
 fun wake(word : Ptr) -> Bool = match Target.os {
-    Darwin -> Libc.osSyncWakeByAddressAny(word, 8, 0) & 0xFFFF_FFFF == 0
-    Linux -> {
-        let woken = Libc.syscall(futex(), word, 129, 1, Ptr.null()) & 0xFFFF_FFFF
-        woken > 0 && woken < 0x8000_0000
-    }
-    -- No other thread to be sleeping.
-    Wasi -> False
+	Darwin -> Libc.osSyncWakeByAddressAny(word, 8, 0) & 0xFFFF_FFFF == 0
+	Linux -> {
+		let woken = Libc.syscall(futex(), word, 129, 1, Ptr.null()) & 0xFFFF_FFFF
+		woken > 0 && woken < 0x8000_0000
+	}
+	-- No other thread to be sleeping.
+	Wasi -> False
 }
 
 --- Wake every thread sleeping on `word`.
 fun wakeAll(word : Ptr) -> Unit = match Target.os {
-    Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
-    Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Ptr.null()) }
-    Wasi -> {}
+	Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
+	Linux  -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Ptr.null()) }
+	Wasi   -> {}
 }
 
 -- `SYS_futex` on arm64 Linux.

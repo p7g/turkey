@@ -28,171 +28,182 @@ import Turkey.Types (TVar, TFun)
 type Dictionaries = Map String CBind
 
 fun dictionaries(binds : Vec CBind) -> Dictionaries {
-    let out = Map.new()
-    for b in binds {
-        if !b.mutable && isDictionary(resultOf(b.ty)) {
-            match recordOf(b) {
-                Some(_) -> Map.put(out, b.name, b)
-                None -> {}
-            }
-        }
-    }
-    out
+	let out = Map.new()
+	for b in binds {
+		if !b.mutable && isDictionary(resultOf(b.ty)) {
+			match recordOf(b) {
+				Some(_) -> Map.put(out, b.name, b)
+				None    -> {}
+			}
+		}
+	}
+	out
 }
 
 fun resultOf(t : Ty.Type) -> Ty.Type = match Ty.prune(t) {
-    TFun(_, r) -> r
-    other -> other
+	TFun(_, r) -> r
+	other      -> other
 }
 
 -- A dictionary's context parameters and slots.
 fun recordOf(b : CBind) -> Option (Array CParam, Array Core) =
-    match b.value.kind {
-        CDict(_, slots) -> Some(([], slots))
-        CLam(params, body, _) -> match body.kind {
-            CDict(_, slots) -> Some((params, slots))
-            _ -> None
-        }
-        _ -> None
-    }
+	match b.value.kind {
+		CDict(_, slots) -> Some(([], slots))
+		CLam(params, body, _) -> match body.kind {
+			CDict(_, slots) -> Some((params, slots))
+			_               -> None
+		}
+		_ -> None
+	}
 
 --- A name or a primitive, applied to types or to names. What a field may hold for this rule
 --- to read it: copying one duplicates no evaluation.
 fun isAtom(e : Core) -> Bool = match e.kind {
-    CVar(_) -> True
-    CPrim(_) -> True
-    CTyApp(f, _) -> isAtom(f)
-    CApp(f, args) -> {
-        if !isAtom(f) { return False }
-        for a in args {
-            match a.kind {
-                CVar(_) -> {}
-                _ -> return False
-            }
-        }
-        True
-    }
-    _ -> False
+	CVar(_)      -> True
+	CPrim(_)     -> True
+	CTyApp(f, _) -> isAtom(f)
+	CApp(f, args) -> {
+		if !isAtom(f) { return False }
+		for a in args {
+			match a.kind {
+				CVar(_) -> {}
+				_       -> return False
+			}
+		}
+		True
+	}
+	_ -> False
 }
 
 --- The atom a projection reads, instantiated: `e` is the projection, `own` the
 --- method's own type arguments where the projection is applied to some, and
 --- `ty` the type the answer is used at.
-fun knownField(dicts : Dictionaries, e : Core, own : Array Ty.Type,
-               ty : Ty.Type) -> Option Core = match e.kind {
-    CSlot(target, field) -> match target.kind {
-        CVar(BySpelling(g)) -> readField(dicts, g, [], [], field, own, ty)
-        CTyApp(dict, types) -> match dict.kind {
-            CVar(BySpelling(g)) -> readField(dicts, g, types, [], field, own, ty)
-            _ -> None
-        }
-        CApp(applied, args) -> match applied.kind {
-            CVar(BySpelling(g)) -> readField(dicts, g, [], args, field, own, ty)
-            CTyApp(dict, types) -> match dict.kind {
-                CVar(BySpelling(g)) -> readField(dicts, g, types, args, field, own, ty)
-                _ -> None
-            }
-            _ -> None
-        }
-        _ -> None
-    }
-    _ -> None
-}
+fun knownField(dicts : Dictionaries, e : Core, own : Array Ty.Type, ty : Ty.Type) -> Option Core =
+	match e.kind {
+		CSlot(target, field) -> match target.kind {
+			CVar(BySpelling(g)) -> readField(dicts, g, [], [], field, own, ty)
+			CTyApp(dict, types) -> match dict.kind {
+				CVar(BySpelling(g)) -> readField(dicts, g, types, [], field, own, ty)
+				_                   -> None
+			}
+			CApp(applied, args) -> match applied.kind {
+				CVar(BySpelling(g)) -> readField(dicts, g, [], args, field, own, ty)
+				CTyApp(dict, types) -> match dict.kind {
+					CVar(BySpelling(g)) -> readField(dicts, g, types, args, field, own, ty)
+					_                   -> None
+				}
+				_ -> None
+			}
+			_ -> None
+		}
+		_ -> None
+	}
 
-fun readField(dicts : Dictionaries, g : String, types : Array Ty.Type,
-              args : Array Core, field : Int, own : Array Ty.Type,
-              ty : Ty.Type) -> Option Core {
-    let b = match Map.get(dicts, g) {
-        Some(found) -> found
-        None -> return None
-    }
-    let shape = match recordOf(b) {
-        Some(s) -> s
-        None -> return None
-    }
-    let params = shape.0
-    if len(b.binders) != len(types) || len(params) != len(args) { return None }
-    -- The context arguments are copied into the answer, so each must be an atom
-    -- itself; anything else would be evaluated twice, or never.
-    for a in args {
-        if !isAtom(a) { return None }
-    }
-    let value = if field < len(shape.1) { Some(shape.1[field]) } else { None }
-    let typeMap = Map.new()
-    for var i = 0; i < len(types); i = i + 1 {
-        Map.put(typeMap, b.binders[i].id, types[i])
-    }
-    -- The method's own quantification, which the use site supplies. A field
-    -- states it either as a type abstraction, or implicitly, as the variables
-    -- its reference applies the method to beyond the instance's. Either way it
-    -- is read only together with the use site's types: a bare projection of
-    -- such a method is left alone, since reading it would leave the answer
-    -- applied to types twice.
-    let atom = match value {
-        Some(v) -> match v.kind {
-            CTyLam(stated, inner) -> {
-                if len(stated) != len(own) || !isAtom(inner) { return None }
-                for var i = 0; i < len(own); i = i + 1 {
-                    Map.put(typeMap, stated[i].id, own[i])
-                }
-                inner
-            }
-            _ -> if isAtom(v) { v } else { return None }
-        }
-        None -> return None
-    }
-    let applied = match typeArgsOf(atom) {
-        Some(ts) -> len(ts)
-        None -> 0
-    }
-    let implicit = match value {
-        Some(v) -> match v.kind {
-            CTyLam(_, _) -> False
-            _ -> True
-        }
-        None -> False
-    }
-    if implicit {
-        if applied > len(b.binders) + len(own) { return None }
-        if len(own) > 0 {
-            let ts = match typeArgsOf(atom) {
-                Some(found) -> found
-                None -> return None
-            }
-            if len(ts) != len(b.binders) + len(own) { return None }
-            for var i = 0; i < len(own); i = i + 1 {
-                match Ty.prune(ts[len(b.binders) + i]) {
-                    TVar(cell) -> Map.put(typeMap, cell.id, own[i])
-                    _ -> return None
-                }
-            }
-        }
-    }
-    let nameMap = Map.new()
-    for var i = 0; i < len(params); i = i + 1 {
-        Map.put(nameMap, refTo(params[i].name, params[i].id), args[i])
-    }
-    let made = instantiate(atom, typeMap, nameMap)
-    Some(mkCore(ty, made.span, made.kind))
+fun readField(
+	dicts : Dictionaries,
+	g : String,
+	types : Array Ty.Type,
+	args : Array Core,
+	field : Int,
+	own : Array Ty.Type,
+	ty : Ty.Type,
+) -> Option Core {
+	let b = match Map.get(dicts, g) {
+		Some(found) -> found
+		None        -> return None
+	}
+	let shape = match recordOf(b) {
+		Some(s) -> s
+		None    -> return None
+	}
+	let params = shape.0
+	if len(b.binders) != len(types) || len(params) != len(args) { return None }
+	-- The context arguments are copied into the answer, so each must be an atom
+	-- itself; anything else would be evaluated twice, or never.
+	for a in args {
+		if !isAtom(a) { return None }
+	}
+	let value = if field < len(shape.1) { Some(shape.1[field]) } else { None }
+	let typeMap = Map.new()
+	for var i = 0; i < len(types); i = i + 1 {
+		Map.put(typeMap, b.binders[i].id, types[i])
+	}
+	-- The method's own quantification, which the use site supplies. A field
+	-- states it either as a type abstraction, or implicitly, as the variables
+	-- its reference applies the method to beyond the instance's. Either way it
+	-- is read only together with the use site's types: a bare projection of
+	-- such a method is left alone, since reading it would leave the answer
+	-- applied to types twice.
+	let atom = match value {
+		Some(v) -> match v.kind {
+			CTyLam(stated, inner) -> {
+				if len(stated) != len(own) || !isAtom(inner) { return None }
+				for var i = 0; i < len(own); i = i + 1 {
+					Map.put(typeMap, stated[i].id, own[i])
+				}
+				inner
+			}
+			_ -> if isAtom(v) { v } else { return None }
+		}
+		None -> return None
+	}
+	let applied = match typeArgsOf(atom) {
+		Some(ts) -> len(ts)
+		None     -> 0
+	}
+	let implicit = match value {
+		Some(v) -> match v.kind {
+			CTyLam(_, _) -> False
+			_            -> True
+		}
+		None -> False
+	}
+	if implicit {
+		if applied > len(b.binders) + len(own) { return None }
+		if len(own) > 0 {
+			let ts = match typeArgsOf(atom) {
+				Some(found) -> found
+				None        -> return None
+			}
+			if len(ts) != len(b.binders) + len(own) { return None }
+			for var i = 0; i < len(own); i = i + 1 {
+				match Ty.prune(ts[len(b.binders) + i]) {
+					TVar(cell) -> Map.put(typeMap, cell.id, own[i])
+					_          -> return None
+				}
+			}
+		}
+	}
+	let nameMap = Map.new()
+	for var i = 0; i < len(params); i = i + 1 {
+		Map.put(nameMap, refTo(params[i].name, params[i].id), args[i])
+	}
+	let made = instantiate(atom, typeMap, nameMap)
+	Some(mkCore(ty, made.span, made.kind))
 }
 
 -- The type arguments of the name at an atom's head, if it is applied to any.
 fun typeArgsOf(e : Core) -> Option (Array Ty.Type) = match e.kind {
-    CTyApp(_, ts) -> Some(ts)
-    CApp(f, _) -> typeArgsOf(f)
-    _ -> None
+	CTyApp(_, ts) -> Some(ts)
+	CApp(f, _)    -> typeArgsOf(f)
+	_             -> None
 }
 
 fun instantiate(e : Core, types : Map Int Ty.Type, names : Map Ref Core) -> Core =
-    match e.kind {
-        CVar(r) -> match Map.get(names, r) {
-            Some(found) -> found
-            None -> mkCore(substitute(e.ty, types), e.span, CVar(r))
-        }
-        CTyApp(f, ts) -> mkCore(substitute(e.ty, types), e.span,
-            CTyApp(instantiate(f, types, names), Array.map(ts, substitute(_, types))))
-        CApp(f, args) -> mkCore(substitute(e.ty, types), e.span,
-            CApp(instantiate(f, types, names),
-                 Array.map(args, instantiate(_, types, names))))
-        _ -> e
-    }
+	match e.kind {
+		CVar(r) -> match Map.get(names, r) {
+			Some(found) -> found
+			None        -> mkCore(substitute(e.ty, types), e.span, CVar(r))
+		}
+		CTyApp(f, ts) -> mkCore(
+			substitute(e.ty, types),
+			e.span,
+			CTyApp(instantiate(f, types, names), Array.map(ts, substitute(_, types))),
+		)
+		CApp(f, args) -> mkCore(
+			substitute(e.ty, types),
+			e.span,
+			CApp(instantiate(f, types, names), Array.map(args, instantiate(_, types, names))),
+		)
+		_ -> e
+	}

@@ -63,41 +63,47 @@ import Turkey.Types as Ty
 
 -- One module's scope, plus the stack of local frames the walk maintains.
 type R = R {
-    scope      : Scope,
-    -- Innermost last, each mapping a name to the binder it means there. A
-    -- name in any frame is local and is left alone.
-    locals     : Vec (Map String Int),
-    -- The program's operators, as `operators` makes them.
-    operators  : Map String (Group, String),
-    binders    : Binders.Table,
-    -- The owner the locals being walked are minted into.
-    var owner  : Int,
+	scope : Scope
+	-- Innermost last, each mapping a name to the binder it means there. A
+	-- name in any frame is local and is left alone.
+	locals : Vec (Map String Int)
+	-- The program's operators, as `operators` makes them.
+	operators : Map String (Group, String)
+	binders   : Binders.Table
+	-- The owner the locals being walked are minted into.
+	var owner : Int
 }
 
 --- `operators` is the table `operators` makes, and `binders` the one `declare`
 --- filled.
-fun program(scope : Scope, p : Program,
-            operators : Map String (Group, String),
-            binders : Binders.Table) -> Unit {
-    let r = R {
-        scope = scope, locals = Vec.new(4),
-        operators = operators, binders = binders, owner = 0,
-    }
-    -- Each top-level declaration is a unit of diagnostics (`Diag.beginUnit`):
-    -- one undeclared operator in a chain is reported once, not again as a
-    -- precedence error against the placeholder group it was given.
-    for decl in p.decls {
-        Diag.beginUnit()
-        match decl {
-            DStmt(s) -> topLevel(r, s)
-            DType(t) -> typeDecl(r, t)
-            DClass(c) -> classDecl(r, c)
-            DInstance(i) -> instanceDecl(r, i)
-            DForeign(f) -> foreignDecl(r, f)
-            DInfix(_) -> {}
-        }
-        let _ = Diag.endUnit()
-    }
+fun program(
+	scope : Scope,
+	p : Program,
+	operators : Map String (Group, String),
+	binders : Binders.Table,
+) -> Unit {
+	let r = R {
+		scope     = scope
+		locals    = Vec.new(4)
+		operators = operators
+		binders   = binders
+		owner     = 0
+	}
+	-- Each top-level declaration is a unit of diagnostics (`Diag.beginUnit`):
+	-- one undeclared operator in a chain is reported once, not again as a
+	-- precedence error against the placeholder group it was given.
+	for decl in p.decls {
+		Diag.beginUnit()
+		match decl {
+			DStmt(s)     -> topLevel(r, s)
+			DType(t)     -> typeDecl(r, t)
+			DClass(c)    -> classDecl(r, c)
+			DInstance(i) -> instanceDecl(r, i)
+			DForeign(f)  -> foreignDecl(r, f)
+			DInfix(_)    -> {}
+		}
+		let _ = Diag.endUnit()
+	}
 }
 
 --- Every module's top-level functions and class methods, by the internal names
@@ -105,25 +111,25 @@ fun program(scope : Scope, p : Program,
 --- resolved, while every declaration still has the name it was written with,
 --- so that an operator may mean a function from any module it can see.
 fun arities(modules : Vec Module) -> Map String Int {
-    let out = Map.new()
-    for m in modules {
-        for decl in m.program.decls {
-            match decl {
-                DStmt(s) -> match s.kind {
-                    SFun(d) -> Map.put(out, Prelude.internal(m.name, d.name), len(d.params))
-                    _ -> {}
-                }
-                DClass(c) -> {
-                    let cls = Prelude.internal(m.name, c.name)
-                    for meth in c.methods {
-                        Map.put(out, cls + "." + meth.name, len(meth.params))
-                    }
-                }
-                _ -> {}
-            }
-        }
-    }
-    out
+	let out = Map.new()
+	for m in modules {
+		for decl in m.program.decls {
+			match decl {
+				DStmt(s) -> match s.kind {
+					SFun(d) -> Map.put(out, Prelude.internal(m.name, d.name), len(d.params))
+					_       -> {}
+				}
+				DClass(c) -> {
+					let cls = Prelude.internal(m.name, c.name)
+					for meth in c.methods {
+						Map.put(out, cls + "." + meth.name, len(meth.params))
+					}
+				}
+				_ -> {}
+			}
+		}
+	}
+	out
 }
 
 --- Declares in `binders` every primitive, and every module's top-level
@@ -137,89 +143,136 @@ fun arities(modules : Vec Module) -> Map String Int {
 --- own. The walk reads them back through `enter`, so this is the one place
 --- that decides what an owner is.
 fun declare(modules : Vec Module, binders : Binders.Table) -> Unit {
-    for b in Prims.all {
-        let name = Prims.spelling(b)
-        discard(Binders.declare(binders, Binders.owner(binders, "Prim", name), name,
-                                name, Primitive, Builtin))
-    }
-    for m in modules {
-        for decl in m.program.decls {
-            match decl {
-                DStmt(s) -> match s.kind {
-                    SFun(d) -> {
-                        let o = ownerFor(binders, m.name, s.id, d.name)
-                        declareAt(binders, o, d.id, Prelude.internal(m.name, d.name),
-                                  d.name, TopLevel, Written(d.span, False))
-                    }
-                    SLet(pat, _) -> declarePattern(binders, m.name, s.id, pat, False)
-                    SVar(pat, _) -> declarePattern(binders, m.name, s.id, pat, True)
-                    SLetElse(mutable, pat, _, _) ->
-                        declarePattern(binders, m.name, s.id, pat, mutable)
-                    SAssign(_, _) | SExpr(_) ->
-                        discard(ownerFor(binders, m.name, s.id, "%top"))
-                }
-                DClass(c) -> for meth in c.methods {
-                    let member = c.name + "." + meth.name
-                    let o = ownerFor(binders, m.name, meth.id, member)
-                    declareAt(binders, o, meth.id, Prelude.internal(m.name, member),
-                              meth.name, Method, Written(meth.span, False))
-                }
-                DInstance(i) -> for meth in i.methods {
-                    discard(ownerFor(binders, m.name, meth.id,
-                                     "instance " + i.cls + "." + meth.name))
-                }
-                DForeign(f) -> {
-                    let o = ownerFor(binders, m.name, f.id, f.name)
-                    declareAt(binders, o, f.id, Prelude.internal(m.name, f.name), f.name,
-                              TopLevel, Written(f.span, False))
-                }
-                DType(_) | DInfix(_) -> {}
-            }
-        }
-    }
+	for b in Prims.all {
+		let name = Prims.spelling(b)
+		discard(
+			Binders.declare(
+				binders,
+				Binders.owner(binders, "Prim", name),
+				name,
+				name,
+				Primitive,
+				Builtin,
+			),
+		)
+	}
+	for m in modules {
+		for decl in m.program.decls {
+			match decl {
+				DStmt(s) -> match s.kind {
+					SFun(d) -> {
+						let o = ownerFor(binders, m.name, s.id, d.name)
+						declareAt(
+							binders,
+							o,
+							d.id,
+							Prelude.internal(m.name, d.name),
+							d.name,
+							TopLevel,
+							Written(d.span, False),
+						)
+					}
+					SLet(pat, _) -> declarePattern(binders, m.name, s.id, pat, False)
+					SVar(pat, _) -> declarePattern(binders, m.name, s.id, pat, True)
+					SLetElse(mutable, pat, _, _) ->
+						declarePattern(binders, m.name, s.id, pat, mutable)
+					SAssign(_, _) | SExpr(_) ->
+						discard(ownerFor(binders, m.name, s.id, "%top"))
+				}
+				DClass(c) -> for meth in c.methods {
+					let member = c.name + "." + meth.name
+					let o = ownerFor(binders, m.name, meth.id, member)
+					declareAt(
+						binders,
+						o,
+						meth.id,
+						Prelude.internal(m.name, member),
+						meth.name,
+						Method,
+						Written(meth.span, False),
+					)
+				}
+				DInstance(i) -> for meth in i.methods {
+					discard(
+						ownerFor(binders, m.name, meth.id, "instance " + i.cls + "." + meth.name),
+					)
+				}
+				DForeign(f) -> {
+					let o = ownerFor(binders, m.name, f.id, f.name)
+					declareAt(
+						binders,
+						o,
+						f.id,
+						Prelude.internal(m.name, f.name),
+						f.name,
+						TopLevel,
+						Written(f.span, False),
+					)
+				}
+				DType(_) | DInfix(_) -> {}
+			}
+		}
+	}
 }
 
 -- Returns a new owner for the declaration `nodeId` of `moduleName`, after
 -- recording it there.
-fun ownerFor(binders : Binders.Table, moduleName : String, nodeId : Int,
-             hint : String) -> Int {
-    let o = Binders.owner(binders, moduleName, Prelude.internal(moduleName, hint))
-    Binders.ownDeclaration(binders, nodeId, o)
-    o
+fun ownerFor(binders : Binders.Table, moduleName : String, nodeId : Int, hint : String) -> Int {
+	let o = Binders.owner(binders, moduleName, Prelude.internal(moduleName, hint))
+	Binders.ownDeclaration(binders, nodeId, o)
+	o
 }
 
 -- Declares a top-level binder in `o` and records `nodeId` as its binding
 -- occurrence.
-fun declareAt(binders : Binders.Table, o : Int, nodeId : Int, internal : String,
-              short : String, kind : Kind, origin : Origin) -> Unit {
-    let id = Binders.declare(binders, o, internal, short, kind, origin)
-    Binders.record(binders, nodeId, id)
+fun declareAt(
+	binders : Binders.Table,
+	o : Int,
+	nodeId : Int,
+	internal : String,
+	short : String,
+	kind : Kind,
+	origin : Origin,
+) -> Unit {
+	let id = Binders.declare(binders, o, internal, short, kind, origin)
+	Binders.record(binders, nodeId, id)
 }
 
-fun declarePattern(binders : Binders.Table, moduleName : String, stmtId : Int,
-                   pat : Pat, mutable : Bool) -> Unit {
-    let vars = varPatterns(pat)
-    let hint = if len(vars) > 0 { varName(vars[0]) } else { "%top" }
-    let o = ownerFor(binders, moduleName, stmtId, hint)
-    let declared = Map.new()
-    for v in vars {
-        let short = varName(v)
-        let id = Binders.declare(binders, o, Prelude.internal(moduleName, short), short,
-                                 TopLevel, Written(v.span, mutable))
-        Binders.record(binders, v.id, id)
-        Map.put(declared, short, id)
-    }
-    -- A name the first alternative does not bind gets a local binder of its
-    -- own, which keeps the side table complete for a program that inference
-    -- then rejects.
-    for v in laterOccurrences(pat) {
-        let short = varName(v)
-        let id = match Map.get(declared, short) {
-            Some(id) -> id
-            None -> Binders.fresh(binders, o, short, Local, Written(v.span, False))
-        }
-        Binders.record(binders, v.id, id)
-    }
+fun declarePattern(
+	binders : Binders.Table,
+	moduleName : String,
+	stmtId : Int,
+	pat : Pat,
+	mutable : Bool,
+) -> Unit {
+	let vars = varPatterns(pat)
+	let hint = if len(vars) > 0 { varName(vars[0]) } else { "%top" }
+	let o = ownerFor(binders, moduleName, stmtId, hint)
+	let declared = Map.new()
+	for v in vars {
+		let short = varName(v)
+		let id = Binders.declare(
+			binders,
+			o,
+			Prelude.internal(moduleName, short),
+			short,
+			TopLevel,
+			Written(v.span, mutable),
+		)
+		Binders.record(binders, v.id, id)
+		Map.put(declared, short, id)
+	}
+	-- A name the first alternative does not bind gets a local binder of its
+	-- own, which keeps the side table complete for a program that inference
+	-- then rejects.
+	for v in laterOccurrences(pat) {
+		let short = varName(v)
+		let id = match Map.get(declared, short) {
+			Some(id) -> id
+			None     -> Binders.fresh(binders, o, short, Local, Written(v.span, False))
+		}
+		Binders.record(binders, v.id, id)
+	}
 }
 
 --- Returns every module's `infix` declarations, keyed by the name the operator
@@ -231,233 +284,247 @@ fun declarePattern(binders : Binders.Table, moduleName : String, stmtId : Int,
 --- resolved, because a use in one module may mean a declaration in another,
 --- and in its own module a use may precede its declaration.
 fun operators(modules : Vec Module, arities : Map String Int) -> Map String (Group, String) {
-    let out = Map.new()
-    for m in modules {
-        let seen = Set.new()
-        for decl in m.program.decls {
-            match decl {
-                DInfix(d) -> {
-                    if Set.contains(seen, d.op) {
-                        report("the operator '" + d.op + "' is declared twice", d.span)
-                    }
-                    Set.add(seen, d.op)
-                    let target = infixTarget(m.scope, d, arities)
-                    Map.put(out, Prelude.internal(m.name, d.op), (d.group, target))
-                }
-                _ -> {}
-            }
-        }
-    }
-    out
+	let out = Map.new()
+	for m in modules {
+		let seen = Set.new()
+		for decl in m.program.decls {
+			match decl {
+				DInfix(d) -> {
+					if Set.contains(seen, d.op) {
+						report("the operator '" + d.op + "' is declared twice", d.span)
+					}
+					Set.add(seen, d.op)
+					let target = infixTarget(m.scope, d, arities)
+					Map.put(out, Prelude.internal(m.name, d.op), (d.group, target))
+				}
+				_ -> {}
+			}
+		}
+	}
+	out
 }
 
 fun infixTarget(scope : Scope, d : InfixDecl, arities : Map String Int) -> String {
-    -- An undefined target is reported and left as written, and one of the
-    -- wrong arity is reported and resolved anyway. Either way `loadProgram`
-    -- stops before anything calls it.
-    let target = match lookupName(scope, ValueSpace, d.target, Some(d.targetSpan)) {
-        Some(t) -> t
-        None -> {
-            report("'" + d.target + "' is not defined", d.targetSpan)
-            return d.target
-        }
-    }
-    match Map.get(arities, target) {
-        Some(2) -> {}
-        Some(n) -> report("'" + d.target + "' takes " + Int.toString(n)
-                          + (if n == 1 { " parameter" } else { " parameters" })
-                          + ", and the operator '" + d.op
-                          + "' must name a function of two", d.targetSpan)
-        None -> report("'" + d.target + "' is neither a top-level function nor a "
-                       + "class method, and the operator '" + d.op + "' must "
-                       + "name one", d.targetSpan)
-    }
-    d.target = target
-    target
+	-- An undefined target is reported and left as written, and one of the
+	-- wrong arity is reported and resolved anyway. Either way `loadProgram`
+	-- stops before anything calls it.
+	let target = match lookupName(scope, ValueSpace, d.target, Some(d.targetSpan)) {
+		Some(t) -> t
+		None -> {
+			report("'" + d.target + "' is not defined", d.targetSpan)
+			return d.target
+		}
+	}
+	match Map.get(arities, target) {
+		Some(2) -> {}
+		Some(n) -> report(
+			"'"
+				+ d.target
+				+ "' takes "
+				+ Int.toString(n)
+				+ (if n == 1 { " parameter" } else { " parameters" })
+				+ ", and the operator '"
+				+ d.op
+				+ "' must name a function of two",
+			d.targetSpan,
+		)
+		None -> report(
+			"'"
+				+ d.target
+				+ "' is neither a top-level function nor a "
+				+ "class method, and the operator '"
+				+ d.op
+				+ "' must "
+				+ "name one",
+			d.targetSpan,
+		)
+	}
+	d.target = target
+	target
 }
 
 fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
-    f.name = lookupOr(r.scope.values, f.name)
-    enter(r, f.id, f.span)
-    for param in f.params { pattern(r, param) }
-    push(r)
-    for param in f.params { bindPattern(r, param, False) }
-    pop(r)
-    typeExpr(r, f.ret)
+	f.name = lookupOr(r.scope.values, f.name)
+	enter(r, f.id, f.span)
+	for param in f.params { pattern(r, param) }
+	push(r)
+	for param in f.params { bindPattern(r, param, False) }
+	pop(r)
+	typeExpr(r, f.ret)
 }
 
 -- -- declarations -------------------------------------------------------------------
 
 fun typeDecl(r : R, d : TypeDecl) -> Unit {
-    d.name = tycon(r, d.name, d.span)
-    for entry in d.derives { entry.cls = cls(r, entry.cls, entry.span) }
-    match d.alias {
-        Some(a) -> typeExpr(r, a)
-        None -> {}
-    }
-    match d.variants {
-        None -> {}
-        Some(vs) -> for v in vs {
-            v.name = con(r, v.name, v.span)
-            context(r, v.context)
-            for a in v.args { typeExpr(r, a) }
-            match v.fields {
-                Some(fs) -> for (_, te) in fs { typeExpr(r, te) }
-                None -> {}
-            }
-        }
-    }
+	d.name = tycon(r, d.name, d.span)
+	for entry in d.derives { entry.cls = cls(r, entry.cls, entry.span) }
+	match d.alias {
+		Some(a) -> typeExpr(r, a)
+		None    -> {}
+	}
+	match d.variants {
+		None -> {}
+		Some(vs) -> for v in vs {
+			v.name = con(r, v.name, v.span)
+			context(r, v.context)
+			for a in v.args { typeExpr(r, a) }
+			match v.fields {
+				Some(fs) -> for (_, te) in fs { typeExpr(r, te) }
+				None     -> {}
+			}
+		}
+	}
 }
 
 fun classDecl(r : R, d : ClassDecl) -> Unit {
-    d.name = cls(r, d.name, d.span)
-    context(r, d.supers)
-    for meth in d.methods {
-        meth.name = d.name + "." + meth.name
-        enter(r, meth.id, meth.span)
-        funDecl(r, meth)
-    }
-    for fam in d.families { fam.name = d.name + "." + fam.name }
+	d.name = cls(r, d.name, d.span)
+	context(r, d.supers)
+	for meth in d.methods {
+		meth.name = d.name + "." + meth.name
+		enter(r, meth.id, meth.span)
+		funDecl(r, meth)
+	}
+	for fam in d.families { fam.name = d.name + "." + fam.name }
 }
 
 fun instanceDecl(r : R, d : InstanceDecl) -> Unit {
-    d.cls = cls(r, d.cls, d.span)
-    typeExpr(r, d.head)
-    context(r, d.context)
-    for bind in d.families {
-        bind.name = tycon(r, bind.name, bind.span)
-        typeExpr(r, bind.body)
-    }
-    -- An instance method's name is a reference to the class method it
-    -- defines. It has no binder when the class is unknown or declares no such
-    -- method, and `Classes` rejects both programs, so there is nothing to
-    -- record; failing here instead would replace that diagnostic with an
-    -- internal error.
-    for meth in d.methods {
-        enter(r, meth.id, meth.span)
-        Binders.refer(r.binders, meth.id, d.cls + "." + meth.name)
-        funDecl(r, meth)
-    }
+	d.cls = cls(r, d.cls, d.span)
+	typeExpr(r, d.head)
+	context(r, d.context)
+	for bind in d.families {
+		bind.name = tycon(r, bind.name, bind.span)
+		typeExpr(r, bind.body)
+	}
+	-- An instance method's name is a reference to the class method it
+	-- defines. It has no binder when the class is unknown or declares no such
+	-- method, and `Classes` rejects both programs, so there is nothing to
+	-- record; failing here instead would replace that diagnostic with an
+	-- internal error.
+	for meth in d.methods {
+		enter(r, meth.id, meth.span)
+		Binders.refer(r.binders, meth.id, d.cls + "." + meth.name)
+		funDecl(r, meth)
+	}
 }
 
 -- A top-level item: its binders are renamed, its body resolved.
 fun topLevel(r : R, s : Stmt) -> Unit = match s.kind {
-    SFun(d) -> {
-        d.name = lookupOr(r.scope.values, d.name)
-        enter(r, s.id, s.span)
-        funDecl(r, d)
-    }
-    SLet(pat, value) -> topLevelBinding(r, s, pat, value)
-    SVar(pat, value) -> topLevelBinding(r, s, pat, value)
-    -- The `else` block is resolved where the value is, outside the pattern's
-    -- scope.
-    SLetElse(_, pat, value, otherwise) -> {
-        topLevelBinding(r, s, pat, value)
-        expr(r, otherwise)
-    }
-    _ -> {
-        -- An assignment or a bare expression at the top level binds nothing, so
-        -- there is nothing to rename -- only to resolve.
-        enter(r, s.id, s.span)
-        push(r)
-        stmt(r, s)
-        pop(r)
-    }
+	SFun(d) -> {
+		d.name = lookupOr(r.scope.values, d.name)
+		enter(r, s.id, s.span)
+		funDecl(r, d)
+	}
+	SLet(pat, value) -> topLevelBinding(r, s, pat, value)
+	SVar(pat, value) -> topLevelBinding(r, s, pat, value)
+	-- The `else` block is resolved where the value is, outside the pattern's
+	-- scope.
+	SLetElse(_, pat, value, otherwise) -> {
+		topLevelBinding(r, s, pat, value)
+		expr(r, otherwise)
+	}
+	_ -> {
+		-- An assignment or a bare expression at the top level binds nothing, so
+		-- there is nothing to rename -- only to resolve.
+		enter(r, s.id, s.span)
+		push(r)
+		stmt(r, s)
+		pop(r)
+	}
 }
 
 -- `declare` has recorded each variable's binder; this renames it.
 fun topLevelBinding(r : R, s : Stmt, pat : Pat, value : Expr) -> Unit {
-    enter(r, s.id, s.span)
-    expr(r, value)
-    pattern(r, pat)
-    for v in varPatterns(pat) { v.kind = PVar(lookupOr(r.scope.values, varName(v))) }
-    for v in laterOccurrences(pat) { v.kind = PVar(lookupOr(r.scope.values, varName(v))) }
+	enter(r, s.id, s.span)
+	expr(r, value)
+	pattern(r, pat)
+	for v in varPatterns(pat) { v.kind = PVar(lookupOr(r.scope.values, varName(v))) }
+	for v in laterOccurrences(pat) { v.kind = PVar(lookupOr(r.scope.values, varName(v))) }
 }
 
 -- Makes the owner `declare` registered for the declaration `nodeId` the one
 -- the locals of its body are minted into.
 fun enter(r : R, nodeId : Int, where : Span) -> Unit {
-    r.owner = Binders.declarationOwner(r.binders, nodeId, where)
+	r.owner = Binders.declarationOwner(r.binders, nodeId, where)
 }
 
 fun funDecl(r : R, d : FunDecl) -> Unit {
-    context(r, d.context)
-    for param in d.params { pattern(r, param) }
-    match d.ret {
-        Some(t) -> typeExpr(r, t)
-        None -> {}
-    }
-    push(r)
-    for param in d.params { bindPattern(r, param, False) }
-    match d.body {
-        Some(b) -> expr(r, b)
-        None -> {}
-    }
-    pop(r)
+	context(r, d.context)
+	for param in d.params { pattern(r, param) }
+	match d.ret {
+		Some(t) -> typeExpr(r, t)
+		None    -> {}
+	}
+	push(r)
+	for param in d.params { bindPattern(r, param, False) }
+	match d.body {
+		Some(b) -> expr(r, b)
+		None    -> {}
+	}
+	pop(r)
 }
 
 -- -- types, predicates and patterns ---------------------------------------------------
 
 fun typeExpr(r : R, t : Type) -> Unit = match t.kind {
-    -- A type variable is scoped to its own declaration and names nothing here.
-    TEVar(_) -> {}
-    TECon(name, args) -> {
-        t.kind = TECon(tycon(r, name, t.span), args)
-        for a in args { typeExpr(r, a) }
-    }
-    TEApp(head, args) -> {
-        typeExpr(r, head)
-        for a in args { typeExpr(r, a) }
-    }
-    TETuple(elems) -> for e in elems { typeExpr(r, e) }
-    TEFun(params, ret) -> {
-        for p in params { typeExpr(r, p) }
-        typeExpr(r, ret)
-    }
-    TEParen(inner) -> typeExpr(r, inner)
+	-- A type variable is scoped to its own declaration and names nothing here.
+	TEVar(_) -> {}
+	TECon(name, args) -> {
+		t.kind = TECon(tycon(r, name, t.span), args)
+		for a in args { typeExpr(r, a) }
+	}
+	TEApp(head, args) -> {
+		typeExpr(r, head)
+		for a in args { typeExpr(r, a) }
+	}
+	TETuple(elems) -> for e in elems { typeExpr(r, e) }
+	TEFun(params, ret) -> {
+		for p in params { typeExpr(r, p) }
+		typeExpr(r, ret)
+	}
+	TEParen(inner) -> typeExpr(r, inner)
 }
 
 -- A superclass list, a function's context or an instance's -- the same node.
 fun context(r : R, preds : Vec Pred) -> Unit {
-    for pred in preds {
-        match pred.kind {
-            PClass(name, arg) -> {
-                pred.kind = PClass(cls(r, name, pred.span), arg)
-                typeExpr(r, arg)
-            }
-            PEq(left, right) -> {
-                typeExpr(r, left)
-                typeExpr(r, right)
-            }
-        }
-    }
+	for pred in preds {
+		match pred.kind {
+			PClass(name, arg) -> {
+				pred.kind = PClass(cls(r, name, pred.span), arg)
+				typeExpr(r, arg)
+			}
+			PEq(left, right) -> {
+				typeExpr(r, left)
+				typeExpr(r, right)
+			}
+		}
+	}
 }
 
 -- Rename the constructors a pattern mentions. Its *variables* are binders, and
 -- `bindPattern` binds them separately.
 fun pattern(r : R, p : Pat) -> Unit = match p.kind {
-    PCon(name, args) -> {
-        p.kind = PCon(con(r, name, p.span), args)
-        for a in args { pattern(r, a) }
-    }
-    PRecord(name, fields, rest) -> {
-        p.kind = PRecord(con(r, name, p.span), fields, rest)
-        for (_, sub) in fields { pattern(r, sub) }
-    }
-    PTuple(elems) -> for e in elems { pattern(r, e) }
-    PAnnot(inner, t) -> {
-        pattern(r, inner)
-        typeExpr(r, t)
-    }
-    POr(alts) -> for a in alts { pattern(r, a) }
-    _ -> {}
+	PCon(name, args) -> {
+		p.kind = PCon(con(r, name, p.span), args)
+		for a in args { pattern(r, a) }
+	}
+	PRecord(name, fields, rest) -> {
+		p.kind = PRecord(con(r, name, p.span), fields, rest)
+		for (_, sub) in fields { pattern(r, sub) }
+	}
+	PTuple(elems) -> for e in elems { pattern(r, e) }
+	PAnnot(inner, t) -> {
+		pattern(r, inner)
+		typeExpr(r, t)
+	}
+	POr(alts) -> for a in alts { pattern(r, a) }
+	_         -> {}
 }
 
 -- Binds each variable of a local pattern in the innermost frame, as a fresh
 -- binder in the current owner, and records the pattern node against it.
 fun bindPattern(r : R, p : Pat, mutable : Bool) -> Unit {
-    for v in varPatterns(p) { bindLocal(r, v.id, varName(v), v.span, mutable) }
-    bindLater(r, p)
+	for v in varPatterns(p) { bindLocal(r, v.id, varName(v), v.span, mutable) }
+	bindLater(r, p)
 }
 
 -- Records the variables of each nested alternative after the first,
@@ -465,14 +532,14 @@ fun bindPattern(r : R, p : Pat, mutable : Bool) -> Unit {
 -- innermost frame. A name the first does not bind gets a binder of its own,
 -- as in `bindAlternatives`.
 fun bindLater(r : R, p : Pat) -> Unit {
-    let frame = r.locals[len(r.locals) - 1]
-    for v in laterOccurrences(p) {
-        let name = varName(v)
-        match Map.get(frame, name) {
-            Some(id) -> Binders.record(r.binders, v.id, id)
-            None -> bindLocal(r, v.id, name, v.span, False)
-        }
-    }
+	let frame = r.locals[len(r.locals) - 1]
+	for v in laterOccurrences(p) {
+		let name = varName(v)
+		match Map.get(frame, name) {
+			Some(id) -> Binders.record(r.binders, v.id, id)
+			None     -> bindLocal(r, v.id, name, v.span, False)
+		}
+	}
 }
 
 -- Binds an arm's alternatives, `A(x) | B(x)`, in the innermost frame. They
@@ -482,228 +549,232 @@ fun bindLater(r : R, p : Pat) -> Unit {
 -- program that inference then rejects. The first's binder for a name in
 -- `assignable` is assignable.
 fun bindAlternatives(r : R, alts : Vec Pat, assignable : Set.Set String) -> Unit {
-    if len(alts) == 0 { return }
-    for v in varPatterns(alts[0]) {
-        let name = varName(v)
-        bindLocal(r, v.id, name, v.span, Set.contains(assignable, name))
-    }
-    bindLater(r, alts[0])
-    let frame = r.locals[len(r.locals) - 1]
-    for var i = 1; i < len(alts); i = i + 1 {
-        for v in varPatterns(alts[i]) {
-            let name = varName(v)
-            match Map.get(frame, name) {
-                Some(id) -> Binders.record(r.binders, v.id, id)
-                None -> bindLocal(r, v.id, name, v.span, False)
-            }
-        }
-        bindLater(r, alts[i])
-    }
+	if len(alts) == 0 { return }
+	for v in varPatterns(alts[0]) {
+		let name = varName(v)
+		bindLocal(r, v.id, name, v.span, Set.contains(assignable, name))
+	}
+	bindLater(r, alts[0])
+	let frame = r.locals[len(r.locals) - 1]
+	for var i = 1; i < len(alts); i = i + 1 {
+		for v in varPatterns(alts[i]) {
+			let name = varName(v)
+			match Map.get(frame, name) {
+				Some(id) -> Binders.record(r.binders, v.id, id)
+				None     -> bindLocal(r, v.id, name, v.span, False)
+			}
+		}
+		bindLater(r, alts[i])
+	}
 }
 
 fun varName(p : Pat) -> String = match p.kind {
-    PVar(name) -> name
-    _ -> error("Resolve.varName: not a variable pattern")
+	PVar(name) -> name
+	_          -> error("Resolve.varName: not a variable pattern")
 }
 
 -- -- expressions --------------------------------------------------------------------
 
 fun expr(r : R, e : Expr) -> Unit = match e.kind {
-    EVar(name, isMethod) -> {
-        -- A marked node is an operator or a `for` loop's `iter`/`next`, written
-        -- by the parser: it means the class method by construction.
-        if isMethod {
-            method(r, e, name)
-        } else {
-            match local(r, name) {
-                Some(id) -> Binders.record(r.binders, e.id, id)
-                None -> match lookupName(r.scope, ValueSpace, name, Some(e.span)) {
-                    Some(target) -> {
-                        e.kind = EVar(target, False)
-                        Binders.refer(r.binders, e.id, target)
-                    }
-                    None -> {
-                        if String.contains(name, ".") {
-                            -- Qualified, and its module is not in scope.
-                            -- Inference would find it anyway -- `Prim.intAdd`
-                            -- is in the shared environment so the Prelude can
-                            -- be checked -- so this is the stage that has to
-                            -- say no.
-                            report("'" + name + "' is not defined", e.span)
-                        }
-                        Binders.leaveUnresolved(r.binders, e.id, name)
-                    }
-                }
-            }
-        }
-    }
-    ECon(name) -> { e.kind = ECon(con(r, name, e.span)) }
-    ELit(_, _) -> {}
-    EUnit -> {}
-    EContinue -> {}
-    ETuple(elems) -> for x in elems { expr(r, x) }
-    EArray(elems) -> for x in elems { expr(r, x) }
-    ERecord(name, fields) -> {
-        e.kind = ERecord(con(r, name, e.span), fields)
-        for (_, value) in fields { expr(r, value) }
-    }
-    ECall(fn, args) -> {
-        expr(r, fn)
-        for a in args { expr(r, a) }
-    }
-    EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
-    EField(obj, _) -> expr(r, obj)
-    EProject(obj, _) -> expr(r, obj)
-    EUnary(_, operand, fn) -> {
-        resolveMethod(r, fn)
-        expr(r, operand)
-    }
-    EBinary(_, left, right, fn) -> {
-        resolveMethod(r, fn)
-        expr(r, left)
-        expr(r, right)
-    }
-    EChain(operands, ops) -> {
-        for x in operands { expr(r, x) }
-        let groups = Vec.map(ops, fun((op, where)) = groupOf(r, op, where))
-        let tree = Fixity.associate(operands, ops, groups,
-                                    fun(i, left, right, from) = binary(r, ops[i], left, right, from),
-                                    fun(x) = x.span)
-        e.span = tree.span
-        e.kind = tree.kind
-    }
-    EAnnot(inner, t) -> {
-        expr(r, inner)
-        typeExpr(r, t)
-    }
-    EIf(cond, then, otherwise) -> {
-        expr(r, cond)
-        expr(r, then)
-        match otherwise {
-            Some(o) -> expr(r, o)
-            None -> {}
-        }
-    }
-    EWhile(cond, body) -> {
-        expr(r, cond)
-        expr(r, body)
-    }
-    ELoop(body) -> expr(r, body)
-    EReturn(value) -> match value {
-        Some(v) -> expr(r, v)
-        None -> {}
-    }
-    EBreak(value) -> match value {
-        Some(v) -> expr(r, v)
-        None -> {}
-    }
-    ELambda(params, ret, body, _) -> {
-        for p in params { pattern(r, p) }
-        match ret {
-            Some(t) -> typeExpr(r, t)
-            None -> {}
-        }
-        push(r)
-        for p in params { bindPattern(r, p, False) }
-        expr(r, body)
-        pop(r)
-    }
-    EMatch(scrutinee, arms) -> {
-        expr(r, scrutinee)
-        for arm in arms {
-            for p in arm.patterns { pattern(r, p) }
-            push(r)
-            bindAlternatives(r, arm.patterns, Set.new())
-            -- Each `let` guard binds in a frame of its own, so a name it binds
-            -- shadows the arm's and the guards' before it.
-            var frames = 1
-            for g in arm.guards {
-                match g {
-                    GTest(test) -> expr(r, test)
-                    GLet(alts, value) -> {
-                        expr(r, value)
-                        for p in alts { pattern(r, p) }
-                        push(r)
-                        frames = frames + 1
-                        bindAlternatives(r, alts, Set.new())
-                    }
-                }
-            }
-            expr(r, arm.body)
-            for var i = 0; i < frames; i = i + 1 { pop(r) }
-        }
-    }
-    EIfLet(conditions, then, otherwise) -> {
-        conditionList(r, conditions, then)
-        match otherwise {
-            Some(o) -> expr(r, o)
-            None -> {}
-        }
-    }
-    EWhileLet(conditions, body) -> conditionList(r, conditions, body)
-    EForIn(pat, iterable, body, iterFn, nextFn) -> {
-        resolveMethod(r, iterFn)
-        resolveMethod(r, nextFn)
-        expr(r, iterable)
-        pattern(r, pat)
-        push(r)
-        bindPattern(r, pat, False)
-        expr(r, body)
-        pop(r)
-    }
-    EForC(init, cond, step, body) -> {
-        -- init, cond, step and body share one scope.
-        push(r)
-        match init {
-            Some(s) -> stmt(r, s)
-            None -> {}
-        }
-        expr(r, cond)
-        match step {
-            Some(s) -> stmt(r, s)
-            None -> {}
-        }
-        expr(r, body)
-        pop(r)
-    }
-    EBlock(stmts) -> {
-        push(r)
-        for s in stmts { stmt(r, s) }
-        pop(r)
-    }
-    EQuestion(inner, bindFn) -> {
-        resolveMethod(r, bindFn)
-        expr(r, inner)
-    }
-    -- Only a marker; the block underneath scopes as any block does.
-    EDo(body) -> expr(r, body)
-    EParen(inner) -> expr(r, inner)
+	EVar(name, isMethod) -> {
+		-- A marked node is an operator or a `for` loop's `iter`/`next`, written
+		-- by the parser: it means the class method by construction.
+		if isMethod {
+			method(r, e, name)
+		} else {
+			match local(r, name) {
+				Some(id) -> Binders.record(r.binders, e.id, id)
+				None -> match lookupName(r.scope, ValueSpace, name, Some(e.span)) {
+					Some(target) -> {
+						e.kind = EVar(target, False)
+						Binders.refer(r.binders, e.id, target)
+					}
+					None -> {
+						if String.contains(name, ".") {
+							-- Qualified, and its module is not in scope.
+							-- Inference would find it anyway -- `Prim.intAdd`
+							-- is in the shared environment so the Prelude can
+							-- be checked -- so this is the stage that has to
+							-- say no.
+							report("'" + name + "' is not defined", e.span)
+						}
+						Binders.leaveUnresolved(r.binders, e.id, name)
+					}
+				}
+			}
+		}
+	}
+	ECon(name)    -> { e.kind = ECon(con(r, name, e.span)) }
+	ELit(_, _)    -> {}
+	EUnit         -> {}
+	EContinue     -> {}
+	ETuple(elems) -> for x in elems { expr(r, x) }
+	EArray(elems) -> for x in elems { expr(r, x) }
+	ERecord(name, fields) -> {
+		e.kind = ERecord(con(r, name, e.span), fields)
+		for (_, value) in fields { expr(r, value) }
+	}
+	ECall(fn, args) -> {
+		expr(r, fn)
+		for a in args { expr(r, a) }
+	}
+	EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
+	EField(obj, _)           -> expr(r, obj)
+	EProject(obj, _)         -> expr(r, obj)
+	EUnary(_, operand, fn) -> {
+		resolveMethod(r, fn)
+		expr(r, operand)
+	}
+	EBinary(_, left, right, fn) -> {
+		resolveMethod(r, fn)
+		expr(r, left)
+		expr(r, right)
+	}
+	EChain(operands, ops) -> {
+		for x in operands { expr(r, x) }
+		let groups = Vec.map(ops, fun((op, where)) = groupOf(r, op, where))
+		let tree = Fixity.associate(
+			operands,
+			ops,
+			groups,
+			fun(i, left, right, from) = binary(r, ops[i], left, right, from),
+			fun(x) = x.span,
+		)
+		e.span = tree.span
+		e.kind = tree.kind
+	}
+	EAnnot(inner, t) -> {
+		expr(r, inner)
+		typeExpr(r, t)
+	}
+	EIf(cond, then, otherwise) -> {
+		expr(r, cond)
+		expr(r, then)
+		match otherwise {
+			Some(o) -> expr(r, o)
+			None    -> {}
+		}
+	}
+	EWhile(cond, body) -> {
+		expr(r, cond)
+		expr(r, body)
+	}
+	ELoop(body) -> expr(r, body)
+	EReturn(value) -> match value {
+		Some(v) -> expr(r, v)
+		None    -> {}
+	}
+	EBreak(value) -> match value {
+		Some(v) -> expr(r, v)
+		None    -> {}
+	}
+	ELambda(params, ret, body, _) -> {
+		for p in params { pattern(r, p) }
+		match ret {
+			Some(t) -> typeExpr(r, t)
+			None    -> {}
+		}
+		push(r)
+		for p in params { bindPattern(r, p, False) }
+		expr(r, body)
+		pop(r)
+	}
+	EMatch(scrutinee, arms) -> {
+		expr(r, scrutinee)
+		for arm in arms {
+			for p in arm.patterns { pattern(r, p) }
+			push(r)
+			bindAlternatives(r, arm.patterns, Set.new())
+			-- Each `let` guard binds in a frame of its own, so a name it binds
+			-- shadows the arm's and the guards' before it.
+			var frames = 1
+			for g in arm.guards {
+				match g {
+					GTest(test) -> expr(r, test)
+					GLet(alts, value) -> {
+						expr(r, value)
+						for p in alts { pattern(r, p) }
+						push(r)
+						frames = frames + 1
+						bindAlternatives(r, alts, Set.new())
+					}
+				}
+			}
+			expr(r, arm.body)
+			for var i = 0; i < frames; i = i + 1 { pop(r) }
+		}
+	}
+	EIfLet(conditions, then, otherwise) -> {
+		conditionList(r, conditions, then)
+		match otherwise {
+			Some(o) -> expr(r, o)
+			None    -> {}
+		}
+	}
+	EWhileLet(conditions, body) -> conditionList(r, conditions, body)
+	EForIn(pat, iterable, body, iterFn, nextFn) -> {
+		resolveMethod(r, iterFn)
+		resolveMethod(r, nextFn)
+		expr(r, iterable)
+		pattern(r, pat)
+		push(r)
+		bindPattern(r, pat, False)
+		expr(r, body)
+		pop(r)
+	}
+	EForC(init, cond, step, body) -> {
+		-- init, cond, step and body share one scope.
+		push(r)
+		match init {
+			Some(s) -> stmt(r, s)
+			None    -> {}
+		}
+		expr(r, cond)
+		match step {
+			Some(s) -> stmt(r, s)
+			None    -> {}
+		}
+		expr(r, body)
+		pop(r)
+	}
+	EBlock(stmts) -> {
+		push(r)
+		for s in stmts { stmt(r, s) }
+		pop(r)
+	}
+	EQuestion(inner, bindFn) -> {
+		resolveMethod(r, bindFn)
+		expr(r, inner)
+	}
+	-- Only a marker; the block underneath scopes as any block does.
+	EDo(body)     -> expr(r, body)
+	EParen(inner) -> expr(r, inner)
 }
 
 fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
-    SLet(pat, value) -> localBinding(r, pat, value, False)
-    SVar(pat, value) -> localBinding(r, pat, value, True)
-    -- The `else` block sees what the value sees, and the pattern's variables
-    -- are bound for the rest of the block.
-    SLetElse(mutable, pat, value, otherwise) -> {
-        expr(r, value)
-        expr(r, otherwise)
-        pattern(r, pat)
-        bindPattern(r, pat, mutable)
-    }
-    SFun(d) -> {
-        -- In scope for its own body, so it may recurse.
-        bindLocal(r, d.id, d.name, d.span, False)
-        funDecl(r, d)
-    }
-    SAssign(target, value) -> {
-        match target.kind {
-            EIndex(arr, index, _, _) -> bracket(r, target, arr, index, True)
-            _ -> expr(r, target)
-        }
-        expr(r, value)
-    }
-    SExpr(e) -> expr(r, e)
+	SLet(pat, value) -> localBinding(r, pat, value, False)
+	SVar(pat, value) -> localBinding(r, pat, value, True)
+	-- The `else` block sees what the value sees, and the pattern's variables
+	-- are bound for the rest of the block.
+	SLetElse(mutable, pat, value, otherwise) -> {
+		expr(r, value)
+		expr(r, otherwise)
+		pattern(r, pat)
+		bindPattern(r, pat, mutable)
+	}
+	SFun(d) -> {
+		-- In scope for its own body, so it may recurse.
+		bindLocal(r, d.id, d.name, d.span, False)
+		funDecl(r, d)
+	}
+	SAssign(target, value) -> {
+		match target.kind {
+			EIndex(arr, index, _, _) -> bracket(r, target, arr, index, True)
+			_                        -> expr(r, target)
+		}
+		expr(r, value)
+	}
+	SExpr(e) -> expr(r, e)
 }
 
 -- Resolves the bracket `e`, `arr[index]`, which is the target of an
@@ -718,35 +789,45 @@ fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
 -- that has no method, and by the syntax and the class, since the module may
 -- have a `get` or `set` of its own that has nothing to do with either.
 fun bracket(r : R, e : Expr, arr : Expr, index : Expr, assigned : Bool) -> Unit {
-    expr(r, arr)
-    expr(r, index)
-    let get = methodRef(r, "get", e.span)
-    let set = methodRef(r, "set", e.span)
-    if assigned {
-        if Option.isNone(set) { noMethod("an indexed assignment", "set", e.span) }
-    } else if Option.isNone(get) {
-        noMethod("indexing", "get", e.span)
-    }
-    e.kind = EIndex(arr, index, get, set)
+	expr(r, arr)
+	expr(r, index)
+	let get = methodRef(r, "get", e.span)
+	let set = methodRef(r, "set", e.span)
+	if assigned {
+		if Option.isNone(set) { noMethod("an indexed assignment", "set", e.span) }
+	} else if Option.isNone(get) {
+		noMethod("indexing", "get", e.span)
+	}
+	e.kind = EIndex(arr, index, get, set)
 }
 
 -- Reports that `syntax` calls the class method a compiler-written reference
 -- marked `spelling` means, and the module cannot see it.
 fun noMethod(syntax : String, spelling : String, where : Span) -> Unit {
-    -- A method's internal name is its module's, a `#`, its class's, a `.`,
-    -- and its own.
-    let target = Option.unwrapOr(Prelude.protocolMethod(spelling), spelling)
-    let owner = Option.unwrapOr(Prelude.moduleOf(target), "")
-    let cls = match String.splitOnce(target, Prelude.sep) {
-        Some((_, member)) -> match String.rsplitOnce(member, ".") {
-            Some((cls, _)) -> cls
-            None -> member
-        }
-        None -> target
-    }
-    report(syntax + " calls '" + spelling + "' of the class '" + cls
-           + "', which is not in scope here; write 'import " + Prelude.display(owner)
-           + " (" + cls + "(..))'", where)
+	-- A method's internal name is its module's, a `#`, its class's, a `.`,
+	-- and its own.
+	let target = Option.unwrapOr(Prelude.protocolMethod(spelling), spelling)
+	let owner = Option.unwrapOr(Prelude.moduleOf(target), "")
+	let cls = match String.splitOnce(target, Prelude.sep) {
+		Some((_, member)) -> match String.rsplitOnce(member, ".") {
+			Some((cls, _)) -> cls
+			None           -> member
+		}
+		None -> target
+	}
+	report(
+		syntax
+			+ " calls '"
+			+ spelling
+			+ "' of the class '"
+			+ cls
+			+ "', which is not in scope here; write 'import "
+			+ Prelude.display(owner)
+			+ " ("
+			+ cls
+			+ "(..))'",
+		where,
+	)
 }
 
 -- Resolves the conditions of an `if` or `while` head and then `body`, which
@@ -759,33 +840,33 @@ fun noMethod(syntax : String, spelling : String, where : Span) -> Unit {
 -- as assignable when any `var` condition binds it. `Turkey.Desugar` gives each
 -- such name in `body` a cell of its own.
 fun conditionList(r : R, conditions : Vec Condition, body : Expr) -> Unit {
-    let assignable : Set.Set String = Set.new()
-    var frames = 0
-    for c in conditions {
-        match c {
-            CondTest(_, test) -> expr(r, test)
-            CondLet(_, isVar, alts, value) -> {
-                expr(r, value)
-                for p in alts { pattern(r, p) }
-                push(r)
-                frames = frames + 1
-                if isVar {
-                    for p in alts {
-                        for name in patternVars(p) { Set.add(assignable, name) }
-                    }
-                }
-                bindAlternatives(r, alts, assignable)
-            }
-        }
-    }
-    expr(r, body)
-    for var i = 0; i < frames; i = i + 1 { pop(r) }
+	let assignable : Set.Set String = Set.new()
+	var frames = 0
+	for c in conditions {
+		match c {
+			CondTest(_, test) -> expr(r, test)
+			CondLet(_, isVar, alts, value) -> {
+				expr(r, value)
+				for p in alts { pattern(r, p) }
+				push(r)
+				frames = frames + 1
+				if isVar {
+					for p in alts {
+						for name in patternVars(p) { Set.add(assignable, name) }
+					}
+				}
+				bindAlternatives(r, alts, assignable)
+			}
+		}
+	}
+	expr(r, body)
+	for var i = 0; i < frames; i = i + 1 { pop(r) }
 }
 
 fun localBinding(r : R, pat : Pat, value : Expr, mutable : Bool) -> Unit {
-    expr(r, value)
-    pattern(r, pat)
-    bindPattern(r, pat, mutable)
+	expr(r, value)
+	pattern(r, pat)
+	bindPattern(r, pat, mutable)
 }
 
 -- -- namespaces ---------------------------------------------------------------------
@@ -794,35 +875,35 @@ fun localBinding(r : R, pat : Pat, value : Expr, mutable : Bool) -> Unit {
 -- to refuse -- except a primitive's, which the table would take for the
 -- primitive itself. A primitive is in scope only through an import.
 fun tycon(r : R, name : String, where : Span) -> String =
-    match lookupName(r.scope, TypeSpace, name, Some(where)) {
-        Some(target) -> target
-        None -> {
-            if Ty.isPrimitive(name) { report("unknown type '" + name + "'", where) }
-            name
-        }
-    }
+	match lookupName(r.scope, TypeSpace, name, Some(where)) {
+		Some(target) -> target
+		None -> {
+			if Ty.isPrimitive(name) { report("unknown type '" + name + "'", where) }
+			name
+		}
+	}
 fun con(r : R, name : String, where : Span) -> String =
-    Option.unwrapOr(lookupName(r.scope, ConstructorSpace, name, Some(where)), name)
+	Option.unwrapOr(lookupName(r.scope, ConstructorSpace, name, Some(where)), name)
 fun cls(r : R, name : String, where : Span) -> String =
-    Option.unwrapOr(lookupName(r.scope, ClassSpace, name, Some(where)), name)
+	Option.unwrapOr(lookupName(r.scope, ClassSpace, name, Some(where)), name)
 
 fun lookupOr(space : Map String String, name : String) -> String =
-    Map.getOr(space, name, name)
+	Map.getOr(space, name, name)
 
 -- A method reference the compiler wrote: `EBinary`'s `fn`, `EForIn`'s `iter`.
 -- Absent when the operator has no class, which `!` and `&&` do not.
 fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
-    None -> {}
-    Some(e) -> match e.kind {
-        EVar(name, _) -> method(r, e, name)
-        _ -> {}
-    }
+	None -> {}
+	Some(e) -> match e.kind {
+		EVar(name, _) -> method(r, e, name)
+		_             -> {}
+	}
 }
 
 -- Resolves the marked reference `e`, spelled `name`.
 fun method(r : R, e : Expr, name : String) -> Unit {
-    let found = protocolMethod(r.scope, r.binders, e.id, name, e.span)
-    if let Some(target) = found { e.kind = EVar(target, True) }
+	let found = protocolMethod(r.scope, r.binders, e.id, name, e.span)
+	if let Some(target) = found { e.kind = EVar(target, True) }
 }
 
 --- Returns the internal name of the class method a compiler-written reference
@@ -830,85 +911,100 @@ fun method(r : R, e : Expr, name : String) -> Unit {
 --- binder. Returns `None` when `scope` cannot see that method, after leaving
 --- `nodeId` for inference to report. Raises an internal error, at `where`, for
 --- a spelling that marks no method.
-fun protocolMethod(scope : Scope, binders : Binders.Table, nodeId : Int,
-                   name : String, where : Span) -> Option String {
-    let found = visibleMethod(scope, name, where)
-    match found {
-        Some(target) -> Binders.refer(binders, nodeId, target)
-        None -> Binders.leaveUnresolved(binders, nodeId, name)
-    }
-    found
+fun protocolMethod(
+	scope : Scope,
+	binders : Binders.Table,
+	nodeId : Int,
+	name : String,
+	where : Span,
+) -> Option String {
+	let found = visibleMethod(scope, name, where)
+	match found {
+		Some(target) -> Binders.refer(binders, nodeId, target)
+		None         -> Binders.leaveUnresolved(binders, nodeId, name)
+	}
+	found
 }
 
 -- The method `Turkey.Prelude.protocolMethod` names for `name`, if `scope`
 -- can see it. Whatever else the scope calls `name` is not a candidate.
 fun visibleMethod(scope : Scope, name : String, where : Span) -> Option String =
-    match Prelude.protocolMethod(name) {
-        Some(target) -> if Set.contains(scope.methods, target) { Some(target) } else { None }
-        None -> Diag.fail(Diag.at("internal error",
-                                  "'" + name + "' marks no class method", where),
-                          where.file)
-    }
+	match Prelude.protocolMethod(name) {
+		Some(target) -> if Set.contains(scope.methods, target) { Some(target) } else { None }
+		None -> Diag.fail(
+			Diag.at("internal error", "'" + name + "' marks no class method", where),
+			where.file,
+		)
+	}
 
 -- A method reference *this* stage writes, for a node the parser left bare.
 -- `None` when the module cannot see the method at all.
 fun methodRef(r : R, name : String, where : Span) -> Option Expr =
-    match visibleMethod(r.scope, name, where) {
-        None -> None
-        -- From the same supply as every parsed node's. A constant here would
-        -- give every bracket in the program one id, and the tables keyed by it
-        -- hold a whole program: the second `get` would read the first's type.
-        Some(target) -> {
-            let made = Expr { id = freshNodeId(), span = where, kind = EVar(target, True) }
-            Binders.refer(r.binders, made.id, target)
-            Some(made)
-        }
-    }
+	match visibleMethod(r.scope, name, where) {
+		None -> None
+		-- From the same supply as every parsed node's. A constant here would
+		-- give every bracket in the program one id, and the tables keyed by it
+		-- hold a whole program: the second `get` would read the first's type.
+		Some(target) -> {
+			let made = Expr { id = freshNodeId(), span = where, kind = EVar(target, True) }
+			Binders.refer(r.binders, made.id, target)
+			Some(made)
+		}
+	}
 
 -- -- operators --------------------------------------------------------------------
 
 -- A declaration of an operator with a fixed group is in that group, so the
 -- fixed group is the answer without asking which declaration is in scope.
 fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.fixedGroup(op) {
-    Some(g) -> g
-    None -> match declared(r, op, where) {
-        Some((g, _)) -> g
-        None -> {
-            -- Any group will do: the declaration is now a failed unit, and
-            -- `loadProgram` stops before anything reads how it was grouped.
-            notDeclared(r, op, where)
-            Fixity.Addition
-        }
-    }
+	Some(g) -> g
+	None -> match declared(r, op, where) {
+		Some((g, _)) -> g
+		None -> {
+			-- Any group will do: the declaration is now a failed unit, and
+			-- `loadProgram` stops before anything reads how it was grouped.
+			notDeclared(r, op, where)
+			Fixity.Addition
+		}
+	}
 }
 
 fun notDeclared(r : R, op : String, where : Span) -> Unit =
-    Diag.report(Diag.at("parse error", missing(r, op), where))
+	Diag.report(Diag.at("parse error", missing(r, op), where))
 
 -- Returns the message for `op`, which is not in scope: which import would
 -- bring it, if one of the module's imports exports it, and otherwise how it
 -- might split into operators that are in scope.
 fun missing(r : R, op : String) -> String {
-    let from = Vec.new(2)
-    for (alias, modules) in Map.entries(r.scope.qualifiers) {
-        for m in modules {
-            if Map.contains(m.exports.operators, op) && !Vec.contains(from, alias) {
-                Vec.push(from, alias)
-            }
-        }
-    }
-    if len(from) == 0 {
-        return "the operator '" + op + "' is not declared" + splitHint(r, op)
-    }
-    let alias = Vec.sort(from)[0]
-    "the operator '" + op + "' is not imported; '" + alias + "' exports it, "
-        + "so name it in the import list, as in 'import " + alias + " (("
-        + op + "))'"
+	let from = Vec.new(2)
+	for (alias, modules) in Map.entries(r.scope.qualifiers) {
+		for m in modules {
+			if Map.contains(m.exports.operators, op) && !Vec.contains(from, alias) {
+				Vec.push(from, alias)
+			}
+		}
+	}
+	if len(from) == 0 {
+		return "the operator '" + op + "' is not declared" + splitHint(r, op)
+	}
+	let alias = Vec.sort(from)[0]
+	"the operator '"
+		+ op
+		+ "' is not imported; '"
+		+ alias
+		+ "' exports it, "
+		+ "so name it in the import list, as in 'import "
+		+ alias
+		+ " (("
+		+ op
+		+ "))'"
 }
 
 fun splitHint(r : R, op : String) -> String =
-    Fixity.splitAdvice(op, fun(piece) = Fixity.isBuiltin(piece)
-                                        || Map.contains(r.scope.operators, piece))
+	Fixity.splitAdvice(
+		op,
+		fun(piece) = Fixity.isBuiltin(piece) || Map.contains(r.scope.operators, piece),
+	)
 
 -- The group and target of the declared operator `op` means here, if any.
 --
@@ -916,57 +1012,64 @@ fun splitHint(r : R, op : String) -> String =
 -- of it an error. Choosing between them by operand types would also choose a
 -- group, and so how the chain around the use is grouped.
 fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
-    match Map.get(conflictsIn(r.scope, OperatorSpace), op) {
-        Some(ids) -> report("the operator '" + op + "' is ambiguous: it is declared in "
-                            + String.join(Vec.map(Vec.sort(ids), declaringModule), " and ")
-                            + "; withhold all but one with '(" + op + ") as _' in "
-                            + "their imports", where)
-        None -> {}
-    }
-    match Map.get(r.scope.operators, op) {
-        Some(id) -> Map.get(r.operators, id)
-        None -> None
-    }
+	match Map.get(conflictsIn(r.scope, OperatorSpace), op) {
+		Some(ids) -> report(
+			"the operator '"
+				+ op
+				+ "' is ambiguous: it is declared in "
+				+ String.join(Vec.map(Vec.sort(ids), declaringModule), " and ")
+				+ "; withhold all but one with '("
+				+ op
+				+ ") as _' in "
+				+ "their imports",
+			where,
+		)
+		None -> {}
+	}
+	match Map.get(r.scope.operators, op) {
+		Some(id) -> Map.get(r.operators, id)
+		None     -> None
+	}
 }
 
 -- The module that declares the operator `id`, an internal name, quoted.
 fun declaringModule(id : String) -> String =
-    "'" + Prelude.display(Option.unwrapOr(Prelude.moduleOf(id), id)) + "'"
+	"'" + Prelude.display(Option.unwrapOr(Prelude.moduleOf(id), id)) + "'"
 
 -- One operator of a chain, applied. A built-in operator's node is spanned by
 -- where its left operand begins; a declared one's is spanned by the operator,
 -- which is what a diagnostic about the call should point at.
 fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -> Expr {
-    let (name, where) = op
-    match declared(r, name, where) {
-        Some((_, target)) -> {
-            let fn = node(where, EVar(target, False))
-            Binders.refer(r.binders, fn.id, target)
-            node(where, EBinary(name, left, right, Some(fn)))
-        }
-        None -> match Fixity.builtinGroup(name) {
-            Some(_) -> node(Source.through(from, right.span), EBinary(name, left, right, None))
-            None -> {
-                notDeclared(r, name, where)
-                node(where, EBinary(name, left, right, None))
-            }
-        }
-    }
+	let (name, where) = op
+	match declared(r, name, where) {
+		Some((_, target)) -> {
+			let fn = node(where, EVar(target, False))
+			Binders.refer(r.binders, fn.id, target)
+			node(where, EBinary(name, left, right, Some(fn)))
+		}
+		None -> match Fixity.builtinGroup(name) {
+			Some(_) -> node(Source.through(from, right.span), EBinary(name, left, right, None))
+			None -> {
+				notDeclared(r, name, where)
+				node(where, EBinary(name, left, right, None))
+			}
+		}
+	}
 }
 
 -- From the same supply as every parsed node's, for the reason `methodRef`
 -- gives.
 fun node(where : Span, kind : ExprKind) -> Expr =
-    Expr { id = freshNodeId(), span = where, kind = kind }
+	Expr { id = freshNodeId(), span = where, kind = kind }
 
 -- -- local frames -------------------------------------------------------------------
 
 -- Returns the binder `name` means in the innermost frame that binds it.
 fun local(r : R, name : String) -> Option Int {
-    for var i = len(r.locals) - 1; i >= 0; i = i - 1 {
-        if let Some(id) = Map.get(r.locals[i], name) { return Some(id) }
-    }
-    None
+	for var i = len(r.locals) - 1; i >= 0; i = i - 1 {
+		if let Some(id) = Map.get(r.locals[i], name) { return Some(id) }
+	}
+	None
 }
 
 fun push(r : R) -> Unit = Vec.push(r.locals, Map.new())
@@ -977,15 +1080,15 @@ fun pop(r : R) -> Unit = discard(Vec.pop(r.locals))
 -- frame, and records `nodeId` as its binding occurrence. A name the frame
 -- already binds is shadowed: later uses mean the new binder.
 fun bindLocal(r : R, nodeId : Int, name : String, where : Span, mutable : Bool) -> Unit {
-    let id = Binders.fresh(r.binders, r.owner, name, Local, Written(where, mutable))
-    Binders.record(r.binders, nodeId, id)
-    match Vec.last(r.locals) {
-        Some(frame) -> Map.put(frame, name, id)
-        None -> {}
-    }
+	let id = Binders.fresh(r.binders, r.owner, name, Local, Written(where, mutable))
+	Binders.record(r.binders, nodeId, id)
+	match Vec.last(r.locals) {
+		Some(frame) -> Map.put(frame, name, id)
+		None        -> {}
+	}
 }
 
 fun report(message : String, where : Span) -> Unit =
-    Diag.report(Diag.at("type error", message, where))
+	Diag.report(Diag.at("type error", message, where))
 
-fun discard(x : a) -> Unit = {}
+fun discard(x : a) -> Unit {}

@@ -274,7 +274,23 @@ turkey format -- -odd-name.gob
 ```
 
 As for the other commands, `--` ends the options, so every argument after it
-is a file, even one whose name starts with `-`.
+is a file, even one whose name starts with `-`. The exception is `-` itself,
+which means standard input there too, as below.
+
+`turkey format -` formats the text on standard input instead and writes it to
+standard output, for an editor to run on a buffer. It checks the text as it
+checks a file, and exits with the same statuses: 2 if the formatter refuses it,
+3 if it cannot be read or does not parse, and 4 for a command line it cannot
+read. On any of those it writes nothing to standard output. With `--check` it
+writes nothing either, and exits with status 1 if the text would change.
+Diagnostics call the input `<stdin>`, or the name given with
+`--stdin-name NAME`. `-` cannot be given with files, so a file named `-` is
+written `./-`.
+
+```sh
+turkey format - < hello.gob > formatted.gob
+turkey format --check --stdin-name hello.gob - < hello.gob
+```
 
 The formatter changes only what leaves the program as it is: line breaks,
 indentation, spaces, blank lines, the commas of a list, `;`, and the `=` before

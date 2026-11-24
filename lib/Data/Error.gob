@@ -62,8 +62,22 @@ type SomeError = SomeError[Error e] { payload : e, cause : Option SomeError }
 
 --- Packs `value` into the channel, with no cause. `throw` packs it and
 --- returns it as a failed result in one step.
-fun fail[Error e](value : e) -> SomeError =
-	SomeError { payload = value, cause = None }
+---
+--- Returns `value` itself when it is a `SomeError` already, so a `SomeError`
+--- never holds another as its payload, and `cast` finds the payload `value`
+--- was packed with.
+fun fail[Error e](value : e) -> SomeError = match packed(value) {
+	Some(s) -> s
+	None    -> SomeError { payload = value, cause = None }
+}
+
+-- `value` as the `SomeError` it is, if it is one. `Error` has `Typed` as its
+-- superclass, so the check needs no constraint beyond the caller's, and it is
+-- the same comparison of reps that `cast` makes.
+fun packed[Error e](value : e) -> Option SomeError {
+	let want : Proxy SomeError = Proxy
+	if typeRep(want) == typeRep(proxyOf(value)) { Some(Prim.castAs(value)) } else { None }
+}
 
 --- Returns `Left(fail(value))`: a failed result whose error is `value`, packed
 --- with no cause.
@@ -80,8 +94,23 @@ fun promote[Error e](x : Either e a) -> Either SomeError a = mapLeft(x, fail)
 
 --- Add context, keeping `inner` as the cause. The new payload is what a reader
 --- sees first; the original is one `causeOf` away and still carries its own.
-fun context[Error e](inner : SomeError, value : e) -> SomeError =
-	SomeError { payload = value, cause = Some(inner) }
+---
+--- When `value` is a `SomeError` already, returns its chain with `inner` after
+--- its last cause, so no payload is itself a `SomeError`, and `describe` reads
+--- `value`'s messages and then `inner`'s.
+fun context[Error e](inner : SomeError, value : e) -> SomeError = match packed(value) {
+	Some(outer) -> above(outer, inner)
+	None        -> SomeError { payload = value, cause = Some(inner) }
+}
+
+-- `outer`'s chain, with `inner` as the cause of its last error.
+fun above(outer : SomeError, inner : SomeError) -> SomeError = match outer {
+	SomeError { payload = p, cause = None } -> SomeError { payload = p, cause = Some(inner) }
+	SomeError { payload = p, cause = Some(c) } -> SomeError {
+		payload = p
+		cause   = Some(above(c, inner))
+	}
+}
 
 -- A packed payload is read by opening it, never by `.field`: the field's type
 -- is the hidden one, so `.payload` has no type to have. These three are the
@@ -104,8 +133,9 @@ fun describe(s : SomeError) -> String = match s {
 
 instance Show SomeError { fun show(s) = describe(s) }
 
---- Returns the whole chain as the message, as `describe` writes it. Passing a
---- `SomeError` to `fail` packs it inside another rather than returning it.
+--- Returns the whole chain as the message, as `describe` writes it. `fail`
+--- returns a `SomeError` unchanged, and `context` appends to its chain, so
+--- neither packs one inside another.
 instance Error SomeError { fun message(s) = describe(s) }
 
 --- One of two errors, as a layer that wraps another describes its failures:

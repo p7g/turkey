@@ -13,7 +13,7 @@ export (
 --- wasm32-wasi, which has none.
 ---
 --- Each function here takes the arguments its namesake in `Turkey.Libc` takes
---- and answers as that one does: -1 or null on failure, with the error in
+--- and returns what that one does: -1 or null on failure, with the error in
 --- `errno`, which is this module's own word. And each speaks arm64 Linux's
 --- numbers and layouts -- its `O_*` flags, `AT_*` values and clock ids, its
 --- error numbers, and its `struct stat` and `struct dirent` -- so that
@@ -24,21 +24,13 @@ export (
 --- so the allocator, the scratch space the calls share and `errno` take no
 --- lock. A wasm program with threads would need them first.
 ---
---- **No `Turkey.Ptr`.** That module, `Turkey.Process` and the rest call into this
---- one through `Turkey.Os`, so this one reads and writes memory through the
---- primitives alone and imports nothing of theirs.
----
 --- **Paths.** WASI has no working directory and no root: a path is opened
 --- relative to a directory the host *preopened* and named, as `wasmtime --dir
---- DIR` does. So a path is resolved here, as wasi-libc resolves one: an
---- absolute path, or a relative one taken from `/`, which is this module's
---- working directory, is opened under the preopened directory whose name is
---- its longest leading run of whole components. A preopen named `.` or `/`
---- matches every path. Anything else -- a path outside every preopen, or `..`
---- out of one -- the host refuses.
----
---- A giblet module, since the collector's own allocations come from here:
---- nothing here allocates on the heap or uses a string literal.
+--- DIR` does. An absolute path, or a relative one taken from `/`, which is
+--- this module's working directory, is opened under the preopened directory
+--- whose name is its longest leading run of whole components. A preopen named
+--- `.` or `/` matches every path. Anything else -- a path outside every
+--- preopen, or `..` out of one -- the host refuses.
 
 import Prelude ()
 import Data.Int (Int)
@@ -46,15 +38,21 @@ import Data.Tuple (Unit)
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), BitOr(..), Shift(..), (&), (|), (<<), (>>))
+import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
 import Data.Int ()
 import Data.Bool (Bool(..))
+
+-- A giblet module, since the collector's own allocations come from here:
+-- nothing here allocates on the heap or uses a string literal. And
+-- `Turkey.Ptr`, `Turkey.Process` and the rest call into this module through
+-- `Turkey.Os`, so it reads and writes memory through the primitives alone and
+-- imports nothing of theirs.
 
 type Ptr = Prim.Ptr
 
 -- -- the imports -----------------------------------------------------------------------
 --
--- WASI preview 1, as the host provides it to a core module. Each answers
+-- WASI preview 1, as the host provides it to a core module. Each returns
 -- WASI's error number as an `i32`, 0 for success, and writes what it
 -- returns through the pointer it is given. Every pointer is an address in
 -- this program's linear memory and crosses as an `i32`; an integer crosses as
@@ -132,20 +130,66 @@ fun store8(p : Ptr, offset : Int, value : Int) -> Unit =
 -- A 32-bit address WASI stored, as a pointer.
 fun loadAddress(p : Ptr, offset : Int) -> Ptr = Prim.ptrFromInt(load32(p, offset))
 
--- -- errno -----------------------------------------------------------------------------
+-- -- the state -------------------------------------------------------------------------
+--
+-- What this module keeps between calls, in a block of its own rather than in
+-- globals: a program compiled for another target loads this module too, and
+-- would carry and initialize every global it declared. The block is the
+-- first `stateBytes()` of the one `startVector` grows, before the argument
+-- vector, which `Turkey.Entry` hands `Turkey.Process.argsSet` as `argv`. So
+-- the state is found from the `argv` word of the process state, the word at 16,
+-- with one thread the only worker record there is. `startVector` runs before
+-- anything else here, and grown memory is zeroed, so each field starts as 0,
+-- null or False.
+--
+-- The fields: `errno` at 0; the allocator's block at 8; the environment and
+-- how many variables it has at 16 and 24, and whether it has been read at 32;
+-- the scratch block at 40; the preopens, how many there are and whether they
+-- have been read at 48, 56 and 64; and what `resolve` leaves, a path and its
+-- length, at 72 and 80.
 
-var lastError : Int = 0
+fun stateBytes() -> Int = 88
+
+fun state() -> Ptr = at(loadPtr(Prim.processState(), 16), -(8 + stateBytes()))
+
+fun flag(offset : Int) -> Bool = load64(state(), offset) != 0
+fun flagSet(offset : Int, value : Bool) -> Unit = store64(state(), offset, if value { 1 } else { 0 })
+
+fun lastError() -> Int = load64(state(), 0)
+fun lastErrorSet(n : Int) -> Unit = store64(state(), 0, n)
+fun allocator() -> Ptr = loadPtr(state(), 8)
+fun allocatorSet(p : Ptr) -> Unit = storePtr(state(), 8, p)
+fun environ() -> Ptr = loadPtr(state(), 16)
+fun environSet(p : Ptr) -> Unit = storePtr(state(), 16, p)
+fun environCount() -> Int = load64(state(), 24)
+fun environCountSet(n : Int) -> Unit = store64(state(), 24, n)
+fun environRead() -> Bool = flag(32)
+fun environReadSet(b : Bool) -> Unit = flagSet(32, b)
+fun scratch() -> Ptr = loadPtr(state(), 40)
+fun scratchSet(p : Ptr) -> Unit = storePtr(state(), 40, p)
+fun preopens() -> Ptr = loadPtr(state(), 48)
+fun preopensSet(p : Ptr) -> Unit = storePtr(state(), 48, p)
+fun preopenCount() -> Int = load64(state(), 56)
+fun preopenCountSet(n : Int) -> Unit = store64(state(), 56, n)
+fun preopensRead() -> Bool = flag(64)
+fun preopensReadSet(b : Bool) -> Unit = flagSet(64, b)
+fun resolvedPath() -> Ptr = loadPtr(state(), 72)
+fun resolvedPathSet(p : Ptr) -> Unit = storePtr(state(), 72, p)
+fun resolvedLength() -> Int = load64(state(), 80)
+fun resolvedLengthSet(n : Int) -> Unit = store64(state(), 80, n)
+
+-- -- errno -----------------------------------------------------------------------------
 
 --- Returns the error number the last failing call here set, in Linux's
 --- numbering.
-fun errno() -> Int = lastError
+fun errno() -> Int = lastError()
 
 --- Sets `errno`.
-fun errnoSet(n : Int) -> Unit { lastError = n }
+fun errnoSet(n : Int) -> Unit = lastErrorSet(n)
 
--- Record WASI's error `code` as `errno`, and answer -1.
+-- Record WASI's error `code` as `errno`, and return -1.
 fun failed(code : Int) -> Int {
-    lastError = linuxErrno(code)
+    lastErrorSet(linuxErrno(code))
     -1
 }
 
@@ -155,9 +199,9 @@ fun checked(code : Prim.Int32) -> Int {
     if n == 0 { 0 } else { failed(n) }
 }
 
--- Record Linux's error number `n` and answer -1, for a failure found here.
+-- Record Linux's error number `n` and return -1, for a failure found here.
 fun refused(n : Int) -> Int {
-    lastError = n
+    lastErrorSet(n)
     -1
 }
 
@@ -254,7 +298,7 @@ fun linuxErrno(code : Int) -> Int = match code {
 -- `malloc` over `memory.grow`, which hands out 64 KiB pages and takes none
 -- back. A block of at most `smallLimit()` bytes comes from a page carved into
 -- blocks of one power of two, from 16 bytes up; a larger block is a run of
--- whole pages, which is also what `alignedAlloc` answers, since a page is
+-- whole pages, which is also what `alignedAlloc` returns, since a page is
 -- aligned to its own size. A freed small block goes on its size's list and a
 -- freed run on the list of runs, first fit, and neither goes back to the
 -- engine.
@@ -272,10 +316,9 @@ fun classes() -> Int = 12
 fun runBit() -> Int = 0x8000_0000
 fun mapBytes() -> Int = 262144
 
--- The page map, then the head of each size class's list from `mapBytes()`, and
--- then the head of the list of free runs. Null until the first allocation.
-var allocator : Ptr = Prim.ptrNull()
-
+-- The allocator's block (`allocator`): the page map, then the head of each
+-- size class's list from `mapBytes()`, and then the head of the list of free
+-- runs. Null until the first allocation.
 fun runsAt() -> Int = mapBytes() + 8 * classes()
 
 -- `pages` new pages, zeroed, or null if the engine refuses.
@@ -285,18 +328,18 @@ fun grow(pages : Int) -> Ptr {
 }
 
 fun ready() -> Bool {
-    if !isNull(allocator) { return True }
+    if !isNull(allocator()) { return True }
     let made = grow((runsAt() + 8 + pageBytes() - 1) / pageBytes())
     if isNull(made) { return False }
-    allocator = made
+    allocatorSet(made)
     True
 }
 
 fun pageOf(p : Ptr) -> Int = address(p) / pageBytes()
 
-fun entry(p : Ptr) -> Int = load32(allocator, 4 * pageOf(p))
+fun entry(p : Ptr) -> Int = load32(allocator(), 4 * pageOf(p))
 
-fun entrySet(p : Ptr, value : Int) -> Unit = store32(allocator, 4 * pageOf(p), value)
+fun entrySet(p : Ptr, value : Int) -> Unit = store32(allocator(), 4 * pageOf(p), value)
 
 -- The class of a request of `size` bytes, from 0 for 16 bytes.
 fun classOf(size : Int) -> Int {
@@ -315,14 +358,14 @@ fun classBytes(c : Int) -> Int {
     bytes
 }
 
---- `size` bytes, uninitialized, aligned to 16, or null.
+--- Returns `size` bytes, uninitialized, aligned to 16, or null.
 fun malloc(size : Int) -> Ptr {
     if size < 0 { return null() }
     if !ready() { return null() }
     if size > smallLimit() { return pages((size + pageBytes() - 1) / pageBytes()) }
     let c = classOf(size)
     let head = mapBytes() + 8 * c
-    var block = loadPtr(allocator, head)
+    var block = loadPtr(allocator(), head)
     if isNull(block) {
         let page = pages(1)
         if isNull(page) { return page }
@@ -338,10 +381,10 @@ fun malloc(size : Int) -> Ptr {
             next = b
             offset = offset - bytes
         }
-        storePtr(allocator, head, next)
+        storePtr(allocator(), head, next)
         return page
     }
-    storePtr(allocator, head, loadPtr(block, 0))
+    storePtr(allocator(), head, loadPtr(block, 0))
     block
 }
 
@@ -349,7 +392,7 @@ fun malloc(size : Int) -> Ptr {
 -- otherwise; marked in the map. The rest of a longer free run stays free.
 fun pages(n : Int) -> Ptr {
     var previous = null()
-    var run = loadPtr(allocator, runsAt())
+    var run = loadPtr(allocator(), runsAt())
     while !isNull(run) {
         let length = load64(run, 8)
         let next = loadPtr(run, 0)
@@ -363,7 +406,7 @@ fun pages(n : Int) -> Ptr {
             } else {
                 next
             }
-            if isNull(previous) { storePtr(allocator, runsAt(), after) }
+            if isNull(previous) { storePtr(allocator(), runsAt(), after) }
             else { storePtr(previous, 0, after) }
             entrySet(run, runBit() | n)
             return run
@@ -377,20 +420,20 @@ fun pages(n : Int) -> Ptr {
     made
 }
 
---- Gives back a block `malloc`, `realloc` or `alignedAlloc` answered. Null is
---- nothing to give back.
+--- Gives back a block `malloc`, `realloc` or `alignedAlloc` returned. Does
+--- nothing with null.
 fun free(p : Ptr) -> Unit {
-    if isNull(p) || isNull(allocator) { return }
+    if isNull(p) || isNull(allocator()) { return }
     let e = entry(p)
     if e & runBit() != 0 {
         entrySet(p, 0)
-        storePtr(p, 0, loadPtr(allocator, runsAt()))
+        storePtr(p, 0, loadPtr(allocator(), runsAt()))
         store64(p, 8, e & 0xFFFF)
-        storePtr(allocator, runsAt(), p)
+        storePtr(allocator(), runsAt(), p)
     } else if e != 0 {
         let head = mapBytes() + 8 * (e - 1)
-        storePtr(p, 0, loadPtr(allocator, head))
-        storePtr(allocator, head, p)
+        storePtr(p, 0, loadPtr(allocator(), head))
+        storePtr(allocator(), head, p)
     }
 }
 
@@ -400,8 +443,8 @@ fun blockBytes(p : Ptr) -> Int {
     if e & runBit() != 0 { (e & 0xFFFF) * pageBytes() } else { classBytes(e - 1) }
 }
 
---- `p`'s block resized to `size` bytes, its contents kept, or null with `p`
---- untouched. A null `p` makes this `malloc`.
+--- Returns `p`'s block resized to `size` bytes, its contents kept, or null with
+--- `p` untouched. A null `p` makes this `malloc`.
 fun realloc(p : Ptr, size : Int) -> Ptr {
     if isNull(p) { return malloc(size) }
     let held = blockBytes(p)
@@ -413,12 +456,12 @@ fun realloc(p : Ptr, size : Int) -> Ptr {
     grown
 }
 
---- `size` bytes at a multiple of `alignment`, which is a power of two, or null.
---- Any alignment up to a page's 64 KiB, and none above it.
+--- Returns `size` bytes at a multiple of `alignment`, which is a power of two,
+--- or null. Takes any alignment up to a page's 64 KiB, and none above it.
 fun alignedAlloc(alignment : Int, size : Int) -> Ptr {
     if alignment <= 16 { return malloc(size) }
     if alignment > pageBytes() || size < 0 || !ready() {
-        lastError = einval()
+        lastErrorSet(einval())
         return null()
     }
     pages((size + pageBytes() - 1) / pageBytes())
@@ -426,15 +469,15 @@ fun alignedAlloc(alignment : Int, size : Int) -> Ptr {
 
 -- -- bytes -----------------------------------------------------------------------------
 
---- The bytes before the first NUL.
+--- Returns how many bytes come before the first NUL.
 fun strlen(s : Ptr) -> Int {
     var n = 0
     while load8(s, n) != 0 { n = n + 1 }
     n
 }
 
---- The address of the first of the `n` bytes at `s` equal to `c`'s low byte,
---- or null.
+--- Returns the address of the first of the `n` bytes at `s` equal to `c`'s
+--- low byte, or null.
 fun memchr(s : Ptr, c : Int, n : Int) -> Ptr {
     let byte = c & 0xFF
     for var i = 0; i < n; i = i + 1 {
@@ -443,8 +486,9 @@ fun memchr(s : Ptr, c : Int, n : Int) -> Ptr {
     null()
 }
 
---- Negative, zero or positive as the `n` bytes at `a` order below, the same
---- as or above the `n` at `b`, compared as unsigned bytes.
+--- Returns a negative number, zero or a positive one as the `n` bytes at `a`
+--- order below, the same as or above the `n` at `b`, compared as unsigned
+--- bytes.
 fun memcmp(a : Ptr, b : Ptr, n : Int) -> Int {
     for var i = 0; i < n; i = i + 1 {
         let x = load8(a, i)
@@ -454,8 +498,8 @@ fun memcmp(a : Ptr, b : Ptr, n : Int) -> Int {
     0
 }
 
---- The address of the first place the `needleLength` bytes at `needle` occur
---- among the `n` at `s`, or null.
+--- Returns the address of the first place the `needleLength` bytes at
+--- `needle` occur among the `n` at `s`, or null.
 fun memmem(s : Ptr, n : Int, needle : Ptr, needleLength : Int) -> Ptr {
     if needleLength == 0 { return s }
     for var i = 0; i + needleLength <= n; i = i + 1 {
@@ -469,44 +513,48 @@ fun memmem(s : Ptr, n : Int, needle : Ptr, needleLength : Int) -> Ptr {
 --- Returns the arguments as `main`'s `argv` would hold them, at word 1 of a
 --- block whose word 0 is `argc`: 8-byte pointers to NUL-terminated strings,
 --- then a null, then a null for an empty environment. In pages grown for it,
---- which last as long as the program, or null if there were none to grow.
----
---- Uses no global, since `Turkey.Entry` calls it before any is initialized.
+--- which last as long as the program, or null if there were none to grow. The
+--- vector is to be handed to `Turkey.Process.argsSet` before any other call
+--- here, which finds this module's state from it.
 fun startVector() -> Ptr {
-    -- The two sizes are written into the first page before its layout is
-    -- known, and the pages grown after it follow it, so the block is one run.
+    -- This module's state, then `argc`, the vector and its two nulls, WASI's
+    -- own 4-byte vector, and the strings. The two sizes are read into the
+    -- first page before the layout is known; the pages grown after it follow
+    -- it, so the block is one run. It reads and writes no state, since the
+    -- state is found from what it returns.
     let first = grow(1)
     if isNull(first) { return first }
-    if int(argsSizesGet(first, at(first, 4))) != 0 { return null() }
+    let vector = at(first, stateBytes())
+    store64(vector, 0, 0)
+    storePtr(vector, 8, null())
+    storePtr(vector, 16, null())
+    if int(argsSizesGet(first, at(first, 4))) != 0 { return vector }
     let count = load32(first, 0)
     let bytes = load32(first, 4)
-    -- `argc`, the vector and its two nulls; WASI's own 4-byte vector; then the
-    -- strings.
+    store64(first, 0, 0)
     let wide = 8 + 8 * (count + 2)
     let narrow = 4 * count
-    let total = wide + narrow + bytes
+    let total = stateBytes() + wide + narrow + bytes
     if total > pageBytes() {
-        if isNull(grow((total - 1) / pageBytes())) { return null() }
+        if isNull(grow((total - 1) / pageBytes())) { return vector }
     }
-    let strings = at(first, wide + narrow)
-    if int(argsGet(at(first, wide), strings)) != 0 { return null() }
-    store64(first, 0, count)
+    let strings = at(vector, wide + narrow)
+    if int(argsGet(at(vector, wide), strings)) != 0 { return vector }
+    store64(vector, 0, count)
     for var i = 0; i < count; i = i + 1 {
-        storePtr(first, 8 + 8 * i, loadAddress(first, wide + 4 * i))
+        storePtr(vector, 8 + 8 * i, loadAddress(vector, wide + 4 * i))
     }
-    storePtr(first, 8 + 8 * count, null())
-    storePtr(first, 8 + 8 * (count + 1), null())
-    first
+    storePtr(vector, 8 + 8 * count, null())
+    storePtr(vector, 8 + 8 * (count + 1), null())
+    vector
 }
 
--- The environment, as WASI's `environ_get` lays it out: 4-byte pointers to
--- `NAME=value` strings, `environCount` of them. Read at the first `getenv`.
-var environ : Ptr = Prim.ptrNull()
-var environCount : Int = 0
-var environRead : Bool = False
+-- The environment (`environ`), as WASI's `environ_get` lays it out: 4-byte
+-- pointers to `NAME=value` strings, `environCount` of them. Read at the first
+-- `getenv`.
 
 fun environLoad() -> Unit {
-    environRead = True
+    environReadSet(True)
     let sizes = malloc(8)
     if isNull(sizes) { return }
     if int(environSizesGet(sizes, at(sizes, 4))) != 0 {
@@ -522,28 +570,28 @@ fun environLoad() -> Unit {
         free(block)
         return
     }
-    environ = block
-    environCount = count
+    environSet(block)
+    environCountSet(count)
 }
 
---- The value of the variable whose NUL-terminated name is `name`, or null.
---- The pointer is good for as long as the program runs.
+--- Returns the value of the variable whose NUL-terminated name is `name`, or
+--- null. The pointer is good for as long as the program runs.
 fun getenv(name : Ptr) -> Ptr {
-    if !environRead { environLoad() }
+    if !environRead() { environLoad() }
     let n = strlen(name)
-    for var i = 0; i < environCount; i = i + 1 {
-        let entry = loadAddress(environ, 4 * i)
+    for var i = 0; i < environCount(); i = i + 1 {
+        let entry = loadAddress(environ(), 4 * i)
         if memcmp(entry, name, n) == 0 && load8(entry, n) == 61 { return at(entry, n + 1) }
     }
     null()
 }
 
---- `/`, in a block from `malloc` the caller frees, or null: the directory a
---- relative path is resolved from.
+--- Returns `/`, the directory a relative path is resolved from, in a block
+--- from `malloc` the caller frees, or null.
 fun getcwd(buffer : Ptr, size : Int) -> Ptr {
     let p = malloc(2)
     if isNull(p) {
-        lastError = enomem()
+        lastErrorSet(enomem())
         return p
     }
     store8(p, 0, 47)
@@ -551,27 +599,25 @@ fun getcwd(buffer : Ptr, size : Int) -> Ptr {
     p
 }
 
---- Null, with `errno` `ENOSYS`: WASI has no way to ask where a symbolic link
---- leads short of reading every component, and no absolute name for a
---- preopened directory.
+--- Returns null, with `errno` `ENOSYS`: WASI has no way to ask where a
+--- symbolic link leads short of reading every component, and no absolute name
+--- for a preopened directory.
 fun realpath(path : Ptr, resolved : Ptr) -> Ptr {
-    lastError = enosys()
+    lastErrorSet(enosys())
     null()
 }
 
 --- Ends the program with `status`, at once.
 fun exit(status : Int) -> Unit = procExit(i32(status))
 
---- 0, at once: with one thread there is nothing to yield to. (WASI's
---- `sched_yield` has the C library's name, which `Turkey.Libc` declares, and a
---- symbol comes from one library.)
+--- Returns 0 at once: with one thread there is nothing to yield to.
 fun schedYield() -> Int = 0
 
 -- -- the clocks ------------------------------------------------------------------------
 
---- Fill the `struct timespec` at `timespec` -- seconds, then nanoseconds --
+--- Fills the `struct timespec` at `timespec` -- seconds, then nanoseconds --
 --- from Linux's clock `id`: `CLOCK_REALTIME` (0), `CLOCK_MONOTONIC` (1) or
---- `CLOCK_REALTIME_COARSE` (5). 0, or -1.
+--- `CLOCK_REALTIME_COARSE` (5). Returns 0, or -1.
 fun clockGettime(id : Int, timespec : Ptr) -> Int {
     let clock = match id {
         0 -> 0
@@ -588,15 +634,13 @@ fun clockGettime(id : Int, timespec : Ptr) -> Int {
 
 -- -- scratch -----------------------------------------------------------------------------
 --
--- Room for what a call hands WASI and reads back: an `iovec` at 0, a count
+-- The scratch block (`scratch`): room for what a call hands WASI and reads back: an `iovec` at 0, a count
 -- or a descriptor at 16, and a `filestat` or an `fdstat` at 64. One thread
 -- makes one call at a time, so one block serves every call.
 
-var scratch : Ptr = Prim.ptrNull()
-
 fun scratchReady() -> Bool {
-    if isNull(scratch) { scratch = malloc(128) }
-    !isNull(scratch)
+    if isNull(scratch()) { scratchSet(malloc(128)) }
+    !isNull(scratch())
 }
 
 fun doneAt() -> Int = 16
@@ -606,51 +650,53 @@ fun statAt() -> Int = 64
 
 -- One `iovec` of `count` bytes at `buf`, at the start of the scratch block.
 fun oneBuffer(buf : Ptr, count : Int) -> Ptr {
-    store32(scratch, 0, address(buf))
-    store32(scratch, 4, count)
-    scratch
+    store32(scratch(), 0, address(buf))
+    store32(scratch(), 4, count)
+    scratch()
 }
 
--- What a transfer answers: the count WASI stored, or -1.
+-- What a transfer returns: the count WASI stored, or -1.
 fun moved(code : Prim.Int32) -> Int =
-    if checked(code) != 0 { -1 } else { load32(scratch, doneAt()) }
+    if checked(code) != 0 { -1 } else { load32(scratch(), doneAt()) }
 
---- Bytes read, 0 at the end, or -1.
+--- Returns how many bytes it read, 0 at the end, or -1.
 fun read(fd : Int, buf : Ptr, count : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdRead(i32(fd), oneBuffer(buf, count), i32(1), at(scratch, doneAt())))
+    moved(fdRead(i32(fd), oneBuffer(buf, count), i32(1), at(scratch(), doneAt())))
 }
 
---- Bytes written, or -1.
+--- Returns how many bytes it wrote, or -1.
 fun write(fd : Int, buf : Ptr, count : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdWrite(i32(fd), oneBuffer(buf, count), i32(1), at(scratch, doneAt())))
+    moved(fdWrite(i32(fd), oneBuffer(buf, count), i32(1), at(scratch(), doneAt())))
 }
 
---- `read` and `write` at `offset`, without moving the file's position.
+--- Reads and writes as `read` and `write` do, at `offset` and without moving
+--- the file's position.
 fun pread(fd : Int, buf : Ptr, count : Int, offset : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdPread(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch, doneAt())))
+    moved(fdPread(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch(), doneAt())))
 }
 
 fun pwrite(fd : Int, buf : Ptr, count : Int, offset : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    moved(fdPwrite(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch, doneAt())))
+    moved(fdPwrite(i32(fd), oneBuffer(buf, count), i32(1), offset, at(scratch(), doneAt())))
 }
 
---- 0, or -1.
+--- Closes `fd`: returns 0, or -1.
 fun close(fd : Int) -> Int = checked(fdClose(i32(fd)))
 
---- 1 for a terminal, and 0 otherwise: a character device that cannot seek,
---- as wasi-libc decides it.
+--- Returns 1 for a terminal, and 0 otherwise, with `errno` `ENOTTY`. A
+--- terminal is a character device that cannot seek, since WASI says nothing
+--- more about a stream.
 fun isatty(fd : Int) -> Int {
     if !scratchReady() { return 0 }
-    let stat = at(scratch, statAt())
+    let stat = at(scratch(), statAt())
     if checked(fdFdstatGet(i32(fd), stat)) != 0 { return 0 }
     -- `fd_seek` and `fd_tell`, rights 1 << 2 and 1 << 5.
     let seeks = load64(stat, 8) & 0x24
     if load8(stat, 0) == 2 && seeks == 0 { return 1 }
-    lastError = enotty()
+    lastErrorSet(enotty())
     0
 }
 
@@ -662,12 +708,12 @@ fun setStatusFlags() -> Int = 4
 fun linuxAppend() -> Int = 0x400
 fun linuxNonBlocking() -> Int = 0x800
 
---- `F_GETFD`, `F_SETFD` and `F_GETFL`, with no argument. There is no
+--- Handles `F_GETFD`, `F_SETFD` and `F_GETFL`, with no argument. There is no
 --- `exec`, so a descriptor's only flag, close-on-exec, reads as clear.
 fun fcntl(fd : Int, command : Int) -> Int {
     if command != getStatusFlags() { return 0 }
     if !scratchReady() { return refused(enomem()) }
-    let stat = at(scratch, statAt())
+    let stat = at(scratch(), statAt())
     if checked(fdFdstatGet(i32(fd), stat)) != 0 { return -1 }
     let flags = load32(stat, 0) >> 16
     var out = 0
@@ -676,8 +722,8 @@ fun fcntl(fd : Int, command : Int) -> Int {
     out
 }
 
---- `F_SETFD` and `F_SETFL`, with one argument: `O_APPEND` and `O_NONBLOCK`
---- are what WASI can set.
+--- Handles `F_SETFD` and `F_SETFL`, with one argument: `O_APPEND` and
+--- `O_NONBLOCK` are what WASI can set.
 fun fcntlWith(fd : Int, command : Int, argument : Int) -> Int {
     if command != setStatusFlags() { return 0 }
     var flags = 0
@@ -686,17 +732,14 @@ fun fcntlWith(fd : Int, command : Int, argument : Int) -> Int {
     checked(fdFdstatSetFlags(i32(fd), i32(flags)))
 }
 
---- -1 with `errno` `ENOSYS`: WASI has no file locks.
+--- Returns -1 with `errno` `ENOSYS`: WASI has no file locks.
 fun flock(fd : Int, operation : Int) -> Int = refused(enosys())
 
 -- -- paths -------------------------------------------------------------------------------
 
--- The preopened directories, read at the first path: `preopenCount` of them,
--- each 24 bytes at `preopens` -- its descriptor, its name with no leading
+-- The preopened directories (`preopens`), read at the first path:
+-- `preopenCount` of them, each 24 bytes -- its descriptor, its name with no leading
 -- `/` or `./` and no trailing `/`, and the name's length.
-var preopens : Ptr = Prim.ptrNull()
-var preopenCount : Int = 0
-var preopensRead : Bool = False
 
 fun preopenBytes() -> Int = 24
 
@@ -708,7 +751,7 @@ fun atRemoveDirectory() -> Int = 0x200
 -- A host numbers the preopens from 3, after the standard streams, and the
 -- first descriptor that is not one ends them.
 fun preopensLoad() -> Unit {
-    preopensRead = True
+    preopensReadSet(True)
     let prestat = malloc(8)
     if isNull(prestat) { return }
     var capacity = 0
@@ -724,25 +767,25 @@ fun preopensLoad() -> Unit {
                 break
             }
             store8(name, length, 0)
-            if preopenCount == capacity {
+            if preopenCount() == capacity {
                 capacity = if capacity == 0 { 4 } else { 2 * capacity }
-                let grown = realloc(preopens, preopenBytes() * capacity)
+                let grown = realloc(preopens(), preopenBytes() * capacity)
                 if isNull(grown) {
                     free(name)
                     break
                 }
-                preopens = grown
+                preopensSet(grown)
             }
             let skip = leading(name, length)
             var end = length
             while end > skip && load8(name, end - 1) == 47 { end = end - 1 }
             -- `.` alone is the empty name, which matches every path.
             if end - skip == 1 && load8(name, skip) == 46 { end = skip }
-            let row = at(preopens, preopenBytes() * preopenCount)
+            let row = at(preopens(), preopenBytes() * preopenCount())
             store64(row, 0, fd)
             storePtr(row, 8, at(name, skip))
             store64(row, 16, end - skip)
-            preopenCount = preopenCount + 1
+            preopenCountSet(preopenCount() + 1)
         }
         fd = fd + 1
     }
@@ -759,10 +802,6 @@ fun leading(path : Ptr, length : Int) -> Int {
     }
 }
 
--- Where `resolve` leaves the path to hand WASI, and its length.
-var resolvedPath : Ptr = Prim.ptrNull()
-var resolvedLength : Int = 0
-
 -- The descriptor WASI is to resolve the NUL-terminated `path` against, as
 -- Linux's `at` calls take `dir` and `path`, with what to resolve against it
 -- in `resolvedPath` and `resolvedLength`; or -1 with `errno` `ENOENT`, for a
@@ -771,19 +810,19 @@ fun resolve(dir : Int, path : Ptr) -> Int {
     let length = strlen(path)
     let absolute = length > 0 && load8(path, 0) == 47
     if dir >= 0 && !absolute {
-        resolvedPath = path
-        resolvedLength = length
+        resolvedPathSet(path)
+        resolvedLengthSet(length)
         return dir
     }
     if dir != atWorkingDirectory() && !absolute { return refused(ebadf()) }
-    if !preopensRead { preopensLoad() }
+    if !preopensRead() { preopensLoad() }
     let skip = leading(path, length)
     let rest = at(path, skip)
     let restLength = length - skip
     var best = -1
     var bestLength = -1
-    for var i = 0; i < preopenCount; i = i + 1 {
-        let row = at(preopens, preopenBytes() * i)
+    for var i = 0; i < preopenCount(); i = i + 1 {
+        let row = at(preopens(), preopenBytes() * i)
         let n = load64(row, 16)
         if n > bestLength && covers(loadPtr(row, 8), n, rest, restLength) {
             best = i
@@ -794,13 +833,13 @@ fun resolve(dir : Int, path : Ptr) -> Int {
     var inside = bestLength
     while inside < restLength && load8(rest, inside) == 47 { inside = inside + 1 }
     if inside == restLength {
-        resolvedPath = Prim.cString(".")
-        resolvedLength = 1
+        resolvedPathSet(Prim.cString("."))
+        resolvedLengthSet(1)
     } else {
-        resolvedPath = at(rest, inside)
-        resolvedLength = restLength - inside
+        resolvedPathSet(at(rest, inside))
+        resolvedLengthSet(restLength - inside)
     }
-    load64(at(preopens, preopenBytes() * best), 0)
+    load64(at(preopens(), preopenBytes() * best), 0)
 }
 
 -- Whether the preopen named by the `n` bytes at `name` holds the path in the
@@ -819,17 +858,35 @@ fun linuxTruncate() -> Int = 0x200
 fun linuxDirectory() -> Int = 0x4000
 fun linuxNoFollow() -> Int = 0x8000
 
--- Every right WASI defines, asked for on every open. Hosts that still check
--- rights grant a preopen's subdirectories what the preopen has, and an open
--- asks for no more than its descriptor's inheriting rights allow.
-fun allRights() -> Int = 0x1FFF_FFFF
+-- WASI's rights to read a file or a directory, `fd_read` and `fd_readdir`,
+-- and to change one, `fd_datasync`, `fd_write`, `fd_allocate` and
+-- `fd_filestat_set_size`. A host decides from them whether a descriptor reads
+-- or writes, so an open asks for the ones its access mode needs and no other
+-- of the six.
+fun readRights() -> Int = 0x2 | 0x4000
+fun writeRights() -> Int = 0x1 | 0x40 | 0x100 | 0x40_0000
 
---- A descriptor for `path`, opened with Linux's `flags`, or -1. `mode` is
---- read only for a file `O_CREAT` makes, and WASI has no permissions to set.
+-- What an open with Linux's `flags` asks for: every right but the six, then
+-- those of them its access mode needs, all within what the directory `dir`
+-- lets a descriptor opened under it have. -1 if `dir` cannot be asked.
+fun rightsFor(dir : Int, flags : Int) -> Int {
+    let stat = at(scratch(), statAt())
+    if checked(fdFdstatGet(i32(dir), stat)) != 0 { return -1 }
+    let inheriting = load64(stat, 16)
+    -- Bits 0 to 29 are every right WASI defines.
+    var wanted = 0x3FFF_FFFF ^ (readRights() | writeRights())
+    let mode = flags & linuxAccessMode()
+    if mode == 0 || mode == 2 { wanted = wanted | readRights() }
+    if mode == 1 || mode == 2 { wanted = wanted | writeRights() }
+    wanted & inheriting
+}
+
+--- Opens `path` with Linux's `flags`: returns a descriptor, or -1. WASI has no
+--- permissions to set, so `mode` is not read.
 fun open(path : Ptr, flags : Int, mode : Int) -> Int =
     openat(atWorkingDirectory(), path, flags, mode)
 
---- `open`, relative to the directory open on `dir`.
+--- Opens as `open` does, relative to the directory open on `dir`.
 fun openat(dir : Int, path : Ptr, flags : Int, mode : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
     let base = resolve(dir, path)
@@ -843,9 +900,12 @@ fun openat(dir : Int, path : Ptr, flags : Int, mode : Int) -> Int {
     if flags & linuxAppend() != 0 { fdflags = fdflags | 1 }
     if flags & linuxNonBlocking() != 0 { fdflags = fdflags | 4 }
     let lookup = if flags & linuxNoFollow() != 0 { 0 } else { 1 }
-    let opened = at(scratch, doneAt())
-    let code = pathOpen(i32(base), i32(lookup), resolvedPath, i32(resolvedLength),
-                        i32(oflags), allRights(), allRights(), i32(fdflags), opened)
+    let rights = rightsFor(base, flags)
+    if rights < 0 { return -1 }
+    let inheriting = load64(at(scratch(), statAt()), 16)
+    let opened = at(scratch(), doneAt())
+    let code = pathOpen(i32(base), i32(lookup), resolvedPath(), i32(resolvedLength()),
+                        i32(oflags), rights, inheriting, i32(fdflags), opened)
     if checked(code) != 0 { return -1 }
     load32(opened, 0)
 }
@@ -880,75 +940,76 @@ fun statFill(stat : Ptr, buf : Ptr) -> Unit {
     store64(buf, 96, modified % 1_000_000_000)
 }
 
---- Fill the `struct stat` at `buf` for the file open on `fd`: 0, or -1.
+--- Fills the `struct stat` at `buf` for the file open on `fd`: returns 0, or
+--- -1.
 fun fstat(fd : Int, buf : Ptr) -> Int {
     if !scratchReady() { return refused(enomem()) }
-    let stat = at(scratch, statAt())
+    let stat = at(scratch(), statAt())
     if checked(fdFilestatGet(i32(fd), stat)) != 0 { return -1 }
     statFill(stat, buf)
     0
 }
 
---- `fstat` for `path`, relative to `dir`, or for the link itself when `flags`
---- has `AT_SYMLINK_NOFOLLOW`.
+--- Fills the `struct stat` at `buf` as `fstat` does, for `path` relative to
+--- `dir`, or for the link itself when `flags` has `AT_SYMLINK_NOFOLLOW`.
 fun fstatat(dir : Int, path : Ptr, buf : Ptr, flags : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
     let base = resolve(dir, path)
     if base < 0 { return -1 }
     let lookup = if flags & atSymlinkNoFollow() != 0 { 0 } else { 1 }
-    let stat = at(scratch, statAt())
-    let code = pathFilestatGet(i32(base), i32(lookup), resolvedPath, i32(resolvedLength), stat)
+    let stat = at(scratch(), statAt())
+    let code = pathFilestatGet(i32(base), i32(lookup), resolvedPath(), i32(resolvedLength()), stat)
     if checked(code) != 0 { return -1 }
     statFill(stat, buf)
     0
 }
 
---- Remove a file, or with `AT_REMOVEDIR` in `flags` an empty directory.
+--- Removes a file, or with `AT_REMOVEDIR` in `flags` an empty directory.
 fun unlinkat(dir : Int, path : Ptr, flags : Int) -> Int {
     let base = resolve(dir, path)
     if base < 0 { return -1 }
     if flags & atRemoveDirectory() != 0 {
-        checked(pathRemoveDirectory(i32(base), resolvedPath, i32(resolvedLength)))
+        checked(pathRemoveDirectory(i32(base), resolvedPath(), i32(resolvedLength())))
     } else {
-        checked(pathUnlinkFile(i32(base), resolvedPath, i32(resolvedLength)))
+        checked(pathUnlinkFile(i32(base), resolvedPath(), i32(resolvedLength())))
     }
 }
 
---- Make a directory. WASI has no permissions, so `mode` is not read.
+--- Makes a directory. WASI has no permissions, so `mode` is not read.
 fun mkdirat(dir : Int, path : Ptr, mode : Int) -> Int {
     let base = resolve(dir, path)
     if base < 0 { return -1 }
-    checked(pathCreateDirectory(i32(base), resolvedPath, i32(resolvedLength)))
+    checked(pathCreateDirectory(i32(base), resolvedPath(), i32(resolvedLength())))
 }
 
---- Rename `from`, relative to `fromDir`, to `to`, relative to `toDir`.
+--- Renames `from`, relative to `fromDir`, to `to`, relative to `toDir`.
 fun renameat(fromDir : Int, from : Ptr, toDir : Int, to : Ptr) -> Int {
     let fromBase = resolve(fromDir, from)
     if fromBase < 0 { return -1 }
-    let fromPath = resolvedPath
-    let fromLength = resolvedLength
+    let fromPath = resolvedPath()
+    let fromLength = resolvedLength()
     let toBase = resolve(toDir, to)
     if toBase < 0 { return -1 }
-    checked(pathRename(i32(fromBase), fromPath, i32(fromLength), i32(toBase), resolvedPath,
-                       i32(resolvedLength)))
+    checked(pathRename(i32(fromBase), fromPath, i32(fromLength), i32(toBase), resolvedPath(),
+                       i32(resolvedLength())))
 }
 
---- The target of the symbolic link `path` into `buf`, with no NUL and cut
---- short at `size` bytes: how many were written, or -1.
+--- Writes the target of the symbolic link `path` into `buf`, with no NUL and
+--- cut short at `size` bytes: returns how many it wrote, or -1.
 fun readlinkat(dir : Int, path : Ptr, buf : Ptr, size : Int) -> Int {
     if !scratchReady() { return refused(enomem()) }
     let base = resolve(dir, path)
     if base < 0 { return -1 }
-    let used = at(scratch, doneAt())
-    let code = pathReadlink(i32(base), resolvedPath, i32(resolvedLength), buf, i32(size), used)
+    let used = at(scratch(), doneAt())
+    let code = pathReadlink(i32(base), resolvedPath(), i32(resolvedLength()), buf, i32(size), used)
     if checked(code) != 0 { return -1 }
     load32(used, 0)
 }
 
---- Null, with `errno` `ENOSYS`: WASI has no source of unique names that a
---- program could rely on to make a private directory.
+--- Returns null, with `errno` `ENOSYS`: WASI has no source of unique names
+--- that a program could rely on to make a private directory.
 fun mkdtemp(template : Ptr) -> Ptr {
-    lastError = enosys()
+    lastErrorSet(enosys())
     null()
 }
 
@@ -958,7 +1019,7 @@ fun mkdtemp(template : Ptr) -> Ptr {
 -- the next entry to ask WASI for at 8, the buffer `fd_readdir` fills at 16,
 -- its size at 24, how much of it holds entries at 32 and how far they have
 -- been read at 40, and whether the last fill reached the directory's end at
--- 48. Then the Linux `struct dirent` `readdir` answers, from `direntAt()`:
+-- 48. Then the Linux `struct dirent` `readdir` returns, from `direntAt()`:
 -- its type at 18 and its name, NUL-terminated, from 19.
 
 fun streamBytes() -> Int = 56
@@ -966,17 +1027,17 @@ fun direntAt() -> Int = 56
 fun direntRoom() -> Int = 19 + 4096 + 1
 fun bufferBytes() -> Int = 4096
 
---- A directory stream over `fd`, which it owns from now on, or null.
+--- Returns a directory stream over `fd`, which it owns from now on, or null.
 fun fdopendir(fd : Int) -> Ptr {
     let stream = malloc(streamBytes() + direntRoom())
     if isNull(stream) {
-        lastError = enomem()
+        lastErrorSet(enomem())
         return stream
     }
     let buffer = malloc(bufferBytes())
     if isNull(buffer) {
         free(stream)
-        lastError = enomem()
+        lastErrorSet(enomem())
         return buffer
     }
     store64(stream, 0, fd)
@@ -993,8 +1054,8 @@ fun fdopendir(fd : Int) -> Ptr {
 -- the type at 20, then the name, not terminated.
 fun wasiDirentBytes() -> Int = 24
 
---- The next entry of `stream`, in storage the stream owns until the next
---- call, or null: at the end, with `errno` untouched, or with it set.
+--- Returns the next entry of `stream`, in storage the stream owns until the
+--- next call, or null: at the end, with `errno` untouched, or with it set.
 fun readdir(stream : Ptr) -> Ptr {
     loop {
         let buffer = loadPtr(stream, 16)
@@ -1019,7 +1080,7 @@ fun readdir(stream : Ptr) -> Ptr {
                 let bytes = 2 * load64(stream, 24)
                 let grown = realloc(buffer, bytes)
                 if isNull(grown) {
-                    lastError = enomem()
+                    lastErrorSet(enomem())
                     return null()
                 }
                 storePtr(stream, 16, grown)
@@ -1029,14 +1090,14 @@ fun readdir(stream : Ptr) -> Ptr {
         -- A short fill was the last; what it left over is no whole entry.
         if load64(stream, 48) != 0 { return null() }
         if !scratchReady() {
-            lastError = enomem()
+            lastErrorSet(enomem())
             return null()
         }
         let room = load64(stream, 24)
         let code = fdReaddir(i32(load64(stream, 0)), loadPtr(stream, 16), i32(room),
-                             load64(stream, 8), at(scratch, doneAt()))
+                             load64(stream, 8), at(scratch(), doneAt()))
         if checked(code) != 0 { return null() }
-        let filled = load32(scratch, doneAt())
+        let filled = load32(scratch(), doneAt())
         store64(stream, 32, filled)
         store64(stream, 40, 0)
         if filled < room { store64(stream, 48, 1) }
@@ -1055,7 +1116,7 @@ fun direntType(t : Int) -> Int = match t {
     _ -> 0
 }
 
---- Close the stream and its descriptor: 0, or -1.
+--- Closes the stream and its descriptor: returns 0, or -1.
 fun closedir(stream : Ptr) -> Int {
     let r = close(load64(stream, 0))
     free(loadPtr(stream, 16))

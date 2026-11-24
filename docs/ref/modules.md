@@ -479,26 +479,66 @@ a circle
 `Kit` exports its own `name` through `..`, the qualifier `Set`, everything
 `Shapes` exports, and `gcd` from `Data.Int`.
 
-The list is written as an [import's list](#imports) is, except that an entry
-cannot rename:
+The list is written as an [import's list](#imports) is, and means what it
+means there:
 
 * `..` stands for every export of the module, **its exported qualifiers
   included**, so passing on a module's contents passes on the qualifiers it
   hands out.
 * Beside `..`, `x as _` withholds a name: `module Shapes (name as _, ..)`.
+* `x as y` passes a name on under a new one, with or without `..`. A rename
+  keeps the name's case, and an operator cannot be renamed.
 * `T` passes on a type alone, `T(..)` its constructors too, and `C(..)` a
-  class with its methods.
+  class with its methods. `T(..) as U` renames the type, and its constructors
+  keep their names.
 * `module X` in the list passes on a qualifier the module exports.
 
-A passed-on name is the declaration it was where it was defined. Reaching it
-by two routes is not a conflict, and an error message names the module that
-declares it.
+A passed-on name is the declaration it was where it was defined, renamed or
+not. Reaching it by two routes is not a conflict, and an error message names
+the module that declares it, by the name it has there.
+
+Here `Kit` passes on `area` as `size` and the type `Shape` as `Form`:
+
+<!-- module: Shapes.gob -->
+```kotlin
+export (Shape(..), area)
+
+type Shape = Circle(Int) | Square(Int)
+
+fun area(s : Shape) -> Int = match s {
+    Circle(r) -> 3 * r * r
+    Square(side) -> side * side
+}
+```
+
+<!-- module: Kit.gob -->
+```kotlin
+export (module Shapes (area as size, Shape(..) as Form))
+
+import Shapes
+```
+
+<!-- run -->
+```kotlin
+import Kit (..)
+
+fun larger(a : Form, b : Form) -> Form = if size(a) > size(b) { a } else { b }
+
+fun main() {
+    print(size(larger(Circle(2), Square(3))))
+}
+```
+
+```text
+12
+```
 
 **Which declaration a name means.** One name is exported as one
 declaration, and the entries are read in this order:
 
 1. An entry that names a declaration, and `..` for the module's own.
-2. A `module Q (...)` entry whose list names the name.
+2. A `module Q (...)` entry whose list names the name. A rename names its
+   new name, also beside a `..`.
 3. A `module Q (...)` entry whose `..` covers the name.
 
 A `..` in a `module` entry gives way silently to anything before it. Above,

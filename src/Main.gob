@@ -778,13 +778,11 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     write(String.drain(b))
     if through("ssa") { return }
     refuseSkipped(skipped, path)
+    refuseForeignCalls(module_, checked.decls, path)
     match target.arch {
         "Arm64" -> compileArm64(b, path, wants, through, listing, sink, checked, entry,
                                 module_, files)
-        "Wasm32" -> {
-            refuseNonImports(module_, checked.decls, path)
-            compileWasm(b, path, wants, through, sink, checked, main, module_)
-        }
+        "Wasm32" -> compileWasm(b, path, wants, through, sink, checked, main, module_)
         _ -> die("internal error: no backend for the architecture '" + target.arch + "'")
     }
 }
@@ -1476,29 +1474,39 @@ fun refuseSkipped(skipped : Vec SsaLower.Unsupported, path : String) -> Unit {
     }
 }
 
--- Stops the compile if a function of `module_` calls a `foreign` declaration
--- that is not a wasm import, naming each such symbol and a function that calls
--- it. A wasm program links against nothing but the modules the host provides,
--- so a C library's symbol could never be resolved. Only the library declares
--- foreign functions, so a call that reaches here is the library's bug: a
--- `Wasi` arm missing from a `match` on `Target.os`, or code a wasm program
--- keeps that only a thread would run.
-fun refuseNonImports(module_ : SsaLower.Module, decls : Decls.DeclTable, path : String) -> Unit {
-    -- The program's entry is declared as a C function and written by the
-    -- backend, on wasm as on arm64.
-    let imports = Set.new()
-    Set.add(imports, Rt.programEntrySymbol)
+-- Stops the compile at a call to a `foreign` declaration that the target
+-- cannot link. A wasm program links against nothing but the modules the host
+-- provides, so a C library's symbol could never be resolved there: each such
+-- symbol is named with a function that calls it. Only the library declares
+-- foreign functions, so such a call is the library's bug, a `Wasi` arm missing
+-- from a `match` on `Target.os`. The other way round, an arm64 program has no
+-- wasm host to import from.
+fun refuseForeignCalls(module_ : SsaLower.Module, decls : Decls.DeclTable,
+                       path : String) -> Unit {
+    let wasm = target.arch == "Wasm32"
+    -- Each wasm import's symbol and its module.
+    let imports = Map.new()
     for (_, info) in Map.entries(decls.foreigns) {
-        if let Some(ForeignLibrary { kind = WasmImports, .. }) = info.library {
-            Set.add(imports, info.symbol)
+        if let Some(ForeignLibrary { name, kind = WasmImports, .. }) = info.library {
+            Map.put(imports, info.symbol, name)
         }
     }
     let callers = Map.new()
     for f in module_.functions {
         for block in f.blocks {
             for i in block.insts {
-                if let LowIr.Call(LowIr.Foreign(symbol, _), _) = i.op {
-                    if !Set.contains(imports, symbol) && !Map.contains(callers, symbol) {
+                let LowIr.Call(LowIr.Foreign(symbol, _), _) = i.op else { continue }
+                match Map.get(imports, symbol) {
+                    Some(owner) -> if !wasm {
+                        Diag.fail(Diag.whole("error", "'" + symbol + "' is imported from the wasm "
+                                             + "module '" + owner + "', which only a wasm target "
+                                             + "can call; '" + target.spelling + "' cannot"),
+                                  path)
+                    }
+                    -- The program's entry is declared as a C function and
+                    -- written by the backend, on wasm as on arm64.
+                    None -> if wasm && symbol != Rt.programEntrySymbol
+                                && !Map.contains(callers, symbol) {
                         Map.put(callers, symbol, f.name)
                     }
                 }
@@ -1877,14 +1885,9 @@ fun importedLibraries(decls : Decls.DeclTable, imports : Vec Asm.Symbol,
             Some(info) -> info
             None -> die("internal error: '" + sym.name + "' is called and never declared")
         }
-        if let Some(library) = info.library {
-            if let WasmImports = library.kind {
-                die("'" + info.symbol + "' is imported from the wasm module '" + library.name
-                    + "', which only a wasm target can call; '" + target.spelling
-                    + "' cannot")
-            }
-            Map.put(out, sym.name, (info.symbol, library))
-        }
+        -- A wasm import never gets here: `refuseForeignCalls` stopped the
+        -- compile at its call.
+        if let Some(library) = info.library { Map.put(out, sym.name, (info.symbol, library)) }
     }
     out
 }

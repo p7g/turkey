@@ -74,12 +74,22 @@ fun new() -> Ptr {
 fun tryAcquire(lock : Ptr) -> Bool = Ptr.atomicCas(lock, 0, 0, 1) == 0
 
 --- Wait until no other thread holds `lock`, and hold it. Not recursive: a
---- thread that takes a lock it holds waits forever.
+--- thread that takes a lock it holds waits forever, and on wasm32-wasi, where
+--- that thread is the only one, ends the program instead.
 fun acquire(lock : Ptr) -> Unit {
     if !tryAcquire(lock) { contended(lock) }
 }
 
 fun contended(lock : Ptr) -> Unit {
+    -- With one thread, the holder is the thread asking, which no wait could
+    -- ever release. Fatal rather than a panic: a panic would return without
+    -- the lock, into a critical section an outer frame is partway through.
+    if let Wasi = Target.os {
+        let message = Prim.cString("turkey: deadlock: a lock is taken again by the thread that holds it\n")
+        let _ = Os.write(2, message, Os.strlen(message))
+        Os.exitNow(2)
+        return
+    }
     -- Reading rather than swapping, so that waiting threads do not take the
     -- cache line from the one that holds it.
     for var i = 0; i < 100; i = Int.addWrapping(i, 1) {

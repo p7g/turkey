@@ -1212,9 +1212,9 @@ fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
     out
 }
 
--- Export what the `module Q (...)` entries among `items` pass on: those whose
--- lists have a `..` if `rest` is set, and those whose lists have none
--- otherwise.
+-- Export what the `module Q (...)` entries among `items` pass on: what their
+-- `..` covers if `rest` is set, and what their lists name otherwise. A list
+-- beside a `..` names what it renames, so `module Q (x as y, ..)` names `y`.
 --
 -- A name `out` already exports as the same declaration is one export. As a
 -- different declaration it is an error when the list names the name, since
@@ -1231,12 +1231,19 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
             Some(entries) -> entries
             None -> continue
         }
-        if item.rest != rest { continue }
-        let dep = match qualifierModule(m, item, strict) {
+        if rest && !item.rest { continue }
+        -- An entry is wrong once, however many times its list is read: what
+        -- is wrong with a list that has a `..` is reported when `rest` is set.
+        let reporting = strict && rest == item.rest
+        let dep = match qualifierModule(m, item, reporting) {
             Some(dep) -> dep
             None -> continue
         }
-        let chosen = listed(l, dep, entries, item.rest, None, True, strict)
+        let chosen = if rest == item.rest {
+            listed(l, dep, entries, item.rest, None, True, reporting)
+        } else {
+            listed(l, dep, Vec.filter(entries, renames), False, None, True, reporting)
+        }
         for space in namespaces {
             let into = spaceAt(out, space)
             for (short, target) in Map.entries(spaceAt(chosen, space)) {
@@ -1276,18 +1283,28 @@ fun passOn(l : Loader, m : Module, items : Vec ExportItem, rest : Bool,
     }
 }
 
+-- Whether a list entry brings its name under another.
+fun renames(entry : ImportItem) -> Bool = match entry.rename {
+    Some(to) -> to != "_"
+    None -> False
+}
+
 -- Report that the entry `item` exports `name` as `second` where the module
 -- already exports it as `first`. The error is at the entry of `item`'s list
 -- that names `name`, if one does.
 fun clash(name : String, first : String, second : String, item : ExportItem,
           entries : Vec ImportItem) -> Unit {
     var where = item.span
+    var named = False
     for entry in entries {
-        let written = if entry.item.qualifier { "module " + entry.item.name }
-                      else { entry.item.name }
-        if written == name && entry.rename != Some("_") { where = entry.item.span }
+        let under = Option.unwrapOr(entry.rename, entry.item.name)
+        let written = if entry.item.qualifier { "module " + under } else { under }
+        if written == name && under != "_" {
+            where = entry.item.span
+            named = True
+        }
     }
-    let fix = if item.rest {
+    let fix = if item.rest && !named {
         "withhold it from one 'module' entry with '" + name + " as _'"
     } else {
         "remove it from 'module " + item.name + "'"
@@ -1473,10 +1490,13 @@ let internalTestHook = "TURKEY_TEST_INTERNAL_IMPORTS"
 -- `TURKEY_CHECK_SPANS` is set, as the test suite sets it for everything it
 -- compiles, also checks the parse's spans, comments and blank lines against
 -- the text (`Turkey.ParseCheck`). Off otherwise, because the check lexes the
--- file again and walks the whole tree.
+-- file again and walks the whole tree. The parentheses around types and
+-- patterns are removed after the check, so no stage after the parser sees
+-- them.
 fun parse(source : Source, tycons : Vec String) -> Program {
     let program = Parser.parse(source, tycons)
     if let Some(_) = Env.get("TURKEY_CHECK_SPANS") { ParseCheck.check(program, source) }
+    removeTypeAndPatternParens(program)
     program
 }
 

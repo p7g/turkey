@@ -115,7 +115,12 @@ fun transitions(z : Zone, from : UnixSeconds, to : UnixSeconds) -> Array Transit
 
 --- The zone the system's time zone files call `id`, `America/Toronto`: read
 --- from `$TZDIR`, or `/usr/share/zoneinfo` if that is unset, once per process.
-fun named(id : String) -> Either ZoneError Zone {
+--- A failure is a `ZoneError`.
+fun named(id : String) -> Either SomeError Zone = Error.promote(lookup(id))
+
+-- `named`, with the error still a `ZoneError`, for the search for the
+-- system's zone, which passes it on and decides on it.
+fun lookup(id : String) -> Either ZoneError Zone {
 	if !validName(id) { return Left(InvalidName(id)) }
 	if let Some(z) = Sync.withLock(cache, fun(m) = Map.get(m, id)) { return Right(z) }
 	let path = directory() + "/" + id
@@ -169,8 +174,8 @@ fun validName(id : String) -> Bool {
 --- set -- a zone name, `:` and a name, a path to a TZif file, or a POSIX rule
 --- -- and otherwise from `/etc/localtime`, which names its zone by being a
 --- symbolic link into the zone files. A copied `/etc/localtime` has no name of
---- its own, and its zone's id is its path.
-fun system() -> Either ZoneError Zone = Sync.force(systemZone)
+--- its own, and its zone's id is its path. A failure is a `ZoneError`.
+fun system() -> Either SomeError Zone = Error.promote(Sync.force(systemZone))
 
 let systemZone : Sync.Once (Either ZoneError Zone) = Sync.once(findSystem)
 
@@ -182,7 +187,7 @@ fun findSystem() -> Either ZoneError Zone = match Env.get("TZ") {
 fun fromTz(tz : String) -> Either ZoneError Zone {
 	if String.isEmpty(tz) { return Left(NoSystemZone) }
 	if String.startsWith(tz, "/") { return fromFile(tz) }
-	match named(tz) {
+	match lookup(tz) {
 		Right(z) -> Right(z)
 		Left(e) -> match posix(tz) {
 			Some(z) -> Right(z)
@@ -195,7 +200,7 @@ fun fromLocaltime() -> Either ZoneError Zone {
 	let localtime = "/etc/localtime"
 	if let Right(target) = File.readLink(localtime) {
 		if let Some((_, name)) = String.rsplitOnce(target, "zoneinfo/") {
-			if let Right(z) = named(name) { return Right(z) }
+			if let Right(z) = lookup(name) { return Right(z) }
 		}
 	}
 	match fromFile(localtime) {

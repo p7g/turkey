@@ -210,9 +210,9 @@ fun lex(source : Source, fatal : Bool) -> (Lexed, Option Diag.Diag) {
 	let tokens = Vec.new(64)
 	loop {
 		skipInlineTrivia(lx)
-		-- Trivia fails only on a block comment with no end, which leaves the
-		-- lexer at the end of the source, so `atEnd` covers that failure too.
-		if atEnd(lx) { break }
+		-- Trivia fails on a block comment with no end, and on one that breaks
+		-- a line inside a hole.
+		if failed(lx) || atEnd(lx) { break }
 		let start = here(lx)
 		match peek(lx) {
 			None -> { break }
@@ -253,7 +253,7 @@ fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Vec Token) -> Token {
 			if hole.depth == 0 {
 				let _ = Vec.pop(lx.holes)
 				bump(lx)
-				return lexPiece(lx, start, False)
+				return lexPiece(lx, start, hole.literal, False)
 			}
 			hole.depth = hole.depth - 1
 		}
@@ -304,7 +304,16 @@ fun skipInlineTrivia(lx : Lexer) -> Unit {
 					}
 					keepComment(lx, start, from, False)
 				} else if c == '{' && charIs(peekAt(lx, 1), '-') {
+					let line = lx.line
 					skipBlockComment(lx)
+					-- A hole cannot span lines, and a comment inside one is no
+					-- exception.
+					if let Some(hole) = Vec.last(lx.holes) {
+						if lx.line != line && !failed(lx) {
+							let _ = oops(lx, unclosedHole, hole.literal, ())
+							break
+						}
+					}
 				} else {
 					break
 				}
@@ -614,19 +623,20 @@ let unclosedHole = "this string literal has a '\u{24}{' with no closing '}' on i
 
 fun lexString(lx : Lexer, start : Span) -> Token {
 	bump(lx)
-	lexPiece(lx, start, True)
+	lexPiece(lx, start, start, True)
 }
 
 -- Lexes the text of a string literal up to its closing `"` or its next `${`,
 -- whichever comes first, from just after its opening `"` (when `first`) or
 -- just after the `}` that closed a hole. At a `${` it opens a hole, whose
--- tokens the main loop goes on to lex.
-fun lexPiece(lx : Lexer, start : Span, first : Bool) -> Token {
+-- tokens the main loop goes on to lex. The piece's token begins at `start`,
+-- and an error points at `literal`, where the whole literal begins.
+fun lexPiece(lx : Lexer, start : Span, literal : Span, first : Bool) -> Token {
 	let b = String.builder()
 	loop {
 		match peek(lx) {
 			None -> {
-				return oops(lx, "the file ends inside this string literal", start, broken(start))
+				return oops(lx, "the file ends inside this string literal", literal, broken(start))
 			}
 			Some(c) -> {
 				if c == '\n' {
@@ -634,7 +644,7 @@ fun lexPiece(lx : Lexer, start : Span, first : Bool) -> Token {
 						lx,
 						"this string literal has no closing '\"' on its line; "
 							+ "write '\\n' for a line break",
-						start,
+						literal,
 						broken(start),
 					)
 				}
@@ -644,7 +654,7 @@ fun lexPiece(lx : Lexer, start : Span, first : Bool) -> Token {
 				}
 				if c == '$' && charIs(peekAt(lx, 1), '{') {
 					bumpBy(lx, 2)
-					Vec.push(lx.holes, Hole { depth = 0, literal = start })
+					Vec.push(lx.holes, Hole { depth = 0, literal = literal })
 					let kind = if first { KStringStart } else { KStringMid }
 					return plain(kind, VText(String.build(b)), start)
 				}

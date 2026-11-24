@@ -93,6 +93,7 @@ fun main() {
     match Target.os {
         Darwin -> line([Sys.soNoSigPipe, 0])
         Linux -> line([Sys.sockNonBlocking, Sys.sockCloseOnExec])
+        Wasi -> {}
     }
     line([Sys.msgNoSignal()])
     line([Sys.ipprotoTCP, Sys.tcpNoDelay, Sys.shutWrite])

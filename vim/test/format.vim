@@ -65,8 +65,77 @@ call s:Check('a parse error leaves the buffer alone',
       \ getline(1, '$') ==# ['fun main() {', '    print(', '}'] && !&modified)
 call s:Check('a parse error is reported', s:messages =~# 'status 3' && s:messages =~# 'parse error',
       \ s:messages)
-call s:Check('the error names the buffer, not the copy',
+call s:Check('the error names the buffer''s file',
       \ s:messages =~# '\V' . escape(expand('%'), '\') . ':3:1: parse error', s:messages)
+bwipeout!
+
+" A buffer with no file is formatted too, and its errors name `<stdin>`.
+enew!
+setfiletype turkey
+call setline(1, readfile($TURKEY_FORMAT_DIR . '/blocks.gob'))
+TurkeyFormat
+call s:Check('TurkeyFormat formats a buffer with no file', getline(1, '$') ==# s:Expected('blocks'),
+      \ string(getline(1, '$')))
+enew!
+setfiletype turkey
+call setline(1, ['fun main() {', '    print(', '}'])
+messages clear
+TurkeyFormat
+let s:messages = execute('messages')
+call s:Check('a parse error leaves a buffer with no file alone',
+      \ getline(1, '$') ==# ['fun main() {', '    print(', '}'])
+call s:Check('the error names a buffer with no file <stdin>',
+      \ s:messages =~# '<stdin>:3:1: parse error', s:messages)
+bwipeout!
+
+" `gq` on lines that hold code formats the whole buffer, in one undo step.
+let s:path = s:Copy('if_else', 'gq.gob')
+let s:before = readfile(s:path)
+execute 'edit! ' . fnameescape(s:path)
+call s:Check('formatexpr is set', &l:formatexpr ==# 'turkey#FormatExpr()', &l:formatexpr)
+normal! 3Ggqq
+call s:Check('gq on one line of code formats the whole buffer',
+      \ getline(1, '$') ==# s:Expected('if_else'), string(getline(1, '$')))
+undo
+call s:Check('one undo restores the buffer after gq', getline(1, '$') ==# s:before)
+normal! gggqG
+call s:Check('gq over the whole buffer formats it', getline(1, '$') ==# s:Expected('if_else'))
+bwipeout!
+
+" `gq` on a comment wraps it at 'textwidth', with Vim's own formatting, and
+" leaves the code around it alone.
+let s:path = s:dir . '/gq-comment.gob'
+let s:words = repeat('word ', 30)
+call writefile(['fun main() {', '    -- ' . s:words, '    print(1)', '}'], s:path)
+execute 'edit! ' . fnameescape(s:path)
+normal! 2Ggqq
+let s:lines = getline(1, '$')
+call s:Check('gq on a comment wraps it with its leader',
+      \ len(s:lines) == 5 && s:lines[1] =~# '^\t-- word' && s:lines[2] =~# '^\t-- word'
+      \ && len(s:lines[1]) <= 100 && s:lines[3] ==# '    print(1)', string(s:lines))
+bwipeout!
+
+" So does `gq` on a block comment, and a `{- -}` before code is code.
+let s:path = s:dir . '/gq-block.gob'
+call writefile(['fun main() {', '    {- ' . s:words . '-}', '    {- c -} print(1)', '}'], s:path)
+execute 'edit! ' . fnameescape(s:path)
+normal! 2Ggqq
+let s:lines = getline(1, '$')
+call s:Check('gq on a block comment wraps it',
+      \ len(s:lines) > 4 && s:lines[1] =~# '^\t{- word' && s:lines[-2] ==# '    {- c -} print(1)',
+      \ string(s:lines))
+normal! Gkgqq
+call s:Check('gq on a line with code after a block comment formats the buffer',
+      \ getline(1, '$')[-2] ==# "\t{- c -} print(1)", string(getline(1, '$')))
+bwipeout!
+
+" Formatting the whole buffer leaves a long comment as it is.
+let s:path = s:dir . '/gq-long.gob'
+call writefile(['fun main() {', "\t-- " . trim(s:words), "\tprint(1)", '}'], s:path)
+execute 'edit! ' . fnameescape(s:path)
+normal! gggqG
+call s:Check('gggqG leaves a long comment long', getline(1, '$') ==# readfile(s:path),
+      \ string(getline(1, '$')))
 bwipeout!
 
 " A command that cannot run is reported and leaves the buffer alone.

@@ -34,8 +34,10 @@ if exists("loaded_matchit")
   let b:match_words = '\<if\>:\<else\>'
 endif
 
-" `:TurkeyFormat` formats the buffer with `turkey format`; see autoload/turkey.vim.
+" `:TurkeyFormat` formats the buffer with `turkey format`, and so does `gq` on
+" any lines that hold code; see autoload/turkey.vim.
 command! -buffer -bar TurkeyFormat call turkey#Format()
+setlocal formatexpr=turkey#FormatExpr()
 
 augroup turkey_format_on_save
   autocmd! * <buffer>
@@ -44,7 +46,7 @@ augroup END
 
 let b:undo_ftplugin = "setlocal commentstring< comments< formatoptions<"
       \ . " iskeyword< include< includeexpr< suffixesadd<"
-      \ . " expandtab< tabstop< shiftwidth< softtabstop< textwidth<"
+      \ . " expandtab< tabstop< shiftwidth< softtabstop< textwidth< formatexpr<"
       \ . " | unlet! b:match_words"
       \ . " | silent! delcommand -buffer TurkeyFormat"
       \ . " | execute 'autocmd! turkey_format_on_save * <buffer>'"

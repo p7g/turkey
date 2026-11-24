@@ -875,19 +875,22 @@ only print is in scope
 The library module `Target` says which platform the program is being compiled
 for. `Target.os` is the operating system, of type `OS`, and `Target.arch` the
 processor architecture, of type `Arch`. Each type lists only the targets the
-compiler supports, which today are arm64 macOS and arm64 Linux: `OS` has the
-constructors `Darwin` and `Linux`, and `Arch` the single constructor `Arm64`.
-The compiler's `--target` option chooses among them. Its value is spelled
-`arch-os`, `arm64-darwin` or `arm64-linux`, and the default is the platform the
-compiler itself runs on:
+compiler knows: `OS` has the constructors `Darwin`, `Linux` and `Wasi`, and
+`Arch` the constructors `Arm64` and `Wasm32`. The compiler's `--target` option
+chooses among them. Its value is spelled `arch-os`: `arm64-darwin`,
+`arm64-linux` or `wasm32-wasi`, and the default is the platform the compiler
+itself runs on. Only the two arm64 targets produce code so far: for
+`wasm32-wasi` the compiler checks the program and stops with an error saying
+the backend is not implemented yet.
 
 ```sh
 turkey build --target arm64-linux main.gob
 ```
 
 Code that differs by platform is an ordinary `match`. The signal for a bus
-error is 10 on macOS and 7 on Linux, so `sigbus()` is one or the other
-depending on the target, and the program prints the same on both:
+error is 10 on macOS and 7 on Linux, and WASI has no signals, so `sigbus()` is
+one of the three depending on the target, and the program prints the same on
+all of them:
 
 <!-- run -->
 ```kotlin
@@ -897,6 +900,7 @@ import Target as Target
 fun sigbus() -> Int = match Target.os {
     Darwin -> 10
     Linux -> 7
+    Wasi -> -1
 }
 
 fun describe(signal : Int) -> String =

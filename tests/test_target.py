@@ -27,10 +27,12 @@ import Target as Target
 fun signalName(n : Int) -> String = match Target.os {
     Darwin -> if n == 10 { "SIGBUS" } else { "other" }
     Linux -> if n == 7 { "SIGBUS" } else { "other" }
+    Wasi -> "other"
 }
 
 fun wordBytes() -> Int = match Target.arch {
     Arm64 -> 8
+    Wasm32 -> 8
 }
 
 fun main() {
@@ -65,7 +67,21 @@ def test_an_unknown_target_is_refused() -> None:
     assert result.returncode == 2
     assert result.stderr.decode() == (
         "turkey: unknown target 'x86_64-linux'; supported: arm64-darwin, "
-        "arm64-linux\n")
+        "arm64-linux, wasm32-wasi\n")
+
+
+def test_wasm_is_checked_and_lowered_then_refused() -> None:
+    """`wasm32-wasi` has no backend yet: the front end and the lowering to the
+    low IR run, and any request for code stops with a diagnostic."""
+    checked = _boot("check", "--target", "wasm32-wasi", str(SOURCE))
+    assert checked.returncode == 0, checked.stderr
+    lowered = _boot("build", "--target", "wasm32-wasi", "--dump", "ssa", "-S",
+                    "-o", os.devnull, str(SOURCE))
+    assert lowered.returncode != 0
+    assert b"global $" in lowered.stdout
+    assert lowered.stderr.decode().endswith(
+        "error: the wasm32 backend is not implemented yet; 'wasm32-wasi' "
+        "compiles as far as the low IR\n")
 
 
 def test_target_without_a_value_is_refused() -> None:
@@ -105,6 +121,7 @@ foreign "__errno_location" fun linuxLocation() -> Prim.Ptr
 fun location() -> Prim.Ptr = match Target.os {
     Darwin -> darwinLocation()
     Linux -> linuxLocation()
+    Wasi -> Prim.ptrNull()
 }
 
 fun found() -> Bool = !Prim.ptrIsNull(location())

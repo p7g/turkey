@@ -172,6 +172,7 @@ def test_a_match_on_a_target_constant_is_accepted(lowered):
         "fun f(n : Int) -> Int = match Target.os {\n"
         "    Darwin -> n\n"
         "    Linux -> n + 1\n"
+        "    Wasi -> n + 2\n"
         "}\n",
         "fun h(n : Int) -> Int = n\n")
     assert code == 0, stderr

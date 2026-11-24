@@ -277,6 +277,7 @@ foreign "close" fun close(fd : Int) -> Int
 fun createFlags() -> Int = match Target.os {
     Darwin -> 0x0001 + 0x0200 + 0x0800
     Linux -> 0x0001 + 0x0040 + 0x0080
+    Wasi -> 0
 }
 
 fun create(path : String, mode : Int) -> Int {

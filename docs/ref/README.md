@@ -257,6 +257,51 @@ fun main() {
 }
 ```
 
+## Formatting
+
+`turkey fmt` rewrites each file it is given in the one style Turkey has, which
+takes no options. `turkey fmt --check` writes nothing: it prints the name of
+each file it would change, and exits with status 1 if there is one. A file
+that cannot be read, parsed or written is reported, the other files are done
+anyway, and the exit status is 3. A file the formatter refuses, because its
+output would not be the same program, is reported as an internal error, with
+status 2, and a command line `turkey fmt` cannot read exits with status 4.
+
+```sh
+turkey fmt hello.gob
+turkey fmt --check *.gob
+turkey fmt -- -odd-name.gob
+```
+
+As for the other commands, `--` ends the options, so every argument after it
+is a file, even one whose name starts with `-`.
+
+The formatter changes only what leaves the program as it is: line breaks,
+indentation, spaces, blank lines, the commas of a list, `;`, and the `=` before
+a block body, so `fun f() = { ... }` becomes `fun f() { ... }`. It never adds
+or removes parentheses, never spells a literal another way, and never changes
+a comment's text, except to drop trailing spaces. Comments keep their order:
+one on a line of its own stays on one, one at the end of a line stays at the
+end of one, and a block comment inside a line stays inside it. A doc comment
+documents what it documented before. Comments do not count toward the width:
+a line holding one may run past it, since moving code to the next line would
+not make the comment fit.
+
+A few choices are left to the author, because the source shows them:
+
+* A line break right after a `(`, `[` or `{` keeps that list, record or block
+  on one line per item, even when it would fit on one. Delete the line break
+  to let it join up again.
+* A line break before a data type's `=` keeps its constructors on one line
+  each.
+* A directive at the end of a line, such as `--@expect(...)`, covers that
+  line, so the formatter keeps the code on that line exactly as it is. A
+  statement written on one line stays on one line, however long. A statement
+  written over several lines with such a directive on any of them, after a
+  `{` or anywhere else, is kept as written, moved only by the change in its
+  first line's indent. A function whose body opens with one keeps its
+  signature as written, and its body is formatted.
+
 ## For maintainers
 
 **Keeping it true.** Examples are checked mechanically. Each `kotlin` fence

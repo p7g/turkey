@@ -393,6 +393,15 @@ That writes `build/docs/index.html`, which opens in a browser as a file,
 alongside one page per module and the JSON. The same site is published to
 <https://p7g.github.io/turkey/> from `main` by `.github/workflows/docs.yml`.
 
+### Formatting
+
+`turkey fmt FILE...` rewrites each file in the one style, and
+`turkey fmt --check FILE...` only names the files it would change, exiting 1 if
+there is one. There are no options. The style is specified by the pairs in
+`tests/fmt/`: each `NAME.gob` and the `NAME.expected.gob` it formats to. The
+formatter refuses a file, with an internal error naming it, unless its output
+parses to the same tree, holds the same comments, and formats to itself.
+
 ## Project status
 
 Turkey is an experimental language under active development. The compiler is

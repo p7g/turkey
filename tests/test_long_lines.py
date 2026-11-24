@@ -1,8 +1,9 @@
 """A long line costs the front end time in proportion to its length.
 
-The parser reads each literal's text from its line. Decoding the whole line
-again for every literal made a one-line array of 20,000 numbers take a
-hundred times as long as the same array over many lines.
+The parser reads each literal's text from the line it is on, so a line of many
+literals must be decoded once and not once per literal. A one-line array of
+20,000 numbers checks in about half a second when it is, and in a hundred
+times that when it is not, so a generous bound tells the two apart.
 """
 
 from __future__ import annotations

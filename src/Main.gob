@@ -32,7 +32,7 @@ import System.Env as Env
 import System.File as File
 import System.IO as IO
 import System.Parallel as Parallel
-import Process as Process
+import Turkey.Children as Children
 import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
@@ -495,7 +495,9 @@ fun baseName(path : String) -> String {
 --
 -- The parser ends the process at the first error, so each file is formatted
 -- in a process of its own, this program run as `fmt --one`, which says by its
--- exit status what became of the file.
+-- exit status what became of the file. WASI has no processes to start, so
+-- there the files are formatted in this one, in order, and the first that
+-- cannot be read or parsed ends the program.
 fun fmt(p : Args.Parser) -> Unit {
     var checking = False
     var one = False
@@ -511,37 +513,37 @@ fun fmt(p : Args.Parser) -> Unit {
         }
     }
     if len(paths) == 0 { fmtUsage("usage: turkey fmt [--check] FILE...") }
-    if one { return fmtOne(paths[0], checking) }
-    let self = match Env.executablePath() {
-        Some(path) -> path
-        None -> die("cannot find this program's own executable to format each file with")
+    if one { Diag.exit(fmtFile(paths[0], checking)) }
+    -- Each file's status, as `fmtFile` gives it, and what it wrote to standard
+    -- error that is still to be written.
+    let outcomes = match Platform.os {
+        Wasi -> Vec.map(paths, fun(path) = (fmtFile(path, checking), ""))
+        Darwin | Linux -> {
+            -- `--` before the path, so a file whose name starts with `-` is a file.
+            let flags = if checking { ["fmt", "--one", "--check", "--"] } else { ["fmt", "--one", "--"] }
+            match Children.runSelf(Vec.map(paths, fun(path) = Array.append(flags, [path]))) {
+                Right(outcomes) -> outcomes
+                Left(why) -> die(why)
+            }
+        }
     }
-    -- `--` before the path, so a file whose name starts with `-` is a file.
-    let flags = if checking { ["fmt", "--one", "--check", "--"] } else { ["fmt", "--one", "--"] }
-    -- The files are formatted at once, and reported in the order given.
-    let runs = Parallel.map(paths, fun(path) =
-        Process.run(Process.command(Array.append(Array.append([self], flags), [path])), None))
     var changed = False
     var failed = False
     var refused = False
     for var i = 0; i < len(paths); i = i + 1 {
         let path = paths[i]
-        let out = match runs[i] {
-            Right(o) -> o
-            Left(e) -> die("cannot run '" + self + "' to format '" + path + "': " + message(e))
-        }
-        let said = String.fromBytesLossy(out.stderr)
-        match out.status {
-            Process.Exited(0) -> {}
-            Process.Exited(10) -> {
+        let (status, said) = outcomes[i]
+        match status {
+            0 -> {}
+            10 -> {
                 changed = True
                 if checking { print(path) }
             }
-            Process.Exited(11) -> {
+            11 -> {
                 toStderr(said)
                 refused = True
             }
-            Process.Exited(12) -> {
+            12 -> {
                 toStderr(path + ": internal error: the formatter refuses this file: the formatted "
                          + "text does not parse: " + said)
                 refused = True
@@ -564,26 +566,28 @@ fun fmtUsage(message : String) -> a {
     Diag.exit(4)
 }
 
--- `fmt --one`: formats `path`, and exits 10 if it changed or would change, 11
--- if the formatter refused it, `Format.unparsedStatus` if the formatted text
--- did not parse, 13 if it could not be written, 1 if it did not parse and 2 if
--- it could not be read.
-fun fmtOne(path : String, checking : Bool) -> Unit {
+-- Formats `path`, and returns 0 if it was formatted already, 10 if it changed
+-- or would change, 11 if the formatter refused it and 13 if it could not be
+-- written, having said why on standard error. Ends the program with status 1
+-- if it does not parse, 2 if it cannot be read, and `Format.unparsedStatus` if
+-- the formatted text does not parse. `fmt --one` exits with the status.
+fun fmtFile(path : String, checking : Bool) -> Int {
     Diag.compiling(path)
     let source = readOrDie(path)
     match Format.format(source) {
         Refused(why) -> {
             toStderr(path + ": internal error: the formatter refuses this file: " + why + "\n")
-            Diag.exit(11)
+            11
         }
-        Formatted(text) -> if text != source.text {
+        Formatted(text) -> {
+            if text == source.text { return 0 }
             if !checking {
                 if let Left(e) = File.writeText(path, text) {
                     toStderr("turkey: cannot write '" + path + "': " + message(e) + "\n")
-                    Diag.exit(13)
+                    return 13
                 }
             }
-            Diag.exit(10)
+            10
         }
     }
 }

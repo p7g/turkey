@@ -14,6 +14,12 @@ export (
 	loadEntry,
 	ownDeclared,
 	ownScope,
+	noteOperator,
+	noteMethod,
+	noteField,
+	ImportPart(..),
+	ImportUse(..),
+	importUses,
 )
 
 --- Loading a program's modules, and deciding what each one can see.
@@ -126,18 +132,34 @@ type Scope = Scope {
 	--- the modules `qualifiers` names have their exports.
 	resolved      : Array (Map String (Vec String))
 	var conflicts : Array (Map String (Vec String))
+	--- What the module's references have read, for `importUses`: each bare
+	--- name looked up, by namespace in the order of `spaces`; each qualifier
+	--- a dotted name was read through, with the name of the module it led
+	--- to, as `Q M`; and each class method a compiler-written reference
+	--- chose. Filled on use, as `resolved` is.
+	readBare    : Array (Set.Set String)
+	readThrough : Set.Set String
+	readMethods : Set.Set String
+	--- The field names `x.f` has read. Whether one reads a record's field
+	--- depends on the record's type, and a field is readable only where the
+	--- record's constructor is in scope, which an import may be there for.
+	readFields : Set.Set String
 }
 
 fun newScope() -> Scope = Scope {
-	values     = Map.new()
-	types      = Map.new()
-	cons       = Map.new()
-	classes    = Map.new()
-	operators  = Map.new()
-	methods    = Set.new()
-	qualifiers = Map.new()
-	resolved   = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()]
-	conflicts  = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()]
+	values      = Map.new()
+	types       = Map.new()
+	cons        = Map.new()
+	classes     = Map.new()
+	operators   = Map.new()
+	methods     = Set.new()
+	qualifiers  = Map.new()
+	resolved    = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()]
+	conflicts   = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()]
+	readBare    = [Set.new(), Set.new(), Set.new(), Set.new(), Set.new()]
+	readThrough = Set.new()
+	readMethods = Set.new()
+	readFields  = Set.new()
 }
 
 --- The five, in a fixed order, so that a rule which applies to all of them is
@@ -170,11 +192,25 @@ fun lookupName(s : Scope, space : Namespace, name : String, where : Option Span)
 			_ -> ambiguous(name, targets, where)
 		}
 	}
+	Set.add(s.readBare[namespaceIndex(space)], name)
 	match Map.get(conflictsIn(s, space), name) {
 		Some(targets) -> ambiguous(name, targets, where)
 		None          -> Map.get(spaceAt(s, space), name)
 	}
 }
+
+--- Records that a reference in the module of `s` read the declared operator
+--- `op`, which it looks up in `s.operators` itself.
+fun noteOperator(s : Scope, op : String) -> Unit =
+	Set.add(s.readBare[namespaceIndex(OperatorSpace)], op)
+
+--- Records that a reference the compiler wrote in the module of `s` means the
+--- class method `target`, an internal name.
+fun noteMethod(s : Scope, target : String) -> Unit = Set.add(s.readMethods, target)
+
+--- Records that a reference in the module of `s` reads a field named
+--- `label`, of whatever record.
+fun noteField(s : Scope, label : String) -> Unit = Set.add(s.readFields, label)
 
 -- Every declaration the dotted name `name` means in `space`, each once. Read
 -- once for each name: a module writes the same few qualified names many
@@ -238,8 +274,12 @@ fun readings(s : Scope, space : Namespace, name : String) -> Vec String {
 	for var k = 0; k < last; k = k + 1 {
 		prefix = if k == 0 { parts[0] } else { prefix + "." + parts[k] }
 		match Map.get(s.qualifiers, prefix) {
-			Some(modules) -> for m in modules { stepThrough(m, parts, k + 1, space, out) }
-			None          -> {}
+			Some(modules) -> for m in modules {
+				let before = len(out)
+				stepThrough(m, parts, k + 1, space, out)
+				if len(out) > before { Set.add(s.readThrough, prefix + " " + m.name) }
+			}
+			None -> {}
 		}
 	}
 	out
@@ -1904,6 +1944,127 @@ fun ownScope(name : String, program : Program) -> Scope {
 		}
 	}
 	scope
+}
+
+-- -- what the imports brought ------------------------------------------------------
+
+--- One part of an import that brings names: its qualifier, an entry of its
+--- list, or the `..` of the list.
+type ImportPart = Qualifier | Entry(ImportItem) | Rest
+
+--- A part of an import, and whether a reference of the module read anything
+--- it brings. `shadowed` is set on an entry every name of which the module
+--- declares itself, so that no reference could read it.
+type ImportUse = ImportUse { decl : ImportDecl, part : ImportPart, used : Bool, shadowed : Bool }
+
+--- Returns, for each import `m` writes, the parts of it that bring names, in
+--- the order written, with whether `m`'s references read them. Call it once
+--- `Turkey.Resolve` has resolved `m`, which fills what `m.scope` has read.
+---
+--- A qualifier is listed for an import with no list, which brings nothing
+--- else, and for one with an alias. An entry that withholds a name, `x as _`,
+--- and the empty list of `import M ()`, which is written for the module's
+--- instances, bring nothing to list.
+fun importUses(l : Loader, m : Module) -> Vec ImportUse {
+	let out = []
+	let scope = m.scope
+	let visible = spaces(scope)
+	-- Whether a reference read the bare name `short` in the namespace `i`,
+	-- and found `target` there.
+	-- A record's constructor is read by the fields read through it.
+	let readAs = fun(i : Int, short : String, target : String) = (Set.contains(
+		scope.readBare[i],
+		short,
+	)
+		&& Map.get(visible[i], short) == Some(target))
+		|| (i == namespaceIndex(ValueSpace) && Set.contains(scope.readMethods, target))
+		|| (i == namespaceIndex(ConstructorSpace)
+			&& Iter.any(fieldsOf(l, target), Set.contains(scope.readFields, _)))
+	-- A qualifier brings every constructor of the module, so a field read
+	-- may need it as `readAs` says.
+	let through =
+		fun(q : String, dep : Module) = Set.contains(scope.readThrough, q + " " + dep.name)
+			|| Iter.any(
+				Map.values(dep.exports.cons),
+				fun(target) = Iter.any(fieldsOf(l, target), Set.contains(scope.readFields, _)),
+			)
+	for imp in m.program.imports {
+		if optsOut(imp) || imp.name == Prelude.entryName { continue }
+		let dep = importedBy(l, m, imp.name)
+		let use = fun(part : ImportPart, used : Bool, shadowed : Bool) = Vec.push(out, ImportUse {
+			decl     = imp
+			part     = part
+			used     = used
+			shadowed = shadowed
+		})
+		let items = match imp.items {
+			Some(items) -> items
+			None -> {
+				use(Qualifier, through(Option.unwrapOr(imp.alias, imp.name), dep), False)
+				continue
+			}
+		}
+		if let Some(alias) = imp.alias { use(Qualifier, through(alias, dep), False) }
+		if imp.rest {
+			var used = False
+			let exported = spaces(dep.exports)
+			for i in Int.range(0, len(exported)) {
+				for (short, target) in Map.entries(exported[i]) {
+					if readAs(i, short, target) { used = True }
+				}
+			}
+			for (q, modules) in Map.entries(dep.exports.qualifiers) {
+				for under in modules {
+					if through(q, under) { used = True }
+				}
+			}
+			use(Rest, used, False)
+		}
+		for entry in items {
+			let under = Option.unwrapOr(entry.rename, entry.item.name)
+			if under == "_" { continue }
+			if entry.item.qualifier {
+				let modules = Map.getOr(dep.exports.qualifiers, entry.item.name, [])
+				use(Entry(entry), Iter.any(modules, through(under, _)), False)
+				continue
+			}
+			var used = False
+			var shadowed = True
+			for (i, short, target, member) in itemNames(l, dep, entry.item, None, False) {
+				let bare = if member { short } else { under }
+				if readAs(i, bare, target) { used = True }
+				if Map.get(visible[i], bare) != Some(Prelude.internal(m.name, bare)) {
+					shadowed = False
+				}
+			}
+			use(Entry(entry), used, shadowed && !used)
+		}
+	}
+	out
+}
+
+-- The fields of the record constructor `target`, an internal name, or none
+-- for a constructor that is not a record's.
+fun fieldsOf(l : Loader, target : String) -> Vec String {
+	let owner = match Prelude.moduleOf(target) {
+		Some(name) -> name
+		None       -> return []
+	}
+	let m = match Map.get(l.modules, owner) {
+		Some(m) -> m
+		None    -> return []
+	}
+	let short = Option.unwrapOr(Option.map(String.splitOnce(target, "#"), fun((_, s)) = s), target)
+	for d in m.program.decls {
+		if let DType(t) = d {
+			for c in Option.unwrapOr(t.variants, []) {
+				if c.name == target || c.name == short {
+					return Vec.map(Option.unwrapOr(c.fields, []), fun((name, _)) = name)
+				}
+			}
+		}
+	}
+	[]
 }
 
 -- -- diagnostics --------------------------------------------------------------------

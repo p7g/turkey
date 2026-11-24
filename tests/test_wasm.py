@@ -301,6 +301,21 @@ def test_every_instruction_encodes_as_the_binary_format_numbers_it():
     assert ops == _every_op() + _OTHER_OPS
 
 
+# -- what the encoder refuses -------------------------------------------------------
+
+
+@pytest.mark.parametrize("case, message", [
+    ("negative-heap-index", "internal error: the type index -16 is negative"),
+    ("negative-block-type", "internal error: the type index -1 is negative"),
+    ("load-offset", "internal error: the memory offset 4294967296 does not fit in 32 bits"),
+    ("store-offset", "internal error: the memory offset -1 does not fit in 32 bits"),
+])
+def test_an_operand_the_format_cannot_hold_is_an_internal_error(case, message):
+    result = lang.run(DRIVER, args=(case,))
+    assert result.code != 0
+    assert lang.panic_message(result) == message
+
+
 # -- an engine ---------------------------------------------------------------------
 
 

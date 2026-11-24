@@ -416,6 +416,14 @@ build/stages/turkey format $(git ls-files 'lib/*.gob' 'src/*.gob' 'examples/*.go
 `tests/` is left as written, since its goldens record positions and source
 lines of its own files.
 
+The commit that formatted the repository is listed in `.git-blame-ignore-revs`,
+so that `git blame` shows who wrote a line rather than the reformat. Tell git
+to skip it once per clone:
+
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
+
 CI also fails on a lint warning in `src/` or `lib/`, which checking the
 compiler lints as its own code:
 

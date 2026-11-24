@@ -14,13 +14,18 @@ export (format, Outcome(..))
 --- end of a line is deferred to the end of the line it follows in the output.
 ---
 --- Every file is checked before it is answered: the output must parse to the
---- same tree, hold the same comments, and format to itself. A directive at
---- the end of a line (`--@expect(...)`) must end a line holding the same code,
---- since the line is its scope. A file that fails any of these is refused.
+--- same tree, hold the same comments, and format to itself. Each doc comment
+--- must document the same node, and each directive (`--@expect(...)`) cover
+--- the same node, as before; a directive at the end of a line covers that
+--- line, which must hold the same code. A file that fails any of these is
+--- refused.
 
 import Turkey.Ast (..)
 import Turkey.Compare as Compare
 import Turkey.Directives as Directives
+import Turkey.Directives (Directive(..), Kind(..))
+import Turkey.DocComments as DocComments
+import Turkey.Lint as Lint
 import Turkey.Fixity as Fixity
 import Turkey.Fixity (Group(..))
 import Turkey.Lexer as Lexer
@@ -53,6 +58,9 @@ fun format(source : Source) -> Outcome {
     if !sameComments(original.comments, reparsed.comments) {
         return Refused("the formatted text does not hold the same comments")
     }
+    if attachments(source, original) != attachments(again, reparsed) {
+        return Refused("a doc comment or directive in the formatted text belongs to another node")
+    }
     if let Some(line) = movedDirective(source, original.comments, again, reparsed.comments) {
         return Refused("the directive at the end of line " + Int.toString(line)
                        + " no longer ends a line holding the same code")
@@ -74,6 +82,53 @@ fun sameComments(xs : Vec Comment, ys : Vec Comment) -> Bool {
         if commentText(xs[i]) != commentText(ys[i]) { return False }
     }
     True
+}
+
+-- What each doc comment documents and what each directive covers, as
+-- positions in the tree, which are the same for two files with the same tree
+-- and the same comments exactly when each comment belongs to the same node.
+--
+-- A run of doc comments documents the first node that begins on the line
+-- below it. Every other node that begins on that line also picks the run up,
+-- such as the constructors of a one-line `type`, but a line break that moves
+-- one of those to a line of its own does not take a comment away from where
+-- the author put it, so only the first counts.
+fun attachments(source : Source, program : Program) -> String {
+    let out = []
+    let runs = DocComments.runs(program.comments, source.text)
+    if len(runs) > 0 {
+        let targets = DocComments.targetSpans(program)
+        for r in runs {
+            var documented = -1
+            for var i = 0; i < len(targets); i = i + 1 {
+                if documented < 0 && targets[i].line == r.documents { documented = i }
+            }
+            Vec.push(out, "doc " + Int.toString(documented) + if r.trailing { " trailing" } else { "" })
+        }
+        let header = DocComments.moduleRun(runs, DocComments.targets(program),
+                                           DocComments.firstDeclLine(program))
+        var position = -1
+        if let Some(h) = header {
+            for var i = 0; i < len(runs); i = i + 1 {
+                if sameSpan(runs[i].span, h.span) { position = i }
+            }
+        }
+        Vec.push(out, "module " + Int.toString(position))
+    }
+    let lines = String.lines(source.text)
+    let directives = []
+    for c in program.comments {
+        if Directives.isDirective(c) {
+            Vec.push(directives, Directive {
+                span = c.span, trailing = !Token.standsAlone(c, lines), kind = Expect([]),
+            })
+        }
+    }
+    if len(directives) > 0 {
+        let covered = Lint.coveredNodes(Lint.file(source.name, source.text, program), directives)
+        Vec.push(out, "covers " + String.join(Vec.map(covered, Int.toString), ","))
+    }
+    String.join(out, "\n")
 }
 
 -- Returns the line of the first directive that ends a line of `before` and
@@ -181,11 +236,6 @@ fun slice(lines : Vec String, s : Span) -> String {
 fun clamp(i : Int, n : Int) -> Int = if i < 0 { 0 } else if i > n { n } else { i }
 
 fun written(f : F, s : Span) -> String = slice(f.lines, s)
-
-fun charAt(f : F, at : Pos) -> Option Char {
-    if at.line < 1 || at.line > len(f.lines) { return None }
-    Vec.at(Vec.fromArray(String.toCodePoints(f.lines[at.line - 1])), at.col - 1)
-}
 
 -- -- tokens -------------------------------------------------------------------------
 
@@ -666,24 +716,17 @@ fun typeDoc(f : F, t : Type) -> Doc = P.cat([leading(f, startOf(t.span)), P.text
 
 fun typeText(t : Type) -> String = match t.kind {
     TEVar(name) -> name
-    TECon(name, args) -> if len(args) == 0 { name } else { name + " " + atoms(args) }
-    TEApp(head, args) -> typeText(head) + " " + atoms(args)
+    TECon(name, args) -> if len(args) == 0 { name } else { name + " " + arguments(args) }
+    TEApp(head, args) -> typeText(head) + " " + arguments(args)
     TETuple(xs) -> "(" + String.join(Vec.map(xs, typeText), ", ") + ")"
     TEFun(params, ret) -> "fun(" + String.join(Vec.map(params, typeText), ", ") + ") -> " + typeText(ret)
+    TEParen(inner) -> "(" + typeText(inner) + ")"
 }
 
-fun atoms(ts : Vec Type) -> String = String.join(Vec.map(ts, atomText), " ")
-
--- A type as an argument of another, which an application or a function type
--- can be only in parentheses.
-fun atomText(t : Type) -> String = match t.kind {
-    TECon(_, args) -> if len(args) == 0 { typeText(t) } else { "(" + typeText(t) + ")" }
-    TEApp(_, _) | TEFun(_, _) -> "(" + typeText(t) + ")"
-    _ -> typeText(t)
-}
+fun arguments(ts : Vec Type) -> String = String.join(Vec.map(ts, typeText), " ")
 
 fun predText(p : Pred) -> String = match p.kind {
-    PClass(name, t) -> name + " " + atomText(t)
+    PClass(name, t) -> name + " " + typeText(t)
     PEq(a, b) -> typeText(a) + " ~ " + typeText(b)
 }
 
@@ -803,14 +846,23 @@ fun instanceDoc(f : F, i : InstanceDecl) -> Doc {
             build = fun() = plain(P.cat([P.text("type " + fam.name + " = "), typeDoc(f, fam.body)])),
         })
     }
-    P.cat([P.text("instance " + i.cls + " " + atomText(i.head) + context + " "), body(f, i.span, items)])
+    P.cat([P.text("instance " + i.cls + " " + typeText(i.head) + context + " "), body(f, i.span, items)])
 }
 
--- The braces of a class or instance, its members in source order.
+-- The braces of a class or instance, its members in source order. One member
+-- goes between spaces on the line when it fits, as a block's one statement
+-- does, unless a line break follows the `{`.
 fun body(f : F, whole : Span, items : Vec Item) -> Doc {
     let ordered = Vec.sortBy(items, fun(a, b) = if lt(startOf(a.span), startOf(b.span)) { LT } else { GT })
+    let open = findToken(f, startOf(whole), "{")
     let close = closerOf(whole)
-    if len(ordered) == 0 && !hasCommentIn(f, startOf(whole), close) { return P.text("{}") }
+    let commented = hasCommentIn(f, tokenPos(f, open), close)
+    if len(ordered) == 0 && !commented { return P.text("{}") }
+    if len(ordered) == 1 && !commented && !opensLine(f, open) {
+        let row = ordered[0].build()
+        let member = P.cat([row.left, row.right])
+        return P.group(P.cat([P.text("{"), P.nest(1, P.cat([P.line, member])), P.line, P.text("}")]))
+    }
     braced(sequence(f, ordered, close))
 }
 
@@ -892,7 +944,7 @@ fun bodyDoc(f : F, b : Expr) -> Doc {
 fun endsInBraces(e : Expr) -> Bool = match e.kind {
     EMatch(_, _) | EIf(_, _, _) | EIfLet(_, _, _) | ERecord(_, _) | EBlock(_) | EWhile(_, _)
         | EWhileLet(_, _) | EForIn(_, _, _, _, _) | EForC(_, _, _, _) | ELoop(_) | EDo(_) -> True
-    ELambda(_, _, _) -> !isShorthand(e)
+    ELambda(_, _, _, _) -> !isShorthand(e)
     _ -> False
 }
 
@@ -916,12 +968,7 @@ fun stmtDoc(f : F, s : Stmt) -> Doc {
 
 -- -- patterns -----------------------------------------------------------------------
 
-fun patDoc(f : F, p : Pat) -> Doc = patAt(f, p, False)
-
--- `p`, which is `delimited` when it is an item of a list in brackets. A `|`
--- anywhere else would separate alternatives of the arm or condition, so a
--- nested `POr` there is in parentheses, as it had to be written.
-fun patAt(f : F, p : Pat, delimited : Bool) -> Doc {
+fun patDoc(f : F, p : Pat) -> Doc {
     let lead = if isMade(p) { P.empty() } else { leading(f, startOf(p.span)) }
     let d = match p.kind {
         PVar(name) -> P.text(name)
@@ -935,24 +982,22 @@ fun patAt(f : F, p : Pat, delimited : Bool) -> Doc {
             let items = Vec.map(fields, fun((field, sub)) = Field {
                 span = sub.span,
                 build = fun() = if isPunned(f, field, sub) { plain(P.text(field)) } else {
-                    Row { kind = Aligned, left = P.text(field), right = P.cat([P.text(" = "), patAt(f, sub, True)]) }
+                    Row { kind = Aligned, left = P.text(field), right = P.cat([P.text(" = "), patDoc(f, sub)]) }
                 },
             })
             P.cat([P.text(name + " "), record(f, open, closerOf(p.span), items, rest)])
         }
-        PLit(_) -> P.raw(written(f, p.span))
+        PLit(_, spelled) -> P.raw(spelled)
         PTuple(xs) -> list(f, tokenFrom(f, startOf(p.span)), "(", ")", patEntries(f, xs))
         PAnnot(inner, t) -> P.cat([patDoc(f, inner), P.text(" : "), typeDoc(f, t)])
-        POr(alts) -> {
-            let shown = joined(Vec.map(alts, patAt(f, _, True)), P.text(" | "))
-            if delimited { shown } else { P.cat([P.text("("), shown, P.text(")")]) }
-        }
+        POr(alts) -> joined(Vec.map(alts, patDoc(f, _)), P.text(" | "))
+        PParen(inner) -> P.cat([P.text("("), patDoc(f, inner), P.text(")")])
     }
     P.cat([lead, d])
 }
 
 fun patEntries(f : F, ps : Vec Pat) -> Vec Entry =
-    Vec.map(ps, fun(q) = Entry { span = q.span, build = fun() = patAt(f, q, True) })
+    Vec.map(ps, fun(q) = Entry { span = q.span, build = fun() = patDoc(f, q) })
 
 -- Whether a record field was written as its name alone. The parser gives the
 -- name and its pattern the same tree either way, so the source says.
@@ -988,7 +1033,7 @@ fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
-    ELit(_) -> P.raw(written(f, e.span))
+    ELit(_, spelled) -> P.raw(spelled)
     EUnit -> P.text("()")
     EVar(name, _) -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
     ECon(name) -> P.text(name)
@@ -1004,9 +1049,8 @@ fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
         })
         P.cat([P.text(name + " "), record(f, open, closerOf(e.span), items, False)])
     }
-    ELambda(params, ret, body) -> if isShorthand(e) {
-        let explicit = charAt(f, startOf(e.span)) == Some('\\')
-        P.cat([P.text(if explicit { "\\" } else { "" }), exprDoc(f, body)])
+    ELambda(params, ret, body, backslash) -> if isShorthand(e) {
+        P.cat([P.text(if backslash { "\\" } else { "" }), exprDoc(f, body)])
     } else {
         let open = tokenFrom(f, startOf(e.span)) + 1
         let shown = list(f, open, "(", ")", patEntries(f, params))
@@ -1209,7 +1253,7 @@ fun callDoc(f : F, e : Expr, fn : Expr, args : Vec Expr) -> Doc {
 -- whose body ends in braces.
 fun huggable(e : Expr) -> Bool = match e.kind {
     EBlock(_) | ERecord(_, _) | EDo(_) -> True
-    ELambda(_, _, body) -> !isShorthand(e) && endsInBraces(body)
+    ELambda(_, _, body, _) -> !isShorthand(e) && endsInBraces(body)
     _ -> False
 }
 
@@ -1228,9 +1272,9 @@ fun arrayDoc(f : F, e : Expr, xs : Vec Expr) -> Doc {
 }
 
 fun isLiteral(e : Expr) -> Bool = match e.kind {
-    ELit(_) -> True
+    ELit(_, _) -> True
     EUnary("-", operand, _) -> match operand.kind {
-        ELit(_) -> True
+        ELit(_, _) -> True
         _ -> False
     }
     _ -> False

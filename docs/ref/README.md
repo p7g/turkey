@@ -163,6 +163,10 @@ left.
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `single-match` | warn | a `match` in which one arm does something and every other arm is `()` or `{}`, which is an [`if let`](statements.md#if-let-and-if-var). `--fix` rewrites it to one when no earlier arm takes a value the live arm's pattern matches. |
+| `irrefutable-match` | warn | a `match` of one arm, whose pattern matches every value, which is a `let` or, for a function's parameter, a [parameter pattern](declarations.md#functions) |
+| `irrefutable-if-let` | warn | an `if let` or `while let` whose conditions always hold ([Irrefutable patterns](patterns.md#irrefutable-patterns)), so the `else` is never taken, or only a `break` ends the loop |
+| `unreachable-arm` | warn | a `match` arm, or an alternative of `\|`, that the arms and alternatives before it already take every value of ([Exhaustiveness](patterns.md#exhaustiveness)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

@@ -168,16 +168,18 @@ left.
 ### Expecting a finding
 
 ```ebnf
-DIRECTIVE ::= "--@" NAME "(" ARGUMENTS ")" TEXT
-EXPECT    ::= "--@expect(" CHECK ("," CHECK)* ")" TEXT
+DIRECTIVE ::= "--@" NAME "(" ARGUMENTS ")" REASON?
+EXPECT    ::= "--@expect(" SPACE* CHECK SPACE* ("," SPACE* CHECK SPACE*)* ")" REASON?
+REASON    ::= SPACE TEXT
+SPACE     ::= " " | "\t"
 ```
 
 A line comment that begins `--@` is a *directive*: an instruction to `turkey`,
 not prose. The directive's name follows `--@` directly, and `(` follows the
-name directly. The arguments run to the first `)`, and the rest of the line is
-free text, the reason for the directive. A comment that begins `--@` and is
-not a well-formed directive is an error, in any module, and so is a name that
-is not a directive's. The one directive is `expect`.
+name directly. The arguments run to the first `)`. Anything after it must
+start with a space, and is free text: the reason for the directive. A comment
+that begins `--@` and is not a well-formed directive is an error, in any
+module. The one directive is `expect`.
 
 `--@expect(NAME, ...)` names one or more checks, separated by commas, with
 spaces allowed around each. It says that each check reports a finding in the
@@ -185,9 +187,12 @@ code the directive covers, and those findings are neither printed nor fixed
 by `--fix`:
 
 * On a line of its own, a directive covers the whole of the statement,
-  declaration or `match` arm that begins next, every line of it included. A
-  doc comment can be directly above the directive and still document the
-  declaration below it ([Doc comments](lexical.md#doc-comments)).
+  declaration or `match` arm that begins next, every line of it included,
+  provided it begins inside the block, type, call or other construct the
+  directive is in. If nothing begins there, as at the end of a block, the
+  directive covers nothing, and warns. A doc comment can be directly above the
+  directive and still document the declaration below it
+  ([Doc comments](lexical.md#doc-comments)).
 * After code, a directive covers the findings that begin on its line.
 
 Each name must be a check's, and may be named once. A check that the level

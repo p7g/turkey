@@ -30,7 +30,7 @@ import Data.Set as Set
 import System.Env as Env
 import System.File as File
 import System.IO as IO
-import Turkey.Ast (Program(..), Decl(..), Child(..), Stmt(..), FunDecl(..), Arm(..), children)
+import Turkey.Ast (Program(..), Decl(..), Child(..), Expr(..), Stmt(..), FunDecl(..), Arm(..), children)
 import Turkey.Diag as Diag
 import Turkey.Directives (Directive(..), Kind(..), Arg(..))
 import Turkey.Source (Span(..))
@@ -164,25 +164,41 @@ fun claim(f : File, directives : Vec Directive) -> Unit {
     Vec.push(own, f)
     Set.add(ownPaths, f.path)
     if len(directives) == 0 { return }
-    let spans = nodeSpans(f)
+    let (coverable, all) = nodeSpans(f)
     for d in directives {
         let Expect(names) = d.kind
-        Vec.push(expectations, Expectation { names = names, scope = scopeOf(d, spans), met = Set.new() })
+        Vec.push(expectations, Expectation { names = names, scope = scopeOf(d, coverable, all),
+                                             met = Set.new() })
     }
 }
 
 -- What `d` covers. After code, that is its line. On a line of its own, it is
--- the first statement, declaration or arm in `spans` that begins on a later
--- line, the outermost of those that begin there, or nothing if none does.
-fun scopeOf(d : Directive, spans : Vec Span) -> Span {
+-- the first of `coverable` that begins on a later line and inside the
+-- innermost of `all` that contains `d`, the outermost of those that begin
+-- there; or nothing if none does. The bound matters: a directive that ends a
+-- block, a type's field list or a call's arguments would otherwise cover the
+-- next declaration down the file, and remove its findings unseen.
+fun scopeOf(d : Directive, coverable : Vec Span, all : Vec Span) -> Span {
     let at = d.span
     if d.trailing {
         return Span { line = at.line, col = 1, endLine = at.line + 1, endCol = 1, file = at.file,
                       inlined = None }
     }
+    var within = None
+    for s in all {
+        if !Source.before(s.line, s.col, at.line, at.col)
+           || !Source.before(at.endLine, at.endCol, s.endLine, s.endCol) { continue }
+        within = match within {
+            Some(w) -> if inside(s, w) { Some(s) } else { Some(w) }
+            None -> Some(s)
+        }
+    }
     var next = None
-    for s in spans {
+    for s in coverable {
         if s.line <= at.line { continue }
+        if let Some(w) = within {
+            if !Source.before(s.line, s.col, w.endLine, w.endCol) { continue }
+        }
         next = match next {
             Some(n) -> if inside(n, s) { Some(s) } else { Some(n) }
             None -> Some(s)
@@ -191,33 +207,42 @@ fun scopeOf(d : Directive, spans : Vec Span) -> Span {
     Option.unwrapOr(next, Source.emptyAt(at))
 }
 
--- The span of every declaration, statement, method and `match` arm the
--- author wrote in `f`.
-fun nodeSpans(f : File) -> Vec Span {
-    let out = []
-    let add = fun(s : Span) {
-        if !Source.isGenerated(s) && !Source.isEmpty(s) { Vec.push(out, s) }
+-- The spans of the nodes the author wrote in `f`: first those an own-line
+-- directive can cover, its declarations, statements, methods and `match`
+-- arms, then those and every expression.
+fun nodeSpans(f : File) -> (Vec Span, Vec Span) {
+    let coverable = []
+    let all = []
+    let add = fun(s : Span, into : Vec Span) {
+        if !Source.isGenerated(s) && !Source.isEmpty(s) { Vec.push(into, s) }
     }
     for d in f.program.decls {
-        match d {
-            DStmt(s) -> add(s.span)
-            DType(t) -> add(t.span)
-            DClass(c) -> add(c.span)
-            DInstance(i) -> add(i.span)
-            DForeign(x) -> add(x.span)
-            DInfix(op) -> add(op.span)
+        let s = match d {
+            DStmt(st) -> st.span
+            DType(t) -> t.span
+            DClass(c) -> c.span
+            DInstance(i) -> i.span
+            DForeign(x) -> x.span
+            DInfix(op) -> op.span
         }
+        add(s, coverable)
+        add(s, all)
     }
     nodes(f, fun(c) {
-        match c {
-            ChStmt(s) -> add(s.span)
-            ChFun(m) -> add(m.span)
-            ChArm(a) -> add(a.span)
-            ChExpr(_) -> {}
+        let s = match c {
+            ChStmt(st) -> st.span
+            ChFun(m) -> m.span
+            ChArm(a) -> a.span
+            ChExpr(e) -> {
+                add(e.span, all)
+                return True
+            }
         }
+        add(s, coverable)
+        add(s, all)
         True
     })
-    out
+    (coverable, all)
 }
 
 --- Returns why an `expect` directive cannot name `name`, given the checks of

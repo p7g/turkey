@@ -139,7 +139,9 @@ before `--`, which begins a comment. Some runs the language spells itself:
 &&  ||  !   =   ->  ~
 ```
 
-`&&`, `||` and `!` are built in, and `=`, `->` and `~` are punctuation. The
+`&&`, `||` and `!` are built in, and `=`, `->` and `~` are punctuation. `!`
+is both the prefix "not" and the postfix [unwrap](do-notation.md#unwrapping-with-),
+and only as a run of its own: `x!=y` is `x`, `!=` and `y`. The
 arithmetic, comparison and bitwise operators are
 [declared by the Prelude](expressions.md#operators-are-class-methods), in
 groups the language fixes. `|` is also punctuation in patterns and type

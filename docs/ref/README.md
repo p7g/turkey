@@ -12,8 +12,8 @@ Some things are deliberately left out:
   it is compiled, and nothing here depends on how a value is laid out in
   memory.
 * **The standard library**, except the parts the language itself relies on:
-  the types and classes behind literals, operators, `for` loops, indexing and
-  `?`. Those are described in [Built-in types and classes](builtins.md).
+  the types and classes behind literals, operators, `for` loops, indexing,
+  `?` and `!`. Those are described in [Built-in types and classes](builtins.md).
   Examples also use a few library functions, such as `print`, without further
   comment.
 
@@ -31,7 +31,8 @@ Some things are deliberately left out:
    patterns may appear in bindings.
 6. [Statements and control flow](statements.md): blocks, assignment, `if`,
    `match`, the loops, `break`, `continue`, and `return`.
-7. [The `?` operator and `do`](do-notation.md): monadic sequencing.
+7. [The `?` and `!` operators and `do`](do-notation.md): monadic sequencing,
+   and unwrapping or panicking.
 8. [Type classes](classes.md): classes, instances, superclasses, associated
    types, and equality constraints.
 9. [Type inference](inference.md): what the compiler infers, when it

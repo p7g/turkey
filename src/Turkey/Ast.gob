@@ -220,6 +220,11 @@ type Expr = Expr {
 type ExprKind
 	--- A literal, and its text as written.
 	= ELit(Lit, String)
+	--- A string literal with holes, `"a${x}b"`: its pieces, one more than its
+	--- holes, each as its value and as written between its delimiters; and the
+	--- expression in each hole. `Turkey.Desugar` rewrites it into the
+	--- `String.Builder` calls it means, and no stage after it sees one.
+	| EInterp(Vec (String, String), Vec Expr)
 	| EUnit
 	--- The `Bool` is set when the compiler wrote this node itself to mean a
 	--- *class method* -- the `add` a `+` means. Resolution looks such a node up
@@ -703,6 +708,7 @@ fun children(c : Child) -> Vec Child = match c {
 
 fun exprChildren(e : Expr) -> Vec Child = match e.kind {
 	ELit(_, _)                 -> []
+	EInterp(_, holes)          -> Vec.map(holes, ChExpr)
 	EUnit                      -> []
 	EVar(_, _)                 -> []
 	ECon(_)                    -> []
@@ -971,8 +977,9 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
 	EQuestion(inner, _) -> reach(inner)
 	-- A `do` block is evaluated as a value of its monad, and a `break` cannot
 	-- cross into one.
-	EDo(_)        -> (Completes, Stops)
-	EParen(inner) -> reach(inner)
+	EDo(_)            -> (Completes, Stops)
+	EParen(inner)     -> reach(inner)
+	EInterp(_, holes) -> inOrder(Vec.map(holes, reach))
 }
 
 fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
@@ -1113,12 +1120,13 @@ fun sketchName(name : String) -> String =
 	if String.startsWith(name, shorthandPrefix) { "$x" } else { name }
 
 fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
-	ELit(l, _)    -> (literalText(l), 8)
-	EUnit         -> ("()", 8)
-	EVar(name, _) -> (sketchName(name), 8)
-	ECon(name)    -> (name, 8)
-	ETuple(xs)    -> ("(" + sketchList(xs) + ")", 8)
-	EArray(xs)    -> ("[" + sketchList(xs) + "]", 8)
+	ELit(l, _)             -> (literalText(l), 8)
+	EInterp(pieces, holes) -> (sketchInterp(pieces, holes), 8)
+	EUnit                  -> ("()", 8)
+	EVar(name, _)          -> (sketchName(name), 8)
+	ECon(name)             -> (name, 8)
+	ETuple(xs)             -> ("(" + sketchList(xs) + ")", 8)
+	EArray(xs)             -> ("[" + sketchList(xs) + "]", 8)
 	ERecord(name, fields) -> {
 		let shown = Vec.map(fields, fun((f, v)) = f + " = " + sketchAt(v, 0))
 		(name + " { " + String.join(shown, ", ") + " }", 8)
@@ -1152,6 +1160,19 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
 	EAnnot(inner, _) -> sketchLevel(inner)
 	EParen(inner)    -> ("(" + sketchAt(inner, 0) + ")", 8)
 	_                -> ("...", 8)
+}
+
+-- `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that builds
+-- this file does not know the `\$` escape.
+fun sketchInterp(pieces : Vec (String, String), holes : Vec Expr) -> String {
+	let b = String.builder()
+	String.push(b, "\"")
+	for var i = 0; i < len(pieces); i = i + 1 {
+		if i > 0 { String.push(b, "\u{24}{" + sketchAt(holes[i - 1], 0) + "}") }
+		String.push(b, pieces[i].1)
+	}
+	String.push(b, "\"")
+	String.build(b)
 }
 
 -- -- type and pattern parentheses -----------------------------------------------------
@@ -1346,7 +1367,8 @@ fun plainExpr(e : Expr) -> Unit {
 		| EBlock(_)
 		| EQuestion(_, _)
 		| EDo(_)
-		| EParen(_) -> {}
+		| EParen(_)
+		| EInterp(_, _) -> {}
 	}
 	for c in exprChildren(e) { plainChild(c) }
 }

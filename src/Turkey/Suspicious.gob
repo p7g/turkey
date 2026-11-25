@@ -1,0 +1,484 @@
+export (repeatedCondition, identicalOperands, selfAssignment, impossibleComparison)
+
+--- Checks for an expression that repeats another where the author almost
+--- certainly meant something else: a condition tested twice in one chain, an
+--- operator applied to one operand twice, a variable assigned to itself, and
+--- two bounds on one value that cannot both hold.
+
+import Data.Set as Set
+import Turkey.Ast (
+	Expr(..),
+	ExprKind(..),
+	Stmt(..),
+	StmtKind(..),
+	Lit(..),
+	Child(..),
+	Condition(..),
+	conditionExpr,
+	exprChildren,
+	sketch,
+	unparen,
+)
+import Turkey.Lint (File, Finding(..), finding)
+import Turkey.Lint as Lint
+import Turkey.Prelude as P
+import Turkey.Source (Span)
+import Turkey.Source as Source
+import Turkey.Typed (TypeTable(..))
+import Turkey.Typed as Typed
+import Turkey.Types (TCon)
+import Turkey.Types as Ty
+
+-- -- structural equality ------------------------------------------------------------
+--
+-- Two expressions are the same when their trees are: the same names, fields,
+-- literals and operators, whatever their spans and grouping parentheses. Only
+-- expressions that bind nothing and call nothing a reader would see as a call
+-- are compared, so that two of them written in one scope evaluate to the same
+-- value. That makes the name enough to identify a binder: nothing inside such
+-- an expression can bind or shadow one, and every check here compares two
+-- expressions from one scope.
+--
+-- An operator counts as a call of nothing when it means the library's own
+-- definition of it, a class method whose instances are expected to be lawful,
+-- or is `&&`, `||` or `!`, which the compiler defines. A module may declare
+-- `-` or `==` again as a function of its own, which may do anything, so an
+-- operator is judged by the function it resolved to and not by its spelling.
+
+-- Whether `a` and `b` are the same plain expression.
+fun same(a : Expr, b : Expr) -> Bool {
+	let x = unparen(a)
+	let y = unparen(b)
+	match (x.kind, y.kind) {
+		(ELit(l, _), ELit(m, _))         -> sameLit(l, m)
+		(EUnit, EUnit)                   -> True
+		(EVar(n, False), EVar(m, False)) -> n == m
+		(ECon(n), ECon(m))               -> n == m
+		(ETuple(xs), ETuple(ys))         -> sameAll(xs, ys)
+		(EField(o, f), EField(p, g))     -> f == g && same(o, p)
+		(EProject(o, i), EProject(p, j)) -> i == j && same(o, p)
+		(EUnary(op, o, fn), EUnary(oq, p, _)) -> op == oq
+			&& library(op, fn, unaryOperators)
+			&& same(o, p)
+		(EBinary(op, l, r, fn), EBinary(oq, m, s, _)) ->
+			op == oq && library(op, fn, binaryOperators) && same(l, m) && same(r, s)
+		_ -> False
+	}
+}
+
+fun sameAll(xs : Vec Expr, ys : Vec Expr) -> Bool {
+	if len(xs) != len(ys) { return False }
+	for var i = 0; i < len(xs); i = i + 1 {
+		if !same(xs[i], ys[i]) { return False }
+	}
+	True
+}
+
+fun sameLit(a : Lit, b : Lit) -> Bool = match (a, b) {
+	(LInt(m), LInt(n))       -> m == n
+	(LFloat(x), LFloat(y))   -> x == y
+	(LString(s), LString(t)) -> s == t
+	(LChar(c), LChar(d))     -> c == d
+	_                        -> False
+}
+
+-- Whether `e` is an expression `same` compares: one with no call, `?`,
+-- indexing or binding in it.
+fun plain(e : Expr) -> Bool = match e.kind {
+	ELit(_, _)              -> True
+	EUnit                   -> True
+	EVar(_, isMethod)       -> !isMethod
+	ECon(_)                 -> True
+	ETuple(xs)              -> Iter.all(xs, plain)
+	EField(obj, _)          -> plain(obj)
+	EProject(obj, _)        -> plain(obj)
+	EUnary(op, operand, fn) -> library(op, fn, unaryOperators) && plain(operand)
+	EBinary(op, left, right, fn) ->
+		library(op, fn, binaryOperators) && plain(left) && plain(right)
+	EParen(inner) -> plain(inner)
+	_             -> False
+}
+
+-- Whether the operator `op`, which means `fn`, is the compiler's own or the
+-- library's definition of it in `table`. An operator with no method is the
+-- compiler's.
+fun library(op : String, fn : Option Expr, table : Map String String) -> Bool = match fn {
+	None -> True
+	Some(f) -> match (f.kind, Map.get(table, op)) {
+		(EVar(target, _), Some(own)) -> target == own
+		_                            -> False
+	}
+}
+
+-- The method each operator means in the library: the operator, the module
+-- that declares the method's class, and the method.
+let binaryOperators = definitions([
+	("==", "Data.Eq", "Eq.eq"),
+	("!=", "Data.Eq", "Eq.ne"),
+	("<", "Data.Ord", "Ord.lt"),
+	("<=", "Data.Ord", "Ord.lte"),
+	(">", "Data.Ord", "Ord.gt"),
+	(">=", "Data.Ord", "Ord.gte"),
+	("+", "Data.Num", "Add.add"),
+	("-", "Data.Num", "Sub.sub"),
+	("*", "Data.Num", "Mul.mul"),
+	("/", "Data.Num", "Div.div"),
+	("%", "Data.Num", "Rem.rem"),
+	("&", "Bits", "BitAnd.and"),
+	("|", "Bits", "BitOr.or"),
+	("^", "Bits", "BitXor.xor"),
+	("<<", "Bits", "Shift.shl"),
+	(">>", "Bits", "Shift.shr"),
+])
+
+let unaryOperators = definitions([("-", "Data.Num", "Neg.neg")])
+
+fun definitions(rows : Array (String, String, String)) -> Map String String {
+	let out = Map.new()
+	for (op, owner, method) in rows { Map.put(out, op, P.internal(owner, method)) }
+	out
+}
+
+-- The text an expression covers. A node of a declared operator spans the
+-- operator alone, so its extent runs from its left operand's to its right's.
+fun extent(e : Expr) -> Span = match e.kind {
+	EBinary(_, left, right, _) -> Source.through(extent(left), extent(right))
+	EUnary(_, operand, _)      -> Source.through(e.span, extent(operand))
+	_                          -> e.span
+}
+
+-- -- repeated-condition -------------------------------------------------------------
+--
+-- In `if a { } else if b { } else if a { }`, the third test runs only once `a`
+-- has been found false, and nothing between the two tests of `a` can change
+-- it unless a test between them calls something: a function may assign a
+-- `var` it captured. So a test with a call in it ends the run of tests an
+-- `a` is compared with, and so does the head of an `if let`, which may call
+-- too and is left out of the comparison.
+
+fun repeatedCondition(f : File) -> Vec Finding {
+	let out = []
+	-- The `if`s that continue a chain, which their chain's head has checked.
+	let continuing = Set.new()
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			match e.kind {
+				EIf(_, _, _) | EIfLet(_, _, _) ->
+					if !Set.contains(continuing, e.id) { chain(e, continuing, out) }
+				_ -> {}
+			}
+		}
+		True
+	})
+	out
+}
+
+fun chain(head : Expr, continuing : Set.Set Int, out : Vec Finding) -> Unit {
+	let earlier = []
+	var at = Some(head)
+	while let Some(e) = at {
+		at = None
+		let otherwise = match e.kind {
+			EIf(cond, _, otherwise) -> {
+				if plain(cond) {
+					if let Some(first) = Iter.find(earlier, same(_, cond)) {
+						Vec.push(
+							out,
+							finding(
+								extent(cond),
+								"this condition repeats '"
+									+ sketch(unparen(first))
+									+ "' "
+									+ where(first, cond)
+									+ ", so its branch can never run; change one of them",
+							),
+						)
+					} else {
+						Vec.push(earlier, cond)
+					}
+				} else {
+					Vec.clear(earlier)
+				}
+				otherwise
+			}
+			EIfLet(_, _, otherwise) -> {
+				Vec.clear(earlier)
+				otherwise
+			}
+			_ -> None
+		}
+		if let Some(next) = otherwise {
+			match next.kind {
+				EIf(_, _, _) | EIfLet(_, _, _) -> {
+					Set.add(continuing, next.id)
+					at = Some(next)
+				}
+				_ -> {}
+			}
+		}
+	}
+}
+
+-- Where `first` is, said from `cond`.
+fun where(first : Expr, cond : Expr) -> String =
+	if first.span.line == cond.span.line {
+		"from earlier on this line"
+	} else {
+		"from line " + Int.toString(first.span.line)
+	}
+
+-- -- identical-operands -------------------------------------------------------------
+--
+-- A comparison of a value with itself has a fixed result, and `e - e`,
+-- `e / e`, `e % e`, `e ^ e`, `e && e` and `e || e` each have one too or a
+-- redundant operand. Not `+`, `*`, `&` or `|`: `n + n` and `n * n` are how
+-- doubling and squaring are written, and the bitwise two are idempotent.
+--
+-- A `Float` operand is exempt. `x != x` is how a NaN test can be written, and
+-- `x - x` is not 0 when `x` is infinite.
+--
+-- Typed, for the `Float` exemption. Desugaring keeps every operator node as
+-- written, and removes only the parentheses `same` ignores anyway.
+
+fun identicalOperands(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let EBinary(op, left, right, fn) = e.kind {
+				if checkedOperator(op)
+						&& library(op, fn, binaryOperators)
+						&& plain(left)
+						&& same(left, right)
+						&& !isFloat(types, left) {
+					Vec.push(
+						out,
+						finding(
+							Source.through(extent(left), extent(right)),
+							"both operands of '"
+								+ op
+								+ "' are '"
+								+ sketch(left)
+								+ "'; change the one that should be something else",
+						),
+					)
+				}
+			}
+		}
+		True
+	})
+	out
+}
+
+fun checkedOperator(op : String) -> Bool = match op {
+	"==" | "!=" | "<" | "<=" | ">" | ">=" -> True
+	"-" | "/" | "%" | "^"                 -> True
+	"&&" | "||"                           -> True
+	_                                     -> False
+}
+
+-- Whether `e`'s type is `Float`, or not known. A node with no recorded type
+-- was made by desugaring, and is left alone.
+fun isFloat(types : TypeTable, e : Expr) -> Bool = match typeName(types, e) {
+	Some(name) -> name == "Float"
+	None       -> !Map.contains(types.exprs, e.id)
+}
+
+-- The name of `e`'s type when it is a constructor applied to nothing.
+fun typeName(types : TypeTable, e : Expr) -> Option String {
+	if !Map.contains(types.exprs, e.id) { return None }
+	match Ty.prune(Typed.of_(types, e)) {
+		TCon(cell) -> Some(cell.name)
+		_          -> None
+	}
+}
+
+-- -- self-assignment ----------------------------------------------------------------
+--
+-- `x = x` and `r.f = r.f` change nothing. Both sides of one assignment are in
+-- one scope, so one name on both sides is one binder. `a[i] = a[i]` is not
+-- reported: it calls `Index.get`, which may panic, as for a `Map` key that is
+-- missing.
+
+fun selfAssignment(f : File) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		if let ChStmt(s) = c {
+			if let SAssign(target, value) = s.kind {
+				if isPath(target) && same(target, value) {
+					Vec.push(
+						out,
+						finding(
+							s.span,
+							"'"
+								+ sketch(target)
+								+ "' is assigned to itself, which changes nothing; assign the "
+								+ "intended value, or remove the assignment",
+						),
+					)
+				}
+			}
+		}
+		True
+	})
+	out
+}
+
+-- Whether `e` is a variable or a field path from one.
+fun isPath(e : Expr) -> Bool = match e.kind {
+	EVar(_, False) -> True
+	EField(obj, _) -> isPath(unparen(obj))
+	_              -> False
+}
+
+-- -- impossible-comparison ----------------------------------------------------------
+--
+-- `e < 3 && e > 5` holds for no value of `e`, and `e >= 3 || e < 5` for every
+-- one. Each comparison of `e` with a constant is the set of values it holds
+-- for, an interval of the integers; a conjunction is impossible when the two
+-- intervals do not meet, and a disjunction always holds when the intervals of
+-- the two negations do not.
+--
+-- Typed, because an integer literal may be a `Float`, and only an `Int` or a
+-- `Char` operand is a value of a discrete order with no NaN. A `Char` compares
+-- by its code point.
+
+fun impossibleComparison(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let EBinary(op, left, right, _) = e.kind {
+				if op == "&&" || op == "||" { bounds(types, e, op == "&&", left, right, out) }
+			}
+		}
+		True
+	})
+	out
+}
+
+-- One comparison of an operand with a constant, the operand written first.
+type Bound = Bound { operand : Expr, op : String, value : Int, shown : String }
+
+fun bounds(
+	types : TypeTable,
+	e : Expr,
+	conjunction : Bool,
+	left : Expr,
+	right : Expr,
+	out : Vec Finding,
+) -> Unit {
+	let Some(a) = comparison(types, left) else { return }
+	let Some(b) = comparison(types, right) else { return }
+	if !same(a.operand, b.operand) { return }
+	-- A disjunction always holds exactly when the conjunction of its two
+	-- negations never does.
+	let (x, y) = if conjunction { (a, b) } else { (negated(a), negated(b)) }
+	let Some((xLow, xHigh)) = interval(x) else { return }
+	let Some((yLow, yHigh)) = interval(y) else { return }
+	if max(xLow, yLow) <= min(xHigh, yHigh) { return }
+	let name = sketch(a.operand)
+	let message = if conjunction {
+		"'"
+			+ name
+			+ "' cannot be both "
+			+ words(a)
+			+ " and "
+			+ words(b)
+			+ ", so this is always False; check the bounds"
+	} else {
+		"'"
+			+ name
+			+ "' is always "
+			+ words(a)
+			+ " or "
+			+ words(b)
+			+ ", so this is always True; check the bounds"
+	}
+	Vec.push(out, finding(Source.through(extent(left), extent(right)), message))
+}
+
+-- `e` as a comparison of a plain `Int` or `Char` operand with a literal of its
+-- type, the operand first.
+fun comparison(types : TypeTable, e : Expr) -> Option Bound {
+	let EBinary(op, left, right, fn) = unparen(e).kind else { return None }
+	if !Iter.any(["<", "<=", ">", ">=", "==", "!="], _ == op) || !library(op, fn, binaryOperators) {
+		return None
+	}
+	let (operand, written, k) = match (constant(left), constant(right)) {
+		(None, Some(k)) -> (left, op, k)
+		(Some(k), None) -> (right, flipped(op), k)
+		_               -> return None
+	}
+	if !plain(operand) { return None }
+	let (value, shown) = k
+	match typeName(types, operand) {
+		Some("Int") | Some("Char") -> {}
+		_                          -> return None
+	}
+	Some(Bound { operand = unparen(operand), op = written, value = value, shown = shown })
+}
+
+-- `e` as an `Int` or `Char` literal: its value, a `Char` as its code point,
+-- and its text.
+fun constant(e : Expr) -> Option (Int, String) {
+	let x = unparen(e)
+	match x.kind {
+		ELit(LInt(n), text)  -> Some((n, text))
+		ELit(LChar(c), text) -> Some((Char.toInt(c), text))
+		EUnary("-", inner, _) -> match unparen(inner).kind {
+			ELit(LInt(n), text) -> Some((-n, "-" + text))
+			_                   -> None
+		}
+		_ -> None
+	}
+}
+
+-- The operator that compares the other way round: `k < e` is `e > k`.
+fun flipped(op : String) -> String = match op {
+	"<"  -> ">"
+	"<=" -> ">="
+	">"  -> "<"
+	">=" -> "<="
+	_    -> op
+}
+
+-- The comparison that holds exactly when `b` does not.
+fun negated(b : Bound) -> Bound {
+	let op = match b.op {
+		"<"  -> ">="
+		"<=" -> ">"
+		">"  -> "<="
+		">=" -> "<"
+		"==" -> "!="
+		_    -> "=="
+	}
+	Bound { operand = b.operand, op = op, value = b.value, shown = b.shown }
+}
+
+-- The values `b` holds for, from the least to the greatest, or `None` for
+-- `!=`, which holds for two intervals.
+fun interval(b : Bound) -> Option (Int, Int) {
+	let k = b.value
+	let least = -Int.maxValue() - 1
+	let most = Int.maxValue()
+	match b.op {
+		"<"  -> if k == least { Some((most, least)) } else { Some((least, k - 1)) }
+		"<=" -> Some((least, k))
+		">"  -> if k == most { Some((most, least)) } else { Some((k + 1, most)) }
+		">=" -> Some((k, most))
+		"==" -> Some((k, k))
+		_    -> None
+	}
+}
+
+-- `b`'s comparison in words, for a message.
+fun words(b : Bound) -> String {
+	let relation = match b.op {
+		"<"  -> "less than"
+		"<=" -> "at most"
+		">"  -> "greater than"
+		">=" -> "at least"
+		"==" -> "equal to"
+		_    -> "other than"
+	}
+	relation + " " + b.shown
+}

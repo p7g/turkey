@@ -18,6 +18,11 @@ change to `src/`, which is when it is least wanted, so it is marked
 
     pytest -m bootstrap
 
+The same holds across targets: the compiler built for wasm32-wasi, run under
+`wasmtime`, must write the compiler for every target exactly as stage2 does.
+That test needs `wasmtime` (`toolchain.needs_wasmtime`) and is opt in with
+the rest.
+
 `tests/test_emit.py` already assembles stage2's emission of the compiler on
 every run, so what is opt-in here is the second compile, not the coverage of
 the emitter itself. The provenance check is cheap and always runs.
@@ -58,35 +63,47 @@ def _stage3_assembly() -> str:
     return bootc.boot_each("asm", [BOOT_MAIN], _split)[BOOT_MAIN]
 
 
-def _write_boot(compiler: Path, output: Path) -> None:
+def _write_boot(compiler: Path, output: Path, *flags: str) -> None:
     result = subprocess.run(
-        toolchain.command(compiler, "build", "-o", str(output), str(BOOT_MAIN)),
+        toolchain.command(compiler, "build", *flags, "-o", str(output), str(BOOT_MAIN)),
         cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
+
+
+@functools.lru_cache(maxsize=None)
+def _source_key() -> str:
+    """Stage2 and today's `src/`, as a cache key for what stage2 writes for
+    the compiler's own source."""
+    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
+    # `build_key` covers the binary and `lib/` alone, and what stage2 writes
+    # is today's `src/` too.
+    h = hashlib.sha256(bootc.build_key().encode())
+    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
+        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
+        h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def _written(name: str, *flags: str) -> Path:
+    """What stage2 writes for the compiler's own source with the build flags
+    `flags`, cached on disk as `name`."""
+    output = CACHE / f"{name}-{_source_key()}"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        staging = CACHE / f"{name}-{_source_key()}-{os.getpid()}"
+        try:
+            _write_boot(bootc.binary(), staging, *flags)
+            os.replace(staging, output)
+        finally:
+            staging.unlink(missing_ok=True)
+    return output
 
 
 @functools.lru_cache(maxsize=None)
 def _stage3() -> Path:
     """The executable stage2 writes for the compiler's own source: a compiler
     built by today's source rather than by the committed one."""
-    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
-    # `build_key` covers the binary and `lib/` alone, and stage3 is
-    # today's `src/` too.
-    h = hashlib.sha256(bootc.build_key().encode())
-    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
-        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
-        h.update(path.read_bytes())
-    key = h.hexdigest()[:16]
-    output = CACHE / f"stage3-{key}"
-    if not output.exists():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        staging = CACHE / f"stage3-{key}-{os.getpid()}"
-        try:
-            _write_boot(bootc.binary(), staging)
-            os.replace(staging, output)
-        finally:
-            staging.unlink(missing_ok=True)
-    return output
+    return _written("stage3")
 
 
 def _sha(text: str) -> str:
@@ -139,6 +156,46 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     stage3 = bootc.split_before(result.stdout, "; === ")
     for path in programs:
         assert _sha(stage2[path]) == _sha(stage3[path.name]), path.name
+
+
+@pytest.mark.bootstrap
+def test_the_wasm_compiler_writes_what_the_native_one_does(tmp_path):
+    """The compiler built for wasm32-wasi, run under wasmtime, compiles its
+    own source to exactly the bytes stage2 writes, for each target.
+
+    A cross-target fixed point: the native and the wasm compiler are the same
+    source, so a difference is a miscompile by the wasm backend or a bug in
+    the WASI port. The targets run one after another rather than as separate
+    tests, since each run holds about 3.4 GiB of linear memory and a CI runner
+    has 16 GB.
+
+    That is close to wasm32's 4 GiB ceiling, and the heap caps its threshold
+    to stay under it. The compile for arm64-darwin peaks at 3.37 GiB. It fails
+    under `-W max-memory-size` of 3392 MiB and passes at 3456 MiB, which
+    leaves 0.6 GiB of headroom.
+
+    wasmtime's default engine stack, 512 KiB, is what it runs with: GC roots
+    are in the shadow stack in linear memory, and the self-compile's deepest
+    chain of wasm frames needs between 96 and 112 KiB of the engine's.
+    """
+    wasmtime = toolchain.needs_wasmtime()
+    compiler = _written("turkey-wasm", "--target", "wasm32-wasi")
+    for target in ("arm64-darwin", "arm64-linux", "wasm32-wasi"):
+        native = compiler if target == "wasm32-wasi" else _written(f"stage3-{target}", "--target", target)
+        # The guest sees `lib`, `src` and `out` relative to the repository's
+        # root, where stage2 was given absolute paths. Neither the entry's
+        # path nor the output's is in the bytes, so the two still agree.
+        result = subprocess.run(
+            [wasmtime, "run", "--dir", "lib", "--dir", "src", "--dir", f"{tmp_path}::out",
+             "--env", "TURKEY_LIB=lib", str(compiler),
+             "build", "--target", target, "-o", f"out/{target}", "src/Main.gob"],
+            cwd=REPO_ROOT, capture_output=True, text=True, timeout=1800)
+        assert result.returncode == 0, f"{target}:\n{result.stderr[-4000:]}"
+        one, two = (tmp_path / target).read_bytes(), native.read_bytes()
+        if one != two:
+            at = next((i for i, (a, b) in enumerate(zip(one, two)) if a != b), min(len(one), len(two)))
+            pytest.fail(f"{target}: the wasm compiler wrote {len(one)} bytes and the native"
+                        f" one {len(two)}, differing first at byte {at}")
 
 
 STRESSED = REPO_ROOT / "tests" / "programs" / "adt.gob"

@@ -22,9 +22,14 @@ import Turkey.Typed as Typed
 -- A local `var`, `var` condition or `var ... else` none of whose variables
 -- any assignment targets, anywhere in the variables' scope, a lambda's body
 -- included: a lambda shares the variable's cell. The fix writes `let` for
--- `var`, which changes nothing a program can do once nothing assigns it.
--- Where only some of a pattern's variables are assigned, the `var` has to
--- stay, and the others are reported with no fix.
+-- `var`. Once nothing assigns the variable, that changes nothing a program
+-- can do but the variable's type: a `let` generalizes a syntactic value, and
+-- a `var` does not. A generalized `1` is an `Int` at one use and a `Float` at
+-- another where the `var`'s was a `Float` at both, which changes what
+-- `print` writes. So the fix is mechanical only where the initializer is not
+-- a value a `let` could generalize to a type with a class in it
+-- (`mayGeneralize`). Where only some of a pattern's variables are assigned,
+-- the `var` has to stay, and the others are reported with no fix.
 --
 -- The check runs before desugaring. A later condition that binds the name of
 -- a `var` condition's variable is assignable in the body only because of the
@@ -36,9 +41,14 @@ import Turkey.Typed as Typed
 -- that one never reports, so the two never find the same `var`.
 
 -- A `var` as written: where its keyword is, each variable it binds, with the
--- binders an assignment to which makes it assigned, and whether it is a C-style
--- `for`'s initializer.
-type Declared = Declared { at : Span, names : Vec (Pat, Vec Int), initializer : Bool }
+-- binders an assignment to which makes it assigned, whether it is a C-style
+-- `for`'s initializer, and whether writing `let` for it may change its type.
+type Declared = Declared {
+	at          : Span
+	names       : Vec (Pat, Vec Int)
+	initializer : Bool
+	generalizes : Bool
+}
 
 fun varNeverReassigned(f : File) -> Vec Finding {
 	let declared = []
@@ -57,10 +67,11 @@ fun varNeverReassigned(f : File) -> Vec Finding {
 	eachLocal(f, fun(c) {
 		match c {
 			ChStmt(s) -> match s.kind {
-				SVar(pat, _) | SLetElse(True, pat, _, _) -> Vec.push(declared, Declared {
+				SVar(pat, value) | SLetElse(True, pat, value, _) -> Vec.push(declared, Declared {
 					at          = s.span
 					names       = variablesOf(pat)
 					initializer = Set.contains(initializers, s.id)
+					generalizes = mayGeneralize(value)
 				})
 				SAssign(target, _) -> {
 					let assignedTo = unparen(target)
@@ -94,7 +105,13 @@ fun varNeverReassigned(f : File) -> Vec Finding {
 								}
 							}
 						}
-						Vec.push(declared, Declared { at = at, names = names, initializer = False })
+						-- A condition's variables are not generalized.
+						Vec.push(declared, Declared {
+							at          = at
+							names       = names
+							initializer = False
+							generalizes = False
+						})
 					}
 				_ -> {}
 			}
@@ -127,7 +144,7 @@ fun varNeverReassigned(f : File) -> Vec Finding {
 					message = shown + verb + " never assigned; write 'let' in place of 'var'"
 					fix = Some(Fix {
 						edits      = [Edit { span = keyword, text = "let" }]
-						mechanical = True
+						mechanical = !d.generalizes
 					})
 				})
 			}
@@ -147,6 +164,32 @@ fun varNeverReassigned(f : File) -> Vec Finding {
 		}
 	}
 	out
+}
+
+-- Whether a `let` could generalize `e` to a type with a class in it: whether
+-- `e` is a syntactic value other than a literal or `()` whose type its
+-- spelling fixes. This answers `True` for values a `let` gives a type with
+-- no class in it, such as `True`, which costs only a fix that is not
+-- mechanical.
+fun mayGeneralize(e : Expr) -> Bool = match e.kind {
+	ELit(LString(_), _) | ELit(LChar(_), _) | ELit(LFloat(_), _) | EUnit -> False
+	EParen(x)                                                            -> mayGeneralize(x)
+	_                                                                    -> isValue(e)
+}
+
+-- Whether `e` is a syntactic value, which the value restriction lets a `let`
+-- generalize. A constructor may be mutable, which the value restriction also
+-- asks, so this answers `True` for more than a `let` generalizes.
+fun isValue(e : Expr) -> Bool = match e.kind {
+	ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | ELambda(_, _, _, _) -> True
+	ETuple(xs)                                                      -> Iter.all(xs, isValue)
+	ECall(callee, args) -> match callee.kind {
+		ECon(_) -> Iter.all(args, isValue)
+		_       -> False
+	}
+	ERecord(_, fields)       -> Iter.all(fields, fun((_, x)) = isValue(x))
+	EAnnot(x, _) | EParen(x) -> isValue(x)
+	_                        -> False
 }
 
 fun nameOf(p : Pat) -> String = match p.kind {
@@ -192,7 +235,8 @@ fun walkIf(c : Child, visit : fun(Child) -> Bool) -> Unit {
 -- the iteration, as a callback does.
 --
 -- The fix makes a copy for each iteration, with `let i = i` first in the
--- body. That changes nothing else only when the body never assigns `i`.
+-- body, which is offered only when the body never assigns `i`. It changes
+-- what the function sees, so it is never mechanical.
 
 -- The functions an argument of which outlives the call.
 let storing = ["Data.Vec#push", "Data.Map#put", "System.Task#spawn"]
@@ -240,8 +284,9 @@ fun capturedIn(
 		Set.add(reported, (at.line, at.col))
 		Vec.push(out, escaping(f, at, captured, ids, names, body))
 	}
-	-- What the expression at a storing position captures, if it is a function.
-	let stored = fun(e : Expr) {
+	-- Reports the functions the expression at a storing position is, or holds
+	-- in a constructor's arguments or a tuple, which are stored with it.
+	fun stored(e : Expr) -> Unit {
 		let x = unwrap(e)
 		match x.kind {
 			ELambda(_, _, inner, _) -> {
@@ -251,7 +296,11 @@ fun capturedIn(
 			EVar(_, _) -> if let Some(id) = Map.get(binders.refs, x.id) {
 				if let Some((at, captured)) = Map.get(named, id) { report(at, captured) }
 			}
-			_ -> {}
+			ECall(callee, args) -> if let ECon(_) = unwrap(callee).kind {
+				for a in args { stored(a) }
+			}
+			ETuple(xs) -> for x in xs { stored(x) }
+			_          -> {}
 		}
 	}
 	walk(ChExpr(body), fun(c) {
@@ -319,39 +368,45 @@ fun escaping(
 	Finding {
 		span    = at
 		message = message
-		fix     = copyFix(f, body, shown, assignsAny(f, body, captured))
+		fix     = if assignsAny(f, body, captured) { None } else { copyFix(f, body, shown) }
 	}
 }
 
 -- The edit that writes `let n = n` for each of `names` first in `body`, a
--- block. Mechanical unless the body assigns one of them.
-fun copyFix(f : File, body : Expr, names : Vec String, assigned : Bool) -> Option Fix {
+-- block. It is never mechanical: a function that sees each iteration's value
+-- in place of the last is the point of the fix, and `check --fix` makes only
+-- changes a program cannot notice.
+fun copyFix(f : File, body : Expr, names : Vec String) -> Option Fix {
 	let EBlock(stmts) = body.kind else { return None }
 	let open = body.span
 	if Source.isGenerated(open) || Lint.charAt(f, open) != Some('{') { return None }
-	let at = Span {
-		line    = open.line
-		col     = open.col + 1
-		endLine = open.line
-		endCol  = open.col + 1
-		file    = open.file
-		inlined = None
-	}
 	let copies = Vec.map(names, fun(n) = "let " + n + " = " + n)
-	let text = if len(stmts) > 0 && stmts[0].span.line > open.line {
+	let (at, text) = if len(stmts) > 0 && stmts[0].span.line > open.line {
 		-- The body's statements are on lines of their own: so is the copy, at
-		-- their indentation.
+		-- their indentation, on the line before the first. A comment after
+		-- the `{` stays on its line.
 		let first = stmts[0].span
 		let lineStart = Lint.offsetOf(f, first.line, 1)
 		let indent = Lint.textOf(
 			f,
 			Lint.spanOf(f, lineStart, Lint.offsetOf(f, first.line, first.col), first),
 		)
-		String.join(Vec.map(copies, fun(c) = "\n" + indent + c), "")
+		(
+			Lint.spanOf(f, lineStart, lineStart, first),
+			String.join(Vec.map(copies, fun(c) = indent + c + "\n"), ""),
+		)
 	} else {
-		" " + String.join(copies, "; ") + ";"
+		let after = Span {
+			line    = open.line
+			col     = open.col + 1
+			endLine = open.line
+			endCol  = open.col + 1
+			file    = open.file
+			inlined = None
+		}
+		(after, " " + String.join(copies, "; ") + ";")
 	}
-	Some(Fix { edits = [Edit { span = at, text = text }], mechanical = !assigned })
+	Some(Fix { edits = [Edit { span = at, text = text }], mechanical = False })
 }
 
 -- Whether anything in `body` assigns one of `ids`.

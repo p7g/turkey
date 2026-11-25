@@ -733,6 +733,30 @@ def test_a_deep_trace_is_shortened():
     assert lines[65:] == ["  at main (Main.gob:3:20)"]
 
 
+# -- the scheduler --------------------------------------------------------------------
+
+# Step `i` adds the results of the two steps before it. On one worker the steps
+# run in turn on the program's own stack, and each waits for a ready step in
+# `Turkey.Scheduler.waitOn`, whose other arm switches to a coroutine's stack:
+# the arm wasm cannot build must be removed, not the whole function.
+GRAPH = """\
+import System.Parallel as Parallel
+
+fun main() {
+    let steps = Parallel.graph(30, fun(i) = if i < 2 { [] } else { [i - 1, i - 2] }, fun(i, finished) {
+        if i < 2 { i } else { finished(i - 1) + finished(i - 2) }
+    })
+    print(steps[29])
+}
+"""
+
+
+@both
+def test_a_dependency_graph_runs_on_one_worker(stress):
+    result = _run(GRAPH, stress=stress)
+    assert (result.returncode, result.stdout) == (0, "514229\n"), result.stderr
+
+
 # -- the build ------------------------------------------------------------------------
 
 

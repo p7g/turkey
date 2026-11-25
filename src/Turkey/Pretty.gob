@@ -354,8 +354,10 @@ fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
 --- then what the pad aligns, at one column after the widest text and notes.
 --- Between the widest of those and what it aligns is the pad's least, none
 --- for `Tokens` and a space for `Suffixes`. `Tokens` pads are set before
---- `Suffixes` pads, which they move. Updates `pads` to match.
-fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
+--- `Suffixes` pads, which they move. A `Tokens` pad with no notes whose line
+--- the column of notes would carry past `width` leaves its run, as it does
+--- in `renderPadded`, and is not padded. Updates `pads` to match.
+fun realigned(lines : Vec String, pads : Vec Pad, width : Int) -> Vec String {
 	let out = Vec.slice(lines, 0, len(lines))
 	let onLine : Map Int (Vec Pad) = Map.new()
 	for pad in pads {
@@ -383,16 +385,56 @@ fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
 			} else {
 				" " + String.join(pad.notes, " ")
 			}
+			-- The columns of the line of `pad` after the pad, up to the suffixes
+			-- that end it, which do not count toward the width.
+			let after = fun(pad : Pad) {
+				let cs = String.toCodePoints(out[pad.line - 1])
+				var stop = len(cs)
+				for other in Map.getOr(onLine, pad.line, []) {
+					if isSuffixes(other.kind) && other.col >= pad.col + pad.width {
+						stop = if other.col < stop { other.col } else { stop }
+					}
+				}
+				columns(String.fromCodePoints(Array.slice(cs, pad.col + pad.width, stop)))
+			}
+			let kept = Vec.filled(len(run), True)
 			var widest = 0
-			for pad in run { widest = larger(widest, before(pad)) }
-			var widestNoted = widest
-			for pad in run { widestNoted = larger(widestNoted, widest + columns(noted(pad))) }
-			for pad in run {
+			var widestNoted = 0
+			var dropped = True
+			-- Dropping a pad can only narrow the run, so this ends.
+			while dropped {
+				dropped = False
+				widest = 0
+				for var k = 0; k < len(run); k = k + 1 {
+					if kept[k] { widest = larger(widest, before(run[k])) }
+				}
+				widestNoted = widest
+				for var k = 0; k < len(run); k = k + 1 {
+					if kept[k] {
+						widestNoted = larger(widestNoted, widest + columns(noted(run[k])))
+					}
+				}
+				for var k = 0; k < len(run); k = k + 1 {
+					if !suffixes
+							&& kept[k]
+							&& len(run[k].notes) == 0
+							&& widestNoted + after(run[k]) > width {
+						kept[k] = False
+						dropped = True
+					}
+				}
+			}
+			for var k = 0; k < len(run); k = k + 1 {
+				let pad = run[k]
 				let least = if suffixes { 1 } else { 0 }
 				let notes = noted(pad)
-				let filled = String.repeat(" ", widest - before(pad))
-					+ notes
-					+ String.repeat(" ", widestNoted - widest - columns(notes) + least)
+				let filled = if kept[k] {
+					String.repeat(" ", widest - before(pad))
+						+ notes
+						+ String.repeat(" ", widestNoted - widest - columns(notes) + least)
+				} else {
+					""
+				}
 				let cs = String.toCodePoints(out[pad.line - 1])
 				out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col))
 					+ filled
@@ -850,8 +892,30 @@ fun laidOut(p : P, indent : Int, r : Row) -> Laid {
 	}
 	let q = printer(p.width, indent * tabWidth, p.marks)
 	layout(q, Cmd { indent = indent, mode = Breaking, doc = cat([r.left, r.right]) })
-	let body = finish(q)
-	let single = len(body) == 1
+	var body = finish(q)
+	var single = len(body) == 1
+	-- An aligned row whose `left` broke, and whose last line still runs past
+	-- the width, gains nothing from the break: its `right` has no room even
+	-- there. If the row fits on one line with `left` flat, keeping the `right`
+	-- as it breaks (or not), lay it out that way.
+	match r.kind {
+		Aligned -> if !single && !isHard(r.left) && measured(p, body[len(body) - 1]) > p.width {
+			let flatQ = printer(p.width, indent * tabWidth, p.marks)
+			layout(flatQ, Cmd {
+				indent = indent
+				mode   = Breaking
+				doc    = cat([flat(r.left), r.right])
+			})
+			let flatBody = finish(flatQ)
+			if len(flatBody) == 1 {
+				body = flatBody
+				single = True
+				q.pending = flatQ.pending
+				q.ends = flatQ.ends
+			}
+		}
+		_ -> {}
+	}
 	let leftText = match r.kind {
 		Aligned -> if single { renderFlat(r.left) } else { "" }
 		_       -> ""

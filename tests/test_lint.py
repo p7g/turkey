@@ -166,6 +166,11 @@ def test_a_file_that_cannot_be_written_is_reported_as_such(program: Path) -> Non
     assert result.returncode == 2
     assert "permission denied" in result.stderr.lower(), result.stderr
     assert (program / "main.gob").read_text() == TWO_FINDINGS
+    # The open failed before anything was written, so the file is intact: the
+    # failure is reported once, and nothing says it is being written back.
+    assert result.stderr.lower().count("permission denied") == 1, result.stderr
+    assert "writing back" not in result.stderr
+    assert "cannot write back" not in result.stderr
 
 
 def test_fix_leaves_an_allowed_check_alone(program: Path) -> None:

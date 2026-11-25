@@ -76,7 +76,8 @@ may appear any number of times.
 
 An integer, floating-point, string or character literal matches values equal
 to it. A literal pattern has no sign, so `-1` cannot be written as a pattern;
-bind the value and compare it instead.
+bind the value and compare it instead. A string literal with a
+[hole](expressions.md#string-interpolation) cannot be a pattern either.
 
 ### Tuple patterns
 

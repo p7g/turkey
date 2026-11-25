@@ -24,10 +24,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "tests" / "playground_host.mjs"
 VENDOR = REPO_ROOT / "playground" / "vendor" / "browser_wasi_shim"
 
+# V8's engine stack for node, in KiB. Its default, 864 KiB on arm64 macOS, is
+# not enough for every compile: V8 first runs each function in Liftoff, its
+# baseline tier, which gives every wasm local a stack slot, and the compiler's
+# largest functions declare thousands of locals. Compiled by Liftoff alone,
+# hello world needs about 1.4 MiB and a 211-line program 2.1 MiB. Under the
+# default tiering, what a compile needs depends on when TurboFan replaces the
+# hot functions, so the default would make these tests fail at random. 4 MiB
+# fits under the 8 MiB main-thread stack of both CI and macOS.
+STACK_KIB = 4096
+
 
 @pytest.fixture(scope="module")
 def inputs(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
     """`turkey.wasm` and `lib.tar.gz`, as the page fetches them."""
+    # Skip before building either, since building the compiler takes minutes.
+    toolchain.needs_node()
     archive = tmp_path_factory.mktemp("playground") / "lib.tar.gz"
     subprocess.run(["sh", str(REPO_ROOT / "scripts" / "lib-tar.sh"), str(archive)],
                    check=True, capture_output=True, timeout=300)
@@ -39,7 +51,7 @@ def _host(inputs: tuple[Path, Path], tmp_path: Path, source: str, stdin: str | N
     compiler, archive = inputs
     entry = tmp_path / "main.gob"
     entry.write_text(source)
-    argv = [node, str(DRIVER), str(compiler), str(archive), str(entry)]
+    argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), str(compiler), str(archive), str(entry)]
     if stdin is not None:
         (tmp_path / "stdin").write_text(stdin)
         argv.append(str(tmp_path / "stdin"))

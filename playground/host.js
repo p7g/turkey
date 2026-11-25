@@ -23,15 +23,16 @@ import {
  * Returns a compiler for `compile`: `wasm` compiled, and `libArchive`
  * unpacked. `wasm` is `turkey.wasm` as bytes or an already compiled
  * `WebAssembly.Module`; `libArchive` is `lib.tar.gz`'s bytes. Neither is read
- * again, so one compiler serves any number of compiles.
+ * again, so one compiler serves any number of compiles. Throws if the archive
+ * is not a well-formed ustar archive holding files under `lib/`.
  */
 export async function loadCompiler(wasm, libArchive) {
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);
-  const files = untar(await gunzip(libArchive));
-  const root = directoryOf(files, { readonly: true });
-  const lib = root.contents.get("lib");
-  if (!(lib instanceof Directory)) {
-    throw new Error("lib.tar.gz holds no lib/ directory");
+  const lib = untar(await gunzip(libArchive))
+    .filter(([path]) => path.startsWith("lib/"))
+    .map(([path, bytes]) => [path.slice("lib/".length), bytes]);
+  if (lib.length === 0) {
+    throw new Error("lib.tar.gz holds no files under lib/");
   }
   return { module, lib };
 }
@@ -47,14 +48,18 @@ export async function loadCompiler(wasm, libArchive) {
  */
 export async function compile(compiler, source) {
   const work = new PreopenDirectory(".", [["main.gob", new File(new TextEncoder().encode(source))]]);
-  // `lib` is its own preopen, and read-only, so that no compile can change
-  // what the next one reads: the compiler resolves `lib/...` against the
+  // `lib` is its own preopen: the compiler resolves `lib/...` against the
   // preopen with the longest matching name, and everything else against `.`.
+  // Each compile gets its own copy of the tree, files and all, so nothing one
+  // compile does to it reaches the next. Sharing one tree would not be safe:
+  // the shim's directories hold the maps they are given, and `readonly`
+  // guards neither a directory's entries nor `fd_filestat_set_size`. The copy
+  // is about 2 MB, which takes a millisecond or two.
   const fds = [
     new OpenFile(new File([])),
     null,
     null,
-    new PreopenDirectory("lib", compiler.lib.contents),
+    new PreopenDirectory("lib", entriesOf(compiler.lib, { readonly: true })),
     work,
   ];
   const argv = ["turkey", "build", "-o", "out.wasm", "--target", "wasm32-wasi", "main.gob"];
@@ -70,8 +75,9 @@ export async function compile(compiler, source) {
 
 /**
  * Runs `program`, a wasm32-wasi module as bytes or a `WebAssembly.Module`,
- * with `stdin` (a string or bytes, empty by default) on its standard input and
- * an empty directory preopened as `.`. Returns `{ status, stdout, stderr, trap,
+ * with `args` after its name on its command line, `stdin` (a string or bytes,
+ * empty by default) on its standard input, and an empty directory preopened
+ * as `.`. Returns `{ status, stdout, stderr, trap,
  * memory }`: `status` is its exit status, or null if it trapped, and `trap` is
  * the trap's message, or null. A panic is not a trap: it writes its report to
  * stderr and exits with a non-zero status.
@@ -134,8 +140,9 @@ async function gunzip(bytes) {
 
 // Returns the regular files in `tar`, a POSIX ustar archive, as [path, bytes]
 // pairs in archive order. It reads what `scripts/lib-tar.sh` writes and
-// refuses anything else: a member that is not a regular file or a directory,
-// or a header that is not ustar's.
+// throws on anything else: a header that is not ustar's or whose checksum is
+// wrong, a member that is not a regular file or a directory, a size that is
+// not octal, or an archive that ends before its end-of-archive block.
 function untar(tar) {
   const files = [];
   const latin1 = new TextDecoder("latin1");
@@ -144,16 +151,38 @@ function untar(tar) {
     const end = bytes.indexOf(0);
     return latin1.decode(end < 0 ? bytes : bytes.subarray(0, end));
   };
+  const octal = (header, offset, length, what) => {
+    const text = field(header, offset, length).trim();
+    if (!/^[0-7]+$/.test(text)) {
+      throw new Error(`lib.tar.gz: the ${what} in the header at byte ${at} is not octal`);
+    }
+    return parseInt(text, 8);
+  };
   let at = 0;
-  // The archive ends with two zero blocks; one is enough to stop at.
-  while (at + 512 <= tar.length && tar[at] !== 0) {
+  for (;;) {
+    if (at + 512 > tar.length) {
+      throw new Error("lib.tar.gz ends before its end-of-archive block");
+    }
     const header = tar.subarray(at, at + 512);
+    // The archive ends with two zero blocks; the first is enough to stop at.
+    if (header.every((byte) => byte === 0)) {
+      return files;
+    }
     if (field(header, 257, 5) !== "ustar") {
       throw new Error(`lib.tar.gz: the header at byte ${at} is not ustar`);
     }
+    // The checksum is the sum of the header's bytes with its own eight bytes
+    // read as spaces.
+    let sum = 8 * 0x20;
+    for (let i = 0; i < 512; i++) {
+      sum += i >= 148 && i < 156 ? 0 : header[i];
+    }
+    if (octal(header, 148, 8, "checksum") !== sum) {
+      throw new Error(`lib.tar.gz: the header at byte ${at} has the wrong checksum`);
+    }
     const prefix = field(header, 345, 155);
     const name = (prefix === "" ? "" : prefix + "/") + field(header, 0, 100);
-    const size = parseInt(field(header, 124, 12).trim(), 8);
+    const size = octal(header, 124, 12, "size");
     const type = String.fromCharCode(header[156]);
     const body = at + 512;
     if (type === "0" || type === "\0") {
@@ -166,12 +195,12 @@ function untar(tar) {
     }
     at = body + Math.ceil(size / 512) * 512;
   }
-  return files;
 }
 
-// Returns a `Directory` holding `files`, [path, bytes] pairs, making each
-// path's parent directories. `options` is given to each `File`.
-function directoryOf(files, options) {
+// Returns the entries of a directory holding `files`, [path, bytes] pairs, as
+// [name, inode] pairs, making each path's parent directories. Each `File`
+// copies its bytes, and `options` is given to it.
+function entriesOf(files, options) {
   // Build plain maps first: a shim `Directory` records each child directory's
   // parent when it is made, so the tree is made from the leaves up, once.
   const tree = new Map();
@@ -187,6 +216,6 @@ function directoryOf(files, options) {
     here.set(parts[parts.length - 1], new File(bytes, options));
   }
   const build = (map) =>
-    new Directory([...map].map(([name, entry]) => [name, entry instanceof Map ? build(entry) : entry]));
+    [...map].map(([name, entry]) => [name, entry instanceof Map ? new Directory(build(entry)) : entry]);
   return build(tree);
 }

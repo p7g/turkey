@@ -680,9 +680,11 @@ fun isSpace(c : Option Char) -> Bool = match c {
 -- reference from a root, or from a binding a root reaches: the roots are the
 -- declarations the module exports, `main`, what an `infix` declaration means,
 -- the functions the runtime enters by name (`Turkey.Runtime.entryPoints`),
--- and every class and instance method. A `foreign` definition is called from outside and is never
--- reported. A module whose export list has a `..` exports everything it
--- declares, and the entry has no list, so neither has anything to report.
+-- every class and instance method, and every `let` or `var` whose initializer
+-- may run code. A `foreign` definition is called from outside and is never
+-- reported, and a name that starts with `_` says it is unused on purpose. A
+-- module whose export list has a `..` exports everything it declares, and
+-- the entry has no list, so neither has anything to report.
 --
 -- Private bindings that refer only to each other, a function's own
 -- recursion included, are all unreached. There is no mechanical fix: the
@@ -710,7 +712,8 @@ fun unusedPrivateFunction(f : File) -> Vec Finding {
 	}
 	let isPrivate = fun(internal : String) {
 		let name = bare(internal)
-		!Set.contains(exported, name)
+		!String.startsWith(name, "_")
+			&& !Set.contains(exported, name)
 			&& !Set.contains(operands, name)
 			&& name != "main"
 			&& !Array.contains(Rt.entryPoints, internal)
@@ -726,11 +729,11 @@ fun unusedPrivateFunction(f : File) -> Vec Finding {
 						Vec.push(bound, (id, "the function '" + bare(fd.name) + "'", Left(fd)))
 					}
 				}
-				-- A binding whose initializer makes a call may be there for
-				-- what the call does, as `let workers = Scheduler.start()`
+				-- A binding whose initializer may run code may be there for
+				-- what the code does, as `let workers = Scheduler.start()`
 				-- is, so it is a root.
 				SLet(pat, value) | SVar(pat, value) | SLetElse(_, pat, value, _) ->
-					if !calls(value) {
+					if isInert(value) {
 						for v in varPatterns(pat) {
 							if let (PVar(name), Some(id)) = (v.kind, Map.get(refs, v.id)) {
 								if isPrivate(name) {
@@ -787,25 +790,6 @@ fun unusedPrivateFunction(f : File) -> Vec Finding {
 		}
 	}
 	out
-}
-
--- Whether evaluating `e` may call a function, outside the functions it makes.
-fun calls(e : Expr) -> Bool {
-	var found = False
-	fun look(c : Child) -> Unit {
-		if found { return }
-		if let ChExpr(x) = c {
-			match x.kind {
-				ECall(_, _)         -> { found = True }
-				ELambda(_, _, _, _) -> return
-				_                   -> {}
-			}
-		}
-		if let ChFun(_) = c { return }
-		for child in children(c) { look(child) }
-	}
-	look(ChExpr(e))
-	found
 }
 
 -- The nodes a top-level declaration holds.

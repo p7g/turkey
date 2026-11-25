@@ -1,0 +1,174 @@
+export (discardedValue, discardedMonadicValue)
+
+--- The checks on values a statement computes and throws away.
+---
+--- A statement that drops a value has a meaning, so the compiler accepts it,
+--- but it is usually a mistake: `Vec.pop(stack)` called for its effect, with
+--- the popped element forgotten. Inference records each place a value is
+--- dropped (`Typed.discard`), and these checks read the places back once
+--- types are solved.
+---
+--- Of the dropped values, those whose type is an `Option`, an `Either` or the
+--- monad of the `?` block they sit in are reported by `discardedMonadicValue`
+--- and by nothing else. Without its `?`, `Int.parse(text)` type-checks and
+--- does not stop the block at a `None`, so it is the case most worth its own
+--- level. `discardedValue` reports every other value that is not `Unit`.
+
+import Data.Set as Set
+import Turkey.Ast (
+	Program(..),
+	Expr(..),
+	ExprKind(..),
+	Stmt(..),
+	StmtKind(..),
+	Child(..),
+	children,
+	completion,
+	completes,
+)
+import Turkey.Lint (File, Finding(..), finding)
+import Turkey.Lint as Lint
+import Turkey.Prelude as P
+import Turkey.Typed (TypeTable)
+import Turkey.Typed as Typed
+import Turkey.Types as Ty
+
+--- Returns a finding for each value of `f` that is not `Unit` and is
+--- discarded, except those `discardedMonadicValue` reports.
+fun discardedValue(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	for (x, ty, kind) in sites(f, types) {
+		if let Plain = kind {
+			Vec.push(
+				out,
+				finding(
+					x.span,
+					"this expression's value has type '"
+						+ Ty.show(ty)
+						+ "' and is discarded; use it, or write 'let _ = ...'",
+				),
+			)
+		}
+	}
+	out
+}
+
+--- Returns a finding for each value of `f` that is discarded and whose type
+--- is an `Option`, an `Either`, or the monad of the `?` block it is a
+--- statement of.
+fun discardedMonadicValue(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	for (x, ty, kind) in sites(f, types) {
+		let shown = "this expression's value has type '" + Ty.show(ty) + "'"
+		let message = match kind {
+			Plain -> continue
+			OfTheBlock -> shown
+				+ ", the monad of this block, and is discarded; write '?' after it to "
+				+ "bind it, or 'let _ = ...' to drop it"
+			Failure(what) -> shown
+				+ " and is discarded, so a '"
+				+ what
+				+ "' it holds goes unseen; use it, or write 'let _ = ...'"
+		}
+		Vec.push(out, finding(x.span, message))
+	}
+	out
+}
+
+-- Which check reports a discarded value: `discardedValue` for a `Plain` one,
+-- and `discardedMonadicValue` for one whose type is the monad of the block it
+-- is a statement of, or else an `Option` or `Either`, which can hold the
+-- failure named.
+type Kind = Plain | OfTheBlock | Failure(String)
+
+-- The discarded values of `f` that are not `Unit` and are computed, each with
+-- its type and the check that reports it. A call that never returns, such as
+-- `error`, computes no value, and neither does a `return`.
+fun sites(f : File, types : TypeTable) -> Vec (Expr, Ty.Type, Kind) {
+	let monads = blockMonads(f, types)
+	let out = []
+	for x in Typed.discardedIn(types, Lint.pathOf(f)) {
+		let ty = Typed.of_(types, x)
+		let head = Ty.headCon(ty)
+		if head == Some("Unit") || !completes(completion(x), Typed.canReturn(types, _)) {
+			continue
+		}
+		let kind = if Option.isSome(head) && Map.get(monads, x.id) == head {
+			OfTheBlock
+		} else if head == Some(P.optionType) {
+			Failure("None")
+		} else if head == Some(P.eitherType) {
+			Failure("Left")
+		} else {
+			Plain
+		}
+		Vec.push(out, (x, ty, kind))
+	}
+	out
+}
+
+-- The monad of the `?` block each statement of `f` is in, by the id of the
+-- statement's expression, for the statements that are expressions.
+--
+-- Desugaring records the statements of each `?` block's own sequence
+-- (`doStatements`), and leaves them in a block whose value is the `bind` that
+-- runs the rest of the `?` block, or a block that is the rest itself. Either
+-- way the block's type is the monad applied to something, so its head is the
+-- monad. A block that is not part of a `?` block may have a monadic type too,
+-- as a function returning `Array Int` does, which is why only blocks holding a
+-- recorded statement are read.
+--
+-- A block nested in one of those statements, such as an `if` body or a loop
+-- body, is in the same `?` block, and has its monad. A `fun` or a lambda is
+-- not: a `?` in a callback belongs to the callback.
+fun blockMonads(f : File, types : TypeTable) -> Map Int String {
+	let monads = Map.new()
+	let recorded = Set.fromIterator(Lint.programOf(f).doStatements)
+	if Set.isEmpty(recorded) { return monads }
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let EBlock(stmts) = e.kind {
+				if Iter.any(stmts, fun(s) = Set.contains(recorded, s.id)) {
+					if let Some(head) = Ty.headCon(Typed.of_(types, e)) {
+						inMonad(stmts, head, recorded, monads)
+					}
+				}
+			}
+		}
+		True
+	})
+	monads
+}
+
+-- Records `monad` for each of `stmts` and for the statements of the blocks
+-- nested in them, short of a `fun`, a lambda, and a block that holds a
+-- recorded statement, which has a `?` block of its own.
+fun inMonad(
+	stmts : Vec Stmt,
+	monad : String,
+	recorded : Set.Set Int,
+	monads : Map Int String,
+) -> Unit {
+	for s in stmts {
+		if let SExpr(x) = s.kind { Map.put(monads, x.id, monad) }
+		for child in children(ChStmt(s)) { nestedIn(child, monad, recorded, monads) }
+	}
+}
+
+fun nestedIn(c : Child, monad : String, recorded : Set.Set Int, monads : Map Int String) -> Unit {
+	match c {
+		ChFun(_) -> return
+		ChExpr(e) -> match e.kind {
+			ELambda(_, _, _, _) -> return
+			EBlock(stmts) -> {
+				if !Iter.any(stmts, fun(s) = Set.contains(recorded, s.id)) {
+					inMonad(stmts, monad, recorded, monads)
+				}
+				return
+			}
+			_ -> {}
+		}
+		_ -> {}
+	}
+	for child in children(c) { nestedIn(child, monad, recorded, monads) }
+}

@@ -253,8 +253,9 @@ Each is shorthand for a lambda. `_ * 2` means `fun($x) = $x * 2`, and
 **How far the function reaches.** The function is the smallest *boundary*
 around the `_`. These are boundaries:
 
-* a function argument, an index, a tuple component, an array element, and a
-  record field;
+* a function argument, an index, a tuple component, an array element, a
+  record field, and a [hole](expressions.md#string-interpolation) in a string
+  literal;
 * a statement, the right-hand side of a `let` or `var`, a function body, a
   match arm, and the value of `return` or `break`.
 

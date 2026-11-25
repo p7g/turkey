@@ -26,7 +26,7 @@ Some things are deliberately left out:
 3. [Declarations](declarations.md): functions, lambdas, placeholder
    functions, `let` and `var`, annotations, and signatures.
 4. [Expressions](expressions.md): operators, calls, field access, indexing,
-   records, tuples, and array literals.
+   records, tuples, array literals, and string interpolation.
 5. [Patterns](patterns.md): the pattern forms, exhaustiveness, and which
    patterns may appear in bindings.
 6. [Statements and control flow](statements.md): blocks, assignment, `if`,

@@ -176,9 +176,11 @@ fun oops(p : P, message : String, where : Span) -> a =
 -- string or character literal carries its own quotes, a keyword says it is
 -- one, and a line break or the end of the file is named in words.
 fun describe(tok : Token) -> String = match tok.kind {
-	KEof     -> "end of file"
-	KNewline -> if tok.forced { "';'" } else { "end of line" }
-	KString  -> Token.quote(text(tok))
+	KEof                    -> "end of file"
+	KNewline                -> if tok.forced { "';'" } else { "end of line" }
+	KString                 -> Token.quote(text(tok))
+	KStringStart            -> "a string literal with holes"
+	KStringMid | KStringEnd -> "'}'"
 	KChar -> match tok.value {
 		VChar(c) -> charLiteral(c)
 		_        -> "'" + text(tok) + "'"
@@ -277,11 +279,13 @@ fun method(p : P, s : Span, name : String) -> Expr =
 let literalKinds = ["INT", "FLOAT", "STRING", "CHAR"]
 
 let exprStart = [
-	"INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "(", "[", "{", "-", "!", "fun", "if",
-	"match", "while", "for", "loop", "return", "break", "continue", "do", "\\",
+	"INT", "FLOAT", "STRING", "STRING_START", "CHAR", "IDENT", "CONID", "(", "[", "{", "-", "!",
+	"fun", "if", "match", "while", "for", "loop", "return", "break", "continue", "do", "\\",
 ]
 
-let patternStart = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
+-- `STRING_START` only so that the pattern parser can say a literal with holes
+-- cannot be a pattern, rather than that it is not a pattern at all.
+let patternStart = ["INT", "FLOAT", "STRING", "STRING_START", "CHAR", "IDENT", "CONID", "("]
 
 -- -- program ------------------------------------------------------------------------
 
@@ -1652,6 +1656,12 @@ fun parsePatternAtom(p : P) -> Pat {
 			step(p)
 			mkPat(p, tok.span, PLit(literalOf(tok), written(p, tok.span)))
 		}
+		"STRING_START" ->
+			oops(
+				p,
+				"a string literal with a hole cannot be a pattern; match a literal without one",
+				tok.span,
+			)
 		"(" -> parseParenPattern(p, tok)
 		_   -> oops(p, "expected a pattern, found " + describe(tok), tok.span)
 	}
@@ -1870,6 +1880,7 @@ fun parseAtom(p : P) -> Expr {
 			step(p)
 			mkExpr(p, tok.span, ELit(literalOf(tok), written(p, tok.span)))
 		}
+		"STRING_START" -> parseInterp(p, tok)
 		"IDENT" -> {
 			step(p)
 			if text(tok) == "_" { p.pending = p.pending + 1 }
@@ -1956,6 +1967,50 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
 	if len(elems) == 1 { return mkExpr(p, tok.span, EParen(elems[0])) }
 	let parts = Vec.map(elems, closePart(p, _))
 	closeAround(p, mkExpr(p, tok.span, ETuple(parts)), parts)
+}
+
+-- A literal with holes, from its `STRING_START`. Each hole is a boundary of a
+-- placeholder function, as an array element is, so `"#${_}"` is a function and
+-- `"${_ + 1}"` holds one.
+fun parseInterp(p : P, tok : Token) -> Expr {
+	let pieces = [piece(p, tok, 1, 2)]
+	let holes = []
+	step(p)
+	let saved = setNoRecord(p, False)
+	loop {
+		if at(p, "STRING_MID") || at(p, "STRING_END") {
+			-- `\u{24}` is `$`, which the compiler in `bootstrap/` cannot read as `\$`.
+			oops(
+				p,
+				"this hole is empty; write an expression between '\u{24}{' and '}'",
+				cur(p).span,
+			)
+		}
+		Vec.push(holes, closePart(p, parseExpr(p)))
+		let next = cur(p)
+		match kindOf(p) {
+			"STRING_MID" -> {
+				step(p)
+				Vec.push(pieces, piece(p, next, 1, 2))
+			}
+			"STRING_END" -> {
+				step(p)
+				Vec.push(pieces, piece(p, next, 1, 1))
+				p.noRecord = saved
+				let e = mkExpr(p, Source.through(tok.span, next.span), EInterp(pieces, holes))
+				return closeAround(p, e, holes)
+			}
+			_ -> oops(p, "expected '}' to close this hole, found " + describe(next), next.span)
+		}
+	}
+}
+
+-- A piece of a literal with holes: its value, and its text as written without
+-- the `before` code points of delimiter that open it (`"` or `}`) and the
+-- `after` that close it (`$` and `{`, or `"`).
+fun piece(p : P, tok : Token, before : Int, after : Int) -> (String, String) {
+	let cs = String.toCodePoints(written(p, tok.span))
+	(text(tok), String.fromCodePoints(Array.slice(cs, before, len(cs) - after)))
 }
 
 fun parseArrayAtom(p : P, tok : Token) -> Expr {

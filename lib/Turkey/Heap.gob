@@ -716,6 +716,15 @@ fun takeRegion(sizeClass : Int) -> Ptr {
 		let slotBytes = classSlot(sizeClass)
 		region = newRegion(slotBytes, slotBytes, sizeClass, False)
 		if Ptr.isNull(region) { return region }
+		if censusKept { Ptr.store(censusTakenNew, times8(sizeClass), Ptr.load(censusTakenNew, times8(sizeClass)) + 1) }
+	} else if censusKept {
+		Ptr.store(censusTakenAvailable, times8(sizeClass), Ptr.load(censusTakenAvailable, times8(sizeClass)) + 1)
+		Ptr.store(
+			censusOffered,
+			times8(sizeClass),
+			Ptr.load(censusOffered, times8(sizeClass))
+				+ (Ptr.load32(region, regionCapacity) - Ptr.load32(region, regionUsed)) * classSlot(sizeClass),
+		)
 	}
 	Ptr.store(available, times8(sizeClass), Ptr.load(region, regionAvailableNext) : Ptr)
 	region
@@ -827,7 +836,7 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
 		spare = Ptr.load(made, regionNext)
 		spareCount = spareCount - 1
 	}
-	let sizes = if !sizesKept {
+	let sizes = if !sizesKept && !censusTables() {
 		Ptr.null()
 	} else if reused {
 		Ptr.load(made, regionSizes)
@@ -900,7 +909,7 @@ fun allocate(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	let cursor = cursorOf(classOf(size))
 	let free : Int = Ptr.load(cursor, cursorFree)
 	if free == 0 { return allocateSlow(size, kind, frame) }
-	taken(takeSlot(cursor, free), size, kind)
+	taken(takeSlot(cursor, free), size, kind, frame)
 }
 
 fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
@@ -922,7 +931,7 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 		return Ptr.null()
 	}
 	let object = slotFor(size)
-	if !Ptr.isNull(object) { return taken(object, size, kind) }
+	if !Ptr.isNull(object) { return taken(object, size, kind, frame) }
 	-- No memory for a region, though the threshold was not reached: the heap
 	-- grows by up to a threshold between collections, set from the live set,
 	-- which can be more than the memory left. So collect everything and try
@@ -933,7 +942,7 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	if Process.pending() { return Ptr.null() }
 	let again = slotFor(size)
 	if Ptr.isNull(again) { return outOfMemory() }
-	taken(again, size, kind)
+	taken(again, size, kind, frame)
 }
 
 -- A slot of `size` bytes, its header unwritten, or null if there is no memory
@@ -1016,7 +1025,8 @@ fun stressDue() -> Bool {
 
 -- A fresh slot for an object of `size` bytes and of `kind`, recorded in the
 -- size table and the statistics where they are kept.
-fun taken(object : Ptr, size : Int, kind : Int) -> Ptr {
+fun taken(object : Ptr, size : Int, kind : Int, frame : Ptr) -> Ptr {
+	if censusKept { censusNote(object, size, frame) }
 	if sizesKept {
 		let region = regionOf(object)
 		Ptr.store(Ptr.load(region, regionSizes), Ptr.diff(object, region), size)
@@ -2072,6 +2082,7 @@ fun collectFrom(frame : Ptr, asked : Asked) -> Unit {
 
 fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	retire()
+	statsRegionsBefore = regionBytesInUse
 	minor = generational
 		&& match asked {
 			Due   -> !fullDue()
@@ -2093,6 +2104,7 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	}
 	markFrom(frame)
 	if Process.pending() { return }
+	if censusKept { census() }
 	let marked = if wanted { nanoseconds() } else { 0 }
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
 	sweep()
@@ -2259,6 +2271,271 @@ fun release(region : Ptr) -> Unit {
 	Os.free(region)
 }
 
+-- -- census (measurement build) --------------------------------------------------------
+--
+-- In a `--gc-stats` build without `--gc-verify`, each region's size-table word
+-- holds a census table instead: per slot, the allocating call's return
+-- address in the high half's place and the requested size, so that a full
+-- collection can report live bytes by size class and by allocation site.
+
+let censusKept : Bool = Prim.gcStats && !Prim.gcVerify
+var statsRegionsBefore : Int = 0
+-- No per-slot tables on wasm32, where they would double the heap under a
+-- 4 GiB ceiling: the census there has classes and occupancy, not sites.
+fun censusTables() -> Bool = match Target.os {
+	Wasi -> False
+	_    -> censusKept
+}
+let censusSites : Int = 65536
+let censusEntry : Int = 40
+var censusTable : Ptr = Ptr.null()
+var censusClasses : Ptr = Ptr.null()
+let censusClassWords : Int = 8
+var censusFull : Int = 0
+-- Slot bytes allocated per class since the last census, and per class the
+-- regions taken off the available list and made (spare or fresh) since.
+var censusAllocated : Ptr = zeroed(8 * (regionClasses + 1))
+var censusTakenAvailable : Ptr = zeroed(8 * (regionClasses + 1))
+var censusTakenNew : Ptr = zeroed(8 * (regionClasses + 1))
+var censusOffered : Ptr = zeroed(8 * (regionClasses + 1))
+-- Occupancy buckets of nonempty small regions: tenths of capacity live, each
+-- the reserved bytes and the live slot bytes.
+var censusBuckets : Ptr = zeroed(8 * 20)
+-- One region's lines with a live object, by 128-byte line of its data, and
+-- the totals: bytes in free 128-byte lines, in free 256-byte lines, and in
+-- free 16KB quarters of nonempty small regions.
+var censusLines : Ptr = zeroed(8 * 8)
+var censusLines256 : Ptr = zeroed(8 * 4)
+var censusFreeLines : Int = 0
+var censusFreeLines256 : Int = 0
+var censusFreeQuarters : Int = 0
+
+fun censusNote(object : Ptr, size : Int, frame : Ptr) -> Unit {
+	let region = regionOf(object)
+	let table : Ptr = Ptr.load(region, regionSizes)
+	if Ptr.isNull(table) { return }
+	let index = if Ptr.load32(region, regionSizeClass) == regionClasses { 0 } else { slotOf(region, object) }
+	let site : Int = siteOf(frame)
+	let cls = Ptr.load32(region, regionSizeClass)
+	let slotBytes : Int = if cls == regionClasses { Ptr.load(region, regionReserved) } else { Ptr.load(region, regionSlotSize) }
+	let _ = Ptr.atomicAdd(censusAllocated, times8(cls), slotBytes)
+	Ptr.store(table, times8(index) * 2, site)
+	Ptr.store(table, plus(times8(index) * 2, 8), size)
+}
+
+fun siteOf(frame : Ptr) -> Int {
+	if let Wasi = Target.os { return 1 }
+	if Ptr.isNull(frame) { return 1 }
+	let ret : Int = Ptr.load(frame, 8)
+	if ret == 0 { 1 } else { ret }
+}
+
+-- Add one live object to the site table.
+fun censusSite(site : Int, slot : Int, size : Int, header : Int) -> Unit {
+	let mask = censusSites - 1
+	var at = (Int.mulWrapping(site, -7046029254386353131) >> 20) & mask
+	loop {
+		let e = Ptr.add(censusTable, Int.mulWrapping(at, censusEntry))
+		let key : Int = Ptr.load(e, 0)
+		if key == site {
+			Ptr.store(e, 8, plus(Ptr.load(e, 8), 1))
+			Ptr.store(e, 16, plus(Ptr.load(e, 16), slot))
+			Ptr.store(e, 24, plus(Ptr.load(e, 24), size))
+			return
+		}
+		if key == 0 {
+			Ptr.store(e, 0, site)
+			Ptr.store(e, 8, 1)
+			Ptr.store(e, 16, slot)
+			Ptr.store(e, 24, size)
+			Ptr.store(e, 32, header)
+			return
+		}
+		at = (at + 1) & mask
+	}
+}
+
+fun classAdd(cls : Int, word : Int, n : Int) -> Unit {
+	let at = times8(cls * censusClassWords + word)
+	Ptr.store(censusClasses, at, plus(Ptr.load(censusClasses, at), n))
+}
+
+fun classGet(cls : Int, word : Int) -> Int = Ptr.load(censusClasses, times8(cls * censusClassWords + word))
+
+-- Live objects by size class and by allocation site, after a full
+-- collection's marking and before its sweep. Class words: 0 regions with a
+-- live object, 1 regions with none, 2 slots in the former, 3 live slots, 4
+-- live slot bytes, 5 live requested bytes, 6 bytes reserved by the former.
+fun census() -> Unit {
+	censusFull = censusFull + 1
+	if Ptr.isNull(censusTable) {
+		censusTable = zeroed(censusSites * censusEntry)
+		censusClasses = zeroed(8 * censusClassWords * (regionClasses + 1))
+	}
+	Memory.fill(censusTable, censusSites * censusEntry, 0)
+	Memory.fill(censusClasses, 8 * censusClassWords * (regionClasses + 1), 0)
+	Memory.fill(censusBuckets, 8 * 20, 0)
+	censusFreeLines = 0
+	censusFreeLines256 = 0
+	censusFreeQuarters = 0
+	var region = regions
+	while !Ptr.isNull(region) {
+		let cls = Ptr.load32(region, regionSizeClass)
+		let live = Ptr.load32(region, regionLive)
+		let capacity = Ptr.load32(region, regionCapacity)
+		let slotSize : Int = Ptr.load(region, regionSlotSize)
+		let reserved : Int = Ptr.load(region, regionReserved)
+		let table : Ptr = Ptr.load(region, regionSizes)
+		if live == 0 {
+			classAdd(cls, 1, 1)
+		} else {
+			classAdd(cls, 0, 1)
+			classAdd(cls, 2, capacity)
+			classAdd(cls, 3, live)
+			classAdd(cls, 6, reserved)
+			if cls < regionClasses {
+				let b = live * 10 / capacity
+				let bucket = if b > 9 { 9 } else { b }
+				Ptr.store(censusBuckets, times8(2 * bucket), Ptr.load(censusBuckets, times8(2 * bucket)) + reserved)
+				Ptr.store(censusBuckets, times8(2 * bucket + 1), Ptr.load(censusBuckets, times8(2 * bucket + 1)) + live * slotSize)
+			}
+			let slotBytes = if cls == regionClasses { reserved } else { slotSize }
+			Memory.fill(censusLines, 64, 0)
+			Memory.fill(censusLines256, 32, 0)
+			for var i = 0; i < capacity; i = i + 1 {
+				if testBit(region, regionMarked, i) && cls < regionClasses {
+					let first = i * slotSize
+					let last = first + slotSize - 1
+					for var l = first >> 7; l <= last >> 7; l = l + 1 { setBit(censusLines, 0, l) }
+					for var l = first >> 8; l <= last >> 8; l = l + 1 { setBit(censusLines256, 0, l) }
+				}
+			}
+			if cls < regionClasses {
+				let dataBytes = regionBytes - regionData
+				var usedLines = 0
+				for var w = 0; w < 8; w = w + 1 { usedLines = usedLines + population(Ptr.load(censusLines, times8(w))) }
+				var used256 = 0
+				for var w = 0; w < 4; w = w + 1 { used256 = used256 + population(Ptr.load(censusLines256, times8(w))) }
+				censusFreeLines = censusFreeLines + (((dataBytes + 127) >> 7) - usedLines) * 128
+				censusFreeLines256 = censusFreeLines256 + (((dataBytes + 255) >> 8) - used256) * 256
+				-- A quarter is 128 lines.
+				for var q = 0; q < 4; q = q + 1 {
+					var any = 0
+					for var w = 2 * q; w < 2 * q + 2; w = w + 1 { any = any | Ptr.load(censusLines, times8(w)) }
+					if any == 0 { censusFreeQuarters = censusFreeQuarters + 16384 }
+				}
+			}
+			for var i = 0; i < capacity; i = i + 1 {
+				if testBit(region, regionMarked, i) {
+					let site : Int = if Ptr.isNull(table) { 1 } else { Ptr.load(table, times8(i) * 2) }
+					let size : Int = if Ptr.isNull(table) { slotSize } else { Ptr.load(table, plus(times8(i) * 2, 8)) }
+					let object = Ptr.add(region, plus(regionData, Int.mulWrapping(i, slotSize)))
+					let header : Int = Ptr.load(object, 0)
+					classAdd(cls, 4, slotBytes)
+					classAdd(cls, 5, size)
+					censusSite(if site == 0 { 1 } else { site }, slotBytes, size, header)
+				}
+			}
+		}
+		region = Ptr.load(region, regionNext)
+	}
+	textLength = 0
+	put(Prim.cString("[census "))
+	putInt(censusFull)
+	put(if minor { Prim.cString(" minor") } else { Prim.cString(" full") })
+	put(Prim.cString("] at gc "))
+	putInt(collections + 1)
+	put(Prim.cString(", anchor "))
+	putHex(Ptr.toInt(Prim.codeAddress("turkey_gc_report")))
+	put(Prim.cString(", spares "))
+	putInt(spareCount)
+	put(Prim.cString(", region table "))
+	putInt(regionTableCapacity * 8)
+	if let Wasi = Target.os {
+		put(Prim.cString(", memory left "))
+		putInt(Wasi.memoryLeft())
+	}
+	put(Prim.cString("\n"))
+	writeLine()
+	for var c = 0; c <= regionClasses; c = c + 1 {
+		if classGet(c, 0) + classGet(c, 1) > 0 {
+			put(Prim.cString("[class] "))
+			putInt(c)
+			put(Prim.cString(" slot "))
+			putInt(if c < regionClasses { classSlot(c) } else { 0 })
+			put(Prim.cString(" regions "))
+			putInt(classGet(c, 0))
+			put(Prim.cString(" empty "))
+			putInt(classGet(c, 1))
+			put(Prim.cString(" slots "))
+			putInt(classGet(c, 2))
+			put(Prim.cString(" live "))
+			putInt(classGet(c, 3))
+			put(Prim.cString(" slotbytes "))
+			putInt(classGet(c, 4))
+			put(Prim.cString(" requested "))
+			putInt(classGet(c, 5))
+			put(Prim.cString(" reserved "))
+			putInt(classGet(c, 6))
+			put(Prim.cString(" alloc "))
+			putInt(Ptr.load(censusAllocated, times8(c)))
+			put(Prim.cString(" fromavail "))
+			putInt(Ptr.load(censusTakenAvailable, times8(c)))
+			put(Prim.cString(" offered "))
+			putInt(Ptr.load(censusOffered, times8(c)))
+			put(Prim.cString(" new "))
+			putInt(Ptr.load(censusTakenNew, times8(c)))
+			put(Prim.cString("\n"))
+			writeLine()
+		}
+	}
+	Memory.fill(censusAllocated, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusTakenAvailable, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusTakenNew, 8 * (regionClasses + 1), 0)
+	Memory.fill(censusOffered, 8 * (regionClasses + 1), 0)
+	put(Prim.cString("[lines] free128 "))
+	putInt(censusFreeLines)
+	put(Prim.cString(" free256 "))
+	putInt(censusFreeLines256)
+	put(Prim.cString(" freequarters "))
+	putInt(censusFreeQuarters)
+	put(Prim.cString("\n"))
+	writeLine()
+	put(Prim.cString("[occupancy]"))
+	for var b = 0; b < 10; b = b + 1 {
+		if b == 5 {
+			put(Prim.cString("\n"))
+			writeLine()
+			put(Prim.cString("[occupancy+]"))
+		}
+		put(Prim.cString(" "))
+		putInt(Ptr.load(censusBuckets, times8(2 * b)))
+		put(Prim.cString("/"))
+		putInt(Ptr.load(censusBuckets, times8(2 * b + 1)))
+	}
+	put(Prim.cString("\n"))
+	writeLine()
+	-- Every site, unsorted: the analysis sorts.
+	for var i = 0; i < censusSites; i = i + 1 {
+		let e = Ptr.add(censusTable, Int.mulWrapping(i, censusEntry))
+		let key : Int = Ptr.load(e, 0)
+		if key != 0 {
+			put(Prim.cString("[site] "))
+			putHex(key)
+			put(Prim.cString(" "))
+			putInt(Ptr.load(e, 8))
+			put(Prim.cString(" "))
+			putInt(Ptr.load(e, 16))
+			put(Prim.cString(" "))
+			putInt(Ptr.load(e, 24))
+			put(Prim.cString(" "))
+			putHex(Ptr.load(e, 32))
+			put(Prim.cString("\n"))
+			writeLine()
+		}
+	}
+}
+
 -- -- statistics -------------------------------------------------------------------------
 
 fun nanoseconds() -> Int {
@@ -2292,6 +2569,14 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 	putInt(freedNow)
 	put(Prim.cString(", next threshold "))
 	putInt(threshold)
+	put(Prim.cString(", regions "))
+	putInt(statsRegionsBefore)
+	put(Prim.cString(" -> "))
+	putInt(regionBytesInUse)
+	put(Prim.cString(", spare "))
+	putInt(spareCount * regionBytes)
+	put(Prim.cString(", kept "))
+	putInt(liveBytes)
 	put(Prim.cString(", "))
 	putFixed(nanos, 1000000, 3)
 	put(Prim.cString(" ms\n"))

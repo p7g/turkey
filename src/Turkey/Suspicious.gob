@@ -19,9 +19,10 @@ import Turkey.Ast (
 	sketch,
 	unparen,
 )
-import Turkey.Fixity as Fixity
 import Turkey.Lint (File, Finding(..), finding)
 import Turkey.Lint as Lint
+import Turkey.Prelude as P
+import Turkey.Source (Span)
 import Turkey.Source as Source
 import Turkey.Typed (TypeTable(..))
 import Turkey.Typed as Typed
@@ -38,25 +39,29 @@ import Turkey.Types as Ty
 -- an expression can bind or shadow one, and every check here compares two
 -- expressions from one scope.
 --
--- The operators of the language's fixed groups count as calls of nothing, since
--- each is a class method whose instances are expected to be lawful. Any other
--- operator is a function the program declares, and may do anything.
+-- An operator counts as a call of nothing when it means the library's own
+-- definition of it, a class method whose instances are expected to be lawful,
+-- or is `&&`, `||` or `!`, which the compiler defines. A module may declare
+-- `-` or `==` again as a function of its own, which may do anything, so an
+-- operator is judged by the function it resolved to and not by its spelling.
 
 -- Whether `a` and `b` are the same plain expression.
 fun same(a : Expr, b : Expr) -> Bool {
 	let x = unparen(a)
 	let y = unparen(b)
 	match (x.kind, y.kind) {
-		(ELit(l, _), ELit(m, _))             -> sameLit(l, m)
-		(EUnit, EUnit)                       -> True
-		(EVar(n, False), EVar(m, False))     -> n == m
-		(ECon(n), ECon(m))                   -> n == m
-		(ETuple(xs), ETuple(ys))             -> sameAll(xs, ys)
-		(EField(o, f), EField(p, g))         -> f == g && same(o, p)
-		(EProject(o, i), EProject(p, j))     -> i == j && same(o, p)
-		(EUnary(op, o, _), EUnary(oq, p, _)) -> op == oq && same(o, p)
-		(EBinary(op, l, r, _), EBinary(oq, m, s, _)) ->
-			op == oq && plainOperator(op) && same(l, m) && same(r, s)
+		(ELit(l, _), ELit(m, _))         -> sameLit(l, m)
+		(EUnit, EUnit)                   -> True
+		(EVar(n, False), EVar(m, False)) -> n == m
+		(ECon(n), ECon(m))               -> n == m
+		(ETuple(xs), ETuple(ys))         -> sameAll(xs, ys)
+		(EField(o, f), EField(p, g))     -> f == g && same(o, p)
+		(EProject(o, i), EProject(p, j)) -> i == j && same(o, p)
+		(EUnary(op, o, fn), EUnary(oq, p, _)) -> op == oq
+			&& library(op, fn, unaryOperators)
+			&& same(o, p)
+		(EBinary(op, l, r, fn), EBinary(oq, m, s, _)) ->
+			op == oq && library(op, fn, binaryOperators) && same(l, m) && same(r, s)
 		_ -> False
 	}
 }
@@ -80,20 +85,67 @@ fun sameLit(a : Lit, b : Lit) -> Bool = match (a, b) {
 -- Whether `e` is an expression `same` compares: one with no call, `?`,
 -- indexing or binding in it.
 fun plain(e : Expr) -> Bool = match e.kind {
-	ELit(_, _)                  -> True
-	EUnit                       -> True
-	EVar(_, isMethod)           -> !isMethod
-	ECon(_)                     -> True
-	ETuple(xs)                  -> Iter.all(xs, plain)
-	EField(obj, _)              -> plain(obj)
-	EProject(obj, _)            -> plain(obj)
-	EUnary(_, operand, _)       -> plain(operand)
-	EBinary(op, left, right, _) -> plainOperator(op) && plain(left) && plain(right)
-	EParen(inner)               -> plain(inner)
-	_                           -> False
+	ELit(_, _)              -> True
+	EUnit                   -> True
+	EVar(_, isMethod)       -> !isMethod
+	ECon(_)                 -> True
+	ETuple(xs)              -> Iter.all(xs, plain)
+	EField(obj, _)          -> plain(obj)
+	EProject(obj, _)        -> plain(obj)
+	EUnary(op, operand, fn) -> library(op, fn, unaryOperators) && plain(operand)
+	EBinary(op, left, right, fn) ->
+		library(op, fn, binaryOperators) && plain(left) && plain(right)
+	EParen(inner) -> plain(inner)
+	_             -> False
 }
 
-fun plainOperator(op : String) -> Bool = Option.isSome(Fixity.fixedGroup(op))
+-- Whether the operator `op`, which means `fn`, is the compiler's own or the
+-- library's definition of it in `table`. An operator with no method is the
+-- compiler's.
+fun library(op : String, fn : Option Expr, table : Map String String) -> Bool = match fn {
+	None -> True
+	Some(f) -> match (f.kind, Map.get(table, op)) {
+		(EVar(target, _), Some(own)) -> target == own
+		_                            -> False
+	}
+}
+
+-- The method each operator means in the library: the operator, the module
+-- that declares the method's class, and the method.
+let binaryOperators = definitions([
+	("==", "Data.Eq", "Eq.eq"),
+	("!=", "Data.Eq", "Eq.ne"),
+	("<", "Data.Ord", "Ord.lt"),
+	("<=", "Data.Ord", "Ord.lte"),
+	(">", "Data.Ord", "Ord.gt"),
+	(">=", "Data.Ord", "Ord.gte"),
+	("+", "Data.Num", "Add.add"),
+	("-", "Data.Num", "Sub.sub"),
+	("*", "Data.Num", "Mul.mul"),
+	("/", "Data.Num", "Div.div"),
+	("%", "Data.Num", "Rem.rem"),
+	("&", "Bits", "BitAnd.and"),
+	("|", "Bits", "BitOr.or"),
+	("^", "Bits", "BitXor.xor"),
+	("<<", "Bits", "Shift.shl"),
+	(">>", "Bits", "Shift.shr"),
+])
+
+let unaryOperators = definitions([("-", "Data.Num", "Neg.neg")])
+
+fun definitions(rows : Array (String, String, String)) -> Map String String {
+	let out = Map.new()
+	for (op, owner, method) in rows { Map.put(out, op, P.internal(owner, method)) }
+	out
+}
+
+-- The text an expression covers. A node of a declared operator spans the
+-- operator alone, so its extent runs from its left operand's to its right's.
+fun extent(e : Expr) -> Span = match e.kind {
+	EBinary(_, left, right, _) -> Source.through(extent(left), extent(right))
+	EUnary(_, operand, _)      -> Source.through(e.span, extent(operand))
+	_                          -> e.span
+}
 
 -- -- repeated-condition -------------------------------------------------------------
 --
@@ -133,7 +185,7 @@ fun chain(head : Expr, continuing : Set.Set Int, out : Vec Finding) -> Unit {
 						Vec.push(
 							out,
 							finding(
-								cond.span,
+								extent(cond),
 								"this condition repeats '"
 									+ sketch(unparen(first))
 									+ "' "
@@ -192,15 +244,16 @@ fun identicalOperands(f : File, types : TypeTable) -> Vec Finding {
 	let out = []
 	Lint.nodes(f, fun(c) {
 		if let ChExpr(e) = c {
-			if let EBinary(op, left, right, _) = e.kind {
+			if let EBinary(op, left, right, fn) = e.kind {
 				if checkedOperator(op)
+						&& library(op, fn, binaryOperators)
 						&& plain(left)
 						&& same(left, right)
 						&& !isFloat(types, left) {
 					Vec.push(
 						out,
 						finding(
-							Source.through(left.span, right.span),
+							Source.through(extent(left), extent(right)),
 							"both operands of '"
 								+ op
 								+ "' are '"
@@ -340,14 +393,16 @@ fun bounds(
 			+ words(b)
 			+ ", so this is always True; check the bounds"
 	}
-	Vec.push(out, finding(Source.through(left.span, right.span), message))
+	Vec.push(out, finding(Source.through(extent(left), extent(right)), message))
 }
 
 -- `e` as a comparison of a plain `Int` or `Char` operand with a literal of its
 -- type, the operand first.
 fun comparison(types : TypeTable, e : Expr) -> Option Bound {
-	let EBinary(op, left, right, _) = unparen(e).kind else { return None }
-	if !Iter.any(["<", "<=", ">", ">=", "==", "!="], _ == op) { return None }
+	let EBinary(op, left, right, fn) = unparen(e).kind else { return None }
+	if !Iter.any(["<", "<=", ">", ">=", "==", "!="], _ == op) || !library(op, fn, binaryOperators) {
+		return None
+	}
 	let (operand, written, k) = match (constant(left), constant(right)) {
 		(None, Some(k)) -> (left, op, k)
 		(Some(k), None) -> (right, flipped(op), k)

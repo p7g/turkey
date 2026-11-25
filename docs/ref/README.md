@@ -165,6 +165,10 @@ left.
 | `unused-variable` | warn | a local binding nothing reads: a `let`, `var` or `let ... else`, a pattern of `for`, `match`, `if let`, `if var`, `while let` or `while var`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
 | `unused-import` | warn | an import, or an entry of an import's list, that brings nothing the module reads or its export list passes on, such as a name a declaration of the module hides. `x as _` is not reported, and `import M ()` only when loading `M` changes nothing a program does. `--fix` removes the entry, writes an unused `x as y` beside `..` as `x as _`, and removes an import none of which is used, unless it is the last import of a module whose loading may run code, provide an instance or define a `foreign` symbol, which it writes as `import M ()`. |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `repeated-condition` | warn | a test in an `if`/`else if` chain that repeats an earlier test of the chain, so its branch can never run. A test with a call in it is not compared, and neither is one after a test with a call. |
+| `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
+| `self-assignment` | warn | an assignment of a variable or a field path to itself, as in `c.count = c.count`, which changes nothing. `a[i] = a[i]` is not reported, since it can panic. |
+| `impossible-comparison` | warn | two comparisons of one `Int` or `Char` with constants, joined by `&&`, that no value satisfies both of, as in `c >= 'a' && c <= 'Z'`, or joined by `\|\|`, that every value satisfies one of |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

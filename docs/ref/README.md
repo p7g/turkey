@@ -169,6 +169,8 @@ left.
 | `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
 | `self-assignment` | warn | an assignment of a variable or a field path to itself, as in `c.count = c.count`, which changes nothing. `a[i] = a[i]` is not reported, since it can panic. |
 | `impossible-comparison` | warn | two comparisons of one `Int` or `Char` with constants, joined by `&&`, that no value satisfies both of, as in `c >= 'a' && c <= 'Z'`, or joined by `\|\|`, that every value satisfies one of |
+| `discarded-value` | warn | a statement that computes a value other than `()` and drops it ([Discarded values](statements.md#discarded-values)), except those `discarded-monadic-value` reports |
+| `discarded-monadic-value` | warn | a statement that drops an `Option`, an `Either`, or a value of the monad of the `?` block it is in, which is most often a missing `?` ([Discarded values](statements.md#discarded-values)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

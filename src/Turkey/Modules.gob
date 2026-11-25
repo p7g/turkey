@@ -1948,21 +1948,24 @@ fun ownScope(name : String, program : Program) -> Scope {
 
 -- -- what the imports brought ------------------------------------------------------
 
---- One part of an import that brings names: its qualifier, an entry of its
---- list, or the `..` of the list.
-type ImportPart = Qualifier | Entry(ImportItem) | Rest
+--- One part of an import: its qualifier, an entry of its list, the `..` of
+--- the list, or the empty list of `import M ()`.
+type ImportPart = Qualifier | Entry(ImportItem) | Rest | Empty
 
 --- A part of an import, and whether a reference of the module read anything
 --- it brings. `shadowed` is set on an entry every name of which the module
---- declares itself, so that no reference could read it. `loaded` is set when
---- every program loads the imported module whatever its importers write: the
---- Prelude imports it, directly or not.
+--- declares itself, so that no reference could read it. `inert` is set when
+--- no import of the imported module changes what a program runs, either
+--- because the Prelude imports it, directly or not, or because neither it nor
+--- a module it imports outside the Prelude's declares an instance a program
+--- could use without them, a `foreign` definition with a body, or a
+--- top-level binding whose initializer may run code (`Turkey.Ast.isInert`).
 type ImportUse = ImportUse {
 	decl     : ImportDecl
 	part     : ImportPart
 	used     : Bool
 	shadowed : Bool
-	loaded   : Bool
+	inert    : Bool
 }
 
 --- Returns, for each import `m` writes, the parts of it that bring names, in
@@ -1971,11 +1974,13 @@ type ImportUse = ImportUse {
 ---
 --- A qualifier is listed for an import with no list, which brings nothing
 --- else, and for one with an alias. An entry that withholds a name, `x as _`,
---- and the empty list of `import M ()`, which is written for the module's
---- instances, bring nothing to list.
+--- brings nothing to list. The empty list of `import M ()`, which is written
+--- for what loading the module does, is listed, as never used, only where
+--- that is nothing (`inert`).
 fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 	let out = []
 	let always = preludeClosure(l)
+	let inert : Map String Bool = Map.new()
 	let scope = m.scope
 	let visible = spaces(scope)
 	-- Whether a reference read the bare name `short` in the namespace `i`,
@@ -2000,12 +2005,15 @@ fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 	for imp in m.program.imports {
 		if optsOut(imp) || imp.name == Prelude.entryName { continue }
 		let dep = importedBy(l, m, imp.name)
+		if !Map.contains(inert, dep.name) {
+			Map.put(inert, dep.name, isInertModule(l, dep, always))
+		}
 		let use = fun(part : ImportPart, used : Bool, shadowed : Bool) = Vec.push(out, ImportUse {
 			decl     = imp
 			part     = part
 			used     = used
 			shadowed = shadowed
-			loaded   = Set.contains(always, dep.name)
+			inert    = Map.get(inert, dep.name) == Some(True)
 		})
 		let items = match imp.items {
 			Some(items) -> items
@@ -2020,6 +2028,13 @@ fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 		match imp.alias {
 			Some(alias) -> use(Qualifier, through(alias, dep), False)
 			None        -> if through(imp.name, dep) { use(Qualifier, True, False) }
+		}
+		if len(items) == 0
+				&& !imp.rest
+				&& Option.isNone(imp.alias)
+				&& !through(imp.name, dep)
+				&& Map.get(inert, dep.name) == Some(True) {
+			use(Empty, False, False)
 		}
 		if imp.rest {
 			var used = False
@@ -2072,6 +2087,56 @@ fun preludeClosure(l : Loader) -> Set.Set String {
 		}
 	}
 	seen
+}
+
+-- Whether no import of `dep` changes what a program runs, as `ImportUse`'s
+-- `inert` says. `always` is the modules every program loads.
+fun isInertModule(l : Loader, dep : Module, always : Set.Set String) -> Bool {
+	-- What would not be loaded without `dep`, at most. Another import may
+	-- load some of it anyway, which only makes the answer more cautious.
+	let alone = Set.new()
+	let pending = [dep.name]
+	while let Some(name) = Vec.pop(pending) {
+		if Set.contains(always, name) || Set.contains(alone, name) { continue }
+		Set.add(alone, name)
+		if let Some(m) = Map.get(l.modules, name) {
+			for next in Map.values(m.imported) { Vec.push(pending, next) }
+		}
+	}
+	-- An instance whose class or one of whose types is declared in `alone`
+	-- can be used only by a program that loads `alone` some other way.
+	let outside = fun(name : String) = match Prelude.moduleOf(name) {
+		Some(owner) -> !Set.contains(alone, owner)
+		None        -> True
+	}
+	fun typesOutside(t : Type) -> Bool = match t.kind {
+		TECon(name, args) -> outside(name) && Iter.all(args, typesOutside)
+		TEApp(head, args) -> typesOutside(head) && Iter.all(args, typesOutside)
+		TETuple(ts)       -> Iter.all(ts, typesOutside)
+		TEFun(ps, r)      -> Iter.all(ps, typesOutside) && typesOutside(r)
+		TEParen(x)        -> typesOutside(x)
+		TEVar(_)          -> True
+	}
+	for name in alone {
+		let m = match Map.get(l.modules, name) {
+			Some(m) -> m
+			None    -> return False
+		}
+		for d in m.program.decls {
+			match d {
+				DStmt(s) -> match s.kind {
+					-- A `foreign` definition with a body is called by its
+					-- symbol, which nothing else would define.
+					SFun(fd) -> if Option.isSome(fd.symbol) { return False }
+					SLet(_, value) | SVar(_, value) -> if !isInert(value) { return False }
+					SLetElse(_, _, _, _) | SAssign(_, _) | SExpr(_) -> return False
+				}
+				DInstance(i) -> if outside(i.cls) && typesOutside(i.head) { return False }
+				DType(_) | DClass(_) | DForeign(_) | DInfix(_) -> {}
+			}
+		}
+	}
+	True
 }
 
 -- The fields of the record constructor `target`, an internal name, or none

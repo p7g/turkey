@@ -320,13 +320,14 @@ fun nameIn(f : File, d : FunDecl) -> Span {
 -- which declaration does.
 --
 -- A name or qualifier the module's export list passes on is used by the
--- export. `x as _` brings nothing, and `import M ()` is written for `M`'s
--- instances; neither is reported.
+-- export. `x as _` brings nothing and is not reported. `import M ()` is
+-- written for what loading `M` does, and is reported only where that is
+-- nothing.
 --
 -- The fix deletes the entry with the comma that separates it from the next,
 -- or the previous for the last. When nothing an import brings is used, it
--- deletes the whole import, and every finding of that import has the same
--- fix.
+-- deletes the whole import, or keeps it as `import M ()` (`Whole`), and every
+-- finding of that import has the same fix.
 
 fun unusedImport(f : File) -> Vec Finding {
 	let exported = exportedNames(Lint.programOf(f))
@@ -350,7 +351,7 @@ fun unusedImport(f : File) -> Vec Finding {
 	-- import of one leaves it loaded.
 	let kept = Set.new()
 	for (decl, parts, unusedParts) in groups {
-		if len(unusedParts) < len(parts) || Iter.any(parts, _.loaded) { Set.add(kept, decl.name) }
+		if len(unusedParts) < len(parts) || Iter.any(parts, _.inert) { Set.add(kept, decl.name) }
 	}
 	let rewritten = Set.new()
 	let out = []
@@ -376,7 +377,8 @@ fun unusedImport(f : File) -> Vec Finding {
 -- import of a module stops the module being loaded, and with it its
 -- instances and the initializers of its top-level bindings, so that import is
 -- written `import M ()` instead, which brings no names and keeps the module.
--- A module the Prelude imports is loaded anyway, and its imports are deleted.
+-- The imports of a module whose loading changes nothing a program runs
+-- (`ImportUse`'s `inert`) are deleted.
 type Whole = Delete | LoadOnly
 
 fun sameSpan(a : Span, b : Span) -> Bool =
@@ -399,7 +401,7 @@ fun reexported(u : ImportUse, exported : Set.Set String) -> Bool = match u.part 
 		let under = Option.unwrapOr(entry.rename, entry.item.name)
 		Set.contains(exported, if entry.item.qualifier { "module " + under } else { under })
 	}
-	Rest -> False
+	Rest | Empty -> False
 }
 
 fun importFinding(
@@ -432,7 +434,8 @@ fun importFinding(
 			}
 			(entry.item.span, "'" + shown + "' is imported and never used" + hidden)
 		}
-		Rest -> (decl.span, "nothing that '..' imports from '" + decl.name + "' is used")
+		Rest  -> (decl.span, "nothing that '..' imports from '" + decl.name + "' is used")
+		Empty -> (decl.span, "loading '" + decl.name + "' changes nothing the program does")
 	}
 	if Source.isGenerated(span) || Source.isEmpty(span) { return }
 	let (fix, remove) = match whole {
@@ -447,6 +450,7 @@ fun importFinding(
 			Qualifier -> (aliasFix(f, decl), "remove 'as " + Option.unwrapOr(decl.alias, "") + "'")
 			Entry(entry) -> (Some(entryFix(f, decl, entry, unusedEntries)), "remove it")
 			Rest         -> (None, "remove '..'")
+			Empty        -> (None, "remove the import")
 		}
 	}
 	Vec.push(out, Finding { span = span, message = what + "; " + remove, fix = fix })
@@ -506,7 +510,8 @@ fun wholeLine(f : File, decl : ImportDecl) -> Fix {
 			None -> break
 			_ -> {
 				-- Something follows on the line: a comment, or another
-				-- statement. Delete the import alone.
+				-- statement. Delete the import alone, and not mechanically,
+				-- since a comment left behind is about the import.
 				kept = False
 				break
 			}
@@ -515,7 +520,7 @@ fun wholeLine(f : File, decl : ImportDecl) -> Fix {
 	let end = if kept { to } else { Lint.offsetOf(f, s.endLine, s.endCol) }
 	Fix {
 		edits      = [Edit { span = Lint.spanOf(f, from, end, s), text = "" }]
-		mechanical = !String.contains(Lint.textOf(f, s), "--")
+		mechanical = kept && !String.contains(Lint.textOf(f, s), "--")
 	}
 }
 

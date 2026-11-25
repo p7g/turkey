@@ -107,10 +107,15 @@ let cellKind : Int = 5
 let regionBytes : Int = 0x10000
 -- Clears the offset within a region, leaving its base.
 let regionMask : Int = -0x10000
--- The words of each slot bitmap: 4096 bits, which the 4028 slots of the
--- 16-byte class need.
-let regionWords : Int = 64
+-- The words of each slot bitmap: 8192 bits, which the 7792 eight-byte granules
+-- of a line region need.
+let regionWords : Int = 128
 let regionClasses : Int = 26
+-- The class of a line region: objects of any small size, bump-allocated into
+-- holes of free lines, each starting at an eight-byte granule. Its "slots" are
+-- the granules, so the slot bitmaps, `slotOf` and `findObject` work on it
+-- unchanged: an allocated bit is an object's first granule.
+let lineClass : Int = 27
 let regionNext : Int = 0
 let regionAvailableNext : Int = 8
 let regionSlotSize : Int = 16
@@ -118,16 +123,28 @@ let regionReserved : Int = 24
 let regionCapacity : Int = 32
 let regionUsed : Int = 36
 let regionLive : Int = 40
+-- In a line region, the line the next search for a hole starts at.
 let regionSearchWord : Int = 44
 let regionSizeClass : Int = 48
-let regionAllocated : Int = 56
-let regionMarked : Int = 568
 -- The region's size table, or null: see `sizesKept`.
-let regionSizes : Int = 1080
--- Where the slots begin. Eight-byte alignment is all an object needs, so
--- every slot size is a multiple of 8 and the smallest is 16: the header and
--- one word.
-let regionData : Int = 1088
+let regionSizes : Int = 56
+let regionAllocated : Int = 64
+let regionMarked : Int = 1088
+-- In a line region, each object's last granule, so that the sweep can find
+-- the extent of an object no header records the size of.
+let regionEnds : Int = 2112
+-- In a line region, a bit per 128-byte line of the region, from its base:
+-- set when the last sweep found a live object on it. Lines below
+-- `regionData` are the header's and are never handed out.
+let regionLines : Int = 3136
+-- Where the slots begin, on a line boundary. Eight-byte alignment is all an
+-- object needs, so every slot size is a multiple of 8 and the smallest is 16:
+-- the header and one word.
+let regionData : Int = 3200
+let lineBytes : Int = 128
+let lineShift : Int = 7
+let regionLineCount : Int = 512
+let dataLine : Int = 25
 
 -- `RootFrame`, the shadow stack -- the globals' frame, and any a C caller
 -- registers -- is a chain of these: the previous frame, a NUL-terminated
@@ -175,6 +192,9 @@ var regions : Ptr = Ptr.null()
 -- Per size class, the regions with a free slot that no cursor owns, linked by
 -- `availableNext`.
 var available : Ptr = zeroed(8 * regionClasses)
+-- The line regions with a free line at or after their search line that no
+-- cursor owns, linked by `availableNext`.
+var recyclable : Ptr = Ptr.null()
 var regionBytesInUse : Int = 0
 var regionBytesPeak : Int = 0
 
@@ -736,7 +756,15 @@ fun retire() -> Unit {
 	}
 }
 
+-- The size-class cursors are never filled while small objects go to line
+-- regions, so only the two bump cursors have anything to give back.
 fun retireWorker(w : Ptr) -> Unit {
+	giveBack(cursorIn(w, 0))
+	giveBack(cursorIn(w, 1))
+	localFold(w)
+}
+
+fun retireClassCursors(w : Ptr) -> Unit {
 	for var rc = 0; rc < regionClasses; rc = rc + 1 {
 		let cursor = cursorIn(w, rc)
 		let r : Ptr = Ptr.load(cursor, cursorRegion)
@@ -807,6 +835,154 @@ fun largeAllocate(bytes : Int) -> Ptr {
 	Ptr.add(made, regionData)
 }
 
+-- -- line regions -----------------------------------------------------------------------
+--
+-- Every small object is bump-allocated into a hole of free lines, whatever
+-- its size, so that a line any object left free can take an object of any
+-- other size. A worker has two bump cursors. The line cursor takes holes in
+-- turn from the partly used regions the last sweep left recyclable, and then
+-- from empty ones. The overflow cursor takes only empty regions, and holds
+-- an object of more than a line that does not fit the line cursor's hole, so
+-- that one such object does not make the line cursor skip the rest of a hole
+-- it could still fill with small ones.
+--
+-- Line marks are exact: the sweep marks every line a live object covers, by
+-- its first and last granule. Allocation therefore never skips a line at the
+-- start of a hole, as a collector that marks only an object's first line
+-- must.
+--
+-- The cursors are in the worker's record, in the first two size classes'
+-- cursors, whose free words stay 0 so that generated code calls in for every
+-- allocation.
+let bumpNext : Int = 8
+let bumpLimit : Int = 16
+let bumpRegion : Int = 24
+
+-- A line region's object size for a request of `size` bytes: whole granules,
+-- and at least the header and one word, as the smallest size class.
+fun lineSize(size : Int) -> Int {
+	let rounded = plus(size, 7) & -8
+	if rounded < 16 { 16 } else { rounded }
+}
+
+-- A small object's space, its header unwritten, or null if there is no memory
+-- for a region.
+fun lineAllocate(size : Int) -> Ptr {
+	let bytes = lineSize(size)
+	let w = Process.workerRecord()
+	let cursor = cursorIn(w, 0)
+	while True {
+		let object = bump(cursor, bytes)
+		if !Ptr.isNull(object) { return object }
+		if bytes > lineBytes { return overflowAllocate(cursorIn(w, 1), bytes) }
+		if !nextHole(cursor) { return Ptr.null() }
+	}
+	Ptr.null()
+}
+
+-- The next `bytes` of the cursor's hole, recorded as an object: its first and
+-- last granules, and the region's count. Null if the hole is shorter.
+fun bump(cursor : Ptr, bytes : Int) -> Ptr {
+	let next : Int = Ptr.load(cursor, bumpNext)
+	let limit : Int = Ptr.load(cursor, bumpLimit)
+	if Int.subWrapping(limit, next) < bytes { return Ptr.null() }
+	Ptr.store(cursor, bumpNext, plus(next, bytes))
+	let object = Ptr.fromInt(next)
+	let region = regionOf(object)
+	let first = Int.subWrapping(Ptr.diff(object, region), regionData) >> 3
+	setBit(region, regionAllocated, first)
+	setBit(region, regionEnds, plus(first, Int.subWrapping(bytes >> 3, 1)))
+	Ptr.store32(region, regionUsed, plus(Ptr.load32(region, regionUsed), 1))
+	localAdd(1, bytes)
+	object
+}
+
+-- Move the line cursor to the next hole of its region, or of the next region
+-- it takes; False if there is no memory for a region.
+fun nextHole(cursor : Ptr) -> Bool {
+	var region : Ptr = Ptr.load(cursor, bumpRegion)
+	while True {
+		if !Ptr.isNull(region) && holeIn(cursor, region) { return True }
+		-- The region has nothing left past its search line, and is on no list
+		-- until the sweep finds it again.
+		Lock.acquire(heapLock)
+		region = takeLineRegion(True)
+		localFold(Process.workerRecord())
+		Lock.release(heapLock)
+		Ptr.store(cursor, bumpRegion, region)
+		Ptr.store(cursor, bumpNext, 0)
+		Ptr.store(cursor, bumpLimit, 0)
+		if Ptr.isNull(region) { return False }
+	}
+	False
+}
+
+-- Point the cursor at `region`'s first hole from its search line, and move
+-- the search line to the hole's end; False if there is none.
+fun holeIn(cursor : Ptr, region : Ptr) -> Bool {
+	var line = Ptr.load32(region, regionSearchWord)
+	while line < regionLineCount && testBit(region, regionLines, line) { line = plus(line, 1) }
+	if line >= regionLineCount {
+		Ptr.store32(region, regionSearchWord, regionLineCount)
+		return False
+	}
+	var end = plus(line, 1)
+	while end < regionLineCount && !testBit(region, regionLines, end) { end = plus(end, 1) }
+	Ptr.store32(region, regionSearchWord, end)
+	Ptr.store(cursor, bumpNext, plus(Ptr.toInt(region), line << lineShift))
+	Ptr.store(cursor, bumpLimit, plus(Ptr.toInt(region), end << lineShift))
+	True
+}
+
+-- An object of more than a line, from the overflow cursor, which takes a new
+-- empty region when its own has too little left.
+fun overflowAllocate(cursor : Ptr, bytes : Int) -> Ptr {
+	let object = bump(cursor, bytes)
+	if !Ptr.isNull(object) { return object }
+	Lock.acquire(heapLock)
+	giveBack(cursor)
+	let region = takeLineRegion(False)
+	localFold(Process.workerRecord())
+	Lock.release(heapLock)
+	if Ptr.isNull(region) { return region }
+	Ptr.store(cursor, bumpRegion, region)
+	let _ = holeIn(cursor, region)
+	bump(cursor, bytes)
+}
+
+-- A recyclable line region if `recycled` and there is one, or else an empty
+-- one; null if there is no memory for it. Under `heapLock`.
+fun takeLineRegion(recycled : Bool) -> Ptr {
+	if recycled && !Ptr.isNull(recyclable) {
+		let region = recyclable
+		recyclable = Ptr.load(region, regionAvailableNext)
+		return region
+	}
+	newRegion(8, 8, lineClass, False)
+}
+
+-- Give up a bump cursor's region: onto the recyclable list, searched again
+-- from the rest of the cursor's hole, if that leaves it a line to search.
+-- Under `heapLock`, or where no other worker can be allocating.
+fun giveBack(cursor : Ptr) -> Unit {
+	let region : Ptr = Ptr.load(cursor, bumpRegion)
+	if Ptr.isNull(region) { return }
+	let next : Int = Ptr.load(cursor, bumpNext)
+	if next != 0 {
+		-- The first whole line past what the cursor took. The lines from it to
+		-- the hole's end are free, and the search line is that end.
+		let line = plus(Int.subWrapping(next, Ptr.toInt(region)), lineBytes - 1) >> lineShift
+		Ptr.store32(region, regionSearchWord, line)
+	}
+	if Ptr.load32(region, regionSearchWord) < regionLineCount {
+		Ptr.store(region, regionAvailableNext, recyclable)
+		recyclable = region
+	}
+	Ptr.store(cursor, bumpRegion, Ptr.null())
+	Ptr.store(cursor, bumpNext, 0)
+	Ptr.store(cursor, bumpLimit, 0)
+}
+
 -- An empty region with slots of `slotSize`, on the region list and, if it is
 -- small, its class's available list; null if there is no memory for it. A
 -- 64KB one is a spare if there is one. Under `heapLock`.
@@ -847,7 +1023,11 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Ptr
 	Ptr.store(made, regionNext, regions)
 	regions = made
 	if !large {
-		Ptr.store(available, times8(sizeClass), made)
+		if sizeClass == lineClass {
+			Ptr.store32(made, regionSearchWord, dataLine)
+		} else {
+			Ptr.store(available, times8(sizeClass), made)
+		}
 		Ptr.store(reciprocals, times8(sizeClass), (0x1_0000_0000 + slotSize - 1) / slotSize)
 	}
 	regionBytesInUse = regionBytesInUse + reserved
@@ -944,10 +1124,7 @@ fun slotFor(size : Int) -> Ptr {
 		Lock.release(heapLock)
 		return object
 	}
-	let sizeClass = classOf(size)
-	let cursor = cursorOf(sizeClass)
-	if Ptr.load(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) { return Ptr.null() }
-	takeSlot(cursor, Ptr.load(cursor, cursorFree))
+	lineAllocate(size)
 }
 
 fun outOfMemory() -> Ptr {
@@ -1354,7 +1531,7 @@ fun scanShadow(frame : Ptr, high : Ptr) -> Unit {
 -- slot size below 2^16, so the rounding adds less than 2^16 / 2^32 to a whole
 -- number. Set by `newRegion` for each class it makes a region of, which is
 -- before anything in the class can be marked.
-var reciprocals : Ptr = zeroed(8 * (regionClasses + 1))
+var reciprocals : Ptr = zeroed(8 * (lineClass + 1))
 
 -- Whether a traced word names no object: null, or one of the small integers
 -- below `immediates`.
@@ -2177,6 +2354,8 @@ fun clearMarks() -> Unit {
 -- A minor collection's marking starts from them, and stops at them.
 fun sweep() -> Unit {
 	Memory.fill(available, 8 * regionClasses, 0)
+	recyclable = Ptr.null()
+	if statsWanted { Memory.fill(statsLines, statsLinesBytes, 0) }
 	liveBytes = 0
 	var previous = Ptr.null()
 	var region = regions
@@ -2212,7 +2391,9 @@ fun sweep() -> Unit {
 			Ptr.store32(region, regionSearchWord, 0)
 			let cls = Ptr.load32(region, regionSizeClass)
 			liveBytes = liveBytes
-				+ (if cls < regionClasses {
+				+ (if cls == lineClass {
+					sweepLines(region)
+				} else if cls < regionClasses {
 					live * Ptr.load(region, regionSlotSize)
 				} else {
 					Ptr.load(region, regionReserved)
@@ -2226,6 +2407,111 @@ fun sweep() -> Unit {
 		region = next
 	}
 	trimSpares()
+}
+
+-- Rebuild a line region's ends and line marks from its marks, which the
+-- caller has made its allocation bitmap, put it on the recyclable list if it
+-- has a free line, and answer its live bytes. A dead object's ends bit would
+-- cut short the extent of an object allocated over it later, so only the
+-- survivors' are kept.
+fun sweepLines(region : Ptr) -> Int {
+	Memory.fill(endsScratch, 8 * regionWords, 0)
+	Memory.fill(Ptr.add(region, regionLines), regionLineCount >> 3, 0)
+	let census = statsWanted
+	if census { Memory.fill(conservativeScratch, regionLineCount >> 3, 0) }
+	var bytes = 0
+	for var wi = 0; wi < regionWords; wi = plus(wi, 1) {
+		var left : Int = Ptr.load(region, plus(regionMarked, times8(wi)))
+		while left != 0 {
+			let lowest = left & Int.negWrapping(left)
+			left = left ^ lowest
+			let first = plus(wi << 6, bitIndex(lowest))
+			let last = endFrom(region, first)
+			setBit(endsScratch, 0, last)
+			let size = plus(Int.subWrapping(last, first), 1) << 3
+			bytes = plus(bytes, size)
+			let firstLine = plus(dataLine, first >> 4)
+			let lastLine = plus(dataLine, last >> 4)
+			for var l = firstLine; l <= lastLine; l = plus(l, 1) { setBit(region, regionLines, l) }
+			if census {
+				-- What a collector marking only a small object's first line
+				-- would have marked: every line of an object of more than one.
+				let upTo = if size <= lineBytes { firstLine } else { lastLine }
+				for var l = firstLine; l <= upTo; l = plus(l, 1) { setBit(conservativeScratch, 0, l) }
+			}
+		}
+	}
+	Memory.copy(Ptr.add(region, regionEnds), endsScratch, 8 * regionWords)
+	Ptr.store32(region, regionSearchWord, dataLine)
+	var marked = 0
+	for var lw = 0; lw < regionLineCount >> 6; lw = plus(lw, 1) {
+		marked = plus(marked, population(Ptr.load(region, plus(regionLines, times8(lw)))))
+	}
+	if marked < regionLineCount - dataLine {
+		Ptr.store(region, regionAvailableNext, recyclable)
+		recyclable = region
+	}
+	if census { lineCensus(region, marked) }
+	bytes
+}
+
+-- The first ends bit of a line region at or after granule `first`.
+fun endFrom(region : Ptr, first : Int) -> Int {
+	var wi = first >> 6
+	var bits : Int = Ptr.load(region, plus(regionEnds, times8(wi))) & Int.negWrapping(bit(first))
+	while bits == 0 {
+		wi = plus(wi, 1)
+		bits = Ptr.load(region, plus(regionEnds, times8(wi)))
+	}
+	plus(wi << 6, bitIndex(bits & Int.negWrapping(bits)))
+}
+
+var endsScratch : Ptr = zeroed(8 * regionWords)
+var conservativeScratch : Ptr = zeroed(regionLineCount >> 3)
+
+-- The line census of one sweep, for `--gc-stats`: the free lines in line
+-- regions that keep a live object, the holes they make by length, and the
+-- free lines a collector marking lines conservatively would lose. Words: free
+-- lines, lost lines, then a hole count and a line count per bucket.
+let statsHoleBuckets : Int = 8
+let statsLinesBytes : Int = 16 + 16 * statsHoleBuckets
+var statsLines : Ptr = zeroed(statsLinesBytes)
+
+-- Count `region`'s free lines and holes after its sweep, which marked
+-- `marked` lines.
+fun lineCensus(region : Ptr, marked : Int) -> Unit {
+	let free = regionLineCount - dataLine - marked
+	Ptr.store(statsLines, 0, plus(Ptr.load(statsLines, 0), free))
+	-- A line is lost to conservative marking if it is free under exact
+	-- marking and either conservatively marked or right after one that is,
+	-- since a hole's first line may hold the end of an object that starts
+	-- on the line before.
+	var lost = 0
+	var carry = 0
+	for var lw = 0; lw < regionLineCount >> 6; lw = plus(lw, 1) {
+		let c : Int = Ptr.load(conservativeScratch, times8(lw))
+		let exact : Int = Ptr.load(region, plus(regionLines, times8(lw)))
+		let blocked = c | c << 1 | carry
+		carry = shiftRight(c, 63)
+		lost = plus(lost, population(blocked & complement(exact)))
+	}
+	Ptr.store(statsLines, 8, plus(Ptr.load(statsLines, 8), lost))
+	var line = dataLine
+	while line < regionLineCount {
+		if testBit(region, regionLines, line) {
+			line = plus(line, 1)
+		} else {
+			var end = plus(line, 1)
+			while end < regionLineCount && !testBit(region, regionLines, end) { end = plus(end, 1) }
+			let length = end - line
+			var bucket = 0
+			while bucket < statsHoleBuckets - 1 && length > 1 << bucket { bucket = plus(bucket, 1) }
+			let at = plus(16, bucket << 4)
+			Ptr.store(statsLines, at, plus(Ptr.load(statsLines, at), 1))
+			Ptr.store(statsLines, plus(at, 8), plus(Ptr.load(statsLines, plus(at, 8)), length))
+			line = end
+		}
+	}
 }
 
 -- Free the spares beyond what the heap's recent peak leaves room for: the
@@ -2298,6 +2584,21 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 	put(Prim.cString(", "))
 	putFixed(nanos, 1000000, 3)
 	put(Prim.cString(" ms\n"))
+	writeLine()
+	put(Prim.cString("[gc "))
+	putInt(collections)
+	put(Prim.cString(" lines] free "))
+	putInt(Ptr.load(statsLines, 0))
+	put(Prim.cString(", conservative-lost "))
+	putInt(Ptr.load(statsLines, 8))
+	put(Prim.cString(", holes"))
+	for var b = 0; b < statsHoleBuckets; b = b + 1 {
+		put(Prim.cString(" "))
+		putInt(Ptr.load(statsLines, 16 + 16 * b))
+		put(Prim.cString("/"))
+		putInt(Ptr.load(statsLines, 24 + 16 * b))
+	}
+	put(Prim.cString("\n"))
 	writeLine()
 }
 

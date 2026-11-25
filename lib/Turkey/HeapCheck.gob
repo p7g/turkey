@@ -161,8 +161,11 @@ let smallBytes : Int = 32768
 -- slots of their size class; a large region is a whole number of 64KB blocks
 -- holding one object, of class `regionClasses`.
 let regionBytes : Int = 0x10000
-let regionWords : Int = 64
+let regionWords : Int = 128
 let regionClasses : Int = 26
+-- A line region: objects of any small size, each starting at an eight-byte
+-- granule, which are its slots. Its search word is a line.
+let lineClass : Int = 27
 let regionNext : Int = 0
 let regionAvailableNext : Int = 8
 let regionSlotSize : Int = 16
@@ -172,13 +175,20 @@ let regionUsed : Int = 36
 let regionLive : Int = 40
 let regionSearchWord : Int = 44
 let regionSizeClass : Int = 48
-let regionAllocated : Int = 56
-let regionMarked : Int = 568
 -- The size table: a word per eight bytes of the region's first 64KB, holding
 -- the size of the object at that offset; null in a program compiled without
 -- `--gc-verify`.
-let regionSizes : Int = 1080
-let regionData : Int = 1088
+let regionSizes : Int = 56
+let regionAllocated : Int = 64
+let regionMarked : Int = 1088
+-- In a line region, a bit at each object's last granule, and a bit per
+-- 128-byte line from the region's base, set by the sweep on each line a
+-- survivor covers.
+let regionEnds : Int = 2112
+let regionLines : Int = 3136
+let regionData : Int = 3200
+let regionLineCount : Int = 512
+let dataLine : Int = 25
 
 -- A shadow-stack frame: the previous frame, the function's name, the slot
 -- count, the slots, and which of the first 64 slots are live. Slots from 64 up
@@ -546,11 +556,14 @@ fun checkRegions() -> Bool {
 				|| capacity > regionWords * 64
 				|| capacity > (reserved - regionData) / slotSize
 				|| used > capacity
-				|| cls > regionClasses
-				|| search >= regionWords {
+				|| (cls > regionClasses && cls != lineClass)
+				|| (cls != lineClass && search >= regionWords)
+				|| (cls == lineClass && (search < dataLine || search > regionLineCount)) {
 			return fail(Prim.cString("invalid region geometry"), r, -1)
 		}
-		let classOk = if cls < regionClasses {
+		let classOk = if cls == lineClass {
+			reserved == regionBytes && slotSize == 8 && capacity == (regionBytes - regionData) / 8
+		} else if cls < regionClasses {
 			reserved == regionBytes
 				&& slotSize == classSlot(cls)
 				&& capacity == (regionBytes - regionData) / classSlot(cls)
@@ -561,7 +574,8 @@ fun checkRegions() -> Bool {
 		if sizesKept && word(r, regionSizes) == 0 {
 			return fail(Prim.cString("region has no size table"), r, -1)
 		}
-		for var wi = 0; wi < search; wi = wi + 1 {
+		let searched = if cls == lineClass { 0 } else { search }
+		for var wi = 0; wi < searched; wi = wi + 1 {
 			if word(r, regionAllocated + 8 * wi) != -1 {
 				return fail(Prim.cString("allocation search skips free slots"), r, wi)
 			}
@@ -577,6 +591,7 @@ fun checkRegions() -> Bool {
 		}
 		regionTotal = regionTotal + reserved
 		if !checkSlots(r, capacity, slotSize) { return False }
+		if cls == lineClass && !checkExtents(r, capacity) { return False }
 		objectTotal = objectTotal + used
 	}
 	let counted = stateWord(stateObjects)
@@ -632,6 +647,54 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
 	let p = Ptr.fromInt(r)
 	if usedSeen != Ptr.load32(p, regionUsed) || liveSeen != Ptr.load32(p, regionLive) {
 		return fail(Prim.cString("region counts disagree"), r, -1)
+	}
+	True
+}
+
+-- A line region's ends bitmap pairs with its allocation bitmap: in granule
+-- order, every object's first granule is followed by exactly one end before
+-- the next object's first, and no end is outside an object.
+fun checkExtents(r : Int, capacity : Int) -> Bool {
+	var open = False
+	for var wi = 0; wi < regionWords; wi = wi + 1 {
+		let starts = word(r, regionAllocated + 8 * wi)
+		let ends = word(r, regionEnds + 8 * wi)
+		if ends & Int.not(slotsIn(wi, capacity)) != 0 {
+			return fail(Prim.cString("object end outside region"), r, 64 * wi)
+		}
+		var left = starts | ends
+		while left != 0 {
+			let b = Memory.trailingZeros(left)
+			left = left & Int.subWrapping(left, 1)
+			if hasBit(starts, b) {
+				if open { return fail(Prim.cString("object starts inside another"), r, 64 * wi + b) }
+				open = True
+			}
+			if hasBit(ends, b) {
+				if !open { return fail(Prim.cString("object end without a start"), r, 64 * wi + b) }
+				open = False
+			}
+		}
+	}
+	if open { return fail(Prim.cString("object without an end"), r, -1) }
+	True
+}
+
+-- The last granule of the object at granule `first` of line region `r`: the
+-- first end at or after it, which `checkExtents` has paired with it.
+fun lastGranule(r : Int, first : Int) -> Int {
+	var g = first
+	while !bitAt(r, regionEnds, g) { g = g + 1 }
+	g
+}
+
+-- Whether every line the object at granule `first` of line region `r` covers
+-- is marked.
+fun linesMarked(r : Int, first : Int) -> Bool {
+	let from = dataLine + first / 16
+	let to = dataLine + lastGranule(r, first) / 16
+	for var l = from; l <= to; l = l + 1 {
+		if !bitAt(r, regionLines, l) { return False }
 	}
 	True
 }
@@ -695,8 +758,13 @@ fun checkObjects() -> Bool {
 				let oj = 64 * ow + Memory.trailingZeros(left)
 				left = left & Int.subWrapping(left, 1)
 				let h = r + regionData + oj * slotSize
-				if sizesKept && !checkSize(r, h, slotSize, cls) { return False }
-				if !checkObject(r, oj, h, slotSize) { return False }
+				-- A line region's object spans its granules to its last.
+				let bound = if cls == lineClass { 8 * (lastGranule(r, oj) - oj + 1) } else { slotSize }
+				if sizesKept && !checkSize(r, h, bound, cls) { return False }
+				if cls == lineClass && afterSweeping() && !linesMarked(r, oj) {
+					return fail(Prim.cString("survivor on an unmarked line"), h, oj)
+				}
+				if !checkObject(r, oj, h, bound) { return False }
 			}
 		}
 	}
@@ -709,6 +777,13 @@ fun checkObjects() -> Bool {
 fun checkSize(r : Int, h : Int, slotSize : Int, cls : Int) -> Bool {
 	let size = sizeOf(r, h)
 	if below(slotSize, size) { return fail(Prim.cString("object exceeds allocation slot"), h, -1) }
+	if cls == lineClass {
+		let rounded = (size + 7) & -8
+		if slotSize != (if rounded < 16 { 16 } else { rounded }) {
+			return fail(Prim.cString("object extent disagrees with its size"), h, -1)
+		}
+		return True
+	}
 	let classed = if cls < regionClasses { ofClass(size, cls) } else { below(smallBytes, size) }
 	if !classed { return fail(Prim.cString("object in another size class's slot"), h, -1) }
 	True

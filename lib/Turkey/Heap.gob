@@ -842,9 +842,10 @@ fun largeAllocate(bytes : Int) -> Ptr {
 -- other size. A worker has two bump cursors. The line cursor takes holes in
 -- turn from the partly used regions the last sweep left recyclable, and then
 -- from empty ones. The overflow cursor takes only empty regions, and holds
--- an object of more than a line that does not fit the line cursor's hole, so
--- that one such object does not make the line cursor skip the rest of a hole
--- it could still fill with small ones.
+-- an object of more than a line that does not fit the line cursor's hole
+-- while a line of that hole is still free, so that one such object does not
+-- make the line cursor skip the rest of a hole it could still fill with small
+-- ones.
 --
 -- Line marks are exact: the sweep marks every line a live object covers, by
 -- its first and last granule. Allocation therefore never skips a line at the
@@ -874,7 +875,12 @@ fun lineAllocate(size : Int) -> Ptr {
 	while True {
 		let object = bump(cursor, bytes)
 		if !Ptr.isNull(object) { return object }
-		if bytes > lineBytes { return overflowAllocate(cursorIn(w, 1), bytes) }
+		-- Overflow only while the hole still has a whole line to give a small
+		-- object; with less, nothing is lost by moving on to the next hole.
+		let left = Int.subWrapping(Ptr.load(cursor, bumpLimit), Ptr.load(cursor, bumpNext))
+		if bytes > lineBytes && left >= lineBytes {
+			return overflowAllocate(cursorIn(w, 1), bytes)
+		}
 		if !nextHole(cursor) { return Ptr.null() }
 	}
 	Ptr.null()
@@ -937,6 +943,10 @@ fun holeIn(cursor : Ptr, region : Ptr) -> Bool {
 -- An object of more than a line, from the overflow cursor, which takes a new
 -- empty region when its own has too little left.
 fun overflowAllocate(cursor : Ptr, bytes : Int) -> Ptr {
+	if statsWanted {
+		let _ = Ptr.atomicAdd(statsOverflow, 0, 1)
+		let _ = Ptr.atomicAdd(statsOverflow, 8, bytes)
+	}
 	let object = bump(cursor, bytes)
 	if !Ptr.isNull(object) { return object }
 	Lock.acquire(heapLock)
@@ -2476,6 +2486,8 @@ var conservativeScratch : Ptr = zeroed(regionLineCount >> 3)
 let statsHoleBuckets : Int = 8
 let statsLinesBytes : Int = 16 + 16 * statsHoleBuckets
 var statsLines : Ptr = zeroed(statsLinesBytes)
+-- The objects, and their bytes, the overflow cursor took over the run.
+var statsOverflow : Ptr = zeroed(16)
 
 -- Count `region`'s free lines and holes after its sweep, which marked
 -- `marked` lines.
@@ -2661,6 +2673,12 @@ foreign "turkey_gc_report" fun report() -> Unit {
 	put(Prim.cString(" s (mark "))
 	putFixed(statsMarkClock, 1000000000, 3)
 	put(Prim.cString(" s)\n"))
+	writeLine()
+	put(Prim.cString("[gc] overflow objects "))
+	putInt(Ptr.atomicLoad(statsOverflow, 0))
+	put(Prim.cString(", bytes "))
+	putInt(Ptr.atomicLoad(statsOverflow, 8))
+	put(Prim.cString("\n"))
 	writeLine()
 	put(Prim.cString("[gc] minor "))
 	putInt(statsMinor)

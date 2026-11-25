@@ -172,10 +172,6 @@ type Generator = Generator {
 	--- A binding pattern, the type it binds, and what a refutable one should
 	--- be rewritten as.
 	binderSites : Vec (Pat, Ty.Type, String, Use)
-	--- And every expression whose value is thrown away, recorded after it is
-	--- generated, since whether a value is discarded is a property of where the
-	--- expression sits rather than of the expression.
-	discardSites : Vec Expr
 	--- See `Program.letElses`.
 	letElses : Vec LetElse
 	--- The ids of the nodes generation types bottom whatever they are: every
@@ -216,7 +212,6 @@ fun newGenerator(
 		patternNames   = Vec.new(4)
 		matchSites     = Vec.new(8)
 		binderSites    = Vec.new(8)
-		discardSites   = Vec.new(8)
 		letElses       = []
 		bottoms        = Set.new()
 		partialHeaders = Map.new()
@@ -1882,22 +1877,6 @@ fun checkExhaustiveness(g : Generator) -> Unit {
 	for le in g.letElses {
 		if completes(le.completion, Typed.canReturn(g.types, _)) { fallsThrough(le) }
 	}
-	-- A value computed and thrown away is an error unless there is no value.
-	for x in g.discardSites {
-		let ty = Typed.of_(g.types, x)
-		let unit = match ty {
-			TCon(c) -> c.name == "Unit"
-			_       -> False
-		}
-		if !unit && completes(completion(x), Typed.canReturn(g.types, _)) {
-			Ty.typeError(
-				"this expression's value has type '"
-					+ Ty.show(ty)
-					+ "' and is discarded; use it, or write 'let _ = ...'",
-				Some(x.span),
-			)
-		}
-	}
 }
 
 -- Reports that a `let ... else` block can fall through. It does so past its
@@ -1919,7 +1898,7 @@ fun fallsThrough(le : LetElse) -> Unit {
 fun discardsLast(g : Generator, body : Expr) -> Unit = if let EBlock(stmts) = body.kind {
 	if len(stmts) > 0 {
 		if let SExpr(x) = stmts[len(stmts) - 1].kind {
-			Vec.push(g.discardSites, x)
+			Typed.discard(g.types, x)
 		}
 	}
 }
@@ -2587,7 +2566,7 @@ fun genSequence(g : Generator, stmts : Vec Stmt, from : Int) -> Ty.Type {
 		_ -> {
 			let value = genStmt(g, stmt)
 			if from + 1 < len(stmts) {
-				if let SExpr(x) = stmt.kind { Vec.push(g.discardSites, x) }
+				if let SExpr(x) = stmt.kind { Typed.discard(g.types, x) }
 				genSequence(g, stmts, from + 1)
 			} else {
 				value

@@ -1,0 +1,79 @@
+export (ordInconsistentWithEq)
+
+--- The checks about instances (`Turkey.Checks` registers them).
+
+import Data.Set as Set
+import Turkey.Ast (Decl(..), InstanceDecl(..), TypeDecl(..), Type(..), TypeKind(..))
+import Turkey.Lint (File, Finding, finding)
+import Turkey.Lint as Lint
+import Turkey.Prelude as P
+
+-- -- ord-inconsistent-with-eq -------------------------------------------------------
+--
+-- `Ord`'s defaults build `<=` and `>=` from `lt` and `eq`, which is right only
+-- when exactly one of `lt(a, b)`, `lt(b, a)` and `a == b` holds. A
+-- hand-written `lt` beside a derived `eq` usually orders by fewer fields than
+-- it compares, and then two values can be neither.
+--
+-- Before desugaring, since only the declarations are needed. Under the orphan
+-- rule an instance of `Eq` or `Ord` for a type is written in the type's own
+-- module or in the class's, so a type this module declares has both of its
+-- instances here, unless the library's class module writes one, which it does
+-- only for types it declares itself. The converse, a derived `Ord` beside a
+-- hand-written `Eq`, is an error the compiler reports.
+
+fun ordInconsistentWithEq(f : File) -> Vec Finding {
+	let decls = Lint.treeOf(f).decls
+	let declared = Set.new()
+	for d in decls {
+		if let DType(t) = d {
+			if Option.isNone(t.alias) { Set.add(declared, t.name) }
+		}
+	}
+	let handEq = Set.new()
+	for d in decls {
+		if let DInstance(i) = d {
+			if i.cls == P.eqClass {
+				if let Some(name) = headName(i.head) { Set.add(handEq, name) }
+			}
+		}
+	}
+	let out = []
+	for d in decls {
+		let DInstance(i) = d else { continue }
+		if i.cls != P.ordClass { continue }
+		let Some(name) = headName(i.head) else { continue }
+		if !Set.contains(declared, name) || Set.contains(handEq, name) { continue }
+		let written = unwrapped(Lint.textOf(f, i.head.span))
+		let head = if String.contains(written, " ") { "(" + written + ")" } else { written }
+		Vec.push(
+			out,
+			finding(
+				i.head.span,
+				"'"
+					+ written
+					+ "' has a hand-written 'Ord' and a derived 'Eq', which can disagree; "
+					+ "exactly one of 'lt(a, b)', 'lt(b, a)' and 'a == b' must hold; "
+					+ "write 'instance Eq "
+					+ head
+					+ "' too, or expect 'ord-inconsistent-with-eq' with the reason they agree",
+			),
+		)
+	}
+	out
+}
+
+-- `text` without the parentheses around the whole of it, which the head's
+-- span covers.
+fun unwrapped(text : String) -> String {
+	let Some(opened) = String.stripPrefix(text, "(") else { return text }
+	let Some(inner) = String.stripSuffix(opened, ")") else { return text }
+	unwrapped(String.trim(inner))
+}
+
+-- The type constructor at the head of an instance's type.
+fun headName(t : Type) -> Option String = match t.kind {
+	TECon(name, _) -> Some(name)
+	TEParen(inner) -> headName(inner)
+	_              -> None
+}

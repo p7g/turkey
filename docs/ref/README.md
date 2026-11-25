@@ -172,6 +172,7 @@ left.
 | `unit-spelling` | warn | `{}` written where its value is used, as in `let done = {}`, and a `match` arm that does nothing spelled `()` in a statement or `{}` in a `match` whose value is used. `{}` is a body that does nothing and `()` the unit value. `--fix` writes the other spelling. |
 | `detached-doc-comment` | warn | a `---` doc comment that documents nothing ([Doc comments](lexical.md#doc-comments)), such as one parted from its declaration by a blank line, one inside a body, or one after code on its line. `--fix` deletes a single blank line between a doc comment and a declaration. |
 | `needless-equality` | warn | an equality in a function's context, such as `Item c ~ a`, whose variable is in no other entry and is written at most once in the signature and nowhere in the body, so that it only names `Item c`. `--fix` removes the entry and writes `Item c` in its place. |
+| `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

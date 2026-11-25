@@ -179,6 +179,8 @@ left.
 | `detached-doc-comment` | warn | a `---` doc comment that documents nothing ([Doc comments](lexical.md#doc-comments)), such as one parted from its declaration by a blank line, one inside a body, or one after code on its line. `--fix` deletes a single blank line between a doc comment and a declaration. |
 | `needless-equality` | warn | an equality in a function's context, such as `Item c ~ a`, whose variable is in no other entry and is written at most once in the signature and nowhere in the body, so that it only names `Item c`. `--fix` removes the entry and writes `Item c` in its place. |
 | `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
+| `infinite-recursion` | warn | a function, local function or method that cannot return without first calling itself, so it never returns. For an instance's method, itself is the class's method at the same instance. A call inside a `fun` value is not counted. |
+| `shared-fill` | warn | `Array.filled(n, v)`, `Vec.filled(n, v)` or `FrozenArray.filled(n, v)` with a `v` whose type is an object ([`Object` and `identical`](builtins.md#object-and-identical)), so every slot holds the one object. `Array.init(n, fun(_) = v)` makes one for each. |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding

@@ -602,6 +602,38 @@ A variable declared in `init` is visible in the test, the step and the body,
 and not after the loop. Either `init` or `step` may be left out, but both `;`
 are required.
 
+`init` runs once, so the loop has one variable for all its rounds, which
+`step` assigns. A function made in the body that captures it sees the value it
+has when the function runs, not the value it had in the round that made the
+function. `let i = i` at the start of the body makes a variable of the round's
+own:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let shared = []
+    let own = []
+    for var i = 0; i < 3; i = i + 1 {
+        Vec.push(shared, fun() = i)
+        let i = i
+        Vec.push(own, fun() = i)
+    }
+    for f in shared { print(f()) }
+    for f in own { print(f()) }
+}
+```
+
+```text
+3
+3
+3
+0
+1
+2
+```
+
+`for x in xs` binds a new `x` for each element, so it needs no copy.
+
 To count up by one, `for i in Int.range(from, to)` says the same with less
 ([`for` over a collection](#for-over-a-collection)).
 

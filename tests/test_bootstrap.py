@@ -41,7 +41,6 @@ from pathlib import Path
 import pytest
 
 from tests import bootc, toolchain
-from tests.bootc import CACHE
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
@@ -63,47 +62,11 @@ def _stage3_assembly() -> str:
     return bootc.boot_each("asm", [BOOT_MAIN], _split)[BOOT_MAIN]
 
 
-def _write_boot(compiler: Path, output: Path, *flags: str) -> None:
-    result = subprocess.run(
-        toolchain.command(compiler, "build", *flags, "-o", str(output), str(BOOT_MAIN)),
-        cwd=REPO_ROOT, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:4000]
-
-
-@functools.lru_cache(maxsize=None)
-def _source_key() -> str:
-    """Stage2 and today's `src/`, as a cache key for what stage2 writes for
-    the compiler's own source."""
-    # Keyed on the source as well as on stage2: under `$TURKEY_BOOT`,
-    # `build_key` covers the binary and `lib/` alone, and what stage2 writes
-    # is today's `src/` too.
-    h = hashlib.sha256(bootc.build_key().encode())
-    for path in sorted((REPO_ROOT / "src").rglob("*.gob")):
-        h.update(str(path.relative_to(REPO_ROOT)).encode() + b"\0")
-        h.update(path.read_bytes())
-    return h.hexdigest()[:16]
-
-
-def _written(name: str, *flags: str) -> Path:
-    """What stage2 writes for the compiler's own source with the build flags
-    `flags`, cached on disk as `name`."""
-    output = CACHE / f"{name}-{_source_key()}"
-    if not output.exists():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        staging = CACHE / f"{name}-{_source_key()}-{os.getpid()}"
-        try:
-            _write_boot(bootc.binary(), staging, *flags)
-            os.replace(staging, output)
-        finally:
-            staging.unlink(missing_ok=True)
-    return output
-
-
 @functools.lru_cache(maxsize=None)
 def _stage3() -> Path:
     """The executable stage2 writes for the compiler's own source: a compiler
     built by today's source rather than by the committed one."""
-    return _written("stage3")
+    return bootc.written_compiler("stage3")
 
 
 def _sha(text: str) -> str:
@@ -121,7 +84,7 @@ def test_stage3_writes_itself_byte_for_byte(tmp_path):
     no line.
     """
     stage4 = tmp_path / "stage4"
-    _write_boot(_stage3(), stage4)
+    bootc.write_compiler(_stage3(), stage4)
     if _stage3().read_bytes() == stage4.read_bytes():
         return
     result = subprocess.run(
@@ -179,9 +142,9 @@ def test_the_wasm_compiler_writes_what_the_native_one_does(tmp_path):
     chain of wasm frames needs between 96 and 112 KiB of the engine's.
     """
     wasmtime = toolchain.needs_wasmtime()
-    compiler = _written("turkey-wasm", "--target", "wasm32-wasi")
+    compiler = bootc.written_compiler("turkey-wasm", "--target", "wasm32-wasi")
     for target in ("arm64-darwin", "arm64-linux", "wasm32-wasi"):
-        native = compiler if target == "wasm32-wasi" else _written(f"stage3-{target}", "--target", target)
+        native = compiler if target == "wasm32-wasi" else bootc.written_compiler(f"stage3-{target}", "--target", target)
         # The guest sees `lib`, `src` and `out` relative to the repository's
         # root, where stage2 was given absolute paths. Neither the entry's
         # path nor the output's is in the bytes, so the two still agree.

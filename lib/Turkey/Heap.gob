@@ -2123,13 +2123,13 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	if Process.pending() { return }
 	let marked = if wanted { nanoseconds() } else { 0 }
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
+	sweep()
+	if verify { verifyAt(Check.AfterSweeping, frame) }
 	if !minor && evacuating {
 		evacuate(frame)
 		if Process.pending() { return }
-		if verify { verifyAt(Check.BeforeSweeping, frame) }
+		if verify { verifyAt(Check.AfterSweeping, frame) }
 	}
-	sweep()
-	if verify { verifyAt(Check.AfterSweeping, frame) }
 	allocationsSince = 0
 	bytesSince = 0
 	if !minor { liveBytesAfterFull = liveBytes }
@@ -2298,10 +2298,12 @@ fun release(region : Ptr) -> Unit {
 
 -- -- evacuation (prototype) --------------------------------------------------------------
 --
--- A full collection, once marking is done, moves the survivors out of its
--- sparsest small regions, per size class, so that the sweep frees those
--- regions whole. Large regions never move. Native only: on wasm32 it is off.
+-- A full collection, once it has swept, moves the survivors out of its
+-- sparsest small regions, per size class, and makes those regions spares.
+-- Large regions never move. Native only: on wasm32 it is off.
 --
+-- After the sweep, so that every allocated object is a survivor: an unswept
+-- dead object may point into a region being emptied, and nothing rewrites it.
 -- After marking rather than during it, because the mark gives every region's
 -- exact live count first. So a class's plan is exact: keep the fewest of its
 -- regions whose free slots hold the live objects of the rest, and empty the
@@ -2557,7 +2559,7 @@ fun evacuateClass(order : Ptr, first : Int, end : Int, cls : Int) -> Unit {
 -- The bits of bitmap word `w` that are slots below `capacity`.
 fun slotsBelow(w : Int, capacity : Int) -> Int {
 	let beyond = capacity - (w << 6)
-	if beyond >= 64 { -1 } else if beyond <= 0 { 0 } else { (1 << beyond) - 1 }
+	if beyond >= 64 { -1 } else if beyond <= 0 { 0 } else { Int.subWrapping(1 << beyond, 1) }
 }
 
 -- Copy slot `from` of `source` to slot `to` of `target`, marked and

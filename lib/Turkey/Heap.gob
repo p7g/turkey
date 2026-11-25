@@ -1254,6 +1254,19 @@ fun stackTasks(frame : Ptr) -> Unit {
 	}
 }
 
+-- Every stack `stackTasks` makes a task of, walked here and now in `mode`.
+fun walkStacks(frame : Ptr, mode : Int) -> Unit {
+	if frameEntryCount == 0 { return }
+	let running = Stack.running()
+	if !Ptr.isNull(frame) && !Ptr.isNull(running) { walkStack(frame, Stack.high(running), mode) }
+	var stack = Stack.first()
+	while !Ptr.isNull(stack) {
+		let parked = Stack.parked(stack)
+		if stack != running && !Ptr.isNull(parked) { walkStack(parked, Stack.high(stack), mode) }
+		stack = Stack.next(stack)
+	}
+}
+
 -- One stack's frames, from the record at `frame` out to `high`.
 --
 -- The stop conditions matter more than the loop: a walk that runs off the end
@@ -1262,7 +1275,16 @@ fun stackTasks(frame : Ptr) -> Unit {
 -- miscompile. So the frame pointer must stay below `high`, stay 8-byte
 -- aligned, and strictly increase. There is no low bound to check: the walk
 -- starts at a live frame and only ever moves outwards.
-fun scanStack(frame : Ptr, high : Ptr) -> Unit {
+fun scanStack(frame : Ptr, high : Ptr) -> Unit = walkStack(frame, high, walkMark)
+
+-- What `walkStack` does with each root it finds: marks it, pins its region
+-- (`flagPinned`), or rewrites the slot to the root's new address
+-- (`forwarded`).
+let walkMark : Int = 0
+let walkPin : Int = 1
+let walkRewrite : Int = 2
+
+fun walkStack(frame : Ptr, high : Ptr, mode : Int) -> Unit {
 	if let Wasi = Target.os { return scanShadow(frame, high) }
 	let top = Ptr.toInt(high)
 	var here = Ptr.toInt(frame)
@@ -1293,7 +1315,13 @@ fun scanStack(frame : Ptr, high : Ptr) -> Unit {
 				-- into a stack, and a stack never points into another's.
 				let at = Ptr.toInt(value)
 				if below(at, Ptr.toInt(frame)) || !below(at, top) {
-					markGrey(value, Prim.cString("arm64 frame"), i)
+					if mode == walkMark {
+						markGrey(value, Prim.cString("arm64 frame"), i)
+					} else if mode == walkPin {
+						pin(value)
+					} else {
+						Ptr.store(caller, rootOffset(offsets, i), forwarded(value))
+					}
 				}
 			}
 		}
@@ -2070,6 +2098,7 @@ fun collectFrom(frame : Ptr, asked : Asked) -> Unit {
 }
 
 fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
+	let begun = nanoseconds()
 	retire()
 	minor = generational
 		&& match asked {
@@ -2094,6 +2123,11 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	if Process.pending() { return }
 	let marked = if wanted { nanoseconds() } else { 0 }
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
+	if !minor && evacuating {
+		evacuate(frame)
+		if Process.pending() { return }
+		if verify { verifyAt(Check.BeforeSweeping, frame) }
+	}
 	sweep()
 	if verify { verifyAt(Check.AfterSweeping, frame) }
 	allocationsSince = 0
@@ -2109,6 +2143,10 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	if let Wasi = Target.os { threshold = belowCeiling(threshold) }
 	if minor { statsMinor = statsMinor + 1 }
 	collections = collections + 1
+	let pause = nanoseconds() - begun
+	collectNanosTotal = collectNanosTotal + pause
+	if !minor && pause > fullNanosMax { fullNanosMax = pause }
+	if collectionLog { logEvacuation(pause) }
 	if wanted {
 		statsMarkClock = statsMarkClock + (marked - started)
 		logCollection(started, liveBefore, allocsSince)
@@ -2256,6 +2294,434 @@ fun trimSpares() -> Unit {
 fun release(region : Ptr) -> Unit {
 	Os.free(Ptr.load(region, regionSizes))
 	Os.free(region)
+}
+
+-- -- evacuation (prototype) --------------------------------------------------------------
+--
+-- A full collection, once marking is done, moves the survivors out of its
+-- sparsest small regions, per size class, so that the sweep frees those
+-- regions whole. Large regions never move. Native only: on wasm32 it is off.
+--
+-- After marking rather than during it, because the mark gives every region's
+-- exact live count first. So a class's plan is exact: keep the fewest of its
+-- regions whose free slots hold the live objects of the rest, and empty the
+-- rest. Marking that evacuated as it went would choose from the previous
+-- cycle's counts, and its parallel markers would race to forward an object.
+-- The cost is one more pass over the live objects, to rewrite the pointers.
+--
+-- A slot is copied whole into a free slot of the same class, so no object's
+-- size is needed. The old header becomes the new address with `forwardedTag`
+-- in its low bits. Every pointer to the old copy is then rewritten: the fields
+-- of every marked object, and the root chain's slots.
+--
+-- Stack roots are not rewritten but pinned: any region a frame-table slot
+-- names, on any stack, is not evacuated. Generated code keeps a traced value
+-- live across a safepoint in a register as well as in its root slot, and a
+-- callee may hold it in its save area: only the root slot is in the table, so
+-- the other copies would be stale. Pinning what the slots name keeps every
+-- copy valid, and with it every untraced address into such an object
+-- (`Ptr.elementAddress`, `turkey_array_new`'s fill, a blocked worker's
+-- buffer), since each holder keeps its base rooted.
+--
+-- TURKEY_GC_EVACUATE=0 turns it off. TURKEY_GC_EVACUATE_LIVE is the percentage
+-- of live slots under which a region is a candidate (30). TURKEY_GC_EVACUATE_BUDGET
+-- caps the bytes moved per collection (none). TURKEY_GC_EVACUATE_ALL moves
+-- every unpinned small region's survivors into new regions at every full
+-- collection, and poisons the emptied regions, to shake out missed roots.
+-- TURKEY_GC_EVACUATE_REWRITE_STACKS rewrites stack slots instead of pinning:
+-- unsound, for showing why. TURKEY_GC_LOG prints a line per collection.
+
+-- A small region's flags, in the four bytes after its size class.
+let regionFlags : Int = 52
+let flagEvacuating : Int = 1
+let flagPinned : Int = 2
+-- The low bits of a forwarded header: no generation has them.
+let forwardedTag : Int = 7
+
+var evacuating : Bool = evacuationFrom(Os.getenv(Prim.cString("TURKEY_GC_EVACUATE")))
+var evacuateAll : Bool = present(Prim.cString("TURKEY_GC_EVACUATE_ALL"))
+var rewriteStacks : Bool = present(Prim.cString("TURKEY_GC_EVACUATE_REWRITE_STACKS"))
+var evacuateLive : Int = settingFrom(Os.getenv(Prim.cString("TURKEY_GC_EVACUATE_LIVE")), 30)
+var evacuateBudget : Int = settingFrom(Os.getenv(Prim.cString("TURKEY_GC_EVACUATE_BUDGET")), 0)
+var collectionLog : Bool = present(Prim.cString("TURKEY_GC_LOG"))
+
+-- This collection's evacuation, and the run's.
+var movedBytes : Int = 0
+-- The bytes this collection's plans have chosen to move so far, against the
+-- budget.
+var plannedBytes : Int = 0
+var movedObjects : Int = 0
+var evacuatedRegions : Int = 0
+var pinnedRegions : Int = 0
+var evacuationNanos : Int = 0
+var movedBytesTotal : Int = 0
+var collectNanosTotal : Int = 0
+var fullNanosMax : Int = 0
+
+fun evacuationFrom(s : Ptr) -> Bool {
+	if let Wasi = Target.os { return False }
+	Ptr.isNull(s) || decimalFrom(s) != 0
+}
+
+fun settingFrom(s : Ptr, fallback : Int) -> Int {
+	if Ptr.isNull(s) { return fallback }
+	let n = decimalFrom(s)
+	if n < 0 { fallback } else { n }
+}
+
+fun flagsOf(region : Ptr) -> Int = Ptr.load32(region, regionFlags)
+
+fun flagSet(region : Ptr, flag : Int) -> Unit =
+	Ptr.store32(region, regionFlags, flagsOf(region) | flag)
+
+-- Pin the region of `value`, a root, if it is a heap object.
+fun pin(value : Ptr) -> Unit {
+	if immediate(value) || isStatic(value) { return }
+	flagSet(regionOf(value), flagPinned)
+}
+
+-- `value`'s new address if it was moved, or `value`. A word into an emptied
+-- region at a slot that was not forwarded is a pointer to an object that was
+-- not marked: a missed root or a wrong descriptor, which is a panic.
+fun forwarded(value : Ptr) -> Ptr {
+	if immediate(value) || isStatic(value) { return value }
+	if flagsOf(regionOf(value)) & flagEvacuating == 0 { return value }
+	let header : Int = Ptr.load(value, 0)
+	if header & forwardedTag != forwardedTag {
+		markFailed(Prim.cString("evacuation: a pointer to an unmarked object in an emptied region"))
+		return value
+	}
+	Ptr.fromInt(header & complement(forwardedTag))
+}
+
+-- Move the survivors of the sparse regions, rewrite every pointer to them, and
+-- free the regions. With the world stopped, after a full collection's marking.
+fun evacuate(frame : Ptr) -> Unit {
+	let started = nanoseconds()
+	movedBytes = 0
+	plannedBytes = 0
+	movedObjects = 0
+	evacuatedRegions = 0
+	pinnedRegions = 0
+	Ptr.atomicStore(marking, failedAt, 0)
+	if !rewriteStacks { walkStacks(frame, walkPin) }
+	var n = 0
+	var region = regions
+	while !Ptr.isNull(region) {
+		if flagsOf(region) & flagPinned != 0 { pinnedRegions = pinnedRegions + 1 }
+		if candidate(region) { n = n + 1 }
+		region = Ptr.load(region, regionNext)
+	}
+	-- Each entry is the class and live count as one sortable key, and the
+	-- region: the frame table's entries, so its sort serves.
+	let order = if n == 0 { Ptr.null() } else { Os.malloc(entryBytes * n) }
+	if !Ptr.isNull(order) {
+		var at = 0
+		region = regions
+		while !Ptr.isNull(region) {
+			if candidate(region) {
+				let key = Ptr.load32(region, regionSizeClass) << 13 | Ptr.load32(region, regionLive)
+				Ptr.store(order, entryBytes * at, key)
+				Ptr.store(order, entryBytes * at + 8, region)
+				at = at + 1
+			}
+			region = Ptr.load(region, regionNext)
+		}
+		sortEntries(order, n)
+		var first = 0
+		while first < n {
+			let cls = entryKey(order, first) >> 13
+			var end = first
+			while end < n && entryKey(order, end) >> 13 == cls { end = end + 1 }
+			evacuateClass(order, first, end, cls)
+			first = end
+		}
+		Os.free(order)
+		if evacuatedRegions > 0 {
+			rewriteHeap()
+			rewriteChain()
+			if rewriteStacks { walkStacks(frame, walkRewrite) }
+		}
+	}
+	releaseEvacuated()
+	movedBytesTotal = movedBytesTotal + movedBytes
+	evacuationNanos = nanoseconds() - started
+	if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
+}
+
+-- Whether `region` may be emptied: small, holding a survivor, and not pinned.
+fun candidate(region : Ptr) -> Bool =
+	Ptr.load32(region, regionSizeClass) < regionClasses
+		&& Ptr.load32(region, regionLive) > 0
+		&& flagsOf(region) & flagPinned == 0
+
+fun orderRegion(order : Ptr, i : Int) -> Ptr = Ptr.load(order, entryBytes * i + 8)
+
+fun orderLive(order : Ptr, i : Int) -> Int = entryKey(order, i) & 8191
+
+-- Plan and move class `cls`, whose candidates are `order[first..end)`, sparsest
+-- first. The sparsest are emptied into the free slots of the densest, which
+-- stay: of the regions under the threshold, as many as their free slots and
+-- those of the regions over it can take, and the regions over it are never
+-- emptied.
+fun evacuateClass(order : Ptr, first : Int, end : Int, cls : Int) -> Unit {
+	let slot = classSlot(cls)
+	let capacity = (regionBytes - regionData) / slot
+	var emptied = first
+	var targets : Ptr = Ptr.null()
+	var targetCount = 0
+	if evacuateAll {
+		var total = 0
+		for var i = first; i < end; i = i + 1 { total = total + orderLive(order, i) }
+		let wanted = (total + capacity - 1) / capacity
+		targets = Os.malloc(8 * wanted)
+		if Ptr.isNull(targets) { return }
+		while targetCount < wanted {
+			let made = newRegion(slot, slot, cls, False)
+			if Ptr.isNull(made) { break }
+			Ptr.store(targets, 8 * targetCount, made)
+			targetCount = targetCount + 1
+		}
+		var room = targetCount * capacity
+		while emptied < end && orderLive(order, emptied) <= room {
+			room = room - orderLive(order, emptied)
+			emptied = emptied + 1
+		}
+	} else {
+		var sparse = first
+		while sparse < end && orderLive(order, sparse) * 100 < capacity * evacuateLive {
+			sparse = sparse + 1
+		}
+		var free = 0
+		for var i = sparse; i < end; i = i + 1 { free = free + capacity - orderLive(order, i) }
+		var kept = sparse - 1
+		while emptied <= kept {
+			let need = orderLive(order, emptied)
+			while free < need && kept > emptied {
+				free = free + capacity - orderLive(order, kept)
+				kept = kept - 1
+			}
+			if free < need { break }
+			if evacuateBudget > 0 && plannedBytes + need * slot > evacuateBudget { break }
+			free = free - need
+			plannedBytes = plannedBytes + need * slot
+			emptied = emptied + 1
+		}
+		targetCount = end - (kept + 1)
+		if emptied == first || targetCount == 0 { return }
+		targets = Os.malloc(8 * targetCount)
+		if Ptr.isNull(targets) { return }
+		for var i = 0; i < targetCount; i = i + 1 {
+			Ptr.store(targets, 8 * i, orderRegion(order, kept + 1 + i))
+		}
+	}
+	var t = 0
+	var word = 0
+	for var i = first; i < emptied; i = i + 1 {
+		let source = orderRegion(order, i)
+		flagSet(source, flagEvacuating)
+		evacuatedRegions = evacuatedRegions + 1
+		for var w = 0; w < regionWords; w = w + 1 {
+			var bits : Int = Ptr.load(source, plus(regionMarked, times8(w)))
+			while bits != 0 {
+				let lowest = bits & Int.negWrapping(bits)
+				bits = bits ^ lowest
+				-- The next free slot of the targets: there is one, by the plan.
+				var free = 0
+				while free == 0 {
+					if t >= targetCount {
+						markFailed(Prim.cString("evacuation: the targets ran out of slots"))
+						Os.free(targets)
+						return
+					}
+					let target : Ptr = Ptr.load(targets, 8 * t)
+					free = complement(Ptr.load(target, plus(regionMarked, times8(word))))
+						& slotsBelow(word, capacity)
+					if free == 0 {
+						word = word + 1
+						if word == regionWords {
+							word = 0
+							t = t + 1
+						}
+					}
+				}
+				let target : Ptr = Ptr.load(targets, 8 * t)
+				let to = plus(word << 6, bitIndex(free & Int.negWrapping(free)))
+				move(source, plus(w << 6, bitIndex(lowest)), target, to, slot)
+			}
+		}
+	}
+	Os.free(targets)
+}
+
+-- The bits of bitmap word `w` that are slots below `capacity`.
+fun slotsBelow(w : Int, capacity : Int) -> Int {
+	let beyond = capacity - (w << 6)
+	if beyond >= 64 { -1 } else if beyond <= 0 { 0 } else { (1 << beyond) - 1 }
+}
+
+-- Copy slot `from` of `source` to slot `to` of `target`, marked and
+-- allocated there, and forward the old header to it.
+fun move(source : Ptr, from : Int, target : Ptr, to : Int, slot : Int) -> Unit {
+	let old = Ptr.add(source, plus(regionData, Int.mulWrapping(from, slot)))
+	let new = Ptr.add(target, plus(regionData, Int.mulWrapping(to, slot)))
+	Memory.copy(new, old, slot)
+	if !testBit(target, regionAllocated, to) {
+		setBit(target, regionAllocated, to)
+		Ptr.store32(target, regionUsed, plus(Ptr.load32(target, regionUsed), 1))
+		heapCount = plus(heapCount, 1)
+	}
+	setBit(target, regionMarked, to)
+	Ptr.store32(target, regionLive, plus(Ptr.load32(target, regionLive), 1))
+	if sizesKept {
+		let size : Int = Ptr.load(Ptr.load(source, regionSizes), Ptr.diff(old, source))
+		Ptr.store(Ptr.load(target, regionSizes), Ptr.diff(new, target), size)
+	}
+	Ptr.store(old, 0, Ptr.toInt(new) | forwardedTag)
+	movedBytes = plus(movedBytes, slot)
+	movedObjects = plus(movedObjects, 1)
+}
+
+-- Rewrite the traced words of every marked object outside the emptied
+-- regions, the moved copies included.
+fun rewriteHeap() -> Unit {
+	var region = regions
+	while !Ptr.isNull(region) {
+		if flagsOf(region) & flagEvacuating == 0 && Ptr.load32(region, regionLive) > 0 {
+			let slot : Int = Ptr.load(region, regionSlotSize)
+			for var w = 0; w < regionWords; w = w + 1 {
+				var bits : Int = Ptr.load(region, plus(regionMarked, times8(w)))
+				while bits != 0 {
+					let lowest = bits & Int.negWrapping(bits)
+					bits = bits ^ lowest
+					let index = plus(w << 6, bitIndex(lowest))
+					rewriteObject(Ptr.add(region, plus(regionData, Int.mulWrapping(index, slot))))
+				}
+			}
+		}
+		region = Ptr.load(region, regionNext)
+	}
+}
+
+-- Rewrite `object`'s traced words, decoded as `drain` decodes them.
+fun rewriteObject(object : Ptr) -> Unit {
+	let header = Ptr.load32(object, 0)
+	let kind = header >> 8 & 255
+	var first = objectFields
+	var runs = header >> 16
+	var per = 1
+	var stride = 8
+	if kind == arrayKind {
+		first = arrayElements
+		per = runs
+		stride = Ptr.load32(object, 4)
+		runs = if per > 0 { Ptr.load(object, arrayLength) } else { 0 }
+	}
+	let stop = plus(first, Int.mulWrapping(runs, stride))
+	for var at = first; at < stop; at = plus(at, stride) {
+		for var k = 0; k < per; k = plus(k, 1) {
+			let offset = plus(at, times8(k))
+			let child : Ptr = Ptr.load(object, offset)
+			let moved = forwarded(child)
+			if moved != child { Ptr.store(object, offset, moved) }
+		}
+	}
+}
+
+-- Rewrite the root chain's live slots, as `run` reads them.
+fun rewriteChain() -> Unit {
+	var root = roots
+	while !Ptr.isNull(root) {
+		let count : Int = Ptr.load(root, frameCount)
+		let live : Int = Ptr.load(root, frameLive)
+		let values : Ptr = Ptr.load(root, frameValues)
+		for var i = 0; i < count; i = plus(i, 1) {
+			if i >= 64 || live >> i & 1 != 0 {
+				Ptr.store(values, times8(i), forwarded(Ptr.load(values, times8(i))))
+			}
+		}
+		root = Ptr.load(root, 0)
+	}
+}
+
+-- Make every emptied region a spare, clear every region's flags, and rebuild
+-- the available lists, which the moves and the new targets have changed.
+fun releaseEvacuated() -> Unit {
+	let poison = evacuateAll || stress || verify
+	var previous = Ptr.null()
+	var region = regions
+	while !Ptr.isNull(region) {
+		let next : Ptr = Ptr.load(region, regionNext)
+		let flags = flagsOf(region)
+		if flags & flagEvacuating != 0 {
+			if Ptr.isNull(previous) {
+				regions = next
+			} else {
+				Ptr.store(previous, regionNext, next)
+			}
+			regionBytesInUse = regionBytesInUse - regionBytes
+			heapCount = heapCount - Ptr.load32(region, regionUsed)
+			tableRemove(region)
+			if poison { Memory.fill(Ptr.add(region, regionData), regionBytes - regionData, 0xA5) }
+			Ptr.store32(region, regionFlags, 0)
+			Ptr.store(region, regionNext, spare)
+			spare = region
+			spareCount = spareCount + 1
+		} else {
+			if flags != 0 { Ptr.store32(region, regionFlags, 0) }
+			previous = region
+		}
+		region = next
+	}
+	Memory.fill(available, 8 * regionClasses, 0)
+	region = regions
+	while !Ptr.isNull(region) {
+		let cls = Ptr.load32(region, regionSizeClass)
+		if cls < regionClasses && Ptr.load32(region, regionUsed) < Ptr.load32(region, regionCapacity) {
+			Ptr.store(region, regionAvailableNext, Ptr.load(available, times8(cls)) : Ptr)
+			Ptr.store(available, times8(cls), region)
+		}
+		region = Ptr.load(region, regionNext)
+	}
+}
+
+-- One line per collection, when TURKEY_GC_LOG asks: its pause, what it moved,
+-- and the live bytes against the bytes the regions hold after it.
+fun logEvacuation(nanos : Int) -> Unit {
+	textLength = 0
+	put(Prim.cString("[gc-log "))
+	putInt(collections)
+	put(if minor { Prim.cString(" minor] ") } else { Prim.cString(" full] ") })
+	putFixed(nanos, 1000000, 3)
+	put(Prim.cString(" ms, live "))
+	putInt(liveBytes)
+	put(Prim.cString(" held "))
+	putInt(regionBytesInUse)
+	put(Prim.cString(" spare "))
+	putInt(spareCount * regionBytes)
+	put(Prim.cString(" peak "))
+	putInt(regionBytesPeak)
+	if !minor {
+		put(Prim.cString(", moved "))
+		putInt(movedBytes)
+		put(Prim.cString(" in "))
+		putInt(movedObjects)
+		put(Prim.cString(" from "))
+		putInt(evacuatedRegions)
+		put(Prim.cString(" pinned "))
+		putInt(pinnedRegions)
+		put(Prim.cString(" evac "))
+		putFixed(evacuationNanos, 1000000, 3)
+		put(Prim.cString(" ms"))
+	}
+	put(Prim.cString(", total "))
+	putFixed(collectNanosTotal, 1000000, 1)
+	put(Prim.cString(" ms moved "))
+	putInt(movedBytesTotal)
+	put(Prim.cString(" max-full "))
+	putFixed(fullNanosMax, 1000000, 3)
+	put(Prim.cString("\n"))
+	writeLine()
 }
 
 -- -- statistics -------------------------------------------------------------------------

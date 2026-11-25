@@ -1,0 +1,275 @@
+export (sharedFill, infiniteRecursion)
+
+--- Checks about what a call does that its text does not show: a function
+--- that cannot return because it calls itself first, and a call that puts
+--- one mutable object in every slot of a collection.
+
+import Turkey.Ast (
+	Expr(..),
+	ExprKind(..),
+	Stmt(..),
+	StmtKind(..),
+	Lit(..),
+	Child(..),
+	Decl(..),
+	FunDecl(..),
+	ClassDecl(..),
+	InstanceDecl(..),
+	completes,
+	returnCompletion,
+	sketch,
+	unparen,
+)
+import Turkey.Binders as Binders
+import Turkey.Classes as Classes
+import Turkey.Classes (Evidence(..), InstInfo(..), MethodInfo(..))
+import Turkey.Solved (Use(..))
+import Turkey.Inert (Inert(..))
+import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
+import Turkey.Lint as Lint
+import Turkey.Prelude as P
+import Turkey.Source (Span(..))
+import Turkey.Source as Source
+import Turkey.Typed (TypeTable(..))
+import Turkey.Typed as Typed
+import Turkey.Types (TCon)
+import Turkey.Types as Ty
+
+-- -- infinite-recursion -----------------------------------------------------------
+--
+-- A function whose body cannot return unless a call to itself does never
+-- returns. `Turkey.Ast.returnCompletion` is the one definition of whether a
+-- body can return, which the type rules and `unreachable-code` read too; the
+-- question here is whether it holds when every call to the function itself
+-- is taken to diverge, and every other call to return.
+--
+-- Other calls are taken to return even where their types say they cannot: a
+-- function that panics on the paths that do not recurse is reported by
+-- nothing here, since its recursion is not what stops it. And a body that
+-- cannot return even when its own calls do, a `loop` with no `break`, is not
+-- reported either: whatever stops it, it is not the recursion.
+--
+-- "Itself" is the binder of the function, which a name in its body that
+-- shadows it does not mean. For a method of an instance, it is the class's
+-- method at that same instance, by the evidence the solver chose for the
+-- use; at another type, as `show(x.field)`, the method is another function.
+-- For a default method of a class, it is the method through the class's own
+-- dictionary, which is the dictionary of the instance the default runs for:
+-- a default runs only for an instance that does not define the method, so
+-- through that dictionary it calls itself.
+--
+-- A local `fun` that desugaring made of a loop is skipped: it calls itself
+-- by construction, once per iteration, and returns through the loop's exit.
+
+fun infiniteRecursion(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	for d in Lint.programOf(f).decls {
+		match d {
+			DInstance(i) -> for m in i.methods {
+				recursive(m, fun(call) = sameInstance(types, i, m, call), out)
+			}
+			DClass(c) -> for m in c.methods {
+				recursive(m, fun(call) = ownDictionary(types, c, m, call), out)
+			}
+			_ -> {}
+		}
+	}
+	Lint.nodes(f, fun(c) {
+		if let ChStmt(s) = c {
+			if let SFun(d) = s.kind {
+				if !d.monomorphic {
+					recursive(d, fun(call) = sameBinder(Lint.bindersOf(f), d, call), out)
+				}
+			}
+		}
+		True
+	})
+	out
+}
+
+-- Reports `d` if its body cannot return without a call that `isSelf`
+-- accepts returning first.
+fun recursive(d : FunDecl, isSelf : fun(Expr) -> Bool, out : Vec Finding) -> Unit {
+	let Some(body) = d.body else { return }
+	let returns = returnCompletion(body)
+	if completes(returns, fun(call) = !isSelf(call)) || !completes(returns, fun(_) = True) {
+		return
+	}
+	Vec.push(
+		out,
+		Lint.finding(
+			d.span,
+			"'"
+				+ Classes.surfaceMember(d.name)
+				+ "' calls itself on every path before it can return, so it never returns; "
+				+ "give it a case that returns without the call",
+		),
+	)
+}
+
+-- The name `call` calls, if it calls one.
+fun callee(call : Expr) -> Option Expr = match call.kind {
+	ECall(fn, _) -> match unparen(fn).kind {
+		EVar(_, _) -> Some(unparen(fn))
+		_          -> None
+	}
+	_ -> None
+}
+
+fun sameBinder(binders : Binders.Table, d : FunDecl, call : Expr) -> Bool {
+	let Some(fn) = callee(call) else { return False }
+	match (Map.get(binders.refs, fn.id), Map.get(binders.refs, d.id)) {
+		(Some(a), Some(b)) -> a == b
+		_                  -> False
+	}
+}
+
+-- The class method `call` calls, and the dictionary it calls it through.
+fun methodUse(types : TypeTable, call : Expr) -> Option (MethodInfo, Evidence) {
+	let fn = callee(call)?
+	let u = Map.get(types.uses, fn.id)?
+	let m = u.method?
+	if len(u.evidence) == 0 { return None }
+	Some((m, u.evidence[0]))
+}
+
+fun sameInstance(types : TypeTable, i : InstanceDecl, d : FunDecl, call : Expr) -> Bool {
+	let Some((m, evidence)) = methodUse(types, call) else { return False }
+	if m.name != d.name { return False }
+	match evidence {
+		FromInstance(inst, _, _) -> inst.decl.span == i.span
+		_                        -> False
+	}
+}
+
+fun ownDictionary(types : TypeTable, c : ClassDecl, d : FunDecl, call : Expr) -> Bool {
+	let Some((m, evidence)) = methodUse(types, call) else { return False }
+	if m.name != d.name { return False }
+	match evidence {
+		FromDict(_, path, Some(given)) ->
+			len(path) == 0 && given.name == m.cls && isClassParam(c, given.args[0])
+		_ -> False
+	}
+}
+
+-- Whether `ty` is the rigid type a default method's body has for its class's
+-- parameter.
+fun isClassParam(c : ClassDecl, ty : Ty.Type) -> Bool = match Ty.prune(ty) {
+	TCon(cell) -> cell.uid != 0 && cell.name == c.param
+	_          -> False
+}
+
+-- -- shared-fill --------------------------------------------------------------------
+--
+-- `Array.filled(n, v)`, `Vec.filled(n, v)` and `FrozenArray.filled(n, v)` put
+-- the one value `v` in every slot. When `v` is an object, a change through one slot shows through all
+-- of them, where the usual intent is `n` separate objects, which
+-- `Array.init(n, fun(_) = v)` makes.
+--
+-- An object is a value of a type `Classes.alwaysObject` accepts: one whose
+-- every value has identity, with no context on its `Object` instance. So
+-- the check asks the compiler's own definition rather than keeping a list.
+-- A wrapper over a type parameter is an object only at some arguments, and
+-- is not reported.
+--
+-- The fix changes what a program that relied on the sharing does, so it is
+-- not mechanical.
+
+let filledFunctions = [
+	(P.internal("Data.Array", "filled"), "Array"),
+	(P.internal("Data.Vec", "filled"), "Vec"),
+	(P.internal("FrozenArray", "filled"), "FrozenArray"),
+]
+
+fun sharedFill(f : File, types : TypeTable) -> Vec Finding {
+	let out = []
+	let Some(inert) = types.inert else { return out }
+	Lint.nodes(f, fun(c) {
+		if let ChExpr(e) = c {
+			if let ECall(fn, args) = e.kind {
+				if len(args) == 2 {
+					if let Some(kind) = filledKind(fn) {
+						sharedIn(f, types, inert.classes, e, fn, kind, args[0], args[1], out)
+					}
+				}
+			}
+		}
+		True
+	})
+	out
+}
+
+-- The collection the `filled` that `fn` names makes, if it names one.
+fun filledKind(fn : Expr) -> Option String {
+	let EVar(name, _) = fn.kind else { return None }
+	for (internal, kind) in filledFunctions {
+		if name == internal { return Some(kind) }
+	}
+	None
+}
+
+fun sharedIn(
+	f : File,
+	types : TypeTable,
+	classes : Classes.ClassTable,
+	call : Expr,
+	fn : Expr,
+	kind : String,
+	count : Expr,
+	value : Expr,
+	out : Vec Finding,
+) -> Unit {
+	-- One slot or none shares with nothing.
+	if let ELit(LInt(n), _) = unparen(count).kind {
+		if n == 0 || n == 1 { return }
+	}
+	if !Map.contains(types.exprs, value.id) { return }
+	let TCon(head) = Ty.spine(Ty.prune(Typed.of_(types, value))).0 else { return }
+	if !Classes.alwaysObject(classes, head.name) { return }
+	let shown = "fun(_) = " + written(f, value)
+	Vec.push(out, Finding {
+		span = call.span
+		message = "every slot of this "
+			+ kind
+			+ " is the same object, so a change through one shows through all; "
+			+ "write '"
+			+ kind
+			+ ".init("
+			+ written(f, count)
+			+ ", "
+			+ shown
+			+ ")' to make one for each"
+		fix = fix(f, fn, value)
+	})
+}
+
+-- `e` as the author wrote it, or near enough when desugaring made it.
+fun written(f : File, e : Expr) -> String =
+	if Source.isEmpty(e.span) || Source.isGenerated(e.span) {
+		sketch(e)
+	} else {
+		Lint.textOf(f, e.span)
+	}
+
+-- Renames the callee `filled` to `init` and makes the value a function of
+-- the index, when the callee is written qualified, `M.filled`: a bare
+-- `filled` was imported by name, and `init` may not have been.
+fun fix(f : File, fn : Expr, value : Expr) -> Option Fix {
+	if !String.endsWith(Lint.textOf(f, fn.span), ".filled") || Source.isEmpty(value.span) {
+		return None
+	}
+	let at = fn.span
+	let renamed = Edit {
+		span = Span {
+			line    = at.endLine
+			col     = at.endCol - String.codePointCount("filled")
+			endLine = at.endLine
+			endCol  = at.endCol
+			file    = at.file
+			inlined = None
+		}
+		text = "init"
+	}
+	let wrapped = Edit { span = Source.emptyAt(value.span), text = "fun(_) = " }
+	Some(Fix { edits = [renamed, wrapped], mechanical = False })
+}

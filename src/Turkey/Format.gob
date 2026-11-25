@@ -1857,12 +1857,13 @@ fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
-	ELit(_, spelled) -> P.raw(spelled)
-	EUnit            -> P.text("()")
-	EVar(name, _)    -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
-	ECon(name)       -> P.text(name)
-	ETuple(xs)       -> list(f, tokenFrom(f, startOf(e.span)), "(", ")", exprEntries(f, xs))
-	EArray(xs)       -> arrayDoc(f, e, xs)
+	ELit(_, spelled)       -> P.raw(spelled)
+	EInterp(pieces, holes) -> interpolation(f, pieces, holes)
+	EUnit                  -> P.text("()")
+	EVar(name, _) -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
+	ECon(name)             -> P.text(name)
+	ETuple(xs)             -> list(f, tokenFrom(f, startOf(e.span)), "(", ")", exprEntries(f, xs))
+	EArray(xs)             -> arrayDoc(f, e, xs)
 	ERecord(name, fields) -> {
 		let open = findToken(f, startOf(e.span), "{")
 		let items = Vec.map(fields, fun((field, value)) = Field {
@@ -2184,6 +2185,23 @@ fun arrayDoc(f : F, e : Expr, xs : Vec Expr) -> Doc {
 	])
 	if opensLine(f, open) { return P.forced(broken) }
 	P.group(P.ifBreak(broken, P.cat([P.text("["), joined(items, P.text(", ")), P.text("]")])))
+}
+
+-- A string literal cannot hold a line break, so each hole is printed flat and
+-- the literal on one line, however long. A hole that begins with a comment
+-- keeps a space after its `${`, which would otherwise read as `{-` opening
+-- one. `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that
+-- builds this file does not know `\$`.
+fun interpolation(f : F, pieces : Vec (String, String), holes : Vec Expr) -> Doc {
+	let parts = [P.raw("\"" + pieces[0].1)]
+	for var i = 0; i < len(holes); i = i + 1 {
+		let after = if i + 1 == len(holes) { "\"" } else { "" }
+		let comment = len(Map.getOr(f.inlineBefore, positionKey(holes[i].span), [])) > 0
+		Vec.push(parts, P.raw(if comment { "\u{24}{ " } else { "\u{24}{" }))
+		Vec.push(parts, P.flat(exprDoc(f, holes[i])))
+		Vec.push(parts, P.raw("}" + pieces[i + 1].1 + after))
+	}
+	P.cat(parts)
 }
 
 fun isLiteral(e : Expr) -> Bool = match e.kind {

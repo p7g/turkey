@@ -1954,8 +1954,16 @@ type ImportPart = Qualifier | Entry(ImportItem) | Rest
 
 --- A part of an import, and whether a reference of the module read anything
 --- it brings. `shadowed` is set on an entry every name of which the module
---- declares itself, so that no reference could read it.
-type ImportUse = ImportUse { decl : ImportDecl, part : ImportPart, used : Bool, shadowed : Bool }
+--- declares itself, so that no reference could read it. `loaded` is set when
+--- every program loads the imported module whatever its importers write: the
+--- Prelude imports it, directly or not.
+type ImportUse = ImportUse {
+	decl     : ImportDecl
+	part     : ImportPart
+	used     : Bool
+	shadowed : Bool
+	loaded   : Bool
+}
 
 --- Returns, for each import `m` writes, the parts of it that bring names, in
 --- the order written, with whether `m`'s references read them. Call it once
@@ -1967,6 +1975,7 @@ type ImportUse = ImportUse { decl : ImportDecl, part : ImportPart, used : Bool, 
 --- instances, bring nothing to list.
 fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 	let out = []
+	let always = preludeClosure(l)
 	let scope = m.scope
 	let visible = spaces(scope)
 	-- Whether a reference read the bare name `short` in the namespace `i`,
@@ -1996,6 +2005,7 @@ fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 			part     = part
 			used     = used
 			shadowed = shadowed
+			loaded   = Set.contains(always, dep.name)
 		})
 		let items = match imp.items {
 			Some(items) -> items
@@ -2004,7 +2014,13 @@ fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 				continue
 			}
 		}
-		if let Some(alias) = imp.alias { use(Qualifier, through(alias, dep), False) }
+		-- With no alias, a list import still brings the module's own
+		-- qualifier. That is seldom what it is for, so it is listed only
+		-- when used, which keeps the import.
+		match imp.alias {
+			Some(alias) -> use(Qualifier, through(alias, dep), False)
+			None        -> if through(imp.name, dep) { use(Qualifier, True, False) }
+		}
 		if imp.rest {
 			var used = False
 			let exported = spaces(dep.exports)
@@ -2041,6 +2057,21 @@ fun importUses(l : Loader, m : Module) -> Vec ImportUse {
 		}
 	}
 	out
+}
+
+-- The names of the modules the Prelude imports, directly or not, which every
+-- program loads, and the Prelude's own.
+fun preludeClosure(l : Loader) -> Set.Set String {
+	let seen = Set.new()
+	let pending = [Prelude.preludeName]
+	while let Some(name) = Vec.pop(pending) {
+		if Set.contains(seen, name) { continue }
+		Set.add(seen, name)
+		if let Some(m) = Map.get(l.modules, name) {
+			for next in Map.values(m.imported) { Vec.push(pending, next) }
+		}
+	}
+	seen
 }
 
 -- The fields of the record constructor `target`, an internal name, or none

@@ -162,7 +162,7 @@ left.
 |---|---|---|
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
-| `unused-variable` | warn | a local binding nothing reads: a `let` or `var`, a pattern of `for`, `match`, `if let` or `while let`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
+| `unused-variable` | warn | a local binding nothing reads: a `let`, `var` or `let ... else`, a pattern of `for`, `match`, `if let`, `if var`, `while let` or `while var`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
 | `unused-import` | warn | an import, or an entry of an import's list, that brings nothing the module reads or its export list passes on, such as a name a declaration of the module hides. `x as _` and `import M ()` are not reported. `--fix` removes the entry, or the whole import when none of it is used. |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
@@ -188,8 +188,8 @@ spaces allowed around each. It says that each check reports a finding in the
 code the directive covers, and those findings are neither printed nor fixed
 by `--fix`:
 
-* On a line of its own, a directive covers the whole of the statement,
-  declaration or `match` arm that begins next, every line of it included,
+* On a line of its own, a directive covers the whole of the import,
+  statement, declaration or `match` arm that begins next, every line of it included,
   provided it begins inside the block, type, call or other construct the
   directive is in. If nothing begins there, as at the end of a block, the
   directive covers nothing, and warns. A doc comment can be directly above the

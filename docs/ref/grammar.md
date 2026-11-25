@@ -22,9 +22,12 @@ decimal ::= "0" | [1-9] ( "_"? [0-9] )*
 digits  ::= [0-9] ( "_"? [0-9] )*
 hex     ::= [0-9a-fA-F]
 INDEX   ::= "0" | [1-9] [0-9]*
-STRING  ::= '"' ( character | escape )* '"'
+STRING  ::= '"' ( character | escape )* '"'                   -- containing no "${"
+STRING_START ::= '"' ( character | escape )* "${"
+STRING_MID   ::= "}" ( character | escape )* "${"
+STRING_END   ::= "}" ( character | escape )* '"'
 CHAR    ::= "'" ( character | escape ) "'"
-escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex? hex? hex? hex? "}"
+escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\$" | "\u{" hex hex? hex? hex? hex? hex? "}"
 OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"
 ```
 
@@ -152,6 +155,7 @@ postfix    ::= atom ( "(" (expression ("," expression)*)? ")"
 
 ```ebnf
 atom ::= INT | FLOAT | STRING | CHAR
+       | STRING_START expression (STRING_MID expression)* STRING_END   -- string interpolation
        | IDENT
        | qualified-CONID
        | CONID ("." CONID)* "." IDENT                            -- qualified variable

@@ -846,18 +846,27 @@ fun largeAllocate(bytes : Int) -> Ptr {
 --
 -- Every small object is bump-allocated into a hole of free lines, whatever
 -- its size, so that a line any object left free can take an object of any
--- other size. A worker has two bump cursors. The line cursor takes holes in
--- turn from the partly used regions the last sweep left recyclable, and then
--- from empty ones. The overflow cursor takes only empty regions, and holds
--- an object of more than a line that does not fit the line cursor's hole
+-- other size. A worker has two bump cursors. The overflow cursor holds an
+-- object of more than `mediumBytes` that does not fit the line cursor's hole
 -- while a line of that hole is still free, so that one such object does not
 -- make the line cursor skip the rest of a hole it could still fill with small
 -- ones.
 --
+-- A line region no cursor owns is on one of two lists, by its largest hole:
+-- `roomy` if that is at least `roomyLines`, `recyclable` if smaller. The line
+-- cursor takes holes in turn from recyclable regions, then roomy ones, then
+-- empty ones. The overflow cursor takes the first hole big enough for its
+-- object from a roomy region, and an empty region only when none has one.
+-- Immix gives medium objects empty blocks only; here that took 2,000-3,000
+-- fresh regions a cycle while recycled holes of 65 lines and more went to
+-- small objects.
+--
 -- Line marks are exact: the sweep marks every line a live object covers, by
 -- its first and last granule. Allocation therefore never skips a line at the
 -- start of a hole, as a collector that marks only an object's first line
--- must.
+-- must. Between sweeps a cursor marks the lines it has taken as it leaves a
+-- hole (`closeHole`), so a region given back is searched again from its
+-- first line.
 --
 -- The cursors are in the worker's record, in the first two size classes'
 -- cursors, whose free words stay 0 so that generated code calls in for every
@@ -888,6 +897,7 @@ fun lineAllocate(size : Int) -> Ptr {
 		if bytes > mediumBytes && left >= mediumBytes {
 			return overflowAllocate(cursorIn(w, 1), bytes)
 		}
+		if statsWanted { let _ = Ptr.atomicAdd(statsTake, 48, left) }
 		if !nextHole(cursor) { return Ptr.null() }
 	}
 	Ptr.null()
@@ -913,6 +923,7 @@ fun bump(cursor : Ptr, bytes : Int) -> Ptr {
 -- Move the line cursor to the next hole of its region, or of the next region
 -- it takes; False if there is no memory for a region.
 fun nextHole(cursor : Ptr) -> Bool {
+	closeHole(cursor)
 	var region : Ptr = Ptr.load(cursor, bumpRegion)
 	while True {
 		if !Ptr.isNull(region) && holeIn(cursor, region) { return True }
@@ -930,6 +941,10 @@ fun nextHole(cursor : Ptr) -> Bool {
 	False
 }
 
+-- The hole a bump cursor is in starts at this address, so that `closeHole`
+-- can mark what it took.
+let bumpHole : Int = 32
+
 -- Point the cursor at `region`'s first hole from its search line, and move
 -- the search line to the hole's end; False if there is none.
 fun holeIn(cursor : Ptr, region : Ptr) -> Bool {
@@ -942,13 +957,61 @@ fun holeIn(cursor : Ptr, region : Ptr) -> Bool {
 	var end = plus(line, 1)
 	while end < regionLineCount && !testBit(region, regionLines, end) { end = plus(end, 1) }
 	Ptr.store32(region, regionSearchWord, end)
-	Ptr.store(cursor, bumpNext, plus(Ptr.toInt(region), line << lineShift))
-	Ptr.store(cursor, bumpLimit, plus(Ptr.toInt(region), end << lineShift))
+	enterHole(cursor, region, line, end)
 	True
 }
 
--- An object of more than a line, from the overflow cursor, which takes a new
--- empty region when its own has too little left.
+fun enterHole(cursor : Ptr, region : Ptr, line : Int, end : Int) -> Unit {
+	if statsWanted {
+		let _ = Ptr.atomicAdd(statsTake, 24, 1)
+		let _ = Ptr.atomicAdd(statsTake, 32, (end - line) << lineShift)
+	}
+	Ptr.store(cursor, bumpHole, plus(Ptr.toInt(region), line << lineShift))
+	Ptr.store(cursor, bumpNext, plus(Ptr.toInt(region), line << lineShift))
+	Ptr.store(cursor, bumpLimit, plus(Ptr.toInt(region), end << lineShift))
+}
+
+-- Mark the lines the cursor's hole has given out, so that the region can be
+-- searched again from its first line: allocation since the sweep is then on
+-- marked lines too, and the sweep recomputes them from the survivors.
+fun closeHole(cursor : Ptr) -> Unit {
+	let region : Ptr = Ptr.load(cursor, bumpRegion)
+	if Ptr.isNull(region) { return }
+	let next : Int = Ptr.load(cursor, bumpNext)
+	let hole : Int = Ptr.load(cursor, bumpHole)
+	if next == 0 || next == hole { return }
+	let base = Ptr.toInt(region)
+	let last = Int.subWrapping(Int.subWrapping(next, 1), base) >> lineShift
+	for var l = Int.subWrapping(hole, base) >> lineShift; l <= last; l = plus(l, 1) {
+		setBit(region, regionLines, l)
+	}
+	Ptr.store(cursor, bumpHole, next)
+}
+
+-- Point the cursor at the first hole of `region` of at least `bytes`, from
+-- its first line, leaving its search line; False if it has none.
+fun fitHole(cursor : Ptr, region : Ptr, bytes : Int) -> Bool {
+	let needed = plus(bytes, lineBytes - 1) >> lineShift
+	var line = dataLine
+	while line < regionLineCount {
+		if testBit(region, regionLines, line) {
+			line = plus(line, 1)
+		} else {
+			var end = plus(line, 1)
+			while end < regionLineCount && !testBit(region, regionLines, end) { end = plus(end, 1) }
+			if end - line >= needed {
+				enterHole(cursor, region, line, end)
+				return True
+			}
+			line = end
+		}
+	}
+	False
+}
+
+-- An object of more than a line, from the overflow cursor: into the hole it
+-- is in, or another of its region's, or the first big enough hole of a roomy
+-- region, or else an empty region.
 fun overflowAllocate(cursor : Ptr, bytes : Int) -> Ptr {
 	if statsWanted {
 		let _ = Ptr.atomicAdd(statsOverflow, 0, 1)
@@ -956,45 +1019,93 @@ fun overflowAllocate(cursor : Ptr, bytes : Int) -> Ptr {
 	}
 	let object = bump(cursor, bytes)
 	if !Ptr.isNull(object) { return object }
+	closeHole(cursor)
+	let own : Ptr = Ptr.load(cursor, bumpRegion)
+	if !Ptr.isNull(own) && fitHole(cursor, own, bytes) { return bump(cursor, bytes) }
 	Lock.acquire(heapLock)
 	giveBack(cursor)
-	let region = takeLineRegion(False)
+	var found = False
+	while !found && !Ptr.isNull(roomy) {
+		let region = roomy
+		roomy = Ptr.load(region, regionAvailableNext)
+		if fitHole(cursor, region, bytes) {
+			Ptr.store(cursor, bumpRegion, region)
+			found = True
+		} else {
+			Ptr.store(region, regionAvailableNext, recyclable)
+			recyclable = region
+		}
+	}
+	if !found {
+		let region = takeLineRegion(False)
+		if !Ptr.isNull(region) {
+			Ptr.store(cursor, bumpRegion, region)
+			let _ = holeIn(cursor, region)
+			found = True
+		}
+	}
 	localFold(Process.workerRecord())
 	Lock.release(heapLock)
-	if Ptr.isNull(region) { return region }
-	Ptr.store(cursor, bumpRegion, region)
-	let _ = holeIn(cursor, region)
+	if !found { return Ptr.null() }
 	bump(cursor, bytes)
 }
 
--- A recyclable line region if `recycled` and there is one, or else an empty
--- one; null if there is no memory for it. Under `heapLock`.
+-- A recyclable line region if `recycled` and there is one, a roomy one next,
+-- or else an empty one; null if there is no memory for it. Under `heapLock`.
 fun takeLineRegion(recycled : Bool) -> Ptr {
+	if statsWanted {
+		let at = if recycled && !(Ptr.isNull(recyclable) && Ptr.isNull(roomy)) { 0 } else if recycled { 8 } else { 16 }
+		Ptr.store(statsTake, at, Ptr.load(statsTake, at) + 1)
+	}
 	if recycled && !Ptr.isNull(recyclable) {
 		let region = recyclable
 		recyclable = Ptr.load(region, regionAvailableNext)
 		return region
 	}
+	if recycled && !Ptr.isNull(roomy) {
+		let region = roomy
+		roomy = Ptr.load(region, regionAvailableNext)
+		return region
+	}
 	newRegion(8, 8, lineClass, False)
 }
 
--- Give up a bump cursor's region: onto the recyclable list, searched again
--- from the rest of the cursor's hole, if that leaves it a line to search.
+-- The line regions whose largest hole is at least `roomyLines`, which the
+-- overflow cursor takes before empty ones and the line cursor after the rest.
+var roomy : Ptr = Ptr.null()
+let roomyLines : Int = 8
+
+-- Put a line region no cursor owns on the list its largest hole calls for,
+-- searched from its first line, or on none if it has no free line.
+fun relist(region : Ptr) -> Unit {
+	Ptr.store32(region, regionSearchWord, dataLine)
+	var largest = 0
+	var run = 0
+	for var l = dataLine; l < regionLineCount; l = plus(l, 1) {
+		if testBit(region, regionLines, l) {
+			run = 0
+		} else {
+			run = plus(run, 1)
+			if run > largest { largest = run }
+		}
+	}
+	if largest == 0 { return }
+	if largest >= roomyLines {
+		Ptr.store(region, regionAvailableNext, roomy)
+		roomy = region
+	} else {
+		Ptr.store(region, regionAvailableNext, recyclable)
+		recyclable = region
+	}
+}
+
+-- Give up a bump cursor's region: its hole marked as taken, and relisted.
 -- Under `heapLock`, or where no other worker can be allocating.
 fun giveBack(cursor : Ptr) -> Unit {
 	let region : Ptr = Ptr.load(cursor, bumpRegion)
 	if Ptr.isNull(region) { return }
-	let next : Int = Ptr.load(cursor, bumpNext)
-	if next != 0 {
-		-- The first whole line past what the cursor took. The lines from it to
-		-- the hole's end are free, and the search line is that end.
-		let line = plus(Int.subWrapping(next, Ptr.toInt(region)), lineBytes - 1) >> lineShift
-		Ptr.store32(region, regionSearchWord, line)
-	}
-	if Ptr.load32(region, regionSearchWord) < regionLineCount {
-		Ptr.store(region, regionAvailableNext, recyclable)
-		recyclable = region
-	}
+	closeHole(cursor)
+	relist(region)
 	Ptr.store(cursor, bumpRegion, Ptr.null())
 	Ptr.store(cursor, bumpNext, 0)
 	Ptr.store(cursor, bumpLimit, 0)
@@ -2372,6 +2483,7 @@ fun clearMarks() -> Unit {
 fun sweep() -> Unit {
 	Memory.fill(available, 8 * regionClasses, 0)
 	recyclable = Ptr.null()
+	roomy = Ptr.null()
 	if statsWanted { Memory.fill(statsLines, statsLinesBytes, 0) }
 	liveBytes = 0
 	var previous = Ptr.null()
@@ -2459,15 +2571,11 @@ fun sweepLines(region : Ptr) -> Int {
 		}
 	}
 	Memory.copy(Ptr.add(region, regionEnds), endsScratch, 8 * regionWords)
-	Ptr.store32(region, regionSearchWord, dataLine)
 	var marked = 0
 	for var lw = 0; lw < regionLineCount >> 6; lw = plus(lw, 1) {
 		marked = plus(marked, population(Ptr.load(region, plus(regionLines, times8(lw)))))
 	}
-	if marked < regionLineCount - dataLine {
-		Ptr.store(region, regionAvailableNext, recyclable)
-		recyclable = region
-	}
+	relist(region)
 	if census { lineCensus(region, marked) }
 	bytes
 }
@@ -2495,6 +2603,7 @@ let statsLinesBytes : Int = 16 + 16 * statsHoleBuckets
 var statsLines : Ptr = zeroed(statsLinesBytes)
 -- The objects, and their bytes, the overflow cursor took over the run.
 var statsOverflow : Ptr = zeroed(16)
+var statsTake : Ptr = zeroed(64)
 
 -- Count `region`'s free lines and holes after its sweep, which marked
 -- `marked` lines.
@@ -2619,6 +2728,21 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 	}
 	put(Prim.cString("\n"))
 	writeLine()
+	put(Prim.cString("[gc take] recycled "))
+	putInt(Ptr.load(statsTake, 0))
+	put(Prim.cString(", new-line "))
+	putInt(Ptr.load(statsTake, 8))
+	put(Prim.cString(", new-overflow "))
+	putInt(Ptr.load(statsTake, 16))
+	put(Prim.cString(", holes "))
+	putInt(Ptr.load(statsTake, 24))
+	put(Prim.cString(", hole-bytes "))
+	putInt(Ptr.load(statsTake, 32))
+	put(Prim.cString(", abandoned "))
+	putInt(Ptr.load(statsTake, 48))
+	put(Prim.cString("\n"))
+	writeLine()
+	Memory.fill(statsTake, 64, 0)
 }
 
 -- The run's totals, when TURKEY_GC_STATS asked for them.

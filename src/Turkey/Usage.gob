@@ -1,7 +1,7 @@
-export (unusedVariable, unusedImport)
+export (unusedVariable, unusedImport, unusedPrivateFunction)
 
---- Checks about whether what a module binds is used: local bindings and
---- imports (`Turkey.Lint`).
+--- Checks about whether what a module binds is used: local bindings,
+--- imports and private top-level bindings (`Turkey.Lint`).
 
 import Data.Set as Set
 import Turkey.Ast (..)
@@ -9,6 +9,7 @@ import Turkey.Binders as Binders
 import Turkey.Lint (File, Finding(..), Fix(..), Edit(..))
 import Turkey.Lint as Lint
 import Turkey.Modules (ImportUse(..), ImportPart(..))
+import Turkey.Runtime as Rt
 import Turkey.Source (Span(..))
 import Turkey.Source as Source
 
@@ -297,17 +298,21 @@ fun punned(f : File, o : Occurrence, name : String) -> Bool {
 	True
 }
 
--- The span of a local function's name, which its declaration's span begins
--- just before: `fun name`.
+-- The span of a function's name, which its declaration's span begins just
+-- before: `fun name`. A top-level function's name is internal by now.
 fun nameIn(f : File, d : FunDecl) -> Span {
 	let start = Lint.offsetOf(f, d.span.line, d.span.col)
-	let text = Lint.textOf(f, d.span)
+	let name = bare(d.name)
+	-- Only the start of the declaration, which holds its name: the whole of
+	-- a long body would be copied for nothing.
+	let head = Source.endingAt(d.span, d.span.line, d.span.col + 16 + String.codePointCount(name))
+	let text = Lint.textOf(f, head)
 	let Some(after) = String.stripPrefix(text, "fun") else { return Source.emptyAt(d.span) }
 	let gap = String.codePointCount(text) - String.codePointCount(after)
 	let trimmed = String.trimStart(after)
 	let from = start + gap + (String.codePointCount(after) - String.codePointCount(trimmed))
-	if !String.startsWith(trimmed, d.name) { return Source.emptyAt(d.span) }
-	Lint.spanOf(f, from, from + String.codePointCount(d.name), d.span)
+	if !String.startsWith(trimmed, name) { return Source.emptyAt(d.span) }
+	Lint.spanOf(f, from, from + String.codePointCount(name), d.span)
 }
 
 -- -- unused-import ------------------------------------------------------------------
@@ -666,4 +671,161 @@ fun skipBack(f : File, offset : Int, like : Span) -> Int {
 fun isSpace(c : Option Char) -> Bool = match c {
 	Some(' ') | Some('\t') | Some('\n') | Some('\r') -> True
 	_                                                -> False
+}
+
+-- -- unused-private-function --------------------------------------------------------
+--
+-- A top-level `fun`, `let` or `var` of a module with an export list that the
+-- list does not name, and that nothing reaches. What reaches a binding is a
+-- reference from a root, or from a binding a root reaches: the roots are the
+-- declarations the module exports, `main`, what an `infix` declaration means,
+-- the functions the runtime enters by name (`Turkey.Runtime.entryPoints`),
+-- and every class and instance method. A `foreign` definition is called from outside and is never
+-- reported. A module whose export list has a `..` exports everything it
+-- declares, and the entry has no list, so neither has anything to report.
+--
+-- Private bindings that refer only to each other, a function's own
+-- recursion included, are all unreached. There is no mechanical fix: the
+-- binding may have been meant for the export list.
+
+-- A top-level declaration: the private bindings it makes, none for a root,
+-- and the top-level binders its body refers to.
+-- A binding's place is its pattern variable's span, or for a function, the
+-- function, whose name is found in the text only if it is reported: finding
+-- it reads the text, which nothing else here needs.
+type TopLevel = TopLevel { bound : Vec (Int, String, Either FunDecl Span), refers : Vec Int }
+
+fun unusedPrivateFunction(f : File) -> Vec Finding {
+	let program = Lint.programOf(f)
+	let exported = match program.exportDecl {
+		Some(d) -> if d.rest { return [] } else { exportedNames(program) }
+		None    -> return []
+	}
+	let refs = Lint.bindersOf(f).refs
+	-- What an `infix` declaration means is reached through the operator, by
+	-- uses here and in its importers alike.
+	let operands = Set.new()
+	for d in program.decls {
+		if let DInfix(op) = d { Set.add(operands, bare(op.target)) }
+	}
+	let isPrivate = fun(internal : String) {
+		let name = bare(internal)
+		!Set.contains(exported, name)
+			&& !Set.contains(operands, name)
+			&& name != "main"
+			&& !Array.contains(Rt.entryPoints, internal)
+	}
+	let tops = []
+	for d in program.decls {
+		let bound = []
+		if let DStmt(s) = d {
+			match s.kind {
+				-- A `foreign` definition with a body is called from outside.
+				SFun(fd) -> if isPrivate(fd.name) && Option.isNone(fd.symbol) {
+					if let Some(id) = Binders.named(Lint.bindersOf(f), fd.name) {
+						Vec.push(bound, (id, "the function '" + bare(fd.name) + "'", Left(fd)))
+					}
+				}
+				-- A binding whose initializer makes a call may be there for
+				-- what the call does, as `let workers = Scheduler.start()`
+				-- is, so it is a root.
+				SLet(pat, value) | SVar(pat, value) | SLetElse(_, pat, value, _) ->
+					if !calls(value) {
+						for v in varPatterns(pat) {
+							if let (PVar(name), Some(id)) = (v.kind, Map.get(refs, v.id)) {
+								if isPrivate(name) {
+									Vec.push(bound, (id, "'" + bare(name) + "'", Right(v.span)))
+								}
+							}
+						}
+					}
+				SAssign(_, _) | SExpr(_) -> {}
+			}
+		}
+		Vec.push(tops, TopLevel { bound = bound, refers = [] })
+	}
+	-- What a root reaches, and then what that reaches.
+	let reached = Set.new()
+	let pending = []
+	let owner : Map Int Int = Map.new()
+	for k in Int.range(0, len(tops)) {
+		for (id, _, _) in tops[k].bound { Map.put(owner, id, k) }
+	}
+	if len(owner) == 0 { return [] }
+	-- Only references to candidates matter, which keeps the walk below to
+	-- them.
+	for k in Int.range(0, len(tops)) {
+		for c in declChildren(program.decls[k]) { referencesIn(refs, owner, c, tops[k].refers) }
+	}
+	for t in tops {
+		if len(t.bound) == 0 {
+			for id in t.refers { Vec.push(pending, id) }
+		}
+	}
+	while let Some(id) = Vec.pop(pending) {
+		if Set.contains(reached, id) { continue }
+		Set.add(reached, id)
+		if let Some(k) = Map.get(owner, id) {
+			for next in tops[k].refers { Vec.push(pending, next) }
+		}
+	}
+	let out = []
+	for t in tops {
+		for (id, what, place) in t.bound {
+			if Set.contains(reached, id) { continue }
+			let at = match place {
+				Left(fd) -> nameIn(f, fd)
+				Right(s) -> s
+			}
+			if Source.isGenerated(at) || Source.isEmpty(at) {
+				continue
+			}
+			Vec.push(
+				out,
+				Lint.finding(at, what + " is neither exported nor used; export it, or remove it"),
+			)
+		}
+	}
+	out
+}
+
+-- Whether evaluating `e` may call a function, outside the functions it makes.
+fun calls(e : Expr) -> Bool {
+	var found = False
+	fun look(c : Child) -> Unit {
+		if found { return }
+		if let ChExpr(x) = c {
+			match x.kind {
+				ECall(_, _)         -> { found = True }
+				ELambda(_, _, _, _) -> return
+				_                   -> {}
+			}
+		}
+		if let ChFun(_) = c { return }
+		for child in children(c) { look(child) }
+	}
+	look(ChExpr(e))
+	found
+}
+
+-- The nodes a top-level declaration holds.
+fun declChildren(d : Decl) -> Vec Child = match d {
+	DStmt(s)                           -> [ChStmt(s)]
+	DClass(c)                          -> Vec.map(c.methods, ChFun)
+	DInstance(i)                       -> Vec.map(i.methods, ChFun)
+	DType(_) | DForeign(_) | DInfix(_) -> []
+}
+
+-- Adds to `out` the binder of every reference in `c` that is one of
+-- `wanted`'s keys. A method reference the compiler wrote means a class
+-- method, which is never one, so those are not walked.
+fun referencesIn(refs : Map Int Int, wanted : Map Int Int, c : Child, out : Vec Int) -> Unit {
+	if let ChExpr(e) = c {
+		if let EVar(_, _) = e.kind {
+			if let Some(id) = Map.get(refs, e.id) {
+				if Map.contains(wanted, id) { Vec.push(out, id) }
+			}
+		}
+	}
+	for child in children(c) { referencesIn(refs, wanted, child, out) }
 }

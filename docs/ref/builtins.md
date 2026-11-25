@@ -18,7 +18,7 @@ The Prelude provides these names unqualified:
 |---|---|
 | Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec`, `FrozenArray` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Zero`, `One`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed`, `Object`, `Debug` |
-| Functions | `print`, `write`, `dbg`, `error`, `fail`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
+| Functions | `print`, `write`, `dbg`, `error`, `fail`, `throw`, `const`, `pipe`, `fmap`, `min`, `max`, `hash` |
 | Operators | `+` `-` `*` `/` `%`, `==` `!=` `<` `<=` `>` `>=`, `&` `\|` `^` `<<` `>>`, `<>`, `\|>` `\|>>` `<&>` `<$>` ([Operators](expressions.md#operators)) |
 
 The Prelude also exports the library modules `Data.Array`, `Data.Bool`,
@@ -1068,7 +1068,7 @@ instance Error NotFound {
     fun message(e) = "not found: " + e.path
 }
 
-fun load(path) = if path == "" { Right("empty") } else { Left(fail(NotFound { path })) }
+fun load(path) = if path == "" { Right("empty") } else { throw(NotFound { path }) }
 
 fun main() {
     match load("notes.txt") {
@@ -1089,8 +1089,9 @@ not found: notes.txt
 could create notes.txt
 ```
 
-`fail(e)` packs a value into a `SomeError`, and `Error.cast` returns `Some`
-only when the packed value has exactly the requested type.
+`throw(e)` is `Left(fail(e))`, where `fail(e)` packs a value into a
+`SomeError`. `Error.cast` returns `Some` only when the packed value has exactly
+the requested type.
 
 The requested type is compared argument by argument, and that includes an
 argument that is itself a type constructor. With `type Cell f = Cell(f Int)`,

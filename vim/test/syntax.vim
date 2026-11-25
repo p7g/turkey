@@ -108,6 +108,16 @@ call s:Probe('"quoted"', 0, 'turkeyMultiString') " a quote does not close it
 call s:Probe('u{1F600} at', 0, 'turkeyEscape')
 call s:Probe('length \\$', 7, 'turkeyMultiString') " a trailing \ is no error
 call s:Probe('^\s*"""', 8, 'turkeyMultiString')
+call s:Probe('sum ', 0, 'turkeyString')
+call s:Probe('\${tricky', 0, 'turkeyHoleDelimiter')
+call s:Probe('+ "in', 0, 'turkeyOperator')      " code inside a hole
+call s:Probe('"in', 0, 'turkeyString')          " a string inside a hole
+call s:Probe('ch}', 0, 'turkeyIdentifier')      " a hole inside that string
+call s:Probe('"} and', 2, 'turkeyString')       " back in the outer string
+call s:Probe('Some {', 0, 'turkeyConstructor')
+call s:Probe('}.x', 2, 'turkeyIdentifier')
+call s:Probe('\\\$', 0, 'turkeyEscape')
+call s:Probe('\$"', 0, 'turkeyString')          " a lone `$` is text
 call s:Probe('\\_', 0, 'turkeyOperator')       " a placeholder function
 call s:Probe('\<for\>', 0, 'turkeyRepeat')
 call s:Probe('\<in\>', 0, 'turkeyRepeat')

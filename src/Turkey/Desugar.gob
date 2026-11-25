@@ -1416,8 +1416,8 @@ fun walkExpr(d : D, e : Expr) -> Expr {
 		EBlock(stmts) -> for var i = 0; i < len(stmts); i = i + 1 {
 			stmts[i] = walkStmt(d, stmts[i])
 		}
-		EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
-		EParen(_)                         -> unbared(e.span)
+		EIfLet(_, _, _) | EWhileLet(_, _) | EInterp(_, _) -> rewritten(e.span)
+		EParen(_)                                         -> unbared(e.span)
 	}
 	e
 }
@@ -1529,6 +1529,7 @@ fun bareKind(e : Expr) -> ExprKind = match e.kind {
 	EQuestion(inner, bindFn) -> EQuestion(bare(inner), bindFn)
 	EDo(body)                -> EDo(bare(body))
 	EParen(_)                -> unbared(e.span)
+	EInterp(pieces, holes)   -> EInterp(pieces, bareAll(holes))
 }
 
 fun bareAll(xs : Vec Expr) -> Vec Expr = Vec.map(xs, bare)
@@ -1601,7 +1602,8 @@ fun matches(d : D, c : Child) -> Unit {
 				)
 				e.kind = ELoop(mkExpr(d, at, EBlock([mkStmt(d, at, SExpr(m))])))
 			}
-			_ -> {}
+			EInterp(pieces, holes) -> { e.kind = interpolation(d, e.span, pieces, holes) }
+			_                      -> {}
 		}
 		ChStmt(s) -> if let SLetElse(mutable, pat, value, otherwise) = s.kind {
 			s.kind = letElse(d, s, mutable, pat, value, otherwise)
@@ -1609,6 +1611,42 @@ fun matches(d : D, c : Child) -> Unit {
 		_ -> {}
 	}
 	for child in children(c) { matches(d, child) }
+}
+
+-- `"a${x}b"` is
+--
+--     { let %s1 = String.builder()
+--       String.push(%s1, "a"); String.push(%s1, show(x)); String.push(%s1, "b")
+--       String.build(%s1) }
+--
+-- with no push for an empty piece. The holes are evaluated left to right, each
+-- once. A `show` is spanned as its hole, which is where a missing `Show`
+-- instance is reported.
+fun interpolation(d : D, span : Span, pieces : Vec (String, String), holes : Vec Expr) -> ExprKind {
+	let at = Source.emptyAt(span)
+	let b = fresh(d, "%s", at)
+	let made = mkExpr(d, at, ECall(globalOf(d, P.stringBuilder, at), []))
+	let stmts = [mkStmt(d, at, SLet(bindTemp(d, b, at), made))]
+	for var i = 0; i < len(pieces); i = i + 1 {
+		if i > 0 {
+			let hole = holes[i - 1]
+			let shown = mkExpr(d, hole.span, ECall(methodRef(d, hole.span, P.showMethod), [hole]))
+			Vec.push(stmts, pushStmt(d, at, b, shown))
+		}
+		let (value, _) = pieces[i]
+		if value != "" {
+			Vec.push(stmts, pushStmt(d, at, b, mkExpr(d, at, literal(LString(value)))))
+		}
+	}
+	let built = mkExpr(d, at, ECall(globalOf(d, P.stringBuild, at), [varOf(d, b, at)]))
+	Vec.push(stmts, mkStmt(d, at, SExpr(built)))
+	EBlock(stmts)
+}
+
+-- `String.push(b, part)`, as a statement.
+fun pushStmt(d : D, at : Span, b : Temp, part : Expr) -> Stmt {
+	let call = mkExpr(d, at, ECall(globalOf(d, P.stringPush, at), [varOf(d, b, at), part]))
+	mkStmt(d, at, SExpr(call))
 }
 
 -- `_ -> body`.
@@ -1927,13 +1965,13 @@ fun indexExpr(d : D, e : Expr) -> Unit = match e.kind {
 			indexExpr(d, a.body)
 		}
 	}
-	EReturn(value)                    -> indexOpt(d, value)
-	EBreak(value)                     -> indexOpt(d, value)
-	EBlock(stmts)                     -> for s in stmts { indexStmt(d, s) }
-	EQuestion(inner, _)               -> indexExpr(d, inner)
-	EDo(body)                         -> indexExpr(d, body)
-	EIfLet(_, _, _) | EWhileLet(_, _) -> rewritten(e.span)
-	EParen(_)                         -> unbared(e.span)
+	EReturn(value)                                    -> indexOpt(d, value)
+	EBreak(value)                                     -> indexOpt(d, value)
+	EBlock(stmts)                                     -> for s in stmts { indexStmt(d, s) }
+	EQuestion(inner, _)                               -> indexExpr(d, inner)
+	EDo(body)                                         -> indexExpr(d, body)
+	EIfLet(_, _, _) | EWhileLet(_, _) | EInterp(_, _) -> rewritten(e.span)
+	EParen(_)                                         -> unbared(e.span)
 }
 
 fun indexAll(d : D, xs : Vec Expr) -> Unit {

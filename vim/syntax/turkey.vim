@@ -40,17 +40,23 @@ syn region turkeyBlockComment start="{-" end="-}" contains=turkeyBlockComment,tu
 syn match turkeyDirective "--@[^( \t]*\%(([^)]*)\)\=" nextgroup=turkeyDirectiveReason
 syn match turkeyDirectiveReason contained ".*$" contains=turkeyTodo
 
-" Strings and characters. No interpolation, and a one-line string
-" cannot span lines. Escapes are exactly \n \t \r \0 \\ \" \' and
-" \u{H...H}; anything else after a backslash is an error, except that a
-" multi-line string may end a line in a backslash. A multi-line string opens
-" with `"""` at the end of a line and closes with a `"""` that starts its own
-" line. It is defined after the one-line string so that it wins where both
-" match.
+" Strings and characters. A one-line string cannot span lines. Escapes are
+" exactly \n \t \r \0 \\ \" \' \$ and \u{H...H}; anything else after a
+" backslash is an error, except that a multi-line string may end a line in a
+" backslash. `${` opens a hole, which holds code up to the `}` that matches
+" it, so the braces of a record or a block inside it nest.
+"
+" A multi-line string opens with `"""` at the end of a line and closes with a
+" `"""` that starts its own line. It holds no holes. It is defined after the
+" one-line string so that it wins where both match.
 syn match turkeyEscapeError contained "\\."
-syn match turkeyEscape contained "\\\(u{\x\{1,6}}\|[ntr0\\"']\)"
-syn region turkeyString start=+"+ skip=+\\"+ end=+"+ oneline contains=turkeyEscape,turkeyEscapeError
+syn match turkeyEscape contained "\\\(u{\x\{1,6}}\|[ntr0\\"'$]\)"
+syn region turkeyString start=+"+ skip=+\\"+ end=+"+ oneline contains=turkeyEscape,turkeyEscapeError,turkeyHole
 syn region turkeyMultiString start=+"""\r\=$+ end=+^\s*\zs"""+ contains=turkeyEscape,turkeyEscapeError
+" Code in a hole: every group but those that only make sense elsewhere.
+syn cluster turkeyHoleCode contains=ALLBUT,turkeyTodo,turkeyDirectiveReason,turkeyEscape,turkeyEscapeError,turkeyHole
+syn region turkeyHole contained matchgroup=turkeyHoleDelimiter start=+\${+ end=+}+ oneline contains=@turkeyHoleCode
+syn region turkeyHoleBraces contained transparent start=+{+ end=+}+ oneline contains=@turkeyHoleCode
 syn region turkeyChar start=+'+ skip=+\\'+ end=+'+ oneline contains=turkeyEscape,turkeyEscapeError
 
 " Numbers: decimal, `0x`, `0o` and `0b` integers, and floats with a
@@ -106,6 +112,7 @@ hi def link turkeyMultiString String
 hi def link turkeyChar Character
 hi def link turkeyEscape SpecialChar
 hi def link turkeyEscapeError Error
+hi def link turkeyHoleDelimiter SpecialChar
 hi def link turkeyLineComment Comment
 hi def link turkeyDocComment SpecialComment
 hi def link turkeyBlockComment Comment

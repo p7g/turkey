@@ -81,18 +81,28 @@ block. A block is a scope: its declarations are not visible after it.
 
 ### Discarded values
 
-A statement whose value is not used must have type `Unit`. Computing a value
-and dropping it is usually a mistake, such as calling `Vec.pop` for its
-effect and forgetting that the popped element was the point. So it is an
-error:
+A statement whose value is not used should have type `Unit`. Computing a
+value and dropping it is usually a mistake, such as calling `String.trim` and
+expecting it to change the string. The program compiles, and the check
+`discarded-value` warns ([Warnings](README.md#warnings)):
 
-<!-- error: this expression's value has type 'Option Int' and is discarded; use it, or write 'let _ = ...' -->
+<!-- run -->
 ```kotlin
 fun main() {
-    let stack = [1, 2, 3]
-    Vec.pop(stack)
-    print(stack)
+    let line = "  hello  "
+    String.trim(line)
+    print("[" + line + "]")
 }
+```
+
+```text
+[  hello  ]
+```
+
+<!-- stderr -->
+```text
+Main.gob:3:5: warning: this expression's value has type 'String' and is discarded; use it, or write 'let _ = ...' [discarded-value]
+1 warning
 ```
 
 To drop a value on purpose, bind it to `_`:
@@ -110,7 +120,38 @@ fun main() {
 [1, 2]
 ```
 
-The rule applies to every statement of a block except the last one, to the
+A dropped `Option` or `Either`, or a dropped value of the monad of the
+[`?` block](do-notation.md) it is a statement of, is reported by the check
+`discarded-monadic-value` instead. Such a statement is most often a `?` left
+out: without it, `Int.parse(b)` below does not stop the block at a `None`.
+
+<!-- run -->
+```kotlin
+fun total(a : String, b : String) -> Option Int {
+    let x = Int.parse(a)?
+    Int.parse(b)
+    Some(x)
+}
+
+fun main() {
+    print(total("1", "two"))
+}
+```
+
+```text
+Some(1)
+```
+
+<!-- stderr -->
+```text
+Main.gob:3:5: warning: this expression's value has type 'Option Int', the monad of this block, and is discarded; write '?' after it to bind it, or 'let _ = ...' to drop it [discarded-monadic-value]
+1 warning
+```
+
+The two checks never report one statement, so `--allow discarded-value`
+leaves the dropped `Option`s and `Either`s reported.
+
+The checks apply to every statement of a block except the last one, to the
 last statement of the body of a `while`, `for` or `loop`, and to the last
 statement of an `if` without an `else`. An expression that never produces a
 value, such as `return` or a call to `error`, is not a discarded value.

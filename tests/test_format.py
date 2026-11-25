@@ -539,3 +539,47 @@ def test_parentheses_and_literals_stay_as_written(tmp_path: Path) -> None:
     target.write_text(source)
     result = run_format("--check", str(target))
     assert (result.returncode, result.stdout, result.stderr) == (0, "", "")
+
+
+def test_another_rows_block_comment_does_not_pad_a_row_past_the_width(tmp_path: Path) -> None:
+    # The comment on `A` widens the column of the arrows, which would carry `B`
+    # to 126 columns, so `B` leaves the run and `C` stays in it.
+    source = (
+        "fun f(e : E) -> Int {\n"
+        "\tmatch e {\n"
+        "\t\tA(n) {- a much longer block comment -} -> f(n)\n"
+        "\t\tB(n) -> someFunctionWithAFairlyLongNameThatTakesUpSpace(n, anotherArgumentHereXXXXXXXXX)\n"
+        "\t\tC(n) -> h(n)\n"
+        "\t}\n"
+        "}\n"
+    )
+    target = tmp_path / "padded.gob"
+    target.write_text(source)
+    result = run_format(str(target))
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == (
+        "fun f(e : E) -> Int {\n"
+        "\tmatch e {\n"
+        "\t\tA(n) {- a much longer block comment -} -> f(n)\n"
+        "\t\tB(n) -> someFunctionWithAFairlyLongNameThatTakesUpSpace(n, anotherArgumentHereXXXXXXXXX)\n"
+        "\t\tC(n)                                   -> h(n)\n"
+        "\t}\n"
+        "}\n"
+    )
+
+
+def test_an_arm_pattern_stays_flat_when_breaking_it_cannot_make_the_arm_fit(tmp_path: Path) -> None:
+    text = "a" * 110
+    source = (
+        "fun f(e : E) -> String {\n"
+        "\tmatch e {\n"
+        f"\t\tShort(n) -> \"{text}\"\n"
+        "\t\tOther(n) -> \"b\"\n"
+        "\t}\n"
+        "}\n"
+    )
+    target = tmp_path / "long_arm.gob"
+    target.write_text(source)
+    result = run_format(str(target))
+    assert result.returncode == 0, result.stderr
+    assert target.read_text() == source

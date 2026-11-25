@@ -38,6 +38,7 @@ export (
 	Decl(..),
 	Program(..),
 	patternVars,
+	isInert,
 	varPatterns,
 	laterOccurrences,
 	orPatterns,
@@ -51,6 +52,7 @@ export (
 	stmtChildren,
 	Completion(..),
 	completion,
+	returnCompletion,
 	stmtCompletion,
 	completes,
 	stmtStops,
@@ -220,6 +222,11 @@ type Expr = Expr {
 type ExprKind
 	--- A literal, and its text as written.
 	= ELit(Lit, String)
+	--- A string literal with holes, `"a${x}b"`: its pieces, one more than its
+	--- holes, each as its value and as written between its delimiters; and the
+	--- expression in each hole. `Turkey.Desugar` rewrites it into the
+	--- `String.Builder` calls it means, and no stage after it sees one.
+	| EInterp(Vec (String, String), Vec Expr)
 	| EUnit
 	--- The `Bool` is set when the compiler wrote this node itself to mean a
 	--- *class method* -- the `add` a `+` means. Resolution looks such a node up
@@ -602,10 +609,40 @@ type Program = Program {
 	--- desugaring may rewrite the block's transfers into values before
 	--- anything checks types.
 	letElses : Vec LetElse
+	-- The block each of these statements is in has the context's monad as
+	-- the head of its type, so `Turkey.Discards` reads the monad off the
+	-- block, and tells a monadic value left without its `?` from any other
+	-- discard.
+	--- The ids of the statements desugaring leaves in a do-context's own
+	--- sequence, other than the last. Empty until desugaring runs.
+	doStatements : Vec Int
 	--- The file's comments and blank lines, which no node holds; see
 	--- `Turkey.Lexer.Lexed`.
 	comments   : Vec Comment
 	blankLines : Vec Int
+}
+
+--- Returns whether evaluating `e` runs no code but the Prelude's, so that it
+--- does nothing but make its value: a literal, a negated literal, a name, a
+--- constructor, a function, or a tuple, array, record or constructor
+--- application of those. Every other expression may run code of the
+--- program's, such as an operator's or an index's method or the `show` of a
+--- hole in a string, and may print or panic.
+fun isInert(e : Expr) -> Bool = match e.kind {
+	ELit(_, _) | EUnit | EVar(_, _) | ECon(_) | ELambda(_, _, _, _) -> True
+	ETuple(xs) | EArray(xs)                                         -> Iter.all(xs, isInert)
+	ERecord(_, fields) -> Iter.all(fields, fun((_, x)) = isInert(x))
+	ECall(callee, args) -> match callee.kind {
+		ECon(_) -> Iter.all(args, isInert)
+		_       -> False
+	}
+	-- A literal is an `Int` or a `Float`, whose negation is the Prelude's.
+	EUnary("-", x, _) -> match x.kind {
+		ELit(_, _) -> True
+		_          -> False
+	}
+	EAnnot(x, _) | EParen(x) -> isInert(x)
+	_                        -> False
 }
 
 --- Every variable a pattern binds.
@@ -703,6 +740,7 @@ fun children(c : Child) -> Vec Child = match c {
 
 fun exprChildren(e : Expr) -> Vec Child = match e.kind {
 	ELit(_, _)                 -> []
+	EInterp(_, holes)          -> Vec.map(holes, ChExpr)
 	EUnit                      -> []
 	EVar(_, _)                 -> []
 	ECon(_)                    -> []
@@ -802,15 +840,17 @@ type Completion
 	| OrElse(Completion, Completion)
 
 --- Returns a formula that holds exactly when `e` can complete normally.
-fun completion(e : Expr) -> Completion {
-	let (ends, _) = reach(e)
-	ends
-}
+fun completion(e : Expr) -> Completion = reach(e).ends
 
 --- Returns a formula that holds exactly when `s` can complete normally.
-fun stmtCompletion(s : Stmt) -> Completion {
-	let (ends, _) = reachStmt(s)
-	ends
+fun stmtCompletion(s : Stmt) -> Completion = reachStmt(s).ends
+
+--- Returns a formula that holds exactly when a function whose body is `e` can
+--- return: when control can reach the end of `e`, or a `return` or a `?` in it
+--- that leaves the function.
+fun returnCompletion(e : Expr) -> Completion {
+	let r = reach(e)
+	orElse(r.ends, r.returns)
 }
 
 --- Evaluates a formula, with `returns` deciding each call.
@@ -828,10 +868,7 @@ fun stmtStops(s : Stmt) -> Bool = !completes(stmtCompletion(s), fun(_) = True)
 
 --- Whether the loop whose body is `body` can reach one of its own breaks,
 --- whatever the body's calls do.
-fun breaksOut(body : Expr) -> Bool {
-	let (_, breaks) = reach(body)
-	completes(breaks, fun(_) = True)
-}
+fun breaksOut(body : Expr) -> Bool = completes(reach(body).breaks, fun(_) = True)
 
 fun andThen(a : Completion, b : Completion) -> Completion = match a {
 	Stops     -> Stops
@@ -853,29 +890,40 @@ fun orElse(a : Completion, b : Completion) -> Completion = match a {
 	}
 }
 
--- Two formulas for `e`, each assuming control reaches its start: that it
--- reaches the end of `e`, and that it reaches a `break` leaving the innermost
--- loop around `e`. A loop completes exactly when one of its own breaks is
--- reached, so the second is what a loop asks of its body.
---
+-- Three formulas for an expression, each assuming control reaches its start:
+-- that it reaches the end (`ends`); that it reaches a `break` leaving the
+-- innermost loop around the expression (`breaks`); and that it reaches a
+-- `return`, or a `?` that does not unwrap, leaving the function
+-- (`returns`). A loop completes exactly when one of its own breaks is
+-- reached, so `breaks` is what a loop asks of its body. A function returns
+-- when its body ends or reaches a `return`, so `returns` is what
+-- `returnCompletion` asks of a body.
+type Reach = Reach { ends : Completion, breaks : Completion, returns : Completion }
+
+-- What reaches nothing past its end.
+let plain = Reach { ends = Completes, breaks = Stops, returns = Stops }
+
+-- What reaches nothing at all.
+let nowhere = Reach { ends = Stops, breaks = Stops, returns = Stops }
+
 -- Each node's formulas are built from its children's, not by threading a
 -- formula for "reached so far" through the walk: threading copies that formula
 -- into both branches of every `if`, and a run of `if`s would double it each
 -- time.
-fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
-	ELit(_, _)         -> (Completes, Stops)
-	EUnit              -> (Completes, Stops)
-	EVar(_, _)         -> (Completes, Stops)
-	ECon(_)            -> (Completes, Stops)
+fun reach(e : Expr) -> Reach = match e.kind {
+	ELit(_, _)         -> plain
+	EUnit              -> plain
+	EVar(_, _)         -> plain
+	ECon(_)            -> plain
 	ETuple(xs)         -> inOrder(Vec.map(xs, reach))
 	EArray(xs)         -> inOrder(Vec.map(xs, reach))
 	ERecord(_, fields) -> inOrder(Vec.map(fields, fun((_, value)) = reach(value)))
 	-- Making a function runs none of it, and its `return`s and `break`s are
 	-- its own.
-	ELambda(_, _, _, _) -> (Completes, Stops)
+	ELambda(_, _, _, _) -> plain
 	ECall(fn, args) -> {
-		let (ends, breaks) = inOrder(Vec.append([reach(fn)], Vec.map(args, reach)))
-		(andThen(ends, IfReturns(e)), breaks)
+		let r = inOrder(Vec.append([reach(fn)], Vec.map(args, reach)))
+		Reach { ends = andThen(r.ends, IfReturns(e)), breaks = r.breaks, returns = r.returns }
 	}
 	EIndex(arr, index, _, _) -> inOrder([reach(arr), reach(index)])
 	EField(obj, _)           -> reach(obj)
@@ -889,103 +937,115 @@ fun reach(e : Expr) -> (Completion, Completion) = match e.kind {
 		}
 	-- Grouping is not known yet, so with a short-circuiting operator anywhere
 	-- in the chain only the first operand is sure to run, and any operand's
-	-- `break` may be reached.
+	-- `break` or `return` may be reached.
 	EChain(operands, ops) -> {
 		let parts = Vec.map(operands, reach)
 		if Iter.any(ops, fun((op, _)) = op == "&&" || op == "||") {
-			let (ends, _) = parts[0]
 			var breaks = Stops
-			for (_, b) in parts { breaks = orElse(breaks, b) }
-			(ends, breaks)
+			var returns = Stops
+			for part in parts {
+				breaks = orElse(breaks, part.breaks)
+				returns = orElse(returns, part.returns)
+			}
+			Reach { ends = parts[0].ends, breaks = breaks, returns = returns }
 		} else {
 			inOrder(parts)
 		}
 	}
 	EAnnot(inner, _) -> reach(inner)
 	EIf(cond, then, otherwise) -> {
-		let (thenEnds, thenBreaks) = reach(then)
-		let (elseEnds, elseBreaks) = match otherwise {
-			Some(o) -> reach(o)
-			None    -> (Completes, Stops)
-		}
-		branch(reach(cond), orElse(thenEnds, elseEnds), orElse(thenBreaks, elseBreaks))
+		let t = reach(then)
+		let o = optReach(otherwise)
+		branch(reach(cond), either(t, o))
 	}
 	-- The body runs only once the condition does, and leaves the loop when the
 	-- condition is false, so the loop completes when the condition does.
-	-- Breaks in the body leave this loop and no other.
-	EWhile(cond, _)              -> reach(cond)
-	EForIn(_, iterable, _, _, _) -> reach(iterable)
-	EForC(init, cond, _, _) -> {
+	-- Breaks in the body leave this loop and no other, and its returns leave
+	-- the function.
+	EWhile(cond, body)              -> looped(reach(cond), [reach(body)])
+	EForIn(_, iterable, body, _, _) -> looped(reach(iterable), [reach(body)])
+	EForC(init, cond, step, body) -> {
 		let first = match init {
 			Some(s) -> reachStmt(s)
-			None    -> (Completes, Stops)
+			None    -> plain
 		}
-		inOrder([first, reach(cond)])
+		let steps = match step {
+			Some(s) -> [reach(body), reachStmt(s)]
+			None    -> [reach(body)]
+		}
+		looped(inOrder([first, reach(cond)]), steps)
 	}
 	ELoop(body) -> {
-		let (_, breaks) = reach(body)
-		(breaks, Stops)
+		let r = reach(body)
+		Reach { ends = r.breaks, breaks = Stops, returns = r.returns }
 	}
 	EMatch(scrutinee, arms) -> {
-		var ends = Stops
-		var breaks = Stops
+		var all = nowhere
 		for arm in arms {
 			-- A guard that is false goes on to a later arm, which this loop
 			-- counts on its own, so an arm reaches its end through its guards
 			-- and then its body.
 			let steps = Vec.map(arm.guards, fun(g) = reach(guardExpr(g)))
 			Vec.push(steps, reach(armBody(arm)))
-			let (armEnds, armBreaks) = inOrder(steps)
-			ends = orElse(ends, armEnds)
-			breaks = orElse(breaks, armBreaks)
+			all = either(all, inOrder(steps))
 		}
-		branch(reach(scrutinee), ends, breaks)
+		branch(reach(scrutinee), all)
 	}
 	-- As the guarded `match` it means: one arm through the conditions and
 	-- `then`, and one through `otherwise`.
 	EIfLet(conditions, then, otherwise) -> {
-		let (test, (armEnds, armBreaks)) = headReach(conditions, then)
-		let (elseEnds, elseBreaks) = optReach(otherwise)
-		branch(test, orElse(armEnds, elseEnds), orElse(armBreaks, elseBreaks))
+		let (test, arm) = headReach(conditions, then)
+		branch(test, either(arm, optReach(otherwise)))
 	}
 	-- As the `loop` around a `match` it means, whose other arm is a `break`:
 	-- the loop completes when a condition fails, and breaks in its head and
 	-- body leave this loop and no other.
 	EWhileLet(conditions, body) -> {
-		let (test, (armEnds, armBreaks)) = headReach(conditions, body)
-		let (_, breaks) = branch(test, armEnds, orElse(armBreaks, Completes))
-		(breaks, Stops)
+		let (test, arm) = headReach(conditions, body)
+		let r = branch(
+			test,
+			Reach {
+				ends    = arm.ends
+				breaks  = orElse(arm.breaks, Completes)
+				returns = arm.returns
+			},
+		)
+		Reach { ends = r.breaks, breaks = Stops, returns = r.returns }
 	}
 	EReturn(value) -> {
-		let (_, breaks) = optReach(value)
-		(Stops, breaks)
+		let r = optReach(value)
+		Reach { ends = Stops, breaks = r.breaks, returns = orElse(r.returns, r.ends) }
 	}
 	EBreak(value) -> {
-		let (ends, breaks) = optReach(value)
-		(Stops, orElse(breaks, ends))
+		let r = optReach(value)
+		Reach { ends = Stops, breaks = orElse(r.breaks, r.ends), returns = r.returns }
 	}
-	EContinue     -> (Stops, Stops)
+	EContinue     -> nowhere
 	EBlock(stmts) -> inOrder(Vec.map(stmts, reachStmt))
 	-- A `?` that does not unwrap leaves the function, and one that does
 	-- completes.
-	EQuestion(inner, _) -> reach(inner)
+	EQuestion(inner, _) -> {
+		let r = reach(inner)
+		Reach { ends = r.ends, breaks = r.breaks, returns = orElse(r.returns, r.ends) }
+	}
 	-- A `do` block is evaluated as a value of its monad, and a `break` cannot
 	-- cross into one.
-	EDo(_)        -> (Completes, Stops)
-	EParen(inner) -> reach(inner)
+	EDo(_)            -> plain
+	EParen(inner)     -> reach(inner)
+	EInterp(_, holes) -> inOrder(Vec.map(holes, reach))
 }
 
-fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
+fun reachStmt(s : Stmt) -> Reach = match s.kind {
 	SLet(_, value)         -> reach(value)
 	SVar(_, value)         -> reach(value)
-	SFun(_)                -> (Completes, Stops)
+	SFun(_)                -> plain
 	SAssign(target, value) -> inOrder([reach(value), reach(target)])
 	SExpr(e)               -> reach(e)
 	-- The value, and then either the pattern matches and the statement
 	-- completes, or the `else` block runs.
 	SLetElse(_, _, value, otherwise) -> {
-		let (_, elseBreaks) = reach(otherwise)
-		branch(reach(value), Completes, elseBreaks)
+		let r = reach(otherwise)
+		branch(reach(value), Reach { ends = Completes, breaks = r.breaks, returns = r.returns })
 	}
 }
 
@@ -994,11 +1054,8 @@ fun reachStmt(s : Stmt) -> (Completion, Completion) = match s.kind {
 -- and those of the arm: every later condition in order, and then `body`. When
 -- the list begins with a test, the arm matches `()` and every condition is a
 -- step of it.
-fun headReach(conditions : Vec Condition, body : Expr) -> (
-	(Completion, Completion),
-	(Completion, Completion),
-) {
-	var test = (Completes, Stops)
+fun headReach(conditions : Vec Condition, body : Expr) -> (Reach, Reach) {
+	var test = plain
 	let steps = Vec.new(len(conditions) + 1)
 	for var i = 0; i < len(conditions); i = i + 1 {
 		match conditions[i] {
@@ -1014,43 +1071,61 @@ fun headReach(conditions : Vec Condition, body : Expr) -> (
 	(test, inOrder(steps))
 }
 
-fun optReach(e : Option Expr) -> (Completion, Completion) = match e {
+fun optReach(e : Option Expr) -> Reach = match e {
 	Some(x) -> reach(x)
-	None    -> (Completes, Stops)
+	None    -> plain
 }
 
 -- Parts that run one after another: the whole completes when every part does,
--- and a `break` is reached in a part once every part before it has completed.
-fun inOrder(parts : Vec (Completion, Completion)) -> (Completion, Completion) {
+-- and a `break` or `return` is reached in a part once every part before it has
+-- completed.
+fun inOrder(parts : Vec Reach) -> Reach {
 	var ends = Completes
 	var breaks = Stops
-	-- From the last part back, so each `break` formula is built once rather
-	-- than repeating the prefix before it.
+	var returns = Stops
+	-- From the last part back, so each `break` and `return` formula is built
+	-- once rather than repeating the prefix before it.
 	for var i = len(parts) - 1; i >= 0; i = i - 1 {
-		let (partEnds, partBreaks) = parts[i]
-		breaks = orElse(partBreaks, andThen(partEnds, breaks))
-		ends = andThen(partEnds, ends)
+		let part = parts[i]
+		breaks = orElse(part.breaks, andThen(part.ends, breaks))
+		returns = orElse(part.returns, andThen(part.ends, returns))
+		ends = andThen(part.ends, ends)
 	}
-	(ends, breaks)
+	Reach { ends = ends, breaks = breaks, returns = returns }
+}
+
+-- One of two branches, either of which may be taken.
+fun either(a : Reach, b : Reach) -> Reach = Reach {
+	ends    = orElse(a.ends, b.ends)
+	breaks  = orElse(a.breaks, b.breaks)
+	returns = orElse(a.returns, b.returns)
 }
 
 -- A test, then one of several branches whose formulas are already combined.
-fun branch(test : (Completion, Completion), ends : Completion, breaks : Completion) -> (
-	Completion,
-	Completion,
-) {
-	let (testEnds, testBreaks) = test
-	(andThen(testEnds, ends), orElse(testBreaks, andThen(testEnds, breaks)))
+fun branch(test : Reach, then : Reach) -> Reach = Reach {
+	ends    = andThen(test.ends, then.ends)
+	breaks  = orElse(test.breaks, andThen(test.ends, then.breaks))
+	returns = orElse(test.returns, andThen(test.ends, then.returns))
+}
+
+-- A loop's head, which decides whether to go round again, and then the steps
+-- of its body. The loop completes when the head does, its breaks are the
+-- head's, and a `return` in the body leaves the function once the head has
+-- completed.
+fun looped(head : Reach, body : Vec Reach) -> Reach {
+	let inside = inOrder(body)
+	Reach {
+		ends    = head.ends
+		breaks  = head.breaks
+		returns = orElse(head.returns, andThen(head.ends, inside.returns))
+	}
 }
 
 -- `left`, and then `right` only sometimes, as `&&` and `||` run it.
-fun orSkip(left : (Completion, Completion), right : (Completion, Completion)) -> (
-	Completion,
-	Completion,
-) {
-	let (leftEnds, leftBreaks) = left
-	let (_, rightBreaks) = right
-	(leftEnds, orElse(leftBreaks, andThen(leftEnds, rightBreaks)))
+fun orSkip(left : Reach, right : Reach) -> Reach = Reach {
+	ends    = left.ends
+	breaks  = orElse(left.breaks, andThen(left.ends, right.breaks))
+	returns = orElse(left.returns, andThen(left.ends, right.returns))
 }
 
 --- What a `let ... else` leaves for the stages after the parser. See
@@ -1113,12 +1188,13 @@ fun sketchName(name : String) -> String =
 	if String.startsWith(name, shorthandPrefix) { "$x" } else { name }
 
 fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
-	ELit(l, _)    -> (literalText(l), 8)
-	EUnit         -> ("()", 8)
-	EVar(name, _) -> (sketchName(name), 8)
-	ECon(name)    -> (name, 8)
-	ETuple(xs)    -> ("(" + sketchList(xs) + ")", 8)
-	EArray(xs)    -> ("[" + sketchList(xs) + "]", 8)
+	ELit(l, _)             -> (literalText(l), 8)
+	EInterp(pieces, holes) -> (sketchInterp(pieces, holes), 8)
+	EUnit                  -> ("()", 8)
+	EVar(name, _)          -> (sketchName(name), 8)
+	ECon(name)             -> (name, 8)
+	ETuple(xs)             -> ("(" + sketchList(xs) + ")", 8)
+	EArray(xs)             -> ("[" + sketchList(xs) + "]", 8)
 	ERecord(name, fields) -> {
 		let shown = Vec.map(fields, fun((f, v)) = f + " = " + sketchAt(v, 0))
 		(name + " { " + String.join(shown, ", ") + " }", 8)
@@ -1154,6 +1230,19 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
 	_                -> ("...", 8)
 }
 
+-- `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that builds
+-- this file does not know the `\$` escape.
+fun sketchInterp(pieces : Vec (String, String), holes : Vec Expr) -> String {
+	let b = String.builder()
+	String.push(b, "\"")
+	for var i = 0; i < len(pieces); i = i + 1 {
+		if i > 0 { String.push(b, "\u{24}{" + sketchAt(holes[i - 1], 0) + "}") }
+		String.push(b, pieces[i].1)
+	}
+	String.push(b, "\"")
+	String.build(b)
+}
+
 -- -- type and pattern parentheses -----------------------------------------------------
 
 --- Removes every `TEParen` and `PParen` in `p`. The node of the parentheses
@@ -1169,9 +1258,10 @@ fun removeTypeAndPatternParens(p : Program) -> Unit {
 		exportDecl = _
 		imports    = _
 		decls
-		letElses   = _
-		comments   = _
-		blankLines = _
+		letElses     = _
+		doStatements = _
+		comments     = _
+		blankLines   = _
 	} = p
 	for d in decls {
 		match d {
@@ -1346,7 +1436,8 @@ fun plainExpr(e : Expr) -> Unit {
 		| EBlock(_)
 		| EQuestion(_, _)
 		| EDo(_)
-		| EParen(_) -> {}
+		| EParen(_)
+		| EInterp(_, _) -> {}
 	}
 	for c in exprChildren(e) { plainChild(c) }
 }

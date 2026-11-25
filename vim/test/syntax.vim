@@ -102,6 +102,16 @@ call s:Probe('escapes', -1, 'turkeyString')
 call s:Probe('u{1F600}', 0, 'turkeyEscape')    " the string's escape this time
 call s:Probe('}{', 0, 'turkeyString')          " braces inside a string
 call s:Probe('not a comment', -6, 'turkeyString')
+call s:Probe('sum ', 0, 'turkeyString')
+call s:Probe('\${tricky', 0, 'turkeyHoleDelimiter')
+call s:Probe('+ "in', 0, 'turkeyOperator')      " code inside a hole
+call s:Probe('"in', 0, 'turkeyString')          " a string inside a hole
+call s:Probe('ch}', 0, 'turkeyIdentifier')      " a hole inside that string
+call s:Probe('"} and', 2, 'turkeyString')       " back in the outer string
+call s:Probe('Some {', 0, 'turkeyConstructor')
+call s:Probe('}.x', 2, 'turkeyIdentifier')
+call s:Probe('\\\$', 0, 'turkeyEscape')
+call s:Probe('\$"', 0, 'turkeyString')          " a lone `$` is text
 call s:Probe('\\_', 0, 'turkeyOperator')       " a placeholder function
 call s:Probe('\<for\>', 0, 'turkeyRepeat')
 call s:Probe('\<in\>', 0, 'turkeyRepeat')

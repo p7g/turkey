@@ -71,8 +71,10 @@ documented
 A doc comment anywhere else documents nothing, and is an ordinary comment: one
 cut off from its declaration by a blank line, a run between the module's
 comment and its first declaration that is not directly above that declaration,
-one above a statement in a body, or one that follows code on its line. A run
-of bare `---` lines says nothing, and documents nothing either.
+one above a statement in a body, or one that follows code on its line. The
+check `detached-doc-comment` warns about each of these
+([Warnings](README.md#warnings)). A run of bare `---` lines says nothing, and
+documents nothing either.
 
 ## Identifiers
 
@@ -284,13 +286,23 @@ with no prefix, separator, exponent or leading zero.
 ### String literals
 
 ```ebnf
-STRING ::= '"' ( character | escape )* '"'
-escape ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex{1,6} "}"
+STRING ::= '"' ( character | escape | hole )* '"'
+escape ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\$" | "\u{" hex{1,6} "}"
+hole   ::= "${" expression "}"
 ```
 
 A string literal is written in double quotes and cannot span lines. Its value
 is a `String`: an immutable sequence of bytes that is always valid UTF-8
 ([Types](types.md#string)).
+
+`${` opens a *hole*, which holds an expression and ends at the `}` that
+matches it, so braces inside the expression nest. The expression is made of
+ordinary tokens, and it may contain string literals with holes of their own.
+Like the rest of the literal, a hole cannot span lines. What a hole means is
+in [String interpolation](expressions.md#string-interpolation).
+
+A `$` that is not followed by `{` is an ordinary character, so `"$5"` needs no
+escape. `\$` writes a `$` anywhere, and is needed only to write `${` itself.
 
 The escapes are:
 
@@ -303,6 +315,7 @@ The escapes are:
 | `\\` | backslash |
 | `\"` | double quote |
 | `\'` | single quote |
+| `\$` | dollar sign |
 | `\u{H}` | the Unicode scalar value with hexadecimal code `H`, one to six digits |
 
 `\u{...}` must name a Unicode scalar value. That excludes the surrogates
@@ -318,6 +331,18 @@ fun main() {
 
 ```text
 tab:	| quote:" | smile:😀
+```
+
+<!-- run -->
+```kotlin
+fun main() {
+    let total = 5
+    print("cost: $${total}, written \${total}")
+}
+```
+
+```text
+cost: $5, written ${total}
 ```
 
 <!-- error: is a surrogate, and a character or string cannot contain one -->

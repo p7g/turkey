@@ -566,6 +566,43 @@ def test_a_long_list(stress):
     assert result.stdout == ("2001000\n" if stress else "500000500000\n")
 
 
+# A list kept live while lists as long are built and dropped, round after
+# round: a live set of about 20 MB, under a heap allowed to grow by twice that
+# between collections.
+KEPT_UNDER_CHURN = """\
+import System.Env as Env
+
+type Chain = Link(Int, Chain) | End
+
+fun build(n : Int, acc : Chain) -> Chain = if n == 0 { acc } else { build(n - 1, Link(n, acc)) }
+
+fun total(xs : Chain, acc : Int) -> Int = match xs {
+    End -> acc
+    Link(x, rest) -> total(rest, acc + x)
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    let kept = build(n, End)
+    var sum = 0
+    for var round = 0; round < 20; round = round + 1 { sum = sum + total(build(n, End), 0) }
+    print(sum + total(kept, 0))
+}
+"""
+
+
+def test_an_allocation_that_finds_no_memory_collects_and_tries_again():
+    """Under a 64 MiB memory, the heap's threshold outgrows what is left before
+    the live set does: the allocation that then fails must collect
+    everything and succeed, not panic. Without that it needs over 96 MiB."""
+    result = _run(KEPT_UNDER_CHURN, "600000", engine=("-W", "max-memory-size=67108864"))
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "3780006300000\n"
+
+
 # A tail-recursive loop whose lambda captures variables and is passed on, so
 # it escapes: every iteration allocates a closure and its environment, 46 MB
 # over a million, which the collector frees as it goes.
@@ -736,6 +773,30 @@ def test_a_deep_trace_is_shortened():
     assert lines[50] == "  ... 19 more frames"
     assert lines[51:65] == ["  at down (Main.gob:1:69)"] * 14
     assert lines[65:] == ["  at main (Main.gob:3:20)"]
+
+
+# -- the scheduler --------------------------------------------------------------------
+
+# Step `i` adds the results of the two steps before it. On one worker the steps
+# run in turn on the program's own stack, and each waits for a ready step in
+# `Turkey.Scheduler.waitOn`, whose other arm switches to a coroutine's stack:
+# the arm wasm cannot build must be removed, not the whole function.
+GRAPH = """\
+import System.Parallel as Parallel
+
+fun main() {
+    let steps = Parallel.graph(30, fun(i) = if i < 2 { [] } else { [i - 1, i - 2] }, fun(i, finished) {
+        if i < 2 { i } else { finished(i - 1) + finished(i - 2) }
+    })
+    print(steps[29])
+}
+"""
+
+
+@both
+def test_a_dependency_graph_runs_on_one_worker(stress):
+    result = _run(GRAPH, stress=stress)
+    assert (result.returncode, result.stdout) == (0, "514229\n"), result.stderr
 
 
 # -- the build ------------------------------------------------------------------------

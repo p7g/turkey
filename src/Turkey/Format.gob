@@ -290,7 +290,7 @@ fun reinsert(f : F, all : Vec Comment, out : String, pads : Vec P.Pad) -> Either
 			pad.col = pad.col + moved
 		}
 	}
-	let joined = String.join(P.realigned(outLines, pads), "\n")
+	let joined = String.join(P.realigned(outLines, pads, width), "\n")
 	Right(
 		if String.endsWith(out, "\n") && !String.endsWith(joined, "\n") {
 			joined + "\n"
@@ -1857,12 +1857,13 @@ fun exprAt(f : F, e : Expr, depth : Int) -> Doc {
 }
 
 fun exprKind(f : F, e : Expr, depth : Int) -> Doc = match e.kind {
-	ELit(_, spelled) -> P.raw(spelled)
-	EUnit            -> P.text("()")
-	EVar(name, _)    -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
-	ECon(name)       -> P.text(name)
-	ETuple(xs)       -> list(f, tokenFrom(f, startOf(e.span)), "(", ")", exprEntries(f, xs))
-	EArray(xs)       -> arrayDoc(f, e, xs)
+	ELit(_, spelled)       -> P.raw(spelled)
+	EInterp(pieces, holes) -> interpolation(f, pieces, holes)
+	EUnit                  -> P.text("()")
+	EVar(name, _) -> P.text(if String.startsWith(name, shorthandPrefix) { "_" } else { name })
+	ECon(name)             -> P.text(name)
+	ETuple(xs)             -> list(f, tokenFrom(f, startOf(e.span)), "(", ")", exprEntries(f, xs))
+	EArray(xs)             -> arrayDoc(f, e, xs)
 	ERecord(name, fields) -> {
 		let open = findToken(f, startOf(e.span), "{")
 		let items = Vec.map(fields, fun((field, value)) = Field {
@@ -2169,10 +2170,13 @@ fun arrayDoc(f : F, e : Expr, xs : Vec Expr) -> Doc {
 	let open = tokenFrom(f, startOf(e.span))
 	if len(xs) == 0
 			|| !Iter.all(xs, isLiteral)
+			|| !sharesLine(xs)
 			|| hasCommentIn(f, startOf(e.span), closerOf(e.span)) {
 		return list(f, open, "[", "]", exprEntries(f, xs))
 	}
-	-- An array of literals is a table, filled a line at a time.
+	-- An array of literals whose source puts some two items on one line is a
+	-- table, filled a line at a time. One whose source has an item to a line
+	-- stays a list, since its author laid it out that way.
 	let items = Vec.map(xs, exprDoc(f, _))
 	let filled = []
 	for var i = 0; i < len(items); i = i + 1 { Vec.push(filled, P.cat([items[i], P.text(",")])) }
@@ -2184,6 +2188,31 @@ fun arrayDoc(f : F, e : Expr, xs : Vec Expr) -> Doc {
 	])
 	if opensLine(f, open) { return P.forced(broken) }
 	P.group(P.ifBreak(broken, P.cat([P.text("["), joined(items, P.text(", ")), P.text("]")])))
+}
+
+-- A string literal cannot hold a line break, so each hole is printed flat and
+-- the literal on one line, however long. A hole that begins with a comment
+-- keeps a space after its `${`, which would otherwise read as `{-` opening
+-- one. `\u{24}` is `$`, spelled so because the compiler in `bootstrap/` that
+-- builds this file does not know `\$`.
+fun interpolation(f : F, pieces : Vec (String, String), holes : Vec Expr) -> Doc {
+	let parts = [P.raw("\"" + pieces[0].1)]
+	for var i = 0; i < len(holes); i = i + 1 {
+		let after = if i + 1 == len(holes) { "\"" } else { "" }
+		let comment = len(Map.getOr(f.inlineBefore, positionKey(holes[i].span), [])) > 0
+		Vec.push(parts, P.raw(if comment { "\u{24}{ " } else { "\u{24}{" }))
+		Vec.push(parts, P.flat(exprDoc(f, holes[i])))
+		Vec.push(parts, P.raw("}" + pieces[i + 1].1 + after))
+	}
+	P.cat(parts)
+}
+
+-- Whether two neighbors of `xs` start on the same source line.
+fun sharesLine(xs : Vec Expr) -> Bool {
+	for var i = 1; i < len(xs); i = i + 1 {
+		if xs[i].span.line == xs[i - 1].span.line { return True }
+	}
+	False
 }
 
 fun isLiteral(e : Expr) -> Bool = match e.kind {
@@ -2253,7 +2282,11 @@ fun chainDoc(f : F, t : Tree, depth : Int) -> Doc = match t {
 				}
 				Vec.push(rest, P.cat([above, spaced, P.line, operand]))
 			} else {
-				Vec.push(rest, P.cat([above, P.line, here, P.text(op + " "), operand]))
+				let following = P.cat([here, P.text(op + " "), operand])
+				-- With one operator, it follows the closing bracket that ends a
+				-- broken left operand on that line.
+				let gap = if len(ops) == 1 { P.afterClosers(following) } else { P.line }
+				Vec.push(rest, P.cat([above, gap, following]))
 			}
 		}
 		P.group(P.cat([first, P.nest(depth, P.cat(rest))]))

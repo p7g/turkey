@@ -11,6 +11,7 @@ import Net.HTTP.Server as Server
 import Net.HTTP.Server (Respond, Done, respond, failed)
 import Net.TCP as TCP
 import Net.HTTP.Client (Client, Received(..), exchange, next, send, sendUnbounded, sendUpgrade, redirect, expectStatus, retryAllowed)
+import Net.HTTP.Cookie as Cookie
 import Net.HTTP.Credentials as Credentials
 import Net.HTTP.Headers as Headers
 import Net.HTTP.HeaderName as HeaderName
@@ -261,7 +262,7 @@ fun rule() {
 fun redirects() {
     let other = plain(fun(s) = ok("other got " + s.method + " " + s.path + ", authorization "
                                   + show(Headers.has(s.headers, Authorization))
-                                  + ", cookie " + show(Headers.has(s.headers, HeaderName.literal("cookie")))))
+                                  + ", cookie " + show(Headers.has(s.headers, Cookie))))
     let p = plain(fun(s) = match s.path {
         "/loop" -> redirectTo("302 Found", "/loop")
         "/a" -> redirectTo("302 Found", "/b")
@@ -274,7 +275,8 @@ fun redirects() {
         "/same" -> redirectTo("302 Found", "/landed")
         "/file" -> redirectTo("302 Found", "file:///etc/passwd")
         "/nowhere" -> reply(response("302 Found", [], ""), Keep)
-        "/landed" -> ok("landed, authorization " + show(Headers.has(s.headers, Authorization)))
+        "/landed" -> ok("landed, authorization " + show(Headers.has(s.headers, Authorization))
+                        + ", cookie " + show(Headers.has(s.headers, Cookie)))
         _ -> ok(s.method + " " + s.path + " [" + s.body + "]")
     })
     scenario([p, other], fun() {
@@ -293,9 +295,9 @@ fun redirects() {
         print(fetch(c, request(newPUT("put"), url(p, "/keep308"))))
         print(fetch(c, request(HEAD, url(p, "/c"))))
         let creds = Option.expect(Credentials.bearer("secret"), "a token")
-        let cookie = HeaderValue.literal("session=1")
+        let cookie = Option.expect(Cookie.pair("session", "1"), "a cookie")
         let withCreds = fun(path) =
-            withHeaders(request(GET, url(p, path)), combine(field(Authorization, creds), field(HeaderName.literal("cookie"), cookie)))
+            withHeaders(request(GET, url(p, path)), combine(field(Authorization, creds), field(Cookie, [cookie])))
         -- Same host, another port: credentials are dropped.
         print(fetch(c, withCreds("/away")))
         print(fetch(c, withCreds("/same")))
@@ -309,6 +311,33 @@ fun redirects() {
         print(fetch(named, request(GET, byName("/same"))))
         print(fetch(named, request(GET, byName("/away"))))
         Client.close(named)
+    })
+}
+
+-- A request's `Cookie` header, as the peer reads it off the wire.
+fun cookies() {
+    let p = plain(fun(s) {
+        let typed = match Headers.get(s.headers, Cookie) {
+            Some(pairs) -> Cookie.pairsToString(pairs)
+            None -> "none"
+        }
+        let wire = match Headers.get(s.headers, HeaderName.literal("cookie")) {
+            Some(text) -> show(text)
+            None -> "none"
+        }
+        ok("typed " + typed + ", wire " + wire + ", set-cookie " + show(Headers.has(s.headers, SetCookie)))
+    })
+    scenario([p], fun() {
+        let c = clientOf(local())
+        let pair = fun(n, v) = Option.expect(Cookie.pair(n, v), n)
+        let get = fun(hs) = fetch(c, withHeaders(request(GET, url(p, "/")), hs))
+        print(get(Headers.empty))
+        print(get(field(Cookie, [pair("session", "abc123")])))
+        print(get(field(Cookie, [pair("a", "1"), pair("b", "\"two\"")])))
+        -- A second `Cookie` field replaces the first: there is one field.
+        print(get(field(Cookie, [pair("a", "1")]) <> field(Cookie, [pair("b", "2")])))
+        print(show(Cookie.pair("a b", "1")) + " " + show(Cookie.pair("a", "1;2")))
+        Client.close(c)
     })
 }
 
@@ -759,6 +788,7 @@ fun run(name : String, dir : String) = match name {
     "retry" -> retry()
     "rule" -> rule()
     "redirects" -> redirects()
+    "cookies" -> cookies()
     "policy" -> policy()
     "deadlines" -> deadlines()
     "early" -> early()

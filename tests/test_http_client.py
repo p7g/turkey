@@ -144,13 +144,24 @@ SCENARIOS = {
         # Another port of the same host: credentials dropped. The same
         # origin: kept.
         "200 other got GET /landed, authorization False, cookie False",
-        "200 landed, authorization True",
+        "200 landed, authorization True, cookie True",
         "error NotSent(BadRedirect(BadTarget(unsupported URL scheme 'file')))",
         # No Location: not followed.
         "302 ",
         # Each hop goes through the policy again.
-        "200 landed, authorization False",
+        "200 landed, authorization False, cookie False",
         "error NotSent(Transport(Forbidden))",
+    ],
+    "cookies": [
+        # No pair, no field.
+        "200 typed none, wire none, set-cookie False",
+        "200 typed session=abc123, wire session=abc123, set-cookie False",
+        # Pairs go on one line, a quoted value with its quotes.
+        '200 typed a=1; b="two", wire a=1; b="two", set-cookie False',
+        # A second field replaces the first, so there is still one.
+        "200 typed b=2, wire b=2, set-cookie False",
+        # A name that is not a token and a value with `;` make no pair.
+        "None None",
     ],
     "policy": [
         "error NotSent(Transport(Forbidden))",

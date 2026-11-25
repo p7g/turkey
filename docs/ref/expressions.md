@@ -699,6 +699,113 @@ is an `Array`, because `for` accepts either and nothing else decides.
 > always an array either: it is whichever of `Array` and `Vec` the program uses
 > it as, so it also stands for `vec![a, b]`.
 
+## String interpolation
+
+**Syntax**
+
+```ebnf
+interpolation ::= '"' ( character | escape | "${" expression "}" )* '"'
+```
+
+A string literal with holes builds a `String` from its text and the values of
+its holes. Each hole holds exactly one expression, of any type with a
+[`Show`](builtins.md#show-and-printing) instance, and contributes `show` of its
+value. `show` of a `String` is the string itself, so a string goes in without
+quotes. The holes are evaluated once each, left to right, and the literal's
+type is always `String`.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let year = 2026
+    let day = 3
+    print("https://adventofcode.com/${year}/day/${day}/input")
+    let moons = [("Mars", 2), ("Venus", 0)]
+    for (planet, n) in moons {
+        print("${planet} has ${n} moon${if n == 1 { "" } else { "s" }}")
+    }
+}
+```
+
+```text
+https://adventofcode.com/2026/day/3/input
+Mars has 2 moons
+Venus has 0 moons
+```
+
+**A hole has no format specification, and never will.** There is no
+`${x:>5}`, no `%05d`, and no second argument after a comma. To control how a
+value is written, call a function in the hole: the formatting is then an
+ordinary expression, checked and named like any other.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let n = 7
+    print("[${String.padStart(show(n), 3, '0')}] [${String.padEnd("ab", 4, '.')}]")
+}
+```
+
+```text
+[007] [ab..]
+```
+
+A literal with holes is approximately equivalent to building the string with
+a `String.Builder`: one push for each piece of text, and
+one push of `show(e)` for each hole `e`. `"a${x}b${y}"` is approximately
+
+```ebnf
+{
+    let $b = String.builder()
+    String.push($b, "a")
+    String.push($b, show(x))
+    String.push($b, "b")
+    String.push($b, show(y))
+    String.build($b)
+}
+```
+
+where `show` and the `String` functions are always the Prelude's, whatever the
+module itself defines under those names.
+
+Each hole is a boundary of a
+[placeholder function](declarations.md#placeholder-functions), as an array
+element is: `"#${_}"` is the function `fun(x) = "#${x}"`.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Array.map([1, 2, 3], "#${_}"))
+}
+```
+
+```text
+["#1", "#2", "#3"]
+```
+
+A value with no `Show` instance cannot go in a hole:
+
+<!-- error: no instance for 'Show (fun(_a) -> _a)' -->
+```kotlin
+fun main() {
+    print("${fun(x) = x}")
+}
+```
+
+A string literal with holes cannot be a [pattern](patterns.md); a pattern
+matches only a literal without one.
+
+<!-- error: a string literal with a hole cannot be a pattern -->
+```kotlin
+fun main() {
+    let n = 2
+    match "2" {
+        "${n}" -> print("two")
+        _      -> print("other")
+    }
+}
+```
+
 ## Blocks
 
 A [block](statements.md#blocks), `{ ... }`, is an expression whose value is

@@ -7,6 +7,7 @@ export (
 	raw,
 	line,
 	softline,
+	afterClosers,
 	hard,
 	cat,
 	nest,
@@ -65,6 +66,10 @@ type Doc
 	| Shifted(String, String)
 	-- A break: a newline in a broken group, and this text in a flat one.
 	| Line(String)
+	-- A space after a line of closing brackets alone when `rest`, which follows
+	-- it, starts on that line without passing the width. Else a break. A space
+	-- in a flat group.
+	| Join(Doc)
 	| Hard
 	-- The parts, and whether any of them is hard.
 	| Cat(Vec Doc, Bool)
@@ -122,6 +127,12 @@ let line = Line(" ")
 
 --- A break that is nothing when flat.
 let softline = Line("")
+
+--- Returns a break that is a space when flat, and in a broken group a space
+--- if the line before it holds only closing brackets and the head of `rest`,
+--- the document that follows, fits after it. Otherwise it is a newline. So an
+--- operator follows the `]` or `)` that ends its left operand.
+fun afterClosers(rest : Doc) -> Doc = Join(rest)
 
 --- A newline, which breaks every group around it. Inside `flat` it is a
 --- space.
@@ -199,7 +210,7 @@ fun isEmpty(d : Doc) -> Bool = match d {
 
 --- Returns whether `d` cannot be laid out on one line.
 fun isHard(d : Doc) -> Bool = match d {
-	Empty | Text(_, _) | Line(_)                          -> False
+	Empty | Text(_, _) | Line(_) | Join(_)                -> False
 	Raw(s) | Shifted(s, _)                                -> String.contains(s, "\n")
 	Hard | Suffix(_, _) | Rows(_) | Below(_, _) | Tail(_) -> True
 	Cat(_, h)                                             -> h
@@ -216,6 +227,7 @@ fun isHard(d : Doc) -> Bool = match d {
 fun breakable(d : Doc) -> Bool = match d {
 	Empty | Text(_, _) | Raw(_) | Shifted(_, _) | Suffix(_, _) | Flat(_) -> False
 	Line(_)
+	| Join(_)
 	| Hard
 	| Group(_, _)
 	| IfBreak(_, _)
@@ -354,8 +366,10 @@ fun renderPadded(d : Doc, width : Int) -> (Vec String, Vec Pad) {
 --- then what the pad aligns, at one column after the widest text and notes.
 --- Between the widest of those and what it aligns is the pad's least, none
 --- for `Tokens` and a space for `Suffixes`. `Tokens` pads are set before
---- `Suffixes` pads, which they move. Updates `pads` to match.
-fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
+--- `Suffixes` pads, which they move. A `Tokens` pad with no notes whose line
+--- the column of notes would carry past `width` leaves its run, as it does
+--- in `renderPadded`, and is not padded. Updates `pads` to match.
+fun realigned(lines : Vec String, pads : Vec Pad, width : Int) -> Vec String {
 	let out = Vec.slice(lines, 0, len(lines))
 	let onLine : Map Int (Vec Pad) = Map.new()
 	for pad in pads {
@@ -383,16 +397,56 @@ fun realigned(lines : Vec String, pads : Vec Pad) -> Vec String {
 			} else {
 				" " + String.join(pad.notes, " ")
 			}
+			-- The columns of the line of `pad` after the pad, up to the suffixes
+			-- that end it, which do not count toward the width.
+			let after = fun(pad : Pad) {
+				let cs = String.toCodePoints(out[pad.line - 1])
+				var stop = len(cs)
+				for other in Map.getOr(onLine, pad.line, []) {
+					if isSuffixes(other.kind) && other.col >= pad.col + pad.width {
+						stop = if other.col < stop { other.col } else { stop }
+					}
+				}
+				columns(String.fromCodePoints(Array.slice(cs, pad.col + pad.width, stop)))
+			}
+			let kept = Vec.filled(len(run), True)
 			var widest = 0
-			for pad in run { widest = larger(widest, before(pad)) }
-			var widestNoted = widest
-			for pad in run { widestNoted = larger(widestNoted, widest + columns(noted(pad))) }
-			for pad in run {
+			var widestNoted = 0
+			var dropped = True
+			-- Dropping a pad can only narrow the run, so this ends.
+			while dropped {
+				dropped = False
+				widest = 0
+				for var k = 0; k < len(run); k = k + 1 {
+					if kept[k] { widest = larger(widest, before(run[k])) }
+				}
+				widestNoted = widest
+				for var k = 0; k < len(run); k = k + 1 {
+					if kept[k] {
+						widestNoted = larger(widestNoted, widest + columns(noted(run[k])))
+					}
+				}
+				for var k = 0; k < len(run); k = k + 1 {
+					if !suffixes
+							&& kept[k]
+							&& len(run[k].notes) == 0
+							&& widestNoted + after(run[k]) > width {
+						kept[k] = False
+						dropped = True
+					}
+				}
+			}
+			for var k = 0; k < len(run); k = k + 1 {
+				let pad = run[k]
 				let least = if suffixes { 1 } else { 0 }
 				let notes = noted(pad)
-				let filled = String.repeat(" ", widest - before(pad))
-					+ notes
-					+ String.repeat(" ", widestNoted - widest - columns(notes) + least)
+				let filled = if kept[k] {
+					String.repeat(" ", widest - before(pad))
+						+ notes
+						+ String.repeat(" ", widestNoted - widest - columns(notes) + least)
+				} else {
+					""
+				}
 				let cs = String.toCodePoints(out[pad.line - 1])
 				out[pad.line - 1] = String.fromCodePoints(Array.slice(cs, 0, pad.col))
 					+ filled
@@ -543,6 +597,20 @@ fun layout(p : P, start : Cmd) -> Unit {
 				Breaking -> newline(p, indent)
 				_        -> emit(p, whenFlat, String.codePointCount(whenFlat))
 			}
+			Join(rest) -> match mode {
+				Breaking ->
+					if closersOnly(p)
+							&& fits(
+								p,
+								Cmd { indent = indent, mode = Breaking, doc = rest },
+								stack,
+							) {
+						emit(p, " ", 1)
+					} else {
+						newline(p, indent)
+					}
+				_ -> emit(p, " ", 1)
+			}
 			Hard -> match mode {
 				Squashing -> emit(p, " ", 1)
 				_         -> newline(p, indent)
@@ -601,6 +669,21 @@ fun layout(p : P, start : Cmd) -> Unit {
 			}
 		}
 	}
+}
+
+-- Whether the line being written holds nothing but closing brackets, and no
+-- suffix waits to end it.
+fun closersOnly(p : P) -> Bool {
+	if len(p.pending) > 0 { return False }
+	var any = False
+	for c in String.codePoints(String.join(p.parts, "")) {
+		if c == ')' || c == ']' || c == '}' {
+			any = True
+		} else if c != '\t' && c != ' ' && Char.toInt(c) < markBase {
+			return False
+		}
+	}
+	any
 }
 
 -- `table` on one line, a `; ` between its rows.
@@ -664,7 +747,7 @@ fun headFits(room : Int, d : Doc, stack : Vec Cmd) -> Bool {
 				remaining = remaining - columns(Option.unwrapOr(Vec.at(String.lines(s), 0), ""))
 			}
 			Line(whenFlat) -> { remaining = remaining - String.codePointCount(whenFlat) }
-			Hard           -> { remaining = remaining - 1 }
+			Join(_) | Hard -> { remaining = remaining - 1 }
 			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
 				Vec.push(todo, parts[i])
 			}
@@ -697,8 +780,8 @@ fun tailFits(room : Int, d : Doc) -> Bool {
 	while let Some(doc) = Vec.pop(todo) {
 		if remaining < 0 { return False }
 		match doc {
-			Line(_) | Hard | Rows(_) | Below(_, _) -> return True
-			Empty | Suffix(_, _)                   -> {}
+			Line(_) | Join(_) | Hard | Rows(_) | Below(_, _) -> return True
+			Empty | Suffix(_, _)                             -> {}
 			Text(_, w) -> {
 				remaining = remaining - w
 				started = True
@@ -756,6 +839,10 @@ fun fitsIn(room : Int, next : Cmd, stack : Vec Cmd) -> Bool {
 			Line(whenFlat) -> match mode {
 				Breaking -> return True
 				_        -> { remaining = remaining - String.codePointCount(whenFlat) }
+			}
+			Join(_) -> match mode {
+				Breaking -> return True
+				_        -> { remaining = remaining - 1 }
 			}
 			Hard | Rows(_) -> return True
 			Cat(parts, _) -> for var i = len(parts) - 1; i >= 0; i = i - 1 {
@@ -850,8 +937,30 @@ fun laidOut(p : P, indent : Int, r : Row) -> Laid {
 	}
 	let q = printer(p.width, indent * tabWidth, p.marks)
 	layout(q, Cmd { indent = indent, mode = Breaking, doc = cat([r.left, r.right]) })
-	let body = finish(q)
-	let single = len(body) == 1
+	var body = finish(q)
+	var single = len(body) == 1
+	-- An aligned row whose `left` broke, and whose last line still runs past
+	-- the width, gains nothing from the break: its `right` has no room even
+	-- there. If the row fits on one line with `left` flat, keeping the `right`
+	-- as it breaks (or not), lay it out that way.
+	match r.kind {
+		Aligned -> if !single && !isHard(r.left) && measured(p, body[len(body) - 1]) > p.width {
+			let flatQ = printer(p.width, indent * tabWidth, p.marks)
+			layout(flatQ, Cmd {
+				indent = indent
+				mode   = Breaking
+				doc    = cat([flat(r.left), r.right])
+			})
+			let flatBody = finish(flatQ)
+			if len(flatBody) == 1 {
+				body = flatBody
+				single = True
+				q.pending = flatQ.pending
+				q.ends = flatQ.ends
+			}
+		}
+		_ -> {}
+	}
 	let leftText = match r.kind {
 		Aligned -> if single { renderFlat(r.left) } else { "" }
 		_       -> ""

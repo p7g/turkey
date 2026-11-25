@@ -42,13 +42,10 @@ import Data.Int (Int)
 import Data.Float (Float)
 import Data.Option (Option(..))
 import Data.Tuple (Unit)
-import Data.Eq (Eq(..), (==), (!=))
-import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Mod(..), Neg(..), (+), (-), (*), (/), (%))
-import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
-import Data.Error (Error(..))
-import Iter (Iterator(..))
-import Data.Int ()
+import Data.Eq ((==), (!=))
+import Data.Ord ((<), (<=), (>), (>=))
+import Data.Num (Neg(..), (+), (-), (*), (/), (%))
+import Bits ((&), (|), (^), (<<), (>>))
 import Data.Bool (Bool(..))
 import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
@@ -65,6 +62,7 @@ import Turkey.Ptr (Ptr)
 import Turkey.Ptr as Ptr
 import Target (OS(..))
 import Target as Target
+import Turkey.Wasi as Wasi
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -919,19 +917,34 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 		)
 		return Ptr.null()
 	}
+	let object = slotFor(size)
+	if !Ptr.isNull(object) { return taken(object, size, kind) }
+	-- No memory for a region, though the threshold was not reached: the heap
+	-- grows by up to a threshold between collections, set from the live set,
+	-- which can be more than the memory left. So collect everything and try
+	-- once more before giving up. On wasm32, `belowCeiling` keeps the
+	-- threshold under the 4 GiB a 32-bit memory has, and this is what is left
+	-- under an engine that allows less.
+	collectFrom(frame, Full)
+	if Process.pending() { return Ptr.null() }
+	let again = slotFor(size)
+	if Ptr.isNull(again) { return outOfMemory() }
+	taken(again, size, kind)
+}
+
+-- A slot of `size` bytes, its header unwritten, or null if there is no memory
+-- for a region to hold it.
+fun slotFor(size : Int) -> Ptr {
 	if below(smallBytes, size) {
 		Lock.acquire(heapLock)
 		let object = largeAllocate(size)
 		Lock.release(heapLock)
-		if Ptr.isNull(object) { return outOfMemory() }
-		return taken(object, size, kind)
+		return object
 	}
 	let sizeClass = classOf(size)
 	let cursor = cursorOf(sizeClass)
-	if Ptr.load(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
-		return outOfMemory()
-	}
-	taken(takeSlot(cursor, Ptr.load(cursor, cursorFree)), size, kind)
+	if Ptr.load(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) { return Ptr.null() }
+	takeSlot(cursor, Ptr.load(cursor, cursorFree))
 }
 
 fun outOfMemory() -> Ptr {
@@ -2090,6 +2103,7 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 		Some(n) -> n
 		None    -> maxInt()
 	}
+	if let Wasi = Target.os { threshold = belowCeiling(threshold) }
 	if minor { statsMinor = statsMinor + 1 }
 	collections = collections + 1
 	if wanted {
@@ -2109,8 +2123,36 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 -- from them, 13.5 s at 3.67 GB.
 fun fullDue() -> Bool {
 	if stress { return collections % 8 == 0 }
+	-- Near wasm32's ceiling, since a minor collection frees no old object
+	-- that has died, and the next must free everything it can.
+	if let Wasi = Target.os { if roomUnderCeiling() < threshold { return True } }
 	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
 	Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
+}
+
+-- The memory left under wasm32's 4 GiB ceiling, which no `memory.grow`
+-- passes, less 64 MiB kept for what the collector itself allocates while it
+-- marks: chiefly the mark stack, which doubles as the heap deepens, and which
+-- a collection that runs with nothing left cannot grow. The compiler compiling
+-- itself, with a 1 GB live set, peaks at an 8 MiB mark stack. Spares count as
+-- left, since a region takes one before it asks for memory.
+fun roomUnderCeiling() -> Int =
+	Wasi.memoryLeft() + spareCount * regionBytes - 0x400_0000
+
+-- `wanted`, or the room under wasm32's ceiling where that is smaller: a
+-- threshold of twice the live set can be more than is left, and the
+-- collection the failed allocation then forces in `allocateSlow` has no memory
+-- for its own marking. The regions grow by at most what is allocated, since
+-- an allocation takes a free slot of its class before it takes a region, so
+-- the cap keeps them under the ceiling.
+--
+-- No lower than an eighth of the live set, so that a heap whose live set
+-- crowds the ceiling collects every so often and not at every allocation.
+fun belowCeiling(wanted : Int) -> Int {
+	let room = roomUnderCeiling()
+	if room >= wanted { return wanted }
+	let least = liveBytesAfterFull / 8
+	if room > least { room } else { least }
 }
 
 -- Before a full collection's marking: no object is marked.

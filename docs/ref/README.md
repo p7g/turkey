@@ -26,7 +26,7 @@ Some things are deliberately left out:
 3. [Declarations](declarations.md): functions, lambdas, placeholder
    functions, `let` and `var`, annotations, and signatures.
 4. [Expressions](expressions.md): operators, calls, field access, indexing,
-   records, tuples, and array literals.
+   records, tuples, array literals, and string interpolation.
 5. [Patterns](patterns.md): the pattern forms, exhaustiveness, and which
    patterns may appear in bindings.
 6. [Statements and control flow](statements.md): blocks, assignment, `if`,
@@ -162,7 +162,21 @@ left.
 |---|---|---|
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
+| `unused-variable` | warn | a local binding nothing reads: a `let`, `var` or `let ... else`, a pattern of `for`, `match`, `if let`, `if var`, `while let` or `while var`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
+| `unused-import` | warn | an import, or an entry of an import's list, that brings nothing the module reads or its export list passes on, such as a name a declaration of the module hides. `x as _` is not reported, and `import M ()` only when loading `M` changes nothing a program does. `--fix` removes the entry, writes an unused `x as y` beside `..` as `x as _`, and removes an import none of which is used, unless it is the last import of a module whose loading may run code, provide an instance or define a `foreign` symbol, which it writes as `import M ()`. |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `repeated-condition` | warn | a test in an `if`/`else if` chain that repeats an earlier test of the chain, so its branch can never run. A test with a call in it is not compared, and neither is one after a test with a call. |
+| `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
+| `self-assignment` | warn | an assignment of a variable or a field path to itself, as in `c.count = c.count`, which changes nothing. `a[i] = a[i]` is not reported, since it can panic. |
+| `impossible-comparison` | warn | two comparisons of one `Int` or `Char` with constants, joined by `&&`, that no value satisfies both of, as in `c >= 'a' && c <= 'Z'`, or joined by `\|\|`, that every value satisfies one of |
+| `discarded-value` | warn | a statement that computes a value other than `()` and drops it ([Discarded values](statements.md#discarded-values)), except those `discarded-monadic-value` reports |
+| `discarded-monadic-value` | warn | a statement that drops an `Option`, an `Either`, or a value of the monad of the `?` block it is in, which is most often a missing `?` ([Discarded values](statements.md#discarded-values)) |
+| `unit-spelling` | warn | `{}` written where its value is used, as in `let done = {}`, and a `match` arm that does nothing spelled `()` in a statement or `{}` in a `match` whose value is used. `{}` is a body that does nothing and `()` the unit value. `--fix` writes the other spelling. |
+| `detached-doc-comment` | warn | a `---` doc comment that documents nothing ([Doc comments](lexical.md#doc-comments)), such as one parted from its declaration by a blank line, one inside a body, or one after code on its line. `--fix` deletes a single blank line between a doc comment and a declaration. |
+| `needless-equality` | warn | an equality in a function's context, such as `Item c ~ a`, whose variable is in no other entry and is written at most once in the signature and nowhere in the body, so that it only names `Item c`. `--fix` removes the entry and writes `Item c` in its place. |
+| `ord-inconsistent-with-eq` | warn | an `instance Ord` written by hand for a type whose `Eq` is derived, which can make `<=` hold in neither direction ([Derived instances](classes.md#derived-instances)) |
+| `infinite-recursion` | warn | a function, local function or method that cannot return without first calling itself, so it never returns. For an instance's method, itself is the class's method at the same instance. A call inside a `fun` value is not counted. |
+| `shared-fill` | warn | `Array.filled(n, v)`, `Vec.filled(n, v)` or `FrozenArray.filled(n, v)` with a `v` whose type is an object ([`Object` and `identical`](builtins.md#object-and-identical)), so every slot holds the one object. `Array.init(n, fun(_) = v)` makes one for each. |
 | `unfulfilled-expect` | warn | a check that an `--@expect` names and that finds nothing in what the directive covers ([Expecting a finding](#expecting-a-finding)) |
 
 ### Expecting a finding
@@ -186,8 +200,8 @@ spaces allowed around each. It says that each check reports a finding in the
 code the directive covers, and those findings are neither printed nor fixed
 by `--fix`:
 
-* On a line of its own, a directive covers the whole of the statement,
-  declaration or `match` arm that begins next, every line of it included,
+* On a line of its own, a directive covers the whole of the import,
+  statement, declaration or `match` arm that begins next, every line of it included,
   provided it begins inside the block, type, call or other construct the
   directive is in. If nothing begins there, as at the end of a block, the
   directive covers nothing, and warns. A doc comment can be directly above the

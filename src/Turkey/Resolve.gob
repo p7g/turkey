@@ -55,6 +55,7 @@ import Turkey.Diag as Diag
 import Turkey.Fixity as Fixity
 import Turkey.Fixity (Group)
 import Turkey.Modules (Module(..), Namespace(..), Scope(..), lookupName, conflictsIn)
+import Turkey.Modules as Modules
 import Turkey.Prelude as Prelude
 import Turkey.Prims as Prims
 import Turkey.Source as Source
@@ -619,8 +620,11 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 		for a in args { expr(r, a) }
 	}
 	EIndex(arr, index, _, _) -> bracket(r, e, arr, index, False)
-	EField(obj, _)           -> expr(r, obj)
-	EProject(obj, _)         -> expr(r, obj)
+	EField(obj, label) -> {
+		Modules.noteField(r.scope, label)
+		expr(r, obj)
+	}
+	EProject(obj, _) -> expr(r, obj)
 	EUnary(_, operand, fn) -> {
 		resolveMethod(r, fn)
 		expr(r, operand)
@@ -747,8 +751,9 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
 		expr(r, inner)
 	}
 	-- Only a marker; the block underneath scopes as any block does.
-	EDo(body)     -> expr(r, body)
-	EParen(inner) -> expr(r, inner)
+	EDo(body)         -> expr(r, body)
+	EParen(inner)     -> expr(r, inner)
+	EInterp(_, holes) -> for h in holes { expr(r, h) }
 }
 
 fun stmt(r : R, s : Stmt) -> Unit = match s.kind {
@@ -930,7 +935,12 @@ fun protocolMethod(
 -- can see it. Whatever else the scope calls `name` is not a candidate.
 fun visibleMethod(scope : Scope, name : String, where : Span) -> Option String =
 	match Prelude.protocolMethod(name) {
-		Some(target) -> if Set.contains(scope.methods, target) { Some(target) } else { None }
+		Some(target) -> if Set.contains(scope.methods, target) {
+			Modules.noteMethod(scope, target)
+			Some(target)
+		} else {
+			None
+		}
 		None -> Diag.fail(
 			Diag.at("internal error", "'" + name + "' marks no class method", where),
 			where.file,
@@ -1026,6 +1036,7 @@ fun declared(r : R, op : String, where : Span) -> Option (Group, String) {
 		)
 		None -> {}
 	}
+	Modules.noteOperator(r.scope, op)
 	match Map.get(r.scope.operators, op) {
 		Some(id) -> Map.get(r.operators, id)
 		None     -> None

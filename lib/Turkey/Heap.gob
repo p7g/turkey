@@ -1745,6 +1745,8 @@ var poolEmpty : Ptr = Ptr.null()
 let taskChain : Int = 0
 let taskStack : Int = 1
 let taskRemembered : Int = 2
+-- Rewrite the regions in an array of them, from one address to another.
+let taskRewrite : Int = 3
 var tasks : Ptr = Ptr.null()
 var taskCount : Int = 0
 var taskCapacity : Int = 0
@@ -1776,12 +1778,19 @@ fun markFrom(frame : Ptr) -> Unit {
 		}
 	}
 	stackTasks(frame)
+	runTasks(if minor { bytesSince } else { plus(liveBytes, bytesSince) })
+	if minor { rememberedCountSet(0) }
+	if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
+}
+
+-- Run the tasks, with every worker stopped at a safepoint and, if `traced`
+-- bytes are enough to repay waking them, every paused one.
+fun runTasks(traced : Int) -> Unit {
 	Ptr.atomicStore(marking, nextTaskAt, 0)
 	let me = Workers.index()
 	let n = Workers.count()
 	-- Under GC stress every collection asks, so that the stressed runs, whose
 	-- heaps are small, still mark with the paused workers.
-	let traced = if minor { bytesSince } else { plus(liveBytes, bytesSince) }
 	let paused = stress || traced >= pausedHelpFloor
 	participants = 1
 	for var i = 0; i < n; i = plus(i, 1) {
@@ -1806,8 +1815,6 @@ fun markFrom(frame : Ptr) -> Unit {
 		}
 		sharing = False
 	}
-	if minor { rememberedCountSet(0) }
-	if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
 }
 
 -- Whether worker `i`, with the world stopped, is to be asked to mark: it is
@@ -1863,6 +1870,10 @@ fun run(task : Int) -> Unit {
 		}
 	} else if kind == taskStack {
 		scanStack(a, b)
+	} else if kind == taskRewrite {
+		for var at = Ptr.toInt(a); at < Ptr.toInt(b); at = plus(at, 8) {
+			rewriteRegion(Ptr.load(Ptr.fromInt(at), 0))
+		}
 	} else {
 		-- A minor collection's other roots: the fields of each remembered
 		-- object, which is marked already, being old. Each is old and not
@@ -2125,7 +2136,7 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
 	sweep()
 	if verify { verifyAt(Check.AfterSweeping, frame) }
-	if !minor && evacuating {
+	if !minor && evacuating && onlyGlobals() {
 		evacuate(frame)
 		if Process.pending() { return }
 		if verify { verifyAt(Check.AfterSweeping, frame) }
@@ -2356,6 +2367,8 @@ var movedObjects : Int = 0
 var evacuatedRegions : Int = 0
 var pinnedRegions : Int = 0
 var evacuationNanos : Int = 0
+-- The part of `evacuationNanos` up to the end of the copying.
+var copiedNanos : Int = 0
 var movedBytesTotal : Int = 0
 var collectNanosTotal : Int = 0
 var fullNanosMax : Int = 0
@@ -2402,6 +2415,7 @@ fun evacuate(frame : Ptr) -> Unit {
 	let started = nanoseconds()
 	movedBytes = 0
 	plannedBytes = 0
+	copiedNanos = 0
 	movedObjects = 0
 	evacuatedRegions = 0
 	pinnedRegions = 0
@@ -2439,6 +2453,7 @@ fun evacuate(frame : Ptr) -> Unit {
 			first = end
 		}
 		Os.free(order)
+		copiedNanos = nanoseconds() - started
 		if evacuatedRegions > 0 {
 			rewriteHeap()
 			rewriteChain()
@@ -2449,6 +2464,22 @@ fun evacuate(frame : Ptr) -> Unit {
 	movedBytesTotal = movedBytesTotal + movedBytes
 	evacuationNanos = nanoseconds() - started
 	if Ptr.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
+}
+
+-- Whether the root chain is the generated globals frame alone. A frame a C
+-- caller registered may have its values in C locals too, which nothing
+-- rewrites, and the runtime's C tests ask by address whether an object is
+-- still in the heap: so while one is registered, nothing moves.
+fun onlyGlobals() -> Bool {
+	if Ptr.isNull(roots) || !Ptr.isNull(Ptr.load(roots, 0) : Ptr) { return False }
+	let name : Ptr = Ptr.load(roots, 8)
+	let globals = Prim.cString("<globals>")
+	var i = 0
+	while byteAt(globals, i) != 0 {
+		if byteAt(name, i) != byteAt(globals, i) { return False }
+		i = i + 1
+	}
+	byteAt(name, i) == 0
 }
 
 -- Whether `region` may be emptied: small, holding a survivor, and not pinned.
@@ -2585,23 +2616,60 @@ fun move(source : Ptr, from : Int, target : Ptr, to : Int, slot : Int) -> Unit {
 }
 
 -- Rewrite the traced words of every marked object outside the emptied
--- regions, the moved copies included.
+-- regions, the moved copies included: as tasks of `rewriteRun` regions, which
+-- the workers share as they share marking. Each region's objects are written
+-- by the one worker that claims its task, and the emptied regions are only
+-- read, so the workers need no synchronization beyond the tasks'.
 fun rewriteHeap() -> Unit {
+	var count = 0
 	var region = regions
 	while !Ptr.isNull(region) {
-		if flagsOf(region) & flagEvacuating == 0 && Ptr.load32(region, regionLive) > 0 {
-			let slot : Int = Ptr.load(region, regionSlotSize)
-			for var w = 0; w < regionWords; w = w + 1 {
-				var bits : Int = Ptr.load(region, plus(regionMarked, times8(w)))
-				while bits != 0 {
-					let lowest = bits & Int.negWrapping(bits)
-					bits = bits ^ lowest
-					let index = plus(w << 6, bitIndex(lowest))
-					rewriteObject(Ptr.add(region, plus(regionData, Int.mulWrapping(index, slot))))
-				}
-			}
+		if rewritten(region) { count = plus(count, 1) }
+		region = Ptr.load(region, regionNext)
+	}
+	let list = Os.malloc(8 * count)
+	if Ptr.isNull(list) {
+		-- No memory for the list: rewrite here, alone.
+		region = regions
+		while !Ptr.isNull(region) {
+			if rewritten(region) { rewriteRegion(region) }
+			region = Ptr.load(region, regionNext)
+		}
+		return
+	}
+	var at = 0
+	region = regions
+	while !Ptr.isNull(region) {
+		if rewritten(region) {
+			Ptr.store(list, times8(at), region)
+			at = plus(at, 1)
 		}
 		region = Ptr.load(region, regionNext)
+	}
+	taskCount = 0
+	for var i = 0; i < count; i = plus(i, rewriteRun) {
+		let end = if count - i < rewriteRun { count } else { plus(i, rewriteRun) }
+		addTask(taskRewrite, Ptr.add(list, times8(i)), Ptr.add(list, times8(end)))
+	}
+	runTasks(liveBytes)
+	Os.free(list)
+}
+
+let rewriteRun : Int = 64
+
+fun rewritten(region : Ptr) -> Bool =
+	flagsOf(region) & flagEvacuating == 0 && Ptr.load32(region, regionLive) > 0
+
+fun rewriteRegion(region : Ptr) -> Unit {
+	let slot : Int = Ptr.load(region, regionSlotSize)
+	for var w = 0; w < regionWords; w = w + 1 {
+		var bits : Int = Ptr.load(region, plus(regionMarked, times8(w)))
+		while bits != 0 {
+			let lowest = bits & Int.negWrapping(bits)
+			bits = bits ^ lowest
+			let index = plus(w << 6, bitIndex(lowest))
+			rewriteObject(Ptr.add(region, plus(regionData, Int.mulWrapping(index, slot))))
+		}
 	}
 }
 
@@ -2714,7 +2782,9 @@ fun logEvacuation(nanos : Int) -> Unit {
 		putInt(pinnedRegions)
 		put(Prim.cString(" evac "))
 		putFixed(evacuationNanos, 1000000, 3)
-		put(Prim.cString(" ms"))
+		put(Prim.cString(" ms (copy "))
+		putFixed(copiedNanos, 1000000, 3)
+		put(Prim.cString(")"))
 	}
 	put(Prim.cString(", total "))
 	putFixed(collectNanosTotal, 1000000, 1)

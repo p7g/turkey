@@ -162,6 +162,8 @@ left.
 |---|---|---|
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
+| `unused-variable` | warn | a local binding nothing reads: a `let`, `var` or `let ... else`, a pattern of `for`, `match`, `if let`, `if var`, `while let` or `while var`, or a local `fun`. Reads in the binding's own assignments, as in `x = x + 1`, do not count. Parameters, and names that start with `_`, are not reported. `--fix` renames the binding `_name`, or writes `_` for a variable inside a pattern. |
+| `unused-import` | warn | an import, or an entry of an import's list, that brings nothing the module reads or its export list passes on, such as a name a declaration of the module hides. `x as _` is not reported, and `import M ()` only when loading `M` changes nothing a program does. `--fix` removes the entry, writes an unused `x as y` beside `..` as `x as _`, and removes an import none of which is used, unless it is the last import of a module whose loading may run code, provide an instance or define a `foreign` symbol, which it writes as `import M ()`. |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
 | `repeated-condition` | warn | a test in an `if`/`else if` chain that repeats an earlier test of the chain, so its branch can never run. A test with a call in it is not compared, and neither is one after a test with a call. |
 | `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
@@ -196,8 +198,8 @@ spaces allowed around each. It says that each check reports a finding in the
 code the directive covers, and those findings are neither printed nor fixed
 by `--fix`:
 
-* On a line of its own, a directive covers the whole of the statement,
-  declaration or `match` arm that begins next, every line of it included,
+* On a line of its own, a directive covers the whole of the import,
+  statement, declaration or `match` arm that begins next, every line of it included,
   provided it begins inside the block, type, call or other construct the
   directive is in. If nothing begins there, as at the end of a block, the
   directive covers nothing, and warns. A doc comment can be directly above the

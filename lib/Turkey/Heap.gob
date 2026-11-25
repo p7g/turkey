@@ -141,10 +141,17 @@ let regionLines : Int = 3136
 -- object needs, so every slot size is a multiple of 8 and the smallest is 16:
 -- the header and one word.
 let regionData : Int = 3200
+-- The line size is a power of two from 8 to 128 bytes, and these change
+-- with it, as do `regionData` and `Turkey.HeapCheck`'s copies: the lines of a
+-- region, the granules of a line as a shift, and the first data line.
 let lineBytes : Int = 128
 let lineShift : Int = 7
 let regionLineCount : Int = 512
+let lineGranuleShift : Int = 4
 let dataLine : Int = 25
+-- An object of more than this is medium: it may go to the overflow cursor,
+-- and a collector that marks lines conservatively marks all its lines.
+let mediumBytes : Int = 128
 
 -- `RootFrame`, the shadow stack -- the globals' frame, and any a C caller
 -- registers -- is a chain of these: the previous frame, a NUL-terminated
@@ -878,7 +885,7 @@ fun lineAllocate(size : Int) -> Ptr {
 		-- Overflow only while the hole still has a whole line to give a small
 		-- object; with less, nothing is lost by moving on to the next hole.
 		let left = Int.subWrapping(Ptr.load(cursor, bumpLimit), Ptr.load(cursor, bumpNext))
-		if bytes > lineBytes && left >= lineBytes {
+		if bytes > mediumBytes && left >= mediumBytes {
 			return overflowAllocate(cursorIn(w, 1), bytes)
 		}
 		if !nextHole(cursor) { return Ptr.null() }
@@ -2440,13 +2447,13 @@ fun sweepLines(region : Ptr) -> Int {
 			setBit(endsScratch, 0, last)
 			let size = plus(Int.subWrapping(last, first), 1) << 3
 			bytes = plus(bytes, size)
-			let firstLine = plus(dataLine, first >> 4)
-			let lastLine = plus(dataLine, last >> 4)
+			let firstLine = plus(dataLine, first >> lineGranuleShift)
+			let lastLine = plus(dataLine, last >> lineGranuleShift)
 			for var l = firstLine; l <= lastLine; l = plus(l, 1) { setBit(region, regionLines, l) }
 			if census {
 				-- What a collector marking only a small object's first line
 				-- would have marked: every line of an object of more than one.
-				let upTo = if size <= lineBytes { firstLine } else { lastLine }
+				let upTo = if size <= mediumBytes { firstLine } else { lastLine }
 				for var l = firstLine; l <= upTo; l = plus(l, 1) { setBit(conservativeScratch, 0, l) }
 			}
 		}

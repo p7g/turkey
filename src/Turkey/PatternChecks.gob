@@ -43,11 +43,11 @@ import Turkey.Typed (TypeTable(..), ArmCoverage(..))
 
 -- -- single-match -------------------------------------------------------------------
 --
--- `match e { p -> A; _ -> {} }` is `if let p = e { A }` written the long way,
--- and `docs/ref/statements.md` defines the second as the first. The rewrite
--- is the same program when one arm does something, every other arm is `()`
--- or `{}`, and no value that an arm before the one that does something takes
--- would reach it once it is tried first. Before desugaring, since `if let`
+-- `if let p = e { A }` means `match e { p -> A; _ -> () }`, so a `match` of
+-- that shape is an `if let` written the long way. The rewrite is the same
+-- program when one arm does something, every other arm is `()` or `{}`, and
+-- no value that an arm before the one that does something takes would reach
+-- it once it is tried first. Before desugaring, since `if let`
 -- desugars into a `match` of this shape and the two cannot be told apart
 -- after.
 
@@ -76,22 +76,24 @@ fun singleMatchAt(f : File, e : Expr, scrutinee : Expr, arms : Vec Arm, out : Ve
 	-- spelling of `if let`.
 	if live < 0 { return }
 	let arm = arms[live]
-	if len(arm.patterns) != 1 { return }
-	let pattern = arm.patterns[0]
 	-- A catch-all would need an `if let` that tests the other arms'
 	-- patterns failing, which there is none of. One that is irrefutable
 	-- another way leaves the other arms unreachable, which `unreachable-arm`
 	-- reports, and its `if let` would be `irrefutable-if-let`'s.
-	if surelyIrrefutable(pattern) { return }
+	if Iter.any(arm.patterns, surelyIrrefutable) { return }
 	for var i = 0; i < live; i = i + 1 {
-		if !Iter.all(arms[i].patterns, disjoint(_, pattern)) { return }
+		for p in arm.patterns {
+			if !Iter.all(arms[i].patterns, disjoint(_, p)) { return }
+		}
 	}
-	if Source.isEmpty(e.span) || Source.isEmpty(scrutinee.span) || Source.isEmpty(pattern.span) {
+	-- The arm's alternatives become the `if let`'s, `|` and all.
+	let pattern = patternsSpan(arm)
+	if Source.isEmpty(e.span) || Source.isEmpty(scrutinee.span) || Source.isEmpty(pattern) {
 		return
 	}
 	let lead = if live == 0 { leadingComments(f, scrutinee, pattern) } else { None }
 	let replacement = "if let "
-		+ Lint.textOf(f, pattern.span)
+		+ Lint.textOf(f, pattern)
 		+ " = "
 		+ Lint.textOf(f, scrutinee.span)
 		+ " "
@@ -106,11 +108,11 @@ fun singleMatchAt(f : File, e : Expr, scrutinee : Expr, arms : Vec Arm, out : Ve
 	})
 }
 
--- The comments between the `match`'s `{` and the pattern of `arm`, its first
--- arm, one per line, which describe that arm and so move into its block; or
+-- The comments between the `match`'s `{` and `pattern`, where its first arm
+-- begins, one per line, which describe that arm and so move into its block; or
 -- `None` if anything else is there.
-fun leadingComments(f : File, scrutinee : Expr, pattern : Pat) -> Option (Vec String) {
-	let between = Lint.textOf(f, from(scrutinee.span, pattern.span))
+fun leadingComments(f : File, scrutinee : Expr, pattern : Span) -> Option (Vec String) {
+	let between = Lint.textOf(f, from(scrutinee.span, pattern))
 	let Some(inside) = String.stripPrefix(String.trimStart(between), "{") else { return None }
 	let out = []
 	for line in String.lines(inside) {
@@ -193,24 +195,31 @@ fun differentLiterals(a : Lit, b : Lit) -> Bool = match (a, b) {
 
 -- The `if let`'s block: the arm's body if it is a block, and the body in one
 -- otherwise, laid out the way the `match` was, with `comments` at its top.
--- The arms sit one step deeper than the `match`, and so does the inside of
--- the block, so a block body loses one step on each line after its first.
+-- The inside of the block is indented as the arms were, or one step deeper
+-- than the `match` when its arms share its line. A block body on several
+-- lines keeps its own lines, each one step less deep, since the arms sit one
+-- step deeper than the `match`.
 fun bodyBlock(f : File, e : Expr, arm : Arm, comments : Vec String) -> String {
 	let outer = indentOf(f, e.span)
 	let armIndent = indentOf(f, arm.span)
 	let step = Option.unwrapOr(String.stripPrefix(armIndent, outer), "")
-	let leading = String.join(Vec.map(comments, \armIndent + _ + "\n"), "")
+	let inner = if arm.span.line > e.span.line {
+		armIndent
+	} else if String.startsWith(outer, " ") {
+		outer + "    "
+	} else {
+		outer + "\t"
+	}
+	let leading = String.join(Vec.map(comments, \inner + _ + "\n"), "")
 	let text = Lint.textOf(f, arm.body.span)
 	let lines = String.split(text, "\n")
 	let EBlock(_) = arm.body.kind else {
-		return "{\n" + leading + armIndent + text + "\n" + outer + "}"
+		return "{\n" + leading + inner + text + "\n" + outer + "}"
 	}
-	if len(lines) == 1 && len(comments) > 0 {
-		let inner = Option.unwrapOr(
-			String.stripSuffix(Option.unwrapOr(String.stripPrefix(text, "{"), text), "}"),
-			text,
-		)
-		return "{\n" + leading + armIndent + String.trim(inner) + "\n" + outer + "}"
+	if len(lines) == 1 {
+		let opened = Option.unwrapOr(String.stripPrefix(text, "{"), text)
+		let body = Option.unwrapOr(String.stripSuffix(opened, "}"), opened)
+		return "{\n" + leading + inner + String.trim(body) + "\n" + outer + "}"
 	}
 	let kept = []
 	for var i = 1; i < len(lines); i = i + 1 {
@@ -246,7 +255,7 @@ fun keepsEverything(
 	f : File,
 	e : Expr,
 	scrutinee : Expr,
-	pattern : Pat,
+	pattern : Span,
 	body : Expr,
 	moved : Bool,
 ) -> Bool {
@@ -261,10 +270,10 @@ fun keepsEverything(
 	}
 	let gaps = [
 		from(Source.emptyAt(e.span), scrutinee.span),
-		from(pattern.span, body.span),
+		from(pattern, body.span),
 		from(body.span, close),
 	]
-	if !moved { Vec.push(gaps, from(scrutinee.span, pattern.span)) }
+	if !moved { Vec.push(gaps, from(scrutinee.span, pattern)) }
 	!Iter.any(gaps, \String.contains(Lint.textOf(f, _), "--"))
 }
 

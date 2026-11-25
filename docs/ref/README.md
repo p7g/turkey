@@ -163,6 +163,10 @@ left.
 | `empty-return-value` | warn | `return {}`, `return ()`, `break {}` and `break ()`, each of which means the bare `return` or `break`. `--fix` removes the value. |
 | `ambiguous-underscore` | warn | a `fun` whose parameter is `_` and whose body uses `_` to make a function of its own ([Placeholder functions](declarations.md#placeholder-functions)), as in `fun(_) = lookup(_, table)`, where the second `_` is not the parameter |
 | `unreachable-code` | warn | a statement after one that cannot complete ([Blocks](statements.md#blocks)) |
+| `repeated-condition` | warn | a test in an `if`/`else if` chain that repeats an earlier test of the chain, so its branch can never run. A test with a call in it is not compared, and neither is one after a test with a call. |
+| `identical-operands` | warn | a comparison, `-`, `/`, `%`, `^`, `&&` or `\|\|` whose two operands are the same expression, with no call or indexing in it, as in `a.x == a.x`. `Float` operands are not reported. |
+| `self-assignment` | warn | an assignment of a variable or a field path to itself, as in `c.count = c.count`, which changes nothing. `a[i] = a[i]` is not reported, since it can panic. |
+| `impossible-comparison` | warn | two comparisons of one `Int` or `Char` with constants, joined by `&&`, that no value satisfies both of, as in `c >= 'a' && c <= 'Z'`, or joined by `\|\|`, that every value satisfies one of |
 | `single-match` | warn | a `match` in which one arm does something and every other arm is `()` or `{}`, which is an [`if let`](statements.md#if-let-and-if-var). `--fix` rewrites it to one when no earlier arm takes a value the live arm's pattern matches. |
 | `irrefutable-match` | warn | a `match` of one arm, whose pattern matches every value, which is a `let` or, for a function's parameter, a [parameter pattern](declarations.md#functions) |
 | `irrefutable-if-let` | warn | an `if let` or `while let` whose conditions always hold ([Irrefutable patterns](patterns.md#irrefutable-patterns)), so the `else` is never taken, or only a `break` ends the loop |

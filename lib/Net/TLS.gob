@@ -225,7 +225,12 @@ type ServerConfig = ServerConfig {
 }
 
 --- A client configuration trusting `roots` and offering `protocols` by ALPN.
-fun clientConfig(roots : Roots, protocols : Array String) -> Either TLSError ClientConfig {
+--- A failure is a `TLSError`.
+fun clientConfig(roots : Roots, protocols : Array String) -> Either SomeError ClientConfig =
+	Error.promote(newClientConfig(roots, protocols))
+
+-- `clientConfig`, with its error still a `TLSError`.
+fun newClientConfig(roots : Roots, protocols : Array String) -> Either TLSError ClientConfig {
 	-- WASI preview 1 has no OpenSSL to load, so on wasm32-wasi each entry
 	-- that would call it panics.
 	if let Wasi = Target.os { return Runtime.unsupported(Left(Untrusted)) }
@@ -259,8 +264,14 @@ fun configureClient(ctx : Ptr, roots : Roots) -> Either TLSError Unit {
 }
 
 --- A server configuration presenting `certificates`, chosen among by SNI, and
---- accepting `protocols` by ALPN.
+--- accepting `protocols` by ALPN. A failure is a `TLSError`.
 fun serverConfig(
+	certificates : Array Certificate,
+	protocols : Array String,
+) -> Either SomeError ServerConfig = Error.promote(newServerConfig(certificates, protocols))
+
+-- `serverConfig`, with its error still a `TLSError`.
+fun newServerConfig(
 	certificates : Array Certificate,
 	protocols : Array String,
 ) -> Either TLSError ServerConfig {
@@ -586,8 +597,17 @@ fun newTLS(
 --- If the handshake fails, `conn` is left open, and closing it is the
 --- caller's. Once this returns a `TLS`, the `TLS` owns `conn`: `close` it
 --- rather than `conn`, and bound it with the `TLS`'s `setDeadline`. The
---- handshake replaces any deadline `conn` had, and leaves it with none.
+--- handshake replaces any deadline `conn` had, and leaves it with none. A
+--- failure is a `TLSError`.
 fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
+	conn : c,
+	to : Destination,
+	config : ClientConfig,
+	timeout : t,
+) -> Either SomeError TLS = Error.promote(connectClient(conn, to, config, timeout))
+
+-- `client`, with its error still a `TLSError`.
+fun connectClient[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout t](
 	conn : c,
 	to : Destination,
 	config : ClientConfig,
@@ -619,7 +639,7 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
 		abandon(t)
 		return Left(e)
 	}
-	match handshake(t, timeout) {
+	match shakeWithin(t, timeout) {
 		Right(_) -> Right(t)
 		Left(e) -> {
 			abandon(t)
@@ -632,10 +652,11 @@ fun client[Connection c, ReadError c ~ IOError, WriteError c ~ IOError, Timeout 
 --- waited for: the handshake runs inside the first read or write, or in
 --- `handshake`. The `TLS` owns `conn`: `close` it rather than `conn`. A
 --- configuration released already is `Configuration`, and leaves `conn` open.
+--- A failure is a `TLSError`.
 fun server[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
 	conn : c,
 	config : ServerConfig,
-) -> Either TLSError TLS = serverAt(conn, config, None, None)
+) -> Either SomeError TLS = Error.promote(serverAt(conn, config, None, None))
 
 -- `server`, whose `connectionInfo` reports `local` and `peer`.
 fun serverAt[Connection c, ReadError c ~ IOError, WriteError c ~ IOError](
@@ -793,8 +814,12 @@ fun withEngine(t : TLS, f : fun(Engine) -> a) -> a = Sync.withLock(t.engine, f)
 -- -- the handshake --------------------------------------------------------------------
 
 --- Run `t`'s handshake if it has not run, within `timeout` and the deadline
---- `t` has, whichever comes first.
-fun handshake[Timeout d](t : TLS, timeout : d) -> Either TLSError Unit =
+--- `t` has, whichever comes first. A failure is a `TLSError`.
+fun handshake[Timeout d](t : TLS, timeout : d) -> Either SomeError Unit =
+	Error.promote(shakeWithin(t, timeout))
+
+-- `handshake`, with its error still a `TLSError`.
+fun shakeWithin[Timeout d](t : TLS, timeout : d) -> Either TLSError Unit =
 	using(t, "handshake", fun() {
 		let own = withEngine(t, fun(engine) = engine.limit)
 		let at = deadline(timeout)

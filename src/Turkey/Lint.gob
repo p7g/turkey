@@ -8,8 +8,12 @@ export (
 	Edit(..),
 	Reported(..),
 	file,
+	resolved,
 	pathOf,
 	programOf,
+	sourceOf,
+	bindersOf,
+	importsOf,
 	finding,
 	named,
 	setLevel,
@@ -29,7 +33,10 @@ export (
 	checkingFixes,
 	checkOverlaps,
 	textOf,
+	treeOf,
 	charAt,
+	offsetOf,
+	spanOf,
 	nodes,
 	coveredNodes,
 )
@@ -51,7 +58,8 @@ export (
 --- removes the findings of the checks it names from what it covers, and is
 --- itself reported, by the check whose tier is `Expectations`, for each name
 --- that removed nothing. On a line of its own it covers the whole of the
---- statement, declaration or `match` arm that begins next; after code, it
+--- import, statement, declaration or `match` arm that begins next; after
+--- code, it
 --- covers the findings that begin on its line.
 
 import Data.Set as Set
@@ -68,8 +76,10 @@ import Turkey.Ast (
 	Arm(..),
 	children,
 )
+import Turkey.Binders as Binders
 import Turkey.Diag as Diag
 import Turkey.Directives (Directive(..), Kind(..), Arg(..))
+import Turkey.Modules (ImportUse)
 import Turkey.Source (Span(..))
 import Turkey.Source as Source
 import Turkey.Typed (TypeTable)
@@ -79,20 +89,66 @@ import Turkey.Typed (TypeTable)
 type Level = Allow | Warn | Deny
 
 --- One module as a check sees it: the path its spans name, the text it was
---- parsed from, and its syntax tree (`program`).
-type File = File { path : String, text : String, program : Program, var lines : Option Lines }
+--- parsed from, and its syntax tree (`program`); and, for a module the
+--- compile resolved (`resolved`), the binder table, whose `refs` give the
+--- binder each binding occurrence and reference in the tree means, and what
+--- its imports brought that its references read.
+type File = File {
+	path      : String
+	text      : String
+	program   : Program
+	binders   : Binders.Table
+	imports   : Vec ImportUse
+	var lines : Option Lines
+}
 -- `lines` is `text` split for `textOf` and `charAt`, made the first time one
--- of them asks; `file` is the only constructor, so it always matches `text`.
+-- of them asks; `file` and `resolved` are the only constructors, so it always
+-- matches `text`.
 
---- Returns the module at `path`, parsed from `text` into `program`.
-fun file(path : String, text : String, program : Program) -> File =
-	File { path = path, text = text, program = program, lines = None }
+--- Returns the module at `path`, parsed from `text` into `program`, with an
+--- empty binder table and no imports recorded, for what reads only the tree.
+fun file(path : String, text : String, program : Program) -> File = File {
+	path    = path
+	text    = text
+	program = program
+	binders = Binders.newTable()
+	imports = []
+	lines   = None
+}
+
+--- Returns the module at `path`, parsed from `text` into `program`, which
+--- resolution recorded in `binders` and whose imports' use is `imports`
+--- (`Turkey.Modules.importUses`). The table is the compile's own, so what
+--- desugaring records in it later is there for a check of the typed tier.
+fun resolved(
+	path : String,
+	text : String,
+	program : Program,
+	binders : Binders.Table,
+	imports : Vec ImportUse,
+) -> File = File {
+	path    = path
+	text    = text
+	program = program
+	binders = binders
+	imports = imports
+	lines   = None
+}
+
+--- Returns the binder table `f` was resolved with.
+fun bindersOf(f : File) -> Binders.Table = f.binders
+
+--- Returns what `f`'s imports brought that its references read.
+fun importsOf(f : File) -> Vec ImportUse = f.imports
 
 --- Returns the path `f`'s spans name.
 fun pathOf(f : File) -> String = f.path
 
 --- Returns `f`'s tree: as written before desugaring, and desugared after.
 fun programOf(f : File) -> Program = f.program
+
+--- Returns the text `f` was parsed from.
+fun sourceOf(f : File) -> String = f.text
 
 --- When a check runs, and what it is given.
 ---
@@ -284,8 +340,8 @@ fun scopeOf(d : Directive, coverable : Vec Span, all : Vec Span) -> Span {
 }
 
 -- The spans of the nodes the author wrote in `f`: first those an own-line
--- directive can cover, its declarations, statements, methods and `match`
--- arms, then those and every expression.
+-- directive can cover, its imports, declarations, statements, methods and
+-- `match` arms, then those and every expression.
 fun nodeSpans(f : File) -> (Vec Span, Vec Span) {
 	let coverable = []
 	let all = []
@@ -296,6 +352,7 @@ fun nodeSpans(f : File) -> (Vec Span, Vec Span) {
 		add(s, coverable)
 		add(s, all)
 	}
+	for imp in f.program.imports { both(imp.span) }
 	for d in f.program.decls {
 		let s = match d {
 			DStmt(st)    -> st.span
@@ -712,12 +769,47 @@ fun offset(lines : Lines, line : Int, col : Int) -> Int {
 	if at > len(lines.codes) { len(lines.codes) } else { at }
 }
 
+--- Returns `f`'s tree.
+fun treeOf(f : File) -> Program = f.program
+
 --- Returns the text `span` covers in `f`.
 fun textOf(f : File, span : Span) -> String {
 	let lines = linesIn(f)
 	let from = offset(lines, span.line, span.col)
 	let to = offset(lines, span.endLine, span.endCol)
 	String.fromCodePoints(Array.slice(lines.codes, from, if to < from { from } else { to }))
+}
+
+--- Returns where `line:col` is in `f`'s text, counted in code points from
+--- its start, or the end of the text for a place past it.
+fun offsetOf(f : File, line : Int, col : Int) -> Int = offset(linesIn(f), line, col)
+
+--- Returns the span of `f` from the offset `from` to the offset `to`
+--- (`offsetOf`), in the file `like` names.
+fun spanOf(f : File, from : Int, to : Int, like : Span) -> Span {
+	let lines = linesIn(f)
+	let (line, col) = placeOf(lines, from)
+	let (endLine, endCol) = placeOf(lines, to)
+	Span {
+		line    = line
+		col     = col
+		endLine = endLine
+		endCol  = endCol
+		file    = like.file
+		inlined = None
+	}
+}
+
+-- The line and column of the offset `at`, by binary search for the last line
+-- that starts at or before it.
+fun placeOf(lines : Lines, at : Int) -> (Int, Int) {
+	var low = 0
+	var high = len(lines.starts) - 1
+	while low < high {
+		let mid = (low + high + 1) / 2
+		if lines.starts[mid] <= at { low = mid } else { high = mid - 1 }
+	}
+	(low + 1, at - lines.starts[low] + 1)
 }
 
 --- Returns the character at the start of `span` in `f`, if there is one.

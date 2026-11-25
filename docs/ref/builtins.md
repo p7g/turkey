@@ -351,7 +351,8 @@ class Shift a {
 ```
 
 For `Int`, `div` rounds toward negative infinity and `mod` takes the sign of
-the divisor, so `div(a, b) * b + mod(a, b) == a` ([Int](types.md#int)).
+the divisor, so `div(a, b) * b + mod(a, b) == a` as arithmetic on integers
+([Int](types.md#int)).
 
 `Int` and `Byte` have instances of the four bitwise classes
 ([Bitwise operators](expressions.md#bitwise-operators)), and `Set` has

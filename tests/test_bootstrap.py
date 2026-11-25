@@ -170,9 +170,9 @@ def test_the_wasm_compiler_writes_what_the_native_one_does(tmp_path):
     has 16 GB.
 
     That is close to wasm32's 4 GiB ceiling, and the heap caps its threshold
-    to stay under it. The compile for arm64-darwin peaks at 3.37 GiB. It fails
-    under `-W max-memory-size` of 3392 MiB and passes at 3456 MiB, which
-    leaves 0.6 GiB of headroom.
+    to stay under it. The compile for arm64-darwin fails under
+    `-W max-memory-size` of 3328 MiB and passes at 3392 MiB, which leaves
+    0.69 GiB of headroom.
 
     wasmtime's default engine stack, 512 KiB, is what it runs with: GC roots
     are in the shadow stack in linear memory, and the self-compile's deepest

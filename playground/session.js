@@ -1,13 +1,13 @@
 // A compile-and-run session for one editor on a page: the editor's
-// highlighting, Run and Stop, Format, and the output pane. Compiling happens
-// in one Worker, highlighting and formatting in a second, and running in a
-// third, so the page itself never waits. The playground and each lesson of
-// the tour start one.
+// highlighting and diagnostic marks, Run and Stop, Format, and the output
+// pane. Compiling happens in one Worker, checking, highlighting and
+// formatting in a second, and running in a third, so the page itself never
+// waits. The playground and each lesson of the tour start one.
 //
 // The Workers are found beside this module, and each fetches `turkey.wasm`
 // relative to itself, so a page in another directory starts the same ones.
 
-import { diagnosticsFor } from "./diagnostics.js";
+import { diagnosticsFor, marksFor } from "./diagnostics.js";
 import { attachEditor, replaceText } from "./editor.js";
 
 /**
@@ -55,7 +55,49 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   const editor = attachEditor(source, highlighted, (text) => {
     pendingHighlight = text;
     flushHighlight();
+    checkWhenIdle();
   });
+
+  // The editor's marks come from `turkey check`, run in the tools Worker once
+  // typing has paused for `IDLE_MS`, and at once when a Run fails to compile.
+  // A check takes about 0.7 s for a program of any size up to a few hundred
+  // lines, most of it spent on the Prelude, and the Worker highlights nothing
+  // while one runs. Waiting for a pause keeps checks from running mid-word
+  // and holding up the highlighting of the next keystrokes. One check is in
+  // flight at a time, a text already checked is not checked again, and a
+  // reply for text since edited is dropped.
+  const IDLE_MS = 500;
+  let checking = false;
+  let checkAgain = false; // a check was asked for while one was in flight
+  let checked = null; // the text the marks were made for
+  let idle = null;
+  function checkWhenIdle() {
+    clearTimeout(idle);
+    idle = setTimeout(checkNow, IDLE_MS);
+  }
+  function checkNow() {
+    clearTimeout(idle);
+    if (!toolsReady || source.value === checked) {
+      return;
+    }
+    if (checking) {
+      checkAgain = true;
+      return;
+    }
+    checking = true;
+    tools.postMessage({ type: "check", id: 0, source: source.value });
+  }
+  function checkedSource(data) {
+    checking = false;
+    if (data.source === source.value) {
+      checked = data.source;
+      editor.mark(marksFor(data.source, data.diagnostics));
+    }
+    if (checkAgain) {
+      checkAgain = false;
+      checkNow();
+    }
+  }
 
   let compiler = null; // the compile Worker
   let runner = null; // the run Worker, idle or running
@@ -107,7 +149,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       } else if (data.type === "ready") {
         if (turkeyModule === null) {
           turkeyModule = data.module;
-          tools?.postMessage({ type: "load", module: turkeyModule, lib: false });
+          tools?.postMessage({ type: "load", module: turkeyModule, lib: true });
         }
         if (phase === "loading") {
           setPhase("idle", "Ready.");
@@ -204,6 +246,8 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
         ["status", status],
       ]);
       setPhase("idle", "Compile failed.");
+      // The marks show where, if the idle check has not already.
+      checkNow();
       return;
     }
     const asked = timeLimit();
@@ -259,23 +303,24 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   });
   stopButton.addEventListener("click", stop);
 
-  // -- Highlighting and Format -------------------------------------------------
+  // -- Highlighting, checking and Format ---------------------------------------
 
-  // A tools Worker that fails leaves the editor working, unhighlighted, and
-  // Format disabled with the reason beside it. It is not restarted: it runs
+  // A tools Worker that fails leaves the editor working, unhighlighted and
+  // unmarked, and Format disabled with the reason beside it. It is not restarted: it runs
   // nothing of the user's that could crash it, so it would fail again.
   function startTools() {
     const worker = new Worker(new URL("compile-worker.js", import.meta.url), { type: "module", name: "tools" });
     tools = worker;
     // It loads once the compile Worker has compiled `turkey.wasm`.
     if (turkeyModule !== null) {
-      worker.postMessage({ type: "load", module: turkeyModule, lib: false });
+      worker.postMessage({ type: "load", module: turkeyModule, lib: true });
     }
     const failed = (text) => {
       worker.terminate();
       tools = null;
       toolsReady = false;
       highlighting = false;
+      checking = false;
       formatting = null;
       formatButton.disabled = true;
       note.textContent = `Highlighting and Format are unavailable: ${text}`;
@@ -285,6 +330,9 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
         toolsReady = true;
         formatButton.disabled = false;
         flushHighlight();
+        checkNow();
+      } else if (data.type === "checked") {
+        checkedSource(data);
       } else if (data.type === "failed") {
         failed(data.text);
       } else if (data.type === "highlighted") {

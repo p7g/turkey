@@ -1,15 +1,17 @@
 // The compile Worker: loads the compiler once, when the page says how, then
 // answers each `compile` message with the program's bytes or the compiler's
-// diagnostics, and each `highlight` and `format` message with what those
-// commands write. A module Worker, so it imports `host.js` as the page does.
+// diagnostics, and each `check`, `highlight` and `format` message with what
+// those commands write. A module Worker, so it imports `host.js` as the page
+// does.
 //
 // The page starts it twice: once to compile, and once, as the tools Worker,
-// to highlight and format, so that neither waits behind a compile that takes
-// seconds. `turkey.wasm` is compiled once per page: the first compile Worker
-// fetches and compiles it and hands the `WebAssembly.Module` to the page,
-// which passes it to the tools Worker and to any compile Worker it starts
-// later. Only a compile Worker fetches `lib.tar.gz`, since neither
-// highlighting nor formatting reads the library.
+// to check, highlight and format, so that none of them waits behind a compile
+// that takes seconds. `turkey.wasm` is compiled once per page: the first
+// compile Worker fetches and compiles it and hands the `WebAssembly.Module` to
+// the page, which passes it to the tools Worker and to any compile Worker it
+// starts later. Both fetch `lib.tar.gz`, which `check` reads as `compile` does;
+// the tools Worker is told to load after the compile Worker has, so its fetch
+// is answered from the HTTP cache.
 //
 // Messages in:  { type: "load", module, lib }       first, and once: `module`
 //                                                   is a compiled turkey.wasm
@@ -17,17 +19,21 @@
 //                                                   `lib` says whether to
 //                                                   fetch lib.tar.gz
 //               { type: "compile", id, source }
+//               { type: "check", id, source }
 //               { type: "highlight", id, source }
 //               { type: "format", id, source }
 // Messages out: { type: "status", text }            progress while loading
 //               { type: "ready", module }           the compiler is loaded
 //               { type: "failed", text }            loading failed for good
 //               { type: "compiled", id, bytes, status, diagnostics, ms }
+//               { type: "checked", id, source, diagnostics, ms }
 //               { type: "highlighted", id, source, html }
 //               { type: "formatted", id, source, text, status, diagnostics }
-// where `html` and `text` are null if the command failed.
+// where `html` and `text` are null if the command failed, and a `checked`
+// message's `diagnostics` is what `check` returns as `diagnostics`, empty if
+// the check failed.
 
-import { loadCompiler, compile, highlight, format } from "./host.js";
+import { loadCompiler, compile, check, highlight, format } from "./host.js";
 
 // Both files are fetched with the default cache mode, so the browser's HTTP
 // cache decides whether the network is touched: the server's validators
@@ -110,6 +116,14 @@ const handlers = {
         ms: performance.now() - started,
       });
     }
+  },
+  async check(compiler, { id, source }) {
+    const started = performance.now();
+    let diagnostics = [];
+    try {
+      diagnostics = (await check(compiler, source)).diagnostics;
+    } catch {}
+    postMessage({ type: "checked", id, source, diagnostics, ms: performance.now() - started });
   },
   async highlight(compiler, { id, source }) {
     let html = null;

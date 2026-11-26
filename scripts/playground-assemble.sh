@@ -16,9 +16,9 @@
 #
 # The page's picker of example programs is built from the recorded programs
 # tests/programs/playground_NAME/Main.gob, so the suite and the page run the
-# same source. OUT/examples/NAME.gob is each one's source without its first
-# line, which is its title as a `-- ` comment, and without its `--%` suite
-# directives and the blank line before them. OUT/examples/index.json lists them
+# same source. OUT/examples/NAME.gob is each one's source, title line kept,
+# without its `--%` suite directives and the blank line before them, so line
+# numbers match the goldens. OUT/examples/index.json lists them
 # as [{"name": NAME, "title": TITLE, "file": "examples/NAME.gob"}], `hello`
 # first and the rest sorted by name.
 #
@@ -71,8 +71,8 @@ for name in $names; do
             exit 1
             ;;
     esac
-    # Drop the title, the directives, and the blank lines left before them.
-    sed -e '1d' -e '/^--%/d' "$src" |
+    # Drop the directives, and the blank lines left before them.
+    sed -e '/^--%/d' "$src" |
         awk '{ lines[NR] = $0 } END { n = NR; while (n > 0 && lines[n] == "") n--; for (i = 1; i <= n; i++) print lines[i] }' \
         > "$out/examples/$name.gob"
     printf '%s\n  {"name": "%s", "title": "%s", "file": "examples/%s.gob"}' "$sep" "$name" "$title" "$name" \

@@ -8,8 +8,8 @@ one's assignment. Two counters have a `count` each.
 A call is in *tail position* when its result is the function's result, with
 nothing left to do after it. Such a call takes the place of its caller's
 frame, so recursion through tail calls runs in constant stack however deep
-it goes, and that holds between functions that call each other too.
-`sumTo` goes a hundred million calls deep.
+it goes. The same holds for functions that call each other, like `isEven`
+and `isOdd`. `sumTo` goes a hundred million calls deep.
 
 <!-- run -->
 ```kotlin

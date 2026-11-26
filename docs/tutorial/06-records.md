@@ -37,11 +37,12 @@ Ada: 13
 Grace: 5
 ```
 
-`players` is bound with `let`, and its players still change: `let` fixes the
-name, not the object. Arrays work the same way, and their elements can be
-assigned too.
+`players` is bound with `let`, and its players still change, because `let`
+fixes only which object the name refers to. Arrays work the same way, and
+their elements can be assigned too.
 
-A field without `var` can't be assigned, and the error says where to fix it:
+A field without `var` can't be assigned, and the error names the type whose
+declaration would need the `var`:
 
 <!-- error: cannot assign to field 'name': it is not 'var' in 'Player' -->
 ```kotlin

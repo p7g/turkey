@@ -1178,6 +1178,8 @@ fun main() {
 
 def test_running_out_of_a_tasks_stack_panics():
     # A 256 MB engine stack, so that the task's shadow stack runs out first.
+    # Not under GC stress: some 30,000 frames each allocating, every
+    # collection walking all of them, is minutes of marking for no new path.
     engine = ("-W", "max-wasm-stack=268435456")
     fits = _run(TASK_OVERFLOW, "1000", engine=engine)
     assert (fits.returncode, fits.stdout) == (0, "1000\n"), fits.stderr
@@ -1186,6 +1188,94 @@ def test_running_out_of_a_tasks_stack_panics():
     lines = result.stderr.splitlines()
     assert lines[0] == "panic: stack overflow", result.stderr
     assert lines[1].startswith("  at depth (Main.gob:")
+    assert lines[-1] == "  at start (Turkey/Coroutine.gob:160:3)"
+
+
+# A closure that calls the next closure in tail position, a hundred thousand
+# deep, and switches on the way: each rewind goes on from the caller to the
+# closure whose frame is parked in its place, through its rewind entry.
+CLOSURE_TAIL_SWITCH = """\
+import System.Env as Env
+import System.Task as Task
+
+fun build(n : Int, k : fun(Int) -> Int) -> fun(Int) -> Int = if n == 0 {
+    k
+} else {
+    build(n - 1, fun(x : Int) -> Int {
+        if x % 1000 == 0 { Task.yield() }
+        k(x + 1)
+    })
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    print(Task.runScope(do {
+        let a = Task.spawn(fun() = build(n, fun(x) = x)(0))?
+        let b = Task.spawn(fun() = build(n / 2, fun(x) = -x)(0))?
+        pure((Task.join(a), Task.join(b)))
+    }))
+}
+"""
+
+
+@both
+def test_a_closure_tail_call_switches(stress):
+    n = 3000 if stress else 100000
+    result = _run(CLOSURE_TAIL_SWITCH, str(n), stress=stress)
+    assert (result.returncode, result.stdout) == (0, f"({n}, {-(n // 2)})\n"), result.stderr
+
+
+# A task that panics after a switch, joined by the program's own code. The
+# trace is the task's own frames, out to its start, as a native build prints
+# it, though the panic goes on returning through the program's.
+TASK_PANIC = """\
+import System.Env as Env
+import System.Task as Task
+
+fun down(n : Int) -> Int = if n == 0 {
+    Task.yield()
+    error("boom")
+} else {
+    down(n - 1) + 1
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    print(Task.runScope(do {
+        let t = Task.spawn(fun() = down(n))?
+        pure(Task.join(t))
+    }))
+}
+"""
+
+
+@both
+def test_a_task_panic_traces_the_task(stress):
+    result = _run(TASK_PANIC, "0", stress=stress)
+    assert (result.returncode, result.stdout) == (1, ""), result.stderr
+    assert result.stderr.splitlines() == [
+        "panic: boom",
+        "  at error (Control/Panic.gob:8:36)",
+        "  at down (Main.gob:6:5)",
+        "  at spawn (System/Task.gob:88:15)",
+        "  at start (Turkey/Coroutine.gob:160:3)",
+    ]
+
+
+def test_a_deep_task_panic_counts_the_frames_left_out():
+    # As native counts them: the task's frames and two under its start.
+    result = _run(TASK_PANIC, "100")
+    assert result.returncode == 1, result.stderr
+    lines = result.stderr.splitlines()
+    assert lines[50] == "  ... 41 more frames"
+    assert lines[-3:] == ["  at down (Main.gob:8:5)", "  at spawn (System/Task.gob:88:15)",
+                          "  at start (Turkey/Coroutine.gob:160:3)"]
 
 
 # -- the build ------------------------------------------------------------------------

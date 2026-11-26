@@ -59,6 +59,7 @@ import Turkey.Wasm as W
 import Turkey.Wasm.Module as M
 import Turkey.Wasm.Resume as Resume
 import Turkey.Wasm.Select as S
+import Turkey.Wasm.Types as Types
 
 --- A function selection stopped in, and what stopped it.
 type Unsupported = Unsupported { name : String, what : String }
@@ -134,10 +135,7 @@ fun build(
 	let functions = Map.new()
 	let results = Map.new()
 	for f in m.functions {
-		let t = M.addType(wasm, W.FuncType {
-			params  = Vec.toArray(Vec.map(f.params, fun(p) = S.valType(Ssa.repOf(f, p))))
-			results = Array.map(f.results, S.valType)
-		})
+		let t = M.addType(wasm, Types.functionType(f))
 		Map.put(functions, f.name, M.declareFunc(wasm, f.name, t))
 		Map.put(results, f.name, f.results)
 	}
@@ -164,7 +162,7 @@ fun build(
 		if let (Some(f), Some(callee)) = (Map.get(functions, name), Map.get(byName, name)) {
 			let t = M.addType(wasm, W.FuncType {
 				params  = []
-				results = Array.map(Map.getOr(results, name, []), S.valType)
+				results = Array.map(Map.getOr(results, name, []), Types.valType)
 			})
 			let entry = M.declareFunc(wasm, name + " rewind", t)
 			Vec.push(slotted, entry)
@@ -300,11 +298,22 @@ fun build(
 
 -- The code selection calls inside an instruction -- an allocation's slow
 -- path, the write barrier, a panic, a trace's entry -- has no resume point
--- around it, since a rewind can only reach an instruction from its start. So
--- none of it may switch stacks. Nor may early initialization, which runs
--- before there is a stack to switch from.
+-- around it, since a rewind can only reach an instruction from its start.
+-- Nor do the calls `_start` and the entry make outside `drive`, which only
+-- `main` and the globals' initializer are called through: `turkey_main`,
+-- around the entry, and the entry's setup and its end. So none of these may
+-- switch stacks. Nor may early initialization, which runs before there is a
+-- stack to switch from.
 fun checkSwitching(m : Module, switching : Resume.Switching) -> Unit {
-	let inside = [
+	let unresumable = [
+		"turkey_main",
+		"turkey_entry_stack_set",
+		"turkey_root_enter",
+		"turkey_frame_table_set",
+		"turkey_trace_table_set",
+		"turkey_static_register",
+		"turkey_entry_returned",
+		"turkey_trace_close",
 		"turkey_object_new",
 		"turkey_cell_new",
 		"turkey_array_new",
@@ -314,13 +323,13 @@ fun checkSwitching(m : Module, switching : Resume.Switching) -> Unit {
 		"turkey_panic_string",
 		"turkey_trace_push",
 	]
-	for symbol in inside {
+	for symbol in unresumable {
 		if let Some(name) = Map.get(switching.defined, symbol) {
 			if Map.contains(switching.switching, name) {
 				error(
 					"internal error: "
 						+ symbol
-						+ " may switch stacks, and selection calls it where no rewind can reach",
+						+ " may switch stacks, and is called where no rewind can reach",
 				)
 			}
 		}
@@ -337,7 +346,7 @@ fun checkSwitching(m : Module, switching : Resume.Switching) -> Unit {
 -- results of.
 fun rewindEntry(callee : Func Low, index : Int) -> Array W.Op {
 	let out = []
-	for p in callee.params { Vec.push(out, zero(S.valType(Ssa.repOf(callee, p)))) }
+	for p in callee.params { Vec.push(out, zero(Types.valType(Ssa.repOf(callee, p)))) }
 	Vec.push(out, W.ReturnCall(index))
 	Vec.toArray(out)
 }
@@ -656,6 +665,21 @@ fun drive(cx : S.Context, out : Vec W.Op, bottom : fun() -> Unit, switches : Boo
 	word(Rt.stackLow)
 	Vec.push(out, W.IntEqz(W.W64))
 	Vec.push(out, W.BrIf(2))
+	-- A coroutine whose body panicked: its trace ends with its own frames,
+	-- as on arm64, though the panic goes on returning through the resumer's.
+	if let Some(name) = Map.get(cx.defined, "turkey_trace_close") {
+		if let Some(close) = Map.get(cx.functions, name) {
+			flags()
+			Vec.push(out, W.Load(W.I32Load, 0))
+			Vec.push(out, W.ConstI32(1))
+			Vec.push(out, W.IntBin(W.W32, W.And))
+			Vec.push(out, W.If(W.Empty))
+			Vec.push(out, W.ConstI64(0))
+			Vec.push(out, W.Call(close))
+			for _ in Map.getOr(cx.results, name, []) { Vec.push(out, W.Drop) }
+			Vec.push(out, W.End)
+		}
+	}
 	flags()
 	word(Rt.stackResumedBy)
 	Vec.push(out, W.Store(W.I64Store, Rt.workerRunningStack))

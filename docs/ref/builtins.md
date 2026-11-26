@@ -78,9 +78,9 @@ so `False < True`.
 type Option a = None | Some(a)
 ```
 
-A value that may be absent. The `Iterator` class's `next` returns an
-`Option` to say whether there is another element, and `Option` is a `Monad`
-whose `?` stops at the first `None` ([`?`](do-notation.md)).
+A value that may be absent. `Option` is a `Monad` whose `?` stops at the first
+`None` ([`?`](do-notation.md)), and iterating an `Option` gives its one element,
+or none.
 
 ## `Either`
 
@@ -659,38 +659,34 @@ class Iterator c {
     type Cursor c
 
     fun iter(c) -> Cursor c
-    fun next(c, Cursor c) -> Option (Item c)
+    fun next(c, Cursor c) -> Iter.Step (Item c) (Cursor c)
 }
+
+type Iter.Step a s = Done | Yield(a, s)
 ```
 
 `for x in c` runs over any type with an `Iterator` instance
 ([`for` over a collection](statements.md#for-over-a-collection)). `Item c` is
-the element type, and `Cursor c` is the type of the state that records how far
-the loop has got. `iter` makes a new cursor, and `next` returns the next
-element and advances the cursor, or returns `None` when there are no more. The
-cursor is usually a mutable record, and nothing asks the collection for its
-length, so a type can be iterated even when it cannot be indexed, such as a
-linked list or a generated sequence:
+the element type, and `Cursor c` is the type of a *position* in `c`. `iter`
+returns the position of the first element, and `next` returns the element at
+a position together with the position after it, as `Iter.Yield(x, after)`, or
+`Iter.Done` when there are no more. `next` changes nothing, so a position can
+be kept and stepped from again, and a second loop over `c` starts again from
+the beginning. Nothing asks the collection for its length, so a type can be
+iterated even when it cannot be indexed, such as a linked list or a generated
+sequence:
 
 <!-- run -->
 ```kotlin
 type Countdown = Countdown { from : Int }
-type CountdownCursor = CountdownCursor { var current : Int }
 
 instance Iterator Countdown {
     type Item = Int
-    type Cursor = CountdownCursor
+    type Cursor = Int
 
-    fun iter(c) = CountdownCursor { current = c.from }
+    fun iter(c) = c.from
 
-    fun next(c, cursor) {
-        if cursor.current == 0 {
-            return None
-        }
-        let value = cursor.current
-        cursor.current = value - 1
-        Some(value)
-    }
+    fun next(_, n) = if n == 0 { Iter.Done } else { Iter.Yield(n, n - 1) }
 }
 
 fun main() {
@@ -704,6 +700,32 @@ fun main() {
 3
 2
 1
+```
+
+A source that keeps its position itself has `()` as its cursor, and every loop
+over it continues from where the last one stopped instead of starting again.
+`Iter.resumable(xs)` makes one from any iterator:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let rest = Iter.resumable(["title", "", "a", "b"])
+    for line in rest {
+        if line == "" {
+            break
+        }
+        print("header: " + line)
+    }
+    for line in rest {
+        print("body: " + line)
+    }
+}
+```
+
+```text
+header: title
+body: a
+body: b
 ```
 
 `Iter.any`, `Iter.all`, `Iter.count` and `Iter.find` ask a

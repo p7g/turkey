@@ -523,16 +523,21 @@ h
 é
 ```
 
-The loop asks the collection for a *cursor*, then asks for the next element
-until there is none. It is approximately equivalent to:
+The loop asks the collection for a *cursor*, the position of its first
+element, then for the element at the cursor and the cursor after it, until
+there is none. It is approximately equivalent to:
 
 ```text
 {
-    let $cursor = iter(e)
+    let $seq = e
+    var $cursor = iter($seq)
     loop {
-        match next(e, $cursor) {
-            Some(x) -> B
-            None -> break
+        match next($seq, $cursor) {
+            Iter.Yield(x, $after) -> {
+                $cursor = $after
+                B
+            }
+            Iter.Done -> break
         }
     }
 }

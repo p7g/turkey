@@ -1,7 +1,7 @@
--- `for x in xs` is `Iterator`: `iter` makes a cursor and `next` advances it,
--- answering `Option (Item xs)`. Both the element type and the cursor type are
--- associated families, so the loop variable's type is computed from the
--- container and nobody has to write it down.
+-- `for x in xs` is `Iterator`: `iter` makes a cursor and `next` answers the
+-- element at it with the cursor after it, or `Done`. Both the element type and
+-- the cursor type are associated families, so the loop variable's type is
+-- computed from the container and nobody has to write it down.
 --
 -- The linked list below is why iteration is cursor-based rather than indexed:
 -- it has no kth element to hand out, and under an indexed protocol a loop over
@@ -9,119 +9,105 @@
 -- case.
 
 type Range = Range { from : Int, to : Int }
-type RangeCursor = RangeCursor { var at : Int }
 
 instance Iterator Range {
-    type Item = Int
-    type Cursor = RangeCursor
+	type Item = Int
+	type Cursor = Int
 
-    fun iter(r) = RangeCursor { at = r.from }
+	fun iter(r) = r.from
 
-    fun next(r, cur) {
-        if cur.at >= r.to { return None }
-        let x = cur.at
-        cur.at = cur.at + 1
-        Some(x)
-    }
+	fun next(r, x) = if x < r.to { Iter.Yield(x, x + 1) } else { Iter.Done }
 }
 
 type List a = Nil | Cons(a, List a)
-type ListCursor a = ListCursor { var rest : List a }
 
 instance Iterator (List a) {
-    type Item = a
-    type Cursor = ListCursor a
+	type Item = a
+	type Cursor = List a
 
-    fun iter(xs) = ListCursor { rest = xs }
+	fun iter(xs) = xs
 
-    fun next(xs, cur) = match cur.rest {
-        Nil -> None
-        Cons(h, t) -> {
-            cur.rest = t
-            Some(h)
-        }
-    }
+	fun next(_, rest) = match rest {
+		Nil        -> Iter.Done
+		Cons(h, t) -> Iter.Yield(h, t)
+	}
 }
 
 type Pair a = Pair(a, a)
-type PairCursor = PairCursor { var taken : Int }
 
 instance Iterator (Pair a) {
-    type Item = a
-    type Cursor = PairCursor
+	type Item = a
+	type Cursor = Int
 
-    fun iter(p) = PairCursor { taken = 0 }
+	fun iter(_) = 0
 
-    fun next(p, cur) {
-        let k = cur.taken
-        cur.taken = k + 1
-        if k >= 2 { return None }
-        match p {
-            Pair(x, y) -> if k == 0 { Some(x) } else { Some(y) }
-        }
-    }
+	fun next(Pair(x, y), taken) = match taken {
+		0 -> Iter.Yield(x, 1)
+		1 -> Iter.Yield(y, 2)
+		_ -> Iter.Done
+	}
 }
 
 -- Inferred over any iterator whose elements add.
 fun total(xs) {
-    var sum = 0
-    for x in xs {
-        sum = sum + x
-    }
-    sum
+	var sum = 0
+	for x in xs {
+		sum = sum + x
+	}
+	sum
 }
 
 -- The annotation is what makes this one concrete. Without it `Item xs ~ Add a`
 -- would be an equation nothing here could decide.
 fun join(xs : Array String) -> String {
-    var out = ""
-    for x in xs {
-        out = out + x
-    }
-    out
+	var out = ""
+	for x in xs {
+		out = out + x
+	}
+	out
 }
 
 -- The class is ordinary, so its methods are callable by name.
-fun firstOf(xs) {
-    let cur = iter(xs)
-    next(xs, cur)
+fun firstOf(xs) = match next(xs, iter(xs)) {
+	Iter.Yield(x, _) -> Some(x)
+	Iter.Done        -> None
 }
 
 fun main() {
-    print(total([1, 2, 3, 4]))
-    print(total(Range { from = 10, to = 15 }))
-    print(total(Pair(20, 22)))
-    print(total(Cons(1, Cons(2, Cons(39, Nil)))))
-    print(join(["x", "y", "z"]))
-    print(firstOf(Pair("a", "b")))
-    let empty : List Int = Nil
-    print(firstOf(empty))
+	print(total([1, 2, 3, 4]))
+	print(total(Range { from = 10, to = 15 }))
+	print(total(Pair(20, 22)))
+	print(total(Cons(1, Cons(2, Cons(39, Nil)))))
+	print(join(["x", "y", "z"]))
+	print(firstOf(Pair("a", "b")))
+	let empty : List Int = Nil
+	print(firstOf(empty))
 
-    -- `continue` still advances, and `break` leaves early.
-    var seen = 0
-    let ten = Range { from = 0, to = 10 }
-    for i in ten {
-        if i % 2 == 0 { continue }
-        if i > 6 { break }
-        seen = seen + i
-    }
-    print(seen)
+	-- `continue` still advances, and `break` leaves early.
+	var seen = 0
+	let ten = Range { from = 0, to = 10 }
+	for i in ten {
+		if i % 2 == 0 { continue }
+		if i > 6 { break }
+		seen = seen + i
+	}
+	print(seen)
 
-    -- `Int.range` is the library's half-open range; empty when `from >= to`.
-    for i in Int.range(3, 6) { print(i) }
-    print(total(Int.range(5, 5)))
-    print(total(Int.range(7, 2)))
-    print(total(Int.range(-2, 3)))
+	-- `Int.range` is the library's half-open range; empty when `from >= to`.
+	for i in Int.range(3, 6) { print(i) }
+	print(total(Int.range(5, 5)))
+	print(total(Int.range(7, 2)))
+	print(total(Int.range(-2, 3)))
 
-    -- The questions every element can be asked, over any iterator.
-    let odd = _ % 2 != 0
-    print(Iter.any(Int.range(0, 10), _ > 8))
-    print(Iter.any(Int.range(0, 0), _ > 8))
-    print(Iter.all(Cons(1, Cons(3, Nil)), odd))
-    print(Iter.all(Int.range(0, 0), odd))
-    print(Iter.all([1, 2, 3], odd))
-    print(Iter.count(Int.range(0, 10), odd))
-    print(Iter.count(Int.range(4, 1), odd))
-    print(Iter.find(Pair("pear", "plum"), String.startsWith(_, "pl")))
-    print(Iter.find(["fig"], String.startsWith(_, "pl")))
+	-- The questions every element can be asked, over any iterator.
+	let odd = _ % 2 != 0
+	print(Iter.any(Int.range(0, 10), _ > 8))
+	print(Iter.any(Int.range(0, 0), _ > 8))
+	print(Iter.all(Cons(1, Cons(3, Nil)), odd))
+	print(Iter.all(Int.range(0, 0), odd))
+	print(Iter.all([1, 2, 3], odd))
+	print(Iter.count(Int.range(0, 10), odd))
+	print(Iter.count(Int.range(4, 1), odd))
+	print(Iter.find(Pair("pear", "plum"), String.startsWith(_, "pl")))
+	print(Iter.find(["fig"], String.startsWith(_, "pl")))
 }

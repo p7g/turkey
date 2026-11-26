@@ -1,5 +1,6 @@
 export (
 	Iterator(..),
+	Step(..),
 	any,
 	all,
 	count,
@@ -55,26 +56,38 @@ export (
 import Prelude ()
 import Data.Bool (Bool(..))
 import Data.Int (Int)
+import Data.Int as Int
 import Data.Eq ((==))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Mul(..), Zero(..), One(..), (+), (-), (*))
+import Data.Num (Add(..), Mul(..), Neg(..), Zero(..), One(..), (+), (-), (*), (/), (%))
 import Data.Option (Option(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Array (Array)
 import Data.Array as Array
 import Data.Vec (Vec)
 import Data.Vec as Vec
-import Control.Monad (Monad(..))
 import Control.Panic (error)
 import Text.Show (Show(..))
 
+--- What can be walked by `for`: `iter` gives the cursor at the start, and
+--- `next` the element at a cursor with the cursor after it, or `Done`. `next`
+--- changes nothing, so a cursor is a position: stepping one cursor twice gives
+--- the same element twice, and a walk restarts by calling `iter` again. A
+--- source whose cursor is `()` keeps its position itself (`System.IO`'s
+--- `Lines`, `resumable`), and every walk of it shares that position.
 class Iterator c {
 	type Item c
 	type Cursor c
 
 	fun iter(c) -> Cursor c
-	fun next(c, Cursor c) -> Option (Item c)
+	fun next(c, Cursor c) -> Step (Item c) (Cursor c)
 }
+
+--- What `next` answers: no more elements, or the next element and the cursor
+--- after it.
+type Step a s
+	= Done
+	| Yield(a, s)
 
 -- The questions asked of every element in turn. `any`, `all` and `find` stop
 -- at the element that decides the answer and pull nothing after it, so they
@@ -218,33 +231,39 @@ fun collect[Iterator c](xs : c) -> Array (Item c) {
 -- Adapters.
 --
 -- Each adapter is a record describing a pipeline and an `Iterator` instance
--- for it. Building one pulls nothing: work happens in `next`, one element at a
--- time, so an adapter over an endless source is fine as long as the consumer
--- stops. The state of a walk lives in the cursor, not in the adapter, so the
--- same adapter can be iterated again from the start.
+-- for it. Building one pulls nothing: work happens in `iter` and `next`, which
+-- a loop calls as it starts and once per element, so an adapter over an endless
+-- source is fine as long as the consumer stops. The state of a walk is the
+-- cursor, a value `next` returns rather than changes, so the same adapter can
+-- be iterated again from the start, and a cursor kept aside resumes from where
+-- it was.
 --
--- A cursor record takes its source's cursor *type* as a parameter rather than
--- declaring a field `Cursor c`: a record whose field is declared with an
--- associated type cannot be built.
--- For the same reason an adapter holding a function takes the element type as
--- its own parameter, tied to the source by `Item c ~ a` in the instance.
+-- A cursor is a tuple of the source's cursor and the adapter's own state, not
+-- a record: a record whose field is declared with an associated type cannot be
+-- built. For the same reason an adapter holding a function takes the element
+-- type as its own parameter, tied to the source by `Item c ~ a` in the
+-- instance.
+--
+-- A `next` that need not loop is one `match` with no early `return`. A
+-- `return` leaves a join behind, and the optimizer cannot move a consumer's
+-- `match` on the `Step` through it, so the `Yield` would be built and taken
+-- apart on every element.
 --
 -- None of them allocates per element, except where the element is itself an
 -- array (`windowed`, `chunked`, `combinations`, `permutations`,
--- `cartesianPower`), which each doc comment says.
+-- `cartesianPower`), which each doc comment says. `chunked`'s cursor holds the
+-- buffer each group is gathered in, which every `next` empties before it
+-- fills it and copies out of; nothing else in a cursor is ever changed.
 
 type Enumerate c = Enumerate { source : c }
-type EnumerateCursor k = EnumerateCursor { inner : k, var at : Int }
 
 instance Iterator (Enumerate c) : Iterator c {
 	type Item = (Int, Item c)
-	type Cursor = EnumerateCursor (Cursor c)
-	fun iter(e) = EnumerateCursor { inner = iter(e.source), at = 0 }
-	fun next(e, cur) {
-		let x = next(e.source, cur.inner)?
-		let i = cur.at
-		cur.at = i + 1
-		Some((i, x))
+	type Cursor = (Int, Cursor c)
+	fun iter(e) = (0, iter(e.source))
+	fun next(e, (i, cur)) = match next(e.source, cur) {
+		Done         -> Done
+		Yield(x, at) -> Yield((i, x), (i + 1, at))
 	}
 }
 
@@ -252,16 +271,17 @@ instance Iterator (Enumerate c) : Iterator c {
 fun enumerate[Iterator c](xs : c) -> Enumerate c = Enumerate { source = xs }
 
 type Zip a b = Zip { left : a, right : b }
-type ZipCursor j k = ZipCursor { left : j, right : k }
 
 instance Iterator (Zip a b) : Iterator a, Iterator b {
 	type Item = (Item a, Item b)
-	type Cursor = ZipCursor (Cursor a) (Cursor b)
-	fun iter(z) = ZipCursor { left = iter(z.left), right = iter(z.right) }
-	fun next(z, cur) {
-		let x = next(z.left, cur.left)?
-		let y = next(z.right, cur.right)?
-		Some((x, y))
+	type Cursor = (Cursor a, Cursor b)
+	fun iter(z) = (iter(z.left), iter(z.right))
+	fun next(z, (l, r)) = match next(z.left, l) {
+		Done -> Done
+		Yield(x, l2) -> match next(z.right, r) {
+			Done         -> Done
+			Yield(y, r2) -> Yield((x, y), (l2, r2))
+		}
 	}
 }
 
@@ -276,9 +296,9 @@ instance Iterator (Mapped c a b) : Iterator c, Item c ~ a {
 	type Item = b
 	type Cursor = Cursor c
 	fun iter(m) = iter(m.source)
-	fun next(m, cur) {
-		let x = next(m.source, cur)?
-		Some(m.f(x))
+	fun next(m, cur) = match next(m.source, cur) {
+		Done         -> Done
+		Yield(x, at) -> Yield(m.f(x), at)
 	}
 }
 
@@ -293,14 +313,27 @@ instance Iterator (Filtered c a) : Iterator c, Item c ~ a {
 	type Item = a
 	type Cursor = Cursor c
 	fun iter(m) = iter(m.source)
-	fun next(m, cur) {
-		loop {
-			match next(m.source, cur) {
-				Some(x) -> if m.keep(x) { return Some(x) }
-				None    -> return None
+	fun next(m, cur) = keptFrom(m.source, m.keep, cur)
+}
+
+-- The first element from `cur` on that `keep` holds for, and the cursor after
+-- it. A loop, not a recursion: the elements skipped are unbounded.
+fun keptFrom[Iterator c](
+	source : c,
+	keep : fun(Item c) -> Bool,
+	cur : Cursor c,
+) -> Step (Item c) (Cursor c) {
+	var at = cur
+	loop {
+		match next(source, at) {
+			Done -> break
+			Yield(x, after) -> {
+				if keep(x) { return Yield(x, after) }
+				at = after
 			}
 		}
 	}
+	Done
 }
 
 --- Returns the elements of `xs` that `keep` holds for. `Array.filter` is the
@@ -309,20 +342,16 @@ fun filter[Iterator c, Item c ~ a](xs : c, keep : fun(a) -> Bool) -> Filtered c 
 	Filtered { source = xs, keep = keep }
 
 type TakeWhile c a = TakeWhile { source : c, keep : fun(a) -> Bool }
-type TakeWhileCursor k = TakeWhileCursor { inner : k, var done : Bool }
 
+-- A loop stops at the `Done` and never asks again, so nothing has to record
+-- that the walk has ended.
 instance Iterator (TakeWhile c a) : Iterator c, Item c ~ a {
 	type Item = a
-	type Cursor = TakeWhileCursor (Cursor c)
-	fun iter(t) = TakeWhileCursor { inner = iter(t.source), done = False }
-	fun next(t, cur) {
-		if cur.done { return None }
-		match next(t.source, cur.inner) {
-			Some(x) -> if t.keep(x) { return Some(x) }
-			None    -> return None
-		}
-		cur.done = True
-		None
+	type Cursor = Cursor c
+	fun iter(t) = iter(t.source)
+	fun next(t, cur) = match next(t.source, cur) {
+		Done         -> Done
+		Yield(x, at) -> if t.keep(x) { Yield(x, at) } else { Done }
 	}
 }
 
@@ -332,22 +361,21 @@ fun takeWhile[Iterator c, Item c ~ a](xs : c, keep : fun(a) -> Bool) -> TakeWhil
 	TakeWhile { source = xs, keep = keep }
 
 type DropWhile c a = DropWhile { source : c, skip : fun(a) -> Bool }
-type DropWhileCursor k = DropWhileCursor { inner : k, var dropping : Bool }
 
+-- The cursor's `Bool` holds whether the elements to skip are still ahead.
 instance Iterator (DropWhile c a) : Iterator c, Item c ~ a {
 	type Item = a
-	type Cursor = DropWhileCursor (Cursor c)
-	fun iter(d) = DropWhileCursor { inner = iter(d.source), dropping = True }
-	fun next(d, cur) {
-		if !cur.dropping { return next(d.source, cur.inner) }
-		loop {
-			match next(d.source, cur.inner) {
-				Some(x) -> if !d.skip(x) {
-					cur.dropping = False
-					return Some(x)
-				}
-				None -> return None
-			}
+	type Cursor = (Bool, Cursor c)
+	fun iter(d) = (True, iter(d.source))
+	fun next(d, (dropping, cur)) {
+		let found = if dropping {
+			keptFrom(d.source, \!d.skip(_), cur)
+		} else {
+			next(d.source, cur)
+		}
+		match found {
+			Done         -> Done
+			Yield(x, at) -> Yield(x, (False, at))
 		}
 	}
 }
@@ -357,16 +385,19 @@ fun dropWhile[Iterator c, Item c ~ a](xs : c, skip : fun(a) -> Bool) -> DropWhil
 	DropWhile { source = xs, skip = skip }
 
 type Take c = Take { source : c, count : Int }
-type TakeCursor k = TakeCursor { inner : k, var left : Int }
 
+-- The cursor's `Int` is how many elements are left to take.
 instance Iterator (Take c) : Iterator c {
 	type Item = Item c
-	type Cursor = TakeCursor (Cursor c)
-	fun iter(t) = TakeCursor { inner = iter(t.source), left = t.count }
-	fun next(t, cur) {
-		if cur.left <= 0 { return None }
-		cur.left = cur.left - 1
-		next(t.source, cur.inner)
+	type Cursor = (Int, Cursor c)
+	fun iter(t) = (t.count, iter(t.source))
+	fun next(t, (left, cur)) = if left <= 0 {
+		Done
+	} else {
+		match next(t.source, cur) {
+			Done         -> Done
+			Yield(x, at) -> Yield(x, (left - 1, at))
+		}
 	}
 }
 
@@ -379,21 +410,27 @@ fun take[Iterator c](xs : c, n : Int) -> Take c {
 }
 
 type Drop c = Drop { source : c, count : Int }
-type DropCursor k = DropCursor { inner : k, var skipped : Bool }
 
+-- `iter` skips the first `count`, so the cursor is the source's own. If they
+-- run out, it is the cursor the source answered `Done` at, which answers
+-- `Done` again.
 instance Iterator (Drop c) : Iterator c {
 	type Item = Item c
-	type Cursor = DropCursor (Cursor c)
-	fun iter(d) = DropCursor { inner = iter(d.source), skipped = False }
-	fun next(d, cur) {
-		if !cur.skipped {
-			cur.skipped = True
-			for var i = 0; i < d.count; i = i + 1 {
-				if let None = next(d.source, cur.inner) { return None }
-			}
+	type Cursor = Cursor c
+	fun iter(d) = skipped(d.source, d.count, iter(d.source))
+	fun next(d, cur) = next(d.source, cur)
+}
+
+-- The cursor `n` elements after `cur`, or the one the source ends at.
+fun skipped[Iterator c](source : c, n : Int, cur : Cursor c) -> Cursor c {
+	var at = cur
+	for var i = 0; i < n; i = i + 1 {
+		match next(source, at) {
+			Done            -> return at
+			Yield(_, after) -> { at = after }
 		}
-		next(d.source, cur.inner)
 	}
+	at
 }
 
 --- Returns the elements of `xs` after the first `n`. Panics if `n` is
@@ -404,31 +441,22 @@ fun drop[Iterator c](xs : c, n : Int) -> Drop c {
 }
 
 type Pairwise c = Pairwise { source : c }
-type PairwiseCursor k a = PairwiseCursor { inner : k, var previous : a }
 
--- The cursor is absent when the source is empty, so that `previous` always
--- holds an element. A `var previous : Option a` would box every element in a
--- fresh `Some` when `a` is not a pointer.
+-- The cursor holds the element to pair with the next one, and is absent when
+-- the source is empty, so that there always is such an element.
 instance Iterator (Pairwise c) : Iterator c {
 	type Item = (Item c, Item c)
-	type Cursor = Option (PairwiseCursor (Cursor c) (Item c))
-	fun iter(p) {
-		let inner = iter(p.source)
-		match next(p.source, inner) {
-			Some(x) -> Some(PairwiseCursor { inner = inner, previous = x })
-			None    -> None
-		}
+	type Cursor = Option (Item c, Cursor c)
+	fun iter(p) = match next(p.source, iter(p.source)) {
+		Done         -> None
+		Yield(x, at) -> Some((x, at))
 	}
-	fun next(p, cursor) = match cursor {
-		Some(cur) -> match next(p.source, cur.inner) {
-			Some(b) -> {
-				let a = cur.previous
-				cur.previous = b
-				Some((a, b))
-			}
-			None -> None
+	fun next(p, held) = match held {
+		None -> Done
+		Some((a, cur)) -> match next(p.source, cur) {
+			Done         -> Done
+			Yield(b, at) -> Yield((a, b), Some((b, at)))
 		}
-		None -> None
 	}
 }
 
@@ -437,64 +465,82 @@ instance Iterator (Pairwise c) : Iterator c {
 fun pairwise[Iterator c](xs : c) -> Pairwise c = Pairwise { source = xs }
 
 type Windowed c = Windowed { source : c, size : Int }
-type WindowedCursor k a = WindowedCursor { inner : k, window : Vec a, var started : Bool }
 
+-- The cursor holds the source's cursor and its own copy of the window last
+-- yielded, or `[]` before the first: a window has at least one element, so the
+-- empty array cannot be one. The copy is the cursor's and nothing changes it,
+-- so neither a kept cursor nor a caller writing into the window it was given
+-- changes a later window. That costs a second array per window.
 instance Iterator (Windowed c) : Iterator c {
 	type Item = Array (Item c)
-	type Cursor = WindowedCursor (Cursor c) (Item c)
-	fun iter(w) = WindowedCursor {
-		inner   = iter(w.source)
-		window  = Vec.new(0)
-		started = False
-	}
-	fun next(w, cur) {
-		if !cur.started {
-			cur.started = True
-			while len(cur.window) < w.size {
-				match next(w.source, cur.inner) {
-					Some(x) -> Vec.push(cur.window, x)
-					None    -> return None
-				}
+	type Cursor = (Cursor c, Array (Item c))
+	fun iter(w) = (iter(w.source), [])
+	fun next(w, (cur, last)) = if len(last) == 0 {
+		firstWindow(w.source, w.size, cur)
+	} else {
+		match next(w.source, cur) {
+			Done -> Done
+			Yield(x, at) -> {
+				let kept = Array.init(w.size, fun(i) = if i + 1 < w.size { last[i + 1] } else { x })
+				Yield(Array.init(w.size, \kept[_]), (at, kept))
 			}
-			return Some(Vec.toArray(cur.window))
-		}
-		match next(w.source, cur.inner) {
-			Some(x) -> {
-				Vec.copy(cur.window, 0, cur.window, 1, w.size - 1)
-				cur.window[w.size - 1] = x
-				Some(Vec.toArray(cur.window))
-			}
-			None -> None
 		}
 	}
 }
 
+-- The first `n` elements from `cur` as a window, with the cursor after them
+-- holding a copy of it.
+fun firstWindow[Iterator c](source : c, n : Int, cur : Cursor c) -> Step (Array (Item c)) (
+	Cursor c,
+	Array (Item c),
+) {
+	-- Grown as elements arrive rather than reserved at `n`, which may be far
+	-- more than the source holds.
+	let window = Vec.new(0)
+	var at = cur
+	while len(window) < n {
+		match next(source, at) {
+			Done -> return Done
+			Yield(x, after) -> {
+				Vec.push(window, x)
+				at = after
+			}
+		}
+	}
+	Yield(Vec.toArray(window), (at, Vec.toArray(window)))
+}
+
 --- Returns every run of `n` consecutive elements of `xs`, each as a fresh
 --- array: `[x0, x1, x2]`, `[x1, x2, x3]`, and so on. Empty if `xs` has fewer
---- than `n`. Allocates one array of `n` per window. Panics if `n` is less
---- than 1.
+--- than `n`. Allocates two arrays of `n` per window: the window, and the
+--- cursor's own copy, so that writing into a window changes no later one.
+--- Panics if `n` is less than 1.
 fun windowed[Iterator c](xs : c, n : Int) -> Windowed c {
 	if n <= 0 { error("Iter.windowed: size " + show(n) + " must be at least 1") }
 	Windowed { source = xs, size = n }
 }
 
 type Chunked c = Chunked { source : c, size : Int }
-type ChunkedCursor k a = ChunkedCursor { inner : k, chunk : Vec a }
 
+-- The cursor holds the source's cursor and the buffer each group is gathered
+-- in.
 instance Iterator (Chunked c) : Iterator c {
 	type Item = Array (Item c)
-	type Cursor = ChunkedCursor (Cursor c) (Item c)
-	fun iter(ch) = ChunkedCursor { inner = iter(ch.source), chunk = Vec.new(0) }
-	fun next(ch, cur) {
-		Vec.clear(cur.chunk)
-		while len(cur.chunk) < ch.size {
-			match next(ch.source, cur.inner) {
-				Some(x) -> Vec.push(cur.chunk, x)
-				None    -> break
+	type Cursor = (Cursor c, Vec (Item c))
+	fun iter(ch) = (iter(ch.source), Vec.new(0))
+	fun next(ch, (cur, chunk)) {
+		Vec.clear(chunk)
+		var at = cur
+		while len(chunk) < ch.size {
+			match next(ch.source, at) {
+				Done -> break
+				Yield(x, after) -> {
+					Vec.push(chunk, x)
+					at = after
+				}
 			}
 		}
-		if len(cur.chunk) == 0 { return None }
-		Some(Vec.toArray(cur.chunk))
+		if len(chunk) == 0 { Done } else { Yield(Vec.toArray(chunk), (at, chunk)) }
 	}
 }
 
@@ -507,42 +553,52 @@ fun chunked[Iterator c](xs : c, n : Int) -> Chunked c {
 	Chunked { source = xs, size = n }
 }
 
-type Resumable c k = Resumable { source : c, cursor : k }
+type Resumable c k = Resumable { source : c, var at : k, var live : Bool }
 
--- The one cursor is built when the value is, and `iter` hands it out every
--- time, so each loop steps the same position. Giving the cursor its own type
--- parameter `k`, tied to `Cursor c` by the instance context (as `Mapped` ties
--- `a` to `Item c`), is required: the compiler rejects building a record
--- whose field is typed `Cursor c`, with a "not usable at" error.
+-- The position is the record's, and the cursor a loop is handed is `()`, so
+-- every loop -- and every branch of a multi-shot `?` -- steps the one
+-- position. `live` records that the walk has ended, so that a later loop asks
+-- the source nothing. Two fields rather than one `Option k`: a `var` field of
+-- a sum is stored boxed, which would allocate on every element. The cursor
+-- type is a parameter `k`, tied to `Cursor c` by the instance context, because
+-- a record whose field is typed `Cursor c` cannot be built.
 instance Iterator (Resumable c k) : Iterator c, Cursor c ~ k {
 	type Item = Item c
-	type Cursor = k
-	fun iter(r) = r.cursor
-	fun next(r, cur) = next(r.source, cur)
+	type Cursor = ()
+	fun iter(_) = ()
+	fun next(r, _) = if !r.live {
+		Done
+	} else {
+		match next(r.source, r.at) {
+			Done -> {
+				r.live = False
+				Done
+			}
+			Yield(x, after) -> {
+				r.at = after
+				Yield(x, ())
+			}
+		}
+	}
 }
 
 --- Returns `xs` as an iterator that keeps its position between loops. Every
 --- loop over the result continues from where the previous one stopped, and a
---- loop that runs to the end leaves it exhausted, so for a source that stays
---- exhausted a later loop runs zero times. The branches of a multi-shot `?`
---- share the one position too, rather than each starting over. A `break` leaves the position
---- just after the element it broke on, which is consumed. `xs` itself is not
---- changed, and a fresh `resumable(xs)` starts from the beginning.
+--- loop that runs to the end leaves it exhausted, so a later loop runs zero
+--- times. The branches of a multi-shot `?` share the one position too, rather
+--- than each starting over. A `break` leaves the position just after the
+--- element it broke on, which is consumed. `xs` itself is not changed, and a
+--- fresh `resumable(xs)` starts from the beginning.
 fun resumable[Iterator c](xs : c) -> Resumable c (Cursor c) =
-	Resumable { source = xs, cursor = iter(xs) }
+	Resumable { source = xs, at = iter(xs), live = True }
 
 type CountFrom = CountFrom { start : Int }
-type CountFromCursor = CountFromCursor { var at : Int }
 
 instance Iterator CountFrom {
 	type Item = Int
-	type Cursor = CountFromCursor
-	fun iter(c) = CountFromCursor { at = c.start }
-	fun next(c, cur) {
-		let x = cur.at
-		cur.at = x + 1
-		Some(x)
-	}
+	type Cursor = Int
+	fun iter(c) = c.start
+	fun next(_, n) = Yield(n, n + 1)
 }
 
 --- Returns `n`, `n + 1`, `n + 2`, and so on without end. A loop over it ends
@@ -550,26 +606,16 @@ instance Iterator CountFrom {
 fun countFrom(n : Int) -> CountFrom = CountFrom { start = n }
 
 type Cycle c = Cycle { source : c }
-type CycleCursor k = CycleCursor { var inner : k, var emptyPass : Bool }
 
+-- When a pass ends, the next starts from `iter`; if that one yields nothing
+-- the source is empty, and so is the walk.
 instance Iterator (Cycle c) : Iterator c {
 	type Item = Item c
-	type Cursor = CycleCursor (Cursor c)
-	fun iter(cy) = CycleCursor { inner = iter(cy.source), emptyPass = True }
-	fun next(cy, cur) {
-		loop {
-			match next(cy.source, cur.inner) {
-				Some(x) -> {
-					cur.emptyPass = False
-					return Some(x)
-				}
-				None -> {
-					if cur.emptyPass { return None }
-					cur.inner = iter(cy.source)
-					cur.emptyPass = True
-				}
-			}
-		}
+	type Cursor = Cursor c
+	fun iter(cy) = iter(cy.source)
+	fun next(cy, cur) = match next(cy.source, cur) {
+		Yield(x, at) -> Yield(x, at)
+		Done         -> next(cy.source, iter(cy.source))
 	}
 }
 
@@ -578,24 +624,24 @@ instance Iterator (Cycle c) : Iterator c {
 fun cycle[Iterator c](xs : c) -> Cycle c = Cycle { source = xs }
 
 type Chain a b = Chain { first : a, second : b }
-type ChainCursor j k = ChainCursor { first : j, second : k, var onSecond : Bool }
 
+-- The cursor's `Int` is 0 while `xs` lasts and 1 after. An `Int` rather than a
+-- `Bool`, and both cursors rather than one constructor per half: a `Yield` too
+-- large to return in registers is boxed, and a tuple of whole words is stored
+-- inside that box, where a sum or a tuple holding a `Bool` is boxed again.
 instance Iterator (Chain a b) : Iterator a, Iterator b, Item b ~ Item a {
 	type Item = Item a
-	type Cursor = ChainCursor (Cursor a) (Cursor b)
-	fun iter(ch) = ChainCursor {
-		first    = iter(ch.first)
-		second   = iter(ch.second)
-		onSecond = False
-	}
-	fun next(ch, cur) {
-		if !cur.onSecond {
-			match next(ch.first, cur.first) {
-				Some(x) -> return Some(x)
-				None    -> { cur.onSecond = True }
+	type Cursor = (Int, Cursor a, Cursor b)
+	fun iter(ch) = (0, iter(ch.first), iter(ch.second))
+	fun next(ch, (phase, ca, cb)) {
+		let fromFirst = if phase == 0 { next(ch.first, ca) } else { Done }
+		match fromFirst {
+			Yield(x, after) -> Yield(x, (0, after, cb))
+			Done -> match next(ch.second, cb) {
+				Done            -> Done
+				Yield(x, after) -> Yield(x, (1, ca, after))
 			}
 		}
-		next(ch.second, cur.second)
 	}
 }
 
@@ -608,108 +654,165 @@ fun chain[Iterator a, Iterator b, Item b ~ Item a](xs : a, ys : b) -> Chain a b 
 -- a fresh array.
 
 type Combinations a = Combinations { pool : Array a, size : Int }
-type CombinationsCursor = CombinationsCursor {
-	at          : Array Int
-	var started : Bool
-	var done    : Bool
-}
 
+-- The cursor holds the positions of the next choice, increasing, or nothing
+-- once every choice has been yielded.
 instance Iterator (Combinations a) {
 	type Item = Array a
-	type Cursor = CombinationsCursor
-	fun iter(c) = CombinationsCursor {
-		at      = Array.init(if c.size > len(c.pool) { 0 } else { c.size }, \_)
-		started = False
-		done    = c.size > len(c.pool)
+	type Cursor = Option (Array Int)
+	fun iter(c) = if c.size > len(c.pool) { None } else { Some(Array.init(c.size, \_)) }
+	fun next(c, cursor) = match cursor {
+		None     -> Done
+		Some(at) -> Yield(Array.init(c.size, \c.pool[at[_]]), nextChoice(at, len(c.pool)))
 	}
-	-- `at` holds the chosen positions, increasing. Advance the rightmost one
-	-- that can still move, and reset the ones after it to follow it.
-	fun next(c, cur) {
-		if cur.done { return None }
-		let k = c.size
-		let n = len(c.pool)
-		if cur.started {
-			var i = k - 1
-			while i >= 0 && cur.at[i] == i + n - k { i = i - 1 }
-			if i < 0 {
-				cur.done = True
-				return None
-			}
-			cur.at[i] = cur.at[i] + 1
-			for var j = i + 1; j < k; j = j + 1 { cur.at[j] = cur.at[j - 1] + 1 }
-		}
-		cur.started = True
-		Some(Array.init(k, \c.pool[cur.at[_]]))
-	}
+}
+
+-- The positions after `at` among `n`: advance the rightmost one that can still
+-- move, and set the ones after it to follow it.
+fun nextChoice(at : Array Int, n : Int) -> Option (Array Int) {
+	let k = len(at)
+	var i = k - 1
+	while i >= 0 && at[i] == i + n - k { i = i - 1 }
+	if i < 0 { return None }
+	let moved = at[i] + 1
+	Some(Array.init(k, fun(j) = if j < i { at[j] } else { moved + j - i }))
 }
 
 --- Returns every choice of `k` elements of `xs`, in the order they appear in
 --- `xs`, without repetition: for `[1, 2, 3]` and 2, `[1, 2]`, `[1, 3]`,
 --- `[2, 3]`. One empty choice if `k` is 0, none if `k` exceeds `len(xs)`.
---- Allocates one array of `k` per choice. Panics if `k` is negative.
+--- Allocates two arrays of `k` per choice: the choice, and the positions of
+--- the next. Panics if `k` is negative.
 fun combinations(xs : Array a, k : Int) -> Combinations a {
 	if k < 0 { error("Iter.combinations: size " + show(k) + " is negative") }
 	Combinations { pool = xs, size = k }
 }
 
 type Permutations a = Permutations { pool : Array a, size : Int }
-type PermutationsCursor = PermutationsCursor {
-	order       : Array Int
-	cycles      : Array Int
-	var started : Bool
-	var done    : Bool
-}
 
+-- The cursor holds every position of the pool, once each: the first `k` are
+-- the next ordering and the rest follow in decreasing order.
+--
+-- A pool of at most `packedLimit` has its positions packed 4 bits each into
+-- the cursor's `Int`, so a step allocates only the ordering it yields; a
+-- larger pool keeps them in the cursor's array, and its `Int` is 0. Either
+-- way the `Int` is -1 once every ordering has been yielded, which no packing
+-- can be: at most 15 fields of 4 bits leave bits 60 to 63 clear, so a packed
+-- code is never negative. A tuple of two words rather than a sum of the two
+-- forms, because the `Yield` then fits the slots it is returned in.
 instance Iterator (Permutations a) {
 	type Item = Array a
-	type Cursor = PermutationsCursor
+	type Cursor = (Int, Array Int)
 	fun iter(p) {
 		let n = len(p.pool)
-		PermutationsCursor {
-			order   = Array.init(n, \_)
-			cycles  = Array.init(if p.size > n { 0 } else { p.size }, \n - _)
-			started = False
-			done    = p.size > n
-		}
-	}
-	-- `order` is a permutation of every position, and its first `k` are the
-	-- ones yielded. `cycles[i]` counts how many more positions slot `i` takes,
-	-- each by a swap with a later slot, before slots `i..` are rotated back to
-	-- increasing order and slot `i - 1` advances. That keeps the yielded
-	-- prefixes in lexicographic order.
-	fun next(p, cur) {
-		if cur.done { return None }
-		let n = len(p.pool)
 		let k = p.size
-		if cur.started {
-			var i = k - 1
-			loop {
-				if i < 0 {
-					cur.done = True
-					return None
-				}
-				cur.cycles[i] = cur.cycles[i] - 1
-				if cur.cycles[i] == 0 {
-					let first = cur.order[i]
-					Array.copy(cur.order, i, cur.order, i + 1, n - i - 1)
-					cur.order[n - 1] = first
-					cur.cycles[i] = n - i
-					i = i - 1
-				} else {
-					Array.swap(cur.order, i, n - cur.cycles[i])
-					break
-				}
+		if k > n {
+			(-1, noPositions)
+		} else if n <= packedLimit {
+			var code = 0
+			for var x = 0; x < n; x = x + 1 {
+				code = Int.or(code, Int.shl(startingAt(x, n, k), 4 * x))
 			}
+			(code, noPositions)
+		} else {
+			(0, Array.init(n, startingAt(_, n, k)))
 		}
-		cur.started = True
-		Some(Array.init(k, \p.pool[cur.order[_]]))
 	}
+	fun next(p, (code, spread)) = if code == -1 {
+		Done
+	} else if len(p.pool) <= packedLimit {
+		Yield(Array.init(p.size, \p.pool[nibble(code, _)]), (
+			nextPacked(code, len(p.pool), p.size),
+			spread,
+		))
+	} else {
+		let ordering = Array.init(p.size, \p.pool[spread[_]])
+		match nextOrdering(spread, p.size) {
+			None     -> Yield(ordering, (-1, spread))
+			Some(at) -> Yield(ordering, (0, at))
+		}
+	}
+}
+
+-- The most positions packed into one `Int`, 4 bits each. 15, not 16, keeps
+-- the top 4 bits, and with them the sign bit, clear, so a packed code is never
+-- the -1 that marks the end. (Every shift would stay below the sign bit even
+-- with 16: the last field's is 60.)
+let packedLimit = 15
+
+let noPositions : Array Int = []
+
+-- The position at slot `x` before the first step: the first `k` in order,
+-- the rest decreasing.
+fun startingAt(x : Int, n : Int, k : Int) -> Int = if x < k { x } else { n - 1 - (x - k) }
+
+-- The position packed at slot `x` of `code`.
+fun nibble(code : Int, x : Int) -> Int = Int.and(Int.shr(code, 4 * x), 15)
+
+-- `nextOrdering` over packed positions, or -1 after the last.
+fun nextPacked(at : Int, n : Int, k : Int) -> Int {
+	-- Most steps move only the last slot of the ordering: when it is below the
+	-- tail's largest position, which is the tail's first, the next ordering
+	-- swaps it with the least larger one, and the tail still decreases. No
+	-- slot before it needs looking at.
+	if k > 0 && k < n && nibble(at, k - 1) < nibble(at, k) {
+		let last = nibble(at, k - 1)
+		var j = n - 1
+		while nibble(at, j) < last { j = j - 1 }
+		let swapped = Int.xor(last, nibble(at, j))
+		return Int.xor(at, Int.or(Int.shl(swapped, 4 * (k - 1)), Int.shl(swapped, 4 * j)))
+	}
+	var i = n - 2
+	while i >= 0 && nibble(at, i) > nibble(at, i + 1) { i = i - 1 }
+	if i < 0 { return -1 }
+	let left = nibble(at, i)
+	var j = n - 1
+	while nibble(at, j) < left { j = j - 1 }
+	var out = Int.or(Int.and(at, Int.shl(1, 4 * i) - 1), Int.shl(nibble(at, j), 4 * i))
+	for var x = i + 1; x < n; x = x + 1 {
+		let y = if x < k { n + i - x } else { i + 1 + x - k }
+		let v = if y == j { left } else { nibble(at, y) }
+		out = Int.or(out, Int.shl(v, 4 * x))
+	}
+	out
+}
+
+-- The positions after `at` whose first `k` are the next ordering in
+-- lexicographic order, with the rest decreasing again.
+--
+-- Because the positions after the first `k` decrease, this is the standard
+-- next permutation of all `n`: find the last ascent `i`, swap `at[i]` with the
+-- least larger value after it, at `j`, and reverse what follows into
+-- increasing order; then reverse the last `n - k` back into decreasing order.
+-- What follows `i` decreases, before and after the swap, so the two reversals
+-- come to this: slots `i + 1` to `k - 1` read that run from its end, and the
+-- slots from `k` read it from its start. So each slot of the result is read
+-- straight from `at`, in one pass and one array, O(n) per step.
+fun nextOrdering(at : Array Int, k : Int) -> Option (Array Int) {
+	let n = len(at)
+	var i = n - 2
+	while i >= 0 && at[i] > at[i + 1] { i = i - 1 }
+	if i < 0 { return None }
+	var j = n - 1
+	while at[j] < at[i] { j = j - 1 }
+	-- Plain loops over one array: a closure here would be allocated per step.
+	let out = Array.filled(n, 0)
+	for var x = 0; x < i; x = x + 1 { out[x] = at[x] }
+	out[i] = at[j]
+	for var x = i + 1; x < n; x = x + 1 {
+		-- The slot of the run after `i`, which is decreasing, that `x` reads:
+		-- from its end before `k`, from its start after.
+		let y = if x < k { n + i - x } else { i + 1 + x - k }
+		out[x] = if y == j { at[i] } else { at[y] }
+	}
+	Some(out)
 }
 
 --- Returns every ordering of `k` distinct elements of `xs` (distinct by
 --- position): for `[1, 2, 3]` and 2, `[1, 2]`, `[1, 3]`, `[2, 1]`, `[2, 3]`,
 --- `[3, 1]`, `[3, 2]`. One empty ordering if `k` is 0, none if `k` exceeds
---- `len(xs)`. Allocates one array of `k` per ordering. Panics if `k` is
+--- `len(xs)`. Allocates one array of `k` per ordering when `xs` has at most
+--- 15 elements, and one more of `len(xs)` when it has more. Panics if `k` is
 --- negative.
 fun permutations(xs : Array a, k : Int) -> Permutations a {
 	if k < 0 { error("Iter.permutations: size " + show(k) + " is negative") }
@@ -717,49 +820,38 @@ fun permutations(xs : Array a, k : Int) -> Permutations a {
 }
 
 type Cartesian a b = Cartesian { outer : a, inner : b }
-type CartesianCursor j k x = CartesianCursor {
-	outer         : j
-	var inner     : k
-	var current   : Option x
-	var freshPass : Bool
-}
 
+-- The cursor holds the element of `xs` being paired, the cursor after it, the
+-- cursor into `ys`, and whether the pass over `ys` has yielded nothing yet.
+-- It is absent once the walk has ended.
 instance Iterator (Cartesian a b) : Iterator a, Iterator b {
 	type Item = (Item a, Item b)
-	type Cursor = CartesianCursor (Cursor a) (Cursor b) (Item a)
-	fun iter(c) {
-		let outer = iter(c.outer)
-		CartesianCursor {
-			outer     = outer
-			inner     = iter(c.inner)
-			current   = next(c.outer, outer)
-			freshPass = True
-		}
+	type Cursor = Option (Item a, Cursor a, Cursor b, Bool)
+	fun iter(c) = match next(c.outer, iter(c.outer)) {
+		Done         -> None
+		Yield(x, at) -> Some((x, at, iter(c.inner), True))
 	}
-	fun next(c, cur) {
+	fun next(c, cursor) {
+		var held = cursor
 		loop {
-			let x = match cur.current {
-				Some(x) -> x
-				None    -> return None
-			}
-			match next(c.inner, cur.inner) {
-				Some(y) -> {
-					cur.freshPass = False
-					return Some((x, y))
-				}
-				-- We assume a pass over `ys` that yields nothing yields nothing
-				-- every time, and end the walk, even when `xs` does not end.
-				None -> {
-					if cur.freshPass {
-						cur.current = None
-						return None
+			match held {
+				None -> break
+				Some((x, outer, inner, fresh)) -> match next(c.inner, inner) {
+					Yield(y, after) -> return Yield((x, y), Some((x, outer, after, False)))
+					-- We assume a pass over `ys` that yields nothing yields nothing
+					-- every time, and end the walk, even when `xs` does not end.
+					Done -> if fresh {
+						break
+					} else {
+						held = match next(c.outer, outer) {
+							Done           -> None
+							Yield(x2, at2) -> Some((x2, at2, iter(c.inner), True))
+						}
 					}
-					cur.current = next(c.outer, cur.outer)
-					cur.inner = iter(c.inner)
-					cur.freshPass = True
 				}
 			}
 		}
+		Done
 	}
 }
 
@@ -771,47 +863,34 @@ fun cartesian[Iterator a, Iterator b](xs : a, ys : b) -> Cartesian a b =
 	Cartesian { outer = xs, inner = ys }
 
 type CartesianPower a = CartesianPower { pool : Array a, size : Int }
-type CartesianPowerCursor = CartesianPowerCursor {
-	at          : Array Int
-	var started : Bool
-	var done    : Bool
-}
 
+-- The cursor is the rank of the next array: its positions are the rank's
+-- digits in base `len(pool)`, the last varying fastest, and a rank left over
+-- after `size` digits is past the last array. Testing that rather than
+-- comparing with `len(pool)` to the power `size` keeps a large `size` from
+-- overflowing.
 instance Iterator (CartesianPower a) {
 	type Item = Array a
-	type Cursor = CartesianPowerCursor
-	fun iter(c) = CartesianPowerCursor {
-		at      = Array.filled(if len(c.pool) == 0 { 0 } else { c.size }, 0)
-		started = False
-		done    = c.size > 0 && len(c.pool) == 0
-	}
-	-- `at` is an odometer over positions in the pool: advance the last digit,
-	-- carrying into the ones before it.
-	fun next(c, cur) {
-		if cur.done { return None }
+	type Cursor = Int
+	fun iter(_) = 0
+	fun next(c, rank) {
 		let n = len(c.pool)
-		if cur.started {
-			var i = c.size - 1
-			while i >= 0 && cur.at[i] == n - 1 {
-				cur.at[i] = 0
-				i = i - 1
-			}
-			if i < 0 {
-				cur.done = True
-				return None
-			}
-			cur.at[i] = cur.at[i] + 1
+		if c.size == 0 { return if rank == 0 { Yield([], 1) } else { Done } }
+		if n == 0 { return Done }
+		let out = Array.filled(c.size, c.pool[0])
+		var rest = rank
+		for var i = c.size - 1; i >= 0; i = i - 1 {
+			out[i] = c.pool[rest % n]
+			rest = rest / n
 		}
-		cur.started = True
-		Some(Array.init(c.size, \c.pool[cur.at[_]]))
+		if rest > 0 { Done } else { Yield(out, rank + 1) }
 	}
 }
 
 --- Returns every array of `n` elements drawn from `xs`, repeats allowed, the
---- last position varying fastest. For
---- `[0, 1]` and 2, `[0, 0]`, `[0, 1]`, `[1, 0]`, `[1, 1]`. One empty array if
---- `n` is 0. Allocates one array of `n` per element. Panics if `n` is
---- negative.
+--- last position varying fastest. For `[0, 1]` and 2, `[0, 0]`, `[0, 1]`,
+--- `[1, 0]`, `[1, 1]`. One empty array if `n` is 0. Allocates one array of `n`
+--- per element. Panics if `n` is negative.
 fun cartesianPower(xs : Array a, n : Int) -> CartesianPower a {
 	if n < 0 { error("Iter.cartesianPower: size " + show(n) + " is negative") }
 	CartesianPower { pool = xs, size = n }

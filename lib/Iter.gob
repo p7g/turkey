@@ -58,7 +58,7 @@ import Data.Bool (Bool(..))
 import Data.Int (Int)
 import Data.Eq ((==))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Mul(..), Zero(..), One(..), (+), (-), (*))
+import Data.Num (Add(..), Mul(..), Zero(..), One(..), (+), (-), (*), (/), (%))
 import Data.Option (Option(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Array (Array)
@@ -465,10 +465,11 @@ fun pairwise[Iterator c](xs : c) -> Pairwise c = Pairwise { source = xs }
 
 type Windowed c = Windowed { source : c, size : Int }
 
--- The cursor holds the source's cursor and the window last yielded, or `[]`
--- before the first: a window has at least one element, so the empty array
--- cannot be one. Each window is a fresh array and is never changed, so a kept
--- cursor still holds the window it was given.
+-- The cursor holds the source's cursor and its own copy of the window last
+-- yielded, or `[]` before the first: a window has at least one element, so the
+-- empty array cannot be one. The copy is the cursor's and nothing changes it,
+-- so neither a kept cursor nor a caller writing into the window it was given
+-- changes a later window. That costs a second array per window.
 instance Iterator (Windowed c) : Iterator c {
 	type Item = Array (Item c)
 	type Cursor = (Cursor c, Array (Item c))
@@ -479,18 +480,15 @@ instance Iterator (Windowed c) : Iterator c {
 		match next(w.source, cur) {
 			Done -> Done
 			Yield(x, at) -> {
-				let window = Array.init(w.size, fun(i) = if i + 1 < w.size {
-					last[i + 1]
-				} else {
-					x
-				})
-				Yield(window, (at, window))
+				let kept = Array.init(w.size, fun(i) = if i + 1 < w.size { last[i + 1] } else { x })
+				Yield(Array.init(w.size, \kept[_]), (at, kept))
 			}
 		}
 	}
 }
 
--- The first `n` elements from `cur` as a window, and the cursor after them.
+-- The first `n` elements from `cur` as a window, with the cursor after them
+-- holding a copy of it.
 fun firstWindow[Iterator c](source : c, n : Int, cur : Cursor c) -> Step (Array (Item c)) (
 	Cursor c,
 	Array (Item c),
@@ -508,14 +506,14 @@ fun firstWindow[Iterator c](source : c, n : Int, cur : Cursor c) -> Step (Array 
 			}
 		}
 	}
-	let first = Vec.toArray(window)
-	Yield(first, (at, first))
+	Yield(Vec.toArray(window), (at, Vec.toArray(window)))
 }
 
 --- Returns every run of `n` consecutive elements of `xs`, each as a fresh
 --- array: `[x0, x1, x2]`, `[x1, x2, x3]`, and so on. Empty if `xs` has fewer
---- than `n`. Allocates one array of `n` per window. Panics if `n` is less
---- than 1.
+--- than `n`. Allocates two arrays of `n` per window: the window, and the
+--- cursor's own copy, so that writing into a window changes no later one.
+--- Panics if `n` is less than 1.
 fun windowed[Iterator c](xs : c, n : Int) -> Windowed c {
 	if n <= 0 { error("Iter.windowed: size " + show(n) + " must be at least 1") }
 	Windowed { source = xs, size = n }
@@ -691,59 +689,64 @@ fun combinations(xs : Array a, k : Int) -> Combinations a {
 
 type Permutations a = Permutations { pool : Array a, size : Int }
 
--- The cursor holds the positions of the next ordering, all different, or
--- nothing once every ordering has been yielded.
+-- The cursor holds every position of the pool, once each: the first `k` are
+-- the next ordering and the rest follow in decreasing order. Or nothing, once
+-- every ordering has been yielded.
 instance Iterator (Permutations a) {
 	type Item = Array a
 	type Cursor = Option (Array Int)
-	fun iter(p) = if p.size > len(p.pool) { None } else { Some(Array.init(p.size, \_)) }
-	fun next(p, cursor) = match cursor {
-		None     -> Done
-		Some(at) -> Yield(Array.init(p.size, \p.pool[at[_]]), nextOrdering(at, len(p.pool)))
-	}
-}
-
--- The positions after `at` among `n` in lexicographic order: the rightmost
--- slot that can take a larger position none before it holds takes the least
--- such, and the slots after it take the least positions left, increasing.
--- Each step scans the slots before it rather than keeping a set of the
--- positions in use, which a cursor would have to copy to stay a value; `k`
--- is small where orderings are enumerated at all.
-fun nextOrdering(at : Array Int, n : Int) -> Option (Array Int) {
-	let k = len(at)
-	for var i = k - 1; i >= 0; i = i - 1 {
-		var v = at[i] + 1
-		while v < n && heldBefore(at, i, v) { v = v + 1 }
-		if v < n {
-			let out = Array.filled(k, 0)
-			for var j = 0; j < i; j = j + 1 { out[j] = at[j] }
-			out[i] = v
-			var least = 0
-			for var j = i + 1; j < k; j = j + 1 {
-				while heldBefore(out, j, least) { least = least + 1 }
-				out[j] = least
-				least = least + 1
-			}
-			return Some(out)
+	fun iter(p) {
+		let n = len(p.pool)
+		let k = p.size
+		if k > n {
+			None
+		} else {
+			Some(Array.init(n, fun(j) = if j < k { j } else { n - 1 - (j - k) }))
 		}
 	}
-	None
+	fun next(p, cursor) = match cursor {
+		None     -> Done
+		Some(at) -> Yield(Array.init(p.size, \p.pool[at[_]]), nextOrdering(at, p.size))
+	}
 }
 
--- Whether one of the first `count` slots of `at` holds `v`.
-fun heldBefore(at : Array Int, count : Int, v : Int) -> Bool {
-	for var j = 0; j < count; j = j + 1 {
-		if at[j] == v { return True }
+-- The positions after `at` whose first `k` are the next ordering in
+-- lexicographic order. Because the positions after the first `k` decrease,
+-- the next permutation of all of them has the next ordering first: find the
+-- last ascent, swap its left side with the least larger value after it, and
+-- reverse what follows into increasing order. Reversing the last `n - k`
+-- again puts them back in decreasing order. O(n) per step, and one array.
+fun nextOrdering(at : Array Int, k : Int) -> Option (Array Int) {
+	let n = len(at)
+	var i = n - 2
+	while i >= 0 && at[i] > at[i + 1] { i = i - 1 }
+	if i < 0 { return None }
+	let out = Array.filled(n, 0)
+	Array.copy(out, 0, at, 0, n)
+	var j = n - 1
+	while out[j] < out[i] { j = j - 1 }
+	Array.swap(out, i, j)
+	reverseRange(out, i + 1, n - 1)
+	reverseRange(out, k, n - 1)
+	Some(out)
+}
+
+-- Reverses `xs` from `lo` to `hi`, both included.
+fun reverseRange(xs : Array Int, lo : Int, hi : Int) {
+	var a = lo
+	var b = hi
+	while a < b {
+		Array.swap(xs, a, b)
+		a = a + 1
+		b = b - 1
 	}
-	False
 }
 
 --- Returns every ordering of `k` distinct elements of `xs` (distinct by
 --- position): for `[1, 2, 3]` and 2, `[1, 2]`, `[1, 3]`, `[2, 1]`, `[2, 3]`,
 --- `[3, 1]`, `[3, 2]`. One empty ordering if `k` is 0, none if `k` exceeds
---- `len(xs)`. Allocates two arrays of `k` per ordering: the ordering, and the
---- positions of the next. Panics if `k` is
---- negative.
+--- `len(xs)`. Allocates two arrays per ordering: the ordering, of `k`, and
+--- the positions of the next, of `len(xs)`. Panics if `k` is negative.
 fun permutations(xs : Array a, k : Int) -> Permutations a {
 	if k < 0 { error("Iter.permutations: size " + show(k) + " is negative") }
 	Permutations { pool = xs, size = k }
@@ -794,38 +797,33 @@ fun cartesian[Iterator a, Iterator b](xs : a, ys : b) -> Cartesian a b =
 
 type CartesianPower a = CartesianPower { pool : Array a, size : Int }
 
--- The cursor holds the positions of the next array, an odometer over the pool,
--- or nothing once every array has been yielded.
+-- The cursor is the rank of the next array: its positions are the rank's
+-- digits in base `len(pool)`, the last varying fastest, and a rank left over
+-- after `size` digits is past the last array. Testing that rather than
+-- comparing with `len(pool)` to the power `size` keeps a large `size` from
+-- overflowing.
 instance Iterator (CartesianPower a) {
 	type Item = Array a
-	type Cursor = Option (Array Int)
-	fun iter(c) = if c.size > 0 && len(c.pool) == 0 {
-		None
-	} else {
-		Some(Array.filled(c.size, 0))
+	type Cursor = Int
+	fun iter(_) = 0
+	fun next(c, rank) {
+		let n = len(c.pool)
+		if c.size == 0 { return if rank == 0 { Yield([], 1) } else { Done } }
+		if n == 0 { return Done }
+		let out = Array.filled(c.size, c.pool[0])
+		var rest = rank
+		for var i = c.size - 1; i >= 0; i = i - 1 {
+			out[i] = c.pool[rest % n]
+			rest = rest / n
+		}
+		if rest > 0 { Done } else { Yield(out, rank + 1) }
 	}
-	fun next(c, cursor) = match cursor {
-		None     -> Done
-		Some(at) -> Yield(Array.init(c.size, \c.pool[at[_]]), nextReading(at, len(c.pool)))
-	}
-}
-
--- The odometer after `at` over `n` positions: advance the last digit that is
--- not at its end, and set the ones after it to 0.
-fun nextReading(at : Array Int, n : Int) -> Option (Array Int) {
-	var i = len(at) - 1
-	while i >= 0 && at[i] == n - 1 { i = i - 1 }
-	if i < 0 { return None }
-	let moved = at[i] + 1
-	Some(Array.init(len(at), fun(j) = if j < i { at[j] } else if j == i { moved } else { 0 }))
 }
 
 --- Returns every array of `n` elements drawn from `xs`, repeats allowed, the
---- last position varying fastest. For
---- `[0, 1]` and 2, `[0, 0]`, `[0, 1]`, `[1, 0]`, `[1, 1]`. One empty array if
---- `n` is 0. Allocates two arrays of `n` per element: the element, and the
---- positions of the next. Panics if `n` is
---- negative.
+--- last position varying fastest. For `[0, 1]` and 2, `[0, 0]`, `[0, 1]`,
+--- `[1, 0]`, `[1, 1]`. One empty array if `n` is 0. Allocates one array of `n`
+--- per element. Panics if `n` is negative.
 fun cartesianPower(xs : Array a, n : Int) -> CartesianPower a {
 	if n < 0 { error("Iter.cartesianPower: size " + show(n) + " is negative") }
 	CartesianPower { pool = xs, size = n }

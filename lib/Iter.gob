@@ -56,9 +56,10 @@ export (
 import Prelude ()
 import Data.Bool (Bool(..))
 import Data.Int (Int)
+import Data.Int as Int
 import Data.Eq ((==))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
-import Data.Num (Add(..), Mul(..), Zero(..), One(..), (+), (-), (*), (/), (%))
+import Data.Num (Add(..), Mul(..), Neg(..), Zero(..), One(..), (+), (-), (*), (/), (%))
 import Data.Option (Option(..))
 import Data.Index (Index(..), SetIndex(..), Length(..))
 import Data.Array (Array)
@@ -690,63 +691,127 @@ fun combinations(xs : Array a, k : Int) -> Combinations a {
 type Permutations a = Permutations { pool : Array a, size : Int }
 
 -- The cursor holds every position of the pool, once each: the first `k` are
--- the next ordering and the rest follow in decreasing order. Or nothing, once
--- every ordering has been yielded.
+-- the next ordering and the rest follow in decreasing order.
+--
+-- A pool of at most `packedLimit` has its positions packed 4 bits each into
+-- the cursor's `Int`, so a step allocates only the ordering it yields; a
+-- larger pool keeps them in the cursor's array, and its `Int` is 0. Either
+-- way the `Int` is -1 once every ordering has been yielded, which no packing
+-- can be: the positions are distinct, and every packed field is below 15
+-- except perhaps one. A tuple of two words rather than a sum of the two
+-- forms, because the `Yield` then fits the slots it is returned in.
 instance Iterator (Permutations a) {
 	type Item = Array a
-	type Cursor = Option (Array Int)
+	type Cursor = (Int, Array Int)
 	fun iter(p) {
 		let n = len(p.pool)
 		let k = p.size
 		if k > n {
-			None
+			(-1, noPositions)
+		} else if n <= packedLimit {
+			var code = 0
+			for var x = 0; x < n; x = x + 1 {
+				code = Int.or(code, Int.shl(startingAt(x, n, k), 4 * x))
+			}
+			(code, noPositions)
 		} else {
-			Some(Array.init(n, fun(j) = if j < k { j } else { n - 1 - (j - k) }))
+			(0, Array.init(n, startingAt(_, n, k)))
 		}
 	}
-	fun next(p, cursor) = match cursor {
-		None     -> Done
-		Some(at) -> Yield(Array.init(p.size, \p.pool[at[_]]), nextOrdering(at, p.size))
+	fun next(p, (code, spread)) = if code == -1 {
+		Done
+	} else if len(p.pool) <= packedLimit {
+		Yield(Array.init(p.size, \p.pool[nibble(code, _)]), (
+			nextPacked(code, len(p.pool), p.size),
+			spread,
+		))
+	} else {
+		let ordering = Array.init(p.size, \p.pool[spread[_]])
+		match nextOrdering(spread, p.size) {
+			None     -> Yield(ordering, (-1, spread))
+			Some(at) -> Yield(ordering, (0, at))
+		}
 	}
 }
 
+-- The most positions packed into one `Int`, 4 bits each. 15, not 16, keeps
+-- every shift below the sign bit.
+let packedLimit = 15
+
+let noPositions : Array Int = []
+
+-- The position at slot `x` before the first step: the first `k` in order,
+-- the rest decreasing.
+fun startingAt(x : Int, n : Int, k : Int) -> Int = if x < k { x } else { n - 1 - (x - k) }
+
+-- The position packed at slot `x` of `code`.
+fun nibble(code : Int, x : Int) -> Int = Int.and(Int.shr(code, 4 * x), 15)
+
+-- `nextOrdering` over packed positions, or -1 after the last.
+fun nextPacked(at : Int, n : Int, k : Int) -> Int {
+	-- Most steps move only the last slot of the ordering: when it is below the
+	-- tail's largest position, which is the tail's first, the next ordering
+	-- swaps it with the least larger one, and the tail still decreases. No
+	-- slot before it needs looking at.
+	if k > 0 && k < n && nibble(at, k - 1) < nibble(at, k) {
+		let last = nibble(at, k - 1)
+		var j = n - 1
+		while nibble(at, j) < last { j = j - 1 }
+		let swapped = Int.xor(last, nibble(at, j))
+		return Int.xor(at, Int.or(Int.shl(swapped, 4 * (k - 1)), Int.shl(swapped, 4 * j)))
+	}
+	var i = n - 2
+	while i >= 0 && nibble(at, i) > nibble(at, i + 1) { i = i - 1 }
+	if i < 0 { return -1 }
+	let left = nibble(at, i)
+	var j = n - 1
+	while nibble(at, j) < left { j = j - 1 }
+	var out = Int.or(Int.and(at, Int.shl(1, 4 * i) - 1), Int.shl(nibble(at, j), 4 * i))
+	for var x = i + 1; x < n; x = x + 1 {
+		let y = if x < k { n + i - x } else { i + 1 + x - k }
+		let v = if y == j { left } else { nibble(at, y) }
+		out = Int.or(out, Int.shl(v, 4 * x))
+	}
+	out
+}
+
 -- The positions after `at` whose first `k` are the next ordering in
--- lexicographic order. Because the positions after the first `k` decrease,
--- the next permutation of all of them has the next ordering first: find the
--- last ascent, swap its left side with the least larger value after it, and
--- reverse what follows into increasing order. Reversing the last `n - k`
--- again puts them back in decreasing order. O(n) per step, and one array.
+-- lexicographic order, with the rest decreasing again.
+--
+-- Because the positions after the first `k` decrease, this is the standard
+-- next permutation of all `n`: find the last ascent `i`, swap `at[i]` with the
+-- least larger value after it, at `j`, and reverse what follows into
+-- increasing order; then reverse the last `n - k` back into decreasing order.
+-- What follows `i` decreases, before and after the swap, so the two reversals
+-- come to this: slots `i + 1` to `k - 1` read that run from its end, and the
+-- slots from `k` read it from its start. So each slot of the result is read
+-- straight from `at`, in one pass and one array, O(n) per step.
 fun nextOrdering(at : Array Int, k : Int) -> Option (Array Int) {
 	let n = len(at)
 	var i = n - 2
 	while i >= 0 && at[i] > at[i + 1] { i = i - 1 }
 	if i < 0 { return None }
-	let out = Array.filled(n, 0)
-	Array.copy(out, 0, at, 0, n)
 	var j = n - 1
-	while out[j] < out[i] { j = j - 1 }
-	Array.swap(out, i, j)
-	reverseRange(out, i + 1, n - 1)
-	reverseRange(out, k, n - 1)
-	Some(out)
-}
-
--- Reverses `xs` from `lo` to `hi`, both included.
-fun reverseRange(xs : Array Int, lo : Int, hi : Int) {
-	var a = lo
-	var b = hi
-	while a < b {
-		Array.swap(xs, a, b)
-		a = a + 1
-		b = b - 1
+	while at[j] < at[i] { j = j - 1 }
+	-- Plain loops over one array: a closure here would be allocated per step.
+	let out = Array.filled(n, 0)
+	for var x = 0; x < i; x = x + 1 { out[x] = at[x] }
+	out[i] = at[j]
+	for var x = i + 1; x < n; x = x + 1 {
+		-- The slot of the run after `i`, which is decreasing, that `x` reads:
+		-- from its end before `k`, from its start after.
+		let y = if x < k { n + i - x } else { i + 1 + x - k }
+		out[x] = if y == j { at[i] } else { at[y] }
 	}
+	Some(out)
 }
 
 --- Returns every ordering of `k` distinct elements of `xs` (distinct by
 --- position): for `[1, 2, 3]` and 2, `[1, 2]`, `[1, 3]`, `[2, 1]`, `[2, 3]`,
 --- `[3, 1]`, `[3, 2]`. One empty ordering if `k` is 0, none if `k` exceeds
---- `len(xs)`. Allocates two arrays per ordering: the ordering, of `k`, and
---- the positions of the next, of `len(xs)`. Panics if `k` is negative.
+--- `len(xs)`. Allocates one array of `k` per ordering when `xs` has at most
+--- 15 elements, and one more of `len(xs)` when it has more. Panics if `k` is
+--- negative.
 fun permutations(xs : Array a, k : Int) -> Permutations a {
 	if k < 0 { error("Iter.permutations: size " + show(k) + " is negative") }
 	Permutations { pool = xs, size = k }

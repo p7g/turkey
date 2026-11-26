@@ -1,7 +1,7 @@
 // The page: a source box, Run and Stop, and an output pane. Compiling happens
 // in one Worker and running in another, so the page itself never waits.
 
-import { withoutBaseline } from "./diagnostics.js";
+import { diagnosticsFor } from "./diagnostics.js";
 
 const $ = (id) => document.getElementById(id);
 const source = $("source");
@@ -29,7 +29,6 @@ source.addEventListener("input", () => {
 
 let compiler = null; // the compile Worker
 let runner = null; // the run Worker, idle or running
-let baseline = 0; // the refused-function count of a program that prints
 let phase = "loading"; // loading | idle | compiling | running
 let nextId = 0;
 let currentId = 0;
@@ -74,9 +73,12 @@ function startCompiler() {
     if (data.type === "status") {
       state.textContent = data.text;
     } else if (data.type === "ready") {
-      baseline = data.baseline;
       if (phase === "loading") {
         setPhase("idle", "Ready.");
+        // Stop during a compile leaves focus on nothing; give it back to Run.
+        if (document.activeElement === document.body) {
+          runButton.focus();
+        }
       }
     } else if (data.type === "failed") {
       setPhase("loading", "The compiler failed to load.");
@@ -115,8 +117,9 @@ function startRunner() {
     const trapped = data.trap !== null;
     finishRun(
       [
-        // Warnings about the user's own program, if the compiler gave any.
-        ["warning", pendingWarnings],
+        // The compiler's warnings, with the refused-functions one only when
+        // the program trapped.
+        ["warning", diagnosticsFor(pendingDiagnostics, trapped)],
         ["stdout", data.stdout],
         ["stderr", data.stderr],
         ["error", trapped ? `trap: ${data.trap}` : ""],
@@ -129,19 +132,17 @@ function startRunner() {
     if (worker !== runner) {
       return;
     }
-    const text = event.message || "the run Worker failed";
-    if (phase === "running") {
-      finishRun([["error", text]], "Run failed.");
-    } else {
-      // Failed to load while idle: replace it, and say why.
-      worker.terminate();
-      startRunner();
-      show([["error", text]]);
-    }
+    // A Worker that fails to load would fail again, so we do not replace it
+    // here: the next Run starts a fresh one, once.
+    clearTimeout(timer);
+    worker.terminate();
+    runner = null;
+    show([["error", event.message || "the run Worker failed"]]);
+    setPhase("idle", "Run failed.");
   };
 }
 
-let pendingWarnings = "";
+let pendingDiagnostics = ""; // the compile's diagnostics, for the run that follows
 
 // Ends the run in progress. A finished Worker is dropped for a fresh one, so
 // no run sees another's leftovers.
@@ -154,7 +155,7 @@ function finishRun(parts, text) {
 }
 
 function compiled(data) {
-  const diagnostics = withoutBaseline(data.diagnostics, baseline);
+  const diagnostics = diagnosticsFor(data.diagnostics, false);
   if (data.bytes === null) {
     const status = data.status === null ? "the compiler trapped" : `compiler exit status ${data.status}`;
     show([
@@ -164,8 +165,12 @@ function compiled(data) {
     setPhase("idle", "Compile failed.");
     return;
   }
-  const limit = Math.min(600, Math.max(1, Math.floor(Number(timeoutInput.value)) || 10));
-  pendingWarnings = diagnostics;
+  const asked = timeoutInput.value.trim() === "" ? NaN : Number(timeoutInput.value);
+  const limit = Number.isNaN(asked) ? 10 : Math.min(600, Math.max(1, asked));
+  pendingDiagnostics = data.diagnostics;
+  if (runner === null) {
+    startRunner();
+  }
   setPhase("running", "Running...");
   timer = setTimeout(
     () => finishRun([["error", `Timed out after ${limit} s; the program was stopped.`]], "Timed out."),

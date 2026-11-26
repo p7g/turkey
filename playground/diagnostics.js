@@ -1,34 +1,20 @@
 // Filters the compiler's diagnostics for the page. No DOM, so node loads it.
 
 // The wasm32 backend refuses some functions and compiles each to a trap. It
-// reports how many on every compile, user functions included, as
-// "main.gob: warning: N functions use operations the wasm32 backend does not
-// compile yet ...".
-const REFUSED = /functions use operations the wasm32 backend does not compile yet/;
-const COUNT = /warning: (\d+) functions? use/;
+// warns on every compile, "main.gob: warning: N functions use operations the
+// wasm32 backend does not compile yet ...", and counts the runtime's own
+// refused functions along with the user's. The count says nothing certain: a
+// program that prints and one that only spawns tasks both report 2.
+const REFUSED = /functions? use operations the wasm32 backend does not compile yet/;
 
-// Returns the number the refused-functions warning in `diagnostics` states,
-// or 0 if there is none.
-export function refusedCount(diagnostics) {
-  for (const line of diagnostics.split("\n")) {
-    if (REFUSED.test(line)) {
-      const match = COUNT.exec(line);
-      return match === null ? 0 : Number(match[1]);
-    }
-  }
-  return 0;
-}
-
-// Returns `diagnostics` trimmed, without the refused-functions warning when
-// its count is `baseline`. The baseline is the count for a program that only
-// prints: the runtime's own refused functions, which say nothing about the
-// user's program. A larger count means the program uses something the
-// backend cannot compile yet, and the warning is the clue to the trap it will
-// hit, so we keep it.
-export function withoutBaseline(diagnostics, baseline) {
+// Returns the diagnostics to show for a program, trimmed. The refused-functions
+// warning is dropped unless the run `trapped`: a program that compiles and
+// exits never reached a refused function, so the warning is noise, and one
+// that traps may have reached one, so the warning is the clue to why.
+export function diagnosticsFor(diagnostics, trapped) {
   return diagnostics
     .split("\n")
-    .filter((line) => !(REFUSED.test(line) && refusedCount(line) === baseline))
+    .filter((line) => trapped || !REFUSED.test(line))
     .join("\n")
     .trim();
 }

@@ -926,8 +926,9 @@ fun allocateSlow(size : Int, kind : Int, frame : Ptr) -> Ptr {
 	-- grows by up to a budget between collections, which can be more than
 	-- the memory left. So collect everything and try once more before giving
 	-- up. On wasm32, the schedule keeps the budget under the 4 GiB a 32-bit
-	-- memory has unless its guard is on, and this is what is left then and
-	-- under an engine that allows less.
+	-- memory has, less the collector's reserve, but its floor may take half
+	-- of that reserve, and an engine may allow less: this is what is left
+	-- then.
 	collectFrom(frame, Full)
 	if Process.pending() { return Ptr.null() }
 	let again = slotFor(size)
@@ -2118,9 +2119,9 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	}
 }
 
--- Whether this collection must be full: when the last collection found the
--- room under the memory target too small (`schedule`), or when the live
--- bytes, old objects that died since included, have grown by half since the
+-- Whether this collection must be full: when the last collection found
+-- more bytes promoted since the last full one than the room left under the
+-- memory target (`schedule`), or when the live bytes, old objects that died since included, have grown by half since the
 -- last full collection kept them. Under GC stress every eighth is, so that a
 -- stressed run exercises both.
 --
@@ -2198,19 +2199,20 @@ fun fullDue() -> Bool {
 -- bytes (`roomUnderTarget`); it bounds the regions in use, which is most of
 -- a program's footprint, not all of it. On wasm32 the 4 GiB ceiling of
 -- linear memory, less the collector's own reserve (`roomUnderCeiling`), caps
--- the budget too, and it has no floor but one 64KB step: past it is the
--- reserve the collector marks with.
+-- the budget too, and there the floor is at most 32 MiB, half the reserve:
+-- a heap living in the reserve collects every so often rather than at every
+-- few allocations, and leaves the marking the other half.
 --
 -- The next collection is full (`fullNext`) when the bytes promoted since the
--- last full collection are more than the room left after the sweep, or are
--- any at all past the target. A minor collection frees no old object that
--- has died, and the promoted bytes are the most that a full one could free
--- beyond it. Right after a full collection nothing has been promoted, so a
--- heap held near its target alternates between the two rather than
--- collecting in full every time, and one whose garbage dies young stays
--- minor. The test is made after the sweep and not when the next collection
--- starts, because by then the budget has used up the room, and every
--- collection would be full.
+-- last full collection are more than the room left after the sweep, and
+-- more than the floor. A minor collection frees no old object that has
+-- died. A full one frees those promoted since and those it kept itself;
+-- nothing counts the dead ones, and the promoted bytes stand in for them.
+-- Right after a full collection nothing has been promoted, so a heap held
+-- near its target collects in full only once a floor's worth has been, and
+-- one whose garbage dies young stays minor. The test is made after the
+-- sweep and not when the next collection starts, because by then the
+-- budget has used up the room, and every collection would be full.
 --
 -- A target can be set below what the program needs, and then every
 -- collection is full and frees little, which is the spiral to guard
@@ -2223,14 +2225,14 @@ fun fullDue() -> Bool {
 -- and the budget ignores the target until a collection drains it again.
 -- With every worker stopped while it collects, wall time is CPU time on
 -- every core, so one second of wall time is Go's one CPU-second per
--- processor. Past its first second, a program held at the target runs at
--- worst about half as fast, not arbitrarily slowly. One that keeps 128 MB
--- live under a 100 MB target while the lists it builds die old takes 1.5 s,
--- against 3.9 s with no guard and 0.5 s with no target; most of the 1.5 s
--- is the second the bucket takes to fill. One whose garbage dies young
--- needs no guard: under a 100 MB target with 256 MB live it stays minor,
--- and takes 1.3 s at a 309 MB footprint against 1.2 s at 717 MB with no
--- target. The guard never lifts wasm32's ceiling, past which there is no
+-- processor. Once the bucket has filled, a program held at the target
+-- collects for about as long as it runs, not arbitrarily long. One that
+-- keeps 128 MB live under a 100 MB target while the lists it builds die old
+-- takes 1.4 s, against 2.6 s with no guard and 0.3 s with no target; most
+-- of the 1.4 s is the second the bucket takes to fill. One whose garbage
+-- dies young, but for an array kept every 100,000 allocations, needs no
+-- guard: under a 100 MB target with 256 MB live it takes 1.4 s at a 308 MB
+-- footprint, against 1.5 s at 717 MB with no target. The guard never lifts wasm32's ceiling, past which there is no
 -- memory to grow into.
 
 -- The tuning factor of the square-root rule, in bytes^(1/2).
@@ -2254,8 +2256,10 @@ var mutatorSmoothed : Float = 0.0
 var freedSmoothed : Float = 0.0
 var markingSmoothed : Float = 0.0
 
--- The leaky bucket, in nanoseconds, and whether it has filled.
-let bucketCapacity : Int = 1000000000
+-- The leaky bucket, in nanoseconds, and whether it has filled. The
+-- capacity is a second, or TURKEY_GC_GUARD_NANOSECONDS, for tests that must
+-- see the guard turn on without running for a second of collecting.
+var bucketCapacity : Int = bucketFrom(Os.getenv(Prim.cString("TURKEY_GC_GUARD_NANOSECONDS")))
 var bucket : Int = 0
 var guarding : Bool = False
 
@@ -2292,12 +2296,13 @@ fun schedule(
 	if budget < least { budget = least }
 	let room = if guarding { maxInt() } else { roomUnderTarget() }
 	if room < budget { budget = if room > least { room } else { least } }
-	-- Past the ceiling's room is the collector's own reserve, which the
-	-- floor may not take: at most one 64KB step of it.
+	-- Past the ceiling's room is the collector's own reserve, of which the
+	-- floor may take at most half.
 	let ceiling = roomUnderCeiling()
-	if ceiling < budget { budget = if ceiling > 65536 { ceiling } else { 65536 } }
+	let nearCeiling = if least < 0x200_0000 { least } else { 0x200_0000 }
+	if ceiling < budget { budget = if ceiling > nearCeiling { ceiling } else { nearCeiling } }
 	let left = if ceiling < room { ceiling } else { room }
-	fullNext = liveBytes - liveBytesAfterFull > (if left > 0 { left } else { 0 })
+	fullNext = liveBytes - liveBytesAfterFull > (if left > least { left } else { least })
 	threshold = budget
 }
 
@@ -2369,6 +2374,14 @@ fun squareRoot(x : Float) -> Float {
 		root = next
 	}
 	root
+}
+
+-- TURKEY_GC_GUARD_NANOSECONDS: a decimal number of at least 1, or a second
+-- if it is unset or anything else.
+fun bucketFrom(s : Ptr) -> Int {
+	if Ptr.isNull(s) { return 1000000000 }
+	let n = decimalFrom(s)
+	if n < 1 { 1000000000 } else { n }
 }
 
 -- TURKEY_GC_TARGET: a decimal number of bytes, with optional surrounding

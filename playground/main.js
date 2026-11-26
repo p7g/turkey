@@ -387,9 +387,70 @@ async function loadLink() {
 }
 window.addEventListener("hashchange", loadLink);
 
+// -- Examples ------------------------------------------------------------------
+
+// The picker lists `examples/index.json`, which the deploy writes from the
+// suite's recorded programs. Choosing one replaces the editor's text through
+// the browser's undo stack, so Ctrl+Z brings the previous text back, and so
+// no confirmation is asked. A page served without the manifest keeps the
+// picker disabled and works as before.
+const picker = $("examples");
+let picking = 0; // the pick in flight, so a slow fetch never overwrites a later one
+
+async function loadExamples() {
+  try {
+    const response = await fetch("examples/index.json");
+    if (!response.ok) {
+      return;
+    }
+    const entries = await response.json();
+    picker.append(
+      ...entries.map(({ name, title }) => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = title;
+        return option;
+      }),
+    );
+    picker.disabled = false;
+    picker.dataset.files = JSON.stringify(Object.fromEntries(entries.map((e) => [e.name, e.file])));
+  } catch {}
+}
+
+picker.addEventListener("change", async () => {
+  const name = picker.value;
+  if (name === "") {
+    return;
+  }
+  const mine = ++picking;
+  const entry = JSON.parse(picker.dataset.files)[name];
+  let text;
+  try {
+    const response = await fetch(entry);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    text = await response.text();
+  } catch (error) {
+    note.textContent = `The example could not be loaded: ${error.message}.`;
+    return;
+  }
+  if (mine !== picking) {
+    return;
+  }
+  replaceText(source, text);
+  source.setSelectionRange(0, 0);
+  source.scrollTop = 0;
+  show([]);
+  formatError.hidden = true;
+  note.textContent = `Loaded "${picker.selectedOptions[0].textContent}". Undo brings back the previous text.`;
+  picker.value = "";
+});
+
 setPhase("loading", "Loading the compiler...");
 formatButton.disabled = true;
 startCompiler();
 startTools();
 startRunner();
 loadLink();
+loadExamples();

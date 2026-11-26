@@ -1,0 +1,129 @@
+export (
+	MethodCall(..),
+	Homes(..),
+	newHomes,
+	isInternal,
+	homeOf,
+	lookup,
+	elsewhere,
+	refer,
+	declares,
+	classMethod,
+	spelling,
+)
+
+--- Method calls: `x.f(args)` calls `x`'s field `f`, or `M.f(x, args)` where
+--- `M` is the home of the type constructor heading `x`'s type, and is an
+--- error if both exist. If neither exists, it calls a class method `f` in
+--- scope whose first parameter has the class's type at its head.
+---
+--- A type's home is the module that declares it. A type declared in an
+--- internal module -- a built-in type, or one declared in `Turkey`, `Prelude`
+--- or a `Turkey.*` module -- has as its home the one public library module
+--- that exports it, by itself or through an alias of it, and has it from no
+--- other public module. `f` is what `M.f` would name: one of `M`'s exports,
+--- or one of `M`'s own declarations when the call is in `M`.
+
+import Turkey.Ast (Expr)
+import Turkey.Solved (Use, Scope)
+import Turkey.Source (Span)
+import Turkey.Types as Ty
+
+--- One `x.f(args)`, as inference sees it until the solver decides it.
+type MethodCall = MethodCall {
+	label : String
+	--- The `EMethod` node, rewritten in place into the call it means once
+	--- the call is decided.
+	call : Expr
+	--- The callee the call is rewritten to call, with an id of its own, typed
+	--- `calleeType` and keyed to `use`: an `EVar` of the function, or an
+	--- `EField` of the receiver's field.
+	callee     : Expr
+	calleeType : Ty.Type
+	--- The receiver's type, then each argument's.
+	args   : Array Ty.Type
+	result : Ty.Type
+	use    : Use
+	--- Whether a local of the call's name is in scope where it is, which
+	--- hides a class method of the name from it.
+	shadowed : Bool
+	--- The dictionary scopes open where the call was first met. A call
+	--- decided later, when a unification elsewhere wakes it, is solved with
+	--- the solver somewhere else, and its use must keep these.
+	var scopes : Option (Vec Scope)
+}
+
+--- What the solver asks to decide a method call.
+type Homes = Homes {
+	--- Returns the home of the type constructor internally named `tycon`,
+	--- or why it has none.
+	home : fun(String) -> Either String String
+	--- Returns the internal name and the binder of what `M.f` names for a
+	--- call at `where`, for the home `M` and the label `f`.
+	lookup : fun(String, String, Option Span) -> Option (String, Int)
+	--- Returns whether the module declares a function of the name, exported
+	--- or not.
+	declares : fun(String, String) -> Bool
+	--- Returns the qualified spellings, `Q.f`, by which the scope of the
+	--- module at `where` names a function `f`.
+	elsewhere : fun(String, Option Span) -> Vec String
+	--- Records that the node with the given id means the given binder.
+	refer : fun(Int, Int) -> Unit
+	--- Returns the class method of the name a call at the span may call,
+	--- with its binder, or why the call cannot call it; `None` when no
+	--- class method of the name is in scope there.
+	classMethod : fun(String, Option Span) -> Option (Either String (String, Int))
+	--- Returns how the scope at the span spells the named function of the
+	--- module.
+	spelling : fun(String, String, Option Span) -> String
+}
+
+--- Returns homes that find nothing: what a solver run without modules uses.
+fun newHomes() -> Homes = Homes {
+	home        = fun(_) = Left("no module declares it")
+	lookup      = fun(_, _, _) = None
+	declares    = fun(_, _) = False
+	elsewhere   = fun(_, _) = []
+	refer       = fun(_, _) {}
+	classMethod = fun(_, _) = None
+	spelling    = fun(home, label, _) = home + "." + label
+}
+
+--- Returns whether the module `name` is one of the library's own, whose types
+--- take their home from the public module that exports them. `Prelude` and
+--- `Turkey` only pass the library's public modules on, so a type that reaches
+--- a program through them still has the module it comes from as its home.
+fun isInternal(name : String) -> Bool =
+	name == "Turkey" || name == "Prelude" || String.startsWith(name, "Turkey.")
+
+--- Returns the home of the type constructor internally named `tycon`, or why
+--- it has none.
+fun homeOf(h : Homes, tycon : String) -> Either String String = (h.home)(tycon)
+
+--- Returns the internal name and binder `home.label` names for a call at
+--- `where`.
+fun lookup(h : Homes, home : String, label : String, where : Option Span) -> Option (String, Int) =
+	(h.lookup)(home, label, where)
+
+--- Returns whether `home` declares a function `label`, exported or not.
+fun declares(h : Homes, home : String, label : String) -> Bool = (h.declares)(home, label)
+
+--- Returns the qualified spellings by which the scope at `where` names a
+--- function `label`.
+fun elsewhere(h : Homes, label : String, where : Option Span) -> Vec String =
+	(h.elsewhere)(label, where)
+
+--- Records that the node `node` means the binder `id`.
+fun refer(h : Homes, node : Int, id : Int) -> Unit = (h.refer)(node, id)
+
+--- Returns the class method `label` a call at `where` may call, with its
+--- binder, or why the call cannot call it; `None` when none is in scope.
+fun classMethod(h : Homes, label : String, where : Option Span) -> Option (Either String (
+	String,
+	Int,
+)) =
+	(h.classMethod)(label, where)
+
+--- Returns how the scope at `where` spells the function `label` of `home`.
+fun spelling(h : Homes, home : String, label : String, where : Option Span) -> String =
+	(h.spelling)(home, label, where)

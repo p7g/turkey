@@ -1820,15 +1820,7 @@ fun parsePostfix(p : P) -> Expr {
 	var e = parseAtom(p)
 	loop {
 		if at(p, "(") {
-			step(p)
-			let saved = setNoRecord(p, False)
-			let args = Vec.new(4)
-			while !at(p, ")") {
-				Vec.push(args, closePart(p, parseExpr(p)))
-				if !eat(p, ",") { break }
-			}
-			skipToken(p, ")")
-			p.noRecord = saved
+			let args = parseArguments(p)
 			e = closeAround(p, mkExpr(p, e.span, ECall(e, args)), args)
 		} else if at(p, "[") {
 			step(p)
@@ -1842,7 +1834,16 @@ fun parsePostfix(p : P) -> Expr {
 			let member = advance(p)
 			match member.kind {
 				KInt -> { e = mkExpr(p, e.span, EProject(e, intOf(member))) }
-				_    -> { e = mkExpr(p, e.span, EField(e, text(member))) }
+				_ -> if at(p, "(") {
+					-- A method call. The receiver is not one of the parts a
+					-- `_` closes at, so `_.trim().len()` is one function, as
+					-- `_.name.len()` is.
+					let args = parseArguments(p)
+					let call = mkExpr(p, e.span, EMethod(text(member), Vec.append([e], args)))
+					e = closeAround(p, call, args)
+				} else {
+					e = mkExpr(p, e.span, EField(e, text(member)))
+				}
 			}
 		} else if at(p, "?") {
 			-- A suffix like the other three, so it binds tighter
@@ -1862,6 +1863,20 @@ fun parsePostfix(p : P) -> Expr {
 		}
 	}
 	e
+}
+
+-- Parses `(a, b, ...)`, each argument closed as a part.
+fun parseArguments(p : P) -> Vec Expr {
+	skipToken(p, "(")
+	let saved = setNoRecord(p, False)
+	let args = Vec.new(4)
+	while !at(p, ")") {
+		Vec.push(args, closePart(p, parseExpr(p)))
+		if !eat(p, ",") { break }
+	}
+	skipToken(p, ")")
+	p.noRecord = saved
+	args
 }
 
 fun memberFollows(p : P) -> Bool = match Token.kindName(peek(p, 1).kind) {

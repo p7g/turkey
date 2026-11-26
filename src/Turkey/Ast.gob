@@ -241,6 +241,11 @@ type ExprKind
 	--- The flag is set on a function written with `\`.
 	| ELambda(Vec Pat, Option Type, Expr, Bool)
 	| ECall(Expr, Vec Expr)
+	--- `x.f(args)`: the method's name, then the receiver followed by the
+	--- arguments, as the call `M.f(x, args)` it means passes them. Inference
+	--- decides which `M` from the receiver's type and rewrites the node into
+	--- that call, so no stage after inference sees one.
+	| EMethod(String, Vec Expr)
 	--- The two trailing references are `Index`'s `get` and `set`, filled in by
 	--- resolution and consumed by desugaring, which turns every bracket into
 	--- the call it means. The parser writes `None` for both.
@@ -753,6 +758,7 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
 	ERecord(_, fields)         -> fieldChildren(fields)
 	ELambda(_, _, body, _)     -> [ChExpr(body)]
 	ECall(fn, args)            -> Vec.append([ChExpr(fn)], Vec.map(args, ChExpr))
+	EMethod(_, args)           -> Vec.map(args, ChExpr)
 	EIndex(arr, index, _, _)   -> [ChExpr(arr), ChExpr(index)]
 	EField(obj, _)             -> [ChExpr(obj)]
 	EProject(obj, _)           -> [ChExpr(obj)]
@@ -927,6 +933,10 @@ fun reach(e : Expr) -> Reach = match e.kind {
 	ELambda(_, _, _, _) -> plain
 	ECall(fn, args) -> {
 		let r = inOrder(Vec.append([reach(fn)], Vec.map(args, reach)))
+		Reach { ends = andThen(r.ends, IfReturns(e)), breaks = r.breaks, returns = r.returns }
+	}
+	EMethod(_, args) -> {
+		let r = inOrder(Vec.map(args, reach))
 		Reach { ends = andThen(r.ends, IfReturns(e)), breaks = r.breaks, returns = r.returns }
 	}
 	EIndex(arr, index, _, _) -> inOrder([reach(arr), reach(index)])
@@ -1212,7 +1222,11 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
 		})
 		("fun(" + String.join(names, ", ") + ") = " + sketchAt(body, 0), 0)
 	}
-	ECall(fn, args)          -> (sketchAt(fn, 7) + "(" + sketchList(args) + ")", 7)
+	ECall(fn, args) -> (sketchAt(fn, 7) + "(" + sketchList(args) + ")", 7)
+	EMethod(name, args) -> (
+		sketchAt(args[0], 7) + "." + name + "(" + sketchList(Vec.slice(args, 1, len(args))) + ")",
+		7,
+	)
 	EIndex(arr, index, _, _) -> (sketchAt(arr, 7) + "[" + sketchAt(index, 0) + "]", 7)
 	EField(obj, name)        -> (sketchAt(obj, 7) + "." + name, 7)
 	EProject(obj, n)         -> (sketchAt(obj, 7) + "." + Int.toString(n), 7)
@@ -1426,6 +1440,7 @@ fun plainExpr(e : Expr) -> Unit {
 		| EArray(_)
 		| ERecord(_, _)
 		| ECall(_, _)
+		| EMethod(_, _)
 		| EIndex(_, _, _, _)
 		| EField(_, _)
 		| EProject(_, _)

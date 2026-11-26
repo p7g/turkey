@@ -37,6 +37,7 @@ import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
+import Turkey.MethodCalls as MethodCalls
 import Turkey.Format as Format
 import Turkey.Format (Outcome(..))
 import Turkey.Highlight as Highlight
@@ -115,6 +116,7 @@ import Turkey.Ast (
 	ClassDecl(..),
 	ForeignLibrary(..),
 	LibraryKind(..),
+	TypeKind(..),
 	patternVars,
 )
 import Turkey.Libraries as Libraries
@@ -2339,7 +2341,7 @@ fun emitModule(
 					for var o = 0; o < len(outs); o = o + 1 {
 						match m.texts[o] {
 							Some(text) -> String.push(outs[o].text, text)
-							None -> outs[o].render(
+							None -> (outs[o].render)(
 								asm.dialect,
 								Vec.slice(m.code, 0, len(m.code)),
 								outs[o].text,
@@ -3097,6 +3099,7 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 		files   = []
 	}
 	checked.classes = Classes.newClassTable(checked.decls)
+	let homes = methodHomes(groups, binders, checked.classes)
 	-- A component of modules is checked in one run: their bindings may use
 	-- each other, so they are inferred together.
 	for group in groups {
@@ -3129,6 +3132,7 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 				None     -> fallback
 			},
 		)
+		solver.homes = homes
 		let (items, constraint) = Infer.generate(g, programs)
 		-- The generator goes on past an error with a placeholder in its place,
 		-- which a constraint built around it would only report against again.
@@ -3140,13 +3144,294 @@ fun checkSource(source : Source) -> (Checked, Modules.Module, Vec (Vec Modules.M
 		Infer.checkExhaustiveness(g)
 		Diag.stopOnErrors()
 		Evidence.run(checked.classes, solver.uses, g.instanceChecks)
-		for item in items { Vec.push(checked.ordered, item) }
+		for item in Infer.evaluationOrder(g, items) { Vec.push(checked.ordered, item) }
+		Diag.stopOnErrors()
 	}
 	if checkingBinders() { Binders.checkInferred(binders, source.name) }
 	checkMain(entry, checked.env, checked.classes)
 	Diag.stopOnErrors()
 	Diag.stopCollecting()
 	(checked, entry, groups)
+}
+
+-- Where the method calls of a program find their functions
+-- (`Turkey.MethodCalls`). The homes of the library's internal types are
+-- worked out here, once, from what the public library modules export, so
+-- that a type exported by two of them is reported whatever the program
+-- calls.
+fun methodHomes(
+	groups : Vec (Vec Modules.Module),
+	binders : Binders.Table,
+	classes : Classes.ClassTable,
+) -> MethodCalls.Homes {
+	let byName = Map.new()
+	let byFile = Map.new()
+	-- Every type alias, by its internal name, and the head of what it stands
+	-- for.
+	let aliases : Map String String = Map.new()
+	for group in groups {
+		for m in group {
+			Map.put(byName, m.name, m)
+			Map.put(byFile, m.file, m)
+			for d in m.program.decls {
+				if let DType(t) = d {
+					if let Some(body) = t.alias {
+						if let TECon(head, _) = body.kind { Map.put(aliases, t.name, head) }
+					}
+				}
+			}
+		}
+	}
+	let internal = internalHomes(groups, aliases)
+	let caller = fun(where : Option Source.Span) = match where {
+		Some(sp) -> Map.get(byFile, sp.file)
+		None     -> None
+	}
+	MethodCalls.Homes {
+		home = fun(tycon) {
+			if let Some((owner, _)) = String.rsplitOnce(tycon, "#") {
+				if !MethodCalls.isInternal(owner) { return Right(owner) }
+			}
+			match Map.get(internal, tycon) {
+				Some(home) -> Right(home)
+				None       -> Left("no public module exports it")
+			}
+		}
+		lookup = fun(home, label, where) {
+			let m = match Map.get(byName, home) {
+				Some(m) -> m
+				None    -> return None
+			}
+			let own = Prelude.internal(home, label)
+			let target = match caller(where) {
+				Some(c) -> if c.name == home && Map.get(m.scope.values, label) == Some(own) {
+					Some(own)
+				} else {
+					Map.get(m.exports.values, label)
+				}
+				None -> Map.get(m.exports.values, label)
+			}
+			match target {
+				Some(t) -> match Binders.named(binders, t) {
+					Some(id) -> Some((t, id))
+					None     -> None
+				}
+				None -> None
+			}
+		}
+		declares = fun(home, label) = match Map.get(byName, home) {
+			Some(m) -> Map.get(m.scope.values, label) == Some(Prelude.internal(home, label))
+			None    -> False
+		}
+		elsewhere = fun(label, where) {
+			let out = Vec.new(1)
+			if let Some(c) = caller(where) {
+				for (q, modules) in Map.entries(c.scope.qualifiers) {
+					if Iter.any(modules, fun(other) = Map.contains(other.exports.values, label)) {
+						Vec.push(out, q + "." + label)
+					}
+				}
+			}
+			out
+		}
+		refer = fun(node, id) = Binders.record(binders, node, id)
+		classMethod = fun(label, where) {
+			let c = caller(where)?
+			-- Two classes' methods in scope under the name: the call cannot
+			-- choose, as a call by name cannot.
+			if let Some(targets) = Map.get(
+				Modules.conflictsIn(c.scope, Modules.ValueSpace),
+				label,
+			) {
+				let classesOf = Vec.filter(
+					Vec.map(targets, fun(t) = Classes.method(classes, t)),
+					Option.isSome,
+				)
+				if len(classesOf) > 1 {
+					let names = Vec.sort(
+						Vec.map(classesOf, fun(info) = match info {
+							Some(i) -> "'" + Ty.shortName(i.cls) + "'"
+							None    -> ""
+						}),
+					)
+					return Some(
+						Left(
+							"'"
+								+ label
+								+ "' is a method of both "
+								+ String.join(names, " and ")
+								+ "; call it by its class's qualified name",
+						),
+					)
+				}
+			}
+			let target = Map.get(c.scope.values, label)?
+			let info = match Classes.method(classes, target) {
+				Some(info) -> info
+				-- A function of the name hides a class method of it that an
+				-- import brings, as it does from a call by name.
+				None ->
+					if Iter.any(
+						Modules.reachable(c.scope),
+						fun(other) = match Map.get(other.exports.values, label) {
+							Some(t) -> Option.isSome(Classes.method(classes, t))
+							None    -> False
+						},
+					) {
+						let whose = match String.rsplitOnce(target, "#") {
+							Some((owner, _)) -> if owner == c.name {
+								"this module's '" + label + "'"
+							} else {
+								"the imported '" + owner + "." + label + "'"
+							}
+							None -> "'" + label + "'"
+						}
+						return Some(
+							Left(
+								"cannot call the class method '"
+									+ label
+									+ "': "
+									+ whose
+									+ " hides it, as it does from a call by name",
+							),
+						)
+					} else {
+						return None
+					}
+			}
+			if !hasReceiver(info) {
+				let why = if parameterCount(info) == 0 {
+					"it has no parameters"
+				} else {
+					"its first parameter's type is not headed by the class's type variable"
+				}
+				return Some(
+					Left(
+						"the method '"
+							+ label
+							+ "' of class '"
+							+ Ty.shortName(info.cls)
+							+ "' has no receiver: "
+							+ why
+							+ ", so it cannot be called with '.'",
+					),
+				)
+			}
+			let id = Binders.named(binders, target)?
+			Some(Right((target, id)))
+		}
+		spelling = fun(home, label, where) {
+			if let Some(c) = caller(where) {
+				if c.name == home { return label }
+				for (q, modules) in Map.entries(c.scope.qualifiers) {
+					if Iter.any(modules, fun(other) = other.name == home) { return q + "." + label }
+				}
+			}
+			home + "." + label
+		}
+	}
+}
+
+-- Returns how many parameters the class method `info` takes.
+fun parameterCount(info : Classes.MethodInfo) -> Int = match Ty.prune(info.scheme.body) {
+	TFun(params, _) -> len(params)
+	_               -> 0
+}
+
+-- Returns whether the class method `info` has a receiver: a first parameter
+-- whose type is headed by the class's type variable, which a method call's
+-- receiver is then of. `show(a)` and `map(f a, ...)` have one; `pure(a)` and
+-- `zero()` do not.
+fun hasReceiver(info : Classes.MethodInfo) -> Bool {
+	let TFun(params, _) = Ty.prune(info.scheme.body) else { return False }
+	if len(params) == 0 { return False }
+	match Ty.spine(Ty.prune(params[0])).0 {
+		TVar(v) -> v.id == info.classVar.id
+		_       -> False
+	}
+}
+
+-- The home of each type internal to the library that a public library
+-- module exports, by itself or through an alias of it, and has from no other
+-- public module: that module. Reports a type that two of them export so,
+-- since a type has one home.
+fun internalHomes(
+	groups : Vec (Vec Modules.Module),
+	aliases : Map String String,
+) -> Map String String {
+	let byName = Map.new()
+	for group in groups {
+		for m in group { Map.put(byName, m.name, m) }
+	}
+	let isPublic = fun(m : Modules.Module) = m.library && !MethodCalls.isInternal(m.name)
+	-- Each exporter of each internal type, and whether it has the type from
+	-- another public module and so only passes it on, as `Net.HTTP` does its
+	-- parts'.
+	let exporters : Map String (Vec (String, Bool)) = Map.new()
+	for group in groups {
+		for m in group {
+			if !isPublic(m) { continue }
+			for target in Map.values(m.exports.types) {
+				let head = aliasHead(aliases, target)
+				let isInternal = match String.rsplitOnce(head, "#") {
+					Some((owner, _)) -> MethodCalls.isInternal(owner)
+					None             -> True
+				}
+				if !isInternal { continue }
+				let passedOn =
+					Iter.any(Map.values(m.imported), fun(name) = match Map.get(byName, name) {
+						Some(other) -> isPublic(other)
+							&& Iter.any(
+								Map.values(other.exports.types),
+								fun(t) = aliasHead(aliases, t) == head,
+							)
+						None -> False
+					})
+				let entry = (m.name, passedOn)
+				match Map.get(exporters, head) {
+					Some(found) -> if !Iter.any(found, fun((n, _)) = n == m.name) {
+						Vec.push(found, entry)
+					}
+					None -> Map.put(exporters, head, [entry])
+				}
+			}
+		}
+	}
+	let out = Map.new()
+	for (tycon, found) in Map.entries(exporters) {
+		let origins = Vec.filter(found, fun((_, passedOn)) = !passedOn)
+		if len(origins) == 1 {
+			Map.put(out, tycon, origins[0].0)
+		} else {
+			-- None at all is public modules passing the type to each other.
+			let named = if len(origins) == 0 { found } else { origins }
+			Ty.typeError(
+				"the library type '"
+					+ Ty.shortName(tycon)
+					+ "' is exported by "
+					+ String.join(
+						Vec.map(Vec.sort(Vec.map(named, fun((n, _)) = n)), fun(n) = "'" + n + "'"),
+						" and ",
+					)
+					+ (if len(origins) == 0 { ", each from the other" } else { "" })
+					+ "; a type internal to the library can have only one public module",
+				None,
+			)
+		}
+	}
+	out
+}
+
+-- The type constructor the type named `name` is, through any aliases.
+fun aliasHead(aliases : Map String String, name : String) -> String {
+	var at = name
+	for _ in Int.range(0, 16) {
+		match Map.get(aliases, at) {
+			Some(next) -> { at = next }
+			None       -> return at
+		}
+	}
+	at
 }
 
 -- The value constructors a module's scope can name, ambiguous ones included.

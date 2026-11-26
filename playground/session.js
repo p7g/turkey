@@ -10,6 +10,10 @@
 import { diagnosticsFor } from "./diagnostics.js";
 import { attachEditor, replaceText } from "./editor.js";
 
+// The most characters the output pane keeps of a run's output. A program that
+// prints without end would otherwise grow the page until the tab hangs.
+const OUTPUT_CAP = 1 << 20;
+
 /**
  * Starts a session over `elements`, an object holding the page's
  * `source` textarea, the `highlighted` code element beneath it, the `run`,
@@ -20,6 +24,11 @@ import { attachEditor, replaceText } from "./editor.js";
  * `lazy`, nothing loads until `load()` is called, or the source is edited,
  * or Run is pressed, which then runs the program once the compiler is ready.
  * `timeLimit()` returns how many seconds a run may take.
+ *
+ * A running program's output appears in the pane as it is written, at most
+ * once per animation frame. Stop and the time limit keep what was written.
+ * The pane keeps the last `OUTPUT_CAP` characters of a run, with a note when
+ * it has dropped earlier ones.
  *
  * Returns `{ editor, load, show, cancel }`: the editor `attachEditor` returned,
  * `load()`, `show(parts)`, which fills the output pane with `[kind,
@@ -94,6 +103,109 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     );
   }
 
+  // -- Streamed output ---------------------------------------------------------
+
+  // The pane of the run in flight, or null: its warnings, a note that output
+  // was dropped, and one `<pre>` holding the program's output as a text node
+  // per stretch of a stream, stderr's in a styled span. Writes wait in
+  // `pending` until the next animation frame, and are cut to the cap there
+  // too, since a hidden tab runs no frames.
+  let live = null;
+
+  function beginStream(diagnostics) {
+    const make = (kind) => {
+      const element = document.createElement("pre");
+      element.className = kind;
+      element.hidden = true;
+      return element;
+    };
+    const warning = make("warning");
+    warning.textContent = diagnostics;
+    warning.hidden = diagnostics === "";
+    const trimmed = make("status");
+    trimmed.textContent = `Output before the last ${OUTPUT_CAP / 1024} KB is not shown.`;
+    live = { warning, trimmed, body: make("stdout"), nodes: [], size: 0, pending: [], pendingSize: 0, dropped: false, frame: 0 };
+    output.replaceChildren(warning, trimmed, live.body);
+  }
+
+  function streamed(chunks) {
+    for (const [stream, text] of chunks) {
+      const end = live.pending[live.pending.length - 1];
+      if (end !== undefined && end[0] === stream) {
+        end[1] += text;
+      } else {
+        live.pending.push([stream, text]);
+      }
+      live.pendingSize += text.length;
+    }
+    // Drop from the front until at most the cap is left.
+    while (live.pendingSize > OUTPUT_CAP) {
+      const excess = live.pendingSize - OUTPUT_CAP;
+      const first = live.pending[0];
+      live.dropped = true;
+      if (first[1].length <= excess) {
+        live.pending.shift();
+        live.pendingSize -= first[1].length;
+      } else {
+        first[1] = first[1].slice(excess);
+        live.pendingSize -= excess;
+      }
+    }
+    if (live.frame === 0) {
+      const mine = live;
+      live.frame = requestAnimationFrame(() => {
+        mine.frame = 0;
+        if (mine === live) {
+          flushStream();
+        }
+      });
+    }
+  }
+
+  // Moves what is pending into the pane and trims the pane to the cap.
+  function flushStream() {
+    const { body, nodes } = live;
+    for (const [stream, text] of live.pending) {
+      const node = document.createTextNode(text);
+      let element = node;
+      if (stream === "stderr") {
+        element = document.createElement("span");
+        element.className = "stderr";
+        element.append(node);
+      }
+      body.append(element);
+      nodes.push({ element, node });
+      live.size += text.length;
+    }
+    live.pending = [];
+    live.pendingSize = 0;
+    while (live.size > OUTPUT_CAP) {
+      const excess = live.size - OUTPUT_CAP;
+      const first = nodes[0];
+      live.dropped = true;
+      if (first.node.length <= excess) {
+        first.element.remove();
+        nodes.shift();
+        live.size -= first.node.length;
+      } else {
+        first.node.deleteData(0, excess);
+        live.size -= excess;
+      }
+    }
+    body.hidden = nodes.length === 0;
+    live.trimmed.hidden = !live.dropped;
+  }
+
+  // Ends the stream, keeping what it shows, and returns its pane for the
+  // run's last lines to follow.
+  function endStream() {
+    const ended = live;
+    cancelAnimationFrame(ended.frame);
+    flushStream();
+    live = null;
+    return ended;
+  }
+
   function startCompiler() {
     const worker = new Worker(new URL("compile-worker.js", import.meta.url), { type: "module" });
     compiler = worker;
@@ -155,14 +267,17 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       if (worker !== runner || phase !== "running") {
         return;
       }
+      if (data.type === "write") {
+        streamed(data.chunks);
+        return;
+      }
       const trapped = data.trap !== null;
+      // The compiler's warnings, with the refused-functions one only when the
+      // program trapped.
+      live.warning.textContent = diagnosticsFor(pendingDiagnostics, trapped);
+      live.warning.hidden = live.warning.textContent === "";
       finishRun(
         [
-          // The compiler's warnings, with the refused-functions one only when
-          // the program trapped.
-          ["warning", diagnosticsFor(pendingDiagnostics, trapped)],
-          ["stdout", data.stdout],
-          ["stderr", data.stderr],
           ["error", trapped ? `trap: ${data.trap}` : ""],
           ["status", trapped ? "no exit status (trapped)" : `exit status ${data.status}`],
         ],
@@ -178,6 +293,9 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       clearTimeout(timer);
       worker.terminate();
       runner = null;
+      if (live !== null) {
+        endStream();
+      }
       show([["error", event.message || "the run Worker failed"]]);
       setPhase("idle", "Run failed.");
     };
@@ -185,14 +303,29 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
 
   let pendingDiagnostics = ""; // the compile's diagnostics, for the run that follows
 
-  // Ends the run in progress. A finished Worker is dropped for a fresh one, so
-  // no run sees another's leftovers.
+  // Ends the run in progress, and follows the output it wrote with `parts`. A
+  // finished Worker is dropped for a fresh one, so no run sees another's
+  // leftovers.
   function finishRun(parts, text) {
     clearTimeout(timer);
     runner.terminate();
     startRunner();
-    show(parts);
+    append(endStream(), parts);
     setPhase("idle", text);
+  }
+
+  // Adds the non-empty `[kind, text]` parts after the pane `ended`.
+  function append(ended, parts) {
+    ended.body.parentNode.append(
+      ...parts
+        .filter(([, line]) => line !== "")
+        .map(([kind, line]) => {
+          const element = document.createElement("pre");
+          element.className = kind;
+          element.textContent = line;
+          return element;
+        }),
+    );
   }
 
   function compiled(data) {
@@ -213,6 +346,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       startRunner();
     }
     setPhase("running", "Running...");
+    beginStream(diagnosticsFor(pendingDiagnostics, false));
     timer = setTimeout(
       () => finishRun([["error", `Timed out after ${limit} s; the program was stopped.`]], "Timed out."),
       limit * 1000,
@@ -231,7 +365,10 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     if (phase === "running") {
       runner.terminate();
       startRunner();
+      // Keep what the program wrote, and add the status after it.
+      append(endStream(), [["status", "Stopped."]]);
       setPhase("idle", "Stopped.");
+      return;
     } else if (phase === "compiling") {
       compiler.terminate();
       startCompiler();

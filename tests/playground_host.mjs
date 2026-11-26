@@ -4,8 +4,9 @@
 //
 // compiles SOURCE with the wasm compiler and, if it wrote a program, runs that
 // with STDIN's contents on its standard input. Prints one JSON object:
-// `compiled`, what `compile` returned less its bytes, and `ran`, what `run`
-// returned, or null.
+// `compiled`, what `compile` returned less its bytes, `ran`, what `run`
+// returned, or null, and `streamed`, what `run` passed to `onWrite`: the
+// bytes of each stream, concatenated and decoded, and the number of calls.
 //
 //     node tests/playground_host.mjs --tools TURKEY.WASM SOURCE
 //
@@ -28,6 +29,14 @@ if (process.argv[2] === "--tools") {
   const compiler = await loadCompiler(await readFile(wasmPath), await readFile(libPath));
   const { bytes, ...compiled } = await compile(compiler, await readFile(sourcePath, "utf8"));
   const stdin = stdinPath === undefined ? "" : await readFile(stdinPath);
-  const ran = bytes === null ? null : await run(bytes, { stdin });
-  process.stdout.write(JSON.stringify({ compiled, ran }) + "\n");
+  const parts = { stdout: [], stderr: [] };
+  let calls = 0;
+  const onWrite = (stream, chunk) => {
+    calls++;
+    parts[stream].push(chunk);
+  };
+  const ran = bytes === null ? null : await run(bytes, { stdin, onWrite });
+  const joined = (chunks) => new TextDecoder().decode(Buffer.concat(chunks));
+  const streamed = { stdout: joined(parts.stdout), stderr: joined(parts.stderr), calls };
+  process.stdout.write(JSON.stringify({ compiled, ran, streamed }) + "\n");
 }

@@ -129,18 +129,25 @@ async function tool(compiler, args, source) {
  * memory }`: `status` is its exit status, or null if it trapped, and `trap` is
  * the trap's message, or null. A panic is not a trap: it writes its report to
  * stderr and exits with a non-zero status.
+ *
+ * With `onWrite`, each write the program makes is also passed to
+ * `onWrite(stream, bytes)` as it happens, `stream` being "stdout" or "stderr"
+ * and `bytes` a `Uint8Array` the callback may keep. `stdout` and `stderr` in
+ * the result still hold everything written, so a stream's streamed bytes,
+ * concatenated, are its text encoded.
  */
-export async function run(program, { stdin = "", args = [] } = {}) {
+export async function run(program, { stdin = "", args = [], onWrite = null } = {}) {
   const module = program instanceof WebAssembly.Module ? program : await WebAssembly.compile(program);
   const input = typeof stdin === "string" ? new TextEncoder().encode(stdin) : stdin;
   const fds = [new OpenFile(new File(input)), null, null, new PreopenDirectory(".", [])];
-  return await start(module, ["main", ...args], [], fds, { merged: false });
+  return await start(module, ["main", ...args], [], fds, { merged: false, onWrite });
 }
 
 // Instantiates `module`, fills fds 1 and 2 with streams that collect what is
 // written, and runs `_start`. With `merged`, both streams collect into one
-// text, in the order the writes were made, as a terminal shows them.
-async function start(module, argv, env, fds, { merged }) {
+// text, in the order the writes were made, as a terminal shows them. With
+// `onWrite`, each write is also passed to it, as `run` documents.
+async function start(module, argv, env, fds, { merged, onWrite = null }) {
   const decoder = { stdout: new TextDecoder(), stderr: new TextDecoder() };
   const text = { stdout: "", stderr: "" };
   // A `ConsoleStdout` is a character device that cannot seek, which the
@@ -148,6 +155,9 @@ async function start(module, argv, env, fds, { merged }) {
   // stdout and stderr interleaved as they were written.
   const stream = (name) =>
     new ConsoleStdout((bytes) => {
+      // Copy, so the callback may keep the bytes whatever the shim does with
+      // its buffer afterwards.
+      onWrite?.(name, bytes.slice());
       const into = merged ? "stdout" : name;
       text[into] += decoder[into].decode(bytes, { stream: true });
     });

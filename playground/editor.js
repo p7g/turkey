@@ -15,16 +15,16 @@
 /**
  * Starts highlighting `textarea` into `code`, a `display: block` element in a
  * `<pre>` beneath it with the same font, padding and `tab-size`.
- * `requestHighlight(source)` is called with the text, at most once per
- * `delay` milliseconds of typing, and the caller hands the compiler's answer
- * to `highlighted(source, html)` on the object this returns. Call `changed()`
- * on it after setting `textarea.value` from code, which fires no event.
+ * `requestHighlight(source)` is called with the text on every change, and the
+ * caller hands the compiler's answer to `highlighted(source, html)` on the
+ * object this returns. The caller coalesces requests while a highlight runs.
+ * Call `changed()` on it after setting `textarea.value` from code, which
+ * fires no event.
  *
  * Tab inserts a tab. Escape and then Tab moves the focus on, as in other
  * editors that take the Tab key.
  */
-export function attachEditor(textarea, code, requestHighlight, { delay = 120 } = {}) {
-  let timer = null;
+export function attachEditor(textarea, code, requestHighlight) {
   // The textarea scrolls, and the code element is moved to match. Moving it
   // with a transform, not by scrolling the `<pre>`, keeps the two aligned at
   // the very end too, where a textarea's scrollbars would let it scroll
@@ -35,8 +35,7 @@ export function attachEditor(textarea, code, requestHighlight, { delay = 120 } =
   const changed = () => {
     patch(code, textarea.value);
     follow();
-    clearTimeout(timer);
-    timer = setTimeout(() => requestHighlight(textarea.value), delay);
+    requestHighlight(textarea.value);
   };
   let escaped = false;
   textarea.addEventListener("keydown", (event) => {

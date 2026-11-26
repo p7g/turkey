@@ -56,9 +56,9 @@ let tools = null; // the Worker that highlights and formats
 let toolsReady = false;
 let formatting = null; // the id of the Format in flight, or null
 
-// At most one highlight is in flight, and only the latest text waits behind
-// it. A highlight that outlasts the editor's debounce would otherwise queue
-// the next ones, and a Format behind them.
+// A keystroke highlights at once when none is in flight. At most one is in
+// flight, and only the latest text waits behind it, so a burst of keystrokes
+// during a highlight costs one more, and a Format never queues behind many.
 let highlighting = false;
 let pendingHighlight = null;
 function flushHighlight() {

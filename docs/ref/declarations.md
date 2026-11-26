@@ -247,8 +247,8 @@ fun main() {
 ["Mars"]
 ```
 
-Each is shorthand for a lambda. `_ * 2` means `fun($x) = $x * 2`, and
-`_.name` means `fun($x) = $x.name`.
+Each is shorthand for a lambda. `_ * 2` means `fun($x) = $x * 2`, `_.name`
+means `fun($x) = $x.name`, and `_.trim()` means `fun($x) = $x.trim()`.
 
 **How far the function reaches.** The function is the smallest *boundary*
 around the `_`. These are boundaries:

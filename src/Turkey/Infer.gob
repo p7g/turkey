@@ -5,6 +5,7 @@ export (
 	solve,
 	bindMethods,
 	checkExhaustiveness,
+	evaluationOrder,
 )
 
 --- Constraint generation.
@@ -63,6 +64,7 @@ import Turkey.Constraints (
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
+import Turkey.MethodCalls (MethodCall(..))
 import Turkey.Inert as Inert
 import Turkey.Lint as Lint
 import Turkey.Inert (Refusal(..), Given(..))
@@ -490,7 +492,31 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
 		}
 	}
 
+	-- A method call `x.f(args)` may mean any top-level `f` of the group:
+	-- which one is decided only by solving. As in Haskell 2010 (section
+	-- 4.5.1), a binding depends only on what it refers to that has no
+	-- complete signature, since a signature's scheme is bound before any group
+	-- is solved (`bindSignatures`). So a method call depends on each
+	-- same-named function of the group without one. Groups solved earlier are
+	-- bound already, and need no edge.
+	let byLabel : Map String (Vec String) = Map.new()
+	for (name, key) in Map.entries(owner) {
+		let signed = match Map.get(byKey, key) {
+			Some(item) -> match item.kind {
+				SFun(d) -> hasCompleteSignature(d)
+				_       -> False
+			}
+			None -> False
+		}
+		if signed { continue }
+		let label = Ty.shortName(name)
+		match Map.get(byLabel, label) {
+			Some(keys) -> Vec.push(keys, key)
+			None       -> Map.put(byLabel, label, [key])
+		}
+	}
 	let graph = Map.new()
+	let named = Map.new()
 	for var i = 0; i < len(items); i = i + 1 {
 		let edges = Set.new()
 		for id in Set.elements(Deps.references(g.binders, items[i])) {
@@ -498,11 +524,17 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
 				Set.add(edges, key)
 			}
 		}
-		Map.put(graph, "item" + Int.toString(i), edges)
+		let guessed = Set.new()
+		for label in Set.elements(Deps.methodLabels(items[i])) {
+			for key in Map.getOr(byLabel, label, []) { Set.add(guessed, key) }
+		}
+		Map.put(named, "item" + Int.toString(i), edges)
+		Map.put(graph, "item" + Int.toString(i), Set.union(edges, guessed))
 	}
 
 	let groups = Vec.new(8)
 	let ordered = Vec.new(16)
+	bindSignatures(g, items)
 	for component in Deps.sccs(graph) {
 		let group = Vec.new(len(component))
 		let boundNames = Vec.new(4)
@@ -516,17 +548,24 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
 		}
 		-- A group reported as cyclic is not generated: the rest of the
 		-- generator takes a recursive group to be all functions.
-		if !checkGroupRecursion(group, Vec.sort(boundNames), component, graph) {
-			Vec.push(groups, group)
+		if !checkGroupRecursion(group, Vec.sort(boundNames), component, graph, named) {
+			Vec.push(groups, (group, guessedGroupAdvice(group, component, graph, named)))
 		}
 		for item in group { Vec.push(ordered, item) }
 	}
 
 	-- Each group is a unit of diagnostics, as it is when solved: one wrong
 	-- record field is reported once, not again as a missing one.
-	for group in groups {
+	for (group, advice) in groups {
 		Diag.beginUnit()
-		bindTopGroup(g, group)
+		match advice {
+			Some(text) -> {
+				push(g)
+				bindTopGroup(g, group)
+				emit(g, CAdvise(text, Some(group[0].span), pop(g)))
+			}
+			None -> bindTopGroup(g, group)
+		}
 		let _ = Diag.endUnit()
 	}
 	-- Method bodies come after every group, so that they may call any
@@ -624,34 +663,199 @@ fun itemBinders(g : Generator, item : Stmt) -> Vec Int = match item.kind {
 fun letElseSurvived(s : Stmt) -> a =
 	bug("a 'let ... else' survived desugaring", Some(s.span))
 
+--- Returns `items`, the top-level items of a module group that solving has
+--- checked, in the order they are initialized in: each after every binding
+--- its value reads. Reports a value that reads itself, since only functions
+--- may be recursive.
+---
+--- The binding groups are not that order. A method call depends on no function
+--- with a complete signature while types are inferred, and solving has since
+--- made each call a reference to the function it calls, so the references
+--- now give every dependency, and no guessed one.
+fun evaluationOrder(g : Generator, items : Vec Stmt) -> Vec Stmt {
+	let byKey = Map.new()
+	let ownerOf = Map.new()
+	for var i = 0; i < len(items); i = i + 1 {
+		let key = "item" + Int.toString(i)
+		Map.put(byKey, key, items[i])
+		for id in itemBinders(g, items[i]) { Map.put(ownerOf, id, key) }
+	}
+	let graph = Map.new()
+	for var i = 0; i < len(items); i = i + 1 {
+		let edges = Set.new()
+		for id in Set.elements(Deps.references(g.binders, items[i])) {
+			if let Some(key) = Map.get(ownerOf, id) { Set.add(edges, key) }
+		}
+		Map.put(graph, "item" + Int.toString(i), edges)
+	}
+	let out = Vec.new(len(items))
+	for component in Deps.sccs(graph) {
+		let group = Vec.new(len(component))
+		let names = Vec.new(len(component))
+		for key in component {
+			if let Some(item) = Map.get(byKey, key) {
+				Vec.push(group, item)
+				for n in itemNames(item) { Vec.push(names, "'" + Ty.shortName(n) + "'") }
+			}
+		}
+		let holdsValue = Iter.any(group, fun(item) = match item.kind {
+			SFun(_) -> False
+			_       -> True
+		})
+		if cyclic(component, graph) && holdsValue {
+			Ty.typeError(
+				"cyclic definition: "
+					+ String.join(Vec.sort(names), ", ")
+					+ " depend on each other through a method call, but only functions can "
+					+ "be mutually recursive",
+				Some(group[0].span),
+			)
+		}
+		for item in group { Vec.push(out, item) }
+	}
+	out
+}
+
+-- Returns whether `d` has a complete signature: every parameter and its result
+-- annotated, so that its scheme is known before its body is solved
+-- (`declaredScheme`).
+fun hasCompleteSignature(d : FunDecl) -> Bool =
+	Option.isSome(d.body)
+		&& Option.isSome(d.ret)
+		&& Iter.all(d.params, fun(p) = match p.kind {
+			PAnnot(_, _) -> True
+			_            -> False
+		})
+
+-- Binds the scheme of every top-level function of `items` with a complete
+-- signature, ahead of every group, so that a method call may use one checked
+-- after it. Its own group binds the same scheme again.
+fun bindSignatures(g : Generator, items : Vec Stmt) -> Unit {
+	let sigs = Vec.new(8)
+	for item in items {
+		if let SFun(d) = item.kind {
+			if hasCompleteSignature(d) {
+				-- A signature that does not check is reported where its own
+				-- group reads it, once.
+				Diag.beginHeld()
+				let declared = declaredScheme(g, d)
+				discard(Diag.endHeld())
+				if let Some((scheme, _)) = declared {
+					Vec.push(sigs, (boundAt(g, d.id, d.name, d.span), d.name, scheme))
+				}
+			}
+		}
+	}
+	if len(sigs) > 0 { emit(g, CBind(sigs, CAnd([]), True)) }
+}
+
 fun checkGroupRecursion(
 	group : Vec Stmt,
 	boundNames : Vec String,
 	component : Vec String,
 	graph : Map String (Set.Set String),
+	named : Map String (Set.Set String),
 ) -> Bool {
-	var recursive = len(component) > 1
-	for k in component {
-		if Set.contains(Map.getOr(graph, k, Set.new()), k) { recursive = True }
+	if !cyclic(component, graph) { return False }
+	if Iter.all(group, fun(item) = match item.kind {
+		SFun(_) -> True
+		_       -> False
+	}) {
+		return False
 	}
-	if !recursive { return False }
-	for item in group {
-		match item.kind {
-			SFun(_) -> {}
-			_ -> {
-				Ty.typeError(
-					"cyclic definition: "
-						+ String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
-						+ " depend on each other, but only functions can be "
-						+ "mutually recursive",
-					Some(group[0].span),
-				)
-				return True
-			}
+	-- Cyclic only through a method call's guess at what it calls: a signature
+	-- on the function it may call takes that function out of the cycle.
+	if !cyclicByName(component, named) {
+		let unsigned = guessedTargets(group, component, graph, named)
+		Ty.typeError(
+			"cyclic definition: "
+				+ String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
+				+ " depend on each other through a method call, which may call "
+				+ String.join(unsigned, " or ")
+				+ "; give "
+				+ String.join(unsigned, " and ")
+				+ " a complete signature",
+			Some(group[0].span),
+		)
+		return True
+	}
+	Ty.typeError(
+		"cyclic definition: "
+			+ String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
+			+ " depend on each other, but only functions can be "
+			+ "mutually recursive",
+		Some(group[0].span),
+	)
+	True
+}
+
+-- The advice for a recursive group of functions that is one only because of
+-- method calls' guesses at what they call: such a group is monomorphic, and a
+-- type error in it may come from that. `None` for any other group.
+fun guessedGroupAdvice(
+	group : Vec Stmt,
+	component : Vec String,
+	graph : Map String (Set.Set String),
+	named : Map String (Set.Set String),
+) -> Option String {
+	if !cyclic(component, graph) || cyclicByName(component, named) { return None }
+	let unsigned = guessedTargets(group, component, graph, named)
+	if len(unsigned) == 0 { return None }
+	Some(
+		"these functions are checked together, so each is used at one type within"
+			+ " them, only because a method call may call "
+			+ String.join(unsigned, " or ")
+			+ "; give "
+			+ String.join(unsigned, " and ")
+			+ " a complete signature",
+	)
+}
+
+-- The functions of `group`, each quoted, that a method call in the component
+-- may call: the targets of its edges that are not references by name. None
+-- of them has a complete signature, or it would have no such edge.
+fun guessedTargets(
+	group : Vec Stmt,
+	component : Vec String,
+	graph : Map String (Set.Set String),
+	named : Map String (Set.Set String),
+) -> Vec String {
+	let targets = Set.new()
+	for key in component {
+		let byName = Map.getOr(named, key, Set.new())
+		for dep in Set.elements(Map.getOr(graph, key, Set.new())) {
+			if !Set.contains(byName, dep) { Set.add(targets, dep) }
 		}
 	}
-	False
+	let out = Vec.new(2)
+	for i in Int.range(0, len(component)) {
+		if Set.contains(targets, component[i]) {
+			if let SFun(d) = group[i].kind { Vec.push(out, "'" + Ty.shortName(d.name) + "'") }
+		}
+	}
+	out
 }
+
+-- Returns whether the component `keys` is a cycle by the edges of `named`
+-- among its own members alone.
+fun cyclicByName(keys : Vec String, named : Map String (Set.Set String)) -> Bool {
+	let members = Set.new()
+	for key in keys { Set.add(members, key) }
+	let byName = Map.new()
+	for key in keys {
+		let edges = Set.new()
+		for dep in Set.elements(Map.getOr(named, key, Set.new())) {
+			if Set.contains(members, dep) { Set.add(edges, dep) }
+		}
+		Map.put(byName, key, edges)
+	}
+	Iter.any(Deps.sccs(byName), cyclic(_, byName))
+}
+
+-- Returns whether the component `keys` of `graph` is a cycle: more than one
+-- binding, or one that depends on itself.
+fun cyclic(keys : Vec String, graph : Map String (Set.Set String)) -> Bool =
+	len(keys) > 1 || Set.contains(Map.getOr(graph, keys[0], Set.new()), keys[0])
 
 -- Put every class method in scope, under the scheme its class gives it, and
 -- each declared C symbol in the environment, monomorphically.
@@ -2747,7 +2951,8 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
 		eq(g, genExpr(g, index), Ty.tInt(), Some(index.span), "an array index")
 		element
 	}
-	EField(_, _) -> genField(g, e, False)
+	EField(_, _)         -> genField(g, e, False)
+	EMethod(label, args) -> genMethodCall(g, e, label, args)
 	EProject(obj, index) -> {
 		let receiver = genExpr(g, obj)
 		let cls = Classes.projectionClass(index)
@@ -3231,6 +3436,48 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
 		}
 		_ -> bug("not a field access", Some(e.span))
 	}
+
+-- `x.f(args)`: a call of what the home of `x`'s type names `f`, which the
+-- solver decides once that type is known (`Constraints.methodRule`). The
+-- callee the call is rewritten to call is made here, typed and keyed to a
+-- `Use`, so that once decided it is a use of a name like any other.
+fun genMethodCall(g : Generator, call : Expr, label : String, args : Vec Expr) -> Ty.Type {
+	let argTypes = Array.map(args, genExpr(g, _))
+	let result = fresh(g)
+	let callee = Expr { id = freshNodeId(), span = call.span, kind = EVar(label, False) }
+	let calleeType = fresh(g)
+	Typed.record(g.types, callee, calleeType)
+	let u = newUse(label, None, Some(call.span), None)
+	Map.put(g.types.uses, callee.id, u)
+	let m = MethodCall {
+		label      = label
+		call       = call
+		callee     = callee
+		calleeType = calleeType
+		args       = argTypes
+		result     = result
+		use        = u
+		shadowed   = Map.contains(g.binders.localMethods, call.id)
+		scopes     = None
+	}
+	emit(g, C.methodCell(m, argTypes[0], fresh(g), Some(memberSpan(args[0].span, label))))
+	result
+}
+
+-- Where `.label` is when it follows a receiver spanning `receiver`: what a
+-- method call's diagnostics point at, which in a chain broken over lines is
+-- not where the call's first receiver starts.
+fun memberSpan(receiver : Span, label : String) -> Span {
+	let Span { endLine, endCol, file, inlined, .. } = receiver
+	Span {
+		line    = endLine
+		col     = endCol
+		endLine = endLine
+		endCol  = endCol + 1 + String.byteLength(label)
+		file    = file
+		inlined = inlined
+	}
+}
 
 -- An operator is a call to the method it desugars to.
 --

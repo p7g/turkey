@@ -433,8 +433,11 @@ call ::= postfix "(" (expression ("," expression)*)? ")"
 
 A call applies a function to arguments. The function can be any expression
 whose type is a function type, such as a name, a field holding a function, or
-a call that returns one: `makeAdder(1)(2)`. The number of arguments must match
-the number of parameters exactly, because functions are [uncurried](types.md#function-types).
+a call that returns one: `makeAdder(1)(2)`. `r.handler(x)` calls a field
+holding a function as a [method call](#method-calls) does, and
+`(r.handler)(x)` calls the field whatever else the name means. The number of
+arguments must match the number of parameters exactly, because functions are
+[uncurried](types.md#function-types).
 
 <!-- error: this function takes 2 arguments but 1 was supplied -->
 ```kotlin
@@ -461,7 +464,9 @@ field ::= postfix "." IDENT
 
 `e.name` reads a field of a [record](types.md#records). The type of `e` must
 have exactly one constructor, and that constructor must be a record with a
-field called `name`. A field declared `var` can also be assigned:
+field called `name`. `e.name(args)` is a [method call](#method-calls), which
+calls the field if the type's module has no function `name`. A field declared
+`var` can also be assigned:
 `e.name = value` ([Assignment](statements.md#assignment)).
 
 The type of `e` does not need to be known where the field is read. A function
@@ -485,6 +490,222 @@ fun main() {
 12
 10
 ```
+
+## Method calls
+
+**Syntax**
+
+```ebnf
+method ::= postfix "." IDENT "(" (expression ("," expression)*)? ")"
+```
+
+`x.f(args)` calls `x`'s field `f` or the function `f` of the module that
+declares `x`'s type, and is an error if both exist. If neither exists and
+`x`'s type is known, it calls a class method `f` in scope whose first
+parameter has the class's type at its head.
+
+The call is decided once the type of `x` is known anywhere in the definition
+the call is in. Calling the module `M`'s function means `M.f(x, args)`: `x`
+is always the first argument, and `M.f` is the function the qualified spelling
+would name: one of `M`'s exports, or, in `M` itself, any of its
+top-level functions. No import is needed, since a module that has a value of
+the type has `M` loaded. A type built into the language, or declared by the
+library for its own use, has as `M` the one public library module that exports
+it: `String`'s is `Data.String` and `Int`'s is `Data.Int`, though both reach a
+program through the Prelude. A module that only passes on another's exports,
+as the Prelude does, is not one. An alias stands for the type it names, so its
+methods are that type's, and a module that re-exports a type does not change
+where its methods are found.
+
+<!-- run -->
+```kotlin
+type Point = Point { x : Int, y : Int }
+
+fun norm(p : Point) -> Int = p.x * p.x + p.y * p.y
+
+fun main() {
+    let line = "  3 apples, 4 pears  "
+    print(line.trim().split(", "))
+    print(Point { x = 3, y = 4 }.norm())
+    print(["a ", " bc"].map(_.trim().byteLength()))
+    print(Int.parse("-12")!.abs())
+}
+```
+
+```text
+["3 apples", "4 pears"]
+25
+[1, 2]
+12
+```
+
+So `line.trim().split(", ")` means `String.split(String.trim(line), ", ")`,
+and `Point { x = 3, y = 4 }.norm()` means `norm(Point { x = 3, y = 4 })`.
+
+A `_` in the receiver stays open past the call, as it does past a field read,
+so `_.trim().byteLength()` is one function
+([Placeholder functions](declarations.md#placeholder-functions)). Prefix
+operators bind looser than a call: `-3.abs()` is `-(3.abs())`, and the
+absolute value of minus three is `(-3).abs()`.
+
+**The receiver's type must be known.** Unlike a [field read](#field-access), a
+method call never makes a function polymorphic: which function it calls
+depends on the type of `x`, so that type has to be fixed somewhere in the
+definition. A parameter used only as a receiver needs an annotation:
+
+<!-- error: cannot tell which 'trim' 's.trim()' calls: the type of 's' is not known here; annotate 's' -->
+```kotlin
+fun clean(s) = s.trim()
+
+fun main() {
+    print(clean(" a "))
+}
+```
+
+`fun clean(s : String) = s.trim()` is accepted. The type may be fixed after
+the call in the source, by a later use in the same definition. The same holds
+of a lambda bound by a `let` that [generalizes](inference.md#generalization):
+`let clean = fun(s) = s.trim()` is rejected, and
+`let clean = fun(s : String) = s.trim()` is accepted.
+
+A method call on a literal narrows the types the literal may have to those
+whose module defines the method, when some of them do: an empty `[]` that has
+`.push` called on it is a `Vec`, and `16.isFinite()` calls
+`Data.Float.isFinite`, since `Data.Int` has no `isFinite`. Classes play no
+part in this, so declaring one cannot change what a literal is. When none of
+the types' modules defines the method, the literal takes its default, and the
+call may then find a class method, as `5.show()` does:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let seen = []
+    seen.push(2)
+    seen.push(3)
+    print(seen)
+    print(16.isFinite())
+    print(5.show())
+}
+```
+
+```text
+[2, 3]
+True
+5
+```
+
+A method call depends, for type inference, only on the functions of its name
+that have no complete [signature](declarations.md#signatures), since one with
+a complete signature is known by it before any definition is checked. So
+functions with signatures may call each other through method calls in any
+mix, and a method call on another type never costs a function of the same name
+its polymorphism. When a value's initializer may reach itself through a method
+call, the error advises a signature:
+
+<!-- error: depend on each other through a method call, which may call 'trim'; give 'trim' a complete signature -->
+```kotlin
+type Box = Box { text : String }
+
+let fallback = " none ".trim()
+
+fun trim(b) = if b.text == "" { Box { text = fallback } } else { b }
+
+fun main() {
+    print(trim(Box { text = "" }).text)
+}
+```
+
+**Fields.** A field holding a function is called the same way, with the
+receiver's other arguments: `c.step(n)` calls the function in `c`'s field
+`step`. The choice is made by name, not by type, so a record with a field `f`
+whose module also defines a function `f` makes `x.f(args)` an error, even
+where only one of them would fit the arguments. `(x.f)(args)` calls the field
+and `M.f(x, args)` the function:
+
+<!-- run -->
+```kotlin
+type Counter = Counter { var count : Int, step : fun(Int) -> Int }
+
+fun advance(c : Counter) {
+    c.count = c.step(c.count)
+}
+
+fun main() {
+    let c = Counter { count = 1, step = fun(n) = n * 10 }
+    c.advance()
+    c.advance()
+    print(c.count)
+}
+```
+
+```text
+100
+```
+
+<!-- error: 'b.ready()' is ambiguous: 'Body' has a field 'ready' and 'Main' defines 'ready' -->
+```kotlin
+type Body = Body { ready : fun() -> Bool }
+
+fun ready(b : Body) -> Bool = b.ready()
+
+fun main() {
+    print(ready(Body { ready = fun() = True }))
+}
+```
+
+**Class methods.** When neither a field nor the type's module has `f`, a
+class method `f` is called, if its bare name is in scope: a Prelude class's
+always, another's when its class is imported, as by `import M (Class(..))`. A
+class method is a candidate only when its first parameter's type has the
+class's type variable at its head, as `show`'s and `map`'s do; `pure` and
+`empty` have none to call with `.`. A type variable from a signature names no
+type, so for it only a class method applies. A name shadowing the class
+method, such as the module's own `show`, hides it here as it does for a call
+by name, and two classes in scope with a method of the name make the call an
+error.
+
+<!-- run -->
+```kotlin
+fun twice[Show a](x : a) -> String = x.show() + ", " + x.show()
+
+fun main() {
+    print(5.show())
+    print([1, 2, 3].len())
+    print(twice(7))
+}
+```
+
+```text
+5
+3
+7, 7
+```
+
+The type's own fields and functions come first, so a module that declares a
+function `show` for its type changes what `x.show()` calls for values of that
+type, without an error. A name that is reachable only qualified, such as
+`Iter.map`, is never a method: `xs.map(f)` on an `Array` is `Array.map`.
+
+**When the module has no such function**, the call is an error that names the
+module looked in. If exactly one module in scope exports a function of that
+name, the message gives its qualified spelling:
+
+<!-- error: 'String' has no method 'length': 'Data.String' defines no 'length' -->
+```kotlin
+fun main() {
+    print("abc".length())
+}
+```
+
+<!-- error: to call 'Char.isDigit', write 'Char.isDigit("7")' -->
+```kotlin
+fun main() {
+    print("7".isDigit())
+}
+```
+
+A value of a function or tuple type has no fields and no module, so only a
+class method can be called on it.
 
 ## Tuple projection
 

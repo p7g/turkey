@@ -1582,6 +1582,7 @@ fun drain() -> Unit {
 			Ptr.store(stack, times8(top), Ptr.fromInt(next))
 			top = plus(top, 1)
 		}
+		if scanLog { let _ = Ptr.atomicAdd(scanCounts, 0, Int.mulWrapping(Int.subWrapping(end, field), per)) }
 		-- `at` is the run's offset and `k` the word's within it.
 		var at = plus(first, Int.mulWrapping(field, stride))
 		let stop = plus(first, Int.mulWrapping(end, stride))
@@ -1852,6 +1853,12 @@ fun run(task : Int) -> Unit {
 		-- remembered after.
 		for var at = Ptr.toInt(a); at < Ptr.toInt(b); at = plus(at, 8) {
 			let parent : Ptr = Ptr.load(Ptr.fromInt(at), 0)
+			if scanLog {
+				let h = Ptr.load32(parent, 0)
+				let words = if (h >> 8 & 255) == arrayKind { Int.mulWrapping(h >> 16, Ptr.load(parent, arrayLength)) } else { h >> 16 }
+				let _ = Ptr.atomicAdd(scanCounts, 8, 1)
+				let _ = Ptr.atomicAdd(scanCounts, 16, words)
+			}
 			promote(parent)
 			push(parent)
 		}
@@ -2102,8 +2109,26 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 		clearMarks()
 		rememberedCountSet(0)
 	}
+	let scanStarted = if scanLog { nanoseconds() } else { 0 }
+	if scanLog { Memory.fill(scanCounts, 24, 0) }
 	markFrom(frame)
 	if Process.pending() { return }
+	if scanLog {
+		let markNanos = nanoseconds() - scanStarted
+		textLength = 0
+		put(if minor { Prim.cString("[scan minor] words ") } else { Prim.cString("[scan full] words ") })
+		putInt(Ptr.load(scanCounts, 0))
+		put(Prim.cString(" remembered "))
+		putInt(Ptr.load(scanCounts, 8))
+		put(Prim.cString(" remembered-words "))
+		putInt(Ptr.load(scanCounts, 16))
+		put(Prim.cString(" mark-us "))
+		putInt(markNanos / 1000)
+		put(Prim.cString(" held "))
+		putInt(regionBytesInUse)
+		put(Prim.cString("\n"))
+		writeLine()
+	}
 	if censusKept { census() }
 	let marked = if wanted { nanoseconds() } else { 0 }
 	if verify { verifyAt(Check.BeforeSweeping, frame) }
@@ -2118,6 +2143,13 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	threshold = match Float.truncate(next) {
 		Some(n) -> n
 		None    -> maxInt()
+	}
+	if youngBytes > 0 { threshold = youngBytes }
+	if targetBytes > 0 {
+		let room = targetBytes - regionBytesInUse
+		if room < threshold { threshold = room }
+		if threshold < 0x400_0000 { threshold = 0x400_0000 }
+		nextFull = room < liveBytesAfterFull / 4
 	}
 	if let Wasi = Target.os { threshold = belowCeiling(threshold) }
 	if minor { statsMinor = statsMinor + 1 }
@@ -2142,9 +2174,18 @@ fun fullDue() -> Bool {
 	-- Near wasm32's ceiling, since a minor collection frees no old object
 	-- that has died, and the next must free everything it can.
 	if let Wasi = Target.os { if roomUnderCeiling() < threshold { return True } }
+	if nextFull { return True }
 	let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-	Float.fromInt(liveBytes) >= Float.fromInt(floor) * 1.5
+	Float.fromInt(liveBytes) >= Float.fromInt(floor) * fullFactor
 }
+
+fun bytesFrom(s : Ptr) -> Int = if Ptr.isNull(s) { 0 } else { decimalFrom(s) }
+
+var youngBytes : Int = bytesFrom(Os.getenv(Prim.cString("TURKEY_GC_YOUNG_BYTES")))
+var targetBytes : Int = bytesFrom(Os.getenv(Prim.cString("TURKEY_GC_TARGET_BYTES")))
+var nextFull : Bool = False
+var scanLog : Bool = present(Prim.cString("TURKEY_GC_SCANLOG"))
+var scanCounts : Ptr = zeroed(24)
 
 -- The memory left under wasm32's 4 GiB ceiling, which no `memory.grow`
 -- passes, less 64 MiB kept for what the collector itself allocates while it
@@ -2170,6 +2211,10 @@ fun belowCeiling(wanted : Int) -> Int {
 	let least = liveBytesAfterFull / 8
 	if room > least { room } else { least }
 }
+
+var fullFactor : Float = fullFactorFrom(Os.getenv(Prim.cString("TURKEY_GC_FULL_FACTOR")))
+
+fun fullFactorFrom(s : Ptr) -> Float = if Ptr.isNull(s) { 1.5 } else { scaleFrom(s) }
 
 -- Before a full collection's marking: no object is marked.
 fun clearMarks() -> Unit {

@@ -147,7 +147,9 @@ def test_the_tour_builds(tmp_path):
     assert picker[0]["name"] == lessons[0] == "01-hello"
     for entry in picker:
         lesson = (REPO_ROOT / "docs" / "tutorial" / f"{entry['name']}.md").read_text()
-        program = re.search(r"<!-- run -->\n```kotlin\n(.*?)```\n", lesson, re.S).group(1)
+        found = re.search(r"<!-- run -->\n```kotlin\n(.*?)```\n", lesson, re.S)
+        assert found is not None, f"{entry['name']} has no '<!-- run -->' fence"
+        program = found.group(1)
         assert (out / entry["file"]).read_text() == program
         page = (out / f"{entry['name']}.html").read_text()
         assert html.unescape(page.split('wrap="off">\n', 1)[1].split("</textarea>")[0]) == program

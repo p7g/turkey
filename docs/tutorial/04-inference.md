@@ -3,7 +3,8 @@
 The programs so far have no type annotations, and every one of them is
 checked. The compiler infers each function's *principal type*: the most
 general type it can have. `twice` works for any function from a type to
-itself, so it doubles a number and shouts a string alike.
+itself, so the one `twice` adds 3 to a number twice and puts two `!` on a
+string.
 
 Reading a field doesn't fix the record's type either. `area` reads `width`
 and `height`, so it takes any record that has both fields, as long as the

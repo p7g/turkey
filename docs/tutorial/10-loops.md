@@ -1,8 +1,9 @@
 # Loops and collections
 
 `for x in xs` runs once for each element of anything iterable: an array, a
-`Vec`, a `Map`, a range of numbers, a string's characters. Its pattern can
-take each element apart, as `(word, n)` does a map's entries.
+`Vec`, a `Map`, a range of numbers, or the code points of a string, through
+`String.codePoints(s)`. Its pattern can take each element apart, as
+`(word, n)` does a map's entries.
 
 `[]` is an empty array. An array has a fixed length. A `Vec` grows, and
 nothing has to say which a literal is: `Vec.push(long, word)` needs a `Vec`,

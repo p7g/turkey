@@ -48,8 +48,9 @@ Mars has 2 moons
 
 `Planet` is a record, which [Records](06-records.md) covers. `if` is an
 expression, so `word` is whichever branch ran. `|>` passes the value on its
-left to the function on its right, and `Array.map(_, _.name)` is a function
-of the array, because each `_` makes a function of the call it stands in.
+left to the function on its right. In `Array.map(_, _.name)`, the bare `_`
+makes the whole call a function of the array, and `_.name` makes a function
+of its own, at the argument it stands in.
 
 Functions can call each other in any order, and a function declared inside a
 block is visible to the lines after it:

@@ -49,9 +49,10 @@ error: not a number: loud
 The last line of a block with a `?` is its result, and it is not wrapped for
 you: `percent` ends with `Right(n)`, not `n`.
 
-`fail(e)` packs `e` as a `SomeError` without making a `Left` of it.
 `Error.context(err, e)` wraps an error in another without losing it, and
-`Error.describe` reads the whole chain, outermost first:
+`Error.describe` reads the whole chain, outermost first. `Either.mapLeft`
+applies it to the error of a call that failed, and leaves a `Right` as it
+is:
 
 <!-- run -->
 ```kotlin
@@ -61,10 +62,12 @@ type Setting = Setting { name : String }
 instance Error NotANumber { fun message(e) = "not a number: ${e.text}" }
 instance Error Setting { fun message(e) = "in setting ${e.name}" }
 
-fun volume(text) = match Int.parse(text) {
+fun parse(text) = match Int.parse(text) {
 	Some(n) -> Right(n)
-	None    -> Left(Error.context(fail(NotANumber { text }), Setting { name = "volume" }))
+	None    -> throw(NotANumber { text })
 }
+
+fun volume(text) = Either.mapLeft(parse(text), Error.context(_, Setting { name = "volume" }))
 
 fun main() {
 	match volume("loud") {

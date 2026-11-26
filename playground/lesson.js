@@ -72,7 +72,14 @@ function start() {
     session.load();
   }
 
+  // Whether the editor's text is being replaced by an example, which is not
+  // an edit of the reader's: what is stored stays as it was, so a reload
+  // brings back the reader's own edits, or the program.
+  let loadingExample = false;
   source.addEventListener("input", () => {
+    if (loadingExample) {
+      return;
+    }
     try {
       if (source.value === original) {
         localStorage.removeItem(key);
@@ -86,8 +93,10 @@ function start() {
   source.addEventListener("focus", () => session.load());
 
   // Reset puts the program back through the undo stack, so Ctrl+Z brings the
-  // edits back, and shows the recorded output again.
+  // edits back, and shows the recorded output again. A run in flight is
+  // stopped first, so its output cannot replace the recorded output.
   resetButton.addEventListener("click", () => {
+    session.cancel();
     if (source.value !== original) {
       replaceText(source, original);
       source.setSelectionRange(0, 0);
@@ -104,7 +113,13 @@ function start() {
     button.disabled = false;
     button.addEventListener("click", () => {
       const code = button.closest(".example").querySelector("pre.shown code");
-      replaceText(source, code.textContent);
+      session.cancel();
+      loadingExample = true;
+      try {
+        replaceText(source, code.textContent);
+      } finally {
+        loadingExample = false;
+      }
       source.setSelectionRange(0, 0);
       source.scrollTop = 0;
       session.show([]);

@@ -14,7 +14,8 @@ links to the sections of the reference that state its rules.
 **One idea, and short.** A lesson is read on a phone beside its program, so
 a few paragraphs, one program and at most two or three more examples. It
 starts with `# Title`, and ends with `## In the reference`, a list of links
-into `docs/ref/` by heading.
+into `docs/ref/` by heading, or, for a lesson about the library rather than
+the language, `## In the library`, a list of links to its modules' pages.
 
 **The first `run` example is the program.** It goes in the page's editor,
 and the `text` fence after it is shown as its output until the reader runs
@@ -27,10 +28,10 @@ inline.
 directive, as [`docs/ref/README.md`](../ref/README.md#for-maintainers) lists,
 and `sh scripts/test.sh docs/tutorial` runs them. The `run` and `panic`
 examples also run with `--target wasm32-wasi`, since that is what the
-browser runs; `<!-- skip: wasm32-wasi: REASON -->` before one skips it there,
-and the page shows that example's program with its recorded output and the
-reason, with Run turned off. A program with `module` files is shown the same
-way, since the browser compiles one file.
+browser runs. `<!-- skip: wasm32-wasi: REASON -->`, on the line before an
+example's directive, skips it there, and the page shows that program with
+its recorded output and the reason, with Run turned off. A program with
+`module` files is shown the same way, since the browser compiles one file.
 
 **The programs are what `turkey format` writes.** The page's Format button
 would otherwise change a lesson's program, and the site's build refuses a

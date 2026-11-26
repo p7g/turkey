@@ -44,7 +44,12 @@ Some("origin")
 3
 ```
 
-`dbg` wrote `Point { x = 3, y = 4 }` beside the output, on standard error.
+`dbg` wrote `Point { x = 3, y = 4 }` on standard error, beside the output.
+
+<!-- stderr -->
+```text
+Point { x = 3, y = 4 }
+```
 
 A type whose fields don't all have a class has no instance of it, and the
 error follows the fields to the one that lacks it:

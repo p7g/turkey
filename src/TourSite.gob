@@ -117,8 +117,7 @@ fun main() {
 		root    = root
 	}
 	let files = []
-	for k in Int.range(0, len(lessons)) {
-		let lesson = lessons[k]
+	for (k, lesson) in Iter.enumerate(lessons) {
 		Vec.push(files, (lesson.slug + ".html", page(targets, lessons, k, problems)))
 		if let Some(p) = live(lesson) {
 			Vec.push(files, ("programs/" + lesson.slug + ".gob", lesson.examples[p].source))
@@ -174,7 +173,7 @@ fun parse(path : String, slug : String, text : String, problems : Vec String) ->
 			continue
 		}
 		if name == "skip" {
-			skip = Option.map(String.stripPrefix(arg, "wasm32-wasi:"), String.trim)
+			skip = wasmSkip(arg)
 			i = i + 1
 			continue
 		}
@@ -257,6 +256,14 @@ fun withStderr(e : Example, stderr : String) -> Example = Example {
 	stderr  = Some(stderr)
 	modules = e.modules
 	skip    = e.skip
+}
+
+-- The reason a `skip` directive's value, `TARGET: REASON`, gives, if its
+-- target is `wasm32-wasi`, read as the test harness reads it: split at the
+-- first `:`, and each side trimmed.
+fun wasmSkip(arg : String) -> Option String {
+	let (target, reason) = String.splitOnce(arg, ":")?
+	if String.trim(target) == "wasm32-wasi" { Some(String.trim(reason)) } else { None }
 }
 
 fun isFails(mode : Mode) -> Bool = match mode {
@@ -397,7 +404,9 @@ fun slug(heading : String) -> String {
 -- -- links -------------------------------------------------------------------------
 
 -- Returns `html` with each link's target rewritten for the site, pushing a
--- problem, which names `where`, for each that leads nowhere.
+-- problem, which names `where`, for each that leads nowhere. A target is
+-- read as the renderer escaped it, and what it is rewritten to keeps that
+-- text after a prefix with nothing to escape, so it is written out as it is.
 fun relinked(targets : Targets, html : String, where : String, problems : Vec String) -> String {
 	let out = String.builder()
 	var rest = html
@@ -406,7 +415,7 @@ fun relinked(targets : Targets, html : String, where : String, problems : Vec St
 		let Some((url, tail)) = String.splitOnce(after, "\"") else { break }
 		String.push(out, before + "<a href=\"")
 		match target(targets, url) {
-			Right(t) -> String.push(out, if t == url { url } else { escape(t) })
+			Right(t) -> String.push(out, t)
 			Left(why) -> {
 				Vec.push(problems, where + ": the link to '" + url + "' leads nowhere: " + why)
 				String.push(out, url)
@@ -509,7 +518,9 @@ fun contents(lessons : Vec Lesson) -> String {
 	String.push(out, "<main class=\"contents-page\">\n<h1>" + siteTitle + "</h1>\n")
 	String.push(
 		out,
-		"<p>Twenty short lessons, each with a program you can edit and run. The compiler runs in your browser, "
+		"<p>"
+			+ show(len(lessons))
+			+ " short lessons, each with a program you can edit and run. The compiler runs in your browser, "
 			+ "and nothing is sent to a server. The <a href=\""
 			+ referenceURL
 			+ "README.md\">language reference</a> states the rules, and the <a href=\"../playground/\">"
@@ -538,16 +549,16 @@ fun header(lessons : Vec Lesson, current : Option Int) -> String {
 		None    -> "Lessons"
 	}
 	String.push(out, "<details class=\"toc\">\n<summary>" + label + "</summary>\n<ol>\n")
-	for k in Int.range(0, len(lessons)) {
+	for (k, lesson) in Iter.enumerate(lessons) {
 		let marked = if current == Some(k) { " aria-current=\"page\"" } else { "" }
 		String.push(
 			out,
 			"<li><a href=\""
-				+ lessons[k].slug
+				+ lesson.slug
 				+ ".html\""
 				+ marked
 				+ ">"
-				+ titleHTML(lessons[k])
+				+ titleHTML(lesson)
 				+ "</a></li>\n",
 		)
 	}
@@ -601,7 +612,13 @@ fun workspace(lesson : Lesson) -> String {
 			+ "<div id=\"output\" aria-live=\"polite\" aria-label=\"Output\">"
 			+ "<pre class=\"stdout\">"
 			+ escape(output)
-			+ "</pre><pre class=\"status\">Recorded when this page was made. Run runs it in your browser.</pre>"
+			+ "</pre>"
+			+ Option.fold(
+				e.stderr,
+				"",
+				fun(text) = "<pre class=\"stderr\">" + escape(text) + "</pre>",
+			)
+			+ "<pre class=\"status\">Recorded when this page was made. Run runs it in your browser.</pre>"
 			+ "</div>\n</section>\n"
 	}
 	let reason = match e.skip {
@@ -623,7 +640,15 @@ fun workspace(lesson : Lesson) -> String {
 		+ main
 		+ "<div class=\"label\">Output</div>\n<pre class=\"output\">"
 		+ escape(output)
-		+ "</pre>\n</section>\n"
+		+ "</pre>\n"
+		+ Option.fold(
+			e.stderr,
+			"",
+			fun(text) = "<div class=\"label\">Standard error</div>\n<pre class=\"output\">"
+				+ escape(text)
+				+ "</pre>\n",
+		)
+		+ "</section>\n"
 }
 
 -- The HTML of the fence `tour N`, which is the block `N` of the lesson, or of

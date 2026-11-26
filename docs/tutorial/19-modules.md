@@ -28,8 +28,7 @@ let pi = 3.14159
 
 <!-- run -->
 ```kotlin
-import Geometry as Geo
-import Geometry (Shape(..))
+import Geometry as Geo (Shape(..))
 
 fun main() {
 	print(Geo.area(Geo.unit))

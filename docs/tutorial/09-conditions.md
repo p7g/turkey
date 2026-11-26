@@ -7,8 +7,8 @@ Its head can list several conditions, separated by commas: patterns and
 
 `let ... else` binds a pattern for the rest of the block, and its `else`
 block runs when the pattern doesn't match. That block has to leave, with
-`return`, `break` or `continue`, so the names are bound wherever the code
-goes on.
+`return`, `break` or `continue`, or end in a call that never returns, such
+as `error(...)`, so the names are bound wherever the code goes on.
 
 `while let` runs its block for as long as a pattern matches.
 
@@ -49,8 +49,10 @@ running test
 running deploy
 ```
 
-`Vec.pop` returns the last element, or `None` once there are none, so the
-`while let` ends when `pending` is empty.
+`pending` is a `Vec`, a sequence that grows and shrinks, which
+[Loops and collections](10-loops.md) covers. `Vec.pop` removes its last
+element and returns it, or `None` once there are none, so the `while let`
+ends when `pending` is empty.
 
 A plain `let`, with no `else`, takes only a pattern that matches every value,
 such as a tuple or a record. Anything else is an error that names a value it

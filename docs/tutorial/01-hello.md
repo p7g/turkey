@@ -24,8 +24,9 @@ Hello, Turkey!
 The program is in an editor, and the output under it is what the program
 printed when this page was made.
 
-* **Run** compiles the program and runs it. The first Run downloads the
-  compiler, about 6 MB, and later visits use the browser's cache.
+* **Run** compiles the program and runs it. The compiler, about 6 MB,
+  downloads the first time you click into the editor or press Run, and later
+  visits use the browser's cache.
 * **Format** lays the program out the way `turkey format` does.
 * **Reset** brings back the lesson's program. Until then, this browser keeps
   your edits to each lesson.

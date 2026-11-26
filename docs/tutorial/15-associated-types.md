@@ -3,41 +3,39 @@
 A class has one type parameter, and an *associated type* lets it talk about
 a second type that depends on the first: a container's element type, say.
 The class declares it with `type Elem c`, and each instance says what it is.
-`Elem (Pair Int)` is `Int`, and `Elem String` is `Char`.
+`Elem (Pair Int)` is `Int`, and `Elem (Array String)` is `String`. `first`
+returns an `Option (Elem c)`, since an array may have no first element.
 
 <!-- run -->
 ```kotlin
 class Container c {
 	type Elem c
-	fun first(c) -> Elem c
+	fun first(c) -> Option (Elem c)
 }
 
 type Pair a = Pair(a, a)
 
 instance Container (Pair a) {
 	type Elem = a
-	fun first(Pair(x, _)) = x
+	fun first(Pair(x, _)) = Some(x)
 }
 
-instance Container String {
-	type Elem = Char
-	fun first(s) = match String.step(s, String.start(s)) {
-		Some((c, _)) -> c
-		None         -> error("an empty string has no first character")
-	}
+instance Container (Array a) {
+	type Elem = a
+	fun first(xs) = if len(xs) == 0 { None } else { Some(xs[0]) }
 }
 
 fun main() {
 	print(first(Pair(10, 20)))
-	print(first("hello"))
-	print(first(Pair("left", "right")))
+	print(first(["left", "right"]))
+	print(first([] : Array Int))
 }
 ```
 
 ```text
-10
-h
-left
+Some(10)
+Some("left")
+None
 ```
 
 A constraint can fix an associated type with `~`. The library's `Iterator`

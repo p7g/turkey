@@ -1,8 +1,10 @@
 # Values, `let` and `var`
 
 `let` gives a value a name. The program names an `Int`, a `Float`, a `Char`,
-a `String` and a `Bool`, and nothing says which is which: each literal has a
-type, and so does every name bound to it.
+a `String` and a `Bool`, and nothing says which is which: the compiler works
+out every name's type. A number literal takes its type from how it is used:
+`12` is an `Int` here, since `total` is made from it and passed to
+`Float.fromInt`, and the same `12` could be a `Float` elsewhere.
 
 `var` makes a name that can be assigned again. A `let` name can't be.
 
@@ -33,9 +35,9 @@ A
 True
 ```
 
-Nothing converts between number types by itself. `total` is an `Int`, so it
-becomes a `Float` through `Float.fromInt` before it is multiplied by a
-`Float`.
+A value, once it has a type, never converts to another by itself. `total`
+is an `Int`, so it becomes a `Float` through `Float.fromInt` before it is
+multiplied by a `Float`.
 
 Assigning a name bound with `let` is an error:
 

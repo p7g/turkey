@@ -64,6 +64,15 @@ fun main() {
 80
 ```
 
+and on standard error, the panic and its trace:
+
+<!-- stderr -->
+```text
+panic: unwrapped None
+  at error (Control/Panic.gob:8:36)
+  at main (Main.gob:5:32)
+```
+
 A failure the caller should handle is better returned than panicked on.
 [Errors as values](11-errors.md) shows how `?` passes one along.
 

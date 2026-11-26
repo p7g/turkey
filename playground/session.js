@@ -21,9 +21,11 @@ import { attachEditor, replaceText } from "./editor.js";
  * or Run is pressed, which then runs the program once the compiler is ready.
  * `timeLimit()` returns how many seconds a run may take.
  *
- * Returns `{ editor, load, show }`: the editor `attachEditor` returned,
- * `load()`, and `show(parts)`, which fills the output pane with `[kind,
- * text]` parts, each a `<pre>` of that class, leaving out empty ones.
+ * Returns `{ editor, load, show, cancel }`: the editor `attachEditor` returned,
+ * `load()`, `show(parts)`, which fills the output pane with `[kind,
+ * text]` parts, each a `<pre>` of that class, leaving out empty ones; and
+ * `cancel()`, which stops a compile or run in flight, as Stop does, and drops
+ * a Run that waits for the compiler.
  */
 export function startSession(elements, { lazy = false, timeLimit = () => 10 } = {}) {
   const { source, highlighted, output, formatError, state, note } = elements;
@@ -352,5 +354,11 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   } else {
     load();
   }
-  return { editor, load, show };
+  // Stops what is in flight, and forgets a Run that waits for the compiler.
+  function cancel() {
+    runWhenReady = false;
+    stop();
+  }
+
+  return { editor, load, show, cancel };
 }

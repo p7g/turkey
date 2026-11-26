@@ -2,12 +2,16 @@
 
 ## Where what you write goes
 
-Six places, and nothing else. A document nobody tests goes stale without anyone
+Seven places, and nothing else. A document nobody tests goes stale without anyone
 noticing, and a stale document is worse than none, because the next reader
 takes it for fact.
 
 * **What the language is:** `docs/ref/`. Every example is compiled and run by
   the test harness (`sh scripts/test.sh docs/ref`), which is why it stays.
+* **What Turkey is like to learn, in order:** `docs/tutorial/`, the tour. Every
+  example is compiled and run by the test harness (`sh scripts/test.sh
+  docs/tutorial`), and its programs again for `wasm32-wasi`, since that is
+  what the browser runs them on.
 * **Why this code is the way it is:** a comment in the module it is about,
   edited in the same commit as the code. See "Comments" below.
 * **Why a change was made:** the commit message. It is dated, so it cannot go

@@ -1,7 +1,8 @@
 export (cases, message, diagnostic, panicMessage, traceProblem)
 
---- Cases from the language reference, `docs/ref/`: every Turkey example in
---- every chapter, checked against what the chapter says of it.
+--- Cases from the language reference, `docs/ref/`, and the tour,
+--- `docs/tutorial/`: every Turkey example in every chapter, checked against
+--- what the chapter says of it.
 ---
 --- An example is a `kotlin` fence, and an HTML comment on the line before it
 --- says how to check it:
@@ -18,6 +19,9 @@ export (cases, message, diagnostic, panicMessage, traceProblem)
 ---                            `run` or `panic` example before it: the
 ---                            compile's warnings, then a panic and its trace
 ---   <!-- module: F.gob -->   another file of the next example's program
+---   <!-- skip: T: REASON -->  the next example, a `run` or `panic` one, is
+---                            skipped on the target T, as a program's
+---                            `--% skip` is
 ---
 --- Every example requires a C compiler, since even one that is only checked
 --- is a promise about a program a reader can build.
@@ -32,12 +36,14 @@ export (cases, message, diagnostic, panicMessage, traceProblem)
 --- unmarked fence is an error rather than a skip because the reference
 --- promises that its examples are real, and an unmarked one is a promise
 --- nobody checks. For the same reason, a directory with no examples at all is
---- a harness error.
+--- a harness error, and so is a `skip` before an example that is only
+--- checked, which no target but the host ever runs.
 ---
 --- Each example is written out as `Main.gob` beside its modules, in a
 --- directory of its own under `WORK` (`Files.writeOut`).
 
 import Case (Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Ending(..), Observed(..))
+import Case as Case
 import Files as Files
 
 -- The stages `turkey` names in a diagnostic, `FILE:LINE:COL: STAGE: MESSAGE`.
@@ -49,13 +55,14 @@ let stages = ["lex error", "parse error", "type error", "internal error", "gible
 type Mode = Run | Check | Fails(String) | Panic(String)
 
 -- What a directive marks the fence after it as: another file, by name, of
--- the next example's program, or an example checked as `Mode` says.
+-- the next example's program, an example checked as `Mode` says, or the
+-- standard error of the example before it.
 type Marker = ModuleFile(String) | Marked(Mode) | Stderr
 
 -- One example as its chapter gives it: the line of its opening fence, how
 -- it is checked, its source, the `text` fence after it, the `text` fence a
--- `stderr` directive marks, and the modules before it, as (file name,
--- source).
+-- `stderr` directive marks, the modules before it, as (file name, source),
+-- and the targets it is skipped on, as (target, reason).
 type Example = Example {
     line : Int,
     mode : Mode,
@@ -63,6 +70,7 @@ type Example = Example {
     stdout : Option String,
     stderr : Option String,
     modules : Array (String, String),
+    skips : Array (String, String),
 }
 
 -- What is wrong with a chapter, and on which line.
@@ -138,7 +146,7 @@ fun example(work : String, name : String, e : Example) -> Case {
         timeout = None,
         requires = [Cc],
         xfail = None,
-        skips = [],
+        skips = e.skips,
         problem = Option.map(Either.left(written), Error.describe),
         checkOnly = match e.mode {
             Check | Fails(_) -> True
@@ -155,10 +163,23 @@ fun example(work : String, name : String, e : Example) -> Case {
 fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
     var modules = []
     var lastModule = 0
+    var skips = []
+    var lastSkip = 0
     var i = 0
     while i < len(lines) {
         let line = String.trim(lines[i])
         if let Some((name, arg)) = directive(line) {
+            -- A `skip` marks no fence of its own: it stands before the
+            -- directive of the example it skips.
+            if name == "skip" {
+                match Case.skipOn(arg) {
+                    Right(skip) -> Vec.push(skips, skip)
+                    Left(why) -> return Left(Malformed(i + 1, why))
+                }
+                lastSkip = i + 1
+                i = i + 1
+                continue
+            }
             match marker(name, arg) {
                 -- Any other comment is prose, unless it stands where a
                 -- directive would, before a `kotlin` fence.
@@ -176,7 +197,7 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                         Some(e) -> match e.mode {
                             Run | Panic(_) -> Example { line = e.line, mode = e.mode, source = e.source,
                                                         stdout = e.stdout, stderr = Some(f.body),
-                                                        modules = e.modules }
+                                                        modules = e.modules, skips = e.skips }
                             _ -> return Left(Malformed(f.line, "'stderr' must follow a run or panic example"))
                         }
                         None -> return Left(Malformed(f.line, "'stderr' must follow a run or panic example"))
@@ -195,10 +216,13 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                             lastModule = f.line
                         }
                         Marked(mode) -> {
-                            let quotesOutput = match mode {
-                                Run -> True
-                                Panic(_) -> nextIsFence(lines, i, "text")
-                                Check | Fails(_) -> False
+                            let (quotesOutput, runs) = match mode {
+                                Run -> (True, True)
+                                Panic(_) -> (nextIsFence(lines, i, "text"), True)
+                                Check | Fails(_) -> (False, False)
+                            }
+                            if len(skips) > 0 && !runs {
+                                return Left(Malformed(lastSkip, "'skip' must precede a run or panic example"))
                             }
                             var stdout = None
                             if quotesOutput {
@@ -208,8 +232,9 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
                                 i = t.next
                             }
                             Vec.push(found, Example { line = f.line, mode, source = f.body, stdout, stderr = None,
-                                                      modules = Vec.toArray(modules) })
+                                                      modules = Vec.toArray(modules), skips = Vec.toArray(skips) })
                             modules = []
+                            skips = []
                         }
                     }
                 }
@@ -223,6 +248,7 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
         }
     }
     if len(modules) > 0 { return Left(Malformed(lastModule, "'module' blocks with no example after them")) }
+    if len(skips) > 0 { return Left(Malformed(lastSkip, "'skip' must precede a run or panic example")) }
     Right(())
 }
 

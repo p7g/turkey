@@ -27,9 +27,9 @@ import {
  * compiled, and `libArchive` unpacked. `wasm` is `turkey.wasm` as bytes or an
  * already compiled `WebAssembly.Module`. `libArchive` is `lib.tar.gz`'s bytes,
  * or null for a compiler that only highlights and formats, since neither
- * reads the library. Neither argument is read again, so one compiler serves any number
- * of calls. Throws if the archive is not a well-formed ustar archive holding
- * files under `lib/`.
+ * reads the library. Neither argument is read again, so one compiler serves
+ * any number of calls. Throws if the archive is not a well-formed ustar
+ * archive holding files under `lib/`.
  */
 export async function loadCompiler(wasm, libArchive = null) {
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);

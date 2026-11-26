@@ -54,12 +54,13 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   }
   // The editor's marks come from `turkey check`, run in the tools Worker once
   // typing has paused for `IDLE_MS`, and at once when a Run fails to compile.
-  // A check takes 0.4 to 0.5 s in Chrome, and 0.7 to 0.8 s under node, for
-  // hello world and for a 300-line program alike, since most of it goes on
-  // the Prelude; the Worker highlights nothing while one runs. Waiting for a pause keeps checks from running mid-word
-  // and holding up the highlighting of the next keystrokes. One check is in
+  // A check takes a large part of a second whatever the program's size, since
+  // most of it goes on the Prelude, and the Worker highlights nothing while
+  // one runs. Waiting for a pause keeps checks from running mid-word and
+  // holding up the highlighting of the next keystrokes. One check is in
   // flight at a time, a text already checked is not checked again, and a
-  // reply for text since edited is dropped.
+  // reply for text since edited is dropped. A check that failed leaves the
+  // marks as they were.
   const IDLE_MS = 500;
   let checking = false;
   let checkAgain = false; // a check was asked for while one was in flight
@@ -83,7 +84,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   }
   function checkedSource(data) {
     checking = false;
-    if (data.source === source.value) {
+    if (data.source === source.value && data.diagnostics !== null) {
       checked = data.source;
       editor.mark(marksFor(data.source, data.diagnostics));
     }

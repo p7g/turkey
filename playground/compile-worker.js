@@ -30,8 +30,8 @@
 //               { type: "highlighted", id, source, html }
 //               { type: "formatted", id, source, text, status, diagnostics }
 // where `html` and `text` are null if the command failed, and a `checked`
-// message's `diagnostics` is what `check` returns as `diagnostics`, empty if
-// the check failed.
+// message's `diagnostics` is what `check` returns as `diagnostics`, or null
+// if the check failed.
 
 import { loadCompiler, compile, check, highlight, format } from "./host.js";
 
@@ -119,7 +119,7 @@ const handlers = {
   },
   async check(compiler, { id, source }) {
     const started = performance.now();
-    let diagnostics = [];
+    let diagnostics = null;
     try {
       diagnostics = (await check(compiler, source)).diagnostics;
     } catch {}

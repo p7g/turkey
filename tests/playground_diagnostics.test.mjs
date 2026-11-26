@@ -72,6 +72,16 @@ assert.deepEqual(warning, {
   label: "warning: 'unused' is never used [unused-variable]",
   notes: ["line 1: note: here"],
 });
+// A note in another file names that file, since its line is not this one's.
+const [elsewhere] = marksFor("x", [
+  at(1, 1, 1, 2, {
+    notes: [
+      { file: "lib/Process.gob", line: 90, column: 2, endLine: 90, endColumn: 8, message: "here" },
+      { file: "lib/Process.gob", line: null, column: null, endLine: null, endColumn: null, message: "x" },
+    ],
+  }),
+]);
+assert.deepEqual(elsewhere.notes, ["lib/Process.gob:90: note: here", "lib/Process.gob: note: x"]);
 
 // An edit keeps the marks before it, moves the ones after it, and drops the
 // ones it reaches into.

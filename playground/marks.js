@@ -14,8 +14,9 @@
 // Both layers ignore the pointer, so the tip is found by hit-testing the
 // marked spans' boxes against the pointer over the textarea. For the
 // keyboard, the tip also shows while the caret is in or at the edge of a
-// marked span, a status region reads it out, F8 and Shift+F8 move the caret
-// to the next and previous mark, and Escape hides the tip.
+// marked span, a status region reads it out when the marks at the caret
+// change, F8 and Shift+F8 move the caret to the next and previous mark, and
+// Escape hides the tip until the caret moves.
 
 import { shiftMarks } from "./diagnostics.js";
 
@@ -91,13 +92,23 @@ export function attachMarks(textarea, overlay) {
   function follow() {
     code.style.transform = `translate(${-textarea.scrollLeft}px, ${-textarea.scrollTop}px)`;
   }
-  // A tip left in place would point at text that has scrolled away.
-  textarea.addEventListener("scroll", () => hide());
+  // A tip left in place would point at text that has moved: the textarea's
+  // own scroll, the page's, or any scrolling element's around it, which the
+  // capturing listener hears too.
+  document.addEventListener("scroll", () => hide(), { capture: true, passive: true });
+  window.addEventListener("resize", () => hide());
 
   // -- The tip ---------------------------------------------------------------
 
   let shownFor = null; // "pointer" or "caret" while the tip shows
   let shownKey = "";
+  // What the status region last read out. An edit hides the tip and the
+  // next keyup shows it again; the text is set again only when it differs,
+  // so the messages at the caret are read once, not once per keystroke.
+  let said = "";
+  // The caret offset where Escape hid the tip, which stays hidden until the
+  // caret moves or the text changes.
+  let dismissed = null;
 
   function show(covering, anchor, by) {
     const key = `${by}:${covering.join(",")}`;
@@ -108,7 +119,10 @@ export function attachMarks(textarea, overlay) {
     if (anchor.bottom < box.top || anchor.top > box.bottom) {
       return hide();
     }
-    const lines = covering.flatMap((i) => [[marks[i].severity, marks[i].label], ...marks[i].notes.map((n) => ["note", n])]);
+    const lines = covering.flatMap((i) => [
+      [marks[i].severity, marks[i].label],
+      ...marks[i].notes.map((n) => ["note", n]),
+    ]);
     tip.replaceChildren(
       ...lines.map(([kind, line]) => {
         const element = document.createElement("div");
@@ -125,10 +139,13 @@ export function attachMarks(textarea, overlay) {
     const height = tip.offsetHeight;
     const width = tip.offsetWidth;
     const below = anchor.bottom + 4;
-    tip.style.top = `${below + height > window.innerHeight ? Math.max(0, anchor.top - 4 - height) : below}px`;
+    const above = Math.max(0, anchor.top - 4 - height);
+    tip.style.top = `${below + height > window.innerHeight ? above : below}px`;
     tip.style.left = `${Math.max(0, Math.min(anchor.left, window.innerWidth - width))}px`;
-    if (by === "caret") {
-      spoken.textContent = lines.map(([, line]) => line).join(". ");
+    const text = lines.map(([, line]) => line).join(". ");
+    if (by === "caret" && text !== said) {
+      spoken.textContent = text;
+      said = text;
     }
   }
 
@@ -136,7 +153,16 @@ export function attachMarks(textarea, overlay) {
     tip.hidden = true;
     shownFor = null;
     shownKey = "";
+  }
+
+  // Hides a tip the caret showed, and forgets what was read out, for when
+  // the caret is on no mark.
+  function leave() {
+    if (shownFor === "caret") {
+      hide();
+    }
     spoken.textContent = "";
+    said = "";
   }
 
   // Returns the marked stretch whose box holds the point, and that box.
@@ -173,25 +199,33 @@ export function attachMarks(textarea, overlay) {
   // Shows the tip for the marks at the caret, or hides a tip the caret showed.
   function atCaret() {
     if (document.activeElement !== textarea || textarea.selectionStart !== textarea.selectionEnd) {
-      return shownFor === "caret" && hide();
+      return leave();
     }
     const caret = textarea.selectionStart;
+    if (caret === dismissed) {
+      return;
+    }
+    dismissed = null;
     const covering = marks.flatMap((m, i) => (m.start <= caret && caret <= m.end ? [i] : []));
-    const stretch = stretches.find((s) => s.start <= caret && caret <= s.end && s.covering.some((i) => covering.includes(i)));
+    const stretch = stretches.find(
+      (s) => s.start <= caret && caret <= s.end && s.covering.some((i) => covering.includes(i)),
+    );
     if (stretch === undefined) {
-      return shownFor === "caret" && hide();
+      return leave();
     }
     show(covering, stretch.element.getClientRects()[0], "caret");
   }
   for (const event of ["keyup", "mouseup", "focus"]) {
     textarea.addEventListener(event, atCaret);
   }
-  textarea.addEventListener("blur", () => shownFor === "caret" && hide());
+  textarea.addEventListener("blur", leave);
 
   textarea.addEventListener("keydown", (event) => {
+    const plain = !event.ctrlKey && !event.metaKey && !event.altKey;
     if (event.key === "Escape" && !tip.hidden) {
       hide();
-    } else if (event.key === "F8" && !event.ctrlKey && !event.metaKey && !event.altKey && marks.length > 0) {
+      dismissed = textarea.selectionStart;
+    } else if (event.key === "F8" && plain && marks.length > 0) {
       event.preventDefault();
       jump(event.shiftKey ? -1 : 1);
     }
@@ -227,6 +261,7 @@ export function attachMarks(textarea, overlay) {
       text = textarea.value;
       render();
       hide();
+      dismissed = null;
       atCaret();
     },
     changed(range) {
@@ -234,6 +269,7 @@ export function attachMarks(textarea, overlay) {
       text = textarea.value;
       render();
       hide();
+      dismissed = null;
     },
     follow,
   };

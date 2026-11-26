@@ -27,7 +27,8 @@ export function diagnosticsFor(diagnostics, trapped) {
  * `start` and `end` are UTF-16 offsets into `text`, as a textarea counts
  * them, and `start < end` unless `text` has no character on that line to
  * mark. `severity` is "error" or "warning". `label` is the text to show for
- * the diagnostic, and `notes` holds one text for each of its notes.
+ * the diagnostic, and `notes` holds one text for each of its notes, which
+ * names the note's file when it is not `file`.
  *
  * The compiler counts lines and columns from 1, and columns in code points.
  * A column past the end of its line is taken as the line's end, and a line
@@ -46,7 +47,8 @@ export function marksFor(text, diagnostics, file = "main.gob") {
       return text.length;
     }
     let at = lines[line - 1];
-    for (let left = column - 1; left > 0 && at < text.length && text.charCodeAt(at) !== NEWLINE; left--) {
+    const lineEnd = line < lines.length ? lines[line] - 1 : text.length;
+    for (let left = column - 1; left > 0 && at < lineEnd; left--) {
       at += unitsAt(text, at);
     }
     return at;
@@ -72,13 +74,22 @@ export function marksFor(text, diagnostics, file = "main.gob") {
       end,
       severity: d.severity === "error" ? "error" : "warning",
       label: `${d.stage}: ${d.message}${d.code === null ? "" : ` [${d.code}]`}`,
-      notes: d.notes.map((n) => `${n.line === null ? n.file : `line ${n.line}`}: note: ${n.message}`),
+      notes: d.notes.map((n) => `${noteWhere(n, d.file)}: note: ${n.message}`),
     });
   }
   return marks;
 }
 
 const NEWLINE = 10;
+
+// Returns where a note is, for its text: its line in the diagnostic's own
+// file, and its file and line in any other.
+function noteWhere(note, file) {
+  if (note.line === null) {
+    return note.file;
+  }
+  return note.file === file ? `line ${note.line}` : `${note.file}:${note.line}`;
+}
 
 // How many UTF-16 units the code point at `at` in `text` takes.
 const unitsAt = (text, at) => (text.codePointAt(at) > 0xffff ? 2 : 1);

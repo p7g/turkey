@@ -1,5 +1,5 @@
-// A compile-and-run session for one editor on a page: the editor's
-// highlighting, Run and Stop, Format, and the output pane. Compiling happens
+// A compile-and-run session for one program on a page: its files' editors
+// and their highlighting, Run and Stop, Format, and the output pane. Compiling happens
 // in one Worker, highlighting and formatting in a second, and running in a
 // third, so the page itself never waits. The playground and each lesson of
 // the tour start one.
@@ -8,11 +8,13 @@
 // relative to itself, so a page in another directory starts the same ones.
 
 import { diagnosticsFor } from "./diagnostics.js";
-import { attachEditor, replaceText } from "./editor.js";
+import { replaceText } from "./editor.js";
+import { attachFiles } from "./files.js";
 
 /**
- * Starts a session over `elements`, an object holding the page's
- * `source` textarea, the `highlighted` code element beneath it, the `run`,
+ * Starts a session over `elements`, an object holding the page's `files`,
+ * the element holding the program's editors as `attachFiles` takes it, the
+ * `run`,
  * `stop` and `format` buttons, the `output` pane, the `formatError`
  * element beside the editor, and the `state` and `note` status elements.
  *
@@ -21,14 +23,18 @@ import { attachEditor, replaceText } from "./editor.js";
  * or Run is pressed, which then runs the program once the compiler is ready.
  * `timeLimit()` returns how many seconds a run may take.
  *
- * Returns `{ editor, load, show, cancel }`: the editor `attachEditor` returned,
- * `load()`, `show(parts)`, which fills the output pane with `[kind,
+ * With `editable`, the files can be added, renamed and removed, as
+ * `attachFiles` says. Run compiles them all, and Format lays out the file
+ * shown.
+ *
+ * Returns `{ files, load, show, cancel }`: the file set `attachFiles`
+ * returned, `load()`, `show(parts)`, which fills the output pane with `[kind,
  * text]` parts, each a `<pre>` of that class, leaving out empty ones; and
  * `cancel()`, which stops a compile or run in flight, as Stop does, and drops
  * a Run that waits for the compiler.
  */
-export function startSession(elements, { lazy = false, timeLimit = () => 10 } = {}) {
-  const { source, highlighted, output, formatError, state, note } = elements;
+export function startSession(elements, { lazy = false, editable = false, timeLimit = () => 10 } = {}) {
+  const { output, formatError, state, note } = elements;
   const runButton = elements.run;
   const stopButton = elements.stop;
   const formatButton = elements.format;
@@ -39,22 +45,29 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
   let tools = null; // the Worker that highlights and formats
   let toolsReady = false;
   let formatting = null; // the id of the Format in flight, or null
+  let formattingFile = null; // the file it lays out
 
   // A keystroke highlights at once when none is in flight. At most one is in
-  // flight, and only the latest text waits behind it, so a burst of keystrokes
-  // during a highlight costs one more, and a Format never queues behind many.
+  // flight, and only each file's latest text waits behind it, so a burst of
+  // keystrokes during a highlight costs one more, and a Format never queues
+  // behind many. A request's id is its file's, which its reply carries back.
   let highlighting = false;
-  let pendingHighlight = null;
+  const pendingHighlights = new Map(); // file id -> text
   function flushHighlight() {
-    if (pendingHighlight !== null && toolsReady && !highlighting) {
-      tools.postMessage({ type: "highlight", id: 0, source: pendingHighlight });
-      pendingHighlight = null;
+    if (pendingHighlights.size > 0 && toolsReady && !highlighting) {
+      const [[id, text]] = pendingHighlights;
+      pendingHighlights.delete(id);
+      tools.postMessage({ type: "highlight", id, source: text });
       highlighting = true;
     }
   }
-  const editor = attachEditor(source, highlighted, (text) => {
-    pendingHighlight = text;
-    flushHighlight();
+  const files = attachFiles(elements.files, {
+    editable,
+    say: (...parts) => note.replaceChildren(...parts),
+    requestHighlight(file, text) {
+      pendingHighlights.set(file.id, text);
+      flushHighlight();
+    },
   });
 
   let compiler = null; // the compile Worker
@@ -246,7 +259,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     currentId = ++nextId;
     show([]);
     setPhase("compiling", "Compiling...");
-    compiler.postMessage({ type: "compile", id: currentId, source: source.value });
+    compiler.postMessage({ type: "compile", id: currentId, files: files.all() });
   }
 
   runButton.addEventListener("click", () => {
@@ -289,7 +302,7 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
         failed(data.text);
       } else if (data.type === "highlighted") {
         highlighting = false;
-        editor.highlighted(data.source, data.html);
+        files.byId(data.id)?.editor.highlighted(data.source, data.html);
         flushHighlight();
       } else if (data.type === "formatted" && data.id === formatting) {
         formatted(data);
@@ -308,14 +321,14 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
       formatError.textContent = `${data.diagnostics.trim()}\n${status}`;
       formatError.hidden = false;
       note.textContent = "Format failed; the source is unchanged.";
-    } else if (source.value !== data.source) {
+    } else if (formattingFile.textarea.value !== data.source || files.active() !== formattingFile) {
       // Replacing the source now would throw away what was typed since Format
       // was pressed.
-      note.textContent = "The source changed while it was formatted; press Format again.";
+      note.textContent = "The source changed, or another file was shown, while it was formatted; press Format again.";
     } else if (data.text === data.source) {
       note.textContent = "Already formatted.";
     } else {
-      replaceText(source, data.text);
+      replaceText(formattingFile.textarea, data.text);
       note.textContent = "Formatted.";
     }
   }
@@ -329,10 +342,16 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     formatButton.disabled = true;
     formatError.hidden = true;
     note.textContent = "Formatting...";
-    tools.postMessage({ type: "format", id: formatting, source: source.value });
+    formattingFile = files.active();
+    tools.postMessage({
+      type: "format",
+      id: formatting,
+      source: formattingFile.textarea.value,
+      name: formattingFile.name,
+    });
   });
 
-  source.addEventListener("input", () => {
+  files.onChange(() => {
     formatError.hidden = true;
     load();
   });
@@ -360,5 +379,5 @@ export function startSession(elements, { lazy = false, timeLimit = () => 10 } = 
     stop();
   }
 
-  return { editor, load, show, cancel };
+  return { files, load, show, cancel };
 }

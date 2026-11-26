@@ -1,5 +1,6 @@
-// Checks `playground/share.js` and `changedRange` in `playground/editor.js`,
-// run by `tests/test_playground_host.py`:
+// Checks `playground/share.js`, the file names `playground/files.js`
+// accepts, and `changedRange` in `playground/editor.js`, run by
+// `tests/test_playground_host.py`:
 //
 //     node tests/playground_share.test.mjs
 
@@ -8,10 +9,89 @@ import {
   MAX_SOURCE_BYTES,
   fragmentFor,
   fromBase64url,
-  sourceFromFragment,
+  filesFromFragment,
   toBase64url,
 } from "../playground/share.js";
 import { changedRange } from "../playground/editor.js";
+import { nameProblem } from "../playground/files.js";
+
+// Returns the text of the one file, `main.gob`, that `fragment` holds, or
+// null if it holds none.
+async function sourceFromFragment(fragment) {
+  const files = await filesFromFragment(fragment);
+  if (files === null) {
+    return null;
+  }
+  assert.equal(files.length, 1);
+  assert.equal(files[0][0], "main.gob");
+  return files[0][1];
+}
+
+// A link made before links held several files opens as it did: the page
+// that made this one knew only `#code=`.
+assert.deepEqual(await filesFromFragment("#code=SyvNU8hNzMzT0FSo5uIsKMrMK9FQ8kjNycnXUQgpLcpOrVRU0uSq5QIA"), [
+  ["main.gob", 'fun main() {\n\tprint("Hello, Turkey!")\n}\n'],
+]);
+// A program that is only `main.gob` still gets that link, given as a string
+// or as files.
+assert.equal(
+  await fragmentFor([["main.gob", 'fun main() {\n\tprint("Hello, Turkey!")\n}\n']]),
+  "#code=SyvNU8hNzMzT0FSo5uIsKMrMK9FQ8kjNycnXUQgpLcpOrVRU0uSq5QIA",
+);
+
+// A program of several files gets a `#files=` link, which brings back every
+// file, its name, its text and its place, the entry first.
+const program = [
+  ["main.gob", "import Geometry\nimport Shapes.Circle\n\nfun main() {\n\tprint(Geometry.unit)\n}\n"],
+  ["Shapes/Circle.gob", "export (area)\n\nfun area(r) = 3 * r * r\n"],
+  ["Geometry.gob", "export (unit)\n\nlet unit = \"\u{1F983} <b>&amp;\"\r\n"],
+];
+const several = await fragmentFor(program);
+assert.match(several, /^#files=[A-Za-z0-9_-]*$/);
+assert.deepEqual(await filesFromFragment(several), program);
+// So does a program of one file that is not `main.gob`.
+const renamed = await fragmentFor([["Main.gob", "fun main() {}\n"]]);
+assert.match(renamed, /^#files=/);
+assert.deepEqual(await filesFromFragment(renamed), [["Main.gob", "fun main() {}\n"]]);
+// `files` wins over `code`, whichever comes first.
+const hello = await fragmentFor("fun main() {}\n");
+assert.deepEqual(await filesFromFragment(hello + "&" + several.slice(1)), program);
+assert.deepEqual(await filesFromFragment(several + "&" + hello.slice(1)), program);
+
+// A `files` link whose files are not a program's is refused with the reason.
+const filesLink = async (value) =>
+  "#files=" +
+  toBase64url(
+    new Uint8Array(
+      await new Response(
+        new Blob([new TextEncoder().encode(value)]).stream().pipeThrough(new CompressionStream("deflate-raw")),
+      ).arrayBuffer(),
+    ),
+  );
+for (const [value, why] of [
+  ["not json", /not JSON/],
+  ["[]", /one or more files/],
+  ['{"main.gob": ""}', /one or more files/],
+  ['[["main.gob"]]', /a name and a source/],
+  ['[["main.gob", 1]]', /a name and a source/],
+  ['[["main.gob", ""], ["../Evil.gob", ""]]', /not a module's file name/],
+  ['[["main.gob", ""], ["lib/Prelude.gob", ""]]', /not a module's file name/],
+  ['[["main.gob", ""], ["Geometry.gob", ""], ["Geometry.gob", ""]]', /already a file named 'Geometry.gob'/],
+  ['[["Dir/main.gob", ""]]', /not a file name such as main.gob/],
+]) {
+  await assert.rejects(filesFromFragment(await filesLink(value)), why, value);
+}
+
+// A module's file is named by its path, each part a module name's.
+for (const name of ["Geometry.gob", "Shapes/Circle.gob", "A_1'.gob", "Data/Int.gob"]) {
+  assert.equal(nameProblem(name), null, name);
+}
+for (const name of ["geometry.gob", "Geometry", "Geometry.go", "/Geometry.gob", "Shapes//Circle.gob",
+                    "Shapes/circle.gob", "Shapes/../Circle.gob", "Geo metry.gob", ".gob", ""]) {
+  assert.match(nameProblem(name), /not a module's file name/, name);
+}
+assert.match(nameProblem("Geometry.gob", ["main.gob", "Geometry.gob"]), /already a file/);
+assert.equal(nameProblem("main.gob", [], { entry: true }), null);
 
 // A link restores the exact text: tabs, CRLF, an empty text, characters
 // outside the BMP, and text that is HTML.

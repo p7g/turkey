@@ -81,7 +81,9 @@ class Colour i : Ssa.Inst i {
 	--- The name of register `n` of the file, for a message.
 	fun registerName(Func i, File i, Int) -> String
 	--- The registers of the file the allocator may hand out, in the order it
-	--- hands them out. A bounded file's register numbers are below 64.
+	--- hands them out. A bounded file's register numbers are below 64. An
+	--- unbounded file has no physical registers: no instruction clobbers,
+	--- reads or writes one of its registers directly.
 	fun pool(Func i, File i) -> Pool
 	--- The registers of the file the instruction destroys, as a mask with bit
 	--- `n` for register `n`: the physical ones it writes, and those a call lets
@@ -109,6 +111,15 @@ class Colour i : Ssa.Inst i {
 	--- The operand whose register the destination would like when that
 	--- operand dies here, as an index into `Ssa.uses`. Only a preference.
 	fun reusedOperand(inst : i) -> Option Int = None
+	--- How many of the instructions directly after instruction `n` of the
+	--- block have their destinations written by instruction `n` itself.
+	--- Their destinations are placed with its own, as if it defined them. So
+	--- they avoid the registers of instruction `n`'s operands only where
+	--- those operands are in its `readAfterWrite` mask: with a mask of 0, a
+	--- later destination may share the register of an operand that dies at
+	--- instruction `n`. `verifyColouring` checks each such destination at
+	--- its own instruction, not at instruction `n`.
+	fun writtenWith(block : Ssa.Block i, n : Int) -> Int = 0
 	--- Whether the instruction calls out of the function, at least on some
 	--- path: a point where the collector may run.
 	fun isCall(i) -> Bool
@@ -118,7 +129,7 @@ class Colour i : Ssa.Inst i {
 type Pool
 	--- These registers, in this order.
 	= Bounded(Array Int)
-	--- As many as are wanted, numbered from 0.
+	--- As many as are wanted, numbered from 0, the lowest free one first.
 	| Unbounded
 
 --- What spilling needs to know about a target's instructions, beyond what
@@ -455,7 +466,7 @@ fun walk[Colour i](
 	-- unassigned value simply does not appear in the checks. It was found by
 	-- the hint hit rate reading exactly 0 of 3714, which is not a bad hint
 	-- rate but an absent one.
-	let entryTaken = newTaken(f)
+	let entryTaken = newTaken()
 	for p in f.params {
 		let id = Ssa.valueId(p)
 		place(w, entryTaken, id, entry, 0)
@@ -468,7 +479,7 @@ fun walk[Colour i](
 		-- A block's parameters are defined at its entry and are all live at
 		-- once, so each avoids the values entering the block and the
 		-- parameters already placed.
-		let taken = newTaken(f)
+		let taken = newTaken()
 		for id in BitSet.elements(liveIn[b]) {
 			if w.of_[id] >= 0 { hold(taken, key(f, id, w.of_[id]), id) }
 		}
@@ -486,27 +497,37 @@ fun walk[Colour i](
 		for var n = 0; n < len(block.insts); n = n + 1 {
 			-- An instruction that writes its destination before its last read
 			-- of some operands (on arm64, an inline array allocation) places
-			-- it while those operands still hold their registers. Only the
-			-- operands it reads solely before writing are released first; the
-			-- rest of what ends here, a dead definition included, is released
-			-- after, which is never wrong and only sometimes wasteful.
+			-- it while those operands still hold their registers. Everything
+			-- else that ends here is released first: the operands it reads
+			-- only before writing, and what it does not read at all, a dead
+			-- definition of the instruction before it or a dead parameter.
 			let i = block.insts[n]
 			let late = readAfterWrite(i)
 			if late != 0 {
 				for id in ends[n] {
-					if readOnlyBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
+					if doneBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
 				}
-				Ssa.eachDef(i, fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
+				placeDefinitions(w, taken, block, n)
 				for id in ends[n] {
-					if !readOnlyBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
+					if !doneBeforeWriting(i, late, id) { releaseValue(w, taken, id) }
 				}
 				continue
 			}
 			for id in ends[n] { releaseValue(w, taken, id) }
-			Ssa.eachDef(block.insts[n], fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
+			placeDefinitions(w, taken, block, n)
 		}
 	}
 	w
+}
+
+-- Places the definitions of instruction `n` of the block, and those of the
+-- instructions after it that it writes (`writtenWith`). A later one's own
+-- turn then finds its definitions placed.
+fun placeDefinitions[Colour i](w : Walk i s, taken : Taken, block : Ssa.Block i, n : Int) -> Unit {
+	let last = n + writtenWith(block, n)
+	for var k = n; k <= last && k < len(block.insts); k = k + 1 {
+		Ssa.eachDef(block.insts[k], fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
+	}
 }
 
 -- For each instruction of a block, the values that stop holding a register
@@ -564,18 +585,18 @@ fun releaseValue[Colour i](w : Walk i s, taken : Taken, id : Int) -> Unit {
 	}
 }
 
--- Whether `id` is an operand of `inst` that no operand in the mask `late`
--- reads: one the instruction is done with before it writes its destination.
-fun readOnlyBeforeWriting[Ssa.Inst i](inst : i, late : Int, id : Int) -> Bool {
+-- Whether `inst` is done with value `id` before it writes its destination:
+-- `id` is no operand in the mask `late`, or no operand at all.
+fun doneBeforeWriting[Ssa.Inst i](inst : i, late : Int, id : Int) -> Bool {
+	-- Every operand is late in the mask that has every bit, and a target that
+	-- answers it may answer it for every instruction, so it is asked without
+	-- building the operand list.
+	if late == -1 { return !Ssa.anyUse(inst, fun(u) = Ssa.valueId(u) == id) }
 	let operands = Ssa.uses(inst)
-	var read = False
 	for var k = 0; k < len(operands); k = k + 1 {
-		if Ssa.valueId(operands[k]) == id {
-			if readsLate(late, k) { return False }
-			read = True
-		}
+		if Ssa.valueId(operands[k]) == id && readsLate(late, k) { return False }
 	}
-	read
+	True
 }
 
 -- Whether operand `k` is in a `readAfterWrite` mask.
@@ -584,8 +605,8 @@ fun readsLate(late : Int, k : Int) -> Bool = forbids(late, if k < 63 { k } else 
 -- A taken-register key. The files are allocated apart, so register 3 of one
 -- and register 3 of another must not collide; the file is part of the key
 -- rather than every table being split per file, which would multiply every
--- loop above. A bounded file's register numbers are below 64, so file `k`'s
--- keys start at `64 * k`.
+-- loop above. Register `n` of file `k`, of `c` files, is key `n * c + k`, so
+-- an unbounded file's keys never run into another file's.
 --
 -- A wrapper rather than a bare `Int` because the tables it keys hold value
 -- ids, which are `Int`s too, and swapping the two must not compile. It erases
@@ -595,38 +616,60 @@ type RegKey = RegKey(Int)
 fun key[Colour i](f : Func i, id : Int, n : Int) -> RegKey = keyIn(f, fileOf(f, id), n)
 
 fun keyIn[Colour i](f : Func i, file : File i, n : Int) -> RegKey =
-	RegKey(keysPerFile * fileIndex(f, file) + n)
+	RegKey(n * len(files(f)) + fileIndex(f, file))
 
-let keysPerFile = 64
+-- A bound on a bounded file's register numbers, which are below it, so that
+-- one word holds a mask of a file's registers.
+let boundedRegisters = 64
 
 -- The registers held at one program point: for each key, the value holding
 -- that register, or `-1`. `place` has to know whom it would evict, so a mask
 -- of the held registers is not enough; an array indexed by key answers both
 -- questions with no hashing, and the colourer updates one per block rather
--- than building one per instruction.
-type Taken = Taken(Array Int)
+-- than building one per instruction. It grows as registers are held, so that
+-- an unbounded file fits; a key past its end is not held.
+type Taken = Taken(Vec Int)
 
-fun newTaken[Colour i](f : Func i) -> Taken =
-	Taken(Array.filled(keysPerFile * len(files(f)), -1))
+fun newTaken() -> Taken = Taken([])
 
-fun holderOf(Taken(held) : Taken, RegKey(k) : RegKey) -> Int = held[k]
+fun holderOf(Taken(held) : Taken, RegKey(k) : RegKey) -> Int = if k < len(held) {
+	held[k]
+} else {
+	-1
+}
 
 fun isHeld(taken : Taken, k : RegKey) -> Bool = holderOf(taken, k) >= 0
 
 fun hold(Taken(held) : Taken, RegKey(k) : RegKey, id : Int) -> Unit {
+	while len(held) <= k { Vec.push(held, -1) }
 	held[k] = id
 }
 
 fun release(Taken(held) : Taken, RegKey(k) : RegKey) -> Unit {
-	held[k] = -1
+	if k < len(held) { held[k] = -1 }
 }
 
--- The registers a file hands out, in order. The walk keeps one entry per
--- register in `Taken` and one bit per register in a forbidden mask, so it
--- colours bounded files only.
+-- The registers a bounded file hands out, in order. Only eviction asks for
+-- them, and the walk evicts only when no register is free, which in an
+-- unbounded file one always is.
 fun poolOf[Colour i](f : Func i, file : File i) -> Array Int = match pool(f, file) {
 	Bounded(registers) -> registers
-	Unbounded          -> error("Regalloc: the " + fileName(f, file) + " file is unbounded")
+	Unbounded -> error(
+		"internal error: an eviction from the unbounded " + fileName(f, file) + " file",
+	)
+}
+
+-- Whether the file's pool hands out register `n`.
+fun inPool[Colour i](f : Func i, file : File i, n : Int) -> Bool = match pool(f, file) {
+	Bounded(registers) -> Array.contains(registers, n)
+	Unbounded          -> n >= 0
+}
+
+-- How many of the file's registers can be physical ones: any of a bounded
+-- file's, and none of an unbounded one's.
+fun physicalCount[Colour i](f : Func i, file : File i) -> Int = match pool(f, file) {
+	Bounded(_) -> boundedRegisters
+	Unbounded  -> 0
 }
 
 -- Give one value the lowest register its file allows that nothing live holds
@@ -741,12 +784,22 @@ fun freeRegister[Colour i](
 	hint : Int,
 ) -> Option Int {
 	if usable(f, taken, forbidden, file, hint) { return Some(hint) }
-	for n in poolOf(f, file) {
-		if !isHeld(taken, keyIn(f, file, n)) && !forbids(forbidden, n) {
-			return Some(n)
+	match pool(f, file) {
+		Bounded(registers) -> {
+			for n in registers {
+				if !isHeld(taken, keyIn(f, file, n)) && !forbids(forbidden, n) {
+					return Some(n)
+				}
+			}
+			None
+		}
+		-- Finitely many registers are held, so the search ends.
+		Unbounded -> {
+			var n = 0
+			while isHeld(taken, keyIn(f, file, n)) || forbids(forbidden, n) { n = n + 1 }
+			Some(n)
 		}
 	}
-	None
 }
 
 -- Whether register `n` can be handed out here. Only a register the pool would
@@ -754,10 +807,7 @@ fun freeRegister[Colour i](
 -- reads the frame, must not colour its destination into the frame register
 -- itself.
 fun usable[Colour i](f : Func i, taken : Taken, forbidden : Int, file : File i, n : Int) -> Bool =
-	n >= 0
-		&& Array.contains(poolOf(f, file), n)
-		&& !isHeld(taken, keyIn(f, file, n))
-		&& !forbids(forbidden, n)
+	n >= 0 && inPool(f, file, n) && !isHeld(taken, keyIn(f, file, n)) && !forbids(forbidden, n)
 
 -- The register `id` would best take, or `-1` for none in particular: the first
 -- of these it may have here, each of which makes one copy redundant.
@@ -862,6 +912,7 @@ fun affinities(f : Func i) -> (Array (Vec Int), Array (Vec Int)) {
 }
 
 fun anyUnheld[Colour i](f : Func i, taken : Taken, file : File i) -> Bool {
+	if let Unbounded = pool(f, file) { return True }
 	for n in poolOf(f, file) {
 		if !isHeld(taken, keyIn(f, file, n)) { return True }
 	}
@@ -1034,7 +1085,9 @@ fun nextUse[Ssa.Inst i](block : Ssa.Block i, id : Int, from : Int) -> Int {
 
 -- For each value, the register numbers it may not take, as a mask: bit `n`
 -- for register `n`. A bounded file's register numbers are below 64, so one
--- word holds the set, and the value's file says which file it is of.
+-- word holds the set, and the value's file says which file it is of. An
+-- unbounded file has no physical registers, so nothing forbids one of its
+-- registers, whatever its number.
 --
 -- One sweep: at every instruction, whatever physical registers it writes are
 -- denied to every value live *across* it, and a call writes all of the
@@ -1092,7 +1145,7 @@ fun forbidHeld[Colour i](out : Array Int, f : Func i, held : PhysicalLive, id : 
 	for r in held.byFile[fileIndex(f, fileOf(f, id))] { out[id] = forbid(out[id], r) }
 }
 
-fun forbids(mask : Int, n : Int) -> Bool = mask >> n & 1 != 0
+fun forbids(mask : Int, n : Int) -> Bool = n < boundedRegisters && mask >> n & 1 != 0
 
 fun forbid(mask : Int, n : Int) -> Int = mask | 1 << n
 
@@ -1145,7 +1198,7 @@ fun physicalLive[Colour i](f : Func i, block : Ssa.Block i) -> (Array PhysicalLi
 	-- Nothing is live at almost every point, so those share one value.
 	let nothing = noneLive(count)
 	let sets = Array.init(len(block.insts), fun(_) = nothing)
-	let live = Array.init(count, fun(_) = BitSet.new(keysPerFile))
+	let live = Array.map(files(f), fun(file) = BitSet.new(physicalCount(f, file)))
 	for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
 		if anyLive(live) { sets[n] = PhysicalLive { byFile = Array.map(live, BitSet.elements) } }
 		let i = block.insts[n]

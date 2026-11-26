@@ -9,6 +9,8 @@ export (
 	intrinsicName,
 	Op(..),
 	Low(..),
+	Storage(..),
+	storageOf,
 	AddressOf(..),
 	FieldRef(..),
 	fieldRef,
@@ -83,6 +85,7 @@ export (
 
 import Data.Map as Map
 import Turkey.Position as Position
+import Turkey.Regalloc as Regalloc
 import Turkey.Runtime as Rt
 import Turkey.Source as Source
 import Turkey.Source (Span)
@@ -805,6 +808,109 @@ instance Inst Low {
 		SlotStore(slot, _) -> Ssa.Stores(slot)
 		_                  -> Ssa.NoSlot
 	}
+}
+
+--- How a value of a representation is held: its register file, for a target
+--- that colours the low IR itself (`Turkey.Regalloc`).
+type Storage
+	--- A 64-bit integer or a pointer.
+	= Word
+	--- A 64-bit float.
+	| Double
+	--- An integer narrower than a word: an `i1`, `i8` or `i32`.
+	| Small
+	--- A unit, which holds no bits.
+	| NoBits
+
+--- Returns how a value of class `c` is held.
+fun storageOf(c : RepClass) -> Storage = match c {
+	I64 | Ptr     -> Word
+	F64           -> Double
+	I1 | I8 | I32 -> Small
+	Unit          -> NoBits
+}
+
+let storages = [Word, Double, Small, NoBits]
+
+--- The low IR as a target with unbounded register files and no physical
+--- registers: one file per `Storage`, so a register is a variable of that
+--- storage. A value's register is not shared with a value live at the same
+--- point, nor with an operand of the instruction that defines it, nor, for
+--- the `Result`s of a call, with anything the call reads.
+---
+--- A unit has a file of its own, so that units take no register of a file
+--- that holds bits. A unit holds no bits, so a target may hold every unit in
+--- one place and ignore their registers. A unit parameter of the function is
+--- the exception: a caller passes it as it passes a small integer, so it is
+--- in the small file, and its register is free for small values once it is
+--- dead.
+instance Regalloc.Colour Low {
+	type File = Storage
+	fun files(_) = storages
+	fun fileIndex(_, s) = match s {
+		Word   -> 0
+		Double -> 1
+		Small  -> 2
+		NoBits -> 3
+	}
+	fun fileOf(f, id) = match f.reps[id].class_ {
+		Unit -> if isParameter(f, id) { Small } else { NoBits }
+		c    -> storageOf(c)
+	}
+	fun fileName(_, s) = match s {
+		Word   -> "word"
+		Double -> "double"
+		Small  -> "small"
+		NoBits -> "unit"
+	}
+	fun registerName(_, s, n) = match s {
+		Word   -> "w" + Int.toString(n)
+		Double -> "d" + Int.toString(n)
+		Small  -> "s" + Int.toString(n)
+		NoBits -> "u" + Int.toString(n)
+	}
+	fun pool(_, _) = Regalloc.Unbounded
+	fun clobbers(_, _) = 0
+	fun callClobbers(_, _) = 0
+	fun eachPhysicalWrite(_, _) {}
+	fun eachPhysicalRead(_, _) {}
+	fun moveHint(_) = None
+	-- Every operand: selection may write the destination before its last
+	-- read of an operand, as a checked add does when it tests for overflow,
+	-- and so may a division, an atomic or a barrier. Listing the operations
+	-- that do would be a second copy of selection's choices to keep in step.
+	fun readAfterWrite(_) = -1
+	-- A call's `Result`s, which selection writes as it returns.
+	fun writtenWith(block, n) = match block.insts[n].op {
+		Call(_, _) -> {
+			let call = block.insts[n].result
+			var count = 0
+			while n + count + 1 < len(block.insts)
+					&& isResultOf(block.insts[n + count + 1].op, call) {
+				count = count + 1
+			}
+			count
+		}
+		_ -> 0
+	}
+	fun isCall(i) = match i.op {
+		Call(_, _) -> True
+		_          -> False
+	}
+}
+
+-- Whether value `id` is one of the function's own parameters.
+fun isParameter(f : Ssa.Func Low, id : Int) -> Bool {
+	for p in f.params {
+		if Ssa.valueId(p) == id { return True }
+	}
+	False
+}
+
+-- Whether `op` is a `Result` of the call that defines `call`.
+fun isResultOf(op : Op, call : Value) -> Bool = match op {
+	Result(of, _) -> of == call
+	_             -> False
 }
 
 --- The representation an operation's result must have, where the operation

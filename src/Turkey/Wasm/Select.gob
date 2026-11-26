@@ -3,7 +3,6 @@ export (
 	Strings(..),
 	Selected(..),
 	selectFunction,
-	valType,
 	importParam,
 	importResult,
 	cString,
@@ -90,6 +89,8 @@ import Turkey.Wasm as W
 import Turkey.Wasm.Module as M
 import Turkey.Wasm.Resume as Resume
 import Turkey.Wasm.Structure as St
+import Turkey.Wasm.Types (valType, storageType)
+import Turkey.Wasm.Types as Types
 
 --- What every function's selection reads about the module, decided before
 --- any function is selected.
@@ -175,10 +176,6 @@ type Selected = Selected {
 	--- and switches. A function with none never unwinds.
 	resumePoints : Int
 }
-
---- Returns the wasm type a value of `r` is held in. A narrow integer is an
---- `i32`, zero-extended from its width, and a unit is an `i32` holding 0.
-fun valType(r : Rep) -> W.ValType = storageType(L.storageOf(r.class_))
 
 --- Returns the type an import takes an argument of `r` at. A pointer is the
 --- memory's own 32-bit address, which is what the host reads; everything
@@ -342,7 +339,7 @@ fun selectFunction(cx : Context, f : Func Low) -> Selected {
 			-- on the stack -- so the end says it.
 			op(s, W.Unreachable)
 			op(s, W.End)
-			if s.switches { unwind(s) }
+			if s.switches { unwind(s) } else { unwindMissed(s) }
 			if let Some(push) = definedIndex(s, "turkey_trace_push") {
 				op(s, W.ConstI64(0))
 				op(s, W.LocalGet(s.leaving))
@@ -606,13 +603,6 @@ fun localsOf(f : Func Low) -> (Array Int, Vec W.ValType) {
 	(local, locals)
 }
 
--- Returns the wasm type a local of storage `s` has.
-fun storageType(s : L.Storage) -> W.ValType = match s {
-	L.Word             -> W.I64
-	L.Double           -> W.F64
-	L.Small | L.NoBits -> W.I32
-}
-
 fun holdsBits(s : L.Storage) -> Bool = match s {
 	L.NoBits -> False
 	_        -> True
@@ -817,6 +807,20 @@ fun unwind(s : Sel) -> Unit {
 	}
 	for t in s.answers { op(s, zeroOf(t)) }
 	op(s, W.Return)
+	op(s, W.End)
+}
+
+-- The way out of a function `Turkey.Wasm.Resume` says cannot switch, which
+-- no unwind should ever reach: one that does is a call the analysis missed,
+-- and returning would leave a frame the rewind cannot rebuild, so it traps.
+fun unwindMissed(s : Sel) -> Unit {
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load, 0))
+	op(s, W.ConstI32(unwinding))
+	op(s, W.IntBin(W.W32, W.And))
+	op(s, W.If(W.Empty))
+	op(s, W.Unreachable)
 	op(s, W.End)
 }
 
@@ -2485,14 +2489,8 @@ fun definedIndex(s : Sel, symbol : String) -> Option Int = match Map.get(s.cx.de
 
 -- The type of a closure's code called with `args`: the environment, then
 -- the arguments, returning `d`'s representation.
-fun closureType(s : Sel, args : Array Value, d : Value) -> Int {
-	let params = [W.I64]
-	for a in args { Vec.push(params, valType(Ssa.repOf(s.source, a))) }
-	M.addType(s.cx.module_, W.FuncType {
-		params  = Vec.toArray(params)
-		results = [valType(Ssa.repOf(s.source, d))]
-	})
-}
+fun closureType(s : Sel, args : Array Value, d : Value) -> Int =
+	M.addType(s.cx.module_, Types.closureCallType(s.source, args, d))
 
 fun closureEnvironment(s : Sel, closure : Value) -> Unit {
 	address(s, closure)
@@ -2505,12 +2503,15 @@ fun closureCode(s : Sel, closure : Value) -> Unit {
 	op(s, W.Convert(W.I32WrapI64))
 }
 
--- After a call: if the callee panicked, leave with zeros.
+-- After a call: if the callee panicked, or the stack is unwinding to switch,
+-- leave with zeros.
 --
--- A panic sets a flag and returns -- there is no unwinding -- so a caller
--- that did not look would carry on with a value the callee never produced.
--- The flag is the first word of the running worker's record, and only ever
--- 0 or 1, so its low half is the whole answer.
+-- A panic sets a flag and returns -- there is no unwinding in the machine's
+-- sense -- so a caller that did not look would carry on with a value the
+-- callee never produced. The flag is the low bit of the first word of the
+-- running worker's record, and the bit above it is `unwinding`; no other bit
+-- is ever set, so the word's low half is the whole answer. The way out tells
+-- the two apart.
 --
 -- Not after a call that ends a block whose terminator is `Unreachable`, as
 -- the lowering leaves a call that never returns: that terminator leaves with

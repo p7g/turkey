@@ -1,4 +1,4 @@
-export (Switching(..), analyse, switchesAt, typeKey)
+export (Switching(..), analyse, switchesAt)
 
 --- Which functions of a program may switch stacks, for the wasm backend's
 --- unwind and rewind (`Turkey.Wasm.Select`).
@@ -21,10 +21,10 @@ import Data.Map as Map
 import Turkey.LowIr (Op(..), Low(..), Callee(..))
 import Turkey.LowIr as L
 import Turkey.Runtime as Rt
-import Turkey.Ssa as Ssa
-import Turkey.Ssa (Func(..), Rep(..), Value)
+import Turkey.Ssa (Func(..), Value)
 import Turkey.SsaLower (Module(..))
 import Turkey.Wasm as W
+import Turkey.Wasm.Types as Types
 
 --- What the backend reads about switching, decided before any function is
 --- selected.
@@ -52,7 +52,9 @@ fun analyse(m : Module, defined : Map String String, slotted : Vec String) -> Sw
 	-- The type each table function has, for matching closure calls to it.
 	let slotTypes = Map.new()
 	for name in slotted {
-		if let Some(f) = Map.get(byName, name) { Map.put(slotTypes, name, functionKey(f)) }
+		if let Some(f) = Map.get(byName, name) {
+			Map.put(slotTypes, name, typeKey(Types.functionType(f)))
+		}
 	}
 	let out = Switching {
 		switching   = Map.new()
@@ -168,37 +170,21 @@ fun target(defined : Map String String, callee : Callee) -> Option String = matc
 	Indirect(_)        -> None
 }
 
--- The type of a closure call with `args` and the result `d`, as
--- `Turkey.Wasm.Select.closureType` builds it: the environment, then the
--- arguments.
-fun callKey(f : Func Low, args : Array Value, d : Value) -> String {
-	let params = [W.I64]
-	for a in args { Vec.push(params, storage(Ssa.repOf(f, a))) }
-	typeKey(Vec.toArray(params), [storage(Ssa.repOf(f, d))])
-}
+-- The type of a closure call's code, as selection gives it, as a key.
+fun callKey(f : Func Low, args : Array Value, d : Value) -> String =
+	typeKey(Types.closureCallType(f, args, d))
 
-fun functionKey(f : Func Low) -> String =
-	typeKey(
-		Vec.toArray(Vec.map(f.params, fun(p) = storage(Ssa.repOf(f, p)))),
-		Array.map(f.results, storage),
-	)
-
--- `Turkey.Wasm.Select.valType`, which this module cannot import, since
--- selection imports it.
-fun storage(r : Rep) -> W.ValType = match L.storageOf(r.class_) {
-	L.Word             -> W.I64
-	L.Double           -> W.F64
-	L.Small | L.NoBits -> W.I32
-}
-
---- Returns a key that two function types share exactly when they are equal.
-fun typeKey(params : Array W.ValType, results : Array W.ValType) -> String {
+-- A key that two function types share exactly when they are equal. No low IR
+-- value is held in a reference.
+fun typeKey(t : W.FuncType) -> String {
 	let letter = fun(t : W.ValType) -> String = match t {
 		W.I32 -> "i"
 		W.I64 -> "l"
 		W.F32 -> "f"
 		W.F64 -> "d"
-		_     -> "r"
+		_     -> error("internal error: a reference in a Turkey function's wasm type")
 	}
-	String.join(Array.map(params, letter), "") + ">" + String.join(Array.map(results, letter), "")
+	String.join(Array.map(t.params, letter), "")
+		+ ">"
+		+ String.join(Array.map(t.results, letter), "")
 }

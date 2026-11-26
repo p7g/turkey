@@ -356,16 +356,22 @@ var statsIgnored : Bool = notCompiledIn(
 -- array's size for each one it counts as one. On the compiler's own run the
 -- two cost the same at equal peak memory, so that is what decided it.
 --
--- 2 is measured, with minor collections on, against 1.5 and 1. The scale sets
--- how much young garbage the heap holds at its peak, so a smaller one saves
--- memory. It also collects more often, and although most of the extra
--- collections are minor, the time shows. The compiler compiling itself, with
--- a live set of about 0.8GB, peaks at a 3.9GB footprint in 5.6s at 2, 3.6GB
--- in 5.9s at 1.5, and 2.7GB in 6.2s at 1. A compile of a small program takes
--- 5% and 7% longer at 1.5 and 1. On wasm32, where `belowCeiling` caps the
--- threshold, the self-compile fits in 3.3GiB of linear memory at 2.
--- TURKEY_GC_THRESHOLD_SCALE overrides it, for experiments and for a program
--- that must fit in less.
+-- The scale is 2 natively and 1 on wasm32, both measured with minor
+-- collections on. The scale sets how much young garbage the heap holds at its
+-- peak, so a smaller one saves memory but collects more often.
+--
+-- Natively, that is a trade of time for memory, and 2 takes the time. The
+-- compiler compiling itself, with a live set of about 0.8GB, peaks at a 3.9GB
+-- footprint in 5.6s at 2, 3.6GB in 5.9s at 1.5, and 2.7GB in 6.2s at 1. A
+-- compile of a small program takes 5% and 7% longer at 1.5 and 1.
+--
+-- On wasm32, linear memory has a hard 4GiB ceiling, and the smaller scale
+-- costs no time: the self-compile needs 3.3GiB of linear memory in 21.2s at
+-- 2, and 2.6GiB in 20.3s at 1. Near the ceiling `belowCeiling` caps the
+-- threshold whatever the scale.
+--
+-- TURKEY_GC_THRESHOLD_SCALE overrides it on either, for experiments and for a
+-- program that must fit in less.
 var thresholdScale : Float = scaleFrom(Os.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
 
 -- The counts every worker adds to as it allocates, by atomic adds: objects
@@ -2453,15 +2459,19 @@ fun writeLine() -> Unit {
 
 -- -- the threshold scale ----------------------------------------------------------------
 
--- TURKEY_GC_THRESHOLD_SCALE, or 2 if it is unset or is not a finite decimal
--- number of at least 1, with optional surrounding whitespace.
+-- TURKEY_GC_THRESHOLD_SCALE, or the target's default (1 on wasm32, 2
+-- elsewhere) if it is unset or is not a finite decimal number of at least 1,
+-- with optional surrounding whitespace.
 --
 -- Parsed by hand: the collector cannot build the `String` the library's parser
 -- takes. Digits past the eighteenth are counted but not accumulated, and the
 -- value is the mantissa scaled by powers of ten. That is not correctly
 -- rounded, which a scale factor for a threshold has no use for.
 fun scaleFrom(s : Ptr) -> Float {
-	let fallback = 2.0
+	let fallback = match Target.os {
+		Wasi -> 1.0
+		_    -> 2.0
+	}
 	if Ptr.isNull(s) { return fallback }
 	var i = skipSpace(s, 0)
 	var negative = False

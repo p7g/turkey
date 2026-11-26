@@ -7,6 +7,7 @@ export (
 	importParam,
 	importResult,
 	cString,
+	unwinding,
 )
 
 --- The low IR to WebAssembly: one function's body as `Turkey.Wasm` instructions.
@@ -52,6 +53,18 @@ export (
 --- adds its site to the trace (`Turkey.Process`), so the trace costs nothing
 --- until a panic is raised.
 ---
+--- **A switch of stacks unwinds and rewinds.** The engine's stack holds the
+--- frames of one Turkey stack at a time. `Prim.swapStack` parks the stack it
+--- leaves by unwinding it: it sets the unwinding bit of the word the panic flag
+--- is in, so the test after every call finds it, and each function on the
+--- stack stores the locals it needs and returns, leaving its shadow frame in
+--- place. The entry (`Turkey.Wasm.Program`) then rewinds the stack resumed: it
+--- calls that stack's outermost function again with the rewinding flag set,
+--- and each function restores its locals and goes straight to the call it was
+--- stopped in, until the switch that parked the stack is reached and clears the
+--- flag. Only the functions `Turkey.Wasm.Resume` finds may switch have resume
+--- points, and only they pay for any of it.
+---
 --- Incomplete by design, as arm64's selection is: an operation with no rule
 --- stops its function, and `stopped` names it.
 
@@ -75,6 +88,7 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), Rep(..), RepClass(..), Func(..), Block(..))
 import Turkey.Wasm as W
 import Turkey.Wasm.Module as M
+import Turkey.Wasm.Resume as Resume
 import Turkey.Wasm.Structure as St
 
 --- What every function's selection reads about the module, decided before
@@ -110,11 +124,20 @@ type Context = Context {
 	--- frame, which each function that has one pushes below it.
 	stackPointer : Int
 	--- The global holding the lowest address a frame may be pushed at: the
-	--- stack's bottom and a reserve above it, which the panic that running
-	--- out raises takes by lowering this to the bottom.
+	--- running stack's bottom and a reserve above it, which the panic that
+	--- running out raises takes by lowering this by the reserve.
 	stackLimit : Int
-	--- The shadow stack's bottom.
-	stackBottom : Int
+	--- The bytes of that reserve.
+	stackReserve : Int
+	--- Which functions may switch stacks.
+	switching : Resume.Switching
+	--- The global holding the rewinding flag, an `i32`: 1 while a parked
+	--- stack's frames are being called again, from its outermost function to
+	--- the switch that parked it.
+	rewinding : Int
+	--- The table slot of each function of `switching.tailCallees`'s rewind
+	--- entry, by the function's name (`Turkey.Wasm.Program.rewindEntry`).
+	rewindEntries : Map String Int
 	--- The sites numbered so far, in every function: a site's number is
 	--- above every number before it, and 0 is no site.
 	var siteCount : Int
@@ -148,6 +171,9 @@ type Selected = Selected {
 	--- The trace table's calls: each site a panic can return through that has
 	--- a source position, as its number and the position.
 	calls : Vec (Int, Int)
+	--- How many resume points the function has: calls that may switch stacks,
+	--- and switches. A function with none never unwinds.
+	resumePoints : Int
 }
 
 --- Returns the wasm type a value of `r` is held in. A narrow integer is an
@@ -217,6 +243,26 @@ type Sel = Sel {
 	calls   : Vec (Int, Int)
 	entered : Map Int Unit
 	called  : Map Int Unit
+	-- Whether the function may switch stacks (`Turkey.Wasm.Resume`), which
+	-- gives it a frame with room to park in.
+	switches : Bool
+	-- The resume point of each instruction that has one, by `key`: the
+	-- points are numbered from 1 in the order selection places them, so the
+	-- points inside any one step of the structured body are a contiguous run.
+	resumes : Map Int Int
+	-- Whether a tail call of the function may switch, which leaves a parked
+	-- frame of the callee's where this function's would be (`forward`).
+	forwards : Bool
+	-- The locals an unwind stores and a rewind loads, each with its slot in
+	-- the frame, from `saveAt` up.
+	saved  : Array Int
+	saveAt : Int
+	-- What a parked frame of this function names as its owner (`forward`).
+	identity : Int
+	-- For each label open around the code being placed, innermost last,
+	-- whether it is one of the structured body's own, which its branches
+	-- count, or one added for a rewind's dispatch, which they do not.
+	labels : Vec Bool
 }
 
 -- Appends `o`, keeping count of the blocks it opens and closes.
@@ -272,15 +318,23 @@ fun known(s : Sel, v : Value) -> Option Int = Map.get(s.known, Ssa.valueId(v))
 --- still returns what was selected before it stopped, which nothing should
 --- write into a module.
 fun selectFunction(cx : Context, f : Func Low) -> Selected {
-	let s = start(cx, f)
-	match St.structure(f) {
+	let structured = St.structure(f)
+	let s = start(
+		cx,
+		f,
+		match structured {
+			Right(body) -> body
+			Left(_)     -> []
+		},
+	)
+	match structured {
 		Left(why) -> stop(s, why)
 		Right(body) -> {
 			prologue(s)
 			-- The body is in a block whose end is the way out of a function a
 			-- panic is leaving (`bail`), so that each site that leaves is a
 			-- branch, and the code that adds to the trace, releases the frame
-			-- and returns zeros is there once.
+			-- and returns zeros is there once. An unwind leaves the same way.
 			op(s, W.Block(W.Empty))
 			control(s, body)
 			-- Every path through the body has left by here. The engine cannot
@@ -288,6 +342,7 @@ fun selectFunction(cx : Context, f : Func Low) -> Selected {
 			-- on the stack -- so the end says it.
 			op(s, W.Unreachable)
 			op(s, W.End)
+			if s.switches { unwind(s) }
 			if let Some(push) = definedIndex(s, "turkey_trace_push") {
 				op(s, W.ConstI64(0))
 				op(s, W.LocalGet(s.leaving))
@@ -299,30 +354,46 @@ fun selectFunction(cx : Context, f : Func Low) -> Selected {
 		}
 	}
 	Selected {
-		locals  = Vec.toArray(s.locals)
-		body    = Vec.toArray(s.out)
-		stopped = s.stopped
-		entries = s.entries
-		calls   = s.calls
+		locals       = Vec.toArray(s.locals)
+		body         = Vec.toArray(s.out)
+		stopped      = s.stopped
+		entries      = s.entries
+		calls        = s.calls
+		resumePoints = len(s.resumes)
 	}
 }
 
-fun start(cx : Context, f : Func Low) -> Sel {
+fun start(cx : Context, f : Func Low, body : Vec St.Control) -> Sel {
 	let (local, locals) = localsOf(f)
 	let params = len(f.params)
 	let frame = Roots.analyze(f)
+	let answers = Array.map(f.results, valType)
+	let switches = Map.contains(cx.switching.switching, f.name)
+	let points = if switches {
+		resumePointsOf(cx, f, frame, answers, body)
+	} else {
+		ResumePoints { resumes = Map.new(), forwards = False }
+	}
+	let saved = if switches { savedLocals(f, local, points.resumes) } else { [] }
 	-- Every shadow frame has the header, so that a walk can step over one
 	-- whatever it holds; a function with neither roots nor objects has no
-	-- frame.
-	let header = if Roots.slotCount(frame) > 0 || len(frame.objects) > 0 { headerBytes } else { 0 }
+	-- frame, unless it may switch stacks, when its frame is where it parks.
+	let header = if Roots.slotCount(frame) > 0 || len(frame.objects) > 0 || switches {
+		headerBytes
+	} else {
+		0
+	}
 	let offsets = Array.filled(len(frame.objects), 0)
 	var bytes = header + 8 * Roots.slotCount(frame)
 	for var k = 0; k < len(frame.objects); k = k + 1 {
 		offsets[k] = bytes
 		bytes = bytes + frame.objects[k].bytes
 	}
+	let saveAt = bytes
+	bytes = bytes + 8 * len(saved)
 	-- The shadow stack pointer stays 16-byte aligned, as a machine stack's is.
-	let frameBytes = (bytes + 15) & -16
+	-- A frame that may park ends in its parked record (`recordBytes`).
+	let frameBytes = ((bytes + 15) & -16) + if switches { recordBytes } else { 0 }
 	let framePointer = if frameBytes > 0 {
 		Vec.push(locals, W.I32)
 		params + len(locals) - 1
@@ -331,6 +402,10 @@ fun start(cx : Context, f : Func Low) -> Sel {
 	}
 	Vec.push(locals, W.I64)
 	let leaving = params + len(locals) - 1
+	let identity = match Map.get(cx.rewindEntries, f.name) {
+		Some(slot) -> slot
+		None       -> -1 - Map.getOr(cx.functions, f.name, 0)
+	}
 	Sel {
 		source       = f
 		cx           = cx
@@ -344,7 +419,7 @@ fun start(cx : Context, f : Func Low) -> Sel {
 		frameBytes   = frameBytes
 		framePointer = framePointer
 		publishes    = publishing(f, frame)
-		answers      = Array.map(f.results, valType)
+		answers      = answers
 		known        = constantsOf(f)
 		place        = (0, 0)
 		depth        = 0
@@ -354,8 +429,103 @@ fun start(cx : Context, f : Func Low) -> Sel {
 		calls        = []
 		entered      = Map.new()
 		called       = Map.new()
+		switches     = switches
+		resumes      = points.resumes
+		forwards     = points.forwards
+		saved        = saved
+		saveAt       = saveAt
+		identity     = identity
+		labels       = []
 	}
 }
+
+-- The resume points of a function that may switch, and whether one of its
+-- tail calls may.
+type ResumePoints = ResumePoints { resumes : Map Int Int, var forwards : Bool }
+
+-- Each instruction of `body` that may switch stacks and is not a tail call,
+-- numbered in the order `control` places them, which is the order of the
+-- structured body: a `Block`'s or a `Loop`'s steps, an `If`'s first arm and
+-- then its second, and a block's instructions up to the tail call that ends
+-- its code, if one does.
+fun resumePointsOf(
+	cx : Context,
+	f : Func Low,
+	frame : Roots.Frame,
+	answers : Array W.ValType,
+	body : Vec St.Control,
+) -> ResumePoints {
+	let out = ResumePoints { resumes = Map.new(), forwards = False }
+	numberSteps(cx, f, frame, answers, body, out)
+	out
+}
+
+fun numberSteps(
+	cx : Context,
+	f : Func Low,
+	frame : Roots.Frame,
+	answers : Array W.ValType,
+	steps : Vec St.Control,
+	out : ResumePoints,
+) -> Unit {
+	for step in steps {
+		match step {
+			St.Block(inner) -> numberSteps(cx, f, frame, answers, inner, out)
+			St.Loop(inner)  -> numberSteps(cx, f, frame, answers, inner, out)
+			St.If(_, taken, otherwise) -> {
+				numberSteps(cx, f, frame, answers, taken, out)
+				numberSteps(cx, f, frame, answers, otherwise, out)
+			}
+			St.Code(id) -> {
+				let b = Ssa.blockId(id)
+				let insts = f.blocks[b].insts
+				for var n = 0; n < len(insts); n = n + 1 {
+					let switching = Resume.switchesAt(cx.switching, f, insts[n])
+					if tailCallAt(cx, f, frame, answers, b, n) {
+						if switching { out.forwards = True }
+						break
+					}
+					if switching { Map.put(out.resumes, key(b, n), len(out.resumes) + 1) }
+				}
+			}
+			_ -> {}
+		}
+	}
+}
+
+-- The locals a rewind must give back: those of the values live after some
+-- resume point, other than the results its call sets again, and of its
+-- operands, which the call is made with again. Each in a word of the frame,
+-- in local order. A unit's local only ever holds 0 (`localsOf`), so it is
+-- left out.
+fun savedLocals(f : Func Low, local : Array Int, resumes : Map Int Int) -> Array Int {
+	if len(resumes) == 0 { return [] }
+	let live = Ssa.liveness(f)
+	let wanted = Map.new()
+	let want = fun(v : Value) {
+		let l = local[Ssa.valueId(v)]
+		if l >= 0 && L.storageOf(Ssa.repOf(f, v).class_) != L.NoBits { Map.put(wanted, l, ()) }
+	}
+	for var b = 0; b < len(f.blocks); b = b + 1 {
+		let insts = f.blocks[b].insts
+		var after : Option (Array (Array Int)) = None
+		for var n = 0; n < len(insts); n = n + 1 {
+			if !Map.contains(resumes, key(b, n)) { continue }
+			if let None = after { after = Some(Ssa.liveAfter(f, Ssa.BlockId(b), live[b])) }
+			if let Some(sets) = after {
+				let result = Ssa.valueId(insts[n].result)
+				for id in sets[n] {
+					if id != result { want(Value(id)) }
+				}
+			}
+			Ssa.eachUse(insts[n], want)
+		}
+	}
+	Array.sort(Map.keys(wanted))
+}
+
+-- The key of the instruction at `(b, n)` in a function's maps.
+fun key(b : Int, n : Int) -> Int = b << 32 | n
 
 -- Returns the local of each of `f`'s values, by value id, and the types of
 -- the locals it declares for them, in index order after its parameters. A
@@ -486,16 +656,41 @@ fun constantsOf(f : Func Low) -> Map Int Int {
 --   16   a word for each root slot (`Turkey.Roots.slotOf`)
 --   then the frame objects, in `Turkey.Roots.Frame.objects` order
 --
--- The walks read it in `Turkey.Heap` and `Turkey.HeapCheck`.
+-- A function that may switch stacks has a frame whatever it holds, and two
+-- more parts, which only an unwind writes and only a rewind reads:
+--
+--   saveAt    a word for each local it saves (`savedLocals`)
+--   top - 16  the parked record: the resume point it is stopped at
+--   top - 8   and its owner (`forward`)
+--
+-- The record is at a fixed distance from the frame's top, not its bottom,
+-- because the top is the shadow stack pointer the function was called with,
+-- which is all a caller rewinding it knows.
+--
+-- The walks read it in `Turkey.Heap` and `Turkey.HeapCheck`. They read the
+-- saved words as nothing: every traced value live at a resume point is in a
+-- root slot as well, since a call that may switch may collect, and the
+-- collector never moves an object, so the saved copy still names it.
 
 let headerBytes = 16
+
+let recordBytes = 16
+
+--- The bit of the panic flag's word that says the running stack is
+--- unwinding to switch. The flag itself is the bit below it.
+let unwinding = 2
 
 -- The frame, when the function has one: the shadow stack pointer moved down
 -- past it, a panic if that passes the stack's limit, the header, each
 -- parameter that is a root in its slot, and the traced fields cleared of
 -- each object some path reads before building it (`Turkey.Roots.FrameObject`).
+--
+-- Rewinding, the frame is where it was when it parked, since every frame
+-- out to the stack's top is pushed again at the size it had. Its locals come
+-- back from it instead, and its roots and objects are left as they are.
 fun prologue(s : Sel) -> Unit {
 	if s.frameBytes == 0 { return }
+	if s.forwards { forward(s) }
 	op(s, W.GlobalGet(s.cx.stackPointer))
 	op(s, W.ConstI64(s.frameBytes))
 	op(s, W.IntBin(W.W64, W.Sub))
@@ -504,12 +699,15 @@ fun prologue(s : Sel) -> Unit {
 	-- here rather than a write over whatever is there. It panics, from the
 	-- caller's frame and with the reserve below the limit for the panic's own
 	-- frames, and returns before this function's body: no frame of it is on
-	-- the trace, as none of the function that overflowed is on arm64's.
+	-- the trace, as none of the function that overflowed is on arm64's. The
+	-- limit is the running stack's, a coroutine's as well as the program's.
 	op(s, W.GlobalGet(s.cx.stackPointer))
 	op(s, W.GlobalGet(s.cx.stackLimit))
 	op(s, W.IntRel(W.W64, W.LtU))
 	op(s, W.If(W.Empty))
-	op(s, W.ConstI64(s.cx.stackBottom))
+	op(s, W.GlobalGet(s.cx.stackLimit))
+	op(s, W.ConstI64(s.cx.stackReserve))
+	op(s, W.IntBin(W.W64, W.Sub))
 	op(s, W.GlobalSet(s.cx.stackLimit))
 	release(s)
 	match definedIndex(s, "turkey_panic") {
@@ -531,6 +729,17 @@ fun prologue(s : Sel) -> Unit {
 	op(s, W.ConstI64(s.frameBytes))
 	op(s, W.IntBin(W.W64, W.Add))
 	op(s, W.Store(W.I64Store, 0))
+	if s.switches {
+		op(s, W.GlobalGet(s.cx.rewinding))
+		op(s, W.If(W.Empty))
+		for var k = 0; k < len(s.saved); k = k + 1 {
+			let l = s.saved[k]
+			op(s, W.LocalGet(s.framePointer))
+			op(s, W.Load(loadOf(localType(s, l)), s.saveAt + 8 * k))
+			op(s, W.LocalSet(l))
+		}
+		op(s, W.Else)
+	}
 	-- No site until the first call that may collect names one. The memory
 	-- holds whatever a frame there held before, which may be a site whose
 	-- entry lists slots this frame has not written.
@@ -547,6 +756,95 @@ fun prologue(s : Sel) -> Unit {
 			}
 		}
 	}
+	if s.switches { op(s, W.End) }
+}
+
+-- Rewinding, a tail call this function made may have left the callee's
+-- frame parked where this function's would go, since the call replaced this
+-- function's frame with its own. So a rewind reads the owner of the record
+-- at the top of that frame first, and when it is not this function, goes on
+-- to the owner: through its rewind entry (`Turkey.Wasm.Program`), whose
+-- type, no parameters and this function's results, is the same whoever the
+-- owner is, since a tail call returns what its caller returns.
+--
+-- An owner that is not this function is always one of
+-- `Resume.Switching.tailCallees`, which each have an entry and name its slot
+-- as their identity. Any other function names itself by a negative number,
+-- which no slot is.
+fun forward(s : Sel) -> Unit {
+	op(s, W.GlobalGet(s.cx.rewinding))
+	op(s, W.If(W.Empty))
+	recordWord(s, 8)
+	op(s, W.ConstI64(s.identity))
+	op(s, W.IntRel(W.W64, W.Ne))
+	op(s, W.If(W.Empty))
+	recordWord(s, 8)
+	op(s, W.Convert(W.I32WrapI64))
+	let t = M.addType(s.cx.module_, W.FuncType { params = [], results = s.answers })
+	op(s, W.ReturnCallIndirect(t, 0))
+	op(s, W.End)
+	op(s, W.End)
+}
+
+-- The word of the parked record `from` bytes below the shadow stack
+-- pointer, before this function's frame is pushed.
+fun recordWord(s : Sel, from : Int) -> Unit {
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.ConstI64(from))
+	op(s, W.IntBin(W.W64, W.Sub))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I64Load, 0))
+}
+
+-- The way out of an unwind, at the end of the body after a bail has stored
+-- the resume point: the owner, then the saved locals, and zeros returned,
+-- with the frame left where it is for the rewind.
+fun unwind(s : Sel) -> Unit {
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load, 0))
+	op(s, W.ConstI32(unwinding))
+	op(s, W.IntBin(W.W32, W.And))
+	op(s, W.If(W.Empty))
+	op(s, W.LocalGet(s.framePointer))
+	op(s, W.ConstI64(s.identity))
+	op(s, W.Store(W.I64Store, s.frameBytes - 8))
+	for var k = 0; k < len(s.saved); k = k + 1 {
+		let l = s.saved[k]
+		op(s, W.LocalGet(s.framePointer))
+		op(s, W.LocalGet(l))
+		op(s, W.Store(storeOf(localType(s, l)), s.saveAt + 8 * k))
+	}
+	for t in s.answers { op(s, zeroOf(t)) }
+	op(s, W.Return)
+	op(s, W.End)
+}
+
+-- Pushes the resume point the frame's record holds.
+fun resumePoint(s : Sel) -> Unit {
+	op(s, W.LocalGet(s.framePointer))
+	op(s, W.Load(W.I32Load, s.frameBytes - 16))
+}
+
+fun localType(s : Sel, l : Int) -> W.ValType =
+	if l < s.params {
+		valType(Ssa.repOf(s.source, s.source.params[l]))
+	} else {
+		s.locals[l - s.params]
+	}
+
+fun loadOf(t : W.ValType) -> W.LoadKind = match t {
+	W.I64 -> W.I64Load
+	W.F64 -> W.F64Load
+	W.F32 -> W.F32Load
+	_     -> W.I32Load
+}
+
+fun storeOf(t : W.ValType) -> W.StoreKind = match t {
+	W.I64 -> W.I64Store
+	W.F64 -> W.F64Store
+	W.F32 -> W.F32Store
+	_     -> W.I32Store
 }
 
 -- `v` stored into its slot, if it has one. A slot holds one value from its
@@ -632,80 +930,232 @@ fun leave(s : Sel) -> Unit {
 -- Leave as a panic leaves every function it passes through: by the way out
 -- at the end of the body, which adds the site being selected to the trace and
 -- returns zeros.
+--
+-- From a resume point, the record gets its number first, which the way out
+-- keeps if the leaving is an unwind.
 fun bail(s : Sel) -> Unit {
+	let (b, n) = s.place
+	if let Some(point) = Map.get(s.resumes, key(b, n)) {
+		op(s, W.LocalGet(s.framePointer))
+		op(s, W.ConstI64(point))
+		op(s, W.Store(W.I64Store, s.frameBytes - 16))
+	}
 	op(s, W.ConstI64(traceSite(s)))
 	op(s, W.LocalSet(s.leaving))
 	op(s, W.Br(s.depth - 1))
 }
 
 -- -- control flow ------------------------------------------------------------------
+--
+-- **The rewind's dispatch.** A rewind enters a function at its top and has to
+-- reach a resume point deep inside the structured body, which no branch can
+-- jump into. So each sequence of steps that holds a resume point starts with
+-- a dispatch, which, rewinding, skips the steps before the one that holds the
+-- point: a `block` ends before each step that holds one, and a `br_table` on
+-- the point leaves the right number of them. A `Block` or a `Loop` is then
+-- entered as it is, and its own sequence dispatches again; an `If` takes the
+-- arm that holds the point, whatever its test now says, since the test's
+-- local may have been reused since; and a block's code dispatches to the
+-- instruction. The steps skipped run nothing, so every local still holds what
+-- the prologue gave back.
+--
+-- Not rewinding, a dispatch costs one test of the flag, at the top of each
+-- sequence that holds a point and does not start with the step holding it.
+--
+-- The dispatch's blocks are labels the structured body's branches do not
+-- count, so every branch's depth is renumbered (`branch`).
 
 fun control(s : Sel, body : Vec St.Control) -> Unit {
-	for step in body {
-		match step {
-			St.Block(inner) -> {
-				op(s, W.Block(W.Empty))
-				control(s, inner)
-				op(s, W.End)
-			}
-			St.Loop(inner) -> {
-				op(s, W.Loop(W.Empty))
-				control(s, inner)
-				op(s, W.End)
-			}
-			St.If(test, taken, otherwise) -> {
-				get(s, test)
-				op(s, W.If(W.Empty))
-				control(s, taken)
-				if len(otherwise) > 0 {
-					op(s, W.Else)
-					control(s, otherwise)
+	if !s.switches {
+		for step in body { controlStep(s, step) }
+		return
+	}
+	let spans = Vec.toArray(Vec.map(body, fun(step) = spanOf(s, step)))
+	dispatch(s, spans, fun(k) = controlStep(s, body[k]))
+}
+
+fun controlStep(s : Sel, step : St.Control) -> Unit = match step {
+	St.Block(inner) -> {
+		open(s, W.Block(W.Empty), True)
+		control(s, inner)
+		close(s)
+	}
+	St.Loop(inner) -> {
+		open(s, W.Loop(W.Empty), True)
+		control(s, inner)
+		close(s)
+	}
+	St.If(test, taken, otherwise) -> {
+		if s.switches && Option.isSome(spanOf(s, step)) {
+			op(s, W.GlobalGet(s.cx.rewinding))
+			op(s, W.If(W.Value(W.I32)))
+			match spanOfAll(s, taken) {
+				Some((low, high)) -> {
+					resumePoint(s)
+					op(s, W.ConstI32(low))
+					op(s, W.IntBin(W.W32, W.Sub))
+					op(s, W.ConstI32(high - low + 1))
+					op(s, W.IntRel(W.W32, W.LtU))
 				}
-				op(s, W.End)
+				None -> op(s, W.ConstI32(0))
 			}
-			St.Br(depth)                          -> op(s, W.Br(depth))
-			St.BrTable(v, base, targets, default) -> table(s, v, base, targets, default)
-			St.BrCases(v, cases, default) -> {
-				let c = classOf(s, v)
-				for (key, depth) in cases {
-					get(s, v)
-					op(s, constant(c, key))
-					op(s, W.IntRel(widthOf(c), W.Eq))
-					op(s, W.BrIf(depth))
-				}
-				op(s, W.Br(default))
-			}
-			St.Code(b) -> code(s, Ssa.blockId(b))
-			St.Return(values) -> {
-				for v in values { get(s, v) }
-				leave(s)
-			}
-			-- No test of the flag after the call: it would find the flag the
-			-- call just set, and the path leaves anyway.
-			St.Panic(message) -> match definedIndex(s, "turkey_panic_string") {
-				Some(f) -> {
-					op(s, W.ConstI64(0))
-					get(s, message)
-					op(s, W.Call(f))
-					op(s, W.Drop)
-					bail(s)
-				}
-				None -> stop(s, "a panic with no turkey_panic_string")
-			}
-			-- After a call that never returns, which returns only to leave,
-			-- the site is the call's; otherwise there is none to trace.
-			St.Unreachable -> {
-				let (b, n) = s.place
-				let insts = s.source.blocks[b].insts
-				if n > 0 && isCallOp(insts[n - 1].op) {
-					s.place = (b, n - 1)
-				} else {
-					s.place = (b, -1)
-				}
-				bail(s)
-			}
+			op(s, W.Else)
+			get(s, test)
+			op(s, W.End)
+		} else {
+			get(s, test)
+		}
+		open(s, W.If(W.Empty), True)
+		control(s, taken)
+		if len(otherwise) > 0 {
+			op(s, W.Else)
+			control(s, otherwise)
+		}
+		close(s)
+	}
+	St.Br(depth) -> op(s, W.Br(branch(s, depth)))
+	St.BrTable(v, base, targets, default) ->
+		table(s, v, base, Array.map(targets, fun(t) = branch(s, t)), branch(s, default))
+	St.BrCases(v, cases, default) -> {
+		let c = classOf(s, v)
+		for (key, depth) in cases {
+			get(s, v)
+			op(s, constant(c, key))
+			op(s, W.IntRel(widthOf(c), W.Eq))
+			op(s, W.BrIf(branch(s, depth)))
+		}
+		op(s, W.Br(branch(s, default)))
+	}
+	St.Code(b) -> code(s, Ssa.blockId(b))
+	St.Return(values) -> {
+		for v in values { get(s, v) }
+		leave(s)
+	}
+	-- No test of the flag after the call: it would find the flag the
+	-- call just set, and the path leaves anyway.
+	St.Panic(message) -> match definedIndex(s, "turkey_panic_string") {
+		Some(f) -> {
+			op(s, W.ConstI64(0))
+			get(s, message)
+			op(s, W.Call(f))
+			op(s, W.Drop)
+			bail(s)
+		}
+		None -> stop(s, "a panic with no turkey_panic_string")
+	}
+	-- After a call that never returns, which returns only to leave,
+	-- the site is the call's; otherwise there is none to trace.
+	St.Unreachable -> {
+		let (b, n) = s.place
+		let insts = s.source.blocks[b].insts
+		if n > 0 && isCallOp(insts[n - 1].op) {
+			s.place = (b, n - 1)
+		} else {
+			s.place = (b, -1)
+		}
+		bail(s)
+	}
+}
+
+-- Opens a `block`, `loop` or `if`, one of the structured body's own labels
+-- if `structural`.
+fun open(s : Sel, o : W.Op, structural : Bool) -> Unit {
+	op(s, o)
+	Vec.push(s.labels, structural)
+}
+
+fun close(s : Sel) -> Unit {
+	op(s, W.End)
+	let _ = Vec.pop(s.labels)
+}
+
+-- The wasm depth of the label a branch of the structured body names at
+-- `depth`, counting only the body's own labels.
+fun branch(s : Sel, depth : Int) -> Int {
+	var seen = -1
+	for var k = len(s.labels) - 1; k >= 0; k = k - 1 {
+		if s.labels[k] {
+			seen = seen + 1
+			if seen == depth { return len(s.labels) - 1 - k }
 		}
 	}
+	error(
+		"internal error: a branch "
+			+ Int.toString(depth)
+			+ " levels out of "
+			+ Int.toString(seen + 1),
+	)
+}
+
+-- Places `emit(0)` up to `emit(len(spans) - 1)` in order, with the dispatch
+-- a rewind takes to the item holding its resume point: `spans[k]` is the
+-- first and last resume points of item `k`, if it holds any.
+fun dispatch(s : Sel, spans : Array (Option (Int, Int)), emit : fun(Int) -> Unit) -> Unit {
+	let holding = []
+	for var k = 0; k < len(spans); k = k + 1 {
+		if Option.isSome(spans[k]) { Vec.push(holding, k) }
+	}
+	-- With nothing to skip, a rewind runs straight into the item.
+	if len(holding) == 0 || (len(holding) == 1 && holding[0] == 0) {
+		for var k = 0; k < len(spans); k = k + 1 { emit(k) }
+		return
+	}
+	let (low, _) = Option.unwrapOr(spans[holding[0]], (0, 0))
+	let (_, high) = Option.unwrapOr(spans[holding[len(holding) - 1]], (0, 0))
+	-- One `block` per item holding a point, the first item's innermost, each
+	-- ending just before its item. From inside the `if`, the first is one
+	-- level out.
+	let targets = Array.filled(high - low + 1, 1)
+	for var j = 0; j < len(holding); j = j + 1 {
+		let (first, last) = Option.unwrapOr(spans[holding[j]], (0, -1))
+		for var point = first; point <= last; point = point + 1 { targets[point - low] = j + 1 }
+	}
+	for _ in holding { open(s, W.Block(W.Empty), False) }
+	op(s, W.GlobalGet(s.cx.rewinding))
+	open(s, W.If(W.Empty), False)
+	resumePoint(s)
+	op(s, W.ConstI32(low))
+	op(s, W.IntBin(W.W32, W.Sub))
+	op(s, W.BrTable(targets, 1))
+	close(s)
+	var next = 0
+	for k in holding {
+		for var e = next; e < k; e = e + 1 { emit(e) }
+		close(s)
+		next = k
+	}
+	for var e = next; e < len(spans); e = e + 1 { emit(e) }
+}
+
+-- The first and last resume points inside `step`, if it holds any.
+fun spanOf(s : Sel, step : St.Control) -> Option (Int, Int) = match step {
+	St.Block(inner)            -> spanOfAll(s, inner)
+	St.Loop(inner)             -> spanOfAll(s, inner)
+	St.If(_, taken, otherwise) -> joined(spanOfAll(s, taken), spanOfAll(s, otherwise))
+	St.Code(b) -> {
+		let id = Ssa.blockId(b)
+		var out = None
+		for var n = 0; n < len(s.source.blocks[id].insts); n = n + 1 {
+			if let Some(point) = Map.get(s.resumes, key(id, n)) {
+				out = joined(out, Some((point, point)))
+			}
+		}
+		out
+	}
+	_ -> None
+}
+
+fun spanOfAll(s : Sel, steps : Vec St.Control) -> Option (Int, Int) {
+	var out = None
+	for step in steps { out = joined(out, spanOf(s, step)) }
+	out
+}
+
+fun joined(a : Option (Int, Int), b : Option (Int, Int)) -> Option (Int, Int) = match (a, b) {
+	(None, _) -> b
+	(_, None) -> a
+	(Some((low, high)), Some((first, last))) ->
+		Some((if first < low { first } else { low }, if last > high { last } else { high }))
 }
 
 -- A `br_table` on `v` less `base`. An `i32` key subtracts as it is, since
@@ -741,18 +1191,33 @@ fun table(s : Sel, v : Value, base : Int, targets : Array Int, default : Int) ->
 -- parameter of the target is held in that local.
 fun code(s : Sel, b : Int) -> Unit {
 	let block = s.source.blocks[b]
-	for p in block.params { keep(s, p) }
+	-- What follows a tail call is its results, which the call returns
+	-- itself, and nothing runs after it.
+	var placed = len(block.insts)
+	var tail = -1
 	for var n = 0; n < len(block.insts); n = n + 1 {
-		s.place = (b, n)
-		-- What follows a tail call is its results, which the call returns
-		-- itself, and nothing runs after it.
 		if isTailCall(s, b, n) {
-			tailCall(s, block.insts[n])
-			return
+			tail = n
+			placed = n + 1
+			break
 		}
-		selectInst(s, block.insts[n])
-		keep(s, block.insts[n].result)
 	}
+	if placed == 0 { for p in block.params { keep(s, p) } }
+	let spans = Array.init(placed, fun(n) = match Map.get(s.resumes, key(b, n)) {
+		Some(point) -> Some((point, point))
+		None        -> None
+	})
+	dispatch(s, spans, fun(n) {
+		if n == 0 { for p in block.params { keep(s, p) } }
+		s.place = (b, n)
+		if n == tail {
+			tailCall(s, block.insts[n])
+		} else {
+			selectInst(s, block.insts[n])
+			keep(s, block.insts[n].result)
+		}
+	})
+	if tail >= 0 { return }
 	-- The terminator, which `control` selects next.
 	s.place = (b, len(block.insts))
 	if let Ssa.Jump(target, args) = block.term {
@@ -776,20 +1241,29 @@ fun code(s : Sel, b : Int) -> Unit {
 -- Unlike arm64, no argument count disqualifies one: wasm passes every
 -- argument the same way. A call whose operands may reach one of this frame's
 -- objects stays a call, since the frame is gone when the callee runs.
-fun isTailCall(s : Sel, b : Int, n : Int) -> Bool {
-	let f = s.source
+fun isTailCall(s : Sel, b : Int, n : Int) -> Bool =
+	tailCallAt(s.cx, s.source, s.frame, s.answers, b, n)
+
+fun tailCallAt(
+	cx : Context,
+	f : Func Low,
+	frame : Roots.Frame,
+	results : Array W.ValType,
+	b : Int,
+	n : Int,
+) -> Bool {
 	if !L.inTailPosition(f, b, n) { return False }
 	let block = f.blocks[b]
 	let i = block.insts[n]
 	let answers = match i.op {
-		Call(Direct(name), _) -> match Map.get(s.cx.results, name) {
+		Call(Direct(name), _) -> match Map.get(cx.results, name) {
 			Some(reps) -> reps
 			None       -> return False
 		}
 		Call(Indirect(_), _) -> [Ssa.repOf(f, i.result)]
 		_                    -> return False
 	}
-	if Array.map(answers, valType) != s.answers { return False }
+	if Array.map(answers, valType) != results { return False }
 	let vs = match L.returned(f, b) {
 		Some(vs) -> vs
 		None     -> return False
@@ -805,7 +1279,7 @@ fun isTailCall(s : Sel, b : Int, n : Int) -> Bool {
 			_ -> return False
 		}
 	}
-	len(Roots.objectsAt(s.frame, b, n)) == 0
+	len(Roots.objectsAt(frame, b, n)) == 0
 }
 
 -- A call `isTailCall` accepted. No panic test follows: a callee that panics
@@ -1851,7 +2325,7 @@ fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = matc
 	}
 	Runtime(r) -> match r {
 		Rt.Exit      -> definedCall(s, d, Rt.entryPoint(r).symbol, args, True)
-		Rt.SwapStack -> stop(s, "Prim.swapStack, which is not supported on wasm yet")
+		Rt.SwapStack -> swapStack(s, args)
 	}
 	Foreign(symbol, fixed) -> foreignCall(s, d, symbol, fixed, args)
 	-- A closure: its environment first, the uniform convention
@@ -1867,6 +2341,50 @@ fun call(s : Sel, d : Value, callee : Callee, args : Array Value) -> Unit = matc
 		set(s, d)
 		propagate(s)
 	}
+}
+
+-- `Prim.swapStack(from, to)`: park the running stack on `from` and resume
+-- `to`, which on wasm is to unwind. The switch names `to` as the worker's
+-- running stack and parks `from` at this function's frame, the innermost of
+-- the stack, which is where the collector walks it from; then it raises the
+-- unwinding bit, and the test after it leaves as the test after a call does.
+-- Every function out to the stack's top does the same, and the entry
+-- (`Turkey.Wasm.Program`) rewinds `to`.
+--
+-- Rewinding `to`, its own switch is where the rewind ends: the flag comes
+-- down, and the stack runs on from here. The test after it then finds the
+-- panic flag if the stack switched back to raised it, as a coroutine whose
+-- body panicked does, and leaves as a panic does.
+--
+-- Its roots are published first, as before a call: a parked stack's frame
+-- names the site it stopped at, and the frame table lists its roots there.
+fun swapStack(s : Sel, args : Array Value) -> Unit {
+	if !s.switches {
+		return stop(s, "internal error: a stack switch in a function that does not switch")
+	}
+	publish(s)
+	op(s, W.GlobalGet(s.cx.rewinding))
+	op(s, W.If(W.Empty))
+	op(s, W.ConstI32(0))
+	op(s, W.GlobalSet(s.cx.rewinding))
+	op(s, W.Else)
+	address(s, args[0])
+	op(s, W.GlobalGet(s.cx.stackPointer))
+	op(s, W.Store(W.I64Store, Rt.stackParked))
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	get(s, args[1])
+	op(s, W.Store(W.I64Store, Rt.workerRunningStack))
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.GlobalGet(s.cx.worker))
+	op(s, W.Convert(W.I32WrapI64))
+	op(s, W.Load(W.I32Load, 0))
+	op(s, W.ConstI32(unwinding))
+	op(s, W.IntBin(W.W32, W.Or))
+	op(s, W.Store(W.I32Store, 0))
+	op(s, W.End)
+	propagate(s)
 }
 
 -- The results of the direct call to `name` just emitted, off the stack: the

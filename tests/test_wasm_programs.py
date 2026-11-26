@@ -897,6 +897,297 @@ def test_a_dependency_graph_runs_on_one_worker(stress):
     assert (result.returncode, result.stdout) == (0, "514229\n"), result.stderr
 
 
+# -- tasks ----------------------------------------------------------------------------
+#
+# A switch of stacks unwinds the stack it leaves and rewinds the one it resumes
+# (`Turkey.Wasm.Select`). Under stress every allocation collects, so a task's
+# roots are walked while it is parked, from the frames its unwind left.
+
+# Each task builds a list and sums it, and yields half way, so that the tasks
+# run interleaved.
+SPAWN_JOIN = """\
+import System.Env as Env
+import System.Task as Task
+
+type Chain = End | Link(Int, Chain)
+
+fun build(n : Int, acc : Chain) -> Chain = if n == 0 { acc } else { build(n - 1, Link(n, acc)) }
+
+fun sum(xs : Chain) -> Int = match xs {
+    End -> 0
+    Link(x, rest) -> x + sum(rest)
+}
+
+fun work(k : Int, n : Int) -> Int {
+    let xs = build(n + k, End)
+    Task.yield()
+    sum(xs) * k
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    let total = Task.runScope(do {
+        var tasks = []
+        for k in Int.range(1, 9) {
+            let t = Task.spawn(fun() = work(k, n))?
+            Vec.push(tasks, t)
+        }
+        pure(Vec.map(tasks, Task.join))
+    })
+    print(total)
+}
+"""
+
+
+@both
+def test_tasks_spawn_and_join(stress):
+    n = 20 if stress else 1000
+    result = _run(SPAWN_JOIN, str(n), stress=stress)
+    expected = [k * (n + k) * (n + k + 1) // 2 for k in range(1, 9)]
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "[" + ", ".join(map(str, expected)) + "]\n"
+
+
+# A channel of two slots, made of a mutex and a condition, between a producer
+# and a consumer, each of which waits for the other in turn; and the values
+# are strings, so the queue between them holds objects only the parked task's
+# frames and the queue reach.
+CHANNEL = """\
+import Deque
+import System.Env as Env
+import System.Sync as Sync
+import System.Task as Task
+
+type Channel = Channel { queue : Sync.Mutex (Deque.Deque String), changed : Sync.Condition (Deque.Deque String) }
+
+fun channel() -> Channel {
+    let queue = Sync.mutex(Deque.new(2))
+    Channel { queue = queue, changed = Sync.condition(queue) }
+}
+
+fun send(c : Channel, s : String) -> Unit {
+    Sync.waitForUnbounded(c.changed, fun(q) = if len(q) < 2 {
+        Deque.pushBack(q, s)
+        Some(())
+    } else {
+        None
+    })
+    Sync.notifyAll(c.changed)
+}
+
+fun receive(c : Channel) -> String {
+    let s = Sync.waitForUnbounded(c.changed, Deque.popFront)
+    Sync.notifyAll(c.changed)
+    s
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    let c = channel()
+    let (sent, got) = Task.runScope(do {
+        let producer = Task.spawn(fun() {
+            for i in Int.range(0, n) { send(c, Int.toString(i)) }
+            send(c, "done")
+            n
+        })?
+        let consumer = Task.spawn(fun() {
+            var total = 0
+            var count = 0
+            loop {
+                let s = receive(c)
+                if s == "done" { break }
+                total = total + Option.unwrapOr(Int.parse(s), 0)
+                count = count + 1
+            }
+            (count, total)
+        })?
+        pure((Task.join(producer), Task.join(consumer)))
+    })
+    print(sent)
+    print(got)
+}
+"""
+
+
+@both
+def test_a_channel_carries_values_between_tasks(stress):
+    n = 50 if stress else 5000
+    result = _run(CHANNEL, str(n), stress=stress)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{n}\n({n}, {n * (n - 1) // 2})\n"
+
+
+# A task that switches from deep in a recursion, every frame holding a root,
+# while the program's own stack is deep too when it waits: each switch unwinds
+# and rewinds both, and every root must be where it was.
+DEEP_SWITCH = """\
+import System.Env as Env
+import System.Task as Task
+
+type Chain = End | Link(String, Chain)
+
+fun down(depth : Int, acc : Chain) -> Int {
+    if depth == 0 {
+        for _ in Int.range(0, 5) { Task.yield() }
+        return length(acc)
+    }
+    let here = Link(Int.toString(depth), acc)
+    let below = down(depth - 1, here)
+    below + String.byteLength(Int.toString(depth)) - String.byteLength(Int.toString(depth))
+}
+
+fun length(xs : Chain) -> Int = match xs {
+    End -> 0
+    Link(_, rest) -> 1 + length(rest)
+}
+
+fun waitDeep(depth : Int, t : Task.Task Int) -> Int = if depth == 0 {
+    Task.join(t)
+} else {
+    let s = Int.toString(depth)
+    waitDeep(depth - 1, t) + String.byteLength(s) - String.byteLength(s)
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    print(Task.runScope(do {
+        let a = Task.spawn(fun() = down(n, End))?
+        let b = Task.spawn(fun() = down(n / 2, End))?
+        pure(waitDeep(n, a) + waitDeep(n / 3, b))
+    }))
+}
+"""
+
+
+@both
+def test_a_deep_stack_switches(stress):
+    n = 60 if stress else 2000
+    result = _run(DEEP_SWITCH, str(n), stress=stress)
+    assert (result.returncode, result.stdout) == (0, f"{n + n // 2}\n"), result.stderr
+
+
+# The task parks holding the only reference to its list, and the program's own
+# code allocates until several collections have run before resuming it.
+PARKED_COLLECTION = """\
+import System.Env as Env
+import System.Sync as Sync
+import System.Task as Task
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    let go = Sync.event()
+    let total = Task.runScope(do {
+        let t = Task.spawn(fun() {
+            let words = Vec.map(Vec.fromArray(Array.init(n, fun(i) = i)), Int.toString)
+            Sync.waitEventUnbounded(go)
+            var sum = 0
+            for w in words { sum = sum + Option.unwrapOr(Int.parse(w), 0) }
+            sum
+        })?
+        Task.yield()
+        var garbage = 0
+        for i in Int.range(0, n * 20) { garbage = garbage + String.byteLength(Int.toString(i)) }
+        Sync.setEvent(go)
+        pure(Task.join(t) + garbage - garbage)
+    })
+    print(total)
+}
+"""
+
+
+@both
+def test_a_collection_finds_a_parked_tasks_roots(stress):
+    n = 100 if stress else 50000
+    result = _run(PARKED_COLLECTION, str(n), stress=stress)
+    assert (result.returncode, result.stdout) == (0, f"{n * (n - 1) // 2}\n"), result.stderr
+
+
+# `even` and `odd` call each other in tail position a hundred thousand times
+# in a task, whose shadow stack a frame per call would overflow, and switch on
+# the way. A switch from inside a tail callee parks the callee's frame where
+# its caller's was, so the rewind goes from the caller to the callee.
+TAIL_SWITCH = """\
+import System.Env as Env
+import System.Task as Task
+
+fun even(n : Int) -> Bool = if n == 0 { True } else { odd(n - 1) }
+
+fun odd(n : Int) -> Bool {
+    if n == 0 { return False }
+    if n % 1000 == 0 { Task.yield() }
+    even(n - 1)
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    print(Task.runScope(do {
+        let a = Task.spawn(fun() = even(n))?
+        let b = Task.spawn(fun() = odd(n))?
+        pure((Task.join(a), Task.join(b)))
+    }))
+}
+"""
+
+
+@both
+def test_a_tail_call_switches(stress):
+    n = 3001 if stress else 100001
+    result = _run(TAIL_SWITCH, str(n), stress=stress)
+    assert (result.returncode, result.stdout) == (0, "(False, True)\n"), result.stderr
+
+
+# A task's shadow stack ends at its own bottom, where running out panics, as
+# the program's own stack's does, rather than writing over what is below it.
+TASK_OVERFLOW = """\
+import System.Env as Env
+import System.Task as Task
+
+fun depth(n : Int) -> Int {
+    if n == 0 { return 0 }
+    let s = Int.toString(n)
+    1 + depth(n - 1) + String.byteLength(s) - String.byteLength(s)
+}
+
+fun main() {
+    let n = match Int.parse(Env.args()[0]) {
+        Some(n) -> n
+        None -> 0
+    }
+    print(Task.runScope(do {
+        let t = Task.spawn(fun() = depth(n))?
+        pure(Task.join(t))
+    }))
+}
+"""
+
+
+def test_running_out_of_a_tasks_stack_panics():
+    # A 256 MB engine stack, so that the task's shadow stack runs out first.
+    engine = ("-W", "max-wasm-stack=268435456")
+    fits = _run(TASK_OVERFLOW, "1000", engine=engine)
+    assert (fits.returncode, fits.stdout) == (0, "1000\n"), fits.stderr
+    result = _run(TASK_OVERFLOW, "400000", engine=engine)
+    assert result.returncode == 1, result.stderr
+    lines = result.stderr.splitlines()
+    assert lines[0] == "panic: stack overflow", result.stderr
+    assert lines[1].startswith("  at depth (Main.gob:")
+
+
 # -- the build ------------------------------------------------------------------------
 
 

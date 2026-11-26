@@ -1,0 +1,204 @@
+export (Switching(..), analyse, switchesAt, typeKey)
+
+--- Which functions of a program may switch stacks, for the wasm backend's
+--- unwind and rewind (`Turkey.Wasm.Select`).
+---
+--- A wasm function cannot leave its frame on the engine's stack and come back
+--- to it later, so a switch unwinds: every frame on the stack being left saves
+--- what it needs and returns, and the stack being resumed is rebuilt by
+--- calling its frames again, each of which restores itself and continues at
+--- the call it was stopped in. Only the functions that may be on the stack at
+--- a switch pay for that, and this says which they are: a function switches if
+--- it switches stacks itself (`Prim.swapStack`), or calls one that may, directly,
+--- through a `foreign` definition's C symbol, or through a closure whose code
+--- may be one.
+---
+--- **A closure's code is known by its type.** An indirect call can only reach a
+--- function in the table of exactly the type the call names, or it traps; so a
+--- closure call may switch if some function in the table of its type does.
+
+import Data.Map as Map
+import Turkey.LowIr (Op(..), Low(..), Callee(..))
+import Turkey.LowIr as L
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Func(..), Rep(..), Value)
+import Turkey.SsaLower (Module(..))
+import Turkey.Wasm as W
+
+--- What the backend reads about switching, decided before any function is
+--- selected.
+type Switching = Switching {
+	--- The functions that may switch stacks, by name.
+	switching : Map String Unit
+	--- The types (`typeKey`) of the closure calls that may switch.
+	closures : Map String Unit
+	--- The functions that a tail call in a switching function may reach while
+	--- it switches, in the order first found. The tail call leaves no frame of
+	--- its caller behind, so the caller's caller resumes the callee's frame
+	--- through a function of its own (`Turkey.Wasm.Program`).
+	tailCallees : Vec String
+	--- The Turkey function of each `foreign` definition, by its C symbol.
+	defined : Map String String
+}
+
+--- Returns which of `m`'s functions may switch stacks. `defined` gives the
+--- Turkey function of each `foreign` definition by its C symbol, and
+--- `slotted` names each function a closure or a code address names, which
+--- an indirect call may reach.
+fun analyse(m : Module, defined : Map String String, slotted : Vec String) -> Switching {
+	let byName = Map.new()
+	for f in m.functions { Map.put(byName, f.name, f) }
+	-- The type each table function has, for matching closure calls to it.
+	let slotTypes = Map.new()
+	for name in slotted {
+		if let Some(f) = Map.get(byName, name) { Map.put(slotTypes, name, functionKey(f)) }
+	}
+	let out = Switching {
+		switching   = Map.new()
+		closures    = Map.new()
+		tailCallees = []
+		defined     = defined
+	}
+	-- A worklist over the reverse call graph, as `Turkey.LowIr.summarize`
+	-- has: each function that switches by itself is found once, and the fact
+	-- runs up its callers from there. A closure call's callers are found
+	-- through the call's type, the first time some table function of that
+	-- type switches.
+	let callers : Map String (Vec String) = Map.new()
+	let closureCallers : Map String (Vec String) = Map.new()
+	let work = []
+	let mark = fun(name : String) {
+		if !Map.contains(out.switching, name) {
+			Map.put(out.switching, name, ())
+			Vec.push(work, name)
+		}
+	}
+	let edge = fun(table : Map String (Vec String), key : String, caller : String) = match Map.get(
+		table,
+		key,
+	) {
+		Some(those) -> Vec.push(those, caller)
+		None        -> Map.put(table, key, [caller])
+	}
+	for f in m.functions {
+		for block in f.blocks {
+			for i in block.insts {
+				match i.op {
+					Call(Runtime(Rt.SwapStack), _) -> mark(f.name)
+					Call(Indirect(_), args) -> edge(
+						closureCallers,
+						callKey(f, args, i.result),
+						f.name,
+					)
+					Call(callee, _) -> if let Some(name) = target(defined, callee) {
+						edge(callers, name, f.name)
+					}
+					_ -> {}
+				}
+			}
+		}
+	}
+	for var k = 0; k < len(work); k = k + 1 {
+		let name = work[k]
+		if let Some(those) = Map.get(callers, name) {
+			for caller in those { mark(caller) }
+		}
+		if let Some(key) = Map.get(slotTypes, name) {
+			if !Map.contains(out.closures, key) {
+				Map.put(out.closures, key, ())
+				if let Some(those) = Map.get(closureCallers, key) {
+					for caller in those { mark(caller) }
+				}
+			}
+		}
+	}
+
+	-- The tail callees: a direct one by name, and for a closure call every
+	-- switching table function of its type.
+	let seen = Map.new()
+	let callee = fun(name : String) {
+		if Map.contains(out.switching, name) && !Map.contains(seen, name) {
+			Map.put(seen, name, ())
+			Vec.push(out.tailCallees, name)
+		}
+	}
+	for f in m.functions {
+		if !Map.contains(out.switching, f.name) { continue }
+		for var b = 0; b < len(f.blocks); b = b + 1 {
+			let insts = f.blocks[b].insts
+			for var n = 0; n < len(insts); n = n + 1 {
+				if !L.inTailPosition(f, b, n) || !switchesAt(out, f, insts[n]) { continue }
+				match insts[n].op {
+					Call(Indirect(_), args) -> {
+						let key = callKey(f, args, insts[n].result)
+						for name in slotted {
+							if Map.get(slotTypes, name) == Some(key) { callee(name) }
+						}
+					}
+					Call(c, _) -> if let Some(name) = target(defined, c) { callee(name) }
+					_          -> {}
+				}
+			}
+		}
+	}
+	out
+}
+
+--- Returns whether the instruction `i` of `f` may switch stacks: a switch
+--- itself, or a call that may reach one.
+fun switchesAt(s : Switching, f : Func Low, i : Low) -> Bool = match i.op {
+	Call(Runtime(Rt.SwapStack), _) -> True
+	Call(Indirect(_), args)        -> Map.contains(s.closures, callKey(f, args, i.result))
+	Call(callee, _) -> match target(s.defined, callee) {
+		Some(name) -> Map.contains(s.switching, name)
+		None       -> False
+	}
+	_ -> False
+}
+
+-- The Turkey function a call of `callee` runs, if it is one: a direct call's,
+-- a `foreign` definition's, or the definition of the runtime routine's
+-- symbol. An import runs in the host, which cannot call back.
+fun target(defined : Map String String, callee : Callee) -> Option String = match callee {
+	Direct(name)       -> Some(name)
+	Foreign(symbol, _) -> Map.get(defined, symbol)
+	Runtime(Rt.Exit)   -> Map.get(defined, Rt.entryPoint(Rt.Exit).symbol)
+	Runtime(_)         -> None
+	Indirect(_)        -> None
+}
+
+-- The type of a closure call with `args` and the result `d`, as
+-- `Turkey.Wasm.Select.closureType` builds it: the environment, then the
+-- arguments.
+fun callKey(f : Func Low, args : Array Value, d : Value) -> String {
+	let params = [W.I64]
+	for a in args { Vec.push(params, storage(Ssa.repOf(f, a))) }
+	typeKey(Vec.toArray(params), [storage(Ssa.repOf(f, d))])
+}
+
+fun functionKey(f : Func Low) -> String =
+	typeKey(
+		Vec.toArray(Vec.map(f.params, fun(p) = storage(Ssa.repOf(f, p)))),
+		Array.map(f.results, storage),
+	)
+
+-- `Turkey.Wasm.Select.valType`, which this module cannot import, since
+-- selection imports it.
+fun storage(r : Rep) -> W.ValType = match L.storageOf(r.class_) {
+	L.Word             -> W.I64
+	L.Double           -> W.F64
+	L.Small | L.NoBits -> W.I32
+}
+
+--- Returns a key that two function types share exactly when they are equal.
+fun typeKey(params : Array W.ValType, results : Array W.ValType) -> String {
+	let letter = fun(t : W.ValType) -> String = match t {
+		W.I32 -> "i"
+		W.I64 -> "l"
+		W.F32 -> "f"
+		W.F64 -> "d"
+		_     -> "r"
+	}
+	String.join(Array.map(params, letter), "") + ">" + String.join(Array.map(results, letter), "")
+}

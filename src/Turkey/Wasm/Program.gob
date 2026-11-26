@@ -57,13 +57,22 @@ import Turkey.SsaLower (Module(..))
 import Turkey.Trace as Trace
 import Turkey.Wasm as W
 import Turkey.Wasm.Module as M
+import Turkey.Wasm.Resume as Resume
 import Turkey.Wasm.Select as S
 
 --- A function selection stopped in, and what stopped it.
 type Unsupported = Unsupported { name : String, what : String }
 
---- The module's bytes, how many functions were selected, and the rest.
-type Program = Program { bytes : Vec Byte, selected : Int, refused : Vec Unsupported }
+--- The module's bytes, how many functions were selected, and the rest:
+--- `switching` counts the selected functions that may switch stacks, and
+--- `resumePoints` the resume points they have between them.
+type Program = Program {
+	bytes        : Vec Byte
+	selected     : Int
+	refused      : Vec Unsupported
+	switching    : Int
+	resumePoints : Int
+}
 
 -- The bytes of the shadow stack, sized to expect the engine's own stack to
 -- run out first. We expect a frame to take more of the engine's stack than of
@@ -144,6 +153,25 @@ fun build(
 			Map.put(slots, name, len(slotted))
 		}
 	}
+	let switching = Resume.analyse(m, defined, wanted.slotted)
+	checkSwitching(m, switching)
+	-- Each tail callee's rewind entry, in the table after the closures' code.
+	let byName = Map.new()
+	for f in m.functions { Map.put(byName, f.name, f) }
+	let rewindEntries = Map.new()
+	let rewound = []
+	for name in switching.tailCallees {
+		if let (Some(f), Some(callee)) = (Map.get(functions, name), Map.get(byName, name)) {
+			let t = M.addType(wasm, W.FuncType {
+				params  = []
+				results = Array.map(Map.getOr(results, name, []), S.valType)
+			})
+			let entry = M.declareFunc(wasm, name + " rewind", t)
+			Vec.push(slotted, entry)
+			Map.put(rewindEntries, name, len(slotted))
+			Vec.push(rewound, (entry, f, callee))
+		}
+	}
 	let table = M.addTable(wasm, M.TableType {
 		elem   = W.funcref
 		limits = M.Limits { min = len(slotted) + 1, max = Some(len(slotted) + 1) }
@@ -159,6 +187,9 @@ fun build(
 	])
 	let stackLimit = M.addGlobal(wasm, M.GlobalType { type_ = W.I64, mutable = True }, [
 		W.ConstI64(Rt.immediates + stackReserve),
+	])
+	let rewinding = M.addGlobal(wasm, M.GlobalType { type_ = W.I32, mutable = True }, [
+		W.ConstI32(0),
 	])
 	let builtins = Map.new()
 	Map.put(builtins, Rt.programEntrySymbol, entry)
@@ -177,15 +208,21 @@ fun build(
 			bytes     = []
 			addresses = Map.new()
 		}
-		worker       = worker
-		stackPointer = stackPointer
-		stackLimit   = stackLimit
-		stackBottom  = Rt.immediates
-		siteCount    = 0
+		worker        = worker
+		stackPointer  = stackPointer
+		stackLimit    = stackLimit
+		stackReserve  = stackReserve
+		switching     = switching
+		rewinding     = rewinding
+		rewindEntries = rewindEntries
+		siteCount     = 0
 	}
+	for (entry, f, callee) in rewound { M.defineFunc(wasm, entry, [], rewindEntry(callee, f)) }
 
 	let refused = []
 	var selected = 0
+	var switches = 0
+	var resumePoints = 0
 	let entries = []
 	let traced : Vec (Trace.Traced Int) = []
 	for f in m.functions {
@@ -199,6 +236,8 @@ fun build(
 			None -> {
 				M.defineFunc(wasm, index, chosen.locals, chosen.body)
 				selected = selected + 1
+				if Map.contains(switching.switching, f.name) { switches = switches + 1 }
+				resumePoints = resumePoints + chosen.resumePoints
 				for e in chosen.entries { Vec.push(entries, e) }
 				Vec.push(traced, Trace.Traced {
 					name  = f.name
@@ -227,7 +266,7 @@ fun build(
 		}
 		pad = fun(n) = for _ in Array.filled(n, 0) { Vec.push(tables, Byte.truncate(0)) }
 	})
-	M.defineFunc(wasm, entry, [], entryBody(cx, m, main, data, frameTable, traceTable))
+	M.defineFunc(wasm, entry, [W.I64], entryBody(cx, m, main, data, frameTable, traceTable))
 	M.defineFunc(
 		wasm,
 		start,
@@ -250,7 +289,64 @@ fun build(
 	M.addData(wasm, memory, strings.start, Vec.toArray(strings.bytes))
 	M.addExport(wasm, "memory", M.ExportMemory, memory)
 	M.addExport(wasm, "_start", M.ExportFunc, start)
-	Program { bytes = M.write(wasm), selected = selected, refused = refused }
+	Program {
+		bytes        = M.write(wasm)
+		selected     = selected
+		refused      = refused
+		switching    = switches
+		resumePoints = resumePoints
+	}
+}
+
+-- The code selection calls inside an instruction -- an allocation's slow
+-- path, the write barrier, a panic, a trace's entry -- has no resume point
+-- around it, since a rewind can only reach an instruction from its start. So
+-- none of it may switch stacks. Nor may early initialization, which runs
+-- before there is a stack to switch from.
+fun checkSwitching(m : Module, switching : Resume.Switching) -> Unit {
+	let inside = [
+		"turkey_object_new",
+		"turkey_cell_new",
+		"turkey_array_new",
+		"turkey_closure_shell",
+		"turkey_write_barrier",
+		"turkey_panic",
+		"turkey_panic_string",
+		"turkey_trace_push",
+	]
+	for symbol in inside {
+		if let Some(name) = Map.get(switching.defined, symbol) {
+			if Map.contains(switching.switching, name) {
+				error(
+					"internal error: "
+						+ symbol
+						+ " may switch stacks, and selection calls it where no rewind can reach",
+				)
+			}
+		}
+	}
+	if Map.contains(switching.switching, m.early) {
+		error("internal error: early initialization may switch stacks")
+	}
+}
+
+-- A tail callee's rewind entry: the callee called with zeros, which it
+-- ignores, rewinding. A caller that finds the callee's frame parked where its
+-- own would be goes on through here (`Turkey.Wasm.Select.forward`), since
+-- the entry's type is the same for every callee its caller returns the
+-- results of.
+fun rewindEntry(callee : Func Low, index : Int) -> Array W.Op {
+	let out = []
+	for p in callee.params { Vec.push(out, zero(S.valType(Ssa.repOf(callee, p)))) }
+	Vec.push(out, W.ReturnCall(index))
+	Vec.toArray(out)
+}
+
+fun zero(t : W.ValType) -> W.Op = match t {
+	W.I64 -> W.ConstI64(0)
+	W.F64 -> W.ConstF64(0.0)
+	W.F32 -> W.ConstF32(0)
+	_     -> W.ConstI32(0)
 }
 
 -- What the module needs that only its instructions say: each C symbol called
@@ -476,11 +572,19 @@ fun entryBody(
 	if data.staticEnd > data.staticStart {
 		runtime("turkey_static_register", [data.staticStart, data.staticEnd])
 	}
-	run(m.initial)
+	let switches = fun(name : String) -> Bool = Map.contains(cx.switching.switching, name)
+	drive(cx, out, fun() = run(m.initial), switches(m.initial))
 	-- `main` takes the closure environment every Turkey function takes, and
 	-- has none.
-	Vec.push(out, W.ConstI64(0))
-	run(main)
+	drive(
+		cx,
+		out,
+		fun() {
+			Vec.push(out, W.ConstI64(0))
+			run(main)
+		},
+		switches(main),
+	)
 	-- A panic's trace counts this call as arm64's counts the frame record
 	-- `main` returns to the entry through, which prints nothing.
 	if let Some(name) = Map.get(cx.defined, "turkey_trace_push") {
@@ -499,6 +603,102 @@ fun entryBody(
 	Vec.push(out, W.End)
 	runtime("turkey_entry_returned", [])
 	Vec.toArray(out)
+}
+
+-- `bottom()`'s call, as the outermost function of the program's own stack,
+-- and, if it may switch stacks, every switch made below it, until it returns.
+--
+-- A switch unwinds the stack it leaves to here (`Turkey.Wasm.Select`), with
+-- the stack to resume as the worker's running one, and here the shadow stack
+-- pointer and its limit become that stack's, and its outermost function is
+-- called again: the program's own stack's is `bottom`'s, and a coroutine's is
+-- `Turkey.Coroutine#start`. A stack that parked is rewound; a coroutine's that
+-- never ran starts. Its outermost function returning without unwinding is the
+-- end of the stack: the program's, which is the end of the loop, or a
+-- coroutine's, whose body has returned or panicked, and which switches to the
+-- stack that resumed it for the last time, as `turkey_stack_start` does on
+-- arm64. That leaves the coroutine's stack running and not parked, so the
+-- collector walks nothing of it, and nothing is on it.
+fun drive(cx : S.Context, out : Vec W.Op, bottom : fun() -> Unit, switches : Bool) -> Unit {
+	bottom()
+	if !switches { return }
+	let running = fun() {
+		Vec.push(out, W.GlobalGet(cx.worker))
+		Vec.push(out, W.Convert(W.I32WrapI64))
+		Vec.push(out, W.Load(W.I64Load, Rt.workerRunningStack))
+	}
+	-- Word `offset` of the stack record in the entry's local.
+	let word = fun(offset : Int) {
+		Vec.push(out, W.LocalGet(0))
+		Vec.push(out, W.Convert(W.I32WrapI64))
+		Vec.push(out, W.Load(W.I64Load, offset))
+	}
+	let flags = fun() {
+		Vec.push(out, W.GlobalGet(cx.worker))
+		Vec.push(out, W.Convert(W.I32WrapI64))
+	}
+	Vec.push(out, W.Block(W.Empty))
+	Vec.push(out, W.Loop(W.Empty))
+	flags()
+	Vec.push(out, W.Load(W.I32Load, 0))
+	Vec.push(out, W.ConstI32(S.unwinding))
+	Vec.push(out, W.IntBin(W.W32, W.And))
+	Vec.push(out, W.If(W.Empty))
+	flags()
+	flags()
+	Vec.push(out, W.Load(W.I32Load, 0))
+	Vec.push(out, W.ConstI32(-1 - S.unwinding))
+	Vec.push(out, W.IntBin(W.W32, W.And))
+	Vec.push(out, W.Store(W.I32Store, 0))
+	Vec.push(out, W.Else)
+	running()
+	Vec.push(out, W.LocalSet(0))
+	word(Rt.stackLow)
+	Vec.push(out, W.IntEqz(W.W64))
+	Vec.push(out, W.BrIf(2))
+	flags()
+	word(Rt.stackResumedBy)
+	Vec.push(out, W.Store(W.I64Store, Rt.workerRunningStack))
+	Vec.push(out, W.End)
+	running()
+	Vec.push(out, W.LocalSet(0))
+	word(Rt.stackHigh)
+	Vec.push(out, W.GlobalSet(cx.stackPointer))
+	-- The program's own stack has no mapping of its own, and its bottom is
+	-- the bottom of the shadow stack.
+	Vec.push(out, W.ConstI64(Rt.immediates))
+	word(Rt.stackLow)
+	word(Rt.stackLow)
+	Vec.push(out, W.IntEqz(W.W64))
+	Vec.push(out, W.Select)
+	Vec.push(out, W.ConstI64(cx.stackReserve))
+	Vec.push(out, W.IntBin(W.W64, W.Add))
+	Vec.push(out, W.GlobalSet(cx.stackLimit))
+	word(Rt.stackParked)
+	Vec.push(out, W.IntEqz(W.W64))
+	Vec.push(out, W.IntEqz(W.W32))
+	Vec.push(out, W.GlobalSet(cx.rewinding))
+	Vec.push(out, W.LocalGet(0))
+	Vec.push(out, W.Convert(W.I32WrapI64))
+	Vec.push(out, W.ConstI64(0))
+	Vec.push(out, W.Store(W.I64Store, Rt.stackParked))
+	word(Rt.stackLow)
+	Vec.push(out, W.IntEqz(W.W64))
+	Vec.push(out, W.If(W.Empty))
+	bottom()
+	Vec.push(out, W.Else)
+	match Map.get(cx.functions, Rt.coroutineStart) {
+		Some(start) -> {
+			Vec.push(out, W.ConstI64(0))
+			Vec.push(out, W.Call(start))
+			for _ in Map.getOr(cx.results, Rt.coroutineStart, []) { Vec.push(out, W.Drop) }
+		}
+		None -> Vec.push(out, W.Unreachable)
+	}
+	Vec.push(out, W.End)
+	Vec.push(out, W.Br(0))
+	Vec.push(out, W.End)
+	Vec.push(out, W.End)
 }
 
 -- The function index of the `foreign` definition of `symbol`, which every

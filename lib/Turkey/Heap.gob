@@ -2119,11 +2119,12 @@ fun collectStopped(frame : Ptr, asked : Asked) -> Unit {
 	}
 }
 
--- Whether this collection must be full: when the last collection found
--- more bytes promoted since the last full one than the room left under the
--- memory target (`schedule`), or when the live bytes, old objects that died since included, have grown by half since the
--- last full collection kept them. Under GC stress every eighth is, so that a
--- stressed run exercises both.
+-- Whether this collection must be full: when the last sweep set `fullNext`,
+-- having found more bytes promoted since the last full collection than the
+-- room left under the memory target or wasm32's ceiling allows
+-- (`schedule`), or when the live bytes, old objects that died since
+-- included, have grown by half since the last full collection kept them.
+-- Under GC stress every eighth is, so that a stressed run exercises both.
 --
 -- Half is measured, on the self-compile against the full collector (17.7 s,
 -- 2.60 GB max RSS): 14.3 s at 2.63 GB. Waiting for the live bytes to double
@@ -2199,13 +2200,16 @@ fun fullDue() -> Bool {
 -- bytes (`roomUnderTarget`); it bounds the regions in use, which is most of
 -- a program's footprint, not all of it. On wasm32 the 4 GiB ceiling of
 -- linear memory, less the collector's own reserve (`roomUnderCeiling`), caps
--- the budget too, and there the floor is at most 32 MiB, half the reserve:
--- a heap living in the reserve collects every so often rather than at every
--- few allocations, and leaves the marking the other half.
+-- the budget too, and there the floor is at most 32 MiB, half the reserve,
+-- less whatever of the reserve the heap already holds, and never below
+-- 64KB: a heap living in the reserve collects every so often rather than at
+-- every few allocations, and leaves the marking at least half.
 --
 -- The next collection is full (`fullNext`) when the bytes promoted since the
--- last full collection are more than the room left after the sweep, and
--- more than the floor. A minor collection frees no old object that has
+-- last full collection are more than the room left after the sweep, and,
+-- under a target, more than the floor. Under wasm32's ceiling there is no
+-- floor to wait for: past the room is the reserve, and promoted bytes that
+-- stay there leave the marking nothing. A minor collection frees no old object that has
 -- died. A full one frees those promoted since and those it kept itself;
 -- nothing counts the dead ones, and the promoted bytes stand in for them.
 -- Right after a full collection nothing has been promoted, so a heap held
@@ -2232,8 +2236,8 @@ fun fullDue() -> Bool {
 -- of the 1.4 s is the second the bucket takes to fill. One whose garbage
 -- dies young, but for an array kept every 100,000 allocations, needs no
 -- guard: under a 100 MB target with 256 MB live it takes 1.4 s at a 308 MB
--- footprint, against 1.5 s at 717 MB with no target. The guard never lifts wasm32's ceiling, past which there is no
--- memory to grow into.
+-- footprint, against 1.5 s at 717 MB with no target. The guard never
+-- lifts wasm32's ceiling, past which there is no memory to grow into.
 
 -- The tuning factor of the square-root rule, in bytes^(1/2).
 let tuning : Float = 40000.0
@@ -2258,7 +2262,8 @@ var markingSmoothed : Float = 0.0
 
 -- The leaky bucket, in nanoseconds, and whether it has filled. The
 -- capacity is a second, or TURKEY_GC_GUARD_NANOSECONDS, for tests that must
--- see the guard turn on without running for a second of collecting.
+-- see the guard turn on without running for a second of collecting. It is
+-- not a tuning knob: a program should leave it unset.
 var bucketCapacity : Int = bucketFrom(Os.getenv(Prim.cString("TURKEY_GC_GUARD_NANOSECONDS")))
 var bucket : Int = 0
 var guarding : Bool = False
@@ -2297,12 +2302,20 @@ fun schedule(
 	let room = if guarding { maxInt() } else { roomUnderTarget() }
 	if room < budget { budget = if room > least { room } else { least } }
 	-- Past the ceiling's room is the collector's own reserve, of which the
-	-- floor may take at most half.
+	-- floor may take at most half, less what the heap already holds of it.
 	let ceiling = roomUnderCeiling()
-	let nearCeiling = if least < 0x200_0000 { least } else { 0x200_0000 }
+	let half = 0x200_0000 + (if ceiling < 0 { ceiling } else { 0 })
+	let nearest = if least < half { least } else { half }
+	let nearCeiling = if nearest > 65536 { nearest } else { 65536 }
 	if ceiling < budget { budget = if ceiling > nearCeiling { ceiling } else { nearCeiling } }
-	let left = if ceiling < room { ceiling } else { room }
-	fullNext = liveBytes - liveBytesAfterFull > (if left > least { left } else { least })
+	-- Under the ceiling, wait for no floor's worth of promotion: the floor
+	-- is a twentieth of the live bytes, far more than the reserve.
+	let promoted = liveBytes - liveBytesAfterFull
+	fullNext = if ceiling <= room {
+		promoted > (if ceiling > 0 { ceiling } else { 0 })
+	} else {
+		promoted > (if room > least { room } else { least })
+	}
 	threshold = budget
 }
 
@@ -2340,8 +2353,10 @@ fun roomUnderTarget() -> Int =
 -- passes, less 64 MiB kept for what the collector itself allocates while it
 -- marks: chiefly the mark stack, which doubles as the heap deepens, and which
 -- a collection that runs with nothing left cannot grow. The compiler compiling
--- itself, with a 1 GB live set, peaks at an 8 MiB mark stack. Spares count as
--- left, since a region takes one before it asks for memory.
+-- itself, with a 1 GB live set, peaks at an 8 MiB mark stack. The remembered
+-- set draws on the reserve too, since `remember` reallocates it as it grows
+-- during marking. Spares count as left, since a region takes one before it
+-- asks for memory.
 -- The most an `Int` holds on any other target, which has no ceiling.
 fun roomUnderCeiling() -> Int = match Target.os {
 	Wasi -> Wasi.memoryLeft() + spareCount * regionBytes - 0x400_0000

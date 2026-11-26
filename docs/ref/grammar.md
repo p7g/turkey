@@ -150,8 +150,12 @@ postfix    ::= atom ( "(" (expression ("," expression)*)? ")"
                     | "[" expression "]"
                     | "." IDENT
                     | "." INDEX
-                    | "?" )*
+                    | "?"
+                    | "!" )*
 ```
+
+A postfix `!` is the token `!` alone: `x!=y` is `x != y`, and `x!!` is the
+operator `!!` ([Unwrapping with `!`](do-notation.md#unwrapping-with-)).
 
 ```ebnf
 atom ::= INT | FLOAT | STRING | CHAR

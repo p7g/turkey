@@ -2,7 +2,7 @@
 
 A type class names a set of operations. An instance provides those operations
 for one type, and a function constrained by the class works on every type that
-has an instance. Operators, `for` loops, indexing, `?` and `print` are all
+has an instance. Operators, `for` loops, indexing, `?`, `!` and `print` are all
 built on classes ([Built-in types and classes](builtins.md)). This chapter
 covers declaring classes and instances, superclasses and default methods,
 associated types, equality constraints, and the rules that keep instances

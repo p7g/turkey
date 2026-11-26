@@ -1,30 +1,76 @@
-// The page: a source box, Run and Stop, and an output pane. Compiling happens
-// in one Worker and running in another, so the page itself never waits.
+// The page: a highlighted source editor, Run and Stop, Format and Share, and
+// an output pane. Compiling happens in one Worker, highlighting and
+// formatting in a second, and running in a third, so the page itself never
+// waits.
 
 import { diagnosticsFor } from "./diagnostics.js";
+import { attachEditor, replaceText } from "./editor.js";
+import { fragmentFor, sourceFromFragment } from "./share.js";
 
 const $ = (id) => document.getElementById(id);
 const source = $("source");
 const runButton = $("run");
 const stopButton = $("stop");
+const formatButton = $("format");
+const shareButton = $("share");
 const output = $("output");
+const formatError = $("format-error");
 const state = $("state");
 const timeoutInput = $("timeout");
 
 const HELLO = `fun main() {
-  print("Hello, Turkey!")
+\tprint("Hello, Turkey!")
 }
 `;
+
+// Past this length a link still works in the browser that made it, but chat
+// apps, mail clients and URL shorteners may cut it short, so we say so.
+const LONG_LINK = 8000;
 
 try {
   source.value = localStorage.getItem("turkey-playground-source") ?? HELLO;
 } catch {
   source.value = HELLO;
 }
+
+// Whether the address bar's fragment holds the editor's text: true after a
+// link loads or Share makes one, false from the next edit. The first edit
+// drops the fragment, so a reload brings back the edits, which `localStorage`
+// keeps, and not the text the link held.
+let linked = false;
 source.addEventListener("input", () => {
   try {
     localStorage.setItem("turkey-playground-source", source.value);
   } catch {}
+  if (linked) {
+    linked = false;
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+  formatError.hidden = true;
+});
+
+// `turkey.wasm`, compiled by the first compile Worker and handed to every
+// Worker started after it, or null until then.
+let turkeyModule = null;
+let tools = null; // the Worker that highlights and formats
+let toolsReady = false;
+let formatting = null; // the id of the Format in flight, or null
+
+// At most one highlight is in flight, and only the latest text waits behind
+// it. A highlight that outlasts the editor's debounce would otherwise queue
+// the next ones, and a Format behind them.
+let highlighting = false;
+let pendingHighlight = null;
+function flushHighlight() {
+  if (pendingHighlight !== null && toolsReady && !highlighting) {
+    tools.postMessage({ type: "highlight", id: 0, source: pendingHighlight });
+    pendingHighlight = null;
+    highlighting = true;
+  }
+}
+const editor = attachEditor(source, $("highlighted"), (text) => {
+  pendingHighlight = text;
+  flushHighlight();
 });
 
 let compiler = null; // the compile Worker
@@ -66,6 +112,7 @@ function show(parts) {
 function startCompiler() {
   const worker = new Worker("compile-worker.js", { type: "module" });
   compiler = worker;
+  worker.postMessage({ type: "load", module: turkeyModule, lib: true });
   worker.onmessage = ({ data }) => {
     if (worker !== compiler) {
       return;
@@ -73,6 +120,10 @@ function startCompiler() {
     if (data.type === "status") {
       state.textContent = data.text;
     } else if (data.type === "ready") {
+      if (turkeyModule === null) {
+        turkeyModule = data.module;
+        tools?.postMessage({ type: "load", module: turkeyModule, lib: false });
+      }
       if (phase === "loading") {
         setPhase("idle", "Ready.");
         // Stop during a compile leaves focus on nothing; give it back to Run.
@@ -212,6 +263,133 @@ runButton.addEventListener("click", () => {
 });
 stopButton.addEventListener("click", stop);
 
+// -- Highlighting and Format ---------------------------------------------------
+
+const note = $("note"); // what Format and Share last did
+
+// A tools Worker that fails leaves the editor working, unhighlighted, and
+// Format disabled with the reason beside it. It is not restarted: it runs
+// nothing of the user's that could crash it, so it would fail again.
+function startTools() {
+  const worker = new Worker("compile-worker.js", { type: "module", name: "tools" });
+  tools = worker;
+  // It loads once the compile Worker has compiled `turkey.wasm`.
+  if (turkeyModule !== null) {
+    worker.postMessage({ type: "load", module: turkeyModule, lib: false });
+  }
+  const failed = (text) => {
+    worker.terminate();
+    tools = null;
+    toolsReady = false;
+    highlighting = false;
+    formatting = null;
+    formatButton.disabled = true;
+    note.textContent = `Highlighting and Format are unavailable: ${text}`;
+  };
+  worker.onmessage = ({ data }) => {
+    if (data.type === "ready") {
+      toolsReady = true;
+      formatButton.disabled = false;
+      flushHighlight();
+    } else if (data.type === "failed") {
+      failed(data.text);
+    } else if (data.type === "highlighted") {
+      highlighting = false;
+      editor.highlighted(data.source, data.html);
+      flushHighlight();
+    } else if (data.type === "formatted" && data.id === formatting) {
+      formatted(data);
+    }
+  };
+  worker.onerror = (event) => failed(event.message || "the Worker failed");
+}
+
+function formatted(data) {
+  formatting = null;
+  formatButton.disabled = false;
+  if (data.text === null) {
+    // The error goes beside the editor, not in the output pane, which still
+    // holds the last run's output.
+    const status = data.status === null ? "the formatter trapped" : `format exit status ${data.status}`;
+    formatError.textContent = `${data.diagnostics.trim()}\n${status}`;
+    formatError.hidden = false;
+    note.textContent = "Format failed; the source is unchanged.";
+  } else if (source.value !== data.source) {
+    // Replacing the source now would throw away what was typed since Format
+    // was pressed.
+    note.textContent = "The source changed while it was formatted; press Format again.";
+  } else if (data.text === data.source) {
+    note.textContent = "Already formatted.";
+  } else {
+    replaceText(source, data.text);
+    note.textContent = "Formatted.";
+  }
+}
+
+let nextFormat = 0;
+formatButton.addEventListener("click", () => {
+  if (!toolsReady || formatting !== null) {
+    return;
+  }
+  formatting = ++nextFormat;
+  formatButton.disabled = true;
+  formatError.hidden = true;
+  note.textContent = "Formatting...";
+  tools.postMessage({ type: "format", id: formatting, source: source.value });
+});
+
+// -- Share links -----------------------------------------------------------------
+
+shareButton.addEventListener("click", async () => {
+  const text = source.value;
+  let fragment;
+  try {
+    fragment = await fragmentFor(text);
+  } catch (error) {
+    note.textContent = `No link: ${error.message}.`;
+    return;
+  }
+  // A link for text since edited would hold the wrong source.
+  if (source.value !== text) {
+    note.textContent = "The source changed while the link was made; press Share again.";
+    return;
+  }
+  history.replaceState(null, "", fragment);
+  linked = true;
+  const url = location.href;
+  let copied = false;
+  try {
+    await navigator.clipboard.writeText(url);
+    copied = true;
+  } catch {}
+  const said = copied ? "Link copied." : "The link is in the address bar.";
+  note.textContent =
+    url.length > LONG_LINK
+      ? `${said} It is ${url.length.toLocaleString("en")} characters long, and some apps cut links that long short.`
+      : said;
+});
+
+// Shows the source the fragment holds, if it holds one. A fragment that
+// cannot be read leaves the editor as it was and says why.
+async function loadLink() {
+  let text;
+  try {
+    text = await sourceFromFragment(location.hash);
+  } catch (error) {
+    note.textContent = `This link cannot be opened: ${error.message}.`;
+    return;
+  }
+  if (text !== null) {
+    source.value = text;
+    editor.changed();
+    linked = true;
+  }
+}
+window.addEventListener("hashchange", loadLink);
+
 setPhase("loading", "Loading the compiler...");
+formatButton.disabled = true;
 startCompiler();
+startTools();
 startRunner();
+loadLink();

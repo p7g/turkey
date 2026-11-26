@@ -2,7 +2,10 @@
 
 The host is the layer the playground's page calls. It runs `turkey.wasm` over
 browser_wasi_shim with `lib/` unpacked from `lib.tar.gz`, and runs the module
-the compiler writes. `tests/playground_host.mjs` drives it under node; the
+the compiler writes, and highlights and formats source for the editor.
+The page's pure modules, the share links and the editor's overlay patch,
+are checked by `tests/playground_share.test.mjs`.
+`tests/playground_host.mjs` drives the host under node; the
 same module runs in a browser's Worker. These tests need node
 (`toolchain.needs_node`), and skip without it unless `$TURKEY_REQUIRE_NODE`
 says they must not.
@@ -12,7 +15,9 @@ bootstrap shard's cross-target test also writes, cached on disk.
 """
 
 import hashlib
+import html
 import json
+import re
 import subprocess
 from pathlib import Path
 
@@ -65,6 +70,48 @@ def test_diagnostics_filter():
     result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_diagnostics.test.mjs")],
                             capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_share_links_and_the_editor_patch():
+    """A share link restores its text exactly and refuses a damaged one, and
+    the editor's overlay patch finds the stretch an edit changed."""
+    node = toolchain.needs_node()
+    result = subprocess.run([node, str(REPO_ROOT / "tests" / "playground_share.test.mjs")],
+                            capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr[-4000:]
+
+
+def _tools(inputs: tuple[Path, Path], tmp_path: Path, source: str) -> dict:
+    node = toolchain.needs_node()
+    entry = tmp_path / "main.gob"
+    entry.write_text(source)
+    argv = [node, f"--stack-size={STACK_KIB}", str(DRIVER), "--tools", str(inputs[0]), str(entry)]
+    result = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr[-4000:]
+    return json.loads(result.stdout)
+
+
+def test_highlighting_escapes_what_the_page_sets_as_html(inputs, tmp_path):
+    """The editor sets `highlight`'s output as HTML, so markup in the source
+    must come out escaped wherever it stands, and the text must be the
+    source exactly."""
+    source = ('fun main() {\n\tprint("<img src=x onerror=alert(1)> & \\"q\\"")'
+              " -- </span><b>&amp;</b>\n}\n{- <script> -}\n")
+    highlighted = _tools(inputs, tmp_path, source)["highlighted"]
+    assert highlighted["status"] == 0, highlighted["diagnostics"]
+    out = highlighted["html"]
+    assert re.findall(r"<(?!span class=\"[a-z-]+\">|/span>)", out) == []
+    assert '"' not in re.sub(r'<span class="[a-z-]+">', "", out)
+    assert html.unescape(re.sub(r"<[^>]*>", "", out)) == source
+    assert '<span class="keyword">fun</span>' in out
+
+
+def test_format_lays_out_the_source_or_reports_why_not(inputs, tmp_path):
+    formatted = _tools(inputs, tmp_path, "fun main() {print(1)}\n")["formatted"]
+    assert formatted == {"text": "fun main() { print(1) }\n", "status": 0, "diagnostics": ""}
+    broken = _tools(inputs, tmp_path, "fun main( {\n")["formatted"]
+    assert broken == {"text": None, "status": 3,
+                      "diagnostics": "main.gob:1:11: parse error: expected a pattern, found '{'\n"}
 
 
 def test_hello_world_compiles_and_runs(inputs, tmp_path):

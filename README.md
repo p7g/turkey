@@ -437,6 +437,12 @@ That writes `build/docs/index.html`, which opens in a browser as a file,
 alongside one page per module and the JSON. The same site is published to
 <https://p7g.github.io/turkey/> from `main` by `.github/workflows/docs.yml`.
 
+`turkey highlight FILE` writes the file as an HTML fragment, every token and
+comment in a `<span>` whose class names its group, as the site's code is
+marked up. `turkey highlight -` reads standard input. It does not parse the
+text, so it marks up a file with errors in it as far as the file lexes. The
+browser playground highlights its editor this way.
+
 ### Formatting
 
 `turkey format FILE...` rewrites each file in the one style, and

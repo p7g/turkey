@@ -9,6 +9,8 @@
 //     const compiler = await loadCompiler(wasmBytes, libTarGz);
 //     const built = await compile(compiler, source);
 //     if (built.bytes) { const ran = await run(built.bytes); }
+//     const { html } = await highlight(compiler, source);
+//     const { text } = await format(compiler, source);
 
 import {
   WASI,
@@ -20,14 +22,19 @@ import {
 } from "./vendor/browser_wasi_shim/index.js";
 
 /**
- * Returns a compiler for `compile`: `wasm` compiled, and `libArchive`
- * unpacked. `wasm` is `turkey.wasm` as bytes or an already compiled
- * `WebAssembly.Module`; `libArchive` is `lib.tar.gz`'s bytes. Neither is read
- * again, so one compiler serves any number of compiles. Throws if the archive
- * is not a well-formed ustar archive holding files under `lib/`.
+ * Returns a compiler for `compile`, `highlight` and `format`: `wasm` compiled,
+ * and `libArchive` unpacked. `wasm` is `turkey.wasm` as bytes or an already
+ * compiled `WebAssembly.Module`. `libArchive` is `lib.tar.gz`'s bytes, or null
+ * for a compiler that only highlights and formats, since neither reads the
+ * library. Neither argument is read again, so one compiler serves any number
+ * of calls. Throws if the archive is not a well-formed ustar archive holding
+ * files under `lib/`.
  */
-export async function loadCompiler(wasm, libArchive) {
+export async function loadCompiler(wasm, libArchive = null) {
   const module = wasm instanceof WebAssembly.Module ? wasm : await WebAssembly.compile(wasm);
+  if (libArchive === null) {
+    return { module, lib: null };
+  }
   const lib = untar(await gunzip(libArchive))
     .filter(([path]) => path.startsWith("lib/"))
     .map(([path, bytes]) => [path.slice("lib/".length), bytes]);
@@ -44,9 +51,12 @@ export async function loadCompiler(wasm, libArchive) {
  * compiler's exit status, or null if it trapped; `diagnostics` is everything
  * it wrote to stdout and stderr, as text, with a trap's message last; `memory`
  * is its linear memory's size in bytes at exit, which is its peak, since wasm
- * memory never shrinks.
+ * memory never shrinks. Throws for a compiler loaded without the library.
  */
 export async function compile(compiler, source) {
+  if (compiler.lib === null) {
+    throw new Error("this compiler was loaded without lib.tar.gz, so it cannot compile");
+  }
   const work = new PreopenDirectory(".", [["main.gob", new File(new TextEncoder().encode(source))]]);
   // `lib` is its own preopen: the compiler resolves `lib/...` against the
   // preopen with the longest matching name, and everything else against `.`.
@@ -70,6 +80,44 @@ export async function compile(compiler, source) {
     status: result.status,
     diagnostics: result.stdout + (result.trap === null ? "" : result.trap + "\n"),
     memory: result.memory,
+  };
+}
+
+/**
+ * Returns `source` as `turkey highlight` writes it: `{ html, status,
+ * diagnostics }`. `html` is the HTML fragment, or null if the compiler failed,
+ * and `diagnostics` is what it wrote to stderr, with a trap's message last.
+ * The fragment escapes every `<`, `>`, `&` and `"` in `source`, so it is safe
+ * as an element's content, and its text is exactly `source`.
+ */
+export async function highlight(compiler, source) {
+  const result = await tool(compiler, ["highlight", "-"], source);
+  return { html: result.output, status: result.status, diagnostics: result.diagnostics };
+}
+
+/**
+ * Returns `source`, as the module `main.gob`, laid out as `turkey format`
+ * lays it out: `{ text, status, diagnostics }`. `text` is the formatted
+ * source, or null if it did not parse or the formatter refused it, and
+ * `diagnostics` is what the formatter wrote to stderr, with a trap's message
+ * last.
+ */
+export async function format(compiler, source) {
+  const result = await tool(compiler, ["format", "--stdin-name", "main.gob", "-"], source);
+  return { text: result.output, status: result.status, diagnostics: result.diagnostics };
+}
+
+// Runs the compiler with `args` and `source` on its standard input. Returns
+// `{ output, status, diagnostics }`, where `output` is its stdout if it
+// exited 0, and otherwise null.
+async function tool(compiler, args, source) {
+  const stdin = new OpenFile(new File(new TextEncoder().encode(source)));
+  const fds = [stdin, null, null, new PreopenDirectory(".", [])];
+  const result = await start(compiler.module, ["turkey", ...args], [], fds, { merged: false });
+  return {
+    output: result.status === 0 ? result.stdout : null,
+    status: result.status,
+    diagnostics: result.stderr + (result.trap === null ? "" : result.trap + "\n"),
   };
 }
 

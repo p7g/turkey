@@ -111,9 +111,10 @@ def test_arithmetic(stress):
 
 
 # One operation on two operands, both from the command line. Each arm reads
-# `a` and `b` for the last time, which is what makes these tests check that a
-# result never shares a local with its operands: a checked `+`, `-` or `*`
-# writes its result before its overflow test reads the operands again.
+# `a` and `b` for the last time, so the arms for `+`, `-` and `*` check that a
+# result never shares a local with its operands: each writes its result before
+# its overflow test reads an operand again. The other arms read their operands
+# before writing, so they do not check it.
 OPERATION = """\
 import System.Env as Env
 
@@ -224,6 +225,70 @@ def test_loops_calls_and_switches(stress):
     result = _run(LOOPS, stress=stress)
     assert result.returncode == 0, result.stderr
     assert result.stdout == "111\n6765\n1650\nzero\none\ntwo\nthree\nzero\n"
+
+
+# Moves into block parameters, which share a local with an argument where they
+# can: a rotation of three values through a loop's parameters, which is a
+# cycle of moves; pairs returned in two results, swapped or combined by each
+# call; and a join that passes one value to both of its parameters on one
+# side and the two in another order on the other.
+MOVES = """\
+import System.Env as Env
+
+fun arg(k : Int) -> Int = match Int.parse(Env.args()[k]) {
+    Some(n) -> n
+    None -> 0
+}
+
+fun rotate(n : Int, a : Int, b : Int, c : Int) -> (Int, Int, Int) {
+    var x = a
+    var y = b
+    var z = c
+    for var i = 0; i < n; i = i + 1 {
+        let t = x
+        x = y
+        y = z
+        z = t
+    }
+    (x, y, z)
+}
+
+fun swapPair(n : Int, a : Int, b : Int) -> (Int, Int) {
+    if n == 0 { return (a, b) }
+    let (x, y) = swapPair(n - 1, a, b)
+    (y, x)
+}
+
+fun fibPair(n : Int) -> (Int, Int) {
+    if n == 0 { return (0, 1) }
+    let (a, b) = fibPair(n - 1)
+    (b, a + b)
+}
+
+fun join(c : Bool, x : Int, y : Int) -> (Int, Int) = if c { (x, x) } else { (y, x) }
+
+fun main() {
+    let n = arg(0)
+    let a = arg(1)
+    let b = arg(2)
+    let (x, y, z) = rotate(n, a, b, a + b)
+    print("${x} ${y} ${z}")
+    let (s, t) = swapPair(n, a, b)
+    print("${s} ${t}")
+    let (f, g) = fibPair(n + 3)
+    print("${f} ${g}")
+    for c in [n > 5, n < 5] {
+        let (j, k) = join(c, a, b)
+        print("${j} ${k}")
+    }
+}
+"""
+
+
+def test_moves_into_block_parameters():
+    result = _run(MOVES, "7", "1", "2")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "2 3 1\n2 1\n55 89\n1 1\n2 1\n"
 
 
 # Ten million calls deep, which runs only if a call in tail position, mutual

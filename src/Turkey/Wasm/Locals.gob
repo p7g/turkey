@@ -8,14 +8,18 @@ export (Locals(..), allocate)
 --- so a function that declares one local per value has frames as large as it
 --- has values. Values that are never live at once share a local instead.
 ---
---- **Greedy is enough.** Every definition dominates its uses (`Ssa.verify`),
---- which makes the graph of which values are live at once chordal, and
---- definitions in an order where each comes after those that dominate it are
---- the reverse of a perfect elimination order of that graph. So giving each
---- value, at its definition, the lowest-numbered local of its type that no
---- live value holds uses no more locals of a type than there are values of
---- that type live at one point. No interference graph is built, and nothing
---- is moved or retried.
+--- **Greedy is enough.** A value holds its local from where it is placed --
+--- its definition, or for a call's `Result` the call -- through the
+--- instruction that reads it last, so an instruction's result and the
+--- operands it reads last hold theirs at once. Every definition dominates its
+--- uses (`Ssa.verify`), so the graph of which values hold locals at once is
+--- chordal, and placing values in an order where each comes after those that
+--- dominate it is the reverse of a perfect elimination order of that graph.
+--- So giving each value the lowest-numbered local of its type that no value
+--- holds uses no more locals of a type than the most values of that type
+--- holding one at a point: the values live there, and at most the operands an
+--- instruction reads last or the results a call places early. No interference
+--- graph is built, and nothing is moved or retried.
 ---
 --- **An instruction's result does not share a local with its operands**, even
 --- one the instruction reads last. Selection may write the result before it
@@ -26,9 +30,14 @@ export (Locals(..), allocate)
 --- `Result` that follows a direct call when it selects the call, so they are
 --- given their locals together, before anything the call reads last is freed.
 ---
---- **Every unit shares one `i32` local, which only ever holds 0.** Nothing
---- writes a unit's local but with a unit, so a value that is never written
---- reads as 0 wherever it is read.
+--- **Every unit shares one `i32` local, which only ever holds 0.** A local
+--- starts at 0, and in every function every write to a unit's local writes 0:
+--- what it writes is read from a unit's local (a unit argument, a unit a call
+--- returns, a jump's unit argument), loaded from a cell or global that only a
+--- unit's local was stored into (`Select.loadWord`), or the 0 `Select.load`
+--- pushes for a unit field. A unit nothing writes, such as a `ConstUnit`,
+--- therefore reads as 0 wherever it is read, whichever unit last wrote the
+--- local.
 ---
 --- **A block parameter prefers its argument's local.** When the local a jump
 --- passes is free at the target's start, the parameter takes it, and the move
@@ -117,7 +126,7 @@ fun allocate(f : Func Low, typeOf : fun(Rep) -> W.ValType) -> Locals {
 }
 
 -- Places the parameters of a block whose predecessors are `preds`. Each
--- takes the local of an argument some jump passes it, if one is free; each
+-- takes the local of an argument some jump passes it, if one is available; each
 -- argument not placed yet is hinted towards its parameter's local.
 fun parameters(p : Pool, params : Vec Value, preds : Vec Ssa.BlockId) -> Unit {
 	for var k = 0; k < len(params); k = k + 1 {
@@ -125,7 +134,7 @@ fun parameters(p : Pool, params : Vec Value, preds : Vec Ssa.BlockId) -> Unit {
 		for from in preds {
 			if let Ssa.Jump(_, args) = Ssa.blockAt(p.source, from).term {
 				let a = p.local[Ssa.valueId(args[k])]
-				if preferred < 0 && free(p, a, params[k]) { preferred = a }
+				if preferred < 0 && available(p, a, params[k]) { preferred = a }
 			}
 		}
 		take(p, params[k], preferred)
@@ -144,7 +153,7 @@ fun place(p : Pool, v : Value) -> Unit {
 	if p.local[id] < 0 { take(p, v, p.hint[id]) }
 }
 
--- Gives `v` a free local of its type: `preferred` if that is one, or else
+-- Gives `v` an available local of its type: `preferred` if that is one, or else
 -- the lowest-numbered, or else a new one.
 fun take(p : Pool, v : Value, preferred : Int) -> Unit {
 	let id = Ssa.valueId(v)
@@ -155,9 +164,9 @@ fun take(p : Pool, v : Value, preferred : Int) -> Unit {
 		return
 	}
 	var k = preferred
-	if !free(p, k, v) {
+	if !available(p, k, v) {
 		k = 0
-		while k < len(p.types) && !free(p, k, v) { k = k + 1 }
+		while k < len(p.types) && !available(p, k, v) { k = k + 1 }
 		if k == len(p.types) { k = fresh(p, p.typeOf(r)) }
 	}
 	p.local[id] = k
@@ -166,7 +175,7 @@ fun take(p : Pool, v : Value, preferred : Int) -> Unit {
 
 -- Whether local `k` may be given `v`: it exists, holds no live value, is of
 -- `v`'s type, and is not the units' local.
-fun free(p : Pool, k : Int, v : Value) -> Bool =
+fun available(p : Pool, k : Int, v : Value) -> Bool =
 	k >= 0 && k != p.unit && !p.busy[k] && p.types[k] == p.typeOf(Ssa.repOf(p.source, v))
 
 fun fresh(p : Pool, t : W.ValType) -> Int {
@@ -181,9 +190,9 @@ fun release(p : Pool, id : Int) -> Unit {
 	if k != p.unit { p.busy[k] = False }
 }
 
--- Returns, for each instruction of block `b`, the values that are live after
--- it no longer: those it reads for the last time, and its result if nothing
--- reads it. Returns too what is live at the block's start, its parameters
+-- Returns, for each instruction of block `b`, the values that stop being live
+-- at it: those it reads for the last time, and its result if nothing reads
+-- it. Returns too what is live at the block's start, its parameters
 -- included.
 fun lastUses(f : Func Low, b : Int, out : BitSet) -> (Array (Vec Int), BitSet) {
 	let block = f.blocks[b]

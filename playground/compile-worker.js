@@ -1,18 +1,26 @@
-// The compile Worker: loads `turkey.wasm` and `lib.tar.gz` once, then answers
-// each `compile` message with the program's bytes or the compiler's
+// The compile Worker: loads the compiler once, when the page says how, then
+// answers each `compile` message with the program's bytes or the compiler's
 // diagnostics, and each `highlight` and `format` message with what those
 // commands write. A module Worker, so it imports `host.js` as the page does.
 //
-// The page starts it twice: once to compile, and once, named "tools", to
-// highlight and format, so that neither waits behind a compile that takes
-// seconds. The tools Worker never fetches `lib.tar.gz`, since neither command
-// reads the library.
+// The page starts it twice: once to compile, and once, as the tools Worker,
+// to highlight and format, so that neither waits behind a compile that takes
+// seconds. `turkey.wasm` is compiled once per page: the first compile Worker
+// fetches and compiles it and hands the `WebAssembly.Module` to the page,
+// which passes it to the tools Worker and to any compile Worker it starts
+// later. Only a compile Worker fetches `lib.tar.gz`, since neither
+// highlighting nor formatting reads the library.
 //
-// Messages in:  { type: "compile", id, source }
+// Messages in:  { type: "load", module, lib }       first, and once: `module`
+//                                                   is a compiled turkey.wasm
+//                                                   or null to fetch one, and
+//                                                   `lib` says whether to
+//                                                   fetch lib.tar.gz
+//               { type: "compile", id, source }
 //               { type: "highlight", id, source }
 //               { type: "format", id, source }
 // Messages out: { type: "status", text }            progress while loading
-//               { type: "ready" }                   the compiler is loaded
+//               { type: "ready", module }           the compiler is loaded
 //               { type: "failed", text }            loading failed for good
 //               { type: "compiled", id, bytes, status, diagnostics, ms }
 //               { type: "highlighted", id, source, html }
@@ -20,8 +28,6 @@
 // where `html` and `text` are null if the command failed.
 
 import { loadCompiler, compile, highlight, format } from "./host.js";
-
-const tools = self.name === "tools";
 
 // Both files are fetched with the default cache mode, so the browser's HTTP
 // cache decides whether the network is touched: the server's validators
@@ -38,26 +44,38 @@ async function fetchOk(url) {
   return response;
 }
 
-async function load() {
+async function load({ module, lib }) {
   postMessage({ type: "status", text: "Loading the compiler..." });
-  const [module, lib] = await Promise.all([
-    WebAssembly.compileStreaming(fetchOk("turkey.wasm")),
-    tools ? null : fetchOk("lib.tar.gz").then((response) => response.arrayBuffer()),
+  const [compiled, archive] = await Promise.all([
+    module ?? WebAssembly.compileStreaming(fetchOk("turkey.wasm")),
+    lib ? fetchOk("lib.tar.gz").then((response) => response.arrayBuffer()) : null,
   ]);
-  const compiler = await loadCompiler(module, lib === null ? null : new Uint8Array(lib));
-  return compiler;
+  return await loadCompiler(compiled, archive === null ? null : new Uint8Array(archive));
 }
 
-const loading = load().then(
-  (compiler) => {
-    postMessage({ type: "ready" });
-    return compiler;
-  },
-  (error) => {
-    postMessage({ type: "failed", text: String(error && error.message ? error.message : error) });
-    return null;
-  },
-);
+// Settles with the compiler, or null if it failed to load, once the page's
+// `load` message has arrived.
+let loaded;
+const loading = new Promise((resolve) => {
+  loaded = resolve;
+});
+let loadAsked = false;
+
+function start(data) {
+  loadAsked = true;
+  loaded(
+    load(data).then(
+      (compiler) => {
+        postMessage({ type: "ready", module: compiler.module });
+        return compiler;
+      },
+      (error) => {
+        postMessage({ type: "failed", text: String(error && error.message ? error.message : error) });
+        return null;
+      },
+    ),
+  );
+}
 
 // Each reply carries the source it was made from, so the page can tell a
 // reply for text it has since edited.
@@ -110,6 +128,12 @@ const handlers = {
 };
 
 onmessage = async ({ data }) => {
+  if (data.type === "load") {
+    if (!loadAsked) {
+      start(data);
+    }
+    return;
+  }
   const handler = Object.hasOwn(handlers, data.type) ? handlers[data.type] : null;
   if (handler === null) {
     return;

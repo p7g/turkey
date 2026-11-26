@@ -14,6 +14,7 @@ const stopButton = $("stop");
 const formatButton = $("format");
 const shareButton = $("share");
 const output = $("output");
+const formatError = $("format-error");
 const state = $("state");
 const timeoutInput = $("timeout");
 
@@ -45,13 +46,31 @@ source.addEventListener("input", () => {
     linked = false;
     history.replaceState(null, "", location.pathname + location.search);
   }
+  formatError.hidden = true;
 });
 
+// `turkey.wasm`, compiled by the first compile Worker and handed to every
+// Worker started after it, or null until then.
+let turkeyModule = null;
 let tools = null; // the Worker that highlights and formats
 let toolsReady = false;
 let formatting = null; // the id of the Format in flight, or null
+
+// At most one highlight is in flight, and only the latest text waits behind
+// it. A highlight that outlasts the editor's debounce would otherwise queue
+// the next ones, and a Format behind them.
+let highlighting = false;
+let pendingHighlight = null;
+function flushHighlight() {
+  if (pendingHighlight !== null && toolsReady && !highlighting) {
+    tools.postMessage({ type: "highlight", id: 0, source: pendingHighlight });
+    pendingHighlight = null;
+    highlighting = true;
+  }
+}
 const editor = attachEditor(source, $("highlighted"), (text) => {
-  tools?.postMessage({ type: "highlight", id: 0, source: text });
+  pendingHighlight = text;
+  flushHighlight();
 });
 
 let compiler = null; // the compile Worker
@@ -93,6 +112,7 @@ function show(parts) {
 function startCompiler() {
   const worker = new Worker("compile-worker.js", { type: "module" });
   compiler = worker;
+  worker.postMessage({ type: "load", module: turkeyModule, lib: true });
   worker.onmessage = ({ data }) => {
     if (worker !== compiler) {
       return;
@@ -100,6 +120,10 @@ function startCompiler() {
     if (data.type === "status") {
       state.textContent = data.text;
     } else if (data.type === "ready") {
+      if (turkeyModule === null) {
+        turkeyModule = data.module;
+        tools?.postMessage({ type: "load", module: turkeyModule, lib: false });
+      }
       if (phase === "loading") {
         setPhase("idle", "Ready.");
         // Stop during a compile leaves focus on nothing; give it back to Run.
@@ -249,10 +273,15 @@ const note = $("note"); // what Format and Share last did
 function startTools() {
   const worker = new Worker("compile-worker.js", { type: "module", name: "tools" });
   tools = worker;
+  // It loads once the compile Worker has compiled `turkey.wasm`.
+  if (turkeyModule !== null) {
+    worker.postMessage({ type: "load", module: turkeyModule, lib: false });
+  }
   const failed = (text) => {
     worker.terminate();
     tools = null;
     toolsReady = false;
+    highlighting = false;
     formatting = null;
     formatButton.disabled = true;
     note.textContent = `Highlighting and Format are unavailable: ${text}`;
@@ -261,10 +290,13 @@ function startTools() {
     if (data.type === "ready") {
       toolsReady = true;
       formatButton.disabled = false;
+      flushHighlight();
     } else if (data.type === "failed") {
       failed(data.text);
     } else if (data.type === "highlighted") {
+      highlighting = false;
       editor.highlighted(data.source, data.html);
+      flushHighlight();
     } else if (data.type === "formatted" && data.id === formatting) {
       formatted(data);
     }
@@ -276,11 +308,11 @@ function formatted(data) {
   formatting = null;
   formatButton.disabled = false;
   if (data.text === null) {
+    // The error goes beside the editor, not in the output pane, which still
+    // holds the last run's output.
     const status = data.status === null ? "the formatter trapped" : `format exit status ${data.status}`;
-    show([
-      ["error", data.diagnostics.trim()],
-      ["status", status],
-    ]);
+    formatError.textContent = `${data.diagnostics.trim()}\n${status}`;
+    formatError.hidden = false;
     note.textContent = "Format failed; the source is unchanged.";
   } else if (source.value !== data.source) {
     // Replacing the source now would throw away what was typed since Format
@@ -301,6 +333,7 @@ formatButton.addEventListener("click", () => {
   }
   formatting = ++nextFormat;
   formatButton.disabled = true;
+  formatError.hidden = true;
   note.textContent = "Formatting...";
   tools.postMessage({ type: "format", id: formatting, source: source.value });
 });
@@ -308,11 +341,17 @@ formatButton.addEventListener("click", () => {
 // -- Share links -----------------------------------------------------------------
 
 shareButton.addEventListener("click", async () => {
+  const text = source.value;
   let fragment;
   try {
-    fragment = await fragmentFor(source.value);
+    fragment = await fragmentFor(text);
   } catch (error) {
     note.textContent = `No link: ${error.message}.`;
+    return;
+  }
+  // A link for text since edited would hold the wrong source.
+  if (source.value !== text) {
+    note.textContent = "The source changed while the link was made; press Share again.";
     return;
   }
   history.replaceState(null, "", fragment);

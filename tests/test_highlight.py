@@ -132,3 +132,11 @@ def test_the_command_fails_on_text_that_is_not_utf8() -> None:
     result = _highlight("-", stdin=b"\xff\n")
     assert result.returncode == 2
     assert result.stderr == b"turkey: standard input is not valid UTF-8\n"
+
+
+def test_the_command_fails_on_a_missing_file(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.gob"
+    result = _highlight(str(missing))
+    assert result.returncode == 2
+    assert result.stderr == f"turkey: open {missing}: no such file or directory\n".encode()
+    assert result.stdout == b""

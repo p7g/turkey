@@ -1,0 +1,71 @@
+-- The benchmark client: `client URL REQUESTS CONCURRENCY`. Sends REQUESTS
+-- GETs to URL from CONCURRENCY tasks over keep-alive, reading each body
+-- whole, and prints the requests per second and the latency percentiles in
+-- microseconds, as bench/http/go/client/main.go does.
+
+import Net as Net
+import Net.HTTP (..)
+import Net.HTTP.Client as Client
+import Net.HTTP.Client (send)
+import System.Env as Env
+import System.IO as IO
+import System.Sync as Sync
+import System.Task as Task
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
+
+fun main() {
+    let args = Env.args()
+    if len(args) != 3 { error("usage: client URL REQUESTS CONCURRENCY") }
+    let url = args[0]
+    let total = Option.expect(Int.parse(args[1]), "a request count")
+    let concurrency = Option.expect(Int.parse(args[2]), "a concurrency")
+    let c = match Client.client(Client.policy(Net.anywhere) <> Client.idlePerOrigin(concurrency)) {
+        Right(c) -> c
+        Left(e) -> error(show(e))
+    }
+    let next = Sync.atomicInt(0)
+    let clock = Stopwatch.start()
+    let runs = Task.runScope(do {
+        let tasks : Vec (Task.Task (Vec Int)) = []
+        for _ in Int.range(0, concurrency) {
+            Vec.push(tasks, Task.spawn(fun() = requests(c, url, total, next))?)
+        }
+        pure(tasks)
+    })
+    let elapsed = Duration.toNanos(Stopwatch.elapsed(clock))
+    let all : Vec Int = []
+    for t in runs {
+        for ns in Task.join(t) { Vec.push(all, ns) }
+    }
+    let sorted = Vec.sort(all)
+    let at = fun(perMille) = sorted[perMille * (total - 1) / 1000] / 1000
+    print("rps=" + show(total * 1000000000 / elapsed) + " p50_us=" + show(at(500)) + " p99_us=" + show(at(990))
+        + " p999_us=" + show(at(999)))
+    Client.close(c)
+}
+
+-- Sends requests until `next` passes `total`, returning each one's latency
+-- in nanoseconds.
+fun requests(c : Client.Client, url : String, total : Int, next : Sync.AtomicInt) -> Vec Int {
+    let mine : Vec Int = []
+    while Sync.addAndGet(next, 1) <= total {
+        let clock = Stopwatch.start()
+        let got = send(c, request(GET, url), Duration.seconds(30), fun(resp) {
+            if resp.status != OK { return Left(fail(Unexpected(resp.status))) }
+            let _ = receive(resp.body, 2 * 1048576)?
+            Right({})
+        })
+        match got {
+            Right(_) -> Vec.push(mine, Duration.toNanos(Stopwatch.elapsed(clock)))
+            Left(e) -> error(Error.describe(e))
+        }
+    }
+    mine
+}
+
+type Unexpected = Unexpected(Status)
+
+instance Show Unexpected { fun show(Unexpected(s)) = "status " + show(s) }
+
+instance Error Unexpected { fun message(e) = show(e) }
